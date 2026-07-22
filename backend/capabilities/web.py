@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import ipaddress
+import os
+import re
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
@@ -21,6 +23,7 @@ from core import net_safety
 from model_api_runtime import tools
 
 from capabilities import errors
+from capabilities import html_extract
 from capabilities.types import CapabilityResult, ok, err
 
 _DEFAULT_SEARCH_LIMIT = 5
@@ -41,6 +44,27 @@ _FETCH_TIMEOUT_SEC = 8.0
 # executor._RESULT_CHAR_CAP and tool_loop's tool_result_char_cap, both 2000.
 # Raising a limit here without raising those would only look like it worked.
 _FETCH_MAX_BODY_BYTES = 300_000
+
+# Kill switch for article extraction. Default ON: a flag that ships OFF is how
+# you get "the code deployed but the feature never did", which this workspace
+# has been bitten by. Flipping it to "0" returns web_fetch to the plain
+# tag-strip — the behaviour every page had before extraction existed.
+# NOTE: read at import; changing it requires restarting the runner. It is a
+# rollback lever, not a live control-plane switch.
+_EXTRACT_ARTICLE = os.environ.get("FEEDLING_WEB_EXTRACT_ARTICLE", "1").strip() != "0"
+
+# Only these get sent to an *article* extractor. web_fetch is also how the model
+# reads a JSON API, a raw .py file, an RSS feed or a plain-text changelog, and
+# running those through a "find the prose" heuristic silently drops fields —
+# with a result long enough that no length-based guard would catch it.
+_HTML_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
+
+# Below this, an extraction is treated as "it found a fragment", not "it found
+# the article", and the plain strip is appended after it. Chosen because real
+# short pages exist (a status page, a term definition, a weather summary) and
+# discarding a correct short answer would re-bury it under the navigation the
+# extractor had just removed.
+_ARTICLE_MIN_CHARS = 200
 _FETCH_USER_AGENT = "Mozilla/5.0 (compatible; FeedlingIO/1.0; +https://feedling.app)"
 _FETCH_MAX_REDIRECTS = 5
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
@@ -199,6 +223,66 @@ def _drop_unterminated_tail(html: str) -> str:
     return html[:cut]
 
 
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+
+def _page_title(html: str) -> str:
+    """The document title, or "".
+
+    The extractor's output does not carry it, and without it a weather page
+    reads "中雨 24℃ 晴转多云" with no clue which city that is. Cheap to take
+    from the markup and worth its ~40 characters of the budget.
+    """
+    m = _TITLE_RE.search(html)
+    if not m:
+        return ""
+    return tools._strip_html_text(m.group(1))[:120]
+
+
+def _looks_like_html(content_type: str, body: str) -> bool:
+    """HTML by declaration, or by sniff when nothing was declared.
+
+    A wrong or absent Content-Type is common; a *misleading* one is not worth
+    defending against here, because the cost of guessing wrong is only that we
+    fall back to the same tag-strip we would have used anyway.
+    """
+    declared = content_type.split(";", 1)[0].strip().lower()
+    if declared:
+        return declared in _HTML_CONTENT_TYPES
+    head = body[:1000].lstrip().lower()
+    return head.startswith("<!doctype html") or head.startswith("<html") or "<body" in head
+
+
+def _readable_text(html: str, *, content_type: str) -> str:
+    """Article text when we can get it, plain stripped text otherwise.
+
+    Three outcomes, and the middle one is the reason this is not a boolean:
+
+    - **article** — extraction returned enough to stand on its own.
+    - **hybrid** — it returned something short. Real pages are legitimately
+      short, so the fragment is kept *first* (it is the part most likely to
+      answer the question) and the plain strip follows to fill the budget.
+      Throwing the fragment away would re-bury a correct short answer.
+    - **fallback** — nothing usable, or this is not HTML at all.
+    """
+    plain = tools._strip_html_text(_drop_unterminated_tail(html))
+    if not _EXTRACT_ARTICLE or not _looks_like_html(content_type, html):
+        return plain
+
+    article = html_extract.extract_article(html)
+    if not article:
+        return plain
+
+    title = _page_title(html)
+    # Skip the title when the extractor already opens with it, which it does on
+    # most articles — paying twice for it out of 2000 characters is a real cost.
+    if title and title[:40] not in article[:200]:
+        article = f"{title}\n\n{article}"
+    if len(article) >= _ARTICLE_MIN_CHARS:
+        return article
+    return f"{article}\n\n{plain}"
+
+
 def search(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
     """params: {"query": str, "limit": int?}. Keyless DuckDuckGo HTML scrape."""
     params = params or {}
@@ -283,9 +367,7 @@ def fetch(store, *, api_key=None, runtime_token=None, params=None) -> Capability
         return err(errors.code_for_status(status_code),
                    f"fetch failed with status {status_code}",
                    retryable=errors.retryable_for_status(status_code))
-    # Unconditional, not only when we truncated: a page can ship an unclosed
-    # <script> on its own, and the leak is identical either way.
-    text = tools._strip_html_text(_drop_unterminated_tail(body))
+    text = _readable_text(body, content_type=str(response_headers.get("content-type") or ""))
     capped = errors.cap_text(text)
     # One honest flag covering BOTH places content can go missing: the raw body
     # cut, and the text cap right here. A model told `truncated: false` while the

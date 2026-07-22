@@ -7,7 +7,7 @@
 #
 # Supply-chain pinning (matches the backend image): base pinned by digest below,
 # npm CLIs pinned to exact versions, Python deps hash-locked via the backend's
-# requirements.lock. To refresh the base digest see deploy/BUILD.md
+# requirements.lock plus the worker-only requirements-runner.lock. To refresh the base digest see deploy/BUILD.md
 # (`docker buildx imagetools inspect python:3.11-slim-bookworm`).
 
 # Pinned by multi-arch index digest. Kept at 3.11 (the backend image is 3.12) to
@@ -30,8 +30,17 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Runtime V2, Genesis, provider, crypto, and PostgreSQL dependencies.
+# Two locks, one install. The worker-only lock is a separate file — `web_fetch`'s
+# HTML parser executes here and nowhere else, and the decrypt enclave (which
+# installs only the shared lock) should not carry a C extension it never calls.
+# But they are installed together in a single pip invocation on purpose: a later
+# bump to the shared lock that disagrees with a package pinned in the runner lock
+# then fails the build, instead of the second install silently overwriting the
+# first. requirements-runner.lock is compiled with the shared lock as a
+# constraint, so today they already agree.
 COPY backend/requirements.lock ./requirements.lock
-RUN pip install --require-hashes -r requirements.lock
+COPY backend/requirements-runner.lock ./requirements-runner.lock
+RUN pip install --require-hashes -r requirements.lock -r requirements-runner.lock
 
 # Runtime V2 is entirely in-process Python. The external resident consumer under
 # tools/ is a separately operated product path and is not shipped in this image.

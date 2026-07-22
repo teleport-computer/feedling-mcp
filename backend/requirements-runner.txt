@@ -1,0 +1,26 @@
+# Extra dependencies for the pooled Runtime V2 worker image ONLY.
+#
+# Everything the backend and the decrypt enclave need lives in
+# requirements.txt / requirements.lock, which all three images install. This
+# second file exists so a dependency that only one process actually executes
+# does not end up inside the other two.
+#
+# `web_fetch` runs in the worker (backend/model_api_runtime/v2/serve_worker.py).
+# The decrypt enclave never calls a capability, so shipping an HTML parser and
+# its C extension there would widen the attested TCB for nothing — and that
+# image's whole value proposition is being small enough to reason about.
+#
+# Consequence to keep in mind: anything listed here MUST be imported lazily and
+# have a working fallback, because the backend image does not have it. See
+# backend/capabilities/html_extract.py.
+
+# Article extraction for web_fetch. The tool loop hands the model at most 2000
+# characters of a page; with a plain tag-strip most of that budget goes to the
+# navigation menu ("Jump to content / Main menu / Donate" fills the first 2257
+# characters of a Wikipedia article), so what reaches the model is mostly not
+# the page. Measured on the pages our users actually ask about: a weather page
+# goes from "首页 预报 预警 雷达 云图" to "中雨 24℃ 晴转多云 33℃/25℃".
+#
+# Pinned exactly, not floored: this parses untrusted input inside a TEE, so the
+# version that ships is the version that was reviewed. Bump deliberately.
+trafilatura==2.1.0
