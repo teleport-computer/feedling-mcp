@@ -60,6 +60,20 @@ MAX_DIMENSIONS = 12  # sanity cap, NOT a floor
 _VALUE_MIN, _VALUE_MAX = 0, 100
 _OK: tuple[bool, str] = (True, "")
 
+# Agent name punctuation strip set — shared between card_policy validation
+# and actions.py normalization to prevent drift. Used when determining
+# "emptiness" for agent_name (so punctuation-only names fall through to
+# agent_name_empty validation instead of triggering rename_pairing).
+AGENT_NAME_STRIP_CHARS = " `\"'""''。，,.;；:：!！?？"
+
+
+def stripped_agent_name(value) -> str:
+    """Normalize agent_name by stripping whitespace + punctuation.
+    Single source of truth for emptiness decision in both card_policy
+    (validation) and actions (normalization). Use for all "is this name empty?"
+    checks to prevent mismatches between validation and downstream handling."""
+    return str(value or "").strip(AGENT_NAME_STRIP_CHARS)
+
 
 def is_runtime_label(name: str) -> bool:
     return str(name or "").strip().lower() in RUNTIME_LABELS
@@ -152,10 +166,13 @@ def validate_rename_pairing(patch: dict) -> tuple[bool, str]:
     patch — a card whose name says one thing while the intro says another is
     self-contradictory. Free-text guessing was rejected (小满/小满满 false hits);
     the rule is unconditional pairing. Server-side: CLI/tool prompts only front-run
-    the error message."""
+    the error message.
+
+    Empty (whitespace + punctuation only) names are NOT considered renames —
+    they fall through to the existing agent_name_empty validation downstream."""
     if not isinstance(patch, dict):
         return (True, "")
-    name = str(patch.get("agent_name") or "").strip()
+    name = stripped_agent_name(patch.get("agent_name"))
     intro = str(patch.get("self_introduction") or "").strip()
     if name and not intro:
         return (False, "rename_requires_self_introduction")

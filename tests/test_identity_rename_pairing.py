@@ -22,3 +22,11 @@ def test_intro_only_ok():
 def test_empty_name_not_a_rename():
     ok, _ = card_policy.validate_rename_pairing({"agent_name": "  "})
     assert ok  # 空名交给既有 agent_name_empty 校验管,不归本规则
+
+
+def test_punctuation_only_name_not_a_rename():
+    # Backtick-only name is not considered a rename (falls through to
+    # agent_name_empty validation downstream). Validation must use the same
+    # punctuation strip set as actions.py normalization to prevent mismatch.
+    ok, _ = card_policy.validate_rename_pairing({"agent_name": "`"})
+    assert ok  # 纯标点名字也不归本规则,让下游 agent_name_empty 处理

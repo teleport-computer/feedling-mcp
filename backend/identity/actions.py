@@ -150,7 +150,7 @@ def _identity_profile_patch(
     audit_new = ""
 
     if "agent_name" in patch:
-        new_name = _identity_action_text(patch.get("agent_name"), 80).strip(" `\"'“”‘’。，,.;；:：!！?？")
+        new_name = card_policy.stripped_agent_name(_identity_action_text(patch.get("agent_name"), 80))
         if not new_name:
             return {"status": "error", "error": "agent_name_empty", "action": "identity.profile_patch"}, [], 400
         if new_name.lower() in identity_service._IDENTITY_RUNTIME_LABELS:
