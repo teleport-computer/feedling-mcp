@@ -818,12 +818,33 @@ def _consumer_commit() -> str:
         return ""
 
 
+# The commit identity of the CODE THIS PROCESS IS RUNNING, captured once at
+# import. Never re-derive identity from the checkout after startup: an operator
+# — or an agent following a maintenance prompt — can move HEAD underneath a
+# live process (Seven's VPS, 2026-07-22). A live re-read would then report a
+# commit we are not actually running, and worse, let the self-update equality
+# check believe "already on target" and never re-exec into the new code.
+_ENV_COMMIT = os.environ.get("FEEDLING_CONSUMER_COMMIT")
+RUNNING_COMMIT = _ENV_COMMIT if _ENV_COMMIT is not None else _consumer_commit()
+
+# Poll-only compatibility claim: when the updater deliberately skips a backend
+# target because the release changes nothing this consumer loads, it advertises
+# that target here so the backend knows the older running commit is a choice,
+# not a stall (suppresses stale-consumer maintenance while it matches).
+_compat_commit = {"value": ""}
+
+
+def _compat_commit_headers() -> dict:
+    value = str(_compat_commit.get("value") or "")
+    return {"X-Feedling-Consumer-Compat-Commit": value} if value else {}
+
+
 _HEADERS = {
     "X-API-Key": FEEDLING_API_KEY,
     "X-Feedling-Consumer": "feedling-chat-resident",
     "X-Feedling-Consumer-Id": CONSUMER_ID,
     "X-Feedling-Consumer-Version": "resident-v1",
-    "X-Feedling-Consumer-Commit": os.environ.get("FEEDLING_CONSUMER_COMMIT", _consumer_commit()),
+    "X-Feedling-Consumer-Commit": RUNNING_COMMIT,
 }
 
 
@@ -1106,13 +1127,19 @@ def _git_fetch(target: str) -> bool:
         return False
 
 
-def _git_changed_files(local: str, target: str) -> set[str]:
+def _git_changed_files(local: str, target: str) -> set[str] | None:
+    """Files changed between two commits, or None when the diff FAILED.
+
+    Failure must stay distinguishable from a successful empty diff: callers
+    sign a compatibility claim off "no relevant files changed", and an
+    unresolvable commit (bad env override, unfetched object) must read as
+    "cannot prove" — never as "proved nothing changed" (fail closed)."""
     try:
         r = _git("diff", "--name-only", local, target, "--", timeout=30)
     except Exception:
-        return set()
+        return None
     if r.returncode != 0:
-        return set()
+        return None
     return {ln.strip() for ln in r.stdout.splitlines() if ln.strip()}
 
 
@@ -1192,18 +1219,60 @@ def _run_self_update(target: str) -> None:
     now = time.monotonic()
     if now - _last_self_update_mono < _SELF_UPDATE_MIN_INTERVAL_SEC:
         return
-    local = _consumer_commit()
+    local = RUNNING_COMMIT  # identity of the running image, NEVER the checkout
     if not local or target.startswith(local) or local.startswith(target):
-        return  # unknown local, or already on the target commit
+        return  # unknown running identity, or already running the target
     _last_self_update_mono = now  # throttle the fetch/diff attempt below
+
+    disk = _consumer_commit()
+    if disk and (target.startswith(disk) or disk.startswith(target)):
+        # The checkout already sits at the target while this process still runs
+        # older code — someone updated the repo without restarting (the exact
+        # wedge from Seven's VPS: an agent followed a maintenance prompt,
+        # checked out the target, and its turn died before the restart step).
+        # Self-heal: no fetch/checkout needed; install changed requirements and
+        # re-exec into the code already on disk.
+        changed = _git_changed_files(local, target)
+        if changed is None:
+            log.warning(
+                "self-update: cannot diff running %s against on-disk target %s; "
+                "not signing compatibility and not re-execing", local, target,
+            )
+            return
+        if not _relevant_changed(changed):
+            _compat_commit["value"] = target
+            return  # nothing we load changed — running image is compatible
+        if _git_tree_dirty():
+            log.warning(
+                "self-update: checkout already at %s but tree is dirty; "
+                "not re-execing over uncommitted changes", target,
+            )
+            return
+        _compat_commit["value"] = ""
+        log.info(
+            "self-update: checkout already at %s; re-exec to replace stale "
+            "running image %s", target, local,
+        )
+        _apply_self_update(local, target, changed)
+        return
 
     if not _git_fetch(target):
         log.warning("self-update: could not fetch %s; will retry later", target)
         return
     changed = _git_changed_files(local, target)
+    if changed is None:
+        log.warning(
+            "self-update: cannot diff %s..%s after fetch; not signing "
+            "compatibility, will retry later", local, target,
+        )
+        return
     relevant = _relevant_changed(changed)
     if not relevant:
-        return  # backend release doesn't touch anything this consumer loads
+        # Deliberate skip — advertise compatibility so the backend does not
+        # count this running commit as a stalled consumer.
+        _compat_commit["value"] = target
+        return
+    _compat_commit["value"] = ""
     dirty = _git_tree_dirty()
     if not _should_self_update(local, target, dirty, AUTO_UPDATE, _HOSTED, relevant):
         if dirty:
@@ -6322,7 +6391,7 @@ def poll_chat(since: float, timeout: int | None = None, claim: bool = True) -> d
         params["claim"] = "false"
     # Ship the decrypt-source health so the backend gate/alert can tell a
     # live-but-undecrypting resident from a healthy one (see _decrypt_health).
-    headers = {**_HEADERS, **_decrypt_health_headers()}
+    headers = {**_HEADERS, **_decrypt_health_headers(), **_compat_commit_headers()}
     resp = _HTTP.get(url, params=params, headers=headers, timeout=poll_to + 10)
     resp.raise_for_status()
     body = resp.json()

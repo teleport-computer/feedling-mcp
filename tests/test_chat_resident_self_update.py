@@ -144,7 +144,12 @@ def update_seams(monkeypatch):
     monkeypatch.setattr(crc, "AUTO_UPDATE", True)
     monkeypatch.setattr(crc, "_HOSTED", False)
     monkeypatch.setattr(crc, "_last_self_update_mono", 0.0)
+    # Identity of the running image (import-time constant) and the checkout on
+    # disk are DIFFERENT seams since the Seven-VPS wedge fix; default them to
+    # the same value (normal steady state: nothing moved HEAD underneath us).
+    monkeypatch.setattr(crc, "RUNNING_COMMIT", "local00")
     monkeypatch.setattr(crc, "_consumer_commit", lambda: "local00")
+    monkeypatch.setitem(crc._compat_commit, "value", "")
     monkeypatch.setattr(crc, "_git_fetch", lambda target: True)
     monkeypatch.setattr(crc, "_git_tree_dirty", lambda: False)
     # Pin the dependency set deterministically — the real one depends on what
@@ -193,6 +198,97 @@ def test_run_self_update_skips_when_hosted(update_seams, monkeypatch):
     monkeypatch.setattr(crc, "_HOSTED", True)
     crc._run_self_update("target99")
     assert update_seams == []
+
+
+def test_external_checkout_self_heals_with_reexec_and_no_fetch(update_seams, monkeypatch):
+    # The Seven-VPS wedge (2026-07-22): an agent followed a maintenance prompt
+    # and checked out the target, but its turn died before restarting the
+    # process. The running image must notice "disk already at target" and
+    # re-exec — with NO network fetch — instead of treating live git HEAD as
+    # its own identity and disarming forever.
+    fetched = []
+    monkeypatch.setattr(crc, "_git_fetch", lambda target: fetched.append(target) or True)
+    monkeypatch.setattr(crc, "_consumer_commit", lambda: "target99")  # disk moved
+    crc._run_self_update("target99")
+    assert update_seams == ["target99"]
+    assert fetched == []  # object already local; no fetch needed
+
+
+def test_external_checkout_with_irrelevant_diff_sets_compat_no_reexec(update_seams, monkeypatch):
+    monkeypatch.setattr(crc, "_consumer_commit", lambda: "target99")
+    monkeypatch.setattr(crc, "_git_changed_files", lambda local, target: {"docs/CHANGELOG.md"})
+    crc._run_self_update("target99")
+    assert update_seams == []
+    assert crc._compat_commit["value"] == "target99"
+
+
+def test_external_checkout_dirty_tree_blocks_reexec(update_seams, monkeypatch):
+    # Force-detaching over uncommitted edits would destroy them; refuse.
+    monkeypatch.setattr(crc, "_consumer_commit", lambda: "target99")
+    monkeypatch.setattr(crc, "_git_tree_dirty", lambda: True)
+    crc._run_self_update("target99")
+    assert update_seams == []
+
+
+def test_irrelevant_release_advertises_compat_commit(update_seams, monkeypatch):
+    # Deliberate skip → compat claim set so the backend does not count the
+    # older running commit as a stalled consumer; a later relevant target
+    # clears the claim before applying.
+    monkeypatch.setattr(crc, "_git_changed_files", lambda local, target: {"docs/CHANGELOG.md"})
+    crc._run_self_update("target99")
+    assert update_seams == []
+    assert crc._compat_commit["value"] == "target99"
+    assert crc._compat_commit_headers() == {
+        "X-Feedling-Consumer-Compat-Commit": "target99"
+    }
+
+    monkeypatch.setattr(crc, "_last_self_update_mono", 0.0)
+    monkeypatch.setattr(crc, "_git_changed_files", lambda local, target: {"tools/io_cli.py"})
+    crc._run_self_update("target100")
+    assert update_seams == ["target100"]
+    assert crc._compat_commit["value"] == ""
+    assert crc._compat_commit_headers() == {}
+
+
+def test_diff_failure_on_fetch_path_never_signs_compat(update_seams, monkeypatch):
+    # A failed diff means "cannot prove", not "proved nothing changed" —
+    # signing compat off it would let a bad RUNNING_COMMIT (e.g. env override
+    # naming an unresolvable object) permanently suppress backend mismatch.
+    crc._compat_commit["value"] = "stale-old-claim"
+    monkeypatch.setattr(crc, "_git_changed_files", lambda local, target: None)
+    crc._run_self_update("target99")
+    assert update_seams == []
+    assert crc._compat_commit["value"] == "stale-old-claim"  # untouched, not target99
+
+
+def test_diff_failure_on_selfheal_path_never_signs_compat(update_seams, monkeypatch):
+    crc._compat_commit["value"] = ""
+    monkeypatch.setattr(crc, "_consumer_commit", lambda: "target99")  # disk at target
+    monkeypatch.setattr(crc, "_git_changed_files", lambda local, target: None)
+    crc._run_self_update("target99")
+    assert update_seams == []  # no re-exec on unprovable diff
+    assert crc._compat_commit["value"] == ""
+
+
+def test_git_changed_files_distinguishes_failure_from_empty(monkeypatch):
+    class _R:
+        def __init__(self, rc, out=""):
+            self.returncode, self.stdout = rc, out
+    monkeypatch.setattr(crc, "_git", lambda *a, **k: _R(128))
+    assert crc._git_changed_files("a", "b") is None
+    monkeypatch.setattr(crc, "_git", lambda *a, **k: _R(0, ""))
+    assert crc._git_changed_files("a", "b") == set()
+
+    def _boom(*a, **k):
+        raise RuntimeError("git gone")
+    monkeypatch.setattr(crc, "_git", _boom)
+    assert crc._git_changed_files("a", "b") is None
+
+
+def test_headers_report_running_commit_not_live_checkout():
+    # _HEADERS is frozen at import from RUNNING_COMMIT; a checkout moving under
+    # the process must not change what identity we report.
+    assert crc._HEADERS["X-Feedling-Consumer-Commit"] == crc.RUNNING_COMMIT
 
 
 def test_run_self_update_throttles_repeated_attempts(update_seams):
