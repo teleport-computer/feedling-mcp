@@ -37,6 +37,16 @@ class ListOpBlank(Exception):
     new op keys."""
 
 
+class ListOpTooManyItems(Exception):
+    """Raised when an add_* op's merged result (existing items + deduped
+    additions) would exceed the 12-item cap. Explicit reject, NOT silent
+    truncation — unlike the legacy direct-list-assign / replace_* paths
+    (which already cap via `_clean_list_items`'s `raw[:12]`, a pre-existing
+    behavior kept for back-compat), add_* is a brand-new op key with no
+    compat concern, so a request that would blow the cap is rejected outright
+    rather than silently dropping whichever items didn't fit."""
+
+
 # field -> (add_key, remove_key, replace_key). Drives apply_list_ops below so
 # the four list fields (signature/boundaries/do_not_say/stable_definitions)
 # share one merge code path instead of four hand-copied ones — only this
@@ -115,6 +125,9 @@ def apply_list_ops(existing: dict, patch: dict) -> dict:
     Raises ListOpConflict / ListOpBlank via ``validate_list_ops_shape`` (see
     there for exact conditions) — called first, so this function is fully
     self-validating even when called without the earlier fail-fast check.
+    Also raises ListOpTooManyItems for add_* if existing + deduped additions
+    would exceed the 12-item cap (this one genuinely needs ``existing``, so
+    it can't move into the existing-independent pre-check).
     """
     if not isinstance(existing, dict):
         existing = {}
@@ -153,6 +166,8 @@ def apply_list_ops(existing: dict, patch: dict) -> dict:
             for item in additions:
                 if item not in merged:
                     merged.append(item)
+            if len(merged) > 12:
+                raise ListOpTooManyItems(field)
             result[field] = merged
             continue
 
@@ -253,10 +268,59 @@ def _save_identity_action_payload(
     }
     if envelope.get("K_enclave"):
         identity["K_enclave"] = envelope["K_enclave"]
-    identity_service._save_identity(store, identity)
+    # CAS, not a plain overwrite: `existing` is the EXACT blob this payload was
+    # merged from. gunicorn runs multiple worker processes (see deploy/
+    # docker-compose.yaml); identity_mutation_lock is a process-local
+    # threading.Lock, so it cannot stop a DIFFERENT worker process (handling
+    # the same user) from writing between our read and our write. A plain
+    # `identity_service._save_identity` here would silently clobber that
+    # worker's change (lost update) instead of detecting it. Audit / effect /
+    # TEE-requeue side effects below only run once this CAS has actually won.
+    if not identity_service._save_identity_cas(store, existing, identity):
+        raise identity_service.IdentityWriteConflict()
     boot_gates._log_bootstrap_event(store, event_type, success=True)
     change = identity_service._append_identity_change(store, audit)
     return identity, change, ""
+
+
+# Bounded retry count for identity_mutation_lock's CAS-conflict recovery
+# (see _with_identity_mutation_lock_and_retry). 3 is generous for two
+# gunicorn workers racing on the same user — a losing worker's retry re-reads
+# the row the winner just committed, so a 3rd collision would need a THIRD
+# concurrent writer to also land in that same narrow window.
+_IDENTITY_WRITE_MAX_ATTEMPTS = 3
+
+
+def _with_identity_mutation_lock_and_retry(
+    store: UserStore, action_name: str, work,
+) -> tuple[dict, list[dict], int]:
+    """Run `work()` — a zero-arg closure doing the full
+    read-existing-card -> merge -> re-encrypt -> CAS-write span — under the
+    per-user identity_mutation_lock, retrying the WHOLE span from a fresh
+    read if identity_service._save_identity_cas loses the DB-level
+    compare-and-swap to a concurrent writer.
+
+    The in-process lock (identity_mutation_lock) alone only serializes
+    writers within THIS worker process; it does nothing for two different
+    gunicorn worker processes writing the same user's card (each has its own
+    independent Lock instance — see identity/service.py). The CAS write is
+    what actually detects that race; this loop is what turns a detected race
+    into a successful retry instead of a client-visible failure, up to
+    _IDENTITY_WRITE_MAX_ATTEMPTS attempts. Exhausting all attempts (sustained
+    contention from 3+ concurrent writers on one user) surfaces as a 409
+    `identity_write_conflict` — same shape as this file's other conflict/
+    error responses, so callers can already handle it."""
+    with identity_service.identity_mutation_lock(store.user_id):
+        for attempt in range(_IDENTITY_WRITE_MAX_ATTEMPTS):
+            try:
+                return work()
+            except identity_service.IdentityWriteConflict:
+                if attempt == _IDENTITY_WRITE_MAX_ATTEMPTS - 1:
+                    return {"status": "error", "error": "identity_write_conflict",
+                            "action": action_name}, [], 409
+    # Unreachable (the loop above always returns), but keeps this an
+    # explicit tuple-returning function for anything that inspects it.
+    return {"status": "error", "error": "identity_write_conflict", "action": action_name}, [], 409
 
 
 def _identity_profile_patch(
@@ -378,6 +442,9 @@ def _identity_profile_patch(
         except ListOpBlank as exc:
             return {"status": "error", "error": "list_op_blank", "field": str(exc),
                     "action": "identity.profile_patch"}, [], 400
+        except ListOpTooManyItems as exc:
+            return {"status": "error", "error": "list_op_too_many_items", "field": str(exc),
+                    "action": "identity.profile_patch"}, [], 400
 
         for key, values in list_updates.items():
             old_values = payload.get(key) if isinstance(payload.get(key), list) else []
@@ -437,8 +504,7 @@ def _identity_profile_patch(
             "change": change or {},
         }, [effect], 200
 
-    with identity_service.identity_mutation_lock(store.user_id):
-        return _read_merge_save()
+    return _with_identity_mutation_lock_and_retry(store, "identity.profile_patch", _read_merge_save)
 
 
 def _identity_dimension_nudge(
@@ -537,8 +603,7 @@ def _identity_dimension_nudge(
             "change": change or {},
         }, [effect], 200
 
-    with identity_service.identity_mutation_lock(store.user_id):
-        return _read_merge_save()
+    return _with_identity_mutation_lock_and_retry(store, "identity.dimension_nudge", _read_merge_save)
 
 
 def _identity_relationship_days_set(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:

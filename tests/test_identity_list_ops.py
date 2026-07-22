@@ -1,12 +1,16 @@
 """Pure-unit tests for explicit list-field ops (add/remove/replace) + the
-per-user identity mutation lock that closes the lost-update window across
-concurrent identity.profile_patch calls.
+per-user identity mutation lock / cross-worker CAS that close the
+lost-update window across concurrent identity.profile_patch /
+identity.dimension_nudge calls.
 
-`apply_list_ops` tests are pure functions (no DB). The concurrency test
-drives the real `_identity_profile_patch` path but stays DB-free by
-monkeypatching every db.* call site it touches (get_blob/set_blob/log_append)
-plus the enclave decrypt / envelope-build boundary — see its docstring for
-why each patch point is necessary.
+Fully DB-free: no real `core.store.UserStore` is ever constructed (Codex
+review I8 — a real UserStore's __init__ eagerly touches db.chat_load /
+frame_list_meta / world_book_load / etc, which is exactly the kind of DB
+dependency a file whitelisted as pure-unit (tests/conftest.py's
+_PURE_UNIT) must never have). Instead every db.* call site the code under
+test touches (get_blob/set_blob/set_blob_if_unchanged/log_append) is
+monkeypatched onto an in-memory dict, plus the enclave decrypt /
+envelope-build boundary — see `_FakeStore` and `_fake_db_blob_layer` below.
 """
 from __future__ import annotations
 
@@ -22,8 +26,46 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
-from core.store import UserStore  # noqa: E402
 from identity import actions as identity_actions  # noqa: E402
+from identity import service as identity_service  # noqa: E402
+
+
+class _FakeStore:
+    """Minimal test double exposing only `user_id` — the sole attribute the
+    profile_patch/dimension_nudge code path touches (identity_mutation_lock
+    is keyed by the plain string user_id, not the store object; every real
+    `store.xxx` call in that path is `store.user_id`). See module docstring
+    for why this exists instead of a real `core.store.UserStore`."""
+
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+
+
+def _fake_db_blob_layer(monkeypatch, blobs: dict[tuple[str, str], dict]) -> None:
+    """Patch the exact db.* functions the profile_patch/dimension_nudge path
+    touches onto an in-memory `blobs` dict — including a CAS-faithful
+    `set_blob_if_unchanged` (plain equality compare on the stored doc,
+    mirroring the real `UPDATE ... WHERE doc = expected` semantics)."""
+
+    def fake_get_blob(uid, kind):
+        return blobs.get((uid, kind))
+
+    def fake_set_blob(uid, kind, doc):
+        blobs[(uid, kind)] = doc
+
+    def fake_set_blob_if_unchanged(uid, kind, expected_doc, new_doc, *, insert_if_missing=False):
+        if blobs.get((uid, kind)) != expected_doc:
+            return False
+        blobs[(uid, kind)] = new_doc
+        return True
+
+    def fake_log_append(uid, stream, doc):
+        return None
+
+    monkeypatch.setattr(db, "get_blob", fake_get_blob)
+    monkeypatch.setattr(db, "set_blob", fake_set_blob)
+    monkeypatch.setattr(db, "set_blob_if_unchanged", fake_set_blob_if_unchanged)
+    monkeypatch.setattr(db, "log_append", fake_log_append)
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +151,62 @@ def test_untouched_field_is_omitted_from_result():
 
 
 # ---------------------------------------------------------------------------
+# I7: add_* must not silently blow past the 12-item cap (12 existing + 12
+# added = 24 stored was the bug; legacy/replace already truncate via
+# _clean_list_items's raw[:12], but add_* didn't check the MERGED total).
+#
+# NOTE ON FILE PLACEMENT: these were originally requested in
+# tests/test_identity_nudge_cap.py, but that file already exists for an
+# unrelated, pre-existing feature (the dimension-NUDGE delta *sum* cap,
+# |Δsum| <= 10 — see identity/card_policy.validate_nudge_sum). Overwriting it
+# would have destroyed that coverage, so these live here instead, alongside
+# the rest of apply_list_ops' pure-function tests. See task report.
+# ---------------------------------------------------------------------------
+
+def test_add_signature_rejects_when_merged_exceeds_cap():
+    # 12 existing (full) + 1 genuinely new addition = 13 -> rejected, not
+    # silently truncated back down to 12.
+    existing = {"signature": [f"s{i}" for i in range(12)]}
+    with pytest.raises(identity_actions.ListOpTooManyItems):
+        identity_actions.apply_list_ops(existing, {"add_signature": ["one-more"]})
+
+
+def test_add_signature_dedup_landing_exactly_at_cap_passes():
+    # 11 existing + ["s0" (dup, no net growth), "s12" (new)] -> 12 total,
+    # exactly at the cap. Must NOT be rejected — the cap is on the MERGED
+    # result, and a dedup hit contributes zero net growth.
+    existing = {"signature": [f"s{i}" for i in range(11)]}
+    merged = identity_actions.apply_list_ops(existing, {"add_signature": ["s0", "s12"]})
+    assert len(merged["signature"]) == 12
+    assert merged["signature"][-1] == "s12"
+
+
+def test_add_signature_13th_item_rejected():
+    # 11 existing + 2 genuinely new (no dedup hits) = 13 -> rejected.
+    existing = {"signature": [f"s{i}" for i in range(11)]}
+    with pytest.raises(identity_actions.ListOpTooManyItems):
+        identity_actions.apply_list_ops(existing, {"add_signature": ["new1", "new2"]})
+
+
+def test_add_boundaries_also_enforces_cap():
+    # Same _LIST_OP_FIELDS-driven code path — not a signature-only special case.
+    existing = {"boundaries": [f"b{i}" for i in range(12)]}
+    with pytest.raises(identity_actions.ListOpTooManyItems):
+        identity_actions.apply_list_ops(existing, {"add_boundaries": ["one-more"]})
+
+
+def test_replace_and_legacy_paths_still_silently_truncate_not_reject():
+    # Unchanged pre-existing behavior for legacy/replace (back-compat: no new
+    # ListOpTooManyItems here — _clean_list_items truncates via raw[:12]).
+    oversized = [f"x{i}" for i in range(20)]
+    merged = identity_actions.apply_list_ops({"signature": []}, {"replace_signatures": oversized})
+    assert len(merged["signature"]) == 12
+
+    merged = identity_actions.apply_list_ops({"signature": []}, {"signature": oversized})
+    assert len(merged["signature"]) == 12
+
+
+# ---------------------------------------------------------------------------
 # Step 4: concurrent add_signature must not lost-update each other.
 # ---------------------------------------------------------------------------
 
@@ -125,27 +223,14 @@ def test_concurrent_add_signature_no_lost_update(monkeypatch):
     }}
     state_lock = threading.Lock()
     blobs: dict[tuple[str, str], dict] = {
-        (user_id, "identity"): {"id": "identity_1", "relationship_started_at": "2026-04-01"},
+        (user_id, "identity"): {
+            "id": "identity_1", "relationship_started_at": "2026-04-01",
+            "relationship_anchor_source": "test",
+        },
     }
+    _fake_db_blob_layer(monkeypatch, blobs)
 
-    def fake_get_blob(uid, kind):
-        return blobs.get((uid, kind))
-
-    def fake_set_blob(uid, kind, doc):
-        blobs[(uid, kind)] = doc
-
-    def fake_log_append(uid, stream, doc):
-        return None
-
-    # Patch db.* BEFORE constructing UserStore: its __init__ eagerly loads/
-    # persists tokens/frames_meta/etc against the real db module, and we want
-    # this test fully DB-free rather than tripping FK errors against a real
-    # (unregistered) user_id.
-    monkeypatch.setattr(db, "get_blob", fake_get_blob)
-    monkeypatch.setattr(db, "set_blob", fake_set_blob)
-    monkeypatch.setattr(db, "log_append", fake_log_append)
-
-    store = UserStore(user_id)
+    store = _FakeStore(user_id)
 
     def fake_enclave_get(path, key, params=None, runtime_token=""):
         if path != "/v1/identity/get":
@@ -213,23 +298,14 @@ def test_concurrent_profile_patch_and_dimension_nudge_no_lost_update(monkeypatch
     }}
     state_lock = threading.Lock()
     blobs: dict[tuple[str, str], dict] = {
-        (user_id, "identity"): {"id": "identity_1", "relationship_started_at": "2026-04-01"},
+        (user_id, "identity"): {
+            "id": "identity_1", "relationship_started_at": "2026-04-01",
+            "relationship_anchor_source": "test",
+        },
     }
+    _fake_db_blob_layer(monkeypatch, blobs)
 
-    def fake_get_blob(uid, kind):
-        return blobs.get((uid, kind))
-
-    def fake_set_blob(uid, kind, doc):
-        blobs[(uid, kind)] = doc
-
-    def fake_log_append(uid, stream, doc):
-        return None
-
-    monkeypatch.setattr(db, "get_blob", fake_get_blob)
-    monkeypatch.setattr(db, "set_blob", fake_set_blob)
-    monkeypatch.setattr(db, "log_append", fake_log_append)
-
-    store = UserStore(user_id)
+    store = _FakeStore(user_id)
 
     def fake_enclave_get(path, key, params=None, runtime_token=""):
         if path != "/v1/identity/get":
@@ -287,3 +363,106 @@ def test_concurrent_profile_patch_and_dimension_nudge_no_lost_update(monkeypatch
     assert set(final_card["signature"]) == {"seed", "sig-A"}
     dims_by_name = {d["name"]: d["value"] for d in final_card["dimensions"]}
     assert dims_by_name["锐利"] == 60
+
+
+# ---------------------------------------------------------------------------
+# C1: per-process lock is not enough across gunicorn worker PROCESSES — the
+# DB-level CAS (identity_service._save_identity_cas / db.set_blob_if_unchanged)
+# is what actually survives that race, via bounded retry in
+# identity_actions._with_identity_mutation_lock_and_retry.
+# ---------------------------------------------------------------------------
+
+def test_cross_worker_cas_retry_survives_concurrent_write(monkeypatch):
+    """Simulates 2 independent gunicorn worker PROCESSES writing the SAME
+    user's identity card. identity_mutation_lock is a plain process-local
+    threading.Lock (see identity/service.py) — in real deployment, two
+    workers each have their OWN independent lock instance, so worker A's
+    lock provides ZERO protection against worker B's write. This test does
+    NOT rely on the lock to serialize the two writes: it injects worker B's
+    complete, independent write directly into the shared fake blob table, at
+    the exact point between worker A's raw-blob CAS-expected read and A's
+    own CAS attempt — proving the DB-level CAS + retry survives that race
+    even though (unlike the two tests above) nothing here serializes the two
+    writers up front."""
+    user_id = "u_cross_worker_cas_test"
+    blobs: dict[tuple[str, str], dict] = {
+        (user_id, "identity"): {
+            "id": "identity_1", "relationship_started_at": "2026-04-01",
+            "relationship_anchor_source": "test",
+        },
+    }
+    _fake_db_blob_layer(monkeypatch, blobs)
+
+    store_a = _FakeStore(user_id)  # "worker process A" — the one under test
+    store_b = _FakeStore(user_id)  # "worker process B" — same user, a totally
+    # independent process in reality; here it just means "a write not driven
+    # through A's call, so A's identity_mutation_lock never touches it."
+
+    plain_card = {
+        "agent_name": "bro", "self_introduction": "keeping it real",
+        "signature": ["seed"],
+    }
+    enclave_reads = {"n": 0}
+    build_calls = {"n": 0}
+
+    def fake_enclave_get(path, key, params=None, runtime_token=""):
+        if path != "/v1/identity/get":
+            return {}, ""
+        enclave_reads["n"] += 1
+        return {"identity": {**plain_card, "decrypt_status": "ok"}}, ""
+
+    def fake_build_envelope(store_arg, plaintext, item_id=None):
+        build_calls["n"] += 1
+        if build_calls["n"] == 1:
+            # Worker B's independent write lands HERE — after A has already
+            # captured `existing` (the raw blob) for its own CAS, but before
+            # A's CAS attempt runs. This is exactly the window a process-
+            # local lock on A's process cannot close. A's OWN attempt-1
+            # payload (built from the now-stale pre-B read) is about to lose
+            # its CAS below, so it must NOT be mirrored into plain_card —
+            # only a write that actually lands should change what the
+            # enclave subsequently reports.
+            ok = identity_service._save_identity_cas(
+                store_b,
+                blobs[(user_id, "identity")],
+                {
+                    **blobs[(user_id, "identity")],
+                    "body_ct": "ct_from_worker_b", "nonce": "n_b", "K_user": "k_b",
+                    "visibility": "shared", "owner_user_id": user_id,
+                    "updated_at": "2026-04-01T00:00:01",
+                },
+            )
+            assert ok, "worker B's independent write should land cleanly (nothing raced it)"
+            plain_card["signature"] = ["seed", "sig-from-B"]
+        else:
+            # This attempt's CAS is expected to win (nothing else races A
+            # past attempt 1 in this test) — mirror its payload into
+            # plain_card, same as a real re-encryption would after landing.
+            payload = json.loads(plaintext.decode("utf-8"))
+            plain_card.clear()
+            plain_card.update(payload)
+
+        return {
+            "id": item_id or "identity_1",
+            "body_ct": f"ct_from_worker_a_{build_calls['n']}", "nonce": "n_a", "K_user": "k_a",
+            "K_enclave": "ke", "visibility": "shared",
+            "owner_user_id": user_id, "enclave_pk_fpr": "test",
+        }, ""
+
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_get)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", fake_build_envelope)
+
+    result, effects, status = identity_actions._identity_profile_patch(
+        store_a, "test-key",
+        {"type": "identity.profile_patch", "patch": {"add_signature": ["sig-from-A"]}},
+    )
+
+    assert status == 200, result
+    # One enclave read + one envelope build per attempt: attempt 1 loses the
+    # CAS (worker B moved the row underneath it), attempt 2 re-reads (now
+    # sees B's plaintext change too) and wins. Exactly 2 of each confirms the
+    # retry path actually ran, not that it coincidentally succeeded first try.
+    assert enclave_reads["n"] == 2, "expected exactly one retry after the CAS conflict"
+    assert build_calls["n"] == 2
+    assert set(plain_card["signature"]) == {"seed", "sig-from-B", "sig-from-A"}
+    assert blobs[(user_id, "identity")]["body_ct"] == "ct_from_worker_a_2"
