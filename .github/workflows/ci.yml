@@ -258,30 +258,31 @@ jobs:
         run: docker compose -f deploy/docker-compose.yaml -f deploy/docker-compose.ci.yml down -v
 
   # -------------------------------------------------------------------------
-  # Docker — the pooled worker image, which docker-build above never touches
+  # Docker — the serve-worker's extra deps in the MAIN image
   #
-  # `docker compose build` only builds deploy/docker-compose.yaml, and that
-  # compose has exactly one service: backend. The worker image was therefore
-  # never built in CI, so a dependency change could go green here and fail at
-  # deploy time on the image that actually executes the tool loop. It also runs
-  # a different interpreter (3.11 vs the backend's 3.12), which is precisely the
-  # kind of difference a build-time gate exists to catch.
+  # web_fetch article extraction (trafilatura) runs in the V2 serve-worker,
+  # which shares the main image (deploy/Dockerfile). docker-build above compiles
+  # that image via `docker compose build`, so --require-hashes already gates
+  # "does it install". This job additionally proves the C extension actually
+  # imports under the image's own 3.12 interpreter — install-but-fail-to-import
+  # is a real lxml failure mode a build-only gate misses. The V1 agent-runner
+  # image intentionally does NOT carry trafilatura and is not checked here.
   # -------------------------------------------------------------------------
-  docker-build-runner:
-    name: docker build (pooled worker image)
+  docker-build-worker-deps:
+    name: docker build (serve-worker deps in main image)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build worker image (no cache, --require-hashes enforced)
+      - name: Build main image (no cache, --require-hashes enforced)
         run: |
           docker build --no-cache \
-            -f deploy/Dockerfile.agent-runner \
-            -t feedling-agent-runner:ci .
+            -f deploy/Dockerfile \
+            -t feedling-main:ci .
 
-      - name: Worker-only deps import under the worker's own interpreter
+      - name: trafilatura imports under the serve-worker interpreter (3.12)
         run: |
-          docker run --rm feedling-agent-runner:ci python -c "
+          docker run --rm feedling-main:ci python -c "
           import sys, trafilatura
           print('python', sys.version.split()[0], '| trafilatura', trafilatura.__version__)
           assert trafilatura.extract('<html><body><article><p>hello world</p></article></body></html>')
@@ -840,7 +841,7 @@ jobs:
   # =========================================================================
   deploy-cvm:
     name: deploy CVM
-    needs: [forge-test, python-tests, docker-build, docker-build-runner, lint, dcap-python, detect-cvm-changes, validate-prod-runner-topology]
+    needs: [forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes, validate-prod-runner-topology]
     if: |
       github.ref == 'refs/heads/main' &&
       github.event_name == 'push' &&
@@ -1142,7 +1143,7 @@ jobs:
 
   deploy-test-cvm:
     name: deploy CVM (test)
-    needs: [forge-test, python-tests, docker-build, docker-build-runner, lint, dcap-python, detect-cvm-changes-test, validate-test-runtime-prerequisites]
+    needs: [forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes-test, validate-test-runtime-prerequisites]
     if: |
       github.ref == 'refs/heads/test' &&
       github.event_name == 'push' &&
@@ -1493,7 +1494,7 @@ jobs:
 
   deploy-pre-cvm:
     name: deploy CVM (pre)
-    needs: [forge-test, python-tests, docker-build, docker-build-runner, lint, dcap-python, detect-cvm-changes-pre, validate-pre-runtime-prerequisites]
+    needs: [forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes-pre, validate-pre-runtime-prerequisites]
     if: |
       github.ref == 'refs/heads/pre' &&
       github.event_name == 'push' &&

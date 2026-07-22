@@ -318,6 +318,10 @@ services:
       FEEDLING_GENESIS_WORKER_ENABLED: "1"
       FEEDLING_V2_SANDBOX_PROVIDER: "disabled"
       FEEDLING_V2_IMAGE_MAX_B64_CHARS: "2700000"
+      # web_fetch article extraction (trafilatura, runs in this serve-worker).
+      # Default ON — a rollback lever, not a feature gate. Set to "0" to fall back
+      # to the plain tag-strip; takes effect on the next serve-worker restart.
+      FEEDLING_WEB_EXTRACT_ARTICLE: "${FEEDLING_WEB_EXTRACT_ARTICLE:-1}"
       FEEDLING_HOSTED_RUNTIME_POLICY: "dual"
       FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
     depends_on:

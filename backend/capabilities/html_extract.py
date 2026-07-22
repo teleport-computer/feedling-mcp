@@ -16,10 +16,11 @@ Two things are deliberate and load-bearing:
 
 - **The extractor runs in a child process.** See ``html_extract_child`` for why
   a thread is not good enough.
-- **The dependency is optional.** trafilatura ships only in the worker image
-  (``requirements-runner.lock``); the backend and the decrypt enclave do not
-  have it. A missing dependency is an ordinary "no article" answer here, never
-  an import error at startup.
+- **The dependency is optional.** trafilatura ships in the main image
+  (``requirements-v2-worker.lock``), which the V2 serve-worker runs from; the V1
+  agent-runner image does not install it, and a local or unpinned environment may
+  not have it either. A missing dependency is an ordinary "no article" answer
+  here, never an import error at startup.
 """
 
 from __future__ import annotations
