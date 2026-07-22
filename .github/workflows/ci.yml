@@ -1022,7 +1022,11 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
-            -e "FEEDLING_ENCLAVE_WORKERS=$FEEDLING_ENCLAVE_WORKERS"
+            -e "FEEDLING_ENCLAVE_WORKERS=$FEEDLING_ENCLAVE_WORKERS" \
+            -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
+            -e "FEEDLING_V2_DEPLOYED_BUILD=${GITHUB_SHA:0:7}"
+          # serve-worker now rides the main CVM: fleet identity (runner_identity.py)
+          # requires CVM id + the 7-char build sha matching the baked image commit.
           # NOT --wait: the CLI's readiness wait is hard-capped at 300s and the
           # main CVM image pull + backend/enclave boot regularly exceeds it. Poll
           # with our own configurable deadline instead (deploy/wait-cvm-ready.sh).
@@ -1238,7 +1242,11 @@ jobs:
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
-            -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS"
+            -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
+            -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
+            -e "FEEDLING_V2_DEPLOYED_BUILD=${GITHUB_SHA:0:7}"
+          # serve-worker now rides the main CVM: fleet identity (runner_identity.py)
+          # requires CVM id + the 7-char build sha matching the baked image commit.
           # NOT --wait: the CLI's readiness wait is hard-capped at 300s and the
           # main CVM image pull + backend/enclave boot regularly exceeds it. Poll
           # with our own configurable deadline instead (deploy/wait-cvm-ready.sh).
@@ -1577,6 +1585,8 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
+            -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
+            -e "FEEDLING_V2_DEPLOYED_BUILD=${GITHUB_SHA:0:7}" \
             --wait
 
       - name: Publish live compose_hash on Sepolia (pre contract)
