@@ -669,7 +669,7 @@ def _write_back_plaintext_user_name(store, api_key: str | None, user_name: str) 
     payload = dict(existing)
     payload["user_preferred_name"] = name
     try:
-        return service.replace_identity_preserving_anchor(store, {"identity": payload})
+        return service.replace_identity_preserving_anchor(store, {"identity": payload}, api_key)
     except Exception:
         return "write_failed"
 
@@ -1298,7 +1298,7 @@ def _run_plaintext_update_identity_job(
         service.mark_failed(store, job_id, f"persona_rebuild_failed:{type(e).__name__}:{str(e)[:160]}")
         return
     status = service.replace_identity_preserving_anchor(
-        store, {"identity": identity_payload, "relationship_anchor": relationship_anchor or {}}
+        store, {"identity": identity_payload, "relationship_anchor": relationship_anchor or {}}, api_key
     )
     if status not in {"initialized", "updated"}:
         service.mark_failed(store, job_id, status)

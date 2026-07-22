@@ -804,20 +804,25 @@ def _identity_replace_action(
     if not identity_service._load_identity(store):
         return {"status": "error", "error": "identity_not_initialized",
                 "action": "identity.replace"}, [], 409
-    # KNOWN RESIDUAL (not fixed here — spec §9 territory): replace_identity_preserving_anchor
-    # writes via the plain (non-CAS) identity_service._save_identity, and this whole action
-    # runs outside identity_mutation_lock. The base_identity_replaced_at check above is a
-    # coarser, replace-vs-replace optimistic-concurrency guard (P5) — it does NOT protect
-    # against a concurrent profile_patch/dimension_nudge CAS win landing between this
-    # function's own reads and its write, which this replace's full-card overwrite would
-    # then silently clobber. Acceptable for now: replace is gated to the resident-distill
-    # job path only (HIGH-RISK docstring above), not a normal concurrent-write hot path.
+    # T12 (spec 3.6 / D5): replace_identity_preserving_anchor now reads the LATEST
+    # decrypted card at write time and key-level merges the distilled payload onto
+    # it under identity_mutation_lock + a CAS retry loop — the base_identity_replaced_at
+    # check above stays as the coarser replace-vs-replace guard (P5), but it is no
+    # longer the only concurrency protection: a profile_patch/dimension_nudge landing
+    # between this function's reads and its write can no longer be silently clobbered
+    # (closes the KNOWN RESIDUAL this comment used to document).
     from genesis import service as genesis_service  # lazy — avoid import cycle
     result = genesis_service.replace_identity_preserving_anchor(
-        store, {"identity": identity_payload, "relationship_anchor": _replace_relationship_anchor(action)}
+        store,
+        {"identity": identity_payload, "relationship_anchor": _replace_relationship_anchor(action)},
+        api_key,
+        runtime_token=runtime_token,
     )
     if result != "updated":
-        status = 409 if result in ("identity_not_initialized", "identity_update_empty", "not_provided") else 400
+        status = 409 if result in (
+            "identity_not_initialized", "identity_update_empty", "not_provided",
+            "identity_plain_unavailable", "identity_write_conflict",
+        ) else 400
         return {"status": "error", "error": result, "action": "identity.replace"}, [], status
     return {"status": "ok", "action": "identity.replace", "job_id": job_id}, [], 200
 

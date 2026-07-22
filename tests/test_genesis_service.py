@@ -613,6 +613,19 @@ def test_replace_identity_preserving_anchor_replaces_body_only(monkeypatch):
     }
 
     monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: existing)
+    monkeypatch.setattr(
+        service.core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda _path, _api_key, **_kwargs: (
+            {"identity": {
+                "agent_name": "旧名",
+                "self_introduction": "旧介绍",
+                "signature": ["旧签名"],
+                "decrypt_status": "ok",
+            }},
+            "",
+        ),
+    )
 
     def fake_envelope(_store, plaintext, item_id=None):
         captured["plaintext"] = json.loads(plaintext.decode("utf-8"))
@@ -631,8 +644,8 @@ def test_replace_identity_preserving_anchor_replaces_body_only(monkeypatch):
     monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", fake_envelope)
     monkeypatch.setattr(
         service.identity_service,
-        "_save_identity",
-        lambda _store, doc: captured.update({"saved": doc}),
+        "_save_identity_cas",
+        lambda _store, _expected, doc: captured.update({"saved": doc}) or True,
     )
     monkeypatch.setattr(service.boot_gates, "_log_bootstrap_event", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(service.identity_service, "_append_identity_change", lambda *_args, **_kwargs: None)
@@ -650,6 +663,7 @@ def test_replace_identity_preserving_anchor_replaces_body_only(monkeypatch):
             "days_with_user": 9999,
             "relationship_anchor_evidence": "must not overwrite",
         },
+        "test-api-key",
     )
 
     assert status == "updated"
@@ -657,6 +671,10 @@ def test_replace_identity_preserving_anchor_replaces_body_only(monkeypatch):
     assert captured["plaintext"]["agent_name"] == "乔伊"
     assert captured["plaintext"]["category"] == "创意 · 活泼"
     assert captured["plaintext"]["dimensions"][0]["name"] == "创造力"
+    # T12: fields the distilled output didn't address (e.g. signature) survive
+    # the replace — key-level overlay onto the LATEST decrypted card, not a
+    # blind full-body overwrite.
+    assert captured["plaintext"]["signature"] == ["旧签名"]
     assert captured["saved"]["id"] == "identity_existing"
     assert captured["saved"]["created_at"] == "2026-05-01T00:00:00"
     assert captured["saved"]["relationship_started_at"] == "2025-01-02"
@@ -727,6 +745,13 @@ def test_replace_identity_preserving_anchor_allows_nameless_nonempty_update(monk
         "identity_dimension_count": 1,
     }
     monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: existing)
+    monkeypatch.setattr(
+        service.core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda _path, _api_key, **_kwargs: (
+            {"identity": {"agent_name": "", "decrypt_status": "ok"}}, "",
+        ),
+    )
 
     def fake_envelope(_store, plaintext, item_id=None):
         captured["plaintext"] = json.loads(plaintext.decode("utf-8"))
@@ -745,8 +770,8 @@ def test_replace_identity_preserving_anchor_allows_nameless_nonempty_update(monk
     monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", fake_envelope)
     monkeypatch.setattr(
         service.identity_service,
-        "_save_identity",
-        lambda _store, doc: captured.update({"saved": doc}),
+        "_save_identity_cas",
+        lambda _store, _expected, doc: captured.update({"saved": doc}) or True,
     )
     monkeypatch.setattr(service.boot_gates, "_log_bootstrap_event", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(service.identity_service, "_append_identity_change", lambda *_args, **_kwargs: None)
@@ -761,6 +786,7 @@ def test_replace_identity_preserving_anchor_allows_nameless_nonempty_update(monk
                 "dimensions": [{"name": "直爽", "value": 90, "description": "说人话，不绕弯。"}],
             },
         },
+        "test-api-key",
     )
 
     assert status == "updated"

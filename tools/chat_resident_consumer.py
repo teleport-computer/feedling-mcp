@@ -11920,11 +11920,36 @@ def _resident_current_replaced_at() -> str:
         return ""
 
 
+def _resident_incremental_payload(payload: dict, existing: dict) -> dict:
+    """T12 (spec 3.6 / D5): drop any field the model merely echoed back
+    UNCHANGED from the (possibly stale, pre-job) `existing` snapshot it was
+    shown for coherence — so what this consumer actually SUBMITS via
+    identity.replace is genuinely incremental (only fields the new material
+    addressed), not a reassembled full card.
+
+    This matters even though the merge template already asks the model to
+    omit unaddressed fields: models aren't reliable enough to be the sole
+    loss-prevention mechanism (the server-side key-level merge in
+    genesis.service.replace_identity_preserving_anchor is), but they ARE
+    reliable enough that an echoed-back field is usually byte-identical to
+    what it was shown. Dropping it here is strictly safer than keeping it:
+    if a concurrent edit changed that same field AFTER `existing` was read
+    (this snapshot is stale by design — read at prompt-build time, not at
+    write time), submitting the stale echoed value would silently revert
+    that edit; omitting it lets the server fill it back in from whatever is
+    ACTUALLY current at write time instead."""
+    if not existing:
+        return payload
+    return {key: value for key, value in payload.items() if existing.get(key) != value}
+
+
 def _resident_derive_identity(document: str, job_id: str) -> dict | None:
     """Persona/identity is small (fits one context) — a single agent derive, no chunking.
     Prompt + parse 来自共享模板 identity/distill_prompt_v1(Batch 2 A1):全量人格字段、
     card_policy 清洗、坏 JSON 重试一次(guardrail 7:报错到 setup log,不静默吞)。
-    Returns a plaintext identity payload for identity.replace, or None if no persona content."""
+    Returns a plaintext identity payload for identity.replace, or None if no persona content
+    (either unparseable after retry, or the material produced no actual change — see
+    _resident_incremental_payload)."""
     from identity import distill_prompt_v1 as _dp
     existing = _resident_existing_identity()
     prompt = _dp.build_resident_identity_prompt(document, existing_identity=existing or None)
@@ -11932,7 +11957,14 @@ def _resident_derive_identity(document: str, job_id: str) -> dict | None:
         raw = str(_capture_agent_reply_text(call_agent(prompt, raw_text=True, trace_id=job_id)) or "").strip()
         payload = _dp.parse_identity_payload(raw)
         if payload is not None:
-            return payload
+            incremental = _resident_incremental_payload(payload, existing)
+            if not incremental:
+                log.info(
+                    "resident identity distill: material produced no change vs current card "
+                    "job=%s — skipping identity update", job_id,
+                )
+                return None
+            return incremental
         log.warning("resident identity distill: unparseable output (attempt %d/2) job=%s head=%r",
                     attempt, job_id, raw[:120])
         prompt = prompt + "\nReturn ONLY the JSON object — no prose, no code fences."

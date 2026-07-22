@@ -891,6 +891,42 @@ def init_identity_if_absent(
     return "updated" if existing else "initialized"
 
 
+def _merge_identity_replace_payload(existing_plain: dict, distilled: dict) -> dict:
+    """T12 (spec 3.6 / D5): key-level overlay of a distilled REPLACE payload onto
+    the LATEST decrypted card, so a field the distill lane didn't address is
+    NEVER wiped ("没提的字段永不丢失"). `existing_plain` must be freshly
+    decrypted at write time (see replace_identity_preserving_anchor) — not a
+    snapshot the consumer's prompt-building read earlier, which may already be
+    stale by the time this lands.
+
+    Rule: a distilled value WINS only when it actually addresses the field
+    (non-empty string / non-empty list); an absent or blank distilled field
+    falls back to the existing card's value untouched. Iterates
+    card_policy's own field lists (PROFILE_STRING_FIELDS / PROFILE_LIST_FIELDS)
+    instead of a hand-copied subset — the single-source-of-truth discipline
+    the module docstring on card_policy.py calls out (hand-copied field lists
+    have silently dropped user-authored fields like custom_persona_prompt
+    before)."""
+    merged = _identity_payload_from_existing_plain(existing_plain)
+    for key in identity_service._IDENTITY_PROFILE_STRING_FIELDS:
+        value = distilled.get(key)
+        if isinstance(value, str) and value.strip():
+            merged[key] = value
+    if isinstance(distilled.get("dimensions"), list) and distilled["dimensions"]:
+        merged["dimensions"] = distilled["dimensions"]
+    for key in identity_service._IDENTITY_PROFILE_LIST_FIELDS:
+        value = distilled.get(key)
+        if isinstance(value, list) and value:
+            merged[key] = value
+    return merged
+
+
+# Bounded retry count for replace_identity_preserving_anchor's CAS-conflict
+# recovery — mirrors identity/actions.py's _IDENTITY_WRITE_MAX_ATTEMPTS (same
+# reasoning: 3 is generous for 2 gunicorn workers racing the same user).
+_IDENTITY_REPLACE_MAX_ATTEMPTS = 3
+
+
 def _relationship_anchor_fields_for_replace(existing: dict, output: dict) -> dict:
     """B2: choose the relationship anchor for an identity replace.
 
@@ -921,17 +957,36 @@ def _relationship_anchor_fields_for_replace(existing: dict, output: dict) -> dic
     }
 
 
-def replace_identity_preserving_anchor(store: UserStore, output: dict) -> str:
-    """Create or replace identity content for explicit update_identity imports.
+def replace_identity_preserving_anchor(
+    store: UserStore,
+    output: dict,
+    api_key: str | None = None,
+    runtime_token: str = "",
+) -> str:
+    """Create or replace identity content for explicit update_identity imports
+    AND the resident-distill (redistill) lane's identity.replace landing point.
 
     With no existing card, reuse the Genesis initialization path so an uploaded
     role card is a true create-or-update operation. With an existing card, the
     relationship anchor (relationship_started_at/source/evidence) is PRESERVED
     by default and only overwritten when the upload carries an explicit, valid
     relationship time — see ``_relationship_anchor_fields_for_replace`` (B2).
+
+    T12 (spec 3.6 / D5): the distilled payload is a KEY-LEVEL OVERLAY onto the
+    LATEST decrypted card, computed at write time — not the caller's own
+    (possibly stale, pre-job) view of the card. This closes the same
+    lost-update / dropped-field class of bug the identity-actions CAS wave
+    (identity/actions.py::_with_identity_mutation_lock_and_retry) closed for
+    profile_patch / dimension_nudge: the whole read-latest -> merge -> encrypt
+    -> CAS-write span runs under the per-user identity_mutation_lock, and the
+    write itself is a compare-and-swap against a snapshot taken at the START
+    of that same span (identity_service._save_identity_cas), so a concurrent
+    profile_patch/dimension_nudge/replace landing mid-span makes the CAS fail
+    and this function retries from a fresh read rather than silently
+    clobbering it. This retires the prior plain-overwrite behavior noted as a
+    KNOWN RESIDUAL in identity/actions.py::_identity_replace_action.
     """
-    existing = identity_service._load_identity(store)
-    if not existing:
+    if not identity_service._load_identity(store):
         init_output = dict(output)
         anchor = output.get("relationship_anchor")
         if isinstance(anchor, dict):
@@ -942,46 +997,68 @@ def replace_identity_preserving_anchor(store: UserStore, output: dict) -> str:
             ):
                 if key not in init_output and key in anchor:
                     init_output[key] = anchor[key]
-        return init_identity_if_absent(store, init_output)
-    payload = _identity_payload_for_replace(output)
-    if not payload:
+        return init_identity_if_absent(store, init_output, api_key, runtime_token)
+
+    distilled = _identity_payload_for_replace(output)
+    if not distilled:
         return "not_provided"
-    if not _identity_replace_payload_has_content(payload):
+    if not _identity_replace_payload_has_content(distilled):
         return "identity_update_empty"
-    envelope, err = core_envelope._build_shared_envelope_for_store(
-        store,
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
-        item_id=existing.get("id") or None,
-    )
-    if envelope is None:
-        raise RuntimeError(f"identity_envelope_failed:{err}")
-    now = datetime.now().isoformat()
-    identity_doc = {
-        **existing,
-        "v": 1,
-        "id": existing.get("id") or envelope.get("id") or core_util._new_public_id("identity"),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", existing.get("enclave_pk_fpr", "")),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
-        "created_at": existing.get("created_at") or now,
-        "updated_at": now,
-        "replaced_at": now,
-        **_relationship_anchor_fields_for_replace(existing, output),
-        "identity_agent_name_present": bool(payload.get("agent_name")),
-        "identity_dimension_count": len(payload.get("dimensions") or []),
-    }
-    if envelope.get("K_enclave"):
-        identity_doc["K_enclave"] = envelope["K_enclave"]
-    identity_service._save_identity(store, identity_doc)
-    boot_gates._log_bootstrap_event(store, "genesis_identity_replaced_v1", success=True)
-    identity_service._append_identity_change(store, {
-        "action": "replace",
-        "reason": "Identity replaced from explicit Genesis identity update.",
-    })
-    return "updated"
+
+    with identity_service.identity_mutation_lock(store.user_id):
+        for attempt in range(_IDENTITY_REPLACE_MAX_ATTEMPTS):
+            # Snapshot the raw blob FIRST — before the enclave plaintext read —
+            # so it covers the ENTIRE span as the CAS `expected` value,
+            # including the enclave round trip itself (same ordering rationale
+            # as identity/actions.py::_load_identity_snapshot_for_write; a
+            # write landing during the enclave call must fail the CAS, not be
+            # silently clobbered by it).
+            snapshot = identity_service._load_identity(store)
+            if not snapshot:
+                return "identity_not_initialized"
+            existing_plain, _plain_err = _existing_identity_plain_for_update(api_key, runtime_token)
+            if existing_plain is None:
+                return "identity_plain_unavailable"
+
+            merged = _merge_identity_replace_payload(existing_plain, distilled)
+            envelope, err = core_envelope._build_shared_envelope_for_store(
+                store,
+                json.dumps(merged, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                item_id=snapshot.get("id") or None,
+            )
+            if envelope is None:
+                raise RuntimeError(f"identity_envelope_failed:{err}")
+            now = datetime.now().isoformat()
+            identity_doc = {
+                **snapshot,
+                "v": 1,
+                "id": snapshot.get("id") or envelope.get("id") or core_util._new_public_id("identity"),
+                "body_ct": envelope["body_ct"],
+                "nonce": envelope["nonce"],
+                "K_user": envelope["K_user"],
+                "enclave_pk_fpr": envelope.get("enclave_pk_fpr", snapshot.get("enclave_pk_fpr", "")),
+                "visibility": envelope["visibility"],
+                "owner_user_id": envelope["owner_user_id"],
+                "created_at": snapshot.get("created_at") or now,
+                "updated_at": now,
+                "replaced_at": now,
+                **_relationship_anchor_fields_for_replace(snapshot, output),
+                "identity_agent_name_present": bool(merged.get("agent_name")),
+                "identity_dimension_count": len(merged.get("dimensions") or []),
+            }
+            if envelope.get("K_enclave"):
+                identity_doc["K_enclave"] = envelope["K_enclave"]
+            if identity_service._save_identity_cas(store, snapshot, identity_doc):
+                boot_gates._log_bootstrap_event(store, "genesis_identity_replaced_v1", success=True)
+                identity_service._append_identity_change(store, {
+                    "action": "replace",
+                    "reason": "Identity replaced from explicit Genesis identity update.",
+                })
+                return "updated"
+            # CAS lost the race to a concurrent writer — retry the whole span
+            # from a fresh read (identity_service.IdentityWriteConflict's
+            # documented recovery path). Falls through the loop.
+        return "identity_write_conflict"
 
 
 def write_persona_artifact(store: UserStore, job_id: str, output: dict) -> tuple[str, str]:
