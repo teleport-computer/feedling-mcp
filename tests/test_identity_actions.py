@@ -936,7 +936,7 @@ def test_identity_dimension_nudge_rejects_out_of_range(client, monkeypatch):
             "actions": [{
                 "type": "identity.dimension_nudge",
                 "dimension": "Signal sensitivity",  # value 92 in _plain_identity()
-                "delta": 50,
+                "delta": 9,  # Task 3: nudges must have |delta| <= 10; 92 + 9 = 101 out of range
                 "reason": "test",
             }],
         },

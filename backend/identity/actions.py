@@ -480,6 +480,12 @@ def _identity_dimension_nudge(
         ok, err = card_policy.validate_dimension_nudge(dimension_name, new_value)
         if not ok:
             return {"status": "error", "error": err, "action": "identity.dimension_nudge"}, [], 400
+        # Defense in depth: single nudge |delta| must not exceed 10 (request-level
+        # batch validation is the primary gate in _execute_identity_actions).
+        # V2 migration note: pre 侧 backend/capabilities/identity.py nudge 能力与
+        # tool_schema.py 需在 0727 合并时同步此限幅。
+        if abs(delta) > 10:
+            return {"status": "error", "error": "nudge_delta_exceeds_cap", "action": "identity.dimension_nudge"}, [], 400
         if new_value == old_value:
             return {
                 "status": "ok",
@@ -704,6 +710,35 @@ def _execute_identity_actions(
 ) -> tuple[dict, int]:
     if not isinstance(actions, list) or not actions:
         return {"status": "error", "error": "actions_required", "results": [], "effects": []}, 400
+
+    # Batch-level nudge sum validation (同请求内同维度归一求和): collect all
+    # identity.dimension_nudge actions and validate that no normalized dimension's
+    # |sum(deltas)| > 10. Reject the whole batch with 400 if validation fails.
+    # V2 migration note: pre 侧 backend/capabilities/identity.py nudge 能力与
+    # tool_schema.py 需在 0727 合并时同步此限幅。
+    nudges: list[tuple[str, float]] = []
+    for action in actions[:10]:
+        action_type = str(action.get("type") or action.get("action") or "").strip()
+        if action_type == "identity.dimension_nudge":
+            dimension_name = _identity_action_text(action.get("dimension") or action.get("dimension_name"), 80)
+            try:
+                delta = int(action.get("delta"))
+                if dimension_name and delta != 0:
+                    nudges.append((dimension_name, delta))
+            except Exception:
+                pass  # Invalid delta will be caught by _execute_identity_action
+
+    if nudges:
+        from identity import card_policy
+        ok, err = card_policy.validate_nudge_sum(nudges)
+        if not ok:
+            return {
+                "status": "error",
+                "error": err,
+                "results": [],
+                "effects": [],
+            }, 400
+
     results: list[dict] = []
     effects: list[dict] = []
     for action in actions[:10]:

@@ -189,6 +189,37 @@ def validate_dimension_nudge(target_name: str, new_value) -> tuple[bool, str]:
     return _OK
 
 
+def validate_nudge_sum(nudges: list[tuple[str, float]]) -> tuple[bool, str]:
+    """Batch-level nudge sum validation per request (同请求内同维度归一求和).
+
+    Normalize dimension names by strip().lower(), group by normalized name,
+    and reject if any normalized dimension's |sum(deltas)| > 10.
+
+    Args:
+        nudges: List of (dimension_name, delta) tuples.
+
+    Returns:
+        (True, "") if all dimensions pass; (False, "nudge_delta_exceeds_cap")
+        if any normalized dimension's |sum| > 10.
+    """
+    if not nudges:
+        return _OK
+
+    # Group deltas by normalized dimension name
+    sums: dict[str, float] = {}
+    for name, delta in nudges:
+        normalized = str(name or "").strip().lower()
+        if normalized:
+            sums[normalized] = sums.get(normalized, 0) + delta
+
+    # Check if any normalized dimension exceeds cap
+    for total in sums.values():
+        if abs(total) > 10:
+            return (False, "nudge_delta_exceeds_cap")
+
+    return _OK
+
+
 def sanitize_identity_card(card: dict) -> dict:
     """Best-effort clean so the card ALWAYS PASSES structure validation WITHOUT
     losing usable content (contract: capture more, don't reject fuzzy issues).
