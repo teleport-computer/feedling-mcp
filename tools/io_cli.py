@@ -1112,7 +1112,7 @@ def main():
              "'what have I been doing/using' — `perception app` only knows the "
              "last 15 minutes.",
     )
-    pra.add_argument("--limit", type=int, default=20)
+    pra.add_argument("--limit", type=int, default=20, help="maximum number of apps to return")
     pra.add_argument("--hours", type=float, default=0, help="only opens within the last N hours")
     pra.set_defaults(func=cmd_perception_recent_apps)
 
@@ -1120,33 +1120,33 @@ def main():
                         help="Rolling baseline + delta for one numeric field (sense change vs norm).")
     pt.add_argument("signal", help="e.g. vitals/steps/sleep/weather/activity/metabolic/body")
     pt.add_argument("--field", default="", help="numeric field, e.g. resting_heart_rate / step_count / asleep_minutes")
-    pt.add_argument("--days", type=int, default=30)
+    pt.add_argument("--days", type=int, default=30, help="trailing window for baseline (default: 30)")
     pt.set_defaults(func=cmd_perception_trend)
 
     ph = sub.add_parser("perception-history",
                         help="Raw per-day rollup docs for a signal over N days.")
     ph.add_argument("signal", help="e.g. vitals/sleep/motion/location/calendar/reminders/mood")
-    ph.add_argument("--days", type=int, default=14)
+    ph.add_argument("--days", type=int, default=14, help="number of historical days to fetch")
     ph.set_defaults(func=cmd_perception_history)
 
     mi = sub.add_parser("memory-index", help="Compact memory index (readside, plaintext-safe).")
-    mi.add_argument("--limit", type=int, default=50)
+    mi.add_argument("--limit", type=int, default=50, help="maximum number of cards to return")
     mi.add_argument("--bucket", default="", help="filter by bucket name")
     mi.add_argument("--thread", default="", help="filter by thread/dimension tag")
     mi.add_argument("--query", default="", help="free-text relevance query")
     mi.add_argument("--ambient", action="store_true", help="ambient (background) selection mode")
-    mi.add_argument("--include-sensitive", dest="include_sensitive", action="store_true")
+    mi.add_argument("--include-sensitive", dest="include_sensitive", action="store_true", help="include cards marked sensitive")
     mi.set_defaults(func=cmd_memory_index)
 
     mf = sub.add_parser("memory-fetch", help="Verbatim decrypted memory cards by id.")
     mf.add_argument("ids", nargs="+", help="one or more memory card ids")
-    mf.add_argument("--limit", type=int, default=20)
-    mf.add_argument("--include-archived", dest="include_archived", action="store_true")
-    mf.add_argument("--include-superseded", dest="include_superseded", action="store_true")
+    mf.add_argument("--limit", type=int, default=20, help="maximum related cards to fetch")
+    mf.add_argument("--include-archived", dest="include_archived", action="store_true", help="include archived cards in results")
+    mf.add_argument("--include-superseded", dest="include_superseded", action="store_true", help="include superseded/corrected versions")
     mf.set_defaults(func=cmd_memory_fetch)
 
     sr = sub.add_parser("screen-recent", help="Recent screen frame metadata (no pixels).")
-    sr.add_argument("--limit", type=int, default=10)
+    sr.add_argument("--limit", type=int, default=10, help="maximum number of frames to return")
     sr.set_defaults(func=cmd_screen_recent)
 
     sd = sub.add_parser("screen-read", help="Decrypted screen frame caption/ocr (pixels off by default).")
@@ -1155,7 +1155,7 @@ def main():
     sd.set_defaults(func=cmd_screen_read)
 
     pr = sub.add_parser("photo-recent", help="Recent photo metadata (scene/time; no raw pixels).")
-    pr.add_argument("--limit", type=int, default=10)
+    pr.add_argument("--limit", type=int, default=10, help="maximum number of photos to return")
     pr.set_defaults(func=cmd_photo_recent)
 
     pd = sub.add_parser("photo-read", help="One specific photo's details by id (metadata + optional image).")
@@ -1257,12 +1257,12 @@ def main():
                          "单条及同维度求和 |delta|<=10,一次最多 10 条")
     iw.set_defaults(func=cmd_identity_write)
 
-    ii = sub.add_parser("identity-init", help="Create the identity card (sanitizes + fresh-start).")
-    ii.add_argument("--agent-name", default="")
-    ii.add_argument("--self-introduction", default="")
+    ii = sub.add_parser("identity-init", help="[setup] Create the identity card (sanitizes + fresh-start).")
+    ii.add_argument("--agent-name", default="", help="your display name")
+    ii.add_argument("--self-introduction", default="", help="agent's self introduction")
     ii.add_argument("--dimensions", default="", help="JSON list of {name,value,description}")
-    ii.add_argument("--days-with-user", type=int, default=None)
-    ii.add_argument("--relationship-anchor-evidence", default="")
+    ii.add_argument("--days-with-user", type=int, default=None, help="days known the user (for relationship context)")
+    ii.add_argument("--relationship-anchor-evidence", default="", help="text evidence/story establishing the relationship")
     ii.add_argument("--fresh-start", action="store_true", help="days=0 + standard anchor")
     ii.set_defaults(func=cmd_identity_init)
 
@@ -1275,7 +1275,7 @@ def main():
     mw.add_argument("--importance", type=float, default=None, help="0-1")
     mw.add_argument("--pulse", type=float, default=None, help="0-1")
     mw.add_argument("--type", default="fact", help="fact|event|quote|moment")
-    mw.add_argument("--source", default="resident_absorb")
+    mw.add_argument("--source", default="resident_absorb", help="source label (e.g. resident_absorb)")
     mw.set_defaults(func=cmd_memory_write)
 
     md = sub.add_parser("memory-delete",
@@ -1294,27 +1294,27 @@ def main():
     mp.add_argument("--importance", type=float, default=None, help="0-1 (else inherits)")
     mp.add_argument("--pulse", type=float, default=None, help="0-1 (else inherits)")
     mp.add_argument("--type", default="fact", help="fact|event|quote|moment")
-    mp.add_argument("--source", default="resident_patch")
+    mp.add_argument("--source", default="resident_patch", help="source label (e.g. resident_patch)")
     mp.add_argument("--reason", default=None, help="why (optional, audit trail)")
     mp.set_defaults(func=cmd_memory_patch)
     ov = sub.add_parser("onboarding-validate",
-                        help="Server-computed onboarding acceptance snapshot (next_action etc.).")
+                        help="[setup] Server-computed onboarding acceptance snapshot (next_action etc.).")
     ov.set_defaults(func=cmd_onboarding_validate)
 
     cvl = sub.add_parser("chat-verify-loop",
-                         help="Liveness probe: ping the resident-consumer reply pipeline and wait for a reply.")
+                         help="[setup] Liveness probe: ping the resident-consumer reply pipeline and wait for a reply.")
     cvl.set_defaults(func=cmd_chat_verify_loop)
 
     ob = sub.add_parser("onboard",
-                        help="Next-step onboarding guide (bootstrap status + what to run next).")
+                        help="[setup] Next-step onboarding guide (bootstrap status + what to run next).")
     ob.set_defaults(func=cmd_onboard)
 
     obs = sub.add_parser("onboard-start",
-                         help="Signal that onboarding has started (track event).")
+                         help="[setup] Signal that onboarding has started (track event).")
     obs.set_defaults(func=cmd_onboard_start)
 
     dr = sub.add_parser("doctor",
-                        help="Five-probe environment health check (api/enclave/identity/memory/chat, read-only).")
+                        help="[setup] Five-probe environment health check (api/enclave/identity/memory/chat, read-only).")
     dr.set_defaults(func=cmd_doctor)
 
     for verb in PHASE2_VERBS:
