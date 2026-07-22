@@ -97,6 +97,201 @@ def test_wrapped_chat_history_plaintext_parses_ios_markdown_export():
     assert "wrapped_json_parse_failed" not in " ".join(warnings)
 
 
+def test_wrapped_json_filename_falls_back_to_plaintext_when_body_is_not_json():
+    wrapped = (
+        "===== BEGIN CHAT HISTORY FILE: conversations.json =====\n"
+        "[2026-06-01 09:00] Seven: 以后叫我 Seven。\n"
+        "[2026-06-01 09:01] 阿樟: 好，我记住了。\n"
+        "===== END CHAT HISTORY FILE: conversations.json ====="
+    )
+    warnings = []
+
+    messages = hi._parse_import_history_content(wrapped, "auto", warnings)
+
+    assert len(messages) == 2
+    assert [message["content"] for message in messages] == [
+        "以后叫我 Seven。",
+        "好，我记住了。",
+    ]
+    assert all(message["source_filename"] == "conversations.json" for message in messages)
+    assert "wrapped_json_parse_failed" not in " ".join(warnings)
+
+
+def test_candidate_prompt_uses_known_name_and_preserves_subject_enum():
+    prompt = hi._memory_candidate_extraction_prompt(
+        {"id": "w1", "text": "User Profile: my name is Seven."},
+        idx=1,
+        total=1,
+        per_window_target=3,
+        relationship_start=date(2026, 5, 1),
+        language="en",
+        user_name="Seven",
+    )
+
+    assert "提到 Seven 就用「Seven」" in prompt
+    assert "第二人称「你」" in prompt
+    assert "subject=user is a machine-readable type label" in prompt
+
+
+def test_candidate_prompt_unknown_name_requires_subject_omission_or_neutral_referent():
+    prompt = hi._memory_candidate_extraction_prompt(
+        {"id": "w1", "text": "No preferred name here."},
+        idx=1,
+        total=1,
+        per_window_target=3,
+        relationship_start=date(2026, 5, 1),
+        language="en",
+        user_name="",
+    )
+
+    assert "优先省略主语" in prompt
+    assert "中性的「对方」" in prompt
+    assert "不要用「用户」/\"user\"" in prompt
+
+
+def test_user_profile_name_extraction_is_strict_and_sanitized(monkeypatch):
+    captured = {}
+
+    def fake_chat_completion(_provider, messages, **_kwargs):
+        captured["prompt"] = "\n".join(str(item.get("content") or "") for item in messages)
+        return {"reply": '{"user_preferred_name":"Seven"}', "usage": {}}
+
+    monkeypatch.setattr(hi.provider_client, "chat_completion", fake_chat_completion)
+    name = hi._extract_import_user_name_with_provider(
+        hi.provider_client.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
+        [{"role": "user", "content": "My name is Seven.", "source": "user_profile_import"}],
+    )
+
+    assert name == "Seven"
+    assert "Do not use an AI companion name" in captured["prompt"]
+
+
+def test_existing_identity_preferred_name_wins_without_provider_call(monkeypatch):
+    monkeypatch.setattr(hi, "_existing_import_user_name", lambda _store, _key: "小雨")
+    monkeypatch.setattr(
+        hi,
+        "_extract_import_user_name_with_provider",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("provider should not run")),
+    )
+
+    name, warnings = hi._resolve_import_user_name(
+        types.SimpleNamespace(user_id="usr_name"),
+        "key",
+        hi.provider_client.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
+        [],
+    )
+
+    assert name == "小雨"
+    assert warnings == []
+
+
+def test_existing_identity_preferred_name_is_read_from_encrypted_card(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_existing_name")
+    monkeypatch.setattr(
+        hi.identity_service,
+        "_load_identity",
+        lambda _store: {"body_ct": "ciphertext", "owner_user_id": "usr_existing_name"},
+    )
+    monkeypatch.setattr(
+        hi.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda _envelope, _key, purpose: (
+            b'{"agent_name":"IO","user_preferred_name":"Seven"}'
+            if purpose == "identity_update_merge"
+            else b"{}"
+        ),
+    )
+
+    assert hi._existing_import_user_name(store, "key") == "Seven"
+
+
+def test_rendered_user_candidate_replaces_system_label_with_known_name():
+    candidates = hi._coerce_import_candidates(
+        {"candidates": [{
+            "candidate_type": "preference",
+            "subject": "user",
+            "title": "Direct collaboration",
+            "summary": "User prefers direct collaboration and clear engineering tradeoffs in long reviews.",
+            "confidence": 0.9,
+        }]},
+        date(2026, 5, 1),
+        window_id="w1",
+    )
+
+    cards = hi._render_candidates_to_memory_cards(
+        candidates,
+        date(2026, 5, 1),
+        {"story": 0, "about_me": 1, "ta_thinking": 0, "total": 1},
+        language="en",
+        user_name="Seven",
+    )
+
+    assert "Seven prefers" in cards[0]["summary"]
+    assert "User prefers" not in cards[0]["content"]
+    assert "user" not in json.dumps(cards[0], ensure_ascii=False).lower()
+
+
+def test_rendered_user_candidate_unknown_name_uses_neutral_referent():
+    candidates = hi._coerce_import_candidates(
+        {"candidates": [{
+            "candidate_type": "preference",
+            "subject": "user",
+            "title": "Direct collaboration",
+            "summary": "用户偏好直接协作，也希望工程取舍说清楚。",
+            "confidence": 0.9,
+        }]},
+        date(2026, 5, 1),
+        window_id="w1",
+    )
+
+    cards = hi._render_candidates_to_memory_cards(
+        candidates,
+        date(2026, 5, 1),
+        {"story": 0, "about_me": 1, "ta_thinking": 0, "total": 1},
+        language="zh-Hans",
+        user_name="",
+    )
+
+    assert cards[0]["summary"].startswith("对方偏好")
+    assert "用户" not in cards[0]["content"]
+    assert "用户" not in json.dumps(cards[0], ensure_ascii=False)
+
+
+def test_history_import_uses_shared_rewrite_for_pronouns_and_product_terms():
+    text = "用户满意度和用户增长是研究主题。用户喜欢研究用户画像与用户留存。她常做复盘。"
+
+    assert hi.rewrite_user_reference(text, "小雨", subject="user") == (
+        "用户满意度和用户增长是研究主题。小雨喜欢研究用户画像与用户留存。小雨常做复盘。"
+    )
+    assert hi.rewrite_user_reference("她说话很直接。", "小雨", subject="ai") == "她说话很直接。"
+
+
+def test_rendered_history_candidate_preserves_user_product_compounds():
+    candidates = hi._coerce_import_candidates(
+        {"candidates": [{
+            "candidate_type": "preference",
+            "subject": "user",
+            "title": "用户满意度研究",
+            "summary": "用户满意度和用户增长是工作主题，用户喜欢研究用户画像与用户留存。",
+            "confidence": 0.9,
+        }]},
+        date(2026, 5, 1),
+        window_id="w1",
+    )
+
+    cards = hi._render_candidates_to_memory_cards(
+        candidates,
+        date(2026, 5, 1),
+        {"story": 0, "about_me": 1, "ta_thinking": 0, "total": 1},
+        language="zh-Hans",
+        user_name="小雨",
+    )
+
+    assert cards[0]["summary"] == (
+        "用户满意度和用户增长是工作主题，小雨喜欢研究用户画像与用户留存。"
+    )
+
+
 def test_normalize_keeps_sparse_evidenced_dimensions_without_padding():
     out = hi._normalize_identity_payload(
         _raw(

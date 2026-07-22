@@ -81,6 +81,8 @@ EXPECTED_HEADER_OPERATIONS = {
         "x-feedling-consumer-id",
         "x-feedling-consumer-version",
         "x-feedling-consumer-commit",
+        "x-feedling-decrypt-status",
+        "x-feedling-decrypt-checked-at",
     },
     ("post", "/v1/chat/response"): {
         "x-feedling-consumer",

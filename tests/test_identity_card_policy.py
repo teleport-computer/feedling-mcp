@@ -61,6 +61,17 @@ def test_profile_patch_only_checks_present_fields():
         {"dimensions": [{"name": "a", "value": 150, "description": "x"}]}) == (False, "dimension_value_out_of_range")
 
 
+def test_profile_patch_rejects_reserved_or_empty_user_preferred_name():
+    assert card_policy.validate_profile_patch({"user_preferred_name": "小雨"}) == (True, "")
+    for reserved in ("用户", "user", "USER", "ta", "TA", "「用户」", "`user`"):
+        assert card_policy.validate_profile_patch(
+            {"user_preferred_name": reserved}
+        ) == (False, "user_preferred_name_is_reserved")
+    assert card_policy.validate_profile_patch(
+        {"user_preferred_name": "  "}
+    ) == (False, "user_preferred_name_empty")
+
+
 def test_dimension_nudge_range_only():
     assert card_policy.validate_dimension_nudge("锐利", 70) == (True, "")
     assert card_policy.validate_dimension_nudge("锐利", 150) == (False, "dimension_value_out_of_range")

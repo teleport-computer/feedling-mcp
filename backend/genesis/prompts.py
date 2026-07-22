@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from identity.user_naming import _naming_rule
 from memory.prompts_v1 import COMMON_BUCKETS_GUIDANCE_V1
 
 
@@ -142,7 +143,7 @@ FACT_WRITE_PROMPT = """你收到从整段历史抽出的事实候选 digest(+ �
  "relationship_anchor_evidence":"..."}
 
 身份卡字段(身份只来自【描述 TA 的素材】:上传的 AI persona,或历史里 TA 真实的说话方式/做过的事;绝不从 user_profile 推):
-- agent_name:TA 的名字。主动找——上传 persona 里写明的名字优先;其次看历史里用户怎么称呼 TA、TA 怎么自称。有据就写,确实没有才留空("")。别用 runtime/model/assistant/provider 这类标签,别拿用户名当 TA 的名字,别编。
+- agent_name:TA 的名字。主动找——上传 persona 里写明的名字优先;其次看历史里本人怎么称呼 TA、TA 怎么自称。有据就写,确实没有才留空("")。别用 runtime/model/assistant/provider 这类标签,别拿本人的姓名或称呼当 TA 的名字,别编。
 - dimensions:抽 TA 表现出的【性格维度】,有素材就给【3-7 个,别留空】。每个【必须】同时写满三项:name(维度名)+ value(0-100,TA 表现这一面的强度)+ description(一句话,指向素材里 TA 的真实表现或原话)。**缺 description 的维度会被系统丢弃,所以每个都要写 description。** 无据的维度不编。
 - category:TA 的【人设标签】,正好两个形容词、用「 · 」连接(例:「安静 · 观察型」「细心 · 稳定」「锐利 · 忠诚」)。从上面 dimensions 里挑最有辨识度的两面浓缩成形容词——通常一个最突出的强项 + 一个最鲜明的反差/弱项。【要的是形容词,别照抄维度原名】(「好奇心驱动」是维度名,「好奇」才是形容词)。有 dimensions 就必须给 category,确实抽不出维度才留空("")。语言跟素材一致(中文素材给中文形容词)。
 - days_with_user:你们认识/相处了多少天(整数)。从素材推:历史里【最早 ↔ 最晚消息时间戳的跨度】折算成天,或素材里明说的关系起点/时长。完全没有时间信号才填 0。
@@ -151,6 +152,15 @@ FACT_WRITE_PROMPT = """你收到从整段历史抽出的事实候选 digest(+ �
 
 def _json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _user_naming_instruction(user_name: str) -> str:
+    return (
+        "\n\n本人称呼规则（只作用于用户可见 prose）:"
+        + _naming_rule(user_name)
+        + " JSON schema 中 about 的固定值 \"user|relationship\" 是类型标签，必须原样保留；"
+        "规则只约束 summary/content/bucket/threads 等可见文字。"
+    )
 
 
 def voice_map_messages(chunk_text: str) -> list[dict[str, str]]:
@@ -173,9 +183,14 @@ def persona_build_messages(
     exemplars: list[dict],
     *,
     existing_persona: str = "",
+    user_name: str = "",
 ) -> list[dict[str, str]]:
     has_existing = bool(str(existing_persona or "").strip())
-    system = PERSONA_BUILD_PROMPT + (PERSONA_UPDATE_MERGE_SUFFIX if has_existing else "")
+    system = (
+        PERSONA_BUILD_PROMPT
+        + (PERSONA_UPDATE_MERGE_SUFFIX if has_existing else "")
+        + _user_naming_instruction(user_name)
+    )
     payload = {
         "persona_material": persona_material or "",
         "behavior_notes": behavior_notes,
@@ -223,22 +238,45 @@ MEMORY_RECHECK_PROMPT = """你在做 VPS resident 记忆蒸馏的【收口二次
 没有真实遗漏就 {"memories":[]}。"""
 
 
-def fact_map_messages(chunk_text: str, *, keep_all: bool = False) -> list[dict[str, str]]:
-    system = FACT_MAP_PROMPT + (FACT_MAP_KEEP_ALL_SUFFIX if keep_all else "") + _STRICT_JSON_SUFFIX
+def fact_map_messages(
+    chunk_text: str,
+    *,
+    keep_all: bool = False,
+    user_name: str = "",
+) -> list[dict[str, str]]:
+    system = (
+        FACT_MAP_PROMPT
+        + (FACT_MAP_KEEP_ALL_SUFFIX if keep_all else "")
+        + _user_naming_instruction(user_name)
+        + _STRICT_JSON_SUFFIX
+    )
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": str(chunk_text or "")},
     ]
 
 
-def combined_map_messages(chunk_text: str) -> list[dict[str, str]]:
+def combined_map_messages(chunk_text: str, *, user_name: str = "") -> list[dict[str, str]]:
     return [
-        {"role": "system", "content": COMBINED_MAP_PROMPT + _STRICT_JSON_SUFFIX},
+        {
+            "role": "system",
+            "content": COMBINED_MAP_PROMPT + _user_naming_instruction(user_name) + _STRICT_JSON_SUFFIX,
+        },
         {"role": "user", "content": str(chunk_text or "")},
     ]
 
 
-def fact_write_messages(fact_digest: list[dict], persona_material: str = "", memory_summary: str = "", known_memories: list[str] | None = None, *, keep_all: bool = False, floor_note: str = "", terms_note: str = "") -> list[dict[str, str]]:
+def fact_write_messages(
+    fact_digest: list[dict],
+    persona_material: str = "",
+    memory_summary: str = "",
+    known_memories: list[str] | None = None,
+    *,
+    keep_all: bool = False,
+    floor_note: str = "",
+    terms_note: str = "",
+    user_name: str = "",
+) -> list[dict[str, str]]:
     effective_keep_all = keep_all or bool(str(memory_summary or "").strip())
     keep_all_suffix = FACT_WRITE_KEEP_ALL_SUFFIX if effective_keep_all else ""
     terms_note_text = (("\n\n★ " + str(terms_note).strip()) if str(terms_note or "").strip() else "")
@@ -268,6 +306,12 @@ def fact_write_messages(fact_digest: list[dict], persona_material: str = "", mem
     else:
         # Default behavior: no changes to output
         system = FACT_WRITE_PROMPT + keep_all_suffix + _STRICT_JSON_SUFFIX
+
+    system = (
+        system[: -len(_STRICT_JSON_SUFFIX)]
+        + _user_naming_instruction(user_name)
+        + _STRICT_JSON_SUFFIX
+    )
 
     return [
         {"role": "system", "content": system},

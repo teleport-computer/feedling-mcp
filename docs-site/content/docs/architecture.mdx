@@ -313,7 +313,8 @@ enabled capability:
 | --- | --- |
 | Account and storage API | Authenticated request plus a successful write/read round trip through PostgreSQL |
 | Memory index and fetch | Storage round trip plus a successful authorized decrypt projection |
-| Hosted Chat | Database, decrypt service, fresh Runtime V2 worker heartbeat and capacity, queue processing, provider call, and encrypted assistant result |
+| Hosted Chat | Database, decrypt service, a fresh runtime heartbeat for the user's fenced runtime (Runtime V2 worker heartbeat and capacity, or V1 resident supervisor heartbeat during the dual-runtime window), queue processing, provider call, and encrypted assistant result |
+| Independent resident Chat | Fresh official poll plus a fresh `ok` decrypt-health report, an exact-parent verify-ping reply, and an encrypted ordinary reply |
 | Screen ingestion | Authenticated WebSocket ingest plus frame persistence and, when needed, decrypt retrieval |
 | Push delivery | Valid device token and a confirmed provider delivery attempt |
 
@@ -322,6 +323,12 @@ dependencies. Operators should compose synthetic, non-production probes for the
 capabilities they enable; `/healthz` covers the backend's own critical
 dependencies (process, PostgreSQL, pool, registry, wake bus) but not the
 capability-level checks above.
+
+The resident decrypt-health headers are an operational self-report used to
+prevent live-loop-only false greens. They do not move the decrypt trust boundary
+and are not attestation: phase one may report `ok` after a successful
+reachability probe. A future encrypted challenge can provide stronger proof
+that the resident opened ciphertext for the account.
 
 ## Security boundary summary
 

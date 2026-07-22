@@ -215,6 +215,8 @@ X-Feedling-Consumer: feedling-chat-resident
 X-Feedling-Consumer-Id: resident-macbook-01
 X-Feedling-Consumer-Version: 1.4.0
 X-Feedling-Consumer-Commit: abc1234
+X-Feedling-Decrypt-Status: ok
+X-Feedling-Decrypt-Checked-At: 1783978499.500
 ```
 
 ```json
@@ -252,15 +254,75 @@ An empty long poll is a successful `200` with `messages: []` and
 `timed_out: true`. Immediately start the next poll; do not treat it as an error.
 The requested timeout is capped at 60 seconds.
 
+#### Decrypt-health heartbeat and onboarding
+
+An official resident reports decrypt-source health on poll requests only:
+
+| Status | Meaning |
+| --- | --- |
+| `ok` | A real message decrypted successfully, or the configured enclave reachability probe succeeded. This phase-one signal is operational self-reporting, not cryptographic proof of a challenge decrypt. |
+| `degraded` | Consecutive claimed messages could not be recovered as non-empty plaintext. The standard consumer changes to this status after two consecutive read failures by default; `FEEDLING_DECRYPT_DEGRADE_AFTER` changes that threshold (minimum 1). Only a later real, ordinary user-message decrypt clears this state. A server-generated maintenance turn is not recovery evidence. |
+| `unconfigured` | `FEEDLING_ENCLAVE_URL` is absent. |
+| `unreachable` | The configured enclave decrypt source could not be reached. |
+
+`X-Feedling-Decrypt-Checked-At` is the Unix epoch time of the confirmation. The
+backend accepts a report as fresh for 300 seconds. The standard resident
+refreshes an idle report every 120 seconds; use
+`FEEDLING_DECRYPT_HEALTH_REFRESH_SEC` to tune that interval, with a minimum of 5
+seconds. Missing, malformed, future, or stale reports normalize to `unknown`.
+Every official poll is authoritative: omitting the two headers clears any
+previous cached green report instead of inheriting it. Response requests do not
+update this poll-heartbeat state.
+
+For a resident-route account that has not completed one ordinary user/agent
+exchange, every non-`ok` result blocks onboarding validation, live-loop
+verification, and visible Chat with `409 bootstrap_incomplete` and
+`stage: "needs_decrypt_source"`. `GET /v1/onboarding/validate` exposes the
+ordered `decrypt_source` step, and `GET /v1/bootstrap/status` exposes
+`decrypt_source_ready`, `decrypt_health`, and `decrypt_health_policy`.
+
+After an account has a durable successful first Chat exchange, explicit
+`degraded`, `unconfigured`, or `unreachable` still blocks onboarding completion
+and a new sticky verification, but does not add a new hard block to ordinary
+Chat. An `unknown` report receives a seven-day warning-only onboarding grace;
+it cannot mint a sticky verification during the grace, and after the grace it
+blocks onboarding while ordinary Chat remains available.
+
+Maintenance notification follows the same cohort policy. `unknown` means the
+consumer report is old, absent, or stale; it can emit a
+`resident_decrypt_health_unreported` in-app notice but never selects
+decrypt-source repair copy and never injects a Chat turn. A new account's
+explicit `degraded`, `unconfigured`, or `unreachable` report can inject a repair
+turn immediately because onboarding is already blocked. For an established
+account, the explicit failure emits an in-app notice first and must remain
+continuous for 30 minutes before it can inject a repair turn; operators can
+change this persistence window with
+`FEEDLING_RESIDENT_DECRYPT_FAILURE_GRACE_SEC`.
+
+`POST /v1/chat/verify_loop` inserts a private `source: "verify_ping"` user row.
+The resident's hidden ack must post `source: "verify_ping"` and set
+`reply_to_message_id` to that exact ping ID. An unrelated or stale agent reply
+does not satisfy the probe. The verify response distinguishes `loop_alive`
+(the exact ack arrived) from `passing` (the ack arrived and decrypt policy also
+allows verification); only `passing: true` records the sticky live-loop green.
+
 If a self-hosted resident consumer appears stale while it is still polling, the
 server may claimably inject a user-role maintenance message with
 `source: "resident_maintenance"`. It is a shared envelope with `K_enclave`, so
 decrypt it through the same enclave history/MCP path as normal chat and pass the
 plaintext to the agent. Replies to that parent should use
 `source: "resident_maintenance"` and should not trigger user-visible push. Treat
-this source as system repair traffic, not as user-authored activity. The
-resident-job fallback scan is throttled by `FEEDLING_RESIDENT_FALLBACK_CHECK_SEC`
-(default 300 seconds).
+this source as system repair traffic, not as user-authored activity. The prompt
+identifies itself as a Feedling server notification, points to the matching App
+notice for verification, limits requested work to the resident environment,
+and separates consumer-update steps from decrypt-source diagnostics.
+
+Maintenance Chat turns use a global reminder interval (24 hours by default).
+Changing heartbeat timestamps, decrypt check timestamps, or the backend's
+expected commit does not bypass that interval. A changed expected commit starts
+the mismatch grace timer again, while the reminder interval remains in force.
+The resident-job fallback scan is throttled by
+`FEEDLING_RESIDENT_FALLBACK_CHECK_SEC` (default 300 seconds).
 
 `user_mcp.fingerprint` changes whenever the account's MCP server list changes;
 see the [MCP servers workflow](/docs/workflows/mcp) for how to manage that list
@@ -271,6 +333,11 @@ and re-materialize local config when the fingerprint moves.
 Decrypt the claimed user turn through the authorized enclave path, invoke the
 agent, then encrypt its reply. `reply_to_message_id` connects the two records and
 enables duplicate-reply protection.
+
+Preserve the final reply's Markdown, blank lines, and leading indentation before
+encryption. Transport logs and reasoning leakage may be filtered, but formatting
+such as headings, list markers, nested-list indentation, blockquotes, and fenced
+code is part of the user-visible reply and must reach the client unchanged.
 
 ```http
 POST /v1/chat/response HTTP/1.1

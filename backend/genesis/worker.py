@@ -23,6 +23,7 @@ import provider_client
 from core.store import get_store
 from genesis import checkpoint, foreground, prompts, service
 from genesis.llm_client import GenesisLLMClient
+from identity.user_naming import rewrite_user_reference
 from notices import catalog as notices_catalog, core as notices_core
 
 GENESIS_WORKER_SCOPES = ["envelope_decrypt", "genesis"]
@@ -319,6 +320,20 @@ def _memory_card_text(memory: dict) -> str:
         if value:
             return value
     return ""
+
+
+def _rewrite_memory_person_references(memory: dict, user_name: str) -> dict:
+    """Apply the shared anchored person-reference guard to visible card prose."""
+    clean = dict(memory)
+    for key in ("summary", "content", "bucket", "title", "description"):
+        if key in clean:
+            clean[key] = rewrite_user_reference(str(clean.get(key) or ""), user_name)
+    if isinstance(clean.get("threads"), list):
+        clean["threads"] = [
+            rewrite_user_reference(str(item or ""), user_name)
+            for item in clean["threads"]
+        ]
+    return clean
 
 
 def _dedupe_recheck_memories(
@@ -747,6 +762,7 @@ def _fact_write(
     keep_all: bool = False,
     floor_note: str = "",
     terms_note: str = "",
+    user_name: str = "",
 ) -> dict:
     if not fact_candidates and not persona_material and not memory_summary:
         return {"memories": [], "identity": {"agent_name": "", "dimensions": []}}
@@ -760,7 +776,16 @@ def _fact_write(
             job_id=job_id,
             task_id=f"fact-write-{idx}",
             runtime=runtime,
-            messages=prompts.fact_write_messages(batch, persona_material, memory_summary, known_memories, keep_all=keep_all, floor_note=floor_note, terms_note=terms_note),
+            messages=prompts.fact_write_messages(
+                batch,
+                persona_material,
+                memory_summary,
+                known_memories,
+                keep_all=keep_all,
+                floor_note=floor_note,
+                terms_note=terms_note,
+                user_name=user_name,
+            ),
             max_tokens=4000,
             idempotency_key=f"{idempotency_prefix}:fact_write:{idx}",
             is_empty=_fact_write_output_empty,
@@ -772,7 +797,11 @@ def _fact_write(
     evidence: list[str] = []
     for output in outputs:
         if isinstance(output.get("memories"), list):
-            memories.extend(item for item in output["memories"] if isinstance(item, dict))
+            memories.extend(
+                _rewrite_memory_person_references(item, user_name)
+                for item in output["memories"]
+                if isinstance(item, dict)
+            )
         identity = output.get("identity") if isinstance(output.get("identity"), dict) else {}
         if not agent_name and identity.get("agent_name"):
             agent_name = str(identity.get("agent_name") or "")
@@ -806,6 +835,7 @@ def _build_reducer_output(
     known_memories: list[str] | None = None,
     include_memory: bool = True,
     include_persona_voice: bool = True,
+    user_name: str = "",
 ) -> dict:
     llm = GenesisLLMClient()
     idempotency_prefix = _idempotency_prefix(job_id, key_prefix)
@@ -829,6 +859,7 @@ def _build_reducer_output(
             runtime=runtime,
             fact_candidates=[],
             persona_material=material,
+            user_name=user_name,
         )) if include_memory else {"memories": []}
         out = {
             **identity_doc,
@@ -847,7 +878,9 @@ def _build_reducer_output(
                 job_id=job_id,
                 task_id="persona-build",
                 runtime=runtime,
-                messages=prompts.persona_build_messages(material, existing_notes, founding),
+                messages=prompts.persona_build_messages(
+                    material, existing_notes, founding, user_name=user_name
+                ),
                 max_tokens=4000,
                 idempotency_key=f"{idempotency_prefix}:persona_build",
             )
@@ -868,6 +901,7 @@ def _build_reducer_output(
             runtime=runtime,
             fact_candidates=[],
             memory_summary=material,
+            user_name=user_name,
         )) if include_memory else {"memories": []}
         return {
             **fact_write,
@@ -913,7 +947,10 @@ def _build_reducer_output(
                 job_id=job_id,
                 task_id=f"fact-map-{idx}",
                 runtime=runtime,
-                messages=prompts.fact_map_messages(_source_tagged_fact_text(source_family, text)),
+                messages=prompts.fact_map_messages(
+                    _source_tagged_fact_text(source_family, text),
+                    user_name=user_name,
+                ),
                 max_tokens=1800,
                 idempotency_key=f"{idempotency_prefix}:fact_map:{idx}",
             )
@@ -966,6 +1003,7 @@ def _build_reducer_output(
         runtime=runtime,
         fact_candidates=fact_candidates,
         known_memories=known_memories,   # genesis v2: foreground core -> "已保存,勿重复"
+        user_name=user_name,
     ) if include_memory else {"memories": [], "identity": {"agent_name": "", "dimensions": []}}
     if source_family == "user_profile":
         fact_write = _strip_identity(fact_write)
@@ -1000,7 +1038,9 @@ def _build_reducer_output(
             job_id=job_id,
             task_id="persona-build",
             runtime=runtime,
-            messages=prompts.persona_build_messages(persona_material, behavior_notes, founding),
+            messages=prompts.persona_build_messages(
+                persona_material, behavior_notes, founding, user_name=user_name
+            ),
             max_tokens=4000,
             idempotency_key=f"{idempotency_prefix}:persona_build",
         )
@@ -1027,6 +1067,7 @@ def build_reducer_output_from_texts(
     known_memories: list[str] | None = None,
     include_memory: bool = True,
     include_persona_voice: bool = True,
+    user_name: str = "",
 ) -> dict:
     """Public wrapper for trusted in-memory Genesis inputs.
 
@@ -1047,6 +1088,7 @@ def build_reducer_output_from_texts(
         known_memories=known_memories,
         include_memory=include_memory,
         include_persona_voice=include_persona_voice,
+        user_name=user_name,
     )
 
 
@@ -1062,6 +1104,7 @@ def build_memory_output_from_fact_candidates(
     keep_all: bool = False,
     floor_note: str = "",
     terms_note: str = "",
+    user_name: str = "",
 ) -> dict:
     """Run the Genesis fact_write step directly for already-mapped candidates.
 
@@ -1084,6 +1127,7 @@ def build_memory_output_from_fact_candidates(
         keep_all=keep_all,
         floor_note=floor_note,
         terms_note=terms_note,
+        user_name=user_name,
     )
 
 
@@ -1147,6 +1191,7 @@ def build_voice_persona_output_from_candidates(
     voice_candidates: list[dict],
     existing_persona: dict | None = None,
     llm: GenesisLLMClient | None = None,
+    user_name: str = "",
 ) -> dict:
     """Reduce already-mapped voice candidates and build the persona artifact.
 
@@ -1178,7 +1223,9 @@ def build_voice_persona_output_from_candidates(
         job_id=job_id,
         task_id="persona-build",
         runtime=runtime,
-        messages=prompts.persona_build_messages(persona_material, behavior_notes, founding),
+        messages=prompts.persona_build_messages(
+            persona_material, behavior_notes, founding, user_name=user_name
+        ),
         max_tokens=4000,
         idempotency_key=f"{prefix}:persona_build",
     )
@@ -1213,6 +1260,7 @@ def build_persona_output_from_material(
     source_family: str = "ai_persona",
     existing_persona: str = "",
     llm: GenesisLLMClient | None = None,
+    user_name: str = "",
 ) -> dict:
     """Build a persona artifact from explicit role-card material.
 
@@ -1244,6 +1292,7 @@ def build_persona_output_from_material(
             behavior_notes,
             founding,
             existing_persona=str(existing_persona or "").strip(),
+            user_name=user_name,
         ),
         max_tokens=4000,
         idempotency_key=f"{prefix}:persona_build",
@@ -1323,6 +1372,7 @@ def build_foreground_output_from_texts(
     write_core: bool = True,
     include_voice_candidates: bool = False,
     keep_all: bool = False,
+    user_name: str = "",
 ) -> dict:
     """Genesis v2 FOREGROUND — the light "open the door" pass (Codex flow).
 
@@ -1358,7 +1408,7 @@ def build_foreground_output_from_texts(
                     job_id=job_id,
                     task_id=f"combined-map-{idx}",
                     runtime=runtime,
-                    messages=prompts.combined_map_messages(text),
+                    messages=prompts.combined_map_messages(text, user_name=user_name),
                     max_tokens=2400,
                     idempotency_key=f"{shared_prefix}:combined_map:{idx}",
                     is_empty=_combined_map_empty,
@@ -1371,7 +1421,11 @@ def build_foreground_output_from_texts(
                     job_id=job_id,
                     task_id=f"fact-map-{idx}",
                     runtime=runtime,
-                    messages=prompts.fact_map_messages(_source_tagged_fact_text(source_family, text), keep_all=keep_all),
+                    messages=prompts.fact_map_messages(
+                        _source_tagged_fact_text(source_family, text),
+                        keep_all=keep_all,
+                        user_name=user_name,
+                    ),
                     max_tokens=1800,
                     idempotency_key=f"{shared_prefix}:fact_map:{idx}",   # SAME key as background -> cache shared
                     is_empty=_fact_map_output_empty,
@@ -1397,6 +1451,7 @@ def build_foreground_output_from_texts(
         key_prefix=fg_write_prefix,   # distinct -> never collides with background fact_write
         runtime=runtime,
         fact_candidates=core,
+        user_name=user_name,
     ) if write_core else {"memories": [], "identity": {"agent_name": "", "dimensions": []}}
     return {
         "memories": fact_write.get("memories") or [],
@@ -1421,6 +1476,7 @@ def derive_identity_from_persona(
     runtime: provider_client.ProviderConfig,
     persona_content: str,
     llm: GenesisLLMClient | None = None,
+    user_name: str = "",
 ) -> dict:
     """Baseline identity guarantee. The reduce can come back with NO structured identity
     (history-only upload / weak naming signal) even though a persona prose WAS generated
@@ -1440,6 +1496,7 @@ def derive_identity_from_persona(
         runtime=runtime,
         fact_candidates=[],
         persona_material=text,
+        user_name=user_name,
     ))
     return doc.get("identity") if isinstance(doc.get("identity"), dict) else {}
 

@@ -84,6 +84,12 @@ def bootstrap_status_payload(store: UserStore) -> dict:
     # least once (agent_messages_count>=1 only proves the agent SPOKE).
     chat_loop_verified = boot_gates._chat_loop_verified_by_server(store)
     resident_consumer = chat_consumer._consumer_validation_state(store)
+    decrypt_health = resident_consumer.get("decrypt_health") or (
+        chat_consumer._decrypt_health_from_state({})
+    )
+    decrypt_policy = chat_consumer._decrypt_health_enforcement_state(
+        store, resident_consumer
+    )
 
     agent_connected = has_identity or memory_count > 0 or agent_msg_count > 0
     candidate_ts = [t for t in (identity_updated_at, last_moment_ts, last_agent_msg_ts) if t]
@@ -95,8 +101,11 @@ def bootstrap_status_payload(store: UserStore) -> dict:
     # (gates.py:137-159). Other and legacy/missing routes retain the resident
     # completion contract. Memory is informational for every route.
     route = accounts_onboarding._load_onboarding_route(store)
+    decrypt_source_ready = route == "model_api" or not decrypt_policy["blocks_onboarding"]
     live_loop_complete = route == "model_api" or (
-        resident_consumer["passing"] and chat_loop_verified
+        resident_consumer["passing"]
+        and decrypt_source_ready
+        and chat_loop_verified
     )
     is_complete = (
         has_identity
@@ -117,5 +126,8 @@ def bootstrap_status_payload(store: UserStore) -> dict:
         "chat_loop_verified": chat_loop_verified,
         "resident_consumer_connected": resident_consumer["passing"],
         "resident_consumer": resident_consumer,
+        "decrypt_source_ready": decrypt_source_ready,
+        "decrypt_health": decrypt_health,
+        "decrypt_health_policy": decrypt_policy,
         "is_complete": is_complete,
     }

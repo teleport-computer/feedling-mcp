@@ -50,6 +50,17 @@ def test_every_catalog_blame_is_valid():
         assert catalog.blame_for(ec) in core.VALID_BLAME
 
 
+def test_resident_decrypt_maintenance_classes_are_registered_as_user_environment():
+    classes = {
+        "resident_decrypt_source_unavailable",
+        "resident_decrypt_health_unreported",
+    }
+    assert classes <= catalog.ERROR_CLASSES
+    for error_class in classes:
+        assert catalog.blame_for(error_class) == "user_environment"
+        assert catalog.user_text_for(error_class) != catalog.user_text_for("unknown")
+
+
 def _consumer_blame_map() -> dict[str, str]:
     """从 consumer 的分类规则表 + classify_agent_error 硬编码分支推导
     error_class -> blame 全集（同源纪律：不重新发明，只是把已知代码路径的

@@ -50,6 +50,82 @@ def _client(monkeypatch):
     return _CoreClient(_store())
 
 
+def test_plaintext_user_name_prefers_encrypted_identity_without_provider(monkeypatch):
+    monkeypatch.setattr(
+        plaintext,
+        "_plaintext_existing_identity_for_update",
+        lambda *_args: {"user_preferred_name": "Seven"},
+    )
+    monkeypatch.setattr(
+        plaintext.history_import,
+        "_extract_import_user_name_with_provider",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("provider must not run")),
+    )
+
+    assert plaintext._resolve_plaintext_user_name(
+        _store(),
+        "api-key",
+        types.SimpleNamespace(),
+        [{"source_family": "user_profile", "chunk_texts": ["请叫我小雨"]}],
+    ) == "Seven"
+
+
+def test_plaintext_user_name_extracts_user_profile_once(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        plaintext,
+        "_plaintext_existing_identity_for_update",
+        lambda *_args: {"agent_name": "Mira"},
+    )
+
+    def fake_extract(_runtime, messages):
+        calls.append(messages)
+        return "小雨"
+
+    monkeypatch.setattr(
+        plaintext.history_import,
+        "_extract_import_user_name_with_provider",
+        fake_extract,
+    )
+
+    assert plaintext._resolve_plaintext_user_name(
+        _store(),
+        "api-key",
+        types.SimpleNamespace(),
+        [
+            {"source_family": "user_profile", "chunk_texts": ["名字：小雨", "请叫我小雨"]},
+            {"source_family": "memory_summary", "chunk_texts": ["用户增长是工作主题"]},
+        ],
+    ) == "小雨"
+    assert len(calls) == 1
+    assert [message["content"] for message in calls[0]] == ["名字：小雨", "请叫我小雨"]
+
+
+def test_plaintext_user_name_writeback_preserves_existing_identity(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        plaintext,
+        "_plaintext_existing_identity_for_update",
+        lambda *_args: {
+            "agent_name": "Mira",
+            "dimensions": [{"name": "Warm", "value": 80, "description": "Steady."}],
+        },
+    )
+    monkeypatch.setattr(
+        plaintext.service,
+        "replace_identity_preserving_anchor",
+        lambda _store, output: captured.update(output) or "updated",
+    )
+
+    status = plaintext._write_back_plaintext_user_name(
+        _store(), "api-key", "小雨"
+    )
+
+    assert status == "updated"
+    assert captured["identity"]["agent_name"] == "Mira"
+    assert captured["identity"]["user_preferred_name"] == "小雨"
+
+
 def _stub_update_identity_persona(monkeypatch):
     monkeypatch.setattr(plaintext, "_plaintext_existing_voice_workset_for_update", lambda *_args: {}, raising=False)
     monkeypatch.setattr(

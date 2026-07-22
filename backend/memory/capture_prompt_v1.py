@@ -18,6 +18,8 @@
 """
 from __future__ import annotations
 
+from identity.user_naming import _naming_rule, sanitize_user_name
+
 from memory.prompts_v1 import COMMON_BUCKETS_GUIDANCE_V1
 
 # action 取值:并入(merge)/ 新增(add)/ 覆盖(supersede)/ 不动(noop)
@@ -218,35 +220,4 @@ def build_capture_prompt(
         threads=threads or "（暂无）",
         identity=identity or "（暂无）",
         window=window or "（空）",
-    )
-
-
-# Identity-card user_name values that are placeholders, not names. A stored
-# "用户"/"user"/"TA" must be treated as unknown, or the naming rule would
-# instruct the model to "use the name 「用户」" — re-polluting the very cards
-# this rule exists to fix.
-_RESERVED_USER_NAMES = {"ta", "user", "用户"}
-
-
-def sanitize_user_name(user_name: str) -> str:
-    """Collapse placeholder "names" to the internal TA marker. Shared with the
-    consumer's transcript labeling so a reserved word never becomes a line
-    label ("用户: …") either."""
-    name = str(user_name or "").strip()
-    if not name or name.casefold() in _RESERVED_USER_NAMES:
-        return "TA"
-    return name
-
-
-def _naming_rule(user_name: str) -> str:
-    """User-visible card text must address the person the way a companion
-    would (Seven, 2026-07-17): the name when known, otherwise a natural
-    relationship referent — never "用户"/"user", and never "TA" (which the
-    app surface reserves for the AI)."""
-    name = sanitize_user_name(user_name)
-    if name != "TA":
-        return f"提到 {name} 就用「{name}」这个名字。"
-    return (
-        "TA 的名字如果对话里出现了就用名字；"
-        "还不知道名字，就用你们关系里自然的称呼（\"她/他\"或你平时对 TA 的叫法）。"
     )

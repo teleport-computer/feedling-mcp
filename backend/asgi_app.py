@@ -93,6 +93,8 @@ if settings.cors_allowed_origins:
             "X-Byte-Start",
             "X-Ciphertext-SHA256",
             "X-Content-SHA256",
+            "X-Feedling-Decrypt-Checked-At",
+            "X-Feedling-Decrypt-Status",
             "X-Envelope-Meta",
             "X-Feedling-Consumer",
             "X-Feedling-Consumer-Commit",

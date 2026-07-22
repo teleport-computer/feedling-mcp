@@ -49,14 +49,36 @@ change must not be interpreted as an API guarantee.
   other still works. `effective` is derived, and covers every lane. `POST` requires a real JSON boolean under `enabled`; strings such as
   `"no"` are rejected with `400` rather than coerced.
 
+- Official resident consumers now report decrypt-source health on
+  `GET /v1/chat/poll` with `X-Feedling-Decrypt-Status`
+  (`ok`, `degraded`, `unconfigured`, or `unreachable`) and
+  `X-Feedling-Decrypt-Checked-At`. Missing, invalid, future, or reports older
+  than 300 seconds normalize to `unknown`. Resident onboarding exposes a new
+  `decrypt_source` validation step; unfinished accounts require a fresh `ok`
+  report before Chat or live-loop verification can pass. Existing accounts keep
+  ordinary Chat available and receive a seven-day warning-only grace for
+  `unknown`. Unknown/absent health now produces only an in-app stale-consumer
+  notice and never injects decrypt-source repair copy. An established resident's
+  explicit decrypt failure must persist for 30 minutes before a repair turn can
+  be injected; new onboarding remains immediately actionable. Verify-ping
+  replies must now use `source: "verify_ping"` and point
+  `reply_to_message_id` at the exact pending ping; `loop_alive` can therefore be
+  true while `passing` is false when decrypt policy blocks sticky verification.
 - Self-hosted resident polls may now receive server-generated maintenance turns
   with `role: "user"` and `source: "resident_maintenance"` when the resident
   consumer appears stale or is not claiming resident-only distill jobs. These
   rows use shared envelopes so enclave-backed consumers can decrypt the repair
-  prompt. Notices and API errors can now use `blame: "user_environment"` for
-  issues in the user's VPS/runtime environment. The resident-only distill job
-  fallback scan is throttled by `FEEDLING_RESIDENT_FALLBACK_CHECK_SEC` (default
-  300 seconds).
+  prompt. Prompts now identify their server origin, provide an App-notice trust
+  anchor, avoid requesting user data, and use reason-specific update or decrypt
+  diagnostics. Heartbeat timestamps and backend deploy commit changes no longer
+  bypass the global 24-hour reminder interval. Notices and API errors can use
+  `blame: "user_environment"` for issues in the user's VPS/runtime environment.
+  The resident-only distill job fallback scan is throttled by
+  `FEEDLING_RESIDENT_FALLBACK_CHECK_SEC` (default 300 seconds).
+- Resident decrypt health now changes to `degraded` only after consecutive
+  claimed-but-unreadable messages (two by default, configurable with
+  `FEEDLING_DECRYPT_DEGRADE_AFTER`). A real ordinary user-message decrypt resets
+  the streak; a server-generated maintenance turn does not count as recovery.
 - New `GET /v1/agent/perception/recent_apps` returns recent app-open history
   (`app`, `category`, `ts`, `minutes_ago`), newest first, with optional `limit`
   (1–100, default 20) and `hours` query parameters. It reads the same app-open
@@ -234,6 +256,24 @@ change must not be interpreted as an API guarantee.
   removed for that turn. Numeric health reads remain composable with outbound
   tools.
 
+- Genesis imports now use the person's saved preferred name in distilled
+  memory prose. When no name is known, generated cards omit the subject where
+  possible or use the neutral “the person”/“对方”; they no longer expose the
+  system labels `user`/`用户`, second-person address, or guessed gender for the
+  person. Product terms such as `用户增长`, `用户画像`, and `用户留存` remain
+  unchanged. An explicit preferred name found in uploaded User Profile material
+  is also retained on the encrypted Identity Card.
+- The resident consumer's default per-turn agent timeout
+  (`FEEDLING_AGENT_TURN_TIMEOUT_SEC`) is raised from 120 to 300 seconds. Slow
+  self-hosted stacks (official Claude Code cold starts, heavy MCP, long-thinking
+  models) can legitimately take 100–120s+ per turn, and the old default was
+  terminating those turns right at the wire so real replies were dropped. The
+  minimum floor (30s) and the operator env override are unchanged, and the cap
+  still exists so a hung agent can never wedge the single-flight chat lane.
+- Resident agent replies now preserve Markdown markers, paragraph breaks, and
+  list indentation when the consumer filters runtime noise. Headings, unordered
+  lists, nested lists, blockquotes, thematic breaks, and fenced code therefore
+  reach clients unchanged instead of being flattened before encryption.
 - Concurrent `POST /v1/chat/response` calls for the same parent are now resolved
   by one PostgreSQL compare-and-swap across all backend workers. Exactly one
   request marks the parent answered and inserts its encrypted reply; later
@@ -265,15 +305,20 @@ change must not be interpreted as an API guarantee.
   message, two near-identical replies" duplication seen when a wake and the
   chat turn answer the same moment.
 - Memory Garden cards no longer refer to the person as "用户"/"user": the
-  capture and dream transcripts label lines with the known identity names
+  capture, dream, and history-import pipelines use the known identity name
+  (history import can also resolve an explicitly self-stated name from User
+  Profile material before writing cards). Capture and dream transcripts label
+  lines with the known identity names
   (falling back to internal TA/我 markers only when unknown) instead of
   literal `user:`/`agent:` markers, the card-writing prompts require the
-  person's name (or a natural relationship referent when unknown — never a
-  system label),
+  person's name; when it is unknown, prompts prefer subject-free prose and use
+  the neutral 「对方」 only when a subject is necessary,
   placeholder "names" such as 用户/user/TA stored on the identity card are
   treated as unknown, and the hardcoded fallback line "用户在对话中明确提到"
   is now subject-free. Dream consolidation also rewrites the old wording out
-  of existing cards over time.
+  of existing cards over time. Wrapped chat-history files whose `.json` body
+  is actually plaintext now fall back to plaintext parsing instead of dropping
+  the entire wrapped block.
 
 ### Documentation and contract
 
@@ -346,6 +391,15 @@ themselves add a backend endpoint or change production request handling.
   wildcard origins.
 - The playground warns that Production requests operate on the authenticated
   account's live data and persists credentials in browser local storage.
+
+### Behavior
+
+- Resident consumers no longer surface an agent's control-protocol JSON as a
+  chat message. When a reply wraps its `{"actions":…,"messages":…}` envelope in
+  prose or a ```json fence, the consumer now parses out the payload — executing
+  the actions and sending only the natural-language messages — instead of
+  posting the raw JSON. Malformed, conflicting, or ambiguous payloads fail
+  closed (nothing is posted) rather than leaking. No public API shape changed.
 
 ### Deprecations
 

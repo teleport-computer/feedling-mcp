@@ -1047,6 +1047,16 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
             "ai_state": _ps.get("ai_state"),
             "broadcast_state": _ps.get("broadcast_state"),
         }
+        # Per-field last-report freshness (timestamps only, no values) so support
+        # can tell "device stopped feeding X" from a backend read gap — the two
+        # blind spots that cost us in usr_7f30 / usr_5d3d triage.
+        try:
+            from perception import service as _perception_service
+            row["perception_freshness"] = _perception_service.admin_perception_freshness(
+                str(user_entry.get("user_id") or "")
+            )
+        except Exception as e:  # noqa: BLE001 — observability must never 500 the page
+            row["perception_freshness"] = {"error": f"{type(e).__name__}:{str(e)[:120]}"}
         row["identity"] = {
             "written": identity is not None,
             "updated_at": identity_updated_at,
@@ -3322,6 +3332,62 @@ def _render_perception_permissions(user: dict) -> str:
     )
 
 
+def _render_perception_freshness(user: dict) -> str:
+    """Per-field last-report freshness — so '感知读不到' can be split into
+    'device stopped feeding' vs 'backend read gap' on sight (usr_7f30/usr_5d3d)."""
+    pf = user.get("perception_freshness")
+    if not isinstance(pf, dict) or pf.get("error"):
+        return ""
+    fields = pf.get("fields") or []
+    if not fields:
+        return ""
+    fresh_n = sum(1 for f in fields if f.get("fresh"))
+    stale_n = sum(1 for f in fields if f.get("reported") and not f.get("fresh"))
+    never_n = sum(1 for f in fields if not f.get("reported"))
+
+    def _fmt_ts(ts):
+        return html.escape(_bj_iso(core_util._epoch_to_iso(ts))) if ts else "—"
+
+    rows = []
+    # reported-and-stale first (what triage cares about), then fresh, then never.
+    for f in sorted(fields, key=lambda r: (not r.get("reported"), bool(r.get("fresh")), r.get("capability"))):
+        if not f.get("reported"):
+            status, last, age = "<span class='ppmuted'>— 从未上报</span>", "—", "—"
+        elif f.get("fresh"):
+            status = "<b class='ppok'>✓ 新鲜</b>"
+            last, age = _fmt_ts(f.get("last_report_ts")), _fmt_duration_sec(f.get("age_sec"))
+        else:
+            status = "<b style='color:#a05a00'>⚠️ 过期</b>"
+            last, age = _fmt_ts(f.get("last_report_ts")), _fmt_duration_sec(f.get("age_sec"))
+        ttl = f.get("ttl_sec")
+        ttl_txt = _fmt_duration_sec(ttl) if ttl else "常驻"
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(f.get('field')))}</td>"
+            f"<td class='ppmuted'>{html.escape(str(f.get('capability')))}</td>"
+            f"<td>{last}</td><td>{age}</td><td>{ttl_txt}</td><td>{status}</td>"
+            "</tr>"
+        )
+    app_ts = pf.get("recent_app_open_ts")
+    app_line = (
+        f"<div class='ppmuted' style='margin-top:6px'>最近 app_open 上报：{_fmt_ts(app_ts)}"
+        f"（{_fmt_duration_sec(pf.get('recent_app_open_age_sec'))} 前）</div>"
+        if app_ts else
+        "<div class='ppmuted' style='margin-top:6px'>最近 app_open 上报：无（iOS 快捷指令可能已停）</div>"
+    )
+    return (
+        "<h2 style='font-size:15px;margin:22px 0 6px'>感知上报新鲜度</h2>"
+        "<div class='ppmuted' style='font-size:12px;margin-bottom:6px'>"
+        "每个感知字段的最后上报时间（只看时间戳，不含内容）。过期=已超该字段 TTL，agent 现在读到 null；"
+        "用来分辨『客户端停止上报』vs『后端读取问题』。共 "
+        f"{len(fields)} 字段：<b class='ppok'>{fresh_n} 新鲜</b> · "
+        f"<b style='color:#a05a00'>{stale_n} 过期</b> · {never_n} 从未上报。</div>"
+        "<table style='font-size:12px'><thead><tr>"
+        "<th>字段</th><th>能力</th><th>最后上报</th><th>距今</th><th>TTL</th><th>状态</th>"
+        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>" + app_line
+    )
+
+
 def _render_user_detail_page(user: dict) -> str:
     qs = _data_track_qs()
     back = f"/admin/data-track?{qs}" if qs else "/admin/data-track"
@@ -3363,6 +3429,7 @@ def _render_user_detail_page(user: dict) -> str:
     <div class="card"><div class="value">{user['proactive']['proactive_messages']}</div><div class="label">proactive writes</div></div>
   </section>
   {_render_perception_permissions(user)}
+  {_render_perception_freshness(user)}
   <div class="muted" style="margin-top:14px">以下所有时间已转北京时间(UTC+8) · 原始存储为 UTC。</div>
   <pre>{html.escape(safe_json)}</pre>
 </main>

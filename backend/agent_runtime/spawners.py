@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -52,6 +53,17 @@ _IO_CLI_VERBS = (
     "perception-history",
     "memory-index",
     "memory-fetch",
+    # identity-read/-write are the rename path. Without identity-write --agent-name
+    # the agent could only rewrite its self_introduction when asked to change its
+    # name, so the displayed name stayed stale while it reported success; without
+    # identity-read it patches the card blind and cannot answer "你叫什么" from it.
+    #
+    # ⚠️ Runtime V2 (origin/pre) reaches the same behaviour through
+    # backend/capabilities/identity.py + capabilities/tool_schema.py — this file and
+    # agent_tools_prompt.md do not exist there. When test merges into pre, the
+    # correct resolution for this hunk is "stay deleted": V1's allowlist retires with
+    # V1. The io_cli --agent-name flag is shared and already present on both lines.
+    "identity-read",
     "identity-write",
     "screen-recent",
     "screen-read",
@@ -488,8 +500,24 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
         #   level is medium, so this flag is only needed to pin a DIFFERENT level
         #   (low/high) — but we always pass it when enabled so the route's exact
         #   choice is authoritative, not pi's default.
+        # shlex.quote the model: this template is a SHELL STRING the resident
+        # re-tokenizes with shlex.split (_cli_cmd_tokens). Relay model aliases
+        # routinely carry spaces (`[Kiro] claude-opus-4-6-thinking [不补]`), and a
+        # bare interpolation splits the alias apart — its tail then lands as
+        # POSITIONAL argv, which pi reads as an EXTRA USER MESSAGE. Prod 2026-07-21:
+        # pi answered the real turn, then answered the stray `[不补]` with "好的。",
+        # and _pi_turn_from_stream keeps the LAST text-bearing message — so every
+        # real reply was replaced by "好的。" (and memory_capture's `{"cards": []}`
+        # became no_json_object). 12 prod users, all of them pi + a spaced alias.
+        # .strip() to match _pi_models_json, which registers the entry id as
+        # `model.strip()`. Whitespace used to be harmless (shlex.split discarded it);
+        # quoting makes it load-bearing, so an unstripped row would ship
+        # `--model 'feedling/gpt-5 '` against entry id `gpt-5` → rc=1, Model not found.
         prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
-        model_part = f"--model {_PI_PROVIDER_ID}/{model} " if model else ""
+        model_id = (model or "").strip()
+        model_part = (
+            f"--model {shlex.quote(f'{_PI_PROVIDER_ID}/{model_id}')} " if model_id else ""
+        )
         eff = _pi_effort(reasoning_effort)
         thinking_part = f"--thinking {eff} " if eff else ""
         return (

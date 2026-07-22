@@ -89,7 +89,10 @@ def _chat_loop_verified_by_server(store) -> bool:
     return False
 
 
-def _reply_is_for_pending_verify_ping(store) -> bool:
+def _reply_is_for_pending_verify_ping(
+    store,
+    reply_to_message_id: str = "",
+) -> bool:
     """True when an unanswered synthetic verify ping is awaiting its reply.
 
     /v1/chat/verify_loop must be able to receive one agent response before
@@ -104,11 +107,10 @@ def _reply_is_for_pending_verify_ping(store) -> bool:
     chat reply and 409'd with needs_live_connection. With no reply ever
     landing, chat_loop_verified never flipped and the gate never opened.
 
-    So we now allow the reply whenever an UNANSWERED verify ping exists — a
-    verify_ping user message with no agent/openclaw reply after it — even if
-    newer real user messages have since arrived. A single landed reply then
-    satisfies verify_loop and opens the gate permanently; the liveness proof
-    (an actual reply POST) is unchanged.
+    A ping stays pending across unrelated real traffic. Only a hidden
+    ``source=verify_ping`` reply whose ``reply_to_message_id`` names that exact
+    ping consumes it. When ``reply_to_message_id`` is provided, this function
+    checks that target rather than accepting any pending probe.
     """
     with store.chat_lock:
         chat_msgs = list(store.chat_messages)
@@ -116,18 +118,21 @@ def _reply_is_for_pending_verify_ping(store) -> bool:
         chat_msgs,
         key=lambda m: float(m.get("ts") or m.get("timestamp") or 0),
     )
-    pending = False
+    pending_ids: set[str] = set()
     for m in sorted_msgs:
         if not isinstance(m, dict):
             continue
         role = m.get("role")
         if role == "user" and m.get("source") == "verify_ping":
-            pending = True
-        elif role in ("agent", "openclaw"):
-            # An agent reply consumes the outstanding ping; a later ping
-            # re-arms it.
-            pending = False
-    return pending
+            msg_id = str(m.get("id") or "")
+            if msg_id:
+                pending_ids.add(msg_id)
+        elif role in ("agent", "openclaw") and m.get("source") == "verify_ping":
+            # A concurrent ordinary reply must not consume a verify probe. The
+            # hidden ack is accepted only when it points at that exact ping.
+            pending_ids.discard(str(m.get("reply_to_message_id") or ""))
+    target = str(reply_to_message_id or "")
+    return target in pending_ids if target else bool(pending_ids)
 
 
 def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
@@ -166,6 +171,30 @@ def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
                 "identity_written": state["identity_written"],
                 "resident_consumer": consumer_state,
                 "required": consumer_state["required"],
+                "skill_url": _SKILL_URL,
+            }), 409
+        decrypt_policy = chat_consumer._decrypt_health_enforcement_state(
+            store, consumer_state
+        )
+        if decrypt_policy["blocks_chat"]:
+            decrypt_health = consumer_state.get("decrypt_health") or (
+                chat_consumer._decrypt_health_from_state({})
+            )
+            print(
+                f"[gate:{store.user_id}] chat_response blocked "
+                f"stage=needs_decrypt_source status={decrypt_health.get('status')} "
+                f"reason={decrypt_health.get('reason')}"
+            )
+            return ({
+                "error": "bootstrap_incomplete",
+                "stage": "needs_decrypt_source",
+                "memory_count": state["memory_count"],
+                "memory_floor": state["memory_floor"],
+                "identity_written": state["identity_written"],
+                "resident_consumer": consumer_state,
+                "decrypt_health": decrypt_health,
+                "decrypt_health_policy": decrypt_policy,
+                "required": decrypt_health["required"],
                 "skill_url": _SKILL_URL,
             }), 409
         if not _chat_loop_verified_by_server(store):

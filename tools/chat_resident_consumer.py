@@ -223,12 +223,15 @@ AGENT_HTTP_SESSION_KEY_HEADER = os.environ.get(
 )
 
 AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
-# Per-turn subprocess cap for the CLI agent. 120s suits the managed claude/codex/
-# pi templates; heavy self-hosted stacks (custom wrappers, slow MCP cold starts,
-# long-thinking models — usr_c190's xiake_wrapper+MCP+opus combo, 2026-07-18)
-# legitimately need more. Raise via env; the cap still exists so a hung agent
-# can never wedge the single-flight chat lane forever.
-AGENT_TURN_TIMEOUT_SEC = max(30, int(os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC", "120")))
+# Per-turn subprocess cap for the CLI agent. Default 300s: the managed
+# claude/codex/pi templates finish well inside it, while self-hosted stacks on
+# modest VPS hardware (official Claude Code cold starts, slow MCP, long-thinking
+# models) legitimately take 100-120s+ per turn — the old 120s default was
+# clipping those right at the wire (usr_6c1971, 2026-07-21: a real reply landed
+# at 104s while most turns hit the cap and were silently dropped). Lower or
+# raise via env; the cap still exists so a hung agent can never wedge the
+# single-flight chat lane forever.
+AGENT_TURN_TIMEOUT_SEC = max(30, int(os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC", "300")))
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
 
 CHECKPOINT_API_KEY_FINGERPRINT = hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]
@@ -464,22 +467,26 @@ def _clear_provider_payment_cooldown() -> None:
     _provider_payment_cooldown_until = 0.0
 
 
-# --- Proactive idle-loop guard + failure backoff (Seven 2026-07-16) -----------
+# --- Proactive self-wake loop guard + failure backoff (Seven 2026-07-16/21) ---
 # The agent can self-schedule wakes ("check on them again soon"); a self-
 # sustaining loop (schedule -> wake -> post "(在)" -> schedule -> ...) floods the
 # user with no new input. Two consumer-side brakes, on top of the backend's
 # schedule_wake min-lead floor:
-#   1. Idle-loop guard: after N consecutive proactive (non-user-driven) sends
-#      with NO intervening user message, stand down — tell the gate via
-#      loop_guard_blocked (blocks the heartbeat tick enqueue) AND skip realizing
-#      further idle proactive jobs (covers the scheduled-wake fire lane, which
-#      does not pass through the tick gate) — until the user speaks again.
+#   1. Self-wake loop guard: after N consecutive turns in which the agent
+#      schedules its OWN next wake with NO intervening user message, stop
+#      scheduling further self-wakes — which breaks the loop at the source —
+#      until the user speaks. This counts ONLY self-wakes. Heartbeats, daily
+#      reminders and event-triggered wakes are NOT self-loops and are never
+#      capped here (Seven 2026-07-21: the old guard counted EVERY idle proactive
+#      send, so 2 unanswered heartbeats silenced the companion — a regression;
+#      normal-heartbeat cadence is governed by wake_interval + DND + the 90s
+#      chat-collision window below, nothing else).
 #   2. Failure backoff: any consecutive proactive realization failure backs off
 #      exponentially (the 402 payment cooldown stays as its own special case for
 #      messaging, but also feeds this general backoff).
 # A blunt hourly cap was deliberately NOT used (Seven): users who want frequent
-# proactive messages are legitimate; only a genuinely input-less loop is stopped.
-MAX_EMPTY_PROACTIVE_TURNS = int(os.environ.get("FEEDLING_MAX_EMPTY_PROACTIVE_TURNS", "2"))
+# proactive messages are legitimate; only a genuinely input-less SELF-loop is stopped.
+MAX_CONSECUTIVE_SELF_WAKES = int(os.environ.get("FEEDLING_MAX_CONSECUTIVE_SELF_WAKES", "3"))
 PROACTIVE_FAIL_BACKOFF_BASE_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_BASE_SEC", "60"))
 PROACTIVE_FAIL_BACKOFF_CAP_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_CAP_SEC", "3600"))
 # Post-time chat-collision window: a visible proactive bubble must not land
@@ -489,26 +496,28 @@ PROACTIVE_FAIL_BACKOFF_CAP_SEC = float(os.environ.get("PROACTIVE_FAIL_BACKOFF_CA
 # so any earlier check (enqueue gate, realize-time peek, prompt-side "prefer
 # silence" advisory) can miss it. 0 disables the gate.
 PROACTIVE_CHAT_COLLISION_WINDOW_SEC = float(os.environ.get("PROACTIVE_CHAT_COLLISION_WINDOW_SEC", "90"))
-_proactive_empty_streak: int = 0
+_self_wake_streak: int = 0
 _proactive_fail_streak: int = 0
 _proactive_backoff_until: float = 0.0
 
 
-def _proactive_idle_guard_tripped() -> bool:
-    return MAX_EMPTY_PROACTIVE_TURNS > 0 and _proactive_empty_streak >= MAX_EMPTY_PROACTIVE_TURNS
+def _self_wake_loop_tripped() -> bool:
+    return MAX_CONSECUTIVE_SELF_WAKES > 0 and _self_wake_streak >= MAX_CONSECUTIVE_SELF_WAKES
 
 
-def _note_idle_proactive_send() -> None:
-    """An idle proactive turn was realized with no new user input since the last
-    one — advance the empty streak toward the guard."""
-    global _proactive_empty_streak
-    _proactive_empty_streak += 1
+def _note_self_wake() -> None:
+    """The agent scheduled its OWN next wake with no intervening user input —
+    advance the self-loop streak. Only self-wakes reach here; heartbeats,
+    reminders and event-triggered wakes never touch this counter."""
+    global _self_wake_streak
+    _self_wake_streak += 1
 
 
 def _reset_proactive_idle_guard() -> None:
-    """The user spoke (new input) — the loop is not idle; allow proactive again."""
-    global _proactive_empty_streak
-    _proactive_empty_streak = 0
+    """The user spoke (new input) — the self-wake loop is broken; allow the
+    agent to schedule self-wakes again."""
+    global _self_wake_streak
+    _self_wake_streak = 0
 
 
 def _proactive_backing_off() -> bool:
@@ -731,6 +740,28 @@ def _note_agent_turn_success() -> None:
     永不重试）。清空失败 → 标记保留 → 下个成功回合自动重试。"""
     if _runtime_error_reported:
         _report_runtime_error("", "")
+
+
+def _agent_call_failed_reason(prefix: str, exc: BaseException) -> str:
+    """Failure reason that keeps the underlying message, not just the exception
+    type. The chat lane records the full error (``agent_call_failed: {e}``), but
+    the capture/dream/migrate lanes historically recorded only
+    ``{prefix}:{type(e).__name__}`` — so a relay rejection (call_agent raises
+    ``RuntimeError("pi agent produced no reply: 403 ...insufficient_user_quota")``)
+    surfaced in job aggregations as an opaque ``RuntimeError``, indistinguishable
+    from a real code fault (usr_77b37bd1, 2026-07-21: 7 such rows were actually
+    the same 403). Keep the ``prefix`` stable for any prefix matching, and append
+    a bounded message so these lanes are diagnosable.
+
+    The reason is persisted to ``status_reason`` (JSONB/text) via
+    ``/v1/proactive/jobs/{id}/status``. Strip ALL C0/DEL control characters
+    (not only LF) and collapse whitespace before truncating: a stray NUL would
+    make the PostgreSQL write fail and drop the very failure record this exists
+    to preserve; CR/tab would also break the single-line contract."""
+    detail = " ".join(re.sub(r"[\x00-\x1f\x7f]+", " ", str(exc)).split())
+    if not detail:
+        return f"{prefix}:{type(exc).__name__}"
+    return f"{prefix}:{type(exc).__name__}: {detail[:400]}"
 
 
 # Prompt routed only when an agent entry cannot receive a native image object.
@@ -1538,12 +1569,150 @@ def _fetch_from_enclave(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Resident decrypt-source health — reported to the backend on every poll.
+#
+# verify_ping liveness probes NEVER exercise decryption (the resident answers
+# them with a locally-generated token, server marks source="verify_ping"), so a
+# resident whose only decrypt source is missing/unreachable still passes the
+# onboarding live-loop check while EVERY real user message is claimed and then
+# silently skipped for want of plaintext (empty-content skip / wedge). That is
+# exactly the usr_6c1971 report (2026-07-21): claimed, no reply, agentMessages=0,
+# verify_ping fine. The backend can only distinguish "live but undecrypting" from
+# "healthy" if the resident tells it, so we derive a health status from REAL
+# decrypt outcomes and ship it on the poll headers:
+#   ok           decrypted >=1 non-empty plaintext, OR the reachability probe
+#                succeeded (a brand-new resident with no history yet is reachable
+#                but not yet proven on a real message — the phase-2 encrypted
+#                challenge closes that residual)
+#   degraded     claimed messages could not be read (empty-content / wedge) for
+#                DECRYPT_DEGRADE_AFTER consecutive claims — a single blip (a
+#                claim/history race, one boundary message) no longer degrades;
+#                only a later real success clears it; a reachability probe never
+#                upgrades degraded, so a real per-message decrypt failure is not
+#                masked
+#   unreachable  the configured enclave source failed
+#   unconfigured no FEEDLING_ENCLAVE_URL at all
+# checked_at is refreshed on every confirmation so a long-idle "ok" cannot look
+# fresh forever; while idle the resident re-probes at most every
+# DECRYPT_HEALTH_REFRESH_SEC, kept well under the backend freshness window.
+# ---------------------------------------------------------------------------
+def _env_float(name: str, default: float, *, minimum: float) -> float:
+    """Parse a float env var, falling back on a bad/empty value instead of
+    killing the process at import, and clamping to a sane floor."""
+    try:
+        val = float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        val = default
+    if not (val == val) or val < minimum:  # NaN or below floor
+        return max(default, minimum)
+    return val
+
+
+DECRYPT_HEALTH_REFRESH_SEC = _env_float(
+    "FEEDLING_DECRYPT_HEALTH_REFRESH_SEC", 120.0, minimum=5.0
+)
+
+_decrypt_health: dict = {"status": "unknown", "checked_at": 0.0}
+
+# One unreadable claim can be a transient blip (claim/history race, a single
+# boundary message). Degrading on the first one parked healthy established
+# residents on a sticky "degraded" overnight and tripped the backend's
+# maintenance alert for a working setup (usr_98306ae2, 2026-07-22). Require a
+# streak of consecutive read failures before reporting degraded; any real
+# decrypt success resets the streak. Floor of 1 restores degrade-immediately
+# for operators who want it.
+try:
+    DECRYPT_DEGRADE_AFTER = max(
+        1, int(os.environ.get("FEEDLING_DECRYPT_DEGRADE_AFTER") or 2)
+    )
+except (TypeError, ValueError):
+    DECRYPT_DEGRADE_AFTER = 2
+
+_decrypt_read_failures = {"count": 0}
+
+
+def _set_decrypt_health(status: str) -> None:
+    _decrypt_health["status"] = status
+    _decrypt_health["checked_at"] = time.time()
+
+
+def _note_decrypt_read_failure() -> None:
+    """Record one claimed-but-unreadable message; degrade only on a streak.
+
+    Below the streak threshold the current status is left untouched (the
+    heartbeat/probe path keeps reporting it) so a lone blip never flips a
+    healthy resident to degraded."""
+    _decrypt_read_failures["count"] += 1
+    if _decrypt_read_failures["count"] >= DECRYPT_DEGRADE_AFTER:
+        _set_decrypt_health("degraded")
+
+
+def _note_decrypt_read_success() -> None:
+    """A real message decrypted to non-empty plaintext — the only signal that
+    clears degraded (reachability probes never do) and resets the streak."""
+    _decrypt_read_failures["count"] = 0
+    _set_decrypt_health("ok")
+
+
+def _decrypt_health_headers() -> dict:
+    """Poll headers carrying the current decrypt-source health, or {} before the
+    first reading. The backend treats a missing header as ``unknown`` on purpose
+    (no inheritance of a previous green), so emitting nothing while status is
+    unknown is correct rather than shipping a hollow value."""
+    status = str(_decrypt_health.get("status") or "unknown")
+    if status == "unknown":
+        return {}
+    return {
+        "X-Feedling-Decrypt-Status": status,
+        "X-Feedling-Decrypt-Checked-At": f"{float(_decrypt_health.get('checked_at') or 0.0):.3f}",
+    }
+
+
+def _probe_decrypt_reachability() -> None:
+    """Refresh health from a reachability probe (startup + throttled idle).
+    Never upgrades a standing ``degraded`` to ``ok`` — a per-message decrypt
+    failure must not be masked by the source merely being dialable; only a real
+    non-empty decrypt clears degraded."""
+    if not FEEDLING_ENCLAVE_URL:
+        _set_decrypt_health("unconfigured")
+        return
+    try:
+        client = _client_for(FEEDLING_ENCLAVE_URL)
+        resp = client.get(
+            f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
+            params={"limit": 1}, headers=_HEADERS, timeout=10,
+        )
+        resp.raise_for_status()
+    except Exception:
+        _set_decrypt_health("unreachable")
+        return
+    if _decrypt_health.get("status") == "degraded":
+        _decrypt_health["checked_at"] = time.time()  # still degraded; heartbeat only
+    else:
+        _set_decrypt_health("ok")
+
+
+_decrypt_health_last_refresh = {"at": 0.0}
+
+
+def _maybe_refresh_decrypt_health() -> None:
+    """Throttled idle refresh so an idle-but-healthy resident keeps a fresh
+    checked_at without probing the enclave on every poll cycle."""
+    now = time.time()
+    if now - _decrypt_health_last_refresh["at"] < DECRYPT_HEALTH_REFRESH_SEC:
+        return
+    _decrypt_health_last_refresh["at"] = now
+    _probe_decrypt_reachability()
+
+
 def _verify_decrypt_sources() -> bool:
     """Probe all configured decrypt sources at startup.
 
     Returns True if at least one configured source is reachable.
     Each unreachable source is logged at ERROR level so the operator
     can distinguish "configured but broken" from "not configured at all".
+    Also seeds the reported decrypt-health status.
     """
     any_ok = False
 
@@ -1559,12 +1728,17 @@ def _verify_decrypt_sources() -> bool:
             resp.raise_for_status()
             log.info("decrypt source OK: enclave at %s", FEEDLING_ENCLAVE_URL)
             any_ok = True
+            _set_decrypt_health("ok")
         except Exception as e:
             log.error(
                 "decrypt source UNREACHABLE: enclave at %s — %s",
                 FEEDLING_ENCLAVE_URL, e,
             )
+            _set_decrypt_health("unreachable")
+    else:
+        _set_decrypt_health("unconfigured")
 
+    _decrypt_health_last_refresh["at"] = time.time()
     return any_ok
 
 
@@ -2972,6 +3146,191 @@ def _dedupe_agent_turn_messages(turn: AgentTurn) -> AgentTurn:
     return turn
 
 
+# --- Protocol-JSON leak fix (fix/protocol-json-leak-parse) ------------------
+# A model sometimes wraps its control payload in prose ("Written to the card.")
+# or a ```json fence instead of emitting bare JSON. The position-anchored guards
+# (_markdown_fenced_json_body / _looks_like_agent_protocol_text) only catch a
+# payload at the very start or as the whole string, so a prose prefix slips past
+# and the raw JSON reaches a chat bubble (prod: identity self_introduction,
+# proactive.sleep — across claude/pi/codex/Gemini). Even proactive.sleep leaks:
+# once a wrapped payload lands in turn.messages, the "and not replies" sleep/
+# broadcast handlers are bypassed and the raw JSON posts.
+#
+# The parse is split into two layers, kept strictly separate (mixing them was
+# the source of every earlier miss):
+#   1. TRANSPORT — machine framing from a driver: a whole-string JSON object, a
+#      whole-string fenced JSON, or an NDJSON stream of transport *events* (each
+#      line carrying a recognized event/type marker). Bare protocol envelopes in
+#      free text are NOT transport.
+#   2. VISIBLE REPLY — free model text (possibly with <think> tags and an
+#      embedded protocol payload). Thinking is stripped HERE, on the decoded
+#      visible text only (stripping before transport parse corrupts a legit
+#      `{"result":"<think>..</think>.."}`). Then a lexer-style scan looks for a
+#      protocol object anchored at a TEXT top-level boundary (line start / after
+#      a fence) — never a nested '{'. Exactly one such root routes (actions
+#      execute, its messages send); malformed debris, conflicting candidates,
+#      unclosed thinking, or an over-budget scan all fail closed (drop, never
+#      post). Ordinary prose and code fences are left untouched.
+#
+# v2 migration: backend/proactive/agent_protocol_v2.py has the same
+# position-anchored weakness (_looks_like_protocol_fragment / _json_payload_
+# from_text use fullmatch / [:1]). Before runtime_v2 ships to prod, port this
+# two-layer split (transport vs visible + _iter_root_json_spans + strict typing)
+# into that parser so it fails closed on the same shapes.
+_SUPPORTED_ACTION_PREFIXES = ("identity.", "memory.", "proactive.")
+_BARE_PROACTIVE_ACTION_TYPES = {
+    "sleep", "send_message", "schedule_wake", "cancel_wake", "request_broadcast",
+}
+# A protocol key sitting in a JSON key position ({ or , or line start, then the
+# quoted key + colon) — catches compact `prefix {"actions":[` too, not just
+# top-of-line. A prose mention like `the "actions": field` never matches.
+_PROTOCOL_DEBRIS_KEY_RE = re.compile(
+    r'(?:[{,]|^|\n)\s*"(?:actions|messages|tool_calls|cards)"\s*:'
+)
+_PROTOCOL_DEBRIS_TYPED_RE = re.compile(
+    r'"type"\s*:\s*"(?:identity|memory|proactive)\.\w+"'
+)
+_UNCLOSED_THINKING_RE = re.compile(r'<\s*(?:think|thinking|reasoning|thought)\s*>', re.I)
+_SCAN_ATTEMPT_BUDGET = 64
+
+
+def _is_supported_action_obj(action: Any) -> bool:
+    if not isinstance(action, dict):
+        return False
+    typ = str(action.get("type") or action.get("action") or "").strip()
+    if not typ:
+        return False
+    return typ.startswith(_SUPPORTED_ACTION_PREFIXES) or typ in _BARE_PROACTIVE_ACTION_TYPES
+
+
+def _is_protocol_object(obj: Any) -> bool:
+    """Strict top-level protocol typing. A bare {"type": ...} is NOT protocol —
+    only a top-level messages/actions/tool_calls/cards envelope qualifies, and
+    an `actions` list must carry at least one supported action type."""
+    if not isinstance(obj, dict):
+        return False
+    if isinstance(obj.get("messages"), list):
+        return True
+    actions = obj.get("actions")
+    if isinstance(actions, list) and any(_is_supported_action_obj(a) for a in actions):
+        return True
+    if isinstance(obj.get("tool_calls"), list) and obj.get("tool_calls"):
+        return True
+    if isinstance(obj.get("cards"), list):
+        return True
+    return False
+
+
+def _is_transport_event_obj(obj: Any) -> bool:
+    """A driver transport event (a stream frame), NOT the model's protocol
+    envelope. Has a non-protocol type/event marker and no top-level
+    actions/messages. `{"type":"result",...}` / `{"type":"message_end",...}` are
+    transport; `{"actions":[...]}` / `{"type":"proactive.sleep"}` are not."""
+    if not isinstance(obj, dict):
+        return False
+    if isinstance(obj.get("actions"), list) or isinstance(obj.get("messages"), list):
+        return False
+    marker = str(
+        obj.get("event") or obj.get("type") or obj.get("kind") or obj.get("phase") or ""
+    ).strip()
+    if not marker:
+        return False
+    return not (marker.startswith(_SUPPORTED_ACTION_PREFIXES)
+                or marker in _BARE_PROACTIVE_ACTION_TYPES)
+
+
+def _transport_objects(raw: str) -> list[Any]:
+    """Structured machine transport only (see the layer note above): whole-string
+    JSON, whole-string fenced JSON, or an NDJSON stream whose every non-empty
+    line is a transport event. Anything else (prose, or bare protocol envelopes)
+    returns [] so it falls through to the visible-reply scanner."""
+    fenced = _markdown_fenced_json_body(raw)
+    if fenced:
+        obj = _safe_json_loads(fenced)
+        if obj is not None:
+            return [obj]
+    whole = _safe_json_loads(raw)
+    if whole is not None:
+        return [whole]
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if len(lines) < 2 or any(ln[0] not in "{[" for ln in lines):
+        return []
+    objs: list[Any] = []
+    for ln in lines:
+        obj = _safe_json_loads(ln)
+        if obj is None:
+            return []
+        objs.append(obj)
+    if all(_is_transport_event_obj(o) for o in objs):
+        return objs
+    return []
+
+
+def _truncate_at_unclosed_thinking(text: str) -> str:
+    """After closed <think>…</think> pairs are removed, an unclosed opening tag
+    means everything from it on is reasoning — never a command. Cut it so its
+    contents can't be scanned or executed."""
+    m = _UNCLOSED_THINKING_RE.search(text)
+    return text[: m.start()] if m else text
+
+
+def _iter_root_json_spans(text: str):
+    """Yield (obj, start, end) for JSON values whose opening bracket sits at a
+    TEXT top-level boundary — the start of the string or the start of a line
+    (after optional whitespace / a ``` fence line). raw_decode gives correct
+    string/escape/nesting handling and we skip past each consumed span, so a
+    nested '{' (after ':' or ',', or inside a value) is never mistaken for a
+    root. Yields the sentinel ("__budget__", i, i) if the attempt budget is hit
+    (caller must fail closed)."""
+    decoder = json.JSONDecoder()
+    attempts = 0
+    for m in re.finditer(r"(?:^|\n)[ \t]*(?=[{\[])", text):
+        i = m.end()
+        attempts += 1
+        if attempts > _SCAN_ATTEMPT_BUDGET:
+            yield ("__budget__", i, i)
+            return
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            continue
+        yield (obj, i, end)
+
+
+def _has_protocol_debris(text: str) -> bool:
+    """Structural evidence of a (possibly malformed) protocol payload: a protocol
+    key in a JSON key position or an identity/memory/proactive typed action,
+    alongside a JSON structural start or fence. A prose mention never counts."""
+    if not (_PROTOCOL_DEBRIS_KEY_RE.search(text) or _PROTOCOL_DEBRIS_TYPED_RE.search(text)):
+        return False
+    return "{" in text or "[" in text or "```" in text
+
+
+def _scan_visible_protocol(text: str) -> tuple[str, Any]:
+    """('route', obj) | ('drop', None) | ('none', None) for a visible reply.
+    Route ONLY when exactly one text-top-level root object is a valid protocol
+    envelope and no other protocol debris sits outside its span. Fail closed
+    (drop) on: an over-budget scan, >=2 protocol roots, or protocol debris with
+    no clean single root. No protocol evidence -> none (caller sanitizes,
+    preserving code fences)."""
+    roots: list[tuple[Any, int, int]] = []
+    for obj, start, end in _iter_root_json_spans(text):
+        if obj == "__budget__":
+            return ("drop", None)
+        if _is_protocol_object(obj):
+            roots.append((obj, start, end))
+    if len(roots) == 1:
+        obj, start, end = roots[0]
+        if _has_protocol_debris(text[:start] + text[end:]):
+            return ("drop", None)
+        return ("route", obj)
+    if len(roots) >= 2:
+        return ("drop", None)
+    if _has_protocol_debris(text):
+        return ("drop", None)
+    return ("none", None)
+
+
 def _agent_turn_from_obj(obj: Any) -> AgentTurn:
     turn = AgentTurn()
 
@@ -2979,7 +3338,10 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         raw = obj.strip()
         if not raw:
             return turn
-        json_objects = _json_objects_from_cli_output(raw)
+        # LAYER 1 — transport. Machine framing only (whole JSON / whole fence /
+        # NDJSON event stream). A transport object's extracted reply text recurses
+        # back into this branch and is parsed as a visible reply below.
+        json_objects = _transport_objects(raw)
         if json_objects:
             for item in json_objects:
                 _merge_agent_turn(turn, _agent_turn_from_obj(item))
@@ -2992,24 +3354,31 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
                 turn.thinking_native = stream_turn.thinking_native
             if stream_turn.messages and not turn.messages:
                 turn.messages = stream_turn.messages
-            if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
-                return _dedupe_agent_turn_messages(turn)
-        nested = _safe_json_loads(raw) if _looks_like_json_text(raw) else None
-        if isinstance(nested, (dict, list)):
-            return _agent_turn_from_obj(nested)
+            # It WAS transport — return its result even when empty (e.g. a lone
+            # non-final event). Never re-process the raw framing as visible text;
+            # that path re-sanitized skipped-event JSON straight into a bubble.
+            return _dedupe_agent_turn_messages(turn)
+        # LAYER 2 — visible reply. Strip thinking HERE (after transport, so a
+        # legit `{"result":"<think>..</think>.."}` is not corrupted), truncate any
+        # unclosed thinking, then scan for a text-top-level protocol root.
         raw, tagged_thinking = _split_tagged_thinking(raw)
+        raw = _truncate_at_unclosed_thinking(raw)
         if tagged_thinking:
-            # Some runtimes inline their reasoning as <think>…</think> in the
-            # final text. Per the original design this is NOT provider-native
-            # reasoning, but it is useful display material — keep it as a
-            # non-native fallback (provider_reasoning_summary) so a genuine
-            # provider-native reasoning always wins in _merge_agent_turn.
+            # Inlined reasoning is NOT provider-native — keep it as a non-native
+            # fallback so a genuine provider-native reasoning still wins in
+            # _merge_agent_turn.
             turn.thinking_summary = _sanitize_thinking_summary(tagged_thinking)
             turn.thinking_kind = "provider_reasoning_summary"
             turn.thinking_source = "tagged_content"
             turn.thinking_native = False
-            if not raw.strip():
-                return turn
+        if not raw.strip():
+            return turn
+        decision, payload = _scan_visible_protocol(raw)
+        if decision == "route":
+            _merge_agent_turn(turn, _agent_turn_from_obj(payload))
+            return turn
+        if decision == "drop":
+            return turn
         if _looks_like_agent_protocol_text(raw):
             return turn
         clean = _sanitize_reply_text(raw)
@@ -4217,6 +4586,68 @@ def _is_pi_cmd(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "pi"
 
 
+# pi's NO-ARGUMENT switches, transcribed from `pi --help` in the agent-runner image.
+# Everything else that looks like a flag is ASSUMED to take a value — pi lets
+# extensions register their own flags ("Extensions can register additional flags,
+# e.g. --plan"), so a closed value-flag allowlist is unmaintainable and every gap in
+# it turns that flag's VALUE into a false "extra user message" alarm. Since this
+# detector is log-only we prefer a missed detection over crying wolf, so the
+# open-ended side is the value-taking one.
+#
+# ⚠️ Membership here is load-bearing in BOTH directions: a value-taking flag listed
+# as bare makes its value read as a positional (false alarm), and a bare switch
+# omitted from this set swallows the following token (missed detection). `--resume`
+# / `-r` is a SWITCH ("Select a session to resume"), not `--resume <id>` — an
+# earlier revision had it backwards and reported `pi -r --session-id sid` as
+# reply-destroying. `--list-models [search]` takes an OPTIONAL argument; it is a
+# terminal diagnostic flag that never appears in a resident template, so bare is the
+# safe reading.
+_PI_BARE_FLAGS = {
+    "-p", "--print", "-c", "--continue", "-r", "--resume", "--no-session",
+    "-nt", "--no-tools", "-nbt", "--no-builtin-tools", "-ne", "--no-extensions",
+    "-ns", "--no-skills", "-np", "--no-prompt-templates", "--no-themes",
+    "-nc", "--no-context-files", "--verbose", "-a", "--approve", "-na",
+    "--no-approve", "--offline", "-h", "--help", "-v", "--version",
+    "--list-models",
+}
+
+
+def _pi_stray_positionals(cmd: list[str]) -> list[str]:
+    """Positional argv tokens in a pi command — each one is an EXTRA user message.
+
+    The resident feeds the real message via STDIN precisely so that no user text
+    rides argv (see ``_default_cli_cmd``'s "NO {message} placeholder" note), so a
+    well-formed pi command is all flags. A positional means the template lost a
+    quote somewhere — prod 2026-07-21 shipped ``--model feedling/[kiro零缓]
+    claude-opus-4-6-thinking [不补]`` unquoted, so pi answered the real turn AND
+    the stray ``[不补]`` ("好的。"), and ``_pi_turn_from_stream`` — which keeps the
+    LAST text-bearing assistant message — handed the user "好的。" instead of the
+    reply. Returns [] for non-pi commands: codex/claude take the message
+    positionally by design."""
+    if not _is_pi_cmd(cmd):
+        return []
+    stray, i = [], 1
+    while i < len(cmd):
+        tok = cmd[i]
+        if tok.startswith("-"):
+            # `--flag=value` carries its value inline — never consume the next token.
+            inline = tok.startswith("--") and "=" in tok
+            i += 1 if (inline or tok in _PI_BARE_FLAGS) else 2
+            continue
+        if not tok:  # an empty token is never a split alias tail
+            i += 1
+            continue
+        # Not user text: `{mcp}`/`{session_id}` placeholders the resident fills per
+        # turn, `__MSG__` (the drift check's own {message} sentinel — a pi template
+        # MAY carry {message}), and `@<path>` pi file refs (_inject_pi_images emits
+        # this shape; an operator may hardcode one).
+        placeholder = tok.startswith("{") and tok.endswith("}")
+        if not placeholder and tok != "__MSG__" and not tok.startswith("@"):
+            stray.append(tok)
+        i += 1
+    return stray
+
+
 def _cli_cmd_tokens() -> list[str]:
     """Tokenize the raw AGENT_CLI_CMD template for driver detection.
 
@@ -4400,6 +4831,22 @@ def _warn_if_agent_entry_may_drift() -> None:
     except ValueError as e:
         log.warning("AGENT_CLI_CMD could not be parsed for drift checks: %s", e)
         return
+
+    stray = _pi_stray_positionals(cmd)
+    if stray:
+        # Diagnostics only, deliberately NOT _report_runtime_error: that channel
+        # cannot carry this. A report sets _runtime_error_reported, and
+        # _note_agent_turn_success clears last_runtime_error on the next successful
+        # turn — and in this failure mode every pi turn SUCCEEDS (it answers the
+        # stray token), so the banner would die seconds after boot. The template is
+        # also operator-overridable, so this stays a warning, not a hard failure.
+        log.warning(
+            "AGENT_CLI_CMD passes positional argument(s) to pi: %r. pi reads "
+            "positionals as EXTRA USER MESSAGES — it will answer them after the "
+            "real turn and that trailing reply replaces the real one. Usually a "
+            "model name containing spaces that was not quoted.",
+            stray,
+        )
 
     if not _is_hermes_chat_cmd(cmd):
         return
@@ -5873,7 +6320,10 @@ def poll_chat(since: float, timeout: int | None = None, claim: bool = True) -> d
         # read-only peek: MUST NOT write the default 600s reply claim (that lease
         # would make other consumers wait on a message this call only glanced at).
         params["claim"] = "false"
-    resp = _HTTP.get(url, params=params, headers=_HEADERS, timeout=poll_to + 10)
+    # Ship the decrypt-source health so the backend gate/alert can tell a
+    # live-but-undecrypting resident from a healthy one (see _decrypt_health).
+    headers = {**_HEADERS, **_decrypt_health_headers()}
+    resp = _HTTP.get(url, params=params, headers=headers, timeout=poll_to + 10)
     resp.raise_for_status()
     body = resp.json()
     if isinstance(body, dict):
@@ -8125,7 +8575,7 @@ def _process_capture_jobs(jobs: list) -> float:
         try:
             reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
         except Exception as e:
-            reason = f"capture_agent_call_failed:{type(e).__name__}"
+            reason = _agent_call_failed_reason("capture_agent_call_failed", e)
             log.error("capture agent call failed id=%s: %s", job_id, e)
             _notify_agent_turn_failure(e, foreground=False)
             update_proactive_job_status(
@@ -8472,7 +8922,7 @@ def _process_dream_jobs(jobs: list) -> float:
         try:
             reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
         except Exception as e:
-            reason = f"dream_agent_call_failed:{type(e).__name__}"
+            reason = _agent_call_failed_reason("dream_agent_call_failed", e)
             log.error("dream agent call failed id=%s: %s", job_id, e)
             _notify_agent_turn_failure(e, foreground=False)
             update_proactive_job_status(
@@ -8669,9 +9119,11 @@ def _process_proactive_jobs(jobs: list) -> float:
             len(frame_ids),
         )
 
-        # Idle-loop guard + failure backoff apply only to genuine idle proactive
-        # turns — never to the first-greeting introduction or the screen-watch
-        # lane (the latter is user-activity-driven and gated separately).
+        # Failure backoff applies only to genuine idle proactive turns — never to
+        # the first-greeting introduction or the screen-watch lane. The self-wake
+        # LOOP guard is NOT here: it fires at the schedule point (where the agent
+        # asks for its own next wake), so realizing a heartbeat / reminder / event
+        # wake is never blocked by it — only the runaway self-wake chain is.
         is_idle_proactive = not is_introduction and not _is_screen_watch_job(job)
         if is_idle_proactive and _proactive_backing_off():
             log.warning(
@@ -8679,15 +9131,6 @@ def _process_proactive_jobs(jobs: list) -> float:
             )
             update_proactive_job_status(
                 job_id, "skipped", "proactive_backoff: cooling down after failures"
-            )
-            continue
-        if is_idle_proactive and _proactive_idle_guard_tripped():
-            log.info(
-                "proactive job skipped — idle loop guard (no new user input); job_id=%s",
-                job_id,
-            )
-            update_proactive_job_status(
-                job_id, "skipped", "proactive_idle_loop: no new user input"
             )
             continue
 
@@ -8777,8 +9220,10 @@ def _process_proactive_jobs(jobs: list) -> float:
             update_proactive_job_status(job_id, "failed", "degenerate_reply_suppressed")
             continue
         _note_agent_turn_success()
-        if is_idle_proactive:
-            _note_idle_proactive_send()
+        # NOTE: the self-wake loop streak is advanced at the schedule point below
+        # (only when the agent asks for its OWN next wake), NOT on every idle
+        # proactive send — a heartbeat/reminder landing must not count toward the
+        # loop guard (that was the regression that silenced quiet users).
         control_reply_reason = _proactive_control_reason_from_result(agent_result, replies)
         if control_reply_reason and not proactive_actions and not memory_identity_actions:
             update_proactive_job_status(
@@ -8824,7 +9269,20 @@ def _process_proactive_jobs(jobs: list) -> float:
         schedule_action_results: list[dict] = []
         scheduled_action_failed = False
         schedule_actions = _scheduled_wake_actions(proactive_actions)
+        # Self-wake loop guard — the ONLY brake on runaway self-scheduling. If the
+        # agent has already scheduled its own next wake MAX_CONSECUTIVE_SELF_WAKES
+        # times with no user input in between, drop this self-wake so no further
+        # wake fires: the chain ends here. Heartbeats/reminders/event wakes never
+        # reach this block, so they keep flowing. The streak clears the moment the
+        # user speaks (_reset_proactive_idle_guard in _process_messages).
+        if schedule_actions and _self_wake_loop_tripped():
+            log.info(
+                "self-wake dropped — loop guard (%d consecutive self-wakes, no user "
+                "input); job_id=%s", _self_wake_streak, job_id,
+            )
+            schedule_actions = []
         if schedule_actions:
+            _note_self_wake()
             try:
                 result = execute_scheduled_wake_actions(schedule_actions, job)
                 schedule_action_results = [
@@ -9090,7 +9548,7 @@ def _process_migrate_jobs(jobs: list) -> float:
         try:
             reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
         except Exception as e:
-            reason = f"migrate_agent_call_failed:{type(e).__name__}"
+            reason = _agent_call_failed_reason("migrate_agent_call_failed", e)
             log.error("migrate agent call failed id=%s: %s", job_id, e)
             update_proactive_job_status(
                 job_id, "failed", reason,
@@ -9321,6 +9779,12 @@ def _process_messages(messages: list) -> float:
             # dead loop. The probe reply is visibility=local_only and GC'd by the
             # server, so it never reaches the user's visible chat.
             log.info("verify ping [ts=%.3f] — exercising real agent path", ts)
+            # Bind every verify reply back to THIS ping so the server can match
+            # it strictly by (source=verify_ping ∧ reply_to_message_id=ping id)
+            # instead of "any agent message after ping_ts" — the loose match let
+            # a concurrent real reply, or a stale ack, falsely satisfy the probe
+            # and mint the sticky live-loop green (codex3 backend strict matcher).
+            _ping_id = str(msg.get("id") or msg.get("message_id") or "").strip()
             probe: dict[str, Any] = {}
 
             def _run_verify_probe() -> None:
@@ -9347,17 +9811,17 @@ def _process_messages(messages: list) -> float:
                 # stray visible message. suppress_push already kills the APNs push.
                 if probe_thread.is_alive():
                     log.warning("verify ping — agent slow (>%ss); canned ack fallback so verify still passes", VERIFY_PROBE_TIMEOUT_SEC)
-                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True)
+                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True, reply_to_message_id=_ping_id)
                 elif "result" in probe:
                     replies = _normalize_agent_replies(probe["result"]) or [VERIFY_PING_REPLY]
-                    post_reply(replies[0], source="verify_ping", suppress_push=True)
+                    post_reply(replies[0], source="verify_ping", suppress_push=True, reply_to_message_id=_ping_id)
                     log.info("verify ping — real agent reply OK")
                 elif "no_usable_reply" in probe:
                     log.error("verify ping — agent produced no usable reply; NOT acking so verify fails (live loop is broken): %s", probe["no_usable_reply"])
                     # post nothing — verify_loop stays unsatisfied on purpose
                 else:
                     log.warning("verify ping — agent call errored (%s); canned ack fallback", probe.get("error"))
-                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True)
+                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True, reply_to_message_id=_ping_id)
             except Exception as e:
                 log.error("failed to post verify-ping reply: %s", e)
             latest = max(latest, ts)
@@ -9422,8 +9886,17 @@ def _process_messages(messages: list) -> float:
             )
             content = BODY_UNAVAILABLE_PLACEHOLDER
         elif not content:
-            # Genuinely empty text — decrypt source missing or failed.
+            # Genuinely empty text — a message was CLAIMED but can't be read.
+            # Report the health so the backend surfaces the real blocker instead
+            # of a verify_ping-only false green. Preserve the actionable
+            # distinction: no source at all → unconfigured (the usr_6c1971 case);
+            # a configured source that still yielded no plaintext → a read
+            # failure, degrading only on a streak (single blips stay green).
             # Never send a fallback for content we cannot read.
+            if FEEDLING_ENCLAVE_URL:
+                _note_decrypt_read_failure()
+            else:
+                _set_decrypt_health("unconfigured")
             log.warning(
                 "user message has no plaintext content ts=%.3f content_type=%s "
                 "— skipping (set FEEDLING_ENCLAVE_URL to enable decryption)",
@@ -9432,6 +9905,16 @@ def _process_messages(messages: list) -> float:
             latest = max(latest, ts)
             continue
         else:
+            # A real user message decrypted to non-empty plaintext — decryption
+            # is genuinely working; clears any earlier degraded and resets the
+            # read-failure streak. Server-injected maintenance turns
+            # (source=resident_maintenance) may arrive through the inline poll
+            # fallback and are not evidence that a real user ciphertext was
+            # readable, so they don't count as recovery — counting them would
+            # let fail→maintenance→fail reset the streak forever and keep a
+            # genuinely degraded source below the threshold.
+            if source != RESIDENT_MAINTENANCE_SOURCE:
+                _note_decrypt_read_success()
             log.info("user message [ts=%.3f]: %s", ts, content[:80])
 
         trace_id = str(msg.get("id") or msg.get("message_id") or "").strip()
@@ -10253,6 +10736,13 @@ def run() -> None:
             )
             sys.exit(1)
     else:
+        # No decrypt source at all. Establish the reported health immediately so
+        # the FIRST poll already carries `unconfigured` — otherwise the initial
+        # value stays `unknown` and the first real message's empty-content path
+        # would mislabel it `degraded`, hiding the most actionable classification
+        # (FEEDLING_ENCLAVE_URL unset) for exactly the usr_6c1971 case.
+        _set_decrypt_health("unconfigured")
+        _decrypt_health_last_refresh["at"] = time.time()
         log.warning(
             "⚠️  No decryption source configured (FEEDLING_ENCLAVE_URL is unset). "
             "User messages in v1 encrypted mode have content=\"\" and will be "
@@ -10374,13 +10864,14 @@ def run() -> None:
                         }
                         if last_broadcast_state:
                             tick_payload["broadcast_state"] = last_broadcast_state
-                        # Idle-loop guard: tell the gate to skip enqueuing the
-                        # heartbeat presence wake once we've sent N proactive
-                        # turns with no intervening user input (contract shared
-                        # with backend/proactive/gate.py).
-                        if _proactive_idle_guard_tripped():
-                            tick_payload["loop_guard_blocked"] = True
-                            tick_payload["loop_guard_reason"] = "no_new_input"
+                        # NOTE: we deliberately no longer send loop_guard_blocked
+                        # here. That flag told the gate to skip enqueuing the
+                        # HEARTBEAT presence wake whenever the old idle guard was
+                        # tripped — which silenced heartbeats to quiet users (the
+                        # regression). The self-wake loop is now broken at its
+                        # source (the schedule point), so the heartbeat tick must
+                        # never be gated by it. (gate.py still accepts the flag for
+                        # back-compat; the consumer just stops sending it.)
                         tick = post_proactive_tick(tick_payload)
                         decision = tick.get("decision") or {}
                         last_broadcast_state = str(
@@ -10486,6 +10977,10 @@ def run() -> None:
             if result.get("timed_out"):
                 # Idle moment: safe to swap to the backend's commit and re-exec
                 # (no in-flight message to interrupt). Does not return if it updates.
+                # Also keep the reported decrypt health fresh while idle so a
+                # healthy-but-quiet resident doesn't drift into a stale reading
+                # (throttled; see DECRYPT_HEALTH_REFRESH_SEC).
+                _maybe_refresh_decrypt_health()
                 _maybe_self_update(result)
                 continue
 
@@ -10509,6 +11004,8 @@ def run() -> None:
                 )
                 if decrypted is None:
                     # All configured sources failed — skip this cycle, keep checkpoint.
+                    # A poll carried messages but decryption is down: unreachable.
+                    _set_decrypt_health("unreachable")
                     log.warning(
                         "poll triggered but all decrypt sources failed; "
                         "skipping cycle (messages not processed)"
@@ -10525,6 +11022,10 @@ def run() -> None:
                     continue
                 messages = _filter_messages_to_poll_ids(decrypted, poll_messages)
                 if not messages:
+                    # Claimed ids weren't in the decrypt history — the messages
+                    # exist and were leased but can't be read: a read failure,
+                    # same class as the empty-content skip (degrades on streak).
+                    _note_decrypt_read_failure()
                     if wedge_miss_ts == last_ts:
                         wedge_miss_count += 1
                     else:

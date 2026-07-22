@@ -1141,6 +1141,11 @@ jobs:
       # deploy isn't done until the runner CVM(s) redeploy. It lives in the
       # notify-lark-prod-deploy job (needs: deploy-cvm + deploy-prod-runner-cvm).
 
+  # 手动重部署 test（代码没变、只想重新走一遍部署）：workflow_dispatch 不行——
+  # 下面的 if 要求 event_name == 'push'，且 detect-cvm-changes-test 的 paths-filter
+  # 必须命中。空 commit 同样无效。办法是对 filter 白名单里的文件（backend/**、
+  # deploy/docker-compose.phala.test.yaml、本文件……）做一处无害改动后 push 到 test，
+  # 且 commit message 不要带 [skip ci]。
   deploy-test-cvm:
     name: deploy CVM (test)
     needs: [forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes-test, validate-test-runtime-prerequisites]

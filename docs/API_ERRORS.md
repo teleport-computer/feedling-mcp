@@ -138,6 +138,8 @@
 | `delta_required` | 400 | — | | |
 | `agent_name_empty` | 400 | — | | |
 | `agent_name_is_runtime_label` | 400 | — | 名字撞 card_policy.RUNTIME_LABELS（原 `agent_name_too_generic`，已统一） | |
+| `user_preferred_name_empty` | 400 | — | identity.profile_patch 的本人称呼为空 | |
+| `user_preferred_name_is_reserved` | 400 | — | 本人称呼是保留占位词（用户/user/TA，不区分大小写） | |
 | `dimension_value_out_of_range` | 400 | — | dimension_nudge / patch dimensions / replace 三处共用（card_policy） | |
 | `dimension_value_not_number` | 400 | — | 同上 | |
 | `dimensions_must_be_list` | 400 | — | 同上 | |
@@ -319,4 +321,6 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `runner_key_decrypt_failed` | — | system | error | **历史兼容，不再产生**：旧 supervisor 为 per-user 子进程解密 provider key 失败 |
 | `runner_degraded` | — | system | warning | **历史兼容，不再产生**：旧 resident 子进程 runtime-token 刷新失败 |
 | `resident_consumer_stale` | — | user_environment | warning | chat：自托管 resident consumer 仍在 poll，但 commit 缺失/不匹配，或 resident-only 蒸馏任务迟迟没被 claim；notice 可带 `copyable_prompt` |
+| `resident_decrypt_source_unavailable` | — | user_environment | warning | chat：resident 明确报告 `degraded`/`unconfigured`/`unreachable`；notice 可立即出现，维护消息仅对新用户立即注入，老用户需持续失败超过宽限期 |
+| `resident_decrypt_health_unreported` | — | user_environment | warning | chat：resident 未上报有效、近期的 decrypt-health；仅发 notice，不生成解密修复文案或聊天维护消息 |
 | `resident_never_claimed` | — | user_environment | error | genesis：resident-only 入住/记忆蒸馏 job 超过 reaper 阈值仍无人 claim，已失败 |

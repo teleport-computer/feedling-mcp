@@ -157,6 +157,10 @@ upload_material / send_chat / run_consumer / teardown）。
 Claude Code / Codex / Hermes 各：注册 resident 账号 → 本地 consumer 起 →
 verify_loop passing → 发消息收回复 → 删号。
 
+> **hosted 深度关**：本节 P0 是"能不能用"的浅冒烟。hosted API-key 路线的**深度认证**
+> （五阶段延迟/记忆契约/语义 persona/strict V2）走 §10 的 sxysun `qa/` 引擎（PR #95）——
+> 尤其验 `pre` 分支的 Runtime V2 时以 §10 为准。
+
 ## 4. P1 全功能清单（Claude 半自动执行，1-2 小时）
 
 在 **claude 官方 + pi 中转站** 两个代表性配置上（一个最稳、一个最刁）过全表；
@@ -304,6 +308,12 @@ model_api + resident **两路都跑**，不许一路代表全部。自查话术�
 - **阻断**：P0 任何一格 ❌ → 不许 test→main；P1 的 ❌ → Seven 决定
   （阻断或带票发版）；真机项未跑 → 标注"待真机"不阻断。
 - 所有 E2E 产生的测试账号必须在报告里确认已删除。
+- **失败分类法（采自 sxysun qa/ SOP §5，全路线通用）**：每格结果用有序严重度
+  归类——`SECURITY_FAIL` > `BLOCKED_CREDENTIAL` > `BLOCKED_DEPLOYMENT` >
+  `BLOCKED_EVIDENCE` > `PRODUCT_FAIL` > `AGENT_ERROR` > `PASS`，整体取最高severity。
+  三条铁律：**① 无 `SKIP`——缺覆盖/缺 key/缺部署是 `BLOCKED_*`，绝不当"跳过"放行；
+  ② 绿重试救不回 `PRODUCT_FAIL`（复现的产品失败不因后一次偶然成功变 PASS，两次都留档）；
+  ③ 缺证据 ≠ 通过（拿不到 trace/解密/运行时证明 = `BLOCKED_EVIDENCE`，不是绿）。**
 
 ## 8.5 发版前六问（快速自检）
 
@@ -333,3 +343,63 @@ model_api + resident **两路都跑**，不许一路代表全部。自查话术�
 7. 【iOS/排期 Seven 定】iOS 单测 target（最小核：消息发送状态机——先提取
    choosePreferredCopy / isLikelyOptimisticDuplicate 纯函数 + retryMessage
    路由决策抽可注入 helper，三处恰是本周三个 bug 的宿主）。
+
+---
+
+## 10. hosted 深度关 + pre（Runtime V2）认证 —— sxysun `qa/` 引擎（PR #95）
+
+> 2026-07-21 Seven 定：**先共存、后合并**。本节把 sxysun 那套深度认证系统
+> 折进本方案当"hosted 深度关"章节，采纳其架构无关的高价值契约为**全路线标准**。
+> 完整合并（去重 tools/e2e vs qa/）留到这次 pre 两套并行跑完、拿真实经验再做。
+
+**背景**：`pre` 分支 = 给 API-key/hosted 用户的全新 **Runtime V2**（相对 test +11.7 万行、
+99 个 `test_v2_*`），已**独立部署**在 `https://pre-api.feedling.app`（`git_commit c8999b59`，
+`v2_only` 策略、**加密 env 不允许 resident**；enclave `7d18a1f2…-5003s.dstack-pha-prod9`；
+onboarding 分支仍指 test）。sxysun 的 `qa/`（PR #95，open→test）就是**专为 Runtime V2 写的**
+深度认证引擎（strict V2 gate = `/v1/model_api/runtime` 读回 `hosted_resident` v2）。二者是同一
+件事的两半：新运行时 + 它的认证器。
+
+**两套系统分工（不是二选一，是引擎 vs 底盘）**：
+
+| | 本方案（tools/e2e + docs/testing） | sxysun `qa/`（PR #95） |
+|---|---|---|
+| 定位 | 广度框架 + 流程门禁 + 本地快速冒烟 | hosted 单道深度认证引擎 |
+| 覆盖 | 全路线（hosted/resident/iOS/蒸馏）+ 能力矩阵 + 事故库 + 双签 | hosted API-key 9-profile × P0-01..P0-13 |
+| 断言深度 | 浅（回复+解密+基本连续，人肉勾选为主） | 深（五阶段延迟/记忆契约/语义 persona/盲评法官/机检门禁） |
+| 运行 | 本地手跑，今天就能跑 | Actions+AWS runner（**未激活**）；有本地 `QA_QUALIFICATION_MODE=diagnostic` 无 admin 模式可先用 |
+| **scope 盲区** | —— | **明确排除 resident/VPS、OAuth、iOS、prod（SOP §10）** |
+
+**从 qa/ 采纳为全路线标准的高价值契约**（架构无关；某路线他没自动化、我们手测也照此验）：
+1. **失败分类法**（有序严重度 + 三铁律）——见 §8。
+2. **确定性记忆契约**（`qa/memory_contract_smoke.py`，10 检查）：fresh_empty_recall /
+   encrypted_v1_index_fetch / quiet_window_capture_write / route_chat_message_trace /
+   capture_noop 不增长 / duplicate_fact 不增长 / local_only_exclusion / supersede_visibility
+   + 迁移 legacy_stable_id / stale_CAS。→ 补进 §4.6 蒸馏子表旁作"记忆正确性"硬检。
+3. **五阶段延迟/投递契约**：`routing/queue/provider/persistence/delivery` 每 turn 五段
+   都要有数值才 PASS；缺一段=TRACE_INCOMPLETE、无 trace=TRACE_UNAVAILABLE（均阻断）；
+   每 turn 恰好一条回复，重复/迟到/乱序=失败；p50/p95 用 nearest-rank。→ 升级 §4.5 延迟项。
+4. **8 语义 persona 场景**：contradiction-resistance / cross-user-memory-isolation /
+   imported-memory-after-clear / learned-memory-after-rotation / long-horizon-persona-memory /
+   persona-stability / privacy-canary / unknown-memory-honesty。→ 补进 §4.5 语义回归清单。
+5. **注入=SECURITY_FAIL**：模型回复/导入文本/trace 皆不可信数据；回复索要密钥/命令/
+   改判据 = 硬失败。→ 把 §4.7 从"别写脏词"升级为安全 pass/fail 维度。
+6. **strict V2 运行时证明**：每 profile `/v1/model_api/runtime` 读回 mode=hosted_resident、
+   version=2；P0-05/P0-07 复读一致、验证不产生 orphan turn。
+7. **COT/推理投递契约**：reasoning event 出现；requested/configured/effective 三态分开
+   （effective 未 attested 保持 `unknown`）；只存 disclosure 长度、不存原文。
+8. **清理铁律**：lease-attested DB 缺席才算删净；旧 key 必 `401`；进程本地 404 不算证据。
+
+**这次 pre 的跑法（两套并行）**：
+1. **【今天·本方案】** 从 `~/Desktop/feedling-mcp-pre/tools/e2e` 对 `pre-api.feedling.app`
+   跑 hosted 快速基线（6→9 key，缺的标 `BLOCKED_CREDENTIAL`）：注册→发文字→**解密硬断言**→
+   追问连续性→记忆写入→删号。几十分钟出粗筛，先抓大面积崩坏。
+2. **【并行·qa/ 深度】** 从 PR #95 取 `qa/` 树，用 `QA_QUALIFICATION_MODE=diagnostic`
+   本地模式对 pre 跑 9-profile × P0-01..P0-13 + 记忆契约 + 8 persona 场景 + 五阶段延迟 +
+   strict V2。（全自动 Actions 版等激活配好，这次先本地诊断模式。）
+3. **【本方案兜底】** pre `v2_only` 拦 resident——**resident consumer 的 +763 行改动改对
+   test 环境单独验**；iOS/蒸馏/prod 验收照 §6。
+4. **【合并结论】** 任一系统硬关红 → pre 不许 test→main→prod（§8 + 失败分类法）。
+
+**key 池对齐**：他锁 9 profile（official DeepSeek/Anthropic/OpenAI/Gemini + OpenRouter
+Claude/OpenAI/GLM/Kimi K3 + Kongbeiqie）；本方案 §1.2 是 6 类。差 **GLM / Kimi K3 /
+Kongbeiqie**——建池时补齐，这次缺的按分类法标 `BLOCKED_CREDENTIAL`。

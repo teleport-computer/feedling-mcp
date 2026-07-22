@@ -91,7 +91,7 @@ AUTH_HEADERS = {}
 if MULTI_TENANT:
     section("0. Multi-tenant registration")
     rr = requests.post(f"{BASE_URL}/v1/users/register",
-                       json={"public_key": "test-pubkey"}, timeout=5)
+                       json={"public_key": f"test-pubkey-{uuid.uuid4().hex}"}, timeout=5)
     check("POST /v1/users/register returns 201", rr.status_code == 201,
           f"got {rr.status_code}: {rr.text[:120]}")
     if rr.status_code == 201:
@@ -153,6 +153,14 @@ CONSUMER_HEADERS = {
     "X-Feedling-Consumer-Version": "test-api",
     "X-Feedling-Consumer-Commit": "test-api",
 }
+
+
+def _consumer_poll_headers() -> dict:
+    return {
+        **CONSUMER_HEADERS,
+        "X-Feedling-Decrypt-Status": "ok",
+        "X-Feedling-Decrypt-Checked-At": str(time.time()),
+    }
 
 
 def _raw_headers(*extras):
@@ -234,20 +242,36 @@ def _seed_live_connection_state():
         try:
             r = _orig_get(
                 f"{BASE_URL}/v1/chat/poll?since={since}&timeout=10",
-                headers=_raw_headers(CONSUMER_HEADERS),
+                headers=_raw_headers(_consumer_poll_headers()),
                 timeout=15,
             )
             poll_rt["poll_status"] = r.status_code
             if r.status_code != 200:
                 poll_rt["err"] = r.text[:120]
                 return
-            if not r.json().get("messages", []):
+            messages = r.json().get("messages", [])
+            if not messages:
                 poll_rt["err"] = "no verify ping message"
+                return
+            verify_ping_id = next(
+                (
+                    str(m.get("id") or "")
+                    for m in messages
+                    if m.get("role") == "user" and m.get("source") == "verify_ping"
+                ),
+                "",
+            )
+            if not verify_ping_id:
+                poll_rt["err"] = "no verify ping id"
                 return
             verify_env = _seed_envelope(USER_ID, visibility="local_only", with_k_enclave=False)
             rr = _orig_post(
                 f"{BASE_URL}/v1/chat/response",
-                json={"envelope": verify_env},
+                json={
+                    "envelope": verify_env,
+                    "source": "verify_ping",
+                    "reply_to_message_id": verify_ping_id,
+                },
                 headers=_raw_headers(CONSUMER_HEADERS),
                 timeout=5,
             )

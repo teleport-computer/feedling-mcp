@@ -51,6 +51,8 @@ ERROR_CLASSES = frozenset({
     # Self-hosted resident maintenance classes. They are not upstream model
     # errors; blame points at the user's own VPS/runtime environment.
     "resident_consumer_stale",
+    "resident_decrypt_source_unavailable",
+    "resident_decrypt_health_unreported",
     "resident_never_claimed",
 })
 
@@ -102,6 +104,10 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "建议换一个支持 /v1/responses 的中转，或改用 Claude 类模型。"),
     "resident_consumer_stale": (
         "user_environment", "你的 VPS resident consumer 版本可能太旧或没有正常接走任务，请更新并重启。"),
+    "resident_decrypt_source_unavailable": (
+        "user_environment", "你的 VPS resident 解密源不可用，真实加密消息暂时无法回复。"),
+    "resident_decrypt_health_unreported": (
+        "user_environment", "你的 VPS resident 端没有上报可验证的解密健康状态,通常是 consumer 版本太旧,请更新并重启。"),
     "resident_never_claimed": (
         "user_environment", "你的 VPS resident consumer 长时间没有接走入住/记忆蒸馏任务，请更新并重启。"),
 }

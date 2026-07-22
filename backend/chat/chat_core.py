@@ -33,6 +33,7 @@ import uuid
 
 import db
 import debug_trace
+from accounts import onboarding as accounts_onboarding
 from bootstrap import gates as boot_gates
 from chat import consumer as chat_consumer
 from chat import idempotency as chat_idempotency
@@ -822,6 +823,10 @@ def write_response(
     turn_failure_error_class = str(payload.get("turn_failure_error_class") or "")[:64]
     reply_to_message_id = _reply_to_message_id(payload)
     if reply_to_message_id and role != "system":
+        # Verify acks are hidden, but their exact parent link is load-bearing:
+        # verify_loop must not accept an unrelated concurrent agent reply.
+        if source == "verify_ping":
+            extra["reply_to_message_id"] = reply_to_message_id
         # Turn-failure metadata（spec 2026-07-18 §2）：兜底回复是【实时载体】——它是
         # 新消息、有新 ts，能通过 /v1/chat/history 的 `since` 增量过滤；而对用户那条
         # 旧消息就地更新 metadata 不产生新 ts，永远进不了增量流。reply_to_message_id
@@ -956,6 +961,40 @@ def write_response(
 # POST /v1/chat/verify_loop
 # --------------------------------------------------------------------------- #
 
+def _verify_synthetic_ids_to_gc(messages) -> list[str]:
+    """Ids of the synthetic verify-loop rows (ping + ack) safe to delete.
+
+    ONLY ``source == 'verify_ping'`` rows qualify. A real reply that merely
+    landed after the ping must NEVER be collected here: deleting it orphans its
+    parent's ``reply_message_id`` (the hosted dangling-pointer lost-reply bug,
+    2026-07-20). Every genuine ack carries ``source='verify_ping'``, so this
+    loses no coverage.
+    """
+    return [
+        str(m.get("id"))
+        for m in messages
+        if isinstance(m, dict)
+        and m.get("source") == "verify_ping"
+        and m.get("id")
+    ]
+
+
+def _verify_reply_matches_ping(message: dict, *, ping_id: str, ping_ts: float) -> bool:
+    """Whether ``message`` is the hidden ack for this exact verify probe."""
+    if not isinstance(message, dict):
+        return False
+    if message.get("role") not in ("agent", "openclaw"):
+        return False
+    if message.get("source") != "verify_ping":
+        return False
+    if str(message.get("reply_to_message_id") or "") != ping_id:
+        return False
+    try:
+        return float(message.get("ts") or 0) > ping_ts
+    except (TypeError, ValueError):
+        return False
+
+
 def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
     """Synthetic ping: insert a marker user message, wait up to ``timeout_sec``
     for an agent-role reply, return whether a reply pipeline is alive.
@@ -1054,57 +1093,66 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
     ping_msg = store.append_chat("user", "verify_ping", synthetic_env)
     store.notify_chat_waiters()
     ping_ts = ping_msg["ts"]
+    ping_id = str(ping_msg.get("id") or "")
 
     print(f"[verify_loop:{store.user_id}] posted synthetic ping {ping_uuid} at ts={ping_ts}")
 
-    # Wait for agent reply that came AFTER our ping
+    # Wait for the hidden reply tied to this exact ping. A concurrent ordinary
+    # agent reply is not evidence that the synthetic probe was handled.
     deadline = time.time() + timeout_sec
     response_time = None
     found_reply = False
-    found_reply_id = ""
     while time.time() < deadline:
         time.sleep(2)
         with store.chat_lock:
             chat_msgs = list(store.chat_messages)
         for m in chat_msgs:
-            if not isinstance(m, dict):
-                continue
-            if m.get("role") not in ("agent", "openclaw"):
-                continue
-            try:
-                m_ts = float(m.get("ts", 0))
-            except Exception:
-                continue
-            if m_ts > ping_ts:
-                response_time = m_ts - ping_ts
+            if _verify_reply_matches_ping(m, ping_id=ping_id, ping_ts=ping_ts):
+                response_time = float(m["ts"]) - ping_ts
                 found_reply = True
-                found_reply_id = m.get("id", "")
                 break
         if found_reply:
             break
 
-    if found_reply:
+    decrypt_health = None
+    decrypt_policy = None
+    route = accounts_onboarding._load_onboarding_route(store)
+    if route not in {"model_api", "official_import"}:
+        consumer_state = chat_consumer._consumer_validation_state(store)
+        decrypt_health = consumer_state.get("decrypt_health") or (
+            chat_consumer._decrypt_health_from_state({})
+        )
+        decrypt_policy = chat_consumer._decrypt_health_enforcement_state(
+            store, consumer_state
+        )
+    decrypt_ready = not (
+        decrypt_policy and decrypt_policy["blocks_verify"]
+    )
+    passing = found_reply and decrypt_ready
+
+    if passing:
         boot_gates._log_bootstrap_event(store, "chat_loop_verified", success=True)
         _maybe_enqueue_resident_introduction(store)
 
-    # Cleanup: remove synthetic ping from history regardless of outcome. If a
-    # reply landed, also remove the matching agent response. The verify exchange
-    # is a private liveness test; it must not open Chat as the user's visible
-    # "First message."
+    # Cleanup: remove the synthetic ping AND its ack from history regardless of
+    # outcome. The verify exchange is a private liveness test; it must not open
+    # Chat as the user's visible "First message."
+    #
+    # GC keys ONLY off source="verify_ping". Older code deleted "the first agent
+    # reply after the ping", so a concurrent REAL reply could be removed and
+    # leave its parent pointing at a missing reply row
+    # (DIAGNOSIS_hosted_reply_dangling_pointer_2026-07-20). The success matcher
+    # above is now stricter still (source + exact reply_to), while source remains
+    # the safe collection boundary for both the ping and its hidden ack.
     with store.chat_lock:
-        def _is_synthetic(m):
-            return (
-                isinstance(m, dict)
-                and (
-                    m.get("source") == "verify_ping"
-                    or (found_reply_id and m.get("id") == found_reply_id)
-                )
-            )
-        removed_ids = [m.get("id") for m in store.chat_messages if _is_synthetic(m)]
-        store.chat_messages = [m for m in store.chat_messages if not _is_synthetic(m)]
+        removed_ids = _verify_synthetic_ids_to_gc(store.chat_messages)
+        removed_set = set(removed_ids)
+        store.chat_messages = [
+            m for m in store.chat_messages
+            if not (isinstance(m, dict) and str(m.get("id") or "") in removed_set)
+        ]
         for rid in removed_ids:
-            if rid:
-                db.chat_delete(store.user_id, rid)
+            db.chat_delete(store.user_id, rid)
 
     suggestions = []
     if not found_reply:
@@ -1119,6 +1167,8 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
             "Use the resident consumer service and verify one ordinary IO Chat "
             "message after passing=true."
         )
+    if found_reply and not decrypt_ready and decrypt_health:
+        suggestions.append(decrypt_health["required"])
 
     return {
         "loop_alive": found_reply,
@@ -1126,5 +1176,12 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
         "ping_id": ping_uuid,
         "timeout_sec": timeout_sec,
         "suggestions": suggestions,
-        "passing": found_reply,
+        "passing": passing,
+        "reason": (
+            decrypt_health["reason"]
+            if found_reply and not decrypt_ready and decrypt_health
+            else ""
+        ),
+        "decrypt_health": decrypt_health,
+        "decrypt_health_policy": decrypt_policy,
     }, 200

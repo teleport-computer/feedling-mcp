@@ -116,6 +116,10 @@ these settings:
 | `FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED` | Defaults to `0`. Encrypted trajectory capture remains on, but provider-backed offline failure review must stay opt-in because it uses the account's configured provider credential and is not a production retry. |
 | `FEEDLING_V2_TRAJECTORY_REVIEW_MAX_ACTIVE` | Must be valid when review is enabled; bounds pending plus running review work across the database-backed fleet. The current default is 64. This is an admission ceiling, not a retention policy. |
 | `FEEDLING_ENCLAVE_URL` | Required for enclave-backed Memory, screen, worldbook, and decrypt operations. Use a private authenticated network path. |
+| `FEEDLING_DECRYPT_HEALTH_REFRESH_SEC` | Optional resident idle-probe cadence in seconds (default 120, minimum 5). Keep it below the backend's 300-second freshness window. |
+| `FEEDLING_DECRYPT_DEGRADE_AFTER` | Optional number of consecutive claimed-but-unreadable messages before the resident reports `degraded` (default 2, minimum 1). A real ordinary user-message decrypt resets the streak; a server maintenance turn does not. |
+| `FEEDLING_RESIDENT_DECRYPT_FAILURE_GRACE_SEC` | Optional backend persistence window before an explicit decrypt failure can inject a maintenance Chat turn for an established resident (default 1800 seconds, minimum 1). New onboarding remains immediately actionable, and all explicit failures can still produce an in-app notice before this window elapses. |
+| `FEEDLING_AGENT_TURN_TIMEOUT_SEC` | Optional wall-clock cap in seconds for one resident CLI agent turn (default 300, minimum 30). A turn exceeding it has its agent subprocess terminated and is treated as a timeout. Raise it for slow self-hosted stacks (cold starts, heavy MCP, long-thinking models); the cap always exists so a hung agent cannot wedge the single-flight chat lane. |
 | `FEEDLING_ASGI_BACKGROUND` | Enable on the real backend instance if it owns the wake bus and screen WebSocket listener. Do not enable competing development instances against the same ports without understanding leader election. |
 | `FEEDLING_PUBLIC_BASE_URL` | Set to the externally reachable HTTPS base URL. |
 | `FEEDLING_CORS_ALLOWED_ORIGINS` | Comma-separated exact browser origins. Leave empty if no browser client needs direct API access. Never use `*`. |
@@ -216,8 +220,13 @@ traffic until all enabled capabilities pass:
   model and completes a test envelope decrypt.
 - Memory `index` and `fetch` complete instead of returning
   `enclave_unavailable`.
-- Hosted Chat has a fresh Runtime V2 worker heartbeat and a test turn produces an
-  encrypted assistant response; or the resident consumer polls and responds.
+- Hosted Chat has a fresh runtime heartbeat for the user's fenced runtime (a
+  Runtime V2 worker heartbeat, or a V1 resident supervisor heartbeat during the
+  dual-runtime window) and a test turn produces an encrypted assistant
+  response; or the resident consumer polls with fresh
+  `X-Feedling-Decrypt-Status: ok` and
+  `X-Feedling-Decrypt-Checked-At` headers, passes `POST /v1/chat/verify_loop`,
+  and replies to an ordinary encrypted test turn.
 - Provider cache telemetry reports the expected route and usage fields. Where
   prompt caching matters operationally, run a two-turn cache-hit canary against
   the exact provider/model; do not infer a live hit from unit tests. The

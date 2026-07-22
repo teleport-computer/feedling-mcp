@@ -12,7 +12,11 @@ from genesis import prompts  # noqa: E402
 
 def test_fact_map_keep_all_off_is_unchanged():
     off = prompts.fact_map_messages("chunk")[0]["content"]
-    assert off == prompts.FACT_MAP_PROMPT + prompts._STRICT_JSON_SUFFIX
+    assert off == (
+        prompts.FACT_MAP_PROMPT
+        + prompts._user_naming_instruction("")
+        + prompts._STRICT_JSON_SUFFIX
+    )
 
 
 def test_fact_map_keep_all_on_appends_directive():
@@ -23,7 +27,11 @@ def test_fact_map_keep_all_on_appends_directive():
 
 def test_fact_write_keep_all_off_is_unchanged():
     off = prompts.fact_write_messages([])[0]["content"]
-    assert off == prompts.FACT_WRITE_PROMPT + prompts._STRICT_JSON_SUFFIX
+    assert off == (
+        prompts.FACT_WRITE_PROMPT
+        + prompts._user_naming_instruction("")
+        + prompts._STRICT_JSON_SUFFIX
+    )
     assert '"occurred_at":"YYYY-MM-DD or empty"' in off
 
 

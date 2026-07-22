@@ -1800,6 +1800,7 @@ def test_memory_summary_fallback_splits_high_recall_cards_without_ai_persona_sto
     assert not any("温柔稳定" in c["description"] and c["type"] in {"moment", "quote"} for c in cards)
     assert any("稳定陪伴" in c["description"] for c in cards)
     assert any("直接" in c["description"] for c in cards)
+    assert all("用户" not in c["description"] for c in cards)
 
 
 def test_identity_without_ai_source_does_not_use_user_profile_as_companion(monkeypatch):
@@ -2275,7 +2276,14 @@ def test_chat_response_accepts_verify_ping_reply_to_pending_ping(client, monkeyp
     )
     res = client.post(
         "/v1/chat/response",
-        json={"envelope": _verify_reply_envelope(user_id), "source": "verify_ping"},
+        json={
+            "envelope": _verify_reply_envelope(user_id),
+            "source": "verify_ping",
+            # This branch's gate is the consumer's strict contract: the ack must
+            # bind to THIS ping (source ∧ reply_to_message_id) — see the resident
+            # consumer's verify-ack sender, which always sets reply_to.
+            "reply_to_message_id": "ping_pending_01",
+        },
         headers=_headers(api_key),
     )
     assert res.status_code == 200, res.get_data(as_text=True)
