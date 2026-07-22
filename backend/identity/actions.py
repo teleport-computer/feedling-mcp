@@ -718,6 +718,8 @@ def _execute_identity_actions(
     # tool_schema.py 需在 0727 合并时同步此限幅。
     nudges: list[tuple[str, float]] = []
     for action in actions[:10]:
+        if not isinstance(action, dict):
+            continue  # Non-dict items will be caught by _execute_identity_action
         action_type = str(action.get("type") or action.get("action") or "").strip()
         if action_type == "identity.dimension_nudge":
             dimension_name = _identity_action_text(action.get("dimension") or action.get("dimension_name"), 80)
