@@ -65,6 +65,37 @@ def _clean_list_items(raw) -> list[str]:
     return [item for item in (_identity_action_text(v, 240) for v in raw[:12]) if item]
 
 
+def validate_list_ops_shape(patch: dict) -> None:
+    """Structural (existing-card-INDEPENDENT) half of the list-op validation:
+    conflict detection + blank-after-clean detection for add_/replace_ ops.
+    Only looks at `patch` — never needs the decrypted card — so callers
+    (``_identity_profile_patch``) can run this BEFORE acquiring the
+    identity_mutation_lock / doing the enclave read, failing fast on a
+    malformed request without touching either. ``apply_list_ops`` below also
+    calls this first, so it stays fully self-validating when used standalone
+    (e.g. directly from tests).
+
+    Raises:
+        ListOpConflict: more than one of {legacy key, add_, remove_,
+            replace_} present for the same field in this patch.
+        ListOpBlank: an add_/replace_ op's items are all blank after
+            stripping (remove has no such guard — removing nothing is a
+            harmless no-op, not a clear).
+    """
+    if not isinstance(patch, dict):
+        return
+    for field, (add_key, remove_key, replace_key) in _LIST_OP_FIELDS.items():
+        present_count = sum((
+            field in patch, add_key in patch, remove_key in patch, replace_key in patch,
+        ))
+        if present_count > 1:
+            raise ListOpConflict(field)
+        if replace_key in patch and not _clean_list_items(patch.get(replace_key)):
+            raise ListOpBlank(field)
+        if add_key in patch and not _clean_list_items(patch.get(add_key)):
+            raise ListOpBlank(field)
+
+
 def apply_list_ops(existing: dict, patch: dict) -> dict:
     """Pure merge for the 4 list-shaped profile fields.
 
@@ -77,17 +108,16 @@ def apply_list_ops(existing: dict, patch: dict) -> dict:
     touches; untouched fields are omitted so the caller's own "did this
     field change" bookkeeping stays correct.
 
-    Raises:
-        ListOpConflict: more than one of {legacy key, add_, remove_,
-            replace_} present for the same field in this patch.
-        ListOpBlank: an add_/replace_ op's items are all blank after
-            stripping (remove has no such guard — removing nothing is a
-            harmless no-op, not a clear).
+    Raises ListOpConflict / ListOpBlank via ``validate_list_ops_shape`` (see
+    there for exact conditions) — called first, so this function is fully
+    self-validating even when called without the earlier fail-fast check.
     """
     if not isinstance(existing, dict):
         existing = {}
     if not isinstance(patch, dict):
         patch = {}
+
+    validate_list_ops_shape(patch)
 
     result: dict[str, list[str]] = {}
     for field, (add_key, remove_key, replace_key) in _LIST_OP_FIELDS.items():
@@ -95,11 +125,8 @@ def apply_list_ops(existing: dict, patch: dict) -> dict:
         add_present = add_key in patch
         remove_present = remove_key in patch
         replace_present = replace_key in patch
-        present_count = sum((legacy_present, add_present, remove_present, replace_present))
-        if present_count == 0:
+        if not (legacy_present or add_present or remove_present or replace_present):
             continue
-        if present_count > 1:
-            raise ListOpConflict(field)
 
         old_list = existing.get(field) if isinstance(existing.get(field), list) else []
         old_list = [str(item) for item in old_list]
@@ -111,16 +138,13 @@ def apply_list_ops(existing: dict, patch: dict) -> dict:
             continue
 
         if replace_present:
-            new_list = _clean_list_items(patch.get(replace_key))
-            if not new_list:
-                raise ListOpBlank(field)
-            result[field] = new_list
+            # Already validated non-blank by validate_list_ops_shape above.
+            result[field] = _clean_list_items(patch.get(replace_key))
             continue
 
         if add_present:
+            # Already validated non-blank by validate_list_ops_shape above.
             additions = _clean_list_items(patch.get(add_key))
-            if not additions:
-                raise ListOpBlank(field)
             merged = list(old_list)
             for item in additions:
                 if item not in merged:
@@ -269,6 +293,19 @@ def _identity_profile_patch(
         if key in patch and not isinstance(patch.get(key), (list, str)):
             return {"status": "error", "error": f"{key}_must_be_list", "action": "identity.profile_patch"}, [], 400
 
+    # Fail fast on a malformed list-op request (conflicting ops on the same
+    # field, or an add_/replace_ whose items are all blank) BEFORE acquiring
+    # the lock or doing the enclave read — this check only looks at `patch`,
+    # never the existing card, so there's no reason to pay for either first.
+    try:
+        validate_list_ops_shape(patch)
+    except ListOpConflict as exc:
+        return {"status": "error", "error": "list_op_conflict", "field": str(exc),
+                "action": "identity.profile_patch"}, [], 400
+    except ListOpBlank as exc:
+        return {"status": "error", "error": "list_op_blank", "field": str(exc),
+                "action": "identity.profile_patch"}, [], 400
+
     # Everything below is a read-existing-card -> merge -> re-encrypt -> save
     # span. It must run under the per-user identity_mutation_lock so two
     # concurrent profile_patch calls (e.g. two different add_signature ops)
@@ -415,74 +452,83 @@ def _identity_dimension_nudge(
     except Exception:
         return {"status": "error", "error": "delta_required", "action": "identity.dimension_nudge"}, [], 400
 
-    plain, err = _identity_plain_for_action(store, api_key, runtime_token=runtime_token)
-    if plain is None:
-        return {"status": "error", "error": err, "action": "identity.dimension_nudge"}, [], 409
+    # Same read-existing-card -> merge -> re-encrypt -> save span as
+    # _identity_profile_patch, on the SAME per-user identity card — must run
+    # under the same identity_mutation_lock, or a concurrent profile_patch
+    # (e.g. add_signature) and a dimension_nudge can each read the
+    # pre-mutation card and lost-update each other's change on save.
+    def _read_merge_save() -> tuple[dict, list[dict], int]:
+        plain, err = _identity_plain_for_action(store, api_key, runtime_token=runtime_token)
+        if plain is None:
+            return {"status": "error", "error": err, "action": "identity.dimension_nudge"}, [], 409
 
-    payload = _identity_payload_from_plain(plain)
-    dims = list(payload.get("dimensions") or [])
-    matched = None
-    for dim in dims:
-        if isinstance(dim, dict) and str(dim.get("name") or "").strip().lower() == dimension_name.lower():
-            matched = dim
-            break
-    if matched is None:
-        return {"status": "error", "error": "dimension_not_found", "action": "identity.dimension_nudge"}, [], 404
-    try:
-        old_value = int(matched.get("value", 0))
-    except Exception:
-        old_value = 0
-    new_value = old_value + delta
-    from identity import card_policy
-    ok, err = card_policy.validate_dimension_nudge(dimension_name, new_value)
-    if not ok:
-        return {"status": "error", "error": err, "action": "identity.dimension_nudge"}, [], 400
-    if new_value == old_value:
+        payload = _identity_payload_from_plain(plain)
+        dims = list(payload.get("dimensions") or [])
+        matched = None
+        for dim in dims:
+            if isinstance(dim, dict) and str(dim.get("name") or "").strip().lower() == dimension_name.lower():
+                matched = dim
+                break
+        if matched is None:
+            return {"status": "error", "error": "dimension_not_found", "action": "identity.dimension_nudge"}, [], 404
+        try:
+            old_value = int(matched.get("value", 0))
+        except Exception:
+            old_value = 0
+        new_value = old_value + delta
+        from identity import card_policy
+        ok, err = card_policy.validate_dimension_nudge(dimension_name, new_value)
+        if not ok:
+            return {"status": "error", "error": err, "action": "identity.dimension_nudge"}, [], 400
+        if new_value == old_value:
+            return {
+                "status": "ok",
+                "action": "identity.dimension_nudge",
+                "changed_fields": [],
+                "noop": True,
+            }, [], 200
+        matched["value"] = new_value
+        reason = _identity_action_text(action.get("reason") or f"{dimension_name} adjusted by {delta:+d}.", 500)
+        if reason:
+            matched["last_nudge_reason"] = reason
+        payload["dimensions"] = dims
+
+        identity, change, err = _save_identity_action_payload(
+            store,
+            payload,
+            audit={
+                "action": "nudge",
+                "dimension": dimension_name,
+                "old_value": old_value,
+                "new_value": new_value,
+                "delta": delta,
+                "reason": reason,
+            },
+            event_type="identity_action_dimension_nudge",
+        )
+        if identity is None:
+            return {"status": "error", "error": err, "action": "identity.dimension_nudge"}, [], 409
+        effect = {
+            "type": "identity_updated",
+            "action": "identity.dimension_nudge",
+            "fields": ["dimensions"],
+            "identity_id": identity.get("id", ""),
+            "change_id": change.get("id", "") if change else "",
+        }
         return {
             "status": "ok",
             "action": "identity.dimension_nudge",
-            "changed_fields": [],
-            "noop": True,
-        }, [], 200
-    matched["value"] = new_value
-    reason = _identity_action_text(action.get("reason") or f"{dimension_name} adjusted by {delta:+d}.", 500)
-    if reason:
-        matched["last_nudge_reason"] = reason
-    payload["dimensions"] = dims
+            "changed_fields": ["dimensions"],
+            "identity": {
+                "id": identity.get("id", ""),
+                "updated_at": identity.get("updated_at", ""),
+                "days_with_user": identity_service._live_days_with_user(identity, store=store),
+            },
+            "change": change or {},
+        }, [effect], 200
 
-    identity, change, err = _save_identity_action_payload(
-        store,
-        payload,
-        audit={
-            "action": "nudge",
-            "dimension": dimension_name,
-            "old_value": old_value,
-            "new_value": new_value,
-            "delta": delta,
-            "reason": reason,
-        },
-        event_type="identity_action_dimension_nudge",
-    )
-    if identity is None:
-        return {"status": "error", "error": err, "action": "identity.dimension_nudge"}, [], 409
-    effect = {
-        "type": "identity_updated",
-        "action": "identity.dimension_nudge",
-        "fields": ["dimensions"],
-        "identity_id": identity.get("id", ""),
-        "change_id": change.get("id", "") if change else "",
-    }
-    return {
-        "status": "ok",
-        "action": "identity.dimension_nudge",
-        "changed_fields": ["dimensions"],
-        "identity": {
-            "id": identity.get("id", ""),
-            "updated_at": identity.get("updated_at", ""),
-            "days_with_user": identity_service._live_days_with_user(identity, store=store),
-        },
-        "change": change or {},
-    }, [effect], 200
+    with identity_service.identity_mutation_lock(store.user_id):
+        return _read_merge_save()
 
 
 def _identity_relationship_days_set(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:

@@ -1,5 +1,9 @@
 """Pure-unit tests for rename pairing validation (no DB required)."""
-from identity import card_policy
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+from identity import card_policy  # noqa: E402
 
 
 def test_rename_without_intro_rejected():

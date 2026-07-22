@@ -11,16 +11,19 @@ why each patch point is necessary.
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
-import db
-from core import enclave as core_enclave
-from core import envelope as core_envelope
-from core.store import UserStore
-from identity import actions as identity_actions
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+import db  # noqa: E402
+from core import enclave as core_enclave  # noqa: E402
+from core import envelope as core_envelope  # noqa: E402
+from core.store import UserStore  # noqa: E402
+from identity import actions as identity_actions  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -192,3 +195,95 @@ def test_concurrent_add_signature_no_lost_update(monkeypatch):
     final_signature = state["card"]["signature"]
     assert set(final_signature) == {"seed", "sig-A", "sig-B"}
     assert len(final_signature) == 3
+
+
+def test_concurrent_profile_patch_and_dimension_nudge_no_lost_update(monkeypatch):
+    # Reviewer-flagged gap: _identity_dimension_nudge is a read->merge->save
+    # writer on the SAME identity card as _identity_profile_patch, but wasn't
+    # under identity_mutation_lock. A concurrent add_signature (profile_patch)
+    # and a dimension nudge could each read the pre-mutation card and
+    # lost-update each other's change on save.
+    user_id = "u_concurrent_cross_action_test"
+
+    state = {"card": {
+        "agent_name": "bro",
+        "self_introduction": "keeping it real",
+        "signature": ["seed"],
+        "dimensions": [{"name": "锐利", "value": 50, "description": "x"}],
+    }}
+    state_lock = threading.Lock()
+    blobs: dict[tuple[str, str], dict] = {
+        (user_id, "identity"): {"id": "identity_1", "relationship_started_at": "2026-04-01"},
+    }
+
+    def fake_get_blob(uid, kind):
+        return blobs.get((uid, kind))
+
+    def fake_set_blob(uid, kind, doc):
+        blobs[(uid, kind)] = doc
+
+    def fake_log_append(uid, stream, doc):
+        return None
+
+    monkeypatch.setattr(db, "get_blob", fake_get_blob)
+    monkeypatch.setattr(db, "set_blob", fake_set_blob)
+    monkeypatch.setattr(db, "log_append", fake_log_append)
+
+    store = UserStore(user_id)
+
+    def fake_enclave_get(path, key, params=None, runtime_token=""):
+        if path != "/v1/identity/get":
+            return {}, ""
+        with state_lock:
+            snapshot = json.loads(json.dumps(state["card"]))
+        time.sleep(0.05)  # widen the race window, see test above
+        return {"identity": {**snapshot, "decrypt_status": "ok"}}, ""
+
+    def fake_build_envelope(store_arg, plaintext, item_id=None):
+        payload = json.loads(plaintext.decode("utf-8"))
+        with state_lock:
+            state["card"] = payload
+        return {
+            "id": item_id or "identity_1",
+            "body_ct": "ct", "nonce": "n", "K_user": "k",
+            "K_enclave": "ke", "visibility": "shared",
+            "owner_user_id": user_id, "enclave_pk_fpr": "test",
+        }, ""
+
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_get)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", fake_build_envelope)
+
+    errors: list[Exception] = []
+
+    def do_profile_patch():
+        try:
+            result, _effects, status = identity_actions._identity_profile_patch(
+                store, "test-key",
+                {"type": "identity.profile_patch", "patch": {"add_signature": ["sig-A"]}},
+            )
+            assert status == 200, result
+        except Exception as exc:  # noqa: BLE001 — surface on the main thread
+            errors.append(exc)
+
+    def do_dimension_nudge():
+        try:
+            result, _effects, status = identity_actions._identity_dimension_nudge(
+                store, "test-key",
+                {"type": "identity.dimension_nudge", "dimension": "锐利", "delta": 10},
+            )
+            assert status == 200, result
+        except Exception as exc:  # noqa: BLE001 — surface on the main thread
+            errors.append(exc)
+
+    t1 = threading.Thread(target=do_profile_patch)
+    t2 = threading.Thread(target=do_dimension_nudge)
+    t1.start()
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert not errors, errors
+    final_card = state["card"]
+    assert set(final_card["signature"]) == {"seed", "sig-A"}
+    dims_by_name = {d["name"]: d["value"] for d in final_card["dimensions"]}
+    assert dims_by_name["锐利"] == 60
