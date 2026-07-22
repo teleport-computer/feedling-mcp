@@ -12,6 +12,24 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- **`web_fetch` now returns the beginning of a large page instead of failing.**
+  A response over the raw-body cap was discarded whole, so the tool errored on
+  essentially every real site (Wikipedia is 360 KB, a weather page 86 KB, the
+  Python docs 41.8 KB) and a model that only ever saw failures would tell the
+  user it had no web access. It now keeps what it read, raises the retained-body
+  cap to 300 KB, and reports a new `truncated` boolean that is true whenever any
+  content was left out — either the body cut or the text cap. An unterminated
+  `<script>`/`<style>` tail is dropped rather than handed over as page text.
+- **`web_fetch` now extracts the readable article from a page.** With only a
+  plain tag-strip, most of the model's per-page budget went to the navigation
+  menu ("Jump to content / Main menu / Donate" fills the first 2257 characters
+  of a Wikipedia article; a weather page opened with "首页 预报 预警 雷达").
+  HTML pages now go through an article extractor first, so a weather page reads
+  "中雨 24℃ 晴转多云" and an article starts at its first sentence. Non-HTML
+  responses (JSON, plain text, source) are untouched. Extraction runs in an
+  isolated, time- and memory-bounded child process and falls back to the plain
+  strip on any failure; the `FEEDLING_WEB_EXTRACT_ARTICLE` env var disables it.
+
 - **Web search is now user-controlled.** `web_search` / `web_fetch` are only
   offered to the model when the account's toggle is on; before this change they
   were always available. The switch covers **every** turn — foreground chat, the
