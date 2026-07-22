@@ -6311,6 +6311,40 @@ _whoami_cache: dict = {
 # keys; 0.0 until the first success so the first reply still fetches.
 _whoami_cache_loaded_at: float = 0.0
 
+class ActionsHTTPError(RuntimeError):
+    """Raised by execute_identity_actions/execute_memory_actions on any HTTP
+    >=400 — same trigger, same message format as a plain RuntimeError, so the
+    several OTHER call sites in this file (capture/dream flows, resident
+    maintenance) that just do ``except Exception: log.warning(...)`` are
+    completely unaffected; this only ADDS an attribute for callers that want
+    it.
+
+    C2: both backends write a batch SERIALLY and stop at the first failing
+    item (backend/identity/actions.py's ``_execute_identity_actions`` /
+    backend/memory/actions.py's ``_execute_memory_actions``), so a 4xx body
+    still carries the real ``results``/``effects`` of any leading actions
+    that DID apply before the failure. Treating the whole bucket as
+    uniformly failed would invite a caller to retry the ENTIRE batch,
+    re-applying those already-applied, possibly non-idempotent leading
+    actions a second time (e.g. a dimension_nudge applied twice). ``body``
+    carries the parsed JSON response (``None`` if the body wasn't valid
+    JSON / wasn't a dict) so execute_agent_actions' admission funnel can
+    recover per-item outcomes instead of guessing."""
+
+    def __init__(self, message: str, *, status_code: int, body: dict | None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
+
+
+def _parse_actions_error_body(resp) -> dict | None:
+    try:
+        candidate = resp.json()
+    except Exception:
+        return None
+    return candidate if isinstance(candidate, dict) else None
+
+
 def execute_identity_actions(actions: list[dict]) -> dict:
     if not actions:
         return {"status": "ok", "results": [], "effects": []}
@@ -6321,7 +6355,11 @@ def execute_identity_actions(actions: list[dict]) -> dict:
         timeout=20,
     )
     if resp.status_code >= 400:
-        raise RuntimeError(f"identity_actions_http_{resp.status_code}:{resp.text[:500]}")
+        raise ActionsHTTPError(
+            f"identity_actions_http_{resp.status_code}:{resp.text[:500]}",
+            status_code=resp.status_code,
+            body=_parse_actions_error_body(resp),
+        )
     body = resp.json()
     if not isinstance(body, dict) or body.get("status") not in {"ok", "created", "replaced"}:
         raise RuntimeError(f"identity_actions_unexpected_response:{str(body)[:500]}")
@@ -6338,7 +6376,11 @@ def execute_memory_actions(actions: list[dict]) -> dict:
         timeout=20,
     )
     if resp.status_code >= 400:
-        raise RuntimeError(f"memory_actions_http_{resp.status_code}:{resp.text[:500]}")
+        raise ActionsHTTPError(
+            f"memory_actions_http_{resp.status_code}:{resp.text[:500]}",
+            status_code=resp.status_code,
+            body=_parse_actions_error_body(resp),
+        )
     body = resp.json()
     if not isinstance(body, dict) or body.get("status") not in {"ok", "created", "replaced"}:
         raise RuntimeError(f"memory_actions_unexpected_response:{str(body)[:500]}")
@@ -6358,6 +6400,16 @@ def execute_memory_actions(actions: list[dict]) -> dict:
 # / identity.patch 的写法),改写 type 会让服务端观测到跟今天不一样的请求,
 # 这正是要避免的。
 # ---------------------------------------------------------------------------
+
+# Same import mechanism as tools/io_cli.py: sys.path already has backend/ on
+# it (module-level insert near the top of this file), but the try/except
+# mirrors io_cli's graceful-degradation posture — if the import ever fails,
+# the funnel's rename-pairing check below (I3) just no-ops instead of taking
+# down the whole consumer process.
+try:
+    from identity import card_policy as _card_policy  # noqa: PLC0415 — single source, pure stdlib
+except Exception:
+    _card_policy = None
 
 _ACTION_TYPE_ALIASES: dict[str, str] = {
     "memory.create": "memory.add",
@@ -6411,19 +6463,24 @@ def _action_allowlist_mode() -> str:
     return "shadow"
 
 
+# M11: the ONLY statuses the server actually returns for a successfully
+# applied per-item result (backend/identity/actions.py + backend/memory/
+# actions.py — every success return is literally {"status": "ok", ...}
+# today; "created"/"replaced" are kept here too since those are the batch-
+# level status values execute_identity_actions/execute_memory_actions accept
+# — same success family, in case a future item-level result ever uses them).
+_ACTION_RESULT_SUCCESS_STATUSES = frozenset({"ok", "created", "replaced"})
+
+
 def _action_result_outcome(item: Any) -> tuple[str, str]:
     """Map ONE action's per-item result (from execute_identity_actions /
-    execute_memory_actions' "results" array) to an outcome label. Both
-    backends early-abort a batch on the first item whose status is an error
-    (returning an HTTP >=400 the caller already turned into an exception
-    before this is reached), so on the success path every item's status is
-    "ok" — the only distinction left to make here is noop vs applied.
+    execute_memory_actions' "results" array) to an outcome label.
 
-    A missing/non-dict item (index out of range — e.g. the backend truncates
-    a batch at 20 actions, so a bucket forwarded with >20 items gets fewer
-    results back than actions sent) must NEVER be read as "applied" — that
-    would silently fabricate success for an action the server never actually
-    reported on. Default to failed_execution/result_missing instead."""
+    M11: only an EXPLICIT success status counts as applied — an unknown/
+    missing status (or a bare ``{}``) must never be silently treated as
+    success just because the item was "some dict". Anything that isn't
+    error/noop/an explicit success status maps to failed_execution/
+    invalid_result."""
     if not isinstance(item, dict):
         return "failed_execution", "result_missing"
     status = str(item.get("status") or "").strip().lower()
@@ -6431,7 +6488,9 @@ def _action_result_outcome(item: Any) -> tuple[str, str]:
         return "failed_execution", str(item.get("error") or "")[:120]
     if item.get("noop") or item.get("skipped"):
         return "noop", ""
-    return "applied", ""
+    if status in _ACTION_RESULT_SUCCESS_STATUSES:
+        return "applied", ""
+    return "failed_execution", "invalid_result"
 
 
 def _outcomes_for_bucket(
@@ -6440,19 +6499,36 @@ def _outcomes_for_bucket(
     error: Exception | None,
     error_code: str = "",
     results: list | None,
+    missing_result_error_code: str = "result_missing",
 ) -> list[dict]:
+    """Build outcomes for one bucket (identity or memory).
+
+    - ``results is None`` (no usable per-item signal at all — a network
+      error, an unparseable/non-dict error body, or a genuinely-never-sent
+      bucket): every entry is uniformly failed_execution, labeled
+      ``error_code`` (or the exception's class name).
+    - ``results`` is a list (a normal 200 success, OR — C2 — a 4xx body we
+      recovered per-item results from): map each entry against its index in
+      ``results`` via ``_action_result_outcome``. An index beyond
+      ``len(results)`` is reported via ``missing_result_error_code`` —
+      callers pass "result_missing" for a truncated-input success (M11) vs
+      "not_attempted" for the serial-abort tail of a recovered partial
+      failure (C2), since those mean different things operationally.
+    """
     outcomes: list[dict] = []
     for idx, (original_type, canonical_type) in enumerate(entries):
-        if error is not None:
+        if results is None:
             outcomes.append({
                 "original_type": original_type,
                 "canonical_type": canonical_type,
                 "outcome": "failed_execution",
-                "error_code": error_code or type(error).__name__,
+                "error_code": error_code or (type(error).__name__ if error is not None else ""),
             })
             continue
-        item = results[idx] if isinstance(results, list) and idx < len(results) else None
-        outcome, item_error_code = _action_result_outcome(item)
+        if idx < len(results):
+            outcome, item_error_code = _action_result_outcome(results[idx])
+        else:
+            outcome, item_error_code = "failed_execution", missing_result_error_code
         outcomes.append({
             "original_type": original_type,
             "canonical_type": canonical_type,
@@ -6490,16 +6566,33 @@ def execute_agent_actions(actions: list[dict]) -> dict:
     Returns a dict that never raises for an ordinary HTTP-level failure —
     callers read `outcomes` (one entry per forwarded-or-rejected action:
     {"original_type", "canonical_type", "outcome", "error_code"}, outcome in
-    applied|noop|rejected_allowlist|failed_execution; error_code "not_attempted"
-    marks a bucket skipped by the early abort above, "result_missing" marks a
-    per-item result the server never returned). NOTE: outcomes are NOT
-    guaranteed to be in the same order as the input `actions` list — they are
-    grouped identity-bucket-first, then memory-bucket, each in its own
-    within-bucket order; match on original_type/canonical_type, not position.
-    Pass the list to rewrite_reply_for_outcomes to produce an honest reply.
-    Still raises RuntimeError for a garbage action type that is neither
-    identity.* nor memory.* — that is a caller/prompt bug, not a server-side
-    outcome.
+    applied|noop|rejected_allowlist|rejected_validation|failed_execution;
+    error_code "not_attempted" marks an action the server never got to (the
+    early abort above, or the serial-abort tail of a batch that failed
+    partway through — see C2 below), "result_missing" marks a per-item
+    result a 200 response never returned (input silently truncated),
+    "invalid_result" marks a per-item result with no recognized status
+    (M11)). NOTE: outcomes are NOT guaranteed to be in the same order as the
+    input `actions` list — they are grouped identity-bucket-first, then
+    memory-bucket, each in its own within-bucket order; match on
+    original_type/canonical_type, not position. Pass the list to
+    rewrite_reply_for_outcomes to produce an honest reply. Still raises
+    RuntimeError for a garbage action type that is neither identity.* nor
+    memory.* — that is a caller/prompt bug, not a server-side outcome.
+
+    C2 (双写风险 / no-retry-double-apply): both backends write a batch
+    SERIALLY and stop at the first failing item, so a 4xx response body
+    still carries the results/effects of any leading actions that DID
+    apply. A 4xx is therefore mapped PER-ITEM (via ActionsHTTPError.body)
+    instead of marking the whole bucket failed_execution — the leading
+    items get their real applied/noop outcome, the failing item gets its
+    real error, and the never-reached tail is not_attempted. Only a
+    genuine network error or an unparseable/bodyless failure falls back to
+    a uniform whole-bucket failed_execution (no per-item signal exists).
+    This does NOT change the identity->memory short-circuit (C1): the
+    identity REQUEST still failed, so the memory bucket is still never
+    sent — recovering partial identity results changes how that failure is
+    REPORTED, not whether memory gets attempted.
     """
     mode = _action_allowlist_mode()
     identity_actions: list[dict] = []
@@ -6520,6 +6613,32 @@ def execute_agent_actions(actions: list[dict]) -> dict:
         else:
             unsupported.append(original_type)
             continue
+
+        # I3 / D4: same-source rename-pairing check for the agent-origin
+        # funnel. This is spec 3.1/3.4's content-validation gate — the
+        # server ALREADY enforces it server-side when a runtime token is
+        # present (backend/identity/actions.py's _identity_profile_patch),
+        # and io_cli front-runs the same rule locally; this is the THIRD of
+        # the three documented enforcement points, for actions arriving
+        # through the consumer's own agent-output funnel. It is explicitly
+        # NOT part of the shadow/enforce/off allowlist experiment — it runs
+        # in ALL THREE modes, never gated by FEEDLING_ACTION_ALLOWLIST.
+        if canonical_type == "identity.profile_patch" and _card_policy is not None:
+            raw_patch = action.get("patch") if isinstance(action.get("patch"), dict) else action
+            pairing_ok, pairing_err = _card_policy.validate_rename_pairing(raw_patch)
+            if not pairing_ok:
+                log.warning(
+                    "action_admission rejected type=%s canonical=%s reason=%s — "
+                    "dropped, not forwarded (D4 rename pairing, all modes)",
+                    original_type, canonical_type, pairing_err,
+                )
+                outcomes.append({
+                    "original_type": original_type,
+                    "canonical_type": canonical_type,
+                    "outcome": "rejected_validation",
+                    "error_code": pairing_err or "rename_requires_self_introduction",
+                })
+                continue
 
         if canonical_type not in _ACTION_ALLOWLIST:
             if mode == "enforce":
@@ -6557,18 +6676,36 @@ def execute_agent_actions(actions: list[dict]) -> dict:
     identity_error: Exception | None = None
     memory_error: Exception | None = None
     memory_not_attempted = False
+    # Tracks whether we actually recovered a usable body on the exception
+    # path (C2) — distinct from identity_result/memory_result's default
+    # placeholder value, which also happens to have an empty "results" list
+    # and must NOT be mistaken for "the server told us nothing applied".
+    identity_recovered = False
+    memory_recovered = False
 
     if identity_actions:
         try:
             identity_result = execute_identity_actions(identity_actions)
         except Exception as e:
             identity_error = e
+            # C2: a 4xx with a parseable JSON body still carries the real
+            # per-item results/effects of any leading actions that DID
+            # apply before the failing one — recover it instead of
+            # discarding it, so outcomes (below) can be built per-item
+            # rather than uniformly failed_execution.
+            recovered = getattr(e, "body", None) if isinstance(e, ActionsHTTPError) else None
+            if isinstance(recovered, dict):
+                identity_result = recovered
+                identity_recovered = True
 
     # C1: restored sequential-with-early-abort — pre-Task-7 semantics never
     # sent the memory HTTP call at all once the identity call raised. Do not
     # "improve" this into independent per-bucket attempts: shadow mode's
     # byte-identical-wire guarantee (content/order/COUNT of requests) must
-    # hold on the failure path too, not just the happy path.
+    # hold on the failure path too, not just the happy path. Recovering
+    # partial identity results (C2, above) changes only how the identity
+    # failure is REPORTED — the identity REQUEST still failed, so memory is
+    # still never sent.
     if identity_error is not None:
         memory_not_attempted = bool(memory_actions)
     elif memory_actions:
@@ -6576,11 +6713,31 @@ def execute_agent_actions(actions: list[dict]) -> dict:
             memory_result = execute_memory_actions(memory_actions)
         except Exception as e:
             memory_error = e
+            recovered = getattr(e, "body", None) if isinstance(e, ActionsHTTPError) else None
+            if isinstance(recovered, dict):
+                memory_result = recovered  # C2, same as identity above
+                memory_recovered = True
 
+    # results=None means "no usable per-item signal AT ALL" to
+    # _outcomes_for_bucket (triggers the uniform whole-bucket failure path).
+    # That must be true whenever the call succeeded with no error (normal
+    # results list — real signal either way) is NOT the ambiguous case;
+    # the ambiguous case is: identity_error is set but recovery did NOT
+    # happen — the default {"results": [], "effects": []} placeholder must
+    # be read as "no signal", not as "server returned zero results".
+    if identity_error is not None and not identity_recovered:
+        identity_results_list = None
+    else:
+        candidate = identity_result.get("results") if isinstance(identity_result, dict) else None
+        identity_results_list = candidate if isinstance(candidate, list) else None
     outcomes.extend(_outcomes_for_bucket(
         identity_entries,
         error=identity_error,
-        results=identity_result.get("results") if isinstance(identity_result, dict) else None,
+        results=identity_results_list,
+        # C2: when the identity request failed, ANY index beyond what we
+        # recovered means the server's serial write never reached it —
+        # "not_attempted", not the success-path's "result_missing".
+        missing_result_error_code="not_attempted" if identity_error is not None else "result_missing",
     ))
     if memory_not_attempted:
         outcomes.extend(_outcomes_for_bucket(
@@ -6590,10 +6747,16 @@ def execute_agent_actions(actions: list[dict]) -> dict:
             results=None,
         ))
     else:
+        if memory_error is not None and not memory_recovered:
+            memory_results_list = None
+        else:
+            candidate = memory_result.get("results") if isinstance(memory_result, dict) else None
+            memory_results_list = candidate if isinstance(candidate, list) else None
         outcomes.extend(_outcomes_for_bucket(
             memory_entries,
             error=memory_error,
-            results=memory_result.get("results") if isinstance(memory_result, dict) else None,
+            results=memory_results_list,
+            missing_result_error_code="not_attempted" if memory_error is not None else "result_missing",
         ))
 
     return {
@@ -6642,7 +6805,7 @@ _ACTION_OUTCOME_MIXED_NOTE_MANY_EN = "Though {n} of those did not actually take 
 
 
 def rewrite_reply_for_outcomes(
-    replies: list[str], outcomes: list[dict], fallback_ok: str
+    replies: list[str], outcomes: list[dict], fallback_ok: str, lang: str = "",
 ) -> list[str]:
     """Pure function — turn per-action outcomes into an honest reply list.
 
@@ -6654,28 +6817,46 @@ def rewrite_reply_for_outcomes(
       KEPT (or [fallback_ok] if it was empty) and ONE short, generic sentence
       is appended naming only the COUNT of items that didn't take effect —
       never the raw action type.
-    - zero applied, but at least one genuine rejected/failed_execution:
-      replies is REPLACED with an honest failure sentence (a batch with any
-      real failure is reported as a failure, not shrugged off as a noop).
+    - zero applied, but at least one genuine rejected/failed_execution/
+      rejected_validation: replies is REPLACED with an honest failure
+      sentence (a batch with any real failure is reported as a failure, not
+      shrugged off as a noop).
     - zero applied, and every outcome is "noop" (nothing failed, there was
       just nothing to do): replies is kept + a short "didn't change
       anything" note appended if non-empty, or a standalone honest noop
       sentence (distinct wording from the failure sentence) if replies was
       empty.
+
+    ``lang`` (I5): optional explicit "zh" or "en" hint — pass it whenever the
+    caller has a reliable signal for the ORIGINAL user message's language
+    (see the foreground call site: raw pre-injection message content, not
+    the composed prompt, which may carry an unrelated Chinese catalog/
+    system block that would otherwise skew the auto-detect below). Anything
+    else (empty, unrecognized) falls back to scanning ``fallback_ok`` and
+    ``replies`` for CJK characters, same as before — kept purely for
+    backward compatibility / callers with no better signal (e.g. the
+    proactive lane, where ``fallback_ok`` is always the model's own
+    already-correct-language reply).
     """
     replies = [r for r in (replies or [])]
     if not outcomes:
         return replies
 
-    zh = bool(re.search(r"[\u4e00-\u9fff]", str(fallback_ok) or "")) or any(
-        re.search(r"[\u4e00-\u9fff]", str(r)) for r in replies
-    )
+    if lang == "zh":
+        zh = True
+    elif lang == "en":
+        zh = False
+    else:
+        zh = bool(re.search(r"[\u4e00-\u9fff]", str(fallback_ok) or "")) or any(
+            re.search(r"[\u4e00-\u9fff]", str(r)) for r in replies
+        )
 
     applied = [o for o in outcomes if isinstance(o, dict) and o.get("outcome") == "applied"]
     noop = [o for o in outcomes if isinstance(o, dict) and o.get("outcome") == "noop"]
     bad = [
         o for o in outcomes
-        if isinstance(o, dict) and o.get("outcome") in ("rejected_allowlist", "failed_execution")
+        if isinstance(o, dict)
+        and o.get("outcome") in ("rejected_allowlist", "rejected_validation", "failed_execution")
     ]
 
     if not noop and not bad:
@@ -10599,6 +10780,14 @@ def _process_messages(messages: list) -> float:
             continue
 
         content = str(msg.get("content") or "").strip()
+        # I5: snapshot BEFORE any prompt-composition mutation below (screen
+        # context / world book / quoted text / time anchor / io_cli capability
+        # catalog / transcript header) — those can all carry unrelated
+        # Chinese boilerplate (the io_cli catalog especially) that would skew
+        # a CJK-presence language check run against the fully-composed
+        # `content` later. Used ONLY for language detection (the honest
+        # success/failure/outcome reply text), never sent to the agent.
+        raw_user_content_for_lang = content
         content_type = msg.get("content_type", "text")
         image_payloads: list[dict[str, str]] = []
         image_paths: list[str] = []
@@ -10829,17 +11018,27 @@ def _process_messages(messages: list) -> float:
                 # 结果真实化(Task 7): execute_agent_actions no longer fakes a
                 # "Done" reply just because the HTTP call didn't raise — it
                 # returns per-action outcomes (applied/noop/rejected_allowlist/
-                # failed_execution) and rewrite_reply_for_outcomes turns those
-                # into an honest reply. All-applied (or no outcomes at all)
-                # is a no-op here — same visible text as before.
+                # rejected_validation/failed_execution) and
+                # rewrite_reply_for_outcomes turns those into an honest
+                # reply. All-applied (or no outcomes at all) is a no-op here
+                # — same visible text as before.
+                #
+                # I5: language is derived from the RAW pre-injection user
+                # message (raw_user_content_for_lang), not `content` — by
+                # this point `content` has been prepended with the io_cli
+                # capability catalog + transcript header + time anchor, all
+                # of which can carry Chinese text unrelated to what language
+                # the user actually wrote in, which would otherwise make an
+                # English-speaking self-hosted user get a Chinese note.
                 replies = rewrite_reply_for_outcomes(
                     replies,
                     action_result.get("outcomes") or [],
-                    fallback_ok=_identity_action_success_reply(content),
+                    fallback_ok=_identity_action_success_reply(raw_user_content_for_lang),
+                    lang=("zh" if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang) else "en"),
                 )
             except Exception as e:
                 log.error("agent action execution failed; suppressing optimistic agent reply: %s", e)
-                replies = [_identity_action_failure_reply(content)]
+                replies = [_identity_action_failure_reply(raw_user_content_for_lang)]
 
         reply_to_message_id = str(msg.get("id") or msg.get("message_id") or "").strip()
         posted_any = False

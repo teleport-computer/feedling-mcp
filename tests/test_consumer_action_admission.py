@@ -313,7 +313,7 @@ def test_execute_agent_actions_shadow_mode_forwards_unknown_type_and_counts_it(m
         "original_type": "memory.frobnicate",
         "canonical_type": "memory.frobnicate",
         "outcome": "failed_execution",
-        "error_code": "RuntimeError",
+        "error_code": "ActionsHTTPError",
     }]
 
 
@@ -408,7 +408,10 @@ def test_execute_agent_actions_identity_patch_canonicalizes_and_is_admitted(monk
         ),
     )
 
-    result = crc.execute_agent_actions([{"type": "identity.patch", "patch": {"agent_name": "小秘"}}])
+    result = crc.execute_agent_actions([{
+        "type": "identity.patch",
+        "patch": {"agent_name": "小秘", "self_introduction": "我是小秘。"},
+    }])
 
     assert len(calls) == 1, "identity.patch must not be dropped by the allowlist gate"
     # The action forwarded on the wire is UNCHANGED — still "identity.patch",
@@ -461,7 +464,7 @@ def test_execute_agent_actions_identity_failure_blocks_memory_bucket_c1(monkeypa
     )
 
     result = crc.execute_agent_actions([
-        {"type": "identity.profile_patch", "patch": {"agent_name": "x"}},
+        {"type": "identity.profile_patch", "patch": {"agent_name": "x", "self_introduction": "hi"}},
         {"type": "memory.add", "memory": {"summary": "y"}},
     ])
 
@@ -610,7 +613,7 @@ def test_proactive_marks_job_failed_when_memory_identity_action_all_fails(monkey
     statuses = []
     posted = []
 
-    action = {"type": "identity.profile_patch", "patch": {"agent_name": "小秘"}}
+    action = {"type": "identity.profile_patch", "patch": {"agent_name": "小秘", "self_introduction": "我是小秘。"}}
     monkeypatch.setattr(crc, "call_agent", lambda *a, **kw: {"actions": [action], "messages": ["改好了。"]})
     monkeypatch.setattr(crc, "post_reply", lambda reply, **kw: posted.append(reply) or {"id": "m3"})
     monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
@@ -653,7 +656,7 @@ def test_proactive_all_failed_action_does_not_kill_scheduled_wake_chain(monkeypa
     posted = []
 
     actions = [
-        {"type": "identity.profile_patch", "patch": {"agent_name": "小秘"}},
+        {"type": "identity.profile_patch", "patch": {"agent_name": "小秘", "self_introduction": "我是小秘。"}},
         {"type": "schedule_wake", "at": "2030-01-01T09:30:00", "tz": "Asia/Shanghai", "note": "check in"},
     ]
     monkeypatch.setattr(crc, "call_agent", lambda *a, **kw: {"actions": actions, "messages": ["改好了。"]})
@@ -721,3 +724,410 @@ def test_proactive_leaves_silent_background_noop_untouched(monkeypatch):
     assert not any(s[1] == "failed" and "memory_identity_action_failed" in s[2] for s in statuses), (
         "a noop must not be reported as an action failure"
     )
+
+
+# ---------------------------------------------------------------------------
+# Round 3 (Codex mid-point review) — C2, M11, I5, I3
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# C2: a 4xx with a parseable body still carries results/effects for any
+# leading actions that DID apply — must not be treated as a uniform
+# whole-bucket failure (that would invite a retry that double-applies the
+# leading, possibly non-idempotent actions).
+# ---------------------------------------------------------------------------
+
+def test_execute_agent_actions_partial_4xx_maps_leading_success_failing_item_and_tail(monkeypatch):
+    """Fabricated server body matching backend/memory/actions.py's
+    _execute_memory_actions shape EXACTLY: it writes serially, stops at the
+    first failing item, and returns the results/effects accumulated so far
+    (this is also backend/identity/actions.py's _execute_identity_actions
+    shape — same pattern, same code)."""
+    # 4 actions submitted; the server applied #0 and #1, #2 failed, and per
+    # the server's serial-abort-on-error design #3 (the tail) was NEVER
+    # attempted at all — it's simply absent from results.
+    server_4xx_body = {
+        "status": "error",
+        "error": "title_required",
+        "results": [
+            {"status": "ok", "action": "memory.add", "memory": {"id": "mom_1"}},
+            {"status": "ok", "action": "memory.add", "memory": {"id": "mom_2"}},
+            {"status": "error", "error": "title_required", "action": "memory.add"},
+        ],
+        "effects": [
+            {"type": "memory_added", "memory_id": "mom_1"},
+            {"type": "memory_added", "memory_id": "mom_2"},
+        ],
+    }
+    monkeypatch.setattr(
+        crc._HTTP, "post",
+        _http_router(memory=_Resp(400, server_4xx_body)),
+    )
+
+    actions = [
+        {"type": "memory.add", "memory": {"summary": f"item {i}"}}
+        for i in range(4)
+    ]
+    result = crc.execute_agent_actions(actions)
+
+    outcomes = result["outcomes"]
+    assert len(outcomes) == 4
+    assert outcomes[0]["outcome"] == "applied"
+    assert outcomes[1]["outcome"] == "applied"
+    assert outcomes[2]["outcome"] == "failed_execution"
+    assert outcomes[2]["error_code"] == "title_required"
+    assert outcomes[3]["outcome"] == "failed_execution"
+    assert outcomes[3]["error_code"] == "not_attempted", (
+        "the never-reached tail must be labeled not_attempted, not lumped in "
+        "with the item that actually failed"
+    )
+    # C2's whole point: leading successes must be visible so nothing retries
+    # (and thus double-applies) mom_1/mom_2.
+    assert result["effects"] == server_4xx_body["effects"]
+
+    # And the reply must be honest without over-claiming full success or
+    # full failure — mixed, since 2 of 4 really did apply.
+    replies = crc.rewrite_reply_for_outcomes(["记好了。"], outcomes, fallback_ok="记好了。")
+    assert replies[0] == "记好了。"
+    assert replies[1] == crc._ACTION_OUTCOME_MIXED_NOTE_MANY_ZH.format(n=2)
+
+
+def test_execute_agent_actions_4xx_without_results_key_falls_back_to_whole_bucket_failure(monkeypatch):
+    """An error body with no results[] at all (or an unparseable/non-JSON
+    body) carries no per-item signal — must fall back to the pre-existing
+    uniform whole-bucket failed_execution, not crash or fabricate items."""
+    monkeypatch.setattr(
+        crc._HTTP, "post",
+        _http_router(memory=_Resp(400, {"status": "error", "error": "actions_required"})),
+    )
+
+    result = crc.execute_agent_actions([{"type": "memory.add", "memory": {"summary": "x"}}])
+
+    assert result["outcomes"] == [{
+        "original_type": "memory.add",
+        "canonical_type": "memory.add",
+        "outcome": "failed_execution",
+        "error_code": "ActionsHTTPError",
+    }]
+
+
+def test_execute_agent_actions_4xx_unparseable_body_falls_back_to_whole_bucket_failure(monkeypatch):
+    class _UnparseableResp:
+        status_code = 400
+        text = "<html>not json</html>"
+
+        def json(self):
+            raise ValueError("not json")
+
+    monkeypatch.setattr(
+        crc._HTTP, "post",
+        _http_router(memory=_UnparseableResp()),
+    )
+
+    result = crc.execute_agent_actions([{"type": "memory.add", "memory": {"summary": "x"}}])
+
+    assert result["outcomes"][0]["outcome"] == "failed_execution"
+    assert result["outcomes"][0]["error_code"] == "ActionsHTTPError"
+
+
+def test_execute_agent_actions_identity_partial_4xx_still_blocks_memory_bucket(monkeypatch):
+    """C2 must not weaken C1: even with a RECOVERED partial identity
+    failure, the identity REQUEST still failed, so memory must still never
+    be sent."""
+    calls = []
+    monkeypatch.setattr(
+        crc._HTTP, "post",
+        _http_router(
+            identity=_Resp(400, {
+                "status": "error",
+                "error": "boom",
+                "results": [{"status": "ok", "action": "identity.profile_patch"}],
+                "effects": [{"type": "identity_updated"}],
+            }),
+            memory=_Resp(200, {"status": "ok", "results": [{"status": "ok"}], "effects": []}),
+            calls=calls,
+        ),
+    )
+
+    result = crc.execute_agent_actions([
+        {"type": "identity.profile_patch", "patch": {"agent_name": "a", "self_introduction": "hi"}},
+        {"type": "identity.dimension_nudge", "dimension": "warmth", "delta": 1},
+        {"type": "memory.add", "memory": {"summary": "y"}},
+    ])
+
+    urls = [c[0] for c in calls]
+    assert urls == [f"{crc.FEEDLING_API_URL}/v1/identity/actions"], (
+        "memory must still never be sent once the identity request failed"
+    )
+    outcomes = {o["original_type"]: o for o in result["outcomes"]}
+    assert outcomes["identity.profile_patch"]["outcome"] == "applied"
+    assert outcomes["identity.dimension_nudge"]["outcome"] == "failed_execution"
+    assert outcomes["identity.dimension_nudge"]["error_code"] == "not_attempted", (
+        "the recovered results[] only covers the first action — the second "
+        "identity action was never reached by the server's serial write"
+    )
+    assert outcomes["memory.add"]["outcome"] == "failed_execution"
+    assert outcomes["memory.add"]["error_code"] == "not_attempted"
+
+
+# ---------------------------------------------------------------------------
+# M11: an unrecognized/missing per-item status must never be treated as
+# applied just because the item was "some dict".
+# ---------------------------------------------------------------------------
+
+def test_action_result_outcome_rejects_unknown_status_as_invalid_result():
+    assert crc._action_result_outcome({}) == ("failed_execution", "invalid_result")
+    assert crc._action_result_outcome({"status": "pending"}) == ("failed_execution", "invalid_result")
+    assert crc._action_result_outcome({"action": "memory.add"}) == ("failed_execution", "invalid_result")
+
+
+def test_action_result_outcome_accepts_the_success_status_family():
+    assert crc._action_result_outcome({"status": "ok"}) == ("applied", "")
+    assert crc._action_result_outcome({"status": "created"}) == ("applied", "")
+    assert crc._action_result_outcome({"status": "replaced"}) == ("applied", "")
+
+
+def test_execute_agent_actions_unknown_item_status_is_not_applied(monkeypatch):
+    monkeypatch.setattr(
+        crc._HTTP, "post",
+        _http_router(memory=_Resp(200, {
+            "status": "ok",
+            "results": [{"action": "memory.add"}],  # no "status" key at all
+            "effects": [],
+        })),
+    )
+
+    result = crc.execute_agent_actions([{"type": "memory.add", "memory": {"summary": "x"}}])
+
+    assert result["outcomes"][0]["outcome"] == "failed_execution"
+    assert result["outcomes"][0]["error_code"] == "invalid_result"
+
+
+# ---------------------------------------------------------------------------
+# I5: notes must follow the ORIGINAL user message's language, not whatever
+# Chinese boilerplate got prepended to the composed prompt (io_cli catalog).
+# ---------------------------------------------------------------------------
+
+def test_rewrite_reply_lang_param_overrides_autodetect():
+    outcomes = [{"original_type": "memory.frobnicate", "canonical_type": "memory.frobnicate",
+                 "outcome": "rejected_allowlist", "error_code": ""}]
+    # fallback_ok is Chinese, but an explicit lang="en" must win.
+    result = crc.rewrite_reply_for_outcomes([], outcomes, fallback_ok="改好了。", lang="en")
+    assert result == [crc._ACTION_OUTCOME_ALL_FAILED_EN]
+
+    result_zh = crc.rewrite_reply_for_outcomes([], outcomes, fallback_ok="Done.", lang="zh")
+    assert result_zh == [crc._ACTION_OUTCOME_ALL_FAILED_ZH]
+
+
+def test_rewrite_reply_lang_empty_falls_back_to_autodetect():
+    outcomes = [{"original_type": "memory.frobnicate", "canonical_type": "memory.frobnicate",
+                 "outcome": "rejected_allowlist", "error_code": ""}]
+    result = crc.rewrite_reply_for_outcomes([], outcomes, fallback_ok="改好了。")
+    assert result == [crc._ACTION_OUTCOME_ALL_FAILED_ZH]
+
+
+def test_foreground_english_user_gets_english_note_despite_chinese_catalog_in_prompt(monkeypatch):
+    """The bug: the io_cli catalog (Chinese) gets prepended to `content`
+    BEFORE the action-execution block runs, so naive language auto-detect
+    against the fully-composed prompt would wrongly conclude "Chinese" for
+    an English-speaking user. The fix derives language from the raw,
+    pre-injection message instead."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setenv("FEEDLING_ACTION_ALLOWLIST", "enforce")
+
+    action = {"type": "memory.frobnicate", "memory_id": "m1"}
+    msg = {"role": "user", "content": "please remember this for me", "ts": 5300.0}
+    posted = []
+
+    monkeypatch.setattr(crc, "call_agent", lambda *a, **kw: {"actions": [action], "messages": []})
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kw: posted.append(reply) or {"id": "m6"})
+    monkeypatch.setattr(crc._HTTP, "post", _http_router())
+    # Simulate the io_cli catalog injection actually firing (Chinese text
+    # prepended to `content` downstream of the raw-content snapshot) —
+    # patched to a fixed Chinese string rather than depending on AGENT_MODE
+    # plumbing/a real io_cli.py build.
+    monkeypatch.setattr(
+        crc, "_prepend_io_cli_capability_catalog",
+        lambda content: "【可用命令目录：身份写卡、记忆写卡……全部中文说明】\n\n" + content,
+    )
+
+    crc._process_messages([msg])
+
+    assert posted == [crc._ACTION_OUTCOME_ALL_FAILED_EN], (
+        "an English user must get the English honest-failure copy even "
+        "though the composed prompt now contains a Chinese catalog block"
+    )
+
+
+def test_foreground_chinese_user_still_gets_chinese_note(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setenv("FEEDLING_ACTION_ALLOWLIST", "enforce")
+
+    action = {"type": "memory.frobnicate", "memory_id": "m1"}
+    msg = {"role": "user", "content": "帮我记一下这件事", "ts": 5301.0}
+    posted = []
+
+    monkeypatch.setattr(crc, "call_agent", lambda *a, **kw: {"actions": [action], "messages": []})
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kw: posted.append(reply) or {"id": "m7"})
+    monkeypatch.setattr(crc._HTTP, "post", _http_router())
+
+    crc._process_messages([msg])
+
+    assert posted == [crc._ACTION_OUTCOME_ALL_FAILED_ZH]
+
+
+# ---------------------------------------------------------------------------
+# I3: same-source rename-pairing (D4) enforced in the agent-origin funnel,
+# in ALL allowlist modes — not part of the shadow experiment.
+# ---------------------------------------------------------------------------
+
+def test_execute_agent_actions_rename_without_self_introduction_is_rejected_and_not_sent(monkeypatch):
+    calls = []
+    monkeypatch.setattr(crc._HTTP, "post", _http_router(calls=calls))
+
+    result = crc.execute_agent_actions([
+        {"type": "identity.profile_patch", "patch": {"agent_name": "老六"}},
+    ])
+
+    assert calls == [], "an unpaired rename must never reach the HTTP layer"
+    assert result["outcomes"] == [{
+        "original_type": "identity.profile_patch",
+        "canonical_type": "identity.profile_patch",
+        "outcome": "rejected_validation",
+        "error_code": "rename_requires_self_introduction",
+    }]
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enforce", "off"])
+def test_execute_agent_actions_rename_pairing_enforced_in_every_allowlist_mode(monkeypatch, mode):
+    """D4 is NOT part of the shadow/enforce/off allowlist experiment — it
+    must reject in all three modes identically."""
+    monkeypatch.setenv("FEEDLING_ACTION_ALLOWLIST", mode)
+    calls = []
+    monkeypatch.setattr(crc._HTTP, "post", _http_router(calls=calls))
+
+    result = crc.execute_agent_actions([
+        {"type": "identity.profile_patch", "patch": {"agent_name": "老六"}},
+    ])
+
+    assert calls == []
+    assert result["outcomes"][0]["outcome"] == "rejected_validation"
+
+
+def test_execute_agent_actions_paired_rename_is_forwarded(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        crc._HTTP, "post",
+        _http_router(
+            identity=_Resp(200, {
+                "status": "ok",
+                "results": [{"status": "ok", "action": "identity.profile_patch"}],
+                "effects": [{"type": "identity_updated"}],
+            }),
+            calls=calls,
+        ),
+    )
+
+    result = crc.execute_agent_actions([
+        {"type": "identity.profile_patch", "patch": {"agent_name": "老六", "self_introduction": "我是老六。"}},
+    ])
+
+    assert len(calls) == 1, "a properly paired rename must be forwarded"
+    assert result["outcomes"][0]["outcome"] == "applied"
+
+
+def test_execute_agent_actions_rename_pairing_via_identity_patch_alias(monkeypatch):
+    """The pairing check must apply to the CANONICAL type, so the identity.patch
+    alias (which canonicalizes to identity.profile_patch) is covered too."""
+    calls = []
+    monkeypatch.setattr(crc._HTTP, "post", _http_router(calls=calls))
+
+    result = crc.execute_agent_actions([
+        {"type": "identity.patch", "patch": {"agent_name": "老六"}},
+    ])
+
+    assert calls == []
+    assert result["outcomes"][0]["outcome"] == "rejected_validation"
+
+
+def test_execute_agent_actions_rename_pairing_top_level_fields_no_patch_key(monkeypatch):
+    """Matches the server's fallback extraction: when there's no "patch" dict
+    key at all, the action itself (its top-level fields) is what gets
+    checked — an agent that puts agent_name directly on the action (no
+    nested "patch") is still caught."""
+    calls = []
+    monkeypatch.setattr(crc._HTTP, "post", _http_router(calls=calls))
+
+    result = crc.execute_agent_actions([
+        {"type": "identity.profile_patch", "agent_name": "老六"},
+    ])
+
+    assert calls == []
+    assert result["outcomes"][0]["outcome"] == "rejected_validation"
+
+
+def test_execute_agent_actions_rename_pairing_only_applies_to_profile_patch():
+    """A dimension_nudge or relationship_days_set action must never be
+    caught by the rename-pairing check even if it happens to carry an
+    'agent_name'-shaped key by coincidence (defensive; these action types
+    don't have that field in practice)."""
+    # No agent_name at all here — just confirms non-profile_patch canonical
+    # types skip the check entirely (no AttributeError / false rejection).
+    with patch.object(crc._HTTP, "post") as mock_post:
+        mock_post.return_value = _Resp(200, {"status": "ok", "results": [{"status": "ok"}], "effects": []})
+        result = crc.execute_agent_actions([
+            {"type": "identity.dimension_nudge", "dimension": "warmth", "delta": 1},
+        ])
+    assert result["outcomes"][0]["outcome"] == "applied"
+
+
+def test_foreground_unpaired_rename_via_action_is_rejected_not_forwarded(monkeypatch):
+    """Full pipeline: an agent-emitted rename action missing self_introduction
+    must be rejected by the funnel and never reach the HTTP layer, with an
+    honest reply — not the fake 'Done' text."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    action = {"type": "identity.profile_patch", "patch": {"agent_name": "老六"}}
+    msg = {"role": "user", "content": "改个名字叫老六", "ts": 5400.0}
+    posted = []
+    calls = []
+
+    monkeypatch.setattr(crc, "call_agent", lambda *a, **kw: {"actions": [action], "messages": []})
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kw: posted.append(reply) or {"id": "m8"})
+    monkeypatch.setattr(crc._HTTP, "post", _http_router(calls=calls))
+
+    crc._process_messages([msg])
+
+    action_calls = [c for c in calls if "/v1/identity/actions" in c[0] or "/v1/memory/actions" in c[0]]
+    assert action_calls == [], "an unpaired rename must never reach the HTTP layer"
+    assert posted == [crc._ACTION_OUTCOME_ALL_FAILED_ZH]
+
+
+def test_foreground_paired_rename_via_action_is_forwarded_and_reported_done(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    action = {"type": "identity.profile_patch", "patch": {"agent_name": "老六", "self_introduction": "我是老六。"}}
+    msg = {"role": "user", "content": "改个名字叫老六，介绍也一起改", "ts": 5401.0}
+    posted = []
+    calls = []
+
+    monkeypatch.setattr(crc, "call_agent", lambda *a, **kw: {"actions": [action], "messages": []})
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kw: posted.append(reply) or {"id": "m9"})
+    monkeypatch.setattr(
+        crc._HTTP, "post",
+        _http_router(identity=_Resp(200, {
+            "status": "ok",
+            "results": [{"status": "ok", "action": "identity.profile_patch"}],
+            "effects": [{"type": "identity_updated"}],
+        }), calls=calls),
+    )
+
+    crc._process_messages([msg])
+
+    action_calls = [c for c in calls if "/v1/identity/actions" in c[0] or "/v1/memory/actions" in c[0]]
+    assert len(action_calls) == 1
+    assert posted == ["改好了。"]
