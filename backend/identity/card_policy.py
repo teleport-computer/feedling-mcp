@@ -64,7 +64,7 @@ _OK: tuple[bool, str] = (True, "")
 # and actions.py normalization to prevent drift. Used when determining
 # "emptiness" for agent_name (so punctuation-only names fall through to
 # agent_name_empty validation instead of triggering rename_pairing).
-AGENT_NAME_STRIP_CHARS = " `\"'""''。，,.;；:：!！?？"
+AGENT_NAME_STRIP_CHARS = ' `"\'“”‘’。，,.;；:：!！?？'
 
 
 def stripped_agent_name(value) -> str:
