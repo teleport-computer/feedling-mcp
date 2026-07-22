@@ -72,7 +72,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:97c8b60
+    image: ghcr.io/teleport-computer/feedling:ae365ab
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -115,7 +115,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:97c8b60
+    image: ghcr.io/teleport-computer/feedling:ae365ab
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -236,7 +236,7 @@ services:
   # removed when this one was added — a single V2 pool per environment avoids
   # two workers claiming the same job queue.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:97c8b60
+    image: ghcr.io/teleport-computer/feedling:ae365ab
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
