@@ -591,6 +591,28 @@ def _recover_cutover_chat_if_needed(user_id: str) -> None:
     wake_bus.notify("v2_jobs", user_id=user_id)
 
 
+def eager_enqueue_v2_chat_if_owned(store: UserStore) -> None:
+    """Eagerly enqueue a V2 chat job for a message that arrived on the generic
+    ``/v1/chat/message`` write path instead of ``/v1/model_api/chat/send``.
+
+    A ``db_action_v2`` user's client normally posts to ``/v1/model_api/chat/send``
+    (which enqueues in the same transaction as the INSERT). But an
+    onboarding-incomplete or post-reset client can still hit ``/v1/chat/message``,
+    which is append-only — its message would otherwise wait up to one
+    ``FEEDLING_V2_RECONCILE_INTERVAL_SEC`` (default 60s) fleet sweep tick for a
+    job, i.e. a 0–60s "first reply is very slow" tail. Hand it to the chat lane
+    now instead.
+
+    Gated on the store-cached fence so the resident / self-hosted hot path — the
+    common ``/v1/chat/message`` caller — never touches the V2 runtime machinery.
+    The authoritative ``state='v2'`` re-check happens under lock inside
+    ``reconcile_unenqueued_v2_message_for_user``; the periodic fleet sweep remains
+    the backstop, so this is strictly a latency optimization."""
+    if get_hosted_runtime_mode(store) != HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+        return
+    _recover_cutover_chat_if_needed(store.user_id)
+
+
 def set_hosted_runtime_mode(store: UserStore, mode: str) -> str:
     """切换该用户的 hosted 运行时模式。非法值、或用户尚无 model_api config
     导致无法落地时，抛 ValueError（绝不返回假成功）。返回真正落地后的 mode。"""

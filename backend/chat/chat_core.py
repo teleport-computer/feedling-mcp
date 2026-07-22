@@ -655,7 +655,21 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
             content_excerpt={"user_message": _plaintext_for_trace(payload, envelope)} if content_type == "text" else None,
         )
         print(f"[chat:{store.user_id}] user(v1, visibility={envelope['visibility']}, type={content_type}) id={msg['id']}")
+        _eager_enqueue_v2_chat(store)
     return {"id": msg["id"], "ts": msg["ts"], "v": msg["v"]}, 200
+
+
+def _eager_enqueue_v2_chat(store: UserStore) -> None:
+    """Best-effort: if this /v1/chat/message writer is a db_action_v2 user,
+    enqueue its V2 chat job now instead of waiting up to one 60s fleet reconcile
+    tick. No-op for resident users. Never raises — the user message is already
+    persisted, and the periodic fleet sweep backstops any failure here."""
+    try:
+        from hosted import config_store as hosted_config_store
+
+        hosted_config_store.eager_enqueue_v2_chat_if_owned(store)
+    except Exception as e:  # noqa: BLE001 — latency optimization, never fatal
+        print(f"[chat:{store.user_id}] eager v2 enqueue skipped: {e}")
 
 
 # --------------------------------------------------------------------------- #

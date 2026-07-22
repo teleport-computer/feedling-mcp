@@ -10,6 +10,7 @@ single-flight enqueues a catch-up job for each.
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import sys
 import time
@@ -403,3 +404,71 @@ def test_stale_blob_mode_cannot_override_authoritative_resident_state():
         assert conn.execute(
             "SELECT count(*) FROM agent_jobs WHERE user_id=%s", (uid,),
         ).fetchone()[0] == 0
+
+
+def _chat_message_envelope(user_id: str, marker: str) -> dict:
+    """Minimal valid v1 shared envelope for chat_core.write_message."""
+    def _b64(raw: bytes) -> str:
+        return base64.b64encode(raw).decode("ascii")
+
+    return {
+        "v": 1, "id": marker,
+        "body_ct": _b64(f"{user_id}:{marker}".encode()),
+        "nonce": _b64(b"\x00" * 12), "K_user": _b64(b"\x01" * 32),
+        "K_enclave": _b64(b"\x02" * 32),
+        "visibility": "shared", "owner_user_id": user_id,
+    }
+
+
+def test_chat_message_from_v2_user_enqueues_immediately_without_sweep():
+    """A db_action_v2 user whose message arrives on /v1/chat/message (an
+    onboarding-incomplete / post-reset client that has not switched to
+    /v1/model_api/chat/send) must get its V2 chat job eagerly at write time,
+    not wait up to one 60s fleet reconcile tick. No db.reconcile_* call here:
+    the job must already exist right after write_message returns."""
+    from chat import chat_core
+
+    uid = "u_eager_chatmsg_v2"
+    seed_user(uid)
+    _mark_db_action_v2(uid)
+    store = core_store.get_store(uid)
+
+    body, status = chat_core.write_message(
+        store, {"envelope": _chat_message_envelope(uid, "m-eager-chatmsg")}
+    )
+    assert status == 200, body
+
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT lane,status,trace_id FROM agent_jobs WHERE user_id=%s",
+            (uid,),
+        ).fetchone()
+    assert row is not None, "write_message did not eagerly enqueue a V2 chat job"
+    lane, status_j, trace_id = row
+    assert lane == "chat"
+    assert status_j == "pending"
+    assert trace_id == "m-eager-chatmsg"
+
+
+def test_chat_message_from_resident_user_enqueues_no_v2_job():
+    """A resident (non-V2) user's /v1/chat/message must not touch the V2 chat
+    lane — the eager hook is a no-op for anyone whose fence isn't
+    db_action_v2. This keeps the resident/self-hosted hot path clean."""
+    from chat import chat_core
+
+    uid = "u_eager_chatmsg_resident"
+    seed_user(uid)
+    configure_model_api_route(uid, provider="anthropic", model="m", test_status="ok")
+    # deliberately NOT marked db_action_v2 -> stays resident
+    store = core_store.get_store(uid)
+
+    body, status = chat_core.write_message(
+        store, {"envelope": _chat_message_envelope(uid, "m-resident")}
+    )
+    assert status == 200, body
+
+    with db.get_pool().connection() as conn:
+        n = conn.execute(
+            "SELECT count(*) FROM agent_jobs WHERE user_id=%s", (uid,)
+        ).fetchone()[0]
+    assert n == 0
