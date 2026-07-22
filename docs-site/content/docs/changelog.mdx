@@ -173,6 +173,19 @@ change must not be interpreted as an API guarantee.
 
 ### Behavior
 
+- The standard resident consumer now answers an offline backlog with one
+  merged agent turn. When a processing batch contains at least
+  `FEEDLING_BACKLOG_COLLAPSE_MIN` (default 3) stale plain-text user messages
+  whose oldest entry is older than `FEEDLING_BACKLOG_COLLAPSE_AGE_SEC`
+  (default 1800 seconds), the pile is presented to the agent as one
+  timestamped timeline with an instruction to reply once. The merged reply
+  anchors to the newest message; older parents stay superseded and are never
+  redelivered. A purely fresh burst from an online user never merges and keeps
+  per-message replies; once a stale pile has triggered, fresh eligible messages
+  in the same batch join that single merged turn. Probe, maintenance, media,
+  and unreadable rows keep their own pipelines, the merged prompt is bounded
+  (newest lines win when trimming), and a transient reply-write failure keeps
+  the checkpoint with the whole pile retryable as one turn.
 - Genesis imports now use the person's saved preferred name in distilled
   memory prose. When no name is known, generated cards omit the subject where
   possible or use the neutral “the person”/“对方”; they no longer expose the

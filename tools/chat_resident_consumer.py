@@ -1556,6 +1556,23 @@ def _mark_seen(key: str) -> bool:
     return True
 
 
+def _unmark_seen(keys) -> None:
+    """Release seen keys so a kept-back checkpoint can actually retry them.
+
+    The transient reply-write failure path keeps the checkpoint behind the
+    failed turn (claim lease expiry + redelivery re-serve it) — but a key left
+    in the seen set would make the retry round skip the message and advance the
+    checkpoint anyway, turning a recoverable failure into a silent drop
+    (codex3 fault-injection, 2026-07-22)."""
+    for key in keys:
+        if key in _seen_ids:
+            _seen_ids.discard(key)
+            try:
+                _seen_ids_order.remove(key)
+            except ValueError:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Decrypt sources — plaintext content for v1 encrypted messages
 # ---------------------------------------------------------------------------
@@ -9793,9 +9810,135 @@ def _quoted_memory_context(msg: dict) -> str:
     )
 
 
+# --- Offline backlog collapse ----------------------------------------------
+# A consumer that was down/stuck for days used to answer every piled-up user
+# message with its own agent turn — a dozen stale "在吗" each got a separate
+# reply (slow, expensive, and weird to receive; usr_6c1971 2026-07-22). When a
+# processing batch contains a STALE pile of plain-text user messages, merge
+# them into one agent turn that answers them together. Fresh messages (a user
+# double-texting while online) never trigger this: the pile must be at least
+# BACKLOG_COLLAPSE_MIN messages AND its oldest message older than
+# BACKLOG_COLLAPSE_AGE_SEC. Approved by Seven 2026-07-22.
+try:
+    BACKLOG_COLLAPSE_MIN = int(os.environ.get("FEEDLING_BACKLOG_COLLAPSE_MIN") or 3)
+except (TypeError, ValueError):
+    BACKLOG_COLLAPSE_MIN = 3
+try:
+    BACKLOG_COLLAPSE_AGE_SEC = max(
+        60.0, float(os.environ.get("FEEDLING_BACKLOG_COLLAPSE_AGE_SEC") or 1800)
+    )
+except (TypeError, ValueError):
+    BACKLOG_COLLAPSE_AGE_SEC = 1800.0
+
+# Merged-prompt bounds: a very long offline pile must not blow the agent call
+# open. Keep the NEWEST lines when trimming — the freshest messages carry the
+# context the reply should anchor to; the header still states the true total.
+_BACKLOG_COLLAPSE_MAX_LINES = 40
+_BACKLOG_COLLAPSE_LINE_CHARS = 500
+
+
+def _collapse_eligible(msg: dict) -> bool:
+    """Only ordinary, readable, plain-text user chat turns merge. Probes,
+    server maintenance turns, media, and unreadable rows keep their own
+    per-message pipelines (each has semantics a merge would break)."""
+    if str(msg.get("role") or "") != "user":
+        return False
+    if str(msg.get("source") or "") in {"verify_ping", RESIDENT_MAINTENANCE_SOURCE}:
+        return False
+    if str(msg.get("content_type") or "text") != "text":
+        return False
+    if msg.get("body_unavailable"):
+        return False
+    if not str(msg.get("content") or "").strip():
+        return False
+    return _msg_key(msg) not in _seen_ids
+
+
+def _collapse_stale_backlog(messages: list) -> list:
+    """Merge a stale pile of eligible user messages into a single turn.
+
+    The merged content replaces the NEWEST eligible message in place (so reply
+    anchoring, screen context, and timestamp all follow the freshest turn); the
+    absorbed older ones are dropped from the batch, with seen ownership
+    deferred until the carrier's reply settles (loop bottom). The trigger
+    counts STALE eligible messages only — at least ``max(2, MIN)`` of them must
+    be older than the age gate, so one leftover old turn cannot swallow an
+    online double-text. Once the stale pile triggers, fresh eligible messages
+    in the same batch merge too — one coherent reply beats answering the
+    backlog and the new message separately."""
+    if BACKLOG_COLLAPSE_MIN <= 0:
+        return messages  # kill switch
+    now = time.time()
+    eligible = sorted(
+        (m for m in messages if _collapse_eligible(m)),
+        key=lambda m: (float(m.get("ts", m.get("timestamp", 0)) or 0), _msg_key(m)),
+    )
+    stale_count = sum(
+        1
+        for m in eligible
+        if now - float(m.get("ts", m.get("timestamp", 0)) or 0) >= BACKLOG_COLLAPSE_AGE_SEC
+    )
+    if stale_count < max(2, BACKLOG_COLLAPSE_MIN):
+        return messages
+    oldest_ts = float(eligible[0].get("ts", eligible[0].get("timestamp", 0)) or 0)
+
+    newest = eligible[-1]
+    lines = []
+    for m in eligible:
+        m_ts = float(m.get("ts", m.get("timestamp", 0)) or 0)
+        stamp = time.strftime("%m-%d %H:%M", time.localtime(m_ts)) if m_ts else "??-?? ??:??"
+        text = str(m.get("content") or "").strip()
+        if len(text) > _BACKLOG_COLLAPSE_LINE_CHARS:
+            text = text[:_BACKLOG_COLLAPSE_LINE_CHARS] + "…(截断)"
+        lines.append(f"- [{stamp}] {text}")
+    dropped = 0
+    if len(lines) > _BACKLOG_COLLAPSE_MAX_LINES:
+        dropped = len(lines) - _BACKLOG_COLLAPSE_MAX_LINES
+        lines = lines[-_BACKLOG_COLLAPSE_MAX_LINES:]  # keep the newest
+    omitted_line = f"(更早的 {dropped} 条较旧消息未逐条列出)\n" if dropped else ""
+    merged = (
+        f"[你离线/未响应期间,用户陆续发来 {len(eligible)} 条消息,按时间排列:]\n"
+        + omitted_line
+        + "\n".join(lines)
+        + "\n\n(请把这些消息当成一个整体,综合它们的内容和情绪自然地回复一次;"
+        "不要逐条分别回复,也不要逐条复述。)"
+    )
+
+    # Ownership rule: absorbed keys are marked seen only AFTER the carrier's
+    # reply actually lands (success or terminal), at the loop bottom. Marking
+    # them here would strand them forever if the carrier never completes this
+    # round (transient write failure, an earlier message breaking the batch):
+    # the retry round would then find them "seen", skip the re-merge, and
+    # silently drop the pile (codex3 fault-injection, 2026-07-22).
+    merged_ids = {_msg_key(m) for m in eligible[:-1]}
+    out: list = []
+    for m in messages:
+        key = _msg_key(m)
+        if m is newest:
+            replacement = dict(newest)
+            replacement["content"] = merged
+            replacement["_backlog_absorbed_keys"] = sorted(merged_ids)
+            out.append(replacement)
+        elif key in merged_ids:
+            pass  # consumed by the merged carrier; seen-marking deferred
+        else:
+            out.append(m)
+    log.info(
+        "collapsed %d stale backlog message(s) spanning %s..%s into one turn",
+        len(eligible),
+        time.strftime("%m-%d %H:%M", time.localtime(oldest_ts)),
+        time.strftime(
+            "%m-%d %H:%M",
+            time.localtime(float(newest.get("ts", newest.get("timestamp", 0)) or 0)),
+        ),
+    )
+    return out
+
+
 def _process_messages(messages: list) -> float:
     """Process a batch of messages, return the highest timestamp seen."""
     global _last_user_message_wall
+    messages = _collapse_stale_backlog(messages)
     latest = 0.0
     for msg in messages:
         # Tolerate both "ts" and "timestamp" key names across API versions.
@@ -10166,11 +10309,27 @@ def _process_messages(messages: list) -> float:
             # of permanently dropping a user turn after a transient write error.
             # pending_failure_notice 随之丢弃：本家的回复没被接受（含 already_
             # answered 409 failover），错误通知由真正被接受的那次尝试来发。
-            continue
+            #
+            # Release THIS turn's seen key so the kept-back checkpoint can
+            # genuinely retry it (a merged carrier re-forms from its unmarked
+            # absorbed messages), and stop the batch here: processing NEWER
+            # messages now would advance the checkpoint past this failed turn
+            # and let the backend's newer-replied floor supersede it forever.
+            _unmark_seen([_msg_key(msg)])
+            log.warning(
+                "transient reply write failure ts=%.3f; keeping checkpoint, "
+                "releasing the turn for retry, deferring the rest of this batch",
+                ts,
+            )
+            break
 
         if pending_failure_notice is not None and posted_any:
             _notify_agent_turn_failure(pending_failure_notice, foreground=True)
 
+        # The turn is settled (posted, or terminally rejected): absorbed
+        # backlog messages are now truly consumed by this carrier.
+        for _absorbed_key in msg.get("_backlog_absorbed_keys") or []:
+            _mark_seen(_absorbed_key)
         latest = max(latest, ts)
 
     return latest
