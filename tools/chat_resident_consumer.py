@@ -6163,12 +6163,28 @@ _IO_CLI_PATH = str(_REPO / "tools" / "io_cli.py")
 _io_cli_catalog_cache: str | None = None
 
 # The agent session id (see _load_agent_session_id) this process already
-# injected the catalog for, on a resume-capable driver (claude/pi/hermes).
-# Starts at ``None`` — deliberately NOT ``""`` — because "" (no session
-# established yet) is itself a legitimate, distinct session key; keeping the
-# "never injected" sentinel out of band means a session going from "" to a
-# real id still reads as a session change and re-injects once.
+# CONFIRMED-injected the catalog for, on a resume-capable driver
+# (claude/pi/hermes). Starts at ``None`` — deliberately NOT ``""`` — because
+# "" (no session established yet) is itself a legitimate, distinct session
+# key; keeping the "never injected" sentinel out of band means a session
+# going from "" to a real id still reads as a session change and re-injects
+# once. Only ever written by _commit_io_cli_catalog_injection — see below.
 _io_cli_catalog_injected_session_id: str | None = None
+
+# pending -> commit pattern (Codex review I10): the session id a turn just
+# injected the catalog for, NOT YET confirmed delivered. _prepend_io_cli_
+# capability_catalog sets this the moment it decides to inject; the
+# foreground call site promotes it to _io_cli_catalog_injected_session_id
+# once THIS turn's agent call actually succeeds (_commit_io_cli_catalog_
+# injection), or drops it on failure (_discard_io_cli_catalog_pending_
+# injection) so the very next turn retries instead of the resume session
+# silently going without the catalog forever. Without this split, marking
+# "injected" at injection time (pre-call) meant a subprocess/HTTP failure on
+# the very first turn of a session — before the model ever saw the prompt —
+# would permanently skip the catalog for that whole session (until a
+# rotation), which is worse than the two-turn duplicate this pattern trades
+# for.
+_io_cli_catalog_pending_session_id: str | None = None
 
 
 def _prepend_io_cli_capability_catalog(content: str) -> str:
@@ -6199,8 +6215,16 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
     resume natively, so re-injecting every turn would just bloat every prompt
     with a block the model already has in its resumed session — inject once
     per agent session id (see ``_io_cli_catalog_injected_session_id`` above);
-    a session id change (rotation, a brand-new session) re-injects once."""
-    global _io_cli_catalog_cache, _io_cli_catalog_injected_session_id
+    a session id change (rotation, a brand-new session) re-injects once.
+
+    Pending -> commit (Codex review I10): for a resume-capable driver this
+    only marks the session id PENDING (``_io_cli_catalog_pending_session_id``)
+    — the caller MUST call ``_commit_io_cli_catalog_injection()`` once this
+    turn's agent call actually succeeds, or ``_discard_io_cli_catalog_
+    pending_injection()`` on failure, so a turn whose subprocess/HTTP call
+    fails before the model ever saw the prompt does not permanently skip the
+    catalog for the rest of that session."""
+    global _io_cli_catalog_cache, _io_cli_catalog_pending_session_id
     if _HOSTED or AGENT_MODE != "cli":
         return content
 
@@ -6209,7 +6233,7 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
     if not is_codex:
         sid = _load_agent_session_id()
         if sid == _io_cli_catalog_injected_session_id:
-            return content  # already injected for this resume-capable session
+            return content  # already confirmed-injected for this session
 
     catalog = _io_cli_catalog_cache
     if catalog is None:
@@ -6232,9 +6256,37 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
         _io_cli_catalog_cache = catalog
 
     if not is_codex:
-        _io_cli_catalog_injected_session_id = sid
+        # NOT committed yet — see _commit_io_cli_catalog_injection /
+        # _discard_io_cli_catalog_pending_injection docstrings above.
+        _io_cli_catalog_pending_session_id = sid
 
     return f"{catalog}\n\n{content}"
+
+
+def _commit_io_cli_catalog_injection() -> None:
+    """Call once THIS turn's foreground agent call has SUCCEEDED (call_agent
+    did not raise — i.e. the prompt, catalog included, was actually handed to
+    the model; a downstream reply-parse failure does not undo that delivery).
+    Promotes the pending session id set by _prepend_io_cli_capability_catalog
+    earlier this turn to confirmed, so a resume-capable driver stops
+    re-injecting for the rest of this session. No-op if nothing is pending
+    (gate was closed, this session was already confirmed, or the driver is
+    codex — codex never sets a pending id)."""
+    global _io_cli_catalog_injected_session_id, _io_cli_catalog_pending_session_id
+    if _io_cli_catalog_pending_session_id is not None:
+        _io_cli_catalog_injected_session_id = _io_cli_catalog_pending_session_id
+        _io_cli_catalog_pending_session_id = None
+
+
+def _discard_io_cli_catalog_pending_injection() -> None:
+    """Call when THIS turn's foreground agent call FAILED (call_agent raised)
+    — the catalog was written into ``content`` but never actually delivered
+    to the model. Drops the pending mark (without touching the confirmed
+    one) so the NEXT turn re-attempts the injection instead of the resume
+    session silently going without the catalog until it happens to rotate.
+    No-op if nothing is pending."""
+    global _io_cli_catalog_pending_session_id
+    _io_cli_catalog_pending_session_id = None
 
 
 def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = None) -> str:
@@ -10970,6 +11022,12 @@ def _process_messages(messages: list) -> float:
                 agent_result = call_agent(content, trace_id=trace_id, lane="chat")
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
+            # Codex review I10: call_agent raised, so the prompt (catalog
+            # included, if _prepend_io_cli_capability_catalog injected it
+            # above) never reached the model this turn — drop the pending
+            # mark so the NEXT turn retries instead of this resume session
+            # silently going without the catalog until it happens to rotate.
+            _discard_io_cli_catalog_pending_injection()
             # 上报/system 通知与兜底话术解耦（Codex review）：SEND_FALLBACK_ON_AGENT_ERROR
             # 只管发不发 FALLBACK_REPLY，错误透出（设置页 + system 通知）两种配置下都要发。
             if SEND_FALLBACK_ON_AGENT_ERROR:
@@ -10983,6 +11041,13 @@ def _process_messages(messages: list) -> float:
                 latest = max(latest, ts)
                 continue
         else:
+            # call_agent did not raise — the prompt (catalog included) was
+            # delivered to the model this turn, regardless of whether the
+            # reply below turns out to be parseable. Confirm the pending
+            # session id now (Codex review I10); see _commit_io_cli_catalog_
+            # injection's docstring for why this must not wait on parse
+            # success.
+            _commit_io_cli_catalog_injection()
             if _consume_reply_parse_failed():
                 pending_failure_notice = ValueError(
                     "agent produced no usable reply after sanitization"
