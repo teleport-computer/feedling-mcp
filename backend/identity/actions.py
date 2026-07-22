@@ -134,6 +134,12 @@ def _identity_profile_patch(
     if not ok:
         return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 400
 
+    ok, err = card_policy.validate_rename_pairing(patch)
+    if not ok:
+        return {"status": "error", "error": err,
+                "hint": "介绍无需变化时读旧卡原样带回 --self-introduction",
+                "action": "identity.profile_patch"}, [], 400
+
     plain, err = _identity_plain_for_action(store, api_key, runtime_token=runtime_token)
     if plain is None:
         return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409

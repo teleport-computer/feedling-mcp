@@ -1,0 +1,24 @@
+"""Pure-unit tests for rename pairing validation (no DB required)."""
+from identity import card_policy
+
+
+def test_rename_without_intro_rejected():
+    ok, err = card_policy.validate_rename_pairing({"agent_name": "老8"})
+    assert (ok, err) == (False, "rename_requires_self_introduction")
+
+
+def test_rename_with_intro_ok():
+    ok, _ = card_policy.validate_rename_pairing(
+        {"agent_name": "老8", "self_introduction": "我是老8"}
+    )
+    assert ok
+
+
+def test_intro_only_ok():
+    ok, _ = card_policy.validate_rename_pairing({"self_introduction": "hi"})
+    assert ok
+
+
+def test_empty_name_not_a_rename():
+    ok, _ = card_policy.validate_rename_pairing({"agent_name": "  "})
+    assert ok  # 空名交给既有 agent_name_empty 校验管,不归本规则

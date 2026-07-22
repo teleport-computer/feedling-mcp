@@ -149,6 +149,7 @@ if not _provisioned:
         "test_user_mcp_ca_fetch.py",
         "test_user_mcp_ca_fetch_leaf.py",
         "test_identity_value_write_path.py",
+        "test_identity_rename_pairing.py",
     }
     collect_ignore = sorted(
         f

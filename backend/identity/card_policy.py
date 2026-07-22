@@ -147,6 +147,21 @@ def validate_profile_patch(patch: dict) -> tuple[bool, str]:
     return _OK
 
 
+def validate_rename_pairing(patch: dict) -> tuple[bool, str]:
+    """Renames must carry the (possibly unchanged) self_introduction in the SAME
+    patch — a card whose name says one thing while the intro says another is
+    self-contradictory. Free-text guessing was rejected (小满/小满满 false hits);
+    the rule is unconditional pairing. Server-side: CLI/tool prompts only front-run
+    the error message."""
+    if not isinstance(patch, dict):
+        return (True, "")
+    name = str(patch.get("agent_name") or "").strip()
+    intro = str(patch.get("self_introduction") or "").strip()
+    if name and not intro:
+        return (False, "rename_requires_self_introduction")
+    return (True, "")
+
+
 def validate_dimension_nudge(target_name: str, new_value) -> tuple[bool, str]:
     if not str(target_name or "").strip():
         return (False, "dimension_name_empty")
