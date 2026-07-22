@@ -839,6 +839,34 @@ def _compat_commit_headers() -> dict:
     return {"X-Feedling-Consumer-Compat-Commit": value} if value else {}
 
 
+# Self-update stall reason — WHY a self-hosted resident isn't on the backend's
+# expected commit, when it isn't. Mirrors _compat_commit's pattern: computed as
+# a side effect of _run_self_update (which already runs the dirty/enabled/fetch
+# checks on every idle poll) and stored here so reporting it is a cheap dict
+# read — never a second git subprocess. One of "dirty" | "disabled" |
+# "fetch_failed" | "" (not stalled / unknown). Lets the backend's 6h
+# stall-mismatch nudge (resident_maintenance.py) name a concrete fix instead of
+# a generic "please update".
+# VPS 线长期资产（自托管专属；hosted 走不到这条路径）; pre 合并原样保留。
+_self_update_stall = {"value": ""}
+
+# Set/cleared inside _git_fetch so a fetch failure can be attributed without a
+# second subprocess call.
+_last_fetch_failed = False
+
+
+def _self_update_stall_reason() -> str:
+    """Cheap, non-blocking read of the last self-update stall reason.
+
+    Never runs git — just returns what _run_self_update last computed."""
+    return str(_self_update_stall.get("value") or "")
+
+
+def _update_stall_headers() -> dict:
+    value = _self_update_stall_reason()
+    return {"X-Feedling-Update-Stall": value} if value else {}
+
+
 _HEADERS = {
     "X-API-Key": FEEDLING_API_KEY,
     "X-Feedling-Consumer": "feedling-chat-resident",
@@ -1127,10 +1155,13 @@ def _git_tree_dirty() -> bool:
 
 
 def _git_fetch(target: str) -> bool:
+    global _last_fetch_failed
     try:
-        return _git("fetch", "--quiet", "origin", target, timeout=120).returncode == 0
+        ok = _git("fetch", "--quiet", "origin", target, timeout=120).returncode == 0
     except Exception:
-        return False
+        ok = False
+    _last_fetch_failed = not ok
+    return ok
 
 
 def _git_changed_files(local: str, target: str) -> set[str] | None:
@@ -1220,14 +1251,24 @@ def _run_self_update(target: str) -> None:
     fetch/diff only runs when an update is genuinely plausible. Re-exec happens
     inside ``_apply_self_update`` and does not return."""
     global _last_self_update_mono
-    if not AUTO_UPDATE or _HOSTED or not target or target == "dev":
+    if not AUTO_UPDATE:
+        # Hosted images never self-update anyway (immutable, see below) — only
+        # report "disabled" for the case it actually explains: a self-hoster
+        # who opted out via FEEDLING_AUTO_UPDATE=0.
+        if not _HOSTED:
+            _self_update_stall["value"] = "disabled"
+        return
+    if _HOSTED or not target or target == "dev":
         return
     now = time.monotonic()
     if now - _last_self_update_mono < _SELF_UPDATE_MIN_INTERVAL_SEC:
         return
     local = RUNNING_COMMIT  # identity of the running image, NEVER the checkout
-    if not local or target.startswith(local) or local.startswith(target):
-        return  # unknown running identity, or already running the target
+    if not local:
+        return  # unknown running identity — can't tell if we're stalled
+    if target.startswith(local) or local.startswith(target):
+        _self_update_stall["value"] = ""  # already running the target
+        return
     _last_self_update_mono = now  # throttle the fetch/diff attempt below
 
     disk = _consumer_commit()
@@ -1247,14 +1288,17 @@ def _run_self_update(target: str) -> None:
             return
         if not _relevant_changed(changed):
             _compat_commit["value"] = target
+            _self_update_stall["value"] = ""
             return  # nothing we load changed — running image is compatible
         if _git_tree_dirty():
             log.warning(
                 "self-update: checkout already at %s but tree is dirty; "
                 "not re-execing over uncommitted changes", target,
             )
+            _self_update_stall["value"] = "dirty"
             return
         _compat_commit["value"] = ""
+        _self_update_stall["value"] = ""
         log.info(
             "self-update: checkout already at %s; re-exec to replace stale "
             "running image %s", target, local,
@@ -1264,6 +1308,7 @@ def _run_self_update(target: str) -> None:
 
     if not _git_fetch(target):
         log.warning("self-update: could not fetch %s; will retry later", target)
+        _self_update_stall["value"] = "fetch_failed"
         return
     changed = _git_changed_files(local, target)
     if changed is None:
@@ -1277,6 +1322,7 @@ def _run_self_update(target: str) -> None:
         # Deliberate skip — advertise compatibility so the backend does not
         # count this running commit as a stalled consumer.
         _compat_commit["value"] = target
+        _self_update_stall["value"] = ""
         return
     _compat_commit["value"] = ""
     dirty = _git_tree_dirty()
@@ -1288,7 +1334,9 @@ def _run_self_update(target: str) -> None:
                 local,
                 target,
             )
+            _self_update_stall["value"] = "dirty"
         return
+    _self_update_stall["value"] = ""
     _apply_self_update(local, target, changed)
 
 
@@ -6854,7 +6902,12 @@ def poll_chat(since: float, timeout: int | None = None, claim: bool = True) -> d
         params["claim"] = "false"
     # Ship the decrypt-source health so the backend gate/alert can tell a
     # live-but-undecrypting resident from a healthy one (see _decrypt_health).
-    headers = {**_HEADERS, **_decrypt_health_headers(), **_compat_commit_headers()}
+    headers = {
+        **_HEADERS,
+        **_decrypt_health_headers(),
+        **_compat_commit_headers(),
+        **_update_stall_headers(),
+    }
     resp = _HTTP.get(url, params=params, headers=headers, timeout=poll_to + 10)
     resp.raise_for_status()
     body = resp.json()
