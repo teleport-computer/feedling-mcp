@@ -184,6 +184,21 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
     The app-facing job status is ``processing`` (the ``awaiting_resident``/claim detail
     stays internal). Idempotent: the same material re-uploaded maps to the same job_id.
 
+    ``job_kind`` (optional payload field) picks the job's ``source_kind`` discriminator
+    when the caller needs a kind distinct from ``mode`` — currently only the terminal
+    ``identity-redistill`` lane (io_cli → consumer IPC, T11) sets it to
+    ``resident_redistill``, which is DB-level exclusive per user
+    (0023_redistill_job_exclusivity.py): a second concurrent redistill job for the same
+    user 409s instead of silently racing the first. Onboarding's plain ``add_memory`` /
+    ``identity_update`` uploads never set ``job_kind`` and keep today's unlimited-
+    concurrency behavior — the exclusivity index only watches
+    ``source_kind = 'resident_redistill'``.
+
+    V2 NOTE (2026-07-27 pre-merge): when ``test`` merges into ``pre``, the exclusivity
+    migration (0023_redistill_job_exclusivity.py) needs a merge revision against pre's
+    alembic head (0052+ at last check), and the TEE mirror schema sync should be
+    re-evaluated then too — see that migration's docstring.
+
     NOTE: the sealed-envelope field names + AAD binding below are the iOS<->backend crypto
     contract (P5) and MUST be reconciled with the client sealer + verified on a real enclave
     e2e (red line) before merge — the DB/size/job logic here is what's unit-verified.
@@ -240,17 +255,28 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
     # field) → "" (back-compat: "" means "no baseline, skip the check").
     current_identity = identity_service._load_identity(store)
     base_identity_replaced_at = str((current_identity or {}).get("replaced_at") or "")
-    created = db.genesis_create_job(store.user_id, {
-        "job_id": job_id,
-        "status": "awaiting_resident",
-        "source_kind": mode_hint or "resident",
-        "total_chunks": 1,
-        "total_bytes": len(encrypted_body),
-        "privacy_mode": "resident_sealed",
-        "metadata": {"mode": mode_hint, "material_kind": material_kind,
-                     "client_job_id": client_job_id, "ingest": "resident_sealed",
-                     "base_identity_replaced_at": base_identity_replaced_at},
-    })
+    job_kind_hint = str(payload.get("job_kind") or "").strip().lower()
+    try:
+        created = db.genesis_create_job(store.user_id, {
+            "job_id": job_id,
+            "status": "awaiting_resident",
+            "source_kind": job_kind_hint or mode_hint or "resident",
+            "total_chunks": 1,
+            "total_bytes": len(encrypted_body),
+            "privacy_mode": "resident_sealed",
+            "metadata": {"mode": mode_hint, "material_kind": material_kind,
+                         "client_job_id": client_job_id, "ingest": "resident_sealed",
+                         "base_identity_replaced_at": base_identity_replaced_at},
+        })
+    except db.GenesisRedistillJobActive as e:
+        # DB-level exclusivity (0023_redistill_job_exclusivity.py): this user already has
+        # an active resident_redistill job under a DIFFERENT job_id — surface it so the
+        # caller (io_cli / consumer, T11) can point the user at the job already running
+        # instead of silently racing a second distill against the same identity card.
+        _log_resident_sealed_rejected(
+            store, mode=mode_hint, reason="redistill_job_active", env=env,
+            active_job_id=e.active_job_id)
+        return _bad("redistill_job_active", 409, active_job_id=e.active_job_id)
     # created is None on ON CONFLICT DO NOTHING (idempotent re-upload) — chunk already stored.
     if created is not None:
         db.genesis_put_chunk(
