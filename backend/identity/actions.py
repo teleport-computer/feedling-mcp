@@ -250,11 +250,14 @@ def _identity_profile_patch(
     if not ok:
         return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 400
 
-    ok, err = card_policy.validate_rename_pairing(patch)
-    if not ok:
-        return {"status": "error", "error": err,
-                "hint": "介绍无需变化时读旧卡原样带回 --self-introduction",
-                "action": "identity.profile_patch"}, [], 400
+    # 成对闸只拦 agent 来源(runtime token):App 用户在 UI 里单独改名是正常路径,不受此约束。
+    # agent 的另两条路径(consumer 夹带通道、io_cli 预检)在各自漏斗处执行同规则——见 spec 3.1/3.4。
+    if runtime_token:
+        ok, err = card_policy.validate_rename_pairing(patch)
+        if not ok:
+            return {"status": "error", "error": err,
+                    "hint": "介绍无需变化时读旧卡原样带回 --self-introduction",
+                    "action": "identity.profile_patch"}, [], 400
 
     # Pre-check the legacy direct-list keys' shape here (outside the lock —
     # pure validation, same as the card_policy checks above): preserves the

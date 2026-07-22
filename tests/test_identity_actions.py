@@ -163,10 +163,7 @@ def test_identity_profile_patch_reencrypts_existing_card(client, monkeypatch):
         json={
             "actions": [{
                 "type": "identity.profile_patch",
-                "patch": {
-                    "agent_name": "小秘",
-                    "self_introduction": _plain_identity()["self_introduction"],
-                },
+                "patch": {"agent_name": "小秘"},
                 "reason": "User asked for a displayed name change.",
             }],
         },
@@ -878,10 +875,7 @@ def test_identity_profile_patch_rename_allowed_on_sparse_card(client, monkeypatc
         json={
             "actions": [{
                 "type": "identity.profile_patch",
-                "patch": {
-                    "agent_name": "阿锐",
-                    "self_introduction": _plain_identity_sparse()["self_introduction"],
-                },
+                "patch": {"agent_name": "阿锐"},
                 "reason": "User asked for a displayed name change.",
             }],
         },
