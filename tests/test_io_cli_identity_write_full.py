@@ -8,9 +8,13 @@ a no-Postgres dev machine still collects and runs it).
 The hosted agent uses `io_cli.py identity-write` to patch its own identity
 card via /v1/identity/actions (identity.profile_patch [+ identity.dimension_nudge]).
 The server does the crypto (decrypt existing -> merge -> re-encrypt); the CLI's
-job is (a) shape the action body and (b) front-run the three local pre-checks
-the server itself enforces (rename pairing / list-op conflict / nudge cap), so
-a malformed call fails fast instead of round-tripping for nothing.
+job is (a) shape the action body and (b) front-run the local pre-checks the
+server itself enforces or silently swallows (rename pairing / list-op conflict
+/ nudge format+cap / I4: total action count <=10 — the server slices
+actions[:10] WITHOUT erroring, so a would-be-11th nudge silently never runs
+while the CLI still sees a 200; we reject >10 locally instead), so a malformed
+call fails fast instead of round-tripping for nothing or worse, "succeeding"
+with a silently dropped action.
 """
 import argparse
 import subprocess
@@ -228,6 +232,57 @@ def test_nudge_batch_sum_different_dimensions_independent():
     payload = io_cli._identity_write_payload_v2(
         _ns(nudge_dimension=["幽默:+8", "耐心:+8"]))
     assert len(payload["actions"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# I4: total action count (profile_patch + nudges) must not exceed 10 — the
+# server (backend/identity/actions.py::_execute_identity_actions) slices
+# actions[:10] WITHOUT erroring, so an 11th action (e.g. the last of 10
+# nudges alongside a profile patch) is silently never executed while the CLI
+# still gets a 200. We decided NOT to change the server (shared entry point,
+# App also depends on the current shape) — so the CLI must reject the >10
+# case itself, before ever building the request.
+# ---------------------------------------------------------------------------
+
+def _n_nudge_specs(n: int, delta: int = 1) -> list:
+    # Distinct dimension names so the per-dimension batch-sum cap (<=10) never
+    # interferes with what this block is actually testing (total action count).
+    return [f"维度{i}:+{delta}" for i in range(n)]
+
+
+def test_nine_nudges_with_patch_passes_total_count_precheck():
+    payload = io_cli._identity_write_payload_v2(
+        _ns(user_preferred_name="老张", nudge_dimension=_n_nudge_specs(9)))
+    assert len(payload["actions"]) == 10  # 1 profile_patch + 9 nudges
+
+
+def test_ten_nudges_with_patch_exceeds_total_count_and_raises():
+    with pytest.raises(io_cli._IdentityWritePrecheckError) as exc_info:
+        io_cli._identity_write_payload_v2(
+            _ns(user_preferred_name="老张", nudge_dimension=_n_nudge_specs(10)))
+    assert exc_info.value.obj["error"] == "too_many_actions"
+    assert "9 条 nudge" in exc_info.value.obj["hint"]
+
+
+def test_ten_nudges_with_patch_exits_2_via_cmd(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        io_cli.cmd_identity_write(
+            _ns(user_preferred_name="老张", nudge_dimension=_n_nudge_specs(10)))
+    assert exc_info.value.code == 2
+    out = capsys.readouterr().out
+    assert '"error": "too_many_actions"' in out
+
+
+def test_ten_nudges_alone_passes_total_count_precheck():
+    payload = io_cli._identity_write_payload_v2(_ns(nudge_dimension=_n_nudge_specs(10)))
+    assert len(payload["actions"]) == 10
+
+
+def test_eleven_nudges_alone_exceeds_total_count_and_raises():
+    with pytest.raises(io_cli._IdentityWritePrecheckError) as exc_info:
+        io_cli._identity_write_payload_v2(_ns(nudge_dimension=_n_nudge_specs(11)))
+    assert exc_info.value.obj["error"] == "too_many_actions"
+    assert "10 条 nudge" in exc_info.value.obj["hint"]
 
 
 @pytest.mark.parametrize("kwargs", [

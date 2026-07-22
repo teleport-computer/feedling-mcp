@@ -61,6 +61,95 @@ def test_catalog_memory_delete_has_id_flag():
         "memory-delete line should contain --id flag (required argument)"
 
 
+def test_catalog_perception_trend_has_signal_positional():
+    """I6: perception-trend's required positional `signal` must survive
+    extraction — a model following the catalog without it hits argparse's
+    'the following arguments are required: signal'."""
+    io_cli_path = os.path.join(
+        os.path.dirname(__file__), "..", "tools", "io_cli.py"
+    )
+    catalog = build_catalog(io_cli_path)
+    assert catalog is not None, "build_catalog should not return None"
+
+    lines = [l for l in catalog.split("\n") if l.startswith("perception-trend ")]
+    assert len(lines) == 1, "Catalog should contain exactly one perception-trend line"
+    assert "signal" in lines[0].split(), \
+        "perception-trend line should contain the required 'signal' positional"
+
+
+def test_catalog_memory_fetch_has_ids_positional():
+    """I6: memory-fetch's required positional `ids` (nargs='+') must survive
+    extraction, not just its optional --limit/--include-* flags."""
+    io_cli_path = os.path.join(
+        os.path.dirname(__file__), "..", "tools", "io_cli.py"
+    )
+    catalog = build_catalog(io_cli_path)
+    assert catalog is not None, "build_catalog should not return None"
+
+    lines = [l for l in catalog.split("\n") if l.startswith("memory-fetch ")]
+    assert len(lines) == 1, "Catalog should contain exactly one memory-fetch line"
+    assert "ids" in lines[0].split(), \
+        "memory-fetch line should contain the required 'ids' positional"
+
+
+def test_catalog_required_positionals_sweep():
+    """I6 sweep: for every currently-injected verb, its required argparse
+    positionals (hand-built below from the verb set as of this test — update
+    this map if a verb's positionals change) must appear in the catalog line,
+    in argparse order, BEFORE any --flag. Verbs with no required positional
+    (including ones with an OPTIONAL positional, e.g. perception's
+    nargs='*' `signals`) must not spuriously grow one either.
+    """
+    io_cli_path = os.path.join(
+        os.path.dirname(__file__), "..", "tools", "io_cli.py"
+    )
+    catalog = build_catalog(io_cli_path)
+    assert catalog is not None, "build_catalog should not return None"
+
+    lines_by_verb = {}
+    for line in catalog.split("\n"):
+        verb = line.split(" ", 1)[0]
+        lines_by_verb[verb] = line
+
+    # Hand-built expected map for the CURRENT verb set (tools/io_cli.py, verbs
+    # actually injected into the catalog — [setup]/[ops]/phase2 verbs excluded).
+    expected_positionals = {
+        "cancel-wake": [],
+        "chat-image": [],
+        "identity-read": [],
+        "identity-write": [],
+        "memory-delete": [],
+        "memory-fetch": ["ids"],
+        "memory-index": [],
+        "memory-patch": [],
+        "memory-write": [],
+        "perception": [],  # signals is nargs='*' (optional) — must NOT appear
+        "perception-history": ["signal"],
+        "perception-recent-apps": [],
+        "perception-trend": ["signal"],
+        "photo-read": [],
+        "photo-recent": [],
+        "schedule-wake": [],
+        "screen-read": [],
+        "screen-recent": [],
+    }
+
+    for verb, positionals in expected_positionals.items():
+        assert verb in lines_by_verb, f"{verb} is missing from the catalog entirely"
+        # Description is separated from the head (verb + positionals + flags)
+        # by exactly two spaces (see io_cli_catalog.build_catalog's f-strings).
+        head = lines_by_verb[verb].split("  ", 1)[0]
+        tokens = head.split()
+        assert tokens[0] == verb
+        rest = tokens[1:]
+        flag_start = next((i for i, t in enumerate(rest) if t.startswith("--")), len(rest))
+        actual_positionals = rest[:flag_start]
+        assert actual_positionals == positionals, (
+            f"{verb}: expected positionals {positionals}, got {actual_positionals} "
+            f"(full head: {head!r})"
+        )
+
+
 def test_catalog_header_is_exactly_two_lines():
     """Catalog header should be exactly two lines (D8 + D3)."""
     io_cli_path = os.path.join(

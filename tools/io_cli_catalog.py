@@ -130,9 +130,17 @@ def build_catalog(io_cli_path: str, python: str = sys.executable) -> Optional[st
         except Exception:
             return None
 
-        # 从 usage 行提取 --flag 名(含必选和可选参数)。
+        # 从 usage 行提取:
+        #   (a) --flag 名(含必选和可选参数)
+        #   (b) 必填的位置参数(bare positional,如 perception-trend/-history 的
+        #       signal、memory-fetch 的 ids)—— I6 修复:旧版只抓 --flag,位置参
+        #       数整个从目录里消失,照目录抄命令的模型会撞上 argparse 的
+        #       "the following arguments are required" 报错。
         # 注:本函数依赖 CPython argparse 当前的格式约定:
-        # - 必选参数无括号 (--id ID)、可选参数有括号 ([--flag ARG])、多行续行缩进
+        # - 必选 flag 无括号 (--id ID)、可选 flag 有括号 ([--flag ARG])、多行续行缩进
+        # - 必填位置参数是裸标识符(signal)或裸标识符+可重复后缀(ids [ids ...],
+        #   nargs='+');可选位置参数(nargs='*')整体套括号([signals ...]),不算
+        #   必填,不提取(如 perception 的 signals)。
         # - 若 argparse 格式变化,正则模式需相应调整
         flags = set()
         usage_lines = []
@@ -158,15 +166,35 @@ def build_catalog(io_cli_path: str, python: str = sys.executable) -> Optional[st
         flags.update(bracketed)
         flags.update(bare)
 
-        # 生成目录行: "verb --flag1 --flag2 ..."
+        # 位置参数提取(I6): 先去掉 "usage: PROG verb" 前缀,再整体去掉全部方括号
+        # 分组(可选 flag 及可选位置参数的 [...] 都是整体括起来的),再去掉必填
+        # flag 自身(上面 bare 已经识别出的 --flag [METAVAR]),剩下裸词里非
+        # "--" 开头的就是必填位置参数,按出现顺序去重。
+        positional_text = re.sub(
+            rf"^usage:\s*\S+\s+{re.escape(verb)}\s*", "", usage_text)
+        positional_text = re.sub(r"\[[^\[\]]*\]", " ", positional_text)
+        for flag in bare:
+            positional_text = re.sub(
+                rf"{re.escape(flag)}(?:\s+[A-Z_][A-Z_0-9]*)?", " ", positional_text)
+        positionals = []
+        for token in positional_text.split():
+            if token.startswith("-"):
+                continue
+            if token not in positionals:
+                positionals.append(token)
+
+        # 生成目录行: "verb <positional...> --flag1 --flag2 ..."(位置参数排在
+        # flag 前面,和实际命令行调用时的位置一致)
+        clean_desc = desc.replace("[setup] ", "").replace("[ops] ", "").strip()
+        head_parts = [verb]
+        if positionals:
+            head_parts.append(" ".join(positionals))
         if flags:
-            flag_str = " ".join(sorted(flags))
-            # 清理 desc(可能含 [setup] 等标记)
-            clean_desc = desc.replace("[setup] ", "").replace("[ops] ", "").strip()
-            catalog_lines.append(f"{verb} {flag_str}  {clean_desc}")
+            head_parts.append(" ".join(sorted(flags)))
+        if len(head_parts) > 1:
+            catalog_lines.append(f"{' '.join(head_parts)}  {clean_desc}")
         else:
-            # 没有 flag 的 verb 仍然列出来
-            clean_desc = desc.replace("[setup] ", "").replace("[ops] ", "").strip()
+            # 既无位置参数也无 flag 的 verb 仍然列出来
             catalog_lines.append(f"{verb}  {clean_desc}")
 
     return "\n".join(catalog_lines)

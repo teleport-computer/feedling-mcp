@@ -664,14 +664,20 @@ def _identity_write_payload_v2(ns) -> dict | None:
     Shape: one ``identity.profile_patch`` action (all 9 string fields + the 4
     list fields' chosen op merged into one ``patch`` dict), followed by zero or
     more ``identity.dimension_nudge`` actions (one per --nudge-dimension) — a
-    SINGLE request, so a rename + a nudge in the same turn land atomically from
-    the caller's point of view. Returns None when nothing was given to write.
+    SINGLE request. That request is NOT atomic: the server
+    (``backend/identity/actions.py::_execute_identity_actions``) runs the
+    action list 逐条串行执行,失败即停,已执行部分不回滚 — a rename that
+    lands followed by a nudge that then fails leaves the rename in place.
+    Partial results are reported back per-action by the consumer layer, not
+    rolled back by this CLI or the server. Returns None when nothing was given
+    to write.
 
     Raises ``_IdentityWritePrecheckError`` (an obj ready for ``_emit(obj, 2)``)
-    for the three local pre-checks spec 3.1 requires front-running before the
+    for the four local pre-checks spec 3.1 requires front-running before the
     server ever sees the request: D4 改名成对 (agent_name without
     self_introduction), a list field targeted by more than one op in the same
-    call, and a malformed or over-cap --nudge-dimension entry.
+    call, a malformed or over-cap --nudge-dimension entry, and a total action
+    count (profile_patch, if any, + nudges) over 10 — see the I4 note below.
     """
     patch: dict = {}
     for field in _STRING_FIELDS:
@@ -715,11 +721,27 @@ def _identity_write_payload_v2(ns) -> dict | None:
     if patch:
         actions.append({"type": "identity.profile_patch", "patch": patch})
 
+    # I4: /v1/identity/actions 对整批 actions 做 actions[:10] 静默截断(见
+    # backend/identity/actions.py::_execute_identity_actions) 而不报错 —— 决定
+    # 不改服务端(共享入口,App 也走这条路)。所以本地在拼请求前就把"profile
+    # patch(有的话占 1 条)+ nudge 条数"的总数摁在 <=10,否则会出现"CLI 拿到
+    # 200,但最后一条 nudge 其实从没被服务端执行过"的假阳性成功。
+    nudge_specs = list(getattr(ns, "nudge_dimension", None) or [])
+    max_nudges = 10 - len(actions)
+    if len(nudge_specs) > max_nudges:
+        raise _IdentityWritePrecheckError({
+            "ok": False, "error": "too_many_actions",
+            "action_count": len(actions) + len(nudge_specs),
+            "hint": "本次总动作数(profile patch + nudge)不能超过 10;"
+                    + ("带 profile patch 时最多 9 条 nudge" if patch else "最多 10 条 nudge")
+                    + f"(当前 --nudge-dimension 给了 {len(nudge_specs)} 条)",
+        })
+
     # 七维只微调: 单条 |delta|<=10,同一次调用里同一维度(strip+lower 归一后)的
     # delta 求和也<=10 —— 口径对齐服务端 card_policy.validate_dimension_nudge /
     # validate_nudge_sum(后者是同请求批量闸,这里只是本地前置,服务端仍是最终权威)。
     nudge_sums: dict[str, int] = {}
-    for spec in list(getattr(ns, "nudge_dimension", None) or []):
+    for spec in nudge_specs:
         try:
             name, delta = _parse_nudge_dimension(spec)
         except ValueError as exc:
@@ -751,20 +773,25 @@ def _identity_write_payload_v2(ns) -> dict | None:
 def cmd_identity_write(args):
     """Patch the agent's identity card — full field set (spec 3.1): 9 string
     fields, 4 list fields (each add/remove/replace, plus --signature's legacy
-    whole-replace), and up to 10 --nudge-dimension micro-adjustments.
+    whole-replace), and up to 9-10 --nudge-dimension micro-adjustments
+    (total action count, profile_patch + nudges, capped at 10 — see I4 note
+    in ``_identity_write_payload_v2``).
 
     POST /v1/identity/actions (identity.profile_patch [+ identity.dimension_nudge
     per --nudge-dimension], ONE request — see ``_identity_write_payload_v2``).
     The server decrypts the existing card, merges, and re-encrypts (no client
-    crypto). Used by post-respawn 7.D so the agent (now itself) writes its own
+    crypto), 逐条串行执行,失败即停,已执行部分不回滚 — this is NOT an atomic
+    batch. Used by post-respawn 7.D so the agent (now itself) writes its own
     intro + signature in-voice, and by any turn where the user renames it
     ("以后叫你老6") — without --agent-name the rename can only land in the
     self_introduction text while the displayed name stays stale, which reads to
     the user as "it said yes and did nothing".
 
-    Local pre-checks (rename pairing / list-op conflict / nudge format+cap) run
-    BEFORE any network call, so a malformed call fails fast with the same error
-    the server would give instead of wasting a round-trip.
+    Local pre-checks (rename pairing / list-op conflict / nudge format+cap /
+    total action count <=10) run BEFORE any network call, so a malformed call
+    fails fast with the same error the server would give (or, for the >10 cap,
+    an error the server would otherwise swallow via a silent actions[:10]
+    slice) instead of wasting a round-trip or a silently-dropped nudge.
     """
     try:
         payload = _identity_write_payload_v2(args)
@@ -1199,6 +1226,9 @@ def main():
             "    --signature 保留)/ --add-* / --remove-* / --replace-* 四选一,混用报错。\n"
             "  七维只微调: --nudge-dimension 名:±整数,单条、以及同一次调用里同一维度的\n"
             "    delta 求和,都不能超过 ±10;想大改用 identity-init 的 --dimensions 整卡给。\n"
+            "  单次总动作数<=10: profile patch(有的话占 1 条)+ nudge 条数合计不能超过\n"
+            "    10——带 profile patch 时最多 9 条 nudge,不带时最多 10 条;超了服务端会\n"
+            "    静默丢弃多出来的,本工具改为本地直接报错,不给假的 200。\n"
         ),
     )
     iw.add_argument("--agent-name", dest="agent_name", default=None,
