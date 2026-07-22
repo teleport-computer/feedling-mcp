@@ -64,6 +64,27 @@ import tools.chat_resident_consumer as crc  # noqa: E402
 import io_cli  # noqa: E402
 
 
+def _content_encryption_is_real() -> bool:
+    """True only when the CURRENTLY-bound ``content_encryption`` module is the
+    real, file-backed backend module — never the in-file fake stub above
+    (which has no ``__file__`` and drops the plaintext entirely, returning a
+    fixed marker dict regardless of input).
+
+    Checked at CALL time, not at this file's own import time above: pytest
+    caches modules process-wide, so a DIFFERENT test file imported earlier in
+    the same session may already have installed the fake into
+    ``sys.modules["content_encryption"]`` before this file's own
+    ``import content_encryption`` line even runs — that import would then
+    silently succeed against the cached fake (no ``ModuleNotFoundError``),
+    which would make a naive "did the try/except above take the except
+    branch" flag say "real" while ``crc._build_envelope`` is actually still
+    the fake lambda. This is exactly the vacuous-pass risk flagged in review:
+    the leak test must fail closed (skip, not silently pass) whenever it
+    cannot tell the difference."""
+    mod = sys.modules.get("content_encryption")
+    return mod is not None and getattr(mod, "__file__", None) is not None
+
+
 @pytest.fixture(autouse=True)
 def _isolate_redistill_state():
     """Every test gets a clean in-memory dedupe dict — this global otherwise
@@ -388,11 +409,25 @@ def test_handle_redistill_ipc_missing_request_id_rejected(redistill_home):
 
 def test_request_body_never_carries_material_plaintext(monkeypatch, redistill_home):
     """The one crypto-touching test: seal with the REAL _build_redistill_envelope
-    (real content_encryption.build_envelope when the backend is importable —
-    see the module bootstrap above) and assert the exact JSON body POSTed to
-    the backend never contains the material's plaintext, anywhere, as a
-    substring — not just in an 'envelope' field some other refactor could
-    rename away from."""
+    (real content_encryption.build_envelope) and assert the exact JSON body
+    POSTed to the backend never contains the material's plaintext, anywhere,
+    as a substring — not just in an 'envelope' field some other refactor
+    could rename away from.
+
+    Must fail CLOSED, not vacuously pass: if the real backend module isn't
+    importable in this environment, ``crc._build_envelope`` is the in-file
+    fake stub (see the bootstrap above) which drops the material entirely —
+    the assertion below would then trivially hold regardless of whether the
+    real code has a leak. Skip rather than give a false green."""
+    if not _content_encryption_is_real():
+        pytest.skip(
+            "real content_encryption module not bound (crc._build_envelope is the "
+            "fake stub) — the plaintext-leak assertion would be vacuous here"
+        )
+    assert crc._build_envelope.__module__ == "content_encryption", (
+        "crc._build_envelope is not content_encryption.build_envelope — "
+        "the leak assertion below would not be testing the real seal path"
+    )
     monkeypatch.setattr(crc, "_whoami_cache_loaded_at", time.monotonic())
     monkeypatch.setitem(crc._whoami_cache, "user_id", "usr_redistill_test")
     monkeypatch.setitem(crc._whoami_cache, "user_pk", os.urandom(32))
@@ -440,6 +475,27 @@ def test_build_redistill_envelope_reuses_capture_style_seal(monkeypatch):
     assert calls[0]["visibility"] == "shared"
     assert calls[0]["item_id"] == "req-abc"
     assert calls[0]["plaintext"] == b"material text"
+
+
+def test_redistill_ipc_refuses_to_bind_in_dir_not_owned_by_us(monkeypatch, short_tmp_dir, caplog):
+    """Directory-ownership hardening (Codex review, T11 follow-up): a
+    pre-existing socket dir owned by a DIFFERENT uid must refuse to bind
+    rather than silently listen there (possible /tmp squat). Simulated
+    without root by making ``os.getuid()`` disagree with the real owner of a
+    dir this test process itself created — the code path exercised is
+    identical to a genuine uid mismatch."""
+    if crc._IS_WINDOWS:
+        pytest.skip("uid ownership check is POSIX-only")
+    sock_path = short_tmp_dir / "sub" / "resident_ipc.sock"
+    real_getuid = os.getuid
+    monkeypatch.setattr(os, "getuid", lambda: real_getuid() + 1)
+
+    with caplog.at_level("ERROR"):
+        crc._redistill_ipc_serve_forever(sock_path)  # returns immediately, no accept loop
+
+    assert not sock_path.exists()
+    assert any("not ours" in rec.message or "refusing to bind" in rec.message
+               for rec in caplog.records)
 
 
 # ---------------------------------------------------------------------------

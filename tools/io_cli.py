@@ -1469,13 +1469,23 @@ def main():
     ird = sub.add_parser(
         "identity-redistill",
         help="仅用户明确要求重新总结/重新蒸馏人设时使用;材料≤64KB,经本机 IPC 交给 "
-             "consumer 整卡重新推导(不是增量 patch,日常改字段用 identity-write)。",
+             "consumer 整卡重新推导(不是增量 patch,日常改字段用 identity-write)。"
+             "敏感材料优先用 --material-file:--material-text 会明文出现在本机 ps 输出里,"
+             "同机其他本地用户可见。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "隐私提示: --material-text 的值会作为进程参数出现在本机 `ps`/`/proc/<pid>/cmdline`\n"
+            "输出里,同一台机器上的其他本地用户可能看到;材料敏感时优先用 --material-file\n"
+            "(写到一个只有自己能读的文件,传路径而不是原文)。\n"
+        ),
     )
     ird_grp = ird.add_mutually_exclusive_group(required=True)
     ird_grp.add_argument("--material-file", dest="material_file", default=None,
-                         help="材料文件路径(UTF-8 文本);与 --material-text 二选一")
+                         help="材料文件路径(UTF-8 文本);与 --material-text 二选一;"
+                              "敏感材料优先用这个(不会出现在 ps 里)")
     ird_grp.add_argument("--material-text", dest="material_text", default=None,
-                         help="材料原文,直接传文本;与 --material-file 二选一")
+                         help="材料原文,直接传文本;与 --material-file 二选一;"
+                              "⚠️ 会明文出现在本机 ps 输出里,敏感材料改用 --material-file")
     ird.set_defaults(func=cmd_identity_redistill)
 
     ii = sub.add_parser("identity-init", help="[setup] Create the identity card (sanitizes + fresh-start).")

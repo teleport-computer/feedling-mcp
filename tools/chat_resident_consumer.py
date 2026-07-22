@@ -11526,12 +11526,38 @@ def _redistill_ipc_serve_forever(sock_path: Path) -> None:
     Runs until ``_running`` flips False (same shutdown flag the main poll
     loop honors) — a final accept() may still be blocked when that happens,
     so the loop uses a short accept timeout to notice the flag promptly
-    instead of hanging past process shutdown."""
+    instead of hanging past process shutdown.
+
+    Directory hardening (Codex review, T11 follow-up): the parent dir is
+    created 0700 (and re-chmod'd — ``mkdir``'s mode is umask-masked, mirrors
+    ``_mkdir_scratch``/``IMAGE_TEMP_DIR``'s pattern), and — POSIX only, since
+    ``os.getuid`` doesn't exist on Windows — refuses to bind at all when a
+    PRE-EXISTING dir isn't owned by our own uid. Socket-file perms alone
+    aren't a reliable gate on every macOS/BSD (connect() isn't guaranteed to
+    enforce them), and a `/tmp` dir-squat landing between a stale-dir cleanup
+    and this mkdir could otherwise let another local user plant a listener
+    that intercepts plaintext identity material."""
+    parent = sock_path.parent
     try:
-        sock_path.parent.mkdir(parents=True, exist_ok=True)
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(parent, 0o700)
     except Exception as e:
-        log.error("redistill IPC: cannot create %s: %s — listener disabled", sock_path.parent, e)
+        log.error("redistill IPC: cannot create %s: %s — listener disabled", parent, e)
         return
+    if not _IS_WINDOWS:
+        try:
+            owner_uid = parent.stat().st_uid
+        except OSError as e:
+            log.error("redistill IPC: cannot stat %s: %s — listener disabled", parent, e)
+            return
+        if owner_uid != os.getuid():
+            log.error(
+                "redistill IPC: %s is owned by uid %d, not ours (uid %d) — refusing to "
+                "bind a socket there (possible /tmp squat); listener disabled. Set "
+                "FEEDLING_HOME to a directory only this user can create.",
+                parent, owner_uid, os.getuid(),
+            )
+            return
     # A stale socket file from a previous (crashed/killed) run makes bind()
     # fail with "address already in use" even though nothing is listening.
     try:
