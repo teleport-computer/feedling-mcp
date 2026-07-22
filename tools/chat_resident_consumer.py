@@ -1585,9 +1585,12 @@ def _fetch_from_enclave(
 #                succeeded (a brand-new resident with no history yet is reachable
 #                but not yet proven on a real message — the phase-2 encrypted
 #                challenge closes that residual)
-#   degraded     a claimed message could not be read (empty-content / wedge) —
+#   degraded     claimed messages could not be read (empty-content / wedge) for
+#                DECRYPT_DEGRADE_AFTER consecutive claims — a single blip (a
+#                claim/history race, one boundary message) no longer degrades;
 #                only a later real success clears it; a reachability probe never
-#                upgrades degraded, so a per-message decrypt failure is not masked
+#                upgrades degraded, so a real per-message decrypt failure is not
+#                masked
 #   unreachable  the configured enclave source failed
 #   unconfigured no FEEDLING_ENCLAVE_URL at all
 # checked_at is refreshed on every confirmation so a long-idle "ok" cannot look
@@ -1612,10 +1615,44 @@ DECRYPT_HEALTH_REFRESH_SEC = _env_float(
 
 _decrypt_health: dict = {"status": "unknown", "checked_at": 0.0}
 
+# One unreadable claim can be a transient blip (claim/history race, a single
+# boundary message). Degrading on the first one parked healthy established
+# residents on a sticky "degraded" overnight and tripped the backend's
+# maintenance alert for a working setup (usr_98306ae2, 2026-07-22). Require a
+# streak of consecutive read failures before reporting degraded; any real
+# decrypt success resets the streak. Floor of 1 restores degrade-immediately
+# for operators who want it.
+try:
+    DECRYPT_DEGRADE_AFTER = max(
+        1, int(os.environ.get("FEEDLING_DECRYPT_DEGRADE_AFTER") or 2)
+    )
+except (TypeError, ValueError):
+    DECRYPT_DEGRADE_AFTER = 2
+
+_decrypt_read_failures = {"count": 0}
+
 
 def _set_decrypt_health(status: str) -> None:
     _decrypt_health["status"] = status
     _decrypt_health["checked_at"] = time.time()
+
+
+def _note_decrypt_read_failure() -> None:
+    """Record one claimed-but-unreadable message; degrade only on a streak.
+
+    Below the streak threshold the current status is left untouched (the
+    heartbeat/probe path keeps reporting it) so a lone blip never flips a
+    healthy resident to degraded."""
+    _decrypt_read_failures["count"] += 1
+    if _decrypt_read_failures["count"] >= DECRYPT_DEGRADE_AFTER:
+        _set_decrypt_health("degraded")
+
+
+def _note_decrypt_read_success() -> None:
+    """A real message decrypted to non-empty plaintext — the only signal that
+    clears degraded (reachability probes never do) and resets the streak."""
+    _decrypt_read_failures["count"] = 0
+    _set_decrypt_health("ok")
 
 
 def _decrypt_health_headers() -> dict:
@@ -9658,9 +9695,13 @@ def _process_messages(messages: list) -> float:
             # Report the health so the backend surfaces the real blocker instead
             # of a verify_ping-only false green. Preserve the actionable
             # distinction: no source at all → unconfigured (the usr_6c1971 case);
-            # a configured source that still yielded no plaintext → degraded.
+            # a configured source that still yielded no plaintext → a read
+            # failure, degrading only on a streak (single blips stay green).
             # Never send a fallback for content we cannot read.
-            _set_decrypt_health("degraded" if FEEDLING_ENCLAVE_URL else "unconfigured")
+            if FEEDLING_ENCLAVE_URL:
+                _note_decrypt_read_failure()
+            else:
+                _set_decrypt_health("unconfigured")
             log.warning(
                 "user message has no plaintext content ts=%.3f content_type=%s "
                 "— skipping (set FEEDLING_ENCLAVE_URL to enable decryption)",
@@ -9670,8 +9711,15 @@ def _process_messages(messages: list) -> float:
             continue
         else:
             # A real user message decrypted to non-empty plaintext — decryption
-            # is genuinely working; clears any earlier degraded.
-            _set_decrypt_health("ok")
+            # is genuinely working; clears any earlier degraded and resets the
+            # read-failure streak. Server-injected maintenance turns
+            # (source=resident_maintenance) may arrive through the inline poll
+            # fallback and are not evidence that a real user ciphertext was
+            # readable, so they don't count as recovery — counting them would
+            # let fail→maintenance→fail reset the streak forever and keep a
+            # genuinely degraded source below the threshold.
+            if source != RESIDENT_MAINTENANCE_SOURCE:
+                _note_decrypt_read_success()
             log.info("user message [ts=%.3f]: %s", ts, content[:80])
 
         trace_id = str(msg.get("id") or msg.get("message_id") or "").strip()
@@ -10780,9 +10828,9 @@ def run() -> None:
                 messages = _filter_messages_to_poll_ids(decrypted, poll_messages)
                 if not messages:
                     # Claimed ids weren't in the decrypt history — the messages
-                    # exist and were leased but can't be read: degraded health,
-                    # same class as the empty-content skip.
-                    _set_decrypt_health("degraded")
+                    # exist and were leased but can't be read: a read failure,
+                    # same class as the empty-content skip (degrades on streak).
+                    _note_decrypt_read_failure()
                     if wedge_miss_ts == last_ts:
                         wedge_miss_count += 1
                     else:
