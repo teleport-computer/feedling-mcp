@@ -1239,6 +1239,17 @@
             "example": "a1b2c3d"
           },
           {
+            "name": "X-Feedling-Consumer-Compat-Commit",
+            "in": "header",
+            "required": false,
+            "description": "Optional poll-only backend target that an older running resident intentionally skipped as irrelevant. It suppresses commit-mismatch maintenance only when a running commit is present and this value matches the backend's current expected commit.",
+            "schema": {
+              "type": "string",
+              "maxLength": 80
+            },
+            "example": "a1b2c3d"
+          },
+          {
             "name": "X-Feedling-Decrypt-Status",
             "in": "header",
             "required": false,
@@ -1267,7 +1278,7 @@
           }
         ],
         "x-feedling-contract-level": "documented",
-        "description": "Long-poll and optionally claim resident chat work. Official residents report decrypt-source status and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At."
+        "description": "Long-poll and optionally claim resident chat work. Official residents report their running commit and may report an intentionally skipped compatible backend target with X-Feedling-Consumer-Compat-Commit. They also report decrypt-source status and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At."
       }
     },
     "/v1/chat/response": {

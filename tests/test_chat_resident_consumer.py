@@ -5310,6 +5310,56 @@ def test_codex_turn_from_stream_0136_item_protocol_still_works():
     assert reasoning == "thinking…"
 
 
+# ---------------------------------------------------------------------------
+# When a codex turn calls tools, a *preamble* agent_message ("let me check…")
+# precedes the tool call and the real answer arrives in a LATER agent_message —
+# the same shape _claude_turn_from_stream documents. The old join glued the
+# preamble onto the answer as one doubled-up bubble (2026-07-22 resident
+# report). The reply must be the LAST agent message only; 0.142's
+# task_complete.last_agent_message is authoritative when present.
+# ---------------------------------------------------------------------------
+
+def test_codex_turn_from_stream_0136_takes_last_agent_message_not_join():
+    # Real-world shape from the 2026-07-22 resident trace: preamble →
+    # mcp_tool_call → final answer.
+    raw = (
+        '{"type":"thread.started","thread_id":"t1"}\n'
+        '{"type":"item.completed","item":{"type":"reasoning","text":"planning"}}\n'
+        '{"type":"item.completed","item":{"type":"agent_message","text":"我先按你的固定流程轻轻走一遍。"}}\n'
+        '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"ob","tool":"pulse","status":"completed"}}\n'
+        '{"type":"item.completed","item":{"type":"agent_message","text":"真正的回答在这里。"}}\n'
+        '{"type":"turn.completed"}\n'
+    )
+    reply, reasoning = crc._codex_turn_from_stream(raw)
+    assert reply == "真正的回答在这里。"
+    assert "我先按你的固定流程" not in reply
+    assert reasoning == "planning"
+
+
+def test_codex_turn_from_stream_0142_takes_last_agent_message_not_join():
+    raw = (
+        '{"type":"task_started"}\n'
+        '{"type":"agent_message","message":"let me check the tools…"}\n'
+        '{"type":"agent_message","message":"the real answer"}\n'
+        '{"type":"task_complete"}\n'
+    )
+    reply, _ = crc._codex_turn_from_stream(raw)
+    assert reply == "the real answer"
+
+
+def test_codex_turn_from_stream_0142_task_complete_last_agent_message_wins():
+    # task_complete carries the final answer alone — trust it over the
+    # collected stream (codex analogue of claude's terminal `result`).
+    raw = (
+        '{"type":"task_started"}\n'
+        '{"type":"agent_message","message":"preamble narration"}\n'
+        '{"type":"agent_message","message":"streamed final"}\n'
+        '{"type":"task_complete","last_agent_message":"authoritative final"}\n'
+    )
+    reply, _ = crc._codex_turn_from_stream(raw)
+    assert reply == "authoritative final"
+
+
 def test_call_agent_cli_codex_0142_routes_reasoning_to_thinking_not_bubble(monkeypatch):
     monkeypatch.setattr(
         crc,

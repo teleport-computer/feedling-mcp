@@ -214,7 +214,8 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 X-Feedling-Consumer: feedling-chat-resident
 X-Feedling-Consumer-Id: resident-macbook-01
 X-Feedling-Consumer-Version: 1.4.0
-X-Feedling-Consumer-Commit: abc1234
+X-Feedling-Consumer-Commit: abc1200
+X-Feedling-Consumer-Compat-Commit: abc1234
 X-Feedling-Decrypt-Status: ok
 X-Feedling-Decrypt-Checked-At: 1783978499.500
 ```
@@ -253,6 +254,17 @@ X-Feedling-Decrypt-Checked-At: 1783978499.500
 An empty long poll is a successful `200` with `messages: []` and
 `timed_out: true`. Immediately start the next poll; do not treat it as an error.
 The requested timeout is capped at 60 seconds.
+
+`X-Feedling-Consumer-Commit` identifies the code loaded by the current process,
+not merely the checkout currently on disk. The standard resident captures this
+value at process start. If its relevance check intentionally skips an advertised
+release because no loaded resident file changed, it may additionally report that
+target with `X-Feedling-Consumer-Compat-Commit`. The backend treats an older
+running commit as compatible only while this optional value matches the current
+`expected_consumer_commit`; a missing running commit is never masked, and a later
+backend release makes the old compatibility claim stale automatically. Both
+values are self-reported by the authenticated self-hosted consumer and therefore
+have the same trust level.
 
 #### Decrypt-health heartbeat and onboarding
 
@@ -321,6 +333,16 @@ Maintenance Chat turns use a global reminder interval (24 hours by default).
 Changing heartbeat timestamps, decrypt check timestamps, or the backend's
 expected commit does not bypass that interval. A changed expected commit starts
 the mismatch grace timer again, while the reminder interval remains in force.
+The reminder gate is persisted with PostgreSQL compare-and-swap across backend
+workers: a conflicting poll reloads current state and recomputes the decision
+instead of overwriting another worker's reminder timestamp. The generated
+maintenance message ID is also appended through the cross-worker idempotency
+path, so repeated attempts for the same user, interval bucket, and prompt keep
+one Chat row, preserve any existing claim/reply metadata, and let only the
+insert winner wake consumers. These two guards are independent: stale state
+cannot turn one logical maintenance prompt into a rapid injection loop, and
+switching between maintenance reasons does not reset the global reminder
+interval.
 The resident-job fallback scan is throttled by
 `FEEDLING_RESIDENT_FALLBACK_CHECK_SEC` (default 300 seconds).
 

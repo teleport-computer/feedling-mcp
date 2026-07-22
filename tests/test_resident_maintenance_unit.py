@@ -17,14 +17,45 @@ def _fake_store():
 
 
 def _patch_state(monkeypatch, state_box: dict) -> None:
-    def load(_store):
-        return copy.deepcopy(state_box.get("state") or {})
-
-    def save(_store, state):
+    def mutate_state(_store, mutate):
+        state = copy.deepcopy(state_box.get("state") or {})
+        result = mutate(state)
         state_box["state"] = copy.deepcopy(state)
+        return state, result
 
-    monkeypatch.setattr(resident_maintenance.chat_consumer, "_load_consumer_state", load)
-    monkeypatch.setattr(resident_maintenance.chat_consumer, "_save_consumer_state", save)
+    monkeypatch.setattr(
+        resident_maintenance.chat_consumer,
+        "_mutate_consumer_state",
+        mutate_state,
+    )
+
+
+def test_state_cas_exhaustion_fails_closed_before_message_append(monkeypatch):
+    store = _fake_store()
+    monkeypatch.setattr(
+        resident_maintenance.onboarding,
+        "_load_onboarding_route",
+        lambda _store: "resident",
+    )
+    monkeypatch.setattr(
+        resident_maintenance.chat_consumer,
+        "_mutate_consumer_state",
+        lambda _store, _mutate: None,
+    )
+    appended: list[str] = []
+    monkeypatch.setattr(
+        resident_maintenance,
+        "_append_maintenance_message",
+        lambda *_args, **_kwargs: appended.append("message"),
+    )
+
+    result = resident_maintenance._maybe_handle_poll(
+        store,
+        {"official": True, "consumer_id": "vps-resident-c1"},
+    )
+
+    assert result == {"triggered": False, "reason": "state_update_conflict"}
+    assert appended == []
 
 
 def test_fallback_db_check_is_throttled(monkeypatch):

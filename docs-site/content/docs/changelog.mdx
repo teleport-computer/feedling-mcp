@@ -49,6 +49,23 @@ change must not be interpreted as an API guarantee.
   other still works. `effective` is derived, and covers every lane. `POST` requires a real JSON boolean under `enabled`; strings such as
   `"no"` are rejected with `400` rather than coerced.
 
+- Resident maintenance reminder state now uses cross-worker PostgreSQL
+  compare-and-swap instead of process-local read-modify-write persistence.
+  Concurrent Chat poll, claim, and pending-work requests therefore preserve one
+  another's heartbeat, decrypt-health, and reminder fields. Maintenance Chat
+  appends also use the existing atomic `client_msg_id` idempotency path: repeated
+  attempts for the same user, reminder bucket, and prompt retain one row and
+  preserve its claim/reply metadata, while only the insert winner wakes
+  consumers. Reason changes remain subject to the same global reminder interval.
+- Official self-hosted resident polls can now include
+  `X-Feedling-Consumer-Compat-Commit` when the updater intentionally keeps an
+  older running image because the advertised release changes no resident-loaded
+  files. A non-empty running commit plus a compatibility value matching the
+  current backend target suppresses commit-mismatch maintenance warnings. A
+  missing running commit, an absent compatibility value, or a compatibility
+  value for an older backend target retains the existing grace and reminder
+  behavior. `X-Feedling-Consumer-Commit` now identifies the commit captured by
+  the running process rather than a checkout changed underneath it.
 - Official resident consumers now report decrypt-source health on
   `GET /v1/chat/poll` with `X-Feedling-Decrypt-Status`
   (`ok`, `degraded`, `unconfigured`, or `unreachable`) and
@@ -256,6 +273,19 @@ change must not be interpreted as an API guarantee.
   removed for that turn. Numeric health reads remain composable with outbound
   tools.
 
+- The standard resident consumer now answers an offline backlog with one
+  merged agent turn. When a processing batch contains at least
+  `FEEDLING_BACKLOG_COLLAPSE_MIN` (default 3) stale plain-text user messages
+  whose oldest entry is older than `FEEDLING_BACKLOG_COLLAPSE_AGE_SEC`
+  (default 1800 seconds), the pile is presented to the agent as one
+  timestamped timeline with an instruction to reply once. The merged reply
+  anchors to the newest message; older parents stay superseded and are never
+  redelivered. A purely fresh burst from an online user never merges and keeps
+  per-message replies; once a stale pile has triggered, fresh eligible messages
+  in the same batch join that single merged turn. Probe, maintenance, media,
+  and unreadable rows keep their own pipelines, the merged prompt is bounded
+  (newest lines win when trimming), and a transient reply-write failure keeps
+  the checkpoint with the whole pile retryable as one turn.
 - Genesis imports now use the person's saved preferred name in distilled
   memory prose. When no name is known, generated cards omit the subject where
   possible or use the neutral “the person”/“对方”; they no longer expose the

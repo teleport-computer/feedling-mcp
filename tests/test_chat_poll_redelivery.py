@@ -93,6 +93,39 @@ def test_newer_replied_user_message_supersedes_older_unanswered(store):
     assert got == []  # conversation moved past m_old_unanswered — never redeliver
 
 
+def test_collapsed_backlog_tail_stays_superseded_even_after_claim_expiry(store):
+    """Backend contract behind the consumer's offline-backlog collapse: the
+    merged reply lands only on the NEWEST parent, so the older pile must stay
+    superseded — cursor already past, live claims lapsed, and an explicit claim
+    expiry sweep must not resurrect them (codex3 seam #1)."""
+    import db as _db
+
+    for i in range(3):
+        _append_user_msg(store, f"m_pile_{i}")
+    newest = _append_user_msg(store, "m_pile_newest")
+    # The consumer claimed the whole pile while processing the collapsed turn.
+    claim_now = time.time()
+    for i in range(3):
+        fields = {
+            "reply_status": "pending",
+            "reply_claimed_by": "consumer-A",
+            "reply_claimed_at": f"{claim_now:.3f}",
+            "reply_claim_expires_at": f"{claim_now + 60:.3f}",
+        }
+        assert _db.chat_try_claim_reply(
+            store.user_id, f"m_pile_{i}", "consumer-A", claim_now, fields
+        ) is not None
+    _mark_replied(store, "m_pile_newest")
+
+    after = _cursor_past(newest)
+    assert [m["id"] for m in _poll(store, since=after)] == []
+    # Claims lapse / an explicit expiry sweep runs — tail must remain dark.
+    _db.chat_expire_reply_claims(store.user_id)
+    assert [m["id"] for m in _poll(store, since=after)] == []
+    # A different consumer must not be able to steal a superseded parent either.
+    assert [m["id"] for m in _poll(store, consumer_id="consumer-B", since=after)] == []
+
+
 def test_redelivery_outside_window_is_dropped(store, monkeypatch):
     msg = _append_user_msg(store, "m_ancient")
     since = _cursor_past(msg)

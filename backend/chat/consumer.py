@@ -1,13 +1,14 @@
 """Resident-consumer liveness state + validation gate input."""
 
+import copy
 import math
 import os
 import time
 from datetime import datetime
+from typing import Callable, TypeVar
 
 import db
 from core.store import UserStore
-
 
 
 _OFFICIAL_CONSUMER_NAME = "feedling-chat-resident"
@@ -33,6 +34,8 @@ _DECRYPT_HEALTH_EXISTING_UNKNOWN_GRACE_SEC = max(
 _RESIDENT_BINDING_SEEN_INTERVAL_SEC = max(
     1, int(os.environ.get("FEEDLING_RESIDENT_BINDING_SEEN_INTERVAL_SEC", "60"))
 )
+_CONSUMER_STATE_CAS_ATTEMPTS = 5
+_ConsumerStateResult = TypeVar("_ConsumerStateResult")
 
 
 def expected_consumer_commit() -> str:
@@ -60,8 +63,43 @@ def _load_consumer_state(store: UserStore) -> dict:
     return {}
 
 
-def _save_consumer_state(store: UserStore, state: dict) -> None:
-    db.set_blob(store.user_id, "consumer_state", state)
+def _mutate_consumer_state(
+    store: UserStore,
+    mutate: Callable[[dict], _ConsumerStateResult],
+) -> tuple[dict, _ConsumerStateResult] | None:
+    """Atomically apply one consumer-state mutation across backend workers.
+
+    ``consumer_state_lock`` only serializes threads sharing this ``UserStore``;
+    gunicorn workers have independent stores and locks. The database CAS closes
+    that process boundary. On conflict we reload the winner and rerun the
+    field-level mutator, so unrelated fields/subtrees survive while a genuine
+    same-field later write retains normal last-writer semantics.
+
+    ``None`` means the bounded retries were exhausted. Callers whose next step
+    has an external side effect (notably maintenance-message injection) must
+    fail closed rather than act on a state transition that was not persisted.
+    """
+    with store.consumer_state_lock:
+        for attempt in range(_CONSUMER_STATE_CAS_ATTEMPTS):
+            current = _load_consumer_state(store)
+            candidate = copy.deepcopy(current)
+            result = mutate(candidate)
+            if candidate == current:
+                return candidate, result
+            if db.set_blob_if_unchanged(
+                store.user_id,
+                "consumer_state",
+                current,
+                candidate,
+                insert_if_missing=True,
+            ):
+                return candidate, result
+            if attempt + 1 < _CONSUMER_STATE_CAS_ATTEMPTS:
+                time.sleep(0.001 * (2**attempt))
+    print(
+        f"[{store.user_id}/consumer_state] CAS retries exhausted; mutation skipped"
+    )
+    return None
 
 
 def _consumer_headers_from_map(headers, remote_addr: str = "") -> dict:
@@ -77,6 +115,12 @@ def _consumer_headers_from_map(headers, remote_addr: str = "") -> dict:
         "consumer_id": (headers.get("X-Feedling-Consumer-Id") or "").strip(),
         "consumer_version": (headers.get("X-Feedling-Consumer-Version") or "").strip(),
         "consumer_commit": (headers.get("X-Feedling-Consumer-Commit") or "").strip(),
+        # Poll-only compatibility claim: the running image intentionally
+        # skipped an irrelevant target while remaining protocol-compatible.
+        # Keep empty values so a later poll clears an obsolete claim.
+        "consumer_compat_commit": (
+            headers.get("X-Feedling-Consumer-Compat-Commit") or ""
+        ).strip(),
         # Keep empty values: an old resident that omits these headers must clear
         # a previously cached report instead of inheriting a stale green state.
         "decrypt_status": (headers.get("X-Feedling-Decrypt-Status") or "").strip().lower(),
@@ -96,8 +140,8 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
         return
     now_epoch = time.time()
     now_iso = datetime.now().isoformat()
-    with store.consumer_state_lock:
-        state = _load_consumer_state(store)
+
+    def mutate(state: dict) -> None:
         event_info = dict(info)
         if event_type != "poll":
             # Decrypt health is a poll-heartbeat contract. Resident response
@@ -106,6 +150,7 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
             # when verify_loop receives its hidden ack.
             event_info.pop("decrypt_status", None)
             event_info.pop("decrypt_checked_at_epoch", None)
+            event_info.pop("consumer_compat_commit", None)
         state.update(event_info)
         state["last_event"] = event_type
         state["last_seen_at"] = now_iso
@@ -122,7 +167,8 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
         elif event_type == "response":
             state["last_response_at"] = now_iso
             state["last_response_epoch"] = now_epoch
-        _save_consumer_state(store, state)
+
+    _mutate_consumer_state(store, mutate)
     if event_type == "poll":
         _touch_resident_binding_seen(store, info=info, now_epoch=now_epoch)
 
@@ -360,6 +406,7 @@ def _consumer_validation_state(
         "consumer_id": state.get("consumer_id", ""),
         "consumer_version": state.get("consumer_version", ""),
         "consumer_commit": state.get("consumer_commit", ""),
+        "consumer_compat_commit": state.get("consumer_compat_commit", ""),
         "last_poll_at": state.get("last_poll_at", ""),
         "last_response_at": state.get("last_response_at", ""),
         "age_sec": age_sec,

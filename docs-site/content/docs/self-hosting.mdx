@@ -120,12 +120,23 @@ these settings:
 | `FEEDLING_DECRYPT_DEGRADE_AFTER` | Optional number of consecutive claimed-but-unreadable messages before the resident reports `degraded` (default 2, minimum 1). A real ordinary user-message decrypt resets the streak; a server maintenance turn does not. |
 | `FEEDLING_RESIDENT_DECRYPT_FAILURE_GRACE_SEC` | Optional backend persistence window before an explicit decrypt failure can inject a maintenance Chat turn for an established resident (default 1800 seconds, minimum 1). New onboarding remains immediately actionable, and all explicit failures can still produce an in-app notice before this window elapses. |
 | `FEEDLING_AGENT_TURN_TIMEOUT_SEC` | Optional wall-clock cap in seconds for one resident CLI agent turn (default 300, minimum 30). A turn exceeding it has its agent subprocess terminated and is treated as a timeout. Raise it for slow self-hosted stacks (cold starts, heavy MCP, long-thinking models); the cap always exists so a hung agent cannot wedge the single-flight chat lane. |
+| `FEEDLING_BACKLOG_COLLAPSE_MIN` | Optional threshold for offline-backlog collapse (default 3, `0` disables). When one processing batch holds at least this many stale plain-text user messages, the resident answers them with a single merged agent turn instead of one turn per message. A purely fresh burst (an online user double-texting) never triggers a merge; once a stale pile has triggered, fresh eligible messages in the same batch join that merged turn. |
+| `FEEDLING_BACKLOG_COLLAPSE_AGE_SEC` | Optional staleness gate for offline-backlog collapse (default 1800, minimum 60). The oldest message in the pile must be at least this old before the merge fires. |
 | `FEEDLING_ASGI_BACKGROUND` | Enable on the real backend instance if it owns the wake bus and screen WebSocket listener. Do not enable competing development instances against the same ports without understanding leader election. |
 | `FEEDLING_PUBLIC_BASE_URL` | Set to the externally reachable HTTPS base URL. |
 | `FEEDLING_CORS_ALLOWED_ORIGINS` | Comma-separated exact browser origins. Leave empty if no browser client needs direct API access. Never use `*`. |
 | `FEEDLING_DATA_DIR` | Non-database local material such as push keys and residual object files. Protect and back it up according to enabled features. |
 | Object-storage variables | Optional, and a one-way switch once used. When configured, heavy ciphertext—screen frames, and Chat image and file bodies—is stored as objects and the database row keeps only a pointer. Leaving them unset keeps every body inline in PostgreSQL. Turning them off, repointing them, or scoping the credential too narrowly **after** pointer rows exist makes those bodies unreadable: the row no longer carries the ciphertext. Treat the store as part of the primary data set, not as a cache. |
 | APNs variables | Optional and secret. Required only for Apple push/Live Activity. |
+
+The resident reports the commit loaded by its running process in
+`X-Feedling-Consumer-Commit`. Do not infer that identity by reading the current
+checkout after startup: an operator may change the files without restarting the
+process. When the built-in updater intentionally skips a backend target because
+the diff is irrelevant to the resident runtime, it reports that target in
+`X-Feedling-Consumer-Compat-Commit`. This suppresses stale-consumer reminders
+only while the optional compatibility value matches the backend's current
+target; it does not substitute for a missing running commit.
 
 Worker count must be sized against PostgreSQL connection capacity. Each backend
 worker owns a pool plus listener/election connections; increasing workers without

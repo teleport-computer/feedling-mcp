@@ -2257,7 +2257,14 @@ def set_blob_strict(user_id: str, kind: str, doc) -> None:
             "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc",
             (user_id, kind, Jsonb(doc)),
         )
-def set_blob_if_unchanged(user_id: str, kind: str, expected_doc, new_doc) -> bool:
+def set_blob_if_unchanged(
+    user_id: str,
+    kind: str,
+    expected_doc,
+    new_doc,
+    *,
+    insert_if_missing: bool = False,
+) -> bool:
     """Compare-and-swap the (user_id, kind) blob: write ``new_doc`` only if the
     row's current doc STILL equals ``expected_doc``. Returns True iff the swap
     happened.
@@ -2272,17 +2279,29 @@ def set_blob_if_unchanged(user_id: str, kind: str, expected_doc, new_doc) -> boo
     delete / toggle that landed in the meantime. On CAS failure the caller drops
     the (best-effort) persistence and keeps the probe result.
 
-    A missing row (``expected_doc`` from a blob that was since deleted) also
-    returns False: the WHERE matches nothing, so we never resurrect it.
+    A missing row normally returns False: the WHERE matches nothing, so callers
+    cannot accidentally resurrect deleted data. ``insert_if_missing=True`` is
+    reserved for state machines whose canonical initial value is an empty
+    object. In that mode, an empty expected object may atomically create the row;
+    concurrent creators serialize through the unique key and only one wins.
     """
     try:
         with get_pool().connection() as conn:
-            row = conn.execute(
-                "UPDATE user_blobs SET doc = %s "
-                "WHERE user_id = %s AND kind = %s AND doc = %s "
-                "RETURNING user_id",
-                (Jsonb(new_doc), user_id, kind, Jsonb(expected_doc)),
-            ).fetchone()
+            with conn.transaction():
+                row = conn.execute(
+                    "UPDATE user_blobs SET doc = %s "
+                    "WHERE user_id = %s AND kind = %s AND doc = %s "
+                    "RETURNING user_id",
+                    (Jsonb(new_doc), user_id, kind, Jsonb(expected_doc)),
+                ).fetchone()
+                if row is None and insert_if_missing and expected_doc == {}:
+                    row = conn.execute(
+                        "INSERT INTO user_blobs (user_id, kind, doc) "
+                        "VALUES (%s, %s, %s) "
+                        "ON CONFLICT (user_id, kind) DO NOTHING "
+                        "RETURNING user_id",
+                        (user_id, kind, Jsonb(new_doc)),
+                    ).fetchone()
     except Exception as e:
         log.error("[db] set_blob_if_unchanged(%s,%s) failed: %s", user_id, kind, e)
         return False
@@ -2314,7 +2333,7 @@ def set_blob(user_id: str, kind: str, doc) -> None:
     # lane（见 identity/service._save_identity）。
     #
     # consumer_state 是全系统最热的写：每一次 /v1/chat/poll 都记一条 consumer 事件
-    # （chat/consumer._record_consumer_event → _save_consumer_state → 本函数），N 个
+    # （chat/consumer._record_consumer_event → _mutate_consumer_state 的 PostgreSQL CAS），N 个
     # 常驻 consumer 长轮询就是每轮 N 次写。把它镜像出去会打满 max_size=4 的 TEE 池
     # （direct-TLS 过网关），于是每个主写都要先在池上等满 pool_timeout 才 fail-open
     # ——2026-07-13 test 实测：13 分钟 18 次 pool timeout，poll/写端点被拖到秒级

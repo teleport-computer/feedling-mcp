@@ -128,6 +128,18 @@ CONSUMER_HEADERS = [
     ),
 ]
 
+CONSUMER_COMPAT_HEADERS = [
+    _header(
+        "X-Feedling-Consumer-Compat-Commit",
+        _schema("string", maxLength=80),
+        "Optional poll-only backend target that an older running resident "
+        "intentionally skipped as irrelevant. It suppresses commit-mismatch "
+        "maintenance only when a running commit is present and this value "
+        "matches the backend's current expected commit.",
+        example="a1b2c3d",
+    ),
+]
+
 DECRYPT_HEALTH_HEADERS = [
     _header(
         "X-Feedling-Decrypt-Status",
@@ -156,6 +168,7 @@ OPERATION_PARAMETERS: dict[Operation, list[dict[str, Any]]] = {
         _query("consumer_id", _schema("string", maxLength=160), "Stable resident consumer identifier.", example="resident_mbp_01"),
         _query("claim", _schema("boolean", default=True), "Whether this poll may claim queued work.", example=True),
         *CONSUMER_HEADERS,
+        *CONSUMER_COMPAT_HEADERS,
         *DECRYPT_HEALTH_HEADERS,
     ],
     ("post", "/v1/chat/response"): [
@@ -1386,7 +1399,7 @@ SPECIAL_REQUEST_BODIES: dict[Operation, dict[str, Any]] = {
 OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("get", "/v1/bootstrap/status"): "Return server-observed onboarding progress. Resident routes include decrypt_source_ready, decrypt_health, and decrypt_health_policy; a fresh resident poll report is required for new-account completion.",
     ("get", "/v1/onboarding/validate"): "Return ordered onboarding checks. Resident routes include a decrypt_source step between resident_consumer and live_loop, with status, checked_at_epoch, reason, policy, and remediation fields.",
-    ("get", "/v1/chat/poll"): "Long-poll and optionally claim resident chat work. Official residents report decrypt-source status and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At.",
+    ("get", "/v1/chat/poll"): "Long-poll and optionally claim resident chat work. Official residents report their running commit and may report an intentionally skipped compatible backend target with X-Feedling-Consumer-Compat-Commit. They also report decrypt-source status and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At.",
     ("post", "/v1/chat/message"): "Store a user chat message as a v1 ciphertext envelope; the server never decrypts it. If the envelope carries a content_pk_fpr label that does not match the user's currently registered content key, the write is rejected with 409 content_pk_fpr_mismatch (re-fetch whoami and re-seal); unlabeled envelopes are accepted for compatibility.",
     ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope). Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/chat/verify_loop"): "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded.",

@@ -39,6 +39,7 @@ def _headers(
     *,
     consumer_id: str = "vps-resident-c1",
     commit: str | None = None,
+    compat_commit: str | None = None,
     decrypt_status: str | None = "ok",
 ):
     out = {
@@ -51,6 +52,8 @@ def _headers(
         out["X-Feedling-Decrypt-Checked-At"] = str(resident_maintenance._now())
     if commit is not None:
         out["X-Feedling-Consumer-Commit"] = commit
+    if compat_commit is not None:
+        out["X-Feedling-Consumer-Compat-Commit"] = compat_commit
     return out
 
 
@@ -339,6 +342,149 @@ def test_consumer_commit_mismatch_waits_for_floor_before_prompting(backend_env, 
     assert len([m for m in db.chat_load(user_id) if m.get("source") == resident_maintenance.SOURCE]) == 1
 
 
+def test_matching_compat_commit_suppresses_mismatch_and_clears_old_state(
+    backend_env,
+    monkeypatch,
+):
+    expected = "abcdef1234567890"
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", expected)
+    monkeypatch.setenv("FEEDLING_RESIDENT_COMMIT_MISMATCH_GRACE_SEC", "3600")
+    now = {"t": 2_050_000.0}
+    monkeypatch.setattr(resident_maintenance, "_now", lambda: now["t"])
+    captured: dict = {}
+    _fake_shared_envelope(monkeypatch, captured)
+    client = make_client()
+    user_id, api_key = _register(client)
+    db.set_blob(
+        user_id,
+        "consumer_state",
+        {
+            "resident_maintenance": {
+                "active_reason": "consumer_commit_mismatch",
+                "commit_notice_active": True,
+                "commit_mismatch_key": f"{expected}:oldoldold1234",
+                "commit_mismatch_since_epoch": now["t"] - 7200,
+            }
+        },
+    )
+
+    for advance in (0, 3601):
+        now["t"] += advance
+        poll = client.get(
+            "/v1/chat/poll?timeout=0",
+            headers=_headers(
+                api_key,
+                commit="oldoldold1234",
+                compat_commit="abcdef1",
+            ),
+        )
+        assert poll.status_code == 200
+        assert poll.get_json()["messages"] == []
+
+    assert "plaintext" not in captured
+    state = db.get_blob(user_id, "consumer_state")
+    assert state["consumer_compat_commit"] == "abcdef1"
+    maintenance = state["resident_maintenance"]
+    assert "commit_mismatch_key" not in maintenance
+    assert "commit_mismatch_since_epoch" not in maintenance
+    assert "commit_notice_active" not in maintenance
+    assert "active_reason" not in maintenance
+    validation = resident_maintenance.chat_consumer._consumer_validation_state(
+        core_store.get_store(user_id),
+    )
+    assert validation["consumer_compat_commit"] == "abcdef1"
+    assert not [
+        m for m in db.chat_load(user_id) if m.get("source") == resident_maintenance.SOURCE
+    ]
+
+
+def test_stale_compat_commit_does_not_mask_new_expected_commit(
+    backend_env,
+    monkeypatch,
+):
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "targetaaaaaaa")
+    monkeypatch.setenv("FEEDLING_RESIDENT_COMMIT_MISMATCH_GRACE_SEC", "3600")
+    now = {"t": 2_075_000.0}
+    monkeypatch.setattr(resident_maintenance, "_now", lambda: now["t"])
+    captured: dict = {}
+    _fake_shared_envelope(monkeypatch, captured)
+    client = make_client()
+    user_id, api_key = _register(client)
+
+    compatible = client.get(
+        "/v1/chat/poll?timeout=0",
+        headers=_headers(
+            api_key,
+            commit="runningold111",
+            compat_commit="targetaaaaaaa",
+        ),
+    )
+    assert compatible.status_code == 200
+    assert compatible.get_json()["messages"] == []
+
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "targetbbbbbbb")
+    starts_grace = client.get(
+        "/v1/chat/poll?timeout=0",
+        headers=_headers(
+            api_key,
+            commit="runningold111",
+            compat_commit="targetaaaaaaa",
+        ),
+    )
+    assert starts_grace.status_code == 200
+    assert starts_grace.get_json()["messages"] == []
+
+    now["t"] += 3601
+    warned = client.get(
+        "/v1/chat/poll?timeout=0",
+        headers=_headers(
+            api_key,
+            commit="runningold111",
+            compat_commit="targetaaaaaaa",
+        ),
+    )
+    assert warned.status_code == 200
+    assert [m["source"] for m in warned.get_json()["messages"]] == [
+        resident_maintenance.SOURCE
+    ]
+    assert "consumer_commit_mismatch" in captured["plaintext"]
+    assert len(
+        [m for m in db.chat_load(user_id) if m.get("source") == resident_maintenance.SOURCE]
+    ) == 1
+
+
+def test_compat_commit_cannot_mask_missing_running_commit(backend_env, monkeypatch):
+    expected = "abcdef1234567890"
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", expected)
+    now = {"t": 2_090_000.0}
+    monkeypatch.setattr(resident_maintenance, "_now", lambda: now["t"])
+    captured: dict = {}
+    _fake_shared_envelope(monkeypatch, captured)
+    client = make_client()
+    user_id, api_key = _register(client)
+
+    first = client.get(
+        "/v1/chat/poll?timeout=0",
+        headers=_headers(api_key, compat_commit=expected),
+    )
+    assert first.status_code == 200
+    assert first.get_json()["messages"] == []
+
+    now["t"] += 15 * 60 + 1
+    warned = client.get(
+        "/v1/chat/poll?timeout=0",
+        headers=_headers(api_key, compat_commit=expected),
+    )
+    assert warned.status_code == 200
+    assert [m["source"] for m in warned.get_json()["messages"]] == [
+        resident_maintenance.SOURCE
+    ]
+    assert "missing_consumer_commit" in captured["plaintext"]
+    assert len(
+        [m for m in db.chat_load(user_id) if m.get("source") == resident_maintenance.SOURCE]
+    ) == 1
+
+
 def test_two_backend_deploys_do_not_bypass_24h_reminder_interval(backend_env, monkeypatch):
     monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "deployaaaaaaaa")
     monkeypatch.setenv("FEEDLING_RESIDENT_COMMIT_MISMATCH_GRACE_SEC", "3600")
@@ -390,7 +536,12 @@ def test_hosted_agent_runner_poll_is_exempt_from_resident_maintenance(backend_en
     })
     poll = client.get(
         "/v1/chat/poll?timeout=0",
-        headers=_headers(api_key, consumer_id=f"agent-runner:{user_id}"),
+        headers=_headers(
+            api_key,
+            consumer_id=f"agent-runner:{user_id}",
+            commit="oldoldold",
+            compat_commit="abcdef1234567890",
+        ),
     )
     assert poll.status_code == 200
     assert poll.get_json()["messages"] == []
@@ -477,6 +628,125 @@ def test_resident_maintenance_reminder_is_rate_limited(backend_env, monkeypatch)
     notices = [n for n in db.log_read_all(user_id, "user_notices") if n["dedupe_key"] == resident_maintenance.DEDUPE_KEY]
     assert len(notices) == 1
     assert notices[0]["occurrences"] == 1
+
+
+def test_maintenance_append_is_idempotent_in_bucket_and_allows_next_bucket(
+    backend_env,
+    monkeypatch,
+):
+    client = make_client()
+    user_id, _api_key = _register(client)
+    captured: dict = {}
+    _fake_shared_envelope(monkeypatch, captured)
+    store = core_store.get_store(user_id)
+    notifications: list[str] = []
+    monkeypatch.setattr(
+        store,
+        "notify_chat_waiters",
+        lambda: notifications.append("wake"),
+    )
+    prompt = "stable maintenance prompt"
+    interval = 24 * 60 * 60
+    first_now = 8_000_000.0
+    first_id = resident_maintenance._message_id(store, prompt, now=first_now)
+
+    first = resident_maintenance._append_maintenance_message(
+        store,
+        prompt=prompt,
+        msg_id=first_id,
+    )
+    db.chat_update_metadata(
+        user_id,
+        first_id,
+        {"reply_status": "replied", "reply_message_id": "maintenance-reply-1"},
+    )
+    duplicate = resident_maintenance._append_maintenance_message(
+        store,
+        prompt=prompt,
+        msg_id=first_id,
+    )
+
+    assert duplicate["id"] == first["id"] == first_id
+    assert duplicate["reply_status"] == "replied"
+    assert duplicate["reply_message_id"] == "maintenance-reply-1"
+    rows = [
+        row
+        for row in db.chat_load(user_id)
+        if row.get("source") == resident_maintenance.SOURCE
+    ]
+    assert [row["id"] for row in rows] == [first_id]
+    assert rows[0]["reply_status"] == "replied"
+    assert notifications == ["wake"], "only the atomic insert winner may notify"
+
+    next_id = resident_maintenance._message_id(
+        store,
+        prompt,
+        now=first_now + interval + 1,
+    )
+    assert next_id != first_id
+    resident_maintenance._append_maintenance_message(
+        store,
+        prompt=prompt,
+        msg_id=next_id,
+    )
+    rows = [
+        row
+        for row in db.chat_load(user_id)
+        if row.get("source") == resident_maintenance.SOURCE
+    ]
+    assert {row["id"] for row in rows} == {first_id, next_id}
+    assert notifications == ["wake", "wake"]
+
+
+def test_reason_flip_does_not_bypass_global_reminder_interval(backend_env, monkeypatch):
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "abcdef1234567890")
+    now = {"t": 8_500_000.0}
+    monkeypatch.setattr(resident_maintenance, "_now", lambda: now["t"])
+    captured: dict = {}
+    _fake_shared_envelope(monkeypatch, captured)
+    client = make_client()
+    user_id, api_key = _register(client)
+    db.set_blob(
+        user_id,
+        "consumer_state",
+        {
+            "decrypt_status": "ok",
+            "decrypt_checked_at_epoch": str(now["t"]),
+            "resident_maintenance": {
+                "missing_commit_since_epoch": now["t"] - 3600,
+            },
+        },
+    )
+
+    first = client.get("/v1/chat/poll?timeout=0", headers=_headers(api_key))
+    assert first.status_code == 200
+    assert len(
+        [
+            row
+            for row in db.chat_load(user_id)
+            if row.get("source") == resident_maintenance.SOURCE
+        ]
+    ) == 1
+
+    now["t"] += 60
+    second = client.get(
+        "/v1/chat/poll?timeout=0",
+        headers=_headers(
+            api_key,
+            commit="abcdef1234567890",
+            decrypt_status="unconfigured",
+        ),
+    )
+    assert second.status_code == 200
+    rows = [
+        row
+        for row in db.chat_load(user_id)
+        if row.get("source") == resident_maintenance.SOURCE
+    ]
+    assert len(rows) == 1
+    state = db.get_blob(user_id, "consumer_state")["resident_maintenance"]
+    assert state["active_reason"].startswith("decrypt_source_unavailable")
+    assert state["last_reminder_epoch"] == now["t"] - 60
 
 
 def test_resident_maintenance_reply_source_is_accepted_before_live_chat_gate(backend_env, monkeypatch):

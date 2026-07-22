@@ -97,6 +97,7 @@ if settings.cors_allowed_origins:
             "X-Feedling-Decrypt-Status",
             "X-Envelope-Meta",
             "X-Feedling-Consumer",
+            "X-Feedling-Consumer-Compat-Commit",
             "X-Feedling-Consumer-Commit",
             "X-Feedling-Consumer-Id",
             "X-Feedling-Consumer-Version",
