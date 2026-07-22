@@ -77,6 +77,12 @@ def _consumer_headers_from_map(headers, remote_addr: str = "") -> dict:
         "consumer_id": (headers.get("X-Feedling-Consumer-Id") or "").strip(),
         "consumer_version": (headers.get("X-Feedling-Consumer-Version") or "").strip(),
         "consumer_commit": (headers.get("X-Feedling-Consumer-Commit") or "").strip(),
+        # Poll-only compatibility claim: the running image intentionally
+        # skipped an irrelevant target while remaining protocol-compatible.
+        # Keep empty values so a later poll clears an obsolete claim.
+        "consumer_compat_commit": (
+            headers.get("X-Feedling-Consumer-Compat-Commit") or ""
+        ).strip(),
         # Keep empty values: an old resident that omits these headers must clear
         # a previously cached report instead of inheriting a stale green state.
         "decrypt_status": (headers.get("X-Feedling-Decrypt-Status") or "").strip().lower(),
@@ -106,6 +112,7 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
             # when verify_loop receives its hidden ack.
             event_info.pop("decrypt_status", None)
             event_info.pop("decrypt_checked_at_epoch", None)
+            event_info.pop("consumer_compat_commit", None)
         state.update(event_info)
         state["last_event"] = event_type
         state["last_seen_at"] = now_iso
@@ -360,6 +367,7 @@ def _consumer_validation_state(
         "consumer_id": state.get("consumer_id", ""),
         "consumer_version": state.get("consumer_version", ""),
         "consumer_commit": state.get("consumer_commit", ""),
+        "consumer_compat_commit": state.get("consumer_compat_commit", ""),
         "last_poll_at": state.get("last_poll_at", ""),
         "last_response_at": state.get("last_response_at", ""),
         "age_sec": age_sec,

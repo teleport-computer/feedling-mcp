@@ -105,6 +105,7 @@ def _classify_commit_state(
     state: dict[str, Any],
     *,
     actual_commit: str,
+    compatible_commit: str,
     expected_commit: str,
     now: float,
 ) -> tuple[dict[str, Any] | None, bool]:
@@ -121,6 +122,7 @@ def _classify_commit_state(
     )
 
     actual = str(actual_commit or "").strip()
+    compatible = str(compatible_commit or "").strip()
     expected = str(expected_commit or "").strip()
     previously_active = bool(state.get("commit_notice_active")) or (
         _active_reason_name(state) in _COMMIT_REASONS
@@ -145,7 +147,14 @@ def _classify_commit_state(
         return None, False
 
     state.pop("missing_commit_since_epoch", None)
-    if expected and not _commit_matches(actual, expected):
+    compatible_with_expected = bool(
+        actual and expected and _commit_matches(compatible, expected)
+    )
+    if (
+        expected
+        and not _commit_matches(actual, expected)
+        and not compatible_with_expected
+    ):
         mismatch_key = f"{expected}:{actual}"
         if state.get("commit_mismatch_key") != mismatch_key:
             state["commit_mismatch_key"] = mismatch_key
@@ -544,6 +553,7 @@ def _maybe_handle_poll(
         commit_reason, commit_resolved = _classify_commit_state(
             maintenance,
             actual_commit=str(info_map.get("consumer_commit") or ""),
+            compatible_commit=str(info_map.get("consumer_compat_commit") or ""),
             expected_commit=chat_consumer.expected_consumer_commit(),
             now=now,
         )

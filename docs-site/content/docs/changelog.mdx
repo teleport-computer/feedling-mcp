@@ -12,6 +12,15 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- Official self-hosted resident polls can now include
+  `X-Feedling-Consumer-Compat-Commit` when the updater intentionally keeps an
+  older running image because the advertised release changes no resident-loaded
+  files. A non-empty running commit plus a compatibility value matching the
+  current backend target suppresses commit-mismatch maintenance warnings. A
+  missing running commit, an absent compatibility value, or a compatibility
+  value for an older backend target retains the existing grace and reminder
+  behavior. `X-Feedling-Consumer-Commit` now identifies the commit captured by
+  the running process rather than a checkout changed underneath it.
 - Official resident consumers now report decrypt-source health on
   `GET /v1/chat/poll` with `X-Feedling-Decrypt-Status`
   (`ok`, `degraded`, `unconfigured`, or `unreachable`) and

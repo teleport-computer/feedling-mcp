@@ -122,6 +122,15 @@ these settings:
 | Object-storage variables | Optional, and a one-way switch once used. When configured, heavy ciphertext—screen frames, and Chat image and file bodies—is stored as objects and the database row keeps only a pointer. Leaving them unset keeps every body inline in PostgreSQL. Turning them off, repointing them, or scoping the credential too narrowly **after** pointer rows exist makes those bodies unreadable: the row no longer carries the ciphertext. Treat the store as part of the primary data set, not as a cache. |
 | APNs variables | Optional and secret. Required only for Apple push/Live Activity. |
 
+The resident reports the commit loaded by its running process in
+`X-Feedling-Consumer-Commit`. Do not infer that identity by reading the current
+checkout after startup: an operator may change the files without restarting the
+process. When the built-in updater intentionally skips a backend target because
+the diff is irrelevant to the resident runtime, it reports that target in
+`X-Feedling-Consumer-Compat-Commit`. This suppresses stale-consumer reminders
+only while the optional compatibility value matches the backend's current
+target; it does not substitute for a missing running commit.
+
 Worker count must be sized against PostgreSQL connection capacity. Each backend
 worker owns a pool plus listener/election connections; increasing workers without
 raising the database limit can turn an apparent capacity improvement into an
