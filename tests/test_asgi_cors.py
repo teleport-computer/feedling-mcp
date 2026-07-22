@@ -28,6 +28,7 @@ PLAYGROUND_REQUEST_HEADERS = (
     "x-content-sha256",
     "x-envelope-meta",
     "x-feedling-consumer",
+    "x-feedling-consumer-compat-commit",
     "x-feedling-consumer-commit",
     "x-feedling-consumer-id",
     "x-feedling-consumer-version",

@@ -23,6 +23,7 @@ from genesis import dedup, foreground, foreground_identity, lightweight_identity
 from hosted import config_store as hosted_config_store
 from hosted import history_import
 from identity import service as identity_service
+from identity.user_naming import sanitize_user_name
 from notices import catalog
 from notices import core as notices_core
 
@@ -600,6 +601,79 @@ def _plaintext_existing_identity_for_update(store, api_key: str | None) -> dict:
         return {}
 
 
+def _plaintext_user_profile_messages(source_groups: list[dict]) -> list[dict]:
+    profiles: list[dict] = []
+    for group in source_groups:
+        if not isinstance(group, dict):
+            continue
+        family = worker._source_family(
+            str(group.get("source_family") or group.get("source_kind") or "")
+        )
+        if family != "user_profile":
+            continue
+        for text in group.get("chunk_texts") if isinstance(group.get("chunk_texts"), list) else []:
+            content = str(text or "").strip()
+            if content:
+                profiles.append({
+                    "role": "user",
+                    "content": content,
+                    "source": history_import._USER_PROFILE_SOURCE,
+                })
+    return profiles
+
+
+def _resolve_plaintext_user_name(
+    store,
+    api_key: str | None,
+    runtime,
+    source_groups: list[dict],
+) -> str:
+    """Resolve once: encrypted Identity Card first, strict User Profile second."""
+    existing = _plaintext_existing_identity_for_update(store, api_key)
+    name = sanitize_user_name(existing.get("user_preferred_name"))
+    if name != "TA":
+        return name
+    profiles = _plaintext_user_profile_messages(source_groups)
+    if not profiles:
+        return "TA"
+    try:
+        return history_import._extract_import_user_name_with_provider(runtime, profiles)
+    except Exception:
+        return "TA"
+
+
+def _attach_plaintext_user_name(output: dict, user_name: str) -> dict:
+    """Attach a real preferred name to an identity output without inventing one."""
+    name = sanitize_user_name(user_name)
+    if name == "TA" or not isinstance(output, dict):
+        return output
+    identity = output.get("identity") if isinstance(output.get("identity"), dict) else {}
+    if not identity:
+        return output
+    identity = dict(identity)
+    identity["user_preferred_name"] = name
+    output["identity"] = identity
+    return output
+
+
+def _write_back_plaintext_user_name(store, api_key: str | None, user_name: str) -> str:
+    """Best-effort preferred-name merge for paths that intentionally skip identity."""
+    name = sanitize_user_name(user_name)
+    if name == "TA":
+        return "not_provided"
+    existing = _plaintext_existing_identity_for_update(store, api_key)
+    if not existing:
+        return "not_provided"
+    if sanitize_user_name(existing.get("user_preferred_name")) == name:
+        return "unchanged"
+    payload = dict(existing)
+    payload["user_preferred_name"] = name
+    try:
+        return service.replace_identity_preserving_anchor(store, {"identity": payload})
+    except Exception:
+        return "write_failed"
+
+
 def _plaintext_existing_persona_for_update(store, api_key: str | None) -> str:
     """Decrypt the current genesis persona so update_identity can merge (旧 persona
     + 新材料) instead of rebuilding from the new material alone. Best-effort — on
@@ -657,6 +731,7 @@ def _run_plaintext_genesis_v2(
     source_groups: list[dict],
     relationship_anchor: dict | None = None,
     analysis_messages: list[dict] | None = None,
+    user_name: str = "",
 ) -> bool:
     """Genesis v2 foreground-fast orchestration (behind FEEDLING_GENESIS_V2_ENABLED).
 
@@ -732,6 +807,7 @@ def _run_plaintext_genesis_v2(
             runtime=runtime, chunk_texts=group_chunks, source_kind=group_kind,
             include_voice_candidates=combined_map,
             write_core=False,
+            user_name=user_name,
         )
         foreground_reduces.append(reduce)
         voice_candidates.extend([c for c in (reduce.get("voice_candidates") or []) if isinstance(c, dict)])
@@ -763,6 +839,7 @@ def _run_plaintext_genesis_v2(
         key_prefix=f"{job_id}:foreground_full",
         runtime=runtime,
         fact_candidates=all_fact_candidates,
+        user_name=user_name,
     )
     fg_merged = _plaintext_merge_reducer_outputs(
         [{**primary_reduce, **full_fact_write}],
@@ -776,11 +853,13 @@ def _run_plaintext_genesis_v2(
             runtime=runtime,
             voice_candidates=voice_candidates,
             existing_persona={"content": "\n\n".join(persona_material_parts).strip()} if persona_material_parts else None,
+            user_name=user_name,
         )
         fg_merged = _plaintext_merge_reducer_outputs(
             [{**fg_merged, **voice_persona_output}],
             relationship_anchor=relationship_anchor,
         )
+    _attach_plaintext_user_name(fg_merged, user_name)
     full_memories = fg_merged.get("memories") or []
     days = int((relationship_anchor or {}).get("days_with_user") or 0)
     # explicit relationship_started_at (user typed a date) -> honored verbatim below,
@@ -820,6 +899,8 @@ def _run_plaintext_genesis_v2(
             if provider_failure:
                 service.mark_failed(store, job_id, "onboarding_no_identity:provider_unstable")
                 return True
+    if sanitize_user_name(user_name) != "TA":
+        identity_payload["user_preferred_name"] = sanitize_user_name(user_name)
     identity_first = bool(msgs) and foreground_identity.has_identity_signal(identity_payload)
     persona_ref = ""
     persona_sha = ""
@@ -905,6 +986,7 @@ def _run_plaintext_genesis_v2(
             skip_family=fg_family, skip_texts=foreground.core_skip_texts(core),
             known_memories=core_memory_texts, write_identity=not identity_first,
             include_memory=False,
+            user_name=user_name,
         )
     except Exception as e:  # noqa: BLE001
         db.genesis_set_job_status(
@@ -928,6 +1010,7 @@ def _run_plaintext_background_enrichment(
     known_memories: list[str] | None = None,
     write_identity: bool = True,
     include_memory: bool = True,
+    user_name: str = "",
 ) -> None:
     """Background continuation: the full reduce over every group (skipping the core the
     foreground already wrote for skip_family), then apply the REST incrementally —
@@ -962,6 +1045,7 @@ def _run_plaintext_background_enrichment(
             skip_fact_texts=skip_texts if group_family == skip_family else None,
             known_memories=known if group_family == skip_family else None,
             include_memory=include_memory,
+            user_name=user_name,
         )
         reducer_outputs.append(output)
         next_persona = _plaintext_existing_persona_from_output(output)
@@ -988,11 +1072,17 @@ def _run_plaintext_background_enrichment(
             persona_content = str(merged["persona"].get("content") or "").strip()
             if persona_content:
                 baseline = worker.derive_identity_from_persona(
-                    user_id=store.user_id, job_id=job_id, runtime=runtime, persona_content=persona_content,
+                    user_id=store.user_id,
+                    job_id=job_id,
+                    runtime=runtime,
+                    persona_content=persona_content,
+                    user_name=user_name,
                 )
                 if baseline.get("agent_name") or baseline.get("dimensions"):
                     merged["identity"] = baseline
-        service.init_identity_if_absent(store, merged, api_key)
+        service.init_identity_if_absent(
+            store, _attach_plaintext_user_name(merged, user_name), api_key
+        )
     service.write_persona_artifact(store, job_id, merged)
     service.write_voice_artifact(store, job_id, merged)
     db.genesis_set_job_status(
@@ -1063,6 +1153,7 @@ def _run_plaintext_add_memory_job(
     runtime,
     source_groups: list[dict],
     relationship_anchor: dict | None = None,
+    user_name: str = "",
 ) -> None:
     # this add_memory job path bypasses service.apply_reducer_output (which resolves
     # genesis notices for the reducer-driven completion path) -> resolve here too, at
@@ -1103,6 +1194,7 @@ def _run_plaintext_add_memory_job(
             source_kind=group_kind,
             write_core=False,
             keep_all=keep_all,
+            user_name=user_name,
         )
         if not first_output:
             first_output = output
@@ -1116,6 +1208,7 @@ def _run_plaintext_add_memory_job(
         runtime=runtime,
         fact_candidates=fact_candidates,
         keep_all=keep_all_job,
+        user_name=user_name,
     )
     merged = _plaintext_merge_reducer_outputs([{**first_output, **memory_output}], relationship_anchor=relationship_anchor)
     raw_items = merged.get("memories")
@@ -1147,6 +1240,7 @@ def _run_plaintext_add_memory_job(
     )
     if completed:
         service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
+    _write_back_plaintext_user_name(store, api_key, user_name)
 
 
 def _run_plaintext_update_identity_job(
@@ -1157,6 +1251,7 @@ def _run_plaintext_update_identity_job(
     runtime,
     analysis_messages: list[dict] | None,
     relationship_anchor: dict | None = None,
+    user_name: str = "",
 ) -> str | None:
     msgs = analysis_messages if isinstance(analysis_messages, list) else []
     language = history_import._import_language_for_store(store, msgs)
@@ -1178,6 +1273,8 @@ def _run_plaintext_update_identity_job(
     if not _identity_payload_has_content(identity_payload):
         service.mark_failed(store, job_id, "identity_update_empty")
         return
+    if sanitize_user_name(user_name) != "TA":
+        identity_payload["user_preferred_name"] = sanitize_user_name(user_name)
     persona_material = _plaintext_persona_material_from_messages(msgs)
     if not persona_material:
         service.mark_failed(store, job_id, "persona_material_required")
@@ -1195,6 +1292,7 @@ def _run_plaintext_update_identity_job(
             source_kind="identity_update",
             source_family="ai_persona",
             existing_persona=existing_persona,
+            user_name=user_name,
         )
     except Exception as e:  # noqa: BLE001
         service.mark_failed(store, job_id, f"persona_rebuild_failed:{type(e).__name__}:{str(e)[:160]}")
@@ -1290,6 +1388,9 @@ def _run_plaintext_genesis_job(
             summary="runtime config loaded",
             detail={"mode": mode},
         )
+        user_name = _resolve_plaintext_user_name(
+            store, api_key, runtime, source_groups
+        )
 
         if mode == "add_memory":
             _trace_genesis(store, "genesis.plaintext.add_memory.started", job_id=job_id, summary="add memory job started")
@@ -1300,6 +1401,7 @@ def _run_plaintext_genesis_job(
                 runtime=runtime,
                 source_groups=source_groups,
                 relationship_anchor=relationship_anchor,
+                user_name=user_name,
             )
             _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="add memory job done",
                            detail={"mode": mode}, dur_ms=(time.time() - started_at) * 1000)
@@ -1314,6 +1416,7 @@ def _run_plaintext_genesis_job(
                 runtime=runtime,
                 analysis_messages=analysis_messages,
                 relationship_anchor=relationship_anchor,
+                user_name=user_name,
             )
             _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="update identity job done",
                            detail={"mode": mode, "identity_status": identity_status or ""},
@@ -1327,6 +1430,7 @@ def _run_plaintext_genesis_job(
             store, api_key, job_id,
             runtime=runtime, source_groups=source_groups, relationship_anchor=relationship_anchor,
             analysis_messages=analysis_messages,
+            user_name=user_name,
         ):
             _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="genesis v2 job handled",
                            detail={"mode": mode, "genesis_v2": True}, dur_ms=(time.time() - started_at) * 1000)
@@ -1376,6 +1480,7 @@ def _run_plaintext_genesis_job(
                 source_kind=group_source_kind,
                 existing_persona=existing_persona,
                 existing_voice=existing_voice,
+                user_name=user_name,
             )
             _trace_genesis(
                 store,
@@ -1405,6 +1510,7 @@ def _run_plaintext_genesis_job(
             reducer_outputs,
             relationship_anchor=relationship_anchor,
         )
+        _attach_plaintext_user_name(reducer_output, user_name)
         db.genesis_set_job_status(
             store.user_id,
             job_id,
@@ -1425,6 +1531,7 @@ def _run_plaintext_genesis_job(
             },
         )
         service.apply_reducer_output(store, api_key, job_id, reducer_output)
+        _write_back_plaintext_user_name(store, api_key, user_name)
         _trace_genesis(
             store,
             "genesis.plaintext.done",

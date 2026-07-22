@@ -55,6 +55,15 @@ _FIELDS_SPEC = (
     "Ground every field in the material; return {} if there is no persona content."
 )
 
+# NOTE (Runtime V2 / pre): the same "rename must not leave a stale name behind"
+# rule needs hardening in the V2 tool surface too — backend/capabilities/
+# tool_schema.py, the `identity_patch` DESCRIPTIONS entry (~L237). There the
+# agent can rename itself live via a single identity_patch carrying agent_name +
+# self_introduction, so the wording currently only *suggests* passing both
+# ("Pass both when the new name should also appear in how you introduce
+# yourself"). When this fix merges into pre, change that suggestion to a hard
+# rule: if self_introduction names the companion, a rename MUST update it in the
+# SAME patch, or the card shows one name and introduces itself with another.
 _MERGE_TEMPLATE = (
     "\nThis is an UPDATE to an EXISTING identity card, not a fresh derivation.\n"
     "Existing card:\n{existing_identity_json}\n"
@@ -65,6 +74,9 @@ _MERGE_TEMPLATE = (
     "do not blank them and do not invent replacements.\n"
     "- Keep the result COHERENT: if a trait / dimension changes, update self_introduction / "
     "tone_style to match, so no stale description from the old card survives.\n"
+    "- In particular, if agent_name changes, you MUST rewrite self_introduction so it uses the "
+    "new name: a card whose name says one thing while its self-introduction still says \"I am "
+    "<old name>\" is self-contradictory. Never leave the old name embedded in self_introduction.\n"
 )
 
 

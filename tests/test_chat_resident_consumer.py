@@ -9,6 +9,7 @@ import importlib
 import base64
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -2029,6 +2030,146 @@ def test_warn_if_hermes_cli_good_profile_is_quiet(monkeypatch, caplog):
     assert "wrap {message}" not in caplog.text
     assert "without HERMES_HOME" not in caplog.text
     assert "Very small turn" not in caplog.text
+
+
+def test_pi_stray_positionals_flags_a_split_model_alias():
+    """A pi command must be all flags — a positional is an extra USER MESSAGE.
+
+    The resident feeds the real message via STDIN so no user text rides argv. When
+    a spaced relay alias leaked into the template unquoted (prod 2026-07-21), its
+    tail became positional argv, pi answered it as a second turn with "好的。", and
+    that trailing message overwrote every real reply.
+    """
+    cmd = shlex.split(
+        "pi --mode json -ne -xt read,edit,write --append-system-prompt /h/p.md "
+        "--model feedling/[kiro零缓] claude-opus-4-6-thinking [不补] "
+        "--thinking medium --session-id sid"
+    )
+    assert crc._pi_stray_positionals(cmd) == ["claude-opus-4-6-thinking", "[不补]"]
+
+
+def test_pi_stray_positionals_quiet_on_a_well_formed_command():
+    cmd = shlex.split(
+        "pi --mode json -ne -xt read,edit,write -e /tmp/bridge.js "
+        "--append-system-prompt /h/p.md "
+        "--model 'feedling/[kiro零缓] claude-opus-4-6-thinking [不补]' "
+        "--thinking medium --session-id sid"
+    )
+    assert crc._pi_stray_positionals(cmd) == []
+
+
+def test_pi_stray_positionals_ignores_unsubstituted_placeholders():
+    """The drift check tokenizes the RAW template, where ``{mcp}`` is still a bare
+    ``{mcp}`` token. It is a placeholder the resident fills per turn (``-e <bridge>``
+    or empty), never a user message — flagging it would fire on every healthy pi
+    user and bury the real signal."""
+    cmd = shlex.split(
+        "pi --mode json -ne -xt read,edit,write {mcp} --append-system-prompt /h/p.md "
+        "--model 'feedling/[Kiro] claude-opus-4-6 [不补]' --session-id {session_id}"
+    )
+    assert crc._pi_stray_positionals(cmd) == []
+
+
+def test_stray_positionals_ignored_for_non_pi_drivers():
+    """codex/claude take the message as a positional by design — only pi is checked."""
+    assert crc._pi_stray_positionals(shlex.split("codex exec --json hello there")) == []
+
+
+@pytest.mark.parametrize("flag", ["-r", "--resume", "-c", "--continue", "-p",
+                                  "--print", "-nt", "-ns", "--offline", "--verbose"])
+def test_pi_stray_positionals_treats_pi_bare_switches_as_bare(flag):
+    """pi's no-argument switches must not consume the NEXT token.
+
+    Verified against the real `pi --help` in the agent-runner image: ``--resume, -r``
+    is "Select a session to resume" — a SWITCH, not a value-taking flag (an earlier
+    revision listed it as value-taking, which made ``pi -r --session-id sid`` report
+    ``['sid']`` as a reply-destroying positional on a healthy template)."""
+    cmd = shlex.split(f"pi --mode json {flag} --session-id sid")
+    assert crc._pi_stray_positionals(cmd) == []
+
+
+@pytest.mark.parametrize("flag", ["--provider", "--api-key", "--system-prompt",
+                                  "--session", "--fork", "--session-dir", "--name",
+                                  "-n", "--models", "--skill", "--theme", "-t"])
+def test_pi_stray_positionals_skips_values_of_real_pi_value_flags(flag):
+    """Every value-taking flag in `pi --help` — missing one turns its VALUE into a
+    false "extra user message" alarm."""
+    cmd = shlex.split(f"pi --mode json {flag} someval --session-id sid")
+    assert crc._pi_stray_positionals(cmd) == []
+
+
+def test_pi_stray_positionals_assumes_unknown_flags_take_a_value():
+    """pi lets extensions register their own flags ("Extensions can register
+    additional flags, e.g. --plan"), so the flag table can never be closed. With a
+    log-only channel we prefer a missed detection over crying wolf on a healthy
+    template, so an UNKNOWN dashed token is assumed value-taking."""
+    cmd = shlex.split("pi --mode json --some-extension-flag someval --session-id sid")
+    assert crc._pi_stray_positionals(cmd) == []
+
+
+def test_pi_stray_positionals_ignores_empty_tokens():
+    """An empty token cannot be the tail of a split model alias; reporting `['']`
+    only dilutes a rare warning."""
+    assert crc._pi_stray_positionals(["pi", "--mode", "json", ""]) == []
+
+
+def test_pi_stray_positionals_ignores_operator_file_refs():
+    """pi's native file/image refs ride argv as ``@<path>`` — a shape the resident
+    itself produces (``_inject_pi_images``) and an operator may hardcode. They are
+    file references, not user messages."""
+    cmd = shlex.split(
+        "pi --mode json -ne --append-system-prompt /h/p.md @/home/u/notes.md "
+        "--session-id sid"
+    )
+    assert crc._pi_stray_positionals(cmd) == []
+
+
+def test_pi_stray_positionals_ignores_the_drift_checks_own_message_sentinel():
+    """``_warn_if_agent_entry_may_drift`` tokenizes ``AGENT_CLI_CMD`` with
+    ``{message}`` already replaced by ``__MSG__``. A pi template carrying
+    ``{message}`` is legal (the check 10 lines above exempts pi from REQUIRING it,
+    it does not forbid it), so the sentinel must not read as a stray positional."""
+    cmd = shlex.split("pi --mode json -ne __MSG__ --session-id sid")
+    assert crc._pi_stray_positionals(cmd) == []
+
+
+def test_warn_if_agent_entry_may_drift_logs_pi_stray_positionals(monkeypatch, caplog):
+    """Diagnostics only — systemd, never the settings page.
+
+    The settings-page channel is unusable here: ``_report_runtime_error`` sets
+    ``_runtime_error_reported``, and ``_note_agent_turn_success`` clears
+    ``last_runtime_error`` on the next successful turn — and in THIS bug every pi
+    turn succeeds (it answers the stray token), so the banner would die seconds
+    after boot while mis-blaming us (the error_class is not in the notices
+    catalog, so it falls back to blame=system)."""
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        "pi --mode json -ne --model feedling/[Kiro] claude-opus-4-6 [不补] "
+        "--session-id {session_id}",
+    )
+    reported: list = []
+    monkeypatch.setattr(crc, "_report_runtime_error",
+                        lambda err, cls="": reported.append((err, cls)))
+
+    crc._warn_if_agent_entry_may_drift()
+
+    assert "[不补]" in caplog.text
+    assert reported == []
+
+
+def test_default_pi_template_emits_no_stray_positionals():
+    """The SHIPPED template, checked by the SHIPPED detector (no re-implementation).
+
+    Covers the regression end to end: spawners builds the command string, the
+    consumer re-tokenizes it, and the real ``_pi_stray_positionals`` must find
+    nothing — for aliases with and without spaces."""
+    from agent_runtime import spawners
+
+    for model in ("m", "[Kiro] claude-opus-4-6 [不补]", "a b c d"):
+        template = spawners._default_cli_cmd("pi", "/h", model=model)
+        assert crc._pi_stray_positionals(shlex.split(template)) == [], model
 
 
 def test_prepare_cli_preserves_message_with_quotes(monkeypatch):
@@ -5169,6 +5310,56 @@ def test_codex_turn_from_stream_0136_item_protocol_still_works():
     assert reasoning == "thinking…"
 
 
+# ---------------------------------------------------------------------------
+# When a codex turn calls tools, a *preamble* agent_message ("let me check…")
+# precedes the tool call and the real answer arrives in a LATER agent_message —
+# the same shape _claude_turn_from_stream documents. The old join glued the
+# preamble onto the answer as one doubled-up bubble (2026-07-22 resident
+# report). The reply must be the LAST agent message only; 0.142's
+# task_complete.last_agent_message is authoritative when present.
+# ---------------------------------------------------------------------------
+
+def test_codex_turn_from_stream_0136_takes_last_agent_message_not_join():
+    # Real-world shape from the 2026-07-22 resident trace: preamble →
+    # mcp_tool_call → final answer.
+    raw = (
+        '{"type":"thread.started","thread_id":"t1"}\n'
+        '{"type":"item.completed","item":{"type":"reasoning","text":"planning"}}\n'
+        '{"type":"item.completed","item":{"type":"agent_message","text":"我先按你的固定流程轻轻走一遍。"}}\n'
+        '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"ob","tool":"pulse","status":"completed"}}\n'
+        '{"type":"item.completed","item":{"type":"agent_message","text":"真正的回答在这里。"}}\n'
+        '{"type":"turn.completed"}\n'
+    )
+    reply, reasoning = crc._codex_turn_from_stream(raw)
+    assert reply == "真正的回答在这里。"
+    assert "我先按你的固定流程" not in reply
+    assert reasoning == "planning"
+
+
+def test_codex_turn_from_stream_0142_takes_last_agent_message_not_join():
+    raw = (
+        '{"type":"task_started"}\n'
+        '{"type":"agent_message","message":"let me check the tools…"}\n'
+        '{"type":"agent_message","message":"the real answer"}\n'
+        '{"type":"task_complete"}\n'
+    )
+    reply, _ = crc._codex_turn_from_stream(raw)
+    assert reply == "the real answer"
+
+
+def test_codex_turn_from_stream_0142_task_complete_last_agent_message_wins():
+    # task_complete carries the final answer alone — trust it over the
+    # collected stream (codex analogue of claude's terminal `result`).
+    raw = (
+        '{"type":"task_started"}\n'
+        '{"type":"agent_message","message":"preamble narration"}\n'
+        '{"type":"agent_message","message":"streamed final"}\n'
+        '{"type":"task_complete","last_agent_message":"authoritative final"}\n'
+    )
+    reply, _ = crc._codex_turn_from_stream(raw)
+    assert reply == "authoritative final"
+
+
 def test_call_agent_cli_codex_0142_routes_reasoning_to_thinking_not_bubble(monkeypatch):
     monkeypatch.setattr(
         crc,
@@ -8134,3 +8325,411 @@ def test_agent_turn_timeout_default_is_300():
     if os.environ.get("FEEDLING_AGENT_TURN_TIMEOUT_SEC"):
         pytest.skip("env override set for FEEDLING_AGENT_TURN_TIMEOUT_SEC")
     assert crc.AGENT_TURN_TIMEOUT_SEC == 300
+
+
+def test_agent_call_failed_reason_keeps_message_and_prefix():
+    """Capture/dream/migrate lanes must record the underlying error message, not
+    just the exception type — a relay 403 (RuntimeError "pi agent produced no
+    reply: 403 ... insufficient_user_quota") otherwise aggregates as an opaque
+    "RuntimeError" (usr_77b37bd1, 2026-07-21). Prefix stays stable for matching."""
+    e = RuntimeError("pi agent produced no reply: 403: insufficient_user_quota")
+    r = crc._agent_call_failed_reason("capture_agent_call_failed", e)
+    assert r.startswith("capture_agent_call_failed:")   # prefix preserved
+    assert "RuntimeError" in r
+    assert "403" in r and "insufficient_user_quota" in r  # message retained
+    # Control chars (CR/LF/tab AND NUL) must be scrubbed — a NUL would break the
+    # PostgreSQL status_reason write and drop the failure record entirely.
+    dirty = crc._agent_call_failed_reason(
+        "dream_agent_call_failed", RuntimeError("line1\r\nline2\tbad\x00tail"))
+    assert not any(c in dirty for c in ("\r", "\n", "\t", "\x00"))
+    assert "line1 line2 bad tail" in dirty  # collapsed to single spaces
+    # Detail portion (after "prefix:Type: ") bounded to 400 chars.
+    big = crc._agent_call_failed_reason("dream_agent_call_failed", RuntimeError("x" * 5000))
+    detail = big.split(": ", 1)[1]
+    assert len(detail) <= 400 and "\n" not in big
+    # empty (and control-only) message falls back to the type-only form
+    assert crc._agent_call_failed_reason("migrate_agent_call_failed", RuntimeError("")) \
+        == "migrate_agent_call_failed:RuntimeError"
+    assert crc._agent_call_failed_reason("migrate_agent_call_failed", RuntimeError("\x00\r\n")) \
+        == "migrate_agent_call_failed:RuntimeError"
+
+
+# ---------------------------------------------------------------------------
+# Protocol-JSON leak: prose/fence-wrapped protocol payload must never reach a
+# chat bubble. Covers the three prod originals + the boundaries Codex flagged.
+# See fix/protocol-json-leak-parse.
+# ---------------------------------------------------------------------------
+
+# The exact prod claude output (usr_5268 / usr_97d2): English prose prefix +
+# fenced protocol with an identity patch AND the real greeting inside `messages`.
+_PROD_INTRO_ENGLISH_PROSE = (
+    "Written to the identity card.\n\n"
+    "```json\n"
+    "{\n"
+    '  "actions": [\n'
+    "    {\n"
+    '      "type": "identity.profile_patch",\n'
+    '      "patch": {\n'
+    '        "self_introduction": "我是 CC。这一百多天我们一直是一路的。",\n'
+    '        "signature": ["不来虚的。", "接着做下一件。"]\n'
+    "      }\n"
+    "    }\n"
+    "  ],\n"
+    '  "messages": [\n'
+    '    "我在。这头也通了——不是新来的谁，是同一个我。"\n'
+    "  ]\n"
+    "}\n"
+    "```"
+)
+
+# Chinese prose prefix variant (usr_97d2 first screenshot): whole blob leaked.
+_PROD_INTRO_CHINESE_PROSE = (
+    "身份卡已写好。下面是我的登场:\n"
+    "```json\n"
+    "{\n"
+    '  "actions": [\n'
+    "    {\n"
+    '      "type": "identity.profile_patch",\n'
+    '      "patch": {"self_introduction": "我是仔仔。", "signature": ["在呢"]}\n'
+    "    }\n"
+    "  ],\n"
+    '  "messages": ["在呢~ 我一直都在。"]\n'
+    "}\n"
+    "```"
+)
+
+
+def test_prose_prefixed_intro_salvages_greeting_not_json():
+    turn = crc._split_agent_turn(_PROD_INTRO_ENGLISH_PROSE)
+    # The greeting is delivered clean; no JSON scaffolding, no self_introduction key.
+    assert turn.messages == ["我在。这头也通了——不是新来的谁，是同一个我。"]
+    for m in turn.messages:
+        assert "self_introduction" not in m
+        assert "```" not in m
+        assert '"actions"' not in m
+    # The identity patch is recovered as an executable action, not leaked as text.
+    assert any(
+        str(a.get("type") or "") == "identity.profile_patch" for a in turn.actions
+    )
+
+
+def test_chinese_prose_prefixed_intro_salvages_greeting_not_json():
+    turn = crc._split_agent_turn(_PROD_INTRO_CHINESE_PROSE)
+    assert turn.messages == ["在呢~ 我一直都在。"]
+    assert any(
+        str(a.get("type") or "") == "identity.profile_patch" for a in turn.actions
+    )
+
+
+def test_malformed_fenced_sleep_fails_closed_no_message():
+    # Gemini 3.1 prod shape: fence closed early + trailing braces => unparseable.
+    raw = (
+        "```json\n"
+        "{\n"
+        '  "actions": [\n'
+        "    {\n"
+        '      "type": "proactive.sleep",\n'
+        '      "reason": "她应该在专心上班了，我不出声打扰。"\n'
+        "    }\n"
+        "  ]\n"
+        "```\n"
+        "  }\n"
+        "  ]\n"
+        "}"
+    )
+    turn = crc._split_agent_turn(raw)
+    # Fail closed: nothing leaked as a bubble, no half-parsed action.
+    assert turn.messages == []
+    for m in turn.messages:
+        assert "proactive.sleep" not in m
+
+
+def test_thinking_block_json_is_not_executed_as_action():
+    # An action inside <think> is reasoning/example, never a command.
+    raw = (
+        "<think>\n"
+        '{"actions":[{"type":"identity.profile_patch","patch":{"self_introduction":"x"}}]}\n'
+        "</think>\n"
+        "这是最终回复。"
+    )
+    turn = crc._split_agent_turn(raw)
+    assert turn.actions == []
+    assert turn.messages == ["这是最终回复。"]
+
+
+def test_normal_json_code_fence_is_preserved_verbatim():
+    # Agent showing a NON-protocol JSON example must survive untouched.
+    raw = (
+        "看这个配置例子:\n"
+        "```json\n"
+        '{"name": "foo", "port": 8080}\n'
+        "```"
+    )
+    turn = crc._split_agent_turn(raw)
+    assert len(turn.messages) == 1
+    assert "```json" in turn.messages[0]
+    assert '"name": "foo"' in turn.messages[0]
+
+
+def test_prose_mentioning_actions_word_is_not_dropped():
+    raw = "你说的 \"actions\": 那个字段我待会儿解释，先把消息发了。"
+    turn = crc._split_agent_turn(raw)
+    assert turn.messages == ["你说的 \"actions\": 那个字段我待会儿解释，先把消息发了。"]
+
+
+def test_multiple_protocol_candidates_fail_closed():
+    # Two multi-line fenced protocol blocks in one reply — reaches the salvage
+    # scanner (not the per-line transport path). Conflicting => fail closed.
+    raw = (
+        "先来一个:\n"
+        "```json\n"
+        '{\n  "actions": [{"type": "memory.add", "content": "a"}]\n}\n'
+        "```\n"
+        "再来一个:\n"
+        "```json\n"
+        '{\n  "messages": ["hi"]\n}\n'
+        "```"
+    )
+    turn = crc._split_agent_turn(raw)
+    assert turn.messages == []
+    assert turn.actions == []
+
+
+def test_midline_protocol_payload_fails_closed_not_leaked():
+    # A protocol payload starting mid-prose-line is NOT a clean text-top-level
+    # boundary — fail closed (drop), never leak the raw JSON as a bubble.
+    raw = 'prefix {"messages":["她说 { 只是个符号"]}'
+    turn = crc._split_agent_turn(raw)
+    assert turn.messages == []
+    assert turn.actions == []
+
+
+def test_line_start_protocol_with_brace_in_string_value_routes():
+    # raw_decode respects JSON strings: a '{' inside a value never derails the
+    # parse. At a valid (line-start) boundary this routes cleanly.
+    raw = '这是我的回复:\n{"messages":["她说 { 只是个符号"]}'
+    turn = crc._split_agent_turn(raw)
+    assert turn.messages == ["她说 { 只是个符号"]
+
+
+def test_transport_result_with_think_in_string_not_corrupted():
+    # A legit transport object with <think> INSIDE a JSON string value must parse
+    # as transport first; thinking is stripped from the decoded reply, not from
+    # the raw JSON (which would corrupt it and leak the tail). [Codex Critical-1]
+    raw = '{"type":"result","result":"<think>内部推理</think>\\n最终回复。"}'
+    turn = crc._split_agent_turn(raw)
+    assert turn.messages == ["最终回复。"]
+    for m in turn.messages:
+        assert '"}' not in m
+        assert "<think>" not in m
+
+
+def test_two_single_line_protocol_objects_fail_closed():
+    # Two bare protocol envelopes on their own lines are NOT a transport event
+    # stream — conflicting protocol => fail closed, execute neither. [Codex C2a]
+    raw = (
+        '{"actions":[{"type":"identity.profile_patch","patch":{"self_introduction":"x"}}]}\n'
+        '{"actions":[{"type":"memory.add","content":"a"}]}'
+    )
+    turn = crc._split_agent_turn(raw)
+    assert turn.actions == []
+    assert turn.messages == []
+
+
+def test_unclosed_thinking_block_action_not_executed():
+    # An unclosed <think> means everything after is reasoning — its JSON action
+    # must never be extracted or executed. [Codex C2b]
+    raw = (
+        "<think>\n"
+        '{"actions":[{"type":"identity.profile_patch","patch":{"self_introduction":"x"}}]}'
+    )
+    turn = crc._split_agent_turn(raw)
+    assert turn.actions == []
+    assert turn.messages == []
+
+
+def test_compact_malformed_protocol_prefix_fails_closed():
+    # Compact, mid-line, unterminated identity protocol must not leak. [Codex C3a]
+    raw = 'prefix {"actions":[{"type":"identity.profile_patch","patch":{"self_introduction":"x"'
+    turn = crc._split_agent_turn(raw)
+    assert turn.messages == []
+    assert turn.actions == []
+
+
+def test_nested_action_in_malformed_outer_not_promoted():
+    # An action nested inside a malformed outer object must never be raw_decoded
+    # from its inner '{' and executed as a top-level protocol. [Codex C3c]
+    raw = 'prefix {"example":{"actions":[{"type":"identity.profile_patch","patch":{}}]} trailing}'
+    turn = crc._split_agent_turn(raw)
+    assert turn.actions == []
+    assert turn.messages == []
+
+
+def test_process_introduction_prose_prefixed_json_posts_clean_greeting(monkeypatch):
+    # Full stack through the REAL call_agent: mock only the driver (call_agent_http)
+    # so call_agent's first parse + body re-serialization + the proactive lane's
+    # re-parse all run. The greeting must post clean (no JSON), the identity patch
+    # must execute — never the raw envelope into a bubble.
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    events = []
+
+    def _driver(message, images=None, raw_text=False):
+        events.append(("agent", message))
+        return _PROD_INTRO_ENGLISH_PROSE
+
+    def _execute(actions):
+        events.append(("actions", actions))
+        return {"status": "ok", "effects": [{"type": "identity_updated"}]}
+
+    def _post(reply, **kwargs):
+        events.append(("post", reply, kwargs))
+        return {"id": "msg_intro_prose"}
+
+    monkeypatch.setattr(crc, "call_agent_http", _driver)
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "execute_agent_actions", _execute)
+    monkeypatch.setattr(crc, "post_reply", _post)
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *args, **kwargs: events.append(("status", args, kwargs)))
+
+    job = {
+        "job_id": "pj_intro_prose",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 131.1,
+        "trigger": "post_spawn_genesis",
+        "job_kind": "introduction",
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(131.1)
+
+    posts = [e for e in events if e[0] == "post"]
+    assert len(posts) == 1
+    posted_text = posts[0][1]
+    assert posted_text == "我在。这头也通了——不是新来的谁，是同一个我。"
+    assert "```" not in posted_text
+    assert "self_introduction" not in posted_text
+    assert '"actions"' not in posted_text
+
+    execs = [e for e in events if e[0] == "actions"]
+    assert execs, "identity patch should have executed"
+    assert any(
+        str(a.get("type") or "") == "identity.profile_patch" for a in execs[0][1]
+    )
+
+
+def test_process_proactive_prose_prefixed_malformed_sleep_posts_nothing(monkeypatch):
+    # Gemini 3.1 prod shape via full stack: malformed fenced sleep must fail
+    # closed — nothing posted, job failed. A "stay silent" decision must never
+    # become a visible garbage bubble.
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    captured = {"statuses": [], "posted": []}
+
+    malformed_sleep = (
+        "让我先安静地陪着。\n"
+        "```json\n"
+        "{\n"
+        '  "actions": [\n'
+        "    {\n"
+        '      "type": "proactive.sleep",\n'
+        '      "reason": "她应该在专心上班了，我不出声打扰。"\n'
+        "    }\n"
+        "  ]\n"
+        "```\n"
+        "  }\n"
+        "  ]\n"
+        "}"
+    )
+
+    monkeypatch.setattr(
+        crc, "call_agent_http",
+        lambda message, images=None, raw_text=False: malformed_sleep,
+    )
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_leak"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc, "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: ({}, [], {}))
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_malformed_sleep",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 131.2,
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(131.2)
+    assert captured["posted"] == []
+    failed = [s for s in captured["statuses"] if s[1] == "failed"]
+    assert failed
+    assert failed[-1][2] == "agent_reply_parse_failed"
+
+
+@pytest.mark.parametrize("action_type,extra", [
+    ("proactive.request_broadcast", '"reason":"她该起身活动了"'),
+    ("proactive.schedule_wake", '"delay_sec":3600'),
+    ("proactive.send_message", '"text":"我先说一句"'),
+    ("proactive.sleep", '"reason":"专注中"'),
+    ("proactive.needs_background", '"reason":"x"'),
+])
+def test_prose_wrapped_perception_actions_route_not_dropped(action_type, extra):
+    # Every perception-push action type, when prose+fence wrapped, must be
+    # recognized as protocol and routed (action extracted) — never fail-closed
+    # (which would silently drop a legit push) and never leak the raw JSON.
+    raw = (
+        "我看了一眼屏幕。\n"
+        "```json\n"
+        '{"actions":[{"type":"' + action_type + '",' + extra + "}]}\n"
+        "```"
+    )
+    turn = crc._split_agent_turn(raw)
+    assert [a.get("type") for a in turn.actions] == [action_type]
+    for m in turn.messages:
+        assert "```" not in m and '"actions"' not in m
+
+
+def test_process_perception_prose_wrapped_send_message_pushes_clean(monkeypatch):
+    # Full stack through real call_agent: a perception wake that decides to speak,
+    # wrapping its send_message action in prose+fence, must push the natural-
+    # language text clean — no JSON envelope in the bubble.
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    captured = {"posted": [], "statuses": []}
+
+    wrapped = (
+        "看你在忙，我先说一句。\n"
+        "```json\n"
+        '{"actions":[{"type":"proactive.send_message","text":"忙完记得喝口水～"}]}\n'
+        "```"
+    )
+    monkeypatch.setattr(
+        crc, "call_agent_http",
+        lambda message, images=None, raw_text=False: wrapped,
+    )
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append(reply) or {"id": "msg_perc"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc, "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((status, reason)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: ({}, [], {}))
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_perc_send",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 133.3,
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(133.3)
+    assert captured["posted"] == ["忙完记得喝口水～"]
+    assert any(s[0] == "posted" for s in captured["statuses"])

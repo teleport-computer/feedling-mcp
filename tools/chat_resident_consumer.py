@@ -742,6 +742,28 @@ def _note_agent_turn_success() -> None:
         _report_runtime_error("", "")
 
 
+def _agent_call_failed_reason(prefix: str, exc: BaseException) -> str:
+    """Failure reason that keeps the underlying message, not just the exception
+    type. The chat lane records the full error (``agent_call_failed: {e}``), but
+    the capture/dream/migrate lanes historically recorded only
+    ``{prefix}:{type(e).__name__}`` — so a relay rejection (call_agent raises
+    ``RuntimeError("pi agent produced no reply: 403 ...insufficient_user_quota")``)
+    surfaced in job aggregations as an opaque ``RuntimeError``, indistinguishable
+    from a real code fault (usr_77b37bd1, 2026-07-21: 7 such rows were actually
+    the same 403). Keep the ``prefix`` stable for any prefix matching, and append
+    a bounded message so these lanes are diagnosable.
+
+    The reason is persisted to ``status_reason`` (JSONB/text) via
+    ``/v1/proactive/jobs/{id}/status``. Strip ALL C0/DEL control characters
+    (not only LF) and collapse whitespace before truncating: a stray NUL would
+    make the PostgreSQL write fail and drop the very failure record this exists
+    to preserve; CR/tab would also break the single-line contract."""
+    detail = " ".join(re.sub(r"[\x00-\x1f\x7f]+", " ", str(exc)).split())
+    if not detail:
+        return f"{prefix}:{type(exc).__name__}"
+    return f"{prefix}:{type(exc).__name__}: {detail[:400]}"
+
+
 # Prompt routed only when an agent entry cannot receive a native image object.
 # The consumer still extracts decrypted image bytes and passes them through
 # the richest available channel:
@@ -796,12 +818,33 @@ def _consumer_commit() -> str:
         return ""
 
 
+# The commit identity of the CODE THIS PROCESS IS RUNNING, captured once at
+# import. Never re-derive identity from the checkout after startup: an operator
+# — or an agent following a maintenance prompt — can move HEAD underneath a
+# live process (Seven's VPS, 2026-07-22). A live re-read would then report a
+# commit we are not actually running, and worse, let the self-update equality
+# check believe "already on target" and never re-exec into the new code.
+_ENV_COMMIT = os.environ.get("FEEDLING_CONSUMER_COMMIT")
+RUNNING_COMMIT = _ENV_COMMIT if _ENV_COMMIT is not None else _consumer_commit()
+
+# Poll-only compatibility claim: when the updater deliberately skips a backend
+# target because the release changes nothing this consumer loads, it advertises
+# that target here so the backend knows the older running commit is a choice,
+# not a stall (suppresses stale-consumer maintenance while it matches).
+_compat_commit = {"value": ""}
+
+
+def _compat_commit_headers() -> dict:
+    value = str(_compat_commit.get("value") or "")
+    return {"X-Feedling-Consumer-Compat-Commit": value} if value else {}
+
+
 _HEADERS = {
     "X-API-Key": FEEDLING_API_KEY,
     "X-Feedling-Consumer": "feedling-chat-resident",
     "X-Feedling-Consumer-Id": CONSUMER_ID,
     "X-Feedling-Consumer-Version": "resident-v1",
-    "X-Feedling-Consumer-Commit": os.environ.get("FEEDLING_CONSUMER_COMMIT", _consumer_commit()),
+    "X-Feedling-Consumer-Commit": RUNNING_COMMIT,
 }
 
 
@@ -1084,13 +1127,19 @@ def _git_fetch(target: str) -> bool:
         return False
 
 
-def _git_changed_files(local: str, target: str) -> set[str]:
+def _git_changed_files(local: str, target: str) -> set[str] | None:
+    """Files changed between two commits, or None when the diff FAILED.
+
+    Failure must stay distinguishable from a successful empty diff: callers
+    sign a compatibility claim off "no relevant files changed", and an
+    unresolvable commit (bad env override, unfetched object) must read as
+    "cannot prove" — never as "proved nothing changed" (fail closed)."""
     try:
         r = _git("diff", "--name-only", local, target, "--", timeout=30)
     except Exception:
-        return set()
+        return None
     if r.returncode != 0:
-        return set()
+        return None
     return {ln.strip() for ln in r.stdout.splitlines() if ln.strip()}
 
 
@@ -1170,18 +1219,60 @@ def _run_self_update(target: str) -> None:
     now = time.monotonic()
     if now - _last_self_update_mono < _SELF_UPDATE_MIN_INTERVAL_SEC:
         return
-    local = _consumer_commit()
+    local = RUNNING_COMMIT  # identity of the running image, NEVER the checkout
     if not local or target.startswith(local) or local.startswith(target):
-        return  # unknown local, or already on the target commit
+        return  # unknown running identity, or already running the target
     _last_self_update_mono = now  # throttle the fetch/diff attempt below
+
+    disk = _consumer_commit()
+    if disk and (target.startswith(disk) or disk.startswith(target)):
+        # The checkout already sits at the target while this process still runs
+        # older code — someone updated the repo without restarting (the exact
+        # wedge from Seven's VPS: an agent followed a maintenance prompt,
+        # checked out the target, and its turn died before the restart step).
+        # Self-heal: no fetch/checkout needed; install changed requirements and
+        # re-exec into the code already on disk.
+        changed = _git_changed_files(local, target)
+        if changed is None:
+            log.warning(
+                "self-update: cannot diff running %s against on-disk target %s; "
+                "not signing compatibility and not re-execing", local, target,
+            )
+            return
+        if not _relevant_changed(changed):
+            _compat_commit["value"] = target
+            return  # nothing we load changed — running image is compatible
+        if _git_tree_dirty():
+            log.warning(
+                "self-update: checkout already at %s but tree is dirty; "
+                "not re-execing over uncommitted changes", target,
+            )
+            return
+        _compat_commit["value"] = ""
+        log.info(
+            "self-update: checkout already at %s; re-exec to replace stale "
+            "running image %s", target, local,
+        )
+        _apply_self_update(local, target, changed)
+        return
 
     if not _git_fetch(target):
         log.warning("self-update: could not fetch %s; will retry later", target)
         return
     changed = _git_changed_files(local, target)
+    if changed is None:
+        log.warning(
+            "self-update: cannot diff %s..%s after fetch; not signing "
+            "compatibility, will retry later", local, target,
+        )
+        return
     relevant = _relevant_changed(changed)
     if not relevant:
-        return  # backend release doesn't touch anything this consumer loads
+        # Deliberate skip — advertise compatibility so the backend does not
+        # count this running commit as a stalled consumer.
+        _compat_commit["value"] = target
+        return
+    _compat_commit["value"] = ""
     dirty = _git_tree_dirty()
     if not _should_self_update(local, target, dirty, AUTO_UPDATE, _HOSTED, relevant):
         if dirty:
@@ -1465,6 +1556,23 @@ def _mark_seen(key: str) -> bool:
     return True
 
 
+def _unmark_seen(keys) -> None:
+    """Release seen keys so a kept-back checkpoint can actually retry them.
+
+    The transient reply-write failure path keeps the checkpoint behind the
+    failed turn (claim lease expiry + redelivery re-serve it) — but a key left
+    in the seen set would make the retry round skip the message and advance the
+    checkpoint anyway, turning a recoverable failure into a silent drop
+    (codex3 fault-injection, 2026-07-22)."""
+    for key in keys:
+        if key in _seen_ids:
+            _seen_ids.discard(key)
+            try:
+                _seen_ids_order.remove(key)
+            except ValueError:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Decrypt sources — plaintext content for v1 encrypted messages
 # ---------------------------------------------------------------------------
@@ -1563,9 +1671,12 @@ def _fetch_from_enclave(
 #                succeeded (a brand-new resident with no history yet is reachable
 #                but not yet proven on a real message — the phase-2 encrypted
 #                challenge closes that residual)
-#   degraded     a claimed message could not be read (empty-content / wedge) —
+#   degraded     claimed messages could not be read (empty-content / wedge) for
+#                DECRYPT_DEGRADE_AFTER consecutive claims — a single blip (a
+#                claim/history race, one boundary message) no longer degrades;
 #                only a later real success clears it; a reachability probe never
-#                upgrades degraded, so a per-message decrypt failure is not masked
+#                upgrades degraded, so a real per-message decrypt failure is not
+#                masked
 #   unreachable  the configured enclave source failed
 #   unconfigured no FEEDLING_ENCLAVE_URL at all
 # checked_at is refreshed on every confirmation so a long-idle "ok" cannot look
@@ -1590,10 +1701,44 @@ DECRYPT_HEALTH_REFRESH_SEC = _env_float(
 
 _decrypt_health: dict = {"status": "unknown", "checked_at": 0.0}
 
+# One unreadable claim can be a transient blip (claim/history race, a single
+# boundary message). Degrading on the first one parked healthy established
+# residents on a sticky "degraded" overnight and tripped the backend's
+# maintenance alert for a working setup (usr_98306ae2, 2026-07-22). Require a
+# streak of consecutive read failures before reporting degraded; any real
+# decrypt success resets the streak. Floor of 1 restores degrade-immediately
+# for operators who want it.
+try:
+    DECRYPT_DEGRADE_AFTER = max(
+        1, int(os.environ.get("FEEDLING_DECRYPT_DEGRADE_AFTER") or 2)
+    )
+except (TypeError, ValueError):
+    DECRYPT_DEGRADE_AFTER = 2
+
+_decrypt_read_failures = {"count": 0}
+
 
 def _set_decrypt_health(status: str) -> None:
     _decrypt_health["status"] = status
     _decrypt_health["checked_at"] = time.time()
+
+
+def _note_decrypt_read_failure() -> None:
+    """Record one claimed-but-unreadable message; degrade only on a streak.
+
+    Below the streak threshold the current status is left untouched (the
+    heartbeat/probe path keeps reporting it) so a lone blip never flips a
+    healthy resident to degraded."""
+    _decrypt_read_failures["count"] += 1
+    if _decrypt_read_failures["count"] >= DECRYPT_DEGRADE_AFTER:
+        _set_decrypt_health("degraded")
+
+
+def _note_decrypt_read_success() -> None:
+    """A real message decrypted to non-empty plaintext — the only signal that
+    clears degraded (reachability probes never do) and resets the streak."""
+    _decrypt_read_failures["count"] = 0
+    _set_decrypt_health("ok")
 
 
 def _decrypt_health_headers() -> dict:
@@ -3087,6 +3232,191 @@ def _dedupe_agent_turn_messages(turn: AgentTurn) -> AgentTurn:
     return turn
 
 
+# --- Protocol-JSON leak fix (fix/protocol-json-leak-parse) ------------------
+# A model sometimes wraps its control payload in prose ("Written to the card.")
+# or a ```json fence instead of emitting bare JSON. The position-anchored guards
+# (_markdown_fenced_json_body / _looks_like_agent_protocol_text) only catch a
+# payload at the very start or as the whole string, so a prose prefix slips past
+# and the raw JSON reaches a chat bubble (prod: identity self_introduction,
+# proactive.sleep — across claude/pi/codex/Gemini). Even proactive.sleep leaks:
+# once a wrapped payload lands in turn.messages, the "and not replies" sleep/
+# broadcast handlers are bypassed and the raw JSON posts.
+#
+# The parse is split into two layers, kept strictly separate (mixing them was
+# the source of every earlier miss):
+#   1. TRANSPORT — machine framing from a driver: a whole-string JSON object, a
+#      whole-string fenced JSON, or an NDJSON stream of transport *events* (each
+#      line carrying a recognized event/type marker). Bare protocol envelopes in
+#      free text are NOT transport.
+#   2. VISIBLE REPLY — free model text (possibly with <think> tags and an
+#      embedded protocol payload). Thinking is stripped HERE, on the decoded
+#      visible text only (stripping before transport parse corrupts a legit
+#      `{"result":"<think>..</think>.."}`). Then a lexer-style scan looks for a
+#      protocol object anchored at a TEXT top-level boundary (line start / after
+#      a fence) — never a nested '{'. Exactly one such root routes (actions
+#      execute, its messages send); malformed debris, conflicting candidates,
+#      unclosed thinking, or an over-budget scan all fail closed (drop, never
+#      post). Ordinary prose and code fences are left untouched.
+#
+# v2 migration: backend/proactive/agent_protocol_v2.py has the same
+# position-anchored weakness (_looks_like_protocol_fragment / _json_payload_
+# from_text use fullmatch / [:1]). Before runtime_v2 ships to prod, port this
+# two-layer split (transport vs visible + _iter_root_json_spans + strict typing)
+# into that parser so it fails closed on the same shapes.
+_SUPPORTED_ACTION_PREFIXES = ("identity.", "memory.", "proactive.")
+_BARE_PROACTIVE_ACTION_TYPES = {
+    "sleep", "send_message", "schedule_wake", "cancel_wake", "request_broadcast",
+}
+# A protocol key sitting in a JSON key position ({ or , or line start, then the
+# quoted key + colon) — catches compact `prefix {"actions":[` too, not just
+# top-of-line. A prose mention like `the "actions": field` never matches.
+_PROTOCOL_DEBRIS_KEY_RE = re.compile(
+    r'(?:[{,]|^|\n)\s*"(?:actions|messages|tool_calls|cards)"\s*:'
+)
+_PROTOCOL_DEBRIS_TYPED_RE = re.compile(
+    r'"type"\s*:\s*"(?:identity|memory|proactive)\.\w+"'
+)
+_UNCLOSED_THINKING_RE = re.compile(r'<\s*(?:think|thinking|reasoning|thought)\s*>', re.I)
+_SCAN_ATTEMPT_BUDGET = 64
+
+
+def _is_supported_action_obj(action: Any) -> bool:
+    if not isinstance(action, dict):
+        return False
+    typ = str(action.get("type") or action.get("action") or "").strip()
+    if not typ:
+        return False
+    return typ.startswith(_SUPPORTED_ACTION_PREFIXES) or typ in _BARE_PROACTIVE_ACTION_TYPES
+
+
+def _is_protocol_object(obj: Any) -> bool:
+    """Strict top-level protocol typing. A bare {"type": ...} is NOT protocol —
+    only a top-level messages/actions/tool_calls/cards envelope qualifies, and
+    an `actions` list must carry at least one supported action type."""
+    if not isinstance(obj, dict):
+        return False
+    if isinstance(obj.get("messages"), list):
+        return True
+    actions = obj.get("actions")
+    if isinstance(actions, list) and any(_is_supported_action_obj(a) for a in actions):
+        return True
+    if isinstance(obj.get("tool_calls"), list) and obj.get("tool_calls"):
+        return True
+    if isinstance(obj.get("cards"), list):
+        return True
+    return False
+
+
+def _is_transport_event_obj(obj: Any) -> bool:
+    """A driver transport event (a stream frame), NOT the model's protocol
+    envelope. Has a non-protocol type/event marker and no top-level
+    actions/messages. `{"type":"result",...}` / `{"type":"message_end",...}` are
+    transport; `{"actions":[...]}` / `{"type":"proactive.sleep"}` are not."""
+    if not isinstance(obj, dict):
+        return False
+    if isinstance(obj.get("actions"), list) or isinstance(obj.get("messages"), list):
+        return False
+    marker = str(
+        obj.get("event") or obj.get("type") or obj.get("kind") or obj.get("phase") or ""
+    ).strip()
+    if not marker:
+        return False
+    return not (marker.startswith(_SUPPORTED_ACTION_PREFIXES)
+                or marker in _BARE_PROACTIVE_ACTION_TYPES)
+
+
+def _transport_objects(raw: str) -> list[Any]:
+    """Structured machine transport only (see the layer note above): whole-string
+    JSON, whole-string fenced JSON, or an NDJSON stream whose every non-empty
+    line is a transport event. Anything else (prose, or bare protocol envelopes)
+    returns [] so it falls through to the visible-reply scanner."""
+    fenced = _markdown_fenced_json_body(raw)
+    if fenced:
+        obj = _safe_json_loads(fenced)
+        if obj is not None:
+            return [obj]
+    whole = _safe_json_loads(raw)
+    if whole is not None:
+        return [whole]
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if len(lines) < 2 or any(ln[0] not in "{[" for ln in lines):
+        return []
+    objs: list[Any] = []
+    for ln in lines:
+        obj = _safe_json_loads(ln)
+        if obj is None:
+            return []
+        objs.append(obj)
+    if all(_is_transport_event_obj(o) for o in objs):
+        return objs
+    return []
+
+
+def _truncate_at_unclosed_thinking(text: str) -> str:
+    """After closed <think>…</think> pairs are removed, an unclosed opening tag
+    means everything from it on is reasoning — never a command. Cut it so its
+    contents can't be scanned or executed."""
+    m = _UNCLOSED_THINKING_RE.search(text)
+    return text[: m.start()] if m else text
+
+
+def _iter_root_json_spans(text: str):
+    """Yield (obj, start, end) for JSON values whose opening bracket sits at a
+    TEXT top-level boundary — the start of the string or the start of a line
+    (after optional whitespace / a ``` fence line). raw_decode gives correct
+    string/escape/nesting handling and we skip past each consumed span, so a
+    nested '{' (after ':' or ',', or inside a value) is never mistaken for a
+    root. Yields the sentinel ("__budget__", i, i) if the attempt budget is hit
+    (caller must fail closed)."""
+    decoder = json.JSONDecoder()
+    attempts = 0
+    for m in re.finditer(r"(?:^|\n)[ \t]*(?=[{\[])", text):
+        i = m.end()
+        attempts += 1
+        if attempts > _SCAN_ATTEMPT_BUDGET:
+            yield ("__budget__", i, i)
+            return
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            continue
+        yield (obj, i, end)
+
+
+def _has_protocol_debris(text: str) -> bool:
+    """Structural evidence of a (possibly malformed) protocol payload: a protocol
+    key in a JSON key position or an identity/memory/proactive typed action,
+    alongside a JSON structural start or fence. A prose mention never counts."""
+    if not (_PROTOCOL_DEBRIS_KEY_RE.search(text) or _PROTOCOL_DEBRIS_TYPED_RE.search(text)):
+        return False
+    return "{" in text or "[" in text or "```" in text
+
+
+def _scan_visible_protocol(text: str) -> tuple[str, Any]:
+    """('route', obj) | ('drop', None) | ('none', None) for a visible reply.
+    Route ONLY when exactly one text-top-level root object is a valid protocol
+    envelope and no other protocol debris sits outside its span. Fail closed
+    (drop) on: an over-budget scan, >=2 protocol roots, or protocol debris with
+    no clean single root. No protocol evidence -> none (caller sanitizes,
+    preserving code fences)."""
+    roots: list[tuple[Any, int, int]] = []
+    for obj, start, end in _iter_root_json_spans(text):
+        if obj == "__budget__":
+            return ("drop", None)
+        if _is_protocol_object(obj):
+            roots.append((obj, start, end))
+    if len(roots) == 1:
+        obj, start, end = roots[0]
+        if _has_protocol_debris(text[:start] + text[end:]):
+            return ("drop", None)
+        return ("route", obj)
+    if len(roots) >= 2:
+        return ("drop", None)
+    if _has_protocol_debris(text):
+        return ("drop", None)
+    return ("none", None)
+
+
 def _agent_turn_from_obj(obj: Any) -> AgentTurn:
     turn = AgentTurn()
 
@@ -3094,7 +3424,10 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         raw = obj.strip()
         if not raw:
             return turn
-        json_objects = _json_objects_from_cli_output(raw)
+        # LAYER 1 — transport. Machine framing only (whole JSON / whole fence /
+        # NDJSON event stream). A transport object's extracted reply text recurses
+        # back into this branch and is parsed as a visible reply below.
+        json_objects = _transport_objects(raw)
         if json_objects:
             for item in json_objects:
                 _merge_agent_turn(turn, _agent_turn_from_obj(item))
@@ -3107,24 +3440,31 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
                 turn.thinking_native = stream_turn.thinking_native
             if stream_turn.messages and not turn.messages:
                 turn.messages = stream_turn.messages
-            if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
-                return _dedupe_agent_turn_messages(turn)
-        nested = _safe_json_loads(raw) if _looks_like_json_text(raw) else None
-        if isinstance(nested, (dict, list)):
-            return _agent_turn_from_obj(nested)
+            # It WAS transport — return its result even when empty (e.g. a lone
+            # non-final event). Never re-process the raw framing as visible text;
+            # that path re-sanitized skipped-event JSON straight into a bubble.
+            return _dedupe_agent_turn_messages(turn)
+        # LAYER 2 — visible reply. Strip thinking HERE (after transport, so a
+        # legit `{"result":"<think>..</think>.."}` is not corrupted), truncate any
+        # unclosed thinking, then scan for a text-top-level protocol root.
         raw, tagged_thinking = _split_tagged_thinking(raw)
+        raw = _truncate_at_unclosed_thinking(raw)
         if tagged_thinking:
-            # Some runtimes inline their reasoning as <think>…</think> in the
-            # final text. Per the original design this is NOT provider-native
-            # reasoning, but it is useful display material — keep it as a
-            # non-native fallback (provider_reasoning_summary) so a genuine
-            # provider-native reasoning always wins in _merge_agent_turn.
+            # Inlined reasoning is NOT provider-native — keep it as a non-native
+            # fallback so a genuine provider-native reasoning still wins in
+            # _merge_agent_turn.
             turn.thinking_summary = _sanitize_thinking_summary(tagged_thinking)
             turn.thinking_kind = "provider_reasoning_summary"
             turn.thinking_source = "tagged_content"
             turn.thinking_native = False
-            if not raw.strip():
-                return turn
+        if not raw.strip():
+            return turn
+        decision, payload = _scan_visible_protocol(raw)
+        if decision == "route":
+            _merge_agent_turn(turn, _agent_turn_from_obj(payload))
+            return turn
+        if decision == "drop":
+            return turn
         if _looks_like_agent_protocol_text(raw):
             return turn
         clean = _sanitize_reply_text(raw)
@@ -3441,15 +3781,27 @@ def _codex_turn_from_stream(raw: str) -> tuple[str, str]:
     - **0.142 flat EventMsg protocol**: ``{"type":"agent_message","message":...}``
       with reasoning under ``{"type":"agent_reasoning","text":...}``.
 
-    The assistant reply is joined in order; the reasoning summary is returned
-    SEPARATELY so the caller routes it to the collapsible thinking disclosure
-    instead of letting it leak as a chat bubble (the 0.142 regression: the old
-    reader matched nothing → the turn fell through to the generic extractor →
-    the reasoning event's ``text`` was emitted as a message). Both empty means a
-    handshake-only / failed turn so the caller can fall back without leaking.
+    The assistant reply is the LAST agent message — never a join of all of
+    them. When a turn calls a tool, codex emits a *preamble* agent message
+    ("let me check…") BEFORE the tool call and the real answer in a LATER one
+    (the exact shape `_claude_turn_from_stream` documents for claude). The old
+    join glued the preamble onto the answer as one doubled-up bubble (2026-07-22
+    resident report: "我先按你的固定流程轻轻走一遍…" + tool calls + the real
+    reply, all sent as one message). Take-last matches the pi driver; the 0.142
+    ``task_complete`` event's ``last_agent_message``, when present, is preferred
+    as the authoritative reply — the codex analogue of the claude driver
+    trusting only the terminal ``result``.
+
+    The reasoning summary is returned SEPARATELY so the caller routes it to the
+    collapsible thinking disclosure instead of letting it leak as a chat bubble
+    (the 0.142 regression: the old reader matched nothing → the turn fell
+    through to the generic extractor → the reasoning event's ``text`` was
+    emitted as a message). Both empty means a handshake-only / failed turn so
+    the caller can fall back without leaking.
     """
     replies: list[str] = []
     reasoning: list[str] = []
+    final_reply = ""
     for obj in _json_objects_from_cli_output(raw):
         if not isinstance(obj, dict):
             continue
@@ -3486,8 +3838,15 @@ def _codex_turn_from_stream(raw: str) -> tuple[str, str]:
                 text = obj.get("message")
             if isinstance(text, str) and text.strip():
                 reasoning.append(text.strip())
+        elif etype == "task_complete":
+            # 0.142 terminal event: carries the final answer alone, never the
+            # pre-tool preamble — authoritative when non-empty.
+            text = obj.get("last_agent_message")
+            if isinstance(text, str) and text.strip():
+                final_reply = text.strip()
 
-    return "\n\n".join(replies), "\n\n".join(reasoning)
+    reply = final_reply or (replies[-1] if replies else "")
+    return reply, "\n\n".join(reasoning)
 
 
 def _codex_reply_from_stream(raw: str) -> str:
@@ -4332,6 +4691,68 @@ def _is_pi_cmd(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "pi"
 
 
+# pi's NO-ARGUMENT switches, transcribed from `pi --help` in the agent-runner image.
+# Everything else that looks like a flag is ASSUMED to take a value — pi lets
+# extensions register their own flags ("Extensions can register additional flags,
+# e.g. --plan"), so a closed value-flag allowlist is unmaintainable and every gap in
+# it turns that flag's VALUE into a false "extra user message" alarm. Since this
+# detector is log-only we prefer a missed detection over crying wolf, so the
+# open-ended side is the value-taking one.
+#
+# ⚠️ Membership here is load-bearing in BOTH directions: a value-taking flag listed
+# as bare makes its value read as a positional (false alarm), and a bare switch
+# omitted from this set swallows the following token (missed detection). `--resume`
+# / `-r` is a SWITCH ("Select a session to resume"), not `--resume <id>` — an
+# earlier revision had it backwards and reported `pi -r --session-id sid` as
+# reply-destroying. `--list-models [search]` takes an OPTIONAL argument; it is a
+# terminal diagnostic flag that never appears in a resident template, so bare is the
+# safe reading.
+_PI_BARE_FLAGS = {
+    "-p", "--print", "-c", "--continue", "-r", "--resume", "--no-session",
+    "-nt", "--no-tools", "-nbt", "--no-builtin-tools", "-ne", "--no-extensions",
+    "-ns", "--no-skills", "-np", "--no-prompt-templates", "--no-themes",
+    "-nc", "--no-context-files", "--verbose", "-a", "--approve", "-na",
+    "--no-approve", "--offline", "-h", "--help", "-v", "--version",
+    "--list-models",
+}
+
+
+def _pi_stray_positionals(cmd: list[str]) -> list[str]:
+    """Positional argv tokens in a pi command — each one is an EXTRA user message.
+
+    The resident feeds the real message via STDIN precisely so that no user text
+    rides argv (see ``_default_cli_cmd``'s "NO {message} placeholder" note), so a
+    well-formed pi command is all flags. A positional means the template lost a
+    quote somewhere — prod 2026-07-21 shipped ``--model feedling/[kiro零缓]
+    claude-opus-4-6-thinking [不补]`` unquoted, so pi answered the real turn AND
+    the stray ``[不补]`` ("好的。"), and ``_pi_turn_from_stream`` — which keeps the
+    LAST text-bearing assistant message — handed the user "好的。" instead of the
+    reply. Returns [] for non-pi commands: codex/claude take the message
+    positionally by design."""
+    if not _is_pi_cmd(cmd):
+        return []
+    stray, i = [], 1
+    while i < len(cmd):
+        tok = cmd[i]
+        if tok.startswith("-"):
+            # `--flag=value` carries its value inline — never consume the next token.
+            inline = tok.startswith("--") and "=" in tok
+            i += 1 if (inline or tok in _PI_BARE_FLAGS) else 2
+            continue
+        if not tok:  # an empty token is never a split alias tail
+            i += 1
+            continue
+        # Not user text: `{mcp}`/`{session_id}` placeholders the resident fills per
+        # turn, `__MSG__` (the drift check's own {message} sentinel — a pi template
+        # MAY carry {message}), and `@<path>` pi file refs (_inject_pi_images emits
+        # this shape; an operator may hardcode one).
+        placeholder = tok.startswith("{") and tok.endswith("}")
+        if not placeholder and tok != "__MSG__" and not tok.startswith("@"):
+            stray.append(tok)
+        i += 1
+    return stray
+
+
 def _cli_cmd_tokens() -> list[str]:
     """Tokenize the raw AGENT_CLI_CMD template for driver detection.
 
@@ -4515,6 +4936,22 @@ def _warn_if_agent_entry_may_drift() -> None:
     except ValueError as e:
         log.warning("AGENT_CLI_CMD could not be parsed for drift checks: %s", e)
         return
+
+    stray = _pi_stray_positionals(cmd)
+    if stray:
+        # Diagnostics only, deliberately NOT _report_runtime_error: that channel
+        # cannot carry this. A report sets _runtime_error_reported, and
+        # _note_agent_turn_success clears last_runtime_error on the next successful
+        # turn — and in this failure mode every pi turn SUCCEEDS (it answers the
+        # stray token), so the banner would die seconds after boot. The template is
+        # also operator-overridable, so this stays a warning, not a hard failure.
+        log.warning(
+            "AGENT_CLI_CMD passes positional argument(s) to pi: %r. pi reads "
+            "positionals as EXTRA USER MESSAGES — it will answer them after the "
+            "real turn and that trailing reply replaces the real one. Usually a "
+            "model name containing spaces that was not quoted.",
+            stray,
+        )
 
     if not _is_hermes_chat_cmd(cmd):
         return
@@ -5990,7 +6427,7 @@ def poll_chat(since: float, timeout: int | None = None, claim: bool = True) -> d
         params["claim"] = "false"
     # Ship the decrypt-source health so the backend gate/alert can tell a
     # live-but-undecrypting resident from a healthy one (see _decrypt_health).
-    headers = {**_HEADERS, **_decrypt_health_headers()}
+    headers = {**_HEADERS, **_decrypt_health_headers(), **_compat_commit_headers()}
     resp = _HTTP.get(url, params=params, headers=headers, timeout=poll_to + 10)
     resp.raise_for_status()
     body = resp.json()
@@ -8243,7 +8680,7 @@ def _process_capture_jobs(jobs: list) -> float:
         try:
             reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
         except Exception as e:
-            reason = f"capture_agent_call_failed:{type(e).__name__}"
+            reason = _agent_call_failed_reason("capture_agent_call_failed", e)
             log.error("capture agent call failed id=%s: %s", job_id, e)
             _notify_agent_turn_failure(e, foreground=False)
             update_proactive_job_status(
@@ -8590,7 +9027,7 @@ def _process_dream_jobs(jobs: list) -> float:
         try:
             reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
         except Exception as e:
-            reason = f"dream_agent_call_failed:{type(e).__name__}"
+            reason = _agent_call_failed_reason("dream_agent_call_failed", e)
             log.error("dream agent call failed id=%s: %s", job_id, e)
             _notify_agent_turn_failure(e, foreground=False)
             update_proactive_job_status(
@@ -9216,7 +9653,7 @@ def _process_migrate_jobs(jobs: list) -> float:
         try:
             reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
         except Exception as e:
-            reason = f"migrate_agent_call_failed:{type(e).__name__}"
+            reason = _agent_call_failed_reason("migrate_agent_call_failed", e)
             log.error("migrate agent call failed id=%s: %s", job_id, e)
             update_proactive_job_status(
                 job_id, "failed", reason,
@@ -9392,9 +9829,135 @@ def _quoted_memory_context(msg: dict) -> str:
     )
 
 
+# --- Offline backlog collapse ----------------------------------------------
+# A consumer that was down/stuck for days used to answer every piled-up user
+# message with its own agent turn — a dozen stale "在吗" each got a separate
+# reply (slow, expensive, and weird to receive; usr_6c1971 2026-07-22). When a
+# processing batch contains a STALE pile of plain-text user messages, merge
+# them into one agent turn that answers them together. Fresh messages (a user
+# double-texting while online) never trigger this: the pile must be at least
+# BACKLOG_COLLAPSE_MIN messages AND its oldest message older than
+# BACKLOG_COLLAPSE_AGE_SEC. Approved by Seven 2026-07-22.
+try:
+    BACKLOG_COLLAPSE_MIN = int(os.environ.get("FEEDLING_BACKLOG_COLLAPSE_MIN") or 3)
+except (TypeError, ValueError):
+    BACKLOG_COLLAPSE_MIN = 3
+try:
+    BACKLOG_COLLAPSE_AGE_SEC = max(
+        60.0, float(os.environ.get("FEEDLING_BACKLOG_COLLAPSE_AGE_SEC") or 1800)
+    )
+except (TypeError, ValueError):
+    BACKLOG_COLLAPSE_AGE_SEC = 1800.0
+
+# Merged-prompt bounds: a very long offline pile must not blow the agent call
+# open. Keep the NEWEST lines when trimming — the freshest messages carry the
+# context the reply should anchor to; the header still states the true total.
+_BACKLOG_COLLAPSE_MAX_LINES = 40
+_BACKLOG_COLLAPSE_LINE_CHARS = 500
+
+
+def _collapse_eligible(msg: dict) -> bool:
+    """Only ordinary, readable, plain-text user chat turns merge. Probes,
+    server maintenance turns, media, and unreadable rows keep their own
+    per-message pipelines (each has semantics a merge would break)."""
+    if str(msg.get("role") or "") != "user":
+        return False
+    if str(msg.get("source") or "") in {"verify_ping", RESIDENT_MAINTENANCE_SOURCE}:
+        return False
+    if str(msg.get("content_type") or "text") != "text":
+        return False
+    if msg.get("body_unavailable"):
+        return False
+    if not str(msg.get("content") or "").strip():
+        return False
+    return _msg_key(msg) not in _seen_ids
+
+
+def _collapse_stale_backlog(messages: list) -> list:
+    """Merge a stale pile of eligible user messages into a single turn.
+
+    The merged content replaces the NEWEST eligible message in place (so reply
+    anchoring, screen context, and timestamp all follow the freshest turn); the
+    absorbed older ones are dropped from the batch, with seen ownership
+    deferred until the carrier's reply settles (loop bottom). The trigger
+    counts STALE eligible messages only — at least ``max(2, MIN)`` of them must
+    be older than the age gate, so one leftover old turn cannot swallow an
+    online double-text. Once the stale pile triggers, fresh eligible messages
+    in the same batch merge too — one coherent reply beats answering the
+    backlog and the new message separately."""
+    if BACKLOG_COLLAPSE_MIN <= 0:
+        return messages  # kill switch
+    now = time.time()
+    eligible = sorted(
+        (m for m in messages if _collapse_eligible(m)),
+        key=lambda m: (float(m.get("ts", m.get("timestamp", 0)) or 0), _msg_key(m)),
+    )
+    stale_count = sum(
+        1
+        for m in eligible
+        if now - float(m.get("ts", m.get("timestamp", 0)) or 0) >= BACKLOG_COLLAPSE_AGE_SEC
+    )
+    if stale_count < max(2, BACKLOG_COLLAPSE_MIN):
+        return messages
+    oldest_ts = float(eligible[0].get("ts", eligible[0].get("timestamp", 0)) or 0)
+
+    newest = eligible[-1]
+    lines = []
+    for m in eligible:
+        m_ts = float(m.get("ts", m.get("timestamp", 0)) or 0)
+        stamp = time.strftime("%m-%d %H:%M", time.localtime(m_ts)) if m_ts else "??-?? ??:??"
+        text = str(m.get("content") or "").strip()
+        if len(text) > _BACKLOG_COLLAPSE_LINE_CHARS:
+            text = text[:_BACKLOG_COLLAPSE_LINE_CHARS] + "…(截断)"
+        lines.append(f"- [{stamp}] {text}")
+    dropped = 0
+    if len(lines) > _BACKLOG_COLLAPSE_MAX_LINES:
+        dropped = len(lines) - _BACKLOG_COLLAPSE_MAX_LINES
+        lines = lines[-_BACKLOG_COLLAPSE_MAX_LINES:]  # keep the newest
+    omitted_line = f"(更早的 {dropped} 条较旧消息未逐条列出)\n" if dropped else ""
+    merged = (
+        f"[你离线/未响应期间,用户陆续发来 {len(eligible)} 条消息,按时间排列:]\n"
+        + omitted_line
+        + "\n".join(lines)
+        + "\n\n(请把这些消息当成一个整体,综合它们的内容和情绪自然地回复一次;"
+        "不要逐条分别回复,也不要逐条复述。)"
+    )
+
+    # Ownership rule: absorbed keys are marked seen only AFTER the carrier's
+    # reply actually lands (success or terminal), at the loop bottom. Marking
+    # them here would strand them forever if the carrier never completes this
+    # round (transient write failure, an earlier message breaking the batch):
+    # the retry round would then find them "seen", skip the re-merge, and
+    # silently drop the pile (codex3 fault-injection, 2026-07-22).
+    merged_ids = {_msg_key(m) for m in eligible[:-1]}
+    out: list = []
+    for m in messages:
+        key = _msg_key(m)
+        if m is newest:
+            replacement = dict(newest)
+            replacement["content"] = merged
+            replacement["_backlog_absorbed_keys"] = sorted(merged_ids)
+            out.append(replacement)
+        elif key in merged_ids:
+            pass  # consumed by the merged carrier; seen-marking deferred
+        else:
+            out.append(m)
+    log.info(
+        "collapsed %d stale backlog message(s) spanning %s..%s into one turn",
+        len(eligible),
+        time.strftime("%m-%d %H:%M", time.localtime(oldest_ts)),
+        time.strftime(
+            "%m-%d %H:%M",
+            time.localtime(float(newest.get("ts", newest.get("timestamp", 0)) or 0)),
+        ),
+    )
+    return out
+
+
 def _process_messages(messages: list) -> float:
     """Process a batch of messages, return the highest timestamp seen."""
     global _last_user_message_wall
+    messages = _collapse_stale_backlog(messages)
     latest = 0.0
     for msg in messages:
         # Tolerate both "ts" and "timestamp" key names across API versions.
@@ -9558,9 +10121,13 @@ def _process_messages(messages: list) -> float:
             # Report the health so the backend surfaces the real blocker instead
             # of a verify_ping-only false green. Preserve the actionable
             # distinction: no source at all → unconfigured (the usr_6c1971 case);
-            # a configured source that still yielded no plaintext → degraded.
+            # a configured source that still yielded no plaintext → a read
+            # failure, degrading only on a streak (single blips stay green).
             # Never send a fallback for content we cannot read.
-            _set_decrypt_health("degraded" if FEEDLING_ENCLAVE_URL else "unconfigured")
+            if FEEDLING_ENCLAVE_URL:
+                _note_decrypt_read_failure()
+            else:
+                _set_decrypt_health("unconfigured")
             log.warning(
                 "user message has no plaintext content ts=%.3f content_type=%s "
                 "— skipping (set FEEDLING_ENCLAVE_URL to enable decryption)",
@@ -9570,8 +10137,15 @@ def _process_messages(messages: list) -> float:
             continue
         else:
             # A real user message decrypted to non-empty plaintext — decryption
-            # is genuinely working; clears any earlier degraded.
-            _set_decrypt_health("ok")
+            # is genuinely working; clears any earlier degraded and resets the
+            # read-failure streak. Server-injected maintenance turns
+            # (source=resident_maintenance) may arrive through the inline poll
+            # fallback and are not evidence that a real user ciphertext was
+            # readable, so they don't count as recovery — counting them would
+            # let fail→maintenance→fail reset the streak forever and keep a
+            # genuinely degraded source below the threshold.
+            if source != RESIDENT_MAINTENANCE_SOURCE:
+                _note_decrypt_read_success()
             log.info("user message [ts=%.3f]: %s", ts, content[:80])
 
         trace_id = str(msg.get("id") or msg.get("message_id") or "").strip()
@@ -9754,11 +10328,27 @@ def _process_messages(messages: list) -> float:
             # of permanently dropping a user turn after a transient write error.
             # pending_failure_notice 随之丢弃：本家的回复没被接受（含 already_
             # answered 409 failover），错误通知由真正被接受的那次尝试来发。
-            continue
+            #
+            # Release THIS turn's seen key so the kept-back checkpoint can
+            # genuinely retry it (a merged carrier re-forms from its unmarked
+            # absorbed messages), and stop the batch here: processing NEWER
+            # messages now would advance the checkpoint past this failed turn
+            # and let the backend's newer-replied floor supersede it forever.
+            _unmark_seen([_msg_key(msg)])
+            log.warning(
+                "transient reply write failure ts=%.3f; keeping checkpoint, "
+                "releasing the turn for retry, deferring the rest of this batch",
+                ts,
+            )
+            break
 
         if pending_failure_notice is not None and posted_any:
             _notify_agent_turn_failure(pending_failure_notice, foreground=True)
 
+        # The turn is settled (posted, or terminally rejected): absorbed
+        # backlog messages are now truly consumed by this carrier.
+        for _absorbed_key in msg.get("_backlog_absorbed_keys") or []:
+            _mark_seen(_absorbed_key)
         latest = max(latest, ts)
 
     return latest
@@ -10680,9 +11270,9 @@ def run() -> None:
                 messages = _filter_messages_to_poll_ids(decrypted, poll_messages)
                 if not messages:
                     # Claimed ids weren't in the decrypt history — the messages
-                    # exist and were leased but can't be read: degraded health,
-                    # same class as the empty-content skip.
-                    _set_decrypt_health("degraded")
+                    # exist and were leased but can't be read: a read failure,
+                    # same class as the empty-content skip (degrades on streak).
+                    _note_decrypt_read_failure()
                     if wedge_miss_ts == last_ts:
                         wedge_miss_count += 1
                     else:

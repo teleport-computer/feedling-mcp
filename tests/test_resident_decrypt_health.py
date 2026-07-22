@@ -45,6 +45,7 @@ import tools.chat_resident_consumer as c  # noqa: E402
 def _reset_health():
     c._decrypt_health.update({"status": "unknown", "checked_at": 0.0})
     c._decrypt_health_last_refresh["at"] = 0.0
+    c._decrypt_read_failures["count"] = 0
     yield
 
 
@@ -173,12 +174,93 @@ def test_empty_content_no_url_reports_unconfigured_not_degraded(monkeypatch):
     assert c._decrypt_health["status"] == "unconfigured"
 
 
-def test_empty_content_configured_reports_degraded(monkeypatch):
-    # A configured source that still yields no plaintext IS degraded.
+def test_empty_content_configured_degrades_only_on_streak(monkeypatch):
+    # A configured source that yields no plaintext is a read failure, but a
+    # SINGLE one is a possible transient blip (claim/history race) and must not
+    # flip health — degrading on the first empty claim parked a healthy
+    # established resident on sticky degraded overnight and tripped the
+    # backend's maintenance alert (usr_98306ae2, 2026-07-22). Only a streak of
+    # DECRYPT_DEGRADE_AFTER consecutive failures degrades.
     monkeypatch.setattr(c, "FEEDLING_ENCLAVE_URL", "https://enclave.example/")
     monkeypatch.setattr(c, "_reset_proactive_idle_guard", lambda: None)
     monkeypatch.setattr(c, "_clear_proactive_failure", lambda: None)
-    c._process_messages([_empty_user_msg("configured_empty")])
+    assert c.DECRYPT_DEGRADE_AFTER == 2  # default under test
+    c._process_messages([_empty_user_msg("configured_empty_1")])
+    assert c._decrypt_health["status"] != "degraded"
+    c._process_messages([_empty_user_msg("configured_empty_2")])
+    assert c._decrypt_health["status"] == "degraded"
+
+
+def test_single_empty_content_blip_keeps_prior_ok(monkeypatch):
+    # An established resident that has proven decryption keeps reporting ok
+    # through one unreadable claim; the blip only counts toward the streak.
+    monkeypatch.setattr(c, "FEEDLING_ENCLAVE_URL", "https://enclave.example/")
+    monkeypatch.setattr(c, "_reset_proactive_idle_guard", lambda: None)
+    monkeypatch.setattr(c, "_clear_proactive_failure", lambda: None)
+    c._note_decrypt_read_success()
+    assert c._decrypt_health["status"] == "ok"
+    c._process_messages([_empty_user_msg("blip")])
+    assert c._decrypt_health["status"] == "ok"
+
+
+def test_real_success_resets_failure_streak():
+    # fail → success → fail must NOT degrade: the success proves the source
+    # works, so the streak restarts from zero.
+    c._note_decrypt_read_failure()
+    c._note_decrypt_read_success()
+    c._note_decrypt_read_failure()
+    assert c._decrypt_health["status"] == "ok"
+    assert c._decrypt_read_failures["count"] == 1
+    c._note_decrypt_read_failure()
+    assert c._decrypt_health["status"] == "degraded"
+
+
+def test_degrade_after_floor_one_restores_immediate(monkeypatch):
+    # Operators can opt back into degrade-on-first-failure.
+    monkeypatch.setattr(c, "DECRYPT_DEGRADE_AFTER", 1)
+    c._note_decrypt_read_failure()
+    assert c._decrypt_health["status"] == "degraded"
+
+
+def test_maintenance_injection_does_not_reset_failure_streak(monkeypatch):
+    # A server-injected maintenance turn (source=resident_maintenance) carries
+    # inline plaintext and never exercises the decrypt path — it must not count
+    # as recovery evidence. fail → maintenance → fail still degrades at K=2,
+    # and the maintenance turn never upgrades health to ok. Otherwise the very
+    # alert sent DURING an outage would reset the streak forever.
+    monkeypatch.setattr(c, "FEEDLING_ENCLAVE_URL", "https://enclave.example/")
+    monkeypatch.setattr(c, "_reset_proactive_idle_guard", lambda: None)
+    monkeypatch.setattr(c, "_clear_proactive_failure", lambda: None)
+    monkeypatch.setattr(c, "_emit_debug_trace", lambda *a, **k: None)
+    monkeypatch.setattr(c, "_screen_context_for_message", lambda content: ("", [], []))
+    monkeypatch.setattr(c, "_worldbook_context_for_foreground", lambda content: "")
+    monkeypatch.setattr(c, "_quoted_memory_context", lambda msg: "")
+    monkeypatch.setattr(c, "_prepend_time_anchor_foreground", lambda content, ts: content)
+    monkeypatch.setattr(c, "_foreground_agent_message", lambda content, current_ts=0: content)
+    monkeypatch.setattr(c, "_resident_chat_runtime_v2_enabled", lambda: False)
+    monkeypatch.setattr(c, "_consume_reply_parse_failed", lambda: False)
+    monkeypatch.setattr(c, "_note_agent_turn_success", lambda: None)
+    monkeypatch.setattr(c, "call_agent", lambda *a, **k: ["on it"])
+    monkeypatch.setattr(c, "execute_agent_actions", lambda actions: {"effects": []})
+    monkeypatch.setattr(c, "post_reply", lambda *a, **k: {"ok": True})
+
+    c._note_decrypt_read_failure()
+    maint = {"role": "user", "content": "【Feedling 维护通知】请检查 consumer",
+             "content_type": "text", "ts": 300.0, "id": "maint_1",
+             "source": c.RESIDENT_MAINTENANCE_SOURCE}
+    c._process_messages([maint])
+    assert c._decrypt_health["status"] == "unknown"  # not upgraded to ok
+    assert c._decrypt_read_failures["count"] == 1    # streak preserved
+    c._process_messages([_empty_user_msg("fail_after_maint")])
+    assert c._decrypt_health["status"] == "degraded"
+
+
+def test_wedge_class_failures_share_the_streak():
+    # The wedge path (claimed ids absent from decrypt history) uses the same
+    # helper, so wedge cycles and empty-content skips accumulate one streak.
+    c._note_decrypt_read_failure()
+    assert c._decrypt_health["status"] == "unknown"  # untouched below streak
+    c._note_decrypt_read_failure()
     assert c._decrypt_health["status"] == "degraded"
 
 

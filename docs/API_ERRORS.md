@@ -311,4 +311,6 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `runner_key_decrypt_failed` | — | system | error | runner：provider key 解密失败，子进程无法拉起 |
 | `runner_degraded` | — | system | warning | runner：runtime-token 刷新失败但子进程仍存活，能力部分受限（token 刷新恢复才会 resolve，spawn 成功不清） |
 | `resident_consumer_stale` | — | user_environment | warning | chat：自托管 resident consumer 仍在 poll，但 commit 缺失/不匹配，或 resident-only 蒸馏任务迟迟没被 claim；notice 可带 `copyable_prompt` |
+| `resident_decrypt_source_unavailable` | — | user_environment | warning | chat：resident 明确报告 `degraded`/`unconfigured`/`unreachable`；notice 可立即出现，维护消息仅对新用户立即注入，老用户需持续失败超过宽限期 |
+| `resident_decrypt_health_unreported` | — | user_environment | warning | chat：resident 未上报有效、近期的 decrypt-health；仅发 notice，不生成解密修复文案或聊天维护消息 |
 | `resident_never_claimed` | — | user_environment | error | genesis：resident-only 入住/记忆蒸馏 job 超过 reaper 阈值仍无人 claim，已失败 |

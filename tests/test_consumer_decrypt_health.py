@@ -28,20 +28,23 @@ def _validation(monkeypatch, state: dict, *, now: float = 1_000.0) -> dict:
     return consumer._consumer_validation_state(store, now_epoch=now)
 
 
-def test_consumer_headers_parse_decrypt_health_and_clear_missing_values():
+def test_consumer_headers_parse_poll_health_and_compat_commit_and_clear_missing_values():
     info = consumer._consumer_headers_from_map(
         {
             "X-Feedling-Consumer": "feedling-chat-resident",
+            "X-Feedling-Consumer-Compat-Commit": " abcdef123456 ",
             "X-Feedling-Decrypt-Status": " DeGrAdEd ",
             "X-Feedling-Decrypt-Checked-At": "123.5",
         }
     )
+    assert info["consumer_compat_commit"] == "abcdef123456"
     assert info["decrypt_status"] == "degraded"
     assert info["decrypt_checked_at_epoch"] == "123.5"
 
     old_consumer = consumer._consumer_headers_from_map(
         {"X-Feedling-Consumer": "feedling-chat-resident"}
     )
+    assert old_consumer["consumer_compat_commit"] == ""
     assert old_consumer["decrypt_status"] == ""
     assert old_consumer["decrypt_checked_at_epoch"] == ""
 
@@ -108,14 +111,15 @@ def test_poll_records_unknown_since_and_clears_it_after_valid_report(monkeypatch
     state: dict = {}
     saved: list[dict] = []
     monkeypatch.setattr(consumer.time, "time", lambda: 1_000.0)
-    monkeypatch.setattr(consumer, "_load_consumer_state", lambda _store: dict(state))
-
-    def _save(_store, value):
+    def _mutate(_store, mutate):
+        value = dict(state)
+        result = mutate(value)
         state.clear()
         state.update(value)
         saved.append(dict(value))
+        return value, result
 
-    monkeypatch.setattr(consumer, "_save_consumer_state", _save)
+    monkeypatch.setattr(consumer, "_mutate_consumer_state", _mutate)
     monkeypatch.setattr(consumer, "_touch_resident_binding_seen", lambda *a, **k: True)
 
     consumer._record_consumer_event(
@@ -142,21 +146,23 @@ def test_poll_records_unknown_since_and_clears_it_after_valid_report(monkeypatch
     assert "decrypt_health_unknown_since_epoch" not in saved[-1]
 
 
-def test_response_event_preserves_latest_poll_decrypt_health(monkeypatch):
+def test_response_event_preserves_latest_poll_health_and_compat_commit(monkeypatch):
     store = _Store()
     state = {
         "official": True,
+        "consumer_compat_commit": "compatible-target",
         "decrypt_status": "ok",
         "decrypt_checked_at_epoch": "995",
     }
     monkeypatch.setattr(consumer.time, "time", lambda: 1_000.0)
-    monkeypatch.setattr(consumer, "_load_consumer_state", lambda _store: dict(state))
-
-    def _save(_store, value):
+    def _mutate(_store, mutate):
+        value = dict(state)
+        result = mutate(value)
         state.clear()
         state.update(value)
+        return value, result
 
-    monkeypatch.setattr(consumer, "_save_consumer_state", _save)
+    monkeypatch.setattr(consumer, "_mutate_consumer_state", _mutate)
 
     consumer._record_consumer_event(
         store,
@@ -165,11 +171,13 @@ def test_response_event_preserves_latest_poll_decrypt_health(monkeypatch):
             "official": True,
             # chat_resident_consumer posts static identity headers on replies;
             # missing poll-only health fields parse as these empty values.
+            "consumer_compat_commit": "",
             "decrypt_status": "",
             "decrypt_checked_at_epoch": "",
         },
     )
 
+    assert state["consumer_compat_commit"] == "compatible-target"
     assert state["decrypt_status"] == "ok"
     assert state["decrypt_checked_at_epoch"] == "995"
     assert state["last_event"] == "response"
