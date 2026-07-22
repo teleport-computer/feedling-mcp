@@ -35,6 +35,17 @@ does not provide Intel TDX attestation or protection from the machine operator.
 Envelope encryption still protects backups and accidental storage exposure, but
 the host operator controls the processes that can request decryption.
 
+A resident consumer can also re-run identity extraction (a "redistill") directly
+from a local terminal conversation, without going through the app's plaintext
+upload flow. This path reuses the existing sealed-import lane: the resident
+consumer itself seals the material into an encrypted envelope on the same host
+before making any network call, so the backend and the network in between never
+receive that material as plaintext, independent of which deployment profile
+above you chose. The backend still serializes these jobs per account — a second
+redistill request while one is already `awaiting_resident` or `processing`
+is rejected with `409 redistill_job_active` (and the in-flight job's id) rather
+than starting a second concurrent job or silently clobbering the first.
+
 ## Component map
 
 A functional deployment can include:

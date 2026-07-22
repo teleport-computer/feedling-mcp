@@ -12,6 +12,39 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- `POST /v1/identity/actions` profile-patch writes now cover the full identity
+  card: 9 string fields (`user_preferred_name`, `agent_role`, `tone_style`,
+  `custom_persona_prompt`, `language_preference`, `relationship_anchor`, and
+  others, alongside the existing `agent_name`/`self_introduction`/`category`),
+  plus explicit `add_*`/`remove_*`/`replace_*` operations on the four list
+  fields (signatures, boundaries, do-not-say, stable definitions) instead of
+  only whole-list replacement. Renaming the agent (`agent_name`) must now
+  include `self_introduction` in the same patch or the write is rejected with
+  `400 rename_requires_self_introduction`; this pairing requirement only
+  applies to agent-originated (runtime-token) writes, not user/app writes made
+  with an API key, which are unchanged. New error codes on this endpoint:
+  `list_op_conflict` (a field targeted by more than one list-operation shape
+  in one patch), `list_op_blank` (an add/replace entry is blank after
+  cleanup), `list_op_too_many_items` (an add would push a list past its
+  12-item cap), and `identity_write_conflict` (`409`, a concurrent writer won
+  after retries under lock were exhausted).
+- `POST /v1/identity/actions` dimension nudges are now capped per request:
+  same-name deltas are normalized and summed, and any dimension whose summed
+  `|delta|` exceeds 10 is rejected with `400 nudge_delta_exceeds_cap` instead
+  of being silently clamped.
+- Resident-sealed identity redistill imports
+  (`POST /v1/genesis/imports/plaintext`, `mode=update_identity`) are now
+  serialized per account: starting a redistill while one is still
+  `awaiting_resident` or `processing` for that account is rejected with
+  `409 redistill_job_active` and the in-flight job's id, instead of starting a
+  second concurrent job. Retrying the same `client_job_id` is unaffected and
+  still returns the existing job. Resident distill now merges its output into
+  the identity card's **latest** state field-by-field at write time (it
+  previously replaced the whole card from the pre-distill snapshot), so a
+  `profile_patch`/`dimension_nudge` made while a redistill is in flight is no
+  longer silently discarded. Distill prompts also now treat instruction-like
+  text found in uploaded material purely as persona content to analyze, never
+  as instructions to follow.
 - Resident maintenance reminder state now uses cross-worker PostgreSQL
   compare-and-swap instead of process-local read-modify-write persistence.
   Concurrent Chat poll, claim, and pending-work requests therefore preserve one
@@ -173,6 +206,18 @@ change must not be interpreted as an API guarantee.
 
 ### Behavior
 
+- Self-hosted resident consumers now only execute embedded agent actions whose
+  type is on an explicit allowlist, and the reply sent to the user is rewritten
+  to match what actually happened — a reply is no longer sent as if an
+  identity/memory change applied when the action payload was empty, unknown,
+  or rejected. Default mode is shadow (log-only, nothing blocked); set
+  `FEEDLING_ACTION_ALLOWLIST=enforce` to actually reject non-allowlisted action
+  types, or `off` to disable the check entirely.
+- Self-hosted resident consumers now report why the built-in auto-updater is
+  stuck — a dirty working tree, `FEEDLING_AUTO_UPDATE=0`, or a failed `git
+  fetch` — alongside their regular poll. The periodic stale-consumer reminder
+  now names the specific cause and remedy instead of a generic "update your
+  resident" notice.
 - The standard resident consumer now answers an offline backlog with one
   merged agent turn. When a processing batch contains at least
   `FEEDLING_BACKLOG_COLLAPSE_MIN` (default 3) stale plain-text user messages

@@ -46,3 +46,14 @@ Task 11: complete (io_cli identity-redistill + consumer 本机 IPC;复用 T10 se
   fingerprint 配方新增默认值;15 新测试全绿,回归 456+9 全绿)
   Minor 待终审: catalog 生成器对 mutually_exclusive_group(required) 的 usage 解析留个 `( | )`
   装饰性残影(功能不受影响,未动共享解析器)
+Task 11: complete (356323f4 + 8151874a 硬化, review clean;opus 审信任边界过;密文边界实证)
+  硬化: socket 目录 0700+属主校验、泄漏测试 fail-closed、material-text ps 提示
+Task 12: has_content 修复中(1c7c3491 + 待修)。
+  ⚠️ 待 hx 拍板(Minor,非阻塞): 蒸馏合并语义扩张到云端 update_identity/name-writeback——
+     改为 merge-onto-latest,后果=不能再靠"重新上传"清空某字段(与"缺失=不变"原则一致,
+     但属既有 replace 调用的行为改变,需 hx 明确背书)。
+Task 12: complete (1c7c3491 + 7948609e, review clean 2nd round;opus 审"没提字段永不丢"实证;Phase 4 完成)
+Task 13: complete (653cea2d + 5c270ca9, review clean;顺带堵 identity-redistill 漏进云端目录;回退文案补齐 18 verb;Phase 5 完成)
+Task 14: complete(docs-site changelog Unreleased + self-hosting 信任模型;OpenAPI 重生成核对无 diff
+  (identity/genesis 两端点契约本就是 generic schema,字段级增补不改公共 schema;redistill IPC
+  本地-only 不入 OpenAPI);types:check/lint/build 三项全绿;Phase 6 完成)
