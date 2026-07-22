@@ -152,6 +152,7 @@ if not _provisioned:
         "test_identity_rename_pairing.py",
         "test_identity_nudge_cap.py",
         "test_identity_list_ops.py",
+        "test_io_cli_identity_write_full.py",
     }
     collect_ignore = sorted(
         f

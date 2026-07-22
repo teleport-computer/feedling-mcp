@@ -562,40 +562,218 @@ def cmd_identity_read(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
-def _identity_write_payload(self_introduction, signature, agent_name=None):
-    """Build the /v1/identity/actions body for a profile_patch. Pure (testable).
+# The 9 free-text profile fields (spec 3.1). Namespace attribute name == patch
+# key == the flag's --kebab-case form (agent-name -> agent_name, etc) — kept a
+# straight 1:1 table (not hand-copied per field) so a spec addition is one new
+# tuple entry + one add_argument call, not four places to remember to touch.
+_STRING_FIELDS: tuple[str, ...] = (
+    "agent_name",
+    "self_introduction",
+    "category",
+    "user_preferred_name",
+    "agent_role",
+    "tone_style",
+    "custom_persona_prompt",
+    "language_preference",
+    "relationship_anchor",
+)
 
-    Returns None when there's nothing to write. signature is a list of short strings.
-    agent_name is the agent's OWN display name — the field the user sees as the
-    companion's name in the app. Validation (empty / runtime label like "claude")
-    is the server's job, so anything non-None is passed straight through.
+# The 4 list-shaped profile fields, each with add/remove/replace ops (spec 3.1)
+# plus one field ("signature") that also keeps its pre-existing legacy
+# whole-replace flag for back-compat. patch_* here MUST match
+# backend/identity/actions.py::_LIST_OP_FIELDS byte-for-byte — that dict is the
+# server-side source of truth this table mirrors (io_cli can't import it: it
+# lives in a DB-touching module, and io_cli must stay stdlib-only).
+#
+# Note the asymmetry: signature's own add/remove CLI flags are singular
+# (--add-signature, one phrase at a time) and so is its wire key; the other
+# three fields are already plural/compound nouns as field names, so their
+# add_/remove_ wire keys are plural (add_boundaries) even though the CLI flag
+# reads singular (--add-boundary, one item at a time) for ergonomics.
+_LIST_FIELDS: dict[str, dict[str, str | None]] = {
+    "signature": {
+        "add_dest": "add_signature", "remove_dest": "remove_signature",
+        "replace_dest": "replace_signatures",
+        "patch_add": "add_signature", "patch_remove": "remove_signature",
+        "patch_replace": "replace_signatures",
+        "legacy_dest": "signature", "legacy_key": "signature",
+    },
+    "boundaries": {
+        "add_dest": "add_boundary", "remove_dest": "remove_boundary",
+        "replace_dest": "replace_boundaries",
+        "patch_add": "add_boundaries", "patch_remove": "remove_boundaries",
+        "patch_replace": "replace_boundaries",
+        "legacy_dest": None, "legacy_key": None,
+    },
+    "do_not_say": {
+        "add_dest": "add_do_not_say", "remove_dest": "remove_do_not_say",
+        "replace_dest": "replace_do_not_say",
+        "patch_add": "add_do_not_say", "patch_remove": "remove_do_not_say",
+        "patch_replace": "replace_do_not_say",
+        "legacy_dest": None, "legacy_key": None,
+    },
+    "stable_definitions": {
+        "add_dest": "add_stable_definition", "remove_dest": "remove_stable_definition",
+        "replace_dest": "replace_stable_definitions",
+        "patch_add": "add_stable_definitions", "patch_remove": "remove_stable_definitions",
+        "patch_replace": "replace_stable_definitions",
+        "legacy_dest": None, "legacy_key": None,
+    },
+}
+
+
+class _IdentityWritePrecheckError(Exception):
+    """Raised by ``_identity_write_payload_v2`` when a LOCAL pre-check fails —
+    caught by ``cmd_identity_write`` and turned into ``_emit(obj, 2)``. ``obj``
+    is already shaped exactly like the JSON the backend would return for the
+    same rejection (same ``error`` code, same ``hint`` text where one exists),
+    so an agent sees an identical message whether the CLI front-runs the
+    server or the request actually round-trips."""
+
+    def __init__(self, obj: dict):
+        super().__init__(obj.get("error", "identity_write_precheck_failed"))
+        self.obj = obj
+
+
+def _parse_nudge_dimension(spec: str) -> tuple[str, int]:
+    """Parse one ``--nudge-dimension`` value: ``名:±整数`` (e.g. ``幽默:+5``,
+    ``耐心:-3``). Pure. Raises ValueError (message meant for a human/agent) on
+    a missing colon, empty name, or non-integer delta."""
+    text = str(spec or "")
+    if ":" not in text:
+        raise ValueError(f"{spec!r} 不是合法格式,应为 名:±整数(如 幽默:+5)")
+    name, _, delta_text = text.partition(":")
+    name = name.strip()
+    delta_text = delta_text.strip()
+    if not name:
+        raise ValueError(f"{spec!r} 缺少维度名")
+    try:
+        delta = int(delta_text)
+    except ValueError:
+        raise ValueError(f"{spec!r} 的增量不是整数") from None
+    return name, delta
+
+
+# V2 镜像:pre 分支 tool_schema.py identity_patch 参数与 capabilities/identity.py;
+# 0727 合并取本分支超集,描述文案照本 help 口径改硬。
+def _identity_write_payload_v2(ns) -> dict | None:
+    """Build the /v1/identity/actions body for identity-write's full field set
+    (spec 3.1). Pure (testable) — only reads attributes off ``ns`` (typically
+    the parsed argparse.Namespace), never touches the network.
+
+    Shape: one ``identity.profile_patch`` action (all 9 string fields + the 4
+    list fields' chosen op merged into one ``patch`` dict), followed by zero or
+    more ``identity.dimension_nudge`` actions (one per --nudge-dimension) — a
+    SINGLE request, so a rename + a nudge in the same turn land atomically from
+    the caller's point of view. Returns None when nothing was given to write.
+
+    Raises ``_IdentityWritePrecheckError`` (an obj ready for ``_emit(obj, 2)``)
+    for the three local pre-checks spec 3.1 requires front-running before the
+    server ever sees the request: D4 改名成对 (agent_name without
+    self_introduction), a list field targeted by more than one op in the same
+    call, and a malformed or over-cap --nudge-dimension entry.
     """
-    patch = {}
-    if agent_name is not None:
-        patch["agent_name"] = agent_name
-    if self_introduction is not None:
-        patch["self_introduction"] = self_introduction
-    if signature:
-        patch["signature"] = list(signature)
-    if not patch:
+    patch: dict = {}
+    for field in _STRING_FIELDS:
+        value = getattr(ns, field, None)
+        if value is not None:
+            patch[field] = value
+
+    # D4 改名成对: agent_name 变了必须同批带 self_introduction,否则显示名和自我
+    # 介绍对不上("小满" vs 介绍里还叫"小美")。报错文案与服务端
+    # card_policy.validate_rename_pairing 的 hint 一字不差,前端拦下和服务端拦下
+    # 看起来是同一件事。
+    if patch.get("agent_name") and not patch.get("self_introduction"):
+        raise _IdentityWritePrecheckError({
+            "ok": False, "error": "rename_requires_self_introduction",
+            "hint": "介绍无需变化时读旧卡原样带回 --self-introduction",
+        })
+
+    for field, meta in _LIST_FIELDS.items():
+        add_vals = list(getattr(ns, meta["add_dest"], None) or [])
+        remove_vals = list(getattr(ns, meta["remove_dest"], None) or [])
+        replace_vals = list(getattr(ns, meta["replace_dest"], None) or [])
+        legacy_dest = meta["legacy_dest"]
+        legacy_vals = list(getattr(ns, legacy_dest, None) or []) if legacy_dest else []
+
+        if sum(bool(v) for v in (legacy_vals, add_vals, remove_vals, replace_vals)) > 1:
+            raise _IdentityWritePrecheckError({
+                "ok": False, "error": "list_op_conflict", "field": field,
+                "hint": "同一次调用里,同一个 list 字段只能用一种操作"
+                        "(legacy 整体赋值 / add / remove / replace 四选一)",
+            })
+        if legacy_vals:
+            patch[meta["legacy_key"]] = legacy_vals
+        elif add_vals:
+            patch[meta["patch_add"]] = add_vals
+        elif remove_vals:
+            patch[meta["patch_remove"]] = remove_vals
+        elif replace_vals:
+            patch[meta["patch_replace"]] = replace_vals
+
+    actions: list = []
+    if patch:
+        actions.append({"type": "identity.profile_patch", "patch": patch})
+
+    # 七维只微调: 单条 |delta|<=10,同一次调用里同一维度(strip+lower 归一后)的
+    # delta 求和也<=10 —— 口径对齐服务端 card_policy.validate_dimension_nudge /
+    # validate_nudge_sum(后者是同请求批量闸,这里只是本地前置,服务端仍是最终权威)。
+    nudge_sums: dict[str, int] = {}
+    for spec in list(getattr(ns, "nudge_dimension", None) or []):
+        try:
+            name, delta = _parse_nudge_dimension(spec)
+        except ValueError as exc:
+            raise _IdentityWritePrecheckError({
+                "ok": False, "error": "nudge_dimension_format_invalid",
+                "hint": "格式为 名:±整数,例如 幽默:+5", "detail": str(exc),
+            }) from None
+        if abs(delta) > 10:
+            raise _IdentityWritePrecheckError({
+                "ok": False, "error": "nudge_delta_exceeds_cap",
+                "dimension": name, "delta": delta,
+                "hint": "单条 --nudge-dimension 的 |delta| 不能超过 10",
+            })
+        normalized = name.strip().lower()
+        nudge_sums[normalized] = nudge_sums.get(normalized, 0) + delta
+        if abs(nudge_sums[normalized]) > 10:
+            raise _IdentityWritePrecheckError({
+                "ok": False, "error": "nudge_delta_exceeds_cap",
+                "dimension": name, "delta": nudge_sums[normalized],
+                "hint": "同一次调用里,同一维度的 delta 求和不能超过 10",
+            })
+        actions.append({"type": "identity.dimension_nudge", "dimension": name, "delta": delta})
+
+    if not actions:
         return None
-    return {"action": {"type": "identity.profile_patch", "patch": patch}}
+    return {"actions": actions}
 
 
 def cmd_identity_write(args):
-    """Patch the agent's display identity card (agent_name / self_introduction / signature).
+    """Patch the agent's identity card — full field set (spec 3.1): 9 string
+    fields, 4 list fields (each add/remove/replace, plus --signature's legacy
+    whole-replace), and up to 10 --nudge-dimension micro-adjustments.
 
-    POST /v1/identity/actions (identity.profile_patch). The server decrypts the
-    existing card, merges, and re-encrypts (no client crypto). Used by post-respawn
-    7.D so the agent (now itself) writes its own intro + signature in-voice, and by
-    any turn where the user renames it ("以后叫你老6") — without --agent-name the
-    rename can only land in the self_introduction text while the displayed name
-    stays stale, which reads to the user as "it said yes and did nothing".
+    POST /v1/identity/actions (identity.profile_patch [+ identity.dimension_nudge
+    per --nudge-dimension], ONE request — see ``_identity_write_payload_v2``).
+    The server decrypts the existing card, merges, and re-encrypts (no client
+    crypto). Used by post-respawn 7.D so the agent (now itself) writes its own
+    intro + signature in-voice, and by any turn where the user renames it
+    ("以后叫你老6") — without --agent-name the rename can only land in the
+    self_introduction text while the displayed name stays stale, which reads to
+    the user as "it said yes and did nothing".
+
+    Local pre-checks (rename pairing / list-op conflict / nudge format+cap) run
+    BEFORE any network call, so a malformed call fails fast with the same error
+    the server would give instead of wasting a round-trip.
     """
-    api_url, auth = _require_backend()
-    payload = _identity_write_payload(args.self_introduction, args.signature, args.agent_name)
+    try:
+        payload = _identity_write_payload_v2(args)
+    except _IdentityWritePrecheckError as exc:
+        _emit(exc.obj, 2)
     if payload is None:
-        _emit({"ok": False, "error": "nothing_to_write: need --agent-name, --self-introduction and/or --signature"}, 2)
+        _emit({"ok": False, "error": "nothing_to_write: need at least one field, "
+                                      "list op, or --nudge-dimension"}, 2)
+    api_url, auth = _require_backend()
     status, body = _http_json("POST", f"{api_url}/v1/identity/actions", auth, payload=payload)
     if status == 200:
         _emit({"ok": True, **body})
@@ -1005,13 +1183,78 @@ def main():
                         help="Read the CURRENT identity card (decrypted) — call before rewriting so you build on it (部分补全).")
     ir.set_defaults(func=cmd_identity_read)
 
-    iw = sub.add_parser("identity-write",
-                        help="Patch the agent's identity card (agent_name / self_introduction / signature).")
+    iw = sub.add_parser(
+        "identity-write",
+        help="Patch the agent's identity card — 9 string fields + 4 list fields "
+             "(add/remove/replace) + 七维 nudge (spec 3.1).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "写卡规则(spec 3.1,详见 io_cli identity-read 拿到的卡结构):\n"
+            "  D3 来源规则: 日常一律用这条命令做局部 patch;整卡覆盖(identity.replace)\n"
+            "    只留给蒸馏任务专用通道,这条命令不提供整卡覆盖。\n"
+            "  D4 改名成对: --agent-name 必须和 --self-introduction 同批给出(介绍不用\n"
+            "    变就原样带回旧的),否则本地直接报错拦下,不会打到服务端。\n"
+            "  list 三操作: 每个 list 字段(signature/boundary/do-not-say/\n"
+            "    stable-definition)一次调用只能用一种操作——legacy 整体赋值(仅\n"
+            "    --signature 保留)/ --add-* / --remove-* / --replace-* 四选一,混用报错。\n"
+            "  七维只微调: --nudge-dimension 名:±整数,单条、以及同一次调用里同一维度的\n"
+            "    delta 求和,都不能超过 ±10;想大改用 identity-init 的 --dimensions 整卡给。\n"
+        ),
+    )
     iw.add_argument("--agent-name", dest="agent_name", default=None,
-                    help="your OWN display name — set it when the user renames you (以后叫你老6)")
-    iw.add_argument("--self-introduction", dest="self_introduction", default=None)
+                    help="your OWN display name — set it when the user renames you "
+                         "(以后叫你老6);必须与 --self-introduction 同批给出")
+    iw.add_argument("--self-introduction", dest="self_introduction", default=None,
+                    help="agent 的自我介绍原文;改名时必带(可原样带回旧值)")
+    iw.add_argument("--category", dest="category", default=None,
+                    help="人设分类标签(如 助理/伙伴/导师)")
+    iw.add_argument("--user-preferred-name", dest="user_preferred_name", default=None,
+                    help="agent 对用户的称呼(用户偏好的叫法)")
+    iw.add_argument("--agent-role", dest="agent_role", default=None,
+                    help="agent 的角色定位(如 私人助理/学习搭子)")
+    iw.add_argument("--tone-style", dest="tone_style", default=None,
+                    help="系统蒸馏出的语气/风格描述")
+    iw.add_argument("--custom-persona-prompt", dest="custom_persona_prompt", default=None,
+                    help="用户手写的人设覆盖指令,优先级高于 --tone-style")
+    iw.add_argument("--language-preference", dest="language_preference", default=None,
+                    help="回复使用的语言偏好")
+    iw.add_argument("--relationship-anchor", dest="relationship_anchor", default=None,
+                    help="关系锚点描述文本")
+
     iw.add_argument("--signature", action="append", default=[],
-                    help="repeatable short string(s) for the signature")
+                    help="[legacy] 整体替换签名短语列表;repeatable;"
+                         "与 --add/remove/replace-signature* 四选一")
+    iw.add_argument("--add-signature", dest="add_signature", action="append", default=[],
+                    help="追加一条签名短语;repeatable")
+    iw.add_argument("--remove-signature", dest="remove_signature", action="append", default=[],
+                    help="移除一条签名短语;repeatable")
+    iw.add_argument("--replace-signatures", dest="replace_signatures", action="append", default=[],
+                    help="整体替换签名短语列表;repeatable")
+
+    iw.add_argument("--add-boundary", dest="add_boundary", action="append", default=[],
+                    help="追加一条边界;repeatable")
+    iw.add_argument("--remove-boundary", dest="remove_boundary", action="append", default=[],
+                    help="移除一条边界;repeatable")
+    iw.add_argument("--replace-boundaries", dest="replace_boundaries", action="append", default=[],
+                    help="整体替换边界列表;repeatable")
+
+    iw.add_argument("--add-do-not-say", dest="add_do_not_say", action="append", default=[],
+                    help="追加一条'不要说'规则;repeatable")
+    iw.add_argument("--remove-do-not-say", dest="remove_do_not_say", action="append", default=[],
+                    help="移除一条'不要说'规则;repeatable")
+    iw.add_argument("--replace-do-not-say", dest="replace_do_not_say", action="append", default=[],
+                    help="整体替换'不要说'规则列表;repeatable")
+
+    iw.add_argument("--add-stable-definition", dest="add_stable_definition", action="append", default=[],
+                    help="追加一条稳定定义(如'老板=张三');repeatable")
+    iw.add_argument("--remove-stable-definition", dest="remove_stable_definition", action="append", default=[],
+                    help="移除一条稳定定义;repeatable")
+    iw.add_argument("--replace-stable-definitions", dest="replace_stable_definitions", action="append", default=[],
+                    help="整体替换稳定定义列表;repeatable")
+
+    iw.add_argument("--nudge-dimension", dest="nudge_dimension", action="append", default=[],
+                    help="七维微调,格式 名:±整数(如 幽默:+5);repeatable;"
+                         "单条及同维度求和 |delta|<=10,一次最多 10 条")
     iw.set_defaults(func=cmd_identity_write)
 
     ii = sub.add_parser("identity-init", help="Create the identity card (sanitizes + fresh-start).")
