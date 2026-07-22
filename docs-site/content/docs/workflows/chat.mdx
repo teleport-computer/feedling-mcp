@@ -359,6 +359,16 @@ Maintenance Chat turns use a global reminder interval (24 hours by default).
 Changing heartbeat timestamps, decrypt check timestamps, or the backend's
 expected commit does not bypass that interval. A changed expected commit starts
 the mismatch grace timer again, while the reminder interval remains in force.
+The reminder gate is persisted with PostgreSQL compare-and-swap across backend
+workers: a conflicting poll reloads current state and recomputes the decision
+instead of overwriting another worker's reminder timestamp. The generated
+maintenance message ID is also appended through the cross-worker idempotency
+path, so repeated attempts for the same user, interval bucket, and prompt keep
+one Chat row, preserve any existing claim/reply metadata, and let only the
+insert winner wake consumers. These two guards are independent: stale state
+cannot turn one logical maintenance prompt into a rapid injection loop, and
+switching between maintenance reasons does not reset the global reminder
+interval.
 The resident-job fallback scan is throttled by
 `FEEDLING_RESIDENT_FALLBACK_CHECK_SEC` (default 300 seconds).
 

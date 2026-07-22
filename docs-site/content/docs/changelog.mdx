@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- Resident maintenance reminder state now uses cross-worker PostgreSQL
+  compare-and-swap instead of process-local read-modify-write persistence.
+  Concurrent Chat poll, claim, and pending-work requests therefore preserve one
+  another's heartbeat, decrypt-health, and reminder fields. Maintenance Chat
+  appends also use the existing atomic `client_msg_id` idempotency path: repeated
+  attempts for the same user, reminder bucket, and prompt retain one row and
+  preserve its claim/reply metadata, while only the insert winner wakes
+  consumers. Reason changes remain subject to the same global reminder interval.
 - Official self-hosted resident polls can now include
   `X-Feedling-Consumer-Compat-Commit` when the updater intentionally keeps an
   older running image because the advertised release changes no resident-loaded

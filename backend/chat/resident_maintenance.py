@@ -423,7 +423,11 @@ def _notice_text(reason: Mapping[str, Any]) -> str:
 
 
 def _message_id(store, prompt: str, *, now: float) -> str:
-    interval = _env_int("FEEDLING_RESIDENT_MAINTENANCE_REMINDER_SEC", _REMINDER_DEFAULT_SEC, lo=3600)
+    interval = _env_int(
+        "FEEDLING_RESIDENT_MAINTENANCE_REMINDER_SEC",
+        _REMINDER_DEFAULT_SEC,
+        lo=3600,
+    )
     bucket = int(now // interval)
     digest = hashlib.sha256(f"{store.user_id}:{bucket}:{prompt}".encode("utf-8")).hexdigest()[:24]
     return f"resident_maintenance_{digest}"
@@ -437,13 +441,21 @@ def _append_maintenance_message(store, *, prompt: str, msg_id: str) -> dict[str,
     )
     if envelope is None:
         raise RuntimeError(err or "envelope_build_failed")
-    msg = store.append_chat(
+    interval = _env_int(
+        "FEEDLING_RESIDENT_MAINTENANCE_REMINDER_SEC",
+        _REMINDER_DEFAULT_SEC,
+        lo=3600,
+    )
+    msg, inserted = store.append_chat_idempotent(
         "user",
         SOURCE,
         envelope,
+        client_msg_id=msg_id,
+        window_sec=interval + 60,
         extra={"client_msg_id": msg_id, "content": prompt},
     )
-    store.notify_chat_waiters()
+    if inserted:
+        store.notify_chat_waiters()
     return msg
 
 
@@ -528,10 +540,16 @@ def _maybe_handle_poll(
     notice_only_reason: dict[str, Any] | None = None
     should_emit_notice_only = False
     reason: dict[str, Any] | None = None
-    interval = _env_int("FEEDLING_RESIDENT_MAINTENANCE_REMINDER_SEC", _REMINDER_DEFAULT_SEC, lo=3600)
+    interval = _env_int(
+        "FEEDLING_RESIDENT_MAINTENANCE_REMINDER_SEC",
+        _REMINDER_DEFAULT_SEC,
+        lo=3600,
+    )
 
-    with store.consumer_state_lock:
-        state = chat_consumer._load_consumer_state(store)
+    def classify_state(state: dict) -> dict[str, Any]:
+        state_fallback_due = False
+        state_fallback_skipped = False
+        state_should_emit_notice_only = False
         maintenance = _maintenance_state(state.get("resident_maintenance"))
         health = chat_consumer._decrypt_health_from_state(state, now_epoch=now)
         decrypt_policy = chat_consumer._decrypt_health_enforcement_state(
@@ -558,53 +576,98 @@ def _maybe_handle_poll(
             now=now,
         )
         if commit_reason is None:
-            fallback_due = _fallback_check_due(maintenance, now=now)
-            fallback_skipped = not fallback_due
+            state_fallback_due = _fallback_check_due(maintenance, now=now)
+            state_fallback_skipped = not state_fallback_due
         if notice_only_reason is not None:
-            should_emit_notice_only = _notice_due(
+            state_should_emit_notice_only = _notice_due(
                 maintenance,
                 reason=notice_only_reason,
                 now=now,
                 interval=interval,
             )
         state["resident_maintenance"] = maintenance
-        chat_consumer._save_consumer_state(store, state)
+        return {
+            "decrypt_reason": decrypt_reason,
+            "notice_only_reason": notice_only_reason,
+            "decrypt_resolved": decrypt_resolved,
+            "decrypt_unknown_resolved": decrypt_unknown_resolved,
+            "commit_reason": commit_reason,
+            "commit_resolved": commit_resolved,
+            "fallback_due": state_fallback_due,
+            "fallback_skipped": state_fallback_skipped,
+            "should_emit_notice_only": state_should_emit_notice_only,
+        }
+
+    classified = chat_consumer._mutate_consumer_state(store, classify_state)
+    if classified is None:
+        return {"triggered": False, "reason": "state_update_conflict"}
+    classification = classified[1]
+    decrypt_reason = classification["decrypt_reason"]
+    notice_only_reason = classification["notice_only_reason"]
+    decrypt_resolved = classification["decrypt_resolved"]
+    decrypt_unknown_resolved = classification["decrypt_unknown_resolved"]
+    commit_reason = classification["commit_reason"]
+    commit_resolved = classification["commit_resolved"]
+    fallback_due = classification["fallback_due"]
+    fallback_skipped = classification["fallback_skipped"]
+    should_emit_notice_only = classification["should_emit_notice_only"]
 
     if commit_reason is None and fallback_due:
         fallback = _fallback_reason(store)
         if fallback is None:
-            with store.consumer_state_lock:
-                state = chat_consumer._load_consumer_state(store)
+
+            def clear_fallback(state: dict) -> bool:
                 maintenance = _maintenance_state(state.get("resident_maintenance"))
+                cleared = False
                 if _active_reason_name(maintenance) == _FALLBACK_REASON:
                     maintenance.pop("active_reason", None)
-                    resolved = True
+                    cleared = True
                 state["resident_maintenance"] = maintenance
-                chat_consumer._save_consumer_state(store, state)
+                return cleared
+
+            fallback_cleared = chat_consumer._mutate_consumer_state(
+                store, clear_fallback
+            )
+            if fallback_cleared is None:
+                return {"triggered": False, "reason": "state_update_conflict"}
+            resolved = fallback_cleared[1]
 
     reason = decrypt_reason or commit_reason or fallback
     resolved = resolved or commit_resolved
 
-    with store.consumer_state_lock:
-        state = chat_consumer._load_consumer_state(store)
-        maintenance = _maintenance_state(state.get("resident_maintenance"))
-        if reason is None:
-            state["resident_maintenance"] = maintenance
-            chat_consumer._save_consumer_state(store, state)
-        else:
+    if reason is not None:
+
+        def select_reminder(state: dict) -> dict[str, Any]:
+            maintenance = _maintenance_state(state.get("resident_maintenance"))
             reason_key = _reason_key(reason)
             maintenance["active_reason"] = reason_key
             maintenance["last_reason"] = reason
             last = _safe_float(maintenance.get("last_reminder_epoch"), 0.0)
-            should_remind = last <= 0 or now - last >= interval
-            if should_remind:
-                prompt = _prompt_for(reason, info_map)
-                msg_id = _message_id(store, prompt, now=now)
+            due = last <= 0 or now - last >= interval
+            selected_prompt = ""
+            selected_msg_id = ""
+            if due:
+                selected_prompt = _prompt_for(reason, info_map)
+                selected_msg_id = _message_id(store, selected_prompt, now=now)
                 maintenance["last_reminder_epoch"] = now
                 maintenance["last_reason_key"] = reason_key
-                maintenance["last_prompt_message_id"] = msg_id
+                maintenance["last_prompt_message_id"] = selected_msg_id
             state["resident_maintenance"] = maintenance
-            chat_consumer._save_consumer_state(store, state)
+            return {
+                "should_remind": due,
+                "prompt": selected_prompt,
+                "msg_id": selected_msg_id,
+            }
+
+        reminder_selected = chat_consumer._mutate_consumer_state(
+            store, select_reminder
+        )
+        if reminder_selected is None:
+            return {"triggered": False, "reason": "state_update_conflict"}
+        reminder = reminder_selected[1]
+        should_remind = reminder["should_remind"]
+        prompt = reminder["prompt"]
+        msg_id = reminder["msg_id"]
 
     if decrypt_resolved:
         notices_core.resolve(store, DECRYPT_DEDUPE_KEY)
@@ -646,13 +709,13 @@ def _maybe_handle_poll(
         error = f"{type(exc).__name__}:{str(exc)[:180]}"
     _emit_notice(store, reason=reason, prompt=prompt, delivered=delivered)
 
-    with store.consumer_state_lock:
-        state = chat_consumer._load_consumer_state(store)
+    def record_delivery(state: dict) -> None:
         maintenance = _maintenance_state(state.get("resident_maintenance"))
         maintenance["last_prompt_delivered"] = bool(delivered)
         maintenance["last_prompt_error"] = error
         state["resident_maintenance"] = maintenance
-        chat_consumer._save_consumer_state(store, state)
+
+    chat_consumer._mutate_consumer_state(store, record_delivery)
 
     return {
         "triggered": True,

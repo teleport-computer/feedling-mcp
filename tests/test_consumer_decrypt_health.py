@@ -111,14 +111,15 @@ def test_poll_records_unknown_since_and_clears_it_after_valid_report(monkeypatch
     state: dict = {}
     saved: list[dict] = []
     monkeypatch.setattr(consumer.time, "time", lambda: 1_000.0)
-    monkeypatch.setattr(consumer, "_load_consumer_state", lambda _store: dict(state))
-
-    def _save(_store, value):
+    def _mutate(_store, mutate):
+        value = dict(state)
+        result = mutate(value)
         state.clear()
         state.update(value)
         saved.append(dict(value))
+        return value, result
 
-    monkeypatch.setattr(consumer, "_save_consumer_state", _save)
+    monkeypatch.setattr(consumer, "_mutate_consumer_state", _mutate)
     monkeypatch.setattr(consumer, "_touch_resident_binding_seen", lambda *a, **k: True)
 
     consumer._record_consumer_event(
@@ -154,13 +155,14 @@ def test_response_event_preserves_latest_poll_health_and_compat_commit(monkeypat
         "decrypt_checked_at_epoch": "995",
     }
     monkeypatch.setattr(consumer.time, "time", lambda: 1_000.0)
-    monkeypatch.setattr(consumer, "_load_consumer_state", lambda _store: dict(state))
-
-    def _save(_store, value):
+    def _mutate(_store, mutate):
+        value = dict(state)
+        result = mutate(value)
         state.clear()
         state.update(value)
+        return value, result
 
-    monkeypatch.setattr(consumer, "_save_consumer_state", _save)
+    monkeypatch.setattr(consumer, "_mutate_consumer_state", _mutate)
 
     consumer._record_consumer_event(
         store,

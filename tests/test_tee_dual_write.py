@@ -136,8 +136,8 @@ def test_consumer_state_blob_is_not_mirrored(backend_env, monkeypatch):
     """``consumer_state`` MUST NOT dual-write to TEE.
 
     It is the single hottest write in the system: EVERY /v1/chat/poll records a
-    consumer event (chat/consumer._record_consumer_event → _save_consumer_state →
-    set_blob), so N long-polling consumers drive N writes per poll cycle. The TEE
+    consumer event (chat/consumer._record_consumer_event → PostgreSQL CAS), so N
+    long-polling consumers drive N writes per poll cycle. The TEE
     pool is max_size=4 over a direct-TLS gateway link, so mirroring it saturated
     the pool and every主 write then blocked for the full pool timeout before the
     mirror fail-open swallowed the error — observed live on test 2026-07-13:
@@ -156,6 +156,12 @@ def test_consumer_state_blob_is_not_mirrored(backend_env, monkeypatch):
     monkeypatch.setattr(mirror, "execute", lambda sql, params=(): mirrored.append(sql))
 
     db.set_blob("usr_cs1", "consumer_state", {"last_poll": 1.0})
+    assert db.set_blob_if_unchanged(
+        "usr_cs1",
+        "consumer_state",
+        {"last_poll": 1.0},
+        {"last_poll": 2.0},
+    ) is True
     assert mirrored == [], "consumer_state must never reach the TEE mirror"
 
     # a normal blob kind still mirrors (no over-broad exclusion)

@@ -630,6 +630,125 @@ def test_resident_maintenance_reminder_is_rate_limited(backend_env, monkeypatch)
     assert notices[0]["occurrences"] == 1
 
 
+def test_maintenance_append_is_idempotent_in_bucket_and_allows_next_bucket(
+    backend_env,
+    monkeypatch,
+):
+    client = make_client()
+    user_id, _api_key = _register(client)
+    captured: dict = {}
+    _fake_shared_envelope(monkeypatch, captured)
+    store = core_store.get_store(user_id)
+    notifications: list[str] = []
+    monkeypatch.setattr(
+        store,
+        "notify_chat_waiters",
+        lambda: notifications.append("wake"),
+    )
+    prompt = "stable maintenance prompt"
+    interval = 24 * 60 * 60
+    first_now = 8_000_000.0
+    first_id = resident_maintenance._message_id(store, prompt, now=first_now)
+
+    first = resident_maintenance._append_maintenance_message(
+        store,
+        prompt=prompt,
+        msg_id=first_id,
+    )
+    db.chat_update_metadata(
+        user_id,
+        first_id,
+        {"reply_status": "replied", "reply_message_id": "maintenance-reply-1"},
+    )
+    duplicate = resident_maintenance._append_maintenance_message(
+        store,
+        prompt=prompt,
+        msg_id=first_id,
+    )
+
+    assert duplicate["id"] == first["id"] == first_id
+    assert duplicate["reply_status"] == "replied"
+    assert duplicate["reply_message_id"] == "maintenance-reply-1"
+    rows = [
+        row
+        for row in db.chat_load(user_id)
+        if row.get("source") == resident_maintenance.SOURCE
+    ]
+    assert [row["id"] for row in rows] == [first_id]
+    assert rows[0]["reply_status"] == "replied"
+    assert notifications == ["wake"], "only the atomic insert winner may notify"
+
+    next_id = resident_maintenance._message_id(
+        store,
+        prompt,
+        now=first_now + interval + 1,
+    )
+    assert next_id != first_id
+    resident_maintenance._append_maintenance_message(
+        store,
+        prompt=prompt,
+        msg_id=next_id,
+    )
+    rows = [
+        row
+        for row in db.chat_load(user_id)
+        if row.get("source") == resident_maintenance.SOURCE
+    ]
+    assert {row["id"] for row in rows} == {first_id, next_id}
+    assert notifications == ["wake", "wake"]
+
+
+def test_reason_flip_does_not_bypass_global_reminder_interval(backend_env, monkeypatch):
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "abcdef1234567890")
+    now = {"t": 8_500_000.0}
+    monkeypatch.setattr(resident_maintenance, "_now", lambda: now["t"])
+    captured: dict = {}
+    _fake_shared_envelope(monkeypatch, captured)
+    client = make_client()
+    user_id, api_key = _register(client)
+    db.set_blob(
+        user_id,
+        "consumer_state",
+        {
+            "decrypt_status": "ok",
+            "decrypt_checked_at_epoch": str(now["t"]),
+            "resident_maintenance": {
+                "missing_commit_since_epoch": now["t"] - 3600,
+            },
+        },
+    )
+
+    first = client.get("/v1/chat/poll?timeout=0", headers=_headers(api_key))
+    assert first.status_code == 200
+    assert len(
+        [
+            row
+            for row in db.chat_load(user_id)
+            if row.get("source") == resident_maintenance.SOURCE
+        ]
+    ) == 1
+
+    now["t"] += 60
+    second = client.get(
+        "/v1/chat/poll?timeout=0",
+        headers=_headers(
+            api_key,
+            commit="abcdef1234567890",
+            decrypt_status="unconfigured",
+        ),
+    )
+    assert second.status_code == 200
+    rows = [
+        row
+        for row in db.chat_load(user_id)
+        if row.get("source") == resident_maintenance.SOURCE
+    ]
+    assert len(rows) == 1
+    state = db.get_blob(user_id, "consumer_state")["resident_maintenance"]
+    assert state["active_reason"].startswith("decrypt_source_unavailable")
+    assert state["last_reminder_epoch"] == now["t"] - 60
+
+
 def test_resident_maintenance_reply_source_is_accepted_before_live_chat_gate(backend_env, monkeypatch):
     monkeypatch.setenv("FEEDLING_GIT_COMMIT", "abcdef1234567890")
     now = {"t": 6_000_000.0}

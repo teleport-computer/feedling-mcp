@@ -147,6 +147,26 @@ def test_set_blob_if_unchanged_cas():
     assert db.get_blob(uid, "never") is None
 
 
+def test_set_blob_if_unchanged_can_atomically_create_empty_initial_state():
+    uid = _uid()
+    seed_user(uid)
+    assert db.set_blob_if_unchanged(
+        uid,
+        "consumer_state",
+        {},
+        {"writer_a": True},
+        insert_if_missing=True,
+    ) is True
+    assert db.set_blob_if_unchanged(
+        uid,
+        "consumer_state",
+        {},
+        {"writer_b": True},
+        insert_if_missing=True,
+    ) is False
+    assert db.get_blob(uid, "consumer_state") == {"writer_a": True}
+
+
 def test_get_blobs_for_users_batches_and_omits_missing_rows():
     uid_a = _uid()
     uid_b = _uid()
