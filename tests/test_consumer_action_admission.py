@@ -197,8 +197,9 @@ def test_rewrite_reply_all_failed_english_variant():
     assert result == [crc._ACTION_OUTCOME_ALL_FAILED_EN]
 
 
-def test_rewrite_reply_mixed_appends_note_naming_unexecuted_item():
-    """Group ②: allowed+unknown 混合 → 附加句点名未执行项, 原回复保留."""
+def test_rewrite_reply_mixed_appends_generic_note_without_leaking_type_name():
+    """Group ②: allowed+unknown 混合 → 附加句点名未执行项(计数, 不泄漏原始
+    action type — minor #5), 原回复保留."""
     outcomes = [
         {"original_type": "memory.add", "canonical_type": "memory.add",
          "outcome": "applied", "error_code": ""},
@@ -208,7 +209,8 @@ def test_rewrite_reply_mixed_appends_note_naming_unexecuted_item():
     result = crc.rewrite_reply_for_outcomes(["记好了。"], outcomes, fallback_ok="记好了。")
     assert result[0] == "记好了。"
     assert len(result) == 2
-    assert "memory.frobnicate" in result[1]
+    assert result[1] == crc._ACTION_OUTCOME_MIXED_NOTE_ONE_ZH
+    assert "memory.frobnicate" not in result[1]
 
 
 def test_rewrite_reply_mixed_with_empty_replies_uses_fallback_plus_note():
@@ -220,7 +222,55 @@ def test_rewrite_reply_mixed_with_empty_replies_uses_fallback_plus_note():
     ]
     result = crc.rewrite_reply_for_outcomes([], outcomes, fallback_ok="改好了。")
     assert result[0] == "改好了。"
-    assert "identity.replace" in result[1]
+    assert result[1] == crc._ACTION_OUTCOME_MIXED_NOTE_ONE_ZH
+    assert "identity.replace" not in result[1]
+
+
+def test_rewrite_reply_mixed_multiple_unexecuted_uses_count():
+    outcomes = [
+        {"original_type": "memory.add", "canonical_type": "memory.add",
+         "outcome": "applied", "error_code": ""},
+        {"original_type": "memory.frobnicate", "canonical_type": "memory.frobnicate",
+         "outcome": "rejected_allowlist", "error_code": ""},
+        {"original_type": "memory.upgrade", "canonical_type": "memory.upgrade",
+         "outcome": "noop", "error_code": ""},
+    ]
+    result = crc.rewrite_reply_for_outcomes(["记好了。"], outcomes, fallback_ok="记好了。")
+    assert result[1] == crc._ACTION_OUTCOME_MIXED_NOTE_MANY_ZH.format(n=2)
+
+
+# ---------------------------------------------------------------------------
+# rewrite_reply_for_outcomes — I2: noop must not read like a failure
+# ---------------------------------------------------------------------------
+
+def test_rewrite_reply_all_noop_empty_replies_uses_distinct_noop_copy():
+    outcomes = [{"original_type": "identity.dimension_nudge", "canonical_type": "identity.dimension_nudge",
+                 "outcome": "noop", "error_code": ""}]
+    result = crc.rewrite_reply_for_outcomes([], outcomes, fallback_ok="改好了。")
+    assert result == [crc._ACTION_OUTCOME_ALL_NOOP_ZH]
+    assert result != [crc._ACTION_OUTCOME_ALL_FAILED_ZH]
+
+
+def test_rewrite_reply_all_noop_nonempty_replies_appends_note_keeps_reply():
+    outcomes = [{"original_type": "identity.dimension_nudge", "canonical_type": "identity.dimension_nudge",
+                 "outcome": "noop", "error_code": ""}]
+    result = crc.rewrite_reply_for_outcomes(["嗯。"], outcomes, fallback_ok="嗯。")
+    assert result[0] == "嗯。", "model's original reply must be kept, not replaced"
+    assert result[1] == crc._ACTION_OUTCOME_NOOP_NOTE_ZH
+
+
+def test_rewrite_reply_zero_applied_mix_of_noop_and_bad_is_reported_as_failure():
+    """A batch with any genuine rejected/failed outcome is reported as a
+    failure even if other items in the same batch were merely noop — a real
+    failure must never be shrugged off as 'just a noop'."""
+    outcomes = [
+        {"original_type": "identity.dimension_nudge", "canonical_type": "identity.dimension_nudge",
+         "outcome": "noop", "error_code": ""},
+        {"original_type": "memory.add", "canonical_type": "memory.add",
+         "outcome": "failed_execution", "error_code": "RuntimeError"},
+    ]
+    result = crc.rewrite_reply_for_outcomes([], outcomes, fallback_ok="改好了。")
+    assert result == [crc._ACTION_OUTCOME_ALL_FAILED_ZH]
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +383,8 @@ def test_execute_agent_actions_mixed_allowed_and_unknown_in_enforce_mode(monkeyp
 
     replies = crc.rewrite_reply_for_outcomes(["记好了。"], result["outcomes"], fallback_ok="记好了。")
     assert replies[0] == "记好了。"
-    assert "memory.frobnicate" in replies[1]
+    assert replies[1] == crc._ACTION_OUTCOME_MIXED_NOTE_ONE_ZH
+    assert "memory.frobnicate" not in replies[1], "minor #5: never leak the raw action type to the user"
 
 
 # ---------------------------------------------------------------------------
@@ -389,13 +440,16 @@ def test_execute_agent_actions_noop_result_is_not_reported_as_applied(monkeypatc
     result = crc.execute_agent_actions([{"type": "memory.upgrade", "memory_id": "missing"}])
 
     assert result["outcomes"][0]["outcome"] == "noop"
+    # I2: a noop is not a failure — distinct copy, not the failure sentence.
     replies = crc.rewrite_reply_for_outcomes([], result["outcomes"], fallback_ok="改好了。")
-    assert replies == [crc._ACTION_OUTCOME_ALL_FAILED_ZH]
+    assert replies == [crc._ACTION_OUTCOME_ALL_NOOP_ZH]
 
 
-def test_execute_agent_actions_identity_failure_does_not_block_memory_bucket(monkeypatch):
-    """Buckets are tried independently: an identity HTTP failure must not
-    prevent the memory bucket's HTTP call in the same batch."""
+def test_execute_agent_actions_identity_failure_blocks_memory_bucket_c1(monkeypatch):
+    """C1: restored sequential-with-early-abort — pre-Task-7 wire semantics
+    NEVER sent the memory HTTP call once the identity call raised. Shadow
+    mode's byte-identical-wire guarantee (content/order/COUNT of requests)
+    must hold on the failure path too, not just the happy path."""
     calls = []
     monkeypatch.setattr(
         crc._HTTP, "post",
@@ -412,16 +466,56 @@ def test_execute_agent_actions_identity_failure_does_not_block_memory_bucket(mon
     ])
 
     urls = [c[0] for c in calls]
-    assert any("/v1/identity/actions" in u for u in urls)
-    assert any("/v1/memory/actions" in u for u in urls), "memory bucket must still be attempted"
-    outcomes = {o["original_type"]: o["outcome"] for o in result["outcomes"]}
-    assert outcomes["identity.profile_patch"] == "failed_execution"
-    assert outcomes["memory.add"] == "applied"
+    assert urls == [f"{crc.FEEDLING_API_URL}/v1/identity/actions"], (
+        "memory bucket's HTTP call must NEVER happen once identity raised — "
+        "exactly one request on the wire, matching pre-Task-7 byte-for-byte"
+    )
+    outcomes = {o["original_type"]: o for o in result["outcomes"]}
+    assert outcomes["identity.profile_patch"]["outcome"] == "failed_execution"
+    assert outcomes["memory.add"]["outcome"] == "failed_execution"
+    assert outcomes["memory.add"]["error_code"] == "not_attempted", (
+        "the never-sent memory action must be reported as not_attempted, never applied"
+    )
 
 
 def test_execute_agent_actions_still_raises_for_garbage_prefix():
     with pytest.raises(RuntimeError, match="unsupported_agent_actions"):
         crc.execute_agent_actions([{"type": "proactive.sleep"}])
+
+
+# ---------------------------------------------------------------------------
+# I3: a missing per-item result (server truncates a batch, e.g. at 20 items)
+# must NEVER be read as "applied".
+# ---------------------------------------------------------------------------
+
+def test_execute_agent_actions_missing_result_for_tail_action_is_not_applied(monkeypatch):
+    n = 5
+    actions = [
+        {"type": "memory.add", "memory": {"summary": f"item {i}"}}
+        for i in range(n)
+    ]
+    # Server returns only n-1 results — the last submitted action was
+    # truncated / never actually reported on.
+    monkeypatch.setattr(
+        crc._HTTP, "post",
+        _http_router(memory=_Resp(200, {
+            "status": "ok",
+            "results": [{"status": "ok", "action": "memory.add"} for _ in range(n - 1)],
+            "effects": [],
+        })),
+    )
+
+    result = crc.execute_agent_actions(actions)
+
+    assert len(result["outcomes"]) == n
+    assert [o["outcome"] for o in result["outcomes"][: n - 1]] == ["applied"] * (n - 1)
+    assert result["outcomes"][-1]["outcome"] == "failed_execution"
+    assert result["outcomes"][-1]["error_code"] == "result_missing"
+
+
+def test_action_result_outcome_never_returns_applied_for_missing_item():
+    assert crc._action_result_outcome(None) == ("failed_execution", "result_missing")
+    assert crc._action_result_outcome("not-a-dict") == ("failed_execution", "result_missing")
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +574,8 @@ def test_foreground_mixed_outcome_appends_note_to_real_reply(monkeypatch):
     assert result_ts == pytest.approx(5200.0)
     assert posted[0] == "记下了。"
     assert len(posted) == 2
-    assert "memory.frobnicate" in posted[1]
+    assert posted[1] == crc._ACTION_OUTCOME_MIXED_NOTE_ONE_ZH
+    assert "memory.frobnicate" not in posted[1], "minor #5: never leak the raw action type to the user"
 
 
 # ---------------------------------------------------------------------------
@@ -532,9 +627,61 @@ def test_proactive_marks_job_failed_when_memory_identity_action_all_fails(monkey
     assert crc._process_proactive_jobs([job]) == pytest.approx(9100.0)
 
     assert not posted, "an all-failed batch must not post the agent's optimistic reply"
-    failed = [s for s in statuses if s[1] == "failed"]
-    assert failed, "non-introduction jobs must now also be marked failed on total action failure"
-    assert failed[-1][2].startswith("memory_identity_action_failed")
+    # I4: this action-failure status update is no longer necessarily the LAST
+    # status call — falling through (instead of `continue`) lets the rest of
+    # the turn run, and with no other actions/replies left it naturally lands
+    # on the pre-existing "failed: empty_agent_reply" terminal status too.
+    # What matters is that the action failure itself was reported somewhere.
+    failed_reasons = [s[2] for s in statuses if s[1] == "failed"]
+    assert any(r.startswith("memory_identity_action_failed") for r in failed_reasons), (
+        "non-introduction jobs must now also be marked failed on total action failure"
+    )
+
+
+def test_proactive_all_failed_action_does_not_kill_scheduled_wake_chain(monkeypatch):
+    """I4: pre-Task-7, a non-introduction memory/identity action failure was
+    silently swallowed and the turn ran to completion — including any
+    schedule_wake the agent asked for in the SAME turn. The generalized
+    'mark job failed' must not regress that: it may suppress the optimistic
+    chat reply, but the scheduled-wake block (self-rewake chain) must still
+    run exactly as before."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    crc._self_wake_streak = 0
+    scheduled_calls = []
+    statuses = []
+    posted = []
+
+    actions = [
+        {"type": "identity.profile_patch", "patch": {"agent_name": "小秘"}},
+        {"type": "schedule_wake", "at": "2030-01-01T09:30:00", "tz": "Asia/Shanghai", "note": "check in"},
+    ]
+    monkeypatch.setattr(crc, "call_agent", lambda *a, **kw: {"actions": actions, "messages": ["改好了。"]})
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kw: posted.append(reply) or {"id": "m5"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc, "update_proactive_job_status",
+        lambda job_id, status, reason="", **kw: statuses.append((job_id, status, reason)),
+    )
+    monkeypatch.setattr(
+        crc, "execute_scheduled_wake_actions",
+        lambda acts, job: scheduled_calls.append((acts, job)) or {
+            "results": [{"type": "schedule_wake_result", "status": "scheduled", "timer_id": "sched_1"}],
+        },
+    )
+    monkeypatch.setattr(
+        crc._HTTP, "post",
+        _http_router(identity=_Resp(500, {"status": "error", "error": "boom"})),
+    )
+
+    job = _base_proactive_job(job_id="pj_admission_rewake", ts=9300.0)
+    assert crc._process_proactive_jobs([job]) == pytest.approx(9300.0)
+
+    assert posted == [], "the optimistic reply must still be suppressed"
+    assert scheduled_calls, "the schedule_wake action must still be attempted — self-rewake chain preserved"
+    assert [a.get("type") for a in scheduled_calls[0][0]] == ["schedule_wake"]
+    failed = [s for s in statuses if s[1] == "failed" and "memory_identity_action_failed" in s[2]]
+    assert failed, "the identity write failure must still be marked failed for observability"
 
 
 def test_proactive_leaves_silent_background_noop_untouched(monkeypatch):

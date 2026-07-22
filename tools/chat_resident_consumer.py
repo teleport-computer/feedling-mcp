@@ -6279,9 +6279,15 @@ def _action_result_outcome(item: Any) -> tuple[str, str]:
     backends early-abort a batch on the first item whose status is an error
     (returning an HTTP >=400 the caller already turned into an exception
     before this is reached), so on the success path every item's status is
-    "ok" — the only distinction left to make here is noop vs applied."""
+    "ok" — the only distinction left to make here is noop vs applied.
+
+    A missing/non-dict item (index out of range — e.g. the backend truncates
+    a batch at 20 actions, so a bucket forwarded with >20 items gets fewer
+    results back than actions sent) must NEVER be read as "applied" — that
+    would silently fabricate success for an action the server never actually
+    reported on. Default to failed_execution/result_missing instead."""
     if not isinstance(item, dict):
-        return "applied", ""
+        return "failed_execution", "result_missing"
     status = str(item.get("status") or "").strip().lower()
     if status == "error":
         return "failed_execution", str(item.get("error") or "")[:120]
@@ -6294,6 +6300,7 @@ def _outcomes_for_bucket(
     entries: list[tuple[str, str]],
     *,
     error: Exception | None,
+    error_code: str = "",
     results: list | None,
 ) -> list[dict]:
     outcomes: list[dict] = []
@@ -6303,18 +6310,25 @@ def _outcomes_for_bucket(
                 "original_type": original_type,
                 "canonical_type": canonical_type,
                 "outcome": "failed_execution",
-                "error_code": type(error).__name__,
+                "error_code": error_code or type(error).__name__,
             })
             continue
         item = results[idx] if isinstance(results, list) and idx < len(results) else None
-        outcome, error_code = _action_result_outcome(item)
+        outcome, item_error_code = _action_result_outcome(item)
         outcomes.append({
             "original_type": original_type,
             "canonical_type": canonical_type,
             "outcome": outcome,
-            "error_code": error_code,
+            "error_code": item_error_code,
         })
     return outcomes
+
+
+# Sentinel exception used only to drive _outcomes_for_bucket's "error path"
+# formatting for the memory bucket when it was never attempted at all (C1:
+# identity failed first, so memory's HTTP call must not happen — see below).
+class _ActionBucketNotAttempted(Exception):
+    pass
 
 
 def execute_agent_actions(actions: list[dict]) -> dict:
@@ -6328,18 +6342,26 @@ def execute_agent_actions(actions: list[dict]) -> dict:
     before the HTTP call (never forwarded). In off mode this whole gate is a
     no-op (matches pre-Task-7 behavior exactly).
 
-    The identity bucket and memory bucket are each tried independently (own
-    try/except) so a failure in one does not block the HTTP call for the
-    other bucket — deliberate: a mixed batch's memory write should not be
-    silently skipped just because the identity write failed.
+    Wire order/short-circuit is UNCHANGED from pre-Task-7 (sequential, with
+    early abort): the identity bucket is sent first, and if that call raises,
+    the memory bucket's HTTP call never happens at all — shadow mode's
+    byte-identical-wire invariant covers the failure path too, not just the
+    happy path. The memory actions in that case are reported as
+    outcome=failed_execution / error_code="not_attempted" (never "applied").
 
     Returns a dict that never raises for an ordinary HTTP-level failure —
     callers read `outcomes` (one entry per forwarded-or-rejected action:
     {"original_type", "canonical_type", "outcome", "error_code"}, outcome in
-    applied|noop|rejected_allowlist|failed_execution) and pass it to
-    rewrite_reply_for_outcomes to produce an honest reply. Still raises
-    RuntimeError for a garbage action type that is neither identity.* nor
-    memory.* — that is a caller/prompt bug, not a server-side outcome.
+    applied|noop|rejected_allowlist|failed_execution; error_code "not_attempted"
+    marks a bucket skipped by the early abort above, "result_missing" marks a
+    per-item result the server never returned). NOTE: outcomes are NOT
+    guaranteed to be in the same order as the input `actions` list — they are
+    grouped identity-bucket-first, then memory-bucket, each in its own
+    within-bucket order; match on original_type/canonical_type, not position.
+    Pass the list to rewrite_reply_for_outcomes to produce an honest reply.
+    Still raises RuntimeError for a garbage action type that is neither
+    identity.* nor memory.* — that is a caller/prompt bug, not a server-side
+    outcome.
     """
     mode = _action_allowlist_mode()
     identity_actions: list[dict] = []
@@ -6396,13 +6418,22 @@ def execute_agent_actions(actions: list[dict]) -> dict:
     memory_result: dict = {"results": [], "effects": []}
     identity_error: Exception | None = None
     memory_error: Exception | None = None
+    memory_not_attempted = False
 
     if identity_actions:
         try:
             identity_result = execute_identity_actions(identity_actions)
         except Exception as e:
             identity_error = e
-    if memory_actions:
+
+    # C1: restored sequential-with-early-abort — pre-Task-7 semantics never
+    # sent the memory HTTP call at all once the identity call raised. Do not
+    # "improve" this into independent per-bucket attempts: shadow mode's
+    # byte-identical-wire guarantee (content/order/COUNT of requests) must
+    # hold on the failure path too, not just the happy path.
+    if identity_error is not None:
+        memory_not_attempted = bool(memory_actions)
+    elif memory_actions:
         try:
             memory_result = execute_memory_actions(memory_actions)
         except Exception as e:
@@ -6413,14 +6444,22 @@ def execute_agent_actions(actions: list[dict]) -> dict:
         error=identity_error,
         results=identity_result.get("results") if isinstance(identity_result, dict) else None,
     ))
-    outcomes.extend(_outcomes_for_bucket(
-        memory_entries,
-        error=memory_error,
-        results=memory_result.get("results") if isinstance(memory_result, dict) else None,
-    ))
+    if memory_not_attempted:
+        outcomes.extend(_outcomes_for_bucket(
+            memory_entries,
+            error=_ActionBucketNotAttempted(),
+            error_code="not_attempted",
+            results=None,
+        ))
+    else:
+        outcomes.extend(_outcomes_for_bucket(
+            memory_entries,
+            error=memory_error,
+            results=memory_result.get("results") if isinstance(memory_result, dict) else None,
+        ))
 
     return {
-        "status": "ok" if identity_error is None and memory_error is None else "error",
+        "status": "ok" if identity_error is None and memory_error is None and not memory_not_attempted else "error",
         "identity": identity_result,
         "memory": memory_result,
         "effects": (identity_result.get("effects") or []) + (memory_result.get("effects") or []),
@@ -6445,6 +6484,24 @@ _ACTION_OUTCOME_ALL_FAILED_EN = (
     "That last action did not actually go through — I'll try again, or you can say it once more."
 )
 
+# Distinct from ALL_FAILED on purpose (I2): a noop is not an error — nothing
+# went WRONG, there was just nothing to change (e.g. a value already at the
+# target, an already-capped nudge). Conflating the two would make routine,
+# harmless no-ops read as apologetic failures.
+_ACTION_OUTCOME_ALL_NOOP_ZH = "刚才那个调整没有产生变化（可能已经是这个状态了）。"
+_ACTION_OUTCOME_ALL_NOOP_EN = (
+    "That last adjustment didn't actually change anything (it may already have been that way)."
+)
+_ACTION_OUTCOME_NOOP_NOTE_ZH = "（不过其中一项没有产生实际变化。）"
+_ACTION_OUTCOME_NOOP_NOTE_EN = "(Though one of those didn't actually change anything.)"
+
+# Mixed-outcome notes are deliberately generic (minor #5) — never surface raw
+# internal action-type strings (e.g. "memory.frobnicate") in user-facing text.
+_ACTION_OUTCOME_MIXED_NOTE_ONE_ZH = "不过其中一项没有生效。"
+_ACTION_OUTCOME_MIXED_NOTE_MANY_ZH = "不过其中 {n} 项没有生效。"
+_ACTION_OUTCOME_MIXED_NOTE_ONE_EN = "Though one of those did not actually take effect."
+_ACTION_OUTCOME_MIXED_NOTE_MANY_EN = "Though {n} of those did not actually take effect."
+
 
 def rewrite_reply_for_outcomes(
     replies: list[str], outcomes: list[dict], fallback_ok: str
@@ -6455,49 +6512,65 @@ def rewrite_reply_for_outcomes(
       (if replies is empty, use [fallback_ok] — but only when fallback_ok is
       non-empty, so a caller with nothing to say stays silent rather than
       posting a synthesized empty bubble).
-    - every outcome is NOT "applied" (noop / rejected_allowlist /
-      failed_execution — nothing actually happened): replies is REPLACED
-      with an honest failure sentence.
-    - mixed (some applied, some not): replies is kept and one sentence is
-      appended naming what did not take effect.
+    - some applied AND some not (noop and/or rejected/failed): replies is
+      KEPT (or [fallback_ok] if it was empty) and ONE short, generic sentence
+      is appended naming only the COUNT of items that didn't take effect —
+      never the raw action type.
+    - zero applied, but at least one genuine rejected/failed_execution:
+      replies is REPLACED with an honest failure sentence (a batch with any
+      real failure is reported as a failure, not shrugged off as a noop).
+    - zero applied, and every outcome is "noop" (nothing failed, there was
+      just nothing to do): replies is kept + a short "didn't change
+      anything" note appended if non-empty, or a standalone honest noop
+      sentence (distinct wording from the failure sentence) if replies was
+      empty.
     """
     replies = [r for r in (replies or [])]
     if not outcomes:
         return replies
 
-    applied = [o for o in outcomes if isinstance(o, dict) and o.get("outcome") == "applied"]
-    not_applied = [
-        o for o in outcomes if not (isinstance(o, dict) and o.get("outcome") == "applied")
-    ]
-
     zh = bool(re.search(r"[\u4e00-\u9fff]", str(fallback_ok) or "")) or any(
         re.search(r"[\u4e00-\u9fff]", str(r)) for r in replies
     )
 
-    if not not_applied:
+    applied = [o for o in outcomes if isinstance(o, dict) and o.get("outcome") == "applied"]
+    noop = [o for o in outcomes if isinstance(o, dict) and o.get("outcome") == "noop"]
+    bad = [
+        o for o in outcomes
+        if isinstance(o, dict) and o.get("outcome") in ("rejected_allowlist", "failed_execution")
+    ]
+
+    if not noop and not bad:
+        # every outcome applied
         if replies:
             return replies
         return [fallback_ok] if fallback_ok else []
 
-    if not applied:
+    if applied:
+        # Mixed: something worked, something didn't (noop and/or bad) — keep
+        # whatever was already going to be said and add one generic sentence.
+        n = len(noop) + len(bad)
+        if n == 1:
+            note = _ACTION_OUTCOME_MIXED_NOTE_ONE_ZH if zh else _ACTION_OUTCOME_MIXED_NOTE_ONE_EN
+        else:
+            note = (_ACTION_OUTCOME_MIXED_NOTE_MANY_ZH if zh else _ACTION_OUTCOME_MIXED_NOTE_MANY_EN).format(n=n)
+        base = replies if replies else ([fallback_ok] if fallback_ok else [])
+        return base + [note]
+
+    if bad:
+        # Zero applied AND at least one genuine rejection/failure: nothing
+        # succeeded — override entirely with an honest failure sentence, even
+        # if some other items in the same batch were merely noop. A batch
+        # with any real failure is reported as a failure, not a shrug.
         return [_ACTION_OUTCOME_ALL_FAILED_ZH if zh else _ACTION_OUTCOME_ALL_FAILED_EN]
 
-    labels: list[str] = []
-    for o in not_applied:
-        label = str(o.get("canonical_type") or o.get("original_type") or "").strip()
-        if label and label not in labels:
-            labels.append(label)
-    joined = ("、".join(labels)) if zh else ", ".join(labels)
-    if joined:
-        note = (
-            f"不过其中「{joined}」没有真正生效。"
-            if zh else f"Note: {joined} did not actually take effect."
-        )
-    else:
-        note = _ACTION_OUTCOME_ALL_FAILED_ZH if zh else _ACTION_OUTCOME_ALL_FAILED_EN
-
-    base = replies if replies else ([fallback_ok] if fallback_ok else [])
-    return base + [note]
+    # Zero applied, zero bad: every outcome was a noop. Nothing went WRONG —
+    # there was just nothing to change. Distinct wording from the failure
+    # case (I2), and appended rather than replacing when there's already a
+    # reply to show.
+    if replies:
+        return replies + [_ACTION_OUTCOME_NOOP_NOTE_ZH if zh else _ACTION_OUTCOME_NOOP_NOTE_EN]
+    return [_ACTION_OUTCOME_ALL_NOOP_ZH if zh else _ACTION_OUTCOME_ALL_NOOP_EN]
 
 
 # Message dedup — rolling window prevents reprocessing the same message on
@@ -9602,10 +9675,11 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
         if memory_identity_actions:
             # 结果真实化(Task 7): execute_agent_actions itself no longer raises
-            # for an ordinary HTTP-level failure (it reports it via
-            # outcomes) — only a caller/prompt bug (garbage action type) can
-            # still raise here, so the except below is a thin safety net,
-            # not the primary failure-detection path anymore.
+            # for an ordinary HTTP-level failure it actually attempted (it
+            # reports that via outcomes) — only a caller/prompt bug (garbage
+            # action type) or the sequential identity->memory short-circuit
+            # (C1) can still raise/propagate here, so the except below is a
+            # thin safety net, not the primary failure-detection path.
             memory_identity_error_label = ""
             try:
                 result = execute_agent_actions(memory_identity_actions)
@@ -9632,17 +9706,22 @@ def _process_proactive_jobs(jobs: list) -> float:
 
             applied_outcomes = [o for o in outcomes if o.get("outcome") == "applied"]
             failed_outcomes = [o for o in outcomes if o.get("outcome") == "failed_execution"]
+            # Deliberately conservative (minor #7): a batch is only ever
+            # reported as a hard failure when NOTHING in it applied AND at
+            # least one item genuinely failed on the wire. A mid-batch
+            # server abort that still leaves some items applied is instead
+            # reported through rewrite_reply_for_outcomes below (mixed
+            # note) — never silently upgraded to "whole batch failed". A
+            # noop-only outcome set (nothing failed, just nothing to do) or
+            # an enforce-mode allowlist rejection with no wire failure is
+            # also NOT treated as a hard failure here.
             if failed_outcomes and not applied_outcomes:
-                # Whole batch genuinely failed on the wire (whether raised as
-                # an exception above or reported via outcomes) — same "mark
-                # failed + skip posting" shape the introduction lane already
-                # had, now generalized to every proactive job so a silent
-                # write failure is no longer invisible in job history. A
-                # noop or an enforce-mode allowlist rejection is NOT treated
-                # as a failure here — nothing going wrong, just nothing to do
-                # or a deliberate policy drop.
                 error_label = memory_identity_error_label or f":{failed_outcomes[0].get('error_code') or ''}"
                 if is_introduction:
+                    # Unchanged from pre-Task-7: the intro greeting depends
+                    # on the identity write actually landing (see
+                    # _introduction_greeting_from_identity_actions below), so
+                    # this lane still hard-stops the turn.
                     update_proactive_job_status(
                         job_id,
                         "failed",
@@ -9653,25 +9732,35 @@ def _process_proactive_jobs(jobs: list) -> float:
                             "wake_result": "identity_action_failed",
                         },
                     )
-                else:
-                    update_proactive_job_status(
-                        job_id,
-                        "failed",
-                        f"memory_identity_action_failed{error_label}",
-                        extra={
-                            "agent_action": "memory_identity_actions",
-                            "agent_action_status": str(failed_outcomes)[:240],
-                            "wake_result": "identity_action_failed",
-                        },
-                    )
-                continue
-
-            # Only touches a reply that was ALREADY going to be posted
-            # (replies non-empty) — an idle background write that produced
-            # no chat text stays silent exactly like before, so a routine
-            # noop (e.g. an already-capped nudge) does not start posting
-            # unsolicited "didn't work" bubbles.
-            if replies and outcomes:
+                    continue
+                # Generalized (new, I4): mark the job failed and suppress the
+                # optimistic reply that assumed the write worked — but do
+                # NOT `continue`. A transient identity/memory write failure
+                # must not also kill this turn's schedule_actions /
+                # self-rewake chain below; pre-Task-7, a non-introduction
+                # failure here was silently swallowed and the turn ran to
+                # completion, so falling through preserves that survival
+                # property while still fixing the silent-failure /
+                # fake-success bugs.
+                update_proactive_job_status(
+                    job_id,
+                    "failed",
+                    f"memory_identity_action_failed{error_label}",
+                    extra={
+                        "agent_action": "memory_identity_actions",
+                        "agent_action_status": str(failed_outcomes)[:240],
+                        "wake_result": "identity_action_failed",
+                    },
+                )
+                replies = []
+            elif replies and outcomes:
+                # Only touches a reply that was ALREADY going to be posted
+                # (replies non-empty) — an idle background write that
+                # produced no chat text stays silent exactly like before, so
+                # a routine noop (e.g. an already-capped nudge) does not
+                # start posting unsolicited bubbles. NOTE: outcomes are not
+                # guaranteed to be in the same order as memory_identity_actions
+                # (identity-bucket entries come first, then memory-bucket).
                 replies = rewrite_reply_for_outcomes(replies, outcomes, fallback_ok=replies[0])
         if is_introduction and not replies and memory_identity_actions:
             reply = _introduction_greeting_from_identity_actions(memory_identity_actions)
