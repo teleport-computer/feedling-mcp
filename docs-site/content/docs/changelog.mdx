@@ -19,8 +19,11 @@ change must not be interpreted as an API guarantee.
   than 300 seconds normalize to `unknown`. Resident onboarding exposes a new
   `decrypt_source` validation step; unfinished accounts require a fresh `ok`
   report before Chat or live-loop verification can pass. Existing accounts keep
-  ordinary Chat available, receive a seven-day warning-only grace for
-  `unknown`, and get an in-app decrypt-source maintenance notice. Verify-ping
+  ordinary Chat available and receive a seven-day warning-only grace for
+  `unknown`. Unknown/absent health now produces only an in-app stale-consumer
+  notice and never injects decrypt-source repair copy. An established resident's
+  explicit decrypt failure must persist for 30 minutes before a repair turn can
+  be injected; new onboarding remains immediately actionable. Verify-ping
   replies must now use `source: "verify_ping"` and point
   `reply_to_message_id` at the exact pending ping; `loop_alive` can therefore be
   true while `passing` is false when decrypt policy blocks sticky verification.
@@ -28,10 +31,17 @@ change must not be interpreted as an API guarantee.
   with `role: "user"` and `source: "resident_maintenance"` when the resident
   consumer appears stale or is not claiming resident-only distill jobs. These
   rows use shared envelopes so enclave-backed consumers can decrypt the repair
-  prompt. Notices and API errors can now use `blame: "user_environment"` for
-  issues in the user's VPS/runtime environment. The resident-only distill job
-  fallback scan is throttled by `FEEDLING_RESIDENT_FALLBACK_CHECK_SEC` (default
-  300 seconds).
+  prompt. Prompts now identify their server origin, provide an App-notice trust
+  anchor, avoid requesting user data, and use reason-specific update or decrypt
+  diagnostics. Heartbeat timestamps and backend deploy commit changes no longer
+  bypass the global 24-hour reminder interval. Notices and API errors can use
+  `blame: "user_environment"` for issues in the user's VPS/runtime environment.
+  The resident-only distill job fallback scan is throttled by
+  `FEEDLING_RESIDENT_FALLBACK_CHECK_SEC` (default 300 seconds).
+- Resident decrypt health now changes to `degraded` only after consecutive
+  claimed-but-unreadable messages (two by default, configurable with
+  `FEEDLING_DECRYPT_DEGRADE_AFTER`). A real ordinary user-message decrypt resets
+  the streak; a server-generated maintenance turn does not count as recovery.
 - New `GET /v1/agent/perception/recent_apps` returns recent app-open history
   (`app`, `category`, `ts`, `minutes_ago`), newest first, with optional `limit`
   (1–100, default 20) and `hours` query parameters. It reads the same app-open

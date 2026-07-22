@@ -79,9 +79,53 @@ def test_prompt_uses_deployment_repo_description_not_internal_clone_name(monkeyp
     )
 
     assert "feedling-mcp-test" not in prompt
-    assert "包含 tools/chat_resident_consumer.py 的仓库目录" in prompt
+    assert "仓库目录(包含 tools/chat_resident_consumer.py)" in prompt
     assert "tools/chat_resident_requirements.txt" in prompt
     assert "FEEDLING_AUTO_UPDATE" in prompt
+    assert prompt.startswith("【Feedling 维护通知】(来自 Feedling 服务端,非用户本人发送)")
+    assert prompt.endswith("expected_commit: abcdef1234567890")
+
+
+def test_decrypt_prompt_uses_only_decrypt_source_steps(monkeypatch):
+    prompt = resident_maintenance._prompt_for(
+        {
+            "reason": "decrypt_source_unavailable",
+            "decrypt_status": "unreachable",
+            "decrypt_reason": "decrypt_source_unreachable",
+            "checked_at_epoch": 123.0,
+        },
+        {"consumer_id": "vps-resident-c1"},
+    )
+
+    assert "不需要带 API key" in prompt
+    assert "curl -k -o /dev/null" in prompt
+    assert "Authorization" not in prompt
+    assert "python -m pip install" not in prompt
+    assert "FEEDLING_AUTO_UPDATE" not in prompt
+    assert prompt.endswith("decrypt_checked_at_epoch: 123.0")
+
+
+def test_reason_key_excludes_heartbeat_and_deploy_commit_diagnostics():
+    mismatch_a = {
+        "reason": "consumer_commit_mismatch",
+        "expected_commit": "deploy-a",
+        "actual_commit": "old-a",
+    }
+    mismatch_b = {
+        "reason": "consumer_commit_mismatch",
+        "expected_commit": "deploy-b",
+        "actual_commit": "old-b",
+    }
+    degraded_a = {
+        "reason": "decrypt_source_unavailable",
+        "decrypt_status": "degraded",
+        "decrypt_reason": "decrypt_source_degraded",
+        "checked_at_epoch": 100.0,
+    }
+    degraded_b = {**degraded_a, "checked_at_epoch": 200.0}
+
+    assert resident_maintenance._reason_key(mismatch_a) == resident_maintenance._reason_key(mismatch_b)
+    assert resident_maintenance._reason_key(degraded_a) == resident_maintenance._reason_key(degraded_b)
 
 
 def test_decrypt_health_failure_warns_immediately_with_diagnostics(monkeypatch):

@@ -4,11 +4,14 @@ import base64
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from chat import resident_maintenance  # noqa: E402
+from core import store as core_store  # noqa: E402
 
 
 _HEADERS = {
@@ -36,21 +39,27 @@ def _headers(
     *,
     consumer_id: str = "vps-resident-c1",
     commit: str | None = None,
-    decrypt_status: str = "ok",
+    decrypt_status: str | None = "ok",
 ):
     out = {
         "X-API-Key": api_key,
         **_HEADERS,
         "X-Feedling-Consumer-Id": consumer_id,
-        "X-Feedling-Decrypt-Status": decrypt_status,
-        "X-Feedling-Decrypt-Checked-At": str(resident_maintenance._now()),
     }
+    if decrypt_status is not None:
+        out["X-Feedling-Decrypt-Status"] = decrypt_status
+        out["X-Feedling-Decrypt-Checked-At"] = str(resident_maintenance._now())
     if commit is not None:
         out["X-Feedling-Consumer-Commit"] = commit
     return out
 
 
-def test_unconfigured_decrypt_source_alerts_on_first_poll(backend_env, monkeypatch):
+@pytest.mark.parametrize("decrypt_status", ["unconfigured", "unreachable"])
+def test_new_explicit_decrypt_failure_alerts_on_first_poll(
+    backend_env,
+    monkeypatch,
+    decrypt_status,
+):
     monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "abcdef1234567890")
     now = {"t": 5_000_000.0}
     monkeypatch.setattr(resident_maintenance, "_now", lambda: now["t"])
@@ -64,7 +73,7 @@ def test_unconfigured_decrypt_source_alerts_on_first_poll(backend_env, monkeypat
         headers=_headers(
             api_key,
             commit="abcdef1234567890",
-            decrypt_status="unconfigured",
+            decrypt_status=decrypt_status,
         ),
     )
 
@@ -72,7 +81,7 @@ def test_unconfigured_decrypt_source_alerts_on_first_poll(backend_env, monkeypat
     messages = poll.get_json()["messages"]
     assert [m["source"] for m in messages] == [resident_maintenance.SOURCE]
     assert "decrypt_source_unavailable" in captured["plaintext"]
-    assert "decrypt_status: unconfigured" in captured["plaintext"]
+    assert f"decrypt_status: {decrypt_status}" in captured["plaintext"]
     assert "FEEDLING_ENCLAVE_URL" in captured["plaintext"]
 
     notices = client.get(
@@ -83,10 +92,148 @@ def test_unconfigured_decrypt_source_alerts_on_first_poll(backend_env, monkeypat
         if n["dedupe_key"] == resident_maintenance.DECRYPT_DEDUPE_KEY
     )
     assert notice["error_class"] == resident_maintenance.DECRYPT_ERROR_CLASS
-    assert "status=unconfigured" in notice["detail"]
+    assert f"status={decrypt_status}" in notice["detail"]
     assert len(
         [m for m in db.chat_load(user_id) if m.get("source") == resident_maintenance.SOURCE]
     ) == 1
+
+
+def test_established_unknown_is_notice_only_and_never_uses_decrypt_copy(
+    backend_env,
+    monkeypatch,
+):
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "abcdef1234567890")
+    now = {"t": 5_100_000.0}
+    monkeypatch.setattr(resident_maintenance, "_now", lambda: now["t"])
+    captured: dict = {}
+    _fake_shared_envelope(monkeypatch, captured)
+    client = make_client()
+    user_id, api_key = _register(client)
+    core_store.get_store(user_id).mark_first_chat_ok(at_iso="2026-07-01T00:00:00")
+
+    poll = client.get(
+        "/v1/chat/poll?timeout=0",
+        headers=_headers(
+            api_key,
+            commit="abcdef1234567890",
+            decrypt_status=None,
+        ),
+    )
+
+    assert poll.status_code == 200, poll.get_data(as_text=True)
+    assert poll.get_json()["messages"] == []
+    assert "plaintext" not in captured
+    notices = client.get(
+        "/v1/notices", headers={"X-API-Key": api_key}
+    ).get_json()["notices"]
+    notice = next(
+        n
+        for n in notices
+        if n["dedupe_key"] == resident_maintenance.DECRYPT_UNKNOWN_DEDUPE_KEY
+    )
+    assert notice["error_class"] == resident_maintenance.DECRYPT_UNKNOWN_ERROR_CLASS
+    assert "copyable_prompt" not in notice
+    assert "解密源不可用" not in notice["user_text"]
+    assert not [
+        m for m in db.chat_load(user_id) if m.get("source") == resident_maintenance.SOURCE
+    ]
+
+
+def test_established_explicit_failure_waits_30m_then_injects_once(
+    backend_env,
+    monkeypatch,
+):
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "abcdef1234567890")
+    monkeypatch.setenv("FEEDLING_RESIDENT_DECRYPT_FAILURE_GRACE_SEC", "1800")
+    now = {"t": 5_200_000.0}
+    monkeypatch.setattr(resident_maintenance, "_now", lambda: now["t"])
+    captured: dict = {}
+    _fake_shared_envelope(monkeypatch, captured)
+    client = make_client()
+    user_id, api_key = _register(client)
+    core_store.get_store(user_id).mark_first_chat_ok(at_iso="2026-07-01T00:00:00")
+
+    first = client.get(
+        "/v1/chat/poll?timeout=0",
+        headers=_headers(api_key, commit="abcdef1234567890", decrypt_status="degraded"),
+    )
+    assert first.status_code == 200
+    assert first.get_json()["messages"] == []
+    assert "plaintext" not in captured
+
+    now["t"] += 1799
+    early = client.get(
+        "/v1/chat/poll?timeout=0",
+        headers=_headers(api_key, commit="abcdef1234567890", decrypt_status="degraded"),
+    )
+    assert early.status_code == 200
+    assert early.get_json()["messages"] == []
+
+    now["t"] += 2
+    late = client.get(
+        "/v1/chat/poll?timeout=0",
+        headers=_headers(api_key, commit="abcdef1234567890", decrypt_status="degraded"),
+    )
+    assert late.status_code == 200
+    assert [m["source"] for m in late.get_json()["messages"]] == [resident_maintenance.SOURCE]
+    assert "decrypt_status: degraded" in captured["plaintext"]
+    assert "python -m pip install" not in captured["plaintext"]
+
+    for _ in range(3):
+        now["t"] += 120
+        repeat = client.get(
+            "/v1/chat/poll?timeout=0",
+            headers=_headers(
+                api_key,
+                commit="abcdef1234567890",
+                decrypt_status="degraded",
+            ),
+        )
+        assert repeat.status_code == 200
+    rows = [
+        m for m in db.chat_load(user_id) if m.get("source") == resident_maintenance.SOURCE
+    ]
+    assert len(rows) == 1
+    state = db.get_blob(user_id, "consumer_state")
+    assert state["resident_maintenance"]["last_reason_key"] == (
+        "decrypt_source_unavailable:degraded:decrypt_source_degraded"
+    )
+
+
+def test_explicit_failure_recovery_resolves_notice_without_injection(
+    backend_env,
+    monkeypatch,
+):
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "abcdef1234567890")
+    now = {"t": 5_300_000.0}
+    monkeypatch.setattr(resident_maintenance, "_now", lambda: now["t"])
+    captured: dict = {}
+    _fake_shared_envelope(monkeypatch, captured)
+    client = make_client()
+    user_id, api_key = _register(client)
+    core_store.get_store(user_id).mark_first_chat_ok(at_iso="2026-07-01T00:00:00")
+
+    failed = client.get(
+        "/v1/chat/poll?timeout=0",
+        headers=_headers(api_key, commit="abcdef1234567890", decrypt_status="unreachable"),
+    )
+    assert failed.status_code == 200
+    assert failed.get_json()["messages"] == []
+    now["t"] += 10
+    recovered = client.get(
+        "/v1/chat/poll?timeout=0",
+        headers=_headers(api_key, commit="abcdef1234567890", decrypt_status="ok"),
+    )
+    assert recovered.status_code == 200
+    assert recovered.get_json()["messages"] == []
+    notices = client.get(
+        "/v1/notices", headers={"X-API-Key": api_key}
+    ).get_json()["notices"]
+    notice = next(
+        n for n in notices if n["dedupe_key"] == resident_maintenance.DECRYPT_DEDUPE_KEY
+    )
+    assert notice["resolved"] is True
+    assert "plaintext" not in captured
 
 
 def _fake_shared_envelope(monkeypatch, captured: dict):
@@ -192,6 +339,43 @@ def test_consumer_commit_mismatch_waits_for_floor_before_prompting(backend_env, 
     assert len([m for m in db.chat_load(user_id) if m.get("source") == resident_maintenance.SOURCE]) == 1
 
 
+def test_two_backend_deploys_do_not_bypass_24h_reminder_interval(backend_env, monkeypatch):
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "deployaaaaaaaa")
+    monkeypatch.setenv("FEEDLING_RESIDENT_COMMIT_MISMATCH_GRACE_SEC", "3600")
+    now = {"t": 2_100_000.0}
+    monkeypatch.setattr(resident_maintenance, "_now", lambda: now["t"])
+    captured: dict = {}
+    _fake_shared_envelope(monkeypatch, captured)
+    client = make_client()
+    user_id, api_key = _register(client)
+    headers = _headers(api_key, commit="residentold111")
+
+    first = client.get("/v1/chat/poll?timeout=0", headers=headers)
+    assert first.status_code == 200
+    now["t"] += 3601
+    headers["X-Feedling-Decrypt-Checked-At"] = str(now["t"])
+    warned = client.get("/v1/chat/poll?timeout=0", headers=headers)
+    assert warned.status_code == 200
+    assert [m["source"] for m in warned.get_json()["messages"]] == [
+        resident_maintenance.SOURCE
+    ]
+
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "deploybbbbbbbb")
+    deploy_change = client.get("/v1/chat/poll?timeout=0", headers=headers)
+    assert deploy_change.status_code == 200
+    now["t"] += 3601
+    headers["X-Feedling-Decrypt-Checked-At"] = str(now["t"])
+    second_matured = client.get("/v1/chat/poll?timeout=0", headers=headers)
+    assert second_matured.status_code == 200
+
+    rows = [
+        m for m in db.chat_load(user_id) if m.get("source") == resident_maintenance.SOURCE
+    ]
+    assert len(rows) == 1
+    state = db.get_blob(user_id, "consumer_state")["resident_maintenance"]
+    assert state["last_reason_key"] == "consumer_commit_mismatch"
+
+
 def test_hosted_agent_runner_poll_is_exempt_from_resident_maintenance(backend_env, monkeypatch):
     monkeypatch.setenv("FEEDLING_GIT_COMMIT", "abcdef1234567890")
     now = {"t": 3_000_000.0}
@@ -212,6 +396,29 @@ def test_hosted_agent_runner_poll_is_exempt_from_resident_maintenance(backend_en
     assert poll.get_json()["messages"] == []
     assert "plaintext" not in captured
     assert not [m for m in db.chat_load(user_id) if m.get("source") == resident_maintenance.SOURCE]
+
+
+def test_non_resident_route_is_exempt_from_resident_maintenance(backend_env, monkeypatch):
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "abcdef1234567890")
+    now = {"t": 3_100_000.0}
+    monkeypatch.setattr(resident_maintenance, "_now", lambda: now["t"])
+    captured: dict = {}
+    _fake_shared_envelope(monkeypatch, captured)
+    client = make_client()
+    user_id, api_key = _register(client)
+    db.set_blob(user_id, "onboarding_route", {"route": "model_api"})
+
+    poll = client.get(
+        "/v1/chat/poll?timeout=0",
+        headers=_headers(api_key, commit="oldoldold", decrypt_status="unreachable"),
+    )
+
+    assert poll.status_code == 200
+    assert poll.get_json()["messages"] == []
+    assert "plaintext" not in captured
+    assert not [
+        m for m in db.chat_load(user_id) if m.get("source") == resident_maintenance.SOURCE
+    ]
 
 
 def test_unclaimed_resident_job_active_poll_warns_without_failing_job(backend_env, monkeypatch):

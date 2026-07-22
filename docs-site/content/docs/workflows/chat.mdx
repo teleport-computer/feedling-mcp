@@ -287,7 +287,7 @@ An official resident reports decrypt-source health on poll requests only:
 | Status | Meaning |
 | --- | --- |
 | `ok` | A real message decrypted successfully, or the configured enclave reachability probe succeeded. This phase-one signal is operational self-reporting, not cryptographic proof of a challenge decrypt. |
-| `degraded` | A claimed message could not be recovered as non-empty plaintext. Only a later real non-empty decrypt clears this state. |
+| `degraded` | Consecutive claimed messages could not be recovered as non-empty plaintext. The standard consumer changes to this status after two consecutive read failures by default; `FEEDLING_DECRYPT_DEGRADE_AFTER` changes that threshold (minimum 1). Only a later real, ordinary user-message decrypt clears this state. A server-generated maintenance turn is not recovery evidence. |
 | `unconfigured` | `FEEDLING_ENCLAVE_URL` is absent. |
 | `unreachable` | The configured enclave decrypt source could not be reached. |
 
@@ -312,9 +312,18 @@ After an account has a durable successful first Chat exchange, explicit
 and a new sticky verification, but does not add a new hard block to ordinary
 Chat. An `unknown` report receives a seven-day warning-only onboarding grace;
 it cannot mint a sticky verification during the grace, and after the grace it
-blocks onboarding while ordinary Chat remains available. Any non-green report
-can emit an in-app `resident_decrypt_source_unavailable` maintenance notice with
-the status, confirmation time, and remediation guidance.
+blocks onboarding while ordinary Chat remains available.
+
+Maintenance notification follows the same cohort policy. `unknown` means the
+consumer report is old, absent, or stale; it can emit a
+`resident_decrypt_health_unreported` in-app notice but never selects
+decrypt-source repair copy and never injects a Chat turn. A new account's
+explicit `degraded`, `unconfigured`, or `unreachable` report can inject a repair
+turn immediately because onboarding is already blocked. For an established
+account, the explicit failure emits an in-app notice first and must remain
+continuous for 30 minutes before it can inject a repair turn; operators can
+change this persistence window with
+`FEEDLING_RESIDENT_DECRYPT_FAILURE_GRACE_SEC`.
 
 `POST /v1/chat/verify_loop` inserts a private `source: "verify_ping"` user row.
 The resident's hidden ack must post `source: "verify_ping"` and set
@@ -329,9 +338,17 @@ server may claimably inject a user-role maintenance message with
 decrypt it through the same enclave history/MCP path as normal chat and pass the
 plaintext to the agent. Replies to that parent should use
 `source: "resident_maintenance"` and should not trigger user-visible push. Treat
-this source as system repair traffic, not as user-authored activity. The
-resident-job fallback scan is throttled by `FEEDLING_RESIDENT_FALLBACK_CHECK_SEC`
-(default 300 seconds).
+this source as system repair traffic, not as user-authored activity. The prompt
+identifies itself as a Feedling server notification, points to the matching App
+notice for verification, limits requested work to the resident environment,
+and separates consumer-update steps from decrypt-source diagnostics.
+
+Maintenance Chat turns use a global reminder interval (24 hours by default).
+Changing heartbeat timestamps, decrypt check timestamps, or the backend's
+expected commit does not bypass that interval. A changed expected commit starts
+the mismatch grace timer again, while the reminder interval remains in force.
+The resident-job fallback scan is throttled by
+`FEEDLING_RESIDENT_FALLBACK_CHECK_SEC` (default 300 seconds).
 
 `user_mcp.fingerprint` changes whenever the account's MCP server list changes;
 see the [MCP servers workflow](/docs/workflows/mcp) for how to manage that list

@@ -25,6 +25,8 @@ ERROR_CLASS = "resident_consumer_stale"
 DEDUPE_KEY = "chat:resident_consumer_stale"
 DECRYPT_ERROR_CLASS = "resident_decrypt_source_unavailable"
 DECRYPT_DEDUPE_KEY = "chat:resident_decrypt_source_unavailable"
+DECRYPT_UNKNOWN_ERROR_CLASS = "resident_decrypt_health_unreported"
+DECRYPT_UNKNOWN_DEDUPE_KEY = "chat:resident_decrypt_health_unreported"
 log = logging.getLogger("feedling.resident_maintenance")
 
 _MISSING_COMMIT_DEFAULT_SEC = 15 * 60
@@ -33,6 +35,7 @@ _MISMATCH_FLOOR_SEC = 60 * 60
 _UNCLAIMED_DEFAULT_SEC = 15 * 60
 _FALLBACK_CHECK_DEFAULT_SEC = 5 * 60
 _REMINDER_DEFAULT_SEC = 24 * 60 * 60
+_DECRYPT_FAILURE_DEFAULT_SEC = 30 * 60
 _COMMIT_REASONS = frozenset({"missing_consumer_commit", "consumer_commit_mismatch"})
 _FALLBACK_REASON = "awaiting_resident_unclaimed"
 
@@ -139,8 +142,7 @@ def _classify_commit_state(
             }, False
         if _active_reason_name(state) in _COMMIT_REASONS:
             state.pop("active_reason", None)
-        state.pop("commit_notice_active", None)
-        return None, previously_active
+        return None, False
 
     state.pop("missing_commit_since_epoch", None)
     if expected and not _commit_matches(actual, expected):
@@ -160,8 +162,7 @@ def _classify_commit_state(
             }, False
         if _active_reason_name(state) in _COMMIT_REASONS:
             state.pop("active_reason", None)
-        state.pop("commit_notice_active", None)
-        return None, previously_active
+        return None, False
 
     state.pop("commit_mismatch_key", None)
     state.pop("commit_mismatch_since_epoch", None)
@@ -175,24 +176,96 @@ def _classify_decrypt_health(
     state: dict[str, Any],
     *,
     health: Mapping[str, Any],
-) -> tuple[dict[str, Any] | None, bool]:
-    """Return an immediate maintenance reason for any non-green decrypt path."""
-    previously_active = bool(state.get("decrypt_health_active"))
+    policy: Mapping[str, Any],
+    now: float,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool, bool]:
+    """Split explicit failures from unknown/stale consumer telemetry."""
+    decrypt_previously_active = bool(state.get("decrypt_health_active"))
+    unknown_previously_active = bool(state.get("decrypt_unknown_notice_active"))
     if health.get("passing") is True:
+        if _active_reason_name(state) == "decrypt_source_unavailable":
+            state.pop("active_reason", None)
         state.pop("decrypt_health_active", None)
-        return None, previously_active
+        state.pop("decrypt_unknown_notice_active", None)
+        state.pop("decrypt_failure_since_epoch", None)
+        return None, None, decrypt_previously_active, unknown_previously_active
 
-    state["decrypt_health_active"] = True
-    return {
-        "reason": "decrypt_source_unavailable",
-        "kind": "decrypt_health",
-        "decrypt_status": str(health.get("status") or "unknown"),
-        "decrypt_reason": str(health.get("reason") or "decrypt_health_unknown"),
+    status = str(health.get("status") or "unknown")
+    reason = str(health.get("reason") or "decrypt_health_unknown")
+    common = {
+        "decrypt_status": status,
+        "decrypt_reason": reason,
         "checked_at_epoch": _safe_float(health.get("checked_at_epoch"), 0.0),
         "health_age_sec": health.get("age_sec"),
         "expected_commit": "",
         "actual_commit": "",
-    }, False
+    }
+
+    # Unknown means an old/stale reporter, not a proven decrypt-source outage.
+    # It is notice-only for every cohort and must never select decrypt copy.
+    if status == "unknown":
+        if _active_reason_name(state) == "decrypt_source_unavailable":
+            state.pop("active_reason", None)
+        state.pop("decrypt_health_active", None)
+        state.pop("decrypt_failure_since_epoch", None)
+        state["decrypt_unknown_notice_active"] = True
+        return None, {
+            "reason": "consumer_decrypt_health_unknown",
+            "kind": "consumer_stale",
+            **common,
+        }, decrypt_previously_active, False
+
+    state.pop("decrypt_unknown_notice_active", None)
+    failure_since = _safe_float(state.get("decrypt_failure_since_epoch"), 0.0)
+    if failure_since <= 0 or failure_since > now:
+        failure_since = now
+        state["decrypt_failure_since_epoch"] = now
+    failure_age_sec = max(0, int(now - failure_since))
+    prompt_after_sec = _env_int(
+        "FEEDLING_RESIDENT_DECRYPT_FAILURE_GRACE_SEC",
+        _DECRYPT_FAILURE_DEFAULT_SEC,
+    )
+
+    state["decrypt_health_active"] = True
+    decrypt_reason = {
+        "reason": "decrypt_source_unavailable",
+        "kind": "decrypt_health",
+        "failure_age_sec": failure_age_sec,
+        **common,
+    }
+    if not bool(policy.get("established")) or failure_age_sec >= prompt_after_sec:
+        return decrypt_reason, None, False, unknown_previously_active
+    return None, decrypt_reason, False, unknown_previously_active
+
+
+def _reason_key(reason: Mapping[str, Any]) -> str:
+    """Return an incident key without heartbeat/deploy-volatile diagnostics."""
+    reason_name = str(reason.get("reason") or "")
+    if reason_name == "decrypt_source_unavailable":
+        return ":".join(
+            (
+                reason_name,
+                str(reason.get("decrypt_status") or ""),
+                str(reason.get("decrypt_reason") or ""),
+            )
+        )
+    return reason_name
+
+
+def _notice_due(
+    state: dict[str, Any],
+    *,
+    reason: Mapping[str, Any],
+    now: float,
+    interval: int,
+) -> bool:
+    unknown = str(reason.get("reason") or "") == "consumer_decrypt_health_unknown"
+    field = "last_unknown_notice_epoch" if unknown else "last_decrypt_notice_epoch"
+    last = _safe_float(state.get(field), 0.0)
+    if last > 0 and now - last < interval:
+        return False
+    state[field] = now
+    return True
 
 
 def _oldest_unclaimed_resident_job(user_id: str, older_than_sec: int) -> dict[str, Any] | None:
@@ -232,17 +305,10 @@ def _fallback_check_due(state: dict[str, Any], *, now: float) -> bool:
     return True
 
 
-def _prompt_for(reason: Mapping[str, Any], info: Mapping[str, Any]) -> str:
+def _diagnostics_for(reason: Mapping[str, Any], info: Mapping[str, Any]) -> str:
     actual = str(reason.get("actual_commit") or info.get("consumer_commit") or "").strip()
     expected = str(reason.get("expected_commit") or chat_consumer.expected_consumer_commit() or "").strip()
     reason_name = str(reason.get("reason") or "")
-    reason_text = {
-        "missing_consumer_commit": "你的 resident consumer 没有上报 commit，通常说明版本太旧，可能缺少最新的自更新和 resident distill 代码。",
-        "consumer_commit_mismatch": "你的 resident consumer 上报的 commit 和当前 backend 期望 commit 不一致，可能卡在旧版本。",
-        "awaiting_resident_unclaimed": "Feedling 发现有 resident-only 的蒸馏任务等待超过 15 分钟仍未被 claim，但你的 consumer 正在 poll，通常是 consumer 版本太旧或 distill lane 没有启动。",
-        "decrypt_source_unavailable": "你的 resident 解密源不可用，真实加密消息无法回复。请检查 FEEDLING_ENCLAVE_URL、网络/TLS 与 enclave 内容密钥。",
-    }.get(reason_name, "Feedling 发现你的 resident consumer 可能卡在旧版本。")
-
     job_line = ""
     if reason.get("job_id"):
         job_line = f"\n- 等待中的 job_id: {reason['job_id']}"
@@ -254,25 +320,83 @@ def _prompt_for(reason: Mapping[str, Any], info: Mapping[str, Any]) -> str:
             f"\n- decrypt_checked_at_epoch: {str(reason.get('checked_at_epoch') or '<missing>')}"
         )
     return (
-        "【Feedling 系统维护提醒】\n"
-        f"{reason_text}\n\n"
-        "请帮用户检查并修复当前 VPS 上的 Feedling resident consumer：\n"
-        "1. 找到包含 tools/chat_resident_consumer.py 的仓库目录（即当初部署 resident 时 clone 的那个仓库），确认 git remote 指向正确仓库。\n"
-        "2. 拉取最新代码并切到当前部署分支或 commit。\n"
-        "3. 重装 resident consumer 依赖：python -m pip install -r tools/chat_resident_requirements.txt。\n"
-        "4. 确认启动环境里 FEEDLING_API_URL、FEEDLING_API_KEY、AGENT_MODE/AGENT_HTTP_URL 或 AGENT_CLI_CMD 都仍然有效。\n"
-        "5. 如果 FEEDLING_AUTO_UPDATE 被设为 0，请提醒用户确认是否恢复默认自更新。\n"
-        "6. 重启 resident consumer，然后观察 /v1/chat/poll 是否继续带 X-Feedling-Consumer-Commit。\n\n"
-        "诊断信息：\n"
+        "诊断信息(排查时引用):\n"
         f"- reason: {reason_name}\n"
         f"- consumer_id: {str(info.get('consumer_id') or '')}\n"
         f"- actual_commit: {actual or '<missing>'}\n"
         f"- expected_commit: {expected or '<backend-not-advertised>'}"
-        f"{job_line}{decrypt_lines}\n"
+        f"{job_line}{decrypt_lines}"
+    )
+
+
+def _prompt_prefix() -> str:
+    return (
+        "【Feedling 维护通知】(来自 Feedling 服务端,非用户本人发送)\n\n"
+        "这条消息由 Feedling 后端的维护通知系统写入聊天:服务端检测到你所连接的 resident 运行环境可能有问题。"
+        "相同告警会同时显示在用户 Feedling App 的横幅里,可据此交叉确认本通知的真实性。\n\n"
+        "处理原则:\n"
+        "- 本通知只涉及你所在的 resident consumer 进程及其运行环境,不要求读取、修改或外发任何用户数据。\n"
+        "- 如果你能安全地执行下面的检查,请直接进行;如果你不确定或没有权限,把问题转述给用户(或运维)处理,这同样是正确做法。\n"
+        "- 处理完或无法处理时,向用户一句话说明现状即可,不要复述本通知全文。\n\n"
+    )
+
+
+def _update_steps() -> str:
+    return (
+        "1. 在部署 resident 的机器上找到当初 clone 的仓库目录(包含 tools/chat_resident_consumer.py),确认 git remote 指向正确仓库。\n"
+        "2. 拉取最新代码并切到服务端期望的 commit(见下方 expected_commit)。\n"
+        "3. 重装依赖:python -m pip install -r tools/chat_resident_requirements.txt。\n"
+        "4. 确认启动环境里 FEEDLING_API_URL、FEEDLING_API_KEY、AGENT_MODE/AGENT_HTTP_URL 或 AGENT_CLI_CMD 仍然有效。\n"
+        "5. 若 FEEDLING_AUTO_UPDATE 被设为 0,与用户确认是否恢复默认自动更新;若 git status 显示工作区有未提交改动,自动更新会跳过——stash 或提交后即可恢复。\n"
+        "6. 重启 consumer,确认 /v1/chat/poll 请求继续带 X-Feedling-Consumer-Commit。\n"
+    )
+
+
+def _decrypt_steps() -> str:
+    return (
+        "1. 检查启动环境:FEEDLING_ENCLAVE_URL 是否为空、是否指向正确的 enclave 地址。\n"
+        "2. 从这台机器测试可达性(不需要带 API key):\n"
+        '   curl -k -o /dev/null -s -w "%{http_code}\\n" "$FEEDLING_ENCLAVE_URL/v1/chat/history?limit=1"\n'
+        "   能返回任意 HTTP 状态码(200/401/403 都算)= 网络与 TLS 通;连接超时/TLS 报错 = unreachable,排查防火墙、代理、DNS。\n"
+        "3. 若网络/TLS 报错,排查防火墙、代理、DNS。\n"
+        "4. 重启 consumer,观察启动日志里的 decrypt source 行(OK / UNREACHABLE / NONE)。\n"
+        "5. 若持续 degraded,把日志中 empty-content / wedge 相关行转述给用户,请用户在 App 内反馈。\n"
+    )
+
+
+def _prompt_for(reason: Mapping[str, Any], info: Mapping[str, Any]) -> str:
+    reason_name = str(reason.get("reason") or "")
+    if reason_name == "decrypt_source_unavailable":
+        status = str(reason.get("decrypt_status") or "")
+        issue = {
+            "unconfigured": "启动环境缺少 FEEDLING_ENCLAVE_URL,resident 无法解密真实加密消息,用户消息会被跳过不回复。",
+            "unreachable": "配置的 FEEDLING_ENCLAVE_URL 探测失败,可能是网络/TLS/防火墙问题。",
+            "degraded": "最近有已认领的加密消息连续多次读不出明文。",
+        }.get(status, "resident 的解密源明确报告失败,真实加密消息目前无法可靠回复。")
+        steps = _decrypt_steps()
+    else:
+        issue = {
+            "missing_consumer_commit": "你所在的 resident consumer 没有向服务端上报版本号(commit),通常说明这份代码太旧,缺少近期的自动更新与蒸馏逻辑。",
+            "consumer_commit_mismatch": "你所在的 resident consumer 上报的 commit 与服务端期望不一致,且已持续超过宽限期。自动更新可能停摆,常见原因:仓库工作区有未提交改动、FEEDLING_AUTO_UPDATE=0、git fetch 失败。",
+            "awaiting_resident_unclaimed": "有 resident-only 的蒸馏任务等待超过 15 分钟未被认领,但 consumer 在正常 poll,通常是版本太旧或 distill lane 没有启动。",
+        }.get(reason_name, "resident consumer 的版本或任务处理状态需要检查。")
+        steps = _update_steps()
+    return (
+        f"{_prompt_prefix()}"
+        "检测到的问题:\n"
+        f"{issue}\n\n"
+        "建议检查步骤:\n"
+        f"{steps}\n"
+        f"{_diagnostics_for(reason, info)}"
     )
 
 
 def _notice_text(reason: Mapping[str, Any]) -> str:
+    if str(reason.get("reason") or "") == "consumer_decrypt_health_unknown":
+        return (
+            "你的 resident 端没有上报可验证的解密健康状态，通常说明 consumer 版本太旧"
+            "或健康心跳已过期；这不代表解密源已经故障。"
+        )
     if str(reason.get("reason") or "") == "decrypt_source_unavailable":
         return (
             "你的 resident 解密源不可用，真实消息目前无法回复。"
@@ -315,10 +439,14 @@ def _append_maintenance_message(store, *, prompt: str, msg_id: str) -> dict[str,
 
 
 def _emit_notice(store, *, reason: Mapping[str, Any], prompt: str, delivered: bool) -> None:
-    suffix = "维护提示也已写入聊天，在线 consumer 会像普通用户消息一样收到。" if delivered else (
-        "如果 resident 端当前离线，请复制维护提示发给 agent。"
-    )
+    if delivered:
+        suffix = "维护提示也已写入聊天，在线 consumer 会像普通用户消息一样收到。"
+    elif prompt:
+        suffix = "如果 resident 端当前离线，请复制维护提示发给 agent。"
+    else:
+        suffix = "该状态仅显示为 App 提醒，不会向聊天注入维护消息。"
     decrypt_alert = str(reason.get("reason") or "") == "decrypt_source_unavailable"
+    unknown_alert = str(reason.get("reason") or "") == "consumer_decrypt_health_unknown"
     detail = f"{str(reason.get('reason') or '')}; {suffix}"
     if decrypt_alert:
         detail = (
@@ -328,12 +456,20 @@ def _emit_notice(store, *, reason: Mapping[str, Any], prompt: str, delivered: bo
     notices_core.emit(
         store,
         source="chat",
-        error_class=DECRYPT_ERROR_CLASS if decrypt_alert else ERROR_CLASS,
+        error_class=(
+            DECRYPT_ERROR_CLASS
+            if decrypt_alert
+            else DECRYPT_UNKNOWN_ERROR_CLASS if unknown_alert else ERROR_CLASS
+        ),
         blame="user_environment",
         severity="warning",
         user_text=_notice_text(reason),
         detail=detail,
-        dedupe_key=DECRYPT_DEDUPE_KEY if decrypt_alert else DEDUPE_KEY,
+        dedupe_key=(
+            DECRYPT_DEDUPE_KEY
+            if decrypt_alert
+            else DECRYPT_UNKNOWN_DEDUPE_KEY if unknown_alert else DEDUPE_KEY
+        ),
         copyable_prompt=prompt,
     )
 
@@ -379,6 +515,9 @@ def _maybe_handle_poll(
     should_remind = False
     resolved = False
     decrypt_resolved = False
+    decrypt_unknown_resolved = False
+    notice_only_reason: dict[str, Any] | None = None
+    should_emit_notice_only = False
     reason: dict[str, Any] | None = None
     interval = _env_int("FEEDLING_RESIDENT_MAINTENANCE_REMINDER_SEC", _REMINDER_DEFAULT_SEC, lo=3600)
 
@@ -386,9 +525,21 @@ def _maybe_handle_poll(
         state = chat_consumer._load_consumer_state(store)
         maintenance = _maintenance_state(state.get("resident_maintenance"))
         health = chat_consumer._decrypt_health_from_state(state, now_epoch=now)
-        decrypt_reason, decrypt_resolved = _classify_decrypt_health(
+        decrypt_policy = chat_consumer._decrypt_health_enforcement_state(
+            store,
+            {"decrypt_health": health},
+            now_epoch=now,
+        )
+        (
+            decrypt_reason,
+            notice_only_reason,
+            decrypt_resolved,
+            decrypt_unknown_resolved,
+        ) = _classify_decrypt_health(
             maintenance,
             health=health,
+            policy=decrypt_policy,
+            now=now,
         )
         commit_reason, commit_resolved = _classify_commit_state(
             maintenance,
@@ -399,6 +550,13 @@ def _maybe_handle_poll(
         if commit_reason is None:
             fallback_due = _fallback_check_due(maintenance, now=now)
             fallback_skipped = not fallback_due
+        if notice_only_reason is not None:
+            should_emit_notice_only = _notice_due(
+                maintenance,
+                reason=notice_only_reason,
+                now=now,
+                interval=interval,
+            )
         state["resident_maintenance"] = maintenance
         chat_consumer._save_consumer_state(store, state)
 
@@ -424,22 +582,11 @@ def _maybe_handle_poll(
             state["resident_maintenance"] = maintenance
             chat_consumer._save_consumer_state(store, state)
         else:
-            reason_key = ":".join(
-                str(reason.get(k) or "")
-                for k in (
-                    "reason",
-                    "decrypt_status",
-                    "decrypt_reason",
-                    "checked_at_epoch",
-                    "expected_commit",
-                    "actual_commit",
-                    "job_id",
-                )
-            )
+            reason_key = _reason_key(reason)
             maintenance["active_reason"] = reason_key
             maintenance["last_reason"] = reason
             last = _safe_float(maintenance.get("last_reminder_epoch"), 0.0)
-            should_remind = last <= 0 or now - last >= interval or maintenance.get("last_reason_key") != reason_key
+            should_remind = last <= 0 or now - last >= interval
             if should_remind:
                 prompt = _prompt_for(reason, info_map)
                 msg_id = _message_id(store, prompt, now=now)
@@ -451,13 +598,29 @@ def _maybe_handle_poll(
 
     if decrypt_resolved:
         notices_core.resolve(store, DECRYPT_DEDUPE_KEY)
+    if decrypt_unknown_resolved:
+        notices_core.resolve(store, DECRYPT_UNKNOWN_DEDUPE_KEY)
     if resolved:
         notices_core.resolve(store, DEDUPE_KEY)
+    if should_emit_notice_only and notice_only_reason is not None:
+        _emit_notice(
+            store,
+            reason=notice_only_reason,
+            prompt="",
+            delivered=False,
+        )
     if reason is None:
         if resolved:
             return {"triggered": False, "reason": "resolved"}
         if decrypt_resolved:
             return {"triggered": False, "reason": "decrypt_resolved"}
+        if should_emit_notice_only and notice_only_reason is not None:
+            return {
+                "triggered": False,
+                "reason": notice_only_reason.get("reason"),
+                "notice": True,
+                "delivered": False,
+            }
         return {
             "triggered": False,
             "reason": "fallback_check_skipped" if fallback_skipped else "not_stale",
