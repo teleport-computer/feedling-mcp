@@ -3781,15 +3781,27 @@ def _codex_turn_from_stream(raw: str) -> tuple[str, str]:
     - **0.142 flat EventMsg protocol**: ``{"type":"agent_message","message":...}``
       with reasoning under ``{"type":"agent_reasoning","text":...}``.
 
-    The assistant reply is joined in order; the reasoning summary is returned
-    SEPARATELY so the caller routes it to the collapsible thinking disclosure
-    instead of letting it leak as a chat bubble (the 0.142 regression: the old
-    reader matched nothing → the turn fell through to the generic extractor →
-    the reasoning event's ``text`` was emitted as a message). Both empty means a
-    handshake-only / failed turn so the caller can fall back without leaking.
+    The assistant reply is the LAST agent message — never a join of all of
+    them. When a turn calls a tool, codex emits a *preamble* agent message
+    ("let me check…") BEFORE the tool call and the real answer in a LATER one
+    (the exact shape `_claude_turn_from_stream` documents for claude). The old
+    join glued the preamble onto the answer as one doubled-up bubble (2026-07-22
+    resident report: "我先按你的固定流程轻轻走一遍…" + tool calls + the real
+    reply, all sent as one message). Take-last matches the pi driver; the 0.142
+    ``task_complete`` event's ``last_agent_message``, when present, is preferred
+    as the authoritative reply — the codex analogue of the claude driver
+    trusting only the terminal ``result``.
+
+    The reasoning summary is returned SEPARATELY so the caller routes it to the
+    collapsible thinking disclosure instead of letting it leak as a chat bubble
+    (the 0.142 regression: the old reader matched nothing → the turn fell
+    through to the generic extractor → the reasoning event's ``text`` was
+    emitted as a message). Both empty means a handshake-only / failed turn so
+    the caller can fall back without leaking.
     """
     replies: list[str] = []
     reasoning: list[str] = []
+    final_reply = ""
     for obj in _json_objects_from_cli_output(raw):
         if not isinstance(obj, dict):
             continue
@@ -3826,8 +3838,15 @@ def _codex_turn_from_stream(raw: str) -> tuple[str, str]:
                 text = obj.get("message")
             if isinstance(text, str) and text.strip():
                 reasoning.append(text.strip())
+        elif etype == "task_complete":
+            # 0.142 terminal event: carries the final answer alone, never the
+            # pre-tool preamble — authoritative when non-empty.
+            text = obj.get("last_agent_message")
+            if isinstance(text, str) and text.strip():
+                final_reply = text.strip()
 
-    return "\n\n".join(replies), "\n\n".join(reasoning)
+    reply = final_reply or (replies[-1] if replies else "")
+    return reply, "\n\n".join(reasoning)
 
 
 def _codex_reply_from_stream(raw: str) -> str:
