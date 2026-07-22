@@ -160,6 +160,22 @@ def test_self_heal_dirty_tree_sets_dirty_reason(monkeypatch):
     assert crc._self_update_stall_reason() == "dirty"
 
 
+def test_self_heal_irrelevant_release_clears_reason(monkeypatch):
+    # Sibling of test_irrelevant_release_clears_reason, but for the self-heal
+    # path (disk already checked out at target): a release that touches
+    # nothing this consumer loads must sign compat AND clear any stale reason,
+    # not just skip.
+    _apply_update_seams(monkeypatch)
+    crc._self_update_stall["value"] = "dirty"  # stale from a prior poll
+    monkeypatch.setattr(crc, "_consumer_commit", lambda: "target99")  # disk moved
+    monkeypatch.setattr(
+        crc, "_git_changed_files", lambda local, target: {"docs/CHANGELOG.md"}
+    )
+    crc._run_self_update("target99")
+    assert crc._self_update_stall_reason() == ""
+    assert crc._compat_commit["value"] == "target99"
+
+
 def test_self_heal_reexec_clears_reason(monkeypatch):
     applied = _apply_update_seams(monkeypatch)
     crc._self_update_stall["value"] = "dirty"  # stale from a prior poll
@@ -169,15 +185,3 @@ def test_self_heal_reexec_clears_reason(monkeypatch):
     assert crc._self_update_stall_reason() == ""
 
 
-def test_last_fetch_failed_tracks_git_fetch_outcome(monkeypatch):
-    class _R:
-        def __init__(self, rc):
-            self.returncode = rc
-
-    monkeypatch.setattr(crc, "_git", lambda *a, **k: _R(0))
-    assert crc._git_fetch("target99") is True
-    assert crc._last_fetch_failed is False
-
-    monkeypatch.setattr(crc, "_git", lambda *a, **k: _R(128))
-    assert crc._git_fetch("target99") is False
-    assert crc._last_fetch_failed is True

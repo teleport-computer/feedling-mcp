@@ -850,10 +850,6 @@ def _compat_commit_headers() -> dict:
 # VPS 线长期资产（自托管专属；hosted 走不到这条路径）; pre 合并原样保留。
 _self_update_stall = {"value": ""}
 
-# Set/cleared inside _git_fetch so a fetch failure can be attributed without a
-# second subprocess call.
-_last_fetch_failed = False
-
 
 def _self_update_stall_reason() -> str:
     """Cheap, non-blocking read of the last self-update stall reason.
@@ -1155,13 +1151,10 @@ def _git_tree_dirty() -> bool:
 
 
 def _git_fetch(target: str) -> bool:
-    global _last_fetch_failed
     try:
-        ok = _git("fetch", "--quiet", "origin", target, timeout=120).returncode == 0
+        return _git("fetch", "--quiet", "origin", target, timeout=120).returncode == 0
     except Exception:
-        ok = False
-    _last_fetch_failed = not ok
-    return ok
+        return False
 
 
 def _git_changed_files(local: str, target: str) -> set[str] | None:

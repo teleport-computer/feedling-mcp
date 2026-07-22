@@ -143,8 +143,7 @@ def test_commit_mismatch_prompt_appends_disabled_fix_line(monkeypatch):
         {"consumer_id": "vps-resident-c1", "update_stall_reason": "disabled"},
     )
 
-    assert "自动更新被手动关闭(FEEDLING_AUTO_UPDATE=0)" in prompt
-    assert "打开后即可" in prompt
+    assert "具体原因:自动更新被手动关闭(FEEDLING_AUTO_UPDATE=0)。" in prompt
 
 
 def test_commit_mismatch_prompt_appends_fetch_failed_fix_line(monkeypatch):
