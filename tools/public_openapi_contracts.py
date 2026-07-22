@@ -297,6 +297,76 @@ OPERATION_PARAMETERS[("put", "/v1/genesis/imports/{job_id}/chunks/{seq}")] = [
 
 
 COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "WebSettingsUpdateRequest": {
+        "type": "object",
+        "description": (
+            "Set the user's web-search preference. `enabled` must be a real "
+            "JSON boolean — strings such as \"no\" are rejected with 400 "
+            "rather than coerced."
+        ),
+        "required": ["enabled"],
+        "additionalProperties": False,
+        "properties": {
+            "enabled": {
+                "type": "boolean",
+                "description": "The user's saved preference. Defaults to false.",
+            }
+        },
+    },
+    "WebSettingsResponse": {
+        "type": "object",
+        "description": (
+            "Web-search state. `enabled` is the user's saved preference and is "
+            "written only by the user — an operator halt never rewrites it. "
+            "`runtime_supported` is false for self-hosted accounts, whose "
+            "consumer does not run the tool loop these tools live in, so the "
+            "preference is inert there. `effective` is derived, and covers "
+            "every lane: the proactive companion's background turns follow the "
+            "same switch as foreground chat."
+        ),
+        "required": [
+            "enabled",
+            "runtime_supported",
+            "status",
+            "effective",
+            "tools",
+        ],
+        "additionalProperties": False,
+        "properties": {
+            "enabled": {"type": "boolean", "description": "The user's saved preference."},
+            "runtime_supported": {
+                "type": "boolean",
+                "description": "Whether this account's runtime has the web tools at all.",
+            },
+            "status": {
+                "type": "string",
+                "enum": ["available", "degraded", "unavailable"],
+                "description": (
+                    "`degraded` means one of the two tools is halted and the "
+                    "other still works — not a synonym for unavailable."
+                ),
+            },
+            "effective": {
+                "type": "boolean",
+                "description": "Whether this account's turns actually get web tools.",
+            },
+            "tools": {
+                "type": "object",
+                "required": ["web_search", "web_fetch"],
+                "additionalProperties": False,
+                "properties": {
+                    "web_search": {"$ref": "#/components/schemas/WebToolState"},
+                    "web_fetch": {"$ref": "#/components/schemas/WebToolState"},
+                },
+            },
+        },
+    },
+    "WebToolState": {
+        "type": "object",
+        "required": ["available"],
+        "additionalProperties": False,
+        "properties": {"available": {"type": "boolean"}},
+    },
     "FreeFormJsonObject": {
         "type": "object",
         "description": "Legacy compatibility payload. Consult the operation description before sending fields.",
@@ -1209,6 +1279,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
 
 
 PRECISE_JSON_BODIES: dict[Operation, str] = {
+    ("post", "/v1/web/settings"): "WebSettingsUpdateRequest",
     ("post", "/v1/users/register"): "RegisterRequest",
     ("post", "/v1/access/link-token"): "LinkTokenRequest",
     ("post", "/v1/access/claim-token"): "ClaimTokenRequest",
@@ -1388,6 +1459,26 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("get", "/v1/web/settings"): {
+        "200": {
+            "description": "Current web-search state for the authenticated user.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/WebSettingsResponse"}
+                }
+            },
+        },
+    },
+    ("post", "/v1/web/settings"): {
+        "200": {
+            "description": "The state after applying the update.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/WebSettingsResponse"}
+                }
+            },
+        },
+    },
     ("get", "/healthz"): {
         "503": {
             "description": (

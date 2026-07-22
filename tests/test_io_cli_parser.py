@@ -61,6 +61,25 @@ def test_photo_read_reaches_handler_not_argparse_crash():
     assert payload.get("ok") is False
 
 
+def test_identity_write_agent_name_reaches_handler_not_argparse_crash():
+    """--agent-name must be a real flag, not an 'unrecognized arguments' exit 2.
+
+    Without it the agent has no way to rename itself, and argparse rejects the
+    attempt on stderr — which the agent never surfaces to the user.
+    """
+    r = _run("identity-write", "--agent-name", "老6")
+    assert "unrecognized arguments" not in r.stderr
+    payload = json.loads(r.stdout.strip().splitlines()[-1])
+    assert payload.get("ok") is False
+
+
+def test_identity_read_reaches_handler_not_argparse_crash():
+    r = _run("identity-read")
+    assert "conflicting subparser" not in r.stderr
+    payload = json.loads(r.stdout.strip().splitlines()[-1])
+    assert payload.get("ok") is False
+
+
 def test_memory_delete_reaches_handler_not_argparse_crash():
     r = _run("memory-delete", "--id", "abc")
     assert "conflicting subparser" not in r.stderr

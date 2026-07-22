@@ -251,6 +251,10 @@ def test_worker_child_loop_reuses_route_but_isolates_and_restricts_tools(
             trajectory_events.append((self.scope, event_kind, payload))
 
     dispatcher = worker._make_task_batch_dispatcher(
+        # The child inherits the PARENT LANE's web decision; these tests drive
+        # the dispatcher directly, so state the foreground/enabled case
+        # explicitly instead of relying on the closed-by-default kwarg.
+        disabled_web_tool_names=frozenset(),
         provider_config=provider_config,
         store=object(),
         api_key=None,
@@ -333,6 +337,10 @@ def test_worker_subagent_budget_is_shared_across_parent_task_batches(
     monkeypatch.setattr(worker, "_SUBAGENT_MAX_TOKENS_PER_CALL", 32_768)
 
     dispatcher = worker._make_task_batch_dispatcher(
+        # The child inherits the PARENT LANE's web decision; these tests drive
+        # the dispatcher directly, so state the foreground/enabled case
+        # explicitly instead of relying on the closed-by-default kwarg.
+        disabled_web_tool_names=frozenset(),
         provider_config=provider_config,
         store=object(),
         api_key=None,
@@ -431,6 +439,10 @@ def test_worker_child_private_read_blocks_later_outbound_web(
         fake_capability,
     )
     dispatcher = worker._make_task_batch_dispatcher(
+        # The child inherits the PARENT LANE's web decision; these tests drive
+        # the dispatcher directly, so state the foreground/enabled case
+        # explicitly instead of relying on the closed-by-default kwarg.
+        disabled_web_tool_names=frozenset(),
         provider_config=provider_config,
         store=object(),
         api_key=None,
@@ -504,6 +516,10 @@ def test_worker_child_forged_mutation_gets_text_fallback_without_dispatch(
         ),
     )
     dispatcher = worker._make_task_batch_dispatcher(
+        # The child inherits the PARENT LANE's web decision; these tests drive
+        # the dispatcher directly, so state the foreground/enabled case
+        # explicitly instead of relying on the closed-by-default kwarg.
+        disabled_web_tool_names=frozenset(),
         provider_config=provider_config,
         store=object(),
         api_key=None,
@@ -526,3 +542,137 @@ def test_worker_child_forged_mutation_gets_text_fallback_without_dispatch(
     )
     assert offered[0] is not None
     assert offered[1] is None
+
+
+
+# --------------------------------------------------------------- web gate
+# The child inherits the PARENT LANE's decision, not the raw user preference:
+# a subagent spawned from a wake turn stays offline even for a user who
+# enabled web search. Offer side and execute side read the SAME computed set.
+
+
+def test_child_loses_web_when_the_parent_lane_disabled_it(
+    monkeypatch,
+) -> None:
+    provider_config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="sk-parent-route",
+    )
+    provider_calls = []
+    responses = iter(
+        [
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "child-read",
+                        "name": "workspace_read",
+                        "args": {"path": "/artifacts/report.txt"},
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 1},
+            },
+            {
+                "reply": "The report contains the requested evidence.",
+                "tool_calls": [],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 2},
+            },
+        ]
+    )
+
+    async def fake_provider(config, messages, *, tools=None):
+        provider_calls.append(
+            {
+                "config": config,
+                "messages": messages,
+                "tools": tools,
+            }
+        )
+        return next(responses)
+
+    capability_calls = []
+
+    class _Result:
+        def to_dict(self):
+            return {
+                "ok": True,
+                "data": {"content": "artifact evidence"},
+            }
+
+    def fake_capability(name, _store, **kwargs):
+        capability_calls.append((name, kwargs["params"]))
+        return _Result()
+
+    monkeypatch.setattr(
+        provider_client,
+        "chat_completion_async",
+        fake_provider,
+    )
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        fake_capability,
+    )
+    usage = []
+    trajectory_events = []
+
+    class _Recorder:
+        def __init__(self, scope="parent"):
+            self.scope = scope
+
+        def scoped(self, scope):
+            return _Recorder(scope)
+
+        async def record(self, event_kind, payload):
+            trajectory_events.append((self.scope, event_kind, payload))
+
+    dispatcher = worker._make_task_batch_dispatcher(
+        # The child inherits the PARENT LANE's web decision; these tests drive
+        # the dispatcher directly, so state the foreground/enabled case
+        # explicitly instead of relying on the closed-by-default kwarg.
+        disabled_web_tool_names=worker.v2_web_gate.WEB_TOOL_NAMES,
+        provider_config=provider_config,
+        store=object(),
+        api_key=None,
+        runtime_token="runtime-token",
+        enclave_sem=asyncio.Semaphore(1),
+        trusted_system_blocks=("<skill>stable policy</skill>",),
+        add_usage=usage.append,
+        trajectory_recorder=_Recorder(),
+    )
+
+    (result,) = asyncio.run(
+        dispatcher(
+            [
+                _call("parent-task-webgate", "Inspect the report for evidence."),
+            ]
+        )
+    )
+    body = json.loads(result.content)
+
+    assert body["status"] == "completed"
+    assert body["summary"] == "The report contains the requested evidence."
+    assert capability_calls == [
+        (
+            "workspace_read",
+            {"path": "/artifacts/report.txt"},
+        )
+    ]
+    assert all(call["config"].api_key == provider_config.api_key for call in provider_calls)
+    assert all(call["config"].model == provider_config.model for call in provider_calls)
+    assert all(call["config"].context_window_tokens == 32_768 for call in provider_calls)
+    offered = {spec.name for spec in provider_calls[0]["tools"]}
+    assert offered == worker._SUBAGENT_ALLOWED_TOOLS - {"web_search", "web_fetch"}
+    assert {"web_search", "web_fetch"}.isdisjoint(offered)
+
+
+def test_child_allowed_and_disabled_sets_are_complementary():
+    """Offer side and execute side must be derived from one computation —
+    deriving them independently is how the two halves of a gate drift apart."""
+    web = set(worker.v2_web_gate.WEB_TOOL_NAMES)
+    allowed = worker._SUBAGENT_ALLOWED_TOOLS - web
+    disabled = worker._SUBAGENT_DISABLED_TOOLS | frozenset(web)
+    assert allowed.isdisjoint(disabled)
+    assert web <= disabled
+    assert "memory_fetch" in allowed          # the rest of the surface is intact

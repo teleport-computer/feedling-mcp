@@ -39,6 +39,8 @@ GATE_REVIEW_MAX = int(os.environ.get("FEEDLING_GATE_REVIEW_MAX", 1000))
 PROACTIVE_USER_STATES = {"default", "focused", "social", "resting", "away"}
 PROACTIVE_AI_STATES = {"present", "watching", "thinking", "curious", "waiting"}
 PROACTIVE_BROADCAST_STATES = {"unknown", "on", "off", "paused"}
+# Web-search toggle. Blob-backed like proactive_settings, so no migration.
+WEB_SETTINGS_BLOB = "web_settings"
 PROACTIVE_DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/Shanghai").strip() or "UTC"
 PROACTIVE_WAKE_INTERVAL_DEFAULT_SEC = 7200
 PROACTIVE_WAKE_INTERVAL_MIN_SEC = 900
@@ -1119,6 +1121,47 @@ class UserStore:
         cur["updated_at"] = datetime.now().isoformat()
         with self.proactive_lock:
             db.set_blob(self.user_id, "proactive_settings", cur)
+        return cur
+
+    # ------- web search -------
+    # USER PREFERENCE ONLY. An operator kill switch must never rewrite this —
+    # otherwise restoring the feature would force every user to re-enable it by
+    # hand. Whether the web tools are actually offered on a given turn is
+    # derived (preference + lane + halted flags) in
+    # model_api_runtime/v2/web_gate.py, not here.
+    #
+    # Strict booleans throughout: bool("no") is True, so a coercing
+    # implementation would read {"enabled": "no"} as web access switched ON.
+    def load_web_settings(self) -> dict:
+        """Web-search toggle. Defaults to OFF, with no migration for existing
+        users: a missing blob means off."""
+        default = {"version": 1, "enabled": False}
+        try:
+            doc = db.get_blob(self.user_id, WEB_SETTINGS_BLOB)
+            if isinstance(doc, dict):
+                # Rebuild the contract rather than spreading the stored doc —
+                # a historic blob's unknown fields would otherwise leak into
+                # every response built from this.
+                return {"version": 1, "enabled": doc.get("enabled") is True}
+        except Exception as e:
+            print(f"[{self.user_id}/web_settings] load failed: {e}")
+        return default
+
+    def save_web_settings_strict(self, patch: dict) -> dict:
+        """Accepts only a real ``bool`` under ``enabled`` — an allowlist, not a
+        denylist. Raises ValueError on any other type; nothing is written.
+
+        Uses ``set_blob_strict`` deliberately. ``db.set_blob`` logs and swallows
+        write failures, which for a user-initiated setting would mean the UI
+        reports "switched on" while the next turn still reads the old value.
+        A failed write has to surface as an error.
+        """
+        cur = self.load_web_settings()
+        if isinstance(patch, dict) and "enabled" in patch:
+            if not isinstance(patch["enabled"], bool):
+                raise ValueError("enabled must be boolean")
+            cur["enabled"] = patch["enabled"]
+        db.set_blob_strict(self.user_id, WEB_SETTINGS_BLOB, cur)
         return cur
 
     def first_chat_ok_at(self) -> str:

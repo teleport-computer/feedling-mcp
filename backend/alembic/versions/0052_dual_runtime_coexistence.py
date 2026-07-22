@@ -1,7 +1,7 @@
 """Dual-runtime coexistence: restore V1 supervisor state + user allowlist.
 
-Revision ID: 0050_dual_runtime_coexistence
-Revises: 0049_merge_test_pre_heads
+Revision ID: 0052_dual_runtime_coexistence
+Revises: 0051_web_settings_backfill
 
 Restores the resident-supervisor tables dropped by 0045 (prod's test-lineage
 DB has NOT yet run 0045; on prod the upgrade chain runs 0045 then this — the
@@ -10,8 +10,8 @@ v2_user_allowlist control table for the per-user canary rollout.
 """
 from alembic import op
 
-revision = "0050_dual_runtime_coexistence"
-down_revision = "0049_merge_test_pre_heads"
+revision = "0052_dual_runtime_coexistence"
+down_revision = "0051_web_settings_backfill"
 branch_labels = None
 depends_on = None
 

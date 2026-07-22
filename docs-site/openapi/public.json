@@ -7067,6 +7067,88 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/web/settings": {
+      "get": {
+        "summary": "Web Settings Get",
+        "operationId": "web_settings_get_v1_web_settings_get",
+        "responses": {
+          "200": {
+            "description": "Current web-search state for the authenticated user.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebSettingsResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "x-feedling-contract-level": "documented"
+      },
+      "post": {
+        "summary": "Web Settings Post",
+        "operationId": "web_settings_post_v1_web_settings_post",
+        "responses": {
+          "200": {
+            "description": "The state after applying the update.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebSettingsResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebSettingsUpdateRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented"
+      }
+    },
     "/v1/worldbook/delete": {
       "delete": {
         "summary": "Worldbook Delete",
@@ -7283,6 +7365,83 @@
           }
         },
         "title": "ValidationError"
+      },
+      "WebSettingsUpdateRequest": {
+        "type": "object",
+        "description": "Set the user's web-search preference. `enabled` must be a real JSON boolean — strings such as \"no\" are rejected with 400 rather than coerced.",
+        "required": [
+          "enabled"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "The user's saved preference. Defaults to false."
+          }
+        }
+      },
+      "WebSettingsResponse": {
+        "type": "object",
+        "description": "Web-search state. `enabled` is the user's saved preference and is written only by the user — an operator halt never rewrites it. `runtime_supported` is false for self-hosted accounts, whose consumer does not run the tool loop these tools live in, so the preference is inert there. `effective` is derived, and covers every lane: the proactive companion's background turns follow the same switch as foreground chat.",
+        "required": [
+          "enabled",
+          "runtime_supported",
+          "status",
+          "effective",
+          "tools"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "The user's saved preference."
+          },
+          "runtime_supported": {
+            "type": "boolean",
+            "description": "Whether this account's runtime has the web tools at all."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "degraded",
+              "unavailable"
+            ],
+            "description": "`degraded` means one of the two tools is halted and the other still works — not a synonym for unavailable."
+          },
+          "effective": {
+            "type": "boolean",
+            "description": "Whether this account's turns actually get web tools."
+          },
+          "tools": {
+            "type": "object",
+            "required": [
+              "web_search",
+              "web_fetch"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "web_search": {
+                "$ref": "#/components/schemas/WebToolState"
+              },
+              "web_fetch": {
+                "$ref": "#/components/schemas/WebToolState"
+              }
+            }
+          }
+        }
+      },
+      "WebToolState": {
+        "type": "object",
+        "required": [
+          "available"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "type": "boolean"
+          }
+        }
       },
       "FreeFormJsonObject": {
         "type": "object",

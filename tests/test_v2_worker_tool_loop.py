@@ -164,6 +164,16 @@ def _text_round(text, *, prompt_tokens=1, completion_tokens=1):
     }
 
 
+def _tool_result_contents(call) -> set[str]:
+    """Tool results reach the next provider round as ToolExchange objects, not
+    plain message dicts."""
+    out = set()
+    for message in call["messages"]:
+        for result in getattr(message, "results", ()) or ():
+            out.add(str(result.content or ""))
+    return out
+
+
 def _tool_round(*tool_calls, prompt_tokens=1, completion_tokens=1):
     return {
         "reply": "",
@@ -179,8 +189,11 @@ def _tc(call_id, name, **args):
     return {"id": call_id, "name": name, "args": args}
 
 
-def _deps(*, messages, token="rt-enclave"):
+def _deps(*, messages, token="rt-enclave", web_enabled=True):
     return worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: web_enabled,
         read_messages=lambda uid: list(messages),
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: token,
@@ -256,6 +269,9 @@ def _late_input_deps(uid: str, written: list[str]) -> worker.TurnDeps:
         return v2_effect_outbox.apply_pending_effects(user_id, dispatch=dispatch)
 
     return worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: True,
         read_messages=lambda _user_id: read_after_seq(uid, 0),
         read_messages_after_seq=read_after_seq,
         resolve_provider=lambda _user_id: (_BYOK, {}),
@@ -837,6 +853,9 @@ def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
         )
 
     deps = worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: True,
         read_messages=lambda _user_id: _read_after_seq(uid, 0),
         read_messages_after_seq=_read_after_seq,
         resolve_provider=lambda _user_id: (_BYOK, {}),
@@ -1032,6 +1051,9 @@ def test_committed_final_reply_survives_post_commit_bookkeeping_failures(
         )
 
     deps = worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: True,
         read_messages=lambda _uid: read_after_seq(uid, 0),
         read_messages_after_seq=read_after_seq,
         resolve_provider=lambda _uid: (_BYOK, {}),
@@ -1112,6 +1134,9 @@ def test_pre_commit_status_failure_still_fails_without_reply(monkeypatch):
         ]
 
     deps = worker.TurnDeps(
+        # web_search/web_fetch are gated per user now (default OFF); these
+        # tests use them as a generic outbound read, so opt in explicitly.
+        web_tools_enabled=lambda uid: True,
         read_messages=lambda _uid: read_after_seq(uid, 0),
         read_messages_after_seq=read_after_seq,
         resolve_provider=lambda _uid: (_BYOK, {}),
@@ -1559,3 +1584,297 @@ def test_chat_turn_with_no_reply_produced_marks_job_failed_not_completed(monkeyp
     row = _turn_metric_row(job_id)
     assert row is not None
     assert row[1] is True  # failed=True in the metric row too
+
+
+# --------------------------------------------------------------- web gate
+
+
+def _offered(call) -> set[str]:
+    return {spec.name for spec in (call["tools"] or ())}
+
+
+def test_chat_offers_web_tools_when_the_user_enabled_them(monkeypatch):
+    uid = "u_web_gate_on"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    calls = _script_provider(monkeypatch, [_text_round("ok")])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+        web_enabled=True,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert {"web_search", "web_fetch"} <= _offered(calls[0])
+
+
+def test_chat_hides_web_tools_when_the_user_disabled_them(monkeypatch):
+    """Closed state means the tools are ABSENT from the request, not offered
+    and then refused: nothing for the model to call, nothing to explain away."""
+    uid = "u_web_gate_off"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    calls = _script_provider(monkeypatch, [_text_round("ok")])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+        web_enabled=False,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert {"web_search", "web_fetch"}.isdisjoint(_offered(calls[0]))
+    # the rest of the catalog is untouched — this gate is additive, not a
+    # wholesale narrowing of what the model can do
+    assert "memory_index" in _offered(calls[0])
+
+
+def test_chat_hides_web_tools_when_deps_seam_is_absent(monkeypatch):
+    """TurnDeps.web_tools_enabled defaults to None (worker never imports
+    hosted). That must read as OFF, not as "unconfigured, therefore allow"."""
+    uid = "u_web_gate_none"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    calls = _script_provider(monkeypatch, [_text_round("ok")])
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [
+            {"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}
+        ],
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt-enclave",
+        apply_pending_effects=_apply_effects,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert {"web_search", "web_fetch"}.isdisjoint(_offered(calls[0]))
+
+
+def test_web_kill_switch_removes_the_tools_even_when_the_user_enabled_them(monkeypatch):
+    uid = "u_web_gate_halted"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    monkeypatch.setattr(worker.kill_switch, "web_halted", lambda: (True, False))
+    calls = _script_provider(monkeypatch, [_text_round("ok")])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+        web_enabled=True,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    offered = _offered(calls[0])
+    assert "web_search" not in offered      # halted
+    assert "web_fetch" in offered           # independently still allowed
+
+
+def test_kill_switch_flipped_mid_turn_cancels_the_next_web_batch(monkeypatch):
+    """turn_catalog is computed once at the turn entry, so the offer side alone
+    cannot stop a batch the model plans AFTER an operator halts web. The
+    dispatcher re-checks before executing.
+
+    Boundary being asserted: NEW dispatches stop. Requests already in flight are
+    not cancelled — that is stated in the helper's docstring and in the runbook.
+    """
+    uid = "u_web_halt_midturn"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    # Not halted while the turn opens (so web IS in the offered catalog), halted
+    # by the time the model asks for it.
+    reads = {"n": 0}
+
+    def _flipping():
+        reads["n"] += 1
+        return (False, False) if reads["n"] == 1 else (True, True)
+
+    monkeypatch.setattr(worker.kill_switch, "web_halted", _flipping)
+
+    calls = _script_provider(monkeypatch, [
+        _tool_round(_tc("s1", "web_search", query="x")),
+        _text_round("done"),
+    ])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+        web_enabled=True,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    # offered at turn entry (first read said "not halted")
+    assert "web_search" in {spec.name for spec in (calls[0]["tools"] or ())}
+    # but the batch never executed: the model saw the halt error instead
+    assert "error: web_tool_halted" in _tool_result_contents(calls[1])
+
+
+def test_sibling_tools_are_cancelled_with_a_distinct_error(monkeypatch):
+    """All-or-nothing: running the siblings while dropping the web call would
+    leave half a batch applied. The sibling gets its own error string so the
+    model can tell it was policy, not a memory_index failure."""
+    uid = "u_web_halt_sibling"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    # Offered at turn entry, halted by the time the batch is dispatched — the
+    # whole point of the second boundary.
+    reads = {"n": 0}
+
+    def _flipping():
+        reads["n"] += 1
+        return (False, False) if reads["n"] == 1 else (True, True)
+
+    monkeypatch.setattr(worker.kill_switch, "web_halted", _flipping)
+
+    calls = _script_provider(monkeypatch, [
+        _tool_round(
+            _tc("s1", "web_search", query="x"),
+            _tc("s2", "memory_index"),
+        ),
+        _text_round("done"),
+    ])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+        web_enabled=True,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    contents = _tool_result_contents(calls[1])
+    assert "error: web_tool_halted" in contents
+    assert "error: batch_cancelled_web_halted" in contents
+
+
+def test_non_web_batches_do_not_pay_for_a_control_read(monkeypatch):
+    """The control-table read only happens when the batch actually contains a
+    web call — otherwise every tool batch would carry a needless DB round-trip."""
+    uid = "u_web_halt_noread"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    reads = {"n": 0}
+
+    def _counting():
+        reads["n"] += 1
+        return (False, False)
+
+    monkeypatch.setattr(worker.kill_switch, "web_halted", _counting)
+
+    _script_provider(monkeypatch, [
+        _tool_round(_tc("s1", "memory_index")),
+        _text_round("done"),
+    ])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+        web_enabled=True,
+    )
+
+    asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    # exactly one read: the turn-entry offer decision. The memory_index batch
+    # must not have triggered a second one.
+    assert reads["n"] == 1
+
+
+def test_half_open_halt_gives_the_still_working_tool_a_collateral_error(monkeypatch):
+    """search halted, fetch fine, one batch holding both.
+
+    Cancelling the whole batch is right, but web_fetch is only collateral — if it
+    is told "web_tool_halted" the model concludes fetch is down too and stops
+    retrying something that still works.
+    """
+    uid = "u_web_half_open"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    _patch_real_write(monkeypatch)
+
+    reads = {"n": 0}
+
+    def _flipping():
+        reads["n"] += 1
+        # open at turn entry so both tools are offered; search halted by dispatch
+        return (False, False) if reads["n"] == 1 else (True, False)
+
+    monkeypatch.setattr(worker.kill_switch, "web_halted", _flipping)
+
+    calls = _script_provider(monkeypatch, [
+        _tool_round(
+            _tc("s1", "web_search", query="x"),
+            _tc("s2", "web_fetch", url="https://example.com/"),
+        ),
+        _text_round("done"),
+    ])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+        web_enabled=True,
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    contents = _tool_result_contents(calls[1])
+    assert "error: web_tool_halted" in contents           # search: really halted
+    assert "error: batch_cancelled_web_halted" in contents  # fetch: collateral

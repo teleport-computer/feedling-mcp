@@ -49,6 +49,8 @@ EXPECTED_PUBLIC_OPERATIONS = {
 }
 
 EXPECTED_API_KEY_ONLY_OPERATIONS = {
+    ("get", "/v1/web/settings"),
+    ("post", "/v1/web/settings"),
     ("post", "/v1/access/link-token"),
     ("post", "/v1/account/reset"),
     ("get", "/v1/mcp/servers"),
@@ -160,9 +162,11 @@ def test_public_operation_and_parameter_inventory(
     operations: dict[tuple[str, str], dict[str, Any]],
 ) -> None:
     # 144 since GET /v1/agent/perception/recent_apps (Lark t100530);
-    # 146 since the two notify-relay endpoints (register/push, both with bodies)
-    assert len(operations) == 146
-    assert sum("requestBody" in operation for operation in operations.values()) == 67
+    # 146 since the two notify-relay endpoints (register/push, both with bodies);
+    # 148 since GET/POST /v1/web/settings (the web-search toggle, Lark t100535) —
+    # only the POST carries a body, hence 67 -> 68.
+    assert len(operations) == 148
+    assert sum("requestBody" in operation for operation in operations.values()) == 68
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")
@@ -571,3 +575,94 @@ def test_every_reference_resolves_to_a_component(public_schema: dict[str, Any]) 
     for ref in refs:
         resolved = _resolve_local_ref(public_schema, ref)
         assert isinstance(resolved, dict) and resolved, ref
+
+
+def test_web_settings_contract_is_precise_not_free_form(
+    operations: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    """The toggle is a security-relevant control plane, so its contract has to
+    be spelled out: a FreeFormJsonObject body would let a client send
+    `{"enabled": "no"}` and only find out at runtime that it is a 400."""
+    post = operations[("post", "/v1/web/settings")]
+    body = post["requestBody"]
+    assert body["required"] is True
+    assert body["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WebSettingsUpdateRequest"
+    }
+    assert post["x-feedling-contract-level"] == "documented"
+
+    for verb in ("get", "post"):
+        response = operations[(verb, "/v1/web/settings")]["responses"]["200"]
+        assert response["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/WebSettingsResponse"
+        }, verb
+
+
+def test_web_settings_schemas_pin_the_field_types(
+    public_schema: dict[str, Any],
+) -> None:
+    components = public_schema["components"]["schemas"]
+
+    request = components["WebSettingsUpdateRequest"]
+    assert request["required"] == ["enabled"]
+    assert request["properties"]["enabled"]["type"] == "boolean"
+    assert request["additionalProperties"] is False
+
+    response = components["WebSettingsResponse"]
+    assert set(response["required"]) == {
+        "enabled", "runtime_supported", "status", "effective", "tools",
+    }
+    for field in ("enabled", "runtime_supported", "effective"):
+        assert response["properties"][field]["type"] == "boolean", field
+    # `degraded` must be expressible: one tool halted, the other still usable.
+    assert set(response["properties"]["status"]["enum"]) == {
+        "available", "degraded", "unavailable",
+    }
+    tools = response["properties"]["tools"]
+    assert set(tools["required"]) == {"web_search", "web_fetch"}
+    assert components["WebToolState"]["properties"]["available"]["type"] == "boolean"
+
+
+def test_web_settings_response_schema_matches_what_the_core_actually_returns(
+    public_schema: dict[str, Any],
+) -> None:
+    """Tie the published contract to the real producer.
+
+    The two are edited in different files, so without this they drift silently —
+    which is exactly how `unavailable_reason` ended up documented as a
+    non-nullable string while the endpoint returns null whenever web is
+    available.
+    """
+    import sys
+    from pathlib import Path as _Path
+
+    sys.path.insert(0, str(_Path(__file__).parent.parent.parent / "backend"))
+    from web import settings_core as web_settings_core
+
+    class _Store:
+        def __init__(self, enabled):
+            self._enabled = enabled
+
+        def load_web_settings(self):
+            return {"version": 1, "enabled": self._enabled}
+
+    schema = public_schema["components"]["schemas"]["WebSettingsResponse"]
+    documented = set(schema["required"])
+    allowed_status = set(schema["properties"]["status"]["enum"])
+
+    def _settings(enabled, halted, supported=True):
+        return web_settings_core.get_settings(
+            _Store(enabled),
+            halted_reader=lambda: halted,
+            runtime_supported_reader=lambda _s: supported,
+        )
+
+    cases = [
+        _settings(False, (False, False)),               # available
+        _settings(True, (True, False)),                 # degraded
+        _settings(True, (True, True)),                  # unavailable via halts
+        _settings(True, (False, False), supported=False),  # unavailable: self-hosted
+    ]
+    for payload in cases:
+        assert set(payload) == documented, payload
+        assert payload["status"] in allowed_status, payload
