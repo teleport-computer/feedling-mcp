@@ -19,6 +19,122 @@ def _identity_action_text(value, max_chars: int) -> str:
     return text[:max_chars].strip()
 
 
+class ListOpConflict(Exception):
+    """Raised when a patch specifies more than one operation (legacy
+    direct-list assign, add_*, remove_*, replace_*) for the SAME list field
+    in a single request — ambiguous intent, rejected rather than guessed at."""
+
+
+class ListOpBlank(Exception):
+    """Raised when an add_*/replace_* op's items are all blank after
+    stripping. Deliberately NOT treated as "clear the list" — that stays the
+    legacy direct-list-assign behavior only (back-compat), so a caller can't
+    accidentally wipe a list field by sending whitespace-only items on the
+    new op keys."""
+
+
+# field -> (add_key, remove_key, replace_key). Drives apply_list_ops below so
+# the four list fields (signature/boundaries/do_not_say/stable_definitions)
+# share one merge code path instead of four hand-copied ones — only this
+# lookup table is per-field, never the logic. Note "signature" pluralizes to
+# "replace_signatures" for the whole-group op (replacing the WHOLE list of
+# signature phrases) while add_/remove_ stay singular (one phrase at a time);
+# the other three fields are already plural/compound nouns so all three keys
+# match the field name.
+#
+# V2 migration note: pre 分支 backend/capabilities/identity.py 的 patch 能力与
+# tool_schema.py 的 identity_patch 参数需在 0727 合并时同步支持这些操作键
+# (add_/remove_/replace_ + 四个 list 字段) —— 取本分支超集，别只挑一半迁过去。
+_LIST_OP_FIELDS: dict[str, tuple[str, str, str]] = {
+    "signature": ("add_signature", "remove_signature", "replace_signatures"),
+    "boundaries": ("add_boundaries", "remove_boundaries", "replace_boundaries"),
+    "do_not_say": ("add_do_not_say", "remove_do_not_say", "replace_do_not_say"),
+    "stable_definitions": (
+        "add_stable_definitions", "remove_stable_definitions", "replace_stable_definitions"),
+}
+
+
+def _clean_list_items(raw) -> list[str]:
+    """Normalize a raw patch value into a stripped/truncated/blank-filtered
+    list[str], the same shape _identity_profile_patch has always produced
+    for these fields (max 12 items, 240 chars each, blanks dropped)."""
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [item for item in (_identity_action_text(v, 240) for v in raw[:12]) if item]
+
+
+def apply_list_ops(existing: dict, patch: dict) -> dict:
+    """Pure merge for the 4 list-shaped profile fields.
+
+    ``existing`` is the current card's relevant fields (a superset dict is
+    fine — only the 4 list fields are read). ``patch`` is the raw action
+    patch, which may carry the legacy direct-list key (e.g. ``signature``)
+    and/or one of ``add_<field>`` / ``remove_<field>`` / ``replace_<field>``.
+
+    Returns ``{field: merged_list}`` — only for fields the patch actually
+    touches; untouched fields are omitted so the caller's own "did this
+    field change" bookkeeping stays correct.
+
+    Raises:
+        ListOpConflict: more than one of {legacy key, add_, remove_,
+            replace_} present for the same field in this patch.
+        ListOpBlank: an add_/replace_ op's items are all blank after
+            stripping (remove has no such guard — removing nothing is a
+            harmless no-op, not a clear).
+    """
+    if not isinstance(existing, dict):
+        existing = {}
+    if not isinstance(patch, dict):
+        patch = {}
+
+    result: dict[str, list[str]] = {}
+    for field, (add_key, remove_key, replace_key) in _LIST_OP_FIELDS.items():
+        legacy_present = field in patch
+        add_present = add_key in patch
+        remove_present = remove_key in patch
+        replace_present = replace_key in patch
+        present_count = sum((legacy_present, add_present, remove_present, replace_present))
+        if present_count == 0:
+            continue
+        if present_count > 1:
+            raise ListOpConflict(field)
+
+        old_list = existing.get(field) if isinstance(existing.get(field), list) else []
+        old_list = [str(item) for item in old_list]
+
+        if legacy_present:
+            # Back-compat: unchanged behavior, including "empty list clears
+            # the field" — no ListOpBlank here, that's the new op keys only.
+            result[field] = _clean_list_items(patch.get(field))
+            continue
+
+        if replace_present:
+            new_list = _clean_list_items(patch.get(replace_key))
+            if not new_list:
+                raise ListOpBlank(field)
+            result[field] = new_list
+            continue
+
+        if add_present:
+            additions = _clean_list_items(patch.get(add_key))
+            if not additions:
+                raise ListOpBlank(field)
+            merged = list(old_list)
+            for item in additions:
+                if item not in merged:
+                    merged.append(item)
+            result[field] = merged
+            continue
+
+        # remove_present
+        removals = set(_clean_list_items(patch.get(remove_key)))
+        result[field] = [item for item in old_list if item not in removals]
+
+    return result
+
+
 def _identity_plain_for_action(store: UserStore, api_key: str | None,
                                runtime_token: str = "") -> tuple[dict | None, str]:
     # Only pass runtime_token when present, so the api_key path keeps the original
@@ -140,125 +256,145 @@ def _identity_profile_patch(
                 "hint": "介绍无需变化时读旧卡原样带回 --self-introduction",
                 "action": "identity.profile_patch"}, [], 400
 
-    plain, err = _identity_plain_for_action(store, api_key, runtime_token=runtime_token)
-    if plain is None:
-        return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409
-
-    payload = _identity_payload_from_plain(plain)
-    changed: list[str] = []
-    audit_old = ""
-    audit_new = ""
-
-    if "agent_name" in patch:
-        new_name = card_policy.stripped_agent_name(_identity_action_text(patch.get("agent_name"), 80))
-        if not new_name:
-            return {"status": "error", "error": "agent_name_empty", "action": "identity.profile_patch"}, [], 400
-        if new_name.lower() in identity_service._IDENTITY_RUNTIME_LABELS:
-            # Same error code as card_policy.validate_profile_patch (raw pre-check above) —
-            # unify so punctuation-wrapped runtime labels ("`hermes`") that slip past the raw
-            # pre-check still fail with the identical code once normalized here.
-            return {"status": "error", "error": "agent_name_is_runtime_label", "action": "identity.profile_patch"}, [], 400
-        old_name = str(payload.get("agent_name") or "")
-        if new_name != old_name:
-            payload["agent_name"] = new_name
-            changed.append("agent_name")
-            audit_old = old_name
-            audit_new = new_name
-
-    if "self_introduction" in patch:
-        intro = str(patch.get("self_introduction") or "").strip()[:1200]
-        if not intro:
-            return {"status": "error", "error": "self_introduction_empty", "action": "identity.profile_patch"}, [], 400
-        old_intro = str(payload.get("self_introduction") or "")
-        if intro != old_intro:
-            payload["self_introduction"] = intro
-            changed.append("self_introduction")
-            if not audit_old and not audit_new:
-                audit_old = old_intro[:120]
-                audit_new = intro[:120]
-
-    for key in identity_service._IDENTITY_PROFILE_STRING_FIELDS:
-        if key in {"agent_name", "self_introduction"} or key not in patch:
-            continue
-        max_len = 1200 if key in {"relationship_anchor", "tone_style", "custom_persona_prompt"} else 240
-        new_value = _identity_action_text(patch.get(key), max_len)
-        old_value = str(payload.get(key) or "")
-        if new_value != old_value:
-            if new_value:
-                payload[key] = new_value
-            else:
-                payload.pop(key, None)
-            changed.append(key)
-            if not audit_old and not audit_new:
-                audit_old = old_value[:120]
-                audit_new = new_value[:120]
-
+    # Pre-check the legacy direct-list keys' shape here (outside the lock —
+    # pure validation, same as the card_policy checks above): preserves the
+    # existing "{field}_must_be_list" 400 for malformed input before we ever
+    # touch the enclave / lock. apply_list_ops itself is lenient (treats a
+    # bad type as empty) because add_/remove_/replace_ op keys never had this
+    # guard to begin with.
     for key in identity_service._IDENTITY_PROFILE_LIST_FIELDS:
-        if key not in patch:
-            continue
-        raw_list = patch.get(key)
-        if isinstance(raw_list, str):
-            raw_list = [raw_list]
-        if not isinstance(raw_list, list):
+        if key in patch and not isinstance(patch.get(key), (list, str)):
             return {"status": "error", "error": f"{key}_must_be_list", "action": "identity.profile_patch"}, [], 400
-        values = [_identity_action_text(item, 240) for item in raw_list[:12]]
-        values = [item for item in values if item]
-        old_values = payload.get(key) if isinstance(payload.get(key), list) else []
-        if values != old_values:
-            if values:
-                payload[key] = values
-            else:
-                payload.pop(key, None)
-            changed.append(key)
-            if not audit_old and not audit_new:
-                audit_old = ", ".join(old_values)[:120]
-                audit_new = ", ".join(values)[:120]
 
-    if not changed:
+    # Everything below is a read-existing-card -> merge -> re-encrypt -> save
+    # span. It must run under the per-user identity_mutation_lock so two
+    # concurrent profile_patch calls (e.g. two different add_signature ops)
+    # can't both read the same pre-mutation card and lost-update each other —
+    # see identity/service.py::identity_mutation_lock for why UserStore's own
+    # identity_lock (which only wraps the final save) isn't enough.
+    def _read_merge_save() -> tuple[dict, list[dict], int]:
+        plain, err = _identity_plain_for_action(store, api_key, runtime_token=runtime_token)
+        if plain is None:
+            return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409
+
+        payload = _identity_payload_from_plain(plain)
+        changed: list[str] = []
+        audit_old = ""
+        audit_new = ""
+
+        if "agent_name" in patch:
+            new_name = card_policy.stripped_agent_name(_identity_action_text(patch.get("agent_name"), 80))
+            if not new_name:
+                return {"status": "error", "error": "agent_name_empty", "action": "identity.profile_patch"}, [], 400
+            if new_name.lower() in identity_service._IDENTITY_RUNTIME_LABELS:
+                # Same error code as card_policy.validate_profile_patch (raw pre-check above) —
+                # unify so punctuation-wrapped runtime labels ("`hermes`") that slip past the raw
+                # pre-check still fail with the identical code once normalized here.
+                return {"status": "error", "error": "agent_name_is_runtime_label", "action": "identity.profile_patch"}, [], 400
+            old_name = str(payload.get("agent_name") or "")
+            if new_name != old_name:
+                payload["agent_name"] = new_name
+                changed.append("agent_name")
+                audit_old = old_name
+                audit_new = new_name
+
+        if "self_introduction" in patch:
+            intro = str(patch.get("self_introduction") or "").strip()[:1200]
+            if not intro:
+                return {"status": "error", "error": "self_introduction_empty", "action": "identity.profile_patch"}, [], 400
+            old_intro = str(payload.get("self_introduction") or "")
+            if intro != old_intro:
+                payload["self_introduction"] = intro
+                changed.append("self_introduction")
+                if not audit_old and not audit_new:
+                    audit_old = old_intro[:120]
+                    audit_new = intro[:120]
+
+        for key in identity_service._IDENTITY_PROFILE_STRING_FIELDS:
+            if key in {"agent_name", "self_introduction"} or key not in patch:
+                continue
+            max_len = 1200 if key in {"relationship_anchor", "tone_style", "custom_persona_prompt"} else 240
+            new_value = _identity_action_text(patch.get(key), max_len)
+            old_value = str(payload.get(key) or "")
+            if new_value != old_value:
+                if new_value:
+                    payload[key] = new_value
+                else:
+                    payload.pop(key, None)
+                changed.append(key)
+                if not audit_old and not audit_new:
+                    audit_old = old_value[:120]
+                    audit_new = new_value[:120]
+
+        try:
+            list_updates = apply_list_ops(payload, patch)
+        except ListOpConflict as exc:
+            return {"status": "error", "error": "list_op_conflict", "field": str(exc),
+                    "action": "identity.profile_patch"}, [], 400
+        except ListOpBlank as exc:
+            return {"status": "error", "error": "list_op_blank", "field": str(exc),
+                    "action": "identity.profile_patch"}, [], 400
+
+        for key, values in list_updates.items():
+            old_values = payload.get(key) if isinstance(payload.get(key), list) else []
+            if values != old_values:
+                if values:
+                    payload[key] = values
+                else:
+                    payload.pop(key, None)
+                changed.append(key)
+                if not audit_old and not audit_new:
+                    audit_old = ", ".join(old_values)[:120]
+                    audit_new = ", ".join(values)[:120]
+
+        if not changed:
+            return {
+                "status": "ok",
+                "action": "identity.profile_patch",
+                "changed_fields": [],
+                "noop": True,
+            }, [], 200
+
+        reason = _identity_action_text(
+            action.get("reason") or f"Identity profile updated: {', '.join(changed)}.",
+            500,
+        )
+        identity, change, err = _save_identity_action_payload(
+            store,
+            payload,
+            audit={
+                "action": "profile_patch",
+                "dimension": "profile",
+                "old_value": audit_old,
+                "new_value": audit_new,
+                "reason": reason,
+            },
+            event_type="identity_action_profile_patch",
+        )
+        if identity is None:
+            return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409
+
+        effect = {
+            "type": "identity_updated",
+            "action": "identity.profile_patch",
+            "fields": changed,
+            "identity_id": identity.get("id", ""),
+            "change_id": change.get("id", "") if change else "",
+        }
         return {
             "status": "ok",
             "action": "identity.profile_patch",
-            "changed_fields": [],
-            "noop": True,
-        }, [], 200
+            "changed_fields": changed,
+            "identity": {
+                "id": identity.get("id", ""),
+                "updated_at": identity.get("updated_at", ""),
+                "days_with_user": identity_service._live_days_with_user(identity, store=store),
+            },
+            "change": change or {},
+        }, [effect], 200
 
-    reason = _identity_action_text(
-        action.get("reason") or f"Identity profile updated: {', '.join(changed)}.",
-        500,
-    )
-    identity, change, err = _save_identity_action_payload(
-        store,
-        payload,
-        audit={
-            "action": "profile_patch",
-            "dimension": "profile",
-            "old_value": audit_old,
-            "new_value": audit_new,
-            "reason": reason,
-        },
-        event_type="identity_action_profile_patch",
-    )
-    if identity is None:
-        return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409
-
-    effect = {
-        "type": "identity_updated",
-        "action": "identity.profile_patch",
-        "fields": changed,
-        "identity_id": identity.get("id", ""),
-        "change_id": change.get("id", "") if change else "",
-    }
-    return {
-        "status": "ok",
-        "action": "identity.profile_patch",
-        "changed_fields": changed,
-        "identity": {
-            "id": identity.get("id", ""),
-            "updated_at": identity.get("updated_at", ""),
-            "days_with_user": identity_service._live_days_with_user(identity, store=store),
-        },
-        "change": change or {},
-    }, [effect], 200
+    with identity_service.identity_mutation_lock(store.user_id):
+        return _read_merge_save()
 
 
 def _identity_dimension_nudge(

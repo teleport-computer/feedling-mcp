@@ -1,7 +1,9 @@
 """Identity card storage, change log, relationship-day anchors."""
 
 import re
+import threading
 import uuid
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 
 
@@ -14,6 +16,34 @@ from memory import service as memory_service
 # (identity/actions.py, genesis/service.py, hosted/history_import.py).
 from identity.card_policy import RUNTIME_LABELS as _IDENTITY_RUNTIME_LABELS  # noqa: F401
 from identity import card_policy
+
+
+# Per-user identity-mutation mutex. Broader than UserStore.identity_lock below
+# (which only wraps the final db.set_blob write in _save_identity): that lock
+# leaves the read-existing-card -> merge -> re-encrypt span unguarded, so two
+# concurrent profile_patch calls for the same user can both read the same
+# pre-mutation card, independently merge (e.g. two different add_signature
+# ops), and the second write clobbers the first's addition (lost update).
+# identity_mutation_lock(user_id) closes that whole span instead.
+#
+# Keyed by user_id (not by UserStore instance) so it holds even if callers
+# construct/obtain separate UserStore objects for the same user. The guard
+# lock only protects inserting a new per-user Lock into the dict — it is not
+# held while the per-user lock itself is held.
+_IDENTITY_MUTATION_LOCKS: dict[str, threading.Lock] = {}
+_IDENTITY_MUTATION_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def identity_mutation_lock(user_id: str):
+    """Serialize identity profile mutations for a single user across threads.
+    Must wrap the full read-existing-card -> merge -> re-encrypt -> save span
+    (see identity/actions.py::_identity_profile_patch), not just the final
+    save — see module docstring above for why."""
+    with _IDENTITY_MUTATION_LOCKS_GUARD:
+        lock = _IDENTITY_MUTATION_LOCKS.setdefault(user_id, threading.Lock())
+    with lock:
+        yield
 
 
 def _load_identity(store: UserStore) -> dict | None:
