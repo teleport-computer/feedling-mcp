@@ -6675,9 +6675,44 @@ def execute_agent_actions(actions: list[dict]) -> dict:
         # through the consumer's own agent-output funnel. It is explicitly
         # NOT part of the shadow/enforce/off allowlist experiment — it runs
         # in ALL THREE modes, never gated by FEEDLING_ACTION_ALLOWLIST.
+        #
+        # The effective patch MUST be built the same way the server builds
+        # it (backend/identity/actions.py's _identity_profile_patch,
+        # ~line 333): start from the "patch" dict (or {} if absent/not a
+        # dict), then overlay any top-level profile field present on the
+        # action that isn't already IN that dict. Anything narrower or
+        # wider than that is a real bug, not a rounding error:
+        #   - narrower (e.g. just the "patch" dict, no top-level overlay):
+        #     an agent can hide an unpaired rename by putting agent_name at
+        #     the TOP level while "patch" carries something else (or is
+        #     empty) — the funnel sees no rename, forwards it, and the
+        #     server's own merge then applies the unpaired rename anyway.
+        #     BYPASS.
+        #   - wider (e.g. treating the whole action as the patch): a
+        #     legitimately paired patch with self_introduction riding at
+        #     the top level (agent_name inside "patch") gets falsely
+        #     rejected as unpaired.
+        # card_policy.PROFILE_FIELDS is exactly the set identity/service.py's
+        # private _IDENTITY_PROFILE_FIELDS aliases
+        # (`_IDENTITY_PROFILE_FIELDS = set(card_policy.PROFILE_FIELDS)`) —
+        # since card_policy is already imported above, this reads the SAME
+        # single source the server itself uses, so it cannot drift the way
+        # a hand-copied field list could (unlike io_cli's _LIST_FIELDS
+        # table, which mirrors a narrower, list-only slice of this and is
+        # hand-kept in sync — this reuses the real thing directly instead).
         if canonical_type == "identity.profile_patch" and _card_policy is not None:
-            raw_patch = action.get("patch") if isinstance(action.get("patch"), dict) else action
-            pairing_ok, pairing_err = _card_policy.validate_rename_pairing(raw_patch)
+            patch_dict = action.get("patch") if isinstance(action.get("patch"), dict) else None
+            # Copy, never mutate: the server mutates action["patch"] in
+            # place while merging, but `action` here is the SAME object
+            # about to be forwarded on the wire unchanged (C1's contract) —
+            # merging top-level fields into it in place would change the
+            # actual JSON body sent to the server, not just this read-only
+            # validation check.
+            effective_patch = dict(patch_dict) if patch_dict is not None else {}
+            for field in _card_policy.PROFILE_FIELDS:
+                if field in action and field not in effective_patch:
+                    effective_patch[field] = action[field]
+            pairing_ok, pairing_err = _card_policy.validate_rename_pairing(effective_patch)
             if not pairing_ok:
                 log.warning(
                     "action_admission rejected type=%s canonical=%s reason=%s — "

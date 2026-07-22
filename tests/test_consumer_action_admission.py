@@ -1053,10 +1053,10 @@ def test_execute_agent_actions_rename_pairing_via_identity_patch_alias(monkeypat
 
 
 def test_execute_agent_actions_rename_pairing_top_level_fields_no_patch_key(monkeypatch):
-    """Matches the server's fallback extraction: when there's no "patch" dict
-    key at all, the action itself (its top-level fields) is what gets
-    checked — an agent that puts agent_name directly on the action (no
-    nested "patch") is still caught."""
+    """Matches the server's merge extraction: when there's no "patch" dict
+    key at all, the effective patch is built purely from top-level profile
+    fields on the action — an agent that puts agent_name directly on the
+    action (no nested "patch") is still caught."""
     calls = []
     monkeypatch.setattr(crc._HTTP, "post", _http_router(calls=calls))
 
@@ -1066,6 +1066,95 @@ def test_execute_agent_actions_rename_pairing_top_level_fields_no_patch_key(monk
 
     assert calls == []
     assert result["outcomes"][0]["outcome"] == "rejected_validation"
+
+
+def test_execute_agent_actions_rename_pairing_bypass_shape_now_rejected(monkeypatch):
+    """Consolidated re-review regression: the funnel used to build its
+    effective patch as `action.get("patch") if dict else action` — no
+    top-level overlay. An agent could put the rename at the TOP level
+    while "patch" carried something unrelated (or was merely present with
+    other fields), so the funnel's naive check saw no "agent_name" inside
+    "patch" and passed it through; the SERVER then merges the top-level
+    agent_name into the patch (backend/identity/actions.py's
+    _identity_profile_patch) and applies the unpaired rename anyway — on
+    the VPS/api-key path the server's OWN pairing gate doesn't even fire
+    (it's runtime-token-gated), so nothing else would have caught this.
+    After the fix, the funnel merges top-level fields the same way the
+    server does and catches it."""
+    calls = []
+    monkeypatch.setattr(crc._HTTP, "post", _http_router(calls=calls))
+
+    result = crc.execute_agent_actions([
+        {
+            "type": "identity.profile_patch",
+            "patch": {"category": "伙伴"},
+            "agent_name": "老六",
+        },
+    ])
+
+    assert calls == [], "the merged-in top-level rename must be caught before any HTTP call"
+    assert result["outcomes"][0]["outcome"] == "rejected_validation"
+    assert result["outcomes"][0]["error_code"] == "rename_requires_self_introduction"
+
+
+def test_execute_agent_actions_rename_pairing_false_reject_shape_now_forwarded(monkeypatch):
+    """The mirror-image bug: self_introduction riding at the TOP level
+    (agent_name inside "patch") is exactly what the server would accept
+    (it merges the top-level self_introduction in before validating) — the
+    funnel must not falsely reject it just because self_introduction isn't
+    physically inside the "patch" dict."""
+    calls = []
+    monkeypatch.setattr(
+        crc._HTTP, "post",
+        _http_router(
+            identity=_Resp(200, {
+                "status": "ok",
+                "results": [{"status": "ok", "action": "identity.profile_patch"}],
+                "effects": [{"type": "identity_updated"}],
+            }),
+            calls=calls,
+        ),
+    )
+
+    result = crc.execute_agent_actions([
+        {
+            "type": "identity.profile_patch",
+            "patch": {"agent_name": "老六"},
+            "self_introduction": "我是老六。",
+        },
+    ])
+
+    assert len(calls) == 1, "a rename paired via a top-level self_introduction must be forwarded"
+    assert result["outcomes"][0]["outcome"] == "applied"
+
+
+def test_execute_agent_actions_rename_pairing_does_not_mutate_the_forwarded_action(monkeypatch):
+    """The funnel's merge must be a read-only COPY for validation purposes
+    only — it must never mutate action["patch"] in place (that would change
+    the actual JSON body sent to the server, unlike the server's own
+    in-place merge, which is fine there because the server owns that dict)."""
+    calls = []
+    monkeypatch.setattr(
+        crc._HTTP, "post",
+        _http_router(
+            identity=_Resp(200, {
+                "status": "ok",
+                "results": [{"status": "ok", "action": "identity.profile_patch"}],
+                "effects": [{"type": "identity_updated"}],
+            }),
+            calls=calls,
+        ),
+    )
+
+    patch_dict = {"agent_name": "老六"}
+    action = {"type": "identity.profile_patch", "patch": patch_dict, "self_introduction": "我是老六。"}
+    crc.execute_agent_actions([action])
+
+    assert patch_dict == {"agent_name": "老六"}, "the original patch dict must be untouched"
+    assert calls[0][1]["actions"][0]["patch"] == {"agent_name": "老六"}, (
+        "the wire payload must be byte-identical to the input — self_introduction "
+        "must NOT be duplicated into the forwarded patch dict"
+    )
 
 
 def test_execute_agent_actions_rename_pairing_only_applies_to_profile_patch():
