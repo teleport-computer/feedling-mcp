@@ -475,3 +475,43 @@ model/changelog Unreleased)+ 若 OpenAPI 面变化则 `npm run openapi:generate`
   如实记录成功率,它是已知薄弱面。
 - FEATURE_LOG「工具能力补全」模块:合并方式、上线状态(consumer 重启/镜像)手工回写。
 - 合 test/推送/上线节奏:hx 拍板,不自行执行。
+
+---
+
+## Phase 7 — onboarding 可观测性(T16;独立无依赖,可在 T14 前执行)
+
+### Task 16: 蒸馏失败原因分类与透传
+
+**Files:**
+- Modify: `backend/genesis/worker.py`(失败点归类)、`backend/genesis/service.py`
+  (`mark_failed` 增 error_code 参数;`write_genesis_state` blob 增
+  `error_code`/`error_hint` 字段)
+- Test: `tests/test_genesis_failure_codes.py`(新)
+
+**Interfaces:**
+- Produces: `service.classify_genesis_error(error: str, exc: Exception | None) -> str`
+  ——返回固定字典之一:`bad_api_key|provider_timeout|provider_quota|
+  model_bad_json|model_empty_output|worker_restarted|consumer_offline|
+  decrypt_failed|internal`;`GENESIS_ERROR_HINTS: dict[str, str]`(中文人话,
+  如 model_bad_json→"模型输出的格式坏了,已重试仍失败——换个模型或重试一次");
+  `write_genesis_state` 在 status=failed 时带 `error_code`+`error_hint`,
+  processing 时带 `worker_claimed_by`+`claimed_age_sec`。
+- 归类依据(实查过的失败点):`invalid_json/json_not_object/
+  invalid_json_after_repair`→model_bad_json;`_complete_json_retry_empty`
+  耗尽→model_empty_output;llm.complete 超时→provider_timeout;
+  provider 401/403→bad_api_key;429→provider_quota;reaper 捞回→
+  worker_restarted;其余→internal。consumer 侧(decrypt_failed/
+  consumer_offline)本期只定义枚举值不接线(共享路径不动),V2 注释标明。
+
+- [ ] **Step 1: 失败测试**:每类错误串→期望 code 各一条;blob 含
+  error_code/error_hint;processing blob 含 claimed 字段
+- [ ] **Step 2: 实现**(worker 各 `mark_failed`/`GenesisWorkerError` 抛点带上
+  分类;分类函数纯字符串匹配,不吞原始 error——原文继续保留在 `error` 字段)
+- [ ] **Step 3: 每个改动点加 V2 迁移注释**:pre 的 worker 在 serve-worker 线程
+  (`backend/genesis/worker.py` pre 版 + `daemon.py`),同函数同改;
+  分类字典与 hint 文案两边共用一份(本文件),合并时零冲突预期
+- [ ] **Step 4: `--collect-only` + `tests/test_genesis_worker.py
+  tests/test_genesis_service.py` 回归;Commit**
+  `feat(genesis): 蒸馏失败原因分类与透传(error_code/error_hint/卡点信息)`
+- [ ] **迁移手册同步**:T15 文档追加一行——T16 字段是纯增量,pre 侧同名文件
+  同改;iOS 展示为独立后续(不阻塞)。
