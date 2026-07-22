@@ -1,4 +1,8 @@
-"""Identity write actions (profile patch / nudge / days set) + executor."""
+"""Identity write actions (profile patch / nudge / days set) + executor.
+
+写卡原则：只有蒸馏任务可 identity.replace，其余一切写卡走 profile_patch（局部合并）。
+replace/patch 合一（patch+版本参数）是 V2 开放问题，归架构层。——spec 2026-07-22 §3.5
+"""
 
 import json
 import re
