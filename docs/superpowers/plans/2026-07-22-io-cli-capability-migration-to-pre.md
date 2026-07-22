@@ -132,8 +132,9 @@ io_cli/consumer,3.1/3.4 说的"CLI 预检"和"consumer 漏斗"两条防线在 V2
    > in the SAME patch, or the card shows one name and introduces itself
    > with another."
 3. **`backend/capabilities/identity.py::merge_patch_fields()` /
-   `patch()`**(~L29-71)——**这是本条最关键的实查发现**:`merge_patch_fields`
-   的 docstring 已经自己写明了一个陷阱,原文摘录:
+   `patch()`**(`merge_patch_fields` L32-54,`patch()` L57-71)——**这是本条
+   最关键的实查发现**:`merge_patch_fields` 的 docstring 已经自己写明了一个
+   陷阱,原文摘录:
    > "tool_schema's validator ALSO gates replay of already-persisted
    > effects (serve_worker validates a decrypted effect through it). A
    > new rejection rule there would re-interpret payloads enqueued by a
@@ -148,11 +149,33 @@ io_cli/consumer,3.1/3.4 说的"CLI 预检"和"consumer 漏斗"两条防线在 V2
    = {"pending", "pending_fenced_v1"}`)——一个 identity_patch 调用先被
    写入 outbox,再由 `serve_worker` 异步取出重放执行。**重放时会再跑一遍
    `tool_schema.validate_tool_args`**(`tool_schema.py:354` 附近的
-   `identity_patch` 分支,复用同一份 `merge_patch_fields`)。如果直接在
-   这个校验函数里加"改名必须带介绍"的拒绝规则,部署那一刻 outbox 里所有
-   "升级前入队的、只改名不带介绍的旧 effect"重放时会被判定非法——而
-   `retryable=False` 意味着**终态丢弃,不是重试**,用户的改名请求会
-   静默消失,且没有任何报错(agent 已经在旧一轮回复里说"改好了")。
+   `identity_patch` 分支,复用同一份 `merge_patch_fields`)。
+
+   **⚠️ 重放失败时的真实后果是"永远重试",不是"终态丢弃"**(这一点
+   docstring 里其实已经写清楚了,首版本文档抄错了方向,这里改正):
+   `backend/model_api_runtime/v2/effect_outbox.py`(~L818-841)的重放循环
+   只认一种异常会落终态——`db.EffectTerminalError`(→
+   `status='discarded'`,不重试);**其余任何异常(包括
+   `validate_tool_args` 校验失败抛出的普通 `RuntimeError`)都走
+   `db._effect_record_error_on_cursor` 那条路,保留 `pending`/
+   `pending_fenced_v1` 状态,下一轮 sweep 还会再捞出来重放**。也就是说,
+   如果把"改名必须带介绍"的拒绝规则加在 `validate_tool_args` 里,部署那
+   一刻 outbox 里"升级前入队的、只改名不带介绍的旧 effect"重放时会不断
+   撞上新校验规则、不断以 `RuntimeError` 失败、**永远卡在 pending 重试
+   循环里,占用 sweep 资源且永远不会真正应用**——比"静默丢弃"更糟,是
+   一个持续吃资源又看不到进展的挂起态。
+
+   `capabilities/identity.py::patch()` 自己已经有一条现成的
+   fail-closed 先例可以照抄(L60-66,`patch` 字段类型不对时的拒绝)。
+   `retryable=False` → `db.EffectTerminalError` 的映射关系已在
+   `serve_worker.py`(~L1956-1957)实查确认:
+   `retryable = result.error["retryable"]; return RuntimeError(code) if
+   retryable else db.EffectTerminalError(code)`——`CapabilityResult` 的
+   `retryable` 位在这里被转成"要不要抛 `EffectTerminalError`"的判断,
+   再由 `effect_outbox.py` 的重放循环认领(L818-841 只认
+   `db.EffectTerminalError` 才落 `discarded`)。这条映射链路三处都在
+   pre 上核实过,合并时如果 `serve_worker.py`/`errors.py` 这段逻辑又变了
+   (pre 变动快),要重新走一遍这条链路确认,不能只看本文档结论。
 
 ### 合并动作(两阶段发布,R2-I2)
 
@@ -162,12 +185,12 @@ io_cli/consumer,3.1/3.4 说的"CLI 预检"和"consumer 漏斗"两条防线在 V2
    - 字段对齐:`tool_schema.py::PARAMS["identity_patch"]` 补齐 9 个字符串
      字段 + 4 个 list 字段的 add/remove/replace 键名(与本分支
      `backend/identity/actions.py::_LIST_OP_FIELDS` 逐字段对齐,那里已经
-     留了 V2 migration 注释指向这里——见 `actions.py` ~L811-813)。
+     留了 V2 migration 注释指向这里——见 `actions.py` L59-60)。
    - 新增 `identity_dimension_nudge` capability(`capabilities/identity.py`
      新函数)+ `tool_schema.py` 对应 `PARAMS`/`DESCRIPTIONS` 条目
      (字段:`dimension` + `delta`,单条 |delta|≤10 由服务端
      `backend/identity/actions.py::_identity_dimension_nudge` 已经兜底,
-     参见该文件 ~L1420-1426 的 V2 migration 注释)。
+     参见该文件 L619-620 的 V2 migration 注释)。
    - `DESCRIPTIONS["identity_patch"]` 措辞按 `distill_prompt_v1.py`
      `303a9439` 的注释改硬(改名必须同次带介绍,不再是"建议")。
    - **本阶段先不加任何服务端拒绝逻辑**——只是让 V2 原生 agent 的
@@ -180,31 +203,63 @@ io_cli/consumer,3.1/3.4 说的"CLI 预检"和"consumer 漏斗"两条防线在 V2
    `type` 落在 identity 相关(`_LEGACY_SENSITIVE_EFFECT_TYPES` 包含
    `"identity"`)的 `pending`/`pending_fenced_v1` 状态 effect 已经全部
    被 `serve_worker` 处理完(应用或终态失败),不再有"旧版本产生的
-   effect 还在排队"。可以查:
+   effect 还在排队"。示意查询(**执行前先对照 pre 上
+   `backend/alembic/versions/0027_v2_effect_outbox.py` 实际 schema 核实
+   一遍列名**——`effect_type`/`created_at`/`status` 这三个列在
+   2026-07-23 实查时确实存在,但 pre 变动快,不要免检直接用):
 
        SELECT count(*) FROM v2_effect_outbox
        WHERE status IN ('pending', 'pending_fenced_v1')
          AND effect_type = 'identity'
          AND created_at < '<部署时间戳>';
 
-   （具体表名/字段名以 pre 上 `backend/alembic/versions/0027_v2_effect_outbox.py`
-   实际 schema 为准,上面是示意)。
-3. **第二阶段(drain 确认干净后,单独一次小改动)**:在
-   `tool_schema.py::validate_tool_args` 的 `identity_patch` 分支(紧跟
-   `merge_patch_fields` 调用之后)加真正的拒绝规则:`merged` 里
-   `agent_name` 非空但 `self_introduction` 为空 → 返回校验错误字符串
-   (走 `retryable=False` 终态丢弃路径,这时可以接受,因为已确认没有
-   "合法旧 effect" 会撞上这条新规则了)。
+   **⚠️ `pending_fenced_v1` 这一档不要只用 `created_at < 部署时间戳`
+   一个条件就认为"清干净了"**:这个状态是由 `0041/0042/0044` 几个
+   migration 加的触发器打上的,语义是"排在某个互斥围栏之后、要等前面的
+   mutation-attempt 先解围栏才能轮到自己"——它不是单纯的时间序列,一条
+   老的 identity 改名 effect 完全可能因为**围栏本身卡住**(而不是时间)
+   迟迟不被处理。上面的 SQL 只能告诉你"有没有旧行还挂着",不能告诉你
+   "它们会不会自己走完"——如果计数不为零且长时间不下降,需要去查
+   `0041_v2_mcp_mutation_attempts.py` 里那条围栏机制本身有没有卡住,而
+   不是想当然等它自然清零。
+3. **第二阶段(drain 确认干净后,单独一次小改动)**——**拒绝规则落点是
+   `capabilities/identity.py::patch()`,不是 `tool_schema.py::
+   validate_tool_args`**:在 `patch()` 里,`merge_patch_fields` 算出
+   `patch_fields` 之后、构造 `payload` 之前,加一条检查:`agent_name`
+   非空但 `self_introduction` 为空 → `return err(errors.INVALID,
+   "identity_patch requires self_introduction alongside a rename",
+   retryable=False)`(照抄 L60-66 那条 `patch` 类型校验的 fail-closed
+   写法,同一个函数、同一种返回形状)。
 
-**补一条兼容测试**(第二阶段和第一阶段之间都要跑,写在 pre 侧
-`tests/test_capabilities_identity.py` 或同类文件):模拟一个"部署前入队
-的旧版 payload"(`{"agent_name": "老六"}`,不带 `self_introduction`)在
-**加闸之前**跑 `validate_tool_args("identity_patch", ...)`,断言仍然
-`None`(通过);在**加闸之后**跑同一个 payload,断言明确返回错误字符串
-且是"预期内拒绝"而不是意外 500——这条测试的真正目的不是测新规则本身
-(那是常规单测),而是**留一个显式的、命名清楚的锚点**,证明"旧 payload
-在两个阶段分别会发生什么",避免后续有人看到"拒绝旧 payload"就以为是
-bug 反手改掉。
+   **绝对不要把这条拒绝规则加在 `tool_schema.py::validate_tool_args`
+   里**——上面"pre 实查"第 3 点已经用 `serve_worker.py` 的真实代码证明了
+   这条路径的失败会变成 `RuntimeError`(retryable),而不是
+   `EffectTerminalError`(terminal discard)。加在这里的后果不是"旧
+   effect 被静默丢弃",而是**旧 effect 永远卡在 pending 状态被反复重放、
+   反复因新规则失败、永远不终结**——比丢弃更糟,且更难发现(没有一条
+   "丢弃"日志可查,只有持续增长的重试计数)。`validate_tool_args` 只能
+   继续保持它现在"从不拒绝、只做形状校验"的性质,新的语义拒绝一律放
+   `patch()` 里。
+
+**补一条兼容测试**(第二阶段落地时必须一起加,写在 pre 侧
+`tests/test_capabilities_identity.py` 或同类文件)——**测的是重放路径的
+终态,不是"返回了个字符串"**:
+
+- 构造一个"部署前入队的旧版 payload"(`{"agent_name": "老六"}`,不带
+  `self_introduction`),模拟 `serve_worker` 重放一条 pre-upgrade 时期
+  入队的、只改名不带介绍的 in-flight identity effect。
+- 断言:走完 `capabilities.identity.patch(...)` → `serve_worker` 那条
+  "`retryable` 位判断要不要抛 `EffectTerminalError`"的转换链路之后,
+  **最终结果是 `db.EffectTerminalError`(对应 `effect_outbox` 里落
+  `status='discarded'`),不是一次普通异常**。只断言
+  `validate_tool_args(...)` 或 `patch(...)` "返回了非 None / 返回了错误
+  字符串"是不够的——那种断言在"拒绝规则错放在 `validate_tool_args`"的
+  错误实现下**同样会通过**(因为那条路径也会返回一个非空的错误字符串,
+  只是它转成 `RuntimeError` 之后被 `effect_outbox` 当成可重试,而不是
+  终态丢弃),等于把"重放会无限重试"这个真正的 bug 用一条看似通过的
+  测试盖起来。测试必须显式跑到 `retryable=False` → `EffectTerminalError`
+  这一步,或者至少直接断言 `patch(...)` 返回的 `CapabilityResult`
+  的 `retryable` 字段是 `False`。
 
 **验证命令(本分支侧,字段来源不变,回归用)**:
 ```
@@ -213,18 +268,26 @@ pytest tests/test_identity_list_ops.py tests/test_identity_nudge_cap.py \
 ```
 （pre 侧的新增测试要在 pre 分支上跑,不在本分支范围内。）
 
-**精确锚点(pre 侧,均已通过 `git show origin/pre:<path>` 核实存在)**:
+**精确锚点(pre 侧,均已通过 `git show origin/pre:<path>` 核实存在,
+2026-07-23)**:
 - `backend/capabilities/tool_schema.py` L48-57(`PARAMS["identity_patch"]`)、
   L237-242(`DESCRIPTIONS["identity_patch"]`)、L354-365
-  (`validate_tool_args` 里 `identity_patch` 分支)
-- `backend/capabilities/identity.py` L29-71(`_TOP_LEVEL_PROFILE_FIELDS` /
-  `merge_patch_fields` / `patch`)
-- `backend/model_api_runtime/v2/effect_outbox.py`
-  (`_LEGACY_SENSITIVE_EFFECT_TYPES`、`_PENDING_EFFECT_STATUSES`)
+  (`validate_tool_args` 里 `identity_patch` 分支——**保持只读校验,新的
+  拒绝规则不落这里**)
+- `backend/capabilities/identity.py` L32-54(`merge_patch_fields`,
+  docstring 是本条发现的原始证据)、**L57-71(`patch()`——第二阶段的拒绝
+  规则落点,照抄 L60-66 的 fail-closed 写法)**
+- `backend/model_api_runtime/v2/effect_outbox.py` L818-841(重放循环,
+  只认 `db.EffectTerminalError` 才落 `discarded`,其余异常保留
+  `pending`/`pending_fenced_v1` 重试)、`_LEGACY_SENSITIVE_EFFECT_TYPES`、
+  `_PENDING_EFFECT_STATUSES`
+- `backend/model_api_runtime/v2/serve_worker.py` L1956-1957
+  (`retryable` → `RuntimeError`/`db.EffectTerminalError` 的转换点)
+- `backend/db.py` L8343(`class EffectTerminalError(RuntimeError)`)
 
-**精确锚点(本分支侧,V2 migration 注释已预留)**:
-- `backend/identity/actions.py` ~L811-813(`_LIST_OP_FIELDS` 上方)、
-  ~L1423-1424(`_identity_dimension_nudge` 单条限幅)、~L1574-1575(批量
+**精确锚点(本分支侧,V2 migration 注释已预留,行号已核对当前 HEAD)**:
+- `backend/identity/actions.py` L59-60(`_LIST_OP_FIELDS` 上方)、
+  L619-620(`_identity_dimension_nudge` 单条限幅)、L874-875(批量
   求和限幅)
 - `backend/identity/distill_prompt_v1.py` ~L63-71(`303a9439` 的
   V2/pre 硬规则注释,已在 `origin/test`)
