@@ -226,14 +226,25 @@ def _save_identity_action_payload(
     store: UserStore,
     payload: dict,
     *,
+    existing: dict,
     audit: dict,
     event_type: str,
 ) -> tuple[dict | None, dict | None, str]:
-    existing = identity_service._load_identity(store)
-    if not existing:
-        return None, None, "identity_not_initialized"
-    if not existing.get("relationship_started_at"):
-        return None, None, "identity_relationship_anchor_missing"
+    # `existing` is a caller-supplied SNAPSHOT of the raw identity blob,
+    # taken BEFORE the enclave plaintext read `payload` was merged from (see
+    # _load_identity_snapshot_for_write and the two _read_merge_save
+    # closures below) — NOT loaded fresh here. This function used to call
+    # identity_service._load_identity(store) itself at this point, which was
+    # a real bug (Codex C1 follow-up): that load happens AFTER the enclave
+    # round trip, so a concurrent write landing between the enclave read and
+    # that later load would make `existing` reflect the concurrent write
+    # while `payload` was still merged from data before it — the CAS below
+    # would then wrongly SUCCEED (expected matches current) and silently
+    # clobber the concurrent write instead of catching it. Snapshotting
+    # first and threading it through here closes that whole window: ANY
+    # write landing after the snapshot — including during the enclave round
+    # trip — now makes the CAS fail and the caller retries from a fresh
+    # snapshot.
     envelope, err = core_envelope._build_shared_envelope_for_store(
         store,
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
@@ -268,19 +279,54 @@ def _save_identity_action_payload(
     }
     if envelope.get("K_enclave"):
         identity["K_enclave"] = envelope["K_enclave"]
-    # CAS, not a plain overwrite: `existing` is the EXACT blob this payload was
-    # merged from. gunicorn runs multiple worker processes (see deploy/
-    # docker-compose.yaml); identity_mutation_lock is a process-local
-    # threading.Lock, so it cannot stop a DIFFERENT worker process (handling
-    # the same user) from writing between our read and our write. A plain
-    # `identity_service._save_identity` here would silently clobber that
-    # worker's change (lost update) instead of detecting it. Audit / effect /
-    # TEE-requeue side effects below only run once this CAS has actually won.
+    # CAS, not a plain overwrite: `existing` IS the exact blob this payload
+    # was merged from (see the parameter comment above — snapshotted by the
+    # caller before the enclave read, not re-loaded here). gunicorn runs
+    # multiple worker processes (see deploy/docker-compose.yaml);
+    # identity_mutation_lock is a process-local threading.Lock, so it cannot
+    # stop a DIFFERENT worker process (handling the same user) from writing
+    # between our snapshot and our write — including during the enclave
+    # round trip. A plain `identity_service._save_identity` here would
+    # silently clobber that worker's change (lost update) instead of
+    # detecting it. Audit / effect / TEE-requeue side effects below only run
+    # once this CAS has actually won.
     if not identity_service._save_identity_cas(store, existing, identity):
         raise identity_service.IdentityWriteConflict()
     boot_gates._log_bootstrap_event(store, event_type, success=True)
     change = identity_service._append_identity_change(store, audit)
     return identity, change, ""
+
+
+def _load_identity_snapshot_for_write(store: UserStore) -> tuple[dict | None, str]:
+    """Load the raw identity blob — the exact snapshot that must later be
+    passed as `existing=` to `_save_identity_action_payload`'s CAS write.
+
+    MUST be called BEFORE the enclave plaintext read
+    (`_identity_plain_for_action`) in both `_identity_profile_patch` and
+    `_identity_dimension_nudge`'s `_read_merge_save` closures — not after.
+    Reading it after the enclave round trip (the original, buggy ordering)
+    leaves a window where a concurrent writer's change lands AFTER the
+    enclave read but BEFORE this load: the merge is computed from stale
+    (pre-write) plaintext, yet `existing` would then equal the concurrent
+    writer's ALREADY-current blob, so the CAS would wrongly match and
+    silently clobber it. Reading first means any write landing after this
+    point — including during the enclave round trip that follows — makes
+    the eventual CAS fail instead, and the caller retries from a fresh
+    snapshot (see identity/actions.py::_with_identity_mutation_lock_and_retry).
+
+    Also runs the two existing-card preconditions previously checked inside
+    _save_identity_action_payload (identity must exist; must carry a
+    relationship anchor) — moved here since they're snapshot-dependent and
+    this is now the FIRST thing that touches the raw blob. Same error codes
+    and callers' response status (409) as before this reorder — this is a
+    timing/ordering fix, not a behavior change for the single-writer case.
+    """
+    existing = identity_service._load_identity(store)
+    if not existing:
+        return None, "identity_not_initialized"
+    if not existing.get("relationship_started_at"):
+        return None, "identity_relationship_anchor_missing"
+    return existing, ""
 
 
 # Bounded retry count for identity_mutation_lock's CAS-conflict recovery
@@ -381,6 +427,16 @@ def _identity_profile_patch(
     # see identity/service.py::identity_mutation_lock for why UserStore's own
     # identity_lock (which only wraps the final save) isn't enough.
     def _read_merge_save() -> tuple[dict, list[dict], int]:
+        # Snapshot the raw blob FIRST — before the enclave plaintext read
+        # below — so it covers the ENTIRE span as the CAS `expected` value,
+        # including the enclave round trip itself. See
+        # _load_identity_snapshot_for_write's docstring for why the ordering
+        # matters (Codex C1 follow-up: reading it after the enclave call left
+        # a window where a concurrent write could be silently clobbered).
+        existing, err = _load_identity_snapshot_for_write(store)
+        if existing is None:
+            return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409
+
         plain, err = _identity_plain_for_action(store, api_key, runtime_token=runtime_token)
         if plain is None:
             return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409
@@ -473,6 +529,7 @@ def _identity_profile_patch(
         identity, change, err = _save_identity_action_payload(
             store,
             payload,
+            existing=existing,
             audit={
                 "action": "profile_patch",
                 "dimension": "profile",
@@ -528,6 +585,13 @@ def _identity_dimension_nudge(
     # (e.g. add_signature) and a dimension_nudge can each read the
     # pre-mutation card and lost-update each other's change on save.
     def _read_merge_save() -> tuple[dict, list[dict], int]:
+        # Snapshot the raw blob FIRST — before the enclave plaintext read
+        # below — see _load_identity_snapshot_for_write's docstring and the
+        # matching comment in _identity_profile_patch's _read_merge_save.
+        existing, err = _load_identity_snapshot_for_write(store)
+        if existing is None:
+            return {"status": "error", "error": err, "action": "identity.dimension_nudge"}, [], 409
+
         plain, err = _identity_plain_for_action(store, api_key, runtime_token=runtime_token)
         if plain is None:
             return {"status": "error", "error": err, "action": "identity.dimension_nudge"}, [], 409
@@ -572,6 +636,7 @@ def _identity_dimension_nudge(
         identity, change, err = _save_identity_action_payload(
             store,
             payload,
+            existing=existing,
             audit={
                 "action": "nudge",
                 "dimension": dimension_name,
@@ -624,6 +689,16 @@ def _identity_relationship_days_set(store: UserStore, action: dict) -> tuple[dic
     evidence = _identity_action_text(action.get("relationship_anchor_evidence") or action.get("reason") or "", 500)
     if evidence:
         identity["relationship_anchor_evidence"] = evidence
+    # KNOWN RESIDUAL (not fixed here — spec §9 territory): this is a plain
+    # overwrite, not the CAS `_save_identity_cas` used by profile_patch /
+    # dimension_nudge, and it isn't under identity_mutation_lock either. A
+    # relationship_days_set landing between a concurrent profile_patch's CAS
+    # win and that patch's caller observing success can still silently
+    # clobber it (this write starts from its OWN `existing` snapshot, taken
+    # independently). Low real-world likelihood (this action is rare —
+    # user-triggered recalibration, not a hot path) but worth flagging
+    # alongside the C1 fix rather than presenting profile_patch/
+    # dimension_nudge as the only writers on this row.
     identity_service._save_identity(store, identity)
     boot_gates._log_bootstrap_event(store, "identity_action_relationship_days_set", success=True)
     change = identity_service._append_identity_change(store, {
@@ -729,6 +804,14 @@ def _identity_replace_action(
     if not identity_service._load_identity(store):
         return {"status": "error", "error": "identity_not_initialized",
                 "action": "identity.replace"}, [], 409
+    # KNOWN RESIDUAL (not fixed here — spec §9 territory): replace_identity_preserving_anchor
+    # writes via the plain (non-CAS) identity_service._save_identity, and this whole action
+    # runs outside identity_mutation_lock. The base_identity_replaced_at check above is a
+    # coarser, replace-vs-replace optimistic-concurrency guard (P5) — it does NOT protect
+    # against a concurrent profile_patch/dimension_nudge CAS win landing between this
+    # function's own reads and its write, which this replace's full-card overwrite would
+    # then silently clobber. Acceptable for now: replace is gated to the resident-distill
+    # job path only (HIGH-RISK docstring above), not a normal concurrent-write hot path.
     from genesis import service as genesis_service  # lazy — avoid import cycle
     result = genesis_service.replace_identity_preserving_anchor(
         store, {"identity": identity_payload, "relationship_anchor": _replace_relationship_anchor(action)}

@@ -378,12 +378,20 @@ def test_cross_worker_cas_retry_survives_concurrent_write(monkeypatch):
     threading.Lock (see identity/service.py) — in real deployment, two
     workers each have their OWN independent lock instance, so worker A's
     lock provides ZERO protection against worker B's write. This test does
-    NOT rely on the lock to serialize the two writes: it injects worker B's
-    complete, independent write directly into the shared fake blob table, at
-    the exact point between worker A's raw-blob CAS-expected read and A's
-    own CAS attempt — proving the DB-level CAS + retry survives that race
-    even though (unlike the two tests above) nothing here serializes the two
-    writers up front."""
+    NOT rely on the lock to serialize the two writes.
+
+    Injection point deliberately targets the window this file's C1 follow-up
+    fix closed: worker B's complete, independent write lands between A's raw
+    -blob snapshot (`_load_identity_snapshot_for_write`, taken BEFORE the
+    enclave call) and A's enclave plaintext read — i.e. DURING what would be
+    the enclave round trip in production. Before that fix, the raw-blob
+    snapshot used for the CAS `expected` value was taken AFTER the enclave
+    round trip (inside `_save_identity_action_payload`), so a write landing
+    in exactly this window would have made `expected` equal the ALREADY-
+    current (post-B) row while the merge was still computed from pre-B
+    plaintext — the CAS would have wrongly matched and silently clobbered
+    B's write instead of catching it. Reordering the snapshot to before the
+    enclave call means this window is now covered too."""
     user_id = "u_cross_worker_cas_test"
     blobs: dict[tuple[str, str], dict] = {
         (user_id, "identity"): {
@@ -409,19 +417,14 @@ def test_cross_worker_cas_retry_survives_concurrent_write(monkeypatch):
         if path != "/v1/identity/get":
             return {}, ""
         enclave_reads["n"] += 1
-        return {"identity": {**plain_card, "decrypt_status": "ok"}}, ""
-
-    def fake_build_envelope(store_arg, plaintext, item_id=None):
-        build_calls["n"] += 1
-        if build_calls["n"] == 1:
-            # Worker B's independent write lands HERE — after A has already
-            # captured `existing` (the raw blob) for its own CAS, but before
-            # A's CAS attempt runs. This is exactly the window a process-
-            # local lock on A's process cannot close. A's OWN attempt-1
-            # payload (built from the now-stale pre-B read) is about to lose
-            # its CAS below, so it must NOT be mirrored into plain_card —
-            # only a write that actually lands should change what the
-            # enclave subsequently reports.
+        if enclave_reads["n"] == 1:
+            # Worker B's independent write lands HERE — after A's raw-blob
+            # snapshot (already taken by this point, via
+            # _load_identity_snapshot_for_write) but before A's OWN read of
+            # this enclave endpoint returns. THIS is the window the C1
+            # follow-up fix closed (see docstring above) — it did not exist
+            # in the pre-fix ordering, where the raw-blob snapshot was taken
+            # only after this call returned.
             ok = identity_service._save_identity_cas(
                 store_b,
                 blobs[(user_id, "identity")],
@@ -434,10 +437,16 @@ def test_cross_worker_cas_retry_survives_concurrent_write(monkeypatch):
             )
             assert ok, "worker B's independent write should land cleanly (nothing raced it)"
             plain_card["signature"] = ["seed", "sig-from-B"]
-        else:
-            # This attempt's CAS is expected to win (nothing else races A
-            # past attempt 1 in this test) — mirror its payload into
-            # plain_card, same as a real re-encryption would after landing.
+        return {"identity": {**plain_card, "decrypt_status": "ok"}}, ""
+
+    def fake_build_envelope(store_arg, plaintext, item_id=None):
+        build_calls["n"] += 1
+        if build_calls["n"] > 1:
+            # Only mirror an attempt that's actually going to WIN the CAS
+            # (attempt 1 always loses here — its expected snapshot predates
+            # worker B's write above) — a losing write must not change what
+            # the enclave subsequently reports, same as it wouldn't in
+            # reality (nothing was actually persisted).
             payload = json.loads(plaintext.decode("utf-8"))
             plain_card.clear()
             plain_card.update(payload)
@@ -458,9 +467,10 @@ def test_cross_worker_cas_retry_survives_concurrent_write(monkeypatch):
     )
 
     assert status == 200, result
-    # One enclave read + one envelope build per attempt: attempt 1 loses the
-    # CAS (worker B moved the row underneath it), attempt 2 re-reads (now
-    # sees B's plaintext change too) and wins. Exactly 2 of each confirms the
+    # One enclave read + one envelope build per attempt: attempt 1's raw-blob
+    # snapshot predates worker B's write (injected during attempt 1's own
+    # enclave read), so attempt 1 loses the CAS; attempt 2 re-snapshots
+    # (now sees B's committed row) and wins. Exactly 2 of each confirms the
     # retry path actually ran, not that it coincidentally succeeded first try.
     assert enclave_reads["n"] == 2, "expected exactly one retry after the CAS conflict"
     assert build_calls["n"] == 2
