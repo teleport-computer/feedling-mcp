@@ -166,6 +166,61 @@ def test_redistill_merge_blank_distilled_field_keeps_existing(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Post-review fix: _identity_replace_payload_has_content used to only count
+# agent_name/dimensions/self_introduction/category/signature as "content" —
+# a redistill whose only change was a non-core PROFILE_FIELDS entry (the
+# EXACT user-authored fields this task exists to protect) was rejected as
+# identity_update_empty (fails closed, but silently drops a legitimate
+# update). Locks that a tone_style-only or custom_persona_prompt-only
+# redistill now lands.
+# ---------------------------------------------------------------------------
+
+def test_redistill_tone_style_only_change_is_not_rejected_as_empty(monkeypatch):
+    user_id = "u_redistill_has_content_tone_style"
+    blobs: dict[tuple[str, str], dict] = {}
+    card: dict = {}
+    _seed(user_id, blobs, card)
+    _fake_db_blob_layer(monkeypatch, blobs)
+    _wire_enclave_and_envelope(monkeypatch, card)
+
+    store = _FakeStore(user_id)
+
+    status = genesis_service.replace_identity_preserving_anchor(
+        store,
+        {"identity": {"tone_style": "更活泼的新语气"}},
+        "test-api-key",
+    )
+
+    assert status == "updated"
+    assert card["tone_style"] == "更活泼的新语气"
+    # Everything else this redistill didn't address survives.
+    assert card["agent_name"] == "旧名"
+    assert card["custom_persona_prompt"] == "用户亲手写的 persona,不可丢"
+
+
+def test_redistill_custom_persona_prompt_only_change_is_not_rejected_as_empty(monkeypatch):
+    user_id = "u_redistill_has_content_persona_prompt"
+    blobs: dict[tuple[str, str], dict] = {}
+    card: dict = {}
+    _seed(user_id, blobs, card)
+    _fake_db_blob_layer(monkeypatch, blobs)
+    _wire_enclave_and_envelope(monkeypatch, card)
+
+    store = _FakeStore(user_id)
+
+    status = genesis_service.replace_identity_preserving_anchor(
+        store,
+        {"identity": {"custom_persona_prompt": "用户更新后的 persona 指令"}},
+        "test-api-key",
+    )
+
+    assert status == "updated"
+    assert card["custom_persona_prompt"] == "用户更新后的 persona 指令"
+    assert card["agent_name"] == "旧名"
+    assert card["tone_style"] == "旧语气"
+
+
+# ---------------------------------------------------------------------------
 # Concurrency: a card mutated BETWEEN the distill snapshot and the merge
 # landing must not be clobbered — the merge reads the LATEST card at write
 # time (not a stale pre-job snapshot), and the CAS retries on a genuine race.

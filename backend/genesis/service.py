@@ -708,16 +708,27 @@ def _identity_payload_for_replace(output: dict) -> dict | None:
 
 
 def _identity_replace_payload_has_content(payload: dict) -> bool:
-    if str(payload.get("agent_name") or "").strip():
-        return True
+    """True iff `payload` carries ANY writable profile signal — dimensions, or
+    any card_policy PROFILE_FIELDS entry (agent_name/self_introduction/category/
+    signature, but ALSO tone_style/agent_role/custom_persona_prompt/
+    language_preference/relationship_anchor/do_not_say/boundaries/
+    stable_definitions/user_preferred_name).
+
+    Reuses identity_service._IDENTITY_PROFILE_FIELDS (== card_policy.PROFILE_FIELDS)
+    as the single source of truth — same list _merge_identity_replace_payload
+    iterates — instead of a hand-picked subset. A hand-picked subset previously
+    missed exactly the user-authored fields this task exists to protect: a
+    redistill whose only change was e.g. custom_persona_prompt or tone_style
+    was rejected as `identity_update_empty` (fails closed, no data loss, but
+    silently drops a legitimate update) — reproduced and fixed post-review."""
     if isinstance(payload.get("dimensions"), list) and payload["dimensions"]:
         return True
-    if str(payload.get("self_introduction") or "").strip():
-        return True
-    if str(payload.get("category") or "").strip():
-        return True
-    if isinstance(payload.get("signature"), list) and payload["signature"]:
-        return True
+    for key in identity_service._IDENTITY_PROFILE_FIELDS:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, list) and value:
+            return True
     return False
 
 
