@@ -9,6 +9,7 @@ import importlib
 import base64
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -2029,6 +2030,146 @@ def test_warn_if_hermes_cli_good_profile_is_quiet(monkeypatch, caplog):
     assert "wrap {message}" not in caplog.text
     assert "without HERMES_HOME" not in caplog.text
     assert "Very small turn" not in caplog.text
+
+
+def test_pi_stray_positionals_flags_a_split_model_alias():
+    """A pi command must be all flags — a positional is an extra USER MESSAGE.
+
+    The resident feeds the real message via STDIN so no user text rides argv. When
+    a spaced relay alias leaked into the template unquoted (prod 2026-07-21), its
+    tail became positional argv, pi answered it as a second turn with "好的。", and
+    that trailing message overwrote every real reply.
+    """
+    cmd = shlex.split(
+        "pi --mode json -ne -xt read,edit,write --append-system-prompt /h/p.md "
+        "--model feedling/[kiro零缓] claude-opus-4-6-thinking [不补] "
+        "--thinking medium --session-id sid"
+    )
+    assert crc._pi_stray_positionals(cmd) == ["claude-opus-4-6-thinking", "[不补]"]
+
+
+def test_pi_stray_positionals_quiet_on_a_well_formed_command():
+    cmd = shlex.split(
+        "pi --mode json -ne -xt read,edit,write -e /tmp/bridge.js "
+        "--append-system-prompt /h/p.md "
+        "--model 'feedling/[kiro零缓] claude-opus-4-6-thinking [不补]' "
+        "--thinking medium --session-id sid"
+    )
+    assert crc._pi_stray_positionals(cmd) == []
+
+
+def test_pi_stray_positionals_ignores_unsubstituted_placeholders():
+    """The drift check tokenizes the RAW template, where ``{mcp}`` is still a bare
+    ``{mcp}`` token. It is a placeholder the resident fills per turn (``-e <bridge>``
+    or empty), never a user message — flagging it would fire on every healthy pi
+    user and bury the real signal."""
+    cmd = shlex.split(
+        "pi --mode json -ne -xt read,edit,write {mcp} --append-system-prompt /h/p.md "
+        "--model 'feedling/[Kiro] claude-opus-4-6 [不补]' --session-id {session_id}"
+    )
+    assert crc._pi_stray_positionals(cmd) == []
+
+
+def test_stray_positionals_ignored_for_non_pi_drivers():
+    """codex/claude take the message as a positional by design — only pi is checked."""
+    assert crc._pi_stray_positionals(shlex.split("codex exec --json hello there")) == []
+
+
+@pytest.mark.parametrize("flag", ["-r", "--resume", "-c", "--continue", "-p",
+                                  "--print", "-nt", "-ns", "--offline", "--verbose"])
+def test_pi_stray_positionals_treats_pi_bare_switches_as_bare(flag):
+    """pi's no-argument switches must not consume the NEXT token.
+
+    Verified against the real `pi --help` in the agent-runner image: ``--resume, -r``
+    is "Select a session to resume" — a SWITCH, not a value-taking flag (an earlier
+    revision listed it as value-taking, which made ``pi -r --session-id sid`` report
+    ``['sid']`` as a reply-destroying positional on a healthy template)."""
+    cmd = shlex.split(f"pi --mode json {flag} --session-id sid")
+    assert crc._pi_stray_positionals(cmd) == []
+
+
+@pytest.mark.parametrize("flag", ["--provider", "--api-key", "--system-prompt",
+                                  "--session", "--fork", "--session-dir", "--name",
+                                  "-n", "--models", "--skill", "--theme", "-t"])
+def test_pi_stray_positionals_skips_values_of_real_pi_value_flags(flag):
+    """Every value-taking flag in `pi --help` — missing one turns its VALUE into a
+    false "extra user message" alarm."""
+    cmd = shlex.split(f"pi --mode json {flag} someval --session-id sid")
+    assert crc._pi_stray_positionals(cmd) == []
+
+
+def test_pi_stray_positionals_assumes_unknown_flags_take_a_value():
+    """pi lets extensions register their own flags ("Extensions can register
+    additional flags, e.g. --plan"), so the flag table can never be closed. With a
+    log-only channel we prefer a missed detection over crying wolf on a healthy
+    template, so an UNKNOWN dashed token is assumed value-taking."""
+    cmd = shlex.split("pi --mode json --some-extension-flag someval --session-id sid")
+    assert crc._pi_stray_positionals(cmd) == []
+
+
+def test_pi_stray_positionals_ignores_empty_tokens():
+    """An empty token cannot be the tail of a split model alias; reporting `['']`
+    only dilutes a rare warning."""
+    assert crc._pi_stray_positionals(["pi", "--mode", "json", ""]) == []
+
+
+def test_pi_stray_positionals_ignores_operator_file_refs():
+    """pi's native file/image refs ride argv as ``@<path>`` — a shape the resident
+    itself produces (``_inject_pi_images``) and an operator may hardcode. They are
+    file references, not user messages."""
+    cmd = shlex.split(
+        "pi --mode json -ne --append-system-prompt /h/p.md @/home/u/notes.md "
+        "--session-id sid"
+    )
+    assert crc._pi_stray_positionals(cmd) == []
+
+
+def test_pi_stray_positionals_ignores_the_drift_checks_own_message_sentinel():
+    """``_warn_if_agent_entry_may_drift`` tokenizes ``AGENT_CLI_CMD`` with
+    ``{message}`` already replaced by ``__MSG__``. A pi template carrying
+    ``{message}`` is legal (the check 10 lines above exempts pi from REQUIRING it,
+    it does not forbid it), so the sentinel must not read as a stray positional."""
+    cmd = shlex.split("pi --mode json -ne __MSG__ --session-id sid")
+    assert crc._pi_stray_positionals(cmd) == []
+
+
+def test_warn_if_agent_entry_may_drift_logs_pi_stray_positionals(monkeypatch, caplog):
+    """Diagnostics only — systemd, never the settings page.
+
+    The settings-page channel is unusable here: ``_report_runtime_error`` sets
+    ``_runtime_error_reported``, and ``_note_agent_turn_success`` clears
+    ``last_runtime_error`` on the next successful turn — and in THIS bug every pi
+    turn succeeds (it answers the stray token), so the banner would die seconds
+    after boot while mis-blaming us (the error_class is not in the notices
+    catalog, so it falls back to blame=system)."""
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        "pi --mode json -ne --model feedling/[Kiro] claude-opus-4-6 [不补] "
+        "--session-id {session_id}",
+    )
+    reported: list = []
+    monkeypatch.setattr(crc, "_report_runtime_error",
+                        lambda err, cls="": reported.append((err, cls)))
+
+    crc._warn_if_agent_entry_may_drift()
+
+    assert "[不补]" in caplog.text
+    assert reported == []
+
+
+def test_default_pi_template_emits_no_stray_positionals():
+    """The SHIPPED template, checked by the SHIPPED detector (no re-implementation).
+
+    Covers the regression end to end: spawners builds the command string, the
+    consumer re-tokenizes it, and the real ``_pi_stray_positionals`` must find
+    nothing — for aliases with and without spaces."""
+    from agent_runtime import spawners
+
+    for model in ("m", "[Kiro] claude-opus-4-6 [不补]", "a b c d"):
+        template = spawners._default_cli_cmd("pi", "/h", model=model)
+        assert crc._pi_stray_positionals(shlex.split(template)) == [], model
 
 
 def test_prepare_cli_preserves_message_with_quotes(monkeypatch):

@@ -7,6 +7,7 @@ docker argv. The live process/docker spawn is integration. Pure-unit (no PG).
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -854,6 +855,46 @@ def test_pi_default_cli_cmd_omits_model_when_unset():
     cmd = spawners._default_cli_cmd("pi", "/h", model="")
     assert "--model" not in cmd
     assert cmd.rstrip().endswith("--session-id {session_id}")
+
+
+def test_pi_default_cli_cmd_quotes_model_with_spaces():
+    """A model id with spaces must survive the consumer's ``shlex.split`` as ONE
+    argv token.
+
+    Relay aliases routinely carry spaces — prod carries a dozen of the form
+    ``[Kiro] claude-opus-4-6-thinking [不补]``. The template is a SHELL STRING that
+    the resident re-tokenizes with ``shlex.split`` (chat_resident_consumer
+    ``_cli_cmd_tokens``), so a bare f-string interpolation splits the alias apart
+    and its tail lands as POSITIONAL argv. pi treats positionals as extra user
+    messages: it answered the real turn, then answered the stray ``[不补]`` with
+    "好的。" — and ``_pi_turn_from_stream`` keeps the LAST text-bearing assistant
+    message, so every real reply was discarded and users got "好的。" instead
+    (usr_50c1177a, prod 2026-07-21; memory_capture died the same way with
+    ``no_json_object`` after ``{"cards": []}`` was overwritten).
+    """
+    model = "[kiro零缓] claude-opus-4-6-thinking [不补]"
+    cmd = spawners._default_cli_cmd("pi", "/h", model=model)
+    argv = shlex.split(cmd)
+    assert f"{spawners._PI_PROVIDER_ID}/{model}" in argv
+
+
+def test_pi_default_cli_cmd_model_matches_models_json_entry_id():
+    """``--model`` must name EXACTLY the id ``_pi_models_json`` registers.
+
+    ``_pi_models_json`` writes ``model.strip()`` as the entry id. Before quoting,
+    surrounding whitespace was harmless — ``shlex.split`` discarded it. Quoting makes
+    it load-bearing, so an unstripped route row would ship ``--model 'feedling/gpt-5 '``
+    against an entry id of ``gpt-5`` and pi would exit rc=1 (`Model not found`) before
+    any request. Both sides must normalize identically."""
+    for model in (" gpt-5 ", "[Kiro] claude-opus-4-6 [不补]", "m"):
+        cmd = spawners._default_cli_cmd("pi", "/h", model=model)
+        argv = shlex.split(cmd)
+        sent = argv[argv.index("--model") + 1]
+        entry_id = json.loads(
+            spawners._pi_models_json(base_url="https://r/v1", model=model,
+                                     provider="openai_compatible")
+        )["providers"][spawners._PI_PROVIDER_ID]["models"][0]["id"]
+        assert sent == f"{spawners._PI_PROVIDER_ID}/{entry_id}", model
 
 
 def test_pi_home_writes_models_json():

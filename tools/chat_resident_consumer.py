@@ -4354,6 +4354,68 @@ def _is_pi_cmd(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "pi"
 
 
+# pi's NO-ARGUMENT switches, transcribed from `pi --help` in the agent-runner image.
+# Everything else that looks like a flag is ASSUMED to take a value — pi lets
+# extensions register their own flags ("Extensions can register additional flags,
+# e.g. --plan"), so a closed value-flag allowlist is unmaintainable and every gap in
+# it turns that flag's VALUE into a false "extra user message" alarm. Since this
+# detector is log-only we prefer a missed detection over crying wolf, so the
+# open-ended side is the value-taking one.
+#
+# ⚠️ Membership here is load-bearing in BOTH directions: a value-taking flag listed
+# as bare makes its value read as a positional (false alarm), and a bare switch
+# omitted from this set swallows the following token (missed detection). `--resume`
+# / `-r` is a SWITCH ("Select a session to resume"), not `--resume <id>` — an
+# earlier revision had it backwards and reported `pi -r --session-id sid` as
+# reply-destroying. `--list-models [search]` takes an OPTIONAL argument; it is a
+# terminal diagnostic flag that never appears in a resident template, so bare is the
+# safe reading.
+_PI_BARE_FLAGS = {
+    "-p", "--print", "-c", "--continue", "-r", "--resume", "--no-session",
+    "-nt", "--no-tools", "-nbt", "--no-builtin-tools", "-ne", "--no-extensions",
+    "-ns", "--no-skills", "-np", "--no-prompt-templates", "--no-themes",
+    "-nc", "--no-context-files", "--verbose", "-a", "--approve", "-na",
+    "--no-approve", "--offline", "-h", "--help", "-v", "--version",
+    "--list-models",
+}
+
+
+def _pi_stray_positionals(cmd: list[str]) -> list[str]:
+    """Positional argv tokens in a pi command — each one is an EXTRA user message.
+
+    The resident feeds the real message via STDIN precisely so that no user text
+    rides argv (see ``_default_cli_cmd``'s "NO {message} placeholder" note), so a
+    well-formed pi command is all flags. A positional means the template lost a
+    quote somewhere — prod 2026-07-21 shipped ``--model feedling/[kiro零缓]
+    claude-opus-4-6-thinking [不补]`` unquoted, so pi answered the real turn AND
+    the stray ``[不补]`` ("好的。"), and ``_pi_turn_from_stream`` — which keeps the
+    LAST text-bearing assistant message — handed the user "好的。" instead of the
+    reply. Returns [] for non-pi commands: codex/claude take the message
+    positionally by design."""
+    if not _is_pi_cmd(cmd):
+        return []
+    stray, i = [], 1
+    while i < len(cmd):
+        tok = cmd[i]
+        if tok.startswith("-"):
+            # `--flag=value` carries its value inline — never consume the next token.
+            inline = tok.startswith("--") and "=" in tok
+            i += 1 if (inline or tok in _PI_BARE_FLAGS) else 2
+            continue
+        if not tok:  # an empty token is never a split alias tail
+            i += 1
+            continue
+        # Not user text: `{mcp}`/`{session_id}` placeholders the resident fills per
+        # turn, `__MSG__` (the drift check's own {message} sentinel — a pi template
+        # MAY carry {message}), and `@<path>` pi file refs (_inject_pi_images emits
+        # this shape; an operator may hardcode one).
+        placeholder = tok.startswith("{") and tok.endswith("}")
+        if not placeholder and tok != "__MSG__" and not tok.startswith("@"):
+            stray.append(tok)
+        i += 1
+    return stray
+
+
 def _cli_cmd_tokens() -> list[str]:
     """Tokenize the raw AGENT_CLI_CMD template for driver detection.
 
@@ -4537,6 +4599,22 @@ def _warn_if_agent_entry_may_drift() -> None:
     except ValueError as e:
         log.warning("AGENT_CLI_CMD could not be parsed for drift checks: %s", e)
         return
+
+    stray = _pi_stray_positionals(cmd)
+    if stray:
+        # Diagnostics only, deliberately NOT _report_runtime_error: that channel
+        # cannot carry this. A report sets _runtime_error_reported, and
+        # _note_agent_turn_success clears last_runtime_error on the next successful
+        # turn — and in this failure mode every pi turn SUCCEEDS (it answers the
+        # stray token), so the banner would die seconds after boot. The template is
+        # also operator-overridable, so this stays a warning, not a hard failure.
+        log.warning(
+            "AGENT_CLI_CMD passes positional argument(s) to pi: %r. pi reads "
+            "positionals as EXTRA USER MESSAGES — it will answer them after the "
+            "real turn and that trailing reply replaces the real one. Usually a "
+            "model name containing spaces that was not quoted.",
+            stray,
+        )
 
     if not _is_hermes_chat_cmd(cmd):
         return
