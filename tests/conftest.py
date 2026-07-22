@@ -156,6 +156,7 @@ if not _provisioned:
         "test_io_cli_identity_write_full.py",
         "test_consumer_action_admission.py",
         "test_consumer_capability_inject.py",
+        "test_identity_redistill_ipc.py",
         "test_update_stall_reason.py",
         "test_resident_maintenance_unit.py",
     }

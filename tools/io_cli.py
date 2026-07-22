@@ -28,12 +28,14 @@ import json
 import hashlib
 import os
 import re
+import socket
 import ssl
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend"))
 try:
@@ -177,7 +179,7 @@ def _http_json(method, url, auth, *, payload=None, insecure=False, timeout=30):
         return -1, {"error": f"{type(e).__name__}: {e}"}
 
 
-_REDACTED_ARG_KEYS = {"query", "self_introduction", "signature", "reason"}
+_REDACTED_ARG_KEYS = {"query", "self_introduction", "signature", "reason", "material_text"}
 
 
 def _clip_arg(s, limit=80):
@@ -807,6 +809,183 @@ def cmd_identity_write(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+# ── identity-redistill: terminal → resident consumer, local IPC (T11) ──────
+# D3 来源规则(identity-write's epilog above) reserves whole-card overwrite
+# (identity.replace) for "the distill lane only" — this verb IS that lane's
+# terminal-facing door. Unlike identity-write's incremental profile_patch,
+# a redistill derives a FULL new card from handed-in material and replaces
+# the existing one wholesale, so it must never fire on an offhand remark —
+# only when the user explicitly asks to re-summarize/re-derive identity from
+# material (a long chat log, an old persona doc, ...).
+#
+# io_cli itself never touches crypto: this verb ships PLAINTEXT material over
+# a LOCAL-ONLY Unix-domain socket to the resident consumer running on the same
+# host, which client-seals it (reusing the same v1-envelope path resident
+# capture already uses — see chat_resident_consumer._build_redistill_envelope)
+# and uploads it through the existing sealed genesis-import entry tagged
+# job_kind=resident_redistill (T10's DB-level exclusivity: a second concurrent
+# redistill for this user 409s instead of racing the first).
+#
+# V2 NOTE (2026-07-27 pre-merge): this whole lane is VPS/self-hosted-CLI only
+# — there is no io_cli.py subprocess in V2's hosted runtime (shared worker
+# pool + in-process provider tool calling via backend/capabilities/), so this
+# verb has no V2 counterpart today. If terminal-driven redistill is wanted on
+# hosted post-merge, it needs a NEW capabilities/ registry entry that talks to
+# the same /v1/genesis/imports/plaintext sealed entry — not a port of this
+# socket, which assumes a single co-located consumer process.
+_RESIDENT_REDISTILL_MAX_MATERIAL_BYTES = 64 * 1024
+_RESIDENT_IPC_SOCK_NAME = "resident_ipc.sock"
+
+
+def _resident_ipc_home():
+    """``$FEEDLING_HOME`` (or a sane fingerprinted default). No existing
+    checkpoint-style state dir in this codebase carries a stable per-account
+    home (CHECKPOINT_FILE / IMAGE_TEMP_DIR are each a single fingerprinted
+    /tmp file, not a directory) — this mirrors their exact fingerprint recipe
+    (sha1(FEEDLING_API_KEY)[:10]) so io_cli and the consumer, given the same
+    env, always agree on the socket path with zero operator configuration,
+    while still keeping co-hosted accounts on the same box from colliding on
+    one socket (the same cross-tenant concern IMAGE_TEMP_DIR's default guards
+    against)."""
+    raw = _env("FEEDLING_HOME")
+    if raw:
+        return raw.rstrip("/")
+    fp = hashlib.sha1((os.environ.get("FEEDLING_API_KEY") or "").encode()).hexdigest()[:10]
+    return f"/tmp/feedling_home_{fp}"
+
+
+def _resident_ipc_sock_path():
+    return os.path.join(_resident_ipc_home(), _RESIDENT_IPC_SOCK_NAME)
+
+
+def _resident_ipc_round_trip(sock_path, line, timeout):
+    """One connect+send+recv-one-line attempt. Returns the raw reply bytes, or
+    raises (FileNotFoundError/ConnectionRefusedError = consumer not
+    listening; socket.timeout = consumer alive but slow/stuck; other OSError =
+    some other local IPC failure). Never touches the network itself — that
+    happens consumer-side."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(timeout)
+        s.connect(sock_path)
+        s.sendall(line)
+        try:
+            s.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass  # some platforms reject shutdown on a socket about to close anyway
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def _resident_ipc_request(material, *, timeout=30.0):
+    """Round-trip one redistill request to the resident consumer's local IPC
+    listener. Retries ONCE with the SAME request_id on timeout — the consumer
+    dedupes by request_id (in-memory + a small disk-backed state file), so a
+    retry after a slow-but-alive consumer can never double-submit the
+    material. Never raises: every failure path returns an
+    ``{"ok": False, ...}`` dict, always carrying ``request_id`` once one was
+    minted, so the caller can point the user at it for a manual follow-up."""
+    sock_path = _resident_ipc_sock_path()
+    request_id = str(uuid.uuid4())
+    line = (json.dumps(
+        {"op": "redistill", "request_id": request_id, "material": material},
+        ensure_ascii=False,
+    ) + "\n").encode("utf-8")
+
+    def _attempt():
+        """(reply_dict_or_None, should_retry). None body ⇒ caller may retry."""
+        try:
+            raw = _resident_ipc_round_trip(sock_path, line, timeout)
+        except (FileNotFoundError, ConnectionRefusedError):
+            return {
+                "ok": False, "error": "consumer_not_running", "request_id": request_id,
+                "hint": f"consumer 未运行(本机 IPC socket 不可用: {sock_path})——"
+                        "先确认 resident consumer 进程在跑,再重试",
+            }, False
+        except socket.timeout:
+            return None, True
+        except OSError as e:
+            return {
+                "ok": False, "error": f"ipc_failed:{type(e).__name__}:{e}",
+                "request_id": request_id,
+            }, False
+        text = raw.decode("utf-8", errors="replace").strip()
+        if not text:
+            return None, True  # closed with no data — treat like a timeout, retry once
+        try:
+            reply = json.loads(text.splitlines()[0])
+        except Exception:
+            return None, True
+        if isinstance(reply, dict):
+            reply.setdefault("request_id", request_id)
+            return reply, False
+        return None, True
+
+    reply, retry = _attempt()
+    if reply is not None or not retry:
+        return reply
+    reply, _retry = _attempt()
+    if reply is not None:
+        return reply
+    return {
+        "ok": False, "error": "timeout_uncertain", "request_id": request_id,
+        "hint": "两次等待都超时,蒸馏任务可能仍在后台运行——记下 request_id,"
+                "稍后可再次确认或联系用户查看",
+    }
+
+
+def cmd_identity_redistill(args):
+    """Hand fresh material to the resident consumer for a FULL identity
+    redistill (whole-card replace), over the local resident-consumer IPC
+    socket. 仅用户明确要求重新总结/重新蒸馏人设时使用——不要在用户随口一句
+    话里就触发;这不是 identity-write 的增量 patch,而是整卡重新推导。
+
+    Reads --material-file (UTF-8 text) or --material-text (mutually
+    exclusive, exactly one required). Material over 64KB is rejected locally
+    (exit 2) — the consumer's sealed upload is a single AEAD ciphertext with
+    the same cap the app enforces (see resident_distill_max_bytes; 64KB here
+    is io_cli's own conservative pre-check, well under that limit).
+
+    io_cli sends PLAINTEXT over the LOCAL socket only; the consumer does the
+    actual client-side sealing (see chat_resident_consumer's redistill IPC
+    handler). If the consumer is not running, this exits 2 with a clear
+    "consumer 未运行" error instead of hanging.
+    """
+    if args.material_file:
+        try:
+            with open(args.material_file, "r", encoding="utf-8") as f:
+                material = f.read()
+        except Exception as e:
+            _emit({"ok": False, "error": f"cannot_read_material_file:{type(e).__name__}:{e}"}, 2)
+    else:
+        material = args.material_text or ""
+    if not material.strip():
+        _emit({"ok": False, "error": "material_empty",
+               "hint": "给 --material-file <path> 或 --material-text \"...\""}, 2)
+    material_bytes = material.encode("utf-8")
+    if len(material_bytes) > _RESIDENT_REDISTILL_MAX_MATERIAL_BYTES:
+        _emit({
+            "ok": False, "error": "material_too_large",
+            "max_bytes": _RESIDENT_REDISTILL_MAX_MATERIAL_BYTES,
+            "got_bytes": len(material_bytes),
+        }, 2)
+    reply = _resident_ipc_request(material)
+    if reply.get("ok"):
+        _emit({"ok": True, **{k: v for k, v in reply.items() if k != "ok"}})
+    exit_code = 2 if reply.get("error") == "consumer_not_running" else 1
+    _emit({"ok": False, **{k: v for k, v in reply.items() if k != "ok"}}, exit_code)
+
+
 _FRESH_START_EVIDENCE = "user-confirmed fresh start"
 
 
@@ -1286,6 +1465,18 @@ def main():
                     help="七维微调,格式 名:±整数(如 幽默:+5);repeatable;"
                          "单条及同维度求和 |delta|<=10,一次最多 10 条")
     iw.set_defaults(func=cmd_identity_write)
+
+    ird = sub.add_parser(
+        "identity-redistill",
+        help="仅用户明确要求重新总结/重新蒸馏人设时使用;材料≤64KB,经本机 IPC 交给 "
+             "consumer 整卡重新推导(不是增量 patch,日常改字段用 identity-write)。",
+    )
+    ird_grp = ird.add_mutually_exclusive_group(required=True)
+    ird_grp.add_argument("--material-file", dest="material_file", default=None,
+                         help="材料文件路径(UTF-8 文本);与 --material-text 二选一")
+    ird_grp.add_argument("--material-text", dest="material_text", default=None,
+                         help="材料原文,直接传文本;与 --material-file 二选一")
+    ird.set_defaults(func=cmd_identity_redistill)
 
     ii = sub.add_parser("identity-init", help="[setup] Create the identity card (sanitizes + fresh-start).")
     ii.add_argument("--agent-name", default="", help="your display name")

@@ -267,6 +267,23 @@ USER_MCP_CASTORE_FILE = os.environ.get(
     "USER_MCP_CASTORE_FILE",
     f"/tmp/feedling_user_mcp_castore_{CHECKPOINT_API_KEY_FINGERPRINT}.pem",
 )
+# identity-redistill local IPC (T11): io_cli connects here to hand the
+# consumer plaintext material for a resident distill. No existing "home dir"
+# convention exists in this file (CHECKPOINT_FILE / USER_MCP_FILE are each a
+# single fingerprinted /tmp FILE, not a directory) — FEEDLING_HOME picks the
+# SAME fingerprint recipe (sha1(FEEDLING_API_KEY)[:10]) so io_cli (a separate
+# process, stdlib-only, cannot import this module) computes the identical
+# default path with zero shared state, while still keeping co-hosted accounts
+# on one box from colliding on a single socket (mirrors the collision hazard
+# _USER_MCP_PATHS_PINNED below documents for a keyless host-all consumer —
+# this lane is VPS/CLI-only and never runs keyless, so no pinning fallback is
+# needed here).
+FEEDLING_HOME = Path(
+    os.environ.get("FEEDLING_HOME")
+    or f"/tmp/feedling_home_{CHECKPOINT_API_KEY_FINGERPRINT}"
+)
+RESIDENT_IPC_SOCK = FEEDLING_HOME / "resident_ipc.sock"
+RESIDENT_IPC_STATE_FILE = FEEDLING_HOME / "resident_ipc_state.json"
 # The fingerprint scoping above only isolates accounts while FEEDLING_API_KEY is
 # non-empty. Host-all (Stage-D zero-roster) consumers run keyless, so sha1("")
 # collides for every user on the host and the /tmp defaults become ONE shared
@@ -11320,6 +11337,271 @@ def _decrypt_sealed_material(env: dict) -> bytes:
     return base64.b64decode(b64)
 
 
+# ── identity-redistill local IPC (T11) ──────────────────────────────────────
+# Terminal-facing door onto this same resident-distill lane: io_cli's
+# `identity-redistill` verb (VPS/self-hosted CLI only) connects to a local
+# Unix-domain socket and hands over PLAINTEXT material; THIS process client-
+# seals it (reusing the identical v1-envelope path _capture_build_envelope
+# uses for genesis material) and uploads it through the SAME sealed import
+# entry the app itself POSTs sealed material to
+# (/v1/genesis/imports/plaintext, format=sealed_v1) — tagged
+# job_kind="resident_redistill" so T10's DB-level exclusivity (a partial
+# unique index on genesis_import_jobs) 409s a second concurrent redistill for
+# this user instead of racing the first. The uploaded job then flows through
+# the EXISTING resident-distill poll loop below (_process_resident_distill_once)
+# exactly like any other awaiting_resident job — mode="update_identity" routes
+# it to _resident_distill_identity, so no new distill pipeline is needed here.
+_REDISTILL_IPC_MAX_MATERIAL_BYTES = 64 * 1024
+_REDISTILL_IPC_MAX_STATE_ENTRIES = 50
+_redistill_ipc_seen: dict[str, dict] = {}  # request_id -> reply (in-memory cache)
+
+
+def _redistill_ipc_state_load() -> dict:
+    try:
+        return json.loads(RESIDENT_IPC_STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _redistill_ipc_state_save(state: dict) -> None:
+    """Best-effort; restart-safety only. The in-memory ``_redistill_ipc_seen``
+    dict is the primary source of truth for THIS process's lifetime — a write
+    failure here never blocks a reply, it only weakens dedup across a restart
+    that happens to land exactly between a client's two retry attempts."""
+    try:
+        RESIDENT_IPC_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = RESIDENT_IPC_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state))
+        tmp.replace(RESIDENT_IPC_STATE_FILE)
+    except Exception as e:
+        log.debug("redistill IPC: state persist failed: %s", e)
+
+
+def _redistill_ipc_seen_get(request_id: str) -> dict | None:
+    cached = _redistill_ipc_seen.get(request_id)
+    if cached is not None:
+        return cached
+    entry = _redistill_ipc_state_load().get(request_id)
+    if entry is not None:
+        _redistill_ipc_seen[request_id] = entry
+    return entry
+
+
+def _redistill_ipc_seen_put(request_id: str, reply: dict) -> None:
+    stamped = {**reply, "_ts": time.time()}
+    _redistill_ipc_seen[request_id] = stamped
+    disk = _redistill_ipc_state_load()
+    disk[request_id] = stamped
+    if len(disk) > _REDISTILL_IPC_MAX_STATE_ENTRIES:
+        oldest = sorted(disk, key=lambda k: disk[k].get("_ts", 0))
+        for stale_id in oldest[: len(disk) - _REDISTILL_IPC_MAX_STATE_ENTRIES]:
+            disk.pop(stale_id, None)
+    _redistill_ipc_state_save(disk)
+
+
+def _build_redistill_envelope(material: str, *, item_id: str) -> dict:
+    """Client-seal redistill material with the SAME v1-envelope path resident
+    capture already uses for genesis material (see ``_capture_build_envelope``)
+    — reuses ``_build_envelope`` + the whoami-cached user/enclave public keys;
+    no new crypto path. ``visibility="shared"`` so the enclave (this process's
+    own decrypt source) can open it once ``resident_pending`` claims the
+    ``awaiting_resident`` job this upload creates. ``item_id`` fixed to the
+    IPC ``request_id`` makes a retried upload with the SAME request_id produce
+    the SAME envelope id (and therefore the same deterministic job_id,
+    genesis_core._resident_sealed_import's job_id hash) — idempotency in
+    depth alongside this module's own request_id cache above."""
+    if not _ENCRYPTION_AVAILABLE:
+        raise RuntimeError("redistill_encryption_unavailable")
+    if not _refresh_whoami_for_encrypted_reply():
+        raise RuntimeError("redistill_whoami_refresh_failed")
+    user_id = str(_whoami_cache.get("user_id") or "").strip()
+    user_pk: bytes | None = _whoami_cache.get("user_pk")
+    enc_pk: bytes | None = _whoami_cache.get("enclave_pk")
+    if not user_id or not user_pk:
+        raise RuntimeError("redistill_missing_user_key")
+    if not enc_pk:
+        raise RuntimeError("redistill_shared_envelope_requires_enclave_key")
+    return _build_envelope(
+        plaintext=material.encode("utf-8"),
+        owner_user_id=user_id,
+        user_pk_bytes=user_pk,
+        enclave_pk_bytes=enc_pk,
+        visibility="shared",
+        item_id=item_id,
+    )
+
+
+def _handle_redistill_ipc(msg: dict) -> dict:
+    """Handle one decoded ``{"op": "redistill", ...}`` IPC request. Never
+    raises — every path returns a JSON-serializable reply dict, which the
+    listener loop writes straight back over the socket.
+
+    A network/HTTP-transport failure is deliberately NOT cached (returned but
+    not persisted via ``_redistill_ipc_seen_put``): a bare retry with the same
+    request_id should get a fresh shot at the network, not a frozen-in-amber
+    failure from one bad connection."""
+    request_id = str(msg.get("request_id") or "").strip()
+    if not request_id:
+        return {"ok": False, "error": "request_id_required"}
+    material = msg.get("material")
+    if not isinstance(material, str) or not material.strip():
+        return {"ok": False, "error": "material_required", "request_id": request_id}
+
+    cached = _redistill_ipc_seen_get(request_id)
+    if cached is not None:
+        return {k: v for k, v in cached.items() if not k.startswith("_")}
+
+    material_bytes = material.encode("utf-8")
+    if len(material_bytes) > _REDISTILL_IPC_MAX_MATERIAL_BYTES:
+        reply = {
+            "ok": False, "error": "material_too_large", "request_id": request_id,
+            "max_bytes": _REDISTILL_IPC_MAX_MATERIAL_BYTES, "got_bytes": len(material_bytes),
+        }
+        _redistill_ipc_seen_put(request_id, reply)
+        return reply
+
+    try:
+        envelope = _build_redistill_envelope(material, item_id=request_id)
+    except Exception as e:
+        reply = {
+            "ok": False, "error": f"seal_failed:{type(e).__name__}:{e}",
+            "request_id": request_id,
+        }
+        _redistill_ipc_seen_put(request_id, reply)
+        return reply
+
+    try:
+        resp = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/genesis/imports/plaintext",
+            json={
+                "format": "sealed_v1",
+                "envelope": envelope,
+                "mode": "update_identity",
+                "job_kind": "resident_redistill",
+                "client_job_id": request_id,
+            },
+            headers=_HEADERS,
+            timeout=20,
+        )
+    except Exception as e:
+        # Transient transport failure — NOT cached, see docstring.
+        return {
+            "ok": False, "error": f"request_failed:{type(e).__name__}:{e}",
+            "request_id": request_id,
+        }
+
+    try:
+        body = resp.json()
+    except Exception:
+        body = {}
+    if resp.status_code == 409:
+        reply = {
+            "ok": False, "error": "already_running", "request_id": request_id,
+            "active_job_id": str((body or {}).get("active_job_id") or ""),
+        }
+        _redistill_ipc_seen_put(request_id, reply)
+        return reply
+    if resp.status_code != 200:
+        reply = {
+            "ok": False, "error": f"http_{resp.status_code}:{body}",
+            "request_id": request_id,
+        }
+        _redistill_ipc_seen_put(request_id, reply)
+        return reply
+
+    job_id = str(((body or {}).get("job") or {}).get("job_id") or "")
+    reply = {"ok": True, "job_id": job_id, "request_id": request_id}
+    _redistill_ipc_seen_put(request_id, reply)
+    return reply
+
+
+def _redistill_ipc_serve_forever(sock_path: Path) -> None:
+    """Single-connection-at-a-time Unix-socket IPC listener for io_cli's
+    identity-redistill verb. VPS/self-hosted CLI only — see the startup gate
+    at the call site in ``run()``. One local terminal caller at a time is the
+    whole use case, so a plain accept→handle→close loop (no thread pool) is
+    enough; the handler's network POST just makes the NEXT local caller wait
+    briefly in the OS accept backlog, which is fine for a one-shot command.
+
+    Runs until ``_running`` flips False (same shutdown flag the main poll
+    loop honors) — a final accept() may still be blocked when that happens,
+    so the loop uses a short accept timeout to notice the flag promptly
+    instead of hanging past process shutdown."""
+    try:
+        sock_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log.error("redistill IPC: cannot create %s: %s — listener disabled", sock_path.parent, e)
+        return
+    # A stale socket file from a previous (crashed/killed) run makes bind()
+    # fail with "address already in use" even though nothing is listening.
+    try:
+        if sock_path.exists():
+            sock_path.unlink()
+    except Exception:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        srv.bind(str(sock_path))
+        try:
+            os.chmod(sock_path, 0o600)  # local-user-only — this carries plaintext material
+        except OSError:
+            pass
+        srv.listen(4)
+        srv.settimeout(1.0)
+    except Exception as e:
+        log.error("redistill IPC: cannot bind %s: %s — listener disabled", sock_path, e)
+        try:
+            srv.close()
+        except Exception:
+            pass
+        return
+    log.info("redistill IPC listening on %s", sock_path)
+    while _running:
+        try:
+            conn, _addr = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            if _running:
+                log.warning("redistill IPC: accept failed; retrying")
+                time.sleep(1)
+                continue
+            break
+        try:
+            conn.settimeout(35)
+            buf = b""
+            while b"\n" not in buf and len(buf) <= _REDISTILL_IPC_MAX_MATERIAL_BYTES + 8192:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            text = buf.decode("utf-8", errors="replace").strip()
+            try:
+                obj = json.loads(text.splitlines()[0]) if text else {}
+            except Exception:
+                obj = {}
+            if not isinstance(obj, dict) or str(obj.get("op") or "") != "redistill":
+                reply = {"ok": False, "error": "unsupported_op"}
+            else:
+                reply = _handle_redistill_ipc(obj)
+            conn.sendall((json.dumps(reply, ensure_ascii=False) + "\n").encode("utf-8"))
+        except Exception as e:
+            log.error("redistill IPC: connection error: %s", e)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    try:
+        srv.close()
+    except Exception:
+        pass
+    try:
+        sock_path.unlink()
+    except Exception:
+        pass
+
+
 # NOTE: the distill PROMPT is intentionally a minimal default — it belongs to the
 # resident skill (owned by Seven) and is expected to be refined there. It asks for a
 # single JSON object; the memory-card fields mirror the capture card shape so
@@ -11827,6 +12109,17 @@ def run() -> None:
         sys.exit(1)
 
     _warn_if_agent_entry_may_drift()
+
+    # identity-redistill local IPC (T11): VPS/self-hosted CLI only — the SAME
+    # gate family as the io_cli capability-catalog injection
+    # (_prepend_io_cli_capability_catalog). Hosted (image-baked, V2
+    # registry-based tool calling) and http-backend agents have no io_cli.py
+    # to shell out to, so there is nothing on the other end of this socket —
+    # starting the listener there would just be a dead file descriptor.
+    if not _HOSTED and AGENT_MODE == "cli":
+        threading.Thread(
+            target=_redistill_ipc_serve_forever, args=(RESIDENT_IPC_SOCK,), daemon=True,
+        ).start()
 
     if FEEDLING_ENCLAVE_URL:
         if not _verify_decrypt_sources():
