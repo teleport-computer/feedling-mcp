@@ -181,7 +181,11 @@ jobs:
           python -m pytest \
             tests/test_ci_image_tag_width.py \
             tests/test_hosted_runtime_policy.py \
-            tests/test_hosted_resident_retirement.py \
+            tests/test_dual_runtime_coexistence.py \
+            tests/test_dual_runtime_send_routing.py \
+            tests/test_dual_runtime_flip_no_loss.py \
+            tests/test_dual_runtime_db.py \
+            tests/test_runtime_reconciler.py \
             tests/test_hosted_runtime_mode.py \
             tests/test_chat_send_v2_enqueue.py \
             tests/test_model_api_chat_send_routing.py \
