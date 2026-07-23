@@ -1066,7 +1066,9 @@ def _synthesized_assistant_payload(exchange: ToolExchange, wire: str):
                 {
                     "role": "assistant",
                     "content": [
-                        {"type": "input_text", "text": exchange.assistant_text}
+                        # assistant-role parts on the Responses wire are
+                        # output_text/refusal only; input_text 400s.
+                        {"type": "output_text", "text": exchange.assistant_text}
                     ],
                 }
             )
@@ -1821,18 +1823,30 @@ def _openai_uses_responses_for_reasoning(model: str) -> bool:
     )
 
 
-def _content_to_openai_responses_parts(content: Any) -> list[dict[str, Any]]:
+def _content_to_openai_responses_parts(
+    content: Any, *, assistant: bool = False
+) -> list[dict[str, Any]]:
     parts: list[dict[str, Any]] = []
     text = _content_text(content)
     if text:
-        parts.append({"type": "input_text", "text": text})
-    for image in _image_parts(content):
+        # The Responses API rejects ``input_text`` on an assistant-role item
+        # with HTTP 400 ("Supported values are: output_text and refusal").
+        # A conversation's prior assistant replies must therefore serialize as
+        # ``output_text`` — otherwise every multi-turn request 400s (the hosted
+        # codex/gpt-5 driver dropped every turn 2+).
         parts.append(
-            {
-                "type": "input_image",
-                "image_url": f"data:{image['mime_type']};base64,{image['data']}",
-            }
+            {"type": "output_text" if assistant else "input_text", "text": text}
         )
+    # Only user-role items carry input images; an assistant output part is
+    # output_text/refusal only, so image parts are skipped for assistant history.
+    if not assistant:
+        for image in _image_parts(content):
+            parts.append(
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{image['mime_type']};base64,{image['data']}",
+                }
+            )
     return parts
 
 
@@ -1859,7 +1873,9 @@ def _openai_responses_input(messages: list[Any]) -> tuple[str, list[dict[str, An
             if role in {"assistant", "openclaw", "agent", "model"}
             else "user"
         )
-        parts = _content_to_openai_responses_parts(content)
+        parts = _content_to_openai_responses_parts(
+            content, assistant=(mapped_role == "assistant")
+        )
         if not parts:
             continue
         input_items.append({"role": mapped_role, "content": parts})
