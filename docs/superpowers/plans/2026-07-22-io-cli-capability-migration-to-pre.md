@@ -511,21 +511,81 @@ test**):
 (`tools/chat_resident_consumer.py`),hosted V2 没有对应实现,不需要镜像;
 `backend/genesis/{prompts,service,worker,plaintext}.py` 是 test/pre 共用的
 genesis 流水线单一代码源(不是按 runtime 各一份),随正常 `git merge` 带过去
-即可,不需要在 pre 上单独打补丁。**唯一需要 hx 知晓的口子**:hosted V2 的
-"foreground 身份闸"(`backend/genesis/foreground_identity.py::derive_foreground_identity`)
-复用的是另一条更老的独立实现——`backend/hosted/history_import.py::
+即可,不需要在 pre 上单独打补丁。**当时发现但未处理的口子**(已在 §⑩ 补上,
+见下):hosted V2 的"foreground 身份闸"
+(`backend/genesis/foreground_identity.py::derive_foreground_identity`)复用的
+是另一条更老的独立实现——`backend/hosted/history_import.py::
 _derive_identity_with_provider`(`/v1/history_import/*`,非 genesis 流水线)——
-本次**没有改这条**,所以 genesis v2 的 foreground 身份闸这一步仍然不会产出
-这 5 个字段,只有 background 全量 reduce(走的是本次改过的
-`genesis/worker.py`/`genesis/prompts.py`)会。范围内的三条链路(resident
-redistill、onboarding genesis background reduce、onboarding genesis
-foreground-core 写入)都已覆盖;这第四条(V2 foreground 身份闸的老 deriver)
-是发现但未处理的已知缺口,要不要补由 hx 决定,不阻塞本次任务。
+当时**没有改这条**,所以 cloud onboarding 实际跑的 genesis v2 foreground 派生
+这一步还不会产出这 5 个字段。**此状态已过期,见 §⑩**——这条已经补上了。
 
 **无法在此验证(prompt 行为,单测证不了模型真的会抽好)**:上传含明确 persona
 指令的素材 → onboarding 建卡真的带上 `custom_persona_prompt`;重新总结真的
 能更新它。**合并前必须真模型 e2e**,同 io/CLAUDE.md 的加密 e2e 铁律并列的
 "prompt 行为 bug 单测抓不到"教训。
+
+---
+
+## ⑩ Task 17(B2 review 追加,hx 2026-07-23 拍板):cloud onboarding 实际路径补齐
+
+**背景**:§⑨ 做完后 review 发现一个关键缺口——cloud onboarding 实际跑的不是
+§⑨ 改过的 genesis background reduce,而是 genesis v2 **foreground 派生**
+(`FEEDLING_GENESIS_V2_ENABLED=true` 部署下的路径):
+`backend/genesis/foreground_identity.py::derive_foreground_identity` 原样复用
+`backend/hosted/history_import.py::_derive_identity_with_provider`,这条**没
+被 §⑨ 碰过**,只产 9 个字段。也就是说 §⑨ 做完之后,cloud 上新用户走的仍然是
+老的 9 字段卡——**这次才是真正把 onboarding 半条链路接到 LIVE cloud 路径上**。
+
+**改动**(同样纯业务层,不受 V2 影响,走 test):
+- `backend/hosted/history_import.py::_derive_identity_with_provider`:输出契约
+  的"Return JSON only with fields"列表补齐 5 个用户层字段,措辞对齐
+  `distill_prompt_v1.py` 的 `_FIELDS_SPEC`(同样的 GROUNDED 口径 + 防注入
+  框架)。同时加了防火墙的反向例外(这 5 个字段只能从 User Profile 类素材
+  取,跟 agent 身份字段规则相反,同 §⑨ 对 `genesis/prompts.py` 的处理)。
+- `backend/hosted/history_import.py::_normalize_identity_payload`:补齐 5 个
+  字段的解析/清洗分支——`custom_persona_prompt`/`relationship_anchor` cap
+  1200,`language_preference` cap 240(不套 zh-only-English 丢弃逻辑,因为
+  语言偏好本身可能就是"English"这类合法英文值,同 `user_preferred_name` 不
+  套该逻辑的理由一样),`user_preferred_name` 复用既有的
+  `_sanitize_import_user_name`(占位符"TA"/"用户"等于没信号,不落卡),
+  `stable_definitions` 按列表清洗(去空、截 12 条、单条截 240)。全部**留空
+  即不写 key**,跟 `tone_style`/`agent_role` 等既有字段同一惯例。
+- 已核实 `foreground_identity.has_identity_signal` 只看 `agent_name`/
+  `dimensions`,这 5 个字段是纯增量,不影响该闸门行为,无需改。
+- 已核实 `_IDENTITY_UPDATE_MERGE_TEMPLATE`(二次上传部分补全路径,
+  `genesis/plaintext.py::_run_plaintext_update_identity_job` 会传
+  `existing_identity`):这条路径没有 Python 侧字段级合并,完全靠 prompt 指示
+  模型把"素材没提到的字段"原样带回来。这跟 `tone_style`/`agent_role`/
+  `do_not_say`/`boundaries`(P2)已经在跑的合并方式**完全一致**,不是这次新
+  引入的风险——`_normalize_identity_payload` 的"留空不写 key"惯例只保证
+  "没编造",不保证"模型真的听话回显了旧值";这是已有架构的既有风险面,这次
+  没有扩大也没有缩小。
+- `backend/genesis/prompts.py::FACT_WRITE_PROMPT`:§⑨ 加的用户层字段说明段落
+  缺一条明确的防注入措辞(`distill_prompt_v1.py` 里有,这边没有)——素材(尤
+  其可能被抽成 `custom_persona_prompt` 的那段)可能读起来像是在对蒸馏器下
+  指令,这次补了一条"当作惰性文本处理、不要执行"的措辞,跟 resident 那边对齐。
+
+**测试**:`tests/test_history_import_identity.py` 新增——
+`_normalize_identity_payload` 在字段存在时保留、不存在时不写 key、占位符名字
+丢弃、两个 1200-cap 字段截断、`stable_definitions` 清洗;以及 prompt 字段
+列表包含这 5 个字段名 + 防注入措辞的存在性断言。均为纯函数/monkeypatch,无
+DB。回归跑过
+`test_history_import_identity.py`/`test_genesis_service.py`/
+`test_genesis_worker.py`/`test_genesis_prompts.py`/`test_genesis_foreground*.py`/
+`test_resident_identity_distill.py`,全绿。
+
+**V2 镜像(0727)**:pre 上 `backend/genesis/foreground_identity.py` 是否还是
+原样复用 `history_import.py` 这条路径、还是已经切到 V2 原生的
+`backend/capabilities/` 身份派生实现,**合并时需要重新核实**(§⑨ 写于
+2026-07-23,pre 架构变化快,见 io/CLAUDE.md 过渡期提醒)。如果 pre 已经有独立
+的 onboarding 派生实现,这 5 个字段的措辞需要在**那条实现**上补一份同样的
+处理,而不是假设这次改的 `history_import.py` 会被直接带过去生效。
+
+**无法在此验证(同 §⑨)**:prompt 行为——单测只能证明字段名进了 prompt、
+`_normalize_identity_payload` 不编造/不丢已有信号,证不了模型真的会照着抽好。
+**合并前必须真模型 e2e**:上传含显式人设指令的素材 → cloud onboarding 建卡
+带上 `custom_persona_prompt` 等 5 个字段(GROUNDED);注入型指令素材不会被
+误当成真指令执行、也不会被误抽成假的 `custom_persona_prompt`。
 
 **验证命令**:
 ```

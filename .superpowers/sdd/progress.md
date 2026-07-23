@@ -135,3 +135,34 @@ Cluster Q: complete.
   **这反转了 T7/ef8e393d(I7)"5 字段刻意不蒸馏"的决定**——那批注释/迁移手册需同步改。
   做梦机制确认只整理记忆、不碰身份(9747),不在本次范围。
   风险:动 onboarding 建卡主流程 + prompt 行为,单测抓不到,合前必须真模型 e2e。
+
+=== 追加 Task 17 review 追问两点(B2 review,hx 2026-07-23 拍板)修复 ===
+review 发现:上面那条 B2 只改了 genesis background reduce 那条链路,但 cloud onboarding
+  实际跑的是 genesis v2 **foreground** 派生——`genesis/foreground_identity.py` 原样复用
+  `hosted/history_import.py::_derive_identity_with_provider`,这条完全没被 B2 碰过,只产 9
+  个字段。也就是说 B2 做完之后 cloud 新用户建卡仍然拿不到这 5 个用户层字段——**这次才是真
+  正把 onboarding 接到 LIVE cloud 路径**。
+Fix 1(critical): `history_import.py::_derive_identity_with_provider` 的输出契约 + 防火墙
+  反向例外 补齐 5 字段(措辞对齐 `distill_prompt_v1.py`);`_normalize_identity_payload` 补
+  5 字段解析/清洗(cap、占位符丢弃、留空不写 key,同既有 tone_style/agent_role 惯例)。已核
+  实 `foreground_identity.has_identity_signal` 和 `_IDENTITY_UPDATE_MERGE_TEMPLATE` 无回归
+  ——后者的"纯靠 prompt 回显旧值"是 P2 字段已有的既有风险面,这次没有扩大。
+Fix 2(important): `genesis/prompts.py` FACT_WRITE_PROMPT 补一条防注入措辞(素材当惰性文本
+  处理、不当指令执行),对齐 resident 侧 `distill_prompt_v1.py` 已有的同款措辞。
+文档:迁移手册加了 §⑩ 记录这次改动 + 0727 时需要重新核实 pre 上 foreground_identity 是否还
+  复用同一条老实现。changelog 之前那句"onboarding Genesis import 也能产 5 字段"当时其实不
+  准(指的是 background reduce,不是决定 cloud 用户实际拿到什么卡的 foreground 路径)——这
+  次改完后才真的准了,未改 wording。
+测试:`tests/test_history_import_identity.py` 新增 6 个纯函数 case(留空/占位符/cap/清洗/
+  prompt 字段名 + 防注入措辞存在性),回归
+  `test_history_import_identity/test_genesis_service/test_genesis_worker/test_genesis_prompts/
+  test_genesis_foreground*/test_resident_identity_distill` 全绿,--collect-only 核对过。
+仍未做:同 B2,prompt 行为单测证不了,合前必须真模型 e2e(上传显式人设指令素材 → cloud
+  onboarding 建卡真的带上 custom_persona_prompt 等;注入型文本不会被误执行/误抽)。
+
+=== TODO(本次更新,待合 test 后处理)===
+[TODO-1] onboarding 自我介绍/招呼 authorship 不统一(cloud=系统生成即有 / VPS=agent 自己写不保证即有)。
+         方向:收敛成一致契约(系统兜底"进场即有" + agent 事后本人润色)。已记全景图。
+[Router] 合进 test 之后,把「本次重构 + 身份卡路径全景 + TODO-1」整理成一条 entry 推 Router
+         (tag: feedling mcp/io + backend + decision/milestone;推前先 router_tags 扫一眼)。
+         —— router MCP 现断开,且按 hx:等合 test 后再推,不提前。
