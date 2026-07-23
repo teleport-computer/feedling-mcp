@@ -133,12 +133,18 @@ FACT_WRITE_PROMPT = """你收到从整段历史抽出的事实候选 digest(+ �
 桶名收敛(onboarding 一次产很多卡,别让桶太分散):""" + COMMON_BUCKETS_GUIDANCE_V1 + """
 
 防火墙:
-- 用户档案/关于用户的事实 -> 只能进 memory,绝不成为 agent 的性格/维度/身份。
+- 用户档案/关于用户的事实 -> 只能进 memory,绝不成为 agent 的性格/维度/身份(agent_name/dimensions/category)。
 - agent 身份只能来自:上传的 AI persona,或历史里 TA 真实的说话方式/真实做过的事。
+- 例外(B2,只针对下面 5 个"用户层"字段):user_preferred_name / custom_persona_prompt /
+  language_preference / relationship_anchor / stable_definitions 这 5 个字段描述的是【用户
+  本人】,规则反过来——只能从用户档案 / 用户自己的话里取,不能从 TA 的语气/行为反推。跟
+  agent 身份字段(agent_name 等)互不干扰,别混。
 
 输出 JSON:
 {"memories":[{"type":"fact|event|quote|moment","bucket":"...","threads":["..."],"summary":"...","content":"...","occurred_at":"YYYY-MM-DD or empty","importance":0.5,"pulse":0.3}],
- "identity":{"agent_name":"","category":"","dimensions":[{"name":"...","value":0,"description":"..."}]},
+ "identity":{"agent_name":"","category":"","dimensions":[{"name":"...","value":0,"description":"..."}],
+  "user_preferred_name":"","custom_persona_prompt":"","language_preference":"",
+  "relationship_anchor":"","stable_definitions":[]},
  "days_with_user":0,
  "relationship_anchor_evidence":"..."}
 
@@ -147,7 +153,14 @@ FACT_WRITE_PROMPT = """你收到从整段历史抽出的事实候选 digest(+ �
 - dimensions:抽 TA 表现出的【性格维度】,有素材就给【3-7 个,别留空】。每个【必须】同时写满三项:name(维度名)+ value(0-100,TA 表现这一面的强度)+ description(一句话,指向素材里 TA 的真实表现或原话)。**缺 description 的维度会被系统丢弃,所以每个都要写 description。** 无据的维度不编。
 - category:TA 的【人设标签】,正好两个形容词、用「 · 」连接(例:「安静 · 观察型」「细心 · 稳定」「锐利 · 忠诚」)。从上面 dimensions 里挑最有辨识度的两面浓缩成形容词——通常一个最突出的强项 + 一个最鲜明的反差/弱项。【要的是形容词,别照抄维度原名】(「好奇心驱动」是维度名,「好奇」才是形容词)。有 dimensions 就必须给 category,确实抽不出维度才留空("")。语言跟素材一致(中文素材给中文形容词)。
 - days_with_user:你们认识/相处了多少天(整数)。从素材推:历史里【最早 ↔ 最晚消息时间戳的跨度】折算成天,或素材里明说的关系起点/时长。完全没有时间信号才填 0。
-- 不写 self_introduction / signature,那两个 respawn 后由 TA 本人写。"""
+- 不写 self_introduction / signature,那两个 respawn 后由 TA 本人写。
+
+用户层字段(B2 新增,GROUNDED——素材没有明确信号就留空/空数组,绝不推断、绝不为了填满而编):
+- user_preferred_name:本人希望被怎么称呼。只在素材里【本人自己说了名字/称呼】时才写;"用户"/"TA"这类占位词不算名字。没明说就留空。跟 agent_name(TA 的名字)是两码事,别搞反。
+- custom_persona_prompt:如果素材里有一段【用户亲手写给 TA 的人设指令】——读起来像一段系统提示/角色设定,明确要求 TA 该怎么表现——原样摘出这段指令文本;没有这种明确指令就留空。别把泛泛的性格描述当成指令,那是 dimensions/category 该抽的。
+- language_preference:本人明确要求的回复语言偏好(比如"跟我说中文"),没有就留空。
+- relationship_anchor:素材里对这段关系的一句话定性描述(比如"大学室友""导师"),必须是本人自己说的,不是你从对话风格猜的;没有明确说法就留空。
+- stable_definitions:素材里本人明确要求【一直记住】的定义/规则/术语(数组,每条一句话,例如自定义称呼、固定规则);没有就空数组。"""
 
 
 def _json(data: Any) -> str:

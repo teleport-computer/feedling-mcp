@@ -522,6 +522,159 @@ def test_identity_payload_from_output_preserves_valid_user_preferred_name():
     assert payload["user_preferred_name"] == "Seven"
 
 
+# ---------------------------------------------------------------------------
+# B2 (reverses I7): the 4 remaining user-layer fields — GROUNDED, so present-
+# in-material -> kept, absent -> just missing from the payload (never invented,
+# never a crash).
+# ---------------------------------------------------------------------------
+
+def test_identity_payload_from_output_carries_the_4_remaining_user_layer_fields():
+    payload = service._identity_payload_from_output({
+        "identity": {
+            "agent_name": "Mira",
+            "dimensions": [],
+            "custom_persona_prompt": "永远用简短的第二人称回复我。",
+            "language_preference": "中文",
+            "relationship_anchor": "大学室友",
+            "stable_definitions": ["老板=我上司", "  ", "deadline 一律北京时间"],
+        }
+    })
+
+    assert payload is not None
+    assert payload["custom_persona_prompt"] == "永远用简短的第二人称回复我。"
+    assert payload["language_preference"] == "中文"
+    assert payload["relationship_anchor"] == "大学室友"
+    # blank list entries are dropped, not preserved as empty strings
+    assert payload["stable_definitions"] == ["老板=我上司", "deadline 一律北京时间"]
+
+
+def test_identity_payload_from_output_caps_long_user_layer_strings():
+    long_text = "长" * 2000
+    payload = service._identity_payload_from_output({
+        "identity": {
+            "agent_name": "Mira", "dimensions": [],
+            "custom_persona_prompt": long_text,
+            "relationship_anchor": long_text,
+            "language_preference": long_text,
+        }
+    })
+
+    assert payload is not None
+    assert len(payload["custom_persona_prompt"]) == 1200
+    assert len(payload["relationship_anchor"]) == 1200
+    assert len(payload["language_preference"]) == 240
+
+
+def test_identity_payload_from_output_material_without_user_layer_signal_omits_them():
+    # Grounding: no signal in the material -> the payload simply doesn't carry
+    # the key at all (never an invented empty string / never a crash).
+    payload = service._identity_payload_from_output({
+        "identity": {"agent_name": "Mira", "dimensions": [
+            {"name": "细心", "value": 80, "description": "d"},
+        ]}
+    })
+
+    assert payload is not None
+    for key in ("user_preferred_name", "custom_persona_prompt", "language_preference",
+                "relationship_anchor", "stable_definitions"):
+        assert key not in payload, key
+
+
+def test_identity_payload_from_output_sparse_material_with_only_persona_directive():
+    # B2 broadens the "has any signal" gate: a persona directive alone (no
+    # agent_name, no dimensions) must not make this return None outright —
+    # a new card can start from just that.
+    payload = service._identity_payload_from_output({
+        "identity": {"agent_name": "", "dimensions": [],
+                      "custom_persona_prompt": "永远直接回答,不要绕。"}
+    })
+
+    assert payload is not None
+    assert payload["custom_persona_prompt"] == "永远直接回答,不要绕。"
+
+
+def test_init_identity_threads_the_5_user_layer_fields_on_a_new_card(monkeypatch):
+    captured: dict = {}
+    monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: None)
+
+    def fake_envelope(_store, plaintext, item_id=None):
+        captured["plaintext"] = json.loads(plaintext.decode("utf-8"))
+        return ({
+            "id": item_id or "identity_new",
+            "body_ct": "encrypted_identity", "nonce": "nonce", "K_user": "ku",
+            "K_enclave": "ke", "visibility": "shared",
+            "owner_user_id": "usr_genesis", "enclave_pk_fpr": "fpr",
+        }, "")
+
+    monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", fake_envelope)
+    monkeypatch.setattr(service.identity_service, "_save_identity",
+                         lambda _store, doc: captured.update({"saved": doc}))
+    monkeypatch.setattr(service.boot_gates, "_log_bootstrap_event", lambda *_a, **_k: None)
+    monkeypatch.setattr(service.identity_service, "_append_identity_change", lambda *_a, **_k: None)
+
+    status = service.init_identity_if_absent(
+        _store(),
+        {
+            "identity": {
+                "agent_name": "Mira",
+                "dimensions": [{"name": "Steady", "value": 84, "description": "Persona says steady."}],
+                "user_preferred_name": "Seven",
+                "custom_persona_prompt": "始终用第二人称、简短直接。",
+                "language_preference": "中文",
+                "relationship_anchor": "大学室友",
+                "stable_definitions": ["老板=我上司"],
+            },
+            "relationship_started_at": "2026-06-01",
+            "relationship_anchor_evidence": "persona card named Mira",
+        },
+        None,
+        "runtime_token_1",
+    )
+
+    assert status == "initialized"
+    plaintext = captured["plaintext"]
+    assert plaintext["user_preferred_name"] == "Seven"
+    assert plaintext["custom_persona_prompt"] == "始终用第二人称、简短直接。"
+    assert plaintext["language_preference"] == "中文"
+    assert plaintext["relationship_anchor"] == "大学室友"
+    assert plaintext["stable_definitions"] == ["老板=我上司"]
+
+
+def test_init_identity_without_user_layer_fields_leaves_new_card_empty_no_crash(monkeypatch):
+    captured: dict = {}
+    monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: None)
+
+    def fake_envelope(_store, plaintext, item_id=None):
+        captured["plaintext"] = json.loads(plaintext.decode("utf-8"))
+        return ({
+            "id": item_id or "identity_new",
+            "body_ct": "encrypted_identity", "nonce": "nonce", "K_user": "ku",
+            "K_enclave": "ke", "visibility": "shared",
+            "owner_user_id": "usr_genesis", "enclave_pk_fpr": "fpr",
+        }, "")
+
+    monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", fake_envelope)
+    monkeypatch.setattr(service.identity_service, "_save_identity",
+                         lambda _store, doc: captured.update({"saved": doc}))
+    monkeypatch.setattr(service.boot_gates, "_log_bootstrap_event", lambda *_a, **_k: None)
+    monkeypatch.setattr(service.identity_service, "_append_identity_change", lambda *_a, **_k: None)
+
+    status = service.init_identity_if_absent(
+        _store(),
+        {"identity": {"agent_name": "Mira", "dimensions": []},
+         "relationship_started_at": "2026-06-01",
+         "relationship_anchor_evidence": "persona card named Mira"},
+        None,
+        "runtime_token_1",
+    )
+
+    assert status == "initialized"
+    plaintext = captured["plaintext"]
+    for key in ("user_preferred_name", "custom_persona_prompt", "language_preference",
+                "relationship_anchor", "stable_definitions"):
+        assert key not in plaintext, key
+
+
 def test_init_identity_upserts_genesis_fields_and_preserves_agent_profile(monkeypatch):
     captured: dict = {}
     existing = {

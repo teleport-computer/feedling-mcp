@@ -328,11 +328,30 @@ def _strip_identity(doc: dict) -> dict:
     return clean
 
 
+# B2: the 5 user-layer identity fields (D1) that a distiller may now populate
+# alongside agent_name/dimensions — see genesis/prompts.py FACT_WRITE_PROMPT's
+# "用户层字段" block and genesis/service.py's PROFILE_STRING/LIST_FIELDS-driven
+# plumbing. Kept as one tuple here so the "does this identity dict carry ANY
+# signal" checks below (_identity_only / _fact_write_output_empty) don't drift
+# from what _fact_write actually aggregates.
+_USER_LAYER_STRING_FIELDS = (
+    "user_preferred_name", "custom_persona_prompt", "language_preference",
+    "relationship_anchor",
+)
+_USER_LAYER_LIST_FIELD = "stable_definitions"
+
+
+def _identity_has_user_layer_signal(identity: dict) -> bool:
+    if any(str(identity.get(key) or "").strip() for key in _USER_LAYER_STRING_FIELDS):
+        return True
+    return bool(identity.get(_USER_LAYER_LIST_FIELD))
+
+
 def _identity_only(doc: dict) -> dict:
     identity = doc.get("identity") if isinstance(doc.get("identity"), dict) else {}
     dims = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
     out = {"memories": []}
-    if identity.get("agent_name") or dims:
+    if identity.get("agent_name") or dims or _identity_has_user_layer_signal(identity):
         out["identity"] = identity
     if out.get("identity") and doc.get("days_with_user") is not None:
         out["days_with_user"] = doc.get("days_with_user")
@@ -710,7 +729,8 @@ def _fact_write_output_empty(output: dict) -> bool:
     memories = output.get("memories") if isinstance(output.get("memories"), list) else []
     identity = output.get("identity") if isinstance(output.get("identity"), dict) else {}
     dims = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
-    if memories or str(identity.get("agent_name") or "").strip() or dims:
+    if (memories or str(identity.get("agent_name") or "").strip() or dims
+            or _identity_has_user_layer_signal(identity)):
         return False
     try:
         if int(output.get("days_with_user") or 0) > 0:
@@ -839,6 +859,12 @@ def _fact_write(
     agent_name = ""
     days_with_user = 0
     evidence: list[str] = []
+    # B2: first-seen-wins for the user-layer strings (same "don't let a later,
+    # thinner batch blank out an earlier real signal" rule as agent_name
+    # above); stable_definitions accumulates across batches instead, deduped
+    # by exact text so repeated batches don't pile up the same entry.
+    user_layer: dict[str, str] = {}
+    stable_definitions: list[str] = []
     for output in outputs:
         if isinstance(output.get("memories"), list):
             memories.extend(
@@ -851,15 +877,26 @@ def _fact_write(
             agent_name = str(identity.get("agent_name") or "")
         if isinstance(identity.get("dimensions"), list):
             dims.extend(item for item in identity["dimensions"] if isinstance(item, dict))
+        for key in _USER_LAYER_STRING_FIELDS:
+            if not user_layer.get(key) and str(identity.get(key) or "").strip():
+                user_layer[key] = str(identity.get(key) or "").strip()
+        if isinstance(identity.get(_USER_LAYER_LIST_FIELD), list):
+            stable_definitions.extend(
+                str(item).strip() for item in identity[_USER_LAYER_LIST_FIELD]
+                if str(item or "").strip()
+            )
         try:
             days_with_user = max(days_with_user, int(output.get("days_with_user") or 0))
         except Exception:
             pass
         if output.get("relationship_anchor_evidence"):
             evidence.append(str(output.get("relationship_anchor_evidence") or ""))
+    identity_out = {"agent_name": agent_name, "dimensions": dims[:7], **user_layer}
+    if stable_definitions:
+        identity_out[_USER_LAYER_LIST_FIELD] = list(dict.fromkeys(stable_definitions))[:12]
     return {
         "memories": memories,
-        "identity": {"agent_name": agent_name, "dimensions": dims[:7]},
+        "identity": identity_out,
         "days_with_user": days_with_user,
         "relationship_anchor_evidence": " | ".join(evidence)[:500],
     }

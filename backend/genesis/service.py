@@ -874,13 +874,32 @@ def _identity_payload_from_output(output: dict) -> dict | None:
         "self_introduction": "",
         "dimensions": clean_dims,
     }
-    if not payload["agent_name"] and not payload["dimensions"]:
-        return None
-    if category:
-        payload["category"] = category
     user_name = sanitize_user_name(identity.get("user_preferred_name"))
     if user_name != "TA":
         payload["user_preferred_name"] = user_name
+    # B2: the 4 remaining user-layer fields (D1) — GROUNDED, so absence/empty in
+    # `identity` (the distiller's own output) just means no signal, never invented
+    # here. Same 1200/240 cap convention as the rest of this module (relationship_anchor/
+    # tone_style/custom_persona_prompt get the long-text cap).
+    for key in ("custom_persona_prompt", "language_preference", "relationship_anchor"):
+        value = _text(identity.get(key), 1200 if key in {"relationship_anchor", "custom_persona_prompt"} else 240)
+        if value:
+            payload[key] = value
+    stable_defs = identity.get("stable_definitions")
+    if isinstance(stable_defs, list):
+        clean_defs = [_text(item, 240) for item in stable_defs[:12]]
+        clean_defs = [item for item in clean_defs if item]
+        if clean_defs:
+            payload["stable_definitions"] = clean_defs
+    has_user_layer_signal = bool(
+        payload.get("user_preferred_name") or payload.get("custom_persona_prompt")
+        or payload.get("language_preference") or payload.get("relationship_anchor")
+        or payload.get("stable_definitions")
+    )
+    if not payload["agent_name"] and not payload["dimensions"] and not has_user_layer_signal:
+        return None
+    if category:
+        payload["category"] = category
     return payload
 
 
@@ -1052,6 +1071,15 @@ def init_identity_if_absent(
     merged_payload["dimensions"] = payload["dimensions"]
     if payload.get("category"):
         merged_payload["category"] = payload["category"]
+    # B2: thread the 5 user-layer fields the distiller may have derived (GROUNDED —
+    # `payload` only carries a key here when `_identity_payload_from_output` found
+    # explicit material signal for it). Previously `user_preferred_name` was already
+    # computed above but silently dropped here — this fixes that alongside adding
+    # the other 4.
+    for key in ("user_preferred_name", "custom_persona_prompt", "language_preference",
+                "relationship_anchor", "stable_definitions"):
+        if payload.get(key):
+            merged_payload[key] = payload[key]
     if "self_introduction" not in merged_payload:
         merged_payload["self_introduction"] = ""
 

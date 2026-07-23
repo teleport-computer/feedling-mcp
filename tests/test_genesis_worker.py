@@ -668,6 +668,110 @@ def test_fact_write_rewrites_person_references_but_preserves_product_terms():
     assert memory["threads"] == ["小雨偏好", "用户增长"]
 
 
+# ---------------------------------------------------------------------------
+# B2 (reverses I7): the onboarding distiller can now also produce the 5
+# user-layer identity fields — _fact_write must carry them from the model's
+# per-batch `identity` output into the aggregated final identity dict, and
+# _identity_only / _fact_write_output_empty must treat them as real signal.
+# ---------------------------------------------------------------------------
+
+def test_fact_write_carries_user_layer_fields_into_aggregated_identity():
+    class FakeLLM:
+        def complete(self, **kwargs):
+            text = json.dumps({
+                "memories": [],
+                "identity": {
+                    "agent_name": "Mira", "dimensions": [],
+                    "user_preferred_name": "Seven",
+                    "custom_persona_prompt": "始终用第二人称、简短直接。",
+                    "language_preference": "中文",
+                    "relationship_anchor": "大学室友",
+                    "stable_definitions": ["老板=我上司", "  ", "deadline 一律北京时间"],
+                },
+            }, ensure_ascii=False)
+            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
+
+    output = worker.build_memory_output_from_fact_candidates(
+        user_id="usr_1", job_id="job_1", runtime=types.SimpleNamespace(),
+        fact_candidates=[{"about": "user", "summary": "用户叫 Seven"}], llm=FakeLLM(),
+    )
+
+    identity = output["identity"]
+    assert identity["user_preferred_name"] == "Seven"
+    assert identity["custom_persona_prompt"] == "始终用第二人称、简短直接。"
+    assert identity["language_preference"] == "中文"
+    assert identity["relationship_anchor"] == "大学室友"
+    # blank entries dropped, real ones kept
+    assert identity["stable_definitions"] == ["老板=我上司", "deadline 一律北京时间"]
+
+
+def test_fact_write_dedups_stable_definitions_across_batches_first_seen_wins(monkeypatch):
+    # _fact_write floors the batch size at 4 (max(4, env)), so 5 candidates is
+    # the minimum that forces 2 batches ([4, 1]).
+    monkeypatch.setenv("FEEDLING_GENESIS_FACT_WRITE_BATCH", "1")
+    calls = []
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            idx = len(calls)
+            calls.append(kwargs["task_id"])
+            if idx == 0:
+                text = json.dumps({
+                    "memories": [], "identity": {
+                        "agent_name": "", "dimensions": [],
+                        "user_preferred_name": "Seven",
+                        "stable_definitions": ["老板=我上司"],
+                    },
+                }, ensure_ascii=False)
+            else:
+                text = json.dumps({
+                    "memories": [], "identity": {
+                        "agent_name": "", "dimensions": [],
+                        # a later batch's DIFFERENT name must not overwrite the first-seen one
+                        "user_preferred_name": "老王",
+                        "stable_definitions": ["老板=我上司", "deadline 一律北京时间"],
+                    },
+                }, ensure_ascii=False)
+            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
+
+    output = worker.build_memory_output_from_fact_candidates(
+        user_id="usr_1", job_id="job_1", runtime=types.SimpleNamespace(),
+        fact_candidates=[{"about": "user", "summary": s} for s in "abcde"],
+        llm=FakeLLM(),
+    )
+
+    assert len(calls) == 2  # confirms this actually exercised 2 batches, not 1
+    identity = output["identity"]
+    assert identity["user_preferred_name"] == "Seven"  # first-seen wins, like agent_name
+    assert identity["stable_definitions"] == ["老板=我上司", "deadline 一律北京时间"]  # deduped, order kept
+
+
+def test_identity_only_keeps_identity_with_only_user_layer_signal():
+    # No agent_name, no dimensions — previously this whole "identity" would be
+    # dropped by _identity_only's gate; B2 broadens it so a persona-directive-
+    # only signal still survives.
+    doc = {"identity": {"agent_name": "", "dimensions": [],
+                         "custom_persona_prompt": "永远用第二人称。"}}
+    out = worker._identity_only(doc)
+    assert out["identity"]["custom_persona_prompt"] == "永远用第二人称。"
+
+
+def test_identity_only_drops_identity_with_no_signal_at_all():
+    doc = {"identity": {"agent_name": "", "dimensions": [], "custom_persona_prompt": "  "}}
+    out = worker._identity_only(doc)
+    assert "identity" not in out
+
+
+def test_fact_write_output_empty_treats_user_layer_signal_as_non_empty():
+    assert worker._fact_write_output_empty({
+        "memories": [], "identity": {"agent_name": "", "dimensions": [],
+                                      "relationship_anchor": "大学室友"},
+    }) is False
+    assert worker._fact_write_output_empty({
+        "memories": [], "identity": {"agent_name": "", "dimensions": []},
+    }) is True
+
+
 def test_fact_write_provider_config_error_does_not_retry(monkeypatch):
     calls = []
 

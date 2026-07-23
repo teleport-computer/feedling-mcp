@@ -716,6 +716,74 @@ def test_plaintext_relationship_anchor_uses_earliest_timestamp_when_no_date():
     assert anchor3["relationship_started_at"] == ""
 
 
+# ---------------------------------------------------------------------------
+# B2 (reverses I7): _plaintext_merge_reducer_outputs must thread the 5
+# user-layer identity fields through — and, unlike agent_name/dimensions,
+# READ THEM FROM source_family=="user_profile" outputs specifically, since
+# those fields describe the user rather than TA.
+# ---------------------------------------------------------------------------
+
+def test_plaintext_merge_reducer_outputs_reads_user_layer_fields_from_user_profile():
+    outputs = [
+        {
+            "source_family": "user_profile",
+            "identity": {
+                "agent_name": "should be ignored",  # TA fields from user_profile don't count
+                "dimensions": [{"name": "should be ignored", "value": 1}],
+                "user_preferred_name": "Seven",
+                "custom_persona_prompt": "始终用第二人称、简短直接。",
+                "language_preference": "中文",
+                "relationship_anchor": "大学室友",
+                "stable_definitions": ["老板=我上司"],
+            },
+        },
+        {
+            "source_family": "ai_persona",
+            "identity": {"agent_name": "Mira", "dimensions": [{"name": "稳定", "value": 80}]},
+        },
+    ]
+
+    merged = plaintext._plaintext_merge_reducer_outputs(outputs)
+
+    identity = merged["identity"]
+    # TA identity firewall unaffected: agent_name/dimensions still only come
+    # from the ai_persona output, never from user_profile.
+    assert identity["agent_name"] == "Mira"
+    assert identity["dimensions"] == [{"name": "稳定", "value": 80}]
+    # user-layer fields DO come from the user_profile output.
+    assert identity["user_preferred_name"] == "Seven"
+    assert identity["custom_persona_prompt"] == "始终用第二人称、简短直接。"
+    assert identity["language_preference"] == "中文"
+    assert identity["relationship_anchor"] == "大学室友"
+    assert identity["stable_definitions"] == ["老板=我上司"]
+
+
+def test_plaintext_merge_reducer_outputs_sparse_user_layer_only_still_produces_identity():
+    # No agent_name/dimensions anywhere, only a persona directive from a
+    # user_profile output — must still surface as `identity` (B2 broadens the
+    # "has any signal" gate the same way genesis/worker.py's _identity_only does).
+    outputs = [{"source_family": "user_profile",
+                "identity": {"custom_persona_prompt": "永远直接回答,不要绕。"}}]
+
+    merged = plaintext._plaintext_merge_reducer_outputs(outputs)
+
+    assert "identity" in merged
+    assert merged["identity"]["custom_persona_prompt"] == "永远直接回答,不要绕。"
+    assert "agent_name" not in merged["identity"]
+
+
+def test_plaintext_merge_reducer_outputs_without_user_layer_signal_omits_it():
+    outputs = [{"source_family": "ai_persona",
+                "identity": {"agent_name": "Mira", "dimensions": [{"name": "稳定", "value": 80}]}}]
+
+    merged = plaintext._plaintext_merge_reducer_outputs(outputs)
+
+    identity = merged["identity"]
+    for key in ("user_preferred_name", "custom_persona_prompt", "language_preference",
+                "relationship_anchor", "stable_definitions"):
+        assert key not in identity, key
+
+
 def test_add_memory_mode_writes_only_memory(monkeypatch):
     store = _store()
     calls: dict = {}

@@ -67,6 +67,10 @@ def _seed(user_id: str, blobs: dict, card: dict) -> None:
         "self_introduction": "旧介绍",
         "tone_style": "旧语气",
         "custom_persona_prompt": "用户亲手写的 persona,不可丢",
+        "user_preferred_name": "老张",
+        "language_preference": "中文",
+        "relationship_anchor": "大学室友",
+        "stable_definitions": ["老板=我上司"],
     })
 
 
@@ -137,6 +141,76 @@ def test_redistill_merge_preserves_unaddressed_custom_persona_prompt(monkeypatch
     assert card["custom_persona_prompt"] == "用户亲手写的 persona,不可丢"
     # Unaddressed self_introduction also survives (not blanked to "").
     assert card["self_introduction"] == "旧介绍"
+
+
+def test_redistill_merge_lands_all_5_user_layer_fields(monkeypatch):
+    """B2: a distill output that addresses all 5 user-layer fields at once must
+    land every one of them (the server-side merge in
+    genesis.service._merge_identity_replace_payload is generic over
+    card_policy's field lists, so this is really "the distiller's output made
+    it into `identity` at all" — see test_identity_distill_prompt.py for the
+    distiller/parser side)."""
+    user_id = "u_redistill_merge_all_user_layer"
+    blobs: dict[tuple[str, str], dict] = {}
+    card: dict = {}
+    _seed(user_id, blobs, card)
+    _fake_db_blob_layer(monkeypatch, blobs)
+    _wire_enclave_and_envelope(monkeypatch, card)
+
+    store = _FakeStore(user_id)
+
+    status = genesis_service.replace_identity_preserving_anchor(
+        store,
+        {"identity": {
+            "user_preferred_name": "老王",
+            "custom_persona_prompt": "新的 persona 指令",
+            "language_preference": "英文",
+            "relationship_anchor": "前同事",
+            "stable_definitions": ["新术语=新含义"],
+        }},
+        "test-api-key",
+    )
+
+    assert status == "updated"
+    assert card["user_preferred_name"] == "老王"
+    assert card["custom_persona_prompt"] == "新的 persona 指令"
+    assert card["language_preference"] == "英文"
+    assert card["relationship_anchor"] == "前同事"
+    assert card["stable_definitions"] == ["新术语=新含义"]
+    # unaddressed core fields survive untouched
+    assert card["agent_name"] == "旧名"
+    assert card["tone_style"] == "旧语气"
+
+
+def test_redistill_merge_material_without_user_layer_fields_preserves_existing(monkeypatch):
+    """Grounding + no-clobber: material that never mentions the 5 user-layer
+    fields (the distiller found no signal for them) must leave the existing
+    card's values exactly as they were — same "没提的字段永不丢失" rule as any
+    other field."""
+    user_id = "u_redistill_merge_no_user_layer_signal"
+    blobs: dict[tuple[str, str], dict] = {}
+    card: dict = {}
+    _seed(user_id, blobs, card)
+    _fake_db_blob_layer(monkeypatch, blobs)
+    _wire_enclave_and_envelope(monkeypatch, card)
+
+    store = _FakeStore(user_id)
+
+    status = genesis_service.replace_identity_preserving_anchor(
+        store,
+        {"identity": {"agent_name": "新名", "dimensions": [
+            {"name": "直接", "value": 90, "description": "从材料里看出来的。"},
+        ]}},
+        "test-api-key",
+    )
+
+    assert status == "updated"
+    assert card["agent_name"] == "新名"
+    assert card["user_preferred_name"] == "老张"
+    assert card["custom_persona_prompt"] == "用户亲手写的 persona,不可丢"
+    assert card["language_preference"] == "中文"
+    assert card["relationship_anchor"] == "大学室友"
+    assert card["stable_definitions"] == ["老板=我上司"]
 
 
 def test_redistill_merge_blank_distilled_field_keeps_existing(monkeypatch):
