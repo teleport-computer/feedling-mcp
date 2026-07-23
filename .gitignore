@@ -41,3 +41,4 @@ deploy/backups/
 # Local dev virtualenvs (created for running the test suite / audit sessions)
 .venv/
 .venv-audit/
+.superpowers/
