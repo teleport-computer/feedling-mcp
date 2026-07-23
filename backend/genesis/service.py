@@ -136,8 +136,15 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
       - `{task_id}:invalid_json` / `:json_not_object` / `:invalid_json_after_repair`
         (worker._json_object / _complete_json's repair-then-give-up path)
         -> model_bad_json.
-      - `all_fact_maps_failed:N/M` (_build_reducer_output's "every chunk's
-        fact-map failed" floor check) -> model_empty_output. NOTE: the brief's
+      - `all_fact_maps_failed:N/M:{cause}` (_build_reducer_output's "every
+        chunk's fact-map failed" floor check) -> {cause} directly, where
+        {cause} is one of bad_api_key/provider_quota/provider_timeout/
+        model_bad_json/internal — worker._classify_fact_map_failures picks
+        it by priority across every fact-map exception in the batch, so a
+        wall of 401s classifies as bad_api_key, not "no output". The bare
+        legacy form `all_fact_maps_failed:N/M` (no cause suffix, from jobs
+        that failed before this fix landed) still -> model_empty_output.
+        NOTE: the brief's
         "_complete_json_retry_empty 耗尽" does not itself raise a distinct
         string — when every retry attempt errors, it re-raises the LAST
         GenesisWorkerError, which is already one of the invalid_json family
@@ -191,6 +198,19 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
         or "json_not_object" in lower
     ):
         return "model_bad_json"
+
+    # I6: worker._classify_fact_map_failures appends the real cause it picked
+    # (by priority across every fact-map exception in the batch) as a third
+    # colon-segment — check that BEFORE the bare-string fallback below so a
+    # wall of 401s/429s/timeouts/bad-json keeps its real classification
+    # instead of collapsing to model_empty_output. Legacy strings persisted
+    # before this fix (no cause suffix) fall through to the old behavior.
+    fact_map_cause = re.search(
+        r"all_fact_maps_failed:\d+/\d+:(bad_api_key|provider_quota|provider_timeout|model_bad_json|internal)",
+        lower,
+    )
+    if fact_map_cause:
+        return fact_map_cause.group(1)
 
     if "all_fact_maps_failed" in lower:
         return "model_empty_output"

@@ -11,7 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import provider_client  # noqa: E402
-from genesis import prompts, worker  # noqa: E402
+from genesis import prompts, service, worker  # noqa: E402
 
 
 def _chunk(seq: int, body: bytes = b"ct") -> dict:
@@ -970,6 +970,62 @@ def test_build_reducer_fails_when_all_fact_maps_fail(monkeypatch):
             chunk_texts=["c0", "c1", "c2"],
             source_kind="history",
         )
+
+
+def test_all_fact_maps_failing_with_401_classifies_as_bad_api_key(monkeypatch):
+    """I6: drive the reducer's ACTUAL exceptions (not a hand-authored string)
+    through to service.classify_genesis_error and confirm a wall of 401s
+    keeps its real cause instead of collapsing to model_empty_output."""
+    class _UnauthorizedLLM(_FaultyLLM):
+        def complete(self, **kwargs):
+            task = kwargs["task_id"]
+            self.calls.append(task)
+            if task in self.fail_tasks:
+                raise provider_client.ProviderError("provider_http_401", status_code=401)
+            return super().complete(**kwargs)
+
+    llm = _UnauthorizedLLM(fail_tasks={"fact-map-0", "fact-map-1", "fact-map-2"})
+    monkeypatch.setattr(worker, "GenesisLLMClient", lambda *a, **k: llm)
+
+    with pytest.raises(worker.GenesisWorkerError) as excinfo:
+        worker.build_reducer_output_from_texts(
+            user_id="usr_1",
+            job_id="job_allfail_401",
+            runtime=types.SimpleNamespace(),
+            chunk_texts=["c0", "c1", "c2"],
+            source_kind="history",
+        )
+
+    raw_error = str(excinfo.value)
+    assert "all_fact_maps_failed" in raw_error
+    assert service.classify_genesis_error(raw_error) == "bad_api_key"
+
+
+def test_all_fact_maps_failing_with_timeout_classifies_as_provider_timeout(monkeypatch):
+    """Same drive-through-the-real-exception approach, for a timeout cause."""
+
+    class _TimeoutLLM(_FaultyLLM):
+        def complete(self, **kwargs):
+            task = kwargs["task_id"]
+            self.calls.append(task)
+            if task in self.fail_tasks:
+                raise worker.GenesisWorkerError(f"{task}:TimeoutException: read timed out")
+            return super().complete(**kwargs)
+
+    llm = _TimeoutLLM(fail_tasks={"fact-map-0", "fact-map-1", "fact-map-2"})
+    monkeypatch.setattr(worker, "GenesisLLMClient", lambda *a, **k: llm)
+
+    with pytest.raises(worker.GenesisWorkerError) as excinfo:
+        worker.build_reducer_output_from_texts(
+            user_id="usr_1",
+            job_id="job_allfail_timeout",
+            runtime=types.SimpleNamespace(),
+            chunk_texts=["c0", "c1", "c2"],
+            source_kind="history",
+        )
+
+    raw_error = str(excinfo.value)
+    assert service.classify_genesis_error(raw_error) == "provider_timeout"
 
 
 def test_reap_stale_atomically_fails_then_syncs_blobs(monkeypatch):

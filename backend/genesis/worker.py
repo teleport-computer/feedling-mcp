@@ -82,6 +82,38 @@ class GenesisWorkerError(Exception):
     """
 
 
+# I6: when every fact-map chunk in a batch fails, pick the most actionable
+# real cause instead of flattening the whole batch to "model produced
+# nothing". Priority order matches user-actionability: a bad key or empty
+# quota blocks the user outright; a timeout is transient; bad JSON is a
+# model/provider quirk. Anything unclassifiable (not one of these four)
+# means we genuinely don't know the cause — model_empty_output is the
+# fallback for THAT case, kept in service.classify_genesis_error itself so
+# legacy (pre-fix) persisted "all_fact_maps_failed:N/M" strings without a
+# cause suffix still classify the same way they always did.
+_FACT_MAP_FAILURE_PRIORITY = (
+    "bad_api_key",
+    "provider_quota",
+    "provider_timeout",
+    "model_bad_json",
+)
+
+
+def _classify_fact_map_failures(errors: list[BaseException]) -> str:
+    """Priority-pick one classify_genesis_error code across all exceptions
+    raised by a totally-failed fact-map batch. Returns "internal" (never
+    model_empty_output) when none of the exceptions match a known
+    actionable cause — this raise site is exception-driven by construction
+    (a valid-but-empty model reply never raises), so it is never actually
+    the "no output" case even when the underlying cause can't be pinned
+    down further."""
+    seen = {service.classify_genesis_error(str(e), e) for e in errors}
+    for code in _FACT_MAP_FAILURE_PRIORITY:
+        if code in seen:
+            return code
+    return "internal"
+
+
 def _trace_genesis(store, event_type: str, *, job_id: str = "", status: str = "ok",
                    summary: str = "", detail: dict | None = None, dur_ms: float | None = None) -> None:
     try:
@@ -930,6 +962,7 @@ def _build_reducer_output(
     fact_candidates: list[dict] = []
     fact_map_attempts = 0
     fact_map_failures = 0
+    fact_map_errors: list[BaseException] = []
     for idx, text in enumerate(chunk_texts):
         if include_persona_voice and source_family == "history":
             try:
@@ -970,6 +1003,7 @@ def _build_reducer_output(
                 fact_candidates.extend(item for item in facts["fact_candidates"] if isinstance(item, dict))
         except (provider_client.ProviderError, GenesisWorkerError) as e:
             fact_map_failures += 1
+            fact_map_errors.append(e)
             print(f"[genesis:{job_id}] fact-map-{idx} skipped: {type(e).__name__}:{str(e)[:120]}")
         # NB: the job's updated_at heartbeat lives in GenesisLLMClient.complete
         # (fires on every LLM call), so it covers the reduce phase and early-return
@@ -978,7 +1012,18 @@ def _build_reducer_output(
     # effectively unusable for this user — fail loudly so the job stays retryable
     # rather than writing an empty/garbage memory garden from zero candidates.
     if include_memory and fact_map_attempts and fact_map_failures == fact_map_attempts:
-        raise GenesisWorkerError(f"all_fact_maps_failed:{fact_map_failures}/{fact_map_attempts}")
+        # I6 fix: this floor is ALWAYS exception-driven (a genuinely-empty-but-valid
+        # model reply never raises, so it never increments fact_map_failures — it
+        # just contributes zero candidates and falls through below). So collapsing
+        # every cause here to "model produced nothing" was actively wrong: a wall of
+        # 401s or a provider timeout has a much more actionable real cause. Reuse
+        # service.classify_genesis_error per-exception and surface the most
+        # actionable one (by priority) as a suffix classify_genesis_error can pick
+        # back up — see the mirrored priority regex there.
+        cause_code = _classify_fact_map_failures(fact_map_errors)
+        raise GenesisWorkerError(
+            f"all_fact_maps_failed:{fact_map_failures}/{fact_map_attempts}:{cause_code}"
+        )
 
     if include_memory and skip_fact_texts:
         # Genesis v2: drop the candidates the foreground already wrote as core, so the
