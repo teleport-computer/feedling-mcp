@@ -4,7 +4,7 @@
 
 **Goal:** 用户在 iOS 设置页（REST）或聊天里（V2 工具）查看自己 provider key 的余额/用量；现查现回，不落库。
 
-**Architecture:** 底层新模块 `backend/provider_usage.py`（无业务依赖，只做三家账单 HTTP + 归一化，紧挨 provider_client.py 这层）。REST 入口 `GET /v1/model_api/usage` 走 hosted 层现有「解一次 key」路径。V2 侧作为 runtime-native 工具进静态目录（同 task/reply），wake lane 显式禁用、subagent 自动落入禁用集，chat lane 经 `_dispatch_mixed_tool_calls` 新分支 + 闭包复用本回合已解密的 `provider_config`，第三方 HTTP 在 enclave 信号量外执行。kill switch 复制 web_halted 双边界模式（目录摘除 + dispatch 活查）。
+**Architecture:** 底层新模块 `backend/core/provider_usage.py`（无业务依赖，只做三家账单 HTTP + 归一化，紧挨 provider_client.py 这层）。REST 入口 `GET /v1/model_api/usage` 走 hosted 层现有「解一次 key」路径。V2 侧作为 runtime-native 工具进静态目录（同 task/reply），wake lane 显式禁用、subagent 自动落入禁用集，chat lane 经 `_dispatch_mixed_tool_calls` 新分支 + 闭包复用本回合已解密的 `provider_config`，第三方 HTTP 在 enclave 信号量外执行。kill switch 复制 web_halted 双边界模式（目录摘除 + dispatch 活查）。
 
 **Tech Stack:** FastAPI + httpx（async, `trust_env=False`）、alembic、pytest（hand-rolled fake httpx，无 respx）。
 
@@ -24,7 +24,7 @@
 
 | 文件 | 动作 | 职责 |
 |---|---|---|
-| `backend/provider_usage.py` | Create | 适配器选择、三家账单 HTTP、payload 归一化、出站安全。唯一的领域核心，REST 和 V2 共用 |
+| `backend/core/provider_usage.py` | Create | 适配器选择、三家账单 HTTP、payload 归一化、出站安全。唯一的领域核心，REST 和 V2 共用 |
 | `backend/hosted/usage_core.py` | Create | 框架中立薄胶水：解 key → 调核心（或错误透传） |
 | `backend/hosted/setup_routes_asgi.py` | Modify | `GET /v1/model_api/usage` 路由（薄壳） |
 | `backend/capabilities/tool_schema.py` | Modify | `PROVIDER_USAGE_TOOL` 常量 + PARAMS/DESCRIPTIONS + build_tool_specs 追加 |
@@ -39,10 +39,10 @@
 
 ---
 
-### Task 1: 查询核心 `backend/provider_usage.py` — 适配器选择与归一化（纯逻辑）
+### Task 1: 查询核心 `backend/core/provider_usage.py` — 适配器选择与归一化（纯逻辑）
 
 **Files:**
-- Create: `backend/provider_usage.py`
+- Create: `backend/core/provider_usage.py`
 - Test: `tests/test_provider_usage.py`
 - Modify: `tests/conftest.py`（`_PURE_UNIT` 集合加 `"test_provider_usage.py"`，插入现有列表字母序处）
 
@@ -60,7 +60,7 @@
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
-import provider_usage as pu
+from core import provider_usage as pu
 
 
 def test_select_adapter_official_origins():
@@ -111,7 +111,7 @@ Expected: FAIL `ModuleNotFoundError: No module named 'provider_usage'`
 - [ ] **Step 3: 最小实现**
 
 ```python
-# backend/provider_usage.py
+# backend/core/provider_usage.py
 """Provider 账单/额度查询核心（bottom layer，无业务依赖）。
 
 REST（hosted/usage_core.py）与 V2 runtime-native 工具共用。只认已解密的
@@ -209,7 +209,7 @@ Expected: 列出 2 个测试（不是 0 个）
 - [ ] **Step 6: Commit**
 
 ```bash
-git add backend/provider_usage.py tests/test_provider_usage.py tests/conftest.py
+git add backend/core/provider_usage.py tests/test_provider_usage.py tests/conftest.py
 git commit -m "feat(provider-usage): adapter selection + payload core"
 ```
 
@@ -218,7 +218,7 @@ git commit -m "feat(provider-usage): adapter selection + payload core"
 ### Task 2: 三家账单 HTTP 适配器（fake httpx 单测）
 
 **Files:**
-- Modify: `backend/provider_usage.py`
+- Modify: `backend/core/provider_usage.py`
 - Test: `tests/test_provider_usage.py`（追加）
 
 **Interfaces:**
@@ -389,7 +389,7 @@ Expected: 新增测试 FAIL（`query_usage_async` 不存在）
 - [ ] **Step 3: 实现**
 
 ```python
-# 追加到 backend/provider_usage.py
+# 追加到 backend/core/provider_usage.py
 import json as _json
 import os
 
@@ -564,7 +564,7 @@ Expected: 全 passed（`test_relay_dashboard_fallback` 里 remaining 是 16.0）
 - [ ] **Step 5: Commit**
 
 ```bash
-git add backend/provider_usage.py tests/test_provider_usage.py
+git add backend/core/provider_usage.py tests/test_provider_usage.py
 git commit -m "feat(provider-usage): deepseek/openrouter/relay billing adapters"
 ```
 
@@ -655,7 +655,7 @@ async def model_api_usage(request: Request, auth: AuthResult = Depends(require_a
     return JSONResponse(payload, status_code=200)
 ```
 
-顶部 import 区补 `from hosted import usage_core` 和 `import provider_usage`
+顶部 import 区补 `from hosted import usage_core` 和 `from core import provider_usage`
 （模块级导入，遵守 `from pkg import module` 风格）。
 
 `docs/API_ERRORS.md` 追加一节：`/v1/model_api/usage` 复用 loader 的 4xx slug
@@ -938,7 +938,7 @@ def _make_provider_usage_dispatcher(*, provider_config):
   `dispatch_provider_usage=_make_provider_usage_dispatcher(provider_config=provider_config)`。
 - offer-time halt：5918 `disabled_tool_names_for_turn` 组装处，
   `kill_switch.provider_usage_halted()` 为 True → 并入工具名（try/except 包住，异常当 halted）。
-- 顶部 import：`import provider_usage`、`import json as _json`（如已有 json 导入则复用）。
+- 顶部 import：`from core import provider_usage`、`import json as _json`（如已有 json 导入则复用）。
 
 - [ ] **Step 4: 跑测试确认通过**；再全量跑 V2 相关：
   `python3 -m pytest tests/test_v2_provider_usage_tool.py tests/test_v2_worker_tool_loop.py tests/test_v2_tool_loop.py -q` → 全绿
@@ -985,7 +985,7 @@ cd /Users/hx/Projects/io/worktrees/feedling-mcp/feat-provider-usage/backend
 python3 - <<'PY'
 import asyncio, json, os, sys
 sys.path.insert(0, ".")
-import provider_client as pc, provider_usage as pu
+import provider_client as pc; from core import provider_usage as pu
 # key 从 io/.env.local 读（现场 export），绝不打印 key
 for prov, env in (("deepseek", "DEEPSEEK_KEY"), ("openrouter", "OPEN_ROUTER_KEY")):
     cfg = pc.ProviderConfig(provider=prov, model="m", api_key=os.environ[env])
