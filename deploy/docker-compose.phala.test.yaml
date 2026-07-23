@@ -188,6 +188,15 @@ services:
       # iOS broadcast-extension frame ingest on :9998 never binds.
       # See asgi/lifespan.py.
       FEEDLING_ASGI_BACKGROUND: "true"
+      # gunicorn worker count (backend/gunicorn_conf.py _worker_count, default 1).
+      # The base compose (docker-compose.phala.yaml) wires this; the test compose
+      # did NOT, so the deploy's `-e FEEDLING_BACKEND_WORKERS=...` (from the repo
+      # var TEST_FEEDLING_BACKEND_WORKERS, =2 since 2026-07-01) was silently
+      # dropped and test ran -w1 regardless. Wiring it makes the var take effect.
+      # -w N is code-supported (LISTEN/NOTIFY wake bus + advisory-lock leader
+      # election, core/wake_bus.py). Budget: test RDS max_connections=79, ~18
+      # conns/worker → -w2≈36, safe.
+      FEEDLING_BACKEND_WORKERS: "${FEEDLING_BACKEND_WORKERS:-1}"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       # This deploy serves test-api, so skill_url must point at io-onboarding's
       # test branch. Code defaults to "main" (so prod just works); the test
