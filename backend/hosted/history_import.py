@@ -2623,9 +2623,13 @@ def _normalize_identity_payload(raw, memories: list[dict], days: int, language: 
         payload["user_preferred_name"] = user_preferred_name
     else:
         payload.pop("user_preferred_name", None)
+    # user_preferred_name, custom_persona_prompt, relationship_anchor, language_preference,
+    # stable_definitions are user-layer fields (D1). custom_persona_prompt and
+    # relationship_anchor are user instructions, not display prose — any language is
+    # valid (an English-authored persona directive in a zh card is the user's intent,
+    # not display text to be dropped for language consistency). Keep them regardless of
+    # language, matching VPS distill_prompt_v1 (no zh-english guard there either).
     custom_persona_prompt = str(payload.get("custom_persona_prompt") or "").strip()[:1200]
-    if str(language).startswith("zh") and _english_only_for_zh(custom_persona_prompt):
-        custom_persona_prompt = ""
     if custom_persona_prompt:
         payload["custom_persona_prompt"] = custom_persona_prompt
     else:
@@ -2640,8 +2644,6 @@ def _normalize_identity_payload(raw, memories: list[dict], days: int, language: 
     else:
         payload.pop("language_preference", None)
     relationship_anchor = str(payload.get("relationship_anchor") or "").strip()[:1200]
-    if str(language).startswith("zh") and _english_only_for_zh(relationship_anchor):
-        relationship_anchor = ""
     if relationship_anchor:
         payload["relationship_anchor"] = relationship_anchor
     else:

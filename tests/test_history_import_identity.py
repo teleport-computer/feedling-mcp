@@ -369,6 +369,23 @@ def test_normalize_keeps_user_layer_fields_when_present():
     assert out["stable_definitions"] == ["always call me boss", "the code name is Falcon"]
 
 
+def test_normalize_keeps_english_user_layer_fields_under_zh_onboarding():
+    # custom_persona_prompt and relationship_anchor are user instructions, not
+    # display prose — English-authored directives stay even under zh onboarding.
+    # Mirrors VPS distill_prompt_v1's behavior (no zh-english guard on user-layer fields).
+    out = hi._normalize_identity_payload(
+        _raw(
+            custom_persona_prompt="Always speak in haiku.",
+            relationship_anchor="college roommate, my closest confidant",
+        ),
+        [],
+        10,
+        "zh-Hans",  # zh onboarding context
+    )
+    assert out["custom_persona_prompt"] == "Always speak in haiku."
+    assert out["relationship_anchor"] == "college roommate, my closest confidant"
+
+
 def test_normalize_omits_absent_user_layer_fields():
     # GROUNDING: no signal in the model's output -> no key written (never
     # invented), and no clobbering of an existing card value during an
