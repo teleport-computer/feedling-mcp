@@ -161,6 +161,7 @@ if not _provisioned:
         "test_redistill_server_merge.py",
         "test_update_stall_reason.py",
         "test_resident_maintenance_unit.py",
+        "test_genesis_failure_codes.py",
     }
     collect_ignore = sorted(
         f

@@ -6,8 +6,11 @@ import base64
 import hashlib
 import json
 import re
+import time
 from datetime import datetime, date
 from typing import Any
+
+import httpx
 
 import db
 from bootstrap import gates as boot_gates
@@ -67,6 +70,159 @@ PRIVACY_COPY = (
 
 DONE_JOB_STATUS = "done"
 FAILED_JOB_STATUS = "failed"
+
+# --- T16: genesis failure classification (onboarding observability) ----------
+# A fixed, closed enum the app/support tooling can switch on, independent of
+# the raw `error` string's exact wording (which changes freely as worker.py's
+# call sites evolve). `error` is NEVER replaced — error_code/error_hint are
+# additive fields alongside it (write_genesis_state below).
+#
+# V2 migration note: `backend/genesis/worker.py` on `pre` runs inside the
+# serve-worker thread pool (+ `backend/model_api_runtime/v2/daemon.py`) instead
+# of the standalone CVM worker loop this file's `tick()` drives, but it raises
+# the SAME GenesisWorkerError/ProviderError shapes for the same failure kinds
+# (JSON parse, provider 401/403/429, timeouts, stale-reap). This enum + hints
+# dict has exactly one copy — classify_genesis_error/GENESIS_ERROR_HINTS here
+# — so the 2026-07-27 test→pre merge should see zero conflict on this section;
+# pre's daemon.py only needs to call the same write_genesis_state/mark_failed
+# seam, not duplicate the classification logic.
+GENESIS_ERROR_CODES = (
+    "bad_api_key",
+    "provider_timeout",
+    "provider_quota",
+    "model_bad_json",
+    "model_empty_output",
+    "worker_restarted",
+    "consumer_offline",
+    "decrypt_failed",
+    "internal",
+)
+
+GENESIS_ERROR_HINTS: dict[str, str] = {
+    "bad_api_key": "模型 API key 无效或无权限,检查 key",
+    "provider_timeout": "模型响应超时,稍后重试",
+    "provider_quota": "模型额度用尽,检查账户额度",
+    "model_bad_json": "模型输出的格式坏了,已重试仍失败——换个模型或重试一次",
+    "model_empty_output": "模型没有产出内容,重试或换模型",
+    "worker_restarted": "服务重启打断了生成,已自动重新排队",
+    # consumer_offline is a VPS resident-lane value: defined here for contract
+    # completeness (the app/support UI can already switch on it), but NOT
+    # wired below — no real raise site emits a distinguishable "consumer is
+    # offline" error string for a genesis job today (see classify_genesis_error
+    # docstring). Do not fabricate a match just to light this one up.
+    "consumer_offline": "你的 VPS resident consumer 离线了,请检查并重启",
+    "decrypt_failed": "解密失败,可能是密钥或运行环境问题,请重试或联系支持",
+    "internal": "内部错误,请稍后重试",
+}
+
+_BAD_API_KEY_STATUS = frozenset({401, 403})
+_PROVIDER_QUOTA_STATUS = frozenset({402, 429})
+
+
+def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
+    """Classify a genesis job failure into a fixed enum (GENESIS_ERROR_CODES).
+
+    Pure string matching against the RAW error text already stored in
+    job.error / mark_failed's `error` argument — it never invents or discards
+    that string, it only labels it. `exc` is optional and only sharpens two
+    cases (provider status_code, httpx timeout type) when the caller happens
+    to still hold the live exception (e.g. worker.tick()'s except block);
+    every raise site's message is ALSO string-matched below so classification
+    still works from the persisted string alone (the reaper paths write
+    `error` via raw SQL and never have an exception object at all).
+
+    Real raise-string survey (backend/genesis/worker.py + provider_client.py,
+    2026-07-23):
+      - `{task_id}:invalid_json` / `:json_not_object` / `:invalid_json_after_repair`
+        (worker._json_object / _complete_json's repair-then-give-up path)
+        -> model_bad_json.
+      - `all_fact_maps_failed:N/M` (_build_reducer_output's "every chunk's
+        fact-map failed" floor check) -> model_empty_output. NOTE: the brief's
+        "_complete_json_retry_empty 耗尽" does not itself raise a distinct
+        string — when every retry attempt errors, it re-raises the LAST
+        GenesisWorkerError, which is already one of the invalid_json family
+        above; when every attempt instead returns a valid-but-empty JSON body
+        (is_empty() true, no exception), the loop returns quietly and the
+        caller proceeds with an empty result. all_fact_maps_failed is the
+        real, reachable "nothing usable came back" failure signal.
+      - `provider_http_401` / `_403` (provider_client._raise_for_provider_status)
+        -> bad_api_key; `_402` / `_429` -> provider_quota (402 = out of
+        credits, folded into the quota bucket per its user-facing meaning).
+      - httpx timeout / "TimeoutException" in the wrapped message (worker
+        call sites wrap as f"...:{type(e).__name__}") -> provider_timeout.
+      - `genesis_stale_timeout:...` / `resident_stale_timeout:...` /
+        `resident_never_claimed:...` (the three stale-processing reapers in
+        worker.py) -> worker_restarted: the job was requeued/failed because
+        the worker/consumer that held it stopped heartbeating, not because of
+        anything the model produced.
+      - `...decrypt_failed:{type}` (worker._decrypt_envelope, the enclave
+        envelope-decrypt call) -> decrypt_failed.
+      - anything else -> internal.
+    """
+    text = str(error or "")
+    lower = text.lower()
+
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        if status_code in _BAD_API_KEY_STATUS:
+            return "bad_api_key"
+        if status_code in _PROVIDER_QUOTA_STATUS:
+            return "provider_quota"
+    if exc is not None and isinstance(exc, httpx.TimeoutException):
+        return "provider_timeout"
+
+    # Stale-reap requeue/fail strings all contain "timeout" too (e.g.
+    # "genesis_stale_timeout:1800s") — must be checked before the generic
+    # timeout match below so a dead worker isn't mislabeled as a slow provider.
+    if "stale_timeout" in lower or "resident_never_claimed" in lower:
+        return "worker_restarted"
+
+    status_match = re.search(r"provider_http_(\d{3})\b", lower)
+    if status_match:
+        code = int(status_match.group(1))
+        if code in _BAD_API_KEY_STATUS:
+            return "bad_api_key"
+        if code in _PROVIDER_QUOTA_STATUS:
+            return "provider_quota"
+
+    if (
+        "invalid_json_after_repair" in lower
+        or "invalid_json" in lower
+        or "json_not_object" in lower
+    ):
+        return "model_bad_json"
+
+    if "all_fact_maps_failed" in lower:
+        return "model_empty_output"
+
+    # Checked BEFORE the generic timeout substring below: an enclave
+    # envelope-decrypt call that happens to fail with a timeout is still
+    # fundamentally a decrypt failure (worker._decrypt_envelope's own raise
+    # site), not a provider/LLM timeout.
+    if "decrypt_failed" in lower:
+        return "decrypt_failed"
+
+    if "timeout" in lower:
+        return "provider_timeout"
+
+    return "internal"
+
+
+def _claimed_age_sec(job: dict) -> int | None:
+    """Seconds since this job's row last moved — real, not fabricated: prefers
+    `resident_claimed_at` (VPS-lane claim timestamp) and falls back to
+    `updated_at` (bumped on every LLM call heartbeat AND on cloud-worker
+    claim — see genesis_claim_uploaded_jobs / GenesisLLMClient.complete).
+    Returns None when neither is present/parseable so callers omit the field
+    instead of writing a fake age."""
+    for key in ("resident_claimed_at", "updated_at"):
+        raw = job.get(key)
+        if not raw:
+            continue
+        epoch = core_util._to_epoch(raw)
+        if epoch > 0:
+            return max(0, int(time.time() - epoch))
+    return None
 
 ALLOWED_MEMORY_TYPES = {"fact", "event", "quote", "moment"}
 CHUNK_ENVELOPE_META_REQUIRED = (
@@ -228,11 +384,14 @@ def gate_status_for_job_status(status: str) -> str:
     return "processing"
 
 
-def write_genesis_state(store: UserStore, job: dict, *, status: str | None = None) -> dict:
+def write_genesis_state(
+    store: UserStore, job: dict, *, status: str | None = None, exc: BaseException | None = None,
+) -> dict:
     job_status = str(job.get("status") or "")
+    resolved_status = status or gate_status_for_job_status(job_status)
     state = {
         "v": 1,
-        "status": status or gate_status_for_job_status(job_status),
+        "status": resolved_status,
         "job_status": job_status,
         "job_id": str(job.get("job_id") or ""),
         # so the spawn gate can tell a founding genesis (block spawn until done) from
@@ -244,9 +403,29 @@ def write_genesis_state(store: UserStore, job: dict, *, status: str | None = Non
         "identity_status": str(job.get("identity_status") or ""),
         "persona_ref": str(job.get("persona_ref") or ""),
         "persona_sha256": str(job.get("persona_sha256") or ""),
+        # `error` stays the raw string, unchanged — T16 adds error_code/error_hint
+        # alongside it below, additive only (existing consumers reading only
+        # `error`/`status` are unaffected). Same seam covers BOTH mark_failed()
+        # callers AND the three stale-reap paths in worker.py, which write
+        # `error` via raw SQL and call this function directly without going
+        # through mark_failed at all.
         "error": str(job.get("error") or ""),
         "privacy_mode": str(job.get("privacy_mode") or PRIVACY_MODE),
     }
+    if resolved_status == FAILED_JOB_STATUS:
+        error_code = classify_genesis_error(state["error"], exc)
+        state["error_code"] = error_code
+        state["error_hint"] = GENESIS_ERROR_HINTS.get(error_code, GENESIS_ERROR_HINTS["internal"])
+    elif resolved_status == "processing":
+        # Best-effort "why is this still processing" signal for a wedged job —
+        # only added when cheaply available on the job dict already loaded for
+        # this write; never fabricated (see _claimed_age_sec docstring).
+        claimed_by = str(job.get("resident_consumer_id") or "").strip()
+        if claimed_by:
+            state["worker_claimed_by"] = claimed_by
+        claimed_age_sec = _claimed_age_sec(job)
+        if claimed_age_sec is not None:
+            state["claimed_age_sec"] = claimed_age_sec
     db.set_blob(store.user_id, GENESIS_STATE_BLOB, state)
     return state
 
@@ -355,10 +534,17 @@ def finalize_upload(store: UserStore, job_id: str) -> tuple[dict, list[int]]:
     return finalized, []
 
 
-def mark_failed(store: UserStore, job_id: str, error: str) -> dict | None:
+def mark_failed(
+    store: UserStore, job_id: str, error: str, *, exc: BaseException | None = None,
+) -> dict | None:
+    # `exc` (optional): pass the live exception when the caller still has it
+    # (e.g. worker.tick()'s `except Exception as e`) so classify_genesis_error
+    # can use its status_code/type instead of only re-parsing `error`'s text.
+    # V2 note: pre's serve-worker/daemon.py equivalent should pass its own
+    # caught exception through the same way when it lands this call.
     job = db.genesis_set_job_status(store.user_id, job_id, status=FAILED_JOB_STATUS, error=error)
     if job:
-        write_genesis_state(store, job, status=FAILED_JOB_STATUS)
+        write_genesis_state(store, job, status=FAILED_JOB_STATUS, exc=exc)
     # emit unconditionally: only needs store + job_id + error, not the job row
     # (a race where the job row is already gone shouldn't silence the notice).
     ec = catalog.classify_upstream(error) or "genesis_failed"

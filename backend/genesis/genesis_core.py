@@ -530,7 +530,11 @@ def finalize(store, job_id: str, payload: dict, *, api_key: str | None) -> tuple
         except ValueError as e:
             return _bad(str(e), 400)
         except Exception as e:  # noqa: BLE001
-            failed = service.mark_failed(store, job_id, f"apply_outputs_failed:{type(e).__name__}:{str(e)[:180]}")
+            # T16: exc=e lets classify_genesis_error use e.status_code if this
+            # ever wraps a ProviderError; string match is the fallback either way.
+            failed = service.mark_failed(
+                store, job_id, f"apply_outputs_failed:{type(e).__name__}:{str(e)[:180]}", exc=e,
+            )
             return _job_response(failed or job, extra={"status": "failed", "error": str(e)[:240]}), 500
 
     return _job_response(job, extra={"status": "uploaded"}), 202
@@ -562,7 +566,9 @@ def apply_outputs(
             store, subsystem="genesis", type="genesis.outputs.applied", actor="backend",
             job_id=job_id, status="failed", summary="apply failed",
             detail={"reason": f"{type(e).__name__}:{str(e)[:80]}"})
-        failed = service.mark_failed(store, job_id, f"apply_outputs_failed:{type(e).__name__}:{str(e)[:180]}")
+        failed = service.mark_failed(
+            store, job_id, f"apply_outputs_failed:{type(e).__name__}:{str(e)[:180]}", exc=e,
+        )
         return _job_response(failed, extra={"status": "failed", "error": str(e)[:240]}), 500
     job = db.genesis_get_job(store.user_id, job_id)
     import debug_trace

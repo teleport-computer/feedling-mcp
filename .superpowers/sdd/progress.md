@@ -57,3 +57,9 @@ Task 13: complete (653cea2d + 5c270ca9, review clean;顺带堵 identity-redistil
 Task 14: complete(docs-site changelog Unreleased + self-hosting 信任模型;OpenAPI 重生成核对无 diff
   (identity/genesis 两端点契约本就是 generic schema,字段级增补不改公共 schema;redistill IPC
   本地-only 不入 OpenAPI);types:check/lint/build 三项全绿;Phase 6 完成)
+Task 14: complete (f5a21e21, review clean 1st round;docs-site 全检通过 npm ci/types/lint/build/openapi;每条文案溯源到代码实证)
+Task 15: complete (33159cee + 57257b9c, review clean 2nd round;opus 逐条对 origin/pre 核实;
+  Critical=拒绝闸落错函数会无限重试,已改到 patch() retryable=False。迁移手册可执行。Phase 6 剩 T16)
+Task 16: complete (error_code/error_hint 分类 + processing 卡点字段,纯增量,write_genesis_state
+  单落点覆盖 mark_failed 与 3 个 reaper 直写路径;consumer_offline 定义未接线、decrypt_failed 找到
+  真实抛点已接线;27 新测试(_PURE_UNIT)+ 修复 4 处旧测试 lambda 签名;回归 252 全绿;Phase 6 完成)

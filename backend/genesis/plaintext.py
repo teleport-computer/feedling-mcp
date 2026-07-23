@@ -1295,7 +1295,9 @@ def _run_plaintext_update_identity_job(
             user_name=user_name,
         )
     except Exception as e:  # noqa: BLE001
-        service.mark_failed(store, job_id, f"persona_rebuild_failed:{type(e).__name__}:{str(e)[:160]}")
+        service.mark_failed(
+            store, job_id, f"persona_rebuild_failed:{type(e).__name__}:{str(e)[:160]}", exc=e,
+        )
         return
     status = service.replace_identity_preserving_anchor(
         store, {"identity": identity_payload, "relationship_anchor": relationship_anchor or {}}, api_key
@@ -1306,7 +1308,9 @@ def _run_plaintext_update_identity_job(
     try:
         persona_ref, persona_sha = service.write_persona_artifact(store, job_id, persona_output)
     except Exception as e:  # noqa: BLE001
-        service.mark_failed(store, job_id, f"persona_write_failed:{type(e).__name__}:{str(e)[:160]}")
+        service.mark_failed(
+            store, job_id, f"persona_write_failed:{type(e).__name__}:{str(e)[:160]}", exc=e,
+        )
         return
     completed = db.genesis_complete_job(
         store.user_id,
@@ -1550,7 +1554,9 @@ def _run_plaintext_genesis_job(
             detail={"mode": mode, "reason": f"{type(e).__name__}:{str(e)[:180]}"},
             dur_ms=(time.time() - started_at) * 1000,
         )
-        service.mark_failed(store, job_id, f"plaintext_import_failed:{type(e).__name__}:{str(e)[:220]}")
+        service.mark_failed(
+            store, job_id, f"plaintext_import_failed:{type(e).__name__}:{str(e)[:220]}", exc=e,
+        )
     finally:
         with _PLAINTEXT_ACTIVE_LOCK:
             _PLAINTEXT_ACTIVE_JOBS.discard(active_key)

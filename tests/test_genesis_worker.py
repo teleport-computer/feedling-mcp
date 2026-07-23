@@ -859,7 +859,7 @@ def test_tick_marks_failed_when_claimed_job_has_missing_chunks(monkeypatch):
     trace_events = []
     monkeypatch.setattr(worker, "get_store", lambda user_id: types.SimpleNamespace(user_id=user_id))
     monkeypatch.setattr(worker.service, "write_genesis_state", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(worker.service, "mark_failed", lambda _store, job_id, error: failures.append((job_id, error)))
+    monkeypatch.setattr(worker.service, "mark_failed", lambda _store, job_id, error, **_kwargs: failures.append((job_id, error)))
     monkeypatch.setattr(
         worker,
         "debug_trace",
@@ -890,7 +890,7 @@ def test_tick_marks_failed_for_empty_import_without_provider_calls(monkeypatch):
     failures = []
     monkeypatch.setattr(worker, "get_store", lambda user_id: types.SimpleNamespace(user_id=user_id))
     monkeypatch.setattr(worker.service, "write_genesis_state", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(worker.service, "mark_failed", lambda _store, job_id, error: failures.append((job_id, error)))
+    monkeypatch.setattr(worker.service, "mark_failed", lambda _store, job_id, error, **_kwargs: failures.append((job_id, error)))
     monkeypatch.setattr(
         worker.db,
         "genesis_claim_uploaded_jobs",

@@ -991,7 +991,7 @@ def test_update_identity_persona_rebuild_failure_does_not_replace_identity(monke
     )
     monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not replace identity when persona rebuild fails")))
     monkeypatch.setattr(plaintext.db, "genesis_complete_job", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("failed persona rebuild must not complete job")))
-    monkeypatch.setattr(plaintext.service, "mark_failed", lambda _store, job_id, error: calls.update({"job_id": job_id, "error": error}))
+    monkeypatch.setattr(plaintext.service, "mark_failed", lambda _store, job_id, error, **_kwargs: calls.update({"job_id": job_id, "error": error}))
 
     plaintext._run_plaintext_genesis_job(
         store,
@@ -1066,7 +1066,7 @@ def test_update_identity_mode_fails_on_empty_identity(monkeypatch):
     monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda _store, _output, *_a, **_k: "identity_update_empty")
     monkeypatch.setattr(plaintext.db, "genesis_complete_job", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("empty identity must not complete job")))
     monkeypatch.setattr(plaintext.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
-    monkeypatch.setattr(plaintext.service, "mark_failed", lambda _store, job_id, error: calls.update({"job_id": job_id, "error": error}))
+    monkeypatch.setattr(plaintext.service, "mark_failed", lambda _store, job_id, error, **_kwargs: calls.update({"job_id": job_id, "error": error}))
 
     plaintext._run_plaintext_genesis_job(
         store,

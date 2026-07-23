@@ -425,6 +425,32 @@ pytest tests/test_spawners_catalog.py tests/test_agent_runtime_spawners.py -q   
 
 ---
 
+## ⑧ T16 蒸馏失败分类(error_code/error_hint/卡点信息)
+
+`backend/genesis/service.py` 新增 `classify_genesis_error` + `GENESIS_ERROR_HINTS`
+（固定枚举:`bad_api_key|provider_timeout|provider_quota|model_bad_json|
+model_empty_output|worker_restarted|consumer_offline|decrypt_failed|internal`），
+`write_genesis_state` 在 `status=failed` 时附加 `error_code`/`error_hint`
+（`error` 原始字符串不变),`status=processing` 时按 job 字典里已有的
+`resident_consumer_id`/`resident_claimed_at`/`updated_at` 附加
+`worker_claimed_by`/`claimed_age_sec`(取不到就不写,不编造)。纯增量——
+`mark_failed` 新增可选 `exc` 参数用于更精确分类,不传时退化为纯字符串匹配。
+
+- **pre 侧同名文件同改**:`backend/genesis/worker.py`(pre 版,跑在
+  serve-worker 线程池 + `daemon.py` 里)抛的是同一批
+  `GenesisWorkerError`/`ProviderError` 字符串,分类逻辑只在
+  `service.py` 存一份,pre 只需要保证自己的失败路径也经过同一个
+  `write_genesis_state`/`mark_failed` 落点,不需要重复维护映射表。
+- `consumer_offline`(VPS resident 离线)本次**只定义枚举值和文案,不接线**——
+  没找到会产出可匹配错误串的真实 consumer-offline 抛点;`decrypt_failed`
+  则找到了真实抛点(`worker._decrypt_envelope`,enclave 解密调用失败)并接了线。
+- iOS 展示是独立后续任务,不阻塞这次合并——`genesis_state` blob 只是多了两个
+  字段,老 app 忽略未知字段,行为不变。
+- 新测试 `tests/test_genesis_failure_codes.py` 纯字符串/monkeypatch,已加入
+  `tests/conftest.py` 的 `_PURE_UNIT` 白名单。
+
+---
+
 ## 收尾验证(全部动作做完后跑一遍)
 
 ```
@@ -438,7 +464,7 @@ pytest tests/test_identity_rename_pairing.py tests/test_identity_nudge_cap.py \
        tests/test_consumer_action_admission.py tests/test_consumer_capability_inject.py \
        tests/test_update_stall_reason.py tests/test_redistill_job_exclusivity.py \
        tests/test_identity_redistill_ipc.py tests/test_redistill_server_merge.py \
-       tests/test_spawners_catalog.py -q
+       tests/test_spawners_catalog.py tests/test_genesis_failure_codes.py -q
 
 # 高风险共享文件的既有回归基线不能破
 pytest tests/test_chat_resident_consumer.py -q          # 456 passed
@@ -452,7 +478,7 @@ FEEDLING_TEST_PG=postgresql://localhost:1/none pytest --collect-only \
     tests/test_io_cli_catalog.py tests/test_consumer_action_admission.py \
     tests/test_consumer_capability_inject.py tests/test_update_stall_reason.py \
     tests/test_identity_redistill_ipc.py tests/test_redistill_server_merge.py \
-    tests/test_spawners_catalog.py -q
+    tests/test_spawners_catalog.py tests/test_genesis_failure_codes.py -q
 
 # docs-site(pre 是否需要重新生成,见下方专节)
 cd docs-site && npm run openapi:generate && git status  # 预期无 diff

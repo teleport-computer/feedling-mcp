@@ -69,7 +69,17 @@ TRUNCATION_STOP_REASONS = {
 
 
 class GenesisWorkerError(Exception):
-    """Retryable/non-retryable worker failure surfaced into job.error."""
+    """Retryable/non-retryable worker failure surfaced into job.error.
+
+    T16: every raise site's message below is classified into a fixed enum by
+    service.classify_genesis_error (string match on this exception's text, no
+    change to the strings themselves) and surfaced as error_code/error_hint on
+    the genesis_state blob. V2 note: pre's worker.py (running in the
+    serve-worker thread pool + daemon.py, not this standalone CVM loop) raises
+    the same GenesisWorkerError shapes for the same failures — the
+    classification lives once in service.py, so no duplicate mapping is needed
+    there; only the raise sites here need to keep producing matchable text.
+    """
 
 
 def _trace_genesis(store, event_type: str, *, job_id: str = "", status: str = "ok",
@@ -468,6 +478,9 @@ def _decrypt_envelope(
             detail={"error_class": error_type},
             dur_ms=(time.time() - started_at) * 1000,
         )
+        # T16: "decrypt_failed" substring -> error_code="decrypt_failed" via
+        # classify_genesis_error. Do not rename this segment without updating
+        # that match.
         raise GenesisWorkerError(f"{purpose}:decrypt_failed:{type(e).__name__}") from e
 
 
@@ -1617,6 +1630,11 @@ def reap_stale_processing_jobs() -> list[dict]:
     history-import's stale reaper. One bad reap doesn't stop the rest.
     """
     stale_sec = _genesis_stale_sec()
+    # T16: this string is what service.classify_genesis_error matches on
+    # ("stale_timeout" substring) to produce error_code="worker_restarted" —
+    # keep the substring if this message ever changes. write_genesis_state
+    # below (called with status="failed") does the classification; this path
+    # never goes through mark_failed.
     error = f"genesis_stale_timeout:{stale_sec}s"
     reaped: list[dict] = []
     # The DB flips status processing->failed atomically, conditional on the row
@@ -1670,6 +1688,8 @@ def reap_stale_resident_jobs() -> list[dict]:
     failure instead of an eternal spinner.
     """
     stale_sec = _resident_stale_sec()
+    # T16: also matches classify_genesis_error's "stale_timeout" substring ->
+    # error_code="worker_restarted" (a died/stalled consumer, not a model fault).
     error = f"resident_stale_timeout:{stale_sec}s"
     reaped: list[dict] = []
     for job in db.genesis_reap_stale_resident_jobs(
@@ -1740,6 +1760,8 @@ def reap_stale_unclaimed_jobs() -> list[dict]:
     # Slug must NOT contain "timeout" — the notices upstream-classifier's `timed? ?out`
     # regex would match it and mislabel this as a server outage ("服务商暂时不可用，请稍后
     # 重试"), telling the user to retry when the real fix is updating their own consumer.
+    # T16: this exact substring is matched by classify_genesis_error ->
+    # error_code="worker_restarted" (no consumer ever picked the job up).
     error = f"resident_never_claimed:{stale_sec}s"
     reaped: list[dict] = []
     for job in db.genesis_reap_stale_unclaimed_jobs(stale_sec, error=error):
@@ -1815,7 +1837,14 @@ def tick(
                     summary="genesis worker job failed",
                     detail={"reason": f"{type(e).__name__}:{str(e)[:180]}"},
                 )
-                service.mark_failed(store, job_id, f"worker_failed:{type(e).__name__}:{str(e)[:180]}")
+                # T16: pass the live exception so classify_genesis_error can use its
+                # status_code (ProviderError 401/403/429/402) instead of only the
+                # wrapped string. V2 note: pre's daemon.py catch-all around the
+                # serve-worker genesis path should mirror this — same call, same
+                # `exc=` kwarg — when it lands the equivalent failure here.
+                service.mark_failed(
+                    store, job_id, f"worker_failed:{type(e).__name__}:{str(e)[:180]}", exc=e,
+                )
             results.append({"user_id": user_id, "job_id": job_id, "status": "failed", "error": str(e)[:240]})
     end = time.time() if now is None else float(now())
     return {
