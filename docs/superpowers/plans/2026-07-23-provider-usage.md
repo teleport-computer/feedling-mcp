@@ -50,7 +50,7 @@
 - Produces:
   - `select_adapter(provider: str, base_url: str) -> str` — 返回 `"deepseek" | "openrouter" | "relay" | "unsupported"`
   - `_metric(status, **kw) -> dict`、`_empty_metrics() -> dict`（五个 metric 键全出现）
-  - `build_payload(provider, adapter, metrics, *, error=None) -> dict` — spec 契约形状；`status` 自动推导：全 ok→`ok`，有 ok 有非 ok→`partial`，无 ok→`error`
+  - `build_payload(provider, adapter, metrics, *, error=None) -> dict` — spec 契约形状；`status` 自动推导（unsupported 不参与）：非 unsupported 的 metric 全 ok 且至少一个 ok→`ok`；ok 与 failed 混杂→`partial`；一个 ok 都没有（全 failed 或全 unsupported）→`error`
   - `PROVIDER_USAGE_TIMEOUT_SEC = 6.0`、`_MAX_RESPONSE_BYTES = 262144`
 
 - [ ] **Step 1: 写失败测试**（适配器选择 + payload 形状）
@@ -98,7 +98,7 @@ def test_build_payload_status_derivation():
     m2 = pu._empty_metrics()
     m2["balance"] = pu._metric("ok", amounts=[{"amount": 25.06, "unit": "CNY"}], scope="account")
     p2 = pu.build_payload("deepseek", "deepseek_balance", m2)
-    assert p2["status"] == "partial"          # balance ok，其余 unsupported
+    assert p2["status"] == "ok"               # unsupported 不拖累总状态
     assert p2["provider"] == "deepseek"
     assert "as_of" in p2 and "error" not in p2
 ```
@@ -175,9 +175,10 @@ def _empty_metrics() -> dict:
 
 def build_payload(provider: str, adapter: str, metrics: dict, *, error: str | None = None) -> dict:
     statuses = [m.get("status") for m in metrics.values()]
-    if all(s == "ok" for s in statuses):
+    considered = [s for s in statuses if s != "unsupported"]
+    if considered and all(s == "ok" for s in considered):
         status = "ok"
-    elif any(s == "ok" for s in statuses):
+    elif any(s == "ok" for s in considered):
         status = "partial"
     else:
         status = "error"
@@ -292,7 +293,7 @@ def test_deepseek_balance_multi_currency(monkeypatch):
     assert bal["status"] == "ok"
     assert bal["amounts"] == [{"amount": "25.06", "unit": "CNY"}, {"amount": "1.00", "unit": "USD"}]
     assert p["metrics"]["usage_today"]["status"] == "unsupported"
-    assert p["status"] == "partial"
+    assert p["status"] == "ok"
     # key 只进 Authorization header，绝不进 payload
     assert "sk-secret" not in json.dumps(p)
     assert fake.requests[0][1]["Authorization"] == "Bearer sk-secret-XYZ"
@@ -615,7 +616,7 @@ def test_usage_route_happy_path(make_client, monkeypatch):
     r = client.get("/v1/model_api/usage", headers={"X-API-Key": client.api_key})
     assert r.status_code == 200
     body = r.json()
-    assert body["status"] == "partial"
+    assert body["status"] == "ok"
     assert body["metrics"]["balance"]["amounts"][0]["unit"] == "CNY"
     assert "api_key" not in str(body)
 ```
