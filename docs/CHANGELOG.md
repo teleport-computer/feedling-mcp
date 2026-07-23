@@ -47,6 +47,34 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-23（数据导出补上世界书）
+
+### [DONE] `/v1/content/export` 加 `world_book`，schema_version 2→3
+
+- **背景**：审查导出/备份功能时发现，导出只覆盖 chat / memory / identity
+  （+frames 密文），但**世界书是用户在 App 里亲手写的内容**
+  （Settings → 世界书，`WorldBookListView`/`WorldBookEntryEditor`），
+  且删号会连带删掉（`db.delete_user_data` 的 14 张表清单里有
+  `world_book_entries`）。导出交给用户的是一份不完整的副本。
+- **实测取证**（test 环境合成账号，跑完已清理）：同一账号
+  `GET /v1/worldbook/list` 返回 1 条，`GET /v1/content/export` 顶层键只有
+  `[attestation_snapshot, chat, exported_at, frames, identity, memory, notes,
+  schema_version, user_id]`——没有任何 worldbook 字段。同一轮还确认了
+  local_only 聊天消息**确实**在导出里（无 K_enclave，本地私钥解密成功）。
+- **改动**：`content_core.export_data` 从 `store.world_books` 读出完整信封
+  （与 `worldbook_core.list_envelopes` 同源），密文逐字返回、服务端不解密；
+  iOS `buildPlaintextExport` 加 `decryptWorldBookForExport`（沿用
+  memory/identity 的"元数据 + 明文平铺合并"形状），plaintext 侧
+  schema_version 3→4；导出文案（zh + en）补上世界书。
+- **schema_version 2→3 的理由**：空 `world_book` 数组和"这份导出早于世界书
+  支持"在 JSON 里长得一样，只有版本号能区分。
+- **TDD**：`tests/test_content_export_world_book.py` 5 条（含 local_only、
+  信封字段完整性、空列表、版本号），先红后绿；`test_asgi_content.py` 的
+  parity 断言随契约更新为 3。
+- **未做**：frames 仍只在服务端导出、iOS 侧丢弃（"服务端搬 40 MiB、客户端
+  全扔"）；导出仍无还原/回灌路径；80 MiB 上限与 60s 超时无逃生舱。
+  这三项见当日审查结论，未立项。
+
 ## 2026-07-18（hermes/openclaw 自托管用户 MCP 接线）
 
 ### [DONE] 给自托管 hermes/openclaw 用户加 user-MCP 接线

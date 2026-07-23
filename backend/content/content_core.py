@@ -946,7 +946,7 @@ class ExportResult:
 
 
 def export_data(store: UserStore) -> ExportResult:
-    """Return the caller's chat, memory, identity, and frames as one JSON blob.
+    """Return the caller's chat, memory, identity, world book, and frames as one JSON blob.
 
     Ciphertext is returned verbatim — iOS decrypts client-side using the user's
     content_sk from Keychain. No decryption happens server-side.
@@ -960,6 +960,12 @@ def export_data(store: UserStore) -> ExportResult:
             if m.get("source") != "verify_ping"]
     moments = memory_service._load_moments(store)
     identity = identity_service._load_identity(store)
+
+    # World book entries are hand-written user content and are dropped by account
+    # deletion (db.delete_user_data), so they belong in the copy the user takes
+    # with them. Same verbatim-envelope treatment as the rest: never decrypted.
+    with store.world_books_lock:
+        world_book = [dict(entry) for entry in store.world_books]
 
     # Inline each frame's stored envelope. frames_meta is the index; the
     # ciphertext lives in its frame_envelopes row. A missing row just means the
@@ -984,7 +990,9 @@ def export_data(store: UserStore) -> ExportResult:
     enclave_info = core_enclave._get_enclave_info() or {}
 
     export = {
-        "schema_version": 2,
+        # 3: world_book added. A reader that needs to know whether an export
+        # predates world book coverage cannot infer it from an empty list.
+        "schema_version": 3,
         "user_id": store.user_id,
         "exported_at": exported_at,
         "attestation_snapshot": {
@@ -994,6 +1002,7 @@ def export_data(store: UserStore) -> ExportResult:
         "chat": hist,
         "memory": moments,
         "identity": identity,
+        "world_book": world_book,
         "frames": frames_out,
         "notes": (
             "Ciphertext included verbatim; decrypt client-side using your"

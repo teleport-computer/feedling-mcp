@@ -12,6 +12,16 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- `GET /v1/content/export` now includes a `world_book` array alongside `chat`,
+  `memory`, `identity` and `frames`. World book entries are user-authored
+  content that account deletion removes, so an export that omitted them handed
+  back an incomplete copy. Entries are returned as stored v1 envelopes,
+  ciphertext verbatim for client-side decryption, exactly like the other
+  sections — the server still never decrypts. `local_only` entries (no
+  `K_enclave`) are included; the caller holds the only key that can read them.
+  The export's `schema_version` goes from 2 to 3 so a reader can distinguish an
+  export taken before world book coverage from one where the user simply had no
+  entries.
 - The resident consumer's idle decrypt-health probe interval
   (`FEEDLING_DECRYPT_HEALTH_REFRESH_SEC`) default changes from 120 to 210
   seconds. The probe is one of the more expensive periodic calls a resident
