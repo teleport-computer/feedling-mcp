@@ -11945,8 +11945,12 @@ def _resident_incremental_payload(payload: dict, existing: dict) -> dict:
 
 def _resident_derive_identity(document: str, job_id: str) -> dict | None:
     """Persona/identity is small (fits one context) — a single agent derive, no chunking.
-    Prompt + parse 来自共享模板 identity/distill_prompt_v1(Batch 2 A1):全量人格字段、
-    card_policy 清洗、坏 JSON 重试一次(guardrail 7:报错到 setup log,不静默吞)。
+    Prompt + parse 来自共享模板 identity/distill_prompt_v1(Batch 2 A1):覆盖
+    RESIDENT_IDENTITY_FIELDS 这 9 个字段(非身份卡全部 13 个 profile 字段 ——
+    user_preferred_name / custom_persona_prompt / language_preference /
+    relationship_anchor / stable_definitions 这 5 个用户层字段刻意不蒸馏,详见
+    distill_prompt_v1.RESIDENT_IDENTITY_FIELDS 的说明)、card_policy 清洗、坏 JSON
+    重试一次(guardrail 7:报错到 setup log,不静默吞)。
     Returns a plaintext identity payload for identity.replace, or None if no persona content
     (either unparseable after retry, or the material produced no actual change — see
     _resident_incremental_payload)."""

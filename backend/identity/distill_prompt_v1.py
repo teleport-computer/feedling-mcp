@@ -15,7 +15,21 @@ import json
 
 from identity import card_policy
 
-# consumer 侧"部分补全"读取现有卡时要保留的全字段集(Task 3 使用)。
+# consumer 侧"部分补全"读取现有卡时要保留的字段集(Task 3 使用)。
+#
+# I7 (2026-07-23): this is NOT the full profile — card_policy.PROFILE_FIELDS has
+# 13 writable profile fields; this resident distill lane only covers 9 of them.
+# The 5 NOT covered here (and therefore never touched by resident distill —
+# uploading persona material can neither set nor overwrite them):
+#   user_preferred_name, custom_persona_prompt, language_preference,
+#   relationship_anchor, stable_definitions
+# This is a DELIBERATE exclusion, not an oversight — in particular
+# custom_persona_prompt is USER-AUTHORED (D1 user layer): per the D3 rule that
+# uploaded files/material are content to analyze, never instructions to follow,
+# resident distill must not let an uploaded persona document silently overwrite
+# a directive the user explicitly wrote themselves through a trusted channel.
+# Whether any of these 5 SHOULD become distillable from material is a product
+# decision (hx), not made here — this comment only keeps the contract honest.
 RESIDENT_IDENTITY_FIELDS: tuple[str, ...] = (
     "agent_name", "self_introduction", "category", "signature",
     "dimensions", "tone_style", "agent_role", "do_not_say", "boundaries",
@@ -95,7 +109,10 @@ _MERGE_TEMPLATE = (
 
 
 def build_resident_identity_prompt(document: str, existing_identity: dict | None = None) -> str:
-    """Persona 材料 → 全字段身份卡蒸馏 prompt。existing_identity 非空时附合并规则(部分补全)。"""
+    """Persona 材料 → 身份卡蒸馏 prompt(覆盖 RESIDENT_IDENTITY_FIELDS 这 9 个字段,
+    非 card_policy.PROFILE_FIELDS 全部 13 个 —— 见上方 RESIDENT_IDENTITY_FIELDS 的
+    NOT-distillable 说明,custom_persona_prompt 等 5 个用户层字段是刻意不蒸馏)。
+    existing_identity 非空时附合并规则(部分补全)。"""
     prompt = (
         "The user uploaded a character/persona description for the companion (you). "
         "Derive the identity card and return ONE JSON object, nothing else.\n"
