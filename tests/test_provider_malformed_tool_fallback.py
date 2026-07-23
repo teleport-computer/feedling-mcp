@@ -132,6 +132,91 @@ def test_malformed_wire_uses_exactly_one_tools_disabled_fallback(
     assert outcome.final_text == "plain fallback"
 
 
+def test_content_400_raises_without_a_wasted_tools_disabled_retry(monkeypatch):
+    """A 400 whose cause is the message content (not the tool schema) must
+    propagate immediately. The old code treated EVERY tools-enabled 400 as
+    'tool_schema_rejected', dropped tools, and re-sent the SAME bad history —
+    a second billed call that 400s again and masks the real error. Here the
+    provider raises a content 400 (the OpenAI Responses assistant/input_text
+    case); the loop must raise on the first call and never retry with tools=None."""
+    seen_tools = []
+
+    async def _provider(_config, _messages, *, tools=None):
+        seen_tools.append(tools)
+        raise provider_client.ProviderError(
+            "provider_http_400: Invalid value: 'input_text'. "
+            "Supported values are: 'output_text' and 'refusal'.",
+            status_code=400,
+        )
+
+    async def _dispatch(_calls):
+        raise AssertionError("no tool calls in this scenario")
+
+    async def _on_reply(text, *, final, reasoning=""):
+        raise AssertionError("no reply expected")
+
+    async def _fold():
+        return []
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    with pytest.raises(provider_client.ProviderError):
+        asyncio.run(tool_loop.run_tool_loop(
+            provider_config=_TEST_PROVIDER_CONFIG,
+            build_messages=lambda _t: [{"role": "user", "content": "hi"}],
+            dispatch_tools=_dispatch,
+            on_reply=_on_reply,
+            fold_new_messages=_fold,
+            add_usage=lambda _u: None,
+            max_calls=5,
+        ))
+    # exactly one provider call, with tools enabled — no tools-disabled retry
+    assert seen_tools == [seen_tools[0]] and seen_tools[0] is not None
+    assert len(seen_tools) == 1
+
+
+def test_tool_schema_400_still_falls_back_to_text(monkeypatch):
+    """A genuine tool-schema 400 (error text implicates the function/tools) must
+    still degrade to exactly one tools-disabled retry that yields text — the
+    fallback's intended purpose is preserved."""
+    seen_tools = []
+
+    async def _provider(_config, _messages, *, tools=None):
+        seen_tools.append(tools)
+        if tools is None:
+            return {"reply": "text without tools", "tool_calls": [], "usage": {}}
+        raise provider_client.ProviderError(
+            "provider_http_400: Invalid schema for function 'do_thing': "
+            "parameters.type must be 'object'.",
+            status_code=400,
+        )
+
+    async def _dispatch(_calls):
+        raise AssertionError("tools were rejected; never dispatched")
+
+    replies = []
+
+    async def _on_reply(text, *, final, reasoning=""):
+        replies.append((text, final))
+
+    async def _fold():
+        return []
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=lambda _t: [{"role": "user", "content": "hi"}],
+        dispatch_tools=_dispatch,
+        on_reply=_on_reply,
+        fold_new_messages=_fold,
+        add_usage=lambda _u: None,
+        max_calls=5,
+    ))
+    assert seen_tools[0] is not None and seen_tools[-1] is None
+    assert sum(t is None for t in seen_tools) == 1
+    assert outcome.final_text == "text without tools"
+    assert replies == [("text without tools", True)]
+
+
 def test_web_observation_revokes_durable_writes_for_later_rounds(monkeypatch):
     provider_tools = []
     responses = iter([

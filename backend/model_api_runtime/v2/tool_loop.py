@@ -42,6 +42,22 @@ def _catalog():
     return _CATALOG
 
 
+def _is_probably_tool_schema_rejection(exc: provider_client.ProviderError) -> bool:
+    """Should a tools-enabled 400/422 be retried once WITHOUT tools?
+
+    Only when the provider's error text actually implicates the tool/function
+    schema. A 400 can equally come from the message content (e.g. an OpenAI
+    Responses assistant history part sent as input_text instead of output_text).
+    Dropping tools then re-sends the identical bad history — a second billed
+    call that 400s again and masks the real error as 'tool_schema_rejected'. The
+    provider surfaces its error body in the ProviderError message
+    (``provider_http_400: <detail>``), and content errors don't mention
+    tools/functions, so this gate keeps the genuine tool-schema fallback while
+    letting a content error propagate on its first call."""
+    detail = str(exc).lower()
+    return "tool" in detail or "function" in detail
+
+
 def _search_result_urls(content: str) -> set[str]:
     """Extract exact result URLs even when the capped JSON tail is truncated."""
     urls: set[str] = set()
@@ -454,6 +470,7 @@ async def run_tool_loop(
                 and isinstance(exc, provider_client.ProviderError)
                 and exc.status_code in {400, 422}
                 and attempts < max_calls
+                and _is_probably_tool_schema_rejection(exc)
             ):
                 force_text_fallback = True
                 await _trajectory(
