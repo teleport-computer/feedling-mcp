@@ -330,3 +330,156 @@ def test_client_swap_clears_stale_content_pk_fpr_no_false_skip(client, monkeypat
     client.post("/v1/content/rewrap-to-current-key",
                 json={"public_key": key_a}, headers=_headers(api_key))
     assert calls["n"] > before
+
+
+# ---------------------------------------------------------------------------
+# C1 (review): rewrap's identity-card write must be CAS-guarded against the
+# same row profile_patch / dimension_nudge / redistill write, not a plain
+# unconditional `_save_identity` — otherwise a CAS-won write from one of
+# those landing DURING rewrap's enclave decrypt round trip gets silently
+# re-encrypted-over with the stale pre-write plaintext.
+# ---------------------------------------------------------------------------
+
+def test_rewrap_cas_conflict_reencrypts_latest_card_not_stale_one(client, monkeypatch):
+    """Ordering (a): a concurrent identity write (simulating a profile_patch's
+    CAS win — modeled directly via `identity_service._save_identity_cas`,
+    the same primitive profile_patch uses) lands DURING rewrap's enclave
+    decrypt of the identity card, i.e. strictly between rewrap's initial
+    `_load_identity` snapshot and the point where it would otherwise write.
+    Rewrap's own write must lose the CAS against its now-stale snapshot,
+    re-read the latest (patched) card, rebuild the envelope from ITS
+    plaintext, and land THAT — never silently re-encrypting the old
+    pre-patch plaintext over the patch's win."""
+    user_id, api_key = _register(client)
+    _seed_encrypted_content(user_id)
+    new_public_key = _b64(b"\x33" * 32)
+    store = core_store.get_store(user_id)
+
+    concurrent_write_done = {"flag": False}
+    decrypt_calls = {"identity1": 0}
+
+    def fake_decrypt(envelope, key, purpose):
+        if envelope.get("id") == "identity1":
+            decrypt_calls["identity1"] += 1
+            if not concurrent_write_done["flag"]:
+                concurrent_write_done["flag"] = True
+                # Simulate a profile_patch CAS win landing HERE — strictly
+                # between rewrap's own `_load_identity` snapshot (taken
+                # before this decrypt call was ever made) and the point
+                # where rewrap will attempt its write. Nothing else has
+                # written yet, so this CAS must succeed cleanly.
+                current = identity_service._load_identity(store)
+                patched = dict(current)
+                patched["body_ct"] = _b64(b"patched-body")
+                patched["K_user"] = _b64(b"\x77" * 48)
+                patched["updated_at"] = datetime.now().isoformat()
+                # A marker only a write built from THIS (patched) snapshot's
+                # plaintext-carry-forward would preserve — proves rewrap's
+                # eventual write re-read the latest card rather than
+                # re-encrypting its original stale snapshot.
+                patched["patch_marker"] = "sig-from-concurrent-patch"
+                assert identity_service._save_identity_cas(store, current, patched)
+        return f"plaintext:{purpose}:{envelope.get('id')}".encode()
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)
+
+    res = client.post(
+        "/v1/content/rewrap-to-current-key",
+        json={"public_key": new_public_key},
+        headers=_headers(api_key),
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    # Converged within the bounded retry budget: identity, memory, chat all
+    # count as rewrapped, zero errors -- NOT a downgrade to "error"/"skipped".
+    assert body["summary"]["total_rewrapped"] == 3, body
+    assert body["summary"]["total_errors"] == 0, body
+    assert body["status"] == "ok"
+    identity_result = next(r for r in body["results"] if r["type"] == "identity")
+    assert identity_result["status"] == "rewrapped"
+
+    # Exactly one retry: the build-phase decrypt (loses the eventual CAS)
+    # plus one re-decrypt after the conflict (wins).
+    assert decrypt_calls["identity1"] == 2
+
+    final = identity_service._load_identity(store)
+    # The concurrent patch's win is PRESERVED -- rewrap re-read and
+    # re-encrypted the LATEST plaintext, not the stale pre-patch one.
+    assert final["patch_marker"] == "sig-from-concurrent-patch"
+    # But the envelope itself was re-wrapped to the NEW key on top of that,
+    # not left on the concurrent write's key.
+    assert final["K_user"] != _b64(b"\x77" * 48)
+    assert "K_enclave" in final
+    assert registry._get_user_public_key(user_id) == new_public_key
+
+
+def test_rewrap_then_profile_patch_uses_patch_own_cas(client, monkeypatch):
+    """Ordering (b): rewrap lands first, then a profile_patch follows. No
+    special handling needed here -- profile_patch already snapshots the
+    identity row fresh at call time (identity/actions.py's
+    `_load_identity_snapshot_for_write`) and CAS-writes against THAT, so it
+    naturally picks up rewrap's card as its base and succeeds cleanly."""
+    user_id, api_key = _register(client)
+    _seed_encrypted_content(user_id)
+    new_public_key = _b64(b"\x33" * 32)
+
+    def fake_decrypt(envelope, key, purpose):
+        return f"plaintext:{purpose}:{envelope.get('id')}".encode()
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)
+
+    rewrap_res = client.post(
+        "/v1/content/rewrap-to-current-key",
+        json={"public_key": new_public_key},
+        headers=_headers(api_key),
+    )
+    assert rewrap_res.get_json()["status"] == "ok"
+
+    store = core_store.get_store(user_id)
+
+    # Now patch on top of the rewrapped card, via the real HTTP action path
+    # (same code identity/actions.py::_identity_profile_patch uses).
+    captured_plaintexts: list = []
+
+    def fake_enclave_get(path, key, params=None, runtime_token=""):
+        if path != "/v1/identity/get":
+            return {}, ""
+        return {"identity": {
+            "agent_name": "old-name",
+            "self_introduction": "old intro",
+            "dimensions": [],
+            "decrypt_status": "ok",
+        }}, ""
+
+    def fake_build_envelope(store_arg, plaintext, item_id=None):
+        import json as _json
+        captured_plaintexts.append(_json.loads(plaintext.decode("utf-8")))
+        return {
+            "id": item_id or "identity1",
+            "body_ct": "ct_patch", "nonce": "n_patch", "K_user": "k_patch",
+            "K_enclave": "ke_patch", "visibility": "shared",
+            "owner_user_id": user_id, "enclave_pk_fpr": "test",
+        }, ""
+
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_get)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", fake_build_envelope)
+
+    patch_res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{
+            "type": "identity.profile_patch",
+            "patch": {"agent_name": "new-name-after-rewrap"},
+            "reason": "test: patch after rewrap",
+        }]},
+    )
+    assert patch_res.status_code == 200, patch_res.get_data(as_text=True)
+    assert patch_res.get_json()["status"] == "ok"
+    assert captured_plaintexts[-1]["agent_name"] == "new-name-after-rewrap"
+
+    final = identity_service._load_identity(store)
+    assert final["body_ct"] == "ct_patch"
+    # Rewrap-carried fields (relationship anchor) survive the patch untouched --
+    # profile_patch's explicit field-list write preserves them by design.
+    assert final["relationship_started_at"] == "2026-06-01"

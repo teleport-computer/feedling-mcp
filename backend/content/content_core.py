@@ -597,6 +597,126 @@ def swap(store: UserStore, payload: dict) -> tuple[dict, int]:
 # POST /v1/content/rewrap-to-current-key
 # --------------------------------------------------------------------------- #
 
+# Bounded retry count for the identity-card CAS write below. Mirrors
+# identity/actions.py's _IDENTITY_WRITE_MAX_ATTEMPTS (same rationale: 3 is
+# generous for concurrent writers on one user's identity row).
+_REWRAP_IDENTITY_MAX_ATTEMPTS = 3
+
+
+def _rewrap_identity_cas_write(
+    store: UserStore,
+    *,
+    api_key: str | None,
+    user_pk: bytes,
+    enclave_pk: bytes,
+    current_fpr: str,
+    snapshot: dict,
+    plan: dict,
+    now: str,
+) -> tuple[str, str]:
+    """Land the identity-card rewrap via the SAME CAS path
+    profile_patch / dimension_nudge / redistill use
+    (identity_service._save_identity_cas), instead of the plain
+    unconditional `_save_identity` this used to call (Codex/review C1).
+
+    Why this exists: `_build_rewrapped_envelope` decrypts the identity card
+    through the enclave and re-encrypts the SAME plaintext under the
+    caller's current key. That round trip takes real wall-clock time. If a
+    profile_patch / dimension_nudge / redistill CAS write commits on this
+    user's identity row during that window, an unconditional write here
+    would re-encrypt the OLD (pre-write) plaintext and clobber the newer
+    card — a silent lost update. This makes the WRITE conditional on the
+    row still matching the snapshot it was built from; it does NOT touch
+    envelope id / AAD / K_enclave / any other crypto detail — same
+    plaintext-in -> same envelope-out semantics as before, just guarded.
+
+    `snapshot` must be the raw identity blob `plan` (the rewrapped
+    envelope) was built from — the caller reads it via
+    `identity_service._load_identity` BEFORE the enclave decrypt that
+    produces `plan`, so ANY write landing after that read (including
+    during the enclave round trip) makes the CAS below correctly fail
+    instead of wrongly matching.
+
+    On a CAS conflict this does NOT retry with the stale `plan` (that would
+    re-encrypt plaintext that's already known-stale) — it re-reads the
+    now-current card and calls `_build_rewrapped_envelope` again to rebuild
+    a fresh envelope from the LATEST plaintext, then retries the CAS
+    against that fresh snapshot. Bounded to
+    `_REWRAP_IDENTITY_MAX_ATTEMPTS`, same shape as identity/actions.py's
+    `_with_identity_mutation_lock_and_retry`.
+
+    Returns (status, reason):
+      - ("rewrapped", "")        — CAS won, audit entry appended.
+      - (<skip status>, reason)  — a re-read found the card no longer needs
+        rewrapping (e.g. a concurrent writer already advanced it past
+        current_fpr, or it stopped qualifying) — not a failure.
+      - ("error", reason)        — decrypt/build failed on a retry, or every
+        attempt lost the CAS to a concurrent writer.
+    """
+    cur_snapshot = snapshot
+    cur_plan = plan
+    with identity_service.identity_mutation_lock(store.user_id):
+        for attempt in range(_REWRAP_IDENTITY_MAX_ATTEMPTS):
+            new_identity = dict(cur_snapshot)
+            _apply_envelope_fields(new_identity, cur_plan)
+            new_identity["rewrapped_at"] = now
+            if identity_service._save_identity_cas(store, cur_snapshot, new_identity):
+                identity_service._append_identity_change(store, {
+                    "action": "rewrap",
+                    "reason": "Identity envelope rewrapped to the current iOS content key.",
+                })
+                return "rewrapped", ""
+            if attempt == _REWRAP_IDENTITY_MAX_ATTEMPTS - 1:
+                break
+            latest = identity_service._load_identity(store)
+            if latest is None:
+                return "error", "identity_missing_after_conflict"
+            env, status, reason = _build_rewrapped_envelope(
+                store, latest, api_key=api_key, user_pk=user_pk,
+                enclave_pk=enclave_pk, kind="identity", current_fpr=current_fpr,
+                plaintext_filter=_identity_card_sanitize_filter,
+            )
+            if env is None:
+                # The latest card no longer needs (or can no longer have) a
+                # rewrap by the time we retried — e.g. a concurrent writer
+                # already advanced content_pk_fpr past current. Not a
+                # failure: there is genuinely nothing left to write.
+                return status, reason
+            cur_snapshot, cur_plan = latest, env
+    return "error", "identity_rewrap_conflict"
+
+
+def _reconcile_identity_rewrap_result(
+    results: list[dict], summary: dict, item_id: str, write_status: str, write_reason: str,
+) -> None:
+    """`identity_plan` (see rewrap_to_current_key) is only ever set when the
+    build-phase `_build_rewrapped_envelope` call returned status
+    "rewrapped" — so by the time this runs, `results`/`summary` already
+    recorded ONE "identity"/item_id entry as "rewrapped" based on a
+    successful decrypt+re-encrypt. If the follow-up CAS write in
+    `_rewrap_identity_cas_write` didn't actually land as "rewrapped" (lost
+    every retry to a concurrent writer, or the card moved on before we
+    could retry), correct both the entry and the running counters so the
+    response accurately reflects what's actually in the DB, not just what
+    was successfully decrypted+re-encrypted."""
+    if write_status == "rewrapped":
+        return
+    bucket = summary["identity"]
+    bucket["rewrapped"] -= 1
+    summary["total_rewrapped"] -= 1
+    new_key = "errors" if write_status == "error" else "skipped"
+    bucket[new_key] += 1
+    summary[f"total_{new_key}"] += 1
+    for r in results:
+        if r["type"] == "identity" and r["id"] == item_id:
+            r["status"] = write_status
+            if write_reason:
+                r["reason"] = write_reason[:240]
+            else:
+                r.pop("reason", None)
+            break
+
+
 def rewrap_to_current_key(
     store: UserStore, payload: dict, *, api_key: str | None
 ) -> tuple[dict, int]:
@@ -727,14 +847,27 @@ def rewrap_to_current_key(
     # 可解内容。收敛来自客户端重试 pending。
     now = datetime.now().isoformat()
     if identity is not None and identity_plan is not None:
-        new_identity = dict(identity)
-        _apply_envelope_fields(new_identity, identity_plan)
-        new_identity["rewrapped_at"] = now
-        identity_service._save_identity(store, new_identity)
-        identity_service._append_identity_change(store, {
-            "action": "rewrap",
-            "reason": "Identity envelope rewrapped to the current iOS content key.",
-        })
+        identity_item_id = str(identity.get("id") or "identity")
+        write_status, write_reason = _rewrap_identity_cas_write(
+            store,
+            api_key=api_key,
+            user_pk=user_pk,
+            enclave_pk=enclave_pk,
+            current_fpr=current_fpr,
+            snapshot=identity,
+            plan=identity_plan,
+            now=now,
+        )
+        _reconcile_identity_rewrap_result(results, summary, identity_item_id, write_status, write_reason)
+        # results/summary just changed (possibly downgrading identity out of
+        # "rewrapped") — response["pending"] was computed before this write
+        # section ran (needed for the dry_run early return above), so recompute
+        # it now the CAS outcome is known, before the status/code decision below
+        # reads off `summary`.
+        response["pending"] = [
+            {"type": r["type"], "id": r["id"], "reason": r.get("reason", "")}
+            for r in results if r["status"] == "error"
+        ]
 
     if memory_plans:
         # Re-read + apply-by-id + save under one memory_lock hold (find by stable
