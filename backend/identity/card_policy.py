@@ -60,6 +60,20 @@ MAX_DIMENSIONS = 12  # sanity cap, NOT a floor
 _VALUE_MIN, _VALUE_MAX = 0, 100
 _OK: tuple[bool, str] = (True, "")
 
+# Agent name punctuation strip set — shared between card_policy validation
+# and actions.py normalization to prevent drift. Used when determining
+# "emptiness" for agent_name (so punctuation-only names fall through to
+# agent_name_empty validation instead of triggering rename_pairing).
+AGENT_NAME_STRIP_CHARS = ' `"\'“”‘’。，,.;；:：!！?？'
+
+
+def stripped_agent_name(value) -> str:
+    """Normalize agent_name by stripping whitespace + punctuation.
+    Single source of truth for emptiness decision in both card_policy
+    (validation) and actions (normalization). Use for all "is this name empty?"
+    checks to prevent mismatches between validation and downstream handling."""
+    return str(value or "").strip(AGENT_NAME_STRIP_CHARS)
+
 
 def is_runtime_label(name: str) -> bool:
     return str(name or "").strip().lower() in RUNTIME_LABELS
@@ -147,6 +161,24 @@ def validate_profile_patch(patch: dict) -> tuple[bool, str]:
     return _OK
 
 
+def validate_rename_pairing(patch: dict) -> tuple[bool, str]:
+    """Renames must carry the (possibly unchanged) self_introduction in the SAME
+    patch — a card whose name says one thing while the intro says another is
+    self-contradictory. Free-text guessing was rejected (小满/小满满 false hits);
+    the rule is unconditional pairing. Server-side: CLI/tool prompts only front-run
+    the error message.
+
+    Empty (whitespace + punctuation only) names are NOT considered renames —
+    they fall through to the existing agent_name_empty validation downstream."""
+    if not isinstance(patch, dict):
+        return (True, "")
+    name = stripped_agent_name(patch.get("agent_name"))
+    intro = str(patch.get("self_introduction") or "").strip()
+    if name and not intro:
+        return (False, "rename_requires_self_introduction")
+    return (True, "")
+
+
 def validate_dimension_nudge(target_name: str, new_value) -> tuple[bool, str]:
     if not str(target_name or "").strip():
         return (False, "dimension_name_empty")
@@ -154,6 +186,37 @@ def validate_dimension_nudge(target_name: str, new_value) -> tuple[bool, str]:
         return (False, "dimension_value_not_number")
     if new_value < _VALUE_MIN or new_value > _VALUE_MAX:
         return (False, "dimension_value_out_of_range")
+    return _OK
+
+
+def validate_nudge_sum(nudges: list[tuple[str, float]]) -> tuple[bool, str]:
+    """Batch-level nudge sum validation per request (同请求内同维度归一求和).
+
+    Normalize dimension names by strip().lower(), group by normalized name,
+    and reject if any normalized dimension's |sum(deltas)| > 10.
+
+    Args:
+        nudges: List of (dimension_name, delta) tuples.
+
+    Returns:
+        (True, "") if all dimensions pass; (False, "nudge_delta_exceeds_cap")
+        if any normalized dimension's |sum| > 10.
+    """
+    if not nudges:
+        return _OK
+
+    # Group deltas by normalized dimension name
+    sums: dict[str, float] = {}
+    for name, delta in nudges:
+        normalized = str(name or "").strip().lower()
+        if normalized:
+            sums[normalized] = sums.get(normalized, 0) + delta
+
+    # Check if any normalized dimension exceeds cap
+    for total in sums.values():
+        if abs(total) > 10:
+            return (False, "nudge_delta_exceeds_cap")
+
     return _OK
 
 

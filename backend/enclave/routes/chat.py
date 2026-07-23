@@ -294,6 +294,15 @@ async def v1_chat_history(request: Request):
     context_memory_trace: dict | None = None
     listing_task: asyncio.Task | None = None
     query_args: dict | None = None
+    # Decrypt-health probes (the resident consumer fires one every
+    # DECRYPT_HEALTH_REFRESH_SEC) only need the decrypt round-trip above to have
+    # succeeded — they read the HTTP status, never the body. Skip the context
+    # fan-out for them: on a normal read it costs an extra memory/list(200) plus
+    # _build_context_memories on the enclave's single busy path, tripling the
+    # probe's weight for nothing. iOS / model_api callers never set probe, so
+    # their context is unchanged.
+    probe = str(request.query_params.get("probe") or "").lower() in {
+        "1", "true", "yes", "on"}
     try:
         context_mode = str(
             request.query_params.get("context_mode")
@@ -321,9 +330,10 @@ async def v1_chat_history(request: Request):
             "authorized_user_id": user_id,
             "content_sk": content_sk,
         }
-        listing_task = asyncio.create_task(backend_client.backend_get(
-            "/v1/memory/list", ctx.forward_headers,
-            params={"limit": str(memory_limit)}))
+        if not probe:
+            listing_task = asyncio.create_task(backend_client.backend_get(
+                "/v1/memory/list", ctx.forward_headers,
+                params={"limit": str(memory_limit)}))
     except Exception as e:
         print(f"[chat/history:{user_id}] context_memories failed: {e}")
 

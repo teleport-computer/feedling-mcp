@@ -114,7 +114,7 @@ def test_plaintext_user_name_writeback_preserves_existing_identity(monkeypatch):
     monkeypatch.setattr(
         plaintext.service,
         "replace_identity_preserving_anchor",
-        lambda _store, output: captured.update(output) or "updated",
+        lambda _store, output, *_a, **_k: captured.update(output) or "updated",
     )
 
     status = plaintext._write_back_plaintext_user_name(
@@ -716,6 +716,74 @@ def test_plaintext_relationship_anchor_uses_earliest_timestamp_when_no_date():
     assert anchor3["relationship_started_at"] == ""
 
 
+# ---------------------------------------------------------------------------
+# B2 (reverses I7): _plaintext_merge_reducer_outputs must thread the 5
+# user-layer identity fields through — and, unlike agent_name/dimensions,
+# READ THEM FROM source_family=="user_profile" outputs specifically, since
+# those fields describe the user rather than TA.
+# ---------------------------------------------------------------------------
+
+def test_plaintext_merge_reducer_outputs_reads_user_layer_fields_from_user_profile():
+    outputs = [
+        {
+            "source_family": "user_profile",
+            "identity": {
+                "agent_name": "should be ignored",  # TA fields from user_profile don't count
+                "dimensions": [{"name": "should be ignored", "value": 1}],
+                "user_preferred_name": "Seven",
+                "custom_persona_prompt": "始终用第二人称、简短直接。",
+                "language_preference": "中文",
+                "relationship_anchor": "大学室友",
+                "stable_definitions": ["老板=我上司"],
+            },
+        },
+        {
+            "source_family": "ai_persona",
+            "identity": {"agent_name": "Mira", "dimensions": [{"name": "稳定", "value": 80}]},
+        },
+    ]
+
+    merged = plaintext._plaintext_merge_reducer_outputs(outputs)
+
+    identity = merged["identity"]
+    # TA identity firewall unaffected: agent_name/dimensions still only come
+    # from the ai_persona output, never from user_profile.
+    assert identity["agent_name"] == "Mira"
+    assert identity["dimensions"] == [{"name": "稳定", "value": 80}]
+    # user-layer fields DO come from the user_profile output.
+    assert identity["user_preferred_name"] == "Seven"
+    assert identity["custom_persona_prompt"] == "始终用第二人称、简短直接。"
+    assert identity["language_preference"] == "中文"
+    assert identity["relationship_anchor"] == "大学室友"
+    assert identity["stable_definitions"] == ["老板=我上司"]
+
+
+def test_plaintext_merge_reducer_outputs_sparse_user_layer_only_still_produces_identity():
+    # No agent_name/dimensions anywhere, only a persona directive from a
+    # user_profile output — must still surface as `identity` (B2 broadens the
+    # "has any signal" gate the same way genesis/worker.py's _identity_only does).
+    outputs = [{"source_family": "user_profile",
+                "identity": {"custom_persona_prompt": "永远直接回答,不要绕。"}}]
+
+    merged = plaintext._plaintext_merge_reducer_outputs(outputs)
+
+    assert "identity" in merged
+    assert merged["identity"]["custom_persona_prompt"] == "永远直接回答,不要绕。"
+    assert "agent_name" not in merged["identity"]
+
+
+def test_plaintext_merge_reducer_outputs_without_user_layer_signal_omits_it():
+    outputs = [{"source_family": "ai_persona",
+                "identity": {"agent_name": "Mira", "dimensions": [{"name": "稳定", "value": 80}]}}]
+
+    merged = plaintext._plaintext_merge_reducer_outputs(outputs)
+
+    identity = merged["identity"]
+    for key in ("user_preferred_name", "custom_persona_prompt", "language_preference",
+                "relationship_anchor", "stable_definitions"):
+        assert key not in identity, key
+
+
 def test_add_memory_mode_writes_only_memory(monkeypatch):
     store = _store()
     calls: dict = {}
@@ -812,7 +880,7 @@ def test_update_identity_mode_replaces_identity_without_writing_memory(monkeypat
         lambda *_args, **_kwargs: ({"agent_name": "乔伊", "dimensions": [{"name": "活泼", "description": "ENFP"}]}, []),
     )
     _stub_update_identity_persona(monkeypatch)
-    monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda _store, output: calls.update({"identity_output": output}) or "updated")
+    monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda _store, output, *_a, **_k: calls.update({"identity_output": output}) or "updated")
     monkeypatch.setattr(plaintext.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
     monkeypatch.setattr(
         plaintext.db,
@@ -862,7 +930,7 @@ def test_update_identity_mode_initializes_missing_identity(monkeypatch):
     monkeypatch.setattr(
         plaintext.service,
         "replace_identity_preserving_anchor",
-        lambda _store, output: calls.update({"identity_output": output}) or "initialized",
+        lambda _store, output, *_a, **_k: calls.update({"identity_output": output}) or "initialized",
     )
     monkeypatch.setattr(
         plaintext.service,
@@ -939,7 +1007,7 @@ def test_update_identity_rebuilds_persona_from_uploaded_role_card_material(monke
         }
 
     monkeypatch.setattr(plaintext.worker, "build_persona_output_from_material", fake_build_persona, raising=False)
-    monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda _store, output: calls.update({"identity_output": output}) or "updated")
+    monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda _store, output, *_a, **_k: calls.update({"identity_output": output}) or "updated")
     monkeypatch.setattr(plaintext.service, "write_persona_artifact", lambda _store, _job_id, output: calls.update({"persona_output": output}) or ("user_blob:genesis_persona", "sha-new"))
     monkeypatch.setattr(plaintext.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
     monkeypatch.setattr(
@@ -991,7 +1059,7 @@ def test_update_identity_persona_rebuild_failure_does_not_replace_identity(monke
     )
     monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not replace identity when persona rebuild fails")))
     monkeypatch.setattr(plaintext.db, "genesis_complete_job", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("failed persona rebuild must not complete job")))
-    monkeypatch.setattr(plaintext.service, "mark_failed", lambda _store, job_id, error: calls.update({"job_id": job_id, "error": error}))
+    monkeypatch.setattr(plaintext.service, "mark_failed", lambda _store, job_id, error, **_kwargs: calls.update({"job_id": job_id, "error": error}))
 
     plaintext._run_plaintext_genesis_job(
         store,
@@ -1020,7 +1088,7 @@ def test_update_identity_mode_allows_nameless_nonempty_identity(monkeypatch):
         lambda *_args, **_kwargs: ({"agent_name": "", "dimensions": [{"name": "直爽", "description": "说人话。"}]}, []),
     )
     _stub_update_identity_persona(monkeypatch)
-    monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda _store, output: calls.update({"identity_output": output}) or "updated")
+    monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda _store, output, *_a, **_k: calls.update({"identity_output": output}) or "updated")
     monkeypatch.setattr(
         plaintext.db,
         "genesis_complete_job",
@@ -1063,10 +1131,10 @@ def test_update_identity_mode_fails_on_empty_identity(monkeypatch):
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError("empty identity must not rebuild persona")),
         raising=False,
     )
-    monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda _store, _output: "identity_update_empty")
+    monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda _store, _output, *_a, **_k: "identity_update_empty")
     monkeypatch.setattr(plaintext.db, "genesis_complete_job", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("empty identity must not complete job")))
     monkeypatch.setattr(plaintext.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
-    monkeypatch.setattr(plaintext.service, "mark_failed", lambda _store, job_id, error: calls.update({"job_id": job_id, "error": error}))
+    monkeypatch.setattr(plaintext.service, "mark_failed", lambda _store, job_id, error, **_kwargs: calls.update({"job_id": job_id, "error": error}))
 
     plaintext._run_plaintext_genesis_job(
         store,

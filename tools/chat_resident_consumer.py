@@ -267,6 +267,23 @@ USER_MCP_CASTORE_FILE = os.environ.get(
     "USER_MCP_CASTORE_FILE",
     f"/tmp/feedling_user_mcp_castore_{CHECKPOINT_API_KEY_FINGERPRINT}.pem",
 )
+# identity-redistill local IPC (T11): io_cli connects here to hand the
+# consumer plaintext material for a resident distill. No existing "home dir"
+# convention exists in this file (CHECKPOINT_FILE / USER_MCP_FILE are each a
+# single fingerprinted /tmp FILE, not a directory) — FEEDLING_HOME picks the
+# SAME fingerprint recipe (sha1(FEEDLING_API_KEY)[:10]) so io_cli (a separate
+# process, stdlib-only, cannot import this module) computes the identical
+# default path with zero shared state, while still keeping co-hosted accounts
+# on one box from colliding on a single socket (mirrors the collision hazard
+# _USER_MCP_PATHS_PINNED below documents for a keyless host-all consumer —
+# this lane is VPS/CLI-only and never runs keyless, so no pinning fallback is
+# needed here).
+FEEDLING_HOME = Path(
+    os.environ.get("FEEDLING_HOME")
+    or f"/tmp/feedling_home_{CHECKPOINT_API_KEY_FINGERPRINT}"
+)
+RESIDENT_IPC_SOCK = FEEDLING_HOME / "resident_ipc.sock"
+RESIDENT_IPC_STATE_FILE = FEEDLING_HOME / "resident_ipc_state.json"
 # The fingerprint scoping above only isolates accounts while FEEDLING_API_KEY is
 # non-empty. Host-all (Stage-D zero-roster) consumers run keyless, so sha1("")
 # collides for every user on the host and the /tmp defaults become ONE shared
@@ -328,6 +345,26 @@ CAPTURE_TICK_START_DELAY_SEC = int(os.environ.get(
     "FEEDLING_CAPTURE_TICK_START_DELAY_SEC",
     str(PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC),
 ))
+# Wake coalescing: one moment, one turn. Perception triggers arrive as separate
+# jobs (unlock_after_absence / photo_added / arrived_at_anchor …) and prod
+# 2026-07-22 saw a user pick up their phone, fire three of them within 0.3s and
+# get the SAME two sentences twice — each job realized its own agent turn, and
+# the only thing standing between them was the model noticing "I just said this"
+# (it noticed on the third, not the second). Collapse them instead: one turn
+# carrying every trigger. Two windows are needed, because those three jobs were
+# CLAIMED 22:24:13 / 22:24:34 / 22:25:14 — same burst, different poll batches:
+#   · within a batch  — keep one carrier, fold the rest into it
+#   · across batches  — a wake this soon after the last realized turn folds too
+# Reminders (scheduled_wake), the first-greeting introduction and the
+# screen-watch lane are never folded (see _is_coalescable_wake_job). 0 disables.
+PROACTIVE_COALESCE_WINDOW_SEC = float(
+    os.environ.get("FEEDLING_PROACTIVE_COALESCE_WINDOW_SEC", "60")
+)
+# When the last wake turn actually ran, and which job carried it — the across-
+# batch half of the window above. Module-global like the self-wake streak.
+_last_proactive_turn_ts: float = 0.0
+_last_proactive_turn_job_id: str = ""
+
 PROACTIVE_MAX_REPLY_MESSAGES = int(os.environ.get("PROACTIVE_MAX_REPLY_MESSAGES", "5"))
 PROACTIVE_RECENT_CHAT_LIMIT = int(os.environ.get("PROACTIVE_RECENT_CHAT_LIMIT", "20"))
 PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT = int(os.environ.get("PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT", "50"))
@@ -839,6 +876,30 @@ def _compat_commit_headers() -> dict:
     return {"X-Feedling-Consumer-Compat-Commit": value} if value else {}
 
 
+# Self-update stall reason — WHY a self-hosted resident isn't on the backend's
+# expected commit, when it isn't. Mirrors _compat_commit's pattern: computed as
+# a side effect of _run_self_update (which already runs the dirty/enabled/fetch
+# checks on every idle poll) and stored here so reporting it is a cheap dict
+# read — never a second git subprocess. One of "dirty" | "disabled" |
+# "fetch_failed" | "" (not stalled / unknown). Lets the backend's 6h
+# stall-mismatch nudge (resident_maintenance.py) name a concrete fix instead of
+# a generic "please update".
+# VPS 线长期资产（自托管专属；hosted 走不到这条路径）; pre 合并原样保留。
+_self_update_stall = {"value": ""}
+
+
+def _self_update_stall_reason() -> str:
+    """Cheap, non-blocking read of the last self-update stall reason.
+
+    Never runs git — just returns what _run_self_update last computed."""
+    return str(_self_update_stall.get("value") or "")
+
+
+def _update_stall_headers() -> dict:
+    value = _self_update_stall_reason()
+    return {"X-Feedling-Update-Stall": value} if value else {}
+
+
 _HEADERS = {
     "X-API-Key": FEEDLING_API_KEY,
     "X-Feedling-Consumer": "feedling-chat-resident",
@@ -1028,6 +1089,12 @@ def _runtime_repo_files() -> set[str]:
     files.update(
         {
             "tools/io_cli.py",
+            # Imported lazily inside _prepend_io_cli_capability_catalog, so it
+            # may not yet be in sys.modules when a release-diff check runs;
+            # register it explicitly so a release that only touches the
+            # catalog generator still triggers a self-update on self-hosted
+            # CLI residents.
+            "tools/io_cli_catalog.py",
             # Imported lazily inside _materialize_user_mcp, so it may not yet be
             # in sys.modules when a release-diff check runs; register it
             # explicitly so a user_mcp materialization change still triggers a
@@ -1214,14 +1281,24 @@ def _run_self_update(target: str) -> None:
     fetch/diff only runs when an update is genuinely plausible. Re-exec happens
     inside ``_apply_self_update`` and does not return."""
     global _last_self_update_mono
-    if not AUTO_UPDATE or _HOSTED or not target or target == "dev":
+    if not AUTO_UPDATE:
+        # Hosted images never self-update anyway (immutable, see below) — only
+        # report "disabled" for the case it actually explains: a self-hoster
+        # who opted out via FEEDLING_AUTO_UPDATE=0.
+        if not _HOSTED:
+            _self_update_stall["value"] = "disabled"
+        return
+    if _HOSTED or not target or target == "dev":
         return
     now = time.monotonic()
     if now - _last_self_update_mono < _SELF_UPDATE_MIN_INTERVAL_SEC:
         return
     local = RUNNING_COMMIT  # identity of the running image, NEVER the checkout
-    if not local or target.startswith(local) or local.startswith(target):
-        return  # unknown running identity, or already running the target
+    if not local:
+        return  # unknown running identity — can't tell if we're stalled
+    if target.startswith(local) or local.startswith(target):
+        _self_update_stall["value"] = ""  # already running the target
+        return
     _last_self_update_mono = now  # throttle the fetch/diff attempt below
 
     disk = _consumer_commit()
@@ -1241,14 +1318,17 @@ def _run_self_update(target: str) -> None:
             return
         if not _relevant_changed(changed):
             _compat_commit["value"] = target
+            _self_update_stall["value"] = ""
             return  # nothing we load changed — running image is compatible
         if _git_tree_dirty():
             log.warning(
                 "self-update: checkout already at %s but tree is dirty; "
                 "not re-execing over uncommitted changes", target,
             )
+            _self_update_stall["value"] = "dirty"
             return
         _compat_commit["value"] = ""
+        _self_update_stall["value"] = ""
         log.info(
             "self-update: checkout already at %s; re-exec to replace stale "
             "running image %s", target, local,
@@ -1258,6 +1338,7 @@ def _run_self_update(target: str) -> None:
 
     if not _git_fetch(target):
         log.warning("self-update: could not fetch %s; will retry later", target)
+        _self_update_stall["value"] = "fetch_failed"
         return
     changed = _git_changed_files(local, target)
     if changed is None:
@@ -1271,6 +1352,7 @@ def _run_self_update(target: str) -> None:
         # Deliberate skip — advertise compatibility so the backend does not
         # count this running commit as a stalled consumer.
         _compat_commit["value"] = target
+        _self_update_stall["value"] = ""
         return
     _compat_commit["value"] = ""
     dirty = _git_tree_dirty()
@@ -1282,7 +1364,9 @@ def _run_self_update(target: str) -> None:
                 local,
                 target,
             )
+            _self_update_stall["value"] = "dirty"
         return
+    _self_update_stall["value"] = ""
     _apply_self_update(local, target, changed)
 
 
@@ -1695,8 +1779,20 @@ def _env_float(name: str, default: float, *, minimum: float) -> float:
     return val
 
 
+# 120 → 210 (2026-07-22): the probe is NOT cheap — its enclave call re-enters the
+# backend for a whoami that always misses (WHOAMI_CACHE_TTL=30s < any sane probe
+# interval) and unconditionally pulls 200 memory cards. At ~200 resident
+# consumers that was ~1.5 rps of the most expensive shape we have, added the
+# night prod started sliding (07-22 01:41, be8beab). Halving the rate keeps the
+# signal and drops the standing cost.
+# The ceiling is not free choice: the backend calls health older than
+# _DECRYPT_HEALTH_RECENT_SEC (300s) "unknown" and blocks onboarding on it, and
+# the probe only gets a turn on an IDLE poll cycle — so the real budget is
+# 300 − one poll round trip, and prod round trips measured 30.7s under load, not
+# the nominal 30. 210 keeps ~30s of slack; 240 does not. Guarded by
+# tests/test_decrypt_health_freshness_budget.py — raise it there or not at all.
 DECRYPT_HEALTH_REFRESH_SEC = _env_float(
-    "FEEDLING_DECRYPT_HEALTH_REFRESH_SEC", 120.0, minimum=5.0
+    "FEEDLING_DECRYPT_HEALTH_REFRESH_SEC", 210.0, minimum=5.0
 )
 
 _decrypt_health: dict = {"status": "unknown", "checked_at": 0.0}
@@ -1767,7 +1863,12 @@ def _probe_decrypt_reachability() -> None:
         client = _client_for(FEEDLING_ENCLAVE_URL)
         resp = client.get(
             f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
-            params={"limit": 1}, headers=_HEADERS, timeout=10,
+            # probe=1: verify the decrypt path is reachable without paying for the
+            # context-memory fan-out (memory/list 200 cards + context build) the
+            # enclave attaches to a normal history read. See
+            # backend/enclave/routes/chat.py — this call fires per resident every
+            # DECRYPT_HEALTH_REFRESH_SEC and only reads the HTTP status.
+            params={"limit": 1, "probe": 1}, headers=_HEADERS, timeout=10,
         )
         resp.raise_for_status()
     except Exception:
@@ -6099,6 +6200,158 @@ def _resident_foreground_chat_message_v2(content: str) -> str:
     return content
 
 
+# ---------------------------------------------------------------------------
+# io_cli capability catalog injection — VPS/self-hosted CLI resident only.
+# V2 云端无此注入(注册表制);VPS 线长期资产,0727 合并原样保留。
+# ---------------------------------------------------------------------------
+
+_IO_CLI_PATH = str(_REPO / "tools" / "io_cli.py")
+
+# None = "never built (yet, or last attempt failed)". A successful build is
+# cached for the life of the process — io_cli's verb/flag surface only changes
+# on a restart (self-update or a manual deploy), so there is no need to shell
+# out to `io_cli --help` (+ one `--help` per verb) on every single foreground
+# turn. A FAILED build (None) is deliberately never cached here — the failure
+# is expected to be transient (e.g. io_cli.py mid-write during a deploy), so
+# the very next turn gets another attempt instead of going dark forever.
+_io_cli_catalog_cache: str | None = None
+
+# The agent session id (see _load_agent_session_id) this process already
+# CONFIRMED-injected the catalog for, on a resume-capable driver
+# (claude/pi/hermes). Starts at ``None`` — deliberately NOT ``""`` — because
+# "" (no session established yet) is itself a legitimate, distinct session
+# key; keeping the "never injected" sentinel out of band means a session
+# going from "" to a real id still reads as a session change and re-injects
+# once. Only ever written by _commit_io_cli_catalog_injection — see below.
+_io_cli_catalog_injected_session_id: str | None = None
+
+# pending -> commit pattern (Codex review I10): the session id a turn just
+# injected the catalog for, NOT YET confirmed delivered. _prepend_io_cli_
+# capability_catalog sets this the moment it decides to inject; the
+# foreground call site promotes it to _io_cli_catalog_injected_session_id
+# once THIS turn's agent call actually succeeds (_commit_io_cli_catalog_
+# injection), or drops it on failure (_discard_io_cli_catalog_pending_
+# injection) so the very next turn retries instead of the resume session
+# silently going without the catalog forever. Without this split, marking
+# "injected" at injection time (pre-call) meant a subprocess/HTTP failure on
+# the very first turn of a session — before the model ever saw the prompt —
+# would permanently skip the catalog for that whole session (until a
+# rotation), which is worse than the two-turn duplicate this pattern trades
+# for.
+_io_cli_catalog_pending_session_id: str | None = None
+
+
+def _prepend_io_cli_capability_catalog(content: str) -> str:
+    """Prepend the live io_cli command catalog (io_cli_catalog.build_catalog,
+    T6) to a foreground CLI turn, so a self-hosted resident's model always
+    sees the io_cli surface actually shipped in THIS checkout — never a stale
+    hand-written list baked into a prompt.
+
+    Gate: VPS/self-hosted CLI only (``not _HOSTED and AGENT_MODE == "cli"``).
+    Hosted (image-baked, V2 registry-based tool calling — no io_cli.py to
+    shell out to) and http-backend agents (Hermes etc. — no io_cli, no local
+    subprocess) pass ``content`` through byte-identical.
+
+    Injection point: called between ``_prepend_time_anchor_foreground`` and
+    ``_foreground_agent_message`` in the foreground compose chain. It only
+    ever prepends to ``content`` BEFORE the transcript-header prepend runs, so
+    the recent-chat transcript header from ``_foreground_agent_message``
+    (when present) always ends up topmost — the invariant
+    ``_message_has_injected_history`` depends on (it keys on the header
+    prefix at position 0 of the final message).
+
+    Caching: see ``_io_cli_catalog_cache`` above — a ``None`` build result is
+    never cached, so injection is silently skipped THIS turn only and retried
+    next turn.
+
+    Once-per-session vs every-turn: codex has no ``--resume``, so every turn
+    starts context-blind and gets the catalog every turn. claude/pi/hermes
+    resume natively, so re-injecting every turn would just bloat every prompt
+    with a block the model already has in its resumed session — inject once
+    per agent session id (see ``_io_cli_catalog_injected_session_id`` above);
+    a session id change (rotation, a brand-new session) re-injects once.
+
+    Pending -> commit (Codex review I10): for a resume-capable driver this
+    only marks the session id PENDING (``_io_cli_catalog_pending_session_id``)
+    — the caller MUST call ``_commit_io_cli_catalog_injection()`` once this
+    turn's agent call actually succeeds, or ``_discard_io_cli_catalog_
+    pending_injection()`` on failure, so a turn whose subprocess/HTTP call
+    fails before the model ever saw the prompt does not permanently skip the
+    catalog for the rest of that session."""
+    global _io_cli_catalog_cache, _io_cli_catalog_pending_session_id
+    if _HOSTED or AGENT_MODE != "cli":
+        return content
+
+    is_codex = _is_codex_cmd(_cli_cmd_tokens())
+    sid = None
+    if not is_codex:
+        sid = _load_agent_session_id()
+        if sid == _io_cli_catalog_injected_session_id:
+            return content  # already confirmed-injected for this session
+
+    catalog = _io_cli_catalog_cache
+    if catalog is None:
+        # The real entrypoint runs as `python tools/chat_resident_consumer.py`
+        # with tools/ auto-added to sys.path[0], so this bare sibling import
+        # normally just works (same convention as user_mcp_materialize /
+        # user_mcp_ca_fetch above). When this module is instead imported as
+        # `tools.chat_resident_consumer` (every test suite, some self-hosted
+        # wrappers), tools/ is NOT on sys.path — guard for that explicitly
+        # rather than relying on some other already-imported module to have
+        # inserted it first.
+        _tools_dir = str(Path(__file__).resolve().parent)
+        if _tools_dir not in sys.path:
+            sys.path.insert(0, _tools_dir)
+        import io_cli_catalog  # noqa: PLC0415 — sibling on tools/ path
+
+        catalog = io_cli_catalog.build_catalog(_IO_CLI_PATH, python=sys.executable)
+        if catalog is None:
+            # Build failed this turn (subprocess error, --help format drift,
+            # io_cli.py mid-deploy write) — skip the full catalog, retry next
+            # turn, don't cache. But the D3 sourcing guardrail is normally
+            # shipped as part of the catalog's own header (build_catalog's
+            # first two lines), so a build failure would otherwise silently
+            # drop the ONLY defense against instructions smuggled through
+            # files/web pages/memory cards now that D2 (confirmation) is gone
+            # (I2). Prepend D3 alone — cheap, doesn't need a subprocess, and
+            # independent of whether the full --help sweep succeeds.
+            return f"{io_cli_catalog.D3_SOURCING_RULE}\n\n{content}"
+        _io_cli_catalog_cache = catalog
+
+    if not is_codex:
+        # NOT committed yet — see _commit_io_cli_catalog_injection /
+        # _discard_io_cli_catalog_pending_injection docstrings above.
+        _io_cli_catalog_pending_session_id = sid
+
+    return f"{catalog}\n\n{content}"
+
+
+def _commit_io_cli_catalog_injection() -> None:
+    """Call once THIS turn's foreground agent call has SUCCEEDED (call_agent
+    did not raise — i.e. the prompt, catalog included, was actually handed to
+    the model; a downstream reply-parse failure does not undo that delivery).
+    Promotes the pending session id set by _prepend_io_cli_capability_catalog
+    earlier this turn to confirmed, so a resume-capable driver stops
+    re-injecting for the rest of this session. No-op if nothing is pending
+    (gate was closed, this session was already confirmed, or the driver is
+    codex — codex never sets a pending id)."""
+    global _io_cli_catalog_injected_session_id, _io_cli_catalog_pending_session_id
+    if _io_cli_catalog_pending_session_id is not None:
+        _io_cli_catalog_injected_session_id = _io_cli_catalog_pending_session_id
+        _io_cli_catalog_pending_session_id = None
+
+
+def _discard_io_cli_catalog_pending_injection() -> None:
+    """Call when THIS turn's foreground agent call FAILED (call_agent raised)
+    — the catalog was written into ``content`` but never actually delivered
+    to the model. Drops the pending mark (without touching the confirmed
+    one) so the NEXT turn re-attempts the injection instead of the resume
+    session silently going without the catalog until it happens to rotate.
+    No-op if nothing is pending."""
+    global _io_cli_catalog_pending_session_id
+    _io_cli_catalog_pending_session_id = None
+
+
 def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = None) -> str:
     """Short plaintext transcript of recent chat turns STRICTLY older than the
     current turn, for injecting cross-turn continuity into foreground messages.
@@ -6173,6 +6426,40 @@ _whoami_cache: dict = {
 # keys; 0.0 until the first success so the first reply still fetches.
 _whoami_cache_loaded_at: float = 0.0
 
+class ActionsHTTPError(RuntimeError):
+    """Raised by execute_identity_actions/execute_memory_actions on any HTTP
+    >=400 — same trigger, same message format as a plain RuntimeError, so the
+    several OTHER call sites in this file (capture/dream flows, resident
+    maintenance) that just do ``except Exception: log.warning(...)`` are
+    completely unaffected; this only ADDS an attribute for callers that want
+    it.
+
+    C2: both backends write a batch SERIALLY and stop at the first failing
+    item (backend/identity/actions.py's ``_execute_identity_actions`` /
+    backend/memory/actions.py's ``_execute_memory_actions``), so a 4xx body
+    still carries the real ``results``/``effects`` of any leading actions
+    that DID apply before the failure. Treating the whole bucket as
+    uniformly failed would invite a caller to retry the ENTIRE batch,
+    re-applying those already-applied, possibly non-idempotent leading
+    actions a second time (e.g. a dimension_nudge applied twice). ``body``
+    carries the parsed JSON response (``None`` if the body wasn't valid
+    JSON / wasn't a dict) so execute_agent_actions' admission funnel can
+    recover per-item outcomes instead of guessing."""
+
+    def __init__(self, message: str, *, status_code: int, body: dict | None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
+
+
+def _parse_actions_error_body(resp) -> dict | None:
+    try:
+        candidate = resp.json()
+    except Exception:
+        return None
+    return candidate if isinstance(candidate, dict) else None
+
+
 def execute_identity_actions(actions: list[dict]) -> dict:
     if not actions:
         return {"status": "ok", "results": [], "effects": []}
@@ -6183,7 +6470,11 @@ def execute_identity_actions(actions: list[dict]) -> dict:
         timeout=20,
     )
     if resp.status_code >= 400:
-        raise RuntimeError(f"identity_actions_http_{resp.status_code}:{resp.text[:500]}")
+        raise ActionsHTTPError(
+            f"identity_actions_http_{resp.status_code}:{resp.text[:500]}",
+            status_code=resp.status_code,
+            body=_parse_actions_error_body(resp),
+        )
     body = resp.json()
     if not isinstance(body, dict) or body.get("status") not in {"ok", "created", "replaced"}:
         raise RuntimeError(f"identity_actions_unexpected_response:{str(body)[:500]}")
@@ -6200,34 +6491,430 @@ def execute_memory_actions(actions: list[dict]) -> dict:
         timeout=20,
     )
     if resp.status_code >= 400:
-        raise RuntimeError(f"memory_actions_http_{resp.status_code}:{resp.text[:500]}")
+        raise ActionsHTTPError(
+            f"memory_actions_http_{resp.status_code}:{resp.text[:500]}",
+            status_code=resp.status_code,
+            body=_parse_actions_error_body(resp),
+        )
     body = resp.json()
     if not isinstance(body, dict) or body.get("status") not in {"ok", "created", "replaced"}:
         raise RuntimeError(f"memory_actions_unexpected_response:{str(body)[:500]}")
     return body
 
 
+# ---------------------------------------------------------------------------
+# 夹带通道(identity./memory. actions)类型白名单 + 结果真实化 — spec 3.4
+#
+# V2 云端无夹带通道(原生 tool loop);本收口属 VPS 线长期资产,0727 合并原样
+# 保留。
+#
+# canonicalize_action_type 只用于两件事:①判定是否在允许清单内 ②结果上报打
+# 标(outcomes 里的 canonical_type)。它绝不改写下发到服务端的 action["type"]
+# ——/v1/identity/actions 与 /v1/memory/actions 本就原生接受这些别名
+# (memory.create / memory.add_correction / memory.patch / memory.content_patch
+# / identity.patch 的写法),改写 type 会让服务端观测到跟今天不一样的请求,
+# 这正是要避免的。
+# ---------------------------------------------------------------------------
+
+# Same import mechanism as tools/io_cli.py: sys.path already has backend/ on
+# it (module-level insert near the top of this file), but the try/except
+# mirrors io_cli's graceful-degradation posture — if the import ever fails,
+# the funnel's rename-pairing check below (I3) just no-ops instead of taking
+# down the whole consumer process.
+try:
+    from identity import card_policy as _card_policy  # noqa: PLC0415 — single source, pure stdlib
+except Exception:
+    _card_policy = None
+
+_ACTION_TYPE_ALIASES: dict[str, str] = {
+    "memory.create": "memory.add",
+    "memory.add_correction": "memory.add",
+    "memory.patch": "memory.supersede",
+    "memory.content_patch": "memory.supersede",
+    "identity.patch": "identity.profile_patch",
+}
+
+
+def canonicalize_action_type(action_type: str) -> str:
+    """Map a known alias to its canonical form; unknown types pass through
+    unchanged. Reuses the same alias table as _normalize_v2_action_type's
+    schedule-path mappings, plus identity.patch -> identity.profile_patch."""
+    return _ACTION_TYPE_ALIASES.get(str(action_type or ""), str(action_type or ""))
+
+
+# spec 3.4 十二类型(canonical 形态)。故意把别名字面量也留在集合里跟 spec 逐字
+# 对齐——canonicalize 之后真正会被查到的只有 7 个 canonical 值(其余 5 个别名
+# 经 canonicalize 后已经折叠掉,不会以别名形式出现在判定里),多留的条目是防御
+# 性的,无害。identity.replace 刻意不在清单里:写卡原则只有蒸馏任务可以整卡替
+# 换,其余一律走 profile_patch。
+_ACTION_ALLOWLIST: frozenset = frozenset({
+    "memory.add", "memory.create", "memory.add_correction",
+    "memory.patch", "memory.content_patch", "memory.supersede",
+    "memory.upgrade", "memory.delete",
+    "identity.profile_patch", "identity.patch",
+    "identity.dimension_nudge", "identity.relationship_days_set",
+})
+
+_ACTION_ALLOWLIST_MODES = {"shadow", "enforce", "off"}
+_action_allowlist_mode_warned = False
+# Shadow-mode visibility counter for allowlist-unknown types that still get
+# forwarded (mode has no enforcement effect on the wire, only counts+logs).
+_action_allowlist_shadow_unknown_count = 0
+
+
+def _action_allowlist_mode() -> str:
+    """FEEDLING_ACTION_ALLOWLIST ∈ shadow|enforce|off, default shadow. Read
+    live (not cached at import) so tests/ops can flip it without a restart.
+    An invalid value falls back to shadow with a one-time warning."""
+    global _action_allowlist_mode_warned
+    raw = str(os.environ.get("FEEDLING_ACTION_ALLOWLIST") or "shadow").strip().lower()
+    if raw in _ACTION_ALLOWLIST_MODES:
+        return raw
+    if not _action_allowlist_mode_warned:
+        log.warning(
+            "invalid FEEDLING_ACTION_ALLOWLIST=%r; defaulting to shadow", raw,
+        )
+        _action_allowlist_mode_warned = True
+    return "shadow"
+
+
+# M11: the ONLY statuses the server actually returns for a successfully
+# applied per-item result (backend/identity/actions.py + backend/memory/
+# actions.py — every success return is literally {"status": "ok", ...}
+# today; "created"/"replaced" are kept here too since those are the batch-
+# level status values execute_identity_actions/execute_memory_actions accept
+# — same success family, in case a future item-level result ever uses them).
+_ACTION_RESULT_SUCCESS_STATUSES = frozenset({"ok", "created", "replaced"})
+
+
+def _action_result_outcome(item: Any) -> tuple[str, str]:
+    """Map ONE action's per-item result (from execute_identity_actions /
+    execute_memory_actions' "results" array) to an outcome label.
+
+    M11: only an EXPLICIT success status counts as applied — an unknown/
+    missing status (or a bare ``{}``) must never be silently treated as
+    success just because the item was "some dict". Anything that isn't
+    error/noop/an explicit success status maps to failed_execution/
+    invalid_result."""
+    if not isinstance(item, dict):
+        return "failed_execution", "result_missing"
+    status = str(item.get("status") or "").strip().lower()
+    if status == "error":
+        return "failed_execution", str(item.get("error") or "")[:120]
+    if item.get("noop") or item.get("skipped"):
+        return "noop", ""
+    if status in _ACTION_RESULT_SUCCESS_STATUSES:
+        return "applied", ""
+    return "failed_execution", "invalid_result"
+
+
+def _outcomes_for_bucket(
+    entries: list[tuple[str, str]],
+    *,
+    error: Exception | None,
+    error_code: str = "",
+    results: list | None,
+    missing_result_error_code: str = "result_missing",
+) -> list[dict]:
+    """Build outcomes for one bucket (identity or memory).
+
+    - ``results is None`` (no usable per-item signal at all — a network
+      error, an unparseable/non-dict error body, or a genuinely-never-sent
+      bucket): every entry is uniformly failed_execution, labeled
+      ``error_code`` (or the exception's class name).
+    - ``results`` is a list (a normal 200 success, OR — C2 — a 4xx body we
+      recovered per-item results from): map each entry against its index in
+      ``results`` via ``_action_result_outcome``. An index beyond
+      ``len(results)`` is reported via ``missing_result_error_code`` —
+      callers pass "result_missing" for a truncated-input success (M11) vs
+      "not_attempted" for the serial-abort tail of a recovered partial
+      failure (C2), since those mean different things operationally.
+    """
+    outcomes: list[dict] = []
+    for idx, (original_type, canonical_type) in enumerate(entries):
+        if results is None:
+            outcomes.append({
+                "original_type": original_type,
+                "canonical_type": canonical_type,
+                "outcome": "failed_execution",
+                "error_code": error_code or (type(error).__name__ if error is not None else ""),
+            })
+            continue
+        if idx < len(results):
+            outcome, item_error_code = _action_result_outcome(results[idx])
+        else:
+            outcome, item_error_code = "failed_execution", missing_result_error_code
+        outcomes.append({
+            "original_type": original_type,
+            "canonical_type": canonical_type,
+            "outcome": outcome,
+            "error_code": item_error_code,
+        })
+    return outcomes
+
+
+# Sentinel exception used only to drive _outcomes_for_bucket's "error path"
+# formatting for the memory bucket when it was never attempted at all (C1:
+# identity failed first, so memory's HTTP call must not happen — see below).
+class _ActionBucketNotAttempted(Exception):
+    pass
+
+
 def execute_agent_actions(actions: list[dict]) -> dict:
+    """Dispatch identity./memory. actions to their executors.
+
+    Admission (allowlist) only ever changes whether an action is FORWARDED;
+    it never rewrites the action itself. In shadow mode (default) every
+    action that was forwarded before this change is still forwarded — the
+    only new thing shadow mode adds is a log line + counter for types not on
+    the allowlist. In enforce mode, not-allowlisted actions are dropped
+    before the HTTP call (never forwarded). In off mode this whole gate is a
+    no-op (matches pre-Task-7 behavior exactly).
+
+    Wire order/short-circuit is UNCHANGED from pre-Task-7 (sequential, with
+    early abort): the identity bucket is sent first, and if that call raises,
+    the memory bucket's HTTP call never happens at all — shadow mode's
+    byte-identical-wire invariant covers the failure path too, not just the
+    happy path. The memory actions in that case are reported as
+    outcome=failed_execution / error_code="not_attempted" (never "applied").
+
+    Returns a dict that never raises for an ordinary HTTP-level failure —
+    callers read `outcomes` (one entry per forwarded-or-rejected action:
+    {"original_type", "canonical_type", "outcome", "error_code"}, outcome in
+    applied|noop|rejected_allowlist|rejected_validation|failed_execution;
+    error_code "not_attempted" marks an action the server never got to (the
+    early abort above, or the serial-abort tail of a batch that failed
+    partway through — see C2 below), "result_missing" marks a per-item
+    result a 200 response never returned (input silently truncated),
+    "invalid_result" marks a per-item result with no recognized status
+    (M11)). NOTE: outcomes are NOT guaranteed to be in the same order as the
+    input `actions` list — they are grouped identity-bucket-first, then
+    memory-bucket, each in its own within-bucket order; match on
+    original_type/canonical_type, not position. Pass the list to
+    rewrite_reply_for_outcomes to produce an honest reply. Still raises
+    RuntimeError for a garbage action type that is neither identity.* nor
+    memory.* — that is a caller/prompt bug, not a server-side outcome.
+
+    C2 (双写风险 / no-retry-double-apply): both backends write a batch
+    SERIALLY and stop at the first failing item, so a 4xx response body
+    still carries the results/effects of any leading actions that DID
+    apply. A 4xx is therefore mapped PER-ITEM (via ActionsHTTPError.body)
+    instead of marking the whole bucket failed_execution — the leading
+    items get their real applied/noop outcome, the failing item gets its
+    real error, and the never-reached tail is not_attempted. Only a
+    genuine network error or an unparseable/bodyless failure falls back to
+    a uniform whole-bucket failed_execution (no per-item signal exists).
+    This does NOT change the identity->memory short-circuit (C1): the
+    identity REQUEST still failed, so the memory bucket is still never
+    sent — recovering partial identity results changes how that failure is
+    REPORTED, not whether memory gets attempted.
+    """
+    mode = _action_allowlist_mode()
     identity_actions: list[dict] = []
     memory_actions: list[dict] = []
+    identity_entries: list[tuple[str, str]] = []
+    memory_entries: list[tuple[str, str]] = []
     unsupported: list[str] = []
+    outcomes: list[dict] = []
+
     for action in actions:
-        action_type = str(action.get("type") or action.get("action") or "")
-        if action_type.startswith("identity."):
-            identity_actions.append(action)
-        elif action_type.startswith("memory."):
-            memory_actions.append(action)
+        original_type = str(action.get("type") or action.get("action") or "")
+        canonical_type = canonicalize_action_type(original_type)
+
+        if original_type.startswith("identity."):
+            bucket_actions, bucket_entries = identity_actions, identity_entries
+        elif original_type.startswith("memory."):
+            bucket_actions, bucket_entries = memory_actions, memory_entries
         else:
-            unsupported.append(action_type)
+            unsupported.append(original_type)
+            continue
+
+        # I3 / D4: same-source rename-pairing check for the agent-origin
+        # funnel. This is spec 3.1/3.4's content-validation gate — the
+        # server ALREADY enforces it server-side when a runtime token is
+        # present (backend/identity/actions.py's _identity_profile_patch),
+        # and io_cli front-runs the same rule locally; this is the THIRD of
+        # the three documented enforcement points, for actions arriving
+        # through the consumer's own agent-output funnel. It is explicitly
+        # NOT part of the shadow/enforce/off allowlist experiment — it runs
+        # in ALL THREE modes, never gated by FEEDLING_ACTION_ALLOWLIST.
+        #
+        # The effective patch MUST be built the same way the server builds
+        # it (backend/identity/actions.py's _identity_profile_patch,
+        # ~line 333): start from the "patch" dict (or {} if absent/not a
+        # dict), then overlay any top-level profile field present on the
+        # action that isn't already IN that dict. Anything narrower or
+        # wider than that is a real bug, not a rounding error:
+        #   - narrower (e.g. just the "patch" dict, no top-level overlay):
+        #     an agent can hide an unpaired rename by putting agent_name at
+        #     the TOP level while "patch" carries something else (or is
+        #     empty) — the funnel sees no rename, forwards it, and the
+        #     server's own merge then applies the unpaired rename anyway.
+        #     BYPASS.
+        #   - wider (e.g. treating the whole action as the patch): a
+        #     legitimately paired patch with self_introduction riding at
+        #     the top level (agent_name inside "patch") gets falsely
+        #     rejected as unpaired.
+        # card_policy.PROFILE_FIELDS is exactly the set identity/service.py's
+        # private _IDENTITY_PROFILE_FIELDS aliases
+        # (`_IDENTITY_PROFILE_FIELDS = set(card_policy.PROFILE_FIELDS)`) —
+        # since card_policy is already imported above, this reads the SAME
+        # single source the server itself uses, so it cannot drift the way
+        # a hand-copied field list could (unlike io_cli's _LIST_FIELDS
+        # table, which mirrors a narrower, list-only slice of this and is
+        # hand-kept in sync — this reuses the real thing directly instead).
+        if canonical_type == "identity.profile_patch" and _card_policy is not None:
+            patch_dict = action.get("patch") if isinstance(action.get("patch"), dict) else None
+            # Copy, never mutate: the server mutates action["patch"] in
+            # place while merging, but `action` here is the SAME object
+            # about to be forwarded on the wire unchanged (C1's contract) —
+            # merging top-level fields into it in place would change the
+            # actual JSON body sent to the server, not just this read-only
+            # validation check.
+            effective_patch = dict(patch_dict) if patch_dict is not None else {}
+            for field in _card_policy.PROFILE_FIELDS:
+                if field in action and field not in effective_patch:
+                    effective_patch[field] = action[field]
+            pairing_ok, pairing_err = _card_policy.validate_rename_pairing(effective_patch)
+            if not pairing_ok:
+                log.warning(
+                    "action_admission rejected type=%s canonical=%s reason=%s — "
+                    "dropped, not forwarded (D4 rename pairing, all modes)",
+                    original_type, canonical_type, pairing_err,
+                )
+                outcomes.append({
+                    "original_type": original_type,
+                    "canonical_type": canonical_type,
+                    "outcome": "rejected_validation",
+                    "error_code": pairing_err or "rename_requires_self_introduction",
+                })
+                continue
+
+        if canonical_type not in _ACTION_ALLOWLIST:
+            if mode == "enforce":
+                log.warning(
+                    "action_allowlist rejected type=%s canonical=%s mode=enforce — "
+                    "dropped, not forwarded",
+                    original_type, canonical_type,
+                )
+                outcomes.append({
+                    "original_type": original_type,
+                    "canonical_type": canonical_type,
+                    "outcome": "rejected_allowlist",
+                    "error_code": "",
+                })
+                continue
+            if mode == "shadow":
+                global _action_allowlist_shadow_unknown_count
+                _action_allowlist_shadow_unknown_count += 1
+                log.info(
+                    "action_allowlist shadow-mode unknown type=%s canonical=%s — "
+                    "forwarded unchanged (shadow_unknown_count=%d)",
+                    original_type, canonical_type, _action_allowlist_shadow_unknown_count,
+                )
+            # off (or shadow, having logged above): forward unchanged, same as
+            # pre-Task-7 behavior.
+
+        bucket_actions.append(action)
+        bucket_entries.append((original_type, canonical_type))
+
     if unsupported:
         raise RuntimeError(f"unsupported_agent_actions:{unsupported}")
-    identity_result = execute_identity_actions(identity_actions)
-    memory_result = execute_memory_actions(memory_actions)
+
+    identity_result: dict = {"results": [], "effects": []}
+    memory_result: dict = {"results": [], "effects": []}
+    identity_error: Exception | None = None
+    memory_error: Exception | None = None
+    memory_not_attempted = False
+    # Tracks whether we actually recovered a usable body on the exception
+    # path (C2) — distinct from identity_result/memory_result's default
+    # placeholder value, which also happens to have an empty "results" list
+    # and must NOT be mistaken for "the server told us nothing applied".
+    identity_recovered = False
+    memory_recovered = False
+
+    if identity_actions:
+        try:
+            identity_result = execute_identity_actions(identity_actions)
+        except Exception as e:
+            identity_error = e
+            # C2: a 4xx with a parseable JSON body still carries the real
+            # per-item results/effects of any leading actions that DID
+            # apply before the failing one — recover it instead of
+            # discarding it, so outcomes (below) can be built per-item
+            # rather than uniformly failed_execution.
+            recovered = getattr(e, "body", None) if isinstance(e, ActionsHTTPError) else None
+            if isinstance(recovered, dict):
+                identity_result = recovered
+                identity_recovered = True
+
+    # C1: restored sequential-with-early-abort — pre-Task-7 semantics never
+    # sent the memory HTTP call at all once the identity call raised. Do not
+    # "improve" this into independent per-bucket attempts: shadow mode's
+    # byte-identical-wire guarantee (content/order/COUNT of requests) must
+    # hold on the failure path too, not just the happy path. Recovering
+    # partial identity results (C2, above) changes only how the identity
+    # failure is REPORTED — the identity REQUEST still failed, so memory is
+    # still never sent.
+    if identity_error is not None:
+        memory_not_attempted = bool(memory_actions)
+    elif memory_actions:
+        try:
+            memory_result = execute_memory_actions(memory_actions)
+        except Exception as e:
+            memory_error = e
+            recovered = getattr(e, "body", None) if isinstance(e, ActionsHTTPError) else None
+            if isinstance(recovered, dict):
+                memory_result = recovered  # C2, same as identity above
+                memory_recovered = True
+
+    # results=None means "no usable per-item signal AT ALL" to
+    # _outcomes_for_bucket (triggers the uniform whole-bucket failure path).
+    # That must be true whenever the call succeeded with no error (normal
+    # results list — real signal either way) is NOT the ambiguous case;
+    # the ambiguous case is: identity_error is set but recovery did NOT
+    # happen — the default {"results": [], "effects": []} placeholder must
+    # be read as "no signal", not as "server returned zero results".
+    if identity_error is not None and not identity_recovered:
+        identity_results_list = None
+    else:
+        candidate = identity_result.get("results") if isinstance(identity_result, dict) else None
+        identity_results_list = candidate if isinstance(candidate, list) else None
+    outcomes.extend(_outcomes_for_bucket(
+        identity_entries,
+        error=identity_error,
+        results=identity_results_list,
+        # C2: when the identity request failed, ANY index beyond what we
+        # recovered means the server's serial write never reached it —
+        # "not_attempted", not the success-path's "result_missing".
+        missing_result_error_code="not_attempted" if identity_error is not None else "result_missing",
+    ))
+    if memory_not_attempted:
+        outcomes.extend(_outcomes_for_bucket(
+            memory_entries,
+            error=_ActionBucketNotAttempted(),
+            error_code="not_attempted",
+            results=None,
+        ))
+    else:
+        if memory_error is not None and not memory_recovered:
+            memory_results_list = None
+        else:
+            candidate = memory_result.get("results") if isinstance(memory_result, dict) else None
+            memory_results_list = candidate if isinstance(candidate, list) else None
+        outcomes.extend(_outcomes_for_bucket(
+            memory_entries,
+            error=memory_error,
+            results=memory_results_list,
+            missing_result_error_code="not_attempted" if memory_error is not None else "result_missing",
+        ))
+
     return {
-        "status": "ok",
+        "status": "ok" if identity_error is None and memory_error is None and not memory_not_attempted else "error",
         "identity": identity_result,
         "memory": memory_result,
         "effects": (identity_result.get("effects") or []) + (memory_result.get("effects") or []),
+        "outcomes": outcomes,
     }
 
 
@@ -6241,6 +6928,118 @@ def _identity_action_success_reply(source_message: str) -> str:
     if re.search(r"[\u4e00-\u9fff]", source_message or ""):
         return "改好了。"
     return "Done. I updated my identity."
+
+
+_ACTION_OUTCOME_ALL_FAILED_ZH = "刚才那个操作没有执行成功，我再试试或者你再说一次。"
+_ACTION_OUTCOME_ALL_FAILED_EN = (
+    "That last action did not actually go through — I'll try again, or you can say it once more."
+)
+
+# Distinct from ALL_FAILED on purpose (I2): a noop is not an error — nothing
+# went WRONG, there was just nothing to change (e.g. a value already at the
+# target, an already-capped nudge). Conflating the two would make routine,
+# harmless no-ops read as apologetic failures.
+_ACTION_OUTCOME_ALL_NOOP_ZH = "刚才那个调整没有产生变化（可能已经是这个状态了）。"
+_ACTION_OUTCOME_ALL_NOOP_EN = (
+    "That last adjustment didn't actually change anything (it may already have been that way)."
+)
+_ACTION_OUTCOME_NOOP_NOTE_ZH = "（不过其中一项没有产生实际变化。）"
+_ACTION_OUTCOME_NOOP_NOTE_EN = "(Though one of those didn't actually change anything.)"
+
+# Mixed-outcome notes are deliberately generic (minor #5) — never surface raw
+# internal action-type strings (e.g. "memory.frobnicate") in user-facing text.
+_ACTION_OUTCOME_MIXED_NOTE_ONE_ZH = "不过其中一项没有生效。"
+_ACTION_OUTCOME_MIXED_NOTE_MANY_ZH = "不过其中 {n} 项没有生效。"
+_ACTION_OUTCOME_MIXED_NOTE_ONE_EN = "Though one of those did not actually take effect."
+_ACTION_OUTCOME_MIXED_NOTE_MANY_EN = "Though {n} of those did not actually take effect."
+
+
+def rewrite_reply_for_outcomes(
+    replies: list[str], outcomes: list[dict], fallback_ok: str, lang: str = "",
+) -> list[str]:
+    """Pure function — turn per-action outcomes into an honest reply list.
+
+    - outcomes empty, or every outcome is "applied": replies unchanged
+      (if replies is empty, use [fallback_ok] — but only when fallback_ok is
+      non-empty, so a caller with nothing to say stays silent rather than
+      posting a synthesized empty bubble).
+    - some applied AND some not (noop and/or rejected/failed): replies is
+      KEPT (or [fallback_ok] if it was empty) and ONE short, generic sentence
+      is appended naming only the COUNT of items that didn't take effect —
+      never the raw action type.
+    - zero applied, but at least one genuine rejected/failed_execution/
+      rejected_validation: replies is REPLACED with an honest failure
+      sentence (a batch with any real failure is reported as a failure, not
+      shrugged off as a noop).
+    - zero applied, and every outcome is "noop" (nothing failed, there was
+      just nothing to do): replies is kept + a short "didn't change
+      anything" note appended if non-empty, or a standalone honest noop
+      sentence (distinct wording from the failure sentence) if replies was
+      empty.
+
+    ``lang`` (I5): optional explicit "zh" or "en" hint — pass it whenever the
+    caller has a reliable signal for the ORIGINAL user message's language
+    (see the foreground call site: raw pre-injection message content, not
+    the composed prompt, which may carry an unrelated Chinese catalog/
+    system block that would otherwise skew the auto-detect below). Anything
+    else (empty, unrecognized) falls back to scanning ``fallback_ok`` and
+    ``replies`` for CJK characters, same as before — kept purely for
+    backward compatibility / callers with no better signal (e.g. the
+    proactive lane, where ``fallback_ok`` is always the model's own
+    already-correct-language reply).
+    """
+    replies = [r for r in (replies or [])]
+    if not outcomes:
+        return replies
+
+    if lang == "zh":
+        zh = True
+    elif lang == "en":
+        zh = False
+    else:
+        zh = bool(re.search(r"[\u4e00-\u9fff]", str(fallback_ok) or "")) or any(
+            re.search(r"[\u4e00-\u9fff]", str(r)) for r in replies
+        )
+
+    applied = [o for o in outcomes if isinstance(o, dict) and o.get("outcome") == "applied"]
+    noop = [o for o in outcomes if isinstance(o, dict) and o.get("outcome") == "noop"]
+    bad = [
+        o for o in outcomes
+        if isinstance(o, dict)
+        and o.get("outcome") in ("rejected_allowlist", "rejected_validation", "failed_execution")
+    ]
+
+    if not noop and not bad:
+        # every outcome applied
+        if replies:
+            return replies
+        return [fallback_ok] if fallback_ok else []
+
+    if applied:
+        # Mixed: something worked, something didn't (noop and/or bad) — keep
+        # whatever was already going to be said and add one generic sentence.
+        n = len(noop) + len(bad)
+        if n == 1:
+            note = _ACTION_OUTCOME_MIXED_NOTE_ONE_ZH if zh else _ACTION_OUTCOME_MIXED_NOTE_ONE_EN
+        else:
+            note = (_ACTION_OUTCOME_MIXED_NOTE_MANY_ZH if zh else _ACTION_OUTCOME_MIXED_NOTE_MANY_EN).format(n=n)
+        base = replies if replies else ([fallback_ok] if fallback_ok else [])
+        return base + [note]
+
+    if bad:
+        # Zero applied AND at least one genuine rejection/failure: nothing
+        # succeeded — override entirely with an honest failure sentence, even
+        # if some other items in the same batch were merely noop. A batch
+        # with any real failure is reported as a failure, not a shrug.
+        return [_ACTION_OUTCOME_ALL_FAILED_ZH if zh else _ACTION_OUTCOME_ALL_FAILED_EN]
+
+    # Zero applied, zero bad: every outcome was a noop. Nothing went WRONG —
+    # there was just nothing to change. Distinct wording from the failure
+    # case (I2), and appended rather than replacing when there's already a
+    # reply to show.
+    if replies:
+        return replies + [_ACTION_OUTCOME_NOOP_NOTE_ZH if zh else _ACTION_OUTCOME_NOOP_NOTE_EN]
+    return [_ACTION_OUTCOME_ALL_NOOP_ZH if zh else _ACTION_OUTCOME_ALL_NOOP_EN]
 
 
 # Message dedup — rolling window prevents reprocessing the same message on
@@ -6427,7 +7226,12 @@ def poll_chat(since: float, timeout: int | None = None, claim: bool = True) -> d
         params["claim"] = "false"
     # Ship the decrypt-source health so the backend gate/alert can tell a
     # live-but-undecrypting resident from a healthy one (see _decrypt_health).
-    headers = {**_HEADERS, **_decrypt_health_headers(), **_compat_commit_headers()}
+    headers = {
+        **_HEADERS,
+        **_decrypt_health_headers(),
+        **_compat_commit_headers(),
+        **_update_stall_headers(),
+    }
     resp = _HTTP.get(url, params=params, headers=headers, timeout=poll_to + 10)
     resp.raise_for_status()
     body = resp.json()
@@ -7790,6 +8594,69 @@ def _is_introduction_job(job: dict) -> bool:
     )
 
 
+def _is_coalescable_wake_job(job: dict) -> bool:
+    """Whether this job may be folded into a neighbouring wake turn.
+
+    Excluded on purpose:
+      · ``scheduled_wake`` — a reminder the user set themselves; each carries its
+        own intent and note, so folding two of them would silently drop one.
+      · introduction / ``post_spawn_genesis`` — a one-off arrival ritual.
+      · screen-watch — its own lightweight lane with a different prompt shape.
+    """
+    if not isinstance(job, dict):
+        return False
+    if str(job.get("source") or "") != PROACTIVE_JOB_SOURCE:
+        return False
+    if _is_introduction_job(job) or _is_screen_watch_job(job):
+        return False
+    return str(job.get("trigger") or "").strip().lower() != "scheduled_wake"
+
+
+def _plan_wake_coalescing(jobs: list) -> None:
+    """Mark, in place, which wake jobs fold into which.
+
+    Sets ``_coalesced_into`` on every folded job (the loop turns that into a
+    ``skipped`` status so the fold stays auditable — each trigger keeps its own
+    row) and ``coalesced_triggers`` on the carrier so the turn's prompt can name
+    every trigger in the burst. Deliberately does NOT drop entries from ``jobs``:
+    the caller's checkpoint advances off each job's ts, and losing one here would
+    make the batch replay forever.
+    """
+    if PROACTIVE_COALESCE_WINDOW_SEC <= 0:
+        return
+    idx = [i for i, job in enumerate(jobs) if _is_coalescable_wake_job(job)]
+    if not idx:
+        return
+
+    # Across batches: a wake landing inside the window after a turn that already
+    # ran folds into that turn — this is the prod case, where the burst was
+    # spread over three poll cycles a minute apart.
+    now = time.time()
+    if _last_proactive_turn_ts and (now - _last_proactive_turn_ts) < PROACTIVE_COALESCE_WINDOW_SEC:
+        for i in idx:
+            jobs[i]["_coalesced_into"] = _last_proactive_turn_job_id or "previous_wake_turn"
+        return
+
+    if len(idx) < 2:
+        return
+
+    # Within a batch: the LAST job carries the turn — its screen frames and
+    # perception context are the freshest view of the moment.
+    carrier = jobs[idx[-1]]
+    triggers = [str(jobs[i].get("trigger") or "").strip() for i in idx]
+    carrier["coalesced_triggers"] = [t for t in triggers if t]
+    carrier_id = str(carrier.get("job_id") or "")
+    for i in idx[:-1]:
+        jobs[i]["_coalesced_into"] = carrier_id
+
+
+def _note_proactive_turn_ran(job_id: str) -> None:
+    """Record that a wake turn actually reached the agent (across-batch window)."""
+    global _last_proactive_turn_ts, _last_proactive_turn_job_id
+    _last_proactive_turn_ts = time.time()
+    _last_proactive_turn_job_id = str(job_id or "")
+
+
 def _message_for_introduction_job(job: dict) -> str:
     return "\n\n".join([
         "[Feedling · 首次登场(onboarding 之后)]",
@@ -7929,6 +8796,25 @@ def _new_photo_hint(job: dict) -> str:
     )
 
 
+def _wake_trigger_line(job: dict) -> str:
+    """The wake's trigger, or every trigger folded into it.
+
+    A coalesced turn must still be able to react to the whole moment ("she
+    unlocked the phone, added a photo AND got home"), so the carrier names all
+    of them rather than only its own.
+    """
+    own = str((job or {}).get("trigger") or "").strip()
+    folded = (job or {}).get("coalesced_triggers")
+    if not isinstance(folded, list) or not folded:
+        return own or "wake"
+    seen: list[str] = []
+    for trig in [*folded, own]:
+        text = str(trig or "").strip()
+        if text and text not in seen:
+            seen.append(text)
+    return ", ".join(seen) if seen else "wake"
+
+
 def _message_for_proactive_job(
     job: dict,
     screen_text: str = "",
@@ -7953,7 +8839,7 @@ def _message_for_proactive_job(
         _reply_language_line(presence),
         (
             "wake_metadata:\n"
-            f"- trigger: {str(job.get('trigger') or 'wake')}\n"
+            f"- trigger: {_wake_trigger_line(job)}\n"
             f"- wake_kind: {wake_kind}\n"
             f"- broadcast_state: {str(job.get('broadcast_state') or 'unknown')}\n"
             f"- screen_context_available: {str(screen_available).lower()}"
@@ -9173,6 +10059,10 @@ def _process_proactive_jobs(jobs: list) -> float:
     The user-turn priority gate lives in ``_process_resident_jobs`` (it must
     cover capture/dream/migrate model turns too, not just proactive)."""
     latest = 0.0
+    # One moment, one turn: decide the folds before realizing anything, so a
+    # burst of perception triggers becomes a single agent turn instead of one
+    # per trigger (prod 2026-07-22: the same two sentences sent twice).
+    _plan_wake_coalescing(jobs)
     for job in jobs:
         ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
         latest = max(latest, ts)
@@ -9186,6 +10076,20 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
 
         job_id = str(job.get("job_id") or "")
+        # Folded into a neighbouring turn — record it and move on. Marked seen
+        # above (so it never replays) and skipped before the claim (the carrier
+        # speaks for it, so there is nothing to claim).
+        coalesced_into = str(job.get("_coalesced_into") or "")
+        if coalesced_into:
+            log.info(
+                "proactive job coalesced id=%s trigger=%s into=%s",
+                job_id, job.get("trigger"), coalesced_into,
+            )
+            update_proactive_job_status(
+                job_id, "skipped", f"coalesced_into: {coalesced_into}"
+            )
+            continue
+
         try:
             if not claim_proactive_job(job_id):
                 log.info("proactive job not claimed id=%s", job_id)
@@ -9277,6 +10181,9 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
         _clear_provider_payment_cooldown()
         _clear_proactive_failure()
+        # The turn reached the agent — open the across-batch coalescing window so
+        # the rest of this burst folds instead of repeating it.
+        _note_proactive_turn_ran(job_id)
         if _consume_reply_parse_failed():
             # Parse failure means call_agent already swapped agent_result for
             # FALLBACK_REPLY — a foreground-only line ("你稍后再发一次…") that
@@ -9344,8 +10251,16 @@ def _process_proactive_jobs(jobs: list) -> float:
             log.info("proactive wake slept from control reply id=%s reason=%s", job_id, control_reply_reason)
             continue
         if memory_identity_actions:
+            # 结果真实化(Task 7): execute_agent_actions itself no longer raises
+            # for an ordinary HTTP-level failure it actually attempted (it
+            # reports that via outcomes) — only a caller/prompt bug (garbage
+            # action type) or the sequential identity->memory short-circuit
+            # (C1) can still raise/propagate here, so the except below is a
+            # thin safety net, not the primary failure-detection path.
+            memory_identity_error_label = ""
             try:
                 result = execute_agent_actions(memory_identity_actions)
+                outcomes = result.get("outcomes") or []
                 log.info(
                     "proactive memory/identity actions applied id=%s effects=%d",
                     job_id,
@@ -9353,18 +10268,77 @@ def _process_proactive_jobs(jobs: list) -> float:
                 )
             except Exception as e:
                 log.warning("proactive memory/identity actions failed id=%s error=%s", job_id, e)
+                outcomes = [
+                    {
+                        "original_type": str(a.get("type") or a.get("action") or ""),
+                        "canonical_type": canonicalize_action_type(
+                            str(a.get("type") or a.get("action") or "")
+                        ),
+                        "outcome": "failed_execution",
+                        "error_code": type(e).__name__,
+                    }
+                    for a in memory_identity_actions
+                ]
+                memory_identity_error_label = f":{type(e).__name__}"
+
+            applied_outcomes = [o for o in outcomes if o.get("outcome") == "applied"]
+            failed_outcomes = [o for o in outcomes if o.get("outcome") == "failed_execution"]
+            # Deliberately conservative (minor #7): a batch is only ever
+            # reported as a hard failure when NOTHING in it applied AND at
+            # least one item genuinely failed on the wire. A mid-batch
+            # server abort that still leaves some items applied is instead
+            # reported through rewrite_reply_for_outcomes below (mixed
+            # note) — never silently upgraded to "whole batch failed". A
+            # noop-only outcome set (nothing failed, just nothing to do) or
+            # an enforce-mode allowlist rejection with no wire failure is
+            # also NOT treated as a hard failure here.
+            if failed_outcomes and not applied_outcomes:
+                error_label = memory_identity_error_label or f":{failed_outcomes[0].get('error_code') or ''}"
                 if is_introduction:
+                    # Unchanged from pre-Task-7: the intro greeting depends
+                    # on the identity write actually landing (see
+                    # _introduction_greeting_from_identity_actions below), so
+                    # this lane still hard-stops the turn.
                     update_proactive_job_status(
                         job_id,
                         "failed",
-                        f"introduction_identity_action_failed:{type(e).__name__}",
+                        f"introduction_identity_action_failed{error_label}",
                         extra={
                             "agent_action": "identity.profile_patch",
-                            "agent_action_status": str(e)[:240],
+                            "agent_action_status": str(failed_outcomes)[:240],
                             "wake_result": "identity_action_failed",
                         },
                     )
                     continue
+                # Generalized (new, I4): mark the job failed and suppress the
+                # optimistic reply that assumed the write worked — but do
+                # NOT `continue`. A transient identity/memory write failure
+                # must not also kill this turn's schedule_actions /
+                # self-rewake chain below; pre-Task-7, a non-introduction
+                # failure here was silently swallowed and the turn ran to
+                # completion, so falling through preserves that survival
+                # property while still fixing the silent-failure /
+                # fake-success bugs.
+                update_proactive_job_status(
+                    job_id,
+                    "failed",
+                    f"memory_identity_action_failed{error_label}",
+                    extra={
+                        "agent_action": "memory_identity_actions",
+                        "agent_action_status": str(failed_outcomes)[:240],
+                        "wake_result": "identity_action_failed",
+                    },
+                )
+                replies = []
+            elif replies and outcomes:
+                # Only touches a reply that was ALREADY going to be posted
+                # (replies non-empty) — an idle background write that
+                # produced no chat text stays silent exactly like before, so
+                # a routine noop (e.g. an already-capped nudge) does not
+                # start posting unsolicited bubbles. NOTE: outcomes are not
+                # guaranteed to be in the same order as memory_identity_actions
+                # (identity-bucket entries come first, then memory-bucket).
+                replies = rewrite_reply_for_outcomes(replies, outcomes, fallback_ok=replies[0])
         if is_introduction and not replies and memory_identity_actions:
             reply = _introduction_greeting_from_identity_actions(memory_identity_actions)
             if reply:
@@ -10059,6 +11033,14 @@ def _process_messages(messages: list) -> float:
             continue
 
         content = str(msg.get("content") or "").strip()
+        # I5: snapshot BEFORE any prompt-composition mutation below (screen
+        # context / world book / quoted text / time anchor / io_cli capability
+        # catalog / transcript header) — those can all carry unrelated
+        # Chinese boilerplate (the io_cli catalog especially) that would skew
+        # a CJK-presence language check run against the fully-composed
+        # `content` later. Used ONLY for language detection (the honest
+        # success/failure/outcome reply text), never sent to the agent.
+        raw_user_content_for_lang = content
         content_type = msg.get("content_type", "text")
         image_payloads: list[dict[str, str]] = []
         image_paths: list[str] = []
@@ -10200,6 +11182,12 @@ def _process_messages(messages: list) -> float:
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
         content = _prepend_time_anchor_foreground(content, ts)
+        # VPS/self-hosted CLI resident only (no-op for hosted / http-backend):
+        # live io_cli command catalog, once per resume-capable session or every
+        # turn for codex. Must run BEFORE _foreground_agent_message below so the
+        # transcript header it prepends stays topmost (see that function's
+        # docstring and _message_has_injected_history).
+        content = _prepend_io_cli_capability_catalog(content)
         # Then inject cross-turn continuity for drivers with no reliable session of
         # their own (codex / hosted claude). No-op for pi / when disabled / when
         # there is no prior turn. Done once here so every dispatch branch below
@@ -10235,6 +11223,12 @@ def _process_messages(messages: list) -> float:
                 agent_result = call_agent(content, trace_id=trace_id, lane="chat")
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
+            # Codex review I10: call_agent raised, so the prompt (catalog
+            # included, if _prepend_io_cli_capability_catalog injected it
+            # above) never reached the model this turn — drop the pending
+            # mark so the NEXT turn retries instead of this resume session
+            # silently going without the catalog until it happens to rotate.
+            _discard_io_cli_catalog_pending_injection()
             # 上报/system 通知与兜底话术解耦（Codex review）：SEND_FALLBACK_ON_AGENT_ERROR
             # 只管发不发 FALLBACK_REPLY，错误透出（设置页 + system 通知）两种配置下都要发。
             if SEND_FALLBACK_ON_AGENT_ERROR:
@@ -10248,6 +11242,13 @@ def _process_messages(messages: list) -> float:
                 latest = max(latest, ts)
                 continue
         else:
+            # call_agent did not raise — the prompt (catalog included) was
+            # delivered to the model this turn, regardless of whether the
+            # reply below turns out to be parseable. Confirm the pending
+            # session id now (Codex review I10); see _commit_io_cli_catalog_
+            # injection's docstring for why this must not wait on parse
+            # success.
+            _commit_io_cli_catalog_injection()
             if _consume_reply_parse_failed():
                 pending_failure_notice = ValueError(
                     "agent produced no usable reply after sanitization"
@@ -10280,11 +11281,30 @@ def _process_messages(messages: list) -> float:
                     len(actions),
                     len(action_result.get("effects") or []),
                 )
-                if not replies:
-                    replies = [_identity_action_success_reply(content)]
+                # 结果真实化(Task 7): execute_agent_actions no longer fakes a
+                # "Done" reply just because the HTTP call didn't raise — it
+                # returns per-action outcomes (applied/noop/rejected_allowlist/
+                # rejected_validation/failed_execution) and
+                # rewrite_reply_for_outcomes turns those into an honest
+                # reply. All-applied (or no outcomes at all) is a no-op here
+                # — same visible text as before.
+                #
+                # I5: language is derived from the RAW pre-injection user
+                # message (raw_user_content_for_lang), not `content` — by
+                # this point `content` has been prepended with the io_cli
+                # capability catalog + transcript header + time anchor, all
+                # of which can carry Chinese text unrelated to what language
+                # the user actually wrote in, which would otherwise make an
+                # English-speaking self-hosted user get a Chinese note.
+                replies = rewrite_reply_for_outcomes(
+                    replies,
+                    action_result.get("outcomes") or [],
+                    fallback_ok=_identity_action_success_reply(raw_user_content_for_lang),
+                    lang=("zh" if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang) else "en"),
+                )
             except Exception as e:
                 log.error("agent action execution failed; suppressing optimistic agent reply: %s", e)
-                replies = [_identity_action_failure_reply(content)]
+                replies = [_identity_action_failure_reply(raw_user_content_for_lang)]
 
         reply_to_message_id = str(msg.get("id") or msg.get("message_id") or "").strip()
         posted_any = False
@@ -10464,6 +11484,297 @@ def _decrypt_sealed_material(env: dict) -> bytes:
     if not b64:
         raise RuntimeError("enclave_returned_no_plaintext")
     return base64.b64decode(b64)
+
+
+# ── identity-redistill local IPC (T11) ──────────────────────────────────────
+# Terminal-facing door onto this same resident-distill lane: io_cli's
+# `identity-redistill` verb (VPS/self-hosted CLI only) connects to a local
+# Unix-domain socket and hands over PLAINTEXT material; THIS process client-
+# seals it (reusing the identical v1-envelope path _capture_build_envelope
+# uses for genesis material) and uploads it through the SAME sealed import
+# entry the app itself POSTs sealed material to
+# (/v1/genesis/imports/plaintext, format=sealed_v1) — tagged
+# job_kind="resident_redistill" so T10's DB-level exclusivity (a partial
+# unique index on genesis_import_jobs) 409s a second concurrent redistill for
+# this user instead of racing the first. The uploaded job then flows through
+# the EXISTING resident-distill poll loop below (_process_resident_distill_once)
+# exactly like any other awaiting_resident job — mode="update_identity" routes
+# it to _resident_distill_identity, so no new distill pipeline is needed here.
+_REDISTILL_IPC_MAX_MATERIAL_BYTES = 64 * 1024
+_REDISTILL_IPC_MAX_STATE_ENTRIES = 50
+_redistill_ipc_seen: dict[str, dict] = {}  # request_id -> reply (in-memory cache)
+
+
+def _redistill_ipc_state_load() -> dict:
+    try:
+        return json.loads(RESIDENT_IPC_STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _redistill_ipc_state_save(state: dict) -> None:
+    """Best-effort; restart-safety only. The in-memory ``_redistill_ipc_seen``
+    dict is the primary source of truth for THIS process's lifetime — a write
+    failure here never blocks a reply, it only weakens dedup across a restart
+    that happens to land exactly between a client's two retry attempts."""
+    try:
+        RESIDENT_IPC_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = RESIDENT_IPC_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state))
+        tmp.replace(RESIDENT_IPC_STATE_FILE)
+    except Exception as e:
+        log.debug("redistill IPC: state persist failed: %s", e)
+
+
+def _redistill_ipc_seen_get(request_id: str) -> dict | None:
+    cached = _redistill_ipc_seen.get(request_id)
+    if cached is not None:
+        return cached
+    entry = _redistill_ipc_state_load().get(request_id)
+    if entry is not None:
+        _redistill_ipc_seen[request_id] = entry
+    return entry
+
+
+def _redistill_ipc_seen_put(request_id: str, reply: dict) -> None:
+    stamped = {**reply, "_ts": time.time()}
+    _redistill_ipc_seen[request_id] = stamped
+    disk = _redistill_ipc_state_load()
+    disk[request_id] = stamped
+    if len(disk) > _REDISTILL_IPC_MAX_STATE_ENTRIES:
+        oldest = sorted(disk, key=lambda k: disk[k].get("_ts", 0))
+        for stale_id in oldest[: len(disk) - _REDISTILL_IPC_MAX_STATE_ENTRIES]:
+            disk.pop(stale_id, None)
+    _redistill_ipc_state_save(disk)
+
+
+def _build_redistill_envelope(material: str, *, item_id: str) -> dict:
+    """Client-seal redistill material with the SAME v1-envelope path resident
+    capture already uses for genesis material (see ``_capture_build_envelope``)
+    — reuses ``_build_envelope`` + the whoami-cached user/enclave public keys;
+    no new crypto path. ``visibility="shared"`` so the enclave (this process's
+    own decrypt source) can open it once ``resident_pending`` claims the
+    ``awaiting_resident`` job this upload creates. ``item_id`` fixed to the
+    IPC ``request_id`` makes a retried upload with the SAME request_id produce
+    the SAME envelope id (and therefore the same deterministic job_id,
+    genesis_core._resident_sealed_import's job_id hash) — idempotency in
+    depth alongside this module's own request_id cache above."""
+    if not _ENCRYPTION_AVAILABLE:
+        raise RuntimeError("redistill_encryption_unavailable")
+    if not _refresh_whoami_for_encrypted_reply():
+        raise RuntimeError("redistill_whoami_refresh_failed")
+    user_id = str(_whoami_cache.get("user_id") or "").strip()
+    user_pk: bytes | None = _whoami_cache.get("user_pk")
+    enc_pk: bytes | None = _whoami_cache.get("enclave_pk")
+    if not user_id or not user_pk:
+        raise RuntimeError("redistill_missing_user_key")
+    if not enc_pk:
+        raise RuntimeError("redistill_shared_envelope_requires_enclave_key")
+    return _build_envelope(
+        plaintext=material.encode("utf-8"),
+        owner_user_id=user_id,
+        user_pk_bytes=user_pk,
+        enclave_pk_bytes=enc_pk,
+        visibility="shared",
+        item_id=item_id,
+    )
+
+
+def _handle_redistill_ipc(msg: dict) -> dict:
+    """Handle one decoded ``{"op": "redistill", ...}`` IPC request. Never
+    raises — every path returns a JSON-serializable reply dict, which the
+    listener loop writes straight back over the socket.
+
+    A network/HTTP-transport failure is deliberately NOT cached (returned but
+    not persisted via ``_redistill_ipc_seen_put``): a bare retry with the same
+    request_id should get a fresh shot at the network, not a frozen-in-amber
+    failure from one bad connection."""
+    request_id = str(msg.get("request_id") or "").strip()
+    if not request_id:
+        return {"ok": False, "error": "request_id_required"}
+    material = msg.get("material")
+    if not isinstance(material, str) or not material.strip():
+        return {"ok": False, "error": "material_required", "request_id": request_id}
+
+    cached = _redistill_ipc_seen_get(request_id)
+    if cached is not None:
+        return {k: v for k, v in cached.items() if not k.startswith("_")}
+
+    material_bytes = material.encode("utf-8")
+    if len(material_bytes) > _REDISTILL_IPC_MAX_MATERIAL_BYTES:
+        reply = {
+            "ok": False, "error": "material_too_large", "request_id": request_id,
+            "max_bytes": _REDISTILL_IPC_MAX_MATERIAL_BYTES, "got_bytes": len(material_bytes),
+        }
+        _redistill_ipc_seen_put(request_id, reply)
+        return reply
+
+    try:
+        envelope = _build_redistill_envelope(material, item_id=request_id)
+    except Exception as e:
+        reply = {
+            "ok": False, "error": f"seal_failed:{type(e).__name__}:{e}",
+            "request_id": request_id,
+        }
+        _redistill_ipc_seen_put(request_id, reply)
+        return reply
+
+    try:
+        resp = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/genesis/imports/plaintext",
+            json={
+                "format": "sealed_v1",
+                "envelope": envelope,
+                "mode": "update_identity",
+                "job_kind": "resident_redistill",
+                "client_job_id": request_id,
+            },
+            headers=_HEADERS,
+            timeout=20,
+        )
+    except Exception as e:
+        # Transient transport failure — NOT cached, see docstring.
+        return {
+            "ok": False, "error": f"request_failed:{type(e).__name__}:{e}",
+            "request_id": request_id,
+        }
+
+    try:
+        body = resp.json()
+    except Exception:
+        body = {}
+    if resp.status_code == 409:
+        reply = {
+            "ok": False, "error": "already_running", "request_id": request_id,
+            "active_job_id": str((body or {}).get("active_job_id") or ""),
+        }
+        _redistill_ipc_seen_put(request_id, reply)
+        return reply
+    if resp.status_code != 200:
+        reply = {
+            "ok": False, "error": f"http_{resp.status_code}:{body}",
+            "request_id": request_id,
+        }
+        _redistill_ipc_seen_put(request_id, reply)
+        return reply
+
+    job_id = str(((body or {}).get("job") or {}).get("job_id") or "")
+    reply = {"ok": True, "job_id": job_id, "request_id": request_id}
+    _redistill_ipc_seen_put(request_id, reply)
+    return reply
+
+
+def _redistill_ipc_serve_forever(sock_path: Path) -> None:
+    """Single-connection-at-a-time Unix-socket IPC listener for io_cli's
+    identity-redistill verb. VPS/self-hosted CLI only — see the startup gate
+    at the call site in ``run()``. One local terminal caller at a time is the
+    whole use case, so a plain accept→handle→close loop (no thread pool) is
+    enough; the handler's network POST just makes the NEXT local caller wait
+    briefly in the OS accept backlog, which is fine for a one-shot command.
+
+    Runs until ``_running`` flips False (same shutdown flag the main poll
+    loop honors) — a final accept() may still be blocked when that happens,
+    so the loop uses a short accept timeout to notice the flag promptly
+    instead of hanging past process shutdown.
+
+    Directory hardening (Codex review, T11 follow-up): the parent dir is
+    created 0700 (and re-chmod'd — ``mkdir``'s mode is umask-masked, mirrors
+    ``_mkdir_scratch``/``IMAGE_TEMP_DIR``'s pattern), and — POSIX only, since
+    ``os.getuid`` doesn't exist on Windows — refuses to bind at all when a
+    PRE-EXISTING dir isn't owned by our own uid. Socket-file perms alone
+    aren't a reliable gate on every macOS/BSD (connect() isn't guaranteed to
+    enforce them), and a `/tmp` dir-squat landing between a stale-dir cleanup
+    and this mkdir could otherwise let another local user plant a listener
+    that intercepts plaintext identity material."""
+    parent = sock_path.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(parent, 0o700)
+    except Exception as e:
+        log.error("redistill IPC: cannot create %s: %s — listener disabled", parent, e)
+        return
+    if not _IS_WINDOWS:
+        try:
+            owner_uid = parent.stat().st_uid
+        except OSError as e:
+            log.error("redistill IPC: cannot stat %s: %s — listener disabled", parent, e)
+            return
+        if owner_uid != os.getuid():
+            log.error(
+                "redistill IPC: %s is owned by uid %d, not ours (uid %d) — refusing to "
+                "bind a socket there (possible /tmp squat); listener disabled. Set "
+                "FEEDLING_HOME to a directory only this user can create.",
+                parent, owner_uid, os.getuid(),
+            )
+            return
+    # A stale socket file from a previous (crashed/killed) run makes bind()
+    # fail with "address already in use" even though nothing is listening.
+    try:
+        if sock_path.exists():
+            sock_path.unlink()
+    except Exception:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        srv.bind(str(sock_path))
+        try:
+            os.chmod(sock_path, 0o600)  # local-user-only — this carries plaintext material
+        except OSError:
+            pass
+        srv.listen(4)
+        srv.settimeout(1.0)
+    except Exception as e:
+        log.error("redistill IPC: cannot bind %s: %s — listener disabled", sock_path, e)
+        try:
+            srv.close()
+        except Exception:
+            pass
+        return
+    log.info("redistill IPC listening on %s", sock_path)
+    while _running:
+        try:
+            conn, _addr = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            if _running:
+                log.warning("redistill IPC: accept failed; retrying")
+                time.sleep(1)
+                continue
+            break
+        try:
+            conn.settimeout(35)
+            buf = b""
+            while b"\n" not in buf and len(buf) <= _REDISTILL_IPC_MAX_MATERIAL_BYTES + 8192:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            text = buf.decode("utf-8", errors="replace").strip()
+            try:
+                obj = json.loads(text.splitlines()[0]) if text else {}
+            except Exception:
+                obj = {}
+            if not isinstance(obj, dict) or str(obj.get("op") or "") != "redistill":
+                reply = {"ok": False, "error": "unsupported_op"}
+            else:
+                reply = _handle_redistill_ipc(obj)
+            conn.sendall((json.dumps(reply, ensure_ascii=False) + "\n").encode("utf-8"))
+        except Exception as e:
+            log.error("redistill IPC: connection error: %s", e)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    try:
+        srv.close()
+    except Exception:
+        pass
+    try:
+        sock_path.unlink()
+    except Exception:
+        pass
 
 
 # NOTE: the distill PROMPT is intentionally a minimal default — it belongs to the
@@ -10758,11 +12069,40 @@ def _resident_current_replaced_at() -> str:
         return ""
 
 
+def _resident_incremental_payload(payload: dict, existing: dict) -> dict:
+    """T12 (spec 3.6 / D5): drop any field the model merely echoed back
+    UNCHANGED from the (possibly stale, pre-job) `existing` snapshot it was
+    shown for coherence — so what this consumer actually SUBMITS via
+    identity.replace is genuinely incremental (only fields the new material
+    addressed), not a reassembled full card.
+
+    This matters even though the merge template already asks the model to
+    omit unaddressed fields: models aren't reliable enough to be the sole
+    loss-prevention mechanism (the server-side key-level merge in
+    genesis.service.replace_identity_preserving_anchor is), but they ARE
+    reliable enough that an echoed-back field is usually byte-identical to
+    what it was shown. Dropping it here is strictly safer than keeping it:
+    if a concurrent edit changed that same field AFTER `existing` was read
+    (this snapshot is stale by design — read at prompt-build time, not at
+    write time), submitting the stale echoed value would silently revert
+    that edit; omitting it lets the server fill it back in from whatever is
+    ACTUALLY current at write time instead."""
+    if not existing:
+        return payload
+    return {key: value for key, value in payload.items() if existing.get(key) != value}
+
+
 def _resident_derive_identity(document: str, job_id: str) -> dict | None:
     """Persona/identity is small (fits one context) — a single agent derive, no chunking.
-    Prompt + parse 来自共享模板 identity/distill_prompt_v1(Batch 2 A1):全量人格字段、
-    card_policy 清洗、坏 JSON 重试一次(guardrail 7:报错到 setup log,不静默吞)。
-    Returns a plaintext identity payload for identity.replace, or None if no persona content."""
+    Prompt + parse 来自共享模板 identity/distill_prompt_v1(Batch 2 A1;B2 起覆盖
+    RESIDENT_IDENTITY_FIELDS 这 14 个字段 == 身份卡全部 13 个 profile 字段 + dimensions,
+    含 user_preferred_name / custom_persona_prompt / language_preference /
+    relationship_anchor / stable_definitions 这 5 个用户层字段,GROUNDED——素材没有明确
+    信号就留空,详见 distill_prompt_v1.RESIDENT_IDENTITY_FIELDS 的说明)、card_policy
+    清洗、坏 JSON 重试一次(guardrail 7:报错到 setup log,不静默吞)。
+    Returns a plaintext identity payload for identity.replace, or None if no persona content
+    (either unparseable after retry, or the material produced no actual change — see
+    _resident_incremental_payload)."""
     from identity import distill_prompt_v1 as _dp
     existing = _resident_existing_identity()
     prompt = _dp.build_resident_identity_prompt(document, existing_identity=existing or None)
@@ -10770,7 +12110,14 @@ def _resident_derive_identity(document: str, job_id: str) -> dict | None:
         raw = str(_capture_agent_reply_text(call_agent(prompt, raw_text=True, trace_id=job_id)) or "").strip()
         payload = _dp.parse_identity_payload(raw)
         if payload is not None:
-            return payload
+            incremental = _resident_incremental_payload(payload, existing)
+            if not incremental:
+                log.info(
+                    "resident identity distill: material produced no change vs current card "
+                    "job=%s — skipping identity update", job_id,
+                )
+                return None
+            return incremental
         log.warning("resident identity distill: unparseable output (attempt %d/2) job=%s head=%r",
                     attempt, job_id, raw[:120])
         prompt = prompt + "\nReturn ONLY the JSON object — no prose, no code fences."
@@ -10973,6 +12320,17 @@ def run() -> None:
         sys.exit(1)
 
     _warn_if_agent_entry_may_drift()
+
+    # identity-redistill local IPC (T11): VPS/self-hosted CLI only — the SAME
+    # gate family as the io_cli capability-catalog injection
+    # (_prepend_io_cli_capability_catalog). Hosted (image-baked, V2
+    # registry-based tool calling) and http-backend agents have no io_cli.py
+    # to shell out to, so there is nothing on the other end of this socket —
+    # starting the listener there would just be a dead file descriptor.
+    if not _HOSTED and AGENT_MODE == "cli":
+        threading.Thread(
+            target=_redistill_ipc_serve_forever, args=(RESIDENT_IPC_SOCK,), daemon=True,
+        ).start()
 
     if FEEDLING_ENCLAVE_URL:
         if not _verify_decrypt_sources():

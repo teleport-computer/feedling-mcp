@@ -1230,26 +1230,27 @@ def test_identity_sanitization_does_not_change_pi_routing_model():
     assert models["providers"]["feedling"]["models"][0]["id"] == raw_model
 
 
-def test_every_verb_documented_in_the_prompt_is_also_allowlisted():
-    """Prompt/allowlist consistency, enforced generically.
+def test_every_verb_documented_in_the_rendered_prompt_is_also_allowlisted():
+    """Prompt/allowlist consistency, enforced generically (T13 successor).
 
-    The per-verb assertions above are hand-written, so adding a new io_cli verb
-    to the prompt without adding it to _IO_CLI_VERBS slips through: claude's
-    --allowed-tools then blocks the call in non-interactive acceptEdits mode
-    while the prompt insists the tool exists, and the agent either loops on
-    "requires approval" or tells the user it can't do something it was told it
-    could. perception-recent-apps shipped with exactly that gap.
+    agent_tools_prompt.md's command block is now the ``<io_cli_catalog>``
+    placeholder (T13) — verbs are taught dynamically from the live io_cli --help
+    sweep (tools/io_cli_catalog.py), not hand-listed in the .md source anymore.
+    That live sweep can surface verbs the hosted claude driver was never granted
+    (e.g. ``identity-redistill`` — VPS-local-IPC-only, no [setup]/[ops] tag to
+    filter it out), which would reproduce the exact "requires approval" loop this
+    test used to catch for the old hand list. So the check now runs against the
+    RENDERED prompt (what the model actually sees), not the static .md source.
     """
-    import re
-    from pathlib import Path
-
-    prompt = Path(spawners.__file__).resolve().parent / "agent_tools_prompt.md"
-    documented = set(re.findall(r"<io_cli>\s+([a-z][a-z0-9-]*)", prompt.read_text()))
-    assert documented, "prompt must document at least one io_cli verb"
+    prompt = spawners.agent_home_files("/h", driver="claude", provider="anthropic")[
+        "/h/agent-tools-prompt.md"
+    ]
+    documented = set(re.findall(rf"python {re.escape(spawners._IO_CLI)} ([a-z][a-z0-9-]*)", prompt))
+    assert documented, "rendered prompt must document at least one io_cli verb"
 
     missing = sorted(documented - set(spawners._IO_CLI_VERBS))
     assert not missing, (
-        f"verbs documented in agent_tools_prompt.md but not granted in "
+        f"verbs documented in the rendered prompt but not granted in "
         f"_IO_CLI_VERBS (the agent will be blocked calling them): {missing}"
     )
 

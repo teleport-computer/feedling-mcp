@@ -117,6 +117,66 @@ def test_prompt_uses_deployment_repo_description_not_internal_clone_name(monkeyp
     assert prompt.endswith("expected_commit: abcdef1234567890")
 
 
+def test_commit_mismatch_prompt_appends_dirty_fix_line(monkeypatch):
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "abcdef1234567890")
+    prompt = resident_maintenance._prompt_for(
+        {
+            "reason": "consumer_commit_mismatch",
+            "expected_commit": "abcdef1234567890",
+            "actual_commit": "old1234567890",
+        },
+        {"consumer_id": "vps-resident-c1", "update_stall_reason": "dirty"},
+    )
+
+    assert "请转告用户:机器上有未提交改动挡住了自动更新" in prompt
+    assert "由用户自行执行 git stash 或提交后即可恢复" in prompt
+
+
+def test_commit_mismatch_prompt_appends_disabled_fix_line(monkeypatch):
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "abcdef1234567890")
+    prompt = resident_maintenance._prompt_for(
+        {
+            "reason": "consumer_commit_mismatch",
+            "expected_commit": "abcdef1234567890",
+            "actual_commit": "old1234567890",
+        },
+        {"consumer_id": "vps-resident-c1", "update_stall_reason": "disabled"},
+    )
+
+    assert "具体原因:请转告用户:自动更新被手动关闭(FEEDLING_AUTO_UPDATE=0)。" in prompt
+
+
+def test_commit_mismatch_prompt_appends_fetch_failed_fix_line(monkeypatch):
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "abcdef1234567890")
+    prompt = resident_maintenance._prompt_for(
+        {
+            "reason": "consumer_commit_mismatch",
+            "expected_commit": "abcdef1234567890",
+            "actual_commit": "old1234567890",
+        },
+        {"consumer_id": "vps-resident-c1", "update_stall_reason": "fetch_failed"},
+    )
+
+    assert "请转告用户:机器拉取 GitHub 失败,请用户检查网络/代理" in prompt
+
+
+def test_commit_mismatch_prompt_stays_generic_without_stall_reason(monkeypatch):
+    # Old resident that doesn't send the X-Feedling-Update-Stall header at all
+    # -> generic text unchanged (backward compatible).
+    monkeypatch.setenv("FEEDLING_EXPECTED_CONSUMER_COMMIT", "abcdef1234567890")
+    prompt = resident_maintenance._prompt_for(
+        {
+            "reason": "consumer_commit_mismatch",
+            "expected_commit": "abcdef1234567890",
+            "actual_commit": "old1234567890",
+        },
+        {"consumer_id": "vps-resident-c1"},
+    )
+
+    assert "具体原因" not in prompt
+    assert "常见原因:仓库工作区有未提交改动、FEEDLING_AUTO_UPDATE=0、git fetch 失败" in prompt
+
+
 def test_decrypt_prompt_uses_only_decrypt_source_steps(monkeypatch):
     prompt = resident_maintenance._prompt_for(
         {

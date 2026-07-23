@@ -100,6 +100,7 @@ if settings.cors_allowed_origins:
             "X-Feedling-Consumer-Commit",
             "X-Feedling-Consumer-Id",
             "X-Feedling-Consumer-Version",
+            "X-Feedling-Update-Stall",
             "X-Feedling-Runtime-Token",
             "X-Relay-Token",
         ],

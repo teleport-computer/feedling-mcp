@@ -56,11 +56,18 @@ import tools.chat_resident_consumer as crc  # noqa: E402  (after env setup)
 def _reset_proactive_guard_state_between_tests():
     """The proactive self-wake loop guard + failure backoff are module-global
     state that accumulates across proactive realizations. Reset before each test
-    so a prior test's self-wakes don't trip the guard and skip this one's."""
+    so a prior test's self-wakes don't trip the guard and skip this one's.
+
+    ``_last_proactive_turn_ts`` belongs to the same family: it opens the
+    across-batch wake-coalescing window, so without a reset here the first test
+    to realize a turn would make every later test's wake fold into it and skip
+    the agent call entirely."""
     crc._self_wake_streak = 0
     crc._proactive_fail_streak = 0
     crc._proactive_backoff_until = 0.0
     crc._provider_payment_cooldown_until = 0.0
+    crc._last_proactive_turn_ts = 0.0
+    crc._last_proactive_turn_job_id = ""
     yield
 
 

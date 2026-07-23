@@ -433,7 +433,7 @@ def test_export_parity_headers_and_ciphertext(env):
     assert fb["chat"][0]["body_ct"] == _old_env("x", "chat1")["body_ct"]
     assert fb["identity"]["body_ct"] == _old_env("x", "identity1")["body_ct"]
     assert "plaintext" not in f[1].decode()
-    assert fb["schema_version"] == 2
+    assert fb["schema_version"] == 3   # 3: world_book added to the export
     assert fb["attestation_snapshot"]["enclave_content_public_key_hex"] == _FAKE_ENCLAVE["content_pk_hex"]
 
 
