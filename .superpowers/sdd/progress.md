@@ -63,3 +63,62 @@ Task 15: complete (33159cee + 57257b9c, review clean 2nd round;opus 逐条对 or
 Task 16: complete (error_code/error_hint 分类 + processing 卡点字段,纯增量,write_genesis_state
   单落点覆盖 mark_failed 与 3 个 reaper 直写路径;consumer_offline 定义未接线、decrypt_failed 找到
   真实抛点已接线;27 新测试(_PURE_UNIT)+ 修复 4 处旧测试 lambda 签名;回归 252 全绿;Phase 6 完成)
+Task 16: complete (d391e7a1, review clean 1st round;真实抛出串核实;consumer_offline 留定义未接线诚实标注)
+  Minor 待终审: test_genesis_v2_orchestration.py:614 一处旧签名 lambda 目前不触发,潜在 trap。
+=== 全部 16 任务完成。整分支终审(final whole-branch review)开始。===
+
+=== 整分支终审(内部 opus): READY TO MERGE, 0C/0I。4 Minor + 3 待签字残留 ===
+Minor(待合并 Codex 结果后一轮修): 
+  M-a init_identity_if_absent 也绕过 CAS(未随 relationship_days_set 一起留档)——补注释
+  M-b 云端回退目录里 identity-write 仍列旧 3 flag(仅 build_catalog 失败时可见)——补全
+  M-c shadow"逐字节"有一个刻意例外:成对闸三档全开会拦未配对改名(设计如此,需向 hx 讲明)
+  M-d 成对闸在 VPS(api key 无 runtime token)只有 consumer 漏斗挡着(coherence 非授权;
+      真危险的 replace 服务端 403 硬挡)——设计如此
+待 hx 签字残留: T12 合并语义扩到云端 update_identity(不能靠重传清空字段)/ >10 动作服务端静默截断 / relationship_days_set 绕 CAS
+未验证(合前 DoD): 加密 e2e(红线:redistill 信封复用 v1 AAD,须真 enclave 部署跑)/ 真 2-worker CAS 竞态 / 真模型 e2e
+=== 等 Codex 终审 ===
+
+=== Codex 终审: NOT PASS 1C+7I+1M。逐条裁定 ===
+过夜就修(明确正确性/契约 bug,安全):
+  C1 rewrap_to_current_key 用普通 _save_identity 覆盖→绕过 CAS 可丢 CAS 胜出的写。
+     修=该写也走 set_blob_if_unchanged(只改写条件性,不动 AAD/envelope,不触加密红线)。
+  I4 _clean_list_items 先 raw[:12] 再校验→空列表 add 13 静默截断成 12,而 changelog 承诺报错。
+     修=add/replace 先全清洗去重再查长度整体拒绝。
+  I6 T16 分类器:fact-map 的 401/429/timeout 全被吞成 all_fact_maps_failed→误报 model_empty_output。
+     修=reducer 保留底层分类,全败时按优先级保 bad_api_key/quota/timeout。
+  I2 D3 来源护栏只在动态目录头,生成失败即消失、未写各 mutating verb help(D2 又取消了确认)。
+     修=D3 进静态 system prompt + 共享常量写入所有写命令 help + fallback 带全字段面。
+  I5 redistill job 与 chunk 两事务,崩溃窗口→同 request_id 重试判"chunk 已存"跳过→空任务卡死。
+     修=job+首 chunk 同事务,或重试时检查 chunk0 缺则补写。
+  I1b T10 服务端信客户端自报 job_kind,省略即退回 update_identity 绕过 0023 排他。
+     修=redistill 路径服务端强制 source_kind,不信客户端。
+  Minor 迁移手册 alembic 图述不准(0049 已合 0022+0048)+ 重复数据清理其实 0023 自己做。修文案。
+  opus M-a init_identity_if_absent 也绕 CAS 未留档→补; M-b 云端 fallback identity-write 仍旧 3 flag→补全
+  I7(部分) resident 蒸馏模板/parser 缺 5 字段,"全量字段"名不副实。
+     过夜修=措辞改准 + 把 user-authored 字段(custom_persona_prompt 等)显式标为不可蒸馏(合 D3)。
+留 hx 拍板(架构/信任边界/推翻既有决定,不过夜动):
+  I1a VPS 用长期 api key 而非 scoped runtime token→成对闸等在服务端对 api-key 来源不生效
+     (coherence 非授权;真危险的 replace 有 403 硬挡)。修法=给 VPS agent 发 scoped runtime token,
+     属 auth 模型架构改动(zhihao),迁移手册已列方向。
+  I3 服务端 >10 动作返 200 静默截前 10——与我们先前"不动服务端 slice(App 兼容)"的明确决定冲突。
+     Codex 建议改 400;但这是推翻既有决定,hx 定。
+  I7(产品契约) 那 5 个字段到底该不该允许蒸馏——产品决定,hx 定。
+修复分三簇串行(避免同分支并发提交撞 index): P=genesis(I5/I6/I1b/I7措辞) → Q=identity/content(C1/I4/M-a) → R=prompt+docs(I2/M-b/Minor)
+
+Cluster Q: complete.
+  C1 rewrap_to_current_key 的 identity 写改走 _save_identity_cas(读取时机不变,只把最终写
+     变成条件写);CAS 冲突→重读最新卡→用最新明文重建信封→有界重试(3 次,同
+     identity/actions.py 的 _IDENTITY_WRITE_MAX_ATTEMPTS)。未动 envelope id/AAD/K_enclave —
+     加密语义逐位不变。新增 2 条真实 DB(make_client)测试覆盖两种时序:
+     (a) 并发写在 rewrap 解密期间落地→rewrap CAS 失败重读保留并发写的内容;
+     (b) rewrap 先落地→profile_patch 用自己既有 CAS 正常succeed。
+  I4 _clean_list_items 先 raw[:12] 再查长度的顺序 bug:新增 _clean_list_items_uncapped,
+     add_*/replace_* 都改成"先清洗去重(不截断)→查真实长度→超 12 整体拒绝"。仅遗留的直接
+     赋值(legacy 裸字段名,如 `signature`)保留截断行为。改写了一条被本次修复推翻的旧测试
+     (test_replace_and_legacy_paths_still_silently_truncate_not_reject 拆成两条,legacy 保留
+     截断、replace_ 改断言为拒绝),changelog 措辞同步更新。
+  M-a init_identity_if_absent 补 KNOWN RESIDUAL 注释(同 relationship_days_set 的写法),
+     两处注释互相引用形成"清单"。未改行为(纯文档,任务要求不连夜重做 onboarding init)。
+  回归: test_identity_list_ops/test_identity_actions/test_asgi_identity/test_content_rewrap*
+     /test_genesis_*/test_identity_concurrency_baseline 全绿(--collect-only 核对新纯单元测试
+     未被 _PURE_UNIT 白名单以外的规则吞掉)。

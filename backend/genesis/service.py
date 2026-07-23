@@ -1099,6 +1099,22 @@ def init_identity_if_absent(
     }
     if envelope.get("K_enclave"):
         identity_doc["K_enclave"] = envelope["K_enclave"]
+    # KNOWN RESIDUAL (not fixed here — same shape as identity/actions.py's
+    # _identity_relationship_days_set, see that comment): this is a plain
+    # overwrite, not the CAS `_save_identity_cas` used by profile_patch /
+    # dimension_nudge / replace_identity_preserving_anchor, and it isn't under
+    # identity_mutation_lock either. The `existing`/`base_payload` snapshot
+    # above was read at the TOP of this function, so a concurrent
+    # profile_patch/dimension_nudge CAS win landing after that read (this
+    # function's own enclave round trip for `_existing_identity_plain_for_update`
+    # included) can be silently clobbered here — and this can happen even when
+    # a card ALREADY exists (the `existing and relationship_anchor_source ==
+    # GENESIS_SOURCE` re-init branch above), not just on first init. Low
+    # real-world likelihood (genesis init/re-init is a one-shot onboarding
+    # path, not a hot path) but worth flagging alongside the C1 fix rather
+    # than presenting profile_patch/dimension_nudge/rewrap as the only
+    # writers on this row — relationship_days_set (identity/actions.py) has
+    # the same residual.
     identity_service._save_identity(store, identity_doc)
     boot_gates._log_bootstrap_event(store, "genesis_identity_written_v1", success=True)
     identity_service._append_identity_change(store, {
