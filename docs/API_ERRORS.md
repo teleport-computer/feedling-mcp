@@ -80,6 +80,30 @@
 | `invalid_reasoning_effort` | 400 | — | reasoning effort 取值非法（setup/patch 两处校验） | |
 | `model_api_config_delete_failed` | 500 | system | 删除 model_api 配置时 DB 写失败 | |
 
+## `GET /v1/model_api/usage`（provider 账单/额度查询）
+
+> 4xx 全部复用上面 model_api / provider 配置表已登记的 loader slug——本端点
+> 先走 `hosted/usage_core.py` 的 `resolve_usage_config`（其实是
+> `config_store._load_runtime_provider_config`），未配置/未测试通过/信封缺失/
+> 解密失败/config 非法分别命中 `model_api_not_configured` /
+> `model_api_not_tested` / `model_api_key_envelope_missing` /
+> `model_api_key_decrypt_failed` / `model_api_config_invalid`，状态码统一
+> 400（不复用 setup_core 那条 404 分支）。下表列的是 200 响应体内
+> `error` / `metrics.<key>.reason` 字段的取值——外呼 provider 计费接口失败时
+> 整个请求仍是 200，只是 `status` 降级为 `partial`/`error`，具体原因走这些
+> reason slug（同 `core/provider_usage.py` 的 `_err_slug`）。「状态码」列在本节
+> 恒为 `—`（同「通知中心 error_class」节的复用姿势，非 HTTP 状态码，仅为复用
+> 上面表格的行格式/守卫测试）。
+
+| error/reason slug | 状态码 | blame | 说明 | 需本地化 |
+|---|---|---|---|---|
+| `usage_timeout` | — | provider_transient | 查询 provider 账单/额度接口超时（`PROVIDER_USAGE_TIMEOUT_SEC`） | |
+| `usage_unreachable` | — | provider_transient | httpx 网络层错误（连接失败/DNS/TLS 等） | |
+| `usage_bad_response` | — | system | 上游响应非预期格式，解析失败 | |
+| `usage_blocked_url` | — | user_provider | 自定义 base_url 未过 `net_safety` 出网校验（非公网/内网地址） | |
+| `usage_unsupported_provider` | — | — | provider/base_url 组合没有对应的账单查询适配器（`select_adapter` 命中 `unsupported`） | |
+| `usage_http_<code>` | — | user_provider/system | 上游返回非 2xx HTTP 状态码，`<code>` 为原始状态码 | |
+
 ## 聊天
 
 | slug | 状态码 | blame | 说明 | 需本地化 |
