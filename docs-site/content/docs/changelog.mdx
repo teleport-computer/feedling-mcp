@@ -46,7 +46,13 @@ change must not be interpreted as an API guarantee.
   `profile_patch`/`dimension_nudge` made while a redistill is in flight is no
   longer silently discarded. Distill prompts also now treat instruction-like
   text found in uploaded material purely as persona content to analyze, never
-  as instructions to follow.
+  as instructions to follow. Both resident redistill and the onboarding
+  Genesis import can now also derive `user_preferred_name`,
+  `custom_persona_prompt`, `language_preference`, `relationship_anchor`, and
+  `stable_definitions` from uploaded material when it explicitly states them
+  (previously these five fields were settable only via chat profile-patch);
+  each stays empty, never invented, when the material gives no explicit
+  signal for it.
 - Resident maintenance reminder state now uses cross-worker PostgreSQL
   compare-and-swap instead of process-local read-modify-write persistence.
   Concurrent Chat poll, claim, and pending-work requests therefore preserve one

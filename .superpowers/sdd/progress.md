@@ -122,3 +122,16 @@ Cluster Q: complete.
   回归: test_identity_list_ops/test_identity_actions/test_asgi_identity/test_content_rewrap*
      /test_genesis_*/test_identity_concurrency_baseline 全绿(--collect-only 核对新纯单元测试
      未被 _PURE_UNIT 白名单以外的规则吞掉)。
+
+=== 终审修复波合并复核(opus,喂了台账): 全部 fixed✅,C1 未碰加密红线,3 延期项确实仍开。
+    VERDICT: READY TO OFFER FOR MERGE TO test。===
+最终全绿(post-fix-wave): 392 + consumer 456 + distill 16 passed, 0 fail。
+分支未推、未合——等 hx 拍板。合前 DoD 未做项(需部署): 真加密 e2e / 真 2-worker CAS 竞态 / 真模型 e2e。
+
+=== 追加 Task 17 (B2, hx 2026-07-23 拍板): 用户层 5 字段补齐生产链 ===
+决定:custom_persona_prompt / user_preferred_name / language_preference / relationship_anchor /
+  stable_definitions 这 5 个"用户层"字段,此前全链无生产入口(onboarding/二次蒸馏/做梦都不产,
+  只有对话 identity-write 能写)。B2=两个蒸馏器都补上,让新建卡与重新总结都能从素材抽出它们。
+  **这反转了 T7/ef8e393d(I7)"5 字段刻意不蒸馏"的决定**——那批注释/迁移手册需同步改。
+  做梦机制确认只整理记忆、不碰身份(9747),不在本次范围。
+  风险:动 onboarding 建卡主流程 + prompt 行为,单测抓不到,合前必须真模型 e2e。

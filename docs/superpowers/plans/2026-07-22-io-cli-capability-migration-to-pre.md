@@ -464,6 +464,84 @@ model_empty_output|worker_restarted|consumer_offline|decrypt_failed|internal`）
 
 ---
 
+## ⑨ Task 17(B2,hx 2026-07-23 拍板):用户层 5 字段补齐两个蒸馏器
+
+**反转 T7/`ef8e393d`(I7)**:`user_preferred_name` / `custom_persona_prompt` /
+`language_preference` / `relationship_anchor` / `stable_definitions` 这 5 个
+D1 用户层字段,此前全链路无生产入口(onboarding、重新总结/redistill、做梦都
+不产,只有对话 `identity-write` 能写)。本条决定让**两个蒸馏器**都能从素材里
+GROUNDED 抽出它们——素材没有明确信号就留空,绝不编。
+
+**改动范围**(纯业务层,不碰 `backend/agent_runtime/`、CLI 行为、
+`backend/capabilities/`,按 io/CLAUDE.md 的过渡期判断表**不受 V2 影响,走
+test**):
+- `backend/identity/distill_prompt_v1.py`:`RESIDENT_IDENTITY_FIELDS` 9→14
+  (= `card_policy.PROFILE_FIELDS` 全部 13 + `dimensions`),`_FIELDS_SPEC`
+  加 5 字段的 GROUNDED 措辞,`_STRING_CAPS`/`_LIST_FIELDS` 补齐,parser 新增
+  `user_preferred_name` 的 "TA"/占位符过滤(复用 `identity.user_naming`)。
+- `backend/genesis/prompts.py`:`FACT_WRITE_PROMPT` 输出契约 + 防火墙加一条
+  **反向例外**——这 5 个字段描述的是用户本人,只能从用户档案/用户自己的话取,
+  跟 agent 身份字段(只能来自描述 TA 的素材)规则相反。
+- `backend/genesis/worker.py`:`_fact_write` 聚合逻辑、`_identity_only`、
+  `_fact_write_output_empty` 三处的"有信号"判断从只看 `agent_name`/
+  `dimensions` 扩到也看这 5 个字段(否则素材只给了 persona 指令但没给名字/
+  维度时,聚合阶段会把它整个丢掉)。
+- `backend/genesis/plaintext.py`:`_plaintext_merge_reducer_outputs` 同样的
+  "有信号"判断扩展,并且这 5 个字段**反过来**要从 `source_family=="user_profile"`
+  的输出里取(agent_name/dimensions 继续排除 user_profile,规则不变)。
+  **顺手修了一个真实回归**:`_run_plaintext_background_enrichment` 里
+  persona-baseline 兜底那段原来是 `merged["identity"] = baseline`(整体覆盖),
+  一旦素材只给了 5 字段信号又同时存在 persona 文本,会被这个兜底悄悄冲掉——
+  改成 `{**existing_identity, **baseline}` 合并,已加回归测试锁住
+  (`test_v2_background_baseline_derivation_merges_not_overwrites_user_layer_fields`)。
+- `backend/genesis/service.py`:`_identity_payload_from_output` 补齐这 5 个字段
+  的抽取(1200/240 cap,同 `card_policy`/本模块既有约定),"有信号"判断同步
+  扩展;`init_identity_if_absent` 补上把这 5 个字段从 `payload` 抄进
+  `merged_payload` 的那一步——**`user_preferred_name` 此前已经算出来了但从
+  没被抄进去,是个已存在的死代码 bug,这次一起修**。
+  `_identity_payload_for_replace`(redistill 落地点)本来就是通用遍历
+  `card_policy.PROFILE_STRING_FIELDS`/`PROFILE_LIST_FIELDS`,**已经**天然支持
+  这 5 个字段(T12 的成果),这条链路只缺蒸馏器本身产出它们,不缺服务端落地。
+- 迁移 doc/changelog 措辞:`docs-site/content/docs/changelog.mdx` 补充一句;
+  `distill_prompt_v1.py`/`chat_resident_consumer.py` 里 I7 写的"9 个字段/
+  刻意不蒸馏"措辞已改成"14 个字段/GROUNDED 蒸馏"。
+
+**V2 镜像(0727)**:**不适用**,已核实——
+`backend/identity/distill_prompt_v1.py` 是 VPS 自托管 resident consumer 专用
+(`tools/chat_resident_consumer.py`),hosted V2 没有对应实现,不需要镜像;
+`backend/genesis/{prompts,service,worker,plaintext}.py` 是 test/pre 共用的
+genesis 流水线单一代码源(不是按 runtime 各一份),随正常 `git merge` 带过去
+即可,不需要在 pre 上单独打补丁。**唯一需要 hx 知晓的口子**:hosted V2 的
+"foreground 身份闸"(`backend/genesis/foreground_identity.py::derive_foreground_identity`)
+复用的是另一条更老的独立实现——`backend/hosted/history_import.py::
+_derive_identity_with_provider`(`/v1/history_import/*`,非 genesis 流水线)——
+本次**没有改这条**,所以 genesis v2 的 foreground 身份闸这一步仍然不会产出
+这 5 个字段,只有 background 全量 reduce(走的是本次改过的
+`genesis/worker.py`/`genesis/prompts.py`)会。范围内的三条链路(resident
+redistill、onboarding genesis background reduce、onboarding genesis
+foreground-core 写入)都已覆盖;这第四条(V2 foreground 身份闸的老 deriver)
+是发现但未处理的已知缺口,要不要补由 hx 决定,不阻塞本次任务。
+
+**无法在此验证(prompt 行为,单测证不了模型真的会抽好)**:上传含明确 persona
+指令的素材 → onboarding 建卡真的带上 `custom_persona_prompt`;重新总结真的
+能更新它。**合并前必须真模型 e2e**,同 io/CLAUDE.md 的加密 e2e 铁律并列的
+"prompt 行为 bug 单测抓不到"教训。
+
+**验证命令**:
+```
+pytest tests/test_identity_distill_prompt.py tests/test_genesis_service.py \
+       tests/test_genesis_worker.py tests/test_genesis_prompts.py \
+       tests/test_redistill_server_merge.py tests/test_identity_actions.py \
+       tests/test_asgi_identity.py tests/test_genesis_plaintext_routes.py \
+       tests/test_genesis_v2_orchestration.py tests/test_genesis_notice.py -q
+pytest tests/test_chat_resident_consumer.py -q             # 456 passed(基线不能破)
+pytest tests/test_resident_identity_distill.py -q           # 单独跑,已知与 consumer 测试有慢交互
+FEEDLING_TEST_PG=postgresql://localhost:1/none pytest --collect-only -q \
+    tests/test_identity_distill_prompt.py
+```
+
+---
+
 ## 收尾验证(全部动作做完后跑一遍)
 
 ```
