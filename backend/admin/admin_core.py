@@ -14,10 +14,19 @@ via ``asgi.threadpool.run_db`` from the async routes.
 
 from __future__ import annotations
 
+import json
+import logging
+from datetime import datetime, timezone
+
+import db
 from accounts import registry
 from admin import data_track
+from content import content_core
 from core import store as core_store
+from core import wake_bus
 from core.reqctx import bind, request
+
+log = logging.getLogger("feedling.admin")
 
 
 def summary_payload(query_string: str) -> dict:
@@ -100,3 +109,65 @@ def store_evict(user_id: str) -> dict:
     evicted = core_store._evict_store(user_id)
     print(f"[admin:store/evict] user_id={user_id} evicted={evicted}")
     return {"evicted": evicted, "user_id": user_id}
+
+
+def delete_user(user_id: str) -> tuple[dict, int]:
+    """Delete one account by authoritative DB id and evict its cached state."""
+    if not db.user_exists(user_id):
+        return {"error": "user_not_found"}, 404
+
+    archive_err = content_core._purge_onboarding_archives_with_retry(user_id)
+    if archive_err is not None:
+        log.error(
+            "[admin:user/delete] onboarding archive cleanup failed user_id=%r: %s",
+            user_id,
+            archive_err,
+        )
+        return {"error": "archive_cleanup_failed"}, 503
+
+    with registry._users_lock:
+        if not db.delete_user(user_id):
+            return {"error": "user_not_found"}, 404
+        registry._users[:] = [
+            entry for entry in registry._users if entry.get("user_id") != user_id
+        ]
+        stale_hashes = [
+            key_hash
+            for key_hash, cached_user_id in registry._key_to_user.items()
+            if cached_user_id == user_id
+        ]
+        for key_hash in stale_hashes:
+            registry._key_to_user.pop(key_hash, None)
+
+    audit = {
+        "event": "admin_user_delete",
+        "who": "admin",
+        "user_id": user_id,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    log.info("[admin:user/delete] %s", json.dumps(audit, separators=(",", ":")))
+
+    registry.notify_users_changed()
+    wake_bus.notify("blob", user_id)
+
+    for label, cleanup in (
+        ("frames-r2", lambda: db.delete_user_frames(user_id)),
+        ("chat-files-r2", lambda: db.delete_user_chat_files(user_id)),
+        ("db-belt", lambda: db.delete_user_data(user_id)),
+    ):
+        try:
+            cleanup()
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "[admin:user/delete] cleanup failed label=%s user_id=%r: %s",
+                label,
+                user_id,
+                exc,
+            )
+
+    with core_store._stores_lock:
+        cached_store = core_store._stores.pop(user_id, None)
+    if cached_store is not None:
+        core_store._wake_store_waiters(cached_store)
+
+    return {"deleted": True, "user_id": user_id}, 200

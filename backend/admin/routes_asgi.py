@@ -13,8 +13,8 @@ routes too, exactly as Flask's ``errorhandler(401)`` does.
 Each handler's body is produced by the same ``admin.data_track`` functions the
 Flask routes call — via ``admin.admin_core``, which runs them inside a throwaway
 Flask request context so ``request.args`` is read from the ASGI query string —
-so the output is byte-for-byte the Flask output. All of that is blocking sync
-``db.py`` work, so it runs through ``threadpool.run_db`` (plan §5.2).
+so the data-track output is byte-for-byte the Flask output. Blocking sync
+``db.py`` work runs through ``threadpool.run_db`` (plan §5.2).
 """
 
 from __future__ import annotations
@@ -214,6 +214,17 @@ async def data_track_user_page(user_id: str, request: Request):
     if kind == "text":
         return PlainTextResponse(body, status_code=status)
     return HTMLResponse(body, status_code=status)
+
+
+@router.post("/v1/admin/users/{user_id}/delete")
+async def delete_user(user_id: str, request: Request):
+    _require_admin(request)
+    payload = await read_json_silent(request)
+    confirm = payload.get("confirm") if isinstance(payload, dict) else None
+    if confirm != user_id:
+        return JSONResponse({"error": "confirmation_mismatch"}, status_code=400)
+    body, status = await threadpool.run_db(admin_core.delete_user, user_id)
+    return JSONResponse(body, status_code=status)
 
 
 @router.post("/v1/admin/store/evict")

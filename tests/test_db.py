@@ -76,7 +76,8 @@ def test_users_roundtrip_and_archive_language_omitted_when_null():
     users = {u["user_id"]: u for u in db.load_all_users()}
     assert users[uid]["archive_language"] == "zh-Hans"
 
-    db.delete_user(uid)
+    assert db.delete_user(uid) is True
+    assert db.delete_user(uid) is False
     assert uid not in {u["user_id"] for u in db.load_all_users()}
 
 

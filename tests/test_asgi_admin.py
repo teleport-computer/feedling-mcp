@@ -1,4 +1,4 @@
-"""Native admin data-track parity: 7 admin-token-gated routes (5 JSON, 2 HTML).
+"""Native admin data-track and privileged-operation route coverage.
 
 Asserts the FastAPI routes (admin.routes_asgi) return the same status/body as the
 Flask oracle (admin.data_track) — both run the *same* admin.data_track functions,
@@ -10,6 +10,7 @@ from the query string). Covers:
     status + Content-Type + body parity, with the embedded ``generated_at``
     ISO timestamp normalised; the 404 branch is text/plain.
   - store/evict: side-effect payload + the 400 (missing user_id) branch.
+  - users/{id}/delete: confirmation guard, cascade, cache eviction, and audit.
   - admin-token auth: 401 (missing/bad) + 503 (unconfigured), mirroring copytext.
 """
 
@@ -27,10 +28,12 @@ import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+import db  # noqa: E402
 from accounts import registry  # noqa: E402
 from admin import routes_asgi as admin_asgi  # noqa: E402
 from asgi import middleware  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
+from content import content_core  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
@@ -288,6 +291,173 @@ def test_store_evict_cached_true(env):
 
 
 # --------------------------------------------------------------------------- #
+# destructive admin user deletion (POST)
+# --------------------------------------------------------------------------- #
+
+_DELETE_TABLES = (
+    "users",
+    "chat_messages",
+    "memory_moments",
+    "user_blobs",
+    "agent_runtime_instances",
+)
+
+
+def _seed_delete_rows(user_id: str) -> None:
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
+            "VALUES (%s, 'admin-delete-msg', 1, '{}'::jsonb)",
+            (user_id,),
+        )
+        conn.execute(
+            "INSERT INTO memory_moments (user_id, moment_id, doc) "
+            "VALUES (%s, 'admin-delete-memory', '{}'::jsonb)",
+            (user_id,),
+        )
+        conn.execute(
+            "INSERT INTO user_blobs (user_id, kind, doc) "
+            "VALUES (%s, 'admin-delete-blob', '{}'::jsonb)",
+            (user_id,),
+        )
+        conn.execute(
+            "INSERT INTO agent_runtime_instances "
+            "(user_id, driver, status, runtime_home) "
+            "VALUES (%s, 'claude', 'idle', '/tmp/admin-delete')",
+            (user_id,),
+        )
+
+
+def _delete_row_counts(user_id: str) -> dict[str, int]:
+    with db.get_pool().connection() as conn:
+        return {
+            table: conn.execute(
+                f"SELECT count(*) FROM {table} WHERE user_id = %s", (user_id,)
+            ).fetchone()[0]
+            for table in _DELETE_TABLES
+        }
+
+
+def test_admin_delete_user_cascades_evicts_and_audits(env, monkeypatch, caplog):
+    uid, _key = _register()
+    _seed_delete_rows(uid)
+    core_store.get_store(uid)
+    assert all(count > 0 for count in _delete_row_counts(uid).values())
+    assert uid in registry._key_to_user.values()
+    assert uid in core_store._stores
+
+    cleanup_calls = []
+    original_delete_user_data = db.delete_user_data
+
+    monkeypatch.setattr(
+        content_core,
+        "_purge_onboarding_archives_with_retry",
+        lambda user_id: cleanup_calls.append(("archives-r2", user_id)),
+    )
+
+    def delete_frames(user_id):
+        cleanup_calls.append(("frames-r2", user_id))
+
+    def delete_chat_files(user_id):
+        cleanup_calls.append(("chat-files-r2", user_id))
+
+    def delete_user_data(user_id):
+        cleanup_calls.append(("db-belt", user_id))
+        original_delete_user_data(user_id)
+
+    monkeypatch.setattr(db, "delete_user_frames", delete_frames)
+    monkeypatch.setattr(db, "delete_user_chat_files", delete_chat_files)
+    monkeypatch.setattr(db, "delete_user_data", delete_user_data)
+    caplog.set_level("INFO", logger="feedling.admin")
+
+    response = _asgi_json(
+        "POST",
+        f"/v1/admin/users/{uid}/delete",
+        headers=_admin(),
+        json={"confirm": uid},
+    )
+
+    assert response == (200, {"deleted": True, "user_id": uid})
+    assert _delete_row_counts(uid) == {table: 0 for table in _DELETE_TABLES}
+    assert all(entry.get("user_id") != uid for entry in registry._users)
+    assert uid not in registry._key_to_user.values()
+    assert uid not in core_store._stores
+    assert cleanup_calls == [
+        ("archives-r2", uid),
+        ("frames-r2", uid),
+        ("chat-files-r2", uid),
+        ("db-belt", uid),
+    ]
+    audit_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if '"event":"admin_user_delete"' in record.getMessage()
+    ]
+    assert len(audit_lines) == 1
+    assert '"who":"admin"' in audit_lines[0]
+    assert f'"user_id":"{uid}"' in audit_lines[0]
+    assert '"ts":"' in audit_lines[0]
+
+
+@pytest.mark.parametrize("payload", [{}, {"confirm": "wrong-user"}, []])
+def test_admin_delete_user_requires_exact_confirmation(env, payload):
+    uid, _key = _register()
+    response = _asgi_json(
+        "POST",
+        f"/v1/admin/users/{uid}/delete",
+        headers=_admin(),
+        json=payload,
+    )
+    assert response == (400, {"error": "confirmation_mismatch"})
+    assert db.user_exists(uid) is True
+
+
+def test_admin_delete_user_not_found(env, monkeypatch):
+    monkeypatch.setattr(
+        content_core,
+        "_purge_onboarding_archives_with_retry",
+        lambda _user_id: pytest.fail("R2 cleanup must not run for an unknown user"),
+    )
+    uid = "usr_admin_delete_missing"
+    response = _asgi_json(
+        "POST",
+        f"/v1/admin/users/{uid}/delete",
+        headers=_admin(),
+        json={"confirm": uid},
+    )
+    assert response == (404, {"error": "user_not_found"})
+
+
+def test_admin_delete_user_wrong_token_is_401(env):
+    uid, _key = _register()
+    response = _asgi_json(
+        "POST",
+        f"/v1/admin/users/{uid}/delete",
+        headers=_admin("wrong"),
+        json={"confirm": uid},
+    )
+    assert response == (401, {"error": "unauthorized"})
+    assert db.user_exists(uid) is True
+
+
+def test_admin_delete_user_archive_failure_aborts(env, monkeypatch):
+    uid, _key = _register()
+    monkeypatch.setattr(
+        content_core,
+        "_purge_onboarding_archives_with_retry",
+        lambda _user_id: RuntimeError("R2 unavailable"),
+    )
+    response = _asgi_json(
+        "POST",
+        f"/v1/admin/users/{uid}/delete",
+        headers=_admin(),
+        json={"confirm": uid},
+    )
+    assert response == (503, {"error": "archive_cleanup_failed"})
+    assert db.user_exists(uid) is True
+
+
+# --------------------------------------------------------------------------- #
 # admin-token auth parity (mirrors copytext admin tests)
 # --------------------------------------------------------------------------- #
 
@@ -297,6 +467,7 @@ def test_store_evict_cached_true(env):
         ("/v1/admin/data-track/summary", "GET"),
         ("/admin/data-track", "GET"),
         ("/v1/admin/store/evict", "POST"),
+        ("/v1/admin/users/usr_admin_delete/delete", "POST"),
     ],
 )
 def test_no_token_is_401_parity(env, path, method):

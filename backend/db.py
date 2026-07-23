@@ -484,12 +484,15 @@ def save_all_users(users: list[dict]) -> None:
     mirror.execute_many(mirror_group)
 
 
-def delete_user(user_id: str) -> None:
+def delete_user(user_id: str) -> bool:
     sql = "DELETE FROM users WHERE user_id = %s"
     with get_pool().connection() as conn:
-        conn.execute(sql, (user_id,))
+        deleted = conn.execute(sql, (user_id,)).rowcount > 0
+    if not deleted:
+        return False
     from tee_shadow import mirror
     mirror.execute(sql, (user_id,))
+    return True
 
 
 # ---------------------------------------------------------------------------
