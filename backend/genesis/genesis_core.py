@@ -184,15 +184,16 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
     The app-facing job status is ``processing`` (the ``awaiting_resident``/claim detail
     stays internal). Idempotent: the same material re-uploaded maps to the same job_id.
 
-    ``job_kind`` (optional payload field) picks the job's ``source_kind`` discriminator
-    when the caller needs a kind distinct from ``mode`` — currently only the terminal
-    ``identity-redistill`` lane (io_cli → consumer IPC, T11) sets it to
-    ``resident_redistill``, which is DB-level exclusive per user
+    ``source_kind`` discriminator: ``mode == "update_identity"`` on this sealed lane
+    ALWAYS maps to ``source_kind = "resident_redistill"`` (I1b fix — forced server-side
+    from the already-validated ``mode``, not from the client-supplied ``job_kind``
+    field, which is no longer trusted as the sole gate: every real caller of sealed
+    ``mode="update_identity"`` today IS the terminal ``identity-redistill`` lane,
+    io_cli → consumer IPC, T11), which is DB-level exclusive per user
     (0023_redistill_job_exclusivity.py): a second concurrent redistill job for the same
     user 409s instead of silently racing the first. Onboarding's plain ``add_memory`` /
-    ``identity_update`` uploads never set ``job_kind`` and keep today's unlimited-
-    concurrency behavior — the exclusivity index only watches
-    ``source_kind = 'resident_redistill'``.
+    other modes are untouched and keep today's unlimited-concurrency behavior — the
+    exclusivity index only watches ``source_kind = 'resident_redistill'``.
 
     V2 NOTE (2026-07-27 pre-merge): when ``test`` merges into ``pre``, the exclusivity
     migration (0023_redistill_job_exclusivity.py) needs a merge revision against pre's
@@ -256,11 +257,30 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
     current_identity = identity_service._load_identity(store)
     base_identity_replaced_at = str((current_identity or {}).get("replaced_at") or "")
     job_kind_hint = str(payload.get("job_kind") or "").strip().lower()
+    # I1b: source_kind used to be job_kind_hint-or-mode_hint, i.e. the DB-level
+    # redistill exclusivity (0023) depended on the client remembering to also
+    # send job_kind="resident_redistill" alongside mode="update_identity" — an
+    # omitted (or simply wrong) job_kind silently fell back to mode_hint
+    # ("update_identity") and dodged the partial-unique index entirely, even
+    # though every real caller of mode="update_identity" on this sealed lane
+    # IS the identity-redistill lane (T11's IPC relay is the only producer;
+    # the resident consumer's own dispatch already keys off mode=="update_identity"
+    # to run _resident_distill_identity — see _handle_redistill_ipc). So derive
+    # source_kind from the mode the server itself just validated, not from the
+    # separate, independently-omittable job_kind field: mode=="update_identity"
+    # on the sealed path ALWAYS means resident_redistill, full stop — job_kind
+    # can no longer opt a request out of exclusivity. Every other mode
+    # (add_memory / onboarding / …) is untouched and keeps unlimited
+    # concurrency exactly as before.
+    if mode_hint == "update_identity":
+        source_kind = "resident_redistill"
+    else:
+        source_kind = job_kind_hint or mode_hint or "resident"
     try:
         created = db.genesis_create_job(store.user_id, {
             "job_id": job_id,
             "status": "awaiting_resident",
-            "source_kind": job_kind_hint or mode_hint or "resident",
+            "source_kind": source_kind,
             "total_chunks": 1,
             "total_bytes": len(encrypted_body),
             "privacy_mode": "resident_sealed",
@@ -277,15 +297,49 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
             store, mode=mode_hint, reason="redistill_job_active", env=env,
             active_job_id=e.active_job_id)
         return _bad("redistill_job_active", 409, active_job_id=e.active_job_id)
-    # created is None on ON CONFLICT DO NOTHING (idempotent re-upload) — chunk already stored.
-    if created is not None:
-        db.genesis_put_chunk(
-            store.user_id, job_id,
-            seq=0, byte_start=0, byte_end=len(encrypted_body),
-            ciphertext_sha256=ciphertext_sha256,
-            content_sha256="",
-            aad=aad, encrypted_body=encrypted_body,
-        )
+    # I5: job-insert (above) and chunk-insert (below) are two SEPARATE transactions.
+    # `created is None` on ON CONFLICT DO NOTHING covers two different situations that
+    # used to be treated as the same thing:
+    #   (a) steady-state idempotent re-upload — the job AND its chunk 0 are already
+    #       fully stored from a prior successful call.
+    #   (b) a crash landed AFTER the job insert committed but BEFORE the chunk insert
+    #       below ran — the job row exists but chunk 0 was never written. Skipping the
+    #       chunk write here (the old behavior) left an unrepairable "awaiting_resident"
+    #       job with zero chunks: the resident consumer's claim path treats a chunkless
+    #       job as malformed and just waits for the reaper to fail it — a retry with the
+    #       SAME request_id could never self-heal it.
+    # Distinguish them by re-checking chunk 0's presence (not just the job row) before
+    # deciding to skip the write, so (b) gets backfilled. Only skip when the job has
+    # already moved past the point chunks are meaningful (done/failed — e.g. the
+    # resident consumer already distilled it and cleaned up the ciphertext via
+    # genesis_delete_chunks) so a stray retry can't resurrect ciphertext for a job
+    # that's already finished and had its material purged.
+    write_chunk = created is not None
+    if created is None:
+        existing_job = db.genesis_get_job(store.user_id, job_id)
+        existing_status = str((existing_job or {}).get("status") or "")
+        if existing_status not in ("done", "failed"):
+            existing_chunks = db.genesis_missing_chunk_seqs(store.user_id, job_id, total_chunks=1)
+            write_chunk = bool(existing_chunks)  # seq 0 missing -> [0], present -> []
+    if write_chunk:
+        # genesis_put_chunk is itself safe to call on a chunk that already exists with
+        # the SAME ciphertext (verifies the hash and no-ops); it only raises on a
+        # genuine mismatch (different ciphertext already stored under this job_id/seq),
+        # which is a real anomaly worth surfacing rather than papering over.
+        try:
+            db.genesis_put_chunk(
+                store.user_id, job_id,
+                seq=0, byte_start=0, byte_end=len(encrypted_body),
+                ciphertext_sha256=ciphertext_sha256,
+                content_sha256="",
+                aad=aad, encrypted_body=encrypted_body,
+            )
+        except ValueError as e:
+            if str(e) == "chunk_hash_conflict":
+                _log_resident_sealed_rejected(
+                    store, mode=mode_hint, reason="chunk_hash_conflict", env=env)
+                return _bad("chunk_hash_conflict", 409)
+            raise
     return {"job": {"job_id": job_id, "status": "processing"}}, 200
 
 
