@@ -13,6 +13,51 @@
 - 前提:合并节奏(何时合、要不要走 PR)由 hx 拍板,本文档只管"合的时候怎么
   解决冲突、怎么验",不代替 hx 的合并决策。
 
+---
+
+## ⚠️ 更新 2026-07-23(演练执行 + Codex 复审后 —— 本节优先于下文原计划)
+
+已在 worktree `chore/capability-pre-dryrun` 真跑了一遍执行+测试(真 ephemeral
+Postgres,批次相关全绿),并过了 Codex code_review。相对下文原计划有以下修正与新增,
+**真迁 pre 前以本节为准**:
+
+### 原计划假设被推翻/需修正
+1. **leak 守卫无需移植**:下文/Router 若说"pre 缺协议 JSON 泄漏守卫、要带过去"——
+   过期。`origin/pre`(dc0cda41 实查)的 `chat_resident_consumer.py` 已有
+   `_scan_visible_protocol`(与 test 逐字节相同);V2 serve-worker 回复路径结构上无此洞。
+   → 删掉"移植 leak 守卫"这一步。
+2. **不止 actions.py 一处冲突**:实测是完整 test→pre 同步,`chat_core.py`/`db.py` 也冲突
+   (pre 的 V2 durable-paging × test 的 V1 缓存自愈 + proactive coalescing)。演练按
+   "保 pre V2 版 + 补回 `db.chat_count_since`"解,但 **V1 coalescing 要不要真迁进 V2 是
+   zhihao 的 V2 地盘,合并前须他拍**。
+
+### Codex 必修项(真迁 pre 前逐条修完再合,否则功能带病上)
+- 🔴 **V2 `identity_dimension_nudge` 加密 effect 回放会卡**:`_validate_decrypted_tool_effect`
+  仍按 identity_patch 校验、不认 `op`/nudge 字段 → RuntimeError 卡 pending、所有 V2 nudge
+  落不了库、可能堵 effect sweeper。修:按可信 `op` 分流、剥 `op`/`effect_id` 后再校验,
+  未知 op fail-closed;补"映射→加密→解密校验→sink"全链回放测试。
+- 🔴 **bootstrap 首建非原子**:两 worker 并发首建 lost-update + 双成功;`set_blob` 吞 DB
+  异常还会假成功。修:用 `set_blob_if_unchanged(expected_doc={}, insert_if_missing=True)`
+  或 `INSERT ... ON CONFLICT DO NOTHING RETURNING`,只有赢家写 audit/effect;补真 Postgres
+  双连接并发首建 + "DB 失败不得返 200" 测试。
+- 🟠 **撤掉能力层改名闸 —— 方向 Codex 已确认正确**(无 V2 单字段改名绕过服务端闸的落库
+  路径,顶回原 §② 是对的)。但改名报错到 sink 才 400、模型收不到可自纠 tool error;升级前
+  排队的合法改名 effect 回放会被 terminal-discard。修:加 V2 入队前语义校验(错误当 tool
+  result 回模型)+ persistent effect 版本化,服务端闸保留作最终防线。**原 §② 里"在
+  `capabilities/identity.py::patch()` 加 retryable=False 改名闸"这一步不要做**(会破坏 pre
+  既有契约、且作用域不看 runtime_token)。
+- 🟠 **`chat_count_since`**:补回的 COUNT 与 hot ring(最新 5000 seq)边界不一致 + 缺
+  `(user_id,ts)` 索引会退化全历史扫。改成
+  `SELECT count(*) FROM (SELECT ts FROM chat_messages WHERE user_id=%s ORDER BY seq DESC LIMIT 5000) recent WHERE ts>%s`。
+
+### 流程提醒(hx 2026-07-23)
+① 真 bug 先修完再合;② 真迁时把本迁移方案按当时实际【再同步更新一遍】(pre 变化极快,
+合并前重新 `git fetch origin pre` 复核下文每条"pre 实查"栏);③ 演练 worktree
+`chore/capability-pre-dryrun`(未推)可作起点。演练实际改动已过 Codex,详见 Router 条目
+(tag `feedling mcp/io`,2026-07-23 io_cli 重构 milestone,§八)。
+
+---
+
 ## 如何使用本文档
 
 1. 先做 §0(DB migration 的 merge revision)——它是唯一会让服务**起不来**的
