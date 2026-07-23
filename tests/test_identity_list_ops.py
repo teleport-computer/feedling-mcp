@@ -195,15 +195,43 @@ def test_add_boundaries_also_enforces_cap():
         identity_actions.apply_list_ops(existing, {"add_boundaries": ["one-more"]})
 
 
-def test_replace_and_legacy_paths_still_silently_truncate_not_reject():
-    # Unchanged pre-existing behavior for legacy/replace (back-compat: no new
-    # ListOpTooManyItems here — _clean_list_items truncates via raw[:12]).
-    oversized = [f"x{i}" for i in range(20)]
-    merged = identity_actions.apply_list_ops({"signature": []}, {"replace_signatures": oversized})
-    assert len(merged["signature"]) == 12
+# ---------------------------------------------------------------------------
+# I4 (review): the ORIGINAL reported repro — empty list + add of 13 distinct
+# values. Pre-fix, `_clean_list_items`'s raw[:12] truncated the 13 additions
+# down to 12 BEFORE the merged-length check ever ran, so this silently
+# produced a 12-item list instead of raising ListOpTooManyItems.
+# ---------------------------------------------------------------------------
 
+def test_add_13_distinct_to_empty_list_rejected_not_truncated():
+    with pytest.raises(identity_actions.ListOpTooManyItems):
+        identity_actions.apply_list_ops(
+            {"signature": []}, {"add_signature": [f"new{i}" for i in range(13)]})
+
+
+def test_add_exactly_12_distinct_to_empty_list_ok():
+    merged = identity_actions.apply_list_ops(
+        {"signature": []}, {"add_signature": [f"new{i}" for i in range(12)]})
+    assert len(merged["signature"]) == 12
+    assert merged["signature"] == [f"new{i}" for i in range(12)]
+
+
+def test_legacy_direct_assign_still_silently_truncates_not_reject():
+    # Unchanged pre-existing behavior for the GENUINE legacy path only (a bare
+    # `signature` key, i.e. direct-list-assign): back-compat, no new
+    # ListOpTooManyItems here — _clean_list_items truncates via raw[:12].
+    oversized = [f"x{i}" for i in range(20)]
     merged = identity_actions.apply_list_ops({"signature": []}, {"signature": oversized})
     assert len(merged["signature"]) == 12
+
+
+def test_replace_signatures_13_items_rejected_not_truncated():
+    # I4 fix: replace_* is a brand-new op key (not the legacy path) and must
+    # now REJECT an oversized request instead of silently truncating it —
+    # the pre-fix behavior truncated via _clean_list_items's raw[:12] before
+    # any length check ever ran.
+    oversized = [f"x{i}" for i in range(13)]
+    with pytest.raises(identity_actions.ListOpTooManyItems):
+        identity_actions.apply_list_ops({"signature": []}, {"replace_signatures": oversized})
 
 
 # ---------------------------------------------------------------------------

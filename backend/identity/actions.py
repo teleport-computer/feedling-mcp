@@ -39,12 +39,22 @@ class ListOpBlank(Exception):
 
 class ListOpTooManyItems(Exception):
     """Raised when an add_* op's merged result (existing items + deduped
-    additions) would exceed the 12-item cap. Explicit reject, NOT silent
-    truncation — unlike the legacy direct-list-assign / replace_* paths
-    (which already cap via `_clean_list_items`'s `raw[:12]`, a pre-existing
-    behavior kept for back-compat), add_* is a brand-new op key with no
-    compat concern, so a request that would blow the cap is rejected outright
-    rather than silently dropping whichever items didn't fit."""
+    additions), or a replace_*'s deduped item list, would exceed the
+    12-item cap. Explicit reject, NOT silent truncation — unlike the
+    legacy direct-list-assign path (e.g. bare `signature`, which keeps
+    capping via `_clean_list_items`'s `raw[:12]` for back-compat), add_*
+    and replace_* are both brand-new op keys with no compat concern, so a
+    request that would blow the cap is rejected outright rather than
+    silently dropping whichever items didn't fit.
+
+    I4 follow-up (review): this used to only apply to add_* in practice,
+    because `apply_list_ops` cleaned add_*/replace_* input through
+    `_clean_list_items`, which ALREADY truncates to 12 items via
+    `raw[:12]` before either op's own length check ever ran — so e.g. an
+    empty list + add of 13 distinct values silently became 12 items and
+    never raised. Both ops now clean through the uncapped
+    `_clean_list_items_uncapped` first so the length check sees the TRUE
+    requested count."""
 
 
 # field -> (add_key, remove_key, replace_key). Drives apply_list_ops below so
@@ -71,12 +81,31 @@ _LIST_OP_FIELDS: dict[str, tuple[str, str, str]] = {
 def _clean_list_items(raw) -> list[str]:
     """Normalize a raw patch value into a stripped/truncated/blank-filtered
     list[str], the same shape _identity_profile_patch has always produced
-    for these fields (max 12 items, 240 chars each, blanks dropped)."""
+    for these fields (max 12 items, 240 chars each, blanks dropped).
+
+    ONLY for the legacy direct-list-assign path (e.g. a bare `signature`
+    key) — that path silently truncates to 12 items for back-compat. The
+    newer add_*/replace_* op keys must NOT use this: see
+    `_clean_list_items_uncapped` and `ListOpTooManyItems`."""
     if isinstance(raw, str):
         raw = [raw]
     if not isinstance(raw, list):
         return []
     return [item for item in (_identity_action_text(v, 240) for v in raw[:12]) if item]
+
+
+def _clean_list_items_uncapped(raw) -> list[str]:
+    """Same per-item normalization as `_clean_list_items` (stripped,
+    240-char truncated, blanks dropped) but WITHOUT truncating the item
+    COUNT to 12. Used by add_*/replace_* so their own 12-item cap check
+    sees the caller's TRUE requested count and can reject the whole op
+    (`ListOpTooManyItems`) instead of `_clean_list_items` silently
+    dropping the overflow before that check ever runs (I4 review)."""
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [item for item in (_identity_action_text(v, 240) for v in raw) if item]
 
 
 def validate_list_ops_shape(patch: dict) -> None:
@@ -104,9 +133,9 @@ def validate_list_ops_shape(patch: dict) -> None:
         ))
         if present_count > 1:
             raise ListOpConflict(field)
-        if replace_key in patch and not _clean_list_items(patch.get(replace_key)):
+        if replace_key in patch and not _clean_list_items_uncapped(patch.get(replace_key)):
             raise ListOpBlank(field)
-        if add_key in patch and not _clean_list_items(patch.get(add_key)):
+        if add_key in patch and not _clean_list_items_uncapped(patch.get(add_key)):
             raise ListOpBlank(field)
 
 
@@ -125,9 +154,11 @@ def apply_list_ops(existing: dict, patch: dict) -> dict:
     Raises ListOpConflict / ListOpBlank via ``validate_list_ops_shape`` (see
     there for exact conditions) — called first, so this function is fully
     self-validating even when called without the earlier fail-fast check.
-    Also raises ListOpTooManyItems for add_* if existing + deduped additions
-    would exceed the 12-item cap (this one genuinely needs ``existing``, so
-    it can't move into the existing-independent pre-check).
+    Also raises ListOpTooManyItems if the final result would exceed the
+    12-item cap: for add_* that's existing + deduped additions (genuinely
+    needs ``existing``, so it can't move into the existing-independent
+    pre-check); for replace_* it's the deduped replacement list itself.
+    Neither op truncates to fit — see ListOpTooManyItems.
     """
     if not isinstance(existing, dict):
         existing = {}
@@ -156,12 +187,24 @@ def apply_list_ops(existing: dict, patch: dict) -> dict:
 
         if replace_present:
             # Already validated non-blank by validate_list_ops_shape above.
-            result[field] = _clean_list_items(patch.get(replace_key))
+            # I4: clean through the UNCAPPED normalizer + dedupe FIRST, then
+            # reject the whole op if the true count exceeds 12 — using
+            # `_clean_list_items` here would truncate to 12 items before this
+            # check ever saw the real count, silently hiding a 13+-item
+            # request instead of rejecting it (same bug class as add_* below).
+            cleaned = _clean_list_items_uncapped(patch.get(replace_key))
+            deduped = list(dict.fromkeys(cleaned))
+            if len(deduped) > 12:
+                raise ListOpTooManyItems(field)
+            result[field] = deduped
             continue
 
         if add_present:
             # Already validated non-blank by validate_list_ops_shape above.
-            additions = _clean_list_items(patch.get(add_key))
+            # I4: uncapped clean so the merged-length check below sees the
+            # caller's TRUE requested count, not a pre-truncated-to-12 one
+            # (see `_clean_list_items_uncapped` / `ListOpTooManyItems`).
+            additions = _clean_list_items_uncapped(patch.get(add_key))
             merged = list(old_list)
             for item in additions:
                 if item not in merged:
@@ -699,6 +742,10 @@ def _identity_relationship_days_set(store: UserStore, action: dict) -> tuple[dic
     # user-triggered recalibration, not a hot path) but worth flagging
     # alongside the C1 fix rather than presenting profile_patch/
     # dimension_nudge as the only writers on this row.
+    # Same shape: genesis/service.py::init_identity_if_absent's re-init branch
+    # (its own plain `_save_identity`, see the comment there) — the two
+    # residuals cross-reference each other so neither reads as an isolated
+    # one-off.
     identity_service._save_identity(store, identity)
     boot_gates._log_bootstrap_event(store, "identity_action_relationship_days_set", success=True)
     change = identity_service._append_identity_change(store, {

@@ -25,9 +25,11 @@ change must not be interpreted as an API guarantee.
   with an API key, which are unchanged. New error codes on this endpoint:
   `list_op_conflict` (a field targeted by more than one list-operation shape
   in one patch), `list_op_blank` (an add/replace entry is blank after
-  cleanup), `list_op_too_many_items` (an add would push a list past its
-  12-item cap), and `identity_write_conflict` (`409`, a concurrent writer won
-  after retries under lock were exhausted).
+  cleanup), `list_op_too_many_items` (an `add_*` or `replace_*` op's final
+  item count would exceed the 12-item cap — the whole op is rejected, not
+  silently truncated; only the legacy direct-list-assign shape still
+  truncates for back-compat), and `identity_write_conflict` (`409`, a
+  concurrent writer won after retries under lock were exhausted).
 - `POST /v1/identity/actions` dimension nudges are now capped per request:
   same-name deltas are normalized and summed, and any dimension whose summed
   `|delta|` exceeds 10 is rejected with `400 nudge_delta_exceeds_cap` instead
