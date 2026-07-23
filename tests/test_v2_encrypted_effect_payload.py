@@ -31,6 +31,80 @@ def test_identity_effect_mapping_preserves_every_advertised_form(args):
     )
     assert effect_type == "identity"
     assert payload == args
+    # identity_patch stays op-less so its enqueued payload is byte-for-byte the
+    # legacy shape an overlapping old sink still understands (Codex C1 wiring).
+    assert "op" not in payload
+
+
+def test_identity_nudge_effect_mapping_carries_trusted_op_from_tool_name():
+    # identity_nudge shares the `identity` effect_type/sink with identity_patch,
+    # disambiguated by an `op` taken from the TOOL NAME — never from model args.
+    effect_type, payload = worker._write_tool_effect_payload(
+        SimpleNamespace(
+            name="identity_nudge",
+            args={"dimension": "trust", "delta": 3, "reason": "kept a promise"},
+        )
+    )
+    assert effect_type == "identity"
+    assert payload == {
+        "dimension": "trust", "delta": 3, "reason": "kept a promise",
+        "op": "identity_nudge",
+    }
+
+
+def test_identity_nudge_effect_mapping_op_cannot_be_overridden_by_model_args():
+    # A model that smuggled an `op` into args must not be able to steer the sink:
+    # {**tc.args, "op": tc.name} puts the trusted op LAST.
+    _effect_type, payload = worker._write_tool_effect_payload(
+        SimpleNamespace(
+            name="identity_nudge",
+            args={"dimension": "trust", "delta": 1, "op": "identity_patch"},
+        )
+    )
+    assert payload["op"] == "identity_nudge"
+
+
+# --- _validate_decrypted_tool_effect: identity op routing (Codex C1) ----------
+
+def test_validate_identity_effect_accepts_legacy_patch_without_op():
+    # Every pre-nudge / in-flight identity effect has NO op key and must keep
+    # validating as identity_patch.
+    serve_worker._validate_decrypted_tool_effect(
+        "identity", {"effect_id": "e", "patch": {"signature": "kind"}}
+    )  # must not raise
+
+
+def test_validate_identity_effect_accepts_explicit_patch_op():
+    serve_worker._validate_decrypted_tool_effect(
+        "identity",
+        {"effect_id": "e", "op": "identity_patch", "self_introduction": "hi"},
+    )  # must not raise
+
+
+def test_validate_identity_effect_accepts_nudge_op():
+    serve_worker._validate_decrypted_tool_effect(
+        "identity",
+        {"effect_id": "e", "op": "identity_nudge", "dimension": "trust", "delta": 2},
+    )  # must not raise
+
+
+def test_validate_identity_effect_rejects_unknown_op_fail_closed():
+    with pytest.raises(RuntimeError, match="invalid encrypted identity operation"):
+        serve_worker._validate_decrypted_tool_effect(
+            "identity",
+            {"effect_id": "e", "op": "identity_wipe", "dimension": "trust"},
+        )
+
+
+def test_validate_identity_nudge_effect_rejects_bad_nudge_args():
+    # op is trusted, but the nudge args still cross the model boundary and are
+    # re-checked against the identity_nudge schema (delta must be an integer).
+    with pytest.raises(RuntimeError, match="invalid encrypted effect arguments"):
+        serve_worker._validate_decrypted_tool_effect(
+            "identity",
+            {"effect_id": "e", "op": "identity_nudge",
+             "dimension": "trust", "delta": "lots"},
+        )
 
 
 def test_tool_effect_builder_persists_only_ciphertext_and_uses_stable_id(monkeypatch):
@@ -294,6 +368,59 @@ def test_production_applier_decrypts_tool_effects_with_one_lazy_token(monkeypatc
             "identity",
             {"signature": "private", "effect_id": "eid-2"},
         ),
+    ]
+
+
+def test_production_applier_replays_nudge_and_legacy_patch_through_validation(monkeypatch):
+    """Full-chain replay (Codex C1): decrypt -> _validate_decrypted_tool_effect
+    -> dispatch, for BOTH a new identity_nudge effect (carries `op`) and an old
+    identity_patch effect enqueued before the op key existed (NO `op`). Both
+    must survive the real validator and reach the sink with `identity` logical
+    type; the nudge keeps its op so the sink can route it."""
+    delivered = []
+    monkeypatch.setattr(
+        serve_worker,
+        "build_production_effect_dispatch",
+        lambda user_id, **kwargs: lambda effect_type, payload: delivered.append(
+            (effect_type, payload)
+        ),
+    )
+    monkeypatch.setattr(
+        serve_worker, "_mint_runtime_token", lambda user_id: "minted-token"
+    )
+
+    def fake_decrypt(value, api_key, *, purpose, runtime_token):
+        if value["body_ct"] == "nudge":
+            return b'{"op":"identity_nudge","dimension":"trust","delta":2}'
+        return b'{"patch":{"signature":"kind"}}'  # legacy patch, no op
+
+    monkeypatch.setattr(
+        serve_worker.core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt
+    )
+
+    def fake_apply(user_id, *, dispatch, dispatch_reply_in_transaction=None):
+        for body_ct, effect_id in (("nudge", "eid-nudge"), ("patch", "eid-patch")):
+            dispatch(worker.ENCRYPTED_TOOL_EFFECT_TYPES["identity"], {
+                "effect_envelope": {
+                    "id": worker._tool_effect_item_id(effect_id),
+                    "owner_user_id": "u_replay",
+                    "body_ct": body_ct,
+                },
+                "effect_id": effect_id,
+            })
+        return {"applied": 2, "discarded": 0}
+
+    monkeypatch.setattr(
+        serve_worker.v2_effect_outbox, "apply_pending_effects", fake_apply
+    )
+
+    result = serve_worker._apply_pending_effects_for_user("u_replay")
+
+    assert result == {"applied": 2, "discarded": 0}
+    assert delivered == [
+        ("identity", {"op": "identity_nudge", "dimension": "trust", "delta": 2,
+                      "effect_id": "eid-nudge"}),
+        ("identity", {"patch": {"signature": "kind"}, "effect_id": "eid-patch"}),
     ]
 
 

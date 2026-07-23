@@ -1958,19 +1958,38 @@ def _capability_effect_error(result, code: str) -> Exception:
 
 
 def _sink_identity(user_id: str, payload: dict, *, runtime_token: str) -> None:
-    """`identity` sink. Payload keys: ``{"patch": dict}`` OR top-level
-    ``self_introduction``/``signature`` keys — mirrors
-    `capabilities.identity.patch`'s own `params` contract exactly. No
-    assembly-tier identity writer exists yet, so (per the brief) this calls
-    the capability directly — a thin adapter, not a reimplementation."""
+    """`identity` sink. One ``identity`` effect_type carries two producers,
+    disambiguated by a trusted ``op`` (set from the tool name in
+    worker._write_tool_effect_payload):
+
+      * ``op`` MISSING or ``"identity_patch"`` -> identity_patch capability.
+        A missing op is the legacy shape (payload keys are ``{"patch": dict}``
+        OR top-level ``agent_name``/``self_introduction``/``signature``), which
+        every pre-nudge and in-flight row uses — it MUST keep working.
+      * ``op == "identity_nudge"`` -> identity_nudge capability
+        (``{"dimension", "delta", optional "reason"}``).
+
+    An unknown op is NOT silently applied as a patch: it terminal-discards.
+    The encrypted path already re-validated op in
+    `_validate_decrypted_tool_effect` before reaching here, so this branch is
+    only reachable for a legacy PLAINTEXT row (which predates op entirely) and
+    is defense-in-depth. No assembly-tier identity writer exists yet, so (per
+    the brief) this calls the capability directly — a thin adapter, not a
+    reimplementation."""
     eid = payload["effect_id"]
     if not db.effect_sink_claim(eid):
         return
     try:
+        op = payload.get("op")
+        if op is None:
+            op = "identity_patch"  # legacy shape: no op key was ever written
+        elif op not in ("identity_patch", "identity_nudge"):
+            # Deterministic bad row — never guess it into identity_patch.
+            raise db.EffectTerminalError("identity_operation_invalid")
         store = core_store.get_store(user_id)
-        params = {k: v for k, v in payload.items() if k != "effect_id"}
+        params = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
         result = cap_registry.run_capability(
-            "identity_patch",
+            op,
             store,
             api_key=None,
             runtime_token=runtime_token,
@@ -1982,7 +2001,7 @@ def _sink_identity(user_id: str, payload: dict, *, runtime_token: str) -> None:
             # identity_not_initialized on a fresh-start user) must terminal-discard
             # so the sweeper stops looping and the reply is not wedged; a retryable
             # 5xx keeps the claim-release retry path below.
-            raise _capability_effect_error(result, "identity_patch_failed")
+            raise _capability_effect_error(result, f"{op}_failed")
     except Exception:
         db.effect_sink_release(
             eid
@@ -2420,8 +2439,23 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
                 raise RuntimeError("invalid encrypted memory metadata")
         return
     elif effect_type == "identity":
-        tool_name = "identity_patch"
-        args = {k: v for k, v in payload.items() if k != "effect_id"}
+        # Trusted op set by the producer from the tool name (see
+        # worker._write_tool_effect_payload). A MISSING op is the legacy
+        # identity_patch shape — every pre-nudge enqueued/in-flight row — and
+        # must keep validating as identity_patch. identity_nudge routes to its
+        # own schema. A present-but-unknown op is fail-closed: it raises the
+        # same plain RuntimeError as every other validation failure here (which
+        # the outbox treats as RETRYABLE, so a payload a newer worker would
+        # understand is never terminal-discarded during a deploy overlap —
+        # consistent with capabilities.identity.merge_patch_fields's contract).
+        op = payload.get("op")
+        if op is None or op == "identity_patch":
+            tool_name = "identity_patch"
+        elif op == "identity_nudge":
+            tool_name = "identity_nudge"
+        else:
+            raise RuntimeError("invalid encrypted identity operation")
+        args = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
     elif effect_type == "schedule":
         tool_name = str(payload.get("op") or "")
         if tool_name not in _SCHEDULE_CAPABILITY_OPS:

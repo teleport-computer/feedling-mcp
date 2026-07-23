@@ -15,6 +15,7 @@ from typing import Any
 
 from capabilities import registry as cap_registry
 from capabilities import tool_schema
+from capabilities import identity as cap_identity
 from model_api_runtime.v2 import provenance as _prov
 from provider_types import ToolResult
 
@@ -179,6 +180,24 @@ async def dispatch_tool_calls(
             results_by_id[tc.id] = ToolResult(call_id=tc.id, content=reason)
             write_index += 1
             continue
+        # LIVE-only semantic gate (Codex I1): a rename must carry
+        # self_introduction in the same identity_patch call. The authoritative
+        # server-side gate (card_policy.validate_rename_pairing) only fires at
+        # the SINK, at end-of-turn, AFTER the model already got "queued" and
+        # moved on — so a single-field rename would fail silently with no tool
+        # error the model can self-correct from. Surfacing it here, before the
+        # effect is enqueued, hands the model a fixable error THIS turn. Kept
+        # out of tool_schema.validate_tool_args on purpose: that also gates
+        # replay of already-persisted effects, where re-rejecting a legal-when-
+        # written rename would terminal-discard it. The server gate remains the
+        # final defense; this only front-runs its message on the live path.
+        if tc.name == "identity_patch":
+            pairing_error = cap_identity.rename_pairing_error(tc.args)
+            if pairing_error:
+                results_by_id[tc.id] = ToolResult(
+                    call_id=tc.id, content=f"error: {pairing_error}")
+                write_index += 1
+                continue
         if before_write is not None:
             await before_write()
         enqueued = enqueue_write_effect(tc)  # producer -> PR A outbox (drained at turn end)

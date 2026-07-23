@@ -334,6 +334,64 @@ def test_identity_sink_forwards_enclave_runtime_token(pg_clean, monkeypatch):
     assert _sink_claim_state("job_identity:identity:0") == "completed"
 
 
+# ------------------------------------------------------------------
+# Codex C1: one `identity` effect_type, two ops. A trusted `op` (missing =>
+# legacy identity_patch; "identity_nudge" => nudge) selects the capability;
+# op and effect_id are stripped from the forwarded params; an unknown op is
+# fail-closed (terminal discard), never silently applied as a patch.
+# ------------------------------------------------------------------
+
+def _record_run_capability(seen):
+    def fake_run_capability(action_type, store, *, api_key=None, runtime_token=None, params=None):
+        from capabilities.types import ok
+        seen.append((action_type, store.user_id, params))
+        return ok(data={})
+    return fake_run_capability
+
+
+def test_identity_sink_routes_nudge_op_to_identity_nudge_capability(pg_clean, monkeypatch):
+    seed_user("u_sink_id_nudge")
+    seen = []
+    monkeypatch.setattr(serve_worker.cap_registry, "run_capability", _record_run_capability(seen))
+    dispatch = serve_worker.build_production_effect_dispatch(
+        "u_sink_id_nudge", runtime_token_provider=lambda: "rt")
+    dispatch("identity", {
+        "effect_id": "job_idn:identity:0",
+        "op": "identity_nudge", "dimension": "trust", "delta": 3, "reason": "kept a promise",
+    })
+    assert seen == [(
+        "identity_nudge", "u_sink_id_nudge",
+        {"dimension": "trust", "delta": 3, "reason": "kept a promise"},
+    )]
+    assert _sink_claim_state("job_idn:identity:0") == "completed"
+
+
+def test_identity_sink_without_op_routes_to_identity_patch(pg_clean, monkeypatch):
+    """Legacy/in-flight identity effects carry NO op and must keep routing to
+    identity_patch — the byte-for-byte shape from before the op key existed."""
+    seed_user("u_sink_id_legacy")
+    seen = []
+    monkeypatch.setattr(serve_worker.cap_registry, "run_capability", _record_run_capability(seen))
+    dispatch = serve_worker.build_production_effect_dispatch(
+        "u_sink_id_legacy", runtime_token_provider=lambda: "rt")
+    dispatch("identity", {"effect_id": "job_idl:identity:0", "patch": {"signature": "kind"}})
+    assert seen == [("identity_patch", "u_sink_id_legacy", {"patch": {"signature": "kind"}})]
+    assert _sink_claim_state("job_idl:identity:0") == "completed"
+
+
+def test_identity_sink_unknown_op_terminal_discards_not_patch(pg_clean, monkeypatch):
+    seed_user("u_sink_id_bad")
+    monkeypatch.setattr(
+        serve_worker.cap_registry, "run_capability",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("unknown op must not run a capability")))
+    dispatch = serve_worker.build_production_effect_dispatch(
+        "u_sink_id_bad", runtime_token_provider=lambda: "rt")
+    with pytest.raises(db.EffectTerminalError, match="identity_operation_invalid"):
+        dispatch("identity", {"effect_id": "job_idb:identity:0", "op": "identity_wipe"})
+    # Claim released (not completed) so the terminal-discard bookkeeping runs.
+    assert _sink_claim_state("job_idb:identity:0") is None
+
+
 def test_memory_sink_forwards_enclave_runtime_token(pg_clean, monkeypatch):
     uid = "u_sink_memory_runtime_token"
     seed_user(uid)

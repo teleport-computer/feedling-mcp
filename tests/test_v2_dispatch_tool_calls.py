@@ -349,3 +349,61 @@ def test_mixed_batch_preserves_original_order_and_every_call_id(monkeypatch):
     assert [r.call_id for r in results] == ["a", "b", "c", "d"]
     assert all(isinstance(r, ToolResult) for r in results)
     assert [tc.id for tc in enqueued] == ["a"]
+
+
+# ------------------------------------------------------------------
+# Codex I1: a rename (agent_name) must carry self_introduction in the same
+# identity_patch call. The check is LIVE-only + pre-enqueue here — it hands the
+# model a fixable tool error THIS turn instead of the write silently failing at
+# the sink at end-of-turn. It must NOT enqueue the effect. A paired rename, or
+# any non-rename patch, still enqueues normally.
+# ------------------------------------------------------------------
+
+def _ok_run_capability(action_type, store, *, api_key, runtime_token, params):
+    return _FakeResult(True, {"body": "ok"})
+
+
+def test_identity_rename_without_self_introduction_errors_and_is_not_enqueued(monkeypatch):
+    tool_calls = [ToolCall(id="r1", name="identity_patch", args={"agent_name": "Ori"})]
+    results, enqueued = _run(
+        tool_calls, turn_authorization=True,
+        run_capability=_ok_run_capability, monkeypatch=monkeypatch)
+
+    assert enqueued == []
+    assert results[0].call_id == "r1"
+    assert results[0].content == "error: rename_requires_self_introduction"
+
+
+def test_identity_rename_inside_patch_object_without_intro_is_caught(monkeypatch):
+    # The rename may arrive inside the free-form `patch` object, not top-level;
+    # the check merges both sides (merge_patch_fields) before judging.
+    tool_calls = [ToolCall(id="r2", name="identity_patch", args={"patch": {"agent_name": "Ori"}})]
+    results, enqueued = _run(
+        tool_calls, turn_authorization=True,
+        run_capability=_ok_run_capability, monkeypatch=monkeypatch)
+
+    assert enqueued == []
+    assert results[0].content == "error: rename_requires_self_introduction"
+
+
+def test_identity_paired_rename_is_enqueued(monkeypatch):
+    tool_calls = [ToolCall(id="r3", name="identity_patch", args={
+        "agent_name": "Ori", "self_introduction": "I'm your co-pilot.",
+    })]
+    results, enqueued = _run(
+        tool_calls, turn_authorization=True,
+        run_capability=_ok_run_capability, monkeypatch=monkeypatch)
+
+    assert [tc.id for tc in enqueued] == ["r3"]
+    assert results[0].content == "queued: identity_patch"
+
+
+def test_identity_non_rename_patch_is_enqueued(monkeypatch):
+    # A patch that touches no agent_name is not a rename — no pairing needed.
+    tool_calls = [ToolCall(id="r4", name="identity_patch", args={"self_introduction": "hi"})]
+    results, enqueued = _run(
+        tool_calls, turn_authorization=True,
+        run_capability=_ok_run_capability, monkeypatch=monkeypatch)
+
+    assert [tc.id for tc in enqueued] == ["r4"]
+    assert results[0].content == "queued: identity_patch"

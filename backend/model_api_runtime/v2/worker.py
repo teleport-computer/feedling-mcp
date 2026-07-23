@@ -2554,7 +2554,18 @@ def _write_tool_effect_payload(tc) -> tuple[str, dict]:
     if tc.name == "identity_patch":
         # Preserve every advertised schema form.  Collapsing to only ``patch``
         # silently discarded top-level self_introduction/signature calls.
+        # Deliberately NO ``op`` key: this keeps the enqueued payload
+        # byte-for-byte identical to every pre-nudge (and in-flight) row, so an
+        # old sink overlapping a deploy still reads it exactly as before, and
+        # the new sink/validator treat a MISSING op as identity_patch.
         return "identity", dict(tc.args)
+    if tc.name == "identity_nudge":
+        # Same ``identity`` effect_type/sink as identity_patch, disambiguated by
+        # a trusted ``op`` taken from the tool NAME (mirrors schedule/workspace):
+        # ``{**tc.args, "op": tc.name}`` puts op LAST so a model that smuggled an
+        # "op" into args cannot override which capability the sink runs. The sink
+        # and the decrypted-effect validator branch on this op.
+        return "identity", {**tc.args, "op": tc.name}
     if tc.name in ("schedule_wake", "cancel_wake"):
         # Keep the trusted operation authoritative even if a future dispatcher
         # accidentally weakens top-level unknown-field rejection.

@@ -358,9 +358,16 @@ def _create_identity_action_payload(
     ``agent_bootstrap``.
 
     A create is a fresh insert with no prior blob to compare against, so it uses
-    ``_save_identity`` (not the CAS write): there is no ``existing`` snapshot to
-    thread through. It runs inside the same per-user identity_mutation_lock as
-    the profile_patch caller, so two writes in THIS worker still serialize.
+    the ATOMIC create-if-absent ``_save_identity_create_if_absent`` (Codex C2),
+    NOT the plain ``_save_identity``. identity_mutation_lock only serializes
+    writers inside THIS gunicorn worker process; two DIFFERENT worker processes
+    both bootstrapping the same fresh user would each run the plain
+    INSERT-ON-CONFLICT-DO-UPDATE and the second would clobber the first (a lost
+    update where BOTH report success). The atomic create makes exactly one
+    caller win the insert; a loser raises ``IdentityWriteConflict`` so
+    ``_with_identity_mutation_lock_and_retry`` re-reads the now-existing card and
+    merges this patch onto it via the normal CAS UPDATE path. The audit/effect
+    below run ONLY for the winner — the loser never reaches them.
     """
     from identity import card_policy
     ok, err = card_policy.validate_full_identity_card(payload)
@@ -395,7 +402,14 @@ def _create_identity_action_payload(
     }
     if envelope.get("K_enclave"):
         identity["K_enclave"] = envelope["K_enclave"]
-    identity_service._save_identity(store, identity)
+    # Atomic create-if-absent, NOT a plain overwrite. Losing the insert race
+    # (another worker already bootstrapped this user, OR a genuine DB error)
+    # raises IdentityWriteConflict so the mutation retry loop re-reads and takes
+    # the CAS UPDATE path — instead of clobbering the winner and reporting a
+    # false success, or masking a DB failure as a 200 (Codex C2). Audit/effect
+    # below run only once the insert has actually won.
+    if not identity_service._save_identity_create_if_absent(store, identity):
+        raise identity_service.IdentityWriteConflict()
     boot_gates._log_bootstrap_event(store, event_type, success=True)
     change = identity_service._append_identity_change(store, audit)
     return identity, change, ""
@@ -656,9 +670,11 @@ def _identity_profile_patch(
             "reason": reason,
         }
         if bootstrap:
-            # No existing card to CAS against — mint one (see
-            # _create_identity_action_payload). Uses _save_identity, not the CAS
-            # write, so it never raises IdentityWriteConflict.
+            # No existing card yet — atomically mint one (see
+            # _create_identity_action_payload). It uses the create-if-absent
+            # write, so losing the fresh-user insert race raises
+            # IdentityWriteConflict and _with_identity_mutation_lock_and_retry
+            # retries down the UPDATE path against the winner's card.
             identity, change, err = _create_identity_action_payload(
                 store, payload, audit=audit,
                 event_type="identity_action_bootstrap")

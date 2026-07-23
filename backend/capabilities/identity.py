@@ -54,6 +54,27 @@ def merge_patch_fields(params) -> dict:
     return {**top_level, **explicit}
 
 
+def rename_pairing_error(params) -> str | None:
+    """LIVE-model-call-only pre-enqueue check: a rename (a non-empty
+    ``agent_name``) must carry ``self_introduction`` in the SAME call. Returns
+    an error code string the model can read and self-correct from, or None.
+
+    Deliberately NOT part of ``merge_patch_fields`` / ``patch`` /
+    ``tool_schema.validate_tool_args``: those also gate REPLAY of already-
+    persisted effects, where re-rejecting a rename that was legal when written
+    would turn it into a terminal discard (see ``merge_patch_fields``'s
+    docstring). This runs ONLY on the live model-call path in
+    ``v2.executor.dispatch_tool_calls`` — before the effect is enqueued — so the
+    model gets a tool error it can fix THIS turn instead of the write silently
+    failing at the sink at end-of-turn. The server-side gate in
+    ``identity/actions.py`` (``card_policy.validate_rename_pairing``) stays as
+    the final, authoritative defense; this only front-runs its message."""
+    from identity import card_policy
+    merged = merge_patch_fields(params or {})
+    ok_, err_ = card_policy.validate_rename_pairing(merged)
+    return None if ok_ else err_
+
+
 def patch(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
     params = params or {}
     raw_patch = params.get("patch")
