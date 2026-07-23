@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- **The Runtime V2 `identity_nudge` tool now actually applies personality-dimension
+  changes.** The tool was exposed in the model-visible catalog but had no effect
+  wiring, so any call failed the turn. Its full produce → encrypt → replay-validate
+  → sink path is now implemented (dimension nudges land on the identity card), with
+  unknown effect operations failing closed. No request/response shape change.
+
 - **`web_fetch` now returns the beginning of a large page instead of failing.**
   A response over the raw-body cap was discarded whole, so the tool errored on
   essentially every real site (Wikipedia is 360 KB, a weather page 86 KB, the
@@ -319,7 +325,7 @@ change must not be interpreted as an API guarantee.
   workspace writes can commit concurrently in conflict-free waves, while
   same/ancestor/descendant paths and external mutations remain ordered.
 
-- The model-visible Runtime V2 catalog now contains 23 built-in tools: 21
+- The model-visible Runtime V2 catalog now contains 24 built-in tools: 22
   platform tools plus `task` and `reply`. `task` runs bounded read-only child
   loops with isolated transcripts and can parallelize independent work without
   exposing reply, recursive-task, MCP mutation, platform-effect, or
