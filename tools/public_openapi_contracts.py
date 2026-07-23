@@ -702,6 +702,88 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "additionalProperties": True,
     },
+    "ModelApiUsageMetricAmount": {
+        "type": "object",
+        "description": "One line item within a metric's `amounts` breakdown (e.g. one currency balance among several).",
+        "required": ["amount", "unit"],
+        "additionalProperties": False,
+        "properties": {
+            "amount": {
+                "oneOf": [{"type": "number"}, {"type": "string"}],
+                "description": "Provider-native numeric value. Kept as a string when the provider returns it that way (e.g. DeepSeek's \"25.06\") to avoid float rounding.",
+            },
+            "unit": {"type": "string", "description": "Currency or unit code as reported by the provider (e.g. \"USD\", \"CNY\", or a provider-defined quota unit)."},
+        },
+    },
+    "ModelApiUsageMetric": {
+        "type": "object",
+        "description": "One usage metric. `status` is always present; the remaining fields are populated only when relevant, and vary by provider/adapter.",
+        "required": ["status"],
+        "additionalProperties": False,
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["ok", "unsupported", "failed"],
+                "description": "`unsupported` — this provider/adapter never reports this metric. `failed` — the provider was queried but the call failed; see `reason`.",
+            },
+            "amount": {
+                "oneOf": [{"type": "number"}, {"type": "string"}],
+                "description": "Single scalar value, used when the metric is not split into multiple line items.",
+            },
+            "amounts": {
+                "type": "array",
+                "items": {"$ref": "#/components/schemas/ModelApiUsageMetricAmount"},
+                "description": "Multi-currency/multi-line breakdown, used instead of `amount` when the provider reports more than one line (e.g. DeepSeek balance per currency).",
+            },
+            "unit": {"type": "string", "description": "Currency or unit code, when `amount` (not `amounts`) is used."},
+            "scope": {"type": "string", "description": "What the figure is scoped to, e.g. \"account\" or \"api_key\", when the provider distinguishes them."},
+            "timezone": {"type": "string", "description": "Timezone the provider uses to bucket this figure, e.g. \"UTC\" for usage_today/usage_month."},
+            "reason": {"type": "string", "description": "Machine-readable failure slug when status is \"failed\" (e.g. usage_timeout, usage_unreachable, usage_bad_response, usage_http_429)."},
+        },
+    },
+    "ModelApiUsageResponse": {
+        "type": "object",
+        "description": (
+            "Live provider balance/usage snapshot — queried from the provider on every call, never "
+            "cached. Field support depends entirely on the configured provider/adapter: DeepSeek and "
+            "OpenRouter are queried through their official APIs, and an openai_compatible relay/中转站 "
+            "is queried through its dashboard-style endpoints when reachable. Metrics the adapter does "
+            "not support report status \"unsupported\" rather than being omitted."
+        ),
+        "required": ["provider", "adapter", "status", "as_of", "metrics"],
+        "additionalProperties": False,
+        "properties": {
+            "provider": {"type": "string", "description": "Normalized provider name from the caller's active model_api route (e.g. \"deepseek\", \"openrouter\", \"openai_compatible\")."},
+            "adapter": {
+                "type": "string",
+                "enum": ["deepseek", "openrouter", "relay", "unsupported"],
+                "description": "Which billing adapter actually served this response. \"unsupported\" means this provider/base_url combination has no usage adapter — every metric will be \"unsupported\" and `error` explains why.",
+            },
+            "status": {
+                "type": "string",
+                "enum": ["ok", "partial", "error"],
+                "description": "\"ok\" — every queried metric succeeded. \"partial\" — some metrics succeeded and some failed. \"error\" — every queried metric failed (or the adapter is unsupported); see `error`.",
+            },
+            "as_of": {"type": "string", "format": "date-time", "description": "ISO 8601 UTC timestamp of this query, not a cache time — every call re-queries the provider."},
+            "metrics": {
+                "type": "object",
+                "description": "Always all five fixed keys, regardless of provider support.",
+                "required": ["balance", "remaining", "usage_total", "usage_today", "usage_month"],
+                "additionalProperties": False,
+                "properties": {
+                    "balance": {"$ref": "#/components/schemas/ModelApiUsageMetric"},
+                    "remaining": {"$ref": "#/components/schemas/ModelApiUsageMetric"},
+                    "usage_total": {"$ref": "#/components/schemas/ModelApiUsageMetric"},
+                    "usage_today": {"$ref": "#/components/schemas/ModelApiUsageMetric"},
+                    "usage_month": {"$ref": "#/components/schemas/ModelApiUsageMetric"},
+                },
+            },
+            "error": {
+                "type": "string",
+                "description": "Top-level failure slug, present when status is \"error\" (e.g. usage_unsupported_provider, usage_blocked_url, usage_timeout) or when every attempted metric failed for the same reason.",
+            },
+        },
+    },
     "ChatMessagePointer": {
         "type": "object",
         "required": ["id", "ts"],
@@ -1408,6 +1490,16 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope). Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/chat/verify_loop"): "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded.",
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
+    ("get", "/v1/model_api/usage"): (
+        "Query the caller's active model_api provider for balance/usage, live on every call — "
+        "never cached and never stored. Uses the same decrypted provider key as chat, decrypted "
+        "server-side just for this request. Which of the five fixed metrics (balance, remaining, "
+        "usage_total, usage_today, usage_month) actually populate depends on the provider/adapter: "
+        "DeepSeek and OpenRouter are queried through their official APIs; an openai_compatible "
+        "relay/中转站 is queried through its dashboard-style endpoints when reachable, and is "
+        "skipped with error=usage_blocked_url if it resolves to a private/loopback address. "
+        "Metrics the adapter cannot report are status=\"unsupported\", not omitted."
+    ),
     ("get", "/v1/chat/history"): "Read encrypted chat history. Use oldest_seq as before_seq for lossless older paging and latest_seq as after_seq for lossless forward paging; timestamp watermarks remain for compatibility.",
     ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",
     ("post", "/v1/memory/fetch"): "Fetch full records for selected memory IDs. Sensitive fetch behavior is not part of the current public contract.",
@@ -1688,6 +1780,21 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
             "description": "Memory repair job queued for asynchronous processing.",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
         }
+    },
+    ("get", "/v1/model_api/usage"): {
+        "200": {
+            "description": "Live provider balance/usage snapshot. HTTP 200 does not imply every metric succeeded — check top-level `status` and each metric's own `status`.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ModelApiUsageResponse"}}},
+        },
+        "400": {
+            "description": (
+                "No usable model_api route to query: model_api_not_configured (no active route), "
+                "model_api_not_tested (route saved but never passed a connection test), "
+                "model_api_key_envelope_missing, model_api_key_decrypt_failed, or "
+                "model_api_config_invalid."
+            ),
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
     },
     ("post", "/v1/proactive/decisions/{decision_id}/review"): {
         "200": {

@@ -168,7 +168,8 @@ def test_public_operation_and_parameter_inventory(
     # 146 since the two notify-relay endpoints (register/push, both with bodies);
     # 148 since GET/POST /v1/web/settings (the web-search toggle, Lark t100535) —
     # only the POST carries a body, hence 67 -> 68.
-    assert len(operations) == 148
+    # 149 since GET /v1/model_api/usage (provider balance/usage snapshot).
+    assert len(operations) == 149
     assert sum("requestBody" in operation for operation in operations.values()) == 68
 
     query_operations = {
