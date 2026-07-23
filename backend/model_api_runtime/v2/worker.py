@@ -497,6 +497,7 @@ _PRIVATE_READ_TOOLS = frozenset(
         "memory_index",
         "memory_search",
         "memory_fetch",
+        cap_tool_schema.PROVIDER_USAGE_TOOL,
     }
 )
 # Static perception grounding is allowed to coexist with first-round web/MCP/task
@@ -4667,6 +4668,13 @@ async def _run_wake(
             search_halted=wake_search_halted,
             fetch_halted=wake_fetch_halted,
         )
+        # provider_usage is chat-lane only (Task 5 design decision): the
+        # proactive companion never has a user-asked-a-question moment to
+        # answer, so it must never be offered here — unconditionally, not
+        # gated by the kill switch (that gate is chat-lane's Task 6 concern).
+        wake_disabled_tool_names = wake_disabled_web_tool_names | {
+            cap_tool_schema.PROVIDER_USAGE_TOOL
+        }
 
         dispatch_task_batch = _make_task_batch_dispatcher(
             disabled_web_tool_names=wake_disabled_web_tool_names,
@@ -5138,7 +5146,7 @@ async def _run_wake(
             await v2_tool_loop.run_tool_loop(
                 provider_config=provider_config,
                 build_messages=build_messages,
-                disabled_tool_names=wake_disabled_web_tool_names,
+                disabled_tool_names=wake_disabled_tool_names,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
                 fold_new_messages=fold_new_messages,
