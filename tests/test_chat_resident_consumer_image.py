@@ -182,7 +182,7 @@ def test_cli_template_includes_image_paths():
     image_paths = ["/tmp/feedling_chat_images/test-img-01_0.jpg"]
 
     with patch.object(crc, "AGENT_CLI_CMD", fake_cmd):
-        argv = crc._render_cli_template(
+        argv, _ = crc._render_cli_template(
             message="describe this image",
             sid="sid-001",
             image_paths=image_paths,
@@ -205,7 +205,7 @@ def test_cli_template_includes_all_image_paths():
     ]
 
     with patch.object(crc, "AGENT_CLI_CMD", fake_cmd):
-        argv = crc._render_cli_template(
+        argv, _ = crc._render_cli_template(
             message="two images",
             sid="",
             image_paths=image_paths,
@@ -221,7 +221,7 @@ def test_cli_template_empty_image_path_when_no_images():
     fake_cmd = "agent {message} --img {image_path}"
 
     with patch.object(crc, "AGENT_CLI_CMD", fake_cmd):
-        argv = crc._render_cli_template(
+        argv, _ = crc._render_cli_template(
             message="hello",
             sid="",
             image_paths=[],

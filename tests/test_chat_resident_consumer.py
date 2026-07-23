@@ -1810,7 +1810,7 @@ def test_prepare_cli_replaces_fixed_session_id_after_rotation(monkeypatch, tmp_p
     crc._save_agent_session_id("feedling-old")
     crc._record_agent_session_turn("feedling-old", sent_bytes=100, received_bytes=100)
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
     sid = crc._cli_flag_value(cmd, "--session-id")
 
     assert sid.startswith("feedling-io-")
@@ -1827,7 +1827,7 @@ def test_prepare_hermes_cli_strips_continue_and_injects_resume(monkeypatch):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
 
     assert "--continue" not in cmd
     assert cmd[:4] == ["hermes", "--resume", "sess_123", "chat"]
@@ -1843,7 +1843,7 @@ def test_prepare_hermes_cli_injects_resume_before_chat_with_top_level_flags(monk
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
 
     assert cmd[:5] == ["hermes", "--resume", "sess_123", "--yolo", "chat"]
     assert "hello" in cmd
@@ -1858,7 +1858,7 @@ def test_prepare_hermes_cli_strips_unsupported_output_mode(monkeypatch):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
 
     assert "--output-mode" not in cmd
     assert "json" not in cmd
@@ -1875,7 +1875,7 @@ def test_prepare_hermes_cli_first_turn_removes_continue(monkeypatch):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
 
     assert "--continue" not in cmd
     assert "--resume" not in cmd
@@ -1973,14 +1973,15 @@ def test_prepare_claude_cli_first_turn_forces_print_json_and_strips_continue(mon
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, stdin_msg = crc._prepare_cli_command("hello")
 
     assert "--continue" not in cmd
     assert "--resume" not in cmd
     assert "--print" in cmd
     assert "--output-format" in cmd
     assert "json" in cmd
-    assert "hello" in cmd
+    assert "hello" not in cmd
+    assert stdin_msg == "hello"
 
 
 def test_prepare_claude_cli_injects_stored_resume(monkeypatch):
@@ -1998,12 +1999,13 @@ def test_prepare_claude_cli_injects_stored_resume(monkeypatch):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: sid)
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, stdin_msg = crc._prepare_cli_command("hello")
 
     assert cmd[:3] == ["claude", "--resume", sid]
     assert "--output-format" in cmd
     assert "json" in cmd
-    assert "hello" in cmd
+    assert "hello" not in cmd
+    assert stdin_msg == "hello"
 
 
 def test_warn_if_hermes_cli_may_drift_logs_profile_and_turns(monkeypatch, caplog):
@@ -2184,7 +2186,7 @@ def test_prepare_cli_preserves_message_with_quotes(monkeypatch):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command('say "hello" now')
+    cmd, _ = crc._prepare_cli_command('say "hello" now')
 
     assert cmd == ["mycli", "ask", 'say "hello" now']
 
@@ -2195,7 +2197,7 @@ def test_prepare_cli_appends_image_path_when_template_has_no_image_slot(monkeypa
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("look at this", image_paths=[image_path])
+    cmd, _ = crc._prepare_cli_command("look at this", image_paths=[image_path])
 
     assert cmd[:2] == ["mycli", "ask"]
     assert "look at this" in cmd[2]
@@ -2225,7 +2227,7 @@ def test_prepare_cli_uses_image_path_template(monkeypatch, tmp_path):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("look at this", image_paths=[image_path])
+    cmd, _ = crc._prepare_cli_command("look at this", image_paths=[image_path])
 
     assert cmd == ["mycli", "ask", "--image", image_path, "look at this"]
 
@@ -2243,7 +2245,7 @@ def test_prepare_cli_injects_codex_image_flags(monkeypatch, tmp_path):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("look", image_paths=[img1, img2])
+    cmd, stdin_msg = crc._prepare_cli_command("look", image_paths=[img1, img2])
 
     # each image attached via the =-bound --image form, so clap's variadic
     # --image cannot swallow the positional prompt (see the regression test below)
@@ -2253,7 +2255,9 @@ def test_prepare_cli_injects_codex_image_flags(monkeypatch, tmp_path):
     assert cmd.index("exec") < cmd.index(f"--image={img1}")
     # the message stays clean — no misleading "Decrypted image file(s)" path prose
     assert "Decrypted image file(s)" not in " ".join(cmd)
-    assert "look" in cmd
+    # codex delivers the prompt via stdin, not argv
+    assert "look" not in cmd
+    assert stdin_msg == "look"
 
 
 def test_prepare_cli_codex_image_flags_do_not_swallow_prompt(monkeypatch, tmp_path):
@@ -2266,9 +2270,11 @@ def test_prepare_cli_codex_image_flags_do_not_swallow_prompt(monkeypatch, tmp_pa
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello there", image_paths=[img])
+    cmd, stdin_msg = crc._prepare_cli_command("hello there", image_paths=[img])
 
-    assert cmd == ["codex", "exec", f"--image={img}", "hello there"]
+    assert cmd == ["codex", "exec", f"--image={img}"]
+    assert "hello there" not in cmd
+    assert stdin_msg == "hello there"
     # never a bare `-i` whose value the prompt could be mistaken for
     assert "-i" not in cmd
 
@@ -2284,9 +2290,11 @@ def test_prepare_cli_codex_respects_explicit_image_flag(monkeypatch, tmp_path):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("look", image_paths=[img])
+    cmd, stdin_msg = crc._prepare_cli_command("look", image_paths=[img])
 
-    assert cmd == ["codex", "exec", "-i", img, "--json", "look"]
+    assert cmd == ["codex", "exec", "-i", img, "--json"]
+    assert "look" not in cmd
+    assert stdin_msg == "look"
 
 
 def test_cli_nonzero_exit_fails_even_with_stdout(monkeypatch):
@@ -2296,7 +2304,7 @@ def test_cli_nonzero_exit_fails_even_with_stdout(monkeypatch):
         stderr = "bad command"
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError, match="cli agent exited 2"):
@@ -2313,7 +2321,7 @@ def test_cli_failure_surfaces_claude_json_error_from_stdout(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p {message}')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["claude", "-p", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["claude", "-p", message], None))
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError) as ei:
@@ -2335,7 +2343,7 @@ def test_cli_failure_surfaces_codex_stream_error_from_stdout(monkeypatch):
         stderr = "Reading additional input from stdin..."
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec --json {message}')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["codex", "exec", "--json", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["codex", "exec", "--json", message], None))
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError) as ei:
@@ -5197,7 +5205,7 @@ def test_cli_tool_only_output_preserves_tool_calls(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     result = crc.call_agent_cli("hi")
@@ -5838,8 +5846,8 @@ def test_call_agent_cli_pi_folds_thinking_and_prefers_command_sid(monkeypatch, t
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id} {message}")
     monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
     monkeypatch.setattr(crc, "_prepare_cli_command",
-                        lambda message, image_paths=None, lane="background": ["pi", "--mode", "json",
-                                                           "--session-id", "sid-cmd-1", message])
+                        lambda message, image_paths=None, lane="background": (["pi", "--mode", "json",
+                                                           "--session-id", "sid-cmd-1", message], None))
     monkeypatch.setattr(crc.subprocess, "run",
                         lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout=raw, stderr=""))
     crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
@@ -5874,8 +5882,8 @@ def test_call_agent_cli_pi_error_turn_does_not_echo_user_message(monkeypatch, tm
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id} {message}")
     monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
     monkeypatch.setattr(crc, "_prepare_cli_command",
-                        lambda message, image_paths=None, lane="background": ["pi", "--mode", "json",
-                                                           "--session-id", "smoke-1", message])
+                        lambda message, image_paths=None, lane="background": (["pi", "--mode", "json",
+                                                           "--session-id", "smoke-1", message], None))
     monkeypatch.setattr(crc.subprocess, "run",
                         lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout=raw, stderr=""))
     crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
@@ -5917,14 +5925,14 @@ def test_prepare_pi_command_generates_session_id_and_keeps_mode_json(monkeypatch
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
     sid = crc._cli_flag_value(cmd, "--session-id")
     assert sid                                   # 空 sid → 现场生成并绑定
     assert sid == crc._load_agent_session_id()   # 已持久化，下一轮复用
     assert cmd[:3] == ["pi", "--mode", "json"]
     assert "hello" not in cmd                    # 消息走 stdin，不进 argv
 
-    cmd2 = crc._prepare_cli_command("second")
+    cmd2, _ = crc._prepare_cli_command("second")
     assert crc._cli_flag_value(cmd2, "--session-id") == sid   # 续接同一会话
 
 
@@ -5934,7 +5942,7 @@ def test_prepare_pi_command_strips_continue_and_adds_mode(monkeypatch, tmp_path)
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
     assert "-c" not in cmd and "--continue" not in cmd   # 续接只靠 --session-id
     assert "--mode" in cmd and crc._cli_flag_value(cmd, "--mode") == "json"
     assert "hello" not in cmd                            # 消息走 stdin
@@ -5948,11 +5956,11 @@ def test_prepare_pi_command_generates_session_when_override_lacks_placeholder(mo
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
     sid = crc._cli_flag_value(cmd, "--session-id")
     assert sid                                    # 现场生成注入
     assert sid == crc._load_agent_session_id()    # 已持久化
-    cmd2 = crc._prepare_cli_command("second")
+    cmd2, _ = crc._prepare_cli_command("second")
     assert crc._cli_flag_value(cmd2, "--session-id") == sid   # 续接同一会话
 
 
@@ -5968,7 +5976,7 @@ def test_prepare_cli_injects_pi_image_refs(monkeypatch, tmp_path):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sid-1")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("look", image_paths=[img1, img2])
+    cmd, _ = crc._prepare_cli_command("look", image_paths=[img1, img2])
     assert f"@{img1}" in cmd and f"@{img2}" in cmd
     # @refs append to the END of argv (message rides STDIN, not argv)
     assert cmd[-2:] == [f"@{img1}", f"@{img2}"]
@@ -5982,7 +5990,7 @@ def test_prepare_cli_pi_image_ref_appends_and_message_via_stdin(monkeypatch, tmp
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sid-1")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello there", image_paths=[img])
+    cmd, _ = crc._prepare_cli_command("hello there", image_paths=[img])
     # @ref is the trailing positional; the message is NOT in argv (goes via stdin)
     assert cmd[-1] == f"@{img}"
     assert "hello there" not in cmd
@@ -5997,9 +6005,136 @@ def test_prepare_cli_pi_respects_operator_image_slot(monkeypatch, tmp_path):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sid-1")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("look", image_paths=[img])
+    cmd, _ = crc._prepare_cli_command("look", image_paths=[img])
     assert img in cmd                 # template's own slot filled with the path
     assert f"@{img}" not in cmd       # no @-injection on top
+
+
+# ---------------------------------------------------------------------------
+# Windows cmd.exe multi-line truncation fix: claude/codex read the prompt on
+# STDIN so a multi-line prompt never rides the argv command line. On Windows npm
+# installs claude as claude.CMD; subprocess routes .cmd through cmd.exe, which
+# truncates an argv token at the first newline — dropping everything after the
+# time-anchor header. Routing to stdin sidesteps cmd.exe entirely.
+# ---------------------------------------------------------------------------
+
+def test_prepare_claude_feeds_message_via_stdin_not_argv(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd, stdin_msg = crc._prepare_cli_command("hello world")
+
+    assert stdin_msg == "hello world"          # message rides stdin
+    assert "hello world" not in cmd            # NEVER in argv
+    assert "-p" in cmd                          # print flag kept → claude reads stdin
+
+
+def test_prepare_codex_feeds_message_via_stdin_not_argv(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec --json {message}")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd, stdin_msg = crc._prepare_cli_command("hello world")
+
+    assert stdin_msg == "hello world"
+    assert "hello world" not in cmd
+    assert cmd[:3] == ["codex", "exec", "--json"]   # exec/--json kept
+
+
+@pytest.mark.parametrize("template", ['claude -p "{message}"', "codex exec {message}"])
+def test_prepare_multiline_message_never_rides_argv(monkeypatch, template):
+    # The exact Windows failure mode: a multi-line prompt as an argv token is
+    # truncated at the first newline by cmd.exe. Routing to stdin means NO argv
+    # token ever contains a newline.
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", template)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    msg = "[10:30]\n\nReply in English.\n\nhello world"
+    cmd, stdin_msg = crc._prepare_cli_command(msg)
+
+    assert stdin_msg == msg
+    assert not any("\n" in token for token in cmd)
+
+
+def test_prepare_codex_images_ride_argv_message_rides_stdin(monkeypatch, tmp_path):
+    # Image flags are separate argv tokens (never the message) → they stay in
+    # argv; only the message is lifted to stdin.
+    img = str(tmp_path / "a.jpg")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec {message}")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd, stdin_msg = crc._prepare_cli_command("look here", image_paths=[img])
+
+    assert cmd == ["codex", "exec", f"--image={img}"]
+    assert stdin_msg == "look here"
+
+
+def test_prepare_claude_without_message_placeholder_routes_to_stdin(monkeypatch):
+    # A claude template that omits {message} is now valid: the message still
+    # reaches the agent via stdin (this used to be a hard error).
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "claude -p")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    assert crc._driver_reads_stdin(["claude", "-p"]) is True
+    cmd, stdin_msg = crc._prepare_cli_command("hello")
+
+    assert stdin_msg == "hello"
+    assert "hello" not in cmd
+
+
+def test_call_agent_cli_hermes_without_message_placeholder_still_raises(monkeypatch):
+    # hermes is NOT a stdin driver here, so a template without {message} genuinely
+    # cannot deliver the message → still fail loud (regression guard for the
+    # relaxed validation).
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "hermes chat -q")
+    monkeypatch.setattr(crc, "_agent_cli_cwd", lambda: None)
+    monkeypatch.setattr(crc, "_agent_cli_cwd_error", "")
+    with pytest.raises(RuntimeError, match="missing the .message. placeholder"):
+        crc.call_agent_cli("hello")
+
+
+def test_prepare_embedded_message_token_stays_in_argv(monkeypatch):
+    # A message embedded in a larger literal token (e.g. Answer:{message}) is
+    # intentional argv wrapping — keep it in argv, do NOT route to stdin.
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec Answer:{message}")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd, stdin_msg = crc._prepare_cli_command("hello")
+
+    assert "Answer:hello" in cmd
+    assert stdin_msg is None
+
+
+def test_call_agent_cli_claude_wires_message_to_stdin(monkeypatch):
+    # End-to-end through call_agent_cli: the stripped message reaches
+    # subprocess.run's stdin (input=), never the argv.
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_agent_cli_cwd", lambda: None)
+    monkeypatch.setattr(crc, "_agent_cli_cwd_error", "")
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(
+            cmd, 0,
+            stdout='{"type":"result","is_error":false,"result":"OK"}', stderr="",
+        )
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+
+    msg = "[10:30]\n\nReply in English.\n\nhello world"
+    crc.call_agent_cli(msg)
+
+    assert captured["input"] == msg                 # message delivered via stdin
+    assert not any("\n" in t for t in captured["cmd"])  # no multi-line argv token
 
 
 def test_call_agent_cli_pi_feeds_message_via_stdin_not_argv(monkeypatch, tmp_path):
@@ -6537,7 +6672,7 @@ def test_resident_claude_auto_keeps_resume_and_skips_transcript(monkeypatch):
     out = crc._foreground_agent_message("hello", current_ts=time.time())
     assert out == "hello"                       # bare message, no transcript
 
-    cmd = crc._prepare_cli_command(out)
+    cmd, _ = crc._prepare_cli_command(out)
     assert cmd[:3] == ["claude", "--resume", sid]
 
 
@@ -7216,7 +7351,7 @@ def test_claude_resume_skipped_when_transcript_was_injected(monkeypatch):
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
     injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n---\nhello"
-    cmd = crc._prepare_cli_command(injected)
+    cmd, _ = crc._prepare_cli_command(injected)
 
     assert "--resume" not in cmd
     assert "sess_123" not in cmd
@@ -7233,7 +7368,7 @@ def test_claude_resume_kept_when_no_transcript_injected(monkeypatch):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello")  # no injected-transcript header
+    cmd, _ = crc._prepare_cli_command("hello")  # no injected-transcript header
 
     assert cmd[:3] == ["claude", "--resume", "sess_123"]
 
@@ -7549,7 +7684,7 @@ def _generic_cli_env(monkeypatch, *, returncode=0, stdout="ok", stderr=""):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
     monkeypatch.setattr(
         crc, "_prepare_cli_command",
-        lambda message, image_paths=None, lane="background": ["mycli", "ask", message],
+        lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None),
     )
     captured = {}
 
@@ -7757,7 +7892,7 @@ def test_prepare_cli_command_drops_resume_after_cwd_rotation(monkeypatch, tmp_pa
     # Positive control: with the cwd unchanged the sid IS injected — so the
     # empty assertion below can only come from the rotation, not from the
     # injection path being inert.
-    control = crc._prepare_cli_command("hello")
+    control, _ = crc._prepare_cli_command("hello")
     assert "--resume" in control and "sess_old_cwd" in control
 
     _reset_cli_cwd_cache(monkeypatch)
@@ -7765,7 +7900,7 @@ def test_prepare_cli_command_drops_resume_after_cwd_rotation(monkeypatch, tmp_pa
     crc._agent_session_id_cache.clear()
     crc._agent_session_meta_cache.clear()
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
 
     assert "--resume" not in cmd
     assert "sess_old_cwd" not in cmd
@@ -7894,7 +8029,7 @@ def test_prepare_cli_command_heals_incident_windows_mcp_path(monkeypatch):
     # Bypass PATH resolution of the 'claude' binary — CI has no claude installed,
     # and this test is about the --mcp-config heal, not executable resolution.
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
-    cmd = crc._prepare_cli_command("hi", lane="chat")
+    cmd, _ = crc._prepare_cli_command("hi", lane="chat")
     assert "--mcp-config" not in cmd
     assert not any("feedling_user_mcp.json" in t for t in cmd)
     assert os.path.basename(cmd[0]) == "claude"

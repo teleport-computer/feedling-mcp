@@ -52,9 +52,11 @@ _CHILD = textwrap.dedent(
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
 
-    turn1 = m._prepare_cli_command("hello world")[1:]   # drop resolved abspath
+    cmd1, stdin1 = m._prepare_cli_command("hello world")
+    turn1 = cmd1[1:]   # drop resolved abspath
     m._save_agent_session_id("sess-123")
-    turn2 = m._prepare_cli_command("second message")[1:]
+    cmd2, stdin2 = m._prepare_cli_command("second message")
+    turn2 = cmd2[1:]
 
     print(json.dumps({
         "agent_mode": m.AGENT_MODE,
@@ -66,6 +68,8 @@ _CHILD = textwrap.dedent(
         "verify_ping_reply": m.VERIFY_PING_REPLY,
         "turn1": turn1,
         "turn2": turn2,
+        "stdin1": stdin1,
+        "stdin2": stdin2,
     }))
     """
 )
@@ -232,9 +236,15 @@ def test_default_claude_cli_renders_json_and_resumes_session(tmp_path):
     assert t1[_index(t1, "--output-format") + 1] == "json"
     assert "--allowed-tools" in t1
     assert t1[_index(t1, "--append-system-prompt-file") + 1] == f"{home}/agent-tools-prompt.md"
-    assert t1[-2:] == ["-p", "hello world"]
+    # claude driver delivers the message on stdin, stripped from argv (which now
+    # ends at the bare -p flag).
+    assert t1[-1] == "-p"
+    assert "hello world" not in t1
+    assert out["stdin1"] == "hello world"
     # Later turn: stored session id is injected as --resume (before the message).
     t2 = out["turn2"]
     assert t2[_index(t2, "--resume") + 1] == "sess-123"
     assert _index(t2, "--resume") < _index(t2, "-p")
-    assert t2[-2:] == ["-p", "second message"]
+    assert t2[-1] == "-p"
+    assert "second message" not in t2
+    assert out["stdin2"] == "second message"

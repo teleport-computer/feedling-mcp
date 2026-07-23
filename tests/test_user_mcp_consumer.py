@@ -199,11 +199,11 @@ def test_render_cli_template_injects_mcp_config(monkeypatch, tmp_path):
     monkeypatch.setattr(c, "USER_MCP_FILE", str(tmp_path / "mcp.json"))
     monkeypatch.setattr(c, "AGENT_CLI_CMD",
                         "claude {mcp} -p {message}")
-    cmd = c._render_cli_template("hello", "sid-1", lane="chat")
+    cmd, _ = c._render_cli_template("hello", "sid-1", lane="chat")
     assert "--mcp-config" in cmd
     assert f"{tmp_path}/mcp.json" in cmd
     # background lane collapses the placeholder to nothing
-    cmd_bg = c._render_cli_template("hello", "sid-1", lane="background")
+    cmd_bg, _ = c._render_cli_template("hello", "sid-1", lane="background")
     assert "--mcp-config" not in cmd_bg
 
 

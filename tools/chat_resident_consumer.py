@@ -4792,6 +4792,17 @@ def _is_pi_cmd(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "pi"
 
 
+def _driver_reads_stdin(cmd: list[str]) -> bool:
+    """Drivers that accept the prompt on STDIN, so a multi-line prompt never
+    rides the argv / cmd.exe command line. pi has always fed the message via
+    stdin; claude ``--print`` and codex ``exec`` also read a piped prompt when no
+    positional prompt is present. Detection must run on the RAW template tokens
+    (``cmd[0]`` == ``claude``/``codex``/``pi``), never a resolved path — on Windows
+    ``shutil.which('claude')`` returns ``claude.CMD`` whose ``Path().name`` is
+    ``claude.CMD``, which the per-driver helpers above would not match."""
+    return _is_pi_cmd(cmd) or _is_claude_code_cmd(cmd) or _is_codex_cmd(cmd)
+
+
 # pi's NO-ARGUMENT switches, transcribed from `pi --help` in the agent-runner image.
 # Everything else that looks like a flag is ASSUMED to take a value — pi lets
 # extensions register their own flags ("Extensions can register additional flags,
@@ -5017,7 +5028,7 @@ def _warn_if_agent_entry_may_drift() -> None:
     if AGENT_MODE != "cli" or not AGENT_CLI_CMD:
         return
 
-    if "{message}" not in AGENT_CLI_CMD and not _is_pi_cmd(_cli_cmd_tokens()):
+    if "{message}" not in AGENT_CLI_CMD and not _driver_reads_stdin(_cli_cmd_tokens()):
         log.error(
             "AGENT_CLI_CMD has NO {message} placeholder — every chat turn will "
             "FAIL: the consumer substitutes placeholders and never appends the "
@@ -5206,7 +5217,14 @@ def _render_cli_template(
     sid: str,
     image_paths: list[str] | None = None,
     lane: str = "background",
-) -> list[str]:
+) -> tuple[list[str], str | None]:
+    """Render the AGENT_CLI_CMD template into argv, returning
+    ``(argv, stdin_message)``. For claude/codex the message is delivered on STDIN
+    (``stdin_message`` is set and the message tokens are removed from argv) so a
+    multi-line prompt never rides the argv → cmd.exe command line (the Windows
+    ``claude.CMD`` shim truncates argv at the first newline). Every other driver
+    keeps the message in argv exactly as before and returns ``stdin_message=None``
+    (pi's own stdin path in ``call_agent_cli`` is unchanged)."""
     image_paths = image_paths or []
     msg_token = "__FEEDLING_MESSAGE__"
     sid_token = "__FEEDLING_SESSION_ID__"
@@ -5226,21 +5244,48 @@ def _render_cli_template(
     cmd = shlex.split(template)
     first_image = image_paths[0] if image_paths else ""
     all_images = " ".join(image_paths)
-    return [
-        part
-        .replace(msg_token, message)
-        .replace(sid_token, sid)
-        .replace(image_path_token, first_image)
-        .replace(image_paths_token, all_images)
-        for part in cmd
-    ]
+
+    def _sub(part: str) -> str:
+        return (
+            part
+            .replace(msg_token, message)
+            .replace(sid_token, sid)
+            .replace(image_path_token, first_image)
+            .replace(image_paths_token, all_images)
+        )
+
+    # claude/codex read the prompt on stdin (see _driver_reads_stdin). Strip the
+    # message-carrier token(s) from argv and hand the message back for stdin, so
+    # multi-line text never rides the cmd.exe command line. Detection is on the
+    # raw pre-resolve cmd[0] ("claude"/"codex"). pi is intentionally excluded here
+    # — it keeps its own stdin path in call_agent_cli.
+    if message and (_is_claude_code_cmd(cmd) or _is_codex_cmd(cmd)):
+        msg_idx = [i for i, part in enumerate(cmd) if msg_token in part]
+
+        def _clean_carrier(part: str) -> bool:
+            # A token that carries ONLY the message: a lone `{message}` positional
+            # (or shlex-collapsed `"{message}"`), or a `--flag=<message>` value.
+            if part == msg_token:
+                return True
+            return part.count(msg_token) == 1 and part.endswith("=" + msg_token)
+
+        # all() over an empty msg_idx is True: a claude/codex template with NO
+        # {message} placeholder still routes the message via stdin. A message
+        # embedded in a larger literal token (e.g. --prompt=Answer:{message}) is
+        # NOT a clean carrier → fall through to argv substitution (safety valve).
+        if all(_clean_carrier(cmd[i]) for i in msg_idx):
+            drop = set(msg_idx)
+            argv = [_sub(part) for i, part in enumerate(cmd) if i not in drop]
+            return argv, message
+
+    return [_sub(part) for part in cmd], None
 
 
 def _prepare_cli_command(
     message: str,
     image_paths: list[str] | None = None,
     lane: str = "background",
-) -> list[str]:
+) -> tuple[list[str], str | None]:
     sid = _load_agent_session_id()
     template_has_image_slot = "{image_path" in AGENT_CLI_CMD
     # codex gets pixels natively via injected --image= flags (_inject_codex_images);
@@ -5257,7 +5302,7 @@ def _prepare_cli_command(
     if (image_paths and not template_has_image_slot
             and not codex_native_images and not pi_native_images):
         rendered_message = _message_for_agent(message, image_paths)
-    cmd = _render_cli_template(rendered_message, sid, image_paths=image_paths, lane=lane)
+    cmd, stdin_msg = _render_cli_template(rendered_message, sid, image_paths=image_paths, lane=lane)
     cmd, sid = _ensure_explicit_cli_session_id(cmd, sid)
 
     cmd, missing_mcp = _strip_missing_mcp_config(cmd)
@@ -5336,7 +5381,7 @@ def _prepare_cli_command(
     if pi_native_images:
         cmd = _inject_pi_images(cmd, image_paths or [])
 
-    return _resolve_cli_executable(cmd)
+    return _resolve_cli_executable(cmd), stdin_msg
 
 
 def _codex_turn_metrics(raw: str) -> dict:
@@ -5667,14 +5712,15 @@ def call_agent_cli(
     # the agent — the render step substitutes placeholders and appends nothing.
     # This used to fail SILENTLY: the agent ran with no prompt and told the user
     # "your message never reached me" (usr_c190's xiake_wrapper, 2026-07-18).
-    # pi is exempt (its managed path feeds the message via stdin by design).
-    if message and "{message}" not in AGENT_CLI_CMD and not _is_pi_cmd(_cli_cmd_tokens()):
+    # Stdin drivers (pi/claude/codex) are exempt: they can deliver the message on
+    # stdin, so a template without {message} still reaches the agent.
+    if message and "{message}" not in AGENT_CLI_CMD and not _driver_reads_stdin(_cli_cmd_tokens()):
         raise RuntimeError(
             "AGENT_CLI_CMD is missing the {message} placeholder — the user's "
             "message cannot reach the agent. Add {message} to the command "
             "template (e.g. claude -p \"{message}\")."
         )
-    cmd = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
+    cmd, stdin_msg = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     _turn_t0 = time.monotonic()
@@ -5714,6 +5760,10 @@ def call_agent_cli(
         _run_kwargs["cwd"] = _cli_cwd
     if _is_pi_cmd(cmd):
         _run_kwargs["input"] = message if "{message}" not in AGENT_CLI_CMD else ""
+    elif stdin_msg is not None:
+        # claude/codex: the prompt was stripped from argv by _render_cli_template
+        # and travels on stdin instead (multi-line text must not ride cmd.exe).
+        _run_kwargs["input"] = stdin_msg
     try:
         result = subprocess.run(cmd, **_run_kwargs)
     except subprocess.TimeoutExpired:
@@ -5834,8 +5884,10 @@ def call_agent_cli(
                 summary="stale --resume cleared; single fresh-session retry",
                 explain="claude 本地会话丢失(--resume 指向不存在的会话)——已清除并用新会话重试本轮",
             )
-            cmd = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
+            cmd, stdin_msg = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
             command_sid = _cli_flag_value(cmd, "--session-id")
+            if stdin_msg is not None:
+                _run_kwargs["input"] = stdin_msg
             result = subprocess.run(cmd, **_run_kwargs)
             _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
             raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
