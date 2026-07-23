@@ -756,8 +756,11 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "provider": {"type": "string", "description": "Normalized provider name from the caller's active model_api route (e.g. \"deepseek\", \"openrouter\", \"openai_compatible\")."},
             "adapter": {
                 "type": "string",
-                "enum": ["deepseek", "openrouter", "relay", "unsupported"],
-                "description": "Which billing adapter actually served this response. \"unsupported\" means this provider/base_url combination has no usage adapter — every metric will be \"unsupported\" and `error` explains why.",
+                "enum": [
+                    "deepseek", "openrouter", "relay", "unsupported",
+                    "deepseek_balance", "openrouter_key", "relay_token", "relay_dashboard",
+                ],
+                "description": "Which billing adapter actually served this response. On success this is fine-grained (deepseek_balance, openrouter_key, relay_token, relay_dashboard — the specific endpoint(s) queried); the coarse deepseek/openrouter/relay/unsupported values only appear on failure paths (unsupported provider, blocked URL, or timeout before an adapter ran).",
             },
             "status": {
                 "type": "string",
