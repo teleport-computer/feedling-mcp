@@ -163,6 +163,9 @@ if not _provisioned:
         "test_update_stall_reason.py",
         "test_resident_maintenance_unit.py",
         "test_genesis_failure_codes.py",
+        # B2: pure stdlib (only imports identity.distill_prompt_v1) — was
+        # missing from this list even before this task, fixed in passing.
+        "test_identity_distill_prompt.py",
     }
     collect_ignore = sorted(
         f
