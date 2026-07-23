@@ -1,7 +1,7 @@
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
-import provider_usage as pu
+from core import provider_usage as pu
 
 
 def test_select_adapter_official_origins():

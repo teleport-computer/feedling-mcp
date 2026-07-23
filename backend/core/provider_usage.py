@@ -1,17 +1,13 @@
-"""Provider 账单/额度查询核心（bottom layer，无业务依赖）。
+"""Provider 账单/额度查询核心（backend/core/provider_usage.py）。
 
 REST（hosted/usage_core.py）与 V2 runtime-native 工具共用。只认已解密的
 ProviderConfig；不查库、不解信封、不落日志（key 绝不出现在任何输出）。
 """
 from __future__ import annotations
 
-import asyncio
 import datetime as _dt
 
-import httpx
-
 import provider_client
-from core import net_safety
 
 PROVIDER_USAGE_TIMEOUT_SEC = 6.0
 _MAX_RESPONSE_BYTES = 262144  # 256KB
