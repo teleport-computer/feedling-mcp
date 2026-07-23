@@ -26,36 +26,49 @@
 
 ## §0. Alembic:合并 head + TEE 镜像 + 排他索引清理
 
-**现状(2026-07-23 实查)**:
-- `test`(本分支)head = `0023_redistill_job_exclusivity`(线性链,无分叉)。
-- `pre` head = `0052_dual_runtime_coexistence`(`0049` 是 test/pre 上一次
-  合流的 merge revision,之后 pre 单独又加到了 0052)。
-- 两条链在 `0049` 之后完全独立,`0023` 与 `0050/0051/0052` 互不认识对方。
+**现状(2026-07-23 实查,R 轮修正)**:
+- `test`(本分支)head = `0023_redistill_job_exclusivity`,`down_revision =
+  0022_notify_relay`(线性链,无分叉)。
+- `pre` head = `0052_dual_runtime_coexistence`。
+- `0049_merge_test_pre_heads` 不是"本分支这次合并"的产物,是 pre 历史上
+  **更早、且已经解决掉**的一次分叉合并:pre 在 0022 之后曾经分出两条链——
+  一条是原样带过去的 `test` 数据侧链(`0020_dau_median_user_sec` ~
+  `0022_notify_relay`,内容与本分支的同名文件逐字节相同,已用 `git diff
+  origin/pre:...0022_notify_relay.py` 核实),另一条是 pre 自己的 V2 链
+  (`0041_v2_mcp_mutation_attempts` ~ `0048_v2_turn_metrics_user_fk`)。
+  `0049` 把这两条**都在 pre 分支内部**的链重新接成单链,之后 pre 才继续
+  线性长到 `0050 → 0051 → 052`。**merge 之后 pre 并不是"两条独立链"，是
+  一条链**——`0023` 与 `0050/0051/0052` 互不认识,不是因为 0049 之后 pre
+  自己分叉了,而是因为**本分支的 `0023` 建在 test 自己的 `0022` 之上,
+  从未见过 `0049`**。真正待解决的分叉只有一处:`test` 的 `0023` vs `pre`
+  的 `052`(或合并时 pre 的实际 head)。
 
 **冲突解法**:合并时用 `alembic merge` 生成一条新的 merge revision,
-`down_revision` 同时指向 `0023`(test 侧)和 `0052`(pre 侧,合并时以 pre
-实际 head 为准,可能已经不是 052 了,先跑 `alembic heads` 确认)。
+`down_revision` 同时指向 `0023`(test 侧)和 pre 实际 head(合并时以
+`alembic heads` 现查为准,不要硬编码 052——pre 领先 test 上百个提交,
+到 0727 可能已经推进过)。
 
 **动作**:
-1. `alembic heads` 确认此时 pre 分支上的真实 head(可能已经推进,不要硬编码 0052)。
+1. `alembic heads` 确认此时 pre 分支上的真实 head(不要硬编码 0052)。
 2. `alembic merge -m "merge test io_cli-capability-completion into pre" <test_head> <pre_head>`
    生成合并 revision 文件,落在 `backend/alembic/versions/`。
-3. **上线前清理重复 active redistill job**:`0023_redistill_job_exclusivity.py`
-   的 `upgrade()` 里已经带了一段防御性清理(把同用户下除最新一条外的所有
-   `active`(`awaiting_resident`/`processing`)状态的 `source_kind=
-   'resident_redistill'` job 标记为 `failed`),**但它假设的前提是这个
-   job kind 在 pre 上此前从未存在过**(本分支 T10/T11 才引入
-   `resident_redistill` 这个 source_kind)。如果 pre 在 0727 之前已经有人
-   手工造过测试数据、或者 pre 分支自己独立造了同名 job kind,先用下面的
-   SQL 确认一遍再跑 migration:
+3. **合并前审计(不是跑 migration 的前置条件)**:`0023_redistill_job_
+   exclusivity.py` 的 `upgrade()` 在建索引**之前**已经自带一段
+   `UPDATE ... FROM ranked WHERE ranked.rn > 1`,会把同用户下除最新一条外
+   的全部 `active`(`awaiting_resident`/`processing`)状态的
+   `source_kind='resident_redistill'` job 自动标记为 `failed`——**索引创建
+   本身不会因为重复数据失败**,migration 可以直接跑,不需要人工先清理。
+   这段 SQL 只是给合并前的人一个可见性:
 
        SELECT user_id, count(*) FROM genesis_import_jobs
        WHERE source_kind = 'resident_redistill'
          AND status IN ('awaiting_resident', 'processing')
        GROUP BY user_id HAVING count(*) > 1;
 
-   有结果 → 索引创建会失败,需要先手工清理(参考 `0023` 里的清理 SQL 写法)
-   再跑 migration。预期是空结果(这个 job kind 是本分支新引入的)。
+   有结果 → 不代表要手工处理,而是提示"migration 会静默把这些用户的
+   较旧 in-flight redistill job 判 failed"——预期是空结果(`resident_
+   redistill` 这个 source_kind 是本分支新引入的),如果非空,合并前知会
+   一下 hx/受影响用户即可,不阻塞 migration 执行。
 4. **TEE 镜像 schema 同步评估**:`backend/alembic_tee` 是否需要对应索引,
    属于本分支未解决的开放问题(`0023` 迁移文件 docstring 和
    `backend/genesis/genesis_core.py` 的 V2 NOTE 都标了这一点,没有代码动作)。

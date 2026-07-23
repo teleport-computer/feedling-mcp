@@ -11,7 +11,11 @@ Pure-function + monkeypatched coverage for
     turn of a session, skips on a later turn of the SAME session — ONLY once
     the turn is confirmed committed (pending -> commit, Codex review I10)
   - codex (no --resume): injects every turn regardless of session id
-  - build_catalog returning None: no injection, no cache, retried next turn
+  - build_catalog returning None: full catalog not injected, no cache, retried
+    next turn — but the D3 sourcing guardrail (io_cli_catalog.D3_SOURCING_RULE)
+    is still prepended alone (I2: it must not vanish just because the --help
+    sweep failed — it's the only defense left against instructions smuggled
+    through files/web pages/memory cards now that D2 confirmation is gone)
   - injection-point invariant: the recent-chat transcript header from
     ``_foreground_agent_message`` stays topmost even when the catalog was
     injected earlier in the same compose chain
@@ -269,7 +273,12 @@ def test_build_failure_skips_injection_without_caching_and_retries_next_turn(mon
     calls = _mock_build_catalog(monkeypatch, side_effect=lambda n: next(results))
 
     first = crc._prepend_io_cli_capability_catalog("turn 1")
-    assert first == "turn 1"  # unchanged — build failed
+    # Full catalog not injected (build failed), but I2: the D3 sourcing
+    # guardrail alone must still ship — it's the only defense against
+    # instructions smuggled through files/web pages/memory cards now that D2
+    # (confirmation) is gone, and it must not depend on the --help sweep
+    # succeeding.
+    assert first == f"{io_cli_catalog.D3_SOURCING_RULE}\n\nturn 1"
     assert crc._io_cli_catalog_cache is None  # failure never cached
     assert crc._io_cli_catalog_pending_session_id is None  # never even marked pending
     assert crc._io_cli_catalog_injected_session_id is None  # not confirmed
@@ -280,6 +289,19 @@ def test_build_failure_skips_injection_without_caching_and_retries_next_turn(mon
     assert crc._io_cli_catalog_pending_session_id == "sess-1"  # pending until commit
     assert crc._io_cli_catalog_injected_session_id is None  # still not confirmed
     assert len(calls) == 2
+
+
+def test_build_failure_d3_fallback_present_even_when_catalog_never_built_before(monkeypatch):
+    """I2 regression pin: a session whose VERY FIRST catalog build fails must
+    still get the D3 sourcing guardrail on that very first turn — not just on
+    a retry after a prior success. Simulates the VPS first-turn generation
+    failure scenario called out in the finding."""
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess-first")
+    _mock_build_catalog(monkeypatch, return_value=None)
+
+    out = crc._prepend_io_cli_capability_catalog("hello")
+    assert io_cli_catalog.D3_SOURCING_RULE in out
+    assert out.startswith(io_cli_catalog.D3_SOURCING_RULE)
 
 
 # ---------------------------------------------------------------------------

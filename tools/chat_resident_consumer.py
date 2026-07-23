@@ -6269,7 +6269,16 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
 
         catalog = io_cli_catalog.build_catalog(_IO_CLI_PATH, python=sys.executable)
         if catalog is None:
-            return content  # build failed this turn — skip, retry next turn, don't cache
+            # Build failed this turn (subprocess error, --help format drift,
+            # io_cli.py mid-deploy write) — skip the full catalog, retry next
+            # turn, don't cache. But the D3 sourcing guardrail is normally
+            # shipped as part of the catalog's own header (build_catalog's
+            # first two lines), so a build failure would otherwise silently
+            # drop the ONLY defense against instructions smuggled through
+            # files/web pages/memory cards now that D2 (confirmation) is gone
+            # (I2). Prepend D3 alone — cheap, doesn't need a subprocess, and
+            # independent of whether the full --help sweep succeeds.
+            return f"{io_cli_catalog.D3_SOURCING_RULE}\n\n{content}"
         _io_cli_catalog_cache = catalog
 
     if not is_codex:
