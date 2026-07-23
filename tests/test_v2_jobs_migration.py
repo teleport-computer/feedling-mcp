@@ -200,7 +200,18 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0052_dual_runtime_coexistence").down_revision == (
         "0051_web_settings_backfill"
     )
-    assert script.get_current_head() == "0052_dual_runtime_coexistence"
+    # test's io_cli capability line added 0023 (redistill job exclusivity) off
+    # the shared 0022_notify_relay ancestor; merging test into pre left it a
+    # second head, so 0053 is a no-op merge rejoining it with the V2 chain
+    # (disjoint objects — a genesis-jobs index vs. the dual-runtime tables).
+    assert script.get_revision("0023_redistill_job_exclusivity").down_revision == (
+        "0022_notify_relay"
+    )
+    assert set(script.get_revision("0053_merge_redistill_v2").down_revision) == {
+        "0052_dual_runtime_coexistence",
+        "0023_redistill_job_exclusivity",
+    }
+    assert script.get_current_head() == "0053_merge_redistill_v2"
 
 
 def test_0046_segmented_summary_schema_is_immutable_and_head_is_bound():

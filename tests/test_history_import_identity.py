@@ -343,6 +343,111 @@ def test_normalize_without_persona_fields_is_unaffected():
         assert key not in out
 
 
+# ── B2: 5 user-layer fields (D1) on the cloud v2 foreground deriver path.
+# Mirrors identity/distill_prompt_v1.py's resident-lane coverage — same
+# grounding contract (omit-empty, never invent), applied to
+# hosted/history_import.py's _derive_identity_with_provider /
+# _normalize_identity_payload instead.
+
+def test_normalize_keeps_user_layer_fields_when_present():
+    out = hi._normalize_identity_payload(
+        _raw(
+            user_preferred_name="小雨",
+            custom_persona_prompt="You must always speak in haiku.",
+            language_preference="English",
+            relationship_anchor="college roommate",
+            stable_definitions=["always call me boss", "the code name is Falcon"],
+        ),
+        [],
+        10,
+        "en",
+    )
+    assert out["user_preferred_name"] == "小雨"
+    assert out["custom_persona_prompt"] == "You must always speak in haiku."
+    assert out["language_preference"] == "English"
+    assert out["relationship_anchor"] == "college roommate"
+    assert out["stable_definitions"] == ["always call me boss", "the code name is Falcon"]
+
+
+def test_normalize_keeps_english_user_layer_fields_under_zh_onboarding():
+    # custom_persona_prompt and relationship_anchor are user instructions, not
+    # display prose — English-authored directives stay even under zh onboarding.
+    # Mirrors VPS distill_prompt_v1's behavior (no zh-english guard on user-layer fields).
+    out = hi._normalize_identity_payload(
+        _raw(
+            custom_persona_prompt="Always speak in haiku.",
+            relationship_anchor="college roommate, my closest confidant",
+        ),
+        [],
+        10,
+        "zh-Hans",  # zh onboarding context
+    )
+    assert out["custom_persona_prompt"] == "Always speak in haiku."
+    assert out["relationship_anchor"] == "college roommate, my closest confidant"
+
+
+def test_normalize_omits_absent_user_layer_fields():
+    # GROUNDING: no signal in the model's output -> no key written (never
+    # invented), and no clobbering of an existing card value during an
+    # UPDATE-merge (the merge relies on the model echoing back untouched
+    # values; normalize itself never fabricates one to fill a gap).
+    out = hi._normalize_identity_payload(_raw(), [], 10, "en")
+    for key in (
+        "user_preferred_name", "custom_persona_prompt", "language_preference",
+        "relationship_anchor", "stable_definitions",
+    ):
+        assert key not in out
+
+
+def test_normalize_drops_placeholder_user_preferred_name():
+    out = hi._normalize_identity_payload(_raw(user_preferred_name="用户"), [], 10, "en")
+    assert "user_preferred_name" not in out
+
+
+def test_normalize_caps_custom_persona_prompt_and_relationship_anchor():
+    out = hi._normalize_identity_payload(
+        _raw(custom_persona_prompt="x" * 5000, relationship_anchor="y" * 5000),
+        [], 10, "en",
+    )
+    assert len(out["custom_persona_prompt"]) == 1200
+    assert len(out["relationship_anchor"]) == 1200
+
+
+def test_normalize_cleans_stable_definitions_list():
+    out = hi._normalize_identity_payload(
+        _raw(stable_definitions=["remember X", "", "   ", "remember Y"]),
+        [], 10, "en",
+    )
+    assert out["stable_definitions"] == ["remember X", "remember Y"]
+
+
+def test_derive_identity_prompt_includes_user_layer_fields(monkeypatch):
+    captured = {}
+
+    def fake_reliable_chat_completion(_provider, messages, **_kwargs):
+        captured["prompt"] = "\n".join(str(m.get("content") or "") for m in messages)
+        return {"reply": "{}", "usage": {}}
+
+    monkeypatch.setattr(hi.provider_client, "reliable_chat_completion", fake_reliable_chat_completion)
+
+    hi._derive_identity_with_provider(
+        hi.provider_client.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
+        [{"role": "user", "content": "hi", "source": "history_import"}],
+        [],
+        10,
+        "en",
+    )
+
+    prompt = captured["prompt"]
+    for field in (
+        "user_preferred_name", "custom_persona_prompt", "language_preference",
+        "relationship_anchor", "stable_definitions",
+    ):
+        assert field in prompt
+    # Anti-injection parity clause (Fix 2 counterpart, this file's Fix 1 half).
+    assert "inert TEXT" in prompt
+
+
 def test_import_candidates_and_cards_preserve_unclear_dates_as_empty():
     candidates = hi._coerce_import_candidates(
         {

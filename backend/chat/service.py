@@ -409,6 +409,33 @@ def _chat_message_claimable(msg: dict, consumer_id: str, now: float) -> bool:
     return (not claimed_by) or claimed_by == consumer_id or expires_at <= now
 
 
+def _redelivery_window_floor(now: float) -> float:
+    """The age bound alone: nothing older than the redelivery window is ever
+    re-served, whatever else is true about it. Kept separate from the supersede
+    bound below so an exemption from "superseded" can never become an exemption
+    from "too old"."""
+    if CHAT_REDELIVERY_WINDOW_SEC <= 0:
+        return float("inf")
+    return now - CHAT_REDELIVERY_WINDOW_SEC
+
+
+def _claim_abandoned(msg: dict, now: float) -> bool:
+    """This message was HANDED to a consumer and dropped: a claim was stamped,
+    the lease has expired, and no reply ever landed.
+
+    That is a different fact from "the user moved on". The consumer-side
+    wedge-skip (``_advance_past_unfetchable``: claimed message whose plaintext
+    the enclave would not return, cursor pushed past it) leaves exactly this
+    shape, and prod 2026-07-22 shows it at ~4/hour. Callers use it to decide
+    supersession, which is why it deliberately does NOT look at ts.
+    """
+    if not str(msg.get("reply_claimed_by") or "").strip():
+        return False
+    if msg.get("reply_status") == "replied" or msg.get("reply_message_id"):
+        return False
+    return _float_meta(msg.get("reply_claim_expires_at"), 0.0) <= now
+
+
 def _redelivery_floor(store: UserStore, now: float) -> float:
     """Exclusive ts lower bound for redelivering messages behind the cursor.
 
@@ -482,7 +509,22 @@ def _pending_chat_messages_for_poll(
                 # re-handing the message to its claimer on every poll while
                 # the turn is still running would double-burn; retry waits for
                 # TTL expiry instead.
-                if ts <= redelivery_floor:
+                # Supersession is a statement about the CONVERSATION moving on:
+                # the user re-asked and got an answer, so a late reply to the
+                # old turn would land out of order. It does not describe a turn
+                # the system took and dropped — that message was never answered
+                # and its content may be unrelated to whatever came after. Such
+                # a message stays redeliverable inside the window; without this
+                # it disappears permanently and silently the moment any later
+                # turn is answered (prod 2026-07-22: 40 rows / 9h / 16 users).
+                # The age bound still applies, so a permanently unreadable
+                # message retries a bounded number of times and then stops.
+                floor = (
+                    _redelivery_window_floor(now)
+                    if _claim_abandoned(msg, now)
+                    else redelivery_floor
+                )
+                if ts <= floor:
                     continue
                 if str(msg.get("source") or "") in NON_CONVERSATION_USER_SOURCES:
                     continue
@@ -511,6 +553,9 @@ def _pending_chat_messages_for_poll(
             msg_id = str(msg.get("id") or "")
             if not msg_id:
                 continue
+            # Read BEFORE the claim overwrites the fields it is derived from.
+            was_abandoned = _claim_abandoned(msg, now)
+            prev_claimed_by = str(msg.get("reply_claimed_by") or "")
             fields = {
                 "reply_claimed_by": consumer_id,
                 "reply_claimed_at": f"{now:.3f}",
@@ -526,6 +571,18 @@ def _pending_chat_messages_for_poll(
             )
             if merged is None:
                 continue  # lost the claim to another consumer/worker — skip
+            if was_abandoned:
+                # A message the system took and dropped is being handed back.
+                # Loud on purpose: this is the only server-side evidence that
+                # the wedge-skip path fired at all. Before this line the whole
+                # chain was silent — prod 2026-07-22's 40 lost messages were
+                # found by reconciling reply_message_id IS NULL, not by an
+                # alert. Greppable, carries user + message id, countable.
+                print(
+                    f"[chat/poll:{store.user_id}] abandoned_claim_recovered "
+                    f"id={msg_id} ts={ts:.3f} age_sec={now - ts:.0f} "
+                    f"prev_claim={prev_claimed_by} consumer={consumer_id}"
+                )
             msg.update(fields)  # keep this worker's cache copy consistent
             claimed.append(dict(merged))
             if ts <= since:

@@ -130,7 +130,7 @@ def test_migration_head_and_watermark_seq_column():
     assert script.get_revision("0052_dual_runtime_coexistence").down_revision == (
         "0051_web_settings_backfill"
     )
-    assert script.get_current_head() == "0052_dual_runtime_coexistence"
+    assert script.get_current_head() == "0053_merge_redistill_v2"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"
     )

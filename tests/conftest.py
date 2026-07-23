@@ -137,6 +137,7 @@ if not _provisioned:
         "test_agent_runtime_tokens.py",
         "test_agent_runtime_resolve_cache.py",
         "test_agent_runtime_spawners.py",
+        "test_spawners_catalog.py",
         "test_agent_runtime_resident_contract.py",
         "test_hosted_agent_runtime_cutover.py",
         "test_worldbook_match.py",
@@ -154,6 +155,22 @@ if not _provisioned:
         "test_user_mcp_ca_fetch_leaf.py",
         "test_identity_value_write_path.py",
         "test_v2_workspace_unit.py",
+        "test_identity_rename_pairing.py",
+        "test_identity_nudge_cap.py",
+        "test_identity_list_ops.py",
+        "test_io_cli_catalog.py",
+        "test_io_cli_identity_write_full.py",
+        "test_io_cli_mutating_verb_sourcing_rule.py",
+        "test_consumer_action_admission.py",
+        "test_consumer_capability_inject.py",
+        "test_identity_redistill_ipc.py",
+        "test_redistill_server_merge.py",
+        "test_update_stall_reason.py",
+        "test_resident_maintenance_unit.py",
+        "test_genesis_failure_codes.py",
+        # B2: pure stdlib (only imports identity.distill_prompt_v1) — was
+        # missing from this list even before this task, fixed in passing.
+        "test_identity_distill_prompt.py",
     }
     collect_ignore = sorted(
         f

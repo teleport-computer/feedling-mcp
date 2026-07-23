@@ -35,9 +35,12 @@ services:
       - wal_level=replica
       # --- 容量（spec §3【补充】）：3 CVM × (4 workers × pool 10) + wake bus
       #     每 worker 1 条 + replicator + monitoring + 余量 ≈ 160，取 200。
-      #     实施 Plan 2 时按 db.py 实际池参数复核。 ---
+      #     实施 Plan 2 时按 db.py 实际池参数复核。
+      #     2026-07-23 提到 400：对齐同内存(4GB) RDS t3.medium 的 402；
+      #     prod RDS 30 天实测峰值 119，为扶正主库预留余量。test CVM 已实测
+      #     原地 redeploy 生效且数据零丢失。 ---
       - -c
-      - max_connections=200
+      - max_connections=400
       - -c
       - shared_buffers=512MB
     environment:

@@ -472,7 +472,36 @@ def _plaintext_merge_reducer_outputs(outputs: list[dict], *, relationship_anchor
 
     agent_name = first_identity_name("ai_persona", "history", "memory_summary")
     dimensions = first_identity_dims("ai_persona", "history")
-    identity = {"agent_name": agent_name, "dimensions": dimensions} if (agent_name or dimensions) else {}
+
+    # B2: the 5 user-layer fields (user_preferred_name/custom_persona_prompt/
+    # language_preference/relationship_anchor/stable_definitions) are the
+    # OPPOSITE of the TA-identity firewall above — they describe the USER, so
+    # (unlike agent_name/dimensions) they are read from ALL outputs INCLUDING
+    # source_family=="user_profile", never excluded by it. See
+    # genesis/worker.py's _USER_LAYER_STRING_FIELDS / _USER_LAYER_LIST_FIELD
+    # for the shared field list this mirrors.
+    all_identity_outputs = [output for output in outputs if isinstance(output.get("identity"), dict)]
+    user_layer: dict[str, str] = {}
+    for key in ("user_preferred_name", "custom_persona_prompt", "language_preference", "relationship_anchor"):
+        for output in all_identity_outputs:
+            value = str(output["identity"].get(key) or "").strip()
+            if value:
+                user_layer[key] = value
+                break
+    stable_definitions: list[str] = []
+    for output in all_identity_outputs:
+        defs = output["identity"].get("stable_definitions")
+        if isinstance(defs, list):
+            stable_definitions.extend(str(item).strip() for item in defs if str(item or "").strip())
+    stable_definitions = list(dict.fromkeys(stable_definitions))[:12]
+
+    identity: dict[str, Any] = {}
+    if agent_name or dimensions:
+        identity["agent_name"] = agent_name
+        identity["dimensions"] = dimensions
+    identity.update(user_layer)
+    if stable_definitions:
+        identity["stable_definitions"] = stable_definitions
 
     persona: dict = {}
     for output in outputs:
@@ -669,7 +698,7 @@ def _write_back_plaintext_user_name(store, api_key: str | None, user_name: str) 
     payload = dict(existing)
     payload["user_preferred_name"] = name
     try:
-        return service.replace_identity_preserving_anchor(store, {"identity": payload})
+        return service.replace_identity_preserving_anchor(store, {"identity": payload}, api_key)
     except Exception:
         return "write_failed"
 
@@ -1079,7 +1108,14 @@ def _run_plaintext_background_enrichment(
                     user_name=user_name,
                 )
                 if baseline.get("agent_name") or baseline.get("dimensions"):
-                    merged["identity"] = baseline
+                    # B2: merge, don't overwrite — `merged["identity"]` may already
+                    # carry user-layer signal (custom_persona_prompt etc, which
+                    # _merged_has_identity deliberately doesn't count as "usable
+                    # identity" below) from a user_profile pass; a plain assignment
+                    # here would silently wipe it the moment a persona baseline
+                    # also exists.
+                    existing_identity = merged.get("identity") if isinstance(merged.get("identity"), dict) else {}
+                    merged["identity"] = {**existing_identity, **baseline}
         service.init_identity_if_absent(
             store, _attach_plaintext_user_name(merged, user_name), api_key
         )
@@ -1295,10 +1331,12 @@ def _run_plaintext_update_identity_job(
             user_name=user_name,
         )
     except Exception as e:  # noqa: BLE001
-        service.mark_failed(store, job_id, f"persona_rebuild_failed:{type(e).__name__}:{str(e)[:160]}")
+        service.mark_failed(
+            store, job_id, f"persona_rebuild_failed:{type(e).__name__}:{str(e)[:160]}", exc=e,
+        )
         return
     status = service.replace_identity_preserving_anchor(
-        store, {"identity": identity_payload, "relationship_anchor": relationship_anchor or {}}
+        store, {"identity": identity_payload, "relationship_anchor": relationship_anchor or {}}, api_key
     )
     if status not in {"initialized", "updated"}:
         service.mark_failed(store, job_id, status)
@@ -1306,7 +1344,9 @@ def _run_plaintext_update_identity_job(
     try:
         persona_ref, persona_sha = service.write_persona_artifact(store, job_id, persona_output)
     except Exception as e:  # noqa: BLE001
-        service.mark_failed(store, job_id, f"persona_write_failed:{type(e).__name__}:{str(e)[:160]}")
+        service.mark_failed(
+            store, job_id, f"persona_write_failed:{type(e).__name__}:{str(e)[:160]}", exc=e,
+        )
         return
     completed = db.genesis_complete_job(
         store.user_id,
@@ -1550,7 +1590,9 @@ def _run_plaintext_genesis_job(
             detail={"mode": mode, "reason": f"{type(e).__name__}:{str(e)[:180]}"},
             dur_ms=(time.time() - started_at) * 1000,
         )
-        service.mark_failed(store, job_id, f"plaintext_import_failed:{type(e).__name__}:{str(e)[:220]}")
+        service.mark_failed(
+            store, job_id, f"plaintext_import_failed:{type(e).__name__}:{str(e)[:220]}", exc=e,
+        )
     finally:
         with _PLAINTEXT_ACTIVE_LOCK:
             _PLAINTEXT_ACTIVE_JOBS.discard(active_key)

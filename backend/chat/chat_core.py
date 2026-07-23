@@ -305,32 +305,51 @@ def _visible_msgs_and_raw_max(store: UserStore, now: float) -> tuple[list, float
     return visible, raw_max_ts
 
 
-def _self_heal_if_stale(store: UserStore, raw_max_ts: float) -> bool:
+def _self_heal_if_stale(store: UserStore, since: float, *, label: str = "chat/history") -> bool:
     """Read-time staleness probe + in-place heal (2026-07-15 延迟诊断报告 P1).
 
     Multi-worker reads serve from each worker's in-memory store; cross-worker
     freshness rides on LISTEN/NOTIFY. A missed broadcast (listener down for a
     blip, worker recycled before its LISTEN was up) previously meant this worker
     served stale chat for up to STORE_CACHE_TTL_SECONDS (15 min) — push arrives,
-    chat page doesn't. On an EMPTY since-poll, probe the DB's newest-appended
-    row ts (single-row (user_id, seq) index lookup — the empty since-poll is hot,
-    ~9/s on prod, so the probe must stay this cheap) and reload in place only
-    when the DB is genuinely ahead of the raw in-memory ring. Fail-open: a probe
-    error returns the (possibly stale) answer rather than 500 — staleness
-    degrades, availability doesn't."""
-    try:
-        newest_db_ts = db.chat_newest_ts(store.user_id)
-    except Exception as e:  # noqa: BLE001 — probe is best-effort by contract
-        print(f"[chat/history:{store.user_id}] stale probe failed (fail-open): {e}")
-        return False
-    if newest_db_ts is None or newest_db_ts <= raw_max_ts:
-        return False
+    chat page doesn't. Reload in place only when the DB genuinely holds rows this
+    worker's ring is missing in the ``ts > since`` window.
+
+    Counts, not max-ts: an earlier version compared the DB's newest ts against
+    the ring's newest ts, which is blind to a *missing middle* row — a dropped
+    broadcast for a message that is NOT the newest (user sends two, the first's
+    NOTIFY is lost, this worker sees the second and replies, so both sides' newest
+    ts are that reply and look equal). Comparing the per-window COUNT catches a
+    gap anywhere in the window. Both counts include hidden rows (verify_ping):
+    comparing raw-to-raw, so a hidden row is not mistaken for a missing one.
+    Still cheap: a capped COUNT on the hot since-poll path. Fail-open: a probe
+    error returns the (possibly stale) answer rather than 500.
+
+    The history-path fallback still calls this with the ring's newest raw ts as
+    ``since`` (only reached on a DB error, where the probe fails open anyway):
+    that degenerates to "does the DB hold anything newer than my newest row",
+    the same signal the old max-ts probe gave, so it stays correct there while
+    the poll path passes a real since-window and gets the missing-middle catch."""
     from core import store as core_store  # lazy: chat_core imports UserStore only
+
+    with store.chat_lock:
+        mem_count = sum(
+            1 for m in store.chat_messages if float(m.get("ts", 0) or 0) > since
+        )
+    try:
+        db_count = db.chat_count_since(
+            store.user_id, since, cap=core_store.MAX_CHAT_MESSAGES
+        )
+    except Exception as e:  # noqa: BLE001 — probe is best-effort by contract
+        print(f"[{label}:{store.user_id}] stale probe failed (fail-open): {e}")
+        return False
+    if db_count <= mem_count:
+        return False
 
     core_store._evict_store(store.user_id)
     print(
-        f"[chat/history:{store.user_id}] stale store self-healed "
-        f"(db newest ts={newest_db_ts} > mem raw max={raw_max_ts})"
+        f"[{label}:{store.user_id}] stale store self-healed "
+        f"(db rows since={db_count} > mem rows since={mem_count})"
     )
     return True
 

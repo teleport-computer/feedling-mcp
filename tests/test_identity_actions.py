@@ -937,7 +937,7 @@ def test_identity_dimension_nudge_rejects_out_of_range(client, monkeypatch):
             "actions": [{
                 "type": "identity.dimension_nudge",
                 "dimension": "Signal sensitivity",  # value 92 in _plain_identity()
-                "delta": 50,
+                "delta": 9,  # Task 3: nudges must have |delta| <= 10; 92 + 9 = 101 out of range
                 "reason": "test",
             }],
         },
@@ -946,6 +946,42 @@ def test_identity_dimension_nudge_rejects_out_of_range(client, monkeypatch):
     assert res.status_code == 400, res.get_data(as_text=True)
     body = res.get_json()
     assert body["error"] == "dimension_value_out_of_range"
+
+
+def test_identity_actions_batch_with_non_dict_action(client, monkeypatch):
+    # Task 3: nudge pre-scan must guard against non-dict items in the batch.
+    # A non-dict (e.g. "not_a_dict") should not raise AttributeError (500),
+    # but be gracefully handled so _execute_identity_action catches it and
+    # returns 400 action_must_be_object (same as base behavior).
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={
+            "actions": [
+                "not_a_dict",  # non-dict element
+                {
+                    "type": "identity.dimension_nudge",
+                    "dimension": "Signal sensitivity",
+                    "delta": 5,
+                    "reason": "test",
+                },
+            ],
+        },
+    )
+
+    # Should not crash with 500; should gracefully return 400 with action_must_be_object
+    assert res.status_code == 400, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["error"] == "action_must_be_object"
 
 
 def test_proactive_settings_wake_directive_validation(client):

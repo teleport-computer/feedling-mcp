@@ -69,7 +69,49 @@ TRUNCATION_STOP_REASONS = {
 
 
 class GenesisWorkerError(Exception):
-    """Retryable/non-retryable worker failure surfaced into job.error."""
+    """Retryable/non-retryable worker failure surfaced into job.error.
+
+    T16: every raise site's message below is classified into a fixed enum by
+    service.classify_genesis_error (string match on this exception's text, no
+    change to the strings themselves) and surfaced as error_code/error_hint on
+    the genesis_state blob. V2 note: pre's worker.py (running in the
+    serve-worker thread pool + daemon.py, not this standalone CVM loop) raises
+    the same GenesisWorkerError shapes for the same failures — the
+    classification lives once in service.py, so no duplicate mapping is needed
+    there; only the raise sites here need to keep producing matchable text.
+    """
+
+
+# I6: when every fact-map chunk in a batch fails, pick the most actionable
+# real cause instead of flattening the whole batch to "model produced
+# nothing". Priority order matches user-actionability: a bad key or empty
+# quota blocks the user outright; a timeout is transient; bad JSON is a
+# model/provider quirk. Anything unclassifiable (not one of these four)
+# means we genuinely don't know the cause — model_empty_output is the
+# fallback for THAT case, kept in service.classify_genesis_error itself so
+# legacy (pre-fix) persisted "all_fact_maps_failed:N/M" strings without a
+# cause suffix still classify the same way they always did.
+_FACT_MAP_FAILURE_PRIORITY = (
+    "bad_api_key",
+    "provider_quota",
+    "provider_timeout",
+    "model_bad_json",
+)
+
+
+def _classify_fact_map_failures(errors: list[BaseException]) -> str:
+    """Priority-pick one classify_genesis_error code across all exceptions
+    raised by a totally-failed fact-map batch. Returns "internal" (never
+    model_empty_output) when none of the exceptions match a known
+    actionable cause — this raise site is exception-driven by construction
+    (a valid-but-empty model reply never raises), so it is never actually
+    the "no output" case even when the underlying cause can't be pinned
+    down further."""
+    seen = {service.classify_genesis_error(str(e), e) for e in errors}
+    for code in _FACT_MAP_FAILURE_PRIORITY:
+        if code in seen:
+            return code
+    return "internal"
 
 
 def _trace_genesis(store, event_type: str, *, job_id: str = "", status: str = "ok",
@@ -286,11 +328,30 @@ def _strip_identity(doc: dict) -> dict:
     return clean
 
 
+# B2: the 5 user-layer identity fields (D1) that a distiller may now populate
+# alongside agent_name/dimensions — see genesis/prompts.py FACT_WRITE_PROMPT's
+# "用户层字段" block and genesis/service.py's PROFILE_STRING/LIST_FIELDS-driven
+# plumbing. Kept as one tuple here so the "does this identity dict carry ANY
+# signal" checks below (_identity_only / _fact_write_output_empty) don't drift
+# from what _fact_write actually aggregates.
+_USER_LAYER_STRING_FIELDS = (
+    "user_preferred_name", "custom_persona_prompt", "language_preference",
+    "relationship_anchor",
+)
+_USER_LAYER_LIST_FIELD = "stable_definitions"
+
+
+def _identity_has_user_layer_signal(identity: dict) -> bool:
+    if any(str(identity.get(key) or "").strip() for key in _USER_LAYER_STRING_FIELDS):
+        return True
+    return bool(identity.get(_USER_LAYER_LIST_FIELD))
+
+
 def _identity_only(doc: dict) -> dict:
     identity = doc.get("identity") if isinstance(doc.get("identity"), dict) else {}
     dims = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
     out = {"memories": []}
-    if identity.get("agent_name") or dims:
+    if identity.get("agent_name") or dims or _identity_has_user_layer_signal(identity):
         out["identity"] = identity
     if out.get("identity") and doc.get("days_with_user") is not None:
         out["days_with_user"] = doc.get("days_with_user")
@@ -469,6 +530,9 @@ def _decrypt_envelope(
             detail={"error_class": error_type},
             dur_ms=(time.time() - started_at) * 1000,
         )
+        # T16: "decrypt_failed" substring -> error_code="decrypt_failed" via
+        # classify_genesis_error. Do not rename this segment without updating
+        # that match.
         raise GenesisWorkerError(f"{purpose}:decrypt_failed:{type(e).__name__}") from e
 
 
@@ -666,7 +730,8 @@ def _fact_write_output_empty(output: dict) -> bool:
     memories = output.get("memories") if isinstance(output.get("memories"), list) else []
     identity = output.get("identity") if isinstance(output.get("identity"), dict) else {}
     dims = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
-    if memories or str(identity.get("agent_name") or "").strip() or dims:
+    if (memories or str(identity.get("agent_name") or "").strip() or dims
+            or _identity_has_user_layer_signal(identity)):
         return False
     try:
         if int(output.get("days_with_user") or 0) > 0:
@@ -795,6 +860,12 @@ def _fact_write(
     agent_name = ""
     days_with_user = 0
     evidence: list[str] = []
+    # B2: first-seen-wins for the user-layer strings (same "don't let a later,
+    # thinner batch blank out an earlier real signal" rule as agent_name
+    # above); stable_definitions accumulates across batches instead, deduped
+    # by exact text so repeated batches don't pile up the same entry.
+    user_layer: dict[str, str] = {}
+    stable_definitions: list[str] = []
     for output in outputs:
         if isinstance(output.get("memories"), list):
             memories.extend(
@@ -807,15 +878,26 @@ def _fact_write(
             agent_name = str(identity.get("agent_name") or "")
         if isinstance(identity.get("dimensions"), list):
             dims.extend(item for item in identity["dimensions"] if isinstance(item, dict))
+        for key in _USER_LAYER_STRING_FIELDS:
+            if not user_layer.get(key) and str(identity.get(key) or "").strip():
+                user_layer[key] = str(identity.get(key) or "").strip()
+        if isinstance(identity.get(_USER_LAYER_LIST_FIELD), list):
+            stable_definitions.extend(
+                str(item).strip() for item in identity[_USER_LAYER_LIST_FIELD]
+                if str(item or "").strip()
+            )
         try:
             days_with_user = max(days_with_user, int(output.get("days_with_user") or 0))
         except Exception:
             pass
         if output.get("relationship_anchor_evidence"):
             evidence.append(str(output.get("relationship_anchor_evidence") or ""))
+    identity_out = {"agent_name": agent_name, "dimensions": dims[:7], **user_layer}
+    if stable_definitions:
+        identity_out[_USER_LAYER_LIST_FIELD] = list(dict.fromkeys(stable_definitions))[:12]
     return {
         "memories": memories,
-        "identity": {"agent_name": agent_name, "dimensions": dims[:7]},
+        "identity": identity_out,
         "days_with_user": days_with_user,
         "relationship_anchor_evidence": " | ".join(evidence)[:500],
     }
@@ -918,6 +1000,7 @@ def _build_reducer_output(
     fact_candidates: list[dict] = []
     fact_map_attempts = 0
     fact_map_failures = 0
+    fact_map_errors: list[BaseException] = []
     for idx, text in enumerate(chunk_texts):
         if include_persona_voice and source_family == "history":
             try:
@@ -958,6 +1041,7 @@ def _build_reducer_output(
                 fact_candidates.extend(item for item in facts["fact_candidates"] if isinstance(item, dict))
         except (provider_client.ProviderError, GenesisWorkerError) as e:
             fact_map_failures += 1
+            fact_map_errors.append(e)
             print(f"[genesis:{job_id}] fact-map-{idx} skipped: {type(e).__name__}:{str(e)[:120]}")
         # NB: the job's updated_at heartbeat lives in GenesisLLMClient.complete
         # (fires on every LLM call), so it covers the reduce phase and early-return
@@ -966,7 +1050,18 @@ def _build_reducer_output(
     # effectively unusable for this user — fail loudly so the job stays retryable
     # rather than writing an empty/garbage memory garden from zero candidates.
     if include_memory and fact_map_attempts and fact_map_failures == fact_map_attempts:
-        raise GenesisWorkerError(f"all_fact_maps_failed:{fact_map_failures}/{fact_map_attempts}")
+        # I6 fix: this floor is ALWAYS exception-driven (a genuinely-empty-but-valid
+        # model reply never raises, so it never increments fact_map_failures — it
+        # just contributes zero candidates and falls through below). So collapsing
+        # every cause here to "model produced nothing" was actively wrong: a wall of
+        # 401s or a provider timeout has a much more actionable real cause. Reuse
+        # service.classify_genesis_error per-exception and surface the most
+        # actionable one (by priority) as a suffix classify_genesis_error can pick
+        # back up — see the mirrored priority regex there.
+        cause_code = _classify_fact_map_failures(fact_map_errors)
+        raise GenesisWorkerError(
+            f"all_fact_maps_failed:{fact_map_failures}/{fact_map_attempts}:{cause_code}"
+        )
 
     if include_memory and skip_fact_texts:
         # Genesis v2: drop the candidates the foreground already wrote as core, so the
@@ -1618,6 +1713,11 @@ def reap_stale_processing_jobs() -> list[dict]:
     history-import's stale reaper. One bad reap doesn't stop the rest.
     """
     stale_sec = _genesis_stale_sec()
+    # T16: this string is what service.classify_genesis_error matches on
+    # ("stale_timeout" substring) to produce error_code="worker_restarted" —
+    # keep the substring if this message ever changes. write_genesis_state
+    # below (called with status="failed") does the classification; this path
+    # never goes through mark_failed.
     error = f"genesis_stale_timeout:{stale_sec}s"
     reaped: list[dict] = []
     # The DB flips status processing->failed atomically, conditional on the row
@@ -1724,6 +1824,8 @@ def reap_stale_resident_jobs() -> list[dict]:
     failure instead of an eternal spinner.
     """
     stale_sec = _resident_stale_sec()
+    # T16: also matches classify_genesis_error's "stale_timeout" substring ->
+    # error_code="worker_restarted" (a died/stalled consumer, not a model fault).
     error = f"resident_stale_timeout:{stale_sec}s"
     reaped: list[dict] = []
     for job in db.genesis_reap_stale_resident_jobs(
@@ -1794,6 +1896,8 @@ def reap_stale_unclaimed_jobs() -> list[dict]:
     # Slug must NOT contain "timeout" — the notices upstream-classifier's `timed? ?out`
     # regex would match it and mislabel this as a server outage ("服务商暂时不可用，请稍后
     # 重试"), telling the user to retry when the real fix is updating their own consumer.
+    # T16: this exact substring is matched by classify_genesis_error ->
+    # error_code="worker_restarted" (no consumer ever picked the job up).
     error = f"resident_never_claimed:{stale_sec}s"
     reaped: list[dict] = []
     for job in db.genesis_reap_stale_unclaimed_jobs(stale_sec, error=error):
@@ -1872,7 +1976,14 @@ def tick(
                     summary="genesis worker job failed",
                     detail={"reason": f"{type(e).__name__}:{str(e)[:180]}"},
                 )
-                service.mark_failed(store, job_id, f"worker_failed:{type(e).__name__}:{str(e)[:180]}")
+                # T16: pass the live exception so classify_genesis_error can use its
+                # status_code (ProviderError 401/403/429/402) instead of only the
+                # wrapped string. V2 note: pre's daemon.py catch-all around the
+                # serve-worker genesis path should mirror this — same call, same
+                # `exc=` kwarg — when it lands the equivalent failure here.
+                service.mark_failed(
+                    store, job_id, f"worker_failed:{type(e).__name__}:{str(e)[:180]}", exc=e,
+                )
             results.append({"user_id": user_id, "job_id": job_id, "status": "failed", "error": str(e)[:240]})
     end = time.time() if now is None else float(now())
     return {

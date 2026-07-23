@@ -3152,7 +3152,51 @@ def _genesis_row(cur, row) -> dict | None:
     return out
 
 
+class GenesisRedistillJobActive(Exception):
+    """Raised by ``genesis_create_job`` when the insert collides with the
+    partial unique index (0023_redistill_job_exclusivity) that enforces "one
+    active resident_redistill job per user" — NOT the ``(user_id, job_id)``
+    primary key (that conflict is absorbed by ``ON CONFLICT ... DO NOTHING``
+    below and simply returns ``None``, same as before this index existed).
+
+    Carries the job_id of whichever OTHER job currently holds the exclusivity
+    slot, so the caller (``genesis_core._resident_sealed_import``) can surface
+    it as ``409 {"error": "redistill_job_active", "active_job_id": ...}``
+    without a second round trip of its own."""
+
+    def __init__(self, active_job_id: str):
+        super().__init__(f"resident_redistill job already active: {active_job_id}")
+        self.active_job_id = active_job_id
+
+
+def _genesis_active_job_of_kind(conn, user_id: str, source_kind: str) -> dict | None:
+    """The job currently occupying the redistill-exclusivity slot for this user
+    (same statuses the partial unique index watches). Used only to resolve
+    ``GenesisRedistillJobActive``'s ``active_job_id`` — never called on the hot
+    path for other job kinds, since only ``resident_redistill`` can raise it."""
+    cur = conn.execute(
+        "SELECT * FROM genesis_import_jobs WHERE user_id = %s AND source_kind = %s "
+        "AND status IN ('awaiting_resident', 'processing') "
+        "ORDER BY updated_at DESC LIMIT 1",
+        (user_id, source_kind),
+    )
+    return _genesis_row(cur, cur.fetchone())
+
+
 def genesis_create_job(user_id: str, job: dict) -> dict | None:
+    """Insert a new genesis import job. Two distinct conflict shapes, kept apart
+    so callers can't mistake one for the other:
+
+    (a) same ``(user_id, job_id)`` already exists (idempotent retry — job_id is
+        a deterministic hash of the caller's request/client_job_id) — absorbed
+        by ``ON CONFLICT ... DO NOTHING``; returns ``None`` and the caller does
+        its own ``genesis_get_job`` lookup to hand back the existing job, same
+        as before this function had any notion of exclusivity.
+    (b) a DIFFERENT job_id of source_kind='resident_redistill' is already
+        active for this user (0023's partial unique index) — raises
+        ``GenesisRedistillJobActive(active_job_id=...)``. This can only happen
+        for that one job kind; every other kind's concurrency is unaffected.
+    """
     sql = (
         """
         INSERT INTO genesis_import_jobs
@@ -3164,11 +3208,12 @@ def genesis_create_job(user_id: str, job: dict) -> dict | None:
         RETURNING *
         """
     )
+    source_kind = job.get("source_kind", "unknown")
     params = (
         user_id,
         job["job_id"],
         job.get("status", "created"),
-        job.get("source_kind", "unknown"),
+        source_kind,
         job.get("file_manifest_hash", ""),
         int(job.get("total_chunks") or 0),
         int(job.get("total_bytes") or 0),
@@ -3176,7 +3221,16 @@ def genesis_create_job(user_id: str, job: dict) -> dict | None:
         Jsonb(job.get("metadata") or {}),
     )
     with get_pool().connection() as conn:
-        cur = conn.execute(sql, params)
+        try:
+            cur = conn.execute(sql, params)
+        except psycopg.errors.UniqueViolation:
+            # Not the (user_id, job_id) PK (that's ON CONFLICT DO NOTHING above) —
+            # this is the redistill-exclusivity partial index. autocommit=True means
+            # this failed statement was its own implicit transaction, so the
+            # connection is immediately usable for the lookup below (no rollback
+            # needed, unlike a multi-statement transaction).
+            active = _genesis_active_job_of_kind(conn, user_id, source_kind)
+            raise GenesisRedistillJobActive(active["job_id"] if active else "") from None
         result = _genesis_row(cur, cur.fetchone())
     from tee_shadow import mirror
     mirror.execute(sql, params)
@@ -3945,6 +3999,29 @@ def chat_newest_ts(user_id: str) -> float | None:
             (user_id,),
         ).fetchone()
     return float(row[0]) if row else None
+
+
+def chat_count_since(user_id: str, since: float, *, cap: int) -> int:
+    """How many chat rows this user has with ``ts > since``, counted in the DB
+    (capped at ``cap``). The staleness self-heal compares this against the same
+    count over the in-memory ring: a *missing middle* row — a dropped
+    cross-worker broadcast for a message that is NOT the newest — leaves the two
+    "newest ts" values equal, so only a per-window COUNT can see it.
+
+    Capped so a very old ``since`` (window wider than the in-memory ring) can't
+    make the DB count structurally exceed the ring and trigger a reload every
+    call: past ``cap`` rows both sides saturate and compare equal. ``cap`` is
+    the ring size, where the in-memory count itself saturates. Raises on DB
+    failure — the caller fails open (staleness degrades, availability doesn't)."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT count(*) FROM ("
+            "  SELECT 1 FROM chat_messages WHERE user_id = %s AND ts > %s LIMIT %s"
+            ") t",
+            (user_id, since, max(1, int(cap))),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
 
 
 def chat_load_strict(user_id: str) -> list[dict]:
@@ -6639,18 +6716,30 @@ def chat_try_claim_reply(
       and never supersede."""
     same_consumer_sql = "" if redelivery else "OR doc->>'reply_claimed_by' = %s "
     unanswered_tail_sql = (
-        "  AND NOT EXISTS ("
-        "    SELECT 1 FROM chat_messages n "
-        "    WHERE n.user_id = chat_messages.user_id "
-        "      AND n.ts > chat_messages.ts "
-        "      AND n.doc->>'role' = 'user' "
-        "      AND COALESCE(n.doc->>'source','') NOT IN ('verify_ping','resident_maintenance') "
-        "      AND ((n.doc->>'reply_status') = 'replied' "
-        "           OR COALESCE(n.doc->>'reply_message_id','') <> '')"
+        "  AND ("
+        # ...unless this row was CLAIMED AND DROPPED (a claim was stamped, the
+        # lease expired, no reply landed). Then the conversation did not move
+        # past it — the system took the turn and lost it, and its content may
+        # have nothing to do with what came after. Mirrors
+        # chat.service._claim_abandoned; kept here too because this CAS is the
+        # authoritative decision (the cache-side pre-filter can be stale).
+        "    (COALESCE(doc->>'reply_claimed_by','') <> '' "
+        "     AND COALESCE(NULLIF(doc->>'reply_claim_expires_at','')::float8, 0) <= %s) "
+        "    OR NOT EXISTS ("
+        "      SELECT 1 FROM chat_messages n "
+        "      WHERE n.user_id = chat_messages.user_id "
+        "        AND n.ts > chat_messages.ts "
+        "        AND n.doc->>'role' = 'user' "
+        "        AND COALESCE(n.doc->>'source','') NOT IN ('verify_ping','resident_maintenance') "
+        "        AND ((n.doc->>'reply_status') = 'replied' "
+        "             OR COALESCE(n.doc->>'reply_message_id','') <> '')"
+        "    )"
         "  ) "
     ) if redelivery else ""
     params: list = [Jsonb(fields), user_id, msg_id]
-    if not redelivery:
+    if redelivery:
+        params.append(now)  # abandoned-claim exemption inside unanswered_tail_sql
+    else:
         params.append(consumer_id)
     params.append(now)
     sql = (

@@ -279,7 +279,7 @@ An official resident reports decrypt-source health on poll requests only:
 
 `X-Feedling-Decrypt-Checked-At` is the Unix epoch time of the confirmation. The
 backend accepts a report as fresh for 300 seconds. The standard resident
-refreshes an idle report every 120 seconds; use
+refreshes an idle report every 210 seconds; use
 `FEEDLING_DECRYPT_HEALTH_REFRESH_SEC` to tune that interval, with a minimum of 5
 seconds. Missing, malformed, future, or stale reports normalize to `unknown`.
 Every official poll is authoritative: omitting the two headers clears any
