@@ -3106,6 +3106,28 @@ def chat_newest_ts(user_id: str) -> float | None:
     return float(row[0]) if row else None
 
 
+def chat_count_since(user_id: str, since: float, *, cap: int) -> int:
+    """How many chat rows this user has with ``ts > since``, counted in the DB
+    (capped at ``cap``). The staleness self-heal compares this against the same
+    count over the in-memory ring: a *missing middle* row — a dropped
+    cross-worker broadcast for a message that is NOT the newest — leaves the two
+    "newest ts" values equal, so only a per-window COUNT can see it.
+
+    Capped so a very old ``since`` (window wider than the in-memory ring) can't
+    make the DB count structurally exceed the ring and trigger a reload every
+    call: past ``cap`` rows both sides saturate and compare equal. ``cap`` is
+    the ring size, where the in-memory count itself saturates. Raises on DB
+    failure — the caller fails open (staleness degrades, availability doesn't)."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT count(*) FROM ("
+            "  SELECT 1 FROM chat_messages WHERE user_id = %s AND ts > %s LIMIT %s"
+            ") t",
+            (user_id, since, max(1, int(cap))),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
 def chat_load(user_id: str) -> list[dict]:
     """Load the user's chat ring. R2-offloaded file rows are returned as SLIM
     POINTERS (``body_key`` + ``body_ct_len``, no ``body_ct``) — the heavy
@@ -3644,18 +3666,30 @@ def chat_try_claim_reply(
       and never supersede."""
     same_consumer_sql = "" if redelivery else "OR doc->>'reply_claimed_by' = %s "
     unanswered_tail_sql = (
-        "  AND NOT EXISTS ("
-        "    SELECT 1 FROM chat_messages n "
-        "    WHERE n.user_id = chat_messages.user_id "
-        "      AND n.ts > chat_messages.ts "
-        "      AND n.doc->>'role' = 'user' "
-        "      AND COALESCE(n.doc->>'source','') NOT IN ('verify_ping','resident_maintenance') "
-        "      AND ((n.doc->>'reply_status') = 'replied' "
-        "           OR COALESCE(n.doc->>'reply_message_id','') <> '')"
+        "  AND ("
+        # ...unless this row was CLAIMED AND DROPPED (a claim was stamped, the
+        # lease expired, no reply landed). Then the conversation did not move
+        # past it — the system took the turn and lost it, and its content may
+        # have nothing to do with what came after. Mirrors
+        # chat.service._claim_abandoned; kept here too because this CAS is the
+        # authoritative decision (the cache-side pre-filter can be stale).
+        "    (COALESCE(doc->>'reply_claimed_by','') <> '' "
+        "     AND COALESCE(NULLIF(doc->>'reply_claim_expires_at','')::float8, 0) <= %s) "
+        "    OR NOT EXISTS ("
+        "      SELECT 1 FROM chat_messages n "
+        "      WHERE n.user_id = chat_messages.user_id "
+        "        AND n.ts > chat_messages.ts "
+        "        AND n.doc->>'role' = 'user' "
+        "        AND COALESCE(n.doc->>'source','') NOT IN ('verify_ping','resident_maintenance') "
+        "        AND ((n.doc->>'reply_status') = 'replied' "
+        "             OR COALESCE(n.doc->>'reply_message_id','') <> '')"
+        "    )"
         "  ) "
     ) if redelivery else ""
     params: list = [Jsonb(fields), user_id, msg_id]
-    if not redelivery:
+    if redelivery:
+        params.append(now)  # abandoned-claim exemption inside unanswered_tail_sql
+    else:
         params.append(consumer_id)
     params.append(now)
     sql = (

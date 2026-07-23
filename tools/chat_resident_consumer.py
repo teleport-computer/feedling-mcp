@@ -328,6 +328,26 @@ CAPTURE_TICK_START_DELAY_SEC = int(os.environ.get(
     "FEEDLING_CAPTURE_TICK_START_DELAY_SEC",
     str(PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC),
 ))
+# Wake coalescing: one moment, one turn. Perception triggers arrive as separate
+# jobs (unlock_after_absence / photo_added / arrived_at_anchor …) and prod
+# 2026-07-22 saw a user pick up their phone, fire three of them within 0.3s and
+# get the SAME two sentences twice — each job realized its own agent turn, and
+# the only thing standing between them was the model noticing "I just said this"
+# (it noticed on the third, not the second). Collapse them instead: one turn
+# carrying every trigger. Two windows are needed, because those three jobs were
+# CLAIMED 22:24:13 / 22:24:34 / 22:25:14 — same burst, different poll batches:
+#   · within a batch  — keep one carrier, fold the rest into it
+#   · across batches  — a wake this soon after the last realized turn folds too
+# Reminders (scheduled_wake), the first-greeting introduction and the
+# screen-watch lane are never folded (see _is_coalescable_wake_job). 0 disables.
+PROACTIVE_COALESCE_WINDOW_SEC = float(
+    os.environ.get("FEEDLING_PROACTIVE_COALESCE_WINDOW_SEC", "60")
+)
+# When the last wake turn actually ran, and which job carried it — the across-
+# batch half of the window above. Module-global like the self-wake streak.
+_last_proactive_turn_ts: float = 0.0
+_last_proactive_turn_job_id: str = ""
+
 PROACTIVE_MAX_REPLY_MESSAGES = int(os.environ.get("PROACTIVE_MAX_REPLY_MESSAGES", "5"))
 PROACTIVE_RECENT_CHAT_LIMIT = int(os.environ.get("PROACTIVE_RECENT_CHAT_LIMIT", "20"))
 PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT = int(os.environ.get("PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT", "50"))
@@ -1695,8 +1715,20 @@ def _env_float(name: str, default: float, *, minimum: float) -> float:
     return val
 
 
+# 120 → 210 (2026-07-22): the probe is NOT cheap — its enclave call re-enters the
+# backend for a whoami that always misses (WHOAMI_CACHE_TTL=30s < any sane probe
+# interval) and unconditionally pulls 200 memory cards. At ~200 resident
+# consumers that was ~1.5 rps of the most expensive shape we have, added the
+# night prod started sliding (07-22 01:41, be8beab). Halving the rate keeps the
+# signal and drops the standing cost.
+# The ceiling is not free choice: the backend calls health older than
+# _DECRYPT_HEALTH_RECENT_SEC (300s) "unknown" and blocks onboarding on it, and
+# the probe only gets a turn on an IDLE poll cycle — so the real budget is
+# 300 − one poll round trip, and prod round trips measured 30.7s under load, not
+# the nominal 30. 210 keeps ~30s of slack; 240 does not. Guarded by
+# tests/test_decrypt_health_freshness_budget.py — raise it there or not at all.
 DECRYPT_HEALTH_REFRESH_SEC = _env_float(
-    "FEEDLING_DECRYPT_HEALTH_REFRESH_SEC", 120.0, minimum=5.0
+    "FEEDLING_DECRYPT_HEALTH_REFRESH_SEC", 210.0, minimum=5.0
 )
 
 _decrypt_health: dict = {"status": "unknown", "checked_at": 0.0}
@@ -7790,6 +7822,69 @@ def _is_introduction_job(job: dict) -> bool:
     )
 
 
+def _is_coalescable_wake_job(job: dict) -> bool:
+    """Whether this job may be folded into a neighbouring wake turn.
+
+    Excluded on purpose:
+      · ``scheduled_wake`` — a reminder the user set themselves; each carries its
+        own intent and note, so folding two of them would silently drop one.
+      · introduction / ``post_spawn_genesis`` — a one-off arrival ritual.
+      · screen-watch — its own lightweight lane with a different prompt shape.
+    """
+    if not isinstance(job, dict):
+        return False
+    if str(job.get("source") or "") != PROACTIVE_JOB_SOURCE:
+        return False
+    if _is_introduction_job(job) or _is_screen_watch_job(job):
+        return False
+    return str(job.get("trigger") or "").strip().lower() != "scheduled_wake"
+
+
+def _plan_wake_coalescing(jobs: list) -> None:
+    """Mark, in place, which wake jobs fold into which.
+
+    Sets ``_coalesced_into`` on every folded job (the loop turns that into a
+    ``skipped`` status so the fold stays auditable — each trigger keeps its own
+    row) and ``coalesced_triggers`` on the carrier so the turn's prompt can name
+    every trigger in the burst. Deliberately does NOT drop entries from ``jobs``:
+    the caller's checkpoint advances off each job's ts, and losing one here would
+    make the batch replay forever.
+    """
+    if PROACTIVE_COALESCE_WINDOW_SEC <= 0:
+        return
+    idx = [i for i, job in enumerate(jobs) if _is_coalescable_wake_job(job)]
+    if not idx:
+        return
+
+    # Across batches: a wake landing inside the window after a turn that already
+    # ran folds into that turn — this is the prod case, where the burst was
+    # spread over three poll cycles a minute apart.
+    now = time.time()
+    if _last_proactive_turn_ts and (now - _last_proactive_turn_ts) < PROACTIVE_COALESCE_WINDOW_SEC:
+        for i in idx:
+            jobs[i]["_coalesced_into"] = _last_proactive_turn_job_id or "previous_wake_turn"
+        return
+
+    if len(idx) < 2:
+        return
+
+    # Within a batch: the LAST job carries the turn — its screen frames and
+    # perception context are the freshest view of the moment.
+    carrier = jobs[idx[-1]]
+    triggers = [str(jobs[i].get("trigger") or "").strip() for i in idx]
+    carrier["coalesced_triggers"] = [t for t in triggers if t]
+    carrier_id = str(carrier.get("job_id") or "")
+    for i in idx[:-1]:
+        jobs[i]["_coalesced_into"] = carrier_id
+
+
+def _note_proactive_turn_ran(job_id: str) -> None:
+    """Record that a wake turn actually reached the agent (across-batch window)."""
+    global _last_proactive_turn_ts, _last_proactive_turn_job_id
+    _last_proactive_turn_ts = time.time()
+    _last_proactive_turn_job_id = str(job_id or "")
+
+
 def _message_for_introduction_job(job: dict) -> str:
     return "\n\n".join([
         "[Feedling · 首次登场(onboarding 之后)]",
@@ -7929,6 +8024,25 @@ def _new_photo_hint(job: dict) -> str:
     )
 
 
+def _wake_trigger_line(job: dict) -> str:
+    """The wake's trigger, or every trigger folded into it.
+
+    A coalesced turn must still be able to react to the whole moment ("she
+    unlocked the phone, added a photo AND got home"), so the carrier names all
+    of them rather than only its own.
+    """
+    own = str((job or {}).get("trigger") or "").strip()
+    folded = (job or {}).get("coalesced_triggers")
+    if not isinstance(folded, list) or not folded:
+        return own or "wake"
+    seen: list[str] = []
+    for trig in [*folded, own]:
+        text = str(trig or "").strip()
+        if text and text not in seen:
+            seen.append(text)
+    return ", ".join(seen) if seen else "wake"
+
+
 def _message_for_proactive_job(
     job: dict,
     screen_text: str = "",
@@ -7953,7 +8067,7 @@ def _message_for_proactive_job(
         _reply_language_line(presence),
         (
             "wake_metadata:\n"
-            f"- trigger: {str(job.get('trigger') or 'wake')}\n"
+            f"- trigger: {_wake_trigger_line(job)}\n"
             f"- wake_kind: {wake_kind}\n"
             f"- broadcast_state: {str(job.get('broadcast_state') or 'unknown')}\n"
             f"- screen_context_available: {str(screen_available).lower()}"
@@ -9173,6 +9287,10 @@ def _process_proactive_jobs(jobs: list) -> float:
     The user-turn priority gate lives in ``_process_resident_jobs`` (it must
     cover capture/dream/migrate model turns too, not just proactive)."""
     latest = 0.0
+    # One moment, one turn: decide the folds before realizing anything, so a
+    # burst of perception triggers becomes a single agent turn instead of one
+    # per trigger (prod 2026-07-22: the same two sentences sent twice).
+    _plan_wake_coalescing(jobs)
     for job in jobs:
         ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
         latest = max(latest, ts)
@@ -9186,6 +9304,20 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
 
         job_id = str(job.get("job_id") or "")
+        # Folded into a neighbouring turn — record it and move on. Marked seen
+        # above (so it never replays) and skipped before the claim (the carrier
+        # speaks for it, so there is nothing to claim).
+        coalesced_into = str(job.get("_coalesced_into") or "")
+        if coalesced_into:
+            log.info(
+                "proactive job coalesced id=%s trigger=%s into=%s",
+                job_id, job.get("trigger"), coalesced_into,
+            )
+            update_proactive_job_status(
+                job_id, "skipped", f"coalesced_into: {coalesced_into}"
+            )
+            continue
+
         try:
             if not claim_proactive_job(job_id):
                 log.info("proactive job not claimed id=%s", job_id)
@@ -9277,6 +9409,9 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
         _clear_provider_payment_cooldown()
         _clear_proactive_failure()
+        # The turn reached the agent — open the across-batch coalescing window so
+        # the rest of this burst folds instead of repeating it.
+        _note_proactive_turn_ran(job_id)
         if _consume_reply_parse_failed():
             # Parse failure means call_agent already swapped agent_result for
             # FALLBACK_REPLY — a foreground-only line ("你稍后再发一次…") that

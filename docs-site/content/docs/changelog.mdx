@@ -12,6 +12,22 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- The resident consumer's idle decrypt-health probe interval
+  (`FEEDLING_DECRYPT_HEALTH_REFRESH_SEC`) default changes from 120 to 210
+  seconds. The probe is one of the more expensive periodic calls a resident
+  makes, and its reporting contract is unchanged: the backend still accepts a
+  report as fresh for 300 seconds. Because the probe only runs on an idle poll
+  cycle, the usable interval is that window minus one poll round trip; values
+  near 300 report stale health and block onboarding verification.
+- Chat poll and Chat history now confirm an answer against the database before
+  reporting that nothing newer exists, instead of only when their cached page
+  is empty. A message committed by another backend worker is therefore served
+  on the next poll rather than after the cache TTL.
+- A chat message that was claimed for reply and abandoned (its claim lease
+  expired with no reply) is no longer treated as superseded by a later
+  answered turn, so the redelivery backstop can still serve it inside the
+  redelivery window. The age bound is unchanged.
+
 - Resident maintenance reminder state now uses cross-worker PostgreSQL
   compare-and-swap instead of process-local read-modify-write persistence.
   Concurrent Chat poll, claim, and pending-work requests therefore preserve one
