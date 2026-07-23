@@ -1863,7 +1863,12 @@ def _probe_decrypt_reachability() -> None:
         client = _client_for(FEEDLING_ENCLAVE_URL)
         resp = client.get(
             f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
-            params={"limit": 1}, headers=_HEADERS, timeout=10,
+            # probe=1: verify the decrypt path is reachable without paying for the
+            # context-memory fan-out (memory/list 200 cards + context build) the
+            # enclave attaches to a normal history read. See
+            # backend/enclave/routes/chat.py — this call fires per resident every
+            # DECRYPT_HEALTH_REFRESH_SEC and only reads the HTTP status.
+            params={"limit": 1, "probe": 1}, headers=_HEADERS, timeout=10,
         )
         resp.raise_for_status()
     except Exception:
