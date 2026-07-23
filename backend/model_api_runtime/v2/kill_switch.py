@@ -187,10 +187,88 @@ def set_turns_halted(halted: bool) -> None:
     _invalidate()
 
 
+# ------------------------------------------------------- provider usage tools
+# Separate cache slot from `turns_halted` and `web_halted` — different column,
+# different TTL lifecycle, and mixing them would let a provider_usage read
+# serve a stale turns/web answer (or vice versa).
+_provider_usage_cache_lock = threading.Lock()
+_provider_usage_cached: bool | None = None
+_provider_usage_cached_at: float = 0.0
+
+
+def _invalidate_provider_usage() -> None:
+    global _provider_usage_cached, _provider_usage_cached_at
+    with _provider_usage_cache_lock:
+        _provider_usage_cached = None
+        _provider_usage_cached_at = 0.0
+
+
+def _fetch_provider_usage_halted_row():
+    """Raw control-row read. Split out so tests can drive the error and
+    missing-row branches without a live database."""
+    with db.get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT provider_usage_halted FROM v2_runtime_control WHERE id=1"
+            )
+            return cur.fetchone()
+
+
+def provider_usage_halted() -> bool:
+    """True iff provider-usage reporting is currently halted, cached
+    ~`_CACHE_TTL_SEC` seconds.
+
+    Fail-CLOSED like `web_halted` and deliberately with no `default_on_error`
+    knob: this is a rollback lever, not a feature with a legitimate fail-open
+    caller.
+
+    - DB ok       -> the real column
+    - DB error    -> `True` (halted), and the error result is cached — a DB
+      wobble must not turn into a query storm.
+    - row missing -> unknown state -> `True`, also cached
+    - NEVER raises
+    """
+    global _provider_usage_cached, _provider_usage_cached_at
+    now = time.monotonic()
+    with _provider_usage_cache_lock:
+        if _provider_usage_cached is not None and (
+            now - _provider_usage_cached_at
+        ) < _CACHE_TTL_SEC:
+            return _provider_usage_cached
+    try:
+        row = _fetch_provider_usage_halted_row()
+        # A missing control row is an unknown state, not "not halted".
+        value = bool(row[0]) if row else True
+    except Exception as exc:  # noqa: BLE001 — must never raise into callers
+        log.warning(
+            "[v2.kill_switch] provider_usage_halted read failed, failing closed: %s",
+            exc,
+        )
+        value = True
+    with _provider_usage_cache_lock:
+        _provider_usage_cached = value
+        _provider_usage_cached_at = now
+    return value
+
+
+def set_provider_usage_halted(value: bool) -> None:
+    """UPDATE the single control row and invalidate the cache so the next read
+    (in this process and any other, once its own TTL lapses) observes it."""
+    with db.get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE v2_runtime_control SET provider_usage_halted=%s, updated_at=now() "
+                "WHERE id=1",
+                (bool(value),),
+            )
+    _invalidate_provider_usage()
+
+
 def _invalidate_all_for_tests() -> None:
-    """Drop BOTH cached values. The two switches have independent lifecycles —
-    `set_turns_halted` must not silently reset the web cache and vice versa — so
-    production code never calls this; it exists so a test can reset the module
-    without reaching into either private slot."""
+    """Drop ALL cached values. The switches have independent lifecycles —
+    `set_turns_halted` must not silently reset the web/provider-usage cache
+    and vice versa — so production code never calls this; it exists so a test
+    can reset the module without reaching into any private slot."""
     _invalidate()
     _invalidate_web()
+    _invalidate_provider_usage()

@@ -233,7 +233,12 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0056_agent_jobs_hb_idx").down_revision == (
         "0055_capture_applied_check"
     )
-    assert script.get_current_head() == "0056_agent_jobs_hb_idx"
+    # 0057 adds the provider_usage_halted kill switch column, chained linearly
+    # off the 0056 head.
+    assert script.get_revision("0057_provider_usage_halted").down_revision == (
+        "0056_agent_jobs_hb_idx"
+    )
+    assert script.get_current_head() == "0057_provider_usage_halted"
 
 
 def test_0046_segmented_summary_schema_is_immutable_and_head_is_bound():
