@@ -69,3 +69,36 @@ def patch(store, *, api_key=None, runtime_token=None, params=None) -> Capability
     body, status = identity_core.run_actions(store, payload, api_key=api_key,
                                              runtime_token=runtime_token or "")
     return _norm(body, status, default_msg="identity patch unavailable")
+
+
+def nudge(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
+    """Adjust one existing relationship/personality dimension score by a signed
+    delta, routing to the ``identity.dimension_nudge`` action.
+
+    Fail-closed on malformed args, mirroring ``patch``: a missing/blank dimension
+    or a non-integer delta is deterministic bad input, so it maps to
+    retryable=False (a terminal discard) rather than an infinite retry. Unlike
+    ``patch`` there is no persisted-effect-replay concern here — this is a brand
+    new capability, so nothing enqueued a dimension_nudge effect before this code
+    existed. The per-dimension existence check and the |delta| ≤ 10 cap stay
+    server-side in identity/actions.py (dimension_not_found → 404,
+    nudge_delta_exceeds_cap → 400), surfaced back through ``_norm``.
+    """
+    params = params or {}
+    dimension = params.get("dimension")
+    if not isinstance(dimension, str) or not dimension.strip():
+        return err(errors.INVALID, "identity_nudge: 'dimension' must be a non-empty string",
+                   retryable=False)
+    try:
+        delta = int(params.get("delta"))
+    except (TypeError, ValueError):
+        return err(errors.INVALID, "identity_nudge: 'delta' must be an integer",
+                   retryable=False)
+    action = {"type": "identity.dimension_nudge", "dimension": dimension, "delta": delta}
+    reason = params.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        action["reason"] = reason
+    payload = {"action": action}
+    body, status = identity_core.run_actions(store, payload, api_key=api_key,
+                                             runtime_token=runtime_token or "")
+    return _norm(body, status, default_msg="identity nudge unavailable")

@@ -128,3 +128,48 @@ def test_get_caps_nested_list(monkeypatch):
                         lambda store: ({"identity": {"signature": list(range(1000))}}, 200))
     r = cap_identity.get("STORE")
     assert r.ok is True and len(r.data["identity"]["signature"]) == 50
+
+
+def test_nudge_builds_dimension_nudge_action(monkeypatch):
+    captured = {}
+
+    def fake_run_actions(store, payload, *, api_key, runtime_token):
+        captured["payload"] = payload
+        captured["rt"] = runtime_token
+        return {"status": "ok", "action": "identity.dimension_nudge"}, 200
+
+    monkeypatch.setattr(identity_core, "run_actions", fake_run_actions)
+    r = cap_identity.nudge("STORE", api_key="k", runtime_token="rt",
+                           params={"dimension": "playfulness", "delta": 3, "reason": "更活泼"})
+    assert r.ok is True
+    action = captured["payload"]["action"]
+    assert action["type"] == "identity.dimension_nudge"
+    assert action["dimension"] == "playfulness"
+    assert action["delta"] == 3
+    assert action["reason"] == "更活泼"
+    assert captured["rt"] == "rt"
+
+
+def test_nudge_coerces_numeric_string_delta_and_omits_blank_reason(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        identity_core, "run_actions",
+        lambda store, payload, *, api_key, runtime_token: (captured.update(payload=payload) or ({"status": "ok"}, 200)))
+    cap_identity.nudge("STORE", params={"dimension": "warmth", "delta": "2"})
+    action = captured["payload"]["action"]
+    assert action["delta"] == 2
+    assert "reason" not in action
+
+
+def test_nudge_fails_closed_on_non_integer_delta():
+    # Deterministic bad input -> terminal discard, never retried (like patch's
+    # malformed-'patch' guard). run_actions must not even be called.
+    r = cap_identity.nudge("STORE", params={"dimension": "warmth", "delta": "abc"})
+    assert r.ok is False
+    assert r.error["retryable"] is False
+
+
+def test_nudge_fails_closed_on_missing_dimension():
+    r = cap_identity.nudge("STORE", params={"delta": 1})
+    assert r.ok is False
+    assert r.error["retryable"] is False

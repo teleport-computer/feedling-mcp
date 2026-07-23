@@ -55,6 +55,17 @@ PARAMS: dict[str, dict] = {
         },
         "required": [],
     },
+    # identity.nudge(store, ...): params.get("dimension") (str) + delta (int),
+    # optional reason. Adjusts ONE existing dimension's score.
+    "identity_nudge": {
+        "type": "object",
+        "properties": {
+            "dimension": _STR,
+            "delta": _INT,
+            "reason": _STR,
+        },
+        "required": ["dimension", "delta"],
+    },
 
     # -- memory.py (backed by memory_core.index/fetch/actions) --
     # memory.index(store, ...): payload passed through to memory_index_core; only
@@ -236,10 +247,22 @@ DESCRIPTIONS: dict[str, str] = {
     "identity_get": "Read the persona's current identity/profile fields.",
     "identity_patch": ("Update the persona's own identity/profile. Use 'agent_name' "
                        "when the user renames you — that is the name shown to them, "
-                       "and rewriting only 'self_introduction' does NOT rename you. "
-                       "Pass both when the new name should also appear in how you "
-                       "introduce yourself, and only act on an explicit request. "
-                       "Also accepts 'signature' or an explicit 'patch' object."),
+                       "and rewriting only 'self_introduction' does NOT rename you; "
+                       "pass both when the new name should also appear in how you "
+                       "introduce yourself. Put any of these inside a 'patch' object: "
+                       "string fields agent_name, self_introduction, category, "
+                       "user_preferred_name, agent_role, tone_style, "
+                       "custom_persona_prompt, language_preference, relationship_anchor; "
+                       "and list fields signature, boundaries, do_not_say, "
+                       "stable_definitions. Edit a list field by whole-list replacement "
+                       "or with op keys add_<field>/remove_<field>/replace_<field> "
+                       "(e.g. add_signature, remove_boundaries). Only act on an "
+                       "explicit request."),
+    "identity_nudge": ("Adjust ONE of the persona's relationship/personality dimension "
+                       "scores by a signed integer 'delta' (|delta| ≤ 10). 'dimension' "
+                       "must name a dimension that already exists — call identity_get "
+                       "first to see the current dimensions and values. Optional "
+                       "'reason'. To add or rename dimensions, use identity_patch."),
     "memory_index": "List recent memory cards, optionally capped by limit.",
     "memory_search": "Keyword-search memory cards by a required query string.",
     "memory_fetch": "Fetch specific memory cards by their ids.",

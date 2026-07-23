@@ -104,3 +104,23 @@ def test_server_validation_covers_required_types_unknowns_and_array_items():
     assert tool_schema.validate_tool_args("identity_get", {"unused": "x"}) == "unknown field: unused"
     assert tool_schema.validate_tool_args("memory_fetch", {"ids": ["ok", 2]}) == "args.ids[1] must be string"
     assert tool_schema.validate_tool_args("schedule_wake", {"at": "tomorrow"}) is None
+
+
+def test_identity_nudge_is_model_facing_and_requires_dimension_and_delta():
+    spec = next(s for s in tool_schema.build_tool_specs() if s.name == "identity_nudge")
+    assert set(spec.parameters["required"]) == {"dimension", "delta"}
+    assert tool_schema.validate_tool_args("identity_nudge", {"dimension": "warmth", "delta": 2}) is None
+    assert tool_schema.validate_tool_args("identity_nudge", {"dimension": "warmth"}) == "missing required field: delta"
+    # bool is a JSON boolean, not an integer
+    assert tool_schema.validate_tool_args("identity_nudge", {"dimension": "warmth", "delta": True}) is not None
+    assert "unknown field" in tool_schema.validate_tool_args(
+        "identity_nudge", {"dimension": "warmth", "delta": 1, "x": 1})
+
+
+def test_identity_patch_description_advertises_list_fields_and_ops():
+    spec = next(s for s in tool_schema.build_tool_specs() if s.name == "identity_patch")
+    d = spec.description
+    # the add_/remove_/replace_ list-op convention must be discoverable
+    assert "add_" in d and "remove_" in d and "replace_" in d
+    # at least one of the newly-reachable list fields is named
+    assert "boundaries" in d

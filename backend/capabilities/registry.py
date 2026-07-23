@@ -11,6 +11,7 @@ from capabilities.types import CapabilityResult, err
 CAPABILITIES: dict[str, Callable[..., CapabilityResult]] = {
     "identity_get": lambda store, **kw: identity.get(store, **kw),
     "identity_patch": lambda store, **kw: identity.patch(store, **kw),
+    "identity_nudge": lambda store, **kw: identity.nudge(store, **kw),
     "memory_index": lambda store, **kw: memory.index(store, **kw),
     "memory_fetch": lambda store, **kw: memory.fetch(store, **kw),
     "memory_write": lambda store, **kw: memory.write(store, **kw),
@@ -35,7 +36,7 @@ CAPABILITIES: dict[str, Callable[..., CapabilityResult]] = {
 }
 
 WRITE_ACTIONS = frozenset({
-    "memory_write", "identity_patch", "schedule_wake", "cancel_wake",
+    "memory_write", "identity_patch", "identity_nudge", "schedule_wake", "cancel_wake",
     "workspace_write", "workspace_delete",
 })
 READ_ACTIONS = frozenset(set(CAPABILITIES) - WRITE_ACTIONS)
