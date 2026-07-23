@@ -183,6 +183,15 @@ def test_identity_replace_action_changes_replaced_at(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
     captured: list = []
+    # T12: replace_identity_preserving_anchor now reads the LATEST decrypted
+    # card at write time before merging the distilled payload onto it.
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None, **kwargs: (
+            ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, "")
+        ),
+    )
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured))
 
     job_id = "job_replace_1"
@@ -394,6 +403,13 @@ def _replace_action(job_id: str, *, agent_name: str = "Nyx", base_identity_repla
 def test_replace_action_with_matching_baseline_succeeds(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None, **kwargs: (
+            ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, "")
+        ),
+    )
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder([]))
 
     job_id = "job_baseline_match"
@@ -437,6 +453,13 @@ def test_replace_action_without_baseline_skips_check(client, monkeypatch):
     # must not be gated by a check it never opted into.
     user_id, api_key = _register(client)
     _seed_identity(user_id)
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None, **kwargs: (
+            ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, "")
+        ),
+    )
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder([]))
 
     job_id = "job_baseline_absent"

@@ -2408,7 +2408,51 @@ def _genesis_row(cur, row) -> dict | None:
     return out
 
 
+class GenesisRedistillJobActive(Exception):
+    """Raised by ``genesis_create_job`` when the insert collides with the
+    partial unique index (0023_redistill_job_exclusivity) that enforces "one
+    active resident_redistill job per user" — NOT the ``(user_id, job_id)``
+    primary key (that conflict is absorbed by ``ON CONFLICT ... DO NOTHING``
+    below and simply returns ``None``, same as before this index existed).
+
+    Carries the job_id of whichever OTHER job currently holds the exclusivity
+    slot, so the caller (``genesis_core._resident_sealed_import``) can surface
+    it as ``409 {"error": "redistill_job_active", "active_job_id": ...}``
+    without a second round trip of its own."""
+
+    def __init__(self, active_job_id: str):
+        super().__init__(f"resident_redistill job already active: {active_job_id}")
+        self.active_job_id = active_job_id
+
+
+def _genesis_active_job_of_kind(conn, user_id: str, source_kind: str) -> dict | None:
+    """The job currently occupying the redistill-exclusivity slot for this user
+    (same statuses the partial unique index watches). Used only to resolve
+    ``GenesisRedistillJobActive``'s ``active_job_id`` — never called on the hot
+    path for other job kinds, since only ``resident_redistill`` can raise it."""
+    cur = conn.execute(
+        "SELECT * FROM genesis_import_jobs WHERE user_id = %s AND source_kind = %s "
+        "AND status IN ('awaiting_resident', 'processing') "
+        "ORDER BY updated_at DESC LIMIT 1",
+        (user_id, source_kind),
+    )
+    return _genesis_row(cur, cur.fetchone())
+
+
 def genesis_create_job(user_id: str, job: dict) -> dict | None:
+    """Insert a new genesis import job. Two distinct conflict shapes, kept apart
+    so callers can't mistake one for the other:
+
+    (a) same ``(user_id, job_id)`` already exists (idempotent retry — job_id is
+        a deterministic hash of the caller's request/client_job_id) — absorbed
+        by ``ON CONFLICT ... DO NOTHING``; returns ``None`` and the caller does
+        its own ``genesis_get_job`` lookup to hand back the existing job, same
+        as before this function had any notion of exclusivity.
+    (b) a DIFFERENT job_id of source_kind='resident_redistill' is already
+        active for this user (0023's partial unique index) — raises
+        ``GenesisRedistillJobActive(active_job_id=...)``. This can only happen
+        for that one job kind; every other kind's concurrency is unaffected.
+    """
     sql = (
         """
         INSERT INTO genesis_import_jobs
@@ -2420,11 +2464,12 @@ def genesis_create_job(user_id: str, job: dict) -> dict | None:
         RETURNING *
         """
     )
+    source_kind = job.get("source_kind", "unknown")
     params = (
         user_id,
         job["job_id"],
         job.get("status", "created"),
-        job.get("source_kind", "unknown"),
+        source_kind,
         job.get("file_manifest_hash", ""),
         int(job.get("total_chunks") or 0),
         int(job.get("total_bytes") or 0),
@@ -2432,7 +2477,16 @@ def genesis_create_job(user_id: str, job: dict) -> dict | None:
         Jsonb(job.get("metadata") or {}),
     )
     with get_pool().connection() as conn:
-        cur = conn.execute(sql, params)
+        try:
+            cur = conn.execute(sql, params)
+        except psycopg.errors.UniqueViolation:
+            # Not the (user_id, job_id) PK (that's ON CONFLICT DO NOTHING above) —
+            # this is the redistill-exclusivity partial index. autocommit=True means
+            # this failed statement was its own implicit transaction, so the
+            # connection is immediately usable for the lookup below (no rollback
+            # needed, unlike a multi-statement transaction).
+            active = _genesis_active_job_of_kind(conn, user_id, source_kind)
+            raise GenesisRedistillJobActive(active["job_id"] if active else "") from None
         result = _genesis_row(cur, cur.fetchone())
     from tee_shadow import mirror
     mirror.execute(sql, params)

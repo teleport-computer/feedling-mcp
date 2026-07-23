@@ -1,7 +1,9 @@
 """Identity card storage, change log, relationship-day anchors."""
 
 import re
+import threading
 import uuid
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 
 
@@ -14,6 +16,58 @@ from memory import service as memory_service
 # (identity/actions.py, genesis/service.py, hosted/history_import.py).
 from identity.card_policy import RUNTIME_LABELS as _IDENTITY_RUNTIME_LABELS  # noqa: F401
 from identity import card_policy
+
+
+# Per-user identity-mutation mutex. Broader than UserStore.identity_lock below
+# (which only wraps the final db.set_blob write in _save_identity): that lock
+# leaves the read-existing-card -> merge -> re-encrypt span unguarded, so two
+# concurrent profile_patch calls for the same user can both read the same
+# pre-mutation card, independently merge (e.g. two different add_signature
+# ops), and the second write clobbers the first's addition (lost update).
+# identity_mutation_lock(user_id) closes that whole span instead.
+#
+# Keyed by user_id (not by UserStore instance) so it holds even if callers
+# construct/obtain separate UserStore objects for the same user. The guard
+# lock only protects inserting a new per-user Lock into the dict — it is not
+# held while the per-user lock itself is held.
+#
+# IMPORTANT — this is a PROCESS-local threading.Lock, not a cluster-wide
+# one. deploy/docker-compose.yaml runs gunicorn with multiple worker
+# PROCESSES; each has its OWN Python interpreter and therefore its OWN
+# independent `_IDENTITY_MUTATION_LOCKS` dict — two workers handling the same
+# user's writes concurrently each acquire their own uncontended lock and can
+# still race at the DB. This lock only closes the race WITHIN one worker
+# process (e.g. two threads in the same worker, or the thread-pooled ASGI
+# server). The cross-worker case is closed at the DB layer instead — see
+# `_save_identity_cas` / `IdentityWriteConflict` below and
+# identity/actions.py::_with_identity_mutation_lock_and_retry, which wraps
+# this lock AND the CAS retry together. Keep both: the lock is cheap
+# same-process serialization (avoids paying for a CAS retry on the common
+# case), the CAS is what's actually correct across workers.
+_IDENTITY_MUTATION_LOCKS: dict[str, threading.Lock] = {}
+_IDENTITY_MUTATION_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def identity_mutation_lock(user_id: str):
+    """Serialize identity profile mutations for a single user WITHIN this
+    process. Must wrap the full read-existing-card -> merge -> re-encrypt ->
+    save span (see identity/actions.py::_identity_profile_patch), not just
+    the final save — see module comment above for why, and for why this
+    alone is NOT sufficient across gunicorn worker processes."""
+    with _IDENTITY_MUTATION_LOCKS_GUARD:
+        lock = _IDENTITY_MUTATION_LOCKS.setdefault(user_id, threading.Lock())
+    with lock:
+        yield
+
+
+class IdentityWriteConflict(Exception):
+    """Raised by `_save_identity_cas` (via its caller) when the DB-level
+    compare-and-swap loses a race to a concurrent writer — same user,
+    potentially a DIFFERENT gunicorn worker process (identity_mutation_lock
+    cannot prevent that, see above). Callers retry the whole
+    read->merge->encrypt->write span from a fresh read; see
+    identity/actions.py::_with_identity_mutation_lock_and_retry."""
 
 
 def _load_identity(store: UserStore) -> dict | None:
@@ -36,6 +90,39 @@ def _save_identity(store: UserStore, data: dict):
     # tee_replicator.worker 的 identity _Table（unpack 写死 item_id="identity"）对齐。
     from tee_shadow import mirror
     mirror.mark_pending(store.user_id, "identity", "identity", "requeue")
+
+
+def _save_identity_cas(store: UserStore, expected: dict, data: dict) -> bool:
+    """Compare-and-swap write for the identity row: writes `data` ONLY if the
+    row's current doc still equals `expected` — the exact blob the caller's
+    merge (in identity/actions.py::_save_identity_action_payload) was
+    computed from. This is the DB-level half of concurrency safety for
+    identity.profile_patch / identity.dimension_nudge: it is what actually
+    closes the cross-gunicorn-worker lost-update window that
+    `identity_mutation_lock` (a process-local threading.Lock) cannot — see
+    that function's docstring above.
+
+    Built on `db.set_blob_if_unchanged`, which does the comparison as a
+    single atomic `UPDATE ... WHERE doc = expected RETURNING` under the row
+    lock (JSONB `=` is a semantic/normalized comparison, so key order and
+    whitespace in `expected` don't matter) — no read-modify-write window at
+    the DB layer either.
+
+    Returns True iff the write landed. On success, ALSO marks the identity
+    row for TEE-plaintext requeue, same as `_save_identity` above — this
+    duplicates that one line rather than calling `_save_identity` (which
+    would re-do the plain `db.set_blob`, defeating the CAS). This is required
+    because `db.set_blob_if_unchanged` deliberately excludes "identity" from
+    its own normal shadow-write mirroring (see db.py's `kind not in
+    ("identity", "consumer_state")` guard) for the exact same reason
+    `_save_identity` documents: identity's TEE mirror goes through the
+    requeue lane, not a direct shadow write, because an in-place UPDATE keeps
+    the same PK and the cursor-based replicator never revisits it."""
+    if not db.set_blob_if_unchanged(store.user_id, "identity", expected, data):
+        return False
+    from tee_shadow import mirror
+    mirror.mark_pending(store.user_id, "identity", "identity", "requeue")
+    return True
 
 
 # Identity change audit log

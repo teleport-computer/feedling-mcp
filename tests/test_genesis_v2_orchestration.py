@@ -728,6 +728,42 @@ def test_v2_background_derives_baseline_identity_from_persona(monkeypatch):
     assert applied["identity"]["dimensions"]
 
 
+def test_v2_background_baseline_derivation_merges_not_overwrites_user_layer_fields(monkeypatch):
+    # B2 regression guard: _merged_has_identity only counts agent_name/dimensions
+    # as "usable identity" (unchanged), so a merged output carrying ONLY a B2
+    # user-layer field (custom_persona_prompt here) still triggers the persona
+    # baseline derivation below — that derivation must MERGE onto the existing
+    # identity dict, not replace it, or the user-layer signal is silently lost
+    # the moment a persona baseline also exists.
+    applied = {}
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "build_reducer_output_from_texts", lambda **k: {
+        "memories": [], "persona": {"content": "你是小柒，温柔细心的陪伴者。"},
+        "identity": {"agent_name": "", "dimensions": [], "custom_persona_prompt": "永远用第二人称。"},
+        "source_family": "history"})
+    monkeypatch.setattr(plaintext, "_plaintext_merge_reducer_outputs", lambda outs, **k: {
+        "memories": [], "persona": outs[0]["persona"],
+        "identity": {"agent_name": "", "dimensions": [], "custom_persona_prompt": "永远用第二人称。"}})
+    monkeypatch.setattr(worker, "derive_identity_from_persona", lambda **k: {
+        "agent_name": "小柒",
+        "dimensions": [{"name": "温柔", "value": 80, "description": "历史里一贯的语气"}]})
+    monkeypatch.setattr(service, "apply_memory_outputs", lambda *a, **k: None)
+    monkeypatch.setattr(service, "init_identity_if_absent",
+                        lambda store, merged, api_key=None: applied.update(identity=merged.get("identity")))
+    monkeypatch.setattr(service, "write_persona_artifact", lambda *a, **k: ("", ""))
+    monkeypatch.setattr(service, "write_voice_artifact", lambda *a, **k: ("", ""))
+
+    plaintext._run_plaintext_background_enrichment(
+        _Store(), "key", "job1", runtime=object(),
+        source_groups=[{"source_kind": "history_import", "source_family": "history", "chunk_texts": ["c"]}],
+        relationship_anchor=None, skip_family="history", skip_texts=set(), known_memories=[])
+
+    assert applied["identity"]["agent_name"] == "小柒"
+    assert applied["identity"]["dimensions"]
+    # the user-layer field survived the baseline merge
+    assert applied["identity"]["custom_persona_prompt"] == "永远用第二人称。"
+
+
 def test_genesis_v2_flag_gate_off_by_default(monkeypatch):
     monkeypatch.delenv("FEEDLING_GENESIS_V2_ENABLED", raising=False)
     assert worker.genesis_v2_enabled() is False                 # default off -> v1 path

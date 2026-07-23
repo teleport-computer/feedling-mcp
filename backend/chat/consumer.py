@@ -121,6 +121,16 @@ def _consumer_headers_from_map(headers, remote_addr: str = "") -> dict:
         "consumer_compat_commit": (
             headers.get("X-Feedling-Consumer-Compat-Commit") or ""
         ).strip(),
+        # Why self-update is stalled ("dirty" | "disabled" | "fetch_failed" | "")
+        # — self-reported by the consumer (tools/chat_resident_consumer.py:
+        # _self_update_stall_reason()) so the 6h commit-mismatch maintenance
+        # nudge can name a concrete fix. An old resident that omits this header
+        # reports "" here, same as consumer_compat_commit, and the nudge falls
+        # back to its pre-existing generic text (backward compatible).
+        # pre 同文件同改（自托管专属字段，与 hosted/V2 路径无关）。
+        "update_stall_reason": (
+            headers.get("X-Feedling-Update-Stall") or ""
+        ).strip().lower(),
         # Keep empty values: an old resident that omits these headers must clear
         # a previously cached report instead of inheriting a stale green state.
         "decrypt_status": (headers.get("X-Feedling-Decrypt-Status") or "").strip().lower(),
@@ -151,6 +161,7 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
             event_info.pop("decrypt_status", None)
             event_info.pop("decrypt_checked_at_epoch", None)
             event_info.pop("consumer_compat_commit", None)
+            event_info.pop("update_stall_reason", None)
         state.update(event_info)
         state["last_event"] = event_type
         state["last_seen_at"] = now_iso
@@ -407,6 +418,7 @@ def _consumer_validation_state(
         "consumer_version": state.get("consumer_version", ""),
         "consumer_commit": state.get("consumer_commit", ""),
         "consumer_compat_commit": state.get("consumer_compat_commit", ""),
+        "update_stall_reason": state.get("update_stall_reason", ""),
         "last_poll_at": state.get("last_poll_at", ""),
         "last_response_at": state.get("last_response_at", ""),
         "age_sec": age_sec,

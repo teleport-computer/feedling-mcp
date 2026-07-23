@@ -373,6 +373,24 @@ def _decrypt_steps() -> str:
     )
 
 
+def _update_stall_fix_line(info: Mapping[str, Any]) -> str:
+    """Specific fix for a self-reported self-update stall, if the resident told
+    us one (tools/chat_resident_consumer.py: _self_update_stall_reason(), sent
+    as the X-Feedling-Update-Stall header on poll). An old resident that omits
+    the header reports "" here, so callers see nothing and the generic
+    consumer_commit_mismatch copy is unchanged — backward compatible.
+    pre 同文件同改（自托管专属，不影响 hosted/V2 路径）。
+
+    修法句只报告不指令——agent 不得据此自行改动用户工作区(D3);既有 348 行的
+    执行式框架属遗留问题,另案。"""
+    reason = str(info.get("update_stall_reason") or "").strip().lower()
+    return {
+        "dirty": "请转告用户:机器上有未提交改动挡住了自动更新,由用户自行执行 git stash 或提交后即可恢复",
+        "disabled": "请转告用户:自动更新被手动关闭(FEEDLING_AUTO_UPDATE=0)",
+        "fetch_failed": "请转告用户:机器拉取 GitHub 失败,请用户检查网络/代理",
+    }.get(reason, "")
+
+
 def _prompt_for(reason: Mapping[str, Any], info: Mapping[str, Any]) -> str:
     reason_name = str(reason.get("reason") or "")
     if reason_name == "decrypt_source_unavailable":
@@ -389,6 +407,10 @@ def _prompt_for(reason: Mapping[str, Any], info: Mapping[str, Any]) -> str:
             "consumer_commit_mismatch": "你所在的 resident consumer 上报的 commit 与服务端期望不一致,且已持续超过宽限期。自动更新可能停摆,常见原因:仓库工作区有未提交改动、FEEDLING_AUTO_UPDATE=0、git fetch 失败。",
             "awaiting_resident_unclaimed": "有 resident-only 的蒸馏任务等待超过 15 分钟未被认领,但 consumer 在正常 poll,通常是版本太旧或 distill lane 没有启动。",
         }.get(reason_name, "resident consumer 的版本或任务处理状态需要检查。")
+        if reason_name == "consumer_commit_mismatch":
+            fix_line = _update_stall_fix_line(info)
+            if fix_line:
+                issue = f"{issue}\n具体原因:{fix_line}。"
         steps = _update_steps()
     return (
         f"{_prompt_prefix()}"
