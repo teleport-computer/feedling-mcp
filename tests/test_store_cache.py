@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -123,3 +124,42 @@ def test_admin_store_evict_requires_admin(client):
     # store must NOT be evicted by an unauthorized call
     core_store.get_store(user_id)
     assert user_id in core_store._stores
+
+
+def test_strict_chat_append_does_not_leave_in_memory_phantom(monkeypatch):
+    store = object.__new__(core_store.UserStore)
+    store.user_id = "strict-user"
+    store.chat_messages = []
+    store.chat_lock = threading.Lock()
+
+    def _fail(*_args, **_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(db, "chat_append_strict", _fail)
+    envelope = {
+        "id": "strict-reply",
+        "v": 1,
+        "body_ct": "ciphertext",
+        "nonce": "nonce",
+        "K_user": "wrapped-key",
+        "owner_user_id": store.user_id,
+    }
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        store.append_chat("openclaw", "model_api", envelope, strict=True)
+
+    assert store.chat_messages == []
+
+
+def test_db_strict_append_raises_while_legacy_wrapper_is_best_effort(monkeypatch):
+    class _BrokenPool:
+        def connection(self):
+            raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(db, "get_pool", lambda: _BrokenPool())
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        db.chat_append_strict("u", "m", 1.0, {"id": "m"}, max_messages=0)
+
+    # Existing callers retain the historical non-raising contract.
+    db.chat_append("u", "m", 1.0, {"id": "m"}, max_messages=0)

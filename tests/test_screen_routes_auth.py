@@ -1,6 +1,6 @@
 """Unit tests for the screen enclave auth-forwarding logic.
 
-host-all / zero-roster agents authenticate with a Stage-D runtime token and have
+Runtime V2 workers authenticate with a scoped runtime token and have
 no api_key; the enclave-proxy screen reads must forward that token (not an empty
 header) or every hosted-agent screen read fails. The Flask ``_enclave_forward_auth``
 wrapper was deleted in the ASGI cutover; this tests the framework-neutral core it

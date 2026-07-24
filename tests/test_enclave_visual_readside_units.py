@@ -61,10 +61,34 @@ def test_memory_inner_to_v1_passthrough_and_legacy():
 
 
 def test_memory_index_filter_items():
-    items = [{"bucket": "a", "threads": ["x"]}, {"bucket": "b", "threads": []}]
+    items = [
+        {"bucket": "a", "threads": ["x"], "content": "Cat food notes"},
+        {"bucket": "b", "threads": [], "content": "Quarterly tax notes"},
+    ]
     assert len(readside.memory_index_filter_items(items, {"bucket": "a"})) == 1
     assert len(readside.memory_index_filter_items(items, {"thread": "x"})) == 1
     assert len(readside.memory_index_filter_items(items, {})) == 2
+    assert readside.memory_index_filter_items(items, {"query": "CAT FOOD"}) == [items[0]]
+    assert readside.memory_index_filter_items(items, {"query": "tax"}) == [items[1]]
+    assert readside.memory_index_filter_items(items, {"query": "missing"}) == []
+
+
+def test_memory_search_item_matches_private_content_without_changing_index_shape():
+    envelope = {"id": "m1"}
+    inner = {
+        "summary": "ordinary summary",
+        "content": "hidden blue-orchid-47 detail",
+        "bucket": "notes",
+        "threads": [],
+    }
+    public_item = readside.build_memory_index_item(envelope, inner)
+    search_item = readside.build_memory_search_item(envelope, inner)
+
+    assert "content" not in public_item
+    assert "_search_content" not in public_item
+    assert readside.memory_index_filter_items(
+        [search_item], {"query": "BLUE-ORCHID-47"}
+    ) == [search_item]
 
 
 def test_decrypt_readside_items_skips_local_only(monkeypatch):

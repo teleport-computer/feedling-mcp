@@ -47,6 +47,212 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-22
+
+### [DONE] Task 11 — 双运行时部署拓扑：serve-worker 并入主 CVM，runner 回 V1-only
+
+- 三份主 CVM compose（`docker-compose.phala.yaml` prod / `.test.yaml` /
+  `.pre.yaml`）各新增 `serve-worker` 服务：与 `backend` 同镜像、同 tag，
+  `command` 跑 `backend/model_api_runtime/v2/serve_worker.py`，
+  `FEEDLING_ENCLAVE_URL`/`FEEDLING_API_URL` 改为 compose 内网地址
+  （`https://enclave:5003` / `http://backend:5001`，照抄 backend 现用值，
+  不再走公网 gateway passthrough）。`backend` 与 `serve-worker` 都加
+  `FEEDLING_HOSTED_RUNTIME_POLICY: "dual"`（原 `v2_only` 字面量）+
+  `FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"`——日一部署行为与部署前
+  完全一致（全员 fence=resident），个别用户走 allowlist 单独切 v2。
+- `deploy/docker-compose.phala.prod.runner.yaml` 从 `origin/test` 逐字节
+  恢复为 V1-only 形态（`agent-runner` + `supervisor.py`）——这就是 prod
+  当前的真实部署形态，仓库文件此前因早前 Runtime-V2-only 迁移任务而漂移。
+- `deploy/docker-compose.phala.runner.yaml`（test 独立 runner CVM）与
+  `deploy/docker-compose.phala.pre.runner.yaml` 均是/回到 V1 `agent-runner`
+  形态。**Code review 纠偏**：test 环境不是「需要新配一个 V1 runner 的缺口」——
+  test **今天本来就是 V1 托管**：`origin/test` 上的 `docker-compose.phala.
+  runner.yaml` 从来就是 agent-runner 形态，CI `deploy-test-runner-cvm` 把它
+  部署到真实存在的 `feedling-io-agents-test` CVM（P0 的 host-all 修复正是在
+  这个 CVM 上验证的）；仓库文件此前因分支上更早一轮 Runtime-V2-only 迁移工作
+  漂移成了纯 serve-worker 形态,未曾推送到该 CVM 的真实部署。本次连同 prod 一起
+  从 `origin/test` 逐字节恢复。pre 的 runner 是从
+  `origin/test:deploy/docker-compose.phala.runner.yaml` 的 V1 runner 模板改编
+  （env var 名不变，仅重命名 app/container/volume 为 pre 前缀）——三环境现在
+  拓扑完全同构：主 CVM `dual`（backend + serve-worker）+ 独立 runner CVM
+  V1 `agent-runner`。P1 用 pre 这一对验证双跑全链路，早于 P3 动 prod。
+- CI（`.github/workflows/ci.yml` + `deploy/pin-runtime-release.sh`）：
+  release-pin 脚本**无需改动**——serve-worker 现在与 backend 共用
+  `ghcr.io/…/feedling:<sha>` 镜像引用，脚本对 `main_compose` 的正则替换
+  本就覆盖它；已 dry-read 确认。`deploy-test-runner-cvm` /
+  `deploy-prod-runner-cvm` / `deploy-pre-runner-cvm` 三个 job 的
+  `phala deploy -e` 参数都改回 V1 变量
+  （`AGENT_MAX_CHILDREN`/`AGENT_RUNTIME_USERS`/`FEEDLING_HOST_ALL` 等），
+  移除了各自 V2-only 的 post-deploy 校验步骤（`check-v2-runner-fleet.py`
+  liveness/fleet-identity gate、pre 的 prompt-cache canary）。
+  `deploy/check-prod-runner-topology.sh` 的「≥2 个独立 runner CVM」检查默认
+  降为软告警（`DEPLOY_PROD_RUNNER_CVM` 开关 + `PROD_RUNNER_TOPOLOGY_ENFORCE`
+  重新拉紧），否则当前只有 1 个已配置的 prod runner CVM 会让硬门槛永久卡死
+  所有未来 prod 主 CVM 部署——**这个默认极性与 disable 开关是 Task 11 新引入
+  的，不是「恢复」origin/test 的旧脚本**（origin/test 从无 disable 参数、也
+  从无「main CVM 不得出现在 runner inventory」检查）。Code review 还纠正了一处
+  安全回归：main-CVM-membership 检查此前被放在 `enabled` 提前返回之后，会被
+  `enabled=false` 一并跳过；已挪到提前返回之前、无条件执行，并补了组合回归
+  测试（`enabled=false` + main CVM 出现在 inventory → 仍必须 hard-fail）。
+- **CI 安全核对**：workflow 顶层 `on.push.branches: [main, test, pre]` /
+  `on.pull_request.branches: [main, test, pre]` 已排除 `feat/dual-runtime`；
+  每个 deploy/validate job 的 `if:` 额外要求
+  `github.ref == 'refs/heads/{main|test|pre}' && github.event_name == 'push'`。
+  推本分支不会匹配任何一个 job，不会触发对 prod/test/pre 的任何自动部署。
+- `deploy/DEPLOYMENTS.md` 新增「双运行时拓扑」小节（拓扑图 + 环境变量表 +
+  P3 部署序）；三环境现已同构描述，删掉了此前一版里关于「test 缺 V1
+  runner」的条件式披露（那是基于 test 现状的错误前提写的，已用上面的纠偏
+  重写）。
+
+## 2026-07-20
+
+### [DONE] Runtime and product telemetry share one honest operator dashboard
+
+- The existing admin data-track page now combines 30-day Runtime V2 effective
+  input/output/cache token totals, provider-usage coverage, V2 account/turn
+  counts, current hosted/self-hosted activated-account coverage, and the
+  existing iOS foreground-duration roll-up.
+- Missing provider usage stays unknown and lowers the displayed coverage ratio
+  instead of becoming a false zero. Self-hosted coverage is explicitly the
+  observable activated account-route count: fully offline instances that never
+  contact the official backend cannot be counted, and reinstall orphan rows can
+  keep it from being an exact human or deployment count.
+
+### [DONE] Runtime V2 release closure makes trajectories durably debuggable
+
+- Encrypted raw chat, trajectory, and review content has no time-based TTL or
+  background GC. Chat Clear moves raw rows into an immutable non-prompt archive
+  and preserves trajectory/review evidence while clearing live conversation/
+  prompt state; account deletion remains the complete per-user erasure boundary.
+- Added a default-off, runner-local break-glass inspector for one exact user/job.
+  It requires a validated operator, fixed reason, and case reference, and writes
+  durable requested/outcome audit phases without creating a plaintext HTTP or
+  admin endpoint.
+- `GET /v1/admin/v2-metrics` now exposes a bounded content-free `turn_health`
+  snapshot covering terminal outcomes, queue/lease expiry, oldest pending age,
+  p95 latency, and trajectory completeness/capture gaps.
+- Automatic Memory Capture and Memory Dream are independent deployment
+  controls and every managed environment, including Pre, defaults both off.
+  The dormant Capture path now uses exact raw-seq coverage with live-row-only
+  provider disclosure, encrypted prepared-batch recovery before provider setup, and one
+  atomic Memory/log/frontier/job commit. User opt-out, fleet halt, Chat Clear,
+  and runtime cutover now linearize against the complete provider disclosure,
+  while Memory retype derives changes from the fresh cross-process-fenced row.
+  Lost ownership and synthetic-only windows fail or advance without leaking
+  content, repeating the provider call, surfacing a chat error, or silently
+  skipping a frontier.
+- The optional E2B artifact path now shares the iOS/backend 25 MiB boundary and
+  a content-addressed template tag. Source is activation-ready, but remains
+  fail-closed until an environment supplies the provider credential/template
+  and approves the external data boundary.
+- Typing-signal pre-warm is explicitly removed from the Runtime V2 release scope.
+  Remaining release gates are operational: target-CVM load/fault soak, external
+  health alerting, a second production runner, and live zero-resident inventory.
+
+## 2026-07-19
+
+### [DONE] Runtime V2 flight recorder becomes byte-complete for model-visible turns
+
+- Oversized provider/tool/reply trajectory events now use exact, digest-verified
+  encrypted chunks appended in one stream transaction and one multi-row INSERT
+  instead of retaining only a 512 KiB prefix. Serialization, compression, and
+  envelope sealing run off the shared asyncio loop; unsupported values now fail
+  visibly instead of becoming depth/unsupported omission markers.
+- Every async compatibility and transient provider HTTP attempt is retained in
+  memory and folded into the existing encrypted response/error event: exact JSON
+  request body, effective request model, status/error class, fallback, ordinals,
+  and monotonic duration. This adds no attempt-level database or network call.
+- Parallel tool results now carry monotonic duration and durable platform/MCP
+  effect evidence; reply delivery records the durable effect disposition.
+  Aggregate metrics still name the user-configured provider/model, while the
+  trajectory names the effective wire model per attempt.
+- Required or best-effort evidence failures emit an encrypted `capture_gap`
+  marker before terminal capture, so an otherwise terminal trajectory remains
+  explicitly partial rather than claiming false completeness.
+- Per-user `v2_turn_metrics` now cascade on account deletion, with the redundant
+  reset belt, dedicated child-key index, and direct cascade coverage updated so
+  model/token telemetry cannot survive the documented complete-erasure boundary.
+- Offline review remains bounded and side-effect-free, and retention/GC plus a
+  restricted inspection/export policy remain explicit product/operations work.
+
+### [DONE] Runtime V2 harness parity lands in source with explicit live gates
+
+- The unified model-visible catalog now has 23 built-in tools: 21 platform
+  capabilities plus bounded `task` subagents and loop-native `reply`. Independent
+  reads/tasks run concurrently; disjoint workspace writes may commit in
+  conflict-free waves, while conflicting paths and external effects remain
+  provider-ordered.
+- Added the encrypted, backend-pluggable VFS: read-only `/artifacts` and
+  `/skills`, editable `/workspace`, and editable `/memory/WORKING.md` separate
+  from Memory Garden. Existing text views and virtual text edits do not acquire
+  a sandbox; uncached artifact materialization fails closed unless an E2B or CVM
+  provider is configured. E2B is source-wired but remains a deployment data-
+  boundary decision, not an automatic upload path.
+- Provider adapters preserve a deterministic tool/system/trusted-skills cache
+  prefix and normalize cache reads/writes/misses, including Bedrock Converse
+  cache points. Editable `WORKING.md` is deliberately pull-only rather than
+  eagerly cached; reading private workspace state removes later outbound
+  web/MCP/`task` tools for that turn. The existing Pre canary proves OpenRouter
+  only; native Bedrock and a live trusted-skills mutation still need deployment
+  evidence.
+- Runtime V2 now persists an append-only encrypted per-job trajectory.
+  Optional provider-backed failure review is default-off, fail-closed,
+  database-admission-bounded, and structurally has no reply/tool/effect surface.
+  It is offline analysis rather than deterministic replay; automatic retention/
+  GC and restricted inspection/export policy remain open.
+- Eager perception grounding is now a strict fixed-field numeric/boolean/null
+  projection. Third-party calendar/reminder/app/place/weather text and
+  screen/photo content are pull-only; after an explicit text-bearing read the
+  loop removes later web, MCP, and `task` channels. Numeric health reads remain
+  compatible with later outbound work.
+- Raw encrypted Chat rows and attachment bodies remain the durable ledger. The
+  5,000-message value is only an in-process hot-window bound, never a database
+  retention rule. Runtime V2 now stores exact-range conversation-summary leaves
+  and higher-level checkpoints as immutable encrypted rows, retains every child,
+  and binds a bounded materialized prompt view to the canonical IDs with a
+  versioned CAS. Existing aggregate summaries migrate lazily and oversized old
+  summaries are reduced through bounded hierarchical calls even without a new
+  message.
+- Explicit Chat clear is now a generation-fenced atomic reset of the live
+  conversation: raw encrypted rows move to an immutable non-prompt archive,
+  while summary, chat-derived artifacts, pending effects/status, and reply
+  cursor are removed. Paused old workers cannot recreate cleared context.
+  Independent Memory, user-authored workspace, schedules, content-free metrics,
+  archived chat, and encrypted trajectory telemetry remain until account
+  deletion, the complete-erasure boundary.
+- Hosted resident retirement is complete in source and managed manifests, but
+  live fleet closure still requires deploying the reviewed image everywhere,
+  provisioning production's second runner failure domain, and verifying zero
+  legacy hosted processes. Typing-signal pre-warm also remains unimplemented.
+- Production runner deploys now bind each worker heartbeat to the target
+  inventory CVM ID and exact seven-character image build. The worker fails
+  closed on missing/mismatched identity, and CI outlives stale heartbeat windows
+  before requiring a current-build turn + Genesis pair for every listed CVM;
+  the gate remains intentionally blocked while only one production CVM ID is
+  provisioned.
+
+## 2026-07-18
+
+### [DONE] Hosted resident fleet retired; all managed hosting is Runtime V2-only
+
+- Local, test, pre, and production backend manifests now force literal
+  `v2_only`; every runner manifest contains only the pooled `serve-worker`.
+  Test/pre/prod worker-CVM deploy jobs are mandatory and fail when their
+  topology is missing.
+- Removed the hosted resident supervisor, spawners, leases, token helper,
+  per-user CLI homes/checkpoints/volumes, roster/host-all controls, and resident
+  rollback/admin selector. The historical `feedling-agent-runner` package name
+  remains, but its image now contains only the Python Runtime V2 worker.
+- Hosted send requires the exact V2 ownership tuple and fails before persistence
+  on stale ownership, dead workers, kill switch, or admission rejection. The
+  independent user-operated `/v1/chat/*` resident consumer remains separate and
+  cannot claim hosted accounts.
+- Preserved iOS retry correctness during the cutover: `client_msg_id` duplicate
+  detection now runs inside the same transaction as V2 message append and job
+  enqueue, so a lost `202` cannot create a second row or execute a second turn.
+- Replaced the resident rollback guide with V2 scale/recovery procedures and
+  added structural tests that reject any return of hosted resident services,
+  selectors, CLI toolchains, or optional worker deploys.
 ## 2026-07-23（数据导出补上世界书）
 
 ### [DONE] `/v1/content/export` 加 `world_book`，schema_version 2→3
@@ -284,6 +490,35 @@
   省掉每次 push 的独立 touch 连接/往返。附带把 ValidationError schema 固化进
   导出工具（防生成环境版本漂移反复增删 input/ctx）。测试增至 66 用例全绿。
 
+## 2026-07-15
+
+### [DONE] Pre becomes automatic Hosted Runtime V2 acceptance environment
+
+- Added a strict Pre-only `v2_only` ownership policy. Backend startup backfills
+  all existing active/tested/supported accounts before serving; fresh setup,
+  successful tests, and route activation persist the same atomic
+  `db_action_v2` + `v2` generation-fenced control. iOS testers no longer need a
+  user id, admin flip, recovery drill, or runtime-service knowledge.
+- Requests fail closed on policy mismatch and worker loss. The Pre deploy now
+  requires the runner job and gates on a build-matched turn worker, capacity,
+  Genesis heartbeat, and complete runtime-policy coverage.
+- Hardened configuration lifetime races: V2 enablement revalidates and locks an
+  active tested route inside the ownership transaction; setup, active-route
+  changes, and active-key rotation generation-fence any pinned provider snapshot;
+  deletion performs a second resident fence; failed/last routes fence current
+  work; config-lock waiters are connection-bounded and deadline-visible; and
+  `resident_only` rollback also discovers orphaned V2 controls with no route.
+- Cutover recovery now chooses the newest unanswered message before consulting
+  its durable terminal marker, so it cannot fall back to an older row and make
+  the worker reread/rebill a terminally failed newer message. Gunicorn also
+  closes the startup reconciliation pool before forking clean worker-local pools.
+- Replaced startup/reconnect account normalization's stale whole-registry rewrite
+  with per-user JSONB compare-and-swap, and made wake-bus handler registration
+  idempotent. A concurrent fresh iOS signup can no longer be deleted by an older
+  worker snapshot while the V2 runner is reconnecting.
+- The resident supervisor stays deployed but has an empty eligible roster on
+  Pre. `PRE_HOSTED_RUNTIME_POLICY=resident_only` is the explicit fleet rollback;
+  test and production remain per-user rollout environments.
 ## 2026-07-17
 
 ### [FEAT] pi 路线终于能用用户 MCP 了（v2 spec §11 的后续项，欠了 4 天）
@@ -432,6 +667,40 @@
 - Reasoning effort forwarded **natively** by pi (openrouter etc.), no gateway intermediary. **NOTE:** the `_PI_MODEL_REASONING_KEY` models.json field is a **PLACEHOLDER** pending a pre-spike on `pre` branch (verify openrouter reasoning returns a real chain with no litellm process).
 - Discovery `list_agent_runtime_enabled_users()` derives pi via the `model_api_routes`/`model_api_credentials` JOIN with CASE fallback (ELSE→`pi`), unconditional (no `include_gateway` flag).
 - Status: implemented on branch `feat/pi-on-multiprofile`, **NOT committed/deployed**; pre-spike on `pre` is the pre-prod validation gate before test deployment.
+
+## 2026-07-11
+
+### [DONE] Hosted Runtime V2 安全审计跟进进入 draft PR；用户切换仍 HOLD
+
+- 以 `feat/hosted-runtime-v2` 的 `bfc8862` 为审计基线，提交 bounded follow-up
+  `20c4b0b`，并开出以该 feature branch 为 base 的
+  [draft PR #70](https://github.com/teleport-computer/feedling-mcp/pull/70)；没有合进
+  `main`、没有部署、没有切任何用户。
+- 工程师随后把 feature branch 推到 `0333bc4`，用“缺失/非法 mode = V2”做隐式全量
+  切换。child branch 保留该提交历史并以 `f08fe5a` 显式 revert：只有明确
+  `db_action_v2` 才进 V2；缺失/非法仍走 resident，mode 读取失败拒绝路由；resident
+  discovery 的 DB 失败不再伪装成空 roster 而误杀全 fleet，admin/scheduler 列表也会
+  枚举没有 runtime blob 的 active-route 用户。该 reconciliation slice **109 passed**；
+  broader changed-surface 为 **680 passed / 1 xfailed / 3 个已在 engineer tree 复现的
+  baseline failures**。
+- 关闭本轮三个直接 blocker：chat 入队即有 queue deadline，pending/active 由独立
+  reaper 终态化并显示错误；Anthropic/Gemini 的 AnyIO limiter 按 worker slots 扩容
+  （native async 仍是后续）；rollout CLI 改用包含 planner rounds + responder 的
+  loop-aware tokens/turn 口径。
+- 同批补齐 mixed-version queue/lease 兼容、per-user 跨 lane 串行、late-input successor、
+  strict chat durability、runtime/effect fences、worker identity/slot supervision、迁移图修复、
+  隐私 scrub、SSRF/redirect/body cap 与 enclave-private memory search。验证：focused
+  **385 passed**，Alembic 单 head `0024_v2_worker_capacity`，真实 PostgreSQL
+  `0020→0024` 升级通过；共享 fixture gate 为 **574.0 tokens/turn、2.3333 calls/turn**。
+- **仍是 NO-GO**：resident→V2 稳定 cursor/generation、transactional outbox + 幂等 effects、
+  永久 hung call 的硬恢复、effect commit 原子 generation fence、tool-output prompt-injection
+  trust boundary、summary coverage/retention invariant、保留 Genesis 的 live pool kill switch
+  未完成。完整验收合同与工程师交接见
+  [Hosted Runtime V2 audit handoff](HOSTED_RUNTIME_V2_AUDIT_HANDOFF_2026-07-11.md)，运维顺序见
+  [rollout runbook](../deploy/HOSTED_RUNTIME_V2_ROLLOUT.md)。
+- 存储词汇校正：conversation summary/trajectory 的产品要求是 storage-agnostic；当前外部
+  RDS adapter 用 envelope encryption，目标 pg CVM 则在 LUKS2 FDE 盘上存 plaintext 并
+  删除 envelope/decrypt/rewrap 层。模型在两种拓扑中都只在授权 CVM 内看到 plaintext。
 
 ## 2026-07-09
 

@@ -87,7 +87,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:1fb4c38
+    image: ghcr.io/teleport-computer/feedling:98df8d5
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -99,10 +99,10 @@ services:
       # runtime token LOCALLY (core/runtime_token.py) in _whoami_cached and
       # /v1/envelope/decrypt, SKIPPING the reentrant backend /v1/users/whoami
       # round-trip (backend/enclave_app.py, commit fdb528a). MUST match the
-      # backend's + agent-runner's secret. Empty = falls back to the backend
+      # backend's + pooled V2 worker's secret. Empty = falls back to the backend
       # round-trip (old behavior, no regression). Encrypted env, not baked into
       # compose_hash. Without this line the local-verify code is dead and every
-      # host-all (runtime-token) decrypt reentrantly hits the backend.
+      # Runtime V2 decrypt reentrantly hits the backend.
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       # gunicorn worker (process) count for the enclave (enclave_app.py
       # _enclave_worker_count, default 1). Prod CVM is 8 vCPU so >1 parallelizes
@@ -149,7 +149,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:1fb4c38
+    image: ghcr.io/teleport-computer/feedling:98df8d5
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -261,6 +261,19 @@ services:
       # flipped to "false" to revert the whole fleet. See
       # core/util.runtime_v2_default_on().
       FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"
+      # Dual-runtime coexistence (2026-07-21 design): hosted accounts default to
+      # the V1 resident runtime (per-user allowlist promotes individual users to
+      # pooled Runtime V2, served by the serve-worker container below). This is a
+      # literal measured-compose value, not an encrypted-env rollback selector —
+      # see backend/hosted/config_store.py HOSTED_RUNTIME_POLICY_ENV.
+      FEEDLING_HOSTED_RUNTIME_POLICY: "dual"
+      # Per-user allowlist fence default for accounts with no explicit runtime
+      # row yet (backend/hosted/runtime_reconciler.py _DEFAULT_DESIRED_ENV).
+      # "resident" keeps day-1 behavior identical to pre-dual-runtime prod;
+      # allowlisted users' desired state overrides this default.
+      FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
+      # Automatic Memory Capture stays explicit opt-in (default off).
+      FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-0}"
       # Genesis v2 (foreground-fast onboarding): greet on 3-5 core + identity
       # baseline, push the heavy reduce (the old ~37% failure surface) to the
       # background. Validated on test; flip to "false" to revert to the v1
@@ -271,26 +284,17 @@ services:
       # test (real-device quality comparison); flip off to revert to the exact
       # old split-map path. Read in worker.genesis_combined_map_enabled().
       FEEDLING_GENESIS_COMBINED_MAP: "true"
-      # Host-all: every configured user is served by the agent-runner. The send
-      # routing here must agree with the supervisor's host_all discovery. Defaults
-      # to "true": the cutover routes all fit-provider users to agent-runner with
-      # no per-user flag (resolve_driver) and the boot gate requires it; unset/empty
-      # → true. The only remaining deploy-time secret is FEEDLING_RUNTIME_TOKEN_SECRET.
-      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-true}"
       # Legacy memory migration is opt-in. Empty = off; set to 1 only after
-      # seeded Garden verification passes. Mirror agent-runner.
+      # seeded Garden verification passes. Mirror the pooled V2 worker.
       FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
-      # Stage-D runtime token secret — the BACKEND verifies tokens (and the
-      # enclave now verifies them locally too, see the enclave service above),
-      # so it MUST share the agent-runner's secret or token auth 401s. Empty =
-      # off. Encrypted env, not baked into compose_hash.
+      # Runtime-token secret shared by backend, enclave, and pooled V2 worker.
+      # Empty = off. Encrypted env, not baked into compose_hash.
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       # gunicorn worker (process) count (backend/gunicorn_conf.py _worker_count,
       # default 1). N>1 is code-supported: leader-elected :9998 WS bind
       # (core/leader.py run_singleton, in the deployed image) + Postgres
       # LISTEN/NOTIFY wake bus (core/wake_bus.py). Needed because each hosted
-      # resident consumer parks a /v1/chat/poll thread for up to 30s — with ~90
-      # consumers, -w1×32 threads starves and even /healthz queues 8-19s. Sizing:
+      # clients can park /v1/chat/poll threads for up to 30s. Sizing:
       # ~18 DB conns/worker; prod RDS max_connections=402 so 4 workers (~72) is
       # safe. Encrypted env, not baked into compose_hash — flip via var without
       # on-chain re-auth. Default 4 here since the deployed image has the leader
@@ -327,14 +331,44 @@ services:
       enclave:
         condition: service_healthy
 
-  # NOTE: the inline agent-runner service was removed here — the hosted agent-
-  # runtime now runs on a DEDICATED runner CVM
-  # (deploy/docker-compose.phala.prod.runner.yaml). This CVM runs only ingress +
-  # enclave + backend. The backend env above intentionally still mirrors the
-  # runner's FEEDLING_HOST_ALL / FEEDLING_RUNTIME_TOKEN_SECRET so the
-  # hosted-cutover gate stays satisfied and the runner CVM shares
-  # the same token auth. Scale hosting by adding runner CVMs, not by re-adding
-  # this service (that would put key-bearing hosting back on the enclave CVM).
+  # --- Pooled Runtime V2 worker (dual-runtime coexistence, in-CVM). ---
+  # Same image as backend — the release-pin script (deploy/pin-runtime-release.sh)
+  # retargets whichever `ghcr.io/…/feedling:<sha>` refs exist in this file, so
+  # backend and serve-worker are pinned to the same commit automatically. This
+  # container serves ONLY the per-user allowlist's v2/draining accounts (see
+  # docs/superpowers/specs/2026-07-21-dual-runtime-v1-v2-coexistence-design.md
+  # §7a); V1 resident hosting for the rest of the fleet still runs on the
+  # separate agent-runner CVM(s) (deploy/docker-compose.phala.prod.runner.yaml),
+  # which this compose change does NOT touch (§7b: "runner CVM: 不动").
+  serve-worker:
+    image: ghcr.io/teleport-computer/feedling:98df8d5
+    container_name: serve-worker
+    command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
+    restart: unless-stopped
+    environment:
+      # Compose-internal URLs — NOT the public gateway. Mirrors backend's own
+      # FEEDLING_ENCLAVE_URL above; the ingress ROUTING_MAP entry
+      # (api.feedling.app=backend:5001) is the source of the backend port.
+      FEEDLING_API_URL: "http://backend:5001"
+      FEEDLING_ENCLAVE_URL: "https://enclave:5003"
+      DATABASE_URL: "${DATABASE_URL:-}"
+      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+      FEEDLING_V2_MAX_WORKERS: "4"
+      FEEDLING_V2_FLEET_IDENTITY_REQUIRED: "1"
+      FEEDLING_V2_RUNNER_CVM_ID: "${FEEDLING_V2_RUNNER_CVM_ID:-main-cvm}"
+      FEEDLING_V2_DEPLOYED_BUILD: "${FEEDLING_V2_DEPLOYED_BUILD:-}"
+      FEEDLING_GENESIS_WORKER_ENABLED: "1"
+      FEEDLING_V2_SANDBOX_PROVIDER: "disabled"
+      FEEDLING_V2_IMAGE_MAX_B64_CHARS: "2700000"
+      # web_fetch article extraction (trafilatura, runs in this serve-worker).
+      # Default ON — a rollback lever, not a feature gate. Set to "0" to fall back
+      # to the plain tag-strip; takes effect on the next serve-worker restart.
+      FEEDLING_WEB_EXTRACT_ARTICLE: "${FEEDLING_WEB_EXTRACT_ARTICLE:-1}"
+      FEEDLING_HOSTED_RUNTIME_POLICY: "dual"
+      FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
+    depends_on:
+      enclave:
+        condition: service_healthy
 
 volumes:
   feedling_enclave_data:

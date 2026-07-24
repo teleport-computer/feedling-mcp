@@ -16,7 +16,9 @@ def test_keepalive_outlives_client_connection_pools():
 
 
 def test_on_starting_calls_assert_hosting_ready(monkeypatch):
-    import sys, os, importlib
+    import importlib
+    import os
+    import sys
 
     # Import gunicorn_conf (backend is on sys.path via PYTHONPATH=. when pytest
     # runs from the backend dir — no manual pre-injection here).
@@ -28,15 +30,63 @@ def test_on_starting_calls_assert_hosting_ready(monkeypatch):
     saved = sys.path[:]
     sys.path[:] = [p for p in sys.path if os.path.abspath(p) != here]
     try:
-        called = {}
+        called = []
         monkeypatch.setattr("hosted.agent_runtime_cutover.assert_hosting_ready",
-                            lambda: called.setdefault("x", True))
+                            lambda: called.append("hosting"))
+        monkeypatch.setattr("db.init_schema", lambda: called.append("schema"))
+        monkeypatch.setattr(
+            "hosted.config_store.reconcile_hosted_runtime_policy",
+            lambda: called.append("policy") or {"policy": "per_user"},
+        )
+        monkeypatch.setattr("db.close_pool", lambda: called.append("close_pool"))
         gconf.on_starting(None)
-        assert called.get("x") is True
+        assert called == ["hosting", "schema", "policy", "close_pool"]
         # Hardening check: on_starting must have re-inserted backend into sys.path.
         assert here in [os.path.abspath(p) for p in sys.path]
     finally:
         sys.path[:] = saved
+
+
+def test_on_starting_closes_master_pool_when_policy_reconcile_fails(monkeypatch):
+    import importlib
+
+    gconf = importlib.import_module("gunicorn_conf")
+    called = []
+    monkeypatch.setattr(
+        "hosted.agent_runtime_cutover.assert_hosting_ready", lambda: None
+    )
+    monkeypatch.setattr("db.init_schema", lambda: None)
+
+    def fail_policy():
+        raise RuntimeError("policy failed")
+
+    monkeypatch.setattr(
+        "hosted.config_store.reconcile_hosted_runtime_policy", fail_policy
+    )
+    monkeypatch.setattr("db.close_pool", lambda: called.append("close_pool"))
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="policy failed"):
+        gconf.on_starting(None)
+    assert called == ["close_pool"]
+
+
+def test_close_pool_forgets_pool_before_stopping_threads(monkeypatch):
+    import db
+
+    closed = []
+
+    class FakePool:
+        def close(self):
+            assert db._pool is None
+            closed.append(True)
+
+    monkeypatch.setattr(db, "_pool", FakePool())
+    db.close_pool()
+
+    assert db._pool is None
+    assert closed == [True]
 
 
 def test_worker_recycling_bounds_arena_growth():

@@ -61,7 +61,7 @@ class ScreenResult:
 def enclave_forward_headers(*, api_key: str | None, runtime_token: str | None) -> dict:
     """Auth header to forward to the enclave, preferring the Stage-D runtime token.
 
-    Mirrors the old Flask ``_enclave_forward_auth``: host-all / zero-roster agents
+    Mirrors the old Flask ``_enclave_forward_auth``: Runtime V2 workers
     have NO per-user api_key, so the runtime token must win. Empty dict only when
     neither credential is present.
     """

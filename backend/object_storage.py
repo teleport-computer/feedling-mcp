@@ -20,6 +20,8 @@ dedicated var so it never collides with the WAL-G backup ``R2_BUCKET``):
   - ``R2_FRAMES_BUCKET``      : the bucket for frame ciphertext (e.g.
                                 ``io-image-frames``). The token MUST be
                                 scoped to this bucket.
+  - ``R2_CONNECT_TIMEOUT_SEC``: bounded TCP/TLS connect timeout (default 3s).
+  - ``R2_READ_TIMEOUT_SEC``   : bounded response/read timeout (default 10s).
 
 When credentials/bucket are unset, ``enabled()`` returns False and callers keep
 the legacy inline-``doc`` behaviour, so local dev / tests work without R2.
@@ -30,6 +32,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import secrets
 import threading
 
 log = logging.getLogger(__name__)
@@ -41,6 +44,15 @@ _KEY_PREFIX = "frames"
 _TEE_KEY_PREFIX = "frames-tee"
 _client_lock = threading.Lock()
 _cached_client = None
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    """Read a strictly-positive timeout without letting bad env wedge startup."""
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+    return value if value > 0 else float(default)
 
 
 def _endpoint() -> str:
@@ -85,6 +97,12 @@ def _client():
                 config=Config(
                     signature_version="s3v4",
                     retries={"max_attempts": 3, "mode": "standard"},
+                    connect_timeout=_positive_float_env(
+                        "R2_CONNECT_TIMEOUT_SEC", 3.0,
+                    ),
+                    read_timeout=_positive_float_env(
+                        "R2_READ_TIMEOUT_SEC", 10.0,
+                    ),
                 ),
             )
         return _cached_client
@@ -275,19 +293,67 @@ def chat_files_enabled() -> bool:
     return bool(_endpoint() and _access_key() and _secret_key() and _chat_files_bucket())
 
 
-def chat_body_key(user_id: str, msg_id: str, content_type: str = "file") -> str:
+def chat_body_key(
+    user_id: str,
+    msg_id: str,
+    content_type: str = "file",
+    *,
+    upload_version: str | None = None,
+    storage_generation: int | None = None,
+) -> str:
     """The R2 key a body of this content_type is written under. Write-side only —
-    readers/deleters use the ``body_key`` stored on the row."""
+    readers/deleters use the ``body_key`` stored on the row.
+
+    Runtime offloads pass both the lifecycle ``storage_generation`` pinned by
+    their initial database write and a fresh ``upload_version``. The generation
+    segment is advanced only when account deletion retires all retained chat;
+    Clear Chat preserves the generation because it archives the ciphertext. The
+    version prevents two in-flight writes for one message overwriting each other
+    before PostgreSQL chooses the winner. ``None`` retains the original key shape
+    for maintenance/legacy callers. Readers and deleters support every layout
+    because they always follow the persisted key.
+    """
     prefix = _CHAT_IMAGE_KEY_PREFIX if content_type == "image" else _CHAT_KEY_PREFIX
-    return f"{prefix}/{user_id}/{msg_id}"
+    if storage_generation is None:
+        base = f"{prefix}/{user_id}/{msg_id}"
+    else:
+        generation = int(storage_generation)
+        if generation < 0:
+            raise ValueError("storage_generation must be >= 0")
+        base = f"{prefix}/{user_id}/g{generation}/{msg_id}"
+    return f"{base}/{upload_version}" if upload_version else base
 
 
-def put_chat_body(user_id: str, msg_id: str, body_ct_b64: str, content_type: str = "file") -> str:
+def new_chat_body_upload_version() -> str:
+    """Return an unguessable per-attempt suffix for a runtime chat upload."""
+    return secrets.token_hex(16)
+
+
+def put_chat_body(
+    user_id: str,
+    msg_id: str,
+    body_ct_b64: str,
+    content_type: str = "file",
+    *,
+    upload_version: str | None = None,
+    storage_generation: int | None = None,
+) -> str:
     """Upload the decoded ciphertext bytes; return the R2 object key to persist.
 
     Raises on failure so the caller (db.chat_append) can fall back to inline
-    ``doc`` storage rather than persist a pointer to a missing object."""
-    key = chat_body_key(user_id, msg_id, content_type)
+    ``doc`` storage rather than persist a pointer to a missing object.
+
+    Runtime callers pass a value from :func:`new_chat_body_upload_version` to
+    allocate a private key for this attempt. The DB then uses compare-and-swap
+    promotion, so a losing upload can be deleted without risking the winner.
+    """
+    key = chat_body_key(
+        user_id,
+        msg_id,
+        content_type,
+        upload_version=upload_version,
+        storage_generation=storage_generation,
+    )
     raw = base64.b64decode(body_ct_b64)
     _client().put_object(
         Bucket=_chat_files_bucket(),
@@ -314,6 +380,49 @@ def chat_key_owned_by(key: str, user_id: str) -> bool:
     return any(key.startswith(f"{p}/{user_id}/") for p in _CHAT_KEY_PREFIXES)
 
 
+def chat_body_storage_generation(key: str, user_id: str) -> int | None:
+    """Generation encoded in a current-layout key, or ``None`` for legacy keys.
+
+    Parsing is intentionally ownership-aware and conservative. A malformed key
+    is never classified as an old generation merely because one segment happens
+    to start with ``g``.
+    """
+    if not chat_key_owned_by(key, user_id):
+        return None
+    parts = key.split("/")
+    if len(parts) < 5 or not parts[2].startswith("g"):
+        return None
+    raw = parts[2][1:]
+    if not raw.isdigit():
+        return None
+    return int(raw)
+
+
+def list_user_chat_body_keys(user_id: str) -> list[str]:
+    """List every persisted chat-body key under both of this user's prefixes.
+
+    Unlike the account-purge convenience helper below, errors propagate. The DB
+    reconciler must retain its durable cleanup intent when an inventory request
+    fails instead of mistaking the failure for an empty prefix.
+    """
+    client = _client()
+    bucket = _chat_files_bucket()
+    keys: list[str] = []
+    for prefix_root in _CHAT_KEY_PREFIXES:
+        prefix = f"{prefix_root}/{user_id}/"
+        token = None
+        while True:
+            kwargs = {"Bucket": bucket, "Prefix": prefix}
+            if token:
+                kwargs["ContinuationToken"] = token
+            resp = client.list_objects_v2(**kwargs)
+            keys.extend(str(item["Key"]) for item in resp.get("Contents", []))
+            if not resp.get("IsTruncated"):
+                break
+            token = resp.get("NextContinuationToken")
+    return keys
+
+
 def get_chat_body(key: str, user_id: str) -> str | None:
     """Fetch the object at ``key`` (the row's ``body_key``, owned by ``user_id``)
     and re-encode to the original base64 ``body_ct``.
@@ -335,16 +444,23 @@ def get_chat_body(key: str, user_id: str) -> str | None:
     return base64.b64encode(raw).decode("ascii")
 
 
-def delete_chat_body(key: str, user_id: str) -> None:
-    """Delete the object at ``key`` (the row's ``body_key``, owned by ``user_id``)."""
+def delete_chat_body(key: str, user_id: str) -> bool:
+    """Delete an owned body key, returning whether deletion was confirmed.
+
+    S3 DELETE is idempotent, so a successful response also confirms an already
+    absent object. Callers with durable cleanup rows use ``False`` to retain and
+    retry the intent instead of losing it on a transient R2 error.
+    """
     if not chat_key_owned_by(key, user_id):
         if key:
             log.error("[r2] delete_chat_body refused foreign key %s for user %s", key, user_id)
-        return
+        return False
     try:
         _client().delete_object(Bucket=_chat_files_bucket(), Key=key)
+        return True
     except Exception as e:  # noqa: BLE001
         log.error("[r2] delete_chat_body(%s) failed: %s", key, e)
+        return False
 
 
 def delete_user_chat_files(user_id: str) -> None:

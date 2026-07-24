@@ -1,5 +1,8 @@
 # Model API 多配置（credential + route）后端设计
 
+> **RETIRED / DO NOT DEPLOY.** Historical design; supervisor/roster sequencing
+> is not part of current Runtime V2 operations.
+
 日期：2026-07-10
 配套前端：`teleport-computer/feedling-mcp-ios` PR #76（`codex/model-api-profiles-debug`）
 

@@ -2,11 +2,11 @@
 
 A runtime token lets a hosted agent call Feedling routes for exactly ONE user
 without the agent ever holding that user's long-term Feedling API key. The
-agent-runner supervisor (trusted infra, same TDX domain) mints a token after
-acquiring a user's runtime lease; the backend verifies it on each request.
+Runtime V2 worker (trusted infra, same TDX domain) mints a token for an admitted
+user-scoped turn; the backend verifies it on each request.
 
 Lives in ``core`` (stdlib-only, no business deps) so both the minting side
-(``agent_runtime``) and the verifying side (``accounts.auth``) can import it
+(``model_api_runtime.v2``) and the verifying side (``accounts.auth``) can import it
 without violating dependency direction.
 
 Self-contained HMAC token (no JWT dependency): ``base64url(payload).hex(sig)``

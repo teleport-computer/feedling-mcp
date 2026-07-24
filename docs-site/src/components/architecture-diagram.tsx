@@ -166,17 +166,17 @@ export function ArchitectureDiagram() {
               Separate confidential-VM boundary
             </p>
             <h3 className="m-0 mb-2 mt-1 text-sm font-semibold" id="architecture-runner">
-              Hosted agent runner
+              Hosted Runtime V2 worker pool
             </h3>
             <div className="grid gap-2">
-              <Node title="Supervisor">
-                Discovers eligible users, maintains leases and heartbeats, and refreshes scoped runtime tokens.
+              <Node title="Pooled serve-worker">
+                Claims durable jobs, publishes capacity heartbeats, and mints scoped runtime tokens per turn.
               </Node>
               <div aria-hidden="true" className="text-center text-lg leading-none text-fd-primary">
                 ↓
               </div>
-              <Node title="Per-user child process">
-                Uses a separate home and session, decrypts authorized context, and invokes the configured agent.
+              <Node title="Bounded turn slot">
+                Runs the native tool loop under deadlines and a watchdog; durable state remains in PostgreSQL.
               </Node>
             </div>
           </section>

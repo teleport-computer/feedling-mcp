@@ -535,38 +535,45 @@ def _memory_retype_action(store: UserStore, action: dict) -> tuple[dict, list[di
         return {"status": "error", "error": "memory_id_required", "action": "memory.retype"}, [], 400
     if new_type not in memory_service.MEMORY_TYPES:
         return {"status": "error", "error": "type_invalid", "got": new_type, "allowed": list(memory_service.MEMORY_TYPES), "action": "memory.retype"}, [], 400
-    moments = memory_service._load_moments(store)
-    idx = next((i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == memory_id), None)
-    if idx is None:
-        return {"status": "error", "error": "not_found", "action": "memory.retype"}, [], 404
-    target = dict(moments[idx])
-    if target.get("owner_user_id") != store.user_id:
-        return {"status": "error", "error": "not_owned", "action": "memory.retype"}, [], 403
     anchor_ids = action.get("anchor_memory_ids") or []
-    ok, err = _memory_validate_write(store, moments, mem_type=new_type, anchor_ids=anchor_ids, memory_id=memory_id, enforce_reflection_cap=False)
-    if not ok:
-        return {"status": "error", **(err or {}), "action": "memory.retype"}, [], 400
-    old_type = target.get("type", "")
-    if old_type == new_type and anchor_ids == (target.get("anchor_memory_ids") or []):
-        return {"status": "ok", "action": "memory.retype", "changed_fields": [], "noop": True}, [], 200
-    target["type"] = new_type
-    target["updated_at"] = core_util._now_iso()
-    target["retyped_at"] = target["updated_at"]
-    if anchor_ids:
-        target["anchor_memory_ids"] = list(anchor_ids)
-    else:
-        target.pop("anchor_memory_ids", None)
-    # Re-read + re-find + replace-by-id + save under one memory_lock hold so a
-    # concurrent same-user write can't lost-update.
+    # Every target-dependent decision belongs under the cross-process Memory
+    # Garden mutation fence.  In particular, do not construct ``target`` from
+    # an optimistic pre-fence read and then drop it into a freshly loaded
+    # Garden: Capture may have re-encrypted or superseded that card while this
+    # request waited, and replacing it with the stale dict would silently erase
+    # the fresh envelope/status fields.
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
-        fresh_idx = next(
+        idx = next(
             (i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == memory_id),
             None,
         )
-        if fresh_idx is None:
+        if idx is None:
             return {"status": "error", "error": "not_found", "action": "memory.retype"}, [], 404
-        moments[fresh_idx] = target
+        target = dict(moments[idx])
+        if target.get("owner_user_id") != store.user_id:
+            return {"status": "error", "error": "not_owned", "action": "memory.retype"}, [], 403
+        ok, err = _memory_validate_write(
+            store,
+            moments,
+            mem_type=new_type,
+            anchor_ids=anchor_ids,
+            memory_id=memory_id,
+            enforce_reflection_cap=False,
+        )
+        if not ok:
+            return {"status": "error", **(err or {}), "action": "memory.retype"}, [], 400
+        old_type = target.get("type", "")
+        if old_type == new_type and anchor_ids == (target.get("anchor_memory_ids") or []):
+            return {"status": "ok", "action": "memory.retype", "changed_fields": [], "noop": True}, [], 200
+        target["type"] = new_type
+        target["updated_at"] = core_util._now_iso()
+        target["retyped_at"] = target["updated_at"]
+        if anchor_ids:
+            target["anchor_memory_ids"] = list(anchor_ids)
+        else:
+            target.pop("anchor_memory_ids", None)
+        moments[idx] = target
         memory_service._save_moments(store, moments)
     change = memory_service._append_memory_change(store, {
         "action": "retype",
@@ -586,7 +593,13 @@ def _memory_retype_action(store: UserStore, action: dict) -> tuple[dict, list[di
     }, [_memory_action_effect("memory.retype", memory_id, ["type", "anchor_memory_ids"])], 200
 
 
-def _memory_supersede_action(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
+def _memory_supersede_action(
+    store: UserStore,
+    api_key: str | None,
+    action: dict,
+    *,
+    runtime_token: str = "",
+) -> tuple[dict, list[dict], int]:
     if isinstance(action.get("envelope"), dict):
         return _memory_supersede_envelope_action(store, action)
 
@@ -626,7 +639,14 @@ def _memory_supersede_action(store: UserStore, api_key: str | None, action: dict
     if not ok:
         return {"status": "error", **(err or {}), "action": "memory.supersede"}, [], 400
 
-    old_inner, _old_inner_err = _memory_plain_from_envelope(old_cards[0], api_key)
+    old_inner, old_inner_err = _memory_plain_from_envelope(
+        old_cards[0], api_key, runtime_token=runtime_token)
+    if old_inner is None:
+        return {
+            "status": "error",
+            "error": old_inner_err,
+            "action": "memory.supersede",
+        }, [], 409
     inherited = _memory_inheritable_inner_fields(old_inner)
     raw_for_inner = {**inherited, **raw, "type": mem_type, "title": title, "description": description}
     if "importance" not in raw_for_inner and old_cards[0].get("importance") is not None:
@@ -812,7 +832,13 @@ def _memory_delete_action(store: UserStore, action: dict) -> tuple[dict, list[di
     return {"status": "ok", "action": "memory.delete", "memory": {"id": memory_id}, "change": change}, [effect], 200
 
 
-def _execute_memory_action(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
+def _execute_memory_action(
+    store: UserStore,
+    api_key: str | None,
+    action: dict,
+    *,
+    runtime_token: str = "",
+) -> tuple[dict, list[dict], int]:
     if not isinstance(action, dict):
         return {"status": "error", "error": "action_must_be_object"}, [], 400
     action_type = str(action.get("type") or action.get("action") or "").strip()
@@ -839,11 +865,12 @@ def _execute_memory_action(store: UserStore, api_key: str | None, action: dict) 
             "reason": action.get("reason") or "Memory patched by superseding old card.",
             "capture_mode": action.get("capture_mode") or "",
             "source_chat_message_ids": action.get("source_chat_message_ids") or [],
-        })
+        }, runtime_token=runtime_token)
     if action_type == "memory.retype":
         return _memory_retype_action(store, action)
     if action_type == "memory.supersede":
-        return _memory_supersede_action(store, api_key, action)
+        return _memory_supersede_action(
+            store, api_key, action, runtime_token=runtime_token)
     if action_type == "memory.upgrade":
         # In-place legacy→v1 upgrade (migration). Its OWN branch — must never be
         # rewritten to supersede (that mints a new id; upgrade preserves id).
@@ -860,13 +887,20 @@ def _execute_memory_action(store: UserStore, api_key: str | None, action: dict) 
     }, [], 400
 
 
-def _execute_memory_actions(store: UserStore, api_key: str | None, actions: list[dict]) -> tuple[dict, int]:
+def _execute_memory_actions(
+    store: UserStore,
+    api_key: str | None,
+    actions: list[dict],
+    *,
+    runtime_token: str = "",
+) -> tuple[dict, int]:
     if not isinstance(actions, list) or not actions:
         return {"status": "error", "error": "actions_required", "results": [], "effects": []}, 400
     results: list[dict] = []
     effects: list[dict] = []
     for action in actions[:20]:
-        result, action_effects, status = _execute_memory_action(store, api_key, action)
+        result, action_effects, status = _execute_memory_action(
+            store, api_key, action, runtime_token=runtime_token)
         results.append(result)
         effects.extend(action_effects)
         if status >= 400:

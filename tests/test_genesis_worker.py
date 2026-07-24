@@ -59,7 +59,7 @@ def _install_success_harness(monkeypatch, *, source_kind: str, chunk_texts: list
     monkeypatch.setattr(
         worker.db,
         "genesis_claim_uploaded_jobs",
-        lambda limit=1: [{
+        lambda *, worker_id="", limit=1: [{
             "user_id": "usr_1",
             "job_id": "job_1",
             "status": "processing",
@@ -165,7 +165,7 @@ def test_tick_claims_decrypts_all_chunks_and_posts_distilled_output(monkeypatch)
     monkeypatch.setattr(
         worker.db,
         "genesis_claim_uploaded_jobs",
-        lambda limit=1: [{"user_id": "usr_1", "job_id": "job_1", "status": "processing", "total_chunks": 2}],
+        lambda *, worker_id="", limit=1: [{"user_id": "usr_1", "job_id": "job_1", "status": "processing", "total_chunks": 2}],
     )
     monkeypatch.setattr(worker.db, "genesis_missing_chunk_seqs", lambda *_args: [])
     monkeypatch.setattr(worker.db, "genesis_list_chunks", lambda *_args: [_chunk(0), _chunk(1)])
@@ -973,7 +973,7 @@ def test_tick_marks_failed_when_claimed_job_has_missing_chunks(monkeypatch):
     monkeypatch.setattr(
         worker.db,
         "genesis_claim_uploaded_jobs",
-        lambda limit=1: [{"user_id": "usr_1", "job_id": "job_1", "status": "processing", "total_chunks": 2}],
+        lambda *, worker_id="", limit=1: [{"user_id": "usr_1", "job_id": "job_1", "status": "processing", "total_chunks": 2}],
     )
     monkeypatch.setattr(worker.db, "genesis_missing_chunk_seqs", lambda *_args: [1])
     monkeypatch.setattr(worker.db, "genesis_list_chunks", lambda *_args: (_ for _ in ()).throw(AssertionError("no chunks")))
@@ -998,7 +998,7 @@ def test_tick_marks_failed_for_empty_import_without_provider_calls(monkeypatch):
     monkeypatch.setattr(
         worker.db,
         "genesis_claim_uploaded_jobs",
-        lambda limit=1: [{"user_id": "usr_1", "job_id": "job_1", "status": "processing", "total_chunks": 0}],
+        lambda *, worker_id="", limit=1: [{"user_id": "usr_1", "job_id": "job_1", "status": "processing", "total_chunks": 0}],
     )
     monkeypatch.setattr(worker.db, "genesis_missing_chunk_seqs", lambda *_args: (_ for _ in ()).throw(AssertionError("no missing check")))
     monkeypatch.setattr(worker.db, "genesis_list_chunks", lambda *_args: (_ for _ in ()).throw(AssertionError("no chunks")))

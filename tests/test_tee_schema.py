@@ -12,13 +12,14 @@ def _tee_conn():
 def test_tee_schema_has_all_tables():
     want = {"server_config","global_blobs","users","user_blobs","user_logs",
             "perception_items","perception_daily","copytext_strings","copytext_meta",
-            "genesis_import_jobs","genesis_import_outputs","agent_runtime_instances",
-            "agent_runtime_supervisor_heartbeats","chat_messages","memory_moments",
+            "genesis_import_jobs","genesis_import_outputs","chat_messages","memory_moments",
             "world_book_entries","frames","tee_replication_cursors",
             "tee_pending_device_migration","notify_relay_configs","notify_relay_logs"}
     with _tee_conn() as c:
         rows = c.execute("SELECT tablename FROM pg_tables WHERE schemaname='public'").fetchall()
     assert want <= {r[0] for r in rows}
+    assert "agent_runtime_instances" not in {r[0] for r in rows}
+    assert "agent_runtime_supervisor_heartbeats" not in {r[0] for r in rows}
 
 
 def test_tee_version_table_is_isolated():

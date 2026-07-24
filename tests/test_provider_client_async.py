@@ -44,6 +44,7 @@ def test_openrouter_wire_async(monkeypatch):
     assert seen["url"].endswith("/chat/completions")
     assert seen["body"]["max_tokens"] == 160
     assert seen["body"]["stream"] is False
+    assert provider_client.runtime_provider_attempt_trace(out) is None
 
 
 def test_provider_error_on_http_error(monkeypatch):
@@ -52,10 +53,58 @@ def test_provider_error_on_http_error(monkeypatch):
     _mock_async_client(monkeypatch, handler)
     cfg = provider_client.ProviderConfig(
         provider="openrouter", model="m", api_key="k",
-        base_url="https://openrouter.ai/api/v1")
-    with pytest.raises(provider_client.ProviderError):
+        base_url="https://openrouter.ai/api/v1", capture_attempt_trace=True)
+    with pytest.raises(provider_client.ProviderError) as raised:
         asyncio.run(provider_client.chat_completion_async(
             cfg, [{"role": "user", "content": "hi"}]))
+    trace = raised.value.feedling_provider_attempt_trace
+    assert trace["version"] == 1
+    assert len(trace["attempts"]) == 1
+    assert trace["attempts"][0]["status"] is None
+    assert trace["attempts"][0]["error_class"] == "transient"
+    assert trace["attempts"][0]["wire"]["payload"]["messages"] == [
+        {"role": "user", "content": "hi"}
+    ]
+
+
+def test_runtime_trace_marks_transport_200_invalid_json_as_postprocess_error(
+    monkeypatch,
+):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"not-json")
+
+    _mock_async_client(monkeypatch, handler)
+    cfg = provider_client.ProviderConfig(
+        provider="openrouter",
+        model="m",
+        api_key="k",
+        base_url="https://openrouter.ai/api/v1",
+        capture_attempt_trace=True,
+    )
+    with pytest.raises(provider_client.ProviderError) as raised:
+        asyncio.run(
+            provider_client.chat_completion_async(
+                cfg,
+                [{"role": "user", "content": "hi"}],
+            )
+        )
+    attempt = raised.value.feedling_provider_attempt_trace["attempts"][0]
+    assert attempt["status"] == 200
+    assert attempt["error_class"] == "transient"
+    assert attempt["outcome"] == "postprocess_error"
+    assert attempt["postprocess_stage"] == "response_decode_or_validation"
+
+
+def test_runtime_attempt_trace_can_be_released_after_durable_capture():
+    trace = {"version": 1, "attempts": [{"wire": {"payload": {"large": "x"}}}]}
+    result = {
+        "reply": "ok",
+        provider_client._RUNTIME_PROVIDER_ATTEMPT_TRACE_FIELD: trace,
+    }
+    stripped = provider_client.without_runtime_provider_attempt_trace(result)
+    assert stripped == {"reply": "ok"}
+    assert provider_client.runtime_provider_attempt_trace(stripped) is None
+    assert provider_client.runtime_provider_attempt_trace(result) == trace
 
 
 def test_missing_key_raises():
@@ -65,20 +114,31 @@ def test_missing_key_raises():
             cfg, [{"role": "user", "content": "hi"}]))
 
 
-def test_non_openai_wire_bridges_to_sync(monkeypatch):
-    called = {}
+def test_non_openai_wire_native_async(monkeypatch):
+    """PR B Task 7 (B3): anthropic/gemini/openai-responses no longer bridge to
+    the sync `chat_completion` via anyio.to_thread — they POST natively async
+    through the shared _async_http_client, same as the openai-compat wire."""
+    def boom(*a, **k):
+        raise AssertionError("must not call sync chat_completion (thread bridge removed)")
 
-    def fake_sync(config, messages, **kw):
-        called["provider"] = config.provider
-        return {"reply": "from-sync"}
+    monkeypatch.setattr(provider_client, "chat_completion", boom)
 
-    monkeypatch.setattr(provider_client, "chat_completion", fake_sync)
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "id": "msg_1",
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "stop_reason": "end_turn",
+        })
+
+    _mock_async_client(monkeypatch, handler)
     cfg = provider_client.ProviderConfig(
         provider="anthropic", model="claude-sonnet-5", api_key="k")
     out = asyncio.run(provider_client.chat_completion_async(
         cfg, [{"role": "user", "content": "hi"}]))
-    assert out == {"reply": "from-sync"}
-    assert called["provider"] == "anthropic"
+    assert out["reply"] == "hi"
+    assert out["provider"] == "anthropic"
+    assert out["tool_calls"] == []
 
 
 def test_openai_compatible_returns_remapped_model_async(monkeypatch):
@@ -127,13 +187,119 @@ def test_async_retries_without_temperature_on_temperature_400(monkeypatch):
     _mock_async_client(monkeypatch, handler)
     cfg = provider_client.ProviderConfig(
         provider="openai_compatible", model="claude-sonnet-5",
-        api_key="sk-x", base_url="https://relay.example/v1")
+        api_key="sk-x", base_url="https://relay.example/v1",
+        capture_attempt_trace=True)
     out = asyncio.run(provider_client.chat_completion_async(
         cfg, [{"role": "user", "content": "hi"}], temperature=0.1))
 
     assert out["reply"] == "ok"
     assert len(seen) == 2
     assert "temperature" not in seen[1]  # retry dropped it
+    trace = out[provider_client._RUNTIME_PROVIDER_ATTEMPT_TRACE_FIELD]
+    assert trace["version"] == 1
+    assert [item["ordinal"] for item in trace["attempts"]] == [1, 2]
+    assert [item["inner_attempt"] for item in trace["attempts"]] == [1, 2]
+    assert [item["status"] for item in trace["attempts"]] == [400, 200]
+    assert trace["attempts"][0]["error_class"] == "provider_config"
+    assert trace["attempts"][0]["compatibility_fallback"] == (
+        "temperature_rejected"
+    )
+    assert trace["attempts"][1]["compatibility_fallback"] is None
+    assert [item["wire"]["payload"] for item in trace["attempts"]] == seen
+    assert all(item["duration_ms"] >= 0 for item in trace["attempts"])
+    serialized_trace = json.dumps(trace)
+    assert "sk-x" not in serialized_trace
+    assert "https://relay.example/v1" not in serialized_trace
+
+
+def test_reliable_async_merges_inner_http_and_outer_retry_attempts(monkeypatch):
+    responses = [
+        httpx.Response(503, json={"error": {"message": "try again"}}),
+        httpx.Response(200, json={
+            "choices": [{
+                "message": {"content": "ok"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"total_tokens": 3},
+        }),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    _mock_async_client(monkeypatch, handler)
+    cfg = provider_client.ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-4o-mini",
+        api_key="secret-key",
+        base_url="https://relay.example/v1",
+        capture_attempt_trace=True,
+    )
+    out = asyncio.run(provider_client.reliable_chat_completion_async(
+        cfg,
+        [{"role": "user", "content": "hi"}],
+        max_attempts=2,
+        base_delay_sec=0.0,
+    ))
+
+    trace = out[provider_client._RUNTIME_PROVIDER_ATTEMPT_TRACE_FIELD]
+    attempts = trace["attempts"]
+    assert [item["ordinal"] for item in attempts] == [1, 2, 3, 4]
+    assert [item["kind"] for item in attempts] == [
+        "http_attempt",
+        "outer_attempt",
+        "http_attempt",
+        "outer_attempt",
+    ]
+    assert [item["outer_attempt"] for item in attempts] == [1, 1, 2, 2]
+    assert attempts[0]["status"] == 503
+    assert attempts[0]["error_class"] == "transient"
+    assert attempts[1]["outcome"] == "retry"
+    assert attempts[1]["wire"]["ordinals"] == [1]
+    assert attempts[2]["status"] == 200
+    assert attempts[3]["outcome"] == "success"
+    assert attempts[3]["wire"]["ordinals"] == [3]
+    assert out["usage"]["provider_retry_count"] == 1
+    serialized_trace = json.dumps(trace)
+    assert "secret-key" not in serialized_trace
+    assert "https://relay.example/v1" not in serialized_trace
+
+
+def test_reliable_async_attaches_complete_trace_to_terminal_exception(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503, json={"error": {"message": "still unavailable"}}
+        )
+
+    _mock_async_client(monkeypatch, handler)
+    cfg = provider_client.ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-4o-mini",
+        api_key="secret-key",
+        base_url="https://relay.example/v1",
+        capture_attempt_trace=True,
+    )
+    with pytest.raises(provider_client.ProviderError) as raised:
+        asyncio.run(provider_client.reliable_chat_completion_async(
+            cfg,
+            [{"role": "user", "content": "hi"}],
+            max_attempts=2,
+            base_delay_sec=0.0,
+        ))
+
+    assert raised.value.feedling_error_class == "transient_exhausted"
+    trace = raised.value.feedling_provider_attempt_trace
+    attempts = trace["attempts"]
+    assert [item["kind"] for item in attempts] == [
+        "http_attempt",
+        "outer_attempt",
+        "http_attempt",
+        "outer_attempt",
+    ]
+    assert [item["status"] for item in attempts] == [503, 503, 503, 503]
+    assert attempts[1]["outcome"] == "retry"
+    assert attempts[3]["outcome"] == "terminal_error"
+    assert all(item["error_class"] == "transient" for item in attempts)
 
 
 def test_shared_async_client_never_replays_cookies_across_users():

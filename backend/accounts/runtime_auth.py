@@ -1,11 +1,11 @@
 """Runtime-token authentication (Stage D) — scope re-check helper.
 
-Lets a hosted consumer authenticate with a short-lived, user-scoped runtime
-token (minted by the trusted agent-runner supervisor) instead of the user's
+Lets a hosted worker authenticate with a short-lived, user-scoped runtime
+token (minted by the trusted Runtime V2 worker) instead of the user's
 long-term Feedling API key, so a compromised consumer can't leak a long-lived
 credential. Verified against the shared HMAC secret
 ``FEEDLING_RUNTIME_TOKEN_SECRET``; the WHOLE feature is OFF unless that secret is
-set, so existing API-key callers are unaffected.
+set, so independent API-key callers are unaffected.
 
 The framework-neutral logic (secret, token extraction, scope authorization)
 lives in ``accounts.auth_core`` so the ASGI routes share one source of truth

@@ -1,0 +1,361 @@
+"""Hosted Runtime V2 D0 Task 4 — GET /v1/admin/v2-metrics.
+
+Admin-token-gated JSON endpoint that surfaces jobs_store's queue-depth/worker-
+liveness/service-time/token-throughput counters, which D4 load-testing
+consumes. Mirrors the admin-token gate + route style of
+test_admin_runtime_mode.py, but the five jobs_store functions
+admin_core.v2_metrics composes are monkeypatched directly rather than
+requiring seeded rows — admin_core.v2_metrics is a thin composition with no
+logic of its own to exercise against real data here (jobs_store's own
+functions already have coverage in test_v2_jobs_store.py/test_v2_turn_metrics.py).
+"""
+from __future__ import annotations
+
+import asyncio
+import sys
+from pathlib import Path
+
+import httpx
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+
+from admin import routes_asgi as admin_asgi  # noqa: E402
+from admin import admin_core  # noqa: E402
+from asgi import middleware  # noqa: E402
+from fastapi import FastAPI  # noqa: E402
+from model_api_runtime.v2 import jobs_store  # noqa: E402
+
+ADMIN_TOKEN = "admin-test-token"
+
+
+def _build_asgi_app() -> FastAPI:
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    middleware.register_exception_handlers(app)
+    admin_asgi.register_asgi(app)
+    return app
+
+
+_ASGI = _build_asgi_app()
+
+
+@pytest.fixture()
+def env(monkeypatch):
+    monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", ADMIN_TOKEN)
+    monkeypatch.setattr(jobs_store, "inflight_job_count", lambda: 3)
+    monkeypatch.setattr(jobs_store, "pending_job_count", lambda: 1)
+    monkeypatch.setattr(jobs_store, "live_worker_count", lambda **kw: 2)
+    monkeypatch.setattr(jobs_store, "live_worker_capacity", lambda **kw: 8)
+    monkeypatch.setattr(
+        jobs_store,
+        "recent_worker_heartbeats",
+        lambda **kw: [{
+            "worker_id": "v2-worker-pod-1-abcd-deadbeef1234",
+            "kind": "turn",
+            "capacity": 8,
+            "beat_at_epoch": 1234.0,
+            "age_sec": 2.0,
+        }],
+    )
+    monkeypatch.setattr(jobs_store, "recent_worker_heartbeat_count", lambda **kw: 1)
+    monkeypatch.setattr(jobs_store, "recent_mean_service_sec", lambda **kw: 4.5)
+    monkeypatch.setattr(jobs_store, "recent_mean_tokens_per_turn", lambda **kw: 123.0)
+    monkeypatch.setattr(
+        jobs_store,
+        "recent_chat_operational_health",
+        lambda **kw: {
+            "window_hours": 24,
+            "sample_limit": 1000,
+            "jobs": {
+                "sampled_terminal_jobs": 10,
+                "completed": 8,
+                "failed": 1,
+                "expired": 1,
+                "queue_expired": 1,
+                "lease_expired": 0,
+                "superseded": 0,
+                "failure_rate": 0.1,
+                "expiry_rate": 0.1,
+                "error_or_expiry_rate": 0.2,
+                "pending": 1,
+                "oldest_pending_age_sec": 12.5,
+            },
+            "latency": {"sampled_turns": 10, "p95_ms": 4200.0},
+            "trajectory": {
+                "sampled_jobs": 12,
+                "complete": 10,
+                "partial": 1,
+                "missing": 0,
+                "open": 1,
+                "capture_gap": 1,
+                "complete_rate": 10 / 12,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "recent_prompt_cache_stats",
+        lambda **kw: {
+            "sampled_turns": 4,
+            "model_calls": 5,
+            "usage_reported_calls": 5,
+            "cache_reported_calls": 4,
+            "usage_telemetry_coverage": 1.0,
+            "cache_telemetry_coverage": 0.8,
+            "route_identity_coverage": 1.0,
+            "route_fingerprint_count": 1,
+            "route_fingerprint": "feedling-v2-route-test",
+            "prompt_tokens": 1000,
+            "cache_read_tokens": 600,
+            "cache_write_tokens": 100,
+            "cache_miss_tokens": 400,
+            "effective_input_tokens": 1000,
+            "hit_ratio": 0.6,
+        },
+    )
+    monkeypatch.setattr(jobs_store, "genesis_worker_alive", lambda **kw: True)
+    monkeypatch.setattr(
+        admin_core.config_store,
+        "hosted_runtime_policy_status",
+        lambda: {
+            "policy": "v2_only",
+            "target_mode": "db_action_v2",
+            "eligible_count": 3,
+            "ready_count": 3,
+            "inconsistent_count": 0,
+            "inconsistent_user_ids": [],
+        },
+    )
+    monkeypatch.setattr(
+        admin_core.db,
+        "effect_outbox_health",
+        lambda: {
+            "pending": 2,
+            "needs_reconciliation": 1,
+            "oldest_unresolved_age_sec": 45.0,
+        },
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "wake_success_stats",
+        lambda **kw: {
+            "completed": 4,
+            "failed": 1,
+            "expired": 0,
+            "success_rate": 0.8,
+            "by_lane": {"heartbeat": {"completed": 4}, "scheduled": {"failed": 1}},
+        },
+    )
+    yield
+
+
+def _admin(token=ADMIN_TOKEN):
+    return {"X-Admin-Token": token}
+
+
+def _asgi(method, path, headers=None, **kw):
+    async def go():
+        transport = httpx.ASGITransport(app=_ASGI)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            return await client.request(method, path, headers=headers or {}, **kw)
+
+    return asyncio.run(go())
+
+
+def _asgi_json(method, path, headers=None, **kw):
+    resp = _asgi(method, path, headers=headers, **kw)
+    body = None
+    if resp.content:
+        try:
+            body = resp.json()
+        except Exception:
+            body = None
+    return resp.status_code, body
+
+
+def test_v2_metrics_returns_every_field(env):
+    status, body = _asgi_json("GET", "/v1/admin/v2-metrics", headers=_admin())
+
+    assert status == 200
+    assert body == {
+        "inflight": 3,
+        "pending": 1,
+        "live_workers": 2,
+        "live_worker_capacity": 8,
+        "worker_heartbeats": [{
+            "worker_id": "v2-worker-pod-1-abcd-deadbeef1234",
+            "kind": "turn",
+            "capacity": 8,
+            "beat_at_epoch": 1234.0,
+            "age_sec": 2.0,
+        }],
+        "worker_heartbeat_count": 1,
+        "runtime_policy": {
+            "policy": "v2_only",
+            "target_mode": "db_action_v2",
+            "eligible_count": 3,
+            "ready_count": 3,
+            "inconsistent_count": 0,
+            "inconsistent_user_ids": [],
+        },
+        "mean_service_sec": 4.5,
+        "recent_mean_tokens_per_turn": 123.0,
+        "turn_health": {
+            "window_hours": 24,
+            "sample_limit": 1000,
+            "jobs": {
+                "sampled_terminal_jobs": 10,
+                "completed": 8,
+                "failed": 1,
+                "expired": 1,
+                "queue_expired": 1,
+                "lease_expired": 0,
+                "superseded": 0,
+                "failure_rate": 0.1,
+                "expiry_rate": 0.1,
+                "error_or_expiry_rate": 0.2,
+                "pending": 1,
+                "oldest_pending_age_sec": 12.5,
+            },
+            "latency": {"sampled_turns": 10, "p95_ms": 4200.0},
+            "trajectory": {
+                "sampled_jobs": 12,
+                "complete": 10,
+                "partial": 1,
+                "missing": 0,
+                "open": 1,
+                "capture_gap": 1,
+                "complete_rate": 10 / 12,
+            },
+        },
+        "prompt_cache": {
+            "sampled_turns": 4,
+            "model_calls": 5,
+            "usage_reported_calls": 5,
+            "cache_reported_calls": 4,
+            "usage_telemetry_coverage": 1.0,
+            "cache_telemetry_coverage": 0.8,
+            "route_identity_coverage": 1.0,
+            "route_fingerprint_count": 1,
+            "route_fingerprint": "feedling-v2-route-test",
+            "prompt_tokens": 1000,
+            "cache_read_tokens": 600,
+            "cache_write_tokens": 100,
+            "cache_miss_tokens": 400,
+            "effective_input_tokens": 1000,
+            "hit_ratio": 0.6,
+        },
+        "wake": {
+            "completed": 4,
+            "failed": 1,
+            "expired": 0,
+            "success_rate": 0.8,
+            "by_lane": {"heartbeat": {"completed": 4}, "scheduled": {"failed": 1}},
+        },
+        "effects": {
+            "pending": 2,
+            "needs_reconciliation": 1,
+            "oldest_unresolved_age_sec": 45.0,
+        },
+        "genesis_alive": True,
+    }
+
+
+def test_v2_metrics_surfaces_a_dead_genesis_thread(env, monkeypatch):
+    """A dead genesis thread must be visible even when every turn worker is healthy.
+
+    `live_workers` counts kind='turn' rows only, so a genesis thread that died to a
+    lazy-import error inside `run_loop` leaves no other trace anywhere.
+    """
+    monkeypatch.setattr(jobs_store, "genesis_worker_alive", lambda **kw: False)
+
+    status, body = _asgi_json("GET", "/v1/admin/v2-metrics", headers=_admin())
+
+    assert status == 200
+    assert body["genesis_alive"] is False
+    assert body["live_workers"] == 2
+
+
+def test_v2_metrics_filters_cache_proof_to_route_and_window(env, monkeypatch):
+    seen = {}
+
+    def _cache_stats(**kwargs):
+        seen.update(kwargs)
+        return {
+            "sampled_turns": 2,
+            "model_calls": 2,
+            "cache_read_tokens": 900,
+            "filter": {
+                "provider": kwargs.get("provider"),
+                "model": kwargs.get("model"),
+                "cache_route_fingerprint": kwargs.get("cache_route_fingerprint"),
+                "user_id": kwargs.get("user_id"),
+                "since_ts": kwargs.get("since_ts"),
+                "until_ts": kwargs.get("until_ts"),
+                "include_turns": kwargs.get("include_turns"),
+            },
+        }
+
+    monkeypatch.setattr(jobs_store, "recent_prompt_cache_stats", _cache_stats)
+    status, body = _asgi_json(
+        "GET",
+        "/v1/admin/v2-metrics?cache_provider=openai&cache_model=gpt-5"
+        "&cache_route_fingerprint=feedling-v2-route-test&cache_user_id=u-canary"
+        "&cache_since_ts=123.5&cache_until_ts=456.5",
+        headers=_admin(),
+    )
+
+    assert status == 200
+    assert seen == {
+        "lane": "chat",
+        "provider": "openai",
+        "model": "gpt-5",
+        "cache_route_fingerprint": "feedling-v2-route-test",
+        "user_id": "u-canary",
+        "since_ts": 123.5,
+        "until_ts": 456.5,
+        "include_turns": True,
+    }
+    assert body["prompt_cache"]["filter"] == {
+        "provider": "openai",
+        "model": "gpt-5",
+        "cache_route_fingerprint": "feedling-v2-route-test",
+        "user_id": "u-canary",
+        "since_ts": 123.5,
+        "until_ts": 456.5,
+        "include_turns": True,
+    }
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-1", "1e308", "not-a-number"])
+def test_v2_metrics_rejects_invalid_cache_window(env, raw):
+    status, body = _asgi_json(
+        "GET", f"/v1/admin/v2-metrics?cache_since_ts={raw}", headers=_admin())
+
+    assert status == 400
+    assert body == {"error": "invalid_cache_since_ts"}
+
+
+def test_v2_metrics_rejects_reversed_cache_window(env):
+    status, body = _asgi_json(
+        "GET",
+        "/v1/admin/v2-metrics?cache_since_ts=200&cache_until_ts=100",
+        headers=_admin(),
+    )
+
+    assert status == 400
+    assert body == {"error": "invalid_cache_window"}
+
+
+def test_v2_metrics_no_token_is_401(env):
+    status, body = _asgi_json("GET", "/v1/admin/v2-metrics")
+
+    assert status == 401
+    assert body == {"error": "unauthorized"}
+
+
+def test_v2_metrics_wrong_token_is_401(env):
+    status, body = _asgi_json("GET", "/v1/admin/v2-metrics", headers=_admin("wrong-token"))
+
+    assert status == 401
+    assert body == {"error": "unauthorized"}

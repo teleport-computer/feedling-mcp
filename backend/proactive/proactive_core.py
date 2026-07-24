@@ -19,11 +19,15 @@ string + Accept-Language header (same technique as ``admin.admin_core``).
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 from core import reqctx
 from core import store as core_store
 from core import util
+from core import wake_bus as core_wake_bus
+from hosted import config_store as hosted_config_store
+from model_api_runtime.v2 import jobs_store
 from proactive import capture_jobs, capture_scheduler, dashboard, dream_scheduler, gate, service
 from proactive.observability_v2 import ROUND3_REVIEW_LABELS_V2
 
@@ -134,7 +138,16 @@ def device_events_append(store, payload: dict) -> dict:
         payload=inner_payload,
     )
     store.append_device_event(event)
-    capture = capture_scheduler.handle_device_event(store, event)
+    # Runtime ownership is read strictly before choosing a capture substrate.
+    # If the control-plane read fails, let the request fail: silently falling
+    # back to the resident ``proactive_jobs`` queue would strand a V2 user's
+    # capture forever.
+    if _runtime_v2_scheduler_owned(store):
+        capture = capture_scheduler.handle_device_event(
+            store, event, submit=_submit_v2_capture
+        )
+    else:
+        capture = capture_scheduler.handle_device_event(store, event)
     try:
         from perception import service as perception_service  # lazy; proactive can run without perception tests importing it
         if perception_service.perception_ingress_runtime_v2_enabled(store):
@@ -166,6 +179,7 @@ def _capture_response_doc(result: dict) -> dict:
         "state": {
             "last_captured_until_message_id": str(state.get("last_captured_until_message_id") or ""),
             "last_captured_until_ts": state.get("last_captured_until_ts") or 0,
+            "last_captured_until_seq": state.get("last_captured_until_seq") or 0,
             "pending_capture_key": str(state.get("pending_capture_key") or ""),
             "last_capture_completed_at": state.get("last_capture_completed_at") or 0,
             "last_seen_message_id": str(state.get("last_seen_message_id") or ""),
@@ -229,6 +243,60 @@ def _dream_response_doc(result: dict) -> dict:
 # capture / dream / proactive ticks
 # --------------------------------------------------------------------------- #
 
+def _runtime_v2_scheduler_owned(store) -> bool:
+    return (
+        hosted_config_store.get_hosted_runtime_mode_strict(store)
+        == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+    )
+
+
+def _v2_capture_feature_enabled() -> bool:
+    return os.environ.get("FEEDLING_V2_CAPTURE_ENABLED", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _submit_v2_capture(store, *, trigger, now, window, capture_key) -> dict:
+    """Submit every V2 Capture trigger through the shared agent_jobs lane."""
+    if not _v2_capture_feature_enabled():
+        return {"enqueued": False, "reason": "capture_disabled", "job": None}
+    job_id, coalesced = jobs_store.enqueue_job(
+        store.user_id,
+        "capture",
+        reason=str(trigger or "capture")[:200],
+    )
+    if not coalesced:
+        core_wake_bus.notify("v2_jobs", store.user_id)
+    return {
+        "enqueued": not coalesced,
+        "reason": "v2_coalesced" if coalesced else "v2",
+        "job": {
+            "id": job_id,
+            "job_id": str(job_id),
+            "job_kind": "memory_capture",
+            "source": "memory_capture",
+            "status": "pending",
+            "trigger": str(trigger or "capture"),
+            "capture_key": str(capture_key or ""),
+            "capture_window": dict(window),
+        },
+    }
+
+
+def _v2_dream_scheduler_noop(store) -> dict:
+    return {
+        "enqueued": False,
+        "reason": "v2_scheduler_owned",
+        "state": dream_scheduler.load_dream_state(store),
+        "job": None,
+        "snapshot": {},
+        "new_cards": 0,
+        "new_turns": 0,
+    }
+
 def capture_tick(store, payload: dict):
     now = None
     if "now" in payload:
@@ -236,6 +304,15 @@ def capture_tick(store, payload: dict):
             now = float(payload.get("now"))
         except (TypeError, ValueError):
             return {"error": "invalid now"}, 400
+    if _runtime_v2_scheduler_owned(store):
+        out = _capture_response_doc(
+            capture_scheduler.tick_quiet_capture(
+                store, now=now, submit=_submit_v2_capture
+            )
+        )
+        out["dream"] = _dream_response_doc(_v2_dream_scheduler_noop(store))
+        out["migrate"] = {"enqueued": False, "reason": "v2_scheduler_owned"}
+        return out, 200
     result = capture_scheduler.tick_quiet_capture(store, now=now)
     out = _capture_response_doc(result)
     out["dream"] = _dream_response_doc(dream_scheduler.tick_memory_dream(store, now=now))
@@ -245,6 +322,10 @@ def capture_tick(store, payload: dict):
 
 
 def capture_force(store) -> dict:
+    if _runtime_v2_scheduler_owned(store):
+        return _capture_response_doc(
+            capture_scheduler.force_capture(store, submit=_submit_v2_capture)
+        )
     result = capture_scheduler.force_capture(store)
     return _capture_response_doc(result)
 
@@ -256,11 +337,28 @@ def dream_tick(store, payload: dict):
             now = float(payload.get("now"))
         except (TypeError, ValueError):
             return {"error": "invalid now"}, 400
+    if _runtime_v2_scheduler_owned(store):
+        return _dream_response_doc(_v2_dream_scheduler_noop(store)), 200
     result = dream_scheduler.tick_memory_dream(store, now=now, force=bool(payload.get("force")))
     return _dream_response_doc(result), 200
 
 
 def proactive_tick(store, payload: dict, *, api_key) -> dict:
+    if hosted_config_store.get_hosted_runtime_mode_strict(store) == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+        # db_action_v2 users have no resident consumer (D0 exclusivity guard). A MANUAL
+        # wake becomes a V2 manual_wake job; non-manual (heartbeat) ticks are owned by the
+        # V2 scheduler, so we create NO resident proactive_job (it would never be claimed).
+        is_manual = (
+            service._proactive_bool(payload, "force", "force_response")
+            or service._proactive_bool(payload, "manual", "manual_wake", "user_initiated")
+            or bool(str(payload.get("context_hint") or "").strip())
+        )
+        if is_manual:
+            job_id, coalesced = jobs_store.enqueue_job(store.user_id, "manual_wake", reason="manual_tick")
+            core_wake_bus.notify("v2_jobs", store.user_id)
+            return {"decision": None, "job": {"id": job_id, "lane": "manual_wake"}, "enqueued": not coalesced, "v2": True}
+        return {"decision": None, "job": None, "enqueued": False, "v2": True}
+
     decision = gate._build_proactive_v2_wake_decision(store, payload, api_key=api_key)
     store.append_gate_decision(decision)
 

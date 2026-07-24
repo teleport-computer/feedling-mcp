@@ -13,6 +13,10 @@ with the delivery trace and locks the response contract.
 
 from __future__ import annotations
 
+import db  # lowest layer — chat may depend downward on it. Do NOT import
+# model_api_runtime.v2.jobs_store here: that's the write side owned by Plan
+# B/C; poll_core's read side goes through db.list_agent_status_events, the
+# single shared read primitive (spec §9 / dependency direction).
 import debug_trace
 from chat import consumer as chat_consumer
 from chat import service as chat_service
@@ -105,10 +109,38 @@ def pending_messages(store: UserStore, *, since: float, consumer_id: str, claim:
     return pending
 
 
+def pending_status_events(store: UserStore, *, after_id: int, limit: int = 50) -> list:
+    """Agent tool-call status events for this user since ``after_id`` (spec §9:
+    foreground-only tool-call progress, never part of chat history).
+
+    Read side only — goes through the ``db`` primitive shared with the write
+    side (``model_api_runtime.v2.jobs_store.append_status_event`` writes the
+    same table; ``jobs_store.list_status_events`` delegates to this same
+    ``db`` read so there is exactly one SQL statement for the read path). The
+    `chat` package must not import upward into `model_api_runtime.v2` — see
+    tests/test_v2_dependency_direction.py and CONTRIBUTING's dependency
+    direction rule.
+    """
+    return db.list_agent_status_events(store.user_id, after_id=after_id, limit=limit)
+
+
 def build_response(
-    *, messages: list, context: dict, consumer_id: str, claim: bool, timed_out: bool
+    *,
+    messages: list,
+    context: dict,
+    consumer_id: str,
+    claim: bool,
+    timed_out: bool,
+    status_events: list | None = None,
+    status_cursor: int = 0,
 ) -> dict:
-    """The `/v1/chat/poll` response contract (locked for parity)."""
+    """The `/v1/chat/poll` response contract (locked for parity, + §9 status).
+
+    ``status_events`` / ``status_cursor`` are additive with safe defaults —
+    an existing call site that never passes them gets an empty list / a zero
+    cursor, byte-identical to the pre-§9 contract in every other field.
+    """
+    events = status_events or []
     return {
         "messages": messages,
         "runtime_v2": context["runtime_v2"],
@@ -117,4 +149,6 @@ def build_response(
         "timed_out": timed_out,
         "consumer_id": consumer_id,
         "claimed": claim,
+        "agent_status_events": events,
+        "status_cursor": int(status_cursor or (events[-1]["id"] if events else 0)),
     }

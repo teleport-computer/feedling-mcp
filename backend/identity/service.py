@@ -125,6 +125,41 @@ def _save_identity_cas(store: UserStore, expected: dict, data: dict) -> bool:
     return True
 
 
+def _save_identity_create_if_absent(store: UserStore, data: dict) -> bool:
+    """Atomic create-if-absent for the identity row: insert `data` ONLY when no
+    identity row exists yet. Returns True iff THIS caller won the insert.
+
+    This is the create-side companion to `_save_identity_cas` and closes the
+    fresh-user bootstrap race (Codex C2). The prior bootstrap path used the
+    plain `_save_identity` (INSERT ... ON CONFLICT DO UPDATE), so two gunicorn
+    worker processes both seeing "no card" on a fresh user would each build a
+    minimal card and the second would clobber the first — a lost update where
+    BOTH callers still reported success. It also masked DB failures: `set_blob`
+    swallows the exception and returns None, so a failed write looked like a
+    success (a false 200).
+
+    Built on `db.set_blob_if_unchanged(expected_doc={}, insert_if_missing=True)`,
+    whose insert is `INSERT ... ON CONFLICT (user_id, kind) DO NOTHING
+    RETURNING` — concurrent creators serialize through the unique key and only
+    the winner gets a row back. A loser (or a genuine DB error) returns False;
+    the caller raises `IdentityWriteConflict` so the standard mutation retry
+    loop re-reads the now-existing card and merges its patch onto it via the
+    normal CAS UPDATE path instead of creating a second time.
+
+    Like `_save_identity_cas`, this marks the identity row for TEE-plaintext
+    requeue manually — `db.set_blob_if_unchanged` deliberately excludes
+    "identity" from its own shadow mirroring (see the `kind not in (...)` guard
+    in db.py), because an in-place UPDATE keeps the same PK and the cursor-based
+    replicator never revisits it."""
+    if not db.set_blob_if_unchanged(
+        store.user_id, "identity", {}, data, insert_if_missing=True
+    ):
+        return False
+    from tee_shadow import mirror
+    mirror.mark_pending(store.user_id, "identity", "identity", "requeue")
+    return True
+
+
 # Identity change audit log
 # ---------------------------------------------------------------------------
 # Appended to on every identity_init / replace / nudge. Surfaced to iOS as

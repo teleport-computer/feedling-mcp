@@ -1,6 +1,6 @@
 """CVM-side Genesis worker.
 
-This module is intended to run inside the agent-runner service. It claims
+This module runs as a dedicated thread inside the Runtime V2 ``serve-worker``. It claims
 finalized import jobs, decrypts chunk envelopes via the enclave, calls the
 user-configured LLM provider with the user's key, and posts only distilled
 reducer output back to the backend apply route.
@@ -475,6 +475,7 @@ def _runtime_for_user(user_id: str, provider_key: str) -> provider_client.Provid
         model=model,
         base_url=base_url,
         api_key=provider_key,
+        context_window_tokens=config.get("context_window_tokens"),
     )
 
 
@@ -1758,6 +1759,59 @@ def _resident_max_attempts() -> int:
     return max(1, _env_int("FEEDLING_GENESIS_RESIDENT_MAX_ATTEMPTS", 3))
 
 
+def _genesis_worker_dead_sec() -> int:
+    # How stale a kind='genesis' heartbeat must be to call the worker dead. The
+    # heartbeat beats independently of the (blocking) tick, so this can be tight
+    # without false-positiving a worker mid-long-distill. Far below the 30-min time
+    # reaper (the alive-but-wedged backstop).
+    return max(60, _env_int("FEEDLING_GENESIS_WORKER_DEAD_SEC", 120))
+
+
+def reclaim_orphaned_processing_jobs(live_worker_ids: list[str]) -> list[dict]:
+    """Fast-recover 'processing' genesis jobs whose claiming worker is dead.
+
+    ``live_worker_ids`` are the worker ids with a fresh ``kind='genesis'``
+    heartbeat (injected by the caller — genesis/ is framework-neutral and does not
+    import the model_api_runtime heartbeat store). A job whose ``worker_claimed_by``
+    is not among them, claimed longer than the dead cutoff ago, was left behind by
+    a killed/replaced worker (esp. a container deploy). The DB flips it back to
+    'uploaded' (chunks stored -> a live worker re-runs it) or 'failed' (plaintext ->
+    client retries); here we sync the genesis_state blob so the app poll reflects
+    it. Mirrors reap_stale_processing_jobs: one bad row never stops the rest, never
+    raises into the loop. Returns the changed rows."""
+    if not live_worker_ids:
+        # Fail closed: with no known-live worker we cannot safely tell a dead claim
+        # from a live one, so touch nothing and let the time reaper backstop.
+        return []
+    changed: list[dict] = []
+    for job in db.genesis_reclaim_orphaned_processing_jobs(
+            live_worker_ids, dead_sec=_genesis_worker_dead_sec(),
+            error="genesis_worker_lost"):
+        user_id = str(job.get("user_id") or "")
+        job_id = str(job.get("job_id") or "")
+        if not user_id or not job_id:
+            continue
+        action = str(job.get("_reclaim_action") or "failed")
+        store = get_store(user_id)
+        # requeued -> back to 'uploaded' (still importing); failed -> terminal.
+        blob_status = "uploaded" if action == "requeued" else "failed"
+        try:
+            service.write_genesis_state(store, job, status=blob_status)
+        except Exception as e:  # noqa: BLE001
+            print(f"[genesis:reclaim] blob sync failed for {user_id}/{job_id}: "
+                  f"{type(e).__name__}:{str(e)[:120]}")
+        _trace_genesis(
+            store,
+            "genesis.worker.orphan_reclaimed",
+            job_id=job_id,
+            status="error" if action == "failed" else "ok",
+            summary=f"orphaned genesis processing job {action}",
+            detail={"action": action, "worker_claimed_by": job.get("worker_claimed_by")},
+        )
+        changed.append({"user_id": user_id, "job_id": job_id, "action": action})
+    return changed
+
+
 def reap_stale_resident_jobs() -> list[dict]:
     """Recover resident-claimed distill jobs whose consumer died mid-run.
 
@@ -1884,17 +1938,20 @@ def tick(
     api_url: str,
     enclave_url: str,
     mint_runtime_token: Callable,
+    worker_id: str = "",
     max_jobs: int = 1,
     now=None,
 ) -> dict:
     """Process up to max_jobs uploaded genesis jobs once.
 
     ``mint_runtime_token(user_id, scopes=...)`` must return a short-lived token
-    carrying ``envelope_decrypt`` and ``genesis`` scopes. ``now`` is accepted for
+    carrying ``envelope_decrypt`` and ``genesis`` scopes. ``worker_id`` attributes
+    the claim so a death-detected reclaim can tell whose claim went stale (it MUST
+    be the id this worker heartbeats under). ``now`` is accepted for
     supervisor/test symmetry; this implementation only reports elapsed time.
     """
     start = time.time() if now is None else float(now())
-    jobs = db.genesis_claim_uploaded_jobs(limit=max_jobs)
+    jobs = db.genesis_claim_uploaded_jobs(worker_id=worker_id, limit=max_jobs)
     results: list[dict] = []
     failed = 0
     for job in jobs:

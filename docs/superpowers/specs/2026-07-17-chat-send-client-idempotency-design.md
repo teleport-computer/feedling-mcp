@@ -55,15 +55,18 @@ transaction:
 2. Query that user's newest chat row with the key whose `ts` is within the
    600-second window.
 3. If found, return its authoritative document with `inserted=false`.
-4. Otherwise insert the candidate, apply the normal chat-ring trim, commit, and
-   return it with `inserted=true`.
+4. Otherwise insert the candidate without any retention delete, commit, and
+   return it with `inserted=true`. The process cache trims its own hot window
+   after commit; the durable source row remains.
 
 The transaction-scoped advisory lock serializes contenders across processes and
 hosts that share PostgreSQL. Hash collisions can only serialize unrelated
 operations; they cannot merge their rows because the subsequent query still
-compares the full user ID and UUID. The per-user ring is capped at 5,000 rows,
-so the JSON metadata lookup is bounded without a new durable index or reservation
-table.
+compares the full user ID and UUID. The per-process hot window is capped at
+5,000 rows, while the durable per-user database ledger is not automatically
+trimmed. The idempotency lookup is restricted to the 600-second timestamp window
+and uses the existing per-user time ordering; it does not depend on destructive
+retention for boundedness.
 
 Database errors on this path fail closed. Treating an unavailable lookup as a
 miss would violate the guarantee by inserting a second row. The legacy no-key

@@ -1,5 +1,8 @@
 # 托管回合上游报错透出（chat system 消息 + 设置页状态）
 
+> **RETIRED / DO NOT DEPLOY.** Historical design; managed hosted execution is
+> Runtime V2-only and has no resident supervisor path.
+
 日期：2026-07-06
 状态：设计定稿，待实现
 

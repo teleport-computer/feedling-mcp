@@ -1,3 +1,7 @@
-# One prod runner CVM id per line (UUID or app_id). Empty = job stays dormant.
-# Add a line per provisioned runner CVM to scale out horizontally.
+# One prod V1 agent-runner CVM id per line (UUID or app_id). Dual-runtime
+# coexistence (Task 11): pooled Runtime V2 now runs on the main CVM itself,
+# so this fleet is V1 resident hosting again — see
+# deploy/check-prod-runner-topology.sh for the (soft, DEPLOY_PROD_RUNNER_CVM-
+# gated) redundancy warning. Add a line per provisioned runner CVM to scale
+# out horizontally.
 130fdfc6-5736-4cdc-9d0f-a35af8957cf2
