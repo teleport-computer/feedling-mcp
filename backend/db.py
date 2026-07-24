@@ -450,6 +450,36 @@ def load_all_users() -> list[dict]:
         return []
 
 
+def find_user_by_api_key_hash(h: str) -> dict | None:
+    """Return the user document whose api key hashes to ``h``, or None.
+
+    The shared source of truth for the in-memory registry's miss fallback
+    (``accounts.registry._resolve_user``): under many workers a just-registered
+    user may not yet be in a given worker's ``_users`` snapshot, and a pure
+    in-memory miss would 401 a valid key. Matching mirrors the in-memory scan:
+    the legacy top-level ``api_key_hash`` matches unconditionally, while an
+    ``api_keys[]`` entry matches only when it is not revoked.
+
+    Unlike the swallow-and-log helpers above, this DELIBERATELY lets a database
+    error PROPAGATE. The caller must be able to tell a transient DB failure apart
+    from a genuine "no such user": on an error it degrades to unauthenticated for
+    that one attempt WITHOUT negative-caching, so a pool-timeout hiccup can't pin
+    a valid key to 401 for the whole cache TTL. ``None`` here means only a
+    definitive miss (the query ran and matched nothing)."""
+    if not h:
+        return None
+    sql = (
+        "SELECT doc FROM users WHERE doc->>'api_key_hash' = %s "
+        "OR EXISTS (SELECT 1 FROM jsonb_array_elements("
+        "COALESCE(doc->'api_keys', '[]'::jsonb)) AS k "
+        "WHERE k->>'api_key_hash' = %s AND COALESCE(k->>'revoked_at', '') = '') "
+        "LIMIT 1"
+    )
+    with get_pool().connection() as conn:
+        row = conn.execute(sql, (h, h)).fetchone()
+    return row[0] if row else None
+
+
 def insert_user(entry: dict) -> None:
     """Insert one user document. ON CONFLICT DO NOTHING so the migration is
     idempotent and a re-registration race can't duplicate a user_id."""

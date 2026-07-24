@@ -118,12 +118,13 @@ async def lifespan(app):
     core_store.set_async_wake_hook(registry.wake)
 
     # (4) Initial account-registry load — mirrors app.py:190. WITHOUT this the
-    #     in-memory `_users` / `_key_to_user` start empty and never populate:
-    #     `_resolve_user` only reads the in-memory table (a cache miss does NOT
-    #     hit the DB), and the wake-bus "users" handler below only RELOADS on a
-    #     cross-process NOTIFY — neither performs the initial load. Result: every
-    #     api key resolves to None → 401 on every authenticated route → clients
-    #     stuck "loading". Runs per-worker (each worker owns its own registry) on
+    #     in-memory `_users` / `_key_to_user` start empty and never fully
+    #     populate. `_resolve_user` now falls back to the DB on a cache miss
+    #     (registry._resolve_user_via_db) and the wake-bus "users" handler below
+    #     RELOADS on a cross-process NOTIFY, but neither is a substitute for the
+    #     initial bulk load: without it every request pays a DB round-trip (or,
+    #     if the fallback is stubbed, resolves to None → 401 → clients stuck
+    #     "loading"). Runs per-worker (each worker owns its own registry) on
     #     the threadpool because load_users() is sync DB I/O. init_schema() has
     #     already run in gunicorn on_starting (master), so the tables exist.
     from accounts import registry as accounts_registry
