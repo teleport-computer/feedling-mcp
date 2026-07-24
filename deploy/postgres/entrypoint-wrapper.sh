@@ -47,7 +47,10 @@ if [ -n "${WALG_S3_PREFIX:-}" ]; then
       # 经 BASH_ENV source 同一文件，一并修好。
       echo "PGDATABASE=${POSTGRES_DB}"
     } >> /etc/environment.walg
-    sed -i '1i BASH_ENV=/etc/environment.walg' /etc/cron.d/walg-backup
+    # 幂等：容器 restart（非 recreate）会在同一份可写层上重跑本 entrypoint，
+    # 无条件 `sed -i 1i` 会每次再插一行 BASH_ENV（2026-07-23 prod 实测已堆到两行）。
+    grep -qx 'BASH_ENV=/etc/environment.walg' /etc/cron.d/walg-backup \
+      || sed -i '1i BASH_ENV=/etc/environment.walg' /etc/cron.d/walg-backup
     cron
 fi
 

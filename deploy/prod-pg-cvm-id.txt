@@ -1,0 +1,6 @@
+# feedling-io-db-prod 的 CVM uuid（真实用户数据所在的 TEE Postgres）。
+# app_id = 4903a1288de38b1b5cfccda6aca1cbc3715090bf（workspace: sxysuns-projects，
+# 故 pg-deploy 的 prod 分支用无前缀的 PHALA_CLOUD_API_KEY 而不是 TEST_ 那把）。
+# 用 uuid 而非 app_id：`phala deploy --wait` 的状态轮询只认 UUID，传 app_id 会
+# 假报 Invalid UUID / 超时（其实 update 已生效）。
+d1326f63-7dc3-44f6-9654-6bcae212cad7

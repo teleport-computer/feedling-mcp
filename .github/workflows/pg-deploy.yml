@@ -1,14 +1,25 @@
 # .github/workflows/pg-deploy.yml — pg CVM 手动部署（绝不并入 merge 自动部署）
+#
+# 为什么 prod 也走这里（2026-07-24）：在此之前 prod/test 的 pg CVM 全靠本地手工
+# `phala deploy`，镜像 tag 从「CVM 内 docker ps 抄现役值」得来。2026-07-23 那次
+# 扶正主库的容量调整（max_connections 200→400）就这么把 tag 抄成了 3de02fd-pgdbfix
+# ——一个早于 463f6b7b（把 wal-g 放进 cron PATH）的镜像。当晚 03:00 起 prod 和 test
+# 的每日 base backup 全部死在 "wal-g: command not found"，26h 后才被 pg-monitor 的
+# BASE 陈旧断言抓到。tag 由 CI 从 checkout 出来的真实 HEAD 算，就没有「抄旧值」这一步。
+#
+# pg CVM 用 `--kms phala`（部署账号授权），**不需要链上 AppAuth**，故本 workflow
+# 没有 publish-compose-hash 步骤（这点和主 app 的部署不同，见
+# docs/TEE_POSTGRES_SHADOW_PROVISIONING.md §0）。
 name: Deploy Postgres CVM
 on:
   workflow_dispatch:
     inputs:
       environment:
         type: choice
-        options: [test]        # prod 待 Phase 8 加
+        options: [test, prod]
         required: true
       confirm:
-        description: '输入 DEPLOY-PG 确认（防误触）'
+        description: '输入 DEPLOY-PG（prod 需输入 DEPLOY-PG-PROD）确认（防误触）'
         required: true
 permissions:
   contents: read
@@ -21,31 +32,38 @@ jobs:
       - name: Typo guard
         env:
           CONFIRM: ${{ inputs.confirm }}
-        run: test "$CONFIRM" = "DEPLOY-PG" || { echo "confirm mismatch"; exit 1; }
-      - uses: actions/checkout@v4
-        with: { ref: test }
-      - name: Required secrets pre-check   # 本仓 compose 用 ${VAR:-}，无法 grep :?，用显式清单
-        env:
-          PG_OWNER_PASSWORD: ${{ secrets.TEST_PG_OWNER_PASSWORD }}
-          APP_DB_PASSWORD: ${{ secrets.TEST_APP_DB_PASSWORD }}
-          REPLICATOR_DB_PASSWORD: ${{ secrets.TEST_REPLICATOR_DB_PASSWORD }}
-          MONITORING_DB_PASSWORD: ${{ secrets.TEST_MONITORING_DB_PASSWORD }}
-          PG_SERVER_CERT_B64: ${{ secrets.TEST_PG_SERVER_CERT_B64 }}
-          PG_SERVER_KEY_B64: ${{ secrets.TEST_PG_SERVER_KEY_B64 }}
-          WALG_S3_PREFIX: ${{ secrets.TEST_WALG_S3_PREFIX }}
-          WALG_LIBSODIUM_KEY: ${{ secrets.TEST_WALG_LIBSODIUM_KEY }}
-          PG_BACKUP_R2_ENDPOINT: ${{ secrets.TEST_PG_BACKUP_R2_ENDPOINT }}
-          PG_BACKUP_R2_ACCESS_KEY_ID: ${{ secrets.TEST_PG_BACKUP_R2_ACCESS_KEY_ID }}
-          PG_BACKUP_R2_SECRET_ACCESS_KEY: ${{ secrets.TEST_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
+          ENVIRONMENT: ${{ inputs.environment }}
         run: |
-          missing=0
-          for v in PG_OWNER_PASSWORD APP_DB_PASSWORD REPLICATOR_DB_PASSWORD \
-                   MONITORING_DB_PASSWORD PG_SERVER_CERT_B64 PG_SERVER_KEY_B64 \
-                   WALG_S3_PREFIX WALG_LIBSODIUM_KEY PG_BACKUP_R2_ENDPOINT \
-                   PG_BACKUP_R2_ACCESS_KEY_ID PG_BACKUP_R2_SECRET_ACCESS_KEY; do
-            [ -n "${!v}" ] || { echo "MISSING secret: $v"; missing=1; }
-          done
-          exit $missing
+          # prod 要求更长的确认串：这条流水线会重启真实用户数据所在的主库容器。
+          if [ "$ENVIRONMENT" = "prod" ]; then WANT=DEPLOY-PG-PROD; else WANT=DEPLOY-PG; fi
+          test "$CONFIRM" = "$WANT" || { echo "::error::confirm mismatch — ${ENVIRONMENT} 需要输入 ${WANT}"; exit 1; }
+      - uses: actions/checkout@v4
+        # test 环境部署 test 分支、prod 部署 main：与 app 的发布流向一致。
+        with:
+          ref: ${{ inputs.environment == 'prod' && 'main' || 'test' }}
+      - name: Resolve image tag from checked-out HEAD
+        id: img
+        # 不能用 ${{ github.sha }}：workflow_dispatch 下它指向触发时所在 ref 的 sha，
+        # 而上面 checkout 的是 test/main，两者可以不同——tag 会与镜像内容对不上。
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Resolve CVM id
+        id: cvm
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          F="deploy/${ENVIRONMENT}-pg-cvm-id.txt"
+          test -f "$F" || { echo "::error::${F} 不存在 — 首次开通走 DEPLOYMENTS.md runbook，不走本 workflow"; exit 1; }
+          # GH Actions runs `run:` steps as `bash -eo pipefail` — a pure-comment
+          # cvm-id.txt makes `grep -v '^#'` exit 1 (no matching lines); under
+          # pipefail that non-zero propagates as the pipeline's exit status
+          # even though `head -1` itself exits 0, so `set -e` would abort right
+          # here with a bare, unexplained non-zero exit — never reaching the
+          # intended fail-closed message below. `|| true` absorbs grep's
+          # no-match exit so CVM_ID legitimately ends up empty and the explicit
+          # check on the next line is what actually fires.
+          CVM_ID=$(grep -v '^#' "$F" | tr -d '[:space:]' | head -1 || true)
+          test -n "$CVM_ID" || { echo "::error::${F} 为空 — 首次开通走 DEPLOYMENTS.md runbook，不走本 workflow"; exit 1; }
+          echo "id=$CVM_ID" >> "$GITHUB_OUTPUT"
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -61,50 +79,91 @@ jobs:
           context: deploy
           file: deploy/postgres/Dockerfile
           push: true
-          tags: ghcr.io/${{ steps.owner.outputs.owner }}/feedling-postgres:${{ github.sha }}
+          tags: ghcr.io/${{ steps.owner.outputs.owner }}/feedling-postgres:${{ steps.img.outputs.sha }}
       - name: Pin image sha into compose
         run: |
-          sed -i -E "s|ghcr\.io/[^/]+/feedling-postgres:[A-Za-z0-9_]+|ghcr.io/${{ steps.owner.outputs.owner }}/feedling-postgres:${{ github.sha }}|" \
+          sed -i -E "s|ghcr\.io/[^/]+/feedling-postgres:[A-Za-z0-9_.-]+|ghcr.io/${{ steps.owner.outputs.owner }}/feedling-postgres:${{ steps.img.outputs.sha }}|" \
             deploy/docker-compose.phala.postgres.yaml
+          grep -n 'feedling-postgres:' deploy/docker-compose.phala.postgres.yaml
       - name: Deploy (update in place; 名字查不到就失败，绝不静默新建)
-        env: { PHALA_CLOUD_API_KEY: '${{ secrets.TEST_PHALA_CLOUD_API_KEY }}' }
-        run: |
-          npm install -g phala@1.1.19
-          # GH Actions runs `run:` steps as `bash -eo pipefail` — a pure-comment
-          # cvm-id.txt makes `grep -v '^#'` exit 1 (no matching lines); under
-          # pipefail that non-zero propagates as the pipeline's exit status
-          # even though `head -1` itself exits 0, so `set -e` would abort right
-          # here with a bare, unexplained non-zero exit — never reaching the
-          # intended fail-closed message below. `|| true` absorbs grep's
-          # no-match exit so CVM_ID legitimately ends up empty and the explicit
-          # check on the next line is what actually fires.
-          CVM_ID=$(grep -v '^#' deploy/test-pg-cvm-id.txt | head -1 || true)
-          test -n "$CVM_ID" || { echo "test-pg-cvm-id.txt empty — 首次开通走 DEPLOYMENTS.md runbook，不走本 workflow"; exit 1; }
-          phala deploy --api-token "$PHALA_CLOUD_API_KEY" --cvm-id "$CVM_ID" \
-            -c deploy/docker-compose.phala.postgres.yaml \
-            -e "PG_OWNER_PASSWORD=${{ secrets.TEST_PG_OWNER_PASSWORD }}" \
-            -e "APP_DB_PASSWORD=${{ secrets.TEST_APP_DB_PASSWORD }}" \
-            -e "REPLICATOR_DB_PASSWORD=${{ secrets.TEST_REPLICATOR_DB_PASSWORD }}" \
-            -e "MONITORING_DB_PASSWORD=${{ secrets.TEST_MONITORING_DB_PASSWORD }}" \
-            -e "PG_SERVER_CERT_B64=${{ secrets.TEST_PG_SERVER_CERT_B64 }}" \
-            -e "PG_SERVER_KEY_B64=${{ secrets.TEST_PG_SERVER_KEY_B64 }}" \
-            -e "WALG_S3_PREFIX=${{ secrets.TEST_WALG_S3_PREFIX }}" \
-            -e "WALG_LIBSODIUM_KEY=${{ secrets.TEST_WALG_LIBSODIUM_KEY }}" \
-            -e "PG_BACKUP_R2_ENDPOINT=${{ secrets.TEST_PG_BACKUP_R2_ENDPOINT }}" \
-            -e "PG_BACKUP_R2_ACCESS_KEY_ID=${{ secrets.TEST_PG_BACKUP_R2_ACCESS_KEY_ID }}" \
-            -e "PG_BACKUP_R2_SECRET_ACCESS_KEY=${{ secrets.TEST_PG_BACKUP_R2_SECRET_ACCESS_KEY }}" \
-            --wait
-      - name: Publish compose hash (independent AppAuth)
         env:
-          PHALA_CLOUD_API_KEY: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
-          PRIVATE_KEY: ${{ secrets.ETH_DEPLOYER_KEY }}
-          ETH_SEPOLIA_RPC_URL: ${{ secrets.ETH_SEPOLIA_RPC_URL }}
-          FEEDLING_APP_AUTH_CONTRACT: ${{ secrets.TEST_PG_APP_AUTH_CONTRACT }}
-          FEEDLING_COMPOSE_FILE: deploy/docker-compose.phala.postgres.yaml
+          ENVIRONMENT: ${{ inputs.environment }}
+          CVM_ID: ${{ steps.cvm.outputs.id }}
+          # 两套机密都注入、在 shell 里按环境挑，而不是用
+          # `${{ inputs.environment == 'prod' && secrets.PROD_X || secrets.TEST_X }}`：
+          # 那种三元在 PROD_X 恰好为空时会短路 fallback 到 TEST_X，于是「非空校验」
+          # 通过、注进 prod CVM 的却是 test 的密码。这里挑错只会挑到空值 → fail-closed。
+          TEST_PHALA_TOKEN: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          PROD_PHALA_TOKEN: ${{ secrets.PHALA_CLOUD_API_KEY }}   # prod 在 sxysun workspace，key 无 PROD_ 前缀
+          TEST_PG_OWNER_PASSWORD: ${{ secrets.TEST_PG_OWNER_PASSWORD }}
+          TEST_APP_DB_PASSWORD: ${{ secrets.TEST_APP_DB_PASSWORD }}
+          TEST_REPLICATOR_DB_PASSWORD: ${{ secrets.TEST_REPLICATOR_DB_PASSWORD }}
+          TEST_MONITORING_DB_PASSWORD: ${{ secrets.TEST_MONITORING_DB_PASSWORD }}
+          TEST_PG_SERVER_CERT_B64: ${{ secrets.TEST_PG_SERVER_CERT_B64 }}
+          TEST_PG_SERVER_KEY_B64: ${{ secrets.TEST_PG_SERVER_KEY_B64 }}
+          TEST_WALG_S3_PREFIX: ${{ secrets.TEST_WALG_S3_PREFIX }}
+          TEST_WALG_LIBSODIUM_KEY: ${{ secrets.TEST_WALG_LIBSODIUM_KEY }}
+          TEST_PG_BACKUP_R2_ENDPOINT: ${{ secrets.TEST_PG_BACKUP_R2_ENDPOINT }}
+          TEST_PG_BACKUP_R2_ACCESS_KEY_ID: ${{ secrets.TEST_PG_BACKUP_R2_ACCESS_KEY_ID }}
+          TEST_PG_BACKUP_R2_SECRET_ACCESS_KEY: ${{ secrets.TEST_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
+          PROD_PG_OWNER_PASSWORD: ${{ secrets.PROD_PG_OWNER_PASSWORD }}
+          PROD_APP_DB_PASSWORD: ${{ secrets.PROD_APP_DB_PASSWORD }}
+          PROD_REPLICATOR_DB_PASSWORD: ${{ secrets.PROD_REPLICATOR_DB_PASSWORD }}
+          PROD_MONITORING_DB_PASSWORD: ${{ secrets.PROD_MONITORING_DB_PASSWORD }}
+          PROD_PG_SERVER_CERT_B64: ${{ secrets.PROD_PG_SERVER_CERT_B64 }}
+          PROD_PG_SERVER_KEY_B64: ${{ secrets.PROD_PG_SERVER_KEY_B64 }}
+          PROD_WALG_S3_PREFIX: ${{ secrets.PROD_WALG_S3_PREFIX }}
+          PROD_WALG_LIBSODIUM_KEY: ${{ secrets.PROD_WALG_LIBSODIUM_KEY }}
+          PROD_PG_BACKUP_R2_ENDPOINT: ${{ secrets.PROD_PG_BACKUP_R2_ENDPOINT }}
+          PROD_PG_BACKUP_R2_ACCESS_KEY_ID: ${{ secrets.PROD_PG_BACKUP_R2_ACCESS_KEY_ID }}
+          PROD_PG_BACKUP_R2_SECRET_ACCESS_KEY: ${{ secrets.PROD_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
         run: |
-          # Same pipefail guard as the Deploy step above (this step only runs
-          # after Deploy already validated a non-empty CVM_ID, but keep the
-          # same defensive `|| true` so this line can never abort the script
-          # on its own with an unexplained exit).
-          export FEEDLING_CVM_ID=$(grep -v '^#' deploy/test-pg-cvm-id.txt | head -1 || true)
-          ./deploy/publish-compose-hash.sh eth_sepolia
+          UP=$(echo "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')
+          pick() { local n="${UP}_$1"; printf '%s' "${!n-}"; }
+
+          # 原地更新必须重带整份机密，漏一个就被清空 → entrypoint fail-closed 起不来
+          # （docs/TEE_POSTGRES_SHADOW_PROVISIONING.md §2.4）。先整份校验再动 CVM。
+          VARS="PG_OWNER_PASSWORD APP_DB_PASSWORD REPLICATOR_DB_PASSWORD
+                MONITORING_DB_PASSWORD PG_SERVER_CERT_B64 PG_SERVER_KEY_B64
+                WALG_S3_PREFIX WALG_LIBSODIUM_KEY PG_BACKUP_R2_ENDPOINT
+                PG_BACKUP_R2_ACCESS_KEY_ID PG_BACKUP_R2_SECRET_ACCESS_KEY"
+          missing=0
+          for v in $VARS; do
+            [ -n "$(pick "$v")" ] || { echo "::error::MISSING secret: ${UP}_${v}"; missing=1; }
+          done
+          TOKEN=$(pick PHALA_TOKEN)
+          [ -n "$TOKEN" ] || { echo "::error::MISSING phala api token for ${ENVIRONMENT}"; missing=1; }
+          [ "$missing" = 0 ] || exit 1
+
+          # 机密落 0600 env 文件而不是拼进命令行：ps/日志里不会出现明文。
+          ENVFILE=$(mktemp); chmod 600 "$ENVFILE"
+          for v in $VARS; do printf '%s=%s\n' "$v" "$(pick "$v")" >> "$ENVFILE"; done
+
+          npm install -g phala@1.1.19
+          phala deploy --api-token "$TOKEN" --cvm-id "$CVM_ID" \
+            -c deploy/docker-compose.phala.postgres.yaml \
+            -e "$ENVFILE" --wait
+          rm -f "$ENVFILE"
+      - name: Post-deploy — 备份链自检
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          CVM_ID: ${{ steps.cvm.outputs.id }}
+          TEST_PHALA_TOKEN: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          PROD_PHALA_TOKEN: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          UP=$(echo "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')
+          eval "TOKEN=\${${UP}_PHALA_TOKEN}"
+          phala cvms get "$CVM_ID" --api-token "$TOKEN" --json > cvm.json
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open('cvm.json'))
+          status = d.get('status')
+          print('status:', status)
+          print('compose_hash:', d.get('compose_hash'))
+          img = [l.strip() for l in d.get('compose_file', {}).get('docker_compose_file', '').splitlines()
+                 if 'feedling-postgres:' in l and not l.lstrip().startswith('#')]
+          print('image:', img)
+          if status != 'running':
+              sys.exit(f'CVM 未回到 running: {status}')
+          PY
+          echo "提醒：镜像内 cron 的每日 base backup 在 03:00 UTC；本次部署后的首个 03:00 由 pg-monitor 的 BASE 断言把关。"
