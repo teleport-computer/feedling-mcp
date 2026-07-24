@@ -80,6 +80,35 @@ def test_index_core_thread_query_does_not_truncate_before_enclave_filter(monkeyp
     assert body["items"] == [{"id": "late_thread_match", "summary": "低分但 thread 命中"}]
 
 
+def test_index_core_private_query_limit_is_applied_after_enclave_search(monkeypatch):
+    monkeypatch.setenv("FEEDLING_MEMORY_READSIDE_HARD_MAX", "10")
+    store = types.SimpleNamespace(user_id="usr_v1_read")
+    moments = [
+        _moment("high_score", importance=0.9, pulse=0.9),
+        _moment("late_private_match", importance=0.1, pulse=0.1,
+                occurred_at="2026-01-01T00:00:00"),
+    ]
+    monkeypatch.setattr(readside_core.memory_service, "_load_moments", lambda _store: moments)
+    captured = {}
+
+    def fake_enclave(api_key, candidates, *, operation, payload=None):
+        captured["ids"] = [m["id"] for m in candidates]
+        captured["payload"] = dict(payload or {})
+        return {"items": [{"id": "late_private_match", "summary": "private match"}]}
+
+    body = readside_core.memory_index_core(
+        store,
+        "key",
+        {"query": "blue-orchid", "limit": 1},
+        post_enclave=fake_enclave,
+    )
+
+    assert captured["ids"] == ["high_score", "late_private_match"]
+    assert captured["payload"]["limit"] == 1
+    assert body["limit"] == 1
+    assert body["items"] == [{"id": "late_private_match", "summary": "private match"}]
+
+
 def test_index_core_ambient_uses_importance_pulse_recency_order(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_v1_read")
     moments = [
@@ -176,6 +205,8 @@ def test_enclave_index_and_fetch_use_v1_shape_without_content_in_index():
         "pulse": 0.4,
         "status": "active",
         "occurred_at": "2026-06-20T10:00:00",
+        "created_at": "",
+        "updated_at": "",
         "last_referenced_at": "2026-06-21T10:00:00",
         "is_sensitive": False,
         "score": 0.0,

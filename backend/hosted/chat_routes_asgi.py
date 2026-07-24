@@ -1,15 +1,11 @@
 """Native ASGI hosted chat send (ASGI-migration plan §11.1).
 
-``POST /v1/model_api/chat/send`` — the hosted Model-API main path. The Flask
-route parked a gunicorn thread inside ``agent_runtime_cutover.handle_send`` while
-polling the store for the agent's reply (up to ~8s of ``time.sleep``); this async
-route hands the ENTIRE route body — provider-config load, envelope build, chat
-append, supervisor wedge guard, debug traces, AND that blocking wait — to the
-bounded threadpool via ``run_db`` in a single hop, so the 202 contract, every
-debug/action trace, the 400/409/413/503 branches, and the single (non-double)
-append are byte-identical to Flask. The route body itself lives in the
-framework-neutral ``hosted.chat_send_core``; only auth + credential extraction +
-the response wrapper differ here.
+``POST /v1/model_api/chat/send`` — the hosted Model-API main path. The framework-
+neutral body validates Runtime V2 ownership/liveness/admission, builds the
+encrypted envelope, and atomically commits the message plus durable job. This
+ASGI adapter runs that synchronous database work through the bounded threadpool;
+it never waits for provider inference. Only auth, credential extraction, and the
+response wrapper differ from the shared core.
 
 No scope: the Flask route only calls ``auth.require_user()`` (no
 ``runtime_auth.authorize_scope``), so this uses plain ``require_auth``.
@@ -50,10 +46,10 @@ async def model_api_chat_send(request: Request, auth: AuthResult = Depends(requi
     # worker thread (worldbook match in hosted.context, screen-frame decrypt in
     # screen.frames/caption) can read X-Feedling-Runtime-Token off the proxy.
     # run_db copies THIS context into the threadpool worker, so binding on the
-    # loop is sufficient. Without it a host-all user (api_key=None, runtime token
+    # loop is sufficient. Without it a Runtime V2 user (api_key=None, runtime token
     # only) silently loses worldbook + screen context — a Flask→ASGI regression
     # (the old global flask.request always carried the header). Plan §5.2: the
-    # whole body incl. the blocking reply-wait runs on the threadpool, never the loop.
+    # whole synchronous persistence path runs on the threadpool, never the loop.
     with reqctx.bind(query_string=request.url.query, headers=dict(request.headers)):
         body, status = await threadpool.run_db(
             chat_send_core.model_api_chat_send_core,

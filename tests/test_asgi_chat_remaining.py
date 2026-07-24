@@ -292,6 +292,7 @@ def test_history_clear_success(user):
         "DELETE", "/v1/chat/history", headers=_hk(api_key), json={"confirm": "clear-chat-history"}
     )
     assert a_status == 200 and a_body["cleared"] is True
+    assert a_body["encrypted_trajectory_telemetry_retained"] is True
     store = core_store.get_store(uid)
     with store.chat_lock:
         assert store.chat_messages == []

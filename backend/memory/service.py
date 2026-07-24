@@ -3,6 +3,7 @@
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 
 
@@ -99,15 +100,27 @@ def _active_memory_moments(moments: list) -> list[dict]:
 _FALLBACK_MUTATION_LOCK = threading.RLock()
 
 
+@contextmanager
 def mutation_lock(store):
-    """The store's reentrant memory_lock, held across a load→mutate→save so
-    concurrent same-user writes serialize and can't lost-update (a stale-snapshot
-    ``memory_replace_all`` would otherwise delete a concurrently-added card).
+    """Serialize one complete Memory Garden mutation locally and in Postgres.
 
-    A real ``UserStore`` always has one; the process-wide fallback only covers
-    partial test doubles that mock ``_load_moments``/``_save_moments`` and never
-    reach the real DB reconcile."""
-    return getattr(store, "memory_lock", None) or _FALLBACK_MUTATION_LOCK
+    The local reentrant lock protects threads sharing a ``UserStore``. The
+    database advisory fence spans the *whole* load→mutate→save transaction, so
+    another backend process (including Runtime V2 Capture) cannot commit a card
+    between a fresh load and a whole-Garden reconcile. Nested ``_save_moments``
+    calls reuse both locks and the same database transaction.
+
+    Partial unit-test doubles have no ``memory_lock`` and mock both persistence
+    helpers; they retain the process-wide fallback without opening a database
+    transaction. Production ``UserStore`` instances always take both fences.
+    """
+    store_lock = getattr(store, "memory_lock", None)
+    with store_lock or _FALLBACK_MUTATION_LOCK:
+        if store_lock is None:
+            yield
+        else:
+            with db.memory_user_mutation_fence(store.user_id):
+                yield
 
 
 def _save_moments(store: UserStore, moments: list):

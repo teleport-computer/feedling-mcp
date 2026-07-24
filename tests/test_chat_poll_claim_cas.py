@@ -127,3 +127,51 @@ def test_peek_does_not_claim(store):
     assert "m_reply_4" in a and "m_reply_4" in b
     # A real claim afterwards still succeeds (the peek didn't lock anything).
     assert "m_reply_4" in [m["id"] for m in _poll(store, "consumer-A")]
+
+
+# ---- Resident↔V2 flip-window guard (chat.service claim gate) ----
+
+def test_db_action_v2_claiming_poll_gated_but_readonly_still_delivers(store):
+    """A db_action_v2 user is served ONLY by the V2 worker pool, not the resident
+    consumer. The resident's CLAIMING poll must return nothing for such a user
+    (so a still-running resident consumer in the ~15s flip window can't claim +
+    reply alongside the V2 worker, which reads independently by seq cursor and
+    ignores reply_claimed_by — that would double-reply). A read-only poll (the
+    client fetching the V2 reply) is unaffected."""
+    import db  # noqa: E402
+    db.patch_blob_strict(
+        store.user_id,
+        "model_api_runtime",
+        {"hosted_runtime_mode": "db_action_v2"},
+        runtime_state_target="v2",
+    )
+    _append_reply(store, "m_v2_1")
+
+    # resident consumer's claiming poll: gated → nothing claimed
+    assert _poll(store, "agent-runner:x", claim=True) == []
+    # read-only poll still sees the pending message (client reads the V2 reply path)
+    assert [m["id"] for m in _poll(store, "client", claim=False)] == ["m_v2_1"]
+    # and because the claiming poll was gated, the row is still unclaimed, so a
+    # subsequent read-only poll continues to deliver it (not stuck behind a claim)
+    assert [m["id"] for m in _poll(store, "client", claim=False)] == ["m_v2_1"]
+
+
+def test_resident_cli_claiming_poll_unaffected_by_guard(store):
+    """The default (resident_cli) user's claiming poll is unchanged — the guard
+    only fires for explicit db_action_v2 users."""
+    _append_reply(store, "m_res_1")
+    assert [m["id"] for m in _poll(store, "agent-runner:x", claim=True)] == ["m_res_1"]
+
+
+def test_runtime_control_read_failure_never_grants_resident_claim(store, monkeypatch):
+    from hosted import config_store as hosted_config_store  # noqa: E402
+
+    _append_reply(store, "m_control_down")
+    monkeypatch.setattr(
+        hosted_config_store,
+        "get_hosted_runtime_control_strict",
+        lambda _store: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+
+    assert _poll(store, "agent-runner:x", claim=True) == []
+    assert [m["id"] for m in _poll(store, "client", claim=False)] == ["m_control_down"]

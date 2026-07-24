@@ -51,18 +51,6 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
         ("user_id", "job_id", "output_type"),
         "user_id, job_id, output_type, ref, status, doc, created_at, updated_at",
     ),
-    # 没有 doc 列——是一堆具名字段（driver/status/pid/lease_owner/...）。
-    "agent_runtime_instances": (
-        ("user_id",),
-        "user_id, driver, status, pid, lease_owner, lease_expires_at, session_ref, "
-        "runtime_home, last_heartbeat_at, last_active_at, error, updated_at",
-    ),
-    # 没有 ts/doc 列——PK 确认是 owner；具名字段 + payload(JSONB) 兜底诊断信息。
-    "agent_runtime_supervisor_heartbeats": (
-        ("owner",),
-        "owner, host, shard_index, shard_count, max_children, active_children, "
-        "host_all, gateway, version, payload, updated_at",
-    ),
     # Notify Relay（自部署推送中继，0020）。configs 的 PK 是 auth_token（明文中继
     # 凭证）；logs 的 id 是 GENERATED ALWAYS AS IDENTITY，见下 _IDENTITY_TABLES。
     # 注意：TEE 侧 configs 有意不带主库的 device_token UNIQUE（见 alembic_tee

@@ -5,13 +5,13 @@ going forward, but rows written before images joined that list still carry a
 1-2MB base64 ciphertext inline in ``chat_messages.doc``. This walks them and
 rewrites each to the pointer shape ``db._is_chat_file_pointer`` expects:
 
-    doc = <doc minus body_ct> + {body_key: chatfiles/<user>/<msg>, body_ct_len: N}
+    doc = <doc minus body_ct> + {body_key: <generation key>, body_ct_len: N}
 
-Ordering mirrors chat_append (crash-safe): upload to R2 FIRST, flip the row only
-after the object exists. A crash leaves the row inline and readable — at worst an
-orphan object in R2, which the next run overwrites. The flip is the same atomic
-``doc - 'body_ct' || pointer`` JSONB update chat_append uses, so a reply/claim
-another worker merged into the row while we were uploading is preserved.
+The backfill delegates to the same generation-fenced, tombstone-guarded offload
+protocol as live appends. A crash leaves the row inline and readable plus a
+durable cleanup intent; clear and same-id replacement cannot promote a stale
+upload. Operational metadata merged during upload is preserved by the same
+crypto-envelope CAS as the live path.
 
 Read side needs no migration: every delivery exit already hydrates a pointer
 (history page, poll peek, claim, single-body fetch) and is content-type agnostic.
@@ -29,8 +29,6 @@ import argparse
 import base64
 import sys
 from pathlib import Path
-
-from psycopg.types.json import Jsonb
 
 # Make `import db` / `import object_storage` work regardless of CWD.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -68,28 +66,35 @@ def _migrate_row(user_id: str, msg_id: str, doc: dict, dry_run: bool) -> tuple[s
         return ("dry", raw_len)
 
     try:
-        # 1) object first — a crash here leaves the row inline and readable. The key
-        #    comes back from the upload (images land under their own prefix).
-        key = object_storage.put_chat_body(user_id, msg_id, body_ct, "image")
-    except Exception as e:  # noqa: BLE001
-        print(f"  FAIL {user_id}/{msg_id} — upload: {e}", file=sys.stderr)
-        return ("failed", 0)
-
-    # 2) object exists → flip to the pointer shape. Atomic on the CURRENT row, so
-    #    metadata merged in during the upload survives. The `? 'body_ct'` guard
-    #    makes a re-run a no-op rather than a double-flip.
-    pointer = {"body_key": key, "body_ct_len": len(body_ct)}
-    try:
         with db.get_pool().connection() as conn:
-            conn.execute(
-                "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
-                "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
-                (Jsonb(pointer), user_id, msg_id),
-            )
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    generation = db._lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+                    cur.execute(
+                        "SELECT storage_generation FROM chat_messages "
+                        "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                        (user_id, msg_id),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        return ("skipped", 0)
+                    if int(row[0]) != generation:
+                        return ("failed", 0)
+        db._offload_chat_body_after_commit(user_id, msg_id, doc, generation)
+        with db.get_pool().connection() as conn:
+            persisted = conn.execute(
+                "SELECT doc FROM chat_messages WHERE user_id=%s AND msg_id=%s",
+                (user_id, msg_id),
+            ).fetchone()
     except Exception as e:  # noqa: BLE001
-        print(f"  FAIL {user_id}/{msg_id} — flip: {e}", file=sys.stderr)
+        print(f"  FAIL {user_id}/{msg_id} — offload: {e}", file=sys.stderr)
         return ("failed", 0)
-    return ("migrated", raw_len)
+    if persisted is None:
+        return ("skipped", 0)
+    persisted_doc = persisted[0] if isinstance(persisted[0], dict) else {}
+    if db._is_chat_file_pointer(persisted_doc):
+        return ("migrated", raw_len)
+    return ("failed", 0)
 
 
 def run(batch_size: int, dry_run: bool, only_user: str = "") -> int:

@@ -710,9 +710,9 @@ def cmd_acceptance(args):
         "memories_written": int(job.get("memory_action_count") or 0) > 0,
     }
     if getattr(args, "check_introduction", False):
-        # §六 7.D: after genesis done, host-all autodiscover spawns the agent, which
-        # should ONCE write its self_introduction (identity.profile_patch) and post a
-        # first greeting. Poll for both within the intro window.
+        # Compatibility option: verify the V2 Genesis onboarding greeting. A
+        # self_introduction identity field is useful diagnostic output but is no
+        # longer a process-spawn contract.
         intro_self, greeting = "", False
         intro_deadline = time.time() + args.intro_timeout
         while time.time() < intro_deadline:
@@ -730,11 +730,10 @@ def cmd_acceptance(args):
                                for m in (ch.get("messages") or []))
             except SystemExit:
                 pass  # flaky proxy — retry next iteration
-            if intro_self.strip() and greeting:
+            if greeting:
                 break
             time.sleep(args.poll)
         identity_body["self_introduction"] = intro_self
-        checks["introduction_self_intro_written"] = bool(intro_self.strip())
         checks["introduction_greeting_posted"] = greeting
     failed = [k for k, v in checks.items() if v is False]
     out = {
@@ -751,10 +750,8 @@ def cmd_acceptance(args):
     }
     print(json.dumps(out, ensure_ascii=False, indent=1))
     if not getattr(args, "no_cleanup", False):
-        # Stop the throwaway from lingering in host-all discovery: each genesis-done +
-        # model_api-ok user keeps a resident consumer, and accumulated test users contend
-        # for agent-runner resources (which can starve a real account's introduction).
-        # Dropping model_api removes it from autodiscover. Best-effort.
+        # Remove the throwaway provider route/credential after acceptance so
+        # test accounts cannot enqueue more paid Runtime V2 work. Best-effort.
         try:
             _http("DELETE", f"{base}/v1/model_api/delete", args.api_key)
         except Exception:  # noqa: BLE001
@@ -829,13 +826,11 @@ def main():
     ac.add_argument("--timeout", type=float, default=900)
     ac.add_argument("--poll", type=float, default=10)
     ac.add_argument("--check-introduction", action="store_true",
-                    help="§六 7.D: after genesis done, wait for the spawned agent to write "
-                         "self_introduction + post a first greeting (needs agent-runner host-all)")
+                    help="after genesis done, wait for the Runtime V2 onboarding greeting")
     ac.add_argument("--intro-timeout", type=float, default=180,
                     help="seconds to wait for the 7.D introduction (default 180)")
     ac.add_argument("--no-cleanup", action="store_true",
-                    help="keep the throwaway's model_api (default: DELETE it after the run "
-                         "so it stops polluting host-all autodiscover)")
+                    help="keep the throwaway's model_api provider config")
     ac.set_defaults(func=cmd_acceptance)
 
     da = sub.add_parser("distill-acceptance",

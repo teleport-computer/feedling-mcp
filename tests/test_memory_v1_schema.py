@@ -231,7 +231,13 @@ def test_memory_patch_becomes_supersede_and_inherits_old_bucket_threads(monkeypa
     }
     moments = [old]
     saved = _install_memory_action_fakes(monkeypatch, moments)
-    monkeypatch.setattr(memory_actions, "_memory_plain_from_envelope", lambda moment, _api_key: (json.loads(moment["body_ct"]), ""))
+    decrypt_tokens = []
+
+    def fake_plain(moment, _api_key, runtime_token=""):
+        decrypt_tokens.append(runtime_token)
+        return json.loads(moment["body_ct"]), ""
+
+    monkeypatch.setattr(memory_actions, "_memory_plain_from_envelope", fake_plain)
 
     body, status = memory_actions._execute_memory_actions(store, "api_key", [
         {
@@ -242,7 +248,7 @@ def test_memory_patch_becomes_supersede_and_inherits_old_bucket_threads(monkeypa
                 "content": "记忆: 蛋子是一只比熊，屁股上有胎记。\n上下文: 用户纠正并补充。\n使用提示: 问到蛋子时用新事实。",
             },
         }
-    ])
+    ], runtime_token="rt-hosted")
 
     assert status == 200
     assert body["results"][0]["action"] == "memory.supersede"
@@ -253,3 +259,4 @@ def test_memory_patch_becomes_supersede_and_inherits_old_bucket_threads(monkeypa
     assert inner["bucket"] == "宠物"
     assert inner["threads"] == ["蛋子", "狗狗"]
     assert inner["summary"] == "蛋子是一只比熊，屁股上有胎记。"
+    assert decrypt_tokens == ["rt-hosted"]

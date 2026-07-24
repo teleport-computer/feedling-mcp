@@ -6,9 +6,7 @@ init_identity/open_chat_gate flow — it predates identity-never-gates.
 - model_api: NO unlock needed. `_bootstrap_state` always reports main_loop
   (identity/memory are informational only, backend/bootstrap/gates.py:39-69)
   and the hosted route bypasses `_gate_bootstrap_for_chat` entirely (:137-159).
-  register → setup → send. Do NOT run a fresh_start genesis job here: while it
-  is `processing` it temporarily BLOCKS the runner spawn (supervisor.py:918-948)
-  — the opposite of an unlock.
+  register → setup → send. Genesis is onboarding work, not a chat unlock.
 
 - resident: the ONLY chat unlock is (a) the official consumer's recent poll
   heartbeat (X-Feedling-Consumer: feedling-chat-resident, 180s window) and

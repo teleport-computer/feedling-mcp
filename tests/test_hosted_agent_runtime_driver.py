@@ -1,12 +1,8 @@
-"""Stage B endpoints: per-user driver flag setter + own key-envelope ciphertext.
+"""Compatibility driver label + owner-only provider-key envelope endpoints.
 
-Both let the agent-runner stop depending on a static roster:
-- ``POST /v1/model_api/driver`` flips ``agent_runtime_driver`` (legacy|claude|codex)
-  so a user can be gradually moved onto the hosted runtime.
-- ``GET /v1/model_api/key_envelope`` returns the caller's OWN ``api_key_envelope``
-  ciphertext so the supervisor (holding the user's API key) can self-fetch the
-  provider-key envelope and enclave-decrypt it JIT — instead of the roster
-  carrying per-user secrets. The server only ever returns ciphertext (E2E intact).
+Runtime V2 derives the driver from the active provider route and receives only
+the caller's encrypted provider-key envelope. The server never returns the
+plaintext provider key.
 """
 
 from __future__ import annotations
@@ -186,6 +182,5 @@ def test_resolve_driver_raises_for_unknown_provider():
     with pytest.raises(arc.UnsupportedProviderError):
         arc.resolve_driver({"provider": "weird"})
 
-def test_resolve_driver_ignores_per_user_flag_and_gateway(monkeypatch):
-    monkeypatch.delenv("FEEDLING_HOST_ALL", raising=False)
+def test_resolve_driver_ignores_retired_per_user_flag():
     assert arc.resolve_driver({"provider": "openrouter", "agent_runtime_driver": "legacy"}) == "pi"

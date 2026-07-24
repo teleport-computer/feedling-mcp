@@ -74,3 +74,122 @@ def test_load_users_is_lock_guarded_and_reloads(captured):
     # deadlock and rebuild the key cache so the user still resolves.
     registry.load_users()
     assert any(u.get("user_id") == uid for u in registry._users)
+
+
+def test_load_users_normalization_cas_preserves_concurrent_registration(
+    captured, monkeypatch
+):
+    """A reconnect reload must not delete an account absent from its snapshot.
+
+    Force a registration between the registry SELECT and legacy normalization
+    persistence. The old full-snapshot save deleted that new row; per-user CAS
+    may update only the legacy row it actually read.
+    """
+    legacy_id = "usr_00000000000000a1"
+    concurrent_id = "usr_00000000000000a2"
+    legacy = {
+        "user_id": legacy_id,
+        "api_key_hash": "legacy-hash",
+        "created_at": "2026-01-01T00:00:00",
+    }
+    concurrent = {
+        "user_id": concurrent_id,
+        "principal_id": "prn_concurrent",
+        "api_key_hash": "concurrent-hash",
+        "api_keys": [],
+        "access_bindings": [],
+        "created_at": "2026-01-02T00:00:00",
+    }
+    registry.db.upsert_user(legacy)
+    real_load = registry.db.load_all_users
+
+    def stale_load_then_register():
+        snapshot = real_load()
+        registry.db.upsert_user(concurrent)
+        return snapshot
+
+    monkeypatch.setattr(registry.db, "load_all_users", stale_load_then_register)
+    registry.load_users()
+
+    persisted = {row["user_id"]: row for row in real_load()}
+    assert concurrent_id in persisted
+    assert persisted[concurrent_id] == concurrent
+    assert persisted[legacy_id].get("principal_id")
+
+
+def test_load_users_normalization_cas_does_not_overwrite_same_user_edit(
+    captured, monkeypatch
+):
+    """A stale normalizer must lose to a newer edit of the same account row."""
+    user_id = "usr_00000000000000b1"
+    legacy = {
+        "user_id": user_id,
+        "api_key_hash": "legacy-same-user-hash",
+        "created_at": "2026-01-01T00:00:00",
+    }
+    concurrent = {
+        "user_id": user_id,
+        "principal_id": "prn_newer_edit",
+        "api_key_hash": "newer-same-user-hash",
+        "api_keys": [],
+        "access_bindings": [],
+        "archive_language": "zh-Hans",
+        "created_at": "2026-01-01T00:00:00",
+    }
+    registry.db.upsert_user(legacy)
+    real_load = registry.db.load_all_users
+
+    def stale_load_then_edit_same_user():
+        snapshot = real_load()
+        registry.db.upsert_user(concurrent)
+        return snapshot
+
+    monkeypatch.setattr(
+        registry.db, "load_all_users", stale_load_then_edit_same_user
+    )
+    registry.load_users()
+
+    persisted = {row["user_id"]: row for row in real_load()}
+    assert persisted[user_id] == concurrent
+    cached = next(row for row in registry._users if row["user_id"] == user_id)
+    assert cached == concurrent
+    assert registry._key_to_user["newer-same-user-hash"] == user_id
+    assert "legacy-same-user-hash" not in registry._key_to_user
+
+
+def test_load_users_normalization_db_failure_serves_original_row(
+    captured, monkeypatch
+):
+    """Never expose process-local generated IDs when normalization cannot write."""
+    user_id = "usr_00000000000000c1"
+    legacy = {
+        "user_id": user_id,
+        "api_key_hash": "legacy-db-failure-hash",
+        "created_at": "2026-01-01T00:00:00",
+    }
+    registry.db.upsert_user(legacy)
+    monkeypatch.setattr(
+        registry.db,
+        "normalize_user_cas",
+        lambda *_args, **_kwargs: (False, None),
+    )
+
+    registry.load_users()
+
+    cached = next(row for row in registry._users if row["user_id"] == user_id)
+    assert cached == legacy
+    assert registry._key_to_user["legacy-db-failure-hash"] == user_id
+
+
+def test_register_handler_is_idempotent():
+    channel = "test_users_handler_idempotence"
+
+    def handler(_user_id: str) -> None:
+        return None
+
+    try:
+        wake_bus.register_handler(channel, handler)
+        wake_bus.register_handler(channel, handler)
+        assert wake_bus._extra_handlers[channel] == [handler]
+    finally:
+        wake_bus._extra_handlers.pop(channel, None)

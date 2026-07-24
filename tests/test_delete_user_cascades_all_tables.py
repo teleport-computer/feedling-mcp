@@ -7,7 +7,6 @@ _PER_USER_TABLES = [
     "chat_messages", "frame_envelopes", "memory_moments", "perception_daily",
     "perception_items", "user_blobs", "user_logs",
     "genesis_import_jobs", "genesis_import_chunks", "genesis_import_outputs",
-    "agent_runtime_instances",
 ]
 
 
@@ -51,11 +50,6 @@ def _seed_min_rows(conn, uid):
     conn.execute(
         "INSERT INTO genesis_import_outputs (user_id, job_id, output_type) "
         "VALUES (%s, 'job1', 'summary')",
-        (uid,),
-    )
-    conn.execute(
-        "INSERT INTO agent_runtime_instances (user_id, driver, status, runtime_home) "
-        "VALUES (%s, 'claude', 'idle', '/tmp/x')",
         (uid,),
     )
 

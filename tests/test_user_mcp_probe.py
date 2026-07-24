@@ -11,7 +11,7 @@ from hosted import mcp_probe  # noqa: E402
 from _ca_helpers import self_signed_ca_pem  # noqa: E402
 
 
-def _fake_mcp_app(require_auth: str | None = None):
+def _fake_mcp_app(require_auth: str | None = None, tools: list[dict] | None = None):
     """进程内 fake streamable-HTTP MCP server（JSON 响应模式）。"""
     async def app(scope, receive, send):
         assert scope["type"] == "http"
@@ -31,8 +31,10 @@ def _fake_mcp_app(require_auth: str | None = None):
             result = {"protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
                       "serverInfo": {"name": "fake", "version": "0"}}
         elif method == "tools/list":
-            result = {"tools": [{"name": "search", "description": "d", "inputSchema": {}},
-                                {"name": "fetch", "description": "d", "inputSchema": {}}]}
+            result = {"tools": tools if tools is not None else [
+                {"name": "search", "description": "d", "inputSchema": {}},
+                {"name": "fetch", "description": "d", "inputSchema": {}},
+            ]}
         elif method == "notifications/initialized":
             await _respond(send, 202, None)
             return
@@ -55,8 +57,158 @@ def test_probe_happy_path(monkeypatch):
     monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: ["93.184.216.34"])
     transport = httpx.ASGITransport(app=_fake_mcp_app())
     out = mcp_probe.probe("https://mcp.example.com/mcp", {}, transport=transport)
-    assert out == {"ok": True, "tool_count": 2, "tool_names": ["search", "fetch"],
-                   "transport": "http"}
+    assert out == {
+        "ok": True,
+        "tool_count": 2,
+        "tool_names": ["search", "fetch"],
+        "read_only_tool_fingerprints": {},
+        "transport": "http",
+    }
+
+
+def test_probe_read_only_candidates_are_always_patch_compatible(monkeypatch):
+    from hosted import mcp_core
+
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: ["93.184.216.34"])
+    annotations = {"readOnlyHint": True}
+    tools = [
+        {"name": "bad\x00name", "inputSchema": {}, "annotations": annotations},
+        {"name": "x" * 257, "inputSchema": {}, "annotations": annotations},
+        *[
+            {
+                "name": f"read_{index}",
+                "inputSchema": {"type": "object"},
+                "annotations": annotations,
+            }
+            for index in range(70)
+        ],
+    ]
+    transport = httpx.ASGITransport(app=_fake_mcp_app(tools=tools))
+
+    out = mcp_probe.probe(
+        "http://mcp.example.com/mcp", {}, transport=transport)
+
+    candidates = out["read_only_tool_fingerprints"]
+    assert list(candidates) == [f"read_{index}" for index in range(64)]
+    assert len(candidates) == mcp_core.MAX_READ_ONLY_TOOL_APPROVALS
+    assert mcp_core._validate_read_only_approvals(candidates) is None
+
+
+def test_probe_duplicate_tool_names_fingerprint_first_routed_entry(monkeypatch):
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: ["93.184.216.34"])
+    first = {
+        "name": "search",
+        "inputSchema": {"type": "object", "required": ["first"]},
+        "annotations": {"readOnlyHint": True},
+    }
+    duplicate = {
+        "name": "search",
+        "inputSchema": {"type": "object", "required": ["second"]},
+        "annotations": {"readOnlyHint": True},
+    }
+    first_mutating = {
+        "name": "write",
+        "inputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": False},
+    }
+    duplicate_read = {
+        "name": "write",
+        "inputSchema": {"type": "object"},
+        "annotations": {"readOnlyHint": True},
+    }
+    transport = httpx.ASGITransport(
+        app=_fake_mcp_app(tools=[
+            first,
+            duplicate,
+            first_mutating,
+            duplicate_read,
+        ]))
+
+    out = mcp_probe.probe(
+        "https://mcp.example.com/mcp", {}, transport=transport)
+
+    assert out["read_only_tool_fingerprints"] == {
+        "search": mcp_probe.catalog_tool_fingerprint(first)}
+
+
+def test_probe_filters_malformed_catalog_entries_from_names_and_count(monkeypatch):
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: ["93.184.216.34"])
+    valid = {
+        "name": "search",
+        "inputSchema": {},
+        "annotations": {"readOnlyHint": True},
+    }
+    transport = httpx.ASGITransport(app=_fake_mcp_app(tools=[
+        None,
+        "scalar",
+        {},
+        {"name": ""},
+        valid,
+    ]))
+
+    out = mcp_probe.probe(
+        "https://mcp.example.com/mcp", {}, transport=transport)
+
+    assert out["tool_names"] == ["search"]
+    assert out["tool_count"] == 1
+    assert out["read_only_tool_fingerprints"] == {
+        "search": mcp_probe.catalog_tool_fingerprint(valid)}
+
+
+def test_probe_rejects_compressed_response_before_body_iteration(monkeypatch):
+    monkeypatch.setattr(
+        mcp_probe, "_resolve_ips", lambda host: ["93.184.216.34"])
+    seen_accept_encoding = []
+
+    class MustNotRead(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise AssertionError("compressed probe response body must never be read")
+            yield b"unreachable"
+
+        async def aclose(self):
+            return None
+
+    async def handler(request):
+        seen_accept_encoding.append(request.headers.get("accept-encoding"))
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/json",
+                "content-encoding": "br",
+            },
+            stream=MustNotRead(),
+        )
+
+    with pytest.raises(mcp_probe.ProbeError) as exc:
+        mcp_probe.probe(
+            "https://mcp.example.com/mcp",
+            {"Accept-Encoding": "gzip"},
+            transport=httpx.MockTransport(handler),
+        )
+    assert exc.value.kind == "protocol"
+    assert exc.value.detail == "compressed MCP responses are not allowed"
+    assert seen_accept_encoding == ["identity"]
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_probe_still_rejects_redirects(monkeypatch, status):
+    monkeypatch.setattr(
+        mcp_probe, "_resolve_ips", lambda host: ["93.184.216.34"])
+
+    async def handler(_request):
+        return httpx.Response(
+            status,
+            headers={"location": "https://redirect.example/mcp"},
+        )
+
+    with pytest.raises(mcp_probe.ProbeError) as exc:
+        mcp_probe.probe(
+            "https://mcp.example.com/mcp",
+            {},
+            transport=httpx.MockTransport(handler),
+        )
+    assert exc.value.kind == "protocol"
+    assert exc.value.detail == "redirects not allowed"
 
 
 def test_probe_forwards_headers(monkeypatch):
@@ -81,11 +233,8 @@ def test_probe_forwards_headers(monkeypatch):
 def test_backend_never_probes_non_global(url):
     """SSRF 回归守卫 —— 请勿删除、请勿弱化。
 
-    probe 跑在后端信任域且把上游响应体回显 160 字节给调用方
-    （mcp_probe.py:120/:134），放开它等于把「探测内网/enclave/云元数据并读回
-    响应」做成产品功能。存储层放开了私网 URL（Task 2），但后端**永远**不去连它。
-    kind 从 blocked_url 改名为 unreachable_from_backend 只是文案诚实化，
-    拒绝行为本身不变。
+    probe 跑在后端信任域；放开它会把对内网/enclave/云元数据发起带用户头部的
+    JSON-RPC 请求做成产品功能。存储层放开了私网 URL，但控制面**永远**不去连它。
     """
     assert mcp_probe.blocked_url_kind(url) == "unreachable_from_backend"
     with pytest.raises(mcp_probe.ProbeError) as e:
@@ -99,6 +248,16 @@ def test_empty_host_still_blocked_url():
     assert mcp_probe.blocked_url_kind("https:///mcp") == "blocked_url"
 
 
+def test_non_http_scheme_is_blocked_before_resolution(monkeypatch):
+    monkeypatch.setattr(
+        mcp_probe,
+        "_resolve_ips",
+        lambda host: (_ for _ in ()).throw(
+            AssertionError("unsupported scheme must not resolve")),
+    )
+    assert mcp_probe.blocked_url_kind("ftp://mcp.example.com/mcp") == "blocked_url"
+
+
 def test_probe_uses_ca_pem_for_verification(monkeypatch):
     """给了 ca_pem 就必须据其建 ssl context 传给 httpx，而不是沿用 certifi。"""
     monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: ["93.184.216.34"])
@@ -107,6 +266,7 @@ def test_probe_uses_ca_pem_for_verification(monkeypatch):
 
     def _spy(*args, **kwargs):
         seen["verify"] = kwargs.get("verify")
+        seen["trust_env"] = kwargs.get("trust_env")
         return real_client(*args, **kwargs)
 
     monkeypatch.setattr(httpx, "AsyncClient", _spy)
@@ -116,6 +276,7 @@ def test_probe_uses_ca_pem_for_verification(monkeypatch):
     assert out["ok"] is True
     import ssl as _ssl
     assert isinstance(seen["verify"], _ssl.SSLContext)
+    assert seen["trust_env"] is False
 
 
 def test_probe_without_ca_pem_leaves_verify_default(monkeypatch):
@@ -125,12 +286,14 @@ def test_probe_without_ca_pem_leaves_verify_default(monkeypatch):
 
     def _spy(*args, **kwargs):
         seen["verify"] = kwargs.get("verify", "<absent>")
+        seen["trust_env"] = kwargs.get("trust_env")
         return real_client(*args, **kwargs)
 
     monkeypatch.setattr(httpx, "AsyncClient", _spy)
     transport = httpx.ASGITransport(app=_fake_mcp_app())
     mcp_probe.probe("https://mcp.example.com/mcp", {}, transport=transport)
     assert seen["verify"] == "<absent>"   # 不传 = httpx 默认 certifi 全校验
+    assert seen["trust_env"] is False
 
 
 def test_blocked_url_kind_public_ok(monkeypatch):
@@ -559,3 +722,73 @@ def test_probe_sse_malformed_endpoint_port_is_400_not_500(monkeypatch, _direct_l
         srv.shutdown()
     assert e.value.kind == "protocol"
     assert "invalid endpoint" in e.value.detail
+
+
+# --- IP pinning: prefer a reachable validated IP (dual-stack / IPv4-only env) --
+#
+# net_safety.resolve_ips returns IPv6 addresses first for dual-stack hosts; a
+# runner CVM with no IPv6 egress could never reach them. _pin_public_target used
+# to pin ips[0] unconditionally (session-wide, no fallback), so a single
+# unreachable IPv6 broke every user-MCP connection. It now pins the first
+# validated IP that accepts a TCP connection; all candidates are already
+# is_global-validated, so trying them in turn is still SSRF-safe and still pins
+# ONE address for the whole session (no DNS-rebinding window).
+
+_V6 = "2600:1f14:36ec:d00:c4d0:fedd:9df1:9d7b"   # global unicast (2000::/3)
+
+
+def test_pin_single_ip_skips_reachability_probe(monkeypatch):
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: ["93.184.216.34"])
+    monkeypatch.setattr(
+        mcp_probe, "_probe_tcp",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("single IP must not be probed")))
+    target = mcp_probe._pin_public_target("https://mcp.example.com/mcp")
+    assert target.request_url.host == "93.184.216.34"
+    assert target.sni_hostname == "mcp.example.com"
+
+
+def test_pin_prefers_reachable_ip_when_first_is_unreachable(monkeypatch):
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: [_V6, "93.184.216.34"])
+    # IPv4-only env: the IPv6 candidate never connects.
+    monkeypatch.setattr(mcp_probe, "_probe_tcp",
+                        lambda ip, port, timeout: ip == "93.184.216.34")
+    target = mcp_probe._pin_public_target("https://mcp.example.com/mcp")
+    assert target.request_url.host == "93.184.216.34"
+    assert target.host_header == "mcp.example.com"
+    assert target.sni_hostname == "mcp.example.com"
+
+
+def test_pin_probes_the_configured_port(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: [_V6, "93.184.216.34"])
+
+    def _probe(ip, port, timeout):
+        seen["port"] = port
+        return ip == "93.184.216.34"
+
+    monkeypatch.setattr(mcp_probe, "_probe_tcp", _probe)
+    target = mcp_probe._pin_public_target("https://mcp.example.com:8443/mcp")
+    assert seen["port"] == 8443
+    assert target.request_url.host == "93.184.216.34"
+
+
+def test_pin_falls_back_to_first_ip_when_none_reachable(monkeypatch):
+    # Nothing connects (probe can't run / all filtered) -> keep ips[0] so the
+    # later real attempt surfaces the concrete error, exactly as before.
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", lambda host: [_V6, "93.184.216.34"])
+    monkeypatch.setattr(mcp_probe, "_probe_tcp", lambda ip, port, timeout: False)
+    target = mcp_probe._pin_public_target("https://mcp.example.com/mcp")
+    assert target.request_url.host == _V6
+
+
+def test_first_reachable_ip_returns_first_success_and_stops(monkeypatch):
+    probed = []
+
+    def _probe(ip, port, timeout):
+        probed.append(ip)
+        return ip == "8.8.8.8"
+
+    monkeypatch.setattr(mcp_probe, "_probe_tcp", _probe)
+    chosen = mcp_probe._first_reachable_ip([_V6, "8.8.8.8", "1.1.1.1"], 443)
+    assert chosen == "8.8.8.8"
+    assert probed == [_V6, "8.8.8.8"]   # stopped before 1.1.1.1

@@ -246,6 +246,8 @@ def test_enclave_index_item_hides_content_body_field():
         "pulse": 0.3,
         "status": "active",
         "occurred_at": "",
+        "created_at": "",
+        "updated_at": "",
         "last_referenced_at": "",
         "is_sensitive": True,
         "score": 0.91,
@@ -364,6 +366,8 @@ def test_enclave_fetch_item_returns_v1_full_card_without_sensitive_scope():
         "status": "active",
         "source": "chat",
         "occurred_at": "",
+        "created_at": "",
+        "updated_at": "",
         "last_referenced_at": "",
         "is_sensitive": True,
     }

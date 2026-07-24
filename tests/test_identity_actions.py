@@ -407,7 +407,8 @@ def test_memory_content_patch_reencrypts_existing_card(client, monkeypatch):
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: json.dumps(_plain_memory()).encode("utf-8"),
+        lambda envelope, key, *, purpose, runtime_token="":
+            json.dumps(_plain_memory()).encode("utf-8"),
     )
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 

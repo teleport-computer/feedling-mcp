@@ -52,7 +52,9 @@ def test_load_runtime_provider_config_uses_active_route(backend_env, fake_enclav
 
     cid = _cred(uid)
     r_sonnet = db.model_api_route_upsert(uid, cid, "claude-sonnet-4-5", None)
-    r_haiku = db.model_api_route_upsert(uid, cid, "claude-haiku-4-5", None)
+    r_haiku = db.model_api_route_upsert(
+        uid, cid, "claude-haiku-4-5", None, 65_536
+    )
     db.model_api_route_mark_test(uid, r_sonnet, status="ok")
     db.model_api_route_mark_test(uid, r_haiku, status="ok")
     db.model_api_route_activate(uid, r_haiku)
@@ -62,6 +64,7 @@ def test_load_runtime_provider_config_uses_active_route(backend_env, fake_enclav
     assert cfg.model == "claude-haiku-4-5"
     assert cfg.api_key == "sk-plain-key"
     assert cfg.provider == "anthropic"
+    assert cfg.context_window_tokens == 65_536
 
 
 def test_load_runtime_provider_config_without_active_route(backend_env):
@@ -91,7 +94,7 @@ def test_load_runtime_provider_config_rejects_untested_active(backend_env, fake_
 
 
 def test_load_runtime_provider_config_forwards_runtime_token(backend_env, monkeypatch):
-    """host-all 托管回合走 runtime_token，不带 api_key；只有 runtime_token 非空时才
+    """Runtime V2 托管回合走 runtime_token，不带 api_key；只有 runtime_token 非空时才
     透传给 enclave 解密调用（api-key 调用者行为不受影响 — 见下一条测试）。"""
     uid = _uid()
     seed_user(uid)

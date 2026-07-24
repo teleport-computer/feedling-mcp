@@ -16,6 +16,7 @@ for the once-per-master items). Reconciliation table (plan §8.1 / §3.3):
 | `core_wake_bus.start_listener()`            | this lifespan (always — cross-worker poll wake)|
 | `core_leader.run_singleton("ws", ...)`      | this lifespan (gated: FEEDLING_ASGI_BACKGROUND)|
 | `core_leader.run_singleton("dau-snapshot")` | this lifespan (same background gate)          |
+| `core_leader.run_singleton("runtime-reconciler")` | this lifespan (same background gate)    |
 
 Only the :9998 WS-leader election is gated OFF by default, so the dev-time
 parallel instance (:5005, plan §8) sharing the live backend's DB does not
@@ -27,6 +28,8 @@ process). See asgi.settings.
 
 from __future__ import annotations
 
+import asyncio
+import os
 from contextlib import asynccontextmanager
 
 import httpx
@@ -35,15 +38,20 @@ from asgi import threadpool
 from asgi.settings import settings
 
 
+def _reload_accounts_registry(_user_id: str) -> None:
+    from accounts import registry as accounts_registry
+
+    accounts_registry.load_users()
+
+
 def _start_wake_bus() -> None:
     """Cross-worker wake bus (per-worker LISTEN). Mirrors app.py's assembly:
     the "users" cache-evict handler is injected here (core may not import
     accounts); store channels are dispatched inside wake_bus and now also fire
     the async wake hook (core.store._fire_async_wake)."""
-    from accounts import registry as accounts_registry
     from core import wake_bus as core_wake_bus
 
-    core_wake_bus.register_handler("users", lambda _uid: accounts_registry.load_users())
+    core_wake_bus.register_handler("users", _reload_accounts_registry)
     core_wake_bus.start_listener()
 
 
@@ -69,6 +77,15 @@ def _start_dau_snapshot_leader() -> None:
     from core import leader as core_leader
 
     core_leader.run_singleton("dau-snapshot", dau_snapshot_scheduler.start)
+
+
+def _start_runtime_reconciler_leader() -> None:
+    """Drive per-user hosted-runtime fences toward the allowlist's desired
+    state on exactly one backend worker (dual-runtime canary rollout)."""
+    from core import leader as core_leader
+    from hosted import runtime_reconciler
+
+    core_leader.run_singleton("runtime-reconciler", runtime_reconciler.start)
 
 
 @asynccontextmanager
@@ -132,11 +149,30 @@ async def lifespan(app):
     if settings.start_background:
         _start_ws_leader()
         _start_dau_snapshot_leader()
+        _start_runtime_reconciler_leader()
         # (6b) TEE 影子库自动同步单例 — 仅在双写已接时选举（env 决定，接=重部署）。
         from tee_shadow import mirror as _tee_mirror
 
         if _tee_mirror.enabled():
             _start_tee_sync_leader()
+
+    # (7) Independent V2 timeout watchdog. The worker process also runs this
+    # loop, but pending jobs must still expire visibly when the whole worker
+    # fleet is dead. Concurrent passes are safe: the UPDATE returns each row to
+    # exactly one winner.
+    from model_api_runtime.v2 import reaper as v2_reaper
+
+    reaper_stop = asyncio.Event()
+    cleanup_settings = v2_reaper.cleanup_settings_from_env()
+    reaper_task = asyncio.create_task(
+        v2_reaper.run_loop(
+            reaper_stop,
+            interval=float(os.environ.get("FEEDLING_V2_REAP_INTERVAL_SEC", "30")),
+        )
+    )
+    cleanup_task = asyncio.create_task(
+        v2_reaper.run_cleanup_loop(reaper_stop, **cleanup_settings)
+    )
 
     print(
         f"[asgi] startup ready: threadpool={settings.db_threads} "
@@ -152,5 +188,7 @@ async def lifespan(app):
         # hook, then close the async clients.
         registry.wake_all()
         core_store.set_async_wake_hook(None)
+        reaper_stop.set()
+        await asyncio.gather(reaper_task, cleanup_task)
         await app.state.internal_http.aclose()
         await app.state.provider_http.aclose()

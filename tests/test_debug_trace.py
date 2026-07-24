@@ -1,5 +1,6 @@
 """v1 flow trace: beta default-on recording with deploy/per-user safety valves."""
 import os
+import queue
 import sys
 import time
 
@@ -23,6 +24,16 @@ def _reset(monkeypatch, store):
     blobs: dict = {}
     monkeypatch.setattr(db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
     monkeypatch.setattr(db, "set_blob", lambda uid, kind, doc: blobs.__setitem__((uid, kind), doc))
+
+    def append_events(uid, kind, new_events, *, cutoff_ts, max_events):
+        current = blobs.get((uid, kind)) or {}
+        events = list(current.get("events") or []) + list(new_events)
+        events = [event for event in events if event.get("ts", 0) >= cutoff_ts]
+        persisted = {"v": 1, "events": events[-max_events:]}
+        blobs[(uid, kind)] = persisted
+        return persisted
+
+    monkeypatch.setattr(db, "append_blob_events_strict", append_events)
     return blobs
 
 
@@ -109,6 +120,27 @@ def test_trace_event_does_not_wait_for_slow_blob_storage(monkeypatch):
     assert elapsed < 0.05
 
 
+def test_debug_read_waits_for_worker_instead_of_becoming_a_second_writer(monkeypatch):
+    """A read barrier must never steal queue items and race the worker's RMW."""
+    uid = "usr_debug_read_barrier"
+    isolated_queue: queue.Queue = queue.Queue()
+    isolated_queue.put((uid, {"ts": time.time(), "type": "queued"}))
+    monkeypatch.setattr(debug_trace, "_event_queue", isolated_queue)
+    monkeypatch.setattr(debug_trace, "_pending_by_uid", {uid: 1})
+
+    writes: list[tuple[str, list[dict]]] = []
+    monkeypatch.setattr(
+        debug_trace,
+        "_append_events",
+        lambda event_uid, events: writes.append((event_uid, events)),
+    )
+
+    debug_trace._flush_pending_for_user(uid, timeout=0.01)
+
+    assert writes == []
+    assert isolated_queue.qsize() == 1
+
+
 # --- M1: explain / content_excerpt / dur_ms + verbose gate + caps -----------
 
 
@@ -122,6 +154,16 @@ def _reset_verbose(monkeypatch):
     blobs = {}
     monkeypatch.setattr(debug_trace.db, "get_blob", lambda uid, k: blobs.get((uid, k)))
     monkeypatch.setattr(debug_trace.db, "set_blob", lambda uid, k, v: blobs.__setitem__((uid, k), v))
+
+    def append_events(uid, kind, new_events, *, cutoff_ts, max_events):
+        current = blobs.get((uid, kind)) or {}
+        events = list(current.get("events") or []) + list(new_events)
+        events = [event for event in events if event.get("ts", 0) >= cutoff_ts]
+        persisted = {"v": 1, "events": events[-max_events:]}
+        blobs[(uid, kind)] = persisted
+        return persisted
+
+    monkeypatch.setattr(debug_trace.db, "append_blob_events_strict", append_events)
     monkeypatch.setattr(debug_trace, "_hard_disabled", lambda: False)
     debug_trace._flag_cache.clear()
     return blobs

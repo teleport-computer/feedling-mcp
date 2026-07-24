@@ -1,60 +1,45 @@
-# Agent runtime isolation (P5 — optional strong isolation)
+# Runtime V2 isolation and sandbox boundary
 
-Date: 2026-06-25
+> **Current status — 2026-07-19.** The former hosted per-user
+> `process | container` resident-supervisor design has been retired. This path
+> remains only as a stable redirect for older links; it is not an implementation
+> plan and none of its old controls can select a hosted runtime.
 
-This is the **opt-in** strong-isolation design for the hosted agent runtime
-(`backend/agent_runtime/`). It is **not** the v1 default — per
-`docs/AGENT_RUNTIME_CC_CODEX_PLAN.zh.md` §P5, per-user containers/microVMs are a
-separate security design layered on only for high-value/high-risk users, not the
-first-version default path.
+Managed hosted execution uses a bounded pooled `serve-worker` on dedicated
+runner CVMs. A turn watchdog/child process is a resource and wedge boundary, not
+a strong sandbox for hostile code. There is no per-user resident process, home,
+checkpoint, lease, Docker socket, or container spawner in the hosted image.
 
-## The seam
+Runtime V2 instead exposes two explicit seams:
 
-The supervisor spawns consumers through an injected `(spawn_fn, alive_fn)` pair,
-selected by `AGENT_RUNTIME_ISOLATION` (`process` | `container`). Strategies live
-in `backend/agent_runtime/spawners.py`:
+- a backend-pluggable encrypted virtual filesystem (`/artifacts`, `/workspace`,
+  `/memory/WORKING.md`, and `/skills`); and
+- a lazily acquired `SandboxProvider` for physical artifact materialization,
+  untrusted binary parsing, shell, or code execution.
 
-- **`process` (default, implemented):** one child process per user inside the
-  shared agent-runner container. Isolation is per-user runtime home + per-user
-  runtime token + non-root user. Cheap; the v1 path.
-- **`container` (opt-in, partial):** `build_container_argv` produces the
-  `docker run -d` command for one container + one volume per user, with secrets
-  passed by env-var *reference* (never as plaintext argv). `get_spawner` still
-  falls back to the process strategy for live spawn until the container lifecycle
-  is finished (see below).
+Ordinary text chat, Memory Garden reads, virtual text-file reads, and virtual
+text edits do not acquire a sandbox. An artifact cache miss fails closed when no
+provider is configured or available; it never falls back to parsing inside the
+API or shared worker. The E2B adapter is source-wired but requires the deployment
+to select it and supply an API key plus template. It runs the fixed extractor in
+a secure microVM with internet disabled by default and records a content-free
+usage event for billing. Sending decrypted bytes to E2B changes the plaintext
+trust boundary and requires explicit deployment policy.
 
-## What `container` buys
+Independent reads and bounded `task` subagents can run concurrently. Disjoint
+workspace mutations may commit in conflict-free parallel waves, while
+same/ancestor/descendant paths serialize and external effectful mutations remain
+provider-ordered. Subagents have isolated transcripts and read-only tool access;
+they cannot reply, recurse, or perform platform/MCP/workspace mutations. The
+current model catalog does not expose generic shell or arbitrary code execution.
 
-| Boundary | process (default) | container (opt-in) |
-|---|---|---|
-| Filesystem | shared FS, per-user home dir | per-user volume, no shared FS |
-| Kernel/PID | shared | shared kernel, isolated PID/mounts/net ns |
-| Blast radius of a compromised turn | other users' homes on same FS | contained to that user's container |
-| Cost | ~1 process | ~1 container/user (image, memory, startup) |
+See:
 
-A microVM strategy (Firecracker/Kata) would extend the same seam for kernel-level
-isolation where the threat model demands it.
+- [`docs/RUNTIME_V2_WORKSPACE.md`](RUNTIME_V2_WORKSPACE.md) for namespaces,
+  encryption, conflict control, and sandbox triggers;
+- [`docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`](HOSTED_RUNTIME_V2_PARITY_MATRIX.md)
+  for current capability status; and
+- [`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`](../deploy/HOSTED_RUNTIME_V2_ROLLOUT.md)
+  for the V2-only deployment and recovery procedure.
 
-## To finish the container strategy
-
-1. **Handle/alive mapping.** `process_alive` uses `os.kill(pid, 0)`; a container
-   has a container id, not a local pid. Either store the container id in the
-   lease (`pid` is `INTEGER` today → add a `handle TEXT` column, or map id→int)
-   and implement `container_alive` via `docker inspect -f '{{.State.Running}}'`.
-2. **Volume lifecycle.** Create/reuse `feedling-agent-vol-<uid>`; decide GC on
-   long-idle users.
-3. **Docker socket exposure.** The supervisor needs the Docker socket to spawn
-   containers. Do **not** give it to the backend (plan non-goal). Scope it
-   to the agent-runner service only, and review the TDX/Phala implications of a
-   docker-in-CVM or sibling-container model before enabling in prod.
-4. **Image + secret delivery.** Per-user containers run
-   `tools/chat_resident_consumer.py` (single user; see
-   `agent_runtime/spawners.py:build_container_argv`), not a nested supervisor.
-   Provider keys and the runtime token flow via env reference from the
-   supervisor's environment.
-
-## Non-goals (unchanged from the plan)
-
-- Not the default: most users run the `process` strategy.
-- The backend never gets the Docker socket.
-- No long-term provider keys on disk in either strategy.
+The historical resident/container proposal remains available in Git history.

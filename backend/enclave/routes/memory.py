@@ -33,14 +33,28 @@ async def v1_memory_index(request: Request):
     if not isinstance(moments, list):
         return JSONResponse({"error": "moments must be a list"}, status_code=400)
     effective_limit = readside.memory_readside_effective_limit(payload.get("limit"))
+    query = str(payload.get("query") or "").strip()
 
     def _work():
+        builder = (
+            readside.build_memory_search_item
+            if query
+            else readside.build_memory_index_item
+        )
+        # Query matching depends on encrypted content.  Decrypt the bounded
+        # candidate window before filtering, then apply the requested result
+        # limit.  Pre-slicing here would make a match after the first N cards
+        # invisible even though the backend sent it to the enclave.
+        decrypt_candidates = moments if query else moments[:effective_limit]
         items, unavailable_ids = readside.decrypt_readside_items(
-            moments[:effective_limit], user_id or "", content_sk,
-            item_builder=readside.build_memory_index_item)
+            decrypt_candidates, user_id or "", content_sk,
+            item_builder=builder)
         items = readside.memory_index_filter_items(items, payload)
         if not bool(payload.get("include_sensitive", False)):
             items = [i for i in items if not i.get("is_sensitive")]
+        items = items[:effective_limit]
+        for item in items:
+            item.pop("_search_content", None)
         return items, unavailable_ids
 
     items, unavailable_ids = await anyio.to_thread.run_sync(_work)

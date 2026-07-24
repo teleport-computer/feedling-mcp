@@ -1,10 +1,11 @@
 """Pure-unit tests for backend/hosted/agent_runtime_cutover.py.
 
-The hosted /v1/model_api/chat/send endpoint can route a user to the out-of-process
-agent runtime instead of the inline LLM call, behind a per-user flag, while
+The hosted /v1/model_api/chat/send endpoint routes a user to either the pooled V2
+worker path or (under the ``dual`` policy) the out-of-process resident consumer,
 keeping the external contract stable (short turn → synchronous reply, slow turn →
 processing). No flask/DB here — the wait helper takes an injected clock/sleep and
-a store-like object exposing ``chat_messages``.
+a store-like object exposing ``chat_messages``; the supervisor wedge guard reads
+DB heartbeats through ``cutover.db`` (monkeypatched).
 """
 
 import sys
@@ -14,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from hosted import agent_runtime_cutover as cutover
+from hosted import agent_runtime_cutover as cutover  # noqa: E402
 
 
 class FakeStore:
@@ -210,42 +211,27 @@ def test_handle_send_returns_processing_when_slow():
     assert status == 202 and body["reply_ready"] is False
 
 
-# ---- assert_hosting_ready ----
+# ---- assert_hosting_ready (V2 pooled-token contract) ----
+# The current fail-fast only requires the shared runtime-token secret (the V2
+# worker decrypts each user's provider key in the enclave with it). It also
+# validates the runtime policy env — a retired value raises.
 
-def test_hosting_ready_no_litellm(monkeypatch):
-    import backend.hosted.agent_runtime_cutover as c
-    monkeypatch.setenv("FEEDLING_HOST_ALL", "1")
-    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "s")
-    c.assert_hosting_ready()   # must not raise
-
-
-def test_assert_hosting_ready_no_longer_requires_litellm(monkeypatch):
-    # LiteLLM gateway retired: assert_hosting_ready must not require it at all.
-    monkeypatch.setenv("FEEDLING_HOST_ALL", "1")
+def test_hosting_ready_accepts_runtime_token_secret(monkeypatch):
     monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "test-secret")
-    cutover.assert_hosting_ready()  # must not raise
+    cutover.assert_hosting_ready()
 
 
-def test_assert_hosting_ready_raises_when_host_all_disabled(monkeypatch):
+def test_hosting_ready_rejects_retired_policy(monkeypatch):
     monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "test-secret")
-    monkeypatch.delenv("FEEDLING_HOST_ALL", raising=False)
-    with pytest.raises(RuntimeError) as exc_info:
+    monkeypatch.setenv("FEEDLING_HOSTED_RUNTIME_POLICY", "resident_only")
+    with pytest.raises(RuntimeError, match="FEEDLING_HOSTED_RUNTIME_POLICY"):
         cutover.assert_hosting_ready()
-    assert "FEEDLING_HOST_ALL" in str(exc_info.value)
 
 
-def test_assert_hosting_ready_raises_when_token_secret_missing(monkeypatch):
-    monkeypatch.setenv("FEEDLING_HOST_ALL", "1")
+def test_hosting_ready_requires_runtime_token_secret(monkeypatch):
     monkeypatch.delenv("FEEDLING_RUNTIME_TOKEN_SECRET", raising=False)
-    with pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(RuntimeError, match="FEEDLING_RUNTIME_TOKEN_SECRET"):
         cutover.assert_hosting_ready()
-    assert "FEEDLING_RUNTIME_TOKEN_SECRET" in str(exc_info.value)
-
-
-def test_assert_hosting_ready_passes_when_all_set(monkeypatch):
-    monkeypatch.setenv("FEEDLING_HOST_ALL", "1")
-    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "test-secret")
-    cutover.assert_hosting_ready()  # 不抛
 
 
 # ---- supervisor heartbeat wedge guard ----

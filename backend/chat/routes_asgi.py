@@ -57,6 +57,10 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
     timeout = min(float(request.query_params.get("timeout", 30)), 60)
     consumer_id = chat_service._parse_consumer_id(request.headers, request.query_params)
     claim = chat_service._parse_bool_arg(request.query_params, "claim", default=True)
+    try:
+        since_status_id = int(request.query_params.get("since_status_id", 0))
+    except (TypeError, ValueError):
+        since_status_id = 0
 
     async def _check():
         return await threadpool.run_db(
@@ -67,13 +71,21 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
             claim=claim,
         )
 
-    def _response(messages, timed_out, ctx):
+    async def _status():
+        return await threadpool.run_db(
+            chat_poll_core.pending_status_events, store, after_id=since_status_id, limit=50
+        )
+
+    def _response(messages, status_events, timed_out, ctx):
+        cursor = status_events[-1]["id"] if status_events else since_status_id
         return chat_poll_core.build_response(
             messages=messages,
             context=ctx,
             consumer_id=consumer_id,
             claim=claim,
             timed_out=timed_out,
+            status_events=status_events,
+            status_cursor=cursor,
         )
 
     waiter = registry.register(
@@ -81,7 +93,7 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
     )
     if waiter is None:
         # Cap hit — shed to an immediate timed-out response; consumer re-polls.
-        return _response([], timed_out=True, ctx=context)
+        return _response([], [], timed_out=True, ctx=context)
     try:
         # Check AFTER registering the waiter. asyncio.Event.set() latches, so a
         # write that wakes in the gap between check and park is NOT lost: if it
@@ -90,10 +102,14 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
         # then the re-check below delivers it. (Checking before registering — the
         # old order — forfeited that latch and could park for the full timeout.)
         pending = await _check()
-        if pending:
+        status_events = await _status()
+        # Either a new chat message OR a new status event (§9 tool-call
+        # progress) is enough to return — a status-only update must wake a
+        # parked waiter too, not just chat messages.
+        if pending or status_events:
             # Immediate delivery before parking: the pre-park context is still
             # the freshest snapshot, so reuse it (no extra DB read).
-            return _response(pending, timed_out=False, ctx=context)
+            return _response(pending, status_events, timed_out=False, ctx=context)
         try:
             await asyncio.wait_for(waiter.event.wait(), timeout=max(0.0, timeout))
             notified = True
@@ -109,8 +125,8 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
     # response rather than the stale pre-park snapshot.
     fresh = await threadpool.run_db(chat_poll_core.poll_context, store)
     if notified:
-        return _response(await _check(), timed_out=False, ctx=fresh)
-    return _response([], timed_out=True, ctx=fresh)
+        return _response(await _check(), await _status(), timed_out=False, ctx=fresh)
+    return _response([], await _status(), timed_out=True, ctx=fresh)
 
 
 # --------------------------------------------------------------------------- #

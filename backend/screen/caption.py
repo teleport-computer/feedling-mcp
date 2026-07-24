@@ -23,7 +23,7 @@ _CAPTION_TIMEOUT = 50.0
 def _enclave_auth_headers(api_key: str | None, runtime_token: str | None = None) -> dict | None:
     """Auth header for an enclave call, preferring the Stage-D runtime token.
 
-    host-all / zero-roster agents have no per-user api_key — their proactive screen
+    Runtime V2 workers have no per-user api_key — their proactive screen
     captions are triggered by a request carrying X-Feedling-Runtime-Token. Pick it
     up from the neutral request context (core.reqctx) when no explicit token/api_key
     is supplied, so these reads stop returning api_key_unavailable. Returns None when

@@ -18,7 +18,7 @@ PROACTIVE_WAKE_FRAME_CANDIDATE_MAX = int(os.environ.get("FEEDLING_PROACTIVE_WAKE
 def _enclave_auth_headers(api_key: str | None, runtime_token: str | None = None) -> dict | None:
     """Auth header for an enclave call, preferring the Stage-D runtime token.
 
-    host-all / zero-roster agents have no per-user api_key — their turns (model_api
+    Runtime V2 workers have no per-user api_key — their turns (model_api
     context build, proactive screen reads) are triggered by a request carrying
     X-Feedling-Runtime-Token. Pick it up from the current request context when no
     explicit token/api_key is supplied, so these server-side screen reads stop

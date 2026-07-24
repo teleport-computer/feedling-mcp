@@ -1,16 +1,8 @@
-"""Hosted model_api → agent-runtime cutover (plan §P3).
+"""Small hosted-response compatibility helpers for Runtime V2.
 
-Behind a per-user flag (``agent_runtime_driver`` in the model_api config:
-``legacy`` | ``claude`` | ``codex``), ``/v1/model_api/chat/send`` can hand the
-turn to the out-of-process agent runtime instead of doing the inline LLM call.
-The external contract stays stable: the user message is written to the chat
-store as today; we then wait briefly for the agent-runner's reply and return it
-synchronously, or return ``processing`` for a slow turn (the client already
-reads replies via chat poll). ``legacy`` (default) is unchanged — flipping the
-flag back is the rollback.
-
-This module is pure/IO-light and unit-tested; the route does the thin delegation.
-The wait helper takes injected ``now``/``sleep`` so it is deterministic in tests.
+The public response still carries the historical provider-driver label. It is a
+wire-compatibility label only: Runtime V2 calls providers natively and there is
+no hosted resident CLI process or supervisor behind it.
 """
 
 from __future__ import annotations
@@ -24,41 +16,21 @@ import provider_client
 
 log = logging.getLogger("feedling.hosted.agent_runtime_cutover")
 
-# Wedge guard: how stale the supervisor heartbeat may be before the backend
-# treats hosting as down. Generous (≈6 ticks at the 15s default) so a brief
-# supervisor restart doesn't 503 sends. Env-overridable for slow deployments.
-_SUPERVISOR_HEARTBEAT_MAX_AGE_SEC = 90.0
-
-# The agent driver is DERIVED from the provider, never user-chosen: each CLI is
-# locked to a wire format (Claude Code = Anthropic Messages, Codex = OpenAI
-# Responses, pi = OpenAI-completions-compatible). Empirically (2026-06-25):
-# Claude Code handles ONLY the Anthropic Messages wire — native anthropic plus
-# deepseek, whose /anthropic endpoint speaks that wire (the CLI is pointed at it
-# via ANTHROPIC_BASE_URL, see spawners._claude_anthropic_base_url).
-# Codex is openai-native only (direct OpenAI Responses). The in-CVM LiteLLM
-# gateway is retired: gemini/openrouter/openai_compatible route
-# through the pi driver instead, which speaks the openai-completions wire
-# directly with a per-user custom baseUrl (no gateway hop). Keep this map in
-# sync with the SQL CASE in db.list_agent_runtime_enabled_users.
+# The public API historically exposed a provider-derived ``driver`` field.
+# Runtime V2 keeps those labels for wire compatibility only; every provider now
+# executes in the same native in-process tool-calling loop.
 _CLAUDE_PROVIDERS = {"anthropic", "deepseek"}
-# Codex-driven providers: openai only (native OpenAI Responses). A provider not
-# here, not in _CLAUDE_PROVIDERS, and not in _PI_PROVIDERS has no hosted fit →
-# ``legacy``.
 _CODEX_PROVIDERS = {"openai"}
-# pi-driven providers: pi speaks the openai-completions wire natively with a
-# per-user custom baseUrl, so these relays connect DIRECTLY — no gateway hop.
-# Unconditional (no flag). Keep in sync with the SQL CASE in
-# db.list_agent_runtime_enabled_users.
 _PI_PROVIDERS = {"openai_compatible", "gemini", "openrouter"}
 
 
 def driver_for_provider(provider: str) -> str:
-    """The agent driver for a provider key — auto-derived, NOT user-chosen.
+    """Return the historical response label for a provider, not an executor.
 
-    anthropic / deepseek → ``claude`` (Anthropic-wire CLI; deepseek via its
-    /anthropic-compatible endpoint); openai_compatible / gemini / openrouter →
-    ``pi`` (direct relay, no gateway), unconditionally; openai → ``codex``
-    (native OpenAI Responses). No configured fit → ``legacy``."""
+    The values preserve the pre-V2 API mapping: anthropic/deepseek →
+    ``claude``; OpenAI-compatible relays → ``pi``; OpenAI → ``codex``. No
+    configured fit → ``legacy``. None of these labels selects a separate V2
+    execution path."""
     p = provider_client.normalize_provider(provider)
     if p in _CLAUDE_PROVIDERS:
         return "claude"
@@ -70,11 +42,7 @@ def driver_for_provider(provider: str) -> str:
 
 
 def codex_transport(provider: str) -> str:
-    """For a codex-driven provider, how Codex reaches it: ``native`` (direct
-    OpenAI Responses — the only codex-driven provider left now that the
-    LiteLLM gateway is retired). Empty string when the provider is not
-    codex-driven — including pi-driven and claude-driven / unconfigured
-    providers."""
+    """Historical telemetry field: OpenAI is native, other labels are empty."""
     p = provider_client.normalize_provider(provider)
     if driver_for_provider(p) != "codex":
         return ""
@@ -82,47 +50,74 @@ def codex_transport(provider: str) -> str:
 
 
 class UnsupportedProviderError(Exception):
-    """provider 未配置或无 agent fit，无法托管到 agent-runner。"""
-
-
-def _env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+    """provider 未配置或 Runtime V2 没有 native provider mapping。"""
 
 
 def assert_hosting_ready() -> None:
-    """进程启动时校验托管前置齐全，否则 fail-fast。
+    """Fail fast unless the pooled V2 worker token contract can be honored."""
+    from hosted import config_store
 
-    收口后 backend 把配了 fit provider 的用户无条件路由到 agent-runner (resolve_driver)。
-    这些用户只有在 supervisor 的 host-all 发现激活时才会被 spawn consumer——host-all 激活需
-    FEEDLING_HOST_ALL + FEEDLING_RUNTIME_TOKEN_SECRET (supervisor host_all_active)。任一缺失即
-    启动失败，避免请求被路由却无 consumer 而永远卡在 processing。须与 supervisor 的
-    host_all_active 判定保持一致。
-
-    LiteLLM 网关已退休：gemini/openrouter/openai_compatible 现在无条件走 pi driver 直连
-    中转站，不再有任何 provider 依赖 in-CVM LiteLLM gateway，故这里不再检查网关开关。"""
+    config_store.hosted_runtime_policy()
     missing = []
-    if not _env_truthy("FEEDLING_HOST_ALL"):
-        missing.append("FEEDLING_HOST_ALL")
     if not os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").strip():
         missing.append("FEEDLING_RUNTIME_TOKEN_SECRET")
     if missing:
         raise RuntimeError(
             "托管前置缺失：" + ", ".join(missing) +
-            "。收口后所有用户走 agent-runner；缺这些 supervisor 不会 spawn consumer、"
-            "请求会卡在 processing。请在 backend 与 agent-runner 两侧设置后再启动。"
+            "。缺少运行时前置会让当前托管策略无法安全处理消息；"
+            "请在 backend 与对应 runtime worker 两侧设置后再启动。"
         )
 
 
 def resolve_driver(config: dict | None) -> str:
-    """该用户该走的 agent driver：``claude`` / ``codex`` / ``pi``。
+    """返回 wire-compatible provider label：``claude`` / ``codex`` / ``pi``。
 
-    配了能 fit 的 provider 即托管（等价于 host-all 永远 on，无 per-user 开关、
-    无 gateway 回退）。无法托管时 raise ``UnsupportedProviderError``。"""
+    Runtime V2 不按 label 分层或选择 loop；所有支持 provider 均进入同一 loop。
+    无法托管时 raise ``UnsupportedProviderError``。"""
     provider = str((config or {}).get("provider") or "")
     driver = driver_for_provider(provider)
     if driver not in ("claude", "codex", "pi"):
         raise UnsupportedProviderError(provider or "unconfigured")
     return driver
+
+
+def _runtime_block(driver: str) -> dict:
+    return {"engine": "feedling_agent_runtime", "mode": "hosted_agent", "driver": driver, "version": 1}
+
+
+def build_processing_response(user_row: dict, *, driver: str) -> tuple[dict, int]:
+    """The client reads the eventual V2 result via Chat history/poll. Always
+    202; never a `reply` field
+    (the server holds only ciphertext under E2E)."""
+    return (
+        {
+            "status": "processing",
+            "reply_ready": False,
+            "user_message": {"id": user_row.get("id"), "ts": user_row.get("ts")},
+            "runtime": _runtime_block(driver),
+        },
+        202,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Resident-runtime helpers (restored for the dual-runtime send path).
+#
+# Under the ``dual`` hosted-runtime policy a per-user ``resident_cli``/``resident``
+# fence routes the send to the out-of-process resident consumer instead of the V2
+# worker pool. These helpers are the wedge guard + reply-wait machinery the
+# resident branch depends on; they are inert under the ``v2_only`` policy (the V2
+# path never calls them).
+# ---------------------------------------------------------------------------
+
+# Wedge guard: how stale the supervisor heartbeat may be before the backend
+# treats hosting as down. Generous (≈6 ticks at the 15s default) so a brief
+# supervisor restart doesn't 503 sends. Env-overridable for slow deployments.
+_SUPERVISOR_HEARTBEAT_MAX_AGE_SEC = 90.0
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
 
 
 def _heartbeat_max_age() -> float:
@@ -294,25 +289,6 @@ def wait_for_reply(
         if now() >= deadline:
             return None
         sleep(poll_interval)
-
-
-def _runtime_block(driver: str) -> dict:
-    return {"engine": "feedling_agent_runtime", "mode": "hosted_agent", "driver": driver, "version": 1}
-
-
-def build_processing_response(user_row: dict, *, driver: str) -> tuple[dict, int]:
-    """Reply not ready within the wait window — the client reads it via chat
-    poll once the agent-runner posts it. Always 202; never a `reply` field
-    (the server holds only ciphertext under E2E)."""
-    return (
-        {
-            "status": "processing",
-            "reply_ready": False,
-            "user_message": {"id": user_row.get("id"), "ts": user_row.get("ts")},
-            "runtime": _runtime_block(driver),
-        },
-        202,
-    )
 
 
 def build_ready_response(user_row: dict, reply_row: dict, *, driver: str) -> tuple[dict, int]:

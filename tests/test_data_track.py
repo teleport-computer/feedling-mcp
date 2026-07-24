@@ -555,16 +555,44 @@ def test_admin_data_track_app_usage_rollup(client):
     }
 
 
-def test_admin_data_track_page_uses_plain_language(client):
+def test_admin_data_track_page_uses_plain_language(client, monkeypatch):
     # The overview HTML leads with 激活用户, de-emphasizes 注册, explains both,
     # and renders the App-usage section — no more "已激活 / 原始行" jargon.
-    _register(client)
+    user_id, _ = _register(client)
+    core_store.get_store(user_id).append_chat(
+        "user", "chat", _env("msg_dashboard_active", user_id)
+    )
+    monkeypatch.setattr(
+        _dt,
+        "_runtime_token_usage_summary",
+        lambda **_kw: {
+            "window_days": 30,
+            "sampled_turns": 7,
+            "users": 1,
+            "model_calls": 8,
+            "usage_reported_calls": 6,
+            "cache_reported_calls": 6,
+            "usage_telemetry_coverage": 0.75,
+            "cache_telemetry_coverage": 0.75,
+            "prompt_tokens": 12_000,
+            "completion_tokens": 345,
+            "total_tokens": 12_345,
+            "cache_read_tokens": 6_000,
+            "cache_write_tokens": 1_000,
+            "cache_miss_tokens": 4_000,
+        },
+    )
     page = client.get("/admin/data-track", headers=_admin_headers()).get_data(as_text=True)
     assert "激活用户（真正用起来的人）" in page
     assert "累计注册行（含重装孤儿·非人数）" in page
     assert "怎么读这些数" in page          # the explainer note-box
     assert "没有、也无法有「已删除账户数」" in page
     assert "App 使用时长" in page
+    assert "运营 Telemetry" in page
+    assert "全站 V2 token 总量（近 30 天）" in page
+    assert "12,345" in page
+    assert "自托管激活账号（当前筛选）" in page
+    assert "可观测账号覆盖数" in page
     assert "已激活 / 原始行" not in page    # old jargon gone
 
 

@@ -1,0 +1,29 @@
+# Extra dependencies for the V2 serve-worker, installed into the MAIN image.
+#
+# Everything the backend and the decrypt enclave need lives in
+# requirements.txt / requirements.lock. This second file adds what only the V2
+# serve-worker actually executes — `web_fetch` article extraction, which runs in
+# backend/model_api_runtime/v2/serve_worker.py.
+#
+# Why a separate file instead of folding it into requirements.lock: the V1
+# agent-runner image installs requirements.lock only. Keeping this split lets
+# that image stay free of the HTML parser and its C extension — it never runs
+# the capability. The main image (backend / decrypt-enclave / serve-worker are
+# one image) does install it, so the decrypt enclave carries lxml even though it
+# never calls it; removing that would require a separate serve-worker image, a
+# tradeoff deliberately declined (extra CI / release / pin / compose surface).
+#
+# Consequence to keep in mind: anything listed here MUST be imported lazily and
+# have a working fallback — the V1 runner image and unpinned local envs do not
+# have it. See backend/capabilities/html_extract.py.
+
+# Article extraction for web_fetch. The tool loop hands the model at most 2000
+# characters of a page; with a plain tag-strip most of that budget goes to the
+# navigation menu ("Jump to content / Main menu / Donate" fills the first 2257
+# characters of a Wikipedia article), so what reaches the model is mostly not
+# the page. Measured on the pages our users actually ask about: a weather page
+# goes from "首页 预报 预警 雷达 云图" to "中雨 24℃ 晴转多云 33℃/25℃".
+#
+# Pinned exactly, not floored: this parses untrusted input inside a TEE, so the
+# version that ships is the version that was reviewed. Bump deliberately.
+trafilatura==2.1.0

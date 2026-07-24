@@ -2,11 +2,10 @@
 memory(warn) → bubbles(sanity) → teardown. One call per provider-key class.
 
 No unlock step: hosted accounts are gate-exempt by design (see unlock.py
-docstring). Send rides the canonical hosted entry POST /v1/model_api/chat/send
-(202 + async reply via history); a 503 hosting_runtime_unavailable right after
-setup is the supervisor's discovery lag and is retried with backoff — it fires
-BEFORE the message is written, so retrying cannot double-send
-(backend/hosted/chat_send_core.py:107-126).
+docstring). Send rides the canonical Runtime V2 entry
+POST /v1/model_api/chat/send (202 + async reply via history). A transient
+``workers_unavailable`` or ``runtime_policy_not_ready`` response is retried
+with the same client_msg_id; admission fails before the message is committed.
 
 Pass criteria mirror docs/testing/RELEASE_TESTING_PROTOCOL.md §3. Memory is a
 WARN (capture is async by design); everything else is pass/fail.
@@ -19,17 +18,17 @@ import uuid
 from .client import E2EClient
 from .config import HostedCell
 
-FIRST_REPLY_TIMEOUT = 300.0   # includes the hosted runner's per-user spawn
+FIRST_REPLY_TIMEOUT = 300.0   # includes provider cold start and queue wait
 NEXT_REPLY_TIMEOUT = 180.0
 MEMORY_POLL_SEC = 300.0
-SEND_RETRY_SEC = 90.0         # 503 hosting_runtime_unavailable backoff window
+SEND_RETRY_SEC = 90.0         # post-deploy worker/policy readiness window
 
 FACT_MSG = "你好呀。顺便记住一件小事：我最喜欢的颜色是青色。"
 CONTINUITY_MSG = "我刚才说我最喜欢的颜色是什么来着？"
 
 
 def _hosted_send(c: E2EClient, text: str) -> tuple[float, str]:
-    """POST /v1/model_api/chat/send with discovery-lag retry.
+    """POST /v1/model_api/chat/send with bounded V2-readiness retry.
     Returns (send_epoch, error) — error=="" on accepted."""
     deadline = time.time() + SEND_RETRY_SEC
     last = ""
@@ -44,8 +43,11 @@ def _hosted_send(c: E2EClient, text: str) -> tuple[float, str]:
             server_ts = float((body.get("user_message") or {}).get("ts") or sent_at)
             return server_ts, ""
         last = f"{r.status_code} {r.text[:120]}"
-        if r.status_code == 503 and "hosting_runtime_unavailable" in r.text:
-            time.sleep(8)     # supervisor discovery lag after setup — safe retry
+        if r.status_code == 503 and any(
+            code in r.text
+            for code in ("workers_unavailable", "runtime_policy_not_ready")
+        ):
+            time.sleep(5)
             continue
         break
     return 0.0, last
@@ -94,7 +96,7 @@ def run_hosted_cell(cell: HostedCell, pool: dict[str, str]) -> dict:
 
         run_start = time.time()
 
-        # -- first chat roundtrip (spawn included) ----------------------------
+        # -- first chat roundtrip ---------------------------------------------
         sent, err = _hosted_send(c, FACT_MSG)
         if err:
             step("chat-send", False, err)

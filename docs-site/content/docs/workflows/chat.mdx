@@ -17,8 +17,9 @@ assistant reply.
 ## Hosted chat
 
 Before sending, the account needs a content public key, a configured model route,
-and a live hosted runtime. Configuration or supervisor failures are returned
-before the user message is stored where possible.
+and a live Hosted Runtime V2 worker pool. Runtime-control, worker-liveness,
+kill-switch, and admission failures are returned before the user message is
+stored.
 
 ### 1. Send the turn
 
@@ -80,8 +81,9 @@ files are accepted. Send only one binary attachment per turn.
 
 ### 2. Handle the asynchronous response
 
-If the agent has not responded within the server's short wait window, the
-response has no `assistant_message`:
+The send endpoint does not wait for inference. It returns immediately after the
+encrypted user row and durable V2 job commit atomically, so the response has no
+`assistant_message`:
 
 ```http
 HTTP/1.1 202 Accepted
@@ -103,43 +105,12 @@ Content-Type: application/json
 }
 ```
 
-If it arrived during that window, the status is still `202 processing`; the
-response adds only a reference to the encrypted assistant message:
-
-```json
-{
-  "status": "processing",
-  "reply_ready": true,
-  "user_message": {
-    "id": "msg_user_123",
-    "ts": 1783978500.125
-  },
-  "assistant_message": {
-    "id": "msg_assistant_456",
-    "ts": 1783978502.75
-  },
-  "runtime": {
-    "engine": "feedling_agent_runtime",
-    "mode": "hosted_agent",
-    "driver": "codex",
-    "version": 1
-  }
-}
-```
-
-Do not look for a `reply` text field. If `assistant_message.id` is present, fetch
-that message directly:
+Do not look for a `reply` text field. Advance the transcript with the durable
+append sequence returned by the previous page. Sequence cursors remain exact
+when several messages share a client timestamp:
 
 ```http
-GET /v1/chat/messages/msg_assistant_456/body HTTP/1.1
-Host: api.feedling.app
-X-API-Key: YOUR_FEEDLING_API_KEY
-```
-
-Otherwise advance the transcript with the user message timestamp:
-
-```http
-GET /v1/chat/history?since=1783978500.125&limit=50&include_image_body=false HTTP/1.1
+GET /v1/chat/history?after_seq=1041&limit=50&include_image_body=false HTTP/1.1
 Host: api.feedling.app
 X-API-Key: YOUR_FEEDLING_API_KEY
 ```
@@ -154,6 +125,7 @@ X-API-Key: YOUR_FEEDLING_API_KEY
       "sender": "assistant",
       "source": "model_api",
       "content_type": "text",
+      "seq": 1042,
       "ts": 1783978502.75,
       "body_ct": "BASE64_CIPHERTEXT",
       "nonce": "BASE64_NONCE",
@@ -168,6 +140,8 @@ X-API-Key: YOUR_FEEDLING_API_KEY
   "total": 42,
   "oldest_ts": 1783978502.75,
   "latest_ts": 1783978502.75,
+  "oldest_seq": 1042,
+  "latest_seq": 1042,
   "has_more_older": true,
   "has_more_newer": false,
   "bodies_omitted": 0,
@@ -448,5 +422,13 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 }
 ```
 
-This clears the authenticated user's transcript only. It does not delete Memory,
-Identity, API keys, or the account.
+This atomically clears the authenticated user's raw transcript plus its live
+Runtime V2 summary, chat-derived artifact views, pending effects/status, and
+reply cursor. It advances the runtime generation so an in-flight pre-clear turn
+cannot recreate a reply or derived context after the endpoint returns.
+
+It does not delete Memory Garden, Identity, API keys, user-authored
+`/workspace`, `/memory/WORKING.md`, skills, schedules, content-free billing/token
+metrics, or the account. Encrypted trajectory/review telemetry is retained under
+its separate retention policy and never re-enters the live prompt. Use account
+reset/deletion when the intended operation is complete data erasure.

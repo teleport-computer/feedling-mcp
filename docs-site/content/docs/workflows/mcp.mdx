@@ -7,10 +7,11 @@ Feedling lets each account register up to 10 remote [MCP](https://modelcontextpr
 servers. Both MCP transports are supported: modern **streamable HTTP** and the
 older **HTTP+SSE** transport that some providers still ship as their `…/sse`
 URL. The transport is detected automatically from the URL and the server's
-handshake — you don't declare it. Your agent — hosted or self-hosted — reads
-this list and calls the tools those servers expose. This backend stores the
-configuration; it does not proxy MCP traffic. Only your agent dials the URL
-when it actually calls a tool.
+handshake — you don't declare it. The active agent runtime reads this list and
+calls the tools those servers expose: a self-hosted runtime dials from your
+machine, while Hosted Runtime V2 dials from its cloud worker. The management API
+stores the configuration and does not proxy MCP traffic or connect at save
+time; its explicit `/test` operation is the only control-plane probe.
 
 > **Runtime support:** the hosted runtime and the `claude` self-hosted runtime
 > speak both transports. The `codex` self-hosted runtime speaks streamable HTTP
@@ -21,6 +22,14 @@ Every `/v1/chat/poll` response includes a `user_mcp.fingerprint` that changes
 whenever your server list changes, so a resident consumer can re-materialize
 its local MCP config without polling `/v1/mcp/servers` on every turn. See the
 [Chat workflow](/docs/workflows/chat) for that poll shape.
+
+**Trust boundary:** Connecting and enabling a server lets its tool names and
+retained structural input schemas enter the model-facing tool catalog, where
+they can influence tool selection. Only connect servers operated by people or
+organizations you trust. Feedling strips prompt-bearing catalog prose and
+treats MCP tool output as untrusted external content that write-taints later
+rounds; a server's `readOnlyHint` also grants no parallel-read privilege unless
+the exact current catalog fingerprint has been explicitly approved.
 
 ## Add or update a server
 
@@ -68,16 +77,19 @@ actually speaks the first time a connectivity test succeeds.
 
 `GET /v1/mcp/servers` returns `{"servers": [...]}` with the same shape.
 `PATCH /v1/mcp/servers/{name}` with `{"enabled": false}` toggles a server
-without resending the URL, headers, or CA. `DELETE /v1/mcp/servers/{name}`
-removes it.
+without resending the URL, headers, or CA. The same PATCH also updates encrypted
+read-only approvals as described below. `DELETE /v1/mcp/servers/{name}` removes
+the server.
 
 ## Network requirements
 
 `url` accepts `http://` and `https://`, including loopback (`127.0.0.1`,
 `localhost`), private-network (`10.x`, `192.168.x`, `172.16–31.x`), and raw IP
-literal hosts. **This backend never connects to the URL at save time** — only
-your agent does, when it actually calls a tool — so none of those forms are
-rejected at `POST /v1/mcp/servers`.
+literal hosts. Saving the config does not connect to the URL, so none of those
+forms are rejected at `POST /v1/mcp/servers`. `POST .../test` does connect from
+the API backend when explicitly requested. Hosted Runtime V2 also contacts every
+enabled server at the start of each chat turn for `tools/list`, before any later
+tool calls.
 
 What reaches the server at call time depends on where your agent runs:
 
@@ -273,6 +285,9 @@ X-API-Key: YOUR_FEEDLING_API_KEY
   "ok": true,
   "tool_count": 2,
   "tool_names": ["search", "fetch"],
+  "read_only_tool_fingerprints": {
+    "search": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
   "transport": "http"
 }
 ```
@@ -284,9 +299,9 @@ non-`/sse` URL that turns out to speak the legacy transport is corrected here.
 
 This runs a best-effort `initialize` → `tools/list` probe **from this
 backend's own network**, as a convenience for validating servers that are
-publicly reachable over `https://`. It is not required before your agent can
-use a server, and it is not authoritative for servers your agent can reach but
-this backend cannot.
+publicly reachable over `http://` or `https://`. It is not required before your
+agent can use a server, and it is not authoritative for servers your agent can
+reach but this backend cannot.
 
 **A `400 unreachable_from_backend` response does not mean the server failed to
 save.** The server was already saved successfully by `POST /v1/mcp/servers`.
@@ -302,9 +317,12 @@ Other `400` kinds from this endpoint:
 | --- | --- |
 | `unreachable_from_backend` | Saved successfully; this backend's network can't reach the host. Verify from your agent instead. |
 | `dns` | The hostname did not resolve. |
+| `dns_busy` | The backend resolver is at capacity; retry later. |
 | `tls` | Certificate/TLS handshake failure — check `ca_pem` if the server uses a private CA. |
 | `codex_cert_chain_required` | The calling account's agent driver is `codex` and the server presented a single self-signed certificate (a CA acting as its own end entity) instead of a CA+leaf chain. See [`codex` needs a certificate chain](#codex-needs-a-certificate-chain-not-a-lone-self-signed-certificate) above. |
+| `transport` | The connection failed before a valid HTTP response arrived. |
 | `timeout` | Connect or read timeout, or the whole probe exceeded its 45-second wall-clock ceiling. A legacy HTTP+SSE endpoint that answers with a never-ending event stream lands here instead of hanging the request. |
+| `response_too_large` | An MCP response exceeded the 1 MiB probe limit. |
 | `http_401` / `http_403` / `http_404` / `http_4xx` / `http_5xx` | The server responded with an HTTP error status. |
 | `protocol` | The response wasn't a valid MCP handshake (bad JSON-RPC envelope, redirect, or empty SSE stream). |
 | `decrypt_failed` | The stored config could not be decrypted for this caller. |
@@ -318,6 +336,42 @@ still works fine for your agent once your agent connects to it.
 
 `404 not_found` means no server with that name exists.
 
+## Approve safe parallel reads
+
+Runtime V2 runs platform reads and approved MCP reads concurrently within a
+model-issued tool batch. MCP mutations remain serialized with platform writes
+in model order. A remote server's `readOnlyHint` is only a claim, so it does not
+grant parallel execution by itself.
+
+After a successful `/test`, show the user the read-only candidates and require
+an explicit choice. The probe returns at most 64 candidates and omits tool names
+that PATCH cannot accept (control characters or more than 256 characters).
+Then PATCH only the selected name/fingerprint pairs:
+
+```http
+PATCH /v1/mcp/servers/search HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: YOUR_FEEDLING_API_KEY
+
+{
+  "read_only_tool_fingerprints": {
+    "search": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}
+```
+
+The PATCH decrypts and re-seals the existing server config, preserving its URL,
+headers, and CA; clients do not need to retain or resend those secrets. Runtime
+V2 grants read-only execution only when the live tool still has strict
+`readOnlyHint: true` and the fingerprint of its current name/schema/hint exactly
+matches the encrypted approval. Catalog drift or a missing approval fails closed
+to serialized mutation handling. Send an empty object to revoke every approval:
+
+```json
+{"read_only_tool_fingerprints": {}}
+```
+
 ## Write-time error kinds
 
 `POST /v1/mcp/servers` returns `400` with one of these `error.kind` values
@@ -328,13 +382,25 @@ envelope could not be built (retry):
 | --- | --- |
 | `invalid_name` | `name` doesn't match `^[a-z0-9_-]{1,32}$`. |
 | `invalid_url` | `url` isn't `http://` or `https://`, or has no host. |
-| `invalid_headers` | `headers` isn't a JSON object. |
+| `invalid_request` | The body isn't an object or contains an unknown field. |
+| `invalid_headers` | `headers` isn't an object or contains a non-string value. |
+| `invalid_enabled` | `enabled` isn't a JSON boolean. |
 | `too_many_headers` | More than 20 header entries. |
 | `headers_too_large` | Combined header names and values exceed 8192 bytes. |
 | `forbidden_header` | A header name is `Host` (case-insensitive). |
-| `invalid_ca` | `ca_pem` isn't parseable PEM. |
+| `invalid_ca` | `ca_pem` isn't a string containing parseable PEM. |
 | `ca_too_large` | `ca_pem` exceeds 32,768 bytes. |
+| `invalid_read_only_tool_fingerprints` | `read_only_tool_fingerprints` isn't an object. |
+| `too_many_read_only_tool_fingerprints` | More than 64 approval entries were supplied. |
+| `invalid_read_only_tool_name` | A tool name is empty, longer than 256 characters, or contains a control character. |
+| `invalid_read_only_tool_fingerprint` | A fingerprint isn't a lowercase 64-character SHA-256 hex string. |
 | `too_many_servers` | The account already has 10 servers and `name` doesn't match an existing one. |
+
+`PATCH /v1/mcp/servers/{name}` rejects an empty or non-object body, unknown
+fields, or unsupported values with `invalid_patch` / `invalid_enabled`; approval
+validation uses the same four `read_only_tool_fingerprints` errors above.
+`decrypt_failed` has no internal exception detail. A re-encryption failure
+returns `409 cannot_encrypt` and leaves the old config unchanged.
 
 See the [MCP tag in the API reference](/docs/api-reference) for the full
 request/response schema of every operation.

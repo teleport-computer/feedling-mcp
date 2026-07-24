@@ -2,19 +2,18 @@
 
 import os
 import time
+import types
 import uuid
-
 
 import db
 from core import enclave as core_enclave
-from provider_client import validate_config as validate_provider_config
-from core.store import UserStore
-
-
 from core import util as core_util
-import provider_client
-from notices import core as notices_core
+from core.store import UserStore
 from notices import catalog as notices_catalog
+from notices import core as notices_core
+import provider_client
+from provider_client import public_config as public_provider_config
+from provider_client import validate_config as validate_provider_config
 
 
 def _load_model_api_config(store: UserStore) -> dict | None:
@@ -40,6 +39,7 @@ def _load_model_api_config(store: UserStore) -> dict | None:
         "provider": route["provider"],
         "model": route["model"],
         "base_url": route["base_url"],
+        "context_window_tokens": route.get("context_window_tokens"),
         "api_key_hint": route["api_key_hint"],
         "supports_responses": route["supports_responses"],
         "test_status": route["test_status"],
@@ -84,15 +84,32 @@ def _load_model_api_runtime_profile(store: UserStore) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _save_model_api_runtime_profile(store: UserStore, profile: dict) -> dict:
+def _save_model_api_runtime_profile(
+    store: UserStore, profile: dict, *, strict: bool = False,
+) -> dict:
     data = dict(profile)
     data["runtime_mode"] = MODEL_API_RUNTIME_MODE
     data["runtime_version"] = MODEL_API_RUNTIME_VERSION
     data["updated_at"] = core_util._now_iso()
     if not data.get("created_at"):
         data["created_at"] = data["updated_at"]
-    db.set_blob(store.user_id, MODEL_API_RUNTIME_BLOB, data)
-    return data
+    # hosted_runtime_mode and the V2 reply cursor have dedicated atomic
+    # writers.  Normalization starts from a potentially stale full profile, so
+    # it must never echo either correctness key back through a generic merge.
+    data.pop("hosted_runtime_mode", None)
+    data.pop("v2_reply_cursor_seq", None)
+    scrubbed = set(data.get(V2_AUTOSEED_SCRUBBED_FLAGS) or [])
+    remove_keys = [
+        key for key in (*AUTOSEED_SCRUB_FLAGS, PERCEPTION_V2_AUTOSEED_SCRUBBED)
+        if key not in data and (key in scrubbed or key == PERCEPTION_V2_AUTOSEED_SCRUBBED)
+    ]
+    if strict:
+        persisted = db.patch_blob_strict(
+            store.user_id, MODEL_API_RUNTIME_BLOB, data, remove_keys=remove_keys)
+    else:
+        persisted = db.patch_blob(
+            store.user_id, MODEL_API_RUNTIME_BLOB, data, remove_keys=remove_keys)
+    return persisted if isinstance(persisted, dict) else data
 
 
 def _ensure_model_api_runtime_profile(
@@ -101,7 +118,7 @@ def _ensure_model_api_runtime_profile(
     *,
     touch: bool = False,
 ) -> dict | None:
-    """Lazily migrate model_api users into the hosted resident runtime.
+    """Lazily materialize Runtime V2 profile metadata for model-API users.
 
     This is intentionally metadata-only: provider key envelopes, chat,
     identity, and memory cards remain untouched.
@@ -165,17 +182,30 @@ def _patch_model_api_runtime_profile(store: UserStore, patch: dict) -> dict | No
     profile = _ensure_model_api_runtime_profile(store) or {}
     if not profile:
         return None
+    values = {k: v for k, v in patch.items() if v is not None}
+    values.update({
+        "runtime_mode": MODEL_API_RUNTIME_MODE,
+        "runtime_version": MODEL_API_RUNTIME_VERSION,
+        "updated_at": core_util._now_iso(),
+    })
+    # Ownership mode and reply cursor are correctness keys with dedicated
+    # transactional/monotonic writers, never generic profile fields.
+    values.pop("hosted_runtime_mode", None)
+    values.pop("v2_reply_cursor_seq", None)
+    persisted = db.patch_blob(store.user_id, MODEL_API_RUNTIME_BLOB, values)
+    if isinstance(persisted, dict):
+        return persisted
     merged = dict(profile)
-    merged.update({k: v for k, v in patch.items() if v is not None})
-    return _save_model_api_runtime_profile(store, merged)
+    merged.update(values)
+    return merged
 
 
 def record_runtime_error(store: UserStore, *, error: str, error_class: str = "") -> tuple[dict, int]:
-    """agent-runner consumer 上报（或清空）最近一次回合失败原因。
+    """Runtime V2 worker 上报（或清空）最近一次回合失败原因。
 
     写 active route 行（``model_api_routes.last_runtime_error*``）。读侧是 setup_core 的
     last_runtime_error（iOS 设置页，也已切到读 route）与 GET /v1/model_api/routes。
-    legacy inline 路径经 action-trace 写同一字段；本函数是 agent-runner 路径的对等写侧
+    legacy inline 路径经 action-trace 写同一字段；本函数是 pooled V2 路径的写侧
     （spec 2026-07-06-upstream-error-surfacing 腿②）。"""
     if not db.model_api_route_mark_runtime_error(
             store.user_id, error=error, error_class=error_class):
@@ -250,6 +280,17 @@ def _append_model_api_action_trace(store: UserStore, entry: dict) -> dict:
     return record
 
 
+def set_last_runtime_error(store: UserStore, message: str) -> None:
+    """Public direct lever to surface a terminal runtime failure to iOS's error
+    chip. The active route is the current read-side truth; the legacy runtime
+    profile remains a rollback/debug mirror. This is for callers — namely the
+    V2 worker and independent reaper — that have no action-trace entry."""
+    value = str(message)[:300]
+    _patch_model_api_runtime_profile(store, {"last_runtime_error": value})
+    db.model_api_route_mark_runtime_error(
+        store.user_id, error=value, error_class=None)
+
+
 def _patch_model_api_action_trace(store: UserStore, trace_id: str, patch: dict) -> dict | None:
     merged = dict(patch)
     if patch.get("status") in {"completed", "failed", "skipped"}:
@@ -286,7 +327,13 @@ def _provider_config_from_plain(config: dict, api_key: str) -> provider_client.P
         str(config.get("model") or ""),
         str(config.get("base_url") or ""),
     )
-    return provider_client.ProviderConfig(provider=provider, model=model, api_key=api_key, base_url=base_url)
+    return provider_client.ProviderConfig(
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        context_window_tokens=config.get("context_window_tokens"),
+    )
 
 
 def load_active_route(store: UserStore) -> dict | None:
@@ -306,7 +353,7 @@ def _load_runtime_provider_config(store: UserStore, api_key: str | None, *, runt
     envelope = route.get("api_key_envelope")
     if not isinstance(envelope, dict):
         return None, {"error": "model_api_key_envelope_missing"}
-    # A hosted (host-all) turn authenticates with a runtime token, not the
+    # A Runtime V2 turn authenticates with a runtime token, not the
     # long-term api_key — forward it so the enclave can authorize the unwrap.
     # The enclave's /v1/envelope/decrypt accepts either credential. Only pass
     # runtime_token through when present, so api-key callers are unchanged.
@@ -324,3 +371,378 @@ def _load_runtime_provider_config(store: UserStore, api_key: str | None, *, runt
         return _provider_config_from_plain(route, provider_key)
     except provider_client.ProviderError as e:
         return None, {"error": "model_api_config_invalid", "detail": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# hosted_runtime_mode — per-user ownership fence (dual-runtime coexistence).
+# resident_cli: the resident CLI consumer path. db_action_v2: chat/send
+# enqueues agent_jobs, drained by the independent V2 worker pool. Both
+# directions are selectable; ``hosted_runtime_policy()`` governs whether
+# ownership is forced fleet-wide (``v2_only``, the retirement-era emergency
+# override) or left to the per-user fence (``dual``, the default). Persisted
+# in the existing model_api_runtime profile blob.
+# ---------------------------------------------------------------------------
+
+HOSTED_RUNTIME_MODE_RESIDENT = "resident_cli"
+HOSTED_RUNTIME_MODE_DB_ACTION_V2 = "db_action_v2"
+_PERSISTED_HOSTED_RUNTIME_MODES = {
+    HOSTED_RUNTIME_MODE_RESIDENT,
+    HOSTED_RUNTIME_MODE_DB_ACTION_V2,
+}
+
+HOSTED_RUNTIME_POLICY_ENV = "FEEDLING_HOSTED_RUNTIME_POLICY"
+HOSTED_RUNTIME_POLICY_V2_ONLY = "v2_only"
+HOSTED_RUNTIME_POLICY_DUAL = "dual"
+_HOSTED_RUNTIME_POLICIES = {HOSTED_RUNTIME_POLICY_V2_ONLY, HOSTED_RUNTIME_POLICY_DUAL}
+
+# Provider/config-scoped fields can be discarded when the user deletes every
+# model API credential. Correctness state (notably v2_reply_cursor_seq), rollout
+# flags, and unknown future control keys deliberately remain in the blob.
+_MODEL_API_DELETE_REMOVE_KEYS = (
+    "provider",
+    "model",
+    "memory_quality_warning",
+    "last_runtime_error",
+    "last_runtime_error_class",
+    "recap_cursor",
+    "last_recap_at",
+    "last_action_trace_id",
+)
+
+
+def effective_hosted_runtime_mode(value: object) -> str:
+    """Normalize the persisted ownership fence.
+
+    ``resident_cli`` is retained only as a dormant/deletion fence and for
+    explicitly independent `/v1/chat/*` consumers. Hosted send requires the
+    exact V2 tuple and fails closed for every other value. Strict callers
+    surface database read failures before reaching this normalizer.
+    """
+    mode = str(value or "")
+    return (
+        mode
+        if mode in _PERSISTED_HOSTED_RUNTIME_MODES
+        else HOSTED_RUNTIME_MODE_RESIDENT
+    )
+
+
+def hosted_runtime_policy() -> str:
+    """Process-wide routing policy. ``dual`` routes per-user by the fence;
+    ``v2_only`` fails-closed for non-V2 users (the retirement-era behavior,
+    restored at P7)."""
+    policy = str(
+        os.environ.get(HOSTED_RUNTIME_POLICY_ENV, HOSTED_RUNTIME_POLICY_DUAL)
+        or HOSTED_RUNTIME_POLICY_DUAL
+    ).strip().lower()
+    if policy not in _HOSTED_RUNTIME_POLICIES:
+        raise RuntimeError(
+            f"{HOSTED_RUNTIME_POLICY_ENV} must be one of "
+            f"{sorted(_HOSTED_RUNTIME_POLICIES)!r}; got {policy!r}"
+        )
+    return policy
+
+
+def forced_hosted_runtime_mode() -> str | None:
+    """Fleet-wide forced target, or ``None`` when ``dual`` defers to each
+    user's own persisted ownership fence."""
+    policy = hosted_runtime_policy()
+    if policy == HOSTED_RUNTIME_POLICY_V2_ONLY:
+        return HOSTED_RUNTIME_MODE_DB_ACTION_V2
+    return None
+
+
+def get_hosted_runtime_mode(store: UserStore) -> str:
+    """读取持久化 ownership fence；hosted send 只接受精确 V2 tuple。"""
+    profile = _load_model_api_runtime_profile(store) or {}
+    return effective_hosted_runtime_mode(profile.get("hosted_runtime_mode"))
+
+
+def get_hosted_runtime_mode_strict(store: UserStore) -> str:
+    """Control-plane read that distinguishes a DB error from an absent flag."""
+    profile = db.get_blob_strict(store.user_id, MODEL_API_RUNTIME_BLOB)
+    profile = profile if isinstance(profile, dict) else {}
+    return effective_hosted_runtime_mode(profile.get("hosted_runtime_mode"))
+
+
+def get_hosted_runtime_control_strict(
+    store: UserStore,
+) -> tuple[str, str, int]:
+    """Read normalized blob mode plus authoritative state/generation once."""
+    raw_mode, state, generation = db.get_hosted_runtime_control_strict(
+        store.user_id)
+    if state not in {"resident", "draining", "v2"}:
+        raise RuntimeError(f"invalid hosted runtime state: {state!r}")
+    return effective_hosted_runtime_mode(raw_mode), state, generation
+
+
+def hosted_runtime_v2_enabled_strict(store: UserStore) -> bool:
+    """True only when routing and the authoritative ownership row agree."""
+    mode, state, _generation = get_hosted_runtime_control_strict(store)
+    return mode == HOSTED_RUNTIME_MODE_DB_ACTION_V2 and state == "v2"
+
+
+def _set_hosted_runtime_mode_for_user_id(
+    user_id: str,
+    mode: str,
+    *,
+    store: UserStore | None = None,
+) -> str:
+    """Serialize ownership changes with provider-config mutation for this user."""
+    with db.hosted_runtime_config_mutation_lock(user_id):
+        return _set_hosted_runtime_mode_for_user_id_locked(
+            user_id, mode, store=store
+        )
+
+
+def _set_hosted_runtime_mode_for_user_id_locked(
+    user_id: str,
+    mode: str,
+    *,
+    store: UserStore | None = None,
+) -> str:
+    """Generation-fenced runtime transition used by policy and admin paths."""
+    if mode not in _PERSISTED_HOSTED_RUNTIME_MODES:
+        raise ValueError(f"unknown hosted_runtime_mode: {mode!r}")
+    # Fleet reconciliation runs before Gunicorn forks and must remain a DB-only
+    # control-plane operation. Constructing UserStore here hydrates chat, frames,
+    # memory, push state, and other per-user data; doing that serially for every
+    # account makes a safe startup backfill scale with conversation history.
+    # These config/profile helpers only require ``user_id``, so use a tiny ref.
+    store_ref = store or types.SimpleNamespace(user_id=str(user_id))
+    config = _load_model_api_config(store_ref)
+    if not config and mode == HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+        raise ValueError("cannot set hosted_runtime_mode: user has no model_api config")
+
+    if mode == HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+        # Seed first. Flipping ownership before a wake schedule exists creates a
+        # window where the resident has been reaped but V2 proactive work has no
+        # durable clock. Preserve an existing schedule rather than resetting its
+        # next heartbeat every time startup reconciliation runs.
+        from model_api_runtime.v2 import jobs_store
+
+        if jobs_store.get_wake_schedule(store_ref.user_id) is None:
+            jobs_store.upsert_wake_schedule(
+                store_ref.user_id, next_heartbeat_at=time.time()
+            )
+    # Read control state fail-loud. A missing profile is a real state (seed it
+    # for configured users); a DB failure must never be mistaken for that state.
+    existing = db.get_blob_strict(store_ref.user_id, MODEL_API_RUNTIME_BLOB)
+    if isinstance(existing, dict) and config:
+        persisted = _ensure_model_api_runtime_profile(store_ref, config)
+    elif isinstance(existing, dict):
+        persisted = dict(existing)
+    elif config:
+        persisted = _ensure_model_api_runtime_profile(store_ref, config)
+    else:
+        # Route deletion must fence orphaned V2 controls even after every route
+        # was removed. The correctness blob can be materialized without provider
+        # metadata; deletion intentionally preserves it for the reply cursor.
+        persisted = {}
+    if persisted is None:
+        raise ValueError("cannot set hosted_runtime_mode: user has no model_api config")
+    expected_state = "v2" if mode == HOSTED_RUNTIME_MODE_DB_ACTION_V2 else "resident"
+    raw_mode, state, _generation = db.get_hosted_runtime_control_strict(
+        store_ref.user_id
+    )
+    if (
+        raw_mode == mode
+        and state == expected_state
+        and persisted.get("runtime_mode") == MODEL_API_RUNTIME_MODE
+        and persisted.get("runtime_version") == MODEL_API_RUNTIME_VERSION
+    ):
+        if mode == HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+            _recover_cutover_chat_if_needed(store_ref.user_id)
+        return mode
+    db.patch_blob_strict(
+        store_ref.user_id,
+        MODEL_API_RUNTIME_BLOB,
+        {
+            "hosted_runtime_mode": mode,
+            "runtime_mode": MODEL_API_RUNTIME_MODE,
+            "runtime_version": MODEL_API_RUNTIME_VERSION,
+            "updated_at": core_util._now_iso(),
+        },
+        runtime_state_target=(
+            "v2" if mode == HOSTED_RUNTIME_MODE_DB_ACTION_V2 else "resident"
+        ),
+        require_active_hosted_route=(
+            mode == HOSTED_RUNTIME_MODE_DB_ACTION_V2
+        ),
+    )
+    readback = db.get_blob_strict(store_ref.user_id, MODEL_API_RUNTIME_BLOB)
+    if not isinstance(readback, dict) or readback.get("hosted_runtime_mode") != mode:
+        raise RuntimeError("hosted_runtime_mode persistence verification failed")
+    raw_mode, state, _generation = db.get_hosted_runtime_control_strict(
+        store_ref.user_id
+    )
+    if raw_mode != mode or state != expected_state:
+        raise RuntimeError("hosted_runtime ownership verification failed")
+    if mode == HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+        _recover_cutover_chat_if_needed(store_ref.user_id)
+    return mode
+
+
+def _recover_cutover_chat_if_needed(user_id: str) -> None:
+    """Immediately hand any resident-era unanswered row to the V2 chat lane."""
+    if not db.reconcile_unenqueued_v2_message_for_user(user_id):
+        return
+    from core import wake_bus
+
+    wake_bus.notify("v2_jobs", user_id=user_id)
+
+
+def eager_enqueue_v2_chat_if_owned(store: UserStore) -> None:
+    """Eagerly enqueue a V2 chat job for a message that arrived on the generic
+    ``/v1/chat/message`` write path instead of ``/v1/model_api/chat/send``.
+
+    A ``db_action_v2`` user's client normally posts to ``/v1/model_api/chat/send``
+    (which enqueues in the same transaction as the INSERT). But an
+    onboarding-incomplete or post-reset client can still hit ``/v1/chat/message``,
+    which is append-only — its message would otherwise wait up to one
+    ``FEEDLING_V2_RECONCILE_INTERVAL_SEC`` (default 60s) fleet sweep tick for a
+    job, i.e. a 0–60s "first reply is very slow" tail. Hand it to the chat lane
+    now instead.
+
+    Gated on the store-cached fence so the resident / self-hosted hot path — the
+    common ``/v1/chat/message`` caller — never touches the V2 runtime machinery.
+    The authoritative ``state='v2'`` re-check happens under lock inside
+    ``reconcile_unenqueued_v2_message_for_user``; the periodic fleet sweep remains
+    the backstop, so this is strictly a latency optimization."""
+    if get_hosted_runtime_mode(store) != HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+        return
+    _recover_cutover_chat_if_needed(store.user_id)
+
+
+def set_hosted_runtime_mode(store: UserStore, mode: str) -> str:
+    """切换该用户的 hosted 运行时模式。非法值、或用户尚无 model_api config
+    导致无法落地时，抛 ValueError（绝不返回假成功）。返回真正落地后的 mode。"""
+    forced_mode = forced_hosted_runtime_mode()
+    if forced_mode is not None and mode != forced_mode:
+        raise ValueError(
+            f"hosted runtime policy {hosted_runtime_policy()!r} requires {forced_mode!r}"
+        )
+    return _set_hosted_runtime_mode_for_user_id(
+        store.user_id, mode, store=store
+    )
+
+
+def apply_hosted_runtime_policy(store: UserStore) -> str | None:
+    """Materialize a forced policy for one configured user, if configured."""
+    target = forced_hosted_runtime_mode()
+    if target is None:
+        return None
+    return _set_hosted_runtime_mode_for_user_id(
+        store.user_id, target, store=store
+    )
+
+
+def reconcile_hosted_runtime_policy() -> dict:
+    """Synchronously materialize forced ownership for every runnable user.
+
+    Called before HTTP workers fork. Any failure propagates so a V2-only Pre
+    cannot start while silently leaving an account on the resident runtime.
+    Reapplying the same target is idempotent at the runtime-generation layer.
+    """
+    policy = hosted_runtime_policy()
+    target = forced_hosted_runtime_mode()
+    if target is None:
+        return {"policy": policy, "eligible": 0, "reconciled": 0}
+
+    controls = db.list_hosted_runtime_eligible_controls()
+    user_ids = [row[0] for row in controls]
+    for user_id in user_ids:
+        _set_hosted_runtime_mode_for_user_id(user_id, target)
+    result = {
+        "policy": policy,
+        "eligible": len(user_ids),
+        "reconciled": len(user_ids),
+    }
+    print(f"[hosted-runtime-policy] {result}", flush=True)
+    return result
+
+
+def hosted_runtime_policy_status() -> dict:
+    """Read-only deploy gate for policy coverage across runnable accounts."""
+    policy = hosted_runtime_policy()
+    target = forced_hosted_runtime_mode()
+    controls = db.list_hosted_runtime_eligible_controls()
+    ready = 0
+    inconsistent: list[str] = []
+    for user_id, raw_mode, state, _generation in controls:
+        effective_mode = effective_hosted_runtime_mode(raw_mode)
+        expected_state = (
+            "v2"
+            if effective_mode == HOSTED_RUNTIME_MODE_DB_ACTION_V2
+            else "resident"
+        )
+        target_ready = target is None or effective_mode == target
+        if state == expected_state and target_ready:
+            ready += 1
+        else:
+            inconsistent.append(user_id)
+    return {
+        "policy": policy,
+        "target_mode": target,
+        "eligible_count": len(controls),
+        "ready_count": ready,
+        "inconsistent_count": len(inconsistent),
+        "inconsistent_user_ids": inconsistent,
+    }
+
+
+def prepare_model_api_delete(store: UserStore) -> dict:
+    """Fence V2 work before credentials disappear, preserving reply history.
+
+    This does not require an active provider route: deletion is idempotent and
+    must also repair stale/split-brain runtime state. The runtime row and blob
+    mode move to resident in the same transaction, bumping generation whenever
+    routing actually changes so pending V2 effects become ineligible. The
+    durable seq cursor remains in ``model_api_runtime``; deleting that cursor
+    would replay the user's old conversation if they configured a provider
+    again later.
+    """
+    persisted = db.patch_blob_strict(
+        store.user_id,
+        MODEL_API_RUNTIME_BLOB,
+        {
+            "hosted_runtime_mode": HOSTED_RUNTIME_MODE_RESIDENT,
+            "runtime_mode": MODEL_API_RUNTIME_MODE,
+            "runtime_version": MODEL_API_RUNTIME_VERSION,
+            "updated_at": core_util._now_iso(),
+        },
+        remove_keys=_MODEL_API_DELETE_REMOVE_KEYS,
+        runtime_state_target="resident",
+    )
+    if (
+        not isinstance(persisted, dict)
+        or persisted.get("hosted_runtime_mode") != HOSTED_RUNTIME_MODE_RESIDENT
+    ):
+        raise RuntimeError("model_api delete runtime fence did not persist")
+    return persisted
+
+
+def fence_hosted_runtime_for_config_change(store: UserStore) -> dict:
+    """Invalidate current V2 work while preserving live config metadata.
+
+    Route/credential mutation can race a stale ``is_active`` snapshot. Fencing
+    every successful deletion is conservative but safe; unlike full config
+    deletion this deliberately keeps provider-scoped profile fields because an
+    already-tested replacement may become active immediately afterward.
+    """
+    persisted = db.patch_blob_strict(
+        store.user_id,
+        MODEL_API_RUNTIME_BLOB,
+        {
+            "hosted_runtime_mode": HOSTED_RUNTIME_MODE_RESIDENT,
+            "runtime_mode": MODEL_API_RUNTIME_MODE,
+            "runtime_version": MODEL_API_RUNTIME_VERSION,
+            "updated_at": core_util._now_iso(),
+        },
+        runtime_state_target="resident",
+    )
+    if (
+        not isinstance(persisted, dict)
+        or persisted.get("hosted_runtime_mode") != HOSTED_RUNTIME_MODE_RESIDENT
+    ):
+        raise RuntimeError("model_api config-change runtime fence did not persist")
+    return persisted

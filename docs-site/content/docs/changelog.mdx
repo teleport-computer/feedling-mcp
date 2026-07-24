@@ -12,6 +12,49 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- **The Runtime V2 `identity_nudge` tool now actually applies personality-dimension
+  changes.** The tool was exposed in the model-visible catalog but had no effect
+  wiring, so any call failed the turn. Its full produce → encrypt → replay-validate
+  → sink path is now implemented (dimension nudges land on the identity card), with
+  unknown effect operations failing closed. No request/response shape change.
+
+- **`web_fetch` now returns the beginning of a large page instead of failing.**
+  A response over the raw-body cap was discarded whole, so the tool errored on
+  essentially every real site (Wikipedia is 360 KB, a weather page 86 KB, the
+  Python docs 41.8 KB) and a model that only ever saw failures would tell the
+  user it had no web access. It now keeps what it read, raises the retained-body
+  cap to 300 KB, and reports a new `truncated` boolean that is true whenever any
+  content was left out — either the body cut or the text cap. An unterminated
+  `<script>`/`<style>` tail is dropped rather than handed over as page text.
+- **`web_fetch` now extracts the readable article from a page.** With only a
+  plain tag-strip, most of the model's per-page budget went to the navigation
+  menu ("Jump to content / Main menu / Donate" fills the first 2257 characters
+  of a Wikipedia article; a weather page opened with "首页 预报 预警 雷达").
+  HTML pages now go through an article extractor first, so a weather page reads
+  "中雨 24℃ 晴转多云" and an article starts at its first sentence. Non-HTML
+  responses (JSON, plain text, source) are untouched. Extraction runs in an
+  isolated, time- and memory-bounded child process and falls back to the plain
+  strip on any failure; the `FEEDLING_WEB_EXTRACT_ARTICLE` env var disables it.
+
+- **Web search is now user-controlled.** `web_search` / `web_fetch` are only
+  offered to the model when the account's toggle is on; before this change they
+  were always available. The switch covers **every** turn — foreground chat, the
+  proactive companion's background turns, and any subagent spawned from either —
+  so there is one answer to "can my companion go online", not a per-lane matrix.
+  Accounts whose persisted runtime target was already the V2 runtime are
+  backfilled to "on" once, so existing users keep exactly what they had; new
+  accounts start off and enable it in the app.
+- New `GET`/`POST` `/v1/web/settings` (api-key only; runtime tokens are
+  refused). The response keeps the user's saved preference separate from what is
+  actually possible right now:
+  `{"enabled", "runtime_supported", "status", "effective", "tools"}`.
+  `enabled` is written only by the user — an operator halt never rewrites it.
+  `runtime_supported` is false for self-hosted accounts, whose consumer does not
+  run the tool loop these tools live in. `status` is `available` / `degraded` /
+  `unavailable`, where `degraded` means one of the two tools is halted and the
+  other still works. `effective` is derived, and covers every lane. `POST` requires a real JSON boolean under `enabled`; strings such as
+  `"no"` are rejected with `400` rather than coerced.
+
 - `GET /v1/content/export` now includes a `world_book` array alongside `chat`,
   `memory`, `identity` and `frames`. World book entries are user-authored
   content that account deletion removes, so an export that omitted them handed
@@ -239,6 +282,69 @@ change must not be interpreted as an API guarantee.
 
 ### Behavior
 
+- Runtime V2 now persists an immutable encrypted turn trajectory alongside its
+  aggregate token telemetry. Provider prompts and responses, late input folds,
+  tool calls and results, planned replies, and failure details are compressed
+  and sealed to the user's and trusted-decrypt keys before database storage.
+  Provider-backed failure review is off by default; when explicitly enabled,
+  a database-serialized fleet ceiling admits a bounded `trajectory_review`
+  lane whose provider call has no tools and whose handler has no reply, effect,
+  MCP, Memory, schedule, or workspace dispatch surface. Disabled/overflow
+  failures still retain capture but enqueue no provider runner, and encrypted
+  analysis is never added to live conversation context automatically. This is
+  bounded offline analysis, not deterministic replay; automatic trajectory
+  retention/GC and restricted operator inspection/export remain open.
+
+- Runtime V2 now treats encrypted Chat rows and referenced object-storage bodies
+  as the durable source ledger. Conversation compaction advances only the
+  summary prompt view: it does not delete source messages, and the 5,000-message
+  limit now bounds only each process's hot cache. Conversation summaries now use
+  immutable encrypted exact-range leaves and retained higher-level checkpoints;
+  a versioned canonical-ID binding keeps the model-facing view bounded and
+  complete. Existing single-blob summaries migrate lazily, including oversized
+  accounts with no new messages.
+
+- Explicit Chat clear now advances the runtime generation and atomically removes
+  raw messages, summary, chat-derived artifacts, effects/status, and reply
+  cursor. Paused old workers cannot resurrect cleared context. Independent
+  Memory/workspace state and encrypted trajectory telemetry retain their own
+  policies; account deletion remains the complete-erasure operation.
+
+- Runtime V2 adds an encrypted virtual workspace foundation with read-only
+  `/artifacts` and `/skills`, editable `/workspace`, and a persistent editable
+  `/memory/WORKING.md` that is distinct from Memory Garden. Native file writes
+  use optimistic revisions and the existing encrypted, generation-fenced effect
+  outbox. Sandbox acquisition is lazy: stored text views and Markdown edits do
+  not start one, while physical artifact materialization, untrusted binary
+  parsing, and any future shell/code execution require a registered sandbox
+  provider. Generic shell/code tools are not currently model-visible.
+  Upload persistence is unchanged, but on a deployment without an audited CVM
+  or E2B adapter an uncached attachment is reported as `sandbox_unavailable`
+  instead of falling back to in-process parsing. Successful acquisitions append
+  content-free billing/usage events; cached text reads do not. Disjoint
+  workspace writes can commit concurrently in conflict-free waves, while
+  same/ancestor/descendant paths and external mutations remain ordered.
+
+- The model-visible Runtime V2 catalog now contains 24 built-in tools: 22
+  platform tools plus `task` and `reply`. `task` runs bounded read-only child
+  loops with isolated transcripts and can parallelize independent work without
+  exposing reply, recursive-task, MCP mutation, platform-effect, or
+  workspace-write surfaces.
+
+- Provider-aware prompt caching now keeps deterministic tool/system/trusted-
+  skills blocks ahead of dynamic conversation/tool data, including Bedrock
+  Converse cache points and provider-neutral cache usage telemetry. Editable
+  `WORKING.md` is deliberately pull-only; after it or another private workspace
+  entry is read, later outbound web/MCP/`task` tools are unavailable for that
+  turn. The existing Pre canary proves an OpenRouter cache hit; native Bedrock
+  and live trusted-`/skills` mutation still need post-deploy proof.
+
+- Eager perception grounding now contains only fixed numeric/boolean/null
+  fields. Calendar/reminder/app/place/weather strings and screen/photo content
+  are pull-only; once explicitly read, later web, MCP, and `task` tools are
+  removed for that turn. Numeric health reads remain composable with outbound
+  tools.
+
 - Self-hosted resident consumers now only execute embedded agent actions whose
   type is on an explicit allowlist, and the reply sent to the user is rewritten
   to match what actually happened — a reply is no longer sent as if an
@@ -363,6 +469,15 @@ themselves add a backend endpoint or change production request handling.
 
 ### Storage and deployment
 
+- Hosted model-API execution is now Runtime V2-only in local, test, pre, and
+  production deployment manifests. The resident supervisor, per-user CLI
+  processes/homes/leases, rollback selectors, and hosted resident admin flip
+  have been removed. The independently operated `/v1/chat/*` resident consumer
+  remains available and is not a hosted fallback.
+- Test, pre, and production deploys now treat their pooled Runtime V2 worker CVM
+  as mandatory. Hosted sends fail before persistence when no fresh worker
+  heartbeat or capacity is available; the worker image contains only the Python
+  V2 runtime, not agent CLIs or resident data volumes.
 - Heavy Chat **image** bodies are now offloaded to object storage alongside file
   bodies, under a separate `chatimages/` key prefix so image retention and usage
   can be governed on their own. The message row keeps envelope metadata plus a

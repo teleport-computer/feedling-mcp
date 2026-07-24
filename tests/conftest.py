@@ -23,10 +23,8 @@ from pathlib import Path
 
 import pytest
 
-# Let hosting-ready check pass in tests by default. Tests that specifically
-# test the assert_hosting_ready() raise path (test_hosted_agent_runtime_cutover.py)
-# use monkeypatch.delenv to explicitly unset these, overriding setdefault.
-os.environ.setdefault("FEEDLING_HOST_ALL", "1")
+# Hosted execution is V2-only. Tests that exercise the runtime-token prerequisite
+# explicitly unset this secret with monkeypatch.
 os.environ.setdefault("FEEDLING_RUNTIME_TOKEN_SECRET", "test-runtime-token-secret")
 
 _ADMIN_URL = os.environ.get("FEEDLING_TEST_PG", "postgresql://postgres:test@127.0.0.1:55432/postgres")
@@ -109,6 +107,9 @@ if not _provisioned:
     # Pure-unit modules that don't touch the DB — keep them collectable so a
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
+        "test_web_settings_store.py",
+        "test_v2_web_gate.py",
+        "test_web_settings_core.py",
         "test_object_storage.py",
         "test_wake_bus.py",
         "test_chat_idempotency_unit.py",
@@ -147,9 +148,13 @@ if not _provisioned:
         "test_chat_resident_consumer_file.py",
         "test_user_mcp_probe.py",
         "test_user_mcp_materialize.py",
+        "test_v2_coalesce.py",
+        "test_v2_status_stream.py",
+        "test_v2_dependency_direction.py",
         "test_user_mcp_ca_fetch.py",
         "test_user_mcp_ca_fetch_leaf.py",
         "test_identity_value_write_path.py",
+        "test_v2_workspace_unit.py",
         "test_identity_rename_pairing.py",
         "test_identity_nudge_cap.py",
         "test_identity_list_ops.py",
@@ -199,6 +204,26 @@ def seed_user(user_id: str, **doc) -> None:
             registry._users.append(entry)
 
 
+def set_v2_runtime_owner(user_id: str, *, generation: int | None = None) -> None:
+    """Test helper: make the authoritative runtime row explicitly V2-owned.
+
+    Production reaches this state through the atomic hosted-runtime cutover;
+    low-level worker/job tests intentionally bypass that assembly path and
+    therefore opt in through this helper before claiming work.
+    """
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_runtime_state "
+            "(user_id,hosted_runtime_state,runtime_generation) "
+            "VALUES (%s,'v2',COALESCE(%s,1)) "
+            "ON CONFLICT (user_id) DO UPDATE SET "
+            "hosted_runtime_state='v2', "
+            "runtime_generation=COALESCE(%s,v2_runtime_state.runtime_generation), "
+            "updated_at=now()",
+            (user_id, generation, generation),
+        )
+
+
 _DEFAULT_MODEL_API_ENVELOPE = {"v": 1, "body_ct": "ct", "nonce": "n"}
 
 
@@ -208,6 +233,7 @@ def configure_model_api_route(user_id: str, *, provider: str = "anthropic",
                               api_key_hint: str = "sk-a...451",
                               supports_responses: bool = False,
                               reasoning_effort=None,
+                              context_window_tokens: int | None = None,
                               test_status: str = "ok",
                               activate: bool = True):
     """Test-only: configure a user's model_api via the new credentials + routes
@@ -227,13 +253,41 @@ def configure_model_api_route(user_id: str, *, provider: str = "anthropic",
         api_key_envelope=envelope if isinstance(envelope, dict) else _DEFAULT_MODEL_API_ENVELOPE,
         api_key_hint=api_key_hint, supports_responses=supports_responses)
     route_id = db.model_api_route_upsert(
-        user_id, credential_id, model, reasoning_effort)
+        user_id, credential_id, model, reasoning_effort, context_window_tokens)
     if test_status:
         db.model_api_route_mark_test(user_id, route_id, status=test_status)
     if activate:
         db.model_api_route_activate(user_id, route_id)
     return credential_id, route_id
 
+
+def seed_api_key(user_id: str) -> str:
+    """Test-only: mint a real (hashed) api key for an already-``seed_user``-ed
+    user and register it in ``accounts.registry`` the same way
+    ``/v1/users/register`` does, so ``require_auth``/``_resolve_user`` — which
+    hash-looks-up ``api_key_hash`` — accept it. Returns the plaintext key for
+    the ``Authorization: Bearer <key>`` header. Idempotent-ish: appends a new
+    key entry each call (fine for tests, which mint once per user)."""
+    import secrets
+
+    from accounts import registry
+
+    api_key = secrets.token_hex(32)
+    api_key_hash = registry._hash_api_key(api_key)
+    with registry._users_lock:
+        for u in registry._users:
+            if u.get("user_id") == user_id:
+                u["api_key_hash"] = api_key_hash
+                u.setdefault("api_keys", []).append({
+                    "key_id": f"key_test_{api_key_hash[:8]}",
+                    "api_key_hash": api_key_hash,
+                    "access_mode": "official_import",
+                    "label": "Test",
+                    "created_at": "",
+                    "revoked_at": "",
+                })
+        registry._key_to_user[api_key_hash] = user_id
+    return api_key
 
 def pytest_report_header(config):
     """Surface WHY the DB-backed suite was skipped (collect_ignore is silent)."""

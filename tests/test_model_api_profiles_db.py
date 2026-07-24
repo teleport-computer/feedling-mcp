@@ -67,6 +67,41 @@ def test_route_upsert_is_idempotent_on_credential_model(backend_env):
     assert db.model_api_route_get(uid, r1)["reasoning_effort"] == "high"
 
 
+def test_route_upsert_persists_and_preserves_context_window(backend_env):
+    uid = _uid()
+    seed_user(uid)
+    cid = _cred(uid)
+
+    route_id = db.model_api_route_upsert(
+        uid, cid, "claude-sonnet-4-5", None, 32_768
+    )
+    assert db.model_api_route_get(uid, route_id)["context_window_tokens"] == 32_768
+
+    # Low-level legacy/test callers that omit the optional argument must not
+    # erase an already-verified route contract.
+    assert db.model_api_route_upsert(
+        uid, cid, "claude-sonnet-4-5", "high"
+    ) == route_id
+    assert db.model_api_route_get(uid, route_id)["context_window_tokens"] == 32_768
+
+    assert db.model_api_route_upsert(
+        uid, cid, "claude-sonnet-4-5", "high", 65_536
+    ) == route_id
+    assert db.model_api_route_get(uid, route_id)["context_window_tokens"] == 65_536
+
+
+def test_route_context_window_database_constraint_rejects_impossible_value(
+        backend_env):
+    uid = _uid()
+    seed_user(uid)
+    cid = _cred(uid)
+
+    assert db.model_api_route_upsert(
+        uid, cid, "claude-sonnet-4-5", None, 1_024
+    ) is None
+    assert db.model_api_routes_list(uid) == []
+
+
 def test_activate_leaves_exactly_one_active(backend_env):
     uid = _uid()
     seed_user(uid)
@@ -306,7 +341,7 @@ def test_concurrent_activate_keeps_exactly_one_active(backend_env):
     assert total_losers >= 1, "concurrency test never hit the rollback path — lost its guard value"
 
 
-def test_roster_only_returns_active_ok_routes(backend_env):
+def test_active_route_tracks_activation_and_reasoning_effort(backend_env):
     uid = _uid()
     seed_user(uid)
     cid = _cred(uid)
@@ -316,40 +351,36 @@ def test_roster_only_returns_active_ok_routes(backend_env):
     db.model_api_route_mark_test(uid, r_haiku, status="ok")
     db.model_api_route_activate(uid, r_sonnet)
 
-    roster = [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid]
-    assert len(roster) == 1
-    assert roster[0]["model"] == "claude-sonnet-4-5"
-    assert roster[0]["driver"] == "claude"       # anthropic → claude
-    assert roster[0]["provider"] == "anthropic"
-    assert roster[0]["reasoning_effort"] == "high"
+    active = db.model_api_active_route(uid)
+    assert active["model"] == "claude-sonnet-4-5"
+    assert active["provider"] == "anthropic"
+    assert active["reasoning_effort"] == "high"
 
-    # 切到 haiku 后 roster 跟着换
+    # 切到 haiku 后 active route 跟着换。
     db.model_api_route_activate(uid, r_haiku)
-    roster = [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid]
-    assert roster[0]["model"] == "claude-haiku-4-5"
-    assert roster[0]["reasoning_effort"] == ""
+    active = db.model_api_active_route(uid)
+    assert active["model"] == "claude-haiku-4-5"
+    assert active["reasoning_effort"] == ""
 
 
-def test_roster_excludes_untested_active_route(backend_env):
+def test_hosted_eligibility_excludes_untested_active_route(backend_env):
     uid = _uid()
     seed_user(uid)
     cid = _cred(uid)
     r = db.model_api_route_upsert(uid, cid, "claude-sonnet-4-5", None)
     db.model_api_route_activate(uid, r)   # test_status 仍是 untested
 
-    assert [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid] == []
+    assert uid not in db.list_hosted_runtime_eligible_user_ids()
 
 
-def test_roster_gemini_discovered_as_pi_unconditionally(backend_env):
+def test_active_route_preserves_gemini_provider(backend_env):
     uid = _uid()
     seed_user(uid)
     cid = _cred(uid, provider="gemini")
     r = db.model_api_route_upsert(uid, cid, "gemini-2.5-flash", None)
     db.model_api_route_mark_test(uid, r, status="ok")
     db.model_api_route_activate(uid, r)
-    rows = [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid]
-    assert len(rows) == 1
-    assert rows[0]["driver"] == "pi"
+    assert db.model_api_active_route(uid)["provider"] == "gemini"
 
 
 def test_account_deletion_clears_credentials_and_routes(backend_env):
@@ -415,17 +446,17 @@ def test_route_columns_timestamps_are_utc_invariant_under_session_timezone(backe
 
         conn.execute("RESET TIME ZONE")
 
-    # _ROUTE_COLUMNS' 0-indexed order: 11=last_test_at, 15=created_at, 16=updated_at
-    # (12/13/14 are last_test_error/last_runtime_error/last_runtime_error_class).
-    for idx, name in ((11, "last_test_at"), (15, "created_at"), (16, "updated_at")):
+    # _ROUTE_COLUMNS' 0-indexed order: 12=last_test_at, 16=created_at, 17=updated_at
+    # (9 is context_window_tokens; 13/14/15 are the three error fields).
+    for idx, name in ((12, "last_test_at"), (16, "created_at"), (17, "updated_at")):
         assert baseline[idx] == shifted[idx], (
             f"{name} changed under SET TIME ZONE — to_char is reading the "
             f"session GUC instead of a fixed UTC offset: "
             f"{baseline[idx]!r} != {shifted[idx]!r}"
         )
     # created_at/updated_at are never blank for a freshly-created route.
-    assert baseline[15] and baseline[15].endswith("Z")
     assert baseline[16] and baseline[16].endswith("Z")
+    assert baseline[17] and baseline[17].endswith("Z")
 
 
 def test_roster_supports_responses_bool_conversion_from_real_column(backend_env):
@@ -445,6 +476,4 @@ def test_roster_supports_responses_bool_conversion_from_real_column(backend_env)
     db.model_api_route_mark_test(uid, r, status="ok")
     db.model_api_route_activate(uid, r)
 
-    rows = [e for e in db.list_agent_runtime_enabled_users() if e["user_id"] == uid]
-    assert len(rows) == 1
-    assert rows[0]["supports_responses"] is True
+    assert db.model_api_active_route(uid)["supports_responses"] is True
