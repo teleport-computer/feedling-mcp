@@ -58,6 +58,28 @@ def _v2_stream(store: UserStore, stream: str, *, limit: int = PROACTIVE_DEBUG_V2
         return []
 
 
+def _derive_message_delivery_status(live_status: str, alert_status: str) -> str:
+    """Derive a proactive message's delivery headline from BOTH push channels.
+
+    AI messages now deliver via the system alert only (Live Activity is gated off
+    by default — see push.service.AI_MSG_LIVE_ACTIVITY), so delivery must follow
+    the alert when Live Activity is not the delivery channel. Critically, a failed
+    sole channel must NOT read as a green ``chat_written*`` headline (status_class
+    colors any ``chat_written*`` value green)."""
+    live = str(live_status or "")
+    alert = str(alert_status or "")
+    # Either channel landing counts as delivered: Live Activity (gate on) or the
+    # system alert (the delivery channel for AI messages by default).
+    if live == "delivered" or alert in {"delivered", "logged_only"}:
+        return "delivered"
+    # Neither delivered and a channel errored → must NOT read green.
+    if "error" in alert or "failed" in alert or "error" in live or "failed" in live:
+        return "alert_failed"
+    if live and live != "disabled":
+        return f"chat_written_live_activity_{live}"
+    return "chat_written"
+
+
 def _proactive_debug_snapshot(store: UserStore) -> dict:
     # The debug dashboard is used as an investigation surface, not a tiny
     # status widget. Read enough rows to cover a normal day of proactive
@@ -110,12 +132,7 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
         if msg:
             live_status = str(msg.get("live_activity_status") or "")
             alert_status = str(msg.get("alert_status") or "")
-            if live_status == "delivered" and alert_status in {"", "delivered", "logged_only"}:
-                row["derived_status"] = "delivered"
-            elif live_status:
-                row["derived_status"] = f"chat_written_live_activity_{live_status}"
-            else:
-                row["derived_status"] = "chat_written"
+            row["derived_status"] = _derive_message_delivery_status(live_status, alert_status)
             row["chat_message_id"] = msg.get("id", "")
             row["chat_ts"] = msg.get("ts")
             row["alert_status"] = alert_status
@@ -404,6 +421,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         "claimed": "处理中",
         "completed": "已完成",
         "delivered": "已送达",
+        "alert_failed": "通知发送失败",
         "chat_written": "已写入聊天",
         "logged_only": "仅记录",
         "skipped": "已跳过",

@@ -5,6 +5,7 @@ gated (FEEDLING_AI_MSG_LIVE_ACTIVITY restores the old dual behavior)."""
 from unittest.mock import patch, MagicMock
 
 from push import service as push_service
+from proactive import dashboard
 
 
 def _store(uid="usr_la_gate"):
@@ -79,3 +80,36 @@ def test_env_flag_parsing():
     os.environ.pop("X_LA", None)
     assert push_service._env_flag("X_LA", False) is False   # unset → default
     assert push_service._env_flag("X_LA", True) is True
+
+
+# --- proactive dashboard delivery derivation must stay alert-aware once the
+#     Dynamic Island (Live Activity) is gated off, so a failed sole channel does
+#     not read as a green "chat_written*" headline. ---
+
+def test_derive_status_disabled_alert_delivered_is_delivered():
+    # New normal success: Live Activity disabled, system alert landed.
+    assert dashboard._derive_message_delivery_status("disabled", "delivered") == "delivered"
+
+
+def test_derive_status_disabled_alert_error_is_not_green():
+    # New sole-channel failure must NOT be a green chat_written* headline.
+    s = dashboard._derive_message_delivery_status("disabled", "error")
+    assert s == "alert_failed"
+    assert not s.startswith("chat_written")     # status_class greens chat_written*
+    assert "failed" in s                        # status_class reds *failed*
+
+
+def test_derive_status_live_delivered_stays_delivered_regardless_of_alert():
+    # Gate-on path unchanged: a delivered Live Activity is delivered even if the
+    # alert push errored (the user saw the Island).
+    assert dashboard._derive_message_delivery_status("delivered", "") == "delivered"
+    assert dashboard._derive_message_delivery_status("delivered", "error") == "delivered"
+
+
+def test_derive_status_disabled_alert_skipped_is_chat_written():
+    # No device token etc. → message written, no push, but not an error.
+    assert dashboard._derive_message_delivery_status("disabled", "skipped") == "chat_written"
+
+
+def test_derive_status_both_channels_error_is_not_green():
+    assert dashboard._derive_message_delivery_status("error", "error") == "alert_failed"

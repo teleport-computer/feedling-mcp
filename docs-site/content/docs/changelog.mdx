@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Received AI messages no longer expand the Dynamic Island.** Chat replies and
+  proactive messages now deliver via the system alert notification only (it stacks
+  in Notification Center instead of the Live Activity briefly expanding). The
+  Live Activity / Dynamic Island push for these messages is gated off by default;
+  set `FEEDLING_AI_MSG_LIVE_ACTIVITY=1` to restore the previous dual delivery. The
+  explicit `/v1/push/dynamic-island`, `/v1/push/live-activity`, and
+  `/v1/push/live-start` routes are unchanged and remain available for other uses.
+  No request/response shape change.
+
 ### API
 
 - Automatic `heartbeat_*` calls to `POST /v1/proactive/tick` now use a
