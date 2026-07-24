@@ -379,6 +379,21 @@ def test_memory_replace_all_diff_semantics():
     assert db.memory_load(uid) == []
 
 
+def test_memory_replace_all_propagates_persistence_failure(monkeypatch):
+    """A caller must never advance a durable frontier after a failed write."""
+
+    class BrokenPool:
+        def connection(self):
+            raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(db, "get_pool", lambda: BrokenPool())
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        db.memory_replace_all(
+            _uid(),
+            [{"id": "must-not-land", "occurred_at": "2026-01-01"}],
+        )
+
+
 def test_memory_replace_all_rewrites_stale_occurred_at_column():
     """If the occurred_at column drifts out of sync with the doc (e.g. a row
     written separately via memory_upsert), an otherwise-unchanged doc must

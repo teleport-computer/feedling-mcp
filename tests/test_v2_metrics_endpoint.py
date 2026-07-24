@@ -62,6 +62,38 @@ def env(monkeypatch):
     monkeypatch.setattr(jobs_store, "recent_mean_tokens_per_turn", lambda **kw: 123.0)
     monkeypatch.setattr(
         jobs_store,
+        "recent_chat_operational_health",
+        lambda **kw: {
+            "window_hours": 24,
+            "sample_limit": 1000,
+            "jobs": {
+                "sampled_terminal_jobs": 10,
+                "completed": 8,
+                "failed": 1,
+                "expired": 1,
+                "queue_expired": 1,
+                "lease_expired": 0,
+                "superseded": 0,
+                "failure_rate": 0.1,
+                "expiry_rate": 0.1,
+                "error_or_expiry_rate": 0.2,
+                "pending": 1,
+                "oldest_pending_age_sec": 12.5,
+            },
+            "latency": {"sampled_turns": 10, "p95_ms": 4200.0},
+            "trajectory": {
+                "sampled_jobs": 12,
+                "complete": 10,
+                "partial": 1,
+                "missing": 0,
+                "open": 1,
+                "capture_gap": 1,
+                "complete_rate": 10 / 12,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        jobs_store,
         "recent_prompt_cache_stats",
         lambda **kw: {
             "sampled_turns": 4,
@@ -168,6 +200,34 @@ def test_v2_metrics_returns_every_field(env):
         },
         "mean_service_sec": 4.5,
         "recent_mean_tokens_per_turn": 123.0,
+        "turn_health": {
+            "window_hours": 24,
+            "sample_limit": 1000,
+            "jobs": {
+                "sampled_terminal_jobs": 10,
+                "completed": 8,
+                "failed": 1,
+                "expired": 1,
+                "queue_expired": 1,
+                "lease_expired": 0,
+                "superseded": 0,
+                "failure_rate": 0.1,
+                "expiry_rate": 0.1,
+                "error_or_expiry_rate": 0.2,
+                "pending": 1,
+                "oldest_pending_age_sec": 12.5,
+            },
+            "latency": {"sampled_turns": 10, "p95_ms": 4200.0},
+            "trajectory": {
+                "sampled_jobs": 12,
+                "complete": 10,
+                "partial": 1,
+                "missing": 0,
+                "open": 1,
+                "capture_gap": 1,
+                "complete_rate": 10 / 12,
+            },
+        },
         "prompt_cache": {
             "sampled_turns": 4,
             "model_calls": 5,

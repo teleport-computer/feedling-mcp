@@ -232,6 +232,7 @@ def v2_metrics(
         "runtime_policy": config_store.hosted_runtime_policy_status(),
         "mean_service_sec": jobs_store.recent_mean_service_sec(lane="chat"),
         "recent_mean_tokens_per_turn": jobs_store.recent_mean_tokens_per_turn(lane="chat"),
+        "turn_health": jobs_store.recent_chat_operational_health(),
         "prompt_cache": jobs_store.recent_prompt_cache_stats(
             lane="chat",
             provider=cache_provider,

@@ -27,7 +27,13 @@ def test_capture_submit_enqueues_a_capture_agent_job(monkeypatch):
                         lambda u, lane, **kw: calls.append((u, lane)) or ("j1", False))
     monkeypatch.setattr("proactive.capture_scheduler.tick_quiet_capture",
                         lambda store, *, now=None, submit=None:
-                            submit(store, trigger="quiet_timeout", now=0.0))
+                            submit(
+                                store,
+                                trigger="quiet_timeout",
+                                now=0.0,
+                                window={"after_seq": 0, "through_seq": 1},
+                                capture_key="capture:test",
+                            ))
     assert serve_worker._tick_capture_for_user("u_cap") == 1
     assert calls == [("u_cap", "capture")]
 

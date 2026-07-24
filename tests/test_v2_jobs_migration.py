@@ -195,8 +195,8 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0048_v2_turn_metrics_user_fk").down_revision == (
         "0047_model_route_context_window"
     )
-    # 0052 restores the V1 supervisor tables 0045 dropped (dual-runtime
-    # coexistence) and chains linearly off 0051.
+    # pre chain: 0052 restores the V1 supervisor tables 0045 dropped
+    # (dual-runtime coexistence) and chains linearly off 0051.
     assert script.get_revision("0052_dual_runtime_coexistence").down_revision == (
         "0051_web_settings_backfill"
     )
@@ -211,7 +211,23 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
         "0052_dual_runtime_coexistence",
         "0023_redistill_job_exclusivity",
     }
-    assert script.get_current_head() == "0053_merge_redistill_v2"
+    # Runtime-V2 lifecycle-closure chain, branched off the same 0049 ancestor.
+    assert script.get_revision("0050_v2_trajectory_access_audit").down_revision == (
+        "0049_merge_test_pre_heads"
+    )
+    assert script.get_revision("0051_v2_capture_batches").down_revision == (
+        "0050_v2_trajectory_access_audit"
+    )
+    assert script.get_revision("0052_chat_clear_archive").down_revision == (
+        "0051_v2_capture_batches"
+    )
+    # 0054 is the no-op merge rejoining the pre head (0053) and the
+    # lifecycle-closure head (0052_chat_clear_archive) into a single head.
+    assert set(script.get_revision("0054_merge_pre_v2_heads").down_revision) == {
+        "0053_merge_redistill_v2",
+        "0052_chat_clear_archive",
+    }
+    assert script.get_current_head() == "0054_merge_pre_v2_heads"
 
 
 def test_0046_segmented_summary_schema_is_immutable_and_head_is_bound():

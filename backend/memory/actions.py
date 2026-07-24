@@ -535,38 +535,45 @@ def _memory_retype_action(store: UserStore, action: dict) -> tuple[dict, list[di
         return {"status": "error", "error": "memory_id_required", "action": "memory.retype"}, [], 400
     if new_type not in memory_service.MEMORY_TYPES:
         return {"status": "error", "error": "type_invalid", "got": new_type, "allowed": list(memory_service.MEMORY_TYPES), "action": "memory.retype"}, [], 400
-    moments = memory_service._load_moments(store)
-    idx = next((i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == memory_id), None)
-    if idx is None:
-        return {"status": "error", "error": "not_found", "action": "memory.retype"}, [], 404
-    target = dict(moments[idx])
-    if target.get("owner_user_id") != store.user_id:
-        return {"status": "error", "error": "not_owned", "action": "memory.retype"}, [], 403
     anchor_ids = action.get("anchor_memory_ids") or []
-    ok, err = _memory_validate_write(store, moments, mem_type=new_type, anchor_ids=anchor_ids, memory_id=memory_id, enforce_reflection_cap=False)
-    if not ok:
-        return {"status": "error", **(err or {}), "action": "memory.retype"}, [], 400
-    old_type = target.get("type", "")
-    if old_type == new_type and anchor_ids == (target.get("anchor_memory_ids") or []):
-        return {"status": "ok", "action": "memory.retype", "changed_fields": [], "noop": True}, [], 200
-    target["type"] = new_type
-    target["updated_at"] = core_util._now_iso()
-    target["retyped_at"] = target["updated_at"]
-    if anchor_ids:
-        target["anchor_memory_ids"] = list(anchor_ids)
-    else:
-        target.pop("anchor_memory_ids", None)
-    # Re-read + re-find + replace-by-id + save under one memory_lock hold so a
-    # concurrent same-user write can't lost-update.
+    # Every target-dependent decision belongs under the cross-process Memory
+    # Garden mutation fence.  In particular, do not construct ``target`` from
+    # an optimistic pre-fence read and then drop it into a freshly loaded
+    # Garden: Capture may have re-encrypted or superseded that card while this
+    # request waited, and replacing it with the stale dict would silently erase
+    # the fresh envelope/status fields.
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
-        fresh_idx = next(
+        idx = next(
             (i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == memory_id),
             None,
         )
-        if fresh_idx is None:
+        if idx is None:
             return {"status": "error", "error": "not_found", "action": "memory.retype"}, [], 404
-        moments[fresh_idx] = target
+        target = dict(moments[idx])
+        if target.get("owner_user_id") != store.user_id:
+            return {"status": "error", "error": "not_owned", "action": "memory.retype"}, [], 403
+        ok, err = _memory_validate_write(
+            store,
+            moments,
+            mem_type=new_type,
+            anchor_ids=anchor_ids,
+            memory_id=memory_id,
+            enforce_reflection_cap=False,
+        )
+        if not ok:
+            return {"status": "error", **(err or {}), "action": "memory.retype"}, [], 400
+        old_type = target.get("type", "")
+        if old_type == new_type and anchor_ids == (target.get("anchor_memory_ids") or []):
+            return {"status": "ok", "action": "memory.retype", "changed_fields": [], "noop": True}, [], 200
+        target["type"] = new_type
+        target["updated_at"] = core_util._now_iso()
+        target["retyped_at"] = target["updated_at"]
+        if anchor_ids:
+            target["anchor_memory_ids"] = list(anchor_ids)
+        else:
+            target.pop("anchor_memory_ids", None)
+        moments[idx] = target
         memory_service._save_moments(store, moments)
     change = memory_service._append_memory_change(store, {
         "action": "retype",

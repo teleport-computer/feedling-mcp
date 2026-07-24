@@ -2,7 +2,8 @@
 
 > **Tool-level companion matrix.** This page maps the executable capability
 > vocabulary to its framework-neutral facades. For current end-to-end runtime
-> status, deferred D items, telemetry-versus-trajectory scope, and deployment
+> status, explicit scope decisions and optional operational lanes,
+> telemetry-versus-trajectory scope, and deployment
 > state, use [`docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md`](../../HOSTED_RUNTIME_V2_PARITY_MATRIX.md).
 > For operational rollout gates use
 > [`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`](../../../deploy/HOSTED_RUNTIME_V2_ROLLOUT.md).

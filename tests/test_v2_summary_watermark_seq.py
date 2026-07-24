@@ -119,6 +119,7 @@ def test_migration_head_and_watermark_seq_column():
     assert script.get_revision("0048_v2_turn_metrics_user_fk").down_revision == (
         "0047_model_route_context_window"
     )
+    # pre chain off 0049.
     assert script.get_revision("0050_v2_web_halted_columns").down_revision == (
         "0049_merge_test_pre_heads"
     )
@@ -130,7 +131,17 @@ def test_migration_head_and_watermark_seq_column():
     assert script.get_revision("0052_dual_runtime_coexistence").down_revision == (
         "0051_web_settings_backfill"
     )
-    assert script.get_current_head() == "0053_merge_redistill_v2"
+    # Runtime-V2 lifecycle-closure chain off the same 0049 ancestor.
+    assert script.get_revision("0050_v2_trajectory_access_audit").down_revision == (
+        "0049_merge_test_pre_heads"
+    )
+    assert script.get_revision("0051_v2_capture_batches").down_revision == (
+        "0050_v2_trajectory_access_audit"
+    )
+    assert script.get_revision("0052_chat_clear_archive").down_revision == (
+        "0051_v2_capture_batches"
+    )
+    assert script.get_current_head() == "0054_merge_pre_v2_heads"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"
     )

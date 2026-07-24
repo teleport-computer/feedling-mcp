@@ -135,8 +135,10 @@ for _mod_name in _ASGI_PACKAGES:
 from admin import data_track as _admin_data_track  # noqa: E402
 from hosted import onboarding_validation as _hosted_onboarding_validation  # noqa: E402
 from identity import service as _identity_service  # noqa: E402
+from model_api_runtime.v2 import jobs_store as _v2_jobs_store  # noqa: E402
 from push import live_activity as _push_live_activity  # noqa: E402
 
 _push_live_activity.load_identity = _identity_service._load_identity
 _admin_data_track._latest_history_import_job = _hosted_onboarding_validation._latest_history_import_job
 _admin_data_track._onboarding_validation_payload = _hosted_onboarding_validation._onboarding_validation_payload
+_admin_data_track._runtime_token_usage_summary = _v2_jobs_store.recent_token_usage_summary

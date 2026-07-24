@@ -87,6 +87,11 @@ output path. User filenames, MIME types, and model content are never appended
 to that extractor command. `FEEDLING_V2_E2B_ALLOW_INTERNET=1` is an explicit
 deployment-level opt-in, not a model option.
 
+The materialization and extractor defaults both match the iOS upload ceiling of
+25 MiB (26,214,400 bytes). The extractor limit is part of the content-addressed
+template digest, so changing it requires rebuilding and deploying the new
+template tag rather than mutating an existing alias.
+
 The repository's older resident `container` strategy is not a usable adapter,
 and the old memory-sandbox compose is a local backend+enclave validation stack,
 not an artifact execution API. When the sandbox provider is disabled,
@@ -110,6 +115,16 @@ The current model-facing catalog exposes artifact/workspace operations but not a
 generic shell or arbitrary code-execution tool. The shell/code bullets above
 define the mandatory sandbox boundary if those tools are added later; they do
 not claim that arbitrary execution is already available.
+
+The sandbox lifecycle itself should not be a generic model-managed tool. Future
+model-visible capabilities should be named for the operation (`run_code`,
+`shell`, `transform_image`, or artifact extraction). The runtime broker acquires
+one `SandboxProvider` session on the first risky capability call, reuses it only
+within that bounded turn/task, and closes it at the deadline. It materializes
+only explicitly referenced encrypted artifacts, exposes no host mounts or
+ambient secrets, defaults network egress off, and re-ingests outputs into the
+encrypted VFS. Usage/billing follows the provider-session lifetime rather than
+charging text-only turns.
 
 ## Bounded subagents
 

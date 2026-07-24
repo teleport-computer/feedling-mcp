@@ -42,6 +42,28 @@ def _invalidate() -> None:
         _cached_at = 0.0
 
 
+def _read_turns_halted(*, default_on_error: bool) -> bool:
+    """Read the control row and refresh this process's cached observation."""
+    global _cached_value, _cached_at
+    try:
+        with db.get_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT turns_halted FROM v2_runtime_control WHERE id=1")
+                row = cur.fetchone()
+                value = bool(row[0]) if row else False
+    except Exception as exc:  # noqa: BLE001 — callers choose fail-open/closed
+        log.warning(
+            "[v2.kill_switch] turns_halted read failed, default_on_error=%s: %s",
+            default_on_error,
+            exc,
+        )
+        return default_on_error
+    with _cache_lock:
+        _cached_value = value
+        _cached_at = time.monotonic()
+    return value
+
+
 def turns_halted(default_on_error: bool = False) -> bool:
     """True iff V2 turns are currently halted. Cached ~`_CACHE_TTL_SEC` seconds.
 
@@ -55,20 +77,18 @@ def turns_halted(default_on_error: bool = False) -> bool:
     with _cache_lock:
         if _cached_value is not None and (now - _cached_at) < _CACHE_TTL_SEC:
             return _cached_value
-    try:
-        with db.get_pool().connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT turns_halted FROM v2_runtime_control WHERE id=1")
-                row = cur.fetchone()
-                value = bool(row[0]) if row else False
-    except Exception as exc:  # noqa: BLE001 — control-plane read must never raise into callers
-        log.warning("[v2.kill_switch] turns_halted read failed, default_on_error=%s: %s",
-                    default_on_error, exc)
-        return default_on_error
-    with _cache_lock:
-        _cached_value = value
-        _cached_at = now
-    return value
+    return _read_turns_halted(default_on_error=default_on_error)
+
+
+def turns_halted_uncached(default_on_error: bool = False) -> bool:
+    """Read the live row without accepting the two-second process cache.
+
+    Long-running Capture work uses this at disclosure and mutation boundaries.
+    A cached ``False`` is suitable for high-frequency admission/slot polling,
+    but it is not an emergency fence once decrypted conversation content is
+    about to leave the enclave or a prepared batch is about to mutate Memory.
+    """
+    return _read_turns_halted(default_on_error=default_on_error)
 
 
 # ---------------------------------------------------------------- web tools

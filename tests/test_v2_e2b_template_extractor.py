@@ -62,6 +62,10 @@ def test_binary_and_oversized_archive_fail_closed() -> None:
         extractor.MAX_ZIP_TOTAL_BYTES = original
 
 
+def test_input_limit_matches_ios_25_mib() -> None:
+    assert extractor.MAX_INPUT_BYTES == 25 * 1024 * 1024
+
+
 def test_output_is_bounded() -> None:
     value = extractor.extract_artifact(
         b"x" * (extractor.MAX_OUTPUT_CHARS + 100),
@@ -69,4 +73,3 @@ def test_output_is_bounded() -> None:
         mime_type="text/plain",
     )
     assert len(value) == extractor.MAX_OUTPUT_CHARS
-
