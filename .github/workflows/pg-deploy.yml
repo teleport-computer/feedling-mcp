@@ -69,7 +69,12 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # feedling-postgres 这个 package 当初是本地手工 docker push 建的、从没关联
+          # 本仓，GITHUB_TOKEN 推它会 `denied: permission_denied: write_package`。
+          # 镜像已带 org.opencontainers.image.source label，用一把有 write:packages
+          # 的 PAT 推成功一次之后 GHCR 会把 package 关联回本仓；届时删掉 GHCR_PAT
+          # 这个 secret，下面就自动回落到 GITHUB_TOKEN，不留长期个人凭证依赖。
+          password: ${{ secrets.GHCR_PAT != '' && secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
       - name: Derive lowercase owner   # ghcr rejects mixed-case image paths (see docker-publish.yml)
         id: owner
         run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
