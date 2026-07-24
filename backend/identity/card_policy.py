@@ -156,6 +156,13 @@ def validate_profile_patch(patch: dict) -> tuple[bool, str]:
             return (False, "user_preferred_name_empty")
         if sanitize_user_name(name) == "TA":
             return (False, "user_preferred_name_is_reserved")
+    if "relationship_days" in patch:
+        # Not a stored string/list profile field — the write path converts it to a
+        # relationship_started_at anchor (see identity/actions.py). Guard the shape
+        # here so a malformed value 400s BEFORE the lock, same as the other fields.
+        days = patch.get("relationship_days")
+        if isinstance(days, bool) or not isinstance(days, int) or days < 0:
+            return (False, "relationship_days_must_be_non_negative_int")
     if "dimensions" in patch:
         return validate_dimensions_structure(patch.get("dimensions"))
     return _OK

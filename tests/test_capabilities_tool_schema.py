@@ -92,6 +92,18 @@ def test_identity_patch_validator_still_rejects_empty_calls():
     assert tool_schema.validate_tool_args("identity_patch", {"agent_name": "   "}) is not None
 
 
+def test_identity_patch_advertises_and_accepts_relationship_days():
+    # The model can only recalibrate the day count if the tool description says how.
+    spec = next(s for s in tool_schema.build_tool_specs() if s.name == "identity_patch")
+    assert "relationship_days" in spec.description
+    # relationship_days inside the open `patch` object validates through the gate,
+    # including the 0 edge ("we met today") which must NOT read as an empty patch.
+    assert tool_schema.validate_tool_args(
+        "identity_patch", {"patch": {"relationship_days": 300}}) is None
+    assert tool_schema.validate_tool_args(
+        "identity_patch", {"patch": {"relationship_days": 0}}) is None
+
+
 def test_all_model_facing_tools_reject_unknown_top_level_fields():
     for spec in tool_schema.build_tool_specs():
         assert spec.parameters["additionalProperties"] is False, spec.name

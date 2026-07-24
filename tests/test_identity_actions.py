@@ -1000,3 +1000,178 @@ def test_proactive_settings_wake_directive_validation(client):
     assert "bogus_key" not in saved                      # unknown keys rejected
     assert store.load_proactive_settings()["wake_directive"] == "x" * 1000
     assert store.load_proactive_settings()["wake_interval_sec"] == 900
+
+
+def test_profile_patch_relationship_days_sets_calibrated_anchor(client, monkeypatch):
+    # relationship_days in the patch converts to a relationship_started_at anchor,
+    # rides the SAME CAS write as any other profile_patch field, stamps
+    # source=user_calibrated, and reads back as the requested day count.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)  # seed anchor: 2026-04-01, source="test"
+    captured_plaintexts: list = []
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={
+            "actions": [{
+                "type": "identity.profile_patch",
+                "patch": {"relationship_days": 300},
+                "reason": "User said we've actually known each other 300 days.",
+            }],
+        },
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["status"] == "ok"
+    assert body["effects"][0]["type"] == "identity_updated"
+    assert body["effects"][0]["fields"] == ["days_with_user"]
+
+    saved = db.get_blob(user_id, "identity")
+    assert saved["relationship_anchor_source"] == "user_calibrated"
+    # Anchor moved off the seeded 2026-04-01, and days_with_user derives to 300.
+    assert saved["relationship_started_at"] != "2026-04-01"
+    assert identity_service._live_days_with_user(
+        saved, store=core_store.get_store(user_id)) == 300
+
+
+def test_profile_patch_relationship_days_with_other_field(client, monkeypatch):
+    # relationship_days co-mutates cleanly with a normal string field in one patch:
+    # the name lands in the encrypted card, the anchor recalibrates, one CAS write.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    captured_plaintexts: list = []
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={
+            "actions": [{
+                "type": "identity.profile_patch",
+                "patch": {"agent_name": "小满", "relationship_days": 100},
+            }],
+        },
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert set(body["effects"][0]["fields"]) == {"agent_name", "days_with_user"}
+    assert captured_plaintexts[-1]["agent_name"] == "小满"
+    saved = db.get_blob(user_id, "identity")
+    assert saved["relationship_anchor_source"] == "user_calibrated"
+    assert identity_service._live_days_with_user(
+        saved, store=core_store.get_store(user_id)) == 100
+
+
+def test_profile_patch_relationship_days_only_leaves_other_fields(client, monkeypatch):
+    # A relationship_days-only patch must not disturb any encrypted profile field —
+    # the re-encrypted plaintext is the untouched existing card.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    captured_plaintexts: list = []
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={
+            "actions": [{
+                "type": "identity.profile_patch",
+                "patch": {"relationship_days": 42},
+            }],
+        },
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    assert captured_plaintexts[-1]["agent_name"] == _plain_identity()["agent_name"]
+    assert captured_plaintexts[-1]["self_introduction"] == _plain_identity()["self_introduction"]
+    saved = db.get_blob(user_id, "identity")
+    assert identity_service._live_days_with_user(
+        saved, store=core_store.get_store(user_id)) == 42
+
+
+def test_profile_patch_relationship_days_zero_accepted(client, monkeypatch):
+    # Edge: 0 days ("we met today") is a legal value, not an empty patch.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    captured_plaintexts: list = []
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{"type": "identity.profile_patch", "patch": {"relationship_days": 0}}]},
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    saved = db.get_blob(user_id, "identity")
+    assert saved["relationship_anchor_source"] == "user_calibrated"
+    assert identity_service._live_days_with_user(
+        saved, store=core_store.get_store(user_id)) == 0
+
+
+def test_profile_patch_relationship_days_rejects_negative(client, monkeypatch):
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{"type": "identity.profile_patch", "patch": {"relationship_days": -5}}]},
+    )
+
+    assert res.status_code == 400, res.get_data(as_text=True)
+    assert res.get_json()["error"] == "relationship_days_must_be_non_negative_int"
+
+
+def test_profile_patch_relationship_days_rejects_non_int(client, monkeypatch):
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{"type": "identity.profile_patch", "patch": {"relationship_days": "300"}}]},
+    )
+
+    assert res.status_code == 400, res.get_data(as_text=True)
+    assert res.get_json()["error"] == "relationship_days_must_be_non_negative_int"

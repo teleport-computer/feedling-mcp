@@ -256,8 +256,11 @@ DESCRIPTIONS: dict[str, str] = {
                        "and list fields signature, boundaries, do_not_say, "
                        "stable_definitions. Edit a list field by whole-list replacement "
                        "or with op keys add_<field>/remove_<field>/replace_<field> "
-                       "(e.g. add_signature, remove_boundaries). Only act on an "
-                       "explicit request."),
+                       "(e.g. add_signature, remove_boundaries). To recalibrate how "
+                       "long you and the user have known each other, put "
+                       "'relationship_days' (a non-negative integer number of days) in "
+                       "the patch — e.g. patch {\"relationship_days\": 300}. Only act on "
+                       "an explicit request."),
     "identity_nudge": ("Adjust ONE of the persona's relationship/personality dimension "
                        "scores by a signed integer 'delta' (|delta| ≤ 10). 'dimension' "
                        "must name a dimension that already exists — call identity_get "
@@ -383,7 +386,15 @@ def validate_tool_args(name: str, args) -> str | None:
         # (see capabilities.identity.merge_patch_fields).
         from capabilities import identity as cap_identity
         merged = cap_identity.merge_patch_fields(args)
-        if not any((v.strip() if isinstance(v, str) else v) for v in merged.values()):
+        # A present non-None value counts as content. `v is not None` (not bool(v))
+        # for non-strings so relationship_days=0 ("we met today") is NOT mistaken
+        # for an empty patch. More permissive than before → safe for the replay
+        # gate this same function guards (it can only newly-ACCEPT, never newly-
+        # reject a legal-when-written effect).
+        if not any(
+            (v.strip() if isinstance(v, str) else v is not None)
+            for v in merged.values()
+        ):
             return "identity_patch requires a non-empty patch or profile field"
     if name == "memory_write":
         actions = args.get("actions") or []

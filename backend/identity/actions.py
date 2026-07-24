@@ -272,6 +272,7 @@ def _save_identity_action_payload(
     existing: dict,
     audit: dict,
     event_type: str,
+    relationship_override: dict | None = None,
 ) -> tuple[dict | None, dict | None, str]:
     # `existing` is a caller-supplied SNAPSHOT of the raw identity blob,
     # taken BEFORE the enclave plaintext read `payload` was merged from (see
@@ -316,9 +317,18 @@ def _save_identity_action_payload(
         # must be listed here or the raw blob overwrite in _save_identity
         # would silently erase it.
         "replaced_at": existing.get("replaced_at", ""),
-        "relationship_started_at": existing.get("relationship_started_at", ""),
-        "relationship_anchor_source": existing.get("relationship_anchor_source", ""),
-        "relationship_anchor_evidence": existing.get("relationship_anchor_evidence", ""),
+        # Relationship anchor: carried forward from `existing` UNLESS this patch
+        # recalibrated it (profile_patch with relationship_days — see
+        # _identity_profile_patch). The override is threaded through here so the
+        # anchor rewrite rides the SAME CAS write as every other profile field,
+        # instead of a separate non-CAS _save_identity (which is the residual the
+        # legacy identity.relationship_days_set action still carries).
+        "relationship_started_at": (relationship_override or {}).get(
+            "relationship_started_at", existing.get("relationship_started_at", "")),
+        "relationship_anchor_source": (relationship_override or {}).get(
+            "relationship_anchor_source", existing.get("relationship_anchor_source", "")),
+        "relationship_anchor_evidence": (relationship_override or {}).get(
+            "relationship_anchor_evidence", existing.get("relationship_anchor_evidence", "")),
     }
     if envelope.get("K_enclave"):
         identity["K_enclave"] = envelope["K_enclave"]
@@ -644,6 +654,47 @@ def _identity_profile_patch(
                     audit_old = ", ".join(old_values)[:120]
                     audit_new = ", ".join(values)[:120]
 
+        # relationship_days: NOT a stored profile field. days_with_user is always
+        # DERIVED from the relationship_started_at anchor (see
+        # identity_service._live_days_with_user), so "set the day count to N" means
+        # "move the anchor to today-N days". We translate here and thread the new
+        # anchor through _save_identity_action_payload's relationship_override so it
+        # rides the SAME CAS write as the rest of this patch — making identity_patch
+        # the CAS-safe canonical path for recalibration (the legacy
+        # identity.relationship_days_set action still uses a non-CAS _save_identity;
+        # left intact for the VPS path, but avoid it here). Only applies to an
+        # existing card; on the bootstrap-create branch the anchor is stamped by
+        # _create_identity_action_payload and relationship_days is ignored.
+        relationship_override = None
+        if "relationship_days" in patch and not bootstrap and existing is not None:
+            raw_days = patch.get("relationship_days")
+            if isinstance(raw_days, bool) or not isinstance(raw_days, int) or raw_days < 0:
+                return {"status": "error", "error": "relationship_days_must_be_non_negative_int",
+                        "action": "identity.profile_patch"}, [], 400
+            new_started_at = identity_service._anchor_from_days(raw_days)
+            old_started_at = str(existing.get("relationship_started_at") or "")
+            old_source = str(existing.get("relationship_anchor_source") or "")
+            # Idempotent: re-setting the same day count on the same calendar day
+            # yields the same anchor, so it's a no-op unless the anchor date OR the
+            # source (was it explicitly user-calibrated?) actually changes.
+            if new_started_at != old_started_at or old_source != "user_calibrated":
+                evidence = _identity_action_text(
+                    action.get("relationship_anchor_evidence")
+                    or action.get("reason")
+                    or existing.get("relationship_anchor_evidence")
+                    or "Relationship day count recalibrated via profile_patch.",
+                    500,
+                )
+                relationship_override = {
+                    "relationship_started_at": new_started_at,
+                    "relationship_anchor_source": "user_calibrated",
+                    "relationship_anchor_evidence": evidence,
+                }
+                changed.append("days_with_user")
+                if not audit_old and not audit_new:
+                    audit_old = str(identity_service._live_days_with_user(existing, store=store))
+                    audit_new = str(raw_days)
+
         if not changed:
             if bootstrap:
                 # A non-empty patch that resolves to zero writable fields against
@@ -685,6 +736,7 @@ def _identity_profile_patch(
                 existing=existing,
                 audit=audit,
                 event_type="identity_action_profile_patch",
+                relationship_override=relationship_override,
             )
         if identity is None:
             return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409
