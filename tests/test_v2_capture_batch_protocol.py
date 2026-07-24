@@ -1660,3 +1660,59 @@ def test_extraction_execution_kill_switches_fail_direct_jobs(
         assert conn.execute(
             "SELECT status,last_error FROM agent_jobs WHERE id=%s", (job_id,)
         ).fetchone() == ("failed", error)
+
+
+def test_delete_user_succeeds_with_applied_capture_batch():
+    """Account deletion stays safe with an applied capture batch present.
+
+    The reliably-broken path (before 0055) is an independent ``agent_jobs``
+    deletion — see ``test_applied_batch_survives_apply_job_deletion_as_null``.
+    Whether the ``DELETE FROM users`` cascade also trips the CHECK depends on the
+    order PostgreSQL fires the ``users -> agent_jobs`` (SET NULL) vs
+    ``users -> v2_capture_batches`` (delete) cascades, which is version/OID
+    dependent. This asserts deletion stays order-independently safe after 0055.
+    """
+    uid = "u_capture_applied_delete"
+    _seed(uid)
+    job_id, _job = _running(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_capture_batches "
+            "(user_id,runtime_generation,after_seq,through_seq,until_message_id,"
+            "actions_json,action_count,status,applied_by_job_id,applied_at) "
+            "VALUES (%s,1,0,1,'m1','[]'::jsonb,0,'applied',%s,now())",
+            (uid, job_id),
+        )
+    # Must not raise. Before 0055 this aborted with a ck_v2_capture_batch_applied_shape
+    # violation the moment the agent_jobs cascade nulled applied_by_job_id.
+    db.delete_user(uid)
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM users WHERE user_id=%s", (uid,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT count(*) FROM v2_capture_batches WHERE user_id=%s", (uid,)
+        ).fetchone()[0] == 0
+
+
+def test_applied_batch_survives_apply_job_deletion_as_null():
+    """The apply job can be GC'd independently; the applied row stays valid."""
+    uid = "u_capture_applied_job_gc"
+    _seed(uid)
+    job_id, _job = _running(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_capture_batches "
+            "(user_id,runtime_generation,after_seq,through_seq,until_message_id,"
+            "actions_json,action_count,status,applied_by_job_id,applied_at) "
+            "VALUES (%s,1,0,1,'m1','[]'::jsonb,0,'applied',%s,now())",
+            (uid, job_id),
+        )
+        # Deleting just the apply job must SET NULL without tripping the CHECK.
+        conn.execute("DELETE FROM agent_jobs WHERE id=%s", (job_id,))
+        row = conn.execute(
+            "SELECT status, applied_by_job_id, applied_at IS NOT NULL AS has_ts "
+            "FROM v2_capture_batches WHERE user_id=%s",
+            (uid,),
+        ).fetchone()
+    assert row[0] == "applied" and row[1] is None and row[2] is True

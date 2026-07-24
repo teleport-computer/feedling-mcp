@@ -141,7 +141,10 @@ def test_migration_head_and_watermark_seq_column():
     assert script.get_revision("0052_chat_clear_archive").down_revision == (
         "0051_v2_capture_batches"
     )
-    assert script.get_current_head() == "0054_merge_pre_v2_heads"
+    assert script.get_revision("0055_capture_applied_check").down_revision == (
+        "0054_merge_pre_v2_heads"
+    )
+    assert script.get_current_head() == "0055_capture_applied_check"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"
     )

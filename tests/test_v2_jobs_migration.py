@@ -227,7 +227,10 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
         "0053_merge_redistill_v2",
         "0052_chat_clear_archive",
     }
-    assert script.get_current_head() == "0054_merge_pre_v2_heads"
+    assert script.get_revision("0055_capture_applied_check").down_revision == (
+        "0054_merge_pre_v2_heads"
+    )
+    assert script.get_current_head() == "0055_capture_applied_check"
 
 
 def test_0046_segmented_summary_schema_is_immutable_and_head_is_bound():
