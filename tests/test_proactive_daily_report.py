@@ -312,9 +312,30 @@ def test_daily_payload_carries_v2_heartbeat_column(monkeypatch):
     assert by_day["2026-07-25"]["v2_heartbeat"] == 3
     # 行序:天倒序,V2-only 天排最前
     assert payload["rows"][0]["day"] == "2026-07-25"
+    # V2-only 最新天不得把顶部 metric 拉成假 0%
+    assert payload["summary"]["latest_has_legacy"] is False
+    assert payload["summary"]["total_v2_heartbeat"] == 10
 
     html_page = data_track._render_proactive_daily_page(payload)
     assert "V2心跳" in html_page
+    # codex review (b) P1:V2-only 健康天曾被渲染成红 0% 假告警——
+    # 现在成功率格显 —,顶部"最近一天成功率"显 N/A,而不是 0%。
+    assert ">N/A<" in html_page
+    first_row = html_page.split("<tbody>")[1].split("</tr>")[0]
+    assert "0%" not in first_row, "V2-only day must not render a red 0% success"
+    assert "—" in first_row
+
+
+def test_agent_jobs_heartbeat_history_index_exists():
+    """0056 迁移:agent_jobs 心跳历史 partial index——没有它,admin 页每次
+    加载对 append-only 的 agent_jobs 全表扫两遍(codex review (b) P1)。"""
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE tablename = 'agent_jobs' AND indexname = 'ix_agent_jobs_hb_history'"
+        ).fetchone()
+    assert row is not None, "ix_agent_jobs_hb_history missing (0056 migration)"
+    assert "lane = 'heartbeat'" in row[0]
 
 
 def test_daily_payload_merges_kinds_and_overspeed(monkeypatch):

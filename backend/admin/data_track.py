@@ -1823,13 +1823,22 @@ def _data_track_proactive_daily_payload() -> dict:
         "days_returned": len(out_rows),
         "latest_day": latest.get("day", ""),
         "latest_success_rate": latest.get("success_rate", 0.0),
+        # 最新天可能是 V2-only 合成行(legacy 分母为 0)——顶部 metric 用这个
+        # flag 显示 N/A 而不是假 0%(codex review (b))。
+        "latest_has_legacy": bool(
+            int(latest.get("delivered") or 0) + int(latest.get("completed") or 0)
+            + int(latest.get("failed") or 0)
+        ),
         "total_jobs": tot_jobs,
         "total_delivered": tot_deliv,
         "total_completed": tot_completed,
         "total_failed": tot_fail,
         "total_maintenance": tot_maint,
         "total_maintenance_failed": tot_maint_fail,
+        "total_v2_heartbeat": sum(int(r.get("v2_heartbeat") or 0) for r in out_rows),
+        "total_v2_heartbeat_failed": sum(int(r.get("v2_heartbeat_failed") or 0) for r in out_rows),
         "overall_success_rate": ((tot_deliv + tot_completed) / tot_resolved) if tot_resolved else 0.0,
+        "overall_has_legacy": bool(tot_resolved),
     }
     return {
         "summary": summary,
@@ -2509,6 +2518,19 @@ def _render_proactive_daily_page(payload: dict) -> str:
     for row in rows:
         sr = float(row.get("success_rate") or 0.0)
         sr_cls = "ok" if sr >= 0.7 else ("warn" if sr >= 0.4 else "bad")
+        # legacy wake lane 当天无已结 job(V2-only 天 / 空天)→ 成功率无分母,
+        # 显示 — 而不是红 0%:那不是故障,是"这条口径当天没有样本"
+        # (codex review (b):合成 V2-only 行曾被渲染成假红色告警)。
+        legacy_resolved = (int(row.get("delivered") or 0)
+                           + int(row.get("completed") or 0)
+                           + int(row.get("failed") or 0))
+        if legacy_resolved:
+            sr_cell = (
+                f"<td><b class='{sr_cls}'>{sr*100:.0f}%</b>"
+                f"<div class='fn-bar'><span class='{sr_cls}' style='width:{sr*100:.0f}%'></span></div></td>"
+            )
+        else:
+            sr_cell = "<td><span class='muted'>—</span></td>"
         overspeed = row.get("overspeed_users") or []
         # 超速哨兵:任何用户当天心跳 > 其 wake_interval 物理上限 → 标红。
         # 出现即频率闸失效的直接信号,别等人肉挖(2026-07-22 教训)。
@@ -2531,8 +2553,7 @@ def _render_proactive_daily_page(payload: dict) -> str:
             f"<td>{int(row.get('failed') or 0)}</td>"
             f"<td>{int(row.get('skipped') or 0)}</td>"
             f"<td>{int(row.get('pending') or 0)}</td>"
-            f"<td><b class='{sr_cls}'>{sr*100:.0f}%</b>"
-            f"<div class='fn-bar'><span class='{sr_cls}' style='width:{sr*100:.0f}%'></span></div></td>"
+            + sr_cell +
             f"<td>{int(row.get('maintenance') or 0)}(f{int(row.get('maintenance_failed') or 0)})</td>"
             f"<td>{int(row.get('heartbeat') or 0)}</td>"
             f"<td>{int(row.get('heartbeat_throttled') or 0)}</td>"
@@ -2571,13 +2592,24 @@ def _render_proactive_daily_page(payload: dict) -> str:
         + ("".join(kind_rows_html) or "<tr><td colspan='16' class='muted'>无数据。</td></tr>")
         + "</tbody></table>"
     ) if rows else ""
+    # 成功率口径只覆盖 V1 legacy wake lane;分母为 0(V2-only 窗口/空窗口)时
+    # 显示 N/A 而非假 0%。V2 心跳单独一格(它有自己的 completed/failed 口径)。
+    overall_sr = (
+        f"{summary['overall_success_rate']*100:.0f}%"
+        if summary.get("overall_has_legacy", True) else "N/A"
+    )
+    latest_sr = (
+        f"{summary['latest_success_rate']*100:.0f}%"
+        if summary.get("latest_has_legacy", True) else "N/A"
+    )
     metrics = "".join([
-        _render_metric("整体成功率 (wake 投递+完成/已结)", f"{summary['overall_success_rate']*100:.0f}%"),
-        _render_metric("最近一天成功率", f"{summary['latest_success_rate']*100:.0f}%"),
+        _render_metric("整体成功率 (V1 wake 投递+完成/已结)", overall_sr),
+        _render_metric("最近一天成功率 (V1)", latest_sr),
         _render_metric("最近一天", summary.get("latest_day") or "n/a"),
-        _render_metric("总 jobs", summary["total_jobs"]),
-        _render_metric("投递+完成 / 失败", f"{summary['total_delivered']}+{summary.get('total_completed', 0)} / {summary['total_failed']}"),
+        _render_metric("总 jobs (V1)", summary["total_jobs"]),
+        _render_metric("投递+完成 / 失败 (V1)", f"{summary['total_delivered']}+{summary.get('total_completed', 0)} / {summary['total_failed']}"),
         _render_metric("维护 / 失败", f"{summary.get('total_maintenance', 0)} / {summary.get('total_maintenance_failed', 0)}"),
+        _render_metric("V2 心跳 / 失败+过期", f"{summary.get('total_v2_heartbeat', 0)} / {summary.get('total_v2_heartbeat_failed', 0)}"),
     ])
     return f"""<!doctype html>
 <html>
