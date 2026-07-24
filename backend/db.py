@@ -1919,17 +1919,21 @@ def admin_proactive_heartbeat_overspeed(*, since_epoch: float = 0.0, days: int =
     +1 容差(重启/日界的首 tick)。任何用户超上限 = 频率闸失效的直接信号
     (2026-07-22:中位 68/天 vs 默认上限 12,靠人肉挖了半天——这个哨兵让它
     自己跳出来)。返回 {day: [{user_id, heartbeats, interval_sec, cap}, ...]},
-    仅含超速用户,按超速幅度降序。"""
+    仅含超速用户,按超速幅度降序。
+
+    两个来源 UNION:legacy V1(user_logs stream='proactive_jobs',consumer tick
+    经 gate)+ Runtime V2(agent_jobs lane='heartbeat',serve-worker 调度器
+    enqueue)。V2 被 gate block 时不落 job 行,所以 V2 侧天然全是 admitted,
+    无需 throttled 排除;dual 共存下用户切换 runtime 也不会脱离监控。"""
     day_limit = max(1, min(int(days or 7), 60))
     since = float(since_epoch or 0.0)
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
                 """
-                WITH hb AS (
+                WITH hb_raw AS (
                     SELECT user_id,
-                           to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
-                           COUNT(*)::int AS heartbeats
+                           to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day
                     FROM user_logs
                     WHERE stream = 'proactive_jobs'
                       AND ts IS NOT NULL
@@ -1949,6 +1953,20 @@ def admin_proactive_heartbeat_overspeed(*, since_epoch: float = 0.0, days: int =
                       -- 与「出现即闸失效」的页面语义正好相反(codex review ④)。
                       AND NOT (COALESCE(doc->>'status','') = 'skipped'
                                AND COALESCE(doc->>'status_reason','') = 'heartbeat_throttled')
+
+                    UNION ALL
+
+                    -- Runtime V2 pooled worker heartbeats (blocked wakes never
+                    -- enqueue, so every row here is admitted by definition).
+                    SELECT user_id,
+                           to_char(created_at AT TIME ZONE %s, 'YYYY-MM-DD') AS day
+                    FROM agent_jobs
+                    WHERE lane = 'heartbeat'
+                      AND (%s = 0 OR created_at >= to_timestamp(%s))
+                ),
+                hb AS (
+                    SELECT user_id, day, COUNT(*)::int AS heartbeats
+                    FROM hb_raw
                     GROUP BY user_id, day
                 ),
                 intervals AS (
@@ -1968,7 +1986,7 @@ def admin_proactive_heartbeat_overspeed(*, since_epoch: float = 0.0, days: int =
                 WHERE hb.heartbeats > (86400 / COALESCE(i.interval_sec, 7200)) + 1
                 ORDER BY hb.day DESC, (hb.heartbeats::float / GREATEST(1, 86400 / COALESCE(i.interval_sec, 7200))) DESC
                 """,
-                (tz, since, since),
+                (tz, since, since, tz, since, since),
             ).fetchall()
         out: dict[str, list[dict]] = {}
         for day, user_id, heartbeats, interval_sec, cap in rows:
@@ -1981,6 +1999,45 @@ def admin_proactive_heartbeat_overspeed(*, since_epoch: float = 0.0, days: int =
         return out
     except Exception as e:
         log.error("[db] admin_proactive_heartbeat_overspeed failed: %s", e)
+        return {}
+
+
+def admin_v2_heartbeat_daily(*, since_epoch: float = 0.0, days: int = 30,
+                             tz: str = "Asia/Shanghai") -> dict[str, dict]:
+    """Runtime V2 心跳日聚合:{day: {jobs, completed, failed, expired}}。
+
+    V2 唤醒走 agent_jobs(lane='heartbeat'),从不写 legacy proactive_jobs 流
+    ——④日报最初只读旧流,V2 心跳是观测盲区(2026-07-24 Seven 定补)。口径
+    对齐 jobs_store.wake_success_stats:completed=成功(含醒了决定不发声),
+    failed/expired=失败侧;这里按天分桶供日报并列展示。blocked 的 wake 不落
+    行,所以 jobs=当天 admitted 总量。"""
+    day_limit = max(1, min(int(days or 30), 366))
+    since = float(since_epoch or 0.0)
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT to_char(created_at AT TIME ZONE %s, 'YYYY-MM-DD') AS day,
+                       COUNT(*)::int AS jobs,
+                       (COUNT(*) FILTER (WHERE status = 'completed'))::int AS completed,
+                       (COUNT(*) FILTER (WHERE status = 'failed'))::int AS failed,
+                       (COUNT(*) FILTER (WHERE status = 'expired'))::int AS expired
+                FROM agent_jobs
+                WHERE lane = 'heartbeat'
+                  AND (%s = 0 OR created_at >= to_timestamp(%s))
+                GROUP BY day
+                ORDER BY day DESC
+                LIMIT %s
+                """,
+                (tz, since, since, day_limit),
+            ).fetchall()
+        return {
+            r[0]: {"jobs": int(r[1]), "completed": int(r[2]),
+                   "failed": int(r[3]), "expired": int(r[4])}
+            for r in rows
+        }
+    except Exception as e:
+        log.error("[db] admin_v2_heartbeat_daily failed: %s", e)
         return {}
 
 

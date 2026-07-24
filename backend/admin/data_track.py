@@ -1765,7 +1765,14 @@ def _data_track_proactive_daily_payload() -> dict:
     overspeed_by_day = db.admin_proactive_heartbeat_overspeed(
         since_epoch=since_epoch, days=min(days, 14), tz="Asia/Shanghai",
     )
+    # Runtime V2 心跳走 agent_jobs(lane='heartbeat'),从不写 legacy 流——
+    # 单独拉一列并入日报,dual 共存下两个 runtime 的心跳量并排可见
+    # (2026-07-24 Seven 定补的 V2 观测盲区;超速哨兵在 db 层已 UNION 两源)。
+    v2_hb_by_day = db.admin_v2_heartbeat_daily(
+        since_epoch=since_epoch, days=days, tz="Asia/Shanghai",
+    )
     out_rows = []
+    v2_days_seen = set()
     for r in rows:
         delivered = int(r.get("delivered") or 0)
         completed = int(r.get("completed") or 0)
@@ -1776,13 +1783,32 @@ def _data_track_proactive_daily_payload() -> dict:
         ok = delivered + completed
         resolved = ok + failed
         day = str(r.get("day") or "")
+        v2 = v2_hb_by_day.get(day) or {}
+        v2_days_seen.add(day)
         out_rows.append({
             **r,
             "success_rate": (ok / resolved) if resolved else 0.0,
             "fail_rate": (failed / resolved) if resolved else 0.0,
             "kinds": kinds_by_day.get(day, {}),
             "overspeed_users": overspeed_by_day.get(day, []),
+            "v2_heartbeat": int(v2.get("jobs") or 0),
+            "v2_heartbeat_failed": int(v2.get("failed") or 0) + int(v2.get("expired") or 0),
         })
+    # 某天只有 V2 心跳、legacy 流全空(V2 全量后的将来态)也要有行,不静默丢。
+    for day, v2 in sorted(v2_hb_by_day.items(), reverse=True):
+        if day in v2_days_seen:
+            continue
+        out_rows.append({
+            "day": day, "jobs": 0, "delivered": 0, "completed": 0, "failed": 0,
+            "skipped": 0, "pending": 0, "maintenance": 0, "maintenance_failed": 0,
+            "screen": 0, "heartbeat": 0, "heartbeat_throttled": 0,
+            "success_rate": 0.0, "fail_rate": 0.0,
+            "kinds": kinds_by_day.get(day, {}),
+            "overspeed_users": overspeed_by_day.get(day, []),
+            "v2_heartbeat": int(v2.get("jobs") or 0),
+            "v2_heartbeat_failed": int(v2.get("failed") or 0) + int(v2.get("expired") or 0),
+        })
+    out_rows.sort(key=lambda r: str(r.get("day") or ""), reverse=True)
     tot_jobs = sum(int(r.get("jobs") or 0) for r in rows)
     tot_deliv = sum(int(r.get("delivered") or 0) for r in rows)
     tot_completed = sum(int(r.get("completed") or 0) for r in rows)
@@ -2510,6 +2536,10 @@ def _render_proactive_daily_page(payload: dict) -> str:
             f"<td>{int(row.get('maintenance') or 0)}(f{int(row.get('maintenance_failed') or 0)})</td>"
             f"<td>{int(row.get('heartbeat') or 0)}</td>"
             f"<td>{int(row.get('heartbeat_throttled') or 0)}</td>"
+            f"<td>{int(row.get('v2_heartbeat') or 0)}"
+            + (f"<span class='bad'>(f{int(row.get('v2_heartbeat_failed') or 0)})</span>"
+               if int(row.get('v2_heartbeat_failed') or 0) else "")
+            + "</td>"
             f"<td>{int(row.get('screen') or 0)}</td>"
             f"<td>{overspeed_cell}</td>"
             "</tr>"
@@ -2586,11 +2616,11 @@ def _render_proactive_daily_page(payload: dict) -> str:
   <section class="metrics">{metrics}</section>
   <h2>每日主动消息成功率(仅 wake lane)</h2>
   <div class="muted">{html.escape(definition.get("success_rate") or "")} {html.escape(definition.get("lanes") or "")}</div>
-  <div class="muted">限频拦截 = 服务端心跳闸(reason=heartbeat_throttled)拦下的 tick,闸上线前恒 0;超速用户 = 当天心跳 job 数超过其 wake_interval 物理上限(86400/interval+1,默认 2h → 12/天)的用户——<b>出现任何一个都说明频率闸失效,立刻查,别等</b>。</div>
+  <div class="muted">限频拦截 = 服务端心跳闸(reason=heartbeat_throttled)拦下的 tick,闸上线前恒 0;V2心跳 = Runtime V2 pooled worker 的心跳(agent_jobs lane=heartbeat,被 gate 拦的不落行,故全为放行量;(fN)=失败+过期);超速用户 = 当天心跳 job 数(V1+V2 两源合计)超过其 wake_interval 物理上限(86400/interval+1,默认 2h → 12/天)的用户——<b>出现任何一个都说明频率闸失效,立刻查,别等</b>。</div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
   <table>
-    <thead><tr><th>北京日</th><th>Jobs</th><th>投递</th><th>完成</th><th>失败</th><th>Skipped</th><th>Pending</th><th>成功率</th><th>维护(失败)</th><th>心跳</th><th>限频拦截</th><th>屏幕</th><th>超速用户</th></tr></thead>
-    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='13' class='muted'>此区间无 proactive job。</td></tr>"}</tbody>
+    <thead><tr><th>北京日</th><th>Jobs</th><th>投递</th><th>完成</th><th>失败</th><th>Skipped</th><th>Pending</th><th>成功率</th><th>维护(失败)</th><th>心跳</th><th>限频拦截</th><th>V2心跳</th><th>屏幕</th><th>超速用户</th></tr></thead>
+    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='14' class='muted'>此区间无 proactive job。</td></tr>"}</tbody>
   </table>
   {kinds_table}
 </main>

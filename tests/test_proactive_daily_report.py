@@ -231,6 +231,92 @@ def test_heartbeat_overspeed_ignores_throttled_ticks():
     assert flagged[uid]["heartbeats"] == 14  # 5+9 admitted;100 条 throttled 不在内
 
 
+# ---------------------------------------------------------------------------
+# 2026-07-24 (b) Runtime V2 观测补盲:V2 心跳走 agent_jobs(lane='heartbeat'),
+# 从不写 legacy proactive_jobs 流——日报加 V2心跳 列,超速哨兵 UNION 两源。
+# ---------------------------------------------------------------------------
+
+def _v2_hb(user_id: str, *, status: str = "completed", at_epoch: float) -> None:
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO agent_jobs (user_id, lane, status, created_at, finished_at) "
+            "VALUES (%s, 'heartbeat', %s, to_timestamp(%s), to_timestamp(%s))",
+            (user_id, status, at_epoch, at_epoch + 5),
+        )
+
+
+def test_v2_heartbeat_daily_counts_by_beijing_day():
+    uid = "usr_v2_hb_daily"
+    seed_user(uid)
+    _v2_hb(uid, status="completed", at_epoch=_DAY2_EPOCH + 3600)
+    _v2_hb(uid, status="completed", at_epoch=_DAY2_EPOCH + 3700)
+    _v2_hb(uid, status="failed", at_epoch=_DAY2_EPOCH + 3800)
+    _v2_hb(uid, status="expired", at_epoch=_DAY2_EPOCH + 3900)
+
+    out = db.admin_v2_heartbeat_daily(
+        since_epoch=_DAY2_EPOCH, days=366, tz="Asia/Shanghai",
+    )
+    day = out.get("2001-02-02") or {}
+    assert day.get("jobs") == 4
+    assert day.get("completed") == 2
+    assert day.get("failed") == 1
+    assert day.get("expired") == 1
+
+
+def test_overspeed_sentinel_unions_v1_and_v2_sources():
+    """dual 共存:用户在两个 runtime 各产生 cap 内的心跳,合计超 cap 才是
+    真实频率——分开看各自合规、合起来超速,哨兵必须逮到(切 runtime 不脱管)。"""
+    uid = "usr_v2_overspeed_mix"
+    seed_user(uid)  # 默认 interval 7200 → cap 12,+1 容差=13
+    # V1 侧 8 条(cap 内) + V2 侧 8 条(cap 内)= 合计 16 > 13 → 超速
+    for i in range(8):
+        _job2(uid, status="posted", trigger="presence", offset=900 + i)
+    for i in range(8):
+        _v2_hb(uid, status="completed", at_epoch=_DAY2_EPOCH + 5000 + i * 10)
+
+    overspeed = db.admin_proactive_heartbeat_overspeed(
+        since_epoch=_DAY2_EPOCH, days=60, tz="Asia/Shanghai",
+    )
+    flagged = {e["user_id"]: e for e in overspeed.get("2001-02-02") or []}
+    assert uid in flagged
+    assert flagged[uid]["heartbeats"] == 16
+
+
+def test_daily_payload_carries_v2_heartbeat_column(monkeypatch):
+    fake_rows = [{
+        "day": "2026-07-24", "jobs": 50, "delivered": 5, "completed": 5,
+        "failed": 2, "skipped": 3, "pending": 0, "maintenance": 10,
+        "maintenance_failed": 1, "heartbeat": 30, "screen": 0,
+        "heartbeat_throttled": 4,
+    }]
+    monkeypatch.setattr(db, "admin_data_track_proactive_daily", lambda **kw: fake_rows)
+    monkeypatch.setattr(db, "admin_data_track_proactive_kinds", lambda **kw: {})
+    monkeypatch.setattr(db, "admin_proactive_heartbeat_overspeed", lambda **kw: {})
+    monkeypatch.setattr(
+        db, "admin_v2_heartbeat_daily",
+        lambda **kw: {
+            "2026-07-24": {"jobs": 7, "completed": 6, "failed": 1, "expired": 0},
+            # V2-only day (legacy 流全空的将来态) —— 不得被静默丢掉
+            "2026-07-25": {"jobs": 3, "completed": 3, "failed": 0, "expired": 0},
+        },
+    )
+    monkeypatch.setattr(
+        data_track, "_data_track_request_filters",
+        lambda: {"since": "", "since_epoch": 0.0, "days": 30},
+    )
+    payload = data_track._data_track_proactive_daily_payload()
+    by_day = {r["day"]: r for r in payload["rows"]}
+    assert by_day["2026-07-24"]["v2_heartbeat"] == 7
+    assert by_day["2026-07-24"]["v2_heartbeat_failed"] == 1
+    assert "2026-07-25" in by_day, "V2-only day must still produce a row"
+    assert by_day["2026-07-25"]["v2_heartbeat"] == 3
+    # 行序:天倒序,V2-only 天排最前
+    assert payload["rows"][0]["day"] == "2026-07-25"
+
+    html_page = data_track._render_proactive_daily_page(payload)
+    assert "V2心跳" in html_page
+
+
 def test_daily_payload_merges_kinds_and_overspeed(monkeypatch):
     fake_rows = [{
         "day": "2026-07-22", "jobs": 100, "delivered": 10, "completed": 10,
