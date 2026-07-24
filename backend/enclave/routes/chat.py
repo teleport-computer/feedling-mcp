@@ -25,6 +25,14 @@ from enclave.routes._json import json_response_offthread
 
 router = APIRouter()
 
+_THINKING_CORRELATION_FIELDS = (
+    "thinking_conversation_id",
+    "thinking_turn_id",
+    "thinking_assistant_message_id",
+    "thinking_source_id",
+    "thinking_update_seq",
+)
+
 
 def _decrypt_caption(m, authorized_user_id, content_sk, errors):
     """Decrypt the optional caption envelope (user text sent alongside an
@@ -47,6 +55,65 @@ def _decrypt_caption(m, authorized_user_id, content_sk, errors):
     except Exception as e:
         errors.append({"id": m.get("id"), "reason": f"caption_decrypt: {e}"})
         return ""
+
+
+def _decrypt_thinking_summary(m, authorized_user_id, content_sk, errors) -> dict:
+    """Decrypt one bound summary, or fail closed without exposing it."""
+    if m.get("role") not in {"assistant", "agent", "openclaw"}:
+        return {}
+    if not m.get("thinking_body_ct"):
+        return {}
+    if any(
+        m.get(field) is None or str(m.get(field)).strip() == ""
+        for field in _THINKING_CORRELATION_FIELDS
+    ):
+        return {}
+    if str(m.get("thinking_assistant_message_id") or "") != str(m.get("id") or ""):
+        return {}
+    try:
+        update_seq = int(str(m.get("thinking_update_seq")))
+    except (TypeError, ValueError):
+        return {}
+    if update_seq <= 0:
+        return {}
+    if m.get("thinking_visibility") != "shared" or not m.get("thinking_K_enclave"):
+        return {}
+
+    thinking_envelope = {
+        "id": m.get("thinking_id") or m.get("id"),
+        "v": int(m.get("thinking_v", m.get("v", 1)) or m.get("v", 1)),
+        "body_ct": m.get("thinking_body_ct"),
+        "nonce": m.get("thinking_nonce"),
+        "K_enclave": m.get("thinking_K_enclave"),
+        "owner_user_id": (
+            m.get("thinking_owner_user_id") or m.get("owner_user_id")
+        ),
+    }
+    try:
+        summary = envelope.decrypt_envelope(
+            thinking_envelope, authorized_user_id, content_sk
+        ).decode("utf-8", errors="replace").strip()
+    except Exception as exc:
+        errors.append({
+            "id": m.get("id"),
+            "reason": f"thinking_decrypt: {exc}",
+        })
+        return {}
+    if not summary:
+        return {}
+
+    return {
+        "thinking_summary": summary,
+        "thinking_kind": str(m.get("thinking_kind") or ""),
+        "thinking_source": str(m.get("thinking_source") or ""),
+        "thinking_model": str(m.get("thinking_model") or ""),
+        "thinking_native": bool(m.get("thinking_native")),
+        "thinking_conversation_id": str(m["thinking_conversation_id"]),
+        "thinking_turn_id": str(m["thinking_turn_id"]),
+        "thinking_assistant_message_id": str(m["thinking_assistant_message_id"]),
+        "thinking_source_id": str(m["thinking_source_id"]),
+        "thinking_update_seq": update_seq,
+    }
 
 
 def _decrypt_history_items(messages, authorized_user_id, content_sk):
@@ -112,6 +179,9 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
             qmids = m.get("quoted_memory_ids")
             if isinstance(qmids, str) and qmids.strip():
                 entry["quoted_memory_ids"] = qmids.strip()
+            entry.update(
+                _decrypt_thinking_summary(m, authorized_user_id, content_sk, errors)
+            )
             decrypted.append(entry)
             continue
 
@@ -154,6 +224,9 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
                 entry["file_name"] = m.get("file_name") or "file"
             else:
                 entry["content"] = plaintext.decode("utf-8", errors="replace")
+            entry.update(
+                _decrypt_thinking_summary(m, authorized_user_id, content_sk, errors)
+            )
             decrypted.append(entry)
         except envelope.DecryptFailure as e:
             # Surface the failure per-item so the agent sees partial

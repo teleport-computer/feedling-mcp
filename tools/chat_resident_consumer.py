@@ -90,6 +90,7 @@ import base64
 from collections import namedtuple
 from dataclasses import dataclass, field
 import hashlib
+import inspect
 import io
 import json
 import logging
@@ -167,6 +168,9 @@ class AgentTurn:
     thinking_source: str = ""
     thinking_model: str = ""
     thinking_native: bool | None = None
+    thinking_conversation_id: str = ""
+    thinking_turn_id: str = ""
+    thinking_source_id: str = ""
     actions: list[dict] = field(default_factory=list)
     runtime_debug: dict = field(default_factory=dict)
     tool_calls: list[dict] = field(default_factory=list)
@@ -181,6 +185,42 @@ class ProactiveChatContext:
     last_user_message_age_sec: float | None = None
     last_visible_proactive_age_sec: float | None = None
     visible_proactive_count_24h: int = 0
+
+
+def _bound_thinking_post_kwargs(
+    turn: AgentTurn, *, expected_turn_id: str
+) -> dict[str, Any]:
+    """Return summary delivery fields only for an exact immutable turn match."""
+    if not turn.thinking_summary:
+        return {}
+    expected_turn_id = str(expected_turn_id or "").strip()
+    valid = (
+        bool(expected_turn_id)
+        and bool(turn.thinking_conversation_id)
+        and turn.thinking_turn_id == expected_turn_id
+        and bool(turn.thinking_source_id)
+    )
+    if not valid:
+        log.warning(
+            "thinking_summary_dropped turn_binding_invalid "
+            "conversation_id=%s turn_id=%s assistant_message_id=pending "
+            "summary_source_id=%s expected_turn_id=%s update_seq=0",
+            turn.thinking_conversation_id or "missing",
+            turn.thinking_turn_id or "missing",
+            turn.thinking_source_id or "missing",
+            expected_turn_id or "missing",
+        )
+        return {}
+    return {
+        "thinking_summary": turn.thinking_summary,
+        "thinking_kind": turn.thinking_kind,
+        "thinking_source": turn.thinking_source,
+        "thinking_model": turn.thinking_model,
+        "thinking_native": turn.thinking_native,
+        "thinking_conversation_id": turn.thinking_conversation_id,
+        "thinking_turn_id": turn.thinking_turn_id,
+        "thinking_source_id": turn.thinking_source_id,
+    }
 
 
 def _mask(val: str) -> str:
@@ -3206,6 +3246,7 @@ _JSON_REPLY_FIELDS = (
 
 _JSON_THINKING_FIELDS = (
     "provider_reasoning",
+    "reasoning_summary",
     "reasoning",
     "reasoning_details",
     "reasoning_content",
@@ -3462,7 +3503,14 @@ def _looks_like_agent_protocol_text(text: str) -> bool:
         stripped = fence.group(1).strip()
     if stripped.lower().startswith("json\n"):
         stripped = stripped[5:].strip()
-    protocol_keys = ('"messages"', '"actions"', '"tool_calls"', '"thinking_summary"', '"cards"')
+    protocol_keys = (
+        '"messages"',
+        '"actions"',
+        '"tool_calls"',
+        '"reasoning_summary"',
+        '"thinking_summary"',
+        '"cards"',
+    )
     if not any(key in stripped for key in protocol_keys):
         return False
     # A bare protocol fragment is a key immediately followed by a colon
@@ -3589,6 +3637,9 @@ def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
         dst.thinking_source = src.thinking_source
         dst.thinking_model = src.thinking_model
         dst.thinking_native = src.thinking_native
+        dst.thinking_conversation_id = src.thinking_conversation_id
+        dst.thinking_turn_id = src.thinking_turn_id
+        dst.thinking_source_id = src.thinking_source_id
     dst.runtime_debug.update(src.runtime_debug)
     return dst
 
@@ -3951,6 +4002,18 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         max_len=96,
     )
     explicit_native = _boolish(obj.get("thinking_native", obj.get("reasoning_native")))
+    explicit_conversation_id = _sanitize_thinking_meta(
+        obj.get("thinking_conversation_id") or obj.get("reasoning_conversation_id"),
+        max_len=200,
+    )
+    explicit_turn_id = _sanitize_thinking_meta(
+        obj.get("thinking_turn_id") or obj.get("reasoning_turn_id"),
+        max_len=200,
+    )
+    explicit_source_id = _sanitize_thinking_meta(
+        obj.get("thinking_source_id") or obj.get("reasoning_source_id"),
+        max_len=200,
+    )
 
     role = str(obj.get("role") or "").lower()
     if (not role or role in {"assistant", "agent", "openclaw", "model"}) and isinstance(obj.get("content"), list):
@@ -3997,6 +4060,11 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
                         if explicit_native is not None
                         else (True if key in _JSON_PROVIDER_NATIVE_THINKING_FIELDS else None)
                     )
+
+    if turn.thinking_summary:
+        turn.thinking_conversation_id = explicit_conversation_id
+        turn.thinking_turn_id = explicit_turn_id
+        turn.thinking_source_id = explicit_source_id
 
     messages = obj.get("messages")
     if isinstance(messages, list):
@@ -6699,6 +6767,59 @@ def _split_agent_turn(result: Any, max_items: int | None = None) -> AgentTurn:
     return _agent_turn_from_raw(result, max_items=max_items)
 
 
+def _bind_agent_turn_summary(turn: AgentTurn, *, trace_id: str) -> AgentTurn:
+    """Bind a synchronous summary to this exact conversation and input turn."""
+    if not turn.thinking_summary:
+        return turn
+    authoritative_conversation_id = (
+        _load_agent_session_id()
+        if AGENT_MODE == "cli"
+        else str(AGENT_HTTP_SESSION_KEY or "").strip()
+    )
+    authoritative_turn_id = str(trace_id or "").strip()
+    correlation_mismatch = (
+        not authoritative_conversation_id
+        or not authoritative_turn_id
+        or (
+            bool(turn.thinking_conversation_id)
+            and turn.thinking_conversation_id != authoritative_conversation_id
+        )
+        or (
+            bool(turn.thinking_turn_id)
+            and turn.thinking_turn_id != authoritative_turn_id
+        )
+    )
+    if correlation_mismatch:
+        log.warning(
+            "thinking_summary_dropped source_binding_mismatch "
+            "conversation_id=%s expected_conversation_id=%s turn_id=%s "
+            "expected_turn_id=%s assistant_message_id=pending "
+            "summary_source_id=%s update_seq=0",
+            turn.thinking_conversation_id or "missing",
+            authoritative_conversation_id or "missing",
+            turn.thinking_turn_id or "missing",
+            authoritative_turn_id or "missing",
+            turn.thinking_source_id or "missing",
+        )
+        turn.thinking_summary = ""
+        turn.thinking_kind = ""
+        turn.thinking_source = ""
+        turn.thinking_model = ""
+        turn.thinking_native = None
+        turn.thinking_conversation_id = ""
+        turn.thinking_turn_id = ""
+        turn.thinking_source_id = ""
+        return turn
+    turn.thinking_conversation_id = authoritative_conversation_id
+    turn.thinking_turn_id = authoritative_turn_id
+    if not turn.thinking_source_id:
+        digest = hashlib.sha256(
+            turn.thinking_summary.encode("utf-8")
+        ).hexdigest()[:24]
+        turn.thinking_source_id = f"summary-sha256:{digest}"
+    return turn
+
+
 def call_agent(
     message: str,
     images: list[dict[str, str]] | None = None,
@@ -6727,7 +6848,9 @@ def call_agent(
         # lines and would behead a pretty-printed JSON object).
         return raw if isinstance(raw, str) else _raw_assistant_text(raw)
 
-    turn = _agent_turn_from_raw(raw)
+    turn = _bind_agent_turn_summary(
+        _agent_turn_from_raw(raw), trace_id=trace_id
+    )
     if turn.actions or turn.messages or turn.thinking_summary or turn.tool_calls:
         body: dict[str, Any] = {
             "actions": turn.actions,
@@ -6753,6 +6876,12 @@ def call_agent(
             body["reasoning_model"] = turn.thinking_model
         if turn.thinking_native is not None:
             body["reasoning_native"] = bool(turn.thinking_native)
+        if turn.thinking_conversation_id:
+            body["reasoning_conversation_id"] = turn.thinking_conversation_id
+        if turn.thinking_turn_id:
+            body["reasoning_turn_id"] = turn.thinking_turn_id
+        if turn.thinking_source_id:
+            body["reasoning_source_id"] = turn.thinking_source_id
         if turn.runtime_debug:
             log.debug("agent runtime debug keys: %s", sorted(turn.runtime_debug.keys()))
         return body
@@ -6761,6 +6890,37 @@ def call_agent(
         _turn_reply_parse_failed = True
         return [FALLBACK_REPLY]
     raise ValueError("agent produced no usable reply after sanitization")
+
+
+def _call_agent_with_turn_context(
+    message: str,
+    *,
+    images: list[dict[str, str]] | None = None,
+    image_paths: list[str] | None = None,
+    trace_id: str,
+    lane: str,
+) -> Any:
+    """Call the active agent while preserving legacy injected callables.
+
+    Operators and tests can inject a narrow ``call_agent`` callable that predates
+    the correlation kwargs. Introspect that boundary before dispatch rather than
+    retrying after ``TypeError`` (which could execute a real model turn twice).
+    The built-in callable accepts both fields, so production always receives the
+    immutable turn id and lane.
+    """
+    kwargs: dict[str, Any] = {"images": images, "image_paths": image_paths}
+    try:
+        parameters = inspect.signature(call_agent).parameters.values()
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters)
+        accepted_names = {p.name for p in parameters}
+    except (TypeError, ValueError):
+        accepts_kwargs = True
+        accepted_names = set()
+    if accepts_kwargs or "trace_id" in accepted_names:
+        kwargs["trace_id"] = trace_id
+    if accepts_kwargs or "lane" in accepted_names:
+        kwargs["lane"] = lane
+    return call_agent(message, **kwargs)
 
 
 def _resident_foreground_chat_message_v2(content: str) -> str:
@@ -8566,6 +8726,9 @@ def post_reply(
     thinking_source: str = "",
     thinking_model: str = "",
     thinking_native: bool | None = None,
+    thinking_conversation_id: str = "",
+    thinking_turn_id: str = "",
+    thinking_source_id: str = "",
     role: str = "",
     notice_kind: str = "",
     turn_failure_error_class: str = "",
@@ -8613,7 +8776,39 @@ def post_reply(
             )
             thinking_envelope = None
             safe_thinking = _sanitize_thinking_summary(thinking_summary)
-            if safe_thinking:
+            summary_ids = {
+                "thinking_conversation_id": _sanitize_thinking_meta(
+                    thinking_conversation_id, max_len=200
+                ),
+                "thinking_turn_id": _sanitize_thinking_meta(
+                    thinking_turn_id, max_len=200
+                ),
+                "thinking_source_id": _sanitize_thinking_meta(
+                    thinking_source_id, max_len=200
+                ),
+            }
+            expected_turn_id = reply_to_message_id or proactive_job_id
+            binding_valid = (
+                bool(safe_thinking)
+                and bool(envelope.get("id"))
+                and all(summary_ids.values())
+                and (
+                    not expected_turn_id
+                    or summary_ids["thinking_turn_id"] == expected_turn_id
+                )
+            )
+            if safe_thinking and not binding_valid:
+                log.warning(
+                    "thinking_summary_dropped correlation_invalid "
+                    "conversation_id=%s turn_id=%s assistant_message_id=%s "
+                    "summary_source_id=%s expected_turn_id=%s update_seq=1",
+                    summary_ids["thinking_conversation_id"] or "missing",
+                    summary_ids["thinking_turn_id"] or "missing",
+                    str(envelope.get("id") or "missing"),
+                    summary_ids["thinking_source_id"] or "missing",
+                    expected_turn_id or "none",
+                )
+            if binding_valid:
                 thinking_envelope = _build_envelope(
                     plaintext=safe_thinking.encode("utf-8"),
                     owner_user_id=seal_user_id,
@@ -8640,6 +8835,17 @@ def post_reply(
                     body["thinking_model"] = model_label
                 if thinking_native is not None:
                     body["thinking_native"] = bool(thinking_native)
+                body.update(summary_ids)
+                body["thinking_assistant_message_id"] = str(envelope["id"])
+                body["thinking_update_seq"] = 1
+                log.info(
+                    "thinking_summary_bound conversation_id=%s turn_id=%s "
+                    "assistant_message_id=%s summary_source_id=%s update_seq=1",
+                    summary_ids["thinking_conversation_id"],
+                    summary_ids["thinking_turn_id"],
+                    body["thinking_assistant_message_id"],
+                    summary_ids["thinking_source_id"],
+                )
             if role:
                 body["role"] = role
             if notice_kind:
@@ -8707,6 +8913,9 @@ def post_reply(
             "thinking_source": _sanitize_thinking_meta(thinking_source, max_len=80),
             "thinking_model": _sanitize_thinking_meta(thinking_model, max_len=96),
             "thinking_native": thinking_native,
+            "thinking_conversation_id": thinking_conversation_id,
+            "thinking_turn_id": thinking_turn_id,
+            "thinking_source_id": thinking_source_id,
             "role": role,
             "notice_kind": notice_kind,
         },
@@ -10777,10 +10986,12 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
         update_proactive_job_status(job_id, "realizing")
         try:
-            agent_result = call_agent(
+            agent_result = _call_agent_with_turn_context(
                 message,
                 images=screen_payloads,
                 image_paths=screen_paths,
+                trace_id=job_id,
+                lane="proactive",
             )
         except Exception as e:
             if _is_provider_payment_error(e):
@@ -11123,12 +11334,12 @@ def _process_proactive_jobs(jobs: list) -> float:
                     "gate_decision_id": str(job.get("gate_decision_id") or ""),
                     "proactive_job_id": job_id,
                 }
-                if idx == 0 and turn.thinking_summary:
-                    post_kwargs["thinking_summary"] = turn.thinking_summary
-                    post_kwargs["thinking_kind"] = turn.thinking_kind
-                    post_kwargs["thinking_source"] = turn.thinking_source
-                    post_kwargs["thinking_model"] = turn.thinking_model
-                    post_kwargs["thinking_native"] = turn.thinking_native
+                if idx == 0:
+                    post_kwargs.update(
+                        _bound_thinking_post_kwargs(
+                            turn, expected_turn_id=job_id
+                        )
+                    )
                 result = post_reply(reply, **post_kwargs)
                 if isinstance(result, dict) and result.get("error"):
                     raise RuntimeError(str(result)[:500])
@@ -11955,12 +12166,12 @@ def _process_messages(messages: list) -> float:
                     post_kwargs["suppress_push"] = True
                 if reply_to_message_id:
                     post_kwargs["reply_to_message_id"] = reply_to_message_id
-                if idx == 0 and turn.thinking_summary:
-                    post_kwargs["thinking_summary"] = turn.thinking_summary
-                    post_kwargs["thinking_kind"] = turn.thinking_kind
-                    post_kwargs["thinking_source"] = turn.thinking_source
-                    post_kwargs["thinking_model"] = turn.thinking_model
-                    post_kwargs["thinking_native"] = turn.thinking_native
+                if idx == 0:
+                    post_kwargs.update(
+                        _bound_thinking_post_kwargs(
+                            turn, expected_turn_id=reply_to_message_id
+                        )
+                    )
                 # 兜底回复才带失败元信息：pending_failure_notice 非空即表示本轮是
                 # 兜底糊的、不是真回复。只给第一条（兜底只有一条）。后台车道的
                 # post_kwargs（proactive 那处）刻意不带——后台失败不进聊天流。

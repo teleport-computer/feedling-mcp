@@ -49,6 +49,13 @@ from push import service as push_service
 log = logging.getLogger(__name__)
 
 _ENVELOPE_REQUIRED = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
+_THINKING_CORRELATION_FIELDS = (
+    "thinking_conversation_id",
+    "thinking_turn_id",
+    "thinking_assistant_message_id",
+    "thinking_source_id",
+    "thinking_update_seq",
+)
 
 
 def _stale_key_conflict(store: UserStore, envelope: dict) -> tuple[dict, int] | None:
@@ -171,6 +178,43 @@ def _reply_to_message_id(payload: dict) -> str:
         or payload.get("in_reply_to")
         or ""
     ).strip()
+
+
+def _thinking_correlation_error(payload: dict, envelope: dict) -> tuple[dict, int] | None:
+    """Validate immutable summary identity before any summary is persisted."""
+    correlation_missing = [
+        field
+        for field in _THINKING_CORRELATION_FIELDS
+        if payload.get(field) is None or str(payload.get(field)).strip() == ""
+    ]
+    if correlation_missing:
+        return {
+            "error": "thinking_correlation_missing_fields",
+            "detail": correlation_missing,
+        }, 400
+    assistant_message_id = str(payload.get("thinking_assistant_message_id") or "")
+    if assistant_message_id != str(envelope.get("id") or ""):
+        return {
+            "error": "thinking_assistant_message_id_mismatch",
+            "expected_assistant_message_id": str(envelope.get("id") or ""),
+            "actual_assistant_message_id": assistant_message_id,
+        }, 409
+    expected_turn_id = _reply_to_message_id(payload) or str(
+        payload.get("proactive_job_id") or ""
+    ).strip()
+    if expected_turn_id and str(payload.get("thinking_turn_id") or "") != expected_turn_id:
+        return {"error": "thinking_turn_id_mismatch"}, 409
+    try:
+        update_seq = int(str(payload.get("thinking_update_seq")))
+    except (TypeError, ValueError):
+        return {"error": "thinking_update_seq_invalid", "minimum": 1}, 400
+    if update_seq <= 0:
+        return {
+            "error": "thinking_update_seq_invalid",
+            "minimum": 1,
+            "actual": update_seq,
+        }, 400
+    return None
 
 
 def _chat_message_by_id(store: UserStore, msg_id: str) -> dict | None:
@@ -769,6 +813,15 @@ def write_response(
         return {"error": "content_type must be 'text' or 'image'"}, 400
     thinking_envelope = payload.get("thinking_envelope")
     thinking_extra: dict = {}
+    plaintext_thinking = ""
+    if thinking_envelope is None:
+        plaintext_thinking, _metadata, _field = (
+            chat_service._chat_plaintext_thinking_from_payload(payload)
+        )
+    if thinking_envelope is not None or plaintext_thinking:
+        correlation_error = _thinking_correlation_error(payload, envelope)
+        if correlation_error is not None:
+            return correlation_error
     if thinking_envelope is not None:
         if not isinstance(thinking_envelope, dict):
             return {"error": "thinking_envelope must be an object"}, 400
@@ -938,6 +991,17 @@ def write_response(
             envelope,
             content_type=content_type,
             extra=extra,
+        )
+    if thinking_envelope is not None:
+        log.info(
+            "thinking_summary_persisted "
+            "conversation_id=%s turn_id=%s assistant_message_id=%s "
+            "summary_source_id=%s update_seq=%s",
+            msg.get("thinking_conversation_id", ""),
+            msg.get("thinking_turn_id", ""),
+            msg.get("id", ""),
+            msg.get("thinking_source_id", ""),
+            msg.get("thinking_update_seq", ""),
         )
     delivery_fields: dict = {}
     visible_push_body = (push_body or alert_body).strip()

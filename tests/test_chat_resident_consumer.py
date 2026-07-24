@@ -482,6 +482,145 @@ def test_post_reply_uses_cached_whoami_keys_when_refresh_fails(monkeypatch):
     assert captured["json"]["envelope"]["visibility"] == "shared"
 
 
+def test_post_reply_seals_reasoning_summary_as_separate_optional_envelope(monkeypatch):
+    captured = {}
+    sealed_plaintexts = []
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"id": "m_summary", "ts": 3.0}
+
+    def _build(**kwargs):
+        plaintext = kwargs["plaintext"].decode("utf-8")
+        sealed_plaintexts.append(plaintext)
+        envelope_id = "assistant-1" if len(sealed_plaintexts) == 1 else "thinking-1"
+        return {
+            "id": envelope_id,
+            "sealed": plaintext,
+            "visibility": kwargs["visibility"],
+        }
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_summary", "user_pk": b"u" * 32, "enclave_pk": b"e" * 32},
+    )
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(crc, "_build_envelope", _build)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
+
+    crc.post_reply(
+        "可见正文。",
+        thinking_summary="面向用户的简短判断依据。",
+        thinking_kind="provider_reasoning_summary",
+        thinking_source="hermes_provider_summary",
+        thinking_model="gpt-5.6-sol",
+        thinking_native=True,
+        thinking_conversation_id="conversation-1",
+        thinking_turn_id="user-message-1",
+        thinking_source_id="reasoning-1",
+        reply_to_message_id="user-message-1",
+    )
+
+    body = captured["json"]
+    assert sealed_plaintexts == ["可见正文。", "面向用户的简短判断依据。"]
+    assert body["envelope"]["sealed"] == "可见正文。"
+    assert body["thinking_envelope"]["sealed"] == "面向用户的简短判断依据。"
+    assert body["alert_body"] == "可见正文。"
+    assert body["thinking_kind"] == "provider_reasoning_summary"
+    assert body["thinking_source"] == "hermes_provider_summary"
+    assert body["thinking_model"] == "gpt-5.6-sol"
+    assert body["thinking_native"] is True
+    assert body["thinking_conversation_id"] == "conversation-1"
+    assert body["thinking_turn_id"] == "user-message-1"
+    assert body["thinking_assistant_message_id"] == "assistant-1"
+    assert body["thinking_source_id"] == "reasoning-1"
+
+
+def test_post_reply_drops_summary_when_correlation_is_incomplete(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"id": "assistant-1", "ts": 3.0}
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_summary", "user_pk": b"u" * 32, "enclave_pk": b"e" * 32},
+    )
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(
+        crc,
+        "_build_envelope",
+        lambda **kwargs: {"id": "assistant-1", "sealed": True, "visibility": "shared"},
+    )
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(crc._HTTP, "post", _post)
+    crc.post_reply(
+        "正文。",
+        thinking_summary="不能无绑定展示。",
+        thinking_conversation_id="conversation-1",
+        thinking_turn_id="",
+        thinking_source_id="reasoning-1",
+    )
+
+    assert "thinking_envelope" not in captured["json"]
+    assert not any(key.startswith("thinking_") for key in captured["json"])
+
+
+def test_post_reply_omits_thinking_envelope_for_blank_summary(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"id": "m_no_summary", "ts": 4.0}
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_summary", "user_pk": b"u" * 32, "enclave_pk": None},
+    )
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(crc, "_build_envelope", lambda **kwargs: {"sealed": True})
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(crc._HTTP, "post", _post)
+    crc.post_reply("普通正文。", thinking_summary="   ")
+
+    assert "thinking_envelope" not in captured["json"]
+    assert not any(key.startswith("thinking_") for key in captured["json"])
+
+
 def test_post_reply_skips_when_whoami_refresh_fails_without_cache(monkeypatch):
     posted = []
 
@@ -1551,8 +1690,9 @@ def test_call_agent_body_round_trips_thinking_back_through_split(monkeypatch):
     )
     monkeypatch.setattr(crc, "AGENT_MODE", "cli")
     monkeypatch.setattr(crc, "call_agent_cli", lambda *a, **k: raw)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "conversation-1")
 
-    body = crc.call_agent("在吗", lane="chat")
+    body = crc.call_agent("在吗", trace_id="user-message-1", lane="chat")
     turn = crc._split_agent_turn(body)
 
     assert turn.messages == ["在的，怎么了？"]
@@ -1577,8 +1717,10 @@ def test_pi_native_thinking_reaches_post_reply_end_to_end(monkeypatch):
     )
     monkeypatch.setattr(crc, "AGENT_MODE", "cli")
     monkeypatch.setattr(crc, "call_agent_cli", lambda *a, **k: raw)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "conversation-1")
 
     msg = _make_msg(role="user", content="在吗", ts=5000.0)
+    msg["id"] = "user-message-1"
     with patch.object(crc, "post_reply") as mock_post:
         crc._process_messages([msg])
 
@@ -1587,6 +1729,148 @@ def test_pi_native_thinking_reaches_post_reply_end_to_end(monkeypatch):
     assert kwargs["thinking_kind"] == "provider_reasoning_summary"
     assert kwargs["thinking_source"] == "pi_thinking"
     assert kwargs["thinking_native"] is True
+
+
+def test_agent_turn_accepts_structured_reasoning_summary_without_touching_reply():
+    raw = {
+        "messages": ["先把服务端协议接好，客户端源码缺失要如实说明。"],
+        "reasoning_summary": "考虑了现有 thinking envelope 与旧客户端兼容性，因此复用加密子信封而不把摘要拼进正文。",
+        "reasoning_kind": "provider_reasoning_summary",
+        "reasoning_source": "hermes_provider_summary",
+        "reasoning_model": "gpt-5.6-sol",
+        "reasoning_native": True,
+        "reasoning_conversation_id": "conversation-1",
+        "reasoning_turn_id": "user-message-1",
+        "reasoning_source_id": "reasoning-1",
+    }
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["先把服务端协议接好，客户端源码缺失要如实说明。"]
+    assert turn.thinking_summary == (
+        "考虑了现有 thinking envelope 与旧客户端兼容性，因此复用加密子信封而不把摘要拼进正文。"
+    )
+    assert turn.thinking_kind == "provider_reasoning_summary"
+    assert turn.thinking_source == "hermes_provider_summary"
+    assert turn.thinking_model == "gpt-5.6-sol"
+    assert turn.thinking_native is True
+    assert turn.thinking_conversation_id == "conversation-1"
+    assert turn.thinking_turn_id == "user-message-1"
+    assert turn.thinking_source_id == "reasoning-1"
+
+
+def test_shim_stdout_json_and_session_line_round_trip_as_one_turn():
+    raw = "\n".join(
+        [
+            json.dumps(
+                {
+                    "messages": ["结构化正文。"],
+                    "reasoning_summary": "结构化判断依据。",
+                    "reasoning_kind": "provider_reasoning_summary",
+                    "reasoning_source": "hermes_provider_summary",
+                    "reasoning_native": True,
+                    "reasoning_conversation_id": "conversation-1",
+                    "reasoning_turn_id": "user-message-1",
+                    "reasoning_source_id": "reasoning-1",
+                },
+                ensure_ascii=False,
+            ),
+            "session_id: io-resident-test01",
+        ]
+    )
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["结构化正文。"]
+    assert turn.thinking_summary == "结构化判断依据。"
+    assert turn.thinking_source == "hermes_provider_summary"
+    assert turn.thinking_conversation_id == "conversation-1"
+    assert turn.thinking_turn_id == "user-message-1"
+    assert turn.thinking_source_id == "reasoning-1"
+
+
+def test_agent_turn_missing_reasoning_summary_has_no_empty_thinking_entry():
+    turn = crc._split_agent_turn({"messages": ["正文保持原样。"]})
+
+    assert turn.messages == ["正文保持原样。"]
+    assert turn.thinking_summary == ""
+    assert turn.thinking_kind == ""
+
+
+def test_bind_agent_turn_summary_drops_out_of_order_turn(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "conversation-current")
+    turn = crc.AgentTurn(
+        messages=["当前回复。"],
+        thinking_summary="上一轮迟到的摘要。",
+        thinking_conversation_id="conversation-current",
+        thinking_turn_id="user-message-old",
+        thinking_source_id="reasoning-old",
+    )
+
+    bound = crc._bind_agent_turn_summary(turn, trace_id="user-message-current")
+
+    assert bound.thinking_summary == ""
+
+
+def test_bind_agent_turn_summary_drops_previous_session_after_switch(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "conversation-new")
+    turn = crc.AgentTurn(
+        messages=["新会话回复。"],
+        thinking_summary="旧会话摘要。",
+        thinking_conversation_id="conversation-old",
+        thinking_turn_id="user-message-new",
+        thinking_source_id="reasoning-old",
+    )
+
+    bound = crc._bind_agent_turn_summary(turn, trace_id="user-message-new")
+
+    assert bound.thinking_summary == ""
+
+
+def test_bind_agent_turn_summary_uses_authoritative_synchronous_ids(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "conversation-current")
+    turn = crc.AgentTurn(
+        messages=["当前回复。"],
+        thinking_summary="当前摘要。",
+    )
+
+    bound = crc._bind_agent_turn_summary(turn, trace_id="user-message-current")
+
+    assert bound.thinking_summary == "当前摘要。"
+    assert bound.thinking_conversation_id == "conversation-current"
+    assert bound.thinking_turn_id == "user-message-current"
+    assert bound.thinking_source_id.startswith("summary-sha256:")
+
+
+def test_structured_reasoning_summary_reaches_first_reply_only(monkeypatch):
+    raw = {
+        "messages": ["第一段正文。", "第二段正文。"],
+        "reasoning_summary": "摘要只附属于第一条 assistant message，不产生额外气泡。",
+        "reasoning_kind": "provider_reasoning_summary",
+        "reasoning_source": "hermes_provider_summary",
+        "reasoning_native": True,
+        "reasoning_conversation_id": "conversation-1",
+        "reasoning_turn_id": "user-message-2",
+        "reasoning_source_id": "reasoning-2",
+    }
+    monkeypatch.setattr(crc, "call_agent", lambda *a, **k: raw)
+
+    msg = _make_msg(role="user", content="测试结构化摘要", ts=5001.0)
+    msg["id"] = "user-message-2"
+    with patch.object(crc, "post_reply") as mock_post:
+        crc._process_messages([msg])
+
+    assert [call.args[0] for call in mock_post.call_args_list] == ["第一段正文。", "第二段正文。"]
+    first_kwargs = mock_post.call_args_list[0].kwargs
+    second_kwargs = mock_post.call_args_list[1].kwargs
+    assert first_kwargs["thinking_summary"] == "摘要只附属于第一条 assistant message，不产生额外气泡。"
+    assert first_kwargs["thinking_kind"] == "provider_reasoning_summary"
+    assert first_kwargs["thinking_source"] == "hermes_provider_summary"
+    assert first_kwargs["thinking_native"] is True
+    assert "thinking_summary" not in second_kwargs
 
 
 def test_call_agent_passes_message_without_thinking_protocol(monkeypatch):

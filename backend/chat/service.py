@@ -197,6 +197,21 @@ def _chat_thinking_metadata_from_payload(payload: dict) -> dict:
     )
     if native is not None:
         out["thinking_native"] = native
+    for field in (
+        "thinking_conversation_id",
+        "thinking_turn_id",
+        "thinking_assistant_message_id",
+        "thinking_source_id",
+    ):
+        value = _bounded_chat_metadata(payload.get(field), max_len=200)
+        if value:
+            out[field] = value
+    try:
+        update_seq = int(payload.get("thinking_update_seq", 0))
+    except (TypeError, ValueError):
+        update_seq = 0
+    if update_seq > 0:
+        out["thinking_update_seq"] = update_seq
     return out
 
 

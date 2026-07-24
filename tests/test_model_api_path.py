@@ -185,6 +185,40 @@ def test_chat_response_plaintext_reasoning_default_is_summary(monkeypatch):
     assert "thinking_native" not in extra
 
 
+def test_chat_response_structured_reasoning_summary_alias_is_optional(monkeypatch):
+    captured_plaintexts: list = []
+
+    class Store:
+        user_id = "user_test"
+
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        _fake_shared_envelope_builder(captured_plaintexts),
+    )
+
+    extra = chat_service._chat_plaintext_thinking_extra_for_store(
+        Store(),
+        {
+            "reasoning_summary": "Compared the available context and chose the compatible path.",
+            "reasoning_kind": "provider_reasoning_summary",
+            "reasoning_source": "hermes_provider_summary",
+            "reasoning_native": True,
+        },
+    )
+    missing = chat_service._chat_plaintext_thinking_extra_for_store(
+        Store(), {"reasoning_summary": "   "}
+    )
+
+    assert captured_plaintexts == [
+        "Compared the available context and chose the compatible path."
+    ]
+    assert extra["thinking_kind"] == "provider_reasoning_summary"
+    assert extra["thinking_source"] == "hermes_provider_summary"
+    assert extra["thinking_native"] is True
+    assert missing == {}
+
+
 def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     user_id, api_key = _register(client)
     raw_provider_key = "sk-test-secret"

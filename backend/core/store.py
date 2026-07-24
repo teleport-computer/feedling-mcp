@@ -507,6 +507,11 @@ class UserStore:
                 "thinking_source",
                 "thinking_model",
                 "thinking_native",
+                "thinking_conversation_id",
+                "thinking_turn_id",
+                "thinking_assistant_message_id",
+                "thinking_source_id",
+                "thinking_update_seq",
                 "reply_claimed_by",
                 "reply_claimed_at",
                 "reply_claim_expires_at",
@@ -526,6 +531,12 @@ class UserStore:
                 if isinstance(value, str) and value.strip():
                     msg[key] = value.strip()
                 elif isinstance(value, bool):
+                    msg[key] = value
+                elif (
+                    key == "thinking_update_seq"
+                    and isinstance(value, int)
+                    and value > 0
+                ):
                     msg[key] = value
         return msg
 
@@ -684,6 +695,11 @@ class UserStore:
                 "thinking_source",
                 "thinking_model",
                 "thinking_native",
+                "thinking_conversation_id",
+                "thinking_turn_id",
+                "thinking_assistant_message_id",
+                "thinking_source_id",
+                "thinking_update_seq",
                 "reply_claimed_by",
                 "reply_claimed_at",
                 "reply_claim_expires_at",
@@ -697,6 +713,12 @@ class UserStore:
                 if isinstance(value, str) and value.strip():
                     msg[key] = value.strip()
                 elif isinstance(value, bool):
+                    msg[key] = value
+                elif (
+                    key == "thinking_update_seq"
+                    and isinstance(value, int)
+                    and value > 0
+                ):
                     msg[key] = value
         if resident_reply_to is not None:
             msg["reply_to_message_id"] = str(resident_reply_to)

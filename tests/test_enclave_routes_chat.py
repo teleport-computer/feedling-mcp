@@ -107,6 +107,111 @@ def test_history_decrypts_text_messages(client, monkeypatch):
     assert "context_memories" in body
 
 
+def test_history_decrypts_thinking_summary_with_immutable_ids(client, monkeypatch):
+    _wire(monkeypatch, [
+        {
+            "id": "assistant-1",
+            "role": "openclaw",
+            "ts": 1.0,
+            "v": 1,
+            "source": "chat",
+            "visibility": "shared",
+            "K_enclave": "body-key",
+            "body_ct": "body-ciphertext",
+            "nonce": "body-nonce",
+            "owner_user_id": "usr_a",
+            "thinking_v": "1",
+            "thinking_id": "thinking-1",
+            "thinking_body_ct": "thinking-ciphertext",
+            "thinking_nonce": "thinking-nonce",
+            "thinking_K_enclave": "thinking-key",
+            "thinking_visibility": "shared",
+            "thinking_owner_user_id": "usr_a",
+            "thinking_kind": "provider_reasoning_summary",
+            "thinking_source": "hermes_provider_summary",
+            "thinking_model": "gpt-5.6-sol",
+            "thinking_native": True,
+            "thinking_conversation_id": "conversation-1",
+            "thinking_turn_id": "user-message-1",
+            "thinking_assistant_message_id": "assistant-1",
+            "thinking_source_id": "reasoning-1",
+            "thinking_update_seq": 1,
+        },
+    ])
+
+    def fake_decrypt(envelope, uid, sk):
+        if envelope.get("body_ct") == "thinking-ciphertext":
+            return "当前消息的中文摘要。".encode()
+        return "当前消息正文。".encode()
+
+    monkeypatch.setattr(envmod, "decrypt_envelope", fake_decrypt)
+
+    response = client.get("/v1/chat/history", headers={"X-API-Key": "k"})
+
+    assert response.status_code == 200
+    message = response.get_json()["messages"][0]
+    assert message["content"] == "当前消息正文。"
+    assert message["thinking_summary"] == "当前消息的中文摘要。"
+    assert message["thinking_conversation_id"] == "conversation-1"
+    assert message["thinking_turn_id"] == "user-message-1"
+    assert message["thinking_assistant_message_id"] == message["id"]
+    assert message["thinking_source_id"] == "reasoning-1"
+    assert message["thinking_update_seq"] == 1
+
+
+@pytest.mark.parametrize(
+    "correlation_override",
+    [
+        {"thinking_assistant_message_id": "different-assistant"},
+        {"thinking_source_id": ""},
+        {"thinking_update_seq": 0},
+    ],
+)
+def test_history_hides_thinking_summary_with_invalid_correlation(
+    client, monkeypatch, correlation_override
+):
+    message = {
+        "id": "assistant-1",
+        "role": "openclaw",
+        "ts": 1.0,
+        "v": 1,
+        "source": "chat",
+        "visibility": "shared",
+        "K_enclave": "body-key",
+        "body_ct": "body-ciphertext",
+        "nonce": "body-nonce",
+        "owner_user_id": "usr_a",
+        "thinking_v": "1",
+        "thinking_id": "thinking-1",
+        "thinking_body_ct": "thinking-ciphertext",
+        "thinking_nonce": "thinking-nonce",
+        "thinking_K_enclave": "thinking-key",
+        "thinking_visibility": "shared",
+        "thinking_owner_user_id": "usr_a",
+        "thinking_conversation_id": "conversation-1",
+        "thinking_turn_id": "user-message-1",
+        "thinking_assistant_message_id": "assistant-1",
+        "thinking_source_id": "reasoning-1",
+        "thinking_update_seq": 1,
+    }
+    message.update(correlation_override)
+    _wire(monkeypatch, [message])
+
+    def fake_decrypt(envelope, uid, sk):
+        assert envelope.get("body_ct") != "thinking-ciphertext"
+        return "当前消息正文。".encode()
+
+    monkeypatch.setattr(envmod, "decrypt_envelope", fake_decrypt)
+
+    response = client.get("/v1/chat/history", headers={"X-API-Key": "k"})
+
+    assert response.status_code == 200
+    returned = response.get_json()["messages"][0]
+    assert returned["content"] == "当前消息正文。"
+    assert "thinking_summary" not in returned
+    assert "thinking_assistant_message_id" not in returned
+
+
 def test_history_decrypts_resident_maintenance_message(client, monkeypatch):
     prompt = "【Feedling 系统维护提醒】\n请更新 resident consumer。"
     _wire(monkeypatch, [

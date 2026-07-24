@@ -505,6 +505,19 @@
   合并——`_log_finish` 一个连接一次 execute_many 同时写 log 完成态 + last_used，
   省掉每次 push 的独立 touch 连接/往返。附带把 ValidationError schema 固化进
   导出工具（防生成环境版本漂移反复增删 input/ctx）。测试增至 66 用例全绿。
+## 2026-07-20
+
+### [DONE] IO/home 结构化思考摘要服务端协议
+
+- Hermes home shim 现在只从 provider 明确提供的 summary surface 提取简短摘要，
+  以 `reasoning_summary` 与正文 `messages` 分字段输出；不读取通用 raw reasoning，
+  没有安全摘要时省略字段。
+- resident consumer 接受该结构化字段，沿用既有 E2E 加密
+  `thinking_envelope`，只附着在该回合第一条 assistant message；正文、推送预览
+  和旧消息兼容行为不变。
+- 增加 shim 提取、空字段、正文隔离、首消息附着和独立信封测试。客户端源码已
+  在 `6cab45f` 迁往当前环境不可访问的私有仓库，尚未假装完成 UI；准确接入契约
+  见 `docs/REASONING_SUMMARY_PROTOCOL.md`。
 
 ## 2026-07-15
 
