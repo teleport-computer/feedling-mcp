@@ -327,7 +327,9 @@ services:
       FEEDLING_V2_RUNNER_CVM_ID: "${FEEDLING_V2_RUNNER_CVM_ID:-main-cvm}"
       FEEDLING_V2_DEPLOYED_BUILD: "${FEEDLING_V2_DEPLOYED_BUILD:-}"
       FEEDLING_GENESIS_WORKER_ENABLED: "1"
-      FEEDLING_V2_SANDBOX_PROVIDER: "disabled"
+      # CVM-local in-process sandbox: PDF/DOCX/XLSX materialize + extract inside
+      # the serve-worker (no E2B). Matches pre; prod stays "disabled" for now.
+      FEEDLING_V2_SANDBOX_PROVIDER: "local"
       FEEDLING_V2_IMAGE_MAX_B64_CHARS: "2700000"
       # web_fetch article extraction (trafilatura, runs in this serve-worker).
       # Default ON — a rollback lever, not a feature gate. Set to "0" to fall back
