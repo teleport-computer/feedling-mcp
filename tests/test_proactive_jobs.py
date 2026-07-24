@@ -1068,6 +1068,19 @@ def test_auto_proactive_v2_schedule_heartbeats_split_presence_and_screen_wakes(t
     )
     assert on_with_frame.status_code == 200
     on_body = on_with_frame.get_json()
+    assert on_body["enqueued"] is False
+    assert on_body["decision"]["reason"] == "heartbeat_throttled"
+
+    settings = db.get_blob(user_id, "proactive_settings")
+    settings[core_store.HEARTBEAT_NEXT_TICK_AT_KEY] = time.time() - 1
+    db.set_blob(user_id, "proactive_settings", settings)
+    on_after_interval = client.post(
+        "/v1/proactive/tick",
+        headers=headers,
+        json={"trigger": "heartbeat_broadcast_on", "broadcast_state": "on"},
+    )
+    assert on_after_interval.status_code == 200
+    on_body = on_after_interval.get_json()
     assert on_body["enqueued"] is True
     assert on_body["decision"]["reason"] == "wake_created"
     assert on_body["decision"]["wake_kind"] == "presence"

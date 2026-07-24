@@ -365,6 +365,27 @@ def proactive_tick(store, payload: dict, *, api_key) -> dict:
     job = None
     if decision.get("should_wake_agent", decision.get("should_reach_out")):
         job = store.append_proactive_job(gate._proactive_job_from_decision(decision))
+        if gate._is_throttled_heartbeat_scope(
+            decision.get("trigger", ""),
+            manual=bool(decision.get("manual")),
+            job_kind=decision.get("job_kind", ""),
+        ):
+            decision["heartbeat_next_tick_at"] = (
+                core_store.advance_proactive_heartbeat_tick(
+                    store.user_id,
+                    now=float(decision.get("ts") or 0.0),
+                    wake_interval_sec=decision.get("wake_interval_sec"),
+                )
+            )
+    elif decision.get("reason") == gate.HEARTBEAT_THROTTLED_REASON:
+        skipped = gate._proactive_job_from_decision(decision)
+        skipped.update({
+            "status": "skipped",
+            "status_reason": gate.HEARTBEAT_THROTTLED_REASON,
+            "failed_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+        })
+        store.append_skipped_proactive_job(skipped)
 
     return {
         "decision": decision,
