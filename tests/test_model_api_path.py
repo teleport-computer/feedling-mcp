@@ -251,6 +251,10 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
 def test_model_api_setup_rejects_unconfigured_prompt_frontier_before_io(
     client, monkeypatch, provider, model, base_url,
 ):
+    # Fail-closed mode: with the unaudited default disabled an unconfigured
+    # custom route is still rejected before any provider I/O or key encryption.
+    # (Default-on gives a conservative window instead — see test_v2_prompt_frontier.)
+    monkeypatch.setenv("FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS", "0")
     user_id, api_key = _register(client)
     provider_calls = []
 
@@ -286,6 +290,39 @@ def test_model_api_setup_rejects_unconfigured_prompt_frontier_before_io(
     assert provider_calls == []
     assert db.model_api_routes_list(user_id) == []
     assert db.model_api_credentials_list(user_id) == []
+
+
+def test_model_api_setup_custom_relay_uses_unaudited_default(client, monkeypatch):
+    """Recovery: a custom relay that does NOT send context_window_tokens now
+    configures successfully using the conservative unaudited default (8192)
+    instead of being rejected with prompt_context_limit_unconfigured — the
+    gate that had silently blocked every custom relay app-wide since 07-19."""
+    monkeypatch.delenv("FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS", raising=False)
+    user_id, api_key = _register(client)
+    tested = []
+    monkeypatch.setattr(
+        provider_client,
+        "test_provider_key",
+        lambda cfg: tested.append(cfg) or {"reply": "ok", "usage": {}},
+    )
+    monkeypatch.setattr(provider_client, "probe_responses_support", lambda _cfg: True)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openai_compatible",
+            "model": "private-model",
+            "base_url": "https://relay.host/v1",
+            "api_key": "sk-relay",
+        },
+        headers=_headers(api_key),
+    )
+
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+    assert setup.get_json()["config"]["context_window_tokens"] == 8192
+    assert tested[0].context_window_tokens == 8192
+    route = db.model_api_active_route(user_id)
+    assert route["context_window_tokens"] == 8192
 
 
 def test_model_api_setup_persists_explicit_custom_prompt_frontier(
