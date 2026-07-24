@@ -87,7 +87,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:c5f3e19
+    image: ghcr.io/teleport-computer/feedling:ae20fff
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -146,7 +146,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:c5f3e19
+    image: ghcr.io/teleport-computer/feedling:ae20fff
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -188,6 +188,15 @@ services:
       # iOS broadcast-extension frame ingest on :9998 never binds.
       # See asgi/lifespan.py.
       FEEDLING_ASGI_BACKGROUND: "true"
+      # gunicorn worker count (backend/gunicorn_conf.py _worker_count, default 1).
+      # The base compose (docker-compose.phala.yaml) wires this; the test compose
+      # did NOT, so the deploy's `-e FEEDLING_BACKEND_WORKERS=...` (from the repo
+      # var TEST_FEEDLING_BACKEND_WORKERS, =2 since 2026-07-01) was silently
+      # dropped and test ran -w1 regardless. Wiring it makes the var take effect.
+      # -w N is code-supported (LISTEN/NOTIFY wake bus + advisory-lock leader
+      # election, core/wake_bus.py). Budget: test RDS max_connections=79, ~18
+      # conns/worker → -w2≈36, safe.
+      FEEDLING_BACKEND_WORKERS: "${FEEDLING_BACKEND_WORKERS:-1}"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       # This deploy serves test-api, so skill_url must point at io-onboarding's
       # test branch. Code defaults to "main" (so prod just works); the test
@@ -299,7 +308,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:c5f3e19
+    image: ghcr.io/teleport-computer/feedling:ae20fff
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
