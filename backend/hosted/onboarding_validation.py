@@ -232,9 +232,16 @@ def _model_api_steps_with_genesis(
         "degraded": bool(history_windows_failed > 0),
         "support_inputs_present": bool(_int_value(metadata.get("support_count")) > 0),
         "required": (
-            "Genesis import failed. Start onboarding again with the latest app build."
+            # Cause-aware bilingual line (classify_genesis_error). The old
+            # static "Start onboarding again with the latest app build" named
+            # the wrong fix for every real cause — usr_9037eaa8 (2026-07-24)
+            # burned five provider-timeout jobs while being told to update
+            # the app.
+            genesis_service.genesis_failure_required_text(
+                str(genesis_job.get("error") or "")
+            )
             if failed else (
-                "Wait for Genesis to finish distilling the onboarding materials."
+                "Wait for Genesis to finish reading your onboarding materials."
                 if not done else ""
             )
         ),

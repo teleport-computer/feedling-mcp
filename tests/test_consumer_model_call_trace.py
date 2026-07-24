@@ -60,7 +60,7 @@ def _recorder():
 
 def test_call_agent_cli_emits_start_then_done(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
 
     result = subprocess.CompletedProcess(
         args=["mycli", "ask", "hi"], returncode=0,
@@ -94,7 +94,7 @@ def test_call_agent_cli_emits_start_then_done(monkeypatch):
 
 def test_call_agent_cli_done_trace_carries_thinking_observation(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
 
     stdout = "\n".join([
         '{"type":"assistant","message":{"role":"assistant","model":"claude-sonnet-4-5",'
@@ -121,7 +121,7 @@ def test_call_agent_cli_done_trace_carries_thinking_observation(monkeypatch):
 
 def test_call_agent_cli_warns_when_claude_stdout_has_unparsed_thinking_marker(monkeypatch, caplog):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
 
     stdout = "\n".join([
         '{"type":"stream_event","event":{"type":"content_block_start","index":0,'
@@ -146,7 +146,7 @@ def test_call_agent_cli_warns_when_claude_stdout_has_unparsed_thinking_marker(mo
 
 def test_call_agent_cli_sets_trace_id_env_for_io_cli(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
 
     result = subprocess.CompletedProcess(
         args=["mycli", "ask", "hi"], returncode=0,
@@ -171,7 +171,7 @@ def test_call_agent_cli_sets_trace_id_env_for_io_cli(monkeypatch):
 
 def test_call_agent_cli_emits_error_on_nonzero_rc(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
 
     result = subprocess.CompletedProcess(
         args=["mycli", "ask", "hi"], returncode=1, stdout="", stderr="boom",
@@ -194,7 +194,7 @@ def test_call_agent_cli_emits_error_on_nonzero_rc(monkeypatch):
 
 def test_call_agent_cli_emits_error_on_timeout_and_reraises(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
 
     def _raise_timeout(*a, **kw):
         raise subprocess.TimeoutExpired(cmd=["mycli", "ask", "hi"], timeout=120)
@@ -275,7 +275,7 @@ def test_error_event_carries_error_detail_beyond_the_reply_head_cap(monkeypatch)
         args=["codex"], returncode=1, stdout=stdout, stderr="Reading additional input from stdin...\n",
     )
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["codex", "exec", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["codex", "exec", message], None))
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
@@ -306,7 +306,7 @@ def test_error_event_extracts_nested_codex_turn_failed_detail(monkeypatch):
         args=["codex"], returncode=1, stdout=stdout, stderr="",
     )
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["codex", "exec", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["codex", "exec", message], None))
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
@@ -327,7 +327,7 @@ def test_error_detail_absent_on_successful_turns(monkeypatch):
         args=["codex"], returncode=0, stdout='{"type":"agent_message","message":"hi"}', stderr="",
     )
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["codex", "exec", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["codex", "exec", message], None))
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()

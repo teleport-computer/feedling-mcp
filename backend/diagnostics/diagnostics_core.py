@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 
 import db
 import debug_trace
+import provider_attempt_ledger
 
 from . import storage
 
@@ -138,10 +139,15 @@ def clear_trace_payload(store):
 
 
 def emit_trace_event_payload(store, payload):
-    """Body of ``POST /v1/debug/trace/event``. A resident consumer (HTTP-only,
-    no DB) reports one flow event. Recording is gated + best-effort; field-picking
-    keeps a careless caller from injecting arbitrary keys. Blocking: per-user blob
-    append."""
+    """Body of ``POST /v1/debug/trace/event`` for the HTTP-only resident.
+
+    Provider-attempt metadata takes the always-on append-only ledger path.
+    Ordinary flow events retain the existing gated, best-effort trace-ring path.
+    Both paths field-pick their input; blocking DB work stays behind the route's
+    threadpool boundary.
+    """
+    if "provider_attempt" in payload or "provider_attempts" in payload:
+        return provider_attempt_ledger.record_attempts_payload(store, payload)
     ev = payload.get("event") if isinstance(payload.get("event"), dict) else {}
     dur = ev.get("dur_ms")
     try:

@@ -94,6 +94,7 @@ import io
 import json
 import logging
 import os
+import queue
 import re
 import shlex
 import shutil
@@ -922,6 +923,52 @@ def _post_debug_trace_event(payload: dict) -> None:
         pass  # observability must never affect the turn
 
 
+def _post_provider_attempts(payload: dict) -> None:
+    """Persist provider-attempt metadata without touching the debug trace ring."""
+    try:
+        resp = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/debug/trace/event",
+            json=payload,
+            headers=_HEADERS,
+            timeout=2,
+        )
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 -- ledger delivery never breaks a turn
+        log.warning("provider attempt ledger post failed: %s", type(exc).__name__)
+
+
+_PROVIDER_ATTEMPT_QUEUE: queue.Queue[dict] = queue.Queue(maxsize=256)
+_PROVIDER_ATTEMPT_WORKER_STARTED = False
+_PROVIDER_ATTEMPT_WORKER_LOCK = threading.Lock()
+
+
+def _provider_attempt_worker() -> None:
+    while True:
+        payload = _PROVIDER_ATTEMPT_QUEUE.get()
+        try:
+            _post_provider_attempts(payload)
+        finally:
+            _PROVIDER_ATTEMPT_QUEUE.task_done()
+
+
+def _queue_provider_attempt_ledger(attempts: list[dict]) -> None:
+    global _PROVIDER_ATTEMPT_WORKER_STARTED
+    if not attempts:
+        return
+    try:
+        if not _PROVIDER_ATTEMPT_WORKER_STARTED:
+            with _PROVIDER_ATTEMPT_WORKER_LOCK:
+                if not _PROVIDER_ATTEMPT_WORKER_STARTED:
+                    threading.Thread(
+                        target=_provider_attempt_worker,
+                        daemon=True,
+                    ).start()
+                    _PROVIDER_ATTEMPT_WORKER_STARTED = True
+        _PROVIDER_ATTEMPT_QUEUE.put_nowait({"provider_attempts": attempts})
+    except Exception as exc:  # noqa: BLE001 -- ledger delivery never breaks a turn
+        log.warning("provider attempt ledger dispatch failed: %s", type(exc).__name__)
+
+
 # Short-TTL cache of whether debug-trace recording is enabled (per-user gate AND
 # deploy kill-switch both true). Lets the hot path (`_emit_debug_trace`) skip
 # all work — including spawning a thread — on every turn while it's off,
@@ -1586,7 +1633,12 @@ def _poll_decrypt_limit(decrypt_since: float, last_ts: float, poll_messages: lis
     return max(50, 2 * len(poll_messages) + 20)
 
 
-def _filter_messages_to_poll_ids(messages: list[dict], poll_messages: list[dict]) -> list[dict]:
+def _filter_messages_to_poll_ids(
+    messages: list[dict],
+    poll_messages: list[dict],
+    *,
+    last_ts: float | None = None,
+) -> list[dict]:
     """Keep only decrypted rows that this poll cycle actually claimed.
 
     /v1/chat/poll is the server-side responder lease. Decrypted history may
@@ -1594,18 +1646,37 @@ def _filter_messages_to_poll_ids(messages: list[dict], poll_messages: list[dict]
     claimed by another responder, so the resident must not treat history as the
     source of work ownership.
     """
-    poll_ids = {
-        str(m.get("id") or m.get("message_id") or "").strip()
+    poll_by_id = {
+        str(m.get("id") or m.get("message_id") or "").strip(): m
         for m in poll_messages
         if isinstance(m, dict)
     }
+    poll_by_id.pop("", None)
+    poll_ids = set(poll_by_id)
     poll_ids.discard("")
     if not poll_ids:
         return messages
-    return [
-        m for m in messages
-        if str(m.get("id") or m.get("message_id") or "").strip() in poll_ids
-    ]
+    filtered: list[dict] = []
+    for message in messages:
+        message_id = str(message.get("id") or message.get("message_id") or "").strip()
+        if message_id not in poll_ids:
+            continue
+        if last_ts is None:
+            filtered.append(message)
+            continue
+        poll_message = poll_by_id[message_id]
+        try:
+            poll_ts = float(
+                poll_message.get("ts", poll_message.get("timestamp", 0)) or 0
+            )
+        except (TypeError, ValueError):
+            poll_ts = 0.0
+        marked = dict(message)
+        marked["_provider_attempt_trigger"] = (
+            "redelivery" if poll_ts <= last_ts else "first"
+        )
+        filtered.append(marked)
+    return filtered
 
 
 # The chat cursor wedges when /v1/chat/poll keeps claiming message ids the enclave
@@ -1795,6 +1866,62 @@ DECRYPT_HEALTH_REFRESH_SEC = _env_float(
     "FEEDLING_DECRYPT_HEALTH_REFRESH_SEC", 210.0, minimum=5.0
 )
 
+# Runner-shared decrypt-health (2026-07-24). The reachability probe verifies
+# only SHARED infrastructure — enclave alive, enclave→backend loopback,
+# content_sk present — none of it per-user. So N resident consumers each
+# probing every DECRYPT_HEALTH_REFRESH_SEC is O(users) redundancy for one
+# answer. When enabled, consumers publish/reuse a runner-shared health file so
+# the probe rate drops to O(runner≈1). host-all consumers collapse to one
+# shared fingerprint path (same mechanism as the checkpoint file — the
+# fingerprint is NOT an isolation boundary here, and that's exactly right: infra
+# health is shared, not per-user); a keyed self-host runner gets its own file,
+# equally correct. The file carries ONLY an infra-layer status — never the
+# per-user `degraded`, which stays local (the passive envelope signal still wins
+# over a shared `ok`). Fail-open: any file problem falls back to self-probing.
+# Design + rationale: docs/proposals/shared-decrypt-health-probe.md.
+DECRYPT_HEALTH_SHARED = _env_bool("FEEDLING_DECRYPT_HEALTH_SHARED", False)
+# Stage 2: probe via the not-bound-to-any-user enclave endpoint
+# GET /v1/decrypt/selfcheck (self-ciphertext restore + enclave→backend loopback)
+# instead of borrowing a user's identity for /v1/chat/history?probe=1. Default
+# off; enable ONLY after the enclave carrying the endpoint is deployed — an
+# older enclave answers 404, which the probe treats as "endpoint absent" and
+# transparently falls back to the history probe (so a premature flip is a soft
+# degrade, not a false outage). See docs/proposals/shared-decrypt-health-probe.md.
+DECRYPT_SELFCHECK = _env_bool("FEEDLING_DECRYPT_SELFCHECK", False)
+DECRYPT_HEALTH_FILE = Path(
+    os.environ.get(
+        "FEEDLING_DECRYPT_HEALTH_FILE",
+        f"/tmp/feedling_decrypt_health_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
+    )
+)
+# Only a POSITIVE reading crosses the runner-shared file. Sharing exists solely
+# to let peers skip a redundant probe of a HEALTHY enclave. A negative reading
+# (`unreachable`) must NEVER be published: one consumer's transient blip (a 10s
+# timeout, a GC pause, a single slow round trip) would otherwise latch EVERY
+# co-hosted consumer to `unreachable` for a whole refresh window — runner-wide
+# blast-radius amplification of a one-off. Negatives stay local: the blipped
+# consumer degrades only itself and re-probes on its own throttle, and a real
+# outage is still found within a refresh window when the shared `ok` ages out
+# and each consumer re-probes. `unconfigured` is derived with no enclave call so
+# sharing it saves nothing; `degraded`/`unknown` are per-user / not-measured and
+# never belong here. See docs/proposals/shared-decrypt-health-probe.md §5.
+_SHARED_HEALTH_REUSABLE = frozenset({"ok"})
+
+# NOTE — no probe jitter here (deliberately removed 2026-07-24). An earlier
+# revision staggered each consumer's re-probe with a per-consumer jitter to
+# smooth the periodic "everyone re-probes when the shared `ok` goes stale" herd.
+# It repeatedly collided with the freshness budget (the reuse grace REFRESH+jitter
+# has to stay under the backend's 300s window while also staying ≥ the probe
+# throttle, and any clamp coupling those to POLL_TIMEOUT either collapsed the
+# jitter, shrank REFRESH into a probe storm, or breached the window). The jitter
+# was only ever an OPTIMISATION: the _decrypt_health_last_refresh throttle already
+# bounds each consumer to one probe per REFRESH_SEC, so the herd's worst case is
+# N probes/window — exactly the non-shared baseline, and usually far below it
+# (one publisher refreshes, the rest reuse). Keeping the reuse grace = REFRESH_SEC
+# restores the original ~30s freshness slack. If the under-load herd ever proves
+# to matter in practice, re-introduce staggering with a design that does NOT tie
+# the reuse grace to POLL_TIMEOUT and with dedicated tests.
+
 _decrypt_health: dict = {"status": "unknown", "checked_at": 0.0}
 
 # One unreadable claim can be a transient blip (claim/history race, a single
@@ -1851,33 +1978,173 @@ def _decrypt_health_headers() -> dict:
     }
 
 
-def _probe_decrypt_reachability() -> None:
-    """Refresh health from a reachability probe (startup + throttled idle).
-    Never upgrades a standing ``degraded`` to ``ok`` — a per-message decrypt
-    failure must not be masked by the source merely being dialable; only a real
-    non-empty decrypt clears degraded."""
+def _measure_infra_health() -> str:
+    """Pure reachability probe of the SHARED decrypt infrastructure. Returns an
+    infra-layer status — ``ok`` | ``unreachable`` | ``unconfigured`` — and does
+    NOT touch _decrypt_health. This is exactly the value published to the
+    runner-shared health file: it must never carry a per-user ``degraded`` (that
+    signal is local-only; the degrade-masking lives in _apply_infra_health).
+
+    Stage 2 (FEEDLING_DECRYPT_SELFCHECK): prefer the not-bound-to-any-user
+    /v1/decrypt/selfcheck endpoint (real content_sk round trip + loopback).
+    An enclave predating that endpoint answers 404, and we transparently fall
+    back to the history reachability probe — so enabling the flag before the
+    enclave rolls out is a soft degrade, not a false outage."""
     if not FEEDLING_ENCLAVE_URL:
-        _set_decrypt_health("unconfigured")
-        return
+        return "unconfigured"
+    if DECRYPT_SELFCHECK:
+        status = _measure_via_selfcheck()
+        if status is not None:
+            return status
+        # endpoint absent (old enclave) → fall through to the history probe
+    return _measure_via_history_probe()
+
+
+def _measure_via_history_probe() -> str:
+    """Legacy reachability probe: GET /v1/chat/history?limit=1&probe=1.
+    probe=1 verifies the decrypt path is reachable without paying for the
+    context-memory fan-out (memory/list 200 cards + context build) the enclave
+    attaches to a normal history read (backend/enclave/routes/chat.py). Only the
+    HTTP status is read."""
     try:
         client = _client_for(FEEDLING_ENCLAVE_URL)
         resp = client.get(
             f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
-            # probe=1: verify the decrypt path is reachable without paying for the
-            # context-memory fan-out (memory/list 200 cards + context build) the
-            # enclave attaches to a normal history read. See
-            # backend/enclave/routes/chat.py — this call fires per resident every
-            # DECRYPT_HEALTH_REFRESH_SEC and only reads the HTTP status.
             params={"limit": 1, "probe": 1}, headers=_HEADERS, timeout=10,
         )
         resp.raise_for_status()
     except Exception:
-        _set_decrypt_health("unreachable")
-        return
-    if _decrypt_health.get("status") == "degraded":
-        _decrypt_health["checked_at"] = time.time()  # still degraded; heartbeat only
+        return "unreachable"
+    return "ok"
+
+
+def _measure_via_selfcheck() -> str | None:
+    """Probe via GET /v1/decrypt/selfcheck. Returns ``ok`` (decrypt AND loopback
+    both ok), ``unreachable`` (dial/verdict failure), or None — "endpoint not
+    usable for me, fall back to the history probe". None covers 404 (an enclave
+    predating the endpoint) AND 401 (the endpoint requires a locally-verifiable
+    runtime token; a keyed consumer that only holds an api_key legitimately
+    falls back to the history probe, which its api_key can serve). Carries no
+    user identity beyond the standard auth headers."""
+    try:
+        client = _client_for(FEEDLING_ENCLAVE_URL)
+        resp = client.get(
+            f"{FEEDLING_ENCLAVE_URL}/v1/decrypt/selfcheck",
+            headers=_HEADERS, timeout=10,
+        )
+    except Exception:
+        return "unreachable"
+    if resp.status_code in (401, 404):
+        return None
+    if resp.status_code != 200:
+        return "unreachable"
+    try:
+        data = resp.json()
+    except Exception:
+        return "unreachable"
+    decrypt = data.get("decrypt")
+    loopback = data.get("loopback")
+    if decrypt == "ok" and loopback == "ok":
+        return "ok"
+    # Both faults gate the runner via the single infra status 'unreachable', but
+    # they need very different remediation — log the ACTUAL fault loudly so the
+    # operator isn't sent to fix network/TLS for a content-key drift. A
+    # decrypt:fail is precisely the mid-life key drift this stage-2 probe exists
+    # to catch (the enclave is reachable; its content_sk can't restore the
+    # self-ciphertext), which 'unreachable' alone would misdiagnose.
+    if decrypt != "ok":
+        log.error(
+            "decrypt self-check FAILED (decrypt=%s loopback=%s): the enclave is "
+            "reachable but its content key cannot decrypt — suspect enclave "
+            "content-key drift / re-key, NOT network/TLS. %s",
+            decrypt, loopback, FEEDLING_ENCLAVE_URL,
+        )
     else:
-        _set_decrypt_health("ok")
+        log.warning(
+            "decrypt self-check loopback FAILED (decrypt=ok loopback=%s): "
+            "enclave→backend round trip is down; decryption engine is fine. %s",
+            loopback, FEEDLING_ENCLAVE_URL,
+        )
+    return "unreachable"
+
+
+def _apply_infra_health(status: str, *, checked_at: float | None = None) -> None:
+    """Fold an infra-layer status into the reported decrypt health, preserving
+    the per-user degrade: a standing ``degraded`` is never upgraded to ``ok`` by
+    a mere reachability signal (only a real non-empty decrypt clears it), just
+    heartbeated so it stays fresh. ``checked_at`` lets a consumer reusing a
+    runner-shared reading report that reading's REAL probe time, so a lagging
+    consumer ages into the backend's own staleness window instead of vouching a
+    stale ``ok`` under its own clock; None means "our own probe, stamp now"."""
+    at = time.time() if checked_at is None else checked_at
+    cur_status = _decrypt_health.get("status")
+    cur_at = float(_decrypt_health.get("checked_at") or 0.0)
+    if cur_status == "degraded":
+        # A reachability signal (ANY of ok / unreachable / unconfigured) is
+        # orthogonal to a per-user envelope degrade and must NEVER overwrite it —
+        # only a real decrypt success (_note_decrypt_read_success) or a failure
+        # streak moves `degraded`. Guarding just the direct `ok` upgrade left a
+        # two-step laundering hole: a transient `unreachable` clobbered degraded,
+        # then a later `ok` cleared it, masking a real per-user decrypt outage.
+        # Heartbeat freshness forward only (never backward past a fresher stamp).
+        _decrypt_health["checked_at"] = max(cur_at, at)
+        return
+    # Reusing an older shared reading must never age our checked_at BACKWARD past
+    # a fresher local stamp of the SAME status (e.g. a real decrypt success just
+    # set now) — that could push us past the backend's staleness window and get
+    # a working consumer marked unknown. A status CHANGE always applies as-is.
+    if status == cur_status:
+        at = max(cur_at, at)
+    _decrypt_health["status"] = status
+    _decrypt_health["checked_at"] = at
+
+
+def _probe_decrypt_reachability() -> None:
+    """Refresh health from a reachability probe (startup + throttled idle).
+    Never upgrades a standing ``degraded`` to ``ok`` — a per-message decrypt
+    failure must not be masked by the source merely being dialable; only a real
+    non-empty decrypt clears degraded. Thin wrapper: measure the shared infra,
+    then apply with degrade-masking under our own clock."""
+    _apply_infra_health(_measure_infra_health())
+
+
+def _read_shared_infra_health() -> tuple[str, float] | None:
+    """Read the runner-shared infra-health reading, or None if absent/unusable.
+    Fail-open: any problem (missing file, a race with a writer, corrupt JSON,
+    a non-infra status, a bad shape) returns None so the caller falls back to
+    probing itself — a shared-file issue must never wedge the probe."""
+    try:
+        data = json.loads(DECRYPT_HEALTH_FILE.read_text())
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    status = str(data.get("status") or "").strip()
+    if status not in _SHARED_HEALTH_REUSABLE:
+        return None
+    try:
+        checked_at = float(data.get("checked_at") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return status, checked_at
+
+
+def _write_shared_infra_health(status: str, checked_at: float) -> None:
+    """Publish this consumer's fresh probe result for the whole runner to reuse.
+    Only a POSITIVE (`ok`) reading is ever written — a negative one must not
+    latch the runner (see _SHARED_HEALTH_REUSABLE), and a per-user ``degraded``
+    must never leak to co-hosted users. Best-effort + atomic (temp + rename, so
+    a peer never reads a half-written file); a write failure just means peers
+    keep probing themselves."""
+    if status not in _SHARED_HEALTH_REUSABLE:
+        return
+    try:
+        _atomic_write_text(
+            str(DECRYPT_HEALTH_FILE),
+            json.dumps({"status": status, "checked_at": checked_at}),
+        )
+    except Exception as e:
+        log.warning("shared decrypt-health write failed: %s", e)
 
 
 _decrypt_health_last_refresh = {"at": 0.0}
@@ -1885,12 +2152,46 @@ _decrypt_health_last_refresh = {"at": 0.0}
 
 def _maybe_refresh_decrypt_health() -> None:
     """Throttled idle refresh so an idle-but-healthy resident keeps a fresh
-    checked_at without probing the enclave on every poll cycle."""
+    checked_at without probing the enclave on every poll cycle.
+
+    Shared mode (FEEDLING_DECRYPT_HEALTH_SHARED): reading the runner-shared file
+    is a local op, so every idle cycle reuses a fresh peer reading — carrying its
+    REAL probe time — and only a stale/missing file triggers an actual enclave
+    probe, which is then republished for the runner. This cuts the probe rate
+    from O(users) to O(runner≈1). No lock: the window between the file going
+    stale and the first prober rewriting it is one enclave round trip, so at
+    most a handful of peers probe together before the fresh write reuses
+    everyone. The per-user envelope layer (_note_decrypt_read_*) still wins — a
+    standing ``degraded`` is never overridden by a shared ``ok``."""
     now = time.time()
+    if not DECRYPT_HEALTH_SHARED:
+        if now - _decrypt_health_last_refresh["at"] < DECRYPT_HEALTH_REFRESH_SEC:
+            return
+        _decrypt_health_last_refresh["at"] = now
+        _probe_decrypt_reachability()
+        return
+
+    shared = _read_shared_infra_health()
+    # Reuse a shared reading while it is within REFRESH_SEC (the same interval the
+    # probe throttle uses), carrying its real checked_at. This keeps the reported
+    # age ≤ REFRESH_SEC + one idle poll, safely inside the backend's 300s window
+    # (the freshness-budget test guards REFRESH_SEC ≤ window − 2·POLL_TIMEOUT).
+    if shared is not None and now - shared[1] < DECRYPT_HEALTH_REFRESH_SEC:
+        _apply_infra_health(shared[0], checked_at=shared[1])
+        return
+    # Missing or stale shared reading → probe and (if healthy) republish. Gate
+    # the actual enclave probe behind the SAME per-consumer throttle the
+    # non-shared path uses: fail-open must not turn "shared file unwritable /
+    # never fresh" into a probe on every idle cycle (an O(users)/30s storm
+    # against the single-threaded enclave — worse than the baseline this feature
+    # reduces). Reuse of a fresh peer reading above stays unthrottled (a free
+    # file read); only real probes are throttled.
     if now - _decrypt_health_last_refresh["at"] < DECRYPT_HEALTH_REFRESH_SEC:
         return
     _decrypt_health_last_refresh["at"] = now
-    _probe_decrypt_reachability()
+    status = _measure_infra_health()
+    _apply_infra_health(status)              # our own probe → checked_at = now
+    _write_shared_infra_health(status, now)  # only a positive reading publishes
 
 
 def _verify_decrypt_sources() -> bool:
@@ -1915,15 +2216,19 @@ def _verify_decrypt_sources() -> bool:
             resp.raise_for_status()
             log.info("decrypt source OK: enclave at %s", FEEDLING_ENCLAVE_URL)
             any_ok = True
-            _set_decrypt_health("ok")
+            # Reachability outcomes ALWAYS route through _apply_infra_health so
+            # they can never clobber a standing per-user `degraded` (at startup
+            # status is `unknown`, so this behaves identically to a bare set —
+            # the routing is the invariant, uniform across every call site).
+            _apply_infra_health("ok")
         except Exception as e:
             log.error(
                 "decrypt source UNREACHABLE: enclave at %s — %s",
                 FEEDLING_ENCLAVE_URL, e,
             )
-            _set_decrypt_health("unreachable")
+            _apply_infra_health("unreachable")
     else:
-        _set_decrypt_health("unconfigured")
+        _apply_infra_health("unconfigured")
 
     _decrypt_health_last_refresh["at"] = time.time()
     return any_ok
@@ -4129,6 +4434,166 @@ def _pi_turn_metrics(raw: str) -> dict:
             "cost_usd": round(cost, 6)}
 
 
+_PROVIDER_ATTEMPT_TRIGGERS = frozenset({"first", "stream_cut_retry", "redelivery"})
+_PROVIDER_REQUEST_ID_KEYS = frozenset({
+    "provider_request_id", "providerRequestId", "request_id", "requestId",
+})
+_PROVIDER_REQUEST_ID_RE = re.compile(
+    r"(?:provider[ _-]?)?request[ _-]?id\s*[:=]\s*[\(\"']?"
+    r"([A-Za-z0-9._:/-]{6,256})",
+    re.I,
+)
+
+
+def _provider_request_id(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in _PROVIDER_REQUEST_ID_KEYS:
+            candidate = value.get(key)
+            if isinstance(candidate, (str, int)):
+                text = str(candidate).strip()
+                if text:
+                    return text[:256]
+        for nested in value.values():
+            found = _provider_request_id(nested)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = _provider_request_id(nested)
+            if found:
+                return found
+    return ""
+
+
+def _provider_request_id_from_text(value: str) -> str:
+    match = _PROVIDER_REQUEST_ID_RE.search(value or "")
+    return match.group(1)[:256] if match else ""
+
+
+def _provider_attempt_error_class(text: str, *, returncode: int = 0) -> str:
+    lowered = (text or "").lower()
+    if _PI_STREAM_CUT_RE.search(text or ""):
+        return "stream_cut"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "timeout"
+    if "429" in lowered or "rate limit" in lowered:
+        return "rate_limit"
+    if "insufficient_quota" in lowered or "credit balance" in lowered:
+        return "quota"
+    if "401" in lowered or "403" in lowered or "invalid key" in lowered:
+        return "provider_auth"
+    if "connection" in lowered or "network" in lowered or "dns" in lowered:
+        return "network"
+    if returncode:
+        return "cli_exit"
+    return "provider_error"
+
+
+def _usage_tokens(usage: Any, *keys: str) -> int | None:
+    if not isinstance(usage, dict):
+        return None
+    for key in keys:
+        if key not in usage:
+            continue
+        try:
+            return max(0, int(usage[key]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _pi_provider_attempt_rows(
+    raw: str,
+    *,
+    parent_message_id: str,
+    trigger: str,
+    ts: float,
+) -> list[dict]:
+    rows: list[dict] = []
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict) or str(obj.get("type") or "") != "message_end":
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict) or str(msg.get("role") or "") != "assistant":
+            continue
+        usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else obj.get("usage")
+        stop_reason = str(msg.get("stopReason") or obj.get("stopReason") or "").lower()
+        error_text = str(msg.get("errorMessage") or obj.get("errorMessage") or "")
+        outcome = (
+            _provider_attempt_error_class(error_text or json.dumps(obj, ensure_ascii=False))
+            if stop_reason == "error" or error_text
+            else "ok"
+        )
+        rows.append({
+            "parent_message_id": parent_message_id,
+            "trigger": trigger,
+            "provider_request_id": (
+                _provider_request_id(msg)
+                or _provider_request_id(obj)
+                or _provider_request_id_from_text(error_text)
+            ),
+            "usage": {
+                "input_tokens": _usage_tokens(usage, "input", "input_tokens", "prompt_tokens"),
+                "output_tokens": _usage_tokens(usage, "output", "output_tokens", "completion_tokens"),
+            },
+            "outcome": outcome,
+            "ts": ts,
+        })
+    if len(rows) == 1 and not rows[0]["provider_request_id"]:
+        rows[0]["provider_request_id"] = _provider_request_id_from_text(raw)
+    return rows
+
+
+def _provider_attempt_rows_for_result(
+    cmd: list[str],
+    result: "subprocess.CompletedProcess",
+    *,
+    parent_message_id: str,
+    trigger: str,
+    ts: float | None = None,
+) -> list[dict]:
+    recorded_at = ts or time.time()
+    normalized_trigger = trigger if trigger in _PROVIDER_ATTEMPT_TRIGGERS else "first"
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    if _is_pi_cmd(cmd):
+        rows = _pi_provider_attempt_rows(
+            stdout,
+            parent_message_id=parent_message_id,
+            trigger=normalized_trigger,
+            ts=recorded_at,
+        )
+        if rows:
+            return rows
+    metrics = _cli_turn_metrics(cmd, result, 0)
+    raw = f"{stdout}\n{stderr}"
+    return [{
+        "parent_message_id": parent_message_id,
+        "trigger": normalized_trigger,
+        "provider_request_id": (
+            next(
+                (
+                    found
+                    for obj in _json_objects_from_cli_output(stdout)
+                    if (found := _provider_request_id(obj))
+                ),
+                "",
+            )
+            or _provider_request_id_from_text(stderr)
+        ),
+        "usage": {
+            "input_tokens": metrics.get("input_tokens"),
+            "output_tokens": metrics.get("output_tokens"),
+        },
+        "outcome": (
+            "ok"
+            if result.returncode == 0
+            else _provider_attempt_error_class(raw, returncode=result.returncode)
+        ),
+        "ts": recorded_at,
+    }]
+
+
 def _extract_text_from_cli_output(raw: str) -> str:
     """Best-effort extraction from raw CLI stdout.
 
@@ -4792,6 +5257,17 @@ def _is_pi_cmd(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "pi"
 
 
+def _driver_reads_stdin(cmd: list[str]) -> bool:
+    """Drivers that accept the prompt on STDIN, so a multi-line prompt never
+    rides the argv / cmd.exe command line. pi has always fed the message via
+    stdin; claude ``--print`` and codex ``exec`` also read a piped prompt when no
+    positional prompt is present. Detection must run on the RAW template tokens
+    (``cmd[0]`` == ``claude``/``codex``/``pi``), never a resolved path — on Windows
+    ``shutil.which('claude')`` returns ``claude.CMD`` whose ``Path().name`` is
+    ``claude.CMD``, which the per-driver helpers above would not match."""
+    return _is_pi_cmd(cmd) or _is_claude_code_cmd(cmd) or _is_codex_cmd(cmd)
+
+
 # pi's NO-ARGUMENT switches, transcribed from `pi --help` in the agent-runner image.
 # Everything else that looks like a flag is ASSUMED to take a value — pi lets
 # extensions register their own flags ("Extensions can register additional flags,
@@ -5017,7 +5493,7 @@ def _warn_if_agent_entry_may_drift() -> None:
     if AGENT_MODE != "cli" or not AGENT_CLI_CMD:
         return
 
-    if "{message}" not in AGENT_CLI_CMD and not _is_pi_cmd(_cli_cmd_tokens()):
+    if "{message}" not in AGENT_CLI_CMD and not _driver_reads_stdin(_cli_cmd_tokens()):
         log.error(
             "AGENT_CLI_CMD has NO {message} placeholder — every chat turn will "
             "FAIL: the consumer substitutes placeholders and never appends the "
@@ -5206,7 +5682,14 @@ def _render_cli_template(
     sid: str,
     image_paths: list[str] | None = None,
     lane: str = "background",
-) -> list[str]:
+) -> tuple[list[str], str | None]:
+    """Render the AGENT_CLI_CMD template into argv, returning
+    ``(argv, stdin_message)``. For claude/codex the message is delivered on STDIN
+    (``stdin_message`` is set and the message tokens are removed from argv) so a
+    multi-line prompt never rides the argv → cmd.exe command line (the Windows
+    ``claude.CMD`` shim truncates argv at the first newline). Every other driver
+    keeps the message in argv exactly as before and returns ``stdin_message=None``
+    (pi's own stdin path in ``call_agent_cli`` is unchanged)."""
     image_paths = image_paths or []
     msg_token = "__FEEDLING_MESSAGE__"
     sid_token = "__FEEDLING_SESSION_ID__"
@@ -5226,21 +5709,48 @@ def _render_cli_template(
     cmd = shlex.split(template)
     first_image = image_paths[0] if image_paths else ""
     all_images = " ".join(image_paths)
-    return [
-        part
-        .replace(msg_token, message)
-        .replace(sid_token, sid)
-        .replace(image_path_token, first_image)
-        .replace(image_paths_token, all_images)
-        for part in cmd
-    ]
+
+    def _sub(part: str) -> str:
+        return (
+            part
+            .replace(msg_token, message)
+            .replace(sid_token, sid)
+            .replace(image_path_token, first_image)
+            .replace(image_paths_token, all_images)
+        )
+
+    # claude/codex read the prompt on stdin (see _driver_reads_stdin). Strip the
+    # message-carrier token(s) from argv and hand the message back for stdin, so
+    # multi-line text never rides the cmd.exe command line. Detection is on the
+    # raw pre-resolve cmd[0] ("claude"/"codex"). pi is intentionally excluded here
+    # — it keeps its own stdin path in call_agent_cli.
+    if message and (_is_claude_code_cmd(cmd) or _is_codex_cmd(cmd)):
+        msg_idx = [i for i, part in enumerate(cmd) if msg_token in part]
+
+        def _clean_carrier(part: str) -> bool:
+            # A token that carries ONLY the message: a lone `{message}` positional
+            # (or shlex-collapsed `"{message}"`), or a `--flag=<message>` value.
+            if part == msg_token:
+                return True
+            return part.count(msg_token) == 1 and part.endswith("=" + msg_token)
+
+        # all() over an empty msg_idx is True: a claude/codex template with NO
+        # {message} placeholder still routes the message via stdin. A message
+        # embedded in a larger literal token (e.g. --prompt=Answer:{message}) is
+        # NOT a clean carrier → fall through to argv substitution (safety valve).
+        if all(_clean_carrier(cmd[i]) for i in msg_idx):
+            drop = set(msg_idx)
+            argv = [_sub(part) for i, part in enumerate(cmd) if i not in drop]
+            return argv, message
+
+    return [_sub(part) for part in cmd], None
 
 
 def _prepare_cli_command(
     message: str,
     image_paths: list[str] | None = None,
     lane: str = "background",
-) -> list[str]:
+) -> tuple[list[str], str | None]:
     sid = _load_agent_session_id()
     template_has_image_slot = "{image_path" in AGENT_CLI_CMD
     # codex gets pixels natively via injected --image= flags (_inject_codex_images);
@@ -5257,7 +5767,7 @@ def _prepare_cli_command(
     if (image_paths and not template_has_image_slot
             and not codex_native_images and not pi_native_images):
         rendered_message = _message_for_agent(message, image_paths)
-    cmd = _render_cli_template(rendered_message, sid, image_paths=image_paths, lane=lane)
+    cmd, stdin_msg = _render_cli_template(rendered_message, sid, image_paths=image_paths, lane=lane)
     cmd, sid = _ensure_explicit_cli_session_id(cmd, sid)
 
     cmd, missing_mcp = _strip_missing_mcp_config(cmd)
@@ -5336,7 +5846,7 @@ def _prepare_cli_command(
     if pi_native_images:
         cmd = _inject_pi_images(cmd, image_paths or [])
 
-    return _resolve_cli_executable(cmd)
+    return _resolve_cli_executable(cmd), stdin_msg
 
 
 def _codex_turn_metrics(raw: str) -> dict:
@@ -5651,6 +6161,7 @@ def call_agent_cli(
     raw_text: bool = False,
     trace_id: str = "",
     lane: str = "background",
+    attempt_trigger: str = "first",
 ) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
@@ -5667,14 +6178,15 @@ def call_agent_cli(
     # the agent — the render step substitutes placeholders and appends nothing.
     # This used to fail SILENTLY: the agent ran with no prompt and told the user
     # "your message never reached me" (usr_c190's xiake_wrapper, 2026-07-18).
-    # pi is exempt (its managed path feeds the message via stdin by design).
-    if message and "{message}" not in AGENT_CLI_CMD and not _is_pi_cmd(_cli_cmd_tokens()):
+    # Stdin drivers (pi/claude/codex) are exempt: they can deliver the message on
+    # stdin, so a template without {message} still reaches the agent.
+    if message and "{message}" not in AGENT_CLI_CMD and not _driver_reads_stdin(_cli_cmd_tokens()):
         raise RuntimeError(
             "AGENT_CLI_CMD is missing the {message} placeholder — the user's "
             "message cannot reach the agent. Add {message} to the command "
             "template (e.g. claude -p \"{message}\")."
         )
-    cmd = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
+    cmd, stdin_msg = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     _turn_t0 = time.monotonic()
@@ -5714,9 +6226,46 @@ def call_agent_cli(
         _run_kwargs["cwd"] = _cli_cwd
     if _is_pi_cmd(cmd):
         _run_kwargs["input"] = message if "{message}" not in AGENT_CLI_CMD else ""
+    elif stdin_msg is not None:
+        # claude/codex: the prompt was stripped from argv by _render_cli_template
+        # and travels on stdin instead (multi-line text must not ride cmd.exe).
+        _run_kwargs["input"] = stdin_msg
+    ledger_enabled = bool(trace_id and lane == "chat")
+    normalized_attempt_trigger = (
+        attempt_trigger if attempt_trigger in _PROVIDER_ATTEMPT_TRIGGERS else "first"
+    )
     try:
         result = subprocess.run(cmd, **_run_kwargs)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        if ledger_enabled:
+            def _timeout_text(value: Any) -> str:
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", errors="replace")
+                return str(value or "")
+
+            timeout_stdout = _timeout_text(getattr(exc, "stdout", ""))
+            timeout_stderr = _timeout_text(getattr(exc, "stderr", ""))
+            timeout_rows = (
+                _pi_provider_attempt_rows(
+                    timeout_stdout,
+                    parent_message_id=trace_id,
+                    trigger=normalized_attempt_trigger,
+                    ts=time.time(),
+                )
+                if _is_pi_cmd(cmd)
+                else []
+            )
+            timeout_rows.append({
+                "parent_message_id": trace_id,
+                "trigger": normalized_attempt_trigger,
+                "provider_request_id": _provider_request_id_from_text(
+                    f"{timeout_stdout}\n{timeout_stderr}"
+                ),
+                "usage": {"input_tokens": None, "output_tokens": None},
+                "outcome": "timeout",
+                "ts": time.time(),
+            })
+            _queue_provider_attempt_ledger(timeout_rows)
         _emit_debug_trace("agent", "agent.model.call.error", status="error", trace_id=trace_id,
                           dur_ms=(time.monotonic() - _turn_t0) * 1000,
                           summary="cli turn timeout",
@@ -5788,6 +6337,13 @@ def call_agent_cli(
         },
         content_excerpt=_excerpt,
     )
+    if ledger_enabled:
+        _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
+            cmd,
+            result,
+            parent_message_id=trace_id,
+            trigger=normalized_attempt_trigger,
+        ))
 
     raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
     if _is_pi_cmd(cmd):
@@ -5834,9 +6390,18 @@ def call_agent_cli(
                 summary="stale --resume cleared; single fresh-session retry",
                 explain="claude 本地会话丢失(--resume 指向不存在的会话)——已清除并用新会话重试本轮",
             )
-            cmd = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
+            cmd, stdin_msg = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
             command_sid = _cli_flag_value(cmd, "--session-id")
+            if stdin_msg is not None:
+                _run_kwargs["input"] = stdin_msg
             result = subprocess.run(cmd, **_run_kwargs)
+            if ledger_enabled:
+                _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
+                    cmd,
+                    result,
+                    parent_message_id=trace_id,
+                    trigger=normalized_attempt_trigger,
+                ))
             _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
             raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
             # Persist the fresh session so the NEXT turn resumes it — but ONLY
@@ -5883,6 +6448,13 @@ def call_agent_cli(
                 explain="上游把流式回复中途掐断(无 finish_reason)——立即重试本轮一次",
             )
             result = subprocess.run(cmd, **_run_kwargs)
+            if ledger_enabled:
+                _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
+                    cmd,
+                    result,
+                    parent_message_id=trace_id,
+                    trigger="stream_cut_retry",
+                ))
             _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
             raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
             if observed_sid:
@@ -6134,6 +6706,7 @@ def call_agent(
     raw_text: bool = False,
     trace_id: str = "",
     lane: str = "background",
+    attempt_trigger: str = "first",
 ) -> Any:
     if AGENT_MODE == "http":
         # http path metrics/timing are out of scope for this event pair (cli-only);
@@ -6143,7 +6716,7 @@ def call_agent(
     elif AGENT_MODE == "cli":
         raw = call_agent_cli(
             message, image_paths=image_paths, raw_text=raw_text,
-            trace_id=trace_id, lane=lane)
+            trace_id=trace_id, lane=lane, attempt_trigger=attempt_trigger)
     else:
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
@@ -7749,6 +8322,56 @@ def _proactive_tick_interval_for_broadcast_state(
                 min(PROACTIVE_WAKE_INTERVAL_MAX_SEC, interval),
             )
     return max(60, PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC)
+
+
+def _next_proactive_tick_delay_sec(
+    decision: dict[str, Any] | None,
+    broadcast_state: str,
+    *,
+    now: float | None = None,
+) -> float:
+    """Seconds until the next heartbeat tick, aligned to the server-side gate.
+
+    The backend's heartbeat throttle (gate ①, 2026-07-24) returns
+    ``heartbeat_next_tick_at`` (server-clock epoch) on every tick decision —
+    including throttled ones. Aligning to it fixes two waste modes the local
+    interval alone can't see:
+
+    - restart amnesia: this process's tick clock lives in memory, and host-all
+      consumers are recycled minutes-apart. Before the gate, every restart fired
+      an opening tick 15s in (the 2026-07-22 heartbeat flood, TOP user 467/day).
+      Now the first tick may come back ``heartbeat_throttled`` — instead of
+      retrying on the full local interval (or hammering), sleep exactly until
+      the gate opens.
+    - interval drift: after an admitted heartbeat the gate advances to
+      now+interval, so aligning is equivalent to the local schedule — but if the
+      user shrinks their interval mid-cycle the next decision reflects it
+      immediately.
+
+    Server epoch vs local clock skew is tolerated: the value is used as a
+    relative delay from the *response*, so only inter-host skew (small vs the
+    900s minimum interval) matters, and the server gate stays authoritative
+    regardless. Missing/zero/past field (old backend, first-ever heartbeat) →
+    fall back to the local per-user interval, the pre-② behaviour.
+    """
+    decision = decision if isinstance(decision, dict) else {}
+    fallback = float(_proactive_tick_interval_for_broadcast_state(
+        broadcast_state, decision.get("wake_interval_sec")
+    ))
+    try:
+        gate_at = float(decision.get("heartbeat_next_tick_at") or 0.0)
+    except (TypeError, ValueError):
+        return fallback
+    if gate_at <= 0:
+        return fallback
+    wait = gate_at - (time.time() if now is None else float(now))
+    if wait <= 0:
+        # Gate already open (or skewed into the past): the local interval still
+        # paces us; the server gate would re-throttle a genuinely-early tick.
+        return fallback
+    # Never tick before the gate opens (that tick is a guaranteed throttle), and
+    # keep a 60s floor so a nearly-open gate doesn't busy-loop.
+    return max(60.0, wait)
 
 
 def post_proactive_tick(payload: dict[str, Any] | None = None) -> dict:
@@ -11109,7 +11732,7 @@ def _process_messages(messages: list) -> float:
             if FEEDLING_ENCLAVE_URL:
                 _note_decrypt_read_failure()
             else:
-                _set_decrypt_health("unconfigured")
+                _apply_infra_health("unconfigured")   # reachability → guarded set
             log.warning(
                 "user message has no plaintext content ts=%.3f content_type=%s "
                 "— skipping (set FEEDLING_ENCLAVE_URL to enable decryption)",
@@ -11131,6 +11754,9 @@ def _process_messages(messages: list) -> float:
             log.info("user message [ts=%.3f]: %s", ts, content[:80])
 
         trace_id = str(msg.get("id") or msg.get("message_id") or "").strip()
+        attempt_trigger = str(msg.get("_provider_attempt_trigger") or "first")
+        if attempt_trigger not in _PROVIDER_ATTEMPT_TRIGGERS:
+            attempt_trigger = "first"
 
         screen_text, screen_payloads, screen_paths = _screen_context_for_message(content)
         screen_attached = bool(screen_payloads or screen_paths)
@@ -11196,6 +11822,11 @@ def _process_messages(messages: list) -> float:
         content = _foreground_agent_message(content, current_ts=ts)
 
         use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
+        attempt_kwargs = (
+            {"attempt_trigger": attempt_trigger}
+            if attempt_trigger != "first"
+            else {}
+        )
         # 本回合失败时待发的 system 通知。不在失败当场发，而是等下面的回复写入被
         # 服务端接受（posted_any）后再发（Codex review）：claim 过期 failover 时另
         # 一个 consumer 已回复，本家的兜底会被 already_answered 409 拒——通知若先
@@ -11210,7 +11841,8 @@ def _process_messages(messages: list) -> float:
             if use_runtime_v2:
                 agent_result = call_agent(
                     _resident_foreground_chat_message_v2(content),
-                    trace_id=trace_id, lane="chat")
+                    trace_id=trace_id, lane="chat",
+                    **attempt_kwargs)
             elif image_payloads or image_paths:
                 agent_result = call_agent(
                     content,
@@ -11218,9 +11850,15 @@ def _process_messages(messages: list) -> float:
                     image_paths=image_paths,
                     trace_id=trace_id,
                     lane="chat",
+                    **attempt_kwargs,
                 )
             else:
-                agent_result = call_agent(content, trace_id=trace_id, lane="chat")
+                agent_result = call_agent(
+                    content,
+                    trace_id=trace_id,
+                    lane="chat",
+                    **attempt_kwargs,
+                )
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
             # Codex review I10: call_agent raised, so the prompt (catalog
@@ -12346,7 +12984,7 @@ def run() -> None:
         # value stays `unknown` and the first real message's empty-content path
         # would mislabel it `degraded`, hiding the most actionable classification
         # (FEEDLING_ENCLAVE_URL unset) for exactly the usr_6c1971 case.
-        _set_decrypt_health("unconfigured")
+        _apply_infra_health("unconfigured")   # reachability → guarded set
         _decrypt_health_last_refresh["at"] = time.time()
         log.warning(
             "⚠️  No decryption source configured (FEEDLING_ENCLAVE_URL is unset). "
@@ -12482,8 +13120,13 @@ def run() -> None:
                         last_broadcast_state = str(
                             decision.get("broadcast_state") or last_broadcast_state or ""
                         ).strip().lower()
-                        next_interval = _proactive_tick_interval_for_broadcast_state(
-                            last_broadcast_state, decision.get("wake_interval_sec")
+                        # ② heartbeat governance: align the next tick to the
+                        # server-side gate (decision.heartbeat_next_tick_at) so a
+                        # restarted process doesn't re-tick early and a throttled
+                        # tick sleeps exactly until the gate opens. Falls back to
+                        # the local per-user interval on old backends.
+                        next_interval = _next_proactive_tick_delay_sec(
+                            decision, last_broadcast_state
                         )
                         log.info(
                             "proactive wake tick wake=%s reason=%s enqueued=%s frames=%d broadcast=%s next=%ds",
@@ -12492,7 +13135,7 @@ def run() -> None:
                             bool(tick.get("enqueued")),
                             len(decision.get("frame_ids") or []),
                             last_broadcast_state or "unknown",
-                            next_interval,
+                            int(next_interval),
                         )
                         next_proactive_tick_mono = time.monotonic() + next_interval
                     if screen_watch_enabled and time.monotonic() >= next_screen_watch_mono:
@@ -12610,7 +13253,12 @@ def run() -> None:
                 if decrypted is None:
                     # All configured sources failed — skip this cycle, keep checkpoint.
                     # A poll carried messages but decryption is down: unreachable.
-                    _set_decrypt_health("unreachable")
+                    # Route through _apply_infra_health (NOT _set_decrypt_health) so
+                    # a standing per-user `degraded` is preserved: a bare set here
+                    # would clobber degraded → unreachable, and a later reachability
+                    # `ok` would then clear it, laundering a real per-user decrypt
+                    # outage back to green (the two-step hole the degrade-guard closes).
+                    _apply_infra_health("unreachable")
                     log.warning(
                         "poll triggered but all decrypt sources failed; "
                         "skipping cycle (messages not processed)"
@@ -12625,7 +13273,11 @@ def run() -> None:
                             last_ts = pts
                             _save_checkpoint(last_ts)
                     continue
-                messages = _filter_messages_to_poll_ids(decrypted, poll_messages)
+                messages = _filter_messages_to_poll_ids(
+                    decrypted,
+                    poll_messages,
+                    last_ts=last_ts,
+                )
                 if not messages:
                     # Claimed ids weren't in the decrypt history — the messages
                     # exist and were leased but can't be read: a read failure,
@@ -12664,7 +13316,11 @@ def run() -> None:
             else:
                 # No decrypt source — fall through with poll content (will be
                 # empty for v1 encrypted messages, skipped in _process_messages).
-                messages = poll_messages
+                messages = _filter_messages_to_poll_ids(
+                    poll_messages,
+                    poll_messages,
+                    last_ts=last_ts,
+                )
 
             new_ts = _process_messages(messages)
             if new_ts > last_ts:

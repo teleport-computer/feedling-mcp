@@ -15,6 +15,7 @@ from screen import frames as screen_frames
 SCREEN_WATCH_JOB_KIND = "screen_watch"
 ACTIVATION_PENDING_REASON = "activation_pending"
 LOOP_GUARD_BLOCK_REASON = "proactive_idle_loop"
+HEARTBEAT_THROTTLED_REASON = "heartbeat_throttled"
 
 
 def _clean_runtime_token(raw: object) -> str:
@@ -85,6 +86,19 @@ def _proactive_v2_wake_kind(trigger: str, *, frame_ids: list[str], job_kind: str
     if normalized_trigger in {"broadcast_opened", "screen_tick"}:
         return "screen"
     return "presence"
+
+
+def _is_throttled_heartbeat_scope(
+    trigger: str,
+    *,
+    manual: bool,
+    job_kind: str = "",
+) -> bool:
+    return (
+        not manual
+        and str(job_kind or "").strip().lower() != SCREEN_WATCH_JOB_KIND
+        and str(trigger or "").strip().lower().startswith("heartbeat")
+    )
 
 
 def _latest_payload_state_from_events(store: UserStore, key: str, allowed: set[str]) -> str:
@@ -181,6 +195,7 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
     wake_interval_sec = core_store.normalize_proactive_wake_interval_sec(
         settings.get("wake_interval_sec")
     )
+    heartbeat_next_tick_at = core_store.proactive_heartbeat_next_tick_at(settings)
     trigger = _proactive_trigger(payload, manual=manual, frames=selected_frames, explicit_trigger=explicit_trigger)
     if not job_kind:
         job_kind = _proactive_job_kind(payload, trigger=trigger)
@@ -197,6 +212,16 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
             settings=resolve_settings_v2(settings),
         )
         block_reason = "" if wake_control.accepted else wake_control.reason
+        if (
+            not block_reason
+            and _is_throttled_heartbeat_scope(
+                trigger,
+                manual=manual,
+                job_kind=job_kind,
+            )
+            and now < heartbeat_next_tick_at
+        ):
+            block_reason = HEARTBEAT_THROTTLED_REASON
         if not block_reason and not manual and not is_screen_watch and loop_guard_blocked:
             block_reason = LOOP_GUARD_BLOCK_REASON
         if not block_reason and not manual and not is_screen_watch:
@@ -248,6 +273,7 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
         "ai_state": ai_state,
         "broadcast_state": broadcast_state,
         "wake_interval_sec": wake_interval_sec,
+        "heartbeat_next_tick_at": heartbeat_next_tick_at,
         "semantic": {
             "reference": "agent_owned_v2",
             "llm_confidence": None,

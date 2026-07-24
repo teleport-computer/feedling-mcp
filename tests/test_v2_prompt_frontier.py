@@ -104,26 +104,52 @@ def test_deployment_override_precedence_is_most_specific_first():
     )
 
 
-def test_unknown_model_and_custom_endpoint_require_an_explicit_limit():
+def test_unaudited_route_gets_conservative_default(monkeypatch):
+    """A custom relay / unknown model with nothing more specific configured now
+    resolves to a conservative default instead of a hard rejection, so custom
+    relays are usable without every client sending context_window_tokens."""
+    monkeypatch.delenv(frontier._UNAUDITED_DEFAULT_ENV, raising=False)
+    resolved = frontier.resolve_model_limit("some-relay", "mystery-model")
+    assert resolved.source == "unaudited_default"
+    assert resolved.context_window_tokens == 16384
+    # A first-party provider NAME pointed at a custom base_url is still unaudited.
+    custom = frontier.resolve_model_limit(
+        "openai", "gpt-4o-mini", base_url="https://llm-proxy.example/v1"
+    )
+    assert custom.source == "unaudited_default"
+    assert custom.context_window_tokens == 16384
+
+
+def test_unaudited_default_is_env_tunable_and_zero_restores_fail_closed(monkeypatch):
+    monkeypatch.setenv(frontier._UNAUDITED_DEFAULT_ENV, "16384")
+    assert (
+        frontier.resolve_model_limit("some-relay", "m").context_window_tokens == 16384
+    )
+    # 0 opts back into strict fail-closed rejection.
+    monkeypatch.setenv(frontier._UNAUDITED_DEFAULT_ENV, "0")
     with pytest.raises(
         frontier.PromptContextLimitUnconfigured,
         match="^prompt_context_limit_unconfigured$",
     ) as unknown:
         frontier.resolve_model_limit("some-relay", "mystery-model")
     assert unknown.value.provider == "some_relay"
-    assert unknown.value.model == "mystery-model"
 
-    with pytest.raises(
-        frontier.PromptContextLimitUnconfigured,
-        match="^prompt_context_limit_unconfigured$",
-    ) as custom:
-        frontier.resolve_model_limit(
-            "openai",
-            "gpt-4o-mini",
-            base_url="https://llm-proxy.example/v1",
-        )
-    assert custom.value.provider == "openai"
-    assert custom.value.model == "gpt-4o-mini"
+
+def test_unaudited_default_is_lowest_precedence(monkeypatch):
+    """Override > caller-supplied > audited family all still win over the default,
+    so enabling the default never masks a value someone stated explicitly."""
+    monkeypatch.delenv(frontier._UNAUDITED_DEFAULT_ENV, raising=False)
+    supplied = frontier.resolve_model_limit(
+        "some-relay", "m", provider_context_window_tokens=4096
+    )
+    assert supplied.source == "provider_metadata"
+    assert supplied.context_window_tokens == 4096
+    override = frontier.resolve_model_limit(
+        "some-relay", "m", deployment_overrides={"*:*": 12000}
+    )
+    assert override.source == "deployment_override"
+    audited = frontier.resolve_model_limit("open-ai", "gpt-4o-mini")
+    assert audited.source == "audited_family"
 
 
 def test_unknown_route_override_is_explicit_and_applies_before_rejection():
@@ -459,6 +485,11 @@ def _run_loop(*, monkeypatch, provider, fold, build_messages, **kwargs):
 
 
 def test_tool_loop_rejects_unconfigured_custom_limit_before_provider_io(monkeypatch):
+    # With the unaudited default disabled (fail-closed mode), an unconfigured
+    # custom route is still rejected BEFORE any provider I/O. (The default-on
+    # behaviour — a conservative window instead of rejection — is covered by the
+    # resolve_model_limit unit tests above.)
+    monkeypatch.setenv(frontier._UNAUDITED_DEFAULT_ENV, "0")
     calls = []
 
     async def provider(_config, _messages, *, tools=None):

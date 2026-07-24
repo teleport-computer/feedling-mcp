@@ -42,10 +42,29 @@ jobs:
           # key 按字典序≈时间序、ISO 时间戳字典序也=时间序，故排序末行即最新。空前缀
           # aws 返回单行 "None"，经 sort|tail 仍是 "None"，check_age 照常当 EMPTY 处理。
           # 注意：不能用 --no-paginate（只取第一页=最旧的 key → 反而误报 stale）。
-          newest() { aws s3api list-objects-v2 --endpoint-url "$ENDPOINT" \
-            --bucket io-in-enclave-db --prefix "$1" \
-            --query 'sort_by(Contents,&LastModified)[-1].LastModified' --output text \
-            | sort | tail -n1; }
+          #
+          # aws 的退出码必须自己接：老写法 `aws ... | sort | tail -n1` 的退出码取自
+          # tail，恒为 0。R2 在分页途中限流（ServiceUnavailable: Reduce your
+          # concurrent request rate）时，aws 中断退出但前几页已经打印出来，于是
+          # 函数照常返回一个「偏旧的最大值」，下游把它当成备份陈旧误报——2026-07-24
+          # 11:15 实测：吐出 09:54 报 "WAL stale 4950s"，而同一时刻库里
+          # pg_stat_archiver.last_archived_time 只有 1s 前、failed_count 自 07-13 未涨。
+          # 限流是瞬时的，故先退避重试；连续失败才报错，且措辞明确区分「R2 查不了」
+          # 与「备份真的陈旧」，避免下一个人照着假信号去查归档。
+          newest() {
+            local prefix="$1" raw rc attempt
+            for attempt in 1 2 3; do
+              raw=$(aws s3api list-objects-v2 --endpoint-url "$ENDPOINT" \
+                --bucket io-in-enclave-db --prefix "$prefix" \
+                --query 'sort_by(Contents,&LastModified)[-1].LastModified' \
+                --output text) && rc=0 || rc=$?
+              if [ "$rc" -eq 0 ]; then printf '%s\n' "$raw" | sort | tail -n1; return 0; fi
+              echo "::warning::ListObjectsV2 '${prefix}' 第 ${attempt} 次失败 (rc=${rc})，退避重试" >&2
+              sleep $((attempt * 10))
+            done
+            echo "::error::ListObjectsV2 '${prefix}' 连续 3 次失败 — R2 侧问题，本次无法判定备份新鲜度（不等于备份陈旧）" >&2
+            return 1
+          }
           WAL_TS=$(newest "prod/wal-g/wal_005/")
           BASE_TS=$(newest "prod/wal-g/basebackups_005/")
           echo "newest wal: $WAL_TS | newest base sentinel: $BASE_TS"

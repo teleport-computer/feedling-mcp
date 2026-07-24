@@ -450,6 +450,36 @@ def load_all_users() -> list[dict]:
         return []
 
 
+def find_user_by_api_key_hash(h: str) -> dict | None:
+    """Return the user document whose api key hashes to ``h``, or None.
+
+    The shared source of truth for the in-memory registry's miss fallback
+    (``accounts.registry._resolve_user``): under many workers a just-registered
+    user may not yet be in a given worker's ``_users`` snapshot, and a pure
+    in-memory miss would 401 a valid key. Matching mirrors the in-memory scan:
+    the legacy top-level ``api_key_hash`` matches unconditionally, while an
+    ``api_keys[]`` entry matches only when it is not revoked.
+
+    Unlike the swallow-and-log helpers above, this DELIBERATELY lets a database
+    error PROPAGATE. The caller must be able to tell a transient DB failure apart
+    from a genuine "no such user": on an error it degrades to unauthenticated for
+    that one attempt WITHOUT negative-caching, so a pool-timeout hiccup can't pin
+    a valid key to 401 for the whole cache TTL. ``None`` here means only a
+    definitive miss (the query ran and matched nothing)."""
+    if not h:
+        return None
+    sql = (
+        "SELECT doc FROM users WHERE doc->>'api_key_hash' = %s "
+        "OR EXISTS (SELECT 1 FROM jsonb_array_elements("
+        "COALESCE(doc->'api_keys', '[]'::jsonb)) AS k "
+        "WHERE k->>'api_key_hash' = %s AND COALESCE(k->>'revoked_at', '') = '') "
+        "LIMIT 1"
+    )
+    with get_pool().connection() as conn:
+        row = conn.execute(sql, (h, h)).fetchone()
+    return row[0] if row else None
+
+
 def insert_user(entry: dict) -> None:
     """Insert one user document. ON CONFLICT DO NOTHING so the migration is
     idempotent and a re-registration race can't duplicate a user_id."""
@@ -600,7 +630,9 @@ def save_all_users(users: list[dict]) -> None:
     mirror.execute_many(mirror_group)
 
 
-def delete_user(user_id: str) -> None:
+def delete_user(user_id: str) -> bool:
+    """False means no such account — callers answer 404 instead of claiming a
+    deletion that never happened."""
     sql = "DELETE FROM users WHERE user_id = %s"
     with get_pool().connection() as conn:
         with conn.transaction():
@@ -608,6 +640,12 @@ def delete_user(user_id: str) -> None:
                 _lock_chat_user_fence_on_cursor(
                     cur, user_id, exclusive=True,
                 )
+                # Under the exclusive fence an absent users row is final, so bail
+                # out before the lifecycle marker below materializes a
+                # chat_r2_lifecycle row for an account that never existed.
+                cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
+                if cur.fetchone() is None:
+                    return False
                 # Lock before the users-row DELETE/FK cascade. The chat DELETE
                 # trigger writes cleanup rows with no users FK, so both lifecycle
                 # generation and exact-key intents survive account removal.
@@ -617,6 +655,7 @@ def delete_user(user_id: str) -> None:
                 cur.execute(sql, (user_id,))
     from tee_shadow import mirror
     mirror.execute(sql, (user_id,))
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1782,7 +1821,8 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
                         to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
                         COALESCE(NULLIF(doc->>'job_kind',''), NULLIF(doc->>'wake_kind',''),
                                  NULLIF(doc->>'trigger',''), 'unknown') AS kind,
-                        COALESCE(doc->>'status','') AS status
+                        COALESCE(doc->>'status','') AS status,
+                        COALESCE(doc->>'status_reason','') AS status_reason
                     FROM user_logs
                     WHERE stream = 'proactive_jobs'
                       AND ts IS NOT NULL
@@ -1806,7 +1846,12 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
                        (COUNT(*) FILTER (WHERE kind IN {screen_kinds}))::int AS screen,
                        -- 自发 tick：现网 kind 是 'presence'，heartbeat* 为历史 kind
                        (COUNT(*) FILTER (WHERE (kind = 'presence' OR kind LIKE 'heartbeat%%')
-                                          AND kind NOT IN {screen_kinds}))::int AS heartbeat
+                                          AND kind NOT IN {screen_kinds}))::int AS heartbeat,
+                       -- ①服务端心跳闸拦下的 tick(gate reason=heartbeat_throttled)。
+                       -- 闸上线前恒 0；上线后此列直接读出闸每天拦了多少。
+                       (COUNT(*) FILTER (WHERE status = 'skipped'
+                                          AND status_reason = 'heartbeat_throttled'))::int
+                           AS heartbeat_throttled
                 FROM jobs
                 GROUP BY day
                 ORDER BY day DESC
@@ -1819,12 +1864,181 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
                 "day": r[0], "jobs": r[1], "delivered": r[2], "completed": r[3],
                 "failed": r[4], "skipped": r[5], "pending": r[6], "maintenance": r[7],
                 "maintenance_failed": r[8], "screen": r[9], "heartbeat": r[10],
+                "heartbeat_throttled": r[11],
             }
             for r in rows
         ]
     except Exception as e:
         log.error("[db] admin_data_track_proactive_daily failed: %s", e)
         return []
+
+
+def admin_data_track_proactive_kinds(*, since_epoch: float = 0.0, days: int = 30,
+                                     tz: str = "Asia/Shanghai") -> dict[str, dict[str, int]]:
+    """Per-Beijing-day raw kind counts: {day: {kind: count}}.
+
+    与 admin_data_track_proactive_daily 同一个 kind 定义(job_kind → wake_kind →
+    trigger → 'unknown')。全量分桶而不是猜枚举——现网出现过什么 kind 就报什么,
+    新增唤醒源(解锁/到达/照片/scheduled…)自动出现,不需要每次改 SQL。
+    2026-07 心跳暴增排查花了半天才发现分类盲区,这个函数就是那次的教训。"""
+    day_limit = max(1, min(int(days or 30), 366))
+    since = float(since_epoch or 0.0)
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
+                       COALESCE(NULLIF(doc->>'job_kind',''), NULLIF(doc->>'wake_kind',''),
+                                NULLIF(doc->>'trigger',''), 'unknown') AS kind,
+                       COUNT(*)::int AS n
+                FROM user_logs
+                WHERE stream = 'proactive_jobs'
+                  AND ts IS NOT NULL
+                  AND (%s = 0 OR ts >= %s)
+                GROUP BY day, kind
+                ORDER BY day DESC
+                """,
+                (tz, since, since),
+            ).fetchall()
+        out: dict[str, dict[str, int]] = {}
+        for day, kind, n in rows:
+            if len(out) >= day_limit and day not in out:
+                continue
+            out.setdefault(day, {})[kind] = int(n)
+        return out
+    except Exception as e:
+        log.error("[db] admin_data_track_proactive_kinds failed: %s", e)
+        return {}
+
+
+def admin_proactive_heartbeat_overspeed(*, since_epoch: float = 0.0, days: int = 7,
+                                        tz: str = "Asia/Shanghai") -> dict[str, list[dict]]:
+    """超速哨兵：每天心跳 job 数超过其 wake_interval 物理上限的用户。
+
+    物理上限 = 86400 / clamp(wake_interval_sec, 900, 43200)(默认 7200 → 12/天),
+    +1 容差(重启/日界的首 tick)。任何用户超上限 = 频率闸失效的直接信号
+    (2026-07-22:中位 68/天 vs 默认上限 12,靠人肉挖了半天——这个哨兵让它
+    自己跳出来)。返回 {day: [{user_id, heartbeats, interval_sec, cap}, ...]},
+    仅含超速用户,按超速幅度降序。
+
+    两个来源 UNION:legacy V1(user_logs stream='proactive_jobs',consumer tick
+    经 gate)+ Runtime V2(agent_jobs lane='heartbeat',serve-worker 调度器
+    enqueue)。V2 被 gate block 时不落 job 行,所以 V2 侧天然全是 admitted,
+    无需 throttled 排除;dual 共存下用户切换 runtime 也不会脱离监控。"""
+    day_limit = max(1, min(int(days or 7), 60))
+    since = float(since_epoch or 0.0)
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                """
+                WITH hb_raw AS (
+                    SELECT user_id,
+                           to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day
+                    FROM user_logs
+                    WHERE stream = 'proactive_jobs'
+                      AND ts IS NOT NULL
+                      AND (%s = 0 OR ts >= %s)
+                      AND (
+                        COALESCE(NULLIF(doc->>'job_kind',''), NULLIF(doc->>'wake_kind',''),
+                                 NULLIF(doc->>'trigger',''), 'unknown') = 'presence'
+                        OR COALESCE(NULLIF(doc->>'job_kind',''), NULLIF(doc->>'wake_kind',''),
+                                    NULLIF(doc->>'trigger',''), 'unknown') LIKE 'heartbeat%%'
+                      )
+                      AND COALESCE(NULLIF(doc->>'job_kind',''), NULLIF(doc->>'wake_kind',''),
+                                   NULLIF(doc->>'trigger',''), 'unknown')
+                          NOT IN ('screen_watch','scene_change','screen_tick',
+                                  'broadcast_opened','heartbeat_broadcast_on')
+                      -- 哨兵只数「放行(admitted)」的心跳:①闸拦下的 throttled
+                      -- skipped 是闸在正常工作,不能算——否则闸守得越好标得越红,
+                      -- 与「出现即闸失效」的页面语义正好相反(codex review ④)。
+                      AND NOT (COALESCE(doc->>'status','') = 'skipped'
+                               AND COALESCE(doc->>'status_reason','') = 'heartbeat_throttled')
+
+                    UNION ALL
+
+                    -- Runtime V2 pooled worker heartbeats (blocked wakes never
+                    -- enqueue, so every row here is admitted by definition).
+                    SELECT user_id,
+                           to_char(created_at AT TIME ZONE %s, 'YYYY-MM-DD') AS day
+                    FROM agent_jobs
+                    WHERE lane = 'heartbeat'
+                      AND (%s = 0 OR created_at >= to_timestamp(%s))
+                ),
+                hb AS (
+                    SELECT user_id, day, COUNT(*)::int AS heartbeats
+                    FROM hb_raw
+                    GROUP BY user_id, day
+                ),
+                intervals AS (
+                    SELECT user_id,
+                           GREATEST(900, LEAST(43200, COALESCE(
+                               NULLIF(doc->>'wake_interval_sec','')::int, 7200
+                           ))) AS interval_sec
+                    FROM user_blobs
+                    WHERE kind = 'proactive_settings'
+                      AND COALESCE(doc->>'wake_interval_sec','') ~ '^[0-9]{1,6}$'
+                )
+                SELECT hb.day, hb.user_id, hb.heartbeats,
+                       COALESCE(i.interval_sec, 7200) AS interval_sec,
+                       (86400 / COALESCE(i.interval_sec, 7200))::int AS cap
+                FROM hb
+                LEFT JOIN intervals i ON i.user_id = hb.user_id
+                WHERE hb.heartbeats > (86400 / COALESCE(i.interval_sec, 7200)) + 1
+                ORDER BY hb.day DESC, (hb.heartbeats::float / GREATEST(1, 86400 / COALESCE(i.interval_sec, 7200))) DESC
+                """,
+                (tz, since, since, tz, since, since),
+            ).fetchall()
+        out: dict[str, list[dict]] = {}
+        for day, user_id, heartbeats, interval_sec, cap in rows:
+            if len(out) >= day_limit and day not in out:
+                continue
+            out.setdefault(day, []).append({
+                "user_id": user_id, "heartbeats": int(heartbeats),
+                "interval_sec": int(interval_sec), "cap": int(cap),
+            })
+        return out
+    except Exception as e:
+        log.error("[db] admin_proactive_heartbeat_overspeed failed: %s", e)
+        return {}
+
+
+def admin_v2_heartbeat_daily(*, since_epoch: float = 0.0, days: int = 30,
+                             tz: str = "Asia/Shanghai") -> dict[str, dict]:
+    """Runtime V2 心跳日聚合:{day: {jobs, completed, failed, expired}}。
+
+    V2 唤醒走 agent_jobs(lane='heartbeat'),从不写 legacy proactive_jobs 流
+    ——④日报最初只读旧流,V2 心跳是观测盲区(2026-07-24 Seven 定补)。口径
+    对齐 jobs_store.wake_success_stats:completed=成功(含醒了决定不发声),
+    failed/expired=失败侧;这里按天分桶供日报并列展示。blocked 的 wake 不落
+    行,所以 jobs=当天 admitted 总量。"""
+    day_limit = max(1, min(int(days or 30), 366))
+    since = float(since_epoch or 0.0)
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT to_char(created_at AT TIME ZONE %s, 'YYYY-MM-DD') AS day,
+                       COUNT(*)::int AS jobs,
+                       (COUNT(*) FILTER (WHERE status = 'completed'))::int AS completed,
+                       (COUNT(*) FILTER (WHERE status = 'failed'))::int AS failed,
+                       (COUNT(*) FILTER (WHERE status = 'expired'))::int AS expired
+                FROM agent_jobs
+                WHERE lane = 'heartbeat'
+                  AND (%s = 0 OR created_at >= to_timestamp(%s))
+                GROUP BY day
+                ORDER BY day DESC
+                LIMIT %s
+                """,
+                (tz, since, since, day_limit),
+            ).fetchall()
+        return {
+            r[0]: {"jobs": int(r[1]), "completed": int(r[2]),
+                   "failed": int(r[3]), "expired": int(r[4])}
+            for r in rows
+        }
+    except Exception as e:
+        log.error("[db] admin_v2_heartbeat_daily failed: %s", e)
+        return {}
 
 
 # Route split for the event-health view: model_api → "API", everything else
@@ -8216,6 +8430,58 @@ def log_append(user_id: str, stream: str, doc: dict,
         "ON CONFLICT (user_id, stream, seq) DO NOTHING"
     )
     mirror.execute(mirror_sql, (user_id, stream, row[0], ts, item_key, Jsonb(doc)))
+
+
+def log_append_numbered(
+    user_id: str,
+    stream: str,
+    doc: dict,
+    *,
+    number_field: str,
+    ts: float,
+    item_key: str,
+) -> dict | None:
+    """Append a log row with a per-item monotonic number assigned atomically.
+
+    The advisory lock covers the empty-stream case where there is no row to lock
+    yet, and also serializes overlapping workers appending attempts for the same
+    logical item. The stored JSON is never patched after insertion.
+    """
+    numbered_doc = dict(doc)
+    seq = None
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (f"numbered-log:{stream}:{user_id}:{item_key}",),
+                    )
+                    cur.execute(
+                        "SELECT COUNT(*) FROM user_logs "
+                        "WHERE user_id = %s AND stream = %s AND item_key = %s",
+                        (user_id, stream, item_key),
+                    )
+                    numbered_doc[number_field] = int(cur.fetchone()[0]) + 1
+                    cur.execute(
+                        "INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
+                        "VALUES (%s, %s, %s, %s, %s) RETURNING seq",
+                        (user_id, stream, ts, item_key, Jsonb(numbered_doc)),
+                    )
+                    seq = cur.fetchone()[0]
+    except Exception as e:
+        log.error("[db] log_append_numbered(%s,%s,%s) failed: %s",
+                  user_id, stream, item_key, e)
+        return None
+
+    from tee_shadow import mirror
+    mirror.execute(
+        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (user_id, stream, seq) DO NOTHING",
+        (user_id, stream, seq, ts, item_key, Jsonb(numbered_doc)),
+    )
+    return numbered_doc
 
 
 def log_read(user_id: str, stream: str, limit: int = 100, since_epoch: float = 0.0) -> list[dict]:

@@ -297,6 +297,8 @@ model_api + resident **两路都跑**，不许一路代表全部。自查话术�
 | app 感知断供 + 读侧缺口（usr_7f30，快捷指令停报 2 天 AI 只字未提） | 已入 pytest（perception recent_apps 权限/TTL/route 共 85 项）；**io_cli allowlist parity test**（防"verb 实现了但没进 _IO_CLI_VERBS"——driver=pi 用户才踩得到的暗坑，两次都是它）；排查口径：客户端快捷指令断供属用户侧，先查 user_logs 对应 stream 最后上报时间再谈后端 |
 | **hosted OpenAI 多轮静默掉回复（pre V2，driver=codex）** | 2026-07-22 深度探针 + 手测 3/3 发现：`provider=openai model=gpt-5.2 driver=codex` **第 1 轮有回复、第 2 轮起无任何 agent row**（非空回复、非迟到、无气泡）。anthropic(claude)/relay(openai_compatible) 同探针多轮全绿→**codex driver 跨轮续接嫌疑**。handoff `docs/HANDOFF_openai_codex_multiturn_2026-07-22.md`（pre 分支），交后端。**教训①：多 provider 必分 driver 跑——换 driver 才暴此 bug，anthropic 永远碰不到；教训②：V2 agent_jobs(聊天)失败无用户/admin 可见信号=静默，该补错误气泡+admin 失败原因（观测缺口）** |
 
+| **一句话双回复+一轮最多三份计费+十几分钟延迟（usr_36038，prod，pi+低价中转）** | 2026-07-23 用户截图报障，admin data-track + iOS 诊断日志分诊（mailbox 20260723T204313Z）。**三层叠加**：① pi stream-cut 立即重跑（计费）；② 300s cap×2 恰好耗尽 600s claim TTL→lost-turn redelivery 第三跑（`chat/service.py:71`）；③ iOS 传输错误（-1001/-1005=结果未知）回填输入框→用户重发铸新 client_msg_id，幂等窗折叠不了。修复（Seven 裁决只做两条）：iOS fleet/p2 `5444842`+`1e48845`（不回填+重试前收据核验——**600s 幂等窗贴着事故 9m26s 延迟的边**，超窗重试同 id 也算新发送，必须先核收据）；后端最小 provider attempt ledger（#4，chat lane only，V2 与心跳暂不入账=已知覆盖边界）。**教训①：分诊先看 runtime.driver + 中转站质量（0.08 折中转 401/403/502/503 一堆=失败重跑土壤）；教训②：17:22 事故 trace 被 200-event ring 淘汰，第二次因 ring 无法复盘——ledger 落地前退款只能按截图人工赔；教训③：客户端"send failed"≠服务端没收到——两个发送端点都同步写行后才响应，一次 history sync 就是可靠收据**。follow-up：图片路径 `sendModelAPIChatImage` 无 client_msg_id（同族敞口）；heartbeat 55min vs 设置 2h 偏频待 `c635d87d` coalescing 版本复测 |
+
 **规则**：以后每个 prod 事故结案时，必须在本表加一行 + 在对应层落一条用例，
 否则不算结案。
 

@@ -147,6 +147,28 @@ def test_filter_messages_to_poll_ids_keeps_only_claimed_rows():
     assert crc._filter_messages_to_poll_ids(decrypted, poll_messages) == [decrypted[0]]
 
 
+def test_filter_messages_marks_attempt_trigger_from_poll_cursor():
+    decrypted = [
+        {"id": "msg-old", "role": "user", "content": "retry"},
+        {"id": "msg-new", "role": "user", "content": "fresh"},
+    ]
+    poll_messages = [
+        {"id": "msg-old", "ts": 100.0},
+        {"id": "msg-new", "ts": 201.0},
+    ]
+
+    marked = crc._filter_messages_to_poll_ids(
+        decrypted,
+        poll_messages,
+        last_ts=200.0,
+    )
+
+    assert [m["_provider_attempt_trigger"] for m in marked] == [
+        "redelivery",
+        "first",
+    ]
+
+
 def test_process_messages_posts_reply_with_source_message_id():
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
@@ -158,6 +180,24 @@ def test_process_messages_posts_reply_with_source_message_id():
 
     assert result_ts == pytest.approx(1111.0)
     assert mock_post.call_args.kwargs["reply_to_message_id"] == "user-msg-1"
+
+
+def test_process_messages_passes_redelivery_attempt_trigger():
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = {
+        "id": "user-msg-redelivery",
+        "role": "user",
+        "content": "hi again",
+        "ts": 1111.5,
+        "_provider_attempt_trigger": "redelivery",
+    }
+
+    with patch.object(crc, "call_agent", return_value="hey") as mock_agent, \
+         patch.object(crc, "post_reply", return_value={"id": "reply-msg-redelivery"}):
+        crc._process_messages([msg])
+
+    assert mock_agent.call_args.kwargs["attempt_trigger"] == "redelivery"
 
 
 def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monkeypatch):
@@ -1810,7 +1850,7 @@ def test_prepare_cli_replaces_fixed_session_id_after_rotation(monkeypatch, tmp_p
     crc._save_agent_session_id("feedling-old")
     crc._record_agent_session_turn("feedling-old", sent_bytes=100, received_bytes=100)
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
     sid = crc._cli_flag_value(cmd, "--session-id")
 
     assert sid.startswith("feedling-io-")
@@ -1827,7 +1867,7 @@ def test_prepare_hermes_cli_strips_continue_and_injects_resume(monkeypatch):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
 
     assert "--continue" not in cmd
     assert cmd[:4] == ["hermes", "--resume", "sess_123", "chat"]
@@ -1843,7 +1883,7 @@ def test_prepare_hermes_cli_injects_resume_before_chat_with_top_level_flags(monk
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
 
     assert cmd[:5] == ["hermes", "--resume", "sess_123", "--yolo", "chat"]
     assert "hello" in cmd
@@ -1858,7 +1898,7 @@ def test_prepare_hermes_cli_strips_unsupported_output_mode(monkeypatch):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
 
     assert "--output-mode" not in cmd
     assert "json" not in cmd
@@ -1875,7 +1915,7 @@ def test_prepare_hermes_cli_first_turn_removes_continue(monkeypatch):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
 
     assert "--continue" not in cmd
     assert "--resume" not in cmd
@@ -1973,14 +2013,15 @@ def test_prepare_claude_cli_first_turn_forces_print_json_and_strips_continue(mon
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, stdin_msg = crc._prepare_cli_command("hello")
 
     assert "--continue" not in cmd
     assert "--resume" not in cmd
     assert "--print" in cmd
     assert "--output-format" in cmd
     assert "json" in cmd
-    assert "hello" in cmd
+    assert "hello" not in cmd
+    assert stdin_msg == "hello"
 
 
 def test_prepare_claude_cli_injects_stored_resume(monkeypatch):
@@ -1998,12 +2039,13 @@ def test_prepare_claude_cli_injects_stored_resume(monkeypatch):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: sid)
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, stdin_msg = crc._prepare_cli_command("hello")
 
     assert cmd[:3] == ["claude", "--resume", sid]
     assert "--output-format" in cmd
     assert "json" in cmd
-    assert "hello" in cmd
+    assert "hello" not in cmd
+    assert stdin_msg == "hello"
 
 
 def test_warn_if_hermes_cli_may_drift_logs_profile_and_turns(monkeypatch, caplog):
@@ -2184,7 +2226,7 @@ def test_prepare_cli_preserves_message_with_quotes(monkeypatch):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command('say "hello" now')
+    cmd, _ = crc._prepare_cli_command('say "hello" now')
 
     assert cmd == ["mycli", "ask", 'say "hello" now']
 
@@ -2195,7 +2237,7 @@ def test_prepare_cli_appends_image_path_when_template_has_no_image_slot(monkeypa
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("look at this", image_paths=[image_path])
+    cmd, _ = crc._prepare_cli_command("look at this", image_paths=[image_path])
 
     assert cmd[:2] == ["mycli", "ask"]
     assert "look at this" in cmd[2]
@@ -2225,7 +2267,7 @@ def test_prepare_cli_uses_image_path_template(monkeypatch, tmp_path):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("look at this", image_paths=[image_path])
+    cmd, _ = crc._prepare_cli_command("look at this", image_paths=[image_path])
 
     assert cmd == ["mycli", "ask", "--image", image_path, "look at this"]
 
@@ -2243,7 +2285,7 @@ def test_prepare_cli_injects_codex_image_flags(monkeypatch, tmp_path):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("look", image_paths=[img1, img2])
+    cmd, stdin_msg = crc._prepare_cli_command("look", image_paths=[img1, img2])
 
     # each image attached via the =-bound --image form, so clap's variadic
     # --image cannot swallow the positional prompt (see the regression test below)
@@ -2253,7 +2295,9 @@ def test_prepare_cli_injects_codex_image_flags(monkeypatch, tmp_path):
     assert cmd.index("exec") < cmd.index(f"--image={img1}")
     # the message stays clean — no misleading "Decrypted image file(s)" path prose
     assert "Decrypted image file(s)" not in " ".join(cmd)
-    assert "look" in cmd
+    # codex delivers the prompt via stdin, not argv
+    assert "look" not in cmd
+    assert stdin_msg == "look"
 
 
 def test_prepare_cli_codex_image_flags_do_not_swallow_prompt(monkeypatch, tmp_path):
@@ -2266,9 +2310,11 @@ def test_prepare_cli_codex_image_flags_do_not_swallow_prompt(monkeypatch, tmp_pa
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello there", image_paths=[img])
+    cmd, stdin_msg = crc._prepare_cli_command("hello there", image_paths=[img])
 
-    assert cmd == ["codex", "exec", f"--image={img}", "hello there"]
+    assert cmd == ["codex", "exec", f"--image={img}"]
+    assert "hello there" not in cmd
+    assert stdin_msg == "hello there"
     # never a bare `-i` whose value the prompt could be mistaken for
     assert "-i" not in cmd
 
@@ -2284,9 +2330,11 @@ def test_prepare_cli_codex_respects_explicit_image_flag(monkeypatch, tmp_path):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("look", image_paths=[img])
+    cmd, stdin_msg = crc._prepare_cli_command("look", image_paths=[img])
 
-    assert cmd == ["codex", "exec", "-i", img, "--json", "look"]
+    assert cmd == ["codex", "exec", "-i", img, "--json"]
+    assert "look" not in cmd
+    assert stdin_msg == "look"
 
 
 def test_cli_nonzero_exit_fails_even_with_stdout(monkeypatch):
@@ -2296,7 +2344,7 @@ def test_cli_nonzero_exit_fails_even_with_stdout(monkeypatch):
         stderr = "bad command"
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError, match="cli agent exited 2"):
@@ -2313,7 +2361,7 @@ def test_cli_failure_surfaces_claude_json_error_from_stdout(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p {message}')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["claude", "-p", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["claude", "-p", message], None))
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError) as ei:
@@ -2335,7 +2383,7 @@ def test_cli_failure_surfaces_codex_stream_error_from_stdout(monkeypatch):
         stderr = "Reading additional input from stdin..."
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec --json {message}')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["codex", "exec", "--json", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["codex", "exec", "--json", message], None))
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError) as ei:
@@ -5068,6 +5116,48 @@ def test_proactive_tick_cadence_decoupled_from_broadcast_state(monkeypatch):
     assert crc._proactive_tick_trigger_for_broadcast_state("mystery") == "heartbeat_unknown"
 
 
+# ---------------------------------------------------------------------------
+# ② heartbeat governance (2026-07-24): the next tick aligns to the server-side
+# gate (decision.heartbeat_next_tick_at). Fixes restart amnesia — the local
+# tick clock lives in process memory, host-all consumers are recycled
+# minutes-apart, and every restart used to fire an opening tick 15s in (the
+# 2026-07-22 heartbeat flood). A throttled tick now sleeps exactly until the
+# gate opens; old backends without the field keep the local-interval behaviour.
+# ---------------------------------------------------------------------------
+
+def test_next_tick_delay_aligns_to_server_gate(monkeypatch):
+    monkeypatch.setattr(crc, "PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", 7200)
+    now = 1_000_000.0
+    # throttled tick: gate opens in 300s → sleep 300s, not the 7200s interval
+    decision = {"wake_interval_sec": 7200, "heartbeat_next_tick_at": now + 300}
+    assert crc._next_proactive_tick_delay_sec(decision, "off", now=now) == 300.0
+    # admitted tick: gate advanced to now+interval → equivalent to local pacing
+    decision = {"wake_interval_sec": 7200, "heartbeat_next_tick_at": now + 7200}
+    assert crc._next_proactive_tick_delay_sec(decision, "off", now=now) == 7200.0
+
+
+def test_next_tick_delay_falls_back_without_gate_field(monkeypatch):
+    monkeypatch.setattr(crc, "PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", 7200)
+    now = 1_000_000.0
+    # old backend: no field → local per-user interval (pre-② behaviour)
+    assert crc._next_proactive_tick_delay_sec(
+        {"wake_interval_sec": 1800}, "off", now=now) == 1800.0
+    # gate in the past / zero / garbage → same fallback
+    for stale in (0, now - 50, "not-a-number", None):
+        d = {"wake_interval_sec": 1800, "heartbeat_next_tick_at": stale}
+        assert crc._next_proactive_tick_delay_sec(d, "off", now=now) == 1800.0
+    # no decision at all (network error path)
+    assert crc._next_proactive_tick_delay_sec(None, "off", now=now) == 7200.0
+
+
+def test_next_tick_delay_keeps_60s_floor(monkeypatch):
+    monkeypatch.setattr(crc, "PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", 7200)
+    now = 1_000_000.0
+    # nearly-open gate must not busy-loop the tick
+    decision = {"wake_interval_sec": 7200, "heartbeat_next_tick_at": now + 5}
+    assert crc._next_proactive_tick_delay_sec(decision, "off", now=now) == 60.0
+
+
 def test_fire_scheduled_wakes_posts_backend_endpoint(monkeypatch):
     captured = {}
 
@@ -5197,7 +5287,7 @@ def test_cli_tool_only_output_preserves_tool_calls(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None))
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     result = crc.call_agent_cli("hi")
@@ -5838,8 +5928,8 @@ def test_call_agent_cli_pi_folds_thinking_and_prefers_command_sid(monkeypatch, t
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id} {message}")
     monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
     monkeypatch.setattr(crc, "_prepare_cli_command",
-                        lambda message, image_paths=None, lane="background": ["pi", "--mode", "json",
-                                                           "--session-id", "sid-cmd-1", message])
+                        lambda message, image_paths=None, lane="background": (["pi", "--mode", "json",
+                                                           "--session-id", "sid-cmd-1", message], None))
     monkeypatch.setattr(crc.subprocess, "run",
                         lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout=raw, stderr=""))
     crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
@@ -5874,8 +5964,8 @@ def test_call_agent_cli_pi_error_turn_does_not_echo_user_message(monkeypatch, tm
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id} {message}")
     monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
     monkeypatch.setattr(crc, "_prepare_cli_command",
-                        lambda message, image_paths=None, lane="background": ["pi", "--mode", "json",
-                                                           "--session-id", "smoke-1", message])
+                        lambda message, image_paths=None, lane="background": (["pi", "--mode", "json",
+                                                           "--session-id", "smoke-1", message], None))
     monkeypatch.setattr(crc.subprocess, "run",
                         lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout=raw, stderr=""))
     crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
@@ -5917,14 +6007,14 @@ def test_prepare_pi_command_generates_session_id_and_keeps_mode_json(monkeypatch
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
     sid = crc._cli_flag_value(cmd, "--session-id")
     assert sid                                   # 空 sid → 现场生成并绑定
     assert sid == crc._load_agent_session_id()   # 已持久化，下一轮复用
     assert cmd[:3] == ["pi", "--mode", "json"]
     assert "hello" not in cmd                    # 消息走 stdin，不进 argv
 
-    cmd2 = crc._prepare_cli_command("second")
+    cmd2, _ = crc._prepare_cli_command("second")
     assert crc._cli_flag_value(cmd2, "--session-id") == sid   # 续接同一会话
 
 
@@ -5934,7 +6024,7 @@ def test_prepare_pi_command_strips_continue_and_adds_mode(monkeypatch, tmp_path)
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
     assert "-c" not in cmd and "--continue" not in cmd   # 续接只靠 --session-id
     assert "--mode" in cmd and crc._cli_flag_value(cmd, "--mode") == "json"
     assert "hello" not in cmd                            # 消息走 stdin
@@ -5948,11 +6038,11 @@ def test_prepare_pi_command_generates_session_when_override_lacks_placeholder(mo
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
     crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
     sid = crc._cli_flag_value(cmd, "--session-id")
     assert sid                                    # 现场生成注入
     assert sid == crc._load_agent_session_id()    # 已持久化
-    cmd2 = crc._prepare_cli_command("second")
+    cmd2, _ = crc._prepare_cli_command("second")
     assert crc._cli_flag_value(cmd2, "--session-id") == sid   # 续接同一会话
 
 
@@ -5968,7 +6058,7 @@ def test_prepare_cli_injects_pi_image_refs(monkeypatch, tmp_path):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sid-1")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("look", image_paths=[img1, img2])
+    cmd, _ = crc._prepare_cli_command("look", image_paths=[img1, img2])
     assert f"@{img1}" in cmd and f"@{img2}" in cmd
     # @refs append to the END of argv (message rides STDIN, not argv)
     assert cmd[-2:] == [f"@{img1}", f"@{img2}"]
@@ -5982,7 +6072,7 @@ def test_prepare_cli_pi_image_ref_appends_and_message_via_stdin(monkeypatch, tmp
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sid-1")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello there", image_paths=[img])
+    cmd, _ = crc._prepare_cli_command("hello there", image_paths=[img])
     # @ref is the trailing positional; the message is NOT in argv (goes via stdin)
     assert cmd[-1] == f"@{img}"
     assert "hello there" not in cmd
@@ -5997,9 +6087,136 @@ def test_prepare_cli_pi_respects_operator_image_slot(monkeypatch, tmp_path):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sid-1")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("look", image_paths=[img])
+    cmd, _ = crc._prepare_cli_command("look", image_paths=[img])
     assert img in cmd                 # template's own slot filled with the path
     assert f"@{img}" not in cmd       # no @-injection on top
+
+
+# ---------------------------------------------------------------------------
+# Windows cmd.exe multi-line truncation fix: claude/codex read the prompt on
+# STDIN so a multi-line prompt never rides the argv command line. On Windows npm
+# installs claude as claude.CMD; subprocess routes .cmd through cmd.exe, which
+# truncates an argv token at the first newline — dropping everything after the
+# time-anchor header. Routing to stdin sidesteps cmd.exe entirely.
+# ---------------------------------------------------------------------------
+
+def test_prepare_claude_feeds_message_via_stdin_not_argv(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd, stdin_msg = crc._prepare_cli_command("hello world")
+
+    assert stdin_msg == "hello world"          # message rides stdin
+    assert "hello world" not in cmd            # NEVER in argv
+    assert "-p" in cmd                          # print flag kept → claude reads stdin
+
+
+def test_prepare_codex_feeds_message_via_stdin_not_argv(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec --json {message}")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd, stdin_msg = crc._prepare_cli_command("hello world")
+
+    assert stdin_msg == "hello world"
+    assert "hello world" not in cmd
+    assert cmd[:3] == ["codex", "exec", "--json"]   # exec/--json kept
+
+
+@pytest.mark.parametrize("template", ['claude -p "{message}"', "codex exec {message}"])
+def test_prepare_multiline_message_never_rides_argv(monkeypatch, template):
+    # The exact Windows failure mode: a multi-line prompt as an argv token is
+    # truncated at the first newline by cmd.exe. Routing to stdin means NO argv
+    # token ever contains a newline.
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", template)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    msg = "[10:30]\n\nReply in English.\n\nhello world"
+    cmd, stdin_msg = crc._prepare_cli_command(msg)
+
+    assert stdin_msg == msg
+    assert not any("\n" in token for token in cmd)
+
+
+def test_prepare_codex_images_ride_argv_message_rides_stdin(monkeypatch, tmp_path):
+    # Image flags are separate argv tokens (never the message) → they stay in
+    # argv; only the message is lifted to stdin.
+    img = str(tmp_path / "a.jpg")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec {message}")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd, stdin_msg = crc._prepare_cli_command("look here", image_paths=[img])
+
+    assert cmd == ["codex", "exec", f"--image={img}"]
+    assert stdin_msg == "look here"
+
+
+def test_prepare_claude_without_message_placeholder_routes_to_stdin(monkeypatch):
+    # A claude template that omits {message} is now valid: the message still
+    # reaches the agent via stdin (this used to be a hard error).
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "claude -p")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    assert crc._driver_reads_stdin(["claude", "-p"]) is True
+    cmd, stdin_msg = crc._prepare_cli_command("hello")
+
+    assert stdin_msg == "hello"
+    assert "hello" not in cmd
+
+
+def test_call_agent_cli_hermes_without_message_placeholder_still_raises(monkeypatch):
+    # hermes is NOT a stdin driver here, so a template without {message} genuinely
+    # cannot deliver the message → still fail loud (regression guard for the
+    # relaxed validation).
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "hermes chat -q")
+    monkeypatch.setattr(crc, "_agent_cli_cwd", lambda: None)
+    monkeypatch.setattr(crc, "_agent_cli_cwd_error", "")
+    with pytest.raises(RuntimeError, match="missing the .message. placeholder"):
+        crc.call_agent_cli("hello")
+
+
+def test_prepare_embedded_message_token_stays_in_argv(monkeypatch):
+    # A message embedded in a larger literal token (e.g. Answer:{message}) is
+    # intentional argv wrapping — keep it in argv, do NOT route to stdin.
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec Answer:{message}")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd, stdin_msg = crc._prepare_cli_command("hello")
+
+    assert "Answer:hello" in cmd
+    assert stdin_msg is None
+
+
+def test_call_agent_cli_claude_wires_message_to_stdin(monkeypatch):
+    # End-to-end through call_agent_cli: the stripped message reaches
+    # subprocess.run's stdin (input=), never the argv.
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_agent_cli_cwd", lambda: None)
+    monkeypatch.setattr(crc, "_agent_cli_cwd_error", "")
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(
+            cmd, 0,
+            stdout='{"type":"result","is_error":false,"result":"OK"}', stderr="",
+        )
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+
+    msg = "[10:30]\n\nReply in English.\n\nhello world"
+    crc.call_agent_cli(msg)
+
+    assert captured["input"] == msg                 # message delivered via stdin
+    assert not any("\n" in t for t in captured["cmd"])  # no multi-line argv token
 
 
 def test_call_agent_cli_pi_feeds_message_via_stdin_not_argv(monkeypatch, tmp_path):
@@ -6071,6 +6288,55 @@ _PI_STREAM_CUT_TURN = _pi_stream_lines(
 )
 
 
+def test_pi_provider_attempt_rows_capture_usage_outcome_and_request_id():
+    raw = _pi_stream_lines(
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "tool round"}],
+                "usage": {"input": 120, "output": 8},
+            },
+        },
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "usage": {"input": 130, "output": 0},
+            },
+            "stopReason": "error",
+            "errorMessage": "429 relay failure (request id: req_abcdef)",
+        },
+    )
+
+    rows = crc._pi_provider_attempt_rows(
+        raw,
+        parent_message_id="msg_1",
+        trigger="redelivery",
+        ts=123.0,
+    )
+
+    assert rows == [
+        {
+            "parent_message_id": "msg_1",
+            "trigger": "redelivery",
+            "provider_request_id": "",
+            "usage": {"input_tokens": 120, "output_tokens": 8},
+            "outcome": "ok",
+            "ts": 123.0,
+        },
+        {
+            "parent_message_id": "msg_1",
+            "trigger": "redelivery",
+            "provider_request_id": "req_abcdef",
+            "usage": {"input_tokens": 130, "output_tokens": 0},
+            "outcome": "rate_limit",
+            "ts": 123.0,
+        },
+    ]
+
+
 def test_call_agent_cli_pi_stream_cut_retries_once_and_succeeds(monkeypatch, tmp_path):
     _pi_cli_env(monkeypatch, tmp_path, "usr_pi_cut_ok")
     runs = []
@@ -6084,6 +6350,74 @@ def test_call_agent_cli_pi_stream_cut_retries_once_and_succeeds(monkeypatch, tmp
     assert crc.call_agent_cli("hello") == "ok"
     assert len(runs) == 2                      # exactly one retry
     assert runs[0] == runs[1]                  # same turn, same command
+
+
+def test_call_agent_cli_ledgers_stream_cut_retry_separately(monkeypatch, tmp_path):
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_cut_ledger")
+    runs = []
+    ledger_rows = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        out = _PI_STREAM_CUT_TURN if len(runs) == 1 else _PI_OK_TURN
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        crc,
+        "_queue_provider_attempt_ledger",
+        lambda rows: ledger_rows.extend(rows),
+    )
+
+    assert crc.call_agent_cli(
+        "hello",
+        trace_id="msg_redelivered",
+        lane="chat",
+        attempt_trigger="redelivery",
+    ) == "ok"
+
+    assert len(ledger_rows) == 2
+    assert [row["trigger"] for row in ledger_rows] == [
+        "redelivery",
+        "stream_cut_retry",
+    ]
+    assert [row["outcome"] for row in ledger_rows] == ["stream_cut", "ok"]
+    assert {row["parent_message_id"] for row in ledger_rows} == {"msg_redelivered"}
+
+
+def test_call_agent_cli_timeout_ledgers_completed_pi_rounds(monkeypatch, tmp_path):
+    partial = _pi_stream_lines(
+        _PI_HEADER,
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "tool round"}],
+                "usage": {"input": 80, "output": 4},
+            },
+        },
+    )
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_timeout_ledger")
+    ledger_rows = []
+
+    def fake_run(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 300, output=partial, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        crc,
+        "_queue_provider_attempt_ledger",
+        lambda rows: ledger_rows.extend(rows),
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        crc.call_agent_cli("hello", trace_id="msg_timeout", lane="chat")
+
+    assert [row["outcome"] for row in ledger_rows] == ["ok", "timeout"]
+    assert ledger_rows[0]["usage"] == {
+        "input_tokens": 80,
+        "output_tokens": 4,
+    }
 
 
 def test_call_agent_cli_pi_stream_cut_twice_raises_no_loop(monkeypatch, tmp_path):
@@ -6537,7 +6871,7 @@ def test_resident_claude_auto_keeps_resume_and_skips_transcript(monkeypatch):
     out = crc._foreground_agent_message("hello", current_ts=time.time())
     assert out == "hello"                       # bare message, no transcript
 
-    cmd = crc._prepare_cli_command(out)
+    cmd, _ = crc._prepare_cli_command(out)
     assert cmd[:3] == ["claude", "--resume", sid]
 
 
@@ -7216,7 +7550,7 @@ def test_claude_resume_skipped_when_transcript_was_injected(monkeypatch):
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
     injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n---\nhello"
-    cmd = crc._prepare_cli_command(injected)
+    cmd, _ = crc._prepare_cli_command(injected)
 
     assert "--resume" not in cmd
     assert "sess_123" not in cmd
@@ -7233,7 +7567,7 @@ def test_claude_resume_kept_when_no_transcript_injected(monkeypatch):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
-    cmd = crc._prepare_cli_command("hello")  # no injected-transcript header
+    cmd, _ = crc._prepare_cli_command("hello")  # no injected-transcript header
 
     assert cmd[:3] == ["claude", "--resume", "sess_123"]
 
@@ -7549,7 +7883,7 @@ def _generic_cli_env(monkeypatch, *, returncode=0, stdout="ok", stderr=""):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
     monkeypatch.setattr(
         crc, "_prepare_cli_command",
-        lambda message, image_paths=None, lane="background": ["mycli", "ask", message],
+        lambda message, image_paths=None, lane="background": (["mycli", "ask", message], None),
     )
     captured = {}
 
@@ -7757,7 +8091,7 @@ def test_prepare_cli_command_drops_resume_after_cwd_rotation(monkeypatch, tmp_pa
     # Positive control: with the cwd unchanged the sid IS injected — so the
     # empty assertion below can only come from the rotation, not from the
     # injection path being inert.
-    control = crc._prepare_cli_command("hello")
+    control, _ = crc._prepare_cli_command("hello")
     assert "--resume" in control and "sess_old_cwd" in control
 
     _reset_cli_cwd_cache(monkeypatch)
@@ -7765,7 +8099,7 @@ def test_prepare_cli_command_drops_resume_after_cwd_rotation(monkeypatch, tmp_pa
     crc._agent_session_id_cache.clear()
     crc._agent_session_meta_cache.clear()
 
-    cmd = crc._prepare_cli_command("hello")
+    cmd, _ = crc._prepare_cli_command("hello")
 
     assert "--resume" not in cmd
     assert "sess_old_cwd" not in cmd
@@ -7894,7 +8228,7 @@ def test_prepare_cli_command_heals_incident_windows_mcp_path(monkeypatch):
     # Bypass PATH resolution of the 'claude' binary — CI has no claude installed,
     # and this test is about the --mcp-config heal, not executable resolution.
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
-    cmd = crc._prepare_cli_command("hi", lane="chat")
+    cmd, _ = crc._prepare_cli_command("hi", lane="chat")
     assert "--mcp-config" not in cmd
     assert not any("feedling_user_mcp.json" in t for t in cmd)
     assert os.path.basename(cmd[0]) == "claude"

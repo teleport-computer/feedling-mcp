@@ -27,6 +27,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -52,6 +53,7 @@ LimitSource = Literal[
     "deployment_override",
     "provider_metadata",
     "audited_family",
+    "unaudited_default",
 ]
 PlanStatus = Literal["fits", "fits_optional_omitted"]
 
@@ -422,6 +424,35 @@ def _normalized_overrides(overrides: Mapping[str, Any] | None) -> dict[str, int]
     return normalized
 
 
+_UNAUDITED_DEFAULT_ENV = "FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS"
+_UNAUDITED_DEFAULT_FALLBACK_TOKENS = 16384
+
+
+def unaudited_default_context_window() -> int:
+    """Conservative context window applied to an unaudited route (custom relay /
+    unknown model) when nothing more specific is configured.
+
+    A deployment may tune it via ``FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS``;
+    setting it to ``0`` restores the original fail-closed behaviour (reject the
+    route until an explicit ``context_window_tokens`` is supplied). This is the
+    LOWEST-precedence source in ``resolve_model_limit`` — a deployment override, a
+    caller-supplied value, and an audited family all win over it — so enabling it
+    never overrides a value someone stated explicitly; it only replaces the hard
+    rejection with a safe lower bound so custom relays are usable out of the box."""
+    raw = os.environ.get(_UNAUDITED_DEFAULT_ENV)
+    if raw is None or not str(raw).strip():
+        return _UNAUDITED_DEFAULT_FALLBACK_TOKENS
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{_UNAUDITED_DEFAULT_ENV} must be a non-negative integer"
+        ) from exc
+    if value < 0:
+        raise ValueError(f"{_UNAUDITED_DEFAULT_ENV} must be a non-negative integer")
+    return value  # 0 disables the default → fail-closed rejection
+
+
 def resolve_model_limit(
     provider: str,
     model: str,
@@ -485,6 +516,23 @@ def resolve_model_limit(
                     source="audited_family",
                     family=family.name,
                 )
+
+    # Lowest-precedence fallback: an unaudited route (custom relay / unknown
+    # model) with nothing more specific configured gets a conservative default
+    # instead of a hard rejection, so custom relays work without every client
+    # having to send context_window_tokens. Deployment override, caller-supplied
+    # value, and audited family were all tried above and win over this. A
+    # deployment can set the default to 0 to restore strict fail-closed.
+    default_tokens = unaudited_default_context_window()
+    if default_tokens > 0:
+        return ModelPromptLimit(
+            provider=normalized_provider,
+            model=normalized_model,
+            context_window_tokens=_validated_context_window(
+                default_tokens, label="unaudited default context window"
+            ),
+            source="unaudited_default",
+        )
 
     raise PromptContextLimitUnconfigured(
         provider=normalized_provider,

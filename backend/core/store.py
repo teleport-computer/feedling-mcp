@@ -45,6 +45,8 @@ PROACTIVE_DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/S
 PROACTIVE_WAKE_INTERVAL_DEFAULT_SEC = 7200
 PROACTIVE_WAKE_INTERVAL_MIN_SEC = 900
 PROACTIVE_WAKE_INTERVAL_MAX_SEC = 43200
+HEARTBEAT_NEXT_TICK_AT_KEY = "heartbeat_next_tick_at"
+_HEARTBEAT_NEXT_TICK_CAS_ATTEMPTS = 4
 
 # Per-thread "currently loading from the DB" flag. The blob-backed loaders
 # (_load_tokens / _load_frames_meta) re-persist normalized state on read, so a
@@ -62,6 +64,58 @@ def normalize_proactive_wake_interval_sec(value) -> int:
     except (TypeError, ValueError):
         return PROACTIVE_WAKE_INTERVAL_DEFAULT_SEC
     return max(PROACTIVE_WAKE_INTERVAL_MIN_SEC, min(PROACTIVE_WAKE_INTERVAL_MAX_SEC, interval))
+
+
+def proactive_heartbeat_next_tick_at(settings: dict | None) -> float:
+    try:
+        return max(0.0, float((settings or {}).get(HEARTBEAT_NEXT_TICK_AT_KEY) or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _cas_heartbeat_next_tick_at(user_id: str, transform) -> float:
+    """CAS one scheduler field without clobbering concurrent settings writes."""
+    for _attempt in range(_HEARTBEAT_NEXT_TICK_CAS_ATTEMPTS):
+        raw = db.get_blob(user_id, "proactive_settings")
+        expected = dict(raw) if isinstance(raw, dict) else {}
+        current = proactive_heartbeat_next_tick_at(expected)
+        updated = max(0.0, float(transform(current)))
+        if updated == current:
+            return current
+        replacement = dict(expected)
+        replacement[HEARTBEAT_NEXT_TICK_AT_KEY] = updated
+        if db.set_blob_if_unchanged(
+            user_id,
+            "proactive_settings",
+            expected,
+            replacement,
+            insert_if_missing=not isinstance(raw, dict),
+        ):
+            return updated
+    return proactive_heartbeat_next_tick_at(db.get_blob(user_id, "proactive_settings"))
+
+
+def advance_proactive_heartbeat_tick(
+    user_id: str,
+    *,
+    now: float,
+    wake_interval_sec,
+) -> float:
+    target = float(now) + normalize_proactive_wake_interval_sec(wake_interval_sec)
+    return _cas_heartbeat_next_tick_at(user_id, lambda current: max(current, target))
+
+
+def shrink_proactive_heartbeat_tick(
+    user_id: str,
+    *,
+    now: float,
+    wake_interval_sec,
+) -> float:
+    target = float(now) + normalize_proactive_wake_interval_sec(wake_interval_sec)
+    return _cas_heartbeat_next_tick_at(
+        user_id,
+        lambda current: min(current, target) if current > 0 else current,
+    )
 
 
 # Used from inside UserStore._load_tokens on boot; must be defined before
@@ -1001,6 +1055,7 @@ class UserStore:
             # preference.
             "wake_directive": "",
             "wake_interval_sec": PROACTIVE_WAKE_INTERVAL_DEFAULT_SEC,
+            HEARTBEAT_NEXT_TICK_AT_KEY: 0.0,
             "dream_enabled": True,
             "capture_enabled": True,
             "screen_watch_enabled": True,
@@ -1144,6 +1199,12 @@ class UserStore:
                 self.user_id,
                 update,
                 seed_doc=cur,
+            )
+        if "wake_interval_sec" in update:
+            persisted[HEARTBEAT_NEXT_TICK_AT_KEY] = shrink_proactive_heartbeat_tick(
+                self.user_id,
+                now=time.time(),
+                wake_interval_sec=update["wake_interval_sec"],
             )
         cur.update(persisted)
         return cur
@@ -1330,6 +1391,23 @@ class UserStore:
         db.log_trim(self.user_id, "proactive_jobs", PROACTIVE_JOB_MAX)
         self.notify_proactive_job_waiters()
         wake_bus.notify("proactive", self.user_id)  # wake other workers' pollers
+        return job
+
+    def append_skipped_proactive_job(self, job: dict) -> dict:
+        """Record a gate rejection without waking consumers or trimming pending work."""
+        db.log_append(
+            self.user_id,
+            "proactive_jobs",
+            job,
+            ts=self._entry_epoch(job),
+            item_key=(str(job.get("job_id") or "") or None),
+        )
+        db.log_trim(
+            self.user_id,
+            "proactive_jobs",
+            PROACTIVE_JOB_MAX,
+            only_statuses=["skipped", "failed", "completed", "delivered", "posted"],
+        )
         return job
 
     def list_proactive_jobs(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:

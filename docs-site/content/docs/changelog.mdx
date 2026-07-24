@@ -10,7 +10,36 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Received AI messages no longer expand the Dynamic Island.** Chat replies and
+  proactive messages now deliver via the system alert notification only (it stacks
+  in Notification Center instead of the Live Activity briefly expanding). The
+  Live Activity / Dynamic Island push for these messages is gated off by default;
+  set `FEEDLING_AI_MSG_LIVE_ACTIVITY=1` to restore the previous dual delivery. The
+  explicit `/v1/push/dynamic-island`, `/v1/push/live-activity`, and
+  `/v1/push/live-start` routes are unchanged and remain available for other uses.
+  No request/response shape change.
+
 ### API
+
+- `GET /v1/onboarding/validate`: when Genesis fails, the `history_import` step's
+  `required` text now names the cause bilingually (zh/en), classified from the
+  job's stored error — API key invalid, provider timeout (naming thinking/slow
+  models and unstable relays), quota exhausted, malformed/empty model output,
+  service restart, decrypt failure, or internal — and always directs the user
+  to fix the cause and restart the import (uploaded materials are kept). It no
+  longer suggests updating the app. User-facing copy now says "文件解读 /
+  reading your onboarding materials" instead of the internal term "蒸馏 /
+  distilling", including the `genesis_failed` / `genesis_partial` notice texts
+  and the in-progress step line.
+- Automatic `heartbeat_*` calls to `POST /v1/proactive/tick` now use a
+  server-clock cadence gate per account. After a heartbeat job is successfully
+  queued, the response's `decision.heartbeat_next_tick_at` advances by the
+  normalized wake interval; another automatic heartbeat before that epoch is
+  rejected with `decision.reason: "heartbeat_throttled"` and recorded as a
+  skipped job. Rejections do not move the deadline. Reducing
+  `wake_interval_sec` shortens an existing deadline immediately. Manual,
+  event-driven, scheduled, screen-watch, and self-wake jobs neither read nor
+  update this scheduler field.
 
 - **The Runtime V2 `identity_nudge` tool now actually applies personality-dimension
   changes.** The tool was exposed in the model-visible catalog but had no effect
@@ -60,9 +89,9 @@ change must not be interpreted as an API guarantee.
   content that account deletion removes, so an export that omitted them handed
   back an incomplete copy. Entries are returned as stored v1 envelopes,
   ciphertext verbatim for client-side decryption, exactly like the other
-  sections — the server still never decrypts. `local_only` entries (no
-  `K_enclave`) are included; the caller holds the only key that can read them.
-  The export's `schema_version` goes from 2 to 3 so a reader can distinguish an
+  sections — the server still never decrypts. The export is not filtered by
+  `visibility`; every stored entry is returned. The export's
+  `schema_version` goes from 2 to 3 so a reader can distinguish an
   export taken before world book coverage from one where the user simply had no
   entries.
 - The resident consumer's idle decrypt-health probe interval

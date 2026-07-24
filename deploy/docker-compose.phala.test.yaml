@@ -87,7 +87,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:ae20fff
+    image: ghcr.io/teleport-computer/feedling:f250dab
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -146,7 +146,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:ae20fff
+    image: ghcr.io/teleport-computer/feedling:f250dab
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -310,7 +310,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:ae20fff
+    image: ghcr.io/teleport-computer/feedling:f250dab
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -327,7 +327,9 @@ services:
       FEEDLING_V2_RUNNER_CVM_ID: "${FEEDLING_V2_RUNNER_CVM_ID:-main-cvm}"
       FEEDLING_V2_DEPLOYED_BUILD: "${FEEDLING_V2_DEPLOYED_BUILD:-}"
       FEEDLING_GENESIS_WORKER_ENABLED: "1"
-      FEEDLING_V2_SANDBOX_PROVIDER: "disabled"
+      # CVM-local in-process sandbox: PDF/DOCX/XLSX materialize + extract inside
+      # the serve-worker (no E2B), staying within the TDX trust boundary.
+      FEEDLING_V2_SANDBOX_PROVIDER: "local"
       FEEDLING_V2_IMAGE_MAX_B64_CHARS: "2700000"
       # web_fetch article extraction (trafilatura, runs in this serve-worker).
       # Default ON — a rollback lever, not a feature gate. Set to "0" to fall back

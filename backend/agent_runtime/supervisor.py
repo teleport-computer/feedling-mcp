@@ -98,6 +98,12 @@ _RUNNER_NOTICE_SUFFIX = {"runner_spawn_failed": "spawn_failed",
                          "runner_key_decrypt_failed": "key_decrypt_failed",
                          "runner_degraded": "degraded"}
 
+_RESTART_BACKOFF_SEC = (15.0, 60.0, 300.0, 900.0, 1800.0)
+_RESTART_HEALTHY_RESET_SEC = 300.0
+_RESTART_CIRCUIT_WINDOW_SEC = 1800.0
+_RESTART_CIRCUIT_FAILURES = 5
+_RESTART_CIRCUIT_RETRY_SEC = 3600.0
+
 # `_fetch_identity_plain_for_intro` returns identity=None for several reasons.
 # Only these two mean the card GENUINELY does not exist yet (a fresh / no-card
 # user) -> safe to introduce without a card. The rest (enclave_url_missing,
@@ -165,6 +171,11 @@ class Supervisor:
         self._notice_debounce: dict[tuple, float] = {}
         self._notice_lock = threading.Lock()
         self._notice_min_interval = float(os.environ.get("RUNNER_NOTICE_MIN_INTERVAL_SEC", "60"))
+        # Per-user, process-local crash history. A failed child keeps its DB
+        # lease while waiting so a peer supervisor cannot bypass this backoff;
+        # if this supervisor itself dies, the normal lease TTL still hands the
+        # user to a healthy peer.
+        self._restart_ledger: dict[str, dict] = {}
 
     def _write_token(self, user_id: str, home: str) -> None:
         if self.token_writer is None:
@@ -187,8 +198,15 @@ class Supervisor:
         if had_degraded:
             self._resolve_runner_notice(user_id, "runner_degraded")
 
-    def _emit_runner_notice(self, user_id: str, error_class: str, detail: str,
-                            *, severity: str = "error") -> None:
+    def _emit_runner_notice(
+        self,
+        user_id: str,
+        error_class: str,
+        detail: str,
+        *,
+        severity: str = "error",
+        user_text: str = "",
+    ) -> None:
         """runner 通知：per-(user,error_class) 最小写间隔（默认 60s，
         RUNNER_NOTICE_MIN_INTERVAL_SEC）+ never-raise. supervisor tick 每
         ~15s 一轮重试同一失败用户，去抖避免每 tick 都打一次 DB（emit 的 upsert
@@ -206,7 +224,7 @@ class Supervisor:
             suffix = _RUNNER_NOTICE_SUFFIX.get(error_class, error_class)
             notices.emit(store, source="runner", error_class=error_class,
                          blame=catalog.blame_for(error_class), severity=severity,
-                         user_text=catalog.user_text_for(error_class),
+                         user_text=user_text or catalog.user_text_for(error_class),
                          detail=str(detail)[:200], dedupe_key=f"runner:{suffix}")
         except Exception:
             log.warning("runner notice emit failed (swallowed)", exc_info=True)
@@ -237,6 +255,116 @@ class Supervisor:
 
     def _home(self, user_id: str) -> str:
         return f"{self.data_root}/users/{user_id}"
+
+    def _record_restart_failure(
+        self,
+        user_id: str,
+        detail: str,
+        *,
+        started_at: float | None = None,
+    ) -> dict:
+        now = self._now()
+        with self._lock:
+            state = dict(self._restart_ledger.get(user_id) or {})
+            if started_at is not None and now - started_at >= _RESTART_HEALTHY_RESET_SEC:
+                state = {}
+            recent = [
+                float(ts)
+                for ts in state.get("failures", [])
+                if now - float(ts) <= _RESTART_CIRCUIT_WINDOW_SEC
+            ]
+            recent.append(now)
+            failure_count = int(state.get("failure_count") or 0) + 1
+            circuit_open = bool(state.get("circuit_open"))
+            if len(recent) >= _RESTART_CIRCUIT_FAILURES:
+                circuit_open = True
+            if circuit_open:
+                delay = _RESTART_CIRCUIT_RETRY_SEC
+            else:
+                delay = _RESTART_BACKOFF_SEC[
+                    min(failure_count - 1, len(_RESTART_BACKOFF_SEC) - 1)
+                ]
+            state = {
+                "failure_count": failure_count,
+                "failures": recent,
+                "next_retry_at": now + delay,
+                "circuit_open": circuit_open,
+                "last_error": str(detail)[:500],
+            }
+            self._restart_ledger[user_id] = state
+
+        # Keep ownership during the wait. The renew is ownership-guarded, so it
+        # cannot steal a lease that another supervisor acquired after expiry.
+        leases.renew(
+            user_id,
+            self.owner,
+            ttl=self.lease_ttl,
+            status="error",
+            now=now,
+        )
+        leases.mark_error(user_id, self.owner, f"restart_backoff:{detail}")
+        if circuit_open:
+            self._emit_runner_notice(
+                user_id,
+                "runner_spawn_failed",
+                (
+                    f"resident crash loop ({len(recent)} failures/"
+                    f"{int(_RESTART_CIRCUIT_WINDOW_SEC)}s); retrying in "
+                    f"{int(_RESTART_CIRCUIT_RETRY_SEC)}s; check provider API key, "
+                    "balance, model, and runner logs"
+                ),
+                user_text=(
+                    "AI 助手连续退出，可能是模型 API Key、额度或模型设置问题。"
+                    "请检查设置；系统会自动重试。"
+                ),
+            )
+        return dict(state)
+
+    def _reap_crashed_child(self, user_id: str, child: dict) -> bool:
+        with self._lock:
+            if self.children.get(user_id) is not child:
+                return False
+            self.children.pop(user_id, None)
+            # Keep child removal and ledger creation atomic to the competing
+            # tick/renew threads. The lock is reentrant, so the helper can
+            # update the ledger without exposing a no-child/no-backoff window.
+            state = self._record_restart_failure(
+                user_id,
+                "consumer_exited",
+                started_at=float(child.get("started_at") or self._now()),
+            )
+        log.info(
+            "child for %s exited; restart deferred %.0fs%s",
+            user_id,
+            max(0.0, float(state["next_retry_at"]) - self._now()),
+            " (circuit open)" if state["circuit_open"] else "",
+        )
+        return True
+
+    def _restart_is_deferred(self, user_id: str, *, now: float) -> bool:
+        with self._lock:
+            state = self._restart_ledger.get(user_id)
+            return bool(state and now < float(state.get("next_retry_at") or 0.0))
+
+    def _mark_child_healthy(self, user_id: str, child: dict, *, now: float) -> None:
+        started_at = float(child.get("started_at") or now)
+        if now - started_at < _RESTART_HEALTHY_RESET_SEC:
+            return
+        with self._lock:
+            if self.children.get(user_id) is not child:
+                return
+            had_failures = self._restart_ledger.pop(user_id, None) is not None
+        if had_failures:
+            log.info("child for %s stayed healthy; clearing restart history", user_id)
+            self._resolve_runner_notice(user_id, "runner_spawn_failed")
+
+    def _resolve_after_spawn(self, user_id: str) -> None:
+        with self._lock:
+            recovering = user_id in self._restart_ledger
+        error_classes = ["runner_key_decrypt_failed"]
+        if not recovering:
+            error_classes.append("runner_spawn_failed")
+        self._resolve_runner_notice(user_id, *error_classes)
 
     def _enqueue_introduction(self, user_id: str, entry: dict) -> None:
         try:
@@ -272,6 +400,7 @@ class Supervisor:
         roster_uids = {str(e.get("user_id") or "") for e in roster}
         with self._lock:
             tracked = list(self.children.items())
+            deferred_users = list(self._restart_ledger)
         for user_id, child in tracked:
             if user_id not in roster_uids:
                 log.info("user %s left the roster; terminating its consumer", user_id)
@@ -279,6 +408,13 @@ class Supervisor:
                 leases.release(user_id, self.owner, now=self._now())
                 with self._lock:
                     self.children.pop(user_id, None)
+                    self._restart_ledger.pop(user_id, None)
+        for user_id in deferred_users:
+            if user_id in roster_uids:
+                continue
+            leases.release(user_id, self.owner, now=self._now())
+            with self._lock:
+                self._restart_ledger.pop(user_id, None)
 
         spawned_this_tick = 0
         newly_acquired: list[tuple[str, dict, str]] = []  # (user_id, entry, home)
@@ -299,7 +435,9 @@ class Supervisor:
                     self.kill_fn(child["pid"])
                     with self._lock:
                         self.children.pop(user_id, None)
+                        self._restart_ledger.pop(user_id, None)
                 elif _spawn_identity(entry) != _spawn_identity(child["entry"]):
+                    self._mark_child_healthy(user_id, child, now=self._now())
                     # Config changed for a still-running user (driver/provider/model/
                     # key) — the consumer's env + home are stale. Respawn in place;
                     # we keep our live lease (just renewed) so no reacquire needed.
@@ -315,9 +453,8 @@ class Supervisor:
                     # up through tick() and abort the whole roster loop (that would
                     # strand every OTHER still-healthy user this tick, including
                     # ones already renewed above). The old child is already killed;
-                    # on failure we deliberately leave its (now-dead) entry in
-                    # self.children so the normal "tracked but dead -> reap" path
-                    # picks it up and retries as a fresh spawn next tick.
+                    # on failure we remove it and enter the same restart backoff as
+                    # an unexpected child exit.
                     spawn_ok = False
                     with self._lock:
                         self.kill_fn(child["pid"])
@@ -342,7 +479,8 @@ class Supervisor:
                             pid = self.spawn_fn(entry, user_id, home)
                         except Exception as e:  # noqa: BLE001
                             detail = f"{type(e).__name__}:{e}"
-                            leases.mark_error(user_id, self.owner, f"spawn_failed:{detail}")
+                            self.children.pop(user_id, None)
+                            self._record_restart_failure(user_id, detail)
                             log.exception("respawn failed for %s", user_id)
                         else:
                             spawn_ok = True
@@ -350,24 +488,37 @@ class Supervisor:
                             leases.renew(user_id, self.owner, ttl=self.lease_ttl, pid=pid,
                                          status="running", driver=entry.get("driver"),
                                          now=self._now())
-                            self.children[user_id] = {"pid": pid, "entry": entry, "home": home}
+                            self.children[user_id] = {
+                                "pid": pid,
+                                "entry": entry,
+                                "home": home,
+                                "started_at": self._now(),
+                            }
                     if spawn_ok:
                         # respawn ok -> clear spawn/decrypt notices only; NOT degraded
                         # (token health is independent — see _write_token).
-                        self._resolve_runner_notice(user_id, "runner_spawn_failed",
-                                                    "runner_key_decrypt_failed")
+                        self._resolve_after_spawn(user_id)
                         self._enqueue_introduction(user_id, entry)
                     else:
                         self._emit_runner_notice(user_id, "runner_spawn_failed", detail)
                 else:
                     self._write_token(user_id, child["home"])  # refresh short-lived token
+                    self._mark_child_healthy(user_id, child, now=self._now())
                 continue
 
             if child:  # tracked but dead → reap
-                log.info("child for %s exited; releasing lease", user_id)
-                leases.release(user_id, self.owner, now=self._now())
-                with self._lock:
-                    self.children.pop(user_id, None)
+                self._reap_crashed_child(user_id, child)
+
+            now = self._now()
+            if self._restart_is_deferred(user_id, now=now):
+                leases.renew(
+                    user_id,
+                    self.owner,
+                    ttl=self.lease_ttl,
+                    status="error",
+                    now=now,
+                )
+                continue
 
             if not _genesis_ready_to_spawn(user_id):
                 # "先 genesis 后 spawn" (spec §5): don't boot a blank consumer while
@@ -420,7 +571,7 @@ class Supervisor:
                 pid = self.spawn_fn(entry, user_id, home)
             except Exception as e:  # noqa: BLE001
                 detail = f"{type(e).__name__}:{e}"
-                leases.mark_error(user_id, self.owner, f"spawn_failed:{detail}")
+                self._record_restart_failure(user_id, detail)
                 self._emit_runner_notice(user_id, "runner_spawn_failed", detail)
                 log.exception("spawn failed for %s", user_id)
                 continue   # skip this user only — no cascading failure for the rest of the batch
@@ -428,11 +579,16 @@ class Supervisor:
             leases.renew(user_id, self.owner, ttl=self.lease_ttl, pid=pid,
                          status="running", now=self._now())
             with self._lock:
-                self.children[user_id] = {"pid": pid, "entry": entry, "home": home}
+                self.children[user_id] = {
+                    "pid": pid,
+                    "entry": entry,
+                    "home": home,
+                    "started_at": self._now(),
+                }
             log.info("spawned resident consumer for %s (pid=%s, home=%s)", user_id, pid, home)
             # successful spawn -> clear spawn/decrypt notices only; NOT degraded
             # (token health is independent — see _write_token).
-            self._resolve_runner_notice(user_id, "runner_spawn_failed", "runner_key_decrypt_failed")
+            self._resolve_after_spawn(user_id)
             self._enqueue_introduction(user_id, entry)
 
     def renew_live(self) -> None:
@@ -456,10 +612,7 @@ class Supervisor:
         live: list[tuple[str, dict]] = []
         for user_id, child in snapshot:
             if not self.alive_fn(child["pid"]):
-                with self._lock:
-                    if self.children.get(user_id) is child:
-                        leases.release(user_id, self.owner, now=self._now())
-                        self.children.pop(user_id, None)
+                self._reap_crashed_child(user_id, child)
                 continue
             live.append((user_id, child))
         if not live:
@@ -469,6 +622,7 @@ class Supervisor:
             self.owner, ttl=self.lease_ttl, now=self._now())
         for user_id, child in live:
             if user_id in held:
+                self._mark_child_healthy(user_id, child, now=self._now())
                 continue
             # Lost the lease (a live other supervisor took over). Kill our orphaned
             # child so two consumers don't both run. A brief self-expiry that
@@ -478,13 +632,18 @@ class Supervisor:
                 if self.children.get(user_id) is child:
                     self.kill_fn(child["pid"])
                     self.children.pop(user_id, None)
+                    self._restart_ledger.pop(user_id, None)
 
     def shutdown(self) -> None:
         with self._lock:
             items = list(self.children.items())
+            deferred_users = set(self._restart_ledger) - set(self.children)
             self.children.clear()
+            self._restart_ledger.clear()
         for user_id, child in items:
             self.kill_fn(child["pid"])
+            leases.release(user_id, self.owner)
+        for user_id in deferred_users:
             leases.release(user_id, self.owner)
 
 

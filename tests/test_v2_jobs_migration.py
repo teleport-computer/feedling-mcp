@@ -230,7 +230,10 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0055_capture_applied_check").down_revision == (
         "0054_merge_pre_v2_heads"
     )
-    assert script.get_current_head() == "0055_capture_applied_check"
+    assert script.get_revision("0056_agent_jobs_hb_idx").down_revision == (
+        "0055_capture_applied_check"
+    )
+    assert script.get_current_head() == "0056_agent_jobs_hb_idx"
 
 
 def test_0046_segmented_summary_schema_is_immutable_and_head_is_bound():

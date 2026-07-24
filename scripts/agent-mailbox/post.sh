@@ -54,6 +54,20 @@ to="$(clean_token "$to")" || usage
 msg_type="$(clean_token "$msg_type")" || usage
 [ -n "$subject" ] || usage
 
+# Identity guard (2026-07-22): --from must match the sender's own tmux session.
+# Stale shared memory repeatedly made agents claim the wrong identity (claude vs
+# claude2 incidents 07-19/21/22). The session name is ground truth. Deliberate
+# on-behalf posts can bypass with AB_FORCE=1.
+if [ -n "${TMUX:-}" ] && [ "${AB_FORCE:-0}" != "1" ]; then
+  actual="$(tmux display-message -p '#S' 2>/dev/null || true)"
+  if [ -n "$actual" ] && [ "$actual" != "$from" ]; then
+    echo "REFUSED: --from '$from' but you are tmux session '$actual'." >&2
+    echo "Run: bash ~/fleet/bus/whoami.sh   (old memories about pairing are invalid)" >&2
+    echo "Posting on someone's behalf intentionally? Set AB_FORCE=1." >&2
+    exit 1
+  fi
+fi
+
 root="$(repo_root)"
 mailbox="${AGENT_MAILBOX_DIR:-$root/.agents/mailbox}"
 messages_dir="$mailbox/messages"

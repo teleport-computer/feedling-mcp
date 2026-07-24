@@ -8,6 +8,7 @@ Persistence is PostgreSQL (db.save_all_users / db.upsert_user).
 import copy
 import hashlib
 import hmac
+import os
 import secrets
 import threading
 import time
@@ -20,6 +21,17 @@ from core import wake_bus
 _users_lock = threading.Lock()
 _users: list[dict] = []                    # [{user_id, principal_id, api_keys, public_key, created_at}]
 _key_to_user: dict[str, str] = {}          # api_key_hash -> user_id (in-memory cache)
+
+# Negative cache for the DB miss-fallback in `_resolve_user`: api_key_hash ->
+# monotonic expiry. A hash the DB has never heard of is remembered for a short
+# TTL so a bogus/forged key cannot hit the DB on every request. Valid keys are
+# NEVER negative-cached (they resolve on the first DB read), so a genuine new
+# user is unaffected. Cleared on every `load_users()` so a real registration
+# that lands between a negative probe and its TTL is picked up immediately.
+_resolve_neg_lock = threading.Lock()
+_resolve_neg_cache: dict[str, float] = {}
+_NEG_CACHE_TTL = max(1.0, float(os.environ.get("FEEDLING_REGISTRY_NEG_CACHE_TTL_SEC", "30") or "30"))
+_NEG_CACHE_MAX = 10000
 
 ACCESS_MODES = ("resident", "model_api", "official_import")
 ACCESS_MODE_LABELS = {
@@ -288,6 +300,12 @@ def load_users():
         _users[:] = db.load_all_users()
         _normalize_all_users_cas()
         _rebuild_key_cache()
+    # Drop the negative cache AFTER releasing _users_lock (no nested lock order):
+    # a fresh full snapshot invalidates any prior "DB has never heard of this
+    # hash" verdict, so a key negative-cached moments before a registration lands
+    # resolves on the next lookup instead of waiting out its TTL.
+    with _resolve_neg_lock:
+        _resolve_neg_cache.clear()
     print(f"[users] loaded {len(_users)} user(s)")
 
 
@@ -320,6 +338,16 @@ def persist_user(entry: dict) -> None:
     notify_users_changed()
 
 
+def _neg_cached(h: str) -> bool:
+    """True while ``h`` is within its negative-cache TTL (the DB has already
+    answered 'no such user'). Checked before the in-memory scan so a bogus key
+    skips both the DB round-trip AND the ``_users_lock`` normalize+scan."""
+    now = time.monotonic()
+    with _resolve_neg_lock:
+        exp = _resolve_neg_cache.get(h)
+        return exp is not None and exp > now
+
+
 def _resolve_user(api_key: str) -> str | None:
     if not api_key:
         return None
@@ -327,6 +355,8 @@ def _resolve_user(api_key: str) -> str | None:
     uid = _key_to_user.get(h)
     if uid:
         return uid
+    if _neg_cached(h):
+        return None
     with _users_lock:
         _normalize_all_users_cas()
         for u in _users:
@@ -339,7 +369,41 @@ def _resolve_user(api_key: str) -> str | None:
                 if key_entry.get("api_key_hash") == h:
                     _key_to_user[h] = u["user_id"]
                     return u["user_id"]
-    return None
+    # In-memory miss. Under -w N a just-registered user may not yet be in THIS
+    # worker's snapshot (the cross-worker "users" reload can be missed when a
+    # worker's wake-bus LISTEN is down). The DB is the shared source of truth —
+    # consult it before rejecting, so a valid key never 401s on a stale worker.
+    return _resolve_user_via_db(h)
+
+
+def _resolve_user_via_db(h: str) -> str | None:
+    """DB miss-fallback for `_resolve_user`. Resolves ``h`` against the DB and
+    lazy-loads the row into this worker's registry on a hit; negative-caches ONLY
+    a definitive miss so a bogus key cannot hammer the DB.
+
+    Critically distinguishes a DB error from a genuine miss: on a transient DB
+    failure (`find_user_by_api_key_hash` raises) it degrades to None WITHOUT
+    negative-caching, so the next request re-queries once the DB recovers. Were
+    it to cache the error as a miss, one pool-timeout hiccup would pin a VALID
+    key to 401 for the whole TTL — and on the stale workers this fallback exists
+    for, `load_users()` (the only other cache-clear) never fires."""
+    try:
+        doc = db.find_user_by_api_key_hash(h)
+    except Exception:
+        return None  # transient DB error — retry next request, do NOT neg-cache
+    if not isinstance(doc, dict) or not doc.get("user_id"):
+        # The query ran and definitively found nothing → safe to negative-cache.
+        with _resolve_neg_lock:
+            if len(_resolve_neg_cache) >= _NEG_CACHE_MAX:
+                _resolve_neg_cache.clear()
+            _resolve_neg_cache[h] = time.monotonic() + _NEG_CACHE_TTL
+        return None
+    uid = str(doc["user_id"])
+    with _users_lock:
+        if _find_user_entry_locked(uid) is None:
+            _users.append(doc)
+        _key_to_user[h] = uid
+    return uid
 
 
 def _register_user(public_key: str | None = None,

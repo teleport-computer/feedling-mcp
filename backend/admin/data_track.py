@@ -29,6 +29,10 @@ from core import util as core_util
 from identity import service as identity_service
 
 
+_PROVIDER_ATTEMPT_STREAM = "provider_attempts"
+_PROVIDER_ATTEMPT_DETAIL_LIMIT = 200
+
+
 # Injected by the assembly layer (asgi_app.py) — the real implementations live
 # in hosted/onboarding_validation.py; admin sits below hosted, so the stub is
 # declared here and assembly wires it.
@@ -956,6 +960,19 @@ def _runtime_summary(store: UserStore) -> dict:
     return out
 
 
+def _provider_attempts_detail(store: UserStore) -> dict:
+    rows = db.log_read(
+        store.user_id,
+        _PROVIDER_ATTEMPT_STREAM,
+        limit=_PROVIDER_ATTEMPT_DETAIL_LIMIT + 1,
+    )
+    return {
+        "coverage": "chat_turns_only",
+        "attempts": rows[-_PROVIDER_ATTEMPT_DETAIL_LIMIT:],
+        "has_more": len(rows) > _PROVIDER_ATTEMPT_DETAIL_LIMIT,
+    }
+
+
 def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) -> dict:
     user_id = str(user_entry.get("user_id") or "")
     store = core_store.get_store(user_id)
@@ -1042,6 +1059,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
     }
     if include_detail:
         row["runtime"] = _runtime_summary(store)
+        row["provider_attempt_ledger"] = _provider_attempts_detail(store)
         _ps = store.load_proactive_settings()
         row["perception_permissions"] = {
             # what the device reports it granted (free-form; keys are app-defined,
@@ -1753,12 +1771,26 @@ def _data_track_dau_payload() -> dict:
 def _data_track_proactive_daily_payload() -> dict:
     filters = _data_track_request_filters()
     days = int(filters.get("days") or 30)
+    since_epoch = float(filters.get("since_epoch") or 0)
     rows = db.admin_data_track_proactive_daily(
-        since_epoch=float(filters.get("since_epoch") or 0),
-        days=days,
-        tz="Asia/Shanghai",
+        since_epoch=since_epoch, days=days, tz="Asia/Shanghai",
+    )
+    # 全量 kind 分桶 + 超速哨兵(2026-07 心跳暴增排查的教训:心跳/屏幕两列外
+    # 全是大杂烩、人均超物理上限没人看见)。查询失败各自降级为空,不碍主表。
+    kinds_by_day = db.admin_data_track_proactive_kinds(
+        since_epoch=since_epoch, days=days, tz="Asia/Shanghai",
+    )
+    overspeed_by_day = db.admin_proactive_heartbeat_overspeed(
+        since_epoch=since_epoch, days=min(days, 14), tz="Asia/Shanghai",
+    )
+    # Runtime V2 心跳走 agent_jobs(lane='heartbeat'),从不写 legacy 流——
+    # 单独拉一列并入日报,dual 共存下两个 runtime 的心跳量并排可见
+    # (2026-07-24 Seven 定补的 V2 观测盲区;超速哨兵在 db 层已 UNION 两源)。
+    v2_hb_by_day = db.admin_v2_heartbeat_daily(
+        since_epoch=since_epoch, days=days, tz="Asia/Shanghai",
     )
     out_rows = []
+    v2_days_seen = set()
     for r in rows:
         delivered = int(r.get("delivered") or 0)
         completed = int(r.get("completed") or 0)
@@ -1768,11 +1800,33 @@ def _data_track_proactive_daily_payload() -> dict:
         # 醒了但决定不说话）算成功：口径衡量「系统是否健康」。
         ok = delivered + completed
         resolved = ok + failed
+        day = str(r.get("day") or "")
+        v2 = v2_hb_by_day.get(day) or {}
+        v2_days_seen.add(day)
         out_rows.append({
             **r,
             "success_rate": (ok / resolved) if resolved else 0.0,
             "fail_rate": (failed / resolved) if resolved else 0.0,
+            "kinds": kinds_by_day.get(day, {}),
+            "overspeed_users": overspeed_by_day.get(day, []),
+            "v2_heartbeat": int(v2.get("jobs") or 0),
+            "v2_heartbeat_failed": int(v2.get("failed") or 0) + int(v2.get("expired") or 0),
         })
+    # 某天只有 V2 心跳、legacy 流全空(V2 全量后的将来态)也要有行,不静默丢。
+    for day, v2 in sorted(v2_hb_by_day.items(), reverse=True):
+        if day in v2_days_seen:
+            continue
+        out_rows.append({
+            "day": day, "jobs": 0, "delivered": 0, "completed": 0, "failed": 0,
+            "skipped": 0, "pending": 0, "maintenance": 0, "maintenance_failed": 0,
+            "screen": 0, "heartbeat": 0, "heartbeat_throttled": 0,
+            "success_rate": 0.0, "fail_rate": 0.0,
+            "kinds": kinds_by_day.get(day, {}),
+            "overspeed_users": overspeed_by_day.get(day, []),
+            "v2_heartbeat": int(v2.get("jobs") or 0),
+            "v2_heartbeat_failed": int(v2.get("failed") or 0) + int(v2.get("expired") or 0),
+        })
+    out_rows.sort(key=lambda r: str(r.get("day") or ""), reverse=True)
     tot_jobs = sum(int(r.get("jobs") or 0) for r in rows)
     tot_deliv = sum(int(r.get("delivered") or 0) for r in rows)
     tot_completed = sum(int(r.get("completed") or 0) for r in rows)
@@ -1787,13 +1841,22 @@ def _data_track_proactive_daily_payload() -> dict:
         "days_returned": len(out_rows),
         "latest_day": latest.get("day", ""),
         "latest_success_rate": latest.get("success_rate", 0.0),
+        # 最新天可能是 V2-only 合成行(legacy 分母为 0)——顶部 metric 用这个
+        # flag 显示 N/A 而不是假 0%(codex review (b))。
+        "latest_has_legacy": bool(
+            int(latest.get("delivered") or 0) + int(latest.get("completed") or 0)
+            + int(latest.get("failed") or 0)
+        ),
         "total_jobs": tot_jobs,
         "total_delivered": tot_deliv,
         "total_completed": tot_completed,
         "total_failed": tot_fail,
         "total_maintenance": tot_maint,
         "total_maintenance_failed": tot_maint_fail,
+        "total_v2_heartbeat": sum(int(r.get("v2_heartbeat") or 0) for r in out_rows),
+        "total_v2_heartbeat_failed": sum(int(r.get("v2_heartbeat_failed") or 0) for r in out_rows),
         "overall_success_rate": ((tot_deliv + tot_completed) / tot_resolved) if tot_resolved else 0.0,
+        "overall_has_legacy": bool(tot_resolved),
     }
     return {
         "summary": summary,
@@ -1807,6 +1870,11 @@ def _data_track_proactive_daily_payload() -> dict:
             "lanes": "heartbeat = the main self-initiated tick (kind=presence); "
                      "screen = screen-share / broadcast driven; "
                      "maintenance = memory capture/dream/migrate (never user-facing).",
+            "kinds": "per-day raw kind counts (job_kind → wake_kind → trigger fallback) — "
+                     "every wake source visible, nothing lumped into a bucket.",
+            "overspeed": "users whose daily heartbeat jobs exceed 86400/wake_interval_sec + 1 "
+                         "(their own setting, default 7200 → cap 12/day). Any entry here means "
+                         "the frequency gate is broken or bypassed — investigate, don't wait.",
             "timezone": "Asia/Shanghai",
         },
     }
@@ -2468,6 +2536,32 @@ def _render_proactive_daily_page(payload: dict) -> str:
     for row in rows:
         sr = float(row.get("success_rate") or 0.0)
         sr_cls = "ok" if sr >= 0.7 else ("warn" if sr >= 0.4 else "bad")
+        # legacy wake lane 当天无已结 job(V2-only 天 / 空天)→ 成功率无分母,
+        # 显示 — 而不是红 0%:那不是故障,是"这条口径当天没有样本"
+        # (codex review (b):合成 V2-only 行曾被渲染成假红色告警)。
+        legacy_resolved = (int(row.get("delivered") or 0)
+                           + int(row.get("completed") or 0)
+                           + int(row.get("failed") or 0))
+        if legacy_resolved:
+            sr_cell = (
+                f"<td><b class='{sr_cls}'>{sr*100:.0f}%</b>"
+                f"<div class='fn-bar'><span class='{sr_cls}' style='width:{sr*100:.0f}%'></span></div></td>"
+            )
+        else:
+            sr_cell = "<td><span class='muted'>—</span></td>"
+        overspeed = row.get("overspeed_users") or []
+        # 超速哨兵:任何用户当天心跳 > 其 wake_interval 物理上限 → 标红。
+        # 出现即频率闸失效的直接信号,别等人肉挖(2026-07-22 教训)。
+        if overspeed:
+            top = overspeed[0]
+            overspeed_cell = (
+                f"<b class='bad'>{len(overspeed)}人</b>"
+                f"<div class='muted' style='font-size:11px'>最凶 "
+                f"{html.escape(str(top.get('user_id') or '')[:16])}… "
+                f"{int(top.get('heartbeats') or 0)}/{int(top.get('cap') or 0)}上限</div>"
+            )
+        else:
+            overspeed_cell = "<span class='muted'>—</span>"
         rows_html.append(
             "<tr>"
             f"<td>{html.escape(str(row.get('day') or ''))}</td>"
@@ -2477,20 +2571,63 @@ def _render_proactive_daily_page(payload: dict) -> str:
             f"<td>{int(row.get('failed') or 0)}</td>"
             f"<td>{int(row.get('skipped') or 0)}</td>"
             f"<td>{int(row.get('pending') or 0)}</td>"
-            f"<td><b class='{sr_cls}'>{sr*100:.0f}%</b>"
-            f"<div class='fn-bar'><span class='{sr_cls}' style='width:{sr*100:.0f}%'></span></div></td>"
+            + sr_cell +
             f"<td>{int(row.get('maintenance') or 0)}(f{int(row.get('maintenance_failed') or 0)})</td>"
             f"<td>{int(row.get('heartbeat') or 0)}</td>"
+            f"<td>{int(row.get('heartbeat_throttled') or 0)}</td>"
+            f"<td>{int(row.get('v2_heartbeat') or 0)}"
+            + (f"<span class='bad'>(f{int(row.get('v2_heartbeat_failed') or 0)})</span>"
+               if int(row.get('v2_heartbeat_failed') or 0) else "")
+            + "</td>"
             f"<td>{int(row.get('screen') or 0)}</td>"
+            f"<td>{overspeed_cell}</td>"
             "</tr>"
         )
+    # 全量 kind 分桶矩阵(最近 14 天):行=kind,列=天。哪个唤醒源在异常一眼可见;
+    # 新 kind 自动出现,不需要改代码。
+    kind_days = [str(r.get("day") or "") for r in rows[:14]]
+    kind_totals: dict[str, int] = {}
+    for r in rows[:14]:
+        for k, n in (r.get("kinds") or {}).items():
+            kind_totals[k] = kind_totals.get(k, 0) + int(n)
+    kind_rows_html = []
+    for kind in sorted(kind_totals, key=lambda k: -kind_totals[k]):
+        cells = "".join(
+            f"<td>{int((r.get('kinds') or {}).get(kind) or 0) or ''}</td>"
+            for r in rows[:14]
+        )
+        kind_rows_html.append(
+            f"<tr><td><b>{html.escape(kind)}</b></td>"
+            f"<td>{kind_totals[kind]}</td>{cells}</tr>"
+        )
+    kinds_table = (
+        "<h2>唤醒源分桶(全量 kind × 最近 14 天)</h2>"
+        "<div class='muted'>kind = job_kind → wake_kind → trigger 回退;现网出现过什么就列什么,"
+        "新唤醒源自动出现。某行突然膨胀 = 那个源在超发。</div>"
+        "<table><thead><tr><th>kind</th><th>Σ14天</th>"
+        + "".join(f"<th>{html.escape(d[5:])}</th>" for d in kind_days)
+        + "</tr></thead><tbody>"
+        + ("".join(kind_rows_html) or "<tr><td colspan='16' class='muted'>无数据。</td></tr>")
+        + "</tbody></table>"
+    ) if rows else ""
+    # 成功率口径只覆盖 V1 legacy wake lane;分母为 0(V2-only 窗口/空窗口)时
+    # 显示 N/A 而非假 0%。V2 心跳单独一格(它有自己的 completed/failed 口径)。
+    overall_sr = (
+        f"{summary['overall_success_rate']*100:.0f}%"
+        if summary.get("overall_has_legacy", True) else "N/A"
+    )
+    latest_sr = (
+        f"{summary['latest_success_rate']*100:.0f}%"
+        if summary.get("latest_has_legacy", True) else "N/A"
+    )
     metrics = "".join([
-        _render_metric("整体成功率 (wake 投递+完成/已结)", f"{summary['overall_success_rate']*100:.0f}%"),
-        _render_metric("最近一天成功率", f"{summary['latest_success_rate']*100:.0f}%"),
+        _render_metric("整体成功率 (V1 wake 投递+完成/已结)", overall_sr),
+        _render_metric("最近一天成功率 (V1)", latest_sr),
         _render_metric("最近一天", summary.get("latest_day") or "n/a"),
-        _render_metric("总 jobs", summary["total_jobs"]),
-        _render_metric("投递+完成 / 失败", f"{summary['total_delivered']}+{summary.get('total_completed', 0)} / {summary['total_failed']}"),
+        _render_metric("总 jobs (V1)", summary["total_jobs"]),
+        _render_metric("投递+完成 / 失败 (V1)", f"{summary['total_delivered']}+{summary.get('total_completed', 0)} / {summary['total_failed']}"),
         _render_metric("维护 / 失败", f"{summary.get('total_maintenance', 0)} / {summary.get('total_maintenance_failed', 0)}"),
+        _render_metric("V2 心跳 / 失败+过期", f"{summary.get('total_v2_heartbeat', 0)} / {summary.get('total_v2_heartbeat_failed', 0)}"),
     ])
     return f"""<!doctype html>
 <html>
@@ -2529,11 +2666,13 @@ def _render_proactive_daily_page(payload: dict) -> str:
   <section class="metrics">{metrics}</section>
   <h2>每日主动消息成功率(仅 wake lane)</h2>
   <div class="muted">{html.escape(definition.get("success_rate") or "")} {html.escape(definition.get("lanes") or "")}</div>
+  <div class="muted">限频拦截 = 服务端心跳闸(reason=heartbeat_throttled)拦下的 tick,闸上线前恒 0;V2心跳 = Runtime V2 pooled worker 的心跳(agent_jobs lane=heartbeat,被 gate 拦的不落行,故全为放行量;(fN)=失败+过期);超速用户 = 当天心跳 job 数(V1+V2 两源合计)超过其 wake_interval 物理上限(86400/interval+1,默认 2h → 12/天)的用户——<b>出现任何一个都说明频率闸失效,立刻查,别等</b>。</div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
   <table>
-    <thead><tr><th>北京日</th><th>Jobs</th><th>投递</th><th>完成</th><th>失败</th><th>Skipped</th><th>Pending</th><th>成功率</th><th>维护(失败)</th><th>心跳</th><th>屏幕</th></tr></thead>
-    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='11' class='muted'>此区间无 proactive job。</td></tr>"}</tbody>
+    <thead><tr><th>北京日</th><th>Jobs</th><th>投递</th><th>完成</th><th>失败</th><th>Skipped</th><th>Pending</th><th>成功率</th><th>维护(失败)</th><th>心跳</th><th>限频拦截</th><th>V2心跳</th><th>屏幕</th><th>超速用户</th></tr></thead>
+    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='14' class='muted'>此区间无 proactive job。</td></tr>"}</tbody>
   </table>
+  {kinds_table}
 </main>
 </body>
 </html>"""

@@ -165,6 +165,10 @@ def test_create_route_with_api_key_always_makes_new_credential(
 def test_create_custom_route_requires_context_window_before_persistence(
         client, registered_user, fake_provider, fake_envelope, fake_enclave,
         monkeypatch):
+    # Fail-closed mode (unaudited default disabled): a missing frontier is
+    # rejected before persistence. Default-on behaviour is covered in
+    # test_v2_prompt_frontier.
+    monkeypatch.setenv("FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS", "0")
     uid = registered_user["user_id"]
     headers = {"X-API-Key": registered_user["api_key"]}
     before_credentials = len(db.model_api_credentials_list(uid))
