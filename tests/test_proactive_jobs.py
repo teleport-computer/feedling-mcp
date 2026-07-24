@@ -2302,6 +2302,10 @@ def test_resident_reaper_does_not_reclaim_hosted_claims(tmp_path, monkeypatch):
 def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    # 4ca348cb gates AI-message Live Activity behind FEEDLING_AI_MSG_LIVE_ACTIVITY
+    # (default off = alert only). These cases exercise the proactive Live
+    # Activity state machine, so opt into the dual path explicitly.
+    monkeypatch.setattr("push.service.AI_MSG_LIVE_ACTIVITY", True)
     core_store._stores.clear()
 
     sent_push_types = []
@@ -2446,6 +2450,10 @@ def test_proactive_chat_response_delivery_off_writes_chat_without_push(tmp_path,
 def test_ai_chat_response_pushes_when_app_background(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    # 4ca348cb gates AI-message Live Activity behind FEEDLING_AI_MSG_LIVE_ACTIVITY
+    # (default off = alert only). These cases exercise the proactive Live
+    # Activity state machine, so opt into the dual path explicitly.
+    monkeypatch.setattr("push.service.AI_MSG_LIVE_ACTIVITY", True)
     core_store._stores.clear()
 
     sent = []
@@ -2740,6 +2748,10 @@ def test_chat_history_sequence_cursor_never_skips_equal_timestamps(tmp_path, mon
 def test_proactive_chat_response_uses_push_to_start_when_start_window_open(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    # 4ca348cb gates AI-message Live Activity behind FEEDLING_AI_MSG_LIVE_ACTIVITY
+    # (default off = alert only). These cases exercise the proactive Live
+    # Activity state machine, so opt into the dual path explicitly.
+    monkeypatch.setattr("push.service.AI_MSG_LIVE_ACTIVITY", True)
     core_store._stores.clear()
 
     sent = []
@@ -2833,6 +2845,10 @@ def test_proactive_chat_response_uses_push_to_start_when_start_window_open(tmp_p
 def test_proactive_chat_response_uses_update_during_start_cooldown(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    # 4ca348cb gates AI-message Live Activity behind FEEDLING_AI_MSG_LIVE_ACTIVITY
+    # (default off = alert only). These cases exercise the proactive Live
+    # Activity state machine, so opt into the dual path explicitly.
+    monkeypatch.setattr("push.service.AI_MSG_LIVE_ACTIVITY", True)
     core_store._stores.clear()
 
     sent = []
