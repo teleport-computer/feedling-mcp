@@ -1914,6 +1914,11 @@ def admin_proactive_heartbeat_overspeed(*, since_epoch: float = 0.0, days: int =
                                    NULLIF(doc->>'trigger',''), 'unknown')
                           NOT IN ('screen_watch','scene_change','screen_tick',
                                   'broadcast_opened','heartbeat_broadcast_on')
+                      -- 哨兵只数「放行(admitted)」的心跳:①闸拦下的 throttled
+                      -- skipped 是闸在正常工作,不能算——否则闸守得越好标得越红,
+                      -- 与「出现即闸失效」的页面语义正好相反(codex review ④)。
+                      AND NOT (COALESCE(doc->>'status','') = 'skipped'
+                               AND COALESCE(doc->>'status_reason','') = 'heartbeat_throttled')
                     GROUP BY user_id, day
                 ),
                 intervals AS (

@@ -201,6 +201,36 @@ def test_heartbeat_overspeed_sentinel_flags_only_over_cap():
     assert ok_uid not in flagged  # cap+1 容差:重启/日界首 tick 不误报
 
 
+def test_heartbeat_overspeed_ignores_throttled_ticks():
+    """闸拦下的 tick 不算「放行心跳」:consumer 在闸内持续 tick 会积大量
+    throttled skipped 行,若被数进哨兵,闸守得越好标得越红——语义正反
+    (codex review ④ 抓出的口径 bug)。哨兵只对 admitted 心跳报警。"""
+    uid = "usr_overspeed_throttled"
+    seed_user(uid)  # 默认 interval 7200 → cap 12
+    # 100 条被闸拦下的 tick + cap 内 5 条真放行 → 不应标红
+    for i in range(100):
+        _job2(uid, status="skipped", trigger="presence",
+              status_reason="heartbeat_throttled", offset=500 + i)
+    for i in range(5):
+        _job2(uid, status="posted", trigger="presence", offset=700 + i)
+
+    overspeed = db.admin_proactive_heartbeat_overspeed(
+        since_epoch=_DAY2_EPOCH, days=60, tz="Asia/Shanghai",
+    )
+    flagged = {e["user_id"] for e in overspeed.get("2001-02-02") or []}
+    assert uid not in flagged
+
+    # 同一用户 admitted 超 cap(14 > 12+1)才标红——throttled 行仍然不计入计数
+    for i in range(9):
+        _job2(uid, status="posted", trigger="presence", offset=800 + i)
+    overspeed = db.admin_proactive_heartbeat_overspeed(
+        since_epoch=_DAY2_EPOCH, days=60, tz="Asia/Shanghai",
+    )
+    flagged = {e["user_id"]: e for e in overspeed.get("2001-02-02") or []}
+    assert uid in flagged
+    assert flagged[uid]["heartbeats"] == 14  # 5+9 admitted;100 条 throttled 不在内
+
+
 def test_daily_payload_merges_kinds_and_overspeed(monkeypatch):
     fake_rows = [{
         "day": "2026-07-22", "jobs": 100, "delivered": 10, "completed": 10,
