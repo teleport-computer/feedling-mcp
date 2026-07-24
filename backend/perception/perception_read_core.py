@@ -40,13 +40,12 @@ def report(store, payload: dict, *, api_key: str | None) -> tuple[dict, int]:
     """Single multiplexed ingest. Mirrors the Flask ``/report`` body exactly.
 
     Body may carry any of ``context_snapshot`` / ``items`` / ``config``; at least
-    one must be present (else 400). The per-user rollout flag selects the v2
-    ingress (which forwards ``api_key`` to the enclave for sensitive-signal
-    decrypt) vs the legacy path.
+    one must be present (else 400). ``context_snapshot`` always takes the v2
+    ingest (which forwards ``api_key`` to the enclave for sensitive-signal
+    decrypt) — see the hotfix note below.
     """
     user_store = store
     uid = user_store.user_id
-    use_ingress_v2 = service.perception_ingress_runtime_v2_enabled(user_store)
     payload = payload or {}
     results: dict = {}
     provided = False
@@ -55,15 +54,25 @@ def report(store, payload: dict, *, api_key: str | None) -> tuple[dict, int]:
     cs = payload.get("context_snapshot")
     if isinstance(cs, list) and cs:
         provided = True
-        if use_ingress_v2:
-            results.update(service.ingest_snapshot_v2(
-                uid,
-                cs,
-                client_ts=payload.get("client_ts"),
-                api_key=api_key,
-            ))
-        else:
-            results.update(service.ingest_snapshot(uid, cs, client_ts=payload.get("client_ts")))
+        # HOTFIX 2026-07-25: context_snapshot ALWAYS takes the v2 ingest (which
+        # owns the enclave decrypt of sensitive-signal envelopes). The iOS
+        # report contract is fully v2-encrypted (location/calendar/playback/
+        # health ride E2E envelopes) regardless of which chat runtime the user
+        # is on — decryption is a data-integrity concern, not a runtime-lane
+        # concern. PR #107 tied this fork to the chat runtime fence
+        # (perception_ingress_runtime_v2_enabled); every resident-chat user
+        # (≈ all of prod) fell to the legacy no-decrypt path, so agents saw
+        # null location/calendar/playback while freshness timestamps kept
+        # advancing (usr_450e report; traces showed zero perception:* enclave
+        # decrypts fleet-wide). The fence keeps governing WAKE-lane forks
+        # (e.g. the photo_added differ split in service.photo_evaluate) —
+        # just not decrypt.
+        results.update(service.ingest_snapshot_v2(
+            uid,
+            cs,
+            client_ts=payload.get("client_ts"),
+            api_key=api_key,
+        ))
 
     items = payload.get("items")
     if isinstance(items, dict) and items:

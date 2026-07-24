@@ -164,14 +164,17 @@ def test_no_auth_is_401_parity(monkeypatch, method, path):
 # =========================================================================== #
 
 def test_report_context_snapshot_parity(env):
+    # HOTFIX 2026-07-25: /report 恒走 v2 ingest;明文敏感信号(motion_state)按
+    # v2 合同被拒,parity 断言改用明文合法的 focus(报文→state 落值语义不变)。
     fake, _ = env
-    body = {"context_snapshot": [{"key": "motion_state", "data": json.dumps({"state": "walking"})}]}
+    body = {"context_snapshot": [{"key": "focus", "data": json.dumps(
+        {"authorization_status": "authorized", "focused": True})}]}
     status, out, ct = _both("POST", "/v1/perception/report", json=body)
     assert status == 200
-    assert out["results"]["motion_state"] == "accepted"
+    assert out["results"]["focus"] == "accepted"
     assert "application/json" in (ct or "")
     # State written once, shared store — the value landed.
-    assert fake.get_state(UID)["motion_state"]["v"] == {"state": "walking"}
+    assert fake.get_state(UID)["in_focus"]["v"] is True
 
 
 def test_report_empty_body_400_parity(env):
