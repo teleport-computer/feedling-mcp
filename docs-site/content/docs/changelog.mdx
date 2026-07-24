@@ -21,6 +21,16 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- `GET /v1/onboarding/validate`: when Genesis fails, the `history_import` step's
+  `required` text now names the cause bilingually (zh/en), classified from the
+  job's stored error — API key invalid, provider timeout (naming thinking/slow
+  models and unstable relays), quota exhausted, malformed/empty model output,
+  service restart, decrypt failure, or internal — and always directs the user
+  to fix the cause and restart the import (uploaded materials are kept). It no
+  longer suggests updating the app. User-facing copy now says "文件解读 /
+  reading your onboarding materials" instead of the internal term "蒸馏 /
+  distilling", including the `genesis_failed` / `genesis_partial` notice texts
+  and the in-progress step line.
 - Automatic `heartbeat_*` calls to `POST /v1/proactive/tick` now use a
   server-clock cadence gate per account. After a heartbeat job is successfully
   queued, the response's `decision.heartbeat_next_tick_at` advances by the

@@ -83,9 +83,9 @@ _CATALOG: dict[str, tuple[str, str]] = {
     "unknown": (
         "system", "连接模型服务时出了问题。"),
     "genesis_failed": (
-        "system", "入住蒸馏没能完成，可稍后在记忆花园重试。"),
+        "system", "入住材料的文件解读没能完成，可稍后在记忆花园重试。"),
     "genesis_partial": (
-        "system", "入住蒸馏完成了，但有部分记忆没能导入。"),
+        "system", "入住材料的文件解读完成了，但有部分记忆没能导入。"),
     "import_failed": (
         "system", "聊天记录导入失败了，请稍后重试。"),
     "import_stale": (

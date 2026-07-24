@@ -100,7 +100,10 @@ GENESIS_ERROR_CODES = (
 
 GENESIS_ERROR_HINTS: dict[str, str] = {
     "bad_api_key": "模型 API key 无效或无权限,检查 key",
-    "provider_timeout": "模型响应超时,稍后重试",
+    # usr_9037eaa8 (2026-07-24): a relay "thinking" model timed out 15+ times
+    # in a row; the old "稍后重试" hint sent the user retrying into the same
+    # wall. Name the two dominant real causes so the fix is actionable.
+    "provider_timeout": "模型响应超时——thinking/慢速模型或不稳定中转最常见;换更快的模型或更稳的服务后重试",
     "provider_quota": "模型额度用尽,检查账户额度",
     "model_bad_json": "模型输出的格式坏了,已重试仍失败——换个模型或重试一次",
     "model_empty_output": "模型没有产出内容,重试或换模型",
@@ -114,6 +117,44 @@ GENESIS_ERROR_HINTS: dict[str, str] = {
     "decrypt_failed": "解密失败,可能是密钥或运行环境问题,请重试或联系支持",
     "internal": "内部错误,请稍后重试",
 }
+
+# English mirror of GENESIS_ERROR_HINTS. The hosted onboarding checklist is
+# read by clients that render `required` verbatim, so the failure line ships
+# both languages; keep the two dicts key-identical (contract-tested).
+GENESIS_ERROR_HINTS_EN: dict[str, str] = {
+    "bad_api_key": "the model API key is invalid or unauthorized — check the key",
+    "provider_timeout": (
+        "the model timed out — thinking/slow models and unstable relays are "
+        "the usual cause; switch to a faster model or steadier provider, then retry"
+    ),
+    "provider_quota": "model quota/credits exhausted — top up or switch keys",
+    "model_bad_json": "the model kept returning malformed output — retry once or switch models",
+    "model_empty_output": "the model produced no usable output — retry or switch models",
+    "worker_restarted": "a service restart interrupted the job; it was re-queued automatically",
+    "consumer_offline": "your VPS resident consumer is offline — check and restart it",
+    "decrypt_failed": "decryption failed — likely a key/runtime issue; retry or contact support",
+    "internal": "internal error — retry later",
+}
+
+
+def genesis_failure_required_text(error: str) -> str:
+    """Bilingual, cause-aware `required` line for the onboarding checklist.
+
+    Replaces the old static "Start onboarding again with the latest app build"
+    — which named the wrong fix for every real failure cause (usr_9037eaa8,
+    2026-07-24: five provider-timeout jobs answered with "update the app").
+    Imported materials survive a failed job, so the action is always "fix the
+    cause, then restart Genesis", never a reinstall/update."""
+    code = classify_genesis_error(error)
+    zh = GENESIS_ERROR_HINTS.get(code, GENESIS_ERROR_HINTS["internal"])
+    en = GENESIS_ERROR_HINTS_EN.get(code, GENESIS_ERROR_HINTS_EN["internal"])
+    # User-facing vocabulary: "文件解读", never the internal term "蒸馏"
+    # (Seven, 2026-07-24).
+    return (
+        f"文件解读失败:{zh}。处理后在 App 里重新发起导入即可,已上传的材料不会丢。"
+        f" / Reading your onboarding materials failed: {en}. Then restart the "
+        "import from the app — your uploaded materials are kept."
+    )
 
 _BAD_API_KEY_STATUS = frozenset({401, 403})
 _PROVIDER_QUOTA_STATUS = frozenset({402, 429})

@@ -257,3 +257,24 @@ def test_mark_failed_without_exc_still_classifies_from_string(monkeypatch):
     service.mark_failed(_store(), "job_2", job_row["error"])
 
     assert captured["error_code"] == "model_bad_json"
+
+
+def test_error_hints_en_mirror_keys_and_required_text_is_cause_aware():
+    # EN mirror must stay key-identical with the zh dict (bilingual contract).
+    assert set(service.GENESIS_ERROR_HINTS_EN.keys()) == set(service.GENESIS_ERROR_HINTS.keys())
+    for hint in service.GENESIS_ERROR_HINTS_EN.values():
+        assert hint.strip()
+
+    timeout_line = service.genesis_failure_required_text(
+        "plaintext_import_failed:ProviderError:provider network error: ReadTimeout"
+    )
+    assert "文件解读失败" in timeout_line
+    assert service.GENESIS_ERROR_HINTS["provider_timeout"] in timeout_line
+    assert service.GENESIS_ERROR_HINTS_EN["provider_timeout"] in timeout_line
+    assert "蒸馏" not in timeout_line
+    assert "app build" not in timeout_line.lower()
+
+    # Unknown garbage must fall back to the internal-cause copy, still bilingual.
+    unknown_line = service.genesis_failure_required_text("mystery blowup ~~ xyz")
+    assert service.GENESIS_ERROR_HINTS["internal"] in unknown_line
+    assert service.GENESIS_ERROR_HINTS_EN["internal"] in unknown_line

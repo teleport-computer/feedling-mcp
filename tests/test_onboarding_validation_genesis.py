@@ -72,6 +72,10 @@ def test_model_api_validate_uses_processing_genesis_job_for_onboarding_steps(mon
     assert steps["history_import"]["genesis"] is True
     assert steps["history_import"]["passing"] is False
     assert steps["history_import"]["job_status"] == "processing"
+    pending_required = steps["history_import"]["required"]
+    assert "reading" in pending_required
+    assert "distill" not in pending_required.lower()
+    assert "蒸馏" not in pending_required
     assert steps["history_import"]["messages_parsed"] == 120
     assert steps["history_import"]["timeline_span_days"] == 9
     assert steps["memory_garden"]["passing"] is True
@@ -149,6 +153,43 @@ def test_model_api_validate_failed_job_keeps_artifacts_lit_but_overall_fails(mon
     assert body["passing"] is False                            # onboarding still fails
     assert body["stage"] == "history_import"
     assert "failed" in steps["history_import"]["required"].lower()
+
+
+def test_model_api_failed_genesis_required_names_the_real_cause(monkeypatch):
+    # usr_9037eaa8 (2026-07-24): five provider-timeout jobs were answered with
+    # the static "Start onboarding again with the latest app build" — the
+    # required line must now carry the classified cause bilingually, point at
+    # a restart (materials are kept) instead of an app update, and use the
+    # user-facing term 文件解读, never the internal 蒸馏.
+    _install_model_api_harness(
+        monkeypatch,
+        identity={},
+        memory_count=0,
+        genesis_jobs=[
+            {
+                "job_id": "genesis_t",
+                "status": "failed",
+                "source_kind": "history_import",
+                "error": (
+                    "plaintext_import_failed:ProviderError:"
+                    "provider network error: ReadTimeout"
+                ),
+                "output": {},
+                "metadata": {"ingest": "plaintext"},
+            }
+        ],
+    )
+
+    body = validation._model_api_onboarding_validation_payload(_store())
+    steps = {s["id"]: s for s in body["steps"]}
+    required = steps["history_import"]["required"]
+
+    assert "文件解读失败" in required
+    assert "模型响应超时" in required            # zh cause (provider_timeout)
+    assert "timed out" in required               # en cause
+    assert "重新发起导入" in required            # correct action
+    assert "app build" not in required.lower()   # the misleading fix is gone
+    assert "蒸馏" not in required                # internal term never user-facing
 
 
 def test_model_api_validate_marks_genesis_done_steps_complete(monkeypatch):
