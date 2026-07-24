@@ -11,6 +11,24 @@ from push import tokens as push_tokens
 
 APP_FOREGROUND_FRESH_SEC = int(os.environ.get("FEEDLING_APP_FOREGROUND_FRESH_SEC", 90))
 
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Received AI messages (chat replies + proactive) no longer expand the Dynamic
+# Island — they deliver only the system alert, which stacks in Notification
+# Center instead of flashing away. The Live Activity module and its explicit
+# /v1/push/{dynamic-island,live-activity,live-start} routes are untouched and stay
+# available for other/future uses; only this AI-message trigger is gated. Set
+# FEEDLING_AI_MSG_LIVE_ACTIVITY=1 to restore the old dual (Live Activity + alert)
+# behavior.
+AI_MSG_LIVE_ACTIVITY = _env_flag("FEEDLING_AI_MSG_LIVE_ACTIVITY", False)
+
+
 def _latest_app_presence(store: UserStore, now: float | None = None) -> dict | None:
     now = now or time.time()
     for event in reversed(store.list_device_events(since_epoch=max(0.0, now - 86400), limit=300)):
@@ -195,13 +213,22 @@ def _deliver_ai_message_push_if_background(
         "data": data or {},
         "visualState": visual_state or "reply",
     }
-    # Neutral dict path (no Flask jsonify): this runs off the event loop in an
+    # AI messages deliver via the system alert only; the Dynamic Island expansion
+    # is gated off (FEEDLING_AI_MSG_LIVE_ACTIVITY). The Live Activity module + its
+    # explicit push routes remain for other uses — this only skips the AI-message
+    # trigger. Neutral dict path (no Flask jsonify): runs off the event loop in an
     # ASGI worker thread with no Flask app context.
-    live_body = live_activity.push_live_activity_hybrid_dict(store, push_payload)
-    fields["live_activity_status"] = live_body.get("status", "unknown")
-    fields["live_activity_reason"] = live_body.get("reason", "")
-    fields["live_activity_activity_id"] = live_body.get("activity_id", "")
-    fields["live_activity_mode"] = live_body.get("mode", "")
+    if AI_MSG_LIVE_ACTIVITY:
+        live_body = live_activity.push_live_activity_hybrid_dict(store, push_payload)
+        fields["live_activity_status"] = live_body.get("status", "unknown")
+        fields["live_activity_reason"] = live_body.get("reason", "")
+        fields["live_activity_activity_id"] = live_body.get("activity_id", "")
+        fields["live_activity_mode"] = live_body.get("mode", "")
+    else:
+        fields["live_activity_status"] = "disabled"
+        fields["live_activity_reason"] = "ai_msg_live_activity_off"
+        fields["live_activity_activity_id"] = ""
+        fields["live_activity_mode"] = "disabled"
 
     alert_result = _send_chat_alert(store, visible_body, alert_title=title or "")
     fields["alert_status"] = (alert_result or {}).get("status", "unknown")
