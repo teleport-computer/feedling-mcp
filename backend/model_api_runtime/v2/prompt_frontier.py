@@ -425,7 +425,7 @@ def _normalized_overrides(overrides: Mapping[str, Any] | None) -> dict[str, int]
 
 
 _UNAUDITED_DEFAULT_ENV = "FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS"
-_UNAUDITED_DEFAULT_FALLBACK_TOKENS = 8192
+_UNAUDITED_DEFAULT_FALLBACK_TOKENS = 16384
 
 
 def unaudited_default_context_window() -> int:

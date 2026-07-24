@@ -294,7 +294,7 @@ def test_model_api_setup_rejects_unconfigured_prompt_frontier_before_io(
 
 def test_model_api_setup_custom_relay_uses_unaudited_default(client, monkeypatch):
     """Recovery: a custom relay that does NOT send context_window_tokens now
-    configures successfully using the conservative unaudited default (8192)
+    configures successfully using the conservative unaudited default (16384)
     instead of being rejected with prompt_context_limit_unconfigured — the
     gate that had silently blocked every custom relay app-wide since 07-19."""
     monkeypatch.delenv("FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS", raising=False)
@@ -319,10 +319,10 @@ def test_model_api_setup_custom_relay_uses_unaudited_default(client, monkeypatch
     )
 
     assert setup.status_code == 200, setup.get_data(as_text=True)
-    assert setup.get_json()["config"]["context_window_tokens"] == 8192
-    assert tested[0].context_window_tokens == 8192
+    assert setup.get_json()["config"]["context_window_tokens"] == 16384
+    assert tested[0].context_window_tokens == 16384
     route = db.model_api_active_route(user_id)
-    assert route["context_window_tokens"] == 8192
+    assert route["context_window_tokens"] == 16384
 
 
 def test_model_api_setup_persists_explicit_custom_prompt_frontier(
