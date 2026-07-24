@@ -256,6 +256,18 @@ def _e2b_provider_factory() -> SandboxProvider:
 _PROVIDER_FACTORIES["e2b"] = _e2b_provider_factory
 
 
+def _local_provider_factory() -> SandboxProvider:
+    # In-process document reader — pure-Python, no external SDK. Parses untrusted
+    # bytes in the worker rather than an isolated sandbox (see local_sandbox for
+    # the security tradeoff and guards). Keeps plaintext inside the CVM.
+    from workspace.local_sandbox import LocalSandboxProvider
+
+    return LocalSandboxProvider()
+
+
+_PROVIDER_FACTORIES["local"] = _local_provider_factory
+
+
 def register_sandbox_provider(name: str, factory: Callable[[], SandboxProvider]) -> None:
     """Deployment hook for ``cvm``/``e2b`` or another audited provider."""
     key = str(name or "").strip().lower()
