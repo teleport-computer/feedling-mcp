@@ -17,6 +17,15 @@ from dstack_tls import derive_tls_cert_and_key
 
 from enclave import attestation, config, keys
 
+# Fixed plaintext sealed to content_pk at boot for the not-bound-to-any-user
+# decrypt self-check probe (GET /v1/decrypt/selfcheck, stage 2 of the
+# runner-shared decrypt-health work). The endpoint opens the stored sealed blob
+# with content_sk and asserts it restores to this — proving the SAME content
+# key derived at boot still decrypts (catches mid-life key drift), stronger than
+# the old "HTTP 200 on a limit=1 read" reachability signal. See
+# docs/proposals/shared-decrypt-health-probe.md.
+SELFCHECK_PLAINTEXT = b"feedling-decrypt-selfcheck-v1"
+
 _state: dict[str, Any] = {
     "ready": False,
     "error": None,
@@ -32,6 +41,10 @@ _state: dict[str, Any] = {
     "tls_key_pem": None,   # bytes; only kept for the SSLContext load path
     "attestation": None,
     "booted_at": None,
+    # box_seal(SELFCHECK_PLAINTEXT, content_pk) filled at boot; None means the
+    # self-check endpoint can't verify decrypt (reports "fail" rather than
+    # crashing). Never carries user data — the plaintext is a fixed constant.
+    "decrypt_selfcheck_sealed": None,
 }
 
 
@@ -83,6 +96,18 @@ def bootstrap():
         _state["content_pk_hex"] = derived["content_pk_bytes"].hex()
         _state["signing_pk_hex"] = derived["signing_pk_bytes"].hex()
         keys.set_cached_content_sk(derived["content_sk"])
+        # Seal the self-check probe to the content pubkey now that the key is
+        # derived. Best-effort: a failure here only degrades /v1/decrypt/selfcheck
+        # to reporting "fail", it must never block the enclave from booting.
+        try:
+            import content_encryption
+            _state["decrypt_selfcheck_sealed"] = content_encryption.box_seal(
+                SELFCHECK_PLAINTEXT, derived["content_pk_bytes"]
+            )
+        except Exception as e:
+            _state["decrypt_selfcheck_sealed"] = None
+            print(f"[enclave] decrypt self-check seal skipped: {e}",
+                  file=sys.stderr, flush=True)
         _state["tls_cert_fingerprint_hex"] = tls_fingerprint.hex()
         _state["attestation"] = att
         _state["booted_at"] = time.time()

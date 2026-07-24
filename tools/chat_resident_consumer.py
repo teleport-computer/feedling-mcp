@@ -1795,6 +1795,62 @@ DECRYPT_HEALTH_REFRESH_SEC = _env_float(
     "FEEDLING_DECRYPT_HEALTH_REFRESH_SEC", 210.0, minimum=5.0
 )
 
+# Runner-shared decrypt-health (2026-07-24). The reachability probe verifies
+# only SHARED infrastructure — enclave alive, enclave→backend loopback,
+# content_sk present — none of it per-user. So N resident consumers each
+# probing every DECRYPT_HEALTH_REFRESH_SEC is O(users) redundancy for one
+# answer. When enabled, consumers publish/reuse a runner-shared health file so
+# the probe rate drops to O(runner≈1). host-all consumers collapse to one
+# shared fingerprint path (same mechanism as the checkpoint file — the
+# fingerprint is NOT an isolation boundary here, and that's exactly right: infra
+# health is shared, not per-user); a keyed self-host runner gets its own file,
+# equally correct. The file carries ONLY an infra-layer status — never the
+# per-user `degraded`, which stays local (the passive envelope signal still wins
+# over a shared `ok`). Fail-open: any file problem falls back to self-probing.
+# Design + rationale: docs/proposals/shared-decrypt-health-probe.md.
+DECRYPT_HEALTH_SHARED = _env_bool("FEEDLING_DECRYPT_HEALTH_SHARED", False)
+# Stage 2: probe via the not-bound-to-any-user enclave endpoint
+# GET /v1/decrypt/selfcheck (self-ciphertext restore + enclave→backend loopback)
+# instead of borrowing a user's identity for /v1/chat/history?probe=1. Default
+# off; enable ONLY after the enclave carrying the endpoint is deployed — an
+# older enclave answers 404, which the probe treats as "endpoint absent" and
+# transparently falls back to the history probe (so a premature flip is a soft
+# degrade, not a false outage). See docs/proposals/shared-decrypt-health-probe.md.
+DECRYPT_SELFCHECK = _env_bool("FEEDLING_DECRYPT_SELFCHECK", False)
+DECRYPT_HEALTH_FILE = Path(
+    os.environ.get(
+        "FEEDLING_DECRYPT_HEALTH_FILE",
+        f"/tmp/feedling_decrypt_health_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
+    )
+)
+# Only a POSITIVE reading crosses the runner-shared file. Sharing exists solely
+# to let peers skip a redundant probe of a HEALTHY enclave. A negative reading
+# (`unreachable`) must NEVER be published: one consumer's transient blip (a 10s
+# timeout, a GC pause, a single slow round trip) would otherwise latch EVERY
+# co-hosted consumer to `unreachable` for a whole refresh window — runner-wide
+# blast-radius amplification of a one-off. Negatives stay local: the blipped
+# consumer degrades only itself and re-probes on its own throttle, and a real
+# outage is still found within a refresh window when the shared `ok` ages out
+# and each consumer re-probes. `unconfigured` is derived with no enclave call so
+# sharing it saves nothing; `degraded`/`unknown` are per-user / not-measured and
+# never belong here. See docs/proposals/shared-decrypt-health-probe.md §5.
+_SHARED_HEALTH_REUSABLE = frozenset({"ok"})
+
+# NOTE — no probe jitter here (deliberately removed 2026-07-24). An earlier
+# revision staggered each consumer's re-probe with a per-consumer jitter to
+# smooth the periodic "everyone re-probes when the shared `ok` goes stale" herd.
+# It repeatedly collided with the freshness budget (the reuse grace REFRESH+jitter
+# has to stay under the backend's 300s window while also staying ≥ the probe
+# throttle, and any clamp coupling those to POLL_TIMEOUT either collapsed the
+# jitter, shrank REFRESH into a probe storm, or breached the window). The jitter
+# was only ever an OPTIMISATION: the _decrypt_health_last_refresh throttle already
+# bounds each consumer to one probe per REFRESH_SEC, so the herd's worst case is
+# N probes/window — exactly the non-shared baseline, and usually far below it
+# (one publisher refreshes, the rest reuse). Keeping the reuse grace = REFRESH_SEC
+# restores the original ~30s freshness slack. If the under-load herd ever proves
+# to matter in practice, re-introduce staggering with a design that does NOT tie
+# the reuse grace to POLL_TIMEOUT and with dedicated tests.
+
 _decrypt_health: dict = {"status": "unknown", "checked_at": 0.0}
 
 # One unreadable claim can be a transient blip (claim/history race, a single
@@ -1851,33 +1907,173 @@ def _decrypt_health_headers() -> dict:
     }
 
 
-def _probe_decrypt_reachability() -> None:
-    """Refresh health from a reachability probe (startup + throttled idle).
-    Never upgrades a standing ``degraded`` to ``ok`` — a per-message decrypt
-    failure must not be masked by the source merely being dialable; only a real
-    non-empty decrypt clears degraded."""
+def _measure_infra_health() -> str:
+    """Pure reachability probe of the SHARED decrypt infrastructure. Returns an
+    infra-layer status — ``ok`` | ``unreachable`` | ``unconfigured`` — and does
+    NOT touch _decrypt_health. This is exactly the value published to the
+    runner-shared health file: it must never carry a per-user ``degraded`` (that
+    signal is local-only; the degrade-masking lives in _apply_infra_health).
+
+    Stage 2 (FEEDLING_DECRYPT_SELFCHECK): prefer the not-bound-to-any-user
+    /v1/decrypt/selfcheck endpoint (real content_sk round trip + loopback).
+    An enclave predating that endpoint answers 404, and we transparently fall
+    back to the history reachability probe — so enabling the flag before the
+    enclave rolls out is a soft degrade, not a false outage."""
     if not FEEDLING_ENCLAVE_URL:
-        _set_decrypt_health("unconfigured")
-        return
+        return "unconfigured"
+    if DECRYPT_SELFCHECK:
+        status = _measure_via_selfcheck()
+        if status is not None:
+            return status
+        # endpoint absent (old enclave) → fall through to the history probe
+    return _measure_via_history_probe()
+
+
+def _measure_via_history_probe() -> str:
+    """Legacy reachability probe: GET /v1/chat/history?limit=1&probe=1.
+    probe=1 verifies the decrypt path is reachable without paying for the
+    context-memory fan-out (memory/list 200 cards + context build) the enclave
+    attaches to a normal history read (backend/enclave/routes/chat.py). Only the
+    HTTP status is read."""
     try:
         client = _client_for(FEEDLING_ENCLAVE_URL)
         resp = client.get(
             f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
-            # probe=1: verify the decrypt path is reachable without paying for the
-            # context-memory fan-out (memory/list 200 cards + context build) the
-            # enclave attaches to a normal history read. See
-            # backend/enclave/routes/chat.py — this call fires per resident every
-            # DECRYPT_HEALTH_REFRESH_SEC and only reads the HTTP status.
             params={"limit": 1, "probe": 1}, headers=_HEADERS, timeout=10,
         )
         resp.raise_for_status()
     except Exception:
-        _set_decrypt_health("unreachable")
-        return
-    if _decrypt_health.get("status") == "degraded":
-        _decrypt_health["checked_at"] = time.time()  # still degraded; heartbeat only
+        return "unreachable"
+    return "ok"
+
+
+def _measure_via_selfcheck() -> str | None:
+    """Probe via GET /v1/decrypt/selfcheck. Returns ``ok`` (decrypt AND loopback
+    both ok), ``unreachable`` (dial/verdict failure), or None — "endpoint not
+    usable for me, fall back to the history probe". None covers 404 (an enclave
+    predating the endpoint) AND 401 (the endpoint requires a locally-verifiable
+    runtime token; a keyed consumer that only holds an api_key legitimately
+    falls back to the history probe, which its api_key can serve). Carries no
+    user identity beyond the standard auth headers."""
+    try:
+        client = _client_for(FEEDLING_ENCLAVE_URL)
+        resp = client.get(
+            f"{FEEDLING_ENCLAVE_URL}/v1/decrypt/selfcheck",
+            headers=_HEADERS, timeout=10,
+        )
+    except Exception:
+        return "unreachable"
+    if resp.status_code in (401, 404):
+        return None
+    if resp.status_code != 200:
+        return "unreachable"
+    try:
+        data = resp.json()
+    except Exception:
+        return "unreachable"
+    decrypt = data.get("decrypt")
+    loopback = data.get("loopback")
+    if decrypt == "ok" and loopback == "ok":
+        return "ok"
+    # Both faults gate the runner via the single infra status 'unreachable', but
+    # they need very different remediation — log the ACTUAL fault loudly so the
+    # operator isn't sent to fix network/TLS for a content-key drift. A
+    # decrypt:fail is precisely the mid-life key drift this stage-2 probe exists
+    # to catch (the enclave is reachable; its content_sk can't restore the
+    # self-ciphertext), which 'unreachable' alone would misdiagnose.
+    if decrypt != "ok":
+        log.error(
+            "decrypt self-check FAILED (decrypt=%s loopback=%s): the enclave is "
+            "reachable but its content key cannot decrypt — suspect enclave "
+            "content-key drift / re-key, NOT network/TLS. %s",
+            decrypt, loopback, FEEDLING_ENCLAVE_URL,
+        )
     else:
-        _set_decrypt_health("ok")
+        log.warning(
+            "decrypt self-check loopback FAILED (decrypt=ok loopback=%s): "
+            "enclave→backend round trip is down; decryption engine is fine. %s",
+            loopback, FEEDLING_ENCLAVE_URL,
+        )
+    return "unreachable"
+
+
+def _apply_infra_health(status: str, *, checked_at: float | None = None) -> None:
+    """Fold an infra-layer status into the reported decrypt health, preserving
+    the per-user degrade: a standing ``degraded`` is never upgraded to ``ok`` by
+    a mere reachability signal (only a real non-empty decrypt clears it), just
+    heartbeated so it stays fresh. ``checked_at`` lets a consumer reusing a
+    runner-shared reading report that reading's REAL probe time, so a lagging
+    consumer ages into the backend's own staleness window instead of vouching a
+    stale ``ok`` under its own clock; None means "our own probe, stamp now"."""
+    at = time.time() if checked_at is None else checked_at
+    cur_status = _decrypt_health.get("status")
+    cur_at = float(_decrypt_health.get("checked_at") or 0.0)
+    if cur_status == "degraded":
+        # A reachability signal (ANY of ok / unreachable / unconfigured) is
+        # orthogonal to a per-user envelope degrade and must NEVER overwrite it —
+        # only a real decrypt success (_note_decrypt_read_success) or a failure
+        # streak moves `degraded`. Guarding just the direct `ok` upgrade left a
+        # two-step laundering hole: a transient `unreachable` clobbered degraded,
+        # then a later `ok` cleared it, masking a real per-user decrypt outage.
+        # Heartbeat freshness forward only (never backward past a fresher stamp).
+        _decrypt_health["checked_at"] = max(cur_at, at)
+        return
+    # Reusing an older shared reading must never age our checked_at BACKWARD past
+    # a fresher local stamp of the SAME status (e.g. a real decrypt success just
+    # set now) — that could push us past the backend's staleness window and get
+    # a working consumer marked unknown. A status CHANGE always applies as-is.
+    if status == cur_status:
+        at = max(cur_at, at)
+    _decrypt_health["status"] = status
+    _decrypt_health["checked_at"] = at
+
+
+def _probe_decrypt_reachability() -> None:
+    """Refresh health from a reachability probe (startup + throttled idle).
+    Never upgrades a standing ``degraded`` to ``ok`` — a per-message decrypt
+    failure must not be masked by the source merely being dialable; only a real
+    non-empty decrypt clears degraded. Thin wrapper: measure the shared infra,
+    then apply with degrade-masking under our own clock."""
+    _apply_infra_health(_measure_infra_health())
+
+
+def _read_shared_infra_health() -> tuple[str, float] | None:
+    """Read the runner-shared infra-health reading, or None if absent/unusable.
+    Fail-open: any problem (missing file, a race with a writer, corrupt JSON,
+    a non-infra status, a bad shape) returns None so the caller falls back to
+    probing itself — a shared-file issue must never wedge the probe."""
+    try:
+        data = json.loads(DECRYPT_HEALTH_FILE.read_text())
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    status = str(data.get("status") or "").strip()
+    if status not in _SHARED_HEALTH_REUSABLE:
+        return None
+    try:
+        checked_at = float(data.get("checked_at") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return status, checked_at
+
+
+def _write_shared_infra_health(status: str, checked_at: float) -> None:
+    """Publish this consumer's fresh probe result for the whole runner to reuse.
+    Only a POSITIVE (`ok`) reading is ever written — a negative one must not
+    latch the runner (see _SHARED_HEALTH_REUSABLE), and a per-user ``degraded``
+    must never leak to co-hosted users. Best-effort + atomic (temp + rename, so
+    a peer never reads a half-written file); a write failure just means peers
+    keep probing themselves."""
+    if status not in _SHARED_HEALTH_REUSABLE:
+        return
+    try:
+        _atomic_write_text(
+            str(DECRYPT_HEALTH_FILE),
+            json.dumps({"status": status, "checked_at": checked_at}),
+        )
+    except Exception as e:
+        log.warning("shared decrypt-health write failed: %s", e)
 
 
 _decrypt_health_last_refresh = {"at": 0.0}
@@ -1885,12 +2081,46 @@ _decrypt_health_last_refresh = {"at": 0.0}
 
 def _maybe_refresh_decrypt_health() -> None:
     """Throttled idle refresh so an idle-but-healthy resident keeps a fresh
-    checked_at without probing the enclave on every poll cycle."""
+    checked_at without probing the enclave on every poll cycle.
+
+    Shared mode (FEEDLING_DECRYPT_HEALTH_SHARED): reading the runner-shared file
+    is a local op, so every idle cycle reuses a fresh peer reading — carrying its
+    REAL probe time — and only a stale/missing file triggers an actual enclave
+    probe, which is then republished for the runner. This cuts the probe rate
+    from O(users) to O(runner≈1). No lock: the window between the file going
+    stale and the first prober rewriting it is one enclave round trip, so at
+    most a handful of peers probe together before the fresh write reuses
+    everyone. The per-user envelope layer (_note_decrypt_read_*) still wins — a
+    standing ``degraded`` is never overridden by a shared ``ok``."""
     now = time.time()
+    if not DECRYPT_HEALTH_SHARED:
+        if now - _decrypt_health_last_refresh["at"] < DECRYPT_HEALTH_REFRESH_SEC:
+            return
+        _decrypt_health_last_refresh["at"] = now
+        _probe_decrypt_reachability()
+        return
+
+    shared = _read_shared_infra_health()
+    # Reuse a shared reading while it is within REFRESH_SEC (the same interval the
+    # probe throttle uses), carrying its real checked_at. This keeps the reported
+    # age ≤ REFRESH_SEC + one idle poll, safely inside the backend's 300s window
+    # (the freshness-budget test guards REFRESH_SEC ≤ window − 2·POLL_TIMEOUT).
+    if shared is not None and now - shared[1] < DECRYPT_HEALTH_REFRESH_SEC:
+        _apply_infra_health(shared[0], checked_at=shared[1])
+        return
+    # Missing or stale shared reading → probe and (if healthy) republish. Gate
+    # the actual enclave probe behind the SAME per-consumer throttle the
+    # non-shared path uses: fail-open must not turn "shared file unwritable /
+    # never fresh" into a probe on every idle cycle (an O(users)/30s storm
+    # against the single-threaded enclave — worse than the baseline this feature
+    # reduces). Reuse of a fresh peer reading above stays unthrottled (a free
+    # file read); only real probes are throttled.
     if now - _decrypt_health_last_refresh["at"] < DECRYPT_HEALTH_REFRESH_SEC:
         return
     _decrypt_health_last_refresh["at"] = now
-    _probe_decrypt_reachability()
+    status = _measure_infra_health()
+    _apply_infra_health(status)              # our own probe → checked_at = now
+    _write_shared_infra_health(status, now)  # only a positive reading publishes
 
 
 def _verify_decrypt_sources() -> bool:
@@ -1915,15 +2145,19 @@ def _verify_decrypt_sources() -> bool:
             resp.raise_for_status()
             log.info("decrypt source OK: enclave at %s", FEEDLING_ENCLAVE_URL)
             any_ok = True
-            _set_decrypt_health("ok")
+            # Reachability outcomes ALWAYS route through _apply_infra_health so
+            # they can never clobber a standing per-user `degraded` (at startup
+            # status is `unknown`, so this behaves identically to a bare set —
+            # the routing is the invariant, uniform across every call site).
+            _apply_infra_health("ok")
         except Exception as e:
             log.error(
                 "decrypt source UNREACHABLE: enclave at %s — %s",
                 FEEDLING_ENCLAVE_URL, e,
             )
-            _set_decrypt_health("unreachable")
+            _apply_infra_health("unreachable")
     else:
-        _set_decrypt_health("unconfigured")
+        _apply_infra_health("unconfigured")
 
     _decrypt_health_last_refresh["at"] = time.time()
     return any_ok
@@ -11161,7 +11395,7 @@ def _process_messages(messages: list) -> float:
             if FEEDLING_ENCLAVE_URL:
                 _note_decrypt_read_failure()
             else:
-                _set_decrypt_health("unconfigured")
+                _apply_infra_health("unconfigured")   # reachability → guarded set
             log.warning(
                 "user message has no plaintext content ts=%.3f content_type=%s "
                 "— skipping (set FEEDLING_ENCLAVE_URL to enable decryption)",
@@ -12398,7 +12632,7 @@ def run() -> None:
         # value stays `unknown` and the first real message's empty-content path
         # would mislabel it `degraded`, hiding the most actionable classification
         # (FEEDLING_ENCLAVE_URL unset) for exactly the usr_6c1971 case.
-        _set_decrypt_health("unconfigured")
+        _apply_infra_health("unconfigured")   # reachability → guarded set
         _decrypt_health_last_refresh["at"] = time.time()
         log.warning(
             "⚠️  No decryption source configured (FEEDLING_ENCLAVE_URL is unset). "
@@ -12662,7 +12896,12 @@ def run() -> None:
                 if decrypted is None:
                     # All configured sources failed — skip this cycle, keep checkpoint.
                     # A poll carried messages but decryption is down: unreachable.
-                    _set_decrypt_health("unreachable")
+                    # Route through _apply_infra_health (NOT _set_decrypt_health) so
+                    # a standing per-user `degraded` is preserved: a bare set here
+                    # would clobber degraded → unreachable, and a later reachability
+                    # `ok` would then clear it, laundering a real per-user decrypt
+                    # outage back to green (the two-step hole the degrade-guard closes).
+                    _apply_infra_health("unreachable")
                     log.warning(
                         "poll triggered but all decrypt sources failed; "
                         "skipping cycle (messages not processed)"

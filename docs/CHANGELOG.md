@@ -274,9 +274,25 @@
   schema_version 3→4；导出文案（zh + en）补上世界书。
 - **schema_version 2→3 的理由**：空 `world_book` 数组和"这份导出早于世界书
   支持"在 JSON 里长得一样，只有版本号能区分。
-- **TDD**：`tests/test_content_export_world_book.py` 5 条（含 local_only、
-  信封字段完整性、空列表、版本号），先红后绿；`test_asgi_content.py` 的
-  parity 断言随契约更新为 3。
+- **TDD**：`tests/test_content_export_world_book.py` 5 条（导出条目、不按
+  visibility 过滤、信封字段完整性、空列表、版本号），先红后绿；
+  `test_asgi_content.py` 的 parity 断言随契约更新为 3。
+- **部署后 test 环境实测通过**：合成账号 seed 2 条世界书 → 导出 2 条 →
+  本地私钥解密出原文；`worldbook/list` 与 export 计数一致，schema_version=3，
+  信封无明文泄漏。跑完账号已 reset，库中零残留。
+  ⚠️ 取证坑：第一轮跑出空结果，实为**部署滚动中途**（compose_hash 从
+  6ddb3480→ab0a16b3 切换期间），当时未改动的 `worldbook/list` 同样读 0；
+  且 ingress 有约 3 分钟 TLS 握手 EOF。查库确认行已落地后排除。
+- **附带定性（既有设计，非本次引入）**：**世界书不支持 local_only**。
+  enclave `routes/worldbook.py:48` 显式把 `visibility == "local_only" or not
+  K_enclave` 判进 `unavailable_ids` → `worldbook_core` 翻成 400
+  `worldbook_validate_failed`；iOS `sealForCurrentUser` 写死 `shared` 且世界书
+  页面无可见性 UI。合理：世界书存在的意义是被注入 agent prompt，注入必须经
+  enclave 解密，local_only 条目永远不会生效。
+  遗留小坑（未修，超本次范围）：`_validate_content_cap_with_enclave` 在
+  `FEEDLING_ENCLAVE_URL` 未配置时直接跳过校验，故自托管不配 enclave 时
+  local_only 世界书**能写进去但永远静默不生效**；且 400 的 slug
+  `worldbook_validate_failed` 没说明真实原因。
 - **未做**：frames 仍只在服务端导出、iOS 侧丢弃（"服务端搬 40 MiB、客户端
   全扔"）；导出仍无还原/回灌路径；80 MiB 上限与 60s 超时无逃生舱。
   这三项见当日审查结论，未立项。

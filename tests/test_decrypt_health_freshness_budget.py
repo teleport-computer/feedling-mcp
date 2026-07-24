@@ -61,6 +61,19 @@ def test_idle_probe_interval_fits_the_backend_freshness_window():
     )
 
 
+def test_shared_reuse_grace_fits_the_backend_freshness_window():
+    """shared 模式下 consumer 复用一份共享读数、钉住它的 checked_at 直到它 REFRESH_SEC
+    旧（reuse grace == REFRESH_SEC，无 jitter），所以最坏上报年龄仍是 REFRESH_SEC + 一个
+    空闲轮询——和上面的探活间隔预算是同一个约束。这条显式守住「reuse grace 就是
+    REFRESH_SEC」这一不变量：若哪天有人重新给复用宽限加了 jitter/常量而没同步进预算，
+    这里连同上面的间隔预算一起把它挡红。"""
+    reuse_grace = crc.DECRYPT_HEALTH_REFRESH_SEC   # no jitter added on top
+    assert reuse_grace <= _budget(), (
+        f"reuse grace {reuse_grace}s 超出预算 {_budget()}s；复用中的 checked_at 会漂过"
+        "后端 300s 窗口，健康用户被判 unknown、onboarding 反复抖动"
+    )
+
+
 def test_the_budget_is_actually_binding():
     """守卫这个守卫：预算必须真的能拒绝一个过大的值。
 

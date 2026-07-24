@@ -96,10 +96,22 @@ def test_export_includes_world_book_entries(client):
     assert base64.b64decode(row["body_ct"]) == b"world-book-ciphertext-1"
 
 
-def test_export_ships_local_only_world_book_entries(client):
-    # local_only entries have no K_enclave — the server and the enclave cannot
-    # read them, but the owner can, so an export owes them to the user just like
-    # a local_only chat message.
+def test_export_does_not_filter_world_book_by_visibility(client):
+    # Export must hand back whatever is stored, not a filtered projection: the
+    # user owns every row and holds the only key that reads it.
+    #
+    # local_only is currently UNREACHABLE for world book in production — the
+    # enclave deliberately refuses to read such an entry
+    # (enclave/routes/worldbook.py: `visibility == "local_only" or not
+    # K_enclave` -> unavailable_ids), so /v1/worldbook/upsert answers 400
+    # worldbook_validate_failed, and iOS seals world book entries as `shared`
+    # unconditionally (FeedlingAPI.sealForCurrentUser). That is by design: a
+    # world book entry exists to be injected into the agent's prompt, which
+    # requires enclave-readable ciphertext. This test reaches the state
+    # directly (no FEEDLING_ENCLAVE_URL -> the cap check is skipped) purely to
+    # pin the export side: should such a row ever exist — legacy data, a
+    # self-hosted deploy with no enclave configured, or a future feature — the
+    # export must still ship it rather than silently drop it.
     user_id, api_key = _register(client)
     _upsert(client, api_key,
             _envelope(user_id, "wb-local", b"private-entry", visibility="local_only"))
