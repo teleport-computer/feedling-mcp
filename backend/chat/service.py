@@ -468,6 +468,31 @@ def _pending_chat_messages_for_poll(
     now = time.time()
     claimed: list[dict] = []
     redelivered = 0
+    # Product-boundary guard (defense-in-depth): a db_action_v2 user is served
+    # ONLY by the pooled V2 worker. Refuse a separately operated `/v1/chat/*`
+    # consumer's claiming poll at the source so an accidentally still-running
+    # external consumer cannot race the hosted worker and double-reply.
+    # NOTE: this is NOT the fix for the no-reply/reconcile-loop bug — that was a
+    # ts-cursor fragility, fixed by the seq reply cursor (see
+    # serve_worker._read_messages). Read-only
+    # polls (claim=False — e.g. the client reading the V2 reply) are unaffected.
+    # The blob flag alone is not an ownership proof: cutover state/generation is
+    # authoritative, and a split tuple must fail closed rather than feed both
+    # responders. Only the exact resident_cli+resident tuple may claim.
+    if claim:
+        from hosted import config_store as _hosted_cfg  # lazy: chat must not own hosted startup
+        try:
+            mode, state, _generation = _hosted_cfg.get_hosted_runtime_control_strict(store)
+        except Exception:
+            # A transient control-plane read failure is safer as an empty long
+            # poll than as a duplicate resident turn. The client will poll
+            # again; no claim/cursor has moved.
+            return []
+        if not (
+            mode == _hosted_cfg.HOSTED_RUNTIME_MODE_RESIDENT
+            and state == "resident"
+        ):
+            return []
     with store.chat_lock:
         redelivery_floor = _redelivery_floor(store, now)
         for msg in store.chat_messages:

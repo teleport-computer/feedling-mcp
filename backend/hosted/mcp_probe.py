@@ -1,9 +1,9 @@
-"""Connectivity probe + SSRF guard for user MCP servers.
+"""Control-plane connectivity probe + SSRF guard for user MCP servers.
 
-The ONLY backend-originated outbound call in the user_mcp feature (spec §6).
+The backend-originated outbound calls in the user_mcp feature (spec §6).
 Hand-rolled single-shot JSON-RPC — initialize → notifications/initialized →
-tools/list — deliberately NOT the `mcp` SDK (one endpoint doesn't justify the
-dependency + requirements.lock churn).
+tools/list — deliberately NOT the `mcp` SDK (one control-plane endpoint
+doesn't justify the dependency + requirements.lock churn).
 
 Two MCP transports are spoken (2026-07-19, SSE-transport batch):
   - streamable HTTP (2025-03-26): POST each JSON-RPC to the URL, answer comes
@@ -16,26 +16,38 @@ Two MCP transports are spoken (2026-07-19, SSE-transport batch):
 The probe auto-detects: a ``transport_hint`` ("sse" from the stored record /
 URL heuristic) picks which handshake to try first, and each path falls back
 to the other on that transport's signature failure. The result dict reports
-the transport that actually worked so callers can persist it.
+the transport that actually worked so callers can persist it, plus the
+read-only tool fingerprints eligible for parallel-read approval.
 
-SSRF guard: the URL host must resolve to global addresses only. Checked
-immediately before connecting (small TOCTOU/DNS-rebinding window is a
-documented residual risk — spec §6); redirects are disabled outright, and the
-legacy ``endpoint`` event — server-controlled data — is only followed when it
-targets the same scheme/host/port as the SSE URL itself.
+SSRF guard: the URL host must resolve to global addresses only. The pinned
+helpers (``_pin_public_target``, used by the runtime-V2 MCP client) make the
+validated address the actual connection target while the original hostname
+stays the HTTP Host and TLS SNI value, closing the validate-then-resolve
+DNS-rebinding gap. The probe path checks ``blocked_url_kind`` immediately
+before connecting (small TOCTOU residual risk — spec §6). Redirects are
+disabled outright, and the legacy ``endpoint`` event — server-controlled
+data — is only followed when it targets the same scheme/host/port as the SSE
+URL itself.
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
+import hashlib
 import ipaddress
 import json
 import socket
 import ssl
+import threading
+from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
 import httpx
+
+from core import net_safety
+from hosted.mcp_approvals import MAX_READ_ONLY_TOOL_APPROVALS, valid_tool_name
 
 
 @contextlib.asynccontextmanager
@@ -75,9 +87,46 @@ _TOTAL_TIMEOUT = 30.0
 # handshake is unusable as an interactive chat tool anyway.
 _WALL_TIMEOUT = 45.0
 _PROTOCOL_VERSION = "2025-03-26"
+_MAX_RESPONSE_BYTES = 1024 * 1024
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_DNS_WORKERS = 8
+_DNS_MAX_PENDING = 32
+_DNS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_DNS_WORKERS,
+    thread_name_prefix="feedling-mcp-dns",
+)
+_DNS_SUBMISSION_SLOTS = threading.BoundedSemaphore(_DNS_MAX_PENDING)
 # Ceiling on bytes read from any one SSE stream while hunting for a frame —
 # a stream that pings forever must exhaust this (or the wall clock), not RAM.
 _MAX_SSE_BYTES = 262144
+
+
+def catalog_tool_fingerprint(tool: dict) -> str:
+    """Change-sensitive approval key for one remote tool's read semantics.
+
+    Free-form descriptions are deliberately excluded because Runtime V2 never
+    injects them. Name, schema, and a strict boolean readOnlyHint are the exact
+    catalog fields whose change must invalidate a user's read-only approval.
+    """
+    annotations = tool.get("annotations")
+    semantic = {
+        "name": str(tool.get("name") or ""),
+        "inputSchema": tool.get("inputSchema"),
+        "readOnlyHint": (
+            isinstance(annotations, dict)
+            and annotations.get("readOnlyHint") is True
+        ),
+    }
+    try:
+        encoded = json.dumps(
+            semantic,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        encoded = b"invalid-mcp-tool-catalog-entry"
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class ProbeError(Exception):
@@ -118,8 +167,156 @@ class _NotStreamableServer(Exception):
 
 
 def _resolve_ips(host: str) -> list[str]:
-    infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
-    return sorted({info[4][0] for info in infos})
+    return net_safety.resolve_ips(host)
+
+
+@dataclass(frozen=True)
+class _PinnedTarget:
+    """One SSRF-validated network target.
+
+    ``request_url`` contains the literal validated address so the HTTP stack
+    cannot perform a second DNS lookup. ``host_header`` and ``sni_hostname``
+    preserve virtual-host routing and certificate verification against the
+    configured hostname.
+    """
+
+    request_url: httpx.URL
+    host_header: str
+    sni_hostname: str
+
+
+def _validated_public_ips(url: str) -> tuple[str, list[str]]:
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname or ""
+        # Accessing .port can itself reject malformed authorities.
+        parsed.port
+    except ValueError:
+        raise ProbeError("blocked_url", "invalid URL") from None
+    if scheme not in ("http", "https") or not host:
+        raise ProbeError("blocked_url", "missing host")
+
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            raw_ips = _resolve_ips(host)
+        except OSError:
+            raise ProbeError("dns", "DNS resolution failed") from None
+        if not raw_ips:
+            raise ProbeError("dns", "DNS resolution failed")
+        ips: list[str] = []
+        try:
+            for raw in raw_ips:
+                address = ipaddress.ip_address(raw)
+                if not address.is_global:
+                    raise ProbeError(
+                        "unreachable_from_backend", "non-public address")
+                normalized = str(address)
+                if normalized not in ips:
+                    ips.append(normalized)
+        except ValueError:
+            raise ProbeError("dns", "DNS resolution failed") from None
+        if not ips:
+            raise ProbeError("dns", "DNS resolution failed")
+        return host, ips
+
+    if not literal.is_global:
+        raise ProbeError("unreachable_from_backend", "non-public address")
+    return host, [str(literal)]
+
+
+_REACHABILITY_PROBE_TIMEOUT = 2.0
+
+
+def _probe_tcp(ip: str, port: int, timeout: float) -> bool:
+    """True if a TCP connection to (ip, port) is accepted. Never raises."""
+    try:
+        socket.create_connection((ip, port), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+def _first_reachable_ip(
+    ips: list[str], port: int, *, timeout: float = _REACHABILITY_PROBE_TIMEOUT
+) -> str:
+    """Pick the first validated IP that accepts a TCP connection on ``port``.
+
+    net_safety.resolve_ips returns IPv6 addresses first for dual-stack hosts; a
+    runner with no IPv6 egress can never reach them, and pinning ips[0] blindly
+    then failed the whole session. Every candidate here is already
+    ``is_global``-validated, so trying them in order stays SSRF-safe while a
+    single dead address family no longer wedges the connection. A single
+    candidate is pinned WITHOUT a probe (no alternative to fall back to, and the
+    unit tests that mock one IP must stay network-free). If none connect, keep
+    ips[0] so the real attempt surfaces the concrete error, exactly as before.
+    """
+    if len(ips) <= 1:
+        return ips[0]
+    for ip in ips:
+        if _probe_tcp(ip, port, timeout):
+            return ip
+    return ips[0]
+
+
+def _pin_public_target(url: str) -> _PinnedTarget:
+    _resolved_host, ips = _validated_public_ips(url)
+    try:
+        configured_url = httpx.URL(url)
+    except (TypeError, ValueError):
+        raise ProbeError("blocked_url", "invalid URL") from None
+    if configured_url.scheme not in ("http", "https"):
+        raise ProbeError("blocked_url", "unsupported URL scheme")
+    # httpx has already IDNA-normalized this ASCII hostname. Use it for Host/SNI
+    # while DNS validation may have accepted the original Unicode spelling.
+    host = configured_url.raw_host.decode("ascii")
+
+    # A single operation deliberately pins one validated address for initialize,
+    # initialized, and the subsequent list/call. A new operation resolves afresh.
+    # Among the validated IPs, pin the first that is actually reachable so a
+    # dual-stack host's unreachable-family address (IPv6 on an IPv4-only runner)
+    # does not wedge the session.
+    probe_port = configured_url.port or (443 if configured_url.scheme == "https" else 80)
+    request_url = configured_url.copy_with(host=_first_reachable_ip(ips, probe_port))
+    host_header = f"[{host}]" if ":" in host else host
+    if configured_url.port is not None:
+        default_port = 443 if configured_url.scheme == "https" else 80
+        if configured_url.port != default_port:
+            host_header = f"{host_header}:{configured_url.port}"
+    return _PinnedTarget(
+        request_url=request_url,
+        host_header=host_header,
+        sni_hostname=host,
+    )
+
+
+async def _pin_public_target_async(url: str) -> _PinnedTarget:
+    """Resolve on a dedicated, submission-bounded executor.
+
+    Cancelling ``getaddrinfo`` cannot stop its native worker thread. Keeping
+    those calls off asyncio's shared default executor prevents hostile MCP DNS
+    from silently exhausting unrelated provider/enclave work. The submission
+    semaphore also prevents an unbounded executor queue while the resolver is
+    degraded; excess work fails closed and the server is skipped for this turn.
+    """
+    if not _DNS_SUBMISSION_SLOTS.acquire(blocking=False):
+        raise ProbeError("dns_busy", "resolver capacity exhausted")
+    try:
+        future = _DNS_EXECUTOR.submit(_pin_public_target, url)
+    except Exception:
+        _DNS_SUBMISSION_SLOTS.release()
+        raise ProbeError("dns", "DNS resolver unavailable") from None
+
+    future.add_done_callback(lambda _future: _DNS_SUBMISSION_SLOTS.release())
+    try:
+        return await asyncio.wrap_future(future)
+    except asyncio.CancelledError:
+        # This cancels queued work when possible. A running getaddrinfo remains
+        # bounded by the dedicated worker count and releases its slot on finish.
+        future.cancel()
+        raise
 
 
 def blocked_url_kind(url: str) -> str | None:
@@ -129,26 +326,14 @@ def blocked_url_kind(url: str) -> str | None:
 
     NOTE: non-global hosts are storable (mcp_core no longer pre-checks — the
     agent, not the backend, makes the real MCP call). The backend still refuses
-    to CONNECT: this function runs in the backend trust domain and probe()
-    echoes 160 bytes of the upstream body back to the caller, so relaxing it
-    would ship an SSRF-with-echo primitive. Do not remove.
+    to CONNECT because this function runs in the backend trust domain. Do not
+    remove or weaken this guard.
     """
-    host = urlparse(url).hostname or ""
-    if not host:
-        return "blocked_url"
     try:
-        ip = ipaddress.ip_address(host)
-        return None if ip.is_global else "unreachable_from_backend"
-    except ValueError:
-        pass  # hostname, not a literal IP
-    try:
-        ips = _resolve_ips(host)
-    except OSError:
-        return "dns"
-    for raw in ips:
-        if not ipaddress.ip_address(raw).is_global:
-            return "unreachable_from_backend"
-    return None
+        _validated_public_ips(url)
+        return None
+    except ProbeError as exc:
+        return exc.kind
 
 
 def leaf_is_ca(url: str, *, timeout: float = 3.0) -> bool | None:
@@ -208,16 +393,192 @@ def _effective_origin(parsed) -> tuple:
 def _parse_rpc_response(resp: httpx.Response) -> dict:
     """Streamable HTTP servers answer either application/json or a one-shot
     SSE stream; take the first `data:` event in the latter case."""
-    ctype = resp.headers.get("content-type", "")
+    ctype = resp.headers.get("content-type", "").lower()
     if "text/event-stream" in ctype:
-        for line in resp.text.splitlines():
-            if line.startswith("data:"):
-                return json.loads(line[len("data:"):].strip())
+        try:
+            text = resp.content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ProbeError("protocol", "invalid SSE encoding") from None
+        # SSE joins consecutive data fields with newlines and terminates an
+        # event with a blank line. Accept a final unterminated event as a
+        # compatibility concession for simple one-shot servers.
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        for event in normalized.split("\n\n"):
+            data = [
+                line[5:].lstrip(" ")
+                for line in event.split("\n")
+                if line.startswith("data:")
+            ]
+            if data:
+                try:
+                    body = json.loads("\n".join(data))
+                except json.JSONDecodeError:
+                    raise ProbeError("protocol", "invalid SSE JSON") from None
+                if not isinstance(body, dict):
+                    raise ProbeError("protocol", "JSON-RPC response must be an object")
+                return body
         raise ProbeError("protocol", "empty SSE stream")
     try:
-        return resp.json()
-    except json.JSONDecodeError:
-        raise ProbeError("protocol", f"non-JSON response ({ctype})")
+        body = json.loads(resp.content)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise ProbeError("protocol", "non-JSON response") from None
+    if not isinstance(body, dict):
+        raise ProbeError("protocol", "JSON-RPC response must be an object")
+    return body
+
+
+def _client_kwargs(ca_pem, transport) -> dict:
+    kwargs = {
+        "timeout": httpx.Timeout(_TOTAL_TIMEOUT, connect=_CONNECT_TIMEOUT),
+        "follow_redirects": False,
+        # User-controlled MCP traffic must never inherit HTTP(S)_PROXY or
+        # SSL_CERT_FILE from the worker environment.
+        "trust_env": False,
+        "transport": transport,
+    }
+    if ca_pem:
+        # Add-trust (verify AGAINST the user's CA), never skip-verify.
+        try:
+            # Build the same certifi-backed context as httpx trust_env=False,
+            # then add the user CA. ssl.create_default_context() can consult
+            # OpenSSL's SSL_CERT_FILE/SSL_CERT_DIR environment variables.
+            ctx = httpx.create_ssl_context(verify=True, trust_env=False)
+            ctx.load_verify_locations(cadata=ca_pem)
+        except (ssl.SSLError, TypeError, ValueError):
+            raise ProbeError("tls", "invalid CA bundle") from None
+        kwargs["verify"] = ctx
+    return kwargs
+
+
+def _send_headers(headers) -> dict:
+    out = {
+        str(k): str(v)
+        for k, v in (headers or {}).items()
+        if str(k).strip().lower() not in {"host", "accept-encoding"}
+    }
+    out.setdefault("Accept", "application/json, text/event-stream")
+    # Bound the wire representation itself. httpx's decoded-byte iterator can
+    # materialize one arbitrarily large gzip/zstd expansion before our running
+    # size check sees that chunk, so compressed MCP responses are not accepted.
+    # A peer that ignores this request header is rejected from response headers
+    # before any body iterator (and therefore any decoder) is entered below.
+    out["Accept-Encoding"] = "identity"
+    out["Content-Type"] = "application/json"
+    return out
+
+
+def _first_complete_sse_event(content: bytes) -> bool:
+    normalized = content.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    for event in normalized.split(b"\n\n")[:-1]:
+        if any(line.startswith(b"data:") for line in event.split(b"\n")):
+            return True
+    return False
+
+
+async def _read_bounded_response(resp: httpx.Response) -> httpx.Response:
+    """Read raw identity bytes incrementally and fail before JSON/SSE parse."""
+    content_encoding = resp.headers.get("content-encoding", "").strip().lower()
+    if content_encoding not in {"", "identity"}:
+        # Check before touching the body. ``aiter_bytes`` would invoke httpx's
+        # decoder first, and a single compressed chunk can expand far past the
+        # cap in memory before Python regains control.
+        raise ProbeError("protocol", "compressed MCP responses are not allowed")
+    content = bytearray()
+    is_sse = "text/event-stream" in resp.headers.get("content-type", "").lower()
+    # Mock/custom transports may hand httpx a pre-buffered identity response.
+    # The real network path entered through ``client.stream`` is unconsumed and
+    # always takes the raw iterator below.
+    if resp.is_stream_consumed:
+        if len(resp.content) > _MAX_RESPONSE_BYTES:
+            raise ProbeError("response_too_large", "MCP response exceeded limit")
+        content.extend(resp.content)
+        return httpx.Response(
+            status_code=resp.status_code,
+            headers=resp.headers,
+            content=bytes(content),
+            request=resp.request,
+            extensions=dict(resp.extensions),
+        )
+    async for chunk in resp.aiter_raw():
+        if len(content) + len(chunk) > _MAX_RESPONSE_BYTES:
+            raise ProbeError("response_too_large", "MCP response exceeded limit")
+        content.extend(chunk)
+        # Streamable-HTTP SSE connections may remain open after the response
+        # event. Stop at the first complete data event instead of waiting for EOF.
+        if is_sse and _first_complete_sse_event(content):
+            break
+    return httpx.Response(
+        status_code=resp.status_code,
+        headers=resp.headers,
+        content=bytes(content),
+        request=resp.request,
+        extensions=dict(resp.extensions),
+    )
+
+
+def _contains_tls_error(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, ssl.SSLError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
+async def _post_bounded(
+    client: httpx.AsyncClient,
+    target: _PinnedTarget,
+    send_headers: dict,
+    payload: dict,
+    extra: dict,
+) -> httpx.Response:
+    headers = {**send_headers, **extra}
+    for key in list(headers):
+        if key.lower() == "host":
+            del headers[key]
+    headers["Host"] = target.host_header
+    try:
+        # httpx's read timeout resets after every chunk. The outer deadline also
+        # bounds an SSE peer that sends keepalives forever.
+        async with asyncio.timeout(_TOTAL_TIMEOUT):
+            async with client.stream(
+                "POST",
+                target.request_url,
+                json=payload,
+                headers=headers,
+                extensions={"sni_hostname": target.sni_hostname},
+            ) as resp:
+                return await _read_bounded_response(resp)
+    except ProbeError:
+        raise
+    except httpx.ConnectTimeout:
+        raise ProbeError("timeout", "connect timeout") from None
+    except (httpx.TimeoutException, TimeoutError):
+        raise ProbeError("timeout", "request timeout") from None
+    except httpx.DecodingError:
+        raise ProbeError("protocol", "invalid response encoding") from None
+    except httpx.ConnectError as exc:
+        if _contains_tls_error(exc):
+            raise ProbeError("tls", "TLS connection failed") from None
+        raise ProbeError("transport", "connection failed") from None
+    except httpx.RemoteProtocolError:
+        raise ProbeError("protocol", "invalid HTTP response") from None
+    except httpx.TransportError:
+        raise ProbeError("transport", "connection failed") from None
+    except (TypeError, ValueError, UnicodeError):
+        raise ProbeError("protocol", "invalid MCP request") from None
+
+
+def _raise_for_status(resp: httpx.Response) -> None:
+    if resp.status_code in _REDIRECT_STATUSES:
+        raise ProbeError("protocol", "redirects not allowed")
+    if resp.status_code >= 400:
+        raise ProbeError(
+            _classify_http(resp.status_code),
+            f"upstream HTTP {resp.status_code}",
+        )
 
 
 class _SseReader:
@@ -320,9 +681,46 @@ def _init_payload() -> dict:
 def _tools_from_rpc(doc: dict) -> dict:
     if "error" in doc:
         raise ProbeError("protocol", json.dumps(doc["error"])[:160])
-    tools = (doc.get("result") or {}).get("tools") or []
-    names = [str(t.get("name") or "") for t in tools]
-    return {"ok": True, "tool_count": len(names), "tool_names": names}
+    result = doc.get("result") or {}
+    if not isinstance(result, dict):
+        raise ProbeError("protocol", "tools/list result must be an object")
+    raw_tools = result.get("tools") or []
+    if not isinstance(raw_tools, list):
+        raise ProbeError("protocol", "tools/list tools must be an array")
+    tools = [
+        tool
+        for tool in raw_tools
+        if isinstance(tool, dict) and str(tool.get("name") or "")
+    ]
+    names = [str(tool.get("name") or "") for tool in tools]
+    read_only_fingerprints: dict[str, str] = {}
+    seen_tool_names: set[str] = set()
+    for tool in tools:
+        name = str(tool.get("name") or "")
+        # Runtime routing is first-name-wins when a broken catalog repeats a
+        # tool name. Mark the name seen even when the first entry is not a
+        # read-only candidate, so a later duplicate cannot masquerade as it.
+        if name in seen_tool_names:
+            continue
+        seen_tool_names.add(name)
+        annotations = tool.get("annotations")
+        if (
+            not valid_tool_name(name)
+            or not isinstance(annotations, dict)
+            or annotations.get("readOnlyHint") is not True
+        ):
+            continue
+        # PATCH accepts at most 64 unique approvals. Keep probing/tool_names
+        # lossless, but expose only candidates that can be sent back as-is.
+        if len(read_only_fingerprints) >= MAX_READ_ONLY_TOOL_APPROVALS:
+            continue
+        read_only_fingerprints[name] = catalog_tool_fingerprint(tool)
+    return {
+        "ok": True,
+        "tool_count": len(names),
+        "tool_names": names,
+        "read_only_tool_fingerprints": read_only_fingerprints,
+    }
 
 
 async def _bounded_body(resp) -> str:
@@ -340,6 +738,97 @@ async def _bounded_body(resp) -> str:
     except httpx.HTTPError:
         pass
     return raw[:4096].decode("utf-8", errors="replace")
+
+
+class _SseSession:
+    """An initialized legacy HTTP+SSE session.
+
+    Replies arrive on the shared long-lived GET stream (via ``_SseReader``);
+    requests/notifications are POSTed to the same-origin ``endpoint`` the
+    handshake validated. Used by BOTH the control-plane probe and the
+    runtime-V2 ``mcp_client`` so the SSE wire logic lives in one place.
+    """
+
+    def __init__(self, reader: "_SseReader", msg_url: str, post):
+        self._reader = reader
+        self._msg_url = msg_url
+        self._post = post
+
+    async def request(self, rpc_id: int, method: str, params=None) -> dict:
+        """POST one JSON-RPC request and return its matching reply frame."""
+        payload = {"jsonrpc": "2.0", "id": rpc_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        await self._post(self._msg_url, payload)
+        return await self._reader.next_rpc(rpc_id)
+
+    async def notify(self, method: str) -> None:
+        """POST a JSON-RPC notification, tolerating a 4xx (some servers reject
+        ``notifications/initialized``)."""
+        await self._post(
+            self._msg_url,
+            {"jsonrpc": "2.0", "method": method},
+            tolerate_4xx=True,
+        )
+
+
+@contextlib.asynccontextmanager
+async def _sse_session(*, stream_get, post, url: str):
+    """Open a legacy HTTP+SSE session and yield an initialized ``_SseSession``.
+
+    ``stream_get()`` returns the httpx streaming context manager for the
+    long-lived GET (the caller sets the target/headers so the pinned runtime
+    path and the raw probe path both work). ``post(msg_url, payload, *,
+    tolerate_4xx=False)`` sends one JSON-RPC frame to the endpoint and enforces
+    the HTTP status. ``url`` is the configured URL the ``endpoint`` event must
+    stay same-origin with.
+
+    ONE implementation drives both callers, so the security-critical steps —
+    redirect refusal, the ``text/event-stream`` requirement, the ``_SseReader``
+    byte budget, and the endpoint same-origin (anti-SSRF) check — exist in
+    exactly one place. ``_NotSseServer`` is raised on a "wrong transport"
+    signal (non-stream GET) so the caller can fall back; a ``ProbeError`` raised
+    here (cross-origin refusal, malformed endpoint, rpc error) is a confirmed
+    failure that must propagate, never trigger fallback.
+    """
+    async with _safe_stream(stream_get()) as stream:
+        if stream.status_code in _REDIRECT_STATUSES:
+            raise ProbeError("protocol", "redirects not allowed")
+        if stream.status_code >= 400:
+            # "wrong transport" signal — let the caller try streamable.
+            raise _NotSseServer()
+        if "text/event-stream" not in stream.headers.get("content-type", ""):
+            raise _NotSseServer()
+        reader = _SseReader(stream.aiter_bytes())
+        event, data = await reader.next_event()
+        if event != "endpoint":
+            raise _NotSseServer()
+        # The endpoint value is server-controlled data. Parsing it (or the
+        # origin comparison) can raise ValueError — a malformed port
+        # (https://h:bad) or IPv6 literal — which must surface as a clean 400
+        # protocol error, never a 500 (codex3 R2).
+        try:
+            msg_url = urljoin(url, data.strip())
+            same_origin = (
+                _effective_origin(urlparse(msg_url))
+                == _effective_origin(urlparse(url)))
+        except ValueError:
+            raise ProbeError("protocol", "invalid endpoint URI")
+        # Refusing a cross-origin target keeps this from becoming an SSRF
+        # primitive (the exchange echoes upstream bodies back to the caller).
+        # Origins are NORMALIZED so an omitted default port
+        # (https://x vs https://x:443) isn't a false mismatch, while a
+        # genuinely different port still is.
+        if not same_origin:
+            raise ProbeError("protocol", "endpoint origin mismatch")
+        await post(msg_url, _init_payload())
+        init_doc = await reader.next_rpc(1)
+        if "error" in init_doc:
+            raise ProbeError("protocol", json.dumps(init_doc["error"])[:160])
+        session = _SseSession(reader, msg_url, post)
+        # spec-required before further requests; tolerate servers that 4xx it
+        await session.notify("notifications/initialized")
+        yield session
 
 
 def probe(url: str, headers: dict, *, ca_pem: str | None = None,
@@ -376,9 +865,9 @@ async def _probe_bounded(url: str, headers: dict, ca_pem: str | None,
 
 async def _probe_async(url: str, headers: dict, ca_pem: str | None,
                        transport, transport_hint: str = "") -> dict:
-    send_headers = {str(k): str(v) for k, v in (headers or {}).items()}
-    send_headers.setdefault("Accept", "application/json, text/event-stream")
-    send_headers["Content-Type"] = "application/json"
+    # _send_headers strips Host/Accept-Encoding and forces identity encoding so
+    # a compressed reply can't expand past the size budget before we see it.
+    send_headers = _send_headers(headers)
 
     def _map_net(e: Exception) -> ProbeError:
         if isinstance(e, httpx.ConnectTimeout):
@@ -402,8 +891,16 @@ async def _probe_async(url: str, headers: dict, ca_pem: str | None,
         try:
             cm = client.stream("POST", url, json=_init_payload(), headers=send_headers)
             async with _safe_stream(cm) as resp:
-                if resp.status_code in (301, 302, 307, 308):
+                if resp.status_code in _REDIRECT_STATUSES:
                     raise ProbeError("protocol", "redirects not allowed")
+                # Reject a compressed body BEFORE any read: httpx's decoder would
+                # expand one chunk past the size budget in memory before our
+                # running check runs. Accept-Encoding was forced to identity.
+                content_encoding = resp.headers.get(
+                    "content-encoding", "").strip().lower()
+                if content_encoding not in ("", "identity"):
+                    raise ProbeError(
+                        "protocol", "compressed MCP responses are not allowed")
                 if resp.status_code >= 400:
                     err = ProbeError(_classify_http(resp.status_code),
                                      (await _bounded_body(resp))[:160])
@@ -447,10 +944,15 @@ async def _probe_async(url: str, headers: dict, ca_pem: str | None,
 
     async def _sse_flow(client: httpx.AsyncClient) -> dict:
         """Legacy HTTP+SSE handshake: GET stream → ``endpoint`` event →
-        POST requests to the (same-origin) endpoint, replies on the stream."""
-        get_headers = {k: v for k, v in send_headers.items()
-                       if k.lower() != "content-type"}
-        get_headers["Accept"] = "text/event-stream"
+        POST requests to the (same-origin) endpoint, replies on the stream.
+        The GET/endpoint/same-origin/init machinery lives in the shared
+        module-level ``_sse_session`` — this closure only supplies the raw
+        (unpinned) probe transport and drives tools/list."""
+        def _stream_get():
+            get_headers = {k: v for k, v in send_headers.items()
+                           if k.lower() != "content-type"}
+            get_headers["Accept"] = "text/event-stream"
+            return client.stream("GET", url, headers=get_headers)
 
         async def _sse_post(msg_url: str, payload: dict, *, tolerate_4xx: bool = False):
             try:
@@ -461,48 +963,10 @@ async def _probe_async(url: str, headers: dict, ca_pem: str | None,
                 raise ProbeError(_classify_http(resp.status_code), resp.text[:160])
 
         try:
-            cm = client.stream("GET", url, headers=get_headers)
-            async with _safe_stream(cm) as stream:
-                if stream.status_code in (301, 302, 307, 308):
-                    raise ProbeError("protocol", "redirects not allowed")
-                if stream.status_code >= 400:
-                    # "wrong transport" signal — let the caller try streamable.
-                    raise _NotSseServer()
-                if "text/event-stream" not in stream.headers.get("content-type", ""):
-                    raise _NotSseServer()
-                reader = _SseReader(stream.aiter_bytes())
-                event, data = await reader.next_event()
-                if event != "endpoint":
-                    raise _NotSseServer()
-                # The endpoint value is server-controlled data. Parsing it (or
-                # the origin comparison) can raise ValueError — a malformed port
-                # (https://h:bad) or IPv6 literal — which must surface as a clean
-                # 400 protocol error, never a 500 (codex3 R2).
-                try:
-                    msg_url = urljoin(url, data.strip())
-                    same_origin = (
-                        _effective_origin(urlparse(msg_url))
-                        == _effective_origin(urlparse(url)))
-                except ValueError:
-                    raise ProbeError("protocol", "invalid endpoint URI")
-                # Refusing a cross-origin target keeps this from becoming an SSRF
-                # primitive (probe echoes upstream bodies back to the caller).
-                # Origins are NORMALIZED so an omitted default port
-                # (https://x vs https://x:443) isn't a false mismatch, while a
-                # genuinely different port still is.
-                if not same_origin:
-                    raise ProbeError("protocol", "endpoint origin mismatch")
-                await _sse_post(msg_url, _init_payload())
-                init_doc = await reader.next_rpc(1)
-                if "error" in init_doc:
-                    raise ProbeError("protocol", json.dumps(init_doc["error"])[:160])
-                # spec-required; tolerate servers that reject the notification
-                await _sse_post(msg_url, {"jsonrpc": "2.0",
-                                          "method": "notifications/initialized"},
-                                tolerate_4xx=True)
-                await _sse_post(msg_url, {"jsonrpc": "2.0", "id": 2,
-                                          "method": "tools/list"})
-                body = await reader.next_rpc(2)
+            async with _sse_session(
+                stream_get=_stream_get, post=_sse_post, url=url,
+            ) as session:
+                body = await session.request(2, "tools/list")
                 return {**_tools_from_rpc(body), "transport": "sse"}
         except _LegacySseEndpoint:
             # endpoint events after the handshake are nonsense — treat as broken
@@ -510,17 +974,10 @@ async def _probe_async(url: str, headers: dict, ca_pem: str | None,
         except (httpx.TimeoutException, httpx.ConnectError) as e:
             raise _map_net(e)
 
-    timeout = httpx.Timeout(_TOTAL_TIMEOUT, connect=_CONNECT_TIMEOUT)
-    client_kwargs = {"timeout": timeout, "follow_redirects": False,
-                     "transport": transport}
-    if ca_pem:
-        # The user pinned their own CA: verify AGAINST IT rather than certifi.
-        # This is "add trust", not "skip verification" — a self-signed server
-        # still has to prove it holds the matching key.
-        ctx = ssl.create_default_context()
-        ctx.load_verify_locations(cadata=ca_pem)
-        client_kwargs["verify"] = ctx
-    async with httpx.AsyncClient(**client_kwargs) as client:
+    # _client_kwargs pins trust_env=False (never inherit HTTP(S)_PROXY /
+    # SSL_CERT_FILE from the worker env) and, when a CA is given, verifies
+    # AGAINST it (add-trust, not skip-verify) on a certifi-backed context.
+    async with httpx.AsyncClient(**_client_kwargs(ca_pem, transport)) as client:
         if str(transport_hint or "").strip().lower() == "sse":
             # Try SSE first. Fall back to streamable ONLY on the narrow
             # "this isn't an SSE server" signal — a ProbeError raised inside a

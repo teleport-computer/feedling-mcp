@@ -346,7 +346,15 @@ def test_parse_openai_compat_body_result_shape():
         resp, provider="openrouter", model="m", require_reply=True)
     assert out["reply"] == "hi there"
     assert out["reasoning"] == "why"
-    assert out["usage"] == {"total_tokens": 3}
+    # PR B Task 2 (B4): usage is normalized in place to prompt/completion/total keys.
+    assert out["usage"] == {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": 3,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+        "cache_miss_tokens": None,
+    }
     assert out["raw_id"] == "chatcmpl-1"
     assert out["provider"] == "openrouter"
     assert out["model"] == "m"
@@ -382,7 +390,15 @@ def test_parse_deepseek_body_extracts_reasoning_content():
 
     assert out["reply"] == "visible answer"
     assert out["reasoning"] == "deepseek reasoning summary"
-    assert out["usage"] == {"total_tokens": 11}
+    # PR B Task 2 (B4): usage is normalized in place to prompt/completion/total keys.
+    assert out["usage"] == {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": 11,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+        "cache_miss_tokens": None,
+    }
     assert out["provider"] == "deepseek"
 
 
@@ -458,6 +474,66 @@ def test_openai_reasoning_model_uses_responses_api_and_extracts_summary(monkeypa
     }]
     assert calls[0]["json"]["reasoning"] == {"effort": "medium", "summary": "concise"}
     assert calls[0]["json"]["store"] is False
+
+
+def test_openai_responses_encodes_assistant_history_as_output_text(monkeypatch):
+    """Multi-turn regression (hosted codex/gpt-5 driver dropped every turn 2+):
+    a prior assistant reply carried in history must serialize as ``output_text``,
+    NOT ``input_text``. The OpenAI Responses API rejects ``input_text`` on an
+    assistant-role content part with HTTP 400 ('Invalid value: input_text.
+    Supported values are: output_text and refusal'), which the V2 loop turned
+    into a silent no-reply turn."""
+    calls = _fake_client(
+        monkeypatch,
+        {
+            "id": "resp_mt",
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "第2轮回复"}]},
+            ],
+            "usage": {},
+        },
+    )
+
+    result = pc.chat_completion(
+        pc.ProviderConfig("openai", "gpt-5", "sk-test"),
+        [
+            {"role": "user", "content": "第1轮"},
+            {"role": "assistant", "content": "第1轮回复"},
+            {"role": "user", "content": "第2轮"},
+        ],
+    )
+
+    assert result["reply"] == "第2轮回复"
+    sent_input = calls[0]["json"]["input"]
+    assistant_items = [it for it in sent_input if it.get("role") == "assistant"]
+    assert assistant_items, "assistant history item missing from Responses input"
+    for part in assistant_items[0]["content"]:
+        assert part["type"] == "output_text", (
+            "assistant content on the Responses wire must be output_text, "
+            f"got {part['type']!r} (would 400)"
+        )
+
+
+def test_synthesized_assistant_tool_turn_uses_output_text_on_responses_wire():
+    """The tool-exchange history encoder (_synthesized_assistant_payload) has the
+    same constraint: a prior assistant turn that called tools must emit its text
+    as output_text on the Responses wire, not input_text."""
+    from provider_types import ToolCall, ToolExchange
+
+    exchange = ToolExchange(
+        calls=(ToolCall(id="call_1", name="probe", args={}),),
+        results=(),
+        assistant_text="let me check",
+    )
+    items = pc._synthesized_assistant_payload(exchange, "openai_responses")
+    text_items = [
+        p for it in items if it.get("role") == "assistant"
+        for p in it.get("content", [])
+    ]
+    assert text_items, "assistant text item missing"
+    assert all(p["type"] == "output_text" for p in text_items), (
+        f"assistant tool-turn text must be output_text, got {[p['type'] for p in text_items]}"
+    )
 
 
 def test_anthropic_chat_completion_maps_image_parts(monkeypatch):

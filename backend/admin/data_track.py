@@ -40,6 +40,26 @@ def _onboarding_validation_payload(store):
     return {}
 
 
+def _runtime_token_usage_summary(*, lane: str = "chat", within_days: int = 30) -> dict:
+    """Injected by ``asgi_app`` to keep admin below Runtime V2."""
+    return {
+        "window_days": within_days,
+        "sampled_turns": 0,
+        "users": 0,
+        "model_calls": 0,
+        "usage_reported_calls": 0,
+        "cache_reported_calls": 0,
+        "usage_telemetry_coverage": None,
+        "cache_telemetry_coverage": None,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+        "cache_miss_tokens": None,
+    }
+
+
 def _data_track_qs(**updates) -> str:
     params: dict[str, str] = {}
     for key in (
@@ -719,7 +739,7 @@ def _data_track_fast_validation(
     # Current-reality onboarding check (2026-07 redo). The old 7-step validator
     # asserted removed MCP tools (feedling_identity_init / _chat_verify_loop /
     # _chat_post_message) and retired story/about_me/ta_thinking memory tabs, so
-    # every genesis/host_all user looked permanently stuck. The live flow has
+    # every Genesis/Runtime V2 user looked permanently stuck. The live flow has
     # exactly four ground-truth milestones — identity written, memory distilled,
     # a live connection, and the first AI-visible message — evaluated the same
     # way the authoritative hosted validator does (memory_count > 0, etc.).
@@ -1206,6 +1226,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     incomplete = max(0, len(rows) - completed)
     stage_counts: dict[str, int] = {}
     route_counts: dict[str, int] = {}
+    activated_route_counts: dict[str, int] = {}
     access_mode_counts: dict[str, int] = {}
     chat_total = 0
     memory_total = 0
@@ -1250,6 +1271,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         is_activated = int(row["memory"].get("total") or 0) > 0 or int(row["chat"].get("user_messages") or 0) > 0
         if is_activated:
             activated += 1
+            activated_route_counts[route] = activated_route_counts.get(route, 0) + 1
         # Connection health only meaningful for users who actually use it.
         if is_activated:
             cstatus = (row.get("connection") or {}).get("status")
@@ -1288,6 +1310,10 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
             principal_rows[pid] = principal_rows.get(pid, 0) + 1
     dup_principals = sum(1 for c in principal_rows.values() if c > 1)
     dup_surplus_rows = sum(c - 1 for c in principal_rows.values() if c > 1)
+    runtime_token_usage = _runtime_token_usage_summary(
+        lane="chat",
+        within_days=int(filters.get("days") or 30),
+    )
     summary = {
         "generated_at": datetime.now().isoformat(),
         "users_total": len(rows),
@@ -1311,6 +1337,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         },
         "stage_counts": stage_counts,
         "route_counts": route_counts,
+        "activated_route_counts": activated_route_counts,
         "access_mode_counts": access_mode_counts,
         "principals_total": len(set(r.get("principal_id") or r.get("user_id") for r in rows)),
         "chat_messages_total": chat_total,
@@ -1326,6 +1353,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
             "users_active": au_users_active,
             "dau_today": au_dau_today,
         },
+        "runtime_token_usage": runtime_token_usage,
     }
     payload = {
         "summary": summary,
@@ -1831,6 +1859,25 @@ def _fmt_duration_sec(value) -> str:
     return f"{sec}s"
 
 
+def _fmt_count(value) -> str:
+    """Compact dashboard count while preserving unknown-vs-zero semantics."""
+    if value is None:
+        return "—"
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _fmt_ratio(value) -> str:
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
 def _render_admin_login_page(error: bool = False, next_url: str = "/admin/data-track") -> str:
     """Password-gate login page for the admin dashboard. Posts to /admin/login,
     which validates FEEDLING_ADMIN_PASSWORD and sets the signed admin_session
@@ -2020,6 +2067,41 @@ def _render_data_track_page(payload: dict) -> str:
         "<h2>Activation funnel（真实使用漏斗 · 基于行为,不看 stage 标签）</h2>"
         f"<section class='funnel'>{funnel_html}</section>"
     )
+    # One operator-facing telemetry surface: Runtime V2 model usage, deployment
+    # route coverage, and iOS foreground duration. The three clocks are labelled
+    # explicitly because model latency is not product engagement time.
+    rt = summary.get("runtime_token_usage") or {}
+    route_counts = summary.get("activated_route_counts") or {}
+    cache_read = rt.get("cache_read_tokens")
+    cache_miss = rt.get("cache_miss_tokens")
+    cache_denominator = (
+        int(cache_read) + int(cache_miss)
+        if cache_read is not None and cache_miss is not None
+        else 0
+    )
+    cache_hit_ratio = (
+        int(cache_read) / cache_denominator if cache_denominator else None
+    )
+    token_window = int(rt.get("window_days") or 30)
+    telemetry_metrics = "".join([
+        _render_metric(f"全站 V2 token 总量（近 {token_window} 天）", _fmt_count(rt.get("total_tokens"))),
+        _render_metric(f"全站 V2 输入 / 输出 token（近 {token_window} 天）", f"{_fmt_count(rt.get('prompt_tokens'))} / {_fmt_count(rt.get('completion_tokens'))}"),
+        _render_metric(f"Prompt cache 读取 token（近 {token_window} 天）", _fmt_count(cache_read)),
+        _render_metric(f"Prompt cache token 命中率（近 {token_window} 天）", _fmt_ratio(cache_hit_ratio)),
+        _render_metric(f"Token 上报覆盖率（近 {token_window} 天）", _fmt_ratio(rt.get("usage_telemetry_coverage"))),
+        _render_metric(f"全站 V2 使用账号 / turns（近 {token_window} 天）", f"{_fmt_count(rt.get('users'))} / {_fmt_count(rt.get('sampled_turns'))}"),
+        _render_metric("托管激活账号（当前筛选）", _fmt_count(route_counts.get("model_api", 0))),
+        _render_metric("自托管激活账号（当前筛选）", _fmt_count(route_counts.get("resident", 0))),
+    ])
+    telemetry_section = (
+        "<h2>运营 Telemetry</h2>"
+        f"<section class='metrics'>{telemetry_metrics}</section>"
+        "<div class='muted'>Token 来自 provider usage，缺报会降低覆盖率而不会伪装成 0；"
+        "prompt token 已包含 cache read/write，不与 cache 列重复相加。"
+        "Token 是全站近期开销，不随用户搜索条件收窄；托管/自托管按当前页面筛选后、当前 route 的已激活账号行统计。"
+        "从未联系官方 backend 的离线自托管实例不可观测，"
+        "重装产生的旧账号也可能重复，因此它是可观测账号覆盖数，不是假装精确的真人/实例数。</div>"
+    )
     # App 使用时长(iOS app_session_end 事件聚合 · summary['app_usage'] 由 db 层填充)。
     au = summary.get("app_usage") or {}
     if au.get("sessions_total"):
@@ -2094,6 +2176,7 @@ def _render_data_track_page(payload: dict) -> str:
 	  {_render_data_track_view_nav("users")}
 		  <section class="metrics">{metrics}</section>
 		  {funnel_section}
+		  {telemetry_section}
 		  {app_usage_section}
 	  <h2>Beta users</h2>
 	  <div class="toolbar"><input id="q" placeholder="Filter user, route, stage"></div>

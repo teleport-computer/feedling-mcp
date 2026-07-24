@@ -1,4 +1,5 @@
-import os, psycopg
+import os
+import psycopg
 import db
 from conftest import seed_user  # noqa: E402
 
@@ -55,12 +56,9 @@ def test_chat_delete_mirrors_to_tee(backend_env, monkeypatch):
                 "WHERE user_id='usr_dw3' AND table_name='chat_messages'")[0][0] == 0
 
 
-def test_chat_append_trim_mirrors_pinned_eviction_and_clears_pending(backend_env, monkeypatch):
-    """Round-2 Fix 1 (P1): chat_append's ring-buffer trim must propagate to the
-    TEE mirror (pinned to the EXACT evicted msg_ids, same pattern as
-    frame_prune_to), and any pending_device_migration marker those evicted rows
-    carried must be cleared too — otherwise a trimmed-away row's marker
-    outlives it and permanently unbalances verify's rds == tee + pending."""
+def test_chat_append_limit_never_deletes_primary_or_tee_history(backend_env, monkeypatch):
+    """A hot-window hint must not retire the durable row, its TEE mirror, or
+    the migration marker that still legitimately refers to that live row."""
     monkeypatch.setenv("FEEDLING_TEE_DUAL_WRITE", "1")
     uid = "usr_dw_trim1"
     seed_user(uid)
@@ -78,18 +76,15 @@ def test_chat_append_trim_mirrors_pinned_eviction_and_clears_pending(backend_env
     db.chat_append(uid, "new1", 2.0, {"id": "new1"}, max_messages=2)
     db.chat_append(uid, "new2", 3.0, {"id": "new2"}, max_messages=2)
 
-    # "old" evicted from RDS by the ring-buffer trim (max_messages=2 keeps
-    # only new1/new2).
     with db.get_pool().connection() as conn:
         rds_ids = {r[0] for r in conn.execute(
             "SELECT msg_id FROM chat_messages WHERE user_id=%s", (uid,)).fetchall()}
-    assert rds_ids == {"new1", "new2"}
+    assert rds_ids == {"old", "new1", "new2"}
 
-    # Mirror delete pinned to the evicted id + its pending marker cleared.
     assert _tee("SELECT count(*) FROM chat_messages WHERE user_id=%s AND msg_id='old'",
-                (uid,))[0][0] == 0
+                (uid,))[0][0] == 1
     assert _tee("SELECT count(*) FROM tee_pending_device_migration "
-                "WHERE user_id=%s AND table_name='chat_messages'", (uid,))[0][0] == 0
+                "WHERE user_id=%s AND table_name='chat_messages'", (uid,))[0][0] == 1
 
 
 def test_delete_user_data_clears_pending_across_all_tables(backend_env, monkeypatch):

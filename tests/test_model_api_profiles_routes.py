@@ -249,10 +249,9 @@ def test_legacy_test_endpoint_mark_ok_write_failure_500(
     assert resp.get_json()["error"] == "model_api_route_write_failed"
 
 
-def test_get_response_key_set_matches_premigration(
+def test_get_response_key_set_adds_prompt_frontier_contract(
         client, fake_provider, fake_envelope, fake_enclave):
-    """GET /v1/model_api/get 的 config 键集合必须与迁移前 public_config() 投影一致
-    （含 created_at / updated_at，未设置时为空串），不能静默窄化已发布契约。"""
+    """GET /get keeps the old projection and exposes the persisted frontier."""
     _uid, headers = _register(client)
     client.post("/v1/model_api/setup", headers=headers, json={
         "provider": "anthropic", "model": "claude-sonnet-4-5",
@@ -263,6 +262,7 @@ def test_get_response_key_set_matches_premigration(
         "provider", "model", "base_url", "api_key_hint", "test_status",
         "last_test_at", "created_at", "updated_at", "last_test_error",
         "configured", "privacy_mode", "reasoning_effort",
+        "context_window_tokens",
     }
     # created_at/updated_at are populated by the DB defaults on insert.
     assert cfg["created_at"] and cfg["updated_at"]

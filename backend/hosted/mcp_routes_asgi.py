@@ -30,15 +30,22 @@ async def mcp_list(auth: AuthResult = Depends(require_api_key)):
 
 @router.post("/v1/mcp/servers")
 async def mcp_upsert(request: Request, auth: AuthResult = Depends(require_api_key)):
-    payload = (await asgi_http.read_json_silent(request)) or {}
+    payload = await asgi_http.read_json_silent(request)
     body, status = await threadpool.run_db(mcp_core.upsert_server, auth.store, payload)
     return JSONResponse(body, status_code=status)
 
 
 @router.patch("/v1/mcp/servers/{name}")
 async def mcp_patch(name: str, request: Request, auth: AuthResult = Depends(require_api_key)):
-    payload = (await asgi_http.read_json_silent(request)) or {}
-    body, status = await threadpool.run_db(mcp_core.set_enabled, auth.store, name, payload)
+    payload = await asgi_http.read_json_silent(request)
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        mcp_core.set_enabled,
+        auth.store,
+        name,
+        payload,
+        caller_api_key,
+    )
     return JSONResponse(body, status_code=status)
 
 

@@ -177,6 +177,8 @@ OPERATION_PARAMETERS: dict[Operation, list[dict[str, Any]]] = {
     ],
     ("get", "/v1/chat/history"): [
         _query("limit", _schema("integer", minimum=1, maximum=200, default=200), "Maximum messages in this page.", example=50),
+        _query("after_seq", _schema("integer", minimum=0), "Lossless forward cursor. Return messages whose durable append sequence is greater than this value; takes precedence over timestamp cursors.", example=1042),
+        _query("before_seq", _schema("integer", minimum=1), "Lossless backward cursor. Return messages whose durable append sequence is less than this value; takes precedence over timestamp cursors.", example=1042),
         _query("since", TIMESTAMP, "Return messages with ts strictly greater than this watermark.", example=1783962000.0),
         _query("before", TIMESTAMP, "Return older messages with ts strictly less than this watermark; takes precedence over since.", example=1783962000.0),
         _query("include_image_body", _schema("boolean", default=True), "Set false to omit image and oversized inline bodies.", example=False),
@@ -329,6 +331,76 @@ OPERATION_PARAMETERS[("put", "/v1/genesis/imports/{job_id}/chunks/{seq}")] = [
 
 
 COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "WebSettingsUpdateRequest": {
+        "type": "object",
+        "description": (
+            "Set the user's web-search preference. `enabled` must be a real "
+            "JSON boolean — strings such as \"no\" are rejected with 400 "
+            "rather than coerced."
+        ),
+        "required": ["enabled"],
+        "additionalProperties": False,
+        "properties": {
+            "enabled": {
+                "type": "boolean",
+                "description": "The user's saved preference. Defaults to false.",
+            }
+        },
+    },
+    "WebSettingsResponse": {
+        "type": "object",
+        "description": (
+            "Web-search state. `enabled` is the user's saved preference and is "
+            "written only by the user — an operator halt never rewrites it. "
+            "`runtime_supported` is false for self-hosted accounts, whose "
+            "consumer does not run the tool loop these tools live in, so the "
+            "preference is inert there. `effective` is derived, and covers "
+            "every lane: the proactive companion's background turns follow the "
+            "same switch as foreground chat."
+        ),
+        "required": [
+            "enabled",
+            "runtime_supported",
+            "status",
+            "effective",
+            "tools",
+        ],
+        "additionalProperties": False,
+        "properties": {
+            "enabled": {"type": "boolean", "description": "The user's saved preference."},
+            "runtime_supported": {
+                "type": "boolean",
+                "description": "Whether this account's runtime has the web tools at all.",
+            },
+            "status": {
+                "type": "string",
+                "enum": ["available", "degraded", "unavailable"],
+                "description": (
+                    "`degraded` means one of the two tools is halted and the "
+                    "other still works — not a synonym for unavailable."
+                ),
+            },
+            "effective": {
+                "type": "boolean",
+                "description": "Whether this account's turns actually get web tools.",
+            },
+            "tools": {
+                "type": "object",
+                "required": ["web_search", "web_fetch"],
+                "additionalProperties": False,
+                "properties": {
+                    "web_search": {"$ref": "#/components/schemas/WebToolState"},
+                    "web_fetch": {"$ref": "#/components/schemas/WebToolState"},
+                },
+            },
+        },
+    },
+    "WebToolState": {
+        "type": "object",
+        "required": ["available"],
+        "additionalProperties": False,
+        "properties": {"available": {"type": "boolean"}},
+    },
     "FreeFormJsonObject": {
         "type": "object",
         "description": "Legacy compatibility payload. Consult the operation description before sending fields.",
@@ -946,12 +1018,15 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "type": "string",
                 "description": (
                     "MCP server endpoint. http:// and https:// are both accepted, including "
-                    "loopback and private-network hosts — this backend never dials the URL itself "
-                    "(see POST .../test); only your agent runtime does."
+                    "loopback and private-network hosts. Saving the config does not dial it. "
+                    "POST .../test dials public endpoints from the API backend on request, and "
+                    "Hosted Runtime V2 contacts each enabled server at turn start for tools/list "
+                    "before any later tool calls."
                 ),
             },
             "headers": {
                 "type": "object",
+                "maxProperties": 20,
                 "additionalProperties": {"type": "string"},
                 "description": "Extra HTTP headers (e.g. Authorization) sent with every MCP request. Max 20 entries, 8192 bytes combined across names and values. The Host header is forbidden.",
             },
@@ -967,6 +1042,27 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                     "send empty to clear a previously stored CA."
                 ),
             },
+            "read_only_tool_fingerprints": {
+                "type": "object",
+                "maxProperties": 64,
+                "propertyNames": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": r"^[^\u0000-\u001f\u007f]{1,256}$",
+                },
+                "additionalProperties": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$",
+                },
+                "description": (
+                    "Exact tool-name to catalog-fingerprint approvals returned by POST "
+                    ".../test. Runtime V2 treats a tool as a parallel read only while the "
+                    "remote catalog still has strict readOnlyHint=true and its current "
+                    "fingerprint exactly matches this encrypted approval; missing or stale "
+                    "entries fail closed to serialized mutation semantics."
+                ),
+            },
         },
         "additionalProperties": False,
         "example": {
@@ -978,10 +1074,34 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "McpServerPatchRequest": {
         "type": "object",
-        "required": ["enabled"],
-        "properties": {"enabled": {"type": "boolean"}},
+        "minProperties": 1,
+        "properties": {
+            "enabled": {"type": "boolean"},
+            "read_only_tool_fingerprints": {
+                "type": "object",
+                "maxProperties": 64,
+                "propertyNames": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": r"^[^\u0000-\u001f\u007f]{1,256}$",
+                },
+                "additionalProperties": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$",
+                },
+                "description": (
+                    "Replace the encrypted read-only approval map without resending URL, "
+                    "headers, or CA. Send {} to revoke every approval."
+                ),
+            },
+        },
         "additionalProperties": False,
-        "example": {"enabled": False},
+        "example": {
+            "read_only_tool_fingerprints": {
+                "search": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        },
     },
     "McpServerRecord": {
         "type": "object",
@@ -1023,15 +1143,49 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "McpServerTestResponse": {
         "type": "object",
-        "required": ["ok", "tool_count", "tool_names", "transport"],
+        "required": [
+            "ok",
+            "tool_count",
+            "tool_names",
+            "read_only_tool_fingerprints",
+            "transport",
+        ],
         "properties": {
             "ok": {"type": "boolean", "const": True},
             "tool_count": {"type": "integer", "minimum": 0},
             "tool_names": {"type": "array", "items": {"type": "string"}},
+            "read_only_tool_fingerprints": {
+                "type": "object",
+                "maxProperties": 64,
+                "propertyNames": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "pattern": r"^[^\u0000-\u001f\u007f]{1,256}$",
+                },
+                "additionalProperties": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$",
+                },
+                "description": (
+                    "Approval candidates for tools whose current MCP catalog has strict "
+                    "readOnlyHint=true. The response contains at most 64 candidates and omits "
+                    "names that PATCH cannot accept. These are not active until the user "
+                    "explicitly sends selected entries to PATCH /v1/mcp/servers/{name}."
+                ),
+            },
             "transport": {"type": "string", "enum": ["http", "sse"], "description": "The MCP transport this probe actually spoke to the server: 'http' (streamable HTTP) or 'sse' (legacy HTTP+SSE). This is the authoritative detection that gets persisted to the server record's transport field."},
         },
         "additionalProperties": True,
-        "example": {"ok": True, "tool_count": 2, "tool_names": ["search", "fetch"], "transport": "http"},
+        "example": {
+            "ok": True,
+            "tool_count": 2,
+            "tool_names": ["search", "fetch"],
+            "read_only_tool_fingerprints": {
+                "search": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "transport": "http",
+        },
     },
     "NotifyRelayRegisterRequest": {
         "type": "object",
@@ -1159,6 +1313,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
 
 
 PRECISE_JSON_BODIES: dict[Operation, str] = {
+    ("post", "/v1/web/settings"): "WebSettingsUpdateRequest",
     ("post", "/v1/users/register"): "RegisterRequest",
     ("post", "/v1/access/link-token"): "LinkTokenRequest",
     ("post", "/v1/access/claim-token"): "ClaimTokenRequest",
@@ -1249,7 +1404,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope). Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/chat/verify_loop"): "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded.",
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
-    ("get", "/v1/chat/history"): "Read encrypted chat history using timestamp watermarks. Use oldest_ts as before for older pages and latest_ts as since for newer pages.",
+    ("get", "/v1/chat/history"): "Read encrypted chat history. Use oldest_seq as before_seq for lossless older paging and latest_seq as after_seq for lossless forward paging; timestamp watermarks remain for compatibility.",
     ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",
     ("post", "/v1/memory/fetch"): "Fetch full records for selected memory IDs. Sensitive fetch behavior is not part of the current public contract.",
     ("post", "/v1/memory/actions"): "Apply up to 20 memory actions in order. The batch is not transactional and Idempotency-Key is not supported.",
@@ -1264,7 +1419,9 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/mcp/servers"): (
         "Create or update a user-configured MCP server (matched by name). http:// and https:// URLs "
         "are both accepted, including loopback and private-network hosts and IP literals — this "
-        "backend never dials the URL at save time (see POST .../test), only your agent runtime does. "
+        "backend does not dial the URL at save time. POST .../test dials public endpoints from the "
+        "API backend on request. Hosted Runtime V2 contacts each enabled server at the start of "
+        "every turn for tools/list, before any later tool calls. "
         "Hosted (cloud-run) agents cannot reach machines on your home or office network; expose a "
         "local MCP server through a tunnel (e.g. Cloudflare Tunnel, Tailscale Funnel, ngrok) to a "
         "public address first. To use a self-signed or private-CA server, paste the issuing CA "
@@ -1272,30 +1429,47 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "for this server; it does not disable certificate verification, and the server still has to "
         "present a certificate chaining to that CA. http:// sends all configured headers, including "
         "API keys, in plaintext over the network; this is an explicit, informed choice. Possible 400 "
-        "error kinds: invalid_name, invalid_url, invalid_headers, too_many_headers, "
-        "headers_too_large, forbidden_header, invalid_ca, ca_too_large, too_many_servers. A 409 "
+        "error kinds: invalid_request, invalid_name, invalid_url, invalid_headers, invalid_enabled, "
+        "too_many_headers, headers_too_large, forbidden_header, invalid_ca, ca_too_large, "
+        "invalid_read_only_tool_fingerprints, invalid_read_only_tool_name, "
+        "invalid_read_only_tool_fingerprint, too_many_read_only_tool_fingerprints, and "
+        "too_many_servers. A 409 "
         "cannot_encrypt means the server-side envelope could not be built."
     ),
-    ("patch", "/v1/mcp/servers/{name}"): "Toggle a user-configured MCP server's enabled flag. 404 not_found when no server with that name exists.",
+    ("patch", "/v1/mcp/servers/{name}"): (
+        "Toggle a user-configured MCP server and/or replace its encrypted read-only tool "
+        "fingerprint approvals without resending URL, headers, or CA. Send an empty approval "
+        "object to revoke all read-only approvals. Unknown fields are rejected and enabled must "
+        "be a JSON boolean. Possible 400 errors include invalid_patch, invalid_enabled, "
+        "invalid_read_only_tool_fingerprints, invalid_read_only_tool_name, "
+        "invalid_read_only_tool_fingerprint, too_many_read_only_tool_fingerprints, and "
+        "decrypt_failed. A 409 cannot_encrypt leaves the old config unchanged. 404 not_found "
+        "when no server with that name exists."
+    ),
     ("delete", "/v1/mcp/servers/{name}"): "Delete a user-configured MCP server. 404 not_found when no server with that name exists.",
     ("post", "/v1/mcp/servers/{name}/test"): (
         "Best-effort connectivity probe (MCP initialize -> tools/list) run from this backend's own "
-        "network, offered purely as a convenience for validating publicly reachable https:// "
+        "network, offered purely as a convenience for validating publicly reachable http:// or "
+        "https:// "
         "servers. A 400 unreachable_from_backend response does NOT mean the server failed to save — "
         "it was already saved successfully by POST /v1/mcp/servers. It only means this backend "
         "process could not reach the host, typically because it is a loopback/private-network "
         "address or a tunnel endpoint that only your agent's environment can reach. For those "
         "servers, skip this probe and instead ask your agent to call the MCP server directly in "
-        "chat to verify it. Other 400 kinds: dns (hostname did not resolve), tls (certificate/TLS "
-        "handshake failure — check ca_pem), codex_cert_chain_required (a hosted codex agent uses a "
-        "rustls TLS stack that rejects a CA certificate presented as the server's own leaf/"
-        "end-entity certificate; reissue the server with a proper CA+leaf chain — a pasted ca_pem "
-        "does not fix this, since rustls rejects the leaf's shape regardless of what is trusted), "
-        "timeout (connect/read timeout, or the whole probe exceeded its 45-second wall-clock "
-        "ceiling — e.g. a legacy HTTP+SSE endpoint answering with a never-ending event stream), "
+        "chat to verify it. Other 400 kinds: dns (hostname did not resolve), dns_busy (resolver "
+        "capacity exhausted), tls (certificate/TLS handshake failure — check ca_pem), "
+        "codex_cert_chain_required (a hosted codex agent uses a rustls TLS stack that rejects a CA "
+        "certificate presented as the server's own leaf/end-entity certificate; reissue the server "
+        "with a proper CA+leaf chain — a pasted ca_pem does not fix this, since rustls rejects the "
+        "leaf's shape regardless of what is trusted), transport (connection failure), timeout "
+        "(connect/read timeout, or the whole probe exceeded its 45-second wall-clock ceiling — "
+        "e.g. a legacy HTTP+SSE endpoint answering with a never-ending event stream), "
+        "response_too_large, "
         "http_401/http_403/http_404/http_4xx/http_5xx (server responded with an HTTP error), "
         "protocol (malformed MCP handshake), decrypt_failed. "
-        "404 not_found when no server with that name exists."
+        "404 not_found when no server with that name exists. A successful response also returns "
+        "at most 64 PATCH-compatible read_only_tool_fingerprints for strict readOnlyHint=true "
+        "tools; those candidates are inactive until explicitly approved through PATCH."
     ),
     ("post", "/v1/notify-relay/register"): (
         "Enroll a device for the self-hosted push relay and mint (or return) its "
@@ -1323,6 +1497,26 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("get", "/v1/web/settings"): {
+        "200": {
+            "description": "Current web-search state for the authenticated user.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/WebSettingsResponse"}
+                }
+            },
+        },
+    },
+    ("post", "/v1/web/settings"): {
+        "200": {
+            "description": "The state after applying the update.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/WebSettingsResponse"}
+                }
+            },
+        },
+    },
     ("get", "/healthz"): {
         "503": {
             "description": (
@@ -1520,6 +1714,10 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
         "200": {
             "description": "Updated server record.",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/McpServerRecord"}}},
+        },
+        "409": {
+            "description": "cannot_encrypt — the old config is unchanged; retry.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
         },
         "404": {
             "description": "not_found — no server with that name exists.",

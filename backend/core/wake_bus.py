@@ -61,8 +61,12 @@ def _enabled() -> bool:
 
 def register_handler(channel: str, fn: Callable[[str], None]) -> None:
     """Wire an extra handler for ``channel`` (called with the notify's user_id).
-    Used by asgi/lifespan.py to attach upward targets the core layer can't import."""
-    _extra_handlers.setdefault(channel, []).append(fn)
+    Used by asgi/lifespan.py to attach upward targets the core layer can't import.
+    Re-registering the same module-level callback is a no-op so repeated assembly
+    cannot multiply full-registry reloads or immediate-job wakeups."""
+    handlers = _extra_handlers.setdefault(channel, [])
+    if fn not in handlers:
+        handlers.append(fn)
 
 
 def notify(channel: str, user_id: str = "") -> None:

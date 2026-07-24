@@ -22,9 +22,11 @@ from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
 from core import store as core_store  # noqa: E402
-from hosted import agent_runtime_cutover  # noqa: E402
+from hosted import chat_send_core  # noqa: E402
+from hosted import config_store as hosted_config_store  # noqa: E402
 from hosted import history_import  # noqa: E402
 from identity import service as identity_service  # noqa: E402
+from model_api_runtime.v2 import jobs_store  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -33,6 +35,12 @@ def _b64(raw: bytes) -> str:
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
+    # Fresh-setup happy-path sends here rely on setup's startup
+    # materialization landing V2 with no explicit flip — the v2_only fleet
+    # contract (see test_asgi_hosted_chat_send.py's ``env`` fixture for the
+    # full rationale). Pin it here so the default "dual" policy (Task 5)
+    # doesn't leave fresh users on the still-resident per-user fence.
+    monkeypatch.setenv(hosted_config_store.HOSTED_RUNTIME_POLICY_ENV, "v2_only")
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     accounts_registry._users[:] = []
     accounts_registry._key_to_user.clear()
@@ -43,10 +51,12 @@ def client(tmp_path, monkeypatch):
         "_get_enclave_info",
         lambda: {"content_pk_hex": ("22" * 32), "compose_hash": "test"},
     )
-    # Seed a fresh supervisor heartbeat so the send wedge guard sees a live
-    # hosting runtime (these are full-path tests that route to the agent-runner).
-    db.set_supervisor_heartbeat({"ts": time.time(), "owner": "test",
-                                 "host_all": True, "gateway": True})
+    # Full-path hosted sends enter the pooled V2 worker lane.
+    monkeypatch.setattr(jobs_store, "workers_alive", lambda **kw: True)
+    monkeypatch.setattr(jobs_store, "live_worker_capacity", lambda **kw: 4)
+    monkeypatch.setattr(jobs_store, "inflight_job_count", lambda: 0)
+    monkeypatch.setattr(jobs_store, "recent_mean_service_sec", lambda **kw: None)
+    monkeypatch.setattr(chat_send_core.kill_switch, "turns_halted", lambda **kw: False)
     with make_client() as c:
         yield c
 
@@ -205,6 +215,7 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     public = setup.get_json()["config"]
     assert public["configured"] is True
     assert public["provider"] == "openrouter"
+    assert public["context_window_tokens"] == 128_000
     assert "api_key" not in public
     assert "api_key_envelope" not in public
 
@@ -230,6 +241,137 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     assert any(step["id"] == "hosted_runtime" and step["passing"] for step in body["steps"])
 
 
+@pytest.mark.parametrize(
+    ("provider", "model", "base_url"),
+    [
+        ("openrouter", "vendor/unknown-model", ""),
+        ("openai_compatible", "private-model", "https://relay.host/v1"),
+    ],
+)
+def test_model_api_setup_rejects_unconfigured_prompt_frontier_before_io(
+    client, monkeypatch, provider, model, base_url,
+):
+    user_id, api_key = _register(client)
+    provider_calls = []
+
+    def provider_test(cfg):
+        provider_calls.append(cfg)
+        raise AssertionError("frontier validation must run before provider I/O")
+
+    def envelope_build(*_args, **_kwargs):
+        raise AssertionError("frontier validation must run before key encryption")
+
+    monkeypatch.setattr(provider_client, "test_provider_key", provider_test)
+    monkeypatch.setattr(
+        core_envelope, "_build_shared_envelope_for_store", envelope_build
+    )
+    payload = {
+        "provider": provider,
+        "model": model,
+        "api_key": "sk-test",
+    }
+    if base_url:
+        payload["base_url"] = base_url
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json=payload,
+        headers=_headers(api_key),
+    )
+
+    assert setup.status_code == 400
+    body = setup.get_json()
+    assert body["error"] == "prompt_context_limit_unconfigured"
+    assert body["required"] == "context_window_tokens"
+    assert provider_calls == []
+    assert db.model_api_routes_list(user_id) == []
+    assert db.model_api_credentials_list(user_id) == []
+
+
+def test_model_api_setup_persists_explicit_custom_prompt_frontier(
+    client, monkeypatch,
+):
+    user_id, api_key = _register(client)
+    tested = []
+    monkeypatch.setattr(
+        provider_client,
+        "test_provider_key",
+        lambda cfg: tested.append(cfg) or {"reply": "ok", "usage": {}},
+    )
+    monkeypatch.setattr(
+        provider_client, "probe_responses_support", lambda _cfg: True
+    )
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openai_compatible",
+            "model": "private-model",
+            "base_url": "https://relay.host/v1",
+            "api_key": "sk-relay",
+            "context_window_tokens": 32_768,
+        },
+        headers=_headers(api_key),
+    )
+
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+    assert setup.get_json()["config"]["context_window_tokens"] == 32_768
+    assert tested[0].context_window_tokens == 32_768
+    route = db.model_api_active_route(user_id)
+    assert route["context_window_tokens"] == 32_768
+    runtime = hosted_config_store._provider_config_from_plain(route, "sk-relay")
+    assert runtime.context_window_tokens == 32_768
+
+    # Exact idempotent setup may reuse the persisted contract, so a client does
+    # not have to resend the field on every key/model health refresh.
+    monkeypatch.setattr(
+        core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: b"sk-relay",
+    )
+    repeated = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openai_compatible",
+            "model": "private-model",
+            "base_url": "https://relay.host/v1",
+        },
+        headers=_headers(api_key),
+    )
+    assert repeated.status_code == 200, repeated.get_data(as_text=True)
+    assert repeated.get_json()["config"]["context_window_tokens"] == 32_768
+
+
+def test_model_api_setup_rejects_context_window_without_input_budget(
+    client, monkeypatch,
+):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        provider_client,
+        "test_provider_key",
+        lambda _cfg: (_ for _ in ()).throw(
+            AssertionError("invalid frontier must fail before provider I/O")
+        ),
+    )
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openai_compatible",
+            "model": "private-model",
+            "base_url": "https://relay.host/v1",
+            "api_key": "sk-relay",
+            # Default output + safety reservations consume 5,120 tokens.
+            "context_window_tokens": 5_120,
+        },
+        headers=_headers(api_key),
+    )
+
+    assert setup.status_code == 400
+    assert setup.get_json()["error"] == "invalid_context_window_tokens"
+    assert db.model_api_routes_list(user_id) == []
+
+
 def test_model_api_setup_stores_responses_support_for_openai_compatible(client, monkeypatch):
     # An openai_compatible relay is probed once at setup; the stored config records
     # whether it implements /v1/responses, so the gateway picks native passthrough
@@ -249,7 +391,8 @@ def test_model_api_setup_stores_responses_support_for_openai_compatible(client, 
     setup = client.post(
         "/v1/model_api/setup",
         json={"provider": "openai_compatible", "model": "gpt-5.4",
-              "base_url": "https://relay.host/v1", "api_key": "sk-relay"},
+              "base_url": "https://relay.host/v1", "api_key": "sk-relay",
+              "context_window_tokens": 128_000},
         headers=_headers(api_key),
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
@@ -280,9 +423,9 @@ def test_model_api_setup_does_not_probe_non_openai_compatible(client, monkeypatc
 
 
 def test_model_api_setup_persists_reasoning_effort(client, monkeypatch):
-    # LiteLLM gateway retired: reasoning_effort is still persisted at setup and
-    # surfaced through discovery (the pi driver consumes it); the old gateway
-    # budget translation (build_model_entry) is gone.
+    # reasoning_effort is persisted on the provider route for the unified native
+    # V2 loop; it must not make the account eligible for the external resident
+    # consumer roster.
     user_id, api_key = _register(client)
     monkeypatch.setattr(provider_client, "test_provider_key",
                         lambda cfg: {"reply": "ok", "usage": {}})
@@ -302,8 +445,8 @@ def test_model_api_setup_persists_reasoning_effort(client, monkeypatch):
     route = db.model_api_active_route(user_id)
     assert route["reasoning_effort"] == "medium"
 
-    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users()}
-    assert rows[user_id]["reasoning_effort"] == "medium"
+    mode, state, _generation = db.get_hosted_runtime_control_strict(user_id)
+    assert (mode, state) == ("db_action_v2", "v2")
 
 
 def test_model_api_setup_reasoning_effort_off_and_default(client, monkeypatch):
@@ -373,7 +516,8 @@ def test_setup_warns_when_relay_lacks_responses(client, monkeypatch):
     setup = client.post(
         "/v1/model_api/setup",
         json={"provider": "openai_compatible", "model": "gpt-5.5",
-              "base_url": "https://relay.host/v1", "api_key": "sk-relay"},
+              "base_url": "https://relay.host/v1", "api_key": "sk-relay",
+              "context_window_tokens": 128_000},
         headers=_headers(api_key),
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
@@ -401,11 +545,13 @@ def test_setup_resolves_responses_warning_when_relay_supports(client, monkeypatc
     monkeypatch.setattr(provider_client, "probe_responses_support", lambda cfg: False)
     client.post("/v1/model_api/setup",
         json={"provider": "openai_compatible", "model": "gpt-5.5",
-              "base_url": "https://bad/v1", "api_key": "sk-r"}, headers=_headers(api_key))
+              "base_url": "https://bad/v1", "api_key": "sk-r",
+              "context_window_tokens": 128_000}, headers=_headers(api_key))
     monkeypatch.setattr(provider_client, "probe_responses_support", lambda cfg: True)
     good = client.post("/v1/model_api/setup",
         json={"provider": "openai_compatible", "model": "gpt-5.5",
-              "base_url": "https://good/v1", "api_key": "sk-r"}, headers=_headers(api_key))
+              "base_url": "https://good/v1", "api_key": "sk-r",
+              "context_window_tokens": 128_000}, headers=_headers(api_key))
     assert not good.get_json().get("warnings"), good.get_json()  # 好中转不带当场警告
     notices = client.get("/v1/notices", headers=_headers(api_key)).get_json()["notices"]
     hit = [n for n in notices if n["error_class"] == "responses_unsupported"]
@@ -423,7 +569,8 @@ def test_delete_resolves_responses_warning(client, monkeypatch):
     client.post("/v1/onboarding/route", json={"route": "model_api"}, headers=_headers(api_key))
     client.post("/v1/model_api/setup",
         json={"provider": "openai_compatible", "model": "gpt-5.5",
-              "base_url": "https://bad/v1", "api_key": "sk-r"}, headers=_headers(api_key))
+              "base_url": "https://bad/v1", "api_key": "sk-r",
+              "context_window_tokens": 128_000}, headers=_headers(api_key))
     client.delete("/v1/model_api/delete", headers=_headers(api_key))
     notices = client.get("/v1/notices", headers=_headers(api_key)).get_json()["notices"]
     hit = [n for n in notices if n["error_class"] == "responses_unsupported"]
@@ -800,15 +947,6 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
 
     monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
 
-    monkeypatch.setattr(
-        agent_runtime_cutover, "check_supervisor_live",
-        lambda **kw: (True, "ok"),
-    )
-    monkeypatch.setattr(
-        agent_runtime_cutover, "handle_send",
-        lambda store, user_row, driver, **kw: ({"status": "processing"}, 202),
-    )
-
     chat = client.post(
         "/v1/model_api/chat/send",
         json={"message": "Can you reply using my imported history?"},
@@ -923,15 +1061,7 @@ def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
 
-    # 图片 turn 现在路由到 agent-runner（不再走 inline）
-    monkeypatch.setattr(
-        agent_runtime_cutover, "check_supervisor_live",
-        lambda **kw: (True, "ok"),
-    )
-    monkeypatch.setattr(
-        agent_runtime_cutover, "handle_send",
-        lambda store, user_row, driver, **kw: ({"status": "processing"}, 202),
-    )
+    # 图片 turn 和文本 turn 一样进入 pooled V2 lane。
     chat = client.post(
         "/v1/model_api/chat/send",
         json={
@@ -1982,7 +2112,14 @@ def test_chat_history_hides_stale_verify_ping(client):
     fresh = store.append_chat("user", "verify_ping", _env("__VERIFY_PING__:fresh"))
     stale = store.append_chat("user", "verify_ping", _env("__VERIFY_PING__:stale"))
     # Backdate the stale ping past the visible TTL (verify_loop long dead).
-    stale["ts"] = time.time() - (chat_core.VERIFY_PING_VISIBLE_TTL_SEC + 60)
+    stale_ts = time.time() - (chat_core.VERIFY_PING_VISIBLE_TTL_SEC + 60)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE chat_messages SET ts=%s, "
+            "doc=jsonb_set(doc, '{ts}', to_jsonb(%s::double precision), true) "
+            "WHERE user_id=%s AND msg_id=%s",
+            (stale_ts, stale_ts, user_id, stale["id"]),
+        )
 
     res = client.get("/v1/chat/history?limit=50", headers=_headers(api_key))
     assert res.status_code == 200, res.get_data(as_text=True)
@@ -2139,7 +2276,14 @@ def test_chat_response_accepts_verify_ping_reply_to_pending_ping(client, monkeyp
     )
     res = client.post(
         "/v1/chat/response",
-        json={"envelope": _verify_reply_envelope(user_id), "source": "verify_ping"},
+        json={
+            "envelope": _verify_reply_envelope(user_id),
+            "source": "verify_ping",
+            # This branch's gate is the consumer's strict contract: the ack must
+            # bind to THIS ping (source ∧ reply_to_message_id) — see the resident
+            # consumer's verify-ack sender, which always sets reply_to.
+            "reply_to_message_id": "ping_pending_01",
+        },
         headers=_headers(api_key),
     )
     assert res.status_code == 200, res.get_data(as_text=True)

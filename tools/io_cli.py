@@ -1302,6 +1302,42 @@ def cmd_doctor(args):
     _emit(out, 0 if out["ok"] else 1)
 
 
+def _require_admin():
+    """Resolve credentials for the ops-only Runtime V2 repair/status surface.
+
+    These endpoints are gated by FEEDLING_ADMIN_TOKEN (X-Admin-Token) on the
+    backend (backend/admin/routes_asgi.py's _require_admin) — deliberately NOT
+    the caller's own per-user FEEDLING_API_KEY / runtime token from
+    _auth_headers().
+    """
+    api_url = _env("FEEDLING_API_URL")
+    token = _env("FEEDLING_ADMIN_TOKEN")
+    if not api_url or not token:
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_ADMIN_TOKEN in env"}, 2)
+    return api_url.rstrip("/"), {"X-Admin-Token": token}
+
+
+def cmd_repair_runtime_v2(args):
+    """[ops] Materialize/repair one user's V2-only ownership tuple."""
+    api_url, auth = _require_admin()
+    status, body = _http_json(
+        "POST", f"{api_url}/v1/admin/hosted-runtime-mode", auth,
+        payload={"user_id": args.user_id, "mode": "db_action_v2"},
+    )
+    if status == 200:
+        _emit({"ok": True, **body})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
+def cmd_runtime_v2_status(args):
+    """[ops] Read the V2 ownership reconciliation status."""
+    api_url, auth = _require_admin()
+    status, body = _http_json("GET", f"{api_url}/v1/admin/hosted-runtime-modes", auth)
+    if status == 200:
+        _emit({"ok": True, **body})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
 def cmd_phase2(args):
     # send / sleep / schedule-wake / cancel-wake are NOT pull tools in the native
     # model — the agent emits them as output actions (JSON messages/actions) which
@@ -1581,6 +1617,19 @@ def main():
     dr = sub.add_parser("doctor",
                         help="[setup] Five-probe environment health check (api/enclave/identity/memory/chat, read-only).")
     dr.set_defaults(func=cmd_doctor)
+
+    rv2 = sub.add_parser(
+        "repair-runtime-v2",
+        help="[ops] Repair one user's V2-only ownership tuple. Requires FEEDLING_ADMIN_TOKEN.",
+    )
+    rv2.add_argument("user_id")
+    rv2.set_defaults(func=cmd_repair_runtime_v2)
+
+    rv2s = sub.add_parser(
+        "runtime-v2-status",
+        help="[ops] Show V2 ownership reconciliation status. Requires FEEDLING_ADMIN_TOKEN.",
+    )
+    rv2s.set_defaults(func=cmd_runtime_v2_status)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")

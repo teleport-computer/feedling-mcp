@@ -36,8 +36,18 @@ RUN apt-get update \
 
 # Hash-verified install. `--require-hashes` fails the build if any package
 # drifts from the lockfile, preventing supply-chain swaps at build time.
+#
+# Two locks, one install: requirements.lock is the shared set every image needs;
+# requirements-v2-worker.lock adds what only the V2 serve-worker executes
+# (trafilatura, for web_fetch article extraction). It ships here because
+# backend / decrypt-enclave / serve-worker all run from this one image. The V1
+# agent-runner image installs requirements.lock only and stays free of the HTML
+# parser — it never runs the capability. The worker lock is compiled with
+# requirements.lock as a constraint, so shared packages pin identically and the
+# single --require-hashes install cannot disagree.
 COPY backend/requirements.lock ./requirements.lock
-RUN pip install --require-hashes -r requirements.lock
+COPY backend/requirements-v2-worker.lock ./requirements-v2-worker.lock
+RUN pip install --require-hashes -r requirements.lock -r requirements-v2-worker.lock
 
 COPY backend/ ./backend/
 

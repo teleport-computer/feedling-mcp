@@ -444,7 +444,6 @@ def test_export_parity_headers_and_ciphertext(env):
 _PER_USER_TABLES = (
     "perception_items",
     "perception_daily",
-    "agent_runtime_instances",
     "genesis_import_jobs",
     "world_book_entries",
 )
@@ -456,8 +455,6 @@ def _seed_per_user_tables(user_id: str) -> None:
                      "VALUES (%s, 'photo', 'i1', 1.0, '{}'::jsonb)", (user_id,))
         conn.execute("INSERT INTO perception_daily (user_id, date, signal, doc, updated_at) "
                      "VALUES (%s, '2026-06-28', 'steps', '{}'::jsonb, 1.0)", (user_id,))
-        conn.execute("INSERT INTO agent_runtime_instances (user_id, driver, status, runtime_home) "
-                     "VALUES (%s, 'claude', 'idle', '/tmp/rt')", (user_id,))
         conn.execute("INSERT INTO genesis_import_jobs (user_id, job_id, status) "
                      "VALUES (%s, 'job1', 'done')", (user_id,))
         conn.execute("INSERT INTO world_book_entries (user_id, entry_id, updated_at, doc) "

@@ -400,7 +400,7 @@ def test_decrypt_proxy_parity_and_credential_forwarding(env, monkeypatch):
 
 
 def test_decrypt_forwards_runtime_token_for_hostall_agent(env, monkeypatch):
-    """host-all / zero-roster agent: authenticates with a VALID Stage-D runtime
+    """Runtime V2 agent: authenticates with a valid scoped runtime
     token and has NO api_key. The enclave proxy must forward that token (not an
     empty header) — the exact failure the memory readside fix addressed."""
     uid, _api_key = _register()

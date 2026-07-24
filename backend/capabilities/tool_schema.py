@@ -1,0 +1,424 @@
+"""Tool-schema catalog (Plan C, Task 3 / C1).
+
+Derives one `ToolSpec` per model-facing capability in `capabilities.registry.CAPABILITIES`
+(everything except the internal-only `chat_image_read` and `chat_file_read`, which have
+no model-facing schema) plus the runtime-native `task` and `reply` tools.  The unified
+tool loop handles both specially instead of dispatching them through the capability
+executor.
+
+Each entry in `PARAMS` mirrors exactly the `params` fields each capability module reads —
+see the module docstring/params usage cited per tool below. Do not add fields the
+capability code does not consume; the executor will simply ignore them, but claiming they
+exist misleads the model into fabricating structured junk.
+"""
+from __future__ import annotations
+
+from provider_types import ToolSpec
+from capabilities import registry
+
+REPLY_TOOL = "reply"
+TASK_TOOL = "task"
+
+_EXCLUDED = frozenset({"chat_image_read", "chat_file_read"})
+
+_STR = {"type": "string"}
+_INT = {"type": "integer"}
+_BOOL = {"type": "boolean"}
+_NO_ARGS: dict = {"type": "object", "properties": {}}
+
+_MEMORY_TOOL_ACTION = {
+    "type": "object",
+    "properties": {
+        "op": {"type": "string", "enum": ["add", "update", "delete"]},
+        "summary": _STR,
+        "content": _STR,
+        "bucket": _STR,
+        "target_id": _STR,
+    },
+    "required": ["op"],
+    "additionalProperties": False,
+}
+
+PARAMS: dict[str, dict] = {
+    # -- identity.py --
+    # identity.get(store, ...): ignores params entirely.
+    "identity_get": _NO_ARGS,
+    # identity.patch(store, ...): params.get("patch") (dict), else falls back to
+    # top-level agent_name/self_introduction/signature strings.
+    "identity_patch": {
+        "type": "object",
+        "properties": {
+            "patch": {"type": "object"},
+            "agent_name": _STR,
+            "self_introduction": _STR,
+            "signature": _STR,
+        },
+        "required": [],
+    },
+    # identity.nudge(store, ...): params.get("dimension") (str) + delta (int),
+    # optional reason. Adjusts ONE existing dimension's score.
+    "identity_nudge": {
+        "type": "object",
+        "properties": {
+            "dimension": _STR,
+            "delta": _INT,
+            "reason": _STR,
+        },
+        "required": ["dimension", "delta"],
+    },
+
+    # -- memory.py (backed by memory_core.index/fetch/actions) --
+    # memory.index(store, ...): payload passed through to memory_index_core; only
+    # "limit" is inspected directly (memory_core.index reads payload.get("limit")).
+    "memory_index": {
+        "type": "object",
+        "properties": {"limit": _INT},
+        "required": [],
+    },
+    # memory.search(store, ...): params.get("query") (required, non-empty) + optional
+    # limit (passed through like index).
+    "memory_search": {
+        "type": "object",
+        "properties": {"query": _STR, "limit": _INT},
+        "required": ["query"],
+    },
+    # memory.fetch(store, ...) -> memory_core.fetch: payload.get("ids") must be a
+    # list of non-empty strings.
+    "memory_fetch": {
+        "type": "object",
+        "properties": {"ids": {"type": "array", "items": _STR}},
+        "required": ["ids"],
+    },
+    # memory.write: the model emits PLAINTEXT cards; the worker's
+    # `_memory_tool_actions` translates each into the server's memory-action shape
+    # ({"type":"memory.add","memory":{summary,content,bucket,threads}}) and the
+    # server builds the E2E envelope (it never sees a model-built envelope — see
+    # worker._memory_tool_actions / _write_tool_effect_payload). The item schema is
+    # explicit so the model supplies summary+content (required for add) rather than
+    # guessing a shape the write path rejects with title_required/400.
+    "memory_write": {
+        "type": "object",
+        "properties": {"actions": {"type": "array", "items": _MEMORY_TOOL_ACTION}},
+        "required": ["actions"],
+    },
+
+    # -- perception.py (backed by agent/perception_core.py) --
+    # perception.snapshot: params.get("signals") (list or csv string).
+    "perception_snapshot": {
+        "type": "object",
+        "properties": {"signals": {"type": "array", "items": _STR}},
+        "required": [],
+    },
+    # perception.trend: params.get("signal"), params.get("field"), params.get("days").
+    "perception_trend": {
+        "type": "object",
+        "properties": {"signal": _STR, "field": _STR, "days": _INT},
+        "required": [],
+    },
+    # perception.history: params.get("signal"), params.get("days").
+    "perception_history": {
+        "type": "object",
+        "properties": {"signal": _STR, "days": _INT},
+        "required": [],
+    },
+
+    # -- screen.py (backed by screen/screen_read_core.py) --
+    # screen.recent: params.get("limit").
+    "screen_recent": {
+        "type": "object",
+        "properties": {"limit": _INT},
+        "required": [],
+    },
+    # screen.read: params.get("frame_id") (defaults to latest frame if absent),
+    # params.get("include_image") (bool).
+    "screen_read": {
+        "type": "object",
+        "properties": {"frame_id": _STR, "include_image": _BOOL},
+        "required": [],
+    },
+
+    # -- photo.py (backed by perception/perception_read_core.py) --
+    # photo.recent: params.get("limit").
+    "photo_recent": {
+        "type": "object",
+        "properties": {"limit": _INT},
+        "required": [],
+    },
+    # photo.read: params.get("photo_id") or params.get("id") (required),
+    # params.get("include_image") (bool).
+    "photo_read": {
+        "type": "object",
+        "properties": {"photo_id": _STR, "include_image": _BOOL},
+        "required": ["photo_id"],
+    },
+
+    # -- web.py (keyless facade over model_api_runtime/tools.py) --
+    # web.search: params: {"query": str, "limit": int?} — per module docstring.
+    "web_search": {
+        "type": "object",
+        "properties": {"query": _STR, "limit": _INT},
+        "required": ["query"],
+    },
+    # web.fetch: params: {"url": str} — per module docstring.
+    "web_fetch": {
+        "type": "object",
+        "properties": {"url": _STR},
+        "required": ["url"],
+    },
+
+    # -- wake.py (backed by proactive/scheduled_wake_v2.py) --
+    # wake.schedule: params.get("at") (required, ISO-ish time string), optional
+    # "tz" and "reason" strings. NOTE: the field is "at", not "when".
+    "schedule_wake": {
+        "type": "object",
+        "properties": {"at": _STR, "tz": _STR, "reason": _STR},
+        "required": ["at"],
+    },
+    # wake.cancel: params.get("wake_id") or params.get("id") (required), optional
+    # "reason" string.
+    "cancel_wake": {
+        "type": "object",
+        "properties": {"wake_id": _STR, "reason": _STR},
+        "required": ["wake_id"],
+    },
+
+    # -- workspace.py (encrypted virtual workspace, never the host filesystem) --
+    "workspace_list": {
+        "type": "object",
+        "properties": {"path": _STR, "recursive": _BOOL, "limit": _INT},
+        "required": [],
+    },
+    "workspace_read": {
+        "type": "object",
+        "properties": {"path": _STR, "start_line": _INT, "line_count": _INT},
+        "required": ["path"],
+    },
+    "workspace_write": {
+        "type": "object",
+        "properties": {
+            "path": _STR,
+            "content": _STR,
+            "expected_revision": _INT,
+        },
+        "required": ["path", "content", "expected_revision"],
+    },
+    "workspace_delete": {
+        "type": "object",
+        "properties": {"path": _STR, "expected_revision": _INT},
+        "required": ["path", "expected_revision"],
+    },
+
+    # -- synthetic bounded-subagent tool --
+    # Overlay workspace merges are intentionally not advertised until the
+    # worker has an isolated overlay + explicit CAS merge implementation.
+    TASK_TOOL: {
+        "type": "object",
+        "properties": {
+            "prompt": _STR,
+            "label": _STR,
+            "workspace_mode": {
+                "type": "string",
+                "enum": ["read_only"],
+            },
+        },
+        "required": ["prompt"],
+    },
+
+    # -- synthetic reply tool --
+    REPLY_TOOL: {
+        "type": "object",
+        "properties": {"text": _STR},
+        "required": ["text"],
+    },
+}
+
+# Tool arguments cross an untrusted model boundary.  Close every model-facing
+# top-level object even when a provider ignores JSON Schema's
+# ``additionalProperties`` keyword; ``validate_tool_args`` below enforces the
+# same contract again before a capability is run or a write effect is queued.
+# The identity ``patch`` object remains capability-owned/free-form. Memory
+# actions are closed explicitly above so the provider sees the model-facing
+# plaintext vocabulary instead of inventing shapes the sink will later reject.
+for _parameters in PARAMS.values():
+    if _parameters.get("type") == "object":
+        _parameters["additionalProperties"] = False
+
+DESCRIPTIONS: dict[str, str] = {
+    "identity_get": "Read the persona's current identity/profile fields.",
+    "identity_patch": ("Update the persona's own identity/profile. Use 'agent_name' "
+                       "when the user renames you — that is the name shown to them, "
+                       "and rewriting only 'self_introduction' does NOT rename you; "
+                       "pass both when the new name should also appear in how you "
+                       "introduce yourself. Put any of these inside a 'patch' object: "
+                       "string fields agent_name, self_introduction, category, "
+                       "user_preferred_name, agent_role, tone_style, "
+                       "custom_persona_prompt, language_preference, relationship_anchor; "
+                       "and list fields signature, boundaries, do_not_say, "
+                       "stable_definitions. Edit a list field by whole-list replacement "
+                       "or with op keys add_<field>/remove_<field>/replace_<field> "
+                       "(e.g. add_signature, remove_boundaries). Only act on an "
+                       "explicit request."),
+    "identity_nudge": ("Adjust ONE of the persona's relationship/personality dimension "
+                       "scores by a signed integer 'delta' (|delta| ≤ 10). 'dimension' "
+                       "must name a dimension that already exists — call identity_get "
+                       "first to see the current dimensions and values. Optional "
+                       "'reason'. To add or rename dimensions, use identity_patch."),
+    "memory_index": "List recent memory cards, optionally capped by limit.",
+    "memory_search": "Keyword-search memory cards by a required query string.",
+    "memory_fetch": "Fetch specific memory cards by their ids.",
+    "memory_write": ("Write, update, or delete memory cards. Each action needs an "
+                     "'op': 'add' (supply a one-line 'summary' AND full 'content', "
+                     "optional 'bucket'), 'update' (supply 'target_id' plus new "
+                     "'summary'/'content'), or 'delete' (supply 'target_id'). Get "
+                     "target_ids from memory_search/memory_index first."),
+    "perception_snapshot": "Read the latest perception snapshot for the given signals.",
+    "perception_trend": "Read a trend summary for a perception signal over recent days.",
+    "perception_history": "Read raw historical values for a perception signal over recent days.",
+    "screen_recent": "List recent screen-share frame metadata.",
+    "screen_read": "Read (decrypt) a specific screen-share frame, or the latest one if no frame_id is given.",
+    "photo_recent": "List recent photos, optionally capped by limit.",
+    "photo_read": "Read a specific photo by id, optionally including its decrypted image.",
+    "web_search": "Search the public web (keyless DuckDuckGo scrape) for a query.",
+    "web_fetch": "Fetch a URL and return its stripped text content.",
+    "schedule_wake": "Schedule a future self-wake at a given time, with optional timezone and reason.",
+    "cancel_wake": "Cancel a previously scheduled self-wake by its wake_id.",
+    "workspace_list": ("List encrypted virtual workspace entries and revisions. "
+                       "Namespaces are /artifacts (read-only), /skills (read-only), "
+                       "/workspace (editable), and /memory/WORKING.md (editable)."),
+    "workspace_read": ("Read a line range from a virtual text entry. This reads a "
+                       "stored text view and does not materialize a physical artifact."),
+    "workspace_write": ("Create or replace an editable virtual text file using optimistic "
+                        "revision control. Use expected_revision=0 to create; /artifacts "
+                        "and /skills are read-only."),
+    "workspace_delete": ("Delete an editable virtual file at its exact revision. "
+                         "Artifacts and skills cannot be deleted by the model."),
+    TASK_TOOL: ("Run a bounded isolated subagent on one focused task. The child can "
+                "read workspace/artifact, memory, and web data but cannot reply to "
+                "the user, mutate state, call MCP, or spawn another task."),
+    REPLY_TOOL: "Send an immediate reply bubble to the user with the given text.",
+}
+
+
+def _matches_json_type(value, expected: str) -> bool:
+    """Small JSON-Schema type predicate for the schema subset used above."""
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "integer":
+        # bool is an int subclass in Python, but a distinct JSON type.
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "null":
+        return value is None
+    return False
+
+
+def _validate_value(value, schema: dict, *, path: str) -> str | None:
+    """Validate the deliberately small JSON-Schema subset used by ``PARAMS``.
+
+    Returning a stable error instead of raising lets the dispatcher feed a
+    bounded tool error back to the model without exposing argument values.
+    """
+    expected = schema.get("type")
+    if expected and not _matches_json_type(value, expected):
+        return f"{path} must be {expected}"
+    allowed = schema.get("enum")
+    if allowed is not None and value not in allowed:
+        return f"{path} has unsupported value"
+
+    if expected == "object":
+        required = schema.get("required") or []
+        for field in required:
+            if field not in value:
+                return f"missing required field: {field}"
+
+        properties = schema.get("properties") or {}
+        if schema.get("additionalProperties") is False:
+            unknown = sorted(str(field) for field in value if field not in properties)
+            if unknown:
+                return f"unknown field: {unknown[0]}"
+
+        for field, child_schema in properties.items():
+            if field in value:
+                error = _validate_value(value[field], child_schema, path=f"{path}.{field}")
+                if error:
+                    return error
+
+    if expected == "array" and "items" in schema:
+        for index, item in enumerate(value):
+            error = _validate_value(item, schema["items"], path=f"{path}[{index}]")
+            if error:
+                return error
+
+    return None
+
+
+def validate_tool_args(name: str, args) -> str | None:
+    """Return ``None`` when args satisfy a model-facing tool's schema.
+
+    This is intentionally dependency-free and covers the complete schema
+    vocabulary currently emitted by this module: object/array/scalar types,
+    required fields, array items, and closed top-level objects.
+    """
+    schema = PARAMS.get(name)
+    if schema is None:
+        return "tool is not model-facing"
+    error = _validate_value(args, schema, path="args")
+    if error:
+        return error
+    if name == "identity_patch":
+        # Run the SAME merge the capability runs, so a call that validates here can't
+        # quietly lose a field later. Import direction is safe: registry already pulls
+        # capabilities.identity, and tool_schema imports registry.
+        # Same normalization the capability applies, so the pre-enqueue emptiness
+        # check and the actual payload can't disagree. It never rejects: this
+        # function also gates replay of already-persisted effects, where a new
+        # rejection rule would turn a legal-when-written payload into a retry loop
+        # (see capabilities.identity.merge_patch_fields).
+        from capabilities import identity as cap_identity
+        merged = cap_identity.merge_patch_fields(args)
+        if not any((v.strip() if isinstance(v, str) else v) for v in merged.values()):
+            return "identity_patch requires a non-empty patch or profile field"
+    if name == "memory_write":
+        actions = args.get("actions") or []
+        if not actions:
+            return "memory_write requires at least one action"
+        for index, action in enumerate(actions):
+            op = action["op"]
+            summary = str(action.get("summary") or "").strip()
+            content = str(action.get("content") or "").strip()
+            target_id = str(action.get("target_id") or "").strip()
+            if op == "add" and (not summary or not content):
+                return f"args.actions[{index}] add requires summary and content"
+            if op == "update" and (not target_id or not summary or not content):
+                return f"args.actions[{index}] update requires target_id, summary, and content"
+            if op == "delete" and not target_id:
+                return f"args.actions[{index}] delete requires target_id"
+    if name in {"workspace_write", "workspace_delete"}:
+        revision = args.get("expected_revision")
+        if type(revision) is not int or revision < 0:
+            return "expected_revision must be a non-negative integer"
+    if name == TASK_TOOL and not str(args.get("prompt") or "").strip():
+        return "task requires a non-empty prompt"
+    return None
+
+
+def build_tool_specs() -> list[ToolSpec]:
+    specs = []
+    for name in registry.CAPABILITIES:
+        if name in _EXCLUDED:
+            continue
+        specs.append(ToolSpec(name=name, description=DESCRIPTIONS[name], parameters=PARAMS[name]))
+    for name in (TASK_TOOL, REPLY_TOOL):
+        specs.append(ToolSpec(
+            name=name,
+            description=DESCRIPTIONS[name],
+            parameters=PARAMS[name],
+        ))
+    return specs

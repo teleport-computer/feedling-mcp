@@ -11,7 +11,7 @@
    requeue 行——见 ``_split_pending`` 的详细口径说明；requeue 行数单独作为
    ``requeue_backlog`` 计入每张密文表的报告（信息性，不参与 ``rows_ok``）。
    没有 user_id 列的明文表（server_config/global_blobs/copytext_strings/
-   copytext_meta/agent_runtime_supervisor_heartbeats）退化成单一全局桶
+   copytext_meta）退化成单一全局桶
    （``_GLOBAL`` 哨兵 key）。
 
 2. **抽样字段比对**——按 ``sample_rate`` 抽 RDS 行：明文表直接逐列比（无需

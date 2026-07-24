@@ -1,5 +1,10 @@
 # Agent-runner 多台独立扩展实施计划
 
+> **【历史设计，禁止按本文部署】** 这里描述的是已退役的 per-user resident
+> supervisor/consumer 拓扑。2026-07-18 起 hosted local/test/pre/prod 均只运行
+> pooled Runtime V2 `serve-worker`；现行拓扑、容量与恢复步骤见
+> `deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`。
+
 日期：2026-06-30
 
 本文目标是把 API-key 用户的 hosted agent-runner 从“单 CVM 内一个独立

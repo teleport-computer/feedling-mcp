@@ -115,6 +115,11 @@ def test_memory_supersede_soft_retires_old_card_and_new_card_is_recallable(monke
     }
     moments = [old]
     saved = _install_memory_action_fakes(monkeypatch, moments)
+    monkeypatch.setattr(
+        memory_actions,
+        "_memory_plain_from_envelope",
+        lambda moment, _api_key, runtime_token="": (_inner(moment), ""),
+    )
 
     body, status = memory_actions._execute_memory_actions(store, "api_key", [
         {
@@ -288,7 +293,11 @@ def test_memory_content_patch_supersedes_old_card_with_v1_shape(monkeypatch):
     }
     moments = [existing]
     saved = _install_memory_action_fakes(monkeypatch, moments)
-    monkeypatch.setattr(memory_actions, "_memory_plain_from_envelope", lambda _moment, _api_key: (_inner(existing), ""))
+    monkeypatch.setattr(
+        memory_actions,
+        "_memory_plain_from_envelope",
+        lambda _moment, _api_key, runtime_token="": (_inner(existing), ""),
+    )
 
     body, status = memory_actions._execute_memory_actions(store, "api_key", [
         {

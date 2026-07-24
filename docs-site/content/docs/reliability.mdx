@@ -14,22 +14,23 @@ resource.
 
 | Endpoint family | Parameters | Ordering and continuation |
 | --- | --- | --- |
-| `GET /v1/chat/history` | `limit` 1–200, `since` Unix seconds, `before` Unix seconds | No cursor returns the latest page. `before` walks older messages. `since` walks forward. Use `oldest_ts`, `latest_ts`, `has_more_older`, and `has_more_newer` from the response. |
+| `GET /v1/chat/history` | `limit` 1–200; preferred `after_seq` / `before_seq`; legacy `since` / `before` Unix seconds | No cursor returns the latest page. Sequence cursors are exact even when messages share a timestamp. Use `oldest_seq`, `latest_seq`, `has_more_older`, and `has_more_newer`. |
 | `GET /v1/memory/list` | `limit` up to 200, `since` ISO-8601 | Newest `occurred_at` first. The implementation keeps records whose `occurred_at >= since`, so de-duplicate by memory ID at page boundaries. `total` is the filtered count before slicing. |
 | `GET /v1/perception/photos` and `/items/{kind}` | `limit` 1–200, default 20 | Returns the most recent items. These endpoints do not currently return a continuation cursor. |
 | Event and receipt streams | Usually `since` plus `limit` | `since` is endpoint-specific; inspect the operation contract before assuming Unix time or ISO-8601. |
 
-For Chat, do not send `before` and `since` together. The server gives `before`
-precedence. A robust older-page loop is:
+For Chat, use sequence cursors in new clients. A robust older-page loop is:
 
 1. Request the latest page without a cursor.
 2. Render and de-duplicate by `message.id`.
-3. While `has_more_older` is true, request `before=<oldest_ts>`.
-4. Stop if the returned page is empty or its `oldest_ts` does not advance.
+3. While `has_more_older` is true, request `before_seq=<oldest_seq>`.
+4. Stop if the returned page is empty or its `oldest_seq` does not advance.
 
-For forward Chat synchronization, persist `latest_ts` only after the page has
-been processed. Request `since=<latest_ts>` and continue while
-`has_more_newer` is true. IDs, not timestamps, are the final de-duplication key.
+For forward Chat synchronization, persist `latest_seq` only after the page has
+been processed. Request `after_seq=<latest_seq>` and continue while
+`has_more_newer` is true. IDs remain the final de-duplication key. Timestamp
+cursors stay available for older clients, but cannot distinguish messages that
+share a timestamp and therefore are not the lossless contract.
 
 ## Rate limits and capacity responses
 

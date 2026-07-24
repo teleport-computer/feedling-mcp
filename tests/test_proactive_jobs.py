@@ -2667,6 +2667,63 @@ def test_chat_history_supports_lightweight_images_and_before_cursor(tmp_path, mo
     assert full_large_text["body_omitted"] is False
 
 
+def test_chat_history_sequence_cursor_never_skips_equal_timestamps(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    core_store._stores.clear()
+
+    api_key = "test_chat_history_sequence_key"
+    user_id = "usr_chat_history_sequence"
+    registry._key_to_user[registry._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
+    store = core_store.get_store(user_id)
+
+    for idx in range(5):
+        msg = store.append_chat(
+            "user",
+            "chat",
+            {
+                "id": f"same_ts_{idx}",
+                "v": 1,
+                "body_ct": f"ct-{idx}",
+                "nonce": "nonce",
+                "K_user": "k-user",
+                "K_enclave": "k-enclave",
+                "visibility": "shared",
+                "owner_user_id": user_id,
+            },
+        )
+        msg["ts"] = 1234.5
+        db.chat_append(user_id, msg["id"], msg["ts"], msg, core_store.MAX_CHAT_MESSAGES)
+
+    with make_client() as client:
+        latest = client.get(
+            "/v1/chat/history?limit=2",
+            headers={"X-API-Key": api_key},
+        ).get_json()
+        middle = client.get(
+            f"/v1/chat/history?before_seq={latest['oldest_seq']}&limit=2",
+            headers={"X-API-Key": api_key},
+        ).get_json()
+        oldest = client.get(
+            f"/v1/chat/history?before_seq={middle['oldest_seq']}&limit=2",
+            headers={"X-API-Key": api_key},
+        ).get_json()
+        forward = client.get(
+            "/v1/chat/history?after_seq=0&limit=5",
+            headers={"X-API-Key": api_key},
+        ).get_json()
+
+    assert [m["id"] for m in latest["messages"]] == ["same_ts_3", "same_ts_4"]
+    assert [m["id"] for m in middle["messages"]] == ["same_ts_1", "same_ts_2"]
+    assert [m["id"] for m in oldest["messages"]] == ["same_ts_0"]
+    assert [m["id"] for m in forward["messages"]] == [f"same_ts_{i}" for i in range(5)]
+    assert [m["seq"] for m in forward["messages"]] == sorted(
+        m["seq"] for m in forward["messages"]
+    )
+    assert latest["has_more_older"] is True
+    assert oldest["has_more_older"] is False
+
+
 def test_proactive_chat_response_uses_push_to_start_when_start_window_open(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)

@@ -1,10 +1,10 @@
 """Pure materialization helpers for user-configured MCP servers.
 
-The resident consumer (hosted CVM AND self-hosted VPS — same process) turns the
-decrypted server list into on-disk agent config:
+The independently operated resident consumer (for example a user's VPS) turns
+the decrypted server list into on-disk agent config:
   - claude: an ``--mcp-config`` JSON file + ``settings.json`` permission rules
   - codex:  a marker-delimited ``[mcp_servers.*]`` block merged into
-    ``config.toml`` WITHOUT disturbing the spawner-owned gateway section
+    ``config.toml`` WITHOUT disturbing unrelated runtime configuration
   - any other runtime: the claude-shaped JSON doubles as the generic
     ``user-mcp.json`` documented for VPS agents (io-onboarding skill).
 

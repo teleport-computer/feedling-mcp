@@ -14,10 +14,14 @@ via ``asgi.threadpool.run_db`` from the async routes.
 
 from __future__ import annotations
 
+import time
+import db
 from accounts import registry
 from admin import data_track
 from core import store as core_store
 from core.reqctx import bind, request
+from hosted import config_store
+from model_api_runtime.v2 import jobs_store
 
 
 def summary_payload(query_string: str) -> dict:
@@ -100,3 +104,155 @@ def store_evict(user_id: str) -> dict:
     evicted = core_store._evict_store(user_id)
     print(f"[admin:store/evict] user_id={user_id} evicted={evicted}")
     return {"evicted": evicted, "user_id": user_id}
+
+
+# --------------------------------------------------------------------------- #
+# hosted_runtime_mode control plane (Hosted Runtime V2 D0 rollout — gated flip
+# between resident_cli and db_action_v2 without a direct DB write).
+# --------------------------------------------------------------------------- #
+
+def set_runtime_mode(user_id: str, mode: str) -> tuple[dict, int]:
+    store = core_store.get_store(user_id)
+    if mode == config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+        try:
+            # Seed first. If profile persistence subsequently fails this row is
+            # dormant because every producer is mode-filtered; the reverse order
+            # creates a real window where the resident is reaped but no V2 wake
+            # schedule exists.
+            jobs_store.upsert_wake_schedule(user_id, next_heartbeat_at=time.time())
+        except Exception as e:  # noqa: BLE001 — do not report a half-ready flip
+            return {"error": "v2_schedule_seed_failed", "detail": str(e)[:160]}, 503
+    try:
+        persisted_mode = config_store.set_hosted_runtime_mode(store, mode)
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    except Exception:
+        return {"error": "runtime_control_unavailable"}, 503
+    return {"user_id": user_id, "hosted_runtime_mode": persisted_mode}, 200
+
+
+def get_runtime_mode(user_id: str) -> tuple[dict, int]:
+    store = core_store.get_store(user_id)
+    try:
+        mode = config_store.get_hosted_runtime_mode_strict(store)
+    except Exception:
+        return {"error": "runtime_control_unavailable"}, 503
+    return {"user_id": user_id, "hosted_runtime_mode": mode}, 200
+
+
+def set_runtime_allowlist(user_id: str, desired: str, *, note: str = "") -> tuple[dict, int]:
+    if desired == "remove":
+        removed = db.delete_runtime_allowlist(user_id)
+        return {"user_id": user_id, "removed": removed}, 200
+    try:
+        db.upsert_runtime_allowlist(user_id, desired, updated_by="admin", note=note)
+    except ValueError as e:
+        return {"error": str(e)}, 400
+    return {"user_id": user_id, "desired": desired}, 200
+
+
+def get_runtime_allowlist() -> dict:
+    """Reconciliation view: every allowlist row plus its live fence (mode/state/
+    generation) and a ``converged`` bool. A per-row read failure (e.g. transient
+    DB hiccup while resolving one user's fence) is captured on that row instead
+    of failing the whole endpoint — this is an admin dashboard, one bad row
+    should not hide the rest of the fleet."""
+    from core import store as core_store  # noqa: PLC0415
+    from hosted import config_store as cs  # noqa: PLC0415
+    rows = db.list_runtime_allowlist()
+    for row in rows:
+        try:
+            mode, state, gen = cs.get_hosted_runtime_control_strict(
+                core_store.get_store(row["user_id"]))
+            row["actual"] = {"mode": mode, "state": state, "generation": gen}
+            row["converged"] = (
+                (row["desired"] == "v2" and state == "v2")
+                or (row["desired"] == "resident" and state == "resident"))
+        except Exception as e:  # noqa: BLE001 — 对账视图不因单行炸
+            row["actual"] = {"error": str(e)[:80]}
+            row["converged"] = False
+    return {"allowlist": rows}
+
+
+def list_runtime_modes() -> dict:
+    # Enumerate every user with an active provider route, not only users who
+    # already have a runtime-profile blob. Otherwise an unset (effective
+    # resident) user disappears from the admin view and from V2 scheduler
+    # eligibility calculations. The shared normalizer keeps missing/invalid
+    # semantics identical to chat routing and the per-user control endpoint.
+    result: dict = {
+        config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2: [],
+        config_store.HOSTED_RUNTIME_MODE_RESIDENT: [],
+    }
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT r.user_id, mrt.doc->>'hosted_runtime_mode' AS mode
+            FROM model_api_routes r
+            LEFT JOIN user_blobs mrt
+              ON mrt.user_id = r.user_id
+             AND mrt.kind = 'model_api_runtime'
+            WHERE r.is_active
+            ORDER BY r.user_id
+            """
+        ).fetchall()
+    for row in rows:
+        user_id = row[0] if not isinstance(row, dict) else row["user_id"]
+        mode = row[1] if not isinstance(row, dict) else row["mode"]
+        effective_mode = config_store.effective_hosted_runtime_mode(mode)
+        result[effective_mode].append(user_id)
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# v2 turn metrics (Task 4 — D4 load-testing consumes these via
+# GET /v1/admin/v2-metrics; queue depth/worker liveness/service time/token
+# throughput, all sourced from jobs_store's existing DB-backed counters).
+# --------------------------------------------------------------------------- #
+
+def v2_metrics(
+    *,
+    cache_provider: str | None = None,
+    cache_model: str | None = None,
+    cache_route_fingerprint: str | None = None,
+    cache_user_id: str | None = None,
+    cache_since_ts: float | None = None,
+    cache_until_ts: float | None = None,
+) -> dict:
+    return {
+        "inflight": jobs_store.inflight_job_count(),
+        "pending": jobs_store.pending_job_count(),
+        "live_workers": jobs_store.live_worker_count(),
+        "live_worker_capacity": jobs_store.live_worker_capacity(),
+        # Two rows (turn + Genesis) per runner. Use the store's bounded maximum
+        # so the production per-CVM gate can prove fleets larger than 25 CVMs
+        # instead of silently truncating at the helper's observational default.
+        "worker_heartbeats": jobs_store.recent_worker_heartbeats(limit=200),
+        "worker_heartbeat_count": jobs_store.recent_worker_heartbeat_count(),
+        "runtime_policy": config_store.hosted_runtime_policy_status(),
+        "mean_service_sec": jobs_store.recent_mean_service_sec(lane="chat"),
+        "recent_mean_tokens_per_turn": jobs_store.recent_mean_tokens_per_turn(lane="chat"),
+        "turn_health": jobs_store.recent_chat_operational_health(),
+        "prompt_cache": jobs_store.recent_prompt_cache_stats(
+            lane="chat",
+            provider=cache_provider,
+            model=cache_model,
+            cache_route_fingerprint=cache_route_fingerprint,
+            user_id=cache_user_id,
+            since_ts=cache_since_ts,
+            until_ts=cache_until_ts,
+            include_turns=bool(
+                cache_user_id
+                and cache_since_ts is not None
+                and cache_until_ts is not None
+            ),
+        ),
+        "wake": jobs_store.wake_success_stats(),
+        "effects": db.effect_outbox_health(),
+        # The genesis import worker rides in the serve_worker process on its own
+        # thread, and `run_loop` imports `genesis.worker` lazily — so that thread can
+        # die while the turn loops keep beating. Without this field, a dead genesis
+        # thread is invisible until a user reports their onboarding distillation
+        # stuck. `live_workers` counts kind='turn' only and would not notice.
+        "genesis_alive": jobs_store.genesis_worker_alive(),
+    }

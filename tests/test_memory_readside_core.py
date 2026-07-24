@@ -179,6 +179,39 @@ def test_index_core_hard_max_caps_full_open_window(monkeypatch):
     assert body["truncated"] is True
 
 
+def test_index_core_exact_query_pages_past_hard_max(monkeypatch):
+    """HARD_MAX bounds each enclave request, never the searchable corpus."""
+    monkeypatch.setenv("FEEDLING_MEMORY_READSIDE_HARD_MAX", "3")
+    store = types.SimpleNamespace(user_id="usr_core")
+    moments = [
+        _moment(f"card_{idx}", importance=1.0 - idx / 10,
+                occurred_at=f"2026-06-{20 - idx:02d}T00:00:00")
+        for idx in range(7)
+    ]
+    monkeypatch.setattr(readside_core.memory_service, "_load_moments", lambda _store: moments)
+    pages: list[list[str]] = []
+
+    def fake_enclave(api_key, candidates, *, operation, payload=None):
+        ids = [m["id"] for m in candidates]
+        pages.append(ids)
+        return {
+            "items": ([{"id": "card_6", "summary": "exact late match"}]
+                      if "card_6" in ids else [])
+        }
+
+    body = readside_core.memory_index_core(
+        store,
+        "key_core",
+        {"query": "exact late match", "limit": 1},
+        post_enclave=fake_enclave,
+    )
+
+    assert [len(page) for page in pages] == [3, 3, 1]
+    assert body["items"] == [{"id": "card_6", "summary": "exact late match"}]
+    assert body["user_card_count"] == 7
+    assert body["truncated"] is False
+
+
 def test_index_core_negative_env_limit_is_ignored_by_v1_full_index(monkeypatch):
     monkeypatch.setenv("FEEDLING_MEMORY_READSIDE_LIMIT", "-1")
     store = types.SimpleNamespace(user_id="usr_core")
@@ -263,7 +296,7 @@ class _FakeClient:
 
 
 def test_post_enclave_readside_forwards_runtime_token(monkeypatch):
-    # host-all / zero-roster agents have a Stage-D runtime token but NO api_key.
+    # Runtime V2 workers have a scoped runtime token but no account API key.
     # The enclave call must forward X-Feedling-Runtime-Token — without this every
     # hosted agent memory read 503s with api_key_unavailable though data is present.
     monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "http://enclave:5003")
