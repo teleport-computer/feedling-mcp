@@ -392,15 +392,110 @@ def test_other_supervisor_cannot_steal_a_live_lease():
 
 def test_dead_child_is_reaped_and_respawned():
     procs = FakeProcTable()
-    sup = _sup(procs)
+    clock = {"now": T0}
+    sup = _sup(procs, clock=lambda: clock["now"])
     sup.tick(_roster("u_1"))
     # The child dies.
     pid = sup.children["u_1"]["pid"]
     procs.alive[pid] = False
 
-    sup.tick(_roster("u_1"))      # detects death → release + reacquire + respawn
+    sup.tick(_roster("u_1"))      # detects death → holds lease during backoff
+    assert len(procs.spawned) == 1
+    assert "u_1" not in sup.children
+    assert leases.get("u_1")["lease_owner"] == "sup_A"
+
+    clock["now"] += supervisor_mod._RESTART_BACKOFF_SEC[0]
+    sup.tick(_roster("u_1"))
     assert len(procs.spawned) == 2
     assert sup.children["u_1"]["pid"] != pid
+
+
+def test_crash_backoff_sequence_opens_hourly_circuit(monkeypatch):
+    procs = FakeProcTable()
+    clock = {"now": T0}
+    sup = _sup(procs, clock=lambda: clock["now"])
+    emitted = []
+    monkeypatch.setattr(
+        sup,
+        "_emit_runner_notice",
+        lambda user_id, error_class, detail, **kwargs:
+            emitted.append((user_id, error_class, detail, kwargs)),
+    )
+    roster = _roster("u_1")
+    sup.tick(roster)
+
+    expected_delays = [15.0, 60.0, 300.0, 900.0, 3600.0]
+    for attempt, delay in enumerate(expected_delays, start=1):
+        pid = sup.children["u_1"]["pid"]
+        procs.alive[pid] = False
+        sup.tick(roster)
+        state = sup._restart_ledger["u_1"]
+        assert state["failure_count"] == attempt
+        assert state["next_retry_at"] == clock["now"] + delay
+        assert state["circuit_open"] is (attempt == 5)
+
+        clock["now"] += delay - 1
+        sup.tick(roster)
+        assert "u_1" not in sup.children
+        clock["now"] += 1
+        sup.tick(roster)
+        assert "u_1" in sup.children
+
+    assert len(emitted) == 1
+    assert emitted[0][0:2] == ("u_1", "runner_spawn_failed")
+    assert "API key" in emitted[0][2]
+    assert "balance" in emitted[0][2]
+    assert "API Key" in emitted[0][3]["user_text"]
+    assert "额度" in emitted[0][3]["user_text"]
+
+
+def test_healthy_child_clears_restart_history_and_notice(monkeypatch):
+    procs = FakeProcTable()
+    clock = {"now": T0}
+    sup = _sup(procs, clock=lambda: clock["now"])
+    resolved = []
+    monkeypatch.setattr(
+        sup,
+        "_resolve_runner_notice",
+        lambda user_id, *error_classes:
+            resolved.append((user_id, error_classes)),
+    )
+    roster = _roster("u_1")
+    sup.tick(roster)
+    resolved.clear()
+
+    pid = sup.children["u_1"]["pid"]
+    procs.alive[pid] = False
+    sup.tick(roster)
+    clock["now"] += supervisor_mod._RESTART_BACKOFF_SEC[0]
+    sup.tick(roster)
+    assert "u_1" in sup._restart_ledger
+    assert all("runner_spawn_failed" not in classes for _, classes in resolved)
+
+    clock["now"] += supervisor_mod._RESTART_HEALTHY_RESET_SEC
+    sup.tick(roster)
+    assert "u_1" not in sup._restart_ledger
+    assert ("u_1", ("runner_spawn_failed",)) in resolved
+
+    pid = sup.children["u_1"]["pid"]
+    procs.alive[pid] = False
+    sup.tick(roster)
+    state = sup._restart_ledger["u_1"]
+    assert state["failure_count"] == 1
+    assert state["next_retry_at"] == clock["now"] + 15.0
+
+
+def test_backoff_lease_is_released_when_user_leaves_roster():
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    sup.tick(_roster("u_1"))
+    procs.alive[sup.children["u_1"]["pid"]] = False
+    sup.tick(_roster("u_1"))
+
+    sup.tick([])
+
+    assert "u_1" not in sup._restart_ledger
+    assert leases.get("u_1")["lease_owner"] is None
 
 
 def test_tick_reaps_child_no_longer_in_roster():
@@ -578,7 +673,10 @@ def test_renew_live_reaps_a_dead_child():
 
     sup.renew_live()
     assert "u_1" not in sup.children
-    assert leases.get("u_1")["lease_owner"] is None   # lease released
+    row = leases.get("u_1")
+    assert row["lease_owner"] == "sup_A"       # held so a peer cannot bypass backoff
+    assert row["status"] == "error"
+    assert sup._restart_ledger["u_1"]["next_retry_at"] == T0 + 15.0
 
 
 def test_renew_live_reclaims_own_expired_lease_without_killing():

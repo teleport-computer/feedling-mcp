@@ -12,6 +12,16 @@ change must not be interpreted as an API guarantee.
 
 ### API
 
+- Automatic `heartbeat_*` calls to `POST /v1/proactive/tick` now use a
+  server-clock cadence gate per account. After a heartbeat job is successfully
+  queued, the response's `decision.heartbeat_next_tick_at` advances by the
+  normalized wake interval; another automatic heartbeat before that epoch is
+  rejected with `decision.reason: "heartbeat_throttled"` and recorded as a
+  skipped job. Rejections do not move the deadline. Reducing
+  `wake_interval_sec` shortens an existing deadline immediately. Manual,
+  event-driven, scheduled, screen-watch, and self-wake jobs neither read nor
+  update this scheduler field.
+
 - **The Runtime V2 `identity_nudge` tool now actually applies personality-dimension
   changes.** The tool was exposed in the model-visible catalog but had no effect
   wiring, so any call failed the turn. Its full produce → encrypt → replay-validate
