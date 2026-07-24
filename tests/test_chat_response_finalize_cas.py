@@ -317,6 +317,37 @@ def test_finalize_insert_collision_rolls_back_parent_and_retry_is_safe(store):
     assert retried_reply == candidate
 
 
+def test_finalize_post_commit_never_trims_durable_chat_source(store):
+    parent = store.append_chat(
+        "user", "chat", _envelope(store.user_id, "parent_no_retention_trim")
+    )
+    candidate = store._build_chat_message(
+        "openclaw", "chat", _envelope(store.user_id, "reply_no_retention_trim")
+    )
+    finalized = db.chat_finalize_reply_once(
+        store.user_id,
+        parent["id"],
+        candidate["id"],
+        candidate["ts"],
+        candidate,
+        {
+            "reply_status": "replied",
+            "reply_message_id": candidate["id"],
+        },
+    )
+    assert finalized is not None
+
+    # Even an artificially tiny hot-cache bound cannot authorize source-row GC.
+    db.chat_finalize_reply_post_commit(store.user_id, candidate, 1)
+
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT msg_id FROM chat_messages WHERE user_id=%s ORDER BY seq",
+            (store.user_id,),
+        ).fetchall()
+    assert [row[0] for row in rows] == [parent["id"], candidate["id"]]
+
+
 def test_finalize_reply_row_shape_matches_append_chat(store, monkeypatch):
     fixed_now = 1_725_000_123.456
     monkeypatch.setattr(core_store.time, "time", lambda: fixed_now)
@@ -582,5 +613,8 @@ def test_finalize_reply_once_explain_uses_parent_primary_key(store):
         ).fetchall()
 
     plan = "\n".join(row[0] for row in plan_rows)
-    assert "Index Scan using chat_messages_pkey on chat_messages" in plan
+    # PostgreSQL may choose either a plain Index Scan or a Bitmap Index Scan as
+    # table statistics evolve across the full suite; both prove the parent PK
+    # access path and neither permits a sequential scan.
+    assert "chat_messages_pkey" in plan
     assert "Seq Scan on chat_messages" not in plan

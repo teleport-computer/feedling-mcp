@@ -31,6 +31,11 @@ _CODE_PATHS_AND_COMMANDS = {
     "python3": ("/tmp/feedling-code.py", "python /tmp/feedling-code.py"),
 }
 
+# Match the public/iOS upload ceiling exactly. A decimal 25 MB default left a
+# valid 25 MiB upload in a 1.2 MiB dead zone where ingest succeeded but the
+# sandbox refused to materialize it.
+DEFAULT_ARTIFACT_MAX_BYTES = 25 * 1024 * 1024
+
 
 def _bounded_positive_int(name: str, default: int, *, maximum: int) -> int:
     raw = os.environ.get(name, str(default))
@@ -215,7 +220,9 @@ class E2BSandboxProvider:
             "FEEDLING_V2_E2B_OUTPUT_MAX_CHARS", 64_000, maximum=1_000_000,
         )
         artifact_max = _bounded_positive_int(
-            "FEEDLING_V2_E2B_ARTIFACT_MAX_BYTES", 25_000_000, maximum=100_000_000,
+            "FEEDLING_V2_E2B_ARTIFACT_MAX_BYTES",
+            DEFAULT_ARTIFACT_MAX_BYTES,
+            maximum=100_000_000,
         )
         try:
             sandbox = self._class().create(

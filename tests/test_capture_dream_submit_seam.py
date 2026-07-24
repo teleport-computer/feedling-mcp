@@ -17,16 +17,21 @@ def test_both_ticks_accept_an_optional_submit_kwarg():
 
 
 def test_capture_submit_replaces_the_legacy_enqueue(monkeypatch):
-    """When `submit` is given, `_enqueue_window` must NOT run (it appends to the dead
-    legacy proactive_jobs stream)."""
+    """The shared gate/window seam must never call the legacy job writer."""
     legacy_called = {"n": 0}
-    monkeypatch.setattr(capture_scheduler, "_enqueue_window",
-                        lambda *a, **k: legacy_called.update(n=legacy_called["n"] + 1) or {})
+    monkeypatch.setattr(
+        capture_scheduler.capture_jobs,
+        "enqueue_memory_capture_job",
+        lambda *a, **k: legacy_called.update(n=legacy_called["n"] + 1) or
+        (None, False, "forbidden"),
+    )
 
     seen = {}
 
-    def _submit(store, *, trigger, now):
+    def _submit(store, *, trigger, now, window, capture_key):
         seen["trigger"] = trigger
+        seen["window"] = window
+        seen["capture_key"] = capture_key
         return {"enqueued": True, "reason": "v2", "job": {"id": "j1"}}
 
     # Drive the gate straight to its enqueue point by stubbing the state it reads.
@@ -36,6 +41,11 @@ def test_capture_submit_replaces_the_legacy_enqueue(monkeypatch):
                                                  "last_captured_until_message_id": ""})
     monkeypatch.setattr(capture_scheduler, "_capture_enabled", lambda store: True)
     monkeypatch.setattr(capture_scheduler, "quiet_sec", lambda: 0)
+    monkeypatch.setattr(
+        capture_scheduler,
+        "_patch_capture_state",
+        lambda _store, state, **_kwargs: dict(state),
+    )
 
     out = capture_scheduler.tick_quiet_capture(object(), now=1000.0, submit=_submit)
 

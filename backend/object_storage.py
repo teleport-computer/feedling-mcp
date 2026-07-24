@@ -305,12 +305,13 @@ def chat_body_key(
     readers/deleters use the ``body_key`` stored on the row.
 
     Runtime offloads pass both the lifecycle ``storage_generation`` pinned by
-    their initial database write and a fresh ``upload_version``.  The generation
-    segment makes a history clear a durable namespace boundary; the version
-    prevents two in-flight writes for one message overwriting each other before
-    PostgreSQL chooses the winner. ``None`` retains the original key shape for
-    maintenance/legacy callers. Readers and deleters support every layout because
-    they always follow the persisted key.
+    their initial database write and a fresh ``upload_version``. The generation
+    segment is advanced only when account deletion retires all retained chat;
+    Clear Chat preserves the generation because it archives the ciphertext. The
+    version prevents two in-flight writes for one message overwriting each other
+    before PostgreSQL chooses the winner. ``None`` retains the original key shape
+    for maintenance/legacy callers. Readers and deleters support every layout
+    because they always follow the persisted key.
     """
     prefix = _CHAT_IMAGE_KEY_PREFIX if content_type == "image" else _CHAT_KEY_PREFIX
     if storage_generation is None:

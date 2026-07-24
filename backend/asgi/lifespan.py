@@ -49,7 +49,6 @@ def _start_wake_bus() -> None:
     the "users" cache-evict handler is injected here (core may not import
     accounts); store channels are dispatched inside wake_bus and now also fire
     the async wake hook (core.store._fire_async_wake)."""
-    from accounts import registry as accounts_registry
     from core import wake_bus as core_wake_bus
 
     core_wake_bus.register_handler("users", _reload_accounts_registry)

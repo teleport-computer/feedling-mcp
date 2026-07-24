@@ -67,7 +67,8 @@ def test_runtime_mode_fence_uses_strict_control_plane_read(monkeypatch):
 
 
 def test_extraction_producer_is_quarantined_by_default(monkeypatch):
-    monkeypatch.setattr(serve_worker, "_EXTRACTION_ENABLED", False)
+    monkeypatch.setattr(serve_worker, "_CAPTURE_ENABLED", False)
+    monkeypatch.setattr(serve_worker, "_DREAM_ENABLED", False)
     monkeypatch.setattr(
         serve_worker.admin_core,
         "list_runtime_modes",
@@ -75,6 +76,27 @@ def test_extraction_producer_is_quarantined_by_default(monkeypatch):
     )
     deps = serve_worker._build_scheduler_deps()
     assert deps.extraction_users() == []
+
+
+def test_capture_and_dream_are_independently_gated(monkeypatch):
+    calls = []
+    monkeypatch.setattr(serve_worker, "_CAPTURE_ENABLED", True)
+    monkeypatch.setattr(serve_worker, "_DREAM_ENABLED", False)
+    monkeypatch.setattr(
+        serve_worker, "_tick_capture_for_user", lambda uid: calls.append(("capture", uid)) or 1
+    )
+    monkeypatch.setattr(
+        serve_worker, "_tick_dream_for_user", lambda uid: calls.append(("dream", uid)) or 1
+    )
+
+    assert serve_worker._tick_extraction_for_user("u1") == 1
+    assert calls == [("capture", "u1")]
+
+    calls.clear()
+    monkeypatch.setattr(serve_worker, "_CAPTURE_ENABLED", False)
+    monkeypatch.setattr(serve_worker, "_DREAM_ENABLED", True)
+    assert serve_worker._tick_extraction_for_user("u1") == 1
+    assert calls == [("dream", "u1")]
 
 
 def test_existing_v2_schedule_backfill_is_idempotent(monkeypatch):

@@ -104,6 +104,51 @@
   runner」的条件式披露（那是基于 test 现状的错误前提写的，已用上面的纠偏
   重写）。
 
+## 2026-07-20
+
+### [DONE] Runtime and product telemetry share one honest operator dashboard
+
+- The existing admin data-track page now combines 30-day Runtime V2 effective
+  input/output/cache token totals, provider-usage coverage, V2 account/turn
+  counts, current hosted/self-hosted activated-account coverage, and the
+  existing iOS foreground-duration roll-up.
+- Missing provider usage stays unknown and lowers the displayed coverage ratio
+  instead of becoming a false zero. Self-hosted coverage is explicitly the
+  observable activated account-route count: fully offline instances that never
+  contact the official backend cannot be counted, and reinstall orphan rows can
+  keep it from being an exact human or deployment count.
+
+### [DONE] Runtime V2 release closure makes trajectories durably debuggable
+
+- Encrypted raw chat, trajectory, and review content has no time-based TTL or
+  background GC. Chat Clear moves raw rows into an immutable non-prompt archive
+  and preserves trajectory/review evidence while clearing live conversation/
+  prompt state; account deletion remains the complete per-user erasure boundary.
+- Added a default-off, runner-local break-glass inspector for one exact user/job.
+  It requires a validated operator, fixed reason, and case reference, and writes
+  durable requested/outcome audit phases without creating a plaintext HTTP or
+  admin endpoint.
+- `GET /v1/admin/v2-metrics` now exposes a bounded content-free `turn_health`
+  snapshot covering terminal outcomes, queue/lease expiry, oldest pending age,
+  p95 latency, and trajectory completeness/capture gaps.
+- Automatic Memory Capture and Memory Dream are independent deployment
+  controls and every managed environment, including Pre, defaults both off.
+  The dormant Capture path now uses exact raw-seq coverage with live-row-only
+  provider disclosure, encrypted prepared-batch recovery before provider setup, and one
+  atomic Memory/log/frontier/job commit. User opt-out, fleet halt, Chat Clear,
+  and runtime cutover now linearize against the complete provider disclosure,
+  while Memory retype derives changes from the fresh cross-process-fenced row.
+  Lost ownership and synthetic-only windows fail or advance without leaking
+  content, repeating the provider call, surfacing a chat error, or silently
+  skipping a frontier.
+- The optional E2B artifact path now shares the iOS/backend 25 MiB boundary and
+  a content-addressed template tag. Source is activation-ready, but remains
+  fail-closed until an environment supplies the provider credential/template
+  and approves the external data boundary.
+- Typing-signal pre-warm is explicitly removed from the Runtime V2 release scope.
+  Remaining release gates are operational: target-CVM load/fault soak, external
+  health alerting, a second production runner, and live zero-resident inventory.
+
 ## 2026-07-19
 
 ### [DONE] Runtime V2 flight recorder becomes byte-complete for model-visible turns
@@ -168,12 +213,13 @@
   versioned CAS. Existing aggregate summaries migrate lazily and oversized old
   summaries are reduced through bounded hierarchical calls even without a new
   message.
-- Explicit Chat clear is now a generation-fenced atomic reset of raw messages,
-  summary, chat-derived artifacts, pending effects/status, and reply cursor.
-  Paused old workers cannot recreate cleared context. Independent Memory,
-  user-authored workspace, schedules, content-free metrics, and encrypted
-  trajectory telemetry remain under their own retention policies; account
-  deletion remains the complete-erasure boundary.
+- Explicit Chat clear is now a generation-fenced atomic reset of the live
+  conversation: raw encrypted rows move to an immutable non-prompt archive,
+  while summary, chat-derived artifacts, pending effects/status, and reply
+  cursor are removed. Paused old workers cannot recreate cleared context.
+  Independent Memory, user-authored workspace, schedules, content-free metrics,
+  archived chat, and encrypted trajectory telemetry remain until account
+  deletion, the complete-erasure boundary.
 - Hosted resident retirement is complete in source and managed manifests, but
   live fleet closure still requires deploying the reviewed image everywhere,
   provisioning production's second runner failure domain, and verifying zero

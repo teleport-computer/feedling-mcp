@@ -272,6 +272,8 @@ services:
       # "resident" keeps day-1 behavior identical to pre-dual-runtime prod;
       # allowlisted users' desired state overrides this default.
       FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
+      # Automatic Memory Capture stays explicit opt-in (default off).
+      FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-0}"
       # Genesis v2 (foreground-fast onboarding): greet on 3-5 core + identity
       # baseline, push the heavy reduce (the old ~37% failure surface) to the
       # background. Validated on test; flip to "false" to revert to the v1

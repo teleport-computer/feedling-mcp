@@ -77,6 +77,16 @@ def _raw_doc(uid: str, mid: str) -> dict | None:
     return row[0] if row else None
 
 
+def _archived_doc(uid: str, mid: str) -> dict | None:
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT doc FROM chat_message_archive "
+            "WHERE user_id=%s AND msg_id=%s ORDER BY source_seq DESC LIMIT 1",
+            (uid, mid),
+        ).fetchone()
+    return row[0] if row else None
+
+
 def _body_key(uid: str, mid: str) -> str:
     doc = _raw_doc(uid, mid)
     assert isinstance(doc, dict) and doc.get("body_key")
@@ -228,20 +238,20 @@ def test_idempotent_append_after_clear_pins_live_storage_generation(
             "WHERE user_id=%s AND msg_id=%s",
             (uid, mid),
         ).fetchone()
-    assert row is not None and int(row[0]) == 1
+    assert row is not None and int(row[0]) == 0
     key = str(row[1]["body_key"])
-    assert object_storage.chat_body_storage_generation(key, uid) == 1
+    assert object_storage.chat_body_storage_generation(key, uid) == 0
 
 
 def test_idempotent_clear_during_slow_put_keeps_durable_cleanup_guard(
     backend_env, monkeypatch,
 ):
-    """A clear cannot lose an idempotent upload that finishes after inventory.
+    """A clear preserves the inline source while a paused offload loses CAS.
 
-    Clear's generation inventory deliberately runs before the paused PUT has
-    made an object visible.  The writer must therefore have committed an exact
-    key cleanup guard before starting the network call; otherwise the late
-    object has neither a chat-row pointer nor any remaining cleanup work.
+    The encrypted row is archived before the upload finishes. The late upload
+    cannot promote a pointer into the now-absent live row, so its exact upload
+    guard reclaims the unreferenced object while the archived inline ciphertext
+    remains available until account deletion.
     """
     upload_started = threading.Event()
     release_upload = threading.Event()
@@ -284,10 +294,7 @@ def test_idempotent_clear_during_slow_put_keeps_durable_cleanup_guard(
         assert upload_started.wait(timeout=3)
         assert db.chat_clear(uid) == 1
 
-        # Reproduce the dangerous ordering: the generation-wide LIST sees no
-        # object and retires its durable marker before the PUT becomes visible.
-        generation = _storage_generation(uid)
-        assert db._reconcile_one_chat_r2_inventory(uid, generation) is True
+        assert _storage_generation(uid) == 0
         assert _inventory_state(uid)[0] is False
     finally:
         release_upload.set()
@@ -297,6 +304,8 @@ def test_idempotent_clear_during_slow_put_keeps_durable_cleanup_guard(
     assert len(outcome) == 1 and not isinstance(outcome[0], BaseException)
     assert outcome[0][1] is True
     assert _raw_doc(uid, mid) is None
+    archived = _archived_doc(uid, mid)
+    assert archived is not None and archived.get("body_ct") is not None
 
     # Only the per-upload guard can discover and reclaim this late object now.
     _drain_r2(uid)
@@ -424,19 +433,23 @@ def test_delete_or_clear_during_upload_reclaims_late_object(
     _drain_r2(uid)
 
     assert _raw_doc(uid, mid) is None
+    archived = _archived_doc(uid, mid)
+    if purge == "clear":
+        assert archived is not None and archived.get("body_ct") is not None
+    else:
+        assert archived is None
     assert client.store == {}
 
 
-def test_clear_waits_for_inflight_pointer_promotion_then_retires_its_key(
+def test_clear_waits_for_inflight_pointer_promotion_then_archives_its_key(
     backend_env, monkeypatch,
 ):
     """Exercise the promotion-wins ordering of the lifecycle fence.
 
     The pointer transaction holds the per-user lifecycle row before clear
-    starts. Clear must wait, then advance the generation and delete the newly
-    promoted row in its own transaction; the retirement trigger leaves an
-    exact-key cleanup intent for the isolated worker even if its first pass
-    loses the advisory-lock race with the uploader.
+    starts. Clear must wait, then archive and hide the newly promoted row in its
+    own transaction. The R2 object remains referenced by that encrypted archive
+    until account deletion.
     """
     client = _FakeS3()
     _enable_r2(monkeypatch, client)
@@ -499,12 +512,14 @@ def test_clear_waits_for_inflight_pointer_promotion_then_retires_its_key(
     assert clear_results == [1]
     assert promoter_lock_count >= 4
     assert _raw_doc(uid, mid) is None
-    assert _storage_generation(uid) == 1
+    assert _storage_generation(uid) == 0
 
-    # The durable trigger tombstone remains until the recurring worker finishes
-    # it after the uploader releases its advisory lock.
     db.reconcile_chat_r2_cleanup(uid, include_inventory=False)
-    assert client.store == {}
+    archived = _archived_doc(uid, mid)
+    assert archived is not None and archived.get("body_key")
+    assert client.store == {
+        (_BUCKET, archived["body_key"]): b"promotion-wins",
+    }
     assert _cleanup_keys(uid) == []
 
 
@@ -548,46 +563,56 @@ def test_pointer_only_replay_after_clear_cannot_recreate_deleted_row(
     _drain_r2(uid)
 
     assert _raw_doc(uid, mid) is None
-    assert client.store == {}
+    assert _archived_doc(uid, mid) == stale_pointer
+    assert client.store == {(_BUCKET, stale_pointer["body_key"]): b"retired"}
 
 
-def test_clear_generation_cleanup_never_deletes_post_clear_append(
+def test_account_deletion_purges_clear_archived_body(
     backend_env, monkeypatch,
 ):
-    """Reproduce the old prefix-sweep race at the inventory boundary.
+    client = _FakeS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid(); seed_user(uid); mid = uuid.uuid4().hex
+    db.chat_append_strict(uid, mid, 1.0, _image_doc(uid, mid, b"until-account-delete"), 100)
+    key = _body_key(uid, mid)
 
-    A generation-1 append lands after clear commits but while the isolated
-    cleanup worker inventories R2. Only generation 0 is eligible for deletion.
-    """
+    assert db.chat_clear(uid) == 1
+    assert _archived_doc(uid, mid)["body_key"] == key
+    assert client.store == {(_BUCKET, key): b"until-account-delete"}
+
+    db.delete_user(uid)
+    _drain_r2(uid)
+
+    assert _archived_doc(uid, mid) is None
+    assert client.store == {}
+    assert _cleanup_keys(uid) == []
+
+
+def test_clear_archive_preserves_old_body_and_post_clear_append(
+    backend_env, monkeypatch,
+):
+    """Clear hides old chat without retiring either old or new ciphertext."""
     client = _FakeS3()
     _enable_r2(monkeypatch, client)
     uid = _uid(); seed_user(uid)
     old_mid, new_mid = uuid.uuid4().hex, uuid.uuid4().hex
     db.chat_append_strict(uid, old_mid, 1.0, _image_doc(uid, old_mid, b"old"), 100)
     old_key = _body_key(uid, old_mid)
-    real_list = object_storage.list_user_chat_body_keys
-    injected = False
-
-    def _list_with_post_clear_append(list_uid: str) -> list[str]:
-        nonlocal injected
-        if not injected:
-            injected = True
-            db.chat_append_strict(
-                uid, new_mid, 2.0, _image_doc(uid, new_mid, b"new"), 100,
-            )
-        return real_list(list_uid)
-
-    monkeypatch.setattr(
-        object_storage, "list_user_chat_body_keys", _list_with_post_clear_append,
-    )
     assert db.chat_clear(uid) == 1
+    db.chat_append_strict(
+        uid, new_mid, 2.0, _image_doc(uid, new_mid, b"new"), 100,
+    )
     _drain_r2(uid)
 
     new_key = _body_key(uid, new_mid)
-    assert _storage_generation(uid) == 1
+    assert _storage_generation(uid) == 0
     assert object_storage.chat_body_storage_generation(old_key, uid) == 0
-    assert object_storage.chat_body_storage_generation(new_key, uid) == 1
-    assert client.store == {(_BUCKET, new_key): b"new"}
+    assert object_storage.chat_body_storage_generation(new_key, uid) == 0
+    assert _archived_doc(uid, old_mid)["body_key"] == old_key
+    assert client.store == {
+        (_BUCKET, old_key): b"old",
+        (_BUCKET, new_key): b"new",
+    }
     assert base64.b64decode(
         db.hydrate_chat_file_body(uid, _raw_doc(uid, new_mid))["body_ct"]
     ) == b"new"
@@ -647,16 +672,16 @@ def test_replacement_tombstone_survives_process_death_before_worker_drain(
     assert client.store == {(_BUCKET, new_key): b"new"}
 
 
-def test_empty_clear_still_advances_durable_storage_generation(
+def test_empty_clear_keeps_durable_storage_retention_generation(
     backend_env, monkeypatch,
 ):
     _enable_r2(monkeypatch, _FakeS3())
     uid = _uid(); seed_user(uid)
 
     assert db.chat_clear(uid) == 0
-    assert _storage_generation(uid) == 1
+    assert _storage_generation(uid) == 0
     assert db.chat_clear(uid) == 0
-    assert _storage_generation(uid) == 2
+    assert _storage_generation(uid) == 0
 
 
 def test_account_cascade_keeps_cleanup_intent_after_user_row_is_gone(
@@ -900,7 +925,7 @@ def test_disabled_r2_stays_inline(backend_env, monkeypatch):
     assert "body_ct" in raw and "body_key" not in raw
 
 
-def test_chat_clear_and_delete_purge_r2(backend_env, monkeypatch):
+def test_chat_delete_purges_but_clear_retains_r2(backend_env, monkeypatch):
     client = _FakeS3()
     _enable_r2(monkeypatch, client)
     uid = _uid(); seed_user(uid)
@@ -914,7 +939,9 @@ def test_chat_clear_and_delete_purge_r2(backend_env, monkeypatch):
     assert (_BUCKET, k1) not in client.store
     db.chat_clear(uid)
     _drain_r2(uid)
-    assert not client.store
+    archived = _archived_doc(uid, m2)
+    assert archived is not None and archived.get("body_key")
+    assert client.store == {(_BUCKET, archived["body_key"]): b"PK\x03\x04docx-bytes"}
 
 
 # --------------------------------------------------------------------------- #
@@ -1310,7 +1337,7 @@ def test_pointer_replay_survives_then_replacement_reclaims_old_object(
 
 
 def test_account_purge_clears_both_prefixes(backend_env, monkeypatch):
-    # Images and files now live under DIFFERENT prefixes. A reset/clear that swept
+    # Images and files now live under DIFFERENT prefixes. An account reset that swept
     # only chatfiles/ would leave a deleted account's photo ciphertext in R2.
     client = _FakeS3()
     _enable_r2(monkeypatch, client)
@@ -1322,7 +1349,7 @@ def test_account_purge_clears_both_prefixes(backend_env, monkeypatch):
     assert (_BUCKET, f_key) in client.store
     assert (_BUCKET, i_key) in client.store
 
-    db.chat_clear(uid)
+    db.delete_user(uid)
     _drain_r2(uid)
     assert not client.store                                   # BOTH prefixes swept
 

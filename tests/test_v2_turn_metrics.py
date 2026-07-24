@@ -74,6 +74,67 @@ def test_recent_mean_tokens_per_turn_none_without_history():
     assert jobs_store.recent_mean_tokens_per_turn(lane="no-such-lane") is None
 
 
+def test_recent_token_usage_summary_keeps_totals_and_coverage_honest():
+    seed_user("u_tm_rollup_a")
+    seed_user("u_tm_rollup_b")
+    jobs_store.record_whole_turn_metric(
+        98001, "u_tm_rollup_a", "chat",
+        prompt_tokens=1_000,
+        completion_tokens=120,
+        cache_read_tokens=600,
+        cache_write_tokens=100,
+        cache_miss_tokens=400,
+        usage_reported_calls=2,
+        cache_reported_calls=2,
+        provider="anthropic",
+        model="claude-test",
+        cache_route_fingerprint="feedling-v2-route-a",
+        latency_ms=500,
+        model_calls=2,
+        retries=0,
+        failed=False,
+        status="ok",
+    )
+    jobs_store.record_whole_turn_metric(
+        98002, "u_tm_rollup_b", "chat",
+        prompt_tokens=None,
+        completion_tokens=None,
+        latency_ms=250,
+        model_calls=1,
+        retries=0,
+        failed=True,
+        status="provider_error",
+    )
+
+    usage = jobs_store.recent_token_usage_summary(lane="chat", within_days=30)
+
+    assert usage == {
+        "window_days": 30,
+        "sampled_turns": 2,
+        "users": 2,
+        "model_calls": 3,
+        "usage_reported_calls": 2,
+        "cache_reported_calls": 2,
+        "usage_telemetry_coverage": pytest.approx(2 / 3),
+        "cache_telemetry_coverage": pytest.approx(2 / 3),
+        "prompt_tokens": 1_000,
+        "completion_tokens": 120,
+        "total_tokens": 1_120,
+        "cache_read_tokens": 600,
+        "cache_write_tokens": 100,
+        "cache_miss_tokens": 400,
+    }
+
+
+def test_recent_token_usage_summary_preserves_unknown_token_totals():
+    usage = jobs_store.recent_token_usage_summary(lane="no-such-lane")
+
+    assert usage["sampled_turns"] == 0
+    assert usage["users"] == 0
+    assert usage["total_tokens"] is None
+    assert usage["usage_telemetry_coverage"] is None
+
+
 def test_recent_prompt_cache_stats_preserve_unknowns_and_report_coverage():
     seed_user("u_tm_cache")
     jobs_store.record_whole_turn_metric(

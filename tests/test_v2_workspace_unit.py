@@ -379,6 +379,33 @@ def test_e2b_adapter_is_secure_offline_bounded_and_uses_fixed_extractor(monkeypa
     assert raw.kill_count == 1
 
 
+def test_e2b_default_materialization_limit_matches_ios_25_mib(monkeypatch):
+    _FakeE2BSandbox.create_calls = []
+    monkeypatch.setenv("E2B_API_KEY", "test-e2b-key")
+    monkeypatch.setenv(
+        "FEEDLING_V2_E2B_TEMPLATE",
+        "feedling-runtime-v2-artifacts-v1-" + "0123456789abcdef" * 4,
+    )
+    monkeypatch.delenv("FEEDLING_V2_E2B_ARTIFACT_MAX_BYTES", raising=False)
+    session = e2b_sandbox.E2BSandboxProvider(
+        sandbox_cls=_FakeE2BSandbox
+    ).acquire(user_id="u_e2b", purpose="materialize_artifact")
+
+    exact_limit = 25 * 1024 * 1024
+    session.materialize(
+        name="ios-limit.bin",
+        data=b"x" * exact_limit,
+        mime_type="application/octet-stream",
+    )
+    with pytest.raises(workspace_sandbox.SandboxUnavailable, match="exceeds"):
+        session.materialize(
+            name="over-limit.bin",
+            data=b"x" * (exact_limit + 1),
+            mime_type="application/octet-stream",
+        )
+    session.close()
+
+
 def test_e2b_adapter_requires_key_and_template_before_sdk_call(monkeypatch):
     _FakeE2BSandbox.create_calls = []
     monkeypatch.delenv("E2B_API_KEY", raising=False)
