@@ -2,6 +2,11 @@
 # postgres:17 digest 待实施时解析：docker manifest inspect postgres:17 取 amd64 digest 后钉死
 FROM postgres:17@sha256:9c1534cbf839ec70409508a874f4c02bf4739de2f32f77efe080eef1cfd34bf4
 
+# GHCR 按这个 label 把 package 关联回仓库。缺了它，package 只属于当初手工
+# `docker push` 的那个人，Actions 的 GITHUB_TOKEN 推它会 permission_denied:
+# write_package（2026-07-24 首次把 pg 部署搬上 CI 时实测撞到）。
+LABEL org.opencontainers.image.source=https://github.com/teleport-computer/feedling-mcp
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl jq cron \
     && rm -rf /var/lib/apt/lists/*
