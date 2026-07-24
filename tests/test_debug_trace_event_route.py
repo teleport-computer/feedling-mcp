@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import debug_trace  # noqa: E402
+import provider_attempt_ledger  # noqa: E402
 from accounts import registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
@@ -75,3 +76,40 @@ def test_emit_event_records(client):
     body = g.get_json()
     assert "verbose" in body
     assert any(e["type"] == "agent.model.call.done" for e in body["events"])
+
+
+def test_provider_attempt_payload_bypasses_debug_ring(client, monkeypatch):
+    user_id, api_key = _register(client)
+    _enable_trace(client, api_key)
+    recorded = []
+
+    def fake_append(uid, stream, doc, *, number_field, ts, item_key):
+        row = {**doc, number_field: len(recorded) + 1}
+        recorded.append((uid, stream, item_key, row))
+        return row
+
+    monkeypatch.setattr(
+        provider_attempt_ledger.db,
+        "log_append_numbered",
+        fake_append,
+    )
+    r = client.post(
+        "/v1/debug/trace/event",
+        headers=_headers(api_key),
+        json={
+            "provider_attempt": {
+                "parent_message_id": "msg_1",
+                "trigger": "redelivery",
+                "provider_request_id": "req_1",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+                "outcome": "ok",
+                "ts": 123.0,
+            }
+        },
+    )
+
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json()["attempt_n"] == [1]
+    assert recorded[0][0:3] == (user_id, "provider_attempts", "msg_1")
+    trace = client.get("/v1/debug/trace?limit=10", headers=_headers(api_key)).get_json()
+    assert trace["events"] == []

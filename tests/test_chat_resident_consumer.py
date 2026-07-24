@@ -147,6 +147,28 @@ def test_filter_messages_to_poll_ids_keeps_only_claimed_rows():
     assert crc._filter_messages_to_poll_ids(decrypted, poll_messages) == [decrypted[0]]
 
 
+def test_filter_messages_marks_attempt_trigger_from_poll_cursor():
+    decrypted = [
+        {"id": "msg-old", "role": "user", "content": "retry"},
+        {"id": "msg-new", "role": "user", "content": "fresh"},
+    ]
+    poll_messages = [
+        {"id": "msg-old", "ts": 100.0},
+        {"id": "msg-new", "ts": 201.0},
+    ]
+
+    marked = crc._filter_messages_to_poll_ids(
+        decrypted,
+        poll_messages,
+        last_ts=200.0,
+    )
+
+    assert [m["_provider_attempt_trigger"] for m in marked] == [
+        "redelivery",
+        "first",
+    ]
+
+
 def test_process_messages_posts_reply_with_source_message_id():
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
@@ -158,6 +180,24 @@ def test_process_messages_posts_reply_with_source_message_id():
 
     assert result_ts == pytest.approx(1111.0)
     assert mock_post.call_args.kwargs["reply_to_message_id"] == "user-msg-1"
+
+
+def test_process_messages_passes_redelivery_attempt_trigger():
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = {
+        "id": "user-msg-redelivery",
+        "role": "user",
+        "content": "hi again",
+        "ts": 1111.5,
+        "_provider_attempt_trigger": "redelivery",
+    }
+
+    with patch.object(crc, "call_agent", return_value="hey") as mock_agent, \
+         patch.object(crc, "post_reply", return_value={"id": "reply-msg-redelivery"}):
+        crc._process_messages([msg])
+
+    assert mock_agent.call_args.kwargs["attempt_trigger"] == "redelivery"
 
 
 def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monkeypatch):
@@ -6248,6 +6288,55 @@ _PI_STREAM_CUT_TURN = _pi_stream_lines(
 )
 
 
+def test_pi_provider_attempt_rows_capture_usage_outcome_and_request_id():
+    raw = _pi_stream_lines(
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "tool round"}],
+                "usage": {"input": 120, "output": 8},
+            },
+        },
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "usage": {"input": 130, "output": 0},
+            },
+            "stopReason": "error",
+            "errorMessage": "429 relay failure (request id: req_abcdef)",
+        },
+    )
+
+    rows = crc._pi_provider_attempt_rows(
+        raw,
+        parent_message_id="msg_1",
+        trigger="redelivery",
+        ts=123.0,
+    )
+
+    assert rows == [
+        {
+            "parent_message_id": "msg_1",
+            "trigger": "redelivery",
+            "provider_request_id": "",
+            "usage": {"input_tokens": 120, "output_tokens": 8},
+            "outcome": "ok",
+            "ts": 123.0,
+        },
+        {
+            "parent_message_id": "msg_1",
+            "trigger": "redelivery",
+            "provider_request_id": "req_abcdef",
+            "usage": {"input_tokens": 130, "output_tokens": 0},
+            "outcome": "rate_limit",
+            "ts": 123.0,
+        },
+    ]
+
+
 def test_call_agent_cli_pi_stream_cut_retries_once_and_succeeds(monkeypatch, tmp_path):
     _pi_cli_env(monkeypatch, tmp_path, "usr_pi_cut_ok")
     runs = []
@@ -6261,6 +6350,74 @@ def test_call_agent_cli_pi_stream_cut_retries_once_and_succeeds(monkeypatch, tmp
     assert crc.call_agent_cli("hello") == "ok"
     assert len(runs) == 2                      # exactly one retry
     assert runs[0] == runs[1]                  # same turn, same command
+
+
+def test_call_agent_cli_ledgers_stream_cut_retry_separately(monkeypatch, tmp_path):
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_cut_ledger")
+    runs = []
+    ledger_rows = []
+
+    def fake_run(cmd, **kw):
+        runs.append(list(cmd))
+        out = _PI_STREAM_CUT_TURN if len(runs) == 1 else _PI_OK_TURN
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        crc,
+        "_queue_provider_attempt_ledger",
+        lambda rows: ledger_rows.extend(rows),
+    )
+
+    assert crc.call_agent_cli(
+        "hello",
+        trace_id="msg_redelivered",
+        lane="chat",
+        attempt_trigger="redelivery",
+    ) == "ok"
+
+    assert len(ledger_rows) == 2
+    assert [row["trigger"] for row in ledger_rows] == [
+        "redelivery",
+        "stream_cut_retry",
+    ]
+    assert [row["outcome"] for row in ledger_rows] == ["stream_cut", "ok"]
+    assert {row["parent_message_id"] for row in ledger_rows} == {"msg_redelivered"}
+
+
+def test_call_agent_cli_timeout_ledgers_completed_pi_rounds(monkeypatch, tmp_path):
+    partial = _pi_stream_lines(
+        _PI_HEADER,
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "tool round"}],
+                "usage": {"input": 80, "output": 4},
+            },
+        },
+    )
+    _pi_cli_env(monkeypatch, tmp_path, "usr_pi_timeout_ledger")
+    ledger_rows = []
+
+    def fake_run(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 300, output=partial, stderr="")
+
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        crc,
+        "_queue_provider_attempt_ledger",
+        lambda rows: ledger_rows.extend(rows),
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        crc.call_agent_cli("hello", trace_id="msg_timeout", lane="chat")
+
+    assert [row["outcome"] for row in ledger_rows] == ["ok", "timeout"]
+    assert ledger_rows[0]["usage"] == {
+        "input_tokens": 80,
+        "output_tokens": 4,
+    }
 
 
 def test_call_agent_cli_pi_stream_cut_twice_raises_no_loop(monkeypatch, tmp_path):

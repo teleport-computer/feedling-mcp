@@ -29,6 +29,10 @@ from core import util as core_util
 from identity import service as identity_service
 
 
+_PROVIDER_ATTEMPT_STREAM = "provider_attempts"
+_PROVIDER_ATTEMPT_DETAIL_LIMIT = 200
+
+
 # Injected by the assembly layer (asgi_app.py) — the real implementations live
 # in hosted/onboarding_validation.py; admin sits below hosted, so the stub is
 # declared here and assembly wires it.
@@ -956,6 +960,19 @@ def _runtime_summary(store: UserStore) -> dict:
     return out
 
 
+def _provider_attempts_detail(store: UserStore) -> dict:
+    rows = db.log_read(
+        store.user_id,
+        _PROVIDER_ATTEMPT_STREAM,
+        limit=_PROVIDER_ATTEMPT_DETAIL_LIMIT + 1,
+    )
+    return {
+        "coverage": "chat_turns_only",
+        "attempts": rows[-_PROVIDER_ATTEMPT_DETAIL_LIMIT:],
+        "has_more": len(rows) > _PROVIDER_ATTEMPT_DETAIL_LIMIT,
+    }
+
+
 def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) -> dict:
     user_id = str(user_entry.get("user_id") or "")
     store = core_store.get_store(user_id)
@@ -1042,6 +1059,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
     }
     if include_detail:
         row["runtime"] = _runtime_summary(store)
+        row["provider_attempt_ledger"] = _provider_attempts_detail(store)
         _ps = store.load_proactive_settings()
         row["perception_permissions"] = {
             # what the device reports it granted (free-form; keys are app-defined,

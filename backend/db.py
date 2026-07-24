@@ -8432,6 +8432,58 @@ def log_append(user_id: str, stream: str, doc: dict,
     mirror.execute(mirror_sql, (user_id, stream, row[0], ts, item_key, Jsonb(doc)))
 
 
+def log_append_numbered(
+    user_id: str,
+    stream: str,
+    doc: dict,
+    *,
+    number_field: str,
+    ts: float,
+    item_key: str,
+) -> dict | None:
+    """Append a log row with a per-item monotonic number assigned atomically.
+
+    The advisory lock covers the empty-stream case where there is no row to lock
+    yet, and also serializes overlapping workers appending attempts for the same
+    logical item. The stored JSON is never patched after insertion.
+    """
+    numbered_doc = dict(doc)
+    seq = None
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (f"numbered-log:{stream}:{user_id}:{item_key}",),
+                    )
+                    cur.execute(
+                        "SELECT COUNT(*) FROM user_logs "
+                        "WHERE user_id = %s AND stream = %s AND item_key = %s",
+                        (user_id, stream, item_key),
+                    )
+                    numbered_doc[number_field] = int(cur.fetchone()[0]) + 1
+                    cur.execute(
+                        "INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
+                        "VALUES (%s, %s, %s, %s, %s) RETURNING seq",
+                        (user_id, stream, ts, item_key, Jsonb(numbered_doc)),
+                    )
+                    seq = cur.fetchone()[0]
+    except Exception as e:
+        log.error("[db] log_append_numbered(%s,%s,%s) failed: %s",
+                  user_id, stream, item_key, e)
+        return None
+
+    from tee_shadow import mirror
+    mirror.execute(
+        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (user_id, stream, seq) DO NOTHING",
+        (user_id, stream, seq, ts, item_key, Jsonb(numbered_doc)),
+    )
+    return numbered_doc
+
+
 def log_read(user_id: str, stream: str, limit: int = 100, since_epoch: float = 0.0) -> list[dict]:
     """Return log docs in chronological (seq) order. When ``limit`` > 0 returns
     the newest ``limit`` rows (still chronological). ``since_epoch`` filters on

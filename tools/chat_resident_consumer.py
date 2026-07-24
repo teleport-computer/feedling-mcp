@@ -94,6 +94,7 @@ import io
 import json
 import logging
 import os
+import queue
 import re
 import shlex
 import shutil
@@ -922,6 +923,52 @@ def _post_debug_trace_event(payload: dict) -> None:
         pass  # observability must never affect the turn
 
 
+def _post_provider_attempts(payload: dict) -> None:
+    """Persist provider-attempt metadata without touching the debug trace ring."""
+    try:
+        resp = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/debug/trace/event",
+            json=payload,
+            headers=_HEADERS,
+            timeout=2,
+        )
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 -- ledger delivery never breaks a turn
+        log.warning("provider attempt ledger post failed: %s", type(exc).__name__)
+
+
+_PROVIDER_ATTEMPT_QUEUE: queue.Queue[dict] = queue.Queue(maxsize=256)
+_PROVIDER_ATTEMPT_WORKER_STARTED = False
+_PROVIDER_ATTEMPT_WORKER_LOCK = threading.Lock()
+
+
+def _provider_attempt_worker() -> None:
+    while True:
+        payload = _PROVIDER_ATTEMPT_QUEUE.get()
+        try:
+            _post_provider_attempts(payload)
+        finally:
+            _PROVIDER_ATTEMPT_QUEUE.task_done()
+
+
+def _queue_provider_attempt_ledger(attempts: list[dict]) -> None:
+    global _PROVIDER_ATTEMPT_WORKER_STARTED
+    if not attempts:
+        return
+    try:
+        if not _PROVIDER_ATTEMPT_WORKER_STARTED:
+            with _PROVIDER_ATTEMPT_WORKER_LOCK:
+                if not _PROVIDER_ATTEMPT_WORKER_STARTED:
+                    threading.Thread(
+                        target=_provider_attempt_worker,
+                        daemon=True,
+                    ).start()
+                    _PROVIDER_ATTEMPT_WORKER_STARTED = True
+        _PROVIDER_ATTEMPT_QUEUE.put_nowait({"provider_attempts": attempts})
+    except Exception as exc:  # noqa: BLE001 -- ledger delivery never breaks a turn
+        log.warning("provider attempt ledger dispatch failed: %s", type(exc).__name__)
+
+
 # Short-TTL cache of whether debug-trace recording is enabled (per-user gate AND
 # deploy kill-switch both true). Lets the hot path (`_emit_debug_trace`) skip
 # all work — including spawning a thread — on every turn while it's off,
@@ -1586,7 +1633,12 @@ def _poll_decrypt_limit(decrypt_since: float, last_ts: float, poll_messages: lis
     return max(50, 2 * len(poll_messages) + 20)
 
 
-def _filter_messages_to_poll_ids(messages: list[dict], poll_messages: list[dict]) -> list[dict]:
+def _filter_messages_to_poll_ids(
+    messages: list[dict],
+    poll_messages: list[dict],
+    *,
+    last_ts: float | None = None,
+) -> list[dict]:
     """Keep only decrypted rows that this poll cycle actually claimed.
 
     /v1/chat/poll is the server-side responder lease. Decrypted history may
@@ -1594,18 +1646,37 @@ def _filter_messages_to_poll_ids(messages: list[dict], poll_messages: list[dict]
     claimed by another responder, so the resident must not treat history as the
     source of work ownership.
     """
-    poll_ids = {
-        str(m.get("id") or m.get("message_id") or "").strip()
+    poll_by_id = {
+        str(m.get("id") or m.get("message_id") or "").strip(): m
         for m in poll_messages
         if isinstance(m, dict)
     }
+    poll_by_id.pop("", None)
+    poll_ids = set(poll_by_id)
     poll_ids.discard("")
     if not poll_ids:
         return messages
-    return [
-        m for m in messages
-        if str(m.get("id") or m.get("message_id") or "").strip() in poll_ids
-    ]
+    filtered: list[dict] = []
+    for message in messages:
+        message_id = str(message.get("id") or message.get("message_id") or "").strip()
+        if message_id not in poll_ids:
+            continue
+        if last_ts is None:
+            filtered.append(message)
+            continue
+        poll_message = poll_by_id[message_id]
+        try:
+            poll_ts = float(
+                poll_message.get("ts", poll_message.get("timestamp", 0)) or 0
+            )
+        except (TypeError, ValueError):
+            poll_ts = 0.0
+        marked = dict(message)
+        marked["_provider_attempt_trigger"] = (
+            "redelivery" if poll_ts <= last_ts else "first"
+        )
+        filtered.append(marked)
+    return filtered
 
 
 # The chat cursor wedges when /v1/chat/poll keeps claiming message ids the enclave
@@ -4363,6 +4434,166 @@ def _pi_turn_metrics(raw: str) -> dict:
             "cost_usd": round(cost, 6)}
 
 
+_PROVIDER_ATTEMPT_TRIGGERS = frozenset({"first", "stream_cut_retry", "redelivery"})
+_PROVIDER_REQUEST_ID_KEYS = frozenset({
+    "provider_request_id", "providerRequestId", "request_id", "requestId",
+})
+_PROVIDER_REQUEST_ID_RE = re.compile(
+    r"(?:provider[ _-]?)?request[ _-]?id\s*[:=]\s*[\(\"']?"
+    r"([A-Za-z0-9._:/-]{6,256})",
+    re.I,
+)
+
+
+def _provider_request_id(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in _PROVIDER_REQUEST_ID_KEYS:
+            candidate = value.get(key)
+            if isinstance(candidate, (str, int)):
+                text = str(candidate).strip()
+                if text:
+                    return text[:256]
+        for nested in value.values():
+            found = _provider_request_id(nested)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = _provider_request_id(nested)
+            if found:
+                return found
+    return ""
+
+
+def _provider_request_id_from_text(value: str) -> str:
+    match = _PROVIDER_REQUEST_ID_RE.search(value or "")
+    return match.group(1)[:256] if match else ""
+
+
+def _provider_attempt_error_class(text: str, *, returncode: int = 0) -> str:
+    lowered = (text or "").lower()
+    if _PI_STREAM_CUT_RE.search(text or ""):
+        return "stream_cut"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "timeout"
+    if "429" in lowered or "rate limit" in lowered:
+        return "rate_limit"
+    if "insufficient_quota" in lowered or "credit balance" in lowered:
+        return "quota"
+    if "401" in lowered or "403" in lowered or "invalid key" in lowered:
+        return "provider_auth"
+    if "connection" in lowered or "network" in lowered or "dns" in lowered:
+        return "network"
+    if returncode:
+        return "cli_exit"
+    return "provider_error"
+
+
+def _usage_tokens(usage: Any, *keys: str) -> int | None:
+    if not isinstance(usage, dict):
+        return None
+    for key in keys:
+        if key not in usage:
+            continue
+        try:
+            return max(0, int(usage[key]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _pi_provider_attempt_rows(
+    raw: str,
+    *,
+    parent_message_id: str,
+    trigger: str,
+    ts: float,
+) -> list[dict]:
+    rows: list[dict] = []
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict) or str(obj.get("type") or "") != "message_end":
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict) or str(msg.get("role") or "") != "assistant":
+            continue
+        usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else obj.get("usage")
+        stop_reason = str(msg.get("stopReason") or obj.get("stopReason") or "").lower()
+        error_text = str(msg.get("errorMessage") or obj.get("errorMessage") or "")
+        outcome = (
+            _provider_attempt_error_class(error_text or json.dumps(obj, ensure_ascii=False))
+            if stop_reason == "error" or error_text
+            else "ok"
+        )
+        rows.append({
+            "parent_message_id": parent_message_id,
+            "trigger": trigger,
+            "provider_request_id": (
+                _provider_request_id(msg)
+                or _provider_request_id(obj)
+                or _provider_request_id_from_text(error_text)
+            ),
+            "usage": {
+                "input_tokens": _usage_tokens(usage, "input", "input_tokens", "prompt_tokens"),
+                "output_tokens": _usage_tokens(usage, "output", "output_tokens", "completion_tokens"),
+            },
+            "outcome": outcome,
+            "ts": ts,
+        })
+    if len(rows) == 1 and not rows[0]["provider_request_id"]:
+        rows[0]["provider_request_id"] = _provider_request_id_from_text(raw)
+    return rows
+
+
+def _provider_attempt_rows_for_result(
+    cmd: list[str],
+    result: "subprocess.CompletedProcess",
+    *,
+    parent_message_id: str,
+    trigger: str,
+    ts: float | None = None,
+) -> list[dict]:
+    recorded_at = ts or time.time()
+    normalized_trigger = trigger if trigger in _PROVIDER_ATTEMPT_TRIGGERS else "first"
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    if _is_pi_cmd(cmd):
+        rows = _pi_provider_attempt_rows(
+            stdout,
+            parent_message_id=parent_message_id,
+            trigger=normalized_trigger,
+            ts=recorded_at,
+        )
+        if rows:
+            return rows
+    metrics = _cli_turn_metrics(cmd, result, 0)
+    raw = f"{stdout}\n{stderr}"
+    return [{
+        "parent_message_id": parent_message_id,
+        "trigger": normalized_trigger,
+        "provider_request_id": (
+            next(
+                (
+                    found
+                    for obj in _json_objects_from_cli_output(stdout)
+                    if (found := _provider_request_id(obj))
+                ),
+                "",
+            )
+            or _provider_request_id_from_text(stderr)
+        ),
+        "usage": {
+            "input_tokens": metrics.get("input_tokens"),
+            "output_tokens": metrics.get("output_tokens"),
+        },
+        "outcome": (
+            "ok"
+            if result.returncode == 0
+            else _provider_attempt_error_class(raw, returncode=result.returncode)
+        ),
+        "ts": recorded_at,
+    }]
+
+
 def _extract_text_from_cli_output(raw: str) -> str:
     """Best-effort extraction from raw CLI stdout.
 
@@ -5930,6 +6161,7 @@ def call_agent_cli(
     raw_text: bool = False,
     trace_id: str = "",
     lane: str = "background",
+    attempt_trigger: str = "first",
 ) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
@@ -5998,9 +6230,42 @@ def call_agent_cli(
         # claude/codex: the prompt was stripped from argv by _render_cli_template
         # and travels on stdin instead (multi-line text must not ride cmd.exe).
         _run_kwargs["input"] = stdin_msg
+    ledger_enabled = bool(trace_id and lane == "chat")
+    normalized_attempt_trigger = (
+        attempt_trigger if attempt_trigger in _PROVIDER_ATTEMPT_TRIGGERS else "first"
+    )
     try:
         result = subprocess.run(cmd, **_run_kwargs)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        if ledger_enabled:
+            def _timeout_text(value: Any) -> str:
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", errors="replace")
+                return str(value or "")
+
+            timeout_stdout = _timeout_text(getattr(exc, "stdout", ""))
+            timeout_stderr = _timeout_text(getattr(exc, "stderr", ""))
+            timeout_rows = (
+                _pi_provider_attempt_rows(
+                    timeout_stdout,
+                    parent_message_id=trace_id,
+                    trigger=normalized_attempt_trigger,
+                    ts=time.time(),
+                )
+                if _is_pi_cmd(cmd)
+                else []
+            )
+            timeout_rows.append({
+                "parent_message_id": trace_id,
+                "trigger": normalized_attempt_trigger,
+                "provider_request_id": _provider_request_id_from_text(
+                    f"{timeout_stdout}\n{timeout_stderr}"
+                ),
+                "usage": {"input_tokens": None, "output_tokens": None},
+                "outcome": "timeout",
+                "ts": time.time(),
+            })
+            _queue_provider_attempt_ledger(timeout_rows)
         _emit_debug_trace("agent", "agent.model.call.error", status="error", trace_id=trace_id,
                           dur_ms=(time.monotonic() - _turn_t0) * 1000,
                           summary="cli turn timeout",
@@ -6072,6 +6337,13 @@ def call_agent_cli(
         },
         content_excerpt=_excerpt,
     )
+    if ledger_enabled:
+        _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
+            cmd,
+            result,
+            parent_message_id=trace_id,
+            trigger=normalized_attempt_trigger,
+        ))
 
     raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
     if _is_pi_cmd(cmd):
@@ -6123,6 +6395,13 @@ def call_agent_cli(
             if stdin_msg is not None:
                 _run_kwargs["input"] = stdin_msg
             result = subprocess.run(cmd, **_run_kwargs)
+            if ledger_enabled:
+                _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
+                    cmd,
+                    result,
+                    parent_message_id=trace_id,
+                    trigger=normalized_attempt_trigger,
+                ))
             _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
             raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
             # Persist the fresh session so the NEXT turn resumes it — but ONLY
@@ -6169,6 +6448,13 @@ def call_agent_cli(
                 explain="上游把流式回复中途掐断(无 finish_reason)——立即重试本轮一次",
             )
             result = subprocess.run(cmd, **_run_kwargs)
+            if ledger_enabled:
+                _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
+                    cmd,
+                    result,
+                    parent_message_id=trace_id,
+                    trigger="stream_cut_retry",
+                ))
             _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
             raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
             if observed_sid:
@@ -6420,6 +6706,7 @@ def call_agent(
     raw_text: bool = False,
     trace_id: str = "",
     lane: str = "background",
+    attempt_trigger: str = "first",
 ) -> Any:
     if AGENT_MODE == "http":
         # http path metrics/timing are out of scope for this event pair (cli-only);
@@ -6429,7 +6716,7 @@ def call_agent(
     elif AGENT_MODE == "cli":
         raw = call_agent_cli(
             message, image_paths=image_paths, raw_text=raw_text,
-            trace_id=trace_id, lane=lane)
+            trace_id=trace_id, lane=lane, attempt_trigger=attempt_trigger)
     else:
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
@@ -11467,6 +11754,9 @@ def _process_messages(messages: list) -> float:
             log.info("user message [ts=%.3f]: %s", ts, content[:80])
 
         trace_id = str(msg.get("id") or msg.get("message_id") or "").strip()
+        attempt_trigger = str(msg.get("_provider_attempt_trigger") or "first")
+        if attempt_trigger not in _PROVIDER_ATTEMPT_TRIGGERS:
+            attempt_trigger = "first"
 
         screen_text, screen_payloads, screen_paths = _screen_context_for_message(content)
         screen_attached = bool(screen_payloads or screen_paths)
@@ -11532,6 +11822,11 @@ def _process_messages(messages: list) -> float:
         content = _foreground_agent_message(content, current_ts=ts)
 
         use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
+        attempt_kwargs = (
+            {"attempt_trigger": attempt_trigger}
+            if attempt_trigger != "first"
+            else {}
+        )
         # 本回合失败时待发的 system 通知。不在失败当场发，而是等下面的回复写入被
         # 服务端接受（posted_any）后再发（Codex review）：claim 过期 failover 时另
         # 一个 consumer 已回复，本家的兜底会被 already_answered 409 拒——通知若先
@@ -11546,7 +11841,8 @@ def _process_messages(messages: list) -> float:
             if use_runtime_v2:
                 agent_result = call_agent(
                     _resident_foreground_chat_message_v2(content),
-                    trace_id=trace_id, lane="chat")
+                    trace_id=trace_id, lane="chat",
+                    **attempt_kwargs)
             elif image_payloads or image_paths:
                 agent_result = call_agent(
                     content,
@@ -11554,9 +11850,15 @@ def _process_messages(messages: list) -> float:
                     image_paths=image_paths,
                     trace_id=trace_id,
                     lane="chat",
+                    **attempt_kwargs,
                 )
             else:
-                agent_result = call_agent(content, trace_id=trace_id, lane="chat")
+                agent_result = call_agent(
+                    content,
+                    trace_id=trace_id,
+                    lane="chat",
+                    **attempt_kwargs,
+                )
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
             # Codex review I10: call_agent raised, so the prompt (catalog
@@ -12971,7 +13273,11 @@ def run() -> None:
                             last_ts = pts
                             _save_checkpoint(last_ts)
                     continue
-                messages = _filter_messages_to_poll_ids(decrypted, poll_messages)
+                messages = _filter_messages_to_poll_ids(
+                    decrypted,
+                    poll_messages,
+                    last_ts=last_ts,
+                )
                 if not messages:
                     # Claimed ids weren't in the decrypt history — the messages
                     # exist and were leased but can't be read: a read failure,
@@ -13010,7 +13316,11 @@ def run() -> None:
             else:
                 # No decrypt source — fall through with poll content (will be
                 # empty for v1 encrypted messages, skipped in _process_messages).
-                messages = poll_messages
+                messages = _filter_messages_to_poll_ids(
+                    poll_messages,
+                    poll_messages,
+                    last_ts=last_ts,
+                )
 
             new_ts = _process_messages(messages)
             if new_ts > last_ts:

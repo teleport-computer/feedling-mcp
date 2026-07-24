@@ -6,6 +6,7 @@ import itertools
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -648,6 +649,26 @@ def test_detail_payload_runtime_includes_reasoning_effort(client):
     row = data_track._build_data_track_user(user_entry, include_detail=True)
 
     assert row["runtime"]["reasoning_effort"] == "medium"
+
+
+def test_provider_attempts_detail_is_bounded_and_reports_more(monkeypatch):
+    rows = [{"attempt_n": n} for n in range(1, 202)]
+    calls = []
+
+    def fake_log_read(user_id, stream, limit):
+        calls.append((user_id, stream, limit))
+        return rows
+
+    monkeypatch.setattr(_dt.db, "log_read", fake_log_read)
+
+    detail = _dt._provider_attempts_detail(SimpleNamespace(user_id="usr_ledger"))
+
+    assert calls == [("usr_ledger", "provider_attempts", 201)]
+    assert detail["coverage"] == "chat_turns_only"
+    assert detail["has_more"] is True
+    assert len(detail["attempts"]) == 200
+    assert detail["attempts"][0]["attempt_n"] == 2
+    assert detail["attempts"][-1]["attempt_n"] == 201
 
 
 def test_perception_permissions_block_renders_granted_denied_and_switches():
