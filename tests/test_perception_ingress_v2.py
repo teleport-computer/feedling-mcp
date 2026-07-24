@@ -607,3 +607,61 @@ def test_compatibility_job_adapter_preserves_presence_hints():
     assert event.source == "perception_event"
     assert event.presence_hints == {"entered_anchor": "home"}
     assert event.origin_refs == ("ios_report:location_signal",)
+
+
+def test_report_decrypts_context_snapshot_even_for_resident_chat_users(monkeypatch):
+    """HOTFIX 2026-07-25 回归钉。
+
+    PR #107 把 report 的 context_snapshot 分叉绑到 chat runtime fence——
+    resident-chat 用户(≈全 prod)掉进 legacy 不解密路径:加密信封(location/
+    calendar/playback/health)没人解密,state 值全空而 freshness ts 照走,
+    agent 看到 null(usr_450e 报障,全 prod trace 零 perception:* 解密)。
+    上报合同是全量 v2 加密的——解密永远发生,与 chat fence 无关。此测试钉住:
+    即使 fence 判 legacy,report 也必须走 v2 ingest 并解出明文进 state。
+    """
+    from perception import perception_read_core
+
+    fake = _Store()
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
+    monkeypatch.setattr(service, "_fire_wake_event_v2", lambda event: None)
+    # chat fence 说 resident/legacy —— 解密必须照样发生
+    monkeypatch.setattr(
+        service, "perception_ingress_runtime_v2_enabled", lambda s: False)
+
+    calls = []
+
+    def fake_decrypt(envelope, api_key, *, purpose):
+        calls.append((purpose, api_key))
+        return json.dumps({
+            "values": {
+                "output_type": "bluetooth",
+                "is_bluetooth": True,
+                "device_name": "AirPods",
+            },
+            "message": "audio fresh",
+        }).encode("utf-8")
+
+    monkeypatch.setattr(
+        service.core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)
+
+    user_store = SimpleNamespace(user_id="u_resident_decrypt")
+    body, status = perception_read_core.report(
+        user_store,
+        {
+            "context_snapshot": [
+                {"key": "audio_route", "envelope": {"id": "env_a1"}, "changed": True},
+            ],
+            "client_ts": 100.0,
+        },
+        api_key="user-api-key",
+    )
+
+    assert status == 200
+    assert body["results"]["audio_route"] == "accepted"
+    # 解密真的发生了(经 enclave,带用户 key、按 purpose 归因)
+    assert calls == [("perception:audio_route", "user-api-key")]
+    # 明文值展开进 state —— agent 拉 snapshot 不再是 null
+    state = fake.get_state("u_resident_decrypt")
+    assert state["output_type"]["v"] == "bluetooth"
+    assert state["device_name"]["v"] == "AirPods"

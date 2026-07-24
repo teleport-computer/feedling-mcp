@@ -557,19 +557,26 @@ def test_ingest_snapshot_null_records_unavailable(env):
 
 
 def test_report_endpoint_context_snapshot(env, monkeypatch):
-    """End-to-end through the /report route with the context_snapshot body."""
-    import sys
-    import types
+    """End-to-end through the /report route with the context_snapshot body.
 
+    HOTFIX 2026-07-25:/report 恒走 v2 ingest(perception_read_core.report)。
+    v2 合同下明文的敏感信号(motion_state)被拒——现网 iOS 全走加密信封,
+    明文只有老客户端/老测试会发;明文合法的信号(focus)照常落 state。"""
     fake, _ = env
 
     client = _PerceptionClient(fake)
     r = client.post("/v1/perception/report", json={"context_snapshot": [
+        {"key": "focus", "data": json.dumps(
+            {"authorization_status": "authorized", "focused": True})},
         {"key": "motion_state", "data": json.dumps({"state": "walking"})},
     ]})
     assert r.status_code == 200
-    assert r.get_json()["results"]["motion_state"] == "accepted"
-    assert fake.get_state(UID)["motion_state"]["v"] == {"state": "walking"}
+    body = r.get_json()["results"]
+    assert body["focus"] == "accepted"
+    assert fake.get_state(UID)["in_focus"]["v"] is True
+    # v2 合同:敏感信号必须加密,明文被拒(不再静默收明文)
+    assert body["motion_state"] == "invalid_plaintext_sensitive_signal"
+    assert "motion_state" not in fake.get_state(UID)
 
     # missing context_snapshot -> 400
     bad = client.post("/v1/perception/report", json={"signals": {}})
