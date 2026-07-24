@@ -8037,6 +8037,56 @@ def _proactive_tick_interval_for_broadcast_state(
     return max(60, PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC)
 
 
+def _next_proactive_tick_delay_sec(
+    decision: dict[str, Any] | None,
+    broadcast_state: str,
+    *,
+    now: float | None = None,
+) -> float:
+    """Seconds until the next heartbeat tick, aligned to the server-side gate.
+
+    The backend's heartbeat throttle (gate ①, 2026-07-24) returns
+    ``heartbeat_next_tick_at`` (server-clock epoch) on every tick decision —
+    including throttled ones. Aligning to it fixes two waste modes the local
+    interval alone can't see:
+
+    - restart amnesia: this process's tick clock lives in memory, and host-all
+      consumers are recycled minutes-apart. Before the gate, every restart fired
+      an opening tick 15s in (the 2026-07-22 heartbeat flood, TOP user 467/day).
+      Now the first tick may come back ``heartbeat_throttled`` — instead of
+      retrying on the full local interval (or hammering), sleep exactly until
+      the gate opens.
+    - interval drift: after an admitted heartbeat the gate advances to
+      now+interval, so aligning is equivalent to the local schedule — but if the
+      user shrinks their interval mid-cycle the next decision reflects it
+      immediately.
+
+    Server epoch vs local clock skew is tolerated: the value is used as a
+    relative delay from the *response*, so only inter-host skew (small vs the
+    900s minimum interval) matters, and the server gate stays authoritative
+    regardless. Missing/zero/past field (old backend, first-ever heartbeat) →
+    fall back to the local per-user interval, the pre-② behaviour.
+    """
+    decision = decision if isinstance(decision, dict) else {}
+    fallback = float(_proactive_tick_interval_for_broadcast_state(
+        broadcast_state, decision.get("wake_interval_sec")
+    ))
+    try:
+        gate_at = float(decision.get("heartbeat_next_tick_at") or 0.0)
+    except (TypeError, ValueError):
+        return fallback
+    if gate_at <= 0:
+        return fallback
+    wait = gate_at - (time.time() if now is None else float(now))
+    if wait <= 0:
+        # Gate already open (or skewed into the past): the local interval still
+        # paces us; the server gate would re-throttle a genuinely-early tick.
+        return fallback
+    # Never tick before the gate opens (that tick is a guaranteed throttle), and
+    # keep a 60s floor so a nearly-open gate doesn't busy-loop.
+    return max(60.0, wait)
+
+
 def post_proactive_tick(payload: dict[str, Any] | None = None) -> dict:
     url = f"{FEEDLING_API_URL}/v1/proactive/tick"
     resp = _HTTP.post(url, json=payload or {}, headers=_HEADERS, timeout=30)
@@ -12768,8 +12818,13 @@ def run() -> None:
                         last_broadcast_state = str(
                             decision.get("broadcast_state") or last_broadcast_state or ""
                         ).strip().lower()
-                        next_interval = _proactive_tick_interval_for_broadcast_state(
-                            last_broadcast_state, decision.get("wake_interval_sec")
+                        # ② heartbeat governance: align the next tick to the
+                        # server-side gate (decision.heartbeat_next_tick_at) so a
+                        # restarted process doesn't re-tick early and a throttled
+                        # tick sleeps exactly until the gate opens. Falls back to
+                        # the local per-user interval on old backends.
+                        next_interval = _next_proactive_tick_delay_sec(
+                            decision, last_broadcast_state
                         )
                         log.info(
                             "proactive wake tick wake=%s reason=%s enqueued=%s frames=%d broadcast=%s next=%ds",
@@ -12778,7 +12833,7 @@ def run() -> None:
                             bool(tick.get("enqueued")),
                             len(decision.get("frame_ids") or []),
                             last_broadcast_state or "unknown",
-                            next_interval,
+                            int(next_interval),
                         )
                         next_proactive_tick_mono = time.monotonic() + next_interval
                     if screen_watch_enabled and time.monotonic() >= next_screen_watch_mono:

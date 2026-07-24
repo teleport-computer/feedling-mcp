@@ -5076,6 +5076,48 @@ def test_proactive_tick_cadence_decoupled_from_broadcast_state(monkeypatch):
     assert crc._proactive_tick_trigger_for_broadcast_state("mystery") == "heartbeat_unknown"
 
 
+# ---------------------------------------------------------------------------
+# ② heartbeat governance (2026-07-24): the next tick aligns to the server-side
+# gate (decision.heartbeat_next_tick_at). Fixes restart amnesia — the local
+# tick clock lives in process memory, host-all consumers are recycled
+# minutes-apart, and every restart used to fire an opening tick 15s in (the
+# 2026-07-22 heartbeat flood). A throttled tick now sleeps exactly until the
+# gate opens; old backends without the field keep the local-interval behaviour.
+# ---------------------------------------------------------------------------
+
+def test_next_tick_delay_aligns_to_server_gate(monkeypatch):
+    monkeypatch.setattr(crc, "PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", 7200)
+    now = 1_000_000.0
+    # throttled tick: gate opens in 300s → sleep 300s, not the 7200s interval
+    decision = {"wake_interval_sec": 7200, "heartbeat_next_tick_at": now + 300}
+    assert crc._next_proactive_tick_delay_sec(decision, "off", now=now) == 300.0
+    # admitted tick: gate advanced to now+interval → equivalent to local pacing
+    decision = {"wake_interval_sec": 7200, "heartbeat_next_tick_at": now + 7200}
+    assert crc._next_proactive_tick_delay_sec(decision, "off", now=now) == 7200.0
+
+
+def test_next_tick_delay_falls_back_without_gate_field(monkeypatch):
+    monkeypatch.setattr(crc, "PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", 7200)
+    now = 1_000_000.0
+    # old backend: no field → local per-user interval (pre-② behaviour)
+    assert crc._next_proactive_tick_delay_sec(
+        {"wake_interval_sec": 1800}, "off", now=now) == 1800.0
+    # gate in the past / zero / garbage → same fallback
+    for stale in (0, now - 50, "not-a-number", None):
+        d = {"wake_interval_sec": 1800, "heartbeat_next_tick_at": stale}
+        assert crc._next_proactive_tick_delay_sec(d, "off", now=now) == 1800.0
+    # no decision at all (network error path)
+    assert crc._next_proactive_tick_delay_sec(None, "off", now=now) == 7200.0
+
+
+def test_next_tick_delay_keeps_60s_floor(monkeypatch):
+    monkeypatch.setattr(crc, "PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", 7200)
+    now = 1_000_000.0
+    # nearly-open gate must not busy-loop the tick
+    decision = {"wake_interval_sec": 7200, "heartbeat_next_tick_at": now + 5}
+    assert crc._next_proactive_tick_delay_sec(decision, "off", now=now) == 60.0
+
+
 def test_fire_scheduled_wakes_posts_backend_endpoint(monkeypatch):
     captured = {}
 
