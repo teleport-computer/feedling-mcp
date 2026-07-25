@@ -1,0 +1,14 @@
+# deploy/redis/Dockerfile.backup — 备份 sidecar。
+#
+# 基底刻意用与 Redis 服务端完全相同的 digest：redis-cli 与服务端同版本
+# （8.8.0），不会出现 cli 老于 server 的 RDB/协议错配。
+# 已实测该基底可 apk 装到 aws-cli 2.32.7 与 age 1.2.1。
+FROM redis:8-alpine@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005
+
+RUN apk add --no-cache aws-cli age ca-certificates
+
+COPY redis/backup-push.sh redis/backup-loop.sh redis/restore.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/backup-push.sh /usr/local/bin/backup-loop.sh \
+    /usr/local/bin/restore.sh
+
+ENTRYPOINT ["/usr/local/bin/backup-loop.sh"]

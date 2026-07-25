@@ -1,0 +1,82 @@
+# deploy/redis/docker-compose.e2e.yaml — 本地端到端演练用（不用于部署）。
+#
+# 只给 deploy/redis/e2e-drill.sh 用：真 Redis + 真 age + 真 S3 兼容存储
+# (MinIO 冒充 R2)，验证「写数据 → 备份 → 恢复 → 校验」全链路。跟生产
+# compose（deploy/docker-compose.phala.redis.yaml）的区别只有两处：
+#   - redis/backup 用 build: 本地构建镜像，而非 image: 拉 ghcr 发布版；
+#   - 多一个 minio 服务冒充 R2。
+# 其余环境变量与卷/健康检查形态刻意跟生产保持一致，drill 才有代表性。
+#
+# 显式命名 default 网络：docker compose 在不同版本间对隐式网络命名
+# （下划线/连字符）不一致，e2e-drill.sh 里一次性容器要用 --network 挂进来，
+# 名字必须是确定的，不能靠猜「<project>_default」。
+name: feedling-redis-e2e
+networks:
+  default:
+    name: feedling-redis-e2e-net
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --address ":9000"
+    environment:
+      MINIO_ROOT_USER: e2eaccess
+      MINIO_ROOT_PASSWORD: e2esecret123
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    build:
+      context: ..
+      dockerfile: redis/Dockerfile
+    environment:
+      REDIS_PASSWORD: e2epassword0123456789abcdef
+      # 自签证书由 e2e-drill.sh 生成后注入（gen-certs.sh 的真实产出）。
+      REDIS_TLS_CERT_B64: "${E2E_CERT_B64}"
+      REDIS_TLS_KEY_B64: "${E2E_KEY_B64}"
+      REDIS_MAXMEMORY: 256mb
+      REDIS_BACKUP_S3_PREFIX: e2e/redis/
+      REDIS_BACKUP_AGE_RECIPIENT: "${E2E_AGE_RECIPIENT}"
+      REDISCLI_AUTH: e2epassword0123456789abcdef
+    volumes:
+      - redisdata:/data
+      - redissock:/var/run/redis
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -s /var/run/redis/redis.sock ping | grep -q PONG"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  backup:
+    build:
+      context: ..
+      dockerfile: redis/Dockerfile.backup
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      REDISCLI_AUTH: e2epassword0123456789abcdef
+      REDIS_BACKUP_S3_PREFIX: e2e/redis/
+      REDIS_BACKUP_AGE_RECIPIENT: "${E2E_AGE_RECIPIENT}"
+      REDIS_BACKUP_BUCKET: e2e-bucket
+      AWS_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: e2eaccess
+      AWS_SECRET_ACCESS_KEY: e2esecret123
+      AWS_REGION: auto
+      AWS_DEFAULT_REGION: auto
+      # 演练不等一小时：跑完 boot 兜底那一轮就退出（见 backup-loop.sh
+      # 的 INTERVAL="0" 测试钩子）。
+      BACKUP_INTERVAL_SEC: "0"
+    volumes:
+      # 跟生产一致：sidecar 从不挂 redisdata，快照走 redis-cli --rdb
+      # 经 unix socket（D4），绝不直接读卷内文件。
+      - redissock:/var/run/redis
+
+volumes:
+  redisdata:
+  redissock:

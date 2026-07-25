@@ -1,0 +1,65 @@
+# deploy/docker-compose.phala.redis.yaml — feedling-redis-{test,pre,prod} CVM
+#
+# 部署（首次开通见 DEPLOYMENTS.md runbook；日常用 redis-deploy workflow）：
+#   phala deploy --cvm-id <id> -c deploy/docker-compose.phala.redis.yaml -e KEY=VAL ... --wait
+#
+# 约定（与本仓其它 phala compose 一致）：
+#  - 所有机密走 "${VAR:-}"（加密 env 注入，不烧 compose_hash）；必填校验在
+#    entrypoint fail-closed（deploy/redis/entrypoint-wrapper.sh）。
+#  - 独立 CVM + `--kms phala` 身份（按部署账号授权，无链上 AppAuth，
+#    同 TEE Postgres，见 docs/TEE_POSTGRES_SHADOW_PROVISIONING.md §0）；
+#    绝不复用主 app 的 AppAuth 合约。不进 merge 自动部署。
+#  - 三环境共用本文件，差异（maxmemory / 备份前缀 / 口令）全在注入的 env 里。
+name: feedling-redis
+services:
+  redis:
+    image: ghcr.io/teleport-computer/feedling-redis:REPLACE_SHA
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
+      REDIS_TLS_CERT_B64: "${REDIS_TLS_CERT_B64:-}"
+      REDIS_TLS_KEY_B64: "${REDIS_TLS_KEY_B64:-}"
+      REDIS_MAXMEMORY: "${REDIS_MAXMEMORY:-}"
+      # 备份公钥在这里只用于 entrypoint 的 fail-closed 校验：配了备份前缀
+      # 就必须有公钥，否则拒绝启动（真正做加密的是 backup 容器）。
+      REDIS_BACKUP_S3_PREFIX: "${REDIS_BACKUP_S3_PREFIX:-}"
+      REDIS_BACKUP_AGE_RECIPIENT: "${REDIS_BACKUP_AGE_RECIPIENT:-}"
+      # healthcheck 用；写进 argv 会让口令出现在容器内进程列表。
+      REDISCLI_AUTH: "${REDIS_PASSWORD:-}"
+    volumes:
+      - redisdata:/data
+      - redissock:/var/run/redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -s /var/run/redis/redis.sock ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      # 冷启动要加载 AOF；大数据集下比 PG 的 initdb 快得多，30s 足够。
+      start_period: 30s
+
+  backup:
+    image: ghcr.io/teleport-computer/feedling-redis-backup:REPLACE_SHA
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDISCLI_AUTH: "${REDIS_PASSWORD:-}"
+      REDIS_BACKUP_S3_PREFIX: "${REDIS_BACKUP_S3_PREFIX:-}"
+      REDIS_BACKUP_AGE_RECIPIENT: "${REDIS_BACKUP_AGE_RECIPIENT:-}"
+      REDIS_BACKUP_BUCKET: "${REDIS_BACKUP_BUCKET:-io-in-enclave-db}"
+      AWS_ENDPOINT_URL: "${REDIS_BACKUP_R2_ENDPOINT:-}"
+      AWS_ACCESS_KEY_ID: "${REDIS_BACKUP_R2_ACCESS_KEY_ID:-}"
+      AWS_SECRET_ACCESS_KEY: "${REDIS_BACKUP_R2_SECRET_ACCESS_KEY:-}"
+      AWS_REGION: "auto"
+      AWS_DEFAULT_REGION: "auto"
+    volumes:
+      # 只挂 socket 目录：快照走 redis-cli --rdb（一致性快照），
+      # 绝不直接读 /data 里写到一半的 AOF/RDB 文件。
+      - redissock:/var/run/redis
+
+volumes:
+  redisdata:
+  redissock:

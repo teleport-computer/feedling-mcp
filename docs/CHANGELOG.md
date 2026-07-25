@@ -291,6 +291,23 @@
   端口"判据不成立）。
 - 验证：pyflakes 零告警；全量 pytest 与清理前基线对照零新增失败。
 
+## 2026-07-24 — TEE Redis CVM 基础设施（未开通）
+
+三套独立 Redis CVM（test/pre/prod）的全部代码就绪：官方 `redis:8-alpine`
+TLS-only + backup sidecar（每小时 `redis-cli --rdb` 快照 → age 非对称加密 → R2）。
+部署纪律复刻 TEE Postgres：`--kms phala` 身份（无链上 AppAuth）、手动 workflow、
+cvm-id fail-closed、永不并入 merge 自动部署。
+
+**当前零流量**：没有任何业务代码引用 Redis，三台 CVM 也尚未开通
+（cvm-id 文件为空 → workflow 拒绝运行）。缓存 / 队列 / 锁的接入各自另开 spec。
+
+关键决策见 `docs/superpowers/specs/2026-07-24-tee-redis-cvm-design.md`：
+`noeviction`（避免静默驱逐锁与队列）、sidecar 而非内嵌镜像、显式 sleep 循环
+而非 cron（PG 2026-07-14 cron PATH 静默失败的教训）、`redis-cli --rdb` 而非
+拷卷文件、age 非对称加密（备份机被攻破也解不了历史备份）。
+
+首次开通 runbook 见 `deploy/DEPLOYMENTS.md`「TEE Redis」章节。
+
 ## 2026-07-22
 
 ### [DONE] Task 11 — 双运行时部署拓扑：serve-worker 并入主 CVM，runner 回 V1-only
