@@ -2168,8 +2168,9 @@ def test_wake_turn_system_prompt_states_the_live_third_party_model(monkeypatch):
     assert "deepseek-chat" in system["content"]
 
 
-def test_official_route_chat_turn_keeps_the_system_prompt_free_of_identity_text(monkeypatch):
-    """官方直连时 agent 自称 Claude 就是事实——不注入，也不动 prompt 缓存前缀。"""
+def test_official_route_chat_turn_also_pins_the_exact_model_id(monkeypatch):
+    """官方直连同样注入：V2 没有 CLI 壳子，不注入时模型会报错版本（实测 anthropic
+    自称 "Claude 3.5 Sonnet"、openai 自称 "GPT-5"）。"""
     uid = "u_w_identity_official"
     conftest.seed_user(uid)
     _reset(uid)
@@ -2184,4 +2185,6 @@ def test_official_route_chat_turn_keeps_the_system_prompt_free_of_identity_text(
     asyncio.run(worker.process_job(
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
-    assert "你的真实身份" not in calls[0]["messages"][0]["content"]
+    system = calls[0]["messages"][0]["content"]
+    assert _BYOK.model in system        # claude-sonnet-4-test，钉死精确型号
+    assert "官方直连" in system          # 走官方文案，不是第三方那套

@@ -28,19 +28,14 @@ def _sanitize_model_name(raw: str) -> str:
 
 
 def _is_official(provider: str, base_url: str) -> bool:
-    """True 仅当该路由按官方原生对待——保持沉默，不注入改写块。
-
-    provider 缺省（空）按官方处理：V2 的 BYOK 路由一定带显式 provider，缺省只出现在
-    legacy/native/default 路径，改写它们会误伤原生身份。
+    """True 当该路由是官方原生 endpoint——用「钉死精确型号」那套文案。
 
     官方 provider（anthropic/openai）的 base_url 为空或等于该 provider 的**默认**
-    endpoint 仍算官方——``validate_config`` 会给官方 provider 也持久化默认 base_url，
-    单纯「非空」不能作判据。只有自定义/非默认 endpoint 才把官方 provider 翻成非官方
-    （中转冒充防御）。非 anthropic/openai 的 provider 一律非官方。
+    endpoint 才算官方——``validate_config`` 会给官方 provider 也持久化默认 base_url，
+    单纯「非空」不能作判据。自定义/非默认 endpoint 把官方 provider 翻成非官方（中转
+    冒充防御，走带反声明的第三方文案）。非 anthropic/openai 的 provider 一律非官方。
     """
     p = provider_client.normalize_provider(provider)
-    if not p:
-        return True
     if p not in {"anthropic", "openai"}:
         return False
     bu = str(base_url or "").strip().rstrip("/")
@@ -49,22 +44,44 @@ def _is_official(provider: str, base_url: str) -> bool:
     return bu == provider_client.default_base_url(p).strip().rstrip("/")
 
 
+_AUTHORITY = (
+    "这条以当前生效的运行时配置为准：它比你的训练印象、对话历史、摘要或记忆里任何关于"
+    "你模型身份的说法都更新、更权威，与它们冲突时一律以本段为准，不要复述旧答案。"
+    "（这不影响你作为陪伴角色的人设——问「你是谁」仍按人设回答，仅「什么模型 / 什么 AI」时说真实模型。）"
+)
+
+
 def override_block(provider: str, model: str, base_url: str) -> str:
-    """特权自称块，或官方原生时返回 ""。
+    """特权自称块；provider 缺省时返回 ""。
+
+    文案分两套。第三方/中转要额外压住「我是 Claude/GPT」的错误自称；官方直连只钉死
+    精确型号——它确实是该厂产品，带反声明会自相矛盾。两套都注入：V2 是裸 API 调用，
+    没有 CLI 壳子提供准确身份，模型对自己的具体版本号往往是错的（2026-07-25 test
+    实测：anthropic 自称 "Claude 3.5 Sonnet"、openai 自称 "GPT-5"）。
 
     自称内容源为配置的 model id（空则回退 provider 名，再回退通用串）。刻意与 persona
     人设解耦：只压「什么模型 / 什么 AI」类元问题，不动「你是谁」的角色扮演。
     """
-    if _is_official(provider, base_url):
+    normalized = provider_client.normalize_provider(provider)
+    if not normalized:
+        # provider 缺省只出现在 legacy/native/default 路径，改写会误伤原生身份。
         return ""
     name = _sanitize_model_name(model) or str(provider or "").strip() or "a third-party model"
+    if _is_official(provider, base_url):
+        return (
+            "## 你的真实身份\n"
+            f"你的底层大模型是 `{name}`（{normalized} 官方直连）。当用户问你是什么模型、"
+            f"哪个版本、用的什么 AI 时，如实回答 `{name}` 这个精确型号，不要说成别的版本号"
+            "或只给系列名。" + _AUTHORITY
+        )
+    # 反声明刻意不写死「不要自称 Claude」：中转卖的常就是 claude-*/gpt-*，清洗后的
+    # id 本身带这些字样，写死会和上一句「如实回答你是 claude-opus-4-6」自相矛盾
+    # （V1 文案的原始毛病）。改成压住「用训练印象替换配置值」这个真正的错误动作。
     return (
         "## 你的真实身份\n"
-        f"你的底层大模型是 `{name}`。当用户问你是什么模型、由谁提供、用的什么 AI 时，"
-        f"如实回答你是 `{name}`；不要声称自己是 Claude、Codex、Anthropic 或 OpenAI 的产品。"
-        "这条以当前生效的运行时配置为准：它比对话历史、摘要或记忆里任何关于你模型身份的"
-        "说法都更新、更权威，与它们冲突时一律以本段为准，不要复述旧答案。"
-        "（这不影响你作为陪伴角色的人设——问「你是谁」仍按人设回答，仅「什么模型 / 什么 AI」时说真实模型。）"
+        f"你的底层大模型是 `{name}`，经第三方 endpoint 接入（不是模型厂商的官方服务）。"
+        f"当用户问你是什么模型、由谁提供、用的什么 AI 时，如实回答 `{name}`，"
+        "不要用训练印象里的其它模型名或厂商替换它。" + _AUTHORITY
     )
 
 
