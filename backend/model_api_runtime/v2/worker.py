@@ -56,6 +56,7 @@ from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
 from core import envelope as core_envelope
+from core import provider_usage
 from core import store as core_store
 from core import wake_bus as core_wake_bus
 from perception.agent_fields import AGENT_PERCEPTION_SIGNALS
@@ -526,6 +527,7 @@ _PRIVATE_READ_TOOLS = frozenset(
         "memory_index",
         "memory_search",
         "memory_fetch",
+        cap_tool_schema.PROVIDER_USAGE_TOOL,
     }
 )
 # Static perception grounding is allowed to coexist with first-round web/MCP/task
@@ -1164,6 +1166,7 @@ async def _dispatch_mixed_tool_calls(
     mcp_timeout_sec: float,
     dispatch_workspace_batch=None,
     dispatch_task_batch=None,
+    dispatch_provider_usage=None,
     prepare_platform_mutation=None,
     prepare_workspace_batch=None,
     mcp_mutation_started=None,
@@ -1207,12 +1210,15 @@ async def _dispatch_mixed_tool_calls(
     mutating_mcp_names = frozenset(str(name) for name in mutating_mcp_names)
     reads: list[tuple[str, Any]] = []
     task_calls: list[Any] = []
+    provider_usage_calls: list[Any] = []
     mutations: list[tuple[str, Any]] = []
     for tc in tool_calls:
         # Mutation policy is authoritative even if a broken duck-typed turn's
         # `handles` metadata disagrees with the tool specs it offered.
         if tc.name == cap_tool_schema.TASK_TOOL:
             task_calls.append(tc)
+        elif tc.name == cap_tool_schema.PROVIDER_USAGE_TOOL:
+            provider_usage_calls.append(tc)
         elif tc.name in mutating_mcp_names:
             mutations.append(("mcp", tc))
         elif mcp_turn.handles(tc.name):
@@ -1433,12 +1439,74 @@ async def _dispatch_mixed_tool_calls(
         )
         return results
 
+    async def _provider_usage_reads() -> list[ToolResult]:
+        if not provider_usage_calls:
+            return []
+        await asyncio.gather(
+            *(
+                _event(tc, "tool_call_started", {"phase": "provider_usage"})
+                for tc in provider_usage_calls
+            )
+        )
+        started_ns = time.monotonic_ns()
+        if dispatch_provider_usage is None:
+            # wake/subagent lanes bind no callable — this tool is never
+            # offered there (Task 5 catalog scoping); a call reaching here
+            # anyway (forged/legacy caller) is refused, not silently routed.
+            results = [
+                ToolResult(call_id=tc.id, content="error: tool_not_allowed")
+                for tc in provider_usage_calls
+            ]
+        else:
+            try:
+                usage_results = await dispatch_provider_usage(provider_usage_calls)
+            except Exception:  # noqa: BLE001 — dispatcher failure stays model-visible
+                results = [
+                    ToolResult(call_id=tc.id, content="error: provider_usage_failed")
+                    for tc in provider_usage_calls
+                ]
+            else:
+                if (
+                    not isinstance(usage_results, (list, tuple))
+                    or len(usage_results) != len(provider_usage_calls)
+                    or any(
+                        not isinstance(result, ToolResult)
+                        or str(result.call_id) != str(tc.id)
+                        for tc, result in zip(provider_usage_calls, usage_results)
+                    )
+                ):
+                    results = [
+                        ToolResult(
+                            call_id=tc.id, content="error: provider_usage_failed"
+                        )
+                        for tc in provider_usage_calls
+                    ]
+                else:
+                    results = list(usage_results)
+        await asyncio.gather(
+            *(
+                _event(
+                    tc,
+                    "tool_call_result",
+                    {
+                        "phase": "provider_usage",
+                        "result": result,
+                        "duration_ms": _duration_ms(started_ns),
+                    },
+                )
+                for tc, result in zip(provider_usage_calls, results)
+            )
+        )
+        return results
+
     results_by_id: dict[str, ToolResult] = {}
     read_future = asyncio.gather(*[_read(kind, tc) for kind, tc in reads])
     task_future = _tasks()
-    read_results, task_results = await asyncio.gather(
+    provider_usage_future = _provider_usage_reads()
+    read_results, task_results, provider_usage_results = await asyncio.gather(
         read_future,
         task_future,
+        provider_usage_future,
     )
     if reads:
         for (_kind, tc), result in zip(reads, read_results):
@@ -1446,7 +1514,10 @@ async def _dispatch_mixed_tool_calls(
     if task_calls:
         for tc, result in zip(task_calls, task_results):
             results_by_id[tc.id] = result
-    if reads or task_calls:
+    if provider_usage_calls:
+        for tc, result in zip(provider_usage_calls, provider_usage_results):
+            results_by_id[tc.id] = result
+    if reads or task_calls or provider_usage_calls:
         _progress("tool_read_phase_complete")
 
     # One ordered sequence across BOTH mutation domains preserves model order.
@@ -2686,6 +2757,50 @@ def _make_task_batch_dispatcher(
                 )
                 for tc in task_calls
             ]
+
+    return _dispatch
+
+
+def _make_provider_usage_dispatcher(
+    *, provider_config
+) -> Callable[[list], Awaitable[list[ToolResult]]]:
+    """Bind the turn's already-decrypted provider_config for provider_usage
+    calls (Task 6). Mirrors ``_make_task_batch_dispatcher``'s closure shape:
+    capture once at turn setup, never re-resolve per call — a second
+    resolution would mean a second decrypt.
+
+    Runs outside the enclave concurrency gate: this function is invoked from
+    the worker's mixed-dispatch layer (`_dispatch_mixed_tool_calls`'s
+    read/task phase), the same layer `_make_task_batch_dispatcher`'s
+    `_dispatch` runs at, which is never wrapped in that gate. The
+    third-party usage-endpoint HTTP call is a plain `await`.
+    """
+
+    async def _dispatch(tool_calls) -> list[ToolResult]:
+        results: list[ToolResult] = []
+        try:
+            halted = await asyncio.to_thread(kill_switch.provider_usage_halted)
+        except Exception:  # noqa: BLE001 — a broken read counts as halted
+            halted = True
+        for tc in tool_calls:
+            if halted:
+                results.append(
+                    ToolResult(call_id=tc.id, content="error: provider_usage_halted")
+                )
+                continue
+            try:
+                payload = await provider_usage.query_usage_async(provider_config)
+                results.append(
+                    ToolResult(
+                        call_id=tc.id,
+                        content=json.dumps(payload, ensure_ascii=False),
+                    )
+                )
+            except Exception:  # noqa: BLE001 — static error, never leak details
+                results.append(
+                    ToolResult(call_id=tc.id, content="error: provider_usage_failed")
+                )
+        return results
 
     return _dispatch
 
@@ -4754,6 +4869,13 @@ async def _run_wake(
             search_halted=wake_search_halted,
             fetch_halted=wake_fetch_halted,
         )
+        # provider_usage is chat-lane only (Task 5 design decision): the
+        # proactive companion never has a user-asked-a-question moment to
+        # answer, so it must never be offered here — unconditionally, not
+        # gated by the kill switch (that gate is chat-lane's Task 6 concern).
+        wake_disabled_tool_names = wake_disabled_web_tool_names | {
+            cap_tool_schema.PROVIDER_USAGE_TOOL
+        }
 
         dispatch_task_batch = _make_task_batch_dispatcher(
             disabled_web_tool_names=wake_disabled_web_tool_names,
@@ -5244,7 +5366,7 @@ async def _run_wake(
             await v2_tool_loop.run_tool_loop(
                 provider_config=provider_config,
                 build_messages=build_messages,
-                disabled_tool_names=wake_disabled_web_tool_names,
+                disabled_tool_names=wake_disabled_tool_names,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
                 fold_new_messages=fold_new_messages,
@@ -6813,8 +6935,25 @@ async def process_job(
             search_halted=web_search_halted,
             fetch_halted=web_fetch_halted,
         )
+        # provider_usage kill switch, offer-time half. This is the chat lane's
+        # own gate (Task 6) — the wake lane withholds the tool unconditionally
+        # (Task 5), never reaching this check. Fail-closed: a broken read
+        # withholds the tool rather than exposing it.
+        try:
+            provider_usage_halted = await asyncio.to_thread(
+                kill_switch.provider_usage_halted
+            )
+        except Exception:  # noqa: BLE001
+            provider_usage_halted = True
+        disabled_provider_usage_tool_names = (
+            frozenset({cap_tool_schema.PROVIDER_USAGE_TOOL})
+            if provider_usage_halted
+            else frozenset()
+        )
         disabled_tool_names_for_turn = (
-            frozenset(disabled_mutation_tool_names) | disabled_web_tool_names
+            frozenset(disabled_mutation_tool_names)
+            | disabled_web_tool_names
+            | disabled_provider_usage_tool_names
         )
         # Shared across every provider round in this chat turn. A per-dispatch
         # budget would reset whenever the model asks for another tool batch and
@@ -6839,6 +6978,11 @@ async def process_job(
             trusted_system_blocks=trusted_system_blocks,
             add_usage=tm.add_call,
             trajectory_recorder=trajectory_recorder,
+        )
+        # Chat-lane only (Task 6): closes over THIS turn's already-decrypted
+        # provider_config, never re-resolved per call.
+        dispatch_provider_usage = _make_provider_usage_dispatcher(
+            provider_config=provider_config
         )
 
         async def _dispatch_tools(tool_calls):
@@ -7082,6 +7226,7 @@ async def process_job(
                 read_parallelism=read_parallelism,
                 mcp_timeout_sec=MCP_TOOL_CALL_TIMEOUT_SEC,
                 dispatch_task_batch=dispatch_task_batch,
+                dispatch_provider_usage=dispatch_provider_usage,
                 prepare_platform_mutation=effect_reservations.prepare,
                 prepare_workspace_batch=effect_reservations.prepare_batch,
                 mcp_mutation_started=_mcp_mutation_started,

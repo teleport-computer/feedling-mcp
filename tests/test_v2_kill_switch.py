@@ -75,3 +75,86 @@ def test_default_on_error_false_on_db_failure(monkeypatch):
 
     monkeypatch.setattr(db, "get_pool", _boom)
     assert kill_switch.turns_halted(default_on_error=False) is False
+
+
+# ------------------------------------------------------- provider usage halt
+
+
+@pytest.fixture(autouse=True)
+def _reset_provider_usage_row():
+    """Mirrors `_reset_control_row` above but for `provider_usage_halted`, so
+    no test's cached value or DB state leaks into the next."""
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_runtime_control SET provider_usage_halted=false, updated_at=now() "
+            "WHERE id=1"
+        )
+    kill_switch._invalidate_provider_usage()
+    yield
+    kill_switch._invalidate_provider_usage()
+
+
+def test_provider_usage_halted_defaults_false():
+    assert kill_switch.provider_usage_halted() is False
+
+
+def test_provider_usage_halted_reads_row(monkeypatch):
+    kill_switch._invalidate_provider_usage()
+    monkeypatch.setattr(kill_switch, "_fetch_provider_usage_halted_row", lambda: (False,))
+    assert kill_switch.provider_usage_halted() is False
+
+
+def test_set_provider_usage_halted_true_then_read_true():
+    kill_switch.set_provider_usage_halted(True)
+    assert kill_switch.provider_usage_halted() is True
+
+
+def test_set_provider_usage_halted_false_resumes():
+    kill_switch.set_provider_usage_halted(True)
+    assert kill_switch.provider_usage_halted() is True
+    kill_switch.set_provider_usage_halted(False)
+    assert kill_switch.provider_usage_halted() is False
+
+
+def test_provider_usage_halted_fail_closed_on_db_error(monkeypatch):
+    def boom():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(kill_switch, "_fetch_provider_usage_halted_row", boom)
+    kill_switch._invalidate_provider_usage()
+    assert kill_switch.provider_usage_halted() is True
+
+
+def test_provider_usage_halted_fail_closed_on_missing_row(monkeypatch):
+    monkeypatch.setattr(kill_switch, "_fetch_provider_usage_halted_row", lambda: None)
+    kill_switch._invalidate_provider_usage()
+    assert kill_switch.provider_usage_halted() is True
+
+
+def test_provider_usage_halted_read_error_is_cached(monkeypatch):
+    calls = {"n": 0}
+
+    def boom():
+        calls["n"] += 1
+        raise RuntimeError("down")
+
+    monkeypatch.setattr(kill_switch, "_fetch_provider_usage_halted_row", boom)
+    kill_switch._invalidate_provider_usage()
+    assert kill_switch.provider_usage_halted() is True
+    assert kill_switch.provider_usage_halted() is True
+    assert calls["n"] == 1
+
+
+def test_provider_usage_halted_never_raises(monkeypatch):
+    def boom():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(kill_switch, "_fetch_provider_usage_halted_row", boom)
+    kill_switch._invalidate_provider_usage()
+    kill_switch.provider_usage_halted()  # must not raise
+
+
+def test_provider_usage_cache_does_not_disturb_turns_halted():
+    before = kill_switch.turns_halted()
+    kill_switch.set_provider_usage_halted(True)
+    assert kill_switch.turns_halted() == before

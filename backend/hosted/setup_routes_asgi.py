@@ -34,8 +34,10 @@ from accounts.auth_core import AuthResult
 from asgi import http as asgi_http
 from asgi import threadpool
 from asgi.deps import require_auth
+from core import provider_usage
 from hosted import config_store
 from hosted import setup_core
+from hosted import usage_core
 
 router = APIRouter()
 
@@ -86,6 +88,17 @@ async def model_api_runtime_status(request: Request, auth: AuthResult = Depends(
     body, status = await threadpool.run_db(
         setup_core.model_api_runtime_status, auth.store, api_key=api_key)
     return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/model_api/usage")
+async def model_api_usage(request: Request, auth: AuthResult = Depends(require_auth)):
+    api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    result = await threadpool.run_db(
+        usage_core.resolve_usage_config, auth.store, api_key=api_key)
+    if isinstance(result, tuple):
+        return JSONResponse(result[1], status_code=400)
+    payload = await provider_usage.query_usage_async(result)
+    return JSONResponse(payload, status_code=200)
 
 
 @router.post("/v1/model_api/runtime_error")

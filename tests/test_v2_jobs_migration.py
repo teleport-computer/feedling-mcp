@@ -236,7 +236,11 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0057_provider_health").down_revision == (
         "0056_agent_jobs_hb_idx"
     )
-    assert script.get_current_head() == "0057_provider_health"
+    # 0058 adds provider_usage_halted, chained off the 0057_provider_health head.
+    assert script.get_revision("0058_provider_usage_halted").down_revision == (
+        "0057_provider_health"
+    )
+    assert script.get_current_head() == "0058_provider_usage_halted"
 
 
 def test_provider_health_schema_is_runtime_neutral():

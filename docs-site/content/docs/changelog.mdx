@@ -137,6 +137,18 @@ change must not be interpreted as an API guarantee.
   other still works. `effective` is derived, and covers every lane. `POST` requires a real JSON boolean under `enabled`; strings such as
   `"no"` are rejected with `400` rather than coerced.
 
+- New `GET /v1/model_api/usage`. Queries the caller's active model_api
+  provider for balance/usage live on every call — never cached, never stored.
+  Response shape: `{"provider", "adapter", "status", "as_of", "metrics", "error"?}`,
+  where `metrics` always has all five fixed keys (`balance`, `remaining`,
+  `usage_total`, `usage_today`, `usage_month`), each with its own `status`
+  (`ok` / `unsupported` / `failed`). Field support depends on the configured
+  provider/adapter: DeepSeek and OpenRouter are queried through their official
+  APIs; an `openai_compatible` relay (中转站) is queried through its
+  dashboard-style endpoints when reachable. `400` when there is no usable
+  route to query (`model_api_not_configured`, `model_api_not_tested`, and
+  related slugs).
+
 - `GET /v1/content/export` now includes a `world_book` array alongside `chat`,
   `memory`, `identity` and `frames`. World book entries are user-authored
   content that account deletion removes, so an export that omitted them handed
