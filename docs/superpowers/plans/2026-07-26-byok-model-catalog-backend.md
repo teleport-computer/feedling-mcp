@@ -6,7 +6,19 @@
 
 **Architecture:** 三层，严格按 `CONTRIBUTING.md` 分层：wire 逻辑（拉取/翻页/解析/错误分类）落在叶子层 `backend/provider_client.py`，与现有各 wire 一样拆成「纯 builder + 纯 parser + 网络编排」；业务编排（XOR 校验、credential 解封、provider 归一、错误→slug）落在 `backend/hosted/setup_core.py`；HTTP 路由 boilerplate 落在 `backend/hosted/setup_routes_asgi.py`。全程**纯新增旁路**，不改任何现有函数、不动加密信封。
 
-**Tech Stack:** Python / FastAPI（APIRouter）/ httpx（复用 `provider_client._http_client()` 共享同步 client）/ pytest（fake-httpx monkeypatch + `asgi_test_client.make_client`）。无 Pydantic（本仓契约是手写 JSON-Schema）。
+**Tech Stack:** Python / FastAPI（APIRouter）/ httpx（复用 `provider_client._http_client()` 共享同步 client，**streaming**）/ pytest（fake-httpx monkeypatch + `asgi_test_client.make_client`）。无 Pydantic（本仓契约是手写 JSON-Schema）。
+
+> ## Codex plan-review 修正（2026-07-26 已落地）
+>
+> 首版实现被 Codex plan-review 挑出 5 处真缺陷（均经 lead 独立核实为真），本轮已改：
+>
+> 1. **资源上限是假的**：`15s/页 + len(resp.text)` 最坏 150s、且非字节非总预算。→ 改成 `time.monotonic()` 总 deadline（20s）+ 每页 timeout=剩余预算 + `client.stream()` 累计**解压字节**（5MB 覆盖整次调用）。后续页失败走部分成功。
+> 2. **catalog 绕过了出网校验**：新 key 路径直接拼 `base_url`，未知 provider 被当「不支持」。→ 新增 `validate_catalog_target(provider, base_url)`（复用 allowlist + scheme 规则、免 model），**未知 provider 硬 400**（`model_api_config_invalid`）；credential 路径仍以存量凭据为真源。
+> 3. **parser 不严**：`{}`/`{"error":...}` 被当空目录成功、非 object 成员抛 AttributeError→500、anthropic `has_more` 缺 `last_id` 误标完整。→ 严格校验 root/数组/元素/id 类型；**缺数组=invalid，空数组=合法空**；非 object 成员跳过；`has_more` 无 `last_id` 视为 invalid；orchestrator 维护 `seen_cursors` 防循环。
+> 4. **错误分类把 4xx 全塞进 auth_failed**。→ 401=auth_failed；402/403/451=access_denied；429=rate_limited；408/425/**所有 5xx**/网络=temporarily_unavailable；404 **仅** openai_compatible→200 `catalog_supported:false`；其余 404/4xx=**invalid_response**（不再冒充鉴权失败）。
+> 5. **OpenRouter 不是全量**：默认只返回 text 模型。→ 加 `output_modalities=all`（live 核实 2026-07-26：HTTP 200，449 vs 345 模型）。
+>
+> 另：公开契约用 `oneOf` 表达 XOR + provider enum + `api_key: writeOnly` + response `required`；新 slug 进 `tests/test_api_errors_doc.py` 的 `MUST_HAVE`（仅加 markdown 行不够）。`PUBLIC_OPERATIONS`（在 `tools/export_public_openapi.py`，非 contracts 文件）是**未鉴权**端点白名单——本路由鉴权，**不加**。
 
 ## Global Constraints
 
@@ -18,7 +30,7 @@
 - **错误纪律**（`CONTRIBUTING.md` §7 / `:201-206`）：所有错误返回 `{"error": "<snake_case_slug>", ...}`，动态内容只能进 `detail`；新 slug 必须同 PR 登记进 `docs/API_ERRORS.md`（`tests/test_api_errors_doc.py` 守卫）。slug 一旦上线冻结。
 - **provider 鉴权失败绝不回 401**：接口自身的 401 是 Feedling 登录失效；provider key 失败一律映射成 400/429/503，避免 iOS 误判成登录过期。
 - **Gemini key 走 header** `x-goog-api-key`，不进 URL query。
-- **上限常量**（防自定义端点拖垮 worker）：`_CATALOG_PER_REQUEST_TIMEOUT = 15.0`、`_CATALOG_MAX_PAGES = 10`、`_CATALOG_MAX_MODELS = 2000`、`_CATALOG_MAX_BODY_BYTES = 5_000_000`、model id 上限 160（与保存约束一致）。
+- **上限常量**（防自定义端点拖垮 worker，**Codex review 修正：单请求 15s×10 页最坏 150s，改成整次调用一个总预算**）：`_CATALOG_TOTAL_BUDGET = 20.0`（`time.monotonic()` 总 deadline，跨所有页共享，每页 socket timeout = 剩余预算）、`_CATALOG_MAX_PAGES = 10`、`_CATALOG_MAX_MODELS = 2000`、`_CATALOG_MAX_BODY_BYTES = 5_000_000`（**streaming 累计的解压字节，覆盖整次调用**，非 `len(resp.text)`）、model id 上限 160。后续页超时/超限/坏 shape/非 JSON → **部分成功**（`complete=False` + warning，绝不丢已收集的模型）；第一页失败才 raise。
 - **conftest 白名单**：新的**纯单元**测试文件（fake-httpx、不碰 DB）必须加进 `tests/conftest.py` 的 `_PURE_UNIT`（`:109-180`），否则无 Postgres 时静默不收集、"全绿"是假的；用 `make_client()`/真实 DB 的测试**不要**加进去（会把优雅跳过变成硬收集错误）。
 
 **7 个 provider**（`provider_client.validate_config:299`）：`openai / openrouter / anthropic / bedrock / gemini / deepseek / openai_compatible`。各家 `/models` 拉取方式与翻页见 Task 1。
@@ -28,9 +40,11 @@
 ## 文件结构
 
 - `backend/provider_client.py`（改）：新增叶子层函数
-  - `_catalog_request(provider, api_key, base_url, cursor) -> tuple[str, dict, dict]`（纯：url, headers, params）
-  - `_parse_catalog_page(provider, body) -> tuple[list[dict], str | None]`（纯：`([{id,display_name}], next_cursor)`）
-  - `list_provider_models(provider, api_key, base_url="") -> dict`（网络编排：翻页/上限/去重，返回 `{"models":[...], "complete":bool, "warnings":[...], "catalog_supported":bool}`）
+  - `validate_catalog_target(provider, base_url="") -> tuple[str, str]`（纯：provider allowlist + URL scheme 校验，免 model；未知 provider raise）
+  - `_catalog_request(provider, api_key, base_url, cursor) -> tuple[str, dict, dict]`（纯：url, headers, params；openrouter 带 `output_modalities=all`）
+  - `_parse_catalog_page(provider, body) -> tuple[list[dict], str | None]`（纯严格解析：坏 shape/缺数组 raise invalid，空数组合法，非 object 成员跳过）
+  - `_fetch_catalog_page(client, url, headers, params, timeout, bytes_so_far) -> tuple[dict, int]`（streaming 单页拉取 + 累计解压字节上限）
+  - `list_provider_models(provider, api_key, base_url="") -> dict`（网络编排：总 deadline/翻页/`seen_cursors`/上限/去重/部分成功，返回 `{"models":[...], "complete":bool, "warnings":[...], "catalog_supported":bool}`）
   - `model_catalog_error_slug(exc) -> str`（纯：ProviderError → slug）
 - `backend/hosted/setup_core.py`（改）：新增 `model_api_models(store, payload, *, caller_api_key) -> tuple[dict, int]`
 - `backend/hosted/setup_routes_asgi.py`（改）：新增 `@router.post("/v1/model_api/models")` handler
@@ -409,10 +423,12 @@ git commit -m "feat(provider): list_provider_models pagination + caps + dedupe"
 | `str(exc)` 含 `model_catalog_unsupported` | `model_catalog_unsupported` |
 | `str(exc)` 含 `model_catalog_invalid_response` | `model_catalog_invalid_response` |
 | `status_code == 401` | `model_catalog_auth_failed` |
-| `status_code == 403` | `model_catalog_access_denied` |
+| `status_code in {402,403,451}` | `model_catalog_access_denied` |
 | `status_code == 429` | `model_catalog_rate_limited` |
-| `status_code in {408,500,502,503,504}` 或 `None` | `model_catalog_temporarily_unavailable` |
-| 其它 4xx（400/402/404/422） | `model_catalog_auth_failed`（多为 key/账号问题） |
+| `status_code in {408,425}` / `500<=sc<=599` / `None`（网络） | `model_catalog_temporarily_unavailable` |
+| 其余 4xx（400/404/409/422…） | `model_catalog_invalid_response`（**不再冒充 auth_failed**） |
+
+> 404 特例不在此函数：`openai_compatible` 的首页 404 由 `list_provider_models` 直接短路成 200 `catalog_supported:false`（provider 上下文只有编排层有），根本不进 slug 映射。
 
 - [ ] **Step 1: 写失败测试**
 

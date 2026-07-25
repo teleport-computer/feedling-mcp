@@ -123,7 +123,7 @@
 | 2xx 空数组 | 成功，`models:[]` | 显示「未返回模型」，保留手填 |
 | 非 JSON / 超限 | `model_catalog_invalid_response` | 手填 + 重试 |
 
-**契约与文档**：用 Pydantic/FastAPI typed contract（`tools/public_openapi_contracts.py` 约定）；error slug 登记进 `docs/API_ERRORS.md`；跑 OpenAPI 回归 + 从 docs-site 重新生成契约。
+**契约与文档**：用**手写 JSON-Schema**（本仓 `tools/public_openapi_contracts.py` 的约定——旁路 raw-`Request` handler 不走 Pydantic 推断，schema 手工登记）：request 用 `oneOf` 表达 `api_key` XOR `credential_id`、provider 用 enum、`api_key` 标 `writeOnly`；response/model-item 列 `required`。error slug 登记进 `docs/API_ERRORS.md` 且加进 `tests/test_api_errors_doc.py` 的 `MUST_HAVE` 守卫集合（仅加 markdown 行不够）；跑 OpenAPI 回归 + 从 docs-site 重新生成契约。
 
 ---
 
