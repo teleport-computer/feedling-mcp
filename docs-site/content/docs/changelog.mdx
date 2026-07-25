@@ -10,6 +10,19 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **New `POST /v1/model_api/models` lists a provider's live model catalog (BYOK
+  setup).** Supply the credential exactly one of two ways — a fresh `api_key`, or
+  a stored `credential_id` whose provider/base_url are the source of truth (any
+  `provider`/`base_url` sent alongside a `credential_id` is ignored). Supplying
+  both, neither, an empty string, or a null is a `400 api_key_or_credential_id_required`.
+  The response returns `models` (each `{id, display_name}`), `complete`, and
+  `catalog_supported`. `complete: false` with `warnings` means the list was
+  truncated (page/size/time budget). `catalog_supported: false` means the
+  provider has no listable catalog (e.g. Bedrock, or a custom endpoint with no
+  `/models` route) and the client should fall back to manual model entry.
+  Provider auth failures are mapped to `400`/`429`/`503` catalog slugs — never
+  `401` — so an expired Feedling login is never confused with a bad provider key.
+
 - **Long-term provider configuration failures now pause proactive model work.**
   When an account has gone 48 hours without a usable provider response and its
   latest failures have continuously required user action for at least one hour,
