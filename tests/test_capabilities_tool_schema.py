@@ -92,6 +92,56 @@ def test_identity_patch_validator_still_rejects_empty_calls():
     assert tool_schema.validate_tool_args("identity_patch", {"agent_name": "   "}) is not None
 
 
+def test_identity_patch_advertises_and_accepts_relationship_days():
+    # The model can only recalibrate the day count if the tool description says how.
+    spec = next(s for s in tool_schema.build_tool_specs() if s.name == "identity_patch")
+    assert "relationship_days" in spec.description
+    # relationship_days inside the open `patch` object validates through the gate,
+    # including the 0 edge ("we met today") which must NOT read as an empty patch.
+    assert tool_schema.validate_tool_args(
+        "identity_patch", {"patch": {"relationship_days": 300}}) is None
+    assert tool_schema.validate_tool_args(
+        "identity_patch", {"patch": {"relationship_days": 0}}) is None
+
+
+def test_identity_patch_empty_gate_matches_baseline():
+    # Round-4: the empty-patch gate is EXACTLY origin/test's semantics plus the
+    # relationship_days presence rule — nothing else. A bare `[]`/`null` is falsy,
+    # so it reads as empty regardless of field (round-4 reverts the round-2 "any
+    # list is content" widening, the Important-3 hole where signature:null passed
+    # this gate and then died at the sink as a fake success).
+    V = tool_schema.validate_tool_args
+    # unknown key with [] -> empty
+    assert V("identity_patch", {"patch": {"unknown": []}}) is not None
+    # string field with [] -> empty
+    assert V("identity_patch", {"patch": {"category": []}}) is not None
+    # a real list field with [] -> ALSO empty now (baseline behavior, bool([]) False)
+    assert V("identity_patch", {"patch": {"signature": []}}) is not None
+    # a real list field with null -> empty (the Important-3 signature:null case)
+    assert V("identity_patch", {"patch": {"signature": None}}) is not None
+    # a real list field WITH content -> passes (normal non-empty patch untouched)
+    assert V("identity_patch", {"patch": {"signature": ["sig"]}}) is None
+
+
+def test_identity_patch_relationship_days_null_reaches_live_gate():
+    # Round-3 fix: relationship_days keys off PRESENCE, not `value is not None`,
+    # so null/False are NOT swallowed as an empty patch — they pass the empty
+    # gate and hit the live pre-enqueue gate, which returns a stable error the
+    # model can self-correct from (never a silent enqueue).
+    from capabilities import identity as cap_identity
+    V = tool_schema.validate_tool_args
+    # not treated as empty (empty gate returns None -> would proceed to live gate)
+    assert V("identity_patch", {"patch": {"relationship_days": None}}) is None
+    assert V("identity_patch", {"patch": {"relationship_days": False}}) is None
+    # 0 = "we met today" is a valid, non-empty patch
+    assert V("identity_patch", {"patch": {"relationship_days": 0}}) is None
+    # the live gate gives null/False a STABLE error (so they never enqueue)
+    assert cap_identity.relationship_days_error(
+        {"patch": {"relationship_days": None}}) == "relationship_days_must_be_non_negative_int"
+    assert cap_identity.relationship_days_error(
+        {"patch": {"relationship_days": False}}) == "relationship_days_must_be_non_negative_int"
+
+
 def test_all_model_facing_tools_reject_unknown_top_level_fields():
     for spec in tool_schema.build_tool_specs():
         assert spec.parameters["additionalProperties"] is False, spec.name

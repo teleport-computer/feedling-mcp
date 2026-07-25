@@ -425,6 +425,19 @@ def test_anchor_not_initialized_404_parity(user):
     assert f == a == (404, {"error": "identity not initialized"})
 
 
+def test_anchor_not_initialized_beats_bad_days_404_parity(user):
+    # Round-3 fix: the endpoint now front-runs the existence check, so an
+    # uninitialized card returns 404 REGARDLESS of whether days_with_user is
+    # valid. Previously the shared CAS helper's shape check ran first and an
+    # uninitialized card + missing/invalid days returned 400 (shape), inverting
+    # the legacy 404-first priority.
+    _uid, api_key = user
+    for body in ({}, {"days_with_user": -1}, {"days_with_user": True}):
+        f = _flask("POST", "/v1/identity/relationship_anchor", headers=_headers(api_key), json_body=body)
+        a = _asgi("POST", "/v1/identity/relationship_anchor", headers=_headers(api_key), json_body=body)
+        assert f == a == (404, {"error": "identity not initialized"}), body
+
+
 def test_anchor_invalid_days_400_parity(user):
     uid, api_key = user
     _seed_identity(uid)

@@ -198,6 +198,17 @@ async def dispatch_tool_calls(
                     call_id=tc.id, content=f"error: {pairing_error}")
                 write_index += 1
                 continue
+            # Same LIVE-only + pre-enqueue rationale as the pairing check above:
+            # reject a malformed / over-cap relationship_days BEFORE it is
+            # enqueued, so the model gets a fixable error THIS turn instead of the
+            # effect 400-ing (or OverflowError-looping) at the sink. Kept out of
+            # tool_schema.validate_tool_args on purpose — that also gates replay.
+            days_error = cap_identity.relationship_days_error(tc.args)
+            if days_error:
+                results_by_id[tc.id] = ToolResult(
+                    call_id=tc.id, content=f"error: {days_error}")
+                write_index += 1
+                continue
         if before_write is not None:
             await before_write()
         enqueued = enqueue_write_effect(tc)  # producer -> PR A outbox (drained at turn end)

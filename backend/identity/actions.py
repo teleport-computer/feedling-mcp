@@ -272,6 +272,7 @@ def _save_identity_action_payload(
     existing: dict,
     audit: dict,
     event_type: str,
+    relationship_override: dict | None = None,
 ) -> tuple[dict | None, dict | None, str]:
     # `existing` is a caller-supplied SNAPSHOT of the raw identity blob,
     # taken BEFORE the enclave plaintext read `payload` was merged from (see
@@ -316,9 +317,18 @@ def _save_identity_action_payload(
         # must be listed here or the raw blob overwrite in _save_identity
         # would silently erase it.
         "replaced_at": existing.get("replaced_at", ""),
-        "relationship_started_at": existing.get("relationship_started_at", ""),
-        "relationship_anchor_source": existing.get("relationship_anchor_source", ""),
-        "relationship_anchor_evidence": existing.get("relationship_anchor_evidence", ""),
+        # Relationship anchor: carried forward from `existing` UNLESS this patch
+        # recalibrated it (profile_patch with relationship_days — see
+        # _identity_profile_patch). The override is threaded through here so the
+        # anchor rewrite rides the SAME CAS write as every other profile field,
+        # instead of a separate non-CAS _save_identity (which is the residual the
+        # legacy identity.relationship_days_set action still carries).
+        "relationship_started_at": (relationship_override or {}).get(
+            "relationship_started_at", existing.get("relationship_started_at", "")),
+        "relationship_anchor_source": (relationship_override or {}).get(
+            "relationship_anchor_source", existing.get("relationship_anchor_source", "")),
+        "relationship_anchor_evidence": (relationship_override or {}).get(
+            "relationship_anchor_evidence", existing.get("relationship_anchor_evidence", "")),
     }
     if envelope.get("K_enclave"):
         identity["K_enclave"] = envelope["K_enclave"]
@@ -340,12 +350,56 @@ def _save_identity_action_payload(
     return identity, change, ""
 
 
+def _resolve_relationship_anchor(days: int, *, trusted_frozen: str | None = None) -> str:
+    """Resolve the absolute ``relationship_started_at`` for a relationship_days
+    recalibration, resolving the relative day count to a fixed calendar anchor
+    exactly once (item 1).
+
+    ``trusted_frozen`` is the FROZEN anchor the V2 producer resolved at ENQUEUE
+    time and threaded down here as an EXPLICIT KEYWORD ARGUMENT — from
+    worker._write_tool_effect_payload -> capabilities.identity.patch ->
+    identity_core.run_actions(trusted_relationship_anchor=...) ->
+    _execute_identity_actions -> _execute_identity_action -> _identity_profile_patch.
+    It travels the call path, NOT the action dict / request body, so it is trusted
+    *by the path it arrived on*, not by whether a date happens to sit in the
+    payload. The public ``POST /v1/identity/actions`` handler never passes it, so
+    a caller who stuffs ``relationship_started_at`` into the request body cannot
+    forge a frozen anchor — on that path ``trusted_frozen`` is None and the value
+    is always recomputed from ``days`` (Important 1 / round-4 fix).
+
+    When a trusted value IS supplied by the sink path, use it VERBATIM under two
+    defensive bounds (defense-in-depth against a producer bug) — and, crucially,
+    once trusted it is returned as-is, never re-aged against the replay day:
+
+      (a) it parses to a real calendar date that is NOT in the future
+          (``frozen <= today``); and
+      (b) the accompanying ``days`` is within ``[0, MAX_RELATIONSHIP_DAYS]``.
+
+    Returning the frozen date verbatim (instead of an ``0 <= today-frozen <= MAX``
+    age check) is what makes a delayed/retried replay idempotent: at
+    ``relationship_days == MAX`` the enqueue-day anchor is ``today-MAX``, so a
+    next-day replay would have ``today-frozen == MAX+1`` and an age check would
+    wrongly reject it → recompute from the replay day → anchor drifts one day
+    forward. A verbatim return cannot drift. A future date, an unparseable
+    string, an out-of-range ``days``, or no trusted value at all falls back to
+    ``_anchor_from_days(days)``."""
+    if trusted_frozen:
+        d = identity_service._parse_iso_calendar_date(trusted_frozen.strip())
+        if d is not None:
+            from datetime import date as _date
+            from identity import card_policy
+            if d <= _date.today() and 0 <= int(days) <= card_policy.MAX_RELATIONSHIP_DAYS:
+                return d.isoformat()  # verbatim — cross-day replay cannot drift it
+    return identity_service._anchor_from_days(days)
+
+
 def _create_identity_action_payload(
     store: UserStore,
     payload: dict,
     *,
     audit: dict,
     event_type: str,
+    relationship_override: dict | None = None,
 ) -> tuple[dict | None, dict | None, str]:
     """Fix A: CREATE a brand-new identity card from an agent action.
 
@@ -395,10 +449,19 @@ def _create_identity_action_payload(
         # A create IS a full-card write, so it stamps the replaced_at baseline
         # (P5 optimistic-concurrency anchor), same as init / replace.
         "replaced_at": now,
-        "relationship_started_at": identity_service._anchor_from_days(
-            0, store=store, prefer_memory=True),
-        "relationship_anchor_source": "agent_bootstrap",
-        "relationship_anchor_evidence": "identity established by the agent via profile_patch",
+        # Anchor: default is the auto tier (today or earliest memory,
+        # source=agent_bootstrap). When the SAME bootstrap patch carried an
+        # explicit relationship_days (item 2a), relationship_override stamps the
+        # user_calibrated anchor instead — user-filled days beat auto-inference,
+        # and previously they were silently dropped at card creation.
+        "relationship_started_at": (relationship_override or {}).get(
+            "relationship_started_at",
+            identity_service._anchor_from_days(0, store=store, prefer_memory=True)),
+        "relationship_anchor_source": (relationship_override or {}).get(
+            "relationship_anchor_source", "agent_bootstrap"),
+        "relationship_anchor_evidence": (relationship_override or {}).get(
+            "relationship_anchor_evidence",
+            "identity established by the agent via profile_patch"),
     }
     if envelope.get("K_enclave"):
         identity["K_enclave"] = envelope["K_enclave"]
@@ -493,6 +556,7 @@ def _identity_profile_patch(
     action: dict,
     *,
     runtime_token: str = "",
+    trusted_relationship_anchor: str | None = None,
 ) -> tuple[dict, list[dict], int]:
     patch = action.get("patch") if isinstance(action.get("patch"), dict) else {}
     for key in identity_service._IDENTITY_PROFILE_FIELDS:
@@ -644,6 +708,78 @@ def _identity_profile_patch(
                     audit_old = ", ".join(old_values)[:120]
                     audit_new = ", ".join(values)[:120]
 
+        # relationship_days: NOT a stored profile field. days_with_user is always
+        # DERIVED from the relationship_started_at anchor (see
+        # identity_service._live_days_with_user), so "set the day count to N" means
+        # "move the anchor to today-N days". We translate here and thread the new
+        # anchor through _save_identity_action_payload / _create_identity_action_payload
+        # via relationship_override so the anchor rewrite rides the SAME CAS write as
+        # the rest of this patch — making identity_patch the CAS-safe canonical path
+        # for recalibration (the legacy identity.relationship_days_set action and the
+        # relationship_anchor endpoint now share the same CAS core, see
+        # _update_relationship_anchor_cas).
+        #
+        # Anchor date is resolved ONCE (item 1): on the V2 sink path the producer
+        # froze the absolute date at enqueue time and threaded it down the call
+        # path as the trusted keyword arg ``trusted_relationship_anchor`` (NOT via
+        # the action dict / request body — see _resolve_relationship_anchor); on
+        # the direct request path there is no trusted frozen date so it is computed
+        # inline from today. Either way the write value is fixed before the CAS, so
+        # a delayed replay is idempotent.
+        #
+        # source = user_calibrated is the TOP tier (user_calibrated > material_stated
+        # > auto): an explicit relationship_days is always the user deliberately
+        # setting the count — at bootstrap (item 2a) it beats the auto default, and
+        # on an existing card it beats any lower-tier anchor.
+        relationship_override = None
+        if "relationship_days" in patch:
+            raw_days = patch.get("relationship_days")
+            shape_err = card_policy.relationship_days_shape_error(raw_days)
+            if shape_err:
+                return {"status": "error", "error": shape_err,
+                        "action": "identity.profile_patch"}, [], 400
+            new_started_at = _resolve_relationship_anchor(
+                raw_days, trusted_frozen=trusted_relationship_anchor)
+            evidence = _identity_action_text(
+                action.get("relationship_anchor_evidence")
+                or action.get("reason")
+                or (existing.get("relationship_anchor_evidence") if existing else "")
+                or "Relationship day count recalibrated via profile_patch.",
+                500,
+            )
+            if bootstrap:
+                # item 2a: an explicit user-filled day count at card creation must
+                # win over _create_identity_action_payload's auto default
+                # (agent_bootstrap / today). Stamp user_calibrated so a later
+                # redistill can't lower-tier-override it. Previously this whole
+                # branch was gated `and not bootstrap`, silently dropping the days
+                # while the other fields created the card.
+                relationship_override = {
+                    "relationship_started_at": new_started_at,
+                    "relationship_anchor_source": "user_calibrated",
+                    "relationship_anchor_evidence": evidence,
+                }
+                changed.append("days_with_user")
+                if not audit_old and not audit_new:
+                    audit_old = "0"
+                    audit_new = str(raw_days)
+            else:
+                old_started_at = str(existing.get("relationship_started_at") or "")
+                old_source = str(existing.get("relationship_anchor_source") or "")
+                # Idempotent: re-setting the same day count on the same calendar day
+                # yields the same anchor, so it's a no-op unless the anchor date OR the
+                # source (was it explicitly user-calibrated?) actually changes.
+                if new_started_at != old_started_at or old_source != "user_calibrated":
+                    relationship_override = {
+                        "relationship_started_at": new_started_at,
+                        "relationship_anchor_source": "user_calibrated",
+                        "relationship_anchor_evidence": evidence,
+                    }
+                    changed.append("days_with_user")
+                    if not audit_old and not audit_new:
+                        audit_old = str(identity_service._live_days_with_user(existing, store=store))
+                        audit_new = str(raw_days)
+
         if not changed:
             if bootstrap:
                 # A non-empty patch that resolves to zero writable fields against
@@ -677,7 +813,8 @@ def _identity_profile_patch(
             # retries down the UPDATE path against the winner's card.
             identity, change, err = _create_identity_action_payload(
                 store, payload, audit=audit,
-                event_type="identity_action_bootstrap")
+                event_type="identity_action_bootstrap",
+                relationship_override=relationship_override)
         else:
             identity, change, err = _save_identity_action_payload(
                 store,
@@ -685,6 +822,7 @@ def _identity_profile_patch(
                 existing=existing,
                 audit=audit,
                 event_type="identity_action_profile_patch",
+                relationship_override=relationship_override,
             )
         if identity is None:
             return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409
@@ -818,39 +956,70 @@ def _identity_dimension_nudge(
     return _with_identity_mutation_lock_and_retry(store, "identity.dimension_nudge", _read_merge_save)
 
 
+def _relationship_anchor_cas_write(
+    store: UserStore, *, days, source: str, evidence: str,
+) -> tuple[dict | None, int, str]:
+    """Single authoritative, metadata-only relationship-anchor writer (item 5).
+
+    Both legacy non-CAS anchor paths — ``identity.relationship_days_set`` (this
+    module) and the ``/v1/identity/relationship_anchor`` endpoint
+    (identity_core.update_relationship_anchor) — used to do a plain
+    ``_save_identity`` (whole-blob overwrite, no lock, no compare-and-swap) from
+    their OWN independently-taken snapshot. Either could land between a concurrent
+    profile_patch/dimension_nudge's CAS win and that caller observing success,
+    silently clobbering it (the KNOWN RESIDUAL the old comment flagged). They now
+    both funnel through here so there is ONE anchor writer and it is CAS-safe.
+
+    Only the 3 ``relationship_*`` fields (+ ``updated_at``) change; the encrypted
+    envelope is copied forward untouched, so NO enclave decrypt/re-encrypt is
+    needed — this is a plaintext-metadata mutation. Runs under
+    ``identity_mutation_lock`` + the same bounded ``_save_identity_cas`` retry as
+    profile_patch, so a mid-span concurrent CAS write makes this retry from a
+    fresh read instead of clobbering it.
+
+    Input validation is UNIFIED with the identity_patch path via
+    ``card_policy.relationship_days_shape_error`` (rejects bool/str/float,
+    negative, over-cap) — the legacy ``int(...)`` coercion that accepted
+    ``int("300")`` / ``True`` is gone.
+
+    Returns ``(identity, old_days, "")`` on success, or ``(None, 0, err_code)``
+    where err_code is one of the shape codes, ``identity_not_initialized``, or
+    ``identity_write_conflict``. Deliberately does NOT append the audit change,
+    log a bootstrap event, or build an effect — the two callers own those so each
+    keeps its own distinct response contract."""
+    from identity import card_policy
+    shape_err = card_policy.relationship_days_shape_error(days)
+    if shape_err:
+        return None, 0, shape_err
+    with identity_service.identity_mutation_lock(store.user_id):
+        for attempt in range(_IDENTITY_WRITE_MAX_ATTEMPTS):
+            existing = identity_service._load_identity(store)
+            if not existing:
+                return None, 0, "identity_not_initialized"
+            old_days = identity_service._live_days_with_user(existing, store=store)
+            identity = dict(existing)
+            identity["updated_at"] = core_util._now_iso()
+            identity["relationship_started_at"] = identity_service._anchor_from_days(int(days))
+            identity["relationship_anchor_source"] = source
+            if evidence:
+                identity["relationship_anchor_evidence"] = evidence
+            if identity_service._save_identity_cas(store, existing, identity):
+                return identity, old_days, ""
+            # CAS lost the race to a concurrent writer — retry from a fresh read.
+    return None, 0, "identity_write_conflict"
+
+
 def _identity_relationship_days_set(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
-    try:
-        days = int(action.get("days_with_user"))
-    except Exception:
+    raw_days = action.get("days_with_user")
+    if raw_days is None:
         return {"status": "error", "error": "days_with_user_required", "action": "identity.relationship_days_set"}, [], 400
-    if days < 0:
-        return {"status": "error", "error": "days_with_user_must_be_non_negative", "action": "identity.relationship_days_set"}, [], 400
-    existing = identity_service._load_identity(store)
-    if not existing:
-        return {"status": "error", "error": "identity_not_initialized", "action": "identity.relationship_days_set"}, [], 409
-    old_days = identity_service._live_days_with_user(existing, store=store)
-    identity = dict(existing)
-    identity["updated_at"] = core_util._now_iso()
-    identity["relationship_started_at"] = identity_service._anchor_from_days(days)
-    identity["relationship_anchor_source"] = "user_calibrated"
     evidence = _identity_action_text(action.get("relationship_anchor_evidence") or action.get("reason") or "", 500)
-    if evidence:
-        identity["relationship_anchor_evidence"] = evidence
-    # KNOWN RESIDUAL (not fixed here — spec §9 territory): this is a plain
-    # overwrite, not the CAS `_save_identity_cas` used by profile_patch /
-    # dimension_nudge, and it isn't under identity_mutation_lock either. A
-    # relationship_days_set landing between a concurrent profile_patch's CAS
-    # win and that patch's caller observing success can still silently
-    # clobber it (this write starts from its OWN `existing` snapshot, taken
-    # independently). Low real-world likelihood (this action is rare —
-    # user-triggered recalibration, not a hot path) but worth flagging
-    # alongside the C1 fix rather than presenting profile_patch/
-    # dimension_nudge as the only writers on this row.
-    # Same shape: genesis/service.py::init_identity_if_absent's re-init branch
-    # (its own plain `_save_identity`, see the comment there) — the two
-    # residuals cross-reference each other so neither reads as an isolated
-    # one-off.
-    identity_service._save_identity(store, identity)
+    identity, old_days, err = _relationship_anchor_cas_write(
+        store, days=raw_days, source="user_calibrated", evidence=evidence)
+    if err:
+        status = 409 if err in ("identity_not_initialized", "identity_write_conflict") else 400
+        return {"status": "error", "error": err, "action": "identity.relationship_days_set"}, [], status
+    days = int(raw_days)
     boot_gates._log_bootstrap_event(store, "identity_action_relationship_days_set", success=True)
     change = identity_service._append_identity_change(store, {
         "action": "relationship_days",
@@ -984,12 +1153,15 @@ def _execute_identity_action(
     action: dict,
     *,
     runtime_token: str = "",
+    trusted_relationship_anchor: str | None = None,
 ) -> tuple[dict, list[dict], int]:
     if not isinstance(action, dict):
         return {"status": "error", "error": "action_must_be_object"}, [], 400
     action_type = str(action.get("type") or action.get("action") or "").strip()
     if action_type == "identity.profile_patch":
-        return _identity_profile_patch(store, api_key, action, runtime_token=runtime_token)
+        return _identity_profile_patch(
+            store, api_key, action, runtime_token=runtime_token,
+            trusted_relationship_anchor=trusted_relationship_anchor)
     if action_type == "identity.dimension_nudge":
         return _identity_dimension_nudge(store, api_key, action, runtime_token=runtime_token)
     if action_type == "identity.relationship_days_set":
@@ -1015,6 +1187,7 @@ def _execute_identity_actions(
     actions: list[dict],
     *,
     runtime_token: str = "",
+    trusted_relationship_anchor: str | None = None,
 ) -> tuple[dict, int]:
     if not isinstance(actions, list) or not actions:
         return {"status": "error", "error": "actions_required", "results": [], "effects": []}, 400
@@ -1057,6 +1230,7 @@ def _execute_identity_actions(
             api_key,
             action,
             runtime_token=runtime_token,
+            trusted_relationship_anchor=trusted_relationship_anchor,
         )
         results.append(result)
         effects.extend(action_effects)

@@ -256,8 +256,11 @@ DESCRIPTIONS: dict[str, str] = {
                        "and list fields signature, boundaries, do_not_say, "
                        "stable_definitions. Edit a list field by whole-list replacement "
                        "or with op keys add_<field>/remove_<field>/replace_<field> "
-                       "(e.g. add_signature, remove_boundaries). Only act on an "
-                       "explicit request."),
+                       "(e.g. add_signature, remove_boundaries). To recalibrate how "
+                       "long you and the user have known each other, put "
+                       "'relationship_days' (a non-negative integer number of days) in "
+                       "the patch — e.g. patch {\"relationship_days\": 300}. Only act on "
+                       "an explicit request."),
     "identity_nudge": ("Adjust ONE of the persona's relationship/personality dimension "
                        "scores by a signed integer 'delta' (|delta| ≤ 10). 'dimension' "
                        "must name a dimension that already exists — call identity_get "
@@ -383,7 +386,32 @@ def validate_tool_args(name: str, args) -> str | None:
         # (see capabilities.identity.merge_patch_fields).
         from capabilities import identity as cap_identity
         merged = cap_identity.merge_patch_fields(args)
-        if not any((v.strip() if isinstance(v, str) else v) for v in merged.values()):
+        # Emptiness gate == origin/test baseline, with EXACTLY ONE addition:
+        # relationship_days counts by PRESENCE of the key (round-4). Rationale:
+        #   * relationship_days -> present == content (0 = "we met today" is valid;
+        #     null/False must still pass this gate and hit the live pre-enqueue gate
+        #     (capabilities.identity.relationship_days_error) so the model gets a
+        #     stable, self-correctable error instead of a silent empty-patch drop).
+        #     Its VALIDITY (int/cap) is enforced there + at the server gate, never
+        #     here — this function ALSO gates replay of already-persisted effects,
+        #     where any NEW rejection rule would turn a legal-when-written effect
+        #     into a retry loop.
+        #   * every other field -> identical to origin/test: a str counts when
+        #     non-blank after strip, everything else by bool(value). So bool([])
+        #     is False — a bare `{"signature": []}` / `{"category": []}` /
+        #     `{"unknown": []}` / `{"signature": null}` is empty, exactly as on
+        #     baseline (round-4 reverts the round-2 "any list is content" widening,
+        #     which was the Important-3 hole where signature:null passed this gate
+        #     and then died at the sink as a fake success). RESULT: zero new
+        #     rejections vs origin/test — the replay gate can never judge an old
+        #     effect empty that baseline would have accepted.
+        def _has_content(key: str, value) -> bool:
+            if key == "relationship_days":
+                return "relationship_days" in merged
+            if isinstance(value, str):
+                return bool(value.strip())
+            return bool(value)
+        if not any(_has_content(k, v) for k, v in merged.items()):
             return "identity_patch requires a non-empty patch or profile field"
     if name == "memory_write":
         actions = args.get("actions") or []

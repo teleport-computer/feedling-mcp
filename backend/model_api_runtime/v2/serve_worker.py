@@ -2530,7 +2530,35 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
             tool_name = "identity_nudge"
         else:
             raise RuntimeError("invalid encrypted identity operation")
-        args = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
+        # `relationship_started_at` is the trusted FROZEN anchor the producer
+        # (worker._write_tool_effect_payload) resolved from relationship_days at
+        # enqueue time (item 1) — internal metadata, NOT a model-facing arg. Strip
+        # it (like effect_id/op) before the model-arg schema check, which is
+        # additionalProperties=false and would otherwise reject the whole effect
+        # into a retry loop. Validate its shape here instead: a well-formed ISO
+        # date if present. The sink still receives it via _sink_identity's params.
+        frozen_anchor = payload.get("relationship_started_at")
+        if frozen_anchor is not None:
+            if not isinstance(frozen_anchor, str) or not frozen_anchor.strip():
+                raise RuntimeError("invalid encrypted identity anchor")
+            from datetime import date as _date
+            # Full-string validation (round-3 fix): the old `[:10]` slice accepted
+            # `2026-04-10garbage` / `2026-04-10T99:99:99` by only parsing the first
+            # 10 chars. The producer only ever emits a canonical YYYY-MM-DD, so
+            # reject anything that isn't exactly that: parse the WHOLE string and
+            # require it round-trips. Normal path is unaffected.
+            s = frozen_anchor.strip()
+            try:
+                parsed = _date.fromisoformat(s)
+            except ValueError:
+                raise RuntimeError("invalid encrypted identity anchor")
+            if parsed.isoformat() != s:
+                raise RuntimeError("invalid encrypted identity anchor")
+        args = {
+            k: v
+            for k, v in payload.items()
+            if k not in ("effect_id", "op", "relationship_started_at")
+        }
     elif effect_type == "schedule":
         tool_name = str(payload.get("op") or "")
         if tool_name not in _SCHEDULE_CAPABILITY_OPS:
