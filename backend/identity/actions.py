@@ -350,41 +350,41 @@ def _save_identity_action_payload(
     return identity, change, ""
 
 
-def _resolve_relationship_anchor(action: dict, days: int) -> str:
+def _resolve_relationship_anchor(days: int, *, trusted_frozen: str | None = None) -> str:
     """Resolve the absolute ``relationship_started_at`` for a relationship_days
     recalibration, resolving the relative day count to a fixed calendar anchor
     exactly once (item 1).
 
-    Prefers the FROZEN anchor the V2 producer threaded in via
-    ``action["relationship_started_at"]`` (worker._write_tool_effect_payload ->
-    capabilities.identity.patch) so a delayed sink replay uses the date computed
-    at ENQUEUE time, not at replay time. Falls back to computing from ``days``
-    against today on the direct request path (immediate execution — no drift
-    window).
+    ``trusted_frozen`` is the FROZEN anchor the V2 producer resolved at ENQUEUE
+    time and threaded down here as an EXPLICIT KEYWORD ARGUMENT — from
+    worker._write_tool_effect_payload -> capabilities.identity.patch ->
+    identity_core.run_actions(trusted_relationship_anchor=...) ->
+    _execute_identity_actions -> _execute_identity_action -> _identity_profile_patch.
+    It travels the call path, NOT the action dict / request body, so it is trusted
+    *by the path it arrived on*, not by whether a date happens to sit in the
+    payload. The public ``POST /v1/identity/actions`` handler never passes it, so
+    a caller who stuffs ``relationship_started_at`` into the request body cannot
+    forge a frozen anchor — on that path ``trusted_frozen`` is None and the value
+    is always recomputed from ``days`` (Important 1 / round-4 fix).
 
-    The frozen value is already inside the encrypted effect envelope and cannot
-    be model-authored (serve_worker strips it from the model-arg schema; the
-    producer generates it from an already-validated ``days``). So the sink trusts
-    it VERBATIM under two defensive bounds — and, crucially, once trusted it is
-    returned as-is, never re-aged against the replay day:
+    When a trusted value IS supplied by the sink path, use it VERBATIM under two
+    defensive bounds (defense-in-depth against a producer bug) — and, crucially,
+    once trusted it is returned as-is, never re-aged against the replay day:
 
       (a) it parses to a real calendar date that is NOT in the future
           (``frozen <= today``); and
-      (b) the accompanying ``days`` is within ``[0, MAX_RELATIONSHIP_DAYS]``
-          (already guaranteed upstream by the live gate + server gate; a
-          defensive second check here).
+      (b) the accompanying ``days`` is within ``[0, MAX_RELATIONSHIP_DAYS]``.
 
-    Returning the frozen date verbatim (instead of the old
-    ``0 <= today-frozen <= MAX`` age check) is what makes a delayed/retried
-    replay idempotent: at ``relationship_days == MAX`` the enqueue-day anchor is
-    ``today-MAX``, so a next-day replay had ``today-frozen == MAX+1`` and the old
-    check wrongly rejected it → recomputed from the replay day → anchor drifted
-    one day forward. A verbatim return cannot drift. Only a future date, an
-    unparseable string, or an out-of-range ``days`` falls back to
+    Returning the frozen date verbatim (instead of an ``0 <= today-frozen <= MAX``
+    age check) is what makes a delayed/retried replay idempotent: at
+    ``relationship_days == MAX`` the enqueue-day anchor is ``today-MAX``, so a
+    next-day replay would have ``today-frozen == MAX+1`` and an age check would
+    wrongly reject it → recompute from the replay day → anchor drifts one day
+    forward. A verbatim return cannot drift. A future date, an unparseable
+    string, an out-of-range ``days``, or no trusted value at all falls back to
     ``_anchor_from_days(days)``."""
-    frozen = str(action.get("relationship_started_at") or "").strip()
-    if frozen:
-        d = identity_service._parse_iso_calendar_date(frozen)
+    if trusted_frozen:
+        d = identity_service._parse_iso_calendar_date(trusted_frozen.strip())
         if d is not None:
             from datetime import date as _date
             from identity import card_policy
@@ -556,6 +556,7 @@ def _identity_profile_patch(
     action: dict,
     *,
     runtime_token: str = "",
+    trusted_relationship_anchor: str | None = None,
 ) -> tuple[dict, list[dict], int]:
     patch = action.get("patch") if isinstance(action.get("patch"), dict) else {}
     for key in identity_service._IDENTITY_PROFILE_FIELDS:
@@ -719,10 +720,12 @@ def _identity_profile_patch(
         # _update_relationship_anchor_cas).
         #
         # Anchor date is resolved ONCE (item 1): on the V2 sink path the producer
-        # froze the absolute date at enqueue time and threaded it in
-        # (action["relationship_started_at"]); on the direct request path there is
-        # no frozen date so it is computed inline from today. Either way the write
-        # value is fixed before the CAS, so a delayed replay is idempotent.
+        # froze the absolute date at enqueue time and threaded it down the call
+        # path as the trusted keyword arg ``trusted_relationship_anchor`` (NOT via
+        # the action dict / request body — see _resolve_relationship_anchor); on
+        # the direct request path there is no trusted frozen date so it is computed
+        # inline from today. Either way the write value is fixed before the CAS, so
+        # a delayed replay is idempotent.
         #
         # source = user_calibrated is the TOP tier (user_calibrated > material_stated
         # > auto): an explicit relationship_days is always the user deliberately
@@ -735,7 +738,8 @@ def _identity_profile_patch(
             if shape_err:
                 return {"status": "error", "error": shape_err,
                         "action": "identity.profile_patch"}, [], 400
-            new_started_at = _resolve_relationship_anchor(action, raw_days)
+            new_started_at = _resolve_relationship_anchor(
+                raw_days, trusted_frozen=trusted_relationship_anchor)
             evidence = _identity_action_text(
                 action.get("relationship_anchor_evidence")
                 or action.get("reason")
@@ -1153,12 +1157,15 @@ def _execute_identity_action(
     action: dict,
     *,
     runtime_token: str = "",
+    trusted_relationship_anchor: str | None = None,
 ) -> tuple[dict, list[dict], int]:
     if not isinstance(action, dict):
         return {"status": "error", "error": "action_must_be_object"}, [], 400
     action_type = str(action.get("type") or action.get("action") or "").strip()
     if action_type == "identity.profile_patch":
-        return _identity_profile_patch(store, api_key, action, runtime_token=runtime_token)
+        return _identity_profile_patch(
+            store, api_key, action, runtime_token=runtime_token,
+            trusted_relationship_anchor=trusted_relationship_anchor)
     if action_type == "identity.dimension_nudge":
         return _identity_dimension_nudge(store, api_key, action, runtime_token=runtime_token)
     if action_type == "identity.relationship_days_set":
@@ -1184,6 +1191,7 @@ def _execute_identity_actions(
     actions: list[dict],
     *,
     runtime_token: str = "",
+    trusted_relationship_anchor: str | None = None,
 ) -> tuple[dict, int]:
     if not isinstance(actions, list) or not actions:
         return {"status": "error", "error": "actions_required", "results": [], "effects": []}, 400
@@ -1226,6 +1234,7 @@ def _execute_identity_actions(
             api_key,
             action,
             runtime_token=runtime_token,
+            trusted_relationship_anchor=trusted_relationship_anchor,
         )
         results.append(result)
         effects.extend(action_effects)

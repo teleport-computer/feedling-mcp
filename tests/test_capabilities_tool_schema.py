@@ -104,17 +104,23 @@ def test_identity_patch_advertises_and_accepts_relationship_days():
         "identity_patch", {"patch": {"relationship_days": 0}}) is None
 
 
-def test_identity_patch_empty_gate_is_field_aware():
-    # Round-3 fix: the empty-patch gate is now truly field-aware. A `[]` only
-    # counts as content on a REAL list field (card_policy.PROFILE_LIST_FIELDS);
-    # a `[]` on a string field or an unknown key is empty, not content.
+def test_identity_patch_empty_gate_matches_baseline():
+    # Round-4: the empty-patch gate is EXACTLY origin/test's semantics plus the
+    # relationship_days presence rule — nothing else. A bare `[]`/`null` is falsy,
+    # so it reads as empty regardless of field (round-4 reverts the round-2 "any
+    # list is content" widening, the Important-3 hole where signature:null passed
+    # this gate and then died at the sink as a fake success).
     V = tool_schema.validate_tool_args
-    # unknown key with [] -> blocked as empty (was wrongly let through before)
+    # unknown key with [] -> empty
     assert V("identity_patch", {"patch": {"unknown": []}}) is not None
-    # string field with [] -> blocked as empty ([] is not a valid string value)
+    # string field with [] -> empty
     assert V("identity_patch", {"patch": {"category": []}}) is not None
-    # a genuine list field with [] -> passes (legitimate clear-the-list op)
-    assert V("identity_patch", {"patch": {"signature": []}}) is None
+    # a real list field with [] -> ALSO empty now (baseline behavior, bool([]) False)
+    assert V("identity_patch", {"patch": {"signature": []}}) is not None
+    # a real list field with null -> empty (the Important-3 signature:null case)
+    assert V("identity_patch", {"patch": {"signature": None}}) is not None
+    # a real list field WITH content -> passes (normal non-empty patch untouched)
+    assert V("identity_patch", {"patch": {"signature": ["sig"]}}) is None
 
 
 def test_identity_patch_relationship_days_null_reaches_live_gate():

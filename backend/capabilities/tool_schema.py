@@ -386,33 +386,30 @@ def validate_tool_args(name: str, args) -> str | None:
         # (see capabilities.identity.merge_patch_fields).
         from capabilities import identity as cap_identity
         merged = cap_identity.merge_patch_fields(args)
-        # Field-aware emptiness (round-3 fix): earlier rounds treated ANY list as
-        # content and keyed relationship_days off `value is not None`. Two holes:
-        # `{"category": []}` (a STRING field) and `{"unknown": []}` slipped past the
-        # empty gate as "has content", while `{"relationship_days": null}` was
-        # judged empty and never reached the live gate that would give the model a
-        # fixable error. Make it truly field-aware WITHOUT re-narrowing the replay
-        # gate this same function guards:
-        #   * relationship_days -> PRESENCE of the key counts (0 = "we met today"
-        #     is valid; null/False must still enter the live gate to get a stable
-        #     error, not be silently dropped as an empty patch). Its VALIDITY
-        #     (int/cap) is enforced by the live pre-enqueue check
-        #     (capabilities.identity.relationship_days_error) + the server gate,
-        #     never here — this function also gates replay, where a new rejection
-        #     rule would turn a legal-when-written effect into a retry loop.
-        #   * str  -> non-blank after strip (original behavior)
-        #   * a REAL list field (card_policy.PROFILE_LIST_FIELDS) -> always content:
-        #     [] is a legitimate clear-the-list op (apply_list_ops treats a bare
-        #     `signature: []` as "clear"). A [] on a non-list field is NOT content.
-        #   * everything else (unknown / string field's []/{} / 0 / False) -> bool(v)
-        from identity import card_policy as _cp
+        # Emptiness gate == origin/test baseline, with EXACTLY ONE addition:
+        # relationship_days counts by PRESENCE of the key (round-4). Rationale:
+        #   * relationship_days -> present == content (0 = "we met today" is valid;
+        #     null/False must still pass this gate and hit the live pre-enqueue gate
+        #     (capabilities.identity.relationship_days_error) so the model gets a
+        #     stable, self-correctable error instead of a silent empty-patch drop).
+        #     Its VALIDITY (int/cap) is enforced there + at the server gate, never
+        #     here — this function ALSO gates replay of already-persisted effects,
+        #     where any NEW rejection rule would turn a legal-when-written effect
+        #     into a retry loop.
+        #   * every other field -> identical to origin/test: a str counts when
+        #     non-blank after strip, everything else by bool(value). So bool([])
+        #     is False — a bare `{"signature": []}` / `{"category": []}` /
+        #     `{"unknown": []}` / `{"signature": null}` is empty, exactly as on
+        #     baseline (round-4 reverts the round-2 "any list is content" widening,
+        #     which was the Important-3 hole where signature:null passed this gate
+        #     and then died at the sink as a fake success). RESULT: zero new
+        #     rejections vs origin/test — the replay gate can never judge an old
+        #     effect empty that baseline would have accepted.
         def _has_content(key: str, value) -> bool:
             if key == "relationship_days":
                 return "relationship_days" in merged
             if isinstance(value, str):
                 return bool(value.strip())
-            if key in _cp.PROFILE_LIST_FIELDS:
-                return True
             return bool(value)
         if not any(_has_content(k, v) for k, v in merged.items()):
             return "identity_patch requires a non-empty patch or profile field"

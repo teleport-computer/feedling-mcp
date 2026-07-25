@@ -19,6 +19,7 @@ from core import envelope as core_envelope  # noqa: E402
 from core import store as core_store  # noqa: E402
 from identity import actions as identity_actions_mod  # noqa: E402
 from identity import card_policy  # noqa: E402
+from identity import identity_core  # noqa: E402
 from identity import service as identity_service  # noqa: E402
 
 
@@ -1187,9 +1188,61 @@ def _rel_mocks(monkeypatch, captured):
 
 
 def test_profile_patch_consumes_frozen_anchor_verbatim(client, monkeypatch):
-    # Item 1: when the sink threads in a frozen relationship_started_at (resolved
-    # at enqueue time), _identity_profile_patch uses it VERBATIM — not today-N —
-    # so a delayed replay does not drift the anchor.
+    # Item 1 (round-4): when the TRUSTED sink (capabilities.identity.patch) threads
+    # in a frozen relationship_started_at (resolved at enqueue time) via the
+    # call-path param, _identity_profile_patch uses it VERBATIM — not today-N — so
+    # a delayed replay does not drift the anchor. The anchor travels the call path,
+    # not the request body.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    _rel_mocks(monkeypatch, [])
+
+    # The trusted frozen anchor arrives via the call-path param (the sink route),
+    # NOT the action dict / request body.
+    body, status = identity_core.run_actions(
+        core_store.get_store(user_id),
+        {"action": {"type": "identity.profile_patch", "patch": {"relationship_days": 300}}},
+        api_key=api_key, runtime_token="",
+        trusted_relationship_anchor="2026-04-10")  # frozen by the producer
+    assert status == 200, body
+    saved = db.get_blob(user_id, "identity")
+    assert saved["relationship_started_at"] == "2026-04-10"       # frozen, NOT today-300
+    assert saved["relationship_anchor_source"] == "user_calibrated"
+
+
+def test_profile_patch_frozen_anchor_replay_is_idempotent(client, monkeypatch):
+    # Item 1 (round-4): applying the SAME frozen-anchor sink call twice (the
+    # write-succeeded-but-sink-complete-crashed → replay scenario) produces NO
+    # second change. Routed through the trusted sink call-path param.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    _rel_mocks(monkeypatch, [])
+
+    def _sink_call():
+        return identity_core.run_actions(
+            core_store.get_store(user_id),
+            {"action": {"type": "identity.profile_patch", "patch": {"relationship_days": 300}}},
+            api_key=api_key, runtime_token="",
+            trusted_relationship_anchor="2026-04-10")
+
+    body1, status1 = _sink_call()
+    assert status1 == 200, body1
+    assert body1["effects"][0]["fields"] == ["days_with_user"]
+
+    body2, status2 = _sink_call()
+    assert status2 == 200, body2
+    # No effect emitted, no fields changed — the fixed anchor already matches.
+    assert body2["results"][0].get("noop") is True
+    assert body2["effects"] == []
+
+
+def test_profile_patch_forged_past_anchor_via_public_api_ignored(client, monkeypatch):
+    # Round-4 (Important 1, the core fix): the PUBLIC POST /v1/identity/actions
+    # path is untrusted. A caller who stuffs an ancient relationship_started_at in
+    # the request body (to blow past the 36600-day cap / break the days<->anchor
+    # invariant) is IGNORED — the anchor is recomputed from relationship_days, so
+    # the forged 0001-01-01 has zero effect.
+    from datetime import date, timedelta
     user_id, api_key = _register(client)
     _seed_identity(user_id)
     _rel_mocks(monkeypatch, [])
@@ -1199,38 +1252,18 @@ def test_profile_patch_consumes_frozen_anchor_verbatim(client, monkeypatch):
         headers=_headers(api_key),
         json={"actions": [{
             "type": "identity.profile_patch",
-            "patch": {"relationship_days": 300},
-            "relationship_started_at": "2026-04-10",  # frozen by the producer
+            "patch": {"relationship_days": 1},
+            "relationship_started_at": "0001-01-01",  # forged — must be ignored
         }]},
     )
     assert res.status_code == 200, res.get_data(as_text=True)
     saved = db.get_blob(user_id, "identity")
-    assert saved["relationship_started_at"] == "2026-04-10"       # frozen, NOT today-300
-    assert saved["relationship_anchor_source"] == "user_calibrated"
-
-
-def test_profile_patch_frozen_anchor_replay_is_idempotent(client, monkeypatch):
-    # Item 1: applying the SAME frozen-anchor patch twice (the write-succeeded-but-
-    # sink-complete-crashed → replay scenario) produces NO second change.
-    user_id, api_key = _register(client)
-    _seed_identity(user_id)
-    _rel_mocks(monkeypatch, [])
-
-    action = {
-        "type": "identity.profile_patch",
-        "patch": {"relationship_days": 300},
-        "relationship_started_at": "2026-04-10",
-    }
-    first = client.post("/v1/identity/actions", headers=_headers(api_key), json={"actions": [action]})
-    assert first.status_code == 200
-    assert first.get_json()["effects"][0]["fields"] == ["days_with_user"]
-
-    second = client.post("/v1/identity/actions", headers=_headers(api_key), json={"actions": [action]})
-    assert second.status_code == 200, second.get_data(as_text=True)
-    body = second.get_json()
-    # No effect emitted, no fields changed — the fixed anchor already matches.
-    assert body["results"][0].get("noop") is True
-    assert body["effects"] == []
+    # Anchor came from days (today-1), NOT the forged ancient date.
+    assert saved["relationship_started_at"] == (date.today() - timedelta(days=1)).isoformat()
+    assert saved["relationship_started_at"] != "0001-01-01"
+    # days_with_user stays within the cap — the forge can't inflate it.
+    assert identity_service._live_days_with_user(
+        saved, store=core_store.get_store(user_id)) == 1
 
 
 def test_resolve_relationship_anchor_boundary_verbatim_no_drift():
@@ -1245,7 +1278,7 @@ def test_resolve_relationship_anchor_boundary_verbatim_no_drift():
 
     frozen_at_cap = (date.today() - timedelta(days=MAX)).isoformat()
     got = identity_actions_mod._resolve_relationship_anchor(
-        {"relationship_started_at": frozen_at_cap}, MAX)
+        MAX, trusted_frozen=frozen_at_cap)
     assert got == frozen_at_cap  # verbatim, not recomputed
 
     # Simulate a cross-day replay: a frozen date OLDER than today-MAX (i.e. what
@@ -1254,15 +1287,22 @@ def test_resolve_relationship_anchor_boundary_verbatim_no_drift():
     # future. This is the exact drift case the old code got wrong.
     frozen_older = (date.today() - timedelta(days=MAX + 1)).isoformat()
     assert identity_actions_mod._resolve_relationship_anchor(
-        {"relationship_started_at": frozen_older}, MAX) == frozen_older
+        MAX, trusted_frozen=frozen_older) == frozen_older
+
+
+def test_resolve_relationship_anchor_no_trusted_value_uses_days():
+    # Round-4: with no trusted frozen anchor (the public / direct request path),
+    # resolution ALWAYS comes from days — a request-body date can never be trusted
+    # because it never reaches this function.
+    got = identity_actions_mod._resolve_relationship_anchor(30, trusted_frozen=None)
+    assert got == identity_service._anchor_from_days(30)
 
 
 def test_resolve_relationship_anchor_future_falls_back_to_days():
     # A future frozen anchor is untrusted -> recompute from days.
     from datetime import date, timedelta
     future = (date.today() + timedelta(days=5)).isoformat()
-    got = identity_actions_mod._resolve_relationship_anchor(
-        {"relationship_started_at": future}, 30)
+    got = identity_actions_mod._resolve_relationship_anchor(30, trusted_frozen=future)
     assert got == identity_service._anchor_from_days(30)
     assert got != future
 
@@ -1271,9 +1311,8 @@ def test_resolve_relationship_anchor_is_idempotent():
     # Resolving the same frozen anchor twice yields the same value (noop replay).
     from datetime import date, timedelta
     frozen = (date.today() - timedelta(days=100)).isoformat()
-    action = {"relationship_started_at": frozen}
-    first = identity_actions_mod._resolve_relationship_anchor(action, 100)
-    second = identity_actions_mod._resolve_relationship_anchor(action, 100)
+    first = identity_actions_mod._resolve_relationship_anchor(100, trusted_frozen=frozen)
+    second = identity_actions_mod._resolve_relationship_anchor(100, trusted_frozen=frozen)
     assert first == second == frozen
 
 

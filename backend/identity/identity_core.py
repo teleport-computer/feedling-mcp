@@ -42,8 +42,17 @@ def get_identity(store) -> tuple[dict, int]:
 
 
 def run_actions(
-    store, payload: dict, *, api_key: str | None, runtime_token: str
+    store, payload: dict, *, api_key: str | None, runtime_token: str,
+    trusted_relationship_anchor: str | None = None,
 ) -> tuple[dict, int]:
+    # ``trusted_relationship_anchor`` is the frozen relationship anchor that the
+    # trusted V2 identity SINK (capabilities.identity.patch) resolved at enqueue
+    # time and passes as an explicit keyword argument. It is NEVER read from
+    # ``payload`` — so the PUBLIC ``POST /v1/identity/actions`` handler (which
+    # calls this without the arg) cannot let a caller forge a frozen anchor by
+    # putting ``relationship_started_at`` in the request body (Important 1 /
+    # round-4 fix). On the public path this stays None and the anchor is always
+    # recomputed from ``relationship_days``.
     actions = payload.get("actions")
     if actions is None and isinstance(payload.get("action"), dict):
         actions = [payload["action"]]
@@ -56,6 +65,7 @@ def run_actions(
         api_key,
         actions,
         runtime_token=runtime_token,
+        trusted_relationship_anchor=trusted_relationship_anchor,
     )
 
 

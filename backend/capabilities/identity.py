@@ -115,16 +115,25 @@ def patch(store, *, api_key=None, runtime_token=None, params=None) -> Capability
     # relationship_days -> an absolute relationship_started_at AT ENQUEUE TIME and
     # threaded it here as a trusted top-level param (stripped from the model args
     # in serve_worker._validate_decrypted_tool_effect, never model-authored). Pass
-    # it into the action so _identity_profile_patch consumes the FIXED anchor
-    # instead of recomputing from today's date on a delayed replay (which would
-    # drift the day count and break idempotency). Absent on the direct request
-    # path — there resolution happens once, inline, in _identity_profile_patch.
+    # it down the call path as an EXPLICIT keyword arg (trusted_relationship_anchor)
+    # — NOT by mutating the action dict — so _identity_profile_patch consumes the
+    # FIXED anchor instead of recomputing from today's date on a delayed replay
+    # (which would drift the day count and break idempotency). Routing it via the
+    # call-path parameter (round-4 / Important 1) is what makes the frozen anchor
+    # trusted only when it arrives through THIS sink; the public request path never
+    # passes it, so a request body carrying relationship_started_at cannot forge
+    # one. Absent on the direct request path — there resolution happens once,
+    # inline, from relationship_days in _identity_profile_patch.
     frozen_anchor = params.get("relationship_started_at")
-    if isinstance(frozen_anchor, str) and frozen_anchor.strip():
-        action["relationship_started_at"] = frozen_anchor.strip()
+    trusted_anchor = (
+        frozen_anchor.strip()
+        if isinstance(frozen_anchor, str) and frozen_anchor.strip()
+        else None
+    )
     payload = {"action": action}
-    body, status = identity_core.run_actions(store, payload, api_key=api_key,
-                                             runtime_token=runtime_token or "")
+    body, status = identity_core.run_actions(
+        store, payload, api_key=api_key, runtime_token=runtime_token or "",
+        trusted_relationship_anchor=trusted_anchor)
     return _norm(body, status, default_msg="identity patch unavailable")
 
 
