@@ -60,11 +60,15 @@ backend/
 └── db.py · content_encryption.py · provider_client.py · provider_types.py ·
     enclave_app.py · dstack_tls.py · hosted_runtime.py · semantic_analysis.py ·
     memory_readside_core.py · memory_index_selector.py ·
-    context_memory_selection.py · object_storage.py ·
+    context_memory_selection.py · object_storage.py · redis_pool.py ·
     provider_attempt_ledger.py · worldbook_match.py ·
     worldbook_readside_core.py · debug_trace.py
                     ← 底层独立模块，保持无业务依赖
 ```
+
+> **接入 Redis（缓存 / 锁 / 队列）**：连接池封装在 `backend/redis_pool.py`
+> （用 `redis_pool.get_redis()`，别自己 new 客户端）；命名 / TTL / read-through
+> 等使用规范见 **`docs/REDIS_USAGE.md`**。当前零流量，接入各自另开 spec。
 
 **决策表——你的代码属于哪里：**
 

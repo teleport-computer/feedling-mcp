@@ -1,8 +1,8 @@
 # Redis 使用文档与规范
 
 > 面向**接入 Redis 的后端开发者**。基础设施开通/运维见
-> `deploy/DEPLOYMENTS.md`「TEE Redis」章节；架构决策见
-> `docs/superpowers/specs/2026-07-24-tee-redis-cvm-design.md`。
+> `deploy/DEPLOYMENTS.md`「TEE Redis」章节；连接池实现见
+> `backend/redis_pool.py`；架构取舍见本文 §0-1 与 `docs/CHANGELOG.md`。
 >
 > **当前零流量**：三台 CVM（test/pre/prod）已 running、待命，**没有任何业务
 > 代码引用 Redis**。任何一类接入（缓存 / 队列 / 锁）都各自另开 spec，并把
@@ -57,41 +57,32 @@ gateway 找不到后端、握手时直接关连接，你只会看到 `unexpected
 - **坑**：`redis-cli --tls` 默认**不**发 SNI，必须显式 `--sni <host>`
   （`deploy/verify-redis.sh` 已处理）。任何自研/低层客户端务必确认 SNI 发对。
 
-### Python 连接工厂（接入时新建，放哪见 `CONTRIBUTING.md`）
+### 连接池：用 `backend/redis_pool.py`，别自己 new 客户端
+
+连接池已经封装在 **`backend/redis_pool.py`**（低层无业务依赖模块，与
+`object_storage.py` 同层）。它从上面那套 env 惰性构造一个**进程内共享的池化
+async 客户端**（每 worker 一个有界池，默认 16 连接），TLS/SNI/CA 校验/超时
+都设好了。**直接用它，不要在业务代码里自己 `redis.Redis(...)`**——重复建池
+会打爆连接数、也会绕过这里统一的 fail-closed 校验。
 
 ```python
-# 目前仓库还没有 redis 客户端模块——第一个接入方按 CONTRIBUTING.md 的
-# 依赖方向新建，例如 backend/cache/redis_client.py。示例用 redis-py(async)，
-# 属示意；确切的 TLS 参数名以你用的 redis-py 版本为准。
-import base64, os, tempfile
-import redis.asyncio as redis
+import redis_pool
 
-def make_redis() -> redis.Redis:
-    # CA 经 base64 注入 → 落一个临时文件给 ssl_ca_certs（跨版本最稳的写法；
-    # 新版 redis-py 也可直接用 ssl_ca_data 传 PEM 文本，免落盘）。
-    ca_pem = base64.b64decode(os.environ["REDIS_CA_B64"])
-    ca_file = tempfile.NamedTemporaryFile(suffix=".crt", delete=False)
-    ca_file.write(ca_pem); ca_file.flush()
-
-    host = os.environ["REDIS_HOST"]              # 完整 gateway 主机名
-    return redis.Redis(
-        host=host, port=443,
-        password=os.environ["REDIS_PASSWORD"],
-        ssl=True,
-        ssl_ca_certs=ca_file.name,               # 校验 CA
-        ssl_cert_reqs="required",                # verify-full
-        ssl_check_hostname=True,
-        # redis-py 在 ssl=True 时默认用 host 做 TLS server_hostname(=SNI)，
-        # 而 host 就是完整 gateway 主机名 → SNI 自动对，无需额外设置。
-        decode_responses=False,                  # 存字节，序列化由你控制
-        socket_timeout=3, socket_connect_timeout=3,
-        health_check_interval=30,
-    )
+if redis_pool.redis_configured():          # 未配置就完全走 PG，别碰 Redis
+    r = redis_pool.get_redis()             # 进程内单例，复用连接池
+    val = await r.get("IO:cache:...")
 ```
 
+- `redis_configured()` — 本环境是否配了 Redis（以 `REDIS_HOST` 为准）。
+- `get_redis()` — 返回共享客户端；首调惰性构造，**不建连接**（redis-py 在
+  首条命令时才连），故不阻塞、不发网络。缺口令/CA 会 fail-closed 报错，
+  绝不无鉴权 / 不校验证书地连公网端点。
+- `close_redis()` — 关停时释放连接池（由 `asgi/lifespan.py` 接线时调用）。
+
 **连不上就降级到 PG，绝不阻塞主流程。** Redis 是加速层，它挂了业务必须
-仍能用（走 PG）——这也是「纯临时层」的另一面。给所有 Redis 调用套超时 +
-`try/except`，异常时当作 cache miss 处理。
+仍能用（走 PG）——这也是「纯临时层」的另一面。给所有 Redis 调用套
+`try/except`（连接/超时/池耗尽都会抛），异常时当作 cache miss 处理。
+`redis_pool` 已把 socket 超时设成 3s，不会让卡住的 Redis 拖垮请求。
 
 ---
 

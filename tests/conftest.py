@@ -170,6 +170,10 @@ if not _provisioned:
         # B2: pure stdlib (only imports identity.distill_prompt_v1) — was
         # missing from this list even before this task, fixed in passing.
         "test_identity_distill_prompt.py",
+        # TEE Redis：配置不变量（读 yaml/sh + subprocess，无 DB）与连接池
+        # （构造不建连接，无 DB）。
+        "test_redis_cvm_config.py",
+        "test_redis_pool.py",
     }
     collect_ignore = sorted(
         f
