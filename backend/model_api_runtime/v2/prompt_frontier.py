@@ -425,7 +425,16 @@ def _normalized_overrides(overrides: Mapping[str, Any] | None) -> dict[str, int]
 
 
 _UNAUDITED_DEFAULT_ENV = "FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS"
-_UNAUDITED_DEFAULT_FALLBACK_TOKENS = 16384
+# 32768 rather than 16384: the smaller value's ~11.5k input budget (after the
+# output reserve and 5% safety margin) is too tight for a real user's REQUIRED
+# prompt — system block + identity + a persona/world-book — so custom-relay users
+# with a non-trivial persona hit `prompt_frontier_exhausted` before any provider
+# call even with a tiny chat history (observed in prod). 32768 lifts the input
+# budget to ~27k, which comfortably fits a persona-sized required set while
+# staying at or below the real context window of essentially every current chat
+# model (32k is the modern floor), so it does not over-promise. Deployments whose
+# relays all back large-context models can raise this via the env var below.
+_UNAUDITED_DEFAULT_FALLBACK_TOKENS = 32768
 
 
 def unaudited_default_context_window() -> int:
