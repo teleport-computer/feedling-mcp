@@ -595,9 +595,19 @@ _ERROR_CLASS_RULES = (
      "API Key 无效或已过期，请到设置里重新保存。",
      re.compile(r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b"
                 r"|provider_http_40[13]", re.I)),
+    # 上游下线/改名一个模型时的措辞五花八门，窄正则会让「改个模型名就好」的错误掉进
+    # unknown/blame=system —— 那一档按纪律【不许】引导用户改配置，用户于是永远收不到
+    # 真正原因（2026-07-25 usr_a40e3713eb189d38：DeepSeek 把 deepseek-chat 并入 V4 线，
+    # 报错原文 "The supported API model names are deepseek-v4-pro or deepseek-v4-flash,
+    # but you passed deepseek-chat" 三条规则一条都不命中）。下面每一条都对应真实观测到
+    # 的上游措辞，不做「400 + model」这类宽匹配（400 出现在太多无关报文里）。
     ("model_not_found", "user_provider",
      "模型名不可用，请检查设置里的模型名。",
-     re.compile(r"invalid model name|model_not_found|no such model", re.I)),
+     re.compile(r"invalid model name|model_not_found|no such model|unknown model"
+                r"|supported .{0,40}model names"      # DeepSeek: "The supported API model names are …"
+                r"|model .{0,80}does not exist"       # OpenAI: "The model `x` does not exist…"
+                r"|not a valid model"
+                r"|model[ _]not[ _]found", re.I)),
     ("cli_config_invalid", "user_provider",
      "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。",
      re.compile(r"missing the \{message\} placeholder", re.I)),
@@ -766,6 +776,32 @@ def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
         _system_notice_last_sent[key] = time.monotonic()
     except Exception:
         log.exception("system notice emit failed (non-fatal)")
+
+
+def _turn_failure_reply_text(notice: "AgentErrorNotice") -> str:
+    """前台失败时那条用户可见气泡该说什么。
+
+    `blame=user_provider` 的错误（余额耗尽 / key 失效 / 模型名被上游下线 / 上下文超限）
+    **永不自愈**。对这类错误发 FALLBACK_REPLY 的「你稍后再发一次，我会继续接」是在
+    骗用户重试，而每一次重试都是又一次注定失败的 provider 调用（并且照样计费）。
+    2026-07-25 的 usr_a40e3713eb189d38 / usr_d98b8d68124090a6 正是这样连吃了几十条
+    「刚刚没接上」，从头到尾没被告知真正原因（模型名下线 / 余额为 0）。
+
+    只有**会自愈**的错误——超时、5xx、限流、流断，以及我们自己的 bug——才配用兜底话术，
+    因为对它们来说「稍后再发一次」是真话。"""
+    if notice is not None and notice.blame == "user_provider":
+        return notice.user_text
+    return FALLBACK_REPLY
+
+
+def _suppress_duplicate_upstream_banner(notice: "AgentErrorNotice") -> None:
+    """可行动话术已经作为回复气泡说过一遍了，别再补一条内容重复的 system 横幅。
+
+    直接盖章 _notify_agent_turn_failure 用的同一个节流键即可——设置页上报
+    (_report_runtime_error) 在该函数里位于节流判断**之前**，因此不受影响。"""
+    if notice is None:
+        return
+    _system_notice_last_sent[notice.error_class] = time.monotonic()
 
 
 def _note_agent_turn_success() -> None:
@@ -11882,7 +11918,13 @@ def _process_messages(messages: list) -> float:
             # 上报/system 通知与兜底话术解耦（Codex review）：SEND_FALLBACK_ON_AGENT_ERROR
             # 只管发不发 FALLBACK_REPLY，错误透出（设置页 + system 通知）两种配置下都要发。
             if SEND_FALLBACK_ON_AGENT_ERROR:
-                agent_result = [FALLBACK_REPLY]
+                # 兜底话术只对「会自愈」的错误成立；配置类错误改发可行动话术，
+                # 否则用户被引导去重试一个永远不会成功的调用（见
+                # _turn_failure_reply_text）。
+                failure_notice = classify_agent_error(e)
+                agent_result = [_turn_failure_reply_text(failure_notice)]
+                if failure_notice.blame == "user_provider":
+                    _suppress_duplicate_upstream_banner(failure_notice)
                 pending_failure_notice = e
             else:
                 # 关兜底时没有回复写入可挂排他性，当场通知（此配置下 failover 双

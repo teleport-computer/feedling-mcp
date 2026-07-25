@@ -96,6 +96,11 @@ def test_classify_upstream_mirrors_consumer_on_samples():
         "400 unsupported parameter 'tool_choice'",
         "maximum context length exceeded",
         "blocked by content policy",
+        # 上游下线模型名的两种真实措辞（2026-07-25 usr_a40e 回归）：两份正则必须同时认，
+        # 否则「改个模型名就好」的错误在某一侧掉进 unknown/blame=system。
+        "API Error: 400 The supported API model names are deepseek-v4-pro or "
+        "deepseek-v4-flash, but you passed deepseek-chat",
+        "404 The model `gpt-4.9-turbo` does not exist or you do not have access to it.",
         # provider_http_<code> slug shape (genesis/import worker errors): the
         # underscore defeats \b<code>\b, so the slug rules must catch these.
         "plaintext_import_failed:ProviderError:provider_http_504: <!DOCTYPE html>",

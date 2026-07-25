@@ -1078,6 +1078,46 @@ def test_agent_failure_posts_visible_fallback_by_default(monkeypatch):
     assert result_ts == pytest.approx(100.0)
 
 
+def test_user_provider_failure_posts_actionable_line_not_fallback(monkeypatch):
+    """blame=user_provider 的失败（余额 / key / 模型名下线）永不自愈。
+
+    此前不论哪一类错误都糊同一句 FALLBACK_REPLY「你稍后再发一次，我会继续接」——
+    对配置类错误这是在骗用户重试，而每次重试都是又一次注定失败且照样计费的
+    provider 调用（2026-07-25 usr_a40e3713eb189d38：模型名被 DeepSeek 下线，
+    连吃几十条「刚刚没接上」，从没被告知真正原因）。
+
+    现在这类改发可行动话术，且不再补一条内容重复的 system 横幅（同一句话说两遍）；
+    设置页上报在节流判断之前，照常发生。"""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
+    monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: True)
+    crc._reset_system_notice_state()
+
+    upstream = RuntimeError(
+        "cli agent exited 1: API Error: 400 The supported API model names are "
+        "deepseek-v4-pro or deepseek-v4-flash, but you passed deepseek-chat")
+
+    with patch.object(crc, "call_agent", side_effect=upstream), \
+         patch.object(crc, "post_reply") as mock_post:
+        crc._process_messages([
+            {"id": "model-gone-1", "role": "user", "content": "在吗", "ts": 100.0}
+        ])
+
+    visible = [c for c in mock_post.call_args_list if c.kwargs.get("role") != "system"]
+    banners = [c for c in mock_post.call_args_list if c.kwargs.get("role") == "system"]
+
+    assert len(visible) == 1
+    assert visible[0].args[0] == "模型名不可用，请检查设置里的模型名。"
+    assert visible[0].args[0] != crc.FALLBACK_REPLY
+    assert "稍后再发一次" not in visible[0].args[0]
+    # 结构化元信息照旧下发，iOS 的错误 chip 依赖它。
+    assert visible[0].kwargs["turn_failure_error_class"] == "model_not_found"
+    assert visible[0].kwargs["turn_failure_blame"] == "user_provider"
+    # 同一句话不说两遍。
+    assert banners == []
+
+
 def test_no_error_notice_when_fallback_rejected_already_answered(monkeypatch):
     """Failover 去重（Codex review）：claim 过期后另一家已回复，本家兜底被
     already_answered 409 拒 → system 错误通知也必须一并压掉，不许出现
