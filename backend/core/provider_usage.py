@@ -101,18 +101,27 @@ def _err_slug(exc: Exception) -> str:
 
 
 async def _get_json(client, url: str, *, api_key: str):
-    """returns (json_dict | None, err_slug | None)。绝不把响应正文放进 slug。"""
+    """returns (json_dict | None, err_slug | None)。绝不把响应正文放进 slug。
+
+    流式读取，运行中累计字节数、超过 _MAX_RESPONSE_BYTES 立刻停止（不把
+    整个响应体吃进内存后再判断），防御恶意/超大 relay 响应。
+    """
     try:
-        resp = await client.get(url, headers={"Authorization": f"Bearer {api_key}"},
-                                follow_redirects=False)
+        async with client.stream("GET", url, headers={"Authorization": f"Bearer {api_key}"},
+                                 follow_redirects=False) as resp:
+            if resp.status_code != 200:
+                return None, f"usage_http_{int(resp.status_code)}"
+            chunks = []
+            total = 0
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+                if total > _MAX_RESPONSE_BYTES:
+                    return None, "usage_bad_response"
+                chunks.append(chunk)
     except Exception as e:  # noqa: BLE001 — 归一化成 slug，绝不透传异常文本
         return None, _err_slug(e)
-    if resp.status_code != 200:
-        return None, f"usage_http_{int(resp.status_code)}"
-    if len(getattr(resp, "content", b"") or b"") > _MAX_RESPONSE_BYTES:
-        return None, "usage_bad_response"
     try:
-        data = resp.json()
+        data = _json.loads(b"".join(chunks))
     except Exception:
         return None, "usage_bad_response"
     if not isinstance(data, dict):

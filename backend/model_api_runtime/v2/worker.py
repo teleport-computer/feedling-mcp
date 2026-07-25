@@ -2728,7 +2728,7 @@ def _make_provider_usage_dispatcher(
     async def _dispatch(tool_calls) -> list[ToolResult]:
         results: list[ToolResult] = []
         try:
-            halted = kill_switch.provider_usage_halted()
+            halted = await asyncio.to_thread(kill_switch.provider_usage_halted)
         except Exception:  # noqa: BLE001 — a broken read counts as halted
             halted = True
         for tc in tool_calls:

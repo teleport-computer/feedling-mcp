@@ -36,6 +36,7 @@ import asyncio, json
 
 
 class FakeResponse:
+    """既支持旧的 .json()/.content 直接访问，也支持新的 stream() aiter_bytes 协议。"""
     def __init__(self, status_code=200, body=None):
         self.status_code = status_code
         self._body = body if body is not None else {}
@@ -44,6 +45,19 @@ class FakeResponse:
 
     def json(self):
         return self._body
+
+    async def aiter_bytes(self):
+        # 模拟真实分块传输：切成小块，逼真化 running-cap 的累加路径
+        data = self.content
+        chunk_size = 7
+        for i in range(0, len(data), chunk_size):
+            yield data[i:i + chunk_size]
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
 
 
 class FakeAsyncClient:
@@ -58,14 +72,26 @@ class FakeAsyncClient:
     async def __aexit__(self, *a):
         return False
 
-    async def get(self, url, headers=None, timeout=None, follow_redirects=None):
+    def stream(self, method, url, headers=None, timeout=None, follow_redirects=None):
         self.requests.append((url, dict(headers or {})))
         for frag, resp in self.routes.items():
             if frag in url:
                 if isinstance(resp, Exception):
-                    raise resp
+                    return _RaisingStreamCtx(resp)
                 return resp
         return FakeResponse(404, {})
+
+
+class _RaisingStreamCtx:
+    """`async with client.stream(...)` 时抛异常（连接错误/超时等）的假上下文管理器。"""
+    def __init__(self, exc):
+        self._exc = exc
+
+    async def __aenter__(self):
+        raise self._exc
+
+    async def __aexit__(self, *a):
+        return False
 
 
 def _cfg(provider, base_url=""):
