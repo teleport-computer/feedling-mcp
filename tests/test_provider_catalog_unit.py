@@ -350,6 +350,20 @@ def test_list_models_later_page_failure_is_partial(monkeypatch):
     assert res["catalog_supported"] is True
 
 
+def test_list_models_empty_first_page_then_failing_second_is_partial(monkeypatch):
+    # A legit-empty first page WITH a next cursor, then a 503 on page 2. Keying
+    # on model count would misfire the first-page `raise` (0 models collected);
+    # keying on page index must treat this as partial success.
+    _install_fake_stream(monkeypatch, [
+        (200, {"data": [], "has_more": True, "last_id": "cur1"}),
+        (503, {"error": "upstream"}),
+    ])
+    res = pc.list_provider_models("anthropic", "k", "")
+    assert res["models"] == []
+    assert res["complete"] is False
+    assert res["catalog_supported"] is True
+
+
 def test_list_models_first_page_failure_raises(monkeypatch):
     _install_fake_stream(monkeypatch, [(401, {"error": "bad key"})])
     with pytest.raises(pc.ProviderError) as ei:

@@ -3621,16 +3621,21 @@ def list_provider_models(provider: str, api_key: str, base_url: str = "") -> dic
                 client, url, headers, params, deadline, total_bytes)
             page_models, next_cursor = _parse_catalog_page(provider, body)
         except ProviderError as e:
-            if not models:
-                # First page. A 404 on a custom endpoint just means "no /models
-                # route" → let the client fall back to manual entry, don't error.
+            if _page == 0:
+                # FIRST fetch failed — key on the page index, NOT on model count.
+                # A legitimately-empty first page that carries a next cursor,
+                # followed by a later-page failure, must NOT be treated as a
+                # first-page failure just because zero models were collected.
+                # A 404 on a custom endpoint just means "no /models route" → let
+                # the client fall back to manual entry, don't error.
                 if (provider == "openai_compatible"
                         and getattr(e, "status_code", None) == 404):
                     return {"models": [], "complete": True, "warnings": [],
                             "catalog_supported": False}
                 raise
-            # Later page failed (network / http / size / bad shape): keep the
-            # models already collected, mark incomplete.
+            # A LATER page failed (network / http / size / bad shape / deadline):
+            # partial success — keep whatever earlier pages returned (possibly an
+            # empty set) and mark incomplete, regardless of model count.
             complete = False
             warnings.append(f"catalog page dropped: {e}")
             break
