@@ -118,7 +118,7 @@ these settings:
 | Setting | Requirement |
 | --- | --- |
 | `DATABASE_URL` | Required. Use a dedicated PostgreSQL role and database. External connections must use TLS, such as `sslmode=require`, and should verify the server certificate where the environment supports it. |
-| `FEEDLING_HOSTED_RUNTIME_POLICY` | Hosted deployments are `v2_only`. The reference Compose files set this literally; retired resident/per-user selectors are rejected. |
+| `FEEDLING_HOSTED_RUNTIME_POLICY` | The code default and managed deployments are `dual` (V1 resident supervisor and Runtime V2 coexist behind a per-user fence). The reference self-hosting Compose file pins `v2_only`, a fail-closed override under which resident/per-user selectors are rejected. |
 | `FEEDLING_RUNTIME_TOKEN_SECRET` | Required by the current hosted topology. Generate a high-entropy secret, supply it to the backend and Runtime V2 workers through a secret manager, and never bake it into an image. |
 | `FEEDLING_V2_MAX_WORKERS` | Bounds concurrent Runtime V2 turn slots per worker container. Size it together with PostgreSQL pool capacity and provider limits. |
 | `FEEDLING_V2_SANDBOX_PROVIDER` | Defaults to `disabled`. Set to `e2b` only on worker deployments that are allowed to send decrypted artifact bytes to E2B. Text-only turns and virtual text edits do not need it. |

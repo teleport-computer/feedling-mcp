@@ -34,7 +34,9 @@ agent_runtime/
   spawners.py      isolation seam: process (default) | container (opt-in);
                    builds the resident-consumer env; ProcessSpawner reaps via poll()
   leases.py        DB-backed lease (acquire/renew/release/takeover) over
-                   agent_runtime_instances (migration 0005)
+                   agent_runtime_instances (migration 0004)
+  introduction.py  shared one-shot post-spawn introduction machinery
+                   (used by supervisor spawn path + chat.chat_core)
   tokens.py        short-lived user-scoped runtime tokens (mint/verify) — kept for
                    the future backend runtime-token auth path (not used yet)
 ```

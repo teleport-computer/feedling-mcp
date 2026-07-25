@@ -1,6 +1,5 @@
 import threading
 
-import pytest
 
 from model_api_runtime.v2 import serve_worker
 

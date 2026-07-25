@@ -1,5 +1,12 @@
 # TEE 内明文 Postgres 迁移设计（feedling-mcp）
 
+> **部分退役说明（2026-07-25 补注）.** 本设计 Phase 0–1（pg CVM 基建）已
+> 落地现役；Phase 2–3（向 hosted supervisor 表 shadow/dual-write）随
+> supervisor 拓扑退役而作废（对应 plan
+> `2026-07-07-tee-pg-phase2-3-shadow-dualwrite.md` 已 RETIRED）。文中
+> `litellm gateway`（已移除）/`supervisor_heartbeats` 等引用为当时背景，
+> 不代表现状。
+
 日期：2026-07-04（2026-07-07 三轮复核补充，见各节【补充】标记。
 第一轮对照参考文档：监控最小权限角色、restore 演练环境、WAL 堆积磁盘告警、
 WAL-G↔PG17 核验、TLS 证书生命周期、部署预检、max_connections 容量、

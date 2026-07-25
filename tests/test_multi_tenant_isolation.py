@@ -315,7 +315,6 @@ def test_concurrent_full_flow_per_user(backend):
     for me in results:
         my_uid = me["user_id"]
         my_key = me["api_key"]
-        my_markers = set(me["memory_markers"]) | set(me["chat_markers"]) | {me["identity_marker_final"]}
         other_markers = set()
         for other in results:
             if other["user_id"] == my_uid:

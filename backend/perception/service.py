@@ -25,7 +25,6 @@ from typing import Any, Callable, Mapping
 
 from content_encryption import random_item_id
 from core import enclave as core_enclave
-from core import util as core_util
 
 from . import catalog, history, permissions, resolve, store
 from .ingress_v2 import device_event_observations_v2, operation_observations_v2, observe_signal_v2

@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 import types
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 import pytest
 

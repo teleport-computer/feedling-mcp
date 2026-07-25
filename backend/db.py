@@ -3302,33 +3302,6 @@ def list_agent_runtime_enabled_users() -> list[dict]:
         return []
 
 
-def try_stamp_hosted_tick(user_id: str, doc: dict, now: float, interval_sec: float) -> bool:
-    """Atomically claim this user's next hosted-heartbeat slot. Stamps the
-    ``hosted_tick`` blob with ``doc`` iff there is no prior stamp or the prior
-    one is at least ``interval_sec`` old, and returns whether THIS call won.
-
-    Replaces the read-then-write ts check so that two workers which both hold
-    the user's plaintext key can't each create a heartbeat in the same interval
-    (the per-job consume path is separately deduped by the job-status CAS in
-    log_patch_item). ``doc`` must carry a numeric ``ts`` field."""
-    sql = ("INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, 'hosted_tick', %s) "
-           "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc "
-           "WHERE COALESCE((user_blobs.doc->>'ts')::float8, 0) <= %s "
-           "RETURNING doc")
-    try:
-        threshold = now - interval_sec
-        with get_pool().connection() as conn:
-            row = conn.execute(sql, (user_id, Jsonb(doc), threshold)).fetchone()
-    except Exception as e:
-        log.error("[db] try_stamp_hosted_tick(%s) failed: %s", user_id, e)
-        return False
-    won = row is not None
-    if won:
-        from tee_shadow import mirror
-        mirror.execute(sql, (user_id, Jsonb(doc), threshold))
-    return won
-
-
 def claim_and_enqueue_introduction(
     user_id: str,
     settings_doc: dict,
@@ -3585,16 +3558,6 @@ def genesis_list_jobs(user_id: str, *, limit: int = 20) -> list[dict]:
                 item[key] = value.isoformat()
         out.append(item)
     return out
-
-
-def genesis_latest_done_job(user_id: str) -> dict | None:
-    with get_pool().connection() as conn:
-        cur = conn.execute(
-            "SELECT * FROM genesis_import_jobs WHERE user_id = %s AND status = 'done' "
-            "ORDER BY completed_at DESC NULLS LAST, updated_at DESC LIMIT 1",
-            (user_id,),
-        )
-        return _genesis_row(cur, cur.fetchone())
 
 
 def genesis_claim_uploaded_jobs(*, worker_id: str = "", limit: int = 1) -> list[dict]:

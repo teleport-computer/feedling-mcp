@@ -30,7 +30,6 @@ Signature data is captured but not parsed.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 
 # Constants from the TDX v4 spec

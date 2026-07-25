@@ -4,7 +4,6 @@ Pure-unit (no PG): backend/agent_runtime/spawners.py's _IO_CLI_VERBS allowlist
 and the io_cli command catalog (tools/io_cli_catalog.py, T6's VPS mechanism)
 rendered into the hosted agent prompt at ``<io_cli_catalog>``.
 """
-import os
 import re
 import sys
 from pathlib import Path

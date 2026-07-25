@@ -1,5 +1,6 @@
 backend/__pycache__/
 **/__pycache__/
+.pytest_cache/
 
 # Foundry build artifacts — contracts/lib is a vendored dep we do commit
 contracts/out/
@@ -15,9 +16,6 @@ contracts/.env
 .DS_Store
 
 # Xcode
-testapp/FeedlingTest.xcodeproj/xcuserdata/
-testapp/FeedlingTest.xcodeproj/project.xcworkspace/xcuserdata/
-testapp/build/
 
 # Swift build artifacts
 ios/FeedlingDCAP/.build/

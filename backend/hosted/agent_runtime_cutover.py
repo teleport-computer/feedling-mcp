@@ -116,10 +116,6 @@ def build_processing_response(user_row: dict, *, driver: str) -> tuple[dict, int
 _SUPERVISOR_HEARTBEAT_MAX_AGE_SEC = 90.0
 
 
-def _env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
-
-
 def _heartbeat_max_age() -> float:
     raw = os.environ.get("FEEDLING_SUPERVISOR_HEARTBEAT_MAX_AGE_SEC", "").strip()
     if not raw:

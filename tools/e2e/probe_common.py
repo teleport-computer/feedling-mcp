@@ -15,7 +15,6 @@ backend invariants run once (deep.py owns that flag).
 """
 from __future__ import annotations
 
-import time
 import uuid
 
 # -- result taxonomy (ordered most→least severe) ----------------------------

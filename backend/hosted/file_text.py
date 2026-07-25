@@ -1,8 +1,11 @@
-"""Legacy in-process document text extraction helpers.
+"""In-process document text extraction helpers.
 
-This module is retained for compatibility tests only. Runtime V2 deliberately
-does not import it: an attachment cache miss must materialize and parse through
-an audited sandbox provider, or fail closed before decrypting physical bytes.
+Production consumer: the Runtime V2 ``local`` sandbox provider
+(``backend/workspace/local_sandbox.py``, opted in via
+``FEEDLING_V2_SANDBOX_PROVIDER=local``) calls ``extract_file_text`` to read
+document bodies in-process. Deployments without a sandbox provider still fail
+closed before decrypting physical bytes — this module only runs once a
+provider is explicitly configured.
 
 - docx / xlsx are zip+XML → pure stdlib (no dependency), mirroring the resident
   extractors so the two paths agree on what text a document yields.

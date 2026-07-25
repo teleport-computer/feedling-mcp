@@ -1,5 +1,10 @@
 # D0 Rollout Infrastructure Implementation Plan
 
+> **RETIRED / DO NOT DEPLOY.** Historical cutover plan：单向 V2 互斥闸
+> rollout 机制已被 2026-07-21 dual 共存的 per-user fence
+> （`resident/draining/v2` + generation）双向切换取代。对应 spec
+> （`…-D0-rollout-infrastructure-design.md`）已 RETIRED，本 plan 同判。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development. Steps use checkbox (`- [ ]`).
 
 **Goal:** 让 V2 在 prod 能跑、安全、可控：部署 worker 池 + 互斥闸 + mode setter + per-turn 指标。

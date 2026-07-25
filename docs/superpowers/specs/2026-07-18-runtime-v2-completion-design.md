@@ -1,5 +1,13 @@
 # Runtime V2 Completion Design
 
+> **RETIRED / SUPERSEDED（2026-07-21）.** 本设计的核心命题——V2-only、杀
+> resident、无 supervisor 拓扑——已被
+> `2026-07-21-dual-runtime-v1-v2-coexistence-design.md` 反转：V1 resident
+> supervisor 已恢复并与 V2 共存（prod 默认全员 V1，policy 默认 `dual`，
+> serve-worker 并入主 CVM）。文中「no resident / V2-only / 部署校验无
+> resident 进程」等结论不再适用；durable history、capture-dream 持久化、
+> workspace/cache 等非拓扑部分仍已落地。
+
 Date: 2026-07-18
 Branch: `codex/runtime-v2-completion`
 Base: `origin/pre` at `9721b226`

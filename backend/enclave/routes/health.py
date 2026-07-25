@@ -16,7 +16,7 @@ router = APIRouter()
 def _health_body() -> dict:
     """Liveness + readiness snapshot, built purely from the in-memory ``_state``.
 
-    The enclave is single-threaded and reentrancy-sensitive, so /healthz does
+    The enclave is reentrancy-sensitive, so /healthz does
     NO crypto and NO backend round-trip — every field here is a plain read of
     the attestation/bootstrap state cached at process start. Backward compatible:
     ``ok`` / ``ready`` / ``error`` keep their old meaning; ``status`` /

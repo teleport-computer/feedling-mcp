@@ -9625,7 +9625,6 @@ def _resident_perception_now() -> dict:
 # from the consumer's real clock + the user's timezone (stable; sourced from
 # the whoami cache), so every turn/wake is anchored to the real present.
 _last_interaction_unix: float = 0.0
-_WEEKDAYS_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
 def _user_timezone() -> str:

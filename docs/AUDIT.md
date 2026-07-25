@@ -73,8 +73,8 @@ shell + code-read + web access.
 | 5 | The attestation TLS cert on the `-5003s.` URL is the one the enclave attested. | `tools/audit_live_cvm.py` row 7 pins `sha256(cert.DER)` vs the attested fingerprint. Row 8 is now a disclosure row: the MCP service was removed 2026-06-12 (`mcp_tls_cert_pubkey_fingerprint_hex` stays empty in the bundle); content privacy is enforced by envelopes sealed to `enclave_content_pk`. | 1 min |
 | 6 | The backend code doesn't decrypt content. | Read the route modules (`backend/*/routes_asgi.py`, assembled by `backend/asgi_app.py`). `/v1/chat/message`, `/v1/memory/add`, `/v1/identity/init`, `/v1/content/swap` all require v1 envelopes and store them verbatim — no crypto primitives called, and plaintext bodies now 400. The only place envelope bodies are decrypted is `backend/enclave_app.py`, which runs inside the TDX container. | 20 min |
 | 7 | Identity.nudge can't silently mutate encrypted cards. | The HTTP `/v1/identity/nudge` endpoint was removed in the 2026-04-20 v0 strip; the MCP nudge tool was removed with the MCP line on 2026-06-12. Identity mutation now only happens via `/v1/identity/actions` envelope-rewrap actions (decrypt happens in the enclave). Plaintext mutation is not expressible on the wire. | 2 min |
-| 8 | The iOS app actually pins the TLS cert, not just displays a green check. | Read `testapp/FeedlingTest/AuditCardView.swift` `PinningCaptureDelegate` + `AuditViewModel.run`. The delegate captures the server's `sha256(cert.DER)` during the TLS handshake; the viewmodel compares it to `bundle.enclave_tls_cert_fingerprint_hex`. Mismatch ⇒ red row + "MITM detected". | 10 min |
-| 9 | The iOS app decrypts client-side, not via the server. | Read `testapp/FeedlingTest/ContentEncryption.swift` + `ChatMessage.decryptedIfNeeded`. Envelopes land in view models, are unsealed with `user_sk` from Keychain, body AEAD-opened with the recovered `K`. | 15 min |
+| 8 | The iOS app actually pins the TLS cert, not just displays a green check. | Read `FeedlingTest/AuditCardView.swift` (separate iOS app repo — iOS moved out of this repo 2026-05-22) `PinningCaptureDelegate` + `AuditViewModel.run`. The delegate captures the server's `sha256(cert.DER)` during the TLS handshake; the viewmodel compares it to `bundle.enclave_tls_cert_fingerprint_hex`. Mismatch ⇒ red row + "MITM detected". | 10 min |
+| 9 | The iOS app decrypts client-side, not via the server. | Read `FeedlingTest/ContentEncryption.swift` (separate iOS app repo) + `ChatMessage.decryptedIfNeeded`. Envelopes land in view models, are unsealed with `user_sk` from Keychain, body AEAD-opened with the recovered `K`. | 15 min |
 | 10 | Reset actually deletes the ciphertext (not just local). | Read `backend/content/routes_asgi.py` `/v1/account/reset`. Calls `shutil.rmtree(store.dir)` + removes the user from `users.json` + evicts the `api_key_hash` cache. Second call with the same key 401s because the user no longer exists. | 5 min |
 
 If rows 4, 5, and 3 pass in that order, the "something real is
@@ -97,14 +97,15 @@ source-review work.
 - `backend/content_encryption.py` — Python mirror of iOS's
   `ContentEncryption.swift`. Same primitives on both sides; if they
   drift, AEAD verification fails on read-back.
-- `testapp/FeedlingTest/ContentEncryption.swift` — iOS client
-  envelope builder + unsealer.
-- `testapp/FeedlingTest/DCAP/` — Intel TDX quote parser + verifier,
+- `FeedlingTest/ContentEncryption.swift` — iOS client envelope
+  builder + unsealer. (iOS source moved to its own repository on
+  2026-05-22; this and the paths below live there, not here.)
+- `FeedlingTest/DCAP/` — Intel TDX quote parser + verifier,
   runs fully on-device.
 
 ### Attestation & trust UI
 
-- `testapp/FeedlingTest/AuditCardView.swift` — the audit card the
+- `FeedlingTest/AuditCardView.swift` — the audit card the
   user sees in Settings → Privacy. Worth reading end-to-end;
   surfaces every check in a labelled row + a tap-to-expand
   mechanism reveal per row.
@@ -257,9 +258,9 @@ reproducible-iOS-build story is a real gap; we mention it here
 instead of pretending it's not there.
 
 Mitigation an agent can recommend: if a user is especially
-paranoid, they can check out this repo, build the iOS app locally,
-and install it via Xcode directly — bypassing any middle party.
-`testapp/FeedlingTest.xcodeproj` is the project.
+paranoid, they can check out the separate iOS app repository, build
+the app locally, and install it via Xcode directly — bypassing any
+middle party.
 
 ---
 

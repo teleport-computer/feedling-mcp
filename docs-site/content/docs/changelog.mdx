@@ -498,15 +498,18 @@ themselves add a backend endpoint or change production request handling.
 
 ### Storage and deployment
 
-- Hosted model-API execution is now Runtime V2-only in local, test, pre, and
-  production deployment manifests. The resident supervisor, per-user CLI
-  processes/homes/leases, rollback selectors, and hosted resident admin flip
-  have been removed. The independently operated `/v1/chat/*` resident consumer
-  remains available and is not a hosted fallback.
-- Test, pre, and production deploys now treat their pooled Runtime V2 worker CVM
-  as mandatory. Hosted sends fail before persistence when no fresh worker
-  heartbeat or capacity is available; the worker image contains only the Python
-  V2 runtime, not agent CLIs or resident data volumes.
+- Hosted model-API execution now runs a dual-runtime topology: the pooled
+  Runtime V2 serve-worker runs inside the main confidential VM alongside the
+  backend, while the V1 resident supervisor (per-user CLI processes, homes, and
+  leases) stays available in its own CVM behind a per-user runtime fence.
+  `FEEDLING_HOSTED_RUNTIME_POLICY` defaults to `dual`; the reference
+  self-hosting Compose pins the fail-closed `v2_only` override. The
+  independently operated `/v1/chat/*` resident consumer remains available and
+  is not a hosted fallback.
+- For accounts on Runtime V2 (and any `v2_only` deployment), hosted sends fail
+  before persistence when no fresh worker heartbeat or capacity is available;
+  the V2 runtime is pure Python and does not use agent CLIs or resident data
+  volumes.
 - Heavy Chat **image** bodies are now offloaded to object storage alongside file
   bodies, under a separate `chatimages/` key prefix so image retention and usage
   can be governed on their own. The message row keeps envelope metadata plus a

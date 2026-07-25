@@ -1,11 +1,15 @@
 # Prod 部署验证清单 — 2026-07 test→main 批次
 
+> 本文是 2026-07 某一批 test→main 部署的实例快照（一次性产物），保留是因为
+> `RELEASE_TESTING_PROTOCOL.md` §6 把它当结构模板引用。别按文中具体
+> commit/用户号执行。
+
 Status: PREPARED (部署前备好)。执行时机:zhihao 完成 prod 部署后,claude 逐项跑。
 本批 test→main 合并携带 13 个实质 commit(另有更早已合并未部署的 fix ①)。
 
 执行约定:admin API 走 `https://api.feedling.app`,X-Admin-Token 见会话内记录;
-网页看板 `https://api.feedling.app/admin/data-track`(密码通道若 zhihao 按
-docs/ENABLE_PROD_ADMIN_PASSWORD_2026-07-14.md 一并配好,顺带验证 §6)。
+网页看板 `https://api.feedling.app/admin/data-track`(密码通道配置文档已因
+2026-07-14 密码泄漏事故删除并 rotate,不再引用)。
 所有时间以看板显示的北京时间为准。
 
 ## 0. 部署本身

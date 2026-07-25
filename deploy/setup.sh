@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# ⚠️ LEGACY: VPS/systemd resident-route setup (pre-CVM era). Production is
+# all-CVM now; for the current self-hosting path use the docker-compose flow
+# in docs-site/content/docs/self-hosting.mdx. Kept for the legacy runbook
+# deploy/SELF_HOSTING.md, which carries the same banner.
+#
 # Feedling VPS setup script
 # Run as ubuntu user on the EC2 instance
 # Usage: bash deploy/setup.sh [--install-caddy]

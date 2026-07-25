@@ -2,7 +2,7 @@
 
 Wire-compatible with:
   - testapp/FeedlingTest/ContentEncryption.swift (iOS side)
-  - backend/enclave_app.py _box_seal_open_hkdf / _decrypt_envelope (enclave side)
+  - backend/enclave/envelope.py box_seal_open_hkdf / decrypt_envelope (enclave side)
 
 Scope:
   - `box_seal(plaintext, recipient_pk)` — wrap a symmetric key for a recipient.
@@ -25,7 +25,7 @@ Primitives used (matches iOS + enclave):
 
 If any of those drift, the enclave's AEAD verify fails and the agent
 can't read that item back. Keep this module in lockstep with
-`ContentEncryption.swift` and the enclave's `_box_seal_open_hkdf`.
+`ContentEncryption.swift` and the enclave's `box_seal_open_hkdf`.
 """
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ def box_seal(plaintext: bytes, recipient_pk_bytes: bytes) -> bytes:
     matching `recipient_pk_bytes` (raw 32-byte encoding).
 
     Wire-compatible with testapp/FeedlingTest/ContentEncryption.swift's
-    BoxSeal.seal and backend/enclave_app.py's `_box_seal_open_hkdf`.
+    BoxSeal.seal and backend/enclave/envelope.py's `box_seal_open_hkdf`.
     """
     if len(recipient_pk_bytes) != 32:
         raise ValueError(f"recipient pubkey must be 32 bytes, got {len(recipient_pk_bytes)}")
@@ -73,7 +73,7 @@ def box_seal(plaintext: bytes, recipient_pk_bytes: bytes) -> bytes:
 
     # HKDF: salt=None, info="feedling-box-seal-v1", 32 bytes.
     # `salt=None` matches iOS `salt: Data()` and the enclave's
-    # _box_seal_open_hkdf — all three resolve to a zero-filled salt of
+    # box_seal_open_hkdf — all three resolve to a zero-filled salt of
     # the hash's output length (32 bytes for SHA-256).
     k_wrap = HKDF(algorithm=SHA256(), length=32, salt=None,
                   info=_BOX_SEAL_INFO).derive(shared)

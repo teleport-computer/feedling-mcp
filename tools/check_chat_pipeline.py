@@ -21,12 +21,10 @@ Checks:
   4. Recent closed loop (user message followed by assistant reply in last 10 min)
 """
 
-import json
 import os
 import subprocess
 import sys
 import time
-from datetime import datetime
 
 try:
     import httpx

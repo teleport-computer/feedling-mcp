@@ -39,7 +39,7 @@ meant the edits were lost on any VPS rebuild.
 
 ## Keep SIGNALS in sync
 `SIGNALS` in `index.js` MUST mirror the agent-pullable signals — i.e.
-`AGENT_PERCEPTION_SIGNALS` in `backend/agent/routes.py` and the groups in
+`AGENT_PERCEPTION_SIGNALS` in `backend/agent/perception_core.py` and the groups in
 `tools/io_cli.py`. When a new signal is exposed to the agent, add it here too,
 copy this file to the VPS, and restart the gateway (below).
 

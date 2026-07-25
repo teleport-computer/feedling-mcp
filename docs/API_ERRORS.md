@@ -77,6 +77,8 @@
 | `credential_not_found` | 404 | user_provider | 指定的 credential id 不属于该用户或已删除 | |
 | `api_key_or_credential_id_required` | 400 | user_provider | POST /routes 必须且只能给 api_key 与 credential_id 之一 | |
 | `nothing_to_update` | 400 | — | PATCH /credentials 两者（label/api_key）都不给 | |
+| `invalid_reasoning_effort` | 400 | — | reasoning effort 取值非法（setup/patch 两处校验） | |
+| `model_api_config_delete_failed` | 500 | system | 删除 model_api 配置时 DB 写失败 | |
 
 ## 聊天
 
@@ -94,6 +96,7 @@
 | `turns_halted` | 503 | system | 运维 kill switch 已暂停新 turn；Genesis 使用独立控制面 | |
 | `busy` | 503 | system | live worker pool 的预计排队时间超过 admission SLA；`reason=queue_over_sla` | |
 | `runtime_control_changed` | 503 | system | 加密消息写入前后 runtime generation/control 发生变化，事务回滚且不留下孤儿 job | |
+| `client_msg_id_invalid` | 400 | — | `client_msg_id` 给了但不是合法 UUID 字符串 | |
 
 ## 记忆（memory 路由 + memory action）
 
@@ -159,6 +162,7 @@
 | `action_must_be_object` | 400 | — | （与 memory 同名 slug，两条独立路由各自返回） | |
 | `actions_required` | 400 | — | | |
 | `unsupported_identity_action` | 400 | — | | |
+| `nudge_delta_exceeds_cap` | 400 | — | `identity.dimension_nudge` 单次 delta 超出 card_policy 上限 | |
 | `identity_action_failed` | — | — | `_execute_identity_actions` 的兜底默认值，状态码随子 action | |
 
 ## 世界书（worldbook）
@@ -206,6 +210,8 @@
 | `raw_reducer_field_not_allowed` | 400 | — | 实际 body 是 `raw_reducer_field_not_allowed:<field>` | |
 | `identity_unavailable` | 409 | — | persona_backfill：身份未就绪 | |
 | `persona_backfill_failed` | 500 | system | 实际 body 是 `persona_backfill_failed:<ExcType>:<msg>` | |
+| `material_empty` | 400 | — | 上传素材为空/提取不到可用文本（detail 说明） | |
+| `redistill_job_active` | 409 | — | 已有 redistill job 进行中（带 `active_job_id`） | |
 
 ## 导入 / 归档（history_import / onboarding_archive / diagnostics / copytext）
 
@@ -247,6 +253,13 @@
 | `public_key_rotation_requires_rewrap` | 409 | — | 已有加密内容时换公钥必须先走 rewrap | |
 | `export_too_large` | 413 | — | 一次性导出超 80MiB 预算 | |
 | `archive_cleanup_failed` | 503 | system | 账号重置：R2 归档清理失败，reset 中止（可安全重试） | |
+| `confirmation_mismatch` | 400 | — | admin 删除用户端点专用：`confirm` 字段 ≠ `user_id` | |
+
+## 通知中继（notify_relay）
+
+| slug | 状态码 | blame | 说明 | 需本地化 |
+|---|---|---|---|---|
+| `device_already_enrolled` | 409 | — | 同一设备已在中继注册过（enroll 幂等冲突） | |
 
 ---
 
