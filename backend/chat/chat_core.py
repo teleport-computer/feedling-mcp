@@ -642,6 +642,15 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
             file_extra["file_name"] = fname[:120]
         if fmime:
             file_extra["file_mime"] = fmime[:120]
+    # User text sent alongside an image/file rides a separate client-built
+    # caption envelope. Persist it via the shared caption_* schema so the enclave
+    # decrypts it into `content` and the agent sees the text. Without this the
+    # caption was silently dropped for content_type=image (image+text → the text
+    # never reached the model, and the optimistic bubble vanished on reconcile).
+    if content_type in ("image", "file"):
+        cap_env = payload.get("caption_envelope")
+        if isinstance(cap_env, dict):
+            file_extra.update(chat_service._chat_caption_extra_from_envelope(cap_env))
     inserted = True
     if client_msg_id is not None:
         msg, inserted = store.append_chat_idempotent(
