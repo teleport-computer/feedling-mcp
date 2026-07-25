@@ -11,9 +11,9 @@ change must not be interpreted as an API guarantee.
 ## Unreleased
 
 - **The `identity_patch` tool can recalibrate the relationship day count.** Put a
-  non-negative integer `relationship_days` inside the `patch` object (e.g. `patch:
-  {"relationship_days": 300}`) and the persona's `days_with_user` is recalibrated by
-  moving its start anchor to `today − relationship_days`. The day count is always
+  non-negative integer `relationship_days` inside the `patch` object (for example
+  `patch: {"relationship_days": 300}`) and the persona's `days_with_user` is
+  recalibrated by moving its start anchor to `today − relationship_days`. The day count is always
   derived from that anchor, so this rides the same compare-and-swap write as every
   other profile field. Notes on the contract:
   - **Absolute anchor is frozen at request time.** The relative day count is
