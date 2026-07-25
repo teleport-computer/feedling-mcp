@@ -2819,8 +2819,9 @@ def _seed_existing_v2_wake_schedules(*, now: float | None = None) -> int:
     return seeded
 
 
-def _reload_accounts_registry(_user_id: str) -> None:
-    accounts_registry.load_users()
+def _reload_accounts_registry(user_id: str) -> None:
+    # 与 asgi/lifespan.py 同款：带 user_id 的 notify 只重载那一行，不带的才全表重载。
+    accounts_registry.reload_users_after_notify(user_id)
 
 
 def wire_assembly() -> None:
@@ -3492,6 +3493,10 @@ def main() -> None:
     # not assume the schema is already at head.
     db.init_schema()
     wire_assembly()
+    # 周期性全量刷新单例：丢失/异常的 users notify 的显式自愈通道。放在运行时入口
+    # 而非 wire_assembly（后者被 13 处测试调用），避免一个改写 registry._users 的
+    # daemon 线程污染整个测试进程。
+    accounts_registry.start_periodic_full_reload()
     poll_interval = _positive_float_env("FEEDLING_V2_POLL_INTERVAL_SEC", "1.0")
     log.info(
         "[v2.serve_worker] configured db_pool_max=%s for max_workers=%s",

@@ -436,9 +436,15 @@ def set_global_blob(key: str, doc) -> None:
 # users registry
 # ---------------------------------------------------------------------------
 
-def load_all_users() -> list[dict]:
+def load_all_users(*, raise_on_error: bool = False) -> list[dict]:
     """Return the full user registry as a list of dicts (each the verbatim
-    stored user document), ordered by created_at."""
+    stored user document), ordered by created_at.
+
+    By default a read failure is swallowed and returns ``[]`` — the historical
+    behavior most callers want. ``raise_on_error=True`` lets the error propagate
+    so a caller can tell a failed read apart from a genuinely empty table; the
+    registry reload uses it to avoid blanking ``_users`` (an empty registry 401s
+    every request) when the database merely blipped."""
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
@@ -447,7 +453,28 @@ def load_all_users() -> list[dict]:
         return [r[0] for r in rows]
     except Exception as e:
         log.error("[db] load_all_users failed: %s", e)
+        if raise_on_error:
+            raise
         return []
+
+
+def load_user(user_id: str) -> dict | None:
+    """Return ONE user document, or None when the row no longer exists.
+
+    Backs the targeted ``users`` wake-bus reload: a per-row write (the resident
+    poll heartbeat rewrites one binding roughly once a minute per online
+    resident) must not make every subscribing process re-read the whole table.
+    Like ``find_user_by_api_key_hash`` this DELIBERATELY lets a database error
+    propagate — the caller has to tell a transient failure apart from a deleted
+    row, because acting on a false "deleted" would evict a live user from the
+    in-memory registry."""
+    if not user_id:
+        return None
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT doc FROM users WHERE user_id = %s", (user_id,)
+        ).fetchone()
+    return row[0] if row else None
 
 
 def find_user_by_api_key_hash(h: str) -> dict | None:
@@ -503,28 +530,31 @@ def upsert_user(entry: dict) -> None:
     mirror.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
 
 
-def normalize_user_cas(
+def compare_and_set_user(
     user_id: str,
     expected: dict,
-    normalized: dict,
-) -> tuple[bool, dict | None]:
-    """Persist startup normalization without overwriting a concurrent edit.
+    new: dict,
+) -> tuple[bool, bool, dict | None]:
+    """Compare-and-set ONE user row: write ``new`` only if the stored doc still
+    equals ``expected`` (JSONB equality is the CAS boundary).
 
-    Registry reloads run in every web/turn process. A stale process must neither
-    full-rewrite the users table (deleting a just-registered account absent from
-    its snapshot) nor replace a row changed after it was read. JSONB equality is
-    the compare-and-swap boundary. Return ``(read_ok, authoritative_doc)`` so a
-    CAS loser immediately replaces its randomly normalized local copy with the
-    winning row. ``authoritative_doc=None`` means the row was concurrently
-    deleted; ``read_ok=False`` means the database operation itself failed.
+    Returns ``(read_ok, applied, authoritative_doc)``:
+    * ``read_ok=False`` — the database operation itself failed.
+    * ``applied`` — whether our write landed (the stored doc matched expected).
+    * ``authoritative_doc`` — the row now in the DB (``new`` when applied, the
+      winning concurrent row when not, ``None`` when the row is now deleted).
+
+    This is the primitive behind both startup normalization and the resident
+    heartbeat: each reads a row, edits its own copy, and CAS-writes so a stale
+    snapshot can neither overwrite a concurrent edit nor lose to one silently.
     """
     sql = (
         "UPDATE users SET created_at=%s, doc=%s "
         "WHERE user_id=%s AND doc=%s RETURNING doc"
     )
     params = (
-        normalized.get("created_at"),
-        Jsonb(normalized),
+        new.get("created_at"),
+        Jsonb(new),
         str(user_id),
         Jsonb(expected),
     )
@@ -539,12 +569,45 @@ def normalize_user_cas(
                         (str(user_id),),
                     ).fetchone()
     except Exception as exc:
-        log.error("[db] normalize_user_cas(%s) failed: %s", user_id, exc)
-        return False, None
+        log.error("[db] compare_and_set_user(%s) failed: %s", user_id, exc)
+        return False, False, None
     if applied:
+        # Mirror the SAME gated CAS to the shadow — deliberately NOT an
+        # unconditional upsert. An unconditional upsert re-creates a shadow row
+        # whose primary was concurrently deleted: db.delete_user removes the row
+        # from primary then shadow, and if it lands between this CAS commit and
+        # this mirror, the upsert resurrects the deleted user's encrypted row in
+        # the shadow until the 24h prune — a data-retention gap. The gated
+        # `WHERE user_id=%s AND doc=%s` form no-ops on a missing shadow row, so
+        # it can never resurrect. A shadow row that has drifted is left for the
+        # reconcile job (the shadow's own convergence backstop), not force-healed
+        # here — the heartbeat drives this path ~once/min per online resident, so
+        # the safe choice is the one that cannot resurrect deleted data.
         from tee_shadow import mirror
         mirror.execute(sql, params)
-    return True, (row[0] if row is not None else None)
+    return True, applied, (row[0] if row is not None else None)
+
+
+def normalize_user_cas(
+    user_id: str,
+    expected: dict,
+    normalized: dict,
+) -> tuple[bool, dict | None]:
+    """Persist startup normalization without overwriting a concurrent edit.
+
+    Registry reloads run in every web/turn process. A stale process must neither
+    full-rewrite the users table (deleting a just-registered account absent from
+    its snapshot) nor replace a row changed after it was read. Thin wrapper over
+    ``compare_and_set_user`` that drops the ``applied`` flag its callers don't
+    need. Return ``(read_ok, authoritative_doc)`` so a CAS loser immediately
+    replaces its randomly normalized local copy with the winning row.
+    ``authoritative_doc=None`` means the row was concurrently deleted;
+    ``read_ok=False`` means the database operation itself failed.
+    """
+    read_ok, _applied, authoritative = compare_and_set_user(
+        user_id, expected, normalized
+    )
+    return read_ok, authoritative
 
 
 def save_all_users(users: list[dict]) -> None:

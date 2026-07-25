@@ -38,10 +38,12 @@ from asgi import threadpool
 from asgi.settings import settings
 
 
-def _reload_accounts_registry(_user_id: str) -> None:
+def _reload_accounts_registry(user_id: str) -> None:
     from accounts import registry as accounts_registry
 
-    accounts_registry.load_users()
+    # A notify carrying a user_id reloads that ONE row; an untargeted one still
+    # reloads the whole registry. See registry.reload_users_after_notify.
+    accounts_registry.reload_users_after_notify(user_id)
 
 
 def _start_wake_bus() -> None:
@@ -53,6 +55,16 @@ def _start_wake_bus() -> None:
 
     core_wake_bus.register_handler("users", _reload_accounts_registry)
     core_wake_bus.start_listener()
+    # Periodic full-registry self-heal — pairs with the "users" handler above:
+    # every process that registers the handler serves auth off the registry and
+    # now takes only targeted single-row reloads, so each needs its own fallback
+    # for a dropped/failed notify. NOT gated on start_background — a web tier
+    # that doesn't set that flag still authenticates and must self-heal. Safe in
+    # tests: ASGITransport doesn't run lifespan, and the one test that does
+    # (test_asgi_lifespan_loads_users) stubs _start_wake_bus.
+    from accounts import registry as accounts_registry
+
+    accounts_registry.start_periodic_full_reload()
 
 
 def _start_ws_leader() -> None:
