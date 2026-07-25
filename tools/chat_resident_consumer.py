@@ -9129,22 +9129,35 @@ def _proactive_control_reason_from_result(agent_result: Any, replies: list[str])
     ).strip()
 
 
-def _is_degenerate_proactive_reply(text: Any) -> bool:
-    """True when a proactive reply carries no actual content — only
+def _is_degenerate_reply(text: Any) -> bool:
+    """True when a reply carries no actual content — only
     whitespace/punctuation/separators (e.g. ".", "。", "…").
 
     Flaky openai-compatible relays can cut the SSE stream right after the
     first token; pi still closes the assistant message with that fragment,
-    and without this check the consumer posts it as an unprompted chat
-    bubble (seen live 2026-07-17: a 2-hour heartbeat posting a bare "."
-    twice). Letters, digits, CJK and emoji all count as content — only a
-    reply with none of those is degenerate. Proactive lane only: a
-    foreground turn the user started still surfaces whatever came back."""
+    and without this check the consumer posts it as a chat bubble (seen live
+    2026-07-17: a 2-hour heartbeat posting a bare "." twice). Letters, digits,
+    CJK and emoji all count as content — only a reply with none of those is
+    degenerate.
+
+    BOTH lanes use this now. It was proactive-only from 2026-07-17 to
+    2026-07-25 on the reasoning that "a foreground turn the user started still
+    surfaces whatever came back" — but what came back was a bare "。", which is
+    worse than the honest fallback line, and it poisons the transcript: on the
+    NEXT turn the agent reads that orphan period back out of its own history,
+    has no memory of writing it, and blames the USER for sending it (usr_36038f,
+    openai_compatible relay + pi + a link dropping 15+ connections/day, accused
+    her of sending periods across two days; she had sent none). Foreground
+    can't just go silent, so the caller substitutes the visible fallback."""
     for ch in str(text or ""):
         cat = unicodedata.category(ch)
         if cat[0] in ("L", "N") or cat == "So":
             return False
     return True
+
+
+# Back-compat alias: the proactive lane and its tests named this first.
+_is_degenerate_proactive_reply = _is_degenerate_reply
 
 
 def _split_proactive_actions(actions: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -10828,9 +10841,9 @@ def _process_proactive_jobs(jobs: list) -> float:
         # the whole "reply" — drop those before any branch below sees them, so
         # a sleep/schedule action still completes quietly instead of posting
         # the fragment as a chat bubble.
-        degenerate_replies = [r for r in replies if _is_degenerate_proactive_reply(r)]
+        degenerate_replies = [r for r in replies if _is_degenerate_reply(r)]
         if degenerate_replies:
-            replies = [r for r in replies if not _is_degenerate_proactive_reply(r)]
+            replies = [r for r in replies if not _is_degenerate_reply(r)]
             log.warning(
                 "proactive degenerate reply fragment(s) dropped id=%s fragments=%r",
                 job_id,
@@ -11942,6 +11955,51 @@ def _process_messages(messages: list) -> float:
             except Exception as e:
                 log.error("agent action execution failed; suppressing optimistic agent reply: %s", e)
                 replies = [_identity_action_failure_reply(raw_user_content_for_lang)]
+
+        # A relay-truncated turn hands back a bare punctuation fragment as the
+        # whole "reply". The proactive lane has dropped these since 385f636c;
+        # the foreground lane did not, so a lone "。" went out as the agent's
+        # chat bubble and then poisoned the transcript (see _is_degenerate_reply
+        # — usr_36038f was accused of sending periods she never sent). Drop the
+        # fragment here, AFTER the action-outcome rewrite, so a real reply
+        # synthesized from action outcomes is never mistaken for one.
+        degenerate = [r for r in replies if _is_degenerate_reply(r)]
+        if degenerate:
+            replies = [r for r in replies if not _is_degenerate_reply(r)]
+            log.warning(
+                "foreground degenerate reply fragment(s) dropped id=%s fragments=%r",
+                msg.get("id") or msg.get("message_id") or "",
+                [str(r)[:20] for r in degenerate],
+            )
+            _emit_debug_trace(
+                "agent", "agent.reply.degenerate", status="error", trace_id=trace_id,
+                summary=f"dropped {len(degenerate)} degenerate fragment(s)",
+                explain="上游把回复流切断了，只剩标点碎片；已丢弃，不发给用户。",
+                detail={"n_dropped": len(degenerate), "had_actions": bool(actions)},
+                content_excerpt={"fragments": repr([str(r)[:20] for r in degenerate])},
+            )
+            if not replies and not actions:
+                # Nothing real is left and no action stood in for the reply. The
+                # user is in the foreground WAITING, so silence is not an option
+                # (that is the whole reason the original guard skipped this lane).
+                # Give them the same honest line an outright agent-call failure
+                # gets. The notice text classifies off the stream-cut signature,
+                # so the banner blames the relay (provider_transient), not us.
+                stream_cut = ValueError(
+                    "agent reply ended without finish_reason "
+                    "(degenerate punctuation fragment only)"
+                )
+                if SEND_FALLBACK_ON_AGENT_ERROR:
+                    replies = [FALLBACK_REPLY]
+                    pending_failure_notice = stream_cut
+                else:
+                    _notify_agent_turn_failure(stream_cut, foreground=True)
+                    log.warning(
+                        "degenerate-only turn and fallback disabled by env; "
+                        "this user turn will not get a visible reply"
+                    )
+                    latest = max(latest, ts)
+                    continue
 
         reply_to_message_id = str(msg.get("id") or msg.get("message_id") or "").strip()
         posted_any = False
