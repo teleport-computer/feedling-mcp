@@ -3341,6 +3341,74 @@ def probe_responses_support(config: ProviderConfig) -> bool:
     return isinstance(body, dict) and not body.get("error")
 
 
+# --- BYOK model catalog: list a provider's models via its /models endpoint ----
+# Pure-additive bypass. NONE of these touch chat_completion / test_provider_key /
+# encryption. Wire logic (request build / page parse / pagination / classify)
+# lives here in the leaf layer, mirroring the rest of provider_client. Guardrails
+# keep a hostile custom endpoint from stalling a worker: bounded pages, models,
+# body size, per-request timeout, and id length.
+_CATALOG_PER_REQUEST_TIMEOUT = 15.0
+_CATALOG_MAX_PAGES = 10
+_CATALOG_MAX_MODELS = 2000
+_CATALOG_MAX_BODY_BYTES = 5_000_000
+
+_CATALOG_BEARER_PROVIDERS = {"openai", "openrouter", "deepseek", "openai_compatible"}
+
+
+def _catalog_request(provider: str, api_key: str, base_url: str,
+                     cursor: str | None) -> tuple[str, dict, dict]:
+    provider = normalize_provider(provider)
+    base = (base_url or default_base_url(provider)).rstrip("/")
+    if provider == "bedrock":
+        raise ProviderError("model_catalog_unsupported")
+    url = f"{base}/models"
+    params: dict = {}
+    if provider in _CATALOG_BEARER_PROVIDERS:
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        if provider == "openrouter":
+            headers["HTTP-Referer"] = "https://feedling.app"
+            headers["X-Title"] = "Feedling IO Hosted Runtime"
+    elif provider == "anthropic":
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                   "Content-Type": "application/json"}
+        params["limit"] = 1000
+        if cursor:
+            params["after_id"] = cursor
+    elif provider == "gemini":
+        headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+        params["pageSize"] = 1000
+        if cursor:
+            params["pageToken"] = cursor
+    else:
+        raise ProviderError("model_catalog_unsupported")
+    return url, headers, params
+
+
+def _parse_catalog_page(provider: str, body: dict) -> tuple[list[dict], str | None]:
+    provider = normalize_provider(provider)
+    out: list[dict] = []
+    if provider == "gemini":
+        for m in (body.get("models") or []):
+            name = str(m.get("name") or "")
+            mid = name.split("/", 1)[1] if name.startswith("models/") else name
+            if not mid:
+                continue
+            out.append({"id": mid, "display_name": str(m.get("displayName") or mid)})
+        nxt = body.get("nextPageToken") or None
+        return out, (str(nxt) if nxt else None)
+    # openai / openrouter / deepseek / openai_compatible / anthropic 都是 data[]
+    for m in (body.get("data") or []):
+        mid = str(m.get("id") or "")
+        if not mid:
+            continue
+        disp = m.get("display_name") or m.get("name") or mid
+        out.append({"id": mid, "display_name": str(disp)})
+    nxt = None
+    if provider == "anthropic" and body.get("has_more"):
+        nxt = str(body.get("last_id") or "") or None
+    return out, nxt
+
+
 def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
     # Validates that the key is usable for this model. We deliberately do NOT
     # require reply text: thinking/reasoning models (gemini-2.5-*, deepseek-
