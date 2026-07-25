@@ -37,6 +37,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import tools.chat_resident_consumer as crc  # noqa: E402
 
+from _fake_clock import freeze_monotonic  # noqa: E402
+
 
 OLD_PK = b"\x11" * 32
 NEW_PK = b"\x22" * 32
@@ -49,6 +51,11 @@ def _fpr(pk: bytes) -> str:
 
 @pytest.fixture(autouse=True)
 def _reset_whoami_cache(monkeypatch):
+    # These tests age the cache by subtracting from time.monotonic(); on a
+    # freshly booted host that goes NEGATIVE, and the over-age guard's
+    # `_whoami_cache_loaded_at > 0` ("never loaded") check then skips the
+    # rejection under test. Pin the clock (see tests/_fake_clock.py).
+    freeze_monotonic(monkeypatch)
     monkeypatch.setitem(crc._whoami_cache, "user_id", "usr_keyguard")
     monkeypatch.setitem(crc._whoami_cache, "user_pk", OLD_PK)
     monkeypatch.setitem(crc._whoami_cache, "enclave_pk", ENC_PK)

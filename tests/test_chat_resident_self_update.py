@@ -33,6 +33,8 @@ import content_encryption  # noqa: F401,E402
 
 import tools.chat_resident_consumer as crc  # noqa: E402  (after env setup)
 
+from _fake_clock import freeze_monotonic  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # _should_self_update — pure decision truth table
@@ -141,6 +143,11 @@ def test_runtime_files_excludes_stdlib_and_site_packages():
 def update_seams(monkeypatch):
     """Wire deterministic git seams + capture whether an update is applied."""
     applied = []
+    # Pin the clock: `_last_self_update_mono = 0.0` only means "the throttle
+    # window has long since elapsed" on a host whose uptime already exceeds
+    # _SELF_UPDATE_MIN_INTERVAL_SEC. On a freshly booted CI runner it does not
+    # (see tests/_fake_clock.py).
+    freeze_monotonic(monkeypatch)
     monkeypatch.setattr(crc, "AUTO_UPDATE", True)
     monkeypatch.setattr(crc, "_HOSTED", False)
     monkeypatch.setattr(crc, "_last_self_update_mono", 0.0)
