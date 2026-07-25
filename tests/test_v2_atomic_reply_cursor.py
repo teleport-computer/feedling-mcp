@@ -1131,3 +1131,138 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
     )) == "completed"
     assert calls_after
     assert cursor.load_seq(core_store.get_store(uid)) == seq5
+
+
+def test_recovery_drained_reply_is_not_pushed(monkeypatch):
+    """上个进程崩溃遗留的 effect 由回合开头的 recovery drain 落库 —— 它不经
+    `_on_reply`，没有明文也不写槽位，所以不推送。消息照常落库。"""
+    uid = "u_atomic_reply_push_recovery"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    db.chat_append_strict(
+        uid, "user-message", 100.0,
+        {"id": "user-message", "role": "user", "ts": 100.0,
+         "body_ct": "u", "nonce": "n", "K_user": "k", "K_enclave": "e"},
+        5000,
+    )
+    input_seq = db.chat_messages_after_seq(uid, 0, limit=None)[0]["seq"]
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("push-recovery-worker")
+    generation = db.get_runtime_generation(uid)
+    effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type="reply",
+        ordinal=0,
+        expected_generation=generation,
+        payload={
+            "envelope": _envelope("b" * 32, body="reply-ciphertext"),
+            "reply_through_seq": input_seq,
+            effect_outbox.FINAL_REPLY_FENCE_KEY: {
+                "claimed_by": "push-recovery-worker",
+                "input_generation": 0,
+                "through_seq": input_seq,
+            },
+        },
+    )
+
+    async def _provider(*args, **kwargs):
+        raise AssertionError("recovery must drain the pending reply before model work")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+
+    def _read_after_seq(_uid: str, after_seq: int):
+        if after_seq >= input_seq:
+            return []
+        return [{"id": "user-message", "seq": input_seq, "ts": 100.0,
+                 "role": "user", "content": "hello"}]
+
+    pushes = []
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        read_messages_after_seq=_read_after_seq,
+        resolve_provider=lambda _uid: (None, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+        send_reply_push=lambda uid, **kw: pushes.append((uid, kw)),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_TEST_PROVIDER_CONFIG,
+        api_key=None, runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert pushes == []
+    store = core_store.get_store(uid)
+    store.reload()
+    replies = [m for m in store.chat_messages if m.get("role") == "openclaw"]
+    assert len(replies) == 1
+
+
+def test_push_transport_failure_does_not_fail_the_turn(monkeypatch):
+    """推送实现抛异常 —— 回合仍然 completed，回复仍然在库里。"""
+    uid = "u_atomic_reply_push_boom"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    db.chat_append_strict(
+        uid, "user-message", 100.0,
+        {"id": "user-message", "role": "user", "ts": 100.0,
+         "body_ct": "u", "nonce": "n", "K_user": "k", "K_enclave": "e"},
+        5000,
+    )
+    input_seq = db.chat_messages_after_seq(uid, 0, limit=None)[0]["seq"]
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("push-boom-worker")
+    generation = db.get_runtime_generation(uid)
+    effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type="reply",
+        ordinal=0,
+        expected_generation=generation,
+        payload={
+            "envelope": _envelope("b" * 32, body="reply-ciphertext"),
+            "reply_through_seq": input_seq,
+            effect_outbox.FINAL_REPLY_FENCE_KEY: {
+                "claimed_by": "push-boom-worker",
+                "input_generation": 0,
+                "through_seq": input_seq,
+            },
+        },
+    )
+
+    async def _provider(*args, **kwargs):
+        raise AssertionError("recovery must drain the pending reply before model work")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+
+    def _read_after_seq(_uid: str, after_seq: int):
+        if after_seq >= input_seq:
+            return []
+        return [{"id": "user-message", "seq": input_seq, "ts": 100.0,
+                 "role": "user", "content": "hello"}]
+
+    def _boom(_uid, **_kw):
+        raise RuntimeError("apns down")
+
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        read_messages_after_seq=_read_after_seq,
+        resolve_provider=lambda _uid: (None, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+        send_reply_push=_boom,
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_TEST_PROVIDER_CONFIG,
+        api_key=None, runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    store = core_store.get_store(uid)
+    store.reload()
+    assert [m for m in store.chat_messages if m.get("role") == "openclaw"]

@@ -6109,6 +6109,7 @@ async def process_job(
     if tm is None:
         tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
     tm.bind_provider(provider_config)
+    push_slot: dict | None = None
     lease_keepalive_stop = asyncio.Event()
     lease_keepalive_task: asyncio.Task | None = None
 
@@ -7191,6 +7192,24 @@ async def process_job(
                     },
                     best_effort=True,
                 )
+                if status == "applied":
+                    # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。构建槽位
+                    # 本身也是 best-effort：某些非 seq_native / 测试注入的 payload 不
+                    # 携带 "envelope"（例如工具循环单测把 `_build_encrypted_reply_
+                    # effect_payload` 换成了不含 envelope 的假实现），这类回合本来就该
+                    # 正常 completed —— 构建槽位失败只跳过这一次推送，绝不能把它变成
+                    # 一个已经成功落库的回合失败。
+                    nonlocal push_slot
+                    try:
+                        push_slot = {
+                            "msg_id": str(payload["envelope"]["id"]),
+                            "body": text[:240],
+                            "is_wake": False,
+                        }
+                    except Exception as e:  # noqa: BLE001 — 见上：绝不能影响回合结果
+                        log.warning(
+                            "[v2.worker] chat reply push slot build failed user=%s: %s",
+                            user_id, e)
                 if status == "applied" and not final:
                     return
                 if status == "applied":
@@ -7605,6 +7624,18 @@ async def process_job(
         if lease_keepalive_task is not None:
             lease_keepalive_task.cancel()
             await asyncio.gather(lease_keepalive_task, return_exceptions=True)
+        if push_slot is not None and deps.send_reply_push is not None:
+            try:
+                await asyncio.to_thread(
+                    deps.send_reply_push,
+                    user_id,
+                    msg_id=push_slot["msg_id"],
+                    body=push_slot["body"],
+                    is_wake=push_slot["is_wake"],
+                )
+            except Exception as e:  # noqa: BLE001 — 推送绝不能影响回合结果
+                log.warning(
+                    "[v2.worker] chat reply push failed user=%s: %s", user_id, e)
 
 
 async def _run_turn(job: dict, deps: TurnDeps) -> str:
