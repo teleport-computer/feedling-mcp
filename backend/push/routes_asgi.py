@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, Request
 
 from accounts.auth_core import AuthResult
 from asgi import threadpool
-from asgi.deps import require_auth
+from asgi.deps import require_auth, require_scope
 from asgi import http as asgi_http
 from push import push_core
 
@@ -67,6 +67,16 @@ async def live_activity(request: Request, auth: AuthResult = Depends(require_aut
 async def live_start(request: Request, auth: AuthResult = Depends(require_auth)):
     body = await _json_body(request)
     return await threadpool.run_db(push_core.live_start, auth.store, payload=body)
+
+
+@router.post("/v1/internal/push/ai_reply")
+async def internal_ai_reply_push(
+    request: Request, auth: AuthResult = Depends(require_scope("chat_push"))
+):
+    """Runtime-internal: V2 serve-worker 把一条已落库回复的明文正文交给 backend
+    发推送。不是产品 API（已排除出公开 OpenAPI 契约）。"""
+    body = await _json_body(request)
+    return await threadpool.run_db(push_core.ai_reply_push, auth.store, payload=body)
 
 
 def register_asgi(app) -> None:
