@@ -220,7 +220,14 @@ def test_call_agent_threads_trace_id_to_cli(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_MODE", "cli")
     seen = {}
 
-    def _fake_cli(message, image_paths=None, raw_text=False, trace_id="", lane="background"):
+    def _fake_cli(
+        message,
+        image_paths=None,
+        raw_text=False,
+        trace_id="",
+        lane="background",
+        attempt_trigger="first",
+    ):
         seen["trace_id"] = trace_id
         return "ok reply"
 

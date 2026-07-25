@@ -167,6 +167,7 @@ jobs:
             tests/test_enclave_visual_plaintext.py \
             tests/test_proactive_agent_protocol_v2.py \
             tests/test_chat_resident_consumer.py \
+            tests/test_consumer_model_call_trace.py \
             tests/test_runtime_v2_default_flag.py \
             tests/test_capture_prompt_v1.py \
             tests/test_dream_prompt_v1.py \
