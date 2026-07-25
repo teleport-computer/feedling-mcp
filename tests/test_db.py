@@ -11,13 +11,14 @@ re-runnable without a fresh DB.
 """
 
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import sys
 import threading
 import time
 import uuid
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -674,6 +675,101 @@ def test_admin_data_track_usage_histogram_boundaries_and_dau_parity():
 def test_admin_data_track_usage_histogram_rejects_invalid_day(bad_day):
     with pytest.raises(ValueError, match="invalid_day"):
         db.admin_data_track_usage_histogram(day=bad_day)
+
+
+def test_admin_data_track_user_daily_usage_zero_fill_boundaries_and_parity():
+    user_id = _uid()
+    parity_user = _uid()
+    seed_user(user_id)
+    seed_user(parity_user)
+    zone = ZoneInfo("Asia/Shanghai")
+    today = datetime.now(zone).date()
+    first_day = today - timedelta(days=2)
+    first_midnight = datetime.combine(
+        first_day, datetime.min.time(), tzinfo=zone
+    ).timestamp()
+    today_midnight = datetime.combine(
+        today, datetime.min.time(), tzinfo=zone
+    ).timestamp()
+    tomorrow_midnight = datetime.combine(
+        today + timedelta(days=1), datetime.min.time(), tzinfo=zone
+    ).timestamp()
+
+    # Window boundaries are [first Beijing midnight, tomorrow midnight).
+    for ts, duration in (
+        (first_midnight - 1, 1000),
+        (first_midnight, 30),
+        (today_midnight, 70),
+        (today_midnight + 1, "bad"),
+        (tomorrow_midnight, 2000),
+    ):
+        db.log_append(
+            user_id,
+            "tracking_events",
+            {"type": "app_session_end", "payload": {"duration_sec": duration}},
+            ts=ts,
+        )
+
+    rows = db.admin_data_track_user_daily_usage(
+        user_id=user_id,
+        days=3,
+        tz="Asia/Shanghai",
+    )
+    assert [row["day"] for row in rows] == [
+        first_day.isoformat(),
+        (first_day + timedelta(days=1)).isoformat(),
+        today.isoformat(),
+    ]
+    assert rows[0] == {
+        "day": first_day.isoformat(),
+        "foreground_sec": 30,
+        "sessions": 1,
+        "max_session_sec": 30,
+    }
+    assert rows[1] == {
+        "day": (first_day + timedelta(days=1)).isoformat(),
+        "foreground_sec": 0,
+        "sessions": 0,
+        "max_session_sec": 0,
+    }
+    assert rows[2] == {
+        "day": today.isoformat(),
+        "foreground_sec": 70,
+        "sessions": 2,
+        "max_session_sec": 70,
+    }
+
+    # With every all-time event inside the same window, daily roll-up and the
+    # established snapshot contract must agree exactly.
+    for ts, duration in (
+        (first_midnight, 25),
+        (today_midnight, 35),
+        (today_midnight + 2, "malformed"),
+    ):
+        db.log_append(
+            parity_user,
+            "tracking_events",
+            {"type": "app_session_end", "payload": {"duration_sec": duration}},
+            ts=ts,
+        )
+    parity_rows = db.admin_data_track_user_daily_usage(
+        user_id=parity_user,
+        days=3,
+    )
+    all_time = db.admin_data_track_snapshot([parity_user])[parity_user]["app_usage"]
+    assert sum(row["foreground_sec"] for row in parity_rows) == all_time["foreground_sec"] == 60
+    assert sum(row["sessions"] for row in parity_rows) == all_time["sessions"] == 3
+
+    # Public bounds and parameter binding: 0 clamps to one day, huge values to
+    # 90, and a SQL-looking user id is harmless data rather than SQL.
+    assert len(db.admin_data_track_user_daily_usage(user_id=user_id, days=0)) == 1
+    assert len(db.admin_data_track_user_daily_usage(user_id=user_id, days=999)) == 90
+    injected = db.admin_data_track_user_daily_usage(
+        user_id=f"{user_id}' OR TRUE --",
+        days=2,
+    )
+    assert len(injected) == 2
+    assert all(row["foreground_sec"] == 0 for row in injected)
 
 
 def test_dau_daily_snapshot_freezes_completed_days_and_preserves_live_fallback():

@@ -1588,6 +1588,126 @@ def admin_data_track_usage_histogram(
         return empty
 
 
+def admin_data_track_user_daily_usage(
+    *,
+    user_id: str,
+    days: int = 14,
+    tz: str = "Asia/Shanghai",
+) -> list[dict]:
+    """Return one user's app usage for the latest ``days`` local dates.
+
+    The series includes today and explicitly backfills dates without a
+    session-end report. Duration parsing is intentionally identical to the
+    all-time data-track snapshot: decimal ``payload.duration_sec`` contributes
+    to foreground time; malformed values count as sessions but contribute zero.
+    """
+    try:
+        day_limit = max(1, min(int(14 if days is None else days), 90))
+    except (TypeError, ValueError):
+        day_limit = 14
+
+    # Keep the read-helper fail-soft contract while still returning the useful
+    # zero-filled shape if PostgreSQL is temporarily unavailable.
+    try:
+        zone = ZoneInfo(tz)
+    except Exception:
+        zone = ZoneInfo("Asia/Shanghai")
+    today = datetime.now(zone).date()
+    empty = [
+        {
+            "day": (today - timedelta(days=offset)).isoformat(),
+            "foreground_sec": 0,
+            "sessions": 0,
+            "max_session_sec": 0,
+        }
+        for offset in range(day_limit)
+    ]
+    empty.reverse()
+
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                """
+                WITH local_clock AS (
+                    SELECT timezone(%s, CURRENT_TIMESTAMP)::date AS today
+                ),
+                bounds AS (
+                    SELECT
+                        today,
+                        EXTRACT(EPOCH FROM (
+                            (today - (%s::int - 1))::timestamp AT TIME ZONE %s
+                        ))::double precision AS start_epoch,
+                        EXTRACT(EPOCH FROM (
+                            (today + 1)::timestamp AT TIME ZONE %s
+                        ))::double precision AS end_epoch
+                    FROM local_clock
+                ),
+                calendar AS (
+                    SELECT generate_series(
+                        (b.today - (%s::int - 1))::timestamp,
+                        b.today::timestamp,
+                        interval '1 day'
+                    )::date AS day
+                    FROM bounds b
+                ),
+                usage AS (
+                    SELECT
+                        timezone(%s, to_timestamp(l.ts))::date AS day,
+                        COALESCE(SUM(
+                            CASE
+                              WHEN l.doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
+                              THEN (l.doc->'payload'->>'duration_sec')::bigint
+                              ELSE 0
+                            END
+                        ), 0)::bigint AS foreground_sec,
+                        COUNT(*)::int AS sessions,
+                        COALESCE(MAX(
+                            CASE
+                              WHEN l.doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
+                              THEN (l.doc->'payload'->>'duration_sec')::bigint
+                              ELSE 0
+                            END
+                        ), 0)::bigint AS max_session_sec
+                    FROM user_logs l
+                    CROSS JOIN bounds b
+                    WHERE l.user_id = %s
+                      AND l.stream = 'tracking_events'
+                      AND l.doc->>'type' = 'app_session_end'
+                      AND l.ts IS NOT NULL
+                      AND l.ts >= b.start_epoch
+                      AND l.ts < b.end_epoch
+                    GROUP BY day
+                )
+                SELECT
+                    to_char(c.day, 'YYYY-MM-DD') AS day,
+                    COALESCE(u.foreground_sec, 0)::bigint AS foreground_sec,
+                    COALESCE(u.sessions, 0)::int AS sessions,
+                    COALESCE(u.max_session_sec, 0)::bigint AS max_session_sec
+                FROM calendar c
+                LEFT JOIN usage u USING (day)
+                ORDER BY c.day
+                """,
+                (tz, day_limit, tz, tz, day_limit, tz, str(user_id or "")),
+            ).fetchall()
+        return [
+            {
+                "day": str(row[0]),
+                "foreground_sec": int(row[1] or 0),
+                "sessions": int(row[2] or 0),
+                "max_session_sec": int(row[3] or 0),
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        log.error(
+            "[db] admin_data_track_user_daily_usage failed user_id=%s days=%s: %s",
+            user_id,
+            day_limit,
+            e,
+        )
+        return empty
+
+
 def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
     zone = ZoneInfo(tz)
     start = datetime.combine(day, datetime.min.time(), tzinfo=zone).timestamp()

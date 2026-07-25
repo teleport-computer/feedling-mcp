@@ -31,6 +31,16 @@ from model_api_runtime.v2 import jobs_store
 
 log = logging.getLogger("feedling.admin")
 InvalidDauDay = data_track.InvalidDauDay
+InvalidDataTrackUserId = data_track.InvalidDataTrackUserId
+
+
+def normalize_data_track_user_id(raw_user_id: str) -> str:
+    return data_track._normalized_data_track_user_id(raw_user_id)
+
+
+def invalid_user_id_page(query_string: str, raw_user_id: str) -> str:
+    with bind(query_string):
+        return data_track._render_invalid_data_track_user_page(raw_user_id)
 
 
 def summary_payload(query_string: str) -> dict:
@@ -60,6 +70,10 @@ def debug_payload(query_string: str) -> dict:
 
 def user_payload(query_string: str, user_id: str) -> tuple[dict, int]:
     # Mirror admin_data_track_user: 404 -> {"error": "user_not_found"}.
+    try:
+        user_id = normalize_data_track_user_id(user_id)
+    except InvalidDataTrackUserId:
+        return {"error": "invalid_user_id"}, 400
     with registry._users_lock:
         entry = next((dict(u) for u in registry._users if u.get("user_id") == user_id), None)
     if not entry:
@@ -97,6 +111,10 @@ def login_page(*, error: bool = False, next_url: str = "/admin/data-track") -> s
 def user_page(query_string: str, user_id: str) -> tuple[str, str, int]:
     # Mirror admin_data_track_user_page. Returns (kind, body, status):
     # ("text", "user not found", 404) or ("html", <page>, 200).
+    try:
+        user_id = normalize_data_track_user_id(user_id)
+    except InvalidDataTrackUserId:
+        return "html", invalid_user_id_page(query_string, user_id), 400
     with registry._users_lock:
         entry = next((dict(u) for u in registry._users if u.get("user_id") == user_id), None)
     if not entry:

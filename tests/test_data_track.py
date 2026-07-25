@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 import itertools
 import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -332,6 +334,137 @@ def test_admin_data_track_dau_histogram_json_and_page(client):
     assert "使用时长分布 · 2030-06-02" in page_html
     assert "样本 3 人" in page_html
     assert "样本=当天有上报的 3 位用户" in page_html
+
+
+def test_user_detail_daily_usage_json_page_and_events_limit(client):
+    user_id, _ = _register(client)
+    zone = ZoneInfo("Asia/Shanghai")
+    today = datetime.now(zone).date()
+    first_day = today - timedelta(days=2)
+    first_midnight = datetime.combine(
+        first_day, datetime.min.time(), tzinfo=zone
+    ).timestamp()
+    today_midnight = datetime.combine(
+        today, datetime.min.time(), tzinfo=zone
+    ).timestamp()
+    for index, (ts, duration) in enumerate((
+        (first_midnight, 40),
+        (today_midnight, 80),
+        (today_midnight + 1, "bad"),
+        (today_midnight + 2, 20),
+        (today_midnight + 3, 30),
+    )):
+        db.log_append(
+            user_id,
+            "tracking_events",
+            {
+                "event_id": f"daily_{index}",
+                "type": "app_session_end",
+                "ts": ts,
+                "payload": {"duration_sec": duration},
+            },
+            ts=ts,
+        )
+
+    res = client.get(
+        f"/v1/admin/data-track/users/{user_id}?days=3&events_limit=2",
+        headers=_admin_headers(),
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+    user = res.get_json()["user"]
+    assert user["daily_usage_days"] == 3
+    assert len(user["daily_usage"]) == 3
+    assert user["daily_usage"][0]["foreground_sec"] == 40
+    assert user["daily_usage"][1]["foreground_sec"] == 0
+    assert user["daily_usage"][1]["sessions"] == 0
+    assert user["daily_usage"][2]["foreground_sec"] == 130
+    assert user["daily_usage"][2]["sessions"] == 4
+    assert sum(row["foreground_sec"] for row in user["daily_usage"]) == user["app_usage"]["foreground_sec"] == 170
+    assert sum(row["sessions"] for row in user["daily_usage"]) == user["app_usage"]["sessions"] == 5
+    assert user["tracking"]["events_limit"] == 2
+    assert len(user["tracking"]["latest"]) == 2
+
+    capped = client.get(
+        f"/v1/admin/data-track/users/{user_id}?days=999&events_limit=999",
+        headers=_admin_headers(),
+    ).get_json()["user"]
+    assert capped["daily_usage_days"] == 90
+    assert len(capped["daily_usage"]) == 90
+    assert capped["tracking"]["events_limit"] == 500
+    assert len(capped["tracking"]["latest"]) == 5
+
+    page = client.get(
+        f"/admin/data-track/users/{user_id}?days=3&events_limit=2",
+        headers=_admin_headers(),
+    )
+    assert page.status_code == 200, page.get_data(as_text=True)
+    body = page.get_data(as_text=True)
+    assert "最近 3 天使用时长" in body
+    assert "窗口合计" in body and "全时段合计" in body
+    assert "未打开" in body
+    assert first_day.isoformat() in body
+    assert (first_day + timedelta(days=1)).isoformat() in body
+
+
+def test_uid_lookup_form_strip_validation_and_admin_key_passthrough(client):
+    user_id, _ = _register(client)
+    page = client.get(
+        "/admin/data-track?admin_key=admin-test-token",
+        headers=_admin_headers(),
+    )
+    body = page.get_data(as_text=True)
+    assert 'action="/admin/data-track/users"' in body
+    assert 'name="uid"' in body
+    assert 'name="admin_key" type="hidden" value="admin-test-token"' in body
+
+    lookup = client.get(
+        f"/admin/data-track/users?uid=%20%0A{user_id}%09&admin_key=admin-test-token",
+        headers=_admin_headers(),
+    )
+    assert lookup.status_code == 303
+    assert lookup.headers["location"] == (
+        f"/admin/data-track/users/{user_id}?admin_key=admin-test-token"
+    )
+
+    invalid_json = client.get(
+        "/v1/admin/data-track/users/not-a-user",
+        headers=_admin_headers(),
+    )
+    assert invalid_json.status_code == 400
+    assert invalid_json.get_json() == {"error": "invalid_user_id"}
+
+    invalid_page = client.get(
+        "/admin/data-track/users?uid=%3Cscript%3E",
+        headers=_admin_headers(),
+    )
+    assert invalid_page.status_code == 400
+    invalid_body = invalid_page.get_data(as_text=True)
+    assert "UID 格式不正确" in invalid_body
+    assert "<script>" not in invalid_body
+    assert "&lt;script&gt;" in invalid_body
+
+    invalid_path = client.get(
+        f"/admin/data-track/users/{quote('<script>', safe='')}",
+        headers=_admin_headers(),
+    )
+    assert invalid_path.status_code == 400
+    assert "UID 格式不正确" in invalid_path.get_data(as_text=True)
+
+
+def test_tracking_stats_events_limit_clamps_to_500():
+    events = [
+        {"event_id": str(index), "type": "app_open", "ts": float(index)}
+        for index in range(600)
+    ]
+    store = SimpleNamespace(list_tracking_events=lambda limit=0: events)
+
+    short = _dt._tracking_stats(store, include_events=True, events_limit=3)
+    assert short["events_limit"] == 3
+    assert [row["event_id"] for row in short["latest"]] == ["599", "598", "597"]
+
+    capped = _dt._tracking_stats(store, include_events=True, events_limit=999)
+    assert capped["events_limit"] == 500
+    assert len(capped["latest"]) == 500
 
 
 def test_admin_data_track_supports_since_filter_and_pagination(client):

@@ -224,10 +224,18 @@ def test_user_detail_parity(env):
 
 
 def test_user_detail_not_found_parity(env):
-    f = _flask_get_json("/v1/admin/data-track/users/does-not-exist", headers=_admin())
-    a = _asgi_json("GET", "/v1/admin/data-track/users/does-not-exist", headers=_admin())
+    missing = "usr_0000000000000000"
+    f = _flask_get_json(f"/v1/admin/data-track/users/{missing}", headers=_admin())
+    a = _asgi_json("GET", f"/v1/admin/data-track/users/{missing}", headers=_admin())
     assert f == a
     assert f == (404, {"error": "user_not_found"})
+
+
+def test_user_detail_invalid_uid_parity(env):
+    path = "/v1/admin/data-track/users/not-a-user"
+    f = _flask_get_json(path, headers=_admin())
+    a = _asgi_json("GET", path, headers=_admin())
+    assert f == a == (400, {"error": "invalid_user_id"})
 
 
 # --------------------------------------------------------------------------- #
@@ -265,11 +273,22 @@ def test_user_detail_page_existing(env):
 
 
 def test_user_detail_page_not_found_parity(env):
-    f_status, f_body, f_ct = _flask_get_raw("/admin/data-track/users/nope", headers=_admin())
-    a_status, a_body, a_ct = _asgi_raw("GET", "/admin/data-track/users/nope", headers=_admin())
+    path = "/admin/data-track/users/usr_0000000000000000"
+    f_status, f_body, f_ct = _flask_get_raw(path, headers=_admin())
+    a_status, a_body, a_ct = _asgi_raw("GET", path, headers=_admin())
     assert f_status == a_status == 404
     assert f_ct == a_ct == "text/plain; charset=utf-8"
     assert f_body == a_body == "user not found"
+
+
+def test_user_detail_page_invalid_uid_parity(env):
+    path = "/admin/data-track/users/not-a-user"
+    f_status, f_body, f_ct = _flask_get_raw(path, headers=_admin())
+    a_status, a_body, a_ct = _asgi_raw("GET", path, headers=_admin())
+    assert f_status == a_status == 400
+    assert f_ct == a_ct == "text/html; charset=utf-8"
+    assert "UID 格式不正确" in f_body
+    assert _norm_html(f_body) == _norm_html(a_body)
 
 
 # --------------------------------------------------------------------------- #
