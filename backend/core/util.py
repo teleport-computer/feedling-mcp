@@ -20,10 +20,19 @@ RUNTIME_V2_DEFAULT_ON_ENV = "FEEDLING_RUNTIME_V2_DEFAULT_ON"
 def runtime_v2_default_on() -> bool:
     """Baseline default for the perception/resident V2 rollout flags.
 
-    OFF by default so prod keeps the dormant legacy path. Set
-    ``FEEDLING_RUNTIME_V2_DEFAULT_ON=true`` in the test enclave so test users run
-    V2 without a per-user blob flip. An explicit per-user blob value still
-    overrides this baseline (operator opt-in/opt-out wins).
+    ⚠️ READ THIS BEFORE ASSUMING "prod is off": ALL THREE main composes
+    (``deploy/docker-compose.phala{,.test,.pre}.yaml``) inject
+    ``FEEDLING_RUNTIME_V2_DEFAULT_ON=true``, so prod/test/pre are all ON. Only a
+    process without the env (local runs, plain pytest) is OFF. The old wording
+    here ("OFF by default so prod keeps the dormant legacy path") described an
+    intent that deployment never matched, and believing it is what made PR #107's
+    "perception ingress follows the chat fence" change look like a no-op — it
+    silently moved every prod user off the decrypting ingress (2026-07-24
+    null-perception incident). Pinned by
+    ``tests/test_hosted_runtime_policy.py::test_every_main_compose_turns_the_runtime_v2_baseline_on``.
+
+    An explicit per-user blob value still overrides this baseline (operator
+    opt-in/opt-out wins).
     """
     return _env_flag_enabled(RUNTIME_V2_DEFAULT_ON_ENV)
 

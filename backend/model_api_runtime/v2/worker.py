@@ -68,6 +68,7 @@ from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import kill_switch
+from model_api_runtime.v2 import model_identity as v2_model_identity
 from model_api_runtime.v2 import web_gate as v2_web_gate
 from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
 from model_api_runtime.v2 import status_stream
@@ -2311,6 +2312,7 @@ def _make_build_messages_fn(
     mutation_recovery_active: bool = False,
     trusted_system_blocks: tuple[str, ...] = (),
     working_memory: str = "",
+    provider_config: Any = None,
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
@@ -2333,13 +2335,16 @@ def _make_build_messages_fn(
     authority. Dynamic tool results remain native exchanges after that base block.
     """
 
+    # 真实模型自称块排在用户可编辑的 workspace skill 之前：它是运行时事实，不能被
+    # 后面的 skill 文本挤到次要位置。官方原生路由返回空串，被 context 过滤掉。
+    identity_block = v2_model_identity.override_block_for_config(provider_config)
     base_messages = context.build_turn_messages(
         system_prompt=system_prompt,
         summary=summary,
         tail=tail,
         action_context=extra_context,
         mutation_recovery_active=mutation_recovery_active,
-        trusted_system_blocks=trusted_system_blocks,
+        trusted_system_blocks=(identity_block, *trusted_system_blocks),
         working_memory=working_memory,
     )
 
@@ -5082,6 +5087,7 @@ async def _run_wake(
             ),
             trusted_system_blocks=trusted_system_blocks,
             working_memory=working_memory,
+            provider_config=provider_config,
         )
 
         await _fence_wake_effect("wake turn")
@@ -7239,6 +7245,7 @@ async def process_job(
             mutation_recovery_active=(mutation_recovery_barrier is not None),
             trusted_system_blocks=trusted_system_blocks,
             working_memory=working_memory,
+            provider_config=provider_config,
         )
 
         await _ensure_runtime_mode()

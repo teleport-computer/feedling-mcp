@@ -1,10 +1,14 @@
 """Per-user flag for screen.read VLM captioning.
 
-Default follows the env-gated baseline (core/util.runtime_v2_default_on): OFF in
-prod-without-env, ON where FEEDLING_RUNTIME_V2_DEFAULT_ON=true. An explicit
-per-user value still wins. NOTE: this gates screen egress to a third-party VLM,
-so it stays fail-closed on errors — any config/db hiccup falls back to OFF and
-never silently enables egress.
+Default follows the env-gated baseline (core/util.runtime_v2_default_on).
+⚠️ That baseline is ON in prod, test AND pre — every main compose injects
+FEEDLING_RUNTIME_V2_DEFAULT_ON=true — so the effective default for a user with
+no explicit value is ENABLED, not disabled. ("OFF in prod-without-env", the
+earlier wording here, is true only of a process that never got the env, e.g. a
+local run.) An explicit per-user value still wins. NOTE: this gates screen
+egress to a VLM, so it stays fail-closed on ERRORS — any config/db hiccup falls
+back to OFF — but a clean read of an unset flag lands on the ON baseline, which
+is a deliberate rollout choice, not a fail-closed one.
 """
 from __future__ import annotations
 

@@ -2107,3 +2107,81 @@ def test_chat_lane_still_takes_the_chat_path(monkeypatch):
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
     assert status == "completed"
     assert written == {"text": "REPLY"}
+
+
+# --- 真实模型自称块进入回合 system 位（prod usr_6bb6…，2026-07-25）----------
+# BYOK 路由切换后 agent 仍照记忆自称旧模型，根因是 V2 的 system prompt 从不携带
+# 真实 provider/model。工厂函数级语义在 tests/test_v2_model_identity.py；这里锁住
+# 两条面向用户的 lane 确实把当回合的 provider_config 传了下去。
+
+_THIRD_PARTY = provider_client.ProviderConfig(
+    provider="deepseek", model="deepseek-chat", api_key="sk-user-byok",
+    base_url="https://api.deepseek.com")
+
+
+def test_chat_turn_system_prompt_states_the_live_third_party_model(monkeypatch):
+    uid = "u_w_identity_chat"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    calls = _script_provider(monkeypatch, [_text_round("REPLY")])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "你是什么模型"}],
+                 provider=(_THIRD_PARTY, {}))
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_THIRD_PARTY, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    system = calls[0]["messages"][0]
+    assert system["role"] == "system"
+    assert "deepseek-chat" in system["content"]
+
+
+def test_wake_turn_system_prompt_states_the_live_third_party_model(monkeypatch):
+    uid = "u_w_identity_wake"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+
+    calls = _script_provider(monkeypatch, [_text_round("hey")])
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_THIRD_PARTY, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_tail=lambda uid_, after_ts, limit: [],
+        read_summary=lambda uid_: ("", 0.0, 0),
+        apply_pending_effects=_apply_effects,
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_THIRD_PARTY, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    system = calls[0]["messages"][0]
+    assert system["role"] == "system"
+    assert "deepseek-chat" in system["content"]
+
+
+def test_official_route_chat_turn_keeps_the_system_prompt_free_of_identity_text(monkeypatch):
+    """官方直连时 agent 自称 Claude 就是事实——不注入，也不动 prompt 缓存前缀。"""
+    uid = "u_w_identity_official"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    calls = _script_provider(monkeypatch, [_text_round("REPLY")])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+
+    asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    assert "你的真实身份" not in calls[0]["messages"][0]["content"]
