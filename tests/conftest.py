@@ -324,6 +324,23 @@ def pytest_unconfigure(config):
         pass
 
 
+@pytest.fixture(autouse=True)
+def _reset_enclave_http_client():
+    """Drop the pooled enclave client around every test.
+
+    ``core.enclave`` keeps one ``httpx.Client`` per process so the V2 prompt
+    path stops paying a TLS handshake per decrypted chat row. That cache
+    outlives a test: any test that monkeypatches ``core_enclave.httpx.Client``
+    would otherwise be served the previous test's stub (or leak its own into
+    the next one). Reset on both sides so pooling stays invisible to tests.
+    """
+    from core import enclave as core_enclave
+
+    core_enclave.reset_http_client()
+    yield
+    core_enclave.reset_http_client()
+
+
 @pytest.fixture()
 def backend_env(tmp_path, monkeypatch):
     """Fresh per-test backend state: FEEDLING_DIR → tmp_path, registry + store

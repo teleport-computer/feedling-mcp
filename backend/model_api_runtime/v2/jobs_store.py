@@ -574,45 +574,107 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
     然后继续看下一个候选，直到拿到一个非过期的可抢行或彻底抢空。必须在同一个
     claim 事务里做，否则两个并发 worker 可能都读到这个陈旧代的行、一个刚判
     superseded、另一个已经把它当活的 claimed 出去。"""
-    if lanes is None:
-        select_sql = (
-            "SELECT j.id, j.user_id, j.expected_runtime_generation FROM agent_jobs j "
-            "JOIN users u ON u.user_id=j.user_id "
-            "WHERE j.status='pending' "
-            "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
-            "CASE WHEN j.lane='chat' THEN "
-            "j.created_at + make_interval(secs => %s) END) IS NULL OR "
-            "COALESCE(j.queue_deadline_at, j.deadline_at, "
-            "CASE WHEN j.lane='chat' THEN "
-            "j.created_at + make_interval(secs => %s) END) > now()) "
-            "AND NOT EXISTS (SELECT 1 FROM agent_jobs active "
-            "WHERE active.user_id=j.user_id "
-            "AND active.status IN ('claimed','running')) "
-            "ORDER BY j.priority DESC, j.created_at LIMIT 1"
-        )
-        select_args = (float(PENDING_CHAT_TTL_SEC), float(PENDING_CHAT_TTL_SEC))
-    else:
-        select_sql = (
-            "SELECT j.id, j.user_id, j.expected_runtime_generation FROM agent_jobs j "
-            "JOIN users u ON u.user_id=j.user_id "
-            "WHERE j.status='pending' "
-            "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
-            "CASE WHEN j.lane='chat' THEN "
-            "j.created_at + make_interval(secs => %s) END) IS NULL OR "
-            "COALESCE(j.queue_deadline_at, j.deadline_at, "
-            "CASE WHEN j.lane='chat' THEN "
-            "j.created_at + make_interval(secs => %s) END) > now()) "
-            "AND j.lane = ANY(%s) "
-            "AND NOT EXISTS (SELECT 1 FROM agent_jobs active "
-            "WHERE active.user_id=j.user_id "
-            "AND active.status IN ('claimed','running')) "
-            "ORDER BY j.priority DESC, j.created_at LIMIT 1"
-        )
-        select_args = (
-            float(PENDING_CHAT_TTL_SEC),
-            float(PENDING_CHAT_TTL_SEC),
-            list(lanes),
-        )
+    # Round-trip budget (the CVM is in Phala, the RDS in AWS — one round trip
+    # measured 63.8ms on test, so each saved statement is real user-visible
+    # latency). What used to be five statements is now two:
+    #   1. `_CANDIDATE_SQL`  set_config + pick the queue head + lock its state row
+    #   2. `_CLAIM_SQL`      lock the job + claim-or-supersede it
+    # The lock ORDER is unchanged and still load-bearing: statement 1 takes only
+    # the v2_runtime_state row, statement 2 only the agent_jobs row. Merging the
+    # two into a single SQL text would hand lock acquisition order to the
+    # planner and re-open the ABBA deadlock against chat/send (which holds state
+    # and wants job) — that is why this stayed two statements, not one.
+    lane_clause = "AND j.lane = ANY(%s) " if lanes is not None else ""
+    candidate_sql = (
+        "WITH cfg AS (SELECT set_config('feedling.v2_worker_protocol',%s,true) AS p), "
+        "cand AS ("
+        "SELECT j.id, j.user_id FROM agent_jobs j "
+        "JOIN users u ON u.user_id=j.user_id "
+        "CROSS JOIN cfg "
+        "WHERE j.status='pending' "
+        "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
+        "CASE WHEN j.lane='chat' THEN "
+        "j.created_at + make_interval(secs => %s) END) IS NULL OR "
+        "COALESCE(j.queue_deadline_at, j.deadline_at, "
+        "CASE WHEN j.lane='chat' THEN "
+        "j.created_at + make_interval(secs => %s) END) > now()) "
+        + lane_clause +
+        "AND NOT EXISTS (SELECT 1 FROM agent_jobs active "
+        "WHERE active.user_id=j.user_id "
+        "AND active.status IN ('claimed','running')) "
+        "ORDER BY j.priority DESC, j.created_at LIMIT 1) "
+        # INNER JOIN because FOR UPDATE cannot be applied to the nullable side
+        # of an outer join. A candidate whose state row is missing therefore
+        # yields no row here and is retired through the orphan path below.
+        "SELECT c.id, c.user_id, s.hosted_runtime_state, s.runtime_generation "
+        "FROM cand c JOIN v2_runtime_state s ON s.user_id=c.user_id "
+        "FOR UPDATE OF s"
+    )
+    # Same predicate, minus the state join: tells "queue is empty" apart from
+    # "queue head has no state row" without costing the hot path a statement.
+    orphan_sql = (
+        "WITH cfg AS (SELECT set_config('feedling.v2_worker_protocol',%s,true) AS p) "
+        "SELECT j.id FROM agent_jobs j "
+        "JOIN users u ON u.user_id=j.user_id "
+        "CROSS JOIN cfg "
+        "WHERE j.status='pending' "
+        "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
+        "CASE WHEN j.lane='chat' THEN "
+        "j.created_at + make_interval(secs => %s) END) IS NULL OR "
+        "COALESCE(j.queue_deadline_at, j.deadline_at, "
+        "CASE WHEN j.lane='chat' THEN "
+        "j.created_at + make_interval(secs => %s) END) > now()) "
+        + lane_clause +
+        "AND NOT EXISTS (SELECT 1 FROM agent_jobs active "
+        "WHERE active.user_id=j.user_id "
+        "AND active.status IN ('claimed','running')) "
+        "AND NOT EXISTS (SELECT 1 FROM v2_runtime_state s "
+        "WHERE s.user_id=j.user_id) "
+        "ORDER BY j.priority DESC, j.created_at LIMIT 1"
+    )
+    probe_args = (
+        (_WORKER_CLAIM_PROTOCOL, float(PENDING_CHAT_TTL_SEC),
+         float(PENDING_CHAT_TTL_SEC))
+        + ((list(lanes),) if lanes is not None else ())
+    )
+    # locked -> (claimed | superseded) in ONE statement. `locked` is referenced
+    # by both data-modifying CTEs, so it is materialised and evaluated first;
+    # the two UPDATEs act on disjoint row sets (generation matches vs not), so
+    # no row is ever updated twice. SKIP LOCKED keeps its semantics inside the
+    # CTE — verified: a row held by another session returns n_locked=0 in ~66ms
+    # instead of blocking.
+    claim_sql = (
+        "WITH locked AS ("
+        "SELECT j.id, j.expected_runtime_generation AS eg FROM agent_jobs j "
+        "WHERE j.id=%s AND j.status='pending' "
+        "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
+        "CASE WHEN j.lane='chat' THEN "
+        "j.created_at + make_interval(secs => %s) END) IS NULL OR "
+        "COALESCE(j.queue_deadline_at, j.deadline_at, "
+        "CASE WHEN j.lane='chat' THEN "
+        "j.created_at + make_interval(secs => %s) END) > clock_timestamp()) "
+        "AND NOT EXISTS (SELECT 1 FROM agent_jobs active "
+        "WHERE active.user_id=j.user_id "
+        "AND active.status IN ('claimed','running')) "
+        "FOR UPDATE OF j SKIP LOCKED), "
+        "claimed AS ("
+        "UPDATE agent_jobs SET status='claimed', claimed_by=%s, "
+        "claimed_at=clock_timestamp(), "
+        "expected_runtime_generation=COALESCE(expected_runtime_generation,%s), "
+        "lease_expires_at = clock_timestamp() + make_interval(secs => %s), "
+        "deadline_at = clock_timestamp() + make_interval(secs => %s) "
+        "WHERE id IN (SELECT id FROM locked WHERE eg IS NULL OR eg=%s) "
+        "RETURNING *), "
+        "sup AS ("
+        "UPDATE agent_jobs SET status='superseded', finished_at=now(), "
+        "last_error='stale_runtime_generation' "
+        "WHERE id IN (SELECT id FROM locked WHERE eg IS NOT NULL AND eg<>%s) "
+        "RETURNING id) "
+        "SELECT l.n_locked, s.n_sup, c.* "
+        "FROM (SELECT count(*) AS n_locked FROM locked) l "
+        "CROSS JOIN (SELECT count(*) AS n_sup FROM sup) s "
+        "LEFT JOIN claimed c ON true"
+    )
 
     # Lock order is runtime-state -> job everywhere. chat/send's atomic
     # append+coalesce and cutover already use that order; claiming the job
@@ -627,85 +689,62 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
                 with conn.cursor(row_factory=dict_row) as cur:
                     # 0041's BEFORE UPDATE trigger leaves the shared pending
                     # queue producer-compatible but makes old claim SQL affect
-                    # zero rows. Scope this opt-in to exactly one claim
+                    # zero rows. The set_config that opts in rides along in the
+                    # candidate CTE, scoped (local=true) to exactly this claim
                     # transaction so pooled connections cannot leak authority.
-                    cur.execute(
-                        "SELECT set_config('feedling.v2_worker_protocol',%s,true)",
-                        (_WORKER_CLAIM_PROTOCOL,),
-                    )
-                    cur.execute(select_sql, select_args)
+                    # Note it only actually runs when the CROSS JOIN yields a
+                    # row — i.e. when there IS a candidate. That is precisely
+                    # when a later UPDATE needs it; the empty-queue path below
+                    # updates nothing.
+                    cur.execute(candidate_sql, probe_args)
                     head = cur.fetchone()
                     if head is None:
-                        return None
-                    # v2_runtime_state is the ownership authority. Lock it in
-                    # the same transaction as the pending->claimed transition
-                    # so a cutover cannot race between validation and claim.
-                    cur.execute(
-                        "SELECT hosted_runtime_state, runtime_generation "
-                        "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
-                        (head["user_id"],),
-                    )
-                    control = cur.fetchone()
-                    cur.execute(
-                        "SELECT expected_runtime_generation FROM agent_jobs j "
-                        "WHERE j.id=%s AND j.status='pending' "
-                        "AND (COALESCE(j.queue_deadline_at, j.deadline_at, "
-                        "CASE WHEN j.lane='chat' THEN "
-                        "j.created_at + make_interval(secs => %s) END) IS NULL OR "
-                        "COALESCE(j.queue_deadline_at, j.deadline_at, "
-                        "CASE WHEN j.lane='chat' THEN "
-                        "j.created_at + make_interval(secs => %s) END) "
-                        "> clock_timestamp()) "
-                        "AND NOT EXISTS (SELECT 1 FROM agent_jobs active "
-                        "WHERE active.user_id=j.user_id "
-                        "AND active.status IN ('claimed','running')) "
-                        "FOR UPDATE OF j SKIP LOCKED",
-                        (
-                            head["id"],
-                            float(PENDING_CHAT_TTL_SEC),
-                            float(PENDING_CHAT_TTL_SEC),
-                        ),
-                    )
-                    locked_job = cur.fetchone()
-                    if locked_job is None:
+                        # Either the queue is empty or its head has no state
+                        # row (the INNER JOIN above cannot tell us which).
+                        cur.execute(orphan_sql, probe_args)
+                        orphan = cur.fetchone()
+                        if orphan is None:
+                            return None
+                        cur.execute(
+                            "UPDATE agent_jobs SET status='superseded', finished_at=now(), "
+                            "last_error='runtime_state_not_v2' WHERE id=%s",
+                            (orphan["id"],),
+                        )
                         continue
-                    if control is None or str(control["hosted_runtime_state"]) != "v2":
+                    if str(head["hosted_runtime_state"]) != "v2":
                         cur.execute(
                             "UPDATE agent_jobs SET status='superseded', finished_at=now(), "
                             "last_error='runtime_state_not_v2' WHERE id=%s",
                             (head["id"],),
                         )
                         continue
-                    expected_gen = locked_job["expected_runtime_generation"]
-                    current_generation = int(control["runtime_generation"])
-                    if (
-                        expected_gen is not None
-                        and int(expected_gen) != current_generation
-                    ):
-                        cur.execute(
-                            "UPDATE agent_jobs SET status='superseded', finished_at=now(), "
-                            "last_error='stale_runtime_generation' WHERE id=%s",
-                            (head["id"],),
-                        )
-                        continue
+                    current_generation = int(head["runtime_generation"])
                     cur.execute(
-                        "UPDATE agent_jobs SET status='claimed', claimed_by=%s, "
-                        "claimed_at=clock_timestamp(), "
-                        "expected_runtime_generation="
-                        "COALESCE(expected_runtime_generation,%s), "
-                        "lease_expires_at = clock_timestamp() + make_interval(secs => %s), "
-                        "deadline_at = clock_timestamp() + make_interval(secs => %s) "
-                        "WHERE id=%s RETURNING *",
+                        claim_sql,
                         (
+                            head["id"],
+                            float(PENDING_CHAT_TTL_SEC),
+                            float(PENDING_CHAT_TTL_SEC),
                             worker_id,
                             current_generation,
                             float(RUNNING_TTL_SEC),
                             float(RUNNING_TTL_SEC),
-                            head["id"],
+                            current_generation,
+                            current_generation,
                         ),
                     )
-                    claimed = cur.fetchone()
-                    if claimed is None:
+                    outcome = cur.fetchone()
+                    # This statement always returns exactly one row; the job
+                    # columns are NULL-extended when nothing was claimed.
+                    n_locked = int(outcome.pop("n_locked") or 0)
+                    n_superseded = int(outcome.pop("n_sup") or 0)
+                    if n_locked == 0:
+                        # A competing worker holds it (SKIP LOCKED) or it no
+                        # longer satisfies the pending predicate — re-pick.
+                        continue
+                    if n_superseded:
+                        continue
+                    if outcome.get("id") is None:
                         # A protocol trigger (current or future) deliberately
                         # skipped the transition. Returning idle is safer than
                         # hot-looping on the same still-pending queue head.
@@ -716,26 +755,27 @@ def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | N
                             _WORKER_CLAIM_PROTOCOL,
                         )
                         return None
-                    return claimed
+                    return outcome
 
 
 def mark_running(job_id, *, claimed_by: str) -> bool:
     with _pool().connection() as conn:
         with conn.transaction():
-            # Discover the user without taking a job lock, then preserve the
-            # global runtime-state -> job lock order. Holding the state row
-            # through the transition gives turn start a real ownership
-            # linearization point instead of a SELECT/UPDATE TOCTOU window.
-            row = conn.execute(
-                "SELECT user_id FROM agent_jobs WHERE id=%s",
-                (job_id,),
-            ).fetchone()
-            if row is None:
-                return False
+            # Discover the user and lock its state row in ONE statement, still
+            # without taking a job lock, so the global runtime-state -> job lock
+            # order is preserved. Holding the state row through the transition
+            # gives turn start a real ownership linearization point instead of a
+            # SELECT/UPDATE TOCTOU window.
+            #
+            # INNER JOIN collapses the two old early-exits into one: a missing
+            # job row and a missing state row both returned False before, and
+            # both yield no row here. FOR UPDATE OF s locks only the state row —
+            # it cannot be applied to an outer join's nullable side anyway.
             control = conn.execute(
-                "SELECT hosted_runtime_state, runtime_generation "
-                "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
-                (row[0],),
+                "SELECT s.hosted_runtime_state, s.runtime_generation "
+                "FROM agent_jobs j JOIN v2_runtime_state s ON s.user_id=j.user_id "
+                "WHERE j.id=%s FOR UPDATE OF s",
+                (job_id,),
             ).fetchone()
             if control is None or str(control[0]) != "v2":
                 return False

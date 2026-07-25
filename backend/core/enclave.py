@@ -19,6 +19,55 @@ _QUIET_SUCCESS_PURPOSE_PREFIXES = ("tee_replicate:",)
 _SUCCESS_TRACE_EVENT_TYPES = frozenset({"enclave.call.start", "enclave.call.done"})
 
 
+# —— Pooled HTTP client ——
+# Every enclave call used to build its own ``httpx.Client``, which meant a fresh
+# TCP connect + TLS handshake per request. That is invisible for one-shot calls
+# but brutal on the V2 prompt path: `_decrypt_chat_rows` decrypts the tail one
+# row at a time, so a full `FEEDLING_V2_TAIL_HARD_CAP` (60) window paid 60
+# handshakes — measured at ~82ms each on test, ~4.9s of every chat turn.
+#
+# One pooled client per process instead. It is lazily built, guarded by a lock,
+# and tagged with the pid that built it: a client inherited across ``fork``
+# holds sockets the parent owns, so the child rebuilds rather than reusing a
+# poisoned pool (it also must NOT close the inherited one — that would send a
+# FIN on the parent's live connections). ``verify=False`` keeps the pre-existing
+# contract: the in-cluster enclave presents a self-signed cert whose trust comes
+# from REPORT_DATA, not a CA. Per-call timeouts stay per-call.
+_HTTP_LIMITS = httpx.Limits(max_keepalive_connections=32, max_connections=64)
+_http_client: "httpx.Client | None" = None
+_http_client_pid: int | None = None
+_http_client_lock = threading.Lock()
+
+
+def _client() -> "httpx.Client":
+    """Return this process's pooled enclave client, building it if needed."""
+    global _http_client, _http_client_pid
+    pid = os.getpid()
+    client = _http_client
+    if client is not None and _http_client_pid == pid:
+        return client
+    with _http_client_lock:
+        if _http_client is not None and _http_client_pid == pid:
+            return _http_client
+        # Inherited across fork: drop the reference without closing it.
+        _http_client = httpx.Client(verify=False, limits=_HTTP_LIMITS)
+        _http_client_pid = pid
+        return _http_client
+
+
+def reset_http_client() -> None:
+    """Close and forget the pooled client (shutdown paths and tests)."""
+    global _http_client, _http_client_pid
+    with _http_client_lock:
+        client, _http_client, _http_client_pid = _http_client, None, None
+    if client is None:
+        return
+    try:
+        client.close()
+    except Exception:  # noqa: BLE001 — best-effort fd cleanup
+        pass
+
+
 def _trace_store_from_user_id(user_id: str):
     user_id = str(user_id or "").strip()
     if not user_id:
@@ -76,12 +125,12 @@ def _enclave_get_json_for_gate(path: str, api_key: str | None, params: dict | No
         return None, "api_key_unavailable"
     headers = {"X-Feedling-Runtime-Token": runtime_token} if runtime_token else {"X-API-Key": api_key}
     try:
-        with httpx.Client(timeout=20, verify=False) as client:
-            resp = client.get(
-                f"{enclave_url}{path}",
-                headers=headers,
-                params=params or {},
-            )
+        resp = _client().get(
+            f"{enclave_url}{path}",
+            headers=headers,
+            params=params or {},
+            timeout=20,
+        )
         if resp.status_code >= 400:
             return None, f"enclave_http_{resp.status_code}:{resp.text[:160]}"
         data = resp.json()
@@ -114,16 +163,15 @@ def _get_enclave_info() -> dict | None:
         if _enclave_info_cache["data"] and now - _enclave_info_cache["ts"] < _ENCLAVE_INFO_TTL:
             return _enclave_info_cache["data"]
     try:
-        # verify=False because the in-cluster enclave presents a
-        # self-signed cert whose trust comes from REPORT_DATA, not a CA.
-        # We're not pinning here; just fetching public material. Any
-        # MITM between backend and enclave would at worst substitute a
-        # different pubkey, which would then fail AEAD verification on
-        # the enclave side when the agent tries to decrypt.
-        with httpx.Client(timeout=5, verify=False) as client:
-            r = client.get(f"{url.rstrip('/')}/attestation")
-            r.raise_for_status()
-            b = r.json()
+        # The pooled client runs verify=False because the in-cluster enclave
+        # presents a self-signed cert whose trust comes from REPORT_DATA, not a
+        # CA. We're not pinning here; just fetching public material. Any MITM
+        # between backend and enclave would at worst substitute a different
+        # pubkey, which would then fail AEAD verification on the enclave side
+        # when the agent tries to decrypt.
+        r = _client().get(f"{url.rstrip('/')}/attestation", timeout=5)
+        r.raise_for_status()
+        b = r.json()
         data = {
             "content_pk_hex": b.get("enclave_content_pk_hex", ""),
             "compose_hash": b.get("compose_hash", ""),
@@ -157,12 +205,12 @@ def _reencrypt_frame_via_enclave(envelope: dict, api_key: str | None, *,
     headers = {"X-Feedling-Runtime-Token": runtime_token} if runtime_token else {"X-API-Key": api_key}
     path = "/v1/storage/reencrypt-frame"
     try:
-        with httpx.Client(timeout=30, verify=False) as client:
-            resp = client.post(
-                f"{enclave_url}{path}",
-                headers=headers,
-                json={"envelope": envelope, "key_version": key_version},
-            )
+        resp = _client().post(
+            f"{enclave_url}{path}",
+            headers=headers,
+            json={"envelope": envelope, "key_version": key_version},
+            timeout=30,
+        )
     except httpx.HTTPError as e:
         raise RuntimeError(f"enclave_error:{type(e).__name__}") from e
     if resp.status_code >= 400:
@@ -195,12 +243,12 @@ def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpos
         summary="enclave decrypt call started",
     )
     try:
-        with httpx.Client(timeout=20, verify=False) as client:
-            resp = client.post(
-                f"{enclave_url}{path}",
-                headers=headers,
-                json={"envelope": envelope, "purpose": purpose},
-            )
+        resp = _client().post(
+            f"{enclave_url}{path}",
+            headers=headers,
+            json={"envelope": envelope, "purpose": purpose},
+            timeout=20,
+        )
     except httpx.HTTPError as e:
         _trace_enclave(
             store,
