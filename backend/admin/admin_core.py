@@ -30,6 +30,7 @@ from hosted import config_store
 from model_api_runtime.v2 import jobs_store
 
 log = logging.getLogger("feedling.admin")
+InvalidDauDay = data_track.InvalidDauDay
 
 
 def summary_payload(query_string: str) -> dict:

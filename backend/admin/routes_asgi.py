@@ -176,7 +176,10 @@ async def data_track_users(request: Request):
 @router.get("/v1/admin/data-track/dau")
 async def data_track_dau(request: Request):
     _require_admin(request)
-    payload = await threadpool.run_db(admin_core.dau_payload, request.url.query)
+    try:
+        payload = await threadpool.run_db(admin_core.dau_payload, request.url.query)
+    except admin_core.InvalidDauDay:
+        return JSONResponse({"error": "invalid_day"}, status_code=400)
     return JSONResponse(payload)
 
 
@@ -204,7 +207,10 @@ async def data_track_user(user_id: str, request: Request):
 @router.get("/admin/data-track")
 async def data_track_page(request: Request):
     _require_admin(request)
-    html = await threadpool.run_db(admin_core.page_html, request.url.query)
+    try:
+        html = await threadpool.run_db(admin_core.page_html, request.url.query)
+    except admin_core.InvalidDauDay:
+        return PlainTextResponse("invalid day", status_code=400)
     return HTMLResponse(html)
 
 

@@ -611,6 +611,71 @@ def test_admin_data_track_dau_median_is_robust_to_heavy_users():
     assert day["median_user_sec"] == 20.0          # median is not fooled by the heavy user
 
 
+def test_admin_data_track_usage_histogram_boundaries_and_dau_parity():
+    selected_day = "2035-05-06"
+    event_ts = _epoch("2035-05-05T18:00:00Z")  # 2035-05-06 Beijing
+    durations = [
+        0, 59,
+        60, 299,
+        300, 899,
+        900, 1799,
+        1800, 3599,
+        3600, 7199,
+        7200, 14399,
+        14400,
+    ]
+    reporters = [_uid() for _ in durations]
+    no_report = _uid()
+    for uid in [*reporters, no_report]:
+        seed_user(uid)
+    for uid, duration in zip(reporters, durations):
+        payload_duration = "bad" if duration == 0 else duration
+        db.log_append(
+            uid,
+            "tracking_events",
+            {
+                "type": "app_session_end",
+                "payload": {"duration_sec": payload_duration},
+            },
+            ts=event_ts,
+        )
+
+    histogram = db.admin_data_track_usage_histogram(
+        day=selected_day,
+        tz="Asia/Shanghai",
+    )
+    assert histogram["day"] == selected_day
+    assert histogram["total_users"] == len(reporters)
+    assert [bucket["users"] for bucket in histogram["buckets"]] == [
+        2, 2, 2, 2, 2, 2, 2, 1,
+    ]
+    assert sum(bucket["users"] for bucket in histogram["buckets"]) == len(reporters)
+    assert histogram["median_sec"] == 1799.0
+    assert histogram["mean_sec"] == pytest.approx(sum(durations) / len(durations))
+    assert histogram["p90_sec"] == pytest.approx(11519.4)
+    assert histogram["max_sec"] == 14400
+
+    dau_day = {
+        row["day"]: row
+        for row in db.admin_data_track_dau(days=366, tz="Asia/Shanghai")
+    }[selected_day]
+    assert dau_day["session_dau"] == histogram["total_users"]
+    assert dau_day["median_user_sec"] == histogram["median_sec"]
+
+    # A registered user with no app_session_end that day never enters the
+    # sample and is not silently backfilled into the 0-1min bucket.
+    assert histogram["total_users"] == len(reporters) < len([*reporters, no_report])
+
+
+@pytest.mark.parametrize(
+    "bad_day",
+    ["", "2035-5-06", "2035-02-30", "2035-05-06' OR TRUE --"],
+)
+def test_admin_data_track_usage_histogram_rejects_invalid_day(bad_day):
+    with pytest.raises(ValueError, match="invalid_day"):
+        db.admin_data_track_usage_histogram(day=bad_day)
+
+
 def test_dau_daily_snapshot_freezes_completed_days_and_preserves_live_fallback():
     old_live = _uid()
     frozen_chat = _uid()
