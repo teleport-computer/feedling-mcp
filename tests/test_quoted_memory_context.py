@@ -19,7 +19,6 @@ import sys
 import types
 from pathlib import Path
 
-import pytest
 
 # Env + path bootstrap BEFORE importing the consumer (it reads env at module
 # scope). Mirrors tests/test_chat_resident_consumer_image.py.

@@ -16,8 +16,8 @@ ENCLAVE_PORT = int(os.environ.get("FEEDLING_ENCLAVE_PORT", 5003))
 
 # Phase 3: in-enclave TLS. When true, bootstrap() derives an ECDSA P-256
 # keypair from dstack-KMS, issues a self-signed cert for it, binds
-# sha256(cert-DER) into REPORT_DATA, and serves Flask over HTTPS on
-# ENCLAVE_PORT. Clients verify by matching the presented cert's DER
+# sha256(cert-DER) into REPORT_DATA, and serves the enclave ASGI app over
+# HTTPS on ENCLAVE_PORT. Clients verify by matching the presented cert's DER
 # hash against the attested fingerprint — not by PKI chain, since the
 # cert is self-signed on purpose (key material is bound to compose_hash
 # via dstack-KMS, which is stronger than LE trust).
@@ -26,10 +26,11 @@ ENCLAVE_PORT = int(os.environ.get("FEEDLING_ENCLAVE_PORT", 5003))
 # docker-compose.phala.yaml sets this true on real deployments.
 ENCLAVE_TLS = os.environ.get("FEEDLING_ENCLAVE_TLS", "false").lower() == "true"
 
-# Internal HTTPS (or HTTP in dev) to the non-TEE Flask backend. This is the
+# Internal HTTPS (or HTTP in dev) to the non-TEE backend. This is the
 # only network dependency the enclave has after boot. Requests carry the
-# caller's api_key so Flask's require_user resolves to the right user's
-# ciphertext. The enclave never sees users.json directly.
+# caller's api_key so the backend's require_user resolves to the right user's
+# ciphertext. The enclave never sees users.json directly. (Env var name keeps
+# the historical FLASK_URL spelling — it is baked into the compose contract.)
 FLASK_URL = os.environ.get("FEEDLING_FLASK_URL", "http://127.0.0.1:5001")
 
 # Shared runtime-token HMAC secret (same value the backend verifies + the

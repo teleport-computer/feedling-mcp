@@ -43,7 +43,6 @@ class _FakePool:
     def connection(self):
         conn = self._conns[self.handed]
         self.handed += 1
-        pool = self
         class _CM:
             def __enter__(self): return conn
             def __exit__(self, *exc): return False

@@ -14,7 +14,6 @@ at them (swap `_fg_pass`/`_bg_pass`) — the assertions, not the fake, are the n
 import sys
 from pathlib import Path
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
@@ -107,7 +106,7 @@ def test_2_large_import_checkpoint_no_rerun():
     assert calls["n"] == 5
     # re-running background (resume-style) must NOT re-call any done chunk
     calls["n"] = 0
-    cp2 = _bg_pass(cp, cands, completion=comp)
+    _bg_pass(cp, cands, completion=comp)
     assert calls["n"] == 0
 
 

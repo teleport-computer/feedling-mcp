@@ -5,7 +5,7 @@ Matches testapp/FeedlingTest/ContentEncryption.swift:
 - K_user / K_enclave: BoxSeal with HKDF-SHA256(info="feedling-box-seal-v1")
   and ChaChaPoly AEAD; wire format ek_pub(32) || ct || tag(16)
 """
-import base64, json, os, secrets, sys, urllib.request
+import base64, json, secrets, urllib.request
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives import hashes, serialization

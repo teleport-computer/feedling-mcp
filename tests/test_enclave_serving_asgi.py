@@ -7,7 +7,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-import pytest  # noqa: E402
 
 
 def _self_signed(tmp_path):

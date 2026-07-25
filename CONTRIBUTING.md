@@ -40,14 +40,29 @@ backend/
 ├── tracking/  admin/  content/  ← 埋点 ｜ data-track 后台 ｜ swap/rewrap/export
 ├── hosted/         ← Model API 托管条线（config_store / context / turn /
 │                      chat_send_core+chat_routes_asgi / history_import …）
-├── model_api_runtime/ ← Model API 线的 agent 运行时：prompts / tools /
-│                      memory_tools / wake（独立包，与 hosted/ 平级；
-│                      被 hosted·proactive·perception 复用）
+├── model_api_runtime/ ← Model API 线的 agent 运行时：tools + v2/
+│                      （Runtime V2 全套：serve_worker / worker / tool_loop /
+│                      jobs_store …；独立包，与 hosted/ 平级）
+├── agent_runtime/  ← V1 agent-runner：多租户 resident supervisor
+│                      （supervisor / spawners / leases / introduction）
 ├── perception/     ← 扩展感知（此模式的最早范本）
-└── db.py · content_encryption.py · provider_client.py · enclave_app.py ·
-    dstack_tls.py · hosted_runtime.py · semantic_analysis.py ·
+├── genesis/  worldbook/  notices/  ← 蒸馏导入 ｜ 世界书 ｜ 通知中心
+├── web/  copytext/  diagnostics/  onboarding_archive/  notify_relay/
+│                   ← 其余承载路由的领域包（同构：routes_asgi.py + *_core.py；
+│                      完整注册表见 asgi_app._ASGI_PACKAGES）
+├── capabilities/  workspace/  ← agent 能力层 ｜ Runtime V2 虚拟工作区
+├── asgi/           ← ASGI 框架装配层：worker / lifespan / middleware /
+│                      responses / threadpool（框架件，不放业务）
+├── enclave/        ← enclave 服务实现包（enclave_app.py 薄入口指向这里；
+│                      含 routes/ 子目录）
+├── runtime/  tee_replicator/  tee_shadow/  ← 运行时辅助 ｜ TEE 影子库复制
+├── alembic/  alembic_tee/  ← 主库 / TEE 库迁移
+└── db.py · content_encryption.py · provider_client.py · provider_types.py ·
+    enclave_app.py · dstack_tls.py · hosted_runtime.py · semantic_analysis.py ·
     memory_readside_core.py · memory_index_selector.py ·
-    context_memory_selection.py
+    context_memory_selection.py · object_storage.py ·
+    provider_attempt_ledger.py · worldbook_match.py ·
+    worldbook_readside_core.py · debug_trace.py
                     ← 底层独立模块，保持无业务依赖
 ```
 

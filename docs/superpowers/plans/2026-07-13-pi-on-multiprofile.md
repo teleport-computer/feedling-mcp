@@ -1,7 +1,9 @@
 # Pi driver on multi-profile schema — Implementation Plan
 
 > **RETIRED / DO NOT DEPLOY.** Historical implementation record; managed hosted
-> execution no longer has host-all or supervisor modes.
+> execution no longer has host-all or supervisor modes. The deepseek→pi mapping
+> below was also reverted 2026-07-14 — deepseek runs on the claude driver now
+> (`backend/agent_runtime/README.md` is the authoritative driver table).
 
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development.
 > Steps use `- [ ]` checkboxes. Spec: `docs/superpowers/specs/2026-07-13-pi-on-multiprofile-schema-design.md`.

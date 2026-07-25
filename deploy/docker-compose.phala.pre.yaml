@@ -177,15 +177,13 @@ services:
       # channel, NOT baked into compose_hash). Empty default keeps dev
       # deploys + CI compose-build healthy — code falls through to
       # "logged_only" mode when unset. KEY_ID + TEAM_ID are also overridable
-      # but default to the Apple dev team's ids in backend/app.py.
+      # but default to the Apple dev team's ids in backend/push/apns.py.
       APNS_KEY_P8_B64: "${APNS_KEY_P8_B64:-}"
       APNS_KEY_ID: "${APNS_KEY_ID:-}"
       APNS_TEAM_ID: "${APNS_TEAM_ID:-}"
-      # Optional LLM Gate for proactive screen outreach. If unset, automatic
-      # Gate records model_not_configured and does not enqueue hidden jobs.
+      # Optional: proactive admin dashboard's debug translation
+      # (backend/proactive/dashboard.py). Unset = translation disabled.
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
-      FEEDLING_PROACTIVE_GATE_PROVIDER: "${FEEDLING_PROACTIVE_GATE_PROVIDER:-openrouter}"
-      FEEDLING_PROACTIVE_GATE_MODEL: "${FEEDLING_PROACTIVE_GATE_MODEL:-google/gemini-3.1-flash-lite}"
       # TEST-ONLY: keep the shared runtime V2 baseline aligned with prod for
       # perception ingress, resident chat, screen caption, and hosted chat.
       # Proactive wake is native-only after P2-2b and no longer uses this flag.

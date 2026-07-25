@@ -240,7 +240,7 @@ services:
       # channel, NOT baked into compose_hash). Empty default keeps dev
       # deploys + CI compose-build healthy — code falls through to
       # "logged_only" mode when unset. KEY_ID + TEAM_ID are also overridable
-      # but default to the Apple dev team's ids in backend/app.py.
+      # but default to the Apple dev team's ids in backend/push/apns.py.
       APNS_KEY_P8_B64: "${APNS_KEY_P8_B64:-}"
       APNS_KEY_ID: "${APNS_KEY_ID:-}"
       APNS_TEAM_ID: "${APNS_TEAM_ID:-}"
@@ -249,11 +249,9 @@ services:
       # device tokens — prod must pin this to "false". (Test deploy keeps the
       # sandbox default for its sandbox-provisioned tokens.)
       APNS_SANDBOX: "false"
-      # Optional LLM Gate for proactive screen outreach. If unset, automatic
-      # Gate records model_not_configured and does not enqueue hidden jobs.
+      # Optional: proactive admin dashboard's debug translation
+      # (backend/proactive/dashboard.py). Unset = translation disabled.
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
-      FEEDLING_PROACTIVE_GATE_PROVIDER: "${FEEDLING_PROACTIVE_GATE_PROVIDER:-openrouter}"
-      FEEDLING_PROACTIVE_GATE_MODEL: "${FEEDLING_PROACTIVE_GATE_MODEL:-google/gemini-3.1-flash-lite}"
       # Baseline-ON for the perception/resident V2 rollout flags
       # (perception_ingress / resident_wake / resident_chat). Prod users run V2
       # by default; an explicit per-user blob value still wins, so rollback for a

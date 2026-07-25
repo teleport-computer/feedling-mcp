@@ -4,7 +4,6 @@ Covers the test-default-ON behaviour (FEEDLING_RUNTIME_V2_DEFAULT_ON), the
 explicit per-user override, and the config_store scrub that unsticks the
 previously auto-seeded perception flag.
 """
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace

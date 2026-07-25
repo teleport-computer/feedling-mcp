@@ -5,12 +5,10 @@ backfill against a fake S3 client. Assertions are scoped to a unique user_id so
 the shared session DB / other tests don't perturb counts.
 """
 
-import base64
 import sys
 import uuid
 from pathlib import Path
 
-import pytest
 from psycopg.types.json import Jsonb
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))

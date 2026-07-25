@@ -1,7 +1,9 @@
 # Spec: Re-implement the pi driver consolidation on test's multi-profile schema
 
 > **RETIRED / DO NOT DEPLOY.** Historical design; managed hosted host-all and
-> supervisor modes no longer exist.
+> supervisor modes no longer exist. The deepseek→pi mapping was also reverted
+> 2026-07-14 — deepseek runs on the claude driver now
+> (`backend/agent_runtime/README.md` is the authoritative driver table).
 
 **Date:** 2026-07-13
 **Status:** Draft (awaiting review)

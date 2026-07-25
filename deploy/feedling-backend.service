@@ -1,5 +1,5 @@
 [Unit]
-Description=Feedling Flask Backend
+Description=Feedling ASGI Backend
 After=network.target
 
 [Service]

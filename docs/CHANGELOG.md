@@ -79,6 +79,146 @@
 - **状态**：未提交、未部署。上线后应观察 unlock 唤醒回到 ~10-15/h、
   `runtime_v2` 感知事件回到 100+/h 量级；主动消息量会随之回升到 07-23 水平。
 
+### [DONE] 例行清理第五轮（链接完整性 / git 洁癖 / enclave+hosted 深扫 / 根级文档）
+
+- **全仓 Markdown 链接检查**：修 5 处现役悬空指针——openclaw 插件 README
+  的 `agent/routes.py`→`perception_core.py`；PARITY_MATRIX 测试清单删已随
+  dual 恢复而删除的 `test_hosted_resident_retirement.py` 行；
+  OPTIMIZATION_BACKLOG #14 补「hosted tick 线已整体退役」后记；
+  DEPLOYMENTS 两处历史指针（acme_dns01、bootstrap-test-cvm.yml）加已删
+  注记。历史横幅文档内的悬空引用（litellm/app.py/设计期 v2 模块名等
+  130+ 处）按惯例保持原状。
+- **hosted/ 深扫**：删 2 个死符号——`agent_runtime_cutover._env_truthy`
+  （dual 恢复批次带回但从未接线）、`mcp_tools.MAX_MCP_TOOL_DESCRIPTION_CHARS`
+  （兄弟常量都活，唯它孤儿）；`config_store.set_last_runtime_error` 判仅
+  测试供养入 #15 台账并修正其 docstring 的幻影调用方声明；
+  **`file_text.py` 头部重写**——原自述「compatibility tests only、V2 不
+  import」已失实（它是 V2 `local` sandbox provider 的生产提取器）。
+- **enclave/ 深扫**：零死符号；修 3 处失实注释（config.py 两处 Flask 措辞
+  →ASGI、health.py 「single-threaded」删除——现为 4 worker×32 线程池）。
+- **根级文档**：CONTRIBUTING 包结构树补齐 15+ 漏列包（8 个承载路由的领域
+  包、asgi/ 装配层、enclave/ 包、agent_runtime/capabilities/workspace 等）
+  与 6 个漏列底层模块；DESIGN.md 头部定位更新（iOS 已迁独立仓、docs-site
+  纳入公开面、admin HTML 面板不受其约束）；README 幽灵数字 31→23
+  （git 移除提交正文自洽值）。建议未动：CLAUDE.md「所有 UI 先读
+  DESIGN.md」可限定为 iOS/SwiftUI（用户指令文件，留 owner 定）。
+- **git 洁癖**：全仓 1318 个被跟踪文件零垃圾（无生成物/pyc/DS_Store/大
+  文件）；唯一补丁 `.gitignore` 加 `.pytest_cache/`。
+
+### [DONE] 例行清理第四轮（db/SQL 层 / V1 consumer / plans 档案横幅 / 目录型资产）
+
+- **db.py**：删 2 个全仓零引用的全死函数 `try_stamp_hosted_tick`（与第二轮
+  删掉的 `FEEDLING_HOSTED_TICK_*` 死配置同源——hosted tick 整线已退役）与
+  `genesis_latest_done_job`。死表 0、死 SQL 常量 0、tee 三包死函数 0。
+  6 个「仅测试供养」候选未删，已登记进 OPTIMIZATION_BACKLOG #15 待领域
+  裁定（`insert_user` 维持 #15 既有勿删判定；`chat_newest_ts` 判 oracle
+  保留）。
+- **僵尸 monkeypatch 修正**：`test_chat_history_selfheal.py` 的 fail-open
+  测试 patch 的是探针已不调用的 `chat_newest_ts`（boom 永不触发、测试空
+  转），改 patch 真实探针 `chat_count_since`。
+- **V1 consumer（13k 行专项）**：仅一个死常量 `_WEEKDAYS_ZH`（时间渲染早
+  已抽到 `chat/reply_language.py`，那份是活的），已删；无死分支、无误导
+  注释；HTTP/Hermes 路径是 env-gated 冷路径非死码。
+- **plans/specs 档案横幅**：`2026-07-18-runtime-v2-completion-design.md`
+  补 RETIRED（整篇 V2-only/杀 resident 命题被 07-21 dual 反转、原先无任何
+  标注，最严重一份）；`2026-07-09-…-D0-rollout-infrastructure.md` plan 补
+  RETIRED（其 spec 早已 RETIRED、plan 漏标）；
+  `2026-07-04-tee-postgres-migration-design.md` 补部分退役说明
+  （Phase 0–1 现役、Phase 2–3 随 supervisor 拓扑作废）。
+- **目录型资产全干净**：copytext（DB 服务非静态目录）、notices catalog
+  24 类全有发射方、conftest 仅 2 个高频 fixture、model_api_runtime 无外部
+  prompt 资产、loadtest/provider_probe 无断裂引用——零死项。
+
+### [DONE] 例行清理第三轮（tests 整洁 / 部署脚本 / 剩余 docs / 模块 docstring）
+
+- **tests/ 未用 import 清理**：pyflakes 告警 73→38。逐条核实后删 30 条纯
+  标准库死 import、2 处部分符号、2 处冗余局部绑定（改裸调用保留副作用）、
+  `test_perception.py` 7 处函数内重复 import。**19 条 `content_encryption`
+  探针 import 是 try/except stub 注入模式（带 noqa），全部保留**；另 2 处
+  作者显式注明故意保留的也未动。11 条被测模块整模块别名 import 疑似死码但
+  不排除冒烟意图，留待人工；2 处疑似「测试漏断言」线索见 CHANGELOG 下方注。
+- **部署面**：`wait-cvm-ready.sh` 删 litellm 残句；`feedling-backend.service`
+  Description Flask→ASGI；`setup.sh` 补 LEGACY 横幅（VPS 时代路径，指向
+  docs-site self-hosting）；`BUILD.md` 补 `requirements-v2-worker.lock`
+  再生成步骤（命令对齐 lock 文件头）。
+- **docs**：`AUDIT.md` 修 5 处指向已迁出 iOS 仓的 `testapp/` 路径（iOS
+  2026-05-22 迁独立仓，07-06 大清理漏网）+ `.gitignore` 删 3 条 testapp
+  残留；`FRONTEND_ERROR_CONTRACT.md` Phase B/C 状态「待排期」→已上线
+  （notices 路由/catalog 均已 ship）；`OPTIMIZATION_BACKLOG.md` #5 帧存
+  R2 标 ✅；`PROD_DEPLOY_VERIFICATION_2026-07.md` 加快照横幅并移除对已因
+  泄漏事故删除的密码文档的悬空引用。
+- **backend docstring**：`agent_runtime/__init__` 停在「P0 单用户 Claude
+  Agent SDK 原型」的描述重写为多租户 cli-mode supervisor 现状；
+  `content_encryption.py` 4 处 `enclave_app.py _box_seal_open_hkdf` 引用
+  改为现址 `enclave/envelope.py box_seal_open_hkdf`（函数已去下划线）；
+  agent_runtime README 迁移号 0005→0004、Layout 补 `introduction.py`。
+- **两个疑似测试缺口已核实并处置**：`test_multi_tenant_isolation.py` 的
+  `my_markers` 经查非漏断言——chat/identity/memory/whoami 四段各有独立正反
+  断言，属纯冗余构造，已删；`test_chat_resident_consumer.py` 原
+  `test_empty_content_decrypt_source_available_replies` 确实没测它声称的
+  场景（`_process_messages` 不做解密，合并在 poll 循环上游；喂
+  `decrypted_msg` 才是它真正测的契约），已改名
+  `test_decrypted_content_from_decrypt_source_replies`、删除无效的
+  `empty_msg`/`get_decrypted_history` patch 并如实重写 docstring；合并
+  胶水的两个 helper（`_poll_decrypt_since`/`_filter_messages_to_poll_ids`）
+  与「配置源仍无明文」读失败分支均确认已有专门测试覆盖。
+
+### [DONE] 例行清理第二轮（docs-site / env 接线 / 参考文档事实性 / 符号级）
+
+- **死配置删除**：`FEEDLING_PROACTIVE_GATE_PROVIDER`/`_MODEL`（三份 phala
+  compose；gate 已 v2 化、`proactive/gate.py` 硬编码 `proactive_v2:wake`，
+  全仓零读取方；`OPENROUTER_API_KEY` 保留——dashboard 调试翻译在用，注释
+  已改写）；`feedling.env.example` 的 `FEEDLING_HOSTED_TICK_*` 两条（被
+  `PROACTIVE_TICK_*` 取代）；`chat_resident.env.example` 的
+  `FALLBACK_COOLDOWN`（无读取方）。
+- **符号级死代码**：删 `model_api_runtime/v2/summary_frontier.render_frontier`
+  （零调用，渲染已走 `render_replacement`）；删 `hosted/config_store.py` 与
+  `perception/service.py` 各一条真·未用顶层 import；清 tools/ 六处未用
+  import（`user_logs.py` 的 boto3 是带 noqa 的故意探测，保留）。
+- **参考文档事实性修正**：`PROJECT_OVERVIEW.md` 删悬空 `acme_dns01.py` 表行；
+  `TESTING.md` L2 路径 `tools/`→`tests/`、决策矩阵 E 行 litellm 遗词改现役
+  pi-driver 体系；`README.md` memory floor 数值对齐代码（1+月 ≥12 非 ≥15）；
+  `RUNTIME_FLOWS.md` §3 历史段顶部补「点名符号可能已删」免责；
+  `API_ERRORS.md` 补登 8 个漏登记 slug（`client_msg_id_invalid`、
+  `invalid_reasoning_effort`、`model_api_config_delete_failed`、
+  `nudge_delta_exceeds_cap`、`material_empty`、`redistill_job_active`、
+  `confirmation_mismatch`、`device_already_enrolled`，新增通知中继小节）。
+- **docs-site 公开文档三处 dual-runtime 失实修正**（changelog.mdx Unreleased
+  的 V2-only 表述、架构图 serve-worker「separate CVM」定位、self-hosting
+  `FEEDLING_HOSTED_RUNTIME_POLICY` 行）；`npm run types:check`/`lint`/`build`
+  全绿，OpenAPI 无需重生成（无 API 面变更）。
+- 判保留：`workspace/sandbox.py` 的 `register_*_sandbox_provider` 部署扩展
+  钩子；tests/ 内 73 条良性 unused-import 告警（独立整洁项，未动）。
+
+### [DONE] 过时代码/文档/注释例行清理（四路全仓扫描 + 逐项取证）
+
+- **删文档 2 份**（均核实已落地后删）：`docs/PI_USER_MCP_GAP_给志豪_2026-07-17.md`
+  （pi user-MCP 桥已在 `spawners.py` `{mcp}` 模板 + consumer `-e <bridge>` 实现，
+  诊断失效）、`docs/IDENTITY_CARD_NEVER_GATES_2026-07-12.md`（已由
+  `2e72f13e`/`24f32df5` 落地）。
+- **删测试 3 处**：`tests/test_bootstrap_gates.py` 两个被 v1 淘汰、长期
+  `@skip("P6 …retired by v1")` 的 per-tab 语义用例（未 skip 的 retype 错误路径
+  用例保留）；`tests/conftest.py` `_PURE_UNIT` 白名单里指向已删除
+  `test_model_api_prompts.py` 的死条目。
+- **修过时注释**：`deploy/Dockerfile` 启动注释从 Flask/app.py 时代重写为
+  ASGI + 多 worker（leader election）现状；三份 phala compose 的
+  `backend/app.py` 指向改 `backend/push/apns.py`；`gunicorn_conf.py` 一句
+  Flask 残留；alembic `0007` 的 backfill 脚本路径。
+- **补历史标注**：`DEPLOYMENTS.md` Phase-E compose 快照行（mcp 已删、backend
+  已 ASGI）；两份 `pi-on-multiprofile` plan/spec 横幅补 deepseek 07-14 回退
+  claude driver 说明。
+- **取证后判保留（勿反复清理）**：`backend/hosted_runtime.py` 与
+  `backend/proactive/background_v2.py` 虽仅测试引用，但 07-18 第五/六轮清理
+  已 git 取证终审判保留（OPTIMIZATION_BACKLOG #15：proactive V2 在建预留面 /
+  oracle），无新证据不推翻；`deploy/PHALA_ACCOUNT_MIGRATION.md`（prod 仍在
+  sxysuns 账号，§Phase 2 未走完）；`AGENT_CLI_INTEGRATION_SURVEY.md`（被
+  live 代码注释引用）；`UPLOAD_MEMORY_IDENTITY_CALIBRATION_2026-07-07.md`
+  （`genesis/prompts.py` 仍标 DRAFT 待定稿，是产品意图正本）；
+  `docs/superpowers/plans+specs` 整目录（持续维护的日期档案）；
+  `tools/frame_envelope_roundtrip_test.py`（5001 仍是现役端口，"Flask 时代
+  端口"判据不成立）。
+- 验证：pyflakes 零告警；全量 pytest 与清理前基线对照零新增失败。
+
 ## 2026-07-22
 
 ### [DONE] Task 11 — 双运行时部署拓扑：serve-worker 并入主 CVM，runner 回 V1-only

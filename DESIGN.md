@@ -16,10 +16,13 @@ here first.
   users. Beta ships to ~30 people from a ~300-person community.
 - **Space / industry:** Consumer AI companion × iOS utility × crypto /
   privacy infrastructure. Rare combination; no direct peer.
-- **Project type:** Primarily a native iOS app. Supporting marketing
-  surface is minimal today (`README.md`, `deploy/SELF_HOSTING.md`,
-  and the public skill at io-onboarding). DESIGN.md serves the app
-  first; any future marketing page inherits from it.
+- **Project type:** Primarily a native iOS app（iOS 源码已于 2026-05-22
+  迁至独立仓 `feedling-mcp-ios`；本文件仍是设计系统权威副本）。Supporting
+  surface today: `README.md`、公开文档站 `docs-site/`、io-onboarding 的
+  public skill（`deploy/SELF_HOSTING.md` 已降级为 legacy runbook）。
+  DESIGN.md serves the app first; any future marketing page inherits
+  from it. 本仓内的 admin data-track 面板（`backend/admin/data_track.py`
+  服务端渲染 HTML）是团队内部工具，不受本设计系统约束。
 - **Peers surveyed (2026-04-20):** Linear (discipline reference),
   Granola (warmth reference, wrong-for-us), Dia (extreme-minimalism
   reference, too far), Replika (companion reference, too saccharine),

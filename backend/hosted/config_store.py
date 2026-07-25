@@ -12,7 +12,6 @@ from core.store import UserStore
 from notices import catalog as notices_catalog
 from notices import core as notices_core
 import provider_client
-from provider_client import public_config as public_provider_config
 from provider_client import validate_config as validate_provider_config
 
 
@@ -283,8 +282,9 @@ def _append_model_api_action_trace(store: UserStore, entry: dict) -> dict:
 def set_last_runtime_error(store: UserStore, message: str) -> None:
     """Public direct lever to surface a terminal runtime failure to iOS's error
     chip. The active route is the current read-side truth; the legacy runtime
-    profile remains a rollback/debug mirror. This is for callers — namely the
-    V2 worker and independent reaper — that have no action-trace entry."""
+    profile remains a rollback/debug mirror. NOTE: the V2 worker/reaper ended
+    up writing last_runtime_error via jobs_store SQL directly, not through
+    this wrapper — currently only tests exercise it (OPTIMIZATION_BACKLOG #15)."""
     value = str(message)[:300]
     _patch_model_api_runtime_profile(store, {"last_runtime_error": value})
     db.model_api_route_mark_runtime_error(

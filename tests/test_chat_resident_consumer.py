@@ -5,7 +5,6 @@ Regression tests for tools/chat_resident_consumer.py
 Run with: pytest tests/test_chat_resident_consumer.py -v
 """
 
-import importlib
 import base64
 import json
 import os
@@ -1010,23 +1009,18 @@ def test_process_messages_executes_memory_actions_before_reply():
 # Phase 3: decrypt source unavailable cases
 # ---------------------------------------------------------------------------
 
-def test_empty_content_decrypt_source_available_replies(monkeypatch):
-    """poll returns content="" but decrypt source is available and returns
-    plaintext — consumer must reply using the decrypted content."""
-    # Simulate poll returning empty-content message
-    empty_msg = _make_msg(role="user", content="", ts=4000.0)
-    # Decrypt source returns the plaintext version
+def test_decrypted_content_from_decrypt_source_replies(monkeypatch):
+    """Post-merge contract of _process_messages: the poll loop uses poll
+    messages only as a trigger and feeds the get_decrypted_history result in
+    (merge glue covered by test_consumer_decrypt_since +
+    _filter_messages_to_poll_ids tests) — a decrypted non-empty message must
+    produce a reply."""
     decrypted_msg = _make_msg(role="user", content="what's the weather?", ts=4000.0)
 
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://127.0.0.1:5003")
-    monkeypatch.setattr(
-        crc, "get_decrypted_history",
-        lambda since, limit=20, include_image_body=True: [decrypted_msg],
-    )
 
     with patch.object(crc, "call_agent", return_value="sunny") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
-        # Consumer uses get_decrypted_history result, not the empty poll message
         result_ts = crc._process_messages([decrypted_msg])
 
     mock_agent.assert_called_once()
@@ -8377,7 +8371,7 @@ def test_generic_failure_sets_backoff(monkeypatch):
 
 
 def test_402_failure_feeds_both_cooldown_and_general_backoff(monkeypatch):
-    cap = _proactive_guard_harness(monkeypatch, raise_exc=RuntimeError("HTTP 402 payment required"))
+    _proactive_guard_harness(monkeypatch, raise_exc=RuntimeError("HTTP 402 payment required"))
     crc._proactive_backoff_until = 0.0
     crc._clear_provider_payment_cooldown()
     crc._process_proactive_jobs([_idle_proactive_job()])

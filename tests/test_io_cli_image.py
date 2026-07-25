@@ -7,7 +7,6 @@ claude Read them; `screen-read`/`photo-read --include-image` must do the same so
 the agent can actually SEE the screen frame / photo it fetched.
 """
 import base64
-import json
 import os
 import sys
 from pathlib import Path

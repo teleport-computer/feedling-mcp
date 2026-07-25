@@ -163,14 +163,16 @@ export function ArchitectureDiagram() {
             className="rounded-2xl border-2 border-fd-primary/60 bg-fd-primary/5 p-3"
           >
             <p className="m-0 text-[0.68rem] font-semibold uppercase tracking-[0.16em] text-fd-primary">
-              Separate confidential-VM boundary
+              Same managed confidential-VM boundary
             </p>
             <h3 className="m-0 mb-2 mt-1 text-sm font-semibold" id="architecture-runner">
               Hosted Runtime V2 worker pool
             </h3>
             <div className="grid gap-2">
               <Node title="Pooled serve-worker">
-                Claims durable jobs, publishes capacity heartbeats, and mints scoped runtime tokens per turn.
+                Runs alongside the backend inside the measured main CVM; claims durable jobs, publishes
+                capacity heartbeats, and mints scoped runtime tokens per turn. During the dual-runtime
+                window a separate CVM still runs the V1 resident runner.
               </Node>
               <div aria-hidden="true" className="text-center text-lg leading-none text-fd-primary">
                 ↓
