@@ -706,6 +706,8 @@ _system_notice_last_sent: dict[str, float] = {}
 # 每进程首个成功回合无条件清一次设置页错误（代价一次 HTTP），覆盖 respawn 前留下的滞留错误：
 # respawn 后新进程从 False 起步则永远不会触发清空，导致用户修好配置后 last_runtime_error 仍滞留。
 _runtime_error_reported = True
+PROVIDER_HEALTH_SUCCESS_REPORT_INTERVAL_SEC = 15 * 60
+_provider_health_success_reported_at = 0.0
 
 # 组件2：call_agent 清洗为空时（SEND_FALLBACK_ON_AGENT_ERROR=true）不抛异常，
 # 靠这个模块级标记让前台调用方知道本轮其实失败了，要补发 reply_parse_failed 通知。
@@ -726,7 +728,11 @@ def _reset_system_notice_state() -> None:
     _system_notice_last_sent.clear()
 
 
-def _report_runtime_error(error: str, error_class: str = "") -> bool:
+def _report_runtime_error(
+    error: str,
+    error_class: str = "",
+    provider_result: str = "",
+) -> bool:
     """腿②：设置页 last_runtime_error。失败只 log（观测性不影响回合）。
 
     只有请求真正落到服务端（2xx，或 404=无 profile 可清）才更新
@@ -736,7 +742,11 @@ def _report_runtime_error(error: str, error_class: str = "") -> bool:
     try:
         resp = _HTTP.post(
             f"{FEEDLING_API_URL}/v1/model_api/runtime_error",
-            json={"error": (error or "")[:300], "error_class": (error_class or "")[:64]},
+            json={
+                "error": (error or "")[:300],
+                "error_class": (error_class or "")[:64],
+                "provider_result": (provider_result or "")[:16],
+            },
             headers=_HEADERS, timeout=10,
         )
         if resp.status_code != 404:
@@ -755,7 +765,11 @@ def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
     + debug 日志。永不抛出：通知是回合失败的旁路，绝不能让它把失败变得更糟。"""
     try:
         notice = classify_agent_error(exc)
-        _report_runtime_error(notice.detail, notice.error_class)
+        _report_runtime_error(
+            notice.detail,
+            notice.error_class,
+            provider_result="failure",
+        )
         if not foreground:
             return
         # 三桶（见上方块注释）：user_provider 各 error_class 一桶、provider_transient
@@ -805,15 +819,25 @@ def _suppress_duplicate_upstream_banner(notice: "AgentErrorNotice") -> None:
 
 
 def _note_agent_turn_success() -> None:
-    """成功回合：清空设置页错误（仅当本进程报过错，省一次 HTTP）。
+    """成功回合：清空设置页错误，并节流刷新 provider health 成功时间。
 
     不再清横幅限流窗口——固定窗口（见 FOREGROUND_NOTICE_WINDOW_SEC）：上游
     一抖一恢复时若每次成功都清零，每次"恢复后再坏"都会重新弹横幅。
     标记翻转在 _report_runtime_error 内部、且仅在清空真正送达时发生——
     这里不再无条件翻 False（Codex P2：清空 POST 失败会让过期错误滞留且
-    永不重试）。清空失败 → 标记保留 → 下个成功回合自动重试。"""
-    if _runtime_error_reported:
-        _report_runtime_error("", "")
+    永不重试）。设置页有错时立即清；正常健康回合最多每 15 分钟上报一次，
+    48h 判定不需要每回合精度，也不应给热路径每轮增加一次 HTTP。"""
+    global _provider_health_success_reported_at
+    now = time.monotonic()
+    due = (
+        _provider_health_success_reported_at <= 0
+        or now - _provider_health_success_reported_at
+        >= PROVIDER_HEALTH_SUCCESS_REPORT_INTERVAL_SEC
+    )
+    if not _runtime_error_reported and not due:
+        return
+    if _report_runtime_error("", "", provider_result="success"):
+        _provider_health_success_reported_at = now
 
 
 def _agent_call_failed_reason(prefix: str, exc: BaseException) -> str:

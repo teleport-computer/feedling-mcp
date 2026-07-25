@@ -317,6 +317,7 @@ _DELETE_TABLES = (
     "memory_moments",
     "user_blobs",
     "agent_runtime_instances",
+    "provider_health",
 )
 
 
@@ -341,6 +342,11 @@ def _seed_delete_rows(user_id: str) -> None:
             "INSERT INTO agent_runtime_instances "
             "(user_id, driver, status, runtime_home) "
             "VALUES (%s, 'claude', 'idle', '/tmp/admin-delete')",
+            (user_id,),
+        )
+        conn.execute(
+            "INSERT INTO provider_health (user_id, provider_state) "
+            "VALUES (%s, 'ok')",
             (user_id,),
         )
 

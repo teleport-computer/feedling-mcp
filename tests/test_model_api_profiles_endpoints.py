@@ -501,6 +501,46 @@ def test_route_test_endpoint_marks_ok(
     assert db.model_api_active_route(uid)["id"] != r2
 
 
+def test_only_active_provider_validation_restores_provider_health(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave):
+    uid = registered_user["user_id"]
+    headers = _setup_one(client, registered_user)
+    cid = db.model_api_credentials_list(uid)[0]["id"]
+    r2 = db.model_api_route_upsert(uid, cid, "claude-haiku-4-5", None)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            UPDATE provider_health
+            SET provider_state = 'needs_user_action',
+                last_provider_failure_at = now(),
+                last_provider_error_class = 'auth_invalid',
+                last_provider_error_blame = 'user_provider',
+                last_probe_at = now()
+            WHERE user_id = %s
+            """,
+            (uid,),
+        )
+
+    tested = client.post(f"/v1/model_api/routes/{r2}/test", headers=headers)
+    assert tested.status_code == 200, tested.get_data(as_text=True)
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT provider_state FROM provider_health WHERE user_id = %s",
+            (uid,),
+        ).fetchone()[0] == "needs_user_action"
+
+    activated = client.post(
+        f"/v1/model_api/routes/{r2}/activate",
+        headers=headers,
+    )
+    assert activated.status_code == 200, activated.get_data(as_text=True)
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT provider_state FROM provider_health WHERE user_id = %s",
+            (uid,),
+        ).fetchone()[0] == "ok"
+
+
 def test_route_test_mark_ok_write_failure_500(
         client, registered_user, fake_provider, fake_envelope, fake_enclave, monkeypatch):
     """Same _test_route_or_error mark_test('ok') check as

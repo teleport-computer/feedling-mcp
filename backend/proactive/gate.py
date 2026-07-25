@@ -10,12 +10,16 @@ from core.store import UserStore
 from proactive.adapters_v2 import source_for_legacy_trigger_v2
 from proactive.controls_v2 import evaluate_wake_control_v2, resolve_settings_v2
 from proactive import service
+import provider_health
 from screen import frames as screen_frames
 
 SCREEN_WATCH_JOB_KIND = "screen_watch"
 ACTIVATION_PENDING_REASON = "activation_pending"
 LOOP_GUARD_BLOCK_REASON = "proactive_idle_loop"
 HEARTBEAT_THROTTLED_REASON = "heartbeat_throttled"
+PROVIDER_NEEDS_USER_ACTION_REASON = (
+    provider_health.PROVIDER_NEEDS_USER_ACTION_REASON
+)
 
 
 def _clean_runtime_token(raw: object) -> str:
@@ -199,6 +203,7 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
     trigger = _proactive_trigger(payload, manual=manual, frames=selected_frames, explicit_trigger=explicit_trigger)
     if not job_kind:
         job_kind = _proactive_job_kind(payload, trigger=trigger)
+    provider_probe = False
 
     activation_pending = not manual and not str(settings.get("first_chat_ok_at") or "").strip()
     if activation_pending:
@@ -230,6 +235,14 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
                 broadcast_state=broadcast_state,
                 frame_ids=frame_ids,
             )
+        if not block_reason and not manual:
+            provider_admission = provider_health.proactive_admission(
+                store.user_id,
+                now=now,
+            )
+            provider_probe = provider_admission.probe
+            if not provider_admission.allowed:
+                block_reason = provider_admission.block_reason
 
     current_app = str(payload.get("current_app") or "").strip()
     if not current_app:
@@ -256,6 +269,7 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
         "should_garden_passive": False,
         "abstention_reason": "" if should_wake_agent else reason,
         "reason": reason,
+        "block_reason": block_reason,
         "intent_label": "",
         "context_hint": "",
         "connections": [],
@@ -291,6 +305,7 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
             "llm_error": "",
             "activation_pending": activation_pending,
             "mechanical_block": block_reason,
+            "provider_health_probe": provider_probe,
             "loop_guard_blocked": loop_guard_blocked,
             "loop_guard_reason": loop_guard_reason,
             "memory_context": {

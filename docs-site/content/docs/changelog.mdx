@@ -10,6 +10,19 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Long-term provider configuration failures now pause proactive model work.**
+  When an account has gone 48 hours without a usable provider response and its
+  latest failures have continuously required user action for at least one hour,
+  Feedling pauses automatic heartbeat, screen-watch, capture, and dream calls
+  instead of retrying every few minutes. Foreground Chat and user-initiated
+  manual wakes remain available, one automatic proactive recovery probe is
+  allowed every 24 hours, and any successful provider response or Settings
+  validation restores normal operation immediately. Temporary rate limits and
+  upstream `5xx` failures do not trigger the pause. Resident runtimes can report
+  the outcome through the new optional
+  `provider_result: "success" | "failure"` field on
+  `POST /v1/model_api/runtime_error`.
+
 - **`POST /v1/chat/message` now persists an optional `caption_envelope`.** To send
   text alongside an image or file, pass the caption as its own E2E
   `EncryptedEnvelope` in `caption_envelope` (same shape as `envelope`, wrapped to

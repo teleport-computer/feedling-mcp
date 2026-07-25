@@ -125,6 +125,7 @@ if not _provisioned:
         "test_ios_perception_contract_v2.py",
         "test_perception_ingress_v2.py",
         "test_provider_client.py",
+        "test_provider_health_unit.py",
         "test_history_import_identity.py",
         "test_model_api_file_payload.py",
         "test_onboarding_validation_genesis.py",

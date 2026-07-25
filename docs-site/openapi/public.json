@@ -4616,12 +4616,13 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/FreeFormJsonObject"
+                "$ref": "#/components/schemas/ModelApiRuntimeErrorRequest"
               }
             }
           }
         },
-        "x-feedling-contract-level": "compatibility"
+        "x-feedling-contract-level": "documented",
+        "description": "Record or clear the resident runtime's latest provider error. provider_result=success refreshes provider health immediately; provider_result=failure applies error_class to the provider-health policy."
       }
     },
     "/v1/model_api/setup": {
@@ -8109,6 +8110,35 @@
               "title": "Morning preferences"
             }
           ]
+        }
+      },
+      "ModelApiRuntimeErrorRequest": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string",
+            "maxLength": 300,
+            "description": "Latest runtime error detail, or an empty string to clear it."
+          },
+          "error_class": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Stable classified error name."
+          },
+          "provider_result": {
+            "type": "string",
+            "enum": [
+              "success",
+              "failure"
+            ],
+            "description": "Optional provider-call outcome. Residents report success for a usable provider reply and failure with error_class."
+          }
+        },
+        "additionalProperties": true,
+        "example": {
+          "error": "provider_http_402 insufficient balance",
+          "error_class": "quota_insufficient",
+          "provider_result": "failure"
         }
       },
       "HostedChatAcceptedResponse": {

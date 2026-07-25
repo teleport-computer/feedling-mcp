@@ -273,17 +273,31 @@ def test_note_success_clears_reported_flag_after_respawn(monkeypatch):
         crc._HTTP, "post",
         lambda url, **kw: calls.append(kw.get("json")) or _FakeResp(200))
     crc._runtime_error_reported = True
+    crc._provider_health_success_reported_at = 0.0
+    monkeypatch.setattr(crc.time, "monotonic", lambda: 1_000.0)
     crc._note_agent_turn_success()
-    assert calls == [{"error": "", "error_class": ""}]
+    assert calls == [
+        {
+            "error": "",
+            "error_class": "",
+            "provider_result": "success",
+        }
+    ]
     assert crc._runtime_error_reported is False
 
 
 def test_clear_failure_keeps_flag_and_retries_next_success(monkeypatch):
     # Codex P2：清空 POST 失败不许翻标记——否则过期错误滞留设置页且永不重试。
     # 序列：传输异常 → 5xx → 200；前两次后标记必须仍为 True，第三次成功后 False，
-    # 之后的成功回合不再发请求。
+    # 之后的成功回合按 15 分钟节流上报 provider_result=success。
     calls = []
-    outcomes = [RuntimeError("connect timeout"), _FakeResp(503), _FakeResp(200)]
+    outcomes = [
+        RuntimeError("connect timeout"),
+        _FakeResp(503),
+        _FakeResp(200),
+        _FakeResp(200),
+    ]
+    clocks = iter([1_000.0, 1_001.0, 1_002.0, 1_003.0, 1_902.0])
 
     def fake_post(url, **kw):
         calls.append(kw.get("json"))
@@ -293,15 +307,20 @@ def test_clear_failure_keeps_flag_and_retries_next_success(monkeypatch):
         return r
 
     monkeypatch.setattr(crc._HTTP, "post", fake_post)
+    monkeypatch.setattr(crc.time, "monotonic", lambda: next(clocks))
     crc._runtime_error_reported = True
+    crc._provider_health_success_reported_at = 0.0
     crc._note_agent_turn_success()   # 传输失败
     assert crc._runtime_error_reported is True
     crc._note_agent_turn_success()   # 5xx
     assert crc._runtime_error_reported is True
     crc._note_agent_turn_success()   # 成功
     assert crc._runtime_error_reported is False
-    crc._note_agent_turn_success()   # 已清，不再发
+    crc._note_agent_turn_success()   # 15 分钟内，跳过
     assert len(calls) == 3
+    crc._note_agent_turn_success()   # 满 15 分钟，刷新健康时间
+    assert len(calls) == 4
+    assert all(call["provider_result"] == "success" for call in calls)
 
 
 def test_report_404_counts_as_settled(monkeypatch):
@@ -309,6 +328,7 @@ def test_report_404_counts_as_settled(monkeypatch):
     # 都对着 404 重试。
     monkeypatch.setattr(crc._HTTP, "post", lambda url, **kw: _FakeResp(404))
     crc._runtime_error_reported = True
+    crc._provider_health_success_reported_at = 0.0
     crc._note_agent_turn_success()
     assert crc._runtime_error_reported is False
 

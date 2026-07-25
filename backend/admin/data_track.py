@@ -1269,9 +1269,27 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     for u in users:
         uid = str(u.get("user_id") or "")
         if include_detail_user and include_detail_user == uid:
-            rows.append(_build_data_track_user(u, include_detail=True))
+            row = _build_data_track_user(u, include_detail=True)
         else:
-            rows.append(_build_data_track_user_fast(u, snapshot.get(uid, {})))
+            row = _build_data_track_user_fast(u, snapshot.get(uid, {}))
+        health = dict(snapshot.get(uid, {}).get("provider_health") or {})
+        row.update(
+            {
+                "provider_state": str(
+                    health.get("provider_state") or "ok"
+                ),
+                "last_provider_success_at": str(
+                    health.get("last_provider_success_at") or ""
+                ),
+                "last_provider_failure_at": str(
+                    health.get("last_provider_failure_at") or ""
+                ),
+                "last_provider_error_class": str(
+                    health.get("last_provider_error_class") or ""
+                ),
+            }
+        )
+        rows.append(row)
     rows = _data_track_apply_text_filter(rows, str(filters.get("q") or ""))
     _data_track_sort_rows(rows, str(filters.get("sort") or ""), str(filters.get("dir") or "desc"))
     completed = sum(1 for r in rows if r["onboarding"]["passing"])
@@ -1302,6 +1320,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     # App usage-duration roll-up (iOS app_session_end). foreground-kill undercount
     # is expected (see analytics-app-session-end.md); this is a slight lower bound.
     au_fg_total = au_sessions_total = au_users_active = au_dau_today = 0
+    provider_needs_user_action = 0
     for row in rows:
         stage = row["onboarding"]["stage"]
         route = row["route"]
@@ -1314,6 +1333,8 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         proactive_jobs += row["proactive"]["jobs"]
         proactive_messages += row["proactive"]["proactive_messages"]
         proactive_failed += row["proactive"]["failed_jobs"]
+        if row.get("provider_state") == "needs_user_action":
+            provider_needs_user_action += 1
         if int(row["memory"].get("total") or 0) > 0:
             fn_has_memory += 1
         if int(row["chat"].get("user_messages") or 0) > 0:
@@ -1398,6 +1419,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         "proactive_jobs_total": proactive_jobs,
         "proactive_messages_total": proactive_messages,
         "proactive_failed_total": proactive_failed,
+        "provider_needs_user_action": provider_needs_user_action,
         "app_usage": {
             "foreground_sec_total": au_fg_total,
             "sessions_total": au_sessions_total,
@@ -2158,6 +2180,10 @@ def _render_data_track_page(payload: dict) -> str:
         _render_metric("聊天消息总数", summary["chat_messages_total"]),
         _render_metric("记忆总数", summary["memory_total"]),
         _render_metric("主动任务数", summary["proactive_jobs_total"]),
+        _render_metric(
+            "模型配置待处理",
+            summary.get("provider_needs_user_action", 0),
+        ),
     ])
     # Ground-truth activation funnel (behaviour-based, not stage-label-based).
     funnel_steps = [
@@ -3756,6 +3782,9 @@ def _render_user_detail_page(user: dict) -> str:
     <div class="card"><div class="value">{user['memory']['total']}</div><div class="label">memories</div></div>
     <div class="card"><div class="value">{html.escape(user.get('genesis', {}).get('status') or 'none')}</div><div class="label">genesis distill</div></div>
     <div class="card"><div class="value">{user['proactive']['proactive_messages']}</div><div class="label">proactive writes</div></div>
+    <div class="card"><div class="value">{html.escape(user.get('provider_state') or 'ok')}</div><div class="label">provider state</div></div>
+    <div class="card"><div class="value">{html.escape(_bj_iso(user.get('last_provider_success_at')) or 'never')}</div><div class="label">last provider success</div></div>
+    <div class="card"><div class="value">{html.escape(user.get('last_provider_error_class') or 'none')}</div><div class="label">latest provider error</div></div>
   </section>
   {_render_perception_permissions(user)}
   {_render_perception_freshness(user)}

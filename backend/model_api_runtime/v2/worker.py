@@ -51,6 +51,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import db
 import provider_client
+import provider_health
 from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
@@ -114,6 +115,34 @@ def _report_turn_progress(stage: str) -> None:
         callback(str(stage))
     except Exception as exc:  # noqa: BLE001 — watchdog telemetry is best-effort
         log.debug("[v2.worker] turn progress callback failed stage=%s: %s", stage, exc)
+
+
+async def _record_provider_success(user_id: str) -> None:
+    await asyncio.to_thread(provider_health.record_success, user_id)
+
+
+async def _record_provider_failure(
+    user_id: str,
+    exc: BaseException,
+) -> None:
+    await asyncio.to_thread(
+        provider_health.record_failure,
+        user_id,
+        error_class=provider_health.error_class_for_exception(exc),
+    )
+
+
+async def _extract_with_provider_health(
+    user_id: str,
+    **kwargs: Any,
+) -> tuple[Any, str | None]:
+    try:
+        result = await v2_extraction.extract(**kwargs)
+    except Exception as exc:
+        await _record_provider_failure(user_id, exc)
+        raise
+    await _record_provider_success(user_id)
+    return result
 
 
 def _positive_int_env(name: str, default: str) -> int:
@@ -1949,16 +1978,21 @@ async def _run_trajectory_review_turn(
             ),
         )
         await _review_fence("trajectory_review_provider_start")
-        result = await asyncio.wait_for(
-            provider_client.chat_completion_async(
-                provider_config,
-                messages,
-                tools=None,
-                max_tokens=_TRAJECTORY_REVIEW_MAX_TOKENS,
-                timeout=_TRAJECTORY_REVIEW_TIMEOUT_SEC,
-            ),
-            timeout=_TRAJECTORY_REVIEW_TIMEOUT_SEC + 5.0,
-        )
+        try:
+            result = await asyncio.wait_for(
+                provider_client.chat_completion_async(
+                    provider_config,
+                    messages,
+                    tools=None,
+                    max_tokens=_TRAJECTORY_REVIEW_MAX_TOKENS,
+                    timeout=_TRAJECTORY_REVIEW_TIMEOUT_SEC,
+                ),
+                timeout=_TRAJECTORY_REVIEW_TIMEOUT_SEC + 5.0,
+            )
+        except Exception as exc:
+            await _record_provider_failure(user_id, exc)
+            raise
+        await _record_provider_success(user_id)
         _report_turn_progress("trajectory_review_provider_complete")
         tm.add_call(result.get("usage") if isinstance(result, dict) else None)
         encoded, _truncated, _original_size = v2_trajectory.encode_payload(
@@ -2602,6 +2636,13 @@ def _make_task_batch_dispatcher(
                 add_usage=_charge_child_usage,
                 max_calls=_SUBAGENT_MAX_LLM_CALLS,
                 before_provider_call=budget.before_provider_call,
+                on_provider_success=lambda: _record_provider_success(
+                    store.user_id
+                ),
+                on_provider_failure=lambda exc: _record_provider_failure(
+                    store.user_id,
+                    exc,
+                ),
                 disabled_tool_names=child_disabled_tools,
                 allow_reply_tool=False,
                 outbound_blocking_read_tool_names=(_PRIVATE_READ_TOOLS),
@@ -3350,15 +3391,25 @@ def _bounded_compaction_prefix(
     return out
 
 
-async def _compaction_llm_with_progress(*args: Any, **kwargs: Any) -> Any:
+async def _compaction_llm_with_progress(
+    user_id: str,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
     """Reliable compaction provider call with per-attempt stall heartbeats."""
 
     def _attempt_progress(stage: str, attempt: int) -> None:
         _report_turn_progress(f"compaction_provider_{stage}_{attempt}")
 
-    return await provider_client.reliable_chat_completion_async(
-        *args, progress_cb=_attempt_progress, **kwargs
-    )
+    try:
+        result = await provider_client.reliable_chat_completion_async(
+            *args, progress_cb=_attempt_progress, **kwargs
+        )
+    except Exception as exc:
+        await _record_provider_failure(user_id, exc)
+        raise
+    await _record_provider_success(user_id)
+    return result
 
 
 async def _rebalance_summary_frontier(
@@ -3445,7 +3496,11 @@ async def _rebalance_summary_frontier(
                 },
             )
             try:
-                result = await _compaction_llm_with_progress(*args, **kwargs)
+                result = await _compaction_llm_with_progress(
+                    user_id,
+                    *args,
+                    **kwargs,
+                )
             except Exception as exc:
                 await _record_trajectory(
                     trajectory_recorder,
@@ -3677,7 +3732,11 @@ async def _run_compaction(
                 {"lane": "maintenance", "messages": messages, "tools": None},
             )
             try:
-                result = await _compaction_llm_with_progress(*args, **kwargs)
+                result = await _compaction_llm_with_progress(
+                    user_id,
+                    *args,
+                    **kwargs,
+                )
             except Exception as exc:
                 await _record_trajectory(
                     trajectory_recorder,
@@ -4191,7 +4250,11 @@ async def _ensure_prompt_coverage(
                 {"lane": "prompt_catchup", "messages": messages, "tools": None},
             )
             try:
-                result = await _compaction_llm_with_progress(*args, **kwargs)
+                result = await _compaction_llm_with_progress(
+                    user_id,
+                    *args,
+                    **kwargs,
+                )
             except Exception as exc:
                 await _record_trajectory(
                     trajectory_recorder,
@@ -5187,6 +5250,11 @@ async def _run_wake(
                 fold_new_messages=fold_new_messages,
                 add_usage=_add_usage,
                 max_calls=_TURN_MAX_LLM_CALLS,
+                on_provider_success=lambda: _record_provider_success(user_id),
+                on_provider_failure=lambda exc: _record_provider_failure(
+                    user_id,
+                    exc,
+                ),
                 fold_before_first=deps.read_messages_after_seq is not None,
                 on_progress=_report_turn_progress,
                 on_trajectory_event=(
@@ -5585,7 +5653,8 @@ async def _run_extraction(
 
             async def _invoke_capture_provider() -> tuple[Any, str | None]:
                 _report_turn_progress("extraction_provider_start")
-                result = await v2_extraction.extract(
+                result = await _extract_with_provider_health(
+                    user_id,
                     provider_config=provider_config,
                     prompt=prompt,
                     parse=parse,
@@ -5711,7 +5780,8 @@ async def _run_extraction(
                 items, reason = await _invoke_capture_provider()
         elif lane != "capture":
             _report_turn_progress("extraction_provider_start")
-            items, reason = await v2_extraction.extract(
+            items, reason = await _extract_with_provider_health(
+                user_id,
                 provider_config=provider_config,
                 prompt=prompt,
                 parse=parse,
@@ -7383,6 +7453,11 @@ async def process_job(
             fold_new_messages=fold_new_messages,
             add_usage=tm.add_call,
             max_calls=_TURN_MAX_LLM_CALLS,
+            on_provider_success=lambda: _record_provider_success(user_id),
+            on_provider_failure=lambda exc: _record_provider_failure(
+                user_id,
+                exc,
+            ),
             fold_before_first=seq_native,
             on_progress=_report_turn_progress,
             on_trajectory_event=(

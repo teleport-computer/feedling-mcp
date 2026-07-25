@@ -6,6 +6,7 @@ import types
 import uuid
 
 import db
+import provider_health
 from core import enclave as core_enclave
 from core import util as core_util
 from core.store import UserStore
@@ -199,7 +200,13 @@ def _patch_model_api_runtime_profile(store: UserStore, patch: dict) -> dict | No
     return merged
 
 
-def record_runtime_error(store: UserStore, *, error: str, error_class: str = "") -> tuple[dict, int]:
+def record_runtime_error(
+    store: UserStore,
+    *,
+    error: str,
+    error_class: str = "",
+    provider_result: str = "",
+) -> tuple[dict, int]:
     """Runtime V2 worker 上报（或清空）最近一次回合失败原因。
 
     写 active route 行（``model_api_routes.last_runtime_error*``）。读侧是 setup_core 的
@@ -209,6 +216,14 @@ def record_runtime_error(store: UserStore, *, error: str, error_class: str = "")
     if not db.model_api_route_mark_runtime_error(
             store.user_id, error=error, error_class=error_class):
         return {"error": "model_api_runtime_profile_missing"}, 404
+    result = str(provider_result or "").strip().lower()
+    if result == "success":
+        provider_health.record_success(store.user_id)
+    elif result == "failure":
+        provider_health.record_failure(
+            store.user_id,
+            error_class=error_class or "unknown",
+        )
     try:
         if error:
             ec = error_class or "unknown"

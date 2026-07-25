@@ -690,6 +690,35 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "context_refs": [{"type": "memory", "id": "mem_abc123", "title": "Morning preferences"}],
         },
     },
+    "ModelApiRuntimeErrorRequest": {
+        "type": "object",
+        "properties": {
+            "error": {
+                "type": "string",
+                "maxLength": 300,
+                "description": "Latest runtime error detail, or an empty string to clear it.",
+            },
+            "error_class": {
+                "type": "string",
+                "maxLength": 64,
+                "description": "Stable classified error name.",
+            },
+            "provider_result": {
+                "type": "string",
+                "enum": ["success", "failure"],
+                "description": (
+                    "Optional provider-call outcome. Residents report success "
+                    "for a usable provider reply and failure with error_class."
+                ),
+            },
+        },
+        "additionalProperties": True,
+        "example": {
+            "error": "provider_http_402 insufficient balance",
+            "error_class": "quota_insufficient",
+            "provider_result": "failure",
+        },
+    },
     "HostedChatAcceptedResponse": {
         "type": "object",
         "required": ["status", "reply_ready", "user_message", "runtime"],
@@ -1325,6 +1354,7 @@ PRECISE_JSON_BODIES: dict[Operation, str] = {
     ("post", "/v1/account/recover/verify"): "RecoverVerifyRequest",
     ("post", "/v1/account/reset"): "AccountResetRequest",
     ("post", "/v1/model_api/chat/send"): "HostedChatSendRequest",
+    ("post", "/v1/model_api/runtime_error"): "ModelApiRuntimeErrorRequest",
     ("post", "/v1/chat/message"): "ChatTransportRequest",
     ("post", "/v1/chat/response"): "ChatResponseRequest",
     ("delete", "/v1/chat/history"): "ChatHistoryClearRequest",
@@ -1346,6 +1376,7 @@ OPTIONAL_PRECISE_BODIES: set[Operation] = {
     ("post", "/v1/users/register"),
     ("post", "/v1/access/link-token"),
     ("post", "/v1/memory/index"),
+    ("post", "/v1/model_api/runtime_error"),
 }
 
 
@@ -1408,6 +1439,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope). Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/chat/verify_loop"): "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded.",
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
+    ("post", "/v1/model_api/runtime_error"): "Record or clear the resident runtime's latest provider error. provider_result=success refreshes provider health immediately; provider_result=failure applies error_class to the provider-health policy.",
     ("get", "/v1/chat/history"): "Read encrypted chat history. Use oldest_seq as before_seq for lossless older paging and latest_seq as after_seq for lossless forward paging; timestamp watermarks remain for compatibility.",
     ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",
     ("post", "/v1/memory/fetch"): "Fetch full records for selected memory IDs. Sensitive fetch behavior is not part of the current public contract.",

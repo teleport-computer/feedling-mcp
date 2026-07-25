@@ -206,6 +206,36 @@ def test_admin_data_track_aggregates_counts_without_content(client):
     assert "private evidence" not in dumped
 
 
+def test_admin_data_track_surfaces_provider_health(client):
+    user_id, _ = _register(client)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO provider_health (
+              user_id, provider_state, last_provider_success_at,
+              last_provider_failure_at, last_provider_error_class,
+              last_provider_error_blame, last_probe_at
+            )
+            VALUES (%s, 'needs_user_action', now() - interval '72 hours',
+                    now() - interval '1 hour', 'auth_invalid',
+                    'user_provider', now())
+            """,
+            (user_id,),
+        )
+
+    body = client.get(
+        "/v1/admin/data-track/users",
+        headers=_admin_headers(),
+    ).get_json()
+
+    assert body["summary"]["provider_needs_user_action"] == 1
+    row = body["users"][0]
+    assert row["provider_state"] == "needs_user_action"
+    assert row["last_provider_success_at"]
+    assert row["last_provider_failure_at"]
+    assert row["last_provider_error_class"] == "auth_invalid"
+
+
 def test_admin_data_track_dau_counts_user_activity_by_beijing_day(client):
     user_a, _ = _register(client)
     user_b, _ = _register(client)

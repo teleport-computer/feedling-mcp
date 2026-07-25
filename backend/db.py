@@ -1232,6 +1232,40 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
 
             rows = conn.execute(
                 """
+                SELECT user_id, provider_state,
+                       COALESCE(to_char(
+                         last_provider_success_at AT TIME ZONE 'UTC',
+                         'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+                       ), ''),
+                       COALESCE(to_char(
+                         last_provider_failure_at AT TIME ZONE 'UTC',
+                         'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+                       ), ''),
+                       last_provider_error_class,
+                       last_provider_error_blame
+                FROM provider_health
+                WHERE user_id = ANY(%s)
+                """,
+                (ids,),
+            ).fetchall()
+            for (
+                uid,
+                provider_state,
+                success_at,
+                failure_at,
+                error_class,
+                error_blame,
+            ) in rows:
+                ensure(out, uid)["provider_health"] = {
+                    "provider_state": provider_state or "ok",
+                    "last_provider_success_at": success_at or "",
+                    "last_provider_failure_at": failure_at or "",
+                    "last_provider_error_class": error_class or "",
+                    "last_provider_error_blame": error_blame or "",
+                }
+
+            rows = conn.execute(
+                """
                 SELECT DISTINCT ON (user_id) user_id, doc
                 FROM user_blobs
                 WHERE user_id = ANY(%s) AND kind LIKE 'history_import_job:%%'

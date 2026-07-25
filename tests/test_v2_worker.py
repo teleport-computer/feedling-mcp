@@ -256,6 +256,66 @@ def test_process_job_end_to_end_writes_reply_and_completes(monkeypatch):
     assert "action_digest" in state  # non-sensitive digest only; no capability data leaked here
 
 
+def test_chat_still_calls_provider_and_restores_unhealthy_state(monkeypatch):
+    uid = "u_w_provider_health_chat_probe"
+    conftest.seed_user(uid)
+    _reset(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO provider_health (
+              user_id, provider_state, last_provider_failure_at,
+              last_provider_error_class, last_provider_error_blame, last_probe_at
+            )
+            VALUES (%s, 'needs_user_action', now() - interval '49 hours',
+                    'quota_insufficient', 'user_provider', now())
+            """,
+            (uid,),
+        )
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-provider-health-chat")
+    calls = _script_provider(monkeypatch, [_text_round("RECOVERED")])
+    deps = _deps(
+        messages=[
+            {
+                "id": "m-provider-health",
+                "ts": 10.0,
+                "role": "user",
+                "content": "I fixed the provider",
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda _store, _text: {"id": "r-provider-health"},
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 1
+    assert _job_status(job_id)[0] == "completed"
+    with db.get_pool().connection() as conn:
+        health = conn.execute(
+            """
+            SELECT provider_state, last_provider_success_at IS NOT NULL
+            FROM provider_health
+            WHERE user_id = %s
+            """,
+            (uid,),
+        ).fetchone()
+    assert health == ("ok", True)
+
+
 def test_message_coalesced_during_provider_call_creates_successor(monkeypatch):
     """finish_chat_job's late-input successor creation lives entirely in
     jobs_store (input_generation vs observed_generation), independent of what
@@ -2065,6 +2125,9 @@ def test_compaction_reliable_attempts_refresh_turn_progress(monkeypatch):
     progress = []
     monkeypatch.setattr(worker, "_report_turn_progress", progress.append)
 
+    async def _ignore_health(_user_id):
+        return None
+
     async def _fake_reliable(*args, progress_cb=None, **kwargs):
         assert progress_cb is not None
         progress_cb("attempt_start", 1)
@@ -2075,7 +2138,10 @@ def test_compaction_reliable_attempts_refresh_turn_progress(monkeypatch):
 
     monkeypatch.setattr(
         worker.provider_client, "reliable_chat_completion_async", _fake_reliable)
-    result = asyncio.run(worker._compaction_llm_with_progress("cfg", []))
+    monkeypatch.setattr(worker, "_record_provider_success", _ignore_health)
+    result = asyncio.run(
+        worker._compaction_llm_with_progress("u-health", "cfg", [])
+    )
 
     assert result == {"reply": "- folded"}
     assert progress == [

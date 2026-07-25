@@ -96,6 +96,7 @@ async def model_api_runtime_error(request: Request, auth: AuthResult = Depends(r
         auth.store,
         error=str(payload.get("error") or ""),
         error_class=str(payload.get("error_class") or ""),
+        provider_result=str(payload.get("provider_result") or ""),
     )
     return JSONResponse(body, status_code=status)
 
