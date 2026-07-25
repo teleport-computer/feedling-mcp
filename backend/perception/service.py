@@ -149,6 +149,30 @@ def _decrypt_signal_payload_v2(
         return None, f"decrypt_failed:{type(e).__name__}"
 
 
+def _record_decrypt_failure_v2(user_id: str, key: str, reason: str, ts: float) -> None:
+    """Make a failed sensitive-signal decrypt visible.
+
+    The ingest still answers "accepted" (the report contract is "we took your
+    envelope") and deliberately writes no value — but a silent skip is
+    indistinguishable from "this user has no reading", which is exactly how the
+    2026-07-24 null-perception regression stayed invisible for hours. One
+    warning + one audit event per failed signal, so a fleet-wide enclave hiccup
+    or a caller that forgot to forward the api key (``decrypt_skipped``) shows
+    up in logs and in the perception event stream instead of nowhere.
+    """
+    log.warning("perception v2 decrypt failed for %s key=%s: %s", user_id, key, reason)
+    try:
+        store.append_event(user_id, {
+            "cap": "perception",
+            "type": "decrypt_failed",
+            "key": key,
+            "reason": reason,
+            "ts": ts,
+        }, ts)
+    except Exception as e:  # observability must never break ingest
+        log.warning("perception decrypt-failure audit write failed for %s: %s", user_id, e)
+
+
 def _decrypted_location_anchor_id_v2(plaintext: Any) -> str:
     if not isinstance(plaintext, Mapping):
         return ""
@@ -337,6 +361,8 @@ def ingest_snapshot_v2(
                     })
                     if key == "location_signal" and signal.changed is True:
                         location_anchor_observations.append((key, values))
+                else:
+                    _record_decrypt_failure_v2(user_id, key, err, now)
             else:
                 storage_items.append(item)
             continue

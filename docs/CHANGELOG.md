@@ -47,6 +47,38 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-25
+
+### [FIX] #107 感知 fence 回归的第二处：device event 观察也恒跑 + 解密失败不再静默
+
+- **背景**：PR #107 把 `perception_ingress_runtime_v2_enabled` 从 env baseline
+  改成跟随 chat runtime fence，07-24 10:12Z 上 prod 后所有 resident-chat 用户
+  （≈全 prod）掉进不解密的 legacy 路径。`/report` 已由 hotfix `c9ab3a12`（PR
+  #114）修好，本次修的是**同源但被漏掉的第二处**。
+- **`proactive_core.device_events_append`**：`ingest_device_event_v2` 不再受
+  fence 控制（这处**根本没有 legacy else 分支**，不像 `photo_evaluate` 有对称
+  的 `_maybe_wake`）。它是 `unlock_after_absence` / `screen_phash` 两类唤醒的
+  **唯一**生产者（`perception/differ_v2.py`）。prod 取证：unlock 唤醒从部署前
+  ~13/h 掉到 0/h，且 #114 之后**没有恢复**；`runtime_v2` 感知事件同期
+  118/h → 0 → 修 report 后只回到 ~36/h（缺口就是这条）。
+- **`service.ingest_snapshot_v2`**：信封解密失败（`decrypt_failed:*` /
+  `decrypt_skipped` / `invalid_envelope`）以前**完全静默**——`results[key]` 在
+  解密前就置了 `accepted`，失败只是不写值，无日志无事件。现在补 `log.warning`
+  + 一条 `perception_events` 审计事件（`type=decrypt_failed`）。客户端契约不
+  变（仍返回 `accepted`），也仍然不臆造值。
+- **注释订正（本次事故的心智根因）**：`core/util.runtime_v2_default_on`、
+  `proactive/screen_flag_v2`、`proactive/resident_runtime_v2` 都写着「prod 默认
+  OFF」，但三份主 compose 全都注入 `FEEDLING_RUNTIME_V2_DEFAULT_ON=true`
+  ——prod 一直是 ON。正是这个错误认知让 #107 的改动看起来像 no-op。新增守卫
+  `test_every_main_compose_turns_the_runtime_v2_baseline_on` 把 compose 与函数
+  钉在一起。
+- **测试**：`test_device_event_ingress_runs_even_when_the_chat_fence_says_legacy`、
+  `test_snapshot_v2_records_an_audit_event_when_a_signal_fails_to_decrypt`；旧的
+  `test_device_event_route_only_runs_perception_ingress_when_flag_on`（钉的正是
+  被修掉的错误行为）改写为 `..._surfaces_the_perception_ingress_result`。
+- **状态**：未提交、未部署。上线后应观察 unlock 唤醒回到 ~10-15/h、
+  `runtime_v2` 感知事件回到 100+/h 量级；主动消息量会随之回升到 07-23 水平。
+
 ## 2026-07-22
 
 ### [DONE] Task 11 — 双运行时部署拓扑：serve-worker 并入主 CVM，runner 回 V1-only

@@ -150,8 +150,18 @@ def device_events_append(store, payload: dict) -> dict:
         capture = capture_scheduler.handle_device_event(store, event)
     try:
         from perception import service as perception_service  # lazy; proactive can run without perception tests importing it
-        if perception_service.perception_ingress_runtime_v2_enabled(store):
-            event["perception_v2"] = perception_service.ingest_device_event_v2(store.user_id, event)
+        # HOTFIX 2026-07-25 (sibling of the /report fix in
+        # perception_read_core.report): device-event ingest is UNCONDITIONAL.
+        # PR #107 tied this fork to the chat runtime fence and, unlike the
+        # photo lane in service.photo_evaluate, there was no legacy branch to
+        # fall through to — so every resident-chat user (≈ all of prod) stopped
+        # producing device-event observations from 07-24 10:12Z. That silenced
+        # the ONLY producers of the unlock_after_absence / screen_phash wakes
+        # (perception/differ_v2.py); prod unlock wakes went ~13/h -> 0/h and
+        # did not recover with the /report hotfix. Producing an observation is
+        # data integrity, not a runtime lane: the differ's own switch gate
+        # (proactive.controls_v2) still decides whether a wake is emitted.
+        event["perception_v2"] = perception_service.ingest_device_event_v2(store.user_id, event)
         # Persist the device timezone from the (already-disclosed) app-presence
         # channel so proactive can localize its current_time anchor without the
         # perception-upload opt-in. Read from the RAW payload — the stored event
