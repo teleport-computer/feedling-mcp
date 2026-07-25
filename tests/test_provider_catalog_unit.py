@@ -6,6 +6,7 @@ fake-httpx + pure functions only; NO DB, NO real network. Registered in
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -13,6 +14,37 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import provider_client as pc  # noqa: E402
+
+
+# --------------------------------------------------------------------------- #
+# Task 2 (new): validate_catalog_target — provider allowlist + URL scheme
+# --------------------------------------------------------------------------- #
+
+def test_validate_catalog_target_fills_default_base():
+    provider, base = pc.validate_catalog_target("anthropic", "")
+    assert provider == "anthropic"
+    assert base == "https://api.anthropic.com/v1"
+
+
+def test_validate_catalog_target_unknown_provider_raises():
+    with pytest.raises(pc.ProviderError):
+        pc.validate_catalog_target("totally-not-a-provider", "")
+
+
+def test_validate_catalog_target_requires_base_for_compatible():
+    with pytest.raises(pc.ProviderError):
+        pc.validate_catalog_target("openai_compatible", "")
+
+
+def test_validate_catalog_target_rejects_bad_scheme():
+    with pytest.raises(pc.ProviderError):
+        pc.validate_catalog_target("openai_compatible", "ftp://evil.example.com")
+    # localhost http is allowed; arbitrary http is not.
+    with pytest.raises(pc.ProviderError):
+        pc.validate_catalog_target("openai_compatible", "http://evil.example.com/v1")
+    provider, base = pc.validate_catalog_target(
+        "openai_compatible", "http://127.0.0.1:8080/v1")
+    assert base == "http://127.0.0.1:8080/v1"
 
 
 # --------------------------------------------------------------------------- #
@@ -25,6 +57,14 @@ def test_catalog_request_openai_compatible_bearer():
     assert url == "https://api.example.com/v1/models"
     assert headers["Authorization"] == "Bearer sk-x"
     assert params == {}
+
+
+def test_catalog_request_openrouter_asks_all_modalities():
+    url, headers, params = pc._catalog_request(
+        "openrouter", "sk-or", "", None)
+    assert url.endswith("/models")
+    assert headers["Authorization"] == "Bearer sk-or"
+    assert params.get("output_modalities") == "all"
 
 
 def test_catalog_request_gemini_key_in_header_not_query():
@@ -73,22 +113,73 @@ def test_catalog_request_bedrock_unsupported():
     assert "model_catalog_unsupported" in str(ei.value)
 
 
+# --- strict parser: valid-empty vs invalid vs junk members ------------------ #
+
+def test_parse_catalog_page_present_empty_array_is_legit():
+    models, nxt = pc._parse_catalog_page("openai", {"data": []})
+    assert models == [] and nxt is None
+
+
+def test_parse_catalog_page_missing_array_is_invalid():
+    for bad in ({}, {"error": {"message": "nope"}}, {"data": "not-a-list"}):
+        with pytest.raises(pc.ProviderError) as ei:
+            pc._parse_catalog_page("openai", bad)
+        assert "model_catalog_invalid_response" in str(ei.value)
+
+
+def test_parse_catalog_page_non_dict_root_is_invalid():
+    with pytest.raises(pc.ProviderError):
+        pc._parse_catalog_page("openai", ["not", "a", "dict"])
+
+
+def test_parse_catalog_page_skips_non_object_and_bad_id_members():
+    body = {"data": [
+        "junk-string",
+        {"id": 123},                 # non-str id
+        {"id": ""},                  # empty id
+        {"id": "x" * 200},           # over length cap
+        {"id": "keep", "name": "Keep"},
+    ]}
+    models, nxt = pc._parse_catalog_page("openai", body)
+    assert models == [{"id": "keep", "display_name": "Keep"}]
+    assert nxt is None
+
+
+def test_parse_catalog_page_anthropic_has_more_missing_last_id_invalid():
+    body = {"data": [{"id": "a"}], "has_more": True}  # no last_id
+    with pytest.raises(pc.ProviderError) as ei:
+        pc._parse_catalog_page("anthropic", body)
+    assert "model_catalog_invalid_response" in str(ei.value)
+
+
 # --------------------------------------------------------------------------- #
-# Task 2: list_provider_models network orchestration (fake httpx)
+# Task 2: list_provider_models network orchestration (fake streaming httpx)
 # --------------------------------------------------------------------------- #
 
-class _FakeResp:
-    def __init__(self, status, body, text=None):
+class _FakeStream:
+    def __init__(self, status, raw: bytes):
         self.status_code = status
-        self._body = body
-        self.text = text if text is not None else "{}"
+        self._raw = raw
 
-    def json(self):
-        return self._body
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def iter_bytes(self):
+        # Chunk it so the byte-cap accounting is exercised across iterations.
+        for i in range(0, len(self._raw), 4096):
+            yield self._raw[i:i + 4096]
 
 
-def _install_fake_get(monkeypatch, pages):
-    """pages: list of (status, body) 依次返回。"""
+def _install_fake_stream(monkeypatch, pages):
+    """pages: list of (status, body[, raw_bytes]) returned in order.
+
+    Fakes ``httpx.Client.stream`` (a context manager exposing ``status_code``
+    and ``iter_bytes``). ``_shared_client`` reset so ``_http_client()`` rebuilds
+    the faked client.
+    """
     seq = list(pages)
     calls = []
 
@@ -96,12 +187,12 @@ def _install_fake_get(monkeypatch, pages):
         def __init__(self, *a, **k):
             pass
 
-        def get(self, url, *, headers=None, params=None, timeout=None):
-            calls.append({"url": url, "params": params or {}})
+        def stream(self, method, url, *, headers=None, params=None, timeout=None):
+            calls.append({"url": url, "params": params or {}, "timeout": timeout})
             page = seq.pop(0)
             status, body = page[0], page[1]
-            text = page[2] if len(page) > 2 else None
-            return _FakeResp(status, body, text)
+            raw = page[2] if len(page) > 2 else json.dumps(body).encode()
+            return _FakeStream(status, raw)
 
     monkeypatch.setattr(pc.httpx, "Client", FakeClient)
     monkeypatch.setattr(pc, "_shared_client", None)
@@ -109,14 +200,23 @@ def _install_fake_get(monkeypatch, pages):
 
 
 def test_list_models_openrouter_single_page(monkeypatch):
-    _install_fake_get(monkeypatch, [(200, {"data": [{"id": "a"}, {"id": "b"}]})])
+    calls = _install_fake_stream(monkeypatch, [(200, {"data": [{"id": "a"}, {"id": "b"}]})])
     res = pc.list_provider_models("openrouter", "k", "")
     assert res["catalog_supported"] is True and res["complete"] is True
     assert [m["id"] for m in res["models"]] == ["a", "b"]
+    assert calls[0]["params"].get("output_modalities") == "all"
+
+
+def test_list_models_per_page_timeout_is_remaining_budget(monkeypatch):
+    calls = _install_fake_stream(monkeypatch, [(200, {"data": [{"id": "a"}]})])
+    pc.list_provider_models("openai", "k", "")
+    # First page's socket timeout is the (near-full) remaining wall-clock budget,
+    # not a hardcoded per-page constant.
+    assert 0 < calls[0]["timeout"] <= pc._CATALOG_TOTAL_BUDGET
 
 
 def test_list_models_anthropic_paginates_and_dedupes(monkeypatch):
-    calls = _install_fake_get(monkeypatch, [
+    calls = _install_fake_stream(monkeypatch, [
         (200, {"data": [{"id": "x"}], "has_more": True, "last_id": "x"}),
         (200, {"data": [{"id": "x"}, {"id": "y"}], "has_more": False}),
     ])
@@ -136,17 +236,69 @@ def test_list_models_page_cap_marks_incomplete(monkeypatch):
     monkeypatch.setattr(pc, "_CATALOG_MAX_PAGES", 3)
     pages = [(200, {"data": [{"id": f"m{i}"}], "has_more": True, "last_id": f"m{i}"})
              for i in range(10)]
-    _install_fake_get(monkeypatch, pages)
+    _install_fake_stream(monkeypatch, pages)
     res = pc.list_provider_models("anthropic", "k", "")
     assert res["complete"] is False
-    assert any("truncated" in w or "不完整" in w for w in res["warnings"])
+    assert any("truncated" in w for w in res["warnings"])
 
 
-def test_list_models_upstream_401_raises(monkeypatch):
-    _install_fake_get(monkeypatch, [(401, {"error": "bad key"}, "unauthorized")])
+def test_list_models_repeated_cursor_stops(monkeypatch):
+    # Same last_id every page → without cursor-dedup this loops; must stop early.
+    pages = [(200, {"data": [{"id": f"m{i}"}], "has_more": True, "last_id": "SAME"})
+             for i in range(5)]
+    calls = _install_fake_stream(monkeypatch, pages)
+    res = pc.list_provider_models("anthropic", "k", "")
+    assert res["complete"] is False
+    assert any("repeated pagination cursor" in w for w in res["warnings"])
+    # page0 (no cursor) + page1 (cursor SAME) then repeat detected → 2 fetches.
+    assert len(calls) == 2
+
+
+def test_list_models_later_page_failure_is_partial(monkeypatch):
+    _install_fake_stream(monkeypatch, [
+        (200, {"data": [{"id": "a"}], "has_more": True, "last_id": "a"}),
+        (503, {"error": "upstream"}),
+    ])
+    res = pc.list_provider_models("anthropic", "k", "")
+    assert [m["id"] for m in res["models"]] == ["a"]   # already-collected kept
+    assert res["complete"] is False
+    assert res["catalog_supported"] is True
+
+
+def test_list_models_first_page_failure_raises(monkeypatch):
+    _install_fake_stream(monkeypatch, [(401, {"error": "bad key"})])
     with pytest.raises(pc.ProviderError) as ei:
         pc.list_provider_models("openai", "k", "")
     assert ei.value.status_code == 401
+
+
+def test_list_models_compatible_404_is_unsupported_not_error(monkeypatch):
+    _install_fake_stream(monkeypatch, [(404, {"error": "no such route"})])
+    res = pc.list_provider_models("openai_compatible", "k", "https://x.example.com/v1")
+    assert res["catalog_supported"] is False and res["models"] == []
+
+
+def test_list_models_body_size_cap_first_page_raises(monkeypatch):
+    huge = b'{"data":[' + b'{"id":"x"},' * 500000 + b'{"id":"y"}]}'
+    assert len(huge) > pc._CATALOG_MAX_BODY_BYTES
+    _install_fake_stream(monkeypatch, [(200, None, huge)])
+    with pytest.raises(pc.ProviderError) as ei:
+        pc.list_provider_models("openai", "k", "")
+    assert "model_catalog_invalid_response" in str(ei.value)
+
+
+def test_list_models_non_json_first_page_raises(monkeypatch):
+    _install_fake_stream(monkeypatch, [(200, None, b"<html>not json</html>")])
+    with pytest.raises(pc.ProviderError) as ei:
+        pc.list_provider_models("openai", "k", "")
+    assert "model_catalog_invalid_response" in str(ei.value)
+
+
+def test_list_models_present_empty_array_is_success(monkeypatch):
+    _install_fake_stream(monkeypatch, [(200, {"data": []})])
+    res = pc.list_provider_models("openai", "k", "")
+    assert res["models"] == [] and res["complete"] is True
+    assert res["catalog_supported"] is True
 
 
 # --------------------------------------------------------------------------- #
@@ -158,8 +310,18 @@ def test_error_slug_mapping():
         return pc.ProviderError(msg, status_code=sc)
     assert pc.model_catalog_error_slug(mk("provider_http_401", 401)) == "model_catalog_auth_failed"
     assert pc.model_catalog_error_slug(mk("provider_http_403", 403)) == "model_catalog_access_denied"
+    assert pc.model_catalog_error_slug(mk("provider_http_402", 402)) == "model_catalog_access_denied"
+    assert pc.model_catalog_error_slug(mk("provider_http_451", 451)) == "model_catalog_access_denied"
     assert pc.model_catalog_error_slug(mk("provider_http_429", 429)) == "model_catalog_rate_limited"
     assert pc.model_catalog_error_slug(mk("x", 503)) == "model_catalog_temporarily_unavailable"
+    assert pc.model_catalog_error_slug(mk("x", 500)) == "model_catalog_temporarily_unavailable"
+    assert pc.model_catalog_error_slug(mk("x", 501)) == "model_catalog_temporarily_unavailable"
+    assert pc.model_catalog_error_slug(mk("x", 408)) == "model_catalog_temporarily_unavailable"
+    assert pc.model_catalog_error_slug(mk("x", 425)) == "model_catalog_temporarily_unavailable"
     assert pc.model_catalog_error_slug(mk("provider network error: ReadTimeout")) == "model_catalog_temporarily_unavailable"
+    # remaining 4xx must NOT masquerade as auth failure
+    assert pc.model_catalog_error_slug(mk("provider_http_400", 400)) == "model_catalog_invalid_response"
+    assert pc.model_catalog_error_slug(mk("provider_http_404", 404)) == "model_catalog_invalid_response"
+    assert pc.model_catalog_error_slug(mk("provider_http_422", 422)) == "model_catalog_invalid_response"
     assert pc.model_catalog_error_slug(mk("model_catalog_unsupported")) == "model_catalog_unsupported"
     assert pc.model_catalog_error_slug(mk("model_catalog_invalid_response")) == "model_catalog_invalid_response"
