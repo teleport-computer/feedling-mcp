@@ -3409,6 +3409,68 @@ def _parse_catalog_page(provider: str, body: dict) -> tuple[list[dict], str | No
     return out, nxt
 
 
+def list_provider_models(provider: str, api_key: str, base_url: str = "") -> dict:
+    provider = normalize_provider(provider)
+    warnings: list[str] = []
+    try:
+        first_url, _, _ = _catalog_request(provider, api_key, base_url, None)
+    except ProviderError as e:
+        if "model_catalog_unsupported" in str(e):
+            return {"models": [], "complete": True, "warnings": [], "catalog_supported": False}
+        raise
+
+    seen: set[str] = set()
+    models: list[dict] = []
+    cursor: str | None = None
+    complete = True
+    client = _http_client()
+    for _page in range(_CATALOG_MAX_PAGES):
+        url, headers, params = _catalog_request(provider, api_key, base_url, cursor)
+        try:
+            resp = client.get(url, headers=headers, params=params,
+                              timeout=_CATALOG_PER_REQUEST_TIMEOUT)
+        except httpx.HTTPError as e:
+            if models:                       # 后续页失败 → 部分成功
+                complete = False
+                warnings.append(f"catalog page fetch failed: {type(e).__name__}")
+                break
+            raise ProviderError(f"provider network error: {type(e).__name__}") from e
+        if resp.status_code >= 400:
+            if models:
+                complete = False
+                warnings.append(f"catalog page returned http {resp.status_code}")
+                break
+            raise ProviderError(f"provider_http_{resp.status_code}", status_code=resp.status_code)
+        if len(resp.text or "") > _CATALOG_MAX_BODY_BYTES:
+            raise ProviderError("model_catalog_invalid_response")
+        try:
+            body = resp.json()
+        except Exception as e:
+            raise ProviderError("model_catalog_invalid_response") from e
+        if not isinstance(body, dict):
+            raise ProviderError("model_catalog_invalid_response")
+        page_models, cursor = _parse_catalog_page(provider, body)
+        for m in page_models:
+            mid = m["id"]
+            if len(mid) > 160 or mid in seen:
+                continue
+            seen.add(mid)
+            models.append(m)
+            if len(models) >= _CATALOG_MAX_MODELS:
+                complete = False
+                warnings.append("model list truncated at cap")
+                break
+        if len(models) >= _CATALOG_MAX_MODELS or not cursor:
+            break
+    else:
+        # for 循环正常跑满 = 还有 cursor 没取完
+        if cursor:
+            complete = False
+            warnings.append("model list truncated: page cap reached")
+    return {"models": models, "complete": complete, "warnings": warnings,
+            "catalog_supported": True}
+
+
 def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
     # Validates that the key is usable for this model. We deliberately do NOT
     # require reply text: thinking/reasoning models (gemini-2.5-*, deepseek-
