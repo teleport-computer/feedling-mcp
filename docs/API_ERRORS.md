@@ -75,7 +75,7 @@
 | `cannot_encrypt_provider_key` | 409 | — | 缺 content public key 或 enclave attestation 不可达 | |
 | `route_not_found` | 404 | user_provider | 指定的 route id 不属于该用户或已删除 | |
 | `credential_not_found` | 404 | user_provider | 指定的 credential id 不属于该用户或已删除 | |
-| `api_key_or_credential_id_required` | 400 | user_provider | POST /routes 必须且只能给 api_key 与 credential_id 之一 | |
+| `api_key_or_credential_id_required` | 400 | user_provider | `POST /routes` 与 `POST /v1/model_api/models` 必须且只能给 api_key 与 credential_id 之一（present 且非空；给了 null/空串/两者都给都算违约） | |
 | `nothing_to_update` | 400 | — | PATCH /credentials 两者（label/api_key）都不给 | |
 | `invalid_reasoning_effort` | 400 | — | reasoning effort 取值非法（setup/patch 两处校验） | |
 | `model_api_config_delete_failed` | 500 | system | 删除 model_api 配置时 DB 写失败 | |
