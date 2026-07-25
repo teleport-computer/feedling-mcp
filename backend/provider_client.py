@@ -3471,6 +3471,24 @@ def list_provider_models(provider: str, api_key: str, base_url: str = "") -> dic
             "catalog_supported": True}
 
 
+def model_catalog_error_slug(exc: BaseException) -> str:
+    msg = str(exc)
+    if "model_catalog_unsupported" in msg:
+        return "model_catalog_unsupported"
+    if "model_catalog_invalid_response" in msg:
+        return "model_catalog_invalid_response"
+    sc = getattr(exc, "status_code", None)
+    if sc == 401:
+        return "model_catalog_auth_failed"
+    if sc == 403:
+        return "model_catalog_access_denied"
+    if sc == 429:
+        return "model_catalog_rate_limited"
+    if sc in {408, 500, 502, 503, 504} or sc is None:
+        return "model_catalog_temporarily_unavailable"
+    return "model_catalog_auth_failed"
+
+
 def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
     # Validates that the key is usable for this model. We deliberately do NOT
     # require reply text: thinking/reasoning models (gemini-2.5-*, deepseek-

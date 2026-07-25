@@ -147,3 +147,19 @@ def test_list_models_upstream_401_raises(monkeypatch):
     with pytest.raises(pc.ProviderError) as ei:
         pc.list_provider_models("openai", "k", "")
     assert ei.value.status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# Task 3: ProviderError -> slug classification
+# --------------------------------------------------------------------------- #
+
+def test_error_slug_mapping():
+    def mk(msg, sc=None):
+        return pc.ProviderError(msg, status_code=sc)
+    assert pc.model_catalog_error_slug(mk("provider_http_401", 401)) == "model_catalog_auth_failed"
+    assert pc.model_catalog_error_slug(mk("provider_http_403", 403)) == "model_catalog_access_denied"
+    assert pc.model_catalog_error_slug(mk("provider_http_429", 429)) == "model_catalog_rate_limited"
+    assert pc.model_catalog_error_slug(mk("x", 503)) == "model_catalog_temporarily_unavailable"
+    assert pc.model_catalog_error_slug(mk("provider network error: ReadTimeout")) == "model_catalog_temporarily_unavailable"
+    assert pc.model_catalog_error_slug(mk("model_catalog_unsupported")) == "model_catalog_unsupported"
+    assert pc.model_catalog_error_slug(mk("model_catalog_invalid_response")) == "model_catalog_invalid_response"
