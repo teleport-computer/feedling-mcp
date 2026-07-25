@@ -103,8 +103,8 @@ def test_load_users_normalization_cas_preserves_concurrent_registration(
     registry.db.upsert_user(legacy)
     real_load = registry.db.load_all_users
 
-    def stale_load_then_register():
-        snapshot = real_load()
+    def stale_load_then_register(*args, **kwargs):
+        snapshot = real_load(*args, **kwargs)
         registry.db.upsert_user(concurrent)
         return snapshot
 
@@ -139,8 +139,8 @@ def test_load_users_normalization_cas_does_not_overwrite_same_user_edit(
     registry.db.upsert_user(legacy)
     real_load = registry.db.load_all_users
 
-    def stale_load_then_edit_same_user():
-        snapshot = real_load()
+    def stale_load_then_edit_same_user(*args, **kwargs):
+        snapshot = real_load(*args, **kwargs)
         registry.db.upsert_user(concurrent)
         return snapshot
 

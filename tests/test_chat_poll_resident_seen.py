@@ -155,18 +155,21 @@ def test_plain_chat_poll_does_not_claim_resident_liveness(client, monkeypatch):
         assert _binding(registry._find_user_entry_locked(user_id), "resident") is None
 
 
-def test_failed_resident_seen_persist_rolls_back_for_next_poll(client, monkeypatch):
+def test_failed_resident_seen_persist_leaves_no_half_written_binding(client, monkeypatch):
+    """The heartbeat now persists via a CAS on a fresh DB row, not an in-memory
+    edit + rollback. A failed CAS must persist nothing and leave no resident
+    binding half-applied in memory; the next poll retries and succeeds."""
     user_id, api_key = _register(client)
-    real_upsert = db.upsert_user
+    real_cas = db.compare_and_set_user
     attempts = {"count": 0}
 
-    def flaky_upsert(entry):
+    def flaky_cas(uid, expected, new):
         attempts["count"] += 1
         if attempts["count"] == 1:
-            raise RuntimeError("transient user-row write failure")
-        return real_upsert(entry)
+            return False, False, None  # read_ok=False → the persist failed
+        return real_cas(uid, expected, new)
 
-    monkeypatch.setattr(db, "upsert_user", flaky_upsert)
+    monkeypatch.setattr(db, "compare_and_set_user", flaky_cas)
     first = client.get("/v1/chat/poll?timeout=0", headers=_poll_headers(api_key))
     assert first.status_code == 200
     with registry._users_lock:
@@ -174,5 +177,5 @@ def test_failed_resident_seen_persist_rolls_back_for_next_poll(client, monkeypat
 
     second = client.get("/v1/chat/poll?timeout=0", headers=_poll_headers(api_key))
     assert second.status_code == 200
-    assert attempts["count"] == 2
+    assert attempts["count"] >= 2
     assert _binding(_persisted_user(user_id), "resident")["last_seen_at"]
