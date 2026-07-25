@@ -95,6 +95,12 @@ iOS 对 unsupported 显示「该服务商不提供」，failed 显示「查询�
 - key 只在内存过一遍：不进日志、不进返回体、不进错误信息（含第三方错误体转发时截断脱敏）。
 - hosted 多租户下中转站目标为公网地址（复用 net_safety 的公网校验思路）；
   self-host 私网 relay 由部署者显式放行，不与 hosted 默认混用。
+- **已知接受风险（首版）：DNS-rebinding TOCTOU。** `net_safety.blocked_url_kind`
+  在校验时解析一次 DNS，httpx 连接时再解析一次；理论上用户自填的中转站域名可在
+  两次之间从公网 IP 翻成 loopback/内网，携 key 打到内网服务。这是全仓 net_safety
+  既有姿势（web fetch 也是这样），非本功能新引入；首版按既有姿势处理，不单独为它
+  做 IP pin。要收紧的话照 `capabilities/web.py` 的 `_pinned_url`（把校验通过的 IP
+  钉进 httpx transport + 保留 Host/SNI）——列为后续可选加固，不阻塞首版。
 
 ## 明确不做（首版）
 
