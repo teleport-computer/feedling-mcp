@@ -205,10 +205,11 @@ hash，全量重建与单行重排共用 `_index_user_keys_locked()` 以免两�
    以防再漏；加回归测试 `test_turn_child_main_starts_the_periodic_full_reload`。
 2. **TEE 影子库不再收敛（PLAUSIBLE）**。心跳从 `upsert_user`（无条件 mirror）改
    `compare_and_set_user`（mirror 是条件 CAS UPDATE `WHERE doc=expected`）后，若影子库
-   该行已 drift，mirror 匹配 0 行静默 no-op，影子行 stale 到 24h reconcile。修：
-   `compare_and_set_user` 的 mirror 改成**无条件 upsert**（`INSERT … ON CONFLICT DO
-   UPDATE`，与 `upsert_user` 的 mirror 同款），主库 CAS 成功后无条件把影子行收敛到
-   新值。`normalize_user_cas` 路径一并受益。
+   该行已 drift，mirror 匹配 0 行静默 no-op，影子行 stale 到 24h reconcile。
+   ⚠️ **本条第一版的修复方向是错的，已被第五轮推翻并回退**——当时把 mirror 改成无
+   条件 upsert，结果制造了一个更严重的问题（删除竞态复活已删用户的影子行，见下方第五轮
+   ①）。最终结论：mirror 保持**条件 CAS**，drift 的收敛让位给 24h reconcile（影子库
+   本来的兜底设计）。
 3. **reindex 删除步扫全 `_key_to_user`（CONFIRMED，性能）**。删除步 `[h for h,uid in
    _key_to_user.items() if uid==user_id …]` 是 O(全舰队 key 数)，抵消了定向重载"每次
    只做一个用户的活"的初衷。`_install_user_row_locked` 本就持有被替换的旧行，改成从旧行
@@ -222,6 +223,31 @@ hash，全量重建与单行重排共用 `_index_user_keys_locked()` 以免两�
    reset notify 的 worker，其 `_key_to_user` 里的已删 key 现在最长 60s（原风暴 ~1.5s）
    才被周期自愈纠正。被周期自愈 + wake-bus 重连 catch-up 双重 bounded；是收窄换来的
    已知代价，非缺陷。
+
+### 第五轮 review 的修复
+
+1. **无条件影子 mirror 复活已删行（CONFIRMED，数据保留）——回退第四轮 ②**。第四轮把
+   `compare_and_set_user` 的 mirror 改成无条件 upsert 后：worker A 心跳 CAS 更新 X 主库
+   行并 commit（applied），在跑独立的影子 mirror 之前，X 的账号删除跑了（`delete_user`
+   删主库 X + 删影子 X），A 随后的无条件 `INSERT … ON CONFLICT` 把 X 的加密行**复活**
+   进影子库，主库已无——已删账号加密元数据滞留到 24h prune。心跳每分钟每在线常驻驱动
+   这条路径，窗口被显著放大。修：mirror 回退为**条件 CAS**（`WHERE doc=expected`），
+   影子行被删时 UPDATE 0 行、绝不复活；drift 交给 reconcile。这条更正了第四轮 ② 的错误
+   方向：无条件 upsert（收敛 drift）换来的复活已删数据，比它想修的「drift 靠 reconcile」
+   严重得多。
+2. **空断言测试（CONFIRMED）**。`test_cas_loss_retry_does_not_mutate_the_installed_row`
+   的 docstring 声称验证 deepcopy 隔离，实际只 `assert installed_seen`（loss 分支跑了）。
+   补真断言：在第二次 CAS 时读 `_users` 里已装行的 `last_seen_at`，必须仍是 loss 分支装
+   的旧值——若丢了 deepcopy、retry 编辑改到已装对象，这个值会变，测试会红。
+
+**保留不改（第五轮 [2] / [4]，已知权衡）**：
+- `reload_user` 在 `_users_lock` 内做 `db.load_user`（+ 未归一化行才 CAS）。锁内读是第一轮
+  修复的原子性要求（读与安装必须原子，否则并发编辑丢失）；稳态每个 targeted notify 只
+  一次单行读，CAS 仅在遇到未归一化行（稀疏、且周期全量归一化后收敛）。pool 极慢时
+  listener 线程会 stall，属原子性的固有代价。
+- `_normalize_all_users_cas` 稳态下先 deepcopy 全表再发现无变化。安全消除它要把
+  `_normalize_user_entry` 从原地改重构成纯函数（它被 lazy-normalize 等多处调用），在收尾
+  阶段风险大于收益（667 行 deepcopy 几 ms、60s 一次，是 CPU 浪费非瓶颈）。记为后续优化。
 
 **保留不改（第三轮 [1]，已知权衡）**：`_reindex_user_keys_locked` 对"已被别人拥有
 的 hash"跳过不抢，代价是孤儿/合并残留的共享 hash 最长滞留一个自愈周期（~60s）才被

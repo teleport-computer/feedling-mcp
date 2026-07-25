@@ -49,6 +49,75 @@
 
 ## 2026-07-25
 
+### [DONE] prod `users` 全表重载风暴 —— 常驻心跳改走定向广播
+
+- 症状：prod 每分钟 30–74 次全表 `users` 重载（667 行 × ~7 个订阅进程）。
+- 真因：`/v1/chat/poll` 的常驻存活心跳每 60s 给每个在线常驻用户重写一次
+  `access_bindings[resident].last_seen_at`，走的 `registry.persist_user()`
+  发的是**不带 user_id** 的 `users` 广播，订阅方一律 `load_users()` 全表重载。
+  单行写被放大成 N × 进程数 × 667 行读，随在线常驻用户数线性增长。
+- ⚠️ 更正：07-24 的交接文档诊断为"access_bindings 纯序列化顺序抖动被误判为真
+  改动"，并建议给 `persist_user` 加 canonical noop 短路。**该诊断已被 prod 复测
+  推翻** —— 27/27 变化行都是真实时间戳标量变化，pure-ordering 行数为 0，noop
+  短路修不了这个风暴。取证与更正见
+  `docs/incidents/2026-07-25-users-reload-storm-resident-heartbeat.md`。
+- 改动：新增 `db.load_user()`（单行读，DB 错误上抛）、
+  `registry.reload_user()`（原地刷新一行 + 重建 key cache，读失败保留现有行，
+  绝不把瞬时错误当成"行已删除"去踢掉活用户）、
+  `registry.reload_users_after_notify()`（带 user_id 走单行、不带走全表），
+  `persist_user(..., targeted_broadcast=True)` 仅供心跳使用；
+  `asgi/lifespan.py` 与 V2 `serve_worker.py` 的 `users` handler 都接上。
+- 其余 `persist_user` 调用点（注册/发钥/公钥/偏好/access flip）语义不变，仍是
+  全表广播 —— 它们稀疏，不构成风暴。
+- code review 后补回收窄丢掉的三个性质（都是 `load_users` 原本顺带提供的）：
+  ①`reload_user` 的库读挪回 `_users_lock` **内**（原先锁外读、锁内装，监听线程会
+  用旧快照回滚同进程的并发编辑，再被下一次整文档 upsert 写回库，永久丢刚签发的
+  key）；②新增 `_normalize_row_cas_locked()` 做单行 normalize+CAS（admin
+  data_track 原样快照 `_users`，依赖重载时归一化）；③新增
+  `start_periodic_full_reload()`（每进程 daemon 线程，默认 300s，
+  `FEEDLING_REGISTRY_FULL_RELOAD_SEC`）——原先那 38.7 次/分的无差别广播事实上
+  兼任了每 ~1.5s 一次的全量自愈通道，收窄后必须显式补回；配套
+  `load_users(guard_empty=True)` 防止 `db.load_all_users` 吞错返回 `[]` 时清空
+  registry 导致全站 401。
+- 另修：单行重载改用 `_reindex_user_keys_locked()` 只动该用户的 key hash（原先仍
+  调全量 `_rebuild_key_cache()` 清空重建，`_resolve_user` 无锁读会在窗口内 miss 并
+  跌进 deepcopy 慢路径，等于换个触发点保留了同一个锁 convoy）；并改掉一处与行为
+  不符的注释（心跳并非"只碰 resident binding"，`persist_user` 一如既往 upsert 整
+  文档，targeted 指的是广播范围）。
+- 第二轮 review 修复收窄的副作用（10 条抓出，逐条处理）：①**心跳改 CAS**——原先
+  整文档 upsert 陈旧快照会覆盖别 worker 刚签发的 API key（自愈间隔拉长后放大成
+  永久丢 key，CONFIRMED），改成对新鲜 DB 行做 `compare_and_set_user`，只改
+  resident binding 时间戳、DB I/O 出锁；②`load_users` 用
+  `db.load_all_users(raise_on_error=True)` 区分读失败（保留快照）vs 真空表（清空），
+  替掉只加在周期路径且会阻止合法清空的 `guard_empty`；③`_env_float` 守卫防坏值
+  import 期崩全站；④daemon 线程移出被测试调用的 `wire_assembly`（backend gate 在
+  `start_background`，V2 移到 `main`）；⑤自愈间隔 300s→60s；⑥reindex 先加后删消除
+  无锁读窗口；⑦定向 reindex 不抢别用户的共享 hash（防串号）；⑧去掉对非 dict 抛错
+  的 sort；⑨测试改 patch registry 本地线程工厂而非 stdlib threading。
+- 第三轮 review 修复：①周期自愈的 gate 移除——第二轮 gate 在 `start_background`
+  （默认 False）会让未设该 flag 的 web worker 有 `users` handler、serve auth 却无
+  自愈通道（丢 notify → 已删/吊销账号持续鉴权），改成与 handler 配对无条件启动；
+  ②删掉 `persist_user` 的死参数 `targeted_broadcast`（心跳改 CAS 后无 caller，且是
+  footgun）；③修两处文档不一致（测试数、自愈段过时的 300s/guard_empty）。
+- 第四轮 review 修复：①**`turn_child.main` 补起周期自愈**——第三轮漏了这个长命
+  spawn 子进程（经 wire_assembly 装配但走自己入口），丢 notify 后它用陈旧公钥封装
+  托管回复 → decrypt-failed（CONFIRMED，用户可见）；②`compare_and_set_user` 的 TEE
+  影子库 mirror 改无条件 upsert，收敛 drift 的影子行（原条件 CAS UPDATE 在影子 drift
+  时静默 no-op）；③`_reindex` 删除步从 O(全舰队 key) 改成 O(该用户 key)（用旧行 diff）；
+  ④CAS-loss 重试复用赢家行、省一次 load_user。
+- 验证：`tests/test_users_reload_targeted.py`（7 条）+
+  `tests/test_users_reload_review_fixes.py`（21 条）；全量 pytest 6269 passed，
+  3 条既有失败与干净 HEAD 基线逐条一致。**未部署**。
+- 第五轮 review 修复：**回退第四轮把 TEE 影子库 mirror 改无条件 upsert 的改动**——
+  它会在删除竞态下复活已删用户的加密影子行（心跳 CAS 更新主库 commit 后、跑独立影子
+  mirror 前若账号删除插入，无条件 upsert 把已删行复活进影子库，滞留到 24h prune）；
+  mirror 回退为条件 CAS（`WHERE doc=expected`，影子行被删则 UPDATE 0 行、不复活），
+  drift 交给 reconcile。更正第四轮方向错误：复活已删数据比 drift 不收敛严重得多。
+  另修一处空断言测试（补 deepcopy 隔离的真断言）。
+- 未做（已记录在 incident 文档「遗留」）：`last_seen_at` 仍存在账号文档里，本次
+  只把扇出缩小 667 倍、没消除，成本仍按（在线常驻数 × 进程数）增长；
+  `reload_user` 锁内单行读、`_normalize_all_users_cas` 稳态全表 deepcopy 为已知权衡。
+
 ### [FIX] #107 感知 fence 回归的第二处：device event 观察也恒跑 + 解密失败不再静默
 
 - **背景**：PR #107 把 `perception_ingress_runtime_v2_enabled` 从 env baseline

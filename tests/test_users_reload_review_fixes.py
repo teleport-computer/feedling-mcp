@@ -374,40 +374,47 @@ def test_cas_loss_retry_reuses_the_winner_row_without_a_second_read(clean, monke
 
 
 def test_cas_loss_retry_does_not_mutate_the_installed_row(clean, monkeypatch):
-    """The retry's next binding edit must not mutate the row already installed in
-    _users (which _resolve_user reads unlocked)."""
+    """The retry's binding edit must operate on a COPY, not the row already
+    installed in _users (which _resolve_user reads unlocked). Dropping the
+    deepcopy would let the retry's edit mutate the installed object in place; we
+    catch that by reading the installed row's last_seen_at at the moment of the
+    SECOND CAS (retry has edited its working copy but not installed it yet)."""
     user_id, _api_key = _register()
+    stale = "2020-01-01T00:00:00"
     with registry._users_lock:
         entry = registry._find_user_entry_locked(user_id)
         binding = registry._upsert_access_binding_locked(entry, "resident")
-        binding["last_seen_at"] = "2020-01-01T00:00:00"
-        binding["updated_at"] = "2020-01-01T00:00:00"
+        binding["last_seen_at"] = stale
+        binding["updated_at"] = stale
         registry.persist_user(entry)
 
     real_cas = db.compare_and_set_user
     calls = {"n": 0}
-    installed_seen: list[str] = []
+    installed_at_second_cas: list[str] = []
 
     def flaky_cas(uid, expected, new):
         calls["n"] += 1
         if calls["n"] == 1:
+            # Lose: install `expected` (last_seen still `stale`) into _users.
             _ok, _applied, current = real_cas(uid, expected, expected)
-            # Capture what the losing branch will install into _users.
-            installed_seen.append(
-                next(b["last_seen_at"] for b in current["access_bindings"]
-                     if b.get("access_mode") == "resident")
-            )
             return True, False, current
+        # Second CAS: the retry has already edited its working copy to now_iso.
+        # If that copy is the SAME object installed by the loss branch, the
+        # installed row's last_seen would read as the new value, not `stale`.
+        with registry._users_lock:
+            inst = registry._find_user_entry_locked(uid)
+            resident = next(
+                b for b in inst["access_bindings"] if b.get("access_mode") == "resident"
+            )
+            installed_at_second_cas.append(resident["last_seen_at"])
         return real_cas(uid, expected, new)
 
     monkeypatch.setattr(db, "compare_and_set_user", flaky_cas)
     assert registry._touch_resident_binding_seen(user_id, min_interval_sec=60) is True
-    # The row installed by the losing branch must be untouched by the retry edit:
-    with registry._users_lock:
-        entry = registry._find_user_entry_locked(user_id)
-    # (no assertion on staleness — the point is it did not raise / corrupt; the
-    # installed value captured pre-retry is what got installed)
-    assert installed_seen  # sanity: the loss branch ran
+    assert calls["n"] == 2
+    assert installed_at_second_cas == [stale], (
+        "retry mutated the row installed in _users — deepcopy isolation is broken"
+    )
 
 
 # --- 7. key reindex is proportional to one user, not the fleet -------------
@@ -450,12 +457,14 @@ def test_targeted_reload_does_not_strand_a_replaced_hash(clean):
     assert registry._key_to_user.get("brand_new_hash_" + "0" * 20) == user_id
 
 
-# --- 8. TEE shadow re-converges on the heartbeat CAS -----------------------
+# --- 8. TEE shadow mirror is gated (cannot resurrect a deleted row) ---------
 
 
-def test_heartbeat_cas_mirrors_unconditionally_to_the_shadow(clean, monkeypatch):
-    """The heartbeat CAS must mirror an UNCONDITIONAL upsert (re-converging a
-    drifted shadow row), not the conditional CAS UPDATE."""
+def test_heartbeat_cas_shadow_mirror_is_gated_not_unconditional(clean, monkeypatch):
+    """The heartbeat CAS must mirror the GATED CAS UPDATE (WHERE doc=expected),
+    NOT an unconditional upsert. An unconditional upsert resurrects a shadow row
+    whose primary was concurrently deleted (delete races the ~1/min heartbeat) —
+    a data-retention gap. The gated form no-ops on a missing shadow row."""
     from tee_shadow import mirror
 
     user_id, _api_key = _register()
@@ -473,12 +482,12 @@ def test_heartbeat_cas_mirrors_unconditionally_to_the_shadow(clean, monkeypatch)
     assert registry._touch_resident_binding_seen(user_id, min_interval_sec=60) is True
 
     assert mirrored, "heartbeat CAS did not mirror to the shadow"
-    assert any("ON CONFLICT" in sql for sql in mirrored), (
-        "shadow mirror must be an unconditional upsert, not the CAS UPDATE — "
-        "otherwise a drifted shadow row silently no-ops"
+    assert all("ON CONFLICT" not in sql for sql in mirrored), (
+        "shadow mirror must NOT be an unconditional upsert — it would resurrect "
+        "a deleted user's shadow row when a delete races the heartbeat"
     )
-    assert not any("WHERE user_id=%s AND doc=" in sql for sql in mirrored), (
-        "shadow mirror must not carry the CAS WHERE doc=expected clause"
+    assert all("WHERE user_id=%s AND doc=%s" in sql for sql in mirrored), (
+        "shadow mirror must be the gated CAS UPDATE (WHERE doc=expected)"
     )
 
 

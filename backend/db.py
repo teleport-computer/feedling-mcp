@@ -572,18 +572,19 @@ def compare_and_set_user(
         log.error("[db] compare_and_set_user(%s) failed: %s", user_id, exc)
         return False, False, None
     if applied:
-        # Mirror to the TEE shadow with an UNCONDITIONAL upsert, not the CAS
-        # UPDATE above. The shadow only follows primary; a shadow row that has
-        # already drifted (e.g. a prior partial dual-write) would make the CAS's
-        # `WHERE doc=expected` match zero rows and silently no-op, leaving the
-        # shadow stale until the 24h reconcile. `upsert_user`'s mirror already
-        # uses this INSERT ... ON CONFLICT form, so this re-converges the row.
+        # Mirror the SAME gated CAS to the shadow — deliberately NOT an
+        # unconditional upsert. An unconditional upsert re-creates a shadow row
+        # whose primary was concurrently deleted: db.delete_user removes the row
+        # from primary then shadow, and if it lands between this CAS commit and
+        # this mirror, the upsert resurrects the deleted user's encrypted row in
+        # the shadow until the 24h prune — a data-retention gap. The gated
+        # `WHERE user_id=%s AND doc=%s` form no-ops on a missing shadow row, so
+        # it can never resurrect. A shadow row that has drifted is left for the
+        # reconcile job (the shadow's own convergence backstop), not force-healed
+        # here — the heartbeat drives this path ~once/min per online resident, so
+        # the safe choice is the one that cannot resurrect deleted data.
         from tee_shadow import mirror
-        upsert_sql = (
-            "INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s) "
-            "ON CONFLICT (user_id) DO UPDATE SET created_at = EXCLUDED.created_at, doc = EXCLUDED.doc"
-        )
-        mirror.execute(upsert_sql, (str(user_id), new.get("created_at"), Jsonb(new)))
+        mirror.execute(sql, params)
     return True, applied, (row[0] if row is not None else None)
 
 
