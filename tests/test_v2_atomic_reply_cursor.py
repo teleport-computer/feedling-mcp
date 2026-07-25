@@ -1235,8 +1235,14 @@ def test_push_transport_failure_does_not_fail_the_turn(monkeypatch):
         lambda _store, _text, *, item_id=None: (_envelope(str(item_id)), ""),
     )
 
+    # Deliberately longer than the push body's 240-char cap (see `_on_reply`'s
+    # `text[:240]` truncation), so the body assertion below can't pass on a
+    # copy-paste bug that pushes the full untruncated text.
+    reply_text = "answered-boom-" + ("x" * 300)
+    assert len(reply_text) > 240
+
     async def _provider(config, messages, *, tools=None):
-        return {"reply": "answered-boom", "tool_calls": [], "usage": {}}
+        return {"reply": reply_text, "tool_calls": [], "usage": {}}
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
 
@@ -1273,4 +1279,20 @@ def test_push_transport_failure_does_not_fail_the_turn(monkeypatch):
     assert boom_calls, "send_reply_push must be invoked on the normal delivery path"
     store = core_store.get_store(uid)
     store.reload()
-    assert [m for m in store.chat_messages if m.get("role") == "openclaw"]
+    replies = [m for m in store.chat_messages if m.get("role") == "openclaw"]
+    assert replies
+
+    # Parameter assertions (review Minor #2): the earlier version of this test
+    # only checked that `send_reply_push` was *called*, which would not have
+    # caught a copy-paste bug (e.g. the wake-lane block's `is_wake` literal
+    # being copied as `False`) — it must also carry the right msg_id/body/
+    # is_wake for the chat lane.
+    _, kw = boom_calls[0]
+    assert kw["msg_id"] == replies[0]["id"], (
+        "pushed msg_id must be the envelope id of the row that was actually "
+        "persisted, not some other identifier"
+    )
+    assert kw["body"] == reply_text[:240]
+    assert len(kw["body"]) == 240
+    assert kw["is_wake"] is False
+    assert kw["lane"] == "", "chat lane must never claim a wake lane name"

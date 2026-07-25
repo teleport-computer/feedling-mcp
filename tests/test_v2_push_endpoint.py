@@ -142,6 +142,80 @@ def test_wake_respects_reminders_delivery_off(app_obj, user, monkeypatch):
     assert written["fields"]["alert_status"] == "suppressed"
 
 
+def test_manual_wake_bypasses_reminders_delivery_off(app_obj, user, monkeypatch):
+    """V1 parity (review Minor #1): manual wakes always deliver, even with the
+    proactive-reminders toggle off — see `evaluate_delivery_v2`'s
+    `manual_bypass` branch and V1's `_proactive_delivery_decision_v2`, which
+    derives `manual` from the wake job rather than hardcoding it False. The V2
+    worker signals this over the wire with `lane="manual_wake"` (the only V2
+    wake lane that is manual); anything else must NOT bypass the gate."""
+    from proactive import controls_v2
+
+    monkeypatch.setattr(
+        controls_v2, "load_settings_v2_for_store",
+        lambda store: controls_v2.resolve_settings_v2({"reminders_delivery": False}))
+    seen = {}
+
+    def _fake_deliver(store, *, body, title="", data=None, visual_state="reply"):
+        seen.update(body=body, title=title)
+        return {"push_decision": "send", "push_reason": "manual_bypass",
+                "alert_status": "delivered", "alert_reason": ""}
+
+    monkeypatch.setattr(
+        push_service, "_deliver_ai_message_push_if_background", _fake_deliver)
+    written = {}
+    monkeypatch.setattr(
+        core_store.UserStore, "update_chat_message_metadata",
+        lambda self, msg_id, fields: written.update(fields=fields))
+
+    status, body = _post(
+        app_obj,
+        "/v1/internal/push/ai_reply",
+        {"msg_id": "msg-manual", "body": "手动唤醒消息", "is_wake": True,
+         "lane": "manual_wake"},
+        {"X-Feedling-Runtime-Token": _token(user, ["chat_push"])},
+    )
+
+    assert status == 200
+    assert body["status"] == "delivered"
+    assert seen["body"] == "手动唤醒消息"
+    assert written["fields"]["alert_status"] == "delivered"
+
+
+def test_non_manual_wake_lane_still_respects_reminders_delivery_off(
+    app_obj, user, monkeypatch
+):
+    """Sibling to the manual-bypass test above: a non-manual wake lane
+    (heartbeat) must still be suppressed when `reminders_delivery` is off —
+    guards against a fix that accidentally makes every wake manual."""
+    from proactive import controls_v2
+
+    monkeypatch.setattr(
+        controls_v2, "load_settings_v2_for_store",
+        lambda store: controls_v2.resolve_settings_v2({"reminders_delivery": False}))
+    called = {"n": 0}
+    monkeypatch.setattr(
+        push_service, "_deliver_ai_message_push_if_background",
+        lambda *a, **k: called.update(n=called["n"] + 1) or {})
+    written = {}
+    monkeypatch.setattr(
+        core_store.UserStore, "update_chat_message_metadata",
+        lambda self, msg_id, fields: written.update(fields=fields))
+
+    status, body = _post(
+        app_obj,
+        "/v1/internal/push/ai_reply",
+        {"msg_id": "msg-heartbeat", "body": "主动消息", "is_wake": True,
+         "lane": "heartbeat"},
+        {"X-Feedling-Runtime-Token": _token(user, ["chat_push"])},
+    )
+
+    assert status == 200
+    assert body["status"] == "suppressed"
+    assert called["n"] == 0
+    assert written["fields"]["alert_status"] == "suppressed"
+
+
 def test_empty_body_is_skipped(app_obj, user, monkeypatch):
     called = {"n": 0}
     monkeypatch.setattr(

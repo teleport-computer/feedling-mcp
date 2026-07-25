@@ -483,12 +483,20 @@ def _mint_push_token(user_id: str) -> str:
     )
 
 
-def _send_reply_push(user_id: str, *, msg_id: str, body: str, is_wake: bool) -> None:
+def _send_reply_push(
+    user_id: str, *, msg_id: str, body: str, is_wake: bool, lane: str = ""
+) -> None:
     """`TurnDeps.send_reply_push` 的生产接线。
 
     APNs 私钥只注入 backend 容器，所以推送由 backend 发；这里只把明文正文经
     compose 内网交过去（与 V1 consumer 走 HTTP 传 push_body 是同一个姿态）。
     完全 best-effort：任何异常都在这里吞掉并记日志，绝不冒到回合上。
+
+    ``lane`` 是本次唤醒的 V2 lane 名（chat lane 传空字符串），backend 用它推
+    manual（``lane == "manual_wake"``）与真实 wake source，对齐 V1
+    `_proactive_delivery_decision_v2` 从 job 推 manual 的做法 —— 缺这个字段会让
+    manual wake 被当成非 manual，关了 reminders_delivery 的用户收不到手动唤醒
+    推送（v2-push-parity 分支审查 Minor #1）。
     """
     api_url = os.environ.get("FEEDLING_API_URL", "").strip()
     if not api_url:
@@ -497,9 +505,15 @@ def _send_reply_push(user_id: str, *, msg_id: str, body: str, is_wake: bool) -> 
     try:
         resp = httpx.post(
             f"{api_url}/v1/internal/push/ai_reply",
-            json={"msg_id": msg_id, "body": body, "is_wake": is_wake},
+            json={"msg_id": msg_id, "body": body, "is_wake": is_wake, "lane": lane},
             headers={"X-Feedling-Runtime-Token": _mint_push_token(user_id)},
-            timeout=10.0,
+            # Best-effort notification, sent synchronously from the turn's
+            # `finally` while the job is already completed but the worker slot
+            # (FEEDLING_V2_MAX_WORKERS) is still held. Keep this short — 10s
+            # would let a slow/wedged backend eat a scarce worker slot per turn;
+            # 3s is enough for an intra-compose-network call and still cheap to
+            # lose if backend is stuck (review Minor #4).
+            timeout=3.0,
         )
         if resp.status_code >= 400:
             log.warning(

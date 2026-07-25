@@ -1227,18 +1227,47 @@ def test_send_reply_push_posts_to_backend(monkeypatch):
             return {"status": "delivered"}
 
     def _fake_post(url, json=None, headers=None, timeout=None):
-        posted.update(url=url, json=json, headers=headers)
+        posted.update(url=url, json=json, headers=headers, timeout=timeout)
         return _Resp()
 
     monkeypatch.setenv("FEEDLING_API_URL", "http://backend:5001")
     monkeypatch.setattr(serve_worker.httpx, "post", _fake_post)
 
     serve_worker._send_reply_push(
-        "u_push_send", msg_id="m1", body="hi", is_wake=True)
+        "u_push_send", msg_id="m1", body="hi", is_wake=True, lane="manual_wake")
 
     assert posted["url"] == "http://backend:5001/v1/internal/push/ai_reply"
-    assert posted["json"] == {"msg_id": "m1", "body": "hi", "is_wake": True}
+    assert posted["json"] == {
+        "msg_id": "m1", "body": "hi", "is_wake": True, "lane": "manual_wake",
+    }
     assert posted["headers"]["X-Feedling-Runtime-Token"]
+    # Review Minor #4: best-effort notification sent synchronously from the
+    # turn's `finally` while a scarce worker slot is still held — must not be
+    # allowed to eat 10s of it.
+    assert posted["timeout"] == 3.0
+
+
+def test_send_reply_push_defaults_lane_to_empty_string(monkeypatch):
+    """Chat-lane call sites (and any caller that predates the `lane` param)
+    must not accidentally claim a wake lane name."""
+    posted = {}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"status": "delivered"}
+
+    def _fake_post(url, json=None, headers=None, timeout=None):
+        posted.update(json=json)
+        return _Resp()
+
+    monkeypatch.setenv("FEEDLING_API_URL", "http://backend:5001")
+    monkeypatch.setattr(serve_worker.httpx, "post", _fake_post)
+
+    serve_worker._send_reply_push("u_push_send2", msg_id="m2", body="hi", is_wake=False)
+
+    assert posted["json"]["lane"] == ""
 
 
 def test_send_reply_push_swallows_transport_errors(monkeypatch):

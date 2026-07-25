@@ -970,11 +970,15 @@ class TurnDeps:
     # of an empty pending set; the field exists so the call site is already wired
     # ahead of the producer landing.
     apply_pending_effects: Callable[[str], dict] | None = None
-    # (user_id, *, msg_id, body, is_wake) -> None：把本回合最后一条已落库回复的
+    # (user_id, *, msg_id, body, is_wake, lane) -> None：把本回合最后一条已落库回复的
     # 明文正文交给 backend 发 APNs（serve-worker 容器没有 APNs 私钥，只有 backend
     # 有）。best-effort：实现方吞掉自身异常，调用点也再兜一层 —— 推送失败绝不能
     # 把一个已经成功发布回复的回合打成 failed。None（所有不接线的测试/legacy
-    # 调用方）= 特性关闭，行为与补齐推送之前完全一致。
+    # 调用方）= 特性关闭，行为与补齐推送之前完全一致。``lane`` 是本次唤醒的 lane
+    # 名（chat lane 传空字符串）：backend 端用它推 manual（lane == "manual_wake"）与
+    # 真实 wake source，对齐 V1 `_proactive_delivery_decision_v2` 从 job 推 manual
+    # 的做法 —— 之前这里硬编码 source="heartbeat"/manual=False，导致关了
+    # reminders_delivery 的用户在 V2 手动唤醒收不到推送（V1 会走 manual_bypass）。
     send_reply_push: Callable[..., None] | None = None
     # (store, *, api_key, runtime_token, enclave_sem) -> awaitable McpTurn: build this chat
     # turn's user-MCP tool surface. Implemented in `hosted.mcp_tools.load_turn_mcp`
@@ -3186,7 +3190,14 @@ def _build_encrypted_reply_effect_payload(
     if wake_kind:
         # Observability marker only: lets the reply row (and the push gate) tell an
         # agent-initiated wake message apart from a reply to the user's own message.
-        # Not plaintext — a fixed vocabulary shared with the proactive_jobs log.
+        # Not plaintext. Fixed vocabulary, but NOT the same one as V1's
+        # `proactive_jobs` log: this is the V2 lane name — one of
+        # heartbeat/scheduled/manual_wake/screen_watch (`_WAKE_LANES`). V1's
+        # `proactive_jobs`/gate.py `wake_kind` field uses a different vocabulary
+        # (presence/screen/screen_watch/scheduled_wake/background_result,
+        # `proactive/gate.py:_proactive_v2_wake_kind`) — only "screen_watch"
+        # overlaps between the two. Do not cross-reference them as if they were
+        # one column.
         payload["wake_kind"] = str(wake_kind)
     return payload
 
@@ -5075,6 +5086,7 @@ async def _run_wake(
                             "msg_id": str(payload["envelope"]["id"]),
                             "body": text[:240],
                             "is_wake": True,
+                            "lane": lane,
                         }
                     except Exception as e:  # noqa: BLE001 — 见上：绝不能影响回合结果
                         log.warning(
@@ -5259,6 +5271,7 @@ async def _run_wake(
                     msg_id=push_slot["msg_id"],
                     body=push_slot["body"],
                     is_wake=push_slot["is_wake"],
+                    lane=push_slot["lane"],
                 )
             except Exception as e:  # noqa: BLE001 — 推送绝不能影响回合结果
                 log.warning(
@@ -7214,6 +7227,11 @@ async def process_job(
                             "msg_id": str(payload["envelope"]["id"]),
                             "body": text[:240],
                             "is_wake": False,
+                            # Chat lane is never a wake — send an empty lane rather
+                            # than the job's own lane=="chat" bookkeeping value, so
+                            # backend's manual/source derivation only ever sees real
+                            # wake lane names (see TurnDeps.send_reply_push).
+                            "lane": "",
                         }
                     except Exception as e:  # noqa: BLE001 — 见上：绝不能影响回合结果
                         log.warning(
@@ -7641,6 +7659,7 @@ async def process_job(
                     msg_id=push_slot["msg_id"],
                     body=push_slot["body"],
                     is_wake=push_slot["is_wake"],
+                    lane=push_slot["lane"],
                 )
             except Exception as e:  # noqa: BLE001 — 推送绝不能影响回合结果
                 log.warning(

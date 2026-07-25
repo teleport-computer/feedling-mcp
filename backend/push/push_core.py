@@ -140,8 +140,23 @@ def ai_reply_push(store: UserStore, *, payload: dict) -> dict:
         return {"status": "skipped", "reason": "empty_body"}
 
     if is_wake:
+        # ``lane`` is the V2 lane name (heartbeat/scheduled/manual_wake/
+        # screen_watch) the serve-worker sent this wake reply's push under.
+        # Mirrors V1's ``_proactive_delivery_decision_v2`` (chat/chat_core.py),
+        # which derives ``source``/``manual`` from the wake job rather than
+        # hardcoding them -- manual==True routes through
+        # ``evaluate_delivery_v2``'s ``manual_bypass`` and is delivered even
+        # when the user has turned ``reminders_delivery`` off. Back-compat: a
+        # caller that predates this field (payload has no "lane" key at all)
+        # falls back to the pre-fix constants instead of erroring.
+        if "lane" in payload:
+            source = str(payload.get("lane") or "").strip() or "heartbeat"
+            manual = source == "manual_wake"
+        else:
+            source = "heartbeat"
+            manual = False
         decision = evaluate_delivery_v2(
-            load_settings_v2_for_store(store), source="heartbeat", manual=False)
+            load_settings_v2_for_store(store), source=source, manual=manual)
         if not decision.allow_visible_delivery:
             fields = {
                 "push_decision": "suppressed",
