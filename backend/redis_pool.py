@@ -37,6 +37,13 @@ _lock = threading.Lock()
 _ca_file_path: Optional[str] = None
 
 _DEFAULT_PORT = 443
+# 每进程池上限。连接预算（接入满载）：backend FEEDLING_BACKEND_WORKERS=6 → 每
+# worker 一个进程一个单例池 = 6×16=96；serve-worker 单进程（FEEDLING_V2_MAX_WORKERS
+# 是进程内并发、共享同一单例池）= ≤16；主 CVM 合计 ≈112，远低于 Redis 默认
+# maxclients=10000（redis.conf 未下调；容器 nofile 默认 1024 时 Redis 会自动把
+# maxclients 降到 ~992，仍 ≫112）。池惰性建连（上限非预分配），空闲近 0。不同于
+# Postgres 紧绷的 max_connections，这里无调参压力。非阻塞池：单 worker 并发命令
+# 超上限时抛错 → 调用方降级 PG（缓存可接受）；某条热路径真需要再调 REDIS_MAX_CONNECTIONS。
 _DEFAULT_MAX_CONNECTIONS = 16
 
 
