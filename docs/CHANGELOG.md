@@ -64,8 +64,11 @@
 - **`service.ingest_snapshot_v2`**：信封解密失败（`decrypt_failed:*` /
   `decrypt_skipped` / `invalid_envelope`）以前**完全静默**——`results[key]` 在
   解密前就置了 `accepted`，失败只是不写值，无日志无事件。现在补 `log.warning`
-  + 一条 `perception_events` 审计事件（`type=decrypt_failed`）。客户端契约不
-  变（仍返回 `accepted`），也仍然不臆造值。
+  + 一条审计行。客户端契约不变（仍返回 `accepted`），也仍然不臆造值。
+  审计行走**独立**的 `perception_decrypt_failures` 流（cap 500/用户），
+  **刻意不写 `perception_events`**：`_last_wake_ts` / `_last_v2_wake_ts` 只扫
+  该流最新 50 行找上一次 wake，失败风暴会把 wake 行挤出窗口 → burst/cluster
+  去重静默失效，正好赶在全站不健康的时候。
 - **注释订正（本次事故的心智根因）**：`core/util.runtime_v2_default_on`、
   `proactive/screen_flag_v2`、`proactive/resident_runtime_v2` 都写着「prod 默认
   OFF」，但三份主 compose 全都注入 `FEEDLING_RUNTIME_V2_DEFAULT_ON=true`

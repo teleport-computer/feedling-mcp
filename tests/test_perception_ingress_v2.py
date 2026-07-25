@@ -28,6 +28,7 @@ def _activate_proactive(monkeypatch) -> None:
 class _Store:
     def __init__(self):
         self.events = {}
+        self.decrypt_failures = {}
         self.state = {}
         self.config = {}
         self.frames = {}
@@ -38,6 +39,12 @@ class _Store:
 
     def read_events(self, uid, limit=50):
         return list(self.events.get(uid, [])[-limit:])
+
+    def append_decrypt_failure(self, uid, doc, ts):
+        self.decrypt_failures.setdefault(uid, []).append(dict(doc))
+
+    def read_decrypt_failures(self, uid, limit=50):
+        return list(self.decrypt_failures.get(uid, [])[-limit:])
 
     def get_config(self, uid):
         return dict(self.config.get(uid, {}))
@@ -435,10 +442,14 @@ def test_snapshot_v2_records_an_audit_event_when_a_signal_fails_to_decrypt(monke
     assert results["location_signal"] == "accepted"      # client contract unchanged
     assert fake.get_state("u_decrypt_failure") == {}      # no value invented
 
-    events = [e for e in fake.read_events("u_decrypt_failure") if e.get("type") == "decrypt_failed"]
-    assert len(events) == 1
-    assert events[0]["key"] == "location_signal"
-    assert events[0]["reason"] == "decrypt_failed:RuntimeError"
+    failures = fake.read_decrypt_failures("u_decrypt_failure")
+    assert len(failures) == 1
+    assert failures[0]["key"] == "location_signal"
+    assert failures[0]["reason"] == "decrypt_failed:RuntimeError"
+    # NOT in the wake-audit stream: service._last_wake_ts / _last_v2_wake_ts scan
+    # only the newest 50 rows there, so a burst of failures would push the last
+    # "wake" row out of the window and silently disable burst/cluster dedup.
+    assert fake.read_events("u_decrypt_failure") == []
 
 
 def test_location_signal_null_or_unchanged_anchor_does_not_wake(monkeypatch):

@@ -155,13 +155,19 @@ def _record_decrypt_failure_v2(user_id: str, key: str, reason: str, ts: float) -
     envelope") and deliberately writes no value — but a silent skip is
     indistinguishable from "this user has no reading", which is exactly how the
     2026-07-24 null-perception regression stayed invisible for hours. One
-    warning + one audit event per failed signal, so a fleet-wide enclave hiccup
+    warning + one audit row per failed signal, so a fleet-wide enclave hiccup
     or a caller that forgot to forward the api key (``decrypt_skipped``) shows
-    up in logs and in the perception event stream instead of nowhere.
+    up in logs and in a queryable stream instead of nowhere.
+
+    The row goes to its OWN stream, never the wake-audit one: ``_last_wake_ts``
+    / ``_last_v2_wake_ts`` scan only the newest 50 rows of that stream to find
+    the last wake, so a burst of failures there would evict the wake row and
+    silently disable burst/cluster dedup — precisely when the fleet is already
+    unhealthy.
     """
     log.warning("perception v2 decrypt failed for %s key=%s: %s", user_id, key, reason)
     try:
-        store.append_event(user_id, {
+        store.append_decrypt_failure(user_id, {
             "cap": "perception",
             "type": "decrypt_failed",
             "key": key,
