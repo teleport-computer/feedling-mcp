@@ -622,6 +622,8 @@ CVM 磁盘创建时定死、事后扩容麻烦，故按「未来可能指向 pro
 
 设计文档 `docs/superpowers/specs/2026-07-24-tee-redis-cvm-design.md`，
 实施计划 `docs/superpowers/plans/2026-07-24-tee-redis-cvm.md`。
+**接入方看这里**：`docs/REDIS_USAGE.md`（连接 + 使用规范：`IO:` 前缀命名、
+强制 TTL、read-through）。本章节只讲开通/运维。
 
 **当前状态**：三台 CVM 已开通、running，冒烟 ALL GREEN，**零业务流量**
 （没有任何业务代码引用 Redis，接入各自另开 spec）。CVM id 已写进
