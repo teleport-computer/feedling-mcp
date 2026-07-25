@@ -39,3 +39,24 @@ def test_chat_lane_omits_wake_kind(monkeypatch):
     payload = worker._build_encrypted_reply_effect_payload(
         _FakeStore(), "hello", effect_id="job1:reply:0")
     assert "wake_kind" not in payload
+
+
+def test_turn_deps_accepts_send_reply_push():
+    calls = []
+    deps = worker.TurnDeps(
+        read_messages=lambda uid: [],
+        resolve_provider=lambda uid: (None, {}),
+        mint_enclave_token=lambda uid: "rt",
+        send_reply_push=lambda uid, **kw: calls.append((uid, kw)),
+    )
+    deps.send_reply_push("u1", msg_id="m1", body="hi", is_wake=True)
+    assert calls == [("u1", {"msg_id": "m1", "body": "hi", "is_wake": True})]
+
+
+def test_send_reply_push_defaults_to_none():
+    deps = worker.TurnDeps(
+        read_messages=lambda uid: [],
+        resolve_provider=lambda uid: (None, {}),
+        mint_enclave_token=lambda uid: "rt",
+    )
+    assert deps.send_reply_push is None

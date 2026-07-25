@@ -970,6 +970,12 @@ class TurnDeps:
     # of an empty pending set; the field exists so the call site is already wired
     # ahead of the producer landing.
     apply_pending_effects: Callable[[str], dict] | None = None
+    # (user_id, *, msg_id, body, is_wake) -> None：把本回合最后一条已落库回复的
+    # 明文正文交给 backend 发 APNs（serve-worker 容器没有 APNs 私钥，只有 backend
+    # 有）。best-effort：实现方吞掉自身异常，调用点也再兜一层 —— 推送失败绝不能
+    # 把一个已经成功发布回复的回合打成 failed。None（所有不接线的测试/legacy
+    # 调用方）= 特性关闭，行为与补齐推送之前完全一致。
+    send_reply_push: Callable[..., None] | None = None
     # (store, *, api_key, runtime_token, enclave_sem) -> awaitable McpTurn: build this chat
     # turn's user-MCP tool surface. Implemented in `hosted.mcp_tools.load_turn_mcp`
     # and injected by `serve_worker.build_production_deps`, because loading a user's
@@ -4343,6 +4349,7 @@ async def _run_wake(
     grounding，不随 tool-loop 轮次增长，跟 `prior_tool_results`（每轮动态积累的工具
     观测）是两回事。
     """
+    push_slot: dict | None = None
     try:
         store = core_store.get_store(user_id)
         # One HMAC token and one encrypted workspace snapshot per wake turn.
@@ -5057,6 +5064,14 @@ async def _run_wake(
                     best_effort=True,
                 )
                 if status == "applied":
+                    # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。
+                    nonlocal push_slot
+                    push_slot = {
+                        "msg_id": str(payload["envelope"]["id"]),
+                        "body": text[:240],
+                        "is_wake": True,
+                    }
+                if status == "applied":
                     if final:
                         source_status = await asyncio.to_thread(
                             jobs_store.get_job_status,
@@ -5226,6 +5241,19 @@ async def _run_wake(
         if tm is not None:
             tm.flush(failed=True, status=code)
         return "failed"
+    finally:
+        if push_slot is not None and deps.send_reply_push is not None:
+            try:
+                await asyncio.to_thread(
+                    deps.send_reply_push,
+                    user_id,
+                    msg_id=push_slot["msg_id"],
+                    body=push_slot["body"],
+                    is_wake=push_slot["is_wake"],
+                )
+            except Exception as e:  # noqa: BLE001 — 推送绝不能影响回合结果
+                log.warning(
+                    "[v2.worker] wake reply push failed user=%s: %s", user_id, e)
 
 
 async def _run_extraction(
