@@ -3354,6 +3354,16 @@ def probe_responses_support(config: ProviderConfig) -> bool:
 # we notice). Later-page failures degrade to partial success; the first page
 # still raises.
 _CATALOG_TOTAL_BUDGET = 20.0          # seconds, wall-clock, across all pages
+# Tight PER-PHASE httpx timeouts. These bound the connect/TLS/header phases and
+# the idle-wait between chunks, but they are NOT a total-time bound: httpx's
+# read timeout only caps waiting for the NEXT chunk, so a slow-dripping endpoint
+# that keeps sending small chunks would run far past _CATALOG_TOTAL_BUDGET. The
+# real wall-clock bound is enforced by the in-loop deadline check in
+# _fetch_catalog_page. Future hardening: a full async wire wrapped in
+# asyncio.timeout(_CATALOG_TOTAL_BUDGET) would give a single truly-cancellable
+# total bound that also covers the connect/TLS phase.
+_CATALOG_CONNECT_TIMEOUT = 5.0        # seconds, connect/write/pool phase cap
+_CATALOG_READ_TIMEOUT = 10.0          # seconds, wait-for-next-chunk cap
 _CATALOG_MAX_PAGES = 10
 _CATALOG_MAX_MODELS = 2000
 _CATALOG_MAX_BODY_BYTES = 5_000_000   # decompressed bytes, summed across pages
@@ -3489,17 +3499,33 @@ def _parse_catalog_page(provider: str, body: Any) -> tuple[list[dict], str | Non
 
 
 def _fetch_catalog_page(client: httpx.Client, url: str, headers: dict,
-                        params: dict, timeout: float,
+                        params: dict, deadline: float,
                         bytes_so_far: int) -> tuple[dict, int]:
-    """Stream one page, enforcing the shared decompressed-byte cap.
+    """Stream one page, enforcing the byte cap AND the wall-clock deadline.
+
+    ``deadline`` is an absolute ``time.monotonic()`` instant shared across all
+    pages. Per-phase httpx timeouts (see the constants above) bound the connect/
+    header phases and the wait for the next chunk; the total-time bound is
+    enforced by re-checking ``time.monotonic()`` inside the chunk loop, because
+    httpx's read timeout does NOT bound total response duration — a slow-drip
+    endpoint could otherwise hold the sync threadpool far past the budget.
 
     Returns ``(parsed_json_dict, new_running_byte_total)``. Raises
     ``ProviderError`` on http>=400 (carrying ``status_code``), network failure
-    (``status_code=None``), the size cap, non-JSON, or a non-dict root. The
-    caller decides first-page (raise) vs later-page (partial) handling.
+    (``status_code=None``), the size cap, the deadline, non-JSON, or a non-dict
+    root. The caller decides first-page (raise) vs later-page (partial) handling.
     """
-    if timeout <= 0:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
         raise ProviderError("provider network error: DeadlineExceeded")
+    # Cap each phase by the smaller of its own budget and the whole remaining
+    # wall-clock, so connect/TLS/header can never themselves outlast the budget.
+    timeout = httpx.Timeout(
+        connect=min(_CATALOG_CONNECT_TIMEOUT, remaining),
+        read=min(_CATALOG_READ_TIMEOUT, remaining),
+        write=min(_CATALOG_CONNECT_TIMEOUT, remaining),
+        pool=min(_CATALOG_CONNECT_TIMEOUT, remaining),
+    )
     chunks: list[bytes] = []
     total = bytes_so_far
     try:
@@ -3509,6 +3535,12 @@ def _fetch_catalog_page(client: httpx.Client, url: str, headers: dict,
             if status >= 400:
                 raise ProviderError(f"provider_http_{status}", status_code=status)
             for chunk in resp.iter_bytes():
+                if time.monotonic() >= deadline:
+                    # Slow-drip past the wall-clock budget: stop reading now and
+                    # treat as a deadline hit. status_code=None → the caller /
+                    # slug mapper classifies this as temporarily_unavailable, and
+                    # a later page keeps whatever was already collected (partial).
+                    raise ProviderError("provider network error: DeadlineExceeded")
                 total += len(chunk)
                 if total > _CATALOG_MAX_BODY_BYTES:
                     raise ProviderError("model_catalog_invalid_response")
@@ -3555,7 +3587,7 @@ def list_provider_models(provider: str, api_key: str, base_url: str = "") -> dic
         url, headers, params = _catalog_request(provider, api_key, base_url, cursor)
         try:
             body, total_bytes = _fetch_catalog_page(
-                client, url, headers, params, remaining, total_bytes)
+                client, url, headers, params, deadline, total_bytes)
             page_models, next_cursor = _parse_catalog_page(provider, body)
         except ProviderError as e:
             if not models:

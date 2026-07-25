@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -207,12 +208,76 @@ def test_list_models_openrouter_single_page(monkeypatch):
     assert calls[0]["params"].get("output_modalities") == "all"
 
 
-def test_list_models_per_page_timeout_is_remaining_budget(monkeypatch):
+def test_list_models_per_phase_timeouts_are_tight_and_bounded(monkeypatch):
     calls = _install_fake_stream(monkeypatch, [(200, {"data": [{"id": "a"}]})])
     pc.list_provider_models("openai", "k", "")
-    # First page's socket timeout is the (near-full) remaining wall-clock budget,
-    # not a hardcoded per-page constant.
-    assert 0 < calls[0]["timeout"] <= pc._CATALOG_TOTAL_BUDGET
+    # Per-phase httpx.Timeout, NOT a single remaining-budget float: connect/read
+    # are each capped by their own tight constant (and by remaining budget), so a
+    # slow connect/header phase can't itself outlast the wall-clock budget.
+    t = calls[0]["timeout"]
+    assert isinstance(t, pc.httpx.Timeout)
+    assert 0 < t.connect <= pc._CATALOG_CONNECT_TIMEOUT
+    assert 0 < t.read <= pc._CATALOG_READ_TIMEOUT
+
+
+class _DripStream:
+    """A stream that keeps emitting small chunks with real sleeps between them,
+    for far longer than the wall-clock budget — the malicious slow-drip case."""
+
+    def __init__(self, status, chunk, n, sleep):
+        self.status_code = status
+        self._chunk = chunk
+        self._n = n
+        self._sleep = sleep
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def iter_bytes(self):
+        for _ in range(self._n):
+            time.sleep(self._sleep)
+            yield self._chunk
+
+
+def test_list_models_slow_drip_past_budget_is_bounded_partial(monkeypatch):
+    # Regression for the "total-time bound is not real" critical: page 1 returns
+    # instantly with a model; page 2 slow-drips small chunks well past the budget.
+    # The in-loop deadline check must stop reading around the budget and return
+    # a PARTIAL result (models already collected) — never complete:true, never
+    # run for the full drip duration.
+    monkeypatch.setattr(pc, "_CATALOG_TOTAL_BUDGET", 0.15)
+
+    page1 = json.dumps({"data": [{"id": "a"}], "has_more": True,
+                        "last_id": "a"}).encode()
+    seq = [(200, page1)]
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def stream(self, method, url, *, headers=None, params=None, timeout=None):
+            if seq:
+                status, raw = seq.pop(0)
+                return _FakeStream(status, raw)
+            # page 2+: drip ~1.5s worth of chunks, far past the 0.15s budget.
+            return _DripStream(200, b'{"id":"x"},', n=50, sleep=0.03)
+
+    monkeypatch.setattr(pc.httpx, "Client", FakeClient)
+    monkeypatch.setattr(pc, "_shared_client", None)
+
+    started = time.monotonic()
+    res = pc.list_provider_models("anthropic", "k", "")
+    elapsed = time.monotonic() - started
+
+    assert res["complete"] is False              # NOT falsely complete
+    assert res["catalog_supported"] is True
+    assert [m["id"] for m in res["models"]] == ["a"]   # page-1 models kept
+    # Bounded near the budget, not the full ~1.5s drip. Generous ceiling to stay
+    # non-flaky on a loaded CI box while still proving we didn't drip to the end.
+    assert elapsed < 1.0, elapsed
 
 
 def test_list_models_anthropic_paginates_and_dedupes(monkeypatch):
