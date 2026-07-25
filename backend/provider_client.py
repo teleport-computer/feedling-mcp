@@ -3640,17 +3640,23 @@ def list_provider_models(provider: str, api_key: str, base_url: str = "") -> dic
             warnings.append(f"catalog page dropped: {e}")
             break
 
-        for m in page_models:
+        cap_hit = False
+        for idx, m in enumerate(page_models):
             mid = m["id"]
             if mid in seen:
                 continue
             seen.add(mid)
             models.append(m)
             if len(models) >= _CATALOG_MAX_MODELS:
-                complete = False
-                warnings.append("model list truncated: model cap reached")
+                # Only truncated if there is GENUINELY more to consume: members
+                # left on this page, or a next cursor. Hitting the cap exactly on
+                # the last member of the last page is a COMPLETE catalog.
+                if page_models[idx + 1:] or next_cursor:
+                    complete = False
+                    warnings.append("model list truncated: model cap reached")
+                cap_hit = True
                 break
-        if len(models) >= _CATALOG_MAX_MODELS:
+        if cap_hit:
             break
 
         cursor = next_cursor

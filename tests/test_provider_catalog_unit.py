@@ -327,6 +327,40 @@ def test_list_models_page_cap_marks_incomplete(monkeypatch):
     assert any("truncated" in w for w in res["warnings"])
 
 
+def test_list_models_exact_cap_no_more_is_complete(monkeypatch):
+    # Exactly _CATALOG_MAX_MODELS on the last page with no next cursor and no
+    # leftover members → genuinely complete, must NOT be flagged truncated.
+    monkeypatch.setattr(pc, "_CATALOG_MAX_MODELS", 2)
+    _install_fake_stream(monkeypatch, [(200, {"data": [{"id": "a"}, {"id": "b"}]})])
+    res = pc.list_provider_models("openai", "k", "")
+    assert [m["id"] for m in res["models"]] == ["a", "b"]
+    assert res["complete"] is True
+    assert res["warnings"] == []
+
+
+def test_list_models_cap_with_next_cursor_is_truncated(monkeypatch):
+    # Hitting the cap while a next cursor is still outstanding IS truncated.
+    monkeypatch.setattr(pc, "_CATALOG_MAX_MODELS", 2)
+    _install_fake_stream(monkeypatch, [
+        (200, {"data": [{"id": "a"}, {"id": "b"}], "has_more": True, "last_id": "b"}),
+    ])
+    res = pc.list_provider_models("anthropic", "k", "")
+    assert [m["id"] for m in res["models"]] == ["a", "b"]
+    assert res["complete"] is False
+    assert any("model cap reached" in w for w in res["warnings"])
+
+
+def test_list_models_cap_with_leftover_members_is_truncated(monkeypatch):
+    # Cap hit mid-page with more members left on the same page → truncated.
+    monkeypatch.setattr(pc, "_CATALOG_MAX_MODELS", 2)
+    _install_fake_stream(monkeypatch, [
+        (200, {"data": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}),
+    ])
+    res = pc.list_provider_models("openai", "k", "")
+    assert [m["id"] for m in res["models"]] == ["a", "b"]
+    assert res["complete"] is False
+
+
 def test_list_models_repeated_cursor_stops(monkeypatch):
     # Same last_id every page → without cursor-dedup this loops; must stop early.
     pages = [(200, {"data": [{"id": f"m{i}"}], "has_more": True, "last_id": "SAME"})
