@@ -1,8 +1,10 @@
-# .github/workflows/redis-monitor.yml — 没有监控 = 没有备份。
+# .github/workflows/redis-monitor.yml — 盯 prod + pre 的 Redis 健康。
 #
-# 监控 prod + pre 的 Redis 备份链与内存水位。test 数据可弃，不监控
-# （与 pg-monitor.yml 同理）。
-name: Redis backup monitor
+# 【无离线备份，刻意为之】Redis 在本架构里是纯临时层（缓存/队列/锁，全部可从
+# Postgres 重建，PG 是权威源），故不做离线备份、没有「R2 快照新鲜度」这一维。
+# 本 workflow 只盯两件事：持久化写状态（AOF/RDB 落盘没报错）+ 内存水位
+# （noeviction 下打满 = 写入报错）。test 数据可弃，不监控（与 pg-monitor.yml 同理）。
+name: Redis monitor
 on:
   schedule: [{ cron: '*/30 * * * *' }]
   workflow_dispatch: {}
@@ -13,106 +15,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # r2_secret_env: pre 与 test 共享同一个 R2 bucket / 同一套机密
-          # （前缀不同，桶相同），所以 R2 那份要挑的机密前缀是 TEST_ 而不是
-          # PRE_——这里显式把它和 env_name 分开写，免得 shell 里用
-          # env_name 的大写形式去拼 R2 机密名反而拼错。
           - env_name: prod
-            prefix: prod/redis/
-            r2_secret_env: PROD
           - env_name: pre
-            prefix: pre/redis/
-            r2_secret_env: TEST
     steps:
-      - name: R2 snapshot freshness
-        env:
-          R2_SECRET_ENV: ${{ matrix.r2_secret_env }}
-          # 两套 R2 机密都注入 job env，在 shell 里按 R2_SECRET_ENV 前缀做
-          # bash 间接展开取值，不用 GitHub Actions 的三元短路写法（env_name
-          # 判断是否等于 prod，是就取 PROD 那份机密，否则取 TEST 那份，用
-          # &&/|| 拼在一起——注意：这段描述本身故意不写成 GHA 的双花括号
-          # 表达式语法，因为 Actions 连 run 脚本里 # 开头的注释也会做表达式
-          # 求值替换，写成活语法会连着把机密插进注释里）。
-          # &&/|| 在左边那个机密恰好为空（轮换空窗/手误删/打错名字）时会
-          # 静默短路 fallback 到右边那份，prod 那条腿就会打着 prod 的名义
-          # 汇报 pre 的 Redis、test 的 R2 桶。见 redis-deploy.yml 同款注释
-          # 与 test_monitor_never_selects_secrets_with_a_ternary。
-          # 挑错这里只会挑到空值 → 下面显式判空 fail-closed，不用 eval。
-          PROD_R2_ACCESS_KEY_ID: ${{ secrets.PROD_PG_BACKUP_R2_ACCESS_KEY_ID }}
-          PROD_R2_SECRET_ACCESS_KEY: ${{ secrets.PROD_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
-          PROD_R2_ENDPOINT: ${{ secrets.PROD_PG_BACKUP_R2_ENDPOINT }}
-          TEST_R2_ACCESS_KEY_ID: ${{ secrets.TEST_PG_BACKUP_R2_ACCESS_KEY_ID }}
-          TEST_R2_SECRET_ACCESS_KEY: ${{ secrets.TEST_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
-          TEST_R2_ENDPOINT: ${{ secrets.TEST_PG_BACKUP_R2_ENDPOINT }}
-          # GitHub runner 没有默认 region；即使 --endpoint-url 指向 R2，
-          # aws CLI 仍会在客户端侧因缺 region 报错。
-          AWS_DEFAULT_REGION: auto
-          AWS_REGION: auto
-          PREFIX: ${{ matrix.prefix }}
-        run: |
-          pick() { local n="${R2_SECRET_ENV}_$1"; printf '%s' "${!n-}"; }
-          AWS_ACCESS_KEY_ID=$(pick R2_ACCESS_KEY_ID)
-          AWS_SECRET_ACCESS_KEY=$(pick R2_SECRET_ACCESS_KEY)
-          ENDPOINT=$(pick R2_ENDPOINT)
-          export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
-          [ -n "$AWS_ACCESS_KEY_ID" ] || { echo "::error::MISSING ${R2_SECRET_ENV}_R2_ACCESS_KEY_ID"; exit 1; }
-          [ -n "$AWS_SECRET_ACCESS_KEY" ] || { echo "::error::MISSING ${R2_SECRET_ENV}_R2_SECRET_ACCESS_KEY"; exit 1; }
-          [ -n "$ENDPOINT" ] || { echo "::error::MISSING ${R2_SECRET_ENV}_R2_ENDPOINT"; exit 1; }
-
-          # aws CLI 自动分页：一个前缀 >1000 对象时每页各输出一个「本页最新」
-          # 时间戳，直接解析会炸。用 sort|tail 取跨页全局最新（对象 key 与
-          # ISO 时间戳的字典序都等于时间序）。不能关闭 aws CLI 的自动分页——
-          # 那样只取第一页（最旧的 key），反而误报 stale。
-          #
-          # aws 的退出码必须自己接：`aws … | sort | tail -n1` 的退出码取自 tail，
-          # 恒为 0。R2 在分页途中限流（ServiceUnavailable: Reduce your concurrent
-          # request rate）时 aws 中断退出，但前几页已经打印出来，函数于是返回一个
-          # 「偏旧的最大值」，下游把它当成备份陈旧误报——2026-07-24 11:15 pg-monitor
-          # 实测过一次。限流是瞬时的，故先退避重试；连续失败才报错，且措辞明确
-          # 区分「R2 查不了」与「备份真的陈旧」。
-          newest() {
-            local prefix="$1" raw rc attempt
-            for attempt in 1 2 3; do
-              raw=$(aws s3api list-objects-v2 --endpoint-url "$ENDPOINT" \
-                --bucket io-in-enclave-db --prefix "$prefix" \
-                --query 'sort_by(Contents,&LastModified)[-1].LastModified' \
-                --output text) && rc=0 || rc=$?
-              if [ "$rc" -eq 0 ]; then printf '%s\n' "$raw" | sort | tail -n1; return 0; fi
-              echo "::warning::ListObjectsV2 '${prefix}' 第 ${attempt} 次失败 (rc=${rc})，退避重试" >&2
-              # 最后一次失败没必要再等——反正接下来就要报错退出了，
-              # 白白多烧 30s。
-              [ "$attempt" -lt 3 ] && sleep $((attempt * 10))
-            done
-            echo "::error::ListObjectsV2 '${prefix}' 连续 3 次失败 — R2 侧问题，本次无法判定备份新鲜度（不等于备份陈旧）" >&2
-            return 1
-          }
-          # 调用点必须自己接 newest() 的退出码，和它内部接 aws 退出码同一个
-          # 手法（rc=0 || rc=$?）——否则 R2 查询失败（newest 返回非 0，$TS
-          # 为空字符串）会直接落进下面「$TS 为空」的判断，被当成「这个前缀
-          # 一份备份都没有」，报出比「R2 查不了」吓人得多的「不可恢复」，
-          # 且是与 newest() 内部去重的同一类假警报，只是换了一条代码路径。
-          TS=$(newest "$PREFIX") && RC=0 || RC=$?
-          if [ "$RC" -ne 0 ]; then
-            echo "::error::${PREFIX} 无法查询 R2 — 连续重试后仍失败，本轮跳过新鲜度判断（不代表备份陈旧或为空，见上面的 ListObjectsV2 警告）"
-            exit 1
-          fi
-          echo "newest snapshot: $TS"
-          if [ -z "$TS" ] || [ "$TS" = "None" ]; then
-            echo "::error::${PREFIX} EMPTY — 一份备份都没有，不可恢复"; exit 1
-          fi
-          AGE=$(python3 -c "import sys, datetime as dt; s=sys.argv[1].strip(); s=s[:-1]+'+00:00' if s.endswith('Z') else s; d=dt.datetime.fromisoformat(s); d=d.replace(tzinfo=dt.timezone.utc) if d.tzinfo is None else d; print(int((dt.datetime.now(dt.timezone.utc)-d).total_seconds()))" "$TS")
-          echo "snapshot age: ${AGE}s"
-          # 备份周期 1h，留一次失败的余量 → 2h 才报警。
-          test "$AGE" -lt 7200 || { echo "::error::snapshot stale ${AGE}s (>7200s) — 备份链断了"; exit 1; }
-
       - name: Redis persistence + memory headroom
         env:
           ENV_NAME: ${{ matrix.env_name }}
           # 两套 Redis 机密都注入 job env，shell 里按 ENV_NAME 大写前缀间接
-          # 展开取值——同上一步的三元短路理由（同样故意不写成活的 GHA
-          # 表达式语法），prod/pre 各自的 host 若用三元短路写法选取，
-          # PROD_REDIS_HOST 恰好为空时会静默连去 pre 的 Redis 却仍打着
-          # prod 的名义汇报。
+          # 展开取值——不用 GitHub Actions 的三元短路写法（同样故意不写成活的
+          # GHA 表达式语法）。prod/pre 各自的 host 若用三元短路写法选取，
+          # PROD_REDIS_HOST 恰好为空（轮换空窗/手误删）时会静默连去 pre 的
+          # Redis 却仍打着 prod 的名义汇报——挑错这里只会挑到空值 → 下面显式
+          # 判空 fail-closed。见 test_monitor_never_selects_secrets_with_a_ternary。
           PROD_REDIS_HOST: ${{ secrets.PROD_REDIS_HOST }}
           PROD_REDIS_PASSWORD: ${{ secrets.PROD_REDIS_PASSWORD }}
           PROD_REDIS_CA_B64: ${{ secrets.PROD_REDIS_CA_B64 }}
@@ -133,7 +47,11 @@ jobs:
           [ -n "$REDIS_CA_B64" ] || { echo "::error::MISSING ${UP}_REDIS_CA_B64"; exit 1; }
 
           echo "$REDIS_CA_B64" | base64 -d > /tmp/redis-ca.crt
-          R="redis-cli --tls --cacert /tmp/redis-ca.crt -h ${REDIS_HOST} -p 443"
+          # --sni 必须：dstack gateway 的 <app-id>-<port>s passthrough 靠 TLS
+          # SNI 路由到后端 CVM。redis-cli --tls 默认不发 SNI，gateway 找不到后端、
+          # 握手时直接关连接，监控会把健康的 Redis 误报成 "unexpected eof"。
+          # 实测 2026-07-25：不带 --sni 恒 eof，带上 = PONG。
+          R="redis-cli --tls --cacert /tmp/redis-ca.crt --sni ${REDIS_HOST} -h ${REDIS_HOST} -p 443"
 
           PERSIST=$($R INFO persistence | tr -d '\r')
           echo "$PERSIST" | grep -E '^(rdb_last_bgsave_status|aof_last_write_status):'

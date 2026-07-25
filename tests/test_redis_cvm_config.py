@@ -106,9 +106,9 @@ def test_persistence_is_aof_everysec_plus_rdb_fallback():
     assert saves == {"900 1", "300 10", "60 10000"}
 
 
-def test_unix_socket_is_exposed_for_the_backup_sidecar():
-    # D3b：明文端口关闭后 sidecar 只能走 unix socket；perm 700 保证
-    # 只有同 uid 进程可连。
+def test_unix_socket_is_exposed_for_the_healthcheck():
+    # D3b：明文端口关闭后，容器内 healthcheck 只能走 unix socket（省掉
+    # 自己跟自己做 TLS）；perm 700 保证只有同 uid 进程可连。
     d = dict(_conf_directives(REDIS_CONF.read_text()))
     assert d["unixsocket"] == "/var/run/redis/redis.sock"
     assert d["unixsocketperm"] == "700"
@@ -136,37 +136,6 @@ def test_entrypoint_refuses_to_start_without_password():
     result = _run_entrypoint({})
     assert result.returncode != 0
     assert "REDIS_PASSWORD" in result.stderr
-
-
-def test_entrypoint_refuses_backup_prefix_without_age_recipient():
-    # fail-closed 的核心：配了备份目的地却没有加密公钥，绝不能
-    # 退化成把明文快照推出 TEE。
-    result = _run_entrypoint(
-        {
-            "REDIS_PASSWORD": "a" * 64,
-            "REDIS_TLS_CERT_B64": "eA==",
-            "REDIS_TLS_KEY_B64": "eA==",
-            "REDIS_MAXMEMORY": "1gb",
-            "REDIS_BACKUP_S3_PREFIX": "test/redis/",
-        }
-    )
-    assert result.returncode != 0
-    assert "REDIS_BACKUP_AGE_RECIPIENT" in result.stderr
-
-
-def test_entrypoint_rejects_malformed_age_recipient():
-    result = _run_entrypoint(
-        {
-            "REDIS_PASSWORD": "a" * 64,
-            "REDIS_TLS_CERT_B64": "eA==",
-            "REDIS_TLS_KEY_B64": "eA==",
-            "REDIS_MAXMEMORY": "1gb",
-            "REDIS_BACKUP_S3_PREFIX": "test/redis/",
-            "REDIS_BACKUP_AGE_RECIPIENT": "not-an-age-key",
-        }
-    )
-    assert result.returncode != 0
-    assert "REDIS_BACKUP_AGE_RECIPIENT" in result.stderr
 
 
 def _valid_material_env(tmp_path: Path) -> dict[str, str]:
@@ -254,9 +223,11 @@ def _redis_compose() -> dict:
     return yaml.safe_load(REDIS_COMPOSE.read_text())
 
 
-def test_compose_has_exactly_redis_and_backup_services():
+def test_compose_has_exactly_the_redis_service():
+    # 无离线备份是刻意的：Redis 为纯临时层，PG 是权威源，故没有 backup
+    # sidecar（见 compose 顶部说明）。多出任何服务都要在这里显式声明。
     compose = _redis_compose()
-    assert set(compose["services"]) == {"redis", "backup"}
+    assert set(compose["services"]) == {"redis"}
 
 
 def test_compose_secrets_all_go_through_optional_env_substitution():
@@ -268,22 +239,12 @@ def test_compose_secrets_all_go_through_optional_env_substitution():
         "REDIS_TLS_CERT_B64",
         "REDIS_TLS_KEY_B64",
         "REDIS_MAXMEMORY",
-        "REDIS_BACKUP_AGE_RECIPIENT",
-        "REDIS_BACKUP_S3_PREFIX",
-        "REDIS_BACKUP_R2_ENDPOINT",
-        "REDIS_BACKUP_R2_ACCESS_KEY_ID",
-        "REDIS_BACKUP_R2_SECRET_ACCESS_KEY",
     ):
         assert f'"${{{var}:-}}"' in source, f"{var} must use ${{VAR:-}} form"
 
 
-def test_backup_sidecar_shares_only_the_socket_volume():
-    # D4：快照由 redis-cli --rdb 生成到 sidecar 自己的临时目录，
-    # sidecar 不该挂数据卷——挂了就有人会图省事去直接拷 AOF 文件，
-    # 那正是我们要避免的不一致读法。
+def test_redis_service_mounts_data_and_socket_volumes():
     services = _redis_compose()["services"]
-    backup_mounts = {m.split(":")[0] for m in services["backup"]["volumes"]}
-    assert backup_mounts == {"redissock"}
     redis_mounts = {m.split(":")[0] for m in services["redis"]["volumes"]}
     assert redis_mounts == {"redisdata", "redissock"}
 
@@ -291,8 +252,6 @@ def test_backup_sidecar_shares_only_the_socket_volume():
 def test_only_the_tls_port_is_published():
     services = _redis_compose()["services"]
     assert services["redis"]["ports"] == ["6379:6379"]
-    # sidecar 绝不暴露端口——它只经 unix socket 与 Redis 通信。
-    assert "ports" not in services["backup"]
 
 
 def test_healthcheck_uses_socket_and_never_puts_password_on_argv():
@@ -304,7 +263,7 @@ def test_healthcheck_uses_socket_and_never_puts_password_on_argv():
     assert "REDISCLI_AUTH" in redis["environment"]
 
 
-def test_both_services_restart_unless_stopped():
+def test_services_restart_unless_stopped():
     for name, svc in _redis_compose()["services"].items():
         assert svc["restart"] == "unless-stopped", name
 
@@ -403,6 +362,15 @@ def test_verify_script_never_passes_password_on_argv():
     assert "-a $" not in source
     assert "--pass" not in source
     assert "REDISCLI_AUTH" in source
+
+
+def test_verify_script_sends_sni_for_gateway_passthrough():
+    # dstack gateway 的 <app-id>-<port>s passthrough 靠 TLS SNI 路由到后端 CVM。
+    # redis-cli --tls 默认不发 SNI，gateway 找不到后端、握手时直接关连接，客户端
+    # 只看到 "unexpected eof"。实测 2026-07-25：不带 --sni 恒 eof、带上 = PONG。
+    # 少了这个断言，将来有人"简化"掉 --sni，冒烟/监控会对健康的 CVM 全线误报。
+    source = VERIFY.read_text()
+    assert "--sni" in source, "gateway passthrough requires redis-cli --sni <host>"
 
 
 def test_verify_script_checks_tls_and_ttl_and_info():
@@ -527,10 +495,9 @@ def test_deploy_workflow_derives_image_tag_from_the_checked_out_head():
     # pg-deploy.yml 的坑：workflow_dispatch 下 github.sha 指向触发时所在
     # ref 的 sha，而 checkout 的是 test/pre/main —— tag 会与镜像内容对不上。
     #
-    # 之前版本只 grep 字面量 "feedling-redis:${{ github.sha }}"：换成
-    # "feedling-redis-backup:${{ github.sha }}"（多了 -backup，子串就不同了）
-    # 或者把 github.sha 塞进「Pin image shas into compose」步骤任一条
-    # sed 表达式里，都不会撞上那条字符串，却是同一个缺陷。这个文件对
+    # 之前版本只 grep 字面量 "feedling-redis:${{ github.sha }}"：把 github.sha
+    # 塞进「Pin image sha into compose」步骤那条 sed 表达式里不会撞上那条
+    # 字符串，却是同一个缺陷。这个文件对
     # github.sha 这个 GHA 表达式没有任何合法用途（唯一合法引用见上面
     # Resolve 步骤里的注释，那里刻意没有写成 ${{ }} 语法，见该注释本身
     # 的说明）——所以直接钉住整份 workflow 里都不出现这个表达式，
@@ -559,11 +526,6 @@ def test_deploy_workflow_prechecks_every_required_secret():
         "REDIS_TLS_CERT_B64",
         "REDIS_TLS_KEY_B64",
         "REDIS_MAXMEMORY",
-        "REDIS_BACKUP_AGE_RECIPIENT",
-        "REDIS_BACKUP_S3_PREFIX",
-        "REDIS_BACKUP_R2_ENDPOINT",
-        "REDIS_BACKUP_R2_ACCESS_KEY_ID",
-        "REDIS_BACKUP_R2_SECRET_ACCESS_KEY",
     ):
         assert var in source, f"{var} missing from workflow"
 
@@ -607,83 +569,29 @@ def test_monitor_runs_on_a_schedule_and_covers_prod_and_pre():
     triggers = wf[True] if True in wf else wf["on"]
     assert "schedule" in triggers
     assert triggers["schedule"][0]["cron"] == "*/30 * * * *"
+    # 监控矩阵覆盖 prod + pre，不覆盖 test（test 数据可弃，与 pg-monitor.yml 同理）。
+    envs = {row["env_name"] for row in wf["jobs"]["check"]["strategy"]["matrix"]["include"]}
+    assert envs == {"prod", "pre"}
+
+
+def test_monitor_has_no_offsite_backup_freshness_check():
+    # 无离线备份是刻意的（Redis 为纯临时层，PG 是权威源）：监控不该再有
+    # 任何 R2 / age / 快照新鲜度维度。有人若日后把备份检查加回来，这个
+    # 断言会强制他先回到设计文档确认那是不是真想要的。
     source = REDIS_MONITOR_WF.read_text()
-    assert "prod/redis/" in source
-    assert "pre/redis/" in source
-    # test 数据可弃，不监控（与 pg-monitor.yml 同理）。
-    assert "test/redis/" not in source
-
-
-def test_monitor_handles_aws_pagination_correctly():
-    # pg-monitor.yml 踩过的坑：list-objects-v2 自动分页，>1000 对象时
-    # 每页各吐一个「本页最新」，下游解析直接炸；而 --no-paginate 只取
-    # 第一页（最旧）反而误报 stale。正解是 sort | tail 取跨页全局最新。
-    source = REDIS_MONITOR_WF.read_text()
-    assert "sort" in source and "tail -n1" in source
-    assert "--no-paginate" not in source
-
-
-def test_monitor_captures_the_aws_exit_code_instead_of_trusting_the_pipe():
-    # pg-monitor.yml 2026-07-24 修正的假警报：`aws … | sort | tail -n1` 的
-    # 退出码取自 tail，恒为 0。R2 在分页途中限流时 aws 中断退出，但前几页
-    # 已经打印出来，函数于是返回一个「偏旧的最大值」→ 误报备份陈旧。
-    # 当天 11:15 prod 实测：吐出 09:54 报 stale 4950s，而库里
-    # last_archived_time 只有 1s 前。正解是自己接退出码 + 退避重试。
-    source = REDIS_MONITOR_WF.read_text()
-    assert "rc=0 || rc=$?" in source
-    assert "sleep" in source          # 退避
-    # 措辞必须区分「R2 查不了」与「备份真的陈旧」，否则下一个人照着
-    # 假信号去查备份链。
-    assert "不等于备份陈旧" in source
-
-    # 上面这几行全在 newest() 函数体内部，与调用点是否真的检查了
-    # newest() 的返回值完全无关——一个把 `TS=$(newest "$PREFIX")` 的
-    # 结果不做任何判断就直接拿去比较 EMPTY 的调用点，能让这个测试
-    # 全绿，却仍然带着 Finding 2 的缺陷（R2 查询失败被误报成「一份
-    # 备份都没有，不可恢复」）。这里改成结构性检查调用点本身：
-    #
-    # 1) 调用点必须自己接 newest() 的退出码，手法与 newest() 内部接
-    #    aws 退出码一样（rc=0 || rc=$?），否则命令替换的失败会被
-    #    悄悄吞掉。
-    call_site = re.search(
-        r'TS=\$\(newest "\$PREFIX"\)\s*&&\s*(\w+)=0\s*\|\|\s*\1=\$\?',
-        source,
-    )
-    assert call_site, (
-        "call site must capture newest()'s own exit status the same way "
-        "newest() captures aws's (e.g. `TS=$(newest \"$PREFIX\") && RC=0 || "
-        "RC=$?`) — otherwise a failed R2 query and a genuinely empty prefix "
-        "are indistinguishable at the point that matters"
-    )
-    rc_var = call_site.group(1)
-
-    # 2) 那个退出码必须在「$TS 是否为空」判断之前就被检查并 fail-closed，
-    #    且报错措辞不能沿用 EMPTY 分支的「不可恢复」——那是两种不同的
-    #    故障，混在一起就是 Finding 2 本身。
-    tail = source[call_site.end():]
-    empty_check_pos = tail.index('[ -z "$TS" ]')
-    before_empty_check = tail[:empty_check_pos]
-    assert re.search(rf'"\${rc_var}"\s*-ne\s*0', before_empty_check), (
-        "the call site must branch on the captured exit code before it "
-        "ever looks at whether $TS is empty"
-    )
-    assert "exit 1" in before_empty_check
-    assert "不可恢复" not in before_empty_check, (
-        "the R2-query-failed branch must not borrow the EMPTY branch's "
-        "'不可恢复' wording — an unreachable R2 is not proof there are no "
-        "backups"
-    )
+    assert "s3api" not in source
+    assert "list-objects" not in source
+    assert "redis/" not in source          # 没有 R2 前缀
+    assert "7200" not in source            # 没有快照陈旧阈值
 
 
 def test_monitor_never_selects_secrets_with_a_ternary():
     # 与 test_deploy_workflow_never_selects_secrets_with_a_ternary 保护的
-    # 是同一类 bug，同一个 sibling task 的另一个文件。redis-monitor.yml
-    # 原先六处都用
-    #   ${{ matrix.env_name == 'prod' && secrets.PROD_X || secrets.TEST_X }}
-    # 选机密。PROD_X 恰好为空（轮换空窗/手误删）时会短路 fallback 到右边
-    # 那份，且不会报错——prod 那条腿会打着 prod 的名义，实际检查 pre 的
-    # Redis、test 的 R2 桶，这个 workflow 存在的唯一目的（盯住 prod）反而
-    # 悄悄失效。
+    # 是同一类 bug。用
+    #   ${{ matrix.env_name == 'prod' && secrets.PROD_X || secrets.PRE_X }}
+    # 选机密，PROD_X 恰好为空（轮换空窗/手误删）时会短路 fallback 到右边
+    # 那份，且不会报错——prod 那条腿会打着 prod 的名义实际检查 pre 的 Redis，
+    # 这个 workflow 存在的唯一目的（盯住 prod）反而悄悄失效。
     #
     # 结构性检查，不是字面量子串匹配：把每个 ${{ ... }} 表达式整体取出
     # （DOTALL 跨行，能扛住不寻常的换行/空格写法），只要表达式里同时出现
@@ -696,10 +604,7 @@ def test_monitor_never_selects_secrets_with_a_ternary():
                 f"ternary/short-circuit secret selection is unsafe: {expr!r}"
             )
     assert "secrets[" not in source, "dynamic secrets[...] indexing is unsafe"
-    # 两套机密都以前缀区分的名字注入 job env（R2 那份用 PROD_/TEST_ 前缀，
-    # 因为 pre 与 test 共享同一个 R2 bucket；Redis 那份用 PROD_/PRE_ 前缀，
-    # 因为 prod 与 pre 是各自独立的 Redis 实例）。
-    assert "PROD_R2_ACCESS_KEY_ID" in source and "TEST_R2_ACCESS_KEY_ID" in source
+    # 两套 Redis 机密都以 <ENV>_ 前缀注入 job env（prod 与 pre 是各自独立的实例）。
     assert "PROD_REDIS_HOST" in source and "PRE_REDIS_HOST" in source
 
 
@@ -710,10 +615,11 @@ def test_monitor_reads_memory_from_info_not_config():
     assert "INFO memory" in source
 
 
-def test_monitor_checks_all_four_documented_signals():
+def test_monitor_checks_persistence_and_memory_signals():
+    # 无离线备份后监控只剩两维：持久化写状态 + 内存水位。
     source = REDIS_MONITOR_WF.read_text()
     assert "rdb_last_bgsave_status" in source
     assert "aof_last_write_status" in source
     assert "used_memory" in source
-    # 快照新鲜度阈值：1h 周期 + 一次失败的余量 = 2h
-    assert "7200" in source
+    # gateway passthrough 必须发 SNI，否则健康的 Redis 被误报 eof。
+    assert "--sni" in source

@@ -1,6 +1,6 @@
 #!/bin/sh
 # deploy/redis/entrypoint-wrapper.sh — 校验 → TLS 材料 → 机密配置 → 启动。
-# fail-closed：缺任何必需机密就退出，绝不降级成明文或无备份运行。
+# fail-closed：缺任何必需机密就退出，绝不降级成明文运行。
 set -eu
 
 # 材料落盘路径可覆盖，默认值与线上一致——测试借此把落盘目标
@@ -15,18 +15,6 @@ fatal() { echo "[redis-init] FATAL: $*" >&2; exit 1; }
 [ -n "${REDIS_TLS_CERT_B64:-}" ]  || fatal "REDIS_TLS_CERT_B64 not set"
 [ -n "${REDIS_TLS_KEY_B64:-}" ]   || fatal "REDIS_TLS_KEY_B64 not set"
 [ -n "${REDIS_MAXMEMORY:-}" ]     || fatal "REDIS_MAXMEMORY not set"
-
-# 备份 fail-closed：配了目的地就必须有加密公钥，绝不把明文快照推出 TEE。
-# （对应 PG 的 entrypoint-wrapper.sh「修正 4」。）
-if [ -n "${REDIS_BACKUP_S3_PREFIX:-}" ]; then
-    [ -n "${REDIS_BACKUP_AGE_RECIPIENT:-}" ] \
-        || fatal "REDIS_BACKUP_S3_PREFIX set but REDIS_BACKUP_AGE_RECIPIENT missing — refusing to ship plaintext snapshots"
-    echo "${REDIS_BACKUP_AGE_RECIPIENT}" | grep -Eq '^age1[0-9a-z]{58}$' \
-        || fatal "REDIS_BACKUP_AGE_RECIPIENT is not a valid age public key"
-    echo "[redis-init] backups configured (age-encrypted → ${REDIS_BACKUP_S3_PREFIX})"
-else
-    echo "[redis-init] WARNING: backups NOT configured — acceptable only for local/scratch" >&2
-fi
 
 # --- TLS 材料落盘 ---
 # busybox 的 `base64 -d` 对非法输入照样 exit 0（只把随机字节写进文件），
@@ -90,7 +78,7 @@ umask 077
 } > "${REDIS_CONF_DIR}/secret.conf"
 umask 022
 
-# --- sidecar 的 socket 目录（共享 volume 挂载点）---
+# --- healthcheck 的 unix socket 目录（共享 volume 挂载点）---
 mkdir -p "${REDIS_RUN_DIR}"
 
 # 官方镜像以 root 启动、由 docker-entrypoint.sh 降权到 redis 用户运行，

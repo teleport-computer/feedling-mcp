@@ -617,289 +617,143 @@ CVM 磁盘创建时定死、事后扩容麻烦，故按「未来可能指向 pro
 （RDS 实例分配磁盘无法从本地 aws cli 查——RDS 在另一 AWS 账号下，当前 IAM 用户
 无权 describe。sizing 以上述实测逻辑数据量为准，不依赖 RDS 分配值。）
 
-## TEE Redis — 待开通（test + pre + prod）
+
+## TEE Redis（test + pre + prod）
 
 设计文档 `docs/superpowers/specs/2026-07-24-tee-redis-cvm-design.md`，
 实施计划 `docs/superpowers/plans/2026-07-24-tee-redis-cvm.md`。
 
-**当前状态**：代码已就绪，三台 CVM 尚未开通（三个 `deploy/*-redis-cvm-id.txt`
-仍是纯注释 → `redis-deploy` workflow 会 fail-closed 拒绝运行，这是刻意的）。
-**当前零流量**：没有任何业务代码引用 Redis，接入各自另开 spec。
+**当前状态**：三台 CVM 已开通、running，冒烟 ALL GREEN，**零业务流量**
+（没有任何业务代码引用 Redis，接入各自另开 spec）。CVM id 已写进
+`deploy/*-redis-cvm-id.txt`，日常更新走 `redis-deploy.yml`。
+
+**⚠️ 无离线备份是刻意的设计，不是遗漏。** Redis 在本架构里是**纯临时层**：
+缓存、队列/唤醒总线、分布式锁——三类用途的数据全部可从 Postgres 重建
+（**PG 始终是权威源**）。而且恢复一份旧快照对锁/队列**有害**：会复活早已
+释放的锁、早已消费的队列项。所以：不推 R2、不做 age 加密、不托管备份密钥、
+没有 restore 演练。CVM 内保留 **AOF**（`appendonly yes`），仅用于**软重启不掉
+数据**；数据整卷丢失时，正确处置就是让 Redis 空启动、从 PG 自然回暖。
 
 | | test | pre | prod |
 |---|---|---|---|
 | CVM 名 | `feedling-redis-test` | `feedling-redis-pre` | `feedling-redis-prod` |
+| CVM id | `169fc911-…` | `819f646f-…` | `8ebbbddb-…` |
 | Phala 账号 | `amiller-user` | `amiller-user` | **`sxysun`** |
+| 节点 | prod9（node-id **18**） | prod9（18） | prod9（18） |
 | 规格 | 1 vCPU / 2 GB / 20 GB | 1 vCPU / 2 GB / 20 GB | 2 vCPU / 4 GB / 30 GB |
 | `maxmemory` | 1 GB | 1 GB | 2560 MB |
 | Phala API key secret | `TEST_PHALA_CLOUD_API_KEY` | `TEST_PHALA_CLOUD_API_KEY` | `PHALA_CLOUD_API_KEY` |
 | 机密 secret 前缀 | `TEST_REDIS_*` | `PRE_REDIS_*` | `PROD_REDIS_*` |
 | 身份模型 | `--kms phala`（无链上 AppAuth） | 同左 | 同左 |
 | 部署分支 | `test` | `pre` | `main` |
-| R2 前缀 | `test/redis/` | `pre/redis/` | `prod/redis/` |
-| R2 凭证来源 | 复用 `TEST_PG_BACKUP_R2_*` | 复用 `TEST_PG_BACKUP_R2_*` | 复用 `PROD_PG_BACKUP_R2_*` |
-| 监控 | 不监控（数据可弃） | ✅ | ✅ |
+| 离线备份 | 无（刻意） | 无 | 无 |
+| 监控 | 不监控（数据可弃） | ✅ 持久化+内存 | ✅ 持久化+内存 |
 
-R2 桶复用 PG 备份的 `io-in-enclave-db`（`deploy/docker-compose.phala.redis.yaml`
-里 `REDIS_BACKUP_BUCKET` 默认值），靠前缀隔离，**没有新建 R2 凭证** ——
-`redis-deploy.yml` 直接把 `TEST_PG_BACKUP_R2_*` / `PROD_PG_BACKUP_R2_*`
-三个既有 secret 注入成 `<PREFIX>_REDIS_BACKUP_R2_*`（见该 workflow「Deploy」
-步骤的 env 块）。**R2 token 的 scope 必须覆盖新前缀**（`io-user-attachments`
-那边踩过 token scope 不够导致 PUT `AccessDenied` 的坑——开通前找持有 R2
-token 权限的人确认三个新前缀已在 scope 内，而不是等第一次备份失败才发现）。
+每环境需要的 GitHub secret：`<PREFIX>_REDIS_PASSWORD`、
+`<PREFIX>_REDIS_TLS_CERT_B64`、`<PREFIX>_REDIS_TLS_KEY_B64`
+（`redis-deploy.yml` 用）。监控用的 `<PREFIX>_REDIS_HOST`、
+`<PREFIX>_REDIS_CA_B64` 另加（prod/pre 才需要，test 不监控）。
+**不再需要任何 R2 / age 备份相关 secret。**
 
-需要新建的 GitHub secret 只有每环境这 4 个（其余都是复用 Phala token /
-R2 凭证）：`<PREFIX>_REDIS_PASSWORD`、`<PREFIX>_REDIS_TLS_CERT_B64`、
-`<PREFIX>_REDIS_TLS_KEY_B64`、`<PREFIX>_REDIS_BACKUP_AGE_RECIPIENT`
-（`<PREFIX>` = `TEST` / `PRE` / `PROD`）。监控用的
-`<PREFIX>_REDIS_HOST`、`<PREFIX>_REDIS_CA_B64` 另加（见下面 runbook 第 10 步）。
+### 首次开通 / 重新开通 runbook（每环境各跑一遍，不走 workflow）
 
-### 首次开通 runbook（每环境各跑一遍，不走 workflow）
+> `redis-deploy.yml`（日常部署）负责构建/推送 redis 镜像、把 `REPLACE_SHA`
+> 换成真实 tag、再 `phala deploy --cvm-id <既有id>` 原地更新——但它读
+> `deploy/<env>-redis-cvm-id.txt` 校验 cvm-id 非空后才敢跑（fail-closed，
+> 绝不静默新建 CVM）。首次开通时该文件还是纯注释，所以下面第 4/5 步手动
+> 把 workflow 做的事各做一遍。
 
-> `redis-deploy.yml`（日常部署）平时负责构建/推送两个镜像、把
-> `REPLACE_SHA` 换成真实 tag、再 `phala deploy --cvm-id <既有id>` 原地
-> 更新——但它读 `deploy/<env>-redis-cvm-id.txt` 校验 cvm-id 非空后才敢跑
-> （fail-closed，绝不静默新建 CVM）。首次开通时这个文件还只是纯注释，
-> 所以下面第 5/6 步得手动把 workflow 做的这几件事各做一遍：构建推送镜像、
-> 钉 tag、**用 `phala deploy`（不带 `--cvm-id`）一步创建并部署 CVM**——
-> 装 CLI 后 `phala cvms create --help` 顶行标着
-> `[DEPRECATED] (use "phala deploy" instead)`，`docs/TEE_POSTGRES_SHADOW_PROVISIONING.md`
-> §2.3 走的也是这条路，本 runbook 照抄同一形态。
-
-1. **切 Phala profile**：test/pre 用 miller 的；**prod 必须先切到 `sxysuns` profile**
-   （最容易忘的一步）。
-   ```bash
-   PROFILE="填入 amiller-user 或 sxysuns 对应的 profile 名"   # 只有这一行需要手改，拿不准用 phala profiles 查
-   phala switch "$PROFILE"
-   ```
+1. **切 Phala profile**：test/pre 用 miller 的；**prod 必须先切到 `sxysuns`
+   profile**（最容易忘的一步）。`phala switch "$PROFILE"`。
 2. `deploy/redis/gen-certs.sh feedling-redis-<env> <outdir>` 生成 TLS 材料。
    **`ca.key` 立即移到离线冷存**，`server.crt`/`server.key` 走 base64 填进
-   `<PREFIX>_REDIS_TLS_CERT_B64` / `<PREFIX>_REDIS_TLS_KEY_B64` secret
-   （脚本自己会打印这两个可直接粘贴的值）。重跑这个脚本前如果输出目录
-   已经有 `ca.key`/`ca.crt`，脚本会拒绝覆盖——这是刻意的，覆盖 CA 会让它
-   已经签过的证书全部失效。
-3. 生成 age 密钥对：`age-keygen -o <env>-redis-backup.key`。**私钥离线冷存**
-   （按 PG 的「内容钥 + 备份钥」双钥托管流程分存），公钥填进
-   `<PREFIX>_REDIS_BACKUP_AGE_RECIPIENT` secret。
-4. 口令：`openssl rand -hex 32` → `<PREFIX>_REDIS_PASSWORD`。
-   **必须是十六进制**：引号 / `$` / 反引号会破坏 compose env 注入。
-5. **构建 + 推送镜像，把真实 tag 钉进 compose**（`redis-deploy.yml` 首次
-   跑不了——它要读的 cvm-id 文件这时还是空的——这一步是手动做同一件事；
-   形态照抄 `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md` §2.3）：
+   `<PREFIX>_REDIS_TLS_CERT_B64` / `<PREFIX>_REDIS_TLS_KEY_B64`（脚本会打印
+   可直接粘贴的值）。重跑前若输出目录已有 `ca.key`，脚本拒绝覆盖（刻意）。
+3. 口令：`openssl rand -hex 32` → `<PREFIX>_REDIS_PASSWORD`。**必须十六进制**：
+   引号 / `$` / 反引号会破坏 compose env 注入。
+4. **构建 + 推送镜像，把真实 tag 钉进 compose**：
    ```bash
-   IMG_TAG="$(git rev-parse HEAD)"   # 完整 40 位 sha，与 redis-deploy.yml 的 tag 约定一致
-   docker build -f deploy/redis/Dockerfile        -t "ghcr.io/teleport-computer/feedling-redis:${IMG_TAG}"        deploy
-   docker build -f deploy/redis/Dockerfile.backup -t "ghcr.io/teleport-computer/feedling-redis-backup:${IMG_TAG}" deploy
-   GH_USER="填入你的 GitHub 用户名"   # 需要对 teleport-computer 的 GHCR push 权限
+   IMG_TAG="$(git rev-parse HEAD)"
+   # ⚠️ CVM 是 amd64，本机若是 arm64（Apple Silicon）必须显式指定平台，
+   #    否则推上去的镜像 CVM 拉下来起不来。
+   docker build --platform linux/amd64 \
+     -f deploy/redis/Dockerfile -t "ghcr.io/teleport-computer/feedling-redis:${IMG_TAG}" deploy
+   GH_USER="填入你的 GitHub 用户名"
    docker login ghcr.io -u "$GH_USER"
    docker push "ghcr.io/teleport-computer/feedling-redis:${IMG_TAG}"
-   docker push "ghcr.io/teleport-computer/feedling-redis-backup:${IMG_TAG}"
 
-   ENV_NAME=test   # 换成 pre / prod，只有这一行需要手改
+   ENV_NAME=test   # 换成 pre / prod
    sed -e "s|feedling-redis:REPLACE_SHA|feedling-redis:${IMG_TAG}|" \
-       -e "s|feedling-redis-backup:REPLACE_SHA|feedling-redis-backup:${IMG_TAG}|" \
        deploy/docker-compose.phala.redis.yaml > "compose.redis-${ENV_NAME}.yaml"
    ```
-   （`compose.redis-<env>.yaml` 只是本地工作文件，不提交——仓库里
-   `deploy/docker-compose.phala.redis.yaml` 继续留着 `REPLACE_SHA`，日常
-   更新交给 `redis-deploy.yml` 自己 sed。）
-6. **建 CVM + 首次部署，一条命令做完**（`phala deploy` 不带 `--cvm-id` 即
-   为新建；`--kms phala` 走 Phala 默认 KMS 按部署账号授权，redis CVM
-   **不需要链上 AppAuth**，与 TEE Postgres 同，见
+   （`compose.redis-<env>.yaml` 是本地工作文件，不提交；仓库里的 compose
+   继续留 `REPLACE_SHA`，日常更新交给 workflow 自己 sed。）
+
+   **⚠️ GHCR 包必须 public**：dstack CVM 匿名拉镜像，包是 private 会
+   `unauthorized`。首次推送后到 GitHub Packages 把 `feedling-redis` 设为
+   public，且**有分钟级传播延迟**——用匿名 `curl` 拉一次 manifest 确认
+   HTTP 200 再往下部署，别等 CVM 拉失败才发现。
+
+5. **建 CVM + 首次部署**（`phala deploy` 不带 `--cvm-id` 即为新建；`--kms
+   phala` 按部署账号授权，redis CVM **不需要链上 AppAuth**，见
    `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md` §0——**切勿复用主 app 的
-   AppAuth 合约**，那会翻掉主 enclave 的钥，教训见本文件「新建 runner
-   CVM 换掉主 enclave 钥」条目。`--instance-type` 与上表规格的对应关系
-   已用装好的 CLI `phala instance-types cpu` 核实：`tdx.small` = 1 vCPU /
-   2 GB，`tdx.medium` = 2 vCPU / 4 GB）：
+   AppAuth 合约**，会翻掉主 enclave 的钥，见本文件「新建 runner CVM 换掉
+   主 enclave 钥」条目）：
    ```bash
+   # ⚠️ --node-id 18：feedling 的 gateway passthrough 基础设施只在 prod9
+   #    的 node 18 上配好了。落到别的节点（如 prod7 = node 12）CVM 能起、
+   #    但 <app-id>-6379s 的 gateway 路由不通，冒烟恒 SSL eof。
    phala deploy --name "feedling-redis-${ENV_NAME}" --compose "compose.redis-${ENV_NAME}.yaml" \
-     --kms phala --instance-type tdx.small --disk-size 20G \
-     -e "REDIS_PASSWORD=<第 4 步生成的口令>" \
-     -e "REDIS_TLS_CERT_B64=<第 2 步 gen-certs.sh 打印的值>" \
-     -e "REDIS_TLS_KEY_B64=<第 2 步 gen-certs.sh 打印的值>" \
-     -e "REDIS_MAXMEMORY=1gb" \
-     -e "REDIS_BACKUP_S3_PREFIX=${ENV_NAME}/redis/" \
-     -e "REDIS_BACKUP_AGE_RECIPIENT=<第 3 步 age-keygen 打印的公钥>" \
-     -e "REDIS_BACKUP_R2_ENDPOINT=<复用 PG 备份的 R2 endpoint>" \
-     -e "REDIS_BACKUP_R2_ACCESS_KEY_ID=<复用 PG 备份的 R2 access key>" \
-     -e "REDIS_BACKUP_R2_SECRET_ACCESS_KEY=<复用 PG 备份的 R2 secret key>" \
-     --wait
+     --kms phala --node-id 18 --instance-type tdx.small --disk-size 20G \
+     -e "REDIS_PASSWORD=<第 3 步口令>" \
+     -e "REDIS_TLS_CERT_B64=<第 2 步值>" \
+     -e "REDIS_TLS_KEY_B64=<第 2 步值>" \
+     -e "REDIS_MAXMEMORY=1gb"
    # prod 换成 --instance-type tdx.medium --disk-size 30G、REDIS_MAXMEMORY=2560mb。
-   # 记下输出里的 CVM ID 与 App ID —— 下一步和后面冒烟/restore 演练都要用。
+   # 记下输出里的 CVM ID 与 App ID。
    ```
-7. 把上一步输出的 `cvm_id` 写进 `deploy/<env>-redis-cvm-id.txt` 并提交
-   （之后 `redis-deploy.yml` 的日常更新才认得到这台 CVM）。
-8. 冒烟（占位值先设成变量——直接把 app_id 写进命令行时 `<` `>` 会被
-   shell 当成重定向）：
+   **⚠️ 本地 `phala deploy` 不要加 `--wait`**（会挂在轮询上）；部署后 CVM 可能
+   停在 `stopped`（dstack 首建的怪癖）——`phala cvms start <id>` 手动拉起。
+   **gateway 注册有 ~30 分钟延迟**：CVM running 后 `<app-id>-6379s` 的路由不会
+   立刻通，冒烟先 eof 属正常，等一会再试。
+
+6. 把 `cvm_id` 写进 `deploy/<env>-redis-cvm-id.txt` 并提交（之后 workflow
+   的日常更新才认得到这台 CVM）。
+7. 冒烟：
    ```bash
-   APP_ID="填入本环境 app_id"          # 只有这一行需要手改
+   APP_ID="填入本环境 app_id"
    REDIS_HOST="${APP_ID}-6379s.dstack-pha-prod9.phala.network"
-   read -rs REDIS_PW                   # 交互输入，不进 shell history
+   read -rs REDIS_PW
    REDIS_CA_FILE=./ca.crt REDISCLI_AUTH="$REDIS_PW" \
      ./deploy/verify-redis.sh "$REDIS_HOST" 443
    ```
    期望最后一行 `[verify] ALL GREEN`。
-9. **restore 演练（硬 gate，不做完不算开通）**：本地先跑
-    `./deploy/redis/e2e-drill.sh` 把整条链路（写入 → 快照 → 加密 → 上传 →
-    下载 → 解密 → 校验 RDB 魔数）在本地过一遍；再对着**真实环境的 R2 前缀**
-    重放一次 `restore.sh`，确认离线身份文件真的能解密这个环境实际推上去
-    的快照（本地 drill 用的是本地生成的 age 身份，验证不了「离线冷存的这
-    把私钥能不能用」这件事，必须单独补这一步）。
+   **⚠️ 客户端必须发 SNI**：gateway passthrough 靠 TLS ClientHello 的 SNI
+   路由到后端 CVM。`redis-cli --tls` 默认不发 SNI，gateway 找不到后端、握手时
+   直接关连接，看到的是 `unexpected eof`。`verify-redis.sh` 与 `redis-monitor.yml`
+   都已带 `--sni <完整 gateway 主机名>`；任何将来的应用客户端连这个 gateway
+   也必须发 SNI。
+8. 把 `<app-id>-6379s.…` 主机名填进 `<PREFIX>_REDIS_HOST`、`ca.crt` 的
+   base64 填进 `<PREFIX>_REDIS_CA_B64`（`redis-monitor` 要用；prod/pre 才需要）。
+9. 手动触发一次 `redis-monitor` workflow，确认全绿。
 
-    `backup` 服务刻意不挂 `redisdata` 卷（快照走 `redis-cli --rdb`，sidecar
-    从不直接读卷内文件，见 `deploy/redis/backup-push.sh` 的 D4 注释）。因此
-    `restore.sh` 不是进现有容器里跑，而是从 `feedling-redis-backup` 镜像
-    另起一个一次性容器，显式挂上 `redisdata` 卷和离线身份文件。
+### 恢复（无离线备份 → 从 PG 回暖）
 
-    **⚠️先停生产 `redis` 服务，并确认它真的停了——这一步必须排在下面任何
-    命令挂载 `redisdata` 卷之前，顺序不能反**：这台 CVM 上的 `redis`
-    服务这时如果还在跑，它自己的定时 `save` 触发的 BGSAVE 会拿它当前
-    （空的，或者是故障前残留的）数据集去覆盖你即将恢复出来的
-    `dump.rdb`——这正是下面「AOF 会抢占加载」那段解释的同一个覆盖机制，
-    只是这次由还在运行的生产容器自己触发；`redis-aof-repair` 临时容器
-    同样会跟一个仍在写入的生产容器共享同一份 `/data`，谁的写落在后面纯
-    属运气。这台 CVM 上跑：
+Redis 整卷丢失 / 实例报废时**没有快照可 restore**，也不需要。正确处置：
 
-    ```bash
-    # docker compose 项目名 feedling-redis + 服务名 redis 的默认容器名，
-    # 拿不准就用 phala ps <APP_ID> 或 docker ps 核实实际名字。
-    docker stop feedling-redis-redis-1
-    # 确认已经停了——期望没有任何一行输出；看到 "Up ..." 状态说明还没
-    # 停干净，不要往下走。
-    docker ps --filter name=feedling-redis-redis-1 --format '{{.Names}} {{.Status}}'
-    ```
+- **软重启 / 容器重建**：卷还在 → AOF 自动加载，数据不掉，无需干预。
+- **整卷丢失 / 换 CVM**：Redis 空启动即可，让上层从 PG 重新填缓存 / 重放
+  队列（PG 是权威源）。首次回暖会有一段 PG 读压上升，零流量期无影响；
+  将来接入时每个 spec 的前置条件里都写明「Redis 冷启动可容忍」。
 
-    确认停妥之后才继续：
-
-    ```bash
-    # 用当前 Dockerfile.backup 在本地重建同一份镜像（不确定线上具体
-    # tag 时最简单可靠的做法；context 必须是 deploy/，同 CI 的构建方式）：
-    docker build -f deploy/redis/Dockerfile.backup -t feedling-redis-backup:local deploy
-
-    ENV_NAME="填入本环境：test / pre / prod"        # 只有这几行需要手改
-    IDENTITY_FILE="填入离线冷存身份文件的本地路径"
-    VOLUME_NAME="feedling-redis_redisdata"           # compose 默认命名；
-                                                      # 拿不准就在 CVM 上
-                                                      # docker volume ls | grep redisdata 核实
-    R2_ENDPOINT="填入本环境 R2 endpoint（同 REDIS_BACKUP_R2_ENDPOINT secret 的值）"
-    R2_ACCESS_KEY_ID="填入本环境 R2 access key"
-    R2_SECRET_ACCESS_KEY="填入本环境 R2 secret key"
-
-    docker run --rm \
-      -v "${VOLUME_NAME}:/data" \
-      -v "${IDENTITY_FILE}:/id.txt:ro" \
-      -e REDIS_BACKUP_AGE_IDENTITY_FILE=/id.txt \
-      -e REDIS_BACKUP_BUCKET=io-in-enclave-db \
-      -e REDIS_BACKUP_S3_PREFIX="${ENV_NAME}/redis/" \
-      -e AWS_ENDPOINT_URL="${R2_ENDPOINT}" \
-      -e AWS_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID}" \
-      -e AWS_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY}" \
-      -e AWS_REGION=auto \
-      -e AWS_DEFAULT_REGION=auto \
-      --entrypoint restore.sh feedling-redis-backup:local
-    ```
-
-    （`AWS_REGION` / `AWS_DEFAULT_REGION` 必须都设成 `auto`：backup 镜像
-    没内置任何 AWS 配置，aws CLI 在客户端侧校验 region 时不认
-    `--endpoint-url` 指向的是 R2，缺这两个变量会在发出请求前就报一个
-    与 R2/网络无关的签名错误——同 `redis-monitor.yml`、`backup` 服务、
-    `e2e-drill.sh` 里的同一条注释。）
-
-    省略末尾的 object key 参数会自动列出该前缀下全部快照并取最新一份
-    （key 形如 `redis-20260724T110000Z.rdb.age`，字典序=时间序）。脚本会
-    把解出的 RDB 写到卷内的 `dump.rdb`。
-
-    **⚠️AOF 会抢占加载，而且比"清掉 appendonlydir/ 就行"要棘手得多**：
-    `redis.conf` 里 `appendonly yes` 是硬编码的（不可改，见下方「已知
-    限制」）。只要目标卷里没有 `appendonlydir/`——不管是因为它本来就没
-    有，还是被人清空过——Redis 8 在 `appendonly yes` 下走的都是"AOF 为
-    空 = 数据集为空"这条路径，**根本不会去看 `dump.rdb`**。已用本仓
-    pinned image（`redis:8-alpine@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005`）
-    配这份真实 `redis.conf` 实测复现：卷内只有刚恢复出的 `dump.rdb`、没有
-    `appendonlydir/` 时启动生产容器，日志打 `BGSAVE done, 0 keys saved`，
-    `DBSIZE` 是 0——**恢复被无声吞掉，且下一轮定时 `save` 触发的 BGSAVE
-    还会把这份空快照写回去覆盖掉 `dump.rdb`**，之后连重试都没有原始数据
-    可用了。也就是说，「卷本来就是全新的，不用管 `appendonlydir/`」这个
-    判断本身就是错的——全新卷同样必须走下面这套转换步骤。
-
-    教科书式修法（先用 `appendonly no` 起服务让 RDB 加载，再
-    `CONFIG SET appendonly yes` 让 Redis 用内存里的数据重建 AOF）在这台
-    机器上也用不了：`redis.conf` 用 `rename-command CONFIG ""` 把 `CONFIG`
-    命令禁掉了（`redis-monitor` 的 monitor 测试断言它必须保持禁用，见下方
-    「已知限制」），生产容器里发不出 `CONFIG SET`。直接换一种思路——用
-    **不带这层加固的临时容器**（就是 `e2e-drill.sh` 校验环节用的同一个
-    裸官方 pinned image，不是 `feedling-redis` 镜像）把 `dump.rdb` 转成
-    合法 AOF，再把卷交还给生产容器。**这套顺序已经用本仓 pinned image +
-    真实 `redis.conf` 端到端跑通**（51 个已知 key 的合成数据集，从
-    restore.sh 落盘 → 临时容器转 AOF → 生产容器加载，最终生产容器
-    `DBSIZE=51` 且抽样 key 逐字节一致；生产容器重启第二次依然
-    `DBSIZE=51`，证明落地的是合法持久化而非侥幸的一次性加载）：
-
-    ```bash
-    # 1) 临时容器（无鉴权、无 TLS、CONFIG 未被禁用）挂上同一个 redisdata
-    #    卷（$VOLUME_NAME 沿用上面 restore.sh 那一步已经设好的同一个变量，
-    #    同一个 shell 会话里接着跑，不用重新填），按 restore.sh 刚写好的
-    #    dump.rdb 启动。只用官方 pinned image，不构建/不使用
-    #    feedling-redis 镜像——这是刻意的，生产镜像里的 redis.conf 硬编码
-    #    appendonly yes 且 CONFIG 已被禁用，这两点都是这一步需要绕开的。
-    docker run -d --name redis-aof-repair \
-      -v "${VOLUME_NAME}:/data" \
-      redis:8-alpine@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005 \
-      redis-server --appendonly no --dir /data --dbfilename dump.rdb --save ""
-
-    # 2) 确认 RDB 真的加载进来了——期望值是故障前的已知 key 数，不是 0：
-    docker exec redis-aof-repair redis-cli DBSIZE
-
-    # 3) 用这个临时容器专属的 CONFIG（生产容器里没有这条命令）触发 AOF
-    #    重建，Redis 会用当前内存数据集生成一份新的 base AOF：
-    docker exec redis-aof-repair redis-cli CONFIG SET appendonly yes
-
-    # 4) 等重建真正做完再往下走——没等就关容器会留下不完整的 AOF：
-    docker exec redis-aof-repair redis-cli INFO persistence \
-      | grep -E 'aof_rewrite_in_progress|aof_last_bgrewrite_status'
-    #   必须看到 aof_rewrite_in_progress:0 且 aof_last_bgrewrite_status:ok，
-    #   没达到就再等几秒重查这两行，不要提前进第 5 步。
-
-    # 5) 优雅关闭并清理临时容器（NOSAVE 只是跳过一次多余的 RDB SAVE——
-    #    AOF 已经落盘，这一步不会丢数据；但从这里开始到第 6 步之间不要
-    #    再对这个卷做任何写入）：
-    docker exec redis-aof-repair redis-cli SHUTDOWN NOSAVE
-    docker rm -f redis-aof-repair
-    ```
-
-    跑完这五步，卷里会多出 `appendonlydir/`（`appendonly.aof.<n>.base.rdb`
-    就是转换出来的完整数据集，配一份 `.manifest` 和一份空的
-    `.incr.aof`）。
-
-    **6) 这之后才能启动真正的生产 `redis` 服务**（该环境正常的部署方式——
-    走 `phala deploy` 或本地 `compose up redis`，取决于事故现场）。生产
-    服务会像正常冷启动一样加载这份 AOF（日志会打 `keys loaded: <N>`，`N`
-    应等于上面第 2 步的 `DBSIZE`），全程没有碰过 `rename-command CONFIG ""`
-    这道加固：`CONFIG SET` 从头到尾都是在上面那个临时容器里发的，生产
-    容器完全不需要、也确实用不了 `CONFIG`。
-
-    **7) 验证（必过，不是可选项）**：跑一遍第 8 步冒烟连上生产实例，
-    `DBSIZE` 必须等于故障前的预期 key 数，并额外挑 1-2 个已知业务 key
-    `GET` 出来核对值——**只看容器"起来了"或健康检查过了不能证明数据是
-    对的，这正是这条 runbook 曾经出错的地方（生产配置在这个场景下会正常
-    启动、正常回应 PING，但数据集是空的）**。`DBSIZE` 或抽样值对不上，
-    立即停止宣布恢复完成，回头检查是否跳过了上面第 1-5 步、或步骤 3/4
-    在重建完成前就被打断。
-
-    这一步是硬 gate：没跑通对真实 R2 前缀 + 离线身份文件的恢复，这个环境
-    不算开通完成。
-10. 把 `<app-id>-6379s.…` 主机名填进 `<PREFIX>_REDIS_HOST`、`ca.crt` 的 base64
-    填进 `<PREFIX>_REDIS_CA_B64`（`redis-monitor` workflow 要用；prod/pre 才需要，
-    test 不监控可跳过）。
-11. 手动触发一次 `redis-monitor` workflow，确认全绿。
+绝不要试图「保留旧 RDB 再挂回去」——对锁/队列会复活陈旧状态，是 bug 不是恢复。
 
 ### 已知限制
 
 - **Redis 端口在公网可达**。dstack CVM 之间没有私网，跨 CVM 只能走 gateway
-  passthrough `<app-id>-6379s.…:443`，只靠 TLS + AUTH 保护。TEE Postgres 现在
-  也是这个模型。
-- **`CONFIG` 命令被禁用**：查容量只能 `INFO memory`，不能 `CONFIG GET maxmemory`。
-- **单实例无 HA**：实例故障需人工恢复，RPO ≤1h 由备份保证（小时快照留最近
-  24 份，每日 03:00 UTC 那份额外留 7 天）。
+  passthrough `<app-id>-6379s.…:443`，只靠 TLS + AUTH 保护（同 TEE Postgres）。
+- **`CONFIG` 命令被禁用**：查容量只能 `INFO memory`，不能 `CONFIG GET`。
+- **单实例无 HA、无离线备份**：实例故障 = Redis 数据清零，靠从 PG 回暖（见上）。
+  这是刻意取舍：Redis 不持有任何权威数据。
 - **prod 账号余额**：test 的老 CVM 就是在 `sxysun` 账号下余额耗尽被废弃
-  （2026-06-18，app_id 报废 + 内容钥全换）。多一台 CVM 多一份烧钱速率。
+  （2026-06-18）。多一台 CVM 多一份烧钱速率。

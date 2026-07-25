@@ -1,3 +1,4 @@
 # feedling-redis-test CVM id — 首次开通后填在下一行（去掉注释）。
 # 空文件是刻意的 fail-closed：redis-deploy workflow 读不到 id 就报错退出，
 # 绝不静默新建 CVM（新建 CVM = 换钥事故，见 DEPLOYMENTS.md）。
+169fc911-5513-4929-9436-da6ce9820fea

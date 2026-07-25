@@ -18,7 +18,13 @@ PORT="${2:?usage: verify-redis.sh <host> <port>}"
 # 口令从 REDISCLI_AUTH 读，绝不放 argv（会进 shell history 与进程列表）。
 [ -n "${REDISCLI_AUTH:-}" ]  || fatal "REDISCLI_AUTH not set"
 
-R="redis-cli --tls --cacert ${REDIS_CA_FILE} -h ${HOST} -p ${PORT}"
+# --sni 是必须的，不是可选：dstack gateway 的 <app-id>-<port>s passthrough 靠
+# TLS ClientHello 的 SNI 把连接路由到正确的后端 CVM。redis-cli --tls 默认不发
+# SNI（只把 -h 当连接地址），gateway 因此找不到后端、在 TLS 握手时直接关闭连接，
+# 客户端看到的就是 "unexpected eof while reading"（TCP 通、握手前对端 0 字节）。
+# 实测 2026-07-25：不带 --sni 恒 eof，带上 = PONG。任何消费方（含 redis-monitor
+# 及将来的应用客户端）连这个 gateway 都必须发 SNI = 完整 gateway 主机名。
+R="redis-cli --tls --cacert ${REDIS_CA_FILE} --sni ${HOST} -h ${HOST} -p ${PORT}"
 KEY="__verify_smoke_$(date -u +%s)"
 
 echo "[verify] target ${HOST}:${PORT}"

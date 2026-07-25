@@ -105,20 +105,9 @@ jobs:
           push: true
           tags: ghcr.io/${{ steps.owner.outputs.owner }}/feedling-redis:${{ steps.img.outputs.sha }}
 
-      - name: Build & push backup sidecar image
-        uses: docker/build-push-action@v6
-        with:
-          context: deploy
-          file: deploy/redis/Dockerfile.backup
-          platforms: linux/amd64
-          push: true
-          tags: ghcr.io/${{ steps.owner.outputs.owner }}/feedling-redis-backup:${{ steps.img.outputs.sha }}
-
-      - name: Pin image shas into compose
+      - name: Pin image sha into compose
         run: |
           sed -i -E "s|ghcr\.io/[^/]+/feedling-redis:[A-Za-z0-9_.-]+|ghcr.io/${{ steps.owner.outputs.owner }}/feedling-redis:${{ steps.img.outputs.sha }}|" \
-            deploy/docker-compose.phala.redis.yaml
-          sed -i -E "s|ghcr\.io/[^/]+/feedling-redis-backup:[A-Za-z0-9_.-]+|ghcr.io/${{ steps.owner.outputs.owner }}/feedling-redis-backup:${{ steps.img.outputs.sha }}|" \
             deploy/docker-compose.phala.redis.yaml
           grep -n 'feedling-redis' deploy/docker-compose.phala.redis.yaml
 
@@ -137,24 +126,12 @@ jobs:
           TEST_REDIS_PASSWORD: ${{ secrets.TEST_REDIS_PASSWORD }}
           TEST_REDIS_TLS_CERT_B64: ${{ secrets.TEST_REDIS_TLS_CERT_B64 }}
           TEST_REDIS_TLS_KEY_B64: ${{ secrets.TEST_REDIS_TLS_KEY_B64 }}
-          TEST_REDIS_BACKUP_AGE_RECIPIENT: ${{ secrets.TEST_REDIS_BACKUP_AGE_RECIPIENT }}
-          TEST_REDIS_BACKUP_R2_ENDPOINT: ${{ secrets.TEST_PG_BACKUP_R2_ENDPOINT }}
-          TEST_REDIS_BACKUP_R2_ACCESS_KEY_ID: ${{ secrets.TEST_PG_BACKUP_R2_ACCESS_KEY_ID }}
-          TEST_REDIS_BACKUP_R2_SECRET_ACCESS_KEY: ${{ secrets.TEST_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
           PRE_REDIS_PASSWORD: ${{ secrets.PRE_REDIS_PASSWORD }}
           PRE_REDIS_TLS_CERT_B64: ${{ secrets.PRE_REDIS_TLS_CERT_B64 }}
           PRE_REDIS_TLS_KEY_B64: ${{ secrets.PRE_REDIS_TLS_KEY_B64 }}
-          PRE_REDIS_BACKUP_AGE_RECIPIENT: ${{ secrets.PRE_REDIS_BACKUP_AGE_RECIPIENT }}
-          PRE_REDIS_BACKUP_R2_ENDPOINT: ${{ secrets.TEST_PG_BACKUP_R2_ENDPOINT }}
-          PRE_REDIS_BACKUP_R2_ACCESS_KEY_ID: ${{ secrets.TEST_PG_BACKUP_R2_ACCESS_KEY_ID }}
-          PRE_REDIS_BACKUP_R2_SECRET_ACCESS_KEY: ${{ secrets.TEST_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
           PROD_REDIS_PASSWORD: ${{ secrets.PROD_REDIS_PASSWORD }}
           PROD_REDIS_TLS_CERT_B64: ${{ secrets.PROD_REDIS_TLS_CERT_B64 }}
           PROD_REDIS_TLS_KEY_B64: ${{ secrets.PROD_REDIS_TLS_KEY_B64 }}
-          PROD_REDIS_BACKUP_AGE_RECIPIENT: ${{ secrets.PROD_REDIS_BACKUP_AGE_RECIPIENT }}
-          PROD_REDIS_BACKUP_R2_ENDPOINT: ${{ secrets.PROD_PG_BACKUP_R2_ENDPOINT }}
-          PROD_REDIS_BACKUP_R2_ACCESS_KEY_ID: ${{ secrets.PROD_PG_BACKUP_R2_ACCESS_KEY_ID }}
-          PROD_REDIS_BACKUP_R2_SECRET_ACCESS_KEY: ${{ secrets.PROD_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
         run: |
           UP=$(echo "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')
           pick() { local n="${UP}_$1"; printf '%s' "${!n-}"; }
@@ -162,13 +139,10 @@ jobs:
           # 非机密的按环境派生值。maxmemory 见 spec 第 2 节：只吃掉一半物理内存，
           # 给 BGSAVE 的 fork + copy-on-write 留余量。
           if [ "$ENVIRONMENT" = "prod" ]; then MAXMEM=2560mb; else MAXMEM=1gb; fi
-          PREFIX="${ENVIRONMENT}/redis/"
 
           # 原地更新必须重带整份机密，漏一个就被清空 → entrypoint fail-closed
           # 起不来。先整份校验再动 CVM。
-          VARS="REDIS_PASSWORD REDIS_TLS_CERT_B64 REDIS_TLS_KEY_B64
-                REDIS_BACKUP_AGE_RECIPIENT REDIS_BACKUP_R2_ENDPOINT
-                REDIS_BACKUP_R2_ACCESS_KEY_ID REDIS_BACKUP_R2_SECRET_ACCESS_KEY"
+          VARS="REDIS_PASSWORD REDIS_TLS_CERT_B64 REDIS_TLS_KEY_B64"
           missing=0
           for v in $VARS; do
             [ -n "$(pick "$v")" ] || { echo "::error::MISSING secret: ${UP}_${v}"; missing=1; }
@@ -181,7 +155,6 @@ jobs:
           ENVFILE=$(mktemp); chmod 600 "$ENVFILE"
           for v in $VARS; do printf '%s=%s\n' "$v" "$(pick "$v")" >> "$ENVFILE"; done
           printf 'REDIS_MAXMEMORY=%s\n' "$MAXMEM" >> "$ENVFILE"
-          printf 'REDIS_BACKUP_S3_PREFIX=%s\n' "$PREFIX" >> "$ENVFILE"
 
           npm install -g phala@1.1.19
           phala deploy --api-token "$TOKEN" --cvm-id "$CVM_ID" \
@@ -213,4 +186,4 @@ jobs:
           if status != 'running':
               sys.exit(f'CVM 未回到 running: {status}')
           PY
-          echo "提醒：sidecar 的首次快照在容器起来后立即推（boot 兜底），之后每小时一次；由 redis-monitor 的 2h 陈旧断言把关。"
+          echo "提醒：无离线备份是刻意的（Redis 为纯临时层，PG 是权威源）；由 redis-monitor 盯持久化写状态与内存水位。"
