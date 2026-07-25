@@ -700,6 +700,21 @@ def _identity_write_payload_v2(ns) -> dict | None:
         if value is not None:
             patch[field] = value
 
+    # relationship_days:重新校准"和用户认识/相处多少天"。days_with_user 是服务端从
+    # 关系起始锚点现算的派生值,不是普通字符串字段,所以单独处理:塞进同一个
+    # profile_patch,服务端把锚点挪到 today - N(见
+    # backend/identity/actions.py::_resolve_relationship_anchor)。报错前置:非负整数,
+    # 服务端 card_policy 也会拦(relationship_days_must_be_non_negative_int /
+    # relationship_days_out_of_range),这里先给个清晰的本地错、不打服务端。
+    rel_days = getattr(ns, "relationship_days", None)
+    if rel_days is not None:
+        if rel_days < 0:
+            raise _IdentityWritePrecheckError({
+                "ok": False, "error": "relationship_days_must_be_non_negative_int",
+                "hint": "相处天数必须是非负整数(0 = 今天刚认识)",
+            })
+        patch["relationship_days"] = rel_days
+
     # D4 改名成对: agent_name 变了必须同批带 self_introduction,否则显示名和自我
     # 介绍对不上("小满" vs 介绍里还叫"小美")。报错文案与服务端
     # card_policy.validate_rename_pairing 的 hint 一字不差,前端拦下和服务端拦下
@@ -1443,7 +1458,7 @@ def main():
     iw = sub.add_parser(
         "identity-write",
         help="Patch the agent's identity card — 9 string fields + 4 list fields "
-             "(add/remove/replace) + 七维 nudge (spec 3.1).",
+             "(add/remove/replace) + relationship_days 相处天数校准 + 七维 nudge (spec 3.1).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "写卡规则(spec 3.1,详见 io_cli identity-read 拿到的卡结构):\n"
@@ -1452,6 +1467,9 @@ def main():
             "    只留给蒸馏任务专用通道,这条命令不提供整卡覆盖。\n"
             "  D4 改名成对: --agent-name 必须和 --self-introduction 同批给出(介绍不用\n"
             "    变就原样带回旧的),否则本地直接报错拦下,不会打到服务端。\n"
+            "  相处天数: --relationship-days N 重新校准 days_with_user(N 非负整数,0=今天\n"
+            "    刚认识)——用户明确要求改'相处/认识多少天'时用。days_with_user 是服务端从\n"
+            "    关系起始锚点现算的,这条把锚点挪到 today-N;负数/超上限本地或服务端拦下。\n"
             "  list 三操作: 每个 list 字段(signature/boundary/do-not-say/\n"
             "    stable-definition)一次调用只能用一种操作——legacy 整体赋值(仅\n"
             "    --signature 保留)/ --add-* / --remove-* / --replace-* 四选一,混用报错。\n"
@@ -1481,6 +1499,10 @@ def main():
                     help="回复使用的语言偏好")
     iw.add_argument("--relationship-anchor", dest="relationship_anchor", default=None,
                     help="关系锚点描述文本")
+    iw.add_argument("--relationship-days", dest="relationship_days", type=int, default=None,
+                    help="重新校准和用户相处/认识的天数(非负整数,0=今天刚认识)。"
+                         "用户明确要求改'相处天数/在一起多久了'时用:服务端据此把关系"
+                         "起始日挪到 today-N,days_with_user 从该锚点现算。只在明确要求时改")
 
     iw.add_argument("--signature", action="append", default=[],
                     help="[legacy] 整体替换签名短语列表;repeatable;"
