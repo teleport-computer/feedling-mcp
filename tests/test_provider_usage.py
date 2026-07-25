@@ -131,7 +131,9 @@ def test_openrouter_full(monkeypatch):
     assert p["status"] == "ok"
     assert p["metrics"]["balance"]["amounts"] == [{"amount": 52.491, "unit": "USD"}]
     assert p["metrics"]["balance"]["scope"] == "account"
-    assert p["metrics"]["remaining"] == {"status": "ok", "amount": 97.13, "unit": "USD", "scope": "api_key"}
+    # OpenRouter 的 limit_remaining 是自设消费上限、非账户余额，会与「余额」并排误导，
+    # 故不再展示 → 恒为 unsupported（中转站的 remaining 语义不同，另测保留）。
+    assert p["metrics"]["remaining"]["status"] == "unsupported"
     assert p["metrics"]["usage_today"] == {"status": "ok", "amount": 0.053, "unit": "USD", "timezone": "UTC"}
     assert p["metrics"]["usage_month"]["amount"] == 52.907
     assert p["metrics"]["usage_total"]["status"] == "unsupported"
@@ -148,7 +150,7 @@ def test_openrouter_partial_failure(monkeypatch):
     assert p["status"] == "partial"
     assert p["metrics"]["balance"]["status"] == "failed"
     assert p["metrics"]["balance"]["reason"] == "usage_http_500"
-    assert p["metrics"]["remaining"]["status"] == "unsupported"  # limit_remaining null → 无限额
+    assert p["metrics"]["remaining"]["status"] == "unsupported"  # OpenRouter 不再展示 key 限额
     assert p["metrics"]["usage_today"]["status"] == "ok"
 
 

@@ -179,13 +179,15 @@ async def _query_openrouter(client, config, metrics):
         else:
             metrics["balance"] = _metric("failed", reason="usage_bad_response")
     if key_err:
-        for k in ("remaining", "usage_today", "usage_month"):
+        for k in ("usage_today", "usage_month"):
             metrics[k] = _metric("failed", reason=key_err)
     else:
         d = key.get("data") or {}
-        lr = _num(d.get("limit_remaining"))
-        metrics["remaining"] = (_metric("ok", amount=lr, unit="USD", scope="api_key")
-                                if lr is not None else _metric("unsupported"))
+        # limit_remaining 是「本 key 自设消费上限还剩多少」，和上面的账户余额是两个
+        # 概念：上限常被设得比账户实际余额高，并排显示会让人误以为「还能花这么多」。
+        # 账户余额才是硬底线，所以 OpenRouter 不再吐 remaining（留 unsupported）。
+        # 注意：中转站(_query_relay)的 remaining 是账户真实剩余额度、不是自设上限，
+        # 那个仍然保留——同名字段两家语义不同。
         ud, um = _num(d.get("usage_daily")), _num(d.get("usage_monthly"))
         metrics["usage_today"] = (_metric("ok", amount=ud, unit="USD", timezone="UTC")
                                   if ud is not None else _metric("failed", reason="usage_bad_response"))
