@@ -178,10 +178,10 @@ jobs:
         run: |
           mapfile -t consumer_tests < <(
             grep -l -E \
-              'tools\.chat_resident_consumer|chat_resident_consumer as|import chat_resident_consumer|from tools import chat_resident_consumer' \
+              'tools\.chat_resident_consumer|chat_resident_consumer as|import chat_resident_consumer|from tools import chat_resident_consumer|chat_resident_consumer\.py' \
               tests/test_*.py | sort
           )
-          if (( ${#consumer_tests[@]} < 20 )); then
+          if (( ${#consumer_tests[@]} < 30 )); then
             echo "resident consumer test discovery unexpectedly found only ${#consumer_tests[@]} files"
             exit 1
           fi
