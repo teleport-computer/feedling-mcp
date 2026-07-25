@@ -34,7 +34,12 @@ def _wire(monkeypatch, *, frames, last_frame_id, chat_msgs, should_wake):
         lambda uid: types.SimpleNamespace(chat_messages=list(chat_msgs)))
     monkeypatch.setattr(
         serve_worker, "_wake_decision_for_user",
-        lambda uid: {"should_wake": should_wake, "wake_interval_sec": 7200, "block_reason": ""})
+        lambda uid, trigger="heartbeat": {
+            "should_wake": should_wake,
+            "wake_interval_sec": 7200,
+            "block_reason": "",
+        },
+    )
 
     enqueue_calls, notify_calls, upsert_calls = [], [], []
     monkeypatch.setattr(
@@ -108,6 +113,33 @@ def test_blocked_proactive_gate_never_enqueues(monkeypatch):
     uid, kw = upsert[0]
     assert kw["next_screen_watch_at"] == _NOW + screen_watch.INTERVAL_SEC
     assert "last_screen_watch_frame_id" not in kw
+
+
+def test_screen_watch_producer_asks_the_screen_watch_oracle(monkeypatch):
+    """The producer must not accidentally ask the heartbeat-only consent question."""
+    seen_triggers = []
+    enqueue, notify, _upsert = _wire(
+        monkeypatch,
+        frames=[{"filename": "frameNEW.env.json", "ts": _NOW, "app": None}],
+        last_frame_id="frameOLD",
+        chat_msgs=[{"role": "user", "ts": _NOW - 1000}],
+        should_wake=True,
+    )
+    monkeypatch.setattr(
+        serve_worker,
+        "_wake_decision_for_user",
+        lambda uid, trigger="heartbeat": seen_triggers.append(trigger)
+        or {
+            "should_wake": False,
+            "wake_interval_sec": 7200,
+            "block_reason": "screen_watch_disabled",
+        },
+    )
+
+    assert serve_worker._tick_screen_watch_for_user("u_screen_disabled") == 0
+    assert seen_triggers == ["screen_watch"]
+    assert enqueue == []
+    assert notify == []
 
 
 def test_next_screen_watch_at_always_advances(monkeypatch):

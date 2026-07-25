@@ -254,6 +254,18 @@ def _capture_enabled_for_user(user_id: str) -> bool:
     return bool(settings.get("capture_enabled", True))
 
 
+def _dream_enabled_for_user(user_id: str) -> bool:
+    """Fail-closed deployment + user consent gate for Dream execution."""
+    if not _DREAM_ENABLED:
+        return False
+    settings = db.get_blob_strict(str(user_id), "proactive_settings")
+    if settings is None:
+        return True
+    if not isinstance(settings, dict):
+        raise RuntimeError("proactive settings malformed")
+    return bool(settings.get("dream_enabled", True))
+
+
 def _configure_db_pool_capacity(max_workers: int) -> int:
     """Guarantee enough pooled connections for every live V2 turn slot.
 
@@ -1193,11 +1205,16 @@ def _append_summary_checkpoint(
     )
 
 
-def _wake_decision_for_user(user_id: str) -> dict:
-    """Read-only heartbeat wake decision via the real proactive gate (assembly
+def _wake_decision_for_user(user_id: str, trigger: str = "heartbeat") -> dict:
+    """Read-only wake decision via the real proactive gate (assembly
     layer — reuses gate._build_proactive_v2_wake_decision so activation gate /
     broadcast suppression / all landmines hold with zero drift). No enqueue here;
-    the scheduler decides what to do with should_wake."""
+    the scheduler decides what to do with should_wake.
+
+    ``screen_watch`` additionally requires Ambient consent. The shared gate checks
+    both switches from one settings snapshot; heartbeat callers retain the existing
+    default behavior.
+    """
     store = core_store.get_store(user_id)
     if not hosted_config_store.hosted_runtime_v2_enabled_strict(store):
         return {
@@ -1205,8 +1222,13 @@ def _wake_decision_for_user(user_id: str) -> dict:
             "wake_interval_sec": 7200,
             "block_reason": "runtime_mode",
         }
-    payload = {"trigger": "heartbeat"}
-    d = proactive_gate._build_proactive_v2_wake_decision(store, payload)
+    normalized_trigger = str(trigger or "heartbeat").strip().lower() or "heartbeat"
+    payload = {"trigger": normalized_trigger}
+    d = proactive_gate._build_proactive_v2_wake_decision(
+        store,
+        payload,
+        require_ambient=normalized_trigger == "screen_watch",
+    )
     return {
         "should_wake": bool(d.get("should_wake_agent")),
         "wake_interval_sec": int(d.get("wake_interval_sec") or 7200),
@@ -1750,7 +1772,9 @@ def _tick_screen_watch_for_user(user_id: str) -> int:
         now=now,
     )
 
-    if should and bool(_wake_decision_for_user(user_id).get("should_wake")):
+    if should and bool(
+        _wake_decision_for_user(user_id, trigger="screen_watch").get("should_wake")
+    ):
         jobs_store.enqueue_job(user_id, "screen_watch", reason="screen_watch")
         core_wake_bus.notify("v2_jobs", user_id)
         # 真醒：推进到期时间 **且** 消费这一帧（记 last_screen_watch_frame_id）。
@@ -2835,7 +2859,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         fail_capture_job=jobs_store.fail_capture_job,
         cancel_capture_job=jobs_store.cancel_capture_job,
         capture_enabled=_capture_enabled_for_user,
-        dream_enabled=lambda _user_id: _DREAM_ENABLED,
+        dream_enabled=_dream_enabled_for_user,
         apply_pending_effects=_apply_pending_effects_for_user,
         load_mcp_turn=mcp_tools.load_turn_mcp,
         load_workspace_prompt=_load_workspace_prompt,
