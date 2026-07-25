@@ -616,3 +616,146 @@ CVM 磁盘创建时定死、事后扩容麻烦，故按「未来可能指向 pro
 
 （RDS 实例分配磁盘无法从本地 aws cli 查——RDS 在另一 AWS 账号下，当前 IAM 用户
 无权 describe。sizing 以上述实测逻辑数据量为准，不依赖 RDS 分配值。）
+
+
+## TEE Redis（test + pre + prod）
+
+**接入方看这里**：`docs/REDIS_USAGE.md`（连接池 `backend/redis_pool.py` +
+使用规范：`IO:` 前缀命名、强制 TTL、read-through）。本章节只讲开通/运维。
+（早期设计 spec/plan 建成后已删，架构取舍见 `docs/REDIS_USAGE.md` §0-1 与
+`docs/CHANGELOG.md` 的 07-24 / 07-25 条目。）
+
+**当前状态**：三台 CVM 已开通、running，冒烟 ALL GREEN，**零业务流量**
+（没有任何业务代码引用 Redis，接入各自另开 spec）。CVM id 已写进
+`deploy/*-redis-cvm-id.txt`，日常更新走 `redis-deploy.yml`。
+
+**⚠️ 无离线备份是刻意的设计，不是遗漏。** Redis 在本架构里是**纯临时层**：
+缓存、队列/唤醒总线、分布式锁——三类用途的数据全部可从 Postgres 重建
+（**PG 始终是权威源**）。而且恢复一份旧快照对锁/队列**有害**：会复活早已
+释放的锁、早已消费的队列项。所以：不推 R2、不做 age 加密、不托管备份密钥、
+没有 restore 演练。CVM 内保留 **AOF**（`appendonly yes`），仅用于**软重启不掉
+数据**；数据整卷丢失时，正确处置就是让 Redis 空启动、从 PG 自然回暖。
+
+| | test | pre | prod |
+|---|---|---|---|
+| CVM 名 | `feedling-redis-test` | `feedling-redis-pre` | `feedling-redis-prod` |
+| CVM id | `169fc911-…` | `819f646f-…` | `8ebbbddb-…` |
+| Phala 账号 | `amiller-user` | `amiller-user` | **`sxysun`** |
+| 节点 | prod9（node-id **18**） | prod9（18） | prod9（18） |
+| 规格 | 1 vCPU / 2 GB / 20 GB | 1 vCPU / 2 GB / 20 GB | 2 vCPU / 4 GB / 30 GB |
+| `maxmemory` | 1 GB | 1 GB | 2560 MB |
+| Phala API key secret | `TEST_PHALA_CLOUD_API_KEY` | `TEST_PHALA_CLOUD_API_KEY` | `PHALA_CLOUD_API_KEY` |
+| 机密 secret 前缀 | `TEST_REDIS_*` | `PRE_REDIS_*` | `PROD_REDIS_*` |
+| 身份模型 | `--kms phala`（无链上 AppAuth） | 同左 | 同左 |
+| 部署分支 | `test` | `pre` | `main` |
+| 离线备份 | 无（刻意） | 无 | 无 |
+| 监控 | 不监控（数据可弃） | ✅ 持久化+内存 | ✅ 持久化+内存 |
+
+每环境需要的 GitHub secret：`<PREFIX>_REDIS_PASSWORD`、
+`<PREFIX>_REDIS_TLS_CERT_B64`、`<PREFIX>_REDIS_TLS_KEY_B64`
+（`redis-deploy.yml` 用）。监控用的 `<PREFIX>_REDIS_HOST`、
+`<PREFIX>_REDIS_CA_B64` 另加（prod/pre 才需要，test 不监控）。
+**不再需要任何 R2 / age 备份相关 secret。**
+
+### 首次开通 / 重新开通 runbook（每环境各跑一遍，不走 workflow）
+
+> `redis-deploy.yml`（日常部署）负责构建/推送 redis 镜像、把 `REPLACE_SHA`
+> 换成真实 tag、再 `phala deploy --cvm-id <既有id>` 原地更新——但它读
+> `deploy/<env>-redis-cvm-id.txt` 校验 cvm-id 非空后才敢跑（fail-closed，
+> 绝不静默新建 CVM）。首次开通时该文件还是纯注释，所以下面第 4/5 步手动
+> 把 workflow 做的事各做一遍。
+
+1. **切 Phala profile**：test/pre 用 miller 的；**prod 必须先切到 `sxysuns`
+   profile**（最容易忘的一步）。`phala switch "$PROFILE"`。
+2. `deploy/redis/gen-certs.sh feedling-redis-<env> <outdir>` 生成 TLS 材料。
+   **`ca.key` 立即移到离线冷存**，`server.crt`/`server.key` 走 base64 填进
+   `<PREFIX>_REDIS_TLS_CERT_B64` / `<PREFIX>_REDIS_TLS_KEY_B64`（脚本会打印
+   可直接粘贴的值）。重跑前若输出目录已有 `ca.key`，脚本拒绝覆盖（刻意）。
+3. 口令：`openssl rand -hex 32` → `<PREFIX>_REDIS_PASSWORD`。**必须十六进制**：
+   引号 / `$` / 反引号会破坏 compose env 注入。
+4. **构建 + 推送镜像，把真实 tag 钉进 compose**：
+   ```bash
+   IMG_TAG="$(git rev-parse HEAD)"
+   # ⚠️ CVM 是 amd64，本机若是 arm64（Apple Silicon）必须显式指定平台，
+   #    否则推上去的镜像 CVM 拉下来起不来。
+   docker build --platform linux/amd64 \
+     -f deploy/redis/Dockerfile -t "ghcr.io/teleport-computer/feedling-redis:${IMG_TAG}" deploy
+   GH_USER="填入你的 GitHub 用户名"
+   docker login ghcr.io -u "$GH_USER"
+   docker push "ghcr.io/teleport-computer/feedling-redis:${IMG_TAG}"
+
+   ENV_NAME=test   # 换成 pre / prod
+   sed -e "s|feedling-redis:REPLACE_SHA|feedling-redis:${IMG_TAG}|" \
+       deploy/docker-compose.phala.redis.yaml > "compose.redis-${ENV_NAME}.yaml"
+   ```
+   （`compose.redis-<env>.yaml` 是本地工作文件，不提交；仓库里的 compose
+   继续留 `REPLACE_SHA`，日常更新交给 workflow 自己 sed。）
+
+   **⚠️ GHCR 包必须 public**：dstack CVM 匿名拉镜像，包是 private 会
+   `unauthorized`。首次推送后到 GitHub Packages 把 `feedling-redis` 设为
+   public，且**有分钟级传播延迟**——用匿名 `curl` 拉一次 manifest 确认
+   HTTP 200 再往下部署，别等 CVM 拉失败才发现。
+
+5. **建 CVM + 首次部署**（`phala deploy` 不带 `--cvm-id` 即为新建；`--kms
+   phala` 按部署账号授权，redis CVM **不需要链上 AppAuth**，见
+   `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md` §0——**切勿复用主 app 的
+   AppAuth 合约**，会翻掉主 enclave 的钥，见本文件「新建 runner CVM 换掉
+   主 enclave 钥」条目）：
+   ```bash
+   # ⚠️ --node-id 18：feedling 的 gateway passthrough 基础设施只在 prod9
+   #    的 node 18 上配好了。落到别的节点（如 prod7 = node 12）CVM 能起、
+   #    但 <app-id>-6379s 的 gateway 路由不通，冒烟恒 SSL eof。
+   phala deploy --name "feedling-redis-${ENV_NAME}" --compose "compose.redis-${ENV_NAME}.yaml" \
+     --kms phala --node-id 18 --instance-type tdx.small --disk-size 20G \
+     -e "REDIS_PASSWORD=<第 3 步口令>" \
+     -e "REDIS_TLS_CERT_B64=<第 2 步值>" \
+     -e "REDIS_TLS_KEY_B64=<第 2 步值>" \
+     -e "REDIS_MAXMEMORY=1gb"
+   # prod 换成 --instance-type tdx.medium --disk-size 30G、REDIS_MAXMEMORY=2560mb。
+   # 记下输出里的 CVM ID 与 App ID。
+   ```
+   **⚠️ 本地 `phala deploy` 不要加 `--wait`**（会挂在轮询上）；部署后 CVM 可能
+   停在 `stopped`（dstack 首建的怪癖）——`phala cvms start <id>` 手动拉起。
+   **gateway 注册有 ~30 分钟延迟**：CVM running 后 `<app-id>-6379s` 的路由不会
+   立刻通，冒烟先 eof 属正常，等一会再试。
+
+6. 把 `cvm_id` 写进 `deploy/<env>-redis-cvm-id.txt` 并提交（之后 workflow
+   的日常更新才认得到这台 CVM）。
+7. 冒烟：
+   ```bash
+   APP_ID="填入本环境 app_id"
+   REDIS_HOST="${APP_ID}-6379s.dstack-pha-prod9.phala.network"
+   read -rs REDIS_PW
+   REDIS_CA_FILE=./ca.crt REDISCLI_AUTH="$REDIS_PW" \
+     ./deploy/verify-redis.sh "$REDIS_HOST" 443
+   ```
+   期望最后一行 `[verify] ALL GREEN`。
+   **⚠️ 客户端必须发 SNI**：gateway passthrough 靠 TLS ClientHello 的 SNI
+   路由到后端 CVM。`redis-cli --tls` 默认不发 SNI，gateway 找不到后端、握手时
+   直接关连接，看到的是 `unexpected eof`。`verify-redis.sh` 与 `redis-monitor.yml`
+   都已带 `--sni <完整 gateway 主机名>`；任何将来的应用客户端连这个 gateway
+   也必须发 SNI。
+8. 把 `<app-id>-6379s.…` 主机名填进 `<PREFIX>_REDIS_HOST`、`ca.crt` 的
+   base64 填进 `<PREFIX>_REDIS_CA_B64`（`redis-monitor` 要用；prod/pre 才需要）。
+9. 手动触发一次 `redis-monitor` workflow，确认全绿。
+
+### 恢复（无离线备份 → 从 PG 回暖）
+
+Redis 整卷丢失 / 实例报废时**没有快照可 restore**，也不需要。正确处置：
+
+- **软重启 / 容器重建**：卷还在 → AOF 自动加载，数据不掉，无需干预。
+- **整卷丢失 / 换 CVM**：Redis 空启动即可，让上层从 PG 重新填缓存 / 重放
+  队列（PG 是权威源）。首次回暖会有一段 PG 读压上升，零流量期无影响；
+  将来接入时每个 spec 的前置条件里都写明「Redis 冷启动可容忍」。
+
+绝不要试图「保留旧 RDB 再挂回去」——对锁/队列会复活陈旧状态，是 bug 不是恢复。
+
+### 已知限制
+
+- **Redis 端口在公网可达**。dstack CVM 之间没有私网，跨 CVM 只能走 gateway
+  passthrough `<app-id>-6379s.…:443`，只靠 TLS + AUTH 保护（同 TEE Postgres）。
+- **`CONFIG` 命令被禁用**：查容量只能 `INFO memory`，不能 `CONFIG GET`。
+- **单实例无 HA、无离线备份**：实例故障 = Redis 数据清零，靠从 PG 回暖（见上）。
+  这是刻意取舍：Redis 不持有任何权威数据。
+- **prod 账号余额**：test 的老 CVM 就是在 `sxysun` 账号下余额耗尽被废弃
+  （2026-06-18）。多一台 CVM 多一份烧钱速率。

@@ -47,6 +47,30 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-25 — TEE Redis：三台 CVM 开通 + 砍掉离线备份
+
+三套 Redis CVM（test/pre/prod）全部开通、running、冒烟 ALL GREEN，落在
+prod9 node 18，仍**零业务流量**。cvm-id 已写进 `deploy/*-redis-cvm-id.txt`。
+
+**[DECISION] 移除全部离线备份链**（age 加密 + R2 推送 + restore 演练 +
+backup sidecar + 备份监控维度）。理由：Redis 在本架构里是**纯临时层**——
+缓存、队列/唤醒总线、分布式锁三类用途的数据全部可从 Postgres 重建
+（**PG 是权威源**）；且恢复旧快照对锁/队列**有害**（复活已释放的锁、已消费
+的队列项），restore 本身就是 bug。保留 CVM 内 **AOF** 仅用于软重启不掉数据；
+整卷丢失时让 Redis 空启动、从 PG 回暖。这同时消掉了 07-25 部署中一个无法
+定位的 age 解密悖论（recipient 逐字节一致却解不开 CVM 推的快照）——备份既然
+不该存在，悖论自然作废。
+
+删除：`deploy/redis/{backup-push,backup-loop,restore,e2e-drill}.sh`、
+`Dockerfile.backup`、`docker-compose.e2e.yaml`、`tests/test_redis_backup_scripts.py`。
+精简：compose 去 backup 服务、entrypoint 去备份 fail-closed、`redis-deploy.yml`
+去备份镜像/age/R2 注入、`redis-monitor.yml` 去 R2 快照新鲜度（只剩持久化+内存）。
+
+部署中固化的坑（写进 `deploy/DEPLOYMENTS.md`）：`--node-id 18`（gateway 只在
+prod9 node 18 配好）、`docker build --platform linux/amd64`、GHCR 包必须 public
+且有分钟级传播延迟、dstack 首建停在 stopped 要手动 start、gateway 注册 ~30min
+延迟、客户端连 gateway 必须发 `--sni`（否则健康 Redis 恒报 eof）。
+
 ## 2026-07-25
 
 ### [DONE] prod `users` 全表重载风暴 —— 常驻心跳改走定向广播
@@ -290,6 +314,23 @@
   `tools/frame_envelope_roundtrip_test.py`（5001 仍是现役端口，"Flask 时代
   端口"判据不成立）。
 - 验证：pyflakes 零告警；全量 pytest 与清理前基线对照零新增失败。
+
+## 2026-07-24 — TEE Redis CVM 基础设施（未开通）
+
+三套独立 Redis CVM（test/pre/prod）的全部代码就绪：官方 `redis:8-alpine`
+TLS-only + backup sidecar（每小时 `redis-cli --rdb` 快照 → age 非对称加密 → R2）。
+部署纪律复刻 TEE Postgres：`--kms phala` 身份（无链上 AppAuth）、手动 workflow、
+cvm-id fail-closed、永不并入 merge 自动部署。
+
+**当前零流量**：没有任何业务代码引用 Redis，三台 CVM 也尚未开通
+（cvm-id 文件为空 → workflow 拒绝运行）。缓存 / 队列 / 锁的接入各自另开 spec。
+
+关键决策见 `docs/superpowers/specs/2026-07-24-tee-redis-cvm-design.md`：
+`noeviction`（避免静默驱逐锁与队列）、sidecar 而非内嵌镜像、显式 sleep 循环
+而非 cron（PG 2026-07-14 cron PATH 静默失败的教训）、`redis-cli --rdb` 而非
+拷卷文件、age 非对称加密（备份机被攻破也解不了历史备份）。
+
+首次开通 runbook 见 `deploy/DEPLOYMENTS.md`「TEE Redis」章节。
 
 ## 2026-07-22
 

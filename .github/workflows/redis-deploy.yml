@@ -1,0 +1,189 @@
+# .github/workflows/redis-deploy.yml — redis CVM 手动部署（绝不并入 merge 自动部署）
+#
+# 环境三选一 → 自动映射 Phala 账号：
+#   test / pre → amiller-user 账号（TEST_PHALA_CLOUD_API_KEY）
+#   prod       → sxysun 账号（PHALA_CLOUD_API_KEY，无前缀）
+#
+# redis CVM 用 `--kms phala`（部署账号授权），**不需要链上 AppAuth**，故本
+# workflow 没有 publish-compose-hash 步骤（同 pg-deploy.yml，见
+# docs/TEE_POSTGRES_SHADOW_PROVISIONING.md §0）。
+#
+# 首次开通不走本 workflow：cvm-id 文件读不到就失败，绝不静默新建 CVM
+# （新建 CVM = 换钥事故，见 DEPLOYMENTS.md「新建 runner CVM 换掉主 enclave 钥」）。
+name: Deploy Redis CVM
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [test, pre, prod]
+        required: true
+      confirm:
+        description: '输入 DEPLOY-REDIS（prod 需输入 DEPLOY-REDIS-PROD）确认（防误触）'
+        required: true
+permissions:
+  contents: read
+  packages: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency: redis-deploy-${{ github.event.inputs.environment }}
+    steps:
+      - name: Validate environment input
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          # `type: choice` 只在 GitHub 网页 UI 里约束输入——REST/`gh` API
+          # dispatch 能把 environment 设成任意字符串。下游每处比较（ref
+          # 选择、typo guard 的确认串、机密前缀查找）都是大小写敏感的精确
+          # 匹配，所以比如 "Prod" 会静默走到 test 分支、同时只需要输入较弱的
+          # DEPLOY-REDIS 确认串。这里显式 fail-closed，而不是依赖后面
+          # cvm-id 文件不存在这个附带效果来兜底。
+          case "$ENVIRONMENT" in
+            test|pre|prod) ;;
+            *)
+              echo "::error::environment 必须是 test/pre/prod 之一（区分大小写），收到: '${ENVIRONMENT}'"
+              exit 1
+              ;;
+          esac
+
+      - name: Typo guard
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          # prod 要求更长的确认串：它打的是另一个账号下的真实用户数据机器。
+          if [ "$ENVIRONMENT" = "prod" ]; then WANT=DEPLOY-REDIS-PROD; else WANT=DEPLOY-REDIS; fi
+          test "$CONFIRM" = "$WANT" || { echo "::error::confirm mismatch — ${ENVIRONMENT} 需要输入 ${WANT}"; exit 1; }
+
+      - uses: actions/checkout@v4
+        # 各环境部署各自的分支，与 app 的发布流向一致。
+        with:
+          ref: ${{ inputs.environment == 'prod' && 'main' || (inputs.environment == 'pre' && 'pre' || 'test') }}
+
+      - name: Resolve image tag from checked-out HEAD
+        id: img
+        # 不能用 github.sha 这个 context 变量（这里刻意不写成 GHA 的
+        # ${{ }} 表达式语法，那样写会被当成活表达式在 bash 存在之前就地替换
+        # 成一个值，即便是在 # 开头的注释行里）：workflow_dispatch 下它指向
+        # 触发时所在 ref 的 sha，而上面 checkout 的是 test/pre/main，
+        # 两者可以不同——tag 会与镜像内容对不上。
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve CVM id
+        id: cvm
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          F="deploy/${ENVIRONMENT}-redis-cvm-id.txt"
+          test -f "$F" || { echo "::error::${F} 不存在 — 首次开通走 DEPLOYMENTS.md runbook，不走本 workflow"; exit 1; }
+          # GHA 以 `bash -eo pipefail` 跑 run 步骤：纯注释的 cvm-id.txt 让
+          # `grep -v '^#'` 退出 1，pipefail 把它当成整条管道的退出码，脚本会在
+          # 这里裸退出、永远走不到下面那句明确的报错。`|| true` 吸收它，让
+          # CVM_ID 正当地为空，由下一行的显式检查来 fail-closed。
+          CVM_ID=$(grep -v '^#' "$F" | tr -d '[:space:]' | head -1 || true)
+          test -n "$CVM_ID" || { echo "::error::${F} 为空 — 首次开通走 DEPLOYMENTS.md runbook，不走本 workflow"; exit 1; }
+          echo "id=$CVM_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive lowercase owner   # ghcr rejects mixed-case image paths
+        id: owner
+        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push redis image
+        uses: docker/build-push-action@v6
+        with:
+          context: deploy
+          file: deploy/redis/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ steps.owner.outputs.owner }}/feedling-redis:${{ steps.img.outputs.sha }}
+
+      - name: Pin image sha into compose
+        run: |
+          sed -i -E "s|ghcr\.io/[^/]+/feedling-redis:[A-Za-z0-9_.-]+|ghcr.io/${{ steps.owner.outputs.owner }}/feedling-redis:${{ steps.img.outputs.sha }}|" \
+            deploy/docker-compose.phala.redis.yaml
+          grep -n 'feedling-redis' deploy/docker-compose.phala.redis.yaml
+
+      - name: Deploy (update in place; 名字查不到就失败，绝不静默新建)
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          CVM_ID: ${{ steps.cvm.outputs.id }}
+          # 三套机密全都注入、在 shell 里按环境挑，而不是用 GitHub Actions 的
+          # 三元短路写法（environment == 'prod' AND secrets 取 PROD 那份 OR 否则
+          # 取 TEST 那份）：那种三元在 prod 那份恰好为空时会短路 fallback 到
+          # test 那份，于是「非空校验」通过、注进 prod CVM 的却是 test 的密码。
+          # 这里挑错只会挑到空值 → fail-closed。
+          TEST_PHALA_TOKEN: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          PRE_PHALA_TOKEN: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}   # pre 与 test 同账号
+          PROD_PHALA_TOKEN: ${{ secrets.PHALA_CLOUD_API_KEY }}       # prod 在 sxysun workspace，key 无前缀
+          TEST_REDIS_PASSWORD: ${{ secrets.TEST_REDIS_PASSWORD }}
+          TEST_REDIS_TLS_CERT_B64: ${{ secrets.TEST_REDIS_TLS_CERT_B64 }}
+          TEST_REDIS_TLS_KEY_B64: ${{ secrets.TEST_REDIS_TLS_KEY_B64 }}
+          PRE_REDIS_PASSWORD: ${{ secrets.PRE_REDIS_PASSWORD }}
+          PRE_REDIS_TLS_CERT_B64: ${{ secrets.PRE_REDIS_TLS_CERT_B64 }}
+          PRE_REDIS_TLS_KEY_B64: ${{ secrets.PRE_REDIS_TLS_KEY_B64 }}
+          PROD_REDIS_PASSWORD: ${{ secrets.PROD_REDIS_PASSWORD }}
+          PROD_REDIS_TLS_CERT_B64: ${{ secrets.PROD_REDIS_TLS_CERT_B64 }}
+          PROD_REDIS_TLS_KEY_B64: ${{ secrets.PROD_REDIS_TLS_KEY_B64 }}
+        run: |
+          UP=$(echo "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')
+          pick() { local n="${UP}_$1"; printf '%s' "${!n-}"; }
+
+          # 非机密的按环境派生值。maxmemory 见 spec 第 2 节：只吃掉一半物理内存，
+          # 给 BGSAVE 的 fork + copy-on-write 留余量。
+          if [ "$ENVIRONMENT" = "prod" ]; then MAXMEM=2560mb; else MAXMEM=1gb; fi
+
+          # 原地更新必须重带整份机密，漏一个就被清空 → entrypoint fail-closed
+          # 起不来。先整份校验再动 CVM。
+          VARS="REDIS_PASSWORD REDIS_TLS_CERT_B64 REDIS_TLS_KEY_B64"
+          missing=0
+          for v in $VARS; do
+            [ -n "$(pick "$v")" ] || { echo "::error::MISSING secret: ${UP}_${v}"; missing=1; }
+          done
+          TOKEN=$(pick PHALA_TOKEN)
+          [ -n "$TOKEN" ] || { echo "::error::MISSING phala api token for ${ENVIRONMENT}"; missing=1; }
+          [ "$missing" = 0 ] || exit 1
+
+          # 机密落 0600 env 文件而不是拼进命令行：ps/日志里不会出现明文。
+          ENVFILE=$(mktemp); chmod 600 "$ENVFILE"
+          for v in $VARS; do printf '%s=%s\n' "$v" "$(pick "$v")" >> "$ENVFILE"; done
+          printf 'REDIS_MAXMEMORY=%s\n' "$MAXMEM" >> "$ENVFILE"
+
+          npm install -g phala@1.1.19
+          phala deploy --api-token "$TOKEN" --cvm-id "$CVM_ID" \
+            -c deploy/docker-compose.phala.redis.yaml \
+            -e "$ENVFILE" --wait
+          rm -f "$ENVFILE"
+
+      - name: Post-deploy — 状态自检
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          CVM_ID: ${{ steps.cvm.outputs.id }}
+          TEST_PHALA_TOKEN: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          PRE_PHALA_TOKEN: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          PROD_PHALA_TOKEN: ${{ secrets.PHALA_CLOUD_API_KEY }}
+        run: |
+          UP=$(echo "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')
+          # 同 Deploy 步骤：bash 间接展开而非 eval——$ENVIRONMENT 派生自
+          # workflow_dispatch 输入，eval 一段用它拼出来的字符串等于把不
+          # 受信任的输入喂进 shell 解释器。
+          pick() { local n="${UP}_$1"; printf '%s' "${!n-}"; }
+          TOKEN=$(pick PHALA_TOKEN)
+          phala cvms get "$CVM_ID" --api-token "$TOKEN" --json > cvm.json
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open('cvm.json'))
+          status = d.get('status')
+          print('status:', status)
+          print('compose_hash:', d.get('compose_hash'))
+          if status != 'running':
+              sys.exit(f'CVM 未回到 running: {status}')
+          PY
+          echo "提醒：无离线备份是刻意的（Redis 为纯临时层，PG 是权威源）；由 redis-monitor 盯持久化写状态与内存水位。"
