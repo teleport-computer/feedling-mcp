@@ -2736,7 +2736,12 @@ def _frozen_relationship_anchor(patch) -> str | None:
     if card_policy.relationship_days_shape_error(patch.get("relationship_days")):
         return None
     from identity import service as identity_service
-    return identity_service._anchor_from_days(int(patch["relationship_days"]))
+    # relationship_days is the USER-FACING 1-based "第 N 天" (day you met = 第 1 天;
+    # iOS shows elapsed + 1). Stored days_with_user is ELAPSED (0 = met today), so
+    # 第 N 天 → elapsed N-1. Freeze the SAME elapsed anchor the direct/fallback path
+    # computes (actions._resolve_relationship_anchor), so frozen-verbatim and
+    # fallback agree. Onboarding (date-derived elapsed) is untouched.
+    return identity_service._anchor_from_days(max(0, int(patch["relationship_days"]) - 1))
 
 
 def _write_tool_effect_payload(tc) -> tuple[str, dict]:

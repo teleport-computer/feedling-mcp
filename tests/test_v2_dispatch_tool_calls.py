@@ -459,7 +459,9 @@ def test_write_tool_effect_payload_freezes_relationship_anchor():
     tc = ToolCall(id="f1", name="identity_patch", args={"patch": {"relationship_days": 300}})
     effect_type, payload = v2_worker._write_tool_effect_payload(tc)
     assert effect_type == "identity"
-    assert payload["relationship_started_at"] == (date.today() - timedelta(days=300)).isoformat()
+    # relationship_days is the 1-based "第 N 天" (met day = 第 1 天), so N=300
+    # freezes to elapsed N-1=299 → today-299.
+    assert payload["relationship_started_at"] == (date.today() - timedelta(days=299)).isoformat()
     # the relative value is preserved for audit; the frozen absolute wins at the sink
     assert payload["patch"]["relationship_days"] == 300
 

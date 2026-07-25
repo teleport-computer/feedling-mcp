@@ -721,6 +721,10 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "content_type": {"type": "string", "enum": ["text", "image", "file"], "default": "text"},
             "file_name": {"type": "string"},
             "file_mime": {"type": "string"},
+            "caption_envelope": {
+                "allOf": [{"$ref": "#/components/schemas/EncryptedEnvelope"}],
+                "description": "Optional separately-encrypted user text sent alongside an image/file (content_type image or file). Same E2E envelope shape as the main `envelope`; the enclave decrypts it into the message's plaintext content so the agent sees the caption. Ignored for content_type=text.",
+            },
         },
         "additionalProperties": True,
     },

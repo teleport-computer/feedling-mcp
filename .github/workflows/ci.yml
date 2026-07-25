@@ -166,13 +166,27 @@ jobs:
             tests/test_enclave_frame_caption.py \
             tests/test_enclave_visual_plaintext.py \
             tests/test_proactive_agent_protocol_v2.py \
-            tests/test_chat_resident_consumer.py \
             tests/test_runtime_v2_default_flag.py \
             tests/test_capture_prompt_v1.py \
             tests/test_dream_prompt_v1.py \
-            tests/test_user_mcp_consumer.py \
             tests/test_pi_mcp_bridge.py \
             -v
+
+      - name: Run resident consumer regression suite
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          mapfile -t consumer_tests < <(
+            grep -l -E \
+              'tools\.chat_resident_consumer|chat_resident_consumer as|import chat_resident_consumer|from tools import chat_resident_consumer|chat_resident_consumer\.py' \
+              tests/test_*.py | sort
+          )
+          if (( ${#consumer_tests[@]} < 30 )); then
+            echo "resident consumer test discovery unexpectedly found only ${#consumer_tests[@]} files"
+            exit 1
+          fi
+          printf 'Running %d resident consumer test files\n' "${#consumer_tests[@]}"
+          python -m pytest "${consumer_tests[@]}" -v
 
       - name: Run Hosted Runtime V2 safety and prompt-cache suites
         env:

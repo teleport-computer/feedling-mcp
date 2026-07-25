@@ -1,0 +1,82 @@
+# .github/workflows/redis-monitor.yml — 盯 prod + pre 的 Redis 健康。
+#
+# 【无离线备份，刻意为之】Redis 在本架构里是纯临时层（缓存/队列/锁，全部可从
+# Postgres 重建，PG 是权威源），故不做离线备份、没有「R2 快照新鲜度」这一维。
+# 本 workflow 只盯两件事：持久化写状态（AOF/RDB 落盘没报错）+ 内存水位
+# （noeviction 下打满 = 写入报错）。test 数据可弃，不监控（与 pg-monitor.yml 同理）。
+name: Redis monitor
+on:
+  schedule: [{ cron: '*/30 * * * *' }]
+  workflow_dispatch: {}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env_name: prod
+          - env_name: pre
+    steps:
+      - name: Redis persistence + memory headroom
+        env:
+          ENV_NAME: ${{ matrix.env_name }}
+          # 两套 Redis 机密都注入 job env，shell 里按 ENV_NAME 大写前缀间接
+          # 展开取值——不用 GitHub Actions 的三元短路写法（同样故意不写成活的
+          # GHA 表达式语法）。prod/pre 各自的 host 若用三元短路写法选取，
+          # PROD_REDIS_HOST 恰好为空（轮换空窗/手误删）时会静默连去 pre 的
+          # Redis 却仍打着 prod 的名义汇报——挑错这里只会挑到空值 → 下面显式
+          # 判空 fail-closed。见 test_monitor_never_selects_secrets_with_a_ternary。
+          PROD_REDIS_HOST: ${{ secrets.PROD_REDIS_HOST }}
+          PROD_REDIS_PASSWORD: ${{ secrets.PROD_REDIS_PASSWORD }}
+          PROD_REDIS_CA_B64: ${{ secrets.PROD_REDIS_CA_B64 }}
+          PRE_REDIS_HOST: ${{ secrets.PRE_REDIS_HOST }}
+          PRE_REDIS_PASSWORD: ${{ secrets.PRE_REDIS_PASSWORD }}
+          PRE_REDIS_CA_B64: ${{ secrets.PRE_REDIS_CA_B64 }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq redis-tools
+
+          UP=$(echo "$ENV_NAME" | tr '[:lower:]' '[:upper:]')
+          pick() { local n="${UP}_REDIS_$1"; printf '%s' "${!n-}"; }
+          REDIS_HOST=$(pick HOST)
+          REDISCLI_AUTH=$(pick PASSWORD)
+          REDIS_CA_B64=$(pick CA_B64)
+          export REDISCLI_AUTH
+          [ -n "$REDIS_HOST" ] || { echo "::error::MISSING ${UP}_REDIS_HOST"; exit 1; }
+          [ -n "$REDISCLI_AUTH" ] || { echo "::error::MISSING ${UP}_REDIS_PASSWORD"; exit 1; }
+          [ -n "$REDIS_CA_B64" ] || { echo "::error::MISSING ${UP}_REDIS_CA_B64"; exit 1; }
+
+          echo "$REDIS_CA_B64" | base64 -d > /tmp/redis-ca.crt
+          # --sni 必须：dstack gateway 的 <app-id>-<port>s passthrough 靠 TLS
+          # SNI 路由到后端 CVM。redis-cli --tls 默认不发 SNI，gateway 找不到后端、
+          # 握手时直接关连接，监控会把健康的 Redis 误报成 "unexpected eof"。
+          # 实测 2026-07-25：不带 --sni 恒 eof，带上 = PONG。
+          R="redis-cli --tls --cacert /tmp/redis-ca.crt --sni ${REDIS_HOST} -h ${REDIS_HOST} -p 443"
+
+          PERSIST=$($R INFO persistence | tr -d '\r')
+          echo "$PERSIST" | grep -E '^(rdb_last_bgsave_status|aof_last_write_status):'
+          echo "$PERSIST" | grep -q '^rdb_last_bgsave_status:ok' \
+            || { echo "::error::rdb_last_bgsave_status != ok"; exit 1; }
+          echo "$PERSIST" | grep -q '^aof_last_write_status:ok' \
+            || { echo "::error::aof_last_write_status != ok — 第一层持久化已失效"; exit 1; }
+
+          # CONFIG 被 rename-command 禁用，容量只能从 INFO memory 读。
+          MEM=$($R INFO memory | tr -d '\r')
+          USED=$(echo "$MEM" | grep '^used_memory:' | cut -d: -f2)
+          MAX=$(echo "$MEM" | grep '^maxmemory:' | cut -d: -f2)
+          echo "used_memory=${USED} maxmemory=${MAX}"
+          export USED MAX
+          # noeviction 下内存打满 = 写入开始报错，80% 是提前量。
+          # heredoc 用 <<'PY'（引号=不做 shell 展开），值经环境变量传进去：
+          # 直接把 ${USED} 插进 Python 源码会在值为空时变成语法错误，
+          # 报一个与真实问题无关的 SyntaxError。
+          python3 - <<'PY'
+          import os, sys
+          used, mx = int(os.environ["USED"] or 0), int(os.environ["MAX"] or 0)
+          if mx == 0:
+              sys.exit('::error::maxmemory is 0 — 未设上限，noeviction 下会一直吃到 OOM')
+          pct = used * 100 // mx
+          print(f'memory usage: {pct}%')
+          if pct >= 80:
+              sys.exit(f'::error::memory at {pct}% of maxmemory (>=80%) — noeviction 下写入即将开始报错')
+          PY

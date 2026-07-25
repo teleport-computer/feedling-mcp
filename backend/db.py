@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from contextlib import contextmanager, nullcontext
@@ -1400,6 +1401,157 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
     except Exception as e:
         log.error("[db] admin_data_track_dau failed: %s", e)
         return []
+
+
+_ADMIN_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def admin_data_track_usage_histogram(
+    *,
+    day: str,
+    tz: str = "Asia/Shanghai",
+) -> dict:
+    """Return one Beijing day's per-user app-usage distribution.
+
+    The sample exactly matches ``admin_data_track_dau``'s ``usage_per_user``
+    CTE: one row per user with at least one ``app_session_end`` event that day,
+    summing only decimal ``payload.duration_sec`` values and treating malformed
+    values as zero. Users without a session-end report are not backfilled with
+    zero. All fixed buckets and summary percentiles are computed in one query.
+    """
+    day_text = str(day or "").strip()
+    if not _ADMIN_DAY_RE.fullmatch(day_text):
+        raise ValueError("invalid_day")
+    try:
+        selected_day = date.fromisoformat(day_text)
+    except ValueError as exc:
+        raise ValueError("invalid_day") from exc
+    if selected_day.isoformat() != day_text:
+        raise ValueError("invalid_day")
+
+    empty = {
+        "day": day_text,
+        "buckets": [
+            {"label": label, "lo_sec": lo, "hi_sec": hi, "users": 0}
+            for label, lo, hi in (
+                ("0-1min", 0, 60),
+                ("1-5min", 60, 300),
+                ("5-15min", 300, 900),
+                ("15-30min", 900, 1800),
+                ("30-60min", 1800, 3600),
+                ("1-2h", 3600, 7200),
+                ("2-4h", 7200, 14400),
+                ("4h+", 14400, None),
+            )
+        ],
+        "total_users": 0,
+        "median_sec": 0.0,
+        "mean_sec": 0.0,
+        "p90_sec": 0.0,
+        "max_sec": 0,
+    }
+    try:
+        zone = ZoneInfo(tz)
+        start = datetime.combine(
+            selected_day, datetime.min.time(), tzinfo=zone
+        ).timestamp()
+        end = datetime.combine(
+            selected_day + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=zone,
+        ).timestamp()
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                """
+                WITH usage_per_user AS (
+                    SELECT
+                        user_id,
+                        SUM(
+                            CASE
+                              WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
+                              THEN (doc->'payload'->>'duration_sec')::bigint
+                              ELSE 0
+                            END
+                        )::bigint AS user_sec
+                    FROM user_logs
+                    WHERE stream = 'tracking_events'
+                      AND doc->>'type' = 'app_session_end'
+                      AND ts IS NOT NULL
+                      AND ts >= %s AND ts < %s
+                    GROUP BY user_id
+                ),
+                stats AS (
+                    SELECT
+                        COUNT(*)::int AS total_users,
+                        COALESCE(
+                          percentile_cont(0.5) WITHIN GROUP (ORDER BY user_sec), 0
+                        )::double precision AS median_sec,
+                        COALESCE(AVG(user_sec), 0)::double precision AS mean_sec,
+                        COALESCE(
+                          percentile_cont(0.9) WITHIN GROUP (ORDER BY user_sec), 0
+                        )::double precision AS p90_sec,
+                        COALESCE(MAX(user_sec), 0)::bigint AS max_sec
+                    FROM usage_per_user
+                ),
+                buckets(ord, label, lo_sec, hi_sec) AS (
+                    VALUES
+                      (1, '0-1min', 0::bigint, 60::bigint),
+                      (2, '1-5min', 60::bigint, 300::bigint),
+                      (3, '5-15min', 300::bigint, 900::bigint),
+                      (4, '15-30min', 900::bigint, 1800::bigint),
+                      (5, '30-60min', 1800::bigint, 3600::bigint),
+                      (6, '1-2h', 3600::bigint, 7200::bigint),
+                      (7, '2-4h', 7200::bigint, 14400::bigint),
+                      (8, '4h+', 14400::bigint, NULL::bigint)
+                )
+                SELECT
+                    b.label,
+                    b.lo_sec,
+                    b.hi_sec,
+                    COUNT(u.user_id)::int AS users,
+                    s.total_users,
+                    s.median_sec,
+                    s.mean_sec,
+                    s.p90_sec,
+                    s.max_sec
+                FROM buckets b
+                CROSS JOIN stats s
+                LEFT JOIN usage_per_user u
+                  ON u.user_sec >= b.lo_sec
+                 AND (b.hi_sec IS NULL OR u.user_sec < b.hi_sec)
+                GROUP BY
+                    b.ord, b.label, b.lo_sec, b.hi_sec,
+                    s.total_users, s.median_sec, s.mean_sec, s.p90_sec, s.max_sec
+                ORDER BY b.ord
+                """,
+                (start, end),
+            ).fetchall()
+        if not rows:
+            return empty
+        return {
+            "day": day_text,
+            "buckets": [
+                {
+                    "label": str(row[0]),
+                    "lo_sec": int(row[1]),
+                    "hi_sec": int(row[2]) if row[2] is not None else None,
+                    "users": int(row[3] or 0),
+                }
+                for row in rows
+            ],
+            "total_users": int(rows[0][4] or 0),
+            "median_sec": float(rows[0][5] or 0),
+            "mean_sec": float(rows[0][6] or 0),
+            "p90_sec": float(rows[0][7] or 0),
+            "max_sec": int(rows[0][8] or 0),
+        }
+    except Exception as e:
+        log.error(
+            "[db] admin_data_track_usage_histogram failed day=%s: %s",
+            day_text,
+            e,
+        )
+        return empty
 
 
 def _completed_dau_row(conn, *, day: date, tz: str) -> dict:

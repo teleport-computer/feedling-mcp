@@ -1039,10 +1039,11 @@ def test_profile_patch_relationship_days_sets_calibrated_anchor(client, monkeypa
 
     saved = db.get_blob(user_id, "identity")
     assert saved["relationship_anchor_source"] == "user_calibrated"
-    # Anchor moved off the seeded 2026-04-01, and days_with_user derives to 300.
+    # Anchor moved off the seeded 2026-04-01. relationship_days is 1-based
+    # ("第 N 天", met day = 第 1 天), so N=300 stores elapsed N-1=299.
     assert saved["relationship_started_at"] != "2026-04-01"
     assert identity_service._live_days_with_user(
-        saved, store=core_store.get_store(user_id)) == 300
+        saved, store=core_store.get_store(user_id)) == 299
 
 
 def test_profile_patch_relationship_days_with_other_field(client, monkeypatch):
@@ -1076,8 +1077,9 @@ def test_profile_patch_relationship_days_with_other_field(client, monkeypatch):
     assert captured_plaintexts[-1]["agent_name"] == "小满"
     saved = db.get_blob(user_id, "identity")
     assert saved["relationship_anchor_source"] == "user_calibrated"
+    # 1-based: N=100 stores elapsed N-1=99.
     assert identity_service._live_days_with_user(
-        saved, store=core_store.get_store(user_id)) == 100
+        saved, store=core_store.get_store(user_id)) == 99
 
 
 def test_profile_patch_relationship_days_only_leaves_other_fields(client, monkeypatch):
@@ -1109,8 +1111,9 @@ def test_profile_patch_relationship_days_only_leaves_other_fields(client, monkey
     assert captured_plaintexts[-1]["agent_name"] == _plain_identity()["agent_name"]
     assert captured_plaintexts[-1]["self_introduction"] == _plain_identity()["self_introduction"]
     saved = db.get_blob(user_id, "identity")
+    # 1-based: N=42 stores elapsed N-1=41.
     assert identity_service._live_days_with_user(
-        saved, store=core_store.get_store(user_id)) == 42
+        saved, store=core_store.get_store(user_id)) == 41
 
 
 def test_profile_patch_relationship_days_zero_accepted(client, monkeypatch):
@@ -1258,12 +1261,13 @@ def test_profile_patch_forged_past_anchor_via_public_api_ignored(client, monkeyp
     )
     assert res.status_code == 200, res.get_data(as_text=True)
     saved = db.get_blob(user_id, "identity")
-    # Anchor came from days (today-1), NOT the forged ancient date.
-    assert saved["relationship_started_at"] == (date.today() - timedelta(days=1)).isoformat()
+    # Anchor came from days, NOT the forged ancient date. relationship_days is
+    # 1-based ("第 N 天", met day = 第 1 天), so N=1 → elapsed 0 → anchor = today.
+    assert saved["relationship_started_at"] == date.today().isoformat()
     assert saved["relationship_started_at"] != "0001-01-01"
     # days_with_user stays within the cap — the forge can't inflate it.
     assert identity_service._live_days_with_user(
-        saved, store=core_store.get_store(user_id)) == 1
+        saved, store=core_store.get_store(user_id)) == 0
 
 
 def test_resolve_relationship_anchor_boundary_verbatim_no_drift():
@@ -1295,7 +1299,8 @@ def test_resolve_relationship_anchor_no_trusted_value_uses_days():
     # resolution ALWAYS comes from days — a request-body date can never be trusted
     # because it never reaches this function.
     got = identity_actions_mod._resolve_relationship_anchor(30, trusted_frozen=None)
-    assert got == identity_service._anchor_from_days(30)
+    # 1-based input: N=30 ("第 30 天") resolves to elapsed N-1=29.
+    assert got == identity_service._anchor_from_days(29)
 
 
 def test_resolve_relationship_anchor_future_falls_back_to_days():
@@ -1303,7 +1308,8 @@ def test_resolve_relationship_anchor_future_falls_back_to_days():
     from datetime import date, timedelta
     future = (date.today() + timedelta(days=5)).isoformat()
     got = identity_actions_mod._resolve_relationship_anchor(30, trusted_frozen=future)
-    assert got == identity_service._anchor_from_days(30)
+    # 1-based input: N=30 resolves to elapsed N-1=29.
+    assert got == identity_service._anchor_from_days(29)
     assert got != future
 
 
@@ -1336,7 +1342,8 @@ def test_profile_patch_forged_future_anchor_falls_back_to_days(client, monkeypat
     )
     assert res.status_code == 200, res.get_data(as_text=True)
     saved = db.get_blob(user_id, "identity")
-    assert saved["relationship_started_at"] == (date.today() - timedelta(days=30)).isoformat()
+    # 1-based input: N=30 → elapsed N-1=29 → today-29.
+    assert saved["relationship_started_at"] == (date.today() - timedelta(days=29)).isoformat()
 
 
 def test_profile_patch_relationship_days_over_cap_rejected(client, monkeypatch):

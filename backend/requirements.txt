@@ -89,3 +89,10 @@ pypdf>=5,<6
 # rejected or dropped to text at the V2 turn. manylinux wheels bundle libjpeg/zlib
 # (no system deps).
 Pillow>=11,<13
+
+# TEE Redis CVM 客户端连接池（backend/redis_pool.py）。当前零流量：只有池模块
+# 与其单元测试引用它，没有请求路径依赖 Redis（接入各自另开 spec，见
+# docs/REDIS_USAGE.md）。生产镜像预置它，未来接入无需再改依赖。模块只用跨
+# 4.5–6.x 稳定的 async API（redis.asyncio.Redis 的 ssl_ca_certs/max_connections
+# 等 + aclose/close 兜底），故 range 放宽。
+redis>=5,<7
