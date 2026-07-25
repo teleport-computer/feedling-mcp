@@ -85,23 +85,14 @@ _FIELDS_SPEC = (
     "material doesn't say — do not infer this from tone or vibe), "
     "stable_definitions (array of short strings: durable facts/definitions/ground rules the "
     "material says should always be remembered, e.g. custom terms or standing instructions; "
-    "empty array if none), "
-    "relationship_started_at (an ISO calendar date YYYY-MM-DD for when the user and the "
-    "companion first met or started their relationship — set it ONLY when the material states "
-    "an explicit concrete start date, OR an unambiguous duration you can convert to a date "
-    "(e.g. 'we've been together exactly two years'); leave it an empty string when the "
-    "material only vaguely implies a length of time or says nothing — never guess from tone), "
-    "relationship_anchor_evidence (a short quote or pointer to WHERE in the material the start "
-    "date/duration is stated; REQUIRED and non-empty whenever relationship_started_at is set, "
-    "empty string otherwise). "
+    "empty array if none). "
     "tone_style/agent_role/do_not_say/boundaries capture the companion's VOICE so it "
     "survives the update — extract them from the material, not just the facts. "
     "user_preferred_name/custom_persona_prompt/language_preference/relationship_anchor/"
     "stable_definitions are USER-authored signal (D1 user layer), not TA identity — GROUNDING "
     "applies even more strictly to these 5: leave each empty/absent unless the material gives "
     "an explicit, unambiguous statement for it; never infer or invent one from context, tone, "
-    "or what would make a nicer-looking card. relationship_started_at is held to the SAME "
-    "strict grounding: an explicit date or a convertible exact duration only — never a guess. "
+    "or what would make a nicer-looking card. "
     "Do not invent facts not grounded in the material. "
     "agent_name is the AI companion's own chosen or user-given name, not the user's name, "
     "account name, provider, model, runtime, platform, or product name. Only set agent_name "
@@ -215,29 +206,8 @@ def parse_identity_payload(raw: str) -> dict | None:
         if sanitized.get("dimensions"):
             out["dimensions"] = sanitized["dimensions"]
 
-    # Relationship timing (item 2, material_stated tier). ONLY carried forward
-    # when the model returned BOTH a well-formed ISO date AND non-empty evidence
-    # — the grounding contract in _FIELDS_SPEC. A bare date with no evidence, a
-    # malformed date, or evidence with no date is dropped (treated as "material
-    # said nothing"), so a vague/hallucinated timing never becomes an anchor. The
-    # consumer lifts these two keys out to the identity.replace action's top level
-    # (they are anchor metadata, not encrypted-card profile fields).
-    started = str(obj.get("relationship_started_at") or "").strip()[:10]
-    anchor_evidence = str(obj.get("relationship_anchor_evidence") or "").strip()[:500]
-    if started and anchor_evidence:
-        from datetime import date as _date
-        try:
-            _date.fromisoformat(started)
-            out["relationship_started_at"] = started
-            out["relationship_anchor_evidence"] = anchor_evidence
-        except ValueError:
-            pass  # not a real date -> no timing signal, drop both
-
     # 清洗后必须还有至少一个字段(即使只有空 agent_name,也算一张卡 — contract B 宽松)。
-    # relationship_started_at/evidence alone do NOT count — they are anchor
-    # metadata, not card content — so a payload that is ONLY timing still returns
-    # None here unless there is also a real profile/dimension field.
-    if not any(k in out for k in RESIDENT_IDENTITY_FIELDS):
+    if not out:
         return None
     ok, _err = card_policy.validate_full_identity_card(
         {"agent_name": out.get("agent_name", ""), "dimensions": out.get("dimensions", [])})

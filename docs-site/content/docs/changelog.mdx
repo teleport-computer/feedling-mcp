@@ -26,9 +26,8 @@ change must not be interpreted as an API guarantee.
     request time, so it cannot drift and re-applying the same recalibration is a
     no-op.
   - **Priority.** An explicit `relationship_days` is treated as a deliberate user
-    calibration and wins over both an auto-inferred count (earliest memory / session)
-    and a duration stated in uploaded persona material; a persona re-derivation will
-    not overwrite a count the user calibrated.
+    calibration and wins over the auto-inferred count (earliest memory / session);
+    a persona re-derivation will not overwrite a count the user calibrated.
   - **New error codes.** `relationship_days_must_be_non_negative_int` (not an
     integer, or negative) and `relationship_days_out_of_range` (exceeds the ~100-year
     cap) are returned as a stable `400` before any write. Invalid values are rejected

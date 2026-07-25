@@ -1066,11 +1066,7 @@ def _replace_relationship_anchor(action: dict) -> dict:
         return {}
     return {
         "relationship_started_at": started,
-        # Tier = material_stated (item 2): the timing was extracted from the
-        # uploaded persona material, not deliberately set by the user. The
-        # replace path's priority guard (genesis._relationship_anchor_fields_for_replace)
-        # keeps this from overwriting an existing user_calibrated anchor.
-        "relationship_anchor_source": "material_stated",
+        "relationship_anchor_source": "genesis_resident_distill",
         "relationship_anchor_evidence": evidence,
     }
 
