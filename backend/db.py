@@ -572,8 +572,18 @@ def compare_and_set_user(
         log.error("[db] compare_and_set_user(%s) failed: %s", user_id, exc)
         return False, False, None
     if applied:
+        # Mirror to the TEE shadow with an UNCONDITIONAL upsert, not the CAS
+        # UPDATE above. The shadow only follows primary; a shadow row that has
+        # already drifted (e.g. a prior partial dual-write) would make the CAS's
+        # `WHERE doc=expected` match zero rows and silently no-op, leaving the
+        # shadow stale until the 24h reconcile. `upsert_user`'s mirror already
+        # uses this INSERT ... ON CONFLICT form, so this re-converges the row.
         from tee_shadow import mirror
-        mirror.execute(sql, params)
+        upsert_sql = (
+            "INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET created_at = EXCLUDED.created_at, doc = EXCLUDED.doc"
+        )
+        mirror.execute(upsert_sql, (str(user_id), new.get("created_at"), Jsonb(new)))
     return True, applied, (row[0] if row is not None else None)
 
 

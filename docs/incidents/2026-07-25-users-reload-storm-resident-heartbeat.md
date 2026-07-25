@@ -120,7 +120,7 @@ hash，全量重建与单行重排共用 `_index_user_keys_locked()` 以免两�
 ## 验证
 
 - L1：`tests/test_users_reload_targeted.py`（7 条）+
-  `tests/test_users_reload_review_fixes.py`（15 条，覆盖各轮 review 的每条修复：
+  `tests/test_users_reload_review_fixes.py`（21 条，覆盖各轮 review 的每条修复：
   锁内读、单行 normalize+CAS、周期自愈、DB 错误保留 vs 真空清空、心跳 CAS 不
   覆盖他 worker 的 key、CAS 输重试、跨用户 hash 不串号、env 守卫、线程幂等）+ 全量
   `python -m pytest tests/ -q --ignore=tests/e2e_model_api_test.py --ignore=tests/test_api.py`
@@ -192,6 +192,36 @@ hash，全量重建与单行重排共用 `_index_user_keys_locked()` 以免两�
    缓存钉住 401。直接删掉参数，`persist_user` 恒定发非定向广播。
 3. 两处文档不一致（CONFIRMED）：CHANGELOG 说 16 条测试实为 15；incident 正文的自愈
    段仍写着初版的 300s / `guard_empty`，与第二轮修订自相矛盾——都已更正为最终值。
+
+### 第四轮 review 的修复
+
+1. **turn_child 不起周期自愈（CONFIRMED，用户可见故障）**。第三轮把自愈 daemon 移进
+   各运行时入口，但漏了 `turn_child.main`——它经 `wire_assembly` 注册了 `users`
+   handler + envelope 公钥 getter、是长命 spawn 子进程，却走自己的入口。少了它，一条
+   丢失的 `users` notify 在该子进程永不自愈：用户轮换内容公钥后，turn_child 会一直用
+   陈旧公钥封装托管回复 → decrypt-failed，直到子进程被杀。修：`turn_child.main` 补上
+   `start_periodic_full_reload()`（对称 `serve_worker.main`）；`start_periodic_full_reload`
+   的 docstring 现在列全三个运行时入口（lifespan / serve_worker.main / turn_child.main）
+   以防再漏；加回归测试 `test_turn_child_main_starts_the_periodic_full_reload`。
+2. **TEE 影子库不再收敛（PLAUSIBLE）**。心跳从 `upsert_user`（无条件 mirror）改
+   `compare_and_set_user`（mirror 是条件 CAS UPDATE `WHERE doc=expected`）后，若影子库
+   该行已 drift，mirror 匹配 0 行静默 no-op，影子行 stale 到 24h reconcile。修：
+   `compare_and_set_user` 的 mirror 改成**无条件 upsert**（`INSERT … ON CONFLICT DO
+   UPDATE`，与 `upsert_user` 的 mirror 同款），主库 CAS 成功后无条件把影子行收敛到
+   新值。`normalize_user_cas` 路径一并受益。
+3. **reindex 删除步扫全 `_key_to_user`（CONFIRMED，性能）**。删除步 `[h for h,uid in
+   _key_to_user.items() if uid==user_id …]` 是 O(全舰队 key 数)，抵消了定向重载"每次
+   只做一个用户的活"的初衷。`_install_user_row_locked` 本就持有被替换的旧行，改成从旧行
+   的 hash 集合算删除集（O(该用户 key 数)）；周期 `_rebuild_key_cache` 仍是兜底，纠正
+   任何 mis-diff 残留。
+4. **CAS-loss 重试重复读库（CONFIRMED，性能）**。重试轮已持有 `compare_and_set_user`
+   返回的赢家行，却又 `db.load_user` 再读一次。改成复用 `authoritative`（deepcopy 隔离，
+   避免下轮编辑改到已装进 `_users`、被 `_resolve_user` 无锁读的那行）。竞争路径从
+   2 读 + 2 CAS 降到 1 读 + 2 CAS。
+5. **revoked/deleted key 鉴权窗口 1.5s→60s（PLAUSIBLE，已文档化权衡）**。丢了 delete/
+   reset notify 的 worker，其 `_key_to_user` 里的已删 key 现在最长 60s（原风暴 ~1.5s）
+   才被周期自愈纠正。被周期自愈 + wake-bus 重连 catch-up 双重 bounded；是收窄换来的
+   已知代价，非缺陷。
 
 **保留不改（第三轮 [1]，已知权衡）**：`_reindex_user_keys_locked` 对"已被别人拥有
 的 hash"跳过不抢，代价是孤儿/合并残留的共享 hash 最长滞留一个自愈周期（~60s）才被

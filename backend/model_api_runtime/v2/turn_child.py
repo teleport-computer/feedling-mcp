@@ -198,6 +198,12 @@ def main(conn: "Connection", worker_id: str, poll_interval: float | None = None)
         serve_worker._configure_db_pool_capacity(v2_worker.MAX_WORKERS)
         db.init_schema()
         serve_worker.wire_assembly()
+        # 周期性全量自愈——和 serve_worker.main / backend lifespan 对称。turn_child
+        # 是长命进程且经 wire_assembly 注册了 users handler + envelope 公钥 getter，
+        # 但走自己的入口（不经 serve_worker.main）。少了这行,一条丢失的 users notify
+        # 在本子进程永不自愈：用户轮换内容公钥后,本进程会一直用陈旧公钥封装托管回复
+        # → decrypt-failed。wire_assembly 本身刻意不起它（被测试调用,见其归属说明）。
+        serve_worker.accounts_registry.start_periodic_full_reload()
         interval = (
             poll_interval if poll_interval is not None
             else serve_worker._positive_float_env("FEEDLING_V2_POLL_INTERVAL_SEC", "1.0")

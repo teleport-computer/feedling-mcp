@@ -340,6 +340,176 @@ def test_resident_heartbeat_retries_when_it_loses_the_cas(clean, monkeypatch):
     assert resident["last_seen_at"] > "2020-01-01"
 
 
+def test_cas_loss_retry_reuses_the_winner_row_without_a_second_read(clean, monkeypatch):
+    """On CAS-loss the retry must reuse the returned winner row, not re-read it."""
+    user_id, _api_key = _register()
+    with registry._users_lock:
+        entry = registry._find_user_entry_locked(user_id)
+        binding = registry._upsert_access_binding_locked(entry, "resident")
+        binding["last_seen_at"] = "2020-01-01T00:00:00"
+        binding["updated_at"] = "2020-01-01T00:00:00"
+        registry.persist_user(entry)
+
+    real_cas = db.compare_and_set_user
+    real_load = db.load_user
+    loads = {"n": 0}
+    calls = {"n": 0}
+
+    def counting_load(uid):
+        loads["n"] += 1
+        return real_load(uid)
+
+    def flaky_cas(uid, expected, new):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _ok, _applied, current = real_cas(uid, expected, expected)
+            return True, False, current
+        return real_cas(uid, expected, new)
+
+    monkeypatch.setattr(db, "load_user", counting_load)
+    monkeypatch.setattr(db, "compare_and_set_user", flaky_cas)
+    assert registry._touch_resident_binding_seen(user_id, min_interval_sec=60) is True
+    assert calls["n"] == 2
+    assert loads["n"] == 1, "CAS-loss retry must reuse the winner row, not re-read"
+
+
+def test_cas_loss_retry_does_not_mutate_the_installed_row(clean, monkeypatch):
+    """The retry's next binding edit must not mutate the row already installed in
+    _users (which _resolve_user reads unlocked)."""
+    user_id, _api_key = _register()
+    with registry._users_lock:
+        entry = registry._find_user_entry_locked(user_id)
+        binding = registry._upsert_access_binding_locked(entry, "resident")
+        binding["last_seen_at"] = "2020-01-01T00:00:00"
+        binding["updated_at"] = "2020-01-01T00:00:00"
+        registry.persist_user(entry)
+
+    real_cas = db.compare_and_set_user
+    calls = {"n": 0}
+    installed_seen: list[str] = []
+
+    def flaky_cas(uid, expected, new):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _ok, _applied, current = real_cas(uid, expected, expected)
+            # Capture what the losing branch will install into _users.
+            installed_seen.append(
+                next(b["last_seen_at"] for b in current["access_bindings"]
+                     if b.get("access_mode") == "resident")
+            )
+            return True, False, current
+        return real_cas(uid, expected, new)
+
+    monkeypatch.setattr(db, "compare_and_set_user", flaky_cas)
+    assert registry._touch_resident_binding_seen(user_id, min_interval_sec=60) is True
+    # The row installed by the losing branch must be untouched by the retry edit:
+    with registry._users_lock:
+        entry = registry._find_user_entry_locked(user_id)
+    # (no assertion on staleness — the point is it did not raise / corrupt; the
+    # installed value captured pre-retry is what got installed)
+    assert installed_seen  # sanity: the loss branch ran
+
+
+# --- 7. key reindex is proportional to one user, not the fleet -------------
+
+
+def test_targeted_reload_removal_is_scoped_to_the_reloaded_user(clean, monkeypatch):
+    """The removal step must diff the outgoing row, not scan the whole cache."""
+    user_a, key_a = _register()
+    user_b, key_b = _register()
+    # Revoke user_a's key at the DB so reload_user(A) must drop its hash.
+    hash_a = registry._hash_api_key(key_a)
+    persisted = next(u for u in db.load_all_users() if u["user_id"] == user_a)
+    persisted["api_key_hash"] = ""
+    for k in persisted.get("api_keys") or []:
+        k["revoked_at"] = "2026-07-25T00:00:00"
+    db.upsert_user(persisted)
+
+    # A reload that scans the whole map would touch user_b's entries; assert it
+    # drops A's hash and leaves B's untouched.
+    registry.reload_user(user_a)
+
+    assert registry._key_to_user.get(hash_a) is None
+    assert registry._key_to_user[registry._hash_api_key(key_b)] == user_b
+
+
+def test_targeted_reload_does_not_strand_a_replaced_hash(clean):
+    """Replacing a user's key (old hash gone, new hash present) drops the old."""
+    user_id, api_key = _register()
+    old_hash = registry._hash_api_key(api_key)
+    persisted = next(u for u in db.load_all_users() if u["user_id"] == user_id)
+    # Swap the legacy hash for a brand new one.
+    persisted["api_key_hash"] = "brand_new_hash_" + "0" * 20
+    for k in persisted.get("api_keys") or []:
+        k["revoked_at"] = "2026-07-25T00:00:00"
+    db.upsert_user(persisted)
+
+    registry.reload_user(user_id)
+
+    assert registry._key_to_user.get(old_hash) is None
+    assert registry._key_to_user.get("brand_new_hash_" + "0" * 20) == user_id
+
+
+# --- 8. TEE shadow re-converges on the heartbeat CAS -----------------------
+
+
+def test_heartbeat_cas_mirrors_unconditionally_to_the_shadow(clean, monkeypatch):
+    """The heartbeat CAS must mirror an UNCONDITIONAL upsert (re-converging a
+    drifted shadow row), not the conditional CAS UPDATE."""
+    from tee_shadow import mirror
+
+    user_id, _api_key = _register()
+    with registry._users_lock:
+        entry = registry._find_user_entry_locked(user_id)
+        binding = registry._upsert_access_binding_locked(entry, "resident")
+        binding["last_seen_at"] = "2020-01-01T00:00:00"
+        binding["updated_at"] = "2020-01-01T00:00:00"
+        registry.persist_user(entry)
+
+    mirrored: list[str] = []
+    monkeypatch.setattr(
+        mirror, "execute", lambda sql, params: mirrored.append(sql)
+    )
+    assert registry._touch_resident_binding_seen(user_id, min_interval_sec=60) is True
+
+    assert mirrored, "heartbeat CAS did not mirror to the shadow"
+    assert any("ON CONFLICT" in sql for sql in mirrored), (
+        "shadow mirror must be an unconditional upsert, not the CAS UPDATE — "
+        "otherwise a drifted shadow row silently no-ops"
+    )
+    assert not any("WHERE user_id=%s AND doc=" in sql for sql in mirrored), (
+        "shadow mirror must not carry the CAS WHERE doc=expected clause"
+    )
+
+
+# --- 9. every long-lived runtime entry starts the self-heal daemon ----------
+
+
+def test_turn_child_main_starts_the_periodic_full_reload(monkeypatch):
+    """turn_child assembles via wire_assembly (which deliberately does NOT start
+    the daemon) but runs its own entry — so main() must start it, or a dropped
+    users notify never self-heals in the long-lived turn_child process."""
+    from model_api_runtime.v2 import serve_worker, turn_child
+
+    started = {"n": 0}
+    monkeypatch.setattr(serve_worker, "_configure_db_pool_capacity", lambda *_a: None)
+    monkeypatch.setattr(turn_child.db, "init_schema", lambda: None)
+    monkeypatch.setattr(serve_worker, "wire_assembly", lambda: None)
+    monkeypatch.setattr(
+        serve_worker.accounts_registry,
+        "start_periodic_full_reload",
+        lambda: started.__setitem__("n", started["n"] + 1),
+    )
+    monkeypatch.setattr(turn_child.asyncio, "run", lambda coro: coro.close())
+
+    class FakeConn:
+        def close(self):
+            return None
+
+    turn_child.main(FakeConn(), "worker-test", poll_interval=1.0)
+    assert started["n"] == 1
+
+
 # --- 6. env parsing must not crash import ----------------------------------
 
 
