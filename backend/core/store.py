@@ -472,6 +472,11 @@ class UserStore:
                 "app_presence_phase",
                 "app_presence_age_sec",
                 "model_api_kind",
+                # V2 wake-lane marker (heartbeat/scheduled/manual_wake/screen_watch):
+                # tells an agent-initiated wake reply apart from a reply to the
+                # user's own message. Fixed vocabulary, not user content -- see
+                # worker._build_encrypted_reply_effect_payload.
+                "wake_kind",
                 # Comma-joined memory ids the user explicitly referenced for
                 # this turn (Garden「talk in chat」). Plaintext ids only; the
                 # enclave expands them into decrypted memory context on read.

@@ -1820,7 +1820,11 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
         raise RuntimeError("transactional reply requires encrypted envelope")
     store = core_store.get_store(user_id)
     thinking_extra = v2_worker._thinking_extra(payload.get("thinking"))
-    build_kwargs = {"extra": thinking_extra} if thinking_extra else {}
+    build_extra = dict(thinking_extra) if thinking_extra else {}
+    wake_kind = str(payload.get("wake_kind") or "")
+    if wake_kind:
+        build_extra["wake_kind"] = wake_kind
+    build_kwargs = {"extra": build_extra} if build_extra else {}
     msg = store._build_chat_message("openclaw", "model_api", envelope, **build_kwargs)
     msg_id = str(msg["id"])
     seq, inserted, finish_db_post_commit = db.chat_append_effect_with_cursor(

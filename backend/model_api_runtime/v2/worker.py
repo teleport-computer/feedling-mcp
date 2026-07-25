@@ -3156,6 +3156,7 @@ def _build_encrypted_reply_effect_payload(
     *,
     effect_id: str,
     reply_through_seq: int | None = None,
+    wake_kind: str = "",
 ) -> dict:
     """Encrypt reply content before it enters the durable outbox.
 
@@ -3176,6 +3177,11 @@ def _build_encrypted_reply_effect_payload(
         if seq < 0:
             raise ValueError("reply_through_seq must be >= 0")
         payload["reply_through_seq"] = seq
+    if wake_kind:
+        # Observability marker only: lets the reply row (and the push gate) tell an
+        # agent-initiated wake message apart from a reply to the user's own message.
+        # Not plaintext — a fixed vocabulary shared with the proactive_jobs log.
+        payload["wake_kind"] = str(wake_kind)
     return payload
 
 
@@ -4908,6 +4914,7 @@ async def _run_wake(
                     text,
                     effect_id=effect_id,
                     reply_through_seq=consumed_seq,
+                    wake_kind=lane,
                 )
                 if consumed_seq is not None:
                     payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
