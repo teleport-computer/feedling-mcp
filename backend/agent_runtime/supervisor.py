@@ -176,6 +176,18 @@ class Supervisor:
         # if this supervisor itself dies, the normal lease TTL still hands the
         # user to a healthy peer.
         self._restart_ledger: dict[str, dict] = {}
+        # Cold-start credential gate (prod/test 2026-07-25). A freshly-discovered
+        # host-all (zero-roster) user can be spawned before ``_resolve_one`` has
+        # fetched+decrypted their provider key, so the consumer's first CLI turn
+        # runs keyless ("Not logged in") and posts a premature "有点慢" fallback.
+        # We defer such a spawn until the key resolves — the user's queued message
+        # waits (chat claim) and gets a REAL reply. Bounded by
+        # ``_keyless_defer_cap_sec``: past the cap we spawn anyway so a permanently
+        # unresolvable key still surfaces the existing fallback rather than a silent
+        # forever-defer. Maps user_id -> first tick we saw it credential-less.
+        self._keyless_since: dict[str, float] = {}
+        self._keyless_defer_cap_sec = float(
+            os.environ.get("FEEDLING_KEYLESS_SPAWN_DEFER_CAP_SEC", "90"))
 
     def _write_token(self, user_id: str, home: str) -> None:
         if self.token_writer is None:
@@ -409,6 +421,7 @@ class Supervisor:
                 with self._lock:
                     self.children.pop(user_id, None)
                     self._restart_ledger.pop(user_id, None)
+                self._keyless_since.pop(user_id, None)
         for user_id in deferred_users:
             if user_id in roster_uids:
                 continue
@@ -426,6 +439,7 @@ class Supervisor:
                 child = self.children.get(user_id)
 
             if child and self.alive_fn(child["pid"]):
+                self._keyless_since.pop(user_id, None)  # running → no longer awaiting a key
                 if not leases.renew(user_id, self.owner, ttl=self.lease_ttl,
                                     pid=child["pid"], status="running", now=self._now()):
                     # Lost the lease (another supervisor took over after an expiry
@@ -526,6 +540,24 @@ class Supervisor:
                 # (no genesis) and done/failed both fall through to spawn.
                 log.info("genesis in progress for %s; deferring spawn this tick", user_id)
                 continue
+            if _entry_has_no_credential(entry):
+                first = self._keyless_since.setdefault(user_id, now)
+                if not _keyless_defer_expired(first, now, self._keyless_defer_cap_sec):
+                    # Cold-start race: the consumer would spawn before _resolve_one
+                    # has fetched+decrypted this user's provider-key envelope, so its
+                    # first CLI turn hits "Not logged in" and posts a premature
+                    # fallback. Defer — the queued message waits (chat claim) and gets
+                    # a REAL reply once the key resolves next tick. provider_key is in
+                    # _spawn_identity, so no other wiring is needed for the self-heal.
+                    log.info("provider key not resolved yet for %s; deferring spawn "
+                             "(%.0fs waited)", user_id, now - first)
+                    continue
+                # Cap exceeded — resolution is stuck; spawn anyway so the existing
+                # keyless fallback / runner_key_decrypt_failed notice still surfaces.
+                log.warning("provider key still unresolved for %s after %.0fs; "
+                            "spawning keyless (fallback path)", user_id, now - first)
+            else:
+                self._keyless_since.pop(user_id, None)
             with self._lock:
                 # Count this tick's not-yet-spawned acquisitions toward the cap so
                 # a single tick can't blow past max_children before they're tracked.
@@ -586,6 +618,7 @@ class Supervisor:
                     "started_at": self._now(),
                 }
             log.info("spawned resident consumer for %s (pid=%s, home=%s)", user_id, pid, home)
+            self._keyless_since.pop(user_id, None)
             # successful spawn -> clear spawn/decrypt notices only; NOT degraded
             # (token health is independent — see _write_token).
             self._resolve_after_spawn(user_id)
@@ -1105,6 +1138,28 @@ def _genesis_ready_to_spawn(user_id: str) -> bool:
         log.warning("genesis_state read failed for %s; allowing spawn: %s", user_id, e)
         return True
     return not _genesis_status_blocks_spawn(blob)
+
+
+def _entry_has_no_credential(entry: dict) -> bool:
+    """Pure gate logic (no DB): True when a roster entry carries NO usable
+    credential — neither an ``api_key`` (dev roster) nor a resolved
+    ``provider_key`` (host-all zero-roster). Spawning such an entry produces a
+    keyless consumer whose first CLI turn fails ("Not logged in · Please run
+    /login") and posts a premature "有点慢" fallback. A dev entry always carries an
+    api_key, so this only ever matches a freshly-discovered host-all user in the
+    cold-start window before ``_resolve_one`` has fetched+decrypted their provider
+    key envelope."""
+    return not (str(entry.get("api_key") or "").strip()
+                or str(entry.get("provider_key") or "").strip())
+
+
+def _keyless_defer_expired(first_seen: float, now: float, cap_sec: float) -> bool:
+    """True once a credential-less user has waited past the cap. The cold-start
+    race resolves within a tick or two; a wait past the cap means resolution is
+    stuck (permanent decrypt/config failure), so stop deferring and spawn anyway —
+    the existing keyless fallback / ``runner_key_decrypt_failed`` notice then
+    surfaces the error instead of an unbounded silent defer."""
+    return (now - first_seen) >= cap_sec
 
 
 # Last-good persona digest per user. A transient DB read failure must NOT flip
