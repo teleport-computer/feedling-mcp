@@ -217,9 +217,11 @@ def test_bootstrap_honors_user_filled_relationship_days(client, monkeypatch):
     assert set(body["effects"][0]["fields"]) == {"agent_name", "self_introduction", "days_with_user"}
     saved = db.get_blob(user_id, "identity")
     assert saved["relationship_anchor_source"] == "user_calibrated"  # user-filled beats auto
-    assert saved["relationship_started_at"] == (date.today() - timedelta(days=200)).isoformat()
+    # relationship_days is 1-based ("第 N 天", met day = 第 1 天), so N=200
+    # stores elapsed N-1=199 → today-199.
+    assert saved["relationship_started_at"] == (date.today() - timedelta(days=199)).isoformat()
     assert identity_service._live_days_with_user(
-        saved, store=core_store.get_store(user_id)) == 200
+        saved, store=core_store.get_store(user_id)) == 199
 
 
 def test_bootstrap_relationship_days_only_creates_calibrated_card(client, monkeypatch):
@@ -241,4 +243,5 @@ def test_bootstrap_relationship_days_only_creates_calibrated_card(client, monkey
     saved = db.get_blob(user_id, "identity")
     assert saved is not None
     assert saved["relationship_anchor_source"] == "user_calibrated"
-    assert saved["relationship_started_at"] == (date.today() - timedelta(days=5)).isoformat()
+    # 1-based: N=5 stores elapsed N-1=4 → today-4.
+    assert saved["relationship_started_at"] == (date.today() - timedelta(days=4)).isoformat()

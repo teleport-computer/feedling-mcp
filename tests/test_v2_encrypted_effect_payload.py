@@ -72,7 +72,9 @@ def test_identity_effect_mapping_freezes_relationship_anchor():
         SimpleNamespace(name="identity_patch", args={"patch": {"relationship_days": 90}})
     )
     assert effect_type == "identity"
-    assert payload["relationship_started_at"] == (date.today() - timedelta(days=90)).isoformat()
+    # relationship_days is the 1-based "第 N 天" (met day = 第 1 天), so N=90
+    # freezes to elapsed N-1=89 → today-89.
+    assert payload["relationship_started_at"] == (date.today() - timedelta(days=89)).isoformat()
     # relative value kept for audit; frozen absolute is the trusted metadata.
     assert payload["patch"]["relationship_days"] == 90
 

@@ -258,9 +258,11 @@ DESCRIPTIONS: dict[str, str] = {
                        "or with op keys add_<field>/remove_<field>/replace_<field> "
                        "(e.g. add_signature, remove_boundaries). To recalibrate how "
                        "long you and the user have known each other, put "
-                       "'relationship_days' (a non-negative integer number of days) in "
-                       "the patch — e.g. patch {\"relationship_days\": 300}. Only act on "
-                       "an explicit request."),
+                       "'relationship_days' in the patch — e.g. patch {\"relationship_days\": 300}. "
+                       "This is the day number AS THE USER SEES AND SAYS IT (the '第 N 天' shown "
+                       "in the app: the day you met is day 1, not day 0). So if the user says "
+                       "'make it day 45', pass 45 and the app will show 45. Positive integer. "
+                       "Only act on an explicit request."),
     "identity_nudge": ("Adjust ONE of the persona's relationship/personality dimension "
                        "scores by a signed integer 'delta' (|delta| ≤ 10). 'dimension' "
                        "must name a dimension that already exists — call identity_get "
