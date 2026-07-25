@@ -9,7 +9,7 @@
 | 期 | 内容 | 状态 |
 |---|---|---|
 | P0 | 硬 4xx 不再发兜底话术 → 改发可行动话术 | ✅ **已落**(claude2,见 §10) |
-| P1 | 轴 B:供给侧健康,连续 48h 无成功即停主动道 | 🔨 已派 codex2,claude2 gatekeep |
+| P1 | 轴 B:供给侧健康,连续 48h 无成功即停主动道 | ✅ **已落**(codex2 `d2a635cd`,claude2 双签,见 §11) |
 | P2 | 免模型召回推送 + 设置页"配置待修复"态 | 待排 |
 | P3 | 轴 A:参与度衰减梯子 | 待排 |
 
@@ -328,3 +328,64 @@ tests/test_chat_resident_consumer.py       新增 1 例端到端:走 _process_me
 仍显示"0 天前"(usr_d98b8d68124090a6 实例)。P0 之后 `blame=user_provider` 的失败
 不再产生这种假 agent 消息 —— 这正是 P1 判定"连续 48h 没有一次成功"所依赖的信号,
 **所以 P0 必须先于 P1**。
+
+## 11. P1 落地记录(codex2 实现,claude2 双签,2026-07-25)
+
+commit `d2a635cd`(origin/test)。新增中立表 `provider_health` + migration `0057_provider_health`,
+新模块 `backend/provider_health.py`。
+
+### 最终判据(比 §B.0 初稿多一个确认窗)
+
+```
+进入 needs_user_action 需同时满足:
+  ① now − baseline ≥ 48h
+       baseline = last_provider_success_at,从未成功过则用 onboarding_route.selected_at
+       (再兜底 active route created_at;都取不到则 baseline = now,fail-safe 不误判)
+  ② 当前失败 blame = user_provider
+  ③ now − user_provider_failure_started_at ≥ 1h   ← USER_PROVIDER_CONFIRM_SEC
+       段起点回填规则:baseline 之后【没有】出现过其他类型失败时,段起点 = baseline
+       (即"窗口内所有失败都是 user_provider",不该被额外罚站);
+       前面出现过 transient/system 失败时,段起点 = 本次事件(必须再同质满 1h)
+```
+
+**③ 是复审加的**。初稿只检查"当前这次失败是 user_provider",复审用其纯函数复现出误伤:
+**50 小时纯 5xx(会自愈的上游故障)+ 恢复期抖出的 1 次 401 → 立刻判定"用户该改配置"**。
+低价中转在抖动/恢复期回 401/403 是常态,这不是边角。把上游的锅算到用户头上,
+正是 `docs/FRONTEND_ERROR_CONTRACT.md §二` 那条纪律要防的事(P0 刚修完它的镜像版本)。
+
+### 行为
+
+- `needs_user_action` → **主动道全停**(gate 返回 `block_reason=provider_needs_user_action`),
+  **V1 consumer tick 与 V2 scheduler 同时生效**(§4.6 的共用咽喉);
+- **聊天道零改动**(全仓 grep:chat 路径无 `provider_health` 引用);
+- **manual / user_initiated 唤醒豁免**(`gate.py` `if not block_reason and not manual`)——
+  与"用户主动发起的永不设门"同一口径,复审加的;
+- 每 24h 一次探活,`SELECT … FOR UPDATE` + 同事务 UPDATE 原子认领;
+  admission 排在所有其他 block_reason **之后**,不会出现"探针被消耗、却被 DND 拦下"的浪费;
+- 任意一次成功 provider 调用 / 设置页在 **active route** 上验证通过 → 立即恢复 `ok`。
+  未激活的备用 route 单测成功**不会**误解封(`model_api_route_test` 只在 `was_active` 时记)。
+- DB 故障 **fail-open**:这是资源优化不是授权边界,观测性故障不得升级成舰队级主动道中断。
+
+### 写点覆盖
+
+| 侧 | 路径 |
+|---|---|
+| V1 | consumer 四条车道(chat/proactive/capture/dream)的成功与失败,均经**已有**的 `POST /v1/model_api/runtime_error`,新增 `provider_result` 字段。成功上报**每进程 15 分钟节流**(48h 判定不需要每回合精度),但设置页有错时立即清;**仅在 POST 真正成功后才盖时间戳**,失败下轮重试 |
+| V2 | worker 全 provider 路径直写(tool_loop 回调 + extraction + trajectory review) |
+
+⚠️ `last_provider_success_at` **绝不能**用 `last_agent_at` 反推初值 —— P0 之前的兜底话术
+是作为 agent 消息写进聊天流的,全崩用户的 `last_agent_at` 仍显示"0 天前"。
+
+### 验证(claude2 独立复跑,非采信提交者数字)
+
+- 纯函数边界 5 例,含两例复审自造:**从未成功 + route 选定 49h 前**(要进)、
+  **死 key 中间夹一次 503 的 2h 心跳节奏**(只晚一轮,不构成活锁);
+- `test_provider_health{,_unit}` 等 P1 相关:133 passed;
+- CI 的 consumer 源码耦合口径 34 个文件:**1093 passed, 1 skipped**(与 P0 基线精确对齐);
+- rebase 到最新 tip 后,`provider_health.py` / `gate.py` / `chat_resident_consumer.py`
+  三个关键文件与双签时的 `f3e25081` **逐字一致**(diff 为空)。
+
+### 尚未做(P2 期,等 Seven 定文案频次)
+
+`needs_user_action` 目前只是**静默**停掉主动道:用户侧除了 P0 那句可行动话术之外没有别的提示。
+key 是死的,生成不出 AI 消息,所以这个状态下的召回**只能**是免模型的模板推送 + 设置页红点。
