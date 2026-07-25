@@ -2714,6 +2714,26 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
     return out
 
 
+def _frozen_relationship_anchor(patch) -> str | None:
+    """Resolve an identity_patch's relative ``relationship_days`` to an absolute
+    ISO ``relationship_started_at`` at ENQUEUE time (item 1 — see the caller).
+
+    Returns the frozen ISO date string, or None when the patch carries no
+    (valid) relationship_days — in which case no anchor metadata is added and the
+    enqueued payload stays byte-for-byte identical to a pre-item-1 row. A
+    malformed/over-cap value returns None too: the live pre-enqueue check
+    (capabilities.identity.relationship_days_error) has already rejected it, so
+    this is only reached for a legal value; refusing to freeze a bad one keeps a
+    smuggled non-int from poisoning the anchor."""
+    if not isinstance(patch, dict) or "relationship_days" not in patch:
+        return None
+    from identity import card_policy
+    if card_policy.relationship_days_shape_error(patch.get("relationship_days")):
+        return None
+    from identity import service as identity_service
+    return identity_service._anchor_from_days(int(patch["relationship_days"]))
+
+
 def _write_tool_effect_payload(tc) -> tuple[str, dict]:
     """Map a WRITE_ACTIONS tool_call to its PR A `(effect_type, payload)` (spec C6). ONE
     definition shared by every lane's `enqueue_write_effect` closure (`process_job`'s chat
@@ -2730,7 +2750,25 @@ def _write_tool_effect_payload(tc) -> tuple[str, dict]:
         # byte-for-byte identical to every pre-nudge (and in-flight) row, so an
         # old sink overlapping a deploy still reads it exactly as before, and
         # the new sink/validator treat a MISSING op as identity_patch.
-        return "identity", dict(tc.args)
+        payload = dict(tc.args)
+        # FROZEN anchor (item 1): relationship_days is a RELATIVE value ("N days
+        # ago from *today*"). If we enqueued only the relative count, the sink
+        # would call _anchor_from_days(N) at REPLAY time — a delayed replay (next
+        # day, after a crash between the durable write and sink-complete) would
+        # resolve a DIFFERENT calendar anchor, drifting the day count and making
+        # the effect non-idempotent. Resolve the absolute relationship_started_at
+        # HERE, once, at enqueue time, and carry it as a trusted top-level
+        # metadata key. The sink consumes this fixed anchor verbatim
+        # (capabilities.identity.patch -> _identity_profile_patch); it is stripped
+        # before the model-arg schema re-validation and can never be model-authored
+        # (the model-facing top-level schema is additionalProperties=false). The
+        # live pre-enqueue check already rejected an invalid/over-cap value, so a
+        # valid int is all that reaches here; a defensive shape check keeps a
+        # non-conforming smuggled value from silently poisoning the anchor.
+        frozen = _frozen_relationship_anchor(payload.get("patch"))
+        if frozen is not None:
+            payload["relationship_started_at"] = frozen
+        return "identity", payload
     if tc.name == "identity_nudge":
         # Same ``identity`` effect_type/sink as identity_patch, disambiguated by
         # a trusted ``op`` taken from the tool NAME (mirrors schedule/workspace):

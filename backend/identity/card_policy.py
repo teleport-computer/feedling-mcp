@@ -60,6 +60,32 @@ MAX_DIMENSIONS = 12  # sanity cap, NOT a floor
 _VALUE_MIN, _VALUE_MAX = 0, 100
 _OK: tuple[bool, str] = (True, "")
 
+# Business cap for the relationship day count. ~100 years. Two reasons it is a
+# hard reject, not a clamp: (1) a value like 1e9 fed to datetime - timedelta
+# raises OverflowError, which — without this guard — escapes as a generic
+# exception on the effect-sink path, releases the claim, and retries forever
+# (a wedged conversation, not a clean 400); (2) anything above this is
+# implausible for a companion relationship. Shared by card_policy (server gate),
+# the V2 live pre-enqueue check, and the anchor-update CAS core so all three
+# agree on the exact contract.
+MAX_RELATIONSHIP_DAYS = 366 * 100  # 36600
+
+
+def relationship_days_shape_error(value) -> str | None:
+    """Return a STABLE error code if ``value`` is not a valid relationship-day
+    count, else None. The count must be a real JSON integer (bool/str/float are
+    rejected — ``int("300")``/``True`` used to slip through the legacy paths),
+    non-negative, and within :data:`MAX_RELATIONSHIP_DAYS`.
+
+    Pure — no DB, no service import — so card_policy stays io_cli-safe and this
+    is callable from every layer that touches relationship_days (server
+    validate_profile_patch, the live pre-enqueue check, the CAS anchor core)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return "relationship_days_must_be_non_negative_int"
+    if value > MAX_RELATIONSHIP_DAYS:
+        return "relationship_days_out_of_range"
+    return None
+
 # Agent name punctuation strip set — shared between card_policy validation
 # and actions.py normalization to prevent drift. Used when determining
 # "emptiness" for agent_name (so punctuation-only names fall through to
@@ -159,10 +185,12 @@ def validate_profile_patch(patch: dict) -> tuple[bool, str]:
     if "relationship_days" in patch:
         # Not a stored string/list profile field — the write path converts it to a
         # relationship_started_at anchor (see identity/actions.py). Guard the shape
-        # here so a malformed value 400s BEFORE the lock, same as the other fields.
-        days = patch.get("relationship_days")
-        if isinstance(days, bool) or not isinstance(days, int) or days < 0:
-            return (False, "relationship_days_must_be_non_negative_int")
+        # AND the business cap here so a malformed / implausibly-large value 400s
+        # BEFORE the lock, same as the other fields. The cap also prevents the
+        # OverflowError-turned-forever-retry described on MAX_RELATIONSHIP_DAYS.
+        err = relationship_days_shape_error(patch.get("relationship_days"))
+        if err:
+            return (False, err)
     if "dimensions" in patch:
         return validate_dimensions_structure(patch.get("dimensions"))
     return _OK

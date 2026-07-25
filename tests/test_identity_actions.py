@@ -1175,3 +1175,163 @@ def test_profile_patch_relationship_days_rejects_non_int(client, monkeypatch):
 
     assert res.status_code == 400, res.get_data(as_text=True)
     assert res.get_json()["error"] == "relationship_days_must_be_non_negative_int"
+
+
+def _rel_mocks(monkeypatch, captured):
+    monkeypatch.setattr(
+        core_enclave, "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured))
+
+
+def test_profile_patch_consumes_frozen_anchor_verbatim(client, monkeypatch):
+    # Item 1: when the sink threads in a frozen relationship_started_at (resolved
+    # at enqueue time), _identity_profile_patch uses it VERBATIM — not today-N —
+    # so a delayed replay does not drift the anchor.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    _rel_mocks(monkeypatch, [])
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{
+            "type": "identity.profile_patch",
+            "patch": {"relationship_days": 300},
+            "relationship_started_at": "2026-04-10",  # frozen by the producer
+        }]},
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+    saved = db.get_blob(user_id, "identity")
+    assert saved["relationship_started_at"] == "2026-04-10"       # frozen, NOT today-300
+    assert saved["relationship_anchor_source"] == "user_calibrated"
+
+
+def test_profile_patch_frozen_anchor_replay_is_idempotent(client, monkeypatch):
+    # Item 1: applying the SAME frozen-anchor patch twice (the write-succeeded-but-
+    # sink-complete-crashed → replay scenario) produces NO second change.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    _rel_mocks(monkeypatch, [])
+
+    action = {
+        "type": "identity.profile_patch",
+        "patch": {"relationship_days": 300},
+        "relationship_started_at": "2026-04-10",
+    }
+    first = client.post("/v1/identity/actions", headers=_headers(api_key), json={"actions": [action]})
+    assert first.status_code == 200
+    assert first.get_json()["effects"][0]["fields"] == ["days_with_user"]
+
+    second = client.post("/v1/identity/actions", headers=_headers(api_key), json={"actions": [action]})
+    assert second.status_code == 200, second.get_data(as_text=True)
+    body = second.get_json()
+    # No effect emitted, no fields changed — the fixed anchor already matches.
+    assert body["results"][0].get("noop") is True
+    assert body["effects"] == []
+
+
+def test_profile_patch_forged_future_anchor_falls_back_to_days(client, monkeypatch):
+    # A frozen anchor outside [today-cap, today] (e.g. a future date) is NOT
+    # trusted — it recomputes from relationship_days, so it can never exceed what
+    # the day count itself allows.
+    from datetime import date, timedelta
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    _rel_mocks(monkeypatch, [])
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{
+            "type": "identity.profile_patch",
+            "patch": {"relationship_days": 30},
+            "relationship_started_at": "2999-01-01",  # implausible future -> ignored
+        }]},
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+    saved = db.get_blob(user_id, "identity")
+    assert saved["relationship_started_at"] == (date.today() - timedelta(days=30)).isoformat()
+
+
+def test_profile_patch_relationship_days_over_cap_rejected(client, monkeypatch):
+    # Item 4: an implausibly large day count is a stable 400 BEFORE the write,
+    # never an OverflowError-turned-retry-loop.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    _rel_mocks(monkeypatch, [])
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{"type": "identity.profile_patch", "patch": {"relationship_days": 10 ** 9}}]},
+    )
+    assert res.status_code == 400, res.get_data(as_text=True)
+    assert res.get_json()["error"] == "relationship_days_out_of_range"
+
+
+# --- Item 5: relationship_days_set now rides the shared CAS anchor core ---
+
+def test_relationship_days_set_via_cas_core(client, monkeypatch):
+    from datetime import date, timedelta
+    from core import store as core_store
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{"type": "identity.relationship_days_set", "days_with_user": 68,
+                           "relationship_anchor_evidence": "user recalibrated"}]},
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+    saved = db.get_blob(user_id, "identity")
+    assert saved["relationship_anchor_source"] == "user_calibrated"
+    assert saved["relationship_started_at"] == (date.today() - timedelta(days=68)).isoformat()
+    assert identity_service._live_days_with_user(saved, store=core_store.get_store(user_id)) == 68
+
+
+def test_relationship_days_set_rejects_bool_and_str(client, monkeypatch):
+    # Unified validation (item 5): the legacy int(...) coercion that accepted
+    # True/"300" is gone.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    for bad in (True, "300", 3.5):
+        res = client.post(
+            "/v1/identity/actions",
+            headers=_headers(api_key),
+            json={"actions": [{"type": "identity.relationship_days_set", "days_with_user": bad}]},
+        )
+        assert res.status_code == 400, (bad, res.get_data(as_text=True))
+        assert res.get_json()["error"] == "relationship_days_must_be_non_negative_int"
+
+
+def test_relationship_anchor_endpoint_contract_preserved(client, monkeypatch):
+    from datetime import date, timedelta
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+
+    res = client.post(
+        "/v1/identity/relationship_anchor",
+        headers=_headers(api_key),
+        json={"days_with_user": 12},
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["status"] == "updated"
+    assert body["relationship_started_at"] == (date.today() - timedelta(days=12)).isoformat()
+    saved = db.get_blob(user_id, "identity")
+    assert saved["relationship_anchor_source"] == "user_calibrated"
+
+
+def test_relationship_anchor_endpoint_rejects_bool(client, monkeypatch):
+    # The old isinstance(int) check let True through as 1; the shared core rejects it.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    res = client.post(
+        "/v1/identity/relationship_anchor",
+        headers=_headers(api_key),
+        json={"days_with_user": True},
+    )
+    assert res.status_code == 400, res.get_data(as_text=True)

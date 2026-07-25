@@ -35,7 +35,24 @@ def test_overwrite_when_explicit_valid_date_and_evidence():
     })
     assert out["relationship_started_at"] == "2026-01-15"
     assert out["relationship_anchor_evidence"] == "user stated in the doc"
-    assert out["relationship_anchor_source"] == "upload"
+    # Tier default changed upload -> material_stated (item 2): a redistill/upload
+    # anchor is a material_stated signal, not a user calibration.
+    assert out["relationship_anchor_source"] == "material_stated"
+
+
+def test_user_calibrated_anchor_never_overwritten_by_redistill():
+    # Item 5 priority guard: user_calibrated (top tier) must survive a redistill
+    # that restates a duration — material_stated must NOT clobber it.
+    existing_calibrated = {
+        "relationship_started_at": "2026-06-01",
+        "relationship_anchor_source": "user_calibrated",
+        "relationship_anchor_evidence": "user set 42 days by hand",
+    }
+    out = gs._relationship_anchor_fields_for_replace(existing_calibrated, {
+        "relationship_anchor": {"relationship_started_at": "2026-01-15",
+                                "relationship_anchor_evidence": "doc says two years"},
+    })
+    assert out == existing_calibrated
 
 
 def test_preserve_when_date_is_not_a_real_date():
@@ -70,7 +87,9 @@ def test_action_anchor_from_days_with_user():
     a = actions._replace_relationship_anchor({"days_with_user": 10, "relationship_anchor_evidence": "runtime history"})
     assert a["relationship_started_at"] == (date.today() - timedelta(days=10)).isoformat()
     assert a["relationship_anchor_evidence"] == "runtime history"
-    assert a["relationship_anchor_source"] == "genesis_resident_distill"
+    # Tier changed genesis_resident_distill -> material_stated (item 2): timing
+    # extracted from uploaded material is a material_stated signal.
+    assert a["relationship_anchor_source"] == "material_stated"
 
 
 def test_action_anchor_explicit_started_at_wins():

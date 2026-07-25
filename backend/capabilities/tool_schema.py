@@ -386,15 +386,29 @@ def validate_tool_args(name: str, args) -> str | None:
         # (see capabilities.identity.merge_patch_fields).
         from capabilities import identity as cap_identity
         merged = cap_identity.merge_patch_fields(args)
-        # A present non-None value counts as content. `v is not None` (not bool(v))
-        # for non-strings so relationship_days=0 ("we met today") is NOT mistaken
-        # for an empty patch. More permissive than before → safe for the replay
-        # gate this same function guards (it can only newly-ACCEPT, never newly-
-        # reject a legal-when-written effect).
-        if not any(
-            (v.strip() if isinstance(v, str) else v is not None)
-            for v in merged.values()
-        ):
+        # Field-aware emptiness (round-2 fix): round 1 loosened this whole gate to
+        # `v is not None`, which let relationship_days=False and unknown=[]/{}/0
+        # sail through to the sink (400 there, but the model already saw success).
+        # Restore per-field semantics WITHOUT re-narrowing the replay gate this
+        # same function guards:
+        #   * str  -> non-blank after strip (original behavior)
+        #   * list -> always content: [] is a legitimate clear-the-list op
+        #     (apply_list_ops treats a bare `signature: []` as "clear")
+        #   * relationship_days -> presence counts (0 = "we met today" is valid);
+        #     its VALIDITY (int/cap) is enforced by the live pre-enqueue check
+        #     (capabilities.identity.relationship_days_error) + the server gate,
+        #     never here — this function also gates replay, where a new rejection
+        #     rule would turn a legal-when-written effect into a retry loop.
+        #   * everything else -> bool(v) (original behavior)
+        def _has_content(key: str, value) -> bool:
+            if isinstance(value, str):
+                return bool(value.strip())
+            if isinstance(value, list):
+                return True
+            if key == "relationship_days":
+                return value is not None
+            return bool(value)
+        if not any(_has_content(k, v) for k, v in merged.items()):
             return "identity_patch requires a non-empty patch or profile field"
     if name == "memory_write":
         actions = args.get("actions") or []

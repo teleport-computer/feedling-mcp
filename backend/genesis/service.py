@@ -1195,6 +1195,19 @@ def _relationship_anchor_fields_for_replace(existing: dict, output: dict) -> dic
     reset relationship history). ONLY overwrite when the upload carries an EXPLICIT,
     valid relationship time — a real ISO date PLUS non-empty evidence — so a vague
     model-derived phrase can't silently reset the anchor (Seven's legality guard)."""
+    preserved = {
+        "relationship_started_at": existing.get("relationship_started_at", ""),
+        "relationship_anchor_source": existing.get("relationship_anchor_source", ""),
+        "relationship_anchor_evidence": existing.get("relationship_anchor_evidence", ""),
+    }
+    # Three-tier priority (item 2/5): user_calibrated > material_stated > auto.
+    # A redistill / role-card upload is at most a material_stated signal, so it
+    # must NEVER overwrite an anchor the USER explicitly calibrated. Without this
+    # guard, re-uploading a persona doc that restated a duration would silently
+    # reset a day count the user had deliberately corrected. Existing card says
+    # user_calibrated -> preserve it, full stop.
+    if str(existing.get("relationship_anchor_source") or "") == "user_calibrated":
+        return preserved
     anchor = output.get("relationship_anchor") if isinstance(output.get("relationship_anchor"), dict) else {}
     started = str(anchor.get("relationship_started_at") or "").strip()
     evidence = str(anchor.get("relationship_anchor_evidence") or "").strip()
@@ -1208,14 +1221,10 @@ def _relationship_anchor_fields_for_replace(existing: dict, output: dict) -> dic
     if valid_date and evidence:
         return {
             "relationship_started_at": started,
-            "relationship_anchor_source": str(anchor.get("relationship_anchor_source") or "upload").strip() or "upload",
+            "relationship_anchor_source": str(anchor.get("relationship_anchor_source") or "material_stated").strip() or "material_stated",
             "relationship_anchor_evidence": evidence,
         }
-    return {
-        "relationship_started_at": existing.get("relationship_started_at", ""),
-        "relationship_anchor_source": existing.get("relationship_anchor_source", ""),
-        "relationship_anchor_evidence": existing.get("relationship_anchor_evidence", ""),
-    }
+    return preserved
 
 
 def replace_identity_preserving_anchor(

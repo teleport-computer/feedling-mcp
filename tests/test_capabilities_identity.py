@@ -173,3 +173,45 @@ def test_nudge_fails_closed_on_missing_dimension():
     r = cap_identity.nudge("STORE", params={"delta": 1})
     assert r.ok is False
     assert r.error["retryable"] is False
+
+
+def test_patch_threads_frozen_relationship_anchor_into_action(monkeypatch):
+    """Item 1 sink path: when the identity sink calls this capability with the
+    trusted frozen relationship_started_at (resolved at enqueue time and stripped
+    from the model args), it must reach _identity_profile_patch as a TOP-LEVEL
+    action field — so the write uses the fixed anchor, not today's date."""
+    seen = {}
+    monkeypatch.setattr(identity_core, "run_actions",
+                        lambda store, payload, *, api_key, runtime_token:
+                        (seen.update(payload=payload), ({"applied": True}, 200))[1])
+    cap_identity.patch("STORE", params={
+        "patch": {"relationship_days": 300},
+        "relationship_started_at": "2026-04-10",
+    })
+    action = seen["payload"]["action"]
+    assert action["patch"] == {"relationship_days": 300}
+    assert action["relationship_started_at"] == "2026-04-10"
+
+
+def test_patch_ignores_blank_frozen_anchor(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(identity_core, "run_actions",
+                        lambda store, payload, *, api_key, runtime_token:
+                        (seen.update(payload=payload), ({"applied": True}, 200))[1])
+    cap_identity.patch("STORE", params={"patch": {"relationship_days": 5}, "relationship_started_at": "  "})
+    assert "relationship_started_at" not in seen["payload"]["action"]
+
+
+def test_relationship_days_error_live_check():
+    from capabilities import identity as ci
+    assert ci.relationship_days_error({"patch": {"relationship_days": 300}}) is None
+    assert ci.relationship_days_error({"patch": {"relationship_days": 0}}) is None
+    assert ci.relationship_days_error({"self_introduction": "hi"}) is None  # not present
+    assert ci.relationship_days_error({"patch": {"relationship_days": "300"}}) == \
+        "relationship_days_must_be_non_negative_int"
+    assert ci.relationship_days_error({"patch": {"relationship_days": True}}) == \
+        "relationship_days_must_be_non_negative_int"
+    assert ci.relationship_days_error({"patch": {"relationship_days": -1}}) == \
+        "relationship_days_must_be_non_negative_int"
+    assert ci.relationship_days_error({"patch": {"relationship_days": 10 ** 9}}) == \
+        "relationship_days_out_of_range"

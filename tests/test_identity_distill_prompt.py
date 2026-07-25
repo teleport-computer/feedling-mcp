@@ -193,3 +193,46 @@ def test_parse_returns_none_on_garbage():
     assert dp.parse_identity_payload("没有 json") is None
     assert dp.parse_identity_payload('["not","a","dict"]') is None
     assert dp.parse_identity_payload('{"tone_style":"  ","dimensions":[]}') is None  # 清洗后空卡
+
+
+# ---------------------------------------------------------------------------
+# Item 2 (material_stated tier): the distiller extracts an explicit relationship
+# start date/duration from the material, GROUNDED — both a valid ISO date AND
+# evidence, or neither. A vague / undated / unevidenced timing yields nothing.
+# ---------------------------------------------------------------------------
+
+def test_prompt_asks_for_grounded_relationship_timing():
+    p = dp.build_resident_identity_prompt("材料")
+    assert "relationship_started_at" in p
+    assert "relationship_anchor_evidence" in p
+    # grounding wording: explicit date/convertible duration only, never a guess
+    assert "never guess from tone" in p
+
+
+def test_parse_keeps_relationship_timing_when_dated_and_evidenced():
+    out = dp.parse_identity_payload(
+        '{"agent_name":"x","relationship_started_at":"2024-01-15",'
+        '"relationship_anchor_evidence":"doc: we met Jan 15 2024"}')
+    assert out["relationship_started_at"] == "2024-01-15"
+    assert out["relationship_anchor_evidence"] == "doc: we met Jan 15 2024"
+
+
+def test_parse_drops_relationship_timing_without_evidence():
+    out = dp.parse_identity_payload(
+        '{"agent_name":"x","relationship_started_at":"2024-01-15","relationship_anchor_evidence":""}')
+    assert "relationship_started_at" not in out
+    assert "relationship_anchor_evidence" not in out
+
+
+def test_parse_drops_relationship_timing_when_date_malformed():
+    out = dp.parse_identity_payload(
+        '{"agent_name":"x","relationship_started_at":"a while ago","relationship_anchor_evidence":"e"}')
+    assert "relationship_started_at" not in out
+
+
+def test_parse_timing_alone_is_not_a_card():
+    # relationship timing is anchor metadata, not card content — a payload that is
+    # ONLY timing (no profile/dimension field) must still parse to None.
+    out = dp.parse_identity_payload(
+        '{"relationship_started_at":"2024-01-15","relationship_anchor_evidence":"e"}')
+    assert out is None

@@ -75,6 +75,29 @@ def rename_pairing_error(params) -> str | None:
     return None if ok_ else err_
 
 
+def relationship_days_error(params) -> str | None:
+    """LIVE-model-call-only pre-enqueue check: if the patch carries
+    ``relationship_days``, it must be a valid non-negative int within the
+    business cap. Returns a stable error code the model can self-correct from,
+    or None.
+
+    Deliberately NOT part of ``merge_patch_fields`` /
+    ``tool_schema.validate_tool_args``: those also gate REPLAY of already-
+    persisted effects, where re-rejecting a value that was legal when written
+    would terminal-discard it. This runs ONLY on the live model-call path in
+    ``v2.executor.dispatch_tool_calls`` — before the effect is enqueued — so a
+    bad day count fails THIS turn with a fixable tool error instead of being
+    enqueued and then 400-ing (or OverflowError-looping) at the sink. The
+    server-side gate (``card_policy.validate_profile_patch``) stays as the final
+    authority; this only front-runs its message, exactly like
+    ``rename_pairing_error``."""
+    from identity import card_policy
+    merged = merge_patch_fields(params or {})
+    if "relationship_days" not in merged:
+        return None
+    return card_policy.relationship_days_shape_error(merged.get("relationship_days"))
+
+
 def patch(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
     params = params or {}
     raw_patch = params.get("patch")
@@ -86,7 +109,20 @@ def patch(store, *, api_key=None, runtime_token=None, params=None) -> Capability
         return err(errors.INVALID, "identity_patch: 'patch' must be an object",
                    retryable=False)
     patch_fields = merge_patch_fields(params)
-    payload = {"action": {"type": "identity.profile_patch", "patch": patch_fields}}
+    action = {"type": "identity.profile_patch", "patch": patch_fields}
+    # FROZEN anchor (item 1): when this capability runs as the identity SINK, the
+    # producer (worker._write_tool_effect_payload) has already resolved
+    # relationship_days -> an absolute relationship_started_at AT ENQUEUE TIME and
+    # threaded it here as a trusted top-level param (stripped from the model args
+    # in serve_worker._validate_decrypted_tool_effect, never model-authored). Pass
+    # it into the action so _identity_profile_patch consumes the FIXED anchor
+    # instead of recomputing from today's date on a delayed replay (which would
+    # drift the day count and break idempotency). Absent on the direct request
+    # path — there resolution happens once, inline, in _identity_profile_patch.
+    frozen_anchor = params.get("relationship_started_at")
+    if isinstance(frozen_anchor, str) and frozen_anchor.strip():
+        action["relationship_started_at"] = frozen_anchor.strip()
+    payload = {"action": action}
     body, status = identity_core.run_actions(store, payload, api_key=api_key,
                                              runtime_token=runtime_token or "")
     return _norm(body, status, default_msg="identity patch unavailable")

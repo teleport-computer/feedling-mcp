@@ -2530,7 +2530,27 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
             tool_name = "identity_nudge"
         else:
             raise RuntimeError("invalid encrypted identity operation")
-        args = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
+        # `relationship_started_at` is the trusted FROZEN anchor the producer
+        # (worker._write_tool_effect_payload) resolved from relationship_days at
+        # enqueue time (item 1) — internal metadata, NOT a model-facing arg. Strip
+        # it (like effect_id/op) before the model-arg schema check, which is
+        # additionalProperties=false and would otherwise reject the whole effect
+        # into a retry loop. Validate its shape here instead: a well-formed ISO
+        # date if present. The sink still receives it via _sink_identity's params.
+        frozen_anchor = payload.get("relationship_started_at")
+        if frozen_anchor is not None:
+            if not isinstance(frozen_anchor, str) or not frozen_anchor.strip():
+                raise RuntimeError("invalid encrypted identity anchor")
+            from datetime import date as _date
+            try:
+                _date.fromisoformat(frozen_anchor.strip()[:10])
+            except ValueError:
+                raise RuntimeError("invalid encrypted identity anchor")
+        args = {
+            k: v
+            for k, v in payload.items()
+            if k not in ("effect_id", "op", "relationship_started_at")
+        }
     elif effect_type == "schedule":
         tool_name = str(payload.get("op") or "")
         if tool_name not in _SCHEDULE_CAPABILITY_OPS:

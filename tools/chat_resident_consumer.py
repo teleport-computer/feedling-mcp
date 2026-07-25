@@ -12779,6 +12779,24 @@ def _resident_distill_identity(state: dict) -> None:
     base_identity_replaced_at = state["base_identity_replaced_at"]
     conflict_retried = False
     while identity_payload is not None:
+        # Lift the material_stated relationship timing (item 2) OUT of the
+        # identity payload to the action's top level: relationship_started_at /
+        # relationship_anchor_evidence are anchor metadata, not encrypted-card
+        # profile fields, so the backend reads them from the ACTION
+        # (identity/actions.py::_replace_relationship_anchor -> source
+        # material_stated) rather than from the card payload. Distiller only emits
+        # them GROUNDED (both present + valid date, else neither — see
+        # distill_prompt_v1.parse_identity_payload); server never overwrites a
+        # user_calibrated anchor with them (genesis priority guard). Purely
+        # additive: absent -> the action is byte-identical to before.
+        anchor_action_fields = {}
+        started = str(identity_payload.pop("relationship_started_at", "") or "").strip()
+        anchor_evidence = str(identity_payload.pop("relationship_anchor_evidence", "") or "").strip()
+        if started and anchor_evidence:
+            anchor_action_fields = {
+                "relationship_started_at": started,
+                "relationship_anchor_evidence": anchor_evidence,
+            }
         try:
             execute_identity_actions([{
                 "type": "identity.replace",
@@ -12787,6 +12805,7 @@ def _resident_distill_identity(state: dict) -> None:
                 "reason": "Distilled identity from material the user uploaded.",
                 "identity": identity_payload,
                 "base_identity_replaced_at": base_identity_replaced_at,
+                **anchor_action_fields,
             }])
             identity_status = "replaced"
             break
