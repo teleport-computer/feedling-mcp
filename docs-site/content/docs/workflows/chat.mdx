@@ -194,6 +194,30 @@ does not wake the resident consumer again. An invalid UUID returns
 
 For `content_type: "file"`, `file_name` and `file_mime` are optional metadata.
 
+To send **text alongside an image or file** (a caption), encrypt that text as its
+own envelope and pass it as `caption_envelope` — the same E2E `EncryptedEnvelope`
+shape as the main `envelope`, wrapped to the enclave (`K_enclave`) so it can be
+decrypted into the message's plaintext content. Without it, an image/file message
+carries no accompanying text and the agent sees only the attachment.
+
+```json
+{
+  "envelope": { "...": "encrypted image bytes" },
+  "content_type": "image",
+  "caption_envelope": {
+    "v": 1,
+    "id": "env_caption_123",
+    "body_ct": "BASE64_CIPHERTEXT_OF_CAPTION_TEXT",
+    "nonce": "BASE64_NONCE",
+    "K_user": "BASE64_KEY_WRAPPED_TO_USER",
+    "K_enclave": "BASE64_KEY_WRAPPED_TO_ENCLAVE",
+    "enclave_pk_fpr": "ENCLAVE_PUBLIC_KEY_FINGERPRINT",
+    "visibility": "shared",
+    "owner_user_id": "usr_0123456789abcdef"
+  }
+}
+```
+
 ```json
 {
   "id": "msg_user_123",

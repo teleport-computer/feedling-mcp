@@ -10,6 +10,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **`POST /v1/chat/message` now persists an optional `caption_envelope`.** To send
+  text alongside an image or file, pass the caption as its own E2E
+  `EncryptedEnvelope` in `caption_envelope` (same shape as `envelope`, wrapped to
+  the enclave). The enclave decrypts it into the message's plaintext content so the
+  agent receives the caption. Previously an image/file sent with typed text
+  dropped the text on this endpoint (the agent saw only the attachment). Image/file
+  sends without a caption are unchanged; `content_type: "text"` ignores the field.
+
 - **The `identity_patch` tool can recalibrate the relationship day count.** Put a
   positive integer `relationship_days` inside the `patch` object (for example
   `patch: {"relationship_days": 300}`) and the persona's relationship start anchor is
