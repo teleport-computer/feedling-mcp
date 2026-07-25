@@ -2542,9 +2542,17 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
             if not isinstance(frozen_anchor, str) or not frozen_anchor.strip():
                 raise RuntimeError("invalid encrypted identity anchor")
             from datetime import date as _date
+            # Full-string validation (round-3 fix): the old `[:10]` slice accepted
+            # `2026-04-10garbage` / `2026-04-10T99:99:99` by only parsing the first
+            # 10 chars. The producer only ever emits a canonical YYYY-MM-DD, so
+            # reject anything that isn't exactly that: parse the WHOLE string and
+            # require it round-trips. Normal path is unaffected.
+            s = frozen_anchor.strip()
             try:
-                _date.fromisoformat(frozen_anchor.strip()[:10])
+                parsed = _date.fromisoformat(s)
             except ValueError:
+                raise RuntimeError("invalid encrypted identity anchor")
+            if parsed.isoformat() != s:
                 raise RuntimeError("invalid encrypted identity anchor")
         args = {
             k: v

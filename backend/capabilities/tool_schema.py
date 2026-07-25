@@ -386,27 +386,33 @@ def validate_tool_args(name: str, args) -> str | None:
         # (see capabilities.identity.merge_patch_fields).
         from capabilities import identity as cap_identity
         merged = cap_identity.merge_patch_fields(args)
-        # Field-aware emptiness (round-2 fix): round 1 loosened this whole gate to
-        # `v is not None`, which let relationship_days=False and unknown=[]/{}/0
-        # sail through to the sink (400 there, but the model already saw success).
-        # Restore per-field semantics WITHOUT re-narrowing the replay gate this
-        # same function guards:
-        #   * str  -> non-blank after strip (original behavior)
-        #   * list -> always content: [] is a legitimate clear-the-list op
-        #     (apply_list_ops treats a bare `signature: []` as "clear")
-        #   * relationship_days -> presence counts (0 = "we met today" is valid);
-        #     its VALIDITY (int/cap) is enforced by the live pre-enqueue check
+        # Field-aware emptiness (round-3 fix): earlier rounds treated ANY list as
+        # content and keyed relationship_days off `value is not None`. Two holes:
+        # `{"category": []}` (a STRING field) and `{"unknown": []}` slipped past the
+        # empty gate as "has content", while `{"relationship_days": null}` was
+        # judged empty and never reached the live gate that would give the model a
+        # fixable error. Make it truly field-aware WITHOUT re-narrowing the replay
+        # gate this same function guards:
+        #   * relationship_days -> PRESENCE of the key counts (0 = "we met today"
+        #     is valid; null/False must still enter the live gate to get a stable
+        #     error, not be silently dropped as an empty patch). Its VALIDITY
+        #     (int/cap) is enforced by the live pre-enqueue check
         #     (capabilities.identity.relationship_days_error) + the server gate,
         #     never here — this function also gates replay, where a new rejection
         #     rule would turn a legal-when-written effect into a retry loop.
-        #   * everything else -> bool(v) (original behavior)
+        #   * str  -> non-blank after strip (original behavior)
+        #   * a REAL list field (card_policy.PROFILE_LIST_FIELDS) -> always content:
+        #     [] is a legitimate clear-the-list op (apply_list_ops treats a bare
+        #     `signature: []` as "clear"). A [] on a non-list field is NOT content.
+        #   * everything else (unknown / string field's []/{} / 0 / False) -> bool(v)
+        from identity import card_policy as _cp
         def _has_content(key: str, value) -> bool:
+            if key == "relationship_days":
+                return "relationship_days" in merged
             if isinstance(value, str):
                 return bool(value.strip())
-            if isinstance(value, list):
+            if key in _cp.PROFILE_LIST_FIELDS:
                 return True
-            if key == "relationship_days":
-                return value is not None
             return bool(value)
         if not any(_has_content(k, v) for k, v in merged.items()):
             return "identity_patch requires a non-empty patch or profile field"

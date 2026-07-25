@@ -104,6 +104,38 @@ def test_identity_patch_advertises_and_accepts_relationship_days():
         "identity_patch", {"patch": {"relationship_days": 0}}) is None
 
 
+def test_identity_patch_empty_gate_is_field_aware():
+    # Round-3 fix: the empty-patch gate is now truly field-aware. A `[]` only
+    # counts as content on a REAL list field (card_policy.PROFILE_LIST_FIELDS);
+    # a `[]` on a string field or an unknown key is empty, not content.
+    V = tool_schema.validate_tool_args
+    # unknown key with [] -> blocked as empty (was wrongly let through before)
+    assert V("identity_patch", {"patch": {"unknown": []}}) is not None
+    # string field with [] -> blocked as empty ([] is not a valid string value)
+    assert V("identity_patch", {"patch": {"category": []}}) is not None
+    # a genuine list field with [] -> passes (legitimate clear-the-list op)
+    assert V("identity_patch", {"patch": {"signature": []}}) is None
+
+
+def test_identity_patch_relationship_days_null_reaches_live_gate():
+    # Round-3 fix: relationship_days keys off PRESENCE, not `value is not None`,
+    # so null/False are NOT swallowed as an empty patch — they pass the empty
+    # gate and hit the live pre-enqueue gate, which returns a stable error the
+    # model can self-correct from (never a silent enqueue).
+    from capabilities import identity as cap_identity
+    V = tool_schema.validate_tool_args
+    # not treated as empty (empty gate returns None -> would proceed to live gate)
+    assert V("identity_patch", {"patch": {"relationship_days": None}}) is None
+    assert V("identity_patch", {"patch": {"relationship_days": False}}) is None
+    # 0 = "we met today" is a valid, non-empty patch
+    assert V("identity_patch", {"patch": {"relationship_days": 0}}) is None
+    # the live gate gives null/False a STABLE error (so they never enqueue)
+    assert cap_identity.relationship_days_error(
+        {"patch": {"relationship_days": None}}) == "relationship_days_must_be_non_negative_int"
+    assert cap_identity.relationship_days_error(
+        {"patch": {"relationship_days": False}}) == "relationship_days_must_be_non_negative_int"
+
+
 def test_all_model_facing_tools_reject_unknown_top_level_fields():
     for spec in tool_schema.build_tool_specs():
         assert spec.parameters["additionalProperties"] is False, spec.name

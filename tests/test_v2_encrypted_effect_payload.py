@@ -97,6 +97,28 @@ def test_validate_identity_effect_rejects_malformed_frozen_anchor():
         )
 
 
+@pytest.mark.parametrize("bad", ["2026-04-10garbage", "2026-04-10T00:00:00", "20260410"])
+def test_validate_identity_effect_rejects_non_canonical_frozen_anchor(bad):
+    # Round-3 fix: the old `[:10]` slice accepted a canonical prefix followed by
+    # junk (or a datetime). Full-string parse + round-trip now rejects anything
+    # that is not exactly YYYY-MM-DD (the only shape the producer ever emits).
+    with pytest.raises(RuntimeError, match="invalid encrypted identity anchor"):
+        serve_worker._validate_decrypted_tool_effect(
+            "identity",
+            {"effect_id": "e", "patch": {"relationship_days": 90},
+             "relationship_started_at": bad},
+        )
+
+
+def test_validate_identity_effect_accepts_canonical_frozen_anchor():
+    # The canonical date the producer emits still passes.
+    serve_worker._validate_decrypted_tool_effect(
+        "identity",
+        {"effect_id": "e", "patch": {"relationship_days": 90},
+         "relationship_started_at": "2026-04-10"},
+    )  # must not raise
+
+
 # --- _validate_decrypted_tool_effect: identity op routing (Codex C1) ----------
 
 def test_validate_identity_effect_accepts_legacy_patch_without_op():

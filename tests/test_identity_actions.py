@@ -18,6 +18,7 @@ from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
 from core import store as core_store  # noqa: E402
 from identity import actions as identity_actions_mod  # noqa: E402
+from identity import card_policy  # noqa: E402
 from identity import service as identity_service  # noqa: E402
 
 
@@ -1230,6 +1231,50 @@ def test_profile_patch_frozen_anchor_replay_is_idempotent(client, monkeypatch):
     # No effect emitted, no fields changed — the fixed anchor already matches.
     assert body["results"][0].get("noop") is True
     assert body["effects"] == []
+
+
+def test_resolve_relationship_anchor_boundary_verbatim_no_drift():
+    # Round-3 (Important 1): at relationship_days == MAX the enqueue-day anchor is
+    # today-MAX. The OLD `0 <= today-frozen <= MAX` age check made a next-day
+    # replay (today-frozen == MAX+1) reject the frozen date and recompute from the
+    # replay day, drifting the anchor one day forward. The fix returns the frozen
+    # date VERBATIM, so replay is idempotent. Assert against the FROZEN INPUT
+    # itself (not a today-MAX recompute) to prove it is returned byte-for-byte.
+    from datetime import date, timedelta
+    MAX = card_policy.MAX_RELATIONSHIP_DAYS
+
+    frozen_at_cap = (date.today() - timedelta(days=MAX)).isoformat()
+    got = identity_actions_mod._resolve_relationship_anchor(
+        {"relationship_started_at": frozen_at_cap}, MAX)
+    assert got == frozen_at_cap  # verbatim, not recomputed
+
+    # Simulate a cross-day replay: a frozen date OLDER than today-MAX (i.e. what
+    # the old delta<=MAX check would have rejected as "out of range") is still
+    # returned verbatim, because days is in-range and the date is not in the
+    # future. This is the exact drift case the old code got wrong.
+    frozen_older = (date.today() - timedelta(days=MAX + 1)).isoformat()
+    assert identity_actions_mod._resolve_relationship_anchor(
+        {"relationship_started_at": frozen_older}, MAX) == frozen_older
+
+
+def test_resolve_relationship_anchor_future_falls_back_to_days():
+    # A future frozen anchor is untrusted -> recompute from days.
+    from datetime import date, timedelta
+    future = (date.today() + timedelta(days=5)).isoformat()
+    got = identity_actions_mod._resolve_relationship_anchor(
+        {"relationship_started_at": future}, 30)
+    assert got == identity_service._anchor_from_days(30)
+    assert got != future
+
+
+def test_resolve_relationship_anchor_is_idempotent():
+    # Resolving the same frozen anchor twice yields the same value (noop replay).
+    from datetime import date, timedelta
+    frozen = (date.today() - timedelta(days=100)).isoformat()
+    action = {"relationship_started_at": frozen}
+    first = identity_actions_mod._resolve_relationship_anchor(action, 100)
+    second = identity_actions_mod._resolve_relationship_anchor(action, 100)
+    assert first == second == frozen
 
 
 def test_profile_patch_forged_future_anchor_falls_back_to_days(client, monkeypatch):

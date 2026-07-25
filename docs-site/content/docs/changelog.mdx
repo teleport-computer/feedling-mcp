@@ -18,8 +18,13 @@ change must not be interpreted as an API guarantee.
   other profile field. Notes on the contract:
   - **Absolute anchor is frozen at request time.** The relative day count is
     resolved to a fixed calendar date when the change is accepted, not when it is
-    later applied, so a delayed/retried apply cannot drift the count and re-applying
-    the same recalibration is a no-op.
+    later applied. When the change is applied, that frozen date is consumed verbatim
+    as long as it is a valid calendar date not in the future and its day count is
+    within the ~100-year cap; the apply step never re-ages it against the day it
+    happens to run. A delayed or retried apply — including one that crosses midnight
+    or lands at the maximum day count — therefore uses the exact date computed at
+    request time, so it cannot drift and re-applying the same recalibration is a
+    no-op.
   - **Priority.** An explicit `relationship_days` is treated as a deliberate user
     calibration and wins over both an auto-inferred count (earliest memory / session)
     and a duration stated in uploaded persona material; a persona re-derivation will

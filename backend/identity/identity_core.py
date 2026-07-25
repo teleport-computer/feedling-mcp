@@ -289,6 +289,16 @@ def update_relationship_anchor(store, payload: dict) -> tuple[dict, int]:
     days_with_user is now rejected (the old `isinstance(int)` check let `True`
     through as 1)."""
     days_with_user = payload.get("days_with_user")
+    # Preserve the LEGACY error priority (round-3 fix): the shared CAS helper does
+    # its shape check FIRST, so an un-created card + a missing/malformed
+    # days_with_user would surface as 400 (shape) instead of the endpoint's
+    # historical 404 (card not found, regardless of day value). Front-run the
+    # existence check here so the 404 wins. The CAS helper still re-checks
+    # existence inside the lock, so this is a message-priority guard, not the
+    # authority — idempotent and harmless.
+    existing = identity_service._load_identity(store)
+    if not existing:
+        return {"error": "identity not initialized"}, 404
     identity, _old_days, err = identity_actions_mod._relationship_anchor_cas_write(
         store, days=days_with_user, source="user_calibrated", evidence="")
     if err == "identity_not_initialized":

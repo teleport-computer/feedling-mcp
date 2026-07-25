@@ -360,19 +360,36 @@ def _resolve_relationship_anchor(action: dict, days: int) -> str:
     capabilities.identity.patch) so a delayed sink replay uses the date computed
     at ENQUEUE time, not at replay time. Falls back to computing from ``days``
     against today on the direct request path (immediate execution — no drift
-    window). The frozen value is trusted but BOUNDED: it must parse to a date in
-    ``[today - MAX_RELATIONSHIP_DAYS, today]``; anything outside recomputes from
-    ``days``, so a stale/forged anchor can never exceed what relationship_days
-    itself allows."""
+    window).
+
+    The frozen value is already inside the encrypted effect envelope and cannot
+    be model-authored (serve_worker strips it from the model-arg schema; the
+    producer generates it from an already-validated ``days``). So the sink trusts
+    it VERBATIM under two defensive bounds — and, crucially, once trusted it is
+    returned as-is, never re-aged against the replay day:
+
+      (a) it parses to a real calendar date that is NOT in the future
+          (``frozen <= today``); and
+      (b) the accompanying ``days`` is within ``[0, MAX_RELATIONSHIP_DAYS]``
+          (already guaranteed upstream by the live gate + server gate; a
+          defensive second check here).
+
+    Returning the frozen date verbatim (instead of the old
+    ``0 <= today-frozen <= MAX`` age check) is what makes a delayed/retried
+    replay idempotent: at ``relationship_days == MAX`` the enqueue-day anchor is
+    ``today-MAX``, so a next-day replay had ``today-frozen == MAX+1`` and the old
+    check wrongly rejected it → recomputed from the replay day → anchor drifted
+    one day forward. A verbatim return cannot drift. Only a future date, an
+    unparseable string, or an out-of-range ``days`` falls back to
+    ``_anchor_from_days(days)``."""
     frozen = str(action.get("relationship_started_at") or "").strip()
     if frozen:
         d = identity_service._parse_iso_calendar_date(frozen)
         if d is not None:
             from datetime import date as _date
             from identity import card_policy
-            delta = (_date.today() - d).days
-            if 0 <= delta <= card_policy.MAX_RELATIONSHIP_DAYS:
-                return d.isoformat()
+            if d <= _date.today() and 0 <= int(days) <= card_policy.MAX_RELATIONSHIP_DAYS:
+                return d.isoformat()  # verbatim — cross-day replay cannot drift it
     return identity_service._anchor_from_days(days)
 
 
