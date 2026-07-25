@@ -1206,3 +1206,53 @@ def test_fire_scheduled_for_user_enqueues_a_scheduled_agent_job(monkeypatch, bac
     monkeypatch.setattr("proactive.scheduled_wake_v2.ScheduledWakeServiceV2", _FakeService)
     assert serve_worker._fire_scheduled_for_user(uid) == 1
     assert calls == [(uid, "scheduled")]
+
+
+def test_push_token_carries_only_the_chat_push_scope():
+    from core import runtime_token
+
+    token = serve_worker._mint_push_token("u_push_scope")
+    claims = runtime_token.verify(b"test-runtime-token-secret", token)
+    assert claims["scope"] == ["chat_push"]
+    assert claims["user_id"] == "u_push_scope"
+
+
+def test_send_reply_push_posts_to_backend(monkeypatch):
+    posted = {}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"status": "delivered"}
+
+    def _fake_post(url, json=None, headers=None, timeout=None):
+        posted.update(url=url, json=json, headers=headers)
+        return _Resp()
+
+    monkeypatch.setenv("FEEDLING_API_URL", "http://backend:5001")
+    monkeypatch.setattr(serve_worker.httpx, "post", _fake_post)
+
+    serve_worker._send_reply_push(
+        "u_push_send", msg_id="m1", body="hi", is_wake=True)
+
+    assert posted["url"] == "http://backend:5001/v1/internal/push/ai_reply"
+    assert posted["json"] == {"msg_id": "m1", "body": "hi", "is_wake": True}
+    assert posted["headers"]["X-Feedling-Runtime-Token"]
+
+
+def test_send_reply_push_swallows_transport_errors(monkeypatch):
+    def _boom(*a, **k):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setenv("FEEDLING_API_URL", "http://backend:5001")
+    monkeypatch.setattr(serve_worker.httpx, "post", _boom)
+
+    # 不抛：推送失败绝不能冒到回合上去。
+    serve_worker._send_reply_push("u_push_err", msg_id="m1", body="hi", is_wake=False)
+
+
+def test_kill_switch_unwires_the_push_dep(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_PUSH_ENABLED", "0")
+    deps = serve_worker.build_production_deps()
+    assert deps.send_reply_push is None

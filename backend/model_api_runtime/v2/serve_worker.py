@@ -52,6 +52,8 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
+import httpx
+
 # Put the backend dir on sys.path BEFORE importing backend modules. When this is
 # run as a script (`python backend/model_api_runtime/v2/serve_worker.py` — how the
 # runner compose starts it), sys.path[0] is the script's own dir (…/v2), NOT
@@ -458,6 +460,53 @@ def _mint_genesis_token(user_id: str, scopes: list[str] | None = None) -> str:
         scope=list(scopes or _GENESIS_TOKEN_SCOPE),
         ttl=float(os.environ.get("FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC", "7200")),
     )
+
+
+# Push is a separate, deliberately narrow scope: the reply-push call only needs to
+# hand backend a plaintext body for an already-published row, never to decrypt
+# anything. Minted per call with a short TTL — do NOT widen _RUNTIME_TOKEN_SCOPE
+# (see the comment above it: the enclave's local check ignores scope, so that list
+# must stay stable).
+_PUSH_TOKEN_SCOPE = ["chat_push"]
+
+
+def _mint_push_token(user_id: str) -> str:
+    secret = os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").strip().encode("utf-8")
+    if not secret:
+        raise RuntimeError("FEEDLING_RUNTIME_TOKEN_SECRET not set")
+    return runtime_token.mint(
+        secret,
+        user_id=user_id,
+        runtime_instance_id="v2-push",
+        scope=_PUSH_TOKEN_SCOPE,
+        ttl=60.0,
+    )
+
+
+def _send_reply_push(user_id: str, *, msg_id: str, body: str, is_wake: bool) -> None:
+    """`TurnDeps.send_reply_push` 的生产接线。
+
+    APNs 私钥只注入 backend 容器，所以推送由 backend 发；这里只把明文正文经
+    compose 内网交过去（与 V1 consumer 走 HTTP 传 push_body 是同一个姿态）。
+    完全 best-effort：任何异常都在这里吞掉并记日志，绝不冒到回合上。
+    """
+    api_url = os.environ.get("FEEDLING_API_URL", "").strip()
+    if not api_url:
+        log.warning("[v2.push] FEEDLING_API_URL not set — reply push skipped")
+        return
+    try:
+        resp = httpx.post(
+            f"{api_url}/v1/internal/push/ai_reply",
+            json={"msg_id": msg_id, "body": body, "is_wake": is_wake},
+            headers={"X-Feedling-Runtime-Token": _mint_push_token(user_id)},
+            timeout=10.0,
+        )
+        if resp.status_code >= 400:
+            log.warning(
+                "[v2.push] reply push rejected user=%s status=%s",
+                user_id, resp.status_code)
+    except Exception as e:  # noqa: BLE001 — best-effort by contract
+        log.warning("[v2.push] reply push failed user=%s: %s", user_id, e)
 
 
 def _prompt_cache_route_scope(runtime, *, secret: bytes) -> str:
@@ -2778,6 +2827,11 @@ def build_production_deps() -> v2_worker.TurnDeps:
         load_workspace_prompt=_load_workspace_prompt,
         seal_trajectory_payload=_seal_trajectory_payload,
         open_trajectory_payload=_open_trajectory_payload,
+        send_reply_push=(
+            _send_reply_push
+            if os.environ.get("FEEDLING_V2_PUSH_ENABLED", "1").strip() != "0"
+            else None
+        ),
     )
 
 
