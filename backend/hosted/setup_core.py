@@ -1188,6 +1188,15 @@ def model_api_models(store, payload: dict, *, caller_api_key: str | None) -> tup
     else:
         provider_key = raw_key
 
+    # Validate the egress target (provider allowlist + URL scheme) with the SAME
+    # rules as save/test, minus the model requirement. An unknown provider is a
+    # hard 400 here — never a silent "catalog unsupported". For the credential
+    # path this re-checks the stored provider/base_url (harmless).
+    try:
+        provider, base_url = provider_client.validate_catalog_target(provider, base_url)
+    except provider_client.ProviderError as e:
+        return {"error": "model_api_config_invalid", "detail": str(e)[:220]}, 400
+
     try:
         result = provider_client.list_provider_models(provider, provider_key, base_url)
     except provider_client.ProviderError as e:
