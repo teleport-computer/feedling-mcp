@@ -89,12 +89,9 @@ def _stale_key_conflict(store: UserStore, envelope: dict) -> tuple[dict, int] | 
 # --------------------------------------------------------------------------- #
 
 def _settings_v2_for_store(store: UserStore):
-    try:
-        from proactive.store_v2 import DBProactiveSettingsStoreV2
+    from proactive.controls_v2 import load_settings_v2_for_store
 
-        return DBProactiveSettingsStoreV2().load(store.user_id)
-    except Exception:
-        return store.load_proactive_settings()
+    return load_settings_v2_for_store(store)
 
 
 def _proactive_job_for_response(store: UserStore, job_id: str) -> dict | None:

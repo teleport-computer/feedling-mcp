@@ -970,6 +970,16 @@ class TurnDeps:
     # of an empty pending set; the field exists so the call site is already wired
     # ahead of the producer landing.
     apply_pending_effects: Callable[[str], dict] | None = None
+    # (user_id, *, msg_id, body, is_wake, lane) -> None：把本回合最后一条已落库回复的
+    # 明文正文交给 backend 发 APNs（serve-worker 容器没有 APNs 私钥，只有 backend
+    # 有）。best-effort：实现方吞掉自身异常，调用点也再兜一层 —— 推送失败绝不能
+    # 把一个已经成功发布回复的回合打成 failed。None（所有不接线的测试/legacy
+    # 调用方）= 特性关闭，行为与补齐推送之前完全一致。``lane`` 是本次唤醒的 lane
+    # 名（chat lane 传空字符串）：backend 端用它推 manual（lane == "manual_wake"）与
+    # 真实 wake source，对齐 V1 `_proactive_delivery_decision_v2` 从 job 推 manual
+    # 的做法 —— 之前这里硬编码 source="heartbeat"/manual=False，导致关了
+    # reminders_delivery 的用户在 V2 手动唤醒收不到推送（V1 会走 manual_bypass）。
+    send_reply_push: Callable[..., None] | None = None
     # (store, *, api_key, runtime_token, enclave_sem) -> awaitable McpTurn: build this chat
     # turn's user-MCP tool surface. Implemented in `hosted.mcp_tools.load_turn_mcp`
     # and injected by `serve_worker.build_production_deps`, because loading a user's
@@ -3161,6 +3171,7 @@ def _build_encrypted_reply_effect_payload(
     *,
     effect_id: str,
     reply_through_seq: int | None = None,
+    wake_kind: str = "",
 ) -> dict:
     """Encrypt reply content before it enters the durable outbox.
 
@@ -3181,6 +3192,18 @@ def _build_encrypted_reply_effect_payload(
         if seq < 0:
             raise ValueError("reply_through_seq must be >= 0")
         payload["reply_through_seq"] = seq
+    if wake_kind:
+        # Observability marker only: lets the reply row (and the push gate) tell an
+        # agent-initiated wake message apart from a reply to the user's own message.
+        # Not plaintext. Fixed vocabulary, but NOT the same one as V1's
+        # `proactive_jobs` log: this is the V2 lane name — one of
+        # heartbeat/scheduled/manual_wake/screen_watch (`_WAKE_LANES`). V1's
+        # `proactive_jobs`/gate.py `wake_kind` field uses a different vocabulary
+        # (presence/screen/screen_watch/scheduled_wake/background_result,
+        # `proactive/gate.py:_proactive_v2_wake_kind`) — only "screen_watch"
+        # overlaps between the two. Do not cross-reference them as if they were
+        # one column.
+        payload["wake_kind"] = str(wake_kind)
     return payload
 
 
@@ -4342,6 +4365,7 @@ async def _run_wake(
     grounding，不随 tool-loop 轮次增长，跟 `prior_tool_results`（每轮动态积累的工具
     观测）是两回事。
     """
+    push_slot: dict | None = None
     try:
         store = core_store.get_store(user_id)
         # One HMAC token and one encrypted workspace snapshot per wake turn.
@@ -4913,6 +4937,7 @@ async def _run_wake(
                     text,
                     effect_id=effect_id,
                     reply_through_seq=consumed_seq,
+                    wake_kind=lane,
                 )
                 if consumed_seq is not None:
                     payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
@@ -5054,6 +5079,24 @@ async def _run_wake(
                     },
                     best_effort=True,
                 )
+                if status == "applied":
+                    # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。构建槽位
+                    # 本身也是 best-effort：payload 缺 "envelope"（例如未来出现的非
+                    # seq_native / 测试注入变体）不该把一个已经成功落库的回合打成
+                    # failed，只应跳过这一次推送。与 chat lane（process_job）的同一段
+                    # 完全同构。
+                    nonlocal push_slot
+                    try:
+                        push_slot = {
+                            "msg_id": str(payload["envelope"]["id"]),
+                            "body": text[:240],
+                            "is_wake": True,
+                            "lane": lane,
+                        }
+                    except Exception as e:  # noqa: BLE001 — 见上：绝不能影响回合结果
+                        log.warning(
+                            "[v2.worker] wake reply push slot build failed user=%s: %s",
+                            user_id, e)
                 if status == "applied":
                     if final:
                         source_status = await asyncio.to_thread(
@@ -5224,6 +5267,20 @@ async def _run_wake(
         if tm is not None:
             tm.flush(failed=True, status=code)
         return "failed"
+    finally:
+        if push_slot is not None and deps.send_reply_push is not None:
+            try:
+                await asyncio.to_thread(
+                    deps.send_reply_push,
+                    user_id,
+                    msg_id=push_slot["msg_id"],
+                    body=push_slot["body"],
+                    is_wake=push_slot["is_wake"],
+                    lane=push_slot["lane"],
+                )
+            except Exception as e:  # noqa: BLE001 — 推送绝不能影响回合结果
+                log.warning(
+                    "[v2.worker] wake reply push failed user=%s: %s", user_id, e)
 
 
 async def _run_extraction(
@@ -6079,6 +6136,7 @@ async def process_job(
     if tm is None:
         tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
     tm.bind_provider(provider_config)
+    push_slot: dict | None = None
     lease_keepalive_stop = asyncio.Event()
     lease_keepalive_task: asyncio.Task | None = None
 
@@ -7161,6 +7219,29 @@ async def process_job(
                     },
                     best_effort=True,
                 )
+                if status == "applied":
+                    # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。构建槽位
+                    # 本身也是 best-effort：某些非 seq_native / 测试注入的 payload 不
+                    # 携带 "envelope"（例如工具循环单测把 `_build_encrypted_reply_
+                    # effect_payload` 换成了不含 envelope 的假实现），这类回合本来就该
+                    # 正常 completed —— 构建槽位失败只跳过这一次推送，绝不能把它变成
+                    # 一个已经成功落库的回合失败。
+                    nonlocal push_slot
+                    try:
+                        push_slot = {
+                            "msg_id": str(payload["envelope"]["id"]),
+                            "body": text[:240],
+                            "is_wake": False,
+                            # Chat lane is never a wake — send an empty lane rather
+                            # than the job's own lane=="chat" bookkeeping value, so
+                            # backend's manual/source derivation only ever sees real
+                            # wake lane names (see TurnDeps.send_reply_push).
+                            "lane": "",
+                        }
+                    except Exception as e:  # noqa: BLE001 — 见上：绝不能影响回合结果
+                        log.warning(
+                            "[v2.worker] chat reply push slot build failed user=%s: %s",
+                            user_id, e)
                 if status == "applied" and not final:
                     return
                 if status == "applied":
@@ -7575,6 +7656,19 @@ async def process_job(
         if lease_keepalive_task is not None:
             lease_keepalive_task.cancel()
             await asyncio.gather(lease_keepalive_task, return_exceptions=True)
+        if push_slot is not None and deps.send_reply_push is not None:
+            try:
+                await asyncio.to_thread(
+                    deps.send_reply_push,
+                    user_id,
+                    msg_id=push_slot["msg_id"],
+                    body=push_slot["body"],
+                    is_wake=push_slot["is_wake"],
+                    lane=push_slot["lane"],
+                )
+            except Exception as e:  # noqa: BLE001 — 推送绝不能影响回合结果
+                log.warning(
+                    "[v2.worker] chat reply push failed user=%s: %s", user_id, e)
 
 
 async def _run_turn(job: dict, deps: TurnDeps) -> str:

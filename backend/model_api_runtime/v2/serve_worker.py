@@ -52,6 +52,8 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
 
+import httpx
+
 # Put the backend dir on sys.path BEFORE importing backend modules. When this is
 # run as a script (`python backend/model_api_runtime/v2/serve_worker.py` — how the
 # runner compose starts it), sys.path[0] is the script's own dir (…/v2), NOT
@@ -458,6 +460,67 @@ def _mint_genesis_token(user_id: str, scopes: list[str] | None = None) -> str:
         scope=list(scopes or _GENESIS_TOKEN_SCOPE),
         ttl=float(os.environ.get("FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC", "7200")),
     )
+
+
+# Push is a separate, deliberately narrow scope: the reply-push call only needs to
+# hand backend a plaintext body for an already-published row, never to decrypt
+# anything. Minted per call with a short TTL — do NOT widen _RUNTIME_TOKEN_SCOPE
+# (see the comment above it: the enclave's local check ignores scope, so that list
+# must stay stable).
+_PUSH_TOKEN_SCOPE = ["chat_push"]
+
+
+def _mint_push_token(user_id: str) -> str:
+    secret = os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").strip().encode("utf-8")
+    if not secret:
+        raise RuntimeError("FEEDLING_RUNTIME_TOKEN_SECRET not set")
+    return runtime_token.mint(
+        secret,
+        user_id=user_id,
+        runtime_instance_id="v2-push",
+        scope=_PUSH_TOKEN_SCOPE,
+        ttl=60.0,
+    )
+
+
+def _send_reply_push(
+    user_id: str, *, msg_id: str, body: str, is_wake: bool, lane: str = ""
+) -> None:
+    """`TurnDeps.send_reply_push` 的生产接线。
+
+    APNs 私钥只注入 backend 容器，所以推送由 backend 发；这里只把明文正文经
+    compose 内网交过去（与 V1 consumer 走 HTTP 传 push_body 是同一个姿态）。
+    完全 best-effort：任何异常都在这里吞掉并记日志，绝不冒到回合上。
+
+    ``lane`` 是本次唤醒的 V2 lane 名（chat lane 传空字符串），backend 用它推
+    manual（``lane == "manual_wake"``）与真实 wake source，对齐 V1
+    `_proactive_delivery_decision_v2` 从 job 推 manual 的做法 —— 缺这个字段会让
+    manual wake 被当成非 manual，关了 reminders_delivery 的用户收不到手动唤醒
+    推送（v2-push-parity 分支审查 Minor #1）。
+    """
+    api_url = os.environ.get("FEEDLING_API_URL", "").strip()
+    if not api_url:
+        log.warning("[v2.push] FEEDLING_API_URL not set — reply push skipped")
+        return
+    try:
+        resp = httpx.post(
+            f"{api_url}/v1/internal/push/ai_reply",
+            json={"msg_id": msg_id, "body": body, "is_wake": is_wake, "lane": lane},
+            headers={"X-Feedling-Runtime-Token": _mint_push_token(user_id)},
+            # Best-effort notification, sent synchronously from the turn's
+            # `finally` while the job is already completed but the worker slot
+            # (FEEDLING_V2_MAX_WORKERS) is still held. Keep this short — 10s
+            # would let a slow/wedged backend eat a scarce worker slot per turn;
+            # 3s is enough for an intra-compose-network call and still cheap to
+            # lose if backend is stuck (review Minor #4).
+            timeout=3.0,
+        )
+        if resp.status_code >= 400:
+            log.warning(
+                "[v2.push] reply push rejected user=%s status=%s",
+                user_id, resp.status_code)
+    except Exception as e:  # noqa: BLE001 — best-effort by contract
+        log.warning("[v2.push] reply push failed user=%s: %s", user_id, e)
 
 
 def _prompt_cache_route_scope(runtime, *, secret: bytes) -> str:
@@ -1820,7 +1883,11 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
         raise RuntimeError("transactional reply requires encrypted envelope")
     store = core_store.get_store(user_id)
     thinking_extra = v2_worker._thinking_extra(payload.get("thinking"))
-    build_kwargs = {"extra": thinking_extra} if thinking_extra else {}
+    build_extra = dict(thinking_extra) if thinking_extra else {}
+    wake_kind = str(payload.get("wake_kind") or "")
+    if wake_kind:
+        build_extra["wake_kind"] = wake_kind
+    build_kwargs = {"extra": build_extra} if build_extra else {}
     msg = store._build_chat_message("openclaw", "model_api", envelope, **build_kwargs)
     msg_id = str(msg["id"])
     seq, inserted, finish_db_post_commit = db.chat_append_effect_with_cursor(
@@ -2774,6 +2841,11 @@ def build_production_deps() -> v2_worker.TurnDeps:
         load_workspace_prompt=_load_workspace_prompt,
         seal_trajectory_payload=_seal_trajectory_payload,
         open_trajectory_payload=_open_trajectory_payload,
+        send_reply_push=(
+            _send_reply_push
+            if os.environ.get("FEEDLING_V2_PUSH_ENABLED", "1").strip() != "0"
+            else None
+        ),
     )
 
 

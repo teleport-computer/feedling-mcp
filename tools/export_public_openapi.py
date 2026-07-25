@@ -32,6 +32,9 @@ EXCLUDED_PREFIXES = (
     "/debug",
     "/v1/admin",
     "/v1/debug",
+    # Runtime-internal surface (runtime-token scope auth, called only by
+    # serve-worker over the compose network). Not a product API.
+    "/v1/internal",
 )
 
 EXCLUDED_OPERATIONS = {

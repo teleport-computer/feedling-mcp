@@ -45,6 +45,7 @@ from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import coalesce as v2_coalesce
+from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import worker
 
 
@@ -166,6 +167,95 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
     assert _job_status(job_id)[0] == "completed"
     system_msg = next(m for m in seen["messages"] if m["role"] == "system")
     assert worker._WAKE_SYSTEM_PROMPT in system_msg["content"]
+
+
+def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypatch):
+    """Review Minor #2: before this test, the wake lane's entire push wiring
+    (push_slot build + the `finally` `deps.send_reply_push` call in `_run_wake`)
+    had zero coverage — a copy-paste bug at the wake lane's `push_slot` build
+    (e.g. `is_wake=True` silently becoming `False`, or a missing/wrong `lane`)
+    would ship undetected. This runs a real seq-native wake turn through the
+    production effect sink (`serve_worker._apply_pending_effects_for_user`,
+    the same one `serve_worker.build_production_deps` wires in prod) so
+    `push_slot` is built from a genuinely persisted envelope, not a test
+    double that bypasses the code path under test — only the enclave envelope
+    crypto itself is stubbed (same technique `test_v2_atomic_reply_cursor.py`
+    uses for the chat lane's analogous test): a real KMS round-trip needs a
+    fully onboarded content key, which is orthogonal to what this test checks.
+    """
+    uid = "u_wake_push"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
+    claimed_by = _claim(job_id)
+    # The seq-native reply-effect fence (`effect_outbox._lock_active_reply_
+    # source_job`) requires the source job to be status=="running", not just
+    # "claimed" — production's `process_job` always transitions through
+    # `mark_running` before dispatching to `_run_wake`; this test calls
+    # `_run_wake` directly (same as every other test in this file), so it must
+    # do the same transition explicitly or the reply effect gets discarded as
+    # `source_job_not_active` before ever reaching `_on_reply`'s applied branch.
+    assert jobs_store.mark_running(job_id, claimed_by=claimed_by)
+
+    def _fake_envelope(_store, _text, *, item_id=None):
+        return (
+            {
+                "v": 1,
+                "id": str(item_id),
+                "owner_user_id": "ignored-by-store",
+                "visibility": "shared",
+                "body_ct": "ciphertext",
+                "nonce": "nonce",
+                "K_user": "sealed-user-key",
+                "K_enclave": "sealed-enclave-key",
+            },
+            "",
+        )
+
+    monkeypatch.setattr(
+        worker.core_envelope, "_build_shared_envelope_for_store", _fake_envelope)
+
+    reply_text = "hey, thinking of you — " + ("x" * 300)
+    assert len(reply_text) > 240
+
+    async def _fake(config, messages, *, tools=None):
+        return _text_round(reply_text)
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
+
+    pushes = []
+    deps = worker.TurnDeps(
+        read_messages=lambda uid: [],
+        resolve_provider=lambda uid: (_BYOK, {}),
+        mint_enclave_token=lambda uid: "rt",
+        read_tail=lambda uid, after_ts, limit: [],
+        read_summary=lambda uid: ("", 0.0, 0),
+        read_messages_after_seq=lambda uid, after_seq: [],
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+        send_reply_push=lambda uid, **kw: pushes.append((uid, kw)),
+    )
+
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "manual_wake", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+
+    assert status == "completed"
+    store = core_store.get_store(uid)
+    store.reload()
+    replies = [m for m in store.chat_messages if m.get("role") == "openclaw"]
+    assert replies, "wake reply must actually be persisted"
+
+    assert pushes, "wake lane must push its final reply"
+    _, kw = pushes[0]
+    assert kw["msg_id"] == replies[0]["id"], (
+        "pushed msg_id must be the envelope id of the row that was actually "
+        "persisted"
+    )
+    assert kw["body"] == reply_text[:240]
+    assert kw["is_wake"] is True, "wake lane must push with is_wake=True"
+    assert kw["lane"] == "manual_wake", (
+        "backend derives manual/source from this — a copy-paste bug here "
+        "silently breaks the reminders_delivery-off manual-wake bypass"
+    )
 
 
 def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(

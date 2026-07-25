@@ -669,3 +669,11 @@ def test_web_settings_response_schema_matches_what_the_core_actually_returns(
     for payload in cases:
         assert set(payload) == documented, payload
         assert payload["status"] in allowed_status, payload
+
+
+def test_internal_prefix_is_never_public() -> None:
+    """`/v1/internal/**` 是 runtime 内部面（runtime-token scope 鉴权），
+    不属于对外产品 API，必须排除在公开契约之外。"""
+    from export_public_openapi import EXCLUDED_PREFIXES
+
+    assert "/v1/internal" in EXCLUDED_PREFIXES
