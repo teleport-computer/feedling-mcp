@@ -50,7 +50,7 @@ services:
   # Exactly one runner. Distinct CVM hostname → distinct lease owner + heartbeat row.
   # No per-runner config: every prod runner CVM deploys this identical compose.
   agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:84a1f49   # CI pins the sha
+    image: ghcr.io/teleport-computer/feedling-agent-runner:fa0389c   # CI pins the sha
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
     environment:
