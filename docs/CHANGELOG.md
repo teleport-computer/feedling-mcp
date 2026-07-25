@@ -49,6 +49,64 @@
 
 ## 2026-07-25
 
+### [DONE] Runtime V2 补齐推送能力（此前 V2 用户零推送）
+
+- **此前状态**：`model_api_runtime/v2/` 全目录零处调用 push service —— V2 serve-worker
+  跑完一个回合、明文回复落库之后，没有任何代码路径去发 APNs。pre 环境切到 V2 的
+  用户（含主动唤醒消息）从未成功投递过一条聊天推送；用户只有打开 app 手动拉取
+  才能看到新回复。V1（`chat_core.response` / consumer）的推送链路完好，问题只在
+  V2 这一侧缺投递入口。
+- **改动**：分 6 步补齐，投递判定与决策链**复用 V1 同一套**，不新造平行逻辑：
+  1. `tools/export_public_openapi.py` 新增排除前缀 `/v1/internal`（连同
+     `EXCLUDED_PREFIXES` 断言测试）—— 为下一步的内部端点预留不进公开契约的位置。
+  2. `backend/push/routes_asgi.py` 新增 `POST /v1/internal/push/ai_reply`，鉴权走
+     `require_scope("chat_push")`（runtime-token，非用户 session）；
+     `backend/push/push_core.ai_reply_push()` 是承接点：`is_wake=True`（agent 主动
+     唤醒）时先过 `proactive/controls_v2.evaluate_delivery_v2`（`reminders_delivery`
+     开关），被挡则把 `push_decision`/`alert_status`/`live_activity_status` 等字段
+     标 `suppressed` 写回 `chat_messages.doc` 后直接返回；放行或非 wake（用户消息
+     的应答）则调 `push.service._deliver_ai_message_push_if_background`——与 V1 走
+     同一条投递函数，结果字段同样回写进消息行的 delivery metadata。
+  3. `chat_messages.doc` 新增 `wake_kind`（`heartbeat`/`scheduled`/`manual_wake`/
+     `screen_watch`）标记 agent 主动发起的唤醒消息，与用户消息的应答区分；chat
+     lane 的回复不带这个键。落库前要在 `UserStore._build_chat_message` 的 extra
+     白名单里显式登记，否则会被该方法的 allowlist 静默丢弃（本次改动过程中发现
+     并修的一个隐藏坑）。
+  4/5. `model_api_runtime/v2/worker.py` 的 wake lane（独立函数 `_run_wake`）与
+     chat lane（`process_job`）各自在回合末尾维护一个覆盖式、仅内存的 `push_slot`
+     （240 字符截断的回复正文），
+     `finally` 块里最多触发一次 `deps.send_reply_push(...)`；构建槽位和发送推送都
+     包在 try/except 里，任何异常只吞掉记日志、绝不影响回合本身的完成/失败结果。
+     一个回合可能吐多条气泡，只有最后一条会成为推送（用户点进 app 能看到全部气泡，
+     推送只是唤醒手段）。
+  6. `model_api_runtime/v2/serve_worker.py::build_production_deps` 接上生产传输：
+     `_send_reply_push` 用短 TTL（60s）、独立窄 scope（`chat_push`，特意不并入
+     `_RUNTIME_TOKEN_SCOPE`）铸一个 runtime token，经 compose 内网 `httpx.post` 到
+     上面的 `/v1/internal/push/ai_reply`——因为 APNs 私钥只注入 backend 容器，
+     serve-worker 没有钥去直接发推送，只能把已落库回复的明文正文经内存传过去
+     （不写库、不进日志正文），姿态与 V1 consumer 走 HTTP 传 `push_body` 一致。
+- **回滚拉杆**：`FEEDLING_V2_PUSH_ENABLED`（默认开，置 `0` 时
+  `build_production_deps` 把 `send_reply_push` 传 `None`，两条 lane 的 finally 判空
+  直接跳过，不改变回合逻辑）。
+- **`/v1/internal` 不进公开契约**：runtime-token scope 鉴权、只被同 compose 网络内
+  的 serve-worker 调用，不是产品 API；`tools/export_public_openapi.py` 已排除，
+  本次未改 `docs-site/openapi/public.json`。
+- **测试覆盖**：`tests/test_v2_push_endpoint.py`（内部端点+`ai_reply_push` 决策分支）、
+  `tests/test_v2_push_delivery.py`（`wake_kind` 落库）、`tests/test_v2_serve_worker.py`
+  （`_send_reply_push` 传输层）、`tests/test_v2_atomic_reply_cursor.py`（两条 lane 的
+  push_slot 接线，含 `test_push_transport_failure_does_not_fail_the_turn`——这条测试
+  真的走 provider 出结果 → `_on_reply` 写库 → 收尾推送一次的正向路径，显式断言
+  `send_reply_push` 被调用且其异常不冒到回合返回值；早期版本套错了 recovery-drain
+  骨架导致断言恒真，复审时改写并核实）。
+- **已知取舍**：worker 崩溃后由 recovery drain 落库的回复不经 `_on_reply`，不写
+  槽位，那条推送会丢（消息本身不丢；V1 同场景也没有推送，接受）；一个回合多条气泡
+  只推最后一条（用户点进 app 能看到全部气泡，推送只是唤醒手段，一次足够）；`title`
+  仍硬编码 `"IO"`，留到下一轮和 V1 一起改，避免两个 runtime 观感不一致。详细设计见
+  `docs/superpowers/specs/2026-07-25-v2-push-parity-design.md`。
+- **未做**：pre 环境真机端到端验证（切后台收锁屏通知、前台不弹通知且
+  `push_decision=suppress`、关闭「主动提醒投递」开关后 `alert_status=suppressed`
+  等四条）需要部署到 pre 加真机操作，本次未执行，留待人工验证。
+
 ### [DONE] prod `users` 全表重载风暴 —— 常驻心跳改走定向广播
 
 - 症状：prod 每分钟 30–74 次全表 `users` 重载（667 行 × ~7 个订阅进程）。
