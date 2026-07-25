@@ -14,6 +14,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
 from capabilities import tool_schema
+from provider_types import ToolCall
 
 
 def test_provider_usage_in_catalog_no_params():
@@ -93,7 +94,7 @@ def test_dispatcher_returns_normalized_payload(monkeypatch):
     monkeypatch.setattr(pu, "query_usage_async", fake_query)
     monkeypatch.setattr(worker.kill_switch, "provider_usage_halted", lambda: False)
     dispatch = worker._make_provider_usage_dispatcher(provider_config=cfg)
-    calls = [worker.ToolCall(id="c1", name=tool_schema.PROVIDER_USAGE_TOOL, args={})]
+    calls = [ToolCall(id="c1", name=tool_schema.PROVIDER_USAGE_TOOL, args={})]
     results = asyncio.run(dispatch(calls))
     body = json.loads(results[0].content)
     assert body["metrics"]["balance"]["status"] == "ok"
@@ -118,8 +119,8 @@ def test_dispatcher_same_object_identity_across_multiple_calls(monkeypatch):
     monkeypatch.setattr(worker.kill_switch, "provider_usage_halted", lambda: False)
     dispatch = worker._make_provider_usage_dispatcher(provider_config=cfg)
     calls = [
-        worker.ToolCall(id="c1", name=tool_schema.PROVIDER_USAGE_TOOL, args={}),
-        worker.ToolCall(id="c2", name=tool_schema.PROVIDER_USAGE_TOOL, args={}),
+        ToolCall(id="c1", name=tool_schema.PROVIDER_USAGE_TOOL, args={}),
+        ToolCall(id="c2", name=tool_schema.PROVIDER_USAGE_TOOL, args={}),
     ]
     results = asyncio.run(dispatch(calls))
     assert len(results) == 2
@@ -134,7 +135,7 @@ def test_dispatcher_live_halt(monkeypatch):
     cfg = pc.ProviderConfig(provider="deepseek", model="m", api_key="sk-x")
     monkeypatch.setattr(worker.kill_switch, "provider_usage_halted", lambda: True)
     dispatch = worker._make_provider_usage_dispatcher(provider_config=cfg)
-    calls = [worker.ToolCall(id="c1", name=tool_schema.PROVIDER_USAGE_TOOL, args={})]
+    calls = [ToolCall(id="c1", name=tool_schema.PROVIDER_USAGE_TOOL, args={})]
     results = asyncio.run(dispatch(calls))
     assert results[0].content == "error: provider_usage_halted"
 
@@ -153,7 +154,7 @@ def test_dispatcher_halt_check_raises_fails_closed(monkeypatch):
 
     monkeypatch.setattr(worker.kill_switch, "provider_usage_halted", _boom)
     dispatch = worker._make_provider_usage_dispatcher(provider_config=cfg)
-    calls = [worker.ToolCall(id="c1", name=tool_schema.PROVIDER_USAGE_TOOL, args={})]
+    calls = [ToolCall(id="c1", name=tool_schema.PROVIDER_USAGE_TOOL, args={})]
     results = asyncio.run(dispatch(calls))
     assert results[0].content == "error: provider_usage_halted"
 
@@ -171,7 +172,7 @@ def test_dispatcher_unexpected_exception_is_static_error(monkeypatch):
     monkeypatch.setattr(pu, "query_usage_async", fake_query)
     monkeypatch.setattr(worker.kill_switch, "provider_usage_halted", lambda: False)
     dispatch = worker._make_provider_usage_dispatcher(provider_config=cfg)
-    calls = [worker.ToolCall(id="c1", name=tool_schema.PROVIDER_USAGE_TOOL, args={})]
+    calls = [ToolCall(id="c1", name=tool_schema.PROVIDER_USAGE_TOOL, args={})]
     results = asyncio.run(dispatch(calls))
     assert results[0].content == "error: provider_usage_failed"
     assert "sk-x" not in results[0].content
@@ -194,7 +195,7 @@ def test_dispatch_mixed_routes_provider_usage_to_injected_callable():
     async def _unreachable_before_mutation():
         raise AssertionError("no mutation expected for provider_usage")
 
-    calls = [worker.ToolCall(id="c1", name=tool_schema.PROVIDER_USAGE_TOOL, args={})]
+    calls = [ToolCall(id="c1", name=tool_schema.PROVIDER_USAGE_TOOL, args={})]
     results = asyncio.run(
         worker._dispatch_mixed_tool_calls(
             calls,
@@ -223,7 +224,7 @@ def test_dispatch_mixed_provider_usage_tool_not_allowed_when_callable_none():
     async def _unreachable_before_mutation():
         raise AssertionError("no mutation expected for provider_usage")
 
-    calls = [worker.ToolCall(id="c1", name=tool_schema.PROVIDER_USAGE_TOOL, args={})]
+    calls = [ToolCall(id="c1", name=tool_schema.PROVIDER_USAGE_TOOL, args={})]
     results = asyncio.run(
         worker._dispatch_mixed_tool_calls(
             calls,

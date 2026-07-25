@@ -51,7 +51,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import db
 import provider_client
-from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolCall, ToolExchange, ToolResult
+from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
 from core import envelope as core_envelope
