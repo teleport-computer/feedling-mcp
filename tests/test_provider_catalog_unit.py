@@ -48,6 +48,26 @@ def test_validate_catalog_target_rejects_bad_scheme():
     assert base == "http://127.0.0.1:8080/v1"
 
 
+def test_validate_catalog_target_rejects_loopback_prefix_forgery():
+    # Real host is evil.example — a startswith("http://127.0.0.1") check accepts
+    # both of these; urlsplit-based validation must reject them so the provider
+    # key is never sent in plaintext to an attacker-controlled host.
+    for bad in (
+        "http://127.0.0.1.evil.example/v1",   # subdomain trick
+        "http://127.0.0.1@evil.example/v1",   # userinfo trick
+    ):
+        with pytest.raises(pc.ProviderError):
+            pc.validate_catalog_target("openai_compatible", bad)
+
+
+def test_validate_catalog_target_allows_localhost_and_forbids_https_userinfo():
+    _, base = pc.validate_catalog_target("openai_compatible", "http://localhost:1234/v1")
+    assert base == "http://localhost:1234/v1"
+    # Userinfo is forbidden regardless of scheme.
+    with pytest.raises(pc.ProviderError):
+        pc.validate_catalog_target("openai_compatible", "https://user:pw@api.example.com/v1")
+
+
 # --------------------------------------------------------------------------- #
 # Task 1: request construction + page parsing (pure)
 # --------------------------------------------------------------------------- #

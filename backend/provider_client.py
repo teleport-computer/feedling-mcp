@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -313,6 +313,11 @@ def validate_config(
         raise ProviderError("model required")
     if provider == "openai_compatible" and not base_url:
         raise ProviderError("base_url required for openai_compatible")
+    # NOTE (owner): this startswith() loopback check has the SAME latent
+    # prefix-forgery flaw fixed in validate_catalog_target / _validate_egress_url
+    # ("http://127.0.0.1.evil.example" and "http://127.0.0.1@evil.example" both
+    # pass). Left untouched here to avoid changing the normal save/test path;
+    # migrate this to _validate_egress_url when that path is next revisited.
     if base_url and not (
         base_url.startswith("https://") or base_url.startswith("http://127.0.0.1")
     ):
@@ -3395,15 +3400,41 @@ def validate_catalog_target(provider: str, base_url: str = "") -> tuple[str, str
         )
     if provider == "openai_compatible" and not base_url:
         raise ProviderError("base_url required for openai_compatible")
-    if base_url and not (
-        base_url.startswith("https://") or base_url.startswith("http://127.0.0.1")
-    ):
-        raise ProviderError("base_url must be https:// or local http://127.0.0.1")
+    if base_url:
+        _validate_egress_url(base_url)
     if not base_url:
         base_url = default_base_url(provider)
     if not base_url:
         raise ProviderError("base_url unavailable for provider")
     return provider, base_url
+
+
+_CATALOG_LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
+
+
+def _validate_egress_url(base_url: str) -> None:
+    """Reject any egress target that isn't ``https://`` or an EXACT loopback
+    ``http://`` host — parsed with ``urlsplit``, never ``startswith``.
+
+    A ``startswith("http://127.0.0.1")`` prefix check is forgeable: both
+    ``http://127.0.0.1.evil.example`` (real host ``evil.example``) and
+    ``http://127.0.0.1@evil.example`` (userinfo ``127.0.0.1``, real host
+    ``evil.example``) pass a prefix check and would send the provider key in
+    plaintext to the attacker. urlsplit resolves the true ``hostname`` and lets
+    us forbid userinfo outright.
+    """
+    parts = urlsplit(base_url)
+    scheme = parts.scheme.lower()
+    if scheme not in ("https", "http"):
+        raise ProviderError("base_url must be https:// or local http://127.0.0.1")
+    # Forbid userinfo: "http://127.0.0.1@evil.example" hides the real host after
+    # the '@'. Reject on any credential component or a stray '@' in netloc.
+    if parts.username or parts.password or "@" in (parts.netloc or ""):
+        raise ProviderError("base_url must be https:// or local http://127.0.0.1")
+    if scheme == "http":
+        host = (parts.hostname or "").lower()
+        if host not in _CATALOG_LOOPBACK_HOSTS:
+            raise ProviderError("base_url must be https:// or local http://127.0.0.1")
 
 
 def _catalog_request(provider: str, api_key: str, base_url: str,
