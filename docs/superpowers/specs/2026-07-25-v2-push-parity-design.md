@@ -141,9 +141,15 @@ visible mid-loop」—— 中间气泡必须即时对用户可见。
 ### 5.1 `backend/model_api_runtime/v2/worker.py`
 
 - `_build_encrypted_reply_effect_payload`：payload 增加 `wake_kind` 字段（非明文）。
-  chat lane 写空字符串；wake lane 写该次 wake 的 kind，取值沿用 `proactive_jobs`
-  日志里同名字段那一套，不新造词汇。落库后即 `chat_messages.doc.wake_kind`，
-  推送分流与事后取证都读它。
+  chat lane 写空字符串；wake lane 写该次 wake 的 lane 名。落库后即
+  `chat_messages.doc.wake_kind`，推送分流与事后取证都读它。
+
+  ⚠️ **它与 V1 `proactive_jobs` 日志里的同名字段不是同一套词表**（本设计初版误称
+  「沿用同一套」，实现时发现不符，2026-07-25 订正）。V2 写的是 lane 名
+  `heartbeat` / `scheduled` / `manual_wake` / `screen_watch`；V1 那套是
+  `presence` / `screen` / `screen_watch` / `scheduled_wake` / `background_result`
+  （`backend/proactive/gate.py`）。两者只有 `screen_watch` 重合 —— **同名不同义，
+  跨 V1/V2 联查时不要把这两列当同一个维度 join。**
 - `TurnDeps`（`:972` 一带）：新增可选注入项 `send_reply_push`，照抄
   `apply_pending_effects` 的形态（`None` 时整个特性静默关闭，单测默认不接线）。
 - 两处 `_on_reply` 的 `status == "applied"` 分支（wake lane `:4986` 之后、chat lane
