@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -96,6 +97,64 @@ def test_report_and_clear_runtime_error(user):
                          json={"error": "", "error_class": ""})
     assert status == 200, body
     assert _runtime_profile(uid)["last_runtime_error"] == ""
+
+
+def test_v1_provider_result_updates_and_restores_health(user):
+    import db
+
+    uid, key = user
+    selected_at = datetime.now(timezone.utc) - timedelta(hours=49)
+    db.set_blob(
+        uid,
+        "onboarding_route",
+        {
+            "route": "model_api",
+            "selected_at": selected_at.isoformat(),
+        },
+    )
+
+    status, body = _post(
+        "/v1/model_api/runtime_error",
+        headers={"X-API-Key": key},
+        json={
+            "error": "provider_http_402 insufficient balance",
+            "error_class": "quota_insufficient",
+            "provider_result": "failure",
+        },
+    )
+    assert status == 200, body
+    with db.get_pool().connection() as conn:
+        unhealthy = conn.execute(
+            """
+            SELECT provider_state, last_provider_success_at,
+                   last_provider_error_class
+            FROM provider_health
+            WHERE user_id = %s
+            """,
+            (uid,),
+        ).fetchone()
+    assert unhealthy == ("needs_user_action", None, "quota_insufficient")
+
+    status, body = _post(
+        "/v1/model_api/runtime_error",
+        headers={"X-API-Key": key},
+        json={
+            "error": "",
+            "error_class": "",
+            "provider_result": "success",
+        },
+    )
+    assert status == 200, body
+    with db.get_pool().connection() as conn:
+        restored = conn.execute(
+            """
+            SELECT provider_state, last_provider_success_at IS NOT NULL
+            FROM provider_health
+            WHERE user_id = %s
+            """,
+            (uid,),
+        ).fetchone()
+    assert restored == ("ok", True)
 
 
 def test_error_truncated_to_300(user):

@@ -42,8 +42,17 @@ def get_identity(store) -> tuple[dict, int]:
 
 
 def run_actions(
-    store, payload: dict, *, api_key: str | None, runtime_token: str
+    store, payload: dict, *, api_key: str | None, runtime_token: str,
+    trusted_relationship_anchor: str | None = None,
 ) -> tuple[dict, int]:
+    # ``trusted_relationship_anchor`` is the frozen relationship anchor that the
+    # trusted V2 identity SINK (capabilities.identity.patch) resolved at enqueue
+    # time and passes as an explicit keyword argument. It is NEVER read from
+    # ``payload`` — so the PUBLIC ``POST /v1/identity/actions`` handler (which
+    # calls this without the arg) cannot let a caller forge a frozen anchor by
+    # putting ``relationship_started_at`` in the request body (Important 1 /
+    # round-4 fix). On the public path this stays None and the anchor is always
+    # recomputed from ``relationship_days``.
     actions = payload.get("actions")
     if actions is None and isinstance(payload.get("action"), dict):
         actions = [payload["action"]]
@@ -56,6 +65,7 @@ def run_actions(
         api_key,
         actions,
         runtime_token=runtime_token,
+        trusted_relationship_anchor=trusted_relationship_anchor,
     )
 
 
@@ -276,21 +286,39 @@ def list_changes(store, *, limit_raw, since: str) -> tuple[dict, int]:
 
 def update_relationship_anchor(store, payload: dict) -> tuple[dict, int]:
     """Update only the relationship anchor (days_with_user), without touching
-    the encrypted identity envelope."""
-    existing = identity_service._load_identity(store)
-    if existing is None:
-        return {"error": "identity not initialized"}, 404
+    the encrypted identity envelope.
 
+    Item 5: the actual write now goes through the SINGLE CAS-safe anchor core
+    (identity.actions._relationship_anchor_cas_write) that identity_patch and
+    identity.relationship_days_set also use — no more independent non-CAS
+    `_save_identity` that could clobber a concurrent profile_patch. The EXTERNAL
+    contract is preserved (same URL/method, same 404/400 error strings, same
+    `{"status":"updated","relationship_started_at":...}` success body) so the VPS
+    caller is unaffected; only the underlying write and the input validation
+    change. Validation is unified with the other paths — a bool/str/float
+    days_with_user is now rejected (the old `isinstance(int)` check let `True`
+    through as 1)."""
     days_with_user = payload.get("days_with_user")
-    if days_with_user is None or not isinstance(days_with_user, int) or days_with_user < 0:
+    # Preserve the LEGACY error priority (round-3 fix): the shared CAS helper does
+    # its shape check FIRST, so an un-created card + a missing/malformed
+    # days_with_user would surface as 400 (shape) instead of the endpoint's
+    # historical 404 (card not found, regardless of day value). Front-run the
+    # existence check here so the 404 wins. The CAS helper still re-checks
+    # existence inside the lock, so this is a message-priority guard, not the
+    # authority — idempotent and harmless.
+    existing = identity_service._load_identity(store)
+    if not existing:
+        return {"error": "identity not initialized"}, 404
+    identity, _old_days, err = identity_actions_mod._relationship_anchor_cas_write(
+        store, days=days_with_user, source="user_calibrated", evidence="")
+    if err == "identity_not_initialized":
+        return {"error": "identity not initialized"}, 404
+    if err == "identity_write_conflict":
+        return {"error": "identity_write_conflict"}, 409
+    if err:
         return {"error": "days_with_user (non-negative int) required"}, 400
-
-    existing["relationship_started_at"] = identity_service._anchor_from_days(days_with_user)
-    existing["relationship_anchor_source"] = "user_calibrated"
-    existing["updated_at"] = datetime.now().isoformat()
-    identity_service._save_identity(store, existing)
-    print(f"[identity:{store.user_id}] anchor updated → {existing['relationship_started_at']} (days={days_with_user})")
-    return {"status": "updated", "relationship_started_at": existing["relationship_started_at"]}, 200
+    print(f"[identity:{store.user_id}] anchor updated → {identity['relationship_started_at']} (days={days_with_user})")
+    return {"status": "updated", "relationship_started_at": identity["relationship_started_at"]}, 200
 
 
 def verify_identity(store) -> tuple[dict, int]:

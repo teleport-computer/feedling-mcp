@@ -30,6 +30,34 @@ _key_to_user: dict[str, str] = {}          # api_key_hash -> user_id (in-memory 
 # that lands between a negative probe and its TTL is picked up immediately.
 _resolve_neg_lock = threading.Lock()
 _resolve_neg_cache: dict[str, float] = {}
+
+def _env_float(name: str, default: float) -> float:
+    """Parse a float env var without letting a typo crash module import. A bad
+    value (e.g. ``5m``) degrades to ``default`` with a log line instead of
+    raising a ValueError out of ``import accounts.registry`` — which would kill
+    every gunicorn worker and the V2 serve_worker at boot, before any health
+    endpoint exists to report it."""
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        print(f"[users] invalid {name}={raw!r}, falling back to {default}")
+        return default
+
+
+# Periodic full-registry refresh — the explicit replacement for the repair that
+# the resident heartbeat's untargeted broadcast used to provide by accident.
+# See start_periodic_full_reload. Kept at the ~minute scale (not the old ~1.5s
+# storm cadence, not a lazy 300s) so a dropped revoke/delete notify still self-
+# heals within roughly a minute while costing one full reload per process per
+# interval instead of ~271/min across the fleet.
+_FULL_RELOAD_INTERVAL_SEC = max(
+    10.0, _env_float("FEEDLING_REGISTRY_FULL_RELOAD_SEC", 60.0)
+)
+_full_reload_start_lock = threading.Lock()
+_full_reload_thread: threading.Thread | None = None
 _NEG_CACHE_TTL = max(1.0, float(os.environ.get("FEEDLING_REGISTRY_NEG_CACHE_TTL_SEC", "30") or "30"))
 _NEG_CACHE_MAX = 10000
 
@@ -265,23 +293,85 @@ def _normalize_all_users_cas() -> bool:
     return True
 
 
+def _index_user_keys_locked(user_entry: dict) -> None:
+    """Point every LIVE key hash of one row at its user_id, unconditionally
+    (last-writer-wins — the full rebuild walks rows in ``db.load_all_users``'
+    deterministic order, so a shared hash resolves to the last row). Caller holds
+    ``_users_lock``."""
+    user_id = str(user_entry.get("user_id") or "")
+    if not user_id:
+        return
+    for key_hash in _live_key_hashes(user_entry):
+        _key_to_user[key_hash] = user_id
+
+
+def _live_key_hashes(user_entry: dict) -> set[str]:
+    """The LIVE api-key hashes of one row (legacy top-level + non-revoked
+    ``api_keys``). Same liveness rule as ``_index_user_keys_locked`` so the two
+    can't disagree on what resolves."""
+    hashes: set[str] = set()
+    if not isinstance(user_entry, dict) or not user_entry.get("user_id"):
+        return hashes
+    legacy_hash = str(user_entry.get("api_key_hash") or "").strip()
+    if legacy_hash:
+        hashes.add(legacy_hash)
+    for key_entry in user_entry.get("api_keys") or []:
+        if not isinstance(key_entry, dict) or key_entry.get("revoked_at"):
+            continue
+        key_hash = str(key_entry.get("api_key_hash") or "").strip()
+        if key_hash:
+            hashes.add(key_hash)
+    return hashes
+
+
+def _reindex_user_keys_locked(
+    user_id: str, user_entry: dict | None, old_entry: dict | None = None
+) -> None:
+    """Re-point ``_key_to_user`` at ONE user's current hashes — the targeted
+    counterpart of ``_rebuild_key_cache``, and the reason a one-row reload does
+    not clear the cache.
+
+    Two things this must NOT do, both because ``_resolve_user`` reads
+    ``_key_to_user`` WITHOUT the lock:
+
+    * Never make a still-valid hash momentarily absent. A clear-then-rebuild (or
+      delete-then-readd) opens a window where a live key misses, takes
+      ``_users_lock`` and runs ``_normalize_all_users_cas`` (a deepcopy of every
+      row) — the exact convoy the storm fix exists to remove. So ADD the new
+      hashes first, then remove only the ones this user no longer has.
+    * Never steal a hash currently owned by ANOTHER user. A single-row reload
+      cannot see the global ``ORDER BY`` precedence that ``_rebuild_key_cache``
+      resolves a shared/orphan hash by, so overwriting it here would cross-wire
+      auth to the wrong account until the next full rebuild. Leave a conflicting
+      hash to whoever owns it; the periodic full reload settles it deterministically.
+
+    ``old_entry`` is the row being replaced (from ``_install_user_row_locked``).
+    Removals are computed from ITS hashes, not by scanning the whole
+    ``_key_to_user`` — the removal set is proportional to one user's keys, not
+    the fleet's, which is the point of a targeted reload. The periodic
+    ``_rebuild_key_cache`` remains the backstop that drops any stale hash a prior
+    mis-diff might have stranded. Caller holds ``_users_lock``."""
+    new_hashes = _live_key_hashes(user_entry) if isinstance(user_entry, dict) else set()
+    for key_hash in new_hashes:
+        owner = _key_to_user.get(key_hash)
+        if owner is None or owner == user_id:
+            _key_to_user[key_hash] = user_id
+        else:
+            print(
+                f"[users] key hash conflict: {key_hash[:12]}… claimed by "
+                f"{owner}, not reassigning to {user_id} (full reload will settle)"
+            )
+    old_hashes = _live_key_hashes(old_entry) if isinstance(old_entry, dict) else set()
+    for key_hash in old_hashes - new_hashes:
+        if _key_to_user.get(key_hash) == user_id:
+            del _key_to_user[key_hash]
+
+
 def _rebuild_key_cache() -> None:
     _key_to_user.clear()
     for user_entry in _users:
-        if not isinstance(user_entry, dict):
-            continue
-        user_id = str(user_entry.get("user_id") or "")
-        if not user_id:
-            continue
-        legacy_hash = str(user_entry.get("api_key_hash") or "").strip()
-        if legacy_hash:
-            _key_to_user[legacy_hash] = user_id
-        for key_entry in user_entry.get("api_keys") or []:
-            if not isinstance(key_entry, dict) or key_entry.get("revoked_at"):
-                continue
-            key_hash = str(key_entry.get("api_key_hash") or "").strip()
-            if key_hash:
-                _key_to_user[key_hash] = user_id
+        if isinstance(user_entry, dict):
+            _index_user_keys_locked(user_entry)
 
 
 def load_users():
@@ -295,9 +385,23 @@ def load_users():
     request threads that mutate the registry under the same lock — without it the
     listener could replace ``_users`` / ``_key_to_user`` mid-edit and lose a
     write or expose a half-rebuilt key cache. Callers must NOT already hold the
-    lock (the two callers — startup assembly and the listener — don't)."""
+    lock (the two callers — startup assembly and the listener — don't).
+
+    A DB READ FAILURE keeps the current snapshot instead of blanking it. Every
+    caller of this — startup, the wake-bus ``users`` handler AND its
+    reconnect-replay, the periodic refresh — could otherwise land on a Postgres
+    blip and leave ``_users`` empty, which 401s every request until the next
+    successful reload (see the lifespan-missing-load_users incident). We tell a
+    failed read from a genuinely empty table via ``raise_on_error`` rather than a
+    row-count heuristic, so a real ``TRUNCATE users`` (0 rows, no error) still
+    correctly clears the registry."""
     with _users_lock:
-        _users[:] = db.load_all_users()
+        try:
+            rows = db.load_all_users(raise_on_error=True)
+        except Exception as e:
+            print(f"[users] reload read failed, keeping current snapshot: {e}")
+            return
+        _users[:] = rows
         _normalize_all_users_cas()
         _rebuild_key_cache()
     # Drop the negative cache AFTER releasing _users_lock (no nested lock order):
@@ -318,22 +422,193 @@ def _save_users():
     db.save_all_users(_users)
 
 
-def notify_users_changed() -> None:
+def notify_users_changed(user_id: str = "") -> None:
     """Broadcast a cross-worker ``users`` reload so other workers don't keep
     serving a stale ``_users`` / ``_key_to_user`` snapshot. Pair it with the
-    persist for any genuine registry edit; ``persist_user`` already does."""
-    wake_bus.notify("users")
+    persist for any genuine registry edit; ``persist_user`` already does.
+
+    Passing ``user_id`` narrows the reload to that ONE row (see
+    ``reload_users_after_notify``); the empty default reloads the whole
+    registry, which is what an edit with cross-row effects (a merge, a delete)
+    needs."""
+    wake_bus.notify("users", user_id)
+
+
+def _normalize_row_cas_locked(row: dict) -> dict | None:
+    """Single-row twin of ``_normalize_all_users_cas`` — same contract, same
+    reasons. Returns the row to install, or None when the CAS read found the row
+    concurrently deleted. Caller holds ``_users_lock``."""
+    expected = copy.deepcopy(row)
+    if not _normalize_user_entry(row):
+        return row
+    read_ok, authoritative = db.normalize_user_cas(
+        str(row.get("user_id") or ""), expected, row
+    )
+    if not read_ok:
+        # Never serve process-local generated ids that failed to persist; keep
+        # the exact row we read and let a later reload retry.
+        return expected
+    return authoritative
+
+
+def _install_user_row_locked(user_id: str, row: dict | None) -> bool:
+    """Replace / insert / remove ONE row in ``_users`` and reindex its keys.
+    ``row=None`` removes the user. Returns True when the row was newly inserted
+    (a user this process had not seen). Caller holds ``_users_lock``.
+
+    Appends a new row at the end rather than re-sorting ``_users``: the DB read
+    order is not a load-bearing invariant (``_resolve_user_via_db`` already
+    appends unsorted), and a Python sort key over possibly-non-dict entries is
+    one more place to raise mid-critical-section."""
+    index = next(
+        (
+            i
+            for i, entry in enumerate(_users)
+            if isinstance(entry, dict) and entry.get("user_id") == user_id
+        ),
+        None,
+    )
+    old_entry = _users[index] if index is not None else None
+    inserted = False
+    if row is None:
+        if index is not None:
+            _users.pop(index)
+    elif index is None:
+        _users.append(row)
+        inserted = True
+    else:
+        _users[index] = row
+    _reindex_user_keys_locked(user_id, row, old_entry)
+    return inserted
+
+
+def reload_user(user_id: str) -> None:
+    """Refresh ONE user row in place from PostgreSQL — the targeted counterpart
+    of ``load_users``, and it must keep that function's three guarantees:
+
+    * The read happens INSIDE ``_users_lock``, so the read and the install are
+      atomic. Reading first and installing later lets a same-process edit that
+      lands in between be reverted in memory — and the next whole-document
+      ``persist_user`` then writes the reverted row back, permanently dropping a
+      key that edit had just issued.
+    * The row is normalized and CAS-persisted, not installed verbatim: admin
+      data_track snapshots ``_users`` raw and relies on reload-time
+      normalization, and lazy normalization in ``_find_user_entry_locked`` only
+      applies in memory — it never writes the generated ids back.
+    * A read failure leaves the current row untouched: the only other option is
+      treating a transient error as "row deleted" and evicting a live user,
+      which 401s every request that key makes until the next full reload.
+    """
+    uid = str(user_id or "").strip()
+    if not uid:
+        return
+    inserted = False
+    with _users_lock:
+        try:
+            row = db.load_user(uid)
+        except Exception as e:
+            print(f"[users] targeted reload failed for {uid}, keeping current row: {e}")
+            return
+        if row is not None:
+            row = _normalize_row_cas_locked(row)
+        inserted = _install_user_row_locked(uid, row)
+    if inserted:
+        # Same reason load_users() clears it, and with the same lock order (never
+        # under _users_lock): a row this process had never seen may hold a key
+        # some earlier lookup negative-cached. An UPDATE needs no clear — a key
+        # set only changes on issue/revoke, and those broadcast untargeted.
+        with _resolve_neg_lock:
+            _resolve_neg_cache.clear()
+
+
+def _full_reload_tick() -> None:
+    """One periodic full-registry refresh. Best-effort: a failure here must
+    never kill the thread that is the last line of defence. ``load_users`` itself
+    keeps the current snapshot on a DB read error, so a blip is a no-op here."""
+    try:
+        load_users()
+    except Exception as e:
+        print(f"[users] periodic full reload failed: {e}")
+
+
+def _full_reload_loop() -> None:
+    while True:
+        time.sleep(_FULL_RELOAD_INTERVAL_SEC)
+        _full_reload_tick()
+
+
+def _spawn_full_reload_thread() -> "threading.Thread":
+    """Create+start the daemon thread. A module-level seam (not an inline
+    ``threading.Thread(...)``) so a test can stub THIS instead of monkeypatching
+    the stdlib ``threading.Thread`` process-wide — which would silently neuter
+    every other thread spawned during that test (pool workers, the wake-bus
+    listener) and hang the suite."""
+    thread = threading.Thread(
+        target=_full_reload_loop, name="users-full-reload", daemon=True
+    )
+    thread.start()
+    return thread
+
+
+def start_periodic_full_reload() -> None:
+    """Start this process's periodic full-registry refresh (idempotent).
+
+    A cross-worker ``users`` notify is best-effort — ``wake_bus._dispatch``
+    swallows a handler exception, and a notify emitted while this process's
+    LISTEN is down is simply lost. Until 2026-07-25 that never mattered: the
+    resident heartbeat broadcast untargeted ~38.7 times/min, so every process
+    re-ran the full ``load_users`` every ~1.5s and any state it had wrong (a
+    stale ``_key_to_user`` entry pointing at a revoked key, a row deleted
+    elsewhere) was repaired within seconds. Narrowing that broadcast to a single
+    row removed the accidental repair channel, so this makes it explicit and
+    cheap: one full reload per process per interval instead of ~271/min across
+    the fleet.
+
+    Wired from EACH long-lived runtime entrypoint that serves auth off the
+    registry, never from the test-facing ``wire_assembly`` (an unstoppable daemon
+    that rewrites ``registry._users`` mid-suite would flake unrelated tests).
+    Those entrypoints are: backend ``asgi/lifespan._start_wake_bus``, the V2
+    ``serve_worker.main``, and the V2 ``turn_child.main`` (a spawned long-lived
+    child that assembles via ``wire_assembly`` but has its own entry). Adding a
+    new such entrypoint means adding this call there too."""
+    global _full_reload_thread
+    with _full_reload_start_lock:
+        if _full_reload_thread is not None:
+            return
+        _full_reload_thread = _spawn_full_reload_thread()
+
+
+def reload_users_after_notify(user_id: str = "") -> None:
+    """Wake-bus ``users`` handler: refresh what the notify says changed.
+
+    An untargeted notify still reloads the whole registry. A targeted one
+    reloads a single row, which is what keeps the resident poll heartbeat from
+    turning ~36 per-row writes/min into a full-table re-read in every
+    subscribing process (prod 2026-07-24: 38.7 users-NOTIFY/min × 667 rows × 7
+    processes, scaling linearly with the number of online residents)."""
+    if str(user_id or "").strip():
+        reload_user(user_id)
+        return
+    load_users()
 
 
 def persist_user(entry: dict) -> None:
     """Persist ONE edited user row (non-destructive per-row upsert) and broadcast
-    a cross-worker reload. This is the multi-worker-safe way to persist a genuine
-    single-user edit (registration, api-key add, access-binding flip, public-key
-    / preference change). It replaces ``_save_users(broadcast=True)``, whose
-    ``db.save_all_users`` does a DELETE-all + reinsert from THIS worker's
-    in-memory snapshot — under ``-w N`` two workers editing DIFFERENT users
-    concurrently could each wipe the other's user before the NOTIFY reload lands.
-    A per-row upsert only touches the edited row. Caller holds ``_users_lock``."""
+    an UNTARGETED cross-worker reload. This is the multi-worker-safe way to
+    persist a genuine single-user edit (registration, api-key add, access-binding
+    flip, public-key / preference change). It replaces ``_save_users(broadcast=
+    True)``, whose ``db.save_all_users`` does a DELETE-all + reinsert from THIS
+    worker's in-memory snapshot — under ``-w N`` two workers editing DIFFERENT
+    users concurrently could each wipe the other's user before the NOTIFY reload
+    lands. A per-row upsert only touches the edited row. Caller holds
+    ``_users_lock``.
+
+    The broadcast is deliberately untargeted: every caller is a sparse edit that
+    can affect a key set, so other processes take a full reload (which also
+    clears their negative cache — ``reload_user`` only does so on insert). The
+    one high-frequency, row-confined writer, the resident heartbeat, does NOT go
+    through here — it persists via ``_persist_resident_seen_cas`` and emits its
+    own targeted ``notify_users_changed(user_id)``."""
     db.upsert_user(entry)
     notify_users_changed()
 
@@ -587,6 +862,72 @@ def _upsert_access_binding_locked(
     return binding
 
 
+def _resident_binding(user_entry: dict) -> dict | None:
+    return next(
+        (
+            binding
+            for binding in user_entry.get("access_bindings") or []
+            if isinstance(binding, dict)
+            and _normalize_access_mode(str(binding.get("access_mode") or "")) == "resident"
+        ),
+        None,
+    )
+
+
+def _persist_resident_seen_cas(user_id: str, now_iso: str, *, attempts: int = 2) -> bool:
+    """Bump ONLY the resident binding's ``last_seen_at`` / ``updated_at``, via a
+    CAS on a FRESH DB document, then sync the winning row into memory.
+
+    Why CAS on a fresh read instead of the in-memory snapshot: the heartbeat
+    fires once a minute for every online resident, and its snapshot can be up to
+    a full-reload interval stale. A whole-document upsert from that snapshot
+    would write every OTHER field back too — permanently deleting an api_key a
+    different worker issued in the meantime. Reading the current row and CAS-ing
+    our binding change on top of it touches nothing the heartbeat didn't intend.
+
+    No ``_users_lock`` is held across the DB round-trips — they must not convoy
+    the global registry lock. Returns True only when it persisted an update."""
+    try:
+        current = db.load_user(user_id)
+    except Exception as e:
+        print(f"[resident-seen] read failed for {user_id}: {e}")
+        return False
+    for _ in range(max(1, attempts)):
+        if current is None:
+            with _users_lock:
+                _install_user_row_locked(user_id, None)
+            return False
+        expected = copy.deepcopy(current)
+        # Pure dict edit on our local copy — despite the _locked name this touches
+        # no module state, so it is safe without the lock (see its body).
+        binding = _upsert_access_binding_locked(current, "resident")
+        binding["last_seen_at"] = now_iso
+        binding["updated_at"] = now_iso
+        if current == expected:
+            return True  # already current — nothing to write
+        read_ok, applied, authoritative = db.compare_and_set_user(
+            user_id, expected, current
+        )
+        if not read_ok:
+            print(f"[resident-seen] persist failed for {user_id}")
+            return False
+        if authoritative is None:  # row deleted concurrently
+            with _users_lock:
+                _install_user_row_locked(user_id, None)
+            return False
+        with _users_lock:
+            _install_user_row_locked(user_id, authoritative)
+        if applied:
+            notify_users_changed(user_id)  # targeted: only this row changed
+            return True
+        # CAS lost to a concurrent writer; the winner's row came back in
+        # `authoritative` (already synced into _users above). Reuse it as the next
+        # `current` instead of re-reading — deepcopy so the next binding edit does
+        # not mutate the row we just installed, which _resolve_user reads unlocked.
+        current = copy.deepcopy(authoritative)
+    return False
+
+
 def _touch_resident_binding_seen(
     user_id: str,
     *,
@@ -600,11 +941,11 @@ def _touch_resident_binding_seen(
     source, which also keeps the behavior stable after a worker restart. Returns
     True only when this call actually persisted an update.
 
-    The single-row upsert stays under ``_users_lock`` because the in-memory user
-    dict is the registry's source of truth; releasing the lock before persisting
-    a snapshot could let a concurrent edit land first and then be overwritten by
-    this stale heartbeat snapshot. At most one call per user per interval reaches
-    the DB. A failed persist rolls the binding back so the next poll retries.
+    The throttle check reads the in-memory snapshot under ``_users_lock``; the
+    persist itself is a CAS on a fresh DB row done WITHOUT the lock (see
+    ``_persist_resident_seen_cas``) so DB I/O never convoys the registry lock and
+    a stale snapshot can never write another field back. The throttle is
+    best-effort across the lock release — a rare duplicate CAS write is harmless.
     """
     try:
         interval = max(0.0, float(min_interval_sec))
@@ -620,33 +961,12 @@ def _touch_resident_binding_seen(
         user_entry = _find_user_entry_locked(user_id)
         if not user_entry:
             return False
-        resident = next(
-            (
-                binding
-                for binding in user_entry.get("access_bindings") or []
-                if isinstance(binding, dict)
-                and _normalize_access_mode(str(binding.get("access_mode") or "")) == "resident"
-            ),
-            None,
-        )
+        resident = _resident_binding(user_entry)
         last_seen_epoch = core_util._to_epoch((resident or {}).get("last_seen_at"))
         if last_seen_epoch > 0 and now - last_seen_epoch < interval:
             return False
 
-        bindings_before = copy.deepcopy(user_entry.get("access_bindings"))
-        binding = _upsert_access_binding_locked(user_entry, "resident")
-        binding["last_seen_at"] = now_iso
-        binding["updated_at"] = now_iso
-        try:
-            persist_user(user_entry)
-        except Exception as e:
-            user_entry["access_bindings"] = bindings_before
-            print(
-                f"[resident-seen] persist failed for {user_id}, "
-                f"rolled back for retry: {e}"
-            )
-            return False
-    return True
+    return _persist_resident_seen_cas(user_id, now_iso)
 
 
 def _issue_api_key_for_user_locked(

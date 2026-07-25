@@ -73,6 +73,30 @@ Suggested client timeout starting points:
 These values are defensive defaults, not availability or latency guarantees.
 Applications should make them configurable for self-hosted deployments.
 
+## Provider health and proactive retries
+
+Feedling tracks whether an account's configured model provider is producing
+usable replies. If an account has no successful provider response for 48 hours
+and its latest failures have continuously required user action for at least one
+hour, such as an invalid API key, exhausted quota, or unavailable model name,
+Feedling pauses model-backed proactive work for that account. This covers
+automatic heartbeat, screen-watch, capture, and dream work in both resident
+Runtime V1 and hosted Runtime V2.
+
+Foreground Chat remains callable and is never blocked by this proactive gate.
+User-initiated manual wakes also remain callable. While automatic proactive work
+is paused, one automatic proactive probe is allowed every 24 hours.
+Any usable provider reply, including a foreground Chat reply, or a successful
+provider validation in Settings restores normal proactive work immediately.
+Temporary provider failures such as rate limits and upstream `5xx` responses do
+not put an account into this state.
+
+Resident runtimes report provider outcomes through
+`POST /v1/model_api/runtime_error`. The optional `provider_result` field is
+`success` or `failure`; failures should include the classified `error_class`.
+An error fallback generated without a usable provider reply must not be
+reported as a success.
+
 ## Retry safety
 
 Classify by operation semantics, not only by HTTP method. In particular,

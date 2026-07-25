@@ -399,6 +399,10 @@ wave 并行落 CAS，同一路径/祖先子孙路径与外部 effectful mutation
 > `deploy/HOSTED_RUNTIME_V2_ROLLOUT.md` 和
 > `docs/RUNTIME_V2_WORKSPACE.md` 为准。
 
+> ⚠️ 以下 [历史] 小节描述的 legacy inline 路径已陆续拆除，点名的部分文件/
+> 符号（如 `model_api_runtime/prompts.py` 的 `build_foreground_chat_messages()`）
+> 已删除、仅存 git 历史；保留这些小节只为解释行为沿革，勿按图索骥找代码。
+
 ### 3.1 [历史] legacy inline 一条消息的旅程
 
 入口：iOS `POST /v1/model_api/chat/send`（`backend/hosted/chat_routes_asgi.py`）。

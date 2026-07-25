@@ -14,7 +14,7 @@ def test_get_wraps(monkeypatch):
 
 def test_patch_builds_profile_patch_action(monkeypatch):
     seen = {}
-    def fake_run_actions(store, payload, *, api_key, runtime_token):
+    def fake_run_actions(store, payload, *, api_key, runtime_token, trusted_relationship_anchor=None):
         seen["payload"] = payload
         seen["runtime_token"] = runtime_token
         return {"applied": True}, 200
@@ -36,7 +36,7 @@ def test_patch_carries_agent_name(monkeypatch):
     the agent reported success. Same gap the V1 io_cli had.
     """
     seen = {}
-    def fake_run_actions(store, payload, *, api_key, runtime_token):
+    def fake_run_actions(store, payload, *, api_key, runtime_token, trusted_relationship_anchor=None):
         seen["payload"] = payload
         return {"applied": True}, 200
     monkeypatch.setattr(identity_core, "run_actions", fake_run_actions)
@@ -52,7 +52,7 @@ def test_patch_carries_agent_name_alongside_intro(monkeypatch):
     one-by-one and are not atomic across actions, so splitting them can half-apply."""
     seen = {}
     monkeypatch.setattr(identity_core, "run_actions",
-                        lambda store, payload, *, api_key, runtime_token:
+                        lambda store, payload, *, api_key, runtime_token, trusted_relationship_anchor=None:
                         (seen.update(payload=payload), ({"applied": True}, 200))[1])
     cap_identity.patch("STORE", params={"agent_name": "老6", "self_introduction": "我是老6"})
     assert seen["payload"]["action"]["patch"] == {
@@ -68,7 +68,7 @@ def test_patch_merges_top_level_field_into_an_explicit_patch_object(monkeypatch)
     original bug reproduced exactly: intro updates, name doesn't, no error anywhere.
     """
     seen = {}
-    def fake_run_actions(store, payload, *, api_key, runtime_token):
+    def fake_run_actions(store, payload, *, api_key, runtime_token, trusted_relationship_anchor=None):
         seen["payload"] = payload
         return {"applied": True}, 200
     monkeypatch.setattr(identity_core, "run_actions", fake_run_actions)
@@ -96,7 +96,7 @@ def test_patch_keeps_the_explicit_patch_value_when_a_field_is_given_twice(monkey
     """
     seen = {}
     monkeypatch.setattr(identity_core, "run_actions",
-                        lambda store, payload, *, api_key, runtime_token:
+                        lambda store, payload, *, api_key, runtime_token, trusted_relationship_anchor=None:
                         (seen.update(payload=payload), ({"applied": True}, 200))[1])
     r = cap_identity.patch("STORE", params={
         "agent_name": "老6", "patch": {"agent_name": "老七"}})
@@ -113,7 +113,7 @@ def test_patch_rejects_a_non_object_patch_instead_of_dropping_it(monkeypatch):
     through and let the server refuse it. retryable=False keeps the outbox's
     terminal-discard semantics for a deterministic 4xx.
     """
-    def must_not_run(store, payload, *, api_key, runtime_token):
+    def must_not_run(store, payload, *, api_key, runtime_token, trusted_relationship_anchor=None):
         raise AssertionError("must not reach the server")
     monkeypatch.setattr(identity_core, "run_actions", must_not_run)
     r = cap_identity.patch("STORE", params={"patch": "not-an-object", "agent_name": "老6"})
@@ -133,7 +133,7 @@ def test_get_caps_nested_list(monkeypatch):
 def test_nudge_builds_dimension_nudge_action(monkeypatch):
     captured = {}
 
-    def fake_run_actions(store, payload, *, api_key, runtime_token):
+    def fake_run_actions(store, payload, *, api_key, runtime_token, trusted_relationship_anchor=None):
         captured["payload"] = payload
         captured["rt"] = runtime_token
         return {"status": "ok", "action": "identity.dimension_nudge"}, 200
@@ -154,7 +154,7 @@ def test_nudge_coerces_numeric_string_delta_and_omits_blank_reason(monkeypatch):
     captured = {}
     monkeypatch.setattr(
         identity_core, "run_actions",
-        lambda store, payload, *, api_key, runtime_token: (captured.update(payload=payload) or ({"status": "ok"}, 200)))
+        lambda store, payload, *, api_key, runtime_token, trusted_relationship_anchor=None: (captured.update(payload=payload) or ({"status": "ok"}, 200)))
     cap_identity.nudge("STORE", params={"dimension": "warmth", "delta": "2"})
     action = captured["payload"]["action"]
     assert action["delta"] == 2
@@ -173,3 +173,56 @@ def test_nudge_fails_closed_on_missing_dimension():
     r = cap_identity.nudge("STORE", params={"delta": 1})
     assert r.ok is False
     assert r.error["retryable"] is False
+
+
+def test_patch_threads_frozen_relationship_anchor_via_call_path_param(monkeypatch):
+    """Round-4 (Important 1) sink path: when the identity sink calls this
+    capability with the trusted frozen relationship_started_at (resolved at
+    enqueue time, stripped from the model args), it must reach run_actions as the
+    EXPLICIT ``trusted_relationship_anchor`` keyword argument — NOT stuffed into
+    the action dict. Threading it via the call path is what keeps it trustworthy
+    only on this sink route; the public request path never passes it, so a request
+    body carrying relationship_started_at can never forge a frozen anchor."""
+    seen = {}
+    monkeypatch.setattr(identity_core, "run_actions",
+                        lambda store, payload, *, api_key, runtime_token, trusted_relationship_anchor=None:
+                        (seen.update(payload=payload,
+                                     trusted_relationship_anchor=trusted_relationship_anchor),
+                         ({"applied": True}, 200))[1])
+    cap_identity.patch("STORE", params={
+        "patch": {"relationship_days": 300},
+        "relationship_started_at": "2026-04-10",
+    })
+    action = seen["payload"]["action"]
+    assert action["patch"] == {"relationship_days": 300}
+    # The anchor is NOT in the action dict — it rides the call-path param.
+    assert "relationship_started_at" not in action
+    assert seen["trusted_relationship_anchor"] == "2026-04-10"
+
+
+def test_patch_ignores_blank_frozen_anchor(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(identity_core, "run_actions",
+                        lambda store, payload, *, api_key, runtime_token, trusted_relationship_anchor=None:
+                        (seen.update(payload=payload,
+                                     trusted_relationship_anchor=trusted_relationship_anchor),
+                         ({"applied": True}, 200))[1])
+    cap_identity.patch("STORE", params={"patch": {"relationship_days": 5}, "relationship_started_at": "  "})
+    assert "relationship_started_at" not in seen["payload"]["action"]
+    # A blank frozen anchor is normalized to None (falls back to days at the sink).
+    assert seen["trusted_relationship_anchor"] is None
+
+
+def test_relationship_days_error_live_check():
+    from capabilities import identity as ci
+    assert ci.relationship_days_error({"patch": {"relationship_days": 300}}) is None
+    assert ci.relationship_days_error({"patch": {"relationship_days": 0}}) is None
+    assert ci.relationship_days_error({"self_introduction": "hi"}) is None  # not present
+    assert ci.relationship_days_error({"patch": {"relationship_days": "300"}}) == \
+        "relationship_days_must_be_non_negative_int"
+    assert ci.relationship_days_error({"patch": {"relationship_days": True}}) == \
+        "relationship_days_must_be_non_negative_int"
+    assert ci.relationship_days_error({"patch": {"relationship_days": -1}}) == \
+        "relationship_days_must_be_non_negative_int"
+    assert ci.relationship_days_error({"patch": {"relationship_days": 10 ** 9}}) == \
+        "relationship_days_out_of_range"

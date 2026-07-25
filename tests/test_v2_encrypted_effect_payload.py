@@ -64,6 +64,63 @@ def test_identity_nudge_effect_mapping_op_cannot_be_overridden_by_model_args():
     assert payload["op"] == "identity_nudge"
 
 
+# --- Item 1: frozen relationship anchor round-trips producer -> validator ------
+
+def test_identity_effect_mapping_freezes_relationship_anchor():
+    from datetime import date, timedelta
+    effect_type, payload = worker._write_tool_effect_payload(
+        SimpleNamespace(name="identity_patch", args={"patch": {"relationship_days": 90}})
+    )
+    assert effect_type == "identity"
+    # relationship_days is the 1-based "第 N 天" (met day = 第 1 天), so N=90
+    # freezes to elapsed N-1=89 → today-89.
+    assert payload["relationship_started_at"] == (date.today() - timedelta(days=89)).isoformat()
+    # relative value kept for audit; frozen absolute is the trusted metadata.
+    assert payload["patch"]["relationship_days"] == 90
+
+
+def test_validate_identity_effect_accepts_frozen_anchor_metadata():
+    # The trusted frozen anchor must pass the decrypted-effect re-validation even
+    # though the model-facing top-level schema is additionalProperties=false — it
+    # is stripped before that check, not fed to it.
+    serve_worker._validate_decrypted_tool_effect(
+        "identity",
+        {"effect_id": "e", "patch": {"relationship_days": 90},
+         "relationship_started_at": "2026-04-10"},
+    )  # must not raise
+
+
+def test_validate_identity_effect_rejects_malformed_frozen_anchor():
+    with pytest.raises(RuntimeError, match="invalid encrypted identity anchor"):
+        serve_worker._validate_decrypted_tool_effect(
+            "identity",
+            {"effect_id": "e", "patch": {"relationship_days": 90},
+             "relationship_started_at": "some day"},
+        )
+
+
+@pytest.mark.parametrize("bad", ["2026-04-10garbage", "2026-04-10T00:00:00", "20260410"])
+def test_validate_identity_effect_rejects_non_canonical_frozen_anchor(bad):
+    # Round-3 fix: the old `[:10]` slice accepted a canonical prefix followed by
+    # junk (or a datetime). Full-string parse + round-trip now rejects anything
+    # that is not exactly YYYY-MM-DD (the only shape the producer ever emits).
+    with pytest.raises(RuntimeError, match="invalid encrypted identity anchor"):
+        serve_worker._validate_decrypted_tool_effect(
+            "identity",
+            {"effect_id": "e", "patch": {"relationship_days": 90},
+             "relationship_started_at": bad},
+        )
+
+
+def test_validate_identity_effect_accepts_canonical_frozen_anchor():
+    # The canonical date the producer emits still passes.
+    serve_worker._validate_decrypted_tool_effect(
+        "identity",
+        {"effect_id": "e", "patch": {"relationship_days": 90},
+         "relationship_started_at": "2026-04-10"},
+    )  # must not raise
+
+
 # --- _validate_decrypted_tool_effect: identity op routing (Codex C1) ----------
 
 def test_validate_identity_effect_accepts_legacy_patch_without_op():

@@ -25,6 +25,7 @@ import uuid
 from functools import wraps
 
 import db
+import provider_health
 from core import enclave as core_enclave
 from core import envelope as core_envelope
 from core import util as core_util
@@ -351,6 +352,11 @@ def _restore_after_setup_write_failure(
     return None
 
 
+def _mark_route_test_ok(user_id: str, route_id: str) -> bool:
+    """Persist a successful route probe; callers restore health once active."""
+    return db.model_api_route_mark_test(user_id, route_id, status="ok")
+
+
 def _serialized_model_api_mutation(fn):
     """Cross-process per-user critical section for config + runtime ownership."""
     @wraps(fn)
@@ -523,7 +529,7 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     # this route between the upsert and the activate (a race the old single set_blob
     # write could not hit). Surface 500 instead of a "configured" 200 describing a
     # route that was never activated.
-    if not db.model_api_route_mark_test(store.user_id, route_id, status="ok"):
+    if not _mark_route_test_ok(store.user_id, route_id):
         restore_error = _restore_after_setup_write_failure(
             store,
             required=restore_v2,
@@ -543,6 +549,7 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
         if restore_error is not None:
             return restore_error
         return {"error": "model_api_route_write_failed"}, 500
+    provider_health.record_success(store.user_id)
 
     # Rollout flags / last_action_trace_* still live in the model_api_runtime blob;
     # seed it so onboarding validate's hosted_runtime step and GET /v1/model_api/runtime
@@ -669,8 +676,9 @@ def _test_active_route(store, route: dict, api_key: str | None) -> tuple[dict, i
     # stay excluded from the agent-runtime roster (which gates on test_status='ok')
     # even though the caller was just told the test succeeded — the false-success
     # pattern this pass exists to catch.
-    if not db.model_api_route_mark_test(store.user_id, route["id"], status="ok"):
+    if not _mark_route_test_ok(store.user_id, route["id"]):
         return {"error": "model_api_route_write_failed"}, 500
+    provider_health.record_success(store.user_id)
     return None
 
 
@@ -984,7 +992,7 @@ def _test_route_or_error(store, route: dict, caller_api_key: str | None):
     # test_status never reaches 'ok', so the just-"activated" route is excluded from
     # the roster (is_active AND test_status='ok') even though the caller gets a 200
     # "activated" response — the false-success pattern this pass exists to catch.
-    if not db.model_api_route_mark_test(store.user_id, route["id"], status="ok"):
+    if not _mark_route_test_ok(store.user_id, route["id"]):
         return {"error": "model_api_route_write_failed"}, 500
     return None
 
@@ -1166,6 +1174,7 @@ def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None
         if restore_error is not None:
             return restore_error
         return {"error": "route_not_found"}, 404
+    provider_health.record_success(store.user_id)
     restore_error = _restore_v2_or_error(store, required=restore_v2)
     if restore_error is not None:
         return restore_error
@@ -1244,6 +1253,7 @@ def model_api_route_test(store, route_id: str, *, api_key: str | None) -> tuple[
                     return restore_error
         return err
     if was_active:
+        provider_health.record_success(store.user_id)
         policy_error = _apply_runtime_policy_or_error(store)
         if policy_error is not None:
             return policy_error
@@ -1370,7 +1380,8 @@ def model_api_credential_patch(store, credential_id: str, payload: dict, *,
     # (cosmetic) — test_status was already 'ok' going in, so the roster
     # invariant this pass cares about isn't at risk either way.
     if active and active["credential_id"] == credential_id:
-        db.model_api_route_mark_test(store.user_id, active["id"], status="ok")
+        _mark_route_test_ok(store.user_id, active["id"])
+        provider_health.record_success(store.user_id)
 
     # 该 credential 下的非 active route 全部退回 untested（新 key 未在它们上验证过）。
     # Not checked: this is UI-freshness bookkeeping only. Activating any of these

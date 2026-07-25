@@ -107,7 +107,7 @@
 
 ---
 
-## 四、通道②：通知中心 `GET /v1/notices` [Phase B/C]
+## 四、通道②：通知中心 `GET /v1/notices` [已上线，原 Phase B/C]
 
 ### 这是什么
 
@@ -289,8 +289,8 @@ poster 提交的值**（`chat_core._turn_failure_attribution`）。理由是归�
 
 | 块 | 内容 | 状态 |
 |---|---|---|
-| 通道③ + `last_runtime_error` | §五、§六首行 | 后端完成（`feat/upstream-error-surfacing` 待合并部署） |
+| 通道③ + `last_runtime_error` | §五、§六首行 | 后端已合并（`model_api_routes.last_runtime_error*`，见 `hosted/config_store.py`） |
 | Phase A | 同步信封增强（blame/request_id/校验错误统一形状）+ slug 治理 | 设计定稿，待排期 |
-| Phase B | `GET /v1/notices` + chat 双写 + §六场景字段补齐 | 设计定稿，待排期 |
-| Phase C | genesis / import / memory / runner 接入通知中心 + 新增 error_class | 设计定稿，待排期 |
+| Phase B | `GET /v1/notices` + chat 双写 + §六场景字段补齐 | 已上线（`backend/notices/routes_asgi.py`；chat 双写 `turn_failure_error_class`） |
+| Phase C | genesis / import / memory / runner 接入通知中心 + 新增 error_class | 已上线（error_class 目录见 `backend/notices/catalog.py`） |
 | iOS | 交付清单见 §一 | 本文档即输入 |

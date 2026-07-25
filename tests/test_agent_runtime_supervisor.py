@@ -68,6 +68,20 @@ def _roster(*uids):
     return [{"user_id": u, "api_key": f"key-{u}"} for u in uids]
 
 
+def _keyless_roster(*uids):
+    """A host-all (zero-roster) roster: entries carry NO api_key and no resolved
+    provider_key yet — the cold-start shape the credential gate must defer. Seeds
+    the users rows exactly like ``_roster`` so acquire isn't FK-rejected."""
+    with db.get_pool().connection() as conn:
+        for u in uids:
+            conn.execute(
+                "INSERT INTO users (user_id, created_at, doc) "
+                "VALUES (%s, '', '{}'::jsonb) ON CONFLICT (user_id) DO NOTHING",
+                (u,),
+            )
+    return [{"user_id": u} for u in uids]
+
+
 def _sup(procs, owner="sup_A", clock=lambda: T0):
     return Supervisor(owner=owner, lease_ttl=300.0, data_root="/agent-data",
                       spawn_fn=procs.spawn, alive_fn=procs.is_alive,
@@ -142,6 +156,37 @@ def test_tick_spawns_fresh_start_user_with_no_genesis(monkeypatch):
     monkeypatch.setattr(db, "get_blob", lambda uid, kind: None)
     sup.tick(_roster("u_1"))
     assert {s[1] for s in procs.spawned} == {"u_1"}
+
+
+def test_tick_defers_keyless_hostall_until_provider_key_resolves(monkeypatch):
+    # Cold-start race: a host-all user discovered before _resolve_one fetched their
+    # provider key must NOT spawn keyless (that first turn would hit "Not logged in"
+    # and post a premature fallback). Once the key resolves, the next tick spawns.
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    monkeypatch.setattr(db, "get_blob", lambda uid, kind: None)  # genesis: fresh start
+    entry = _keyless_roster("u_kl")
+    sup.tick(entry)
+    assert procs.spawned == []                          # deferred while key unresolved
+    entry[0]["provider_key"] = "sk-ant-resolved"        # _resolve_one resolved it
+    sup.tick(entry)
+    assert {s[1] for s in procs.spawned} == {"u_kl"}    # key present → spawned
+
+
+def test_tick_spawns_keyless_after_defer_cap(monkeypatch):
+    # Bounded defer: if the key never resolves, past the cap we spawn anyway so the
+    # existing keyless fallback / decrypt-failed notice still reaches the user rather
+    # than deferring forever in silence.
+    procs = FakeProcTable()
+    tk = {"t": T0}
+    sup = _sup(procs, clock=lambda: tk["t"])
+    monkeypatch.setattr(db, "get_blob", lambda uid, kind: None)
+    entry = _keyless_roster("u_stuck")
+    sup.tick(entry)
+    assert procs.spawned == []                          # deferred within the cap
+    tk["t"] = T0 + sup._keyless_defer_cap_sec + 1.0     # wait past the cap
+    sup.tick(entry)
+    assert {s[1] for s in procs.spawned} == {"u_stuck"}  # cap exceeded → keyless backstop
 
 
 def test_tick_enqueues_introduction_after_spawn(monkeypatch):

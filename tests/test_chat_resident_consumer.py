@@ -5,7 +5,6 @@ Regression tests for tools/chat_resident_consumer.py
 Run with: pytest tests/test_chat_resident_consumer.py -v
 """
 
-import importlib
 import base64
 import json
 import os
@@ -1010,23 +1009,18 @@ def test_process_messages_executes_memory_actions_before_reply():
 # Phase 3: decrypt source unavailable cases
 # ---------------------------------------------------------------------------
 
-def test_empty_content_decrypt_source_available_replies(monkeypatch):
-    """poll returns content="" but decrypt source is available and returns
-    plaintext — consumer must reply using the decrypted content."""
-    # Simulate poll returning empty-content message
-    empty_msg = _make_msg(role="user", content="", ts=4000.0)
-    # Decrypt source returns the plaintext version
+def test_decrypted_content_from_decrypt_source_replies(monkeypatch):
+    """Post-merge contract of _process_messages: the poll loop uses poll
+    messages only as a trigger and feeds the get_decrypted_history result in
+    (merge glue covered by test_consumer_decrypt_since +
+    _filter_messages_to_poll_ids tests) — a decrypted non-empty message must
+    produce a reply."""
     decrypted_msg = _make_msg(role="user", content="what's the weather?", ts=4000.0)
 
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://127.0.0.1:5003")
-    monkeypatch.setattr(
-        crc, "get_decrypted_history",
-        lambda since, limit=20, include_image_body=True: [decrypted_msg],
-    )
 
     with patch.object(crc, "call_agent", return_value="sunny") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
-        # Consumer uses get_decrypted_history result, not the empty poll message
         result_ts = crc._process_messages([decrypted_msg])
 
     mock_agent.assert_called_once()
@@ -1082,6 +1076,46 @@ def test_agent_failure_posts_visible_fallback_by_default(monkeypatch):
 
     assert mock_post.call_count == 2
     assert result_ts == pytest.approx(100.0)
+
+
+def test_user_provider_failure_posts_actionable_line_not_fallback(monkeypatch):
+    """blame=user_provider 的失败（余额 / key / 模型名下线）永不自愈。
+
+    此前不论哪一类错误都糊同一句 FALLBACK_REPLY「你稍后再发一次，我会继续接」——
+    对配置类错误这是在骗用户重试，而每次重试都是又一次注定失败且照样计费的
+    provider 调用（2026-07-25 usr_a40e3713eb189d38：模型名被 DeepSeek 下线，
+    连吃几十条「刚刚没接上」，从没被告知真正原因）。
+
+    现在这类改发可行动话术，且不再补一条内容重复的 system 横幅（同一句话说两遍）；
+    设置页上报在节流判断之前，照常发生。"""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
+    monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: True)
+    crc._reset_system_notice_state()
+
+    upstream = RuntimeError(
+        "cli agent exited 1: API Error: 400 The supported API model names are "
+        "deepseek-v4-pro or deepseek-v4-flash, but you passed deepseek-chat")
+
+    with patch.object(crc, "call_agent", side_effect=upstream), \
+         patch.object(crc, "post_reply") as mock_post:
+        crc._process_messages([
+            {"id": "model-gone-1", "role": "user", "content": "在吗", "ts": 100.0}
+        ])
+
+    visible = [c for c in mock_post.call_args_list if c.kwargs.get("role") != "system"]
+    banners = [c for c in mock_post.call_args_list if c.kwargs.get("role") == "system"]
+
+    assert len(visible) == 1
+    assert visible[0].args[0] == "模型名不可用，请检查设置里的模型名。"
+    assert visible[0].args[0] != crc.FALLBACK_REPLY
+    assert "稍后再发一次" not in visible[0].args[0]
+    # 结构化元信息照旧下发，iOS 的错误 chip 依赖它。
+    assert visible[0].kwargs["turn_failure_error_class"] == "model_not_found"
+    assert visible[0].kwargs["turn_failure_blame"] == "user_provider"
+    # 同一句话不说两遍。
+    assert banners == []
 
 
 def test_no_error_notice_when_fallback_rejected_already_answered(monkeypatch):
@@ -3328,6 +3362,129 @@ def test_is_degenerate_proactive_reply_classification():
     # Anything with a letter, digit, CJK char or emoji is real content.
     for text in ("嗯", "在忙吗?", "ok.", "1", "🌙", "好~", "Hi"):
         assert not crc._is_degenerate_proactive_reply(text), repr(text)
+    # Back-compat alias still points at the generalized implementation.
+    assert crc._is_degenerate_proactive_reply is crc._is_degenerate_reply
+
+
+# ---------------------------------------------------------------------------
+# Foreground degenerate-reply guard (2026-07-25).
+#
+# The guard above shipped 2026-07-17 for the PROACTIVE lane only, reasoning that
+# "a foreground turn the user started still surfaces whatever came back". What
+# came back was a bare "。", and it did two kinds of damage: the user got a
+# period instead of an honest "上游没接上" line, AND the orphan period landed in
+# the transcript — so on the next turn the agent read it back, had no memory of
+# writing it, and accused the USER of sending it (usr_36038f, openai_compatible
+# relay + pi driver + a link dropping 15+ connections/day; two days of "你发个
+# 句号跟我杠" at a user who had sent none). Foreground now drops the fragment and
+# substitutes the same visible fallback an agent-call failure gets.
+# ---------------------------------------------------------------------------
+
+def _foreground_reply_harness(monkeypatch, agent_result, *, actions_ok=True):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    captured = {"posted": [], "failures": []}
+    monkeypatch.setattr(crc, "call_agent", lambda message, **kwargs: agent_result)
+    monkeypatch.setattr(
+        crc, "post_reply",
+        lambda reply, **kwargs: (
+            captured["posted"].append((reply, kwargs)),
+            {"id": f"msg_{len(captured['posted'])}"},
+        )[1],
+    )
+    monkeypatch.setattr(
+        crc, "_notify_agent_turn_failure",
+        lambda exc, *, foreground: captured["failures"].append((str(exc), foreground)),
+    )
+    if actions_ok:
+        monkeypatch.setattr(
+            crc, "execute_agent_actions",
+            lambda actions: {"effects": [], "outcomes": []},
+        )
+    return captured
+
+
+def _visible_replies(captured):
+    """User-facing bubbles only — the role=system notice row is separate."""
+    return [r for r, kw in captured["posted"] if kw.get("role") != "system"]
+
+
+def test_foreground_degenerate_only_reply_falls_back_instead_of_posting_period():
+    """THE regression: a bare 「。」 must never reach the user as the reply."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = {"id": "u-degen", "role": "user", "content": "晚安呀", "ts": 2222.0}
+
+    with patch.object(crc, "call_agent", return_value="。"), \
+         patch.object(crc, "post_reply", return_value={"id": "r1"}) as mock_post:
+        result_ts = crc._process_messages([msg])
+
+    posted = [c.args[0] for c in mock_post.call_args_list]
+    assert "。" not in posted, "relay fragment leaked to the user"
+    assert crc.FALLBACK_REPLY in posted
+    # Blame lands on the relay, not on us (provider_transient), matching the
+    # stream-cut classification 385f636c established.
+    kwargs = mock_post.call_args_list[0].kwargs
+    assert kwargs["turn_failure_error_class"] == "upstream_unavailable"
+    assert kwargs["turn_failure_blame"] == "provider_transient"
+    # Checkpoint still advances — the turn is resolved, not retried forever.
+    assert result_ts == pytest.approx(2222.0)
+
+
+@pytest.mark.parametrize("fragment", [".", "。", "…", "……", "!", "，", "、", "——", ". ."])
+def test_foreground_degenerate_shapes_all_suppressed(fragment):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = {"id": f"u-{fragment}", "role": "user", "content": "hi", "ts": 1.0}
+
+    with patch.object(crc, "call_agent", return_value=fragment), \
+         patch.object(crc, "post_reply", return_value={"id": "r"}) as mock_post:
+        crc._process_messages([msg])
+
+    posted = [c.args[0] for c in mock_post.call_args_list]
+    assert fragment not in posted, f"{fragment!r} leaked"
+
+
+def test_foreground_degenerate_fragment_dropped_but_real_reply_still_posted():
+    """Mixed output: drop the fragment, keep the real bubble, NO fallback line."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = {"id": "u-mixed", "role": "user", "content": "在吗", "ts": 3333.0}
+
+    with patch.object(crc, "call_agent", return_value=["。", "在的，怎么了"]), \
+         patch.object(crc, "post_reply", return_value={"id": "r"}) as mock_post:
+        crc._process_messages([msg])
+
+    posted = [c.args[0] for c in mock_post.call_args_list]
+    assert posted == ["在的，怎么了"]
+    assert crc.FALLBACK_REPLY not in posted  # partial success is not a failure
+
+
+def test_foreground_emoji_only_reply_is_not_dropped():
+    """Hardening: an emoji-only reply is real content and must survive."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = {"id": "u-emoji", "role": "user", "content": "晚安", "ts": 4444.0}
+
+    with patch.object(crc, "call_agent", return_value="🌙"), \
+         patch.object(crc, "post_reply", return_value={"id": "r"}) as mock_post:
+        crc._process_messages([msg])
+
+    assert [c.args[0] for c in mock_post.call_args_list] == ["🌙"]
+
+
+def test_foreground_degenerate_with_fallback_disabled_posts_nothing(monkeypatch):
+    """FALLBACK off → still never post the fragment; notify + advance instead."""
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", False)
+    captured = _foreground_reply_harness(monkeypatch, "。")
+
+    result_ts = crc._process_messages(
+        [{"id": "u-nofb", "role": "user", "content": "hi", "ts": 5555.0}]
+    )
+
+    assert _visible_replies(captured) == []
+    assert captured["failures"] and captured["failures"][0][1] is True  # foreground
+    assert result_ts == pytest.approx(5555.0)
 
 
 def _degenerate_test_harness(monkeypatch, agent_result):
@@ -8377,7 +8534,7 @@ def test_generic_failure_sets_backoff(monkeypatch):
 
 
 def test_402_failure_feeds_both_cooldown_and_general_backoff(monkeypatch):
-    cap = _proactive_guard_harness(monkeypatch, raise_exc=RuntimeError("HTTP 402 payment required"))
+    _proactive_guard_harness(monkeypatch, raise_exc=RuntimeError("HTTP 402 payment required"))
     crc._proactive_backoff_until = 0.0
     crc._clear_provider_payment_cooldown()
     crc._process_proactive_jobs([_idle_proactive_job()])

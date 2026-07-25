@@ -147,9 +147,11 @@ def test_history_probe_fails_open(user, monkeypatch):
     first = _send(client, user_id, api_key, "m1")
     ts1 = float(first["ts"])
 
-    def boom(uid):
+    def boom(*args, **kwargs):
         raise RuntimeError("db probe down")
-    monkeypatch.setattr(db, "chat_newest_ts", boom)
+    # The staleness probe counts rows via chat_count_since (chat_core
+    # _self_heal_if_stale); patching that is what actually exercises fail-open.
+    monkeypatch.setattr(db, "chat_count_since", boom)
     body = _history_since(client, api_key, ts1)
     assert (body.get("messages") or []) == []
 

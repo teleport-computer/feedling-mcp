@@ -240,7 +240,7 @@ services:
       # channel, NOT baked into compose_hash). Empty default keeps dev
       # deploys + CI compose-build healthy — code falls through to
       # "logged_only" mode when unset. KEY_ID + TEAM_ID are also overridable
-      # but default to the Apple dev team's ids in backend/app.py.
+      # but default to the Apple dev team's ids in backend/push/apns.py.
       APNS_KEY_P8_B64: "${APNS_KEY_P8_B64:-}"
       APNS_KEY_ID: "${APNS_KEY_ID:-}"
       APNS_TEAM_ID: "${APNS_TEAM_ID:-}"
@@ -249,11 +249,9 @@ services:
       # device tokens — prod must pin this to "false". (Test deploy keeps the
       # sandbox default for its sandbox-provisioned tokens.)
       APNS_SANDBOX: "false"
-      # Optional LLM Gate for proactive screen outreach. If unset, automatic
-      # Gate records model_not_configured and does not enqueue hidden jobs.
+      # Optional: proactive admin dashboard's debug translation
+      # (backend/proactive/dashboard.py). Unset = translation disabled.
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
-      FEEDLING_PROACTIVE_GATE_PROVIDER: "${FEEDLING_PROACTIVE_GATE_PROVIDER:-openrouter}"
-      FEEDLING_PROACTIVE_GATE_MODEL: "${FEEDLING_PROACTIVE_GATE_MODEL:-google/gemini-3.1-flash-lite}"
       # Baseline-ON for the perception/resident V2 rollout flags
       # (perception_ingress / resident_wake / resident_chat). Prod users run V2
       # by default; an explicit per-user blob value still wins, so rollback for a
@@ -274,6 +272,10 @@ services:
       FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
       # Automatic Memory Capture stays explicit opt-in (default off).
       FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-0}"
+      # Unaudited-route context-window default — keep in sync with serve-worker
+      # (the setup path resolves/validates the same limit). See the serve-worker
+      # block for the rationale. ${VAR:-} form → tunable without a new compose_hash.
+      FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS: "${FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS:-131072}"
       # Genesis v2 (foreground-fast onboarding): greet on 3-5 core + identity
       # baseline, push the heavy reduce (the old ~37% failure surface) to the
       # background. Validated on test; flip to "false" to revert to the v1
@@ -362,6 +364,14 @@ services:
       # the serve-worker (no E2B), staying within the TDX trust boundary.
       FEEDLING_V2_SANDBOX_PROVIDER: "local"
       FEEDLING_V2_IMAGE_MAX_B64_CHARS: "2700000"
+      # Unaudited-route (custom relay / unknown model) context-window default.
+      # Prod's custom-relay users all back >=128k-context models, so 131072 gives
+      # a persona/world-book-sized REQUIRED prompt real headroom instead of the
+      # code default's conservative 32768 (which was itself raised from 16384
+      # after world-book users hit prompt_frontier_exhausted before any provider
+      # call). ${VAR:-} form: tunable later via encrypted env WITHOUT a new
+      # compose_hash; "0" restores strict fail-closed.
+      FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS: "${FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS:-131072}"
       # web_fetch article extraction (trafilatura, runs in this serve-worker).
       # Default ON — a rollback lever, not a feature gate. Set to "0" to fall back
       # to the plain tag-strip; takes effect on the next serve-worker restart.

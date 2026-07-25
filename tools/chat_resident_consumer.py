@@ -595,9 +595,19 @@ _ERROR_CLASS_RULES = (
      "API Key 无效或已过期，请到设置里重新保存。",
      re.compile(r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b"
                 r"|provider_http_40[13]", re.I)),
+    # 上游下线/改名一个模型时的措辞五花八门，窄正则会让「改个模型名就好」的错误掉进
+    # unknown/blame=system —— 那一档按纪律【不许】引导用户改配置，用户于是永远收不到
+    # 真正原因（2026-07-25 usr_a40e3713eb189d38：DeepSeek 把 deepseek-chat 并入 V4 线，
+    # 报错原文 "The supported API model names are deepseek-v4-pro or deepseek-v4-flash,
+    # but you passed deepseek-chat" 三条规则一条都不命中）。下面每一条都对应真实观测到
+    # 的上游措辞，不做「400 + model」这类宽匹配（400 出现在太多无关报文里）。
     ("model_not_found", "user_provider",
      "模型名不可用，请检查设置里的模型名。",
-     re.compile(r"invalid model name|model_not_found|no such model", re.I)),
+     re.compile(r"invalid model name|model_not_found|no such model|unknown model"
+                r"|supported .{0,40}model names"      # DeepSeek: "The supported API model names are …"
+                r"|model .{0,80}does not exist"       # OpenAI: "The model `x` does not exist…"
+                r"|not a valid model"
+                r"|model[ _]not[ _]found", re.I)),
     ("cli_config_invalid", "user_provider",
      "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。",
      re.compile(r"missing the \{message\} placeholder", re.I)),
@@ -696,6 +706,8 @@ _system_notice_last_sent: dict[str, float] = {}
 # 每进程首个成功回合无条件清一次设置页错误（代价一次 HTTP），覆盖 respawn 前留下的滞留错误：
 # respawn 后新进程从 False 起步则永远不会触发清空，导致用户修好配置后 last_runtime_error 仍滞留。
 _runtime_error_reported = True
+PROVIDER_HEALTH_SUCCESS_REPORT_INTERVAL_SEC = 15 * 60
+_provider_health_success_reported_at = 0.0
 
 # 组件2：call_agent 清洗为空时（SEND_FALLBACK_ON_AGENT_ERROR=true）不抛异常，
 # 靠这个模块级标记让前台调用方知道本轮其实失败了，要补发 reply_parse_failed 通知。
@@ -716,7 +728,11 @@ def _reset_system_notice_state() -> None:
     _system_notice_last_sent.clear()
 
 
-def _report_runtime_error(error: str, error_class: str = "") -> bool:
+def _report_runtime_error(
+    error: str,
+    error_class: str = "",
+    provider_result: str = "",
+) -> bool:
     """腿②：设置页 last_runtime_error。失败只 log（观测性不影响回合）。
 
     只有请求真正落到服务端（2xx，或 404=无 profile 可清）才更新
@@ -726,7 +742,11 @@ def _report_runtime_error(error: str, error_class: str = "") -> bool:
     try:
         resp = _HTTP.post(
             f"{FEEDLING_API_URL}/v1/model_api/runtime_error",
-            json={"error": (error or "")[:300], "error_class": (error_class or "")[:64]},
+            json={
+                "error": (error or "")[:300],
+                "error_class": (error_class or "")[:64],
+                "provider_result": (provider_result or "")[:16],
+            },
             headers=_HEADERS, timeout=10,
         )
         if resp.status_code != 404:
@@ -745,7 +765,11 @@ def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
     + debug 日志。永不抛出：通知是回合失败的旁路，绝不能让它把失败变得更糟。"""
     try:
         notice = classify_agent_error(exc)
-        _report_runtime_error(notice.detail, notice.error_class)
+        _report_runtime_error(
+            notice.detail,
+            notice.error_class,
+            provider_result="failure",
+        )
         if not foreground:
             return
         # 三桶（见上方块注释）：user_provider 各 error_class 一桶、provider_transient
@@ -768,16 +792,52 @@ def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
         log.exception("system notice emit failed (non-fatal)")
 
 
+def _turn_failure_reply_text(notice: "AgentErrorNotice") -> str:
+    """前台失败时那条用户可见气泡该说什么。
+
+    `blame=user_provider` 的错误（余额耗尽 / key 失效 / 模型名被上游下线 / 上下文超限）
+    **永不自愈**。对这类错误发 FALLBACK_REPLY 的「你稍后再发一次，我会继续接」是在
+    骗用户重试，而每一次重试都是又一次注定失败的 provider 调用（并且照样计费）。
+    2026-07-25 的 usr_a40e3713eb189d38 / usr_d98b8d68124090a6 正是这样连吃了几十条
+    「刚刚没接上」，从头到尾没被告知真正原因（模型名下线 / 余额为 0）。
+
+    只有**会自愈**的错误——超时、5xx、限流、流断，以及我们自己的 bug——才配用兜底话术，
+    因为对它们来说「稍后再发一次」是真话。"""
+    if notice is not None and notice.blame == "user_provider":
+        return notice.user_text
+    return FALLBACK_REPLY
+
+
+def _suppress_duplicate_upstream_banner(notice: "AgentErrorNotice") -> None:
+    """可行动话术已经作为回复气泡说过一遍了，别再补一条内容重复的 system 横幅。
+
+    直接盖章 _notify_agent_turn_failure 用的同一个节流键即可——设置页上报
+    (_report_runtime_error) 在该函数里位于节流判断**之前**，因此不受影响。"""
+    if notice is None:
+        return
+    _system_notice_last_sent[notice.error_class] = time.monotonic()
+
+
 def _note_agent_turn_success() -> None:
-    """成功回合：清空设置页错误（仅当本进程报过错，省一次 HTTP）。
+    """成功回合：清空设置页错误，并节流刷新 provider health 成功时间。
 
     不再清横幅限流窗口——固定窗口（见 FOREGROUND_NOTICE_WINDOW_SEC）：上游
     一抖一恢复时若每次成功都清零，每次"恢复后再坏"都会重新弹横幅。
     标记翻转在 _report_runtime_error 内部、且仅在清空真正送达时发生——
     这里不再无条件翻 False（Codex P2：清空 POST 失败会让过期错误滞留且
-    永不重试）。清空失败 → 标记保留 → 下个成功回合自动重试。"""
-    if _runtime_error_reported:
-        _report_runtime_error("", "")
+    永不重试）。设置页有错时立即清；正常健康回合最多每 15 分钟上报一次，
+    48h 判定不需要每回合精度，也不应给热路径每轮增加一次 HTTP。"""
+    global _provider_health_success_reported_at
+    now = time.monotonic()
+    due = (
+        _provider_health_success_reported_at <= 0
+        or now - _provider_health_success_reported_at
+        >= PROVIDER_HEALTH_SUCCESS_REPORT_INTERVAL_SEC
+    )
+    if not _runtime_error_reported and not due:
+        return
+    if _report_runtime_error("", "", provider_result="success"):
+        _provider_health_success_reported_at = now
 
 
 def _agent_call_failed_reason(prefix: str, exc: BaseException) -> str:
@@ -9129,22 +9189,35 @@ def _proactive_control_reason_from_result(agent_result: Any, replies: list[str])
     ).strip()
 
 
-def _is_degenerate_proactive_reply(text: Any) -> bool:
-    """True when a proactive reply carries no actual content — only
+def _is_degenerate_reply(text: Any) -> bool:
+    """True when a reply carries no actual content — only
     whitespace/punctuation/separators (e.g. ".", "。", "…").
 
     Flaky openai-compatible relays can cut the SSE stream right after the
     first token; pi still closes the assistant message with that fragment,
-    and without this check the consumer posts it as an unprompted chat
-    bubble (seen live 2026-07-17: a 2-hour heartbeat posting a bare "."
-    twice). Letters, digits, CJK and emoji all count as content — only a
-    reply with none of those is degenerate. Proactive lane only: a
-    foreground turn the user started still surfaces whatever came back."""
+    and without this check the consumer posts it as a chat bubble (seen live
+    2026-07-17: a 2-hour heartbeat posting a bare "." twice). Letters, digits,
+    CJK and emoji all count as content — only a reply with none of those is
+    degenerate.
+
+    BOTH lanes use this now. It was proactive-only from 2026-07-17 to
+    2026-07-25 on the reasoning that "a foreground turn the user started still
+    surfaces whatever came back" — but what came back was a bare "。", which is
+    worse than the honest fallback line, and it poisons the transcript: on the
+    NEXT turn the agent reads that orphan period back out of its own history,
+    has no memory of writing it, and blames the USER for sending it (usr_36038f,
+    openai_compatible relay + pi + a link dropping 15+ connections/day, accused
+    her of sending periods across two days; she had sent none). Foreground
+    can't just go silent, so the caller substitutes the visible fallback."""
     for ch in str(text or ""):
         cat = unicodedata.category(ch)
         if cat[0] in ("L", "N") or cat == "So":
             return False
     return True
+
+
+# Back-compat alias: the proactive lane and its tests named this first.
+_is_degenerate_proactive_reply = _is_degenerate_reply
 
 
 def _split_proactive_actions(actions: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -9625,7 +9698,6 @@ def _resident_perception_now() -> dict:
 # from the consumer's real clock + the user's timezone (stable; sourced from
 # the whoami cache), so every turn/wake is anchored to the real present.
 _last_interaction_unix: float = 0.0
-_WEEKDAYS_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
 def _user_timezone() -> str:
@@ -10829,9 +10901,9 @@ def _process_proactive_jobs(jobs: list) -> float:
         # the whole "reply" — drop those before any branch below sees them, so
         # a sleep/schedule action still completes quietly instead of posting
         # the fragment as a chat bubble.
-        degenerate_replies = [r for r in replies if _is_degenerate_proactive_reply(r)]
+        degenerate_replies = [r for r in replies if _is_degenerate_reply(r)]
         if degenerate_replies:
-            replies = [r for r in replies if not _is_degenerate_proactive_reply(r)]
+            replies = [r for r in replies if not _is_degenerate_reply(r)]
             log.warning(
                 "proactive degenerate reply fragment(s) dropped id=%s fragments=%r",
                 job_id,
@@ -11870,7 +11942,13 @@ def _process_messages(messages: list) -> float:
             # 上报/system 通知与兜底话术解耦（Codex review）：SEND_FALLBACK_ON_AGENT_ERROR
             # 只管发不发 FALLBACK_REPLY，错误透出（设置页 + system 通知）两种配置下都要发。
             if SEND_FALLBACK_ON_AGENT_ERROR:
-                agent_result = [FALLBACK_REPLY]
+                # 兜底话术只对「会自愈」的错误成立；配置类错误改发可行动话术，
+                # 否则用户被引导去重试一个永远不会成功的调用（见
+                # _turn_failure_reply_text）。
+                failure_notice = classify_agent_error(e)
+                agent_result = [_turn_failure_reply_text(failure_notice)]
+                if failure_notice.blame == "user_provider":
+                    _suppress_duplicate_upstream_banner(failure_notice)
                 pending_failure_notice = e
             else:
                 # 关兜底时没有回复写入可挂排他性，当场通知（此配置下 failover 双
@@ -11943,6 +12021,51 @@ def _process_messages(messages: list) -> float:
             except Exception as e:
                 log.error("agent action execution failed; suppressing optimistic agent reply: %s", e)
                 replies = [_identity_action_failure_reply(raw_user_content_for_lang)]
+
+        # A relay-truncated turn hands back a bare punctuation fragment as the
+        # whole "reply". The proactive lane has dropped these since 385f636c;
+        # the foreground lane did not, so a lone "。" went out as the agent's
+        # chat bubble and then poisoned the transcript (see _is_degenerate_reply
+        # — usr_36038f was accused of sending periods she never sent). Drop the
+        # fragment here, AFTER the action-outcome rewrite, so a real reply
+        # synthesized from action outcomes is never mistaken for one.
+        degenerate = [r for r in replies if _is_degenerate_reply(r)]
+        if degenerate:
+            replies = [r for r in replies if not _is_degenerate_reply(r)]
+            log.warning(
+                "foreground degenerate reply fragment(s) dropped id=%s fragments=%r",
+                msg.get("id") or msg.get("message_id") or "",
+                [str(r)[:20] for r in degenerate],
+            )
+            _emit_debug_trace(
+                "agent", "agent.reply.degenerate", status="error", trace_id=trace_id,
+                summary=f"dropped {len(degenerate)} degenerate fragment(s)",
+                explain="上游把回复流切断了，只剩标点碎片；已丢弃，不发给用户。",
+                detail={"n_dropped": len(degenerate), "had_actions": bool(actions)},
+                content_excerpt={"fragments": repr([str(r)[:20] for r in degenerate])},
+            )
+            if not replies and not actions:
+                # Nothing real is left and no action stood in for the reply. The
+                # user is in the foreground WAITING, so silence is not an option
+                # (that is the whole reason the original guard skipped this lane).
+                # Give them the same honest line an outright agent-call failure
+                # gets. The notice text classifies off the stream-cut signature,
+                # so the banner blames the relay (provider_transient), not us.
+                stream_cut = ValueError(
+                    "agent reply ended without finish_reason "
+                    "(degenerate punctuation fragment only)"
+                )
+                if SEND_FALLBACK_ON_AGENT_ERROR:
+                    replies = [FALLBACK_REPLY]
+                    pending_failure_notice = stream_cut
+                else:
+                    _notify_agent_turn_failure(stream_cut, foreground=True)
+                    log.warning(
+                        "degenerate-only turn and fallback disabled by env; "
+                        "this user turn will not get a visible reply"
+                    )
+                    latest = max(latest, ts)
+                    continue
 
         reply_to_message_id = str(msg.get("id") or msg.get("message_id") or "").strip()
         posted_any = False

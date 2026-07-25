@@ -2,7 +2,12 @@
 
 This is an operations cutover flag, not a user-facing switch. Resident users do
 not have the hosted model_api runtime profile, so the flag lives in its own
-per-user blob and defaults off.
+per-user blob.
+
+⚠️ It does NOT default off in a deployed environment: absence falls through to
+core/util.runtime_v2_default_on(), and every main compose injects
+FEEDLING_RUNTIME_V2_DEFAULT_ON=true (prod included). Off is only the default of
+an env-less process.
 """
 from __future__ import annotations
 
@@ -25,7 +30,8 @@ def load_resident_runtime_profile_v2(store: UserStore) -> dict[str, Any]:
 def _resident_flag_enabled(store: UserStore, flag: str) -> bool:
     # No auto-seeding: the resident_runtime_v2 blob only carries a key when an
     # operator set it. So an explicit value (True or False) wins; absence falls
-    # back to the env-gated baseline (OFF prod / ON test).
+    # back to the env-gated baseline — which every deployed environment (prod
+    # included) turns ON, see core/util.runtime_v2_default_on.
     try:
         val = load_resident_runtime_profile_v2(store).get(flag)
         return core_util.runtime_v2_default_on() if val is None else bool(val)

@@ -407,3 +407,67 @@ def test_identity_non_rename_patch_is_enqueued(monkeypatch):
 
     assert [tc.id for tc in enqueued] == ["r4"]
     assert results[0].content == "queued: identity_patch"
+
+
+# ------------------------------------------------------------------
+# Item 3/4: relationship_days is validated LIVE, pre-enqueue (like the rename
+# pairing check) — a malformed / over-cap value hands the model a fixable error
+# THIS turn and is NOT enqueued. A valid value enqueues normally. Kept out of
+# tool_schema.validate_tool_args (which also gates replay).
+# ------------------------------------------------------------------
+
+def test_identity_relationship_days_invalid_errors_and_is_not_enqueued(monkeypatch):
+    tool_calls = [ToolCall(id="d1", name="identity_patch",
+                           args={"patch": {"relationship_days": "300"}})]
+    results, enqueued = _run(
+        tool_calls, turn_authorization=True,
+        run_capability=_ok_run_capability, monkeypatch=monkeypatch)
+    assert enqueued == []
+    assert results[0].content == "error: relationship_days_must_be_non_negative_int"
+
+
+def test_identity_relationship_days_over_cap_errors_and_is_not_enqueued(monkeypatch):
+    tool_calls = [ToolCall(id="d2", name="identity_patch",
+                           args={"patch": {"relationship_days": 10 ** 9}})]
+    results, enqueued = _run(
+        tool_calls, turn_authorization=True,
+        run_capability=_ok_run_capability, monkeypatch=monkeypatch)
+    assert enqueued == []
+    assert results[0].content == "error: relationship_days_out_of_range"
+
+
+def test_identity_valid_relationship_days_is_enqueued(monkeypatch):
+    tool_calls = [ToolCall(id="d3", name="identity_patch",
+                           args={"patch": {"relationship_days": 300}})]
+    results, enqueued = _run(
+        tool_calls, turn_authorization=True,
+        run_capability=_ok_run_capability, monkeypatch=monkeypatch)
+    assert [tc.id for tc in enqueued] == ["d3"]
+    assert results[0].content == "queued: identity_patch"
+
+
+# ------------------------------------------------------------------
+# Item 1: the write producer FREEZES the absolute anchor at enqueue time. A
+# relationship_days patch gets an absolute relationship_started_at (= today - N)
+# added as trusted top-level metadata; the sink consumes it verbatim so a delayed
+# replay cannot drift the anchor.
+# ------------------------------------------------------------------
+
+def test_write_tool_effect_payload_freezes_relationship_anchor():
+    from datetime import date, timedelta
+    from model_api_runtime.v2 import worker as v2_worker
+    tc = ToolCall(id="f1", name="identity_patch", args={"patch": {"relationship_days": 300}})
+    effect_type, payload = v2_worker._write_tool_effect_payload(tc)
+    assert effect_type == "identity"
+    # relationship_days is the 1-based "第 N 天" (met day = 第 1 天), so N=300
+    # freezes to elapsed N-1=299 → today-299.
+    assert payload["relationship_started_at"] == (date.today() - timedelta(days=299)).isoformat()
+    # the relative value is preserved for audit; the frozen absolute wins at the sink
+    assert payload["patch"]["relationship_days"] == 300
+
+
+def test_write_tool_effect_payload_no_freeze_without_relationship_days():
+    from model_api_runtime.v2 import worker as v2_worker
+    tc = ToolCall(id="f2", name="identity_patch", args={"patch": {"signature": ["x"]}})
+    _effect_type, payload = v2_worker._write_tool_effect_payload(tc)
+    assert "relationship_started_at" not in payload  # byte-identical to a pre-item-1 row

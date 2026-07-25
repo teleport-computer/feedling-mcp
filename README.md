@@ -10,7 +10,7 @@ Agent 是大脑，Feedling 是身体。
 ## What this repo is
 
 > **Note (2026-06-12)**: the MCP user line (FastMCP server, `mcp.feedling.app`,
-> the 31 `feedling_*` tools) was removed. Historical mentions below are kept
+> the 23 `feedling_*` tools) was removed. Historical mentions below are kept
 > only where they describe past milestones.
 
 1. **HTTP backend** (FastAPI/ASGI, `backend/asgi_app.py`) — iOS, resident-consumer, and proactive APIs
@@ -459,7 +459,7 @@ struct ContentState: Codable, Hashable {
 1. Agent calls `POST /v1/bootstrap`
 2. Backend returns `first_time` + instructions
 3. Before any tool call, Agent performs Step 0 context verification from its own runtime memory: earliest message date, name it has been called, and memorable-moment count. If history is missing, it asks the user for context or an explicit fresh start instead of writing defaults.
-4. Agent runs the four memory passes from the public skill: theme inventory, candidate enumeration, write-through with `feedling_memory_add_moment`, then user verification in the external runtime. Memory floors are relationship-age based: <1 month ≥5, 1+ month ≥15, 6+ months ≥30. Agent calls `feedling_memory_verify` before identity.
+4. Agent runs the four memory passes from the public skill: theme inventory, candidate enumeration, write-through with `feedling_memory_add_moment`, then user verification in the external runtime. Memory floors are relationship-age based: 2+ days ≥5, 1+ month ≥12, 6+ months ≥30. Agent calls `feedling_memory_verify` before identity.
 5. Agent derives identity from the written memories, then calls `feedling_identity_init` with exactly 7 dimensions and `days_with_user = today - earliest_memory.occurred_at`. The server records `relationship_started_at` from `days_with_user` as a fixed anchor, and Agent calls `feedling_identity_verify`.
 6. Agent establishes Live connection before the user enters Chat by running the independent `feedling-chat-resident` / IO resident consumer service when a machine/server path is used. The resident consumer polls `/v1/chat/poll`, calls the agent's HTTP or CLI entry, posts `/v1/chat/response`, then `feedling_chat_verify_loop` proves the loop before the first greeting.
 7. After Live connection is verified, Agent calls `feedling_chat_post_message` to greet the user — this is the first visible Feedling chat message. It states the computed day count as a fact and tells the user the connection is live. If the user corrects the day count, Agent calls `feedling_identity_set_relationship_days` to recalibrate the anchor.

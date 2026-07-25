@@ -1,4 +1,3 @@
-import math
 from model_api_runtime.v2 import admission
 
 

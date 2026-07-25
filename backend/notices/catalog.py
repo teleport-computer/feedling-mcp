@@ -143,8 +143,14 @@ _UPSTREAM_RULES = (
     ("auth_invalid", re.compile(
         r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b"
         r"|provider_http_40[13]", re.I)),
+    # 与 consumer _ERROR_CLASS_RULES 的同名规则逐字对齐（见那边的长注释：上游下线
+    # 一个模型时措辞五花八门，窄正则会把可自助修复的错误误判成 blame=system）。
     ("model_not_found", re.compile(
-        r"invalid model name|model_not_found|no such model", re.I)),
+        r"invalid model name|model_not_found|no such model|unknown model"
+        r"|supported .{0,40}model names"      # DeepSeek: "The supported API model names are …"
+        r"|model .{0,80}does not exist"       # OpenAI: "The model `x` does not exist…"
+        r"|not a valid model"
+        r"|model[ _]not[ _]found", re.I)),
     ("cli_config_invalid", re.compile(
         r"missing the \{message\} placeholder", re.I)),
     ("provider_incompatible", re.compile(

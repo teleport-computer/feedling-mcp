@@ -91,8 +91,7 @@ def on_starting(server):
     from hosted import agent_runtime_cutover
     agent_runtime_cutover.assert_hosting_ready()
     # DB migration single-point (master, once, before fork). See module docstring:
-    # the ASGI entrypoint asgi_app:app does NOT import app.py, so this is the only
-    # place the schema is upgraded under FastAPI. Idempotent for the Flask path.
+    # this is the only place the schema is upgraded — workers never run alembic.
     import db
     db.init_schema()
     from hosted import config_store

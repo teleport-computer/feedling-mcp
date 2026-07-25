@@ -195,6 +195,23 @@ def test_dau_parity(env):
     assert f[0] == a[0] == 200
     assert _norm_json(f[1]) == _norm_json(a[1])
     assert f[1]["summary"]["timezone"] == "Asia/Shanghai"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", f[1]["usage_histogram"]["day"])
+    assert len(f[1]["usage_histogram"]["buckets"]) == 8
+
+
+def test_dau_day_selector_and_invalid_day_parity(env):
+    path = "/v1/admin/data-track/dau?day=2035-05-06"
+    f = _flask_get_json(path, headers=_admin())
+    a = _asgi_json("GET", path, headers=_admin())
+    assert f[0] == a[0] == 200
+    assert _norm_json(f[1]) == _norm_json(a[1])
+    assert f[1]["filters"]["day"] == "2035-05-06"
+    assert f[1]["usage_histogram"]["day"] == "2035-05-06"
+
+    invalid_path = "/v1/admin/data-track/dau?day=2035-02-30"
+    f_bad = _flask_get_json(invalid_path, headers=_admin())
+    a_bad = _asgi_json("GET", invalid_path, headers=_admin())
+    assert f_bad == a_bad == (400, {"error": "invalid_day"})
 
 
 def test_user_detail_parity(env):
@@ -300,6 +317,7 @@ _DELETE_TABLES = (
     "memory_moments",
     "user_blobs",
     "agent_runtime_instances",
+    "provider_health",
 )
 
 
@@ -324,6 +342,11 @@ def _seed_delete_rows(user_id: str) -> None:
             "INSERT INTO agent_runtime_instances "
             "(user_id, driver, status, runtime_home) "
             "VALUES (%s, 'claude', 'idle', '/tmp/admin-delete')",
+            (user_id,),
+        )
+        conn.execute(
+            "INSERT INTO provider_health (user_id, provider_state) "
+            "VALUES (%s, 'ok')",
             (user_id,),
         )
 

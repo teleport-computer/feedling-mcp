@@ -18,6 +18,8 @@ from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
 from core import store as core_store  # noqa: E402
 from identity import actions as identity_actions_mod  # noqa: E402
+from identity import card_policy  # noqa: E402
+from identity import identity_core  # noqa: E402
 from identity import service as identity_service  # noqa: E402
 
 
@@ -1000,3 +1002,427 @@ def test_proactive_settings_wake_directive_validation(client):
     assert "bogus_key" not in saved                      # unknown keys rejected
     assert store.load_proactive_settings()["wake_directive"] == "x" * 1000
     assert store.load_proactive_settings()["wake_interval_sec"] == 900
+
+
+def test_profile_patch_relationship_days_sets_calibrated_anchor(client, monkeypatch):
+    # relationship_days in the patch converts to a relationship_started_at anchor,
+    # rides the SAME CAS write as any other profile_patch field, stamps
+    # source=user_calibrated, and reads back as the requested day count.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)  # seed anchor: 2026-04-01, source="test"
+    captured_plaintexts: list = []
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={
+            "actions": [{
+                "type": "identity.profile_patch",
+                "patch": {"relationship_days": 300},
+                "reason": "User said we've actually known each other 300 days.",
+            }],
+        },
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["status"] == "ok"
+    assert body["effects"][0]["type"] == "identity_updated"
+    assert body["effects"][0]["fields"] == ["days_with_user"]
+
+    saved = db.get_blob(user_id, "identity")
+    assert saved["relationship_anchor_source"] == "user_calibrated"
+    # Anchor moved off the seeded 2026-04-01. relationship_days is 1-based
+    # ("第 N 天", met day = 第 1 天), so N=300 stores elapsed N-1=299.
+    assert saved["relationship_started_at"] != "2026-04-01"
+    assert identity_service._live_days_with_user(
+        saved, store=core_store.get_store(user_id)) == 299
+
+
+def test_profile_patch_relationship_days_with_other_field(client, monkeypatch):
+    # relationship_days co-mutates cleanly with a normal string field in one patch:
+    # the name lands in the encrypted card, the anchor recalibrates, one CAS write.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    captured_plaintexts: list = []
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={
+            "actions": [{
+                "type": "identity.profile_patch",
+                "patch": {"agent_name": "小满", "relationship_days": 100},
+            }],
+        },
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert set(body["effects"][0]["fields"]) == {"agent_name", "days_with_user"}
+    assert captured_plaintexts[-1]["agent_name"] == "小满"
+    saved = db.get_blob(user_id, "identity")
+    assert saved["relationship_anchor_source"] == "user_calibrated"
+    # 1-based: N=100 stores elapsed N-1=99.
+    assert identity_service._live_days_with_user(
+        saved, store=core_store.get_store(user_id)) == 99
+
+
+def test_profile_patch_relationship_days_only_leaves_other_fields(client, monkeypatch):
+    # A relationship_days-only patch must not disturb any encrypted profile field —
+    # the re-encrypted plaintext is the untouched existing card.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    captured_plaintexts: list = []
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={
+            "actions": [{
+                "type": "identity.profile_patch",
+                "patch": {"relationship_days": 42},
+            }],
+        },
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    assert captured_plaintexts[-1]["agent_name"] == _plain_identity()["agent_name"]
+    assert captured_plaintexts[-1]["self_introduction"] == _plain_identity()["self_introduction"]
+    saved = db.get_blob(user_id, "identity")
+    # 1-based: N=42 stores elapsed N-1=41.
+    assert identity_service._live_days_with_user(
+        saved, store=core_store.get_store(user_id)) == 41
+
+
+def test_profile_patch_relationship_days_zero_accepted(client, monkeypatch):
+    # Edge: 0 days ("we met today") is a legal value, not an empty patch.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    captured_plaintexts: list = []
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{"type": "identity.profile_patch", "patch": {"relationship_days": 0}}]},
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    saved = db.get_blob(user_id, "identity")
+    assert saved["relationship_anchor_source"] == "user_calibrated"
+    assert identity_service._live_days_with_user(
+        saved, store=core_store.get_store(user_id)) == 0
+
+
+def test_profile_patch_relationship_days_rejects_negative(client, monkeypatch):
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{"type": "identity.profile_patch", "patch": {"relationship_days": -5}}]},
+    )
+
+    assert res.status_code == 400, res.get_data(as_text=True)
+    assert res.get_json()["error"] == "relationship_days_must_be_non_negative_int"
+
+
+def test_profile_patch_relationship_days_rejects_non_int(client, monkeypatch):
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{"type": "identity.profile_patch", "patch": {"relationship_days": "300"}}]},
+    )
+
+    assert res.status_code == 400, res.get_data(as_text=True)
+    assert res.get_json()["error"] == "relationship_days_must_be_non_negative_int"
+
+
+def _rel_mocks(monkeypatch, captured):
+    monkeypatch.setattr(
+        core_enclave, "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured))
+
+
+def test_profile_patch_consumes_frozen_anchor_verbatim(client, monkeypatch):
+    # Item 1 (round-4): when the TRUSTED sink (capabilities.identity.patch) threads
+    # in a frozen relationship_started_at (resolved at enqueue time) via the
+    # call-path param, _identity_profile_patch uses it VERBATIM — not today-N — so
+    # a delayed replay does not drift the anchor. The anchor travels the call path,
+    # not the request body.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    _rel_mocks(monkeypatch, [])
+
+    # The trusted frozen anchor arrives via the call-path param (the sink route),
+    # NOT the action dict / request body.
+    body, status = identity_core.run_actions(
+        core_store.get_store(user_id),
+        {"action": {"type": "identity.profile_patch", "patch": {"relationship_days": 300}}},
+        api_key=api_key, runtime_token="",
+        trusted_relationship_anchor="2026-04-10")  # frozen by the producer
+    assert status == 200, body
+    saved = db.get_blob(user_id, "identity")
+    assert saved["relationship_started_at"] == "2026-04-10"       # frozen, NOT today-300
+    assert saved["relationship_anchor_source"] == "user_calibrated"
+
+
+def test_profile_patch_frozen_anchor_replay_is_idempotent(client, monkeypatch):
+    # Item 1 (round-4): applying the SAME frozen-anchor sink call twice (the
+    # write-succeeded-but-sink-complete-crashed → replay scenario) produces NO
+    # second change. Routed through the trusted sink call-path param.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    _rel_mocks(monkeypatch, [])
+
+    def _sink_call():
+        return identity_core.run_actions(
+            core_store.get_store(user_id),
+            {"action": {"type": "identity.profile_patch", "patch": {"relationship_days": 300}}},
+            api_key=api_key, runtime_token="",
+            trusted_relationship_anchor="2026-04-10")
+
+    body1, status1 = _sink_call()
+    assert status1 == 200, body1
+    assert body1["effects"][0]["fields"] == ["days_with_user"]
+
+    body2, status2 = _sink_call()
+    assert status2 == 200, body2
+    # No effect emitted, no fields changed — the fixed anchor already matches.
+    assert body2["results"][0].get("noop") is True
+    assert body2["effects"] == []
+
+
+def test_profile_patch_forged_past_anchor_via_public_api_ignored(client, monkeypatch):
+    # Round-4 (Important 1, the core fix): the PUBLIC POST /v1/identity/actions
+    # path is untrusted. A caller who stuffs an ancient relationship_started_at in
+    # the request body (to blow past the 36600-day cap / break the days<->anchor
+    # invariant) is IGNORED — the anchor is recomputed from relationship_days, so
+    # the forged 0001-01-01 has zero effect.
+    from datetime import date, timedelta
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    _rel_mocks(monkeypatch, [])
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{
+            "type": "identity.profile_patch",
+            "patch": {"relationship_days": 1},
+            "relationship_started_at": "0001-01-01",  # forged — must be ignored
+        }]},
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+    saved = db.get_blob(user_id, "identity")
+    # Anchor came from days, NOT the forged ancient date. relationship_days is
+    # 1-based ("第 N 天", met day = 第 1 天), so N=1 → elapsed 0 → anchor = today.
+    assert saved["relationship_started_at"] == date.today().isoformat()
+    assert saved["relationship_started_at"] != "0001-01-01"
+    # days_with_user stays within the cap — the forge can't inflate it.
+    assert identity_service._live_days_with_user(
+        saved, store=core_store.get_store(user_id)) == 0
+
+
+def test_resolve_relationship_anchor_boundary_verbatim_no_drift():
+    # Round-3 (Important 1): at relationship_days == MAX the enqueue-day anchor is
+    # today-MAX. The OLD `0 <= today-frozen <= MAX` age check made a next-day
+    # replay (today-frozen == MAX+1) reject the frozen date and recompute from the
+    # replay day, drifting the anchor one day forward. The fix returns the frozen
+    # date VERBATIM, so replay is idempotent. Assert against the FROZEN INPUT
+    # itself (not a today-MAX recompute) to prove it is returned byte-for-byte.
+    from datetime import date, timedelta
+    MAX = card_policy.MAX_RELATIONSHIP_DAYS
+
+    frozen_at_cap = (date.today() - timedelta(days=MAX)).isoformat()
+    got = identity_actions_mod._resolve_relationship_anchor(
+        MAX, trusted_frozen=frozen_at_cap)
+    assert got == frozen_at_cap  # verbatim, not recomputed
+
+    # Simulate a cross-day replay: a frozen date OLDER than today-MAX (i.e. what
+    # the old delta<=MAX check would have rejected as "out of range") is still
+    # returned verbatim, because days is in-range and the date is not in the
+    # future. This is the exact drift case the old code got wrong.
+    frozen_older = (date.today() - timedelta(days=MAX + 1)).isoformat()
+    assert identity_actions_mod._resolve_relationship_anchor(
+        MAX, trusted_frozen=frozen_older) == frozen_older
+
+
+def test_resolve_relationship_anchor_no_trusted_value_uses_days():
+    # Round-4: with no trusted frozen anchor (the public / direct request path),
+    # resolution ALWAYS comes from days — a request-body date can never be trusted
+    # because it never reaches this function.
+    got = identity_actions_mod._resolve_relationship_anchor(30, trusted_frozen=None)
+    # 1-based input: N=30 ("第 30 天") resolves to elapsed N-1=29.
+    assert got == identity_service._anchor_from_days(29)
+
+
+def test_resolve_relationship_anchor_future_falls_back_to_days():
+    # A future frozen anchor is untrusted -> recompute from days.
+    from datetime import date, timedelta
+    future = (date.today() + timedelta(days=5)).isoformat()
+    got = identity_actions_mod._resolve_relationship_anchor(30, trusted_frozen=future)
+    # 1-based input: N=30 resolves to elapsed N-1=29.
+    assert got == identity_service._anchor_from_days(29)
+    assert got != future
+
+
+def test_resolve_relationship_anchor_is_idempotent():
+    # Resolving the same frozen anchor twice yields the same value (noop replay).
+    from datetime import date, timedelta
+    frozen = (date.today() - timedelta(days=100)).isoformat()
+    first = identity_actions_mod._resolve_relationship_anchor(100, trusted_frozen=frozen)
+    second = identity_actions_mod._resolve_relationship_anchor(100, trusted_frozen=frozen)
+    assert first == second == frozen
+
+
+def test_profile_patch_forged_future_anchor_falls_back_to_days(client, monkeypatch):
+    # A frozen anchor outside [today-cap, today] (e.g. a future date) is NOT
+    # trusted — it recomputes from relationship_days, so it can never exceed what
+    # the day count itself allows.
+    from datetime import date, timedelta
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    _rel_mocks(monkeypatch, [])
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{
+            "type": "identity.profile_patch",
+            "patch": {"relationship_days": 30},
+            "relationship_started_at": "2999-01-01",  # implausible future -> ignored
+        }]},
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+    saved = db.get_blob(user_id, "identity")
+    # 1-based input: N=30 → elapsed N-1=29 → today-29.
+    assert saved["relationship_started_at"] == (date.today() - timedelta(days=29)).isoformat()
+
+
+def test_profile_patch_relationship_days_over_cap_rejected(client, monkeypatch):
+    # Item 4: an implausibly large day count is a stable 400 BEFORE the write,
+    # never an OverflowError-turned-retry-loop.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    _rel_mocks(monkeypatch, [])
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{"type": "identity.profile_patch", "patch": {"relationship_days": 10 ** 9}}]},
+    )
+    assert res.status_code == 400, res.get_data(as_text=True)
+    assert res.get_json()["error"] == "relationship_days_out_of_range"
+
+
+# --- Item 5: relationship_days_set now rides the shared CAS anchor core ---
+
+def test_relationship_days_set_via_cas_core(client, monkeypatch):
+    from datetime import date, timedelta
+    from core import store as core_store
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{"type": "identity.relationship_days_set", "days_with_user": 68,
+                           "relationship_anchor_evidence": "user recalibrated"}]},
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+    saved = db.get_blob(user_id, "identity")
+    assert saved["relationship_anchor_source"] == "user_calibrated"
+    assert saved["relationship_started_at"] == (date.today() - timedelta(days=68)).isoformat()
+    assert identity_service._live_days_with_user(saved, store=core_store.get_store(user_id)) == 68
+
+
+def test_relationship_days_set_rejects_bool_and_str(client, monkeypatch):
+    # Unified validation (item 5): the legacy int(...) coercion that accepted
+    # True/"300" is gone.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    for bad in (True, "300", 3.5):
+        res = client.post(
+            "/v1/identity/actions",
+            headers=_headers(api_key),
+            json={"actions": [{"type": "identity.relationship_days_set", "days_with_user": bad}]},
+        )
+        assert res.status_code == 400, (bad, res.get_data(as_text=True))
+        assert res.get_json()["error"] == "relationship_days_must_be_non_negative_int"
+
+
+def test_relationship_anchor_endpoint_contract_preserved(client, monkeypatch):
+    from datetime import date, timedelta
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+
+    res = client.post(
+        "/v1/identity/relationship_anchor",
+        headers=_headers(api_key),
+        json={"days_with_user": 12},
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["status"] == "updated"
+    assert body["relationship_started_at"] == (date.today() - timedelta(days=12)).isoformat()
+    saved = db.get_blob(user_id, "identity")
+    assert saved["relationship_anchor_source"] == "user_calibrated"
+
+
+def test_relationship_anchor_endpoint_rejects_bool(client, monkeypatch):
+    # The old isinstance(int) check let True through as 1; the shared core rejects it.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    res = client.post(
+        "/v1/identity/relationship_anchor",
+        headers=_headers(api_key),
+        json={"days_with_user": True},
+    )
+    assert res.status_code == 400, res.get_data(as_text=True)

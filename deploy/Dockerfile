@@ -73,17 +73,12 @@ USER feedling
 
 EXPOSE 5001 9998
 
-# Default command runs the Flask backend under gunicorn (production WSGI;
-# the Werkzeug dev server in app.run() stalls on large responses under the
-# TDX CVM). Single worker is mandatory — app.py binds the WebSocket ingest
-# on :9998 at import time, so multiple workers would collide on that port;
-# concurrency comes from threads. docker-compose overrides this for MCP.
-# --threads is a balance: /v1/chat/poll + /v1/proactive/jobs/poll park a worker
-# thread on a threading.Event for up to 30s (parked threads release the GIL, so
-# they don't add CPU contention) — too few starves the pool. But because -w 1
-# means one GIL, too MANY *runnable* threads convoy on the GIL and even a trivial
-# whoami waits tens of seconds. 16 starved the long-poll pool; 64 made the GIL
-# convoy worse under load. 32 is the middle ground until the real fix lands
-# (move the :9998 WS ingest off the import path so we can run -w >1). Keep in
-# sync with deploy/docker-compose.yaml.
+# Default command runs the ASGI backend (FastAPI, asgi_app:app) under gunicorn
+# with the uvicorn worker. `-w 1` here is only the bare-image default: the
+# compose files override the whole command and omit `-w`, so worker count is
+# env-driven via FEEDLING_BACKEND_WORKERS (backend/gunicorn_conf.py).
+# Multi-worker is supported — cross-worker LISTEN/NOTIFY wake bus
+# (core/wake_bus.py) plus advisory-lock leader election (core/leader.py) so
+# only one worker binds the :9998 WS ingest. Keep in sync with
+# deploy/docker-compose.yaml.
 CMD ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-w", "1", "-k", "asgi.worker.FeedlingUvicornWorker", "--timeout", "120", "-b", "0.0.0.0:5001", "asgi_app:app"]

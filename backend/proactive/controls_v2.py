@@ -302,3 +302,15 @@ def evaluate_scheduled_action_v2(
 
 def now_settings_updated_at_v2() -> str:
     return datetime.now().isoformat()
+
+
+def load_settings_v2_for_store(store) -> ProactiveSettingsV2:
+    """Load one user's V2 proactive settings, falling back to the store's own
+    copy when the DB-backed reader is unavailable. Single source of truth for
+    both the V1 chat route and the V2 push endpoint."""
+    try:
+        from proactive.store_v2 import DBProactiveSettingsStoreV2
+
+        return DBProactiveSettingsStoreV2().load(store.user_id)
+    except Exception:
+        return resolve_settings_v2(store.load_proactive_settings())

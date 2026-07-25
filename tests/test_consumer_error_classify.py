@@ -273,17 +273,31 @@ def test_note_success_clears_reported_flag_after_respawn(monkeypatch):
         crc._HTTP, "post",
         lambda url, **kw: calls.append(kw.get("json")) or _FakeResp(200))
     crc._runtime_error_reported = True
+    crc._provider_health_success_reported_at = 0.0
+    monkeypatch.setattr(crc.time, "monotonic", lambda: 1_000.0)
     crc._note_agent_turn_success()
-    assert calls == [{"error": "", "error_class": ""}]
+    assert calls == [
+        {
+            "error": "",
+            "error_class": "",
+            "provider_result": "success",
+        }
+    ]
     assert crc._runtime_error_reported is False
 
 
 def test_clear_failure_keeps_flag_and_retries_next_success(monkeypatch):
     # Codex P2：清空 POST 失败不许翻标记——否则过期错误滞留设置页且永不重试。
     # 序列：传输异常 → 5xx → 200；前两次后标记必须仍为 True，第三次成功后 False，
-    # 之后的成功回合不再发请求。
+    # 之后的成功回合按 15 分钟节流上报 provider_result=success。
     calls = []
-    outcomes = [RuntimeError("connect timeout"), _FakeResp(503), _FakeResp(200)]
+    outcomes = [
+        RuntimeError("connect timeout"),
+        _FakeResp(503),
+        _FakeResp(200),
+        _FakeResp(200),
+    ]
+    clocks = iter([1_000.0, 1_001.0, 1_002.0, 1_003.0, 1_902.0])
 
     def fake_post(url, **kw):
         calls.append(kw.get("json"))
@@ -293,15 +307,20 @@ def test_clear_failure_keeps_flag_and_retries_next_success(monkeypatch):
         return r
 
     monkeypatch.setattr(crc._HTTP, "post", fake_post)
+    monkeypatch.setattr(crc.time, "monotonic", lambda: next(clocks))
     crc._runtime_error_reported = True
+    crc._provider_health_success_reported_at = 0.0
     crc._note_agent_turn_success()   # 传输失败
     assert crc._runtime_error_reported is True
     crc._note_agent_turn_success()   # 5xx
     assert crc._runtime_error_reported is True
     crc._note_agent_turn_success()   # 成功
     assert crc._runtime_error_reported is False
-    crc._note_agent_turn_success()   # 已清，不再发
+    crc._note_agent_turn_success()   # 15 分钟内，跳过
     assert len(calls) == 3
+    crc._note_agent_turn_success()   # 满 15 分钟，刷新健康时间
+    assert len(calls) == 4
+    assert all(call["provider_result"] == "success" for call in calls)
 
 
 def test_report_404_counts_as_settled(monkeypatch):
@@ -309,6 +328,7 @@ def test_report_404_counts_as_settled(monkeypatch):
     # 都对着 404 重试。
     monkeypatch.setattr(crc._HTTP, "post", lambda url, **kw: _FakeResp(404))
     crc._runtime_error_reported = True
+    crc._provider_health_success_reported_at = 0.0
     crc._note_agent_turn_success()
     assert crc._runtime_error_reported is False
 
@@ -380,3 +400,82 @@ def test_turn_failure_kwargs_truncate_long_user_text():
     """契约：user_text ≤ 500，杜绝把长文灌进用户可见文案。"""
     notice = crc.AgentErrorNotice("unknown", "system", "x" * 900, "detail")
     assert len(crc.turn_failure_post_kwargs(notice)["turn_failure_user_text"]) == 500
+
+
+# --- 上游下线模型名 → 必须落 user_provider（2026-07-25 usr_a40e/usr_d98b 回归） ---
+
+def test_deepseek_retired_model_name_is_model_not_found():
+    """prod 原文：DeepSeek 2026-07-24 把 deepseek-chat 并入 V4 线。
+
+    旧的窄正则（invalid model name|model_not_found|no such model）一条都不命中，
+    错误掉进 unknown/blame=system —— 那一档按纪律不许引导用户改配置，于是用户
+    连吃几十条兜底话术却永远不知道真正原因。"""
+    n = _cls(RuntimeError(
+        "cli agent exited 1: API Error: 400 The supported API model names are "
+        "deepseek-v4-pro or deepseek-v4-flash, but you passed deepseek-chat "
+        "(api_status=400)"))
+    assert n.error_class == "model_not_found"
+    assert n.blame == "user_provider"
+
+
+def test_openai_model_does_not_exist_is_model_not_found():
+    n = _cls(RuntimeError(
+        "API Error: 404 The model `gpt-4.9-turbo` does not exist or you do not "
+        "have access to it."))
+    assert n.error_class == "model_not_found" and n.blame == "user_provider"
+
+
+def test_unknown_model_wording_is_model_not_found():
+    assert _cls(RuntimeError("relay said: unknown model 'glm-9'")).error_class == "model_not_found"
+
+
+def test_model_word_in_5xx_still_upstream_not_model_not_found():
+    """反向防误伤：报文里出现 model 字样的 5xx 仍是上游抖动，不能被新正则吞掉
+    （否则会把「等它自己好」的错误误报成「去改你的配置」）。"""
+    n = _cls(RuntimeError("cli agent exited 1: 503 model gateway overloaded, retry later"))
+    assert n.error_class == "upstream_unavailable"
+    assert n.blame == "provider_transient"
+
+
+# --- 兜底话术分道：只有会自愈的错误才配说「稍后再发一次」 ---
+
+def test_user_provider_failure_reply_is_actionable_not_fallback():
+    """配置类错误永不自愈：发 FALLBACK_REPLY 的「你稍后再发一次，我会继续接」
+    是在骗用户重试，每次重试都是又一次注定失败且照样计费的 provider 调用。"""
+    notice = _cls(RuntimeError("cli agent exited 1: API Error: 402 Insufficient Balance"))
+    text = crc._turn_failure_reply_text(notice)
+
+    assert notice.blame == "user_provider"
+    assert text == notice.user_text
+    assert text != crc.FALLBACK_REPLY
+    assert "稍后再发一次" not in text
+
+
+def test_transient_failure_reply_keeps_fallback():
+    """会自愈的错误（5xx/限流/流断）——「稍后再发一次」对它们是真话，保持不变。"""
+    notice = _cls(RuntimeError("cli agent exited 1: 503 upstream overloaded"))
+    assert notice.blame == "provider_transient"
+    assert crc._turn_failure_reply_text(notice) == crc.FALLBACK_REPLY
+
+
+def test_system_failure_reply_keeps_fallback():
+    """我们自己的锅同样保持兜底：绝不能引导用户去改配置（误导，见 dded 案例）。"""
+    notice = _cls(subprocess.TimeoutExpired(cmd="agent", timeout=300))
+    assert notice.blame == "system"
+    assert crc._turn_failure_reply_text(notice) == crc.FALLBACK_REPLY
+
+
+def test_none_notice_falls_back():
+    assert crc._turn_failure_reply_text(None) == crc.FALLBACK_REPLY
+
+
+def test_actionable_reply_suppresses_duplicate_banner():
+    """可行动话术已在气泡里说过一遍，不必再补一条内容重复的 system 横幅；
+    设置页上报在节流判断之前，不受影响。"""
+    notice = _cls(RuntimeError("cli agent exited 1: API Error: 402 Insufficient Balance"))
+    crc._system_notice_last_sent.pop(notice.error_class, None)
+
+    crc._suppress_duplicate_upstream_banner(notice)
+
+    assert notice.error_class in crc._system_notice_last_sent
+    crc._system_notice_last_sent.pop(notice.error_class, None)

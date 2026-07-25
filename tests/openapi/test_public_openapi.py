@@ -168,7 +168,8 @@ def test_public_operation_and_parameter_inventory(
     # 146 since the two notify-relay endpoints (register/push, both with bodies);
     # 148 since GET/POST /v1/web/settings (the web-search toggle, Lark t100535) —
     # only the POST carries a body, hence 67 -> 68.
-    assert len(operations) == 148
+    # 149 since GET /v1/model_api/usage (provider balance/usage snapshot).
+    assert len(operations) == 149
     assert sum("requestBody" in operation for operation in operations.values()) == 68
 
     query_operations = {
@@ -669,3 +670,11 @@ def test_web_settings_response_schema_matches_what_the_core_actually_returns(
     for payload in cases:
         assert set(payload) == documented, payload
         assert payload["status"] in allowed_status, payload
+
+
+def test_internal_prefix_is_never_public() -> None:
+    """`/v1/internal/**` 是 runtime 内部面（runtime-token scope 鉴权），
+    不属于对外产品 API，必须排除在公开契约之外。"""
+    from export_public_openapi import EXCLUDED_PREFIXES
+
+    assert "/v1/internal" in EXCLUDED_PREFIXES

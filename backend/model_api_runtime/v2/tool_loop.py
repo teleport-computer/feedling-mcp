@@ -186,6 +186,8 @@ async def run_tool_loop(
     add_usage,
     max_calls: int,
     before_provider_call=None,
+    on_provider_success=None,
+    on_provider_failure=None,
     fold_before_first: bool = False,
     on_progress=None,
     on_trajectory_event=None,
@@ -465,6 +467,11 @@ async def run_tool_loop(
             # (model_calls bumped, just with no token usage) — add_usage(None)
             # before either falling back or propagating.
             add_usage(None)
+            if on_provider_failure is not None:
+                try:
+                    await on_provider_failure(exc)
+                except Exception:
+                    pass
             if (
                 tools is not None
                 and isinstance(exc, provider_client.ProviderError)
@@ -482,6 +489,11 @@ async def run_tool_loop(
             raise
         _progress("provider_complete")
         add_usage(result.get("usage"))
+        if on_provider_success is not None:
+            try:
+                await on_provider_success()
+            except Exception:
+                pass
         await _trajectory(
             "provider_response",
             {"round": attempts, "response": result},

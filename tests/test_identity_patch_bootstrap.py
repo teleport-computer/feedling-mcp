@@ -184,3 +184,64 @@ def test_profile_patch_existing_card_takes_update_path(client, monkeypatch):
     assert saved["relationship_started_at"] == "2026-04-01"    # anchor preserved
     assert saved["relationship_anchor_source"] == "test"       # NOT agent_bootstrap
     assert captured[-1]["agent_name"] == "阿锐"
+
+
+def test_bootstrap_honors_user_filled_relationship_days(client, monkeypatch):
+    # Item 2a: a fresh-start card built via profile_patch that ALSO carries an
+    # explicit relationship_days must honor it (source=user_calibrated), not
+    # silently drop it while the other fields create the card.
+    from datetime import date, timedelta
+    from core import store as core_store
+    from identity import service as identity_service
+
+    user_id, api_key = _register(client)
+    captured: list = []
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", _no_identity_enclave)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured))
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={
+            "actions": [{
+                "type": "identity.profile_patch",
+                "patch": {"agent_name": "Ori", "self_introduction": "I'm your co-pilot.",
+                          "relationship_days": 200},
+                "reason": "User says we've actually known each other 200 days.",
+            }],
+        },
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert set(body["effects"][0]["fields"]) == {"agent_name", "self_introduction", "days_with_user"}
+    saved = db.get_blob(user_id, "identity")
+    assert saved["relationship_anchor_source"] == "user_calibrated"  # user-filled beats auto
+    # relationship_days is 1-based ("第 N 天", met day = 第 1 天), so N=200
+    # stores elapsed N-1=199 → today-199.
+    assert saved["relationship_started_at"] == (date.today() - timedelta(days=199)).isoformat()
+    assert identity_service._live_days_with_user(
+        saved, store=core_store.get_store(user_id)) == 199
+
+
+def test_bootstrap_relationship_days_only_creates_calibrated_card(client, monkeypatch):
+    # A relationship_days-only patch on a fresh user is enough to create the card
+    # (days_with_user is a writable field now) with the user_calibrated anchor.
+    from datetime import date, timedelta
+    user_id, api_key = _register(client)
+    captured: list = []
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", _no_identity_enclave)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured))
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [{"type": "identity.profile_patch", "patch": {"relationship_days": 5}}]},
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    saved = db.get_blob(user_id, "identity")
+    assert saved is not None
+    assert saved["relationship_anchor_source"] == "user_calibrated"
+    # 1-based: N=5 stores elapsed N-1=4 → today-4.
+    assert saved["relationship_started_at"] == (date.today() - timedelta(days=4)).isoformat()

@@ -22,7 +22,6 @@ import base64
 import sys
 import time
 import uuid
-from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -36,7 +35,7 @@ from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import store as core_store  # noqa: E402
 
-from test_chat_file_r2 import _BUCKET, _enable_r2  # noqa: E402
+from test_chat_file_r2 import _enable_r2  # noqa: E402
 from test_frame_r2 import _FakeS3  # noqa: E402
 
 

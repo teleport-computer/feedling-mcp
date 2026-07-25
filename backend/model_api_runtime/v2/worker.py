@@ -51,10 +51,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import db
 import provider_client
+import provider_health
 from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
 from core import envelope as core_envelope
+from core import provider_usage
 from core import store as core_store
 from core import wake_bus as core_wake_bus
 from perception.agent_fields import AGENT_PERCEPTION_SIGNALS
@@ -68,6 +70,7 @@ from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import kill_switch
+from model_api_runtime.v2 import model_identity as v2_model_identity
 from model_api_runtime.v2 import web_gate as v2_web_gate
 from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
 from model_api_runtime.v2 import status_stream
@@ -113,6 +116,34 @@ def _report_turn_progress(stage: str) -> None:
         callback(str(stage))
     except Exception as exc:  # noqa: BLE001 — watchdog telemetry is best-effort
         log.debug("[v2.worker] turn progress callback failed stage=%s: %s", stage, exc)
+
+
+async def _record_provider_success(user_id: str) -> None:
+    await asyncio.to_thread(provider_health.record_success, user_id)
+
+
+async def _record_provider_failure(
+    user_id: str,
+    exc: BaseException,
+) -> None:
+    await asyncio.to_thread(
+        provider_health.record_failure,
+        user_id,
+        error_class=provider_health.error_class_for_exception(exc),
+    )
+
+
+async def _extract_with_provider_health(
+    user_id: str,
+    **kwargs: Any,
+) -> tuple[Any, str | None]:
+    try:
+        result = await v2_extraction.extract(**kwargs)
+    except Exception as exc:
+        await _record_provider_failure(user_id, exc)
+        raise
+    await _record_provider_success(user_id)
+    return result
 
 
 def _positive_int_env(name: str, default: str) -> int:
@@ -496,6 +527,7 @@ _PRIVATE_READ_TOOLS = frozenset(
         "memory_index",
         "memory_search",
         "memory_fetch",
+        cap_tool_schema.PROVIDER_USAGE_TOOL,
     }
 )
 # Static perception grounding is allowed to coexist with first-round web/MCP/task
@@ -969,6 +1001,16 @@ class TurnDeps:
     # of an empty pending set; the field exists so the call site is already wired
     # ahead of the producer landing.
     apply_pending_effects: Callable[[str], dict] | None = None
+    # (user_id, *, msg_id, body, is_wake, lane) -> None：把本回合最后一条已落库回复的
+    # 明文正文交给 backend 发 APNs（serve-worker 容器没有 APNs 私钥，只有 backend
+    # 有）。best-effort：实现方吞掉自身异常，调用点也再兜一层 —— 推送失败绝不能
+    # 把一个已经成功发布回复的回合打成 failed。None（所有不接线的测试/legacy
+    # 调用方）= 特性关闭，行为与补齐推送之前完全一致。``lane`` 是本次唤醒的 lane
+    # 名（chat lane 传空字符串）：backend 端用它推 manual（lane == "manual_wake"）与
+    # 真实 wake source，对齐 V1 `_proactive_delivery_decision_v2` 从 job 推 manual
+    # 的做法 —— 之前这里硬编码 source="heartbeat"/manual=False，导致关了
+    # reminders_delivery 的用户在 V2 手动唤醒收不到推送（V1 会走 manual_bypass）。
+    send_reply_push: Callable[..., None] | None = None
     # (store, *, api_key, runtime_token, enclave_sem) -> awaitable McpTurn: build this chat
     # turn's user-MCP tool surface. Implemented in `hosted.mcp_tools.load_turn_mcp`
     # and injected by `serve_worker.build_production_deps`, because loading a user's
@@ -1124,6 +1166,7 @@ async def _dispatch_mixed_tool_calls(
     mcp_timeout_sec: float,
     dispatch_workspace_batch=None,
     dispatch_task_batch=None,
+    dispatch_provider_usage=None,
     prepare_platform_mutation=None,
     prepare_workspace_batch=None,
     mcp_mutation_started=None,
@@ -1167,12 +1210,15 @@ async def _dispatch_mixed_tool_calls(
     mutating_mcp_names = frozenset(str(name) for name in mutating_mcp_names)
     reads: list[tuple[str, Any]] = []
     task_calls: list[Any] = []
+    provider_usage_calls: list[Any] = []
     mutations: list[tuple[str, Any]] = []
     for tc in tool_calls:
         # Mutation policy is authoritative even if a broken duck-typed turn's
         # `handles` metadata disagrees with the tool specs it offered.
         if tc.name == cap_tool_schema.TASK_TOOL:
             task_calls.append(tc)
+        elif tc.name == cap_tool_schema.PROVIDER_USAGE_TOOL:
+            provider_usage_calls.append(tc)
         elif tc.name in mutating_mcp_names:
             mutations.append(("mcp", tc))
         elif mcp_turn.handles(tc.name):
@@ -1393,12 +1439,74 @@ async def _dispatch_mixed_tool_calls(
         )
         return results
 
+    async def _provider_usage_reads() -> list[ToolResult]:
+        if not provider_usage_calls:
+            return []
+        await asyncio.gather(
+            *(
+                _event(tc, "tool_call_started", {"phase": "provider_usage"})
+                for tc in provider_usage_calls
+            )
+        )
+        started_ns = time.monotonic_ns()
+        if dispatch_provider_usage is None:
+            # wake/subagent lanes bind no callable — this tool is never
+            # offered there (Task 5 catalog scoping); a call reaching here
+            # anyway (forged/legacy caller) is refused, not silently routed.
+            results = [
+                ToolResult(call_id=tc.id, content="error: tool_not_allowed")
+                for tc in provider_usage_calls
+            ]
+        else:
+            try:
+                usage_results = await dispatch_provider_usage(provider_usage_calls)
+            except Exception:  # noqa: BLE001 — dispatcher failure stays model-visible
+                results = [
+                    ToolResult(call_id=tc.id, content="error: provider_usage_failed")
+                    for tc in provider_usage_calls
+                ]
+            else:
+                if (
+                    not isinstance(usage_results, (list, tuple))
+                    or len(usage_results) != len(provider_usage_calls)
+                    or any(
+                        not isinstance(result, ToolResult)
+                        or str(result.call_id) != str(tc.id)
+                        for tc, result in zip(provider_usage_calls, usage_results)
+                    )
+                ):
+                    results = [
+                        ToolResult(
+                            call_id=tc.id, content="error: provider_usage_failed"
+                        )
+                        for tc in provider_usage_calls
+                    ]
+                else:
+                    results = list(usage_results)
+        await asyncio.gather(
+            *(
+                _event(
+                    tc,
+                    "tool_call_result",
+                    {
+                        "phase": "provider_usage",
+                        "result": result,
+                        "duration_ms": _duration_ms(started_ns),
+                    },
+                )
+                for tc, result in zip(provider_usage_calls, results)
+            )
+        )
+        return results
+
     results_by_id: dict[str, ToolResult] = {}
     read_future = asyncio.gather(*[_read(kind, tc) for kind, tc in reads])
     task_future = _tasks()
-    read_results, task_results = await asyncio.gather(
+    provider_usage_future = _provider_usage_reads()
+    read_results, task_results, provider_usage_results = await asyncio.gather(
         read_future,
         task_future,
+        provider_usage_future,
     )
     if reads:
         for (_kind, tc), result in zip(reads, read_results):
@@ -1406,7 +1514,10 @@ async def _dispatch_mixed_tool_calls(
     if task_calls:
         for tc, result in zip(task_calls, task_results):
             results_by_id[tc.id] = result
-    if reads or task_calls:
+    if provider_usage_calls:
+        for tc, result in zip(provider_usage_calls, provider_usage_results):
+            results_by_id[tc.id] = result
+    if reads or task_calls or provider_usage_calls:
         _progress("tool_read_phase_complete")
 
     # One ordered sequence across BOTH mutation domains preserves model order.
@@ -1938,16 +2049,21 @@ async def _run_trajectory_review_turn(
             ),
         )
         await _review_fence("trajectory_review_provider_start")
-        result = await asyncio.wait_for(
-            provider_client.chat_completion_async(
-                provider_config,
-                messages,
-                tools=None,
-                max_tokens=_TRAJECTORY_REVIEW_MAX_TOKENS,
-                timeout=_TRAJECTORY_REVIEW_TIMEOUT_SEC,
-            ),
-            timeout=_TRAJECTORY_REVIEW_TIMEOUT_SEC + 5.0,
-        )
+        try:
+            result = await asyncio.wait_for(
+                provider_client.chat_completion_async(
+                    provider_config,
+                    messages,
+                    tools=None,
+                    max_tokens=_TRAJECTORY_REVIEW_MAX_TOKENS,
+                    timeout=_TRAJECTORY_REVIEW_TIMEOUT_SEC,
+                ),
+                timeout=_TRAJECTORY_REVIEW_TIMEOUT_SEC + 5.0,
+            )
+        except Exception as exc:
+            await _record_provider_failure(user_id, exc)
+            raise
+        await _record_provider_success(user_id)
         _report_turn_progress("trajectory_review_provider_complete")
         tm.add_call(result.get("usage") if isinstance(result, dict) else None)
         encoded, _truncated, _original_size = v2_trajectory.encode_payload(
@@ -2311,6 +2427,7 @@ def _make_build_messages_fn(
     mutation_recovery_active: bool = False,
     trusted_system_blocks: tuple[str, ...] = (),
     working_memory: str = "",
+    provider_config: Any = None,
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
@@ -2333,13 +2450,16 @@ def _make_build_messages_fn(
     authority. Dynamic tool results remain native exchanges after that base block.
     """
 
+    # 真实模型自称块排在用户可编辑的 workspace skill 之前：它是运行时事实，不能被
+    # 后面的 skill 文本挤到次要位置。官方原生路由返回空串，被 context 过滤掉。
+    identity_block = v2_model_identity.override_block_for_config(provider_config)
     base_messages = context.build_turn_messages(
         system_prompt=system_prompt,
         summary=summary,
         tail=tail,
         action_context=extra_context,
         mutation_recovery_active=mutation_recovery_active,
-        trusted_system_blocks=trusted_system_blocks,
+        trusted_system_blocks=(identity_block, *trusted_system_blocks),
         working_memory=working_memory,
     )
 
@@ -2587,6 +2707,13 @@ def _make_task_batch_dispatcher(
                 add_usage=_charge_child_usage,
                 max_calls=_SUBAGENT_MAX_LLM_CALLS,
                 before_provider_call=budget.before_provider_call,
+                on_provider_success=lambda: _record_provider_success(
+                    store.user_id
+                ),
+                on_provider_failure=lambda exc: _record_provider_failure(
+                    store.user_id,
+                    exc,
+                ),
                 disabled_tool_names=child_disabled_tools,
                 allow_reply_tool=False,
                 outbound_blocking_read_tool_names=(_PRIVATE_READ_TOOLS),
@@ -2630,6 +2757,50 @@ def _make_task_batch_dispatcher(
                 )
                 for tc in task_calls
             ]
+
+    return _dispatch
+
+
+def _make_provider_usage_dispatcher(
+    *, provider_config
+) -> Callable[[list], Awaitable[list[ToolResult]]]:
+    """Bind the turn's already-decrypted provider_config for provider_usage
+    calls (Task 6). Mirrors ``_make_task_batch_dispatcher``'s closure shape:
+    capture once at turn setup, never re-resolve per call — a second
+    resolution would mean a second decrypt.
+
+    Runs outside the enclave concurrency gate: this function is invoked from
+    the worker's mixed-dispatch layer (`_dispatch_mixed_tool_calls`'s
+    read/task phase), the same layer `_make_task_batch_dispatcher`'s
+    `_dispatch` runs at, which is never wrapped in that gate. The
+    third-party usage-endpoint HTTP call is a plain `await`.
+    """
+
+    async def _dispatch(tool_calls) -> list[ToolResult]:
+        results: list[ToolResult] = []
+        try:
+            halted = await asyncio.to_thread(kill_switch.provider_usage_halted)
+        except Exception:  # noqa: BLE001 — a broken read counts as halted
+            halted = True
+        for tc in tool_calls:
+            if halted:
+                results.append(
+                    ToolResult(call_id=tc.id, content="error: provider_usage_halted")
+                )
+                continue
+            try:
+                payload = await provider_usage.query_usage_async(provider_config)
+                results.append(
+                    ToolResult(
+                        call_id=tc.id,
+                        content=json.dumps(payload, ensure_ascii=False),
+                    )
+                )
+            except Exception:  # noqa: BLE001 — static error, never leak details
+                results.append(
+                    ToolResult(call_id=tc.id, content="error: provider_usage_failed")
+                )
+        return results
 
     return _dispatch
 
@@ -2714,6 +2885,31 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
     return out
 
 
+def _frozen_relationship_anchor(patch) -> str | None:
+    """Resolve an identity_patch's relative ``relationship_days`` to an absolute
+    ISO ``relationship_started_at`` at ENQUEUE time (item 1 — see the caller).
+
+    Returns the frozen ISO date string, or None when the patch carries no
+    (valid) relationship_days — in which case no anchor metadata is added and the
+    enqueued payload stays byte-for-byte identical to a pre-item-1 row. A
+    malformed/over-cap value returns None too: the live pre-enqueue check
+    (capabilities.identity.relationship_days_error) has already rejected it, so
+    this is only reached for a legal value; refusing to freeze a bad one keeps a
+    smuggled non-int from poisoning the anchor."""
+    if not isinstance(patch, dict) or "relationship_days" not in patch:
+        return None
+    from identity import card_policy
+    if card_policy.relationship_days_shape_error(patch.get("relationship_days")):
+        return None
+    from identity import service as identity_service
+    # relationship_days is the USER-FACING 1-based "第 N 天" (day you met = 第 1 天;
+    # iOS shows elapsed + 1). Stored days_with_user is ELAPSED (0 = met today), so
+    # 第 N 天 → elapsed N-1. Freeze the SAME elapsed anchor the direct/fallback path
+    # computes (actions._resolve_relationship_anchor), so frozen-verbatim and
+    # fallback agree. Onboarding (date-derived elapsed) is untouched.
+    return identity_service._anchor_from_days(max(0, int(patch["relationship_days"]) - 1))
+
+
 def _write_tool_effect_payload(tc) -> tuple[str, dict]:
     """Map a WRITE_ACTIONS tool_call to its PR A `(effect_type, payload)` (spec C6). ONE
     definition shared by every lane's `enqueue_write_effect` closure (`process_job`'s chat
@@ -2730,7 +2926,25 @@ def _write_tool_effect_payload(tc) -> tuple[str, dict]:
         # byte-for-byte identical to every pre-nudge (and in-flight) row, so an
         # old sink overlapping a deploy still reads it exactly as before, and
         # the new sink/validator treat a MISSING op as identity_patch.
-        return "identity", dict(tc.args)
+        payload = dict(tc.args)
+        # FROZEN anchor (item 1): relationship_days is a RELATIVE value ("N days
+        # ago from *today*"). If we enqueued only the relative count, the sink
+        # would call _anchor_from_days(N) at REPLAY time — a delayed replay (next
+        # day, after a crash between the durable write and sink-complete) would
+        # resolve a DIFFERENT calendar anchor, drifting the day count and making
+        # the effect non-idempotent. Resolve the absolute relationship_started_at
+        # HERE, once, at enqueue time, and carry it as a trusted top-level
+        # metadata key. The sink consumes this fixed anchor verbatim
+        # (capabilities.identity.patch -> _identity_profile_patch); it is stripped
+        # before the model-arg schema re-validation and can never be model-authored
+        # (the model-facing top-level schema is additionalProperties=false). The
+        # live pre-enqueue check already rejected an invalid/over-cap value, so a
+        # valid int is all that reaches here; a defensive shape check keeps a
+        # non-conforming smuggled value from silently poisoning the anchor.
+        frozen = _frozen_relationship_anchor(payload.get("patch"))
+        if frozen is not None:
+            payload["relationship_started_at"] = frozen
+        return "identity", payload
     if tc.name == "identity_nudge":
         # Same ``identity`` effect_type/sink as identity_patch, disambiguated by
         # a trusted ``op`` taken from the tool NAME (mirrors schedule/workspace):
@@ -3113,6 +3327,7 @@ def _build_encrypted_reply_effect_payload(
     *,
     effect_id: str,
     reply_through_seq: int | None = None,
+    wake_kind: str = "",
 ) -> dict:
     """Encrypt reply content before it enters the durable outbox.
 
@@ -3133,6 +3348,18 @@ def _build_encrypted_reply_effect_payload(
         if seq < 0:
             raise ValueError("reply_through_seq must be >= 0")
         payload["reply_through_seq"] = seq
+    if wake_kind:
+        # Observability marker only: lets the reply row (and the push gate) tell an
+        # agent-initiated wake message apart from a reply to the user's own message.
+        # Not plaintext. Fixed vocabulary, but NOT the same one as V1's
+        # `proactive_jobs` log: this is the V2 lane name — one of
+        # heartbeat/scheduled/manual_wake/screen_watch (`_WAKE_LANES`). V1's
+        # `proactive_jobs`/gate.py `wake_kind` field uses a different vocabulary
+        # (presence/screen/screen_watch/scheduled_wake/background_result,
+        # `proactive/gate.py:_proactive_v2_wake_kind`) — only "screen_watch"
+        # overlaps between the two. Do not cross-reference them as if they were
+        # one column.
+        payload["wake_kind"] = str(wake_kind)
     return payload
 
 
@@ -3279,15 +3506,25 @@ def _bounded_compaction_prefix(
     return out
 
 
-async def _compaction_llm_with_progress(*args: Any, **kwargs: Any) -> Any:
+async def _compaction_llm_with_progress(
+    user_id: str,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
     """Reliable compaction provider call with per-attempt stall heartbeats."""
 
     def _attempt_progress(stage: str, attempt: int) -> None:
         _report_turn_progress(f"compaction_provider_{stage}_{attempt}")
 
-    return await provider_client.reliable_chat_completion_async(
-        *args, progress_cb=_attempt_progress, **kwargs
-    )
+    try:
+        result = await provider_client.reliable_chat_completion_async(
+            *args, progress_cb=_attempt_progress, **kwargs
+        )
+    except Exception as exc:
+        await _record_provider_failure(user_id, exc)
+        raise
+    await _record_provider_success(user_id)
+    return result
 
 
 async def _rebalance_summary_frontier(
@@ -3374,7 +3611,11 @@ async def _rebalance_summary_frontier(
                 },
             )
             try:
-                result = await _compaction_llm_with_progress(*args, **kwargs)
+                result = await _compaction_llm_with_progress(
+                    user_id,
+                    *args,
+                    **kwargs,
+                )
             except Exception as exc:
                 await _record_trajectory(
                     trajectory_recorder,
@@ -3606,7 +3847,11 @@ async def _run_compaction(
                 {"lane": "maintenance", "messages": messages, "tools": None},
             )
             try:
-                result = await _compaction_llm_with_progress(*args, **kwargs)
+                result = await _compaction_llm_with_progress(
+                    user_id,
+                    *args,
+                    **kwargs,
+                )
             except Exception as exc:
                 await _record_trajectory(
                     trajectory_recorder,
@@ -4120,7 +4365,11 @@ async def _ensure_prompt_coverage(
                 {"lane": "prompt_catchup", "messages": messages, "tools": None},
             )
             try:
-                result = await _compaction_llm_with_progress(*args, **kwargs)
+                result = await _compaction_llm_with_progress(
+                    user_id,
+                    *args,
+                    **kwargs,
+                )
             except Exception as exc:
                 await _record_trajectory(
                     trajectory_recorder,
@@ -4294,6 +4543,7 @@ async def _run_wake(
     grounding，不随 tool-loop 轮次增长，跟 `prior_tool_results`（每轮动态积累的工具
     观测）是两回事。
     """
+    push_slot: dict | None = None
     try:
         store = core_store.get_store(user_id)
         # One HMAC token and one encrypted workspace snapshot per wake turn.
@@ -4619,6 +4869,13 @@ async def _run_wake(
             search_halted=wake_search_halted,
             fetch_halted=wake_fetch_halted,
         )
+        # provider_usage is chat-lane only (Task 5 design decision): the
+        # proactive companion never has a user-asked-a-question moment to
+        # answer, so it must never be offered here — unconditionally, not
+        # gated by the kill switch (that gate is chat-lane's Task 6 concern).
+        wake_disabled_tool_names = wake_disabled_web_tool_names | {
+            cap_tool_schema.PROVIDER_USAGE_TOOL
+        }
 
         dispatch_task_batch = _make_task_batch_dispatcher(
             disabled_web_tool_names=wake_disabled_web_tool_names,
@@ -4865,6 +5122,7 @@ async def _run_wake(
                     text,
                     effect_id=effect_id,
                     reply_through_seq=consumed_seq,
+                    wake_kind=lane,
                 )
                 if consumed_seq is not None:
                     payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
@@ -5007,6 +5265,24 @@ async def _run_wake(
                     best_effort=True,
                 )
                 if status == "applied":
+                    # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。构建槽位
+                    # 本身也是 best-effort：payload 缺 "envelope"（例如未来出现的非
+                    # seq_native / 测试注入变体）不该把一个已经成功落库的回合打成
+                    # failed，只应跳过这一次推送。与 chat lane（process_job）的同一段
+                    # 完全同构。
+                    nonlocal push_slot
+                    try:
+                        push_slot = {
+                            "msg_id": str(payload["envelope"]["id"]),
+                            "body": text[:240],
+                            "is_wake": True,
+                            "lane": lane,
+                        }
+                    except Exception as e:  # noqa: BLE001 — 见上：绝不能影响回合结果
+                        log.warning(
+                            "[v2.worker] wake reply push slot build failed user=%s: %s",
+                            user_id, e)
+                if status == "applied":
                     if final:
                         source_status = await asyncio.to_thread(
                             jobs_store.get_job_status,
@@ -5082,6 +5358,7 @@ async def _run_wake(
             ),
             trusted_system_blocks=trusted_system_blocks,
             working_memory=working_memory,
+            provider_config=provider_config,
         )
 
         await _fence_wake_effect("wake turn")
@@ -5089,12 +5366,17 @@ async def _run_wake(
             await v2_tool_loop.run_tool_loop(
                 provider_config=provider_config,
                 build_messages=build_messages,
-                disabled_tool_names=wake_disabled_web_tool_names,
+                disabled_tool_names=wake_disabled_tool_names,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
                 fold_new_messages=fold_new_messages,
                 add_usage=_add_usage,
                 max_calls=_TURN_MAX_LLM_CALLS,
+                on_provider_success=lambda: _record_provider_success(user_id),
+                on_provider_failure=lambda exc: _record_provider_failure(
+                    user_id,
+                    exc,
+                ),
                 fold_before_first=deps.read_messages_after_seq is not None,
                 on_progress=_report_turn_progress,
                 on_trajectory_event=(
@@ -5175,6 +5457,20 @@ async def _run_wake(
         if tm is not None:
             tm.flush(failed=True, status=code)
         return "failed"
+    finally:
+        if push_slot is not None and deps.send_reply_push is not None:
+            try:
+                await asyncio.to_thread(
+                    deps.send_reply_push,
+                    user_id,
+                    msg_id=push_slot["msg_id"],
+                    body=push_slot["body"],
+                    is_wake=push_slot["is_wake"],
+                    lane=push_slot["lane"],
+                )
+            except Exception as e:  # noqa: BLE001 — 推送绝不能影响回合结果
+                log.warning(
+                    "[v2.worker] wake reply push failed user=%s: %s", user_id, e)
 
 
 async def _run_extraction(
@@ -5479,7 +5775,8 @@ async def _run_extraction(
 
             async def _invoke_capture_provider() -> tuple[Any, str | None]:
                 _report_turn_progress("extraction_provider_start")
-                result = await v2_extraction.extract(
+                result = await _extract_with_provider_health(
+                    user_id,
                     provider_config=provider_config,
                     prompt=prompt,
                     parse=parse,
@@ -5605,7 +5902,8 @@ async def _run_extraction(
                 items, reason = await _invoke_capture_provider()
         elif lane != "capture":
             _report_turn_progress("extraction_provider_start")
-            items, reason = await v2_extraction.extract(
+            items, reason = await _extract_with_provider_health(
+                user_id,
                 provider_config=provider_config,
                 prompt=prompt,
                 parse=parse,
@@ -6030,6 +6328,7 @@ async def process_job(
     if tm is None:
         tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
     tm.bind_provider(provider_config)
+    push_slot: dict | None = None
     lease_keepalive_stop = asyncio.Event()
     lease_keepalive_task: asyncio.Task | None = None
 
@@ -6636,8 +6935,25 @@ async def process_job(
             search_halted=web_search_halted,
             fetch_halted=web_fetch_halted,
         )
+        # provider_usage kill switch, offer-time half. This is the chat lane's
+        # own gate (Task 6) — the wake lane withholds the tool unconditionally
+        # (Task 5), never reaching this check. Fail-closed: a broken read
+        # withholds the tool rather than exposing it.
+        try:
+            provider_usage_halted = await asyncio.to_thread(
+                kill_switch.provider_usage_halted
+            )
+        except Exception:  # noqa: BLE001
+            provider_usage_halted = True
+        disabled_provider_usage_tool_names = (
+            frozenset({cap_tool_schema.PROVIDER_USAGE_TOOL})
+            if provider_usage_halted
+            else frozenset()
+        )
         disabled_tool_names_for_turn = (
-            frozenset(disabled_mutation_tool_names) | disabled_web_tool_names
+            frozenset(disabled_mutation_tool_names)
+            | disabled_web_tool_names
+            | disabled_provider_usage_tool_names
         )
         # Shared across every provider round in this chat turn. A per-dispatch
         # budget would reset whenever the model asks for another tool batch and
@@ -6662,6 +6978,11 @@ async def process_job(
             trusted_system_blocks=trusted_system_blocks,
             add_usage=tm.add_call,
             trajectory_recorder=trajectory_recorder,
+        )
+        # Chat-lane only (Task 6): closes over THIS turn's already-decrypted
+        # provider_config, never re-resolved per call.
+        dispatch_provider_usage = _make_provider_usage_dispatcher(
+            provider_config=provider_config
         )
 
         async def _dispatch_tools(tool_calls):
@@ -6905,6 +7226,7 @@ async def process_job(
                 read_parallelism=read_parallelism,
                 mcp_timeout_sec=MCP_TOOL_CALL_TIMEOUT_SEC,
                 dispatch_task_batch=dispatch_task_batch,
+                dispatch_provider_usage=dispatch_provider_usage,
                 prepare_platform_mutation=effect_reservations.prepare,
                 prepare_workspace_batch=effect_reservations.prepare_batch,
                 mcp_mutation_started=_mcp_mutation_started,
@@ -7112,6 +7434,29 @@ async def process_job(
                     },
                     best_effort=True,
                 )
+                if status == "applied":
+                    # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。构建槽位
+                    # 本身也是 best-effort：某些非 seq_native / 测试注入的 payload 不
+                    # 携带 "envelope"（例如工具循环单测把 `_build_encrypted_reply_
+                    # effect_payload` 换成了不含 envelope 的假实现），这类回合本来就该
+                    # 正常 completed —— 构建槽位失败只跳过这一次推送，绝不能把它变成
+                    # 一个已经成功落库的回合失败。
+                    nonlocal push_slot
+                    try:
+                        push_slot = {
+                            "msg_id": str(payload["envelope"]["id"]),
+                            "body": text[:240],
+                            "is_wake": False,
+                            # Chat lane is never a wake — send an empty lane rather
+                            # than the job's own lane=="chat" bookkeeping value, so
+                            # backend's manual/source derivation only ever sees real
+                            # wake lane names (see TurnDeps.send_reply_push).
+                            "lane": "",
+                        }
+                    except Exception as e:  # noqa: BLE001 — 见上：绝不能影响回合结果
+                        log.warning(
+                            "[v2.worker] chat reply push slot build failed user=%s: %s",
+                            user_id, e)
                 if status == "applied" and not final:
                     return
                 if status == "applied":
@@ -7239,6 +7584,7 @@ async def process_job(
             mutation_recovery_active=(mutation_recovery_barrier is not None),
             trusted_system_blocks=trusted_system_blocks,
             working_memory=working_memory,
+            provider_config=provider_config,
         )
 
         await _ensure_runtime_mode()
@@ -7252,6 +7598,11 @@ async def process_job(
             fold_new_messages=fold_new_messages,
             add_usage=tm.add_call,
             max_calls=_TURN_MAX_LLM_CALLS,
+            on_provider_success=lambda: _record_provider_success(user_id),
+            on_provider_failure=lambda exc: _record_provider_failure(
+                user_id,
+                exc,
+            ),
             fold_before_first=seq_native,
             on_progress=_report_turn_progress,
             on_trajectory_event=(
@@ -7525,6 +7876,19 @@ async def process_job(
         if lease_keepalive_task is not None:
             lease_keepalive_task.cancel()
             await asyncio.gather(lease_keepalive_task, return_exceptions=True)
+        if push_slot is not None and deps.send_reply_push is not None:
+            try:
+                await asyncio.to_thread(
+                    deps.send_reply_push,
+                    user_id,
+                    msg_id=push_slot["msg_id"],
+                    body=push_slot["body"],
+                    is_wake=push_slot["is_wake"],
+                    lane=push_slot["lane"],
+                )
+            except Exception as e:  # noqa: BLE001 — 推送绝不能影响回合结果
+                log.warning(
+                    "[v2.worker] chat reply push failed user=%s: %s", user_id, e)
 
 
 async def _run_turn(job: dict, deps: TurnDeps) -> str:

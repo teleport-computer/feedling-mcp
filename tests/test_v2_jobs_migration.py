@@ -233,7 +233,43 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0056_agent_jobs_hb_idx").down_revision == (
         "0055_capture_applied_check"
     )
-    assert script.get_current_head() == "0056_agent_jobs_hb_idx"
+    assert script.get_revision("0057_provider_health").down_revision == (
+        "0056_agent_jobs_hb_idx"
+    )
+    # 0058 adds provider_usage_halted, chained off the 0057_provider_health head.
+    assert script.get_revision("0058_provider_usage_halted").down_revision == (
+        "0057_provider_health"
+    )
+    assert script.get_current_head() == "0058_provider_usage_halted"
+
+
+def test_provider_health_schema_is_runtime_neutral():
+    with db.get_pool().connection() as conn:
+        columns = {
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='provider_health'"
+            ).fetchall()
+        }
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE tablename='provider_health'"
+            ).fetchall()
+        }
+    assert {
+        "user_id",
+        "provider_state",
+        "last_provider_success_at",
+        "last_provider_failure_at",
+        "last_provider_error_class",
+        "last_provider_error_blame",
+        "user_provider_failure_started_at",
+        "last_probe_at",
+    }.issubset(columns)
+    assert "ix_provider_health_state" in indexes
 
 
 def test_0046_segmented_summary_schema_is_immutable_and_head_is_bound():

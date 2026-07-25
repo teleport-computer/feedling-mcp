@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from contextlib import contextmanager, nullcontext
@@ -436,9 +437,15 @@ def set_global_blob(key: str, doc) -> None:
 # users registry
 # ---------------------------------------------------------------------------
 
-def load_all_users() -> list[dict]:
+def load_all_users(*, raise_on_error: bool = False) -> list[dict]:
     """Return the full user registry as a list of dicts (each the verbatim
-    stored user document), ordered by created_at."""
+    stored user document), ordered by created_at.
+
+    By default a read failure is swallowed and returns ``[]`` — the historical
+    behavior most callers want. ``raise_on_error=True`` lets the error propagate
+    so a caller can tell a failed read apart from a genuinely empty table; the
+    registry reload uses it to avoid blanking ``_users`` (an empty registry 401s
+    every request) when the database merely blipped."""
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
@@ -447,7 +454,28 @@ def load_all_users() -> list[dict]:
         return [r[0] for r in rows]
     except Exception as e:
         log.error("[db] load_all_users failed: %s", e)
+        if raise_on_error:
+            raise
         return []
+
+
+def load_user(user_id: str) -> dict | None:
+    """Return ONE user document, or None when the row no longer exists.
+
+    Backs the targeted ``users`` wake-bus reload: a per-row write (the resident
+    poll heartbeat rewrites one binding roughly once a minute per online
+    resident) must not make every subscribing process re-read the whole table.
+    Like ``find_user_by_api_key_hash`` this DELIBERATELY lets a database error
+    propagate — the caller has to tell a transient failure apart from a deleted
+    row, because acting on a false "deleted" would evict a live user from the
+    in-memory registry."""
+    if not user_id:
+        return None
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT doc FROM users WHERE user_id = %s", (user_id,)
+        ).fetchone()
+    return row[0] if row else None
 
 
 def find_user_by_api_key_hash(h: str) -> dict | None:
@@ -503,28 +531,31 @@ def upsert_user(entry: dict) -> None:
     mirror.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
 
 
-def normalize_user_cas(
+def compare_and_set_user(
     user_id: str,
     expected: dict,
-    normalized: dict,
-) -> tuple[bool, dict | None]:
-    """Persist startup normalization without overwriting a concurrent edit.
+    new: dict,
+) -> tuple[bool, bool, dict | None]:
+    """Compare-and-set ONE user row: write ``new`` only if the stored doc still
+    equals ``expected`` (JSONB equality is the CAS boundary).
 
-    Registry reloads run in every web/turn process. A stale process must neither
-    full-rewrite the users table (deleting a just-registered account absent from
-    its snapshot) nor replace a row changed after it was read. JSONB equality is
-    the compare-and-swap boundary. Return ``(read_ok, authoritative_doc)`` so a
-    CAS loser immediately replaces its randomly normalized local copy with the
-    winning row. ``authoritative_doc=None`` means the row was concurrently
-    deleted; ``read_ok=False`` means the database operation itself failed.
+    Returns ``(read_ok, applied, authoritative_doc)``:
+    * ``read_ok=False`` — the database operation itself failed.
+    * ``applied`` — whether our write landed (the stored doc matched expected).
+    * ``authoritative_doc`` — the row now in the DB (``new`` when applied, the
+      winning concurrent row when not, ``None`` when the row is now deleted).
+
+    This is the primitive behind both startup normalization and the resident
+    heartbeat: each reads a row, edits its own copy, and CAS-writes so a stale
+    snapshot can neither overwrite a concurrent edit nor lose to one silently.
     """
     sql = (
         "UPDATE users SET created_at=%s, doc=%s "
         "WHERE user_id=%s AND doc=%s RETURNING doc"
     )
     params = (
-        normalized.get("created_at"),
-        Jsonb(normalized),
+        new.get("created_at"),
+        Jsonb(new),
         str(user_id),
         Jsonb(expected),
     )
@@ -539,12 +570,45 @@ def normalize_user_cas(
                         (str(user_id),),
                     ).fetchone()
     except Exception as exc:
-        log.error("[db] normalize_user_cas(%s) failed: %s", user_id, exc)
-        return False, None
+        log.error("[db] compare_and_set_user(%s) failed: %s", user_id, exc)
+        return False, False, None
     if applied:
+        # Mirror the SAME gated CAS to the shadow — deliberately NOT an
+        # unconditional upsert. An unconditional upsert re-creates a shadow row
+        # whose primary was concurrently deleted: db.delete_user removes the row
+        # from primary then shadow, and if it lands between this CAS commit and
+        # this mirror, the upsert resurrects the deleted user's encrypted row in
+        # the shadow until the 24h prune — a data-retention gap. The gated
+        # `WHERE user_id=%s AND doc=%s` form no-ops on a missing shadow row, so
+        # it can never resurrect. A shadow row that has drifted is left for the
+        # reconcile job (the shadow's own convergence backstop), not force-healed
+        # here — the heartbeat drives this path ~once/min per online resident, so
+        # the safe choice is the one that cannot resurrect deleted data.
         from tee_shadow import mirror
         mirror.execute(sql, params)
-    return True, (row[0] if row is not None else None)
+    return True, applied, (row[0] if row is not None else None)
+
+
+def normalize_user_cas(
+    user_id: str,
+    expected: dict,
+    normalized: dict,
+) -> tuple[bool, dict | None]:
+    """Persist startup normalization without overwriting a concurrent edit.
+
+    Registry reloads run in every web/turn process. A stale process must neither
+    full-rewrite the users table (deleting a just-registered account absent from
+    its snapshot) nor replace a row changed after it was read. Thin wrapper over
+    ``compare_and_set_user`` that drops the ``applied`` flag its callers don't
+    need. Return ``(read_ok, authoritative_doc)`` so a CAS loser immediately
+    replaces its randomly normalized local copy with the winning row.
+    ``authoritative_doc=None`` means the row was concurrently deleted;
+    ``read_ok=False`` means the database operation itself failed.
+    """
+    read_ok, _applied, authoritative = compare_and_set_user(
+        user_id, expected, normalized
+    )
+    return read_ok, authoritative
 
 
 def save_all_users(users: list[dict]) -> None:
@@ -1168,6 +1232,40 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
 
             rows = conn.execute(
                 """
+                SELECT user_id, provider_state,
+                       COALESCE(to_char(
+                         last_provider_success_at AT TIME ZONE 'UTC',
+                         'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+                       ), ''),
+                       COALESCE(to_char(
+                         last_provider_failure_at AT TIME ZONE 'UTC',
+                         'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+                       ), ''),
+                       last_provider_error_class,
+                       last_provider_error_blame
+                FROM provider_health
+                WHERE user_id = ANY(%s)
+                """,
+                (ids,),
+            ).fetchall()
+            for (
+                uid,
+                provider_state,
+                success_at,
+                failure_at,
+                error_class,
+                error_blame,
+            ) in rows:
+                ensure(out, uid)["provider_health"] = {
+                    "provider_state": provider_state or "ok",
+                    "last_provider_success_at": success_at or "",
+                    "last_provider_failure_at": failure_at or "",
+                    "last_provider_error_class": error_class or "",
+                    "last_provider_error_blame": error_blame or "",
+                }
+
+            rows = conn.execute(
+                """
                 SELECT DISTINCT ON (user_id) user_id, doc
                 FROM user_blobs
                 WHERE user_id = ANY(%s) AND kind LIKE 'history_import_job:%%'
@@ -1337,6 +1435,157 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
     except Exception as e:
         log.error("[db] admin_data_track_dau failed: %s", e)
         return []
+
+
+_ADMIN_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def admin_data_track_usage_histogram(
+    *,
+    day: str,
+    tz: str = "Asia/Shanghai",
+) -> dict:
+    """Return one Beijing day's per-user app-usage distribution.
+
+    The sample exactly matches ``admin_data_track_dau``'s ``usage_per_user``
+    CTE: one row per user with at least one ``app_session_end`` event that day,
+    summing only decimal ``payload.duration_sec`` values and treating malformed
+    values as zero. Users without a session-end report are not backfilled with
+    zero. All fixed buckets and summary percentiles are computed in one query.
+    """
+    day_text = str(day or "").strip()
+    if not _ADMIN_DAY_RE.fullmatch(day_text):
+        raise ValueError("invalid_day")
+    try:
+        selected_day = date.fromisoformat(day_text)
+    except ValueError as exc:
+        raise ValueError("invalid_day") from exc
+    if selected_day.isoformat() != day_text:
+        raise ValueError("invalid_day")
+
+    empty = {
+        "day": day_text,
+        "buckets": [
+            {"label": label, "lo_sec": lo, "hi_sec": hi, "users": 0}
+            for label, lo, hi in (
+                ("0-1min", 0, 60),
+                ("1-5min", 60, 300),
+                ("5-15min", 300, 900),
+                ("15-30min", 900, 1800),
+                ("30-60min", 1800, 3600),
+                ("1-2h", 3600, 7200),
+                ("2-4h", 7200, 14400),
+                ("4h+", 14400, None),
+            )
+        ],
+        "total_users": 0,
+        "median_sec": 0.0,
+        "mean_sec": 0.0,
+        "p90_sec": 0.0,
+        "max_sec": 0,
+    }
+    try:
+        zone = ZoneInfo(tz)
+        start = datetime.combine(
+            selected_day, datetime.min.time(), tzinfo=zone
+        ).timestamp()
+        end = datetime.combine(
+            selected_day + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=zone,
+        ).timestamp()
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                """
+                WITH usage_per_user AS (
+                    SELECT
+                        user_id,
+                        SUM(
+                            CASE
+                              WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
+                              THEN (doc->'payload'->>'duration_sec')::bigint
+                              ELSE 0
+                            END
+                        )::bigint AS user_sec
+                    FROM user_logs
+                    WHERE stream = 'tracking_events'
+                      AND doc->>'type' = 'app_session_end'
+                      AND ts IS NOT NULL
+                      AND ts >= %s AND ts < %s
+                    GROUP BY user_id
+                ),
+                stats AS (
+                    SELECT
+                        COUNT(*)::int AS total_users,
+                        COALESCE(
+                          percentile_cont(0.5) WITHIN GROUP (ORDER BY user_sec), 0
+                        )::double precision AS median_sec,
+                        COALESCE(AVG(user_sec), 0)::double precision AS mean_sec,
+                        COALESCE(
+                          percentile_cont(0.9) WITHIN GROUP (ORDER BY user_sec), 0
+                        )::double precision AS p90_sec,
+                        COALESCE(MAX(user_sec), 0)::bigint AS max_sec
+                    FROM usage_per_user
+                ),
+                buckets(ord, label, lo_sec, hi_sec) AS (
+                    VALUES
+                      (1, '0-1min', 0::bigint, 60::bigint),
+                      (2, '1-5min', 60::bigint, 300::bigint),
+                      (3, '5-15min', 300::bigint, 900::bigint),
+                      (4, '15-30min', 900::bigint, 1800::bigint),
+                      (5, '30-60min', 1800::bigint, 3600::bigint),
+                      (6, '1-2h', 3600::bigint, 7200::bigint),
+                      (7, '2-4h', 7200::bigint, 14400::bigint),
+                      (8, '4h+', 14400::bigint, NULL::bigint)
+                )
+                SELECT
+                    b.label,
+                    b.lo_sec,
+                    b.hi_sec,
+                    COUNT(u.user_id)::int AS users,
+                    s.total_users,
+                    s.median_sec,
+                    s.mean_sec,
+                    s.p90_sec,
+                    s.max_sec
+                FROM buckets b
+                CROSS JOIN stats s
+                LEFT JOIN usage_per_user u
+                  ON u.user_sec >= b.lo_sec
+                 AND (b.hi_sec IS NULL OR u.user_sec < b.hi_sec)
+                GROUP BY
+                    b.ord, b.label, b.lo_sec, b.hi_sec,
+                    s.total_users, s.median_sec, s.mean_sec, s.p90_sec, s.max_sec
+                ORDER BY b.ord
+                """,
+                (start, end),
+            ).fetchall()
+        if not rows:
+            return empty
+        return {
+            "day": day_text,
+            "buckets": [
+                {
+                    "label": str(row[0]),
+                    "lo_sec": int(row[1]),
+                    "hi_sec": int(row[2]) if row[2] is not None else None,
+                    "users": int(row[3] or 0),
+                }
+                for row in rows
+            ],
+            "total_users": int(rows[0][4] or 0),
+            "median_sec": float(rows[0][5] or 0),
+            "mean_sec": float(rows[0][6] or 0),
+            "p90_sec": float(rows[0][7] or 0),
+            "max_sec": int(rows[0][8] or 0),
+        }
+    except Exception as e:
+        log.error(
+            "[db] admin_data_track_usage_histogram failed day=%s: %s",
+            day_text,
+            e,
+        )
+        return empty
 
 
 def _completed_dau_row(conn, *, day: date, tz: str) -> dict:
@@ -3302,33 +3551,6 @@ def list_agent_runtime_enabled_users() -> list[dict]:
         return []
 
 
-def try_stamp_hosted_tick(user_id: str, doc: dict, now: float, interval_sec: float) -> bool:
-    """Atomically claim this user's next hosted-heartbeat slot. Stamps the
-    ``hosted_tick`` blob with ``doc`` iff there is no prior stamp or the prior
-    one is at least ``interval_sec`` old, and returns whether THIS call won.
-
-    Replaces the read-then-write ts check so that two workers which both hold
-    the user's plaintext key can't each create a heartbeat in the same interval
-    (the per-job consume path is separately deduped by the job-status CAS in
-    log_patch_item). ``doc`` must carry a numeric ``ts`` field."""
-    sql = ("INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, 'hosted_tick', %s) "
-           "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc "
-           "WHERE COALESCE((user_blobs.doc->>'ts')::float8, 0) <= %s "
-           "RETURNING doc")
-    try:
-        threshold = now - interval_sec
-        with get_pool().connection() as conn:
-            row = conn.execute(sql, (user_id, Jsonb(doc), threshold)).fetchone()
-    except Exception as e:
-        log.error("[db] try_stamp_hosted_tick(%s) failed: %s", user_id, e)
-        return False
-    won = row is not None
-    if won:
-        from tee_shadow import mirror
-        mirror.execute(sql, (user_id, Jsonb(doc), threshold))
-    return won
-
-
 def claim_and_enqueue_introduction(
     user_id: str,
     settings_doc: dict,
@@ -3585,16 +3807,6 @@ def genesis_list_jobs(user_id: str, *, limit: int = 20) -> list[dict]:
                 item[key] = value.isoformat()
         out.append(item)
     return out
-
-
-def genesis_latest_done_job(user_id: str) -> dict | None:
-    with get_pool().connection() as conn:
-        cur = conn.execute(
-            "SELECT * FROM genesis_import_jobs WHERE user_id = %s AND status = 'done' "
-            "ORDER BY completed_at DESC NULLS LAST, updated_at DESC LIMIT 1",
-            (user_id,),
-        )
-        return _genesis_row(cur, cur.fetchone())
 
 
 def genesis_claim_uploaded_jobs(*, worker_id: str = "", limit: int = 1) -> list[dict]:

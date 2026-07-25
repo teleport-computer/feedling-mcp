@@ -349,6 +349,24 @@ def read_events(user_id: str, limit: int = 50) -> list[dict]:
     return log_read(user_id, EVENT_STREAM, limit=limit)
 
 
+# Sensitive-signal decrypt failures. A SEPARATE stream on purpose: the wake
+# debounce readers (service._last_wake_ts / _last_v2_wake_ts) scan only the last
+# 50 EVENT_STREAM rows for the most recent "wake", so a burst of failures in
+# that stream would push the wake out of the window and silently disable
+# burst/cluster dedup — exactly when the fleet is already unhealthy.
+DECRYPT_FAILURE_STREAM = "perception_decrypt_failures"
+DECRYPT_FAILURE_MAX = int(os.environ.get("FEEDLING_PERCEPTION_DECRYPT_FAILURE_MAX", 500))
+
+
+def append_decrypt_failure(user_id: str, doc: dict, ts: float) -> None:
+    log_append(user_id, DECRYPT_FAILURE_STREAM, doc, ts=ts)
+    log_trim(user_id, DECRYPT_FAILURE_STREAM, DECRYPT_FAILURE_MAX)
+
+
+def read_decrypt_failures(user_id: str, limit: int = 50) -> list[dict]:
+    return log_read(user_id, DECRYPT_FAILURE_STREAM, limit=limit)
+
+
 # App-usage time series (one append per app-open from the iOS Shortcut endpoint).
 APP_USAGE_STREAM = "app_usage"
 APP_USAGE_MAX = int(os.environ.get("FEEDLING_APP_USAGE_MAX", 2000))

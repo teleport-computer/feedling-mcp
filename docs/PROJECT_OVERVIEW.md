@@ -198,7 +198,6 @@ flip、resident supervisor 或 hosted resident rollback。旧 proactive API 如�
 | `context_memory_selection.py` | 记忆检索与相关性打分，组上下文窗口 |
 | `perception/` | 扩展感知：信号目录、权限、快照、wake 触发 |
 | `dstack_tls.py` | dstack-KMS 密钥派生 + 确定性 TLS 证书生成 |
-| `acme_dns01.py` | ACME DNS-01（历史 Phase C.2 在 enclave 内签 LE 证书的路径） |
 
 ## 5. 三个服务的分工细节与 Agent 接入
 

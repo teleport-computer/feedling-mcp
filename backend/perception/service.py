@@ -25,7 +25,6 @@ from typing import Any, Callable, Mapping
 
 from content_encryption import random_item_id
 from core import enclave as core_enclave
-from core import util as core_util
 
 from . import catalog, history, permissions, resolve, store
 from .ingress_v2 import device_event_observations_v2, operation_observations_v2, observe_signal_v2
@@ -147,6 +146,36 @@ def _decrypt_signal_payload_v2(
         return _decode_decrypted_payload_v2(raw), ""
     except Exception as e:
         return None, f"decrypt_failed:{type(e).__name__}"
+
+
+def _record_decrypt_failure_v2(user_id: str, key: str, reason: str, ts: float) -> None:
+    """Make a failed sensitive-signal decrypt visible.
+
+    The ingest still answers "accepted" (the report contract is "we took your
+    envelope") and deliberately writes no value — but a silent skip is
+    indistinguishable from "this user has no reading", which is exactly how the
+    2026-07-24 null-perception regression stayed invisible for hours. One
+    warning + one audit row per failed signal, so a fleet-wide enclave hiccup
+    or a caller that forgot to forward the api key (``decrypt_skipped``) shows
+    up in logs and in a queryable stream instead of nowhere.
+
+    The row goes to its OWN stream, never the wake-audit one: ``_last_wake_ts``
+    / ``_last_v2_wake_ts`` scan only the newest 50 rows of that stream to find
+    the last wake, so a burst of failures there would evict the wake row and
+    silently disable burst/cluster dedup — precisely when the fleet is already
+    unhealthy.
+    """
+    log.warning("perception v2 decrypt failed for %s key=%s: %s", user_id, key, reason)
+    try:
+        store.append_decrypt_failure(user_id, {
+            "cap": "perception",
+            "type": "decrypt_failed",
+            "key": key,
+            "reason": reason,
+            "ts": ts,
+        }, ts)
+    except Exception as e:  # observability must never break ingest
+        log.warning("perception decrypt-failure audit write failed for %s: %s", user_id, e)
 
 
 def _decrypted_location_anchor_id_v2(plaintext: Any) -> str:
@@ -337,6 +366,8 @@ def ingest_snapshot_v2(
                     })
                     if key == "location_signal" and signal.changed is True:
                         location_anchor_observations.append((key, values))
+                else:
+                    _record_decrypt_failure_v2(user_id, key, err, now)
             else:
                 storage_items.append(item)
             continue

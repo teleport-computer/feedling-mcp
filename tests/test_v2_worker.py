@@ -256,6 +256,66 @@ def test_process_job_end_to_end_writes_reply_and_completes(monkeypatch):
     assert "action_digest" in state  # non-sensitive digest only; no capability data leaked here
 
 
+def test_chat_still_calls_provider_and_restores_unhealthy_state(monkeypatch):
+    uid = "u_w_provider_health_chat_probe"
+    conftest.seed_user(uid)
+    _reset(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO provider_health (
+              user_id, provider_state, last_provider_failure_at,
+              last_provider_error_class, last_provider_error_blame, last_probe_at
+            )
+            VALUES (%s, 'needs_user_action', now() - interval '49 hours',
+                    'quota_insufficient', 'user_provider', now())
+            """,
+            (uid,),
+        )
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-provider-health-chat")
+    calls = _script_provider(monkeypatch, [_text_round("RECOVERED")])
+    deps = _deps(
+        messages=[
+            {
+                "id": "m-provider-health",
+                "ts": 10.0,
+                "role": "user",
+                "content": "I fixed the provider",
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda _store, _text: {"id": "r-provider-health"},
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 1
+    assert _job_status(job_id)[0] == "completed"
+    with db.get_pool().connection() as conn:
+        health = conn.execute(
+            """
+            SELECT provider_state, last_provider_success_at IS NOT NULL
+            FROM provider_health
+            WHERE user_id = %s
+            """,
+            (uid,),
+        ).fetchone()
+    assert health == ("ok", True)
+
+
 def test_message_coalesced_during_provider_call_creates_successor(monkeypatch):
     """finish_chat_job's late-input successor creation lives entirely in
     jobs_store (input_generation vs observed_generation), independent of what
@@ -2065,6 +2125,9 @@ def test_compaction_reliable_attempts_refresh_turn_progress(monkeypatch):
     progress = []
     monkeypatch.setattr(worker, "_report_turn_progress", progress.append)
 
+    async def _ignore_health(_user_id):
+        return None
+
     async def _fake_reliable(*args, progress_cb=None, **kwargs):
         assert progress_cb is not None
         progress_cb("attempt_start", 1)
@@ -2075,7 +2138,10 @@ def test_compaction_reliable_attempts_refresh_turn_progress(monkeypatch):
 
     monkeypatch.setattr(
         worker.provider_client, "reliable_chat_completion_async", _fake_reliable)
-    result = asyncio.run(worker._compaction_llm_with_progress("cfg", []))
+    monkeypatch.setattr(worker, "_record_provider_success", _ignore_health)
+    result = asyncio.run(
+        worker._compaction_llm_with_progress("u-health", "cfg", [])
+    )
 
     assert result == {"reply": "- folded"}
     assert progress == [
@@ -2107,3 +2173,84 @@ def test_chat_lane_still_takes_the_chat_path(monkeypatch):
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
     assert status == "completed"
     assert written == {"text": "REPLY"}
+
+
+# --- 真实模型自称块进入回合 system 位（prod usr_6bb6…，2026-07-25）----------
+# BYOK 路由切换后 agent 仍照记忆自称旧模型，根因是 V2 的 system prompt 从不携带
+# 真实 provider/model。工厂函数级语义在 tests/test_v2_model_identity.py；这里锁住
+# 两条面向用户的 lane 确实把当回合的 provider_config 传了下去。
+
+_THIRD_PARTY = provider_client.ProviderConfig(
+    provider="deepseek", model="deepseek-chat", api_key="sk-user-byok",
+    base_url="https://api.deepseek.com")
+
+
+def test_chat_turn_system_prompt_states_the_live_third_party_model(monkeypatch):
+    uid = "u_w_identity_chat"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    calls = _script_provider(monkeypatch, [_text_round("REPLY")])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "你是什么模型"}],
+                 provider=(_THIRD_PARTY, {}))
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_THIRD_PARTY, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    system = calls[0]["messages"][0]
+    assert system["role"] == "system"
+    assert "deepseek-chat" in system["content"]
+
+
+def test_wake_turn_system_prompt_states_the_live_third_party_model(monkeypatch):
+    uid = "u_w_identity_wake"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+
+    calls = _script_provider(monkeypatch, [_text_round("hey")])
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_THIRD_PARTY, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_tail=lambda uid_, after_ts, limit: [],
+        read_summary=lambda uid_: ("", 0.0, 0),
+        apply_pending_effects=_apply_effects,
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_THIRD_PARTY, api_key=None, runtime_token="rt"))
+
+    assert status == "completed"
+    system = calls[0]["messages"][0]
+    assert system["role"] == "system"
+    assert "deepseek-chat" in system["content"]
+
+
+def test_official_route_chat_turn_also_pins_the_exact_model_id(monkeypatch):
+    """官方直连同样注入：V2 没有 CLI 壳子，不注入时模型会报错版本（实测 anthropic
+    自称 "Claude 3.5 Sonnet"、openai 自称 "GPT-5"）。"""
+    uid = "u_w_identity_official"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult({}))
+    calls = _script_provider(monkeypatch, [_text_round("REPLY")])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+    monkeypatch.setattr(worker, "_write_encrypted_reply", lambda store, text: {"id": "r"})
+
+    asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    system = calls[0]["messages"][0]["content"]
+    assert _BYOK.model in system        # claude-sonnet-4-test，钉死精确型号
+    assert "官方直连" in system          # 走官方文案，不是第三方那套

@@ -528,6 +528,36 @@ def test_all_main_composes_force_literal_dual_policy():
             assert env["FEEDLING_RUNTIME_DEFAULT_DESIRED"] == "resident"
 
 
+def test_every_main_compose_turns_the_runtime_v2_baseline_on(monkeypatch):
+    """Guard: "prod is OFF by default" is FALSE, and code comments must not say it.
+
+    ``core.util.runtime_v2_default_on`` is the baseline for the env-gated V2
+    rollout flags (perception ingress before it moved to the chat fence, screen
+    captioning, the resident runtime flags). Its docstring — and screen_flag_v2's
+    — used to read as "OFF in prod", but all three main composes inject
+    FEEDLING_RUNTIME_V2_DEFAULT_ON=true, so prod has been ON the whole time.
+    That mismatch is precisely why PR #107's "follow the chat fence" change
+    silently flipped every prod user off the decrypting perception ingress
+    (2026-07-24 null-perception incident). Pin compose and function together so
+    neither side can drift back into the misleading state.
+    """
+    from core import util as core_util
+
+    for name in (
+        "docker-compose.phala.yaml",
+        "docker-compose.phala.test.yaml",
+        "docker-compose.phala.pre.yaml",
+    ):
+        compose = yaml.safe_load((ROOT / "deploy" / name).read_text())
+        value = compose["services"]["backend"]["environment"]["FEEDLING_RUNTIME_V2_DEFAULT_ON"]
+        assert str(value).lower() == "true", name
+        monkeypatch.setenv("FEEDLING_RUNTIME_V2_DEFAULT_ON", str(value))
+        assert core_util.runtime_v2_default_on() is True, name
+
+    monkeypatch.delenv("FEEDLING_RUNTIME_V2_DEFAULT_ON", raising=False)
+    assert core_util.runtime_v2_default_on() is False  # only an env-less process is OFF
+
+
 def test_main_compose_serve_worker_shares_the_backend_image_and_stays_internal():
     # The serve-worker container is a second copy of the SAME image as backend
     # (so deploy/pin-runtime-release.sh's existing backend-image regex retags

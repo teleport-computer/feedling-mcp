@@ -206,6 +206,36 @@ def test_admin_data_track_aggregates_counts_without_content(client):
     assert "private evidence" not in dumped
 
 
+def test_admin_data_track_surfaces_provider_health(client):
+    user_id, _ = _register(client)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO provider_health (
+              user_id, provider_state, last_provider_success_at,
+              last_provider_failure_at, last_provider_error_class,
+              last_provider_error_blame, last_probe_at
+            )
+            VALUES (%s, 'needs_user_action', now() - interval '72 hours',
+                    now() - interval '1 hour', 'auth_invalid',
+                    'user_provider', now())
+            """,
+            (user_id,),
+        )
+
+    body = client.get(
+        "/v1/admin/data-track/users",
+        headers=_admin_headers(),
+    ).get_json()
+
+    assert body["summary"]["provider_needs_user_action"] == 1
+    row = body["users"][0]
+    assert row["provider_state"] == "needs_user_action"
+    assert row["last_provider_success_at"]
+    assert row["last_provider_failure_at"]
+    assert row["last_provider_error_class"] == "auth_invalid"
+
+
 def test_admin_data_track_dau_counts_user_activity_by_beijing_day(client):
     user_a, _ = _register(client)
     user_b, _ = _register(client)
@@ -265,6 +295,43 @@ def test_admin_data_track_dau_counts_user_activity_by_beijing_day(client):
     assert "Daily Active Users" in html
     assert "Chat DAU" in html
     assert "2030-06-02" in html
+
+
+def test_admin_data_track_dau_histogram_json_and_page(client):
+    users = [_register(client)[0] for _ in range(3)]
+    event_ts = _epoch("2030-06-01T18:00:00Z")  # 2030-06-02 Beijing
+    for uid, duration in zip(users, (59, 60, 3600)):
+        db.log_append(
+            uid,
+            "tracking_events",
+            {"type": "app_session_end", "payload": {"duration_sec": duration}},
+            ts=event_ts,
+        )
+
+    res = client.get(
+        "/v1/admin/data-track/dau?day=2030-06-02&days=10",
+        headers=_admin_headers(),
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    histogram = body["usage_histogram"]
+    assert body["filters"]["day"] == "2030-06-02"
+    assert histogram["day"] == "2030-06-02"
+    assert histogram["total_users"] == 3
+    assert [bucket["users"] for bucket in histogram["buckets"]] == [
+        1, 1, 0, 0, 0, 1, 0, 0,
+    ]
+    assert histogram["median_sec"] == 60.0
+
+    page = client.get(
+        "/admin/data-track?view=dau&day=2030-06-02&days=10",
+        headers=_admin_headers(),
+    )
+    assert page.status_code == 200, page.get_data(as_text=True)
+    page_html = page.get_data(as_text=True)
+    assert "使用时长分布 · 2030-06-02" in page_html
+    assert "样本 3 人" in page_html
+    assert "样本=当天有上报的 3 位用户" in page_html
 
 
 def test_admin_data_track_supports_since_filter_and_pagination(client):
@@ -473,6 +540,48 @@ def test_dau_page_marks_frozen_vs_live_and_cutover_note():
     assert "首个冻结日是 <b>2026-07-13</b>" in out  # cutover named in the note
     assert "<b>今天</b>仍是实时数据" in out
     assert "<th>状态</th>" in out       # status column present
+
+
+def test_dau_page_renders_usage_histogram_with_day_links_and_sample_copy():
+    summary = {
+        "latest_dau": 5, "latest_day": "2026-07-24", "max_dau": 5, "avg_dau": 4.0,
+        "user_messages": 10, "tracking_events": 20, "days_returned": 2,
+        "timezone": "Asia/Shanghai", "generated_at": "2026-07-25T00:00:00",
+        "snapshot_first_day": "", "snapshot_last_day": "", "snapshot_days": 0,
+    }
+    rows = [
+        {"day": "2026-07-25", "frozen": False},
+        {"day": "2026-07-24", "frozen": True},
+    ]
+    histogram = {
+        "day": "2026-07-24",
+        "buckets": [
+            {"label": "0-1min", "lo_sec": 0, "hi_sec": 60, "users": 2},
+            {"label": "1-5min", "lo_sec": 60, "hi_sec": 300, "users": 3},
+        ],
+        "total_users": 5,
+        "median_sec": 120,
+        "mean_sec": 180,
+        "p90_sec": 300,
+        "max_sec": 600,
+    }
+    out = _dt._render_data_track_dau_page({
+        "summary": summary,
+        "filters": {"day": "2026-07-24"},
+        "definition": {"dau": "", "excluded": ""},
+        "rows": rows,
+        "usage_histogram": histogram,
+    })
+
+    assert "使用时长分布 · 2026-07-24" in out
+    assert "width:66.67%" in out
+    assert "width:100.00%" in out
+    assert "2 人 · 40.0%" in out
+    assert "样本 5 人 · 中位数 2m · 均值 3m · P90 5m · 最大值 10m" in out
+    assert "day=2026-07-25" in out
+    assert "day=2026-07-24" in out
+    assert "样本=当天有上报的 5 位用户" in out
+    assert "没有 app_session_end 上报的用户不计入" in out
 
 
 def test_bj_deep_converts_only_iso_datetime_strings():

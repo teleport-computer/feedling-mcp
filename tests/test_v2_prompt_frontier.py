@@ -111,13 +111,36 @@ def test_unaudited_route_gets_conservative_default(monkeypatch):
     monkeypatch.delenv(frontier._UNAUDITED_DEFAULT_ENV, raising=False)
     resolved = frontier.resolve_model_limit("some-relay", "mystery-model")
     assert resolved.source == "unaudited_default"
-    assert resolved.context_window_tokens == 16384
+    assert resolved.context_window_tokens == 32768
     # A first-party provider NAME pointed at a custom base_url is still unaudited.
     custom = frontier.resolve_model_limit(
         "openai", "gpt-4o-mini", base_url="https://llm-proxy.example/v1"
     )
     assert custom.source == "unaudited_default"
-    assert custom.context_window_tokens == 16384
+    assert custom.context_window_tokens == 32768
+
+
+def test_raised_default_fits_persona_sized_required_prompt(monkeypatch):
+    """Regression: a persona/world-book-sized REQUIRED set (~20k tokens) that
+    overflowed the old 16384 default's input budget now fits under the raised
+    default, so a custom-relay user with a real persona is served instead of
+    getting ``prompt_frontier_exhausted`` before any provider call (the prod
+    failure mode for world-book users on unaudited relays)."""
+    monkeypatch.delenv(frontier._UNAUDITED_DEFAULT_ENV, raising=False)
+    # One indivisible required component larger than the old ~11.5k input budget
+    # but smaller than the new ~27k one — i.e. it straddles the raise.
+    persona = frontier.PromptComponent(
+        name="persona", estimated_tokens=20_000, required=True
+    )
+    limit = frontier.resolve_model_limit("some-relay", "mystery-model")
+    plan = frontier.plan_prompt(model_limit=limit, components=[persona])
+    assert "persona" in plan.included_components  # planned, no exhaustion
+
+    # The old 16384 default (opt back in via env) would reject the same set.
+    monkeypatch.setenv(frontier._UNAUDITED_DEFAULT_ENV, "16384")
+    old_limit = frontier.resolve_model_limit("some-relay", "mystery-model")
+    with pytest.raises(frontier.PromptFrontierExhausted):
+        frontier.plan_prompt(model_limit=old_limit, components=[persona])
 
 
 def test_unaudited_default_is_env_tunable_and_zero_restores_fail_closed(monkeypatch):

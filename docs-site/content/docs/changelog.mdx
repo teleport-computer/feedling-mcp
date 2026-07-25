@@ -10,6 +10,59 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Long-term provider configuration failures now pause proactive model work.**
+  When an account has gone 48 hours without a usable provider response and its
+  latest failures have continuously required user action for at least one hour,
+  Feedling pauses automatic heartbeat, screen-watch, capture, and dream calls
+  instead of retrying every few minutes. Foreground Chat and user-initiated
+  manual wakes remain available, one automatic proactive recovery probe is
+  allowed every 24 hours, and any successful provider response or Settings
+  validation restores normal operation immediately. Temporary rate limits and
+  upstream `5xx` failures do not trigger the pause. Resident runtimes can report
+  the outcome through the new optional
+  `provider_result: "success" | "failure"` field on
+  `POST /v1/model_api/runtime_error`.
+
+- **`POST /v1/chat/message` now persists an optional `caption_envelope`.** To send
+  text alongside an image or file, pass the caption as its own E2E
+  `EncryptedEnvelope` in `caption_envelope` (same shape as `envelope`, wrapped to
+  the enclave). The enclave decrypts it into the message's plaintext content so the
+  agent receives the caption. Previously an image/file sent with typed text
+  dropped the text on this endpoint (the agent saw only the attachment). Image/file
+  sends without a caption are unchanged; `content_type: "text"` ignores the field.
+
+- **The `identity_patch` tool can recalibrate the relationship day count.** Put a
+  positive integer `relationship_days` inside the `patch` object (for example
+  `patch: {"relationship_days": 300}`) and the persona's relationship start anchor is
+  recalibrated so the app shows that day count. `relationship_days` is the **1-based,
+  user-facing** count — the "day N" the client displays, where the day you met is
+  day 1 (not day 0); the anchor is moved to `today − (relationship_days − 1)`. (The
+  stored `days_with_user` remains the elapsed 0-based count and the client adds 1 for
+  display, so "set it to 45" shows 45.) Onboarding, which derives the elapsed count
+  from a relationship date rather than a user-stated number, is unaffected. The day
+  count is always derived from the anchor, so this rides the same compare-and-swap
+  write as every other profile field. Notes on the contract:
+  - **Absolute anchor is frozen at request time.** The relative day count is
+    resolved to a fixed calendar date when the change is accepted, not when it is
+    later applied. When the change is applied, that frozen date is consumed verbatim
+    as long as it is a valid calendar date not in the future and its day count is
+    within the ~100-year cap; the apply step never re-ages it against the day it
+    happens to run. A delayed or retried apply — including one that crosses midnight
+    or lands at the maximum day count — therefore uses the exact date computed at
+    request time, so it cannot drift and re-applying the same recalibration is a
+    no-op.
+  - **Priority.** An explicit `relationship_days` is treated as a deliberate user
+    calibration and wins over the auto-inferred count (earliest memory / session);
+    a persona re-derivation will not overwrite a count the user calibrated.
+  - **New error codes.** `relationship_days_must_be_non_negative_int` (not an
+    integer, or negative) and `relationship_days_out_of_range` (exceeds the ~100-year
+    cap) are returned as a stable `400` before any write. Invalid values are rejected
+    up front rather than failing at apply time.
+  - `POST /v1/identity/relationship_anchor` and the `identity.relationship_days_set`
+    action keep their existing request/response shapes but now share this same
+    compare-and-swap write and integer validation (a boolean/string day count is now
+    rejected instead of coerced).
+
 - **Received AI messages no longer expand the Dynamic Island.** Chat replies and
   proactive messages now deliver via the system alert notification only (it stacks
   in Notification Center instead of the Live Activity briefly expanding). The
@@ -83,6 +136,18 @@ change must not be interpreted as an API guarantee.
   `unavailable`, where `degraded` means one of the two tools is halted and the
   other still works. `effective` is derived, and covers every lane. `POST` requires a real JSON boolean under `enabled`; strings such as
   `"no"` are rejected with `400` rather than coerced.
+
+- New `GET /v1/model_api/usage`. Queries the caller's active model_api
+  provider for balance/usage live on every call — never cached, never stored.
+  Response shape: `{"provider", "adapter", "status", "as_of", "metrics", "error"?}`,
+  where `metrics` always has all five fixed keys (`balance`, `remaining`,
+  `usage_total`, `usage_today`, `usage_month`), each with its own `status`
+  (`ok` / `unsupported` / `failed`). Field support depends on the configured
+  provider/adapter: DeepSeek and OpenRouter are queried through their official
+  APIs; an `openai_compatible` relay (中转站) is queried through its
+  dashboard-style endpoints when reachable. `400` when there is no usable
+  route to query (`model_api_not_configured`, `model_api_not_tested`, and
+  related slugs).
 
 - `GET /v1/content/export` now includes a `world_book` array alongside `chat`,
   `memory`, `identity` and `frames`. World book entries are user-authored
@@ -498,15 +563,18 @@ themselves add a backend endpoint or change production request handling.
 
 ### Storage and deployment
 
-- Hosted model-API execution is now Runtime V2-only in local, test, pre, and
-  production deployment manifests. The resident supervisor, per-user CLI
-  processes/homes/leases, rollback selectors, and hosted resident admin flip
-  have been removed. The independently operated `/v1/chat/*` resident consumer
-  remains available and is not a hosted fallback.
-- Test, pre, and production deploys now treat their pooled Runtime V2 worker CVM
-  as mandatory. Hosted sends fail before persistence when no fresh worker
-  heartbeat or capacity is available; the worker image contains only the Python
-  V2 runtime, not agent CLIs or resident data volumes.
+- Hosted model-API execution now runs a dual-runtime topology: the pooled
+  Runtime V2 serve-worker runs inside the main confidential VM alongside the
+  backend, while the V1 resident supervisor (per-user CLI processes, homes, and
+  leases) stays available in its own CVM behind a per-user runtime fence.
+  `FEEDLING_HOSTED_RUNTIME_POLICY` defaults to `dual`; the reference
+  self-hosting Compose pins the fail-closed `v2_only` override. The
+  independently operated `/v1/chat/*` resident consumer remains available and
+  is not a hosted fallback.
+- For accounts on Runtime V2 (and any `v2_only` deployment), hosted sends fail
+  before persistence when no fresh worker heartbeat or capacity is available;
+  the V2 runtime is pure Python and does not use agent CLIs or resident data
+  volumes.
 - Heavy Chat **image** bodies are now offloaded to object storage alongside file
   bodies, under a separate `chatimages/` key prefix so image retention and usage
   can be governed on their own. The message row keeps envelope metadata plus a

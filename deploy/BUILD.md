@@ -66,8 +66,19 @@ uv pip compile backend/requirements.txt \
     --python-version 3.12 \
     -o backend/requirements.lock
 
-# Commit both requirements.txt (source of truth for what we want) and
-# requirements.lock (exact versions + content hashes we ship with).
+# The image installs a second lockfile too (deploy/Dockerfile) — regenerate
+# it when backend/requirements-v2-worker.txt changes (command from the
+# lockfile's own header; constrained by requirements.lock so shared deps
+# stay on identical versions):
+uv pip compile backend/requirements-v2-worker.txt \
+    --generate-hashes \
+    --python-version 3.12 \
+    --python-platform linux \
+    --constraint backend/requirements.lock \
+    -o backend/requirements-v2-worker.lock
+
+# Commit both requirements*.txt (source of truth for what we want) and
+# requirements*.lock (exact versions + content hashes we ship with).
 ```
 
 Any change to either pin invalidates the build digest, which invalidates

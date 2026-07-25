@@ -38,6 +38,22 @@ def test_overwrite_when_explicit_valid_date_and_evidence():
     assert out["relationship_anchor_source"] == "upload"
 
 
+def test_user_calibrated_anchor_never_overwritten_by_redistill():
+    # Priority guard: a user_calibrated anchor (the top tier, set when the user
+    # explicitly corrects the day count) must survive a redistill/upload that
+    # restates a duration — a derived anchor must NOT clobber it.
+    existing_calibrated = {
+        "relationship_started_at": "2026-06-01",
+        "relationship_anchor_source": "user_calibrated",
+        "relationship_anchor_evidence": "user set 42 days by hand",
+    }
+    out = gs._relationship_anchor_fields_for_replace(existing_calibrated, {
+        "relationship_anchor": {"relationship_started_at": "2026-01-15",
+                                "relationship_anchor_evidence": "doc says two years"},
+    })
+    assert out == existing_calibrated
+
+
 def test_preserve_when_date_is_not_a_real_date():
     # legality guard: a vague phrase must NOT reset the anchor
     out = gs._relationship_anchor_fields_for_replace(_EXISTING, {

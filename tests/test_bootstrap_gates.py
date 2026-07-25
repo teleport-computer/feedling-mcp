@@ -1333,35 +1333,6 @@ def test_memory_add_reflection_lifetime_cap_under_30d(backend):
     assert r.json()["error"] == "reflection_lifetime_cap"
 
 
-@pytest.mark.skip(reason="P6: memory.retype + per-tab semantics retired by v1 "
-                  "(_count_by_tab shim; retype is legacy). Pre-existing on "
-                  "origin/test; rewrite/remove in P6.")
-def test_memory_retype_changes_tab(backend):
-    """Retype a fact → moment. About me count goes down, Story up."""
-    user_id, api_key = _register(backend["base_url"])
-    f1 = _add_memory(backend["base_url"], user_id, api_key, "f1", mem_type="fact")
-    fact_id = f1["moment"]["id"]
-
-    r = requests.post(
-        f"{backend['base_url']}/v1/memory/retype",
-        json={"id": fact_id, "type": "moment"},
-        headers={"X-API-Key": api_key},
-        timeout=TIMEOUT,
-    )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["moment"]["type"] == "moment"
-
-    r = requests.get(
-        f"{backend['base_url']}/v1/memory/verify",
-        headers={"X-API-Key": api_key},
-        timeout=TIMEOUT,
-    )
-    counts = r.json()["counts"]
-    assert counts["story"] == 1
-    assert counts["about_me"] == 0
-
-
 def test_memory_retype_into_insight_requires_anchor(backend):
     """Retype fact → insight without anchors → 400."""
     user_id, api_key = _register(backend["base_url"])
@@ -1402,27 +1373,6 @@ def test_memory_retype_unknown_id_returns_404(backend):
         timeout=TIMEOUT,
     )
     assert r.status_code == 404
-
-
-@pytest.mark.skip(reason="P6: per-tab counts in /v1/memory/verify retired by v1 "
-                  "_count_by_tab shim. Pre-existing on origin/test; rewrite in P6.")
-def test_per_tab_counts_in_verify(backend):
-    """Write one of each non-anchor type, verify per-tab counts match."""
-    user_id, api_key = _register(backend["base_url"])
-    _add_memory(backend["base_url"], user_id, api_key, "m1", mem_type="moment")
-    _add_memory(backend["base_url"], user_id, api_key, "q1", mem_type="quote")
-    _add_memory(backend["base_url"], user_id, api_key, "f1", mem_type="fact")
-    _add_memory(backend["base_url"], user_id, api_key, "e1", mem_type="event")
-    r = requests.get(
-        f"{backend['base_url']}/v1/memory/verify",
-        headers={"X-API-Key": api_key},
-        timeout=TIMEOUT,
-    )
-    counts = r.json()["counts"]
-    assert counts["story"] == 2       # moment + quote
-    assert counts["about_me"] == 2    # fact + event
-    assert counts["ta_thinking"] == 0
-    assert counts["total"] == 4
 
 
 def test_running_capture_supported_after_main_loop(backend):

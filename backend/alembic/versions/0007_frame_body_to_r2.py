@@ -22,7 +22,7 @@ VARCHAR(32).
 
 DDL is idempotent (IF [NOT] EXISTS) to match the baseline's safety property.
 This migration only changes schema; it does NOT move existing row data — that
-is done out-of-band by scripts/backfill_frames_to_r2.py.
+is done out-of-band by backend/backfill_frames_to_r2.py.
 """
 
 from alembic import op

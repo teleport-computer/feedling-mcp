@@ -18,9 +18,7 @@ import sys
 import types
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
 
-import pytest
 
 # ---------------------------------------------------------------------------
 # Module bootstrap — set required env vars BEFORE importing consumer.

@@ -405,7 +405,6 @@ At minimum, current-status changes should remain covered by:
 - `tests/test_v2_kill_switch.py`
 - `tests/test_v2_e2b_template_extractor.py`
 - `tests/test_hosted_runtime_policy.py`
-- `tests/test_hosted_resident_retirement.py`
 - `tests/test_prod_runner_topology.py`
 - `tests/test_no_litellm_anywhere.py`
 

@@ -2,9 +2,13 @@
 
 Derives one `ToolSpec` per model-facing capability in `capabilities.registry.CAPABILITIES`
 (everything except the internal-only `chat_image_read` and `chat_file_read`, which have
-no model-facing schema) plus the runtime-native `task` and `reply` tools.  The unified
-tool loop handles both specially instead of dispatching them through the capability
-executor.
+no model-facing schema) plus the runtime-native `task`, `reply`, and
+`provider_usage` tools.  The unified tool loop handles these specially instead
+of dispatching them through the capability executor. `provider_usage` is
+chat-lane only — it is deliberately absent from `worker._SUBAGENT_ALLOWED_TOOLS`
+(so subagents never see it) and is always withheld from the wake/screen_watch/
+manual_wake lane (see `worker._run_wake`); see Task 5's brief for why it is not
+in `provenance.EXTERNAL_READS` but is in `worker._PRIVATE_READ_TOOLS`.
 
 Each entry in `PARAMS` mirrors exactly the `params` fields each capability module reads —
 see the module docstring/params usage cited per tool below. Do not add fields the
@@ -18,6 +22,7 @@ from capabilities import registry
 
 REPLY_TOOL = "reply"
 TASK_TOOL = "task"
+PROVIDER_USAGE_TOOL = "provider_usage"
 
 _EXCLUDED = frozenset({"chat_image_read", "chat_file_read"})
 
@@ -230,6 +235,10 @@ PARAMS: dict[str, dict] = {
         "properties": {"text": _STR},
         "required": ["text"],
     },
+
+    # -- runtime-native provider_usage tool (chat-lane only; see worker.py
+    # _SUBAGENT_ALLOWED_TOOLS / _PRIVATE_READ_TOOLS / _run_wake disabled set) --
+    PROVIDER_USAGE_TOOL: {"type": "object", "properties": {}, "additionalProperties": False},
 }
 
 # Tool arguments cross an untrusted model boundary.  Close every model-facing
@@ -256,8 +265,13 @@ DESCRIPTIONS: dict[str, str] = {
                        "and list fields signature, boundaries, do_not_say, "
                        "stable_definitions. Edit a list field by whole-list replacement "
                        "or with op keys add_<field>/remove_<field>/replace_<field> "
-                       "(e.g. add_signature, remove_boundaries). Only act on an "
-                       "explicit request."),
+                       "(e.g. add_signature, remove_boundaries). To recalibrate how "
+                       "long you and the user have known each other, put "
+                       "'relationship_days' in the patch — e.g. patch {\"relationship_days\": 300}. "
+                       "This is the day number AS THE USER SEES AND SAYS IT (the '第 N 天' shown "
+                       "in the app: the day you met is day 1, not day 0). So if the user says "
+                       "'make it day 45', pass 45 and the app will show 45. Positive integer. "
+                       "Only act on an explicit request."),
     "identity_nudge": ("Adjust ONE of the persona's relationship/personality dimension "
                        "scores by a signed integer 'delta' (|delta| ≤ 10). 'dimension' "
                        "must name a dimension that already exists — call identity_get "
@@ -296,6 +310,10 @@ DESCRIPTIONS: dict[str, str] = {
                 "read workspace/artifact, memory, and web data but cannot reply to "
                 "the user, mutate state, call MCP, or spawn another task."),
     REPLY_TOOL: "Send an immediate reply bubble to the user with the given text.",
+    PROVIDER_USAGE_TOOL: (
+        "查询当前 AI 服务商账户的余额与用量（只读）。仅在用户明确询问余额、用量、"
+        "还剩多少钱时调用；结果如实转述，查不到就说查不到。"
+    ),
 }
 
 
@@ -383,7 +401,32 @@ def validate_tool_args(name: str, args) -> str | None:
         # (see capabilities.identity.merge_patch_fields).
         from capabilities import identity as cap_identity
         merged = cap_identity.merge_patch_fields(args)
-        if not any((v.strip() if isinstance(v, str) else v) for v in merged.values()):
+        # Emptiness gate == origin/test baseline, with EXACTLY ONE addition:
+        # relationship_days counts by PRESENCE of the key (round-4). Rationale:
+        #   * relationship_days -> present == content (0 = "we met today" is valid;
+        #     null/False must still pass this gate and hit the live pre-enqueue gate
+        #     (capabilities.identity.relationship_days_error) so the model gets a
+        #     stable, self-correctable error instead of a silent empty-patch drop).
+        #     Its VALIDITY (int/cap) is enforced there + at the server gate, never
+        #     here — this function ALSO gates replay of already-persisted effects,
+        #     where any NEW rejection rule would turn a legal-when-written effect
+        #     into a retry loop.
+        #   * every other field -> identical to origin/test: a str counts when
+        #     non-blank after strip, everything else by bool(value). So bool([])
+        #     is False — a bare `{"signature": []}` / `{"category": []}` /
+        #     `{"unknown": []}` / `{"signature": null}` is empty, exactly as on
+        #     baseline (round-4 reverts the round-2 "any list is content" widening,
+        #     which was the Important-3 hole where signature:null passed this gate
+        #     and then died at the sink as a fake success). RESULT: zero new
+        #     rejections vs origin/test — the replay gate can never judge an old
+        #     effect empty that baseline would have accepted.
+        def _has_content(key: str, value) -> bool:
+            if key == "relationship_days":
+                return "relationship_days" in merged
+            if isinstance(value, str):
+                return bool(value.strip())
+            return bool(value)
+        if not any(_has_content(k, v) for k, v in merged.items()):
             return "identity_patch requires a non-empty patch or profile field"
     if name == "memory_write":
         actions = args.get("actions") or []
@@ -415,7 +458,7 @@ def build_tool_specs() -> list[ToolSpec]:
         if name in _EXCLUDED:
             continue
         specs.append(ToolSpec(name=name, description=DESCRIPTIONS[name], parameters=PARAMS[name]))
-    for name in (TASK_TOOL, REPLY_TOOL):
+    for name in (TASK_TOOL, REPLY_TOOL, PROVIDER_USAGE_TOOL):
         specs.append(ToolSpec(
             name=name,
             description=DESCRIPTIONS[name],

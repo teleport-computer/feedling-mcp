@@ -89,12 +89,9 @@ def _stale_key_conflict(store: UserStore, envelope: dict) -> tuple[dict, int] | 
 # --------------------------------------------------------------------------- #
 
 def _settings_v2_for_store(store: UserStore):
-    try:
-        from proactive.store_v2 import DBProactiveSettingsStoreV2
+    from proactive.controls_v2 import load_settings_v2_for_store
 
-        return DBProactiveSettingsStoreV2().load(store.user_id)
-    except Exception:
-        return store.load_proactive_settings()
+    return load_settings_v2_for_store(store)
 
 
 def _proactive_job_for_response(store: UserStore, job_id: str) -> dict | None:
@@ -642,6 +639,15 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
             file_extra["file_name"] = fname[:120]
         if fmime:
             file_extra["file_mime"] = fmime[:120]
+    # User text sent alongside an image/file rides a separate client-built
+    # caption envelope. Persist it via the shared caption_* schema so the enclave
+    # decrypts it into `content` and the agent sees the text. Without this the
+    # caption was silently dropped for content_type=image (image+text → the text
+    # never reached the model, and the optimistic bubble vanished on reconcile).
+    if content_type in ("image", "file"):
+        cap_env = payload.get("caption_envelope")
+        if isinstance(cap_env, dict):
+            file_extra.update(chat_service._chat_caption_extra_from_envelope(cap_env))
     inserted = True
     if client_msg_id is not None:
         msg, inserted = store.append_chat_idempotent(

@@ -47,6 +47,349 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-25 — TEE Redis：三台 CVM 开通 + 砍掉离线备份
+
+三套 Redis CVM（test/pre/prod）全部开通、running、冒烟 ALL GREEN，落在
+prod9 node 18，仍**零业务流量**。cvm-id 已写进 `deploy/*-redis-cvm-id.txt`。
+
+**[DECISION] 移除全部离线备份链**（age 加密 + R2 推送 + restore 演练 +
+backup sidecar + 备份监控维度）。理由：Redis 在本架构里是**纯临时层**——
+缓存、队列/唤醒总线、分布式锁三类用途的数据全部可从 Postgres 重建
+（**PG 是权威源**）；且恢复旧快照对锁/队列**有害**（复活已释放的锁、已消费
+的队列项），restore 本身就是 bug。保留 CVM 内 **AOF** 仅用于软重启不掉数据；
+整卷丢失时让 Redis 空启动、从 PG 回暖。这同时消掉了 07-25 部署中一个无法
+定位的 age 解密悖论（recipient 逐字节一致却解不开 CVM 推的快照）——备份既然
+不该存在，悖论自然作废。
+
+删除：`deploy/redis/{backup-push,backup-loop,restore,e2e-drill}.sh`、
+`Dockerfile.backup`、`docker-compose.e2e.yaml`、`tests/test_redis_backup_scripts.py`。
+精简：compose 去 backup 服务、entrypoint 去备份 fail-closed、`redis-deploy.yml`
+去备份镜像/age/R2 注入、`redis-monitor.yml` 去 R2 快照新鲜度（只剩持久化+内存）。
+
+部署中固化的坑（写进 `deploy/DEPLOYMENTS.md`）：`--node-id 18`（gateway 只在
+prod9 node 18 配好）、`docker build --platform linux/amd64`、GHCR 包必须 public
+且有分钟级传播延迟、dstack 首建停在 stopped 要手动 start、gateway 注册 ~30min
+延迟、客户端连 gateway 必须发 `--sni`（否则健康 Redis 恒报 eof）。
+
+## 2026-07-25
+
+### [DONE] Runtime V2 补齐推送能力（此前 V2 用户零推送）
+
+- **此前状态**：`model_api_runtime/v2/` 全目录零处调用 push service —— V2 serve-worker
+  跑完一个回合、明文回复落库之后，没有任何代码路径去发 APNs。pre 环境切到 V2 的
+  用户（含主动唤醒消息）从未成功投递过一条聊天推送；用户只有打开 app 手动拉取
+  才能看到新回复。V1（`chat_core.response` / consumer）的推送链路完好，问题只在
+  V2 这一侧缺投递入口。
+- **改动**：分 6 步补齐，投递判定与决策链**复用 V1 同一套**，不新造平行逻辑：
+  1. `tools/export_public_openapi.py` 新增排除前缀 `/v1/internal`（连同
+     `EXCLUDED_PREFIXES` 断言测试）—— 为下一步的内部端点预留不进公开契约的位置。
+  2. `backend/push/routes_asgi.py` 新增 `POST /v1/internal/push/ai_reply`，鉴权走
+     `require_scope("chat_push")`（runtime-token，非用户 session）；
+     `backend/push/push_core.ai_reply_push()` 是承接点：`is_wake=True`（agent 主动
+     唤醒）时先过 `proactive/controls_v2.evaluate_delivery_v2`（`reminders_delivery`
+     开关），被挡则把 `push_decision`/`alert_status`/`live_activity_status` 等字段
+     标 `suppressed` 写回 `chat_messages.doc` 后直接返回；放行或非 wake（用户消息
+     的应答）则调 `push.service._deliver_ai_message_push_if_background`——与 V1 走
+     同一条投递函数，结果字段同样回写进消息行的 delivery metadata。
+  3. `chat_messages.doc` 新增 `wake_kind`（`heartbeat`/`scheduled`/`manual_wake`/
+     `screen_watch`）标记 agent 主动发起的唤醒消息，与用户消息的应答区分；chat
+     lane 的回复不带这个键。落库前要在 `UserStore._build_chat_message` 的 extra
+     白名单里显式登记，否则会被该方法的 allowlist 静默丢弃（本次改动过程中发现
+     并修的一个隐藏坑）。
+  4/5. `model_api_runtime/v2/worker.py` 的 wake lane（独立函数 `_run_wake`）与
+     chat lane（`process_job`）各自在回合末尾维护一个覆盖式、仅内存的 `push_slot`
+     （240 字符截断的回复正文），
+     `finally` 块里最多触发一次 `deps.send_reply_push(...)`；构建槽位和发送推送都
+     包在 try/except 里，任何异常只吞掉记日志、绝不影响回合本身的完成/失败结果。
+     一个回合可能吐多条气泡，只有最后一条会成为推送（用户点进 app 能看到全部气泡，
+     推送只是唤醒手段）。
+  6. `model_api_runtime/v2/serve_worker.py::build_production_deps` 接上生产传输：
+     `_send_reply_push` 用短 TTL（60s）、独立窄 scope（`chat_push`，特意不并入
+     `_RUNTIME_TOKEN_SCOPE`）铸一个 runtime token，经 compose 内网 `httpx.post` 到
+     上面的 `/v1/internal/push/ai_reply`——因为 APNs 私钥只注入 backend 容器，
+     serve-worker 没有钥去直接发推送，只能把已落库回复的明文正文经内存传过去
+     （不写库、不进日志正文），姿态与 V1 consumer 走 HTTP 传 `push_body` 一致。
+- **回滚拉杆**：`FEEDLING_V2_PUSH_ENABLED`（默认开，置 `0` 时
+  `build_production_deps` 把 `send_reply_push` 传 `None`，两条 lane 的 finally 判空
+  直接跳过，不改变回合逻辑）。
+- **`/v1/internal` 不进公开契约**：runtime-token scope 鉴权、只被同 compose 网络内
+  的 serve-worker 调用，不是产品 API；`tools/export_public_openapi.py` 已排除，
+  本次未改 `docs-site/openapi/public.json`。
+- **测试覆盖**：`tests/test_v2_push_endpoint.py`（内部端点+`ai_reply_push` 决策分支）、
+  `tests/test_v2_push_delivery.py`（`wake_kind` 落库）、`tests/test_v2_serve_worker.py`
+  （`_send_reply_push` 传输层）、`tests/test_v2_atomic_reply_cursor.py`（两条 lane 的
+  push_slot 接线，含 `test_push_transport_failure_does_not_fail_the_turn`——这条测试
+  真的走 provider 出结果 → `_on_reply` 写库 → 收尾推送一次的正向路径，显式断言
+  `send_reply_push` 被调用且其异常不冒到回合返回值；早期版本套错了 recovery-drain
+  骨架导致断言恒真，复审时改写并核实）。
+- **已知取舍**：worker 崩溃后由 recovery drain 落库的回复不经 `_on_reply`，不写
+  槽位，那条推送会丢（消息本身不丢；V1 同场景也没有推送，接受）；一个回合多条气泡
+  只推最后一条（用户点进 app 能看到全部气泡，推送只是唤醒手段，一次足够）；`title`
+  仍硬编码 `"IO"`，留到下一轮和 V1 一起改，避免两个 runtime 观感不一致。详细设计见
+  `docs/superpowers/specs/2026-07-25-v2-push-parity-design.md`。
+- **未做**：pre 环境真机端到端验证（切后台收锁屏通知、前台不弹通知且
+  `push_decision=suppress`、关闭「主动提醒投递」开关后 `alert_status=suppressed`
+  等四条）需要部署到 pre 加真机操作，本次未执行，留待人工验证。
+
+### [DONE] prod `users` 全表重载风暴 —— 常驻心跳改走定向广播
+
+- 症状：prod 每分钟 30–74 次全表 `users` 重载（667 行 × ~7 个订阅进程）。
+- 真因：`/v1/chat/poll` 的常驻存活心跳每 60s 给每个在线常驻用户重写一次
+  `access_bindings[resident].last_seen_at`，走的 `registry.persist_user()`
+  发的是**不带 user_id** 的 `users` 广播，订阅方一律 `load_users()` 全表重载。
+  单行写被放大成 N × 进程数 × 667 行读，随在线常驻用户数线性增长。
+- ⚠️ 更正：07-24 的交接文档诊断为"access_bindings 纯序列化顺序抖动被误判为真
+  改动"，并建议给 `persist_user` 加 canonical noop 短路。**该诊断已被 prod 复测
+  推翻** —— 27/27 变化行都是真实时间戳标量变化，pure-ordering 行数为 0，noop
+  短路修不了这个风暴。取证与更正见
+  `docs/incidents/2026-07-25-users-reload-storm-resident-heartbeat.md`。
+- 改动：新增 `db.load_user()`（单行读，DB 错误上抛）、
+  `registry.reload_user()`（原地刷新一行 + 重建 key cache，读失败保留现有行，
+  绝不把瞬时错误当成"行已删除"去踢掉活用户）、
+  `registry.reload_users_after_notify()`（带 user_id 走单行、不带走全表），
+  `persist_user(..., targeted_broadcast=True)` 仅供心跳使用；
+  `asgi/lifespan.py` 与 V2 `serve_worker.py` 的 `users` handler 都接上。
+- 其余 `persist_user` 调用点（注册/发钥/公钥/偏好/access flip）语义不变，仍是
+  全表广播 —— 它们稀疏，不构成风暴。
+- code review 后补回收窄丢掉的三个性质（都是 `load_users` 原本顺带提供的）：
+  ①`reload_user` 的库读挪回 `_users_lock` **内**（原先锁外读、锁内装，监听线程会
+  用旧快照回滚同进程的并发编辑，再被下一次整文档 upsert 写回库，永久丢刚签发的
+  key）；②新增 `_normalize_row_cas_locked()` 做单行 normalize+CAS（admin
+  data_track 原样快照 `_users`，依赖重载时归一化）；③新增
+  `start_periodic_full_reload()`（每进程 daemon 线程，默认 300s，
+  `FEEDLING_REGISTRY_FULL_RELOAD_SEC`）——原先那 38.7 次/分的无差别广播事实上
+  兼任了每 ~1.5s 一次的全量自愈通道，收窄后必须显式补回；配套
+  `load_users(guard_empty=True)` 防止 `db.load_all_users` 吞错返回 `[]` 时清空
+  registry 导致全站 401。
+- 另修：单行重载改用 `_reindex_user_keys_locked()` 只动该用户的 key hash（原先仍
+  调全量 `_rebuild_key_cache()` 清空重建，`_resolve_user` 无锁读会在窗口内 miss 并
+  跌进 deepcopy 慢路径，等于换个触发点保留了同一个锁 convoy）；并改掉一处与行为
+  不符的注释（心跳并非"只碰 resident binding"，`persist_user` 一如既往 upsert 整
+  文档，targeted 指的是广播范围）。
+- 第二轮 review 修复收窄的副作用（10 条抓出，逐条处理）：①**心跳改 CAS**——原先
+  整文档 upsert 陈旧快照会覆盖别 worker 刚签发的 API key（自愈间隔拉长后放大成
+  永久丢 key，CONFIRMED），改成对新鲜 DB 行做 `compare_and_set_user`，只改
+  resident binding 时间戳、DB I/O 出锁；②`load_users` 用
+  `db.load_all_users(raise_on_error=True)` 区分读失败（保留快照）vs 真空表（清空），
+  替掉只加在周期路径且会阻止合法清空的 `guard_empty`；③`_env_float` 守卫防坏值
+  import 期崩全站；④daemon 线程移出被测试调用的 `wire_assembly`（backend gate 在
+  `start_background`，V2 移到 `main`）；⑤自愈间隔 300s→60s；⑥reindex 先加后删消除
+  无锁读窗口；⑦定向 reindex 不抢别用户的共享 hash（防串号）；⑧去掉对非 dict 抛错
+  的 sort；⑨测试改 patch registry 本地线程工厂而非 stdlib threading。
+- 第三轮 review 修复：①周期自愈的 gate 移除——第二轮 gate 在 `start_background`
+  （默认 False）会让未设该 flag 的 web worker 有 `users` handler、serve auth 却无
+  自愈通道（丢 notify → 已删/吊销账号持续鉴权），改成与 handler 配对无条件启动；
+  ②删掉 `persist_user` 的死参数 `targeted_broadcast`（心跳改 CAS 后无 caller，且是
+  footgun）；③修两处文档不一致（测试数、自愈段过时的 300s/guard_empty）。
+- 第四轮 review 修复：①**`turn_child.main` 补起周期自愈**——第三轮漏了这个长命
+  spawn 子进程（经 wire_assembly 装配但走自己入口），丢 notify 后它用陈旧公钥封装
+  托管回复 → decrypt-failed（CONFIRMED，用户可见）；②`compare_and_set_user` 的 TEE
+  影子库 mirror 改无条件 upsert，收敛 drift 的影子行（原条件 CAS UPDATE 在影子 drift
+  时静默 no-op）；③`_reindex` 删除步从 O(全舰队 key) 改成 O(该用户 key)（用旧行 diff）；
+  ④CAS-loss 重试复用赢家行、省一次 load_user。
+- 验证：`tests/test_users_reload_targeted.py`（7 条）+
+  `tests/test_users_reload_review_fixes.py`（21 条）；全量 pytest 6269 passed，
+  3 条既有失败与干净 HEAD 基线逐条一致。**未部署**。
+- 第五轮 review 修复：**回退第四轮把 TEE 影子库 mirror 改无条件 upsert 的改动**——
+  它会在删除竞态下复活已删用户的加密影子行（心跳 CAS 更新主库 commit 后、跑独立影子
+  mirror 前若账号删除插入，无条件 upsert 把已删行复活进影子库，滞留到 24h prune）；
+  mirror 回退为条件 CAS（`WHERE doc=expected`，影子行被删则 UPDATE 0 行、不复活），
+  drift 交给 reconcile。更正第四轮方向错误：复活已删数据比 drift 不收敛严重得多。
+  另修一处空断言测试（补 deepcopy 隔离的真断言）。
+- 未做（已记录在 incident 文档「遗留」）：`last_seen_at` 仍存在账号文档里，本次
+  只把扇出缩小 667 倍、没消除，成本仍按（在线常驻数 × 进程数）增长；
+  `reload_user` 锁内单行读、`_normalize_all_users_cas` 稳态全表 deepcopy 为已知权衡。
+
+### [FIX] #107 感知 fence 回归的第二处：device event 观察也恒跑 + 解密失败不再静默
+
+- **背景**：PR #107 把 `perception_ingress_runtime_v2_enabled` 从 env baseline
+  改成跟随 chat runtime fence，07-24 10:12Z 上 prod 后所有 resident-chat 用户
+  （≈全 prod）掉进不解密的 legacy 路径。`/report` 已由 hotfix `c9ab3a12`（PR
+  #114）修好，本次修的是**同源但被漏掉的第二处**。
+- **`proactive_core.device_events_append`**：`ingest_device_event_v2` 不再受
+  fence 控制（这处**根本没有 legacy else 分支**，不像 `photo_evaluate` 有对称
+  的 `_maybe_wake`）。它是 `unlock_after_absence` / `screen_phash` 两类唤醒的
+  **唯一**生产者（`perception/differ_v2.py`）。prod 取证：unlock 唤醒从部署前
+  ~13/h 掉到 0/h，且 #114 之后**没有恢复**；`runtime_v2` 感知事件同期
+  118/h → 0 → 修 report 后只回到 ~36/h（缺口就是这条）。
+- **`service.ingest_snapshot_v2`**：信封解密失败（`decrypt_failed:*` /
+  `decrypt_skipped` / `invalid_envelope`）以前**完全静默**——`results[key]` 在
+  解密前就置了 `accepted`，失败只是不写值，无日志无事件。现在补 `log.warning`
+  + 一条审计行。客户端契约不变（仍返回 `accepted`），也仍然不臆造值。
+  审计行走**独立**的 `perception_decrypt_failures` 流（cap 500/用户），
+  **刻意不写 `perception_events`**：`_last_wake_ts` / `_last_v2_wake_ts` 只扫
+  该流最新 50 行找上一次 wake，失败风暴会把 wake 行挤出窗口 → burst/cluster
+  去重静默失效，正好赶在全站不健康的时候。
+- **注释订正（本次事故的心智根因）**：`core/util.runtime_v2_default_on`、
+  `proactive/screen_flag_v2`、`proactive/resident_runtime_v2` 都写着「prod 默认
+  OFF」，但三份主 compose 全都注入 `FEEDLING_RUNTIME_V2_DEFAULT_ON=true`
+  ——prod 一直是 ON。正是这个错误认知让 #107 的改动看起来像 no-op。新增守卫
+  `test_every_main_compose_turns_the_runtime_v2_baseline_on` 把 compose 与函数
+  钉在一起。
+- **测试**：`test_device_event_ingress_runs_even_when_the_chat_fence_says_legacy`、
+  `test_snapshot_v2_records_an_audit_event_when_a_signal_fails_to_decrypt`；旧的
+  `test_device_event_route_only_runs_perception_ingress_when_flag_on`（钉的正是
+  被修掉的错误行为）改写为 `..._surfaces_the_perception_ingress_result`。
+- **状态**：未提交、未部署。上线后应观察 unlock 唤醒回到 ~10-15/h、
+  `runtime_v2` 感知事件回到 100+/h 量级；主动消息量会随之回升到 07-23 水平。
+
+### [DONE] 例行清理第五轮（链接完整性 / git 洁癖 / enclave+hosted 深扫 / 根级文档）
+
+- **全仓 Markdown 链接检查**：修 5 处现役悬空指针——openclaw 插件 README
+  的 `agent/routes.py`→`perception_core.py`；PARITY_MATRIX 测试清单删已随
+  dual 恢复而删除的 `test_hosted_resident_retirement.py` 行；
+  OPTIMIZATION_BACKLOG #14 补「hosted tick 线已整体退役」后记；
+  DEPLOYMENTS 两处历史指针（acme_dns01、bootstrap-test-cvm.yml）加已删
+  注记。历史横幅文档内的悬空引用（litellm/app.py/设计期 v2 模块名等
+  130+ 处）按惯例保持原状。
+- **hosted/ 深扫**：删 2 个死符号——`agent_runtime_cutover._env_truthy`
+  （dual 恢复批次带回但从未接线）、`mcp_tools.MAX_MCP_TOOL_DESCRIPTION_CHARS`
+  （兄弟常量都活，唯它孤儿）；`config_store.set_last_runtime_error` 判仅
+  测试供养入 #15 台账并修正其 docstring 的幻影调用方声明；
+  **`file_text.py` 头部重写**——原自述「compatibility tests only、V2 不
+  import」已失实（它是 V2 `local` sandbox provider 的生产提取器）。
+- **enclave/ 深扫**：零死符号；修 3 处失实注释（config.py 两处 Flask 措辞
+  →ASGI、health.py 「single-threaded」删除——现为 4 worker×32 线程池）。
+- **根级文档**：CONTRIBUTING 包结构树补齐 15+ 漏列包（8 个承载路由的领域
+  包、asgi/ 装配层、enclave/ 包、agent_runtime/capabilities/workspace 等）
+  与 6 个漏列底层模块；DESIGN.md 头部定位更新（iOS 已迁独立仓、docs-site
+  纳入公开面、admin HTML 面板不受其约束）；README 幽灵数字 31→23
+  （git 移除提交正文自洽值）。建议未动：CLAUDE.md「所有 UI 先读
+  DESIGN.md」可限定为 iOS/SwiftUI（用户指令文件，留 owner 定）。
+- **git 洁癖**：全仓 1318 个被跟踪文件零垃圾（无生成物/pyc/DS_Store/大
+  文件）；唯一补丁 `.gitignore` 加 `.pytest_cache/`。
+
+### [DONE] 例行清理第四轮（db/SQL 层 / V1 consumer / plans 档案横幅 / 目录型资产）
+
+- **db.py**：删 2 个全仓零引用的全死函数 `try_stamp_hosted_tick`（与第二轮
+  删掉的 `FEEDLING_HOSTED_TICK_*` 死配置同源——hosted tick 整线已退役）与
+  `genesis_latest_done_job`。死表 0、死 SQL 常量 0、tee 三包死函数 0。
+  6 个「仅测试供养」候选未删，已登记进 OPTIMIZATION_BACKLOG #15 待领域
+  裁定（`insert_user` 维持 #15 既有勿删判定；`chat_newest_ts` 判 oracle
+  保留）。
+- **僵尸 monkeypatch 修正**：`test_chat_history_selfheal.py` 的 fail-open
+  测试 patch 的是探针已不调用的 `chat_newest_ts`（boom 永不触发、测试空
+  转），改 patch 真实探针 `chat_count_since`。
+- **V1 consumer（13k 行专项）**：仅一个死常量 `_WEEKDAYS_ZH`（时间渲染早
+  已抽到 `chat/reply_language.py`，那份是活的），已删；无死分支、无误导
+  注释；HTTP/Hermes 路径是 env-gated 冷路径非死码。
+- **plans/specs 档案横幅**：`2026-07-18-runtime-v2-completion-design.md`
+  补 RETIRED（整篇 V2-only/杀 resident 命题被 07-21 dual 反转、原先无任何
+  标注，最严重一份）；`2026-07-09-…-D0-rollout-infrastructure.md` plan 补
+  RETIRED（其 spec 早已 RETIRED、plan 漏标）；
+  `2026-07-04-tee-postgres-migration-design.md` 补部分退役说明
+  （Phase 0–1 现役、Phase 2–3 随 supervisor 拓扑作废）。
+- **目录型资产全干净**：copytext（DB 服务非静态目录）、notices catalog
+  24 类全有发射方、conftest 仅 2 个高频 fixture、model_api_runtime 无外部
+  prompt 资产、loadtest/provider_probe 无断裂引用——零死项。
+
+### [DONE] 例行清理第三轮（tests 整洁 / 部署脚本 / 剩余 docs / 模块 docstring）
+
+- **tests/ 未用 import 清理**：pyflakes 告警 73→38。逐条核实后删 30 条纯
+  标准库死 import、2 处部分符号、2 处冗余局部绑定（改裸调用保留副作用）、
+  `test_perception.py` 7 处函数内重复 import。**19 条 `content_encryption`
+  探针 import 是 try/except stub 注入模式（带 noqa），全部保留**；另 2 处
+  作者显式注明故意保留的也未动。11 条被测模块整模块别名 import 疑似死码但
+  不排除冒烟意图，留待人工；2 处疑似「测试漏断言」线索见 CHANGELOG 下方注。
+- **部署面**：`wait-cvm-ready.sh` 删 litellm 残句；`feedling-backend.service`
+  Description Flask→ASGI；`setup.sh` 补 LEGACY 横幅（VPS 时代路径，指向
+  docs-site self-hosting）；`BUILD.md` 补 `requirements-v2-worker.lock`
+  再生成步骤（命令对齐 lock 文件头）。
+- **docs**：`AUDIT.md` 修 5 处指向已迁出 iOS 仓的 `testapp/` 路径（iOS
+  2026-05-22 迁独立仓，07-06 大清理漏网）+ `.gitignore` 删 3 条 testapp
+  残留；`FRONTEND_ERROR_CONTRACT.md` Phase B/C 状态「待排期」→已上线
+  （notices 路由/catalog 均已 ship）；`OPTIMIZATION_BACKLOG.md` #5 帧存
+  R2 标 ✅；`PROD_DEPLOY_VERIFICATION_2026-07.md` 加快照横幅并移除对已因
+  泄漏事故删除的密码文档的悬空引用。
+- **backend docstring**：`agent_runtime/__init__` 停在「P0 单用户 Claude
+  Agent SDK 原型」的描述重写为多租户 cli-mode supervisor 现状；
+  `content_encryption.py` 4 处 `enclave_app.py _box_seal_open_hkdf` 引用
+  改为现址 `enclave/envelope.py box_seal_open_hkdf`（函数已去下划线）；
+  agent_runtime README 迁移号 0005→0004、Layout 补 `introduction.py`。
+- **两个疑似测试缺口已核实并处置**：`test_multi_tenant_isolation.py` 的
+  `my_markers` 经查非漏断言——chat/identity/memory/whoami 四段各有独立正反
+  断言，属纯冗余构造，已删；`test_chat_resident_consumer.py` 原
+  `test_empty_content_decrypt_source_available_replies` 确实没测它声称的
+  场景（`_process_messages` 不做解密，合并在 poll 循环上游；喂
+  `decrypted_msg` 才是它真正测的契约），已改名
+  `test_decrypted_content_from_decrypt_source_replies`、删除无效的
+  `empty_msg`/`get_decrypted_history` patch 并如实重写 docstring；合并
+  胶水的两个 helper（`_poll_decrypt_since`/`_filter_messages_to_poll_ids`）
+  与「配置源仍无明文」读失败分支均确认已有专门测试覆盖。
+
+### [DONE] 例行清理第二轮（docs-site / env 接线 / 参考文档事实性 / 符号级）
+
+- **死配置删除**：`FEEDLING_PROACTIVE_GATE_PROVIDER`/`_MODEL`（三份 phala
+  compose；gate 已 v2 化、`proactive/gate.py` 硬编码 `proactive_v2:wake`，
+  全仓零读取方；`OPENROUTER_API_KEY` 保留——dashboard 调试翻译在用，注释
+  已改写）；`feedling.env.example` 的 `FEEDLING_HOSTED_TICK_*` 两条（被
+  `PROACTIVE_TICK_*` 取代）；`chat_resident.env.example` 的
+  `FALLBACK_COOLDOWN`（无读取方）。
+- **符号级死代码**：删 `model_api_runtime/v2/summary_frontier.render_frontier`
+  （零调用，渲染已走 `render_replacement`）；删 `hosted/config_store.py` 与
+  `perception/service.py` 各一条真·未用顶层 import；清 tools/ 六处未用
+  import（`user_logs.py` 的 boto3 是带 noqa 的故意探测，保留）。
+- **参考文档事实性修正**：`PROJECT_OVERVIEW.md` 删悬空 `acme_dns01.py` 表行；
+  `TESTING.md` L2 路径 `tools/`→`tests/`、决策矩阵 E 行 litellm 遗词改现役
+  pi-driver 体系；`README.md` memory floor 数值对齐代码（1+月 ≥12 非 ≥15）；
+  `RUNTIME_FLOWS.md` §3 历史段顶部补「点名符号可能已删」免责；
+  `API_ERRORS.md` 补登 8 个漏登记 slug（`client_msg_id_invalid`、
+  `invalid_reasoning_effort`、`model_api_config_delete_failed`、
+  `nudge_delta_exceeds_cap`、`material_empty`、`redistill_job_active`、
+  `confirmation_mismatch`、`device_already_enrolled`，新增通知中继小节）。
+- **docs-site 公开文档三处 dual-runtime 失实修正**（changelog.mdx Unreleased
+  的 V2-only 表述、架构图 serve-worker「separate CVM」定位、self-hosting
+  `FEEDLING_HOSTED_RUNTIME_POLICY` 行）；`npm run types:check`/`lint`/`build`
+  全绿，OpenAPI 无需重生成（无 API 面变更）。
+- 判保留：`workspace/sandbox.py` 的 `register_*_sandbox_provider` 部署扩展
+  钩子；tests/ 内 73 条良性 unused-import 告警（独立整洁项，未动）。
+
+### [DONE] 过时代码/文档/注释例行清理（四路全仓扫描 + 逐项取证）
+
+- **删文档 2 份**（均核实已落地后删）：`docs/PI_USER_MCP_GAP_给志豪_2026-07-17.md`
+  （pi user-MCP 桥已在 `spawners.py` `{mcp}` 模板 + consumer `-e <bridge>` 实现，
+  诊断失效）、`docs/IDENTITY_CARD_NEVER_GATES_2026-07-12.md`（已由
+  `2e72f13e`/`24f32df5` 落地）。
+- **删测试 3 处**：`tests/test_bootstrap_gates.py` 两个被 v1 淘汰、长期
+  `@skip("P6 …retired by v1")` 的 per-tab 语义用例（未 skip 的 retype 错误路径
+  用例保留）；`tests/conftest.py` `_PURE_UNIT` 白名单里指向已删除
+  `test_model_api_prompts.py` 的死条目。
+- **修过时注释**：`deploy/Dockerfile` 启动注释从 Flask/app.py 时代重写为
+  ASGI + 多 worker（leader election）现状；三份 phala compose 的
+  `backend/app.py` 指向改 `backend/push/apns.py`；`gunicorn_conf.py` 一句
+  Flask 残留；alembic `0007` 的 backfill 脚本路径。
+- **补历史标注**：`DEPLOYMENTS.md` Phase-E compose 快照行（mcp 已删、backend
+  已 ASGI）；两份 `pi-on-multiprofile` plan/spec 横幅补 deepseek 07-14 回退
+  claude driver 说明。
+- **取证后判保留（勿反复清理）**：`backend/hosted_runtime.py` 与
+  `backend/proactive/background_v2.py` 虽仅测试引用，但 07-18 第五/六轮清理
+  已 git 取证终审判保留（OPTIMIZATION_BACKLOG #15：proactive V2 在建预留面 /
+  oracle），无新证据不推翻；`deploy/PHALA_ACCOUNT_MIGRATION.md`（prod 仍在
+  sxysuns 账号，§Phase 2 未走完）；`AGENT_CLI_INTEGRATION_SURVEY.md`（被
+  live 代码注释引用）；`UPLOAD_MEMORY_IDENTITY_CALIBRATION_2026-07-07.md`
+  （`genesis/prompts.py` 仍标 DRAFT 待定稿，是产品意图正本）；
+  `docs/superpowers/plans+specs` 整目录（持续维护的日期档案）；
+  `tools/frame_envelope_roundtrip_test.py`（5001 仍是现役端口，"Flask 时代
+  端口"判据不成立）。
+- 验证：pyflakes 零告警；全量 pytest 与清理前基线对照零新增失败。
+
+## 2026-07-24 — TEE Redis CVM 基础设施（未开通）
+
+三套独立 Redis CVM（test/pre/prod）的全部代码就绪：官方 `redis:8-alpine`
+TLS-only + backup sidecar（每小时 `redis-cli --rdb` 快照 → age 非对称加密 → R2）。
+部署纪律复刻 TEE Postgres：`--kms phala` 身份（无链上 AppAuth）、手动 workflow、
+cvm-id fail-closed、永不并入 merge 自动部署。
+
+**当前零流量**：没有任何业务代码引用 Redis，三台 CVM 也尚未开通
+（cvm-id 文件为空 → workflow 拒绝运行）。缓存 / 队列 / 锁的接入各自另开 spec。
+
+关键决策见 `docs/superpowers/specs/2026-07-24-tee-redis-cvm-design.md`：
+`noeviction`（避免静默驱逐锁与队列）、sidecar 而非内嵌镜像、显式 sleep 循环
+而非 cron（PG 2026-07-14 cron PATH 静默失败的教训）、`redis-cli --rdb` 而非
+拷卷文件、age 非对称加密（备份机被攻破也解不了历史备份）。
+
+首次开通 runbook 见 `deploy/DEPLOYMENTS.md`「TEE Redis」章节。
+
 ## 2026-07-22
 
 ### [DONE] Task 11 — 双运行时部署拓扑：serve-worker 并入主 CVM，runner 回 V1-only

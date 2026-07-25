@@ -28,6 +28,7 @@ def _activate_proactive(monkeypatch) -> None:
 class _Store:
     def __init__(self):
         self.events = {}
+        self.decrypt_failures = {}
         self.state = {}
         self.config = {}
         self.frames = {}
@@ -38,6 +39,12 @@ class _Store:
 
     def read_events(self, uid, limit=50):
         return list(self.events.get(uid, [])[-limit:])
+
+    def append_decrypt_failure(self, uid, doc, ts):
+        self.decrypt_failures.setdefault(uid, []).append(dict(doc))
+
+    def read_decrypt_failures(self, uid, limit=50):
+        return list(self.decrypt_failures.get(uid, [])[-limit:])
 
     def get_config(self, uid):
         return dict(self.config.get(uid, {}))
@@ -407,6 +414,44 @@ def test_location_signal_decrypt_feeds_wifi_anchor_differ_once(monkeypatch):
     assert fake.get_state("u_wifi_anchor_decrypt")["wifi_anchor_id"]["v"] == "wifi-work"
 
 
+def test_snapshot_v2_records_an_audit_event_when_a_signal_fails_to_decrypt(monkeypatch):
+    """A failed envelope decrypt must leave a trace.
+
+    ``results[key]`` is set to "accepted" BEFORE the decrypt runs (the report
+    contract is "we took your envelope"), and a failed decrypt then silently
+    skipped the state write: no log, no counter, no event. A fleet-wide enclave
+    hiccup or a caller that forgot to forward the api key therefore looks
+    exactly like "this user has no reading" — the same invisibility that let
+    the 2026-07-24 null-perception regression run for hours. The value write
+    stays skipped (never store a guess); only observability is added.
+    """
+    fake = _Store()
+    monkeypatch.setattr(service, "store", fake)
+
+    def boom(envelope, api_key, *, purpose):
+        raise RuntimeError("enclave unreachable")
+
+    results = service.ingest_snapshot_v2(
+        "u_decrypt_failure",
+        [{"key": "location_signal", "envelope": {"id": "loc_1"}, "changed": True}],
+        client_ts=500.0,
+        api_key="api-key",
+        decrypt_envelope=boom,
+    )
+
+    assert results["location_signal"] == "accepted"      # client contract unchanged
+    assert fake.get_state("u_decrypt_failure") == {}      # no value invented
+
+    failures = fake.read_decrypt_failures("u_decrypt_failure")
+    assert len(failures) == 1
+    assert failures[0]["key"] == "location_signal"
+    assert failures[0]["reason"] == "decrypt_failed:RuntimeError"
+    # NOT in the wake-audit stream: service._last_wake_ts / _last_v2_wake_ts scan
+    # only the newest 50 rows there, so a burst of failures would push the last
+    # "wake" row out of the window and silently disable burst/cluster dedup.
+    assert fake.read_events("u_decrypt_failure") == []
+
+
 def test_location_signal_null_or_unchanged_anchor_does_not_wake(monkeypatch):
     fake = _Store()
     emitted = []
@@ -500,10 +545,15 @@ def test_photo_added_wake_is_differ_event_with_digest_and_origin_refs(monkeypatc
     assert "photo_added" in emitted[0].change_digest
 
 
-def test_device_event_route_only_runs_perception_ingress_when_flag_on(monkeypatch):
+def test_device_event_route_surfaces_the_perception_ingress_result(monkeypatch):
     # The Flask /v1/device/events route was deleted in the ASGI cutover; this
     # exercises the framework-neutral core the route (and its ASGI counterpart)
     # delegate to — proactive_core.device_events_append — directly.
+    #
+    # 2026-07-25: this test used to assert the mirror case ("fence off => no
+    # ingest"). That fork was the sibling of the /report regression and is
+    # gone; the fence-independence of the ingest is now pinned by
+    # test_device_event_ingress_runs_even_when_the_chat_fence_says_legacy.
     from proactive import proactive_core
 
     class DeviceStore:
@@ -526,14 +576,6 @@ def test_device_event_route_only_runs_perception_ingress_when_flag_on(monkeypatc
         "wake_events": 1,
     })
 
-    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled", lambda user_or_store: False)
-    off = proactive_core.device_events_append(fake_store, {
-        "type": "screen_frame",
-        "payload": {"safe_screen_phash": "hash_a", "broadcast_state": "on"},
-    })
-    assert "perception_v2" not in off
-    assert calls == []
-
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled", lambda user_or_store: True)
     on = proactive_core.device_events_append(fake_store, {
         "type": "screen_frame",
@@ -541,6 +583,52 @@ def test_device_event_route_only_runs_perception_ingress_when_flag_on(monkeypatc
     })
     assert on["perception_v2"] == {"observations": 1, "wake_events": 1}
     assert calls and calls[-1][0] == "u_device"
+
+
+def test_device_event_ingress_runs_even_when_the_chat_fence_says_legacy(monkeypatch):
+    """Sibling of the 2026-07-25 /report hotfix (the test above).
+
+    PR #107 tied ``perception_ingress_runtime_v2_enabled`` to the hosted chat
+    runtime fence. ``/report`` was un-tied by the hotfix, but this second call
+    site was missed — and it has NO legacy branch at all, so every
+    resident-chat user (≈ all of prod) stopped producing device-event
+    observations. That killed the only producers of the ``unlock_after_absence``
+    and ``screen_phash`` wakes (perception/differ_v2.py): prod unlock wakes went
+    from ~13/h to 0/h at the 07-24 10:12Z deploy and did NOT recover with the
+    /report hotfix. Producing an observation is a data-integrity concern, not a
+    runtime-lane concern — it must not depend on which chat runtime owns the
+    user.
+    """
+    from proactive import proactive_core
+
+    class DeviceStore:
+        user_id = "u_device_legacy_fence"
+
+        def __init__(self):
+            self.events = []
+
+        def append_device_event(self, event):
+            self.events.append(dict(event))
+
+        def list_device_events(self, since_epoch=0.0, limit=100):
+            return list(self.events)[-limit:]
+
+    calls = []
+    monkeypatch.setattr(service, "ingest_device_event_v2", lambda uid, event: calls.append((uid, event)) or {
+        "observations": 1,
+        "wake_events": 1,
+    })
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled", lambda user_or_store: False)
+
+    # A non-capture-boundary event keeps this focused on the ingress fork
+    # (a boundary event would drag the capture scheduler's DB path in).
+    out = proactive_core.device_events_append(DeviceStore(), {
+        "type": "screen_frame",
+        "payload": {"safe_screen_phash": "hash_legacy_fence", "broadcast_state": "on"},
+    })
+
+    assert out["perception_v2"] == {"observations": 1, "wake_events": 1}
+    assert calls and calls[-1][0] == "u_device_legacy_fence"
 
 
 def test_device_event_phash_respects_broadcast_state(monkeypatch):

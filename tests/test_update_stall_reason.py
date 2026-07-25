@@ -31,6 +31,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import tools.chat_resident_consumer as crc  # noqa: E402  (after env setup)
 
+from _fake_clock import freeze_monotonic  # noqa: E402
+
 
 def _refuse_git(*_a, **_k):
     raise AssertionError("_self_update_stall_reason() must not run git")
@@ -72,6 +74,9 @@ def test_update_stall_headers_only_present_when_non_empty(monkeypatch):
 
 def _apply_update_seams(monkeypatch):
     applied = []
+    # Pin the clock — `_last_self_update_mono = 0.0` is only outside the
+    # throttle window on a host with real uptime (see tests/_fake_clock.py).
+    freeze_monotonic(monkeypatch)
     monkeypatch.setattr(crc, "AUTO_UPDATE", True)
     monkeypatch.setattr(crc, "_HOSTED", False)
     monkeypatch.setattr(crc, "_last_self_update_mono", 0.0)

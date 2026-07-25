@@ -125,8 +125,9 @@ if not _provisioned:
         "test_ios_perception_contract_v2.py",
         "test_perception_ingress_v2.py",
         "test_provider_client.py",
+        "test_provider_health_unit.py",
+        "test_provider_usage.py",
         "test_history_import_identity.py",
-        "test_model_api_prompts.py",
         "test_model_api_file_payload.py",
         "test_onboarding_validation_genesis.py",
         "test_enclave_frame_caption.py",
@@ -151,6 +152,7 @@ if not _provisioned:
         "test_v2_coalesce.py",
         "test_v2_status_stream.py",
         "test_v2_dependency_direction.py",
+        "test_v2_provider_usage_tool.py",
         "test_user_mcp_ca_fetch.py",
         "test_user_mcp_ca_fetch_leaf.py",
         "test_identity_value_write_path.py",
@@ -171,6 +173,10 @@ if not _provisioned:
         # B2: pure stdlib (only imports identity.distill_prompt_v1) — was
         # missing from this list even before this task, fixed in passing.
         "test_identity_distill_prompt.py",
+        # TEE Redis：配置不变量（读 yaml/sh + subprocess，无 DB）与连接池
+        # （构造不建连接，无 DB）。
+        "test_redis_cvm_config.py",
+        "test_redis_pool.py",
     }
     collect_ignore = sorted(
         f
@@ -319,6 +325,23 @@ def pytest_unconfigure(config):
         admin.close()
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_enclave_http_client():
+    """Drop the pooled enclave client around every test.
+
+    ``core.enclave`` keeps one ``httpx.Client`` per process so the V2 prompt
+    path stops paying a TLS handshake per decrypted chat row. That cache
+    outlives a test: any test that monkeypatches ``core_enclave.httpx.Client``
+    would otherwise be served the previous test's stub (or leak its own into
+    the next one). Reset on both sides so pooling stays invisible to tests.
+    """
+    from core import enclave as core_enclave
+
+    core_enclave.reset_http_client()
+    yield
+    core_enclave.reset_http_client()
 
 
 @pytest.fixture()

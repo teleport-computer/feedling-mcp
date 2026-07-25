@@ -1,7 +1,7 @@
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))  # noqa: E402
 
-from capabilities.types import CapabilityResult, ok, err  # noqa: E402
+from capabilities.types import ok, err  # noqa: E402
 from capabilities import errors  # noqa: E402
 
 

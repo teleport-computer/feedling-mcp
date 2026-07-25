@@ -230,19 +230,6 @@ def validate_canonical_frontier(
     return ordered
 
 
-def render_frontier(frontier: Sequence[SummarySegment]) -> str:
-    """Render oldest-to-newest immutable nodes without leaking DB seq values.
-
-    A stable delimiter keeps node boundaries unambiguous.  Segment ids, levels,
-    and source counters are content-free storage provenance and intentionally do
-    not leave the trusted runtime in the model prompt.
-    """
-
-    return "\n\n--- historical summary checkpoint ---\n\n".join(
-        item.text.strip() for item in frontier
-    )
-
-
 def render_replacement(
     frontier: Sequence[SummarySegment],
     *,

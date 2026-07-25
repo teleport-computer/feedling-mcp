@@ -3,7 +3,7 @@
 #
 # `phala deploy --wait` uses a HARD-CODED 300s ceiling (dist/index.js:
 # `Xl(e,t=3e5)`) with no flag or env override; runner CVMs routinely need
-# longer (big agent-runner image pull + litellm boot), so CI deploys were
+# longer (big agent-runner image pull), so CI deploys were
 # failing on the CLI's timeout while the update itself completed fine.
 # Deploy WITHOUT --wait, then poll readiness here with a real deadline.
 #

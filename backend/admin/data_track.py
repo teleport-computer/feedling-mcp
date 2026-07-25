@@ -4,7 +4,7 @@ import json
 import hashlib
 import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from urllib.parse import parse_qs, quote
@@ -69,7 +69,7 @@ def _data_track_qs(**updates) -> str:
     for key in (
         "admin_key", "since", "registered_since", "q", "limit", "offset", "sort",
         "dir", "view", "days", "user_id", "subsystem", "status", "trace_id",
-        "mode", "reveal", "page", "event",
+        "mode", "reveal", "page", "event", "day",
     ):
         value = request.args.get(key, "").strip()
         if value:
@@ -426,6 +426,40 @@ def _data_track_count_dict(raw: dict | None) -> dict:
 
 
 _SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+_DAU_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class InvalidDauDay(ValueError):
+    """The admin DAU histogram received an invalid YYYY-MM-DD selector."""
+
+
+def _validated_dau_day(value: str) -> str:
+    raw = str(value or "").strip()
+    if not _DAU_DAY_RE.fullmatch(raw):
+        raise InvalidDauDay("invalid_day")
+    try:
+        parsed = date.fromisoformat(raw)
+    except ValueError as exc:
+        raise InvalidDauDay("invalid_day") from exc
+    if parsed.isoformat() != raw:
+        raise InvalidDauDay("invalid_day")
+    return raw
+
+
+def _default_usage_histogram_day(rows: list[dict]) -> str:
+    """Latest completed Beijing day present in the DAU table, or yesterday."""
+    today = datetime.now(_SHANGHAI_TZ).date()
+    for row in rows:
+        raw = str(row.get("day") or "").strip()
+        if not _DAU_DAY_RE.fullmatch(raw):
+            continue
+        try:
+            candidate = date.fromisoformat(raw)
+        except ValueError:
+            continue
+        if candidate < today:
+            return candidate.isoformat()
+    return (today - timedelta(days=1)).isoformat()
 
 
 def _bj_iso(value) -> str:
@@ -1235,9 +1269,27 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     for u in users:
         uid = str(u.get("user_id") or "")
         if include_detail_user and include_detail_user == uid:
-            rows.append(_build_data_track_user(u, include_detail=True))
+            row = _build_data_track_user(u, include_detail=True)
         else:
-            rows.append(_build_data_track_user_fast(u, snapshot.get(uid, {})))
+            row = _build_data_track_user_fast(u, snapshot.get(uid, {}))
+        health = dict(snapshot.get(uid, {}).get("provider_health") or {})
+        row.update(
+            {
+                "provider_state": str(
+                    health.get("provider_state") or "ok"
+                ),
+                "last_provider_success_at": str(
+                    health.get("last_provider_success_at") or ""
+                ),
+                "last_provider_failure_at": str(
+                    health.get("last_provider_failure_at") or ""
+                ),
+                "last_provider_error_class": str(
+                    health.get("last_provider_error_class") or ""
+                ),
+            }
+        )
+        rows.append(row)
     rows = _data_track_apply_text_filter(rows, str(filters.get("q") or ""))
     _data_track_sort_rows(rows, str(filters.get("sort") or ""), str(filters.get("dir") or "desc"))
     completed = sum(1 for r in rows if r["onboarding"]["passing"])
@@ -1268,6 +1320,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     # App usage-duration roll-up (iOS app_session_end). foreground-kill undercount
     # is expected (see analytics-app-session-end.md); this is a slight lower bound.
     au_fg_total = au_sessions_total = au_users_active = au_dau_today = 0
+    provider_needs_user_action = 0
     for row in rows:
         stage = row["onboarding"]["stage"]
         route = row["route"]
@@ -1280,6 +1333,8 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         proactive_jobs += row["proactive"]["jobs"]
         proactive_messages += row["proactive"]["proactive_messages"]
         proactive_failed += row["proactive"]["failed_jobs"]
+        if row.get("provider_state") == "needs_user_action":
+            provider_needs_user_action += 1
         if int(row["memory"].get("total") or 0) > 0:
             fn_has_memory += 1
         if int(row["chat"].get("user_messages") or 0) > 0:
@@ -1364,6 +1419,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         "proactive_jobs_total": proactive_jobs,
         "proactive_messages_total": proactive_messages,
         "proactive_failed_total": proactive_failed,
+        "provider_needs_user_action": provider_needs_user_action,
         "app_usage": {
             "foreground_sec_total": au_fg_total,
             "sessions_total": au_sessions_total,
@@ -1722,10 +1778,17 @@ def _data_track_debug_payload() -> dict:
 def _data_track_dau_payload() -> dict:
     filters = _data_track_request_filters()
     days = int(filters.get("days") or 30)
+    raw_day = str(request.args.get("day") or "").strip()
+    requested_day = _validated_dau_day(raw_day) if raw_day else ""
     snapshot = db.admin_dau_snapshot_bounds()
     rows = db.admin_data_track_dau(
         since_epoch=float(filters.get("since_epoch") or 0),
         days=days,
+        tz="Asia/Shanghai",
+    )
+    histogram_day = requested_day or _default_usage_histogram_day(rows)
+    usage_histogram = db.admin_data_track_usage_histogram(
+        day=histogram_day,
         tz="Asia/Shanghai",
     )
     dau_values = [int(row.get("dau") or 0) for row in rows]
@@ -1750,6 +1813,7 @@ def _data_track_dau_payload() -> dict:
         "filters": {
             "since": filters.get("since", ""),
             "days": days,
+            "day": histogram_day,
             "view": "dau",
         },
         "rows": [
@@ -1760,6 +1824,7 @@ def _data_track_dau_payload() -> dict:
             }
             for row in rows
         ],
+        "usage_histogram": usage_histogram,
         "definition": {
             "dau": "Distinct users with at least one user chat message or tracking event on the Beijing day.",
             "excluded": "Agent/openclaw messages, proactive writes, and verify_ping synthetic messages are excluded.",
@@ -2115,6 +2180,10 @@ def _render_data_track_page(payload: dict) -> str:
         _render_metric("聊天消息总数", summary["chat_messages_total"]),
         _render_metric("记忆总数", summary["memory_total"]),
         _render_metric("主动任务数", summary["proactive_jobs_total"]),
+        _render_metric(
+            "模型配置待处理",
+            summary.get("provider_needs_user_action", 0),
+        ),
     ])
     # Ground-truth activation funnel (behaviour-based, not stage-label-based).
     funnel_steps = [
@@ -2272,8 +2341,22 @@ def _render_data_track_dau_page(payload: dict) -> str:
     summary = payload["summary"]
     filters = payload.get("filters", {})
     rows = payload.get("rows", [])
+    histogram = payload.get("usage_histogram") or {}
+    histogram_day = str(
+        histogram.get("day") or filters.get("day") or ""
+    ).strip()
+    histogram_buckets = list(histogram.get("buckets") or [])
+    histogram_total = int(histogram.get("total_users") or 0)
     definition = payload.get("definition", {})
-    api_qs = _data_track_qs(view=None, q=None, limit=None, offset=None, sort=None, dir=None)
+    api_qs = _data_track_qs(
+        view=None,
+        q=None,
+        limit=None,
+        offset=None,
+        sort=None,
+        dir=None,
+        day=histogram_day,
+    )
     api_url = f"/v1/admin/data-track/dau?{api_qs}" if api_qs else "/v1/admin/data-track/dau"
     _snap_first = str(summary.get("snapshot_first_day") or "")
     _cutover_html = (
@@ -2310,6 +2393,42 @@ def _render_data_track_dau_page(payload: dict) -> str:
             + f"<td>{html.escape(_bj_iso(row.get('last_at')))}</td>"
             + "</tr>"
         )
+    histogram_days = []
+    for row in rows:
+        row_day = str(row.get("day") or "").strip()
+        if not _DAU_DAY_RE.fullmatch(row_day):
+            continue
+        cls = "sort-button active" if row_day == histogram_day else "sort-button"
+        href = _data_track_page_href(view="dau", day=row_day, offset=0)
+        histogram_days.append(
+            f"<a class='{cls}' href='{html.escape(href, quote=True)}'>"
+            f"{html.escape(row_day)}</a>"
+        )
+    max_bucket_users = max(
+        (int(bucket.get("users") or 0) for bucket in histogram_buckets),
+        default=0,
+    )
+    histogram_rows = []
+    for bucket in histogram_buckets:
+        users = int(bucket.get("users") or 0)
+        percent = (users * 100.0 / histogram_total) if histogram_total else 0.0
+        width = (users * 100.0 / max_bucket_users) if max_bucket_users else 0.0
+        histogram_rows.append(
+            "<div class='hist-row'>"
+            f"<div class='hist-label'>{html.escape(str(bucket.get('label') or ''))}</div>"
+            "<div class='hist-track'>"
+            f"<span style='width:{width:.2f}%'></span>"
+            "</div>"
+            f"<div class='hist-value'>{users} 人 · {percent:.1f}%</div>"
+            "</div>"
+        )
+    histogram_summary = (
+        f"样本 {histogram_total} 人 · "
+        f"中位数 {_fmt_duration_sec(histogram.get('median_sec'))} · "
+        f"均值 {_fmt_duration_sec(histogram.get('mean_sec'))} · "
+        f"P90 {_fmt_duration_sec(histogram.get('p90_sec'))} · "
+        f"最大值 {_fmt_duration_sec(histogram.get('max_sec'))}"
+    )
     metrics = "".join([
         _render_metric("latest DAU", summary["latest_dau"]),
         _render_metric("latest day", summary.get("latest_day") or "n/a"),
@@ -2344,6 +2463,13 @@ def _render_data_track_dau_page(payload: dict) -> str:
     .viewbar,.toolbar {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0 18px; }}
     .sort-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
     .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
+    .histogram {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; }}
+    .hist-row {{ display:grid; grid-template-columns:72px minmax(120px,1fr) 110px; gap:10px; align-items:center; margin:9px 0; }}
+    .hist-label {{ color:var(--muted); font-size:12px; text-align:right; }}
+    .hist-track {{ height:18px; background:#f0e6dd; border-radius:4px; overflow:hidden; }}
+    .hist-track span {{ display:block; height:100%; background:var(--accent); border-radius:4px; min-width:0; }}
+    .hist-value {{ font-variant-numeric:tabular-nums; font-size:12px; }}
+    .hist-summary {{ color:var(--muted); font-size:12px; margin-top:12px; }}
     table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
     th,td {{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }}
     th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }}
@@ -2358,6 +2484,12 @@ def _render_data_track_dau_page(payload: dict) -> str:
   <div class="muted">Showing {html.escape(str(summary["days_returned"]))} active days. Since {html.escape(str(filters.get("since") or "all time"))}; days limit {html.escape(str(filters.get("days") or 30))}.</div>
   {_render_data_track_view_nav("dau")}
   <section class="metrics">{metrics}</section>
+  <h2>使用时长分布 · {html.escape(histogram_day or "n/a")}</h2>
+  <div class="toolbar">{''.join(histogram_days)}</div>
+  <section class="histogram">
+    {''.join(histogram_rows) if histogram_rows else "<div class='muted'>这一天没有 app_session_end 上报。</div>"}
+    <div class="hist-summary">{html.escape(histogram_summary)}</div>
+  </section>
   <h2>Daily Active Users</h2>
   <div style="background:#fff8ef;border:1px solid #e8d8be;border-radius:8px;padding:12px 14px;margin:10px 0;font-size:13px;line-height:1.7;color:#5a4d3c">
     <b>⚠️ 历史数据偏少 · 已知问题</b><br>
@@ -2371,6 +2503,7 @@ def _render_data_track_dau_page(payload: dict) -> str:
     <thead><tr><th>Beijing day</th><th>状态</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>使用DAU</th><th>人均日使用时长</th><th>中位数日使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='13' class='muted'>No DAU activity in this range.</td></tr>"}</tbody>
   </table>
+  <div class="muted" style="margin-top:12px">使用时长分布口径：先汇总每位用户在所选北京日的全部 app_session_end duration_sec，再按固定右开区间分桶。样本=当天有上报的 {histogram_total} 位用户；没打开 App 或没有 app_session_end 上报的用户不计入，也不会补 0。</div>
 </main>
 </body>
 </html>"""
@@ -3649,6 +3782,9 @@ def _render_user_detail_page(user: dict) -> str:
     <div class="card"><div class="value">{user['memory']['total']}</div><div class="label">memories</div></div>
     <div class="card"><div class="value">{html.escape(user.get('genesis', {}).get('status') or 'none')}</div><div class="label">genesis distill</div></div>
     <div class="card"><div class="value">{user['proactive']['proactive_messages']}</div><div class="label">proactive writes</div></div>
+    <div class="card"><div class="value">{html.escape(user.get('provider_state') or 'ok')}</div><div class="label">provider state</div></div>
+    <div class="card"><div class="value">{html.escape(_bj_iso(user.get('last_provider_success_at')) or 'never')}</div><div class="label">last provider success</div></div>
+    <div class="card"><div class="value">{html.escape(user.get('last_provider_error_class') or 'none')}</div><div class="label">latest provider error</div></div>
   </section>
   {_render_perception_permissions(user)}
   {_render_perception_freshness(user)}

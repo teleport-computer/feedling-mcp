@@ -192,7 +192,7 @@ runner 侧的 serve-worker 完全一致。
 | Provider | Phala Cloud dstack on prod9 (`dstack-pha-prod9.phala.network`, node id `18`). **Account: `amiller-user` (amiller-users-projects)** since the 2026-07-01 account move — see below. |
 | CVM ID | `5bfa1543-c5b4-42ca-842d-fd88984e5edf` (also in `deploy/test-cvm-id.txt`) |
 | App ID | `173c7f49aeb54acb424676b17b17f78e5e2b2938` |
-| Created | 2026-07-01 as `feedling-io-test`, instance `tdx.small`, **Phala KMS** (prod9 chain-0). Account migration (path B): the old test CVM `19b13ebe-d12e-4d19-97d1-6cf41389b663` / app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` under `sxysun` was abandoned (balance exhausted 2026-06-18). Fresh app_id → new `enclave_content_pk`, so the reused test RDS was wiped of undecryptable rows. iOS test build repointed to the new app_id. Bootstrapped via the one-shot `.github/workflows/bootstrap-test-cvm.yml` (push to `bootstrap-cvm` branch). CI deploy key is now `TEST_PHALA_CLOUD_API_KEY` (separate from prod's `PHALA_CLOUD_API_KEY`). |
+| Created | 2026-07-01 as `feedling-io-test`, instance `tdx.small`, **Phala KMS** (prod9 chain-0). Account migration (path B): the old test CVM `19b13ebe-d12e-4d19-97d1-6cf41389b663` / app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` under `sxysun` was abandoned (balance exhausted 2026-06-18). Fresh app_id → new `enclave_content_pk`, so the reused test RDS was wiped of undecryptable rows. iOS test build repointed to the new app_id. Bootstrapped via the one-shot `.github/workflows/bootstrap-test-cvm.yml` (push to `bootstrap-cvm` branch; workflow since removed). CI deploy key is now `TEST_PHALA_CLOUD_API_KEY` (separate from prod's `PHALA_CLOUD_API_KEY`). |
 | Compose | `deploy/docker-compose.phala.test.yaml` — same 3 services as prod (`ingress`/`backend`/`enclave`), with test domains + `_test` volumes |
 | Public API | `https://test-api.feedling.app` (via dstack-ingress — live, `/healthz` 200) |
 | Public MCP | 已下线（FastMCP 服务器 2026-06-12 移除） |
@@ -482,7 +482,7 @@ via the normal `POST /v1/users/register` flow from iOS.
 | App ID | `051a174f2457a6c474680a5d745372398f97b6ad` |
 | VM UUID | `4386636e-1325-4b92-99d8-f2ca00befdb4` |
 | Compose | `deploy/docker-compose.phala.yaml` @ commit `f53cbbd` |
-| Image | `ghcr.io/account-link/feedling:169cb6a` — adds ACME-DNS-01 client in `backend/acme_dns01.py`, CF API token env injection via Phala's encrypted channel, `/tls` dir pre-created with feedling ownership so the LE cert cache is writable |
+| Image | `ghcr.io/account-link/feedling:169cb6a` — adds ACME-DNS-01 client in `backend/acme_dns01.py` (file since deleted 2026-06-12 with the mcp removal), CF API token env injection via Phala's encrypted channel, `/tls` dir pre-created with feedling ownership so the LE cert cache is writable |
 | Compose hash | `0x23a2c2869567d15220383e4acb5ceb5cf27d78e087d2d4e357e4b3c053a5dc68` |
 | TLS cert fingerprint (attestation port 5003) | `5698f0ade4bb412d6b0847a62d695138f3bbd287dc7d1dbdeb67b15dc445e5ef` — unchanged across SEVEN compose rotations. dstack-KMS per-app derivation is still load-bearing stable. |
 | MCP TLS pubkey fingerprint (port 5002) | `e98665a3e94ac90a0a26453a73e16d5a569f791c181cfbc6ba98598f358cf63e` — sha256(SubjectPublicKeyInfo DER) of the LE cert's pubkey. Derived from dstack-KMS at path `feedling-mcp-tls-v1`, so the pubkey is stable across LE cert renewals (the cert changes every 90 days, the key doesn't). |
@@ -505,7 +505,7 @@ from the single CVM described in **Production CVM (prod9, current)** above.
 | Name | `feedling-enclave-v2` (new CVM → new app_id → new on-chain authorization required). |
 | App ID | `9798850e096d770293c67305c6cfdceed68c1d28` |
 | CVM ID | `0711c9a4-afdc-40c6-ba49-d8cb95f7e850` |
-| Compose | `deploy/docker-compose.phala.yaml` — now 4 services: `ingress` (dstack-ingress 2.2 multi-domain, HAProxy-based), `enclave` (decrypt + attestation, own TLS on :5003), `backend` (Flask HTTP + WS ingest), `mcp` (FastMCP SSE, plain HTTP behind ingress). |
+| Compose | `deploy/docker-compose.phala.yaml` — at the Phase-E writeup, 4 services: `ingress` (dstack-ingress 2.2 multi-domain, HAProxy-based), `enclave` (decrypt + attestation, own TLS on :5003), `backend` (Flask HTTP + WS ingest), `mcp` (FastMCP SSE, plain HTTP behind ingress). ⚠️ **Historical snapshot** — `mcp` was removed 2026-06-12 and `backend` is FastAPI/ASGI since 2026-07; see **Production CVM (prod9, current)** above for the live service set. |
 | Compose_hash at Phase-E writeup | `0xf09f1ddc41a5fc1b5ee434f1a7beafbefba880b93bcad33582ac64ad5f14bc09` (from `/attestation`, 2026-05-18; build `b1e72a6`). ⚠️ **Historical — this is the value as of the Phase E writeup, NOT current.** Live prod9 is now compose `0x0f136ba9…` / build `22b0ed6` (2026-07-02) — see the **Production CVM (prod9, current)** table at the top of this file for the live values. |
 | TLS termination | **Migrated**: mcp.feedling.app + api.feedling.app are terminated by `dstack-ingress` inside the CVM (LE certs issued via CF DNS-01, `CLOUDFLARE_API_TOKEN` injected via `phala deploy -e`, not in compose_hash). `enclave` service still terminates its own TLS on :5003 (reached via `-5003s.` passthrough) — iOS audit card Row 7 still pins `sha256(cert.DER)` to REPORT_DATA. WS ingest on :9998 stays gateway-TLS with FrameEnvelope v1 app-layer crypto. |
 | MCP pubkey pin (Phase C.2) | **Retired**: `FEEDLING_MCP_TLS_IN_ENCLAVE=false` on the enclave service, so `mcp_tls_cert_pubkey_fingerprint_hex` is empty. iOS audit card shows the existing "Pre-Phase-C.2 deployment" disclosure row. Content-layer envelope crypto (enclave_content_pk) remains the real trust boundary for reads/writes. |
@@ -616,3 +616,146 @@ CVM 磁盘创建时定死、事后扩容麻烦，故按「未来可能指向 pro
 
 （RDS 实例分配磁盘无法从本地 aws cli 查——RDS 在另一 AWS 账号下，当前 IAM 用户
 无权 describe。sizing 以上述实测逻辑数据量为准，不依赖 RDS 分配值。）
+
+
+## TEE Redis（test + pre + prod）
+
+**接入方看这里**：`docs/REDIS_USAGE.md`（连接池 `backend/redis_pool.py` +
+使用规范：`IO:` 前缀命名、强制 TTL、read-through）。本章节只讲开通/运维。
+（早期设计 spec/plan 建成后已删，架构取舍见 `docs/REDIS_USAGE.md` §0-1 与
+`docs/CHANGELOG.md` 的 07-24 / 07-25 条目。）
+
+**当前状态**：三台 CVM 已开通、running，冒烟 ALL GREEN，**零业务流量**
+（没有任何业务代码引用 Redis，接入各自另开 spec）。CVM id 已写进
+`deploy/*-redis-cvm-id.txt`，日常更新走 `redis-deploy.yml`。
+
+**⚠️ 无离线备份是刻意的设计，不是遗漏。** Redis 在本架构里是**纯临时层**：
+缓存、队列/唤醒总线、分布式锁——三类用途的数据全部可从 Postgres 重建
+（**PG 始终是权威源**）。而且恢复一份旧快照对锁/队列**有害**：会复活早已
+释放的锁、早已消费的队列项。所以：不推 R2、不做 age 加密、不托管备份密钥、
+没有 restore 演练。CVM 内保留 **AOF**（`appendonly yes`），仅用于**软重启不掉
+数据**；数据整卷丢失时，正确处置就是让 Redis 空启动、从 PG 自然回暖。
+
+| | test | pre | prod |
+|---|---|---|---|
+| CVM 名 | `feedling-redis-test` | `feedling-redis-pre` | `feedling-redis-prod` |
+| CVM id | `169fc911-…` | `819f646f-…` | `8ebbbddb-…` |
+| Phala 账号 | `amiller-user` | `amiller-user` | **`sxysun`** |
+| 节点 | prod9（node-id **18**） | prod9（18） | prod9（18） |
+| 规格 | 1 vCPU / 2 GB / 20 GB | 1 vCPU / 2 GB / 20 GB | 2 vCPU / 4 GB / 30 GB |
+| `maxmemory` | 1 GB | 1 GB | 2560 MB |
+| Phala API key secret | `TEST_PHALA_CLOUD_API_KEY` | `TEST_PHALA_CLOUD_API_KEY` | `PHALA_CLOUD_API_KEY` |
+| 机密 secret 前缀 | `TEST_REDIS_*` | `PRE_REDIS_*` | `PROD_REDIS_*` |
+| 身份模型 | `--kms phala`（无链上 AppAuth） | 同左 | 同左 |
+| 部署分支 | `test` | `pre` | `main` |
+| 离线备份 | 无（刻意） | 无 | 无 |
+| 监控 | 不监控（数据可弃） | ✅ 持久化+内存 | ✅ 持久化+内存 |
+
+每环境需要的 GitHub secret：`<PREFIX>_REDIS_PASSWORD`、
+`<PREFIX>_REDIS_TLS_CERT_B64`、`<PREFIX>_REDIS_TLS_KEY_B64`
+（`redis-deploy.yml` 用）。监控用的 `<PREFIX>_REDIS_HOST`、
+`<PREFIX>_REDIS_CA_B64` 另加（prod/pre 才需要，test 不监控）。
+**不再需要任何 R2 / age 备份相关 secret。**
+
+### 首次开通 / 重新开通 runbook（每环境各跑一遍，不走 workflow）
+
+> `redis-deploy.yml`（日常部署）负责构建/推送 redis 镜像、把 `REPLACE_SHA`
+> 换成真实 tag、再 `phala deploy --cvm-id <既有id>` 原地更新——但它读
+> `deploy/<env>-redis-cvm-id.txt` 校验 cvm-id 非空后才敢跑（fail-closed，
+> 绝不静默新建 CVM）。首次开通时该文件还是纯注释，所以下面第 4/5 步手动
+> 把 workflow 做的事各做一遍。
+
+1. **切 Phala profile**：test/pre 用 miller 的；**prod 必须先切到 `sxysuns`
+   profile**（最容易忘的一步）。`phala switch "$PROFILE"`。
+2. `deploy/redis/gen-certs.sh feedling-redis-<env> <outdir>` 生成 TLS 材料。
+   **`ca.key` 立即移到离线冷存**，`server.crt`/`server.key` 走 base64 填进
+   `<PREFIX>_REDIS_TLS_CERT_B64` / `<PREFIX>_REDIS_TLS_KEY_B64`（脚本会打印
+   可直接粘贴的值）。重跑前若输出目录已有 `ca.key`，脚本拒绝覆盖（刻意）。
+3. 口令：`openssl rand -hex 32` → `<PREFIX>_REDIS_PASSWORD`。**必须十六进制**：
+   引号 / `$` / 反引号会破坏 compose env 注入。
+4. **构建 + 推送镜像，把真实 tag 钉进 compose**：
+   ```bash
+   IMG_TAG="$(git rev-parse HEAD)"
+   # ⚠️ CVM 是 amd64，本机若是 arm64（Apple Silicon）必须显式指定平台，
+   #    否则推上去的镜像 CVM 拉下来起不来。
+   docker build --platform linux/amd64 \
+     -f deploy/redis/Dockerfile -t "ghcr.io/teleport-computer/feedling-redis:${IMG_TAG}" deploy
+   GH_USER="填入你的 GitHub 用户名"
+   docker login ghcr.io -u "$GH_USER"
+   docker push "ghcr.io/teleport-computer/feedling-redis:${IMG_TAG}"
+
+   ENV_NAME=test   # 换成 pre / prod
+   sed -e "s|feedling-redis:REPLACE_SHA|feedling-redis:${IMG_TAG}|" \
+       deploy/docker-compose.phala.redis.yaml > "compose.redis-${ENV_NAME}.yaml"
+   ```
+   （`compose.redis-<env>.yaml` 是本地工作文件，不提交；仓库里的 compose
+   继续留 `REPLACE_SHA`，日常更新交给 workflow 自己 sed。）
+
+   **⚠️ GHCR 包必须 public**：dstack CVM 匿名拉镜像，包是 private 会
+   `unauthorized`。首次推送后到 GitHub Packages 把 `feedling-redis` 设为
+   public，且**有分钟级传播延迟**——用匿名 `curl` 拉一次 manifest 确认
+   HTTP 200 再往下部署，别等 CVM 拉失败才发现。
+
+5. **建 CVM + 首次部署**（`phala deploy` 不带 `--cvm-id` 即为新建；`--kms
+   phala` 按部署账号授权，redis CVM **不需要链上 AppAuth**，见
+   `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md` §0——**切勿复用主 app 的
+   AppAuth 合约**，会翻掉主 enclave 的钥，见本文件「新建 runner CVM 换掉
+   主 enclave 钥」条目）：
+   ```bash
+   # ⚠️ --node-id 18：feedling 的 gateway passthrough 基础设施只在 prod9
+   #    的 node 18 上配好了。落到别的节点（如 prod7 = node 12）CVM 能起、
+   #    但 <app-id>-6379s 的 gateway 路由不通，冒烟恒 SSL eof。
+   phala deploy --name "feedling-redis-${ENV_NAME}" --compose "compose.redis-${ENV_NAME}.yaml" \
+     --kms phala --node-id 18 --instance-type tdx.small --disk-size 20G \
+     -e "REDIS_PASSWORD=<第 3 步口令>" \
+     -e "REDIS_TLS_CERT_B64=<第 2 步值>" \
+     -e "REDIS_TLS_KEY_B64=<第 2 步值>" \
+     -e "REDIS_MAXMEMORY=1gb"
+   # prod 换成 --instance-type tdx.medium --disk-size 30G、REDIS_MAXMEMORY=2560mb。
+   # 记下输出里的 CVM ID 与 App ID。
+   ```
+   **⚠️ 本地 `phala deploy` 不要加 `--wait`**（会挂在轮询上）；部署后 CVM 可能
+   停在 `stopped`（dstack 首建的怪癖）——`phala cvms start <id>` 手动拉起。
+   **gateway 注册有 ~30 分钟延迟**：CVM running 后 `<app-id>-6379s` 的路由不会
+   立刻通，冒烟先 eof 属正常，等一会再试。
+
+6. 把 `cvm_id` 写进 `deploy/<env>-redis-cvm-id.txt` 并提交（之后 workflow
+   的日常更新才认得到这台 CVM）。
+7. 冒烟：
+   ```bash
+   APP_ID="填入本环境 app_id"
+   REDIS_HOST="${APP_ID}-6379s.dstack-pha-prod9.phala.network"
+   read -rs REDIS_PW
+   REDIS_CA_FILE=./ca.crt REDISCLI_AUTH="$REDIS_PW" \
+     ./deploy/verify-redis.sh "$REDIS_HOST" 443
+   ```
+   期望最后一行 `[verify] ALL GREEN`。
+   **⚠️ 客户端必须发 SNI**：gateway passthrough 靠 TLS ClientHello 的 SNI
+   路由到后端 CVM。`redis-cli --tls` 默认不发 SNI，gateway 找不到后端、握手时
+   直接关连接，看到的是 `unexpected eof`。`verify-redis.sh` 与 `redis-monitor.yml`
+   都已带 `--sni <完整 gateway 主机名>`；任何将来的应用客户端连这个 gateway
+   也必须发 SNI。
+8. 把 `<app-id>-6379s.…` 主机名填进 `<PREFIX>_REDIS_HOST`、`ca.crt` 的
+   base64 填进 `<PREFIX>_REDIS_CA_B64`（`redis-monitor` 要用；prod/pre 才需要）。
+9. 手动触发一次 `redis-monitor` workflow，确认全绿。
+
+### 恢复（无离线备份 → 从 PG 回暖）
+
+Redis 整卷丢失 / 实例报废时**没有快照可 restore**，也不需要。正确处置：
+
+- **软重启 / 容器重建**：卷还在 → AOF 自动加载，数据不掉，无需干预。
+- **整卷丢失 / 换 CVM**：Redis 空启动即可，让上层从 PG 重新填缓存 / 重放
+  队列（PG 是权威源）。首次回暖会有一段 PG 读压上升，零流量期无影响；
+  将来接入时每个 spec 的前置条件里都写明「Redis 冷启动可容忍」。
+
+绝不要试图「保留旧 RDB 再挂回去」——对锁/队列会复活陈旧状态，是 bug 不是恢复。
+
+### 已知限制
+
+- **Redis 端口在公网可达**。dstack CVM 之间没有私网，跨 CVM 只能走 gateway
+  passthrough `<app-id>-6379s.…:443`，只靠 TLS + AUTH 保护（同 TEE Postgres）。
+- **`CONFIG` 命令被禁用**：查容量只能 `INFO memory`，不能 `CONFIG GET`。
+- **单实例无 HA、无离线备份**：实例故障 = Redis 数据清零，靠从 PG 回暖（见上）。
+  这是刻意取舍：Redis 不持有任何权威数据。
+- **prod 账号余额**：test 的老 CVM 就是在 `sxysun` 账号下余额耗尽被废弃
+  （2026-06-18）。多一台 CVM 多一份烧钱速率。

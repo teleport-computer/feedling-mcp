@@ -1131,3 +1131,168 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
     )) == "completed"
     assert calls_after
     assert cursor.load_seq(core_store.get_store(uid)) == seq5
+
+
+def test_recovery_drained_reply_is_not_pushed(monkeypatch):
+    """上个进程崩溃遗留的 effect 由回合开头的 recovery drain 落库 —— 它不经
+    `_on_reply`，没有明文也不写槽位，所以不推送。消息照常落库。"""
+    uid = "u_atomic_reply_push_recovery"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    db.chat_append_strict(
+        uid, "user-message", 100.0,
+        {"id": "user-message", "role": "user", "ts": 100.0,
+         "body_ct": "u", "nonce": "n", "K_user": "k", "K_enclave": "e"},
+        5000,
+    )
+    input_seq = db.chat_messages_after_seq(uid, 0, limit=None)[0]["seq"]
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("push-recovery-worker")
+    generation = db.get_runtime_generation(uid)
+    effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type="reply",
+        ordinal=0,
+        expected_generation=generation,
+        payload={
+            "envelope": _envelope("b" * 32, body="reply-ciphertext"),
+            "reply_through_seq": input_seq,
+            effect_outbox.FINAL_REPLY_FENCE_KEY: {
+                "claimed_by": "push-recovery-worker",
+                "input_generation": 0,
+                "through_seq": input_seq,
+            },
+        },
+    )
+
+    async def _provider(*args, **kwargs):
+        raise AssertionError("recovery must drain the pending reply before model work")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+
+    def _read_after_seq(_uid: str, after_seq: int):
+        if after_seq >= input_seq:
+            return []
+        return [{"id": "user-message", "seq": input_seq, "ts": 100.0,
+                 "role": "user", "content": "hello"}]
+
+    pushes = []
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        read_messages_after_seq=_read_after_seq,
+        resolve_provider=lambda _uid: (None, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+        send_reply_push=lambda uid, **kw: pushes.append((uid, kw)),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_TEST_PROVIDER_CONFIG,
+        api_key=None, runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert pushes == []
+    store = core_store.get_store(uid)
+    store.reload()
+    replies = [m for m in store.chat_messages if m.get("role") == "openclaw"]
+    assert len(replies) == 1
+
+
+def test_push_transport_failure_does_not_fail_the_turn(monkeypatch):
+    """推送实现抛异常 —— 回合仍然 completed，回复仍然在库里，且推送确实被调用过。
+
+    走的是正常投递路径（provider 真跑一轮 -> `_on_reply` 的 `status=="applied"`
+    分支写 `push_slot` -> `finally` 里真的调用 `deps.send_reply_push`），不是
+    recovery-drain：后者在到达 `_on_reply` 之前就已经 `return "completed"`，
+    `push_slot` 永远是 `None`，`_boom` 根本不会被调用（见本文件同名测试上一版
+    的复核发现——即使把 `finally` 里保护推送的 try/except 整段删掉也依然全绿，
+    没有判别力）。
+    """
+    uid = "u_atomic_reply_push_boom"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    db.chat_append_strict(
+        uid, "user-message", 100.0,
+        {"id": "user-message", "role": "user", "ts": 100.0,
+         "body_ct": "u", "nonce": "n", "K_user": "k", "K_enclave": "e"},
+        5000,
+    )
+    input_seq = db.chat_messages_after_seq(uid, 0, limit=None)[0]["seq"]
+
+    # Real production sink (serve_worker._apply_pending_effects_for_user) needs
+    # a real-shaped envelope with an "id" out of the enclave round-trip; stub
+    # only that boundary (same technique as
+    # test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once
+    # above), so the reply effect's payload actually carries "envelope"/"id"
+    # and _on_reply's push_slot write hits the real code path, not a mock gap.
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda _store, _text, *, item_id=None: (_envelope(str(item_id)), ""),
+    )
+
+    # Deliberately longer than the push body's 240-char cap (see `_on_reply`'s
+    # `text[:240]` truncation), so the body assertion below can't pass on a
+    # copy-paste bug that pushes the full untruncated text.
+    reply_text = "answered-boom-" + ("x" * 300)
+    assert len(reply_text) > 240
+
+    async def _provider(config, messages, *, tools=None):
+        return {"reply": reply_text, "tool_calls": [], "usage": {}}
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
+
+    def _read_after_seq(_uid: str, after_seq: int):
+        if after_seq >= input_seq:
+            return []
+        return [{"id": "user-message", "seq": input_seq, "ts": 100.0,
+                 "role": "user", "content": "hello"}]
+
+    boom_calls = []
+
+    def _boom(_uid, **kw):
+        boom_calls.append((_uid, kw))
+        raise RuntimeError("apns down")
+
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        read_messages_after_seq=_read_after_seq,
+        resolve_provider=lambda _uid: (None, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+        send_reply_push=_boom,
+    )
+
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("push-boom-worker")
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_TEST_PROVIDER_CONFIG,
+        api_key=None, runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    assert boom_calls, "send_reply_push must be invoked on the normal delivery path"
+    store = core_store.get_store(uid)
+    store.reload()
+    replies = [m for m in store.chat_messages if m.get("role") == "openclaw"]
+    assert replies
+
+    # Parameter assertions (review Minor #2): the earlier version of this test
+    # only checked that `send_reply_push` was *called*, which would not have
+    # caught a copy-paste bug (e.g. the wake-lane block's `is_wake` literal
+    # being copied as `False`) — it must also carry the right msg_id/body/
+    # is_wake for the chat lane.
+    _, kw = boom_calls[0]
+    assert kw["msg_id"] == replies[0]["id"], (
+        "pushed msg_id must be the envelope id of the row that was actually "
+        "persisted, not some other identifier"
+    )
+    assert kw["body"] == reply_text[:240]
+    assert len(kw["body"]) == 240
+    assert kw["is_wake"] is False
+    assert kw["lane"] == "", "chat lane must never claim a wake lane name"

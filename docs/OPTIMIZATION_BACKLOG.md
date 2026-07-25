@@ -60,11 +60,12 @@
 - **结果**：`memory_replace_all` 改为选择性 reconcile——只删被移除的行、
   只 upsert doc 变化的行，单卡编辑不再重写整个 garden（full-replace 语义保留）。
 
-### #5 屏幕帧存 PG JSONB ⬜ P2 · 中期
+### #5 屏幕帧存 PG JSONB ✅ 已完成（帧正文已迁 R2）
 
-- **现状**：`frame_envelopes` 单行可 >150KB，走 TOAST，DB 膨胀快、备份重。
-- **方向**：密文模型下对象存储是安全的（内容本来就是密文），DB 只存
-  元数据 + 指针。
+- **结果**：帧正文进对象存储（R2），DB 只存元数据 + `body_key` 指针
+  （alembic `0007_frame_body_to_r2` + `backend/object_storage.py`；存量
+  由 `backend/backfill_frames_to_r2.py` 离线迁移，迁后 `doc = NULL`）。
+  密文模型下对象存储安全（内容本来就是密文）。
 
 ### #6 app.py 巨石化 ✅ 已完成（2026-06-12）
 
@@ -139,6 +140,9 @@ verify 回包 gate 竞态等三层修复曾处于"已修未部署"状态，确�
   自然被跳过；跨 worker 的 `try_consume_pending_for_user` 也是 cache-only
   查找（`_stores.get`，不加载）。回归测试见
   `tests/test_hosted_wake_distribution.py`。
+- **后记（2026-07-25）**：hosted tick / hosted wake driver 这条线后来整体
+  退役（2bdcc809 移除），上述回归测试与 `_hosted_keyholder_user_ids` 已
+  不在仓内；本条目仅存为历史记录。
 
 ### #15 「生产已死、仅测试供养」符号分诊清单 ⬜ P3 · 需领域判断
 
@@ -183,3 +187,16 @@ verify 回包 gate 竞态等三层修复曾处于"已修未部署"状态，确�
 
 复现扫描：对 backend 顶层符号统计 prod-corpus 与 test-corpus whole-word
 引用数，prod≤1 且 test≥1 即候选（`asgi_test_client.py` 计入 test 侧）。
+
+- **2026-07-25 第四轮清理补充**（db.py 专项扫描；全死的
+  `try_stamp_hosted_tick`/`genesis_latest_done_job` 已当轮删除）：新增仅
+  测试供养、待领域裁定的候选——`db.effect_mark`（effect 生命周期已走
+  effect_sink_claim/complete/release）、`db.frame_prune_to`、
+  `db.delete_blob`（疑对称 API 刻意保留）、
+  `db.list_hosted_runtime_eligible_user_ids`（controls 变体的瘦包装）、
+  `tools/chat_resident_consumer._codex_reply_from_stream`（thin wrapper，
+  两个测试断言供养）；`hosted/config_store.set_last_runtime_error`
+  （第五轮发现：V2 worker/reaper 实际走 jobs_store 直写 SQL，此包装仅
+  测试调用，docstring 的幻影调用方声明已当轮修正）。**oracle 判保留**：`db.chat_newest_ts`
+  （selfheal_blocked_by_nonempty_page 用它断言 raw-max-ts 一致性；其在
+  fail-open 测试里的僵尸 monkeypatch 已当轮修正为 chat_count_since）。

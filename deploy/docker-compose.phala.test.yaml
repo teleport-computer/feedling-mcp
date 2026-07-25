@@ -87,7 +87,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:c9ab3a1
+    image: ghcr.io/teleport-computer/feedling:0ca5bf9
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -146,7 +146,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:c9ab3a1
+    image: ghcr.io/teleport-computer/feedling:0ca5bf9
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -249,15 +249,13 @@ services:
       # channel, NOT baked into compose_hash). Empty default keeps dev
       # deploys + CI compose-build healthy — code falls through to
       # "logged_only" mode when unset. KEY_ID + TEAM_ID are also overridable
-      # but default to the Apple dev team's ids in backend/app.py.
+      # but default to the Apple dev team's ids in backend/push/apns.py.
       APNS_KEY_P8_B64: "${APNS_KEY_P8_B64:-}"
       APNS_KEY_ID: "${APNS_KEY_ID:-}"
       APNS_TEAM_ID: "${APNS_TEAM_ID:-}"
-      # Optional LLM Gate for proactive screen outreach. If unset, automatic
-      # Gate records model_not_configured and does not enqueue hidden jobs.
+      # Optional: proactive admin dashboard's debug translation
+      # (backend/proactive/dashboard.py). Unset = translation disabled.
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
-      FEEDLING_PROACTIVE_GATE_PROVIDER: "${FEEDLING_PROACTIVE_GATE_PROVIDER:-openrouter}"
-      FEEDLING_PROACTIVE_GATE_MODEL: "${FEEDLING_PROACTIVE_GATE_MODEL:-google/gemini-3.1-flash-lite}"
       # TEST-ONLY: keep the shared runtime V2 baseline aligned with prod for
       # perception ingress, resident chat, screen caption, and hosted chat.
       # Proactive wake is native-only after P2-2b and no longer uses this flag.
@@ -310,7 +308,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:c9ab3a1
+    image: ghcr.io/teleport-computer/feedling:0ca5bf9
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
