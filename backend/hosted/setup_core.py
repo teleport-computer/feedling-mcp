@@ -1165,11 +1165,24 @@ def _catalog_status_for_slug(slug: str) -> int:
 def model_api_models(store, payload: dict, *, caller_api_key: str | None) -> tuple[dict, int]:
     provider = str(payload.get("provider") or "")
     base_url = str(payload.get("base_url") or "")
-    raw_key = str(payload.get("api_key") or "").strip()
-    credential_id = str(payload.get("credential_id") or "").strip()
-    if bool(raw_key) == bool(credential_id):
+    # Strict XOR matching the published OpenAPI oneOf (ModelApiModelsRequest):
+    # exactly ONE of api_key / credential_id must be PRESENT in the payload, and
+    # whichever is present must be a non-empty string. An explicit null, an empty
+    # string, or supplying both is a malformed request — this keeps the runtime
+    # byte-for-byte with the schema (a presence-only-or-null contract drifted).
+    key_present = "api_key" in payload
+    cred_present = "credential_id" in payload
+    if key_present == cred_present:
         return {"error": "api_key_or_credential_id_required",
                 "detail": "supply exactly one of api_key / credential_id"}, 400
+    raw_key = str(payload.get("api_key") or "").strip()
+    credential_id = str(payload.get("credential_id") or "").strip()
+    if key_present and not raw_key:
+        return {"error": "api_key_or_credential_id_required",
+                "detail": "api_key must be a non-empty string"}, 400
+    if cred_present and not credential_id:
+        return {"error": "api_key_or_credential_id_required",
+                "detail": "credential_id must be a non-empty string"}, 400
 
     if credential_id:
         cred = db.model_api_credential_get(store.user_id, credential_id)

@@ -341,6 +341,14 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         ),
         "required": ["provider"],
         "additionalProperties": True,
+        # Strict XOR that matches the runtime (setup_core.model_api_models):
+        # exactly one of api_key / credential_id must be PRESENT and non-empty.
+        # `oneOf` on `required` gives "exactly one present"; `minLength: 1` on the
+        # value gives "non-empty"; dropping OpenAPI-3.0 `nullable` forbids an
+        # explicit null (this document is 3.1.0, where null is a JSON-Schema type,
+        # not a `nullable` flag). So {"api_key":"k","credential_id":null} — which
+        # a presence-only oneOf + nullable used to accept while the runtime
+        # rejected it — is now invalid on BOTH sides.
         "oneOf": [
             {"required": ["api_key"]},
             {"required": ["credential_id"]},
@@ -369,12 +377,12 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "api_key": {
                 "type": "string",
                 "writeOnly": True,
-                "nullable": True,
+                "minLength": 1,
                 "description": "Fresh provider key. Mutually exclusive with `credential_id`.",
             },
             "credential_id": {
                 "type": "string",
-                "nullable": True,
+                "minLength": 1,
                 "description": "Stored credential id. Mutually exclusive with `api_key`.",
             },
         },

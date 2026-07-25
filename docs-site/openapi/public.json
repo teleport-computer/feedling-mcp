@@ -7535,12 +7535,12 @@
           "api_key": {
             "type": "string",
             "writeOnly": true,
-            "nullable": true,
+            "minLength": 1,
             "description": "Fresh provider key. Mutually exclusive with `credential_id`."
           },
           "credential_id": {
             "type": "string",
-            "nullable": true,
+            "minLength": 1,
             "description": "Stored credential id. Mutually exclusive with `api_key`."
           }
         },
