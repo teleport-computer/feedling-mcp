@@ -382,7 +382,16 @@ def _resolve_relationship_anchor(days: int, *, trusted_frozen: str | None = None
     wrongly reject it → recompute from the replay day → anchor drifts one day
     forward. A verbatim return cannot drift. A future date, an unparseable
     string, an out-of-range ``days``, or no trusted value at all falls back to
-    ``_anchor_from_days(days)``."""
+    the day-count computation below.
+
+    1-BASED INPUT: ``days`` (relationship_days) is the USER-FACING day count —
+    the "第 N 天" the app shows, where the day you met is 第 1 天, not 第 0 天
+    (iOS adds +1 for display; this is the inverse on the way in). The card's
+    stored ``days_with_user`` stays ELAPSED (0 = met today), so 第 N 天 → elapsed
+    N-1. Only this recalibration input is 1-based; onboarding derives elapsed
+    from a date and is untouched. The frozen path is consistent — the producer
+    (worker._frozen_relationship_anchor) already froze ``_anchor_from_days(N-1)``,
+    so a verbatim frozen return and this fallback resolve to the same anchor."""
     if trusted_frozen:
         d = identity_service._parse_iso_calendar_date(trusted_frozen.strip())
         if d is not None:
@@ -390,7 +399,7 @@ def _resolve_relationship_anchor(days: int, *, trusted_frozen: str | None = None
             from identity import card_policy
             if d <= _date.today() and 0 <= int(days) <= card_policy.MAX_RELATIONSHIP_DAYS:
                 return d.isoformat()  # verbatim — cross-day replay cannot drift it
-    return identity_service._anchor_from_days(days)
+    return identity_service._anchor_from_days(max(0, int(days) - 1))
 
 
 def _create_identity_action_payload(

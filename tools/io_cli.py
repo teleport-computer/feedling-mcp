@@ -1467,9 +1467,10 @@ def main():
             "    只留给蒸馏任务专用通道,这条命令不提供整卡覆盖。\n"
             "  D4 改名成对: --agent-name 必须和 --self-introduction 同批给出(介绍不用\n"
             "    变就原样带回旧的),否则本地直接报错拦下,不会打到服务端。\n"
-            "  相处天数: --relationship-days N 重新校准 days_with_user(N 非负整数,0=今天\n"
-            "    刚认识)——用户明确要求改'相处/认识多少天'时用。days_with_user 是服务端从\n"
-            "    关系起始锚点现算的,这条把锚点挪到 today-N;负数/超上限本地或服务端拦下。\n"
+            "  相处天数: --relationship-days N 重新校准显示的相处天数。N 是【用户看到/说出的\n"
+            "    那个数】——app 里的\"第 N 天\"(认识当天=第 1 天,不是第 0 天)。用户说\"改成\n"
+            "    第45天/相处45天\"就传 45,app 就显示 45。服务端内部存 elapsed(=N-1)、iOS 显示\n"
+            "    时 +1,你只管传用户说的数。仅用户明确要求时改;超上限服务端拦下。\n"
             "  list 三操作: 每个 list 字段(signature/boundary/do-not-say/\n"
             "    stable-definition)一次调用只能用一种操作——legacy 整体赋值(仅\n"
             "    --signature 保留)/ --add-* / --remove-* / --replace-* 四选一,混用报错。\n"
@@ -1500,9 +1501,10 @@ def main():
     iw.add_argument("--relationship-anchor", dest="relationship_anchor", default=None,
                     help="关系锚点描述文本")
     iw.add_argument("--relationship-days", dest="relationship_days", type=int, default=None,
-                    help="重新校准和用户相处/认识的天数(非负整数,0=今天刚认识)。"
-                         "用户明确要求改'相处天数/在一起多久了'时用:服务端据此把关系"
-                         "起始日挪到 today-N,days_with_user 从该锚点现算。只在明确要求时改")
+                    help="重新校准显示的相处天数。传【用户看到/说出的那个数】——app 里的"
+                         "'第 N 天'(认识当天=第 1 天,不是第 0 天)。用户说'改成第45天/相处45天'"
+                         "就传 45,app 就显示 45(服务端内部存 elapsed=N-1、iOS 显示时 +1)。"
+                         "仅用户明确要求时改")
 
     iw.add_argument("--signature", action="append", default=[],
                     help="[legacy] 整体替换签名短语列表;repeatable;"
