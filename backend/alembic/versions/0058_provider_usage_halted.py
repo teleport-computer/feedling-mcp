@@ -1,4 +1,4 @@
-"""0057 provider usage kill switch: `provider_usage_halted` on the single-row
+"""0058 provider usage kill switch: `provider_usage_halted` on the single-row
 `v2_runtime_control` table.
 
 Default `false` = not halted = feature ON — same semantics as `turns_halted`
@@ -6,12 +6,12 @@ Default `false` = not halted = feature ON — same semantics as `turns_halted`
 rollback lever, not a feature gate. Flip it to `true` to stop provider-usage
 reporting without a redeploy if it misbehaves in production.
 
-Revision ID: 0057_provider_usage_halted
+Revision ID: 0058_provider_usage_halted
 """
 from alembic import op
 
-revision = "0057_provider_usage_halted"
-down_revision = "0056_agent_jobs_hb_idx"
+revision = "0058_provider_usage_halted"
+down_revision = "0057_provider_health"
 branch_labels = None
 depends_on = None
 
