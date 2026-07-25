@@ -5064,13 +5064,22 @@ async def _run_wake(
                     best_effort=True,
                 )
                 if status == "applied":
-                    # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。
+                    # 覆盖式：一个回合可能吐多条气泡，只有最后一条会成为推送。构建槽位
+                    # 本身也是 best-effort：payload 缺 "envelope"（例如未来出现的非
+                    # seq_native / 测试注入变体）不该把一个已经成功落库的回合打成
+                    # failed，只应跳过这一次推送。与 chat lane（process_job）的同一段
+                    # 完全同构。
                     nonlocal push_slot
-                    push_slot = {
-                        "msg_id": str(payload["envelope"]["id"]),
-                        "body": text[:240],
-                        "is_wake": True,
-                    }
+                    try:
+                        push_slot = {
+                            "msg_id": str(payload["envelope"]["id"]),
+                            "body": text[:240],
+                            "is_wake": True,
+                        }
+                    except Exception as e:  # noqa: BLE001 — 见上：绝不能影响回合结果
+                        log.warning(
+                            "[v2.worker] wake reply push slot build failed user=%s: %s",
+                            user_id, e)
                 if status == "applied":
                     if final:
                         source_status = await asyncio.to_thread(

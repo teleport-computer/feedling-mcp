@@ -1202,7 +1202,15 @@ def test_recovery_drained_reply_is_not_pushed(monkeypatch):
 
 
 def test_push_transport_failure_does_not_fail_the_turn(monkeypatch):
-    """推送实现抛异常 —— 回合仍然 completed，回复仍然在库里。"""
+    """推送实现抛异常 —— 回合仍然 completed，回复仍然在库里，且推送确实被调用过。
+
+    走的是正常投递路径（provider 真跑一轮 -> `_on_reply` 的 `status=="applied"`
+    分支写 `push_slot` -> `finally` 里真的调用 `deps.send_reply_push`），不是
+    recovery-drain：后者在到达 `_on_reply` 之前就已经 `return "completed"`，
+    `push_slot` 永远是 `None`，`_boom` 根本不会被调用（见本文件同名测试上一版
+    的复核发现——即使把 `finally` 里保护推送的 try/except 整段删掉也依然全绿，
+    没有判别力）。
+    """
     uid = "u_atomic_reply_push_boom"
     conftest.seed_user(uid)
     _reset(uid)
@@ -1214,28 +1222,21 @@ def test_push_transport_failure_does_not_fail_the_turn(monkeypatch):
         5000,
     )
     input_seq = db.chat_messages_after_seq(uid, 0, limit=None)[0]["seq"]
-    job_id, _ = jobs_store.enqueue_job(uid, "chat")
-    job = jobs_store.claim_next_job("push-boom-worker")
-    generation = db.get_runtime_generation(uid)
-    effect_outbox.enqueue_effect(
-        job_id=job_id,
-        user_id=uid,
-        effect_type="reply",
-        ordinal=0,
-        expected_generation=generation,
-        payload={
-            "envelope": _envelope("b" * 32, body="reply-ciphertext"),
-            "reply_through_seq": input_seq,
-            effect_outbox.FINAL_REPLY_FENCE_KEY: {
-                "claimed_by": "push-boom-worker",
-                "input_generation": 0,
-                "through_seq": input_seq,
-            },
-        },
+
+    # Real production sink (serve_worker._apply_pending_effects_for_user) needs
+    # a real-shaped envelope with an "id" out of the enclave round-trip; stub
+    # only that boundary (same technique as
+    # test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once
+    # above), so the reply effect's payload actually carries "envelope"/"id"
+    # and _on_reply's push_slot write hits the real code path, not a mock gap.
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda _store, _text, *, item_id=None: (_envelope(str(item_id)), ""),
     )
 
-    async def _provider(*args, **kwargs):
-        raise AssertionError("recovery must drain the pending reply before model work")
+    async def _provider(config, messages, *, tools=None):
+        return {"reply": "answered-boom", "tool_calls": [], "usage": {}}
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider)
 
@@ -1245,7 +1246,10 @@ def test_push_transport_failure_does_not_fail_the_turn(monkeypatch):
         return [{"id": "user-message", "seq": input_seq, "ts": 100.0,
                  "role": "user", "content": "hello"}]
 
-    def _boom(_uid, **_kw):
+    boom_calls = []
+
+    def _boom(_uid, **kw):
+        boom_calls.append((_uid, kw))
         raise RuntimeError("apns down")
 
     deps = worker.TurnDeps(
@@ -1257,12 +1261,16 @@ def test_push_transport_failure_does_not_fail_the_turn(monkeypatch):
         send_reply_push=_boom,
     )
 
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("push-boom-worker")
+
     status = asyncio.run(worker.process_job(
         job, deps, provider_config=_TEST_PROVIDER_CONFIG,
         api_key=None, runtime_token="rt",
     ))
 
     assert status == "completed"
+    assert boom_calls, "send_reply_push must be invoked on the normal delivery path"
     store = core_store.get_store(uid)
     store.reload()
     assert [m for m in store.chat_messages if m.get("role") == "openclaw"]
