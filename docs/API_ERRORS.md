@@ -79,6 +79,11 @@
 | `nothing_to_update` | 400 | — | PATCH /credentials 两者（label/api_key）都不给 | |
 | `invalid_reasoning_effort` | 400 | — | reasoning effort 取值非法（setup/patch 两处校验） | |
 | `model_api_config_delete_failed` | 500 | system | 删除 model_api 配置时 DB 写失败 | |
+| `model_catalog_auth_failed` | 400 | user_provider | `POST /models` 目录拉取：上游 401，provider key 被拒（本接口绝不透传 401，避免 iOS 误判登录失效） | ✅ |
+| `model_catalog_access_denied` | 400 | user_provider | 目录拉取上游 402/403/451：额度/权限/地区/项目限制，非「key 错」 | ✅ |
+| `model_catalog_rate_limited` | 429 | user_provider | 目录拉取上游 429 限流，保留输入可重试 | ✅ |
+| `model_catalog_temporarily_unavailable` | 503 | user_provider | 目录拉取上游超时/网络/408/425/所有 5xx，可重试 | ✅ |
+| `model_catalog_invalid_response` | 400 | user_provider | 目录拉取上游非 JSON/超限/坏 shape/其余 4xx（400/404/422 等），非鉴权问题 | ✅ |
 
 ## `GET /v1/model_api/usage`（provider 账单/额度查询）
 

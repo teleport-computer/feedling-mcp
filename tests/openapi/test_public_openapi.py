@@ -169,8 +169,9 @@ def test_public_operation_and_parameter_inventory(
     # 148 since GET/POST /v1/web/settings (the web-search toggle, Lark t100535) —
     # only the POST carries a body, hence 67 -> 68.
     # 149 since GET /v1/model_api/usage (provider balance/usage snapshot).
-    assert len(operations) == 149
-    assert sum("requestBody" in operation for operation in operations.values()) == 68
+    # 150 since POST /v1/model_api/models (BYOK model catalog listing, has a body).
+    assert len(operations) == 150
+    assert sum("requestBody" in operation for operation in operations.values()) == 69
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")

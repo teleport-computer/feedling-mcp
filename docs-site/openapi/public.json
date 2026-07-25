@@ -4319,6 +4319,49 @@
         "x-feedling-contract-level": "compatibility"
       }
     },
+    "/v1/model_api/models": {
+      "post": {
+        "summary": "Model Api Models",
+        "operationId": "model_api_models_v1_model_api_models_post",
+        "responses": {
+          "200": {
+            "description": "The account's visible model catalog for this provider.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelApiModelsResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelApiModelsRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented",
+        "description": "列出某 provider 在该凭据下可见的模型清单（实时拉取，非 io 兼容性保证）。unsupported / partial 时客户端退回手填。"
+      }
+    },
     "/v1/model_api/routes": {
       "get": {
         "summary": "Model Api Routes Get",
@@ -7451,6 +7494,113 @@
           }
         },
         "title": "ValidationError"
+      },
+      "ModelApiModelsRequest": {
+        "type": "object",
+        "description": "List a provider's live model catalog. Supply the credential **exactly one** of two ways: a fresh `api_key`, or a stored `credential_id` whose provider/base_url are the source of truth (any provider/base_url sent alongside a credential_id is ignored).",
+        "required": [
+          "provider"
+        ],
+        "additionalProperties": true,
+        "oneOf": [
+          {
+            "required": [
+              "api_key"
+            ]
+          },
+          {
+            "required": [
+              "credential_id"
+            ]
+          }
+        ],
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": [
+              "openai",
+              "openrouter",
+              "anthropic",
+              "bedrock",
+              "gemini",
+              "deepseek",
+              "openai_compatible"
+            ],
+            "description": "Provider to enumerate. `openai_compatible` requires `base_url`."
+          },
+          "base_url": {
+            "type": "string",
+            "description": "Override base URL. Required for `openai_compatible`; must be `https://` or local `http://127.0.0.1`."
+          },
+          "api_key": {
+            "type": "string",
+            "writeOnly": true,
+            "nullable": true,
+            "description": "Fresh provider key. Mutually exclusive with `credential_id`."
+          },
+          "credential_id": {
+            "type": "string",
+            "nullable": true,
+            "description": "Stored credential id. Mutually exclusive with `api_key`."
+          }
+        },
+        "example": {
+          "provider": "openai",
+          "api_key": "sk-..."
+        }
+      },
+      "ModelApiModelItem": {
+        "type": "object",
+        "required": [
+          "id",
+          "display_name"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Provider model id (≤160 chars)."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "Human label; falls back to id."
+          }
+        }
+      },
+      "ModelApiModelsResponse": {
+        "type": "object",
+        "description": "The account's visible model catalog for this provider — a live pull, NOT an io compatibility guarantee. `complete=false` means the list was truncated (see `warnings`); `catalog_supported=false` means the provider has no listable catalog (e.g. bedrock, or a custom endpoint with no `/models`) and the client should fall back to manual model entry.",
+        "required": [
+          "provider",
+          "models",
+          "complete",
+          "catalog_supported",
+          "warnings"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "type": "string"
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelApiModelItem"
+            }
+          },
+          "complete": {
+            "type": "boolean"
+          },
+          "catalog_supported": {
+            "type": "boolean"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
       },
       "WebSettingsUpdateRequest": {
         "type": "object",

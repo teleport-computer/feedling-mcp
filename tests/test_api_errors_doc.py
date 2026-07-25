@@ -18,6 +18,13 @@ MUST_HAVE = {
     "unauthorized", "forbidden", "service_busy", "not_found",
     "model_api_key_decrypt_failed", "already_answered",
     "unsupported_file_type", "invalid_file",
+    # BYOK model catalog (POST /v1/model_api/models) — the client-facing slugs
+    # must stay documented; a markdown row alone is not enough, this set guards
+    # them. `model_catalog_unsupported` is intentionally absent: it is a 200
+    # catalog_supported:false success, not an error slug.
+    "model_catalog_auth_failed", "model_catalog_access_denied",
+    "model_catalog_rate_limited", "model_catalog_temporarily_unavailable",
+    "model_catalog_invalid_response",
 }
 
 
