@@ -141,6 +141,15 @@ async def model_api_route_create(request: Request, auth: AuthResult = Depends(re
     return JSONResponse(body, status_code=status)
 
 
+@router.post("/v1/model_api/models")
+async def model_api_models(request: Request, auth: AuthResult = Depends(require_auth)):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.model_api_models, auth.store, payload, caller_api_key=caller_api_key)
+    return JSONResponse(body, status_code=status)
+
+
 @router.post("/v1/model_api/routes/{route_id}/activate")
 async def model_api_route_activate(route_id: str, request: Request,
                                    auth: AuthResult = Depends(require_auth)):
