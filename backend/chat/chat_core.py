@@ -942,10 +942,11 @@ def write_response(
     if file_followups and not reply_to_message_id:
         return {"error": "file_followups require reply_to_message_id"}, 400
     if reply_to_message_id and role != "system":
-        # Verify acks are hidden, but their exact parent link is load-bearing:
-        # verify_loop must not accept an unrelated concurrent agent reply.
-        if source == "verify_ping":
-            extra["reply_to_message_id"] = reply_to_message_id
+        # Persist the parent link on every ordinary reply, not only failures and
+        # file cards. Consecutive user messages can arrive before the first reply;
+        # the client needs this exact id to show which earlier turn a late text
+        # bubble answers. It is also load-bearing for hidden verify acks.
+        extra["reply_to_message_id"] = reply_to_message_id
         # Turn-failure metadata（spec 2026-07-18 §2）：兜底回复是【实时载体】——它是
         # 新消息、有新 ts，能通过 /v1/chat/history 的 `since` 增量过滤；而对用户那条
         # 旧消息就地更新 metadata 不产生新 ts，永远进不了增量流。reply_to_message_id
@@ -963,7 +964,6 @@ def write_response(
             extra["turn_failure_error_class"] = turn_failure_error_class
             extra["turn_failure_blame"] = turn_failure_blame
             extra["turn_failure_user_text"] = turn_failure_user_text
-            extra["reply_to_message_id"] = reply_to_message_id
         # Build the exact append_chat row immediately before the one-statement
         # parent-CAS + reply-INSERT.  No slow work belongs in this gap: two workers
         # may arrive together, and PostgreSQL decides the sole winner.

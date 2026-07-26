@@ -135,6 +135,7 @@ def test_chat_core_two_workers_one_reply_and_winner_only_side_effects(
     ]
     assert len(replies) == 1
     winner_id = replies[0]["id"]
+    assert replies[0]["reply_to_message_id"] == parent["id"]
     persisted_parent = next(
         msg for msg in db.chat_load(store.user_id) if msg.get("id") == parent["id"]
     )

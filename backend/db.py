@@ -7317,6 +7317,117 @@ def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None
     return row[0] if row is not None else None
 
 
+def chat_reconcile_legacy_adjacent_reply(
+    user_id: str,
+    parent_msg_id: str,
+    reply_msg_id: str,
+) -> tuple[dict, dict] | None:
+    """Atomically link one legacy chat reply to its immediately preceding turn.
+
+    Older consumers could append an ordinary ``source=chat`` assistant message
+    without ``reply_to_message_id`` and without settling the parent user row.
+    The lost-turn backstop then treated that visibly answered turn as abandoned
+    and ran the model again. Reconcile only the unambiguous legacy shape: both
+    rows still exist, the parent is unanswered, the assistant reply is unlinked,
+    and no conversation user message sits between their timestamps.
+    """
+    parent_fields = {
+        "reply_status": "replied",
+        "reply_message_id": reply_msg_id,
+        "replied_by": "legacy_adjacent_reconcile",
+    }
+    reply_fields = {"reply_to_message_id": parent_msg_id}
+    parent_doc: dict | None = None
+    reply_doc: dict | None = None
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+                    cur.execute(
+                        "SELECT msg_id, ts, doc FROM chat_messages "
+                        "WHERE user_id=%s AND msg_id=ANY(%s) "
+                        "ORDER BY msg_id FOR UPDATE",
+                        (user_id, [parent_msg_id, reply_msg_id]),
+                    )
+                    rows = {str(row[0]): (float(row[1]), row[2]) for row in cur.fetchall()}
+                    if parent_msg_id not in rows or reply_msg_id not in rows:
+                        return None
+                    parent_ts, parent = rows[parent_msg_id]
+                    reply_ts, reply = rows[reply_msg_id]
+                    if (
+                        parent.get("role") != "user"
+                        or str(parent.get("source") or "") in (
+                            "verify_ping", "resident_maintenance"
+                        )
+                        or parent.get("reply_status") == "replied"
+                        or str(parent.get("reply_message_id") or "").strip()
+                        or str(reply.get("role") or "") not in (
+                            "openclaw", "assistant", "agent"
+                        )
+                        or str(reply.get("source") or "") not in ("", "chat")
+                        or str(reply.get("reply_to_message_id") or "").strip()
+                        or reply_ts <= parent_ts
+                    ):
+                        return None
+                    cur.execute(
+                        "SELECT 1 FROM chat_messages "
+                        "WHERE user_id=%s AND ts>%s AND ts<%s "
+                        "  AND doc->>'role'='user' "
+                        "  AND COALESCE(doc->>'source','') "
+                        "      NOT IN ('verify_ping','resident_maintenance') "
+                        "LIMIT 1",
+                        (user_id, parent_ts, reply_ts),
+                    )
+                    if cur.fetchone() is not None:
+                        return None
+                    cur.execute(
+                        "UPDATE chat_messages SET doc=doc || %s "
+                        "WHERE user_id=%s AND msg_id=%s "
+                        "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+                        "  AND COALESCE(doc->>'reply_message_id','')='' "
+                        "RETURNING doc",
+                        (Jsonb(parent_fields), user_id, parent_msg_id),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        return None
+                    parent_doc = row[0]
+                    cur.execute(
+                        "UPDATE chat_messages SET doc=doc || %s "
+                        "WHERE user_id=%s AND msg_id=%s "
+                        "  AND COALESCE(doc->>'reply_to_message_id','')='' "
+                        "RETURNING doc",
+                        (Jsonb(reply_fields), user_id, reply_msg_id),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        raise RuntimeError("legacy adjacent reply changed during reconcile")
+                    reply_doc = row[0]
+    except Exception as e:
+        log.error(
+            "[db] chat_reconcile_legacy_adjacent_reply(%s,%s,%s) failed: %s",
+            user_id,
+            parent_msg_id,
+            reply_msg_id,
+            e,
+        )
+        return None
+
+    if parent_doc is None or reply_doc is None:
+        return None
+    from tee_shadow import mirror
+    mirror.execute(
+        "UPDATE chat_messages SET doc=doc || %s WHERE user_id=%s AND msg_id=%s",
+        (Jsonb(parent_fields), user_id, parent_msg_id),
+    )
+    mirror.execute(
+        "UPDATE chat_messages SET doc=doc || %s WHERE user_id=%s AND msg_id=%s",
+        (Jsonb(reply_fields), user_id, reply_msg_id),
+    )
+    return parent_doc, reply_doc
+
+
 _CHAT_FINALIZE_REPLY_ONCE_SQL = (
     "WITH won AS ("
     "  UPDATE chat_messages SET doc = doc || %s "

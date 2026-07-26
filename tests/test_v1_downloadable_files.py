@@ -4,6 +4,8 @@ from __future__ import annotations
 import base64
 import os
 import sys
+import threading
+import time
 import types
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -113,6 +115,7 @@ def test_v1_text_and_file_followup_commit_as_one_ordered_reply(
     card = next(row for row in rows if row["id"] == "v1_file_card")
     assert persisted_parent["reply_message_id"] == primary["id"]
     assert primary["content_type"] == "text"
+    assert primary["reply_to_message_id"] == parent["id"]
     assert card["content_type"] == "file"
     assert card["file_name"] == "一日计划.docx"
     assert card["file_mime"] == document_render.DOCX_MIME
@@ -354,6 +357,79 @@ def test_v1_completion_guard_matches_natural_word_request():
     )
     assert requirement == (".docx",)
     assert resident._missing_outbound_file_suffixes(requirement, []) == (".docx",)
+
+
+def test_v1_visible_reply_strips_codex_local_file_citation():
+    cleaned, removed = resident._sanitize_outbound_file_reply(
+        '已生成并附上 Word 文档：:codex-file-citation{path="/private/tmp/secret/plan.docx" purpose="output"}\n\n'
+        "内容已经准备好。"
+    )
+
+    assert removed is True
+    assert cleaned == "已生成并附上 Word 文档。\n内容已经准备好。"
+    assert "/private/tmp" not in cleaned
+    assert "codex-file-citation" not in cleaned
+
+
+def test_v1_outbound_prompt_limits_expensive_document_qa():
+    prompt = resident._outbound_file_prompt_block()
+
+    assert "at most one lightweight check" in prompt
+    assert "do not repeatedly render" in prompt
+
+
+def test_foreground_agent_call_keeps_resident_fresh_without_claiming(monkeypatch):
+    heartbeat_seen = threading.Event()
+    polls = []
+    refreshes = []
+
+    def fake_poll(since, timeout=None, claim=True):
+        polls.append((since, timeout, claim))
+        heartbeat_seen.set()
+        return {"messages": []}
+
+    def fake_agent(_message, images=None, raw_text=False):
+        assert heartbeat_seen.wait(1.0)
+        return "ok"
+
+    monkeypatch.setattr(resident, "AGENT_MODE", "http")
+    monkeypatch.setattr(resident, "RESIDENT_BUSY_POLL_INTERVAL_SEC", 0.01)
+    monkeypatch.setattr(resident, "poll_chat", fake_poll)
+    monkeypatch.setattr(
+        resident, "_maybe_refresh_decrypt_health", lambda: refreshes.append(True)
+    )
+    monkeypatch.setattr(resident, "call_agent_http", fake_agent)
+
+    assert resident.call_agent("hello", raw_text=True, lane="chat") == "ok"
+    assert polls
+    assert all(timeout == 0 and claim is False for _, timeout, claim in polls)
+    assert refreshes
+
+    count_after_return = len(polls)
+    time.sleep(0.03)
+    assert len(polls) == count_after_return
+
+
+def test_background_agent_call_does_not_start_busy_poll(monkeypatch):
+    polls = []
+
+    def fake_agent(_message, images=None, raw_text=False):
+        time.sleep(0.03)
+        return "ok"
+
+    monkeypatch.setattr(resident, "AGENT_MODE", "http")
+    monkeypatch.setattr(resident, "RESIDENT_BUSY_POLL_INTERVAL_SEC", 0.01)
+    monkeypatch.setattr(
+        resident,
+        "poll_chat",
+        lambda since, timeout=None, claim=True: polls.append(
+            (since, timeout, claim)
+        ),
+    )
+    monkeypatch.setattr(resident, "call_agent_http", fake_agent)
+
+    assert resident.call_agent("background", raw_text=True) == "ok"
+    assert polls == []
 
 
 def test_resident_posts_primary_and_encrypted_file_followup_together(monkeypatch):

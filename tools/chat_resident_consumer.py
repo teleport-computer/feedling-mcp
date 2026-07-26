@@ -83,6 +83,9 @@ Optional:
                         questions so the agent does not need to run curl/MCP
                         commands from its own sandbox.
   POLL_TIMEOUT          Long-poll timeout in seconds (default: 30)
+  FEEDLING_RESIDENT_BUSY_POLL_INTERVAL_SEC
+                        Claim-free liveness poll cadence while a foreground
+                        agent turn is running (default: 30)
   LOG_LEVEL             DEBUG / INFO / WARNING (default: INFO)
 """
 
@@ -463,6 +466,13 @@ VERIFY_PROBE_MESSAGE = os.environ.get("VERIFY_PROBE_MESSAGE", "（连接自检�
 VERIFY_PROBE_TIMEOUT_SEC = float(os.environ.get("VERIFY_PROBE_TIMEOUT_SEC", "20"))
 SEND_FALLBACK_ON_AGENT_ERROR = _env_bool("SEND_FALLBACK_ON_AGENT_ERROR", True)
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
+try:
+    RESIDENT_BUSY_POLL_INTERVAL_SEC = max(
+        5.0,
+        float(os.environ.get("FEEDLING_RESIDENT_BUSY_POLL_INTERVAL_SEC", "30")),
+    )
+except (TypeError, ValueError):
+    RESIDENT_BUSY_POLL_INTERVAL_SEC = 30.0
 # Enclave decrypt-fetch resilience. The enclave is a single-threaded decrypt proxy
 # shared by every user + the main backend; under load it intermittently maps a
 # reentrant dependency failure to HTTP 502/503. A foreground poll that hits one used
@@ -6773,6 +6783,44 @@ def _split_agent_turn(result: Any, max_items: int | None = None) -> AgentTurn:
     return _agent_turn_from_raw(result, max_items=max_items)
 
 
+def _call_with_resident_busy_poll(invoke, *, lane: str) -> Any:
+    """Keep the official resident fresh while one foreground model turn runs.
+
+    The main loop cannot poll while ``call_agent`` blocks. A slow document turn
+    can therefore outlive the backend's resident-recency window and have its
+    otherwise-valid reply rejected as ``needs_resident_consumer``. This helper
+    sends only non-blocking, claim-free polls: it refreshes liveness and decrypt
+    health without leasing or processing any newly-arrived user message.
+    """
+    if lane != "chat":
+        return invoke()
+
+    stop = threading.Event()
+
+    def _heartbeat() -> None:
+        while not stop.wait(RESIDENT_BUSY_POLL_INTERVAL_SEC):
+            try:
+                _maybe_refresh_decrypt_health()
+                poll_chat(time.time(), timeout=0, claim=False)
+            except Exception as exc:  # best-effort; the foreground turn continues
+                log.warning("resident busy liveness poll failed: %s", exc)
+
+    thread = threading.Thread(
+        target=_heartbeat,
+        name="feedling-resident-busy-poll",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        return invoke()
+    finally:
+        stop.set()
+        # The ordinary claim-free poll is immediate. Keep the reply path bounded
+        # if the network is unhealthy; the daemon exits after that in-flight
+        # request reaches its own timeout.
+        thread.join(timeout=0.25)
+
+
 def call_agent(
     message: str,
     images: list[dict[str, str]] | None = None,
@@ -6782,17 +6830,19 @@ def call_agent(
     lane: str = "background",
     attempt_trigger: str = "first",
 ) -> Any:
-    if AGENT_MODE == "http":
-        # http path metrics/timing are out of scope for this event pair (cli-only);
-        # trace_id is accepted here for a uniform call signature but unused.
-        # lane gates MCP injection, which only exists on the cli path — unused here.
-        raw = call_agent_http(message, images=images, raw_text=raw_text)
-    elif AGENT_MODE == "cli":
-        raw = call_agent_cli(
-            message, image_paths=image_paths, raw_text=raw_text,
-            trace_id=trace_id, lane=lane, attempt_trigger=attempt_trigger)
-    else:
+    def _invoke() -> Any:
+        if AGENT_MODE == "http":
+            # http path metrics/timing are out of scope for this event pair (cli-only);
+            # trace_id is accepted here for a uniform call signature but unused.
+            # lane gates MCP injection, which only exists on the cli path — unused here.
+            return call_agent_http(message, images=images, raw_text=raw_text)
+        if AGENT_MODE == "cli":
+            return call_agent_cli(
+                message, image_paths=image_paths, raw_text=raw_text,
+                trace_id=trace_id, lane=lane, attempt_trigger=attempt_trigger)
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
+
+    raw = _call_with_resident_busy_poll(_invoke, lane=lane)
 
     if raw_text:
         # Background memory lanes (capture/dream) parse JSON from the model's
@@ -6896,7 +6946,10 @@ def _outbound_file_prompt_block() -> str:
         f"{_IO_CLI_PATH} send-file --path <source_path> --name <download_name>`. "
         "Use the requested suffix exactly (Word=.docx, PDF=.pdf); never substitute "
         "Markdown, never ask for an internal path, and claim success only after "
-        "send-file returns ok. Tutorial questions alone do not require a file."
+        "send-file returns ok. Do at most one lightweight check that the output "
+        "opens and has the requested format; do not repeatedly render, screenshot, "
+        "or tune fonts unless the user explicitly asks for layout QA. Tutorial "
+        "questions alone do not require a file."
     )
 
 
@@ -6938,6 +6991,23 @@ def _outbound_file_failure_reply(text: str) -> str:
     if re.search(r"[\u4e00-\u9fff]", str(text or "")):
         return "这次没能生成你要求的可下载文件，请稍后再试。"
     return "I couldn't generate the requested downloadable file this time. Please try again."
+
+
+_CODEX_FILE_CITATION_RE = re.compile(
+    r":codex-file-citation\{[^{}\r\n]*\}"
+)
+
+
+def _sanitize_outbound_file_reply(text: str) -> tuple[str, bool]:
+    """Remove Codex-local attachment markup from user-visible reply text."""
+    value = str(text or "")
+    cleaned, removed = _CODEX_FILE_CITATION_RE.subn("", value)
+    if not removed:
+        return value, False
+    cleaned = re.sub(r"[ \t]+(?=\r?$)", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"[：:]\s*(?=\r?\n|$)", "。", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, True
 
 
 def _prepend_io_cli_capability_catalog(content: str) -> str:
@@ -7093,11 +7163,21 @@ def _foreground_agent_message(content: str, *, current_ts: float) -> str:
     transcript = _recent_chat_context_for_foreground(before_ts=current_ts)
     if not transcript:
         return content
-    # "---" (not a bare blank line) closes the transcript: weaker self-hosted
-    # models read "\n\n" as just another turn boundary inside the quoted
-    # history and answer the wrong message. Nothing parses this marker back —
-    # _message_has_injected_history keys on the header prefix only.
-    return f"{FOREGROUND_CHAT_CONTEXT_HEADER}\n{transcript}\n---\n{content}"
+    # A double-text can arrive before the previous model turn finishes. By the
+    # time this turn runs, the injected transcript may therefore end with that
+    # older, actionable user request while its later reply is excluded by the
+    # current turn's timestamp. Make the execution boundary explicit: history
+    # is context, never a backlog of tasks. The current message still decides
+    # file intent semantically (including natural-language resend requests).
+    current_turn_header = (
+        "[当前用户消息 — 只处理下面这一条。上方记录仅用于理解语境，不是待办；"
+        "不得重做旧任务，也不得仅因旧消息提到文件就生成或重发附件。"
+        "只有当前消息本身要求时才可以创建或重发文件。]"
+    )
+    return (
+        f"{FOREGROUND_CHAT_CONTEXT_HEADER}\n{transcript}\n---\n"
+        f"{current_turn_header}\n{content}"
+    )
 
 
 def _message_has_injected_history(message: str) -> bool:
@@ -12126,6 +12206,22 @@ def _process_messages(messages: list) -> float:
                 _note_agent_turn_success()
 
         turn = _split_agent_turn(agent_result)
+        sanitized_messages: list[str] = []
+        stripped_file_citation = False
+        for message in turn.messages:
+            if not isinstance(message, str):
+                continue
+            sanitized, removed = _sanitize_outbound_file_reply(message)
+            stripped_file_citation = stripped_file_citation or removed
+            if sanitized.strip():
+                sanitized_messages.append(sanitized)
+        if stripped_file_citation:
+            log.warning("removed internal Codex file citation from visible reply")
+            turn.messages = sanitized_messages
+            if not staged_outbound_files:
+                turn.messages = [
+                    _outbound_file_failure_reply(raw_user_content_for_lang)
+                ]
         if staged_outbound_files and not turn.messages:
             turn.messages = [
                 "文件已经准备好了。"

@@ -458,6 +458,32 @@ def _redelivery_floor(store: UserStore, now: float) -> float:
     return floor
 
 
+def _legacy_adjacent_reply_candidate(
+    messages: list[dict], parent_index: int
+) -> tuple[int, dict] | None:
+    """Find a legacy unlinked chat reply before the next conversation turn.
+
+    Consecutive user messages are deliberately not guessed: a later assistant
+    response could belong only to the newest one. Proactive/system rows may sit
+    between a user turn and its reply, so they are skipped rather than treated
+    as evidence that the turn was answered.
+    """
+    for index in range(parent_index + 1, len(messages)):
+        candidate = messages[index]
+        if is_conversation_user_message(candidate):
+            return None
+        if str(candidate.get("role") or "") not in (
+            "openclaw", "assistant", "agent"
+        ):
+            continue
+        if str(candidate.get("source") or "") not in ("", "chat"):
+            continue
+        if str(candidate.get("reply_to_message_id") or "").strip():
+            return None
+        return index, candidate
+    return None
+
+
 def _pending_chat_messages_for_poll(
     store: UserStore,
     *,
@@ -495,9 +521,35 @@ def _pending_chat_messages_for_poll(
             return []
     with store.chat_lock:
         redelivery_floor = _redelivery_floor(store, now)
-        for msg in store.chat_messages:
+        for msg_index, msg in enumerate(store.chat_messages):
             ts = _float_meta(msg.get("ts"), 0.0)
             if ts <= since:
+                if (
+                    claim
+                    and msg.get("role") == "user"
+                    and msg.get("reply_status") != "replied"
+                    and not str(msg.get("reply_message_id") or "").strip()
+                ):
+                    legacy_reply = _legacy_adjacent_reply_candidate(
+                        store.chat_messages, msg_index
+                    )
+                    if legacy_reply is not None:
+                        reply_index, reply = legacy_reply
+                        reconciled = db.chat_reconcile_legacy_adjacent_reply(
+                            store.user_id,
+                            str(msg.get("id") or ""),
+                            str(reply.get("id") or ""),
+                        )
+                        if reconciled is not None:
+                            parent_doc, reply_doc = reconciled
+                            msg.update(parent_doc)
+                            store.chat_messages[reply_index].update(reply_doc)
+                            print(
+                                f"[chat/poll:{store.user_id}] "
+                                f"legacy_adjacent_reply_reconciled "
+                                f"parent={msg.get('id')} reply={reply.get('id')}"
+                            )
+                            continue
                 if redelivered >= CHAT_REDELIVERY_BATCH_MAX:
                     continue  # budget spent — leftovers roll into the next poll unclaimed
                 # Redelivery backstop: an unanswered turn the cursor already

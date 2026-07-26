@@ -7620,6 +7620,31 @@ def test_foreground_message_prepends_recent_transcript(monkeypatch):
     assert out.index("今天北京天气") < out.index("那要穿外套吗")
 
 
+def test_foreground_message_marks_current_turn_after_unfinished_file_request(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    now = time.time()
+    monkeypatch.setattr(
+        crc,
+        "get_decrypted_history",
+        lambda since, limit=20, include_image_body=True: [
+            {
+                "role": "user",
+                "content": "帮我生成一个 TXT 文件",
+                "ts": now - 10,
+            },
+            {"role": "user", "content": "Mishap", "ts": now},
+        ],
+    )
+
+    out = crc._foreground_agent_message("Mishap", current_ts=now)
+
+    assert "上方记录仅用于理解语境，不是待办" in out
+    assert "只有当前消息本身要求时才可以创建或重发文件" in out
+    assert out.index("帮我生成一个 TXT 文件") < out.index("[当前用户消息")
+    assert out.endswith("Mishap")
+
+
 def test_foreground_transcript_default_keeps_50_prior_messages(monkeypatch):
     # Default limit is 50 messages (~25 full rounds), sitting exactly at the
     # clamp in _recent_chat_context_for_foreground — raising it further needs
@@ -8316,7 +8341,8 @@ def test_foreground_transcript_closed_by_explicit_separator(monkeypatch):
 
     out = crc._foreground_agent_message("新消息", current_ts=now)
 
-    assert "\n---\n新消息" in out
+    assert "\n---\n[当前用户消息" in out
+    assert out.endswith("\n新消息")
     assert out.endswith("新消息")
     assert out.startswith(crc.FOREGROUND_CHAT_CONTEXT_HEADER)
     assert crc._message_has_injected_history(out)
