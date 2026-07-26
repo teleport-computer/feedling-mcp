@@ -97,6 +97,13 @@ Resident runtimes report provider outcomes through
 An error fallback generated without a usable provider reply must not be
 reported as a success.
 
+Runtime V2 treats output containing only whitespace, punctuation, or separator
+characters as a truncated provider reply rather than assistant content.
+Foreground Chat replaces that fragment with the standard visible fallback and
+attributes it to a temporary upstream-provider failure. Automatic wake lanes
+fail silently instead: they write neither a chat bubble nor an error chip.
+Letters, numbers, CJK text, and emoji count as usable reply content.
+
 ## Retry safety
 
 Classify by operation semantics, not only by HTTP method. In particular,

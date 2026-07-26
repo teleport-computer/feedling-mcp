@@ -6610,6 +6610,19 @@ def chat_append_effect_with_cursor(
         "replied_by": "hosted_runtime_v2",
         "replied_at": f"{float(ts):.3f}",
     }
+    failure_error_class = str(
+        effect_doc.get("turn_failure_error_class") or ""
+    ).strip()
+    if failure_error_class:
+        replied_fields.update(
+            {
+                "reply_error_class": failure_error_class,
+                "reply_blame": str(effect_doc.get("turn_failure_blame") or "").strip(),
+                "reply_user_text": str(
+                    effect_doc.get("turn_failure_user_text") or ""
+                ).strip(),
+            }
+        )
     connection_scope = (
         nullcontext(connection)
         if connection is not None
@@ -6739,6 +6752,8 @@ def chat_append_effect_with_cursor(
                         "id", "role", "source", "v", "body_ct", "nonce",
                         "K_user", "K_enclave", "enclave_pk_fpr", "visibility",
                         "owner_user_id", "content_type",
+                        "turn_failure_error_class", "turn_failure_blame",
+                        "turn_failure_user_text",
                     )
                     if not isinstance(existing_doc, dict) or any(
                         existing_doc.get(field) != effect_doc.get(field)

@@ -461,6 +461,55 @@ def test_run_wake_empty_tail_also_sleeps_silently(monkeypatch):
     assert len(conversation_messages) == 1  # just the nudge — no real tail rows
 
 
+def test_run_wake_degenerate_reply_fails_silently(monkeypatch):
+    uid = "u_wake_degenerate_reply"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    _script_provider(monkeypatch, [_text_round("。")])
+    write_called = {"n": 0}
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: (
+            write_called.update(n=write_called["n"] + 1) or {"id": "never"}
+        ),
+    )
+    surface_called = {"n": 0}
+    monkeypatch.setattr(
+        worker,
+        "_surface_terminal_error",
+        lambda *args, **kwargs: surface_called.update(
+            n=surface_called["n"] + 1
+        ),
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            worker.ENCLAVE_SEMAPHORE,
+            claimed_by,
+        )
+    )
+
+    assert status == "failed"
+    assert write_called["n"] == 0
+    assert surface_called["n"] == 0
+    assert _job_status(job_id) == (
+        "failed",
+        "wake_failed:degenerate_reply_suppressed",
+    )
+    assert not any(event["kind"] == "error" for event in _status_events(uid))
+
+
 def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
     """A real provider failure (BYOK 402, enclave hiccup, etc.) must NOT be
     confused with a weak-wake sleep — it's a real failure, silently marked,

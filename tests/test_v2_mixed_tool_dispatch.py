@@ -270,7 +270,10 @@ def test_only_wake_lane_schedule_reservation_gets_self_wake_marker():
     schedule = ToolCall(
         id="schedule",
         name="schedule_wake",
-        args={"at": "2026-07-26T10:00:00Z"},
+        args={
+            "at": "2026-07-26T10:00:00Z",
+            "_self_wake": True,
+        },
     )
     cancel = ToolCall(
         id="cancel",
@@ -293,6 +296,8 @@ def test_only_wake_lane_schedule_reservation_gets_self_wake_marker():
 
     assert wake_reservations.get(schedule).payload["_self_wake"] is True
     assert "_self_wake" not in wake_reservations.get(cancel).payload
+    # The wake marker above was re-added by the trusted reservation. The same
+    # model-authored field in a foreground/chat reservation is stripped.
     assert "_self_wake" not in chat_reservations.get(schedule).payload
 
 

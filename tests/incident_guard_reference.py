@@ -34,3 +34,7 @@ def legacy_wake_should_publish(
     )
     collision = legacy._proactive_chat_collision(now=now)
     return lane == "scheduled" or not collision
+
+
+def legacy_reply_is_degenerate(text) -> bool:
+    return bool(legacy_consumer()._is_degenerate_reply(text))

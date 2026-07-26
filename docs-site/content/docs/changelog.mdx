@@ -10,6 +10,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 no longer publishes punctuation-only provider fragments as
+  assistant messages.** A foreground Chat turn replaces a truncated fragment
+  such as `.` or `。` with the standard visible fallback and classifies it as a
+  temporary upstream-provider failure. Background wake lanes record the failed
+  turn silently and do not create a chat bubble or error chip. Emoji, letters,
+  digits, and CJK text remain valid replies.
 - **Runtime V2 now carries forward the incident-hardened proactive interruption
   guards from Runtime V1.** After three consecutive AI-authored follow-up wake
   schedules without genuine user input, the fourth schedule is suppressed until

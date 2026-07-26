@@ -703,6 +703,12 @@ class UserStore:
                 "replied_by",
                 "replied_at",
                 "resident_delivery_id",
+                # Turn-failure metadata carried by a visible fallback reply.
+                # Keep this subset aligned with `_build_chat_message`, which
+                # the transactional V2 sink uses.
+                "turn_failure_error_class",
+                "turn_failure_blame",
+                "turn_failure_user_text",
             ):
                 value = extra.get(key)
                 if isinstance(value, str) and value.strip():

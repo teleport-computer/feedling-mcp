@@ -42,6 +42,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -52,6 +53,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import db
 import provider_client
 import provider_health
+from notices import catalog as notices_catalog
 from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
@@ -834,6 +836,15 @@ _SCREEN_WATCH_SYSTEM_PROMPT = (
 # excludes cooled-down users (Task 1), so no further wakes fire until it lapses.
 _WAKE_COOLDOWN_SEC = float(os.environ.get("FEEDLING_V2_WAKE_COOLDOWN_SEC", "600"))
 
+_DEGENERATE_REPLY_FALLBACK = (
+    os.environ.get(
+        "FALLBACK_REPLY",
+        "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。",
+    ).strip()
+    or "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
+)
+_DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
+
 
 class LostJobLease(RuntimeError):
     """The reaper or another lifecycle transition fenced this worker out."""
@@ -855,13 +866,26 @@ class WorkspacePromptUnavailable(RuntimeError):
     """The encrypted workspace prefix could not be loaded safely."""
 
 
+def _is_degenerate_reply(text: Any) -> bool:
+    """Return true for empty or punctuation/separator-only provider output."""
+    for char in str(text or ""):
+        category = unicodedata.category(char)
+        if category[0] in {"L", "N"} or category == "So":
+            return False
+    return True
+
+
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
     """Stable plaintext error code that never embeds exception messages."""
     if isinstance(exc, WorkspacePromptUnavailable):
         kind = "workspace_prompt_unavailable"
     elif isinstance(exc, TurnError):
         raw = str(exc)
-        if raw in {"empty_reply", "no_user_messages"}:
+        if raw in {
+            "degenerate_reply_suppressed",
+            "empty_reply",
+            "no_user_messages",
+        }:
             kind = raw
         else:
             # Keep the established persisted code stable across the internal
@@ -2970,8 +2994,12 @@ def _write_tool_effect_payload(tc) -> tuple[str, dict]:
         return "identity", {**tc.args, "op": tc.name}
     if tc.name in ("schedule_wake", "cancel_wake"):
         # Keep the trusted operation authoritative even if a future dispatcher
-        # accidentally weakens top-level unknown-field rejection.
-        return "schedule", {**tc.args, "op": tc.name}
+        # accidentally weakens top-level unknown-field rejection.  The model
+        # cannot author the internal self-wake provenance bit: remove any
+        # attempted value before `_PlatformEffectReservations` adds its trusted
+        # wake-lane marker.
+        payload = {key: value for key, value in tc.args.items() if key != "_self_wake"}
+        return "schedule", {**payload, "op": tc.name}
     if tc.name in ("workspace_write", "workspace_delete"):
         # The trusted operation name stays outside the model-controlled args.
         # Content is encrypted before entering the durable effect outbox, then
@@ -3313,6 +3341,23 @@ def _thinking_extra(thinking: dict | None) -> dict:
             extra[key] = val
     if isinstance(meta.get("thinking_native"), bool):
         extra["thinking_native"] = meta["thinking_native"]
+    return extra
+
+
+def _reply_effect_extra(payload: dict) -> dict:
+    """Build the allowlisted chat-row metadata for one reply effect."""
+    extra = _thinking_extra(payload.get("thinking"))
+    error_class = str(payload.get("turn_failure_error_class") or "").strip()
+    if error_class:
+        if error_class not in notices_catalog.ERROR_CLASSES:
+            raise ValueError("invalid reply turn_failure_error_class")
+        extra.update(
+            {
+                "turn_failure_error_class": error_class,
+                "turn_failure_blame": notices_catalog.blame_for(error_class),
+                "turn_failure_user_text": notices_catalog.user_text_for(error_class),
+            }
+        )
     return extra
 
 
@@ -5106,6 +5151,19 @@ async def _run_wake(
 
         async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
             text = str(text or "").strip()
+            if text and _is_degenerate_reply(text):
+                log.warning(
+                    "[v2.worker] wake degenerate reply suppressed user=%s "
+                    "job=%s lane=%s final=%s fragment=%r",
+                    user_id,
+                    job_id,
+                    lane,
+                    final,
+                    text[:20],
+                )
+                if final:
+                    raise TurnError("degenerate_reply_suppressed")
+                return
             if not text:
                 # Silence is a legitimate wake outcome — both mid-loop (an empty
                 # `reply{}` call) and terminal ("weak wake sleeps"): unlike the chat
@@ -7300,6 +7358,21 @@ async def process_job(
         async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
             nonlocal final_job_completed_atomically
             text = str(text or "").strip()
+            turn_failure_error_class = ""
+            if text and _is_degenerate_reply(text):
+                log.warning(
+                    "[v2.worker] chat degenerate reply suppressed user=%s "
+                    "job=%s final=%s fragment=%r",
+                    user_id,
+                    job_id,
+                    final,
+                    text[:20],
+                )
+                if not final:
+                    return
+                text = _DEGENERATE_REPLY_FALLBACK
+                turn_failure_error_class = _DEGENERATE_REPLY_ERROR_CLASS
+                reasoning = ""
             if final and not text:
                 # BUG-4 no-filler: chat lane always replies — an empty terminal
                 # text is a model/provider failure here (unlike wake, where
@@ -7327,6 +7400,8 @@ async def process_job(
                 ordinal=ordinal_value,
             )
             payload = {"text": text}
+            if turn_failure_error_class:
+                payload["turn_failure_error_class"] = turn_failure_error_class
             if seq_native:
                 payload = await asyncio.to_thread(
                     _build_encrypted_reply_effect_payload,
@@ -7335,6 +7410,8 @@ async def process_job(
                     effect_id=effect_id,
                     reply_through_seq=(cursor_box["seq"] if final else None),
                 )
+                if turn_failure_error_class:
+                    payload["turn_failure_error_class"] = turn_failure_error_class
                 if final:
                     # Reply content is encrypted; the owner id and two integers
                     # are only non-sensitive routing metadata. The outbox

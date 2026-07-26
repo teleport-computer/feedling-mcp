@@ -1852,10 +1852,10 @@ def _sink_reply(user_id: str, payload: dict) -> None:
     reply-is-terminal invariant; restores the deleted
     `test_reply_envelope_failure_is_terminal_not_success` guarantee on the
     new PR A effect-sink path)."""
-    # Only forward ``extra`` when a thinking sub-envelope is present, so a
-    # no-reasoning reply keeps its exact prior sink call shape.
-    thinking_extra = v2_worker._thinking_extra(payload.get("thinking"))
-    extra_kwargs = {"extra": thinking_extra} if thinking_extra else {}
+    # Only forward ``extra`` when thinking or turn-failure metadata is present,
+    # so an ordinary reply keeps its exact prior sink call shape.
+    reply_extra = v2_worker._reply_effect_extra(payload)
+    extra_kwargs = {"extra": reply_extra} if reply_extra else {}
     envelope = payload.get("envelope")
     if isinstance(envelope, dict):
         store = core_store.get_store(user_id)
@@ -1897,8 +1897,7 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
     if not isinstance(envelope, dict):
         raise RuntimeError("transactional reply requires encrypted envelope")
     store = core_store.get_store(user_id)
-    thinking_extra = v2_worker._thinking_extra(payload.get("thinking"))
-    build_extra = dict(thinking_extra) if thinking_extra else {}
+    build_extra = v2_worker._reply_effect_extra(payload)
     wake_kind = str(payload.get("wake_kind") or "")
     if wake_kind:
         build_extra["wake_kind"] = wake_kind

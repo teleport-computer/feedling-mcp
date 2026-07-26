@@ -126,10 +126,11 @@ def _reply_effect_dispatch(user_id):
 
     def dispatch(effect_type, payload):
         if effect_type == "reply":
+            extra = worker._reply_effect_extra(payload)
             worker._write_encrypted_reply(
                 core_store.get_store(user_id),
                 str(payload.get("text") or ""),
-                extra=worker._thinking_extra(payload.get("thinking")),
+                **({"extra": extra} if extra else {}),
             )
 
     return dispatch
@@ -311,6 +312,79 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert row[1] is False  # not failed
     assert row[2] == "ok"
     assert _job_status_row(job_id)[0] == "completed"
+
+
+def test_degenerate_terminal_reply_becomes_attributed_fallback(monkeypatch):
+    uid = "u_toolloop_degenerate_fallback"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-degenerate")
+    _patch_real_write(monkeypatch)
+    persisted_extra = {}
+    real_write = worker._write_encrypted_reply
+
+    def _capture_write(store, text, *, extra=None):
+        persisted_extra.update(extra or {})
+        return real_write(store, text, extra=extra)
+
+    monkeypatch.setattr(worker, "_write_encrypted_reply", _capture_write)
+    _script_provider(monkeypatch, [_text_round("。")])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "晚安呀"}]
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    bubbles = _bubbles(uid)
+    assert len(bubbles) == 1
+    assert bubbles[0]["body_ct"] == worker._DEGENERATE_REPLY_FALLBACK
+    assert persisted_extra["turn_failure_error_class"] == "upstream_unavailable"
+    assert bubbles[0]["turn_failure_error_class"] == "upstream_unavailable"
+    assert bubbles[0]["turn_failure_blame"] == "provider_transient"
+    assert "模型服务暂时不可用" in bubbles[0]["turn_failure_user_text"]
+    assert _job_status_row(job_id)[0] == "completed"
+
+
+def test_degenerate_intermediate_is_dropped_before_real_final_reply(monkeypatch):
+    uid = "u_toolloop_degenerate_intermediate"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-degenerate-mixed")
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda action_type, store, **kwargs: _FakeCapResult({"snippet": "result"}),
+    )
+    _patch_real_write(monkeypatch)
+    _script_provider(
+        monkeypatch,
+        [
+            _tool_round(
+                _tc("r1", "reply", text="."),
+                _tc("s1", "web_search", query="x"),
+            ),
+            _text_round("在的，怎么了"),
+        ],
+    )
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}]
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert [bubble["body_ct"] for bubble in _bubbles(uid)] == ["在的，怎么了"]
 
 
 def _stub_envelope_build(monkeypatch):

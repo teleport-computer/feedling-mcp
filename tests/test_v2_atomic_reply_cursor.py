@@ -137,6 +137,47 @@ def test_final_v2_reply_marks_consumed_user_rows_answered_for_resident_rollback(
         ) is None
 
 
+def test_final_v2_fallback_copies_failure_attribution_to_consumed_user_rows():
+    uid = "u_atomic_reply_failure_bridge"
+    conftest.seed_user(uid)
+    _reset(uid)
+    db.chat_append(
+        uid,
+        "user-failed",
+        1.0,
+        {"id": "user-failed", "role": "user", "body_ct": "ct"},
+        0,
+    )
+    through_seq = db.chat_seq_for_msg_id(uid, "user-failed")
+    assert through_seq is not None
+
+    db.chat_append_effect_with_cursor(
+        uid,
+        "v2-fallback",
+        2.0,
+        {
+            "id": "v2-fallback",
+            "role": "openclaw",
+            "source": "model_api",
+            "body_ct": "fallback",
+            "turn_failure_error_class": "upstream_unavailable",
+            "turn_failure_blame": "provider_transient",
+            "turn_failure_user_text": "你的模型服务暂时不可用，稍后会自动恢复。",
+        },
+        0,
+        through_seq,
+    )
+
+    with db.get_pool().connection() as conn:
+        doc = conn.execute(
+            "SELECT doc FROM chat_messages WHERE user_id=%s AND msg_id=%s",
+            (uid, "user-failed"),
+        ).fetchone()[0]
+    assert doc["reply_error_class"] == "upstream_unavailable"
+    assert doc["reply_blame"] == "provider_transient"
+    assert "模型服务暂时不可用" in doc["reply_user_text"]
+
+
 def test_v2_final_reply_aborts_if_resident_won_after_prompt_snapshot():
     uid = "u_atomic_reply_resident_race"
     conftest.seed_user(uid)
