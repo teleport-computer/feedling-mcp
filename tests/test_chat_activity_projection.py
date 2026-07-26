@@ -210,6 +210,13 @@ def test_memory_activity_unknown_category_falls_back_to_total():
     ) == {"memory_count": 2}
 
 
+def test_memory_activity_eleven_results_with_custom_category_falls_back_to_total():
+    assert activity_metadata.memory_result_metadata(
+        "memory_search",
+        _memory_result("妈妈", *("Family" for _ in range(10))),
+    ) == {"memory_count": 11}
+
+
 def test_chat_tool_callback_persists_only_safe_memory_summary(monkeypatch):
     captured = []
     monkeypatch.setattr(

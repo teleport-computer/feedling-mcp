@@ -35,7 +35,9 @@ Prepare memories that can be recognized without reading private text in logs:
 
 1. Three cards in the canonical `我们的关系` / `Our relationship` bucket.
 2. One card in the canonical `家庭` / `Family` bucket.
-3. One card in a custom bucket such as `妈妈`.
+3. A mixed result set containing at least one custom bucket such as `妈妈`; the
+   other cards may use canonical buckets. Eleven returned cards is one useful
+   example, not a fixed product threshold.
 4. A nonsense search term that matches no card.
 
 Only the returned count and canonical category keys may appear in activity
@@ -76,13 +78,33 @@ category.
 
 ### D. Unknown or custom category
 
-Use a query that returns the custom `妈妈` card (it may also return canonical
-cards).
+Use a query that returns a mixed result set, including the custom `妈妈` card.
 
-Expected: total-only copy such as “涌现 2 条相关记忆”. The custom label and every
-partial category breakdown are omitted.
+Expected: total-only copy “涌现 N 条相关记忆”, where `N` is the actual number
+of returned memories. For example, eleven returned cards display “涌现 11 条相关
+记忆”. The custom label and every partial category breakdown are omitted.
 
-### E. Confirmed side effect
+### E. Combined memory-to-download flow
+
+Send a natural request such as:
+
+“请回忆我们相处过程中与亲密关系和家人有关的内容，帮我整理成一份《我们的关系小档案》，生成 PDF 给我下载。”
+
+Repeat once with Markdown as the requested format.
+
+Expected:
+
+1. A confirmed memory row appears first. Complete canonical results use
+   “涌现 3 条关于亲密关系的记忆和 1 条关于家人的记忆”; incomplete or custom
+   classification uses the total-only fallback with the actual returned count.
+2. File-generation activity follows without exposing memory text, search terms,
+   tool arguments, or local paths.
+3. The final assistant text is followed by a real downloadable PDF/Markdown
+   card, grouped under one agent name and linked to the original user request.
+4. The downloaded file has the requested format and its content reflects the
+   selected memories.
+
+### F. Confirmed side effect
 
 Ask for a short reminder, then cancel it in a second turn.
 

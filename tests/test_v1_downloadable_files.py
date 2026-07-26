@@ -124,6 +124,82 @@ def test_v1_text_and_file_followup_commit_as_one_ordered_reply(
     assert float(card["ts"]) > float(primary["ts"])
 
 
+def test_v1_text_file_and_confirmed_memory_activity_commit_together(
+    store, monkeypatch
+):
+    _quiet_response_side_effects(monkeypatch)
+    parent = store.append_chat(
+        "user", "chat", _envelope(store.user_id, "v1_memory_file_parent")
+    )
+    monkeypatch.setattr(
+        chat_core.chat_activity_store,
+        "resident_activity_rows",
+        lambda *_args: [
+            {
+                "id": 1,
+                "job_id": None,
+                "kind": "tool_activity",
+                "created_at": 10.0,
+                "detail_json": {
+                    "activity_id": "v1:memory-call-1",
+                    "tool_name": "memory_search",
+                    "call_id": "v1:memory-call-1",
+                    "state": "success",
+                    "memory_count": 4,
+                    "memory_categories": [
+                        {"key": "relationship", "count": 3},
+                        {"key": "family", "count": 1},
+                    ],
+                },
+            }
+        ],
+    )
+
+    body, status = chat_core.write_response(
+        store,
+        {
+            "envelope": _envelope(store.user_id, "v1_memory_file_primary"),
+            "reply_to_message_id": parent["id"],
+            "file_followups": [
+                {
+                    "envelope": _envelope(store.user_id, "v1_memory_file_card"),
+                    "file_name": "我们的关系小档案.pdf",
+                    "file_mime": document_render.PDF_MIME,
+                    "file_byte_count": 2048,
+                }
+            ],
+        },
+        consumer_id="resident-v1",
+        consumer_info={},
+        allow_verify_reply=False,
+    )
+
+    assert status == 200, body
+    rows = db.chat_load(store.user_id)
+    primary = next(row for row in rows if row["id"] == "v1_memory_file_primary")
+    card = next(row for row in rows if row["id"] == "v1_memory_file_card")
+    assert primary["reply_to_message_id"] == parent["id"]
+    assert primary["activity_events"] == [
+        {
+            "id": "v1:memory-call-1",
+            "kind": "tool",
+            "name": "memory_search",
+            "status": "success",
+            "job_id": "",
+            "call_id": "v1:memory-call-1",
+            "started_at": 10.0,
+            "finished_at": 10.0,
+            "memory_count": 4,
+            "memory_categories": [
+                {"key": "relationship", "count": 3},
+                {"key": "family", "count": 1},
+            ],
+        }
+    ]
+    assert card["reply_to_message_id"] == parent["id"]
+    assert card["file_name"] == "我们的关系小档案.pdf"
+
+
 def test_v1_file_sequence_rolls_back_if_followup_insert_fails(store, monkeypatch):
     _quiet_response_side_effects(monkeypatch)
     parent = store.append_chat(
