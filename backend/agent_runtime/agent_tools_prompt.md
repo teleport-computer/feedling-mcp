@@ -81,6 +81,16 @@ that visibly did not change. Say it's done only after the command returns
 `{"ok": true}`; if it returns an error, tell the user plainly that the rename did
 not go through.
 
+**When the user asks to change how long you two have been together — the
+relationship day count, the "第 N 天" shown in the app (e.g. "把相处天数改成 30 天",
+"相处日期改到 45 天", "我们其实认识两年了") — pass `--relationship-days N`**, where `N`
+is the number the user states (the count they see in the app; the day you met is
+day 1). `days_with_user` derives from a relationship-start anchor and auto-increments
+daily, but `--relationship-days` is exactly how you recalibrate it — so do NOT tell
+the user it's "auto-computed" and you can't change it, and do NOT fake it by only
+writing text into another field. Only recalibrate on an explicit request; say it's
+done only after the command returns `{"ok": true}`.
+
 - Use it for what the user actually asked. A rename changes `--agent-name`; a
   change to how you describe yourself changes `--self-introduction`. When the new
   name should also show up in how you introduce yourself, pass both.
