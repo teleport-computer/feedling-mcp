@@ -261,8 +261,8 @@ DESCRIPTIONS: dict[str, str] = {
                        "'relationship_days' in the patch — e.g. patch {\"relationship_days\": 300}. "
                        "This is the day number AS THE USER SEES AND SAYS IT (the '第 N 天' shown "
                        "in the app: the day you met is day 1, not day 0). So if the user says "
-                       "'make it day 45', pass 45 and the app will show 45. Positive integer. "
-                       "Only act on an explicit request."),
+                       "'make it day 45', pass 45 and the app will show 45. Whole number, "
+                       "day 1 = the day you met. Only act on an explicit request."),
     "identity_nudge": ("Adjust ONE of the persona's relationship/personality dimension "
                        "scores by a signed integer 'delta' (|delta| ≤ 10). 'dimension' "
                        "must name a dimension that already exists — call identity_get "
