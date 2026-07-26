@@ -52,6 +52,14 @@ PARAMS: dict[str, dict] = {
             "agent_name": _STR,
             "self_introduction": _STR,
             "signature": _STR,
+            # relationship_days is a FIRST-CLASS top-level arg (like agent_name),
+            # NOT only reachable inside the free-form `patch` object. It used to
+            # live only in `patch`, but with additionalProperties=False a model
+            # that naturally called identity_patch(relationship_days=N) — the same
+            # shape it uses for agent_name — got the arg rejected/dropped and then
+            # falsely reported success. merge_patch_fields folds this top-level
+            # value into the patch (patch wins on conflict), so both shapes work.
+            "relationship_days": _INT,
         },
         "required": [],
     },
@@ -257,8 +265,8 @@ DESCRIPTIONS: dict[str, str] = {
                        "stable_definitions. Edit a list field by whole-list replacement "
                        "or with op keys add_<field>/remove_<field>/replace_<field> "
                        "(e.g. add_signature, remove_boundaries). To recalibrate how "
-                       "long you and the user have known each other, put "
-                       "'relationship_days' in the patch — e.g. patch {\"relationship_days\": 300}. "
+                       "long you and the user have known each other, set the "
+                       "'relationship_days' argument directly — e.g. identity_patch(relationship_days=300). "
                        "This is the day number AS THE USER SEES AND SAYS IT (the '第 N 天' shown "
                        "in the app: the day you met is day 1, not day 0). So if the user says "
                        "'make it day 45', pass 45 and the app will show 45. Whole number, "

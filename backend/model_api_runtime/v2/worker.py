@@ -2775,7 +2775,14 @@ def _write_tool_effect_payload(tc) -> tuple[str, dict]:
         # live pre-enqueue check already rejected an invalid/over-cap value, so a
         # valid int is all that reaches here; a defensive shape check keeps a
         # non-conforming smuggled value from silently poisoning the anchor.
-        frozen = _frozen_relationship_anchor(payload.get("patch"))
+        # Freeze from the MERGED view (top-level relationship_days OR nested in
+        # `patch`), matching the schema/sink: relationship_days is now a
+        # first-class top-level arg, so reading only ``payload["patch"]`` would
+        # skip the freeze for the top-level shape a model naturally emits, and a
+        # delayed replay would then drift the anchor. merge_patch_fields folds
+        # both shapes (patch wins on conflict) exactly as the sink does.
+        from capabilities import identity as _cap_identity
+        frozen = _frozen_relationship_anchor(_cap_identity.merge_patch_fields(payload))
         if frozen is not None:
             payload["relationship_started_at"] = frozen
         return "identity", payload

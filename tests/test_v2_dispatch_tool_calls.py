@@ -466,6 +466,20 @@ def test_write_tool_effect_payload_freezes_relationship_anchor():
     assert payload["patch"]["relationship_days"] == 300
 
 
+def test_write_tool_effect_payload_freezes_top_level_relationship_days():
+    # Regression: relationship_days is a FIRST-CLASS top-level arg (like agent_name),
+    # not only reachable inside `patch`. A weak model naturally calls
+    # identity_patch(relationship_days=N) — the same shape it uses for agent_name.
+    # The producer must freeze the anchor for THIS shape too (it used to read only
+    # payload["patch"], so a top-level call skipped the freeze). 1-based: N=300 → 299.
+    from datetime import date, timedelta
+    from model_api_runtime.v2 import worker as v2_worker
+    tc = ToolCall(id="ftl", name="identity_patch", args={"relationship_days": 300})
+    effect_type, payload = v2_worker._write_tool_effect_payload(tc)
+    assert effect_type == "identity"
+    assert payload["relationship_started_at"] == (date.today() - timedelta(days=299)).isoformat()
+
+
 def test_write_tool_effect_payload_no_freeze_without_relationship_days():
     from model_api_runtime.v2 import worker as v2_worker
     tc = ToolCall(id="f2", name="identity_patch", args={"patch": {"signature": ["x"]}})
