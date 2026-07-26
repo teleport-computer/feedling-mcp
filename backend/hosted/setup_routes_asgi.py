@@ -38,6 +38,7 @@ from core import provider_usage
 from hosted import config_store
 from hosted import setup_core
 from hosted import usage_core
+from hosted import vision_observer
 
 router = APIRouter()
 
@@ -109,6 +110,19 @@ async def vision_route_test(route_id: str, request: Request,
         setup_core.vision_route_test,
         auth.store,
         route_id,
+        caller_api_key=caller_api_key,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/vision/observe")
+async def vision_observe(request: Request, auth: AuthResult = Depends(require_auth)):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        vision_observer.observe_pinned_message,
+        auth.store,
+        payload,
         caller_api_key=caller_api_key,
     )
     return JSONResponse(body, status_code=status)

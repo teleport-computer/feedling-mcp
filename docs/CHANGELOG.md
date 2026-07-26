@@ -9,6 +9,15 @@
 
 ---
 
+## 2026-07-26
+
+### [FEATURE] V1 与 VPS 支持独立视觉模型
+- 官方 resident 通过 `vision_observer_v1` capability 声明支持；图片发送时固定
+  dedicated route，观察结果以不可信文本交给主模型。
+- dedicated observer 失败或 resident 过旧时在消息落库前 fail-closed，绝不把原图
+  fallback 给主模型；follow-main 继续沿用既有图片链路，Runtime V2 行为保留。
+- 补齐 iOS preflight/状态契约、公开 OpenAPI、错误 slug 与文档。
+
 ## 给 Claude Code 的说明
 
 **每次开新对话时**，请按顺序读：

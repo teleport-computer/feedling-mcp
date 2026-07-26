@@ -1239,6 +1239,17 @@
             "example": "a1b2c3d"
           },
           {
+            "name": "X-Feedling-Consumer-Capabilities",
+            "in": "header",
+            "required": false,
+            "description": "Comma-separated capabilities advertised by the current official resident poll.",
+            "schema": {
+              "type": "string",
+              "maxLength": 500
+            },
+            "example": "vision_observer_v1"
+          },
+          {
             "name": "X-Feedling-Consumer-Compat-Commit",
             "in": "header",
             "required": false,
@@ -1365,6 +1376,17 @@
               "maxLength": 80
             },
             "example": "a1b2c3d"
+          },
+          {
+            "name": "X-Feedling-Consumer-Capabilities",
+            "in": "header",
+            "required": false,
+            "description": "Comma-separated capabilities advertised by the current official resident poll.",
+            "schema": {
+              "type": "string",
+              "maxLength": 500
+            },
+            "example": "vision_observer_v1"
           }
         ],
         "requestBody": {
@@ -7426,6 +7448,48 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/vision/observe": {
+      "post": {
+        "summary": "Vision Observe",
+        "operationId": "vision_observe_v1_vision_observe_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VisionObserveRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented"
+      }
+    },
     "/v1/vision/routes/{route_id}/test": {
       "post": {
         "summary": "Vision Route Test",
@@ -8709,6 +8773,24 @@
             }
           }
         ],
+        "additionalProperties": false
+      },
+      "VisionObserveRequest": {
+        "type": "object",
+        "required": [
+          "message_id",
+          "route_id"
+        ],
+        "properties": {
+          "message_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "route_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
         "additionalProperties": false
       },
       "HostedChatAcceptedResponse": {

@@ -12,6 +12,7 @@ from core.store import UserStore
 
 
 _OFFICIAL_CONSUMER_NAME = "feedling-chat-resident"
+VISION_OBSERVER_CAPABILITY = "vision_observer_v1"
 _CONSUMER_RECENT_SEC = int(os.environ.get("FEEDLING_CONSUMER_RECENT_SEC", "180"))
 _DECRYPT_HEALTH_STATUSES = frozenset(
     {"ok", "degraded", "unconfigured", "unreachable"}
@@ -110,10 +111,18 @@ def _consumer_headers_from_map(headers, remote_addr: str = "") -> dict:
     name = (headers.get("X-Feedling-Consumer") or "").strip()
     if not name:
         return {}
+    capabilities = sorted({
+        item.strip().lower()
+        for item in str(
+            headers.get("X-Feedling-Consumer-Capabilities") or ""
+        ).split(",")
+        if item.strip()
+    })
     return {
         "consumer_name": name,
         "consumer_id": (headers.get("X-Feedling-Consumer-Id") or "").strip(),
         "consumer_version": (headers.get("X-Feedling-Consumer-Version") or "").strip(),
+        "consumer_capabilities": capabilities,
         "consumer_commit": (headers.get("X-Feedling-Consumer-Commit") or "").strip(),
         # Poll-only compatibility claim: the running image intentionally
         # skipped an irrelevant target while remaining protocol-compatible.
@@ -161,6 +170,7 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
             event_info.pop("decrypt_status", None)
             event_info.pop("decrypt_checked_at_epoch", None)
             event_info.pop("consumer_compat_commit", None)
+            event_info.pop("consumer_capabilities", None)
             event_info.pop("update_stall_reason", None)
         state.update(event_info)
         state["last_event"] = event_type
@@ -416,6 +426,7 @@ def _consumer_validation_state(
         "consumer_name": state.get("consumer_name", ""),
         "consumer_id": state.get("consumer_id", ""),
         "consumer_version": state.get("consumer_version", ""),
+        "consumer_capabilities": list(state.get("consumer_capabilities") or []),
         "consumer_commit": state.get("consumer_commit", ""),
         "consumer_compat_commit": state.get("consumer_compat_commit", ""),
         "update_stall_reason": state.get("update_stall_reason", ""),
@@ -431,3 +442,19 @@ def _consumer_validation_state(
             "X-Feedling-Consumer headers."
         ),
     }
+
+
+def consumer_supports_capability(
+    store: UserStore,
+    capability: str,
+    *,
+    now_epoch: float | None = None,
+) -> bool:
+    """Require a fresh official poll before trusting a resident capability."""
+    validation = _consumer_validation_state(store, now_epoch=now_epoch)
+    advertised = {
+        str(item).strip().lower()
+        for item in validation.get("consumer_capabilities") or []
+        if str(item).strip()
+    }
+    return bool(validation.get("passing") and capability.lower() in advertised)

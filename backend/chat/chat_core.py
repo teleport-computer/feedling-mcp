@@ -637,6 +637,15 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
     if content_type not in ("text", "image", "file"):
         return {"error": "content_type must be 'text', 'image', or 'file'"}, 400
     file_extra: dict = {}
+    if content_type == "image":
+        # Lazy import mirrors the existing hosted bridge below.
+        from hosted import vision_routing
+
+        vision_route, vision_error = vision_routing.dedicated_route_for_send(store)
+        if vision_error is not None:
+            return vision_error
+        if vision_route is not None:
+            file_extra["vision_route_id"] = str(vision_route.get("id") or "")
     if content_type == "file":
         fname = str(payload.get("file_name") or "").strip()
         fmime = str(payload.get("file_mime") or "").strip()

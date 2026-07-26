@@ -24,6 +24,7 @@ from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
 from hosted import context as hosted_context
 from hosted import turn as hosted_turn
+from hosted import vision_routing
 from model_api_runtime.v2 import admission
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import kill_switch
@@ -154,9 +155,8 @@ def model_api_chat_send_core(
             )
             return {"error": "runtime_control_invalid"}, 503
 
-    # Dedicated vision is a V2-only routing decision. Resolve and pin it before
-    # persistence so a later Settings change cannot redirect already-accepted
-    # pixels. The V1 resident branch above remains untouched.
+    # Resolve and pin V2 image routing before persistence so a later Settings
+    # change cannot redirect already-accepted pixels.
     vision_route_id = ""
     if has_image:
         vision_route = db.model_api_vision_route(store.user_id)
@@ -379,6 +379,14 @@ def _send_resident(
     ``summary`` stays ``supervisor_unavailable`` (that is how the two were split
     historically).
     """
+    vision_route_id = ""
+    if has_image:
+        vision_route, vision_error = vision_routing.dedicated_route_for_send(store)
+        if vision_error is not None:
+            return vision_error
+        if vision_route is not None:
+            vision_route_id = str(vision_route.get("id") or "")
+
     trace_start = time.time()
     config = hosted_config_store._load_model_api_config(store)
     runtime = hosted_config_store._load_runtime_provider_config(
@@ -432,6 +440,8 @@ def _send_resident(
     extra: dict = {}
     if has_image and image_mime:
         extra["image_mime"] = image_mime
+    if has_image and vision_route_id:
+        extra["vision_route_id"] = vision_route_id
     if has_image and message:
         # 带文字说明的图片：独立加密 caption，enclave history 解后填 content。
         caption_env, caption_err = core_envelope._build_shared_envelope_for_store(

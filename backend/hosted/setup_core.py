@@ -41,6 +41,7 @@ import provider_client
 from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
 from hosted import turn as hosted_turn
+from hosted import vision_routing
 from model_api_runtime.v2 import prompt_frontier
 
 
@@ -234,7 +235,7 @@ def _vision_test_lock(user_id: str, route_id: str):
 
 
 def _vision_runtime_v2_enabled(store) -> bool:
-    """Dedicated vision is a Hosted Runtime V2 capability only."""
+    """Compatibility helper for callers that still inspect V2 directly."""
     try:
         return (
             accounts_onboarding._load_onboarding_route(store) == "model_api"
@@ -242,6 +243,10 @@ def _vision_runtime_v2_enabled(store) -> bool:
         )
     except Exception:
         return False
+
+
+def _vision_routing_available(store) -> bool:
+    return bool(vision_routing.runtime_capability(store)["available"])
 
 
 def _cached_vision_verdict(route: dict, *, include_failed: bool):
@@ -392,10 +397,11 @@ def _run_route_vision_test_or_error(
 
 
 def _vision_config_payload(store) -> dict:
-    onboarding_route = accounts_onboarding._load_onboarding_route(store)
+    capability = vision_routing.runtime_capability(store)
+    onboarding_route = capability["onboarding_route"]
     active = db.model_api_active_route(store.user_id)
-    runtime_v2 = onboarding_route == "model_api" and _vision_runtime_v2_enabled(store)
-    dedicated = db.model_api_vision_route(store.user_id) if runtime_v2 else None
+    routing_available = bool(capability["available"])
+    dedicated = db.model_api_vision_route(store.user_id)
 
     if onboarding_route == "model_api":
         main = {
@@ -423,24 +429,22 @@ def _vision_config_payload(store) -> dict:
         }
 
     mode = "dedicated" if dedicated else "follow_main"
-    if not runtime_v2:
-        effective_status = (
-            "managed_by_vps"
-            if onboarding_route != "model_api"
-            else "runtime_v2_required"
-        )
+    if not routing_available:
+        effective_status = "resident_update_required"
     else:
         effective_status = (
             dedicated.get("vision_test_status", "untested")
             if dedicated
-            else main["vision_test_status"]
+            else (
+                main["vision_test_status"]
+                if onboarding_route == "model_api"
+                else "managed_by_vps"
+            )
         )
     return {
-        "available": runtime_v2,
-        "runtime": "v2" if runtime_v2 else "legacy_or_resident",
-        "unavailable_reason": (
-            "" if runtime_v2 else "hosted_runtime_v2_required"
-        ),
+        "available": routing_available,
+        "runtime": capability["runtime"],
+        "unavailable_reason": capability["unavailable_reason"],
         "mode": mode,
         "onboarding_route": onboarding_route,
         "main_model": main,
@@ -887,34 +891,45 @@ def vision_config_set(
     *,
     caller_api_key: str | None,
 ) -> tuple[dict, int]:
-    if not _vision_runtime_v2_enabled(store):
-        return {
-            "error": "vision_runtime_v2_required",
-            "config": _vision_config_payload(store),
-        }, 409
-
     mode = str(payload.get("mode") or "").strip().lower()
     if mode not in {"follow_main", "dedicated"}:
         return {"error": "invalid_vision_mode"}, 400
+
+    routing_available = _vision_routing_available(store)
+    if not routing_available and mode == "dedicated":
+        return {
+            "error": "vision_resident_update_required",
+            "config": _vision_config_payload(store),
+        }, 409
+    if not routing_available:
+        if not db.model_api_route_clear_vision(store.user_id):
+            return {"error": "model_api_route_write_failed"}, 500
+        return {"config": _vision_config_payload(store)}, 200
 
     if mode == "dedicated":
         route_id = str(payload.get("route_id") or "").strip()
         route = db.model_api_route_get(store.user_id, route_id) if route_id else None
         if not route:
             return {"error": "route_not_found"}, 404
-    else:
+    elif accounts_onboarding._load_onboarding_route(store) == "model_api":
         route = db.model_api_active_route(store.user_id)
         if not route:
             return {"error": "model_api_not_configured"}, 404
+    else:
+        route = None
 
-    test_error = _test_route_vision_or_error(store, route, caller_api_key)
+    test_error = (
+        _test_route_vision_or_error(store, route, caller_api_key)
+        if route is not None
+        else None
+    )
     warning = None
     if test_error is not None:
         error_body, _ = test_error
         if error_body.get("error") != "vision_model_unsupported":
             return test_error
-        # Keep an explicit text-only selection visible while send-time V2
-        # admission remains fail-closed on its persisted unsupported verdict.
+        # Keep an explicit text-only selection visible while image admission
+        # remains fail-closed on its persisted unsupported verdict.
         warning = error_body
 
     changed = (
@@ -937,10 +952,10 @@ def vision_route_configure(
     *,
     caller_api_key: str | None,
 ) -> tuple[dict, int]:
-    """Create or reuse a route, then probe and select it for V2 images."""
-    if not _vision_runtime_v2_enabled(store):
+    """Create or reuse a route, then probe and select it for image turns."""
+    if not _vision_routing_available(store):
         return {
-            "error": "vision_runtime_v2_required",
+            "error": "vision_resident_update_required",
             "config": _vision_config_payload(store),
         }, 409
 
@@ -982,8 +997,8 @@ def vision_route_test(
     *,
     caller_api_key: str | None,
 ) -> tuple[dict, int]:
-    if not _vision_runtime_v2_enabled(store):
-        return {"error": "vision_runtime_v2_required"}, 409
+    if not _vision_routing_available(store):
+        return {"error": "vision_resident_update_required"}, 409
     route = db.model_api_route_get(store.user_id, route_id)
     if not route:
         return {"error": "route_not_found"}, 404

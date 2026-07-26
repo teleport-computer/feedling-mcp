@@ -67,6 +67,7 @@ EXPECTED_CORE_BODY_REFS = {
     ("post", "/v1/model_api/chat/send"): "HostedChatSendRequest",
     ("put", "/v1/vision/config"): "VisionConfigUpdateRequest",
     ("post", "/v1/vision/config"): "VisionRouteCreateRequest",
+    ("post", "/v1/vision/observe"): "VisionObserveRequest",
     ("post", "/v1/chat/message"): "ChatTransportRequest",
     ("post", "/v1/chat/response"): "ChatResponseRequest",
     ("post", "/v1/chat/turn-activity/{turn_id}/events"): "ChatActivityEventRequest",
@@ -86,6 +87,7 @@ EXPECTED_HEADER_OPERATIONS = {
         "x-feedling-consumer-id",
         "x-feedling-consumer-version",
         "x-feedling-consumer-commit",
+        "x-feedling-consumer-capabilities",
         "x-feedling-consumer-compat-commit",
         "x-feedling-decrypt-status",
         "x-feedling-decrypt-checked-at",
@@ -95,6 +97,7 @@ EXPECTED_HEADER_OPERATIONS = {
         "x-feedling-consumer-id",
         "x-feedling-consumer-version",
         "x-feedling-consumer-commit",
+        "x-feedling-consumer-capabilities",
     },
     ("put", "/v1/genesis/imports/{job_id}/chunks/{seq}"): {
         "x-envelope-meta",
@@ -177,10 +180,10 @@ def test_public_operation_and_parameter_inventory(
     # 150 since POST /v1/model_api/models (BYOK model catalog listing, has a body).
     # 151 since GET /v1/chat/turn-activity/{turn_id} (V2 activity read model).
     # 152 and 70 bodies since V1 resident tool-activity event ingest.
-    # Vision routing adds GET/PUT/POST config plus POST route test; the two
-    # mutation endpoints carry request bodies.
-    assert len(operations) == 156
-    assert sum("requestBody" in operation for operation in operations.values()) == 72
+    # Vision routing adds GET/PUT/POST config, POST route test, and the
+    # authenticated resident observer exchange; three mutations carry bodies.
+    assert len(operations) == 157
+    assert sum("requestBody" in operation for operation in operations.values()) == 73
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")

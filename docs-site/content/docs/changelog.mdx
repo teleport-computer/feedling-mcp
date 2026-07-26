@@ -106,6 +106,12 @@ change must not be interpreted as an API guarantee.
   unknown buckets fall back to total-only. The shipped V1 resident `io_cli`
   records the same fixed-shape invocation transitions through an authenticated,
   turn-scoped write boundary; tool arguments and result bodies are never sent.
+- **Separate vision models now work on Hosted Runtime V1 and VPS residents as
+  well as Runtime V2.** The official resident advertises a fresh
+  `vision_observer_v1` capability, accepted image turns pin the selected route,
+  and only a neutral untrusted observation reaches the main model. Dedicated
+  routing fails closed when the resident is outdated or the observer fails;
+  follow-main keeps the existing image path.
 
 - **Runtime V2 now honors the Dream and screen-watch consent switches at
   execution time.** Disabling Dream prevents queued Dream work from making a

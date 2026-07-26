@@ -127,6 +127,12 @@ CONSUMER_HEADERS = [
         "Resident consumer source revision.",
         example="a1b2c3d",
     ),
+    _header(
+        "X-Feedling-Consumer-Capabilities",
+        _schema("string", maxLength=500),
+        "Comma-separated capabilities advertised by the current official resident poll.",
+        example="vision_observer_v1",
+    ),
 ]
 
 CONSUMER_COMPAT_HEADERS = [
@@ -840,6 +846,15 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             {"required": ["api_key"], "not": {"required": ["credential_id"]}},
             {"required": ["credential_id"], "not": {"required": ["api_key"]}},
         ],
+        "additionalProperties": False,
+    },
+    "VisionObserveRequest": {
+        "type": "object",
+        "required": ["message_id", "route_id"],
+        "properties": {
+            "message_id": {"type": "string", "minLength": 1},
+            "route_id": {"type": "string", "minLength": 1},
+        },
         "additionalProperties": False,
     },
     "HostedChatAcceptedResponse": {
@@ -1622,6 +1637,7 @@ PRECISE_JSON_BODIES: dict[Operation, str] = {
     ("post", "/v1/model_api/runtime_error"): "ModelApiRuntimeErrorRequest",
     ("put", "/v1/vision/config"): "VisionConfigUpdateRequest",
     ("post", "/v1/vision/config"): "VisionRouteCreateRequest",
+    ("post", "/v1/vision/observe"): "VisionObserveRequest",
     ("post", "/v1/chat/message"): "ChatTransportRequest",
     ("post", "/v1/chat/response"): "ChatResponseRequest",
     ("post", "/v1/chat/turn-activity/{turn_id}/events"): "ChatActivityEventRequest",
