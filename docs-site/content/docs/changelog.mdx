@@ -10,6 +10,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 now gives unaudited model routes a 65,536-token default context
+  window.** The existing environment override remains available, and setting it
+  to `0` still restores fail-closed configuration. Explicit route metadata,
+  audited model families, and deployment overrides continue to take
+  precedence.
 - **Runtime V2 now applies a persistent per-user retry delay after automatic
   wake failures.** Consecutive heartbeat or agent-scheduled wake failures back
   off from 60 seconds to a maximum of one hour, and a successful automatic

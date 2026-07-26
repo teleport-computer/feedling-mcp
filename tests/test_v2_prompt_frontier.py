@@ -111,36 +111,41 @@ def test_unaudited_route_gets_conservative_default(monkeypatch):
     monkeypatch.delenv(frontier._UNAUDITED_DEFAULT_ENV, raising=False)
     resolved = frontier.resolve_model_limit("some-relay", "mystery-model")
     assert resolved.source == "unaudited_default"
-    assert resolved.context_window_tokens == 32768
+    assert resolved.context_window_tokens == 65536
     # A first-party provider NAME pointed at a custom base_url is still unaudited.
     custom = frontier.resolve_model_limit(
         "openai", "gpt-4o-mini", base_url="https://llm-proxy.example/v1"
     )
     assert custom.source == "unaudited_default"
-    assert custom.context_window_tokens == 32768
+    assert custom.context_window_tokens == 65536
 
 
-def test_raised_default_fits_persona_sized_required_prompt(monkeypatch):
-    """Regression: a persona/world-book-sized REQUIRED set (~20k tokens) that
-    overflowed the old 16384 default's input budget now fits under the raised
-    default, so a custom-relay user with a real persona is served instead of
-    getting ``prompt_frontier_exhausted`` before any provider call (the prod
-    failure mode for world-book users on unaudited relays)."""
+def test_raised_default_provides_target_58880_input_budget(monkeypatch):
+    """The 64K default reserves 4K output + 1K safety and leaves 58,880 input
+    tokens, enough headroom for the target 40-turn history."""
     monkeypatch.delenv(frontier._UNAUDITED_DEFAULT_ENV, raising=False)
-    # One indivisible required component larger than the old ~11.5k input budget
-    # but smaller than the new ~27k one — i.e. it straddles the raise.
     persona = frontier.PromptComponent(
-        name="persona", estimated_tokens=20_000, required=True
+        name="target_history", estimated_tokens=58_880, required=True
     )
     limit = frontier.resolve_model_limit("some-relay", "mystery-model")
-    plan = frontier.plan_prompt(model_limit=limit, components=[persona])
-    assert "persona" in plan.included_components  # planned, no exhaustion
+    plan = frontier.plan_prompt(
+        model_limit=limit,
+        components=[persona],
+        output_reserve_tokens=4_096,
+        safety_margin_tokens=1_024,
+    )
+    assert "target_history" in plan.included_components
 
-    # The old 16384 default (opt back in via env) would reject the same set.
-    monkeypatch.setenv(frontier._UNAUDITED_DEFAULT_ENV, "16384")
+    # The old 32K default (opt back in via env) rejects the same required set.
+    monkeypatch.setenv(frontier._UNAUDITED_DEFAULT_ENV, "32768")
     old_limit = frontier.resolve_model_limit("some-relay", "mystery-model")
     with pytest.raises(frontier.PromptFrontierExhausted):
-        frontier.plan_prompt(model_limit=old_limit, components=[persona])
+        frontier.plan_prompt(
+            model_limit=old_limit,
+            components=[persona],
+            output_reserve_tokens=4_096,
+            safety_margin_tokens=1_024,
+        )
 
 
 def test_unaudited_default_is_env_tunable_and_zero_restores_fail_closed(monkeypatch):

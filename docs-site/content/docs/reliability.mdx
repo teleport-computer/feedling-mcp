@@ -104,6 +104,14 @@ attributes it to a temporary upstream-provider failure. Automatic wake lanes
 fail silently instead: they write neither a chat bubble nor an error chip.
 Letters, numbers, CJK text, and emoji count as usable reply content.
 
+For a custom or otherwise unaudited model route without an explicit context
+window, Runtime V2 uses a 65,536-token default. With the standard 4,096-token
+output reserve and 1,024-token safety margin, 58,880 tokens remain for input.
+Self-hosted operators can override the default with
+`FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS`; setting it to `0`
+restores fail-closed configuration. Explicit route metadata, audited model
+families, and deployment overrides keep precedence over this fallback.
+
 Automatic Runtime V2 heartbeat and agent-scheduled wake failures use a
 persistent per-user exponential retry delay. The delay starts at 60 seconds
 and is capped at one hour; a successful automatic wake clears it. A new
