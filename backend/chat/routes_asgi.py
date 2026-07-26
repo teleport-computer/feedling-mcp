@@ -23,6 +23,7 @@ from asgi import threadpool
 from asgi.deps import require_auth
 from asgi.settings import settings
 from bootstrap import gates as boot_gates
+from chat import activity_core as chat_activity_core
 from chat import chat_core
 from chat import consumer as chat_consumer
 from chat import poll_core as chat_poll_core
@@ -205,6 +206,14 @@ async def chat_history(request: Request, auth: AuthResult = Depends(require_auth
         query=dict(request.query_params),
         user_agent=request.headers.get("User-Agent", ""),
         remote_addr=request.client.host if request.client else "",
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/chat/turn-activity/{turn_id}")
+async def chat_turn_activity(turn_id: str, auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(
+        chat_activity_core.read_turn_activity, auth.store, turn_id
     )
     return JSONResponse(body, status_code=status)
 

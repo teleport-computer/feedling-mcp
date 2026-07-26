@@ -1649,6 +1649,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "Metrics the adapter cannot report are status=\"unsupported\", not omitted."
     ),
     ("get", "/v1/chat/history"): "Read encrypted chat history. Use oldest_seq as before_seq for lossless older paging and latest_seq as after_seq for lossless forward paging; timestamp watermarks remain for compatibility.",
+    ("get", "/v1/chat/turn-activity/{turn_id}"): "Read display-safe Runtime V2 activity for one hosted chat turn. Events come only from backend-owned job and tool-dispatch records and include bounded identifiers, state, timing, result classification, and durable-effect disposition; successful memory_search/memory_fetch events also include the confirmed returned-item count and, only when every item uses the canonical bucket taxonomy, a complete category-count breakdown. Tool arguments, result bodies, assistant prose, reasoning, and custom bucket labels are never returned. A V1/resident turn has no activity resource and returns 404 turn_activity_not_found.",
     ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",
     ("post", "/v1/memory/fetch"): "Fetch full records for selected memory IDs. Sensitive fetch behavior is not part of the current public contract.",
     ("post", "/v1/memory/actions"): "Apply up to 20 memory actions in order. The batch is not transactional and Idempotency-Key is not supported.",

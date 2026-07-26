@@ -171,6 +171,64 @@ plus a bounded filename, MIME, and byte count. The worker never scans a runtime
 directory, and `send_file` rejects host paths and non-`/workspace` namespaces.
 Both editable source and rendered output are limited to 1,000,000 bytes.
 
+### 3. Read confirmed Runtime V2 activity
+
+Use the accepted user message id as `turn_id` while waiting for the hosted
+reply:
+
+~~~http
+GET /v1/chat/turn-activity/msg_user_123 HTTP/1.1
+Host: api.feedling.app
+X-API-Key: YOUR_FEEDLING_API_KEY
+~~~
+
+~~~json
+{
+  "turn_id": "msg_user_123",
+  "runtime": "v2",
+  "complete": false,
+  "phase": "processing",
+  "jobs": [{ "job_id": "job_abc", "status": "running" }],
+  "events": [
+    {
+      "id": "job_abc:1:1",
+      "kind": "tool",
+      "name": "memory_search",
+      "status": "success",
+      "job_id": "job_abc",
+      "call_id": "call_01",
+      "duration_ms": 18.4,
+      "result_code": "ok",
+      "memory_count": 4,
+      "memory_categories": [
+        { "key": "relationship", "count": 3 },
+        { "key": "family", "count": 1 }
+      ]
+    }
+  ]
+}
+~~~
+
+This is a read-only Runtime V2 projection. It is sourced from backend-owned job
+and tool-dispatch records, not reconstructed from assistant text. It never
+returns tool arguments, tool result bodies, or reasoning. Durable effects may
+add `effect_id`, `effect_type`, and `effect_status` only after the dispatcher
+has confirmed their disposition. V1/resident turns return
+`404 turn_activity_not_found`.
+
+For successful `memory_search` and `memory_fetch`, `memory_count` is derived
+from the actual capability result before the provider-facing result can be
+truncated. `memory_categories` is optional: it is present only when every
+returned item has one of the canonical bilingual memory buckets and its counts
+sum to `memory_count`. If any bucket is custom or unknown, the category list is
+omitted and clients should show the total only. Raw bucket labels, summaries,
+memory content, and query text never enter activity metadata.
+
+Completed tool events are also attached to the assistant history item's
+`activity_events` metadata, so clients can render the execution record below
+the final reply. A separately encrypted `thinking_*` envelope remains the only
+source for display-safe reasoning and must not be merged with tool activity.
+
 ## Independent resident loop
 
 The resident path is a queue-and-reply protocol. It does not accept plaintext

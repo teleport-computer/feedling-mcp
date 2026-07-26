@@ -171,7 +171,8 @@ def test_public_operation_and_parameter_inventory(
     # only the POST carries a body, hence 67 -> 68.
     # 149 since GET /v1/model_api/usage (provider balance/usage snapshot).
     # 150 since POST /v1/model_api/models (BYOK model catalog listing, has a body).
-    assert len(operations) == 150
+    # 151 since GET /v1/chat/turn-activity/{turn_id} (V2 activity read model).
+    assert len(operations) == 151
     assert sum("requestBody" in operation for operation in operations.values()) == 69
 
     query_operations = {

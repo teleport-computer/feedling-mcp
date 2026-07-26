@@ -154,7 +154,10 @@ def test_migration_head_and_watermark_seq_column():
     assert script.get_revision("0058_provider_usage_halted").down_revision == (
         "0057_provider_health"
     )
-    assert script.get_current_head() == "0058_provider_usage_halted"
+    assert script.get_revision("0059_chat_activity_lookup_idx").down_revision == (
+        "0058_provider_usage_halted"
+    )
+    assert script.get_current_head() == "0059_chat_activity_lookup_idx"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"
     )

@@ -37,6 +37,9 @@ class ToolCall:
 class ToolResult:
     call_id: str
     content: str
+    # Trusted in-process metadata for observability/UI projection. Provider
+    # encoders intentionally consume only call_id + content.
+    metadata: dict | None = None
 
 
 @dataclass(frozen=True)

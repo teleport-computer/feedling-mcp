@@ -216,6 +216,8 @@
 | `job_not_found` | 404 | — | resident pending/heartbeat/complete 路径 | ✅ |
 | `heartbeat_rejected` | 409 | — | 非 owner 或 job 已不在 processing | |
 | `invalid_job_id` | 400 | — | | |
+| `invalid_turn_id` | 400 | — | Runtime V2 chat activity turn id is malformed | |
+| `turn_activity_not_found` | 404 | — | No Runtime V2 job belongs to this chat turn; expected for V1/resident turns | |
 | `genesis_job_not_found` | 404 | — | plaintext job 状态/chunk 上传路径（同语义、不同 slug 名） | |
 | `ciphertext_sha256_mismatch` | 400 | — | | |
 | `chunk_envelope_required` | 400 | — | genesis 分片上传信封校验族（下 9 行同族，见 genesis/service.py raise 点） | |

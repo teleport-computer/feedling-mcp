@@ -2013,12 +2013,20 @@ def _sink_reply(user_id: str, payload: dict) -> None:
     if v2_worker.REPLY_FOLLOWUPS_KEY in payload:
         raise RuntimeError("reply followups require the transactional sink")
 
-    # Only forward ``extra`` when thinking, failure, or file metadata is present,
-    # so an ordinary reply keeps its exact prior sink call shape.
+    # Keep all reply metadata on the same authoritative row. File content,
+    # thinking, failure, and confirmed activity use disjoint keys.
     content_type, message_extra = _reply_message_fields(payload)
-    reply_extra = v2_worker._reply_effect_extra(payload)
-    combined_extra = {**reply_extra, **message_extra}
-    extra_kwargs = {"extra": combined_extra} if combined_extra else {}
+    extra = v2_worker._reply_effect_extra(payload)
+    if payload.get("activity_job_id"):
+        extra.update(
+            v2_worker._activity_extra(
+                payload.get("activity_events"),
+                turn_id=str(payload.get("activity_turn_id") or ""),
+                job_id=int(payload["activity_job_id"]),
+            )
+        )
+    extra.update(message_extra)
+    extra_kwargs = {"extra": extra} if extra else {}
     envelope = payload.get("envelope")
     if isinstance(envelope, dict):
         store = core_store.get_store(user_id)

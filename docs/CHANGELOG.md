@@ -47,7 +47,19 @@
 
 ## 记录正文（最新的在上面）
 
-## 2026-07-26 — V1 resident 补齐可下载文件
+## 2026-07-26
+
+### [DONE] Runtime V2 聊天执行记录改为后端权威投影
+- V2 provider-native 工具调度在调用开始和真实结果/异常边界写入 display-safe
+  `agent_status_events`；只保留受限的工具名、call/job/effect id、状态、耗时和结果
+  分类，不保存参数、结果正文、助手文案或推理。
+- 新增用户鉴权的只读 `GET /v1/chat/turn-activity/{turn_id}`。它按 user + turn
+  关联 `agent_jobs.trace_id`，V1/resident 回合固定返回 404，不提供客户端自报写入口。
+- 最终回复把同一份受限工具事件附在 `activity_events` metadata；provider-native
+  reasoning 继续走独立加密 thinking envelope，二者不混合。
+- `memory_search` / `memory_fetch` 在 capability 真实结果还未截断时提取返回总数；
+  只有每一项都命中固定双语通用桶时才附完整分类计数，任一自定义/未知桶则只保留总数。
+  记忆摘要、正文、搜索词和原始桶名都不进入活动记录。
 
 ### [DONE] Claude / Codex / Pi 共用文件生成与原子回复
 - V1 CLI resident 新增 `io_cli send-file`：模型把 UTF-8 源文件写进每用户隔离的

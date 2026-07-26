@@ -249,7 +249,10 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0061_v2_adaptive_tail_metrics").down_revision == (
         "0060_v2_wake_failure_backoff"
     )
-    assert script.get_current_head() == "0061_v2_adaptive_tail_metrics"
+    assert script.get_revision("0062_chat_activity_lookup_idx").down_revision == (
+        "0061_v2_adaptive_tail_metrics"
+    )
+    assert script.get_current_head() == "0062_chat_activity_lookup_idx"
 
 
 def test_provider_health_schema_is_runtime_neutral():

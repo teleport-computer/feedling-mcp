@@ -59,6 +59,7 @@ from notices import catalog as notices_catalog
 from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
+from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
 from core import provider_usage
 from core import store as core_store
@@ -2012,6 +2013,129 @@ def _make_tool_trajectory_callback(
         )
 
     return _record
+
+
+def _make_chat_tool_activity_callback(
+    *,
+    user_id: str,
+    job_id: int,
+    attempt_identity: int,
+    recorder: v2_trajectory.TrajectoryRecorder | None,
+    effect_evidence_by_call: dict[str, dict],
+):
+    """Write a display-safe status row at each confirmed V2 tool boundary."""
+    trajectory_callback = _make_tool_trajectory_callback(
+        recorder, effect_evidence_by_call
+    )
+    invocation_ids: dict[int, str] = {}
+    ordinal = itertools.count(1)
+
+    async def _record(tc, event_kind: str, payload: dict) -> None:
+        if trajectory_callback is not None:
+            await trajectory_callback(tc, event_kind, payload)
+
+        object_key = id(tc)
+        if event_kind == "tool_call_started" or object_key not in invocation_ids:
+            invocation_ids[object_key] = (
+                f"{job_id}:{int(attempt_identity)}:{next(ordinal)}"
+            )
+        result = payload.get("result")
+        result_content = result.content if isinstance(result, ToolResult) else ""
+        effect = effect_evidence_by_call.get(str(tc.id)) or {}
+        detail: dict[str, Any] = {
+            "activity_id": invocation_ids[object_key],
+            "tool_name": core_chat_activity.safe_token(tc.name, max_len=120),
+            "call_id": core_chat_activity.safe_token(tc.id, max_len=160),
+            "state": core_chat_activity.event_state(event_kind, result_content),
+        }
+        duration = core_chat_activity.safe_duration_ms(payload.get("duration_ms"))
+        if duration is not None:
+            detail["duration_ms"] = duration
+        if event_kind == "tool_call_error":
+            detail["result_code"] = "tool_error"
+        elif event_kind == "tool_call_result":
+            detail["result_code"] = core_chat_activity.result_code(
+                result_content, effect
+            )
+        for key, target, limit in (
+            ("effect_id", "effect_id", 160),
+            ("effect_type", "effect_type", 80),
+            ("status", "effect_status", 40),
+        ):
+            token = core_chat_activity.safe_token(effect.get(key), max_len=limit)
+            if token:
+                detail[target] = token
+        if isinstance(result, ToolResult):
+            detail.update(core_chat_activity.safe_memory_metadata(result.metadata))
+        try:
+            await asyncio.to_thread(
+                jobs_store.append_status_event,
+                user_id,
+                core_chat_activity.TOOL_ACTIVITY_KIND,
+                job_id=job_id,
+                label=detail["tool_name"],
+                detail=detail,
+            )
+        except Exception as exc:  # noqa: BLE001 — observability cannot fail a tool
+            log.warning(
+                "[v2.activity] append failed user=%s job=%s code=%s",
+                user_id,
+                job_id,
+                type(exc).__name__.lower(),
+            )
+        if event_kind in {"tool_call_result", "tool_call_error"}:
+            invocation_ids.pop(object_key, None)
+
+    return _record
+
+
+def _activity_extra(events: list[dict] | None, *, turn_id: str, job_id: int) -> dict:
+    """Validate the final display-safe projection before storing it on chat."""
+    safe_events: list[dict] = []
+    for event in list(events or [])[: core_chat_activity.MAX_ACTIVITY_EVENTS]:
+        if not isinstance(event, dict):
+            continue
+        event_id = core_chat_activity.safe_token(event.get("id"), max_len=160)
+        name = core_chat_activity.safe_token(event.get("name"), max_len=120)
+        status = core_chat_activity.safe_token(event.get("status"), max_len=24)
+        if not event_id or not name or status not in {"running", "success", "failure"}:
+            continue
+        item: dict[str, Any] = {
+            "id": event_id,
+            "kind": "tool",
+            "name": name,
+            "status": status,
+            "job_id": str(int(job_id)),
+        }
+        for key, limit in (
+            ("call_id", 160),
+            ("effect_id", 160),
+            ("effect_type", 80),
+            ("effect_status", 40),
+            ("result_code", 64),
+        ):
+            token = core_chat_activity.safe_token(event.get(key), max_len=limit)
+            if token:
+                item[key] = token
+        for key in ("started_at", "finished_at"):
+            try:
+                value = float(event.get(key))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(value) and value > 0:
+                item[key] = value
+        duration = core_chat_activity.safe_duration_ms(event.get("duration_ms"))
+        if duration is not None:
+            item["duration_ms"] = duration
+        item.update(core_chat_activity.safe_memory_metadata(event))
+        safe_events.append(item)
+    extra: dict[str, Any] = {
+        "activity_turn_id": core_chat_activity.safe_token(turn_id, max_len=160),
+        "activity_job_id": str(int(job_id)),
+    }
+    if safe_events:
+        extra["activity_events"] = safe_events
+    return {key: value for key, value in extra.items() if value not in ("", [])}
 
 
 async def _run_trajectory_review_turn(
@@ -7896,6 +8020,15 @@ async def process_job(
         dispatch_provider_usage = _make_provider_usage_dispatcher(
             provider_config=provider_config
         )
+        # One recorder spans every provider round so invocation ids remain
+        # unique for the whole job, including policy-blocked calls.
+        chat_tool_activity_callback = _make_chat_tool_activity_callback(
+            user_id=user_id,
+            job_id=int(job_id),
+            attempt_identity=int(job.get("attempt_count") or 0),
+            recorder=trajectory_recorder,
+            effect_evidence_by_call=effect_evidence_by_call,
+        )
 
         async def _dispatch_tools(tool_calls):
             cancelled = await _web_batch_cancellation(
@@ -8105,28 +8238,23 @@ async def process_job(
                 dispatchable_calls = [
                     tc for tc in tool_calls if str(tc.id) not in blocked_by_id
                 ]
-                blocked_event = _make_tool_trajectory_callback(
-                    trajectory_recorder,
-                    effect_evidence_by_call,
-                )
-                if blocked_event is not None:
-                    for tc in tool_calls:
-                        result = blocked_by_id.get(str(tc.id))
-                        if result is None:
-                            continue
-                        await blocked_event(
-                            tc,
-                            "tool_call_started",
-                            {"phase": "mutation_recovery_blocked"},
-                        )
-                        await blocked_event(
-                            tc,
-                            "tool_call_result",
-                            {
-                                "phase": "mutation_recovery_blocked",
-                                "result": result,
-                            },
-                        )
+                for tc in tool_calls:
+                    result = blocked_by_id.get(str(tc.id))
+                    if result is None:
+                        continue
+                    await chat_tool_activity_callback(
+                        tc,
+                        "tool_call_started",
+                        {"phase": "mutation_recovery_blocked"},
+                    )
+                    await chat_tool_activity_callback(
+                        tc,
+                        "tool_call_result",
+                        {
+                            "phase": "mutation_recovery_blocked",
+                            "result": result,
+                        },
+                    )
 
             dispatched = await _dispatch_mixed_tool_calls(
                 dispatchable_calls,
@@ -8145,10 +8273,7 @@ async def process_job(
                 mcp_mutation_finished=_mcp_mutation_finished,
                 mcp_wall_budget=mcp_wall_budget,
                 on_progress=_report_turn_progress,
-                on_tool_event=_make_tool_trajectory_callback(
-                    trajectory_recorder,
-                    effect_evidence_by_call,
-                ),
+                on_tool_event=chat_tool_activity_callback,
             )
             dispatched_by_id = {str(result.call_id): result for result in dispatched}
             results = [
@@ -8272,6 +8397,25 @@ async def process_job(
                     payload[REPLY_FOLLOWUPS_KEY] = followups
             if turn_failure_error_class:
                 payload["turn_failure_error_class"] = turn_failure_error_class
+            if final:
+                try:
+                    status_rows = await asyncio.to_thread(
+                        jobs_store.status_events_for_job, user_id, int(job_id)
+                    )
+                    payload.update(
+                        _activity_extra(
+                            core_chat_activity.project_tool_events(status_rows),
+                            turn_id=str(job.get("trace_id") or ""),
+                            job_id=int(job_id),
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 — reply stays authoritative
+                    log.warning(
+                        "[v2.activity] final projection failed user=%s job=%s code=%s",
+                        user_id,
+                        job_id,
+                        type(exc).__name__.lower(),
+                    )
             # Provider chain-of-thought rides the same effect as its final reply,
             # sealed into a separate thinking envelope so the durable outbox holds
             # only ciphertext and a retry re-addresses the same thinking row. Only

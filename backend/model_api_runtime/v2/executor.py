@@ -16,6 +16,7 @@ from typing import Any
 from capabilities import registry as cap_registry
 from capabilities import tool_schema
 from capabilities import identity as cap_identity
+from capabilities import activity_metadata
 from model_api_runtime.v2 import provenance as _prov
 from provider_types import ToolResult
 
@@ -103,12 +104,14 @@ async def dispatch_tool_calls(
 
     async def _read(tc):
         step = {"type": tc.name, "payload": tc.args}
+        metadata = None
         try:
             _t, data = await _run_one(
                 store, step, api_key=api_key, runtime_token=runtime_token,
                 enclave_sem=enclave_sem,
             )
             content = _summarize_capability_result(data)
+            metadata = activity_metadata.memory_result_metadata(tc.name, data) or None
         except Exception:  # noqa: BLE001 — isolate one bad read; never expose its exception
             # Read calls are independent and side-effect-free.  A capability bug or
             # adapter failure must not discard successful sibling results or fail the
@@ -116,7 +119,7 @@ async def dispatch_tool_calls(
             # text can contain decrypted data, URLs, or query terms.  Cancellation is a
             # BaseException on supported Python versions and therefore still propagates.
             content = "error: capability_failed"
-        return tc.id, ToolResult(call_id=tc.id, content=content)
+        return tc.id, ToolResult(call_id=tc.id, content=content, metadata=metadata)
 
     read_sem = asyncio.Semaphore(max(1, int(read_parallelism)))
 

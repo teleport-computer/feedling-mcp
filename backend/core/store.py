@@ -520,6 +520,11 @@ class UserStore:
                 "thinking_source",
                 "thinking_model",
                 "thinking_native",
+                # Runtime V2 display-safe execution projection. It contains
+                # fixed identifiers/status codes only, never args/results.
+                "activity_turn_id",
+                "activity_job_id",
+                "activity_events",
                 "reply_claimed_by",
                 "reply_claimed_at",
                 "reply_claim_expires_at",
@@ -542,6 +547,10 @@ class UserStore:
                     msg[key] = value
                 elif key == "file_byte_count" and isinstance(value, int) and value > 0:
                     msg[key] = value
+                elif key == "activity_events" and isinstance(value, list):
+                    msg[key] = [
+                        dict(item) for item in value if isinstance(item, dict)
+                    ][:100]
         return msg
 
     def append_chat(
@@ -701,6 +710,9 @@ class UserStore:
                 "thinking_source",
                 "thinking_model",
                 "thinking_native",
+                "activity_turn_id",
+                "activity_job_id",
+                "activity_events",
                 "reply_claimed_by",
                 "reply_claimed_at",
                 "reply_claim_expires_at",
@@ -723,6 +735,10 @@ class UserStore:
                     msg[key] = value
                 elif key == "file_byte_count" and isinstance(value, int) and value > 0:
                     msg[key] = value
+                elif key == "activity_events" and isinstance(value, list):
+                    msg[key] = [
+                        dict(item) for item in value if isinstance(item, dict)
+                    ][:100]
         if resident_reply_to is not None:
             msg["reply_to_message_id"] = str(resident_reply_to)
 

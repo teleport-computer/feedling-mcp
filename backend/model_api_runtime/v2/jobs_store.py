@@ -2900,6 +2900,44 @@ def append_status_event(
     return event_id
 
 
+def chat_turn_activity_rows(user_id: str, turn_id: str) -> tuple[list[dict], list[dict]]:
+    """Return V2 jobs and display-safe status rows for one chat message id."""
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, status FROM agent_jobs "
+                "WHERE user_id=%s AND lane='chat' AND trace_id=%s ORDER BY id ASC",
+                (str(user_id), str(turn_id)),
+            )
+            jobs = [dict(row) for row in cur.fetchall()]
+            cur.execute(
+                "SELECT event.id,event.job_id,event.user_id,event.kind,event.label,"
+                "event.detail_json,event.seq,"
+                "extract(epoch FROM event.created_at)::float8 AS created_at "
+                "FROM agent_status_events AS event "
+                "JOIN agent_jobs AS job ON job.id=event.job_id "
+                "WHERE event.user_id=%s AND job.user_id=%s AND job.lane='chat' "
+                "AND job.trace_id=%s ORDER BY event.id ASC LIMIT 500",
+                (str(user_id), str(user_id), str(turn_id)),
+            )
+            events = [dict(row) for row in cur.fetchall()]
+    return jobs, events
+
+
+def status_events_for_job(user_id: str, job_id: int) -> list[dict]:
+    """Read one V2 job's status stream for final reply projection."""
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id,job_id,user_id,kind,label,detail_json,seq,"
+                "extract(epoch FROM created_at)::float8 AS created_at "
+                "FROM agent_status_events WHERE user_id=%s AND job_id=%s "
+                "ORDER BY id ASC LIMIT 500",
+                (str(user_id), int(job_id)),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+
 def list_status_events(user_id, *, after_id=0, limit=50) -> list[dict]:
     """按 id 升序返回 user 自 after_id 之后的 status 事件（游标读）。每行含
     id/job_id/user_id/kind/label/detail_json/seq/created_at(epoch float)。委托到
