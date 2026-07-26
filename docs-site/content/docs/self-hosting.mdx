@@ -121,6 +121,10 @@ these settings:
 | `FEEDLING_HOSTED_RUNTIME_POLICY` | The code default and managed deployments are `dual` (V1 resident supervisor and Runtime V2 coexist behind a per-user fence). The reference self-hosting Compose file pins `v2_only`, a fail-closed override under which resident/per-user selectors are rejected. |
 | `FEEDLING_RUNTIME_TOKEN_SECRET` | Required by the current hosted topology. Generate a high-entropy secret, supply it to the backend and Runtime V2 workers through a secret manager, and never bake it into an image. |
 | `FEEDLING_V2_MAX_WORKERS` | Bounds concurrent Runtime V2 turn slots per worker container. Size it together with PostgreSQL pool capacity and provider limits. |
+| `FEEDLING_V2_CHAT_TAIL_MAX_TURNS` | Optional maximum complete-turn replay target for foreground Chat (default 40). The model-aware prompt frontier may choose a smaller newest suffix. |
+| `FEEDLING_V2_WAKE_TAIL_MAX_TURNS` | Optional maximum complete-turn replay target for proactive wake lanes (default 16). Larger values increase user-BYOK prompt cost. |
+| `FEEDLING_V2_RECENT_TURN_ROW_CAP` | Defensive encrypted-row read cap used while locating complete recent turns (default 512). If the cap cuts the oldest selected turn, Runtime V2 drops that partial turn and records a tail fallback instead of rendering an incomplete group. |
+| `FEEDLING_V2_TAIL_BUDGET_MSGS` | Legacy compaction message threshold only. It is not interpreted as turns; use the two `*_TAIL_MAX_TURNS` settings for replay depth. |
 | `FEEDLING_V2_SANDBOX_PROVIDER` | Defaults to `disabled`. Set to `e2b` only on worker deployments that are allowed to send decrypted artifact bytes to E2B. Text-only turns and virtual text edits do not need it. |
 | `E2B_API_KEY` + `FEEDLING_V2_E2B_TEMPLATE` | Required together when the sandbox provider is `e2b`. The template must implement Feedling's fixed extractor contract; inject the API key through the deployment secret channel. |
 | `FEEDLING_V2_E2B_ALLOW_INTERNET` | Defaults to `0`. Enabling sandbox internet is a deployment-level trust and egress decision, never a model-selected option. |

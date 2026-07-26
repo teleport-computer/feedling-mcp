@@ -246,7 +246,10 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0060_v2_wake_failure_backoff").down_revision == (
         "0059_v2_incident_wake_guards"
     )
-    assert script.get_current_head() == "0060_v2_wake_failure_backoff"
+    assert script.get_revision("0061_v2_adaptive_tail_metrics").down_revision == (
+        "0060_v2_wake_failure_backoff"
+    )
+    assert script.get_current_head() == "0061_v2_adaptive_tail_metrics"
 
 
 def test_provider_health_schema_is_runtime_neutral():
@@ -576,24 +579,32 @@ def test_0041_downgrade_is_unconditionally_unsupported_after_diagnostics():
                 conn.execute(migration._DOWN_UNSUPPORTED)
 
 
-def test_prompt_cache_metric_columns_and_recent_window_index_exist():
+def test_prompt_cache_and_adaptive_tail_metric_schema_exists():
     with db.get_pool().connection() as conn:
         columns = conn.execute(
-            "SELECT column_name FROM information_schema.columns "
+            "SELECT column_name, data_type, is_nullable, column_default "
+            "FROM information_schema.columns "
             "WHERE table_name='v2_turn_metrics' AND column_name IN "
             "('provider','model','cache_read_tokens','cache_write_tokens',"
             "'cache_miss_tokens','usage_reported_calls','cache_reported_calls',"
-            "'cache_route_fingerprint')"
+            "'cache_route_fingerprint','effective_tail_turns','tail_fallback',"
+            "'prompt_frontier_exhaustion_count')"
         ).fetchall()
         indexes = conn.execute(
-            "SELECT indexname FROM pg_indexes WHERE tablename='v2_turn_metrics'"
+            "SELECT indexname, indexdef FROM pg_indexes "
+            "WHERE tablename='v2_turn_metrics'"
+        ).fetchall()
+        constraints = conn.execute(
+            "SELECT conname FROM pg_constraint "
+            "WHERE conrelid='v2_turn_metrics'::regclass"
         ).fetchall()
         token_types = conn.execute(
             "SELECT column_name, data_type FROM information_schema.columns "
             "WHERE table_name='v2_turn_metrics' "
             "AND column_name IN ('prompt_tokens','completion_tokens')"
         ).fetchall()
-    assert {row[0] for row in columns} == {
+    by_column = {row[0]: row[1:] for row in columns}
+    assert set(by_column) == {
         "provider",
         "model",
         "cache_route_fingerprint",
@@ -602,9 +613,27 @@ def test_prompt_cache_metric_columns_and_recent_window_index_exist():
         "cache_miss_tokens",
         "usage_reported_calls",
         "cache_reported_calls",
+        "effective_tail_turns",
+        "tail_fallback",
+        "prompt_frontier_exhaustion_count",
     }
-    assert "ix_v2_turn_metrics_lane_created_at" in {row[0] for row in indexes}
-    assert "ix_v2_turn_metrics_cache_proof" in {row[0] for row in indexes}
+    assert by_column["effective_tail_turns"] == ("integer", "YES", None)
+    assert by_column["tail_fallback"] == ("boolean", "NO", "false")
+    assert by_column["prompt_frontier_exhaustion_count"] == (
+        "integer",
+        "NO",
+        "0",
+    )
+    by_index = dict(indexes)
+    assert "ix_v2_turn_metrics_lane_created_at" in by_index
+    assert "ix_v2_turn_metrics_cache_proof" in by_index
+    assert "idx_v2_turn_metrics_tail_lane_created" in by_index
+    assert "WHERE (effective_tail_turns IS NOT NULL)" in by_index[
+        "idx_v2_turn_metrics_tail_lane_created"
+    ]
+    constraint_names = {row[0] for row in constraints}
+    assert "ck_v2_turn_metrics_effective_tail_turns" in constraint_names
+    assert "ck_v2_turn_metrics_frontier_exhaustion_count" in constraint_names
     assert dict(token_types) == {
         "prompt_tokens": "bigint",
         "completion_tokens": "bigint",

@@ -5150,6 +5150,69 @@ def chat_messages_after_seq(
     ]
 
 
+def chat_recent_turn_rows(
+    user_id: str,
+    *,
+    max_turns: int,
+    row_cap: int,
+    through_seq: int | None = None,
+) -> dict:
+    """Newest bounded rows anchored at genuine user turn seeds.
+
+    ``max_turns`` bounds the seed search while ``row_cap`` bounds encrypted row
+    disclosure. The newest-row scan may begin inside the oldest selected turn;
+    callers must drop that partial prefix before rendering. ``window_rows``
+    reports the pre-cap row count without exposing content.
+    """
+    bounded_turns = max(1, min(int(max_turns), 1000))
+    bounded_rows = max(1, min(int(row_cap), 10_000))
+    upper = int(through_seq) if through_seq is not None else chat_max_seq(user_id)
+    if upper < 0:
+        raise ValueError("through_seq must be >= 0")
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "WITH seeds AS ("
+            " SELECT seq FROM chat_messages "
+            " WHERE user_id=%s AND seq<=%s "
+            " AND doc->>'role' IN ('user','human') "
+            " AND COALESCE(doc->>'source','') "
+            " NOT IN ('verify_ping','resident_maintenance') "
+            " ORDER BY seq DESC LIMIT %s"
+            "), boundary AS (SELECT MIN(seq) AS first_seq FROM seeds), "
+            "windowed AS ("
+            " SELECT cm.seq,cm.msg_id,cm.ts,cm.doc,count(*) OVER() AS window_rows "
+            " FROM chat_messages cm CROSS JOIN boundary b "
+            " WHERE cm.user_id=%s AND b.first_seq IS NOT NULL "
+            " AND cm.seq>=b.first_seq AND cm.seq<=%s"
+            ") SELECT seq,msg_id,ts,doc,window_rows FROM windowed "
+            "ORDER BY seq DESC LIMIT %s",
+            (
+                str(user_id),
+                upper,
+                bounded_turns,
+                str(user_id),
+                upper,
+                bounded_rows,
+            ),
+        ).fetchall()
+    chronological = list(reversed(rows))
+    window_rows = int(rows[0][4]) if rows else 0
+    return {
+        "rows": [
+            {
+                **dict(row[3] or {}),
+                "id": str(row[1]),
+                "ts": float(row[2]),
+                "seq": int(row[0]),
+            }
+            for row in chronological
+        ],
+        "requested_turns": bounded_turns,
+        "window_rows": window_rows,
+        "source_truncated": window_rows > len(rows),
+    }
+
+
 def chat_capture_messages_after_seq(
     user_id: str,
     after_seq: int,
@@ -5244,7 +5307,12 @@ def chat_seqs_after_seq(
     return [int(r[0]) for r in rows]
 
 
-def count_messages_after_seq(user_id: str, after_seq: int) -> int:
+def count_messages_after_seq(
+    user_id: str,
+    after_seq: int,
+    *,
+    through_seq: int | None = None,
+) -> int:
     """COUNT of THIS USER's own ``chat_messages`` rows with ``seq > after_seq``
     — scoped by ``user_id``, unlike a bare ``chat_max_seq(...) - after_seq``
     seq-arithmetic estimate. ``chat_messages.seq`` is a TABLE-WIDE ``BIGINT
@@ -5259,12 +5327,46 @@ def count_messages_after_seq(user_id: str, after_seq: int) -> int:
     ``tail_limit`` using a real per-user count, not a global-seq guess — a
     one-shot ``COUNT(*)`` on the existing ``(user_id, seq)`` index, exactly
     as cheap as :func:`chat_max_seq`."""
+    upper = int(through_seq) if through_seq is not None else None
+    if upper is not None and upper <= int(after_seq):
+        return 0
+    predicate = "WHERE user_id = %s AND seq > %s"
+    params: list = [user_id, after_seq]
+    if upper is not None:
+        predicate += " AND seq <= %s"
+        params.append(upper)
     with get_pool().connection() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) FROM chat_messages WHERE user_id = %s AND seq > %s",
-            (user_id, after_seq),
+            f"SELECT COUNT(*) FROM chat_messages {predicate}",
+            tuple(params),
         ).fetchone()
     return int(row[0]) if row and row[0] is not None else 0
+
+
+def chat_recent_genuine_turn_boundary_seq(
+    user_id: str,
+    *,
+    max_turns: int,
+    through_seq: int,
+) -> int | None:
+    """Oldest seed seq among the newest ``max_turns`` genuine user turns."""
+    bounded = max(1, min(int(max_turns), 1000))
+    upper = int(through_seq)
+    if upper < 0:
+        raise ValueError("through_seq must be >= 0")
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT MIN(seq) FROM ("
+            " SELECT seq FROM chat_messages "
+            " WHERE user_id=%s AND seq<=%s "
+            " AND doc->>'role' IN ('user','human') "
+            " AND COALESCE(doc->>'source','') "
+            " NOT IN ('verify_ping','resident_maintenance') "
+            " ORDER BY seq DESC LIMIT %s"
+            ") recent_seeds",
+            (str(user_id), upper, bounded),
+        ).fetchone()
+    return int(row[0]) if row and row[0] is not None else None
 
 
 def chat_seq_for_msg_id(user_id: str, msg_id: str) -> int | None:

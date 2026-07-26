@@ -822,7 +822,7 @@ def _read_tail_window(
 def _read_tail_window_after_seq(
     user_id: str,
     after_seq: int,
-    limit: int,
+    limit: int | None,
     *,
     oldest_first: bool,
     through_seq: int | None = None,
@@ -832,7 +832,7 @@ def _read_tail_window_after_seq(
     rows = db.chat_messages_after_seq(
         user_id,
         int(after_seq),
-        limit=int(limit),
+        limit=(int(limit) if limit is not None else None),
         oldest_first=oldest_first,
         through_seq=through_seq,
     )
@@ -848,7 +848,7 @@ def _read_tail_window_after_seq(
 def _read_tail_after_seq(
     user_id: str,
     after_seq: int,
-    limit: int,
+    limit: int | None,
     *,
     through_seq: int | None = None,
 ) -> list[dict]:
@@ -882,6 +882,42 @@ def _read_compaction_tail_after_seq(
         # retain their existing exact output contract.
         include_capture_metadata=True,
     )
+
+
+def _read_recent_turns(
+    user_id: str,
+    max_turns: int,
+    row_cap: int,
+    *,
+    through_seq: int | None = None,
+) -> dict:
+    """Decrypt a frozen recent turn window while retaining seed metadata."""
+    window = db.chat_recent_turn_rows(
+        user_id,
+        max_turns=max_turns,
+        row_cap=row_cap,
+        through_seq=through_seq,
+    )
+    raw_rows = list(window.get("rows") or [])
+    decrypted = _decrypt_chat_rows(
+        user_id,
+        raw_rows,
+        user_only=False,
+        preserve_unreadable=True,
+    )
+    raw_by_seq = {int(row["seq"]): row for row in raw_rows}
+    for row in decrypted:
+        raw = raw_by_seq.get(int(row.get("seq") or 0), {})
+        role = str(raw.get("role") or "").strip().lower()
+        source = str(raw.get("source") or "")
+        row["_genuine_user"] = (
+            role in {"user", "human"}
+            and source not in {"verify_ping", "resident_maintenance"}
+        )
+    return {
+        **window,
+        "rows": decrypted,
+    }
 
 
 def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
@@ -2894,6 +2930,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_compaction_tail=_read_compaction_tail,
         read_tail_after_seq=_read_tail_after_seq,
         read_compaction_tail_after_seq=_read_compaction_tail_after_seq,
+        read_recent_turns=_read_recent_turns,
         read_temporal_snapshot=_read_temporal_snapshot,
         read_summary=_read_summary,
         read_summary_with_seq=_read_summary_with_seq,

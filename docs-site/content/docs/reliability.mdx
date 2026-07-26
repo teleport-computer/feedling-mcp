@@ -121,6 +121,24 @@ precedence over the latest stable device-perception timezone; users without
 either value fall back to UTC. Temporal metadata is appended as untrusted
 application data and does not change the original conversation messages.
 
+Runtime V2 selects recent context in complete user-seeded turns rather than a
+raw message count. Foreground Chat targets up to 40 turns; heartbeat,
+agent-scheduled, manual, and screen-watch wakes target up to 16. A smaller
+provider window may reduce the replay to the largest newest suffix that fits,
+but only after those rows are durably represented by the encrypted summary.
+The summary, every uncovered source row, the current request or wake nudge, and
+the provider-native tool transcript remain required and are never clipped.
+This keeps the union of summary coverage and exact rows complete even when
+optional replay shrinks between provider rounds.
+
+The previous wake window was 20 messages, approximately 10 ordinary
+user/assistant turns. A 16-turn wake can therefore replay about 60% more
+conversation in the common two-message shape. Relative to the 40-turn Chat
+target, it replays 60% fewer turns. Provider and compaction calls use the
+account's configured BYOK credential, so the account owner bears those token
+costs. Actual usage depends on message size, summary size, tools, and the
+provider's context limit.
+
 Automatic Runtime V2 heartbeat and agent-scheduled wake failures use a
 persistent per-user exponential retry delay. The delay starts at 60 seconds
 and is capped at one hour; a successful automatic wake clears it. A new

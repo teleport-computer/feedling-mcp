@@ -274,6 +274,16 @@ def v2_metrics(
                 and cache_until_ts is not None
             ),
         ),
+        "tail_window": {
+            lane: jobs_store.recent_tail_window_stats(lane=lane)
+            for lane in (
+                "chat",
+                "heartbeat",
+                "scheduled",
+                "manual_wake",
+                "screen_watch",
+            )
+        },
         "wake": jobs_store.wake_success_stats(),
         "effects": db.effect_outbox_health(),
         # The genesis import worker rides in the serve_worker process on its own

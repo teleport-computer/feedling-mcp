@@ -31,6 +31,16 @@ change must not be interpreted as an API guarantee.
   a rewriter: only the model can tell whether a given "user" means the account
   holder or that person's own customers, and guessing wrong would silently
   rewrite a true memory into a false one.
+- **Runtime V2 now selects recent conversation context in complete turns.**
+  Foreground Chat targets the newest 40 user-seeded turns and proactive wake
+  lanes target 16. Before every provider round, smaller model windows can
+  reduce only summary-covered verbatim replay to the largest newest suffix that
+  fits; the summary, uncovered exact rows, current request or wake nudge, and
+  native tool transcript are never clipped. Budget pressure can first compact
+  a safe answered prefix and then rebuild from the new durable watermark, so
+  every stored row remains represented by either summary coverage or exact
+  prompt content. New turn-based environment settings control the two targets;
+  the legacy message-count setting keeps its old compaction meaning.
 - **Runtime V2 chat and wake turns now receive explicit temporal context.**
   Each turn gets one snapshot containing UTC and user-local time, the latest
   genuine user-message age, and timestamps for the verbatim conversation tail.

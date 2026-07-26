@@ -3145,6 +3145,9 @@ def record_whole_turn_metric(
     provider=None,
     model=None,
     cache_route_fingerprint=None,
+    effective_tail_turns=None,
+    tail_fallback=False,
+    prompt_frontier_exhaustion_count=0,
 ) -> None:
     """One idempotent whole-turn metric per job (spec B5): upsert on job_id so a
     re-drive (redelivery/retry of the same job) REPLACES rather than appends. Covers
@@ -3156,8 +3159,10 @@ def record_whole_turn_metric(
                 "completion_tokens, cache_read_tokens, cache_write_tokens, "
                 "cache_miss_tokens, usage_reported_calls, cache_reported_calls, "
                 "provider, model, cache_route_fingerprint, latency_ms, model_calls, "
-                "retries, failed, status) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "retries, failed, status, effective_tail_turns, tail_fallback, "
+                "prompt_frontier_exhaustion_count) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                "%s,%s,%s) "
                 "ON CONFLICT (job_id) DO UPDATE SET "
                 "user_id=EXCLUDED.user_id, lane=EXCLUDED.lane, "
                 "prompt_tokens=EXCLUDED.prompt_tokens, completion_tokens=EXCLUDED.completion_tokens, "
@@ -3170,6 +3175,10 @@ def record_whole_turn_metric(
                 "cache_route_fingerprint=EXCLUDED.cache_route_fingerprint, "
                 "latency_ms=EXCLUDED.latency_ms, model_calls=EXCLUDED.model_calls, "
                 "retries=EXCLUDED.retries, failed=EXCLUDED.failed, status=EXCLUDED.status, "
+                "effective_tail_turns=EXCLUDED.effective_tail_turns, "
+                "tail_fallback=EXCLUDED.tail_fallback, "
+                "prompt_frontier_exhaustion_count="
+                "EXCLUDED.prompt_frontier_exhaustion_count, "
                 "updated_at=now()",
                 (
                     job_id,
@@ -3190,10 +3199,62 @@ def record_whole_turn_metric(
                     retries,
                     failed,
                     status,
+                    effective_tail_turns,
+                    bool(tail_fallback),
+                    max(0, int(prompt_frontier_exhaustion_count)),
                 ),
             )
     except Exception as e:  # noqa: BLE001 — best-effort instrumentation, never fail the turn
         log.error("[jobs_store] record_whole_turn_metric(%s) failed: %s", job_id, e)
+
+
+def recent_tail_window_stats(*, lane: str, limit: int = 1000) -> dict:
+    """Content-free adaptive-tail outcomes for one exact Runtime V2 lane."""
+    bounded = max(1, min(int(limit), 10_000))
+    with _pool().connection() as conn:
+        row = conn.execute(
+            "WITH recent AS ("
+            " SELECT effective_tail_turns,tail_fallback,"
+            " prompt_frontier_exhaustion_count,prompt_tokens "
+            " FROM v2_turn_metrics WHERE lane=%s "
+            " ORDER BY created_at DESC,id DESC LIMIT %s"
+            ") SELECT count(*)::int,"
+            " count(effective_tail_turns)::int,"
+            " min(effective_tail_turns)::int,"
+            " avg(effective_tail_turns)::double precision,"
+            " max(effective_tail_turns)::int,"
+            " count(*) FILTER (WHERE tail_fallback)::int,"
+            " coalesce(sum(prompt_frontier_exhaustion_count),0)::bigint,"
+            " sum(prompt_tokens)::bigint FROM recent",
+            (str(lane), bounded),
+        ).fetchone()
+    sampled = int(row[0] or 0) if row else 0
+    measured = int(row[1] or 0) if row else 0
+    fallback_turns = int(row[5] or 0) if row else 0
+    return {
+        "lane": str(lane),
+        "sample_limit": bounded,
+        "sampled_turns": sampled,
+        "measured_turns": measured,
+        "measurement_coverage": (
+            float(measured) / float(sampled) if sampled else None
+        ),
+        "effective_tail_turns_min": (
+            int(row[2]) if row and row[2] is not None else None
+        ),
+        "effective_tail_turns_avg": (
+            float(row[3]) if row and row[3] is not None else None
+        ),
+        "effective_tail_turns_max": (
+            int(row[4]) if row and row[4] is not None else None
+        ),
+        "fallback_turns": fallback_turns,
+        "fallback_rate": (
+            float(fallback_turns) / float(measured) if measured else None
+        ),
+        "prompt_frontier_exhaustion_count": int(row[6] or 0) if row else 0,
+        "prompt_tokens": int(row[7]) if row and row[7] is not None else None,
+    }
 
 
 def recent_mean_tokens_per_turn(*, lane: str = "chat", limit: int = 50) -> float | None:

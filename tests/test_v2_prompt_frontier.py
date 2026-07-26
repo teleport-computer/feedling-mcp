@@ -688,3 +688,113 @@ def test_tool_catalog_is_counted_and_omitted_whole_when_only_it_does_not_fit(
     assert len(calls) == 1
     assert calls[0][1] is None
     assert calls[0][0] == [{"role": "system", "content": "stable prefix"}]
+
+
+def test_adaptive_round_reports_tail_window_to_metrics_and_trajectory(monkeypatch):
+    calls = []
+    metric_windows = []
+    trajectory = []
+
+    class AdaptiveBuilder:
+        def __call__(self, transcript):
+            return [{"role": "user", "content": "fallback"}, *transcript]
+
+        def plan_provider_round(self, **kwargs):
+            messages = [{"role": "user", "content": "adaptive"}]
+            plan = frontier.plan_provider_round(
+                model_limit=kwargs["model_limit"],
+                messages=messages,
+                tools=kwargs["tools"],
+                output_reserve_tokens=kwargs["output_reserve_tokens"],
+                safety_margin_tokens=kwargs["safety_margin_tokens"],
+                utf8_bytes_per_token=kwargs["utf8_bytes_per_token"],
+                image_reserve_tokens=kwargs["image_reserve_tokens"],
+            )
+            return messages, plan, {
+                "lane": "chat",
+                "target_turns": 40,
+                "available_turns": 40,
+                "effective_turns": 23,
+                "fallback": True,
+                "source_truncated": False,
+            }
+
+    async def provider(_config, messages, *, tools=None):
+        calls.append((messages, tools))
+        return {"reply": "ok", "tool_calls": [], "usage": {}}
+
+    async def fold():
+        return []
+
+    async def record(kind, payload):
+        trajectory.append((kind, payload))
+
+    outcome = _run_loop(
+        monkeypatch=monkeypatch,
+        provider=provider,
+        fold=fold,
+        build_messages=AdaptiveBuilder(),
+        provider_config=provider_client.ProviderConfig(
+            "custom",
+            "adaptive",
+            "key",
+            context_window_tokens=32_768,
+        ),
+        on_tail_window=lambda item: metric_windows.append(item),
+        on_trajectory_event=record,
+    )
+
+    assert outcome.final_text == "ok"
+    assert calls[0][0] == [{"role": "user", "content": "adaptive"}]
+    assert metric_windows == [{
+        "lane": "chat",
+        "target_turns": 40,
+        "available_turns": 40,
+        "effective_turns": 23,
+        "fallback": True,
+        "source_truncated": False,
+    }]
+    request = next(payload for kind, payload in trajectory if kind == "provider_request")
+    assert request["tail_window"] == metric_windows[0]
+
+
+def test_adaptive_required_exhaustion_is_counted_and_still_raised(monkeypatch):
+    counted = []
+    provider_calls = []
+
+    class ExhaustedBuilder:
+        def __call__(self, transcript):
+            return []
+
+        def plan_provider_round(self, **kwargs):
+            raise frontier.PromptFrontierExhausted(
+                required_tokens=10_000,
+                input_budget_tokens=8_000,
+                context_window_tokens=12_000,
+                required_components=("message_context",),
+            )
+
+    async def provider(_config, messages, *, tools=None):
+        provider_calls.append(messages)
+        return {"reply": "not reached", "tool_calls": [], "usage": {}}
+
+    async def fold():
+        return []
+
+    with pytest.raises(frontier.PromptFrontierExhausted):
+        _run_loop(
+            monkeypatch=monkeypatch,
+            provider=provider,
+            fold=fold,
+            build_messages=ExhaustedBuilder(),
+            provider_config=provider_client.ProviderConfig(
+                "custom",
+                "adaptive",
+                "key",
+                context_window_tokens=12_000,
+            ),
+            on_prompt_frontier_exhaustion=lambda: counted.append(True),
+        )
+
+    assert counted == [True]
+    assert provider_calls == []

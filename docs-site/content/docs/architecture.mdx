@@ -70,7 +70,16 @@ notification text also passes through the external push provider.
 Runtime V2 builds each turn from an encrypted hierarchical summary frontier plus
 every uncovered source message verbatim. The trusted runner decrypts that
 selected view in memory before sending ordinary plaintext messages to the
-configured model. Exact immutable leaf segments carry source-range/count
+configured model. It can additionally replay a newest suffix of complete,
+user-seeded turns that the summary already covers: Chat targets 40 turns and
+proactive wake lanes target 16. Before each provider round, the runner admits
+the largest newest complete-turn suffix that fits the resolved model window
+after the fixed prompt, summary, uncovered exact core, and provider-native tool
+transcript. Only summary-covered replay is optional; uncovered rows are never
+clipped. If the required core is too large, the runner first compacts only a
+safe answered prefix and rebuilds the prompt from the new durable watermark.
+
+Exact immutable leaf segments carry source-range/count
 witnesses; immutable higher-level checkpoints retain and name their ordered
 children, while one encrypted materialized view keeps ordinary turns to a
 single summary decrypt. The durable encrypted `chat_messages` rows and
