@@ -147,6 +147,39 @@ def _load_workspace_prompt(store, *, runtime_token: str) -> dict:
     }
 
 
+def _load_workspace_file(
+    store,
+    *,
+    runtime_token: str,
+    path: str,
+    expected_revision: int,
+) -> dict:
+    """Resolve one explicit send_file target inside the current user's VFS.
+
+    ``model_writable_path`` canonicalizes traversal and namespace aliases. The
+    stricter prefix check keeps working memory out of downloadable replies and
+    makes ``/workspace`` the sole publication namespace. No host path is ever
+    opened or materialized.
+    """
+    canonical = model_writable_path(str(path or ""))
+    if not canonical.startswith("/workspace/"):
+        raise ValueError("send_file target is outside /workspace")
+    entry = production_workspace_backend(
+        store,
+        runtime_token=str(runtime_token or ""),
+    ).read(canonical)
+    if type(expected_revision) is not int or expected_revision <= 0:
+        raise ValueError("send_file revision is invalid")
+    if entry.revision != expected_revision:
+        raise ValueError("send_file revision conflict")
+    return {
+        "path": entry.path,
+        "content": entry.content,
+        "mime_type": entry.mime_type,
+        "revision": entry.revision,
+    }
+
+
 def _positive_float_env(name: str, default: str) -> float:
     raw = os.environ.get(name, default)
     try:
@@ -1842,6 +1875,76 @@ def build_effect_dispatch(deps: EffectSinkDeps) -> Callable[[str, dict], None]:
     return dispatch
 
 
+def _reply_message_fields(payload: dict) -> tuple[str, dict]:
+    """Validate the bounded plaintext metadata attached to a reply effect."""
+    raw = payload.get("message_extra")
+    if raw is None:
+        return "text", {}
+    if not isinstance(raw, dict) or set(raw) != {
+        "content_type",
+        "file_name",
+        "file_mime",
+        "file_byte_count",
+    }:
+        raise RuntimeError("invalid reply message metadata")
+    if raw.get("content_type") != "file":
+        raise RuntimeError("unsupported reply content type")
+    name = v2_worker._safe_download_name(
+        "/workspace/" + str(raw.get("file_name") or "")
+    )
+    if name != str(raw.get("file_name") or ""):
+        raise RuntimeError("invalid reply file name")
+    mime_type = str(raw.get("file_mime") or "").strip()
+    if (
+        not mime_type
+        or len(mime_type) > 120
+        or any(not char.isprintable() for char in mime_type)
+    ):
+        raise RuntimeError("invalid reply file mime")
+    byte_count = raw.get("file_byte_count")
+    if (
+        type(byte_count) is not int
+        or byte_count <= 0
+        or byte_count > v2_worker._WORKSPACE_FILE_MAX_BYTES
+    ):
+        raise RuntimeError("invalid reply file size")
+    return "file", {
+        "file_name": name,
+        "file_mime": mime_type,
+        "file_byte_count": byte_count,
+    }
+
+
+def _reply_payload_sequence(payload: dict) -> list[dict]:
+    """Validate a final text reply followed by its downloadable file cards."""
+    if v2_worker.REPLY_FOLLOWUPS_KEY not in payload:
+        return [payload]
+    raw_followups = payload.get(v2_worker.REPLY_FOLLOWUPS_KEY)
+    if (
+        not isinstance(raw_followups, list)
+        or not raw_followups
+        or len(raw_followups) > v2_worker.MAX_TOOL_CALLS_PER_TURN
+    ):
+        raise RuntimeError("invalid reply followups")
+
+    primary = dict(payload)
+    primary.pop(v2_worker.REPLY_FOLLOWUPS_KEY, None)
+    if _reply_message_fields(primary)[0] != "text":
+        raise RuntimeError("reply followups require a text primary")
+
+    sequence = [primary]
+    for raw_followup in raw_followups:
+        if (
+            not isinstance(raw_followup, dict)
+            or set(raw_followup) != {"envelope", "message_extra"}
+            or not isinstance(raw_followup.get("envelope"), dict)
+            or _reply_message_fields(raw_followup)[0] != "file"
+        ):
+            raise RuntimeError("invalid reply followup")
+        sequence.append(dict(raw_followup))
+    return sequence
+
+
 def _sink_reply(user_id: str, payload: dict) -> None:
     """Persist a naturally-idempotent encrypted reply effect.
 
@@ -1861,10 +1964,15 @@ def _sink_reply(user_id: str, payload: dict) -> None:
     reply-is-terminal invariant; restores the deleted
     `test_reply_envelope_failure_is_terminal_not_success` guarantee on the
     new PR A effect-sink path)."""
+    if v2_worker.REPLY_FOLLOWUPS_KEY in payload:
+        raise RuntimeError("reply followups require the transactional sink")
+
     # Only forward ``extra`` when a thinking sub-envelope is present, so a
     # no-reasoning reply keeps its exact prior sink call shape.
+    content_type, message_extra = _reply_message_fields(payload)
     thinking_extra = v2_worker._thinking_extra(payload.get("thinking"))
-    extra_kwargs = {"extra": thinking_extra} if thinking_extra else {}
+    combined_extra = {**thinking_extra, **message_extra}
+    extra_kwargs = {"extra": combined_extra} if combined_extra else {}
     envelope = payload.get("envelope")
     if isinstance(envelope, dict):
         store = core_store.get_store(user_id)
@@ -1872,6 +1980,7 @@ def _sink_reply(user_id: str, payload: dict) -> None:
             store,
             envelope,
             reply_through_seq=int(payload.get("reply_through_seq") or 0),
+            content_type=content_type,
             **extra_kwargs,
         )
         return
@@ -1902,29 +2011,47 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
     commit, so none of those auxiliary systems can turn a durably published
     reply/job/effect into a reported failure.
     """
-    envelope = payload.get("envelope")
-    if not isinstance(envelope, dict):
-        raise RuntimeError("transactional reply requires encrypted envelope")
+    message_payloads = _reply_payload_sequence(payload)
     store = core_store.get_store(user_id)
-    thinking_extra = v2_worker._thinking_extra(payload.get("thinking"))
-    build_extra = dict(thinking_extra) if thinking_extra else {}
-    wake_kind = str(payload.get("wake_kind") or "")
-    if wake_kind:
-        build_extra["wake_kind"] = wake_kind
-    build_kwargs = {"extra": build_extra} if build_extra else {}
-    msg = store._build_chat_message("openclaw", "model_api", envelope, **build_kwargs)
-    msg_id = str(msg["id"])
-    seq, inserted, finish_db_post_commit = db.chat_append_effect_with_cursor(
-        user_id,
-        msg_id,
-        float(msg["ts"]),
-        msg,
-        core_store.MAX_CHAT_MESSAGES,
-        payload.get("reply_through_seq"),
-        connection=connection,
-        defer_post_commit=True,
-    )
-    msg["seq"] = int(seq)
+    records = []
+    previous_ts: float | None = None
+    last_index = len(message_payloads) - 1
+    for index, message_payload in enumerate(message_payloads):
+        envelope = message_payload.get("envelope")
+        if not isinstance(envelope, dict):
+            raise RuntimeError("transactional reply requires encrypted envelope")
+        content_type, message_extra = _reply_message_fields(message_payload)
+        thinking_extra = v2_worker._thinking_extra(message_payload.get("thinking"))
+        build_extra = {**thinking_extra, **message_extra}
+        wake_kind = str(message_payload.get("wake_kind") or "")
+        if wake_kind:
+            build_extra["wake_kind"] = wake_kind
+        build_kwargs = {"extra": build_extra} if build_extra else {}
+        msg = store._build_chat_message(
+            "openclaw",
+            "model_api",
+            envelope,
+            content_type=content_type,
+            **build_kwargs,
+        )
+        message_ts = float(msg["ts"])
+        if previous_ts is not None and message_ts <= previous_ts:
+            message_ts = previous_ts + 0.000001
+            msg["ts"] = message_ts
+        previous_ts = message_ts
+        msg_id = str(msg["id"])
+        seq, inserted, finish_db_post_commit = db.chat_append_effect_with_cursor(
+            user_id,
+            msg_id,
+            message_ts,
+            msg,
+            core_store.MAX_CHAT_MESSAGES,
+            payload.get("reply_through_seq") if index == last_index else None,
+            connection=connection,
+            defer_post_commit=True,
+        )
+        msg["seq"] = int(seq)
+        records.append((msg, inserted, finish_db_post_commit))
 
     # PostgreSQL delivers NOTIFY only if the surrounding outbox transaction
     # commits.  This closes the commit->process-crash wake gap for other backend
@@ -1939,14 +2066,15 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
     )
 
     def post_commit() -> None:
-        try:
-            finish_db_post_commit()
-        except Exception as exc:  # noqa: BLE001 — committed primary is authoritative
-            log.warning(
-                "[v2.reply] post-commit mirror/offload failed user=%s code=%s",
-                user_id,
-                type(exc).__name__.lower(),
-            )
+        for _msg, _inserted, finish_db_post_commit in records:
+            try:
+                finish_db_post_commit()
+            except Exception as exc:  # noqa: BLE001 — committed primary is authoritative
+                log.warning(
+                    "[v2.reply] post-commit mirror/offload failed user=%s code=%s",
+                    user_id,
+                    type(exc).__name__.lower(),
+                )
         try:
             store.reload_chat_strict()
         except Exception as exc:  # noqa: BLE001 — cross-worker reload/poll is fallback
@@ -1955,13 +2083,13 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
                 user_id,
                 type(exc).__name__.lower(),
             )
-        if inserted:
+        if any(inserted for _msg, inserted, _finish in records):
             try:
                 # Runtime V2's runner-owned sweep is the sole capture producer.
                 # Replies update the shared frontier counters but never append
                 # the dead resident ``proactive_jobs`` stream.
                 capture_scheduler.refresh_capture_state_from_chat(
-                    store, now=msg["ts"]
+                    store, now=records[-1][0]["ts"]
                 )
             except Exception as exc:  # noqa: BLE001 — auxiliary capture only
                 log.warning(
@@ -2863,6 +2991,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         apply_pending_effects=_apply_pending_effects_for_user,
         load_mcp_turn=mcp_tools.load_turn_mcp,
         load_workspace_prompt=_load_workspace_prompt,
+        load_workspace_file=_load_workspace_file,
         seal_trajectory_payload=_seal_trajectory_payload,
         open_trajectory_payload=_open_trajectory_payload,
         send_reply_push=(

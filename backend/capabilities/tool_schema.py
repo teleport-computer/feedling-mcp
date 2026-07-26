@@ -21,6 +21,7 @@ from provider_types import ToolSpec
 from capabilities import registry
 
 REPLY_TOOL = "reply"
+FILE_REPLY_TOOL = "send_file"
 TASK_TOOL = "task"
 PROVIDER_USAGE_TOOL = "provider_usage"
 
@@ -235,6 +236,14 @@ PARAMS: dict[str, dict] = {
         "properties": {"text": _STR},
         "required": ["text"],
     },
+    # Explicitly publish one file that already exists in the encrypted V2
+    # workspace. The worker resolves the path for the current user; this never
+    # accepts a host filesystem path.
+    FILE_REPLY_TOOL: {
+        "type": "object",
+        "properties": {"path": _STR, "revision": _INT},
+        "required": ["path", "revision"],
+    },
 
     # -- runtime-native provider_usage tool (chat-lane only; see worker.py
     # _SUBAGENT_ALLOWED_TOOLS / _PRIVATE_READ_TOOLS / _run_wake disabled set) --
@@ -301,15 +310,34 @@ DESCRIPTIONS: dict[str, str] = {
                        "/workspace (editable), and /memory/WORKING.md (editable)."),
     "workspace_read": ("Read a line range from a virtual text entry. This reads a "
                        "stored text view and does not materialize a physical artifact."),
-    "workspace_write": ("Create or replace an editable virtual text file using optimistic "
-                        "revision control. Use expected_revision=0 to create; /artifacts "
-                        "and /skills are read-only."),
+    "workspace_write": ("Create or replace editable UTF-8 source using optimistic "
+                        "revision control. For a downloadable .docx or .pdf target, "
+                        "write clear Markdown-like source at that exact target path; "
+                        "send_file renders the binary document. Use expected_revision=0 "
+                        "to create; /artifacts and /skills are read-only."),
     "workspace_delete": ("Delete an editable virtual file at its exact revision. "
                          "Artifacts and skills cannot be deleted by the model."),
     TASK_TOOL: ("Run a bounded isolated subagent on one focused task. The child can "
                 "read workspace/artifact, memory, and web data but cannot reply to "
                 "the user, mutate state, call MCP, or spawn another task."),
     REPLY_TOOL: "Send an immediate reply bubble to the user with the given text.",
+    FILE_REPLY_TOOL: (
+        "Deliver an existing /workspace source as a downloadable attachment. "
+        "Plain-text formats are sent directly; .docx and .pdf targets are rendered "
+        "into real Word/PDF bytes. Preserve any format the user explicitly requested: "
+        "Word means .docx and PDF means .pdf, and never replace either with Markdown. "
+        "Choose this tool from the user's meaning, not from exact "
+        "keywords, wording, language, or a named extension: use it whenever the "
+        "requested result is meant to be a reusable standalone artifact they can "
+        "save, open, download, share, or use outside the chat. If format or name "
+        "is omitted, infer a useful text format and safe filename yourself; the "
+        "user never needs to know /workspace or provide an internal path. Create "
+        "or update the file with workspace_write first, wait for that tool result, "
+        "then call send_file in a later round with the exact returned revision. "
+        "Do not call this merely because a conversational answer contains a list "
+        "or structured text. Host filesystem paths and /artifacts, /skills, or "
+        "/memory entries are not accepted."
+    ),
     PROVIDER_USAGE_TOOL: (
         "查询当前 AI 服务商账户的余额与用量（只读）。仅在用户明确询问余额、用量、"
         "还剩多少钱时调用；结果如实转述，查不到就说查不到。"
@@ -449,6 +477,12 @@ def validate_tool_args(name: str, args) -> str | None:
             return "expected_revision must be a non-negative integer"
     if name == TASK_TOOL and not str(args.get("prompt") or "").strip():
         return "task requires a non-empty prompt"
+    if name == FILE_REPLY_TOOL and not str(args.get("path") or "").strip():
+        return "send_file requires a non-empty path"
+    if name == FILE_REPLY_TOOL and (
+        type(args.get("revision")) is not int or args["revision"] <= 0
+    ):
+        return "send_file revision must be a positive integer"
     return None
 
 
@@ -458,7 +492,7 @@ def build_tool_specs() -> list[ToolSpec]:
         if name in _EXCLUDED:
             continue
         specs.append(ToolSpec(name=name, description=DESCRIPTIONS[name], parameters=PARAMS[name]))
-    for name in (TASK_TOOL, REPLY_TOOL, PROVIDER_USAGE_TOOL):
+    for name in (TASK_TOOL, REPLY_TOOL, FILE_REPLY_TOOL, PROVIDER_USAGE_TOOL):
         specs.append(ToolSpec(
             name=name,
             description=DESCRIPTIONS[name],

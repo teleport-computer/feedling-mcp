@@ -145,7 +145,7 @@ def _script_provider(monkeypatch, responses):
     it = iter(responses)
     calls = []
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         calls.append({"messages": messages, "tools": tools})
         return next(it)
 
@@ -597,7 +597,7 @@ def test_chat_native_task_runs_child_then_returns_result_to_parent(
     )
     calls = []
 
-    async def provider(config, messages, *, tools=None):
+    async def provider(config, messages, *, tools=None, **_kwargs):
         calls.append(
             {
                 "config": config,
@@ -688,7 +688,7 @@ def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
     deps = _late_input_deps(uid, written)
     calls = []
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **_kwargs):
         calls.append(list(messages))
         if len(calls) == 1:
             # This is the production send invariant: B and the running job's
@@ -869,7 +869,7 @@ def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
     first_attempt_calls = 0
     retry_messages = []
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **_kwargs):
         nonlocal first_attempt_calls
         if phase == "crash":
             first_attempt_calls += 1
@@ -1212,7 +1212,7 @@ def test_sweeper_wins_final_effect_before_producer_drain_and_loop_still_retries(
     deps.apply_pending_effects = sweep_before_producer
     calls = []
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **_kwargs):
         calls.append(list(messages))
         if len(calls) == 1:
             _seq, same_job_id = db.chat_append_and_enqueue(
@@ -1302,7 +1302,7 @@ def test_last_call_late_input_hands_off_without_reply_or_error_chip(
         cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({})
     )
 
-    async def provider(_config, _messages, *, tools=None):
+    async def provider(_config, _messages, *, tools=None, **_kwargs):
         _seq, same_job_id = db.chat_append_and_enqueue(
             uid,
             "B",
@@ -1398,7 +1398,7 @@ def test_invalid_final_fence_fails_visibly_without_reply_or_retry_loop(monkeypat
 
     deps.apply_pending_effects = corrupt_terminal_before_apply
 
-    async def provider(_config, _messages, *, tools=None):
+    async def provider(_config, _messages, *, tools=None, **_kwargs):
         return _text_round("must never be visible")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)

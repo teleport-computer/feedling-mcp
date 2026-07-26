@@ -195,6 +195,7 @@ async def run_tool_loop(
     extra_mutating_tool_names=None,
     disabled_tool_names=None,
     allow_reply_tool: bool = True,
+    on_file_reply=None,
     outbound_blocking_read_tool_names=None,
     outbound_blocking_read_tool_predicate=None,
     max_tool_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
@@ -231,7 +232,12 @@ async def run_tool_loop(
     `deps.apply_pending_effects`, whose reply sink does an enclave-bound encrypted
     write; the drain itself is `asyncio.to_thread`-offloaded on the caller's side, so
     ``on_reply`` must be awaited here, never called synchronously (a sync call would
-    reintroduce the event-loop-blocking write the offload is meant to avoid)."""
+    reintroduce the event-loop-blocking write the offload is meant to avoid).
+
+    ``on_file_reply`` is an optional async chat-lane callback. When absent, the
+    ``send_file`` tool is removed from the offered catalog. Production resolves
+    only encrypted ``/workspace`` entries through this callback; the loop never
+    interprets a model string as a host filesystem path."""
     max_tool_calls_per_round = _positive_limit(
         max_tool_calls_per_round, name="max_tool_calls_per_round"
     )
@@ -331,6 +337,8 @@ async def run_tool_loop(
         disabled_names.discard(tool_schema.REPLY_TOOL)
     else:
         disabled_names.add(tool_schema.REPLY_TOOL)
+    if on_file_reply is None:
+        disabled_names.add(tool_schema.FILE_REPLY_TOOL)
     turn_catalog = [
         spec
         for spec in (_catalog() + list(extra_tool_specs or []))
@@ -449,8 +457,18 @@ async def run_tool_loop(
         attempts += 1
         _progress("provider_start")
         try:
+            provider_kwargs = {"tools": tools}
+            if on_file_reply is not None:
+                # File-capable foreground chat may need to place an entire
+                # generated document inside workspace_write arguments. The
+                # provider client's historical 700-token default predates V2
+                # tools and truncates even modest documents into malformed
+                # JSON. Use the output budget already reserved by V2's prompt
+                # frontier; wake/child/screen lanes omit on_file_reply and keep
+                # their existing limits unchanged.
+                provider_kwargs["max_tokens"] = prompt_output_reserve_tokens
             result = await provider_client.chat_completion_async(
-                provider_config, messages, tools=tools
+                provider_config, messages, **provider_kwargs
             )
         except Exception as exc:
             attempt_trace = provider_client.runtime_provider_attempt_trace(exc)
@@ -578,7 +596,8 @@ async def run_tool_loop(
             for tc in pr.tool_calls
         )
         mixed_reply_write = any(
-            tc.name == tool_schema.REPLY_TOOL for tc in pr.tool_calls
+            tc.name in {tool_schema.REPLY_TOOL, tool_schema.FILE_REPLY_TOOL}
+            for tc in pr.tool_calls
         ) and any(
             tc.name in cap_registry.WRITE_ACTIONS or tc.name in mutating_mcp_names
             for tc in pr.tool_calls
@@ -619,7 +638,11 @@ async def run_tool_loop(
 
         # text accompanying tool_calls = preamble/thinking, NOT a bubble.
         reply_calls = [tc for tc in pr.tool_calls if tc.name == tool_schema.REPLY_TOOL]
-        other_calls = [tc for tc in pr.tool_calls if tc.name != tool_schema.REPLY_TOOL]
+        file_reply_calls = [
+            tc for tc in pr.tool_calls if tc.name == tool_schema.FILE_REPLY_TOOL
+        ]
+        loop_reply_tools = {tool_schema.REPLY_TOOL, tool_schema.FILE_REPLY_TOOL}
+        other_calls = [tc for tc in pr.tool_calls if tc.name not in loop_reply_tools]
         reply_results: dict[str, ToolResult] = {}
         for tc in reply_calls:
             reply_text = str(tc.args.get("text") or "")
@@ -639,6 +662,24 @@ async def run_tool_loop(
             else:
                 content = "ok: empty reply ignored"
             reply_results[tc.id] = ToolResult(call_id=tc.id, content=content)
+
+        for tc in file_reply_calls:
+            workspace_path = str(tc.args.get("path") or "").strip()
+            workspace_revision = int(tc.args["revision"])
+            await _trajectory(
+                "file_reply_planned",
+                {"round": attempts, "call_id": tc.id},
+            )
+            # Presence is guaranteed by the offer gate above. Keep the explicit
+            # check as a defense for direct/internal callers.
+            if on_file_reply is None:
+                raise RuntimeError("send_file callback is unavailable")
+            await on_file_reply(workspace_path, workspace_revision)
+            replied_intermediate = True
+            reply_results[tc.id] = ToolResult(
+                call_id=tc.id,
+                content="ok: file delivered",
+            )
 
         if other_calls:
             await _trajectory(

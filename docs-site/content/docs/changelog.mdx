@@ -254,11 +254,13 @@ change must not be interpreted as an API guarantee.
   replies must now use `source: "verify_ping"` and point
   `reply_to_message_id` at the exact pending ping; `loop_alive` can therefore be
   true while `passing` is false when decrypt policy blocks sticky verification.
-- `POST /v1/chat/response` now accepts `content_type: "file"` with required
-  `file_name` and optional `file_mime` / `file_byte_count`; the encrypted
-  envelope contains the raw file bytes. Hosted API-key runtimes use this to
-  convert newly generated files in the per-user runtime directory into native
-  download cards instead of exposing an internal `/agent-data/...` path.
+- Hosted Runtime V2 can now publish a generated `/workspace` document as a
+  native download card through the explicit `send_file` tool. Text formats are
+  delivered directly, while `.docx` and `.pdf` requests produce real Word and
+  PDF bytes instead of Markdown with a renamed suffix. The entry remains
+  user-scoped and encrypted; final assistant text and its file cards commit as
+  one ordered, idempotent reply bundle; host filesystem paths are never scanned
+  or accepted.
 - Self-hosted resident polls may now receive server-generated maintenance turns
   with `role: "user"` and `source: "resident_maintenance"` when the resident
   consumer appears stale or is not claiming resident-only distill jobs. These

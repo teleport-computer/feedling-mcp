@@ -124,7 +124,7 @@ def _script_provider(monkeypatch, responses):
     it = iter(responses)
     calls = []
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         calls.append({"messages": messages, "tools": tools})
         return next(it)
 
@@ -333,7 +333,7 @@ def test_message_coalesced_during_provider_call_creates_successor(monkeypatch):
         lambda action_type, store, **kwargs: _FakeCapResult({}),
     )
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         same_id, coalesced = jobs_store.enqueue_job(uid, "chat", reason="late-B")
         assert (same_id, coalesced) == (job_id, True)
         return _text_round("reply to A")
@@ -672,7 +672,7 @@ def test_process_job_terminal_failure_emits_error_status_and_calls_callback(monk
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    async def _boom(config, messages, *, tools=None):
+    async def _boom(config, messages, *, tools=None, **_kwargs):
         raise RuntimeError("provider blew up")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
@@ -720,7 +720,7 @@ def test_process_job_terminal_failure_tolerates_missing_callback(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    async def _boom(config, messages, *, tools=None):
+    async def _boom(config, messages, *, tools=None, **_kwargs):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _boom)

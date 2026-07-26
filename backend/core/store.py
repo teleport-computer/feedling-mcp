@@ -491,6 +491,7 @@ class UserStore:
                 "image_mime",
                 "file_name",
                 "file_mime",
+                "file_byte_count",
                 # Optional client operation UUID. Plaintext routing metadata
                 # only: it identifies a logical send retry but carries no
                 # message content and is not part of the E2EE envelope.
@@ -539,6 +540,8 @@ class UserStore:
                     msg[key] = value.strip()
                 elif isinstance(value, bool):
                     msg[key] = value
+                elif key == "file_byte_count" and isinstance(value, int) and value > 0:
+                    msg[key] = value
         return msg
 
     def append_chat(
@@ -566,7 +569,8 @@ class UserStore:
         "file". Used by clients/enclave to render the decrypted bytes
         correctly — the envelope itself only carries opaque bytes; the type
         tag tells the renderer to show a string, decode JPEG, or offer a
-        file download (with `file_name`/`file_mime` extras, see below).
+        file download (with `file_name`/`file_mime`/`file_byte_count` extras,
+        see below).
 
         `enqueue` (v2 send path only, requires `strict=True`): when provided,
         the message INSERT and its V2 job enqueue/coalesce happen in ONE DB

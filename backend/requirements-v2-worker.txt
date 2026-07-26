@@ -14,8 +14,8 @@
 # tradeoff deliberately declined (extra CI / release / pin / compose surface).
 #
 # Consequence to keep in mind: anything listed here MUST be imported lazily and
-# have a working fallback — the V1 runner image and unpinned local envs do not
-# have it. See backend/capabilities/html_extract.py.
+# fail closed when unavailable — the V1 runner image and unpinned local envs do
+# not have it. See backend/capabilities/html_extract.py.
 
 # Article extraction for web_fetch. The tool loop hands the model at most 2000
 # characters of a page; with a plain tag-strip most of that budget goes to the
@@ -27,3 +27,7 @@
 # Pinned exactly, not floored: this parses untrusted input inside a TEE, so the
 # version that ships is the version that was reviewed. Bump deliberately.
 trafilatura==2.1.0
+
+# Generated PDF downloads. Imported lazily only when send_file targets .pdf;
+# Word .docx rendering uses the standard-library OOXML writer.
+reportlab==5.0.0

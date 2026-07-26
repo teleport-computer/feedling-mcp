@@ -93,7 +93,6 @@ import hashlib
 import io
 import json
 import logging
-import mimetypes
 import os
 import queue
 import re
@@ -101,7 +100,6 @@ import shlex
 import shutil
 import signal
 import socket
-import stat
 import subprocess
 import sys
 import tempfile
@@ -2542,160 +2540,6 @@ def _write_scratch_file(path: Path, data: bytes) -> None:
         os.chmod(path, 0o600)  # existing file kept its prior mode on O_CREAT
     except OSError:
         pass
-
-
-GENERATED_FILE_MAX_BYTES = 25 * 1024 * 1024
-GENERATED_FILE_MAX_PER_TURN = 5
-_GENERATED_FILE_BLOCKED_EXTENSIONS = {
-    "app", "bat", "cmd", "com", "dmg", "exe", "html", "htm", "js", "msi",
-    "ps1", "sh", "svg",
-}
-_GENERATED_FILE_BINARY_EXTENSIONS = {
-    "avif", "csv", "doc", "docx", "epub", "gif", "heic", "heif", "jpeg",
-    "jpg", "key", "numbers", "pages", "pdf", "png", "ppt", "pptx", "rtf",
-    "webp", "xls", "xlsx", "zip",
-}
-
-
-@dataclass(frozen=True)
-class GeneratedArtifact:
-    path: Path
-    name: str
-    mime: str
-    data: bytes
-
-
-def _generated_file_snapshot() -> dict[str, tuple[int, int]]:
-    """Capture regular, non-symlink files in this user's attachment directory."""
-    if not _mkdir_scratch(FILE_TEMP_DIR):
-        return {}
-    try:
-        root = FILE_TEMP_DIR.resolve()
-    except OSError as e:
-        log.warning("generated-file snapshot root unavailable: %s", e)
-        return {}
-
-    snapshot: dict[str, tuple[int, int]] = {}
-    for path in root.rglob("*"):
-        try:
-            if path.is_symlink() or not path.is_file():
-                continue
-            resolved = path.resolve(strict=True)
-            if resolved != root and root not in resolved.parents:
-                continue
-            stat = resolved.stat()
-            snapshot[str(resolved)] = (stat.st_mtime_ns, stat.st_size)
-        except OSError:
-            continue
-    return snapshot
-
-
-def _generated_file_is_referenced(path: Path, reply_text: str) -> bool:
-    decoded = urllib.parse.unquote(reply_text)
-    raw = str(path)
-    try:
-        uri = path.as_uri()
-    except ValueError:
-        uri = ""
-    return raw in decoded or (uri and uri in reply_text)
-
-
-def _generated_file_mime(name: str, data: bytes) -> str | None:
-    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-    if not ext or ext in _GENERATED_FILE_BLOCKED_EXTENSIONS:
-        return None
-    if ext not in _GENERATED_FILE_BINARY_EXTENSIONS:
-        if b"\x00" in data:
-            return None
-        try:
-            data.decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-    return (
-        mimetypes.guess_type(name)[0]
-        or ({"md": "text/markdown", "markdown": "text/markdown"}.get(ext))
-        or "application/octet-stream"
-    )
-
-
-def _read_generated_file(path: Path) -> bytes | None:
-    """Read one regular file without following a last-moment symlink swap."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as e:
-        log.warning("generated-file open failed type=%s error=%s", path.suffix.lower(), e)
-        return None
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or not (0 < info.st_size <= GENERATED_FILE_MAX_BYTES):
-            return None
-        chunks: list[bytes] = []
-        remaining = GENERATED_FILE_MAX_BYTES + 1
-        while remaining > 0:
-            chunk = os.read(descriptor, min(1024 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        data = b"".join(chunks)
-        return data if 0 < len(data) <= GENERATED_FILE_MAX_BYTES else None
-    except OSError as e:
-        log.warning("generated-file read failed type=%s error=%s", path.suffix.lower(), e)
-        return None
-    finally:
-        os.close(descriptor)
-
-
-def _generated_files_since(
-    before: dict[str, tuple[int, int]],
-    replies: list[str],
-) -> list[GeneratedArtifact]:
-    """Return new/changed files explicitly referenced by the current agent reply.
-
-    Requiring both a filesystem change and an exact path reference prevents an old
-    upload or runtime scratch file from becoming a surprise chat attachment.
-    """
-    reply_text = "\n".join(str(reply or "") for reply in replies)
-    after = _generated_file_snapshot()
-    changed = [
-        (path, signature)
-        for path, signature in after.items()
-        if before.get(path) != signature
-    ]
-    changed.sort(key=lambda item: item[1][0])
-
-    artifacts: list[GeneratedArtifact] = []
-    for raw_path, (_, size) in changed:
-        if len(artifacts) >= GENERATED_FILE_MAX_PER_TURN:
-            break
-        path = Path(raw_path)
-        if not _generated_file_is_referenced(path, reply_text):
-            continue
-        if size <= 0 or size > GENERATED_FILE_MAX_BYTES:
-            log.warning("generated-file skipped size=%d type=%s", size, path.suffix.lower())
-            continue
-        data = _read_generated_file(path)
-        if data is None:
-            continue
-        mime = _generated_file_mime(path.name, data)
-        if mime is None:
-            log.warning("generated-file skipped unsupported type=%s", path.suffix.lower())
-            continue
-        artifacts.append(GeneratedArtifact(path=path, name=path.name[:120], mime=mime, data=data))
-    return artifacts
-
-
-def _redact_generated_file_paths(reply: str, artifacts: list[GeneratedArtifact]) -> str:
-    visible = reply
-    for artifact in artifacts:
-        raw = str(artifact.path)
-        visible = visible.replace(raw, f"附件「{artifact.name}」")
-        try:
-            visible = visible.replace(artifact.path.as_uri(), f"附件「{artifact.name}」")
-        except ValueError:
-            pass
-    return visible
 
 
 def _strip_ns(tag: str) -> str:
@@ -8772,10 +8616,6 @@ def execute_scheduled_wake_actions(actions: list[dict], job: dict) -> dict:
 def post_reply(
     content: str,
     *,
-    content_bytes: bytes | None = None,
-    content_type: str = "text",
-    file_name: str = "",
-    file_mime: str = "",
     source: str = "chat",
     gate_decision_id: str = "",
     proactive_job_id: str = "",
@@ -8808,12 +8648,6 @@ def post_reply(
     daemon to loop on this dead-end forever. The operator sees what's
     wrong in the log instead.
     """
-    if content_type not in {"text", "image", "file"}:
-        raise ValueError(f"unsupported reply content_type: {content_type}")
-    payload_bytes = content.encode("utf-8") if content_bytes is None else content_bytes
-    if content_type == "file" and (not payload_bytes or not file_name.strip()):
-        raise ValueError("file replies require non-empty bytes and file_name")
-
     url = f"{FEEDLING_API_URL}/v1/chat/response"
     if _ENCRYPTION_AVAILABLE and not _refresh_whoami_for_encrypted_reply():
         log.error("whoami refresh failed before encrypted reply and no cached keys are available; skipping write")
@@ -8831,7 +8665,7 @@ def post_reply(
             seal_enc_pk: bytes | None = _whoami_cache["enclave_pk"]
             visibility = "shared" if seal_enc_pk else "local_only"
             envelope = _build_envelope(
-                plaintext=payload_bytes,
+                plaintext=content.encode("utf-8"),
                 owner_user_id=seal_user_id,
                 user_pk_bytes=seal_user_pk,
                 enclave_pk_bytes=seal_enc_pk,
@@ -8852,12 +8686,7 @@ def post_reply(
                 "envelope": envelope,
                 "source": source,
                 "alert_body": visible_body,
-                "content_type": content_type,
             }
-            if content_type == "file":
-                body["file_name"] = Path(file_name).name[:120]
-                body["file_mime"] = file_mime[:120]
-                body["file_byte_count"] = len(payload_bytes)
             if thinking_envelope:
                 body["thinking_envelope"] = thinking_envelope
                 kind = _sanitize_thinking_kind(thinking_kind)
@@ -8917,9 +8746,6 @@ def post_reply(
                 resp = _HTTP.post(url, json=_sealed_body(), headers=_HEADERS, timeout=15)
         return _handle_post_reply_response(resp)
 
-    if content_type != "text":
-        raise RuntimeError("encrypted envelope support is required for binary replies")
-
     # Encryption unavailable — plaintext path (will 400 on v1 backends).
     log.error(
         "ENCRYPTION UNAVAILABLE — posting plaintext will fail on v1 backends. "
@@ -8947,33 +8773,6 @@ def post_reply(
         headers=_HEADERS, timeout=15,
     )
     return _handle_post_reply_response(resp)
-
-
-def post_generated_artifact(artifact: GeneratedArtifact) -> dict:
-    """Encrypt and publish one native file-card message, retrying once."""
-    last_error: BaseException | None = None
-    for attempt in range(2):
-        try:
-            return post_reply(
-                "",
-                content_bytes=artifact.data,
-                content_type="file",
-                file_name=artifact.name,
-                file_mime=artifact.mime,
-                suppress_push=True,
-            )
-        except Exception as e:
-            last_error = e
-            if attempt == 0:
-                log.warning(
-                    "generated-file post retry type=%s bytes=%d error=%s",
-                    artifact.path.suffix.lower(),
-                    len(artifact.data),
-                    e,
-                )
-                time.sleep(0.25)
-    assert last_error is not None
-    raise last_error
 
 
 def _is_fpr_mismatch_response(resp) -> bool:
@@ -12100,7 +11899,6 @@ def _process_messages(messages: list) -> float:
             if attempt_trigger != "first"
             else {}
         )
-        generated_file_before = _generated_file_snapshot()
         # 本回合失败时待发的 system 通知。不在失败当场发，而是等下面的回复写入被
         # 服务端接受（posted_any）后再发（Codex review）：claim 过期 failover 时另
         # 一个 consumer 已回复，本家的兜底会被 already_answered 409 拒——通知若先
@@ -12175,18 +11973,7 @@ def _process_messages(messages: list) -> float:
                 _note_agent_turn_success()
 
         turn = _split_agent_turn(agent_result)
-        generated_artifacts = (
-            []
-            if pending_failure_notice is not None
-            else _generated_files_since(generated_file_before, turn.messages)
-        )
-        visible_turn_messages = [
-            _redact_generated_file_paths(reply, generated_artifacts)
-            for reply in turn.messages
-        ]
-        _reply_text = "\n\n".join(
-            m for m in visible_turn_messages if isinstance(m, str) and m.strip()
-        )
+        _reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
         _emit_debug_trace(
             "agent", "agent.reply", trace_id=trace_id,
             summary=f"reply parsed ({len(turn.messages)} msg)",
@@ -12196,8 +11983,7 @@ def _process_messages(messages: list) -> float:
                     "thinking_kind": turn.thinking_kind or "", "thinking_model": turn.thinking_model or ""},
             content_excerpt={"reply": _reply_text[:3000], "thinking": (turn.thinking_summary or "")[:2000]},
         )
-        actions = turn.actions
-        replies = visible_turn_messages
+        actions, replies = turn.actions, turn.messages
         if use_runtime_v2:
             actions = [
                 action for action in actions
@@ -12344,25 +12130,6 @@ def _process_messages(messages: list) -> float:
         # backlog messages are now truly consumed by this carrier.
         for _absorbed_key in msg.get("_backlog_absorbed_keys") or []:
             _mark_seen(_absorbed_key)
-
-        if posted_any and generated_artifacts:
-            for artifact in generated_artifacts:
-                try:
-                    result = post_generated_artifact(artifact)
-                    if isinstance(result, dict) and result.get("error"):
-                        raise RuntimeError(str(result)[:500])
-                    log.info(
-                        "generated-file sent type=%s bytes=%d",
-                        artifact.path.suffix.lower(),
-                        len(artifact.data),
-                    )
-                except Exception as e:
-                    log.error(
-                        "generated-file post failed type=%s bytes=%d error=%s",
-                        artifact.path.suffix.lower(),
-                        len(artifact.data),
-                        e,
-                    )
         latest = max(latest, ts)
 
     return latest

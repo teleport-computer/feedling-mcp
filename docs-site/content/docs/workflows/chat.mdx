@@ -154,6 +154,18 @@ Decrypt `body_ct` on the authorized client. When a history item has
 `body_omitted: true`, fetch `/v1/chat/messages/{message_id}/body` instead of
 assuming the message is empty.
 
+Hosted Runtime V2 can return a generated document as a native attachment. The
+model first creates or replaces editable UTF-8 source in an encrypted
+`/workspace/...` entry with `workspace_write`. After that write succeeds, it
+calls `send_file` with the same virtual path in a later tool round. Text formats
+are delivered directly; `.docx` and `.pdf` targets are rendered into real Word
+and PDF bytes at delivery time. The worker resolves only the current user's
+entry, then commits the final assistant text followed by its download cards as
+one idempotent reply bundle. It stores `content_type: "file"` plus a bounded
+filename, MIME, and byte count. The worker never scans a runtime directory, and
+`send_file` rejects host paths and non-`/workspace` namespaces. Both editable
+source and rendered output are limited to 1,000,000 bytes.
+
 ## Independent resident loop
 
 The resident path is a queue-and-reply protocol. It does not accept plaintext
@@ -410,33 +422,6 @@ X-Feedling-Consumer-Commit: abc1234
   "content_type": "text",
   "source": "chat",
   "reply_to_message_id": "msg_user_123"
-}
-```
-
-To return a native downloadable attachment, post a second encrypted response
-with `content_type: "file"`. The envelope plaintext is the raw file bytes (not
-base64 text); `file_name` is required, while `file_mime` and `file_byte_count`
-provide display metadata. A resident should first win the parent turn with its
-text reply, then post the file without `reply_to_message_id`, so a losing
-consumer cannot leave an orphaned duplicate attachment.
-
-```json
-{
-  "envelope": {
-    "v": 1,
-    "id": "env_file_789",
-    "body_ct": "BASE64_CIPHERTEXT_OF_FILE_BYTES",
-    "nonce": "BASE64_NONCE",
-    "K_user": "BASE64_KEY_WRAPPED_TO_USER",
-    "K_enclave": "BASE64_KEY_WRAPPED_TO_ENCLAVE",
-    "visibility": "shared",
-    "owner_user_id": "usr_0123456789abcdef"
-  },
-  "content_type": "file",
-  "file_name": "plan.md",
-  "file_mime": "text/markdown",
-  "file_byte_count": 846,
-  "source": "chat"
 }
 ```
 

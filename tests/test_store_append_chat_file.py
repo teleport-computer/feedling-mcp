@@ -17,7 +17,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from asgi_test_client import make_client  # noqa: E402
 from core import store as core_store  # noqa: E402
-from chat import chat_core  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -67,43 +66,3 @@ def test_append_chat_text_turn_still_works(store):
     assert m["content_type"] == "text"
     assert "file_name" not in m
     assert "file_mime" not in m
-
-
-def test_agent_response_accepts_native_file_metadata(store, monkeypatch):
-    monkeypatch.setattr(
-        chat_core.chat_consumer, "_record_consumer_event", lambda *args, **kwargs: None
-    )
-    body, status = chat_core.write_response(
-        store,
-        {
-            "envelope": _env(store.user_id, "agentfile1"),
-            "content_type": "file",
-            "file_name": "../2022世界杯参赛队名单.md",
-            "file_mime": "text/markdown",
-            "file_byte_count": 846,
-        },
-        consumer_id="resident-test",
-        consumer_info={},
-        allow_verify_reply=False,
-    )
-    assert status == 200, body
-    message = next(x for x in store.chat_messages if x["id"] == "agentfile1")
-    assert message["content_type"] == "file"
-    assert message["file_name"] == "2022世界杯参赛队名单.md"
-    assert message["file_mime"] == "text/markdown"
-    assert message["file_byte_count"] == 846
-
-
-def test_agent_file_response_requires_filename(store, monkeypatch):
-    monkeypatch.setattr(
-        chat_core.chat_consumer, "_record_consumer_event", lambda *args, **kwargs: None
-    )
-    body, status = chat_core.write_response(
-        store,
-        {"envelope": _env(store.user_id, "agentfile2"), "content_type": "file"},
-        consumer_id="resident-test",
-        consumer_info={},
-        allow_verify_reply=False,
-    )
-    assert status == 400
-    assert body["error"] == "file_name_required"

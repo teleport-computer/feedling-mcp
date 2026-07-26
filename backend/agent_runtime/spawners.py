@@ -280,25 +280,13 @@ def _file_read_allow_rule(home: str) -> str:
     return f"Read(//{home.strip('/')}/files/**)"
 
 
-def _file_write_allow_rule(home: str) -> str:
-    """Claude Write allow-rule for user-requested downloadable artifacts.
-
-    The directory is already per-user and is the only location the resident
-    scans for generated attachments. Keep the grant narrower than the user's
-    full runtime home so checkpoints, credentials, and agent config remain
-    outside the model's write surface.
-    """
-    return f"Write(//{home.strip('/')}/files/**)"
-
-
 def _claude_allow_rules(io_cli: str, home: str) -> list[str]:
     """Full claude --allowed-tools / settings allowlist: io_cli verbs + image Read
-    + file Read/Write."""
+    + file Read."""
     return [
         *_io_cli_allow_rules(io_cli),
         _image_read_allow_rule(home),
         _file_read_allow_rule(home),
-        _file_write_allow_rule(home),
     ]
 
 
@@ -787,11 +775,8 @@ def agent_home_files(
     # The hand-listed command block is now the ``<io_cli_catalog>`` placeholder;
     # fill it with the LIVE catalog (falls back to the static list internally on
     # any build failure — see _hosted_io_cli_catalog_text).
-    system_append = (
-        _AGENT_PROMPT_TEXT
-        .replace("<io_cli>", io_cli)
-        .replace(_IO_CLI_CATALOG_PLACEHOLDER, _hosted_io_cli_catalog_text(io_cli))
-        .replace("<file_temp_dir>", f"{home}/files")
+    system_append = _AGENT_PROMPT_TEXT.replace("<io_cli>", io_cli).replace(
+        _IO_CLI_CATALOG_PLACEHOLDER, _hosted_io_cli_catalog_text(io_cli)
     )
     persona = (persona_content or "").strip()
     if persona:

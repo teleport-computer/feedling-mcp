@@ -520,9 +520,14 @@ cvm-id fail-closed、永不并入 merge 自动部署。
 
 ### [DONE] Runtime V2 harness parity lands in source with explicit live gates
 
-- The unified model-visible catalog now has 23 built-in tools: 21 platform
-  capabilities plus bounded `task` subagents and loop-native `reply`. Independent
-  reads/tasks run concurrently; disjoint workspace writes may commit in
+- The unified model-visible catalog now has 24 built-in tools: 21 platform
+  capabilities plus bounded `task` subagents, loop-native `reply`, and chat-only
+  `send_file`. `send_file` publishes only an explicit, current-user encrypted
+  `/workspace` entry through the idempotent reply outbox; UTF-8 text formats are
+  delivered directly, while `.docx` and `.pdf` targets are rendered into real
+  Word/PDF bytes instead of renaming Markdown. Final text and file cards commit
+  as one ordered reply bundle. It never scans or accepts a host filesystem path.
+  Independent reads/tasks run concurrently; disjoint workspace writes may commit in
   conflict-free waves, while conflicting paths and external effects remain
   provider-ordered.
 - Added the encrypted, backend-pluggable VFS: read-only `/artifacts` and

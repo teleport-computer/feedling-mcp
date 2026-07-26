@@ -771,8 +771,8 @@ def write_response(
     if conflict is not None:
         return conflict
     content_type = payload.get("content_type", "text")
-    if content_type not in ("text", "image", "file"):
-        return {"error": "content_type must be 'text', 'image', or 'file'"}, 400
+    if content_type not in ("text", "image"):
+        return {"error": "content_type must be 'text' or 'image'"}, 400
     thinking_envelope = payload.get("thinking_envelope")
     thinking_extra: dict = {}
     if thinking_envelope is not None:
@@ -850,25 +850,6 @@ def write_response(
     }
     if resident_delivery_id:
         extra["resident_delivery_id"] = resident_delivery_id
-    if content_type == "file":
-        raw_file_name = str(payload.get("file_name") or "").strip()
-        file_name = raw_file_name.replace("\\", "/").rsplit("/", 1)[-1]
-        file_name = "".join(
-            char for char in file_name
-            if char.isprintable() and char not in ("\n", "\r", "\t")
-        ).strip().strip(".")
-        if not file_name:
-            return {"error": "file_name_required"}, 400
-        extra["file_name"] = file_name[:120]
-        extra["file_mime"] = str(
-            payload.get("file_mime") or "application/octet-stream"
-        ).strip()[:120]
-        try:
-            file_byte_count = int(payload.get("file_byte_count") or 0)
-        except (TypeError, ValueError):
-            file_byte_count = 0
-        if file_byte_count > 0:
-            extra["file_byte_count"] = file_byte_count
     if notice_kind:
         extra["notice_kind"] = notice_kind
     if source == proactive_service.PROACTIVE_JOB_SOURCE:

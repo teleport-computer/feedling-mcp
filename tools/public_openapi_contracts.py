@@ -861,14 +861,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "description": "Resident protocol source. Ordinary replies should use chat.",
             },
             "reply_to_message_id": {"type": "string", "description": "Parent user message; strongly recommended for duplicate-reply protection."},
-            "content_type": {"type": "string", "enum": ["text", "image", "file"], "default": "text"},
-            "file_name": {
-                "type": "string",
-                "maxLength": 120,
-                "description": "Required when content_type is file; the envelope plaintext contains the file bytes.",
-            },
-            "file_mime": {"type": "string", "maxLength": 120},
-            "file_byte_count": {"type": "integer", "minimum": 0},
+            "content_type": {"type": "string", "enum": ["text", "image"], "default": "text"},
             "turn_failure_error_class": {
                 "type": "string",
                 "maxLength": 64,
