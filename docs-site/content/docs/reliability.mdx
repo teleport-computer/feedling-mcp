@@ -106,7 +106,8 @@ Letters, numbers, CJK text, and emoji count as usable reply content.
 
 For a custom or otherwise unaudited model route without an explicit context
 window, Runtime V2 uses a 65,536-token default. With the standard 4,096-token
-output reserve and 1,024-token safety margin, 58,880 tokens remain for input.
+output reserve and 5% safety margin (3,277 tokens), 58,163 tokens remain for
+input.
 Self-hosted operators can override the default with
 `FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS`; setting it to `0`
 restores fail-closed configuration. Explicit route metadata, audited model

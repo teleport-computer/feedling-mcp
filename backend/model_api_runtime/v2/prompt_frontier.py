@@ -425,11 +425,18 @@ def _normalized_overrides(overrides: Mapping[str, Any] | None) -> dict[str, int]
 
 
 _UNAUDITED_DEFAULT_ENV = "FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS"
-# 65536 leaves 58,880 input tokens after the default 4,096 output reserve and
-# 1,024-token safety margin. That comfortably covers the target 40-turn history
-# while remaining the audited DeepSeek-family floor. Deployments that know an
-# unaudited relay's real limit can still override this value; setting it to zero
-# retains the strict fail-closed mode.
+# A smaller fallback caused custom-relay users with non-trivial persona/world-book
+# prompts to hit prompt_frontier_exhausted before any provider call, even with a
+# tiny chat history (observed in production). 65536 leaves 58,163 input tokens
+# after the default 4,096 output reserve and ceil(5%)=3,277 safety margin.
+#
+# Raising an unaudited fallback can over-promise a model's real window. The
+# current-population check found that all 17 openai-compatible routes among 32
+# active configured users name recognizable Claude/Gemini/Minimax/GLM/GPT
+# families whose real windows are at least 128K. That evidence supports 64K for
+# today's population; re-evaluate this fallback if the route population changes.
+# Explicit deployment knowledge still belongs in the env override, and zero
+# retains strict fail-closed mode.
 _UNAUDITED_DEFAULT_FALLBACK_TOKENS = 65536
 
 

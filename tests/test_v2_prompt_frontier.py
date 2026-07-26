@@ -120,21 +120,21 @@ def test_unaudited_route_gets_conservative_default(monkeypatch):
     assert custom.context_window_tokens == 65536
 
 
-def test_raised_default_provides_target_58880_input_budget(monkeypatch):
-    """The 64K default reserves 4K output + 1K safety and leaves 58,880 input
-    tokens, enough headroom for the target 40-turn history."""
+def test_raised_default_provides_target_58163_input_budget(monkeypatch):
+    """The 64K default reserves 4K output + 5% safety and leaves 58,163 input."""
     monkeypatch.delenv(frontier._UNAUDITED_DEFAULT_ENV, raising=False)
     persona = frontier.PromptComponent(
-        name="target_history", estimated_tokens=58_880, required=True
+        name="target_history", estimated_tokens=58_163, required=True
     )
     limit = frontier.resolve_model_limit("some-relay", "mystery-model")
     plan = frontier.plan_prompt(
         model_limit=limit,
         components=[persona],
         output_reserve_tokens=4_096,
-        safety_margin_tokens=1_024,
     )
     assert "target_history" in plan.included_components
+    assert plan.budget.safety_margin_tokens == 3_277
+    assert plan.budget.input_budget_tokens == 58_163
 
     # The old 32K default (opt back in via env) rejects the same required set.
     monkeypatch.setenv(frontier._UNAUDITED_DEFAULT_ENV, "32768")
@@ -144,7 +144,6 @@ def test_raised_default_provides_target_58880_input_budget(monkeypatch):
             model_limit=old_limit,
             components=[persona],
             output_reserve_tokens=4_096,
-            safety_margin_tokens=1_024,
         )
 
 
