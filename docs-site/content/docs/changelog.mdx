@@ -22,6 +22,12 @@ change must not be interpreted as an API guarantee.
   `/models` route) and the client should fall back to manual model entry.
   Provider auth failures are mapped to `400`/`429`/`503` catalog slugs — never
   `401` — so an expired Feedling login is never confused with a bad provider key.
+- **Runtime V2 now honors the Dream and screen-watch consent switches at
+  execution time.** Disabling Dream prevents queued Dream work from making a
+  provider call even when the deployment-wide Dream feature flag is enabled.
+  Disabling screen watch prevents its producer from enqueueing background work;
+  screen watch also remains paused when Ambient companionship is disabled.
+  Runtime V1 behavior is unchanged.
 
 - **Long-term provider configuration failures now pause proactive model work.**
   When an account has gone 48 hours without a usable provider response and its

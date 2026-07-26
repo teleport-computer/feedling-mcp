@@ -31,6 +31,32 @@ from identity import service as identity_service
 
 _PROVIDER_ATTEMPT_STREAM = "provider_attempts"
 _PROVIDER_ATTEMPT_DETAIL_LIMIT = 200
+_DATA_TRACK_USER_ID_RE = re.compile(r"^usr_[0-9a-f]{16}$")
+
+
+class InvalidDataTrackUserId(ValueError):
+    pass
+
+
+def _normalized_data_track_user_id(raw_user_id: str) -> str:
+    user_id = str(raw_user_id or "").strip()
+    if not _DATA_TRACK_USER_ID_RE.fullmatch(user_id):
+        raise InvalidDataTrackUserId("invalid_user_id")
+    return user_id
+
+
+def _data_track_query_int(
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        value = int(request.args.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
 
 
 # Injected by the assembly layer (asgi_app.py) — the real implementations live
@@ -69,7 +95,7 @@ def _data_track_qs(**updates) -> str:
     for key in (
         "admin_key", "since", "registered_since", "q", "limit", "offset", "sort",
         "dir", "view", "days", "user_id", "subsystem", "status", "trace_id",
-        "mode", "reveal", "page", "event", "day",
+        "mode", "reveal", "page", "event", "day", "events_limit",
     ):
         value = request.args.get(key, "").strip()
         if value:
@@ -283,15 +309,29 @@ def _push_stats(store: UserStore) -> dict:
     }
 
 
-def _tracking_stats(store: UserStore, *, include_events: bool = False) -> dict:
+def _tracking_stats(
+    store: UserStore,
+    *,
+    include_events: bool = False,
+    events_limit: int = 50,
+) -> dict:
+    try:
+        detail_limit = max(1, min(int(events_limit or 50), 500))
+    except (TypeError, ValueError):
+        detail_limit = 50
     events = store.list_tracking_events(limit=0)
     by_type = _count_rows(events, "type")
     epochs = [core_util._to_epoch(e.get("ts") or e.get("created_at")) for e in events]
-    latest = sorted(events, key=lambda e: core_util._to_epoch(e.get("ts") or e.get("created_at")), reverse=True)[:50]
+    latest = sorted(
+        events,
+        key=lambda e: core_util._to_epoch(e.get("ts") or e.get("created_at")),
+        reverse=True,
+    )[:detail_limit]
     out = {
         "events": len(events),
         "by_type": by_type,
         "last_at": core_util._epoch_to_iso(max(epochs, default=0)),
+        "events_limit": detail_limit,
     }
     if include_events:
         out["latest"] = [
@@ -1031,7 +1071,17 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
     memory = _memory_stats(store)
     proactive = _proactive_stats(store)
     push = _push_stats(store)
-    tracking = _tracking_stats(store, include_events=include_detail)
+    events_limit = _data_track_query_int(
+        "events_limit",
+        default=50,
+        minimum=1,
+        maximum=500,
+    )
+    tracking = _tracking_stats(
+        store,
+        include_events=include_detail,
+        events_limit=events_limit,
+    )
     bootstrap_events = _bootstrap_event_stats(store, include_events=include_detail)
     history_import = _history_import_stats(store)
     genesis = _genesis_stats(store, include_jobs=include_detail)
@@ -1092,6 +1142,20 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         "genesis": genesis,
     }
     if include_detail:
+        daily_days = _data_track_query_int(
+            "days",
+            default=14,
+            minimum=1,
+            maximum=90,
+        )
+        detail_snapshot = db.admin_data_track_snapshot([user_id]).get(user_id, {})
+        row["app_usage"] = _data_track_app_usage_from_snapshot(detail_snapshot)
+        row["daily_usage"] = db.admin_data_track_user_daily_usage(
+            user_id=user_id,
+            days=daily_days,
+            tz="Asia/Shanghai",
+        )
+        row["daily_usage_days"] = daily_days
         row["runtime"] = _runtime_summary(store)
         row["provider_attempt_ledger"] = _provider_attempts_detail(store)
         _ps = store.load_proactive_settings()
@@ -2287,6 +2351,7 @@ def _render_data_track_page(payload: dict) -> str:
 	    .sort-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
 	    .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
 	    input {{ width:320px; max-width:100%; border:1px solid var(--line); border-radius:6px; padding:9px 10px; background:white; color:var(--fg); }}
+	    .toolbar button {{ border:0; border-radius:6px; padding:9px 13px; background:var(--accent); color:white; font-weight:600; cursor:pointer; }}
     table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
     th,td {{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }}
     th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }}
@@ -2316,6 +2381,11 @@ def _render_data_track_page(payload: dict) -> str:
 		  {telemetry_section}
 		  {app_usage_section}
 	  <h2>Beta users</h2>
+	  <form class="toolbar" method="get" action="/admin/data-track/users">
+	    <input name="admin_key" type="hidden" value="{html.escape(request.args.get('admin_key', ''), quote=True)}">
+	    <input name="uid" placeholder="输入 UID 直查（usr_…）" autocomplete="off">
+	    <button type="submit">打开用户详情</button>
+	  </form>
 	  <div class="toolbar"><input id="q" placeholder="Filter user, route, stage"></div>
 	  <div class="sortbar">{sort_controls}</div>
 	  {pager}
@@ -3743,6 +3813,88 @@ def _render_perception_freshness(user: dict) -> str:
     )
 
 
+def _render_user_daily_usage(user: dict) -> str:
+    rows = list(user.get("daily_usage") or [])
+    days = int(user.get("daily_usage_days") or len(rows) or 14)
+    window_total = sum(int(row.get("foreground_sec") or 0) for row in rows)
+    window_sessions = sum(int(row.get("sessions") or 0) for row in rows)
+    all_time = user.get("app_usage") or {}
+    all_time_total = int(all_time.get("foreground_sec") or 0)
+    all_time_sessions = int(all_time.get("sessions") or 0)
+    max_daily = max(
+        (int(row.get("foreground_sec") or 0) for row in rows),
+        default=0,
+    )
+    daily_rows = []
+    for row in rows:
+        foreground = int(row.get("foreground_sec") or 0)
+        sessions = int(row.get("sessions") or 0)
+        width = (foreground * 100.0 / max_daily) if max_daily else 0.0
+        state = (
+            f"{html.escape(_fmt_duration_sec(foreground))} · {sessions} 次会话"
+            if sessions
+            else "未打开"
+        )
+        daily_rows.append(
+            "<div class='daily-row'>"
+            f"<div class='daily-day'>{html.escape(str(row.get('day') or ''))}</div>"
+            f"<div class='daily-track {'daily-zero' if sessions == 0 else ''}'>"
+            f"<span style='width:{width:.2f}%'></span>"
+            "</div>"
+            f"<div class='daily-value'>{state}</div>"
+            "</div>"
+        )
+    action = f"/admin/data-track/users/{quote(str(user.get('user_id') or ''))}"
+    return (
+        f"<h2 class='daily-heading'>最近 {days} 天使用时长</h2>"
+        "<div class='daily-summary'>"
+        f"<b>窗口合计 {html.escape(_fmt_duration_sec(window_total))}</b>"
+        f" · {window_sessions} 次会话"
+        f"；全时段合计 <b>{html.escape(_fmt_duration_sec(all_time_total))}</b>"
+        f" · {all_time_sessions} 次会话"
+        "</div>"
+        f"<form class='daily-controls' method='get' action='{html.escape(action, quote=True)}'>"
+        f"<input name='admin_key' type='hidden' value='{html.escape(request.args.get('admin_key', ''), quote=True)}'>"
+        f"<input name='events_limit' type='hidden' value='{int((user.get('tracking') or {}).get('events_limit') or 50)}'>"
+        f"<label>天数 <input name='days' type='number' min='1' max='90' value='{days}'></label>"
+        "<button type='submit'>更新</button>"
+        "</form>"
+        "<section class='daily-usage'>"
+        + (
+            "".join(daily_rows)
+            if daily_rows
+            else "<div class='muted'>暂无使用时长数据。</div>"
+        )
+        + "</section>"
+        "<div class='muted daily-note'>"
+        "按北京日统计 app_session_end；没有上报的日期明确显示“未打开”。"
+        "前台被强杀会漏报，因此时长略偏低估。"
+        "</div>"
+    )
+
+
+def _render_invalid_data_track_user_page(raw_user_id: str) -> str:
+    back_qs = _data_track_qs(uid=None)
+    back = f"/admin/data-track?{back_qs}" if back_qs else "/admin/data-track"
+    supplied = str(raw_user_id or "").strip()
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UID 格式错误 · Feedling Data Track</title>
+<style>
+  :root {{ color-scheme:light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; }}
+  body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+  main {{ max-width:620px; margin:80px auto; padding:24px; }}
+  .box {{ background:var(--card); border:1px solid var(--line); border-radius:10px; padding:22px; }}
+  h1 {{ margin:0 0 8px; font-size:20px; }} .muted {{ color:var(--muted); }}
+  code {{ word-break:break-all; }} a {{ color:var(--accent); text-decoration:none; }}
+</style></head><body><main><section class="box">
+  <h1>UID 格式不正确</h1>
+  <p>请输入形如 <code>usr_0123456789abcdef</code> 的 UID。</p>
+  <p class="muted">收到：<code>{html.escape(supplied) if supplied else "（空）"}</code></p>
+  <a href="{html.escape(back, quote=True)}">← 返回 Data Track</a>
+</section></main></body></html>"""
+
+
 def _render_user_detail_page(user: dict) -> str:
     qs = _data_track_qs()
     back = f"/admin/data-track?{qs}" if qs else "/admin/data-track"
@@ -3768,6 +3920,18 @@ def _render_user_detail_page(user: dict) -> str:
     .pp-box {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin:8px 0; font-size:13px; line-height:2; }}
     .pp-item {{ display:inline-block; margin:0 14px 4px 0; }}
     .ppok {{ color:#1d7a4d; }} .ppbad {{ color:#b7352b; }} .ppmuted {{ color:var(--muted); }}
+    .daily-heading {{ font-size:17px; margin:26px 0 6px; }}
+    .daily-summary {{ background:#fff8ef; border:1px solid #e8d8be; border-radius:8px; padding:11px 13px; color:#5a4d3c; }}
+    .daily-controls {{ display:flex; align-items:center; gap:8px; margin:10px 0; }}
+    .daily-controls input[type=number] {{ width:72px; border:1px solid var(--line); border-radius:6px; padding:7px; }}
+    .daily-controls button {{ border:0; border-radius:6px; padding:8px 12px; background:var(--accent); color:white; font-weight:600; cursor:pointer; }}
+    .daily-usage {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:13px 15px; }}
+    .daily-row {{ display:grid; grid-template-columns:90px minmax(130px,1fr) 150px; gap:10px; align-items:center; margin:8px 0; }}
+    .daily-day,.daily-value {{ font-size:12px; font-variant-numeric:tabular-nums; }}
+    .daily-track {{ height:16px; background:#f0e6dd; border-radius:4px; overflow:hidden; }}
+    .daily-track span {{ display:block; height:100%; min-width:0; background:var(--accent); border-radius:4px; }}
+    .daily-track.daily-zero {{ background:#e7e2de; border:1px dashed #c9beb6; box-sizing:border-box; }}
+    .daily-note {{ margin-top:7px; font-size:12px; }}
   </style>
 </head>
 <body>
@@ -3786,6 +3950,7 @@ def _render_user_detail_page(user: dict) -> str:
     <div class="card"><div class="value">{html.escape(_bj_iso(user.get('last_provider_success_at')) or 'never')}</div><div class="label">last provider success</div></div>
     <div class="card"><div class="value">{html.escape(user.get('last_provider_error_class') or 'none')}</div><div class="label">latest provider error</div></div>
   </section>
+  {_render_user_daily_usage(user)}
   {_render_perception_permissions(user)}
   {_render_perception_freshness(user)}
   <div class="muted" style="margin-top:14px">以下所有时间已转北京时间(UTC+8) · 原始存储为 UTC。</div>

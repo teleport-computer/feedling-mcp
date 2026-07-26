@@ -126,7 +126,13 @@ def _effective_broadcast_state(store: UserStore, settings: dict) -> str:
     )
 
 
-def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: str | None = None) -> dict:
+def _build_proactive_v2_wake_decision(
+    store: UserStore,
+    payload: dict,
+    api_key: str | None = None,
+    *,
+    require_ambient: bool = False,
+) -> dict:
     """Create a V2 wake event without doing platform-side semantic judgment.
 
     The platform may decide whether a wake is mechanically allowed, but it does
@@ -205,16 +211,19 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
         job_kind = _proactive_job_kind(payload, trigger=trigger)
     provider_probe = False
 
+    resolved_settings = resolve_settings_v2(settings)
     activation_pending = not manual and not str(settings.get("first_chat_ok_at") or "").strip()
     if activation_pending:
         block_reason = ACTIVATION_PENDING_REASON
+    elif require_ambient and not resolved_settings.ambient:
+        block_reason = "ambient_disabled"
     else:
         wake_source = source_for_legacy_trigger_v2(trigger, manual=manual)
         wake_control = evaluate_wake_control_v2(
             wake_source,
             trigger=trigger,
             manual=manual,
-            settings=resolve_settings_v2(settings),
+            settings=resolved_settings,
         )
         block_reason = "" if wake_control.accepted else wake_control.reason
         if (
