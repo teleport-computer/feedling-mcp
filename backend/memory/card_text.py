@@ -108,11 +108,13 @@ def card_text_rejection(*, summary: str, content: str) -> str | None:
 def sanitize_card_labels(
     *, bucket: str, threads: list[str]
 ) -> tuple[str, list[str], list[str]]:
-    """清洗软字段。返回 ``(bucket, threads, reasons)``;``reasons`` 非空表示确实洗掉了东西。
+    """清洗软字段。返回 ``(bucket, threads, reasons)``,``reasons`` 供调用方观测。
 
-    ⚠️ ``reasons`` **不参与**打回判定 —— 它只是「洗掉了什么」的记录。硬内容
-    (summary/content)完全正常、只是 ``bucket="无"`` 的卡不值得为它多烧一次
-    BYOK 调用;软字段的定义就是「能就地修好」(codex 07-26 review P1-2)。
+    ⚠️ ``reasons`` **不参与**打回判定 —— 硬内容(summary/content)完全正常、
+    只是 ``bucket="无"`` 的卡不值得为它多烧一次 BYOK 调用;软字段的定义就是
+    「能就地修好」(codex 07-26 review P1-2)。当前两个 parser 都只取清洗结果、
+    不消费 ``reasons``(纯模块无 logger),所以线上暂时看不到软字段洗了什么;
+    要观测就在调用侧接进 trajectory,别改成打回条件。
     """
     reasons: list[str] = []
     clean_bucket = (bucket or "").strip()
