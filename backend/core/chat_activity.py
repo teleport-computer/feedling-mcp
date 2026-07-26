@@ -1,8 +1,9 @@
-"""Display-safe projection of Runtime V2 chat activity.
+"""Display-safe projection of runtime-neutral chat activity.
 
-The authoritative records are ``agent_jobs`` and ``agent_status_events``.
-This module only projects their fixed metadata; it never accepts model prose,
-tool arguments, tool result bodies, or chain-of-thought.
+The authoritative records are V2 ``agent_jobs`` / ``agent_status_events`` and
+V1 ``chat_turn_activity_events``. This module only projects their fixed
+metadata; it never accepts model prose, tool arguments, tool result bodies, or
+chain-of-thought.
 """
 from __future__ import annotations
 
@@ -164,4 +165,21 @@ def turn_response(turn_id: str, jobs: Iterable[Mapping[str, Any]], rows: Iterabl
         "phase": safe_token(phases[-1], max_len=40) if phases else "queued",
         "jobs": job_list,
         "events": project_tool_events(row_list),
+    }
+
+
+def resident_turn_response(turn_id: str, parent: Mapping[str, Any], rows: Iterable[Mapping[str, Any]]) -> dict:
+    """Project a V1 resident turn from its durable parent and tool evidence."""
+    complete = (
+        str(parent.get("reply_status") or "") == "replied"
+        or bool(str(parent.get("reply_message_id") or ""))
+    )
+    status = "completed" if complete else "running"
+    return {
+        "turn_id": turn_id,
+        "runtime": "v1",
+        "complete": complete,
+        "phase": "done" if complete else "processing",
+        "jobs": [{"job_id": f"v1:{turn_id}", "status": status}],
+        "events": project_tool_events(rows),
     }

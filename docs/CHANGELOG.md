@@ -49,12 +49,15 @@
 
 ## 2026-07-26
 
-### [DONE] Runtime V2 聊天执行记录改为后端权威投影
+### [DONE] V1/V2 聊天执行记录统一为可信投影
 - V2 provider-native 工具调度在调用开始和真实结果/异常边界写入 display-safe
   `agent_status_events`；只保留受限的工具名、call/job/effect id、状态、耗时和结果
   分类，不保存参数、结果正文、助手文案或推理。
-- 新增用户鉴权的只读 `GET /v1/chat/turn-activity/{turn_id}`。它按 user + turn
-  关联 `agent_jobs.trace_id`，V1/resident 回合固定返回 404，不提供客户端自报写入口。
+- V1 resident 的 `io_cli` 也在真实命令开始/结束边界写同一份按 turn 持久化的
+  fixed-shape 事件；记忆分类只从 `memory-index` / `memory-fetch` 实际返回项统计，
+  自定义分类时只给总数。
+- 用户鉴权的 `GET /v1/chat/turn-activity/{turn_id}` 现在同时读取 V1/V2；新增
+  resident 专用写入口，只接受已存在 user turn 下的固定字段，V2 所有权会拒绝该写入。
 - 最终回复把同一份受限工具事件附在 `activity_events` metadata；provider-native
   reasoning 继续走独立加密 thinking envelope，二者不混合。
 - `memory_search` / `memory_fetch` 在 capability 真实结果还未截断时提取返回总数；

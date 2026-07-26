@@ -103,9 +103,45 @@ def test_main_emits_tool_trace_after_command_exit(monkeypatch, capsys):
     assert exc.value.code == 0
     stdout = json.loads(capsys.readouterr().out.strip())
     assert stdout["ok"] is True
-    assert [call["method"] for call in calls] == ["GET", "POST"]
-    event = calls[1]["payload"]["event"]
+    assert [call["method"] for call in calls] == ["POST", "GET", "POST", "POST"]
+    assert calls[0]["payload"]["state"] == "running"
+    assert calls[2]["payload"]["state"] == "success"
+    event = calls[3]["payload"]["event"]
     assert event["type"] == "agent.tool.call"
     assert event["detail"]["tool"] == "perception"
     assert event["detail"]["args"] == {"signals": "1 item(s): now"}
     assert event["detail"]["result_status"] == "ok"
+
+
+def test_memory_activity_metadata_uses_actual_items_and_complete_categories():
+    assert io_cli._memory_activity_metadata(
+        "memory_search",
+        {
+            "ok": True,
+            "items": [
+                {"id": "m1", "bucket": "我们的关系", "summary": "private"},
+                {"id": "m2", "bucket": "Our relationship"},
+                {"id": "m3", "bucket": "我们的关系"},
+                {"id": "m4", "bucket": "家庭"},
+            ],
+        },
+    ) == {
+        "memory_count": 4,
+        "memory_categories": [
+            {"key": "relationship", "count": 3},
+            {"key": "family", "count": 1},
+        ],
+    }
+
+
+def test_memory_activity_metadata_custom_bucket_falls_back_to_total():
+    assert io_cli._memory_activity_metadata(
+        "memory_fetch",
+        {
+            "ok": True,
+            "items": [
+                {"id": f"m{index}", "bucket": "妈妈" if index == 0 else "家庭"}
+                for index in range(11)
+            ],
+        },
+    ) == {"memory_count": 11}

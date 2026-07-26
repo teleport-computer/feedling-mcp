@@ -66,6 +66,7 @@ EXPECTED_CORE_BODY_REFS = {
     ("post", "/v1/model_api/chat/send"): "HostedChatSendRequest",
     ("post", "/v1/chat/message"): "ChatTransportRequest",
     ("post", "/v1/chat/response"): "ChatResponseRequest",
+    ("post", "/v1/chat/turn-activity/{turn_id}/events"): "ChatActivityEventRequest",
     ("delete", "/v1/chat/history"): "ChatHistoryClearRequest",
     ("post", "/v1/memory/index"): "MemoryIndexRequest",
     ("post", "/v1/memory/fetch"): "MemoryFetchRequest",
@@ -172,8 +173,9 @@ def test_public_operation_and_parameter_inventory(
     # 149 since GET /v1/model_api/usage (provider balance/usage snapshot).
     # 150 since POST /v1/model_api/models (BYOK model catalog listing, has a body).
     # 151 since GET /v1/chat/turn-activity/{turn_id} (V2 activity read model).
-    assert len(operations) == 151
-    assert sum("requestBody" in operation for operation in operations.values()) == 69
+    # 152 and 70 bodies since V1 resident tool-activity event ingest.
+    assert len(operations) == 152
+    assert sum("requestBody" in operation for operation in operations.values()) == 70
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")

@@ -218,6 +218,17 @@ async def chat_turn_activity(turn_id: str, auth: AuthResult = Depends(require_au
     return JSONResponse(body, status_code=status)
 
 
+@router.post("/v1/chat/turn-activity/{turn_id}/events")
+async def chat_turn_activity_event(
+    turn_id: str, request: Request, auth: AuthResult = Depends(require_auth)
+):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    body, status = await threadpool.run_db(
+        chat_activity_core.write_turn_activity, auth.store, turn_id, payload
+    )
+    return JSONResponse(body, status_code=status)
+
+
 @router.delete("/v1/chat/history")
 async def chat_history_clear(request: Request, auth: AuthResult = Depends(require_auth)):
     payload = (await asgi_http.read_json_silent(request)) or {}

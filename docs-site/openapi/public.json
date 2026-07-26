@@ -1432,7 +1432,71 @@
           "Chat"
         ],
         "x-feedling-contract-level": "documented",
-        "description": "Read display-safe Runtime V2 activity for one hosted chat turn. Events come only from backend-owned job and tool-dispatch records and include bounded identifiers, state, timing, result classification, and durable-effect disposition; successful memory_search/memory_fetch events also include the confirmed returned-item count and, only when every item uses the canonical bucket taxonomy, a complete category-count breakdown. Tool arguments, result bodies, assistant prose, reasoning, and custom bucket labels are never returned. A V1/resident turn has no activity resource and returns 404 turn_activity_not_found."
+        "description": "Read display-safe activity for one V1 resident or Runtime V2 chat turn. V2 events come from backend jobs and tool dispatch; V1 events come from the authenticated resident io_cli boundary and are durably scoped to an existing user message. Both runtimes expose only bounded identifiers, state, timing, and result classification. Successful memory_search/memory_fetch events include the confirmed returned-item count and, only when every item uses the canonical bucket taxonomy, a complete category-count breakdown. Tool arguments, result bodies, assistant prose, reasoning, and custom bucket labels are never returned."
+      }
+    },
+    "/v1/chat/turn-activity/{turn_id}/events": {
+      "post": {
+        "summary": "Chat Turn Activity Event",
+        "operationId": "chat_turn_activity_event_v1_chat_turn_activity__turn_id__events_post",
+        "parameters": [
+          {
+            "name": "turn_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Turn Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid path or request parameter.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatActivityEventRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented",
+        "description": "Append one authenticated V1 resident tool transition. This endpoint is used by the shipped resident io_cli runtime, accepts only running/success/failure plus display-safe fixed metadata, rejects V2-owned users, and never accepts tool arguments, model prose, or result bodies."
       }
     },
     "/v1/chat/verify_loop": {
@@ -8727,6 +8791,87 @@
           }
         },
         "additionalProperties": true
+      },
+      "ChatActivityEventRequest": {
+        "type": "object",
+        "required": [
+          "activity_id",
+          "tool_name",
+          "state"
+        ],
+        "properties": {
+          "activity_id": {
+            "type": "string",
+            "maxLength": 160
+          },
+          "call_id": {
+            "type": "string",
+            "maxLength": 160
+          },
+          "tool_name": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "running",
+              "success",
+              "failure"
+            ]
+          },
+          "duration_ms": {
+            "type": "number",
+            "minimum": 0
+          },
+          "result_code": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "memory_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000
+          },
+          "memory_categories": {
+            "type": "array",
+            "description": "Complete canonical breakdown only; counts must sum to memory_count.",
+            "items": {
+              "type": "object",
+              "required": [
+                "key",
+                "count"
+              ],
+              "properties": {
+                "key": {
+                  "type": "string",
+                  "enum": [
+                    "work",
+                    "growth",
+                    "family",
+                    "friends",
+                    "pets",
+                    "relationship",
+                    "feelings",
+                    "preferences",
+                    "values",
+                    "health",
+                    "interests",
+                    "money",
+                    "food",
+                    "travel"
+                  ]
+                },
+                "count": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
       },
       "ChatHistoryClearRequest": {
         "type": "object",

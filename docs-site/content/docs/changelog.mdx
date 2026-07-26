@@ -94,7 +94,7 @@ change must not be interpreted as an API guarantee.
   `/models` route) and the client should fall back to manual model entry.
   Provider auth failures are mapped to `400`/`429`/`503` catalog slugs — never
   `401` — so an expired Feedling login is never confused with a bad provider key.
-- **Hosted Runtime V2 chat now exposes confirmed execution activity.**
+- **V1 resident and Hosted Runtime V2 chat now expose confirmed execution activity.**
   `GET /v1/chat/turn-activity/{turn_id}` returns a user-scoped, read-only
   projection of backend job and tool-dispatch records while a turn runs. The
   projection contains only bounded identifiers, state, timing, result
@@ -103,8 +103,9 @@ change must not be interpreted as an API guarantee.
   also appear as `activity_events` on the assistant history item. Confirmed
   memory-search/fetch results include a total count and include canonical
   category counts only when the complete classification is reliable; custom or
-  unknown buckets fall back to total-only. V1/resident
-  turns have no activity resource and return `404 turn_activity_not_found`.
+  unknown buckets fall back to total-only. The shipped V1 resident `io_cli`
+  records the same fixed-shape invocation transitions through an authenticated,
+  turn-scoped write boundary; tool arguments and result bodies are never sent.
 
 - **Runtime V2 now honors the Dream and screen-watch consent switches at
   execution time.** Disabling Dream prevents queued Dream work from making a

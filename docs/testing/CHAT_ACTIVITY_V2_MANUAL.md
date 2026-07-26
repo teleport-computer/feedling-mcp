@@ -1,4 +1,4 @@
-# Runtime V2 chat activity — local manual test
+# V1 and V2 chat activity — local manual test
 
 Run this only after both local branches are built:
 
@@ -6,8 +6,7 @@ Run this only after both local branches are built:
 - iOS: `codex/chat-activity-timeline-mock`
 
 Do not point the test app at a shared environment until the local checks pass.
-The account must be owned by Runtime V2. A V1/resident account is a deliberate
-negative control and must keep the old typing indicator with no activity list.
+Run the same cases on a resident-owned V1 account and a Runtime V2 account.
 
 ## Driver matrix
 
@@ -43,7 +42,7 @@ Only the returned count and canonical category keys may appear in activity
 metadata. Search terms, summaries, contents, threads, and custom bucket labels
 must not appear.
 
-## Cases to repeat on Codex and Pi
+## Cases to repeat on V1 Codex, Claude, Pi, and V2 routes
 
 ### A. Live activity and final placement
 
@@ -51,7 +50,7 @@ Send: “请先搜索与我们的关系和家人有关的记忆，再根据找�
 
 Expected:
 
-1. The legacy dots appear first; once the backend confirms V2, the live row
+1. The legacy dots appear first; once the backend confirms the turn, the live row
    changes to Working / 正在处理.
 2. A real `memory_search` or `memory_fetch` row appears only after that tool
    starts. There is no locally invented “理解问题” or “正在思考” activity row.
@@ -91,12 +90,10 @@ Expected: schedule/cancel rows become successful only after their durable effect
 has a confirmed disposition. A failed or uncertain effect must not be shown as
 successful.
 
-### F. V1 negative control
+### F. Runtime parity
 
-Run one resident/V1 account against the same iOS build.
-
-Expected: the old dots and normal reply remain unchanged. The V2 activity
-endpoint returns `404 turn_activity_not_found`; no phase or tool row is shown.
+Repeat A–E on resident/V1 and V2. V1 `io_cli` tools and V2 native capability
+tools must produce the same display labels and memory-count fallback rules.
 
 ## Optional wire check
 
@@ -109,7 +106,7 @@ X-API-Key: TEST_ACCOUNT_KEY
 
 Check that:
 
-- `runtime` is `v2`;
+- `runtime` is `v1` or `v2` and matches the selected route;
 - every event has a backend job/call identity and a state;
 - memory events have `memory_count`;
 - `memory_categories`, when present, sums exactly to `memory_count`;

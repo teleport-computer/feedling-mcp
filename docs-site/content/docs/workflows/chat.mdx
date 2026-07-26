@@ -171,10 +171,10 @@ plus a bounded filename, MIME, and byte count. The worker never scans a runtime
 directory, and `send_file` rejects host paths and non-`/workspace` namespaces.
 Both editable source and rendered output are limited to 1,000,000 bytes.
 
-### 3. Read confirmed Runtime V2 activity
+### 3. Read confirmed V1 or V2 activity
 
-Use the accepted user message id as `turn_id` while waiting for the hosted
-reply:
+Use the accepted user message id as `turn_id` while waiting for either a
+resident V1 or hosted V2 reply:
 
 ~~~http
 GET /v1/chat/turn-activity/msg_user_123 HTTP/1.1
@@ -185,18 +185,18 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 ~~~json
 {
   "turn_id": "msg_user_123",
-  "runtime": "v2",
+  "runtime": "v1",
   "complete": false,
   "phase": "processing",
-  "jobs": [{ "job_id": "job_abc", "status": "running" }],
+  "jobs": [{ "job_id": "v1:msg_user_123", "status": "running" }],
   "events": [
     {
-      "id": "job_abc:1:1",
+      "id": "v1:4be4dce72b0a4f76bff3ec2c601598ce",
       "kind": "tool",
       "name": "memory_search",
       "status": "success",
-      "job_id": "job_abc",
-      "call_id": "call_01",
+      "job_id": "",
+      "call_id": "v1:4be4dce72b0a4f76bff3ec2c601598ce",
       "duration_ms": 18.4,
       "result_code": "ok",
       "memory_count": 4,
@@ -209,16 +209,16 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 }
 ~~~
 
-This is a read-only Runtime V2 projection. It is sourced from backend-owned job
-and tool-dispatch records, not reconstructed from assistant text. It never
-returns tool arguments, tool result bodies, or reasoning. Durable effects may
-add `effect_id`, `effect_type`, and `effect_status` only after the dispatcher
-has confirmed their disposition. V1/resident turns return
-`404 turn_activity_not_found`.
+This is a runtime-neutral projection, not a reconstruction of assistant text.
+V2 uses backend-owned job and tool-dispatch records. V1 accepts fixed-shape
+events from the authenticated shipped resident runtime and binds them to an
+existing user turn. Neither path returns tool arguments, tool result bodies, or
+reasoning. Durable V2 effects may add `effect_id`, `effect_type`, and
+`effect_status` only after the dispatcher has confirmed their disposition.
 
 For successful `memory_search` and `memory_fetch`, `memory_count` is derived
-from the actual capability result before the provider-facing result can be
-truncated. `memory_categories` is optional: it is present only when every
+from the actual V2 capability result or V1 `io_cli` response before any
+provider-facing truncation. `memory_categories` is optional: it is present only when every
 returned item has one of the canonical bilingual memory buckets and its counts
 sum to `memory_count`. If any bucket is custom or unknown, the category list is
 omitted and clients should show the total only. Raw bucket labels, summaries,

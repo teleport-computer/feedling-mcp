@@ -1009,6 +1009,40 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "additionalProperties": True,
     },
+    "ChatActivityEventRequest": {
+        "type": "object",
+        "required": ["activity_id", "tool_name", "state"],
+        "properties": {
+            "activity_id": {"type": "string", "maxLength": 160},
+            "call_id": {"type": "string", "maxLength": 160},
+            "tool_name": {"type": "string", "maxLength": 120},
+            "state": {"type": "string", "enum": ["running", "success", "failure"]},
+            "duration_ms": {"type": "number", "minimum": 0},
+            "result_code": {"type": "string", "maxLength": 64},
+            "memory_count": {"type": "integer", "minimum": 0, "maximum": 1000},
+            "memory_categories": {
+                "type": "array",
+                "description": "Complete canonical breakdown only; counts must sum to memory_count.",
+                "items": {
+                    "type": "object",
+                    "required": ["key", "count"],
+                    "properties": {
+                        "key": {
+                            "type": "string",
+                            "enum": [
+                                "work", "growth", "family", "friends", "pets",
+                                "relationship", "feelings", "preferences", "values",
+                                "health", "interests", "money", "food", "travel",
+                            ],
+                        },
+                        "count": {"type": "integer", "minimum": 1},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "additionalProperties": False,
+    },
     "ChatHistoryClearRequest": {
         "type": "object",
         "required": ["confirm"],
@@ -1554,6 +1588,7 @@ PRECISE_JSON_BODIES: dict[Operation, str] = {
     ("post", "/v1/model_api/runtime_error"): "ModelApiRuntimeErrorRequest",
     ("post", "/v1/chat/message"): "ChatTransportRequest",
     ("post", "/v1/chat/response"): "ChatResponseRequest",
+    ("post", "/v1/chat/turn-activity/{turn_id}/events"): "ChatActivityEventRequest",
     ("delete", "/v1/chat/history"): "ChatHistoryClearRequest",
     ("post", "/v1/memory/index"): "MemoryIndexRequest",
     ("post", "/v1/memory/fetch"): "MemoryFetchRequest",
@@ -1649,7 +1684,8 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "Metrics the adapter cannot report are status=\"unsupported\", not omitted."
     ),
     ("get", "/v1/chat/history"): "Read encrypted chat history. Use oldest_seq as before_seq for lossless older paging and latest_seq as after_seq for lossless forward paging; timestamp watermarks remain for compatibility.",
-    ("get", "/v1/chat/turn-activity/{turn_id}"): "Read display-safe Runtime V2 activity for one hosted chat turn. Events come only from backend-owned job and tool-dispatch records and include bounded identifiers, state, timing, result classification, and durable-effect disposition; successful memory_search/memory_fetch events also include the confirmed returned-item count and, only when every item uses the canonical bucket taxonomy, a complete category-count breakdown. Tool arguments, result bodies, assistant prose, reasoning, and custom bucket labels are never returned. A V1/resident turn has no activity resource and returns 404 turn_activity_not_found.",
+    ("get", "/v1/chat/turn-activity/{turn_id}"): "Read display-safe activity for one V1 resident or Runtime V2 chat turn. V2 events come from backend jobs and tool dispatch; V1 events come from the authenticated resident io_cli boundary and are durably scoped to an existing user message. Both runtimes expose only bounded identifiers, state, timing, and result classification. Successful memory_search/memory_fetch events include the confirmed returned-item count and, only when every item uses the canonical bucket taxonomy, a complete category-count breakdown. Tool arguments, result bodies, assistant prose, reasoning, and custom bucket labels are never returned.",
+    ("post", "/v1/chat/turn-activity/{turn_id}/events"): "Append one authenticated V1 resident tool transition. This endpoint is used by the shipped resident io_cli runtime, accepts only running/success/failure plus display-safe fixed metadata, rejects V2-owned users, and never accepts tool arguments, model prose, or result bodies.",
     ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",
     ("post", "/v1/memory/fetch"): "Fetch full records for selected memory IDs. Sensitive fetch behavior is not part of the current public contract.",
     ("post", "/v1/memory/actions"): "Apply up to 20 memory actions in order. The batch is not transactional and Idempotency-Key is not supported.",

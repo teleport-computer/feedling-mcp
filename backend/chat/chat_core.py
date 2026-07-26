@@ -38,6 +38,8 @@ from bootstrap import gates as boot_gates
 from chat import consumer as chat_consumer
 from chat import idempotency as chat_idempotency
 from chat import service as chat_service
+from chat import activity_store as chat_activity_store
+from core import chat_activity as chat_activity_projection
 from core import envelope as core_envelope
 from core import wake_bus
 from core.store import UserStore
@@ -942,6 +944,11 @@ def write_response(
     if file_followups and not reply_to_message_id:
         return {"error": "file_followups require reply_to_message_id"}, 400
     if reply_to_message_id and role != "system":
+        resident_activity = chat_activity_projection.project_tool_events(
+            chat_activity_store.resident_activity_rows(store.user_id, reply_to_message_id)
+        )
+        if resident_activity:
+            extra["activity_events"] = resident_activity
         # Persist the parent link on every ordinary reply, not only failures and
         # file cards. Consecutive user messages can arrive before the first reply;
         # the client needs this exact id to show which earlier turn a late text
