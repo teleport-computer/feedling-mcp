@@ -1209,12 +1209,7 @@ def _wake_decision_for_user(user_id: str, trigger: str = "heartbeat") -> dict:
     """Read-only wake decision via the real proactive gate (assembly
     layer — reuses gate._build_proactive_v2_wake_decision so activation gate /
     broadcast suppression / all landmines hold with zero drift). No enqueue here;
-    the scheduler decides what to do with should_wake.
-
-    ``screen_watch`` additionally requires Ambient consent. The shared gate checks
-    both switches from one settings snapshot; heartbeat callers retain the existing
-    default behavior.
-    """
+    the scheduler decides what to do with should_wake."""
     store = core_store.get_store(user_id)
     if not hosted_config_store.hosted_runtime_v2_enabled_strict(store):
         return {
@@ -1224,11 +1219,7 @@ def _wake_decision_for_user(user_id: str, trigger: str = "heartbeat") -> dict:
         }
     normalized_trigger = str(trigger or "heartbeat").strip().lower() or "heartbeat"
     payload = {"trigger": normalized_trigger}
-    d = proactive_gate._build_proactive_v2_wake_decision(
-        store,
-        payload,
-        require_ambient=normalized_trigger == "screen_watch",
-    )
+    d = proactive_gate._build_proactive_v2_wake_decision(store, payload)
     return {
         "should_wake": bool(d.get("should_wake_agent")),
         "wake_interval_sec": int(d.get("wake_interval_sec") or 7200),

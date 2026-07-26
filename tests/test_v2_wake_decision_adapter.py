@@ -87,7 +87,7 @@ def test_screen_watch_decision_requires_its_user_switch():
     assert decision["block_reason"] == "screen_watch_disabled"
 
 
-def test_screen_watch_decision_also_requires_ambient():
+def test_screen_watch_decision_is_independent_from_ambient():
     uid = "usr_wake_decision_ambient_disabled"
     seed_user(uid)
     _enable_v2(uid)
@@ -100,28 +100,21 @@ def test_screen_watch_decision_also_requires_ambient():
 
     decision = _wake_decision_for_user(uid, trigger="screen_watch")
 
-    assert decision["should_wake"] is False
-    assert decision["block_reason"] == "ambient_disabled"
-
-    # V1 calls the shared gate without the Runtime V2 assembly-only requirement.
-    # Keep that existing control split unchanged.
-    v1_decision = proactive_gate._build_proactive_v2_wake_decision(
-        store,
-        {"trigger": "screen_watch"},
-    )
-    assert v1_decision["block_reason"] != "ambient_disabled"
+    assert decision["should_wake"] is True
+    assert decision["block_reason"] == "wake_created"
 
 
 @pytest.mark.parametrize(
-    "settings",
+    ("settings", "expected_enqueued"),
     [
-        {"ambient": True, "screen_watch_enabled": False},
-        {"ambient": False, "screen_watch_enabled": True},
+        ({"ambient": True, "screen_watch_enabled": False}, False),
+        ({"ambient": False, "screen_watch_enabled": True}, True),
     ],
 )
 def test_screen_watch_switches_block_the_production_enqueue(
     monkeypatch,
     settings,
+    expected_enqueued,
 ):
     uid = (
         "usr_screen_producer_screen_disabled"
@@ -133,6 +126,13 @@ def test_screen_watch_switches_block_the_production_enqueue(
     store = core_store.get_store(uid)
     store.mark_first_chat_ok(at_iso="2026-07-01T00:00:00")
     store.save_proactive_settings(settings)
+    monkeypatch.setattr(
+        proactive_gate.provider_health,
+        "proactive_admission",
+        lambda *_args, **_kwargs: proactive_gate.provider_health.ProactiveAdmission(
+            allowed=True,
+        ),
+    )
 
     now = 10_000.0
     monkeypatch.setattr(serve_worker.time, "time", lambda: now)
@@ -157,6 +157,13 @@ def test_screen_watch_switches_block_the_production_enqueue(
         "upsert_wake_schedule",
         lambda *_args, **_kwargs: None,
     )
+    notify_calls = []
+    monkeypatch.setattr(
+        serve_worker.core_wake_bus,
+        "notify",
+        lambda *args: notify_calls.append(args),
+    )
 
-    assert serve_worker._tick_screen_watch_for_user(uid) == 0
-    assert enqueue_calls == []
+    assert serve_worker._tick_screen_watch_for_user(uid) == int(expected_enqueued)
+    assert len(enqueue_calls) == int(expected_enqueued)
+    assert len(notify_calls) == int(expected_enqueued)

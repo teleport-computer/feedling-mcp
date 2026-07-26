@@ -1050,6 +1050,8 @@ class UserStore:
     def load_proactive_settings(self) -> dict:
         default = {
             "version": 2,
+            # Heartbeat-only switch, shown as "心跳" / "Heartbeat" in the app.
+            # `enabled` is its historical alias, not a proactive master switch.
             "enabled": True,
             "dnd": False,
             "scheduled": True,

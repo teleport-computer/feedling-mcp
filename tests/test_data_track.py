@@ -953,6 +953,8 @@ def test_detail_payload_exposes_permission_metadata_without_private_directive(cl
     row = _dt._build_data_track_user(user_entry, include_detail=True)
     pp = row["perception_permissions"]
     assert pp["permission_states"]["photos"] == "authorized"
+    assert pp["switches"]["ambient_心跳"] is True
+    assert "ambient_陪伴" not in pp["switches"]
     assert pp["switches"]["photo_wake_照片唤醒"] is False
     assert pp["wake_directive_configured"] is True
     assert pp["wake_interval_sec"] == 3600
