@@ -17,6 +17,7 @@ import db
 from model_api_runtime.v2 import effect_outbox, effect_id, jobs_store
 
 from conftest import seed_user
+from incident_guard_reference import legacy_wake_should_publish
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"),
@@ -112,6 +113,45 @@ def _running_chat_job(uid: str, generation: int, *, owner: str = "owner") -> int
     return job_id
 
 
+def _running_wake_job(
+    uid: str,
+    generation: int,
+    *,
+    lane: str = "heartbeat",
+    owner: str = "owner",
+) -> int:
+    job_id, coalesced = jobs_store.enqueue_job(
+        uid,
+        lane,
+        expected_generation=generation,
+    )
+    assert coalesced is False
+    job = jobs_store.claim_next_job(owner)
+    assert job is not None and int(job["id"]) == job_id
+    assert jobs_store.mark_running(job_id, claimed_by=owner) is True
+    return job_id
+
+
+def _wake_intermediate_payload(*, lane: str = "heartbeat") -> dict:
+    return {
+        "text": "proactive candidate",
+        "wake_kind": lane,
+        effect_outbox.REPLY_SOURCE_FENCE_KEY: {"claimed_by": "owner"},
+    }
+
+
+def _wake_terminal_payload(*, observed_user_seq: int, lane: str = "heartbeat") -> dict:
+    return {
+        "text": "proactive candidate",
+        "wake_kind": lane,
+        effect_outbox.FINAL_REPLY_FENCE_KEY: {
+            "claimed_by": "owner",
+            "input_generation": 0,
+            "observed_user_seq": observed_user_seq,
+        },
+    }
+
+
 def _final_fence_payload(
     *, input_generation: int, through_seq: int, claimed_by: str = "owner"
 ) -> dict:
@@ -175,6 +215,138 @@ def test_fenced_reply_is_hidden_from_old_pending_reader_but_current_drain_sees_i
     assert result == {"applied": 1, "discarded": 0}
     assert seen == [("reply", "still working")]
     assert db.effect_pending(uid) == []
+
+
+def test_wake_reply_is_suppressed_when_user_arrives_during_model_turn(
+    pg_clean,
+    monkeypatch,
+):
+    """The user row lands after the wake job starts but before publication.
+    V2 must sleep at post time, not fold that row and make another provider
+    call. This is the same conclusion as V1's post-time collision guard."""
+    uid = "u_ob_wake_collision_during_turn"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    _set_v2_owner(uid)
+    job_id = _running_wake_job(uid, generation)
+    now = time.time()
+    message = {
+        "id": "user-during-wake",
+        "role": "user",
+        "source": "chat",
+        "body_ct": "ciphertext",
+        "ts": now,
+    }
+    assert legacy_wake_should_publish(
+        monkeypatch,
+        lane="heartbeat",
+        message=message,
+        now=now,
+    ) is False
+    db.chat_append_strict(
+        uid,
+        "user-during-wake",
+        now,
+        message,
+        5000,
+    )
+    observed_user_seq = int(
+        db.chat_seq_for_msg_id(uid, "user-during-wake")
+    )
+    eid = effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type=effect_outbox.TERMINAL_REPLY_EFFECT_TYPE,
+        ordinal=0,
+        expected_generation=generation,
+        payload=_wake_terminal_payload(observed_user_seq=observed_user_seq),
+    )
+    seen = []
+
+    result = effect_outbox.apply_pending_effects(
+        uid,
+        dispatch=lambda *args: seen.append(args),
+    )
+
+    assert result["applied"] == 0
+    assert result["discarded"] == 1
+    assert seen == []
+    assert effect_outbox.get_effect_disposition(
+        eid,
+        user_id=uid,
+        job_id=job_id,
+        effect_type=effect_outbox.TERMINAL_REPLY_EFFECT_TYPE,
+    ) == {
+        "status": "discarded",
+        "last_error": effect_outbox.WAKE_REPLY_CHAT_COLLISION,
+    }
+
+
+@pytest.mark.parametrize(
+    ("lane", "age_sec", "should_publish"),
+    [
+        ("heartbeat", 91.0, True),
+        ("scheduled", 1.0, True),
+    ],
+)
+def test_wake_collision_window_and_scheduled_exemption_match_v1(
+    pg_clean,
+    monkeypatch,
+    lane,
+    age_sec,
+    should_publish,
+):
+    uid = f"u_ob_wake_collision_{lane}_{int(age_sec)}"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    _set_v2_owner(uid)
+    job_id = _running_wake_job(uid, generation, lane=lane)
+    now = time.time()
+    message = {
+        "id": "nearby-user",
+        "role": "user",
+        "source": "chat",
+        "body_ct": "ciphertext",
+        "ts": now - age_sec,
+    }
+    assert legacy_wake_should_publish(
+        monkeypatch,
+        lane=lane,
+        message=message,
+        now=now,
+    ) is should_publish
+    db.chat_append_strict(
+        uid,
+        "nearby-user",
+        now - age_sec,
+        message,
+        5000,
+    )
+    eid = effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type=effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE,
+        ordinal=0,
+        expected_generation=generation,
+        payload=_wake_intermediate_payload(lane=lane),
+    )
+    seen = []
+
+    result = effect_outbox.apply_pending_effects(
+        uid,
+        dispatch=lambda effect_type, payload: seen.append(
+            (effect_type, payload["text"])
+        ),
+    )
+
+    assert result == {"applied": 1, "discarded": 0}
+    assert seen == [("reply", "proactive candidate")]
+    assert effect_outbox.get_effect_disposition(
+        eid,
+        user_id=uid,
+        job_id=job_id,
+        effect_type=effect_outbox.INTERMEDIATE_REPLY_EFFECT_TYPE,
+    )["status"] == "applied"
 
 
 def test_valid_final_reply_atomically_completes_job_and_clears_route_error(

@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 now carries forward the incident-hardened proactive interruption
+  guards from Runtime V1.** After three consecutive AI-authored follow-up wake
+  schedules without genuine user input, the fourth schedule is suppressed until
+  the user speaks; heartbeat and screen/event wakes do not consume this budget.
+  Heartbeat, manual, and screen-watch replies also perform a final 90-second
+  chat-collision check inside publication, so a user message or foreground
+  agent reply that lands while the wake model call is running makes that wake
+  sleep instead of posting or folding and retrying. User-requested scheduled
+  reminders remain deliverable during active chat.
 - **New `POST /v1/model_api/models` lists a provider's live model catalog (BYOK
   setup).** Supply the credential exactly one of two ways — a fresh `api_key`, or
   a stored `credential_id` whose provider/base_url are the source of truth (any

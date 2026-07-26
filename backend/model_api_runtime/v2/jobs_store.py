@@ -5158,7 +5158,9 @@ def get_wake_schedule(user_id) -> dict | None:
                 "EXTRACT(EPOCH FROM next_capture_at) AS next_capture_at, "
                 "EXTRACT(EPOCH FROM payment_cooldown_until) AS payment_cooldown_until, "
                 "EXTRACT(EPOCH FROM next_screen_watch_at) AS next_screen_watch_at, "
-                "last_screen_watch_frame_id, updated_at "
+                "last_screen_watch_frame_id, self_wake_streak, "
+                "self_wake_user_seq, self_wake_last_effect_id, "
+                "self_wake_last_effect_accepted, updated_at "
                 "FROM v2_wake_schedule WHERE user_id=%s",
                 (user_id,),
             )
@@ -5169,6 +5171,86 @@ def get_wake_schedule(user_id) -> dict | None:
     if result["next_screen_watch_at"] is not None:
         result["next_screen_watch_at"] = float(result["next_screen_watch_at"])
     return result
+
+
+def reserve_self_wake(
+    user_id: str,
+    *,
+    effect_id: str,
+    max_consecutive: int,
+) -> dict[str, Any]:
+    """Atomically admit one AI-authored self-schedule attempt.
+
+    Only Runtime V2 wake turns call this helper. Heartbeat/event wake
+    realization never touches the counter. A newer genuine user message lazily
+    resets the streak at the next admission decision. Production calls this
+    from the effect sink while the outbox owns the chat-user advisory fence, so
+    the reset is ordered against a concurrent Send. The last effect result
+    makes an outbox replay return the same decision without incrementing twice.
+    """
+    normalized_user_id = str(user_id)
+    normalized_effect_id = str(effect_id or "").strip()
+    if not normalized_effect_id:
+        raise ValueError("self-wake effect_id required")
+    limit = max(0, int(max_consecutive))
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "INSERT INTO v2_wake_schedule (user_id) VALUES (%s) "
+                    "ON CONFLICT (user_id) DO NOTHING",
+                    (normalized_user_id,),
+                )
+                cur.execute(
+                    "SELECT self_wake_streak,self_wake_user_seq,"
+                    "self_wake_last_effect_id,self_wake_last_effect_accepted "
+                    "FROM v2_wake_schedule WHERE user_id=%s FOR UPDATE",
+                    (normalized_user_id,),
+                )
+                state = cur.fetchone()
+                if state is None:
+                    raise RuntimeError("self-wake schedule row missing")
+                if str(state["self_wake_last_effect_id"] or "") == normalized_effect_id:
+                    accepted = bool(state["self_wake_last_effect_accepted"])
+                    return {
+                        "accepted": accepted,
+                        "streak": int(state["self_wake_streak"] or 0),
+                        "reason": "" if accepted else "self_wake_loop_guard",
+                        "replayed": True,
+                    }
+                cur.execute(
+                    "SELECT COALESCE(MAX(seq),0) AS user_seq FROM chat_messages "
+                    "WHERE user_id=%s AND doc->>'role' IN ('user','human') "
+                    "AND COALESCE(doc->>'source','') "
+                    "NOT IN ('verify_ping','resident_maintenance')",
+                    (normalized_user_id,),
+                )
+                user_seq = int(cur.fetchone()["user_seq"] or 0)
+                previous_user_seq = int(state["self_wake_user_seq"] or 0)
+                streak = int(state["self_wake_streak"] or 0)
+                if user_seq > previous_user_seq:
+                    streak = 0
+                accepted = limit <= 0 or streak < limit
+                next_streak = streak + 1 if accepted else streak
+                cur.execute(
+                    "UPDATE v2_wake_schedule SET self_wake_streak=%s,"
+                    "self_wake_user_seq=%s,self_wake_last_effect_id=%s,"
+                    "self_wake_last_effect_accepted=%s,updated_at=now() "
+                    "WHERE user_id=%s",
+                    (
+                        next_streak,
+                        user_seq,
+                        normalized_effect_id,
+                        accepted,
+                        normalized_user_id,
+                    ),
+                )
+                return {
+                    "accepted": accepted,
+                    "streak": next_streak,
+                    "reason": "" if accepted else "self_wake_loop_guard",
+                    "replayed": False,
+                }
 
 
 def upsert_wake_schedule(

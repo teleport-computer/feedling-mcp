@@ -2177,6 +2177,15 @@ _SCHEDULE_PAYLOAD_KEYS = (
 
 
 _SCHEDULE_CAPABILITY_OPS = frozenset({"schedule_wake", "cancel_wake"})
+try:
+    _MAX_CONSECUTIVE_SELF_WAKES = max(
+        0,
+        int(os.environ.get("FEEDLING_MAX_CONSECUTIVE_SELF_WAKES", "3")),
+    )
+except ValueError as exc:
+    raise RuntimeError(
+        "FEEDLING_MAX_CONSECUTIVE_SELF_WAKES must be an integer"
+    ) from exc
 
 
 def _sink_schedule(user_id: str, payload: dict) -> None:
@@ -2208,8 +2217,36 @@ def _sink_schedule(user_id: str, payload: dict) -> None:
     try:
         op = payload.get("op")
         if op in _SCHEDULE_CAPABILITY_OPS:
+            internal_self_wake = (
+                op == "schedule_wake" and payload.get("_self_wake") is True
+            )
+            if internal_self_wake:
+                reservation = jobs_store.reserve_self_wake(
+                    user_id,
+                    effect_id=eid,
+                    max_consecutive=_MAX_CONSECUTIVE_SELF_WAKES,
+                )
+                if not reservation["accepted"]:
+                    log.info(
+                        "[v2.serve_worker] self-wake schedule suppressed "
+                        "user=%s effect=%s streak=%s",
+                        user_id,
+                        eid,
+                        reservation["streak"],
+                    )
+                    db.effect_sink_complete(eid)
+                    return
             store = core_store.get_store(user_id)
-            params = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
+            params = {
+                k: v
+                for k, v in payload.items()
+                if k not in ("effect_id", "op", "_self_wake")
+            }
+            if internal_self_wake:
+                # Internal capability metadata: the public schema never accepts
+                # it, but ScheduledWakeServiceV2 uses it to enforce the existing
+                # five-minute minimum lead for AI-authored follow-up wakes.
+                params["_self_wake"] = True
             result = cap_registry.run_capability(op, store, api_key=None, params=params)
             if not result.ok:
                 # Same retryable-honoring contract as _sink_identity: a
@@ -2645,7 +2682,16 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
         tool_name = str(payload.get("op") or "")
         if tool_name not in _SCHEDULE_CAPABILITY_OPS:
             raise RuntimeError("invalid encrypted schedule operation")
-        args = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
+        self_wake = payload.get("_self_wake")
+        if self_wake is not None and (
+            self_wake is not True or tool_name != "schedule_wake"
+        ):
+            raise RuntimeError("invalid encrypted self-wake marker")
+        args = {
+            k: v
+            for k, v in payload.items()
+            if k not in ("effect_id", "op", "_self_wake")
+        }
     elif effect_type == "workspace":
         tool_name = str(payload.get("op") or "")
         if tool_name not in {"workspace_write", "workspace_delete"}:

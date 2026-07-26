@@ -3112,9 +3112,10 @@ class _PlatformEffectReservations:
     keeps an explicit provider-order predecessor fence as defence in depth.
     """
 
-    def __init__(self, *, job_id, ordinal_counter) -> None:
+    def __init__(self, *, job_id, ordinal_counter, self_wake: bool = False) -> None:
         self._job_id = job_id
         self._ordinal_counter = ordinal_counter
+        self._self_wake = bool(self_wake)
         self._last_ready: asyncio.Event | None = None
         self._by_call: dict[str, _PreparedPlatformEffect] = {}
         self._by_batch: dict[tuple[str, ...], _PreparedPlatformEffect] = {}
@@ -3155,6 +3156,11 @@ class _PlatformEffectReservations:
         if existing is not None and not existing.ready.is_set():
             raise RuntimeError("duplicate prepared platform write")
         logical_effect_type, payload = _write_tool_effect_payload(tc)
+        if self._self_wake and tc.name == "schedule_wake":
+            # Trusted lane metadata, added after model-argument validation and
+            # encrypted with the effect payload. The sink strips it before
+            # re-validating the public tool arguments.
+            payload["_self_wake"] = True
         effect_type = ENCRYPTED_TOOL_EFFECT_TYPES[logical_effect_type]
         self._by_call[call_id] = self._reserve(
             payload=payload,
@@ -4764,6 +4770,7 @@ async def _run_wake(
         effect_reservations = _PlatformEffectReservations(
             job_id=job_id,
             ordinal_counter=ordinal,
+            self_wake=True,
         )
         platform_effects_by_call: dict[str, tuple[str, str]] = {}
         platform_workspace_batches: dict[
@@ -5301,6 +5308,14 @@ async def _run_wake(
                             raise RuntimeError(
                                 "wake final applied without completing source job"
                             )
+                    return
+                if (
+                    status == "discarded"
+                    and last_error == v2_effect_outbox.WAKE_REPLY_CHAT_COLLISION
+                ):
+                    # Post-time collision is an intentional sleep, not stale
+                    # input to fold into another provider call. The wake job
+                    # finishes normally without publishing or pushing.
                     return
                 if (
                     status == "discarded"

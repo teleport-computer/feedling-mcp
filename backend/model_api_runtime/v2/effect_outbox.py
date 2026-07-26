@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import logging
+import math
+import os
 from typing import Callable
 import db
 from model_api_runtime.v2 import effect_id as _effect_id
@@ -42,6 +44,7 @@ FINALIZED_JOB_IDS_KEY = "finalized_job_ids"
 FINAL_REPLY_INPUT_ADVANCED = "input_generation_advanced"
 FINAL_REPLY_INVALID_FENCE = "invalid_final_reply_fence"
 FINAL_REPLY_SOURCE_JOB_INACTIVE = "source_job_not_active"
+WAKE_REPLY_CHAT_COLLISION = "wake_chat_collision"
 EFFECT_RUNTIME_STATE_CHANGED = "runtime_state_not_v2"
 EFFECT_RUNTIME_GENERATION_CHANGED = "runtime_generation_advanced"
 APPLIED_RESULT_PAYLOAD_KEY = "_applied_result_v1"
@@ -53,6 +56,64 @@ WORKSPACE_BATCH_TERMINAL_ERRORS = frozenset(
 )
 _APPLIED_RESULT_MAX_BYTES = 16_384
 _SAFE_EFFECT_ID_PUNCTUATION = frozenset(":_-.")
+_COLLISION_WAKE_KINDS = frozenset(
+    {"heartbeat", "manual_wake", "screen_watch"}
+)
+_COLLISION_PROACTIVE_SOURCE = "agent_initiated_proactive"
+_COLLISION_CLOCK_SKEW_SEC = 5.0
+
+
+def _collision_window_sec() -> float:
+    raw = os.environ.get("PROACTIVE_CHAT_COLLISION_WINDOW_SEC", "90")
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "PROACTIVE_CHAT_COLLISION_WINDOW_SEC must be finite"
+        ) from exc
+    if not math.isfinite(value):
+        raise RuntimeError(
+            "PROACTIVE_CHAT_COLLISION_WINDOW_SEC must be finite"
+        )
+    return max(0.0, value)
+
+
+def _wake_reply_chat_collision(cur, *, user_id: str, payload: dict) -> bool:
+    """Check the V1 post-time collision rule on the publication transaction.
+
+    Scheduled reminders remain exempt: they are user-requested deliveries and
+    V1 deliberately posts them even during an active conversation. Existing V2
+    wake rows are also excluded so the gate does not become a wake-spacing
+    mechanism; self-wake and delivery guards own that policy.
+    """
+    wake_kind = str(payload.get("wake_kind") or "").strip().lower()
+    if wake_kind not in _COLLISION_WAKE_KINDS:
+        return False
+    window = _collision_window_sec()
+    if window <= 0:
+        return False
+    cur.execute(
+        "SELECT 1 FROM chat_messages "
+        "WHERE user_id=%s AND ts>=(EXTRACT(EPOCH FROM clock_timestamp())-%s) "
+        "AND ts<=(EXTRACT(EPOCH FROM clock_timestamp())+%s) "
+        "AND COALESCE(doc->>'source','') "
+        "NOT IN ('verify_ping','resident_maintenance') "
+        "AND ("
+        "  doc->>'role' IN ('user','human') "
+        "  OR ("
+        "    doc->>'role' IN ('openclaw','assistant','agent','model') "
+        "    AND COALESCE(doc->>'source','')<>%s "
+        "    AND COALESCE(doc->>'wake_kind','')=''"
+        "  )"
+        ") LIMIT 1",
+        (
+            str(user_id),
+            window,
+            _COLLISION_CLOCK_SKEW_SEC,
+            _COLLISION_PROACTIVE_SOURCE,
+        ),
+    )
+    return cur.fetchone() is not None
 
 
 @dataclass(frozen=True)
@@ -262,6 +323,10 @@ def _reply_fence_matches(
         )
         if job is None:
             return FINAL_REPLY_SOURCE_JOB_INACTIVE, None, None, "transactional"
+        if _wake_reply_chat_collision(cur, user_id=user_id, payload=payload):
+            return WAKE_REPLY_CHAT_COLLISION, str(job[3]), int(job[1] or 0), (
+                "transactional"
+            )
         return None, None, None, "transactional"
 
     if effect_type == TERMINAL_REPLY_EFFECT_TYPE:
@@ -289,6 +354,13 @@ def _reply_fence_matches(
         )
         if job is None:
             return FINAL_REPLY_SOURCE_JOB_INACTIVE, None, None, "terminal"
+        if _wake_reply_chat_collision(cur, user_id=user_id, payload=payload):
+            return (
+                WAKE_REPLY_CHAT_COLLISION,
+                str(job[3]),
+                int(job[1] or 0),
+                "terminal",
+            )
         expected_input_generation = int(final_fence["input_generation"])
         if int(job[1] or 0) != expected_input_generation:
             return (
@@ -335,6 +407,10 @@ def _reply_fence_matches(
             cur, user_id=user_id, job_id=job_id, expected_claimed_by=None)
         if job is None:
             return FINAL_REPLY_SOURCE_JOB_INACTIVE, None, None, "transactional"
+        if _wake_reply_chat_collision(cur, user_id=user_id, payload=payload):
+            return WAKE_REPLY_CHAT_COLLISION, str(job[3]), int(job[1] or 0), (
+                "transactional"
+            )
         return None, None, None, "transactional"
 
     if effect_type == FINAL_REPLY_EFFECT_TYPE or (
@@ -393,6 +469,13 @@ def _reply_fence_matches(
     mode = "legacy_final" if is_legacy_final else "final"
     if job is None:
         return FINAL_REPLY_SOURCE_JOB_INACTIVE, None, None, mode
+    if _wake_reply_chat_collision(cur, user_id=user_id, payload=payload):
+        return (
+            WAKE_REPLY_CHAT_COLLISION,
+            str(job[3]),
+            int(job[1] or 0),
+            mode,
+        )
     if (
         expected_input_generation is not None
         and int(job[1] or 0) != expected_input_generation
