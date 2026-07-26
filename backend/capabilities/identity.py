@@ -26,7 +26,7 @@ def get(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityRe
 # only land in self_introduction, so the displayed name went stale while the agent
 # reported success. Values are passed through — card_policy owns the real rules
 # (non-empty, not a runtime label like "claude").
-_TOP_LEVEL_PROFILE_FIELDS = ("agent_name", "self_introduction", "signature")
+_TOP_LEVEL_PROFILE_FIELDS = ("agent_name", "self_introduction", "signature", "relationship_days")
 
 
 def merge_patch_fields(params) -> dict:
