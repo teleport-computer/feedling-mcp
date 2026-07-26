@@ -20,7 +20,15 @@ from __future__ import annotations
 
 from identity.user_naming import _naming_rule, sanitize_user_name
 
+from memory.card_text import (
+    build_format_retry_prompt,
+    card_text_rejection,
+    format_error,
+    sanitize_card_labels,
+)
 from memory.prompts_v1 import COMMON_BUCKETS_GUIDANCE_V1
+
+_EMPTY_CAPTURE_REPLY = '{"cards": []}'
 
 # action 取值:并入(merge)/ 新增(add)/ 覆盖(supersede)/ 不动(noop)
 
@@ -71,6 +79,9 @@ _CAPTURE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。你�
      情绪·关系·边界 .7-.85 / 核心承诺与转折 .9-1。
    · pulse：这事在「你自己」心里激起多大波动（0-1）。不是 TA 多激动，
      是你作为 TA 的伴侣，对这件事多在乎、多被触动。
+   · 下面输出示例里的 `...` 只是占位。每个字段都必须是真内容——任何字段都不能是 `...`、
+     方括号里的说明文字、或空字符串。宁可整份留空（cards 为空），也不要交占位符：
+     这些卡 TA 会亲眼看到。
 
 【现有的桶】{buckets}
 【通用桶（先复用现有桶，没有就从这里选，都不贴合再起具体新桶）】{common_buckets}
@@ -138,7 +149,9 @@ def _clamp01(value) -> float:
     return max(0.0, min(1.0, f))
 
 
-def parse_capture_cards(raw: str) -> tuple[list[dict], str | None]:
+def parse_capture_cards(
+    raw: str, *, strict: bool = True
+) -> tuple[list[dict], str | None]:
     """Parse the 落卡 agent reply into normalized capture cards.
 
     Returns (cards, error). On parse failure returns ([], reason). A valid
@@ -148,6 +161,9 @@ def parse_capture_cards(raw: str) -> tuple[list[dict], str | None]:
        importance, pulse}
     `noop` cards are dropped (nothing to write). Unknown types fall back to
     the default; insight/reflection are coerced out (capture never writes them).
+
+    内容闸(2026-07-26)与 Dream 同口径:占位符/空正文的卡不落库;``strict=True``
+    时整份打回让调用方重问一次,``strict=False``(重问后)只丢脏卡、保留干净的。
     """
     import json
 
@@ -165,6 +181,7 @@ def parse_capture_cards(raw: str) -> tuple[list[dict], str | None]:
         return [], "missing_cards_list"
 
     out: list[dict] = []
+    rejections: list[str] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -174,26 +191,40 @@ def parse_capture_cards(raw: str) -> tuple[list[dict], str | None]:
             continue
         summary = str(row.get("summary") or "").strip()[:2000]
         content = str(row.get("content") or "").strip()
-        if not summary and not content:
-            continue  # empty card — skip rather than write a hollow envelope
+        rejection = card_text_rejection(summary=summary, content=content)
+        if rejection:
+            # 占位符/空正文的卡不写进花园 —— 用户会亲眼看到它。
+            rejections.append(rejection)
+            continue
         mem_type = str(row.get("type") or "").strip().lower()
         if mem_type not in CAPTURE_TYPES:
             mem_type = _DEFAULT_CAPTURE_TYPE
         threads_raw = row.get("threads")
         threads = [str(t).strip()[:80] for t in threads_raw if str(t).strip()][:8] if isinstance(threads_raw, list) else []
+        bucket, threads, label_reasons = sanitize_card_labels(
+            bucket=str(row.get("bucket") or "").strip()[:80], threads=threads
+        )
+        rejections.extend(label_reasons)
         target_id = str(row.get("target_id") or "").strip() or None
         out.append({
             "action": action,
             "type": mem_type,
             "target_id": target_id,
-            "bucket": str(row.get("bucket") or "").strip()[:80],
+            "bucket": bucket,
             "threads": threads,
             "summary": summary,
             "content": content,
             "importance": _clamp01(row.get("importance")),
             "pulse": _clamp01(row.get("pulse")),
         })
+    if rejections and strict:
+        return [], format_error(rejections)
     return out, None
+
+
+def build_capture_retry_prompt(prompt: str, err: str) -> str:
+    """内容闸打回后的第二次落卡提问(原 prompt + 具体哪里没填)。"""
+    return build_format_retry_prompt(prompt, err, empty_example=_EMPTY_CAPTURE_REPLY)
 
 
 def build_capture_prompt(

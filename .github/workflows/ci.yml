@@ -169,6 +169,7 @@ jobs:
             tests/test_runtime_v2_default_flag.py \
             tests/test_capture_prompt_v1.py \
             tests/test_dream_prompt_v1.py \
+            tests/test_card_text_gate.py \
             tests/test_pi_mcp_bridge.py \
             -v
 
@@ -237,6 +238,9 @@ jobs:
             tests/test_v2_atomic_reply_cursor.py \
             tests/test_v2_effect_outbox.py \
             tests/test_v2_watchdog.py \
+            tests/test_v2_extraction.py \
+            tests/test_v2_extraction_lanes.py \
+            tests/test_v2_extraction_memory_integration.py \
             -v
 
   # -------------------------------------------------------------------------

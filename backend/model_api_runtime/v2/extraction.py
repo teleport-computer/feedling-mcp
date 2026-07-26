@@ -11,13 +11,28 @@
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, NamedTuple
 
 import provider_client
 
 _MAX_TOKENS = 1500
 _TEMPERATURE = 0.3
 _TIMEOUT_SEC = 90.0
+
+
+class ParseRetry(NamedTuple):
+    """「解析结果不合格 → 原样打回去重问一次」的注入点。
+
+    判据与纠错文案属于 memory/ 层（依赖方向不允许本模块 import 它），
+    所以由 worker 组装三个纯回调传进来：
+      should_retry(err)          -> 这个 reason 值不值得重问；
+      build_prompt(prompt, err)  -> 第二次的 prompt（含「哪个字段没填」）；
+      parse(reply)               -> 第二次的解析（通常放宽成「只丢脏行」）。
+    """
+
+    should_retry: Callable[[str], bool]
+    build_prompt: Callable[[str, str], str]
+    parse: Callable[[str], tuple]
 
 
 async def extract(
@@ -29,50 +44,81 @@ async def extract(
     progress_cb: Callable[[str, int], None] | None = None,
     usage_out: Callable[[dict | None], None] | None = None,
     trajectory_out: Callable[[str, dict], Awaitable[None]] | None = None,
+    parse_retry: ParseRetry | None = None,
 ) -> tuple[Any, str | None]:
     """跑一次 BYOK 抽取调用并解析。**永不抛**——失败一律返回 (None, reason)。
 
     `parse` 是 memory/*_prompt_v1 里的纯解析函数。它的返回是 (value, err) 或
     (value, questions, err)；我们只取首项与末项（末项恒为 err）。
+
+    给了 `parse_retry` 时，内容闸判为「模型把输出示例的占位符抄了回来」的回复会被
+    打回、带着「哪个字段没填」重问一次（**最多一次**，第二次的结果直接采信）。
+    provider 报错 / 空回复 / JSON 根本没出来不走这条路——重问同一段 prompt 也没用，
+    它们各有自己的重试与退避。
     """
-    messages = [{"role": "user", "content": prompt}]
-    if trajectory_out is not None:
-        await trajectory_out("provider_request", {"messages": messages, "tools": None})
-    try:
-        result = await provider_client.reliable_chat_completion_async(
-            provider_config,
-            messages,
-            max_tokens=max_tokens,
-            temperature=_TEMPERATURE,
-            timeout=_TIMEOUT_SEC,
-            progress_cb=progress_cb,
-        )
-    except Exception as e:  # noqa: BLE001 — 背景 job：归一成 reason，绝不抛
+
+    async def _call(attempt_prompt: str) -> tuple[str | None, str | None]:
+        """跑一次 provider，返回 (reply, error_reason)。"""
+        messages = [{"role": "user", "content": attempt_prompt}]
         if trajectory_out is not None:
             await trajectory_out(
-                "provider_error",
-                {
-                    "error_class": type(e).__name__,
-                    "provider_attempt_trace": (
-                        provider_client.runtime_provider_attempt_trace(e)
-                    ),
-                },
+                "provider_request", {"messages": messages, "tools": None}
             )
+        try:
+            result = await provider_client.reliable_chat_completion_async(
+                provider_config,
+                messages,
+                max_tokens=max_tokens,
+                temperature=_TEMPERATURE,
+                timeout=_TIMEOUT_SEC,
+                progress_cb=progress_cb,
+            )
+        except Exception as e:  # noqa: BLE001 — 背景 job：归一成 reason，绝不抛
+            if trajectory_out is not None:
+                await trajectory_out(
+                    "provider_error",
+                    {
+                        "error_class": type(e).__name__,
+                        "provider_attempt_trace": (
+                            provider_client.runtime_provider_attempt_trace(e)
+                        ),
+                    },
+                )
+            if usage_out is not None:
+                usage_out(None)
+            return None, f"provider_call_failed:{type(e).__name__}"
         if usage_out is not None:
-            usage_out(None)
-        return None, f"provider_call_failed:{type(e).__name__}"
-    if usage_out is not None:
-        usage_out(result.get("usage") if isinstance(result, dict) else None)
-    if trajectory_out is not None:
-        await trajectory_out("provider_response", {"response": result})
-    reply = str((result or {}).get("reply") or "").strip()
-    if not reply:
-        return None, "empty_reply"
+            usage_out(result.get("usage") if isinstance(result, dict) else None)
+        if trajectory_out is not None:
+            await trajectory_out("provider_response", {"response": result})
+        reply = str((result or {}).get("reply") or "").strip()
+        if not reply:
+            return None, "empty_reply"
+        return reply, None
+
+    reply, call_error = await _call(prompt)
+    if call_error is not None:
+        return None, call_error
     parsed = parse(reply)
     value, err = parsed[0], parsed[-1]
-    if err:
+    if not err:
+        return value, None
+    if parse_retry is None or not parse_retry.should_retry(str(err)):
         return None, str(err)
-    return value, None
+
+    if trajectory_out is not None:
+        await trajectory_out("parse_bounced", {"reason": str(err)})
+    retry_reply, retry_call_error = await _call(
+        parse_retry.build_prompt(prompt, str(err))
+    )
+    if retry_call_error is not None:
+        # 重问这一跳自己挂了：如实报重问的失败原因，别把它伪装成原来的格式问题。
+        return None, retry_call_error
+    retried = parse_retry.parse(retry_reply)
+    retry_value, retry_err = retried[0], retried[-1]
+    if retry_err:
+        return None, str(retry_err)
+    return retry_value, None
 
 
 def _inner_from_card(card: dict) -> dict:

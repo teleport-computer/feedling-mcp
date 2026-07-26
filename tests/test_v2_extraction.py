@@ -83,6 +83,109 @@ def test_extract_treats_empty_reply_as_a_reason_not_a_crash(monkeypatch):
     assert parsed is None and err == "empty_reply"
 
 
+# ---------- parse_retry(内容闸打回)----------
+
+def _stub_provider(replies):
+    """provider 桩:按顺序吐 replies,并记录每次收到的 prompt。"""
+    seen_prompts = []
+
+    async def _fake(cfg, messages, **kw):
+        seen_prompts.append(messages[0]["content"])
+        return {"reply": replies[len(seen_prompts) - 1]}
+
+    return _fake, seen_prompts
+
+
+def test_extract_bounces_format_error_once_and_recovers(monkeypatch):
+    fake, prompts = _stub_provider(["placeholder", "real"])
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", fake)
+    parsed, err = asyncio.run(extraction.extract(
+        provider_config=object(), prompt="P",
+        parse=lambda raw: (None, "invalid_card_content:content_empty"),
+        parse_retry=extraction.ParseRetry(
+            should_retry=lambda e: e.startswith("invalid_card_content"),
+            build_prompt=lambda prompt, e: f"{prompt}|redo:{e}",
+            parse=lambda raw: (["clean"], None),
+        )))
+    assert parsed == ["clean"] and err is None
+    # 第二问必须带着原 prompt 的上下文 + 具体哪里没填
+    assert prompts == ["P", "P|redo:invalid_card_content:content_empty"]
+
+
+def test_extract_bounces_at_most_once(monkeypatch):
+    fake, prompts = _stub_provider(["placeholder", "still placeholder"])
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", fake)
+    parsed, err = asyncio.run(extraction.extract(
+        provider_config=object(), prompt="P",
+        parse=lambda raw: (None, "invalid_card_content:summary_empty"),
+        parse_retry=extraction.ParseRetry(
+            should_retry=lambda e: True,
+            build_prompt=lambda prompt, e: prompt,
+            parse=lambda raw: (None, "invalid_card_content:summary_empty"),
+        )))
+    assert parsed is None and err == "invalid_card_content:summary_empty"
+    assert len(prompts) == 2  # 不反复捶打 provider
+
+
+def test_extract_does_not_bounce_non_format_errors(monkeypatch):
+    fake, prompts = _stub_provider(["garbage", "unused"])
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", fake)
+    parsed, err = asyncio.run(extraction.extract(
+        provider_config=object(), prompt="P",
+        parse=lambda raw: (None, "no_json_object"),
+        parse_retry=extraction.ParseRetry(
+            should_retry=lambda e: e.startswith("invalid_card_content"),
+            build_prompt=lambda prompt, e: prompt,
+            parse=lambda raw: (["never"], None),
+        )))
+    # JSON 根本没出来 / provider 挂了,各有自己的路径;重问同一段 prompt 没有意义
+    assert parsed is None and err == "no_json_object"
+    assert len(prompts) == 1
+
+
+def test_extract_reports_the_retry_hops_own_failure(monkeypatch):
+    calls = {"n": 0}
+
+    async def _fake(cfg, messages, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"reply": "placeholder"}
+        raise RuntimeError("402 no credit")
+
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", _fake)
+    parsed, err = asyncio.run(extraction.extract(
+        provider_config=object(), prompt="P",
+        parse=lambda raw: (None, "invalid_card_content:summary_empty"),
+        parse_retry=extraction.ParseRetry(
+            should_retry=lambda e: True,
+            build_prompt=lambda prompt, e: prompt,
+            parse=lambda raw: (["never"], None),
+        )))
+    # 重问这一跳自己挂了就如实报,别伪装成原来的格式问题
+    assert parsed is None and err.startswith("provider_call_failed:")
+
+
+def test_extract_records_the_bounce_in_the_trajectory(monkeypatch):
+    fake, _prompts = _stub_provider(["placeholder", "real"])
+    monkeypatch.setattr(extraction.provider_client, "reliable_chat_completion_async", fake)
+    events = []
+
+    async def _record(kind, payload):
+        events.append((kind, payload))
+
+    asyncio.run(extraction.extract(
+        provider_config=object(), prompt="P",
+        parse=lambda raw: (None, "invalid_card_content:content_empty"),
+        trajectory_out=_record,
+        parse_retry=extraction.ParseRetry(
+            should_retry=lambda e: True,
+            build_prompt=lambda prompt, e: prompt,
+            parse=lambda raw: (["clean"], None),
+        )))
+    bounced = [p for kind, p in events if kind == "parse_bounced"]
+    assert bounced == [{"reason": "invalid_card_content:content_empty"}]
+
+
 # ---------- cards_to_actions ----------
 
 def test_cards_to_actions_add_and_supersede():

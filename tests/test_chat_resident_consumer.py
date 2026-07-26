@@ -2530,6 +2530,112 @@ def test_memory_lane_raw_text_survives_chat_sanitizer(monkeypatch):
     assert chat_err is not None
 
 
+def _dream_reply(summary: str, content: str, card_id: str = "m_1") -> str:
+    return (
+        '{"consolidations":[{"op":"thicken","card_ids":["%s"],"result":'
+        '{"bucket":"工作","threads":["加班"],"summary":%s,"content":%s}}],'
+        '"questions_to_ask":[]}'
+    ) % (card_id, json.dumps(summary, ensure_ascii=False), json.dumps(content, ensure_ascii=False))
+
+
+def test_memory_content_gate_bounces_placeholder_reply_once(monkeypatch):
+    """弱模型抄回占位符 → 带着「哪个字段没填」重问一次,而不是静默落库。
+
+    现场(usr_ed21…,minimax-M3):花园里出现 `[thickened summary]` / 正文只有 `...`
+    的卡。JSON 合法、字段非空,老路径直接封信封写进去,用户能亲眼看到空白卡。
+    """
+    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
+
+    prompts: list[str] = []
+    replies = [
+        _dream_reply("[thickened summary]", "[thickened content combining work + incident]"),
+        _dream_reply("他最近一直在加班", "他说组里走了三个人，晚上睡不着。"),
+    ]
+
+    def _fake_call_agent(prompt, **kw):
+        prompts.append(prompt)
+        return replies[len(prompts) - 1]
+
+    monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+
+    (cons, questions, err), bounce = crc._memory_agent_parse_with_bounce(
+        "原始 dream prompt",
+        parse=parse_dream_consolidations,
+        build_retry_prompt=build_dream_retry_prompt,
+        lane="dream",
+        job_id="job_1",
+    )
+    assert err is None and bounce == "bounced_ok"
+    assert len(cons) == 1 and cons[0]["result"]["summary"] == "他最近一直在加班"
+    # 只问两次(第一问 + 一次打回),且第二问带着原 prompt 的上下文和具体问题
+    assert len(prompts) == 2
+    assert prompts[1].startswith("原始 dream prompt")
+    assert "content 还是方括号占位" in prompts[1] or "summary 还是方括号占位" in prompts[1]
+
+
+def test_memory_content_gate_clean_reply_asks_once(monkeypatch):
+    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
+
+    prompts: list[str] = []
+
+    def _fake_call_agent(prompt, **kw):
+        prompts.append(prompt)
+        return _dream_reply("他最近一直在加班", "他说组里走了三个人，晚上睡不着。")
+
+    monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+
+    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
+        "P", parse=parse_dream_consolidations,
+        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_2",
+    )
+    assert err is None and bounce == "" and len(cons) == 1
+    assert len(prompts) == 1  # 正常回复不额外烧一次调用
+
+
+def test_memory_content_gate_gives_up_after_one_bounce(monkeypatch):
+    """第二问还是占位符 → 记原因、这轮不写卡;不无限重问。"""
+    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
+
+    prompts: list[str] = []
+
+    def _fake_call_agent(prompt, **kw):
+        prompts.append(prompt)
+        return _dream_reply("...", "...")
+
+    monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+
+    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
+        "P", parse=parse_dream_consolidations,
+        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_3",
+    )
+    assert cons == [] and bounce == "bounced_partial" and err is None
+    assert len(prompts) == 2
+
+
+def test_memory_content_gate_does_not_bounce_broken_json(monkeypatch):
+    """JSON 根本没出来是另一条路(provider/流被截),重问同一段 prompt 没意义。"""
+    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
+
+    prompts: list[str] = []
+
+    def _fake_call_agent(prompt, **kw):
+        prompts.append(prompt)
+        return "抱歉，我想不出来"
+
+    monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+
+    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
+        "P", parse=parse_dream_consolidations,
+        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_4",
+    )
+    assert cons == [] and err == "no_json_object" and bounce == ""
+    assert len(prompts) == 1
+
+
 def test_openai_http_protocol_sends_multimodal_image_block(monkeypatch):
     captured = {}
 

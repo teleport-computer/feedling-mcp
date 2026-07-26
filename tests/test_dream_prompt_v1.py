@@ -80,28 +80,31 @@ def test_parse_empty_is_clean():
 
 def test_parse_drops_unknown_op():
     cons, qs, err = parse_dream_consolidations(
-        '{"consolidations":[{"op":"delete","card_ids":["a"],"result":{"summary":"s","content":"c"}}]}'
+        '{"consolidations":[{"op":"delete","card_ids":["a"],"result":{"summary":"标题","content":"正文"}}]}'
     )
     assert cons == [] and err is None  # delete is not a Dream op (no hard delete)
 
 
 def test_parse_drops_consolidation_without_card_ids():
     cons, qs, err = parse_dream_consolidations(
-        '{"consolidations":[{"op":"merge","card_ids":[],"result":{"summary":"s","content":"c"}}]}'
+        '{"consolidations":[{"op":"merge","card_ids":[],"result":{"summary":"标题","content":"正文"}}]}'
     )
     assert cons == [] and err is None  # Dream only edits existing cards
 
 
-def test_parse_drops_hollow_result():
-    cons, qs, err = parse_dream_consolidations(
-        '{"consolidations":[{"op":"thicken","card_ids":["a"],"result":{}}]}'
-    )
+def test_parse_bounces_hollow_result():
+    # 空 result 以前静默丢弃;现在严格模式打回(让调用方重问一次),
+    # 放宽模式(打回后的第二问)才只丢这一行。
+    raw = '{"consolidations":[{"op":"thicken","card_ids":["a"],"result":{}}]}'
+    cons, qs, err = parse_dream_consolidations(raw)
+    assert cons == [] and err == "invalid_card_content:summary_empty"
+    cons, qs, err = parse_dream_consolidations(raw, strict=False)
     assert cons == [] and err is None
 
 
 def test_parse_handles_fence_and_prose_and_clamps():
     raw = ("整理完了：" + _FENCE + 'json\n{"consolidations":[{"op":"supersede","card_ids":["old"],'
-           '"result":{"summary":"s","content":"c","importance":5,"pulse":-2}}]}\n' + _FENCE)
+           '"result":{"summary":"标题","content":"正文","importance":5,"pulse":-2}}]}\n' + _FENCE)
     cons, qs, err = parse_dream_consolidations(raw)
     assert err is None and len(cons) == 1
     assert cons[0]["op"] == "supersede"

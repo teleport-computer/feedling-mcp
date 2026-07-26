@@ -81,8 +81,17 @@ from model_api_runtime.v2 import trajectory as v2_trajectory
 
 # 纯 prompt/parse 模块（无 I/O、不碰 DB/enclave）——依赖方向允许 worker 直接 import
 # （extraction.py 同样只 import 这两个 + provider_client）。
-from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards
-from memory.dream_prompt_v1 import build_dream_prompt, parse_dream_consolidations
+from memory.capture_prompt_v1 import (
+    build_capture_prompt,
+    build_capture_retry_prompt,
+    parse_capture_cards,
+)
+from memory.card_text import is_card_format_error
+from memory.dream_prompt_v1 import (
+    build_dream_prompt,
+    build_dream_retry_prompt,
+    parse_dream_consolidations,
+)
 
 log = logging.getLogger("feedling.runtime_v2.worker")
 
@@ -5753,6 +5762,13 @@ async def _run_extraction(
 
         if lane == "capture":
             parse, to_actions = parse_capture_cards, v2_extraction.cards_to_actions
+            # 内容闸打回后的第二问：放宽成「只丢占位符那几张、干净的照收」，
+            # 不让一张脏卡把整个窗口的落卡清零。
+            parse_retry = v2_extraction.ParseRetry(
+                should_retry=is_card_format_error,
+                build_prompt=build_capture_retry_prompt,
+                parse=lambda reply: parse_capture_cards(reply, strict=False),
+            )
         else:
             prompt = build_dream_prompt(
                 ai_name=ctx.get("ai_name", ""),
@@ -5765,6 +5781,11 @@ async def _run_extraction(
             parse, to_actions = (
                 parse_dream_consolidations,
                 v2_extraction.consolidations_to_actions,
+            )
+            parse_retry = v2_extraction.ParseRetry(
+                should_retry=is_card_format_error,
+                build_prompt=build_dream_retry_prompt,
+                parse=lambda reply: parse_dream_consolidations(reply, strict=False),
             )
 
         if lane == "capture" and not prompt_tail:
@@ -5802,6 +5823,7 @@ async def _run_extraction(
                     provider_config=provider_config,
                     prompt=prompt,
                     parse=parse,
+                    parse_retry=parse_retry,
                     progress_cb=lambda stage, attempt: _report_turn_progress(
                         f"extraction_provider_{stage}_{attempt}"
                     ),
@@ -5929,6 +5951,7 @@ async def _run_extraction(
                 provider_config=provider_config,
                 prompt=prompt,
                 parse=parse,
+                parse_retry=parse_retry,
                 progress_cb=lambda stage, attempt: _report_turn_progress(
                     f"extraction_provider_{stage}_{attempt}"
                 ),

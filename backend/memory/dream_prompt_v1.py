@@ -17,6 +17,15 @@ from __future__ import annotations
 
 from identity.user_naming import _naming_rule, sanitize_user_name
 
+from memory.card_text import (
+    build_format_retry_prompt,
+    card_text_rejection,
+    format_error,
+    sanitize_card_labels,
+)
+
+_EMPTY_DREAM_REPLY = '{"consolidations": [], "questions_to_ask": []}'
+
 # Dream 只产这三种整理操作;拿不准的矛盾留到 questions_to_ask,不擅自决定。
 DREAM_OPS = ("merge", "thicken", "supersede")
 
@@ -52,6 +61,9 @@ _DREAM_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。现在
   改成已知名字；名字未知时优先省略主语，确实需要主语才用中性的「对方」——
   卡里若有指代你（AI）的「TA」，那是 TA 视角对你的叫法，保留不动。
 · 没有需要整理的，就什么都不做（consolidations 为空）。这很正常。
+· 下面输出示例里的 `...` 只是占位。你写的每个字段都必须是真内容——summary 是一句真话，
+  content 是完整的一段正文；任何字段都不能是 `...`、方括号里的说明文字、或空字符串。
+  宁可整份留空（consolidations 为空），也不要交占位符：这些卡 TA 会亲眼看到。
 
 【现有的卡】{cards}
 【这几天的对话】{recent_conversations}
@@ -124,7 +136,9 @@ def _clamp01(value) -> float:
     return max(0.0, min(1.0, f))
 
 
-def parse_dream_consolidations(raw: str) -> tuple[list[dict], list[str], str | None]:
+def parse_dream_consolidations(
+    raw: str, *, strict: bool = True
+) -> tuple[list[dict], list[str], str | None]:
     """Parse the Dream agent reply.
 
     Returns (consolidations, questions_to_ask, error). A valid "nothing to do"
@@ -133,6 +147,11 @@ def parse_dream_consolidations(raw: str) -> tuple[list[dict], list[str], str | N
       {op, card_ids[], result{bucket,threads[],summary,content,importance,pulse}}
     Rows missing card_ids or a usable result are dropped (Dream only edits
     existing cards; it never hard-deletes — execution uses supersede).
+
+    内容闸(2026-07-26):summary/content 是占位符或没有实质内容的行一律不落库。
+    ``strict=True``(默认,第一次尝试)时,只要有任何一行被拦,整份回复带
+    ``invalid_card_content:*`` 打回,让调用方原样重问一次;``strict=False``
+    (打回后的第二次尝试)只丢掉脏行、保留干净的,避免一颗老鼠屎让整晚整理归零。
     """
     import json
 
@@ -154,6 +173,7 @@ def parse_dream_consolidations(raw: str) -> tuple[list[dict], list[str], str | N
         return [], questions, "missing_consolidations_list"
 
     out: list[dict] = []
+    rejections: list[str] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -167,15 +187,22 @@ def parse_dream_consolidations(raw: str) -> tuple[list[dict], list[str], str | N
         result = row.get("result") if isinstance(row.get("result"), dict) else {}
         summary = str(result.get("summary") or "").strip()[:2000]
         content = str(result.get("content") or "").strip()
-        if not summary and not content:
-            continue  # empty result — skip rather than write a hollow card
+        rejection = card_text_rejection(summary=summary, content=content)
+        if rejection:
+            # 占位符/空正文的卡不写进花园 —— 用户会亲眼看到它。
+            rejections.append(rejection)
+            continue
         threads_raw = result.get("threads")
         threads = [str(t).strip()[:80] for t in threads_raw if str(t).strip()][:8] if isinstance(threads_raw, list) else []
+        bucket, threads, label_reasons = sanitize_card_labels(
+            bucket=str(result.get("bucket") or "").strip()[:80], threads=threads
+        )
+        rejections.extend(label_reasons)
         out.append({
             "op": op,
             "card_ids": card_ids,
             "result": {
-                "bucket": str(result.get("bucket") or "").strip()[:80],
+                "bucket": bucket,
                 "threads": threads,
                 "summary": summary,
                 "content": content,
@@ -183,4 +210,11 @@ def parse_dream_consolidations(raw: str) -> tuple[list[dict], list[str], str | N
                 "pulse": _clamp01(result.get("pulse")),
             },
         })
+    if rejections and strict:
+        return [], questions, format_error(rejections)
     return out, questions, None
+
+
+def build_dream_retry_prompt(prompt: str, err: str) -> str:
+    """内容闸打回后的第二次 Dream 提问(原 prompt + 具体哪里没填)。"""
+    return build_format_retry_prompt(prompt, err, empty_example=_EMPTY_DREAM_REPLY)
