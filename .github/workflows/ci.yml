@@ -216,6 +216,7 @@ jobs:
             tests/test_user_mcp_routes.py \
             tests/test_v2_prompt_cache_key.py \
             tests/test_v2_prompt_frontier.py \
+            tests/test_v2_adaptive_tail.py \
             tests/test_v2_metrics_endpoint.py \
             tests/test_prod_runner_fleet_gate.py \
             tests/test_v2_turn_metrics.py \

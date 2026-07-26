@@ -5233,19 +5233,23 @@ async def _run_wake(
             # A wake is proactive work only while there is no unanswered user
             # input.  Keep the frozen prompt snapshot boundary separate from
             # the durable reply cursor: a send can commit after this wake was
-            # claimed but before ``wake_snapshot_seq`` was taken.  That row is
-            # already represented in the frozen prompt (verbatim in ``tail`` or
-            # behind its encrypted-summary watermark), so seeding the first fold
-            # after the snapshot prevents a duplicate prompt entry; it must NOT
-            # also make the row look previously answered.  Query the authoritative
-            # user-row interval rather than inferring membership from the tail.
-            # Yield before any provider/tool work and let the atomically enqueued
-            # chat job own the response.
+            # claimed or while summary/tail assembly is in flight.  Re-read the
+            # all-role upper bound after assembly so that later send also makes
+            # wake yield, even though it is intentionally absent from the frozen
+            # prompt.  ``wake_snapshot_seq`` remains the first-fold de-duplication
+            # boundary; neither boundary may make a row look previously answered.
+            # Query the authoritative user-row interval rather than inferring
+            # membership from the tail, then let the atomically enqueued chat job
+            # own the response before any provider/tool work begins.
+            pending_check_through_seq = await asyncio.to_thread(
+                db.chat_max_seq,
+                user_id,
+            )
             base_prompt_user_frontier = await asyncio.to_thread(
                 db.chat_max_user_seq_between,
                 user_id,
                 wake_reply_cursor_seq,
-                wake_snapshot_seq,
+                pending_check_through_seq,
             )
             if base_prompt_user_frontier > wake_reply_cursor_seq:
                 completed = await asyncio.to_thread(
