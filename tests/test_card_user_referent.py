@@ -174,6 +174,74 @@ def test_engineering_product_terms_are_not_mistaken_for_the_person():
         assert out["summary"] == kept, kept
 
 
+def _scrubbed(text: str, user_name: str = "小雨") -> str:
+    return scrub_card_user_references(
+        {"summary": text, "content": text}, user_name=user_name
+    )["summary"]
+
+
+# 名词/谓词两用的头(登录/注册/支持/测试/付费/授权 + tests/supports/services):
+# 同一个词两个方向都必须锁,否则修好一侧就会打坏另一侧 —— 这正是 codex 两轮
+# review 各抓到一侧的原因(v1 漏本人主语,v2 改坏产品词)。
+_PERSON_SUBJECT_SENTENCES = (
+    "用户登录了新设备",
+    "用户注册了新账号",
+    "用户支持这个方案",
+    "用户测试了新功能",
+    "用户付费升级了会员",
+    "用户授权了日历权限",
+    "用户通知了家里人",
+    "User tests the new feature",
+    "User supports this plan",
+    "User services the account",
+)
+_PRODUCT_SENTENCES = (
+    "用户登录流程需要优化",
+    "用户注册转化率掉了",
+    "用户支持很好",
+    "用户测试的结论是什么",
+    "用户登录很慢",
+    "用户认证由 OAuth 提供",
+    "用户授权页面要重做",
+    "User tests need updating",
+    "User support is slow",
+    "User services are degraded",
+)
+
+
+def test_ambiguous_heads_person_subject_is_rewritten():
+    """两用头做谓语时,主语就是本人 —— 必须改写。
+
+    codex round-2 的复现清单:v2 把「登录/注册/支持/测试/付费/授权」当成无条件
+    产品名词,于是「用户登录了新设备」被原样放过;英文更糟 —— 对任意 token 做
+    s/es 归一,把第三人称谓词 tests/supports/services 判成了产品名词。
+    """
+    for sentence in _PERSON_SUBJECT_SENTENCES:
+        out = _scrubbed(sentence)
+        assert out.startswith("小雨"), (sentence, out)
+        assert not out.lower().startswith(("用户", "user")), (sentence, out)
+
+
+def test_ambiguous_heads_product_usage_is_preserved():
+    """同样的头做名词时是产品词 —— 必须原样保留(改坏内容更难发现)。"""
+    for sentence in _PRODUCT_SENTENCES:
+        assert _scrubbed(sentence) == sentence, sentence
+
+
+def test_english_plurals_are_not_blanket_normalized():
+    """英文复数只认显式列表,不做 s/es 自动归一。
+
+    自动归一会把 tests/supports/services 当成 test/support/service 的复数
+    → 判成产品名词 → 本人主语句被漏掉。产品复数(personas/interviews/stories/
+    settings)显式列,代价只是列表长一点。
+    """
+    for kept in ("User personas need updating", "User interviews are scheduled",
+                 "User stories were rewritten", "User settings look wrong"):
+        assert _scrubbed(kept) == kept, kept
+    for rewritten in ("User tests the new feature", "User supports this plan"):
+        assert _scrubbed(rewritten) != rewritten, rewritten
+
+
 def test_known_residual_ambiguity_user_preference():
     """「用户偏好」是这套判据留下的已知歧义,行为由既有测试定,不是漏改。
 

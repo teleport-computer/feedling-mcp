@@ -68,69 +68,134 @@ def transcript_speaker_label(role: str, *, user_name: str, ai_name: str = "") ->
     return " ".join(str(ai_name or "").split()) or "我"
 
 
-# 「用户X」是产品词而不是指代本人的**封闭集**:这一层白名单必须列名词头,不能列动词。
-# 理由(2026-07-26 实测):谓词锚点是开放集 —— 中文任何动词都能跟在主语后面,
-# 所以线上真实泄漏的「用户承诺这周末去看医生」正好落榜(承诺/答应/报名 都不在表里)。
-# 名词头是有限且稳定的(这个领域就是增长/画像/留存/满意度那几个),漏一个的代价也小,
-# 所以主语位上改成「除非是产品词,否则就是本人」——把白名单从开放集换成封闭集。
-_PRODUCT_TERM_HEADS = (
-    # 指标 / 研究
-    "增长", "增长率", "画像", "留存", "满意度", "满意", "粘性", "活跃", "活跃度",
-    "流失", "转化", "转化率", "反馈", "需求", "体验", "调研", "访谈", "问卷",
+# ---------------------------------------------------------------------------
+# 主语位判据:「用户X…」里的 X 是产品词,还是本人做的事?
+#
+# 演化历史(两轮 review 打出来的,别退回去):
+#   v1 谓词白名单 —— 开放集,必漏。线上真实泄漏「用户承诺这周末去看医生」就落榜
+#      (中文任何动词都能当谓语)。
+#   v2 名词头白名单 —— 方向对了,但一张表不够:「登录/注册/支持/测试/付费/授权」
+#      **同时是谓词**,于是「用户登录了新设备」被当成产品词放过(codex round-2)。
+#      英文对任意 token 做 s/es 归一更糟 —— tests/supports/services 是第三人称谓词,
+#      被误判成产品名词。
+#   v3(现在)分三类:只作名词的头一律保留;名词/谓词两用的头看**后一个词**;
+#      其余按本人处理。判据全是封闭小表,且两个方向都有回归锁。
+# ---------------------------------------------------------------------------
+
+# ① 只可能是产品名词的头 —— 无条件保留。
+_NOUN_ONLY_HEADS = (
+    "增长率", "增长", "画像", "留存", "满意度", "满意", "粘性", "活跃度", "活跃",
+    "流失", "转化率", "转化", "反馈", "需求", "体验", "调研", "访谈", "问卷",
     "数量", "规模", "基数", "数据", "行为", "路径", "漏斗", "分层", "旅程",
-    "场景", "故事", "运营", "生命周期", "研究", "分析", "报告", "招募", "测试",
-    # 产品 / 工程(codex 2026-07-26 review P1-2 的复现清单:这些漏掉会把本人
-    # 真实内容改坏,比残留一次「用户」更严重 —— 「用户界面」→「小雨界面」)
-    "登录", "注册", "账户", "账号", "界面", "接口", "功能", "流程", "认证",
-    "授权", "权限", "标签", "属性", "特征", "权益", "状态", "内容", "消息",
-    "通知", "活动", "付费", "订单", "服务", "支持", "社区", "渠道", "来源",
-    "群体", "客服", "引导", "隐私", "协议", "教育", "中心", "列表", "名单",
-    "角色", "管理", "平台", "端", "侧", "群", "池", "量", "数", "id", "ID",
-    # ⚠️ 刻意**不含**「偏好」:codex 建议把它收进来,但已落地的
+    "场景", "故事", "生命周期", "报告", "界面", "接口", "功能", "流程", "账户",
+    "账号", "权限", "标签", "属性", "特征", "权益", "消息", "订单", "社区",
+    "渠道", "来源", "群体", "客服", "隐私", "协议", "列表", "名单", "中心",
+    "平台", "端", "侧", "群", "池", "量", "数", "id", "ID",
+    # ⚠️ 刻意**不含**「偏好」:codex 建议收进来,但已落地的
     # tests/test_genesis_worker.py 断言 threads ["用户偏好"] → ["小雨偏好"]
-    # (身份卡语境下「用户偏好」就是本人的偏好),而且「偏好」本来就在下面的
-    # 句中谓词锚点表里 —— 收进来也会被第二遍改掉。两边直接冲突,保留有测试
-    # 背书的那一侧,并把这条残留歧义记在测试里。
-)
-_PRODUCT_TERM_HEADS_EN = (
-    "growth", "retention", "research", "feedback", "persona", "journey",
-    "experience", "base", "count", "acquisition", "churn", "segment",
-    "survey", "interview", "data", "behavior", "behaviour", "funnel",
-    "analytics", "metrics", "satisfaction", "engagement", "activation",
-    "conversion", "lifecycle", "cohort",
-    # 同上,codex 的复现清单
-    "interface", "account", "profile", "login", "signup", "registration",
-    "authentication", "authorization", "permission", "onboarding",
-    "preference", "setting", "feature", "flow", "path", "story", "test",
-    "privacy", "consent", "support", "service", "community", "rights",
-    "activity", "status", "role", "management", "platform", "id",
+    # (身份卡语境下那就是本人的偏好),且「偏好」本来就在下面的句中谓词锚点表里,
+    # 收进来也会被第二遍改掉。两边直接冲突,保留有测试背书的那一侧,
+    # 并把这条残留歧义写进 test_known_residual_ambiguity_user_preference。
 )
 
-# 主语位:文本开头,或紧跟句末标点/换行/分号之后。
-_ZH_SUBJECT_USER_RE = re.compile(r"(^|[。！？!?；;\n]\s*)用户")
-_EN_SUBJECT_USER_RE = re.compile(r"(?i)(^|[.!?;\n]\s+)(?:the\s+)?user\b")
+# ② 名词/谓词两用的头 —— 「用户登录了新设备」(谓词,本人)vs
+#    「用户登录流程需要优化」(名词,产品)。靠后一个词判。
+_AMBIGUOUS_HEADS = (
+    "登录", "注册", "支持", "测试", "付费", "授权", "认证", "服务", "管理",
+    "引导", "通知", "活动", "内容", "状态", "角色", "教育", "分析", "研究",
+    "招募", "运营",
+)
+
+# 紧跟在头后面的**体标记/宾语起头** → 这个头在做谓语 → 主语是本人。
+_ZH_VERB_MARKERS = (
+    "了", "过", "着", "到", "完", "成", "上", "下", "起", "掉",
+    "这", "那", "该", "此", "我", "你", "他", "她", "它", "自己", "一", "两",
+    "三", "四", "五", "几", "全部", "所有",
+)
+# 紧跟在头后面的**名词尾** → 头和它组成更长的产品名词。
+_ZH_NOUN_TAILS = (
+    "流程", "体系", "页面", "入口", "模块", "功能", "权限", "记录", "信息",
+    "设置", "中心", "机制", "策略", "方式", "渠道", "链路", "接口", "服务",
+    "率", "量", "数", "值", "态", "时长", "占比", "比例", "转化", "漏斗",
+)
+# 紧跟在头后面的**判断/修饰词** → 头是主语名词短语的一部分。
+_ZH_NOUN_MARKERS = (
+    "是", "的", "由", "在", "有", "没有", "需要", "要", "会", "也", "都", "很",
+    "太", "被", "和", "与", "及", "比", "更", "还", "已经", "尚未", "不",
+    "，", ",", "。", "、", "；", ";", "：", ":", "(", "（",
+)
+
+
+def _starts_with_any(text: str, options) -> bool:
+    return any(text.startswith(opt) for opt in options)
 
 
 def _zh_subject_is_product_term(rest: str) -> bool:
-    return any(rest.startswith(head) for head in _PRODUCT_TERM_HEADS)
+    """主语位的「用户X…」是不是产品词。``rest`` 是「用户」之后的全部文本。"""
+    if _starts_with_any(rest, _NOUN_ONLY_HEADS):
+        return True
+    for head in sorted(_AMBIGUOUS_HEADS, key=len, reverse=True):
+        if not rest.startswith(head):
+            continue
+        after = rest[len(head):]
+        if _starts_with_any(after, _ZH_VERB_MARKERS):
+            return False  # 用户登录了新设备 / 用户支持这个方案 → 本人
+        if _starts_with_any(after, _ZH_NOUN_TAILS):
+            return True   # 用户登录流程需要优化 → 产品
+        if _starts_with_any(after, _ZH_NOUN_MARKERS):
+            return True   # 用户认证由 OAuth 提供 / 用户支持很好 → 产品
+        # 两用头 + 认不出的后文:默认按谓词(本人)处理。产品用法通常带
+        # 「是/的/率/量」这类标记,而漏掉本人主语才是这道闸要防的那个 bug。
+        return False
+    return False
 
 
-_PRODUCT_TERM_HEADS_EN_SET = frozenset(h.casefold() for h in _PRODUCT_TERM_HEADS_EN)
+# 主语位:文本开头,或紧跟句末标点/换行/分号之后。逗号刻意不算 ——
+# 「他说,用户投诉了」里的「用户」更可能是本人真的在聊自己的用户。
+_ZH_SUBJECT_USER_RE = re.compile(r"(^|[。！？!?；;\n]\s*)用户")
+_EN_SUBJECT_USER_RE = re.compile(r"(?i)(^|[.!?;\n]\s+)(?:the\s+)?user\b")
+
+# 英文:只作名词的产品词(复数逐个列 —— **不做** s/es 自动归一,那会把
+# tests/supports/services 这些第三人称谓词误判成产品名词,codex round-2)。
+_EN_NOUN_ONLY = frozenset({
+    "growth", "retention", "research", "feedback", "persona", "personas",
+    "journey", "journeys", "experience", "experiences", "base", "count",
+    "acquisition", "churn", "segment", "segments", "survey", "surveys",
+    "interview", "interviews", "data", "behavior", "behaviour", "funnel",
+    "funnels", "analytics", "metrics", "satisfaction", "engagement",
+    "activation", "conversion", "lifecycle", "cohort", "cohorts",
+    "interface", "interfaces", "account", "accounts", "profile", "profiles",
+    "registration", "authentication", "authorization", "permission",
+    "permissions", "onboarding", "preference", "preferences", "setting",
+    "settings", "feature", "features", "flow", "flows", "path", "paths",
+    "story", "stories", "privacy", "consent", "community", "rights",
+    "management", "platform", "id", "ids",
+})
+# 英文两用词:名词或第三人称谓词。"User tests the new feature"(谓词)vs
+# "User tests need updating"(名词)—— 靠后一个词是不是限定词/所有格来判。
+_EN_AMBIGUOUS = frozenset({
+    "test", "tests", "support", "supports", "service", "services",
+    "login", "logins", "signup", "signups", "role", "roles",
+    "status", "activity", "activities",
+})
+_EN_OBJECT_STARTERS = frozenset({
+    "the", "a", "an", "this", "that", "these", "those", "his", "her",
+    "their", "my", "our", "its", "new", "all", "every", "each", "another",
+    "some", "it", "them", "him", "us", "me",
+})
 
 
 def _en_subject_is_product_term(rest: str) -> bool:
-    word = re.match(r"\s*([A-Za-z]+)", rest)
-    if not word:
+    words = re.findall(r"[A-Za-z']+", rest[:80])
+    if not words:
         return False
-    token = word.group(1).casefold()
-    if token in _PRODUCT_TERM_HEADS_EN_SET:
+    token = words[0].casefold()
+    if token in _EN_NOUN_ONLY:
         return True
-    # 复数不必逐个列("personas"/"interviews"/"settings"/"stories")
-    for suffix, base in (("ies", "y"), ("es", ""), ("s", "")):
-        if token.endswith(suffix):
-            candidate = token[: -len(suffix)] + base
-            if candidate in _PRODUCT_TERM_HEADS_EN_SET:
-                return True
+    if token in _EN_AMBIGUOUS:
+        nxt = words[1].casefold() if len(words) > 1 else ""
+        # 后面跟宾语起头 → 它是谓词 → 主语是本人
+        return nxt not in _EN_OBJECT_STARTERS
     return False
 
 
