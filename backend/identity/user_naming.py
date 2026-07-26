@@ -11,6 +11,12 @@ import re
 
 _RESERVED_USER_NAMES = frozenset({"ta", "user", "用户"})
 
+# 名字未知时,**模型可见文本**里对本人的中性称呼。内部未知标记仍是 "TA"
+# (sanitize_user_name 的返回),但「TA」不能出现在模型看得见的地方 ——
+# _naming_rule 正是禁止模型这么叫本人的。
+UNKNOWN_PERSON_LABEL = "对方"
+UNKNOWN_PERSON_LABEL_EN = "The person"
+
 
 def sanitize_user_name(user_name: str) -> str:
     """Return a real preferred name, or the internal ``TA`` unknown marker."""
@@ -54,7 +60,11 @@ def transcript_speaker_label(role: str, *, user_name: str, ai_name: str = "") ->
     if str(role or "").strip().lower() == "user":
         # 再 sanitize 一次(纵深防御):把 用户/user 当"名字"传进来,
         # 也不能变成 "用户: …" 这一行。
-        return sanitize_user_name(user_name)
+        name = sanitize_user_name(user_name)
+        # 名字未知时不能退回内部标记「TA」:_naming_rule 明令禁止模型用「TA」
+        # 指代本人,转写里连着出现二十行 "TA:" 就是把 "user:" 的教学问题原样
+        # 换了个词(codex 2026-07-26 review P1-1)。退到中性的「对方」。
+        return UNKNOWN_PERSON_LABEL if name == "TA" else name
     return " ".join(str(ai_name or "").split()) or "我"
 
 
@@ -64,17 +74,36 @@ def transcript_speaker_label(role: str, *, user_name: str, ai_name: str = "") ->
 # 名词头是有限且稳定的(这个领域就是增长/画像/留存/满意度那几个),漏一个的代价也小,
 # 所以主语位上改成「除非是产品词,否则就是本人」——把白名单从开放集换成封闭集。
 _PRODUCT_TERM_HEADS = (
-    "增长", "画像", "留存", "满意度", "满意", "粘性", "活跃", "流失", "转化",
-    "反馈", "需求", "体验", "调研", "访谈", "问卷", "数量", "规模", "基数",
-    "数据", "行为", "路径", "漏斗", "分层", "旅程", "场景", "故事", "运营",
-    "增长率", "生命周期", "研究", "分析", "报告", "名单", "列表", "权限",
-    "隐私", "协议", "教育", "中心", "群", "池", "端", "侧", "量", "数", "id", "ID",
+    # 指标 / 研究
+    "增长", "增长率", "画像", "留存", "满意度", "满意", "粘性", "活跃", "活跃度",
+    "流失", "转化", "转化率", "反馈", "需求", "体验", "调研", "访谈", "问卷",
+    "数量", "规模", "基数", "数据", "行为", "路径", "漏斗", "分层", "旅程",
+    "场景", "故事", "运营", "生命周期", "研究", "分析", "报告", "招募", "测试",
+    # 产品 / 工程(codex 2026-07-26 review P1-2 的复现清单:这些漏掉会把本人
+    # 真实内容改坏,比残留一次「用户」更严重 —— 「用户界面」→「小雨界面」)
+    "登录", "注册", "账户", "账号", "界面", "接口", "功能", "流程", "认证",
+    "授权", "权限", "标签", "属性", "特征", "权益", "状态", "内容", "消息",
+    "通知", "活动", "付费", "订单", "服务", "支持", "社区", "渠道", "来源",
+    "群体", "客服", "引导", "隐私", "协议", "教育", "中心", "列表", "名单",
+    "角色", "管理", "平台", "端", "侧", "群", "池", "量", "数", "id", "ID",
+    # ⚠️ 刻意**不含**「偏好」:codex 建议把它收进来,但已落地的
+    # tests/test_genesis_worker.py 断言 threads ["用户偏好"] → ["小雨偏好"]
+    # (身份卡语境下「用户偏好」就是本人的偏好),而且「偏好」本来就在下面的
+    # 句中谓词锚点表里 —— 收进来也会被第二遍改掉。两边直接冲突,保留有测试
+    # 背书的那一侧,并把这条残留歧义记在测试里。
 )
 _PRODUCT_TERM_HEADS_EN = (
-    "growth", "retention", "research", "feedback", "persona", "personas",
-    "journey", "journeys", "experience", "base", "count", "acquisition",
-    "churn", "segment", "segments", "survey", "interviews", "interview",
-    "data", "behavior", "behaviour", "funnel", "analytics", "metrics",
+    "growth", "retention", "research", "feedback", "persona", "journey",
+    "experience", "base", "count", "acquisition", "churn", "segment",
+    "survey", "interview", "data", "behavior", "behaviour", "funnel",
+    "analytics", "metrics", "satisfaction", "engagement", "activation",
+    "conversion", "lifecycle", "cohort",
+    # 同上,codex 的复现清单
+    "interface", "account", "profile", "login", "signup", "registration",
+    "authentication", "authorization", "permission", "onboarding",
+    "preference", "setting", "feature", "flow", "path", "story", "test",
+    "privacy", "consent", "support", "service", "community", "rights",
+    "activity", "status", "role", "management", "platform", "id",
 )
 
 # 主语位:文本开头,或紧跟句末标点/换行/分号之后。
@@ -86,11 +115,23 @@ def _zh_subject_is_product_term(rest: str) -> bool:
     return any(rest.startswith(head) for head in _PRODUCT_TERM_HEADS)
 
 
+_PRODUCT_TERM_HEADS_EN_SET = frozenset(h.casefold() for h in _PRODUCT_TERM_HEADS_EN)
+
+
 def _en_subject_is_product_term(rest: str) -> bool:
-    word = re.match(r"[\s]*([A-Za-z]+)", rest)
-    return bool(word) and word.group(1).casefold() in {
-        h.casefold() for h in _PRODUCT_TERM_HEADS_EN
-    }
+    word = re.match(r"\s*([A-Za-z]+)", rest)
+    if not word:
+        return False
+    token = word.group(1).casefold()
+    if token in _PRODUCT_TERM_HEADS_EN_SET:
+        return True
+    # 复数不必逐个列("personas"/"interviews"/"settings"/"stories")
+    for suffix, base in (("ies", "y"), ("es", ""), ("s", "")):
+        if token.endswith(suffix):
+            candidate = token[: -len(suffix)] + base
+            if candidate in _PRODUCT_TERM_HEADS_EN_SET:
+                return True
+    return False
 
 
 def _rewrite_subject_position(raw: str, zh_referent: str, en_referent: str) -> str:

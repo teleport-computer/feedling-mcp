@@ -2556,9 +2556,11 @@ def test_capture_window_never_labels_the_person_user():
     text = crc._capture_window_text(msgs, user_label="小雨", agent_label="小柒")
     assert "小雨:" in text and "小柒:" in text
     assert "user:" not in text.lower() and "用户:" not in text
-    # 名字未知也不能退回 "user:"
+    # 名字未知退到中性的「对方」——既不能是 "user:",也不能是内部标记 "TA:"
+    # (prompt 明令禁止模型用「TA」指代本人,连着出现就是同一个标签教学问题)
     fallback = crc._capture_window_text(msgs, user_label="", agent_label="")
-    assert "user:" not in fallback.lower() and "TA:" in fallback
+    assert "user:" not in fallback.lower() and "TA:" not in fallback
+    assert "对方:" in fallback
 
 
 def _dream_reply(summary: str, content: str, card_id: str = "m_1") -> str:
@@ -3867,16 +3869,20 @@ def test_capture_transcript_labels_use_real_names():
     """The capture/dream transcript must never label lines with a literal
     "user:"/"agent:" — models mirror the label into user-visible cards as
     "用户" (usr_fee1 complaint 2026-07-17). Known names are used verbatim;
-    unknown fall back to the prompt's own TA/我 framing."""
+    unknown falls back to the neutral 「对方」.
+
+    2026-07-26 更新:fallback 从内部标记「TA」改成「对方」。prompt 本身明令禁止
+    模型用「TA」指代本人,所以转写里连着出现 "TA:" 是把 "user:" 的标签教学问题
+    换了个词而已(codex review P1-1)。「TA」只留作内部未知标记。"""
     user_msg = {"role": "user", "ts": 1000.0, "content": "我在看攻略"}
     agent_msg = {"role": "openclaw", "ts": 1001.0, "content": "山路小心"}
     assert crc._capture_message_role(user_msg, user_label="小雨", agent_label="小舟") == "小雨"
     assert crc._capture_message_role(agent_msg, user_label="小雨", agent_label="小舟") == "小舟"
-    # Defaults match the prompt framing, not system labels.
-    assert crc._capture_message_role(user_msg) == "TA"
+    # Defaults are neutral, and never a system label.
+    assert crc._capture_message_role(user_msg) == "对方"
     assert crc._capture_message_role(agent_msg) == "我"
     # Empty labels fall back rather than rendering "" as a name.
-    assert crc._capture_message_role(user_msg, user_label="", agent_label="") == "TA"
+    assert crc._capture_message_role(user_msg, user_label="", agent_label="") == "对方"
 
     text = crc._capture_window_text(
         [user_msg, agent_msg], user_label="小雨", agent_label="小舟"
@@ -3892,9 +3898,9 @@ def test_capture_transcript_labels_reject_reserved_placeholder_names():
     line the fix removes."""
     user_msg = {"role": "user", "ts": 1000.0, "content": "hi"}
     for reserved in ("用户", "user", "USER", "ta"):
-        assert crc._capture_message_role(user_msg, user_label=reserved) == "TA", repr(reserved)
+        assert crc._capture_message_role(user_msg, user_label=reserved) == "对方", repr(reserved)
     text = crc._capture_window_text([user_msg], user_label="用户", agent_label="小舟")
-    assert "用户:" not in text and "TA: hi" in text
+    assert "用户:" not in text and "TA:" not in text and "对方: hi" in text
 
 
 def test_capture_identity_context_sanitizes_reserved_user_name(monkeypatch):

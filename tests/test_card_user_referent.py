@@ -39,16 +39,24 @@ def test_speaker_label_uses_the_real_name_when_known():
     assert transcript_speaker_label("assistant", user_name="小雨", ai_name="小柒") == "小柒"
 
 
-def test_speaker_label_falls_back_to_ta_not_user():
-    # 名字未知也绝不退回 "user" —— 退回去就等于把禁词喂回给模型
-    assert transcript_speaker_label("user", user_name="", ai_name="") == "TA"
+def test_speaker_label_falls_back_to_neutral_not_user_and_not_ta():
+    """名字未知时退到中性的「对方」。
+
+    既不能退回 "user"(那是原 bug),也**不能**退回内部标记「TA」——
+    `_naming_rule` 明令禁止模型用「TA」指代本人,转写里连着二十行 "TA:"
+    就是把同一个标签教学问题换了个词(codex 2026-07-26 review P1-1)。
+    """
+    assert transcript_speaker_label("user", user_name="", ai_name="") == "对方"
     assert transcript_speaker_label("assistant", user_name="", ai_name="") == "我"
+    for label in (transcript_speaker_label("user", user_name=n, ai_name="")
+                  for n in ("", "   ", "TA", "ta")):
+        assert label == "对方"
 
 
 def test_reserved_name_cannot_smuggle_itself_into_the_label():
     """有人把「用户」当名字存进来,也不能变成 "用户: …" 那一行(纵深防御)。"""
-    assert transcript_speaker_label("user", user_name="用户", ai_name="小柒") == "TA"
-    assert transcript_speaker_label("user", user_name="USER", ai_name="小柒") == "TA"
+    assert transcript_speaker_label("user", user_name="用户", ai_name="小柒") == "对方"
+    assert transcript_speaker_label("user", user_name="USER", ai_name="小柒") == "对方"
 
 
 def test_v2_capture_window_has_no_literal_user_label():
@@ -137,6 +145,48 @@ def test_scrub_preserves_product_terms():
     assert out["summary"] == card["summary"]
     assert out["content"] == card["content"]
     assert out["threads"] == ["用户增长"]
+
+
+def test_engineering_product_terms_are_not_mistaken_for_the_person():
+    """codex 2026-07-26 review P1-2 的复现清单,逐条锁死。
+
+    这些漏掉的代价是**确定性地改坏本人真实内容**(「用户界面需要统一」
+    →「小雨界面需要统一」),比残留一次「用户」更严重、也更难发现 ——
+    所以封闭集列表宁可长。
+    """
+    for kept in (
+        "用户登录流程需要优化",
+        "用户账户体系下周重构",
+        "用户界面需要统一",
+        "用户认证由 OAuth 提供",
+        "用户授权流程太长",
+        "用户通知的文案要改",
+        "用户订单量掉了",
+        "User interface needs work",
+        "User profile migration starts Monday",
+        "User onboarding conversion dropped",
+        "User personas need updating",     # 复数不必逐个列
+        "User interviews are scheduled",
+        "User stories were rewritten",
+    ):
+        out = scrub_card_user_references({"summary": kept, "content": kept},
+                                        user_name="小雨")
+        assert out["summary"] == kept, kept
+
+
+def test_known_residual_ambiguity_user_preference():
+    """「用户偏好」是这套判据留下的已知歧义,行为由既有测试定,不是漏改。
+
+    codex 建议把「偏好」收进产品词封闭集,但 tests/test_genesis_worker.py 已断言
+    threads ["用户偏好"] → ["小雨偏好"](身份卡语境下那就是本人的偏好),而且
+    「偏好」本来就在句中谓词锚点表里 —— 收进封闭集也会被第二遍改掉。
+    两边直接冲突,保留有测试背书的那一侧,把歧义摆在这里而不是藏起来。
+    """
+    out = scrub_card_user_references(
+        {"summary": "用户偏好决定推荐结果", "content": "用户偏好决定推荐结果"},
+        user_name="小雨",
+    )
+    assert out["summary"] == "小雨偏好决定推荐结果"
 
 
 def test_product_terms_survive_even_in_subject_position():
