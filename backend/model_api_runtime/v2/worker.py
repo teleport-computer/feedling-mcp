@@ -835,6 +835,13 @@ _SCREEN_WATCH_SYSTEM_PROMPT = (
 # `payment_cooldown_until` on the wake schedule; `jobs_store.due_heartbeat_users` already
 # excludes cooled-down users (Task 1), so no further wakes fire until it lapses.
 _WAKE_COOLDOWN_SEC = float(os.environ.get("FEEDLING_V2_WAKE_COOLDOWN_SEC", "600"))
+_WAKE_FAIL_BACKOFF_BASE_SEC = float(
+    os.environ.get("PROACTIVE_FAIL_BACKOFF_BASE_SEC", "60")
+)
+_WAKE_FAIL_BACKOFF_CAP_SEC = float(
+    os.environ.get("PROACTIVE_FAIL_BACKOFF_CAP_SEC", "3600")
+)
+_FAIL_BACKOFF_WAKE_LANES = frozenset({"heartbeat", "scheduled"})
 
 _DEGENERATE_REPLY_FALLBACK = (
     os.environ.get(
@@ -5506,7 +5513,10 @@ async def _run_wake(
             raise
 
         await asyncio.to_thread(
-            jobs_store.mark_completed, job_id, claimed_by=claimed_by
+            jobs_store.mark_completed,
+            job_id,
+            claimed_by=claimed_by,
+            clear_wake_backoff=(lane in _FAIL_BACKOFF_WAKE_LANES),
         )
         # End-of-turn drain (mirrors process_job's chat-branch finalize): a write
         # tool_call in the LAST round has no subsequent on_reply to trigger a drain,
@@ -5540,8 +5550,21 @@ async def _run_wake(
         log.warning(
             "[v2.worker] wake job %s lane=%s failed code=%s", job_id, lane, code
         )
+        arm_wake_backoff = (
+            lane in _FAIL_BACKOFF_WAKE_LANES
+            and not isinstance(e, (LostJobLease, RuntimeModeChanged))
+        )
         await asyncio.to_thread(
-            jobs_store.mark_failed, job_id, code, claimed_by=claimed_by
+            jobs_store.mark_failed,
+            job_id,
+            code,
+            claimed_by=claimed_by,
+            wake_backoff_base_sec=(
+                _WAKE_FAIL_BACKOFF_BASE_SEC if arm_wake_backoff else None
+            ),
+            wake_backoff_cap_sec=(
+                _WAKE_FAIL_BACKOFF_CAP_SEC if arm_wake_backoff else None
+            ),
         )
         if tm is not None:
             tm.flush(failed=True, status=code)

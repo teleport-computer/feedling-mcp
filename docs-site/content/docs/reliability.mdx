@@ -104,6 +104,13 @@ attributes it to a temporary upstream-provider failure. Automatic wake lanes
 fail silently instead: they write neither a chat bubble nor an error chip.
 Letters, numbers, CJK text, and emoji count as usable reply content.
 
+Automatic Runtime V2 heartbeat and agent-scheduled wake failures use a
+persistent per-user exponential retry delay. The delay starts at 60 seconds
+and is capped at one hour; a successful automatic wake clears it. A new
+genuine user message invalidates an older delay immediately. Manual wakes and
+screen-watch events bypass this short-horizon guard. Sustained provider
+failures remain the responsibility of the separate provider health circuit.
+
 ## Retry safety
 
 Classify by operation semantics, not only by HTTP method. In particular,

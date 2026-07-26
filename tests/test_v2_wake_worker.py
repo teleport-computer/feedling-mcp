@@ -545,6 +545,7 @@ def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
     assert row[0] == "failed"
     assert row[1] == "wake_failed:runtimeerror"
     assert not any(e["kind"] == "error" for e in _status_events(uid))
+    assert jobs_store.get_wake_schedule(uid) is None
 
 
 def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):
@@ -589,6 +590,16 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
     uid = "u_wake_nodeps"
     conftest.seed_user(uid)
     _reset(uid)
+    failed_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    failed_owner = _claim(failed_id)
+    assert jobs_store.mark_failed(
+        failed_id,
+        "wake_failed:runtimeerror",
+        claimed_by=failed_owner,
+        wake_backoff_base_sec=60,
+        wake_backoff_cap_sec=3600,
+        wake_backoff_now=time.time(),
+    )
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
 
@@ -623,6 +634,9 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
     # when available, is a separate untrusted user-role runtime-data block.
     assert len(conversation_messages) == 1
     assert conversation_messages[0]["role"] == "user"
+    schedule = jobs_store.get_wake_schedule(uid)
+    assert schedule["proactive_fail_streak"] == 0
+    assert schedule["proactive_backoff_until"] is None
 
 
 # ------------------------------------------------------------------
@@ -717,6 +731,7 @@ def test_run_wake_rollback_blocks_provider_cooldown_write(monkeypatch):
 
     assert status == "failed"
     assert cooldown_calls == []
+    assert jobs_store.get_wake_schedule(uid) is None
 
 
 def test_run_wake_lost_lease_blocks_provider_cooldown_write(monkeypatch):
@@ -744,6 +759,7 @@ def test_run_wake_lost_lease_blocks_provider_cooldown_write(monkeypatch):
 
     assert status == "failed"
     assert cooldown_calls == []
+    assert jobs_store.get_wake_schedule(uid) is None
 
 
 def test_run_wake_transient_error_does_not_set_payment_cooldown(monkeypatch):
@@ -775,7 +791,9 @@ def test_run_wake_transient_error_does_not_set_payment_cooldown(monkeypatch):
     assert _job_status(job_id)[0] == "failed"
     assert cooldown_calls == []
     schedule = jobs_store.get_wake_schedule(uid)
-    assert schedule is None or schedule["payment_cooldown_until"] is None
+    assert schedule["payment_cooldown_until"] is None
+    assert schedule["proactive_fail_streak"] == 1
+    assert schedule["proactive_backoff_until"] > time.time()
 
 
 # ------------------------------------------------------------------

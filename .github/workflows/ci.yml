@@ -236,6 +236,8 @@ jobs:
             tests/test_v2_worker_mcp.py \
             tests/test_v2_worker_tool_loop.py \
             tests/test_v2_wake_worker.py \
+            tests/test_v2_wake_schedule.py \
+            tests/test_v2_scheduled_due.py \
             tests/test_v2_atomic_reply_cursor.py \
             tests/test_v2_effect_outbox.py \
             tests/test_v2_watchdog.py \

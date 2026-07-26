@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 now applies a persistent per-user retry delay after automatic
+  wake failures.** Consecutive heartbeat or agent-scheduled wake failures back
+  off from 60 seconds to a maximum of one hour, and a successful automatic
+  wake clears the streak. A new user message resumes automatic wakes
+  immediately. Manual wakes and screen-watch events remain available, while
+  the longer-horizon provider health circuit continues to handle sustained
+  provider outages.
 - **Runtime V2 no longer publishes punctuation-only provider fragments as
   assistant messages.** A foreground Chat turn replaces a truncated fragment
   such as `.` or `。` with the standard visible fallback and classifies it as a

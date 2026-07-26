@@ -25,6 +25,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(autouse=True)
 def _clean_wake_schedule_table():
     with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM agent_jobs")
         conn.execute("DELETE FROM v2_wake_schedule")
     yield
 
@@ -110,6 +111,97 @@ def _append_user_row(user_id: str, msg_id: str, *, source: str = "chat") -> int:
         5000,
     )
     return int(db.chat_seq_for_msg_id(user_id, msg_id))
+
+
+def _claim_wake(user_id: str, lane: str, owner: str) -> int:
+    from conftest import set_v2_runtime_owner
+
+    set_v2_runtime_owner(user_id)
+    job_id, coalesced = jobs_store.enqueue_job(user_id, lane)
+    assert coalesced is False
+    job = jobs_store.claim_next_job(owner)
+    assert job is not None
+    assert int(job["id"]) == int(job_id)
+    return int(job_id)
+
+
+def test_failure_backoff_grows_caps_and_success_clears():
+    uid = "u_ws_failure_backoff"
+    seed_user(uid)
+
+    first = _claim_wake(uid, "heartbeat", "backoff-1")
+    assert jobs_store.mark_failed(
+        first,
+        "wake_failed:runtimeerror",
+        claimed_by="backoff-1",
+        wake_backoff_base_sec=60,
+        wake_backoff_cap_sec=100,
+        wake_backoff_now=1_000,
+    )
+    state = jobs_store.get_wake_schedule(uid)
+    assert state["proactive_fail_streak"] == 1
+    assert state["proactive_backoff_until"] == pytest.approx(1_060)
+
+    second = _claim_wake(uid, "scheduled", "backoff-2")
+    assert jobs_store.mark_failed(
+        second,
+        "wake_failed:runtimeerror",
+        claimed_by="backoff-2",
+        wake_backoff_base_sec=60,
+        wake_backoff_cap_sec=100,
+        wake_backoff_now=1_001,
+    )
+    state = jobs_store.get_wake_schedule(uid)
+    assert state["proactive_fail_streak"] == 2
+    assert state["proactive_backoff_until"] == pytest.approx(1_101)
+
+    success = _claim_wake(uid, "heartbeat", "backoff-ok")
+    assert jobs_store.mark_completed(
+        success,
+        claimed_by="backoff-ok",
+        clear_wake_backoff=True,
+    )
+    state = jobs_store.get_wake_schedule(uid)
+    assert state["proactive_fail_streak"] == 0
+    assert state["proactive_backoff_until"] is None
+
+
+def test_due_heartbeat_backoff_is_bypassed_only_by_genuine_user_input():
+    uid = "u_ws_failure_user_reset"
+    seed_user(uid)
+    now = time.time()
+    jobs_store.upsert_wake_schedule(uid, next_heartbeat_at=now - 10)
+    failed = _claim_wake(uid, "heartbeat", "backoff-user")
+    assert jobs_store.mark_failed(
+        failed,
+        "wake_failed:runtimeerror",
+        claimed_by="backoff-user",
+        wake_backoff_base_sec=300,
+        wake_backoff_cap_sec=300,
+        wake_backoff_now=now,
+    )
+
+    assert uid not in jobs_store.due_heartbeat_users(now=now + 1)
+    _append_user_row(uid, "maintenance-reset-no", source="resident_maintenance")
+    assert uid not in jobs_store.due_heartbeat_users(now=now + 1)
+    _append_user_row(uid, "genuine-reset")
+    assert uid in jobs_store.due_heartbeat_users(now=now + 1)
+
+
+@pytest.mark.parametrize("lane", ["manual_wake", "screen_watch"])
+def test_non_idle_wake_lanes_never_arm_generic_backoff(lane):
+    uid = f"u_ws_failure_scope_{lane}"
+    seed_user(uid)
+    failed = _claim_wake(uid, lane, f"scope-{lane}")
+    assert jobs_store.mark_failed(
+        failed,
+        "wake_failed:runtimeerror",
+        claimed_by=f"scope-{lane}",
+        wake_backoff_base_sec=60,
+        wake_backoff_cap_sec=3600,
+        wake_backoff_now=1_000,
+    )
+    assert jobs_store.get_wake_schedule(uid) is None
 
 
 def test_self_wake_limit_replay_and_user_reset_match_v1_semantics(monkeypatch):
