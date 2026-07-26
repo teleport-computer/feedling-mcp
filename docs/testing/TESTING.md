@@ -110,6 +110,10 @@
 - **探针轮询非 200 必须硬失败**（`raise SystemExit`），不许忽略继续循环：否则"账号半路没了"这类事故会被静默藏十几分钟，再以别的形状炸出来。这是 e2e 假 PASS 的同一个形状，2026-07-26 又犯了一次。
 - **用户投诉的原话，先全仓 grep 一遍**：usr_a40e 报"AI 一直说没接上"，那句话根本不是模型生成的，是我们自己的 `FALLBACK_REPLY` 硬编码文案（`chat_resident_consumer.py:448`）。**先确认这句话是谁写的，再谈模型有没有问题**——省掉整轮跑偏的 provider 排查。
 - **`runtime.test_status=ok` 骗人**：它只证明轻量 ping 通了，真实生成仍可能全部 timeout（廉价中转限流/欠费/过载）。判"中转是否真活着"要看 `provider_attempt_ledger` 尾部的 `outcome`。
+- **openai_compatible 中转验证，`test_status:ok` 之外还有两个独立坑**（2026-07-27 Kimi/Moonshot 验证）：
+  ① **key 有区域锁**——同一家中转多个区域 endpoint，key 只在签发区有效：Moonshot 的 key 在 `api.moonshot.cn` 返 200，同 key 打 `api.moonshot.ai` 直接 `401 Invalid Authentication`。用户报 `provider_test_failed` / 401，**先核 `base_url` 区域是否配对 key 的签发区，再谈 key 废没废**（先 `curl {base_url}/models -H "Authorization: Bearer <key>"` 隔离 provider 侧）。
+  ② **`responses` 协议支持是独立一维**——setup 会 probe `/responses` 并把结果放进返回体的 `warnings[]`（`responses_unsupported`, blame=`user_provider`）+ 落 `supports_responses`。只支持 `/chat/completions` 的中转（Moonshot 全系）：**`test_status:ok` + 真实生成 OK ≠ 记忆/工具 OK**（那条 test_status 坑讲"能不能生成"，这条讲"能生成、但记忆/工具会不稳"）。验一家新中转必须读 `warnings[]` 和 `supports_responses`，并**单独验一轮带记忆写入/工具调用的回合**，别只验"能回话"。
+  旁证（可复用基线）：enclave 能连 `api.moonshot.cn`；Kimi `kimi-k2.5` 经 openai_compatible 端到端可用、原生 thinking 正常。验证走 L2/L3 真链路（`tests/e2e_model_api_test.py` / `tools/e2e/`，register→setup→send→客户端解密）——openai_compatible 只需 setup 传 `provider=openai_compatible` + `base_url` + `context_window_tokens`。
 - **改用户可见文案前，先从屏幕反向追到抛点**：确认这条 error code 在**目标运行时**真会走到用户面前。V2 抛的是 `prompt_frontier_exhausted`（裸协议码），不是 provider 的 `context_overflow`——改后者的话术对 V2 用户一个字都不会生效（07-26 险些上线一条死分支，撤回）。
 - **判"某个缺陷修没修好"，先确认你的用例真能让它复现**：称谓泄漏只在**账号没名字**时发生，拿有名字的账号怎么测都是 0——不是修好了，是根本没触发。概率性缺陷的验收用例必须先证明"改之前它会挂"。
 - **上下文注入了新成分，就要证明模型真读到了**：问一个**答案只存在于新注入段**的问题，判分（`tools/e2e/temporal_probe.py` 的做法：问"距上一条多久"，答"刚刚"判 FAIL）。"prompt 里有这段字符串"≠"模型用上了"。

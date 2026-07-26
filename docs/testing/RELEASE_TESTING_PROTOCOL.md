@@ -43,7 +43,7 @@
 | 2 | OpenAI 官方 | codex | |
 | 3 | Gemini 官方 | pi | |
 | 4 | OpenRouter | pi | 官方聚合器代表 |
-| 5 | 中转站代表（openai_compatible） | pi | 流不稳/模型名带标签的典型场景（usr_6f5a 类）；选一家真实用户在用的 |
+| 5 | 中转站代表（openai_compatible） | pi | 流不稳/模型名带标签的典型场景（usr_6f5a 类）；选一家真实用户在用的。**至少覆盖一家 `responses`-unsupported 中转（如 Kimi/Moonshot，只支持 `/chat/completions`）**——setup 会返 `warnings[]` 的 `responses_unsupported`，`test_status:ok`+能回话 ≠ 记忆/工具 OK，须单独验一轮带记忆写入/工具调用的回合（详 TESTING §6）；注意区域锁 key（`.cn` key 打 `.ai` 直接 401） |
 | 6 | DeepSeek 官方 | claude(base override) | `ANTHROPIC_BASE_URL={base}/anthropic` 路线 |
 
 - 存放：本地 `~/.feedling-e2e-keys.env`（chmod 600，**永不入 git**）；格式
