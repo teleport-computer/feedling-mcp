@@ -51,7 +51,7 @@ change must not be interpreted as an API guarantee.
   sends without a caption are unchanged; `content_type: "text"` ignores the field.
 
 - **The `identity_patch` tool can recalibrate the relationship day count.** Put a
-  positive integer `relationship_days` inside the `patch` object (for example
+  whole number `relationship_days` inside the `patch` object (for example
   `patch: {"relationship_days": 300}`) and the persona's relationship start anchor is
   recalibrated so the app shows that day count. `relationship_days` is the **1-based,
   user-facing** count — the "day N" the client displays, where the day you met is
