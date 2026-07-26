@@ -21,6 +21,7 @@ from identity.user_naming import (  # noqa: E402
     transcript_speaker_label,
 )
 from memory.card_text import (  # noqa: E402
+    count_person_referent_leaks,
     scrub_card_user_references,
     scrub_dream_consolidations,
 )
@@ -184,18 +185,28 @@ def _scrubbed(text: str, user_name: str = "小雨") -> str:
 # 同一个词两个方向都必须锁,否则修好一侧就会打坏另一侧 —— 这正是 codex 两轮
 # review 各抓到一侧的原因(v1 漏本人主语,v2 改坏产品词)。
 _PERSON_SUBJECT_SENTENCES = (
+    # 体标记(了/过/着)紧跟 1-2 字动词 —— 封闭类证据
     "用户登录了新设备",
     "用户注册了新账号",
-    "用户支持这个方案",
     "用户测试了新功能",
-    "用户付费升级了会员",
     "用户授权了日历权限",
     "用户通知了家里人",
-    "User tests the new feature",
-    "User supports this plan",
-    "User services the account",
+    "用户反馈了一个问题",
+    "用户体验了新功能",
+    "用户调研了三家竞品",
+    "用户访谈了候选人",
+    # 限定词/代词起头的宾语
+    "用户支持这个方案",
+    # 时间/程度副词(封闭类,产品复合词不可能这么接)
+    "用户昨天加班到十一点",
+    "用户很焦虑",
+    "用户最近总是失眠",
+    # 谓词锚点里的高频真例(线上观察到的)
+    "用户承诺这周末去看医生",
+    "用户报名了课程",
 )
 _PRODUCT_SENTENCES = (
+    # 同一批词做名词时必须原样保留 —— 和上面成对,改坏内容比残留更难发现
     "用户登录流程需要优化",
     "用户注册转化率掉了",
     "用户支持很好",
@@ -203,43 +214,76 @@ _PRODUCT_SENTENCES = (
     "用户登录很慢",
     "用户认证由 OAuth 提供",
     "用户授权页面要重做",
+    "用户体验变差了",
+    "用户调研安排在周四",
+    "用户界面需要统一",
+    "用户账户体系下周重构",
+    # 指标名词 + 体标记:主语是指标不是人(_METRIC_NOUNS 豁免)
+    "用户增长了20%",
+    "用户留存跌过一次",
+    "用户满意度很高",
+    "用户数还在涨",
+    "用户画像做得不细",
+    # 英文侧刻意只走保守锚点,所以名词短语一律安全
     "User tests need updating",
     "User support is slow",
     "User services are degraded",
+    "User interface needs work",
+    "User profile migration starts Monday",
+    "User onboarding conversion dropped",
+    "User personas need updating",
 )
 
 
-def test_ambiguous_heads_person_subject_is_rewritten():
-    """两用头做谓语时,主语就是本人 —— 必须改写。
+def test_person_subject_sentences_are_rewritten():
+    """有封闭类证据(体标记/限定词/副词)时,主语就是本人 —— 必须改写。
 
-    codex round-2 的复现清单:v2 把「登录/注册/支持/测试/付费/授权」当成无条件
-    产品名词,于是「用户登录了新设备」被原样放过;英文更糟 —— 对任意 token 做
-    s/es 归一,把第三人称谓词 tests/supports/services 判成了产品名词。
+    codex round-2/3 的复现清单都在 _PERSON_SUBJECT_SENTENCES 里。
     """
     for sentence in _PERSON_SUBJECT_SENTENCES:
         out = _scrubbed(sentence)
         assert out.startswith("小雨"), (sentence, out)
-        assert not out.lower().startswith(("用户", "user")), (sentence, out)
 
 
-def test_ambiguous_heads_product_usage_is_preserved():
-    """同样的头做名词时是产品词 —— 必须原样保留(改坏内容更难发现)。"""
+def test_product_usage_is_preserved():
+    """同一批词做名词时是产品词 —— 必须原样保留。
+
+    和上面那条**成对**:同一个词修好一侧就会打坏另一侧,只锁一侧等于没锁 ——
+    这正是前几版各漏一侧的原因。
+    """
     for sentence in _PRODUCT_SENTENCES:
         assert _scrubbed(sentence) == sentence, sentence
 
 
-def test_english_plurals_are_not_blanket_normalized():
-    """英文复数只认显式列表,不做 s/es 自动归一。
+def test_deliberately_uncovered_cases_are_documented_not_silent():
+    """这道闸**有意**不覆盖的残留,摆在这里而不是假装覆盖了。
 
-    自动归一会把 tests/supports/services 当成 test/support/service 的复数
-    → 判成产品名词 → 本人主语句被漏掉。产品复数(personas/interviews/stories/
-    settings)显式列,代价只是列表长一点。
+    可以证明这些无法用词法规则收敛 —— codex round-2 与 round-3 的要求互斥:
+        User profiles the application      要改(第三人称谓词)
+        User profile migration starts …    要留(名词短语)      ← 差别在第 3 个 token 词性
+        用户体验了新功能                    要改
+        用户体验变差了                      要留               ← 这一对靠体标记可分,已覆盖
+    英文那一对没有任何封闭类标记可依,所以英文只走保守锚点;猜错的代价是
+    确定性地改坏本人真实内容,比残留一次「用户」更严重。
+    覆盖不到的部分由 ①转写标签(根因)+ ②prompt 明令(要求产品术语去掉前缀)兜,
+    并由 count_person_referent_leaks() 量真实残留率 —— 有数再决定要不要往前走。
     """
-    for kept in ("User personas need updating", "User interviews are scheduled",
-                 "User stories were rewritten", "User settings look wrong"):
-        assert _scrubbed(kept) == kept, kept
-    for rewritten in ("User tests the new feature", "User supports this plan"):
-        assert _scrubbed(rewritten) != rewritten, rewritten
+    for uncovered in (
+        "User profiles the application",
+        "User accounts for half the traffic",
+        "User experiences anxiety at night",
+        "User surveys the room",
+        # 动词-动词复合:体标记不在紧邻位。放宽窗口就会打坏「用户满意度提升了」。
+        "用户付费升级了会员",
+    ):
+        assert _scrubbed(uncovered) == uncovered, (
+            f"{uncovered!r} 现在被改写了 —— 如果这是有意扩大覆盖,"
+            f"请同时确认 _PRODUCT_SENTENCES 全绿,再更新这条清单"
+        )
+        # 但残留必须被**数出来**,这样它是可观测的,不是无声的
+        assert count_person_referent_leaks(
+            {"summary": uncovered, "content": ""}
+        ) >= 1, uncovered
 
 
 def test_known_residual_ambiguity_user_preference():

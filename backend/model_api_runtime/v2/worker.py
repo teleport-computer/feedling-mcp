@@ -90,6 +90,7 @@ from memory.capture_prompt_v1 import (
 )
 from identity.user_naming import transcript_speaker_label
 from memory.card_text import (
+    count_person_referent_leaks,
     is_card_format_error,
     scrub_card_user_references,
     scrub_dream_consolidations,
@@ -6186,6 +6187,21 @@ async def _run_extraction(
                     for item in items
                 ]
             )
+            # 残留计数:改写判据刻意不猜词性,所以必然有剩。残留不等于错误
+            # (可能就是本人在聊自己的产品用户),但它是唯一能验证标签层 + prompt
+            # 到底管不管用的信号 —— 不量就只能靠猜。
+            leak_count = sum(
+                count_person_referent_leaks(
+                    item.get("result") if lane != "capture" and isinstance(item.get("result"), dict) else item
+                )
+                for item in items
+                if isinstance(item, dict)
+            )
+            if leak_count and trajectory_recorder is not None:
+                await trajectory_recorder.record(
+                    "card_person_referent_residual",
+                    {"lane": lane, "count": leak_count, "cards": len(items)},
+                )
             actions, _added, _superseded = to_actions(
                 items,
                 occurred_at=occurred_at,

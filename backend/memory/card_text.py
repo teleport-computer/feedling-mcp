@@ -167,6 +167,32 @@ def scrub_card_user_references(card: dict, *, user_name: str) -> dict:
     return out
 
 
+_PERSON_REFERENT_LEAK_RE = re.compile(r"用户|(?i:\buser\b)")
+
+
+def count_person_referent_leaks(card: dict) -> int:
+    """确定性改写之后,可见字段里还剩几处「用户」/「user」。
+
+    这是这道防线的**诚实刻度**:改写判据只用封闭类证据(体标记/限定词),
+    刻意不猜词性 —— 因为「用户体验了新功能」(本人)和「用户体验变差了」(产品)
+    在词法上无法区分,猜错会改坏本人真实内容。所以必然有残留。
+
+    残留**不是**错误(它可能就是本人在聊自己的产品用户),但残留率是我们唯一能
+    验证 ①标签层 + ②prompt 到底管不管用的信号 —— 否则只能靠猜。
+    """
+    total = 0
+    for field in _VISIBLE_TEXT_FIELDS:
+        value = card.get(field)
+        if isinstance(value, str):
+            total += len(_PERSON_REFERENT_LEAK_RE.findall(value))
+    threads = card.get("threads")
+    if isinstance(threads, list):
+        for thread in threads:
+            if isinstance(thread, str):
+                total += len(_PERSON_REFERENT_LEAK_RE.findall(thread))
+    return total
+
+
 def scrub_dream_consolidations(
     consolidations: list[dict], *, user_name: str
 ) -> list[dict]:
