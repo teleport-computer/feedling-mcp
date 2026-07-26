@@ -10,6 +10,26 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Memory cards are no longer written with unfilled template placeholders.**
+  Capture and Dream now validate card *content*, not just field presence: a
+  `summary` or `content` that is a bracketed placeholder (`[thickened summary]`),
+  a bare ellipsis, a copied instruction fragment, or empty is rejected, and both
+  fields must carry real text. A reply containing any such card is returned to
+  the model once with an explicit note about which field was unfilled; the second
+  attempt keeps whatever cards are clean. If nothing usable survives the retry,
+  the extraction job fails and its conversation window is left for a later
+  attempt instead of being silently consumed. Substantive-character detection is
+  language-neutral (Arabic, Cyrillic, Hebrew, accented Latin, and CJK all count),
+  so non-Latin cards are unaffected.
+- **Memory cards no longer refer to the account holder as "user".** The
+  conversation transcript given to the Capture and Dream models now labels
+  speakers with the person's own name — or the neutral `对方` when no name is
+  known — instead of the raw `user` / `assistant` roles, and card text passes a
+  deterministic rewrite before it is stored. Product vocabulary is deliberately
+  preserved: phrases such as `用户增长`, `用户留存`, `用户界面`, and
+  `user growth` are left untouched, because only the model can tell whether a
+  given "user" means the account holder or that person's own customers — the
+  prompts now ask for the prefix to be dropped in the latter case.
 - **Runtime V2 chat and wake turns now receive explicit temporal context.**
   Each turn gets one snapshot containing UTC and user-local time, the latest
   genuine user-message age, and timestamps for the verbatim conversation tail.

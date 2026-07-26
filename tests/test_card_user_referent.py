@@ -21,7 +21,7 @@ from identity.user_naming import (  # noqa: E402
     transcript_speaker_label,
 )
 from memory.card_text import (  # noqa: E402
-    count_person_referent_leaks,
+    count_user_token_residuals,
     scrub_card_user_references,
     scrub_dream_consolidations,
 )
@@ -89,9 +89,10 @@ def test_naming_rule_forbids_the_system_labels():
 # --- ③ 写入层 --------------------------------------------------------------
 
 def test_scrub_replaces_the_system_label_with_the_name():
+    """线上真实泄漏那张卡(2026-07-26 sonnet-4.6)。"""
     card = {
         "summary": "用户承诺这周末去看医生",
-        "content": "用户昨天连着加班到十一点，事后答应自己这周末一定去看医生。",
+        "content": "用户答应了自己，这周末一定去看医生。",
         "bucket": "健康",
         "threads": ["加班", "看医生"],
     }
@@ -109,181 +110,114 @@ def test_scrub_uses_neutral_referent_when_name_unknown():
     assert "用户" not in out["content"]
 
 
-def test_scrub_catches_the_verb_the_old_anchor_list_missed():
-    """线上真实泄漏那句必须被抓到。
-
-    2026-07-26 sonnet-4.6 写的是「用户承诺这周末去看医生」,而当时的谓词锚点表里
-    没有「承诺」—— 谓词是**开放集**(中文任何动词都能当谓语),白名单注定漏。
-    主语位改成封闭集判据(不是产品词就是本人)之后才抓得住。
-    这几个动词都是当时实测落榜的。
-    """
-    for verb_sentence in (
-        "用户承诺这周末去看医生",
-        "用户答应了自己要早睡",
-        "用户报名了周末的课程",
-        "用户取消了周三的会",
-        "用户搬到了新的城市",
-    ):
-        out = scrub_card_user_references(
-            {"summary": verb_sentence, "content": verb_sentence}, user_name="小雨"
-        )
-        assert "用户" not in out["summary"], verb_sentence
-        assert out["summary"].startswith("小雨"), verb_sentence
-
-
-def test_scrub_preserves_product_terms():
-    """本人真的在聊「我们的用户」时不能被改掉 —— 这就是不能一刀切拦词的原因。
-
-    (rewrite_user_reference 的预谓词锚点负责这件事;这里锁住它确实接上了。)
-    """
-    card = {
-        "summary": "在做用户增长的复盘",
-        "content": "他们这季度盯用户画像和用户留存，说 user growth 的数字不好看。",
-        "bucket": "工作",
-        "threads": ["用户增长"],
-    }
-    out = scrub_card_user_references(card, user_name="小雨")
-    assert out["summary"] == card["summary"]
-    assert out["content"] == card["content"]
-    assert out["threads"] == ["用户增长"]
-
-
-def test_engineering_product_terms_are_not_mistaken_for_the_person():
-    """codex 2026-07-26 review P1-2 的复现清单,逐条锁死。
-
-    这些漏掉的代价是**确定性地改坏本人真实内容**(「用户界面需要统一」
-    →「小雨界面需要统一」),比残留一次「用户」更严重、也更难发现 ——
-    所以封闭集列表宁可长。
-    """
-    for kept in (
-        "用户登录流程需要优化",
-        "用户账户体系下周重构",
-        "用户界面需要统一",
-        "用户认证由 OAuth 提供",
-        "用户授权流程太长",
-        "用户通知的文案要改",
-        "用户订单量掉了",
-        "User interface needs work",
-        "User profile migration starts Monday",
-        "User onboarding conversion dropped",
-        "User personas need updating",     # 复数不必逐个列
-        "User interviews are scheduled",
-        "User stories were rewritten",
-    ):
-        out = scrub_card_user_references({"summary": kept, "content": kept},
-                                        user_name="小雨")
-        assert out["summary"] == kept, kept
-
-
 def _scrubbed(text: str, user_name: str = "小雨") -> str:
     return scrub_card_user_references(
         {"summary": text, "content": text}, user_name=user_name
     )["summary"]
 
 
-# 名词/谓词两用的头(登录/注册/支持/测试/付费/授权 + tests/supports/services):
-# 同一个词两个方向都必须锁,否则修好一侧就会打坏另一侧 —— 这正是 codex 两轮
-# review 各抓到一侧的原因(v1 漏本人主语,v2 改坏产品词)。
+# 确定性改写这一层**只**做「紧邻高置信个人谓词」这一件小事。
+# 两个方向必须成对锁:同一批规则修好一侧就会打坏另一侧,四轮 review 每轮都是
+# 这么破的(v1 漏本人主语 → v2/v3 改坏产品词 → v4 又改坏产品词)。
 _PERSON_SUBJECT_SENTENCES = (
-    # 体标记(了/过/着)紧跟 1-2 字动词 —— 封闭类证据
-    "用户登录了新设备",
-    "用户注册了新账号",
-    "用户测试了新功能",
-    "用户授权了日历权限",
-    "用户通知了家里人",
-    "用户反馈了一个问题",
-    "用户体验了新功能",
-    "用户调研了三家竞品",
-    "用户访谈了候选人",
-    # 限定词/代词起头的宾语
-    "用户支持这个方案",
-    # 时间/程度副词(封闭类,产品复合词不可能这么接)
-    "用户昨天加班到十一点",
-    "用户很焦虑",
-    "用户最近总是失眠",
-    # 谓词锚点里的高频真例(线上观察到的)
+    # 线上真实泄漏那句 + 同义谓词(2026-07-26 sonnet-4.6 实测)
     "用户承诺这周末去看医生",
-    "用户报名了课程",
+    "用户答应了自己要早睡",
+    "用户报名了周末的课程",
+    "用户搬到了新的城市",
+    # codex4 原本就落地的锚点集合
+    "用户希望被提醒吃药",
+    "用户喜欢燕麦奶",
+    "用户的猫叫豆豆",
+    "User promised to see a doctor.",
+    "User prefers oat milk.",
 )
 _PRODUCT_SENTENCES = (
-    # 同一批词做名词时必须原样保留 —— 和上面成对,改坏内容比残留更难发现
+    # codex round-4 的复现清单:限定词/副词**不是** product-safe 证据 ——
+    # 「用户」和标记之间夹的那几个字本身就可以是产品名词。
+    "用户界面这一版需要重做",
+    "用户账户这个模块要迁移",
+    "用户界面我觉得太复杂",
+    "用户最近流失很多",
+    "用户最近活跃度下降了",
+    "用户昨天的留存率下降了",
+    # round-2/3 的清单
     "用户登录流程需要优化",
     "用户注册转化率掉了",
     "用户支持很好",
     "用户测试的结论是什么",
-    "用户登录很慢",
     "用户认证由 OAuth 提供",
-    "用户授权页面要重做",
     "用户体验变差了",
     "用户调研安排在周四",
     "用户界面需要统一",
-    "用户账户体系下周重构",
-    # 指标名词 + 体标记:主语是指标不是人(_METRIC_NOUNS 豁免)
     "用户增长了20%",
-    "用户留存跌过一次",
-    "用户满意度很高",
+    "用户满意度和用户增长是研究主题",
     "用户数还在涨",
     "用户画像做得不细",
-    # 英文侧刻意只走保守锚点,所以名词短语一律安全
-    "User tests need updating",
-    "User support is slow",
-    "User services are degraded",
+    # 这批曾被我收进锚点,产品语境同样自然,已撤出
+    "用户开始流失",
+    "用户忘记密码怎么办",
+    "用户完成了注册",
+    "用户取消了订阅",
     "User interface needs work",
     "User profile migration starts Monday",
     "User onboarding conversion dropped",
     "User personas need updating",
+    "User tests need updating",
+    "User profiles the application",
 )
 
 
 def test_person_subject_sentences_are_rewritten():
-    """有封闭类证据(体标记/限定词/副词)时,主语就是本人 —— 必须改写。
-
-    codex round-2/3 的复现清单都在 _PERSON_SUBJECT_SENTENCES 里。
-    """
+    """紧邻高置信个人谓词 —— 这是确定性层唯一负责的事。"""
     for sentence in _PERSON_SUBJECT_SENTENCES:
         out = _scrubbed(sentence)
         assert out.startswith("小雨"), (sentence, out)
 
 
 def test_product_usage_is_preserved():
-    """同一批词做名词时是产品词 —— 必须原样保留。
+    """产品语境一律原样保留。
 
-    和上面那条**成对**:同一个词修好一侧就会打坏另一侧,只锁一侧等于没锁 ——
-    这正是前几版各漏一侧的原因。
+    和上面**成对**:改坏本人真实内容比残留一个系统词严重得多,也更难发现。
+    四轮 review 里 codex 每轮都从这一侧找到破绽,所以这张表只会变长不会变短。
     """
     for sentence in _PRODUCT_SENTENCES:
         assert _scrubbed(sentence) == sentence, sentence
 
 
-def test_deliberately_uncovered_cases_are_documented_not_silent():
-    """这道闸**有意**不覆盖的残留,摆在这里而不是假装覆盖了。
+def test_deliberately_uncovered_is_documented_and_counted_not_silent():
+    """有意不覆盖的残留:摆出来 + 数出来,不假装覆盖。
 
-    可以证明这些无法用词法规则收敛 —— codex round-2 与 round-3 的要求互斥:
-        User profiles the application      要改(第三人称谓词)
-        User profile migration starts …    要留(名词短语)      ← 差别在第 3 个 token 词性
-        用户体验了新功能                    要改
-        用户体验变差了                      要留               ← 这一对靠体标记可分,已覆盖
-    英文那一对没有任何封闭类标记可依,所以英文只走保守锚点;猜错的代价是
-    确定性地改坏本人真实内容,比残留一次「用户」更严重。
-    覆盖不到的部分由 ①转写标签(根因)+ ②prompt 明令(要求产品术语去掉前缀)兜,
-    并由 count_person_referent_leaks() 量真实残留率 —— 有数再决定要不要往前走。
+    可以证明这些无法用词法收敛 —— 同一个词、同一个位置,两个方向都自然:
+        用户体验了新功能   本人试用 / 泛用户试用
+        用户反馈了一个问题 本人反馈 / 用户们反馈
+        User profiles the application / User profile migration starts Monday
+    所以确定性层不碰它们。兜底靠 ①转写标签(根因,不再把 "user:" 喂给模型)
+    和 ②prompt 明令(产品术语去掉「用户」前缀),效果由残留计数验证。
     """
     for uncovered in (
+        "用户体验了新功能",
+        "用户反馈了一个问题",
+        "用户调研了三家竞品",
+        "用户登录了新设备",
+        "用户很焦虑",
         "User profiles the application",
         "User accounts for half the traffic",
-        "User experiences anxiety at night",
-        "User surveys the room",
-        # 动词-动词复合:体标记不在紧邻位。放宽窗口就会打坏「用户满意度提升了」。
-        "用户付费升级了会员",
     ):
         assert _scrubbed(uncovered) == uncovered, (
-            f"{uncovered!r} 现在被改写了 —— 如果这是有意扩大覆盖,"
-            f"请同时确认 _PRODUCT_SENTENCES 全绿,再更新这条清单"
+            f"{uncovered!r} 被改写了 —— 若确认要扩大覆盖,"
+            f"必须同时确认 _PRODUCT_SENTENCES 全绿"
         )
-        # 但残留必须被**数出来**,这样它是可观测的,不是无声的
-        assert count_person_referent_leaks(
-            {"summary": uncovered, "content": ""}
-        ) >= 1, uncovered
+        assert count_user_token_residuals({"summary": uncovered}) >= 1, uncovered
+
+
+def test_residual_counter_counts_tokens_not_leaks():
+    """名字要诚实:它数的是 token 出现次数,里面可能全是正当的产品用法。"""
+    assert count_user_token_residuals(
+        {"summary": "用户留存这个月掉了", "content": "user growth 也不好看",
+         "bucket": "工作", "threads": ["用户增长"]}
+    ) == 3  # summary 1 + content "user" 1 + threads 1;bucket 里没有
+    assert count_user_token_residuals({"summary": "他终于去看医生了"}) == 0
 
 
 def test_known_residual_ambiguity_user_preference():

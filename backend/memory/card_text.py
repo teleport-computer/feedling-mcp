@@ -167,29 +167,33 @@ def scrub_card_user_references(card: dict, *, user_name: str) -> dict:
     return out
 
 
-_PERSON_REFERENT_LEAK_RE = re.compile(r"用户|(?i:\buser\b)")
+_USER_TOKEN_RE = re.compile(r"用户|(?i:\buser\b)")
 
 
-def count_person_referent_leaks(card: dict) -> int:
+def count_user_token_residuals(card: dict) -> int:
     """确定性改写之后,可见字段里还剩几处「用户」/「user」。
 
-    这是这道防线的**诚实刻度**:改写判据只用封闭类证据(体标记/限定词),
-    刻意不猜词性 —— 因为「用户体验了新功能」(本人)和「用户体验变差了」(产品)
-    在词法上无法区分,猜错会改坏本人真实内容。所以必然有残留。
+    ⚠️ 这数的是**「用户/user」这个 token 出现了几次**,不是「称谓泄漏了几次」——
+    其中一部分完全可能是本人在正当地聊自己的产品用户(「用户留存这个月掉了」)。
+    别把它当人称泄漏率读(codex 07-26 review P2)。
 
-    残留**不是**错误(它可能就是本人在聊自己的产品用户),但残留率是我们唯一能
-    验证 ①标签层 + ②prompt 到底管不管用的信号 —— 否则只能靠猜。
+    这是这道防线的**诚实刻度**:改写判据只保留紧邻谓词锚点,刻意不猜词性 ——
+    「用户体验了新功能」既可能是本人试用、也可能是泛用户试用,词法上无法区分,
+    猜错会确定性地改坏本人真实内容。所以必然有残留。
+
+    残留率是我们唯一能验证 ①转写标签 + ②prompt 去前缀到底管不管用的信号 ——
+    否则只能靠猜。两条运行时都接:V2 记进 trajectory,resident 记进 job extra。
     """
     total = 0
     for field in _VISIBLE_TEXT_FIELDS:
         value = card.get(field)
         if isinstance(value, str):
-            total += len(_PERSON_REFERENT_LEAK_RE.findall(value))
+            total += len(_USER_TOKEN_RE.findall(value))
     threads = card.get("threads")
     if isinstance(threads, list):
         for thread in threads:
             if isinstance(thread, str):
-                total += len(_PERSON_REFERENT_LEAK_RE.findall(thread))
+                total += len(_USER_TOKEN_RE.findall(thread))
     return total
 
 

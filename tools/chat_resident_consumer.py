@@ -136,6 +136,7 @@ from memory.capture_prompt_v1 import (
 )
 from identity.user_naming import transcript_speaker_label
 from memory.card_text import (
+    count_user_token_residuals,
     is_card_format_error,
     scrub_card_user_references,
     scrub_dream_consolidations,
@@ -10365,6 +10366,9 @@ def _process_capture_jobs(jobs: list) -> float:
         # 最后一公里称呼改写(与 V2 同一实现):prompt 的禁令是软的,这一步是
         # 确定性的;预谓词锚点保住「用户增长」这类产品词。
         cards = [scrub_card_user_references(c, user_name=user_name) for c in cards]
+        # 残留计数(与 V2 同口径):数的是「用户/user」这个 token 还剩几处,
+        # 其中一部分可能是本人正当地在聊自己的产品用户 —— 它是刻度不是错误。
+        user_token_residual = sum(count_user_token_residuals(c) for c in cards)
         if not cards:
             update_proactive_job_status(
                 job_id,
@@ -10374,6 +10378,7 @@ def _process_capture_jobs(jobs: list) -> float:
                     # content_gate 记下「这轮空是因为占位符被打回」,否则它和
                     # 「真的没什么值得记」在 admin 上长得一模一样。
                     "content_gate": bounce or None,
+                    "user_token_residual": user_token_residual or None,
                     "capture_result": {"status": "noop", "reason": "nothing_worth_keeping"},
                     "capture_window": window,
                     "cards_added": 0,
@@ -10721,6 +10726,10 @@ def _process_dream_jobs(jobs: list) -> float:
             continue
         # 同上:Dream 的可见文字在里层 result 上。
         consolidations = scrub_dream_consolidations(consolidations, user_name=user_name)
+        user_token_residual = sum(
+            count_user_token_residuals(row.get("result") or {})
+            for row in consolidations if isinstance(row, dict)
+        )
         if not consolidations:
             update_proactive_job_status(
                 job_id,
@@ -10730,6 +10739,7 @@ def _process_dream_jobs(jobs: list) -> float:
                     # content_gate 记下「这轮空是因为占位符被打回」,否则它和
                     # 「真的没什么要整理」在 admin 上长得一模一样。
                     "content_gate": bounce or None,
+                    "user_token_residual": user_token_residual or None,
                     "dream_result": {
                         "status": "noop",
                         "reason": "dream_nothing_to_consolidate",

@@ -70,76 +70,28 @@ def transcript_speaker_label(role: str, *, user_name: str, ai_name: str = "") ->
 
 
 # ---------------------------------------------------------------------------
-# 主语位判据:「用户X…」里的「用户」指的是本人,还是产品术语的前缀?
+# 为什么这一层只剩「紧邻谓词锚点」,不再有任何主语位规则
 #
-# 演化史(三轮 review 打出来的。别再往回加词表 —— 那条路已经证明走不通):
-#   v1 谓词白名单 —— 开放集,必漏。线上真实泄漏「用户承诺这周末去看医生」落榜。
-#   v2 名词头白名单 —— 「登录/注册/支持/测试」同时是谓词,于是本人主语句被放过。
-#   v3 名词/谓词两用词分类 —— 同样的漏洞只是搬到了「只作名词」那张表里
-#      (用户反馈了一个问题 / 用户体验了新功能 / User profiles the application)。
-#   v4(现在)**不再猜词性**。理由是可以证明的:codex round-2 与 round-3 的要求
-#      在词法层互斥 —— 同一个词、同一个位置,两个方向:
-#          User profiles the application     要改(谓词)
-#          User profile migration starts …   要留(名词短语)  ← 差别在第 3 个 token 的词性
-#          用户体验了新功能                   要改
-#          用户体验变差了                     要留
-#      任何「词表 + 后一词」规则都不可能同时满足这两组。安全边界不该承担一个完整
-#      POS parser(这是 codex round-3 的架构结论,我同意)。
+# 四轮 review 的收敛过程(别再往回加规则,每一版都被真例打穿过):
+#   v1 谓词白名单        —— 开放集,漏掉线上真例「用户承诺这周末去看医生」。
+#   v2 名词头白名单      —— 「登录/注册/支持/测试」同时是谓词,本人主语句被放过。
+#   v3 名词/谓词两用分类 —— 漏洞只是搬进了「只作名词」那张表。
+#   v4 封闭类证据        —— 前提「产品复合词不可能接限定词/副词」直接不成立:
+#         用户界面这一版需要重做   →  小雨界面这一版…    (限定词)
+#         用户最近流失很多         →  小雨最近流失很多    (时间副词)
+#      因为「用户」和标记之间夹的那 1-3 个字**本身就可以是产品名词**。
+#   v5(现在)只保留**紧邻**谓词锚点:锚点必须直接贴着「用户」,中间不许夹任何字,
+#      所以结构上不可能命中「用户+产品名词+…」。
 #
-# 所以 v4 只用**封闭类证据**,没有证据就不动:
-#   · 体标记 了/过/着 紧跟在 1-2 字动词后 → 「用户」是这个动词的主语 → 本人;
-#     例外:指标名词(增长/留存/转化…)—— 「用户增长了 20%」说的是指标不是人。
-#   · 限定词/代词 这/那/我/自己… 起头的宾语 → 同理。
-#   · 其余仍走下面那套保守的谓词锚点(codex4 落地的原设计,产品词零风险)。
-# 英文刻意**只**保留保守锚点:profiles/accounts/experiences 这类第三人称谓词与
-# 名词短语在词法上无法区分(见上面的反例),猜错的代价是改坏本人真实内容。
-# 覆盖不到的部分由 ①标签层(根因)和 ②prompt 明令兜,并由
-# memory.card_text.count_person_referent_leaks() 量真实残留率 —— 不假装覆盖。
-# 已知未覆盖(有意):动词-动词复合「用户付费升级了会员」——体标记不在紧邻位。
-# 把窗口放宽到 3-4 字就会打坏「用户满意度提升了」,这是同一枚硬币的两面。
+# 更根本的一点:词法层根本无法判定。同一个词、同一个位置,两个方向都自然:
+#      User profiles the application / User profile migration starts Monday
+#      用户体验了新功能(本人试用)   / 用户体验了新功能(泛用户试用)
+# 安全边界不该承担一个 POS parser。真正的完整性靠:
+#   ① transcript_speaker_label —— 根因,不再把 "user:" 喂给模型;
+#   ② prompt 明令 —— 产品术语去掉「用户」前缀,只有模型知道自己想说哪个意思;
+#   ③ memory.card_text.count_user_token_residuals() —— 把残留量出来,不假装覆盖。
+# 这一层只做「已观察到的、高置信的个人谓词」这一件小事。
 # ---------------------------------------------------------------------------
-
-# 指标名词:跟在「用户」后面 + 体标记时,主语是指标而不是人。
-# (「用户增长了20%」「用户留存跌过一次」——这是**唯一**需要词表的地方,
-#  而且它只用来**豁免**体标记规则,列漏一个的后果是少改一句,不是改坏一句。)
-_METRIC_NOUNS = (
-    "增长", "留存", "转化", "流失", "活跃", "粘性", "满意", "满意度", "画像",
-    "数量", "规模", "占比", "基数", "复购", "渗透",
-)
-
-# 封闭类:体标记(动词后)+ 宾语起头的限定词/代词。
-_ZH_ASPECT_MARKERS = "了过着"
-_ZH_OBJECT_STARTERS = "这那该此我你他她它一两三几每某"
-
-# 主语位:文本开头,或紧跟句末标点/换行/分号之后。逗号刻意不算 ——
-# 「他说,用户投诉了」里的「用户」更可能是本人真的在聊自己的用户。
-_ZH_SUBJECT_PREFIX = r"(^|[。！？!?；;\n]\s*)"
-# 用户 + 1~2 字动词 + 体标记
-_ZH_SUBJECT_ASPECT_RE = re.compile(
-    _ZH_SUBJECT_PREFIX + r"用户([\u4e00-\u9fff]{1,2})(?=[" + _ZH_ASPECT_MARKERS + r"])"
-)
-# 用户 + 1~3 字动词 + 限定词/代词起头的宾语
-_ZH_SUBJECT_OBJECT_RE = re.compile(
-    _ZH_SUBJECT_PREFIX + r"用户([\u4e00-\u9fff]{1,3})(?=[" + _ZH_OBJECT_STARTERS + r"])"
-)
-
-
-def _rewrite_zh_subject_with_closed_class_evidence(raw: str, zh_referent: str) -> str:
-    """只在有封闭类证据时改写主语位的「用户」。没有证据就原样留着。"""
-    def _aspect(match: re.Match) -> str:
-        verb = match.group(2)
-        if verb in _METRIC_NOUNS:
-            return match.group(0)  # 用户增长了 20% —— 主语是指标
-        return match.group(1) + zh_referent + verb
-
-    def _object(match: re.Match) -> str:
-        verb = match.group(2)
-        if verb in _METRIC_NOUNS:
-            return match.group(0)
-        return match.group(1) + zh_referent + verb
-
-    raw = _ZH_SUBJECT_ASPECT_RE.sub(_aspect, raw)
-    return _ZH_SUBJECT_OBJECT_RE.sub(_object, raw)
 
 
 def rewrite_user_reference(text: str, user_name: str, subject: str = "") -> str:
@@ -153,9 +105,10 @@ def rewrite_user_reference(text: str, user_name: str, subject: str = "") -> str:
     neutral default is intentional for Genesis fact-write output, which no
     longer carries ``about`` and therefore cannot disambiguate ``TA`` safely.
 
-    判据只用**封闭类证据**(体标记/限定词/副词),没有证据就不动 —— 上面那段
-    注释里有「为什么不能靠词表猜词性」的反证。所以本函数**必然**有残留,
-    那不是 bug:残留由 memory.card_text.count_person_referent_leaks() 计数,
+    锚点必须**紧贴**「用户」——中间不许夹字,所以结构上不可能命中
+    「用户+产品名词+…」。所有主语位规则都已删除(v4 被真例打穿:
+    「用户界面这一版…」「用户最近流失很多」)。因此本函数**必然**有残留,
+    那不是 bug:残留由 memory.card_text.count_user_token_residuals() 计数,
     真正的完整性靠转写标签(transcript_speaker_label)和 prompt 明令。
     """
     raw = str(text or "")
@@ -164,29 +117,26 @@ def rewrite_user_reference(text: str, user_name: str, subject: str = "") -> str:
     name = sanitize_user_name(user_name)
     zh_referent = name if name != "TA" else UNKNOWN_PERSON_LABEL
     en_referent = name if name != "TA" else UNKNOWN_PERSON_LABEL_EN
-    # 先跑主语位的封闭类证据规则(体标记/限定词),再跑句中的保守谓词锚点。
-    raw = _rewrite_zh_subject_with_closed_class_evidence(raw, zh_referent)
     raw = re.sub(
-        # 谓词锚点:紧跟在「用户」后面,所以不存在产品复合词误伤。
-        # 第二行是 2026-07-26 从线上真实泄漏观察到的那批动词(承诺/答应/报名/…)。
-        # 这张表**注定不完整**(中文动词是开放集),它只负责把高频真例收进来;
-        # 完整性靠 ①标签层(根因)和 ②prompt 明令,不靠这张表。
+        # 紧邻谓词锚点。第一行是 codex4 原本落地的集合;第二行是 2026-07-26
+        # 线上真实泄漏观察到的那批(「用户承诺这周末去看医生」及其同义词)。
+        # 收得很紧 —— 只留个人承诺/迁居这类产品语境几乎不会这么说的谓词。
+        # 刻意**没有**收进来的(产品语境同样自然,收进来会改坏真内容):
+        #   完成/开始/停止/发现/找到/收到/参加/取消/推迟/确认/尝试/忘记/记得
+        #   ——「用户开始流失」「用户忘记密码」「用户完成了注册」都是正常产品句。
+        # 这张表注定不完整(中文动词是开放集),完整性不靠它。
         r"用户(?=(?:明确|要求|希望|想要?|喜欢|偏好|说|提到|需要|常常?|总是|通常|曾经?|会|能|愿意|拒绝|认为|觉得|正在|已经|仍然|依然|在|有|没有|是|不是|把|对|来自|住在|工作|习惯|倾向|计划|决定|担心|感到|名?叫|养|写|做|使用|选择|爱|讨厌|擅长|关注"
-        r"|承诺|答应|报名|取消|推迟|参加|参与|抱怨|吐槽|强调|补充|澄清|纠正|确认|完成|开始|停止|忘记|记得|尝试|试过|打算|准备|搬到|搬去|遇到|碰到|发现|找到|收到"
-        # 时间/程度/语气副词是**封闭类** —— 「用户昨天…」「用户很…」不可能是产品复合词,
-        # 所以这批是判据里最硬的证据,不像上面那行动词表那样注定不完整。
-        r"|昨天|今天|明天|前天|后天|昨晚|今晚|今早|上周|上个月|这周|这个月|最近|刚才|刚刚|后来|以前|之前|之后|每天|每次"
-        r"|终于|居然|竟然|一直|从来|偶尔|很|太|非常|挺|更|又|才|就|也|还"
+        r"|承诺|答应|报名|搬到|搬去|吐槽"
         r"|的|$|[\s，。！？；;：:、,.!?]))",
         zh_referent,
         raw,
     )
     raw = re.sub(
-        # 英文刻意只保留这套保守锚点。profiles/accounts/experiences 这类第三人称
+        # 英文同样只保留紧邻锚点。profiles/accounts/experiences 这类第三人称
         # 谓词与名词短语在词法上无法区分("User profiles the application" vs
         # "User profile migration starts Monday"),猜错的代价是改坏本人真实内容。
         r"(?i)\b(?:the\s+)?user(?=(?:'s|\s+(?:is|has|was|wants|needs|likes|prefers|often|usually|always|never|can|will|works|writes|feels|said|asked|lives|uses|chooses|plans|decided"
-        r"|promised|agreed|signed|cancelled|canceled|moved|started|stopped|forgot|remembered|mentioned|complained|tried|joined|booked)\b))",
+        r"|promised|agreed|moved|remembered|complained)\b))",
         en_referent,
         raw,
     )
