@@ -51,13 +51,28 @@ def test_file_delivery_policy_is_semantic_and_hides_internal_paths():
     assert "real Word/PDF bytes" in description
 
 
-def _run_loop(monkeypatch, responses, *, on_file_reply=None, dispatch=None):
+def _run_loop(
+    monkeypatch,
+    responses,
+    *,
+    on_file_reply=None,
+    dispatch=None,
+    required_file_suffixes=None,
+    file_requirement_messages=(),
+    resolve_required_file_suffixes=None,
+    on_file_requirement_changed=None,
+    fold_batches=(),
+    max_calls=3,
+):
     calls = []
     replies = []
+    messages_seen = []
     response_iter = iter(responses)
+    fold_iter = iter(fold_batches)
 
     async def fake_chat(config, messages, *, tools=None, **kwargs):
         calls.append(tuple(spec.name for spec in (tools or ())))
+        messages_seen.append(messages)
         return next(response_iter)
 
     async def on_reply(text, *, final, reasoning=""):
@@ -69,7 +84,7 @@ def _run_loop(monkeypatch, responses, *, on_file_reply=None, dispatch=None):
         return [ToolResult(call_id=tc.id, content="ok") for tc in tool_calls]
 
     async def no_fold():
-        return []
+        return next(fold_iter, [])
 
     monkeypatch.setattr(provider_client, "chat_completion_async", fake_chat)
     outcome = asyncio.run(
@@ -79,12 +94,16 @@ def _run_loop(monkeypatch, responses, *, on_file_reply=None, dispatch=None):
             dispatch_tools=dispatch_tools,
             on_reply=on_reply,
             on_file_reply=on_file_reply,
+            required_file_suffixes=required_file_suffixes,
+            file_requirement_messages=file_requirement_messages,
+            resolve_required_file_suffixes=resolve_required_file_suffixes,
+            on_file_requirement_changed=on_file_requirement_changed,
             fold_new_messages=no_fold,
             add_usage=lambda usage: None,
-            max_calls=3,
+            max_calls=max_calls,
         )
     )
-    return outcome, calls, replies
+    return outcome, calls, replies, messages_seen
 
 
 def test_file_capable_chat_uses_v2_output_budget_without_changing_global_default(
@@ -154,7 +173,7 @@ def test_send_file_is_chat_only_and_invokes_explicit_callback(monkeypatch):
     async def on_file(path, revision):
         files.append((path, revision))
 
-    outcome, calls, replies = _run_loop(
+    outcome, calls, replies, _ = _run_loop(
         monkeypatch,
         [
             {
@@ -180,7 +199,7 @@ def test_send_file_is_chat_only_and_invokes_explicit_callback(monkeypatch):
 
 
 def test_send_file_is_not_offered_without_delivery_callback(monkeypatch):
-    _, calls, _ = _run_loop(
+    _, calls, _, _ = _run_loop(
         monkeypatch,
         [{"reply": "plain", "tool_calls": [], "usage": {}}],
     )
@@ -198,7 +217,7 @@ def test_send_file_cannot_share_a_batch_with_workspace_write(monkeypatch):
     async def on_file(path, revision):
         files.append((path, revision))
 
-    outcome, _, replies = _run_loop(
+    outcome, _, replies, _ = _run_loop(
         monkeypatch,
         [
             {
@@ -231,6 +250,292 @@ def test_send_file_cannot_share_a_batch_with_workspace_write(monkeypatch):
     assert files == []
     assert replies == [("fallback", True)]
     assert outcome.stop_reason == "final_text"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("给我一个 Word 文档", (".docx",)),
+        ("给我一个Word文档", (".docx",)),
+        ("我想要一份 Word 文档", (".docx",)),
+        ("请生成一个 PDF 发给我", (".pdf",)),
+        ("请生成PDF文件发给我", (".pdf",)),
+        ("给我生成一个可以下载的健身计划文档", ()),
+        ("把 Markdown 文件转换成 Word 文档", (".docx",)),
+        ("把Markdown文件转成Word文档", (".docx",)),
+        ("Word 和 PDF 有什么区别？", None),
+        ("请帮我看看这个 Word 文档", None),
+        ("如何创建 Word 文档？", None),
+        ("请解释怎么导出 PDF，不要替我生成文件", None),
+        ("你能帮我创建Word文档吗？", (".docx",)),
+        ("不要 Markdown 文档，给我Word文档", (".docx",)),
+        ("生成 Word 文档，不要 PDF", (".docx",)),
+        ("不要生成 Word 文档", None),
+        ("不用生成 PDF 文件", None),
+        ("别帮我制作 Word 文档", None),
+        ("Don't create a Word document; create a PDF instead", (".pdf",)),
+        ("Do not generate a PDF file; make a Word document instead", (".docx",)),
+    ],
+)
+def test_required_file_suffixes_detects_clear_file_intent(text, expected):
+    assert v2_context.required_file_suffixes(
+        [{"role": "user", "content": text}]
+    ) == expected
+
+
+def test_required_file_suffixes_follow_latest_user_correction():
+    assert v2_context.required_file_suffixes(
+        [
+            {"role": "user", "content": "给我一个 Word 文档"},
+            {"role": "user", "content": "不用文件了，直接回答"},
+        ]
+    ) is None
+    assert v2_context.required_file_suffixes(
+        [
+            {"role": "user", "content": "给我一个 Word 文档"},
+            {"role": "user", "content": "不要生成 Word 文档"},
+        ]
+    ) is None
+    assert v2_context.required_file_suffixes(
+        [
+            {"role": "user", "content": "Create a Word document for me"},
+            {
+                "role": "user",
+                "content": "Don't create a Word document; create a PDF instead",
+            },
+        ]
+    ) == (".pdf",)
+    assert v2_context.required_file_suffixes(
+        [
+            {"role": "user", "content": "给我一个 Word 文档"},
+            {"role": "user", "content": "改成 PDF 文档"},
+        ]
+    ) == (".pdf",)
+    assert v2_context.required_file_suffixes(
+        [
+            {"role": "user", "content": "给我一个 Word 文档"},
+            {"role": "user", "content": "另外也生成一份 PDF"},
+        ]
+    ) == (".docx", ".pdf")
+
+
+def test_late_folded_word_request_enables_file_completion_guard(monkeypatch):
+    files = []
+    initial_messages = [{"role": "user", "content": "先帮我想想健身计划"}]
+    late_word_request = [{"role": "user", "content": "请做成 Word 文档"}]
+
+    async def on_file(path, revision):
+        files.append((path, revision))
+
+    outcome, _, replies, _ = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "r1",
+                        "name": "workspace_read",
+                        "args": {"path": "/workspace/notes.md"},
+                    }
+                ],
+                "usage": {},
+            },
+            {"reply": "这里是计划。", "tool_calls": [], "usage": {}},
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "w1",
+                        "name": "workspace_write",
+                        "args": {
+                            "path": "/workspace/计划.docx",
+                            "content": "# 计划",
+                            "expected_revision": 0,
+                        },
+                    }
+                ],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "f1",
+                        "name": "send_file",
+                        "args": {"path": "/workspace/计划.docx", "revision": 1},
+                    }
+                ],
+                "usage": {},
+            },
+            {"reply": "Word 文档已发给你。", "tool_calls": [], "usage": {}},
+        ],
+        on_file_reply=on_file,
+        file_requirement_messages=initial_messages,
+        resolve_required_file_suffixes=v2_context.required_file_suffixes,
+        fold_batches=[late_word_request],
+        max_calls=5,
+    )
+
+    assert files == [("/workspace/计划.docx", 1)]
+    assert replies == [("Word 文档已发给你。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+def test_late_folded_cancellation_disables_file_completion_guard(monkeypatch):
+    initial_messages = [{"role": "user", "content": "给我一个 Word 文档"}]
+    cancellation = [{"role": "user", "content": "不用文件了，直接回答"}]
+
+    outcome, _, replies, _ = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "r1",
+                        "name": "workspace_read",
+                        "args": {"path": "/workspace/notes.md"},
+                    }
+                ],
+                "usage": {},
+            },
+            {"reply": "好的，直接回答。", "tool_calls": [], "usage": {}},
+        ],
+        on_file_reply=lambda path, revision: None,
+        required_file_suffixes=(".docx",),
+        file_requirement_messages=initial_messages,
+        resolve_required_file_suffixes=v2_context.required_file_suffixes,
+        fold_batches=[cancellation],
+        max_calls=3,
+    )
+
+    assert replies == [("好的，直接回答。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+def test_late_cancellation_discards_an_already_staged_file(monkeypatch):
+    initial_messages = [{"role": "user", "content": "给我一个 Word 文档"}]
+    cancellation = [{"role": "user", "content": "不用文件了，直接回答"}]
+    staged_files = []
+
+    async def on_file(path, revision):
+        staged_files.append((path, revision))
+
+    async def on_requirement_changed():
+        staged_files.clear()
+
+    outcome, _, replies, _ = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "f1",
+                        "name": "send_file",
+                        "args": {"path": "/workspace/计划.docx", "revision": 1},
+                    }
+                ],
+                "usage": {},
+            },
+            {"reply": "好的，改为直接回答。", "tool_calls": [], "usage": {}},
+        ],
+        on_file_reply=on_file,
+        required_file_suffixes=(".docx",),
+        file_requirement_messages=initial_messages,
+        resolve_required_file_suffixes=v2_context.required_file_suffixes,
+        on_file_requirement_changed=on_requirement_changed,
+        fold_batches=[cancellation],
+        max_calls=3,
+    )
+
+    assert staged_files == []
+    assert replies == [("好的，改为直接回答。", True)]
+    assert outcome.stop_reason == "final_text"
+
+
+def test_required_word_file_retries_plain_text_until_docx_is_delivered(monkeypatch):
+    files = []
+
+    async def on_file(path, revision):
+        files.append((path, revision))
+
+    outcome, calls, replies, messages_seen = _run_loop(
+        monkeypatch,
+        [
+            {"reply": "这是你的计划。", "tool_calls": [], "usage": {}},
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "w1",
+                        "name": "workspace_write",
+                        "args": {
+                            "path": "/workspace/计划.docx",
+                            "content": "# 计划",
+                            "expected_revision": 0,
+                        },
+                    }
+                ],
+                "usage": {},
+            },
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "f1",
+                        "name": "send_file",
+                        "args": {"path": "/workspace/计划.docx", "revision": 1},
+                    }
+                ],
+                "usage": {},
+            },
+            {"reply": "Word 文档已经发给你了。", "tool_calls": [], "usage": {}},
+        ],
+        on_file_reply=on_file,
+        required_file_suffixes=(".docx",),
+        max_calls=4,
+    )
+
+    assert replies == [("Word 文档已经发给你了。", True)]
+    assert files == [("/workspace/计划.docx", 1)]
+    assert outcome.stop_reason == "final_text"
+    assert "send_file" in calls[1]
+    assert "REQUIRED FILE DELIVERY" in messages_seen[1][0]["content"]
+
+
+def test_required_word_file_rejects_markdown_substitution(monkeypatch):
+    files = []
+
+    async def on_file(path, revision):
+        files.append((path, revision))
+
+    outcome, _, replies, _ = _run_loop(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [
+                    {
+                        "id": "f1",
+                        "name": "send_file",
+                        "args": {"path": "/workspace/计划.md", "revision": 1},
+                    }
+                ],
+                "usage": {},
+            },
+            {"reply": "已经发给你了。", "tool_calls": [], "usage": {}},
+            {"reply": "仍未生成。", "tool_calls": [], "usage": {}},
+        ],
+        on_file_reply=on_file,
+        required_file_suffixes=(".docx",),
+        max_calls=3,
+    )
+
+    assert files == []
+    assert replies == []
+    assert outcome.stop_reason == "required_file_missing"
 
 
 def test_workspace_file_result_rejects_host_and_non_workspace_paths():
@@ -509,6 +814,7 @@ def test_process_job_commits_text_then_workspace_file_as_one_final_reply(
         )
 
     async def direct_loop(**kwargs):
+        assert kwargs["required_file_suffixes"] == ()
         await kwargs["on_file_reply"]("/workspace/report.md", 4)
         with db.get_pool().connection() as connection:
             visible_before_final = connection.execute(

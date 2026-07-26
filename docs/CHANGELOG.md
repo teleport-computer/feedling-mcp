@@ -526,7 +526,10 @@ cvm-id fail-closed、永不并入 merge 自动部署。
   `/workspace` entry through the idempotent reply outbox; UTF-8 text formats are
   delivered directly, while `.docx` and `.pdf` targets are rendered into real
   Word/PDF bytes instead of renaming Markdown. Final text and file cards commit
-  as one ordered reply bundle. It never scans or accepts a host filesystem path.
+  as one ordered reply bundle. Explicit file requests now remain incomplete until
+  the requested format is delivered, so plain text or a Markdown substitution
+  cannot silently satisfy a Word/PDF request. It never scans or accepts a host
+  filesystem path.
   Independent reads/tasks run concurrently; disjoint workspace writes may commit in
   conflict-free waves, while conflicting paths and external effects remain
   provider-ordered.

@@ -6745,6 +6745,9 @@ async def process_job(
         coalesced, cursor_seq, cursor_ts = await _coalesce_inputs(
             deps, user_id, since_seq, enclave_sem=enclave_sem
         )
+        required_file_suffixes = (
+            context.required_file_suffixes(coalesced) if lane == "chat" else None
+        )
         if not coalesced and lane == "chat":
             # 无未回复消息（已被别的回合吃掉，或是竞态下的重复 claim）——干净收尾，不落 filler。
             completed, successor_id = await asyncio.to_thread(
@@ -7391,6 +7394,10 @@ async def process_job(
         pending_file_replies: list[WorkspaceFileReply] = []
         pending_file_keys: set[tuple[str, int]] = set()
 
+        async def _on_file_requirement_changed() -> None:
+            pending_file_replies.clear()
+            pending_file_keys.clear()
+
         async def _on_reply(
             text: str | WorkspaceFileReply,
             *,
@@ -7787,6 +7794,10 @@ async def process_job(
             dispatch_tools=_dispatch_tools,
             on_reply=_on_reply,
             on_file_reply=_on_file_reply,
+            required_file_suffixes=required_file_suffixes,
+            file_requirement_messages=coalesced,
+            resolve_required_file_suffixes=context.required_file_suffixes,
+            on_file_requirement_changed=_on_file_requirement_changed,
             fold_new_messages=fold_new_messages,
             add_usage=tm.add_call,
             max_calls=_TURN_MAX_LLM_CALLS,

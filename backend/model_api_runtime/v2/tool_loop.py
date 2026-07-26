@@ -4,6 +4,7 @@ all side effects injected. One loop for every model — no is_official branch.""
 from __future__ import annotations
 from dataclasses import dataclass
 import json
+import posixpath
 import re
 from provider_types import ProviderResponse, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
@@ -196,6 +197,10 @@ async def run_tool_loop(
     disabled_tool_names=None,
     allow_reply_tool: bool = True,
     on_file_reply=None,
+    required_file_suffixes: tuple[str, ...] | None = None,
+    file_requirement_messages=(),
+    resolve_required_file_suffixes=None,
+    on_file_requirement_changed=None,
     outbound_blocking_read_tool_names=None,
     outbound_blocking_read_tool_predicate=None,
     max_tool_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
@@ -237,7 +242,14 @@ async def run_tool_loop(
     ``on_file_reply`` is an optional async chat-lane callback. When absent, the
     ``send_file`` tool is removed from the offered catalog. Production resolves
     only encrypted ``/workspace`` entries through this callback; the loop never
-    interprets a model string as a host filesystem path."""
+    interprets a model string as a host filesystem path.
+
+    ``required_file_suffixes`` is a completion guard for clear user file intent.
+    ``None`` disables it, ``()`` requires any delivered file, and a non-empty
+    tuple requires every listed suffix before terminal text can be published.
+    Chat callers may also provide ``file_requirement_messages`` plus a resolver;
+    newly folded user messages then update or cancel the requirement before each
+    later provider round."""
     max_tool_calls_per_round = _positive_limit(
         max_tool_calls_per_round, name="max_tool_calls_per_round"
     )
@@ -296,6 +308,34 @@ async def run_tool_loop(
     external_content_seen = False
     mutation_outcome_unknown = False
     outbound_tools_blocked = False
+    file_requirement_message_state = [
+        dict(message)
+        for message in file_requirement_messages
+        if isinstance(message, dict)
+    ]
+
+    def _normalize_file_requirement(value) -> tuple[bool, frozenset[str]]:
+        required = value is not None
+        suffixes = frozenset(
+            str(suffix).strip().casefold() for suffix in (value or ())
+        )
+        if any(
+            re.fullmatch(r"\.[a-z0-9]{1,16}", suffix) is None
+            for suffix in suffixes
+        ):
+            raise ValueError("required_file_suffixes contains an invalid suffix")
+        return required, suffixes
+
+    resolved_file_requirement = required_file_suffixes
+    if resolve_required_file_suffixes is not None:
+        resolved_file_requirement = resolve_required_file_suffixes(
+            file_requirement_message_state
+        )
+    file_delivery_required, normalized_required_suffixes = (
+        _normalize_file_requirement(resolved_file_requirement)
+    )
+    delivered_file_suffixes: set[str] = set()
+    delivery_retry_instruction = ""
     outbound_blocking_reads = {
         str(name) for name in (outbound_blocking_read_tool_names or ()) if str(name)
     }
@@ -381,8 +421,46 @@ async def run_tool_loop(
                     {"round": attempts + 1, "messages": folded},
                 )
                 transcript.extend(folded)
+                if resolve_required_file_suffixes is not None:
+                    file_requirement_message_state.extend(
+                        dict(message)
+                        for message in folded
+                        if isinstance(message, dict)
+                    )
+                    (
+                        next_file_delivery_required,
+                        next_required_suffixes,
+                    ) = _normalize_file_requirement(
+                        resolve_required_file_suffixes(
+                            file_requirement_message_state
+                        )
+                    )
+                    if (
+                        next_file_delivery_required != file_delivery_required
+                        or next_required_suffixes
+                        != normalized_required_suffixes
+                    ):
+                        file_delivery_required = next_file_delivery_required
+                        normalized_required_suffixes = next_required_suffixes
+                        delivered_file_suffixes.clear()
+                        delivery_retry_instruction = ""
+                        if on_file_requirement_changed is not None:
+                            await on_file_requirement_changed()
 
         messages = build_messages(list(transcript))
+        if delivery_retry_instruction:
+            messages = [dict(message) for message in messages]
+            if messages and messages[0].get("role") == "system":
+                messages[0]["content"] = (
+                    str(messages[0].get("content") or "").rstrip()
+                    + "\n\n"
+                    + delivery_retry_instruction
+                )
+            else:
+                messages.insert(
+                    0,
+                    {"role": "system", "content": delivery_retry_instruction},
+                )
         # Reserve the final provider attempt for a tools-disabled terminal reply.
         # A 400/422 tool-schema rejection or repeated malformed call also forces
         # this same one-shot fallback; the fallback itself is never retried.
@@ -525,6 +603,51 @@ async def run_tool_loop(
         # A tools-disabled request is terminal even if a broken relay invents a
         # tool call anyway.  Never execute an undeclared call; use only its text.
         if tools is None or not pr.tool_calls:
+            requirement_met = (
+                not file_delivery_required
+                or (
+                    bool(delivered_file_suffixes)
+                    if not normalized_required_suffixes
+                    else normalized_required_suffixes.issubset(
+                        delivered_file_suffixes
+                    )
+                )
+            )
+            if not requirement_met:
+                missing_suffixes = sorted(
+                    normalized_required_suffixes - delivered_file_suffixes
+                )
+                await _trajectory(
+                    "required_file_missing",
+                    {
+                        "round": attempts,
+                        "required_suffixes": sorted(normalized_required_suffixes),
+                        "delivered_suffixes": sorted(delivered_file_suffixes),
+                    },
+                )
+                if missing_suffixes:
+                    target = ", ".join(missing_suffixes)
+                    delivery_retry_instruction = (
+                        "REQUIRED FILE DELIVERY: The user explicitly requested "
+                        f"downloadable output in {target}. Do not finish with "
+                        "plain text. Create editable source with workspace_write, "
+                        "then call send_file for every missing format before the "
+                        "terminal reply."
+                    )
+                else:
+                    delivery_retry_instruction = (
+                        "REQUIRED FILE DELIVERY: The user explicitly requested a "
+                        "downloadable file. Do not finish with plain text. Create "
+                        "it with workspace_write, then call send_file before the "
+                        "terminal reply."
+                    )
+                force_text_fallback = False
+                if attempts < max_calls:
+                    _progress("required_file_retry_boundary")
+                    continue
+                return LoopOutcome(
+                    "", attempts, "required_file_missing", replied_intermediate
+                )
             await _trajectory(
                 "reply_planned",
                 {
@@ -674,7 +797,21 @@ async def run_tool_loop(
             # check as a defense for direct/internal callers.
             if on_file_reply is None:
                 raise RuntimeError("send_file callback is unavailable")
+            file_suffix = posixpath.splitext(workspace_path)[1].casefold()
+            if (
+                normalized_required_suffixes
+                and file_suffix not in normalized_required_suffixes
+            ):
+                reply_results[tc.id] = ToolResult(
+                    call_id=tc.id,
+                    content=(
+                        "error: wrong file format; required suffixes: "
+                        + ", ".join(sorted(normalized_required_suffixes))
+                    ),
+                )
+                continue
             await on_file_reply(workspace_path, workspace_revision)
+            delivered_file_suffixes.add(file_suffix)
             replied_intermediate = True
             reply_results[tc.id] = ToolResult(
                 call_id=tc.id,

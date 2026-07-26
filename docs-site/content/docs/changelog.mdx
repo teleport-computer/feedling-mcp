@@ -257,10 +257,12 @@ change must not be interpreted as an API guarantee.
 - Hosted Runtime V2 can now publish a generated `/workspace` document as a
   native download card through the explicit `send_file` tool. Text formats are
   delivered directly, while `.docx` and `.pdf` requests produce real Word and
-  PDF bytes instead of Markdown with a renamed suffix. The entry remains
-  user-scoped and encrypted; final assistant text and its file cards commit as
-  one ordered, idempotent reply bundle; host filesystem paths are never scanned
-  or accepted.
+  PDF bytes instead of Markdown with a renamed suffix. Clear file requests are
+  now completion-gated: plain text cannot finish the turn before a file is
+  delivered, and an explicitly requested format cannot be replaced with a
+  different suffix. The entry remains user-scoped and encrypted; final assistant
+  text and its file cards commit as one ordered, idempotent reply bundle; host
+  filesystem paths are never scanned or accepted.
 - Self-hosted resident polls may now receive server-generated maintenance turns
   with `role: "user"` and `source: "resident_maintenance"` when the resident
   consumer appears stale or is not claiming resident-only distill jobs. These

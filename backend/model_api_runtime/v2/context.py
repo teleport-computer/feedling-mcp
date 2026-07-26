@@ -8,6 +8,8 @@ only.
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from typing import Any, Sequence
 
 # Mirrors `_ASSISTANT_ROLES` in `backend/model_api_runtime/v2/coalesce.py`.
@@ -95,6 +97,91 @@ ACTION_CONTEXT_CHAR_CAP = 8000
 PER_ACTION_CHAR_CAP = 2000
 _BLOB_KEYS = frozenset({"image_b64"})
 
+_FILE_ARTIFACT_RE = re.compile(
+    r"(?:文档|文件|附件|报告|计划书|清单|表格|简历|可下载|下载版|"
+    r"\b(?:document|file|attachment|report|plan|checklist|spreadsheet|resume)\b)"
+)
+_FILE_CREATE_RE = re.compile(
+    r"(?:生成|创建|制作|导出|保存(?:成|为)?|转换?(?:成|为)|转成|改(?:成|为)|整理(?:成|为)|"
+    r"写成|做成|制成|发给我|提供给我|交给我|"
+    r"给我(?:一个|一份|生成|创建|制作|导出|保存|转换|转成|整理|写成|做成)|"
+    r"给我\s*(?:word|pdf|markdown|md|docx)|"
+    r"\b(?:create|generate|make|produce|export|save|convert|send|give|provide)\b)"
+)
+_FILE_DESIRE_RE = re.compile(
+    r"(?:我(?:想要|要|需要)(?:一个|一份|这份|这个)?\s*"
+    r"(?:word|pdf|markdown|md|docx|文档|文件|附件|报告|计划书|清单|表格|简历)|"
+    r"\b(?:i want|i need|i would like|i'd like)\s+(?:a\s+|an\s+)?"
+    r"(?:word|pdf|markdown|md|docx|document|file|attachment|report|plan|checklist|spreadsheet|resume)\b)"
+)
+_FILE_EXPLICIT_REQUEST_RE = re.compile(
+    r"(?:(?:帮我|替我|为我)(?:生成|创建|制作|导出|保存|转换|转成|整理|写成|做成)|"
+    r"给我\s*(?:一个|一份)?\s*(?:word|pdf|markdown|md|docx|文档|文件|附件|报告|计划书|清单|表格|简历)|"
+    r"我(?:想要|要|需要)(?:一个|一份|这份|这个)?\s*"
+    r"(?:word|pdf|markdown|md|docx|文档|文件|附件|报告|计划书|清单|表格|简历)|"
+    r"\b(?:create|generate|make|produce|export|save|convert)\b.{0,40}\bfor me\b|"
+    r"\b(?:send|give|provide) me\b)"
+)
+_FILE_INFORMATION_RE = re.compile(
+    r"(?:如何|怎么|怎样|教程|步骤|方法|请(?:解释|介绍|说明|告诉我)|"
+    r"解释一下|介绍一下|讲讲|了解|有什么区别|"
+    r"\b(?:how (?:do|can|should|to)|tutorial|steps?|explain|describe|"
+    r"tell me how|what is|what are|difference between)\b)"
+)
+_FILE_CANCEL_RE = re.compile(
+    r"(?:(?:不要|不用|无需|不需要|别)(?:替我|帮我|为我)?"
+    r"(?:生成|创建|制作|导出|发送|发|提供)?(?:任何|这个|该)?"
+    r"\s*(?:文档|文件|附件)|"
+    r"取消(?:生成|创建|制作|导出|发送)?(?:文档|文件|附件)|"
+    r"直接(?:在这里)?回答|只(?:要|需)(?:文字|文本|回答)|不(?:用|要)(?:下载|附件)|"
+    r"\b(?:do not|don't|no need to)\s+"
+    r"(?:(?:create|generate|make|export|send|provide)\s+)?"
+    r"(?:(?:a|an|any|the)\s+)?(?:file|document|attachment)\b|"
+    r"\bjust answer(?: in (?:text|chat))?\b)"
+)
+_FILE_NEGATED_FORMAT_RE = re.compile(
+    r"(?:(?:不要|不用|无需|不需要|别)(?:替我|帮我|为我)?\s*"
+    r"(?:生成|创建|制作|导出|发送|发|提供)?\s*"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)"
+    r"\s*(?:格式|文档|文件)?|"
+    r"\b(?:do not|don't|no need to)\s+"
+    r"(?:(?:create|generate|make|export|send|provide)\s+)?"
+    r"(?:(?:a|an|any|the)\s+)?"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)"
+    r"(?:\s+(?:format|document|file))?\b)"
+)
+_FILE_ADDITIVE_RE = re.compile(
+    r"(?:另外|同时|还要|也要|再(?:来|给|生成|做|制作)|以及|"
+    r"\b(?:also|as well|in addition|and another)\b)"
+)
+_CONVERSION_TARGET_RE = re.compile(
+    r"(?:转换?(?:成|为)|转成|改(?:成|为)|导出(?:成|为)|保存(?:成|为)|"
+    r"\b(?:convert|export|save)\b.{0,24}?\b(?:to|as)\b)"
+)
+_FILE_FORMAT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        ".docx",
+        re.compile(
+            r"(?:\.docx(?![a-z0-9_])|(?<![a-z0-9_])docx(?![a-z0-9_])|"
+            r"(?<![a-z0-9_])word(?![a-z0-9_]))"
+        ),
+    ),
+    (
+        ".pdf",
+        re.compile(
+            r"(?:\.pdf(?![a-z0-9_])|(?<![a-z0-9_])pdf(?![a-z0-9_]))"
+        ),
+    ),
+    (".md", re.compile(r"(?:\.md\b|\bmarkdown\b|markdown\s*文档|md\s*文档)")),
+    (".txt", re.compile(r"(?:\.txt\b|\btxt\b|纯文本(?:文档|文件)?)")),
+    (".csv", re.compile(r"(?:\.csv\b|\bcsv\b)")),
+    (".html", re.compile(r"(?:\.html?\b|\bhtml\b)")),
+    (".json", re.compile(r"(?:\.json\b|\bjson\b)")),
+    (".xml", re.compile(r"(?:\.xml\b|\bxml\b)")),
+    (".yaml", re.compile(r"(?:\.ya?ml\b|\byaml\b)")),
+    (".rtf", re.compile(r"(?:\.rtf\b|\brtf\b)")),
+)
+
 
 def _norm_role(role: Any) -> str:
     return "assistant" if str(role or "") in _ASSISTANT_ROLES else "user"
@@ -116,6 +203,77 @@ def text_of(content: Any) -> str:
         ]
         return "\n".join(parts).strip()
     return str(content or "").strip()
+
+
+def _required_file_suffixes_for_text(normalized: str) -> tuple[str, ...] | None:
+    intent_scope = _FILE_NEGATED_FORMAT_RE.sub(" ", normalized)
+    has_action = bool(
+        _FILE_CREATE_RE.search(intent_scope) or _FILE_DESIRE_RE.search(intent_scope)
+    )
+    if not has_action:
+        return None
+    if (
+        _FILE_INFORMATION_RE.search(intent_scope)
+        and not _FILE_EXPLICIT_REQUEST_RE.search(intent_scope)
+    ):
+        return None
+
+    search_from = 0
+    conversion_markers = list(_CONVERSION_TARGET_RE.finditer(intent_scope))
+    if conversion_markers:
+        # For "convert Markdown to Word", only Word is a required output.
+        search_from = conversion_markers[-1].end()
+    format_scope = intent_scope[search_from:]
+    requested = tuple(
+        suffix
+        for suffix, pattern in _FILE_FORMAT_PATTERNS
+        if pattern.search(format_scope)
+    )
+    if requested:
+        return requested
+    if _FILE_ARTIFACT_RE.search(intent_scope):
+        return ()
+    return None
+
+
+def required_file_suffixes(messages: Sequence[dict]) -> tuple[str, ...] | None:
+    """Return the file formats a clear current-turn request must deliver.
+
+    The model remains responsible for semantic intent and content generation.
+    This conservative detector is only a completion guard: it prevents a plain
+    text answer (or a Markdown substitution) from satisfying an explicit file
+    request. ``()`` means any downloadable file is acceptable; ``None`` means
+    ordinary conversational completion remains valid.
+    """
+    requirement: tuple[str, ...] | None = None
+    for message in messages:
+        if _norm_role(message.get("role")) != "user":
+            continue
+        normalized = unicodedata.normalize(
+            "NFKC", text_of(message.get("content"))
+        ).casefold()
+        if not normalized.strip():
+            continue
+
+        cancellation = _FILE_CANCEL_RE.search(normalized)
+        negated_format = _FILE_NEGATED_FORMAT_RE.search(normalized)
+        if cancellation:
+            positive_tail = normalized[cancellation.end():]
+            candidate = _required_file_suffixes_for_text(positive_tail)
+            if candidate is None:
+                requirement = None
+                continue
+        else:
+            candidate = _required_file_suffixes_for_text(normalized)
+            if candidate is None:
+                if negated_format:
+                    requirement = None
+                continue
+        if _FILE_ADDITIVE_RE.search(normalized) and requirement:
+            requirement = tuple(dict.fromkeys((*requirement, *candidate)))
+        else:
+            requirement = candidate
+    return requirement
 
 
 def _has_payload(content: Any) -> bool:

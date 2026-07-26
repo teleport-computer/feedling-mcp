@@ -159,7 +159,10 @@ model first creates or replaces editable UTF-8 source in an encrypted
 `/workspace/...` entry with `workspace_write`. After that write succeeds, it
 calls `send_file` with the same virtual path in a later tool round. Text formats
 are delivered directly; `.docx` and `.pdf` targets are rendered into real Word
-and PDF bytes at delivery time. The worker resolves only the current user's
+and PDF bytes at delivery time. Clear requests for a downloadable file are
+completion-gated: terminal text is not published until a file is delivered,
+and an explicitly requested suffix such as `.docx` cannot be satisfied by a
+Markdown substitute. The worker resolves only the current user's
 entry, then commits the final assistant text followed by its download cards as
 one idempotent reply bundle. It stores `content_type: "file"` plus a bounded
 filename, MIME, and byte count. The worker never scans a runtime directory, and
