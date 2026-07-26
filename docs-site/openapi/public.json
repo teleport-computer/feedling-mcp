@@ -7314,6 +7314,171 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/vision/config": {
+      "get": {
+        "summary": "Vision Config Get",
+        "operationId": "vision_config_get_v1_vision_config_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ],
+        "x-feedling-contract-level": "documented"
+      },
+      "put": {
+        "summary": "Vision Config Set",
+        "operationId": "vision_config_set_v1_vision_config_put",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VisionConfigUpdateRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented"
+      },
+      "post": {
+        "summary": "Vision Route Configure",
+        "operationId": "vision_route_configure_v1_vision_config_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VisionRouteCreateRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented"
+      }
+    },
+    "/v1/vision/routes/{route_id}/test": {
+      "post": {
+        "summary": "Vision Route Test",
+        "operationId": "vision_route_test_v1_vision_routes__route_id__test_post",
+        "parameters": [
+          {
+            "name": "route_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Route Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid path or request parameter.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ],
+        "x-feedling-contract-level": "documented"
+      }
+    },
     "/v1/web/settings": {
       "get": {
         "summary": "Web Settings Get",
@@ -8451,6 +8616,100 @@
           "error_class": "quota_insufficient",
           "provider_result": "failure"
         }
+      },
+      "VisionConfigUpdateRequest": {
+        "type": "object",
+        "required": [
+          "mode"
+        ],
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "follow_main",
+              "dedicated"
+            ]
+          },
+          "route_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Required when mode is dedicated."
+          }
+        },
+        "if": {
+          "properties": {
+            "mode": {
+              "const": "dedicated"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        },
+        "then": {
+          "required": [
+            "route_id"
+          ]
+        },
+        "additionalProperties": false
+      },
+      "VisionRouteCreateRequest": {
+        "type": "object",
+        "required": [
+          "model"
+        ],
+        "properties": {
+          "provider": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1
+          },
+          "api_key": {
+            "type": "string",
+            "minLength": 1,
+            "writeOnly": true
+          },
+          "credential_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "label": {
+            "type": "string"
+          },
+          "base_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "context_window_tokens": {
+            "type": "integer",
+            "minimum": 8192
+          }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "api_key"
+            ],
+            "not": {
+              "required": [
+                "credential_id"
+              ]
+            }
+          },
+          {
+            "required": [
+              "credential_id"
+            ],
+            "not": {
+              "required": [
+                "api_key"
+              ]
+            }
+          }
+        ],
+        "additionalProperties": false
       },
       "HostedChatAcceptedResponse": {
         "type": "object",

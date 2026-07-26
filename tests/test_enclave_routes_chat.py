@@ -153,7 +153,7 @@ def test_image_message_with_caption(client, monkeypatch):
     _wire(monkeypatch, [
         {"id": "img1", "role": "user", "ts": 1.0, "v": 1, "content_type": "image",
          "K_enclave": "x", "body_ct": "x", "nonce": "x", "owner_user_id": "usr_a",
-         "image_mime": "image/png", "vision_route_id": "vision-route-a",
+         "image_mime": "image/png",
          "caption_body_ct": "y", "caption_nonce": "y", "caption_K_enclave": "y"},
     ])
     jpeg = b"\x89PNG fake"
@@ -164,7 +164,6 @@ def test_image_message_with_caption(client, monkeypatch):
     m = r.get_json()["messages"][0]
     assert base64.b64decode(m["image_b64"]) == jpeg
     assert m["image_mime"] == "image/png"
-    assert m["vision_route_id"] == "vision-route-a"
     assert m["content"] == "what is this?"
 
 
@@ -351,8 +350,7 @@ def test_omitted_image_body_degrades_without_a_decrypt_error(client, monkeypatch
         {"id": "i1", "role": "user", "ts": 1.0, "v": 1, "content_type": "image",
          "body_omitted": True, "body_omitted_reason": "image_body", "body_ct_len": 1425288,
          "caption_body_ct": "c", "caption_nonce": "cn", "caption_K_enclave": "ck",
-         "owner_user_id": "usr_a", "image_mime": "image/jpeg",
-         "vision_route_id": "vision-route-a"},
+         "owner_user_id": "usr_a", "image_mime": "image/jpeg"},
     ])
     monkeypatch.setattr(envmod, "decrypt_envelope", lambda e, u, s: b"what is wrong here?")
 
@@ -364,7 +362,6 @@ def test_omitted_image_body_degrades_without_a_decrypt_error(client, monkeypatch
     assert "image_b64" not in m
     assert m["content"] == "what is wrong here?"   # caption survived the omission
     assert m["content_type"] == "image"
-    assert m["vision_route_id"] == "vision-route-a"
     assert body["decrypt_errors"] == []            # not a failure — an opt-out
 
 

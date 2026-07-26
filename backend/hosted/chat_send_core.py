@@ -154,6 +154,20 @@ def model_api_chat_send_core(
             )
             return {"error": "runtime_control_invalid"}, 503
 
+    # Dedicated vision is a V2-only routing decision. Resolve and pin it before
+    # persistence so a later Settings change cannot redirect already-accepted
+    # pixels. The V1 resident branch above remains untouched.
+    vision_route_id = ""
+    if has_image:
+        vision_route = db.model_api_vision_route(store.user_id)
+        effective_route = vision_route or db.model_api_active_route(store.user_id)
+        if not effective_route or str(
+            effective_route.get("vision_test_status") or "untested"
+        ) != "ok":
+            return {"error": "vision_model_required"}, 409
+        if vision_route:
+            vision_route_id = str(vision_route.get("id") or "")
+
     # V2 liveness guard: if every serve_worker
     # process is dead (crashed, not yet deployed, scaled to zero), enqueue_job
     # would still succeed and the message would queue in agent_jobs forever with
@@ -241,6 +255,8 @@ def model_api_chat_send_core(
         extra["client_msg_id"] = client_msg_id
     if has_image and image_mime:
         extra["image_mime"] = image_mime
+    if has_image and vision_route_id:
+        extra["vision_route_id"] = vision_route_id
     if has_image and message:
         # 带文字说明的图片：独立加密 caption，enclave history 解后填 content。
         caption_env, caption_err = core_envelope._build_shared_envelope_for_store(

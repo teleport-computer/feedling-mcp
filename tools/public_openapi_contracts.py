@@ -27,6 +27,7 @@ BODYLESS_OPERATIONS: set[Operation] = {
     ("post", "/v1/model_api/test"),
     ("post", "/v1/model_api/routes/{route_id}/activate"),
     ("post", "/v1/model_api/routes/{route_id}/test"),
+    ("post", "/v1/vision/routes/{route_id}/test"),
     ("post", "/v1/proactive/scheduled/fire"),
 }
 
@@ -808,6 +809,39 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "provider_result": "failure",
         },
     },
+    "VisionConfigUpdateRequest": {
+        "type": "object",
+        "required": ["mode"],
+        "properties": {
+            "mode": {"type": "string", "enum": ["follow_main", "dedicated"]},
+            "route_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Required when mode is dedicated.",
+            },
+        },
+        "if": {"properties": {"mode": {"const": "dedicated"}}, "required": ["mode"]},
+        "then": {"required": ["route_id"]},
+        "additionalProperties": False,
+    },
+    "VisionRouteCreateRequest": {
+        "type": "object",
+        "required": ["model"],
+        "properties": {
+            "provider": {"type": "string"},
+            "model": {"type": "string", "minLength": 1},
+            "api_key": {"type": "string", "minLength": 1, "writeOnly": True},
+            "credential_id": {"type": "string", "format": "uuid"},
+            "label": {"type": "string"},
+            "base_url": {"type": "string", "format": "uri"},
+            "context_window_tokens": {"type": "integer", "minimum": 8192},
+        },
+        "oneOf": [
+            {"required": ["api_key"], "not": {"required": ["credential_id"]}},
+            {"required": ["credential_id"], "not": {"required": ["api_key"]}},
+        ],
+        "additionalProperties": False,
+    },
     "HostedChatAcceptedResponse": {
         "type": "object",
         "required": ["status", "reply_ready", "user_message", "runtime"],
@@ -1586,6 +1620,8 @@ PRECISE_JSON_BODIES: dict[Operation, str] = {
     ("post", "/v1/model_api/chat/send"): "HostedChatSendRequest",
     ("post", "/v1/model_api/models"): "ModelApiModelsRequest",
     ("post", "/v1/model_api/runtime_error"): "ModelApiRuntimeErrorRequest",
+    ("put", "/v1/vision/config"): "VisionConfigUpdateRequest",
+    ("post", "/v1/vision/config"): "VisionRouteCreateRequest",
     ("post", "/v1/chat/message"): "ChatTransportRequest",
     ("post", "/v1/chat/response"): "ChatResponseRequest",
     ("post", "/v1/chat/turn-activity/{turn_id}/events"): "ChatActivityEventRequest",

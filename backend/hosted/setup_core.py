@@ -19,9 +19,14 @@ is ever introduced here. Module-level references (``provider_client``,
 
 from __future__ import annotations
 
+import base64
 import os
+import random
+import re
+import struct
 import threading
 import uuid
+import zlib
 from functools import wraps
 
 import db
@@ -41,6 +46,13 @@ from model_api_runtime.v2 import prompt_frontier
 
 _REASONING_EFFORT_OFF = {"off", "none", "no", "false", "0", "disabled"}
 _REASONING_EFFORT_LEVELS = {"low", "medium", "high"}
+_VISION_COLORS = {
+    "red": (224, 67, 54),
+    "green": (52, 168, 83),
+    "blue": (66, 133, 244),
+    "yellow": (251, 188, 4),
+}
+_VISION_TEST_LOCKS = tuple(threading.Lock() for _ in range(32))
 
 
 def _prompt_frontier_runtime_numbers() -> tuple[dict[str, int], int, int]:
@@ -186,6 +198,255 @@ def _public_route(route: dict | None) -> dict:
     if route.get("context_window_tokens") is not None:
         safe["context_window_tokens"] = int(route["context_window_tokens"])
     return safe
+
+
+def _public_saved_route(route: dict | None) -> dict | None:
+    """Project a saved route without returning its credential envelope."""
+    if not route:
+        return None
+    return {key: value for key, value in route.items() if key != "api_key_envelope"}
+
+
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    checksum = zlib.crc32(kind + data)
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
+
+
+def _vision_probe_image() -> tuple[str, str]:
+    """Return a random four-stripe PNG and its unpredictable answer."""
+    names = list(_VISION_COLORS)
+    random.SystemRandom().shuffle(names)
+    width, height = 96, 24
+    scanlines = bytearray()
+    for _ in range(height):
+        scanlines.append(0)
+        for x in range(width):
+            scanlines.extend(_VISION_COLORS[names[min(x // 24, 3)]])
+    png = b"\x89PNG\r\n\x1a\n"
+    png += _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    png += _png_chunk(b"IDAT", zlib.compress(bytes(scanlines), 9))
+    png += _png_chunk(b"IEND", b"")
+    return base64.b64encode(png).decode("ascii"), ",".join(names)
+
+
+def _vision_test_lock(user_id: str, route_id: str):
+    return _VISION_TEST_LOCKS[hash((user_id, route_id)) % len(_VISION_TEST_LOCKS)]
+
+
+def _vision_runtime_v2_enabled(store) -> bool:
+    """Dedicated vision is a Hosted Runtime V2 capability only."""
+    try:
+        return (
+            accounts_onboarding._load_onboarding_route(store) == "model_api"
+            and hosted_config_store.hosted_runtime_v2_enabled_strict(store)
+        )
+    except Exception:
+        return False
+
+
+def _cached_vision_verdict(route: dict, *, include_failed: bool):
+    status = str(route.get("vision_test_status") or "untested")
+    if status == "ok":
+        return True, None
+    detail = str(route.get("last_vision_test_error") or "")
+    if status == "unsupported":
+        return True, ({"error": "vision_model_unsupported", "detail": detail}, 400)
+    if status == "failed" and include_failed:
+        body = {"error": "vision_model_test_failed", "detail": detail}
+        match = re.search(r"provider_http_(\d{3})", detail)
+        if match:
+            body["status_code"] = int(match.group(1))
+        return True, (body, 400)
+    return False, None
+
+
+def _test_route_vision_or_error(
+    store,
+    route: dict,
+    caller_api_key: str | None,
+    *,
+    runtime_token: str = "",
+    reuse_cached: bool = False,
+):
+    """Serialize a route's visual probe and reuse an already-known verdict."""
+    route_id = str(route.get("id") or "")
+    initial_test_at = str(route.get("last_vision_test_at") or "")
+    with _vision_test_lock(store.user_id, route_id):
+        current = db.model_api_route_get(store.user_id, route_id)
+        if not current:
+            return {"error": "route_not_found"}, 404
+        concurrent_verdict = bool(current.get("last_vision_test_at")) and (
+            str(current.get("last_vision_test_at")) != initial_test_at
+        )
+        if reuse_cached or concurrent_verdict:
+            handled, verdict = _cached_vision_verdict(
+                current,
+                include_failed=concurrent_verdict,
+            )
+            if handled:
+                return verdict
+        return _run_route_vision_test_or_error(
+            store,
+            current,
+            caller_api_key,
+            runtime_token=runtime_token,
+        )
+
+
+def _run_route_vision_test_or_error(
+    store,
+    route: dict,
+    caller_api_key: str | None,
+    *,
+    runtime_token: str = "",
+):
+    """Prove that a saved route can inspect pixels, not merely answer text."""
+    envelope = route.get("api_key_envelope")
+    if not isinstance(envelope, dict):
+        credential = db.model_api_credential_get(store.user_id, route["credential_id"])
+        envelope = (credential or {}).get("api_key_envelope")
+    if not isinstance(envelope, dict):
+        return {"error": "model_api_key_envelope_missing"}, 404
+    decrypt_kwargs = {"runtime_token": runtime_token} if runtime_token else {}
+    try:
+        provider_key = core_enclave._decrypt_envelope_via_enclave(
+            envelope,
+            caller_api_key,
+            purpose="model_api_provider_key",
+            **decrypt_kwargs,
+        ).decode("utf-8")
+    except Exception as exc:
+        return {
+            "error": "model_api_key_decrypt_failed",
+            "detail": str(exc)[:220],
+        }, 400
+
+    image_b64, expected = _vision_probe_image()
+    prompt = (
+        "This is a capability check. The image has four solid color stripes. "
+        "Reply with only their colors from left to right, using lowercase English "
+        "names separated by commas."
+    )
+    try:
+        result = provider_client.chat_completion(
+            provider_client.ProviderConfig(
+                route["provider"],
+                route["model"],
+                provider_key,
+                route["base_url"],
+                context_window_tokens=route.get("context_window_tokens"),
+            ),
+            [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                    },
+                ],
+            }],
+            max_tokens=80,
+            temperature=None,
+            timeout=45.0,
+            include_reasoning=False,
+        )
+    except provider_client.ProviderError as exc:
+        unsupported = exc.status_code in {400, 415, 422}
+        status = "unsupported" if unsupported else "failed"
+        error_slug = (
+            "vision_model_unsupported" if unsupported else "vision_model_test_failed"
+        )
+        if not db.model_api_route_mark_vision_test(
+            store.user_id,
+            route["id"],
+            status=status,
+            error=str(exc),
+        ):
+            return {"error": "model_api_route_write_failed"}, 500
+        return {
+            "error": error_slug,
+            "detail": str(exc),
+            "status_code": exc.status_code,
+        }, 400
+
+    reply = str(result.get("reply") or "").strip().lower()
+    observed = ",".join(re.findall(r"red|green|blue|yellow", reply)[:4])
+    if observed != expected:
+        detail = "The model did not identify the visual test image correctly."
+        if not db.model_api_route_mark_vision_test(
+            store.user_id,
+            route["id"],
+            status="unsupported",
+            error=detail,
+        ):
+            return {"error": "model_api_route_write_failed"}, 500
+        return {"error": "vision_model_unsupported", "detail": detail}, 400
+    if not db.model_api_route_mark_vision_test(
+        store.user_id,
+        route["id"],
+        status="ok",
+    ):
+        return {"error": "model_api_route_write_failed"}, 500
+    return None
+
+
+def _vision_config_payload(store) -> dict:
+    onboarding_route = accounts_onboarding._load_onboarding_route(store)
+    active = db.model_api_active_route(store.user_id)
+    runtime_v2 = onboarding_route == "model_api" and _vision_runtime_v2_enabled(store)
+    dedicated = db.model_api_vision_route(store.user_id) if runtime_v2 else None
+
+    if onboarding_route == "model_api":
+        main = {
+            "source": "model_api",
+            "route_id": (active or {}).get("id"),
+            "provider": (active or {}).get("provider", ""),
+            "model": (active or {}).get("model", ""),
+            "vision_test_status": (
+                active.get("vision_test_status", "untested")
+                if active
+                else "not_configured"
+            ),
+            "last_vision_test_error": (active or {}).get(
+                "last_vision_test_error", ""
+            ),
+        }
+    else:
+        main = {
+            "source": "resident",
+            "route_id": None,
+            "provider": "",
+            "model": "",
+            "vision_test_status": "managed_by_vps",
+            "last_vision_test_error": "",
+        }
+
+    mode = "dedicated" if dedicated else "follow_main"
+    if not runtime_v2:
+        effective_status = (
+            "managed_by_vps"
+            if onboarding_route != "model_api"
+            else "runtime_v2_required"
+        )
+    else:
+        effective_status = (
+            dedicated.get("vision_test_status", "untested")
+            if dedicated
+            else main["vision_test_status"]
+        )
+    return {
+        "available": runtime_v2,
+        "runtime": "v2" if runtime_v2 else "legacy_or_resident",
+        "unavailable_reason": (
+            "" if runtime_v2 else "hosted_runtime_v2_required"
+        ),
+        "mode": mode,
+        "onboarding_route": onboarding_route,
+        "main_model": main,
+        "dedicated_route": _public_saved_route(dedicated),
+        "effective_status": effective_status,
+    }
 
 
 def _resolve_provider_key(store, raw_key: str, existing: dict | None,
@@ -613,6 +874,128 @@ def model_api_key_envelope(store) -> tuple[dict, int]:
     if not isinstance(envelope, dict):
         return {"error": "model_api_key_envelope_missing"}, 404
     return {"api_key_envelope": envelope}, 200
+
+
+def vision_config_get(store) -> tuple[dict, int]:
+    return {"config": _vision_config_payload(store)}, 200
+
+
+@_serialized_model_api_mutation
+def vision_config_set(
+    store,
+    payload: dict,
+    *,
+    caller_api_key: str | None,
+) -> tuple[dict, int]:
+    if not _vision_runtime_v2_enabled(store):
+        return {
+            "error": "vision_runtime_v2_required",
+            "config": _vision_config_payload(store),
+        }, 409
+
+    mode = str(payload.get("mode") or "").strip().lower()
+    if mode not in {"follow_main", "dedicated"}:
+        return {"error": "invalid_vision_mode"}, 400
+
+    if mode == "dedicated":
+        route_id = str(payload.get("route_id") or "").strip()
+        route = db.model_api_route_get(store.user_id, route_id) if route_id else None
+        if not route:
+            return {"error": "route_not_found"}, 404
+    else:
+        route = db.model_api_active_route(store.user_id)
+        if not route:
+            return {"error": "model_api_not_configured"}, 404
+
+    test_error = _test_route_vision_or_error(store, route, caller_api_key)
+    warning = None
+    if test_error is not None:
+        error_body, _ = test_error
+        if error_body.get("error") != "vision_model_unsupported":
+            return test_error
+        # Keep an explicit text-only selection visible while send-time V2
+        # admission remains fail-closed on its persisted unsupported verdict.
+        warning = error_body
+
+    changed = (
+        db.model_api_route_set_vision(store.user_id, route["id"])
+        if mode == "dedicated"
+        else db.model_api_route_clear_vision(store.user_id)
+    )
+    if not changed:
+        return {"error": "model_api_route_write_failed"}, 500
+    body = {"config": _vision_config_payload(store)}
+    if warning is not None:
+        body["warning"] = warning
+    return body, 200
+
+
+@_serialized_model_api_mutation
+def vision_route_configure(
+    store,
+    payload: dict,
+    *,
+    caller_api_key: str | None,
+) -> tuple[dict, int]:
+    """Create or reuse a route, then probe and select it for V2 images."""
+    if not _vision_runtime_v2_enabled(store):
+        return {
+            "error": "vision_runtime_v2_required",
+            "config": _vision_config_payload(store),
+        }, 409
+
+    route_ids_before = {
+        str(route.get("id") or "")
+        for route in db.model_api_routes_list(store.user_id)
+    }
+    create_payload = {**payload, "activate": False}
+    created, status = model_api_route_create.__wrapped__(
+        store,
+        create_payload,
+        caller_api_key=caller_api_key,
+    )
+    if status != 200:
+        return created, status
+    route = created.get("route")
+    if not isinstance(route, dict):
+        return {"error": "model_api_route_write_failed"}, 500
+    selected, selected_status = vision_config_set.__wrapped__(
+        store,
+        {"mode": "dedicated", "route_id": route["id"]},
+        caller_api_key=caller_api_key,
+    )
+    route_id = str(route.get("id") or "")
+    if selected_status != 200 and route_id not in route_ids_before:
+        if str(payload.get("credential_id") or "").strip():
+            db.model_api_route_delete(store.user_id, route_id)
+        else:
+            credential_id = str(route.get("credential_id") or "")
+            if credential_id:
+                db.model_api_credential_delete(store.user_id, credential_id)
+    return selected, selected_status
+
+
+@_serialized_model_api_mutation
+def vision_route_test(
+    store,
+    route_id: str,
+    *,
+    caller_api_key: str | None,
+) -> tuple[dict, int]:
+    if not _vision_runtime_v2_enabled(store):
+        return {"error": "vision_runtime_v2_required"}, 409
+    route = db.model_api_route_get(store.user_id, route_id)
+    if not route:
+        return {"error": "route_not_found"}, 404
+    error = _test_route_vision_or_error(store, route, caller_api_key)
+    if error is not None:
+        return error
+    return {
+        "status": "ok",
+        "route": _public_saved_route(
+            db.model_api_route_get(store.user_id, route_id)
+        ),
+    }, 200
 
 
 def _test_active_route(store, route: dict, api_key: str | None) -> tuple[dict, int] | None:

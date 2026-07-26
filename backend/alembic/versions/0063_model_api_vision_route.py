@@ -1,13 +1,13 @@
-"""Add an optional dedicated vision role to saved model routes.
+"""Add a dedicated Runtime V2 vision role to saved model routes.
 
-Revision ID: 0023_model_api_vision_route
+Revision ID: 0063_model_api_vision_route
 """
 
 from alembic import op
 
 
-revision = "0023_model_api_vision_route"
-down_revision = "0022_notify_relay"
+revision = "0063_model_api_vision_route"
+down_revision = "0062_chat_activity_lookup_idx"
 branch_labels = None
 depends_on = None
 

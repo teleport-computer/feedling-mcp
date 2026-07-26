@@ -84,6 +84,11 @@
 | `model_catalog_rate_limited` | 429 | user_provider | 目录拉取上游 429 限流，保留输入可重试 | ✅ |
 | `model_catalog_temporarily_unavailable` | 503 | user_provider | 目录拉取上游超时/网络/408/425/所有 5xx，可重试 | ✅ |
 | `model_catalog_invalid_response` | 400 | user_provider | 目录拉取上游非 JSON/超限/坏 shape/其余 4xx（400/404/422 等），非鉴权问题 | ✅ |
+| `vision_runtime_v2_required` | 409 | user_environment | 专用视觉路由仅支持 Hosted Runtime V2；V1/VPS 旧图片链路不变 | ✅ |
+| `vision_model_required` | 409 | user_provider | V2 图片发送前没有已验证可用的视觉路由；消息尚未落库 | ✅ |
+| `vision_model_unsupported` | 400 | user_provider | 候选模型未正确识别随机视觉测试图；可保留选择但图片发送仍被阻止 | ✅ |
+| `vision_model_test_failed` | 400 | user_provider | 视觉能力验证因鉴权、额度、网络或 provider 错误未完成 | ✅ |
+| `invalid_vision_mode` | 400 | user_provider | mode 不是 follow_main 或 dedicated | |
 
 ## `GET /v1/model_api/usage`（provider 账单/额度查询）
 

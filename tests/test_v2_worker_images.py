@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from model_api_runtime.v2 import worker
@@ -98,3 +100,67 @@ def test_injection_cap_covers_any_image_ingestion_accepts():
         f"{max_ingested_b64_len} of the ingestion cap "
         f"{MODEL_API_MAX_IMAGE_BYTES} bytes — images in the dead zone are "
         f"accepted at send but dropped to text-only at the turn")
+
+
+def test_dedicated_image_becomes_untrusted_observation_not_raw_pixels():
+    tail = [{
+        **_img_row("m1", caption="这张图怎么了"),
+        "vision_route_id": "vision-route",
+    }]
+    raw_reads = []
+    observer_calls = []
+
+    def read_images(user_id, message_ids):
+        raw_reads.append((user_id, message_ids))
+        return {"m1": {"image_mime": "image/png", "image_b64": "RAW"}}
+
+    def observe(user_id, targets):
+        observer_calls.append((user_id, targets))
+        return {"m1": "A blue chart with a rising line."}
+
+    out = worker._inject_tail_images(
+        tail,
+        user_id="u",
+        read_images=read_images,
+        active_image_ids={"m1"},
+        read_vision_observations=observe,
+    )
+
+    assert raw_reads == []
+    assert observer_calls == [(
+        "u",
+        [{"message_id": "m1", "route_id": "vision-route"}],
+    )]
+    assert isinstance(out[0]["content"], str)
+    assert "UNTRUSTED VISUAL OBSERVATION" in out[0]["content"]
+    assert "A blue chart with a rising line." in out[0]["content"]
+    assert "image_url" not in out[0]["content"]
+
+
+def test_dedicated_observer_failure_is_explicit_and_never_falls_back():
+    tail = [{**_img_row("m1"), "vision_route_id": "vision-route"}]
+
+    def observe(_user_id, _targets):
+        raise RuntimeError("provider down")
+
+    with pytest.raises(worker.DedicatedVisionUnavailable):
+        worker._inject_tail_images(
+            tail,
+            user_id="u",
+            read_images=lambda *_args: pytest.fail("raw fallback is forbidden"),
+            active_image_ids={"m1"},
+            read_vision_observations=observe,
+        )
+
+
+def test_historical_dedicated_image_is_not_observed_or_resent():
+    tail = [{**_img_row("m1"), "vision_route_id": "vision-route"}]
+    out = worker._inject_tail_images(
+        tail,
+        user_id="u",
+        read_images=lambda *_args: pytest.fail("raw pixels must not be read"),
+        active_image_ids=set(),
+        read_vision_observations=lambda *_args: pytest.fail("observer must not rerun"),
+    )
+
+    assert out[0]["content"] == "[image]"

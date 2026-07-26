@@ -114,16 +114,6 @@ async def vision_route_test(route_id: str, request: Request,
     return JSONResponse(body, status_code=status)
 
 
-@router.get("/v1/vision/key_envelope")
-async def vision_key_envelope(route_id: str = "", auth: AuthResult = Depends(require_auth)):
-    body, status = await threadpool.run_db(
-        setup_core.vision_key_envelope,
-        auth.store,
-        route_id,
-    )
-    return JSONResponse(body, status_code=status)
-
-
 @router.post("/v1/model_api/test")
 async def model_api_test(request: Request, auth: AuthResult = Depends(require_auth)):
     api_key = auth_core.extract_api_key(request.headers, request.query_params)

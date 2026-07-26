@@ -67,8 +67,8 @@ For an image turn, add `image_b64` and `image_mime`. The decoded image limit is
 
 ### Image model selection
 
-An account can either use its main model for images or select a separate saved
-model route as an image observer. Read the current choice with `GET
+On Hosted Runtime V2, a model-API account can either use its main model for
+images or select a separate saved model route as an image observer. Read the current choice with `GET
 /v1/vision/config`, and change it with `PUT /v1/vision/config`:
 
 ```json
@@ -83,8 +83,7 @@ and records whether the returned observation proves image understanding.
 Selection and capability are separate: a reachable text-only model may remain
 selected with `effective_status: "unsupported"`, but an image send then returns
 `409 vision_model_required` before storing the turn. `mode: "follow_main"`
-performs the same check for a model-API main route; a VPS main model remains
-owned and validated by that VPS runtime.
+performs the same check for a model-API main route.
 
 Use `POST /v1/vision/config` when adding a dedicated image model. It creates or
 reuses the saved route, runs the generated-image check, and selects the route
@@ -93,18 +92,22 @@ saved and selected with an `unsupported` warning, while authentication,
 provider, quota, and other operational failures remove only the route or
 credential created by that request.
 
-When a dedicated route is configured, the resident sends pixels only to that
+When a dedicated route is configured, the V2 worker sends pixels only to that
 route. It asks for a neutral visual observation, marks the result as untrusted
 data, and passes only that text to the main agent. A vision-call failure does
 not fall back to sending the raw image to the main model.
 
 `POST /v1/vision/routes/{route_id}/test` repeats the capability check without
 changing the selection. Each accepted image turn records the dedicated route it
-preflighted. The resident passes that id as `GET /v1/vision/key_envelope?route_id=...`,
-so changing Settings cannot reroute an already queued image. If the pinned route
-was deleted, the turn fails instead of exposing raw pixels to the main model.
-Without `route_id`, the endpoint returns the currently selected route. Both forms
-return the provider credential's encrypted envelope, never the plaintext key.
+preflighted, so changing Settings cannot reroute an already queued image. The V2
+worker reads that exact route and decrypts its credential inside the enclave. If
+the pinned route was deleted, the turn fails instead of exposing raw pixels to
+the main model.
+
+This configuration surface is intentionally unavailable to Runtime V1 and VPS
+resident accounts. `GET /v1/vision/config` reports the boundary, while mutation
+endpoints return `409 vision_runtime_v2_required`; their existing image paths are
+not changed by this feature.
 
 For a document, use `file_b64`, `file_name`, and `file_mime` instead. The decoded
 file limit is 25 MiB. PDF, DOCX, XLSX, supported images, and UTF-8 text/source

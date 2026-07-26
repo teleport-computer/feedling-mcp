@@ -8433,9 +8433,11 @@ _ROUTE_COLUMNS = """
     r.id::text, r.credential_id::text, c.provider, r.model, c.label,
     c.api_key_hint, c.base_url, c.supports_responses,
     COALESCE(r.reasoning_effort, ''), r.context_window_tokens,
-    r.is_active, r.test_status,
+    r.is_active, r.is_vision, r.test_status,
     COALESCE(to_char(r.last_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
-    r.last_test_error, r.last_runtime_error, r.last_runtime_error_class,
+    r.last_test_error, r.vision_test_status,
+    COALESCE(to_char(r.last_vision_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
+    r.last_vision_test_error, r.last_runtime_error, r.last_runtime_error_class,
     COALESCE(to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
     COALESCE(to_char(r.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '')
 """
@@ -8447,10 +8449,12 @@ def _route_row_to_dict(row: tuple) -> dict:
         "credential_label": row[4], "api_key_hint": row[5], "base_url": row[6],
         "supports_responses": bool(row[7]), "reasoning_effort": row[8],
         "context_window_tokens": int(row[9]) if row[9] is not None else None,
-        "is_active": bool(row[10]), "test_status": row[11], "last_test_at": row[12],
-        "last_test_error": row[13], "last_runtime_error": row[14],
-        "last_runtime_error_class": row[15],
-        "created_at": row[16], "updated_at": row[17],
+        "is_active": bool(row[10]), "is_vision": bool(row[11]),
+        "test_status": row[12], "last_test_at": row[13], "last_test_error": row[14],
+        "vision_test_status": row[15], "last_vision_test_at": row[16],
+        "last_vision_test_error": row[17], "last_runtime_error": row[18],
+        "last_runtime_error_class": row[19],
+        "created_at": row[20], "updated_at": row[21],
     }
 
 
@@ -8566,11 +8570,21 @@ def model_api_credential_update(user_id: str, credential_id: str, *,
     params += [user_id, credential_id]
     try:
         with get_pool().connection() as conn:
-            cur = conn.execute(
-                f"UPDATE model_api_credentials SET {', '.join(sets)} "
-                "WHERE user_id = %s AND id = %s",
-                tuple(params),
-            )
+            with conn.transaction():
+                cur = conn.execute(
+                    f"UPDATE model_api_credentials SET {', '.join(sets)} "
+                    "WHERE user_id = %s AND id = %s",
+                    tuple(params),
+                )
+                if api_key_envelope is not None and cur.rowcount > 0:
+                    conn.execute(
+                        "UPDATE model_api_routes SET "
+                        "vision_test_status = 'untested', "
+                        "last_vision_test_error = '', last_vision_test_at = NULL, "
+                        "updated_at = now() "
+                        "WHERE user_id = %s AND credential_id = %s",
+                        (user_id, credential_id),
+                    )
         return cur.rowcount > 0
     except Exception as e:
         log.error("[db] model_api_credential_update(%s,%s) failed: %s", user_id, credential_id, e)
@@ -8623,6 +8637,32 @@ def model_api_route_get(user_id: str, route_id: str) -> dict | None:
         return None
 
 
+def model_api_route_get_with_envelope(user_id: str, route_id: str) -> dict | None:
+    """Return one caller-owned route with its encrypted provider credential."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                f"SELECT {_ROUTE_COLUMNS}, c.api_key_envelope "
+                "FROM model_api_routes r "
+                "JOIN model_api_credentials c ON c.id = r.credential_id "
+                "WHERE r.user_id = %s AND r.id = %s",
+                (user_id, route_id),
+            ).fetchone()
+        if row is None:
+            return None
+        out = _route_row_to_dict(row)
+        out["api_key_envelope"] = row[-1]
+        return out
+    except Exception as e:
+        log.error(
+            "[db] model_api_route_get_with_envelope(%s,%s) failed: %s",
+            user_id,
+            route_id,
+            e,
+        )
+        return None
+
+
 def model_api_active_route(user_id: str) -> dict | None:
     """带 api_key_envelope —— 供 config_store 走 enclave 解密。"""
     try:
@@ -8644,6 +8684,27 @@ def model_api_active_route(user_id: str) -> dict | None:
         return out
     except Exception as e:
         log.error("[db] model_api_active_route(%s) failed: %s", user_id, e)
+        return None
+
+
+def model_api_vision_route(user_id: str) -> dict | None:
+    """Return the dedicated vision route with its encrypted credential."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                f"SELECT {_ROUTE_COLUMNS}, c.api_key_envelope "
+                "FROM model_api_routes r "
+                "JOIN model_api_credentials c ON c.id = r.credential_id "
+                "WHERE r.user_id = %s AND r.is_vision",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        out = _route_row_to_dict(row)
+        out["api_key_envelope"] = row[-1]
+        return out
+    except Exception as e:
+        log.error("[db] model_api_vision_route(%s) failed: %s", user_id, e)
         return None
 
 
@@ -8754,6 +8815,74 @@ def model_api_route_mark_test(user_id: str, route_id: str, *, status: str, error
         return cur.rowcount > 0
     except Exception as e:
         log.error("[db] model_api_route_mark_test(%s,%s) failed: %s", user_id, route_id, e)
+        return False
+
+
+def model_api_route_mark_vision_test(
+    user_id: str,
+    route_id: str,
+    *,
+    status: str,
+    error: str = "",
+) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                "UPDATE model_api_routes SET vision_test_status = %s, "
+                "       last_vision_test_error = %s, last_vision_test_at = now(), "
+                "       updated_at = now() WHERE user_id = %s AND id = %s",
+                (status, str(error or "")[:300], user_id, route_id),
+            )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error(
+            "[db] model_api_route_mark_vision_test(%s,%s) failed: %s",
+            user_id,
+            route_id,
+            e,
+        )
+        return False
+
+
+def model_api_route_set_vision(user_id: str, route_id: str) -> bool:
+    """Atomically assign one saved route as the user's V2 image observer."""
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                target = conn.execute(
+                    "SELECT 1 FROM model_api_routes "
+                    "WHERE user_id = %s AND id = %s FOR UPDATE",
+                    (user_id, route_id),
+                ).fetchone()
+                if target is None:
+                    return False
+                conn.execute(
+                    "UPDATE model_api_routes SET is_vision = FALSE, updated_at = now() "
+                    "WHERE user_id = %s AND is_vision AND id != %s",
+                    (user_id, route_id),
+                )
+                cur = conn.execute(
+                    "UPDATE model_api_routes SET is_vision = TRUE, updated_at = now() "
+                    "WHERE user_id = %s AND id = %s",
+                    (user_id, route_id),
+                )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error("[db] model_api_route_set_vision(%s,%s) failed: %s", user_id, route_id, e)
+        return False
+
+
+def model_api_route_clear_vision(user_id: str) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE model_api_routes SET is_vision = FALSE, updated_at = now() "
+                "WHERE user_id = %s AND is_vision",
+                (user_id,),
+            )
+        return True
+    except Exception as e:
+        log.error("[db] model_api_route_clear_vision(%s) failed: %s", user_id, e)
         return False
 
 

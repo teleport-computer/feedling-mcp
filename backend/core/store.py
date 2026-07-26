@@ -679,9 +679,9 @@ class UserStore:
                 # enclave expands them into decrypted memory context on read.
                 "quoted_memory_ids",
                 "image_mime",
-                # Dedicated visual route proven at image-send time. The resident
+                # Dedicated visual route proven at image-send time. Runtime V2
                 # resolves this exact caller-owned route so a concurrent Settings
-                # change cannot reroute pixels or fall through to the main model.
+                # change cannot reroute pixels or expose them to the main model.
                 "vision_route_id",
                 "file_name",
                 "file_mime",

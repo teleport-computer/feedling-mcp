@@ -36,6 +36,7 @@ EXPECTED_BODYLESS_POSTS = {
     ("post", "/v1/model_api/test"),
     ("post", "/v1/model_api/routes/{route_id}/activate"),
     ("post", "/v1/model_api/routes/{route_id}/test"),
+    ("post", "/v1/vision/routes/{route_id}/test"),
     ("post", "/v1/proactive/scheduled/fire"),
 }
 
@@ -64,6 +65,8 @@ EXPECTED_API_KEY_ONLY_OPERATIONS = {
 
 EXPECTED_CORE_BODY_REFS = {
     ("post", "/v1/model_api/chat/send"): "HostedChatSendRequest",
+    ("put", "/v1/vision/config"): "VisionConfigUpdateRequest",
+    ("post", "/v1/vision/config"): "VisionRouteCreateRequest",
     ("post", "/v1/chat/message"): "ChatTransportRequest",
     ("post", "/v1/chat/response"): "ChatResponseRequest",
     ("post", "/v1/chat/turn-activity/{turn_id}/events"): "ChatActivityEventRequest",
@@ -174,8 +177,10 @@ def test_public_operation_and_parameter_inventory(
     # 150 since POST /v1/model_api/models (BYOK model catalog listing, has a body).
     # 151 since GET /v1/chat/turn-activity/{turn_id} (V2 activity read model).
     # 152 and 70 bodies since V1 resident tool-activity event ingest.
-    assert len(operations) == 152
-    assert sum("requestBody" in operation for operation in operations.values()) == 70
+    # Vision routing adds GET/PUT/POST config plus POST route test; the two
+    # mutation endpoints carry request bodies.
+    assert len(operations) == 156
+    assert sum("requestBody" in operation for operation in operations.values()) == 72
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")
