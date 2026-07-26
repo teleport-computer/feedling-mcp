@@ -84,6 +84,11 @@ e2b==2.34.0
 # V2 production artifact reads use a registered sandbox provider instead.
 pypdf>=5,<6
 
+# Generated PDF downloads. Both the V1 resident agent-runner and the V2
+# serve-worker render model-authored source into real PDF bytes. Imported lazily
+# only when send_file targets .pdf; Word .docx uses the standard library.
+reportlab==5.0.0
+
 # Image downscaling at chat ingestion (backend/hosted/image_resize.py): bound an
 # oversized phone photo to ~1568px so it is stored/injected small instead of
 # rejected or dropped to text at the V2 turn. manylinux wheels bundle libjpeg/zlib

@@ -174,6 +174,19 @@ source and rendered output are limited to 1,000,000 bytes.
 The resident path is a queue-and-reply protocol. It does not accept plaintext
 message bodies.
 
+CLI residents (Claude, Codex, and Pi) can also generate native download cards.
+The agent writes UTF-8 Markdown-like source inside its private
+`$FEEDLING_HOME/outbound-files` directory and calls the resident `send-file`
+command with a user-visible filename. `.docx` and `.pdf` names are rendered into
+real Word and PDF bytes; an explicitly requested suffix cannot be replaced by
+Markdown. Clear file requests are completion-gated and get one bounded retry if
+the first agent response omits the file. The resident seals the primary text and
+every file separately, then sends them through `file_followups` on
+`POST /v1/chat/response`; the parent CAS and all message inserts commit in one
+transaction, preserving text-first/card-below ordering without partial success.
+Source and rendered output are each limited to 1,000,000 bytes, and staging
+rejects paths outside the per-user outbound directory.
+
 ### 1. The client stores a user message
 
 Encrypt the user text or attachment and post the complete envelope:

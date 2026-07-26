@@ -7388,6 +7388,62 @@ def chat_finalize_reply_once(
     return row[0], row[1]
 
 
+def chat_finalize_reply_sequence_once(
+    user_id: str,
+    parent_msg_id: str,
+    replies: list[tuple[str, float, dict]],
+    replied_fields: dict,
+) -> tuple[dict, list[dict]] | None:
+    """Atomically answer one parent with a text primary and file follow-ups.
+
+    The parent CAS and every reply INSERT share one transaction.  A duplicate
+    id or malformed follow-up rolls the whole sequence back, so clients never
+    observe a success bubble without the downloadable cards that belong below
+    it.  Losing the parent CAS is the only normal ``None`` result.
+    """
+    if not replies:
+        raise ValueError("reply sequence must not be empty")
+
+    parent_doc = None
+    inserted_docs: list[dict] = []
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+                cur.execute(
+                    "UPDATE chat_messages SET doc = doc || %s "
+                    "WHERE user_id = %s AND msg_id = %s "
+                    "AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+                    "AND COALESCE(doc->>'reply_message_id','') = '' "
+                    "RETURNING doc",
+                    (Jsonb(replied_fields), user_id, parent_msg_id),
+                )
+                parent_row = cur.fetchone()
+                if parent_row is None:
+                    return None
+                parent_doc = parent_row[0]
+                for reply_msg_id, reply_ts, reply_doc in replies:
+                    cur.execute(
+                        "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
+                        "VALUES (%s, %s, %s, %s) RETURNING doc",
+                        (
+                            user_id,
+                            reply_msg_id,
+                            reply_ts,
+                            Jsonb(reply_doc),
+                        ),
+                    )
+                    inserted_docs.append(cur.fetchone()[0])
+
+    from tee_shadow import mirror
+
+    mirror.execute(
+        _CHAT_FINALIZE_REPLY_PARENT_MIRROR_SQL,
+        (Jsonb(replied_fields), user_id, parent_msg_id),
+    )
+    return parent_doc, inserted_docs
+
+
 def chat_finalize_reply_post_commit(
     user_id: str, reply_doc: dict, max_messages: int
 ) -> None:

@@ -49,6 +49,9 @@ from push import service as push_service
 log = logging.getLogger(__name__)
 
 _ENVELOPE_REQUIRED = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
+_FILE_NAME_BIDI_CONTROLS = frozenset(
+    chr(code) for code in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))
+)
 
 
 def _stale_key_conflict(store: UserStore, envelope: dict) -> tuple[dict, int] | None:
@@ -773,6 +776,79 @@ def write_response(
     content_type = payload.get("content_type", "text")
     if content_type not in ("text", "image"):
         return {"error": "content_type must be 'text' or 'image'"}, 400
+    raw_file_followups = payload.get("file_followups")
+    file_followups: list[tuple[dict, dict]] = []
+    if raw_file_followups is not None:
+        if (
+            content_type != "text"
+            or not isinstance(raw_file_followups, list)
+            or not raw_file_followups
+            or len(raw_file_followups) > 8
+        ):
+            return {"error": "invalid file_followups"}, 400
+        for raw_followup in raw_file_followups:
+            if not isinstance(raw_followup, dict):
+                return {"error": "invalid file_followup"}, 400
+            followup_envelope = raw_followup.get("envelope")
+            if not isinstance(followup_envelope, dict):
+                return {"error": "file_followup envelope required"}, 400
+            missing = [
+                field for field in _ENVELOPE_REQUIRED
+                if not followup_envelope.get(field)
+            ]
+            if missing:
+                return {
+                    "error": "file_followup_envelope_missing_fields",
+                    "detail": missing,
+                }, 400
+            if followup_envelope["visibility"] not in ("shared", "local_only"):
+                return {"error": "invalid file_followup visibility"}, 400
+            if (
+                followup_envelope["visibility"] == "shared"
+                and not followup_envelope.get("K_enclave")
+            ):
+                return {
+                    "error": "shared file_followup requires K_enclave"
+                }, 400
+            conflict = _stale_key_conflict(store, followup_envelope)
+            if conflict is not None:
+                return conflict
+
+            file_name = str(raw_followup.get("file_name") or "").strip()
+            file_mime = str(raw_followup.get("file_mime") or "").strip().lower()
+            file_byte_count = raw_followup.get("file_byte_count")
+            if (
+                not file_name
+                or len(file_name) > 120
+                or file_name in {".", ".."}
+                or "/" in file_name
+                or "\\" in file_name
+                or any(not char.isprintable() for char in file_name)
+                or any(char in _FILE_NAME_BIDI_CONTROLS for char in file_name)
+            ):
+                return {"error": "invalid file_followup name"}, 400
+            if (
+                not file_mime
+                or len(file_mime) > 120
+                or any(not char.isprintable() for char in file_mime)
+            ):
+                return {"error": "invalid file_followup mime"}, 400
+            if (
+                type(file_byte_count) is not int
+                or file_byte_count <= 0
+                or file_byte_count > 1_000_000
+            ):
+                return {"error": "invalid file_followup size"}, 400
+            file_followups.append(
+                (
+                    followup_envelope,
+                    {
+                        "file_name": file_name,
+                        "file_mime": file_mime,
+                        "file_byte_count": file_byte_count,
+                    },
+                )
+            )
     thinking_envelope = payload.get("thinking_envelope")
     thinking_extra: dict = {}
     if thinking_envelope is not None:
@@ -817,6 +893,8 @@ def write_response(
         proactive_service.PROACTIVE_JOB_SOURCE,
     }:
         return {"error": "invalid source"}, 400
+    if file_followups and source != "chat":
+        return {"error": "file_followups are chat-only"}, 400
     # role: 消费者可声明 "system"（技术通知气泡，spec 2026-07-06-upstream-error-
     # surfacing）。白名单外一律落 openclaw——新增 role 前先过 spec 的 role 审计表。
     role = str(payload.get("role") or "openclaw").strip()
@@ -861,6 +939,8 @@ def write_response(
         extra["push_live_activity_requested"] = bool(payload.get("push_live_activity"))
     turn_failure_error_class = str(payload.get("turn_failure_error_class") or "")[:64]
     reply_to_message_id = _reply_to_message_id(payload)
+    if file_followups and not reply_to_message_id:
+        return {"error": "file_followups require reply_to_message_id"}, 400
     if reply_to_message_id and role != "system":
         # Verify acks are hidden, but their exact parent link is load-bearing:
         # verify_loop must not accept an unrelated concurrent agent reply.
@@ -907,8 +987,31 @@ def write_response(
             replied_fields["reply_error_class"] = turn_failure_error_class
             replied_fields["reply_blame"] = turn_failure_blame
             replied_fields["reply_user_text"] = turn_failure_user_text
-        finalized = store.finalize_chat_reply_once(
-            reply_to_message_id, candidate, replied_fields
+        candidates = [candidate]
+        previous_ts = float(candidate["ts"])
+        for followup_envelope, followup_extra in file_followups:
+            followup = store._build_chat_message(
+                role,
+                source,
+                followup_envelope,
+                content_type="file",
+                extra={
+                    **followup_extra,
+                    "reply_to_message_id": reply_to_message_id,
+                },
+            )
+            if float(followup["ts"]) <= previous_ts:
+                followup["ts"] = previous_ts + 0.000001
+            previous_ts = float(followup["ts"])
+            candidates.append(followup)
+        finalized = (
+            store.finalize_chat_reply_sequence_once(
+                reply_to_message_id, candidates, replied_fields
+            )
+            if file_followups
+            else store.finalize_chat_reply_once(
+                reply_to_message_id, candidate, replied_fields
+            )
         )
         if finalized is None:
             # The parent already carries a committed reply. finalize never
@@ -933,7 +1036,8 @@ def write_response(
                         "v": winner["v"],
                     }, 200
             return {"error": "already_answered", "reply_status": "replied"}, 409
-        _parent_doc, msg = finalized
+        _parent_doc, finalized_reply = finalized
+        msg = finalized_reply[0] if file_followups else finalized_reply
         _maybe_mark_first_chat_ok(store, reply_to_message_id)
     else:
         # System notices bypass reply exclusivity by design, as do ordinary

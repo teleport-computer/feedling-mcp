@@ -35,6 +35,7 @@ def test_consumer_env_drives_resident_in_cli_mode_for_claude():
     assert env["AGENT_SESSION_FILE"] == "/agent-data/users/u_1/agent-session.txt"
     assert env["AGENT_SESSION_MAX_TURNS"] == "24"   # host rotates sooner than VPS default (40)
     assert env["CLAUDE_CONFIG_DIR"] == "/agent-data/users/u_1/claude-home"
+    assert env["FEEDLING_HOME"] == "/agent-data/users/u_1"
     assert env["CONSUMER_ID"] == "agent-runner:u_1"
     assert env["PATH"] == "/bin" and env["FEEDLING_API_URL"] == "http://b:5001"  # base preserved
 
@@ -503,6 +504,8 @@ def test_agent_home_files_seeds_prompt_and_claude_permission_allow():
     assert any("io_cli.py perception" in rule for rule in allow)
     assert any("io_cli.py memory-index" in rule for rule in allow)
     assert any("io_cli.py identity-write" in rule for rule in allow)  # 7.D post-respawn tool + rename
+    assert any("io_cli.py send-file" in rule for rule in allow)
+    assert any("Write(//agent-data/users/u/outbound-files/**)" == rule for rule in allow)
     # identity-read: the agent could write its own card but not read it, so a rename
     # was a blind write and "你叫什么" had to be guessed. Granting the read closes both.
     assert any("io_cli.py identity-read" in rule for rule in allow)
@@ -678,6 +681,7 @@ def test_materialize_home_creates_image_dir_for_claude(tmp_path):
     assert (tmp_path / "u" / "images").is_dir()
     # Same for the chat-file dir the claude command --add-dir's every turn.
     assert (tmp_path / "u" / "files").is_dir()
+    assert (tmp_path / "u" / "outbound-files").is_dir()
 
 
 # ---- Stage D slice 3a: runtime-token file delivery ----

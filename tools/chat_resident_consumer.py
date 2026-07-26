@@ -93,6 +93,7 @@ import hashlib
 import io
 import json
 import logging
+import mimetypes
 import os
 import queue
 import re
@@ -136,6 +137,8 @@ from chat.reply_language import (
     infer_reply_language_policy,
     reply_language_system_line,
 )
+from model_api_runtime.v2 import context as downloadable_file_context
+from model_api_runtime.v2 import document_render as downloadable_document_render
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -170,6 +173,16 @@ class AgentTurn:
     actions: list[dict] = field(default_factory=list)
     runtime_debug: dict = field(default_factory=dict)
     tool_calls: list[dict] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class StagedChatFile:
+    """One resident-generated file waiting for the primary chat reply commit."""
+
+    source_path: str
+    name: str
+    mime_type: str
+    data: bytes
 
 
 @dataclass
@@ -285,6 +298,7 @@ FEEDLING_HOME = Path(
 )
 RESIDENT_IPC_SOCK = FEEDLING_HOME / "resident_ipc.sock"
 RESIDENT_IPC_STATE_FILE = FEEDLING_HOME / "resident_ipc_state.json"
+OUTBOUND_FILE_DIR = FEEDLING_HOME / "outbound-files"
 # The fingerprint scoping above only isolates accounts while FEEDLING_API_KEY is
 # non-empty. Host-all (Stage-D zero-roster) consumers run keyless, so sha1("")
 # collides for every user on the host and the /tmp defaults become ONE shared
@@ -6874,6 +6888,58 @@ _io_cli_catalog_injected_session_id: str | None = None
 _io_cli_catalog_pending_session_id: str | None = None
 
 
+def _outbound_file_prompt_block() -> str:
+    return (
+        "DOWNLOADABLE FILE DELIVERY: Interpret requests semantically. If the user "
+        "wants a reusable result to save/open/download/share, write UTF-8 "
+        f"Markdown-like source under {OUTBOUND_FILE_DIR}, then run `python "
+        f"{_IO_CLI_PATH} send-file --path <source_path> --name <download_name>`. "
+        "Use the requested suffix exactly (Word=.docx, PDF=.pdf); never substitute "
+        "Markdown, never ask for an internal path, and claim success only after "
+        "send-file returns ok. Tutorial questions alone do not require a file."
+    )
+
+
+def _required_outbound_file_suffixes(text: str) -> tuple[str, ...] | None:
+    return downloadable_file_context.required_file_suffixes(
+        [{"role": "user", "content": str(text or "")}]
+    )
+
+
+def _missing_outbound_file_suffixes(
+    requirement: tuple[str, ...] | None,
+    staged: list[StagedChatFile],
+) -> tuple[str, ...] | None:
+    if requirement is None:
+        return None
+    if not requirement:
+        return () if not staged else None
+    delivered = {Path(item.name).suffix.lower() for item in staged}
+    missing = tuple(suffix for suffix in requirement if suffix not in delivered)
+    return missing or None
+
+
+def _outbound_file_retry_prompt(
+    original_request: str, missing: tuple[str, ...]
+) -> str:
+    target = ", ".join(missing) if missing else "a suitable downloadable format"
+    return (
+        "The previous answer did not stage the file the user explicitly requested. "
+        f"Original user request: {str(original_request or '')[:2000]}\n"
+        f"Missing output: {target}. Create UTF-8 Markdown-like source under "
+        f"{OUTBOUND_FILE_DIR}, then run `python {_IO_CLI_PATH} send-file --path "
+        "<source_path> --name <download_name>`. Word must use .docx and PDF must "
+        "use .pdf. Do not substitute Markdown or claim success unless send-file "
+        "returns ok. Finish with one short user-facing reply after staging."
+    )
+
+
+def _outbound_file_failure_reply(text: str) -> str:
+    if re.search(r"[\u4e00-\u9fff]", str(text or "")):
+        return "这次没能生成你要求的可下载文件，请稍后再试。"
+    return "I couldn't generate the requested downloadable file this time. Please try again."
+
+
 def _prepend_io_cli_capability_catalog(content: str) -> str:
     """Prepend the live io_cli command catalog (io_cli_catalog.build_catalog,
     T6) to a foreground CLI turn, so a self-hosted resident's model always
@@ -6948,7 +7014,10 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
             # files/web pages/memory cards now that D2 (confirmation) is gone
             # (I2). Prepend D3 alone — cheap, doesn't need a subprocess, and
             # independent of whether the full --help sweep succeeds.
-            return f"{io_cli_catalog.D3_SOURCING_RULE}\n\n{content}"
+            return (
+                f"{io_cli_catalog.D3_SOURCING_RULE}\n"
+                f"{_outbound_file_prompt_block()}\n\n{content}"
+            )
         _io_cli_catalog_cache = catalog
 
     if not is_codex:
@@ -6956,7 +7025,7 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
         # _discard_io_cli_catalog_pending_injection docstrings above.
         _io_cli_catalog_pending_session_id = sid
 
-    return f"{catalog}\n\n{content}"
+    return f"{catalog}\n{_outbound_file_prompt_block()}\n\n{content}"
 
 
 def _commit_io_cli_catalog_injection() -> None:
@@ -8631,6 +8700,7 @@ def post_reply(
     turn_failure_error_class: str = "",
     turn_failure_blame: str = "",
     turn_failure_user_text: str = "",
+    file_followups: list[StagedChatFile] | None = None,
 ) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
 
@@ -8671,6 +8741,23 @@ def post_reply(
                 enclave_pk_bytes=seal_enc_pk,
                 visibility=visibility,
             )
+            sealed_file_followups = []
+            for file_item in file_followups or []:
+                file_envelope = _build_envelope(
+                    plaintext=bytes(file_item.data),
+                    owner_user_id=seal_user_id,
+                    user_pk_bytes=seal_user_pk,
+                    enclave_pk_bytes=seal_enc_pk,
+                    visibility=visibility,
+                )
+                sealed_file_followups.append(
+                    {
+                        "envelope": file_envelope,
+                        "file_name": file_item.name,
+                        "file_mime": file_item.mime_type,
+                        "file_byte_count": len(file_item.data),
+                    }
+                )
             thinking_envelope = None
             safe_thinking = _sanitize_thinking_summary(thinking_summary)
             if safe_thinking:
@@ -8710,6 +8797,8 @@ def post_reply(
                 body["turn_failure_user_text"] = turn_failure_user_text
             if reply_to_message_id:
                 body["reply_to_message_id"] = reply_to_message_id
+            if sealed_file_followups:
+                body["file_followups"] = sealed_file_followups
             if gate_decision_id:
                 body["gate_decision_id"] = gate_decision_id
             if proactive_job_id:
@@ -8745,6 +8834,10 @@ def post_reply(
             ) and _whoami_cache.get("user_pk"):
                 resp = _HTTP.post(url, json=_sealed_body(), headers=_HEADERS, timeout=15)
         return _handle_post_reply_response(resp)
+
+    if file_followups:
+        log.error("cannot post encrypted file followups without envelope encryption")
+        return {"error": "file_followup_encryption_unavailable"}
 
     # Encryption unavailable — plaintext path (will 400 on v1 backends).
     log.error(
@@ -11899,11 +11992,25 @@ def _process_messages(messages: list) -> float:
             if attempt_trigger != "first"
             else {}
         )
+        outbound_file_turn_active = source == "chat" and AGENT_MODE == "cli"
+        outbound_file_requirement = (
+            _required_outbound_file_suffixes(raw_user_content_for_lang)
+            if outbound_file_turn_active
+            else None
+        )
+        staged_outbound_files: list[StagedChatFile] = []
+        if outbound_file_turn_active:
+            try:
+                _begin_outbound_file_turn(trace_id, outbound_file_requirement)
+            except OSError as exc:
+                outbound_file_turn_active = False
+                log.error("cannot prepare outbound file directory: %s", exc)
         # 本回合失败时待发的 system 通知。不在失败当场发，而是等下面的回复写入被
         # 服务端接受（posted_any）后再发（Codex review）：claim 过期 failover 时另
         # 一个 consumer 已回复，本家的兜底会被 already_answered 409 拒——通知若先
         # 发就成了重复错误气泡。让通知与回复共享同一份排他性。
         pending_failure_notice: BaseException | None = None
+        pending_failure_is_parse_only = False
         try:
             # Discard any parse-failed marker left dangling by another lane
             # (proactive / verify_probe) running earlier in this single-threaded
@@ -11955,6 +12062,8 @@ def _process_messages(messages: list) -> float:
                 # 通知是边角，接受）。
                 _notify_agent_turn_failure(e, foreground=True)
                 log.warning("agent error fallback disabled by env; this user turn will not get a visible reply")
+                if outbound_file_turn_active:
+                    _finish_outbound_file_turn(trace_id)
                 latest = max(latest, ts)
                 continue
         else:
@@ -11969,10 +12078,60 @@ def _process_messages(messages: list) -> float:
                 pending_failure_notice = ValueError(
                     "agent produced no usable reply after sanitization"
                 )
+                pending_failure_is_parse_only = True
             else:
                 _note_agent_turn_success()
 
+        if outbound_file_turn_active:
+            staged_now = _staged_outbound_file_snapshot(trace_id)
+            missing = _missing_outbound_file_suffixes(
+                outbound_file_requirement, staged_now
+            )
+            if missing is not None and pending_failure_notice is None:
+                try:
+                    retry_result = call_agent(
+                        _outbound_file_retry_prompt(
+                            raw_user_content_for_lang, missing
+                        ),
+                        trace_id=trace_id,
+                        lane="chat",
+                    )
+                    if _consume_reply_parse_failed():
+                        pending_failure_is_parse_only = True
+                        raise ValueError(
+                            "file delivery retry produced no usable reply"
+                        )
+                    agent_result = retry_result
+                except Exception as exc:
+                    log.error("outbound file completion retry failed: %s", exc)
+                    pending_failure_notice = exc
+
+            staged_outbound_files = _finish_outbound_file_turn(trace_id)
+            still_missing = _missing_outbound_file_suffixes(
+                outbound_file_requirement, staged_outbound_files
+            )
+            if still_missing is not None:
+                staged_outbound_files = []
+                agent_result = {
+                    "messages": [
+                        _outbound_file_failure_reply(raw_user_content_for_lang)
+                    ]
+                }
+            elif staged_outbound_files and pending_failure_is_parse_only:
+                # A successfully staged file is itself a usable model result.
+                # Some CLI drivers emit no separate assistant text after the
+                # send-file tool call; synthesize the short confirmation below
+                # without misclassifying the completed turn as an agent error.
+                pending_failure_notice = None
+                _note_agent_turn_success()
+
         turn = _split_agent_turn(agent_result)
+        if staged_outbound_files and not turn.messages:
+            turn.messages = [
+                "文件已经准备好了。"
+                if re.search(r"[\u4e00-\u9fff]", raw_user_content_for_lang)
+                else "The file is ready."
+            ]
         _reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
         _emit_debug_trace(
             "agent", "agent.reply", trace_id=trace_id,
@@ -12091,6 +12250,8 @@ def _process_messages(messages: list) -> float:
                     post_kwargs.update(
                         turn_failure_post_kwargs(classify_agent_error(pending_failure_notice))
                     )
+                if idx == 0 and staged_outbound_files:
+                    post_kwargs["file_followups"] = staged_outbound_files
                 result = post_reply(reply, **post_kwargs)
                 if isinstance(result, dict) and result.get("error"):
                     if result.get("error") == "bootstrap_incomplete":
@@ -12247,7 +12408,211 @@ def _decrypt_sealed_material(env: dict) -> bytes:
     return base64.b64decode(b64)
 
 
-# ── identity-redistill local IPC (T11) ──────────────────────────────────────
+# ── resident local IPC: outbound files + identity redistill ─────────────────
+# Outbound-file staging is available to both hosted and self-hosted CLI
+# residents.  The model writes UTF-8 source under this user's private outbox;
+# io_cli asks this process to render and stage it.  Publication happens later,
+# in the same atomic response write as the primary text bubble.
+_OUTBOUND_FILE_MAX_BYTES = 1_000_000
+_OUTBOUND_FILE_SUFFIXES = frozenset(
+    {".docx", ".pdf", ".md", ".txt", ".csv", ".html", ".json", ".xml", ".yaml", ".yml", ".rtf"}
+)
+_OUTBOUND_FILE_MIMES = {
+    ".csv": "text/csv",
+    ".html": "text/html",
+    ".json": "application/json",
+    ".md": "text/markdown",
+    ".rtf": "text/rtf",
+    ".txt": "text/plain",
+    ".xml": "application/xml",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+}
+_OUTBOUND_FILE_BIDI_CONTROLS = frozenset(
+    chr(code) for code in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))
+)
+_outbound_file_lock = threading.Lock()
+_active_outbound_file_turn_id = ""
+_active_outbound_file_suffixes: tuple[str, ...] | None = None
+_staged_outbound_files: list[StagedChatFile] = []
+
+
+def _begin_outbound_file_turn(
+    turn_id: str, required_suffixes: tuple[str, ...] | None
+) -> None:
+    global _active_outbound_file_turn_id, _active_outbound_file_suffixes
+    OUTBOUND_FILE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(OUTBOUND_FILE_DIR, 0o700)
+    except OSError:
+        pass
+    with _outbound_file_lock:
+        _active_outbound_file_turn_id = str(turn_id or "")
+        _active_outbound_file_suffixes = required_suffixes
+        _staged_outbound_files.clear()
+
+
+def _staged_outbound_file_snapshot(turn_id: str) -> list[StagedChatFile]:
+    with _outbound_file_lock:
+        if str(turn_id or "") != _active_outbound_file_turn_id:
+            return []
+        return list(_staged_outbound_files)
+
+
+def _finish_outbound_file_turn(turn_id: str) -> list[StagedChatFile]:
+    global _active_outbound_file_turn_id, _active_outbound_file_suffixes
+    with _outbound_file_lock:
+        if str(turn_id or "") != _active_outbound_file_turn_id:
+            return []
+        staged = list(_staged_outbound_files)
+        _staged_outbound_files.clear()
+        _active_outbound_file_turn_id = ""
+        _active_outbound_file_suffixes = None
+    for item in staged:
+        try:
+            Path(item.source_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+    return staged
+
+
+def _safe_outbound_file_name(raw: str) -> str:
+    value = Path(str(raw or "").strip()).name
+    cleaned = "".join(
+        char
+        for char in value
+        if char.isprintable()
+        and char not in _OUTBOUND_FILE_BIDI_CONTROLS
+        and char not in {"\n", "\r", "\t", "\\"}
+    ).strip().strip(".")
+    if not cleaned:
+        raise ValueError("file_name_required")
+    suffix = Path(cleaned).suffix.lower()
+    if suffix not in _OUTBOUND_FILE_SUFFIXES:
+        raise ValueError("unsupported_file_suffix")
+    if len(cleaned) > 120:
+        stem = Path(cleaned).stem
+        cleaned = stem[: max(1, 120 - len(suffix))] + suffix
+    return cleaned
+
+
+def _outbound_file_mime(name: str) -> str:
+    suffix = Path(name).suffix.lower()
+    if suffix == ".docx":
+        return downloadable_document_render.DOCX_MIME
+    if suffix == ".pdf":
+        return downloadable_document_render.PDF_MIME
+    return (
+        _OUTBOUND_FILE_MIMES.get(suffix)
+        or mimetypes.guess_type(name)[0]
+        or "text/plain"
+    )
+
+
+def _handle_stage_file_ipc(msg: dict) -> dict:
+    """Validate, render, and stage one model-authored UTF-8 document source."""
+    request_id = str(msg.get("request_id") or "").strip()
+    raw_path = str(msg.get("path") or "").strip()
+    if not request_id:
+        return {"ok": False, "error": "request_id_required"}
+    if not raw_path:
+        return {"ok": False, "error": "path_required", "request_id": request_id}
+
+    with _outbound_file_lock:
+        active_turn_id = _active_outbound_file_turn_id
+        required_suffixes = _active_outbound_file_suffixes
+    if not active_turn_id:
+        return {
+            "ok": False,
+            "error": "no_active_chat_turn",
+            "request_id": request_id,
+        }
+
+    source_path = Path(raw_path)
+    if not source_path.is_absolute():
+        source_path = OUTBOUND_FILE_DIR / source_path
+    try:
+        resolved_dir = OUTBOUND_FILE_DIR.resolve()
+        resolved_path = source_path.resolve(strict=True)
+        resolved_path.relative_to(resolved_dir)
+    except (OSError, ValueError):
+        return {
+            "ok": False,
+            "error": "path_outside_outbound_dir",
+            "request_id": request_id,
+        }
+
+    try:
+        name = _safe_outbound_file_name(
+            str(msg.get("name") or resolved_path.name)
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc), "request_id": request_id}
+    suffix = Path(name).suffix.lower()
+    if required_suffixes and suffix not in required_suffixes:
+        return {
+            "ok": False,
+            "error": "wrong_file_suffix",
+            "required_suffixes": list(required_suffixes),
+            "request_id": request_id,
+        }
+
+    try:
+        source_bytes = resolved_path.read_bytes()
+        if not source_bytes or len(source_bytes) > _OUTBOUND_FILE_MAX_BYTES:
+            raise ValueError("file_source_empty_or_too_large")
+        source = source_bytes.decode("utf-8")
+        rendered = downloadable_document_render.render_download(name, source)
+        data = rendered[0] if rendered is not None else source_bytes
+        mime_type = rendered[1] if rendered is not None else _outbound_file_mime(name)
+        if not data or len(data) > _OUTBOUND_FILE_MAX_BYTES:
+            raise ValueError("rendered_file_empty_or_too_large")
+    except UnicodeDecodeError:
+        return {
+            "ok": False,
+            "error": "file_source_must_be_utf8",
+            "request_id": request_id,
+        }
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc), "request_id": request_id}
+
+    item = StagedChatFile(
+        source_path=str(resolved_path),
+        name=name,
+        mime_type=mime_type,
+        data=data,
+    )
+    with _outbound_file_lock:
+        if active_turn_id != _active_outbound_file_turn_id:
+            return {
+                "ok": False,
+                "error": "chat_turn_finished",
+                "request_id": request_id,
+            }
+        for existing in _staged_outbound_files:
+            if existing.source_path == item.source_path and existing.name == item.name:
+                item = existing
+                break
+        else:
+            if len(_staged_outbound_files) >= 8:
+                return {
+                    "ok": False,
+                    "error": "too_many_staged_files",
+                    "request_id": request_id,
+                }
+            _staged_outbound_files.append(item)
+    return {
+        "ok": True,
+        "staged": True,
+        "name": item.name,
+        "mime": item.mime_type,
+        "byte_count": len(item.data),
+        "request_id": request_id,
+    }
+
+
+# identity-redistill remains VPS/self-hosted-only even though it shares the
+# listener.  Hosted agents are granted send-file, never identity-redistill.
 # Terminal-facing door onto this same resident-distill lane: io_cli's
 # `identity-redistill` verb (VPS/self-hosted CLI only) connects to a local
 # Unix-domain socket and hands over PLAINTEXT material; THIS process client-
@@ -12426,9 +12791,10 @@ def _handle_redistill_ipc(msg: dict) -> dict:
 
 
 def _redistill_ipc_serve_forever(sock_path: Path) -> None:
-    """Single-connection-at-a-time Unix-socket IPC listener for io_cli's
-    identity-redistill verb. VPS/self-hosted CLI only — see the startup gate
-    at the call site in ``run()``. One local terminal caller at a time is the
+    """Single-connection-at-a-time Unix-socket IPC listener for io_cli.
+
+    ``stage_file`` serves every CLI resident; ``redistill`` remains reachable
+    only to a self-hosted caller. One local caller at a time is the
     whole use case, so a plain accept→handle→close loop (no thread pool) is
     enough; the handler's network POST just makes the NEXT local caller wait
     briefly in the OS accept backlog, which is fine for a one-shot command.
@@ -12491,7 +12857,7 @@ def _redistill_ipc_serve_forever(sock_path: Path) -> None:
         except Exception:
             pass
         return
-    log.info("redistill IPC listening on %s", sock_path)
+    log.info("resident IPC listening on %s", sock_path)
     while _running:
         try:
             conn, _addr = srv.accept()
@@ -12516,10 +12882,13 @@ def _redistill_ipc_serve_forever(sock_path: Path) -> None:
                 obj = json.loads(text.splitlines()[0]) if text else {}
             except Exception:
                 obj = {}
-            if not isinstance(obj, dict) or str(obj.get("op") or "") != "redistill":
-                reply = {"ok": False, "error": "unsupported_op"}
-            else:
+            op = str(obj.get("op") or "") if isinstance(obj, dict) else ""
+            if op == "stage_file":
+                reply = _handle_stage_file_ipc(obj)
+            elif op == "redistill" and not _HOSTED:
                 reply = _handle_redistill_ipc(obj)
+            else:
+                reply = {"ok": False, "error": "unsupported_op"}
             conn.sendall((json.dumps(reply, ensure_ascii=False) + "\n").encode("utf-8"))
         except Exception as e:
             log.error("redistill IPC: connection error: %s", e)
@@ -13082,13 +13451,9 @@ def run() -> None:
 
     _warn_if_agent_entry_may_drift()
 
-    # identity-redistill local IPC (T11): VPS/self-hosted CLI only — the SAME
-    # gate family as the io_cli capability-catalog injection
-    # (_prepend_io_cli_capability_catalog). Hosted (image-baked, V2
-    # registry-based tool calling) and http-backend agents have no io_cli.py
-    # to shell out to, so there is nothing on the other end of this socket —
-    # starting the listener there would just be a dead file descriptor.
-    if not _HOSTED and AGENT_MODE == "cli":
+    # Outbound-file staging is shared by hosted and self-hosted CLI residents.
+    # The redistill operation itself remains rejected for hosted callers.
+    if AGENT_MODE == "cli":
         threading.Thread(
             target=_redistill_ipc_serve_forever, args=(RESIDENT_IPC_SOCK,), daemon=True,
         ).start()

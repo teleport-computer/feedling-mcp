@@ -1,0 +1,432 @@
+"""V1 resident downloadable-file delivery regression coverage."""
+from __future__ import annotations
+
+import base64
+import os
+import sys
+import types
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import psycopg
+import pytest
+
+
+ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "backend"))
+
+os.environ.setdefault("FEEDLING_API_URL", "http://localhost:5001")
+os.environ.setdefault("FEEDLING_API_KEY", "test_key_00000000")
+os.environ.setdefault("AGENT_MODE", "cli")
+os.environ.setdefault("AGENT_CLI_CMD", "agent {message}")
+os.environ.setdefault("CHECKPOINT_FILE", "/tmp/feedling_v1_download_checkpoint.json")
+
+try:
+    import content_encryption  # noqa: F401
+except ModuleNotFoundError:
+    fake_encryption = types.ModuleType("content_encryption")
+    fake_encryption.build_envelope = lambda **kwargs: {"v": 1, **kwargs}
+    sys.modules.setdefault("content_encryption", fake_encryption)
+
+import db  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
+from chat import chat_core  # noqa: E402
+from core import store as core_store  # noqa: E402
+from model_api_runtime.v2 import document_render  # noqa: E402
+from tools import chat_resident_consumer as resident  # noqa: E402
+
+
+def _b64(raw: bytes) -> str:
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _envelope(user_id: str, msg_id: str) -> dict:
+    return {
+        "v": 1,
+        "id": msg_id,
+        "body_ct": _b64(f"ciphertext:{msg_id}".encode()),
+        "nonce": _b64(b"\x00" * 12),
+        "K_user": _b64(b"\x01" * 32),
+        "K_enclave": _b64(b"\x02" * 32),
+        "visibility": "shared",
+        "owner_user_id": user_id,
+    }
+
+
+@pytest.fixture()
+def store(backend_env):
+    response = make_client().post(
+        "/v1/users/register",
+        json={"public_key": _b64(b"\x11" * 32), "archive_language": "en"},
+    )
+    assert response.status_code == 201
+    return core_store.get_store(response.get_json()["user_id"])
+
+
+def _quiet_response_side_effects(monkeypatch):
+    monkeypatch.setattr(
+        chat_core.chat_consumer, "_record_consumer_event", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        chat_core.debug_trace, "trace_event", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(chat_core, "_maybe_mark_first_chat_ok", lambda *args: None)
+    monkeypatch.setattr(core_store.wake_bus, "notify", lambda *args: None)
+    from proactive import capture_scheduler
+
+    monkeypatch.setattr(capture_scheduler, "record_chat_append", lambda *args: {})
+
+
+def test_v1_text_and_file_followup_commit_as_one_ordered_reply(
+    store, monkeypatch
+):
+    _quiet_response_side_effects(monkeypatch)
+    parent = store.append_chat(
+        "user", "chat", _envelope(store.user_id, "v1_file_parent")
+    )
+
+    body, status = chat_core.write_response(
+        store,
+        {
+            "envelope": _envelope(store.user_id, "v1_file_primary"),
+            "reply_to_message_id": parent["id"],
+            "file_followups": [
+                {
+                    "envelope": _envelope(store.user_id, "v1_file_card"),
+                    "file_name": "一日计划.docx",
+                    "file_mime": document_render.DOCX_MIME,
+                    "file_byte_count": 1234,
+                }
+            ],
+        },
+        consumer_id="resident-v1",
+        consumer_info={},
+        allow_verify_reply=False,
+    )
+
+    assert status == 200
+    assert body["id"] == "v1_file_primary"
+    rows = db.chat_load(store.user_id)
+    persisted_parent = next(row for row in rows if row["id"] == parent["id"])
+    primary = next(row for row in rows if row["id"] == "v1_file_primary")
+    card = next(row for row in rows if row["id"] == "v1_file_card")
+    assert persisted_parent["reply_message_id"] == primary["id"]
+    assert primary["content_type"] == "text"
+    assert card["content_type"] == "file"
+    assert card["file_name"] == "一日计划.docx"
+    assert card["file_mime"] == document_render.DOCX_MIME
+    assert card["file_byte_count"] == 1234
+    assert card["reply_to_message_id"] == parent["id"]
+    assert float(card["ts"]) > float(primary["ts"])
+
+
+def test_v1_file_sequence_rolls_back_if_followup_insert_fails(store, monkeypatch):
+    _quiet_response_side_effects(monkeypatch)
+    parent = store.append_chat(
+        "user", "chat", _envelope(store.user_id, "v1_atomic_parent")
+    )
+    store.append_chat(
+        "openclaw", "chat", _envelope(store.user_id, "v1_collision")
+    )
+
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        chat_core.write_response(
+            store,
+            {
+                "envelope": _envelope(store.user_id, "v1_rolled_back_primary"),
+                "reply_to_message_id": parent["id"],
+                "file_followups": [
+                    {
+                        "envelope": _envelope(store.user_id, "v1_collision"),
+                        "file_name": "plan.pdf",
+                        "file_mime": document_render.PDF_MIME,
+                        "file_byte_count": 100,
+                    }
+                ],
+            },
+            consumer_id="resident-v1",
+            consumer_info={},
+            allow_verify_reply=False,
+        )
+
+    persisted_parent = next(
+        row for row in db.chat_load(store.user_id) if row["id"] == parent["id"]
+    )
+    assert persisted_parent.get("reply_message_id") in (None, "")
+    assert persisted_parent.get("reply_status") != "replied"
+    assert not any(
+        row["id"] == "v1_rolled_back_primary" for row in db.chat_load(store.user_id)
+    )
+
+
+def test_v1_competing_reply_sequences_store_only_the_winner(store, monkeypatch):
+    _quiet_response_side_effects(monkeypatch)
+    parent = store.append_chat(
+        "user", "chat", _envelope(store.user_id, "v1_sequence_race_parent")
+    )
+
+    def post(label: str):
+        return chat_core.write_response(
+            store,
+            {
+                "envelope": _envelope(store.user_id, f"v1_primary_{label}"),
+                "reply_to_message_id": parent["id"],
+                "file_followups": [
+                    {
+                        "envelope": _envelope(store.user_id, f"v1_card_{label}"),
+                        "file_name": f"plan-{label}.pdf",
+                        "file_mime": document_render.PDF_MIME,
+                        "file_byte_count": 100,
+                    }
+                ],
+            },
+            consumer_id=f"resident-{label}",
+            consumer_info={},
+            allow_verify_reply=False,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(post, ("a", "b")))
+
+    assert sorted(status for _body, status in results) == [200, 409]
+    rows = db.chat_load(store.user_id)
+    stored_reply_ids = {
+        row["id"]
+        for row in rows
+        if row["id"].startswith(("v1_primary_", "v1_card_"))
+    }
+    assert stored_reply_ids in (
+        {"v1_primary_a", "v1_card_a"},
+        {"v1_primary_b", "v1_card_b"},
+    )
+
+
+def test_resident_stages_and_renders_real_docx(tmp_path, monkeypatch):
+    outbox = tmp_path / "outbound-files"
+    monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
+    resident._begin_outbound_file_turn("turn-docx", (".docx",))
+    source = outbox / "source.md"
+    source.write_text("# 一日计划\n\n- 早餐\n- 训练", encoding="utf-8")
+
+    reply = resident._handle_stage_file_ipc(
+        {
+            "op": "stage_file",
+            "request_id": "request-docx",
+            "path": str(source),
+            "name": "一日计划.docx",
+        }
+    )
+
+    assert reply["ok"] is True
+    staged = resident._finish_outbound_file_turn("turn-docx")
+    assert len(staged) == 1
+    assert staged[0].name == "一日计划.docx"
+    assert staged[0].mime_type == document_render.DOCX_MIME
+    assert staged[0].data.startswith(b"PK")
+    assert not source.exists()
+
+
+def test_resident_stages_and_renders_real_pdf(tmp_path, monkeypatch):
+    outbox = tmp_path / "outbound-files"
+    monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
+    resident._begin_outbound_file_turn("turn-pdf", (".pdf",))
+    source = outbox / "source.md"
+    source.write_text("# 一日计划\n\n- 早餐\n- 训练", encoding="utf-8")
+
+    reply = resident._handle_stage_file_ipc(
+        {
+            "op": "stage_file",
+            "request_id": "request-pdf",
+            "path": str(source),
+            "name": "一日计划.pdf",
+        }
+    )
+
+    assert reply["ok"] is True
+    staged = resident._finish_outbound_file_turn("turn-pdf")
+    assert len(staged) == 1
+    assert staged[0].name == "一日计划.pdf"
+    assert staged[0].mime_type == document_render.PDF_MIME
+    assert staged[0].data.startswith(b"%PDF-")
+    assert not source.exists()
+
+
+def test_file_only_cli_result_is_success_not_parse_failure(tmp_path, monkeypatch):
+    outbox = tmp_path / "outbound-files"
+    monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
+    monkeypatch.setattr(resident, "AGENT_MODE", "cli")
+    monkeypatch.setattr(resident, "_resident_chat_runtime_v2_enabled", lambda: False)
+    monkeypatch.setattr(
+        resident, "_prepend_io_cli_capability_catalog", lambda content: content
+    )
+    monkeypatch.setattr(resident, "_commit_io_cli_catalog_injection", lambda: None)
+    monkeypatch.setattr(
+        resident,
+        "_foreground_agent_message",
+        lambda content, current_ts: content,
+    )
+    parse_results = iter((False, True))
+    monkeypatch.setattr(
+        resident, "_consume_reply_parse_failed", lambda: next(parse_results)
+    )
+    posted = {}
+
+    def fake_agent(message, **kwargs):
+        source = outbox / "source.md"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("# 一日计划\n\n- 早餐\n- 训练", encoding="utf-8")
+        staged = resident._handle_stage_file_ipc(
+            {
+                "op": "stage_file",
+                "request_id": "request-file-only",
+                "path": str(source),
+                "name": "一日计划.docx",
+            }
+        )
+        assert staged["ok"] is True
+        return {"messages": []}
+
+    def fake_post(reply, **kwargs):
+        posted["reply"] = reply
+        posted["kwargs"] = kwargs
+        return {"id": "reply-file-only"}
+
+    monkeypatch.setattr(resident, "call_agent", fake_agent)
+    monkeypatch.setattr(resident, "post_reply", fake_post)
+    mock_notify = []
+    monkeypatch.setattr(
+        resident,
+        "_notify_agent_turn_failure",
+        lambda *args, **kwargs: mock_notify.append((args, kwargs)),
+    )
+    successes = []
+    monkeypatch.setattr(
+        resident, "_note_agent_turn_success", lambda: successes.append(True)
+    )
+    resident._seen_ids.clear()
+    resident._seen_ids_order.clear()
+
+    result = resident._process_messages(
+        [
+            {
+                "id": "user-file-only",
+                "role": "user",
+                "source": "chat",
+                "content": "给我生成一个一日计划 Word 文档。",
+                "ts": 1234.0,
+            }
+        ]
+    )
+
+    assert result == pytest.approx(1234.0)
+    assert posted["reply"] == "文件已经准备好了。"
+    assert len(posted["kwargs"]["file_followups"]) == 1
+    assert not any(key.startswith("turn_failure_") for key in posted["kwargs"])
+    assert mock_notify == []
+    assert successes == [True]
+
+
+def test_resident_rejects_markdown_for_required_word(tmp_path, monkeypatch):
+    outbox = tmp_path / "outbound-files"
+    monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
+    resident._begin_outbound_file_turn("turn-word", (".docx",))
+    source = outbox / "source.md"
+    source.write_text("# Plan", encoding="utf-8")
+
+    reply = resident._handle_stage_file_ipc(
+        {
+            "op": "stage_file",
+            "request_id": "request-md",
+            "path": str(source),
+            "name": "plan.md",
+        }
+    )
+
+    assert reply["ok"] is False
+    assert reply["error"] == "wrong_file_suffix"
+    assert resident._finish_outbound_file_turn("turn-word") == []
+
+
+def test_v1_completion_guard_matches_natural_word_request():
+    requirement = resident._required_outbound_file_suffixes(
+        "我今天想让你安排一日三餐和健身计划，给我一个 Word 文档。"
+    )
+    assert requirement == (".docx",)
+    assert resident._missing_outbound_file_suffixes(requirement, []) == (".docx",)
+
+
+def test_resident_posts_primary_and_encrypted_file_followup_together(monkeypatch):
+    sealed_plaintexts = []
+    posted = {}
+
+    def fake_build_envelope(**kwargs):
+        plaintext = bytes(kwargs["plaintext"])
+        sealed_plaintexts.append(plaintext)
+        marker = f"sealed-{len(sealed_plaintexts)}"
+        return {
+            "v": 1,
+            "id": marker,
+            "body_ct": _b64(plaintext),
+            "nonce": _b64(b"\x00" * 12),
+            "K_user": _b64(b"\x01" * 32),
+            "K_enclave": _b64(b"\x02" * 32),
+            "visibility": "shared",
+            "owner_user_id": "user-v1",
+        }
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"id": "sealed-1", "ts": 1.0, "v": 1}
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    def fake_post(_url, *, json, headers, timeout):
+        posted.update(json)
+        return Response()
+
+    monkeypatch.setattr(resident, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(
+        resident,
+        "_whoami_cache",
+        {
+            "user_id": "user-v1",
+            "user_pk": b"u" * 32,
+            "enclave_pk": b"e" * 32,
+        },
+    )
+    monkeypatch.setattr(
+        resident, "_refresh_whoami_for_encrypted_reply", lambda: True
+    )
+    monkeypatch.setattr(resident, "_build_envelope", fake_build_envelope)
+    monkeypatch.setattr(resident._HTTP, "post", fake_post)
+
+    result = resident.post_reply(
+        "文件已准备好。",
+        reply_to_message_id="parent-v1",
+        file_followups=[
+            resident.StagedChatFile(
+                source_path="/tmp/source.md",
+                name="计划.pdf",
+                mime_type=document_render.PDF_MIME,
+                data=b"%PDF-real-bytes",
+            )
+        ],
+    )
+
+    assert result["id"] == "sealed-1"
+    assert sealed_plaintexts == [
+        "文件已准备好。".encode("utf-8"),
+        b"%PDF-real-bytes",
+    ]
+    assert posted["reply_to_message_id"] == "parent-v1"
+    assert len(posted["file_followups"]) == 1
+    followup = posted["file_followups"][0]
+    assert followup["file_name"] == "计划.pdf"
+    assert followup["file_mime"] == document_render.PDF_MIME
+    assert followup["file_byte_count"] == len(b"%PDF-real-bytes")

@@ -842,6 +842,21 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "additionalProperties": True,
     },
+    "ChatFileFollowup": {
+        "type": "object",
+        "required": ["envelope", "file_name", "file_mime", "file_byte_count"],
+        "properties": {
+            "envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
+            "file_name": {"type": "string", "minLength": 1, "maxLength": 120},
+            "file_mime": {"type": "string", "minLength": 1, "maxLength": 120},
+            "file_byte_count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000,
+            },
+        },
+        "additionalProperties": False,
+    },
     "ChatResponseRequest": {
         "type": "object",
         "required": ["envelope"],
@@ -862,6 +877,13 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "reply_to_message_id": {"type": "string", "description": "Parent user message; strongly recommended for duplicate-reply protection."},
             "content_type": {"type": "string", "enum": ["text", "image"], "default": "text"},
+            "file_followups": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {"$ref": "#/components/schemas/ChatFileFollowup"},
+                "description": "Optional encrypted download cards committed atomically after a text primary. Chat source only; reply_to_message_id is required. The order in this array is the display order below the primary reply.",
+            },
             "turn_failure_error_class": {
                 "type": "string",
                 "maxLength": 64,
@@ -1521,7 +1543,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("get", "/v1/onboarding/validate"): "Return ordered onboarding checks. Resident routes include a decrypt_source step between resident_consumer and live_loop, with status, checked_at_epoch, reason, policy, and remediation fields.",
     ("get", "/v1/chat/poll"): "Long-poll and optionally claim resident chat work. Official residents report their running commit and may report an intentionally skipped compatible backend target with X-Feedling-Consumer-Compat-Commit. They also report decrypt-source status and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At.",
     ("post", "/v1/chat/message"): "Store a user chat message as a v1 ciphertext envelope; the server never decrypts it. If the envelope carries a content_pk_fpr label that does not match the user's currently registered content key, the write is rejected with 409 content_pk_fpr_mismatch (re-fetch whoami and re-seal); unlabeled envelopes are accepted for compatibility.",
-    ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope). Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
+    ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope and encrypted file_followups). A text primary and its file cards commit as one ordered transaction. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/chat/verify_loop"): "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded.",
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
     ("post", "/v1/model_api/runtime_error"): "Record or clear the resident runtime's latest provider error. provider_result=success refreshes provider health immediately; provider_result=failure applies error_class to the provider-health policy.",

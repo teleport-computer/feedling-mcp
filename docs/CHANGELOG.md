@@ -47,6 +47,17 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-26 — V1 resident 补齐可下载文件
+
+### [DONE] Claude / Codex / Pi 共用文件生成与原子回复
+- V1 CLI resident 新增 `io_cli send-file`：模型把 UTF-8 源文件写进每用户隔离的
+  `outbound-files`，Word/PDF 在投递时渲染成真实 `.docx` / `.pdf`。
+- 明确格式请求沿用 V2 的完成保护：错误后缀会被拒绝，首轮漏发文件会再补一次，仍
+  未生成时不会拿普通文本或 Markdown 冒充成功。
+- `/v1/chat/response` 新增加密 `file_followups`；文字主回复、文件 Card 与父消息 CAS
+  在同一个 PostgreSQL 事务提交，保证文字在上、Card 在下，且不会出现半成功。
+- 同时覆盖 VPS/self-hosted 与 API-key hosted resident；未推送、未建 PR、未合并。
+
 ## 2026-07-25 — TEE Redis：三台 CVM 开通 + 砍掉离线备份
 
 三套 Redis CVM（test/pre/prod）全部开通、running、冒烟 ALL GREEN，落在
