@@ -240,7 +240,10 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0058_provider_usage_halted").down_revision == (
         "0057_provider_health"
     )
-    assert script.get_current_head() == "0058_provider_usage_halted"
+    assert script.get_revision("0059_v2_incident_wake_guards").down_revision == (
+        "0058_provider_usage_halted"
+    )
+    assert script.get_current_head() == "0059_v2_incident_wake_guards"
 
 
 def test_provider_health_schema_is_runtime_neutral():
