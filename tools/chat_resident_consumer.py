@@ -134,7 +134,12 @@ from memory.capture_prompt_v1 import (
     parse_capture_cards,
     sanitize_user_name,
 )
-from memory.card_text import is_card_format_error
+from identity.user_naming import transcript_speaker_label
+from memory.card_text import (
+    is_card_format_error,
+    scrub_card_user_references,
+    scrub_dream_consolidations,
+)
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
     build_dream_retry_prompt,
@@ -10023,13 +10028,15 @@ def _capture_message_role(msg: dict, *, user_label: str = "TA", agent_label: str
     """Transcript line label. Real names, not system labels: a literal "user:"
     prefix is what taught capture models to write "用户" into user-visible
     cards (usr_fee1 complaint, 2026-07-17) — the model mirrors whatever the
-    transcript calls the speakers."""
-    role = str(msg.get("role") or "").strip().lower()
-    if role == "user":
-        # sanitize again here (defense in depth): a reserved "name" (用户/user)
-        # passed as a label must never become a "用户: …" line.
-        return sanitize_user_name(user_label)
-    return (agent_label or "").strip() or "我"
+    transcript calls the speakers.
+
+    这里只是薄壳:实现搬进了 identity.user_naming.transcript_speaker_label,
+    由两条运行时共用。原因很直接 —— 这个 bug 2026-07-17 只修在这里,
+    托管 Runtime V2 自己插原始 role,一直漏到 2026-07-26。同一条规则两份实现,
+    就一定会漏一份。"""
+    return transcript_speaker_label(
+        str(msg.get("role") or ""), user_name=user_label, ai_name=agent_label
+    )
 
 
 def _capture_message_id(msg: dict) -> str:
@@ -10355,6 +10362,9 @@ def _process_capture_jobs(jobs: list) -> float:
                 },
             )
             continue
+        # 最后一公里称呼改写(与 V2 同一实现):prompt 的禁令是软的,这一步是
+        # 确定性的;预谓词锚点保住「用户增长」这类产品词。
+        cards = [scrub_card_user_references(c, user_name=user_name) for c in cards]
         if not cards:
             update_proactive_job_status(
                 job_id,
@@ -10709,6 +10719,8 @@ def _process_dream_jobs(jobs: list) -> float:
                 },
             )
             continue
+        # 同上:Dream 的可见文字在里层 result 上。
+        consolidations = scrub_dream_consolidations(consolidations, user_name=user_name)
         if not consolidations:
             update_proactive_job_status(
                 job_id,

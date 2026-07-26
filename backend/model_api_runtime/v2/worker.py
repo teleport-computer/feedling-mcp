@@ -88,7 +88,12 @@ from memory.capture_prompt_v1 import (
     build_capture_retry_prompt,
     parse_capture_cards,
 )
-from memory.card_text import is_card_format_error
+from identity.user_naming import transcript_speaker_label
+from memory.card_text import (
+    is_card_format_error,
+    scrub_card_user_references,
+    scrub_dream_consolidations,
+)
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
     build_dream_retry_prompt,
@@ -5893,8 +5898,16 @@ async def _run_extraction(
                     in _CAPTURE_PROMPT_SOURCES
                 )
             ]
+        # 说话人标签用真名,绝不用原始 role。字面量 "user:" 正是教会模型往用户
+        # 可见的卡里写「用户」的元凶(usr_fee1 2026-07-17):prompt 在上面禁这个词,
+        # 转写在下面把人叫了二十遍 user。resident 当时修了,这条托管路径漏到
+        # 2026-07-26 才发现(sonnet-4.6 写出「用户承诺这周末去看医生」)。
+        # 共用 transcript_speaker_label —— 各写一份正是它漏掉的原因。
+        speaker_user_name = ctx.get("user_name", "")
+        speaker_ai_name = ctx.get("ai_name", "")
         window = "\n".join(
-            f"- {m.get('role')}: {context.text_of(m.get('content'))}"
+            f"- {transcript_speaker_label(str(m.get('role') or ''), user_name=speaker_user_name, ai_name=speaker_ai_name)}: "
+            f"{context.text_of(m.get('content'))}"
             for m in prompt_tail
         ).strip()
         source_ids = [str(m.get("id")) for m in prompt_tail if m.get("id")]
@@ -6159,6 +6172,20 @@ async def _run_extraction(
 
         actions: list[dict] = []
         if items:
+            # 最后一公里:把「用户」/「user」这类系统称谓换成本人的名字(或中性
+            # 「对方」)。prompt 里的禁令是软的 —— 实测会被无视 —— 而这一步是
+            # 确定性的,且 rewrite_user_reference 的预谓词锚点保住了「用户增长」
+            # 这类产品词。genesis/import 早就过这一关,日常 capture/dream 一直没接。
+            items = (
+                scrub_dream_consolidations(items, user_name=speaker_user_name)
+                if lane != "capture"
+                else [
+                    scrub_card_user_references(item, user_name=speaker_user_name)
+                    if isinstance(item, dict)
+                    else item
+                    for item in items
+                ]
+            )
             actions, _added, _superseded = to_actions(
                 items,
                 occurred_at=occurred_at,

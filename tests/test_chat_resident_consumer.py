@@ -2530,6 +2530,37 @@ def test_memory_lane_raw_text_survives_chat_sanitizer(monkeypatch):
     assert chat_err is not None
 
 
+def test_both_runtimes_share_one_transcript_label_implementation():
+    """resident 的 _capture_message_role 必须**委托**给共用实现,不是自己再写一份。
+
+    这个 bug(转写里的字面量 "user:" 教会模型往卡里写「用户」)2026-07-17 只修在
+    resident,托管 Runtime V2 自己插原始 role,漏到 2026-07-26 才被探针抓到。
+    同一条规则两份实现就一定会漏一份 —— 这条断言让下一次分叉直接红。
+    """
+    from identity.user_naming import transcript_speaker_label
+
+    for role in ("user", "assistant", "system", "tool", ""):
+        for user_label, agent_label in (("小雨", "小柒"), ("", ""), ("用户", "小柒")):
+            assert crc._capture_message_role(
+                {"role": role}, user_label=user_label, agent_label=agent_label
+            ) == transcript_speaker_label(
+                role, user_name=user_label, ai_name=agent_label
+            ), (role, user_label)
+
+
+def test_capture_window_never_labels_the_person_user():
+    msgs = [
+        {"role": "user", "content": "我昨天加班到十一点", "ts": 1000.0},
+        {"role": "assistant", "content": "别熬了", "ts": 1001.0},
+    ]
+    text = crc._capture_window_text(msgs, user_label="小雨", agent_label="小柒")
+    assert "小雨:" in text and "小柒:" in text
+    assert "user:" not in text.lower() and "用户:" not in text
+    # 名字未知也不能退回 "user:"
+    fallback = crc._capture_window_text(msgs, user_label="", agent_label="")
+    assert "user:" not in fallback.lower() and "TA:" in fallback
+
+
 def _dream_reply(summary: str, content: str, card_id: str = "m_1") -> str:
     return (
         '{"consolidations":[{"op":"thicken","card_ids":["%s"],"result":'

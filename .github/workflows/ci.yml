@@ -170,6 +170,7 @@ jobs:
             tests/test_capture_prompt_v1.py \
             tests/test_dream_prompt_v1.py \
             tests/test_card_text_gate.py \
+            tests/test_card_user_referent.py \
             tests/test_pi_mcp_bridge.py \
             -v
 

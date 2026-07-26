@@ -19,6 +19,11 @@ from __future__ import annotations
 import re
 import unicodedata
 
+from identity.user_naming import rewrite_user_reference
+
+# 卡上会被用户亲眼看到的文字字段(bucket/threads 也显示在花园里)。
+_VISIBLE_TEXT_FIELDS = ("summary", "content", "bucket")
+
 # 输出示例里出现过的骨架文字。弱模型常原样抄回来。
 _TEMPLATE_FRAGMENTS = (
     "一段厚的正文",
@@ -133,6 +138,50 @@ def sanitize_card_labels(
             continue
         clean_threads.append(text)
     return clean_bucket, clean_threads, reasons
+
+
+def scrub_card_user_references(card: dict, *, user_name: str) -> dict:
+    """卡落库前的最后一公里:把「用户」/「user」这类系统称谓换成本人的名字。
+
+    ``rewrite_user_reference`` 早就存在、也早有预谓词锚点(所以「用户增长」
+    「用户画像」「user growth」这类产品词不会被误改),但它**只接在 genesis 和
+    history_import 上** —— 日常 capture/dream 写的卡(用户每天真正看到的那些)
+    从来不过这一关。2026-07-26 实测 sonnet-4.6 写出「用户承诺这周末去看医生」。
+
+    刻意用**中性** subject(不改 TA/你/他/她):卡里指代 AI 的「TA」是本人视角对
+    伴侣的叫法,必须原样保留;这里只处理明确的系统标签泄漏。
+
+    返回新 dict,不改原对象(调用方可能还要拿原始值做日志/对比)。
+    """
+    out = dict(card or {})
+    for field in _VISIBLE_TEXT_FIELDS:
+        value = out.get(field)
+        if isinstance(value, str) and value:
+            out[field] = rewrite_user_reference(value, user_name)
+    threads = out.get("threads")
+    if isinstance(threads, list):
+        out["threads"] = [
+            rewrite_user_reference(str(t), user_name) if isinstance(t, str) else t
+            for t in threads
+        ]
+    return out
+
+
+def scrub_dream_consolidations(
+    consolidations: list[dict], *, user_name: str
+) -> list[dict]:
+    """Dream 的形状是 ``{op, card_ids, result{...}}``,要洗的是里层 ``result``。"""
+    out: list[dict] = []
+    for row in consolidations or []:
+        if not isinstance(row, dict):
+            out.append(row)
+            continue
+        fresh = dict(row)
+        result = fresh.get("result")
+        if isinstance(result, dict):
+            fresh["result"] = scrub_card_user_references(result, user_name=user_name)
+        out.append(fresh)
+    return out
 
 
 def format_error(reasons: list[str], *, after_retry: bool = False) -> str:
