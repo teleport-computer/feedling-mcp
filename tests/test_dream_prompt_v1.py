@@ -98,8 +98,9 @@ def test_parse_bounces_hollow_result():
     raw = '{"consolidations":[{"op":"thicken","card_ids":["a"],"result":{}}]}'
     cons, qs, err = parse_dream_consolidations(raw)
     assert cons == [] and err == "invalid_card_content:summary_empty"
+    # 放宽的第二问里它是唯一一行 → 全脏,报 after_retry 让 job 失败(别推进 frontier)
     cons, qs, err = parse_dream_consolidations(raw, strict=False)
-    assert cons == [] and err is None
+    assert cons == [] and err == "invalid_card_content_after_retry:summary_empty"
 
 
 def test_parse_handles_fence_and_prose_and_clamps():

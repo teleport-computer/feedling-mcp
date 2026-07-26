@@ -150,8 +150,13 @@ def parse_dream_consolidations(
 
     内容闸(2026-07-26):summary/content 是占位符或没有实质内容的行一律不落库。
     ``strict=True``(默认,第一次尝试)时,只要有任何一行被拦,整份回复带
-    ``invalid_card_content:*`` 打回,让调用方原样重问一次;``strict=False``
-    (打回后的第二次尝试)只丢掉脏行、保留干净的,避免一颗老鼠屎让整晚整理归零。
+    ``invalid_card_content:*`` 打回,让调用方原样重问一次。
+    ``strict=False``(打回后的第二次尝试)三种结局:
+      - 有干净行 → 只丢脏行、保留干净的(避免一颗老鼠屎让整晚整理归零);
+      - 干净行为 0 且**有脏行** → ``invalid_card_content_after_retry:*``,调用方
+        必须让 job 失败 —— 报成 noop 会推进 frontier 把窗口永久丢掉;
+      - 干净行为 0 且**没有脏行** → 模型真的选择了空结果,那是合法 noop。
+    bucket/threads 属软字段:永远只清洗,不参与打回判定。
     """
     import json
 
@@ -173,7 +178,7 @@ def parse_dream_consolidations(
         return [], questions, "missing_consolidations_list"
 
     out: list[dict] = []
-    rejections: list[str] = []
+    hard_rejections: list[str] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -190,14 +195,14 @@ def parse_dream_consolidations(
         rejection = card_text_rejection(summary=summary, content=content)
         if rejection:
             # 占位符/空正文的卡不写进花园 —— 用户会亲眼看到它。
-            rejections.append(rejection)
+            hard_rejections.append(rejection)
             continue
         threads_raw = result.get("threads")
         threads = [str(t).strip()[:80] for t in threads_raw if str(t).strip()][:8] if isinstance(threads_raw, list) else []
-        bucket, threads, label_reasons = sanitize_card_labels(
+        # 软字段只清洗,不参与打回判定(硬内容没问题就不值得再烧一次 provider)。
+        bucket, threads, _label_reasons = sanitize_card_labels(
             bucket=str(result.get("bucket") or "").strip()[:80], threads=threads
         )
-        rejections.extend(label_reasons)
         out.append({
             "op": op,
             "card_ids": card_ids,
@@ -210,8 +215,13 @@ def parse_dream_consolidations(
                 "pulse": _clamp01(result.get("pulse")),
             },
         })
-    if rejections and strict:
-        return [], questions, format_error(rejections)
+    if hard_rejections:
+        if strict:
+            return [], questions, format_error(hard_rejections)
+        if not out:
+            # 第二问全脏:**不能**报成 ([], None)。那会让 job 以 noop 完成、
+            # V2 还会推进 capture frontier,这段窗口就永久丢了(codex review P1-3)。
+            return [], questions, format_error(hard_rejections, after_retry=True)
     return out, questions, None
 
 

@@ -10155,8 +10155,10 @@ def _memory_agent_parse_with_bounce(
     「哪个字段没填」重问一次;第二次放宽为「只丢脏卡、保留干净的」。
 
     返回 ``(parsed, bounce)``:``parsed`` 是 parse 的原始元组,``bounce`` 是
-    ``""``/``bounced_ok``/``bounced_partial``/``bounced_failed``,只用于观测。
+    ``""``/``bounced_ok``/``bounced_empty``/``bounced_failed``,只用于观测。
     调用方仍然只看 parse 元组末位的 err 决定成败 —— 打回是内部实现,不改判成败的口径。
+    注意第二问全脏时 parse 会给 ``invalid_card_content_after_retry:*``,
+    调用方据此把 job 判失败:报成 noop 会推进 frontier 把这段窗口永久丢掉。
     """
     reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
     _note_agent_turn_success()
@@ -10171,14 +10173,16 @@ def _memory_agent_parse_with_bounce(
         call_agent(build_retry_prompt(prompt, err), raw_text=True)
     )
     _note_agent_turn_success()
-    # 第二次放宽:脏行丢掉、干净的照收,不让一行占位符把整晚整理清零。
+    # 第二次放宽:脏行丢掉、干净的照收,不让一行占位符把整晚整理清零;
+    # 但一张干净的都没剩下时 parse 会报 *_after_retry,不伪装成成功。
     retried = parse(retry_text, strict=False)
     if retried[-1]:
         log.warning("%s content gate retry still bad id=%s reason=%s", lane, job_id, retried[-1])
         return retried, "bounced_failed"
     if not retried[0]:
-        log.warning("%s content gate retry produced nothing usable id=%s", lane, job_id)
-        return retried, "bounced_partial"
+        # 模型接受了「宁可留空」这条出路 —— 这是 prompt 想要的结果,不是失败。
+        log.info("%s content gate retry returned a clean empty result id=%s", lane, job_id)
+        return retried, "bounced_empty"
     log.info("%s content gate retry recovered id=%s cards=%d", lane, job_id, len(retried[0]))
     return retried, "bounced_ok"
 

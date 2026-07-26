@@ -2595,7 +2595,11 @@ def test_memory_content_gate_clean_reply_asks_once(monkeypatch):
 
 
 def test_memory_content_gate_gives_up_after_one_bounce(monkeypatch):
-    """第二问还是占位符 → 记原因、这轮不写卡;不无限重问。"""
+    """第二问还是占位符 → job **失败**(不是 noop),且不无限重问。
+
+    报成 noop 会让这轮以「没什么要整理」完成 —— V2 那侧还会推进 capture frontier,
+    窗口就永久丢了,而且 data-track 上完全看不见(codex review P1-3)。
+    """
     from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
 
     prompts: list[str] = []
@@ -2611,8 +2615,33 @@ def test_memory_content_gate_gives_up_after_one_bounce(monkeypatch):
         "P", parse=parse_dream_consolidations,
         build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_3",
     )
-    assert cons == [] and bounce == "bounced_partial" and err is None
+    assert cons == [] and bounce == "bounced_failed"
+    assert err.startswith("invalid_card_content_after_retry:")
     assert len(prompts) == 2
+
+
+def test_memory_content_gate_accepts_the_clean_empty_answer(monkeypatch):
+    """第二问选择「宁可留空」→ 这是 prompt 想要的结果,算干净 noop 不算失败。"""
+    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
+
+    replies = [
+        _dream_reply("[thickened summary]", "..."),
+        '{"consolidations": [], "questions_to_ask": []}',
+    ]
+    prompts: list[str] = []
+
+    def _fake_call_agent(prompt, **kw):
+        prompts.append(prompt)
+        return replies[len(prompts) - 1]
+
+    monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+
+    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
+        "P", parse=parse_dream_consolidations,
+        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_5",
+    )
+    assert cons == [] and err is None and bounce == "bounced_empty"
 
 
 def test_memory_content_gate_does_not_bounce_broken_json(monkeypatch):

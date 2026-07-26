@@ -25,6 +25,7 @@ from memory.card_text import (  # noqa: E402
     is_card_format_error,
     placeholder_reason,
     sanitize_card_labels,
+    substantive_len,
 )
 from memory.dream_prompt_v1 import (  # noqa: E402
     build_dream_prompt,
@@ -68,6 +69,39 @@ def test_real_text_is_not_rejected():
         assert placeholder_reason(text) is None, repr(text)
 
 
+def test_substantive_count_is_language_neutral():
+    """判「有没有字」必须语种中立。
+
+    早先那版用字符区间白名单(ASCII/CJK/假名/谚文),阿拉伯文、西里尔文、希伯来文
+    实义字数一律算 0 → 整语种的卡全部被判「只有标点」而打回。这是对非拉丁非 CJK
+    用户的静默封杀,codex 07-26 review P1-1 抓到。
+    """
+    for text in ("مرحبا", "Привет", "שלום", "Καλημέρα", "café résumé", "Ngày mai"):
+        assert substantive_len(text) >= 2, repr(text)
+        assert placeholder_reason(text) is None, repr(text)
+    # 反面:标点/省略号/emoji 仍然不算字
+    for text in ("...", "…", "。。。", "！？", "🙂🙂"):
+        assert substantive_len(text) == 0, repr(text)
+
+
+def test_card_accepts_non_latin_content():
+    assert card_text_rejection(summary="Привет", content="Он наконец пошёл к врачу.") is None
+    assert card_text_rejection(summary="مرحبا", content="ذهب إلى الطبيب أخيرا.") is None
+
+
+def test_known_conservative_rejections_are_a_deliberate_tradeoff():
+    """记下这道闸偏保守的已知代价,别让它以后被当成 bug 悄悄改掉。
+
+    prompt 明确要求 summary 是一句话、content 是一段正文,所以整段就是
+    `[laughs]` 这类舞台提示、或只有单个字符,判「没写」是可接受的取舍
+    (codex review A)。真要放开必须是产品决定,不是顺手改判据。
+    """
+    assert placeholder_reason("[laughs]") == "bracket_placeholder"
+    assert card_text_rejection(summary="A", content="I.") == "summary_too_short"
+    # 但夹在句子里的方括号不受影响 —— 只有「整段就是一个方括号」才算占位
+    assert placeholder_reason("他说「[原话保留]我不去」，然后挂了电话") is None
+
+
 def test_card_needs_both_summary_and_content():
     # 旧判据是「两个都空才拦」,于是「有标题、没正文」一路写进花园 —— 用户看到的第 1 类垃圾卡。
     assert card_text_rejection(summary="她今天讲了很多关于工作的事", content="...") == (
@@ -82,13 +116,30 @@ def test_soft_labels_are_sanitized_not_fatal():
         bucket="...", threads=["...", "工作", "", "[thread]"]
     )
     assert bucket == "" and threads == ["工作"]
-    assert reasons  # 洗掉了东西 → 严格模式下同样触发一次重问
+    assert reasons  # 记录洗掉了什么(只做观测)
+
+
+def test_soft_field_placeholder_alone_never_bounces():
+    """硬内容正常、只是 bucket/threads 是占位词 → 清洗后照收,不为它多烧一次调用。
+
+    (第一版把软字段 reason 也并进打回条件,codex review P1-2。)
+    """
+    raw = (
+        '{"cards":[{"action":"add","type":"event","bucket":"无","threads":["none","加班"],'
+        '"summary":"他连着加了三天班","content":"他说项目要上线，连着三天到十一点才走。"}]}'
+    )
+    cards, err = parse_capture_cards(raw)
+    assert err is None and len(cards) == 1
+    assert cards[0]["bucket"] == "" and cards[0]["threads"] == ["加班"]
 
 
 def test_format_error_and_predicate():
     err = format_error(["summary_empty", "summary_empty", "content_too_short"])
     assert err == "invalid_card_content:summary_empty,content_too_short"
     assert is_card_format_error(err)
+    after = format_error(["summary_empty"], after_retry=True)
+    assert after == "invalid_card_content_after_retry:summary_empty"
+    assert not is_card_format_error(after)  # 终局,不再打回
     # 这些各有自己的失败路径,重问同一段 prompt 没有意义
     for other in (None, "", "no_json_object", "empty_reply", "provider_call_failed:TimeoutError"):
         assert not is_card_format_error(other)
@@ -141,8 +192,28 @@ def test_capture_bounces_placeholder_card():
     )
     cards, err = parse_capture_cards(raw)
     assert cards == [] and is_card_format_error(err)
+    # 第二问还是全脏 → 必须报 after_retry 让 job 失败,不能伪装成「没什么值得记」
     cards, err = parse_capture_cards(raw, strict=False)
-    assert cards == [] and err is None
+    assert cards == []
+    assert err == "invalid_card_content_after_retry:summary_no_substantive_chars"
+    assert not is_card_format_error(err)  # 不能再打回一次 —— 那是死循环
+
+
+def test_all_dirty_after_retry_never_looks_like_a_clean_noop():
+    """第二问全脏 ≠ 成功空手。
+
+    报成 ([], None) 会让 resident 的 job 以 noop 完成、V2 还会推进 capture
+    frontier —— 这段对话/这批卡就永久丢了,而且 data-track 上完全看不见
+    (codex review P1-3)。真正的空结果必须是「模型没给脏行」。
+    """
+    all_dirty = '{"consolidations":[{"op":"merge","card_ids":["m_1"],"result":{"summary":"...","content":"..."}}]}'
+    cons, _qs, err = parse_dream_consolidations(all_dirty, strict=False)
+    assert cons == [] and err.startswith("invalid_card_content_after_retry:")
+
+    # 对照:模型真的选择了空结果(prompt 给的正当出路)→ 干净的 noop
+    genuinely_empty = '{"consolidations": [], "questions_to_ask": []}'
+    cons, _qs, err = parse_dream_consolidations(genuinely_empty, strict=False)
+    assert cons == [] and err is None
 
 
 def test_clean_reply_never_bounces():

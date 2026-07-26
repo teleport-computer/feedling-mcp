@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 
 # 输出示例里出现过的骨架文字。弱模型常原样抄回来。
 _TEMPLATE_FRAGMENTS = (
@@ -42,23 +43,29 @@ _PLACEHOLDER_WORD_RE = re.compile(
     re.IGNORECASE,
 )
 
-# 「有实质内容」的字符:数字/拉丁字母/日文假名/汉字/谚文。标点、省略号、空白都不算,
-# 所以 "..." / "…" / "。" / "——" 一律判为无实质内容。
-_SUBSTANTIVE_RE = re.compile(
-    r"[0-9A-Za-z぀-ヿ㐀-䶿一-鿿가-힯]"
-)
-
 # 下限刻意压到只能拦「明显没写」(单字残留),不评判写得好不好 —— 卡片写得薄是
 # 模型能力问题,不该由这道闸来判死;它只负责拦占位符和空壳。
 MIN_SUMMARY_CHARS = 2
 MIN_CONTENT_CHARS = 2
 
 _FORMAT_ERROR_PREFIX = "invalid_card_content"
+_AFTER_RETRY_ERROR_PREFIX = "invalid_card_content_after_retry"
+
+
+def _is_substantive_char(ch: str) -> bool:
+    """字母或数字(任何语种)。标点、省略号、空白、emoji、组合符号都不算。
+
+    ⚠️ 用 unicodedata 而不是字符区间白名单:早先那版只列了 ASCII/CJK/假名/谚文,
+    阿拉伯文、西里尔文、希伯来文的整张卡实义字数会算成 0 → 整语种被误判成
+    「只有标点」而全部打回(codex 07-26 review P1-1)。判「有没有字」这件事必须
+    语种中立,否则这道闸会变成对非拉丁非 CJK 用户的静默封杀。
+    """
+    return unicodedata.category(ch)[0] in {"L", "N"}
 
 
 def substantive_len(text: str) -> int:
-    """有效字符数(不含标点/空白)。"""
-    return len(_SUBSTANTIVE_RE.findall(text or ""))
+    """有效字符数(不含标点/空白/emoji)。"""
+    return sum(1 for ch in (text or "") if _is_substantive_char(ch))
 
 
 def placeholder_reason(text: str) -> str | None:
@@ -73,8 +80,8 @@ def placeholder_reason(text: str) -> str | None:
     for fragment in _TEMPLATE_FRAGMENTS:
         if fragment in s:
             return "template_fragment"
-    if not _SUBSTANTIVE_RE.search(s):
-        # 纯标点/省略号:"..."、"…"、"。"、"— —"
+    if substantive_len(s) == 0:
+        # 纯标点/省略号/emoji:"..."、"…"、"。"、"— —"
         return "no_substantive_chars"
     return None
 
@@ -101,7 +108,12 @@ def card_text_rejection(*, summary: str, content: str) -> str | None:
 def sanitize_card_labels(
     *, bucket: str, threads: list[str]
 ) -> tuple[str, list[str], list[str]]:
-    """清洗软字段。返回 ``(bucket, threads, reasons)``;``reasons`` 非空表示确实洗掉了东西。"""
+    """清洗软字段。返回 ``(bucket, threads, reasons)``;``reasons`` 非空表示确实洗掉了东西。
+
+    ⚠️ ``reasons`` **不参与**打回判定 —— 它只是「洗掉了什么」的记录。硬内容
+    (summary/content)完全正常、只是 ``bucket="无"`` 的卡不值得为它多烧一次
+    BYOK 调用;软字段的定义就是「能就地修好」(codex 07-26 review P1-2)。
+    """
     reasons: list[str] = []
     clean_bucket = (bucket or "").strip()
     reason = placeholder_reason(clean_bucket) if clean_bucket else None
@@ -121,22 +133,30 @@ def sanitize_card_labels(
     return clean_bucket, clean_threads, reasons
 
 
-def format_error(reasons: list[str]) -> str:
-    """把逐行的拒绝码收敛成一个可进 job status 的短 reason。"""
+def format_error(reasons: list[str], *, after_retry: bool = False) -> str:
+    """把逐行的拒绝码收敛成一个可进 job status 的短 reason。
+
+    ``after_retry=True`` 换一个前缀:那是「打回重问之后还是全脏」的终局,
+    调用方必须让 job **失败**(而不是伪装成 noop 推进 frontier),
+    data-track 上也要能和第一问的打回分开看。
+    """
+    prefix = _AFTER_RETRY_ERROR_PREFIX if after_retry else _FORMAT_ERROR_PREFIX
     seen: list[str] = []
     for reason in reasons:
         if reason and reason not in seen:
             seen.append(reason)
     if not seen:
-        return _FORMAT_ERROR_PREFIX
-    return f"{_FORMAT_ERROR_PREFIX}:" + ",".join(seen[:3])
+        return prefix
+    return f"{prefix}:" + ",".join(seen[:3])
 
 
 def is_card_format_error(err: str | None) -> bool:
     """这个 reason 是不是「值得原样打回去重来一次」的格式问题。
 
-    只认内容闸自己发的码 —— provider 挂了、JSON 根本没出来(``no_json_object``)
+    只认内容闸**第一问**发的码 —— provider 挂了、JSON 根本没出来(``no_json_object``)
     这类问题重问一遍也没用,不在此列;它们各有自己的重试/退避路径。
+    ``invalid_card_content_after_retry`` 也刻意不在此列:那已经是第二问的终局,
+    再打回就成了死循环。
     """
     return bool(err) and str(err).split(":", 1)[0] == _FORMAT_ERROR_PREFIX
 

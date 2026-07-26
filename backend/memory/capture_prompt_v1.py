@@ -162,8 +162,11 @@ def parse_capture_cards(
     `noop` cards are dropped (nothing to write). Unknown types fall back to
     the default; insight/reflection are coerced out (capture never writes them).
 
-    内容闸(2026-07-26)与 Dream 同口径:占位符/空正文的卡不落库;``strict=True``
-    时整份打回让调用方重问一次,``strict=False``(重问后)只丢脏卡、保留干净的。
+    内容闸(2026-07-26)与 Dream 同口径:占位符/空正文的卡不落库。``strict=True``
+    时整份带 ``invalid_card_content:*`` 打回让调用方重问一次;``strict=False``
+    (重问后)有干净卡就只丢脏卡,一张干净的都没有且确实有脏卡则报
+    ``invalid_card_content_after_retry:*``——**必须让 job 失败**,报成 noop 会推进
+    capture frontier 把这段对话永久丢掉。bucket/threads 属软字段,只清洗不打回。
     """
     import json
 
@@ -181,7 +184,7 @@ def parse_capture_cards(
         return [], "missing_cards_list"
 
     out: list[dict] = []
-    rejections: list[str] = []
+    hard_rejections: list[str] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -194,17 +197,17 @@ def parse_capture_cards(
         rejection = card_text_rejection(summary=summary, content=content)
         if rejection:
             # 占位符/空正文的卡不写进花园 —— 用户会亲眼看到它。
-            rejections.append(rejection)
+            hard_rejections.append(rejection)
             continue
         mem_type = str(row.get("type") or "").strip().lower()
         if mem_type not in CAPTURE_TYPES:
             mem_type = _DEFAULT_CAPTURE_TYPE
         threads_raw = row.get("threads")
         threads = [str(t).strip()[:80] for t in threads_raw if str(t).strip()][:8] if isinstance(threads_raw, list) else []
-        bucket, threads, label_reasons = sanitize_card_labels(
+        # 软字段只清洗,不参与打回判定(硬内容没问题就不值得再烧一次 provider)。
+        bucket, threads, _label_reasons = sanitize_card_labels(
             bucket=str(row.get("bucket") or "").strip()[:80], threads=threads
         )
-        rejections.extend(label_reasons)
         target_id = str(row.get("target_id") or "").strip() or None
         out.append({
             "action": action,
@@ -217,8 +220,14 @@ def parse_capture_cards(
             "importance": _clamp01(row.get("importance")),
             "pulse": _clamp01(row.get("pulse")),
         })
-    if rejections and strict:
-        return [], format_error(rejections)
+    if hard_rejections:
+        if strict:
+            return [], format_error(hard_rejections)
+        if not out:
+            # 第二问全脏:**不能**报成 ([], None)。那会让 capture job 以
+            # nothing_worth_keeping 完成并推进 frontier,这段对话就再也没人落卡了
+            # (codex review P1-3)。
+            return [], format_error(hard_rejections, after_retry=True)
     return out, None
 
 

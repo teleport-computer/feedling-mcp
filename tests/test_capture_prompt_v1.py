@@ -137,8 +137,9 @@ def test_parse_bounces_hollow_card():
     raw = '{"cards":[{"action":"add","type":"event"}]}'
     cards, err = parse_capture_cards(raw)
     assert cards == [] and err == "invalid_card_content:summary_empty"
+    # 放宽的第二问里它是唯一一张 → 全脏,报 after_retry 让 job 失败(别推进 frontier)
     cards, err = parse_capture_cards(raw, strict=False)
-    assert cards == [] and err is None
+    assert cards == [] and err == "invalid_card_content_after_retry:summary_empty"
 
 
 def test_parse_caps_threads_at_eight():
