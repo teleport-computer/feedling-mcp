@@ -153,3 +153,55 @@ def test_name_is_used_as_a_regex_replacement_template():
     with pytest.raises(Exception):
         rewrite_user_reference("用户的反馈很多", "N\\A")
     assert rewrite_user_reference("用户的反馈很多", "\\g<0>") == "用户的反馈很多"
+
+
+# --- 三条路都必须遵守同一条规则 ---------------------------------------------
+
+def test_all_three_write_paths_carry_the_naming_rule():
+    """蒸馏 / 落卡 / 做梦 —— 三条会写出用户可见文字的路都要带称呼规则。
+
+    2026-07-26 Seven 问的正是这个:"早期进来第一次走蒸馏"和"做梦整理旧记忆"
+    这两条有没有被约束。规则本身三条都有,漏的是**转写标签**(见下一条)。
+    """
+    from memory.capture_prompt_v1 import build_capture_prompt
+    from memory.dream_prompt_v1 import build_dream_prompt
+
+    capture = build_capture_prompt(ai_name="小柒", user_name="", buckets="",
+                                   threads="", identity="", window="- 对方: hi")
+    dream = build_dream_prompt(ai_name="小柒", user_name="", cards="", recent_conversations="")
+    for prompt, who in ((capture, "capture"), (dream, "dream")):
+        assert "「用户」" in prompt or '"用户"' in prompt, who   # 明令禁用
+        assert "对方" in prompt, who                            # 无名时的中性主语
+    # 做梦还必须被要求**回头修**旧卡里的老写法,否则历史包袱永远不会自愈
+    assert "整理旧卡" in dream
+
+    import hosted.history_import as hi
+    assert "_naming_rule" in Path(
+        Path(__file__).resolve().parents[1] / "backend" / "hosted" / "history_import.py"
+    ).read_text()
+    assert hi.IMPORT_TRANSCRIPT_PERSON_LABEL  # 蒸馏侧的标签是显式常量
+
+
+def test_import_transcript_never_labels_the_person_user():
+    """蒸馏转写的说话人标签不得是字面量 "User"。
+
+    蒸馏是名字**按定义还不存在**的时刻(名字正是它要推导的东西),所以这里用
+    稳定中性标签而不是查名字。它是三条路里最后一条还在喂 "User:" 的
+    —— 规则在 prompt 里禁这个词,材料在下面每一行都在说它。
+    """
+    import hosted.history_import as hi
+
+    line = hi._format_import_message_line(
+        {"role": "user", "content": "我昨天加班到十一点", "ts": 0}
+    )
+    assert line.startswith("The person: "), line
+    assert not line.startswith("User"), line
+    agent_line = hi._format_import_message_line(
+        {"role": "assistant", "content": "别熬了", "ts": 0}
+    )
+    assert agent_line.startswith("Assistant: "), agent_line
+    # 来源家族标签(ChatGPT 导出的 "User profile" 素材)是另一回事,不受影响
+    profile = hi._format_import_message_line(
+        {"role": "user", "source": hi._USER_PROFILE_SOURCE, "content": "喜欢猫", "ts": 0}
+    )
+    assert profile.startswith("User profile: "), profile
