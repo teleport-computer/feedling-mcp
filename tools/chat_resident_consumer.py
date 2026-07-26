@@ -138,8 +138,6 @@ from identity.user_naming import transcript_speaker_label
 from memory.card_text import (
     count_user_token_residuals,
     is_card_format_error,
-    scrub_card_user_references,
-    scrub_dream_consolidations,
 )
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
@@ -10363,11 +10361,8 @@ def _process_capture_jobs(jobs: list) -> float:
                 },
             )
             continue
-        # 最后一公里称呼改写(与 V2 同一实现):prompt 的禁令是软的,这一步是
-        # 确定性的;预谓词锚点保住「用户增长」这类产品词。
-        cards = [scrub_card_user_references(c, user_name=user_name) for c in cards]
-        # 残留计数(与 V2 同口径):数的是「用户/user」这个 token 还剩几处,
-        # 其中一部分可能是本人正当地在聊自己的产品用户 —— 它是刻度不是错误。
+        # 残留计数(与 V2 同口径)。**刻意不在这里跑确定性改写** —— 那个改写器
+        # 现有的锚点在产品语境下会改坏真内容(见 test_card_user_referent.py)。
         user_token_residual = sum(count_user_token_residuals(c) for c in cards)
         if not cards:
             update_proactive_job_status(
@@ -10724,8 +10719,7 @@ def _process_dream_jobs(jobs: list) -> float:
                 },
             )
             continue
-        # 同上:Dream 的可见文字在里层 result 上。
-        consolidations = scrub_dream_consolidations(consolidations, user_name=user_name)
+
         user_token_residual = sum(
             count_user_token_residuals(row.get("result") or {})
             for row in consolidations if isinstance(row, dict)

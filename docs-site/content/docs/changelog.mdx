@@ -21,15 +21,16 @@ change must not be interpreted as an API guarantee.
   attempt instead of being silently consumed. Substantive-character detection is
   language-neutral (Arabic, Cyrillic, Hebrew, accented Latin, and CJK all count),
   so non-Latin cards are unaffected.
-- **Memory cards no longer refer to the account holder as "user".** The
+- **Memory cards are less likely to refer to the account holder as "user".** The
   conversation transcript given to the Capture and Dream models now labels
   speakers with the person's own name — or the neutral `对方` when no name is
-  known — instead of the raw `user` / `assistant` roles, and card text passes a
-  deterministic rewrite before it is stored. Product vocabulary is deliberately
-  preserved: phrases such as `用户增长`, `用户留存`, `用户界面`, and
-  `user growth` are left untouched, because only the model can tell whether a
-  given "user" means the account holder or that person's own customers — the
-  prompts now ask for the prefix to be dropped in the latter case.
+  known — instead of the raw `user` / `assistant` roles, which is what taught
+  models to copy the system label into cards. The prompts also ask for the
+  `用户` / `user` prefix to be dropped from product vocabulary, so a card says
+  `界面` rather than `用户界面`. Card text is deliberately **not** post-edited by
+  a rewriter: only the model can tell whether a given "user" means the account
+  holder or that person's own customers, and guessing wrong would silently
+  rewrite a true memory into a false one.
 - **Runtime V2 chat and wake turns now receive explicit temporal context.**
   Each turn gets one snapshot containing UTC and user-local time, the latest
   genuine user-message age, and timestamps for the verbatim conversation tail.

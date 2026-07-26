@@ -92,8 +92,6 @@ from identity.user_naming import transcript_speaker_label
 from memory.card_text import (
     count_user_token_residuals,
     is_card_format_error,
-    scrub_card_user_references,
-    scrub_dream_consolidations,
 )
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
@@ -6173,23 +6171,12 @@ async def _run_extraction(
 
         actions: list[dict] = []
         if items:
-            # 最后一公里:把「用户」/「user」这类系统称谓换成本人的名字(或中性
-            # 「对方」)。prompt 里的禁令是软的 —— 实测会被无视 —— 而这一步是
-            # 确定性的,且 rewrite_user_reference 的预谓词锚点保住了「用户增长」
-            # 这类产品词。genesis/import 早就过这一关,日常 capture/dream 一直没接。
-            items = (
-                scrub_dream_consolidations(items, user_name=speaker_user_name)
-                if lane != "capture"
-                else [
-                    scrub_card_user_references(item, user_name=speaker_user_name)
-                    if isinstance(item, dict)
-                    else item
-                    for item in items
-                ]
-            )
-            # 残留计数:改写判据刻意不猜词性,所以必然有剩。残留不等于错误
-            # (可能就是本人在聊自己的产品用户),但它是唯一能验证标签层 + prompt
-            # 到底管不管用的信号 —— 不量就只能靠猜。
+            # 残留计数。**刻意不在这里跑确定性改写** —— 见
+            # tests/test_card_user_referent.py 里的证据:那个改写器会把
+            # 「用户说这个价格太贵了」改成「小雨说…」、「月活用户在下降」改成
+            # 「月活小雨在下降」。它现有的锚点(的/标点/说/希望/是/在/有/会)
+            # 在产品语境下是确定性内容损坏,接到每天跑的写入路径上会放大成灾。
+            # 这里只**量**残留:标签层和 prompt 到底管不管用,靠这个数说话。
             leak_count = sum(
                 count_user_token_residuals(
                     item.get("result") if lane != "capture" and isinstance(item.get("result"), dict) else item

@@ -7,8 +7,9 @@
 
 所以这里锁三件事:
   ① 标签层:两条运行时**共用**一个 transcript_speaker_label,且它永不吐 "user";
-  ② prompt 层:_naming_rule 明令(已有,这里只做在位断言);
-  ③ 写入层:scrub_* 的确定性改写接在 capture/dream 上,且不误伤产品词。
+  ② prompt 层:_naming_rule 明令 + 要求产品术语去掉「用户」前缀;
+  ③ 残留计数:量出①②到底管不管用 —— 并且**刻意不在写入路径上跑确定性改写**,
+     原因见文件末尾那条测试(rewrite_user_reference 在产品语境下会改坏真内容)。
 """
 import sys
 from pathlib import Path
@@ -20,11 +21,8 @@ from identity.user_naming import (  # noqa: E402
     _naming_rule,
     transcript_speaker_label,
 )
-from memory.card_text import (  # noqa: E402
-    count_user_token_residuals,
-    scrub_card_user_references,
-    scrub_dream_consolidations,
-)
+from memory.card_text import count_user_token_residuals  # noqa: E402
+from identity.user_naming import rewrite_user_reference  # noqa: E402
 
 
 # --- ① 标签层 --------------------------------------------------------------
@@ -86,130 +84,7 @@ def test_naming_rule_forbids_the_system_labels():
     assert "对方" in unknown  # 名字未知时的中性替代
 
 
-# --- ③ 写入层 --------------------------------------------------------------
-
-def test_scrub_replaces_the_system_label_with_the_name():
-    """线上真实泄漏那张卡(2026-07-26 sonnet-4.6)。"""
-    card = {
-        "summary": "用户承诺这周末去看医生",
-        "content": "用户答应了自己，这周末一定去看医生。",
-        "bucket": "健康",
-        "threads": ["加班", "看医生"],
-    }
-    out = scrub_card_user_references(card, user_name="小雨")
-    assert "用户" not in out["summary"] and "小雨承诺" in out["summary"]
-    assert "用户" not in out["content"]
-    assert card["summary"].startswith("用户")  # 原对象不被就地改写
-
-
-def test_scrub_uses_neutral_referent_when_name_unknown():
-    out = scrub_card_user_references(
-        {"summary": "用户希望被提醒吃药", "content": "用户说总忘。"}, user_name=""
-    )
-    assert "用户" not in out["summary"] and "对方希望" in out["summary"]
-    assert "用户" not in out["content"]
-
-
-def _scrubbed(text: str, user_name: str = "小雨") -> str:
-    return scrub_card_user_references(
-        {"summary": text, "content": text}, user_name=user_name
-    )["summary"]
-
-
-# 确定性改写这一层**只**做「紧邻高置信个人谓词」这一件小事。
-# 两个方向必须成对锁:同一批规则修好一侧就会打坏另一侧,四轮 review 每轮都是
-# 这么破的(v1 漏本人主语 → v2/v3 改坏产品词 → v4 又改坏产品词)。
-_PERSON_SUBJECT_SENTENCES = (
-    # 线上真实泄漏那句 + 同义谓词(2026-07-26 sonnet-4.6 实测)
-    "用户承诺这周末去看医生",
-    "用户答应了自己要早睡",
-    "用户报名了周末的课程",
-    "用户搬到了新的城市",
-    # codex4 原本就落地的锚点集合
-    "用户希望被提醒吃药",
-    "用户喜欢燕麦奶",
-    "用户的猫叫豆豆",
-    "User promised to see a doctor.",
-    "User prefers oat milk.",
-)
-_PRODUCT_SENTENCES = (
-    # codex round-4 的复现清单:限定词/副词**不是** product-safe 证据 ——
-    # 「用户」和标记之间夹的那几个字本身就可以是产品名词。
-    "用户界面这一版需要重做",
-    "用户账户这个模块要迁移",
-    "用户界面我觉得太复杂",
-    "用户最近流失很多",
-    "用户最近活跃度下降了",
-    "用户昨天的留存率下降了",
-    # round-2/3 的清单
-    "用户登录流程需要优化",
-    "用户注册转化率掉了",
-    "用户支持很好",
-    "用户测试的结论是什么",
-    "用户认证由 OAuth 提供",
-    "用户体验变差了",
-    "用户调研安排在周四",
-    "用户界面需要统一",
-    "用户增长了20%",
-    "用户满意度和用户增长是研究主题",
-    "用户数还在涨",
-    "用户画像做得不细",
-    # 这批曾被我收进锚点,产品语境同样自然,已撤出
-    "用户开始流失",
-    "用户忘记密码怎么办",
-    "用户完成了注册",
-    "用户取消了订阅",
-    "User interface needs work",
-    "User profile migration starts Monday",
-    "User onboarding conversion dropped",
-    "User personas need updating",
-    "User tests need updating",
-    "User profiles the application",
-)
-
-
-def test_person_subject_sentences_are_rewritten():
-    """紧邻高置信个人谓词 —— 这是确定性层唯一负责的事。"""
-    for sentence in _PERSON_SUBJECT_SENTENCES:
-        out = _scrubbed(sentence)
-        assert out.startswith("小雨"), (sentence, out)
-
-
-def test_product_usage_is_preserved():
-    """产品语境一律原样保留。
-
-    和上面**成对**:改坏本人真实内容比残留一个系统词严重得多,也更难发现。
-    四轮 review 里 codex 每轮都从这一侧找到破绽,所以这张表只会变长不会变短。
-    """
-    for sentence in _PRODUCT_SENTENCES:
-        assert _scrubbed(sentence) == sentence, sentence
-
-
-def test_deliberately_uncovered_is_documented_and_counted_not_silent():
-    """有意不覆盖的残留:摆出来 + 数出来,不假装覆盖。
-
-    可以证明这些无法用词法收敛 —— 同一个词、同一个位置,两个方向都自然:
-        用户体验了新功能   本人试用 / 泛用户试用
-        用户反馈了一个问题 本人反馈 / 用户们反馈
-        User profiles the application / User profile migration starts Monday
-    所以确定性层不碰它们。兜底靠 ①转写标签(根因,不再把 "user:" 喂给模型)
-    和 ②prompt 明令(产品术语去掉「用户」前缀),效果由残留计数验证。
-    """
-    for uncovered in (
-        "用户体验了新功能",
-        "用户反馈了一个问题",
-        "用户调研了三家竞品",
-        "用户登录了新设备",
-        "用户很焦虑",
-        "User profiles the application",
-        "User accounts for half the traffic",
-    ):
-        assert _scrubbed(uncovered) == uncovered, (
-            f"{uncovered!r} 被改写了 —— 若确认要扩大覆盖,"
-            f"必须同时确认 _PRODUCT_SENTENCES 全绿"
-        )
-        assert count_user_token_residuals({"summary": uncovered}) >= 1, uncovered
-
+# --- ③ 残留计数 + 「为什么不在写入路径上跑改写」 ----------------------------
 
 def test_residual_counter_counts_tokens_not_leaks():
     """名字要诚实:它数的是 token 出现次数,里面可能全是正当的产品用法。"""
@@ -220,70 +95,38 @@ def test_residual_counter_counts_tokens_not_leaks():
     assert count_user_token_residuals({"summary": "他终于去看医生了"}) == 0
 
 
-def test_known_residual_ambiguity_user_preference():
-    """「用户偏好」是这套判据留下的已知歧义,行为由既有测试定,不是漏改。
+def test_deterministic_rewriter_is_not_wired_into_the_daily_card_path():
+    """capture/dream 的写入路径**不得**调用 rewrite_user_reference。
 
-    codex 建议把「偏好」收进产品词封闭集,但 tests/test_genesis_worker.py 已断言
-    threads ["用户偏好"] → ["小雨偏好"](身份卡语境下那就是本人的偏好),而且
-    「偏好」本来就在句中谓词锚点表里 —— 收进封闭集也会被第二遍改掉。
-    两边直接冲突,保留有测试背书的那一侧,把歧义摆在这里而不是藏起来。
+    2026-07-26 对抗性复核实测:这个改写器现有的锚点在产品语境下是确定性内容
+    损坏,而记忆卡的主人自己可能就是 PM/工程师,天天在聊「我们的用户」。
+    下面每一条都是实测输出,不是假设。接到每天跑的写入路径上,就是把一个潜伏在
+    一次性 import 里的 bug 放大成每人每天。
+
+    它仍留在 genesis / history_import 上(那是既有行为,单独处理),
+    但日常写卡这条路只做①标签 + ②prompt + 计数。
     """
-    out = scrub_card_user_references(
-        {"summary": "用户偏好决定推荐结果", "content": "用户偏好决定推荐结果"},
-        user_name="小雨",
-    )
-    assert out["summary"] == "小雨偏好决定推荐结果"
+    corrupted = {
+        # 「的」/标点/空白 锚点 —— 这几个恰恰是「用户」作泛指的标志
+        "用户的反馈集中在加载速度上": "小雨的反馈集中在加载速度上",
+        "我们这周流失了一批用户。": "我们这周流失了一批小雨。",
+        "这个功能面向的是付费用户。": "这个功能面向的是付费小雨。",
+        # 产品写作的标准词汇
+        "用户说这个价格太贵了": "小雨说这个价格太贵了",
+        "用户是我们最重要的资产": "小雨是我们最重要的资产",
+        # 修饰语被撕开,同一句里还自相矛盾
+        "月活用户在下降": "月活小雨在下降",
+        "我们要区分新用户、老用户和回流用户。": "我们要区分新小雨、老用户和回流小雨。",
+        # 英文限定词悬空 / 中文名 + 's
+        "A user is confused by the empty state.": "A 小雨 is confused by the empty state.",
+        "The user's retention dropped 12%.": "小雨's retention dropped 12%.",
+    }
+    for src, broken in corrupted.items():
+        assert rewrite_user_reference(src, "小雨") == broken, (
+            f"{src!r} 的改写行为变了 —— 如果这是修好了,可以重新考虑把它接回写入路径,"
+            f"但必须先补齐产品语境的成对回归"
+        )
 
-
-def test_product_terms_survive_even_in_subject_position():
-    """主语位的新规则不能吃掉「用户满意度是研究主题」这类真产品词。
-
-    封闭集白名单(名词头)负责这件事 —— 它列错一个的代价是改坏本人真实内容,
-    所以这条锁死几个高频头。history_import 已有的用例也在守同一条线。
-    """
-    for kept in (
-        "用户满意度和用户增长是研究主题",
-        "用户画像做得不细",
-        "用户留存这个月掉了",
-        "用户数还在涨",
-        "用户调研安排在周四",
-    ):
-        out = scrub_card_user_references({"summary": kept, "content": kept},
-                                        user_name="小雨")
-        assert out["summary"] == kept, kept
-
-
-def test_scrub_leaves_ai_referring_pronouns_alone():
-    """卡里指代 AI 的「TA」是本人视角对伴侣的叫法,必须原样保留。
-
-    所以 scrub 刻意用中性 subject —— 只处理明确的系统标签泄漏,不动代词。
-    """
-    card = {"summary": "TA 陪我熬过了那一晚", "content": "你说会一直在。"}
-    out = scrub_card_user_references(card, user_name="小雨")
-    assert out["summary"] == card["summary"]
-    assert out["content"] == card["content"]
-
-
-def test_scrub_dream_reaches_the_inner_result():
-    rows = [
-        {"op": "thicken", "card_ids": ["m_1"],
-         "result": {"summary": "用户在加班", "content": "用户说组里走了三个人。",
-                    "bucket": "工作", "threads": ["加班"]}},
-        {"op": "merge", "card_ids": ["m_2"], "result": {}},
-        "not-a-dict",
-    ]
-    out = scrub_dream_consolidations(rows, user_name="小雨")
-    assert "用户" not in out[0]["result"]["summary"]
-    assert "小雨" in out[0]["result"]["summary"]
-    assert out[0]["card_ids"] == ["m_1"] and out[0]["op"] == "thicken"
-    assert out[1]["result"] == {}          # 空 result 不炸
-    assert out[2] == "not-a-dict"          # 非 dict 原样透传
-    assert rows[0]["result"]["summary"].startswith("用户")  # 不就地改写
-
-
-def test_scrub_is_wired_into_both_write_paths():
-    """判据存在不等于接上了 —— rewrite_user_reference 就是「存在但只接了
-    genesis/import」才让日常 capture/dream 漏了这么久。"""
     consumer_src = (
         Path(__file__).resolve().parents[1] / "tools" / "chat_resident_consumer.py"
     ).read_text()
@@ -292,5 +135,21 @@ def test_scrub_is_wired_into_both_write_paths():
         / "backend" / "model_api_runtime" / "v2" / "worker.py"
     ).read_text()
     for src, who in ((consumer_src, "resident"), (worker_src, "V2 worker")):
-        assert "scrub_card_user_references(" in src, who
-        assert "scrub_dream_consolidations(" in src, who
+        assert "rewrite_user_reference" not in src, who
+        assert "scrub_card_user_references" not in src, who
+        assert "count_user_token_residuals" in src, f"{who} 必须仍在量残留"
+
+
+def test_name_is_used_as_a_regex_replacement_template():
+    r"""⚠️ 既有 bug(不是本次引入,但本次实证):名字被当成 re.sub 的替换模板。
+
+    这条现在就活在 genesis / history_import 上。含反斜杠的偏好名直接抛异常;
+    名字恰好是 `\g<0>` 则静默变成 no-op —— 正好把这个函数存在的意义抵消掉。
+    一行可修(改成 lambda 或转义替换串),但那是 identity 域,单独交接。
+    留这条测试是为了让它**可见**,而不是躺在某个人的记忆里。
+    """
+    import pytest
+
+    with pytest.raises(Exception):
+        rewrite_user_reference("用户的反馈很多", "N\\A")
+    assert rewrite_user_reference("用户的反馈很多", "\\g<0>") == "用户的反馈很多"
