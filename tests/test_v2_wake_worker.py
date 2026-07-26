@@ -457,6 +457,9 @@ def test_run_wake_empty_tail_also_sleeps_silently(monkeypatch):
         and not str(message.get("content") or "").startswith(
             v2_context.RUNTIME_CONTEXT_HEADER
         )
+        and not str(message.get("content") or "").startswith(
+            v2_context.TEMPORAL_CONTEXT_HEADER
+        )
     ]
     assert len(conversation_messages) == 1  # just the nudge — no real tail rows
 
@@ -628,6 +631,9 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
         if message.get("role") != "system"
         and not str(message.get("content") or "").startswith(
             v2_context.RUNTIME_CONTEXT_HEADER
+        )
+        and not str(message.get("content") or "").startswith(
+            v2_context.TEMPORAL_CONTEXT_HEADER
         )
     ]
     # The conversational tail should be just the wake nudge. Live grounding,

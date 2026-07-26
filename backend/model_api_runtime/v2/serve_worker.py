@@ -100,6 +100,7 @@ from model_api_runtime.v2 import worker as v2_worker
 from proactive import capture_scheduler
 from proactive import dream_scheduler
 from proactive import gate as proactive_gate
+from perception import service as perception_service
 from workspace.artifacts import ArtifactWorkspace, artifact_text_view_path
 from workspace.backends import WorkspaceNotFound, model_writable_path
 from workspace.prompt import render_trusted_prefix_blocks
@@ -891,6 +892,24 @@ def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
 def _read_compaction_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
     """Oldest contiguous batch so summary watermarks never skip backlog rows."""
     return _read_tail_window(user_id, after_ts, limit, oldest_first=True)
+
+
+def _read_temporal_snapshot(
+    user_id: str,
+    *,
+    through_seq: int | None = None,
+) -> dict:
+    """Read content-free temporal metadata for one frozen prompt frontier."""
+    timezone_name = accounts_registry._get_user_timezone(user_id)
+    if not timezone_name:
+        timezone_name = perception_service.stable_context_timezone(user_id)
+    return {
+        "timezone": str(timezone_name or "UTC"),
+        "last_user_message_ts": db.chat_latest_genuine_user_ts(
+            user_id,
+            through_seq=through_seq,
+        ),
+    }
 
 
 def _summary_metadata_frontier(state: dict) -> list:
@@ -2875,6 +2894,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_compaction_tail=_read_compaction_tail,
         read_tail_after_seq=_read_tail_after_seq,
         read_compaction_tail_after_seq=_read_compaction_tail_after_seq,
+        read_temporal_snapshot=_read_temporal_snapshot,
         read_summary=_read_summary,
         read_summary_with_seq=_read_summary_with_seq,
         write_summary=_write_summary,

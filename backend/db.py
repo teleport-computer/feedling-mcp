@@ -5024,6 +5024,33 @@ def chat_max_seq(user_id: str) -> int:
     return int(row[0]) if row and row[0] is not None else 0
 
 
+def chat_latest_genuine_user_ts(
+    user_id: str,
+    *,
+    through_seq: int | None = None,
+) -> float | None:
+    """Latest real user-message timestamp inside an optional frozen frontier."""
+    params: list = [str(user_id)]
+    upper_predicate = ""
+    if through_seq is not None:
+        upper = int(through_seq)
+        if upper < 0:
+            raise ValueError("through_seq must be >= 0")
+        upper_predicate = "AND seq <= %s "
+        params.append(upper)
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT ts FROM chat_messages "
+            "WHERE user_id=%s AND doc->>'role' IN ('user','human') "
+            "AND COALESCE(doc->>'source','') "
+            "NOT IN ('verify_ping','resident_maintenance') "
+            + upper_predicate
+            + "ORDER BY seq DESC LIMIT 1",
+            tuple(params),
+        ).fetchone()
+    return float(row[0]) if row and row[0] is not None else None
+
+
 def chat_max_user_seq_between(
     user_id: str,
     after_seq: int,

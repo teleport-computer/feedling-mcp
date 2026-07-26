@@ -10,6 +10,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 chat and wake turns now receive explicit temporal context.**
+  Each turn gets one snapshot containing UTC and user-local time, the latest
+  genuine user-message age, and timestamps for the verbatim conversation tail.
+  Account timezone, stable device timezone, and UTC are used in that order.
 - **Runtime V2 now gives unaudited model routes a 65,536-token default context
   window.** The existing environment override remains available, and setting it
   to `0` still restores fail-closed configuration. Explicit route metadata,

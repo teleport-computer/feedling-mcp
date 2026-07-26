@@ -960,6 +960,10 @@ class TurnDeps:
     read_compaction_tail: Callable[[str, float, int], list[dict]] | None = None
     read_tail_after_seq: Callable[..., list[dict]] | None = None
     read_compaction_tail_after_seq: Callable[..., list[dict]] | None = None
+    # (user_id, through_seq|None) -> {"timezone","last_user_message_ts"}.
+    # Production resolves registry timezone -> perception fallback -> UTC and
+    # bounds the genuine-user timestamp to the turn's frozen prompt frontier.
+    read_temporal_snapshot: Callable[..., dict] | None = None
     # user_id -> (summary_plaintext, watermark_ts, version)：读取该用户当前会话摘要（enclave
     # 解密明文）；从未压缩过时 ("", 0.0, 0)（D1：turn 看 摘要+尾巴 而不是全量重放）。默认
     # None：worker.py 自身不 import hosted，测试/其他调用方不必提供；生产装配见
@@ -2468,6 +2472,7 @@ def _make_build_messages_fn(
     trusted_system_blocks: tuple[str, ...] = (),
     working_memory: str = "",
     provider_config: Any = None,
+    temporal_context: dict[str, Any] | None = None,
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
@@ -2501,6 +2506,7 @@ def _make_build_messages_fn(
         mutation_recovery_active=mutation_recovery_active,
         trusted_system_blocks=(identity_block, *trusted_system_blocks),
         working_memory=working_memory,
+        temporal_context=temporal_context,
     )
 
     def build_messages(transcript: list) -> list:
@@ -2515,6 +2521,51 @@ def _make_build_messages_fn(
         return list(base_messages) + rendered
 
     return build_messages
+
+
+async def _resolve_turn_temporal_context(
+    *,
+    user_id: str,
+    deps: TurnDeps,
+    tail: list[dict],
+    through_seq: int | None,
+) -> dict[str, Any]:
+    """Capture time once so every provider round in the turn sees one snapshot."""
+    now_ts = time.time()
+    snapshot: dict[str, Any] = {}
+    if deps.read_temporal_snapshot is not None:
+        try:
+            loaded = await asyncio.to_thread(
+                deps.read_temporal_snapshot,
+                user_id,
+                through_seq=through_seq,
+            )
+            if isinstance(loaded, dict):
+                snapshot = loaded
+        except Exception as exc:
+            log.warning(
+                "[v2.worker] temporal snapshot fallback user=%s: %s",
+                user_id,
+                type(exc).__name__,
+            )
+
+    last_user_ts = snapshot.get("last_user_message_ts")
+    if last_user_ts is None:
+        tail_user_timestamps: list[float] = []
+        for row in tail:
+            if str(row.get("role") or "") not in {"user", "human"}:
+                continue
+            try:
+                tail_user_timestamps.append(float(row["ts"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        last_user_ts = max(tail_user_timestamps, default=None)
+    return context.build_temporal_context(
+        now_ts=now_ts,
+        timezone_name=str(snapshot.get("timezone") or "UTC"),
+        last_user_message_ts=last_user_ts,
+        tail=tail,
+    )
 
 
 async def _web_batch_cancellation(
@@ -4775,6 +4826,12 @@ async def _run_wake(
             # not a reuse of `_ensure_prompt_coverage`'s return — see
             # `_assert_prompt_covers`'s docstring for why.
             await _assert_prompt_covers(user_id, _TAIL_BUDGET)
+        temporal_context = await _resolve_turn_temporal_context(
+            user_id=user_id,
+            deps=deps,
+            tail=tail,
+            through_seq=(wake_snapshot_seq if seq_context else None),
+        )
         wake_tail = list(tail) + [{"role": "user", "content": _WAKE_NUDGE}]
 
         # screen_watch lane grounds on recent shared-screen availability (Task 3).
@@ -5455,6 +5512,7 @@ async def _run_wake(
             trusted_system_blocks=trusted_system_blocks,
             working_memory=working_memory,
             provider_config=provider_config,
+            temporal_context=temporal_context,
         )
 
         await _fence_wake_effect("wake turn")
@@ -6881,6 +6939,15 @@ async def process_job(
         else:
             summary, tail = "", []
 
+        temporal_context = await _resolve_turn_temporal_context(
+            user_id=user_id,
+            deps=deps,
+            tail=tail,
+            through_seq=(
+                prompt_snapshot_through_seq if seq_native else None
+            ),
+        )
+
         platform_effects_by_call: dict[str, tuple[str, str]] = {}
         platform_workspace_batches: dict[
             tuple[str, ...], tuple[str, str]
@@ -7730,6 +7797,7 @@ async def process_job(
             trusted_system_blocks=trusted_system_blocks,
             working_memory=working_memory,
             provider_config=provider_config,
+            temporal_context=temporal_context,
         )
 
         await _ensure_runtime_mode()

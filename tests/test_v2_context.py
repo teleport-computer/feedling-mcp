@@ -1,8 +1,10 @@
+import asyncio
+import json
 import pathlib
 import sys
-import json
+from datetime import datetime, timezone
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))
-from model_api_runtime.v2 import context
+from model_api_runtime.v2 import context, worker
 
 def test_build_turn_messages_orders_persona_summary_tail():
     tail = [
@@ -159,6 +161,107 @@ def test_build_turn_messages_still_drops_empty_text_rows():
     msgs = context.build_turn_messages(
         system_prompt="sys", summary="", tail=[{"role": "user", "content": "   "}])
     assert [m["role"] for m in msgs] == ["system"]
+
+
+def test_temporal_context_maps_visible_tail_without_mutating_messages():
+    now = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc).timestamp()
+    blocks = [{"type": "text", "text": "look"}]
+    tail = [
+        {"role": "user", "content": " ", "ts": now - 500},
+        {"role": "user", "content": "USER_TAIL_MARKER", "ts": now - 3600},
+        {"role": "assistant", "content": blocks, "ts": now - 90},
+        {"role": "user", "content": "no timestamp"},
+    ]
+    temporal = context.build_temporal_context(
+        now_ts=now,
+        timezone_name="Asia/Shanghai",
+        last_user_message_ts=now - 3600,
+        tail=tail,
+    )
+    messages = context.build_turn_messages(
+        system_prompt="sys",
+        summary="",
+        tail=tail,
+        temporal_context=temporal,
+    )
+
+    assert messages[1] == {"role": "user", "content": "USER_TAIL_MARKER"}
+    assert messages[2]["content"] is blocks
+    assert messages[3] == {"role": "user", "content": "no timestamp"}
+    assert messages[-1]["content"].startswith(context.TEMPORAL_CONTEXT_HEADER + "\n")
+    payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
+    data = payload["temporal_context"]
+    assert data["current_local_time"] == "2026-07-26T20:00:00+08:00"
+    assert data["current_utc_time"] == "2026-07-26T12:00:00+00:00"
+    assert data["timezone"] == "Asia/Shanghai"
+    assert data["last_genuine_user_message_sent_at"] == (
+        "2026-07-26T19:00:00+08:00"
+    )
+    assert data["seconds_since_last_genuine_user_message"] == 3600
+    assert data["tail_timestamps"] == [
+        {
+            "age_label": "1h ago",
+            "age_seconds": 3600,
+            "index": 0,
+            "sent_at": "2026-07-26T19:00:00+08:00",
+        },
+        {
+            "age_label": "1m ago",
+            "age_seconds": 90,
+            "index": 1,
+            "sent_at": "2026-07-26T19:58:30+08:00",
+        },
+    ]
+    assert "USER_TAIL_MARKER" not in messages[0]["content"]
+    assert context.TEMPORAL_CONTEXT_HEADER in messages[0]["content"]
+
+
+def test_temporal_context_invalid_timezone_falls_back_to_utc():
+    temporal = context.build_temporal_context(
+        now_ts=1_000,
+        timezone_name="not/a-zone",
+        last_user_message_ts=1e300,
+        tail=[
+            {"role": "user", "content": "bad time", "ts": 1e300},
+            {"role": "assistant", "content": "also bad", "ts": float("inf")},
+        ],
+    )
+    assert temporal["timezone"] == "UTC"
+    assert temporal["current_local_time"].endswith("+00:00")
+    assert temporal["last_genuine_user_message_sent_at"] is None
+    assert temporal["seconds_since_last_genuine_user_message"] is None
+    assert temporal["tail_timestamps"] == []
+
+
+def test_worker_captures_temporal_snapshot_once_at_frozen_frontier(monkeypatch):
+    calls = []
+    deps = worker.TurnDeps(
+        read_messages=lambda _user_id: [],
+        resolve_provider=lambda _user_id: (None, {}),
+        mint_enclave_token=lambda _user_id: "token",
+        read_temporal_snapshot=lambda user_id, *, through_seq=None: (
+            calls.append((user_id, through_seq))
+            or {
+                "timezone": "Asia/Shanghai",
+                "last_user_message_ts": 900.0,
+            }
+        ),
+    )
+    monkeypatch.setattr(worker.time, "time", lambda: 1_000.0)
+
+    temporal = asyncio.run(
+        worker._resolve_turn_temporal_context(
+            user_id="u-time",
+            deps=deps,
+            tail=[{"role": "user", "content": "hello", "ts": 900.0}],
+            through_seq=42,
+        )
+    )
+
+    assert calls == [("u-time", 42)]
+    assert temporal["timezone"] == "Asia/Shanghai"
+    assert temporal["seconds_since_last_genuine_user_message"] == 100
+    assert temporal["tail_timestamps"][0]["index"] == 0
 
 
 def test_needs_compaction_counts_image_rows():

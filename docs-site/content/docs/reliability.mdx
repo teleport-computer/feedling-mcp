@@ -113,6 +113,14 @@ Self-hosted operators can override the default with
 restores fail-closed configuration. Explicit route metadata, audited model
 families, and deployment overrides keep precedence over this fallback.
 
+Runtime V2 takes one temporal snapshot for each chat or wake turn.
+The prompt receives the current UTC time, the user's local IANA timezone and
+local time, the age of the latest genuine user message, and timestamp metadata
+for the verbatim conversation tail. The registered account timezone takes
+precedence over the latest stable device-perception timezone; users without
+either value fall back to UTC. Temporal metadata is appended as untrusted
+application data and does not change the original conversation messages.
+
 Automatic Runtime V2 heartbeat and agent-scheduled wake failures use a
 persistent per-user exponential retry delay. The delay starts at 60 seconds
 and is capped at one hour; a successful automatic wake clears it. A new
