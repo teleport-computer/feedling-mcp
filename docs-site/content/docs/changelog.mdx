@@ -28,6 +28,12 @@ change must not be interpreted as an API guarantee.
   Disabling screen watch prevents its producer from enqueueing background work;
   Heartbeat and the other proactive controls remain independent. Runtime V1
   behavior is unchanged.
+- **Legacy perception wakes now honor the same dedicated controls as Runtime
+  V2.** Photo, arrival, and unlock events map to their canonical triggers and
+  are governed only by their corresponding switches; disabling Heartbeat no
+  longer suppresses them. Motion-state changes remain readable perception
+  context but no longer create proactive wakes. DND and Away remain global
+  suppressors.
 
 - **Long-term provider configuration failures now pause proactive model work.**
   When an account has gone 48 hours without a usable provider response and its

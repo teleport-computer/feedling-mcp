@@ -320,7 +320,7 @@ def test_playback_and_calendar_via_report(env):
     assert snap["calendar_next_event"]["minutes_until_start"] == 45
 
 
-def test_wake_debounce(env):
+def test_arrival_wake_debounce(env):
     fake, wakes = env
     fake.merge_config(UID, {"geofences": [
         {"label": "home", "lat": 37.0, "lon": -122.0, "radius_m": 150},
@@ -330,6 +330,37 @@ def test_wake_debounce(env):
     service.ingest_snapshot(UID, [_item("location_signal",
                                         {"signal": {"latitude": 40.0, "longitude": -73.0}})])   # work, debounced
     assert len([w for w in wakes if w[0] == "location"]) == 1
+    events = fake.read_events(UID)
+    assert any(e.get("type") == "wake" and e.get("trigger") == "arrived_at_anchor"
+               for e in events)
+    assert any(e.get("type") == "debounced" and e.get("trigger") == "arrived_at_anchor"
+               for e in events)
+
+
+def test_legacy_motion_change_is_context_only_and_never_wakes(env):
+    fake, wakes = env
+
+    service.ingest_snapshot(UID, [_item("motion_state", {"state": "walking"})])
+    service.ingest_snapshot(UID, [_item("motion_state", {"state": "running"})])
+
+    assert service.snapshot(UID)["motion_state"] == {"state": "running"}
+    assert wakes == []
+    assert not any(e.get("type") == "wake" for e in fake.read_events(UID))
+
+
+@pytest.mark.parametrize(
+    ("cap_key", "trigger"),
+    [
+        ("photos", "photo_added"),
+        ("location", "arrived_at_anchor"),
+        ("wifi", "arrived_at_anchor"),
+        ("region", "arrived_at_anchor"),
+        ("device", "unlock_after_absence"),
+        ("motion", ""),
+    ],
+)
+def test_legacy_wake_trigger_map_has_no_supported_source_gaps(cap_key, trigger):
+    assert service._legacy_wake_trigger(cap_key) == trigger
 
 
 def test_photo_sensitive_scene_stored_without_hard_block(env):
@@ -691,7 +722,7 @@ def test_report_items_malformed_400(env, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Mechanical wake gate (enabled / dnd / away) — mirrors the tick path
+# Mechanical wake gate (dedicated switch / dnd / away)
 # ---------------------------------------------------------------------------
 
 def _ingest_location(uid, label):
@@ -714,10 +745,9 @@ def test_wake_suppressed_when_perception_user_state_away(env, monkeypatch):
     assert not any(e.get("type") == "wake" for e in events)
 
 
-def test_wake_suppressed_when_settings_disabled_or_dnd_or_away(env, monkeypatch):
+def test_wake_suppressed_when_dnd_or_away(env, monkeypatch):
     fake, wakes = env
     cases = [
-        ({"enabled": False}, "proactive_disabled"),
         ({"enabled": True, "dnd": True}, "dnd_enabled"),
         ({"enabled": True, "dnd": False, "user_state": "away"}, "user_away"),
     ]
@@ -728,6 +758,54 @@ def test_wake_suppressed_when_settings_disabled_or_dnd_or_away(env, monkeypatch)
         assert wakes == [], f"case {reason}: wake should be suppressed"
         assert any(e.get("type") == "suppressed" and e.get("reason") == reason
                    for e in fake.read_events(uid)), f"case {reason}"
+
+
+@pytest.mark.parametrize(
+    ("kind", "switch", "blocked_reason"),
+    [
+        ("photos", "photo_wake_enabled", "photo_wake_disabled"),
+        ("location", "arrival_wake_enabled", "arrival_wake_disabled"),
+        ("unlock", "unlock_wake_enabled", "unlock_wake_disabled"),
+    ],
+)
+def test_legacy_wakes_use_dedicated_switches_not_heartbeat(
+    env, monkeypatch, kind, switch, blocked_reason
+):
+    fake, wakes = env
+
+    def emit(uid):
+        if kind == "photos":
+            out, code = service.photo_evaluate(
+                uid, {"scene_hint": "food"}, {"id": f"p_{uid}", "body_ct": "cipher"})
+            assert code == 200 and out["status"] == "stored"
+        elif kind == "location":
+            _ingest_location(uid, "gym")
+        else:
+            service._maybe_wake(
+                uid, "device", 0.0, "last_unlock_ago_sec", 3600, 0, 1000.0)
+
+    blocked_uid = f"u_{kind}_blocked"
+    monkeypatch.setattr(
+        service,
+        "_settings_v2_for_user",
+        lambda uid: {"enabled": False, "switches": {switch: False}},
+    )
+    emit(blocked_uid)
+    assert wakes == []
+    assert any(
+        e.get("type") == "suppressed" and e.get("reason") == blocked_reason
+        for e in fake.read_events(blocked_uid)
+    )
+
+    allowed_uid = f"u_{kind}_allowed"
+    monkeypatch.setattr(
+        service,
+        "_settings_v2_for_user",
+        lambda uid: {"enabled": False, "switches": {switch: True}},
+    )
+    emit(allowed_uid)
+    assert len(wakes) == 1
+    assert any(e.get("type") == "wake" for e in fake.read_events(allowed_uid))
 
 
 def test_wake_suppressed_until_proactive_activation(env, monkeypatch):

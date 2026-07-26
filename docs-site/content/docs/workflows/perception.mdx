@@ -129,6 +129,14 @@ The response confirms classification and processing, not that a proactive wake
 was emitted. Wake policy, user settings, activation state, freshness ordering,
 and debounce can suppress downstream notification independently.
 
+Legacy compatibility producers use the same dedicated wake controls as Runtime
+V2: photos map to `photo_added`, location/Wi-Fi/region arrival signals map to
+`arrived_at_anchor`, and a return after a long device lock maps to
+`unlock_after_absence`. These are controlled by the photo, arrival, and unlock
+wake switches respectively; disabling Heartbeat does not disable them. Motion
+state remains available in the snapshot but never creates a proactive wake.
+Global DND and Away suppression still apply.
+
 ## 3. Read the current snapshot
 
 ```http
