@@ -82,6 +82,29 @@ def _unpin(api_url: str, user_id: str, token: str) -> None:
            body={"user_id": user_id, "desired": "resident", "note": "temporal probe cleanup"})
 
 
+def _retry_transport(fn, *, attempts: int = 4, label: str = ""):
+    """Run ``fn`` through transient TLS/connect flaps on the test CVM.
+
+    The test gateway drops TLS during deploy windows (observed 2026-07-26:
+    handshake fails while TCP still connects in 4ms). Letting that abort the
+    probe is bad twice over — the run is lost, AND the ``finally`` cleanup hits
+    the same dead gateway and leaks a provisioned account. Everything that
+    talks to the API goes through here.
+    """
+    delay, last = 4.0, None
+    for _ in range(attempts):
+        try:
+            return fn()
+        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as exc:
+            last = exc
+            if label:
+                print(f"[temporal] {label}: transport flap ({exc}); retrying in {delay:.0f}s",
+                      file=sys.stderr)
+            time.sleep(delay)
+            delay *= 2
+    raise last  # type: ignore[misc]
+
+
 def _ask(c: E2EClient, text: str) -> tuple[str, float]:
     """Send one hosted turn, return (decrypted_reply_text, round_trip_sec).
 
@@ -90,10 +113,11 @@ def _ask(c: E2EClient, text: str) -> tuple[str, float]:
     off the row yields nothing.
     """
     t0 = time.time()
-    sent, err = _hosted_send(c, text)
+    sent, err = _retry_transport(lambda: _hosted_send(c, text), label="send")
     if err:
         return f"[send failed: {err}]", time.time() - t0
-    reply = c.wait_reply(sent, timeout=REPLY_TIMEOUT_SEC)
+    reply = _retry_transport(
+        lambda: c.wait_reply(sent, timeout=REPLY_TIMEOUT_SEC), label="wait_reply")
     return (c.message_text(reply) if reply else ""), time.time() - t0
 
 
@@ -133,8 +157,42 @@ def _judge_gap(reply: str, gap_sec: float) -> tuple[bool, str]:
     return False, f"reply {nums} far from real {minutes:.1f}min"
 
 
+def _cleanup_orphans(api_url: str, token: str) -> int:
+    """Unpin every leaked account, then hand deletion to p0's existing sweeper.
+
+    Deletion logic is deliberately NOT duplicated here: ``p0._cleanup_orphans``
+    already encodes the rules that matter (``_refuse_prod`` on every manifest,
+    remove the entry only on proof of deletion, keep it on 401 as an evidence
+    trail). Copying that would mean two sweepers drifting apart. This adds only
+    the step p0 has no reason to know about — releasing the Runtime V2 allowlist
+    pin this probe applied.
+    """
+    from tools.e2e.client import _ORPHANS_DIR
+    from tools.e2e.p0 import _cleanup_orphans as sweep
+
+    files = sorted(_ORPHANS_DIR.glob("*.json")) if _ORPHANS_DIR.exists() else []
+    for path in files:
+        try:
+            rec = json.loads(path.read_text())
+            uid = str(rec["user_id"])
+            api = str(rec.get("api_url") or api_url)
+        except Exception as exc:  # noqa: BLE001 — p0's sweep reports bad manifests
+            print(f"[temporal] {path.name}: unreadable ({exc}); leaving to sweeper",
+                  file=sys.stderr)
+            continue
+        try:
+            _retry_transport(lambda: _unpin(api, uid, token), label=f"unpin {uid}")
+            print(f"[temporal] {uid}: allowlist pin released")
+        except Exception as exc:  # noqa: BLE001 — deletion still worth attempting
+            print(f"[temporal] {uid}: unpin failed ({exc}); deleting anyway",
+                  file=sys.stderr)
+    return sweep()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--cleanup-orphans", action="store_true",
+                    help="unpin+delete accounts left by a crashed run, then exit")
     ap.add_argument("--gap-sec", type=float, default=240.0,
                     help="measured silence before Q2 (default 240s)")
     ap.add_argument("--api", default=os.environ.get("FEEDLING_E2E_API", TEST_API))
@@ -148,6 +206,8 @@ def main() -> int:
     if not token:
         print(f"[temporal] no admin token at {ADMIN_TOKEN_FILE}", file=sys.stderr)
         return 2
+    if args.cleanup_orphans:
+        return _cleanup_orphans(args.api, token)
     key = load_keys().get(args.key_env, "")
     if not key:
         print(f"[temporal] no {args.key_env} in the key pool", file=sys.stderr)
@@ -197,15 +257,22 @@ def main() -> int:
     finally:
         if user_id and not args.keep:
             try:
-                _unpin(args.api, user_id, token)
+                _retry_transport(lambda: _unpin(args.api, user_id, token), label="unpin")
             except Exception as exc:  # noqa: BLE001 — cleanup must not mask results
                 print(f"[temporal] unpin failed (non-fatal): {exc}", file=sys.stderr)
         if not args.keep:
             try:
-                c.teardown()
+                _retry_transport(c.teardown, label="teardown")
                 print("[temporal] account torn down")
             except Exception as exc:  # noqa: BLE001
-                print(f"[temporal] teardown failed — ORPHAN {user_id}: {exc}", file=sys.stderr)
+                # The orphan manifest (~/.feedling-e2e-orphans/) still holds the
+                # credentials; say so explicitly instead of leaving a bare stack
+                # trace, because a leaked account is a hygiene violation someone
+                # has to clean up by hand.
+                print(f"[temporal] teardown failed — ORPHAN {user_id} "
+                      f"(creds in ~/.feedling-e2e-orphans/{user_id}.json, "
+                      f"rerun with --cleanup-orphans once the env is back): {exc}",
+                      file=sys.stderr)
 
 
 def _report(results: list[tuple[str, bool, str]]) -> int:
