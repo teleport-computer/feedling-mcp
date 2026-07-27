@@ -243,6 +243,9 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0059_v2_incident_wake_guards").down_revision == (
         "0058_provider_usage_halted"
     )
+    assert script.get_revision("0059_chat_activity_lookup_idx").down_revision == (
+        "0058_provider_usage_halted"
+    )
     assert script.get_revision("0060_v2_wake_failure_backoff").down_revision == (
         "0059_v2_incident_wake_guards"
     )
@@ -255,7 +258,11 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0063_model_api_vision_route").down_revision == (
         "0062_chat_activity_lookup_idx"
     )
-    assert script.get_current_head() == "0063_model_api_vision_route"
+    assert set(script.get_revision("0064_merge_legacy_chat_activity").down_revision) == {
+        "0063_model_api_vision_route",
+        "0059_chat_activity_lookup_idx",
+    }
+    assert script.get_current_head() == "0064_merge_legacy_chat_activity"
 
 
 def test_provider_health_schema_is_runtime_neutral():
