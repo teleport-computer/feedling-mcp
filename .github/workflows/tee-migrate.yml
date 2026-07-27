@@ -58,27 +58,48 @@ jobs:
           python -m pip install --upgrade pip
           pip install --require-hashes -r backend/requirements.lock
 
+      # ⚠️ 下面三个 step 一律「两套机密都注入、在 shell 里按环境挑」，**绝不**写成
+      # `${{ inputs.environment == 'prod' && secrets.PROD_X || secrets.TEST_X }}`。
+      # GH 表达式的 &&/|| 是 JS 语义（返回值而非布尔，空串是 falsy）：PROD_X 恰好
+      # 为空时会静默短路 fallback 到 TEST_X，于是非空校验照样通过，而一次标记为
+      # prod 的 dispatch 实际跑在 test 库上、Assert 还全部匹配、job 绿灯——正好复现
+      # 本 workflow 要根治的那类「以为执行了其实没执行」的故障，只是换了个方向。
+      # 本仓库已有同款教训与既定写法：见 pg-deploy.yml:96-99（那次是注进 prod CVM
+      # 的却是 test 的密码）。按环境挑错只会挑到空值 → fail-closed。
+      # 注意 pg-deploy.yml:43 的 `ref: ${{ ... && 'main' || 'test' }}` 不受此影响：
+      # 它的两个分支是字面量，永远非空。危险的只是把它用在可能为空的 secrets 上。
       - name: Write CA cert
         env:
-          CA_PEM: ${{ inputs.environment == 'prod' && secrets.PROD_TEE_PG_CA_PEM || secrets.TEST_TEE_PG_CA_PEM }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          TEST_CA_PEM: ${{ secrets.TEST_TEE_PG_CA_PEM }}
+          PROD_CA_PEM: ${{ secrets.PROD_TEE_PG_CA_PEM }}
         run: |
           umask 077
+          if [ "$ENVIRONMENT" = "prod" ]; then CA_PEM="$PROD_CA_PEM"; else CA_PEM="$TEST_CA_PEM"; fi
           printf '%s' "$CA_PEM" > /tmp/tee-ca.crt
-          test -s /tmp/tee-ca.crt || { echo "::error::CA cert secret 为空"; exit 1; }
+          test -s /tmp/tee-ca.crt || { echo "::error::${ENVIRONMENT} 的 CA cert secret 为空或未创建"; exit 1; }
 
       - name: Run alembic_tee upgrade head
         env:
-          TEE_MIGRATION_DATABASE_URL: ${{ inputs.environment == 'prod' && secrets.PROD_TEE_MIGRATION_DSN || secrets.TEST_TEE_MIGRATION_DSN }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          TEST_DSN: ${{ secrets.TEST_TEE_MIGRATION_DSN }}
+          PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
         run: |
+          if [ "$ENVIRONMENT" = "prod" ]; then DSN="$PROD_DSN"; else DSN="$TEST_DSN"; fi
+          test -n "$DSN" || { echo "::error::${ENVIRONMENT} 的 TEE_MIGRATION_DSN secret 为空或未创建"; exit 1; }
           # DSN 里必须已含 sslmode=verify-full&sslnegotiation=direct；这里只补 CA 路径。
-          export TEE_MIGRATION_DATABASE_URL="${TEE_MIGRATION_DATABASE_URL}&sslrootcert=/tmp/tee-ca.crt"
+          export TEE_MIGRATION_DATABASE_URL="${DSN}&sslrootcert=/tmp/tee-ca.crt"
           python -m backend.alembic_tee upgrade
 
       - name: Assert version == code head
         env:
-          TEE_MIGRATION_DATABASE_URL: ${{ inputs.environment == 'prod' && secrets.PROD_TEE_MIGRATION_DSN || secrets.TEST_TEE_MIGRATION_DSN }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          TEST_DSN: ${{ secrets.TEST_TEE_MIGRATION_DSN }}
+          PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
         run: |
-          export TEE_MIGRATION_DATABASE_URL="${TEE_MIGRATION_DATABASE_URL}&sslrootcert=/tmp/tee-ca.crt"
+          if [ "$ENVIRONMENT" = "prod" ]; then DSN="$PROD_DSN"; else DSN="$TEST_DSN"; fi
+          test -n "$DSN" || { echo "::error::${ENVIRONMENT} 的 TEE_MIGRATION_DSN secret 为空或未创建"; exit 1; }
+          export TEE_MIGRATION_DATABASE_URL="${DSN}&sslrootcert=/tmp/tee-ca.crt"
           python - <<'PY'
           import os, sys, psycopg
           sys.path.insert(0, "backend")
