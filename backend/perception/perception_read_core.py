@@ -132,13 +132,27 @@ def items_recent(store, kind: str, limit_raw: Any) -> tuple[dict, int]:
     return service.items_recent(store.user_id, kind, limit=limit)
 
 
-def app_open(store, query) -> tuple[dict, int]:
-    """Record one app-open event from the iOS Shortcut GET. ALL params (incl. the
-    api key, already consumed by auth) arrive in the query string. ``query`` is a
-    mapping with ``.get`` (Flask ``request.args`` / Starlette ``query_params``);
-    the fallback order (``app``/``bundle_id``, ``ts``/``client_ts``) is kept here
-    so both adapters extract identically."""
+def _app_event_params(query) -> tuple[str, str | None, str | None]:
+    """Extract (app, category, client_ts) from an iOS Shortcut GET.
+
+    ALL params (incl. the api key, already consumed by auth) arrive in the query
+    string. The fallback order (``app``/``bundle_id``, ``ts``/``client_ts``) lives
+    HERE so both endpoints and every adapter extract identically. ``query`` is a
+    mapping with ``.get`` (Starlette ``query_params``; a plain dict in tests)."""
     app = query.get("app") or query.get("bundle_id") or ""
     category = query.get("category")
     client_ts = query.get("ts") or query.get("client_ts")
+    return app, category, client_ts
+
+
+def app_open(store, query) -> tuple[dict, int]:
+    """Record one app-open event from the iOS Shortcut GET."""
+    app, category, client_ts = _app_event_params(query)
     return service.app_open(store.user_id, app, category=category, client_ts=client_ts)
+
+
+def app_close(store, query) -> tuple[dict, int]:
+    """Record one app-close event from the iOS Shortcut GET (the automation's
+    "is closed" trigger)."""
+    app, category, client_ts = _app_event_params(query)
+    return service.app_close(store.user_id, app, category=category, client_ts=client_ts)

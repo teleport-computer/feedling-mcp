@@ -55,9 +55,11 @@ class _PerceptionClient:
 
     def get(self, path):
         u = urlparse(path)
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
         if u.path == "/v1/perception/app_open":
-            q = {k: v[0] for k, v in parse_qs(u.query).items()}
             return _PResp(*perception_read_core.app_open(self._store, q))
+        if u.path == "/v1/perception/app_close":
+            return _PResp(*perception_read_core.app_close(self._store, q))
         raise AssertionError(f"unrouted path: {u.path}")
 
 
@@ -592,6 +594,17 @@ def test_app_open_via_get_route(env, monkeypatch):
     r = client.get("/v1/perception/app_open?key=APIKEY&app=Instagram&category=social&ts=1000")
     assert r.status_code == 200 and r.get_json()["app"] == "Instagram"
     assert fake.get_state(UID)["app_name"]["v"] == "Instagram"
+
+
+def test_app_close_via_get_route(env, monkeypatch):
+    """走真实的 read_core 参数提取（含 bundle_id / client_ts 两组别名）。"""
+    fake, _ = env
+    client = _PerceptionClient(fake)
+    client.get("/v1/perception/app_open?key=APIKEY&app=Instagram&ts=1000")
+    r = client.get("/v1/perception/app_close?key=APIKEY&bundle_id=Instagram&client_ts=1600")
+    assert r.status_code == 200
+    assert r.get_json()["app"] == "Instagram"
+    assert fake.get_state(UID)["app_state"]["v"] == "closed"
 
 
 def test_future_client_ts_clamped(env):
