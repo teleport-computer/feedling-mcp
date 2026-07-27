@@ -53,6 +53,7 @@ from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import db
+import provider_attempt_ledger
 import provider_client
 import provider_health
 from notices import catalog as notices_catalog
@@ -893,6 +894,26 @@ class WorkspacePromptUnavailable(RuntimeError):
     """The encrypted workspace prefix could not be loaded safely."""
 
 
+# The prompt-coverage invariant's stable error string.  Kept as a constant
+# because it is matched (not just raised) in `_safe_failure_code`, which turns
+# it into the persisted terminal status operators read.
+_COVERAGE_INCOMPLETE = "prompt_coverage_incomplete"
+
+
+def _coverage_incomplete_reason(reject_code: str = "") -> str:
+    """Attach a content-free compaction reject code to the coverage error.
+
+    A catch-up that keeps rejecting the same fold stalls the watermark
+    silently and re-reads the identical batch forever.  Carrying the reject
+    code out to the terminal status is what makes that loop diagnosable from
+    `agent_jobs.last_error` alone — no trajectory decrypt, no code reading.
+    """
+    code = str(reject_code or "").strip()
+    if not code:
+        return _COVERAGE_INCOMPLETE
+    return f"{_COVERAGE_INCOMPLETE}:{code}"[:110]
+
+
 def _is_degenerate_reply(text: Any) -> bool:
     """Return true for empty or punctuation/separator-only provider output."""
     for char in str(text or ""):
@@ -913,6 +934,17 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
             "empty_reply",
             "no_user_messages",
         }:
+            kind = raw
+        elif raw == _COVERAGE_INCOMPLETE or raw.startswith(
+            f"{_COVERAGE_INCOMPLETE}:"
+        ):
+            # Promoted out of the `responder_error` bucket deliberately. A
+            # coverage stall is invisible to the user (the turn never reaches
+            # the model that answers them) and self-perpetuating (the identical
+            # batch is re-read next turn), so it must be distinguishable from
+            # the other eleven TurnError sites without decrypting a trajectory.
+            # The suffix, when present, is the content-free compaction reject
+            # code that stalled the watermark.
             kind = raw
         else:
             # Keep the established persisted code stable across the internal
@@ -1961,6 +1993,73 @@ def _make_trajectory_recorder(
     )
 
 
+_LEDGER_EVENTS = frozenset({"provider_response", "provider_error"})
+
+
+def _note_provider_attempt(
+    user_id: str, event_kind: str, payload: dict, *, job_id: Any = None
+) -> None:
+    """Mirror one provider outcome into the plaintext attempt ledger.
+
+    The trajectory already records this, but it is sealed: answering "does this
+    user's relay work at all" from it needs a break-glass decrypt. V1's resident
+    consumer has kept a plaintext ledger of exactly this shape all along, which
+    is why "the same relay succeeds 897 times under V1" was a one-line query
+    while the V2 side of the same comparison was not (usr_90184…, 2026-07-27).
+
+    Metadata only — outcome, token counts, provider/model, error CLASS. No
+    prompt, no reply, no raw error text, matching the module's contract.
+    """
+    if event_kind not in _LEDGER_EVENTS:
+        return
+    try:
+        lane = str(payload.get("lane") or "") or "chat"
+        trigger = "v2_catchup" if lane == "prompt_catchup" else "v2_turn"
+        response = payload.get("response")
+        usage = response.get("usage") if isinstance(response, dict) else None
+        usage = usage if isinstance(usage, dict) else {}
+        failed = event_kind == "provider_error"
+        provider_attempt_ledger.record_runtime_attempt(
+            user_id,
+            parent_key=f"v2job:{job_id}" if job_id is not None else "v2job:unknown",
+            trigger=trigger,
+            outcome="provider_error" if failed else "ok",
+            provider=str(payload.get("provider") or ""),
+            model=str(payload.get("model") or ""),
+            lane=lane,
+            input_tokens=usage.get("prompt_tokens"),
+            output_tokens=usage.get("completion_tokens"),
+            error_class=str(payload.get("error_class") or "") if failed else "",
+        )
+    except Exception:  # noqa: BLE001 - telemetry must not break a turn
+        pass
+
+
+async def _mirror_provider_attempt(
+    recorder: Any, event_kind: str, payload: dict
+) -> None:
+    """Best-effort ledger mirror for whatever trajectory sink is in play.
+
+    Deliberately tolerant of the sink's shape: a recorder without a `user_id`
+    (test doubles, narrower callers) simply produces no ledger row. Telemetry
+    that can raise is worse than telemetry that is absent — this wraps the
+    foreground turn's provider calls, so an AttributeError here would fail the
+    very turns it exists to explain.
+    """
+    if event_kind not in _LEDGER_EVENTS:
+        return
+    user_id = str(getattr(recorder, "user_id", "") or "")
+    if not user_id:
+        return
+    await asyncio.to_thread(
+        _note_provider_attempt,
+        user_id,
+        event_kind,
+        payload,
+        job_id=getattr(recorder, "job_id", None),
+    )
+
+
 async def _record_trajectory(
     recorder: v2_trajectory.TrajectoryRecorder | None,
     event_kind: str,
@@ -1971,9 +2070,30 @@ async def _record_trajectory(
     if recorder is None:
         return False
     if best_effort:
-        return await recorder.record_best_effort(event_kind, payload)
-    await recorder.record(event_kind, payload)
-    return True
+        recorded = await recorder.record_best_effort(event_kind, payload)
+    else:
+        await recorder.record(event_kind, payload)
+        recorded = True
+    await _mirror_provider_attempt(recorder, event_kind, payload)
+    return recorded
+
+
+def _ledger_tapped_sink(recorder: v2_trajectory.TrajectoryRecorder | None):
+    """`recorder.record` plus the plaintext ledger mirror, for tool_loop.
+
+    The foreground turn's provider calls reach the trajectory through
+    `on_trajectory_event`, not through `_record_trajectory`, so tapping only
+    the latter would leave the lane that actually answers the user — the one
+    whose failures the user sees — missing from the ledger.
+    """
+    if recorder is None:
+        return None
+
+    async def _record(event_kind: str, payload: dict) -> None:
+        await recorder.record(event_kind, payload)
+        await _mirror_provider_attempt(recorder, event_kind, payload)
+
+    return _record
 
 
 def _make_tool_trajectory_callback(
@@ -4802,6 +4922,165 @@ async def _assert_prompt_tail_exact(
         raise TurnError("prompt_coverage_incomplete")
 
 
+_QUARANTINE_ENABLED = os.environ.get(
+    "FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _quarantine_segment_text(reject_code: str) -> str:
+    """The stand-in summary written for a message no model would fold.
+
+    Deterministic and content-free by construction — it is generated here, not
+    by a provider, precisely because every provider attempt was refused. It
+    still has to read as a useful summary line, because it goes into the same
+    prompt position the real summary would have: it tells the assistant that a
+    message exists here which this summary does not represent, so the
+    assistant does not treat the gap as "nothing happened".
+
+    Quarantining loses summary coverage, NOT data: `chat_messages` is the
+    immutable transcript and is untouched. The row stays readable through
+    history and stays foldable by a future, smarter compactor.
+    """
+    detail = str(reject_code or "").strip() or "unknown"
+    return (
+        "- （系统记录）此处有 1 条历史消息未能被自动摘要"
+        f"（连续多次归纳失败，最后一次原因：{detail}），"
+        "其内容不在本摘要覆盖范围内；原始消息仍完整保留在聊天记录中。"
+    )
+
+
+async def _quarantine_unfoldable_head(
+    user_id: str,
+    deps: TurnDeps,
+    *,
+    enclave_sem: "asyncio.Semaphore | None",
+    seq_callbacks: bool,
+    watermark_seq: int,
+    compact_through_seq: int | None,
+    reject_code: str,
+    within_deadline: Callable[[Callable[[], Awaitable[Any]]], Awaitable[Any]],
+    renew_lease: Callable[[], Awaitable[None]],
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+) -> bool:
+    """Cover exactly the one oldest unsummarized row with a stand-in segment.
+
+    Head-of-line unblocking, the same shape as the TEE replication poison-row
+    fix: isolate the one row that cannot move, advance past it, and leave a
+    durable record of what was skipped. Coverage stays honest — the segment's
+    seq range is exactly the row it replaces, so
+    `validate_canonical_frontier`'s witnesses still hold — while the summary
+    text says plainly that this row's content is not represented.
+
+    Deliberately ONE row, never the failed batch: quarantining 200 messages to
+    unblock one would throw away 199 perfectly foldable ones.
+    """
+
+    async def _read_head() -> tuple[Any, list[dict]]:
+        if seq_callbacks:
+            summary_ = await asyncio.to_thread(deps.read_summary_with_seq, user_id)
+            reader_ = deps.read_compaction_tail_after_seq or deps.read_tail_after_seq
+            rows_ = await asyncio.to_thread(
+                reader_,
+                user_id,
+                watermark_seq,
+                1,
+                **(
+                    {"through_seq": int(compact_through_seq)}
+                    if compact_through_seq is not None
+                    else {}
+                ),
+            )
+            return summary_, list(rows_ or [])
+        summary_ = await asyncio.to_thread(deps.read_summary, user_id)
+        reader_ = deps.read_compaction_tail or deps.read_tail
+        rows_ = await asyncio.to_thread(reader_, user_id, summary_[1], 1)
+        return summary_, list(rows_ or [])
+
+    async def _read_head_gated() -> tuple[Any, list[dict]]:
+        if enclave_sem is not None:
+            async with enclave_sem:
+                return await _read_head()
+        return await _read_head()
+
+    summary_fields, head = await within_deadline(_read_head_gated)
+    if not head:
+        return False
+    summary, watermark_ts, version = summary_fields[:3]
+    if seq_callbacks and int(summary_fields[3]) != watermark_seq:
+        # A concurrent compactor moved the frontier — that IS progress; let the
+        # caller re-loop from the winning watermark rather than quarantining a
+        # row somebody else may already have folded.
+        return False
+
+    row = head[0]
+    row_seq = row.get("seq")
+    if row_seq is None:
+        row_id = row.get("id")
+        if row_id is None:
+            return False
+        row_seq = await within_deadline(
+            lambda: asyncio.to_thread(db.chat_seq_for_msg_id, user_id, row_id)
+        )
+    if row_seq is None:
+        return False
+    row_seq = int(row_seq)
+    row_ts = row["ts"]
+    text = _quarantine_segment_text(reject_code)
+
+    await renew_lease()
+    if deps.append_summary_segment is not None and seq_callbacks:
+        wrote = await within_deadline(
+            lambda: asyncio.to_thread(
+                deps.append_summary_segment,
+                user_id,
+                text,
+                current_summary=summary,
+                start_seq=row_seq,
+                end_seq=row_seq,
+                source_message_count=1,
+                watermark_ts=row_ts,
+                expected_version=version,
+                previous_watermark_seq=watermark_seq,
+            )
+        )
+    elif deps.write_summary is not None:
+        separator = "" if not summary or summary.endswith("\n") else "\n"
+        wrote = await within_deadline(
+            lambda: asyncio.to_thread(
+                deps.write_summary,
+                user_id,
+                (summary + separator + text) if summary else text,
+                row_ts,
+                version,
+                row_seq,
+            )
+        )
+    else:
+        return False
+
+    await _record_trajectory(
+        trajectory_recorder,
+        "compaction_quarantined",
+        {
+            "lane": "prompt_catchup",
+            "seq": row_seq,
+            "reject_code": str(reject_code or ""),
+            "written": bool(wrote),
+        },
+        best_effort=True,
+    )
+    if wrote:
+        # Plaintext, greppable, and rate-limited by construction (one line per
+        # row that ever needed this) — the signal that some user's history has
+        # a summary hole a future compactor should revisit.
+        print(
+            f"[v2-compaction] quarantined unfoldable row user={user_id} "
+            f"seq={row_seq} reject={reject_code or 'unknown'}",
+            flush=True,
+        )
+    return bool(wrote)
+
+
 async def _ensure_prompt_coverage(
     user_id: str,
     deps: TurnDeps,
@@ -4924,6 +5203,18 @@ async def _ensure_prompt_coverage(
     no_progress_attempts = 0
     last_observed_watermark: int | None = None
     attempted_since_observation = False
+    # Why the most recent fold was refused, if it was.  Content-free (rule
+    # name plus a count) and overwritten each attempt: what matters is the
+    # reason the batch that finally exhausted the retry budget was rejected.
+    last_reject_code = ""
+    # Shrinks on repeated refusal (see the escalation below).  Starts at the
+    # configured batch size so the healthy path is unchanged.
+    batch_cap = _COMPACTION_BATCH
+
+    def _note_reject(code: str) -> None:
+        nonlocal last_reject_code
+        last_reject_code = str(code or "")[:80]
+
     while True:
         _remaining()
         summary_row = await _within_deadline(
@@ -4969,21 +5260,78 @@ async def _ensure_prompt_coverage(
             )
         )
         if (
-            no_progress_attempts >= max_retries
-            or (
+            (
                 deps.write_summary is None
                 and deps.append_summary_segment is None
             )
             or not (seq_callbacks or legacy_callbacks)
         ):
-            raise TurnError("prompt_coverage_incomplete")
+            raise TurnError(_coverage_incomplete_reason("catchup_unwired"))
+        if no_progress_attempts >= max_retries:
+            # This batch is unfoldable, not merely slow: `max_retries`
+            # consecutive attempts left the watermark exactly where it was,
+            # and the next read returns the identical batch, so retrying the
+            # same shape can only repeat. Escalate instead of raising here.
+            if batch_cap > 1:
+                # Shrink first. Most refusals are a property of the BATCH, not
+                # of any one message (too many lines to render under the
+                # output budget, two messages summarizing to the same bullet),
+                # and a quarter-size batch usually folds cleanly. Each new size
+                # gets its own retry budget because it is a genuinely
+                # different request, not a repeat of the failed one.
+                batch_cap = max(1, batch_cap // 4)
+                no_progress_attempts = 0
+                last_observed_watermark = None
+                _report_turn_progress(f"prompt_catchup_shrink_{batch_cap}")
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "compaction_batch_shrunk",
+                    {
+                        "lane": "prompt_catchup",
+                        "batch_cap": batch_cap,
+                        "reject_code": last_reject_code,
+                    },
+                    best_effort=True,
+                )
+                continue
+            # Down to a single message and still refused: no smaller request
+            # exists. Without an escape hatch this user's every later message
+            # is blocked forever behind this one row (usr_7f30…, three days).
+            if not _QUARANTINE_ENABLED:
+                raise TurnError(_coverage_incomplete_reason(last_reject_code))
+            quarantined = await _quarantine_unfoldable_head(
+                user_id,
+                deps,
+                enclave_sem=enclave_sem,
+                seq_callbacks=seq_callbacks,
+                watermark_seq=watermark_seq,
+                compact_through_seq=compact_through_seq,
+                reject_code=last_reject_code,
+                within_deadline=_within_deadline,
+                renew_lease=_renew_catchup_lease,
+                trajectory_recorder=trajectory_recorder,
+            )
+            if not quarantined:
+                raise TurnError(
+                    _coverage_incomplete_reason(
+                        last_reject_code or "quarantine_failed"
+                    )
+                )
+            # Advance past it and keep going: the rest of the backlog is
+            # almost certainly foldable, and the batch cap resets because the
+            # blocking row is behind us now.
+            batch_cap = _COMPACTION_BATCH
+            no_progress_attempts = 0
+            last_observed_watermark = None
+            last_reject_code = ""
+            continue
         fold_count = min(
             (
                 unsummarized_count
                 if target_mode
                 else unsummarized_count - tail_limit
             ),
-            _COMPACTION_BATCH,
+            batch_cap,
         )
         if fold_count <= 0:
             continue
@@ -5034,9 +5382,40 @@ async def _ensure_prompt_coverage(
             continue
         summary, watermark_ts, version = summary_fields[:3]
         try:
-            old = _bounded_compaction_prefix(old)
+            old = _bounded_compaction_prefix(old, max_messages=batch_cap)
         except ValueError as exc:
-            raise TurnError("prompt_coverage_incomplete") from exc
+            # The oldest row alone exceeds the whole batch's char budget, so
+            # `_bounded_compaction_prefix` refuses to skip it (skipping would
+            # make the summary's seq coverage dishonest). No batch size can
+            # ever include it, which makes it permanently unfoldable rather
+            # than merely refused — shrinking would spin, so quarantine it
+            # directly. This is a real prod shape: an R2-offloaded row whose
+            # hydrated body is hundreds of KB sits in the backlog and stalls
+            # every message behind it (usr_7f30…, seq 682632).
+            if not _QUARANTINE_ENABLED:
+                raise TurnError(
+                    _coverage_incomplete_reason("message_exceeds_char_budget")
+                ) from exc
+            if not await _quarantine_unfoldable_head(
+                user_id,
+                deps,
+                enclave_sem=enclave_sem,
+                seq_callbacks=seq_callbacks,
+                watermark_seq=watermark_seq,
+                compact_through_seq=compact_through_seq,
+                reject_code="message_exceeds_char_budget",
+                within_deadline=_within_deadline,
+                renew_lease=_renew_catchup_lease,
+                trajectory_recorder=trajectory_recorder,
+            ):
+                raise TurnError(
+                    _coverage_incomplete_reason("message_exceeds_char_budget")
+                ) from exc
+            batch_cap = _COMPACTION_BATCH
+            no_progress_attempts = 0
+            last_observed_watermark = None
+            last_reject_code = ""
+            continue
         if not old:
             # The count says a gap exists but the reader returned nothing
             # (e.g. a ts-windowed fake/reader whose window doesn't line up
@@ -5092,6 +5471,7 @@ async def _ensure_prompt_coverage(
                     old_messages=old,
                     llm=_recording_catchup_llm,
                     usage_out=add_usage,
+                    reject_out=_note_reject,
                 )
             )
             new_summary = segment_text or ""
@@ -5103,6 +5483,7 @@ async def _ensure_prompt_coverage(
                     old_messages=old,
                     llm=_recording_catchup_llm,
                     usage_out=add_usage,
+                    reject_out=_note_reject,
                 )
             )
         _report_turn_progress("prompt_catchup_batch_complete")
@@ -5118,6 +5499,19 @@ async def _ensure_prompt_coverage(
             # the bug this task exists to close, just moved one layer down.
             # Leave the gap in place; the `while` loop's fresh watermark read
             # consumes one no-progress attempt and eventually raises.
+            _report_turn_progress("prompt_catchup_batch_rejected")
+            await _record_trajectory(
+                trajectory_recorder,
+                "compaction_rejected",
+                {
+                    "lane": "prompt_catchup",
+                    "reject_code": last_reject_code,
+                    "batch_messages": len(old),
+                    "segmented": bool(segmented_write),
+                    "no_progress_attempts": no_progress_attempts,
+                },
+                best_effort=True,
+            )
             await _renew_catchup_lease()
             continue
         # Fence the summary CAS with current job ownership and refresh enough
@@ -6202,11 +6596,7 @@ async def _run_wake(
                 ),
                 fold_before_first=deps.read_messages_after_seq is not None,
                 on_progress=_report_turn_progress,
-                on_trajectory_event=(
-                    trajectory_recorder.record
-                    if trajectory_recorder is not None
-                    else None
-                ),
+                on_trajectory_event=_ledger_tapped_sink(trajectory_recorder),
                 outbound_blocking_read_tool_names=_PRIVATE_READ_TOOLS,
                 outbound_blocking_read_tool_predicate=_read_blocks_later_outbound,
                 max_tool_calls_per_round=MAX_TOOL_CALLS_PER_ROUND,
@@ -8671,9 +9061,7 @@ async def process_job(
             ),
             fold_before_first=seq_native,
             on_progress=_report_turn_progress,
-            on_trajectory_event=(
-                trajectory_recorder.record if trajectory_recorder is not None else None
-            ),
+            on_trajectory_event=_ledger_tapped_sink(trajectory_recorder),
             extra_tool_specs=offered_mcp_tool_specs,
             extra_mutating_tool_names=mcp_mutating_names,
             disabled_tool_names=disabled_tool_names_for_turn,
