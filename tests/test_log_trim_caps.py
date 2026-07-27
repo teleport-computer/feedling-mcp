@@ -71,6 +71,28 @@ def test_app_usage_stream_is_trimmed(monkeypatch):
     assert [e["n"] for e in kept] == [6, 7, 8, 9]
 
 
+def test_app_close_stream_is_trimmed(monkeypatch):
+    monkeypatch.setattr(perception_store, "APP_CLOSE_MAX", 4)
+    uid = _uid()
+    seed_user(uid)
+    for i in range(10):
+        perception_store.append_app_close(uid, {"n": i, "ts": float(i)}, float(i))
+    kept = db.log_read_all(uid, perception_store.APP_CLOSE_STREAM)
+    assert [e["n"] for e in kept] == [6, 7, 8, 9]
+
+
+def test_app_close_stream_is_separate_from_app_usage(monkeypatch):
+    """两条流互不干扰：close 的写入不占用也不污染 open 的流。"""
+    uid = _uid()
+    seed_user(uid)
+    perception_store.append_app_open(uid, {"app": "douyin", "ts": 1.0}, 1.0)
+    perception_store.append_app_close(uid, {"app": "douyin", "ts": 2.0}, 2.0)
+    opens = db.log_read_all(uid, perception_store.APP_USAGE_STREAM)
+    closes = db.log_read_all(uid, perception_store.APP_CLOSE_STREAM)
+    assert [e["ts"] for e in opens] == [1.0]
+    assert [e["ts"] for e in closes] == [2.0]
+
+
 def test_log_trim_only_statuses_keeps_non_terminal_rows():
     # An in-flight (non-terminal) row must survive trim regardless of age — only
     # rows whose status is in ``only_statuses`` are eligible for deletion.

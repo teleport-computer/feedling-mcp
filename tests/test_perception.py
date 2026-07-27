@@ -72,6 +72,7 @@ class FakeStore:
         self.events = {}  # uid -> [event...]
         self.frames = {}  # (uid, frame_id) -> envelope
         self.app_opens = {}  # uid -> [event...]
+        self.app_closes = {}  # uid -> [event...]
 
     # singletons
     def get_state(self, uid): return {k: dict(v) for k, v in self.state.get(uid, {}).items()}
@@ -146,6 +147,15 @@ class FakeStore:
         if since_epoch:
             rows = [r for r in rows if (r.get("ts") or 0) > since_epoch]
         return [dict(r) for r in rows[-limit:]]
+
+    # app-close time series
+    def append_app_close(self, uid, doc, ts):
+        self.app_closes.setdefault(uid, []).append(dict(doc))
+    def read_app_closes(self, uid, limit=100, since_epoch=0.0):
+        rows = self.app_closes.get(uid, [])
+        if since_epoch:
+            rows = [r for r in rows if float(r.get("ts") or 0.0) > since_epoch]
+        return rows[-limit:] if limit else list(rows)
 
     # photo ciphertext channel (reuses frame_envelopes in prod)
     def put_photo_envelope(self, uid, frame_id, ts, env):
