@@ -3521,6 +3521,70 @@ def recent_chat_operational_health(
     }
 
 
+def recent_runtime_health(
+    *,
+    within_hours: int = 24,
+    limit: int = 1000,
+) -> dict:
+    """全 lane 运行时健康快照（content-free），喂 admin 值班台。
+
+    分母刻意从 ``agent_jobs`` 起算而非从 metrics/trajectory 起算：一次完全漏写
+    若同时消失于分子和分母，就会报出虚假健康的机群。``superseded`` 单列、不进
+    失败率——运行时代际切换不是故障，混进去会稀释真实失败率。
+    """
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    safe_limit = max(1, min(int(limit), 1000))
+
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "WITH recent AS ("
+                "  SELECT lane,status,last_error FROM agent_jobs "
+                "  WHERE status IN ('completed','failed','expired','superseded') "
+                "    AND finished_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY finished_at DESC,id DESC LIMIT %s"
+                ") SELECT lane,"
+                "  COUNT(*) FILTER (WHERE status='completed')::int AS completed,"
+                "  COUNT(*) FILTER (WHERE status='failed')::int AS failed,"
+                "  COUNT(*) FILTER (WHERE status='expired')::int AS expired,"
+                "  COUNT(*) FILTER (WHERE status='superseded')::int AS superseded,"
+                "  COUNT(*) FILTER (WHERE status='expired' "
+                "    AND last_error='queue_timeout')::int AS queue_expired,"
+                "  COUNT(*) FILTER (WHERE status='expired' "
+                "    AND last_error='lease_timeout')::int AS lease_expired "
+                "FROM recent GROUP BY lane",
+                (safe_hours, safe_limit),
+            )
+            outcome_rows = cur.fetchall()
+
+    lanes = []
+    for row in outcome_rows:
+        completed = int(row["completed"] or 0)
+        failed = int(row["failed"] or 0)
+        expired = int(row["expired"] or 0)
+        resolved = completed + failed + expired
+        lanes.append({
+            "lane": str(row["lane"] or "unknown"),
+            "sampled_jobs": resolved,
+            "completed": completed,
+            "failed": failed,
+            "expired": expired,
+            "superseded": int(row["superseded"] or 0),
+            "queue_expired": int(row["queue_expired"] or 0),
+            "lease_expired": int(row["lease_expired"] or 0),
+            "failure_rate": (
+                float(failed + expired) / float(resolved) if resolved else None
+            ),
+        })
+
+    lanes.sort(key=lambda item: (item["sampled_jobs"], item["lane"]), reverse=True)
+    return {
+        "window_hours": safe_hours,
+        "generated_at": time.time(),
+        "lanes": lanes,
+    }
+
+
 def recent_prompt_cache_stats(
     *,
     lane: str = "chat",
