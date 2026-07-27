@@ -53,7 +53,8 @@ def test_reconcile_runs_before_replicate_then_verify(calls):
     # BEFORE any ciphertext child replicate, or the children FK-fail.
     sched._sync_tick(do_reconcile=True)
     actions = [c[0] for c in calls]
-    assert actions == ["reconcile"] + ["replicate"] * 5 + ["verify"]
+    assert actions == (["reconcile", "snapshot"]
+                       + ["replicate"] * len(sched._ciphertext_tables()) + ["verify"])
     reconcile = next(c for c in calls if c[0] == "reconcile")
     verify = next(c for c in calls if c[0] == "verify")
     assert reconcile[3] == "MIGRATE"
@@ -74,7 +75,7 @@ def test_reconcile_failure_does_not_block_replicate(monkeypatch):
     monkeypatch.setattr(tr, "run_action", fake)
     sched._sync_tick(do_reconcile=True)
     assert calls[0] == "reconcile"
-    assert calls.count("replicate") == 5
+    assert calls.count("replicate") == len(sched._ciphertext_tables())
 
 
 def test_already_running_aborts_replicate_phase(monkeypatch):
@@ -88,8 +89,10 @@ def test_already_running_aborts_replicate_phase(monkeypatch):
 
     monkeypatch.setattr(tr, "run_action", fake)
     sched._sync_tick(do_reconcile=True)
-    # reconcile ran; first replicate raises AlreadyRunning → return before the rest
-    assert calls == [("reconcile", None), ("replicate", "chat_messages")]
+    # reconcile ran; snapshot also raises AlreadyRunning but only logs (no return,
+    # unlike the replicate loop) so the tick proceeds to replicate, which then
+    # raises AlreadyRunning on the first table → return before the rest.
+    assert calls == [("reconcile", None), ("snapshot", None), ("replicate", "chat_messages")]
 
 
 def test_unconfigured_aborts_silently(monkeypatch):
@@ -103,7 +106,10 @@ def test_unconfigured_aborts_silently(monkeypatch):
 
     monkeypatch.setattr(tr, "run_action", fake)
     sched._sync_tick(do_reconcile=True)
-    assert calls == ["reconcile", "replicate"]  # stopped on first replicate Unconfigured
+    # snapshot's Unconfigured handler does `return reconcile_ok` (unlike its
+    # AlreadyRunning handler, which only logs) — so the abort point is snapshot
+    # itself, not the first replicate call; replicate is never reached.
+    assert calls == ["reconcile", "snapshot"]
 
 
 def test_one_table_error_does_not_stop_the_pass(monkeypatch):
@@ -117,8 +123,9 @@ def test_one_table_error_does_not_stop_the_pass(monkeypatch):
 
     monkeypatch.setattr(tr, "run_action", fake)
     sched._sync_tick(do_reconcile=False)
-    # memory_moments raised a generic error but the loop continued past it
-    assert seen == list(sched._ciphertext_tables())
+    # memory_moments raised a generic error but the loop continued past it;
+    # snapshot runs unconditionally (not gated by do_reconcile) and comes first.
+    assert seen == ["snapshot"] + list(sched._ciphertext_tables())
 
 
 def test_start_spawns_a_daemon_thread(monkeypatch):
