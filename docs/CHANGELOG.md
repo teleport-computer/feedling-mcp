@@ -53,7 +53,8 @@
 - V1 CLI resident 新增 `io_cli send-file`：模型把 UTF-8 源文件写进每用户隔离的
   `outbound-files`，Word/PDF 在投递时渲染成真实 `.docx` / `.pdf`。
 - 明确格式请求沿用 V2 的完成保护：错误后缀会被拒绝，首轮漏发文件会再补一次，仍
-  未生成时不会拿普通文本或 Markdown 冒充成功。
+  未生成时保留模型正文，不再把整轮替换成固定失败话术；未指定格式的请求只走语义
+  prompt，不参与硬性终态阻塞。
 - `/v1/chat/response` 新增加密 `file_followups`；文字主回复、文件 Card 与父消息 CAS
   在同一个 PostgreSQL 事务提交，保证文字在上、Card 在下，且不会出现半成功。
 - 同时覆盖 VPS/self-hosted 与 API-key hosted resident；未推送、未建 PR、未合并。
@@ -537,9 +538,10 @@ cvm-id fail-closed、永不并入 merge 自动部署。
   `/workspace` entry through the idempotent reply outbox; UTF-8 text formats are
   delivered directly, while `.docx` and `.pdf` targets are rendered into real
   Word/PDF bytes instead of renaming Markdown. Final text and file cards commit
-  as one ordered reply bundle. Explicit file requests now remain incomplete until
-  the requested format is delivered, so plain text or a Markdown substitution
-  cannot silently satisfy a Word/PDF request. It never scans or accepts a host
+  as one ordered reply bundle. Explicit formats get one bounded completion
+  recovery and reject a Markdown substitution. If the file is still missing, the
+  model's non-empty terminal text is preserved and the turn completes with a
+  `required_file_missing` trajectory event. It never scans or accepts a host
   filesystem path.
   Independent reads/tasks run concurrently; disjoint workspace writes may commit in
   conflict-free waves, while conflicting paths and external effects remain

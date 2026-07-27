@@ -6963,10 +6963,8 @@ def _missing_outbound_file_suffixes(
     requirement: tuple[str, ...] | None,
     staged: list[StagedChatFile],
 ) -> tuple[str, ...] | None:
-    if requirement is None:
-        return None
     if not requirement:
-        return () if not staged else None
+        return None
     delivered = {Path(item.name).suffix.lower() for item in staged}
     missing = tuple(suffix for suffix in requirement if suffix not in delivered)
     return missing or None
@@ -12162,6 +12160,8 @@ def _process_messages(messages: list) -> float:
             else:
                 _note_agent_turn_success()
 
+        initial_agent_result = agent_result
+        initial_agent_result_usable = pending_failure_notice is None
         if outbound_file_turn_active:
             staged_now = _staged_outbound_file_snapshot(trace_id)
             missing = _missing_outbound_file_suffixes(
@@ -12192,11 +12192,28 @@ def _process_messages(messages: list) -> float:
             )
             if still_missing is not None:
                 staged_outbound_files = []
-                agent_result = {
-                    "messages": [
-                        _outbound_file_failure_reply(raw_user_content_for_lang)
-                    ]
-                }
+                log.warning(
+                    "outbound file still missing after bounded retry suffixes=%s",
+                    list(still_missing),
+                )
+                _emit_debug_trace(
+                    "agent",
+                    "required_file_missing",
+                    status="error",
+                    trace_id=trace_id,
+                    summary="required file missing after bounded retry",
+                    detail={"required_suffixes": list(still_missing)},
+                )
+                if initial_agent_result_usable:
+                    agent_result = initial_agent_result
+                    pending_failure_notice = None
+                    pending_failure_is_parse_only = False
+                else:
+                    agent_result = {
+                        "messages": [
+                            _outbound_file_failure_reply(raw_user_content_for_lang)
+                        ]
+                    }
             elif staged_outbound_files and pending_failure_is_parse_only:
                 # A successfully staged file is itself a usable model result.
                 # Some CLI drivers emit no separate assistant text after the

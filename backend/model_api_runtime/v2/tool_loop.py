@@ -244,9 +244,9 @@ async def run_tool_loop(
     only encrypted ``/workspace`` entries through this callback; the loop never
     interprets a model string as a host filesystem path.
 
-    ``required_file_suffixes`` is a completion guard for clear user file intent.
-    ``None`` disables it, ``()`` requires any delivered file, and a non-empty
-    tuple requires every listed suffix before terminal text can be published.
+    ``required_file_suffixes`` is a completion guard for explicit output formats.
+    ``None`` and ``()`` disable the hard guard; a non-empty tuple gets one bounded
+    completion retry before the provider's terminal text is published normally.
     Chat callers may also provide ``file_requirement_messages`` plus a resolver;
     newly folded user messages then update or cancel the requirement before each
     later provider round."""
@@ -315,7 +315,6 @@ async def run_tool_loop(
     ]
 
     def _normalize_file_requirement(value) -> tuple[bool, frozenset[str]]:
-        required = value is not None
         suffixes = frozenset(
             str(suffix).strip().casefold() for suffix in (value or ())
         )
@@ -324,7 +323,7 @@ async def run_tool_loop(
             for suffix in suffixes
         ):
             raise ValueError("required_file_suffixes contains an invalid suffix")
-        return required, suffixes
+        return bool(suffixes), suffixes
 
     resolved_file_requirement = required_file_suffixes
     if resolve_required_file_suffixes is not None:
@@ -336,6 +335,10 @@ async def run_tool_loop(
     )
     delivered_file_suffixes: set[str] = set()
     delivery_retry_instruction = ""
+    file_delivery_retry_used = False
+    required_file_missing_recorded = False
+    file_delivery_fallback_text = ""
+    file_delivery_fallback_reasoning = ""
     outbound_blocking_reads = {
         str(name) for name in (outbound_blocking_read_tool_names or ()) if str(name)
     }
@@ -408,6 +411,20 @@ async def run_tool_loop(
         if on_trajectory_event is not None:
             await on_trajectory_event(event_kind, payload)
 
+    async def _record_required_file_missing(round_number: int) -> None:
+        nonlocal required_file_missing_recorded
+        if required_file_missing_recorded:
+            return
+        await _trajectory(
+            "required_file_missing",
+            {
+                "round": round_number,
+                "required_suffixes": sorted(normalized_required_suffixes),
+                "delivered_suffixes": sorted(delivered_file_suffixes),
+            },
+        )
+        required_file_missing_recorded = True
+
     while attempts < max_calls:
         _progress("round_boundary")
         if attempts > 0 or fold_before_first:
@@ -444,6 +461,10 @@ async def run_tool_loop(
                         normalized_required_suffixes = next_required_suffixes
                         delivered_file_suffixes.clear()
                         delivery_retry_instruction = ""
+                        file_delivery_retry_used = False
+                        required_file_missing_recorded = False
+                        file_delivery_fallback_text = ""
+                        file_delivery_fallback_reasoning = ""
                         if on_file_requirement_changed is not None:
                             await on_file_requirement_changed()
 
@@ -569,6 +590,54 @@ async def run_tool_loop(
                 except Exception:
                     pass
             if (
+                file_delivery_retry_used
+                and not normalized_required_suffixes.issubset(
+                    delivered_file_suffixes
+                )
+            ):
+                # The extra completion attempt is best-effort. A provider error
+                # here must not retroactively discard the usable text from the
+                # original terminal response that triggered the retry.
+                await _record_required_file_missing(attempts)
+                await _trajectory(
+                    "reply_planned",
+                    {
+                        "round": attempts,
+                        "final": True,
+                        "text": file_delivery_fallback_text,
+                        "reason": "required_file_missing",
+                    },
+                )
+                if file_delivery_fallback_text.strip():
+                    try:
+                        await on_reply(
+                            file_delivery_fallback_text,
+                            final=True,
+                            reasoning=file_delivery_fallback_reasoning,
+                        )
+                    except FinalReplySuperseded:
+                        _progress("final_reply_superseded")
+                        await _trajectory(
+                            "final_reply_superseded",
+                            {"round": attempts},
+                        )
+                        if attempts < max_calls:
+                            delivery_retry_instruction = ""
+                            file_delivery_retry_used = False
+                            required_file_missing_recorded = False
+                            file_delivery_fallback_text = ""
+                            file_delivery_fallback_reasoning = ""
+                            continue
+                        return LoopOutcome(
+                            "", attempts, "input_advanced", replied_intermediate
+                        )
+                return LoopOutcome(
+                    file_delivery_fallback_text,
+                    attempts,
+                    "required_file_missing",
+                    replied_intermediate,
+                )
+            if (
                 tools is not None
                 and isinstance(exc, provider_client.ProviderError)
                 and exc.status_code in {400, 422}
@@ -617,14 +686,11 @@ async def run_tool_loop(
                 missing_suffixes = sorted(
                     normalized_required_suffixes - delivered_file_suffixes
                 )
-                await _trajectory(
-                    "required_file_missing",
-                    {
-                        "round": attempts,
-                        "required_suffixes": sorted(normalized_required_suffixes),
-                        "delivered_suffixes": sorted(delivered_file_suffixes),
-                    },
-                )
+                if pr.text.strip() and not file_delivery_fallback_text:
+                    file_delivery_fallback_text = pr.text
+                    file_delivery_fallback_reasoning = str(
+                        pr.raw.get("reasoning") or ""
+                    )
                 if missing_suffixes:
                     target = ", ".join(missing_suffixes)
                     delivery_retry_instruction = (
@@ -642,11 +708,58 @@ async def run_tool_loop(
                         "terminal reply."
                     )
                 force_text_fallback = False
-                if attempts < max_calls:
+                # One guard-triggered recovery is enough. Tool calls emitted by
+                # that recovery may still take later rounds to write, deliver,
+                # and finish; the guard itself must not keep re-arming or consume
+                # the tools-disabled final round when delivery is impossible.
+                if not file_delivery_retry_used and attempts < max_calls - 1:
+                    file_delivery_retry_used = True
                     _progress("required_file_retry_boundary")
                     continue
+                await _record_required_file_missing(attempts)
+                terminal_text = file_delivery_fallback_text or pr.text
+                terminal_reasoning = (
+                    file_delivery_fallback_reasoning
+                    if file_delivery_fallback_text
+                    else str(pr.raw.get("reasoning") or "")
+                )
+                await _trajectory(
+                    "reply_planned",
+                    {
+                        "round": attempts,
+                        "final": True,
+                        "text": terminal_text,
+                        "reason": "required_file_missing",
+                    },
+                )
+                if terminal_text.strip():
+                    try:
+                        await on_reply(
+                            terminal_text,
+                            final=True,
+                            reasoning=terminal_reasoning,
+                        )
+                    except FinalReplySuperseded:
+                        _progress("final_reply_superseded")
+                        await _trajectory(
+                            "final_reply_superseded",
+                            {"round": attempts},
+                        )
+                        if attempts < max_calls:
+                            delivery_retry_instruction = ""
+                            file_delivery_retry_used = False
+                            required_file_missing_recorded = False
+                            file_delivery_fallback_text = ""
+                            file_delivery_fallback_reasoning = ""
+                            continue
+                        return LoopOutcome(
+                            "", attempts, "input_advanced", replied_intermediate
+                        )
                 return LoopOutcome(
-                    "", attempts, "required_file_missing", replied_intermediate
+                    terminal_text,
+                    attempts,
+                    "required_file_missing",
+                    replied_intermediate,
                 )
             await _trajectory(
                 "reply_planned",

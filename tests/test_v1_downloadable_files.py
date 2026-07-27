@@ -359,6 +359,166 @@ def test_v1_completion_guard_matches_natural_word_request():
     assert resident._missing_outbound_file_suffixes(requirement, []) == (".docx",)
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "给我一份下周的工作清单",
+        "can you make a plan for my week?",
+        "give me a report on how I slept",
+        "help me make a checklist for packing",
+        "给我一个报告",
+    ],
+)
+def test_v1_completion_guard_ignores_conversational_requests(text):
+    assert resident._required_outbound_file_suffixes(text) is None
+
+
+def _patch_v1_foreground_file_turn(monkeypatch):
+    monkeypatch.setattr(resident, "AGENT_MODE", "cli")
+    monkeypatch.setattr(resident, "_resident_chat_runtime_v2_enabled", lambda: False)
+    monkeypatch.setattr(
+        resident, "_prepend_io_cli_capability_catalog", lambda content: content
+    )
+    monkeypatch.setattr(resident, "_commit_io_cli_catalog_injection", lambda: None)
+    monkeypatch.setattr(
+        resident,
+        "_foreground_agent_message",
+        lambda content, current_ts: content,
+    )
+    monkeypatch.setattr(resident, "_consume_reply_parse_failed", lambda: False)
+    monkeypatch.setattr(resident, "_note_agent_turn_success", lambda: None)
+    monkeypatch.setattr(resident, "_worldbook_context_for_foreground", lambda _text: "")
+    resident._seen_ids.clear()
+    resident._seen_ids_order.clear()
+
+
+def test_v1_conversational_request_does_not_spend_file_retry(monkeypatch):
+    _patch_v1_foreground_file_turn(monkeypatch)
+    calls = []
+    posted = {}
+
+    def fake_agent(message, **kwargs):
+        calls.append((message, kwargs))
+        return {"messages": ["这是你的下周工作清单。"]}
+
+    def fake_post(reply, **kwargs):
+        posted["reply"] = reply
+        posted["kwargs"] = kwargs
+        return {"id": "reply-v1-conversation"}
+
+    monkeypatch.setattr(resident, "call_agent", fake_agent)
+    monkeypatch.setattr(resident, "post_reply", fake_post)
+
+    result = resident._process_messages(
+        [
+            {
+                "id": "user-v1-conversation",
+                "role": "user",
+                "source": "chat",
+                "content": "给我一份下周的工作清单",
+                "ts": 1235.0,
+            }
+        ]
+    )
+
+    assert result == pytest.approx(1235.0)
+    assert len(calls) == 1
+    assert posted["reply"] == "这是你的下周工作清单。"
+    assert posted["kwargs"].get("file_followups") in (None, [])
+
+
+def test_v1_missing_explicit_file_keeps_original_model_reply(monkeypatch):
+    _patch_v1_foreground_file_turn(monkeypatch)
+    replies = iter(
+        (
+            {"messages": ["这是你的完整睡眠报告。"]},
+            {"messages": ["仍未生成附件。"]},
+        )
+    )
+    calls = []
+    posted = {}
+    trace_types = []
+
+    def fake_agent(message, **kwargs):
+        calls.append((message, kwargs))
+        return next(replies)
+
+    def fake_post(reply, **kwargs):
+        posted["reply"] = reply
+        posted["kwargs"] = kwargs
+        return {"id": "reply-v1-missing-file"}
+
+    monkeypatch.setattr(resident, "call_agent", fake_agent)
+    monkeypatch.setattr(resident, "post_reply", fake_post)
+    monkeypatch.setattr(
+        resident,
+        "_emit_debug_trace",
+        lambda _subsystem, event_type, **_kwargs: trace_types.append(event_type),
+    )
+
+    result = resident._process_messages(
+        [
+            {
+                "id": "user-v1-missing-file",
+                "role": "user",
+                "source": "chat",
+                "content": "给我一份 PDF 睡眠报告",
+                "ts": 1236.0,
+            }
+        ]
+    )
+
+    assert result == pytest.approx(1236.0)
+    assert len(calls) == 2
+    assert posted["reply"] == "这是你的完整睡眠报告。"
+    assert posted["kwargs"].get("file_followups") in (None, [])
+    assert trace_types.count("required_file_missing") == 1
+
+
+def test_v1_file_retry_error_keeps_original_reply_without_failure_notice(monkeypatch):
+    _patch_v1_foreground_file_turn(monkeypatch)
+    calls = []
+    posted = {}
+    notices = []
+
+    def fake_agent(message, **kwargs):
+        calls.append((message, kwargs))
+        if len(calls) == 1:
+            return {"messages": ["这是你的完整睡眠报告。"]}
+        raise RuntimeError("retry provider unavailable")
+
+    def fake_post(reply, **kwargs):
+        posted["reply"] = reply
+        posted["kwargs"] = kwargs
+        return {"id": "reply-v1-retry-error"}
+
+    monkeypatch.setattr(resident, "call_agent", fake_agent)
+    monkeypatch.setattr(resident, "post_reply", fake_post)
+    monkeypatch.setattr(
+        resident,
+        "_notify_agent_turn_failure",
+        lambda *args, **kwargs: notices.append((args, kwargs)),
+    )
+
+    result = resident._process_messages(
+        [
+            {
+                "id": "user-v1-retry-error",
+                "role": "user",
+                "source": "chat",
+                "content": "给我一份 PDF 睡眠报告",
+                "ts": 1237.0,
+            }
+        ]
+    )
+
+    assert result == pytest.approx(1237.0)
+    assert len(calls) == 2
+    assert posted["reply"] == "这是你的完整睡眠报告。"
+    assert posted["kwargs"].get("file_followups") in (None, [])
+    assert notices == []
+
+
 def test_v1_visible_reply_strips_codex_local_file_citation():
     cleaned, removed = resident._sanitize_outbound_file_reply(
         '已生成并附上 Word 文档：:codex-file-citation{path="/private/tmp/secret/plan.docx" purpose="output"}\n\n'

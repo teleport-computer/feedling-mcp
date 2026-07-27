@@ -63,6 +63,7 @@ def _run_loop(
     on_file_requirement_changed=None,
     fold_batches=(),
     max_calls=3,
+    trajectory_events=None,
 ):
     calls = []
     replies = []
@@ -73,7 +74,10 @@ def _run_loop(
     async def fake_chat(config, messages, *, tools=None, **kwargs):
         calls.append(tuple(spec.name for spec in (tools or ())))
         messages_seen.append(messages)
-        return next(response_iter)
+        response = next(response_iter)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
     async def on_reply(text, *, final, reasoning=""):
         replies.append((text, final))
@@ -85,6 +89,10 @@ def _run_loop(
 
     async def no_fold():
         return next(fold_iter, [])
+
+    async def record_trajectory(event_kind, payload):
+        if trajectory_events is not None:
+            trajectory_events.append((event_kind, payload))
 
     monkeypatch.setattr(provider_client, "chat_completion_async", fake_chat)
     outcome = asyncio.run(
@@ -101,6 +109,9 @@ def _run_loop(
             fold_new_messages=no_fold,
             add_usage=lambda usage: None,
             max_calls=max_calls,
+            on_trajectory_event=(
+                record_trajectory if trajectory_events is not None else None
+            ),
         )
     )
     return outcome, calls, replies, messages_seen
@@ -260,7 +271,15 @@ def test_send_file_cannot_share_a_batch_with_workspace_write(monkeypatch):
         ("我想要一份 Word 文档", (".docx",)),
         ("请生成一个 PDF 发给我", (".pdf",)),
         ("请生成PDF文件发给我", (".pdf",)),
-        ("给我生成一个可以下载的健身计划文档", ()),
+        ("给我生成一个可以下载的健身计划文档", None),
+        ("我想要一份睡眠报告，PDF 格式", (".pdf",)),
+        ("I want a sleep report in PDF format", (".pdf",)),
+        ("I want to know what PDF is", None),
+        ("给我一份下周的工作清单", None),
+        ("can you make a plan for my week?", None),
+        ("give me a report on how I slept", None),
+        ("help me make a checklist for packing", None),
+        ("给我一个报告", None),
         ("把 Markdown 文件转换成 Word 文档", (".docx",)),
         ("把Markdown文件转成Word文档", (".docx",)),
         ("Word 和 PDF 有什么区别？", None),
@@ -317,6 +336,19 @@ def test_required_file_suffixes_follow_latest_user_correction():
             {"role": "user", "content": "另外也生成一份 PDF"},
         ]
     ) == (".docx", ".pdf")
+
+
+def test_empty_file_requirement_is_soft_prompt_guidance(monkeypatch):
+    outcome, calls, replies, _ = _run_loop(
+        monkeypatch,
+        [{"reply": "这是你的工作清单。", "tool_calls": [], "usage": {}}],
+        required_file_suffixes=(),
+        max_calls=6,
+    )
+
+    assert len(calls) == 1
+    assert replies == [("这是你的工作清单。", True)]
+    assert outcome.stop_reason == "final_text"
 
 
 def test_late_folded_word_request_enables_file_completion_guard(monkeypatch):
@@ -457,6 +489,7 @@ def test_late_cancellation_discards_an_already_staged_file(monkeypatch):
 
 def test_required_word_file_retries_plain_text_until_docx_is_delivered(monkeypatch):
     files = []
+    trajectory_events = []
 
     async def on_file(path, revision):
         files.append((path, revision))
@@ -496,11 +529,15 @@ def test_required_word_file_retries_plain_text_until_docx_is_delivered(monkeypat
         on_file_reply=on_file,
         required_file_suffixes=(".docx",),
         max_calls=4,
+        trajectory_events=trajectory_events,
     )
 
     assert replies == [("Word 文档已经发给你了。", True)]
     assert files == [("/workspace/计划.docx", 1)]
     assert outcome.stop_reason == "final_text"
+    assert all(
+        kind != "required_file_missing" for kind, _payload in trajectory_events
+    )
     assert "send_file" in calls[1]
     assert "REQUIRED FILE DELIVERY" in messages_seen[1][0]["content"]
 
@@ -534,7 +571,49 @@ def test_required_word_file_rejects_markdown_substitution(monkeypatch):
     )
 
     assert files == []
-    assert replies == []
+    assert replies == [("已经发给你了。", True)]
+    assert outcome.stop_reason == "required_file_missing"
+    assert outcome.final_text == "已经发给你了。"
+
+
+def test_required_file_missing_retries_once_then_keeps_original_text(monkeypatch):
+    trajectory_events = []
+    outcome, calls, replies, _ = _run_loop(
+        monkeypatch,
+        [
+            {"reply": "这是你的完整睡眠报告。", "tool_calls": [], "usage": {}},
+            {"reply": "仍未生成附件。", "tool_calls": [], "usage": {}},
+        ],
+        required_file_suffixes=(".pdf",),
+        max_calls=6,
+        trajectory_events=trajectory_events,
+    )
+
+    assert len(calls) == 2
+    assert replies == [("这是你的完整睡眠报告。", True)]
+    assert outcome.final_text == "这是你的完整睡眠报告。"
+    assert outcome.stop_reason == "required_file_missing"
+    assert [kind for kind, _payload in trajectory_events].count(
+        "required_file_missing"
+    ) == 1
+
+
+def test_required_file_retry_provider_error_keeps_original_text(
+    monkeypatch,
+):
+    outcome, calls, replies, _ = _run_loop(
+        monkeypatch,
+        [
+            {"reply": "这是你的完整睡眠报告。", "tool_calls": [], "usage": {}},
+            RuntimeError("retry provider unavailable"),
+        ],
+        required_file_suffixes=(".pdf",),
+        max_calls=6,
+    )
+
+    assert len(calls) == 2
+    assert replies == [("这是你的完整睡眠报告。", True)]
+    assert outcome.final_text == "这是你的完整睡眠报告。"
     assert outcome.stop_reason == "required_file_missing"
 
 
@@ -814,7 +893,7 @@ def test_process_job_commits_text_then_workspace_file_as_one_final_reply(
         )
 
     async def direct_loop(**kwargs):
-        assert kwargs["required_file_suffixes"] == ()
+        assert kwargs["required_file_suffixes"] is None
         await kwargs["on_file_reply"]("/workspace/report.md", 4)
         with db.get_pool().connection() as connection:
             visible_before_final = connection.execute(

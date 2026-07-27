@@ -13,11 +13,12 @@ change must not be interpreted as an API guarantee.
 - **V1 CLI residents can now return generated documents as native download
   cards.** Claude, Codex, and Pi residents receive a `send-file` command backed
   by a private per-user staging directory. Word and PDF requests render real
-  `.docx`/`.pdf` bytes, explicit formats cannot fall back to Markdown, and clear
-  file requests receive a bounded completion retry. The text primary and its
-  encrypted `file_followups` now commit atomically through
-  `POST /v1/chat/response`, so clients keep text-first/card-below ordering and
-  never observe a successful text bubble without its requested file.
+  `.docx`/`.pdf` bytes, and explicit formats cannot fall back to Markdown. Named
+  formats receive one bounded completion retry; no-format requests remain
+  semantic prompt guidance, and a missing file no longer replaces or fails the
+  model's text reply. When a file is delivered, the text primary and its encrypted
+  `file_followups` commit atomically through `POST /v1/chat/response`, preserving
+  text-first/card-below ordering.
 
 - **Runtime V2 now honors the Dream and screen-watch consent switches at
   execution time.** Disabling Dream prevents queued Dream work from making a

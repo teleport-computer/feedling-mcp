@@ -1586,6 +1586,49 @@ def test_chat_turn_with_no_reply_produced_marks_job_failed_not_completed(monkeyp
     assert row[1] is True  # failed=True in the metric row too
 
 
+def test_required_file_missing_with_empty_provider_text_gets_terminal_reply(
+    monkeypatch,
+):
+    uid = "u_toolloop_required_file_missing"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-required-file-missing")
+    _patch_real_write(monkeypatch)
+
+    async def direct_loop(**_kwargs):
+        return worker.v2_tool_loop.LoopOutcome(
+            final_text="",
+            rounds=2,
+            stop_reason="required_file_missing",
+            replied_intermediate=False,
+        )
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", direct_loop)
+    deps = _deps(
+        messages=[
+            {
+                "id": "m1",
+                "ts": 10.0,
+                "role": "user",
+                "content": "请生成一份 PDF 报告",
+            }
+        ]
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert [bubble["body_ct"] for bubble in _bubbles(uid)] == [
+        "这次没能生成你要求的可下载文件，请稍后再试。"
+    ]
+    assert _job_status_row(job_id)[0] == "completed"
+
+
 # --------------------------------------------------------------- web gate
 
 

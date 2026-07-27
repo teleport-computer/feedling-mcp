@@ -879,6 +879,19 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
     return f"{scope}:{kind}"[:120]
 
 
+def _required_file_missing_fallback(messages: list[dict]) -> str:
+    user_text = "\n".join(
+        context.text_of(message.get("content"))
+        for message in messages
+    )
+    if re.search(r"[\u4e00-\u9fff]", user_text):
+        return "这次没能生成你要求的可下载文件，请稍后再试。"
+    return (
+        "I couldn't generate the requested downloadable file this time. "
+        "Please try again."
+    )
+
+
 @dataclass
 class TurnDeps:
     """turn 执行体的注入式依赖（生产实现见 serve_worker.build_production_deps）。
@@ -7850,6 +7863,19 @@ async def process_job(
             await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
             tm.flush(failed=False, status="input_advanced_handoff")
             return "completed"
+        if outcome.stop_reason == "required_file_missing":
+            # File completion is best-effort after one bounded recovery. Keep a
+            # usable provider terminal reply, and synthesize an honest non-empty
+            # final only when the provider returned no text at all.
+            if not (outcome.final_text or "").strip():
+                outcome.final_text = _required_file_missing_fallback(coalesced)
+                await _on_reply(outcome.final_text, final=True)
+            log.warning(
+                "[v2.worker] required file missing after bounded retry "
+                "user=%s job=%s",
+                user_id,
+                job_id,
+            )
         if not outcome.replied_intermediate and not (outcome.final_text or "").strip():
             # BUG-4 no-filler class: the loop returned WITHOUT ever producing a
             # bubble — budget_exhausted (max_calls reached with no terminal

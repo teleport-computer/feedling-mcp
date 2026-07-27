@@ -97,10 +97,6 @@ ACTION_CONTEXT_CHAR_CAP = 8000
 PER_ACTION_CHAR_CAP = 2000
 _BLOB_KEYS = frozenset({"image_b64"})
 
-_FILE_ARTIFACT_RE = re.compile(
-    r"(?:文档|文件|附件|报告|计划书|清单|表格|简历|可下载|下载版|"
-    r"\b(?:document|file|attachment|report|plan|checklist|spreadsheet|resume)\b)"
-)
 _FILE_CREATE_RE = re.compile(
     r"(?:生成|创建|制作|导出|保存(?:成|为)?|转换?(?:成|为)|转成|改(?:成|为)|整理(?:成|为)|"
     r"写成|做成|制成|发给我|提供给我|交给我|"
@@ -109,16 +105,19 @@ _FILE_CREATE_RE = re.compile(
     r"\b(?:create|generate|make|produce|export|save|convert|send|give|provide)\b)"
 )
 _FILE_DESIRE_RE = re.compile(
-    r"(?:我(?:想要|要|需要)(?:一个|一份|这份|这个)?\s*"
-    r"(?:word|pdf|markdown|md|docx|文档|文件|附件|报告|计划书|清单|表格|简历)|"
+    r"(?:我(?:想要|要|需要)(?:一个|一份|这份|这个)?\s*(?:"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)|"
+    r"[^。！？\n]{0,32}?(?:文档|文件|附件|报告|计划书|清单|表格|简历))|"
     r"\b(?:i want|i need|i would like|i'd like)\s+(?:a\s+|an\s+)?"
-    r"(?:word|pdf|markdown|md|docx|document|file|attachment|report|plan|checklist|spreadsheet|resume)\b)"
+    r"(?:(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)\b|"
+    r"[^.!?\n]{0,48}?\b(?:document|file|attachment|report|plan|checklist|"
+    r"spreadsheet|resume)\b))"
 )
 _FILE_EXPLICIT_REQUEST_RE = re.compile(
     r"(?:(?:帮我|替我|为我)(?:生成|创建|制作|导出|保存|转换|转成|整理|写成|做成)|"
-    r"给我\s*(?:一个|一份)?\s*(?:word|pdf|markdown|md|docx|文档|文件|附件|报告|计划书|清单|表格|简历)|"
+    r"给我\s*(?:一个|一份)?\s*(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)|"
     r"我(?:想要|要|需要)(?:一个|一份|这份|这个)?\s*"
-    r"(?:word|pdf|markdown|md|docx|文档|文件|附件|报告|计划书|清单|表格|简历)|"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)|"
     r"\b(?:create|generate|make|produce|export|save|convert)\b.{0,40}\bfor me\b|"
     r"\b(?:send|give|provide) me\b)"
 )
@@ -229,11 +228,7 @@ def _required_file_suffixes_for_text(normalized: str) -> tuple[str, ...] | None:
         for suffix, pattern in _FILE_FORMAT_PATTERNS
         if pattern.search(format_scope)
     )
-    if requested:
-        return requested
-    if _FILE_ARTIFACT_RE.search(intent_scope):
-        return ()
-    return None
+    return requested or None
 
 
 def required_file_suffixes(messages: Sequence[dict]) -> tuple[str, ...] | None:
@@ -241,9 +236,10 @@ def required_file_suffixes(messages: Sequence[dict]) -> tuple[str, ...] | None:
 
     The model remains responsible for semantic intent and content generation.
     This conservative detector is only a completion guard: it prevents a plain
-    text answer (or a Markdown substitution) from satisfying an explicit file
-    request. ``()`` means any downloadable file is acceptable; ``None`` means
-    ordinary conversational completion remains valid.
+    text answer (or a Markdown substitution) from satisfying a request with an
+    explicit supported format. Requests without a format remain semantic prompt
+    guidance and return ``None`` so ordinary conversation is never blocked by a
+    translated keyword list.
     """
     requirement: tuple[str, ...] | None = None
     for message in messages:
