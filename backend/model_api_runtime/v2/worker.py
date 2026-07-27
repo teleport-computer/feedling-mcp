@@ -8650,7 +8650,9 @@ async def process_job(
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
             on_reply=_on_reply,
-            on_file_reply=_on_file_reply,
+            on_file_reply=(
+                _on_file_reply if deps.load_workspace_file is not None else None
+            ),
             required_file_suffixes=required_file_suffixes,
             file_requirement_messages=coalesced,
             resolve_required_file_suffixes=context.required_file_suffixes,
