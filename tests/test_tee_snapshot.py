@@ -10,7 +10,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import psycopg
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -76,7 +75,15 @@ def test_snapshot_propagates_update_and_delete(sample_table):
 
 def test_failed_snapshot_leaves_old_data_intact(sample_table, monkeypatch):
     """TRUNCATE + COPY 必须在同一事务：中途失败时 TEE 侧保留旧的完整快照，
-    绝不出现空表窗口（读路径会读到空表 = 用户数据凭空消失）。"""
+    绝不出现空表窗口（读路径会读到空表 = 用户数据凭空消失）。
+
+    失败必须真实发生在 dst 侧执行 `COPY ... FROM STDIN` 的过程中——此时
+    `TRUNCATE` 已经在同一事务里跑过。如果只在源库读取阶段（`_stream_rows`）
+    注入异常，异常永远不会传到 `mirror.get_tee_pool()` 那一侧，`TRUNCATE`
+    和 `dst.transaction()` 根本没被执行到，这条测试就测不出"有没有把两条
+    语句包在同一事务里"这件事——所以让 `_stream_rows` 正常返回，但返回一段
+    postgres 无法解析的损坏 COPY BINARY 载荷，让失败落在 dst 端。
+    """
     with db.get_pool().connection() as c:
         c.execute("INSERT INTO _snap_probe (k, v) VALUES ('a','1')")
     snapshot.snapshot_table(sample_table)
@@ -85,14 +92,35 @@ def test_failed_snapshot_leaves_old_data_intact(sample_table, monkeypatch):
     with db.get_pool().connection() as c:
         c.execute("UPDATE _snap_probe SET v='2' WHERE k='a'")
 
-    def boom(*a, **kw):
-        raise RuntimeError("injected mid-copy failure")
+    def corrupted(*a, **kw):
+        return b"not a valid postgresql binary copy payload at all"
 
-    monkeypatch.setattr(snapshot, "_stream_rows", boom)
+    monkeypatch.setattr(snapshot, "_stream_rows", corrupted)
     rep = snapshot.snapshot_table(sample_table)
     assert rep["ok"] is False
-    assert "injected" in (rep["error"] or "")
-    # 旧快照原样还在，没被 TRUNCATE 掉。
+    assert rep["error"]
+    # 旧快照原样还在，没被 TRUNCATE 掉——证明 TRUNCATE 与 COPY 在同一事务里：
+    # COPY 因载荷损坏而失败时，先前跑过的 TRUNCATE 也随事务一起回滚了。
+    assert _tee_rows(sample_table) == [("a", "1")]
+
+
+def test_snapshot_refuses_when_table_exceeds_max_rows(sample_table, monkeypatch):
+    """超限必须失败，不能静默截断——否则 TEE 会悄悄缺数据而无人察觉。
+    早退分支不该碰 TEE 侧：旧快照必须原样保留，证明真的没有执行到 TRUNCATE/COPY。
+    """
+    with db.get_pool().connection() as c:
+        c.execute("INSERT INTO _snap_probe (k, v) VALUES ('a','1')")
+    snapshot.snapshot_table(sample_table)
+    assert _tee_rows(sample_table) == [("a", "1")]
+
+    with db.get_pool().connection() as c:
+        c.execute("UPDATE _snap_probe SET v='2' WHERE k='a'")
+
+    monkeypatch.setattr(snapshot, "MAX_ROWS", 0)
+    rep = snapshot.snapshot_table(sample_table)
+    assert rep["ok"] is False
+    assert "MAX_ROWS" in (rep["error"] or "")
+    # 早退分支没碰 TEE 侧：旧快照原样还在。
     assert _tee_rows(sample_table) == [("a", "1")]
 
 
