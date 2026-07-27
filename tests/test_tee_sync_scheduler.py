@@ -287,3 +287,52 @@ def test_reconcile_failure_does_not_mark(monkeypatch):
     monkeypatch.setattr(tr, "run_action", fake)
     sched._sync_tick(do_reconcile=True)
     assert marks == []
+
+
+def test_snapshot_action_is_accepted():
+    from admin import tee_replication as tr
+
+    # 不触发真实运行——只验证校验层放行 snapshot 这个 action。
+    tr._validate("snapshot", None, True)
+
+
+def test_snapshot_action_rejects_unknown_table():
+    from admin import tee_replication as tr
+
+    with pytest.raises(tr.BadRequest) as e:
+        tr._validate("snapshot", "not_a_real_table", True)
+    assert e.value.error == "unknown_table"
+
+
+def test_ciphertext_tables_are_derived_from_registry():
+    """scheduler 不再手工维护密文表清单——它必须来自注册表，否则又会出现
+    '加了表但某一处没登记' 的老问题。"""
+    from admin import tee_sync_scheduler as sched
+    from tee_shadow import table_registry as reg
+
+    assert set(sched._ciphertext_tables()) == set(reg.tables_in_lane(reg.CIPHERTEXT))
+
+
+def test_sync_tick_records_snapshot_metrics(monkeypatch):
+    from admin import tee_sync_scheduler as sched
+
+    monkeypatch.setattr(sched, "_ciphertext_tables", lambda: ())
+
+    calls = {}
+
+    def fake_run_action(**kw):
+        calls[kw["action"]] = kw
+        if kw["action"] == "snapshot":
+            return {"tables": [{"table": "provider_health", "rows": 3, "ok": True}],
+                    "copied": 3, "failures": 0}
+        return {"tables": []}
+
+    from admin import tee_replication as tr
+
+    monkeypatch.setattr(tr, "run_action", fake_run_action)
+    monkeypatch.setattr(sched.mirror, "probe", lambda: {"ok": True, "latency_ms": 1.0})
+    monkeypatch.setattr(sched.db, "record_tee_sync_run", lambda s: None)
+    monkeypatch.setattr(sched.db, "mark_reconcile_success", lambda: None)
+
+    sched._sync_tick(do_reconcile=True)
+    assert "snapshot" in calls
