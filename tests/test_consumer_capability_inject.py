@@ -123,6 +123,10 @@ def _make_msg(role="user", content="hello", ts=None):
     return msg
 
 
+def _with_download_delivery_prompt(prefix: str, content: str) -> str:
+    return f"{prefix}\n{crc._outbound_file_prompt_block()}\n\n{content}"
+
+
 # ---------------------------------------------------------------------------
 # Gate: hosted / http-backend — byte-identical passthrough
 # ---------------------------------------------------------------------------
@@ -159,7 +163,9 @@ def test_cli_mode_first_turn_injects_and_marks_pending_not_committed(monkeypatch
 
     result = crc._prepend_io_cli_capability_catalog("user turn 1")
 
-    assert result == "CATALOG_TEXT\n\nuser turn 1"
+    assert result == _with_download_delivery_prompt("CATALOG_TEXT", "user turn 1")
+    assert "send-file" in result
+    assert str(crc.OUTBOUND_FILE_DIR) in result
     assert len(calls) == 1
     assert crc._io_cli_catalog_cache == "CATALOG_TEXT"
     # Injected into the prompt, but NOT yet confirmed — the caller has not
@@ -198,7 +204,7 @@ def test_cli_mode_same_session_second_turn_does_not_reinject_after_commit(monkey
     crc._commit_io_cli_catalog_injection()  # turn 1's agent call succeeded
     second = crc._prepend_io_cli_capability_catalog("user turn 2")
 
-    assert first == "CATALOG_TEXT\n\nuser turn 1"
+    assert first == _with_download_delivery_prompt("CATALOG_TEXT", "user turn 1")
     assert second == "user turn 2"  # unchanged — already confirmed this session
     assert len(calls) == 1  # build_catalog was not called a second time
 
@@ -214,8 +220,10 @@ def test_cli_mode_same_session_second_turn_reinjects_without_commit(monkeypatch)
     # No commit call here — simulates the turn 1 agent call failing.
     second = crc._prepend_io_cli_capability_catalog("user turn 2")
 
-    assert first == "CATALOG_TEXT\n\nuser turn 1"
-    assert second == "CATALOG_TEXT\n\nuser turn 2"  # retried, not skipped
+    assert first == _with_download_delivery_prompt("CATALOG_TEXT", "user turn 1")
+    assert second == _with_download_delivery_prompt(
+        "CATALOG_TEXT", "user turn 2"
+    )  # retried, not skipped
     assert len(calls) == 1  # cache still reused — no need to rebuild
 
 
@@ -230,8 +238,8 @@ def test_cli_mode_session_change_reinjects(monkeypatch):
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess-2")
     second = crc._prepend_io_cli_capability_catalog("turn 2")
 
-    assert first == "CATALOG_TEXT\n\nturn 1"
-    assert second == "CATALOG_TEXT\n\nturn 2"
+    assert first == _with_download_delivery_prompt("CATALOG_TEXT", "turn 1")
+    assert second == _with_download_delivery_prompt("CATALOG_TEXT", "turn 2")
     # Cache is reused across the session change (no need to rebuild) — only
     # the dedup key changed, not the io_cli surface itself.
     assert len(calls) == 1
@@ -253,8 +261,8 @@ def test_codex_injects_every_turn(monkeypatch):
     first = crc._prepend_io_cli_capability_catalog("turn 1")
     second = crc._prepend_io_cli_capability_catalog("turn 2")
 
-    assert first == "CATALOG_TEXT\n\nturn 1"
-    assert second == "CATALOG_TEXT\n\nturn 2"
+    assert first == _with_download_delivery_prompt("CATALOG_TEXT", "turn 1")
+    assert second == _with_download_delivery_prompt("CATALOG_TEXT", "turn 2")
     # Catalog build is still cached (no repeated subprocess work) even though
     # every turn re-injects it into the prompt.
     assert len(calls) == 1
@@ -278,13 +286,17 @@ def test_build_failure_skips_injection_without_caching_and_retries_next_turn(mon
     # instructions smuggled through files/web pages/memory cards now that D2
     # (confirmation) is gone, and it must not depend on the --help sweep
     # succeeding.
-    assert first == f"{io_cli_catalog.D3_SOURCING_RULE}\n\nturn 1"
+    assert first == _with_download_delivery_prompt(
+        io_cli_catalog.D3_SOURCING_RULE, "turn 1"
+    )
     assert crc._io_cli_catalog_cache is None  # failure never cached
     assert crc._io_cli_catalog_pending_session_id is None  # never even marked pending
     assert crc._io_cli_catalog_injected_session_id is None  # not confirmed
 
     second = crc._prepend_io_cli_capability_catalog("turn 1 retry")
-    assert second == "CATALOG_TEXT\n\nturn 1 retry"  # retried and succeeded
+    assert second == _with_download_delivery_prompt(
+        "CATALOG_TEXT", "turn 1 retry"
+    )  # retried and succeeded
     assert crc._io_cli_catalog_cache == "CATALOG_TEXT"
     assert crc._io_cli_catalog_pending_session_id == "sess-1"  # pending until commit
     assert crc._io_cli_catalog_injected_session_id is None  # still not confirmed

@@ -8,6 +8,8 @@ only.
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -89,6 +91,19 @@ _RUNTIME_CONTEXT_POLICY = (
 CHAT_SYSTEM_PROMPT = (
     "You are the user's personal companion. Reply directly and concisely to the "
     "user's latest messages. Do not narrate tool use or system status. "
+    "Interpret requests for a reusable standalone deliverable semantically, not "
+    "by matching specific words, examples, languages, or file extensions. When "
+    "the user's meaning is that they want the result as something they can save, "
+    "open, download, share, or use outside the chat, create editable UTF-8 source "
+    "in the encrypted workspace and deliver it with send_file. Use a target suffix "
+    "that matches the requested output: Word means .docx and PDF means .pdf; those "
+    "formats are rendered from the workspace source at delivery. Never substitute "
+    "Markdown when the user explicitly requested another supported format, even "
+    "when reformatting an existing file. Infer a useful format and safe filename "
+    "only when the user did not specify them; never ask the user for an internal "
+    "workspace path. Do not force a file when "
+    "the user only wants a conversational answer, and never claim that a file was "
+    "created or delivered unless send_file succeeds. "
     "When the user EXPLICITLY asks you to change your own identity — your name, how "
     "you introduce yourself, or the relationship day count (the '第 N 天' shown in the "
     "app, e.g. '把相处天数改成 100 天' / 'make it day 100' / '我们其实认识两年了') — you "
@@ -102,6 +117,90 @@ CHAT_SYSTEM_PROMPT = (
 ACTION_CONTEXT_CHAR_CAP = 8000
 PER_ACTION_CHAR_CAP = 2000
 _BLOB_KEYS = frozenset({"image_b64"})
+
+_FILE_CREATE_RE = re.compile(
+    r"(?:生成|创建|制作|导出|保存(?:成|为)?|转换?(?:成|为)|转成|改(?:成|为)|整理(?:成|为)|"
+    r"写成|做成|制成|发给我|提供给我|交给我|"
+    r"给我(?:一个|一份|生成|创建|制作|导出|保存|转换|转成|整理|写成|做成)|"
+    r"给我\s*(?:word|pdf|markdown|md|docx)|"
+    r"\b(?:create|generate|make|produce|export|save|convert|send|give|provide)\b)"
+)
+_FILE_DESIRE_RE = re.compile(
+    r"(?:我(?:想要|要|需要)(?:一个|一份|这份|这个)?\s*(?:"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)|"
+    r"[^。！？\n]{0,32}?(?:文档|文件|附件|报告|计划书|清单|表格|简历))|"
+    r"\b(?:i want|i need|i would like|i'd like)\s+(?:a\s+|an\s+)?"
+    r"(?:(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)\b|"
+    r"[^.!?\n]{0,48}?\b(?:document|file|attachment|report|plan|checklist|"
+    r"spreadsheet|resume)\b))"
+)
+_FILE_EXPLICIT_REQUEST_RE = re.compile(
+    r"(?:(?:帮我|替我|为我)(?:生成|创建|制作|导出|保存|转换|转成|整理|写成|做成)|"
+    r"给我\s*(?:一个|一份)?\s*(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)|"
+    r"我(?:想要|要|需要)(?:一个|一份|这份|这个)?\s*"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)|"
+    r"\b(?:create|generate|make|produce|export|save|convert)\b.{0,40}\bfor me\b|"
+    r"\b(?:send|give|provide) me\b)"
+)
+_FILE_INFORMATION_RE = re.compile(
+    r"(?:如何|怎么|怎样|教程|步骤|方法|请(?:解释|介绍|说明|告诉我)|"
+    r"解释一下|介绍一下|讲讲|了解|有什么区别|"
+    r"\b(?:how (?:do|can|should|to)|tutorial|steps?|explain|describe|"
+    r"tell me how|what is|what are|difference between)\b)"
+)
+_FILE_CANCEL_RE = re.compile(
+    r"(?:(?:不要|不用|无需|不需要|别)(?:替我|帮我|为我)?"
+    r"(?:生成|创建|制作|导出|发送|发|提供)?(?:任何|这个|该)?"
+    r"\s*(?:文档|文件|附件)|"
+    r"取消(?:生成|创建|制作|导出|发送)?(?:文档|文件|附件)|"
+    r"直接(?:在这里)?回答|只(?:要|需)(?:文字|文本|回答)|不(?:用|要)(?:下载|附件)|"
+    r"\b(?:do not|don't|no need to)\s+"
+    r"(?:(?:create|generate|make|export|send|provide)\s+)?"
+    r"(?:(?:a|an|any|the)\s+)?(?:file|document|attachment)\b|"
+    r"\bjust answer(?: in (?:text|chat))?\b)"
+)
+_FILE_NEGATED_FORMAT_RE = re.compile(
+    r"(?:(?:不要|不用|无需|不需要|别)(?:替我|帮我|为我)?\s*"
+    r"(?:生成|创建|制作|导出|发送|发|提供)?\s*"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)"
+    r"\s*(?:格式|文档|文件)?|"
+    r"\b(?:do not|don't|no need to)\s+"
+    r"(?:(?:create|generate|make|export|send|provide)\s+)?"
+    r"(?:(?:a|an|any|the)\s+)?"
+    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)"
+    r"(?:\s+(?:format|document|file))?\b)"
+)
+_FILE_ADDITIVE_RE = re.compile(
+    r"(?:另外|同时|还要|也要|再(?:来|给|生成|做|制作)|以及|"
+    r"\b(?:also|as well|in addition|and another)\b)"
+)
+_CONVERSION_TARGET_RE = re.compile(
+    r"(?:转换?(?:成|为)|转成|改(?:成|为)|导出(?:成|为)|保存(?:成|为)|"
+    r"\b(?:convert|export|save)\b.{0,24}?\b(?:to|as)\b)"
+)
+_FILE_FORMAT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        ".docx",
+        re.compile(
+            r"(?:\.docx(?![a-z0-9_])|(?<![a-z0-9_])docx(?![a-z0-9_])|"
+            r"(?<![a-z0-9_])word(?![a-z0-9_]))"
+        ),
+    ),
+    (
+        ".pdf",
+        re.compile(
+            r"(?:\.pdf(?![a-z0-9_])|(?<![a-z0-9_])pdf(?![a-z0-9_]))"
+        ),
+    ),
+    (".md", re.compile(r"(?:\.md\b|\bmarkdown\b|markdown\s*文档|md\s*文档)")),
+    (".txt", re.compile(r"(?:\.txt\b|\btxt\b|纯文本(?:文档|文件)?)")),
+    (".csv", re.compile(r"(?:\.csv\b|\bcsv\b)")),
+    (".html", re.compile(r"(?:\.html?\b|\bhtml\b)")),
+    (".json", re.compile(r"(?:\.json\b|\bjson\b)")),
+    (".xml", re.compile(r"(?:\.xml\b|\bxml\b)")),
+    (".yaml", re.compile(r"(?:\.ya?ml\b|\byaml\b)")),
+    (".rtf", re.compile(r"(?:\.rtf\b|\brtf\b)")),
+)
 
 
 def _norm_role(role: Any) -> str:
@@ -124,6 +223,74 @@ def text_of(content: Any) -> str:
         ]
         return "\n".join(parts).strip()
     return str(content or "").strip()
+
+
+def _required_file_suffixes_for_text(normalized: str) -> tuple[str, ...] | None:
+    intent_scope = _FILE_NEGATED_FORMAT_RE.sub(" ", normalized)
+    has_action = bool(
+        _FILE_CREATE_RE.search(intent_scope) or _FILE_DESIRE_RE.search(intent_scope)
+    )
+    if not has_action:
+        return None
+    if (
+        _FILE_INFORMATION_RE.search(intent_scope)
+        and not _FILE_EXPLICIT_REQUEST_RE.search(intent_scope)
+    ):
+        return None
+
+    search_from = 0
+    conversion_markers = list(_CONVERSION_TARGET_RE.finditer(intent_scope))
+    if conversion_markers:
+        # For "convert Markdown to Word", only Word is a required output.
+        search_from = conversion_markers[-1].end()
+    format_scope = intent_scope[search_from:]
+    requested = tuple(
+        suffix
+        for suffix, pattern in _FILE_FORMAT_PATTERNS
+        if pattern.search(format_scope)
+    )
+    return requested or None
+
+
+def required_file_suffixes(messages: Sequence[dict]) -> tuple[str, ...] | None:
+    """Return the file formats a clear current-turn request must deliver.
+
+    The model remains responsible for semantic intent and content generation.
+    This conservative detector is only a completion guard: it prevents a plain
+    text answer (or a Markdown substitution) from satisfying a request with an
+    explicit supported format. Requests without a format remain semantic prompt
+    guidance and return ``None`` so ordinary conversation is never blocked by a
+    translated keyword list.
+    """
+    requirement: tuple[str, ...] | None = None
+    for message in messages:
+        if _norm_role(message.get("role")) != "user":
+            continue
+        normalized = unicodedata.normalize(
+            "NFKC", text_of(message.get("content"))
+        ).casefold()
+        if not normalized.strip():
+            continue
+
+        cancellation = _FILE_CANCEL_RE.search(normalized)
+        negated_format = _FILE_NEGATED_FORMAT_RE.search(normalized)
+        if cancellation:
+            positive_tail = normalized[cancellation.end():]
+            candidate = _required_file_suffixes_for_text(positive_tail)
+            if candidate is None:
+                requirement = None
+                continue
+        else:
+            candidate = _required_file_suffixes_for_text(normalized)
+            if candidate is None:
+                if negated_format:
+                    requirement = None
+                continue
+        if _FILE_ADDITIVE_RE.search(normalized) and requirement:
+            requirement = tuple(dict.fromkeys((*requirement, *candidate)))
+        else:
+            requirement = candidate
+    return requirement
 
 
 def _has_payload(content: Any) -> bool:

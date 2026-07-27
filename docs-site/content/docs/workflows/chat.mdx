@@ -154,10 +154,43 @@ Decrypt `body_ct` on the authorized client. When a history item has
 `body_omitted: true`, fetch `/v1/chat/messages/{message_id}/body` instead of
 assuming the message is empty.
 
+Hosted Runtime V2 can return a generated document as a native attachment. The
+model first creates or replaces editable UTF-8 source in an encrypted
+`/workspace/...` entry with `workspace_write`. After that write succeeds, it
+calls `send_file` with the same virtual path in a later tool round. Text formats
+are delivered directly; `.docx` and `.pdf` targets are rendered into real Word
+and PDF bytes at delivery time. Semantic file intent without a named format is
+handled by the model prompt and never blocks an ordinary conversational reply.
+An explicitly requested format such as `.docx` gets one bounded completion
+recovery and cannot be satisfied by a Markdown substitute. If delivery still
+fails, the worker records `required_file_missing` and publishes a non-empty
+terminal reply instead of failing the chat turn. The worker resolves only the
+current user's entry, then commits the final assistant text followed by its
+download cards as one idempotent reply bundle. It stores `content_type: "file"`
+plus a bounded filename, MIME, and byte count. The worker never scans a runtime
+directory, and `send_file` rejects host paths and non-`/workspace` namespaces.
+Both editable source and rendered output are limited to 1,000,000 bytes.
+
 ## Independent resident loop
 
 The resident path is a queue-and-reply protocol. It does not accept plaintext
 message bodies.
+
+CLI residents (Claude, Codex, and Pi) can also generate native download cards.
+The agent writes UTF-8 Markdown-like source inside its private
+`$FEEDLING_HOME/outbound-files` directory and calls the resident `send-file`
+command with a user-visible filename. `.docx` and `.pdf` names are rendered into
+real Word and PDF bytes; an explicitly requested suffix cannot be replaced by
+Markdown. Named formats get one bounded completion retry if the first agent
+response omits the file. Requests without a named format remain prompt-level
+semantic guidance. If the retry still omits the file, the resident keeps the
+original model reply instead of replacing it with a file-failure response. The
+resident seals the primary text and every file separately, then sends them
+through `file_followups` on `POST /v1/chat/response`; the parent CAS and all
+message inserts commit in one transaction, preserving text-first/card-below
+ordering without partial success.
+Source and rendered output are each limited to 1,000,000 bytes, and staging
+rejects paths outside the per-user outbound directory.
 
 ### 1. The client stores a user message
 

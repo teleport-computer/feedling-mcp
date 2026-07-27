@@ -27,6 +27,7 @@ import base64
 import json
 import hashlib
 import os
+from pathlib import Path
 import re
 import socket
 import ssl
@@ -975,6 +976,84 @@ def _resident_ipc_request(material, *, timeout=30.0):
     }
 
 
+def _resident_ipc_call(op, payload, *, timeout=30.0):
+    """Generic resident IPC request used by foreground file staging."""
+    sock_path = _resident_ipc_sock_path()
+    request_id = str(uuid.uuid4())
+    line = (
+        json.dumps(
+            {"op": op, "request_id": request_id, **dict(payload or {})},
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+    def _attempt():
+        try:
+            raw = _resident_ipc_round_trip(sock_path, line, timeout)
+        except (FileNotFoundError, ConnectionRefusedError):
+            return {
+                "ok": False,
+                "error": "consumer_not_running",
+                "request_id": request_id,
+                "hint": f"resident consumer IPC unavailable: {sock_path}",
+            }, False
+        except socket.timeout:
+            return None, True
+        except OSError as exc:
+            return {
+                "ok": False,
+                "error": f"ipc_failed:{type(exc).__name__}:{exc}",
+                "request_id": request_id,
+            }, False
+        text = raw.decode("utf-8", errors="replace").strip()
+        if not text:
+            return None, True
+        try:
+            reply = json.loads(text.splitlines()[0])
+        except Exception:
+            return None, True
+        if isinstance(reply, dict):
+            reply.setdefault("request_id", request_id)
+            return reply, False
+        return None, True
+
+    reply, retry = _attempt()
+    if reply is not None or not retry:
+        return reply
+    reply, _retry = _attempt()
+    if reply is not None:
+        return reply
+    return {
+        "ok": False,
+        "error": "timeout_uncertain",
+        "request_id": request_id,
+        "hint": "resident consumer did not confirm the operation",
+    }
+
+
+def cmd_send_file(args):
+    """Stage one generated UTF-8 source file for this foreground chat turn."""
+    raw_path = str(args.path or "").strip()
+    if not raw_path:
+        _emit({"ok": False, "error": "path_required"}, 2)
+    source_path = Path(raw_path)
+    if not source_path.is_absolute():
+        source_path = Path(_resident_ipc_home()) / "outbound-files" / source_path
+    reply = _resident_ipc_call(
+        "stage_file",
+        {"path": str(source_path), "name": str(args.name or "").strip()},
+    )
+    if reply.get("ok"):
+        _emit({"ok": True, **{key: value for key, value in reply.items() if key != "ok"}})
+    exit_code = 2 if reply.get("error") in {
+        "consumer_not_running",
+        "no_active_chat_turn",
+        "path_outside_outbound_dir",
+    } else 1
+    _emit({"ok": False, **{key: value for key, value in reply.items() if key != "ok"}}, exit_code)
+
+
 def cmd_identity_redistill(args):
     """Hand fresh material to the resident consumer for a FULL identity
     redistill (whole-card replace), over the local resident-consumer IPC
@@ -1440,6 +1519,21 @@ def main():
     ci.add_argument("--id", dest="message_id", required=True, help="chat message id (from the [image] placeholder in the transcript)")
     ci.add_argument("--limit", type=int, default=20, help="how many recent messages to search for the id")
     ci.set_defaults(func=cmd_chat_image)
+
+    sf = sub.add_parser(
+        "send-file",
+        help="Stage a generated document for download in the current chat reply.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Write UTF-8 Markdown-like source under $FEEDLING_HOME/outbound-files, "
+            "then pass its path here. --name is the user-visible output name; "
+            "Word (.docx) and PDF (.pdf) are rendered from the UTF-8 source.\n"
+            f"{D3_SOURCING_RULE}"
+        ),
+    )
+    sf.add_argument("--path", required=True, help="UTF-8 source path inside the outbound-files directory")
+    sf.add_argument("--name", required=True, help="download filename with the requested suffix")
+    sf.set_defaults(func=cmd_send_file)
 
     sw = sub.add_parser("schedule-wake", help="Ask to be woken at a later time (native self-wake).")
     sw.add_argument("--at", required=True, help="When to wake: ISO time (e.g. 2026-06-29T18:00) or a relative spec.")

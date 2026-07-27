@@ -904,7 +904,7 @@ def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
 
     provider_calls: list[list[dict]] = []
 
-    async def _provider(_config, messages, *, tools=None):
+    async def _provider(_config, messages, *, tools=None, **_kwargs):
         provider_calls.append(messages)
         return {"reply": "chat answered once", "tool_calls": [], "usage": {}}
 
@@ -1102,7 +1102,7 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
         {"reply": "answered-three", "tool_calls": [], "usage": {}},
     ])
 
-    async def _provider(config, messages, *, tools=None):
+    async def _provider(config, messages, *, tools=None, **_kwargs):
         provider_calls.append(messages)
         return next(scripted)
 
@@ -1159,7 +1159,7 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
     seq5 = _append_user("m5", "fifth-same-ts")
     calls_after = []
 
-    async def _fourth_provider(config, messages, *, tools=None):
+    async def _fourth_provider(config, messages, *, tools=None, **_kwargs):
         calls_after.append(messages)
         return {"reply": "answered-fourth", "tool_calls": [], "usage": {}}
 
@@ -1282,7 +1282,7 @@ def test_push_transport_failure_does_not_fail_the_turn(monkeypatch):
     reply_text = "answered-boom-" + ("x" * 300)
     assert len(reply_text) > 240
 
-    async def _provider(config, messages, *, tools=None):
+    async def _provider(config, messages, *, tools=None, **_kwargs):
         return {"reply": reply_text, "tool_calls": [], "usage": {}}
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider)

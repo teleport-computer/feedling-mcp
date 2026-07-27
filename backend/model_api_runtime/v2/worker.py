@@ -38,7 +38,9 @@ import itertools
 import json
 import logging
 import math
+import mimetypes
 import os
+import posixpath
 import re
 import threading
 import time
@@ -66,6 +68,7 @@ from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
 from model_api_runtime.v2 import cursor as v2_cursor
+from model_api_runtime.v2 import document_render as v2_document_render
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import executor as v2_executor
@@ -933,6 +936,19 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
     return f"{scope}:{kind}"[:120]
 
 
+def _required_file_missing_fallback(messages: list[dict]) -> str:
+    user_text = "\n".join(
+        context.text_of(message.get("content"))
+        for message in messages
+    )
+    if re.search(r"[\u4e00-\u9fff]", user_text):
+        return "这次没能生成你要求的可下载文件，请稍后再试。"
+    return (
+        "I couldn't generate the requested downloadable file this time. "
+        "Please try again."
+    )
+
+
 @dataclass
 class TurnDeps:
     """turn 执行体的注入式依赖（生产实现见 serve_worker.build_production_deps）。
@@ -1094,6 +1110,11 @@ class TurnDeps:
     # the outbound-data fence. Missing wiring remains empty only for legacy/unit
     # callers; a wired loader failure is terminal and visible/conservative.
     load_workspace_prompt: Callable[..., dict] | None = None
+    # (store, *, runtime_token, path, expected_revision) -> workspace data. Production
+    # resolves the path inside this user's encrypted V2 workspace. It never
+    # materializes or accepts a host filesystem path. Chat uses this only for
+    # the explicit send_file tool; wake/child lanes leave it unwired.
+    load_workspace_file: Callable[..., dict] | None = None
     # Encrypted full-trajectory codec boundary. Production seals every event to
     # the user's content key + enclave key before jobs_store sees it. The open
     # callback is used only by the side-effect-disabled trajectory-review lane;
@@ -3568,6 +3589,102 @@ class _PlatformEffectReservations:
 
 
 _THINKING_MAX_CHARS = 20000
+_WORKSPACE_FILE_MAX_BYTES = 1_000_000
+REPLY_FOLLOWUPS_KEY = "reply_followups"
+_DOWNLOAD_NAME_MAX_CHARS = 120
+_BIDI_CONTROL_CHARS = frozenset(
+    chr(code)
+    for code in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))
+)
+
+
+@dataclass(frozen=True)
+class WorkspaceFileReply:
+    """One user-owned encrypted V2 workspace entry ready for publication."""
+
+    path: str
+    name: str
+    mime_type: str
+    data: bytes
+
+
+def _safe_download_name(path: str) -> str:
+    """Return a bounded display filename while preserving a useful suffix."""
+    base = posixpath.basename(str(path or "").strip())
+    cleaned = "".join(
+        char
+        for char in base
+        if char.isprintable()
+        and char not in _BIDI_CONTROL_CHARS
+        and char not in {"\n", "\r", "\t"}
+    ).strip().strip(".")
+    if not cleaned:
+        raise ValueError("workspace file name is empty")
+    if len(cleaned) <= _DOWNLOAD_NAME_MAX_CHARS:
+        return cleaned
+    stem, suffix = posixpath.splitext(cleaned)
+    suffix = suffix[:20]
+    stem_limit = max(1, _DOWNLOAD_NAME_MAX_CHARS - len(suffix))
+    return stem[:stem_limit] + suffix
+
+
+def _workspace_file_mime(name: str, declared: str = "") -> str:
+    """Choose a safe MIME for generated workspace files sent without rendering."""
+    explicit = str(declared or "").strip().lower()
+    if explicit.startswith("text/") or explicit in {
+        "application/json",
+        "application/xml",
+        "application/yaml",
+    }:
+        return explicit[:120]
+    suffix = posixpath.splitext(name)[1].lower()
+    known = {
+        ".csv": "text/csv",
+        ".html": "text/html",
+        ".htm": "text/html",
+        ".json": "application/json",
+        ".md": "text/markdown",
+        ".markdown": "text/markdown",
+        ".rtf": "text/rtf",
+        ".svg": "image/svg+xml",
+        ".tsv": "text/tab-separated-values",
+        ".xml": "application/xml",
+        ".yaml": "application/yaml",
+        ".yml": "application/yaml",
+    }
+    return known.get(suffix) or mimetypes.guess_type(name)[0] or "text/plain"
+
+
+def _workspace_file_reply_from_result(result: dict) -> WorkspaceFileReply:
+    """Validate assembly output before any model-selected file is published."""
+    if not isinstance(result, dict):
+        raise RuntimeError("workspace file loader returned invalid data")
+    path = str(result.get("path") or "").strip()
+    if not path.startswith("/workspace/") or "\\" in path:
+        raise ValueError("send_file requires a /workspace file")
+    content = result.get("content")
+    if not isinstance(content, str):
+        raise ValueError("send_file requires UTF-8 workspace source content")
+    source_data = content.encode("utf-8")
+    if not source_data or len(source_data) > _WORKSPACE_FILE_MAX_BYTES:
+        raise ValueError("workspace file is empty or too large")
+    name = _safe_download_name(path)
+    rendered = v2_document_render.render_download(name, content)
+    if rendered is None:
+        data = source_data
+        mime_type = _workspace_file_mime(
+            name, str(result.get("mime_type") or "")
+        )
+    else:
+        data, mime_type = rendered
+    if not data or len(data) > _WORKSPACE_FILE_MAX_BYTES:
+        raise ValueError("rendered workspace file is empty or too large")
+    return WorkspaceFileReply(
+        path=path,
+        name=name,
+        mime_type=mime_type,
+        data=data,
+    )
 
 
 def _sanitize_reasoning(text: str) -> str:
@@ -3733,6 +3850,37 @@ def _build_encrypted_reply_effect_payload(
     return payload
 
 
+def _build_encrypted_file_reply_effect_payload(
+    store,
+    file_reply: WorkspaceFileReply,
+    *,
+    effect_id: str,
+) -> dict:
+    """Seal a V2 workspace file into a deterministic intermediate reply.
+
+    The outbox stores only ciphertext plus bounded display metadata. The same
+    effect id always addresses the same chat row, so a reconciliation replay
+    cannot create a duplicate attachment card.
+    """
+    item_id = hashlib.sha256(effect_id.encode("utf-8")).hexdigest()[:32]
+    envelope, error = core_envelope._build_shared_envelope_for_store(
+        store,
+        bytes(file_reply.data),
+        item_id=item_id,
+    )
+    if envelope is None:
+        raise RuntimeError(error or "file reply envelope build failed")
+    return {
+        "envelope": envelope,
+        "message_extra": {
+            "content_type": "file",
+            "file_name": file_reply.name,
+            "file_mime": file_reply.mime_type,
+            "file_byte_count": len(file_reply.data),
+        },
+    }
+
+
 def _tool_effect_item_id(effect_id: str) -> str:
     """Return the row-bound envelope id for a deterministic tool effect."""
     return hashlib.sha256(f"v2-tool-effect:{effect_id}".encode("utf-8")).hexdigest()[
@@ -3779,6 +3927,7 @@ def _write_encrypted_reply_effect(
     envelope: dict,
     *,
     reply_through_seq: int = 0,
+    content_type: str = "text",
     extra: dict | None = None,
 ) -> dict:
     """Naturally-idempotent sink for encrypted V2 reply effects.
@@ -3791,6 +3940,7 @@ def _write_encrypted_reply_effect(
         "openclaw",
         "model_api",
         envelope,
+        content_type=content_type,
         strict=True,
         reply_through_seq=int(reply_through_seq),
         **kwargs,
@@ -7348,6 +7498,9 @@ async def process_job(
         coalesced, cursor_seq, cursor_ts = await _coalesce_inputs(
             deps, user_id, since_seq, enclave_sem=enclave_sem
         )
+        required_file_suffixes = (
+            context.required_file_suffixes(coalesced) if lane == "chat" else None
+        )
         if not coalesced and lane == "chat":
             # 无未回复消息（已被别的回合吃掉，或是竞态下的重复 claim）——干净收尾，不落 filler。
             completed, successor_id = await asyncio.to_thread(
@@ -8010,12 +8163,26 @@ async def process_job(
             return results
 
         final_job_completed_atomically = False
+        pending_file_replies: list[WorkspaceFileReply] = []
+        pending_file_keys: set[tuple[str, int]] = set()
 
-        async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
+        async def _on_file_requirement_changed() -> None:
+            pending_file_replies.clear()
+            pending_file_keys.clear()
+
+        async def _on_reply(
+            text: str | WorkspaceFileReply,
+            *,
+            final: bool,
+            reasoning: str = "",
+        ) -> None:
             nonlocal final_job_completed_atomically
-            text = str(text or "").strip()
+            file_reply = text if isinstance(text, WorkspaceFileReply) else None
+            text = "" if file_reply is not None else str(text or "").strip()
+            if file_reply is not None and final:
+                raise RuntimeError("a file reply cannot be terminal")
             turn_failure_error_class = ""
-            if text and _is_degenerate_reply(text):
+            if file_reply is None and text and _is_degenerate_reply(text):
                 log.warning(
                     "[v2.worker] chat degenerate reply suppressed user=%s "
                     "job=%s final=%s fragment=%r",
@@ -8035,7 +8202,7 @@ async def process_job(
                 # silence is legitimate), so this becomes a mark_failed via the
                 # outer except below, never a placeholder bubble.
                 raise TurnError("empty_reply")
-            if not text:
+            if not text and file_reply is None:
                 return  # empty intermediate reply{} call: no bubble, not an error
             delivery_started_ns = time.monotonic_ns()
             # A cutover/ABA can happen while awaiting the provider. Fence at
@@ -8056,9 +8223,18 @@ async def process_job(
                 ordinal=ordinal_value,
             )
             payload = {"text": text}
-            if turn_failure_error_class:
-                payload["turn_failure_error_class"] = turn_failure_error_class
-            if seq_native:
+            if file_reply is not None:
+                payload = await asyncio.to_thread(
+                    _build_encrypted_file_reply_effect_payload,
+                    store,
+                    file_reply,
+                    effect_id=effect_id,
+                )
+                if seq_native:
+                    payload[v2_effect_outbox.REPLY_SOURCE_FENCE_KEY] = {
+                        "claimed_by": claimed_by,
+                    }
+            elif seq_native:
                 payload = await asyncio.to_thread(
                     _build_encrypted_reply_effect_payload,
                     store,
@@ -8066,8 +8242,6 @@ async def process_job(
                     effect_id=effect_id,
                     reply_through_seq=(cursor_box["seq"] if final else None),
                 )
-                if turn_failure_error_class:
-                    payload["turn_failure_error_class"] = turn_failure_error_class
                 if final:
                     # Reply content is encrypted; the owner id and two integers
                     # are only non-sensitive routing metadata. The outbox
@@ -8084,12 +8258,26 @@ async def process_job(
                     payload[v2_effect_outbox.REPLY_SOURCE_FENCE_KEY] = {
                         "claimed_by": claimed_by,
                     }
+                if final and pending_file_replies:
+                    followups = []
+                    for index, pending_file in enumerate(pending_file_replies):
+                        followups.append(
+                            await asyncio.to_thread(
+                                _build_encrypted_file_reply_effect_payload,
+                                store,
+                                pending_file,
+                                effect_id=f"{effect_id}:file:{index}",
+                            )
+                    )
+                    payload[REPLY_FOLLOWUPS_KEY] = followups
+            if turn_failure_error_class:
+                payload["turn_failure_error_class"] = turn_failure_error_class
             # Provider chain-of-thought rides the same effect as its final reply,
             # sealed into a separate thinking envelope so the durable outbox holds
             # only ciphertext and a retry re-addresses the same thinking row. Only
             # final replies carry it — intermediate reply{} bubbles are
             # agent-authored text, not provider reasoning.
-            if final and reasoning:
+            if final and reasoning and file_reply is None:
                 thinking_payload = await asyncio.to_thread(
                     _build_thinking_payload,
                     store,
@@ -8223,7 +8411,7 @@ async def process_job(
                     try:
                         push_slot = {
                             "msg_id": str(payload["envelope"]["id"]),
-                            "body": text[:240],
+                            "body": (text or file_reply.name)[:240],
                             "is_wake": False,
                             # Chat lane is never a wake — send an empty lane rather
                             # than the job's own lane=="chat" bookkeeping value, so
@@ -8323,6 +8511,27 @@ async def process_job(
             "seq": max(int(since_seq), int(cursor_seq)),
             "ts": float(cursor_ts),
         }
+
+        async def _on_file_reply(path: str, revision: int) -> None:
+            if deps.load_workspace_file is None:
+                raise RuntimeError("workspace file delivery is unavailable")
+            loaded = await asyncio.to_thread(
+                deps.load_workspace_file,
+                store,
+                runtime_token=runtime_token,
+                path=str(path or ""),
+                expected_revision=revision,
+            )
+            file_reply = await asyncio.to_thread(
+                _workspace_file_reply_from_result, loaded
+            )
+            if not seq_native:
+                await _on_reply(file_reply, final=False)
+                return
+            key = (file_reply.path, int(revision))
+            if key not in pending_file_keys:
+                pending_file_keys.add(key)
+                pending_file_replies.append(file_reply)
         # Pass THIS turn's enclave_sem through explicitly (not the closure's module-level
         # default) — process_job may have been called with an injected/test semaphore
         # (e.g. tests/test_v2_worker.py's _CountingSemaphore), and the per-round fold must
@@ -8441,6 +8650,13 @@ async def process_job(
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
             on_reply=_on_reply,
+            on_file_reply=(
+                _on_file_reply if deps.load_workspace_file is not None else None
+            ),
+            required_file_suffixes=required_file_suffixes,
+            file_requirement_messages=coalesced,
+            resolve_required_file_suffixes=context.required_file_suffixes,
+            on_file_requirement_changed=_on_file_requirement_changed,
             fold_new_messages=fold_new_messages,
             add_usage=tm.add_call,
             max_calls=_TURN_MAX_LLM_CALLS,
@@ -8500,6 +8716,19 @@ async def process_job(
             await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
             tm.flush(failed=False, status="input_advanced_handoff")
             return "completed"
+        if outcome.stop_reason == "required_file_missing":
+            # File completion is best-effort after one bounded recovery. Keep a
+            # usable provider terminal reply, and synthesize an honest non-empty
+            # final only when the provider returned no text at all.
+            if not (outcome.final_text or "").strip():
+                outcome.final_text = _required_file_missing_fallback(coalesced)
+                await _on_reply(outcome.final_text, final=True)
+            log.warning(
+                "[v2.worker] required file missing after bounded retry "
+                "user=%s job=%s",
+                user_id,
+                job_id,
+            )
         if not outcome.replied_intermediate and not (outcome.final_text or "").strip():
             # BUG-4 no-filler class: the loop returned WITHOUT ever producing a
             # bubble — budget_exhausted (max_calls reached with no terminal

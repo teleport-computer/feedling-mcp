@@ -16,7 +16,14 @@ from agent_runtime import spawners  # noqa: E402
 import io_cli_catalog  # noqa: E402  (sibling under tools/, same convention as spawners' lazy import)
 
 
-NEW_VERBS = ("memory-write", "memory-patch", "memory-delete", "schedule-wake", "cancel-wake")
+NEW_VERBS = (
+    "memory-write",
+    "memory-patch",
+    "memory-delete",
+    "schedule-wake",
+    "cancel-wake",
+    "send-file",
+)
 
 
 def setup_function(_fn):
@@ -124,6 +131,8 @@ def test_agent_home_files_renders_full_prompt_with_no_leftover_placeholder():
     prompt = files["/h/agent-tools-prompt.md"]
     assert "<io_cli_catalog>" not in prompt
     assert "<io_cli>" not in prompt
+    assert "<outbound_file_dir>" not in prompt
+    assert "/h/outbound-files" in prompt
 
 
 def test_d3_sourcing_rule_mirrors_io_cli_catalog_source_of_truth():

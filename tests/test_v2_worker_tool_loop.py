@@ -146,7 +146,7 @@ def _script_provider(monkeypatch, responses):
     it = iter(responses)
     calls = []
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         calls.append({"messages": messages, "tools": tools})
         return next(it)
 
@@ -671,7 +671,7 @@ def test_chat_native_task_runs_child_then_returns_result_to_parent(
     )
     calls = []
 
-    async def provider(config, messages, *, tools=None):
+    async def provider(config, messages, *, tools=None, **_kwargs):
         calls.append(
             {
                 "config": config,
@@ -762,7 +762,7 @@ def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
     deps = _late_input_deps(uid, written)
     calls = []
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **_kwargs):
         calls.append(list(messages))
         if len(calls) == 1:
             # This is the production send invariant: B and the running job's
@@ -943,7 +943,7 @@ def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
     first_attempt_calls = 0
     retry_messages = []
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **_kwargs):
         nonlocal first_attempt_calls
         if phase == "crash":
             first_attempt_calls += 1
@@ -1286,7 +1286,7 @@ def test_sweeper_wins_final_effect_before_producer_drain_and_loop_still_retries(
     deps.apply_pending_effects = sweep_before_producer
     calls = []
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **_kwargs):
         calls.append(list(messages))
         if len(calls) == 1:
             _seq, same_job_id = db.chat_append_and_enqueue(
@@ -1376,7 +1376,7 @@ def test_last_call_late_input_hands_off_without_reply_or_error_chip(
         cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({})
     )
 
-    async def provider(_config, _messages, *, tools=None):
+    async def provider(_config, _messages, *, tools=None, **_kwargs):
         _seq, same_job_id = db.chat_append_and_enqueue(
             uid,
             "B",
@@ -1472,7 +1472,7 @@ def test_invalid_final_fence_fails_visibly_without_reply_or_retry_loop(monkeypat
 
     deps.apply_pending_effects = corrupt_terminal_before_apply
 
-    async def provider(_config, _messages, *, tools=None):
+    async def provider(_config, _messages, *, tools=None, **_kwargs):
         return _text_round("must never be visible")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
@@ -1658,6 +1658,49 @@ def test_chat_turn_with_no_reply_produced_marks_job_failed_not_completed(monkeyp
     row = _turn_metric_row(job_id)
     assert row is not None
     assert row[1] is True  # failed=True in the metric row too
+
+
+def test_required_file_missing_with_empty_provider_text_gets_terminal_reply(
+    monkeypatch,
+):
+    uid = "u_toolloop_required_file_missing"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-required-file-missing")
+    _patch_real_write(monkeypatch)
+
+    async def direct_loop(**_kwargs):
+        return worker.v2_tool_loop.LoopOutcome(
+            final_text="",
+            rounds=2,
+            stop_reason="required_file_missing",
+            replied_intermediate=False,
+        )
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", direct_loop)
+    deps = _deps(
+        messages=[
+            {
+                "id": "m1",
+                "ts": 10.0,
+                "role": "user",
+                "content": "请生成一份 PDF 报告",
+            }
+        ]
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert [bubble["body_ct"] for bubble in _bubbles(uid)] == [
+        "这次没能生成你要求的可下载文件，请稍后再试。"
+    ]
+    assert _job_status_row(job_id)[0] == "completed"
 
 
 # --------------------------------------------------------------- web gate

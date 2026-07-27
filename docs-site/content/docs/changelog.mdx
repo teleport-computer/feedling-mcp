@@ -10,6 +10,16 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **V1 CLI residents can now return generated documents as native download
+  cards.** Claude, Codex, and Pi residents receive a `send-file` command backed
+  by a private per-user staging directory. Word and PDF requests render real
+  `.docx`/`.pdf` bytes, and explicit formats cannot fall back to Markdown. Named
+  formats receive one bounded completion retry; no-format requests remain
+  semantic prompt guidance, and a missing file no longer replaces or fails the
+  model's text reply. When a file is delivered, the text primary and its encrypted
+  `file_followups` commit atomically through `POST /v1/chat/response`, preserving
+  text-first/card-below ordering.
+
 - **Memory cards are no longer written with unfilled template placeholders.**
   Capture and Dream now validate card *content*, not just field presence: a
   `summary` or `content` that is a bracketed placeholder (`[thickened summary]`),
@@ -334,6 +344,17 @@ change must not be interpreted as an API guarantee.
   replies must now use `source: "verify_ping"` and point
   `reply_to_message_id` at the exact pending ping; `loop_alive` can therefore be
   true while `passing` is false when decrypt policy blocks sticky verification.
+- Hosted Runtime V2 can now publish a generated `/workspace` document as a
+  native download card through the explicit `send_file` tool. Text formats are
+  delivered directly, while `.docx` and `.pdf` requests produce real Word and
+  PDF bytes instead of Markdown with a renamed suffix. Explicit formats get one
+  bounded completion recovery and cannot be replaced with a different suffix;
+  requests without a named format remain prompt-level semantic guidance. If
+  delivery still fails, Runtime V2 records `required_file_missing` and preserves
+  a non-empty terminal reply instead of failing the turn. The entry remains
+  user-scoped and encrypted; final assistant text and its file cards commit as
+  one ordered, idempotent reply bundle; host filesystem paths are never scanned
+  or accepted.
 - Self-hosted resident polls may now receive server-generated maintenance turns
   with `role: "user"` and `source: "resident_maintenance"` when the resident
   consumer appears stale or is not claiming resident-only distill jobs. These
