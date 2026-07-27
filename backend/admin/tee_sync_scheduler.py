@@ -33,10 +33,19 @@ log = logging.getLogger("feedling.tee_sync")
 
 # 密文表 —— 经 enclave 解密成明文。**从注册表派生**，不再手工维护：手工清单正是
 # "加了表但某一处没登记"的老问题的来源（2026-07-27 之前 V2 的 19 张表一处都没登记）。
+#
+# ⚠️ 必须并上 PSEUDO_CIPHERTEXT_TABLES。worker._TABLES 的 key 不全是 RDS 表名——
+# "identity" 是个伪表名，实际操作的是 `user_blobs WHERE kind='identity'`
+# （RDS 侧密文信封 → enclave 解密 → TEE 侧 user_blobs 明文行）。注册表按表名登记，
+# user_blobs 整表归 MIRROR lane（reconciler 的 _SCOPE_WHERE 又特意排除 kind='identity'
+# 把它让给 replicator），所以 CIPHERTEXT lane 里**不会**出现 "identity" 这个 key。
+# 只按 lane 派生会静默丢掉整条用户身份/人设的同步路径（2026-07-28 Task 6 实施期发现）。
 def _ciphertext_tables() -> tuple[str, ...]:
     from tee_shadow import table_registry as reg
 
-    return reg.tables_in_lane(reg.CIPHERTEXT)
+    return tuple(sorted(
+        set(reg.tables_in_lane(reg.CIPHERTEXT)) | set(reg.PSEUDO_CIPHERTEXT_TABLES)
+    ))
 
 # 首个 tick 的启动延迟（秒）：短于常规间隔，让父表回填尽快发生（见 _loop）。
 _FIRST_DELAY = 30.0

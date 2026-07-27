@@ -170,3 +170,15 @@ def tables_in_lane(lane: str) -> tuple[str, ...]:
 def synced_tables() -> tuple[str, ...]:
     """所有会进 TEE 的表（即非 SKIP），按字典序。"""
     return tuple(sorted(t for t, e in REGISTRY.items() if e.lane != SKIP))
+
+
+# worker._TABLES 里那些**不是 RDS 表名**的 key。
+#
+# "identity" 实际操作 `user_blobs WHERE kind='identity'`：RDS 侧是密文信封，经 enclave
+# 解密后写进 TEE 侧 user_blobs 的明文行。它没法作为 REGISTRY 的一条登记——REGISTRY 按
+# 表名索引，而 user_blobs 整表已登记为 MIRROR（reconciler 的 _SCOPE_WHERE 排除了
+# kind='identity'，正是把这部分让给 replicator）。
+#
+# 放在这里而不是散落在调度器里，是为了让"CIPHERTEXT 通道要跑哪些东西"仍然只有一个出处。
+# 它刻意不进 REGISTRY，因此不受完备性守卫约束（守卫比的是真实表名）。
+PSEUDO_CIPHERTEXT_TABLES: tuple[str, ...] = ("identity",)

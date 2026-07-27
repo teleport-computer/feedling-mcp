@@ -310,7 +310,28 @@ def test_ciphertext_tables_are_derived_from_registry():
     from admin import tee_sync_scheduler as sched
     from tee_shadow import table_registry as reg
 
-    assert set(sched._ciphertext_tables()) == set(reg.tables_in_lane(reg.CIPHERTEXT))
+    want = set(reg.tables_in_lane(reg.CIPHERTEXT)) | set(reg.PSEUDO_CIPHERTEXT_TABLES)
+    assert set(sched._ciphertext_tables()) == want
+
+
+def test_scheduler_covers_every_worker_table():
+    """调度器必须覆盖 worker._TABLES 的**每一个 key**，包括非表名的伪 key。
+
+    这条是上一条的反向守卫，缺了它就会重演 2026-07-28 的回归：把写死的
+    _CIPHERTEXT_TABLES 改成"按 lane 派生"时，静默丢掉了 "identity" 这个伪表名
+    （它实际操作 user_blobs WHERE kind='identity'，而 user_blobs 整表登记在
+    MIRROR lane，因此永远不会出现在 CIPHERTEXT lane 里）。后果是整条用户身份/
+    人设的同步路径消失，而上一条测试是同义反复、抓不到。
+    """
+    from admin import tee_sync_scheduler as sched
+    from tee_replicator import worker
+
+    missing = sorted(set(worker._TABLES) - set(sched._ciphertext_tables()))
+    assert not missing, (
+        f"worker 配了这些复制目标，但调度器不会去跑它们：{missing}\n"
+        "若某个 key 不是 RDS 表名（伪表名），把它加进 "
+        "table_registry.PSEUDO_CIPHERTEXT_TABLES。"
+    )
 
 
 def test_sync_tick_records_snapshot_metrics(monkeypatch):
