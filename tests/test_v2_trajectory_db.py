@@ -339,6 +339,51 @@ def test_recent_chat_operational_health_counts_missing_capture_from_jobs():
     }
 
 
+def test_failure_reasons_reconcile_with_the_counts_they_sit_next_to():
+    """The histogram and the failure count must describe the SAME sample.
+
+    Caught in review of 2b6fb852: the reasons were a second "most recent N
+    failures" scan while the counts came from "most recent N terminal jobs".
+    Once a window holds more than N terminal jobs those are different sets,
+    so the panel would show `failed: 0` beside a list of failure reasons —
+    two implementations of one number, which is the trap TESTING §2-N exists
+    to catch.
+    """
+    def add_job(user_id: str, status: str, *, last_error: str, age_hours: int) -> None:
+        seed_user(user_id)
+        set_v2_runtime_owner(user_id)
+        job_id, _ = jobs_store.enqueue_job(user_id, "chat")
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE agent_jobs SET status=%s,last_error=%s,"
+                "finished_at=clock_timestamp()-make_interval(hours => %s) "
+                "WHERE id=%s",
+                (status, last_error, age_hours, job_id),
+            )
+
+    # Older failures, newer successes: a bounded sample must exclude both
+    # the failures AND their reasons, together.
+    add_job("u_recon_old_fail_a", "failed", last_error="evicted_reason", age_hours=5)
+    add_job("u_recon_old_fail_b", "expired", last_error="evicted_reason", age_hours=4)
+    for index in range(3):
+        add_job(f"u_recon_ok_{index}", "completed", last_error="", age_hours=index)
+
+    health = jobs_store.recent_chat_operational_health(limit=3)
+    jobs = health["jobs"]
+
+    assert jobs["failed"] + jobs["expired"] == sum(
+        entry["count"] for entry in jobs["failure_reasons"]
+    ), "reasons must sum to the failures reported beside them"
+    assert jobs["failure_reasons"] == [], "evicted failures take their reasons with them"
+
+    # Widen the sample and both sides must grow together.
+    widened = jobs_store.recent_chat_operational_health(limit=1000)["jobs"]
+    assert widened["failed"] + widened["expired"] == sum(
+        entry["count"] for entry in widened["failure_reasons"]
+    )
+    assert {"reason": "evicted_reason", "count": 2} in widened["failure_reasons"]
+
+
 def test_recent_chat_failures_for_user_answers_why_this_user_went_silent():
     """The fleet histogram says "V2 is unhealthy"; support needs "this person".
 

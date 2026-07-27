@@ -3467,6 +3467,22 @@ def recent_chat_operational_health(
                 "    COUNT(*) FILTER (WHERE status='expired' "
                 "      AND last_error='lease_timeout')::int AS lease_expired "
                 "  FROM recent_outcomes"
+                # Reasons MUST come out of recent_outcomes, not a second scan
+                # of agent_jobs. A separate "most recent N failures" query
+                # samples a different set than the "most recent N terminal
+                # jobs" the counts above are computed from, so once the window
+                # holds more than `limit` terminal jobs the histogram stops
+                # summing to `failed + expired` and the panel contradicts
+                # itself. Sharing the CTE also keeps this to one index scan.
+                "), failure_reasons AS ("
+                "  SELECT COALESCE(json_agg(json_build_object("
+                "    'reason',reason,'count',n) ORDER BY n DESC,reason),"
+                "    '[]'::json) AS reasons FROM ("
+                "    SELECT COALESCE(NULLIF(last_error,''),'(empty)') AS reason,"
+                "      COUNT(*)::int AS n FROM recent_outcomes "
+                "    WHERE status IN ('failed','expired') "
+                "    GROUP BY 1 ORDER BY n DESC,reason LIMIT %s"
+                "  ) ranked"
                 "), superseded AS ("
                 "  SELECT COUNT(*)::int AS superseded FROM recent_superseded"
                 "), pending AS ("
@@ -3475,31 +3491,18 @@ def recent_chat_operational_health(
                 "      (clock_timestamp()-MIN(created_at))) AS oldest_pending_age_sec "
                 "  FROM agent_jobs WHERE lane='chat' AND status='pending'"
                 ") SELECT outcomes.*,superseded.superseded,pending.pending,"
-                "pending.oldest_pending_age_sec "
-                "FROM outcomes CROSS JOIN superseded CROSS JOIN pending",
-                (safe_hours, safe_limit, safe_hours, safe_limit),
+                "pending.oldest_pending_age_sec,failure_reasons.reasons "
+                "FROM outcomes CROSS JOIN failure_reasons "
+                "CROSS JOIN superseded CROSS JOIN pending",
+                (
+                    safe_hours,
+                    safe_limit,
+                    safe_hours,
+                    safe_limit,
+                    _FAILURE_REASON_TOP_N,
+                ),
             )
             job_row = cur.fetchone()
-
-            # WHY a reason histogram: on 2026-07-27 two prod users went
-            # silent for hours on V2 and this endpoint could report a 52.6%
-            # failure rate without a single reason string. `last_error` was
-            # written all along — the CTE above already selects it — but
-            # nothing ever surfaced it, so triage had to infer the cause from
-            # provider-ledger gaps and guess. A count without a reason is a
-            # smoke alarm with no address.
-            cur.execute(
-                "WITH recent_failures AS ("
-                "  SELECT last_error FROM agent_jobs "
-                "  WHERE lane='chat' AND status IN ('failed','expired') "
-                "    AND finished_at >= now() - make_interval(hours => %s) "
-                "  ORDER BY finished_at DESC,id DESC LIMIT %s"
-                ") SELECT COALESCE(NULLIF(last_error,''),'(empty)') AS reason,"
-                "  COUNT(*)::int AS n "
-                "FROM recent_failures GROUP BY 1 ORDER BY n DESC,reason LIMIT %s",
-                (safe_hours, safe_limit, _FAILURE_REASON_TOP_N),
-            )
-            failure_reason_rows = cur.fetchall()
 
             cur.execute(
                 "WITH recent AS ("
@@ -3589,12 +3592,14 @@ def recent_chat_operational_health(
                 if oldest_pending_age is not None
                 else None
             ),
+            # Reasons come from the same recent_outcomes sample as the counts
+            # above, so this list always reconciles with failed + expired.
             "failure_reasons": [
                 {
-                    "reason": _truncated_failure_reason(row["reason"]),
-                    "count": int(row["n"] or 0),
+                    "reason": _truncated_failure_reason(entry.get("reason")),
+                    "count": int(entry.get("count") or 0),
                 }
-                for row in failure_reason_rows
+                for entry in (job_row["reasons"] or [])
             ],
         },
         "latency": {
