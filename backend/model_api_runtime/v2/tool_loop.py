@@ -216,6 +216,8 @@ async def run_tool_loop(
     prompt_safety_margin_tokens: int | None = None,
     prompt_estimator_utf8_bytes_per_token: float = prompt_frontier.DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
     prompt_image_reserve_tokens: int = prompt_frontier.DEFAULT_IMAGE_RESERVE_TOKENS,
+    on_tail_window=None,
+    on_prompt_frontier_exhaustion=None,
 ) -> LoopOutcome:
     """Run one chronological, provider-native tool transcript.
 
@@ -528,15 +530,41 @@ async def run_tool_loop(
             tools = [spec for spec in turn_catalog if spec.name not in blocked_tools]
         else:
             tools = turn_catalog
-        frontier_plan = prompt_frontier.plan_provider_round(
-            model_limit=model_prompt_limit,
-            messages=messages,
-            tools=tools,
-            output_reserve_tokens=prompt_output_reserve_tokens,
-            safety_margin_tokens=prompt_safety_margin_tokens,
-            utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
-            image_reserve_tokens=prompt_image_reserve_tokens,
-        )
+        tail_window = None
+        adaptive_planner = getattr(build_messages, "plan_provider_round", None)
+        try:
+            if callable(adaptive_planner):
+                messages, frontier_plan, tail_window = adaptive_planner(
+                    transcript=list(transcript),
+                    tools=tools,
+                    model_limit=model_prompt_limit,
+                    output_reserve_tokens=prompt_output_reserve_tokens,
+                    safety_margin_tokens=prompt_safety_margin_tokens,
+                    utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
+                    image_reserve_tokens=prompt_image_reserve_tokens,
+                )
+            else:
+                frontier_plan = prompt_frontier.plan_provider_round(
+                    model_limit=model_prompt_limit,
+                    messages=messages,
+                    tools=tools,
+                    output_reserve_tokens=prompt_output_reserve_tokens,
+                    safety_margin_tokens=prompt_safety_margin_tokens,
+                    utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
+                    image_reserve_tokens=prompt_image_reserve_tokens,
+                )
+        except prompt_frontier.PromptFrontierExhausted:
+            if on_prompt_frontier_exhaustion is not None:
+                try:
+                    on_prompt_frontier_exhaustion()
+                except Exception:
+                    pass
+            raise
+        if tail_window is not None and on_tail_window is not None:
+            try:
+                on_tail_window(dict(tail_window))
+            except Exception:
+                pass
         if "tool_schemas" in frontier_plan.omitted_optional_components:
             # Schemas are atomic and optional: omitting the whole catalog is a
             # valid weak-model/text-only degradation. Required conversation and
@@ -551,6 +579,7 @@ async def run_tool_loop(
                 "messages": messages,
                 "tools": tools,
                 "prompt_frontier": frontier_plan,
+                "tail_window": tail_window,
             },
         )
         attempts += 1

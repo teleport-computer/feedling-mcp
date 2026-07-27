@@ -44,6 +44,7 @@ import posixpath
 import re
 import threading
 import time
+import unicodedata
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -54,6 +55,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import db
 import provider_client
 import provider_health
+from notices import catalog as notices_catalog
 from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
@@ -84,8 +86,21 @@ from model_api_runtime.v2 import trajectory as v2_trajectory
 
 # 纯 prompt/parse 模块（无 I/O、不碰 DB/enclave）——依赖方向允许 worker 直接 import
 # （extraction.py 同样只 import 这两个 + provider_client）。
-from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards
-from memory.dream_prompt_v1 import build_dream_prompt, parse_dream_consolidations
+from memory.capture_prompt_v1 import (
+    build_capture_prompt,
+    build_capture_retry_prompt,
+    parse_capture_cards,
+)
+from identity.user_naming import transcript_speaker_label
+from memory.card_text import (
+    count_user_token_residuals,
+    is_card_format_error,
+)
+from memory.dream_prompt_v1 import (
+    build_dream_prompt,
+    build_dream_retry_prompt,
+    parse_dream_consolidations,
+)
 
 log = logging.getLogger("feedling.runtime_v2.worker")
 
@@ -428,14 +443,27 @@ def _reserved_lane_slots(max_workers: int, reserved: int | None = None) -> list:
     return [{"chat", "manual_wake"} if i < r else None for i in range(n)]
 
 
-# D1（full-conversation context）：turn 使用 summary+tail，而不是"仅未回复的 user
-# 消息"。tail 超过 _TAIL_BUDGET 条（双角色计数）时，chat turn 顺手（best-effort，不阻塞
-# 回复）入队一个 maintenance lane 的 compaction job，把最旧的一批折进摘要，只留
-# _TAIL_KEEP 条最近消息逐字保留。_TAIL_HARD_CAP 是 chat turn 读 tail 时的硬上限（喂
-# 当前 turn，不是压缩用——压缩自己读到 watermark 之后的全部，见 `_run_compaction`）。
+# Legacy message-count controls remain compaction compatibility knobs only.
+# They are deliberately not reinterpreted as turns: doing so would silently
+# double effective history for the common user+assistant shape.
 _TAIL_BUDGET = int(os.environ.get("FEEDLING_V2_TAIL_BUDGET_MSGS", "20"))
 _TAIL_KEEP = int(os.environ.get("FEEDLING_V2_TAIL_KEEP_MSGS", "10"))
 _TAIL_HARD_CAP = int(os.environ.get("FEEDLING_V2_TAIL_HARD_CAP", "60"))
+_CHAT_TAIL_MAX_TURNS = _positive_int_env(
+    "FEEDLING_V2_CHAT_TAIL_MAX_TURNS", "40"
+)
+_WAKE_TAIL_MAX_TURNS = _positive_int_env(
+    "FEEDLING_V2_WAKE_TAIL_MAX_TURNS", "16"
+)
+_RECENT_TURN_ROW_CAP = _positive_int_env(
+    "FEEDLING_V2_RECENT_TURN_ROW_CAP", "512"
+)
+if "FEEDLING_V2_TAIL_BUDGET_MSGS" in os.environ:
+    log.warning(
+        "[v2.worker] FEEDLING_V2_TAIL_BUDGET_MSGS remains a legacy "
+        "compaction message threshold; use FEEDLING_V2_CHAT_TAIL_MAX_TURNS "
+        "and FEEDLING_V2_WAKE_TAIL_MAX_TURNS for prompt replay depth"
+    )
 _CAPTURE_BATCH_LIMIT = 60
 _CAPTURE_PROMPT_RAW_ROLES = frozenset({"user", "openclaw"})
 _CAPTURE_PROMPT_SOURCES = frozenset(
@@ -827,6 +855,22 @@ _SCREEN_WATCH_SYSTEM_PROMPT = (
 # `payment_cooldown_until` on the wake schedule; `jobs_store.due_heartbeat_users` already
 # excludes cooled-down users (Task 1), so no further wakes fire until it lapses.
 _WAKE_COOLDOWN_SEC = float(os.environ.get("FEEDLING_V2_WAKE_COOLDOWN_SEC", "600"))
+_WAKE_FAIL_BACKOFF_BASE_SEC = float(
+    os.environ.get("PROACTIVE_FAIL_BACKOFF_BASE_SEC", "60")
+)
+_WAKE_FAIL_BACKOFF_CAP_SEC = float(
+    os.environ.get("PROACTIVE_FAIL_BACKOFF_CAP_SEC", "3600")
+)
+_FAIL_BACKOFF_WAKE_LANES = frozenset({"heartbeat", "scheduled"})
+
+_DEGENERATE_REPLY_FALLBACK = (
+    os.environ.get(
+        "FALLBACK_REPLY",
+        "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。",
+    ).strip()
+    or "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
+)
+_DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
 
 
 class LostJobLease(RuntimeError):
@@ -849,13 +893,26 @@ class WorkspacePromptUnavailable(RuntimeError):
     """The encrypted workspace prefix could not be loaded safely."""
 
 
+def _is_degenerate_reply(text: Any) -> bool:
+    """Return true for empty or punctuation/separator-only provider output."""
+    for char in str(text or ""):
+        category = unicodedata.category(char)
+        if category[0] in {"L", "N"} or category == "So":
+            return False
+    return True
+
+
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
     """Stable plaintext error code that never embeds exception messages."""
     if isinstance(exc, WorkspacePromptUnavailable):
         kind = "workspace_prompt_unavailable"
     elif isinstance(exc, TurnError):
         raw = str(exc)
-        if raw in {"empty_reply", "no_user_messages"}:
+        if raw in {
+            "degenerate_reply_suppressed",
+            "empty_reply",
+            "no_user_messages",
+        }:
             kind = raw
         else:
             # Keep the established persisted code stable across the internal
@@ -936,6 +993,14 @@ class TurnDeps:
     read_compaction_tail: Callable[[str, float, int], list[dict]] | None = None
     read_tail_after_seq: Callable[..., list[dict]] | None = None
     read_compaction_tail_after_seq: Callable[..., list[dict]] | None = None
+    # (user_id, max_turns, row_cap, through_seq=...) -> content-free window
+    # metadata plus decrypted rows. A turn starts at a genuine user row and
+    # includes every following row before the next genuine user seed.
+    read_recent_turns: Callable[..., dict] | None = None
+    # (user_id, through_seq|None) -> {"timezone","last_user_message_ts"}.
+    # Production resolves registry timezone -> perception fallback -> UTC and
+    # bounds the genuine-user timestamp to the turn's frozen prompt frontier.
+    read_temporal_snapshot: Callable[..., dict] | None = None
     # user_id -> (summary_plaintext, watermark_ts, version)：读取该用户当前会话摘要（enclave
     # 解密明文）；从未压缩过时 ("", 0.0, 0)（D1：turn 看 摘要+尾巴 而不是全量重放）。默认
     # None：worker.py 自身不 import hosted，测试/其他调用方不必提供；生产装配见
@@ -1729,6 +1794,9 @@ class TurnMetrics:
     cache_miss_tokens: int | None = None
     usage_reported_calls: int = 0
     cache_reported_calls: int = 0
+    effective_tail_turns: int | None = None
+    tail_fallback: bool = False
+    prompt_frontier_exhaustion_count: int = 0
     _flushed: bool = False
     _started: float = 0.0
 
@@ -1815,6 +1883,21 @@ class TurnMetrics:
             self.cache_miss_tokens, usage.get("cache_miss_tokens")
         )
 
+    def record_tail_window(self, *, effective_turns: int, fallback: bool) -> None:
+        """Keep the worst memory depth and whether any provider round shrank."""
+        parsed = max(0, int(effective_turns))
+        if self.effective_tail_turns is None:
+            self.effective_tail_turns = parsed
+        else:
+            self.effective_tail_turns = min(self.effective_tail_turns, parsed)
+        self.tail_fallback = self.tail_fallback or bool(fallback)
+
+    def record_prompt_frontier_exhaustion(self) -> None:
+        self.prompt_frontier_exhaustion_count = min(
+            (1 << 31) - 1,
+            self.prompt_frontier_exhaustion_count + 1,
+        )
+
     def flush(self, *, failed: bool, status: str) -> None:
         """Idempotent per-job upsert; guarded so this SAME accumulator instance
         never double-writes even if a lane handler somehow reaches two terminal
@@ -1838,6 +1921,11 @@ class TurnMetrics:
             provider=self.provider,
             model=self.model,
             cache_route_fingerprint=self.cache_route_fingerprint,
+            effective_tail_turns=self.effective_tail_turns,
+            tail_fallback=self.tail_fallback,
+            prompt_frontier_exhaustion_count=(
+                self.prompt_frontier_exhaustion_count
+            ),
             latency_ms=latency_ms,
             model_calls=self.model_calls,
             retries=self.retries,
@@ -2257,6 +2345,80 @@ def _max_seq(rows: list[dict], *, default: int) -> int:
     return max(seqs) if seqs else default
 
 
+def _is_genuine_user_seed(row: dict) -> bool:
+    """Whether ``row`` begins a real conversational turn.
+
+    Production readers attach ``_genuine_user`` from encrypted-row metadata.
+    Plain test fixtures retain the natural user/human fallback.
+    """
+    if "_genuine_user" in row:
+        return row.get("_genuine_user") is True
+    return str(row.get("role") or "").strip().lower() in {"user", "human"}
+
+
+def _group_complete_turns(rows: list[dict]) -> list[list[dict]]:
+    """Return complete user-seeded groups, dropping a partial leading prefix."""
+    groups: list[list[dict]] = []
+    current: list[dict] | None = None
+    for row in rows:
+        if _is_genuine_user_seed(row):
+            current = []
+            groups.append(current)
+        if current is not None:
+            current.append(row)
+    return groups
+
+
+def _flatten_turns(turns: list[list[dict]]) -> list[dict]:
+    return [row for turn in turns for row in turn]
+
+
+def _adaptive_replay_parts(
+    window: dict,
+    *,
+    watermark_seq: int,
+    required_tail: list[dict],
+) -> tuple[list[list[dict]], list[dict], bool]:
+    """Split a recent window into summary-covered replay and exact core.
+
+    Optional groups must be wholly at or below the summary watermark. Exact
+    core rows are returned in full, annotated with seed metadata when the
+    recent reader observed the same seq. The union therefore never relies on
+    optional replay for coverage above the durable summary frontier.
+    """
+    rows = [dict(row) for row in list(window.get("rows") or [])]
+    groups = _group_complete_turns(rows)
+    optional: list[list[dict]] = []
+    for group in groups:
+        seqs = [
+            int(row["seq"])
+            for row in group
+            if row.get("seq") is not None
+        ]
+        if len(seqs) == len(group) and seqs and max(seqs) <= int(watermark_seq):
+            optional.append(group)
+
+    seed_by_seq = {
+        int(row["seq"]): row.get("_genuine_user") is True
+        for row in rows
+        if row.get("seq") is not None
+    }
+    enriched_required: list[dict] = []
+    for row in required_tail:
+        copied = dict(row)
+        seq = copied.get("seq")
+        if seq is not None and int(seq) in seed_by_seq:
+            copied["_genuine_user"] = seed_by_seq[int(seq)]
+        enriched_required.append(copied)
+
+    leading_partial = bool(rows) and not _is_genuine_user_seed(rows[0])
+    return (
+        optional,
+        enriched_required,
+        bool(window.get("source_truncated")) or leading_partial,
+    )
+
+
 async def _coalesce_inputs(
     deps: TurnDeps, user_id: str, since_seq: int, *, enclave_sem=None
 ) -> tuple[list[dict], int, float]:
@@ -2449,6 +2611,12 @@ def _make_build_messages_fn(
     trusted_system_blocks: tuple[str, ...] = (),
     working_memory: str = "",
     provider_config: Any = None,
+    temporal_context: dict[str, Any] | None = None,
+    temporal_snapshot: dict[str, Any] | None = None,
+    optional_tail_turns: list[list[dict]] | None = None,
+    tail_target_turns: int | None = None,
+    tail_source_truncated: bool = False,
+    tail_lane: str = "",
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
@@ -2474,15 +2642,40 @@ def _make_build_messages_fn(
     # 真实模型自称块排在用户可编辑的 workspace skill 之前：它是运行时事实，不能被
     # 后面的 skill 文本挤到次要位置。官方原生路由返回空串，被 context 过滤掉。
     identity_block = v2_model_identity.override_block_for_config(provider_config)
-    base_messages = context.build_turn_messages(
-        system_prompt=system_prompt,
-        summary=summary,
-        tail=tail,
-        action_context=extra_context,
-        mutation_recovery_active=mutation_recovery_active,
-        trusted_system_blocks=(identity_block, *trusted_system_blocks),
-        working_memory=working_memory,
+    required_tail = list(tail)
+    optional_turns = list(optional_tail_turns or [])
+    target_turns = (
+        max(0, int(tail_target_turns))
+        if tail_target_turns is not None
+        else None
     )
+
+    def _temporal_for(rendered_tail: list[dict]) -> dict[str, Any] | None:
+        if temporal_snapshot is None:
+            return temporal_context
+        return context.build_temporal_context(
+            now_ts=float(temporal_snapshot["now_ts"]),
+            timezone_name=str(temporal_snapshot.get("timezone") or "UTC"),
+            last_user_message_ts=temporal_snapshot.get(
+                "last_user_message_ts"
+            ),
+            tail=rendered_tail,
+        )
+
+    def _base(selected_turns: list[list[dict]]) -> list:
+        rendered_tail = _flatten_turns(selected_turns) + required_tail
+        return context.build_turn_messages(
+            system_prompt=system_prompt,
+            summary=summary,
+            tail=rendered_tail,
+            action_context=extra_context,
+            mutation_recovery_active=mutation_recovery_active,
+            trusted_system_blocks=(identity_block, *trusted_system_blocks),
+            working_memory=working_memory,
+            temporal_context=_temporal_for(rendered_tail),
+        )
+
+    base_messages = _base(optional_turns)
 
     def build_messages(transcript: list) -> list:
         rendered: list = []
@@ -2495,7 +2688,150 @@ def _make_build_messages_fn(
                 rendered.append({"role": "user", "content": content})
         return list(base_messages) + rendered
 
+    if target_turns is not None:
+        required_turn_count = sum(
+            1 for row in required_tail if _is_genuine_user_seed(row)
+        )
+        optional_limit = max(0, target_turns - required_turn_count)
+        eligible_optional = (
+            optional_turns[-optional_limit:] if optional_limit else []
+        )
+
+        def plan_provider_round(
+            *,
+            transcript: list,
+            tools,
+            model_limit,
+            output_reserve_tokens: int,
+            safety_margin_tokens: int | None,
+            utf8_bytes_per_token: float,
+            image_reserve_tokens: int,
+        ) -> tuple[list, Any, dict]:
+            rendered_transcript: list = []
+            for item in transcript:
+                if isinstance(item, ToolExchange):
+                    rendered_transcript.append(item)
+                    continue
+                content = item.get("content")
+                if context._has_payload(content):
+                    rendered_transcript.append({
+                        "role": "user",
+                        "content": content,
+                    })
+
+            def _candidate(count: int) -> tuple[list, Any]:
+                selected = eligible_optional[-count:] if count else []
+                messages = _base(selected) + rendered_transcript
+                plan = v2_prompt_frontier.plan_provider_round(
+                    model_limit=model_limit,
+                    messages=messages,
+                    tools=tools,
+                    output_reserve_tokens=output_reserve_tokens,
+                    safety_margin_tokens=safety_margin_tokens,
+                    utf8_bytes_per_token=utf8_bytes_per_token,
+                    image_reserve_tokens=image_reserve_tokens,
+                )
+                return messages, plan
+
+            # Required-only must fit. It is the structural failure boundary:
+            # summary, exact core, and native transcript are never clipped.
+            best_messages, best_plan = _candidate(0)
+            low, high, best = 1, len(eligible_optional), 0
+            while low <= high:
+                middle = (low + high) // 2
+                try:
+                    messages, plan = _candidate(middle)
+                except v2_prompt_frontier.PromptFrontierExhausted:
+                    high = middle - 1
+                else:
+                    best = middle
+                    best_messages, best_plan = messages, plan
+                    low = middle + 1
+            effective_turns = required_turn_count + best
+            available_turns = required_turn_count + len(eligible_optional)
+            fallback = (
+                bool(tail_source_truncated)
+                or len(optional_turns) > len(eligible_optional)
+                or best < len(eligible_optional)
+            )
+            return best_messages, best_plan, {
+                "lane": str(tail_lane),
+                "target_turns": target_turns,
+                "available_turns": available_turns,
+                "effective_turns": effective_turns,
+                "fallback": fallback,
+                "source_truncated": bool(tail_source_truncated),
+            }
+
+        build_messages.plan_provider_round = plan_provider_round
+
     return build_messages
+
+
+async def _capture_turn_temporal_snapshot(
+    *,
+    user_id: str,
+    deps: TurnDeps,
+    tail: list[dict],
+    through_seq: int | None,
+) -> dict[str, Any]:
+    """Capture time once so every provider round in the turn sees one snapshot."""
+    now_ts = time.time()
+    snapshot: dict[str, Any] = {}
+    if deps.read_temporal_snapshot is not None:
+        try:
+            loaded = await asyncio.to_thread(
+                deps.read_temporal_snapshot,
+                user_id,
+                through_seq=through_seq,
+            )
+            if isinstance(loaded, dict):
+                snapshot = loaded
+        except Exception as exc:
+            log.warning(
+                "[v2.worker] temporal snapshot fallback user=%s: %s",
+                user_id,
+                type(exc).__name__,
+            )
+
+    last_user_ts = snapshot.get("last_user_message_ts")
+    if last_user_ts is None:
+        tail_user_timestamps: list[float] = []
+        for row in tail:
+            if str(row.get("role") or "") not in {"user", "human"}:
+                continue
+            try:
+                tail_user_timestamps.append(float(row["ts"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        last_user_ts = max(tail_user_timestamps, default=None)
+    return {
+        "now_ts": now_ts,
+        "timezone": str(snapshot.get("timezone") or "UTC"),
+        "last_user_message_ts": last_user_ts,
+    }
+
+
+async def _resolve_turn_temporal_context(
+    *,
+    user_id: str,
+    deps: TurnDeps,
+    tail: list[dict],
+    through_seq: int | None,
+) -> dict[str, Any]:
+    """Compatibility wrapper returning the rendered immutable snapshot."""
+    snapshot = await _capture_turn_temporal_snapshot(
+        user_id=user_id,
+        deps=deps,
+        tail=tail,
+        through_seq=through_seq,
+    )
+    return context.build_temporal_context(
+        now_ts=float(snapshot["now_ts"]),
+        timezone_name=str(snapshot["timezone"]),
+        last_user_message_ts=snapshot.get("last_user_message_ts"),
+        tail=tail,
+    )
 
 
 async def _web_batch_cancellation(
@@ -2962,7 +3298,14 @@ def _write_tool_effect_payload(tc) -> tuple[str, dict]:
         # live pre-enqueue check already rejected an invalid/over-cap value, so a
         # valid int is all that reaches here; a defensive shape check keeps a
         # non-conforming smuggled value from silently poisoning the anchor.
-        frozen = _frozen_relationship_anchor(payload.get("patch"))
+        # Freeze from the MERGED view (top-level relationship_days OR nested in
+        # `patch`), matching the schema/sink: relationship_days is now a
+        # first-class top-level arg, so reading only ``payload["patch"]`` would
+        # skip the freeze for the top-level shape a model naturally emits, and a
+        # delayed replay would then drift the anchor. merge_patch_fields folds
+        # both shapes (patch wins on conflict) exactly as the sink does.
+        from capabilities import identity as _cap_identity
+        frozen = _frozen_relationship_anchor(_cap_identity.merge_patch_fields(payload))
         if frozen is not None:
             payload["relationship_started_at"] = frozen
         return "identity", payload
@@ -2975,8 +3318,12 @@ def _write_tool_effect_payload(tc) -> tuple[str, dict]:
         return "identity", {**tc.args, "op": tc.name}
     if tc.name in ("schedule_wake", "cancel_wake"):
         # Keep the trusted operation authoritative even if a future dispatcher
-        # accidentally weakens top-level unknown-field rejection.
-        return "schedule", {**tc.args, "op": tc.name}
+        # accidentally weakens top-level unknown-field rejection.  The model
+        # cannot author the internal self-wake provenance bit: remove any
+        # attempted value before `_PlatformEffectReservations` adds its trusted
+        # wake-lane marker.
+        payload = {key: value for key, value in tc.args.items() if key != "_self_wake"}
+        return "schedule", {**payload, "op": tc.name}
     if tc.name in ("workspace_write", "workspace_delete"):
         # The trusted operation name stays outside the model-controlled args.
         # Content is encrypted before entering the durable effect outbox, then
@@ -3126,9 +3473,10 @@ class _PlatformEffectReservations:
     keeps an explicit provider-order predecessor fence as defence in depth.
     """
 
-    def __init__(self, *, job_id, ordinal_counter) -> None:
+    def __init__(self, *, job_id, ordinal_counter, self_wake: bool = False) -> None:
         self._job_id = job_id
         self._ordinal_counter = ordinal_counter
+        self._self_wake = bool(self_wake)
         self._last_ready: asyncio.Event | None = None
         self._by_call: dict[str, _PreparedPlatformEffect] = {}
         self._by_batch: dict[tuple[str, ...], _PreparedPlatformEffect] = {}
@@ -3169,6 +3517,11 @@ class _PlatformEffectReservations:
         if existing is not None and not existing.ready.is_set():
             raise RuntimeError("duplicate prepared platform write")
         logical_effect_type, payload = _write_tool_effect_payload(tc)
+        if self._self_wake and tc.name == "schedule_wake":
+            # Trusted lane metadata, added after model-argument validation and
+            # encrypted with the effect payload. The sink strips it before
+            # re-validating the public tool arguments.
+            payload["_self_wake"] = True
         effect_type = ENCRYPTED_TOOL_EFFECT_TYPES[logical_effect_type]
         self._by_call[call_id] = self._reserve(
             payload=payload,
@@ -3408,6 +3761,23 @@ def _thinking_extra(thinking: dict | None) -> dict:
             extra[key] = val
     if isinstance(meta.get("thinking_native"), bool):
         extra["thinking_native"] = meta["thinking_native"]
+    return extra
+
+
+def _reply_effect_extra(payload: dict) -> dict:
+    """Build the allowlisted chat-row metadata for one reply effect."""
+    extra = _thinking_extra(payload.get("thinking"))
+    error_class = str(payload.get("turn_failure_error_class") or "").strip()
+    if error_class:
+        if error_class not in notices_catalog.ERROR_CLASSES:
+            raise ValueError("invalid reply turn_failure_error_class")
+        extra.update(
+            {
+                "turn_failure_error_class": error_class,
+                "turn_failure_blame": notices_catalog.blame_for(error_class),
+                "turn_failure_user_text": notices_catalog.user_text_for(error_class),
+            }
+        )
     return extra
 
 
@@ -3896,6 +4266,129 @@ async def _bound_materialized_summary(
     return bounded
 
 
+async def _read_seq_adaptive_prompt_context(
+    *,
+    user_id: str,
+    deps: TurnDeps,
+    through_seq: int,
+    target_turns: int,
+    provider_config: Any,
+    enclave_sem: "asyncio.Semaphore",
+    claimed_by: str | None,
+    job_id,
+    add_usage: Callable[[dict | None], None] | None,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
+) -> tuple[str, list[dict], list[list[dict]], bool, int]:
+    """Read one exact core plus summary-covered complete-turn replay."""
+    async with enclave_sem:
+        (
+            summary,
+            _watermark_ts,
+            _version,
+            watermark_seq,
+        ) = await asyncio.to_thread(deps.read_summary_with_seq, user_id)
+        tail = await asyncio.to_thread(
+            deps.read_tail_after_seq,
+            user_id,
+            watermark_seq,
+            None,
+            through_seq=through_seq,
+        )
+        optional_tail_turns: list[list[dict]] = []
+        tail_source_truncated = False
+        if deps.read_recent_turns is not None:
+            recent_window = await asyncio.to_thread(
+                deps.read_recent_turns,
+                user_id,
+                target_turns,
+                _RECENT_TURN_ROW_CAP,
+                through_seq=through_seq,
+            )
+            (
+                optional_tail_turns,
+                tail,
+                tail_source_truncated,
+            ) = _adaptive_replay_parts(
+                recent_window,
+                watermark_seq=watermark_seq,
+                required_tail=tail,
+            )
+        tail = await asyncio.to_thread(
+            _inject_tail_images,
+            tail,
+            user_id=user_id,
+            read_images=deps.read_images,
+        )
+        tail = await asyncio.to_thread(
+            _inject_tail_files,
+            tail,
+            user_id=user_id,
+            read_files=deps.read_files,
+        )
+        if optional_tail_turns:
+            optional_rows = await asyncio.to_thread(
+                _inject_tail_images,
+                _flatten_turns(optional_tail_turns),
+                user_id=user_id,
+                read_images=deps.read_images,
+            )
+            optional_rows = await asyncio.to_thread(
+                _inject_tail_files,
+                optional_rows,
+                user_id=user_id,
+                read_files=deps.read_files,
+            )
+            optional_tail_turns = _group_complete_turns(optional_rows)
+    summary = await _bound_materialized_summary(
+        user_id,
+        summary,
+        deps,
+        provider_config=provider_config,
+        enclave_sem=enclave_sem,
+        claimed_by=claimed_by,
+        job_id=job_id,
+        add_usage=add_usage,
+        trajectory_recorder=trajectory_recorder,
+    )
+    await _assert_prompt_tail_exact(
+        user_id,
+        watermark_seq=watermark_seq,
+        through_seq=through_seq,
+        tail=tail,
+    )
+    return (
+        summary,
+        tail,
+        optional_tail_turns,
+        tail_source_truncated,
+        int(watermark_seq),
+    )
+
+
+def _preflight_adaptive_builder(
+    build_messages: Callable[[list], list],
+    *,
+    provider_config: Any,
+) -> None:
+    """Validate required-only prompt admission before any provider call."""
+    planner = getattr(build_messages, "plan_provider_round", None)
+    if not callable(planner):
+        return
+    model_limit = v2_prompt_frontier.resolve_model_limit_from_config(
+        provider_config,
+        deployment_overrides=PROMPT_CONTEXT_WINDOW_OVERRIDES,
+    )
+    planner(
+        transcript=[],
+        tools=None,
+        model_limit=model_limit,
+        output_reserve_tokens=PROMPT_OUTPUT_RESERVE_TOKENS,
+        safety_margin_tokens=PROMPT_SAFETY_MARGIN_TOKENS,
+        utf8_bytes_per_token=PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
+        image_reserve_tokens=PROMPT_IMAGE_RESERVE_TOKENS,
+    )
+
+
 async def _run_compaction(
     job_id,
     user_id: str,
@@ -4199,13 +4692,29 @@ def _gap_from_count(unsummarized_count: int, tail_limit: int) -> bool:
     return unsummarized_count > tail_limit
 
 
-async def _unsummarized_count(user_id: str, watermark_seq: int) -> int:
+async def _unsummarized_count(
+    user_id: str,
+    watermark_seq: int,
+    *,
+    through_seq: int | None = None,
+) -> int:
     """THIS USER's own ``chat_messages`` row count with ``seq > watermark_seq``
     — one cheap indexed ``COUNT(*)`` (see ``db.count_messages_after_seq``),
     scoped by ``user_id``. Replaces the old ``max_seq - watermark_seq``
     global-seq-span estimate — see ``_gap_from_count``'s docstring for why
     that was wrong."""
-    return await asyncio.to_thread(db.count_messages_after_seq, user_id, watermark_seq)
+    if through_seq is None:
+        return await asyncio.to_thread(
+            db.count_messages_after_seq,
+            user_id,
+            watermark_seq,
+        )
+    return await asyncio.to_thread(
+        db.count_messages_after_seq,
+        user_id,
+        watermark_seq,
+        through_seq=through_seq,
+    )
 
 
 async def _prompt_coverage_gap(
@@ -4302,6 +4811,7 @@ async def _ensure_prompt_coverage(
     catchup_deadline_sec: float | None = None,
     add_usage: Callable[[dict | None], None] | None = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+    compact_through_seq: int | None = None,
 ) -> tuple[int, int]:
     """D6 (Task 10): close a compaction backlog gap BEFORE assembling a turn's
     prompt. Today's bug: ``_read_tail`` only ever returns the newest
@@ -4425,9 +4935,19 @@ async def _ensure_prompt_coverage(
         attempted_since_observation = False
 
         unsummarized_count = await _within_deadline(
-            lambda: _unsummarized_count(user_id, watermark_seq)
+            lambda: _unsummarized_count(
+                user_id,
+                watermark_seq,
+                through_seq=compact_through_seq,
+            )
         )
-        if not _gap_from_count(unsummarized_count, tail_limit):
+        target_mode = compact_through_seq is not None
+        needs_compaction = (
+            unsummarized_count > 0
+            if target_mode
+            else _gap_from_count(unsummarized_count, tail_limit)
+        )
+        if not needs_compaction:
             max_seq = await _within_deadline(
                 lambda: asyncio.to_thread(db.chat_max_seq, user_id)
             )
@@ -4436,8 +4956,13 @@ async def _ensure_prompt_coverage(
             deps.read_compaction_tail_after_seq is not None
             or deps.read_tail_after_seq is not None
         )
-        legacy_callbacks = deps.read_summary is not None and (
-            deps.read_compaction_tail is not None or deps.read_tail is not None
+        legacy_callbacks = (
+            compact_through_seq is None
+            and deps.read_summary is not None
+            and (
+                deps.read_compaction_tail is not None
+                or deps.read_tail is not None
+            )
         )
         if (
             no_progress_attempts >= max_retries
@@ -4448,7 +4973,14 @@ async def _ensure_prompt_coverage(
             or not (seq_callbacks or legacy_callbacks)
         ):
             raise TurnError("prompt_coverage_incomplete")
-        fold_count = min(unsummarized_count - tail_limit, _COMPACTION_BATCH)
+        fold_count = min(
+            (
+                unsummarized_count
+                if target_mode
+                else unsummarized_count - tail_limit
+            ),
+            _COMPACTION_BATCH,
+        )
         if fold_count <= 0:
             continue
 
@@ -4463,7 +4995,15 @@ async def _ensure_prompt_coverage(
                     deps.read_compaction_tail_after_seq or deps.read_tail_after_seq
                 )
                 old_ = await asyncio.to_thread(
-                    reader_, user_id, watermark_seq, fold_count
+                    reader_,
+                    user_id,
+                    watermark_seq,
+                    fold_count,
+                    **(
+                        {"through_seq": int(compact_through_seq)}
+                        if compact_through_seq is not None
+                        else {}
+                    ),
                 )
                 return summary_, old_, False
 
@@ -4757,6 +5297,22 @@ async def _run_wake(
             and deps.read_tail_after_seq is not None
         )
         legacy_context = deps.read_summary is not None and deps.read_tail is not None
+        optional_tail_turns: list[list[dict]] = []
+        tail_source_truncated = False
+        wake_snapshot_seq = 0
+        compact_through_seq = None
+        if seq_context:
+            wake_snapshot_seq = await asyncio.to_thread(
+                db.chat_max_seq, user_id
+            )
+            oldest_retained_seed = await asyncio.to_thread(
+                db.chat_recent_genuine_turn_boundary_seq,
+                user_id,
+                max_turns=_WAKE_TAIL_MAX_TURNS,
+                through_seq=wake_snapshot_seq,
+            )
+            if oldest_retained_seed is not None and oldest_retained_seed > 1:
+                compact_through_seq = oldest_retained_seed - 1
         if seq_context or legacy_context:
             await _ensure_prompt_coverage(
                 user_id,
@@ -4768,69 +5324,82 @@ async def _run_wake(
                 claimed_by=claimed_by,
                 add_usage=tm.add_call if tm is not None else None,
                 trajectory_recorder=trajectory_recorder,
+                compact_through_seq=compact_through_seq,
             )
-        async with enclave_sem:
-            if seq_context:
-                summary, _watermark_ts, _ver, watermark_seq = await asyncio.to_thread(
-                    deps.read_summary_with_seq, user_id
-                )
-                wake_snapshot_seq = await asyncio.to_thread(db.chat_max_seq, user_id)
-                tail = await asyncio.to_thread(
-                    deps.read_tail_after_seq,
-                    user_id,
-                    watermark_seq,
-                    _TAIL_BUDGET,
-                    through_seq=wake_snapshot_seq,
-                )
-            elif legacy_context:
-                summary, watermark, _ver = await asyncio.to_thread(
-                    deps.read_summary, user_id
-                )
-                tail = await asyncio.to_thread(
-                    deps.read_tail, user_id, watermark, _TAIL_BUDGET
-                )
-            else:
-                summary, tail = "", []
-            tail = await asyncio.to_thread(
-                _inject_tail_images, tail, user_id=user_id, read_images=deps.read_images
-            )
-            tail = await asyncio.to_thread(
-                _inject_tail_files, tail, user_id=user_id, read_files=deps.read_files
-            )
-        summary = await _bound_materialized_summary(
-            user_id,
-            summary,
-            deps,
-            provider_config=provider_config,
-            enclave_sem=enclave_sem,
-            claimed_by=claimed_by,
-            job_id=job_id,
-            add_usage=tm.add_call if tm is not None else None,
-            trajectory_recorder=trajectory_recorder,
-        )
         if seq_context:
-            await _assert_prompt_tail_exact(
-                user_id,
-                watermark_seq=watermark_seq,
+            (
+                summary,
+                tail,
+                optional_tail_turns,
+                tail_source_truncated,
+                watermark_seq,
+            ) = await _read_seq_adaptive_prompt_context(
+                user_id=user_id,
+                deps=deps,
                 through_seq=wake_snapshot_seq,
-                tail=tail,
+                target_turns=_WAKE_TAIL_MAX_TURNS,
+                provider_config=provider_config,
+                enclave_sem=enclave_sem,
+                claimed_by=claimed_by,
+                job_id=job_id,
+                add_usage=tm.add_call if tm is not None else None,
+                trajectory_recorder=trajectory_recorder,
             )
+        else:
+            async with enclave_sem:
+                if legacy_context:
+                    summary, watermark, _ver = await asyncio.to_thread(
+                        deps.read_summary, user_id
+                    )
+                    tail = await asyncio.to_thread(
+                        deps.read_tail, user_id, watermark, _TAIL_BUDGET
+                    )
+                else:
+                    summary, tail = "", []
+                tail = await asyncio.to_thread(
+                    _inject_tail_images,
+                    tail,
+                    user_id=user_id,
+                    read_images=deps.read_images,
+                )
+                tail = await asyncio.to_thread(
+                    _inject_tail_files,
+                    tail,
+                    user_id=user_id,
+                    read_files=deps.read_files,
+                )
+            summary = await _bound_materialized_summary(
+                user_id,
+                summary,
+                deps,
+                provider_config=provider_config,
+                enclave_sem=enclave_sem,
+                claimed_by=claimed_by,
+                job_id=job_id,
+                add_usage=tm.add_call if tm is not None else None,
+                trajectory_recorder=trajectory_recorder,
+            )
+        if seq_context:
             # A wake is proactive work only while there is no unanswered user
             # input.  Keep the frozen prompt snapshot boundary separate from
             # the durable reply cursor: a send can commit after this wake was
-            # claimed but before ``wake_snapshot_seq`` was taken.  That row is
-            # already represented in the frozen prompt (verbatim in ``tail`` or
-            # behind its encrypted-summary watermark), so seeding the first fold
-            # after the snapshot prevents a duplicate prompt entry; it must NOT
-            # also make the row look previously answered.  Query the authoritative
-            # user-row interval rather than inferring membership from the tail.
-            # Yield before any provider/tool work and let the atomically enqueued
-            # chat job own the response.
+            # claimed or while summary/tail assembly is in flight.  Re-read the
+            # all-role upper bound after assembly so that later send also makes
+            # wake yield, even though it is intentionally absent from the frozen
+            # prompt.  ``wake_snapshot_seq`` remains the first-fold de-duplication
+            # boundary; neither boundary may make a row look previously answered.
+            # Query the authoritative user-row interval rather than inferring
+            # membership from the tail, then let the atomically enqueued chat job
+            # own the response before any provider/tool work begins.
+            pending_check_through_seq = await asyncio.to_thread(
+                db.chat_max_seq,
+                user_id,
+            )
             base_prompt_user_frontier = await asyncio.to_thread(
                 db.chat_max_user_seq_between,
                 user_id,
                 wake_reply_cursor_seq,
-                wake_snapshot_seq,
+                pending_check_through_seq,
             )
             if base_prompt_user_frontier > wake_reply_cursor_seq:
                 completed = await asyncio.to_thread(
@@ -4851,7 +5420,17 @@ async def _run_wake(
             # not a reuse of `_ensure_prompt_coverage`'s return — see
             # `_assert_prompt_covers`'s docstring for why.
             await _assert_prompt_covers(user_id, _TAIL_BUDGET)
-        wake_tail = list(tail) + [{"role": "user", "content": _WAKE_NUDGE}]
+        temporal_snapshot = await _capture_turn_temporal_snapshot(
+            user_id=user_id,
+            deps=deps,
+            tail=tail,
+            through_seq=(wake_snapshot_seq if seq_context else None),
+        )
+        wake_tail = list(tail) + [{
+            "role": "user",
+            "content": _WAKE_NUDGE,
+            "_genuine_user": False,
+        }]
 
         # screen_watch lane grounds on recent shared-screen availability (Task 3).
         # Fetch ONLY screen_recent — NOT perception_snapshot: the resident explicitly
@@ -4907,6 +5486,7 @@ async def _run_wake(
         effect_reservations = _PlatformEffectReservations(
             job_id=job_id,
             ordinal_counter=ordinal,
+            self_wake=True,
         )
         platform_effects_by_call: dict[str, tuple[str, str]] = {}
         platform_workspace_batches: dict[
@@ -5233,6 +5813,19 @@ async def _run_wake(
 
         async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
             text = str(text or "").strip()
+            if text and _is_degenerate_reply(text):
+                log.warning(
+                    "[v2.worker] wake degenerate reply suppressed user=%s "
+                    "job=%s lane=%s final=%s fragment=%r",
+                    user_id,
+                    job_id,
+                    lane,
+                    final,
+                    text[:20],
+                )
+                if final:
+                    raise TurnError("degenerate_reply_suppressed")
+                return
             if not text:
                 # Silence is a legitimate wake outcome — both mid-loop (an empty
                 # `reply{}` call) and terminal ("weak wake sleeps"): unlike the chat
@@ -5447,6 +6040,14 @@ async def _run_wake(
                     return
                 if (
                     status == "discarded"
+                    and last_error == v2_effect_outbox.WAKE_REPLY_CHAT_COLLISION
+                ):
+                    # Post-time collision is an intentional sleep, not stale
+                    # input to fold into another provider call. The wake job
+                    # finishes normally without publishing or pushing.
+                    return
+                if (
+                    status == "discarded"
                     and last_error == v2_effect_outbox.FINAL_REPLY_INPUT_ADVANCED
                 ):
                     raise v2_tool_loop.FinalReplySuperseded()
@@ -5495,21 +6096,89 @@ async def _run_wake(
         fold_new_messages = _make_fold_new_messages(
             user_id, deps, cursor_box, enclave_sem=enclave_sem
         )
-        build_messages = _make_build_messages_fn(
-            system_prompt=(
-                _SCREEN_WATCH_SYSTEM_PROMPT
-                if lane == "screen_watch"
-                else _WAKE_SYSTEM_PROMPT
-            ),
-            summary=summary,
-            tail=wake_tail,
-            extra_context=(
-                context.action_context_str(screen_results) if screen_results else ""
-            ),
-            trusted_system_blocks=trusted_system_blocks,
-            working_memory=working_memory,
-            provider_config=provider_config,
-        )
+        def _wake_builder():
+            return _make_build_messages_fn(
+                system_prompt=(
+                    _SCREEN_WATCH_SYSTEM_PROMPT
+                    if lane == "screen_watch"
+                    else _WAKE_SYSTEM_PROMPT
+                ),
+                summary=summary,
+                tail=wake_tail,
+                extra_context=(
+                    context.action_context_str(screen_results)
+                    if screen_results
+                    else ""
+                ),
+                trusted_system_blocks=trusted_system_blocks,
+                working_memory=working_memory,
+                provider_config=provider_config,
+                temporal_snapshot=temporal_snapshot,
+                optional_tail_turns=optional_tail_turns,
+                tail_target_turns=(
+                    _WAKE_TAIL_MAX_TURNS if seq_context else None
+                ),
+                tail_source_truncated=tail_source_truncated,
+                tail_lane=lane,
+            )
+
+        build_messages = _wake_builder()
+        if seq_context:
+            try:
+                _preflight_adaptive_builder(
+                    build_messages,
+                    provider_config=provider_config,
+                )
+            except v2_prompt_frontier.PromptFrontierExhausted:
+                if tm is not None:
+                    tm.record_prompt_frontier_exhaustion()
+                if wake_snapshot_seq <= watermark_seq:
+                    raise
+                await _ensure_prompt_coverage(
+                    user_id,
+                    deps,
+                    provider_config=provider_config,
+                    enclave_sem=enclave_sem,
+                    tail_limit=0,
+                    job_id=job_id,
+                    claimed_by=claimed_by,
+                    add_usage=tm.add_call if tm is not None else None,
+                    trajectory_recorder=trajectory_recorder,
+                    compact_through_seq=wake_snapshot_seq,
+                )
+                (
+                    summary,
+                    tail,
+                    optional_tail_turns,
+                    tail_source_truncated,
+                    watermark_seq,
+                ) = await _read_seq_adaptive_prompt_context(
+                    user_id=user_id,
+                    deps=deps,
+                    through_seq=wake_snapshot_seq,
+                    target_turns=_WAKE_TAIL_MAX_TURNS,
+                    provider_config=provider_config,
+                    enclave_sem=enclave_sem,
+                    claimed_by=claimed_by,
+                    job_id=job_id,
+                    add_usage=tm.add_call if tm is not None else None,
+                    trajectory_recorder=trajectory_recorder,
+                )
+                wake_tail = list(tail) + [{
+                    "role": "user",
+                    "content": _WAKE_NUDGE,
+                    "_genuine_user": False,
+                }]
+                build_messages = _wake_builder()
+                try:
+                    _preflight_adaptive_builder(
+                        build_messages,
+                        provider_config=provider_config,
+                    )
+                except v2_prompt_frontier.PromptFrontierExhausted:
+                    if tm is not None:
+                        tm.record_prompt_frontier_exhaustion()
+                    raise
 
         await _fence_wake_effect("wake turn")
         try:
@@ -5551,6 +6220,21 @@ async def _run_wake(
                     PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
                 ),
                 prompt_image_reserve_tokens=PROMPT_IMAGE_RESERVE_TOKENS,
+                on_tail_window=(
+                    (
+                        lambda item: tm.record_tail_window(
+                            effective_turns=item["effective_turns"],
+                            fallback=item["fallback"],
+                        )
+                    )
+                    if tm is not None
+                    else None
+                ),
+                on_prompt_frontier_exhaustion=(
+                    tm.record_prompt_frontier_exhaustion
+                    if tm is not None
+                    else None
+                ),
             )
         except Exception as e:  # noqa: BLE001 — classify below, then let it fall to the outer silent mark_failed
             if provider_client.classify_provider_error(e) == "provider_config":
@@ -5567,7 +6251,10 @@ async def _run_wake(
             raise
 
         await asyncio.to_thread(
-            jobs_store.mark_completed, job_id, claimed_by=claimed_by
+            jobs_store.mark_completed,
+            job_id,
+            claimed_by=claimed_by,
+            clear_wake_backoff=(lane in _FAIL_BACKOFF_WAKE_LANES),
         )
         # End-of-turn drain (mirrors process_job's chat-branch finalize): a write
         # tool_call in the LAST round has no subsequent on_reply to trigger a drain,
@@ -5601,8 +6288,21 @@ async def _run_wake(
         log.warning(
             "[v2.worker] wake job %s lane=%s failed code=%s", job_id, lane, code
         )
+        arm_wake_backoff = (
+            lane in _FAIL_BACKOFF_WAKE_LANES
+            and not isinstance(e, (LostJobLease, RuntimeModeChanged))
+        )
         await asyncio.to_thread(
-            jobs_store.mark_failed, job_id, code, claimed_by=claimed_by
+            jobs_store.mark_failed,
+            job_id,
+            code,
+            claimed_by=claimed_by,
+            wake_backoff_base_sec=(
+                _WAKE_FAIL_BACKOFF_BASE_SEC if arm_wake_backoff else None
+            ),
+            wake_backoff_cap_sec=(
+                _WAKE_FAIL_BACKOFF_CAP_SEC if arm_wake_backoff else None
+            ),
         )
         if tm is not None:
             tm.flush(failed=True, status=code)
@@ -5873,14 +6573,29 @@ async def _run_extraction(
                     in _CAPTURE_PROMPT_SOURCES
                 )
             ]
+        # 说话人标签用真名,绝不用原始 role。字面量 "user:" 正是教会模型往用户
+        # 可见的卡里写「用户」的元凶(usr_fee1 2026-07-17):prompt 在上面禁这个词,
+        # 转写在下面把人叫了二十遍 user。resident 当时修了,这条托管路径漏到
+        # 2026-07-26 才发现(sonnet-4.6 写出「用户承诺这周末去看医生」)。
+        # 共用 transcript_speaker_label —— 各写一份正是它漏掉的原因。
+        speaker_user_name = ctx.get("user_name", "")
+        speaker_ai_name = ctx.get("ai_name", "")
         window = "\n".join(
-            f"- {m.get('role')}: {context.text_of(m.get('content'))}"
+            f"- {transcript_speaker_label(str(m.get('role') or ''), user_name=speaker_user_name, ai_name=speaker_ai_name)}: "
+            f"{context.text_of(m.get('content'))}"
             for m in prompt_tail
         ).strip()
         source_ids = [str(m.get("id")) for m in prompt_tail if m.get("id")]
 
         if lane == "capture":
             parse, to_actions = parse_capture_cards, v2_extraction.cards_to_actions
+            # 内容闸打回后的第二问：放宽成「只丢占位符那几张、干净的照收」，
+            # 不让一张脏卡把整个窗口的落卡清零。
+            parse_retry = v2_extraction.ParseRetry(
+                should_retry=is_card_format_error,
+                build_prompt=build_capture_retry_prompt,
+                parse=lambda reply: parse_capture_cards(reply, strict=False),
+            )
         else:
             prompt = build_dream_prompt(
                 ai_name=ctx.get("ai_name", ""),
@@ -5893,6 +6608,11 @@ async def _run_extraction(
             parse, to_actions = (
                 parse_dream_consolidations,
                 v2_extraction.consolidations_to_actions,
+            )
+            parse_retry = v2_extraction.ParseRetry(
+                should_retry=is_card_format_error,
+                build_prompt=build_dream_retry_prompt,
+                parse=lambda reply: parse_dream_consolidations(reply, strict=False),
             )
 
         if lane == "capture" and not prompt_tail:
@@ -5930,6 +6650,7 @@ async def _run_extraction(
                     provider_config=provider_config,
                     prompt=prompt,
                     parse=parse,
+                    parse_retry=parse_retry,
                     progress_cb=lambda stage, attempt: _report_turn_progress(
                         f"extraction_provider_{stage}_{attempt}"
                     ),
@@ -6057,6 +6778,7 @@ async def _run_extraction(
                 provider_config=provider_config,
                 prompt=prompt,
                 parse=parse,
+                parse_retry=parse_retry,
                 progress_cb=lambda stage, attempt: _report_turn_progress(
                     f"extraction_provider_{stage}_{attempt}"
                 ),
@@ -6125,6 +6847,24 @@ async def _run_extraction(
 
         actions: list[dict] = []
         if items:
+            # 残留计数。**刻意不在这里跑确定性改写** —— 见
+            # tests/test_card_user_referent.py 里的证据:那个改写器会把
+            # 「用户说这个价格太贵了」改成「小雨说…」、「月活用户在下降」改成
+            # 「月活小雨在下降」。它现有的锚点(的/标点/说/希望/是/在/有/会)
+            # 在产品语境下是确定性内容损坏,接到每天跑的写入路径上会放大成灾。
+            # 这里只**量**残留:标签层和 prompt 到底管不管用,靠这个数说话。
+            leak_count = sum(
+                count_user_token_residuals(
+                    item.get("result") if lane != "capture" and isinstance(item.get("result"), dict) else item
+                )
+                for item in items
+                if isinstance(item, dict)
+            )
+            if leak_count and trajectory_recorder is not None:
+                await trajectory_recorder.record(
+                    "card_user_token_residual",
+                    {"lane": lane, "count": leak_count, "cards": len(items)},
+                )
             actions, _added, _superseded = to_actions(
                 items,
                 occurred_at=occurred_at,
@@ -6822,6 +7562,20 @@ async def process_job(
         # rows returned by initial coalescing or a round-boundary fold.
         prompt_snapshot_through_seq = int(cursor_seq or 0) if seq_native else 0
         legacy_context = deps.read_summary is not None and deps.read_tail is not None
+        optional_tail_turns: list[list[dict]] = []
+        tail_source_truncated = False
+        through_seq = 0
+        compact_through_seq = None
+        if seq_context:
+            through_seq = await asyncio.to_thread(db.chat_max_seq, user_id)
+            oldest_retained_seed = await asyncio.to_thread(
+                db.chat_recent_genuine_turn_boundary_seq,
+                user_id,
+                max_turns=_CHAT_TAIL_MAX_TURNS,
+                through_seq=through_seq,
+            )
+            if oldest_retained_seed is not None and oldest_retained_seed > 1:
+                compact_through_seq = oldest_retained_seed - 1
         if seq_context or legacy_context:
             # D6/Task 10: close a compaction backlog gap BEFORE reading the
             # actual prompt content — see `_ensure_prompt_coverage`'s
@@ -6837,76 +7591,81 @@ async def process_job(
                 claimed_by=claimed_by,
                 add_usage=tm.add_call,
                 trajectory_recorder=trajectory_recorder,
+                compact_through_seq=compact_through_seq,
             )
-            async with enclave_sem:
-                if seq_context:
-                    (
-                        summary,
-                        _watermark_ts,
-                        _ver,
-                        watermark_seq,
-                    ) = await asyncio.to_thread(deps.read_summary_with_seq, user_id)
-                    through_seq = await asyncio.to_thread(db.chat_max_seq, user_id)
-                    # The base tail already contains every row through this
-                    # all-role snapshot. The first round-boundary fold still
-                    # reads/coalesces user rows after the consumed frontier, but
-                    # suppresses rows at or below this bound from its returned
-                    # transcript so a coalesce/tail race cannot duplicate them.
-                    prompt_snapshot_through_seq = max(
-                        prompt_snapshot_through_seq,
-                        int(through_seq),
-                    )
-                    tail = await asyncio.to_thread(
-                        deps.read_tail_after_seq,
-                        user_id,
-                        watermark_seq,
-                        _TAIL_HARD_CAP,
-                        through_seq=through_seq,
-                    )
-                else:
+            if seq_context:
+                # The base tail already contains every row through this
+                # all-role snapshot. The fold still consumes user rows after
+                # the durable cursor, but suppresses duplicates through here.
+                prompt_snapshot_through_seq = max(
+                    prompt_snapshot_through_seq,
+                    int(through_seq),
+                )
+                (
+                    summary,
+                    tail,
+                    optional_tail_turns,
+                    tail_source_truncated,
+                    watermark_seq,
+                ) = await _read_seq_adaptive_prompt_context(
+                    user_id=user_id,
+                    deps=deps,
+                    through_seq=through_seq,
+                    target_turns=_CHAT_TAIL_MAX_TURNS,
+                    provider_config=provider_config,
+                    enclave_sem=enclave_sem,
+                    claimed_by=claimed_by,
+                    job_id=job_id,
+                    add_usage=tm.add_call,
+                    trajectory_recorder=trajectory_recorder,
+                )
+            else:
+                async with enclave_sem:
                     summary, watermark, _ver = await asyncio.to_thread(
                         deps.read_summary, user_id
                     )
                     tail = await asyncio.to_thread(
                         deps.read_tail, user_id, watermark, _TAIL_HARD_CAP
                     )
-                tail = await asyncio.to_thread(
-                    _inject_tail_images,
-                    tail,
-                    user_id=user_id,
-                    read_images=deps.read_images,
+                    tail = await asyncio.to_thread(
+                        _inject_tail_images,
+                        tail,
+                        user_id=user_id,
+                        read_images=deps.read_images,
+                    )
+                    tail = await asyncio.to_thread(
+                        _inject_tail_files,
+                        tail,
+                        user_id=user_id,
+                        read_files=deps.read_files,
+                    )
+                summary = await _bound_materialized_summary(
+                    user_id,
+                    summary,
+                    deps,
+                    provider_config=provider_config,
+                    enclave_sem=enclave_sem,
+                    claimed_by=claimed_by,
+                    job_id=job_id,
+                    add_usage=tm.add_call,
+                    trajectory_recorder=trajectory_recorder,
                 )
-                tail = await asyncio.to_thread(
-                    _inject_tail_files,
-                    tail,
-                    user_id=user_id,
-                    read_files=deps.read_files,
-                )
-            summary = await _bound_materialized_summary(
-                user_id,
-                summary,
-                deps,
-                provider_config=provider_config,
-                enclave_sem=enclave_sem,
-                claimed_by=claimed_by,
-                job_id=job_id,
-                add_usage=tm.add_call,
-                trajectory_recorder=trajectory_recorder,
-            )
             # Post-assembly hard assertion (D6): independent re-derivation,
             # not a reuse of `_ensure_prompt_coverage`'s return — see
             # `_assert_prompt_covers`'s docstring for why.
-            if seq_context:
-                await _assert_prompt_tail_exact(
-                    user_id,
-                    watermark_seq=watermark_seq,
-                    through_seq=through_seq,
-                    tail=tail,
-                )
-            else:
+            if not seq_context:
                 await _assert_prompt_covers(user_id, _TAIL_HARD_CAP)
         else:
             summary, tail = "", []
+
+        temporal_snapshot = await _capture_turn_temporal_snapshot(
+            user_id=user_id,
+            deps=deps,
+            tail=tail,
+            through_seq=(
+                prompt_snapshot_through_seq if seq_native else None
+            ),
+        )
 
         platform_effects_by_call: dict[str, tuple[str, str]] = {}
         platform_workspace_batches: dict[
@@ -7422,6 +8181,21 @@ async def process_job(
             text = "" if file_reply is not None else str(text or "").strip()
             if file_reply is not None and final:
                 raise RuntimeError("a file reply cannot be terminal")
+            turn_failure_error_class = ""
+            if file_reply is None and text and _is_degenerate_reply(text):
+                log.warning(
+                    "[v2.worker] chat degenerate reply suppressed user=%s "
+                    "job=%s final=%s fragment=%r",
+                    user_id,
+                    job_id,
+                    final,
+                    text[:20],
+                )
+                if not final:
+                    return
+                text = _DEGENERATE_REPLY_FALLBACK
+                turn_failure_error_class = _DEGENERATE_REPLY_ERROR_CLASS
+                reasoning = ""
             if final and not text:
                 # BUG-4 no-filler: chat lane always replies — an empty terminal
                 # text is a model/provider failure here (unlike wake, where
@@ -7494,8 +8268,10 @@ async def process_job(
                                 pending_file,
                                 effect_id=f"{effect_id}:file:{index}",
                             )
-                        )
+                    )
                     payload[REPLY_FOLLOWUPS_KEY] = followups
+            if turn_failure_error_class:
+                payload["turn_failure_error_class"] = turn_failure_error_class
             # Provider chain-of-thought rides the same effect as its final reply,
             # sealed into a separate thinking envelope so the durable outbox holds
             # only ciphertext and a retry re-addresses the same thinking row. Only
@@ -7787,16 +8563,84 @@ async def process_job(
         turn_extra_context = (
             context.action_context_str(perception_results) if perception_results else ""
         )
-        build_messages = _make_build_messages_fn(
-            system_prompt=context.CHAT_SYSTEM_PROMPT,
-            summary=summary,
-            tail=tail,
-            extra_context=turn_extra_context,
-            mutation_recovery_active=(mutation_recovery_barrier is not None),
-            trusted_system_blocks=trusted_system_blocks,
-            working_memory=working_memory,
-            provider_config=provider_config,
-        )
+        def _chat_builder():
+            return _make_build_messages_fn(
+                system_prompt=context.CHAT_SYSTEM_PROMPT,
+                summary=summary,
+                tail=tail,
+                extra_context=turn_extra_context,
+                mutation_recovery_active=(mutation_recovery_barrier is not None),
+                trusted_system_blocks=trusted_system_blocks,
+                working_memory=working_memory,
+                provider_config=provider_config,
+                temporal_snapshot=temporal_snapshot,
+                optional_tail_turns=optional_tail_turns,
+                tail_target_turns=(
+                    _CHAT_TAIL_MAX_TURNS if seq_context else None
+                ),
+                tail_source_truncated=tail_source_truncated,
+                tail_lane=lane,
+            )
+
+        build_messages = _chat_builder()
+        if seq_context:
+            try:
+                _preflight_adaptive_builder(
+                    build_messages,
+                    provider_config=provider_config,
+                )
+            except v2_prompt_frontier.PromptFrontierExhausted:
+                tm.record_prompt_frontier_exhaustion()
+                pending_seqs = [
+                    int(row["seq"])
+                    for row in coalesced
+                    if row.get("seq") is not None
+                    and str(row.get("role") or "") in {"user", "human"}
+                ]
+                safe_through_seq = (
+                    min(pending_seqs) - 1 if pending_seqs else watermark_seq
+                )
+                if safe_through_seq <= watermark_seq:
+                    raise
+                await _ensure_prompt_coverage(
+                    user_id,
+                    deps,
+                    provider_config=provider_config,
+                    enclave_sem=enclave_sem,
+                    tail_limit=0,
+                    job_id=job_id,
+                    claimed_by=claimed_by,
+                    add_usage=tm.add_call,
+                    trajectory_recorder=trajectory_recorder,
+                    compact_through_seq=safe_through_seq,
+                )
+                (
+                    summary,
+                    tail,
+                    optional_tail_turns,
+                    tail_source_truncated,
+                    watermark_seq,
+                ) = await _read_seq_adaptive_prompt_context(
+                    user_id=user_id,
+                    deps=deps,
+                    through_seq=through_seq,
+                    target_turns=_CHAT_TAIL_MAX_TURNS,
+                    provider_config=provider_config,
+                    enclave_sem=enclave_sem,
+                    claimed_by=claimed_by,
+                    job_id=job_id,
+                    add_usage=tm.add_call,
+                    trajectory_recorder=trajectory_recorder,
+                )
+                build_messages = _chat_builder()
+                try:
+                    _preflight_adaptive_builder(
+                        build_messages,
+                        provider_config=provider_config,
+                    )
+                except v2_prompt_frontier.PromptFrontierExhausted:
+                    tm.record_prompt_frontier_exhaustion()
+                    raise
 
         await _ensure_runtime_mode()
         await _renew_lease()
@@ -7844,6 +8688,13 @@ async def process_job(
                 PROMPT_ESTIMATOR_UTF8_BYTES_PER_TOKEN
             ),
             prompt_image_reserve_tokens=PROMPT_IMAGE_RESERVE_TOKENS,
+            on_tail_window=lambda item: tm.record_tail_window(
+                effective_turns=item["effective_turns"],
+                fallback=item["fallback"],
+            ),
+            on_prompt_frontier_exhaustion=(
+                tm.record_prompt_frontier_exhaustion
+            ),
         )
         if outcome.stop_reason == "input_advanced":
             # The hard provider-call budget remains authoritative. The stale

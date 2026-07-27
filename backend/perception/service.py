@@ -597,19 +597,17 @@ def _app_proactive_settings(user_id: str) -> dict:
 
 
 def _wake_block_reason(user_id: str) -> str:
-    """Mechanical gate for AUTOMATIC perception wakes, mirroring the tick
-    path's enabled/dnd/away suppression (proactive/gate.py
-    _build_proactive_v2_wake_decision). Perception wakes are all automatic —
-    manual summons go through the tick path — so there is no manual bypass.
-    Away is honored from EITHER source: the app proactive settings (iOS
-    Proactive panel) or perception's own focus/manual stack."""
+    """Global mechanical gate for automatic legacy perception wakes.
+
+    Dedicated photo/arrival/unlock consent is applied separately by
+    ``_legacy_wake_control_decision``. The historical ``enabled`` field is the
+    Heartbeat switch, not a master perception gate. DND and Away remain global.
+    """
     try:
         settings = _app_proactive_settings(user_id) or {}
     except Exception as e:
         log.warning("wake gate settings read failed for %s: %s", user_id, e)
         settings = {}
-    if settings and not settings.get("enabled", True):
-        return "proactive_disabled"
     if settings.get("dnd", False):
         return "dnd_enabled"
     if str(settings.get("user_state") or "") == "away":
@@ -646,6 +644,34 @@ def _settings_v2_for_user(user_id: str):
 def _proactive_activation_ready(user_id: str) -> bool:
     from core import store as core_store  # lazy
     return core_store.get_store(user_id).proactive_activation_ready()
+
+
+_LEGACY_WAKE_TRIGGER_BY_CAPABILITY = {
+    "photos": "photo_added",
+    "location": "arrived_at_anchor",
+    "wifi": "arrived_at_anchor",
+    "region": "arrived_at_anchor",
+    # The only legacy device wake candidate is last_unlock_ago_sec.
+    "device": "unlock_after_absence",
+}
+
+
+def _legacy_wake_trigger(cap_key: str) -> str:
+    """Map every supported legacy wake source onto its V2 consent trigger."""
+    return _LEGACY_WAKE_TRIGGER_BY_CAPABILITY.get(str(cap_key or "").strip(), "")
+
+
+def _legacy_wake_control_decision(user_id: str, cap_key: str):
+    from proactive.controls_v2 import evaluate_wake_control_v2  # lazy
+
+    trigger = _legacy_wake_trigger(cap_key)
+    if not trigger:
+        return trigger, None
+    return trigger, evaluate_wake_control_v2(
+        "perception_event",
+        trigger=trigger,
+        settings=_settings_v2_for_user(user_id),
+    )
 
 
 def _submit_wake_event_v2_compat(event) -> None:
@@ -753,14 +779,24 @@ def _maybe_wake(user_id, cap_key, debounce, field, old, new_v, now) -> None:
             "field": field, "old": old, "new": new_v, "ts": now,
         }, now)
         return
+    trigger, decision = _legacy_wake_control_decision(user_id, cap_key)
+    if decision is None:
+        log.warning("drop unmapped legacy perception wake: cap=%s field=%s", cap_key, field)
+        return
+    if not decision.accepted:
+        store.append_event(user_id, {
+            "cap": cap_key, "type": "suppressed", "reason": decision.reason,
+            "trigger": trigger, "field": field, "old": old, "new": new_v, "ts": now,
+        }, now)
+        return
     if debounce and (now - _last_wake_ts(user_id, cap_key)) < debounce:
         store.append_event(user_id, {
-            "cap": cap_key, "type": "debounced", "field": field,
+            "cap": cap_key, "type": "debounced", "trigger": trigger, "field": field,
             "old": old, "new": new_v, "ts": now,
         }, now)
         return
     store.append_event(user_id, {
-        "cap": cap_key, "type": "wake", "field": field,
+        "cap": cap_key, "type": "wake", "trigger": trigger, "field": field,
         "old": old, "new": new_v, "ts": now,
     }, now)
     _fire_wake(user_id, cap_key, _wake_hint(cap_key, field, old, new_v), now)
@@ -785,6 +821,10 @@ def _wake_hint(cap_key: str, field: str, old, new_v) -> str:
 def _fire_wake(user_id: str, cap_key: str, hint: str, now: float) -> None:
     """Enqueue a proactive job so the resident agent wakes. Lazy-imports app to
     avoid an import cycle (app registers this module at the bottom of startup)."""
+    trigger = _legacy_wake_trigger(cap_key)
+    if not trigger:
+        log.warning("drop unmapped legacy perception enqueue: cap=%s", cap_key)
+        return
     try:
         from core import store as core_store  # lazy
         from core import util as core_util  # lazy
@@ -798,10 +838,10 @@ def _fire_wake(user_id: str, cap_key: str, hint: str, now: float) -> None:
             "created_at": datetime.fromtimestamp(now).isoformat(),
             "source": proactive_service.PROACTIVE_JOB_SOURCE,
             "status": "pending",
-            "intent_label": f"perception_{cap_key}"[:120],
+            "intent_label": trigger[:120],
             # trigger/wake_kind keep the V2 job schema consistent with the
             # tick path so consumers and the wake dashboard see one shape.
-            "trigger": f"perception_{cap_key}"[:120],
+            "trigger": trigger[:120],
             "wake_kind": "presence",
             "context_hint": hint[:2000],
             "connections": [],

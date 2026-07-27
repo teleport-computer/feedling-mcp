@@ -1165,7 +1165,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
             "permission_states": dict(_ps.get("permission_states") or {}),
             # per-user autonomy switches (all default on)
             "switches": {
-                "ambient_陪伴": bool(_ps.get("enabled", True)),
+                "ambient_心跳": bool(_ps.get("enabled", True)),
                 "dnd_勿扰": bool(_ps.get("dnd", False)),
                 "scheduled_定时": bool(_ps.get("scheduled", True)),
                 "dream_做梦": bool(_ps.get("dream_enabled", True)),

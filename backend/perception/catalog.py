@@ -59,8 +59,10 @@ CAPABILITIES: dict[str, Capability] = {c.key: c for c in [
     # --- permissioned ---
     Capability("location", "你大概在哪里（只看地点标签，不看具体地址）", 1,
                wake_source=True, debounce_sec=60.0, context_field=True, query_tool=True),
-    Capability("motion", "你在动还是静止", 1,
-               wake_source=True, debounce_sec=30.0, context_field=True),
+    # Motion remains pullable context, but is intentionally not a wake source.
+    # It changes too frequently to justify interrupting the user, matching the
+    # Runtime V2 differ's motion_state suppression.
+    Capability("motion", "你在动还是静止", 1, context_field=True),
     Capability("calendar", "日历下一场日程", 1, context_field=True, query_tool=True),
     Capability("now_playing", "你在听的音乐", 1, context_field=True, query_tool=True),
     Capability("focus", "专注模式", 1, context_field=True),

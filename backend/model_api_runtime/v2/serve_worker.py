@@ -100,6 +100,7 @@ from model_api_runtime.v2 import worker as v2_worker
 from proactive import capture_scheduler
 from proactive import dream_scheduler
 from proactive import gate as proactive_gate
+from perception import service as perception_service
 from workspace.artifacts import ArtifactWorkspace, artifact_text_view_path
 from workspace.backends import WorkspaceNotFound, model_writable_path
 from workspace.prompt import render_trusted_prefix_blocks
@@ -854,7 +855,7 @@ def _read_tail_window(
 def _read_tail_window_after_seq(
     user_id: str,
     after_seq: int,
-    limit: int,
+    limit: int | None,
     *,
     oldest_first: bool,
     through_seq: int | None = None,
@@ -864,7 +865,7 @@ def _read_tail_window_after_seq(
     rows = db.chat_messages_after_seq(
         user_id,
         int(after_seq),
-        limit=int(limit),
+        limit=(int(limit) if limit is not None else None),
         oldest_first=oldest_first,
         through_seq=through_seq,
     )
@@ -880,7 +881,7 @@ def _read_tail_window_after_seq(
 def _read_tail_after_seq(
     user_id: str,
     after_seq: int,
-    limit: int,
+    limit: int | None,
     *,
     through_seq: int | None = None,
 ) -> list[dict]:
@@ -916,6 +917,42 @@ def _read_compaction_tail_after_seq(
     )
 
 
+def _read_recent_turns(
+    user_id: str,
+    max_turns: int,
+    row_cap: int,
+    *,
+    through_seq: int | None = None,
+) -> dict:
+    """Decrypt a frozen recent turn window while retaining seed metadata."""
+    window = db.chat_recent_turn_rows(
+        user_id,
+        max_turns=max_turns,
+        row_cap=row_cap,
+        through_seq=through_seq,
+    )
+    raw_rows = list(window.get("rows") or [])
+    decrypted = _decrypt_chat_rows(
+        user_id,
+        raw_rows,
+        user_only=False,
+        preserve_unreadable=True,
+    )
+    raw_by_seq = {int(row["seq"]): row for row in raw_rows}
+    for row in decrypted:
+        raw = raw_by_seq.get(int(row.get("seq") or 0), {})
+        role = str(raw.get("role") or "").strip().lower()
+        source = str(raw.get("source") or "")
+        row["_genuine_user"] = (
+            role in {"user", "human"}
+            and source not in {"verify_ping", "resident_maintenance"}
+        )
+    return {
+        **window,
+        "rows": decrypted,
+    }
+
+
 def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
     """Newest bounded verbatim window for chat/wake context."""
     return _read_tail_window(user_id, after_ts, limit, oldest_first=False)
@@ -924,6 +961,24 @@ def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
 def _read_compaction_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
     """Oldest contiguous batch so summary watermarks never skip backlog rows."""
     return _read_tail_window(user_id, after_ts, limit, oldest_first=True)
+
+
+def _read_temporal_snapshot(
+    user_id: str,
+    *,
+    through_seq: int | None = None,
+) -> dict:
+    """Read content-free temporal metadata for one frozen prompt frontier."""
+    timezone_name = accounts_registry._get_user_timezone(user_id)
+    if not timezone_name:
+        timezone_name = perception_service.stable_context_timezone(user_id)
+    return {
+        "timezone": str(timezone_name or "UTC"),
+        "last_user_message_ts": db.chat_latest_genuine_user_ts(
+            user_id,
+            through_seq=through_seq,
+        ),
+    }
 
 
 def _summary_metadata_frontier(state: dict) -> list:
@@ -1242,12 +1297,7 @@ def _wake_decision_for_user(user_id: str, trigger: str = "heartbeat") -> dict:
     """Read-only wake decision via the real proactive gate (assembly
     layer — reuses gate._build_proactive_v2_wake_decision so activation gate /
     broadcast suppression / all landmines hold with zero drift). No enqueue here;
-    the scheduler decides what to do with should_wake.
-
-    ``screen_watch`` additionally requires Ambient consent. The shared gate checks
-    both switches from one settings snapshot; heartbeat callers retain the existing
-    default behavior.
-    """
+    the scheduler decides what to do with should_wake."""
     store = core_store.get_store(user_id)
     if not hosted_config_store.hosted_runtime_v2_enabled_strict(store):
         return {
@@ -1257,11 +1307,7 @@ def _wake_decision_for_user(user_id: str, trigger: str = "heartbeat") -> dict:
         }
     normalized_trigger = str(trigger or "heartbeat").strip().lower() or "heartbeat"
     payload = {"trigger": normalized_trigger}
-    d = proactive_gate._build_proactive_v2_wake_decision(
-        store,
-        payload,
-        require_ambient=normalized_trigger == "screen_watch",
-    )
+    d = proactive_gate._build_proactive_v2_wake_decision(store, payload)
     return {
         "should_wake": bool(d.get("should_wake_agent")),
         "wake_interval_sec": int(d.get("wake_interval_sec") or 7200),
@@ -1967,11 +2013,11 @@ def _sink_reply(user_id: str, payload: dict) -> None:
     if v2_worker.REPLY_FOLLOWUPS_KEY in payload:
         raise RuntimeError("reply followups require the transactional sink")
 
-    # Only forward ``extra`` when a thinking sub-envelope is present, so a
-    # no-reasoning reply keeps its exact prior sink call shape.
+    # Only forward ``extra`` when thinking, failure, or file metadata is present,
+    # so an ordinary reply keeps its exact prior sink call shape.
     content_type, message_extra = _reply_message_fields(payload)
-    thinking_extra = v2_worker._thinking_extra(payload.get("thinking"))
-    combined_extra = {**thinking_extra, **message_extra}
+    reply_extra = v2_worker._reply_effect_extra(payload)
+    combined_extra = {**reply_extra, **message_extra}
     extra_kwargs = {"extra": combined_extra} if combined_extra else {}
     envelope = payload.get("envelope")
     if isinstance(envelope, dict):
@@ -2021,8 +2067,8 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
         if not isinstance(envelope, dict):
             raise RuntimeError("transactional reply requires encrypted envelope")
         content_type, message_extra = _reply_message_fields(message_payload)
-        thinking_extra = v2_worker._thinking_extra(message_payload.get("thinking"))
-        build_extra = {**thinking_extra, **message_extra}
+        reply_extra = v2_worker._reply_effect_extra(message_payload)
+        build_extra = {**reply_extra, **message_extra}
         wake_kind = str(message_payload.get("wake_kind") or "")
         if wake_kind:
             build_extra["wake_kind"] = wake_kind
@@ -2314,6 +2360,15 @@ _SCHEDULE_PAYLOAD_KEYS = (
 
 
 _SCHEDULE_CAPABILITY_OPS = frozenset({"schedule_wake", "cancel_wake"})
+try:
+    _MAX_CONSECUTIVE_SELF_WAKES = max(
+        0,
+        int(os.environ.get("FEEDLING_MAX_CONSECUTIVE_SELF_WAKES", "3")),
+    )
+except ValueError as exc:
+    raise RuntimeError(
+        "FEEDLING_MAX_CONSECUTIVE_SELF_WAKES must be an integer"
+    ) from exc
 
 
 def _sink_schedule(user_id: str, payload: dict) -> None:
@@ -2345,8 +2400,36 @@ def _sink_schedule(user_id: str, payload: dict) -> None:
     try:
         op = payload.get("op")
         if op in _SCHEDULE_CAPABILITY_OPS:
+            internal_self_wake = (
+                op == "schedule_wake" and payload.get("_self_wake") is True
+            )
+            if internal_self_wake:
+                reservation = jobs_store.reserve_self_wake(
+                    user_id,
+                    effect_id=eid,
+                    max_consecutive=_MAX_CONSECUTIVE_SELF_WAKES,
+                )
+                if not reservation["accepted"]:
+                    log.info(
+                        "[v2.serve_worker] self-wake schedule suppressed "
+                        "user=%s effect=%s streak=%s",
+                        user_id,
+                        eid,
+                        reservation["streak"],
+                    )
+                    db.effect_sink_complete(eid)
+                    return
             store = core_store.get_store(user_id)
-            params = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
+            params = {
+                k: v
+                for k, v in payload.items()
+                if k not in ("effect_id", "op", "_self_wake")
+            }
+            if internal_self_wake:
+                # Internal capability metadata: the public schema never accepts
+                # it, but ScheduledWakeServiceV2 uses it to enforce the existing
+                # five-minute minimum lead for AI-authored follow-up wakes.
+                params["_self_wake"] = True
             result = cap_registry.run_capability(op, store, api_key=None, params=params)
             if not result.ok:
                 # Same retryable-honoring contract as _sink_identity: a
@@ -2782,7 +2865,16 @@ def _validate_decrypted_tool_effect(effect_type: str, payload: dict) -> None:
         tool_name = str(payload.get("op") or "")
         if tool_name not in _SCHEDULE_CAPABILITY_OPS:
             raise RuntimeError("invalid encrypted schedule operation")
-        args = {k: v for k, v in payload.items() if k not in ("effect_id", "op")}
+        self_wake = payload.get("_self_wake")
+        if self_wake is not None and (
+            self_wake is not True or tool_name != "schedule_wake"
+        ):
+            raise RuntimeError("invalid encrypted self-wake marker")
+        args = {
+            k: v
+            for k, v in payload.items()
+            if k not in ("effect_id", "op", "_self_wake")
+        }
     elif effect_type == "workspace":
         tool_name = str(payload.get("op") or "")
         if tool_name not in {"workspace_write", "workspace_delete"}:
@@ -2967,6 +3059,8 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_compaction_tail=_read_compaction_tail,
         read_tail_after_seq=_read_tail_after_seq,
         read_compaction_tail_after_seq=_read_compaction_tail_after_seq,
+        read_recent_turns=_read_recent_turns,
+        read_temporal_snapshot=_read_temporal_snapshot,
         read_summary=_read_summary,
         read_summary_with_seq=_read_summary_with_seq,
         write_summary=_write_summary,

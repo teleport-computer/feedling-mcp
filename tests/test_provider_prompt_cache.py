@@ -138,6 +138,43 @@ def _multimodal_runtime_messages() -> list[dict]:
     )
 
 
+def test_temporal_context_stays_after_the_reusable_conversation_prefix() -> None:
+    stable_tail = [{"role": "user", "content": "first stable request", "ts": 100.0}]
+    first = v2_context.build_turn_messages(
+        system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
+        summary="",
+        tail=stable_tail,
+        temporal_context=v2_context.build_temporal_context(
+            now_ts=200.0,
+            timezone_name="UTC",
+            last_user_message_ts=100.0,
+            tail=stable_tail,
+        ),
+    )
+    second_tail = [
+        *stable_tail,
+        {"role": "assistant", "content": "first stable response", "ts": 210.0},
+        {"role": "user", "content": "second stable request", "ts": 220.0},
+    ]
+    second = v2_context.build_turn_messages(
+        system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
+        summary="",
+        tail=second_tail,
+        temporal_context=v2_context.build_temporal_context(
+            now_ts=230.0,
+            timezone_name="UTC",
+            last_user_message_ts=220.0,
+            tail=second_tail,
+        ),
+    )
+
+    assert first[:2] == second[:2]
+    assert first[-1]["content"].startswith(v2_context.TEMPORAL_CONTEXT_HEADER)
+    assert second[-1]["content"].startswith(v2_context.TEMPORAL_CONTEXT_HEADER)
+    assert first[-1] != second[-1]
+    assert "1970-01-01T00:03:20+00:00" not in first[0]["content"]
+
+
 def _wire_message_text(message: dict) -> str:
     if "parts" in message:
         return pc._content_text(message.get("parts"))

@@ -457,8 +457,60 @@ def test_run_wake_empty_tail_also_sleeps_silently(monkeypatch):
         and not str(message.get("content") or "").startswith(
             v2_context.RUNTIME_CONTEXT_HEADER
         )
+        and not str(message.get("content") or "").startswith(
+            v2_context.TEMPORAL_CONTEXT_HEADER
+        )
     ]
     assert len(conversation_messages) == 1  # just the nudge — no real tail rows
+
+
+def test_run_wake_degenerate_reply_fails_silently(monkeypatch):
+    uid = "u_wake_degenerate_reply"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+    _script_provider(monkeypatch, [_text_round("。")])
+    write_called = {"n": 0}
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda store, text: (
+            write_called.update(n=write_called["n"] + 1) or {"id": "never"}
+        ),
+    )
+    surface_called = {"n": 0}
+    monkeypatch.setattr(
+        worker,
+        "_surface_terminal_error",
+        lambda *args, **kwargs: surface_called.update(
+            n=surface_called["n"] + 1
+        ),
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+
+    status = asyncio.run(
+        worker._run_wake(
+            job_id,
+            uid,
+            "heartbeat",
+            deps,
+            _BYOK,
+            worker.ENCLAVE_SEMAPHORE,
+            claimed_by,
+        )
+    )
+
+    assert status == "failed"
+    assert write_called["n"] == 0
+    assert surface_called["n"] == 0
+    assert _job_status(job_id) == (
+        "failed",
+        "wake_failed:degenerate_reply_suppressed",
+    )
+    assert not any(event["kind"] == "error" for event in _status_events(uid))
 
 
 def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
@@ -496,6 +548,7 @@ def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
     assert row[0] == "failed"
     assert row[1] == "wake_failed:runtimeerror"
     assert not any(e["kind"] == "error" for e in _status_events(uid))
+    assert jobs_store.get_wake_schedule(uid) is None
 
 
 def test_run_wake_unexpected_exception_also_silent_mark_failed(monkeypatch):
@@ -540,6 +593,16 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
     uid = "u_wake_nodeps"
     conftest.seed_user(uid)
     _reset(uid)
+    failed_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    failed_owner = _claim(failed_id)
+    assert jobs_store.mark_failed(
+        failed_id,
+        "wake_failed:runtimeerror",
+        claimed_by=failed_owner,
+        wake_backoff_base_sec=60,
+        wake_backoff_cap_sec=3600,
+        wake_backoff_now=time.time(),
+    )
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
 
@@ -569,11 +632,17 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
         and not str(message.get("content") or "").startswith(
             v2_context.RUNTIME_CONTEXT_HEADER
         )
+        and not str(message.get("content") or "").startswith(
+            v2_context.TEMPORAL_CONTEXT_HEADER
+        )
     ]
     # The conversational tail should be just the wake nudge. Live grounding,
     # when available, is a separate untrusted user-role runtime-data block.
     assert len(conversation_messages) == 1
     assert conversation_messages[0]["role"] == "user"
+    schedule = jobs_store.get_wake_schedule(uid)
+    assert schedule["proactive_fail_streak"] == 0
+    assert schedule["proactive_backoff_until"] is None
 
 
 # ------------------------------------------------------------------
@@ -668,6 +737,7 @@ def test_run_wake_rollback_blocks_provider_cooldown_write(monkeypatch):
 
     assert status == "failed"
     assert cooldown_calls == []
+    assert jobs_store.get_wake_schedule(uid) is None
 
 
 def test_run_wake_lost_lease_blocks_provider_cooldown_write(monkeypatch):
@@ -695,6 +765,7 @@ def test_run_wake_lost_lease_blocks_provider_cooldown_write(monkeypatch):
 
     assert status == "failed"
     assert cooldown_calls == []
+    assert jobs_store.get_wake_schedule(uid) is None
 
 
 def test_run_wake_transient_error_does_not_set_payment_cooldown(monkeypatch):
@@ -726,7 +797,9 @@ def test_run_wake_transient_error_does_not_set_payment_cooldown(monkeypatch):
     assert _job_status(job_id)[0] == "failed"
     assert cooldown_calls == []
     schedule = jobs_store.get_wake_schedule(uid)
-    assert schedule is None or schedule["payment_cooldown_until"] is None
+    assert schedule["payment_cooldown_until"] is None
+    assert schedule["proactive_fail_streak"] == 1
+    assert schedule["proactive_backoff_until"] > time.time()
 
 
 # ------------------------------------------------------------------

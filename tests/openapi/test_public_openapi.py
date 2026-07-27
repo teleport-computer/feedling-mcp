@@ -7,6 +7,7 @@ server or make network requests.
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from collections.abc import Iterator
@@ -169,8 +170,9 @@ def test_public_operation_and_parameter_inventory(
     # 148 since GET/POST /v1/web/settings (the web-search toggle, Lark t100535) —
     # only the POST carries a body, hence 67 -> 68.
     # 149 since GET /v1/model_api/usage (provider balance/usage snapshot).
-    assert len(operations) == 149
-    assert sum("requestBody" in operation for operation in operations.values()) == 68
+    # 150 since POST /v1/model_api/models (BYOK model catalog listing, has a body).
+    assert len(operations) == 150
+    assert sum("requestBody" in operation for operation in operations.values()) == 69
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")
@@ -387,6 +389,53 @@ def test_conditional_payloads_and_review_contract_match_runtime(
         assert review_content[media_type]["schema"] == {
             "$ref": "#/components/schemas/ProactiveDecisionReviewRequest"
         }
+
+
+def test_model_catalog_request_schema_expresses_strict_xor(
+    public_schema: dict[str, Any],
+    operations: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    """ModelApiModelsRequest must encode the SAME strict credential contract the
+    runtime enforces: exactly one of api_key / credential_id present and
+    non-empty, api_key write-only, no OpenAPI-3.0 `nullable`, provider enum, and
+    a concrete response schema. The prior 49 tests asserted none of this."""
+    schemas = public_schema["components"]["schemas"]
+    req = schemas["ModelApiModelsRequest"]
+
+    # XOR on presence (exactly one of the two credential fields).
+    assert req["oneOf"] == [
+        {"required": ["api_key"]},
+        {"required": ["credential_id"]},
+    ]
+    assert req["required"] == ["provider"]
+
+    props = req["properties"]
+    # Non-empty enforced on both credential fields; null forbidden (nullable gone).
+    for field in ("api_key", "credential_id"):
+        assert props[field]["type"] == "string"
+        assert props[field]["minLength"] == 1
+        assert "nullable" not in props[field]
+    # api_key is write-only (never echoed back).
+    assert props["api_key"]["writeOnly"] is True
+    assert "writeOnly" not in props["credential_id"]
+
+    # Provider enum stays pinned.
+    assert set(props["provider"]["enum"]) == {
+        "openai", "openrouter", "anthropic", "bedrock", "gemini",
+        "deepseek", "openai_compatible",
+    }
+
+    # Response schema is concrete with the full required set.
+    resp = schemas["ModelApiModelsResponse"]
+    assert set(resp["required"]) == {
+        "provider", "models", "complete", "catalog_supported", "warnings",
+    }
+    # No `nullable` anywhere in the request schema (3.1 hygiene).
+    assert "nullable" not in json.dumps(req)
+
+    # The endpoint actually references the request/response schemas.
+    op = operations[("post", "/v1/model_api/models")]
+    assert _json_body_ref(op) == "#/components/schemas/ModelApiModelsRequest"
 
 
 def test_error_response_supports_unified_and_mcp_shapes(

@@ -56,6 +56,68 @@ def test_run_forever_clean_return_does_not_relaunch(monkeypatch):
     assert sleeps == []
 
 
+def test_temporal_snapshot_prefers_registry_timezone_and_freezes_timestamp(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        serve_worker.accounts_registry,
+        "_get_user_timezone",
+        lambda _user_id: "Asia/Shanghai",
+    )
+    monkeypatch.setattr(
+        serve_worker.perception_service,
+        "stable_context_timezone",
+        lambda _user_id: calls.append("perception") or "Europe/Berlin",
+    )
+    monkeypatch.setattr(
+        serve_worker.db,
+        "chat_latest_genuine_user_ts",
+        lambda user_id, *, through_seq=None: (
+            calls.append((user_id, through_seq)) or 123.0
+        ),
+    )
+
+    snapshot = serve_worker._read_temporal_snapshot(
+        "u-time",
+        through_seq=42,
+    )
+
+    assert snapshot == {
+        "timezone": "Asia/Shanghai",
+        "last_user_message_ts": 123.0,
+    }
+    assert calls == [("u-time", 42)]
+
+
+def test_temporal_snapshot_uses_perception_then_utc_fallback(monkeypatch):
+    monkeypatch.setattr(
+        serve_worker.accounts_registry,
+        "_get_user_timezone",
+        lambda _user_id: None,
+    )
+    monkeypatch.setattr(
+        serve_worker.db,
+        "chat_latest_genuine_user_ts",
+        lambda _user_id, *, through_seq=None: None,
+    )
+    monkeypatch.setattr(
+        serve_worker.perception_service,
+        "stable_context_timezone",
+        lambda _user_id: "Europe/Berlin",
+    )
+    assert serve_worker._read_temporal_snapshot("u-time")["timezone"] == (
+        "Europe/Berlin"
+    )
+
+    monkeypatch.setattr(
+        serve_worker.perception_service,
+        "stable_context_timezone",
+        lambda _user_id: None,
+    )
+    assert serve_worker._read_temporal_snapshot("u-time")["timezone"] == "UTC"
+
+
 def test_run_forever_backoff_is_bounded(monkeypatch):
     calls, sleeps = [], []
     script = [RuntimeError(f"boom{i}") for i in range(8)] + [None]
@@ -240,6 +302,7 @@ def test_build_production_deps_returns_turndeps():
     assert callable(deps.mint_enclave_token)
     assert callable(deps.read_tail_after_seq)
     assert callable(deps.read_compaction_tail_after_seq)
+    assert callable(deps.read_temporal_snapshot)
     assert callable(deps.read_summary_with_seq)
 
 

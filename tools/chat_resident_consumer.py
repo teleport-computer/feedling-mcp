@@ -132,8 +132,22 @@ try:
 except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
-from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards, sanitize_user_name
-from memory.dream_prompt_v1 import build_dream_prompt, parse_dream_consolidations
+from memory.capture_prompt_v1 import (
+    build_capture_prompt,
+    build_capture_retry_prompt,
+    parse_capture_cards,
+    sanitize_user_name,
+)
+from identity.user_naming import transcript_speaker_label
+from memory.card_text import (
+    count_user_token_residuals,
+    is_card_format_error,
+)
+from memory.dream_prompt_v1 import (
+    build_dream_prompt,
+    build_dream_retry_prompt,
+    parse_dream_consolidations,
+)
 from memory.migrate_prompt_v1 import build_migrate_prompt, parse_migrated_cards
 from chat.reply_language import (
     format_time_anchor,
@@ -10184,13 +10198,15 @@ def _capture_message_role(msg: dict, *, user_label: str = "TA", agent_label: str
     """Transcript line label. Real names, not system labels: a literal "user:"
     prefix is what taught capture models to write "用户" into user-visible
     cards (usr_fee1 complaint, 2026-07-17) — the model mirrors whatever the
-    transcript calls the speakers."""
-    role = str(msg.get("role") or "").strip().lower()
-    if role == "user":
-        # sanitize again here (defense in depth): a reserved "name" (用户/user)
-        # passed as a label must never become a "用户: …" line.
-        return sanitize_user_name(user_label)
-    return (agent_label or "").strip() or "我"
+    transcript calls the speakers.
+
+    这里只是薄壳:实现搬进了 identity.user_naming.transcript_speaker_label,
+    由两条运行时共用。原因很直接 —— 这个 bug 2026-07-17 只修在这里,
+    托管 Runtime V2 自己插原始 role,一直漏到 2026-07-26。同一条规则两份实现,
+    就一定会漏一份。"""
+    return transcript_speaker_label(
+        str(msg.get("role") or ""), user_name=user_label, ai_name=agent_label
+    )
 
 
 def _capture_message_id(msg: dict) -> str:
@@ -10298,6 +10314,54 @@ def _capture_agent_reply_text(result: Any) -> str:
     if isinstance(result, list):
         return json.dumps(result, ensure_ascii=False)
     return str(result or "")
+
+
+def _memory_agent_parse_with_bounce(
+    prompt: str,
+    *,
+    parse,
+    build_retry_prompt,
+    lane: str,
+    job_id: str,
+) -> tuple[tuple, str]:
+    """跑一次记忆抽取,内容不合格就原样打回去重问一次。
+
+    弱模型(实测 minimax-M3)会把输出示例的骨架抄回来:JSON 合法、字段非空,
+    但 summary/content 是 ``...`` 或 ``[thickened summary]``。这类回复以前
+    静默落库,用户在花园里就看到空白卡。现在第一次严格判、不合格就带着
+    「哪个字段没填」重问一次;第二次放宽为「只丢脏卡、保留干净的」。
+
+    返回 ``(parsed, bounce)``:``parsed`` 是 parse 的原始元组,``bounce`` 是
+    ``""``/``bounced_ok``/``bounced_empty``/``bounced_failed``,只用于观测。
+    调用方仍然只看 parse 元组末位的 err 决定成败 —— 打回是内部实现,不改判成败的口径。
+    注意第二问全脏时 parse 会给 ``invalid_card_content_after_retry:*``,
+    调用方据此把 job 判失败:报成 noop 会推进 frontier 把这段窗口永久丢掉。
+    """
+    reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
+    _note_agent_turn_success()
+    parsed = parse(reply_text, strict=True)
+    err = parsed[-1]
+    if not is_card_format_error(err):
+        return parsed, ""
+    log.warning(
+        "%s content gate bounced id=%s reason=%s — re-asking once", lane, job_id, err
+    )
+    retry_text = _capture_agent_reply_text(
+        call_agent(build_retry_prompt(prompt, err), raw_text=True)
+    )
+    _note_agent_turn_success()
+    # 第二次放宽:脏行丢掉、干净的照收,不让一行占位符把整晚整理清零;
+    # 但一张干净的都没剩下时 parse 会报 *_after_retry,不伪装成成功。
+    retried = parse(retry_text, strict=False)
+    if retried[-1]:
+        log.warning("%s content gate retry still bad id=%s reason=%s", lane, job_id, retried[-1])
+        return retried, "bounced_failed"
+    if not retried[0]:
+        # 模型接受了「宁可留空」这条出路 —— 这是 prompt 想要的结果,不是失败。
+        log.info("%s content gate retry returned a clean empty result id=%s", lane, job_id)
+        return retried, "bounced_empty"
+    log.info("%s content gate retry recovered id=%s cards=%d", lane, job_id, len(retried[0]))
+    return retried, "bounced_ok"
 
 
 def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", item_id: str = "") -> dict:
@@ -10430,7 +10494,13 @@ def _process_capture_jobs(jobs: list) -> float:
             window=window_text,
         )
         try:
-            reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
+            (cards, err), bounce = _memory_agent_parse_with_bounce(
+                prompt,
+                parse=parse_capture_cards,
+                build_retry_prompt=build_capture_retry_prompt,
+                lane="capture",
+                job_id=job_id,
+            )
         except Exception as e:
             reason = _agent_call_failed_reason("capture_agent_call_failed", e)
             log.error("capture agent call failed id=%s: %s", job_id, e)
@@ -10448,8 +10518,6 @@ def _process_capture_jobs(jobs: list) -> float:
                 },
             )
             continue
-        _note_agent_turn_success()
-        cards, err = parse_capture_cards(reply_text)
         if err:
             update_proactive_job_status(
                 job_id,
@@ -10464,12 +10532,19 @@ def _process_capture_jobs(jobs: list) -> float:
                 },
             )
             continue
+        # 残留计数(与 V2 同口径)。**刻意不在这里跑确定性改写** —— 那个改写器
+        # 现有的锚点在产品语境下会改坏真内容(见 test_card_user_referent.py)。
+        user_token_residual = sum(count_user_token_residuals(c) for c in cards)
         if not cards:
             update_proactive_job_status(
                 job_id,
                 "completed",
                 "nothing_worth_keeping",
                 extra={
+                    # content_gate 记下「这轮空是因为占位符被打回」,否则它和
+                    # 「真的没什么值得记」在 admin 上长得一模一样。
+                    "content_gate": bounce or None,
+                    "user_token_residual": user_token_residual or None,
                     "capture_result": {"status": "noop", "reason": "nothing_worth_keeping"},
                     "capture_window": window,
                     "cards_added": 0,
@@ -10777,7 +10852,13 @@ def _process_dream_jobs(jobs: list) -> float:
             recent_conversations=recent_text,
         )
         try:
-            reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
+            (consolidations, questions, err), bounce = _memory_agent_parse_with_bounce(
+                prompt,
+                parse=parse_dream_consolidations,
+                build_retry_prompt=build_dream_retry_prompt,
+                lane="dream",
+                job_id=job_id,
+            )
         except Exception as e:
             reason = _agent_call_failed_reason("dream_agent_call_failed", e)
             log.error("dream agent call failed id=%s: %s", job_id, e)
@@ -10795,8 +10876,6 @@ def _process_dream_jobs(jobs: list) -> float:
                 },
             )
             continue
-        _note_agent_turn_success()
-        consolidations, questions, err = parse_dream_consolidations(reply_text)
         if err:
             update_proactive_job_status(
                 job_id,
@@ -10811,12 +10890,21 @@ def _process_dream_jobs(jobs: list) -> float:
                 },
             )
             continue
+
+        user_token_residual = sum(
+            count_user_token_residuals(row.get("result") or {})
+            for row in consolidations if isinstance(row, dict)
+        )
         if not consolidations:
             update_proactive_job_status(
                 job_id,
                 "completed",
                 "dream_nothing_to_consolidate",
                 extra={
+                    # content_gate 记下「这轮空是因为占位符被打回」,否则它和
+                    # 「真的没什么要整理」在 admin 上长得一模一样。
+                    "content_gate": bounce or None,
+                    "user_token_residual": user_token_residual or None,
                     "dream_result": {
                         "status": "noop",
                         "reason": "dream_nothing_to_consolidate",

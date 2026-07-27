@@ -112,6 +112,31 @@ def test_through_seq_freezes_both_row_and_identity_windows(pg_clean):
     assert all(row["seq"] <= through_seq for row in rows)
 
 
+def test_latest_genuine_user_ts_respects_source_and_frozen_frontier(pg_clean):
+    uid = "u_cur_latest_genuine"
+    seed_user(uid)
+    db.chat_append(
+        uid, "real-1", 100.0,
+        {"role": "user", "source": "chat"}, 5000,
+    )
+    first_seq = db.chat_max_seq(uid)
+    db.chat_append(
+        uid, "internal", 200.0,
+        {"role": "user", "source": "verify_ping"}, 5000,
+    )
+    db.chat_append(
+        uid, "assistant", 250.0,
+        {"role": "assistant", "source": "model_api"}, 5000,
+    )
+    db.chat_append(
+        uid, "real-2", 300.0,
+        {"role": "human", "source": "chat"}, 5000,
+    )
+
+    assert db.chat_latest_genuine_user_ts(uid) == 300.0
+    assert db.chat_latest_genuine_user_ts(uid, through_seq=first_seq) == 100.0
+
+
 def test_max_seq_zero_for_unknown_user(pg_clean):
     assert db.chat_max_seq("u_cur_never_wrote") == 0
     assert db.chat_messages_after_seq("u_cur_never_wrote", 0, limit=10) == []

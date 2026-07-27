@@ -835,18 +835,102 @@ def renew_job_lease(
             return cur.rowcount == 1
 
 
-def mark_completed(job_id, *, claimed_by: str) -> bool:
+_FAIL_BACKOFF_WAKE_LANES = frozenset({"heartbeat", "scheduled"})
+
+
+def _latest_genuine_user_seq_on_cursor(cur, user_id: str) -> int:
+    cur.execute(
+        "SELECT COALESCE(MAX(seq),0) FROM chat_messages "
+        "WHERE user_id=%s AND doc->>'role' IN ('user','human') "
+        "AND COALESCE(doc->>'source','') "
+        "NOT IN ('verify_ping','resident_maintenance')",
+        (str(user_id),),
+    )
+    return int(cur.fetchone()[0] or 0)
+
+
+def _clear_wake_backoff_on_cursor(cur, user_id: str) -> None:
+    user_seq = _latest_genuine_user_seq_on_cursor(cur, user_id)
+    cur.execute(
+        "UPDATE v2_wake_schedule SET proactive_fail_streak=0, "
+        "proactive_fail_user_seq=%s, proactive_backoff_until=NULL, "
+        "updated_at=now() WHERE user_id=%s",
+        (user_seq, str(user_id)),
+    )
+
+
+def _arm_wake_backoff_on_cursor(
+    cur,
+    user_id: str,
+    *,
+    now: float,
+    base_sec: float,
+    cap_sec: float,
+) -> None:
+    base = max(0.0, float(base_sec))
+    cap = max(0.0, float(cap_sec))
+    if base <= 0 or cap <= 0:
+        return
+    normalized_user_id = str(user_id)
+    cur.execute(
+        "INSERT INTO v2_wake_schedule (user_id) VALUES (%s) "
+        "ON CONFLICT (user_id) DO NOTHING",
+        (normalized_user_id,),
+    )
+    cur.execute(
+        "SELECT proactive_fail_streak,proactive_fail_user_seq "
+        "FROM v2_wake_schedule WHERE user_id=%s FOR UPDATE",
+        (normalized_user_id,),
+    )
+    state = cur.fetchone()
+    if state is None:
+        raise RuntimeError("wake schedule row missing")
+    user_seq = _latest_genuine_user_seq_on_cursor(cur, normalized_user_id)
+    streak = int(state[0] or 0)
+    if user_seq > int(state[1] or 0):
+        streak = 0
+    streak += 1
+    delay = min(base * (2 ** min(streak - 1, 62)), cap)
+    cur.execute(
+        "UPDATE v2_wake_schedule SET proactive_fail_streak=%s, "
+        "proactive_fail_user_seq=%s, proactive_backoff_until=to_timestamp(%s), "
+        "updated_at=now() WHERE user_id=%s",
+        (streak, user_seq, float(now) + delay, normalized_user_id),
+    )
+
+
+def mark_completed(
+    job_id,
+    *,
+    claimed_by: str,
+    clear_wake_backoff: bool = False,
+) -> bool:
     with _pool().connection() as conn:
-        cur = conn.execute(
-            "UPDATE agent_jobs SET status='completed', finished_at=now() "
-            "WHERE id=%s AND status IN ('claimed','running') "
-            "AND claimed_by=%s AND lease_expires_at > now()",
-            (job_id, str(claimed_by)),
-        )
-        return cur.rowcount == 1
+        with conn.transaction():
+            cur = conn.execute(
+                "UPDATE agent_jobs SET status='completed', finished_at=now() "
+                "WHERE id=%s AND status IN ('claimed','running') "
+                "AND claimed_by=%s AND lease_expires_at > now() "
+                "RETURNING user_id,lane",
+                (job_id, str(claimed_by)),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return False
+            if clear_wake_backoff and str(row[1]) in _FAIL_BACKOFF_WAKE_LANES:
+                _clear_wake_backoff_on_cursor(cur, str(row[0]))
+            return True
 
 
-def mark_failed(job_id, error: str, *, claimed_by: str) -> bool:
+def mark_failed(
+    job_id,
+    error: str,
+    *,
+    claimed_by: str,
+    wake_backoff_base_sec: float | None = None,
+    wake_backoff_cap_sec: float | None = None,
+    wake_backoff_now: float | None = None,
+) -> bool:
     """Fail an owned job and transactionally queue chat failure visibility.
 
     Terminalization, the user-visible outbox obligation, and any trajectory
@@ -878,6 +962,22 @@ def mark_failed(job_id, error: str, *, claimed_by: str) -> bool:
             row = cur.fetchone()
             if row is None:
                 return False
+            if (
+                str(row[2]) in _FAIL_BACKOFF_WAKE_LANES
+                and wake_backoff_base_sec is not None
+                and wake_backoff_cap_sec is not None
+            ):
+                _arm_wake_backoff_on_cursor(
+                    cur,
+                    str(row[1]),
+                    now=(
+                        time.time()
+                        if wake_backoff_now is None
+                        else float(wake_backoff_now)
+                    ),
+                    base_sec=float(wake_backoff_base_sec),
+                    cap_sec=float(wake_backoff_cap_sec),
+                )
             _recover_review_runner_on_cursor(cur, job_id)
             _queue_failure_review_on_cursor(cur, job_id)
             return True
@@ -3045,6 +3145,9 @@ def record_whole_turn_metric(
     provider=None,
     model=None,
     cache_route_fingerprint=None,
+    effective_tail_turns=None,
+    tail_fallback=False,
+    prompt_frontier_exhaustion_count=0,
 ) -> None:
     """One idempotent whole-turn metric per job (spec B5): upsert on job_id so a
     re-drive (redelivery/retry of the same job) REPLACES rather than appends. Covers
@@ -3056,8 +3159,10 @@ def record_whole_turn_metric(
                 "completion_tokens, cache_read_tokens, cache_write_tokens, "
                 "cache_miss_tokens, usage_reported_calls, cache_reported_calls, "
                 "provider, model, cache_route_fingerprint, latency_ms, model_calls, "
-                "retries, failed, status) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "retries, failed, status, effective_tail_turns, tail_fallback, "
+                "prompt_frontier_exhaustion_count) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                "%s,%s,%s) "
                 "ON CONFLICT (job_id) DO UPDATE SET "
                 "user_id=EXCLUDED.user_id, lane=EXCLUDED.lane, "
                 "prompt_tokens=EXCLUDED.prompt_tokens, completion_tokens=EXCLUDED.completion_tokens, "
@@ -3070,6 +3175,10 @@ def record_whole_turn_metric(
                 "cache_route_fingerprint=EXCLUDED.cache_route_fingerprint, "
                 "latency_ms=EXCLUDED.latency_ms, model_calls=EXCLUDED.model_calls, "
                 "retries=EXCLUDED.retries, failed=EXCLUDED.failed, status=EXCLUDED.status, "
+                "effective_tail_turns=EXCLUDED.effective_tail_turns, "
+                "tail_fallback=EXCLUDED.tail_fallback, "
+                "prompt_frontier_exhaustion_count="
+                "EXCLUDED.prompt_frontier_exhaustion_count, "
                 "updated_at=now()",
                 (
                     job_id,
@@ -3090,10 +3199,62 @@ def record_whole_turn_metric(
                     retries,
                     failed,
                     status,
+                    effective_tail_turns,
+                    bool(tail_fallback),
+                    max(0, int(prompt_frontier_exhaustion_count)),
                 ),
             )
     except Exception as e:  # noqa: BLE001 — best-effort instrumentation, never fail the turn
         log.error("[jobs_store] record_whole_turn_metric(%s) failed: %s", job_id, e)
+
+
+def recent_tail_window_stats(*, lane: str, limit: int = 1000) -> dict:
+    """Content-free adaptive-tail outcomes for one exact Runtime V2 lane."""
+    bounded = max(1, min(int(limit), 10_000))
+    with _pool().connection() as conn:
+        row = conn.execute(
+            "WITH recent AS ("
+            " SELECT effective_tail_turns,tail_fallback,"
+            " prompt_frontier_exhaustion_count,prompt_tokens "
+            " FROM v2_turn_metrics WHERE lane=%s "
+            " ORDER BY created_at DESC,id DESC LIMIT %s"
+            ") SELECT count(*)::int,"
+            " count(effective_tail_turns)::int,"
+            " min(effective_tail_turns)::int,"
+            " avg(effective_tail_turns)::double precision,"
+            " max(effective_tail_turns)::int,"
+            " count(*) FILTER (WHERE tail_fallback)::int,"
+            " coalesce(sum(prompt_frontier_exhaustion_count),0)::bigint,"
+            " sum(prompt_tokens)::bigint FROM recent",
+            (str(lane), bounded),
+        ).fetchone()
+    sampled = int(row[0] or 0) if row else 0
+    measured = int(row[1] or 0) if row else 0
+    fallback_turns = int(row[5] or 0) if row else 0
+    return {
+        "lane": str(lane),
+        "sample_limit": bounded,
+        "sampled_turns": sampled,
+        "measured_turns": measured,
+        "measurement_coverage": (
+            float(measured) / float(sampled) if sampled else None
+        ),
+        "effective_tail_turns_min": (
+            int(row[2]) if row and row[2] is not None else None
+        ),
+        "effective_tail_turns_avg": (
+            float(row[3]) if row and row[3] is not None else None
+        ),
+        "effective_tail_turns_max": (
+            int(row[4]) if row and row[4] is not None else None
+        ),
+        "fallback_turns": fallback_turns,
+        "fallback_rate": (
+            float(fallback_turns) / float(measured) if measured else None
+        ),
+        "prompt_frontier_exhaustion_count": int(row[6] or 0) if row else 0,
+        "prompt_tokens": int(row[7]) if row and row[7] is not None else None,
+    }
 
 
 def recent_mean_tokens_per_turn(*, lane: str = "chat", limit: int = 50) -> float | None:
@@ -5158,7 +5319,12 @@ def get_wake_schedule(user_id) -> dict | None:
                 "EXTRACT(EPOCH FROM next_capture_at) AS next_capture_at, "
                 "EXTRACT(EPOCH FROM payment_cooldown_until) AS payment_cooldown_until, "
                 "EXTRACT(EPOCH FROM next_screen_watch_at) AS next_screen_watch_at, "
-                "last_screen_watch_frame_id, updated_at "
+                "EXTRACT(EPOCH FROM proactive_backoff_until) "
+                "AS proactive_backoff_until, "
+                "last_screen_watch_frame_id, self_wake_streak, "
+                "self_wake_user_seq, self_wake_last_effect_id, "
+                "self_wake_last_effect_accepted, proactive_fail_streak, "
+                "proactive_fail_user_seq, updated_at "
                 "FROM v2_wake_schedule WHERE user_id=%s",
                 (user_id,),
             )
@@ -5168,7 +5334,91 @@ def get_wake_schedule(user_id) -> dict | None:
     result = dict(row)
     if result["next_screen_watch_at"] is not None:
         result["next_screen_watch_at"] = float(result["next_screen_watch_at"])
+    if result["proactive_backoff_until"] is not None:
+        result["proactive_backoff_until"] = float(
+            result["proactive_backoff_until"]
+        )
     return result
+
+
+def reserve_self_wake(
+    user_id: str,
+    *,
+    effect_id: str,
+    max_consecutive: int,
+) -> dict[str, Any]:
+    """Atomically admit one AI-authored self-schedule attempt.
+
+    Only Runtime V2 wake turns call this helper. Heartbeat/event wake
+    realization never touches the counter. A newer genuine user message lazily
+    resets the streak at the next admission decision. Production calls this
+    from the effect sink while the outbox owns the chat-user advisory fence, so
+    the reset is ordered against a concurrent Send. The last effect result
+    makes an outbox replay return the same decision without incrementing twice.
+    """
+    normalized_user_id = str(user_id)
+    normalized_effect_id = str(effect_id or "").strip()
+    if not normalized_effect_id:
+        raise ValueError("self-wake effect_id required")
+    limit = max(0, int(max_consecutive))
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "INSERT INTO v2_wake_schedule (user_id) VALUES (%s) "
+                    "ON CONFLICT (user_id) DO NOTHING",
+                    (normalized_user_id,),
+                )
+                cur.execute(
+                    "SELECT self_wake_streak,self_wake_user_seq,"
+                    "self_wake_last_effect_id,self_wake_last_effect_accepted "
+                    "FROM v2_wake_schedule WHERE user_id=%s FOR UPDATE",
+                    (normalized_user_id,),
+                )
+                state = cur.fetchone()
+                if state is None:
+                    raise RuntimeError("self-wake schedule row missing")
+                if str(state["self_wake_last_effect_id"] or "") == normalized_effect_id:
+                    accepted = bool(state["self_wake_last_effect_accepted"])
+                    return {
+                        "accepted": accepted,
+                        "streak": int(state["self_wake_streak"] or 0),
+                        "reason": "" if accepted else "self_wake_loop_guard",
+                        "replayed": True,
+                    }
+                cur.execute(
+                    "SELECT COALESCE(MAX(seq),0) AS user_seq FROM chat_messages "
+                    "WHERE user_id=%s AND doc->>'role' IN ('user','human') "
+                    "AND COALESCE(doc->>'source','') "
+                    "NOT IN ('verify_ping','resident_maintenance')",
+                    (normalized_user_id,),
+                )
+                user_seq = int(cur.fetchone()["user_seq"] or 0)
+                previous_user_seq = int(state["self_wake_user_seq"] or 0)
+                streak = int(state["self_wake_streak"] or 0)
+                if user_seq > previous_user_seq:
+                    streak = 0
+                accepted = limit <= 0 or streak < limit
+                next_streak = streak + 1 if accepted else streak
+                cur.execute(
+                    "UPDATE v2_wake_schedule SET self_wake_streak=%s,"
+                    "self_wake_user_seq=%s,self_wake_last_effect_id=%s,"
+                    "self_wake_last_effect_accepted=%s,updated_at=now() "
+                    "WHERE user_id=%s",
+                    (
+                        next_streak,
+                        user_seq,
+                        normalized_effect_id,
+                        accepted,
+                        normalized_user_id,
+                    ),
+                )
+                return {
+                    "accepted": accepted,
+                    "streak": next_streak,
+                    "reason": "" if accepted else "self_wake_loop_guard",
+                    "replayed": False,
+                }
 
 
 def upsert_wake_schedule(
@@ -5220,6 +5470,15 @@ def upsert_wake_schedule(
         )
 
 
+_LATEST_GENUINE_USER_SEQ_SQL = (
+    "(SELECT COALESCE(MAX(message.seq),0) FROM chat_messages AS message "
+    "WHERE message.user_id=schedule.user_id "
+    "AND message.doc->>'role' IN ('user','human') "
+    "AND COALESCE(message.doc->>'source','') "
+    "NOT IN ('verify_ping','resident_maintenance'))"
+)
+
+
 def due_heartbeat_users(*, now: float | None = None, limit: int = 500) -> list[str]:
     """到期需要心跳唤醒的 user_id 列表（next_heartbeat_at 已到且不在 BYOK 支付冷却
     窗口内），按 next_heartbeat_at 升序（最该醒的排前面），供 D3 调度器 poll 后逐个
@@ -5229,13 +5488,20 @@ def due_heartbeat_users(*, now: float | None = None, limit: int = 500) -> list[s
     with _pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT user_id FROM v2_wake_schedule "
-                "WHERE next_heartbeat_at IS NOT NULL "
-                "AND next_heartbeat_at <= COALESCE(to_timestamp(%s), now()) "
-                "AND (payment_cooldown_until IS NULL "
-                "     OR payment_cooldown_until <= COALESCE(to_timestamp(%s), now())) "
-                "ORDER BY next_heartbeat_at LIMIT %s",
-                (ts, ts, int(limit)),
+                "SELECT schedule.user_id FROM v2_wake_schedule AS schedule "
+                "WHERE schedule.next_heartbeat_at IS NOT NULL "
+                "AND schedule.next_heartbeat_at "
+                "<= COALESCE(to_timestamp(%s), now()) "
+                "AND (schedule.payment_cooldown_until IS NULL "
+                "     OR schedule.payment_cooldown_until "
+                "        <= COALESCE(to_timestamp(%s), now())) "
+                "AND (schedule.proactive_backoff_until IS NULL "
+                "     OR schedule.proactive_backoff_until "
+                "        <= COALESCE(to_timestamp(%s), now()) "
+                "     OR schedule.proactive_fail_user_seq < "
+                + _LATEST_GENUINE_USER_SEQ_SQL
+                + ") ORDER BY schedule.next_heartbeat_at LIMIT %s",
+                (ts, ts, ts, int(limit)),
             )
             return [row[0] for row in cur.fetchall()]
 
@@ -5278,18 +5544,28 @@ def due_scheduled_users(*, now: float | None = None, limit: int = 500) -> list[s
     if limit <= 0:
         return []
     sql = (
-        "SELECT DISTINCT user_id FROM ("
+        "SELECT DISTINCT latest.user_id FROM ("
         "  SELECT DISTINCT ON (user_id, item_key) user_id, doc"
         "  FROM user_logs WHERE stream = %s"
         "  ORDER BY user_id, item_key, seq DESC"
         ") latest "
+        "LEFT JOIN v2_wake_schedule AS schedule "
+        "ON schedule.user_id=latest.user_id "
         "WHERE COALESCE(NULLIF(doc->>'due_at','')::float8, 0) <= %s "
         "  AND (doc->>'status' = 'pending' OR (doc->>'status' = 'claimed' "
         "       AND COALESCE(NULLIF(doc->>'claim_expires_at','')::float8, 0) <= %s)) "
+        "  AND (schedule.proactive_backoff_until IS NULL "
+        "       OR schedule.proactive_backoff_until <= to_timestamp(%s) "
+        "       OR schedule.proactive_fail_user_seq < "
+        + _LATEST_GENUINE_USER_SEQ_SQL
+        + ") "
         "LIMIT %s"
     )
     with _pool().connection() as conn:
-        rows = conn.execute(sql, (SCHEDULED_WAKE_STREAM, ts, ts, limit)).fetchall()
+        rows = conn.execute(
+            sql,
+            (SCHEDULED_WAKE_STREAM, ts, ts, ts, limit),
+        ).fetchall()
     return [str(r[0]) for r in rows]
 
 

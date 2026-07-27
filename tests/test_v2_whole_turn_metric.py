@@ -34,13 +34,21 @@ def test_upsert_is_idempotent_by_job(pg_clean_metrics):
     uid = "u_wtm1"
     jid = _seed_job(uid)
     jobs_store.record_whole_turn_metric(jid, uid, "chat", prompt_tokens=10,
-        completion_tokens=5, latency_ms=100, model_calls=2, retries=0, failed=False, status="ok")
+        completion_tokens=5, latency_ms=100, model_calls=2, retries=0,
+        failed=False, status="ok", effective_tail_turns=40,
+        tail_fallback=False, prompt_frontier_exhaustion_count=0)
     jobs_store.record_whole_turn_metric(jid, uid, "chat", prompt_tokens=30,
-        completion_tokens=9, latency_ms=200, model_calls=3, retries=1, failed=False, status="ok")
+        completion_tokens=9, latency_ms=200, model_calls=3, retries=1,
+        failed=False, status="ok", effective_tail_turns=17,
+        tail_fallback=True, prompt_frontier_exhaustion_count=2)
     with db.get_pool().connection() as c:
-        rows = c.execute("SELECT prompt_tokens, model_calls FROM v2_turn_metrics WHERE job_id=%s",
-                         (jid,)).fetchall()
-    assert len(rows) == 1 and rows[0][0] == 30 and rows[0][1] == 3   # latest wins, one row
+        rows = c.execute(
+            "SELECT prompt_tokens, model_calls, effective_tail_turns, "
+            "tail_fallback, prompt_frontier_exhaustion_count "
+            "FROM v2_turn_metrics WHERE job_id=%s",
+            (jid,),
+        ).fetchall()
+    assert rows == [(30, 3, 17, True, 2)]
 
 
 def test_failed_turn_is_recorded(pg_clean_metrics):

@@ -1142,6 +1142,82 @@ def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) 
     return {"route": db.model_api_route_get(store.user_id, route_id)}, 200
 
 
+# --- BYOK model catalog: list a provider's models for the setup UI ------------
+# Pure-additive read-only bypass. Does NOT mutate anything, does NOT touch the
+# encryption envelope beyond READING+decrypting a saved credential to obtain the
+# provider key (same decrypt call the route-test path already uses). Provider
+# auth failures are mapped to 400/429/503 — never 401 — so iOS never mistakes a
+# bad provider key for an expired Feedling login.
+_CATALOG_STATUS = {
+    "model_catalog_auth_failed": 400,
+    "model_catalog_access_denied": 400,
+    "model_catalog_invalid_response": 400,
+    "model_catalog_unsupported": 400,   # 不会走到（unsupported 是 200 成功分支）
+    "model_catalog_rate_limited": 429,
+    "model_catalog_temporarily_unavailable": 503,
+}
+
+
+def _catalog_status_for_slug(slug: str) -> int:
+    return _CATALOG_STATUS.get(slug, 400)
+
+
+def model_api_models(store, payload: dict, *, caller_api_key: str | None) -> tuple[dict, int]:
+    provider = str(payload.get("provider") or "")
+    base_url = str(payload.get("base_url") or "")
+    # Strict XOR matching the published OpenAPI oneOf (ModelApiModelsRequest):
+    # exactly ONE of api_key / credential_id must be PRESENT in the payload, and
+    # whichever is present must be a non-empty string. An explicit null, an empty
+    # string, or supplying both is a malformed request — this keeps the runtime
+    # byte-for-byte with the schema (a presence-only-or-null contract drifted).
+    key_present = "api_key" in payload
+    cred_present = "credential_id" in payload
+    if key_present == cred_present:
+        return {"error": "api_key_or_credential_id_required",
+                "detail": "supply exactly one of api_key / credential_id"}, 400
+    raw_key = str(payload.get("api_key") or "").strip()
+    credential_id = str(payload.get("credential_id") or "").strip()
+    if key_present and not raw_key:
+        return {"error": "api_key_or_credential_id_required",
+                "detail": "api_key must be a non-empty string"}, 400
+    if cred_present and not credential_id:
+        return {"error": "api_key_or_credential_id_required",
+                "detail": "credential_id must be a non-empty string"}, 400
+
+    if credential_id:
+        cred = db.model_api_credential_get(store.user_id, credential_id)
+        if not cred:
+            return {"error": "credential_not_found"}, 404
+        provider = cred.get("provider") or provider      # 凭据为 provider/base_url 唯一真源
+        base_url = cred.get("base_url") or ""
+        envelope = cred.get("api_key_envelope")
+        if not isinstance(envelope, dict):
+            return {"error": "model_api_key_envelope_missing"}, 404
+        try:
+            provider_key = core_enclave._decrypt_envelope_via_enclave(
+                envelope, caller_api_key, purpose="model_api_provider_key").decode("utf-8")
+        except Exception as e:
+            return {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}, 400
+    else:
+        provider_key = raw_key
+
+    # Validate the egress target (provider allowlist + URL scheme) with the SAME
+    # rules as save/test, minus the model requirement. An unknown provider is a
+    # hard 400 here — never a silent "catalog unsupported". For the credential
+    # path this re-checks the stored provider/base_url (harmless).
+    try:
+        provider, base_url = provider_client.validate_catalog_target(provider, base_url)
+    except provider_client.ProviderError as e:
+        return {"error": "model_api_config_invalid", "detail": str(e)[:220]}, 400
+
+    try:
+        result = provider_client.list_provider_models(provider, provider_key, base_url)
+    except provider_client.ProviderError as e:
+        slug = provider_client.model_catalog_error_slug(e)
+        return {"error": slug, "detail": str(e)[:220]}, _catalog_status_for_slug(slug)
+    return {"provider": provider, **result}, 200
+
+
 @_serialized_model_api_mutation
 def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None) -> tuple[dict, int]:
     """先同步测活，通过才切换。测不过 → 400，旧 active 纹丝不动。

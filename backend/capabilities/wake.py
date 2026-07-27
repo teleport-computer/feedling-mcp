@@ -22,7 +22,7 @@ class _Accepted:
     reason = "persisted_for_scheduler"
 
 
-def _apply(user_id: str, action: dict) -> CapabilityResult:
+def _apply(user_id: str, action: dict, *, self_wake: bool = False) -> CapabilityResult:
     from proactive import scheduled_wake_v2
     from proactive.store_v2 import DBProactiveSettingsStoreV2
 
@@ -31,7 +31,12 @@ def _apply(user_id: str, action: dict) -> CapabilityResult:
         scheduled_wake_v2.DBScheduledWakeStoreV2(), owner_id=_OWNER_ID)
     try:
         results = service.apply_turn_actions(
-            user_id, [action], settings=settings, submit_wake=lambda _event: _Accepted())
+            user_id,
+            [action],
+            settings=settings,
+            self_wake=self_wake,
+            submit_wake=lambda _event: _Accepted(),
+        )
     except Exception as e:  # noqa: BLE001
         return err(errors.UPSTREAM, f"scheduled wake failed: {type(e).__name__}", retryable=True)
     return ok(data={"results": [r.as_dict() for r in results] if results else []})
@@ -47,7 +52,11 @@ def schedule(store, *, api_key=None, runtime_token=None, params=None) -> Capabil
         value = str(params.get(key) or "").strip()
         if value:
             action[key] = value
-    return _apply(store.user_id, action)
+    return _apply(
+        store.user_id,
+        action,
+        self_wake=params.get("_self_wake") is True,
+    )
 
 
 def cancel(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:

@@ -266,6 +266,41 @@ def test_effect_reservations_pin_ordinals_and_gate_enqueue_order():
     asyncio.run(_scenario())
 
 
+def test_only_wake_lane_schedule_reservation_gets_self_wake_marker():
+    schedule = ToolCall(
+        id="schedule",
+        name="schedule_wake",
+        args={
+            "at": "2026-07-26T10:00:00Z",
+            "_self_wake": True,
+        },
+    )
+    cancel = ToolCall(
+        id="cancel",
+        name="cancel_wake",
+        args={"wake_id": "wake-1"},
+    )
+    wake_reservations = worker._PlatformEffectReservations(
+        job_id=81,
+        ordinal_counter=itertools.count(),
+        self_wake=True,
+    )
+    wake_reservations.prepare(schedule)
+    wake_reservations.prepare(cancel)
+
+    chat_reservations = worker._PlatformEffectReservations(
+        job_id=82,
+        ordinal_counter=itertools.count(),
+    )
+    chat_reservations.prepare(schedule)
+
+    assert wake_reservations.get(schedule).payload["_self_wake"] is True
+    assert "_self_wake" not in wake_reservations.get(cancel).payload
+    # The wake marker above was re-added by the trusted reservation. The same
+    # model-authored field in a foreground/chat reservation is stripped.
+    assert "_self_wake" not in chat_reservations.get(schedule).payload
+
+
 def test_platform_reads_really_overlap_but_results_keep_model_order():
     async def _scenario():
         first_started = asyncio.Event()

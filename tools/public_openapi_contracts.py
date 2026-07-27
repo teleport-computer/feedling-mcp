@@ -331,6 +331,95 @@ OPERATION_PARAMETERS[("put", "/v1/genesis/imports/{job_id}/chunks/{seq}")] = [
 
 
 COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "ModelApiModelsRequest": {
+        "type": "object",
+        "description": (
+            "List a provider's live model catalog. Supply the credential "
+            "**exactly one** of two ways: a fresh `api_key`, or a stored "
+            "`credential_id` whose provider/base_url are the source of truth "
+            "(any provider/base_url sent alongside a credential_id is ignored)."
+        ),
+        "required": ["provider"],
+        "additionalProperties": True,
+        # Strict XOR that matches the runtime (setup_core.model_api_models):
+        # exactly one of api_key / credential_id must be PRESENT and non-empty.
+        # `oneOf` on `required` gives "exactly one present"; `minLength: 1` on the
+        # value gives "non-empty"; dropping OpenAPI-3.0 `nullable` forbids an
+        # explicit null (this document is 3.1.0, where null is a JSON-Schema type,
+        # not a `nullable` flag). So {"api_key":"k","credential_id":null} — which
+        # a presence-only oneOf + nullable used to accept while the runtime
+        # rejected it — is now invalid on BOTH sides.
+        "oneOf": [
+            {"required": ["api_key"]},
+            {"required": ["credential_id"]},
+        ],
+        "properties": {
+            "provider": {
+                "type": "string",
+                "enum": [
+                    "openai",
+                    "openrouter",
+                    "anthropic",
+                    "bedrock",
+                    "gemini",
+                    "deepseek",
+                    "openai_compatible",
+                ],
+                "description": "Provider to enumerate. `openai_compatible` requires `base_url`.",
+            },
+            "base_url": {
+                "type": "string",
+                "description": (
+                    "Override base URL. Required for `openai_compatible`; must be "
+                    "`https://` or local `http://127.0.0.1`."
+                ),
+            },
+            "api_key": {
+                "type": "string",
+                "writeOnly": True,
+                "minLength": 1,
+                "description": "Fresh provider key. Mutually exclusive with `credential_id`.",
+            },
+            "credential_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Stored credential id. Mutually exclusive with `api_key`.",
+            },
+        },
+        "example": {"provider": "openai", "api_key": "sk-..."},
+    },
+    "ModelApiModelItem": {
+        "type": "object",
+        "required": ["id", "display_name"],
+        "additionalProperties": False,
+        "properties": {
+            "id": {"type": "string", "description": "Provider model id (≤160 chars)."},
+            "display_name": {"type": "string", "description": "Human label; falls back to id."},
+        },
+    },
+    "ModelApiModelsResponse": {
+        "type": "object",
+        "description": (
+            "The account's visible model catalog for this provider — a live "
+            "pull, NOT an io compatibility guarantee. `complete=false` means the "
+            "list was truncated (see `warnings`); `catalog_supported=false` means "
+            "the provider has no listable catalog (e.g. bedrock, or a custom "
+            "endpoint with no `/models`) and the client should fall back to "
+            "manual model entry."
+        ),
+        "required": ["provider", "models", "complete", "catalog_supported", "warnings"],
+        "additionalProperties": False,
+        "properties": {
+            "provider": {"type": "string"},
+            "models": {
+                "type": "array",
+                "items": {"$ref": "#/components/schemas/ModelApiModelItem"},
+            },
+            "complete": {"type": "boolean"},
+            "catalog_supported": {"type": "boolean"},
+            "warnings": {"type": "array", "items": {"type": "string"}},
+        },
+    },
     "WebSettingsUpdateRequest": {
         "type": "object",
         "description": (
@@ -1461,6 +1550,7 @@ PRECISE_JSON_BODIES: dict[Operation, str] = {
     ("post", "/v1/account/recover/verify"): "RecoverVerifyRequest",
     ("post", "/v1/account/reset"): "AccountResetRequest",
     ("post", "/v1/model_api/chat/send"): "HostedChatSendRequest",
+    ("post", "/v1/model_api/models"): "ModelApiModelsRequest",
     ("post", "/v1/model_api/runtime_error"): "ModelApiRuntimeErrorRequest",
     ("post", "/v1/chat/message"): "ChatTransportRequest",
     ("post", "/v1/chat/response"): "ChatResponseRequest",
@@ -1546,6 +1636,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope and encrypted file_followups). A text primary and its file cards commit as one ordered transaction. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/chat/verify_loop"): "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded.",
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
+    ("post", "/v1/model_api/models"): "列出某 provider 在该凭据下可见的模型清单（实时拉取，非 io 兼容性保证）。unsupported / partial 时客户端退回手填。",
     ("post", "/v1/model_api/runtime_error"): "Record or clear the resident runtime's latest provider error. provider_result=success refreshes provider health immediately; provider_result=failure applies error_class to the provider-health policy.",
     ("get", "/v1/model_api/usage"): (
         "Query the caller's active model_api provider for balance/usage, live on every call — "
@@ -1724,6 +1815,12 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
         "202": {
             "description": "Turn accepted for asynchronous processing.",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HostedChatAcceptedResponse"}}},
+        }
+    },
+    ("post", "/v1/model_api/models"): {
+        "200": {
+            "description": "The account's visible model catalog for this provider.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ModelApiModelsResponse"}}},
         }
     },
     ("post", "/v1/notify-relay/register"): {

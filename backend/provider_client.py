@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -313,6 +313,11 @@ def validate_config(
         raise ProviderError("model required")
     if provider == "openai_compatible" and not base_url:
         raise ProviderError("base_url required for openai_compatible")
+    # NOTE (owner): this startswith() loopback check has the SAME latent
+    # prefix-forgery flaw fixed in validate_catalog_target / _validate_egress_url
+    # ("http://127.0.0.1.evil.example" and "http://127.0.0.1@evil.example" both
+    # pass). Left untouched here to avoid changing the normal save/test path;
+    # migrate this to _validate_egress_url when that path is next revisited.
     if base_url and not (
         base_url.startswith("https://") or base_url.startswith("http://127.0.0.1")
     ):
@@ -3339,6 +3344,365 @@ def probe_responses_support(config: ProviderConfig) -> bool:
     except Exception:
         return False
     return isinstance(body, dict) and not body.get("error")
+
+
+# --- BYOK model catalog: list a provider's models via its /models endpoint ----
+# Pure-additive bypass. NONE of these touch chat_completion / test_provider_key /
+# encryption. Wire logic (target validation / request build / streaming fetch /
+# strict page parse / bounded pagination / error classification) lives here in
+# the leaf layer, mirroring the rest of provider_client.
+#
+# Resource discipline is a single WHOLE-CALL budget, not a per-page fudge: one
+# monotonic wall-clock deadline shared across every page, each page's socket
+# timeout = the remaining budget, and a decompressed-byte cap summed across the
+# entire call (streamed, so a hostile endpoint can't buffer us to death before
+# we notice). Later-page failures degrade to partial success; the first page
+# still raises.
+_CATALOG_TOTAL_BUDGET = 20.0          # seconds, wall-clock, across all pages
+# Tight PER-PHASE httpx timeouts. These bound the connect/TLS/header phases and
+# the idle-wait between chunks, but they are NOT a total-time bound: httpx's
+# read timeout only caps waiting for the NEXT chunk, so a slow-dripping endpoint
+# that keeps sending small chunks would run far past _CATALOG_TOTAL_BUDGET. The
+# real wall-clock bound is enforced by the in-loop deadline check in
+# _fetch_catalog_page. Future hardening: a full async wire wrapped in
+# asyncio.timeout(_CATALOG_TOTAL_BUDGET) would give a single truly-cancellable
+# total bound that also covers the connect/TLS phase.
+_CATALOG_CONNECT_TIMEOUT = 5.0        # seconds, connect/write/pool phase cap
+_CATALOG_READ_TIMEOUT = 10.0          # seconds, wait-for-next-chunk cap
+_CATALOG_MAX_PAGES = 10
+_CATALOG_MAX_MODELS = 2000
+_CATALOG_MAX_BODY_BYTES = 5_000_000   # decompressed bytes, summed across pages
+_CATALOG_MAX_ID_LEN = 160
+
+_CATALOG_BEARER_PROVIDERS = {"openai", "openrouter", "deepseek", "openai_compatible"}
+_CATALOG_SUPPORTED_PROVIDERS = {
+    "openai", "openrouter", "anthropic", "bedrock", "gemini",
+    "deepseek", "openai_compatible",
+}
+
+
+def validate_catalog_target(provider: str, base_url: str = "") -> tuple[str, str]:
+    """Validate provider + base_url for the catalog path (no model required).
+
+    Mirrors ``validate_config``'s provider allowlist and URL-scheme rule
+    (``https://`` or local ``http://127.0.0.1`` only) minus the model check, so
+    the catalog endpoint is not a looser server-side egress than save/test. An
+    UNKNOWN provider raises — the caller must surface an error, never silently
+    treat it as "catalog unsupported". Returns the normalized ``(provider,
+    base_url)`` with the provider default filled in when blank.
+    """
+    provider = normalize_provider(provider)
+    base_url = (base_url or "").strip().rstrip("/")
+    if provider not in _CATALOG_SUPPORTED_PROVIDERS:
+        raise ProviderError(
+            "provider must be openai, openrouter, anthropic, bedrock, gemini, "
+            "deepseek, or openai_compatible"
+        )
+    if provider == "openai_compatible" and not base_url:
+        raise ProviderError("base_url required for openai_compatible")
+    if base_url:
+        _validate_egress_url(base_url)
+    if not base_url:
+        base_url = default_base_url(provider)
+    if not base_url:
+        raise ProviderError("base_url unavailable for provider")
+    return provider, base_url
+
+
+_CATALOG_LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
+
+
+def _validate_egress_url(base_url: str) -> None:
+    """Reject any egress target that isn't ``https://`` or an EXACT loopback
+    ``http://`` host — parsed with ``urlsplit``, never ``startswith``.
+
+    A ``startswith("http://127.0.0.1")`` prefix check is forgeable: both
+    ``http://127.0.0.1.evil.example`` (real host ``evil.example``) and
+    ``http://127.0.0.1@evil.example`` (userinfo ``127.0.0.1``, real host
+    ``evil.example``) pass a prefix check and would send the provider key in
+    plaintext to the attacker. urlsplit resolves the true ``hostname`` and lets
+    us forbid userinfo outright.
+    """
+    parts = urlsplit(base_url)
+    scheme = parts.scheme.lower()
+    if scheme not in ("https", "http"):
+        raise ProviderError("base_url must be https:// or local http://127.0.0.1")
+    # Forbid userinfo: "http://127.0.0.1@evil.example" hides the real host after
+    # the '@'. Reject on any credential component or a stray '@' in netloc.
+    if parts.username or parts.password or "@" in (parts.netloc or ""):
+        raise ProviderError("base_url must be https:// or local http://127.0.0.1")
+    if scheme == "http":
+        host = (parts.hostname or "").lower()
+        if host not in _CATALOG_LOOPBACK_HOSTS:
+            raise ProviderError("base_url must be https:// or local http://127.0.0.1")
+
+
+def _catalog_request(provider: str, api_key: str, base_url: str,
+                     cursor: str | None) -> tuple[str, dict, dict]:
+    provider = normalize_provider(provider)
+    base = (base_url or default_base_url(provider)).rstrip("/")
+    if provider == "bedrock":
+        raise ProviderError("model_catalog_unsupported")
+    url = f"{base}/models"
+    params: dict = {}
+    if provider in _CATALOG_BEARER_PROVIDERS:
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        if provider == "openrouter":
+            headers["HTTP-Referer"] = "https://feedling.app"
+            headers["X-Title"] = "Feedling IO Hosted Runtime"
+            # OpenRouter's /models defaults to text-output models only. Ask for
+            # the full multimodal catalog — the product decision is "show all,
+            # no modality filtering". Verified live 2026-07-26: the param
+            # returns HTTP 200 with a superset (449 vs 345 models).
+            params["output_modalities"] = "all"
+    elif provider == "anthropic":
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                   "Content-Type": "application/json"}
+        params["limit"] = 1000
+        if cursor:
+            params["after_id"] = cursor
+    elif provider == "gemini":
+        headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+        params["pageSize"] = 1000
+        if cursor:
+            params["pageToken"] = cursor
+    else:
+        raise ProviderError("model_catalog_unsupported")
+    return url, headers, params
+
+
+def _parse_catalog_page(provider: str, body: Any) -> tuple[list[dict], str | None]:
+    """Strictly parse one catalog page → ``(models, next_cursor)``.
+
+    Strictness rules (a permissive parser would mislabel garbage as an empty
+    catalog and 500 on non-object members):
+    - root must be a dict carrying the expected array (``models`` for gemini,
+      else ``data``). Missing/renamed array (``{}``, ``{"error": ...}``) is an
+      ``model_catalog_invalid_response`` — NOT an empty success. A PRESENT empty
+      list IS a legitimate empty catalog.
+    - each array member must be a dict; non-object members are skipped, never
+      allowed to raise ``AttributeError`` → 500.
+    - id must be a non-empty ``str`` ≤ 160 chars.
+    - anthropic ``has_more=true`` with a missing/blank ``last_id`` is treated as
+      truncated/invalid (raise), never signalled as a complete page.
+    """
+    provider = normalize_provider(provider)
+    if not isinstance(body, dict):
+        raise ProviderError("model_catalog_invalid_response")
+
+    array_key = "models" if provider == "gemini" else "data"
+    raw = body.get(array_key)
+    if not isinstance(raw, list):
+        raise ProviderError("model_catalog_invalid_response")
+
+    out: list[dict] = []
+    for m in raw:
+        if not isinstance(m, dict):
+            continue
+        if provider == "gemini":
+            name = m.get("name")
+            if not isinstance(name, str):
+                continue
+            mid = name.split("/", 1)[1] if name.startswith("models/") else name
+            disp = m.get("displayName")
+        else:
+            mid = m.get("id")
+            if not isinstance(mid, str):
+                continue
+            disp = m.get("display_name") or m.get("name")
+        mid = mid.strip()
+        if not mid or len(mid) > _CATALOG_MAX_ID_LEN:
+            continue
+        display = disp if isinstance(disp, str) and disp else mid
+        out.append({"id": mid, "display_name": display})
+
+    nxt: str | None = None
+    if provider == "gemini":
+        tok = body.get("nextPageToken")
+        nxt = tok if isinstance(tok, str) and tok else None
+    elif provider == "anthropic" and body.get("has_more"):
+        last = body.get("last_id")
+        if isinstance(last, str) and last:
+            nxt = last
+        else:
+            raise ProviderError("model_catalog_invalid_response")
+    return out, nxt
+
+
+def _fetch_catalog_page(client: httpx.Client, url: str, headers: dict,
+                        params: dict, deadline: float,
+                        bytes_so_far: int) -> tuple[dict, int]:
+    """Stream one page, enforcing the byte cap AND the wall-clock deadline.
+
+    ``deadline`` is an absolute ``time.monotonic()`` instant shared across all
+    pages. Per-phase httpx timeouts (see the constants above) bound the connect/
+    header phases and the wait for the next chunk; the total-time bound is
+    enforced by re-checking ``time.monotonic()`` inside the chunk loop, because
+    httpx's read timeout does NOT bound total response duration — a slow-drip
+    endpoint could otherwise hold the sync threadpool far past the budget.
+
+    Returns ``(parsed_json_dict, new_running_byte_total)``. Raises
+    ``ProviderError`` on http>=400 (carrying ``status_code``), network failure
+    (``status_code=None``), the size cap, the deadline, non-JSON, or a non-dict
+    root. The caller decides first-page (raise) vs later-page (partial) handling.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProviderError("provider network error: DeadlineExceeded")
+    # Cap each phase by the smaller of its own budget and the whole remaining
+    # wall-clock, so connect/TLS/header can never themselves outlast the budget.
+    timeout = httpx.Timeout(
+        connect=min(_CATALOG_CONNECT_TIMEOUT, remaining),
+        read=min(_CATALOG_READ_TIMEOUT, remaining),
+        write=min(_CATALOG_CONNECT_TIMEOUT, remaining),
+        pool=min(_CATALOG_CONNECT_TIMEOUT, remaining),
+    )
+    chunks: list[bytes] = []
+    total = bytes_so_far
+    try:
+        with client.stream("GET", url, headers=headers, params=params,
+                           timeout=timeout) as resp:
+            status = resp.status_code
+            if status >= 400:
+                raise ProviderError(f"provider_http_{status}", status_code=status)
+            for chunk in resp.iter_bytes():
+                if time.monotonic() >= deadline:
+                    # Slow-drip past the wall-clock budget: stop reading now and
+                    # treat as a deadline hit. status_code=None → the caller /
+                    # slug mapper classifies this as temporarily_unavailable, and
+                    # a later page keeps whatever was already collected (partial).
+                    raise ProviderError("provider network error: DeadlineExceeded")
+                total += len(chunk)
+                if total > _CATALOG_MAX_BODY_BYTES:
+                    raise ProviderError("model_catalog_invalid_response")
+                chunks.append(chunk)
+    except ProviderError:
+        raise
+    except httpx.HTTPError as e:
+        raise ProviderError(f"provider network error: {type(e).__name__}") from e
+    try:
+        body = json.loads(b"".join(chunks))
+    except Exception as e:
+        raise ProviderError("model_catalog_invalid_response") from e
+    if not isinstance(body, dict):
+        raise ProviderError("model_catalog_invalid_response")
+    return body, total
+
+
+def list_provider_models(provider: str, api_key: str, base_url: str = "") -> dict:
+    provider = normalize_provider(provider)
+    warnings: list[str] = []
+    try:
+        _catalog_request(provider, api_key, base_url, None)
+    except ProviderError as e:
+        if "model_catalog_unsupported" in str(e):
+            return {"models": [], "complete": True, "warnings": [],
+                    "catalog_supported": False}
+        raise
+
+    seen: set[str] = set()
+    seen_cursors: set[str] = set()
+    models: list[dict] = []
+    cursor: str | None = None
+    complete = True
+    total_bytes = 0
+    deadline = time.monotonic() + _CATALOG_TOTAL_BUDGET
+    client = _http_client()
+
+    for _page in range(_CATALOG_MAX_PAGES):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            complete = False
+            warnings.append("model list truncated: time budget exceeded")
+            break
+        url, headers, params = _catalog_request(provider, api_key, base_url, cursor)
+        try:
+            body, total_bytes = _fetch_catalog_page(
+                client, url, headers, params, deadline, total_bytes)
+            page_models, next_cursor = _parse_catalog_page(provider, body)
+        except ProviderError as e:
+            if _page == 0:
+                # FIRST fetch failed — key on the page index, NOT on model count.
+                # A legitimately-empty first page that carries a next cursor,
+                # followed by a later-page failure, must NOT be treated as a
+                # first-page failure just because zero models were collected.
+                # A 404 on a custom endpoint just means "no /models route" → let
+                # the client fall back to manual entry, don't error.
+                if (provider == "openai_compatible"
+                        and getattr(e, "status_code", None) == 404):
+                    return {"models": [], "complete": True, "warnings": [],
+                            "catalog_supported": False}
+                raise
+            # A LATER page failed (network / http / size / bad shape / deadline):
+            # partial success — keep whatever earlier pages returned (possibly an
+            # empty set) and mark incomplete, regardless of model count.
+            complete = False
+            warnings.append(f"catalog page dropped: {e}")
+            break
+
+        cap_hit = False
+        for idx, m in enumerate(page_models):
+            mid = m["id"]
+            if mid in seen:
+                continue
+            seen.add(mid)
+            models.append(m)
+            if len(models) >= _CATALOG_MAX_MODELS:
+                # Only truncated if there is GENUINELY more to consume: members
+                # left on this page, or a next cursor. Hitting the cap exactly on
+                # the last member of the last page is a COMPLETE catalog.
+                if page_models[idx + 1:] or next_cursor:
+                    complete = False
+                    warnings.append("model list truncated: model cap reached")
+                cap_hit = True
+                break
+        if cap_hit:
+            break
+
+        cursor = next_cursor
+        if not cursor:
+            break
+        if cursor in seen_cursors:
+            # Provider handed back a cursor we already followed → would loop.
+            complete = False
+            warnings.append("model list truncated: repeated pagination cursor")
+            break
+        seen_cursors.add(cursor)
+    else:
+        # Ran the full page range with a cursor still outstanding.
+        if cursor:
+            complete = False
+            warnings.append("model list truncated: page cap reached")
+
+    return {"models": models, "complete": complete, "warnings": warnings,
+            "catalog_supported": True}
+
+
+def model_catalog_error_slug(exc: BaseException) -> str:
+    """Map a catalog ``ProviderError`` to a stable client-facing slug.
+
+    Deliberately narrow about "auth_failed": only a real 401 says "your key was
+    rejected". 402/403/451 are access/policy problems, 429 is rate limiting,
+    timeouts and every 5xx are transient, and every other 4xx (400/404/409/422…)
+    is a rejected/malformed exchange — NOT an excuse to tell the user to swap
+    their key. (404 on openai_compatible never reaches here — the orchestrator
+    already turns it into ``catalog_supported:false``.)
+    """
+    msg = str(exc)
+    if "model_catalog_unsupported" in msg:
+        return "model_catalog_unsupported"
+    if "model_catalog_invalid_response" in msg:
+        return "model_catalog_invalid_response"
+    sc = getattr(exc, "status_code", None)
+    if sc == 401:
+        return "model_catalog_auth_failed"
+    if sc in {402, 403, 451}:
+        return "model_catalog_access_denied"
+    if sc == 429:
+        return "model_catalog_rate_limited"
+    if sc in {408, 425} or sc is None or (isinstance(sc, int) and 500 <= sc <= 599):
+        return "model_catalog_temporarily_unavailable"
+    return "model_catalog_invalid_response"
 
 
 def test_provider_key(config: ProviderConfig) -> dict[str, Any]:

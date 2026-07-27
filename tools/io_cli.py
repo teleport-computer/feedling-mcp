@@ -703,8 +703,9 @@ def _identity_write_payload_v2(ns) -> dict | None:
 
     # relationship_days:重新校准"和用户认识/相处多少天"。days_with_user 是服务端从
     # 关系起始锚点现算的派生值,不是普通字符串字段,所以单独处理:塞进同一个
-    # profile_patch,服务端把锚点挪到 today - N(见
-    # backend/identity/actions.py::_resolve_relationship_anchor)。报错前置:非负整数,
+    # profile_patch。relationship_days 是用户看到的 1-based「第 N 天」,服务端把锚点挪到
+    # today - (N-1)(第1天=今天认识;见 backend/identity/actions.py::_resolve_relationship_anchor)。
+    # 报错前置:非负整数,
     # 服务端 card_policy 也会拦(relationship_days_must_be_non_negative_int /
     # relationship_days_out_of_range),这里先给个清晰的本地错、不打服务端。
     rel_days = getattr(ns, "relationship_days", None)
@@ -712,7 +713,7 @@ def _identity_write_payload_v2(ns) -> dict | None:
         if rel_days < 0:
             raise _IdentityWritePrecheckError({
                 "ok": False, "error": "relationship_days_must_be_non_negative_int",
-                "hint": "相处天数必须是非负整数(0 = 今天刚认识)",
+                "hint": "相处天数必须是非负整数;传用户看到的第 N 天(第 1 天 = 今天刚认识)",
             })
         patch["relationship_days"] = rel_days
 
@@ -1564,7 +1565,9 @@ def main():
             "  相处天数: --relationship-days N 重新校准显示的相处天数。N 是【用户看到/说出的\n"
             "    那个数】——app 里的\"第 N 天\"(认识当天=第 1 天,不是第 0 天)。用户说\"改成\n"
             "    第45天/相处45天\"就传 45,app 就显示 45。服务端内部存 elapsed(=N-1)、iOS 显示\n"
-            "    时 +1,你只管传用户说的数。仅用户明确要求时改;超上限服务端拦下。\n"
+            "    时 +1,你只管传用户说的数。天数虽自动按锚点每天递增,但这条命令就是校准它的\n"
+            "    正路——别告诉用户\"自动算的、我改不了\",也别只往别的字段写文字假装改了。\n"
+            "    仅用户明确要求时改;超上限服务端拦下。\n"
             "  list 三操作: 每个 list 字段(signature/boundary/do-not-say/\n"
             "    stable-definition)一次调用只能用一种操作——legacy 整体赋值(仅\n"
             "    --signature 保留)/ --add-* / --remove-* / --replace-* 四选一,混用报错。\n"

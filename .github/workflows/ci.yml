@@ -169,6 +169,8 @@ jobs:
             tests/test_runtime_v2_default_flag.py \
             tests/test_capture_prompt_v1.py \
             tests/test_dream_prompt_v1.py \
+            tests/test_card_text_gate.py \
+            tests/test_card_user_referent.py \
             tests/test_pi_mcp_bridge.py \
             -v
 
@@ -214,6 +216,7 @@ jobs:
             tests/test_user_mcp_routes.py \
             tests/test_v2_prompt_cache_key.py \
             tests/test_v2_prompt_frontier.py \
+            tests/test_v2_adaptive_tail.py \
             tests/test_v2_metrics_endpoint.py \
             tests/test_prod_runner_fleet_gate.py \
             tests/test_v2_turn_metrics.py \
@@ -234,9 +237,15 @@ jobs:
             tests/test_v2_tool_loop_mcp.py \
             tests/test_v2_worker_mcp.py \
             tests/test_v2_worker_tool_loop.py \
+            tests/test_v2_wake_worker.py \
+            tests/test_v2_wake_schedule.py \
+            tests/test_v2_scheduled_due.py \
             tests/test_v2_atomic_reply_cursor.py \
             tests/test_v2_effect_outbox.py \
             tests/test_v2_watchdog.py \
+            tests/test_v2_extraction.py \
+            tests/test_v2_extraction_lanes.py \
+            tests/test_v2_extraction_memory_integration.py \
             -v
 
   # -------------------------------------------------------------------------

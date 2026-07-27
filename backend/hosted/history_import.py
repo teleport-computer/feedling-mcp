@@ -1022,7 +1022,27 @@ _IMPORT_SUPPORT_SOURCES = {
 }
 
 
+# 蒸馏转写里的说话人标签。刻意是常量、不查名字 —— 蒸馏时名字按定义还不存在。
+# 「The person」而不是「User」:后者正是被模型抄进卡里变成「用户」的那个词。
+IMPORT_TRANSCRIPT_PERSON_LABEL = "The person"
+IMPORT_TRANSCRIPT_AGENT_LABEL = "Assistant"
+
+
 def _format_import_message_line(msg: dict) -> str:
+    """One transcript line for the distillation prompts.
+
+    ⚠️ The speaker label must never be the literal ``User``. That prefix is what
+    teaches extraction models to write 「用户」 into the person's own visible
+    memory cards — diagnosed 2026-07-17 (usr_fee1), fixed then only in the
+    resident consumer, and found still open in hosted Capture/Dream on
+    2026-07-26. This import path was the last one left: the prompt right above
+    the transcript forbids the word while the transcript below repeats it on
+    every line.
+
+    Distillation is also the one place where the name genuinely does not exist
+    yet — deriving it is the point — so this deliberately uses a **stable
+    neutral label** rather than looking a name up (codex 2026-07-26 handoff).
+    """
     source = _import_source_family(str(msg.get("source") or msg.get("source_family") or ""))
     if source == _AI_PERSONA_SOURCE:
         role = "AI Persona material"
@@ -1033,7 +1053,11 @@ def _format_import_message_line(msg: dict) -> str:
     elif source == _FRESH_START_SOURCE:
         role = "Fresh start"
     else:
-        role = "User" if msg.get("role") == "user" else "Assistant"
+        role = (
+            IMPORT_TRANSCRIPT_PERSON_LABEL
+            if msg.get("role") == "user"
+            else IMPORT_TRANSCRIPT_AGENT_LABEL
+        )
     at = ""
     try:
         if msg.get("ts"):
