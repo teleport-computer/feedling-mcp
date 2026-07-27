@@ -129,3 +129,85 @@ def test_recent_runtime_health_is_empty_without_history():
     health = jobs_store.recent_runtime_health()
     assert health["lanes"] == []
     assert health["window_hours"] == 24
+
+
+def test_recent_runtime_health_latency_ignores_failed_turns():
+    # 只算成功回合：一批失败超时回合不得把 p95 拉高，否则一个故障会同时点亮
+    # 「失败率」和「延迟」两盏灯，值班时看起来像两个独立故障。
+    ok_job = _add_job("u_rh_lat_ok", "chat", "completed")
+    bad_job = _add_job("u_rh_lat_bad", "chat", "failed")
+    jobs_store.record_whole_turn_metric(
+        ok_job, "u_rh_lat_ok", "chat",
+        prompt_tokens=10, completion_tokens=5, latency_ms=20_000,
+        model_calls=1, retries=0, failed=False, status="ok",
+    )
+    jobs_store.record_whole_turn_metric(
+        bad_job, "u_rh_lat_bad", "chat",
+        prompt_tokens=None, completion_tokens=None, latency_ms=550_000,
+        model_calls=1, retries=0, failed=True,
+        status="turn_failed:providererror",
+    )
+
+    lanes = {r["lane"]: r for r in jobs_store.recent_runtime_health()["lanes"]}
+
+    assert lanes["chat"]["p95_ok_ms"] == pytest.approx(20_000)
+    assert lanes["chat"]["p50_ok_ms"] == pytest.approx(20_000)
+
+
+def test_recent_runtime_health_latency_is_none_without_successful_turns():
+    bad_job = _add_job("u_rh_lat_none", "chat", "failed")
+    jobs_store.record_whole_turn_metric(
+        bad_job, "u_rh_lat_none", "chat",
+        prompt_tokens=None, completion_tokens=None, latency_ms=99_000,
+        model_calls=1, retries=0, failed=True,
+        status="turn_failed:responder_error",
+    )
+
+    lanes = {r["lane"]: r for r in jobs_store.recent_runtime_health()["lanes"]}
+
+    # 无成功样本 → None（页面显 N/A），绝不能拿失败回合的延迟冒充
+    assert lanes["chat"]["p95_ok_ms"] is None
+    assert lanes["chat"]["p50_ok_ms"] is None
+
+
+def test_recent_runtime_health_counts_missing_capture_from_jobs():
+    # 有终态 job 但没有 trajectory 流 → missing，必须从 agent_jobs 起算才看得见
+    _add_job("u_rh_cap_missing", "chat", "completed")
+
+    lanes = {r["lane"]: r for r in jobs_store.recent_runtime_health()["lanes"]}
+
+    assert lanes["chat"]["capture"]["missing"] == 1
+    assert lanes["chat"]["capture"]["complete"] == 0
+
+
+def test_recent_runtime_health_top_failures_are_enumerated_codes():
+    _add_job("u_rh_tf_1", "chat", "failed", last_error="turn_failed:providererror")
+    _add_job("u_rh_tf_2", "chat", "failed", last_error="turn_failed:providererror")
+    _add_job("u_rh_tf_3", "chat", "failed", last_error="turn_failed:responder_error")
+
+    lanes = {r["lane"]: r for r in jobs_store.recent_runtime_health()["lanes"]}
+    top = lanes["chat"]["top_failures"]
+
+    assert top[0] == {"code": "turn_failed:providererror", "count": 2}
+    assert {"code": "turn_failed:responder_error", "count": 1} in top
+
+
+def test_recent_runtime_health_reports_pool_and_pending_age():
+    _add_job("u_rh_pool_pending", "chat", "pending", age_hours=1)
+
+    pool = jobs_store.recent_runtime_health()["pool"]
+
+    assert pool["pending"] == 1
+    assert pool["oldest_pending_age_sec"] >= 3_500  # ~1h
+    assert pool["inflight"] >= 1
+    assert pool["live_workers"] >= 0
+    assert pool["capacity"] >= 0
+
+
+def test_recent_runtime_health_pool_pending_age_is_none_when_idle():
+    _add_job("u_rh_pool_idle", "chat", "completed")
+
+    pool = jobs_store.recent_runtime_health()["pool"]
+
+    assert pool["pending"] == 0
+    assert pool["oldest_pending_age_sec"] is None

@@ -3530,10 +3530,12 @@ def recent_runtime_health(
 
     分母刻意从 ``agent_jobs`` 起算而非从 metrics/trajectory 起算：一次完全漏写
     若同时消失于分子和分母，就会报出虚假健康的机群。``superseded`` 单列、不进
-    失败率——运行时代际切换不是故障，混进去会稀释真实失败率。
+    失败率——运行时代际切换不是故障。延迟分位数只取成功回合（``failed IS NOT
+    TRUE``）：失败超时回合会把 p95 拉到与故障同源的高位，让一个故障看起来像两个。
     """
     safe_hours = max(1, min(int(within_hours), 24 * 30))
     safe_limit = max(1, min(int(limit), 1000))
+    terminal_statuses = ("completed", "failed", "expired", "superseded")
 
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -3557,14 +3559,102 @@ def recent_runtime_health(
             )
             outcome_rows = cur.fetchall()
 
+            cur.execute(
+                "WITH recent AS ("
+                "  SELECT lane,latency_ms FROM v2_turn_metrics "
+                "  WHERE failed IS NOT TRUE AND latency_ms IS NOT NULL "
+                "    AND latency_ms >= 0 "
+                "    AND created_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY created_at DESC,id DESC LIMIT %s"
+                ") SELECT lane,"
+                "  percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms) AS p50_ms,"
+                "  percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms "
+                "FROM recent GROUP BY lane",
+                (safe_hours, safe_limit),
+            )
+            latency_rows = cur.fetchall()
+
+            cur.execute(
+                "WITH recent_jobs AS ("
+                "  SELECT id,lane,status FROM agent_jobs "
+                "  WHERE created_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY id DESC LIMIT %s"
+                "), classified AS ("
+                "  SELECT job.lane,"
+                "    CASE "
+                "      WHEN stream.job_id IS NULL "
+                "        AND job.status=ANY(%s::text[]) THEN 'missing' "
+                "      WHEN stream.job_id IS NULL THEN 'open' "
+                "      WHEN EXISTS (SELECT 1 FROM v2_trajectory_events gap "
+                "        WHERE gap.job_id=job.id "
+                "          AND gap.event_kind='capture_gap') THEN 'partial' "
+                "      WHEN EXISTS (SELECT 1 FROM v2_trajectory_events terminal "
+                "        WHERE terminal.job_id=job.id "
+                "          AND terminal.event_kind='turn_terminal') THEN 'complete' "
+                "      WHEN job.status=ANY(%s::text[]) THEN 'partial' "
+                "      ELSE 'open' "
+                "    END AS capture_status "
+                "  FROM recent_jobs job "
+                "  LEFT JOIN v2_trajectory_streams stream ON stream.job_id=job.id"
+                ") SELECT lane,"
+                "  COUNT(*) FILTER (WHERE capture_status='complete')::int AS complete,"
+                "  COUNT(*) FILTER (WHERE capture_status='partial')::int AS partial,"
+                "  COUNT(*) FILTER (WHERE capture_status='missing')::int AS missing,"
+                "  COUNT(*) FILTER (WHERE capture_status='open')::int AS open "
+                "FROM classified GROUP BY lane",
+                (
+                    safe_hours,
+                    safe_limit,
+                    list(terminal_statuses),
+                    list(terminal_statuses),
+                ),
+            )
+            capture_rows = cur.fetchall()
+
+            cur.execute(
+                "WITH recent AS ("
+                "  SELECT lane,last_error FROM agent_jobs "
+                "  WHERE status IN ('failed','expired') AND last_error IS NOT NULL "
+                "    AND finished_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY finished_at DESC,id DESC LIMIT %s"
+                ") SELECT lane,last_error,COUNT(*)::int AS count "
+                "FROM recent GROUP BY lane,last_error ORDER BY count DESC",
+                (safe_hours, safe_limit),
+            )
+            failure_rows = cur.fetchall()
+
+            cur.execute(
+                "SELECT COUNT(*)::int AS pending,"
+                "  EXTRACT(EPOCH FROM "
+                "    (clock_timestamp()-MIN(created_at))) AS oldest_pending_age_sec "
+                "FROM agent_jobs WHERE status='pending'"
+            )
+            pending_row = cur.fetchone()
+
+    latency_by_lane = {str(row["lane"] or ""): row for row in latency_rows}
+    capture_by_lane = {str(row["lane"] or ""): row for row in capture_rows}
+    failures_by_lane: dict[str, list[dict]] = {}
+    for row in failure_rows:
+        failures_by_lane.setdefault(str(row["lane"] or ""), []).append({
+            "code": str(row["last_error"] or ""),
+            "count": int(row["count"] or 0),
+        })
+
+    def _optional_ms(row, key):
+        if row is None or row.get(key) is None:
+            return None
+        return float(row[key])
+
     lanes = []
     for row in outcome_rows:
+        lane = str(row["lane"] or "unknown")
         completed = int(row["completed"] or 0)
         failed = int(row["failed"] or 0)
         expired = int(row["expired"] or 0)
         resolved = completed + failed + expired
+        capture = capture_by_lane.get(lane)
         lanes.append({
-            "lane": str(row["lane"] or "unknown"),
+            "lane": lane,
             "sampled_jobs": resolved,
             "completed": completed,
             "failed": failed,
@@ -3575,13 +3665,34 @@ def recent_runtime_health(
             "failure_rate": (
                 float(failed + expired) / float(resolved) if resolved else None
             ),
+            "p50_ok_ms": _optional_ms(latency_by_lane.get(lane), "p50_ms"),
+            "p95_ok_ms": _optional_ms(latency_by_lane.get(lane), "p95_ms"),
+            "capture": {
+                "complete": int((capture or {}).get("complete") or 0),
+                "partial": int((capture or {}).get("partial") or 0),
+                "missing": int((capture or {}).get("missing") or 0),
+                "open": int((capture or {}).get("open") or 0),
+            },
+            "top_failures": failures_by_lane.get(lane, [])[:5],
         })
 
     lanes.sort(key=lambda item: (item["sampled_jobs"], item["lane"]), reverse=True)
+    oldest_pending = (
+        pending_row.get("oldest_pending_age_sec") if pending_row else None
+    )
     return {
         "window_hours": safe_hours,
         "generated_at": time.time(),
         "lanes": lanes,
+        "pool": {
+            "inflight": inflight_job_count(),
+            "pending": int((pending_row or {}).get("pending") or 0),
+            "live_workers": live_worker_count(),
+            "capacity": live_worker_capacity(),
+            "oldest_pending_age_sec": (
+                float(oldest_pending) if oldest_pending is not None else None
+            ),
+        },
     }
 
 
