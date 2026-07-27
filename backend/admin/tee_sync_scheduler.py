@@ -47,6 +47,26 @@ def _ciphertext_tables() -> tuple[str, ...]:
         set(reg.tables_in_lane(reg.CIPHERTEXT)) | set(reg.PSEUDO_CIPHERTEXT_TABLES)
     ))
 
+
+def _replicable_tables() -> tuple[str, ...]:
+    """本 tick 真正要 replicate 的表 = 调度清单 ∩ worker 已配置的表。
+
+    取交集而不是直接用 _ciphertext_tables()：注册表可能已经把某张表登记为 CIPHERTEXT，
+    而 tee_replicator.worker._TABLES 里还没有它的复制配置（跨 Task 的中间态，或有人
+    先登记后接线）。直接调过去会让 tee_replication._validate 抛
+    BadRequest("unknown_table")，被兜底 except 吞掉后计入 replicate_table_failures
+    并触发指数退避（封顶 1 小时）——每个 tick 白报错一次，既污染失败率指标，又让
+    "真失败"和"还没接线"在指标里混成一团。
+
+    取了交集之后，未接线的表被静默跳过、接线后自动被吸收，不需要任何跨 Task 的部署
+    时序协调（否则就得靠"某某 Task 完成前不要部署"这种人工记忆——本仓库已经有多次
+    "改完忘了部署/提交"的前科）。反向守卫 test_scheduler_covers_every_worker_table
+    的语义不受影响：它管的是"worker 配了的表调度器不能漏"，方向相反。
+    """
+    from tee_replicator import worker as tee_worker
+
+    return tuple(t for t in _ciphertext_tables() if t in tee_worker._TABLES)
+
 # 首个 tick 的启动延迟（秒）：短于常规间隔，让父表回填尽快发生（见 _loop）。
 _FIRST_DELAY = 30.0
 
@@ -181,7 +201,7 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
         log.warning("[tee-sync] snapshot 失败: %s", e)
 
     # (2) replicate 密文子表在后 —— 父表已在，不再 FK 失败。
-    for table in _ciphertext_tables():
+    for table in _replicable_tables():
         fails, retry_at = _table_backoff.get(table, (0, 0.0))
         if retry_at > time.monotonic():
             # 连败退避中 → 本 tick 跳过这张表（其余表照常），到点自动恢复重试。

@@ -124,8 +124,22 @@ def run_action(
         elif action == "snapshot":
             from tee_shadow import snapshot as tee_snapshot
 
-            report = (tee_snapshot.snapshot_all() if table is None
-                      else {"tables": [tee_snapshot.snapshot_table(table)]})
+            if dry_run:
+                # dry-run 短路，与 _run_reconcile 同款：只回计划、绝不碰 TEE。
+                #
+                # ⚠️ 这条分支是**安全必需**，不是锦上添花。confirm 门的条件是
+                # `action != "verify" and not dry_run and confirm != "MIGRATE"`——
+                # 也就是说 dry_run=True 时**根本不检查 confirm**。而 HTTP 端点
+                # `POST /v1/admin/tee-replication/run`（routes_asgi.py:286）是
+                # `dry_run=payload.get("dry_run", True)`，默认 True。
+                # 少了这条短路，一个 `{"action": "snapshot"}` 的探测请求（admin 按
+                # reconcile/replicate 的既有习惯，会以为这是安全的演练）就会直接对
+                # TEE 侧 25 张表做真实 TRUNCATE+COPY，且绕过全部确认门。
+                tables = list(tee_snapshot.snapshot_order()) if table is None else [table]
+                report = {"planned": tables, "tables": [], "copied": 0, "failures": 0}
+            else:
+                report = (tee_snapshot.snapshot_all() if table is None
+                          else {"tables": [tee_snapshot.snapshot_table(table)]})
         else:
             report = _run_verify(sample_rate=sample_rate)
     finally:
