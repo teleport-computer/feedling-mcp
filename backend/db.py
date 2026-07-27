@@ -6702,6 +6702,7 @@ def chat_append_effect_with_cursor(
     *,
     connection=None,
     defer_post_commit: bool = False,
+    require_cursor_advance: bool = False,
 ):
     """Atomically persist one deterministic V2 reply and optionally advance its cursor.
 
@@ -6716,6 +6717,10 @@ def chat_append_effect_with_cursor(
     ``defer_post_commit`` returns a thunk for R2/mirror work; callers must invoke
     it only after that outer commit.  The default wrapper behavior is unchanged.
 
+    ``require_cursor_advance`` is reserved for delayed terminal-failure
+    delivery. It suppresses the candidate atomically when a newer terminal
+    reply already advanced the cursor through the captured failure frontier.
+
     Returns ``(seq, inserted)`` by default, or
     ``(seq, inserted, post_commit)`` when ``defer_post_commit`` is true. A
     replay returns the existing seq and still monotonically advances a terminal
@@ -6729,6 +6734,10 @@ def chat_append_effect_with_cursor(
     )
     if cursor_seq is not None and cursor_seq < 0:
         raise ValueError("reply_through_seq must be >= 0")
+    if require_cursor_advance and cursor_seq is None:
+        raise ValueError(
+            "require_cursor_advance requires a terminal reply cursor"
+        )
 
     effect_doc = _normalize_chat_body_doc(doc)
     replied_user_ids: list[str] = []
@@ -6792,6 +6801,10 @@ def chat_append_effect_with_cursor(
                     if not raw_previous_cursor.isdigit():
                         raise RuntimeError("invalid persisted V2 reply cursor")
                     previous_cursor = int(raw_previous_cursor)
+                    if require_cursor_advance and cursor_seq <= previous_cursor:
+                        if defer_post_commit:
+                            return 0, False, lambda: None
+                        return 0, False
                 storage_generation = _lock_chat_r2_lifecycle_on_cursor(
                     cur, user_id,
                 )

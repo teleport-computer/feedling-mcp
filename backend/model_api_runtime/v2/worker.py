@@ -968,6 +968,51 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
     return f"{scope}:{kind}"[:120]
 
 
+def _turn_failure_error_class(exc: BaseException) -> str:
+    """Classify V2 foreground failures through the shared notice catalog."""
+    if isinstance(exc, v2_prompt_frontier.PromptFrontierExhausted):
+        # An unaudited default is our conservative local ceiling, not the
+        # provider's model limit. Never blame the user or tell them to shorten
+        # a conversation when our fallback budget caused the rejection.
+        if exc.limit_source == "unaudited_default":
+            return "unknown"
+        return "context_overflow"
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "turn_timeout"
+    if isinstance(exc, TurnError) and str(exc) in {
+        "degenerate_reply_suppressed",
+        "empty_reply",
+    }:
+        return "reply_parse_failed"
+    if isinstance(exc, TurnError) and (
+        str(exc) == _COVERAGE_INCOMPLETE
+        or str(exc).startswith(f"{_COVERAGE_INCOMPLETE}:")
+    ):
+        # Compaction validation is our own coverage invariant. Its content-free
+        # reject suffix is diagnostic, never evidence of a provider/user fault.
+        return "unknown"
+
+    classified = notices_catalog.classify_upstream(str(exc))
+    if classified:
+        return classified
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 402:
+        return "quota_insufficient"
+    if status_code in {401, 403}:
+        return "auth_invalid"
+    if status_code in {400, 422}:
+        return "provider_incompatible"
+    if status_code == 408:
+        return "turn_timeout"
+    if status_code == 429:
+        return "rate_limited"
+    if isinstance(status_code, int) and 500 <= status_code <= 599:
+        return "upstream_unavailable"
+    if provider_client.classify_provider_error(exc) == "transient":
+        return "upstream_unavailable"
+    return "unknown"
+
+
 def _required_file_missing_fallback(messages: list[dict]) -> str:
     user_text = "\n".join(
         context.text_of(message.get("content"))
@@ -7593,7 +7638,8 @@ async def process_job(
     api_key/runtime_token 是 enclave-auth 的两套凭证，只喂 capability 侧（预取 + executor
     的 tool_call 派发），从不流向 provider 的 LLM 调用。
 
-    返回终态字符串（"completed"/"failed"），任一步失败 → mark_failed（绝不写占位气泡）。
+    返回终态字符串（"completed"/"failed"）。Chat 失败由 durable terminal outbox
+    发布归责后的加密失败气泡；后台 lane 仍然静默。
 
     `tm`（spec B5，可选）：`_run_turn` 创建的这个 job 的 `TurnMetrics` whole-turn 累加器；
     None 时（既有直调 `process_job` 的单测、未经 `_run_turn`）就地新建一个，本函数自己
@@ -8594,7 +8640,8 @@ async def process_job(
                 # BUG-4 no-filler: chat lane always replies — an empty terminal
                 # text is a model/provider failure here (unlike wake, where
                 # silence is legitimate), so this becomes a mark_failed via the
-                # outer except below, never a placeholder bubble.
+                # outer except below. The terminal outbox, not the model loop,
+                # owns the attributed failure bubble.
                 raise TurnError("empty_reply")
             if not text and file_reply is None:
                 return  # empty intermediate reply{} call: no bubble, not an error
@@ -9323,7 +9370,7 @@ async def process_job(
         # Repeating either action here would duplicate user-visible errors/metrics.
         log.info("[v2.worker] job %s stopped at rollout fence: %s", job_id, e)
         return "failed"
-    except Exception as e:  # noqa: BLE001 — 任何失败落 last_error，绝不写占位气泡
+    except Exception as e:  # noqa: BLE001 - terminal outbox owns failure visibility
         message = _safe_failure_code("turn_failed", e)
         await _record_trajectory(
             trajectory_recorder,
@@ -9337,7 +9384,11 @@ async def process_job(
         )
         log.warning("[v2.worker] job %s failed code=%s", job_id, message)
         owned = await asyncio.to_thread(
-            jobs_store.mark_failed, job_id, message, claimed_by=claimed_by
+            jobs_store.mark_failed,
+            job_id,
+            message,
+            claimed_by=claimed_by,
+            error_class=_turn_failure_error_class(e),
         )
         if owned and lane == "chat":
             await asyncio.to_thread(
@@ -9632,7 +9683,11 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
         )
         log.warning("[v2.worker] job %s outer turn failure code=%s", job_id, message)
         owned = await asyncio.to_thread(
-            jobs_store.mark_failed, job_id, message, claimed_by=claimed_by
+            jobs_store.mark_failed,
+            job_id,
+            message,
+            claimed_by=claimed_by,
+            error_class=_turn_failure_error_class(e),
         )
         if owned and lane == "chat":
             await asyncio.to_thread(

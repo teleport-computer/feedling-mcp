@@ -10,6 +10,18 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 Chat failures no longer leave the sender waiting silently.**
+  A failed or expired foreground turn now commits a parent-linked encrypted
+  failure reply carrying the same `turn_failure_error_class`,
+  `turn_failure_blame`, and `turn_failure_user_text` metadata as the resident
+  path. Actionable provider configuration failures show their specific recovery
+  text; transient provider and system failures use the standard retry-later
+  fallback. A conservative internal context-window default is attributed to the
+  system, not misreported as the user's model limit. Delivery is replayed from a
+  durable outbox after worker crashes and lease timeouts, while a newer
+  successful reply atomically suppresses a stale failure bubble. Proactive and
+  maintenance lanes remain silent.
+
 - **V1 CLI residents can now return generated documents as native download
   cards.** Claude, Codex, and Pi residents receive a `send-file` command backed
   by a private per-user staging directory. Word and PDF requests render real

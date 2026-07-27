@@ -15,7 +15,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
+from core import envelope as core_envelope
+from core import store as core_store
 from core import wake_bus
+from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import jobs_store
 
 from conftest import seed_user
@@ -55,6 +58,41 @@ def _seed_active_route(uid: str, *, error: str = "") -> str:
             (route_id, uid, credential_id, error),
         )
     return route_id
+
+
+def _append_user_message(uid: str, msg_id: str = "parent-user") -> int:
+    store = core_store.get_store(uid)
+    store.append_chat(
+        "user",
+        "chat",
+        {
+            "v": 1,
+            "id": msg_id,
+            "body_ct": "encrypted-user-body",
+            "nonce": "user-nonce",
+            "K_user": "wrapped-user-key",
+            "visibility": "shared",
+            "owner_user_id": uid,
+        },
+        strict=True,
+    )
+    seq = db.chat_seq_for_msg_id(uid, msg_id)
+    assert seq is not None
+    return seq
+
+
+def _fake_failure_envelope(store, plaintext: bytes, *, item_id: str | None = None):
+    return {
+        "v": 1,
+        "id": item_id or "failure-envelope",
+        "body_ct": "encrypted-failure-body",
+        "nonce": "failure-nonce",
+        "K_user": "wrapped-failure-key",
+        "K_enclave": "wrapped-enclave-key",
+        "visibility": "shared",
+        "owner_user_id": store.user_id,
+        "enclave_pk_fpr": "test",
+    }, ""
 
 
 @pytest.fixture(autouse=True)
@@ -336,11 +374,13 @@ def test_mark_failed_crash_window_has_durable_visibility_marker_and_replays_once
         "examined": 1,
         "status_delivered": 1,
         "runtime_error_delivered": 1,
+        "reply_delivered": 1,
     }
     assert second == {
         "examined": 0,
         "status_delivered": 0,
         "runtime_error_delivered": 0,
+        "reply_delivered": 0,
     }
     assert recorded == [(uid, "turn_failed:runtimeerror")]
     errors = [
@@ -349,6 +389,136 @@ def test_mark_failed_crash_window_has_durable_visibility_marker_and_replays_once
         if event["kind"] == "error" and event["job_id"] == job_id
     ]
     assert len(errors) == 1
+
+
+def test_terminal_failure_reply_is_encrypted_linked_classified_and_idempotent(
+    monkeypatch,
+):
+    uid = "u_js_terminal_reply"
+    seed_user(uid)
+    _reset(uid)
+    parent_seq = _append_user_message(uid)
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        _fake_failure_envelope,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w")
+    assert jobs_store.mark_failed(
+        job_id,
+        "turn_failed:providererror",
+        claimed_by="w",
+        error_class="quota_insufficient",
+    )
+
+    first = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
+    second = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
+
+    assert first["reply_delivered"] == 1
+    assert second["reply_delivered"] == 0
+    messages = db.chat_load_strict(uid)
+    failures = [
+        row for row in messages
+        if str(row.get("terminal_failure_job_id") or "") == str(job_id)
+    ]
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure["body_ct"] == "encrypted-failure-body"
+    assert failure["reply_to_message_id"] == "parent-user"
+    assert failure["turn_failure_error_class"] == "quota_insufficient"
+    assert failure["turn_failure_blame"] == "user_provider"
+    assert "额度不足" in failure["turn_failure_user_text"]
+    assert "额度不足" not in failure["body_ct"]
+
+    parent = db.chat_get_strict(uid, "parent-user")
+    assert parent["reply_status"] == "replied"
+    assert parent["reply_message_id"] == failure["id"]
+    assert parent["reply_error_class"] == "quota_insufficient"
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == parent_seq
+
+
+def test_terminal_failure_reply_retry_adopts_committed_bubble_after_ack_crash(
+    monkeypatch,
+):
+    uid = "u_js_terminal_reply_ack_crash"
+    seed_user(uid)
+    _reset(uid)
+    _append_user_message(uid)
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        _fake_failure_envelope,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w")
+    assert jobs_store.mark_failed(job_id, "lease_timeout", claimed_by="w")
+
+    real_ack = jobs_store._ack_terminal_failure_reply
+    monkeypatch.setattr(
+        jobs_store,
+        "_ack_terminal_failure_reply",
+        lambda _job_id: False,
+    )
+    first = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
+    monkeypatch.setattr(jobs_store, "_ack_terminal_failure_reply", real_ack)
+    second = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
+
+    assert first["reply_delivered"] == 0
+    assert second["reply_delivered"] == 1
+    messages = db.chat_load_strict(uid)
+    assert sum(
+        str(row.get("terminal_failure_job_id") or "") == str(job_id)
+        for row in messages
+    ) == 1
+
+
+def test_terminal_failure_reply_is_suppressed_after_newer_cursor_success(
+    monkeypatch,
+):
+    uid = "u_js_terminal_reply_stale"
+    seed_user(uid)
+    _reset(uid)
+    parent_seq = _append_user_message(uid)
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        _fake_failure_envelope,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w")
+    assert jobs_store.mark_failed(job_id, "lease_timeout", claimed_by="w")
+
+    store = core_store.get_store(uid)
+    success = store._build_chat_message(
+        "openclaw",
+        "model_api",
+        {
+            "v": 1,
+            "id": "newer-success",
+            "body_ct": "encrypted-success",
+            "nonce": "success-nonce",
+            "K_user": "success-key",
+            "visibility": "shared",
+            "owner_user_id": uid,
+        },
+    )
+    db.chat_append_effect_with_cursor(
+        uid,
+        "newer-success",
+        float(success["ts"]),
+        success,
+        core_store.MAX_CHAT_MESSAGES,
+        parent_seq,
+    )
+
+    result = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
+
+    assert result["reply_delivered"] == 1
+    assert not any(
+        row.get("terminal_failure_job_id")
+        for row in db.chat_load_strict(uid)
+    )
 
 
 def test_terminal_visibility_retries_each_fail_once_sink_without_duplicates(

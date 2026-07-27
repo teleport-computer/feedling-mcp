@@ -464,6 +464,26 @@ answers to the claimed user turn. A network failure after sending is ambiguous
 because Chat does not support `Idempotency-Key`; check history or the parent
 message's reply metadata before deciding whether to retry.
 
+### Runtime V2 terminal failures
+
+When a Runtime V2 foreground turn fails or expires, Chat stores an encrypted
+assistant failure reply instead of leaving the user message unanswered. The
+reply is linked through `reply_to_message_id` and carries
+`turn_failure_error_class`, `turn_failure_blame`, and
+`turn_failure_user_text`. Provider-configuration failures use actionable text
+from the shared error catalog; transient provider and system failures use the
+standard retry-later fallback while preserving the classified metadata.
+If an internal conservative context-window default rejects a turn, Chat treats
+that as a system failure rather than blaming the user's provider configuration.
+
+The failure obligation is committed with the terminal job transition and
+replayed independently, so a worker crash or lease timeout cannot lose it.
+Delivery uses a deterministic message identity and advances the Runtime V2
+reply cursor in the same transaction as the encrypted row and parent metadata.
+If a newer successful reply already advanced that cursor, the delayed failure
+is acknowledged without inserting a stale bubble. Background wake, Capture,
+Dream, and maintenance failures do not write Chat messages.
+
 ## Destructive transcript clear
 
 Clearing Chat requires an explicit body even though the method is `DELETE`:
