@@ -152,6 +152,15 @@ SIGNALS: dict[str, Signal] = {s.input: s for s in [
     # agent see app_name=None for any turn that wasn't right after a launch.
     # `app_state` is what distinguishes "still in it" (foreground) from "just
     # left it" (closed); `recent_apps` covers anything older.
+    #
+    # NOTE: this `app_state` (values "foreground" / "closed" / null) is about
+    # some OTHER app on the user's phone — the one the iOS Shortcut just
+    # opened or closed. It is UNRELATED to the `app_state` field found in
+    # device_events / proactive scene-phase code (backend/proactive/service.py,
+    # backend/push/service.py, backend/proactive/capture_scheduler.py), which
+    # tracks IO's OWN foreground/background/inactive phase. Same name,
+    # different namespace (perception_state field vs. device_events payload),
+    # no functional overlap.
     Signal("app", "app", ("app_name", "app_category", "app_state"),
            ttl_sec=900.0, significant=False),
 ]}

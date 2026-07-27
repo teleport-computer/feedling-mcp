@@ -1172,6 +1172,18 @@ def _record_app_event(user_id: str, app: str, category: str | None,
     app_category keep their values): leaving app_name at the open ts would let
     it expire under the 900s TTL while app_state still read "closed" — i.e. the
     agent would see "closed a null".
+
+    Per-field ts guard caveat: `_current_app_cells` above is a plain read, not
+    part of the same transaction as the `merge_state_guarded` call below it.
+    If the user switches apps fast enough — close-A and open-B fired by iOS
+    within the same narrow window — close-A's read of the snapshot can land
+    before open-B's write commits, and if close-A's ts is newer than open-B's
+    ts, the per-field guard lets close-A overwrite B's just-written state with
+    "closed A". The blast radius is bounded: at most one 900s TTL window shows
+    a wrong snapshot, no history rows are lost, and the very next app event
+    self-heals it. A real fix means moving the current-app comparison inside
+    `merge_state_guarded` itself (a store API change) so the read-compare-write
+    is atomic; not done here.
     """
     app = (app or "").strip()
     if not app:
@@ -1180,6 +1192,10 @@ def _record_app_event(user_id: str, app: str, category: str | None,
     category = (category or "").strip() or None
 
     if closing:
+        # Append the event row BEFORE touching the snapshot (open does the
+        # reverse). Deliberate: a close is the more important signal to not
+        # lose, so if the snapshot write below fails silently, the close is
+        # still on record in the app-close stream.
         store.append_app_close(user_id, {"app": app, "category": category, "ts": now}, now)
         current_app, current_category = _current_app_cells(user_id)
         if current_app and str(current_app).strip().casefold() == app.casefold():

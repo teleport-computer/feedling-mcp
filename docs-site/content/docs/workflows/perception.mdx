@@ -280,15 +280,20 @@ app is actually current.
 
 Each call writes to two places: the current-app snapshot fields (`app_name` /
 `app_category` / `app_state`, which expire 15 minutes after the reported open
-or close) and an append-only app-open/app-close history. `app_state` is
-`"foreground"` after an open and `"closed"` after a matching close; it is
-`null` when no open has been reported yet.
+or close) and an append-only history — opens and closes each append to their
+own stream. `app_state` is `"foreground"` after an open and `"closed"` after a
+matching close; it is `null` when no open has been reported yet.
 
 The shortcut reports opens and closes, so `app_name` means "the app named in
 the most recent open-or-matching-close event observed within the TTL" — check
 `app_state` if you need to distinguish "still in it" from "just left it".
 
-`GET /v1/agent/perception/recent_apps` reads the history:
+`GET /v1/agent/perception/recent_apps` reads **only the app-open history** —
+there is currently no read endpoint over the app-close stream. A close event's
+only externally visible effect is the `app_state: "closed"` it may leave in
+the snapshot above (until the 15-minute TTL expires it). The close stream is
+being accumulated for a future usage-duration pairing (open ts → matching
+close ts), not exposed on its own yet.
 
 ```http
 GET /v1/agent/perception/recent_apps?limit=20&hours=24 HTTP/1.1
