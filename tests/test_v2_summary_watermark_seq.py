@@ -154,7 +154,13 @@ def test_migration_head_and_watermark_seq_column():
     assert script.get_revision("0058_provider_usage_halted").down_revision == (
         "0057_provider_health"
     )
-    assert script.get_current_head() == "0058_provider_usage_halted"
+    # 刻意不钉死 head 的具体 revision 名：链每合入一个 migration 就要回来改这行，
+    # 而"当前 head 叫什么"本身没有约束价值——真正要防的是**链分叉成多头**
+    # （多头会让部署时的 alembic upgrade head 失败，本仓库有过多头事故）。
+    # get_current_head() 在多头时本就会抛错，这里再显式断言一次单头，失败信息更直白。
+    # 2026-07-27：本行原钉死 "0058_provider_usage_halted"，被 0059/0060/0061 合入后
+    # 撞红——那是测试维护滞后，不是迁移链有问题。
+    assert len(script.get_heads()) == 1, f"迁移链分叉成多头：{script.get_heads()}"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"
     )
