@@ -916,13 +916,17 @@ def _is_degenerate_reply(text: Any) -> bool:
 class DedicatedVisionUnavailable(RuntimeError):
     """A pinned V2 image observer failed before the main model saw pixels."""
 
+    def __init__(self, message: str, *, error_code: str = "vision_model_failed"):
+        super().__init__(message)
+        self.error_code = error_code
+
 
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
     """Stable plaintext error code that never embeds exception messages."""
     if isinstance(exc, WorkspacePromptUnavailable):
         kind = "workspace_prompt_unavailable"
     elif isinstance(exc, DedicatedVisionUnavailable):
-        kind = "vision_model_failed"
+        kind = exc.error_code
     elif isinstance(exc, TurnError):
         raw = str(exc)
         if raw in {
@@ -7409,7 +7413,13 @@ def _inject_tail_images(
         try:
             observations = read_vision_observations(user_id, dedicated_targets) or {}
         except Exception as exc:  # noqa: BLE001 — stable V2 failure surface below
-            raise DedicatedVisionUnavailable("vision observer failed") from exc
+            safe_code = str(
+                getattr(exc, "error_code", "") or "vision_model_failed"
+            )[:64]
+            raise DedicatedVisionUnavailable(
+                "vision observer failed",
+                error_code=safe_code,
+            ) from exc
         if any(
             not str(observations.get(item["message_id"]) or "").strip()
             for item in dedicated_targets

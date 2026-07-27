@@ -90,6 +90,75 @@ def _make_image_msg(ts=1.0, image_bytes=b"fake-jpeg"):
     return msg
 
 
+def test_pi_runtime_metadata_reads_exact_model_modalities(tmp_path, monkeypatch):
+    models_file = tmp_path / "models.json"
+    models_file.write_text(json.dumps({
+        "providers": {
+            "feedling": {
+                "baseUrl": "https://openrouter.ai/api/v1",
+                "models": [
+                    {
+                        "id": "deepseek/deepseek-v4-flash",
+                        "input": ["text"],
+                    }
+                ]
+            }
+        }
+    }))
+    monkeypatch.delenv("FEEDLING_AGENT_MODEL_ID", raising=False)
+    monkeypatch.delenv("FEEDLING_AGENT_PROVIDER", raising=False)
+    monkeypatch.delenv("FEEDLING_AGENT_INPUT_MODALITIES", raising=False)
+
+    metadata = crc._agent_runtime_metadata(
+        cli_cmd=(
+            "pi --mode json --model "
+            "feedling/deepseek/deepseek-v4-flash"
+        ),
+        models_file=models_file,
+    )
+
+    assert metadata == {
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-flash",
+        "input_modalities": ["text"],
+    }
+
+
+def test_runtime_model_identity_uses_configured_fact(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "AGENT_RUNTIME_METADATA",
+        {
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-flash",
+            "input_modalities": ["text"],
+        },
+    )
+
+    prompt = crc._prepend_runtime_model_identity("你是什么模型？")
+
+    assert "deepseek/deepseek-v4-flash" in prompt
+    assert "Do not infer a different model" in prompt
+    assert prompt.endswith("你是什么模型？")
+
+
+def test_agent_session_rotates_when_configured_model_entry_changes(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        "pi --model feedling/openai/gpt-5-mini --session-id {session_id}",
+    )
+    old_meta = crc._empty_agent_session_meta("session-1")
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        "pi --model feedling/deepseek/deepseek-v4-flash --session-id {session_id}",
+    )
+
+    assert crc._agent_session_meta_entry_changed(old_meta) is True
+
+
 # ---------------------------------------------------------------------------
 # Case 1: user message with empty content → no fallback, checkpoint advances
 # ---------------------------------------------------------------------------
@@ -8512,6 +8581,7 @@ def test_cwd_resolution_failure_preserves_existing_session(monkeypatch, tmp_path
     _bridge_session_env(monkeypatch, tmp_path, "usr_cwd_err")
     monkeypatch.setattr(crc, "AGENT_MODE", "cli")
     _reset_cli_cwd_cache(monkeypatch)
+    _generic_cli_env(monkeypatch)
     old_home = tmp_path / "old-home"
     monkeypatch.setenv("FEEDLING_AGENT_CLI_CWD", str(old_home))
 
@@ -8524,7 +8594,6 @@ def test_cwd_resolution_failure_preserves_existing_session(monkeypatch, tmp_path
     crc._agent_session_id_cache.clear()
     crc._agent_session_meta_cache.clear()
     _reset_cli_cwd_cache(monkeypatch)
-    _generic_cli_env(monkeypatch)
 
     with pytest.raises(RuntimeError, match="restart the consumer"):
         crc.call_agent_cli("hi")

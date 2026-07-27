@@ -419,27 +419,31 @@ def _vision_config_payload(store) -> dict:
             ),
         }
     else:
+        resident_runtime = vision_routing.chat_consumer.consumer_agent_runtime(store)
+        resident_modalities = set(resident_runtime.get("input_modalities") or [])
+        if "image" in resident_modalities:
+            resident_vision_status = "ok"
+        elif resident_modalities:
+            resident_vision_status = "unsupported"
+        else:
+            resident_vision_status = "untested"
         main = {
             "source": "resident",
             "route_id": None,
-            "provider": "",
-            "model": "",
-            "vision_test_status": "managed_by_vps",
+            "provider": resident_runtime.get("provider", ""),
+            "model": resident_runtime.get("model", ""),
+            "vision_test_status": resident_vision_status,
             "last_vision_test_error": "",
         }
 
     mode = "dedicated" if dedicated else "follow_main"
-    if not routing_available:
+    if dedicated and not routing_available:
         effective_status = "resident_update_required"
+    elif dedicated:
+        effective_status = dedicated.get("vision_test_status", "untested")
     else:
         effective_status = (
-            dedicated.get("vision_test_status", "untested")
-            if dedicated
-            else (
-                main["vision_test_status"]
-                if onboarding_route == "model_api"
-                else "managed_by_vps"
-            )
+            main["vision_test_status"]
         )
     return {
         "available": routing_available,

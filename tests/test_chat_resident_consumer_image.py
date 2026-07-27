@@ -361,15 +361,35 @@ def test_dedicated_vision_observer_failure_never_calls_main_model(tmp_path):
     replies = []
 
     with patch.object(crc, "IMAGE_TEMP_DIR", tmp_path), \
-         patch.object(crc, "_vision_observation", side_effect=RuntimeError("offline")), \
+         patch.object(
+             crc,
+             "_vision_observation",
+             side_effect=crc.VisionObserverFailure(
+                 "vision_model_unavailable",
+                 status_code=502,
+                 detail="ProviderError",
+             ),
+         ), \
          patch.object(crc, "call_agent") as mock_call, \
-         patch.object(crc, "post_reply", side_effect=lambda reply, **_kwargs: replies.append(reply) or {"id": "reply-fail-01"}):
+         patch.object(
+             crc,
+             "post_reply",
+             side_effect=lambda reply, **kwargs: replies.append((reply, kwargs)) or {"id": "reply-fail-01"},
+         ):
         result_ts = crc._process_messages([msg])
 
     assert result_ts == pytest.approx(9400.0)
     mock_call.assert_not_called()
-    assert replies
-    assert "视觉模型" in replies[0] or "vision model" in replies[0].lower()
+    assert len(replies) == 2
+    carrier_text, carrier_kwargs = replies[0]
+    assert "视觉模型" in carrier_text or "vision model" in carrier_text.lower()
+    assert carrier_kwargs["turn_failure_error_class"] == "vision_model_unavailable"
+    assert carrier_kwargs["turn_failure_blame"] == "provider_transient"
+    notice_text, notice_kwargs = replies[1]
+    assert "vision_model_unavailable" in notice_text
+    assert "HTTP 502" in notice_text
+    assert notice_kwargs["role"] == "system"
+    assert notice_kwargs["notice_kind"] == "upstream_error"
 
 
 # ---------------------------------------------------------------------------

@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+
 import db
 import provider_client
 from capabilities import registry as cap_registry
 from core import enclave as core_enclave
+
+
+log = logging.getLogger(__name__)
 
 
 _OBSERVATION_PROMPT = (
@@ -15,6 +20,75 @@ _OBSERVATION_PROMPT = (
     "Do not answer the user or take actions. "
     "Return a concise neutral observation for another model."
 )
+
+
+class VisionObserverError(RuntimeError):
+    """Display-safe visual-route failure shared by hosted and resident paths."""
+
+    def __init__(
+        self,
+        error_code: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+        detail: str = "",
+    ):
+        super().__init__(error_code)
+        self.error_code = error_code
+        self.status_code = status_code
+        self.retryable = retryable
+        self.detail = detail[:160]
+
+
+def classify_vision_error(exc: BaseException) -> VisionObserverError:
+    """Reduce provider/runtime failures to stable codes without raw response text."""
+    if isinstance(exc, VisionObserverError):
+        return exc
+
+    status = getattr(exc, "status_code", None)
+    status_code = int(status) if isinstance(status, int) else None
+    raw = str(exc).strip().lower()
+    provider_class = str(
+        getattr(exc, "feedling_error_class", "")
+        or provider_client.classify_provider_error(exc)
+    )
+
+    if raw in {
+        "vision_route_missing",
+        "vision_route_not_ready",
+        "vision_key_envelope_missing",
+    }:
+        code = "vision_model_not_ready"
+    elif raw == "vision_model_empty_observation":
+        code = "vision_model_empty_response"
+    elif status_code in {401, 403}:
+        code = "vision_model_auth_invalid"
+    elif status_code == 402:
+        code = "vision_model_quota_insufficient"
+    elif status_code == 404:
+        code = "vision_model_not_found"
+    elif status_code in {400, 415, 422}:
+        code = "vision_model_incompatible"
+    elif status_code == 429:
+        code = "vision_model_rate_limited"
+    elif provider_class in {"transient", "transient_exhausted"} or (
+        status_code is not None and (status_code == 408 or status_code >= 500)
+    ):
+        code = "vision_model_unavailable"
+    else:
+        code = "vision_model_failed"
+
+    return VisionObserverError(
+        code,
+        status_code=status_code,
+        retryable=code in {
+            "vision_model_rate_limited",
+            "vision_model_unavailable",
+            "vision_model_empty_response",
+            "vision_model_failed",
+        },
+        detail=type(exc).__name__,
+    )
 
 
 def load_provider_config(
@@ -54,29 +128,38 @@ def observe_image(
     image_mime: str,
     image_b64: str,
 ) -> str:
-    result = provider_client.chat_completion(
-        config,
-        [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": _OBSERVATION_PROMPT},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{image_mime};base64,{image_b64}",
+    # A saved route has already passed its visual probe, so one transient
+    # OpenRouter/provider blip should not turn a real image into a false
+    # "could not inspect" reply. Keep the total budget below the resident's
+    # 100-second request timeout and never retry key/credit/config failures.
+    try:
+        result = provider_client.reliable_chat_completion(
+            config,
+            [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _OBSERVATION_PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{image_mime};base64,{image_b64}",
+                        },
                     },
-                },
-            ],
-        }],
-        max_tokens=1200,
-        temperature=None,
-        timeout=90.0,
-        include_reasoning=False,
-    )
-    observation = str(result.get("reply") or "").strip()
-    if not observation:
-        raise RuntimeError("vision_model_empty_observation")
-    return observation
+                ],
+            }],
+            max_tokens=1200,
+            temperature=None,
+            timeout=45.0,
+            include_reasoning=False,
+            max_attempts=2,
+            base_delay_sec=0.5,
+        )
+        observation = str(result.get("reply") or "").strip()
+        if not observation:
+            raise RuntimeError("vision_model_empty_observation")
+        return observation
+    except Exception as exc:  # noqa: BLE001 - stable shared failure contract
+        raise classify_vision_error(exc) from exc
 
 
 def observe_pinned_message(
@@ -92,8 +175,14 @@ def observe_pinned_message(
 
     try:
         rows = store.reload_chat_strict()
-    except Exception:
-        return {"error": "vision_image_unavailable", "retryable": True}, 502
+    except Exception as exc:
+        return {
+            "error": "vision_image_unavailable",
+            "error_class": "vision_image_unavailable",
+            "status_code": 502,
+            "retryable": True,
+            "detail": type(exc).__name__,
+        }, 502
     message = next(
         (row for row in rows if str(row.get("id") or "") == message_id),
         None,
@@ -113,13 +202,21 @@ def observe_pinned_message(
         code = str((image_result.error or {}).get("code") or "")
         return {
             "error": "vision_image_unavailable",
+            "error_class": "vision_image_unavailable",
+            "status_code": 502,
             "retryable": bool((image_result.error or {}).get("retryable")),
-            "cause": code,
+            "detail": code[:160],
         }, 502
     image = image_result.data or {}
     image_b64 = str(image.get("image_b64") or "")
     if not image_b64:
-        return {"error": "vision_image_unavailable", "retryable": False}, 502
+        return {
+            "error": "vision_image_unavailable",
+            "error_class": "vision_image_unavailable",
+            "status_code": 502,
+            "retryable": False,
+            "detail": "image_body_missing",
+        }, 502
 
     try:
         config = load_provider_config(
@@ -133,9 +230,22 @@ def observe_pinned_message(
             image_b64=image_b64,
         )
     except Exception as exc:  # noqa: BLE001 - stable public failure surface
+        failure = classify_vision_error(exc)
+        log.warning(
+            "[vision.observer] provider call failed user=%s route=%s "
+            "error=%s class=%s status=%s",
+            str(store.user_id)[:8],
+            route_id[:8],
+            type(exc).__name__,
+            failure.error_code,
+            failure.status_code,
+        )
         return {
             "error": "vision_observer_failed",
-            "detail": type(exc).__name__,
+            "detail": failure.detail,
+            "error_class": failure.error_code,
+            "status_code": failure.status_code,
+            "retryable": failure.retryable,
         }, 502
     return {
         "message_id": message_id,

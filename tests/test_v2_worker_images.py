@@ -167,6 +167,29 @@ def test_dedicated_observer_failure_is_explicit_and_never_falls_back():
         )
 
 
+def test_dedicated_observer_failure_keeps_safe_reason_code():
+    tail = [{**_img_row("m1"), "vision_route_id": "vision-route"}]
+
+    class ObserverFailure(RuntimeError):
+        error_code = "vision_model_auth_invalid"
+
+    with pytest.raises(worker.DedicatedVisionUnavailable) as caught:
+        worker._inject_tail_images(
+            tail,
+            user_id="u",
+            read_images=lambda *_args: pytest.fail("raw fallback is forbidden"),
+            active_image_ids={"m1"},
+            read_vision_observations=lambda *_args: (_ for _ in ()).throw(
+                ObserverFailure("secret provider response")
+            ),
+        )
+
+    assert caught.value.error_code == "vision_model_auth_invalid"
+    assert worker._safe_failure_code("turn_failed", caught.value) == (
+        "turn_failed:vision_model_auth_invalid"
+    )
+
+
 def test_historical_dedicated_image_is_not_observed_or_resent():
     tail = [{**_img_row("m1"), "vision_route_id": "vision-route"}]
     out = worker._inject_tail_images(

@@ -11,7 +11,7 @@ def _store(user_id="u1"):
     return SimpleNamespace(user_id=user_id)
 
 
-def test_config_reports_vps_as_unavailable_until_resident_advertises_observer(monkeypatch):
+def test_config_reports_text_only_vps_main_as_unsupported(monkeypatch):
     monkeypatch.setattr(
         setup_core.accounts_onboarding,
         "_load_onboarding_route",
@@ -22,6 +22,15 @@ def test_config_reports_vps_as_unavailable_until_resident_advertises_observer(mo
         "consumer_supports_capability",
         lambda _store, _capability: False,
     )
+    monkeypatch.setattr(
+        vision_routing.chat_consumer,
+        "consumer_agent_runtime",
+        lambda _store: {
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-flash",
+            "input_modalities": ["text"],
+        },
+    )
     monkeypatch.setattr(setup_core.db, "model_api_active_route", lambda _uid: None)
     monkeypatch.setattr(setup_core.db, "model_api_vision_route", lambda _uid: None)
 
@@ -29,8 +38,40 @@ def test_config_reports_vps_as_unavailable_until_resident_advertises_observer(mo
 
     assert config["available"] is False
     assert config["runtime"] == "vps"
-    assert config["effective_status"] == "resident_update_required"
+    assert config["effective_status"] == "unsupported"
     assert config["main_model"]["source"] == "resident"
+    assert config["main_model"]["model"] == "deepseek/deepseek-v4-flash"
+
+
+def test_config_allows_image_capable_vps_main_without_dedicated_observer(monkeypatch):
+    monkeypatch.setattr(
+        setup_core.accounts_onboarding,
+        "_load_onboarding_route",
+        lambda _store: "resident",
+    )
+    monkeypatch.setattr(
+        vision_routing.chat_consumer,
+        "consumer_supports_capability",
+        lambda _store, _capability: False,
+    )
+    monkeypatch.setattr(
+        vision_routing.chat_consumer,
+        "consumer_agent_runtime",
+        lambda _store: {
+            "provider": "openrouter",
+            "model": "openai/gpt-5-mini",
+            "input_modalities": ["text", "image"],
+        },
+    )
+    monkeypatch.setattr(setup_core.db, "model_api_active_route", lambda _uid: None)
+    monkeypatch.setattr(setup_core.db, "model_api_vision_route", lambda _uid: None)
+
+    config = setup_core._vision_config_payload(_store())
+
+    assert config["available"] is False
+    assert config["mode"] == "follow_main"
+    assert config["effective_status"] == "ok"
+    assert config["main_model"]["vision_test_status"] == "ok"
 
 
 def test_config_reports_model_api_v1_as_available_with_resident_observer(monkeypatch):
@@ -70,7 +111,7 @@ def test_config_reports_model_api_v1_as_available_with_resident_observer(monkeyp
     assert config["mode"] == "follow_main"
 
 
-def test_config_reports_model_api_v1_resident_update_required(monkeypatch):
+def test_config_reports_model_api_v1_without_main_as_not_configured(monkeypatch):
     monkeypatch.setattr(
         setup_core.accounts_onboarding,
         "_load_onboarding_route",
@@ -93,6 +134,49 @@ def test_config_reports_model_api_v1_resident_update_required(monkeypatch):
 
     assert config["available"] is False
     assert config["runtime"] == "hosted_v1"
+    assert config["effective_status"] == "not_configured"
+
+
+def test_config_requires_resident_update_only_for_saved_dedicated_route(monkeypatch):
+    monkeypatch.setattr(
+        setup_core.accounts_onboarding,
+        "_load_onboarding_route",
+        lambda _store: "model_api",
+    )
+    monkeypatch.setattr(
+        setup_core.hosted_config_store,
+        "hosted_runtime_v2_enabled_strict",
+        lambda _store: False,
+    )
+    monkeypatch.setattr(
+        vision_routing.chat_consumer,
+        "consumer_supports_capability",
+        lambda _store, _capability: False,
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_active_route",
+        lambda _uid: {
+            "id": "main",
+            "provider": "openai",
+            "model": "gpt-4.1-mini",
+            "vision_test_status": "ok",
+        },
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_vision_route",
+        lambda _uid: {
+            "id": "vision",
+            "provider": "openai",
+            "model": "gpt-4.1-mini",
+            "vision_test_status": "ok",
+        },
+    )
+
+    config = setup_core._vision_config_payload(_store())
+
+    assert config["mode"] == "dedicated"
     assert config["effective_status"] == "resident_update_required"
 
 

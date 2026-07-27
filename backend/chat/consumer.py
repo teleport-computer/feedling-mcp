@@ -118,11 +118,25 @@ def _consumer_headers_from_map(headers, remote_addr: str = "") -> dict:
         ).split(",")
         if item.strip()
     })
+    input_modalities = sorted({
+        item.strip().lower()
+        for item in str(
+            headers.get("X-Feedling-Agent-Input-Modalities") or ""
+        ).split(",")
+        if item.strip().lower() in {"text", "image", "audio", "video"}
+    })
     return {
         "consumer_name": name,
         "consumer_id": (headers.get("X-Feedling-Consumer-Id") or "").strip(),
         "consumer_version": (headers.get("X-Feedling-Consumer-Version") or "").strip(),
         "consumer_capabilities": capabilities,
+        "agent_provider": (
+            headers.get("X-Feedling-Agent-Provider") or ""
+        ).strip()[:120],
+        "agent_model": (
+            headers.get("X-Feedling-Agent-Model") or ""
+        ).strip()[:240],
+        "agent_input_modalities": input_modalities,
         "consumer_commit": (headers.get("X-Feedling-Consumer-Commit") or "").strip(),
         # Poll-only compatibility claim: the running image intentionally
         # skipped an irrelevant target while remaining protocol-compatible.
@@ -171,6 +185,9 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
             event_info.pop("decrypt_checked_at_epoch", None)
             event_info.pop("consumer_compat_commit", None)
             event_info.pop("consumer_capabilities", None)
+            event_info.pop("agent_provider", None)
+            event_info.pop("agent_model", None)
+            event_info.pop("agent_input_modalities", None)
             event_info.pop("update_stall_reason", None)
         state.update(event_info)
         state["last_event"] = event_type
@@ -427,6 +444,11 @@ def _consumer_validation_state(
         "consumer_id": state.get("consumer_id", ""),
         "consumer_version": state.get("consumer_version", ""),
         "consumer_capabilities": list(state.get("consumer_capabilities") or []),
+        "agent_provider": state.get("agent_provider", ""),
+        "agent_model": state.get("agent_model", ""),
+        "agent_input_modalities": list(
+            state.get("agent_input_modalities") or []
+        ),
         "consumer_commit": state.get("consumer_commit", ""),
         "consumer_compat_commit": state.get("consumer_compat_commit", ""),
         "update_stall_reason": state.get("update_stall_reason", ""),
@@ -458,3 +480,23 @@ def consumer_supports_capability(
         if str(item).strip()
     }
     return bool(validation.get("passing") and capability.lower() in advertised)
+
+
+def consumer_agent_runtime(
+    store: UserStore,
+    *,
+    now_epoch: float | None = None,
+) -> dict:
+    """Return fresh model metadata advertised by the official resident."""
+    validation = _consumer_validation_state(store, now_epoch=now_epoch)
+    if not validation.get("passing"):
+        return {"provider": "", "model": "", "input_modalities": []}
+    return {
+        "provider": str(validation.get("agent_provider") or ""),
+        "model": str(validation.get("agent_model") or ""),
+        "input_modalities": sorted({
+            str(item).strip().lower()
+            for item in validation.get("agent_input_modalities") or []
+            if str(item).strip().lower() in {"text", "image", "audio", "video"}
+        }),
+    }
