@@ -78,6 +78,7 @@ from hosted import config_store as hosted_config_store
 from hosted import mcp_tools
 from identity import identity_core
 from memory import memory_core
+from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import child_supervisor as v2_child_supervisor
 from model_api_runtime.v2 import effect_id as v2_effect_id
@@ -973,7 +974,7 @@ def _read_temporal_snapshot(
     if not timezone_name:
         timezone_name = perception_service.stable_context_timezone(user_id)
     return {
-        "timezone": str(timezone_name or "UTC"),
+        "timezone": str(timezone_name or v2_context.DEFAULT_TIMEZONE),
         "last_user_message_ts": db.chat_latest_genuine_user_ts(
             user_id,
             through_seq=through_seq,

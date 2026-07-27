@@ -305,7 +305,6 @@ def test_model_api_setup_custom_relay_uses_unaudited_default(client, monkeypatch
         "test_provider_key",
         lambda cfg: tested.append(cfg) or {"reply": "ok", "usage": {}},
     )
-    monkeypatch.setattr(provider_client, "probe_responses_support", lambda _cfg: True)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -334,9 +333,6 @@ def test_model_api_setup_persists_explicit_custom_prompt_frontier(
         provider_client,
         "test_provider_key",
         lambda cfg: tested.append(cfg) or {"reply": "ok", "usage": {}},
-    )
-    monkeypatch.setattr(
-        provider_client, "probe_responses_support", lambda _cfg: True
     )
 
     setup = client.post(
@@ -409,49 +405,18 @@ def test_model_api_setup_rejects_context_window_without_input_budget(
     assert db.model_api_routes_list(user_id) == []
 
 
-def test_model_api_setup_stores_responses_support_for_openai_compatible(client, monkeypatch):
-    # An openai_compatible relay is probed once at setup; the stored config records
-    # whether it implements /v1/responses, so the gateway picks native passthrough
-    # vs the chat-completions bridge (forcing the bridge on a /responses relay
-    # breaks codex's tool loop).
+def test_model_api_setup_leaves_responses_support_false(client, monkeypatch):
+    """`supports_responses` 列保留（V1 roster payload 仍带它，删列要迁移且
+    收益为零），但不再由探测填写——恒 false，对每个 provider 都一样。"""
     user_id, api_key = _register(client)
     monkeypatch.setattr(provider_client, "test_provider_key",
                         lambda cfg: {"reply": "ok", "usage": {}})
-    probed: list = []
-
-    def fake_probe(cfg):
-        probed.append(cfg.base_url)
-        return True
-
-    monkeypatch.setattr(provider_client, "probe_responses_support", fake_probe)
     client.post("/v1/onboarding/route", json={"route": "model_api"}, headers=_headers(api_key))
     setup = client.post(
         "/v1/model_api/setup",
         json={"provider": "openai_compatible", "model": "gpt-5.4",
               "base_url": "https://relay.host/v1", "api_key": "sk-relay",
               "context_window_tokens": 128_000},
-        headers=_headers(api_key),
-    )
-    assert setup.status_code == 200, setup.get_data(as_text=True)
-    assert probed == ["https://relay.host/v1"]  # probed exactly the relay
-    route = db.model_api_active_route(user_id)
-    assert route["supports_responses"] is True
-
-
-def test_model_api_setup_does_not_probe_non_openai_compatible(client, monkeypatch):
-    # openai/anthropic/gemini/openrouter never use the bridge flag, so no probe.
-    user_id, api_key = _register(client)
-    monkeypatch.setattr(provider_client, "test_provider_key",
-                        lambda cfg: {"reply": "ok", "usage": {}})
-
-    def boom(cfg):
-        raise AssertionError("probe must not run for non-openai_compatible")
-
-    monkeypatch.setattr(provider_client, "probe_responses_support", boom)
-    client.post("/v1/onboarding/route", json={"route": "model_api"}, headers=_headers(api_key))
-    setup = client.post(
-        "/v1/model_api/setup",
-        json={"provider": "openrouter", "model": "openai/gpt-4.1-mini", "api_key": "sk-x"},
         headers=_headers(api_key),
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
@@ -541,78 +506,60 @@ def test_model_api_setup_rejects_invalid_reasoning_effort(client, monkeypatch):
     assert setup.get_json()["error"] == "invalid_reasoning_effort"
 
 
-def test_setup_warns_when_relay_lacks_responses(client, monkeypatch):
-    # openai_compatible 中转不实现 /v1/responses → LiteLLM 强制 chat-completions
-    # 桥接 → mangle codex 工具循环 → 记忆/工具静默不可靠(rc=0 但工具从不真调)。
-    # setup 探测到即发一条 warning 通知(配置期预警,不必等回合失败)。
+def test_setup_never_warns_about_responses_for_chat_only_relay(client, monkeypatch):
+    """chat-only 中转（Moonshot 全系）配置成功后不得带任何 responses 警告。
+
+    退役理由（2026-07-27，代码取证 + test 环境四轮实测）：那条 warning 的因由是
+    「LiteLLM 强制 responses→chat-completions 桥接 → mangle codex 工具循环」，
+    三个前提全部失效——LiteLLM 已移除；openai_compatible 派生的是 pi 而非 codex
+    (hosted/agent_runtime_cutover.py)；V2 全程 chat_completion_async，
+    provider_client 里 /responses 的唯一入口条件是 provider == "openai"。
+    实测 Kimi/Moonshot 在 V1(pi) 与 V2 两条路径上记忆写入、连续回读、工具调用
+    (trajectory 记到 tool_call_started/result 各 3 次) 全部正常。
+    """
     _uid, api_key = _register(client)
     monkeypatch.setattr(provider_client, "test_provider_key",
                         lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(provider_client, "probe_responses_support", lambda cfg: False)
     client.post("/v1/onboarding/route", json={"route": "model_api"}, headers=_headers(api_key))
     setup = client.post(
         "/v1/model_api/setup",
-        json={"provider": "openai_compatible", "model": "gpt-5.5",
-              "base_url": "https://relay.host/v1", "api_key": "sk-relay",
+        json={"provider": "openai_compatible", "model": "kimi-k2.5",
+              "base_url": "https://api.moonshot.cn/v1", "api_key": "sk-relay",
               "context_window_tokens": 128_000},
         headers=_headers(api_key),
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
-    # ① 当场:setup 响应体直接带 warnings(设置页保存后立即显示,不必等通知中心页)
-    warns = setup.get_json().get("warnings", [])
-    assert any(w["error_class"] == "responses_unsupported"
-               and w["severity"] == "warning"
-               and w["blame"] == "user_provider" for w in warns), setup.get_json()
-    # ② 持久:同一条也写进通知中心
+    assert not setup.get_json().get("warnings"), setup.get_json()
     notices = client.get("/v1/notices", headers=_headers(api_key)).get_json()["notices"]
-    hit = [n for n in notices if n["error_class"] == "responses_unsupported"]
-    assert len(hit) == 1, notices
-    assert hit[0]["severity"] == "warning"
-    assert hit[0]["blame"] == "user_provider"
-    assert hit[0]["source"] == "model_api"
-    assert hit[0]["resolved"] is False
+    assert [n for n in notices if n["error_class"] == "responses_unsupported"] == []
 
 
-def test_setup_resolves_responses_warning_when_relay_supports(client, monkeypatch):
-    # 换到支持 /v1/responses 的中转 → 旧 warning 应被 resolve(问题好了要告诉用户)。
+def test_setup_does_not_probe_responses_endpoint(client, monkeypatch):
+    """setup 不得再对中转打 /responses：该探测唯一的下游是已退役的 warning，
+    `supports_responses` 在整个 backend 没有任何行为消费点（consumer_env 也不读
+    它），却要为每次 openai_compatible setup 付一次最多 20s 的网络往返。"""
     _uid, api_key = _register(client)
+    assert not hasattr(provider_client, "probe_responses_support")
+    posted: list = []
     monkeypatch.setattr(provider_client, "test_provider_key",
                         lambda cfg: {"reply": "ok", "usage": {}})
-    client.post("/v1/onboarding/route", json={"route": "model_api"}, headers=_headers(api_key))
-    monkeypatch.setattr(provider_client, "probe_responses_support", lambda cfg: False)
-    client.post("/v1/model_api/setup",
-        json={"provider": "openai_compatible", "model": "gpt-5.5",
-              "base_url": "https://bad/v1", "api_key": "sk-r",
-              "context_window_tokens": 128_000}, headers=_headers(api_key))
-    monkeypatch.setattr(provider_client, "probe_responses_support", lambda cfg: True)
-    good = client.post("/v1/model_api/setup",
-        json={"provider": "openai_compatible", "model": "gpt-5.5",
-              "base_url": "https://good/v1", "api_key": "sk-r",
-              "context_window_tokens": 128_000}, headers=_headers(api_key))
-    assert not good.get_json().get("warnings"), good.get_json()  # 好中转不带当场警告
-    notices = client.get("/v1/notices", headers=_headers(api_key)).get_json()["notices"]
-    hit = [n for n in notices if n["error_class"] == "responses_unsupported"]
-    assert len(hit) == 1, notices
-    assert hit[0]["resolved"] is True
 
+    class _NoResponsesProbe:
+        def post(self, url, **_kw):
+            posted.append(url)
+            raise AssertionError(f"setup must not POST {url}")
 
-def test_delete_resolves_responses_warning(client, monkeypatch):
-    # 删除 model_api 配置(而非换成受支持的 provider)也要清掉这条 warning,
-    # 否则 /v1/notices 会为一个已不存在的配置一直显示活跃警告。
-    _uid, api_key = _register(client)
-    monkeypatch.setattr(provider_client, "test_provider_key",
-                        lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(provider_client, "probe_responses_support", lambda cfg: False)
+    monkeypatch.setattr(provider_client, "_http_client", lambda: _NoResponsesProbe())
     client.post("/v1/onboarding/route", json={"route": "model_api"}, headers=_headers(api_key))
-    client.post("/v1/model_api/setup",
-        json={"provider": "openai_compatible", "model": "gpt-5.5",
-              "base_url": "https://bad/v1", "api_key": "sk-r",
-              "context_window_tokens": 128_000}, headers=_headers(api_key))
-    client.delete("/v1/model_api/delete", headers=_headers(api_key))
-    notices = client.get("/v1/notices", headers=_headers(api_key)).get_json()["notices"]
-    hit = [n for n in notices if n["error_class"] == "responses_unsupported"]
-    assert len(hit) == 1, notices
-    assert hit[0]["resolved"] is True
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai_compatible", "model": "kimi-k2.5",
+              "base_url": "https://api.moonshot.cn/v1", "api_key": "sk-relay",
+              "context_window_tokens": 128_000},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+    assert posted == []
 
 
 @pytest.mark.xfail(

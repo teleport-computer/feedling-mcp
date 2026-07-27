@@ -192,7 +192,10 @@ def test_temporal_context_maps_visible_tail_without_mutating_messages():
     payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
     data = payload["temporal_context"]
     assert data["current_local_time"] == "2026-07-26T20:00:00+08:00"
-    assert data["current_utc_time"] == "2026-07-26T12:00:00+00:00"
+    # A raw UTC wall-clock sibling field is a foot-gun: the model misreads the
+    # evening-UTC value as the user's local time ("晚上9点你那边" at 凌晨4:55).
+    # current_local_time + timezone fully specify the instant.
+    assert "current_utc_time" not in data
     assert data["timezone"] == "Asia/Shanghai"
     assert data["last_genuine_user_message_sent_at"] == (
         "2026-07-26T19:00:00+08:00"
@@ -216,7 +219,11 @@ def test_temporal_context_maps_visible_tail_without_mutating_messages():
     assert context.TEMPORAL_CONTEXT_HEADER in messages[0]["content"]
 
 
-def test_temporal_context_invalid_timezone_falls_back_to_utc():
+def test_temporal_context_invalid_timezone_falls_back_to_china_default():
+    # A garbage zone must NOT silently become UTC (8h off for CN users → the
+    # model states the wrong "your side" time). Fall back to the same China
+    # default the resident/proactive paths use, so the two time sources in one
+    # prompt never disagree.
     temporal = context.build_temporal_context(
         now_ts=1_000,
         timezone_name="not/a-zone",
@@ -226,11 +233,28 @@ def test_temporal_context_invalid_timezone_falls_back_to_utc():
             {"role": "assistant", "content": "also bad", "ts": float("inf")},
         ],
     )
-    assert temporal["timezone"] == "UTC"
-    assert temporal["current_local_time"].endswith("+00:00")
-    assert temporal["last_genuine_user_message_sent_at"] is None
-    assert temporal["seconds_since_last_genuine_user_message"] is None
-    assert temporal["tail_timestamps"] == []
+    assert temporal["timezone"] == "Asia/Shanghai"
+    assert temporal["timezone"] == context.DEFAULT_TIMEZONE
+
+
+def test_temporal_context_unknown_timezone_defaults_to_china_not_utc():
+    # The screenshot bug: tz unknown → current_local_time degraded to UTC
+    # (20:55 "晚上9点") while the message-content anchor showed the correct
+    # Asia/Shanghai 04:55. Both sources must agree on the China default.
+    now = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc).timestamp()
+    for missing in ("", None):
+        temporal = context.build_temporal_context(
+            now_ts=now,
+            timezone_name=missing,  # type: ignore[arg-type]
+            last_user_message_ts=None,
+            tail=[],
+        )
+        assert temporal["timezone"] == "Asia/Shanghai"
+        # 12:00 UTC == 20:00 +08:00, NOT a raw 12:00 UTC-as-local value.
+        assert temporal["current_local_time"] == "2026-07-26T20:00:00+08:00"
+        assert temporal["last_genuine_user_message_sent_at"] is None
+        assert temporal["seconds_since_last_genuine_user_message"] is None
+        assert temporal["tail_timestamps"] == []
 
 
 def test_worker_captures_temporal_snapshot_once_at_frozen_frontier(monkeypatch):
