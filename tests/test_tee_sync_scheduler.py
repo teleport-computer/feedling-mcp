@@ -41,7 +41,7 @@ def calls(monkeypatch):
 def test_replicate_tick_hits_every_ciphertext_table(calls):
     sched._sync_tick(do_reconcile=False)
     replicated = [c for c in calls if c[0] == "replicate"]
-    assert [c[1] for c in replicated] == list(sched._CIPHERTEXT_TABLES)
+    assert [c[1] for c in replicated] == list(sched._ciphertext_tables())
     # non-dry-run + confirm gate carried on every replicate
     assert all(c[2] is False and c[3] == "MIGRATE" for c in replicated)
     # do_reconcile=False → no reconcile/verify
@@ -118,7 +118,7 @@ def test_one_table_error_does_not_stop_the_pass(monkeypatch):
     monkeypatch.setattr(tr, "run_action", fake)
     sched._sync_tick(do_reconcile=False)
     # memory_moments raised a generic error but the loop continued past it
-    assert seen == list(sched._CIPHERTEXT_TABLES)
+    assert seen == list(sched._ciphertext_tables())
 
 
 def test_start_spawns_a_daemon_thread(monkeypatch):
