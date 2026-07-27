@@ -1256,7 +1256,7 @@ def test_fire_scheduled_for_user_enqueues_a_scheduled_agent_job(monkeypatch, bac
 
     calls = []
     monkeypatch.setattr(jobs_store, "enqueue_job",
-                        lambda u, lane, **kw: calls.append((u, lane)) or ("job1", False))
+                        lambda u, lane, **kw: calls.append((u, lane)) or (101, False))
 
     class _FakeService:
         def __init__(self, *a, **kw):
@@ -1269,6 +1269,79 @@ def test_fire_scheduled_for_user_enqueues_a_scheduled_agent_job(monkeypatch, bac
     monkeypatch.setattr("proactive.scheduled_wake_v2.ScheduledWakeServiceV2", _FakeService)
     assert serve_worker._fire_scheduled_for_user(uid) == 1
     assert calls == [(uid, "scheduled")]
+
+
+def test_read_scheduled_wake_context_returns_notes_and_confirmed_metadata_for_one_job(
+    monkeypatch, backend_env
+):
+    import conftest
+    from proactive.scheduled_wake_v2 import ScheduledWakeRecordV2
+
+    uid = "u_sw_scheduled_notes"
+    conftest.seed_user(uid)
+
+    records = [
+        ScheduledWakeRecordV2(
+            timer_id="timer-1",
+            user_id=uid,
+            status="fired",
+            at="2026-07-27T08:00:00",
+            timezone="Asia/Shanghai",
+            due_at=1.0,
+            note="提醒我喝水",
+            fired_job_id=88,
+        ),
+        ScheduledWakeRecordV2(
+            timer_id="timer-2",
+            user_id=uid,
+            status="fired",
+            at="2026-07-27T08:00:00",
+            timezone="Asia/Shanghai",
+            due_at=1.0,
+            note="提醒我拉伸",
+            fired_job_id=88,
+        ),
+        ScheduledWakeRecordV2(
+            timer_id="timer-other",
+            user_id=uid,
+            status="fired",
+            at="2026-07-27T08:00:00",
+            timezone="Asia/Shanghai",
+            due_at=1.0,
+            note="不属于当前任务",
+            fired_job_id=99,
+        ),
+    ]
+
+    class _Store:
+        def list_records(self, _user_id):
+            return records
+
+    monkeypatch.setattr(
+        "proactive.scheduled_wake_v2.DBScheduledWakeStoreV2",
+        _Store,
+    )
+
+    assert serve_worker._read_scheduled_wake_context(uid, 88) == [
+        {
+            "note": "提醒我喝水",
+            "operation": "scheduled_wake",
+            "status": "fired",
+            "task_id": "timer-1",
+            "next_trigger_at": "2026-07-27T08:00:00",
+            "timezone": "Asia/Shanghai",
+            "fired_at": 0.0,
+        },
+        {
+            "note": "提醒我拉伸",
+            "operation": "scheduled_wake",
+            "status": "fired",
+            "task_id": "timer-2",
+            "next_trigger_at": "2026-07-27T08:00:00",
+            "timezone": "Asia/Shanghai",
+            "fired_at": 0.0,
+        },
+    ]
 
 
 def test_push_token_carries_only_the_chat_push_scope():

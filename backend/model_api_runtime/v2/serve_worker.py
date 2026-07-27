@@ -1344,15 +1344,52 @@ def _fire_scheduled_for_user(user_id: str) -> int:
 
     def _submit(event):
         nonlocal fired
-        jobs_store.enqueue_job(user_id, "scheduled", reason="scheduled_wake")
-        core_wake_bus.notify("v2_jobs", user_id)
+        job_id, _ = jobs_store.enqueue_job(
+            user_id,
+            "scheduled",
+            reason="scheduled_wake",
+        )
         fired += 1
-        return WakeControlDecisionV2(True, "queued_v2", settings)
+        return types.SimpleNamespace(
+            accepted=True,
+            reason="queued_v2",
+            settings=settings,
+            job_id=int(job_id),
+        )
 
     service.fire_due_timers(
         user_id, settings=settings, submit_wake=_submit, owner_id=_V2_WAKE_OWNER_ID
     )
+    if fired:
+        # Notify only after fire_due_timers has attached every accepted timer to
+        # the job. This keeps a woken worker from racing the reminder context.
+        core_wake_bus.notify("v2_jobs", user_id)
     return fired
+
+
+def _read_scheduled_wake_context(user_id: str, job_id: int) -> list[dict]:
+    """Return reminder content plus backend-confirmed trigger metadata."""
+    from proactive.scheduled_wake_v2 import DBScheduledWakeStoreV2, SCHEDULED_FIRED
+
+    context: list[dict] = []
+    for record in DBScheduledWakeStoreV2().list_records(user_id):
+        if record.status != SCHEDULED_FIRED or record.fired_job_id != int(job_id):
+            continue
+        note = str(record.note or "").strip()
+        if not note:
+            continue
+        context.append({
+            "note": note[:1000],
+            "operation": "scheduled_wake",
+            "status": "fired",
+            "task_id": str(record.timer_id or ""),
+            "next_trigger_at": str(record.at or ""),
+            "timezone": str(record.timezone or ""),
+            "fired_at": float(record.fired_at or 0.0),
+        })
+        if len(context) >= 10:
+            break
+    return context
 
 
 def _read_images(user_id: str, message_ids: list[str]) -> dict[str, dict]:
@@ -1895,7 +1932,7 @@ class EffectSinkDeps:
     workspace: Callable[[dict], None]
 
 
-def build_effect_dispatch(deps: EffectSinkDeps) -> Callable[[str, dict], None]:
+def build_effect_dispatch(deps: EffectSinkDeps) -> Callable[[str, dict], object]:
     """Pure router (spec A6): `dispatch(effect_type, payload) -> None`. Side-
     effect-free at construction — building the dispatch closure touches no DB;
     effects happen only when `dispatch(...)` is actually called. Unknown
@@ -1912,11 +1949,11 @@ def build_effect_dispatch(deps: EffectSinkDeps) -> Callable[[str, dict], None]:
         "workspace": deps.workspace,
     }
 
-    def dispatch(effect_type: str, payload: dict) -> None:
+    def dispatch(effect_type: str, payload: dict) -> object:
         sink = routes.get(effect_type)
         if sink is None:
             raise ValueError(f"unknown effect_type: {effect_type!r}")
-        sink(payload)
+        return sink(payload)
 
     return dispatch
 
@@ -2379,7 +2416,7 @@ except ValueError as exc:
     ) from exc
 
 
-def _sink_schedule(user_id: str, payload: dict) -> None:
+def _sink_schedule(user_id: str, payload: dict) -> object:
     """`schedule` sink — two distinct producers share this one effect_type:
 
     1. Worker's write-tool-call mapping (`worker.process_job`'s
@@ -2404,7 +2441,8 @@ def _sink_schedule(user_id: str, payload: dict) -> None:
     """
     eid = payload["effect_id"]
     if not db.effect_sink_claim(eid):
-        return
+        return None
+    applied_result = None
     try:
         op = payload.get("op")
         if op in _SCHEDULE_CAPABILITY_OPS:
@@ -2443,6 +2481,23 @@ def _sink_schedule(user_id: str, payload: dict) -> None:
                 # Same retryable-honoring contract as _sink_identity: a
                 # deterministic 4xx terminal-discards instead of wedging.
                 raise _capability_effect_error(result, f"{op}_failed")
+            rows = result.data.get("results") if isinstance(result.data, dict) else None
+            row = rows[0] if isinstance(rows, list) and rows else None
+            if isinstance(row, dict):
+                applied = {
+                    "kind": v2_effect_outbox.SCHEDULE_RESULT_KIND,
+                    "operation": str(op),
+                    "status": str(row.get("status") or ""),
+                }
+                for source, target in (
+                    ("timer_id", "task_id"),
+                    ("next_trigger_at", "next_trigger_at"),
+                    ("timezone", "timezone"),
+                ):
+                    value = str(row.get(source) or "").strip()
+                    if value:
+                        applied[target] = value
+                applied_result = v2_effect_outbox.ScheduleAppliedResult(applied)
         else:
             kwargs = {k: v for k, v in payload.items() if k in _SCHEDULE_PAYLOAD_KEYS}
             jobs_store.upsert_wake_schedule(user_id, **kwargs)
@@ -2452,6 +2507,7 @@ def _sink_schedule(user_id: str, payload: dict) -> None:
         )  # write failed -> undo the claim so replay re-does it
         raise
     db.effect_sink_complete(eid)
+    return applied_result
 
 
 def _sink_workspace(user_id: str, payload: dict, *, runtime_token: str) -> None:
@@ -2974,8 +3030,7 @@ def _apply_pending_effects_for_user(user_id: str) -> dict:
                     runtime_token=get_runtime_token(),
                 )
             effect_type = logical_effect_type
-        production_dispatch(effect_type, payload)
-        return None
+        return production_dispatch(effect_type, payload)
 
     return v2_effect_outbox.apply_pending_effects(
         user_id,
@@ -3078,6 +3133,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_images=_read_images,
         read_files=_read_files,
         read_memory_context=_read_memory_context,
+        read_scheduled_wake_context=_read_scheduled_wake_context,
         apply_memory_actions=_apply_memory_actions,
         build_memory_envelope=_build_memory_envelope,
         read_capture_state=_read_capture_state,

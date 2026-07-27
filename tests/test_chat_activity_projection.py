@@ -45,7 +45,6 @@ def test_projection_keeps_ids_and_status_but_never_result_body():
             },
         },
     ]
-
     assert chat_activity.project_tool_events(rows) == [
         {
             "id": "9:1:1",
@@ -62,6 +61,73 @@ def test_projection_keeps_ids_and_status_but_never_result_body():
             "result_code": "ok",
         }
     ]
+
+
+def test_projection_keeps_only_confirmed_scheduled_task_metadata():
+    rows = [{
+        "id": 1,
+        "job_id": 12,
+        "kind": "tool_activity",
+        "created_at": 20.0,
+        "detail_json": {
+            "activity_id": "12:1:1",
+            "tool_name": "schedule_wake",
+            "call_id": "call-schedule",
+            "state": "success",
+            "schedule_operation": "schedule_wake",
+            "schedule_status": "scheduled",
+            "schedule_task_id": "sched_real_1",
+            "schedule_next_trigger_at": "2026-07-27T08:00:00",
+            "schedule_timezone": "Asia/Shanghai",
+            "note": "private reminder body",
+        },
+    }]
+
+    event = chat_activity.project_tool_events(rows)[0]
+    assert event["schedule_operation"] == "schedule_wake"
+    assert event["schedule_status"] == "scheduled"
+    assert event["schedule_task_id"] == "sched_real_1"
+    assert event["schedule_next_trigger_at"] == "2026-07-27T08:00:00"
+    assert event["schedule_timezone"] == "Asia/Shanghai"
+    assert "private reminder body" not in repr(event)
+
+
+def test_chat_tool_callback_marks_rejected_schedule_as_failure(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        worker.jobs_store,
+        "append_status_event",
+        lambda _user_id, _kind, **kwargs: captured.append(kwargs["detail"]),
+    )
+    callback = worker._make_chat_tool_activity_callback(
+        user_id="usr_schedule_failure",
+        job_id=13,
+        attempt_identity=1,
+        recorder=None,
+        effect_evidence_by_call={},
+    )
+    call = SimpleNamespace(id="call-schedule", name="schedule_wake")
+
+    async def run():
+        await callback(call, "tool_call_started", {})
+        await callback(
+            call,
+            "tool_call_result",
+            {
+                "result": ToolResult(
+                    call_id="call-schedule",
+                    content='{"status":"rejected"}',
+                    metadata={
+                        "schedule_operation": "schedule_wake",
+                        "schedule_status": "rejected",
+                    },
+                ),
+            },
+        )
+
+    asyncio.run(run())
+    assert captured[-1]["state"] == "failure"
+    assert captured[-1]["result_code"] == "schedule_rejected"
 
 
 def test_chat_tool_callback_emits_safe_result_metadata(monkeypatch):

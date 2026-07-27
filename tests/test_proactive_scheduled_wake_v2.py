@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
@@ -77,6 +78,8 @@ def test_schedule_action_persists_wall_time_timezone_note_and_origin_refs():
 
     assert result.status == "scheduled"
     assert result.timer_id == record.timer_id
+    assert result.next_trigger_at == "2026-06-20T09:30:00"
+    assert result.timezone == "Asia/Shanghai"
     assert record.status == SCHEDULED_PENDING
     assert record.at == "2026-06-20T09:30:00"
     assert record.timezone == "Asia/Shanghai"
@@ -264,6 +267,33 @@ def test_due_timer_fires_once_across_workers_and_survives_service_restart():
     assert ctx is not None
     assert ctx.trigger == "scheduled_wake"
     assert ctx.scheduled_note == "check in"
+
+
+def test_fired_timer_records_the_v2_job_that_will_deliver_its_note():
+    store, service = _service()
+    service.apply_turn_actions(
+        "u1",
+        [{
+            "type": "schedule_wake",
+            "at": "2026-06-20T09:00:00",
+            "tz": "UTC",
+            "note": "提醒我喝水",
+        }],
+        now=1.0,
+    )
+
+    fired = service.fire_due_timers(
+        "u1",
+        settings={},
+        now=2_000_000_000.0,
+        submit_wake=lambda _event: SimpleNamespace(accepted=True, job_id=42),
+    )
+
+    assert len(fired) == 1
+    record = store.list_records("u1")[0]
+    assert record.status == SCHEDULED_FIRED
+    assert record.fired_job_id == 42
+    assert record.note == "提醒我喝水"
 
 
 def test_claimed_due_timer_is_reclaimed_after_claim_ttl():

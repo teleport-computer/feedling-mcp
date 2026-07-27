@@ -51,6 +51,7 @@ APPLIED_RESULT_PAYLOAD_KEY = "_applied_result_v1"
 APPLIED_WITH_RESULTS_STATUS = "applied_with_results"
 WORKSPACE_BATCH_RESULT_KIND = "workspace_batch_v1"
 WORKSPACE_BATCH_RESULT_MAX_ITEMS = 24
+SCHEDULE_RESULT_KIND = "schedule_v1"
 WORKSPACE_BATCH_TERMINAL_ERRORS = frozenset(
     {"workspace_write_failed", "workspace_delete_failed"}
 )
@@ -131,6 +132,14 @@ class WorkspaceBatchAppliedResult:
     status: str = "applied"
 
 
+@dataclass(frozen=True)
+class ScheduleAppliedResult:
+    """Bounded, non-sensitive truth returned by the scheduled-wake sink."""
+
+    result: dict
+    status: str = "applied"
+
+
 def _validate_applied_result(value: WorkspaceBatchAppliedResult) -> None:
     result = value.result
     if not isinstance(result, dict) or set(result) != {"kind", "items"}:
@@ -174,13 +183,73 @@ def _validate_applied_result(value: WorkspaceBatchAppliedResult) -> None:
         raise RuntimeError("applied effect result status is inconsistent")
 
 
+def _validate_schedule_applied_result(value: ScheduleAppliedResult) -> None:
+    result = value.result
+    allowed = {
+        "kind",
+        "operation",
+        "task_id",
+        "status",
+        "next_trigger_at",
+        "timezone",
+    }
+    if not isinstance(result, dict) or set(result) - allowed:
+        raise RuntimeError("applied schedule result shape is invalid")
+    if result.get("kind") != SCHEDULE_RESULT_KIND:
+        raise RuntimeError("applied schedule result kind is invalid")
+    if result.get("operation") not in {"schedule_wake", "cancel_wake"}:
+        raise RuntimeError("applied schedule operation is invalid")
+    task_id = result.get("task_id")
+    if task_id is not None and (
+        not isinstance(task_id, str)
+        or len(task_id) > 200
+        or any(
+            not char.isascii()
+            or not (char.isalnum() or char in "_.:-")
+            for char in task_id
+        )
+    ):
+        raise RuntimeError("applied schedule task id is invalid")
+    if result.get("status") not in {
+        "scheduled",
+        "canceled",
+        "not_found",
+        "invalid",
+        "rejected",
+    }:
+        raise RuntimeError("applied schedule status is invalid")
+    next_trigger = result.get("next_trigger_at")
+    if next_trigger is not None and (
+        not isinstance(next_trigger, str)
+        or not 1 <= len(next_trigger) <= 80
+        or any(char not in "0123456789-:T.+ " for char in next_trigger)
+    ):
+        raise RuntimeError("applied schedule next trigger is invalid")
+    timezone_name = result.get("timezone")
+    if timezone_name is not None and (
+        not isinstance(timezone_name, str)
+        or not 1 <= len(timezone_name) <= 80
+        or any(
+            not char.isascii()
+            or not (char.isalnum() or char in "_+./-")
+            for char in timezone_name
+        )
+    ):
+        raise RuntimeError("applied schedule timezone is invalid")
+    if value.status != "applied":
+        raise RuntimeError("applied schedule result status is inconsistent")
+
+
 def _serialized_applied_result(value: object) -> tuple[str, str] | None:
-    if not isinstance(value, WorkspaceBatchAppliedResult):
+    if not isinstance(value, (WorkspaceBatchAppliedResult, ScheduleAppliedResult)):
         # Dispatch was historically a void callback. Preserve compatibility
         # with adapters that happen to return an incidental value; only the
         # explicit wrapper opts into durable structured results.
         return None
-    _validate_applied_result(value)
+    if isinstance(value, WorkspaceBatchAppliedResult):
+        _validate_applied_result(value)
+    else:
+        _validate_schedule_applied_result(value)
     rendered = json.dumps(
         {APPLIED_RESULT_PAYLOAD_KEY: value.result},
         ensure_ascii=True,

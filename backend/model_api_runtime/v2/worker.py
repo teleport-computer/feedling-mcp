@@ -64,6 +64,7 @@ from core import envelope as core_envelope
 from core import provider_usage
 from core import store as core_store
 from core import wake_bus as core_wake_bus
+from core.downloadable_reply import sanitize_downloadable_reply
 from perception.agent_fields import AGENT_PERCEPTION_SIGNALS
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
@@ -836,6 +837,12 @@ _WAKE_SYSTEM_PROMPT = (
     "empty message; staying silent is correct and expected."
 )
 _WAKE_NUDGE = "(A quiet moment has passed. Reach out only if something is genuinely worth saying right now.)"
+_SCHEDULED_WAKE_SYSTEM_PROMPT = (
+    "You are delivering one or more reminders that the user explicitly scheduled. "
+    "Deliver every supplied reminder now, naturally and concisely. Do not stay silent, "
+    "do not greet the user, do not ask what they need, and do not replace the reminder "
+    "with a generic check-in."
+)
 # screen_watch lane (Task 3): a wake grounded on recent shared-screen frames rather
 # than a perception snapshot. Its own system prompt sits beside _WAKE_SYSTEM_PROMPT;
 # _run_wake selects it only for lane=="screen_watch". Silence is still the correct
@@ -1045,6 +1052,10 @@ class TurnDeps:
     # 任意一项可为 ""）：capture/dream prompt 需要的记忆上下文（enclave 解密明文）。取数失败
     # → 降级为空上下文，不失败 job（spec §3.5）。
     read_memory_context: Callable[[str], dict] | None = None
+    # (user_id, job_id) -> due reminder content and backend-confirmed trigger
+    # metadata. Plaintext remains in the scheduled-wake record; only bounded
+    # task identity/state metadata may be attached to the visible activity.
+    read_scheduled_wake_context: Callable[[str, int], list[dict]] | None = None
     # (user_id, actions) -> result dict：把抽取产出的 memory.add/memory.supersede action 落库
     # （走既有 /v1/memory/actions 同路径的服务端实现）。None 时跳过持久化、仍干净 mark_completed
     # （让 handler 无 DB/enclave 也可单测）。
@@ -2067,6 +2078,17 @@ def _make_chat_tool_activity_callback(
                 detail[target] = token
         if isinstance(result, ToolResult):
             detail.update(core_chat_activity.safe_memory_metadata(result.metadata))
+            schedule_metadata = core_chat_activity.safe_schedule_metadata(
+                result.metadata
+            )
+            detail.update(schedule_metadata)
+            schedule_status = schedule_metadata.get("schedule_status")
+            if (
+                event_kind == "tool_call_result"
+                and schedule_status in {"not_found", "invalid", "rejected"}
+            ):
+                detail["state"] = "failure"
+                detail["result_code"] = f"schedule_{schedule_status}"
         try:
             await asyncio.to_thread(
                 jobs_store.append_status_event,
@@ -2128,6 +2150,7 @@ def _activity_extra(events: list[dict] | None, *, turn_id: str, job_id: int) -> 
         if duration is not None:
             item["duration_ms"] = duration
         item.update(core_chat_activity.safe_memory_metadata(event))
+        item.update(core_chat_activity.safe_schedule_metadata(event))
         safe_events.append(item)
     extra: dict[str, Any] = {
         "activity_turn_id": core_chat_activity.safe_token(turn_id, max_len=160),
@@ -5544,6 +5567,55 @@ async def _run_wake(
             # not a reuse of `_ensure_prompt_coverage`'s return — see
             # `_assert_prompt_covers`'s docstring for why.
             await _assert_prompt_covers(user_id, _TAIL_BUDGET)
+        wake_nudge = _WAKE_NUDGE
+        wake_system_prompt = _WAKE_SYSTEM_PROMPT
+        scheduled_activity_events: list[dict] = []
+        if lane == "scheduled" and deps.read_scheduled_wake_context is not None:
+            scheduled_context: list[dict] = []
+            # The scheduler notifies after associating the records, but a worker
+            # may also discover the pending job through polling. Briefly retry
+            # the read so that tiny enqueue/mark-fired races cannot turn a real
+            # reminder into a generic proactive greeting.
+            for attempt in range(3):
+                scheduled_context = await asyncio.to_thread(
+                    deps.read_scheduled_wake_context,
+                    user_id,
+                    int(job_id),
+                )
+                if scheduled_context or attempt == 2:
+                    break
+                await asyncio.sleep(0.05)
+            scheduled_notes: list[str] = []
+            for index, item in enumerate(scheduled_context[:10]):
+                if not isinstance(item, dict):
+                    continue
+                note = str(item.get("note") or "").strip()
+                if note:
+                    scheduled_notes.append(note[:1000])
+                metadata = core_chat_activity.safe_schedule_metadata(item)
+                if not metadata:
+                    continue
+                event: dict[str, Any] = {
+                    "id": f"{job_id}:scheduled:{index + 1}",
+                    "kind": "tool",
+                    "name": "scheduled_wake",
+                    "status": "success",
+                    "result_code": "fired",
+                    **metadata,
+                }
+                try:
+                    fired_at = float(item.get("fired_at") or 0.0)
+                except (TypeError, ValueError, OverflowError):
+                    fired_at = 0.0
+                if math.isfinite(fired_at) and fired_at > 0:
+                    event["finished_at"] = fired_at
+                scheduled_activity_events.append(event)
+            if scheduled_notes:
+                wake_system_prompt = _SCHEDULED_WAKE_SYSTEM_PROMPT
+                wake_nudge = (
+                    "The following user-scheduled reminders are due now:\n"
+                    + "\n".join(f"- {note}" for note in scheduled_notes)
+                )
         temporal_snapshot = await _capture_turn_temporal_snapshot(
             user_id=user_id,
             deps=deps,
@@ -5552,7 +5624,7 @@ async def _run_wake(
         )
         wake_tail = list(tail) + [{
             "role": "user",
-            "content": _WAKE_NUDGE,
+            "content": wake_nudge,
             "_genuine_user": False,
         }]
 
@@ -5815,9 +5887,20 @@ async def _run_wake(
                         raise RuntimeError(
                             "platform write was not durably applied: " + status
                         )
+                    durable_result = disposition.get("result")
+                    schedule_metadata = (
+                        core_chat_activity.safe_schedule_metadata(durable_result)
+                        if tc.name in {"schedule_wake", "cancel_wake"}
+                        else {}
+                    )
                     return ToolResult(
                         call_id=tc.id,
-                        content=f"ok: {tc.name} applied",
+                        content=(
+                            json.dumps(durable_result, ensure_ascii=False)
+                            if schedule_metadata
+                            else f"ok: {tc.name} applied"
+                        ),
+                        metadata=schedule_metadata or None,
                     )
                 return result
 
@@ -6007,6 +6090,14 @@ async def _run_wake(
                     payload[v2_effect_outbox.REPLY_SOURCE_FENCE_KEY] = {
                         "claimed_by": claimed_by,
                     }
+            if final and scheduled_activity_events:
+                payload.update(
+                    _activity_extra(
+                        scheduled_activity_events,
+                        turn_id=f"scheduled:{job_id}",
+                        job_id=int(job_id),
+                    )
+                )
             # Surface provider chain-of-thought on the same effect (sealed into a
             # separate thinking envelope), matching the chat lane. Only a final
             # reply carries it; intermediate reply{} bubbles are agent-authored.
@@ -6225,7 +6316,7 @@ async def _run_wake(
                 system_prompt=(
                     _SCREEN_WATCH_SYSTEM_PROMPT
                     if lane == "screen_watch"
-                    else _WAKE_SYSTEM_PROMPT
+                    else wake_system_prompt
                 ),
                 summary=summary,
                 tail=wake_tail,
@@ -6290,7 +6381,7 @@ async def _run_wake(
                 )
                 wake_tail = list(tail) + [{
                     "role": "user",
-                    "content": _WAKE_NUDGE,
+                    "content": wake_nudge,
                     "_genuine_user": False,
                 }]
                 build_messages = _wake_builder()
@@ -8329,6 +8420,21 @@ async def process_job(
                 raise TurnError("empty_reply")
             if not text and file_reply is None:
                 return  # empty intermediate reply{} call: no bubble, not an error
+            if file_reply is None:
+                text, removed_internal_reference = sanitize_downloadable_reply(
+                    text,
+                    attachment_staged=bool(pending_file_replies),
+                )
+                if removed_internal_reference:
+                    log.warning(
+                        "[v2.file] removed internal file reference from visible reply "
+                        "user=%s job=%s attachment=%s",
+                        user_id,
+                        job_id,
+                        bool(pending_file_replies),
+                    )
+                    if not pending_file_replies:
+                        raise TurnError("internal_file_reference_without_attachment")
             delivery_started_ns = time.monotonic_ns()
             # A cutover/ABA can happen while awaiting the provider. Fence at
             # the reply effect itself; the pre-round check is not sufficient.

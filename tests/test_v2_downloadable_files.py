@@ -902,9 +902,14 @@ def test_process_job_commits_text_then_workspace_file_as_one_final_reply(
                 (user_id,),
             ).fetchone()[0]
         assert visible_before_final == 0
-        await kwargs["on_reply"]("文件已生成。", final=True)
+        await kwargs["on_reply"](
+            "已生成文件，可下载：\n"
+            "sandbox:/workspace/report.md\n"
+            "需要我把内容贴出来吗？",
+            final=True,
+        )
         return tool_loop.LoopOutcome(
-            final_text="文件已生成。",
+            final_text="文件已生成，可在下方下载。",
             rounds=2,
             stop_reason="final_text",
             replied_intermediate=True,
@@ -956,6 +961,9 @@ def test_process_job_commits_text_then_workspace_file_as_one_final_reply(
         and message.get("source") == "model_api"
     ]
     assert [message["content_type"] for message in replies] == ["text", "file"]
+    visible_text = base64.b64decode(replies[0]["body_ct"]).decode("utf-8")
+    assert visible_text == "文件已生成，可在下方下载。"
+    assert "sandbox:" not in visible_text
     assert replies[0]["ts"] < replies[1]["ts"]
     file_message = replies[1]
     assert file_message["file_name"] == "report.md"

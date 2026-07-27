@@ -93,6 +93,54 @@ def safe_memory_metadata(value: Any) -> dict:
     return safe
 
 
+def safe_schedule_metadata(value: Any) -> dict:
+    """Keep only backend-confirmed scheduled-task identity and state."""
+    if not isinstance(value, Mapping):
+        return {}
+    operation = safe_token(
+        value.get("schedule_operation") or value.get("operation"),
+        max_len=40,
+    )
+    status = safe_token(
+        value.get("schedule_status") or value.get("status"),
+        max_len=40,
+    )
+    if operation not in {"schedule_wake", "cancel_wake", "scheduled_wake"}:
+        return {}
+    if status not in {"scheduled", "canceled", "not_found", "invalid", "rejected", "fired"}:
+        return {}
+    safe: dict[str, Any] = {
+        "schedule_operation": operation,
+        "schedule_status": status,
+    }
+    task_id = safe_token(
+        value.get("schedule_task_id") or value.get("task_id"),
+        max_len=200,
+    )
+    if task_id:
+        safe["schedule_task_id"] = task_id
+    next_trigger = str(
+        value.get("schedule_next_trigger_at") or value.get("next_trigger_at") or ""
+    ).strip()
+    if (
+        1 <= len(next_trigger) <= 80
+        and all(char in "0123456789-:T.+ " for char in next_trigger)
+    ):
+        safe["schedule_next_trigger_at"] = next_trigger
+    timezone_name = str(
+        value.get("schedule_timezone") or value.get("timezone") or ""
+    ).strip()
+    if (
+        1 <= len(timezone_name) <= 80
+        and all(
+            char.isascii() and (char.isalnum() or char in "_+./-")
+            for char in timezone_name
+        )
+    ):
+        safe["schedule_timezone"] = timezone_name
+    return safe
+
+
 def project_tool_events(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Collapse start/result status rows into one event per confirmed invocation."""
     ordered: list[str] = []
@@ -143,6 +191,7 @@ def project_tool_events(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any
             if token:
                 event[target] = token
         event.update(safe_memory_metadata(detail))
+        event.update(safe_schedule_metadata(detail))
     return [projected[event_id] for event_id in ordered]
 
 
