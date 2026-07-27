@@ -676,6 +676,12 @@ def test_process_job_terminal_failure_emits_error_status_and_calls_callback(monk
         raise RuntimeError("provider blew up")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
+    settled = []
+    monkeypatch.setattr(
+        worker.db,
+        "chat_settle_failed_input",
+        lambda *args: settled.append(args) or True,
+    )
     write_called = {"n": 0}
     monkeypatch.setattr(
         worker, "_write_encrypted_reply",
@@ -708,6 +714,7 @@ def test_process_job_terminal_failure_emits_error_status_and_calls_callback(monk
     assert rec_msg == "turn_failed:runtimeerror"
     assert row[1] == rec_msg
     assert "provider blew up" not in rec_msg
+    assert settled == [(uid, "m1", rec_msg)]
 
 
 def test_process_job_terminal_failure_tolerates_missing_callback(monkeypatch):
@@ -804,13 +811,19 @@ def test_run_turn_provider_resolve_failure_emits_error_status_and_callback(monke
     uid = "u_w_terminalerr_early"
     conftest.seed_user(uid)
     _reset(uid)
-    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job_id, _ = jobs_store.enqueue_job(uid, "chat", trace_id="m-provider")
     job = jobs_store.claim_next_job("w")
 
     def _boom(*a, **k):
         raise AssertionError("must not run past provider resolution failure")
 
     recorded = []
+    settled = []
+    monkeypatch.setattr(
+        worker.db,
+        "chat_settle_failed_input",
+        lambda *args: settled.append(args) or True,
+    )
     deps = worker.TurnDeps(
         read_messages=_boom,
         resolve_provider=lambda uid_: (None, {"error": "model_api_key_decrypt_failed"}),
@@ -828,6 +841,7 @@ def test_run_turn_provider_resolve_failure_emits_error_status_and_callback(monke
     assert rec_uid == uid
     assert rec_msg == "provider_unavailable"
     assert "model_api_key_decrypt_failed" not in rec_msg
+    assert settled == [(uid, "m-provider", "provider_unavailable")]
 
 
 def test_run_turn_maintenance_resolve_failure_is_silent_no_user_error(monkeypatch):

@@ -6692,6 +6692,85 @@ def chat_append_resident_message(
     return seq, inserted, persisted_doc
 
 
+def chat_settle_failed_input(
+    user_id: str,
+    msg_id: str,
+    error_code: str,
+) -> bool:
+    """Mark one failed user turn settled and advance the V2 reply cursor.
+
+    A terminal provider failure is still a completed settlement decision for
+    ordering purposes. Leaving its user row beyond the durable cursor makes the
+    next chat job answer that old row before the newly submitted message.
+    """
+    from model_api_runtime.v2 import cursor as v2_cursor
+
+    message_id = str(msg_id or "").strip()
+    if not message_id:
+        return False
+    persisted_runtime_doc: dict | None = None
+    failed_fields = {
+        "reply_status": "failed",
+        "reply_failure_code": str(error_code or "turn_failed")[:200],
+        "replied_by": "hosted_runtime_v2",
+        "replied_at": f"{time.time():.3f}",
+    }
+    updated = False
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                cur.execute(
+                    "SELECT seq,doc FROM chat_messages "
+                    "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                    (user_id, message_id),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                seq = int(row["seq"] if isinstance(row, dict) else row[0])
+                doc = row["doc"] if isinstance(row, dict) else row[1]
+                if not isinstance(doc, dict) or str(doc.get("role") or "") not in {
+                    "user",
+                    "human",
+                }:
+                    return False
+                already_replied = (
+                    str(doc.get("reply_status") or "") == "replied"
+                    or bool(str(doc.get("reply_message_id") or ""))
+                )
+                if not already_replied:
+                    cur.execute(
+                        "UPDATE chat_messages SET doc=doc || %s "
+                        "WHERE user_id=%s AND msg_id=%s",
+                        (Jsonb(failed_fields), user_id, message_id),
+                    )
+                    updated = True
+                persisted_runtime_doc = _advance_blob_int_on_cursor(
+                    cur,
+                    user_id,
+                    "model_api_runtime",
+                    v2_cursor.CURSOR_KEY,
+                    seq,
+                )
+
+    if updated:
+        from tee_shadow import mirror
+
+        mirror.execute(
+            "UPDATE chat_messages SET doc=doc || %s "
+            "WHERE user_id=%s AND msg_id=%s",
+            (Jsonb(failed_fields), user_id, message_id),
+        )
+    if persisted_runtime_doc is not None:
+        _mirror_persisted_blob(
+            user_id,
+            "model_api_runtime",
+            persisted_runtime_doc,
+        )
+    return True
+
+
 def chat_append_effect_with_cursor(
     user_id: str,
     msg_id: str,

@@ -23,7 +23,8 @@ def test_inject_builds_openai_content_blocks_with_caption_first():
     tail = [_img_row("m1", caption="这个报告哪里有问题")]
     out = worker._inject_tail_images(
         tail, user_id="u",
-        read_images=_fake_reader({"m1": {"image_mime": "image/png", "image_b64": "AAAA"}}))
+        read_images=_fake_reader({"m1": {"image_mime": "image/png", "image_b64": "AAAA"}}),
+        active_image_ids={"m1"})
     blocks = out[0]["content"]
     assert blocks[0] == {"type": "text", "text": "这个报告哪里有问题"}
     assert blocks[1] == {"type": "image_url",
@@ -35,7 +36,8 @@ def test_inject_omits_text_block_for_the_bare_image_marker():
     tail = [_img_row("m1")]
     out = worker._inject_tail_images(
         tail, user_id="u",
-        read_images=_fake_reader({"m1": {"image_mime": "image/jpeg", "image_b64": "AAAA"}}))
+        read_images=_fake_reader({"m1": {"image_mime": "image/jpeg", "image_b64": "AAAA"}}),
+        active_image_ids={"m1"})
     assert out[0]["content"] == [
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}}]
 
@@ -43,7 +45,12 @@ def test_inject_omits_text_block_for_the_bare_image_marker():
 def test_inject_only_takes_the_most_recent_N_images():
     tail = [_img_row(f"m{i}") for i in range(5)]
     payload = {f"m{i}": {"image_mime": "image/jpeg", "image_b64": "AAAA"} for i in range(5)}
-    out = worker._inject_tail_images(tail, user_id="u", read_images=_fake_reader(payload))
+    out = worker._inject_tail_images(
+        tail,
+        user_id="u",
+        read_images=_fake_reader(payload),
+        active_image_ids={f"m{i}" for i in range(5)},
+    )
     injected = [i for i, r in enumerate(out) if isinstance(r["content"], list)]
     assert injected == [3, 4]                       # newest _TAIL_IMAGE_LIMIT=2
     assert out[0]["content"] == "[image]"           # older rows stay text
@@ -55,7 +62,8 @@ def test_inject_skips_oversized_image_and_keeps_text():
     big = "A" * (worker._IMAGE_MAX_B64_CHARS + 1)
     out = worker._inject_tail_images(
         tail, user_id="u",
-        read_images=_fake_reader({"m1": {"image_mime": "image/jpeg", "image_b64": big}}))
+        read_images=_fake_reader({"m1": {"image_mime": "image/jpeg", "image_b64": big}}),
+        active_image_ids={"m1"})
     assert out[0]["content"] == "看看这个"           # degraded to text, turn still answers
 
 
@@ -63,7 +71,12 @@ def test_inject_degrades_silently_when_reader_raises():
     def _boom(user_id, message_ids):
         raise RuntimeError("enclave down")
     tail = [_img_row("m1", caption="看看这个")]
-    out = worker._inject_tail_images(tail, user_id="u", read_images=_boom)
+    out = worker._inject_tail_images(
+        tail,
+        user_id="u",
+        read_images=_boom,
+        active_image_ids={"m1"},
+    )
     assert out[0]["content"] == "看看这个"           # no-filler: never fail the turn
 
 
@@ -79,7 +92,8 @@ def test_inject_does_not_mutate_the_input_tail():
     original = dict(tail[0])
     worker._inject_tail_images(
         tail, user_id="u",
-        read_images=_fake_reader({"m1": {"image_mime": "image/jpeg", "image_b64": "AAAA"}}))
+        read_images=_fake_reader({"m1": {"image_mime": "image/jpeg", "image_b64": "AAAA"}}),
+        active_image_ids={"m1"})
     assert tail[0] == original
 
 
@@ -164,3 +178,39 @@ def test_historical_dedicated_image_is_not_observed_or_resent():
     )
 
     assert out[0]["content"] == "[image]"
+
+
+def test_historical_follow_main_image_is_not_resent():
+    tail = [_img_row("m1", caption="之前那张图")]
+    out = worker._inject_tail_images(
+        tail,
+        user_id="u",
+        read_images=lambda *_args: pytest.fail("historical pixels must not be read"),
+        active_image_ids=set(),
+    )
+
+    assert out[0]["content"] == "之前那张图"
+
+
+def test_current_dedicated_image_does_not_rehydrate_historical_follow_main_pixels():
+    tail = [
+        _img_row("old", caption="旧图"),
+        {
+            **_img_row("current", caption="看看新图"),
+            "vision_route_id": "vision-route",
+        },
+    ]
+
+    out = worker._inject_tail_images(
+        tail,
+        user_id="u",
+        read_images=lambda *_args: pytest.fail("historical pixels must not be read"),
+        active_image_ids={"current"},
+        read_vision_observations=lambda _user_id, _targets: {
+            "current": "A red square."
+        },
+    )
+
+    assert out[0]["content"] == "旧图"
+    assert "UNTRUSTED VISUAL OBSERVATION" in out[1]["content"]
+    assert "A red square." in out[1]["content"]

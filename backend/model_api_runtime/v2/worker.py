@@ -7382,10 +7382,10 @@ def _inject_tail_images(
 ) -> list[dict]:
     """Materialize V2 image rows without crossing the selected privacy route.
 
-    Follow-main rows become native image blocks. A pinned dedicated row is sent
-    only to the configured observer, and the main model receives its explicitly
-    untrusted text observation. Historical dedicated rows stay text-only so a
-    later turn never re-sends old pixels or repeats a paid observer call.
+    Current follow-main rows become native image blocks. A pinned dedicated row
+    is sent only to the configured observer, and the main model receives its
+    explicitly untrusted text observation. Historical image rows stay text-only
+    so a later turn never re-sends old pixels or repeats a paid observer call.
     """
     active_ids = set(active_image_ids or ())
     targets = [r for r in tail if r.get("has_image") and r.get("id")]
@@ -7420,6 +7420,7 @@ def _inject_tail_images(
         str(row["id"])
         for row in targets
         if not str(row.get("vision_route_id") or "")
+        and str(row["id"]) in active_ids
     ]
     fetched: dict[str, dict] = {}
     if wanted and read_images is not None:
@@ -7555,6 +7556,7 @@ async def process_job(
     lane = job.get("lane") or "chat"
     claimed_by = str(job.get("claimed_by") or "")
     observed_generation = int(job.get("input_generation") or 0)
+    reply_parent_message_id = ""
     if tm is None:
         tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
     tm.bind_provider(provider_config)
@@ -7580,6 +7582,24 @@ async def process_job(
             ):
                 raise LostJobLease("job lease expired or ownership changed")
 
+        async def _settle_failed_reply_target(code: str) -> None:
+            if lane != "chat" or not reply_parent_message_id:
+                return
+            try:
+                await asyncio.to_thread(
+                    db.chat_settle_failed_input,
+                    user_id,
+                    reply_parent_message_id,
+                    code,
+                )
+            except Exception as exc:  # noqa: BLE001 — failure marker remains visible
+                log.warning(
+                    "[v2.worker] failed-input settlement failed user=%s job=%s code=%s",
+                    user_id,
+                    job_id,
+                    type(exc).__name__.lower(),
+                )
+
         async def _fail_runtime_fence(code: str, detail: str) -> None:
             """Own terminal bookkeeping before raising ``RuntimeModeChanged``.
 
@@ -7594,6 +7614,7 @@ async def process_job(
                 claimed_by=claimed_by,
             )
             if owned and lane == "chat":
+                await _settle_failed_reply_target(code)
                 await asyncio.to_thread(
                     _surface_terminal_error,
                     deps,
@@ -9428,6 +9449,7 @@ async def process_job(
             jobs_store.mark_failed, job_id, message, claimed_by=claimed_by
         )
         if owned and lane == "chat":
+            await _settle_failed_reply_target(message)
             await asyncio.to_thread(
                 _surface_terminal_error, deps, user_id, job_id, message
             )
@@ -9468,6 +9490,25 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
     claimed_by = str(job.get("claimed_by") or "")
     lane = str(job.get("lane") or "chat")
     tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
+
+    async def _settle_traced_chat_failure(code: str) -> None:
+        trace_id = str(job.get("trace_id") or "")
+        if lane != "chat" or not trace_id:
+            return
+        try:
+            await asyncio.to_thread(
+                db.chat_settle_failed_input,
+                user_id,
+                trace_id,
+                code,
+            )
+        except Exception as exc:  # noqa: BLE001 — failure marker remains visible
+            log.warning(
+                "[v2.worker] traced failure settlement failed user=%s job=%s code=%s",
+                user_id,
+                job_id,
+                type(exc).__name__.lower(),
+            )
     if lane == _TRAJECTORY_REVIEW_LANE:
         return await _run_trajectory_review_turn(job, deps, tm)
     if lane in _EXTRACTION_LANES:
@@ -9675,6 +9716,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
                 jobs_store.mark_failed, job_id, err, claimed_by=claimed_by
             )
             if owned and lane == "chat":
+                await _settle_traced_chat_failure(err)
                 await asyncio.to_thread(
                     _surface_terminal_error, deps, user_id, job_id, err
                 )
@@ -9723,6 +9765,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
             jobs_store.mark_failed, job_id, message, claimed_by=claimed_by
         )
         if owned and lane == "chat":
+            await _settle_traced_chat_failure(message)
             await asyncio.to_thread(
                 _surface_terminal_error, deps, user_id, job_id, message
             )
