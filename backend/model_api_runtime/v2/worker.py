@@ -1994,10 +1994,17 @@ def _make_trajectory_recorder(
 
 
 _LEDGER_EVENTS = frozenset({"provider_response", "provider_error"})
+_LEDGER_ROUTE_ATTR = "_ledger_route"
 
 
 def _note_provider_attempt(
-    user_id: str, event_kind: str, payload: dict, *, job_id: Any = None
+    user_id: str,
+    event_kind: str,
+    payload: dict,
+    *,
+    job_id: Any = None,
+    provider: str = "",
+    model: str = "",
 ) -> None:
     """Mirror one provider outcome into the plaintext attempt ledger.
 
@@ -2024,8 +2031,8 @@ def _note_provider_attempt(
             parent_key=f"v2job:{job_id}" if job_id is not None else "v2job:unknown",
             trigger=trigger,
             outcome="provider_error" if failed else "ok",
-            provider=str(payload.get("provider") or ""),
-            model=str(payload.get("model") or ""),
+            provider=provider,
+            model=model,
             lane=lane,
             input_tokens=usage.get("prompt_tokens"),
             output_tokens=usage.get("completion_tokens"),
@@ -2046,17 +2053,38 @@ async def _mirror_provider_attempt(
     foreground turn's provider calls, so an AttributeError here would fail the
     very turns it exists to explain.
     """
+    # Route identity is announced once per turn and is NOT repeated on the
+    # provider_* events themselves, so stash it on the recorder (whose lifetime
+    # is exactly this job) for the ledger rows that follow. Caught in
+    # post-deploy regression: without this the ledger's provider/model were
+    # empty, which is most of what makes a V1-vs-V2 comparison readable.
+    if event_kind == "provider_config_resolved":
+        try:
+            setattr(
+                recorder,
+                _LEDGER_ROUTE_ATTR,
+                (
+                    str(payload.get("provider") or ""),
+                    str(payload.get("model") or ""),
+                ),
+            )
+        except Exception:  # noqa: BLE001 - narrow doubles may reject attributes
+            pass
+        return
     if event_kind not in _LEDGER_EVENTS:
         return
     user_id = str(getattr(recorder, "user_id", "") or "")
     if not user_id:
         return
+    provider, model = getattr(recorder, _LEDGER_ROUTE_ATTR, ("", ""))
     await asyncio.to_thread(
         _note_provider_attempt,
         user_id,
         event_kind,
         payload,
         job_id=getattr(recorder, "job_id", None),
+        provider=provider,
+        model=model,
     )
 
 

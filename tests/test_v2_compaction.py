@@ -402,3 +402,48 @@ def test_ledger_mirror_tolerates_a_recorder_without_user_id():
     asyncio.run(worker._mirror_provider_attempt(
         _NarrowSink(), "provider_response", {"response": {}}
     ))  # must not raise
+
+
+def test_ledger_carries_the_route_announced_at_turn_start():
+    """provider/model come from `provider_config_resolved`, not the call event.
+
+    The provider_* events carry no route identity, so a ledger row built only
+    from their payload has empty provider/model — which is most of what makes
+    the V1-vs-V2 comparison readable. Post-deploy regression on test caught
+    exactly that; this pins the fix.
+    """
+    import sys, pathlib as _p
+    sys.path.insert(0, str(_p.Path(__file__).parent.parent / "backend"))
+    from model_api_runtime.v2 import worker
+    import provider_attempt_ledger
+
+    class _Sink:
+        user_id = "usr_route"
+        job_id = 99
+
+        async def record(self, kind, payload):
+            return None
+
+    sink = _Sink()
+    seen = []
+    import unittest.mock as _mock
+    with _mock.patch.object(
+        provider_attempt_ledger, "record_runtime_attempt",
+        lambda uid, **kw: seen.append(kw) or True,
+    ):
+        # Turn start announces the route…
+        asyncio.run(worker._mirror_provider_attempt(
+            sink, "provider_config_resolved",
+            {"provider": "anthropic", "model": "claude-sonnet-4-6"},
+        ))
+        assert seen == []  # the announcement itself is not a ledger row
+        # …and every later provider outcome inherits it.
+        asyncio.run(worker._mirror_provider_attempt(
+            sink, "provider_response",
+            {"response": {"usage": {"prompt_tokens": 5059, "completion_tokens": 15}}},
+        ))
+
+    assert len(seen) == 1
+    assert seen[0]["provider"] == "anthropic"
+    assert seen[0]["model"] == "claude-sonnet-4-6"
+    assert seen[0]["input_tokens"] == 5059
