@@ -614,6 +614,120 @@ def test_fast_validation_genesis_user_is_complete_despite_empty_tabs():
     assert mg["passing"] is True  # cards exist -> garden satisfied (bucket-agnostic)
 
 
+def test_effective_responder_uses_current_fences_before_poll_samples():
+    now = 1_000.0
+    result = _dt._effective_responder(
+        route="resident",
+        consumer_state={
+            "poll_consumers": {
+                "resident-vps": {
+                    "responder": "resident",
+                    "last_poll_epoch": 999.0,
+                    "last_poll_at": "recent",
+                },
+                "agent-runner:u": {
+                    "responder": "hosted_v1",
+                    "last_poll_epoch": 998.0,
+                    "last_poll_at": "also recent",
+                },
+            }
+        },
+        runtime={
+            "hosted_runtime_state": "resident",
+            "model_api_route": {"is_active": True, "test_status": "ok"},
+            "runner_lease": {"active": True},
+        },
+        now_epoch=now,
+    )
+    assert result["effective_responder"] == "hosted_v1"
+    assert result["basis"] == "live_agent_runtime_lease"
+    assert result["mismatch"] is True
+    assert "non_model_api_route_with_hosted_responder" in result["mismatch_reasons"]
+    assert "multiple_responder_classes_detected" in result["mismatch_reasons"]
+    assert {item["responder"] for item in result["recent_poll_observations"]} == {
+        "hosted_v1",
+        "resident",
+    }
+
+
+def test_effective_responder_covers_v2_resident_and_none_states():
+    hosted_v2 = _dt._effective_responder(
+        route="model_api",
+        consumer_state=None,
+        runtime={
+            "hosted_runtime_state": "v2",
+            "model_api_route": {"is_active": True, "test_status": "ok"},
+            "runner_lease": {"active": False},
+        },
+        now_epoch=1_000.0,
+    )
+    assert hosted_v2["effective_responder"] == "hosted_v2"
+    assert hosted_v2["mismatch"] is False
+
+    resident = _dt._effective_responder(
+        route="resident",
+        consumer_state={
+            "poll_consumers": {
+                "resident-vps": {
+                    "responder": "resident",
+                    "last_poll_epoch": 999.0,
+                }
+            }
+        },
+        runtime={"hosted_runtime_state": "resident", "runner_lease": {"active": False}},
+        now_epoch=1_000.0,
+    )
+    assert resident["effective_responder"] == "resident"
+    assert resident["mismatch"] is False
+
+    none = _dt._effective_responder(
+        route="resident",
+        consumer_state=None,
+        runtime=None,
+        now_epoch=1_000.0,
+    )
+    assert none["effective_responder"] == "none"
+    assert none["mismatch"] is False
+
+    official_import = _dt._effective_responder(
+        route="official_import",
+        consumer_state={
+            "poll_consumers": {
+                "resident-vps": {
+                    "responder": "resident",
+                    "last_poll_epoch": 999.0,
+                }
+            }
+        },
+        runtime=None,
+        now_epoch=1_000.0,
+    )
+    assert official_import["effective_responder"] == "resident"
+    assert official_import["mismatch"] is True
+    assert (
+        "official_import_route_with_resident_poll"
+        in official_import["mismatch_reasons"]
+    )
+
+    stale_hosted = _dt._effective_responder(
+        route="resident",
+        consumer_state={
+            "poll_consumers": {
+                "agent-runner:u": {
+                    "responder": "hosted_v1",
+                    "last_poll_epoch": 1.0,
+                }
+            }
+        },
+        runtime=None,
+        now_epoch=1_000.0,
+    )
+    assert stale_hosted["effective_responder"] == "none"
+    assert stale_hosted["mismatch"] is False
+    assert stale_hosted["poll_observations"][0]["recent"] is False
+    assert stale_hosted["recent_poll_observations"] == []
+
+
 # App usage-duration rendering (app_session_end aggregation surfaced in the overview).
 def test_fmt_duration_sec_compact_human_readable():
     assert _dt._fmt_duration_sec(0) == "0s"

@@ -89,6 +89,11 @@ def _seed_model_api(user_id: str, *, provider: str, test_status: str,
     if test_status:
         db.model_api_route_mark_test(user_id, rid, status=test_status)
     db.model_api_route_activate(user_id, rid)
+    db.set_onboarding_route_strict(
+        user_id,
+        {"route": "model_api", "selected_at": "2026-07-27T00:00:00Z"},
+    )
+    return rid
 
 
 def _seed_all(_clean_blobs):
@@ -180,3 +185,82 @@ def test_list_enabled_users_ignores_explicit_opt_out_flag(_clean_blobs):
     _seed_model_api("usr_d", provider="openai", test_status="ok", agent_runtime_driver="legacy")
     rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users()}
     assert "usr_d" in rows and rows["usr_d"]["driver"] == "codex"
+
+
+def test_resident_route_is_excluded_and_switch_back_restores_route(_clean_blobs):
+    uid = "usr_route_owner"
+    route_id = _seed_model_api(uid, provider="anthropic", test_status="ok")
+    assert uid in {row["user_id"] for row in db.list_agent_runtime_enabled_users()}
+
+    db.set_onboarding_route_strict(
+        uid,
+        {"route": "resident", "selected_at": "2026-07-27T00:01:00Z"},
+    )
+    assert uid not in {row["user_id"] for row in db.list_agent_runtime_enabled_users()}
+    assert db.model_api_route_get(uid, route_id)["is_active"] is False
+
+    restored = db.set_onboarding_route_strict(
+        uid,
+        {"route": "model_api", "selected_at": "2026-07-27T00:02:00Z"},
+    )
+    assert restored == route_id
+    assert db.model_api_route_get(uid, route_id)["is_active"] is True
+    assert uid in {row["user_id"] for row in db.list_agent_runtime_enabled_users()}
+
+
+def test_missing_route_blob_fails_closed(_clean_blobs):
+    uid = "usr_missing_route_blob"
+    seed_user(uid)
+    cid = db.model_api_credential_create(
+        uid,
+        provider="anthropic",
+        base_url="",
+        label="key",
+        api_key_envelope=_ENV,
+        api_key_hint="sk-x...000",
+        supports_responses=False,
+    )
+    rid = db.model_api_route_upsert(uid, cid, "claude", None)
+    db.model_api_route_mark_test(uid, rid, status="ok")
+    db.model_api_route_activate(uid, rid)
+
+    assert uid not in {row["user_id"] for row in db.list_agent_runtime_enabled_users()}
+
+
+def test_route_conflict_audit_dry_run_matches_apply_and_reports_live_lease(_clean_blobs):
+    uid = "usr_route_audit"
+    route_id = _seed_model_api(uid, provider="anthropic", test_status="ok")
+    # Recreate the production inconsistency without using the fixed writer.
+    db.set_blob(
+        uid,
+        "onboarding_route",
+        {"route": "resident", "selected_at": "2026-07-27T00:03:00Z"},
+    )
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM agent_runtime_instances WHERE user_id = %s", (uid,))
+        conn.execute(
+            "INSERT INTO agent_runtime_instances "
+            "(user_id,driver,status,pid,lease_owner,lease_expires_at,runtime_home) "
+            "VALUES (%s,'claude','running',123,'supervisor-test',"
+            "now()+interval '5 minutes','/tmp/runtime')",
+            (uid,),
+        )
+
+    dry_rows = db.audit_resident_active_model_routes()
+    dry = next(row for row in dry_rows if row["user_id"] == uid)
+    assert dry["route_blob"]["route"] == "resident"
+    assert dry["model_api_route"] == {
+        "id": route_id,
+        "is_active": True,
+        "test_status": "ok",
+        "provider": "anthropic",
+        "model": "x",
+    }
+    assert dry["runner_lease"]["active"] is True
+
+    applied_rows = db.audit_resident_active_model_routes(apply=True)
+    assert next(row for row in applied_rows if row["user_id"] == uid) == dry
+    assert db.model_api_route_get(uid, route_id)["is_active"] is False
+    assert all(
+        row["user_id"] != uid for row in db.audit_resident_active_model_routes()
+    )

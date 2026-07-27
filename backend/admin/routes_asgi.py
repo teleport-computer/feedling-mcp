@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, quote, urlencode
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
+import db
 from admin import admin_core
 from admin import tee_replication as admin_tee_replication
 from asgi import threadpool
@@ -195,6 +196,28 @@ async def data_track_debug(request: Request):
     _require_admin(request)
     payload = await threadpool.run_db(admin_core.debug_payload, request.url.query)
     return JSONResponse(payload)
+
+
+@router.get("/v1/admin/route-fence-audit")
+async def route_fence_audit(request: Request):
+    """Read-only L1 inventory; remediation intentionally remains CLI-only."""
+    _require_admin(request)
+    rows = await threadpool.run_db(
+        db.audit_resident_active_model_routes,
+        apply=False,
+    )
+    return JSONResponse(
+        {
+            "mode": "dry_run",
+            "conflicts": len(rows),
+            "rows": rows,
+            "lease_source": {
+                "table": "agent_runtime_instances",
+                "cardinality": "one row per user (user_id primary key)",
+                "live_when": "lease_owner is set and lease_expires_at >= database now()",
+            },
+        }
+    )
 
 
 @router.get("/v1/admin/data-track/users/{user_id}")

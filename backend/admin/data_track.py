@@ -883,6 +883,144 @@ def _data_track_fast_validation(
     }
 
 
+def _effective_responder(
+    *,
+    route: str,
+    consumer_state: dict | None,
+    runtime: dict | None,
+    now_epoch: float | None = None,
+) -> dict:
+    """Classify who can answer, keeping current facts separate from samples.
+
+    A live V1 lease and V2 ownership are current control-plane facts. Poll rows
+    are recent observations only; they never prove that a process is still
+    running. This distinction is surfaced verbatim in the payload/UI because a
+    single last-writer-wins ``consumer_id`` caused the original misdiagnosis.
+    """
+    now = time.time() if now_epoch is None else float(now_epoch)
+    state = consumer_state if isinstance(consumer_state, dict) else {}
+    runtime_data = runtime if isinstance(runtime, dict) else {}
+    lease = runtime_data.get("runner_lease")
+    lease = lease if isinstance(lease, dict) else {}
+    model_route = runtime_data.get("model_api_route")
+    model_route = model_route if isinstance(model_route, dict) else {}
+    runtime_state = str(
+        runtime_data.get("hosted_runtime_state") or "resident"
+    ).strip().lower()
+
+    raw_pollers = state.get("poll_consumers")
+    pollers = raw_pollers if isinstance(raw_pollers, dict) else {}
+    # Backward compatibility for states written before poll_consumers existed.
+    if not pollers and state.get("last_poll_epoch"):
+        consumer_id = str(state.get("consumer_id") or "")
+        responder = (
+            "hosted_v1"
+            if consumer_id.startswith("agent-runner:")
+            else "hosted_v2"
+            if consumer_id == "hosted_runtime_v2"
+            else "resident"
+        )
+        pollers = {
+            consumer_id or str(state.get("consumer_name") or "unknown"): {
+                "consumer_id": consumer_id,
+                "consumer_name": str(state.get("consumer_name") or ""),
+                "responder": responder,
+                "last_poll_at": str(state.get("last_poll_at") or ""),
+                "last_poll_epoch": state.get("last_poll_epoch"),
+            }
+        }
+
+    poll_observations = []
+    for identity, value in pollers.items():
+        if not isinstance(value, dict):
+            continue
+        try:
+            last_epoch = float(value.get("last_poll_epoch") or 0)
+        except (TypeError, ValueError):
+            last_epoch = 0.0
+        age_sec = max(0.0, now - last_epoch) if last_epoch > 0 else None
+        responder = str(value.get("responder") or "")
+        if responder not in {"hosted_v1", "hosted_v2", "resident"}:
+            consumer_id = str(value.get("consumer_id") or "")
+            responder = (
+                "hosted_v1"
+                if consumer_id.startswith("agent-runner:")
+                else "hosted_v2"
+                if consumer_id == "hosted_runtime_v2"
+                else "resident"
+            )
+        poll_observations.append(
+            {
+                "identity": str(identity),
+                "responder": responder,
+                "last_poll_at": str(value.get("last_poll_at") or ""),
+                "last_poll_epoch": last_epoch,
+                "age_sec": int(age_sec) if age_sec is not None else None,
+                "recent": bool(
+                    age_sec is not None
+                    and age_sec <= chat_consumer._CONSUMER_RECENT_SEC
+                ),
+            }
+        )
+    poll_observations.sort(
+        key=lambda item: item["last_poll_epoch"],
+        reverse=True,
+    )
+    recent_polls = [item for item in poll_observations if item["recent"]]
+
+    v2_owned = runtime_state in {"v2", "draining"}
+    v1_lease_active = bool(lease.get("active"))
+    current = []
+    if v1_lease_active:
+        current.append("hosted_v1")
+    if v2_owned:
+        current.append("hosted_v2")
+    detected = set(current)
+    detected.update(item["responder"] for item in recent_polls)
+
+    if v2_owned:
+        effective = "hosted_v2"
+        basis = "v2_runtime_ownership"
+    elif v1_lease_active:
+        effective = "hosted_v1"
+        basis = "live_agent_runtime_lease"
+    elif recent_polls:
+        effective = recent_polls[0]["responder"]
+        basis = "most_recent_poll_observation"
+    else:
+        effective = "none"
+        basis = "no_current_or_recent_evidence"
+
+    mismatch_reasons = []
+    hosted_detected = bool(detected & {"hosted_v1", "hosted_v2"})
+    if route != "model_api" and hosted_detected:
+        mismatch_reasons.append("non_model_api_route_with_hosted_responder")
+    if route == "official_import" and "resident" in detected:
+        mismatch_reasons.append("official_import_route_with_resident_poll")
+    if route == "model_api" and "resident" in detected:
+        mismatch_reasons.append("model_api_route_with_resident_poll")
+    if len(detected) > 1:
+        mismatch_reasons.append("multiple_responder_classes_detected")
+    if route != "model_api" and bool(model_route.get("is_active")):
+        mismatch_reasons.append("non_model_api_route_with_active_model_route")
+
+    return {
+        "effective_responder": effective,
+        "basis": basis,
+        "mismatch": bool(mismatch_reasons),
+        "mismatch_reasons": mismatch_reasons,
+        "current_control_plane": sorted(current),
+        "poll_observations": poll_observations,
+        "recent_poll_observations": recent_polls,
+        "criteria": (
+            "current: live agent_runtime_instances lease => hosted_v1; "
+            "v2_runtime_state v2/draining => hosted_v2. "
+            "observed: each consumer identity's poll within the recent window; "
+            "poll evidence is not proof the process is still running."
+        ),
+    }
+
+
 def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
     user_id = str(user_entry.get("user_id") or "")
     blobs = dict(snap.get("blobs") or {})
@@ -936,7 +1074,7 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
     )
     passing = bool(validation.get("passing"))
     stuck_for_sec = 0 if passing else int(max(0, time.time() - latest_epoch)) if latest_epoch else None
-    return {
+    row = {
         "user_id": user_id,
         "principal_id": user_entry.get("principal_id") or "",
         "registered_at": registered_at,
@@ -971,6 +1109,16 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
         "bootstrap_events": bootstrap_events,
         "history_import": history_import,
     }
+    row["responder"] = _effective_responder(
+        route=route,
+        consumer_state=(
+            blobs.get("consumer_state")
+            if isinstance(blobs.get("consumer_state"), dict)
+            else None
+        ),
+        runtime=snap.get("responder_runtime"),
+    )
+    return row
 
 
 def _push_stats_from_user_entry(user_entry: dict) -> dict:
@@ -1173,6 +1321,16 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         )
         detail_snapshot = db.admin_data_track_snapshot([user_id]).get(user_id, {})
         row["app_usage"] = _data_track_app_usage_from_snapshot(detail_snapshot)
+        detail_blobs = detail_snapshot.get("blobs") or {}
+        row["responder"] = _effective_responder(
+            route=route,
+            consumer_state=(
+                detail_blobs.get("consumer_state")
+                if isinstance(detail_blobs.get("consumer_state"), dict)
+                else None
+            ),
+            runtime=detail_snapshot.get("responder_runtime"),
+        )
         row["daily_usage"] = db.admin_data_track_user_daily_usage(
             user_id=user_id,
             days=daily_days,
@@ -3923,6 +4081,18 @@ def _render_user_detail_page(user: dict) -> str:
     qs = _data_track_qs()
     back = f"/admin/data-track?{qs}" if qs else "/admin/data-track"
     safe_json = json.dumps(_bj_deep(user), ensure_ascii=False, indent=2)
+    responder = user.get("responder") if isinstance(user.get("responder"), dict) else {}
+    responder_name = str(responder.get("effective_responder") or "none")
+    mismatch = bool(responder.get("mismatch"))
+    mismatch_reasons = ", ".join(
+        str(reason) for reason in responder.get("mismatch_reasons") or []
+    )
+    responder_notice = (
+        f'<div class="responder-alert"><strong>RESPONDER MISMATCH</strong>: '
+        f'{html.escape(mismatch_reasons or "route/evidence conflict")}</div>'
+        if mismatch
+        else ""
+    )
     return f"""<!doctype html>
 <html>
 <head>
@@ -3956,6 +4126,7 @@ def _render_user_detail_page(user: dict) -> str:
     .daily-track span {{ display:block; height:100%; min-width:0; background:var(--accent); border-radius:4px; }}
     .daily-track.daily-zero {{ background:#e7e2de; border:1px dashed #c9beb6; box-sizing:border-box; }}
     .daily-note {{ margin-top:7px; font-size:12px; }}
+    .responder-alert {{ margin:10px 0; padding:11px 13px; color:#8f1711; background:#fff0ee; border:2px solid #c62f25; border-radius:8px; }}
   </style>
 </head>
 <body>
@@ -3973,7 +4144,10 @@ def _render_user_detail_page(user: dict) -> str:
     <div class="card"><div class="value">{html.escape(user.get('provider_state') or 'ok')}</div><div class="label">provider state</div></div>
     <div class="card"><div class="value">{html.escape(_bj_iso(user.get('last_provider_success_at')) or 'never')}</div><div class="label">last provider success</div></div>
     <div class="card"><div class="value">{html.escape(user.get('last_provider_error_class') or 'none')}</div><div class="label">latest provider error</div></div>
+    <div class="card"><div class="value">{html.escape(responder_name)}</div><div class="label">effective responder</div></div>
   </section>
+  {responder_notice}
+  <div class="muted">Responder 判据：{html.escape(str(responder.get('criteria') or 'unavailable'))}</div>
   {_render_user_daily_usage(user)}
   {_render_perception_permissions(user)}
   {_render_perception_freshness(user)}

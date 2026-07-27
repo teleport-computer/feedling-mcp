@@ -21,6 +21,15 @@ and a live Hosted Runtime V2 worker pool. Runtime-control, worker-liveness,
 kill-switch, and admission failures are returned before the user message is
 stored.
 
+The account's selected onboarding route is the execution-ownership switch.
+Hosted Runtime V1 is eligible only when that selector is positively
+`model_api`; Runtime V2's `v2`/`draining` ownership fence excludes V1
+independently. Switching the selector to `resident` or `official_import`
+atomically deactivates the active V1 model route. Switching back to `model_api`
+restores the most recently updated tested-ok route when one exists. Missing or
+legacy selector state fails closed for V1, so it cannot silently run beside an
+independent resident.
+
 ### 1. Send the turn
 
 At least one of `message`, `image_b64`, or `file_b64` is required. `message` is
@@ -175,6 +184,11 @@ Both editable source and rendered output are limited to 1,000,000 bytes.
 
 The resident path is a queue-and-reply protocol. It does not accept plaintext
 message bodies.
+
+Select the account's `resident` route before operating this loop. That route is
+also the hosted-V1 kill switch; changing it away from `resident` transfers
+execution ownership to the selected path. Poll claims remain database-atomic, so
+two healthy poll consumers cannot both claim the same parent turn.
 
 CLI residents (Claude, Codex, and Pi) can also generate native download cards.
 The agent writes UTF-8 Markdown-like source inside its private
