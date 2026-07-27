@@ -112,6 +112,19 @@ def test_recent_runtime_health_respects_window():
     assert lanes_168["chat"]["failed"] == 1
 
 
+def test_recent_runtime_health_zero_sample_rate_is_none():
+    # 零样本（全是 superseded）与零失败（有 completed）必须可区分。
+    # 该 lane 出现在结果里（不是被整个过滤掉），但 sampled_jobs=0 故 failure_rate=None。
+    _add_job("u_rh_sup_only_1", "chat", "superseded")
+    _add_job("u_rh_sup_only_2", "chat", "superseded")
+
+    lanes = {r["lane"]: r for r in jobs_store.recent_runtime_health()["lanes"]}
+
+    assert lanes["chat"]["superseded"] == 2
+    assert lanes["chat"]["sampled_jobs"] == 0
+    assert lanes["chat"]["failure_rate"] is None  # 零样本，不是零失败
+
+
 def test_recent_runtime_health_is_empty_without_history():
     health = jobs_store.recent_runtime_health()
     assert health["lanes"] == []
