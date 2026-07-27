@@ -92,7 +92,11 @@ def test_already_running_aborts_replicate_phase(monkeypatch):
     # reconcile ran; snapshot also raises AlreadyRunning but only logs (no return,
     # unlike the replicate loop) so the tick proceeds to replicate, which then
     # raises AlreadyRunning on the first table → return before the rest.
-    assert calls == [("reconcile", None), ("snapshot", None), ("replicate", "chat_messages")]
+    # 中止发生在 replicate 循环的第一张表上；表名随注册表内容变化，别写死。
+    # （2026-07-28：密文表从手写元组改为按字母序派生后，首张已从 chat_messages
+    #  变成 chat_message_archive。）
+    first = sched._ciphertext_tables()[0]
+    assert calls == [("reconcile", None), ("snapshot", None), ("replicate", first)]
 
 
 def test_unconfigured_aborts_silently(monkeypatch):
