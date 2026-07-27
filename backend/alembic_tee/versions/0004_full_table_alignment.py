@@ -25,12 +25,23 @@ TEE 成为 RDS 的完整副本以备扶正，就不能留这个缺口。
    要求 body_ct/K_enclave 等键存在，明文行必然违反）。derive_tee_ddl.py 本身不导出任何
    CHECK 约束，所以这两条不是"从草稿里删掉"，而是从一开始就没被派生出来——本轮审校
    逐表核对 pg_constraint 确认这是仅有的两条信封 CHECK，且没有别的 CHECK 意外带入。
-2. per-user FK 指向 TEE 自己的 users 表，ON DELETE CASCADE（与 RDS 侧逐表核对一致，
-   包括 v2_turn_metrics.user_id 可空但仍带 FK 的这一特例）。RDS 侧还有一批表间 FK
-   （如 agent_action_queue.job_id → agent_jobs.id、v2_trajectory_streams.job_id →
-   agent_jobs.id 等），本 revision 未带：TEE 侧各表走独立的 lane 刷新（SNAPSHOT 是
-   逐表 TRUNCATE+COPY），带上跨表 FK 会在刷新顺序不确定时产生级联误删，留给
-   Task 5/7 的写路径落地后按需再评估是否需要。
+2. per-user FK 指向 TEE 自己的 users 表，ON DELETE CASCADE——**但只在 RDS 侧这张表
+   本来就有 user_id → users 的 FK 时才加**。第一版审校曾用"有 user_id 列就加 FK"
+   的规则，这是错的：TEE 是 RDS 的副本，副本的约束比源库更严格，就意味着源库里
+   合法的数据在副本插不进去。复核发现 6 张表在 RDS 侧根本没有这条 FK——
+   agent_action_queue（RDS 只有 job_id→agent_jobs）、chat_r2_cleanup（RDS 无 FK）、
+   chat_r2_lifecycle（RDS 无 FK；prod 实测 32/344 行是孤儿，user_id 已不在 users
+   里——这不是假设风险，加了 FK 会让 Task 5 的 SNAPSHOT TRUNCATE+COPY 单事务每个
+   tick 都因这 32 行整表失败）、v2_terminal_failure_outbox（RDS 只有
+   job_id→agent_jobs）、v2_trajectory_events（RDS 只有复合 FK
+   (job_id,user_id)→v2_trajectory_streams，没有单独的 user_id→users）、
+   v2_user_allowlist（RDS 无 FK）。这 6 张表已不带 user_id FK；derive_tee_ddl.py 的
+   判定规则也已同步改为查询 RDS 实际 FK（见 _has_user_fk），不再按列名猜测。
+   其余 21 张确有该 FK 的表核对无误，含 v2_turn_metrics.user_id 可空但仍带 FK 的特例。
+   RDS 侧还有一批表间 FK（如 agent_action_queue.job_id → agent_jobs.id、
+   v2_trajectory_streams.job_id → agent_jobs.id 等），本 revision 未带：TEE 侧各表
+   走独立的 lane 刷新（SNAPSHOT 是逐表 TRUNCATE+COPY），带上跨表 FK 会在刷新顺序
+   不确定时产生级联误删，留给 Task 5/7 的写路径落地后按需再评估是否需要。
 3. 索引只带 PK；两张恢复表额外带回原有的 lease/updated_at 索引（有明确读路径在用），
    其余 32 张新表不带任何非 PK 索引——TEE 是副本，写模式是批量替换，Task 5/7 前没有
    已知读路径，多余索引只是写放大。RDS 侧还有几个业务 UNIQUE 约束（如
@@ -175,8 +186,9 @@ CREATE TABLE IF NOT EXISTS v2_trajectory_events (
     payload_bytes    INTEGER NOT NULL,
     truncated        BOOLEAN NOT NULL DEFAULT false,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (job_id, event_index),
-    FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
+    -- RDS 侧没有单独的 user_id → users FK（只有复合 FK 指向
+    -- v2_trajectory_streams(job_id,user_id)），故不带，见 docstring 第 2 类改动。
+    PRIMARY KEY (job_id, event_index)
 );
 
 CREATE TABLE IF NOT EXISTS v2_trajectory_reviews (
@@ -227,8 +239,9 @@ CREATE TABLE IF NOT EXISTS agent_action_queue (
     created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
     started_at                TIMESTAMPTZ,
     finished_at               TIMESTAMPTZ,
-    PRIMARY KEY (id),
-    FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
+    PRIMARY KEY (id)
+    -- RDS 侧没有 user_id → users FK（只有 job_id→agent_jobs），故不带，见 docstring
+    -- 第 2 类改动。
 );
 
 CREATE TABLE IF NOT EXISTS agent_jobs (
@@ -279,8 +292,8 @@ CREATE TABLE IF NOT EXISTS chat_r2_cleanup (
     last_attempt_at TIMESTAMPTZ,
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_error      TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (body_key),
-    FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
+    PRIMARY KEY (body_key)
+    -- RDS 侧没有任何 FK，故不带 user_id → users FK，见 docstring 第 2 类改动。
 );
 
 CREATE TABLE IF NOT EXISTS chat_r2_lifecycle (
@@ -291,8 +304,9 @@ CREATE TABLE IF NOT EXISTS chat_r2_lifecycle (
     inventory_attempt_count   INTEGER NOT NULL DEFAULT 0,
     inventory_last_error      TEXT NOT NULL DEFAULT '',
     updated_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (user_id),
-    FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
+    PRIMARY KEY (user_id)
+    -- RDS 侧没有任何 FK；prod 实测 32/344 行 user_id 已不在 users 里，
+    -- 加 FK 会让 SNAPSHOT 的 TRUNCATE+COPY 整表失败，见 docstring 第 2 类改动。
 );
 
 CREATE TABLE IF NOT EXISTS dau_daily_snapshot (
@@ -481,8 +495,9 @@ CREATE TABLE IF NOT EXISTS v2_terminal_failure_outbox (
     runtime_error_next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_at                    TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at                    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (job_id),
-    FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
+    PRIMARY KEY (job_id)
+    -- RDS 侧没有 user_id → users FK（只有 job_id→agent_jobs），故不带，见 docstring
+    -- 第 2 类改动。
 );
 
 CREATE TABLE IF NOT EXISTS v2_trajectory_access_audit (
@@ -542,8 +557,8 @@ CREATE TABLE IF NOT EXISTS v2_user_allowlist (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_by TEXT NOT NULL DEFAULT '',
     note       TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (user_id),
-    FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE
+    PRIMARY KEY (user_id)
+    -- RDS 侧没有任何 FK，故不带 user_id → users FK，见 docstring 第 2 类改动。
 );
 
 CREATE TABLE IF NOT EXISTS v2_wake_schedule (
