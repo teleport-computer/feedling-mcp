@@ -10,6 +10,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Chat route selection now fences Hosted Runtime V1 from independent
+  residents.** The onboarding route is the execution-ownership source of truth:
+  V1 discovery requires an explicit `model_api` selector in addition to a
+  tested active model route and the existing Runtime V2 fence. Switching to
+  `resident` or `official_import` deactivates the V1 route atomically; switching
+  back restores the most recently updated tested-ok route. Missing selector
+  state fails closed. Operations telemetry now keeps recent polls per consumer
+  identity, reports the effective responder and its evidence, and marks
+  route/lease/poll conflicts instead of treating the last poller as proof that
+  another process stopped.
+
 - **Runtime V2 Chat failures no longer leave the sender waiting silently.**
   A failed or expired foreground turn now commits a parent-linked encrypted
   failure reply carrying the same `turn_failure_error_class`,
