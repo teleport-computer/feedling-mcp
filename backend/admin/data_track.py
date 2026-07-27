@@ -695,11 +695,18 @@ def _connection_health(route: str, access_modes: list, chat: dict) -> dict:
     rm = modes.get("resident", {})
     seen = rm.get("last_seen_at") or ""
     sh = age_h(seen)
-    if rm.get("connected") and (sh is None or sh > _CONN_STALE_H):
+    # Liveness is `last_seen_at`, never the `connected` flag. That flag only
+    # means "a binding row exists", and bindings are append-only — the backend
+    # upserts one for the active route on every whoami and never clears the old
+    # ones — so it stays true forever once a user has merely *selected* a route.
+    # Trusting it labelled 103 of 278 prod resident users 掉线 ("it broke, go
+    # debug their consumer") when the truth was 未连接 ("they never ran one").
+    # Those are two different next actions for whoever picks up the ticket.
+    if not seen:
+        return {"status": "idle", "label": "未连接", "last_seen_at": "", "stale_h": None}
+    if sh is None or sh > _CONN_STALE_H:
         return {"status": "offline", "label": "掉线", "last_seen_at": seen, "stale_h": sh}
-    if rm.get("connected"):
-        return {"status": "ok", "label": "在线", "last_seen_at": seen, "stale_h": sh}
-    return {"status": "idle", "label": "未连接", "last_seen_at": seen, "stale_h": sh}
+    return {"status": "ok", "label": "在线", "last_seen_at": seen, "stale_h": sh}
 
 
 def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:

@@ -965,3 +965,41 @@ def test_detail_payload_exposes_permission_metadata_without_private_directive(cl
     assert "<private>" not in rendered
     assert "&lt;script&gt;" in rendered
     assert "&lt;private&gt;" in rendered
+
+
+def test_connection_health_separates_never_connected_from_went_offline():
+    """`connected` means "a binding row exists", not "a consumer is alive".
+
+    Access bindings are append-only: the backend upserts one for the active
+    route on every whoami and never clears the old ones, so the flag stays
+    true forever once a user has merely *selected* the resident route. Reading
+    it as liveness labelled 103 of 278 prod resident users 掉线 — "it broke, go
+    debug their consumer" — when the truth was 未连接, "they never ran one".
+    Support acts differently on those two, so the panel must not merge them.
+    """
+    from admin import data_track as _dt
+
+    def health(last_seen_at: str, *, connected: bool = True) -> dict:
+        return _dt._connection_health(
+            "resident",
+            [{"access_mode": "resident", "connected": connected,
+              "last_seen_at": last_seen_at}],
+            {},
+        )
+
+    never = health("")
+    assert (never["status"], never["label"]) == ("idle", "未连接")
+    assert never["stale_h"] is None, "no sighting means no age to report"
+
+    # Same append-only binding, but this consumer really did phone home once.
+    long_ago = (datetime.now() - timedelta(hours=_dt._CONN_STALE_H + 3)).isoformat()
+    gone = health(long_ago)
+    assert (gone["status"], gone["label"]) == ("offline", "掉线")
+    assert gone["stale_h"] > _dt._CONN_STALE_H
+
+    fresh = health(datetime.now().isoformat())
+    assert (fresh["status"], fresh["label"]) == ("ok", "在线")
+
+    # A live sighting outranks a missing/false binding flag: liveness is the
+    # heartbeat, and the flag is the thing we stopped trusting.
+    assert health(datetime.now().isoformat(), connected=False)["status"] == "ok"
