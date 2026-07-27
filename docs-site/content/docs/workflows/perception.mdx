@@ -168,6 +168,7 @@ X-API-Key: YOUR_FEEDLING_API_KEY
   "in_focus": true,
   "app_name": null,
   "app_category": null,
+  "app_state": null,
   "user_state": "default",
   "recent_apps": []
 }
@@ -227,11 +228,15 @@ other sensitive content through it unless that storage exposure is acceptable
 for your threat model. New sensitive-signal integrations should use encrypted
 `context_snapshot` envelopes.
 
-## App-open shortcut
+## App-open / app-close shortcuts
 
-`GET /v1/perception/app_open` is a compatibility endpoint with a write side
-effect. This is an important exception to the usual assumption that GET is
-read-only.
+`GET /v1/perception/app_open` and `GET /v1/perception/app_close` are
+compatibility endpoints with a write side effect. This is an important
+exception to the usual assumption that GET is read-only. They correspond to
+the "is opened" and "is closed" trigger options on the same iOS Shortcuts App
+automation; a user can configure only one of the two automations, and the
+other being absent is a benign degradation (you simply lose that half of the
+signal, nothing errors).
 
 ```http
 GET /v1/perception/app_open?app=Notes&category=productivity&ts=1783978500.125 HTTP/1.1
@@ -248,17 +253,40 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 }
 ```
 
-Do not retry it blindly after an ambiguous timeout; a retry can append a second
-usage event.
+```http
+GET /v1/perception/app_close?app=Notes&ts=1783980000.125 HTTP/1.1
+Host: api.feedling.app
+X-API-Key: YOUR_FEEDLING_API_KEY
+```
+
+```json
+{
+  "status": "ok",
+  "app": "Notes",
+  "ts": 1783980000.125
+}
+```
+
+Do not retry either one blindly after an ambiguous timeout; a retry can append
+a second usage event.
+
+A close only updates the current-app state when the closed app is the one
+currently recorded as in the foreground. An older app that was killed in the
+background by the OS — and reports its close after a newer app has already
+opened — is recorded in the app-close history but does not clobber whichever
+app is actually current.
 
 ### Reading app usage back
 
 Each call writes to two places: the current-app snapshot fields (`app_name` /
-`app_category`, which expire 15 minutes after the reported open) and an
-append-only app-open history.
+`app_category` / `app_state`, which expire 15 minutes after the reported open
+or close) and an append-only app-open/app-close history. `app_state` is
+`"foreground"` after an open and `"closed"` after a matching close; it is
+`null` when no open has been reported yet.
 
-The shortcut reports opens and never reports a close, so `app_name` means "the
-last open observed within the TTL", not "this app is on screen now".
+The shortcut reports opens and closes, so `app_name` means "the app named in
+the most recent open-or-matching-close event observed within the TTL" — check
+`app_state` if you need to distinguish "still in it" from "just left it".
 
 `GET /v1/agent/perception/recent_apps` reads the history:
 

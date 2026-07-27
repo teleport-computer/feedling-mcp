@@ -258,6 +258,19 @@ OPERATION_PARAMETERS: dict[Operation, list[dict[str, Any]]] = {
         _query("ts", TIMESTAMP, "Client event Unix timestamp.", example=1783962000.0),
         _query("client_ts", TIMESTAMP, "Compatibility alias for ts.", deprecated=True),
     ],
+    ("get", "/v1/perception/app_close"): [
+        _query(
+            "app",
+            _schema("string", minLength=1),
+            "Application name or identifier. The public contract requires this canonical parameter; bundle_id remains a deprecated runtime alias.",
+            required=True,
+            example="com.apple.MobileSafari",
+        ),
+        _query("bundle_id", _schema("string"), "Compatibility alias for app.", deprecated=True),
+        _query("category", _schema("string"), "Optional application category.", example="browser"),
+        _query("ts", TIMESTAMP, "Client event Unix timestamp.", example=1783962000.0),
+        _query("client_ts", TIMESTAMP, "Compatibility alias for ts.", deprecated=True),
+    ],
     ("get", "/v1/proactive/jobs/poll"): [
         _query("since", TIMESTAMP, "Return jobs newer than this Unix timestamp.", example=1783962000.0),
         _query("timeout", _schema("number", minimum=0, maximum=60, default=30), "Long-poll wait in seconds.", example=30),
@@ -1654,6 +1667,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/memory/actions"): "Apply up to 20 memory actions in order. The batch is not transactional and Idempotency-Key is not supported.",
     ("post", "/v1/perception/report"): "Submit device context. Sensitive signals must use encrypted envelopes; inspect each results entry even when HTTP status is 200.",
     ("get", "/v1/perception/app_open"): "Legacy iOS Shortcut compatibility endpoint. This GET records an event and therefore has side effects.",
+    ("get", "/v1/perception/app_close"): "iOS Shortcut compatibility endpoint for the automation's \"is closed\" trigger. This GET records an event and therefore has side effects.",
     ("post", "/v1/users/register"): "Create a Feedling user and issue its first API key. The key is returned once and this operation is not idempotent.",
     ("post", "/v1/access/claim-token"): "Consume a one-time link token and issue an additional API key. Existing keys remain active.",
     ("post", "/v1/account/recover/verify"): "Verify keypair possession and issue an additional API key for the existing account. Existing keys remain active.",

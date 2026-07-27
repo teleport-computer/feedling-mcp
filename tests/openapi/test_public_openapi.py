@@ -171,7 +171,8 @@ def test_public_operation_and_parameter_inventory(
     # only the POST carries a body, hence 67 -> 68.
     # 149 since GET /v1/model_api/usage (provider balance/usage snapshot).
     # 150 since POST /v1/model_api/models (BYOK model catalog listing, has a body).
-    assert len(operations) == 150
+    # 151 since GET /v1/perception/app_close (app_open's "is closed" trigger counterpart).
+    assert len(operations) == 151
     assert sum("requestBody" in operation for operation in operations.values()) == 69
 
     query_operations = {
@@ -180,7 +181,7 @@ def test_public_operation_and_parameter_inventory(
     header_operations = {
         key for key, operation in operations.items() if _parameters(operation, "header")
     }
-    assert len(query_operations) == 32
+    assert len(query_operations) == 33
     assert header_operations == set(EXPECTED_HEADER_OPERATIONS)
 
     for key, expected_names in EXPECTED_HEADER_OPERATIONS.items():
