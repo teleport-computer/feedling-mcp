@@ -521,6 +521,9 @@ _TAIL_FILE_LIMIT = int(os.environ.get("FEEDLING_V2_TAIL_FILE_LIMIT", "2"))
 # 单个 native tool loop 的 provider 调用硬闸。最后一次调用会禁用
 # tools 来强制收口，使模型无法用无限工具链烧穿用户的 BYOK key。
 _TURN_MAX_LLM_CALLS = int(os.environ.get("FEEDLING_V2_TURN_MAX_LLM_CALLS", "6"))
+_FILE_TURN_MAX_LLM_CALLS = int(
+    os.environ.get("FEEDLING_V2_FILE_TURN_MAX_LLM_CALLS", "10")
+)
 _SUBAGENT_MAX_LLM_CALLS = _positive_int_env("FEEDLING_V2_SUBAGENT_MAX_LLM_CALLS", "4")
 _SUBAGENT_MAX_TOTAL_LLM_CALLS = _positive_int_env(
     "FEEDLING_V2_SUBAGENT_MAX_TOTAL_LLM_CALLS", "12"
@@ -987,6 +990,9 @@ class TurnDeps:
     # callbacks above so a positional float/int mix-up cannot silently drop a
     # same-timestamp message during rollout.
     read_messages_after_seq: Callable[[str, int], list[dict]] | None = None
+    # Production chat preserves one visible reply per user message. Later sends
+    # stay queued behind the current turn instead of being folded into it.
+    ordered_chat_replies: bool = False
     runtime_mode_enabled: Callable[[str], bool] | None = None
     # (user_id) -> bool：用户的「联网搜索」开关。None / 抛异常 / 非 bool 返回值
     # 一律按禁用处理（见 web_gate.resolve_user_enabled）。默认 None：worker.py
@@ -1056,6 +1062,8 @@ class TurnDeps:
     # metadata. Plaintext remains in the scheduled-wake record; only bounded
     # task identity/state metadata may be attached to the visible activity.
     read_scheduled_wake_context: Callable[[str, int], list[dict]] | None = None
+    # Pending timer identity lets follow-ups use a backend-confirmed wake_id.
+    read_pending_scheduled_wake_context: Callable[[str], dict] | None = None
     # (user_id, actions) -> result dict：把抽取产出的 memory.add/memory.supersede action 落库
     # （走既有 /v1/memory/actions 同路径的服务端实现）。None 时跳过持久化、仍干净 mark_completed
     # （让 handler 无 DB/enclave 也可单测）。
@@ -1366,17 +1374,18 @@ async def _dispatch_mixed_tool_calls(
         ):
             run, reservation_index = _workspace_run(reservation_index)
             valid_run = _valid_workspace_calls(run)
-            if valid_run and prepare_workspace_batch is not None:
-                prepared = prepare_workspace_batch(valid_run)
-                if inspect.isawaitable(prepared):
-                    await prepared
-            elif prepare_platform_mutation is not None:
-                # Compatibility for callers that opt into scheduling batches but
-                # have not adopted parent-effect reservations.
-                for candidate in run:
-                    prepared = prepare_platform_mutation(candidate)
+            if valid_run:
+                if prepare_workspace_batch is not None:
+                    prepared = prepare_workspace_batch(valid_run)
                     if inspect.isawaitable(prepared):
                         await prepared
+                elif prepare_platform_mutation is not None:
+                    # Compatibility for callers that opt into scheduling batches
+                    # but have not adopted parent-effect reservations.
+                    for candidate in valid_run:
+                        prepared = prepare_platform_mutation(candidate)
+                        if inspect.isawaitable(prepared):
+                            await prepared
             continue
         if kind == "platform" and prepare_platform_mutation is not None:
             prepared = prepare_platform_mutation(tc)
@@ -3507,6 +3516,7 @@ def _valid_workspace_tool_calls(tool_calls) -> list[Any]:
         if tc.name in {"workspace_write", "workspace_delete"}
         and tc.args_ok
         and cap_tool_schema.validate_tool_args(tc.name, tc.args) is None
+        and v2_executor.workspace_mutation_path_error(tc.name, tc.args) is None
     ]
 
 
@@ -3582,17 +3592,39 @@ def _workspace_batch_tool_results(
         if str(item.get("effect_id") or "") != expected_effect_id:
             raise RuntimeError("workspace batch child result identity is invalid")
         status = str(item.get("status") or "")
-        if status == "applied" and set(item) == {"effect_id", "status"}:
-            content = f"ok: {tc.name} applied"
+        if status == "applied" and set(item) in (
+            {"effect_id", "status"},
+            {"effect_id", "status", "revision"},
+        ):
+            revision = item.get("revision")
+            if type(revision) is int and revision > 0:
+                content = (
+                    f"ok: {tc.name} applied at revision {revision}; "
+                    f"use the same path and revision {revision} with send_file"
+                )
+            elif revision is None:
+                content = f"ok: {tc.name} applied"
+            else:
+                raise RuntimeError("workspace batch child revision is invalid")
         elif status == "discarded" and set(item) == {
             "effect_id",
             "status",
             "error",
         }:
-            expected_error = f"{tc.name}_failed"
-            if item.get("error") != expected_error:
+            expected_error = str(item.get("error") or "")
+            if expected_error not in {
+                f"{tc.name}_failed",
+                "workspace_revision_conflict",
+            }:
                 raise RuntimeError("workspace batch child error is invalid")
-            content = f"error: {expected_error}"
+            if expected_error == "workspace_revision_conflict":
+                content = (
+                    "error: workspace_revision_conflict; choose a new /workspace "
+                    "path and retry with expected_revision=0, or read the existing "
+                    "entry and replace its exact revision"
+                )
+            else:
+                content = f"error: {expected_error}"
         else:
             raise RuntimeError("workspace batch child status is invalid")
         mapped.append(ToolResult(call_id=tc.id, content=content))
@@ -4922,6 +4954,7 @@ async def _assert_prompt_tail_exact(
     watermark_seq: int,
     through_seq: int,
     tail: list[dict],
+    ordered_user_through_seq: int | None = None,
 ) -> None:
     """Assert exact prompt membership against one race-bounded DB snapshot.
 
@@ -4935,12 +4968,28 @@ async def _assert_prompt_tail_exact(
         actual = [int(row["seq"]) for row in tail]
     except (KeyError, TypeError, ValueError) as exc:
         raise TurnError("prompt_coverage_incomplete") from exc
-    expected = await asyncio.to_thread(
-        db.chat_seqs_after_seq,
-        user_id,
-        int(watermark_seq),
-        through_seq=int(through_seq),
-    )
+    if ordered_user_through_seq is None:
+        expected = await asyncio.to_thread(
+            db.chat_seqs_after_seq,
+            user_id,
+            int(watermark_seq),
+            through_seq=int(through_seq),
+        )
+    else:
+        expected_rows = await asyncio.to_thread(
+            db.chat_messages_after_seq,
+            user_id,
+            int(watermark_seq),
+            limit=None,
+            through_seq=int(through_seq),
+        )
+        expected = [
+            int(row["seq"])
+            for row in context.ordered_reply_tail(
+                expected_rows,
+                user_through_seq=int(ordered_user_through_seq),
+            )
+        ]
     if actual != expected:
         raise TurnError("prompt_coverage_incomplete")
 
@@ -7713,8 +7762,27 @@ async def process_job(
         coalesced, cursor_seq, cursor_ts = await _coalesce_inputs(
             deps, user_id, since_seq, enclave_sem=enclave_sem
         )
+        ordered_chat_replies = bool(seq_native and deps.ordered_chat_replies)
+        if ordered_chat_replies and coalesced:
+            # A chat bubble is the settlement unit. Pin this turn to the oldest
+            # unanswered user row so a later quick follow-up cannot replace it
+            # in the model prompt or be marked answered by the same reply.
+            coalesced = coalesced[:1]
+            cursor_seq = int(coalesced[0]["seq"])
+            cursor_ts = float(coalesced[0].get("ts") or 0.0)
+        reply_parent_message_id = (
+            str(coalesced[0].get("id") or "") if coalesced else ""
+        )
+        # A recovery turn is deliberately mutation-free. Keeping the hard file
+        # completion guard active here creates an impossible state: the guard
+        # demands workspace_write while the recovery barrier withholds it, so
+        # the same oldest unanswered message retries until empty_reply forever.
+        # Settle that message honestly as text; the next ordinary job can create
+        # a file after the reply cursor has cleared the old mutation frontier.
         required_file_suffixes = (
-            context.required_file_suffixes(coalesced) if lane == "chat" else None
+            context.required_file_suffixes(coalesced)
+            if lane == "chat" and mutation_recovery_barrier is None
+            else None
         )
         if not coalesced and lane == "chat":
             # 无未回复消息（已被别的回合吃掉，或是竞态下的重复 claim）——干净收尾，不落 filler。
@@ -7834,6 +7902,11 @@ async def process_job(
                     add_usage=tm.add_call,
                     trajectory_recorder=trajectory_recorder,
                 )
+                if ordered_chat_replies:
+                    tail = context.ordered_reply_tail(
+                        tail,
+                        user_through_seq=int(cursor_seq),
+                    )
             else:
                 async with enclave_sem:
                     summary, watermark, _ver = await asyncio.to_thread(
@@ -8035,7 +8108,9 @@ async def process_job(
         offered_mcp_tool_specs = tuple(mcp_turn.tool_specs)
         if mutation_recovery_barrier is not None:
             disabled_mutation_tool_names = frozenset(
-                set(cap_registry.WRITE_ACTIONS) | set(mcp_mutating_names)
+                set(cap_registry.WRITE_ACTIONS)
+                | set(mcp_mutating_names)
+                | {cap_tool_schema.FILE_REPLY_TOOL}
             )
             offered_mcp_tool_specs = tuple(
                 spec
@@ -8095,6 +8170,28 @@ async def process_job(
         perception_results = await _perception_grounding_results(
             store, runtime_token=runtime_token, enclave_sem=enclave_sem
         )
+        pending_schedule_results = None
+        if deps.read_pending_scheduled_wake_context is not None:
+            try:
+                pending_schedule_context = await asyncio.to_thread(
+                    deps.read_pending_scheduled_wake_context,
+                    user_id,
+                )
+                if (
+                    isinstance(pending_schedule_context, dict)
+                    and pending_schedule_context.get("timers")
+                ):
+                    pending_schedule_results = {
+                        "scheduled_wakes": [
+                            {"ok": True, "data": pending_schedule_context}
+                        ]
+                    }
+            except Exception as exc:  # noqa: BLE001 — grounding is best-effort
+                log.warning(
+                    "[v2.schedule] pending context unavailable user=%s code=%s",
+                    user_id,
+                    type(exc).__name__.lower(),
+                )
         dispatch_task_batch = _make_task_batch_dispatcher(
             disabled_web_tool_names=disabled_web_tool_names,
             provider_config=provider_config,
@@ -8485,6 +8582,10 @@ async def process_job(
                         "input_generation": int(observed_generation),
                         "through_seq": int(cursor_box["seq"]),
                     }
+                    if ordered_chat_replies:
+                        payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY][
+                            "preserve_queued_input"
+                        ] = True
                 else:
                     payload[v2_effect_outbox.REPLY_SOURCE_FENCE_KEY] = {
                         "claimed_by": claimed_by,
@@ -8503,6 +8604,8 @@ async def process_job(
                     payload[REPLY_FOLLOWUPS_KEY] = followups
             if turn_failure_error_class:
                 payload["turn_failure_error_class"] = turn_failure_error_class
+            if final and reply_parent_message_id:
+                payload["reply_to_message_id"] = reply_parent_message_id
             if final:
                 try:
                     status_rows = await asyncio.to_thread(
@@ -8796,6 +8899,8 @@ async def process_job(
 
         async def fold_new_messages() -> list[dict]:
             nonlocal observed_generation
+            if ordered_chat_replies:
+                return []
             # Pin admission BEFORE the message read. If a send commits between
             # these two operations, the prompt may already contain it but the
             # deliberately older generation makes the final apply fence miss,
@@ -8810,9 +8915,18 @@ async def process_job(
             observed_generation = int(boundary_generation)
             return await base_fold_new_messages()
 
+        grounding_results: dict[str, Any] = {}
+        if perception_results:
+            grounding_results.update(perception_results)
+        if pending_schedule_results:
+            grounding_results.update(pending_schedule_results)
         turn_extra_context = (
-            context.action_context_str(perception_results) if perception_results else ""
+            context.action_context_str(grounding_results) if grounding_results else ""
         )
+        turn_trusted_system_blocks = tuple(trusted_system_blocks)
+        if ordered_chat_replies:
+            turn_trusted_system_blocks += (context.ORDERED_REPLY_TARGET_POLICY,)
+
         def _chat_builder():
             return _make_build_messages_fn(
                 system_prompt=context.CHAT_SYSTEM_PROMPT,
@@ -8820,7 +8934,7 @@ async def process_job(
                 tail=tail,
                 extra_context=turn_extra_context,
                 mutation_recovery_active=(mutation_recovery_barrier is not None),
-                trusted_system_blocks=trusted_system_blocks,
+                trusted_system_blocks=turn_trusted_system_blocks,
                 working_memory=working_memory,
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,
@@ -8882,6 +8996,11 @@ async def process_job(
                     add_usage=tm.add_call,
                     trajectory_recorder=trajectory_recorder,
                 )
+                if ordered_chat_replies:
+                    tail = context.ordered_reply_tail(
+                        tail,
+                        user_through_seq=int(cursor_seq),
+                    )
                 build_messages = _chat_builder()
                 try:
                     _preflight_adaptive_builder(
@@ -8909,13 +9028,17 @@ async def process_job(
             on_file_requirement_changed=_on_file_requirement_changed,
             fold_new_messages=fold_new_messages,
             add_usage=tm.add_call,
-            max_calls=_TURN_MAX_LLM_CALLS,
+            max_calls=(
+                max(_TURN_MAX_LLM_CALLS, _FILE_TURN_MAX_LLM_CALLS)
+                if required_file_suffixes is not None
+                else _TURN_MAX_LLM_CALLS
+            ),
             on_provider_success=lambda: _record_provider_success(user_id),
             on_provider_failure=lambda exc: _record_provider_failure(
                 user_id,
                 exc,
             ),
-            fold_before_first=seq_native,
+            fold_before_first=seq_native and not ordered_chat_replies,
             on_progress=_report_turn_progress,
             on_trajectory_event=(
                 trajectory_recorder.record if trajectory_recorder is not None else None
@@ -9049,6 +9172,21 @@ async def process_job(
             _prev_ts = 0.0
         new_last_replied = cursor_box["ts"] if cursor_box["ts"] > _prev_ts else _prev_ts
         successor_id = None
+        if final_job_completed_atomically and ordered_chat_replies:
+            newest_seq = await asyncio.to_thread(db.chat_max_seq, user_id)
+            pending_user_seq = await asyncio.to_thread(
+                db.chat_max_user_seq_between,
+                user_id,
+                int(new_seq),
+                int(newest_seq),
+            )
+            if pending_user_seq:
+                successor_id, _ = await asyncio.to_thread(
+                    jobs_store.enqueue_job,
+                    user_id,
+                    "chat",
+                    reason="ordered_followup",
+                )
         if final_job_completed_atomically:
             # Reply/cursor/job completion is already the authoritative terminal
             # commit. Runtime-state telemetry is useful but must not let a

@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import conftest  # noqa: E402
 from core import store as core_store  # noqa: E402
-from model_api_runtime.v2 import jobs_store  # noqa: E402
+from model_api_runtime.v2 import jobs_store, serve_worker  # noqa: E402
 
 
 def _env(user_id: str, message_id: str) -> dict:
@@ -149,3 +149,68 @@ def test_v1_activity_event_rejects_v2_owned_turn(client, backend_env):
     )
     assert response.status_code == 409
     assert response.json["error"] == "activity_event_rejected"
+
+
+def test_transactional_reply_sink_persists_completed_v2_activity(monkeypatch):
+    captured = {}
+
+    class Store:
+        def _build_chat_message(
+            self, role, source, envelope, content_type="text", extra=None
+        ):
+            captured.update(
+                role=role,
+                source=source,
+                envelope=envelope,
+                content_type=content_type,
+                extra=extra,
+            )
+            return {"id": envelope["id"], "ts": 1.0}
+
+    class Connection:
+        def execute(self, *_args):
+            return None
+
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda _user_id: Store())
+    monkeypatch.setattr(
+        serve_worker.db,
+        "chat_append_effect_with_cursor",
+        lambda *args, **kwargs: (7, False, lambda: None),
+    )
+
+    post_commit = serve_worker._sink_reply_in_transaction(
+        "usr_activity_tx",
+        {
+            "envelope": {"id": "a" * 32},
+            "activity_turn_id": "turn-v2",
+            "activity_job_id": "42",
+            "activity_events": [
+                {
+                    "id": "42:0:1",
+                    "kind": "tool",
+                    "name": "schedule_wake",
+                    "status": "success",
+                    "schedule_operation": "schedule_wake",
+                    "schedule_task_id": "sched-test",
+                    "schedule_status": "scheduled",
+                }
+            ],
+        },
+        Connection(),
+    )
+
+    assert callable(post_commit)
+    assert captured["extra"]["activity_turn_id"] == "turn-v2"
+    assert captured["extra"]["activity_job_id"] == "42"
+    assert captured["extra"]["activity_events"] == [
+        {
+            "id": "42:0:1",
+            "kind": "tool",
+            "name": "schedule_wake",
+            "status": "success",
+            "job_id": "42",
+            "schedule_operation": "schedule_wake",
+            "schedule_task_id": "sched-test",
+            "schedule_status": "scheduled",
+        }
+    ]

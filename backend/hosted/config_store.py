@@ -348,6 +348,7 @@ def _provider_config_from_plain(config: dict, api_key: str) -> provider_client.P
         api_key=api_key,
         base_url=base_url,
         context_window_tokens=config.get("context_window_tokens"),
+        reasoning_effort=str(config.get("reasoning_effort") or ""),
     )
 
 

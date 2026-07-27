@@ -37,7 +37,7 @@ def memory_result_metadata(tool_name: str, result: Mapping[str, Any]) -> dict:
     has a canonical bucket; one unknown/custom bucket makes the whole
     classification optional field disappear so the UI falls back to total only.
     """
-    if str(tool_name) not in {"memory_search", "memory_fetch"}:
+    if str(tool_name) not in {"memory_index", "memory_search", "memory_fetch"}:
         return {}
     if not isinstance(result, Mapping) or result.get("ok") is not True:
         return {}

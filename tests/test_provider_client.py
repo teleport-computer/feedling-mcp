@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import provider_client as pc  # noqa: E402
+from provider_types import ToolSpec  # noqa: E402
 
 
 class FakeResponse:
@@ -333,6 +334,31 @@ def test_build_openai_compat_payload_shape():
         response_format=None, extra_body=None, include_reasoning=True)
     assert "reasoning" not in p2  # reasoning 注入只对 openrouter
     assert "response_format" not in p2
+
+
+def test_openai_compat_payload_preserves_forced_tool_choice():
+    choice = {"type": "function", "function": {"name": "workspace_write"}}
+    payload = pc._build_openai_compat_payload(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-flash",
+        messages=[{"role": "user", "content": "create a file"}],
+        temperature=None,
+        max_tokens=4096,
+        response_format=None,
+        extra_body=None,
+        include_reasoning=False,
+        tools=[
+            ToolSpec(
+                name="workspace_write",
+                description="write",
+                parameters={"type": "object", "properties": {}},
+            )
+        ],
+        tool_choice=choice,
+    )
+
+    assert payload["tool_choice"] == choice
+    assert payload["tool_choice"] is not choice
 
 
 def test_parse_openai_compat_body_result_shape():

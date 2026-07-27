@@ -358,6 +358,7 @@ def test_model_api_setup_persists_explicit_custom_prompt_frontier(
     assert route["context_window_tokens"] == 32_768
     runtime = hosted_config_store._provider_config_from_plain(route, "sk-relay")
     assert runtime.context_window_tokens == 32_768
+    assert runtime.reasoning_effort == ""
 
     # Exact idempotent setup may reuse the persisted contract, so a client does
     # not have to resend the field on every key/model health refresh.
@@ -481,6 +482,8 @@ def test_model_api_setup_persists_reasoning_effort(client, monkeypatch):
     assert setup.get_json()["config"]["reasoning_effort"] == "medium"
     route = db.model_api_active_route(user_id)
     assert route["reasoning_effort"] == "medium"
+    runtime = hosted_config_store._provider_config_from_plain(route, "sk-or")
+    assert runtime.reasoning_effort == "medium"
 
     mode, state, _generation = db.get_hosted_runtime_control_strict(user_id)
     assert (mode, state) == ("db_action_v2", "v2")

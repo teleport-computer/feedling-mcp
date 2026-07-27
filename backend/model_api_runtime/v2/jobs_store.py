@@ -2670,6 +2670,23 @@ def get_chat_mutation_recovery_barrier(
             "  WHERE effect.user_id=%s AND job.lane='chat' "
             "    AND effect.input_frontier_seq>%s "
             "    AND (%s::bigint IS NULL OR effect.job_id<>%s)"
+            "    AND NOT ("
+            "      effect.effect_type='workspace_batch_encrypted_v1' "
+            "      AND effect.status='applied_with_results' "
+            "      AND effect.payload->'_applied_result_v1'->>'kind'="
+            "          'workspace_batch_v1' "
+            "      AND jsonb_typeof("
+            "          effect.payload->'_applied_result_v1'->'items'"
+            "      )='array' "
+            "      AND jsonb_array_length("
+            "          effect.payload->'_applied_result_v1'->'items'"
+            "      )>0 "
+            "      AND NOT EXISTS ("
+            "        SELECT 1 FROM jsonb_array_elements("
+            "          effect.payload->'_applied_result_v1'->'items'"
+            "        ) item WHERE item->>'status'<>'discarded'"
+            "      )"
+            "    )"
             ") SELECT MAX(input_frontier_seq),"
             "         COALESCE(bool_or(kind='mcp'),false),"
             "         COALESCE(bool_or(kind='platform'),false) "
@@ -2905,7 +2922,7 @@ def chat_turn_activity_rows(user_id: str, turn_id: str) -> tuple[list[dict], lis
     with _pool().connection() as conn:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "SELECT id, status FROM agent_jobs "
+                "SELECT id, status, last_error FROM agent_jobs "
                 "WHERE user_id=%s AND lane='chat' AND trace_id=%s ORDER BY id ASC",
                 (str(user_id), str(turn_id)),
             )

@@ -820,6 +820,96 @@ def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
     )
 
 
+def test_ordered_chat_replies_settle_each_user_message_separately(monkeypatch):
+    uid = "u_toolloop_ordered_replies"
+    conftest.seed_user(uid)
+    _reset(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM user_blobs WHERE user_id=%s AND kind='model_api_runtime'",
+            (uid,),
+        )
+    db.chat_append_strict(uid, "A", 10.0, _user_doc("A", "first A"), 5000)
+    generation = db.get_runtime_generation(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat", expected_generation=generation)
+    job = jobs_store.claim_next_job("w-ordered-replies")
+
+    monkeypatch.setattr(
+        worker,
+        "_build_encrypted_reply_effect_payload",
+        lambda _store, text, *, effect_id, reply_through_seq=None: {
+            "text": text,
+            "reply_through_seq": reply_through_seq,
+        },
+    )
+    monkeypatch.setattr(
+        cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({})
+    )
+    written: list[str] = []
+    deps = _late_input_deps(uid, written)
+    deps.ordered_chat_replies = True
+    deps.read_summary = lambda _uid: ("", 0.0, 0)
+    deps.read_tail = lambda _uid, _watermark, _limit: [
+        {"id": "A", "ts": 10.0, "role": "user", "content": "first A"}
+    ]
+    calls = []
+
+    async def provider(_config, messages, *, tools=None, **_kwargs):
+        calls.append(list(messages))
+        assert worker.context.ORDERED_REPLY_TARGET_POLICY in messages[0]["content"]
+        assert any(
+            isinstance(message, dict) and message.get("content") == "first A"
+            for message in messages
+        )
+        assert not any(
+            isinstance(message, dict) and message.get("content") == "late B"
+            for message in messages
+        )
+        seq, same_job_id = db.chat_append_and_enqueue(
+            uid,
+            "B",
+            20.0,
+            _user_doc("B", "late B"),
+            5000,
+            "chat",
+            expected_generation=generation,
+        )
+        assert seq > 0 and same_job_id == job_id
+        return _text_round("answer A")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 1
+    assert written == ["answer A"]
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == db.chat_seq_for_msg_id(
+        uid, "A"
+    )
+    with db.get_pool().connection() as conn:
+        successor = conn.execute(
+            "SELECT status,reason FROM agent_jobs "
+            "WHERE user_id=%s AND id<>%s ORDER BY id DESC LIMIT 1",
+            (uid, job_id),
+        ).fetchone()
+        reply_payload = conn.execute(
+            "SELECT payload FROM v2_effect_outbox "
+            "WHERE user_id=%s AND effect_type=%s ORDER BY enqueue_seq DESC LIMIT 1",
+            (uid, v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE),
+        ).fetchone()[0]
+    assert successor == ("pending", "ordered_followup")
+    assert reply_payload["reply_to_message_id"] == "A"
+
+
 def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
     monkeypatch,
 ):

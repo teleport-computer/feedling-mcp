@@ -228,6 +228,72 @@ def test_turn_response_reports_backend_job_phase_separately_from_tools():
     }
 
 
+def test_turn_response_exposes_only_bounded_failure_identity():
+    response = chat_activity.turn_response(
+        "turn-failed",
+        [{
+            "id": 41,
+            "status": "failed",
+            "last_error": "turn_failed:empty_reply secret words",
+        }],
+        [{"kind": "error", "created_at": 4.0, "detail_json": {}}],
+    )
+
+    assert response["failure"] == {
+        "code": "turn_failed:failed",
+        "job_id": "41",
+    }
+    assert response["complete"] is True
+
+
+def test_memory_projection_suppresses_repeated_zero_discovery_before_positive():
+    rows = []
+    for index, (name, count) in enumerate(
+        [("memory_search", 0), ("memory_search", 0), ("memory_index", 2)],
+        start=1,
+    ):
+        rows.append({
+            "id": index,
+            "job_id": 9,
+            "kind": "tool_activity",
+            "created_at": float(index),
+            "detail_json": {
+                "activity_id": f"9:1:{index}",
+                "tool_name": name,
+                "call_id": f"call-{index}",
+                "state": "success",
+                "memory_count": count,
+            },
+        })
+
+    events = chat_activity.project_tool_events(rows)
+    assert [(event["name"], event["memory_count"]) for event in events] == [
+        ("memory_index", 2),
+    ]
+
+
+def test_memory_projection_keeps_only_latest_zero_without_positive_result():
+    rows = [
+        {
+            "id": index,
+            "job_id": 9,
+            "kind": "tool_activity",
+            "created_at": float(index),
+            "detail_json": {
+                "activity_id": f"9:1:{index}",
+                "tool_name": "memory_search",
+                "call_id": f"call-{index}",
+                "state": "success",
+                "memory_count": 0,
+            },
+        }
+        for index in (1, 2)
+    ]
+
+    events = chat_activity.project_tool_events(rows)
+    assert [event["call_id"] for event in events] == ["call-2"]
+
+
 def test_result_classifier_never_turns_error_body_into_metadata():
     assert chat_activity.result_code("error: private customer record") == "tool_error"
     assert chat_activity.result_code("queued: effect-123") == "queued"
@@ -261,6 +327,19 @@ def test_memory_activity_multiple_results_groups_bilingual_canonical_buckets():
     assert activity_metadata.memory_result_metadata(
         "memory_search",
         _memory_result("我们的关系", "Our relationship", "我们的关系", "Family"),
+    ) == {
+        "memory_count": 4,
+        "memory_categories": [
+            {"key": "relationship", "count": 3},
+            {"key": "family", "count": 1},
+        ],
+    }
+
+
+def test_memory_index_activity_reports_exact_count_and_categories():
+    assert activity_metadata.memory_result_metadata(
+        "memory_index",
+        _memory_result("我们的关系", "Our relationship", "Family", "我们的关系"),
     ) == {
         "memory_count": 4,
         "memory_categories": [

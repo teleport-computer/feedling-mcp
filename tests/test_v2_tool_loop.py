@@ -20,6 +20,7 @@ import pytest
 
 import provider_client
 from provider_types import ToolExchange, ToolResult
+from model_api_runtime.v2 import executor as v2_executor
 from model_api_runtime.v2 import tool_loop
 
 
@@ -37,8 +38,13 @@ class _ScriptedProvider:
         self.responses = list(responses)
         self.calls = []  # list of {"config":..., "messages":..., "tools":...}
 
-    async def __call__(self, config, messages, *, tools=None):
-        self.calls.append({"config": config, "messages": messages, "tools": tools})
+    async def __call__(self, config, messages, *, tools=None, **kwargs):
+        self.calls.append({
+            "config": config,
+            "messages": messages,
+            "tools": tools,
+            **kwargs,
+        })
         if not self.responses:
             raise AssertionError("provider called more times than scripted")
         return self.responses.pop(0)
@@ -129,6 +135,123 @@ def test_empty_tool_calls_is_final_reply_no_dispatch(monkeypatch):
     assert outcome.stop_reason == "final_text"
     assert outcome.replied_intermediate is False
     assert progress == ["round_boundary", "provider_start", "provider_complete"]
+
+
+def test_transient_empty_provider_response_retries_inside_same_round(monkeypatch):
+    calls = 0
+
+    async def provider(config, messages, *, tools=None, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise provider_client.ProviderError(
+                "provider response had no usable reply text"
+            )
+        return {"reply": "recovered", "tool_calls": [], "usage": {}}
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    on_reply = _RecordingReply()
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=on_reply,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+    ))
+
+    assert calls == 2
+    assert outcome.rounds == 1
+    assert outcome.final_text == "recovered"
+    assert on_reply.calls == [("recovered", True)]
+
+
+def test_reasoning_route_requests_and_publishes_provider_reasoning(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "answer",
+            "reasoning": "safe provider reasoning summary",
+            "tool_calls": [],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = []
+
+    async def publish(text, *, final, reasoning=""):
+        published.append((text, final, reasoning))
+
+    config = provider_client.ProviderConfig(
+        provider="openrouter",
+        model="anthropic/claude-sonnet-4.6",
+        api_key="test-key",
+        reasoning_effort="medium",
+    )
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=config,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=publish,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=2,
+    ))
+
+    assert provider.calls[0]["include_reasoning"] is True
+    assert published == [("answer", True, "safe provider reasoning summary")]
+    assert outcome.final_text == "answer"
+
+
+def test_reasoning_from_tool_rounds_survives_a_plain_final_round(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "reasoning": "I should find memories about the requested subject.",
+            "tool_calls": [{
+                "id": "memory-1",
+                "name": "memory_search",
+                "args": {"query": "our relationship"},
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "grounded answer",
+            "reasoning": "",
+            "tool_calls": [],
+            "usage": {},
+        },
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    published = []
+
+    async def publish(text, *, final, reasoning=""):
+        published.append((text, final, reasoning))
+
+    config = provider_client.ProviderConfig(
+        provider="openrouter",
+        model="anthropic/claude-sonnet-4.6",
+        api_key="test-key",
+        reasoning_effort="medium",
+    )
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=config,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=publish,
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+    ))
+
+    assert [call["include_reasoning"] for call in provider.calls] == [True, True]
+    assert published == [(
+        "grounded answer",
+        True,
+        "I should find memories about the requested subject.",
+    )]
+    assert outcome.final_text == "grounded answer"
 
 
 def test_superseded_final_folds_new_input_and_retries_without_stale_transcript(
@@ -437,6 +560,318 @@ def test_budget_bound_last_call_omits_tools_and_terminates(monkeypatch):
     assert on_reply.calls[-1] == ("final terminal text", True)
 
 
+def test_each_memory_discovery_mode_is_offered_only_until_its_first_result(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "m1", "name": "memory_index", "args": {}}
+            ],
+            "usage": {},
+        },
+        {"reply": "direct answer", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+    ))
+
+    first_names = {spec.name for spec in provider.calls[0]["tools"]}
+    second_names = {spec.name for spec in provider.calls[1]["tools"]}
+    assert {"memory_index", "memory_search"}.issubset(first_names)
+    assert "memory_index" not in second_names
+    assert "memory_search" in second_names
+    assert outcome.final_text == "direct answer"
+
+
+def test_repeated_memory_discovery_reuses_prior_result_without_dispatch(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{"id": "m1", "name": "memory_index", "args": {}}],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{"id": "m2", "name": "memory_index", "args": {}}],
+            "usage": {},
+        },
+        {"reply": "direct answer", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch("two memories")
+    build_messages = _RecordingBuildMessages()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=build_messages,
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[], []]),
+        add_usage=_noop_add_usage,
+        max_calls=4,
+    ))
+
+    assert len(dispatch.calls) == 1
+    assert [tc.id for tc in dispatch.calls[0]] == ["m1"]
+    repeated_exchange = build_messages.calls[2][-1]
+    assert isinstance(repeated_exchange, ToolExchange)
+    assert repeated_exchange.results[0].call_id == "m2"
+    assert "already completed" in repeated_exchange.results[0].content
+    assert outcome.final_text == "direct answer"
+
+
+def test_same_batch_duplicate_memory_discovery_dispatches_only_once(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [
+                {"id": "m1", "name": "memory_index", "args": {}},
+                {"id": "m2", "name": "memory_index", "args": {"limit": 20}},
+            ],
+            "usage": {},
+        },
+        {"reply": "direct answer", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatch = _RecordingDispatch("two memories")
+    build_messages = _RecordingBuildMessages()
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=build_messages,
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+    ))
+
+    assert len(dispatch.calls) == 1
+    assert [tc.id for tc in dispatch.calls[0]] == ["m1"]
+    exchange = build_messages.calls[1][-1]
+    assert [result.call_id for result in exchange.results] == ["m1", "m2"]
+    assert "already completed" in exchange.results[1].content
+    assert outcome.final_text == "direct answer"
+
+
+def test_openrouter_file_recovery_forces_write_then_send_file(monkeypatch):
+    provider = _ScriptedProvider([
+        {"reply": "# draft", "tool_calls": [], "usage": {}},
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "w1",
+                "name": "workspace_write",
+                "args": {
+                    "path": "/workspace/summary.md",
+                    "content": "# summary",
+                    "expected_revision": 0,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "f1",
+                "name": "send_file",
+                "args": {"path": "/workspace/summary.md", "revision": 1},
+            }],
+            "usage": {},
+        },
+        {"reply": "文档已生成。", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    dispatched = []
+    files = []
+
+    async def dispatch(tool_calls):
+        dispatched.extend(tool_calls)
+        return [
+            ToolResult(
+                call_id=tc.id,
+                content=(
+                    "ok: workspace_write applied at revision 1; use the same "
+                    "path and revision 1 with send_file"
+                ),
+            )
+            for tc in tool_calls
+        ]
+
+    async def on_file(path, revision):
+        files.append((path, revision))
+
+    config = provider_client.ProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+    )
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=config,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        on_file_reply=on_file,
+        required_file_suffixes=(".md",),
+        fold_new_messages=_RecordingFold([[], [], []]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    assert [tc.name for tc in dispatched] == ["workspace_write"]
+    assert provider.calls[1]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "workspace_write"},
+    }
+    assert [spec.name for spec in provider.calls[1]["tools"]] == ["workspace_write"]
+    assert provider.calls[2]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "send_file"},
+    }
+    assert [spec.name for spec in provider.calls[2]["tools"]] == ["send_file"]
+    assert files == [("/workspace/summary.md", 1)]
+    assert outcome.final_text == "文档已生成。"
+
+
+def test_invalid_artifact_write_is_model_visible_and_retries_in_workspace(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "bad-write",
+                "name": "workspace_write",
+                "args": {
+                    "path": "/artifacts/memory_summary.md",
+                    "content": "# Memory summary",
+                    "expected_revision": 0,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "good-write",
+                "name": "workspace_write",
+                "args": {
+                    "path": "/workspace/memory_summary.md",
+                    "content": "# Memory summary",
+                    "expected_revision": 0,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "deliver",
+                "name": "send_file",
+                "args": {
+                    "path": "/workspace/memory_summary.md",
+                    "revision": 1,
+                },
+            }],
+            "usage": {},
+        },
+        {"reply": "Markdown 文档已经生成。", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    enqueued = []
+    files = []
+    build_messages = _RecordingBuildMessages()
+
+    async def dispatch(tool_calls):
+        return await v2_executor.dispatch_tool_calls(
+            tool_calls,
+            store=None,
+            api_key=None,
+            runtime_token="",
+            enclave_sem=asyncio.Semaphore(1),
+            turn_authorization=True,
+            enqueue_write_effect=lambda call: enqueued.append(call),
+        )
+
+    async def on_file(path, revision):
+        files.append((path, revision))
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        build_messages=build_messages,
+        dispatch_tools=dispatch,
+        on_reply=_RecordingReply(),
+        on_file_reply=on_file,
+        required_file_suffixes=(".md",),
+        fold_new_messages=_RecordingFold([[], [], []]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    assert [call.args["path"] for call in enqueued] == [
+        "/workspace/memory_summary.md"
+    ]
+    first_exchange = build_messages.calls[1][-1]
+    assert isinstance(first_exchange, ToolExchange)
+    assert "/workspace/<filename>" in first_exchange.results[0].content
+    assert files == [("/workspace/memory_summary.md", 1)]
+    assert outcome.final_text == "Markdown 文档已经生成。"
+
+
+def test_budget_bound_last_call_also_disables_reasoning(monkeypatch):
+    """The last tools-disabled round must reserve its budget for visible text."""
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "reasoning": "first thought",
+            "tool_calls": [{
+                "id": "1", "name": "memory_search", "args": {"query": "a"},
+            }],
+            "usage": {},
+        },
+        {
+            "reply": "",
+            "reasoning": "second thought",
+            "tool_calls": [{
+                "id": "2", "name": "memory_search", "args": {"query": "b"},
+            }],
+            "usage": {},
+        },
+        {"reply": "final terminal text", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    reasoning_config = provider_client.ProviderConfig(
+        provider="openrouter",
+        model="anthropic/claude-sonnet-4.6",
+        api_key="test-key",
+        reasoning_effort="medium",
+    )
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=reasoning_config,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+    ))
+
+    assert provider.calls[0]["include_reasoning"] is True
+    assert provider.calls[1]["include_reasoning"] is True
+    assert provider.calls[2]["tools"] is None
+    assert "include_reasoning" not in provider.calls[2]
+    assert outcome.final_text == "final terminal text"
+
+
 def test_fold_at_every_round_boundary_feeds_chronological_transcript(monkeypatch):
     """The first boundary closes prompt-assembly races; later boundaries append
     newly arrived user messages after the preceding native tool exchange."""
@@ -559,6 +994,38 @@ def test_malformed_args_gets_one_tools_disabled_fallback_without_dispatch(monkey
     assert outcome.rounds == 2
 
 
+def test_malformed_reasoning_turn_disables_reasoning_for_text_fallback(monkeypatch):
+    provider = _ScriptedProvider([
+        {
+            "reply": "", "tool_calls": [{"id": "c1", "name": "web_search",
+                                             "args": {}, "args_raw": "{", "args_ok": False}],
+            "usage": {},
+        },
+        {"reply": "Plain fallback.", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    reasoning_config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-sonnet-4-test",
+        api_key="test-key",
+        reasoning_effort="high",
+    )
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=reasoning_config,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=5,
+    ))
+
+    assert provider.calls[0]["include_reasoning"] is True
+    assert "include_reasoning" not in provider.calls[1]
+    assert outcome.final_text == "Plain fallback."
+
+
 def test_duplicate_call_ids_fall_back_before_any_side_effect(monkeypatch):
     provider = _ScriptedProvider([
         {
@@ -618,11 +1085,11 @@ def test_per_round_tool_call_ceiling_is_all_or_nothing(monkeypatch):
 def test_per_turn_tool_call_ceiling_rejects_only_the_overflow_batch(monkeypatch):
     provider = _ScriptedProvider([
         {"reply": "", "tool_calls": [
-            {"id": "c1", "name": "memory_index", "args": {}}], "usage": {}},
+            {"id": "c1", "name": "workspace_list", "args": {}}], "usage": {}},
         {"reply": "", "tool_calls": [
-            {"id": "c2", "name": "memory_index", "args": {}}], "usage": {}},
+            {"id": "c2", "name": "workspace_list", "args": {}}], "usage": {}},
         {"reply": "", "tool_calls": [
-            {"id": "c3", "name": "memory_index", "args": {}}], "usage": {}},
+            {"id": "c3", "name": "workspace_list", "args": {}}], "usage": {}},
         {"reply": "turn fallback", "tool_calls": [], "usage": {}},
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
@@ -693,11 +1160,11 @@ def test_oversized_tool_exchange_falls_back_before_dispatch(
 def test_all_tool_results_share_per_call_and_aggregate_prompt_budgets(monkeypatch):
     provider = _ScriptedProvider([
         {
-            "reply": "",
-            "tool_calls": [
-                {"id": f"c{i}", "name": "memory_index", "args": {}}
-                for i in range(5)
-            ],
+                "reply": "",
+                "tool_calls": [
+                    {"id": f"c{i}", "name": "workspace_list", "args": {}}
+                    for i in range(5)
+                ],
             "usage": {},
         },
         {"reply": "done", "tool_calls": [], "usage": {}},

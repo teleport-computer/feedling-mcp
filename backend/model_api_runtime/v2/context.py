@@ -91,6 +91,14 @@ _RUNTIME_CONTEXT_POLICY = (
 CHAT_SYSTEM_PROMPT = (
     "You are the user's personal companion. Reply directly and concisely to the "
     "user's latest messages. Do not narrate tool use or system status. "
+    "Use memory or workspace reads only when the current request actually depends "
+    "on remembered or stored information. Ordinary conversation and questions "
+    "about your model or runtime identity never require memory or workspace reads. "
+    "A current message that is only a greeting, acknowledgement, emoji, "
+    "interjection, or casual small talk never requires memory discovery, even "
+    "when earlier history discussed memories or files; answer it directly. Once "
+    "an earlier request has a linked assistant reply, do not resume its memory "
+    "lookup or file workflow unless the current user message explicitly asks. "
     "Interpret requests for a reusable standalone deliverable semantically, not "
     "by matching specific words, examples, languages, or file extensions. When "
     "the user's meaning is that they want the result as something they can save, "
@@ -103,7 +111,18 @@ CHAT_SYSTEM_PROMPT = (
     "only when the user did not specify them; never ask the user for an internal "
     "workspace path. Do not force a file when "
     "the user only wants a conversational answer, and never claim that a file was "
-    "created or delivered unless send_file succeeds. "
+    "created or delivered unless send_file succeeds. When the user asks for a "
+    "summary or deliverable grounded in memory about a specific subject, search "
+    "memory for that subject instead of relying only on the recent-memory index. "
+    "For an open-ended request about all memories or the overall relationship, use "
+    "memory_index once instead of guessing keywords or repeating memory_search. "
+    "Use only relevant returned memories as evidence. If no relevant memory exists, "
+    "say that plainly; do not substitute unrelated preferences or events as if they "
+    "answered the requested subject. If a file is still useful, mark the missing "
+    "evidence clearly inside it instead of inventing a summary. "
+    "When the user asks to cancel or change a pending reminder, use the exact "
+    "wake_id from runtime_data.scheduled_wakes.timers and call cancel_wake; do "
+    "not search memories for reminder identifiers. "
     "When the user EXPLICITLY asks you to change your own identity — your name, how "
     "you introduce yourself, or the relationship day count (the '第 N 天' shown in the "
     "app, e.g. '把相处天数改成 100 天' / 'make it day 100' / '我们其实认识两年了') — you "
@@ -114,13 +133,25 @@ CHAT_SYSTEM_PROMPT = (
     "it. Only act on an explicit request, not a passing mention."
 )
 
+ORDERED_REPLY_TARGET_POLICY = (
+    "ORDERED CHAT REPLY: This turn answers exactly one queued user message. "
+    "Answer only the final ordinary conversation user message in the prompt. "
+    "Earlier user messages are history and may already have been answered even "
+    "when their assistant reply was persisted later. Do not repeat or combine "
+    "answers to those earlier messages."
+)
+
 ACTION_CONTEXT_CHAR_CAP = 8000
 PER_ACTION_CHAR_CAP = 2000
 _BLOB_KEYS = frozenset({"image_b64"})
 
+_FILE_ARTIFACT_RE = re.compile(
+    r"(?:文档|文件|附件|可下载|下载版|提供下载|"
+    r"\b(?:document|file|attachment|downloadable|download)\b)"
+)
 _FILE_CREATE_RE = re.compile(
-    r"(?:生成|创建|制作|导出|保存(?:成|为)?|转换?(?:成|为)|转成|改(?:成|为)|整理(?:成|为)|"
-    r"写成|做成|制成|发给我|提供给我|交给我|"
+    r"(?:生成|创建|制作|导出|保存(?:成|为)?|转换?(?:成|为)|转成|改(?:成|为)|"
+    r"整理(?:成|为|一个|一份)?|写成|做成|制成|发给我|提供(?:下载|给我)|交给我|"
     r"给我(?:一个|一份|生成|创建|制作|导出|保存|转换|转成|整理|写成|做成)|"
     r"给我\s*(?:word|pdf|markdown|md|docx)|"
     r"\b(?:create|generate|make|produce|export|save|convert|send|give|provide)\b)"
@@ -207,6 +238,76 @@ def _norm_role(role: Any) -> str:
     return "assistant" if str(role or "") in _ASSISTANT_ROLES else "user"
 
 
+def ordered_reply_tail(
+    tail: Sequence[dict], *, user_through_seq: int
+) -> list[dict]:
+    """Build causal prompt order for one queued user-message target.
+
+    Durable chat rows are ordered by insertion. If users send A then B before
+    A's reply lands, storage is A, B, reply(A). The ordered worker must present
+    that as A, reply(A), B while withholding later user inputs. Linked reply
+    parts move beside their parent; unrelated or legacy-unlinked assistant rows
+    retain storage order.
+    """
+    target_seq = int(user_through_seq)
+    admitted: list[dict] = []
+    excluded_user_ids: set[str] = set()
+    for row in tail:
+        role = _norm_role(row.get("role"))
+        raw_seq = row.get("seq")
+        if role == "user" and raw_seq is not None and int(raw_seq) > target_seq:
+            row_id = str(row.get("id") or "")
+            if row_id:
+                excluded_user_ids.add(row_id)
+            continue
+        admitted.append(row)
+
+    parent_ids: list[str | None] = []
+    for row in admitted:
+        if _norm_role(row.get("role")) != "assistant":
+            parent_ids.append(None)
+            continue
+        parent = str(row.get("reply_to_message_id") or "").strip()
+        parent_ids.append(parent or None)
+
+    # Intermediate V2 bubbles can be unlinked until a later final row carries
+    # the parent. Keep the whole adjacent assistant block with that parent.
+    if len(admitted) > 1:
+        for index in range(len(admitted) - 2, -1, -1):
+            if (
+                _norm_role(admitted[index].get("role")) == "assistant"
+                and parent_ids[index] is None
+                and _norm_role(admitted[index + 1].get("role")) == "assistant"
+            ):
+                parent_ids[index] = parent_ids[index + 1]
+
+    present_user_ids = {
+        str(row.get("id") or "")
+        for row in admitted
+        if _norm_role(row.get("role")) == "user"
+    }
+    linked_by_parent: dict[str, list[dict]] = {}
+    linked_indexes: set[int] = set()
+    dropped_indexes: set[int] = set()
+    for index, parent_id in enumerate(parent_ids):
+        if parent_id is None:
+            continue
+        if parent_id in excluded_user_ids:
+            dropped_indexes.add(index)
+        elif parent_id in present_user_ids:
+            linked_indexes.add(index)
+            linked_by_parent.setdefault(parent_id, []).append(admitted[index])
+
+    ordered: list[dict] = []
+    for index, row in enumerate(admitted):
+        if index in linked_indexes or index in dropped_indexes:
+            continue
+        ordered.append(row)
+        if _norm_role(row.get("role")) == "user":
+            ordered.extend(linked_by_parent.pop(str(row.get("id") or ""), ()))
+    return ordered
+
+
 def text_of(content: Any) -> str:
     """Extract the human-readable text from a tail row's ``content``.
 
@@ -249,7 +350,11 @@ def _required_file_suffixes_for_text(normalized: str) -> tuple[str, ...] | None:
         for suffix, pattern in _FILE_FORMAT_PATTERNS
         if pattern.search(format_scope)
     )
-    return requested or None
+    if requested:
+        return requested
+    if _FILE_ARTIFACT_RE.search(intent_scope):
+        return ()
+    return None
 
 
 def required_file_suffixes(messages: Sequence[dict]) -> tuple[str, ...] | None:
@@ -257,10 +362,9 @@ def required_file_suffixes(messages: Sequence[dict]) -> tuple[str, ...] | None:
 
     The model remains responsible for semantic intent and content generation.
     This conservative detector is only a completion guard: it prevents a plain
-    text answer (or a Markdown substitution) from satisfying a request with an
-    explicit supported format. Requests without a format remain semantic prompt
-    guidance and return ``None`` so ordinary conversation is never blocked by a
-    translated keyword list.
+    text answer (or a Markdown substitution) from satisfying an explicit file
+    request. ``()`` means any downloadable file is acceptable; ``None`` means
+    ordinary conversational completion remains valid.
     """
     requirement: tuple[str, ...] | None = None
     for message in messages:

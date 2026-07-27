@@ -34,6 +34,18 @@ MCP_MUTATION_OUTCOME_UNKNOWN_ERROR = "error: mcp_mutation_outcome_unknown"
 MUTATION_BLOCKED_AFTER_UNKNOWN_OUTCOME_ERROR = (
     "error: mutation_blocked_after_unknown_outcome"
 )
+_MEMORY_DISCOVERY_TOOLS = frozenset({"memory_index", "memory_search"})
+_FILE_DELIVERY_TOOLS = frozenset(
+    {
+        "memory_index",
+        "memory_search",
+        "memory_fetch",
+        "workspace_list",
+        "workspace_read",
+        "workspace_write",
+        tool_schema.FILE_REPLY_TOOL,
+    }
+)
 
 
 def _catalog():
@@ -306,6 +318,8 @@ async def run_tool_loop(
     replied_intermediate = False
     attempts = 0
     tool_calls_used = 0
+    reasoning_fragments: list[str] = []
+    seen_reasoning_fragments: set[str] = set()
     force_text_fallback = False
     external_content_seen = False
     mutation_outcome_unknown = False
@@ -325,7 +339,7 @@ async def run_tool_loop(
             for suffix in suffixes
         ):
             raise ValueError("required_file_suffixes contains an invalid suffix")
-        return bool(suffixes), suffixes
+        return value is not None, suffixes
 
     resolved_file_requirement = required_file_suffixes
     if resolve_required_file_suffixes is not None:
@@ -341,6 +355,9 @@ async def run_tool_loop(
     required_file_missing_recorded = False
     file_delivery_fallback_text = ""
     file_delivery_fallback_reasoning = ""
+    file_delivery_recovery_needed = False
+    workspace_write_applied = False
+    completed_memory_discovery_tools: set[str] = set()
     outbound_blocking_reads = {
         str(name) for name in (outbound_blocking_read_tool_names or ()) if str(name)
     }
@@ -427,6 +444,19 @@ async def run_tool_loop(
         )
         required_file_missing_recorded = True
 
+    def _capture_reasoning(result: dict) -> None:
+        reasoning = str(result.get("reasoning") or "").strip()
+        if not reasoning:
+            return
+        key = " ".join(reasoning.split()).casefold()
+        if key in seen_reasoning_fragments:
+            return
+        seen_reasoning_fragments.add(key)
+        reasoning_fragments.append(reasoning)
+
+    def _merged_reasoning() -> str:
+        return "\n\n".join(reasoning_fragments)
+
     while attempts < max_calls:
         _progress("round_boundary")
         if attempts > 0 or fold_before_first:
@@ -435,6 +465,11 @@ async def run_tool_loop(
             # after-first behavior until their timestamp seam is removed.
             folded = await fold_new_messages()
             if folded:
+                # A newly arrived user message changes the answer target. Do not
+                # attach reasoning produced for the superseded prompt to the
+                # revised final reply.
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
                 await _trajectory(
                     "late_input_fold",
                     {"round": attempts + 1, "messages": folded},
@@ -472,8 +507,18 @@ async def run_tool_loop(
 
         messages = build_messages(list(transcript))
         if delivery_retry_instruction:
-            messages = [dict(message) for message in messages]
-            if messages and messages[0].get("role") == "system":
+            # Keep provider-native tool exchanges intact. They are dataclasses,
+            # not mappings, and must survive unchanged so the next provider
+            # round can replay the exact assistant/tool-result transcript.
+            messages = [
+                dict(message) if isinstance(message, dict) else message
+                for message in messages
+            ]
+            if (
+                messages
+                and isinstance(messages[0], dict)
+                and messages[0].get("role") == "system"
+            ):
                 messages[0]["content"] = (
                     str(messages[0].get("content") or "").rstrip()
                     + "\n\n"
@@ -487,7 +532,8 @@ async def run_tool_loop(
         # Reserve the final provider attempt for a tools-disabled terminal reply.
         # A 400/422 tool-schema rejection or repeated malformed call also forces
         # this same one-shot fallback; the fallback itself is never retried.
-        if force_text_fallback or attempts == max_calls - 1:
+        terminal_text_round = force_text_fallback or attempts == max_calls - 1
+        if terminal_text_round:
             tools = None
         elif (
             external_content_seen or mutation_outcome_unknown or outbound_tools_blocked
@@ -530,6 +576,34 @@ async def run_tool_loop(
             tools = [spec for spec in turn_catalog if spec.name not in blocked_tools]
         else:
             tools = turn_catalog
+        if tools is not None and completed_memory_discovery_tools:
+            # Each discovery mode may run once. A keyword search can legitimately
+            # miss while memory_index still finds the user's saved cards, so do
+            # not suppress both after only one observation.
+            tools = [
+                spec
+                for spec in tools
+                if spec.name not in completed_memory_discovery_tools
+            ]
+        requirement_already_met = (
+            not file_delivery_required
+            or (
+                bool(delivered_file_suffixes)
+                if not normalized_required_suffixes
+                else normalized_required_suffixes.issubset(delivered_file_suffixes)
+            )
+        )
+        forced_delivery_tool = ""
+        if tools is not None and file_delivery_required and not requirement_already_met:
+            # Keep the recovery path narrow enough for weaker tool-using models.
+            tools = [spec for spec in tools if spec.name in _FILE_DELIVERY_TOOLS]
+            if file_delivery_recovery_needed:
+                forced_delivery_tool = (
+                    tool_schema.FILE_REPLY_TOOL
+                    if workspace_write_applied
+                    else "workspace_write"
+                )
+                tools = [spec for spec in tools if spec.name == forced_delivery_tool]
         tail_window = None
         adaptive_planner = getattr(build_messages, "plan_provider_round", None)
         try:
@@ -578,6 +652,7 @@ async def run_tool_loop(
                 "round": attempts + 1,
                 "messages": messages,
                 "tools": tools,
+                "forced_tool": forced_delivery_tool,
                 "prompt_frontier": frontier_plan,
                 "tail_window": tail_window,
             },
@@ -586,6 +661,30 @@ async def run_tool_loop(
         _progress("provider_start")
         try:
             provider_kwargs = {"tools": tools}
+            if (
+                forced_delivery_tool
+                and tools is not None
+                and str(getattr(provider_config, "provider", "")).strip().lower()
+                == "openrouter"
+            ):
+                provider_kwargs["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": forced_delivery_tool},
+                }
+            reasoning_effort = str(
+                getattr(provider_config, "reasoning_effort", "") or ""
+            ).strip().lower()
+            # A protocol fallback must produce usable plain text. Some reasoning
+            # relays can spend the whole fallback budget on hidden reasoning and
+            # return no reply body, which turns a safe degradation into another
+            # provider failure. Earlier rounds already captured reasoning, so the
+            # tools-disabled correction round intentionally asks for text only.
+            if (
+                reasoning_effort
+                and reasoning_effort not in {"off", "none"}
+                and not terminal_text_round
+            ):
+                provider_kwargs["include_reasoning"] = True
             if on_file_reply is not None:
                 # File-capable foreground chat may need to place an entire
                 # generated document inside workspace_write arguments. The
@@ -595,8 +694,13 @@ async def run_tool_loop(
                 # frontier; wake/child/screen lanes omit on_file_reply and keep
                 # their existing limits unchanged.
                 provider_kwargs["max_tokens"] = prompt_output_reserve_tokens
-            result = await provider_client.chat_completion_async(
-                provider_config, messages, **provider_kwargs
+            result = await provider_client.reliable_chat_completion_async(
+                provider_config,
+                messages,
+                max_attempts=(1 if forced_delivery_tool else 2),
+                base_delay_sec=0.2,
+                max_delay_sec=1.0,
+                **provider_kwargs,
             )
         except Exception as exc:
             attempt_trace = provider_client.runtime_provider_attempt_trace(exc)
@@ -697,6 +801,7 @@ async def run_tool_loop(
         # ProviderResponse.raw keeps its input mapping alive.
         result = provider_client.without_runtime_provider_attempt_trace(result)
         pr = ProviderResponse.from_result(result)
+        _capture_reasoning(pr.raw)
 
         # A tools-disabled request is terminal even if a broken relay invents a
         # tool call anyway.  Never execute an undeclared call; use only its text.
@@ -741,6 +846,7 @@ async def run_tool_loop(
                 # that recovery may still take later rounds to write, deliver,
                 # and finish; the guard itself must not keep re-arming or consume
                 # the tools-disabled final round when delivery is impossible.
+                file_delivery_recovery_needed = True
                 if not file_delivery_retry_used and attempts < max_calls - 1:
                     file_delivery_retry_used = True
                     _progress("required_file_retry_boundary")
@@ -809,9 +915,11 @@ async def run_tool_loop(
                 await on_reply(
                     pr.text,
                     final=True,
-                    reasoning=str(pr.raw.get("reasoning") or ""),
+                    reasoning=_merged_reasoning(),
                 )
             except FinalReplySuperseded:
+                reasoning_fragments.clear()
+                seen_reasoning_fragments.clear()
                 _progress("final_reply_superseded")
                 await _trajectory(
                     "final_reply_superseded",
@@ -848,7 +956,10 @@ async def run_tool_loop(
             not tc.id
             or not tc.name
             or not tc.args_ok
-            or tc.name not in offered_names
+            or (
+                tc.name not in offered_names
+                and tc.name not in completed_memory_discovery_tools
+            )
             or (
                 external_content_seen
                 and tc.name == "web_fetch"
@@ -909,6 +1020,28 @@ async def run_tool_loop(
         loop_reply_tools = {tool_schema.REPLY_TOOL, tool_schema.FILE_REPLY_TOOL}
         other_calls = [tc for tc in pr.tool_calls if tc.name not in loop_reply_tools]
         reply_results: dict[str, ToolResult] = {}
+        repeated_memory_calls = []
+        dispatch_calls = []
+        discovery_names_in_batch: set[str] = set()
+        for tc in other_calls:
+            repeated_discovery = (
+                tc.name in completed_memory_discovery_tools
+                or tc.name in discovery_names_in_batch
+            )
+            if repeated_discovery:
+                repeated_memory_calls.append(tc)
+                continue
+            dispatch_calls.append(tc)
+            if tc.name in _MEMORY_DISCOVERY_TOOLS:
+                discovery_names_in_batch.add(tc.name)
+        for tc in repeated_memory_calls:
+            reply_results[tc.id] = ToolResult(
+                call_id=tc.id,
+                content=(
+                    "ok: this memory discovery was already completed; use its "
+                    "prior result and continue without calling it again"
+                ),
+            )
         for tc in reply_calls:
             reply_text = str(tc.args.get("text") or "")
             await _trajectory(
@@ -965,7 +1098,7 @@ async def run_tool_loop(
                 "tool_batch_planned",
                 {"round": attempts, "calls": other_calls},
             )
-        dispatched = list(await dispatch_tools(other_calls)) if other_calls else []
+        dispatched = list(await dispatch_tools(dispatch_calls)) if dispatch_calls else []
         _progress("tool_batch_complete")
         dispatched_by_id = {result.call_id: result for result in dispatched}
         if len(dispatched_by_id) != len(dispatched):
@@ -976,7 +1109,7 @@ async def run_tool_loop(
             if result_for_call is None:
                 raise RuntimeError(f"tool dispatcher omitted result for call {tc.id!r}")
             ordered_results.append(result_for_call)
-        if set(dispatched_by_id) != {tc.id for tc in other_calls}:
+        if set(dispatched_by_id) != {tc.id for tc in dispatch_calls}:
             raise RuntimeError("tool dispatcher returned mismatched call ids")
 
         if any(
@@ -1015,9 +1148,18 @@ async def run_tool_loop(
                 allowed_fetch_urls.update(_search_result_urls(result.content))
             elif tc.name == "web_fetch":
                 allowed_fetch_urls.discard(str(tc.args.get("url") or "").strip())
+        completed_memory_discovery_tools.update(
+            tc.name for tc in dispatch_calls if tc.name in _MEMORY_DISCOVERY_TOOLS
+        )
+        if any(
+            tc.name == "workspace_write"
+            and str(ordered_results_by_id[tc.id].content).strip().lower().startswith("ok")
+            for tc in dispatch_calls
+        ):
+            workspace_write_applied = True
         if any(
             tc.name in provenance.EXTERNAL_READS or tc.name in mcp_names
-            for tc in other_calls
+            for tc in dispatch_calls
         ):
             # Set only after dispatch: a write selected in the SAME batch was
             # chosen before the model saw the external result.  Only later
@@ -1027,7 +1169,7 @@ async def run_tool_loop(
             # contain web data, private workspace data, or both, so provenance
             # propagates conservatively across the subagent boundary.
             external_content_seen = True
-        if any(_read_blocks_later_outbound(tc) for tc in other_calls):
+        if any(_read_blocks_later_outbound(tc) for tc in dispatch_calls):
             # Same-batch outbound calls were selected before the model observed
             # this result. Only subsequent rounds are data-dependent and fenced.
             outbound_tools_blocked = True

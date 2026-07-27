@@ -733,6 +733,9 @@ def _decrypt_chat_rows(
                 item = {"id": mid, "ts": ts, "role": role, "content": plaintext}
         if m.get("seq") is not None:
             item["seq"] = int(m["seq"])
+        reply_to_message_id = str(m.get("reply_to_message_id") or "").strip()
+        if role == "assistant" and reply_to_message_id:
+            item["reply_to_message_id"] = reply_to_message_id
         if include_capture_metadata:
             source = str(m.get("source") or "")
             item["source"] = source
@@ -1392,6 +1395,20 @@ def _read_scheduled_wake_context(user_id: str, job_id: int) -> list[dict]:
     return context
 
 
+def _read_pending_scheduled_wake_context(user_id: str) -> dict:
+    """Return the bounded pending-timer list used by ordinary chat turns."""
+    from proactive.scheduled_wake_v2 import (
+        DBScheduledWakeStoreV2,
+        ScheduledWakeServiceV2,
+    )
+
+    service = ScheduledWakeServiceV2(
+        DBScheduledWakeStoreV2(),
+        owner_id=_V2_WAKE_OWNER_ID,
+    )
+    return service.agent_context_for_user(user_id)
+
+
 def _read_images(user_id: str, message_ids: list[str]) -> dict[str, dict]:
     """按 id 取图片字节。复用内部 `chat_image_read` capability（见
     multimodal spec §4.0），但它不暴露给模型；worker 仅把最近图片作为
@@ -2028,6 +2045,22 @@ def _reply_payload_sequence(payload: dict) -> list[dict]:
     return sequence
 
 
+def _reply_parent_message_id(payload: dict) -> str:
+    value = payload.get("reply_to_message_id")
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise RuntimeError("invalid reply parent message id")
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > 160
+        or any(not char.isprintable() for char in normalized)
+    ):
+        raise RuntimeError("invalid reply parent message id")
+    return normalized
+
+
 def _sink_reply(user_id: str, payload: dict) -> None:
     """Persist a naturally-idempotent encrypted reply effect.
 
@@ -2063,6 +2096,9 @@ def _sink_reply(user_id: str, payload: dict) -> None:
             )
         )
     extra.update(message_extra)
+    reply_parent_id = _reply_parent_message_id(payload)
+    if reply_parent_id:
+        extra["reply_to_message_id"] = reply_parent_id
     extra_kwargs = {"extra": extra} if extra else {}
     envelope = payload.get("envelope")
     if isinstance(envelope, dict):
@@ -2103,6 +2139,7 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
     reply/job/effect into a reported failure.
     """
     message_payloads = _reply_payload_sequence(payload)
+    reply_parent_id = _reply_parent_message_id(payload)
     store = core_store.get_store(user_id)
     records = []
     previous_ts: float | None = None
@@ -2113,7 +2150,16 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
             raise RuntimeError("transactional reply requires encrypted envelope")
         content_type, message_extra = _reply_message_fields(message_payload)
         reply_extra = v2_worker._reply_effect_extra(message_payload)
-        build_extra = {**reply_extra, **message_extra}
+        activity_extra: dict[str, Any] = {}
+        if message_payload.get("activity_job_id"):
+            activity_extra = v2_worker._activity_extra(
+                message_payload.get("activity_events"),
+                turn_id=str(message_payload.get("activity_turn_id") or ""),
+                job_id=int(message_payload["activity_job_id"]),
+            )
+        build_extra = {**reply_extra, **activity_extra, **message_extra}
+        if reply_parent_id:
+            build_extra["reply_to_message_id"] = reply_parent_id
         wake_kind = str(message_payload.get("wake_kind") or "")
         if wake_kind:
             build_extra["wake_kind"] = wake_kind
@@ -2529,6 +2575,13 @@ def _sink_workspace(user_id: str, payload: dict, *, runtime_token: str) -> None:
             params=params,
         )
         if not result.ok:
+            error = result.error if isinstance(result.error, dict) else {}
+            if (
+                op == "workspace_write"
+                and str(error.get("message") or "")
+                == "workspace revision conflict"
+            ):
+                raise db.EffectTerminalError("workspace_revision_conflict")
             raise _capability_effect_error(result, f"{op}_failed")
     except Exception:
         db.effect_sink_release(eid)
@@ -2608,6 +2661,13 @@ def _apply_workspace_batch_operation(
             params=params,
         )
         if not result.ok:
+            error = result.error if isinstance(result.error, dict) else {}
+            if (
+                op == "workspace_write"
+                and str(error.get("message") or "")
+                == "workspace revision conflict"
+            ):
+                raise db.EffectTerminalError("workspace_revision_conflict")
             raise _capability_effect_error(result, f"{op}_failed")
     except Exception:
         # Only a write that raised is safe to retry.  A hard process death after
@@ -2616,7 +2676,12 @@ def _apply_workspace_batch_operation(
         db.effect_sink_release(child_effect_id)
         raise
     db.effect_sink_complete(child_effect_id)
-    return {"effect_id": child_effect_id, "status": "applied"}
+    outcome = {"effect_id": child_effect_id, "status": "applied"}
+    data = result.data if isinstance(getattr(result, "data", None), dict) else {}
+    revision = data.get("revision")
+    if op == "workspace_write" and type(revision) is int and revision > 0:
+        outcome["revision"] = revision
+    return outcome
 
 
 def _sink_workspace_batch(
@@ -2660,26 +2725,44 @@ def _sink_workspace_batch(
                 outcome = future.result()
             except db.EffectDeliveryUncertainError as exc:
                 uncertain_errors.append(exc)
-            except db.EffectTerminalError:
+            except db.EffectTerminalError as exc:
+                terminal_code = str(exc)
+                if terminal_code not in v2_effect_outbox.WORKSPACE_BATCH_TERMINAL_ERRORS:
+                    terminal_code = f"{operation['op']}_failed"
                 outcomes[child_effect_id] = {
                     "effect_id": child_effect_id,
                     "status": "discarded",
                     # The capability adapter deliberately exposes only this
                     # stable code; never persist exception text from a sink.
-                    "error": f"{operation['op']}_failed",
+                    "error": terminal_code,
                 }
             except Exception as exc:  # noqa: BLE001 - re-raised after siblings settle
                 retryable_errors.append(exc)
             else:
-                if not isinstance(outcome, dict) or outcome != {
-                    "effect_id": child_effect_id,
-                    "status": "applied",
-                }:
+                if not isinstance(outcome, dict):
                     retryable_errors.append(
                         RuntimeError("workspace child returned an invalid outcome")
                     )
                 else:
-                    outcomes[child_effect_id] = outcome
+                    outcome_keys = set(outcome)
+                    revision = outcome.get("revision")
+                    if not (
+                        outcome.get("effect_id") == child_effect_id
+                        and outcome.get("status") == "applied"
+                        and (
+                            outcome_keys == {"effect_id", "status"}
+                            or (
+                                outcome_keys == {"effect_id", "status", "revision"}
+                                and type(revision) is int
+                                and revision > 0
+                            )
+                        )
+                    ):
+                        retryable_errors.append(
+                            RuntimeError("workspace child returned an invalid outcome")
+                        )
+                    else:
+                        outcomes[child_effect_id] = outcome
         # Delivery uncertainty dominates every other outcome. Ordinary
         # retryable failures dominate deterministic item rejections so a
         # terminal sibling can never discard work that still needs a replay.
@@ -3106,6 +3189,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_messages=_read_messages,
         read_messages_since=_read_messages,
         read_messages_after_seq=_read_messages_after_seq,
+        ordered_chat_replies=True,
         runtime_mode_enabled=lambda user_id: (
             hosted_config_store.hosted_runtime_v2_enabled_strict(
                 core_store.get_store(user_id)
@@ -3134,6 +3218,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_files=_read_files,
         read_memory_context=_read_memory_context,
         read_scheduled_wake_context=_read_scheduled_wake_context,
+        read_pending_scheduled_wake_context=_read_pending_scheduled_wake_context,
         apply_memory_actions=_apply_memory_actions,
         build_memory_envelope=_build_memory_envelope,
         read_capture_state=_read_capture_state,

@@ -19,7 +19,11 @@ MEMORY_CATEGORY_KEYS = frozenset({
     "preferences", "values", "health", "interests", "money", "food", "travel",
 })
 _SAFE_TOKEN_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
-_TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "cancelled", "discarded"})
+_TERMINAL_JOB_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "discarded", "expired"}
+)
+_FAILED_JOB_STATUSES = frozenset({"failed", "cancelled", "discarded", "expired"})
+_MEMORY_DISCOVERY_TOOLS = frozenset({"memory_index", "memory_search"})
 
 
 def safe_token(value: Any, *, max_len: int = 128) -> str:
@@ -141,6 +145,34 @@ def safe_schedule_metadata(value: Any) -> dict:
     return safe
 
 
+def _collapse_memory_discovery(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Hide contradictory/repeated zero-result discovery rows.
+
+    Search and index use different matching semantics, so a zero keyword search
+    followed by a positive index is not contradictory backend data. Presenting
+    both as separate user-facing conclusions is nevertheless misleading.
+    """
+    has_positive_memory = any(
+        event.get("status") == "success"
+        and isinstance(event.get("memory_count"), int)
+        and int(event["memory_count"]) > 0
+        for event in events
+    )
+    zero_discovery_indexes = [
+        index
+        for index, event in enumerate(events)
+        if event.get("name") in _MEMORY_DISCOVERY_TOOLS
+        and event.get("status") == "success"
+        and event.get("memory_count") == 0
+    ]
+    if not zero_discovery_indexes:
+        return events
+    suppressed = set(zero_discovery_indexes)
+    if not has_positive_memory:
+        suppressed.discard(zero_discovery_indexes[-1])
+    return [event for index, event in enumerate(events) if index not in suppressed]
+
+
 def project_tool_events(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Collapse start/result status rows into one event per confirmed invocation."""
     ordered: list[str] = []
@@ -192,22 +224,43 @@ def project_tool_events(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any
                 event[target] = token
         event.update(safe_memory_metadata(detail))
         event.update(safe_schedule_metadata(detail))
-    return [projected[event_id] for event_id in ordered]
+    return _collapse_memory_discovery([projected[event_id] for event_id in ordered])
+
+
+def _turn_failure(jobs: list[Mapping[str, Any]]) -> dict[str, Any] | None:
+    for job in reversed(jobs):
+        status = safe_token(job.get("status"), max_len=32).lower()
+        if status not in _FAILED_JOB_STATUSES:
+            continue
+        raw_code = str(job.get("last_error") or "").strip().lower()
+        code = (
+            raw_code
+            if re.fullmatch(r"[a-z0-9_.:-]{1,96}", raw_code) is not None
+            else ""
+        )
+        if not code:
+            code = f"turn_failed:{status}"
+        return {
+            "code": code,
+            "job_id": safe_token(job.get("id"), max_len=64),
+        }
+    return None
 
 
 def turn_response(turn_id: str, jobs: Iterable[Mapping[str, Any]], rows: Iterable[Mapping[str, Any]]) -> dict:
+    source_jobs = list(jobs)
     job_list = [
         {
             "job_id": str(job.get("id") or ""),
             "status": safe_token(job.get("status"), max_len=32),
         }
-        for job in jobs
+        for job in source_jobs
     ]
     row_list = list(rows)
     phases = [str(row.get("kind") or "") for row in row_list if row.get("kind") != TOOL_ACTIVITY_KIND]
     statuses = {job["status"] for job in job_list if job["status"]}
     complete = bool(statuses) and statuses.issubset(_TERMINAL_JOB_STATUSES)
-    return {
+    response = {
         "turn_id": turn_id,
         "runtime": "v2",
         "complete": complete,
@@ -215,6 +268,10 @@ def turn_response(turn_id: str, jobs: Iterable[Mapping[str, Any]], rows: Iterabl
         "jobs": job_list,
         "events": project_tool_events(row_list),
     }
+    failure = _turn_failure(source_jobs)
+    if failure is not None:
+        response["failure"] = failure
+    return response
 
 
 def resident_turn_response(turn_id: str, parent: Mapping[str, Any], rows: Iterable[Mapping[str, Any]]) -> dict:

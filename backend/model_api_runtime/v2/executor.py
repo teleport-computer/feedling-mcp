@@ -19,6 +19,7 @@ from capabilities import identity as cap_identity
 from capabilities import activity_metadata
 from model_api_runtime.v2 import provenance as _prov
 from provider_types import ToolResult
+from workspace.backends import WorkspaceError, model_writable_path
 
 async def _run_one(store, step, *, api_key, runtime_token, enclave_sem) -> tuple[str, dict]:
     """Run one synchronous capability behind the shared enclave gate."""
@@ -44,6 +45,21 @@ async def _run_one(store, step, *, api_key, runtime_token, enclave_sem) -> tuple
 # 只是这里的单位是一个 native tool call。
 _RESULT_CHAR_CAP = 2000
 _BLOB_KEYS = frozenset({"image_b64"})
+
+
+def workspace_mutation_path_error(name: str, args: dict) -> str | None:
+    """Return a stable live-only error for a non-writable VFS mutation path."""
+    if name not in {"workspace_write", "workspace_delete"}:
+        return None
+    try:
+        model_writable_path(args.get("path"))
+    except WorkspaceError:
+        return (
+            f"invalid workspace path for {name}; "
+            "use /workspace/<filename> for generated files; "
+            "/artifacts and /skills are read-only"
+        )
+    return None
 
 
 def _strip_blobs(value: Any) -> Any:
@@ -100,6 +116,16 @@ async def dispatch_tool_calls(
         elif tc.name in cap_registry.READ_ACTIONS:
             reads.append(tc)
         elif tc.name in cap_registry.WRITE_ACTIONS:
+            if path_error := workspace_mutation_path_error(tc.name, tc.args):
+                # LIVE-only pre-enqueue gate. The sink remains authoritative,
+                # but a model typo such as /artifacts/report.md must be
+                # recoverable in this turn instead of terminally discarding
+                # the encrypted effect after the model was told it queued.
+                results_by_id[tc.id] = ToolResult(
+                    call_id=tc.id,
+                    content=f"error: {path_error}",
+                )
+                continue
             writes.append(tc)
 
     async def _read(tc):
