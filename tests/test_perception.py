@@ -508,6 +508,79 @@ def test_snapshot_exposes_app_state_field(env):
     assert snap["app_state"] is None
 
 
+def test_app_open_marks_foreground(env):
+    fake, _ = env
+    service.app_open(UID, "Instagram", category="social", client_ts=1000.0)
+    state = fake.get_state(UID)
+    assert state["app_name"]["v"] == "Instagram"
+    assert state["app_state"]["v"] == "foreground"
+
+
+def test_app_close_records_event_and_marks_closed(env):
+    """关闭当前 app：事件进 app_close 流，状态保留 app_name 但转 closed —— TA
+    要能说「你刚从 Instagram 出来」，而不是「你刚离开了一个 null」。"""
+    fake, _ = env
+    service.app_open(UID, "Instagram", category="social", client_ts=1000.0)
+    out, code = service.app_close(UID, "Instagram", category="social", client_ts=1600.0)
+    assert code == 200 and out["app"] == "Instagram" and out["ts"] == 1600.0
+    assert fake.read_app_closes(UID)[-1]["app"] == "Instagram"
+    state = fake.get_state(UID)
+    assert state["app_name"]["v"] == "Instagram"
+    assert state["app_state"]["v"] == "closed"
+    # open 那条事件行不受影响
+    assert fake.read_app_opens(UID)[-1]["app"] == "Instagram"
+
+
+def test_app_close_aligns_all_three_timestamps(env):
+    """三格 ts 必须一起刷新到 close 时刻：否则 900s TTL 到点时 app_name 先
+    过期而 app_state 还在，agent 会看到「关闭了一个 null」。"""
+    fake, _ = env
+    service.app_open(UID, "Instagram", category="social", client_ts=1000.0)
+    service.app_close(UID, "Instagram", category="social", client_ts=1600.0)
+    state = fake.get_state(UID)
+    assert state["app_name"]["ts"] == 1600.0
+    assert state["app_category"]["ts"] == 1600.0
+    assert state["app_state"]["ts"] == 1600.0
+
+
+def test_app_close_ignores_a_non_current_app(env):
+    """后台被系统杀掉的旧 app，其 close 的 ts 比新 app 的 open 更新（ts 守卫
+    放行），绝不能把当前前台覆盖掉。"""
+    fake, _ = env
+    service.app_open(UID, "douyin", category="social", client_ts=1000.0)
+    service.app_open(UID, "wechat", category="social", client_ts=2000.0)
+    out, code = service.app_close(UID, "douyin", category="social", client_ts=2100.0)
+    assert code == 200
+    state = fake.get_state(UID)
+    assert state["app_name"]["v"] == "wechat"          # 当前前台不动
+    assert state["app_state"]["v"] == "foreground"     # 也没被改成 closed
+    assert fake.read_app_closes(UID)[-1]["app"] == "douyin"   # 事件照记
+
+
+def test_app_close_matches_app_name_case_insensitively(env):
+    """快捷指令里用户手填的 app 名大小写/空格不稳定。"""
+    fake, _ = env
+    service.app_open(UID, "Instagram", category="social", client_ts=1000.0)
+    service.app_close(UID, "  instagram ", client_ts=1600.0)
+    assert fake.get_state(UID)["app_state"]["v"] == "closed"
+
+
+def test_app_close_keeps_category_when_not_supplied(env):
+    """close 的 URL 不带 category（iOS 生成的 URL 只有 key+app），不能把已知
+    category 抹成 None。"""
+    fake, _ = env
+    service.app_open(UID, "Instagram", category="social", client_ts=1000.0)
+    service.app_close(UID, "Instagram", client_ts=1600.0)
+    assert fake.get_state(UID)["app_category"]["v"] == "social"
+
+
+def test_app_close_requires_app(env):
+    fake, _ = env
+    out, code = service.app_close(UID, "")
+    assert code == 400 and out["error"] == "app_required"
+    assert fake.read_app_closes(UID) == []
+
+
 def test_app_open_via_get_route(env, monkeypatch):
     """End-to-end: GET with everything (incl. key) in the URL query string."""
 

@@ -1143,27 +1143,76 @@ def items_recent(user_id: str, kind: str, limit: int = 20) -> tuple[dict, int]:
 
 
 # ---------------------------------------------------------------------------
-# App usage (iOS Shortcut GET endpoint) — "what app at what time"
+# App usage (iOS Shortcut GET endpoints) — "what app at what time"
 # ---------------------------------------------------------------------------
 
-def app_open(user_id: str, app: str, category: str | None = None,
-             client_ts=None) -> tuple[dict, int]:
-    """Record one app-open event (fired by an iOS Shortcut when the user opens an
-    app). Updates current app in the snapshot AND appends to the usage time series
-    for later stats."""
+def _current_app_cells(user_id: str) -> tuple[str | None, str | None]:
+    """(current app_name, current app_category) as plain values from the snapshot."""
+    state = store.get_state(user_id)
+
+    def _value(field: str):
+        cell = state.get(field)
+        return cell.get("v") if isinstance(cell, dict) else None
+
+    return _value("app_name"), _value("app_category")
+
+
+def _record_app_event(user_id: str, app: str, category: str | None,
+                      client_ts, *, closing: bool) -> tuple[dict, int]:
+    """Record one app open/close event fired by an iOS Shortcut automation.
+
+    Both directions append to their own stream and refresh the snapshot's app
+    cells. The ONE asymmetry: an open unconditionally becomes the current app,
+    while a close only touches the snapshot when the app being closed IS the
+    current one. A background app killed after the user already switched away
+    carries a NEWER ts than the next app's open, so the per-field ts guard would
+    happily let it clobber what is actually on screen.
+
+    On close all three cells are rewritten with the close ts (app_name/
+    app_category keep their values): leaving app_name at the open ts would let
+    it expire under the 900s TTL while app_state still read "closed" — i.e. the
+    agent would see "closed a null".
+    """
     app = (app or "").strip()
     if not app:
         return {"error": "app_required"}, 400
     now = _coerce_ts(client_ts)
     category = (category or "").strip() or None
-    # current app -> snapshot (ts-guarded)
-    store.merge_state_guarded(user_id, {
-        "app_name": _cell(app, now, None),
-        "app_category": _cell(category, now, None),
-    })
-    # append to the usage time series
-    store.append_app_open(user_id, {"app": app, "category": category, "ts": now}, now)
+
+    if closing:
+        store.append_app_close(user_id, {"app": app, "category": category, "ts": now}, now)
+        current_app, current_category = _current_app_cells(user_id)
+        if current_app and str(current_app).strip().casefold() == app.casefold():
+            store.merge_state_guarded(user_id, {
+                "app_name": _cell(app, now, None),
+                "app_category": _cell(category if category is not None else current_category,
+                                      now, None),
+                "app_state": _cell("closed", now, None),
+            })
+    else:
+        store.merge_state_guarded(user_id, {
+            "app_name": _cell(app, now, None),
+            "app_category": _cell(category, now, None),
+            "app_state": _cell("foreground", now, None),
+        })
+        store.append_app_open(user_id, {"app": app, "category": category, "ts": now}, now)
     return {"status": "ok", "app": app, "category": category, "ts": now}, 200
+
+
+def app_open(user_id: str, app: str, category: str | None = None,
+             client_ts=None) -> tuple[dict, int]:
+    """Record one app-open event (fired by an iOS Shortcut when the user opens an
+    app). Updates current app in the snapshot AND appends to the usage time
+    series for later stats."""
+    return _record_app_event(user_id, app, category, client_ts, closing=False)
+
+
+def app_close(user_id: str, app: str, category: str | None = None,
+              client_ts=None) -> tuple[dict, int]:
+    """Record one app-close event (the Shortcut automation's "is closed"
+    trigger). Mirror of ``app_open`` on the wire; see ``_record_app_event`` for
+    the one place the two intentionally differ."""
+    return _record_app_event(user_id, app, category, client_ts, closing=True)
 
 
 def app_history_denied_reason(user_id: str) -> str:
