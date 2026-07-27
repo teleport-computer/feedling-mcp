@@ -8,11 +8,23 @@ only.
 from __future__ import annotations
 
 import json
+import os
 import re
 import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+# Fallback timezone when the user's IANA zone is unknown or invalid. Defaults to
+# Asia/Shanghai (most users are in China) and matches the resident consumer's
+# `_DEFAULT_TIMEZONE` and the proactive path's `PROACTIVE_DEFAULT_TIMEZONE`, so
+# the V2 temporal block never disagrees with the in-message time anchor. A
+# silent UTC clock is 8h off for CN users and makes the model state the wrong
+# "your side" time (e.g. "晚上9点" at 凌晨4:55, since 04:55 CST == 20:55 UTC).
+DEFAULT_TIMEZONE = (
+    os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/Shanghai").strip()
+    or "Asia/Shanghai"
+)
 
 # Mirrors `_ASSISTANT_ROLES` in `backend/model_api_runtime/v2/coalesce.py`.
 # Replicated (not imported) to keep this module dependency-free.
@@ -498,12 +510,18 @@ def build_temporal_context(
     tail: list[dict],
 ) -> dict[str, Any]:
     """Build one immutable, provider-neutral temporal snapshot for a turn."""
-    zone_name = str(timezone_name or "").strip() or "UTC"
+    zone_name = str(timezone_name or "").strip() or DEFAULT_TIMEZONE
     try:
         zone = ZoneInfo(zone_name)
     except (ValueError, ZoneInfoNotFoundError):
-        zone_name = "UTC"
-        zone = ZoneInfo("UTC")
+        # Unknown/garbage zone: use the China default, never a silent UTC clock.
+        try:
+            zone_name = DEFAULT_TIMEZONE
+            zone = ZoneInfo(DEFAULT_TIMEZONE)
+        except (ValueError, ZoneInfoNotFoundError):
+            # Only reachable if FEEDLING_DEFAULT_TIMEZONE is itself misconfigured.
+            zone_name = "UTC"
+            zone = ZoneInfo("UTC")
 
     now_value = float(now_ts)
     now_utc = datetime.fromtimestamp(now_value, tz=timezone.utc)
@@ -542,8 +560,10 @@ def build_temporal_context(
         prompt_index += 1
 
     return {
+        # current_local_time + timezone fully specify the instant. A raw
+        # current_utc_time sibling was a foot-gun: the model misread the
+        # evening-UTC value as the user's local wall clock. Omitted on purpose.
         "current_local_time": now_local.isoformat(timespec="seconds"),
-        "current_utc_time": now_utc.isoformat(timespec="seconds"),
         "last_genuine_user_message_sent_at": last_sent_at,
         "seconds_since_last_genuine_user_message": seconds_since_last,
         "tail_timestamps": tail_timestamps,

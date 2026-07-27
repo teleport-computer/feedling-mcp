@@ -9,15 +9,6 @@
 
 ---
 
-## 2026-07-26
-
-### [FEATURE] V1 与 VPS 支持独立视觉模型
-- 官方 resident 通过 `vision_observer_v1` capability 声明支持；图片发送时固定
-  dedicated route，观察结果以不可信文本交给主模型。
-- dedicated observer 失败或 resident 过旧时在消息落库前 fail-closed，绝不把原图
-  fallback 给主模型；follow-main 继续沿用既有图片链路，Runtime V2 行为保留。
-- 补齐 iOS preflight/状态契约、公开 OpenAPI、错误 slug 与文档。
-
 ## 给 Claude Code 的说明
 
 **每次开新对话时**，请按顺序读：
@@ -56,6 +47,49 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-27 — 退役 `responses_unsupported`：一条对着 Kimi 用户空放了很久的警告
+
+**[DECISION] 删除 `/responses` 探测与 `responses_unsupported` 警告**。用户配
+Kimi/Moonshot（`openai_compatible`）时，setup 会返回一条 warning：「你选的中转
+不支持 Responses 协议，AI 的记忆和工具调用可能不稳定，建议换一个中转」。这条
+警告是误报，代码取证与真机实测两头闭合：
+
+- 它的因由（`setup_core._emit_responses_support_notice` 的注释）是「中转不实现
+  `/v1/responses` → LiteLLM 强制 responses→chat-completions 桥接 → mangle codex
+  工具循环」。**三个前提全部失效**：① LiteLLM 网关早已退役（`db.py` 自己写着
+  「pi 走 openai-completions wire，不经 LiteLLM 网关」）；② `openai_compatible`
+  派生的 driver label 是 `pi` 而非 `codex`（`hosted/agent_runtime_cutover.py`），
+  而 warning 的触发条件恰恰限死在 `openai_compatible`——只在**永远用不到 codex
+  的那类 provider 上**报警；③ Runtime V2 全程 `chat_completion_async`，
+  `provider_client` 里 `/responses` 的唯一入口条件是 `provider == "openai"`。
+- `supports_responses` 在整个 backend **没有任何行为消费点**（`consumer_env` 也
+  不读它），唯一下游就是这条 warning。
+- test 环境实测四个临时账号（`kimi-k2.5` + `https://api.moonshot.cn/v1`）：V1(pi)
+  路径 3 轮、V2 路径 1 轮，记忆写入 4/4、下一轮回读 4/4、错误气泡 0；V2 的
+  `v2_trajectory_events` 记到 `tool_call_started` / `tool_call_result` /
+  `tool_batch_planned` / `tool_batch_result` **各 3 次**，`turn_terminal` 2 次。
+  即：警告声称会不稳的两件事，在它自己声称会出问题的路径上都是好的。
+
+改动：删 `provider_client.probe_responses_support`（省掉每次 openai_compatible
+setup 一次最多 20s 的网络往返）、删 `setup_core._emit_responses_support_notice`
+与两处 probe 调用、setup 响应不再有 `warnings` 字段、`notices/catalog` 移除该
+error class。`supports_responses` **列保留**并钉死 false——V1 roster payload 仍
+带着它，删列要迁移而收益为零。
+
+存量已 emit 的通知走**读侧过滤**下架（`catalog.RETIRED_ERROR_CLASSES` +
+`notices.core.list_notices` 跳过），不做 SQL 回填：`user_logs` 有 TEE 影子库
+镜像，回填只改主库会让两边分叉。
+
+文档：`docs/FRONTEND_ERROR_CONTRACT.md` 删该行；`docs/testing/TESTING.md` §6 与
+`RELEASE_TESTING_PROTOCOL.md` 第 5 格改口径——**「能回话 ≠ 记忆/工具能用」这条
+测试纪律保留且加强，但没有任何配置字段能替代跑一轮真回合**（旧文写的「验一家新
+中转必须读 `warnings[]` 和 `supports_responses`」是错的指引）。公开文档与
+OpenAPI 不涉及（零命中）。
+
+同期确认的一条独立事实（与本条无关，仍成立）：Moonshot 的 key 有**区域锁**，
+`.cn` 签发的 key 打 `api.moonshot.ai` 直接 `401 Invalid Authentication`；用户报
+`provider_test_failed`/401 时先核 `base_url` 与 key 签发区是否配对。
+
 ## 2026-07-26
 
 ### [DONE] V1/V2 聊天执行记录统一为可信投影
@@ -72,6 +106,8 @@
 - `memory_search` / `memory_fetch` 在 capability 真实结果还未截断时提取返回总数；
   只有每一项都命中固定双语通用桶时才附完整分类计数，任一自定义/未知桶则只保留总数。
   记忆摘要、正文、搜索词和原始桶名都不进入活动记录。
+
+### [DONE] V1 resident 补齐可下载文件
 
 ### [DONE] Claude / Codex / Pi 共用文件生成与原子回复
 - V1 CLI resident 新增 `io_cli send-file`：模型把 UTF-8 源文件写进每用户隔离的

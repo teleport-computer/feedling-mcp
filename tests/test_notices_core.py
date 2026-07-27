@@ -175,6 +175,28 @@ def test_list_dedupes_same_key_keeping_latest():
     assert dups[0]["last_ts"] == now      # 保留的是最新那条
 
 
+def test_list_hides_retired_error_classes():
+    """退役的 error_class（catalog 里已删）不能再出现在通知中心。
+
+    存量行是历史 emit 留下的真实数据，改不动也不该改（user_logs 有 TEE 影子库
+    镜像，SQL 迁移只改主库会让两边分叉）——读侧过滤是唯一幂等且不分叉的清法。
+    responses_unsupported 是第一条：它的前提（LiteLLM 桥接 mangle codex 工具
+    循环）三条全失效，openai_compatible 派生 pi 而非 codex，实测记忆/工具正常。"""
+    uid = _uid(); seed_user(uid); s = _store(uid)
+    import time
+    now = time.time()
+    stale = _doc("model_api:responses_unsupported", now, resolved=False)
+    stale["error_class"] = "responses_unsupported"
+    stale["source"] = "model_api"
+    db.log_append(uid, core.NOTICES_STREAM, stale, ts=now,
+                  item_key="model_api:responses_unsupported")
+    db.log_append(uid, core.NOTICES_STREAM, _doc("chat:live", now, resolved=False),
+                  ts=now, item_key="chat:live")
+    body, status = core.list_notices(s, include_resolved=True)
+    assert status == 200
+    assert [n["dedupe_key"] for n in body["notices"]] == ["chat:live"]
+
+
 def test_list_dedupe_resolved_then_active_shows_active():
     """resolve 后又 emit 新增（resolved 行 + active 新行同 key）→ 读侧只回最新的 active。"""
     uid = _uid(); seed_user(uid); s = _store(uid)

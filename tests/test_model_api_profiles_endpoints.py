@@ -54,7 +54,6 @@ def fake_provider(monkeypatch):
     """测活恒成功。patch 打在定义模块 provider_client 上。"""
     monkeypatch.setattr(provider_client, "test_provider_key",
                         lambda cfg: {"usage": {"total_tokens": 1}})
-    monkeypatch.setattr(provider_client, "probe_responses_support", lambda cfg: False)
 
 
 @pytest.fixture
@@ -173,10 +172,6 @@ def test_create_custom_route_requires_context_window_before_persistence(
     headers = {"X-API-Key": registered_user["api_key"]}
     before_credentials = len(db.model_api_credentials_list(uid))
 
-    def must_not_probe(_cfg):
-        raise AssertionError("missing frontier must fail before relay probe")
-
-    monkeypatch.setattr(provider_client, "probe_responses_support", must_not_probe)
     resp = client.post("/v1/model_api/routes", headers=headers, json={
         "provider": "openai_compatible",
         "model": "private-model",
@@ -189,32 +184,13 @@ def test_create_custom_route_requires_context_window_before_persistence(
     assert len(db.model_api_credentials_list(uid)) == before_credentials
 
 
-def test_create_route_with_api_key_probes_supports_responses_true(
-        client, registered_user, fake_provider, fake_envelope, fake_enclave, monkeypatch):
-    """Issue 2 regression: the api_key branch of model_api_route_create used to
-    hardcode supports_responses=False, unlike model_api_setup which probes. A
-    relay that DOES implement /v1/responses would then get forced through the
-    LiteLLM chat-completions bridge, mangling codex's tool loop."""
+def test_create_route_with_api_key_leaves_supports_responses_false(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave):
+    """The /responses probe is retired (2026-07-27), so both credential-creating
+    paths — model_api_setup and this api_key branch — pin supports_responses
+    false. Nothing reads the column; it survives only in the V1 roster payload."""
     uid = registered_user["user_id"]
     headers = _setup_one(client, registered_user)
-    monkeypatch.setattr(provider_client, "probe_responses_support", lambda cfg: True)
-
-    resp = client.post("/v1/model_api/routes", headers=headers, json={
-        "provider": "openai_compatible", "model": "gpt-relay",
-        "base_url": "https://relay.example.com/v1", "api_key": "sk-relay-key",
-        "context_window_tokens": 128_000})
-    assert resp.status_code == 200, resp.get_data(as_text=True)
-
-    creds = [c for c in db.model_api_credentials_list(uid) if c["provider"] == "openai_compatible"]
-    assert len(creds) == 1
-    assert creds[0]["supports_responses"] is True
-
-
-def test_create_route_with_api_key_probes_supports_responses_false(
-        client, registered_user, fake_provider, fake_envelope, fake_enclave, monkeypatch):
-    uid = registered_user["user_id"]
-    headers = _setup_one(client, registered_user)
-    monkeypatch.setattr(provider_client, "probe_responses_support", lambda cfg: False)
 
     resp = client.post("/v1/model_api/routes", headers=headers, json={
         "provider": "openai_compatible", "model": "gpt-relay",

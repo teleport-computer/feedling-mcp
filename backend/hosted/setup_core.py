@@ -490,36 +490,6 @@ def _resolve_provider_key(store, raw_key: str, existing: dict | None,
     return provider_key, existing_envelope, str(existing.get("api_key_hint") or "saved key")
 
 
-def _emit_responses_support_notice(store, provider: str, supports_responses: bool,
-                                   base_url: str) -> list[dict]:
-    """openai_compatible 中转不实现 /v1/responses → LiteLLM 强制 chat-completions 桥接
-    → mangle codex 工具循环 → 记忆/工具静默不可靠(rc=0 但工具从不真调,无限"我再试
-    一次")。配置期就能预知,双写:
-      ① setup 响应带 warnings → 设置页保存后当场显示(不必等通知中心页)
-      ② 通知中心 emit → 持久化,通知中心页/其它端也能看到
-    换到支持 /v1/responses 的中转(或非 openai_compatible provider)时 resolve。"""
-    warnings: list[dict] = []
-    try:
-        from notices import core as notices_core
-        from notices import catalog as notices_catalog
-        _ec = "responses_unsupported"
-        if provider == "openai_compatible" and not supports_responses:
-            _blame = notices_catalog.blame_for(_ec)
-            _text = notices_catalog.user_text_for(_ec)
-            warnings.append({"error_class": _ec, "blame": _blame,
-                             "severity": "warning", "user_text": _text})
-            notices_core.emit(
-                store, source="model_api", error_class=_ec,
-                blame=_blame, severity="warning", user_text=_text,
-                detail=f"probe /v1/responses -> supported=False (base_url={base_url})",
-                dedupe_key=f"model_api:{_ec}")
-        else:
-            notices_core.resolve(store, f"model_api:{_ec}")
-    except Exception:
-        pass  # 扇出绝不影响 setup 主职责(emit/resolve 本身已 never-raise,这是双保险)
-    return warnings
-
-
 def _apply_runtime_policy_or_error(store) -> tuple[dict, int] | None:
     """Apply environment-forced runtime ownership before reporting success."""
     try:
@@ -713,24 +683,14 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
         return {"error": "provider_test_failed", "detail": str(e),
                 "status_code": e.status_code}, 400
 
-    # For openai_compatible relays, probe the Responses capability once and
-    # persist it for the native provider client. This is transport metadata for
-    # the unified V2 loop, not a runtime selector.
+    # `supports_responses` is retired transport metadata: nothing in the backend
+    # reads it (not even spawners.consumer_env), and /responses has exactly one
+    # caller — provider_client's `provider == "openai"` branch, which an
+    # openai_compatible relay can never reach. The probe it used to feed cost a
+    # network round-trip per setup and drove a warning that told Moonshot users
+    # their memory/tools were unreliable when they demonstrably are not. Column
+    # kept (V1 roster payload still carries it) and pinned false.
     supports_responses = False
-    if provider == "openai_compatible":
-        supports_responses = provider_client.probe_responses_support(
-            provider_client.ProviderConfig(
-                provider,
-                model,
-                provider_key,
-                base_url,
-                context_window_tokens=context_window_tokens,
-            )
-        )
-        print(
-            f"[model_api:{store.user_id}] openai_compatible /responses probe -> "
-            f"supports={supports_responses} base_url={base_url}"
-        )
 
     try:
         restore_v2 = _runtime_should_restore_v2(store)
@@ -834,13 +794,8 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     accounts_onboarding._save_onboarding_route(store, "model_api")
     print(f"[model_api:{store.user_id}] setup provider={provider} model={model}")
 
-    warnings = _emit_responses_support_notice(store, provider, supports_responses, base_url)
-
     route = hosted_config_store.load_active_route(store)
-    resp = {"status": "configured", "config": _public_route(route)}
-    if warnings:
-        resp["warnings"] = warnings
-    return resp, 200
+    return {"status": "configured", "config": _public_route(route)}, 200
 
 
 def model_api_get(store) -> tuple[dict, int]:
@@ -1139,8 +1094,8 @@ def model_api_delete(store) -> tuple[dict, int]:
         hosted_config_store.prepare_model_api_delete(store)
     except Exception:
         return {"error": "model_api_runtime_disable_failed"}, 500
-    # 配置没了,任何 config 期发出的 model_api 警告(如 responses_unsupported)也随之
-    # 作废——否则 /v1/notices 会为一个已不存在的 provider 一直显示活跃警告。
+    # 配置没了,任何 config 期发出的 model_api 通知也随之作废——否则 /v1/notices
+    # 会为一个已不存在的 provider 一直显示活跃警告。
     try:
         from notices import core as notices_core
         notices_core.resolve(store, "model_api:")
@@ -1494,23 +1449,9 @@ def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) 
             store, raw_key.encode("utf-8"), item_id=f"model_api_key_{uuid.uuid4().hex}")
         if envelope is None:
             return {"error": "cannot_encrypt_provider_key", "detail": err}, 409
-        # Mirror model_api_setup's one-time openai_compatible Responses probe so
-        # the native provider client does not silently lose the relay capability.
+        # Mirrors model_api_setup: the /responses probe is retired, the column
+        # stays and is pinned false (see the note there).
         supports_responses = False
-        if provider == "openai_compatible":
-            supports_responses = provider_client.probe_responses_support(
-                provider_client.ProviderConfig(
-                    provider,
-                    model,
-                    raw_key,
-                    base_url,
-                    context_window_tokens=context_window_tokens,
-                )
-            )
-            print(
-                f"[model_api:{store.user_id}] openai_compatible /responses probe -> "
-                f"supports={supports_responses} base_url={base_url}"
-            )
         # 显式带 api_key 就是「新建一把凭据」，总是插新行 —— 同 provider 允许多把 key。
         credential_id = db.model_api_credential_create(
             store.user_id, provider=provider, base_url=base_url,

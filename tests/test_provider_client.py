@@ -885,60 +885,28 @@ class _StatusClient:
         pass
 
 
-def _fake_responses_probe(monkeypatch, status_code: int, body: dict | None = None):
-    calls: list[dict] = []
+def test_openai_compatible_never_reaches_the_responses_wire(monkeypatch):
+    """openai_compatible 恒走 /chat/completions。
 
-    class FakeClient(_StatusClient):
+    这是 probe_responses_support 退役后剩下的那半个断言：/responses 在本模块只有
+    一个入口（`provider == "openai"` 且 reasoning 模型），中转永远进不去，所以
+    「中转不支持 Responses」对我们没有任何后果。"""
+    urls: list[str] = []
+
+    class RecordingClient(_StatusClient):
         def post(self, url, *, headers=None, json=None, timeout=None):
-            calls.append({"url": url, "json": json or {}})
-            return FakeResponse(status_code, body or {})
+            urls.append(url)
+            return FakeResponse(200, {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"total_tokens": 1},
+            })
 
-    monkeypatch.setattr(pc.httpx, "Client", FakeClient)
+    monkeypatch.setattr(pc.httpx, "Client", RecordingClient)
     monkeypatch.setattr(pc, "_shared_client", None)
-    return calls
-
-
-def test_probe_responses_support_true_on_2xx(monkeypatch):
-    calls = _fake_responses_probe(monkeypatch, 200, {"object": "response", "status": "completed"})
-    cfg = pc.ProviderConfig("openai_compatible", "gpt-5.4", "k", "https://relay.host/v1")
-    assert pc.probe_responses_support(cfg) is True
-    # it must hit the relay's /responses endpoint
-    assert calls and calls[0]["url"].rstrip("/").endswith("/responses")
-
-
-def test_probe_responses_support_false_on_not_implemented(monkeypatch):
-    # relays that only do chat completions return 404/500 "not implemented" here
-    _fake_responses_probe(monkeypatch, 500, {"error": {"message": "not implemented"}})
-    cfg = pc.ProviderConfig("openai_compatible", "m", "k", "https://relay.host/v1")
-    assert pc.probe_responses_support(cfg) is False
-
-
-def test_probe_responses_support_false_on_error_shaped_2xx(monkeypatch):
-    # Some relays return HTTP 200 with an {"error": ...} body for an endpoint they
-    # don't actually implement. Status alone would mark this as supported and route
-    # codex through a broken /responses path — reject error-shaped 2xx.
-    _fake_responses_probe(monkeypatch, 200, {"error": {"message": "responses not supported"}})
-    cfg = pc.ProviderConfig("openai_compatible", "m", "k", "https://relay.host/v1")
-    assert pc.probe_responses_support(cfg) is False
-
-
-def test_probe_responses_support_true_on_2xx_response_object(monkeypatch):
-    # A genuine Responses API success returns object="response" (no error key).
-    _fake_responses_probe(monkeypatch, 200, {"object": "response", "status": "completed"})
-    cfg = pc.ProviderConfig("openai_compatible", "gpt-5.4", "k", "https://relay.host/v1")
-    assert pc.probe_responses_support(cfg) is True
-
-
-def test_probe_responses_support_false_on_network_error(monkeypatch):
-    class BoomClient(_StatusClient):
-        def post(self, *a, **k):
-            raise pc.httpx.ConnectError("boom")
-
-    monkeypatch.setattr(pc.httpx, "Client", BoomClient)
-    monkeypatch.setattr(pc, "_shared_client", None)
-    cfg = pc.ProviderConfig("openai_compatible", "m", "k", "https://relay.host/v1")
-    # ambiguous failure → safe default is the bridge (False), never crash
-    assert pc.probe_responses_support(cfg) is False
+    cfg = pc.ProviderConfig("openai_compatible", "kimi-k2.5", "k",
+                            "https://api.moonshot.cn/v1")
+    pc.chat_completion(cfg, [{"role": "user", "content": "hi"}])
+    assert urls and all(u.endswith("/chat/completions") for u in urls), urls
 
 
 def test_shared_client_never_replays_cookies_across_users():

@@ -39,7 +39,6 @@ def fake_provider(monkeypatch):
     """测活恒成功。patch 打在定义模块 provider_client 上。"""
     monkeypatch.setattr(provider_client, "test_provider_key",
                         lambda cfg: {"usage": {"total_tokens": 1}})
-    monkeypatch.setattr(provider_client, "probe_responses_support", lambda cfg: False)
 
 
 @pytest.fixture

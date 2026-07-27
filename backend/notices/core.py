@@ -17,6 +17,7 @@ import time
 import uuid
 
 import db
+from notices import catalog
 
 log = logging.getLogger("feedling.notices")
 
@@ -115,6 +116,10 @@ def list_notices(store, *, include_resolved: bool = True) -> tuple[dict, int]:
     并自愈 emit 读-改非原子 / DB 瞬时读失败可能留下的重复行）；活跃通知全给；
     resolved 仅给近 7 天且 include_resolved 时。按 last_ts 倒序。
 
+    退役类（catalog.RETIRED_ERROR_CLASSES）在这里丢弃：存量行是历史 emit 留下的
+    真实数据，user_logs 又有 TEE 影子库镜像，SQL 回填只改主库会让两边分叉——读侧
+    过滤是唯一幂等且不分叉的下架方式。
+
     注意：底层 db.log_read 对 DB 故障是吞异常返回 []（见 backend/db.py），所以 DB
     宕机时本端点返回 200 空快照而非 500——静默空是实际语义，不是本函数不吞异常
     就能改变的。"""
@@ -123,6 +128,8 @@ def list_notices(store, *, include_resolved: bool = True) -> tuple[dict, int]:
     latest_by_key = {}
     for r in rows:
         key = r.get("dedupe_key")
+        if r.get("error_class") in catalog.RETIRED_ERROR_CLASSES:
+            continue
         if key is not None:
             latest_by_key[key] = r      # rows 按 seq 升序，后写覆盖 → 保留最新一条
     cutoff = _now() - RESOLVED_WINDOW_SEC

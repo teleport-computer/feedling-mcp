@@ -43,11 +43,6 @@ ERROR_CLASSES = frozenset({
     "runner_spawn_failed",
     "runner_key_decrypt_failed",
     "runner_degraded",
-    # model_api config-time warning — same rationale as above. Emitted at setup
-    # when an openai_compatible relay does not implement /v1/responses: LiteLLM
-    # then force-bridges responses→chat-completions, which mangles codex's tool
-    # loop so memory/tool calls silently go unreliable (turn still rc=0).
-    "responses_unsupported",
     # Self-hosted resident maintenance classes. They are not upstream model
     # errors; blame points at the user's own VPS/runtime environment.
     "resident_consumer_stale",
@@ -99,9 +94,6 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "system", "你的 AI 助手暂时无法启动（密钥读取失败），我们正在处理。"),
     "runner_degraded": (
         "system", "你的 AI 助手部分能力暂时受限，正在自动恢复。"),
-    "responses_unsupported": (
-        "user_provider", "你选的中转不支持 Responses 协议，AI 的记忆和工具调用可能不稳定。"
-        "建议换一个支持 /v1/responses 的中转，或改用 Claude 类模型。"),
     "resident_consumer_stale": (
         "user_environment", "你的 VPS resident consumer 版本可能太旧或没有正常接走任务，请更新并重启。"),
     "resident_decrypt_source_unavailable": (
@@ -114,6 +106,20 @@ _CATALOG: dict[str, tuple[str, str]] = {
 
 _FALLBACK_BLAME = "system"
 _FALLBACK_USER_TEXT = "连接模型服务时出了问题。"
+
+# Classes removed from the catalog that may still sit in users' notice streams.
+# Read-side filtering (notices.core.list_notices) is how a retired class stops
+# being shown: user_logs rows are mirrored to the TEE shadow DB, so a SQL
+# backfill would only touch the primary and leave the two diverged.
+#
+# responses_unsupported (retired 2026-07-27): warned openai_compatible users
+# that a relay without /v1/responses made memory/tool calls unreliable. Its
+# premise — LiteLLM force-bridging responses→chat-completions and mangling
+# codex's tool loop — no longer holds anywhere: the gateway is retired,
+# openai_compatible derives `pi` not `codex`, and V2 calls every provider over
+# chat/completions. Verified on test: Kimi/Moonshot wrote memory, recalled it
+# next turn, and ran 3/3 tool calls on both the V1 and V2 paths.
+RETIRED_ERROR_CLASSES = frozenset({"responses_unsupported"})
 
 
 def blame_for(error_class: str) -> str:

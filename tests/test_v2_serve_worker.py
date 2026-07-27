@@ -90,7 +90,7 @@ def test_temporal_snapshot_prefers_registry_timezone_and_freezes_timestamp(
     assert calls == [("u-time", 42)]
 
 
-def test_temporal_snapshot_uses_perception_then_utc_fallback(monkeypatch):
+def test_temporal_snapshot_uses_perception_then_china_default(monkeypatch):
     monkeypatch.setattr(
         serve_worker.accounts_registry,
         "_get_user_timezone",
@@ -115,7 +115,12 @@ def test_temporal_snapshot_uses_perception_then_utc_fallback(monkeypatch):
         "stable_context_timezone",
         lambda _user_id: None,
     )
-    assert serve_worker._read_temporal_snapshot("u-time")["timezone"] == "UTC"
+    # No record tz and no perception tz must NOT degrade to UTC (8h off for CN
+    # users). Fall back to the China default shared with the resident anchor so
+    # the V2 temporal block never contradicts the in-message time anchor.
+    assert serve_worker._read_temporal_snapshot("u-time")["timezone"] == (
+        "Asia/Shanghai"
+    )
 
 
 def test_run_forever_backoff_is_bounded(monkeypatch):

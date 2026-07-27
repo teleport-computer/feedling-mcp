@@ -2826,7 +2826,9 @@ def _make_build_messages_fn(
             return temporal_context
         return context.build_temporal_context(
             now_ts=float(temporal_snapshot["now_ts"]),
-            timezone_name=str(temporal_snapshot.get("timezone") or "UTC"),
+            timezone_name=str(
+                temporal_snapshot.get("timezone") or context.DEFAULT_TIMEZONE
+            ),
             last_user_message_ts=temporal_snapshot.get(
                 "last_user_message_ts"
             ),
@@ -2978,7 +2980,9 @@ async def _capture_turn_temporal_snapshot(
         last_user_ts = max(tail_user_timestamps, default=None)
     return {
         "now_ts": now_ts,
-        "timezone": str(snapshot.get("timezone") or "UTC"),
+        # Never a silent UTC clock: align with the resident anchor's China
+        # default so the two time sources in one prompt cannot disagree.
+        "timezone": str(snapshot.get("timezone") or context.DEFAULT_TIMEZONE),
         "last_user_message_ts": last_user_ts,
     }
 
