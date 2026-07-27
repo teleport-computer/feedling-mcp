@@ -1047,6 +1047,22 @@ def _provider_attempts_detail(store: UserStore) -> dict:
     }
 
 
+def _v2_chat_failures_detail(user_id: str) -> dict:
+    """Why this user's V2 chat turns failed.
+
+    Complements ``provider_attempt_ledger``, which is V1-only
+    (``coverage: chat_turns_only`` is written by the runner, and the V2
+    package contains no ledger writes at all). Reading the two together is
+    the whole point: a V2 user's ledger goes silent at the moment of the
+    cutover, so silence there means "switched", not "no provider call".
+    """
+    try:
+        from model_api_runtime.v2 import jobs_store as _v2_jobs_store
+        return _v2_jobs_store.recent_chat_failures_for_user(user_id)
+    except Exception as e:  # noqa: BLE001 — observability must never 500 the page
+        return {"error": f"{type(e).__name__}:{str(e)[:120]}"}
+
+
 def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) -> dict:
     user_id = str(user_entry.get("user_id") or "")
     store = core_store.get_store(user_id)
@@ -1158,6 +1174,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         row["daily_usage_days"] = daily_days
         row["runtime"] = _runtime_summary(store)
         row["provider_attempt_ledger"] = _provider_attempts_detail(store)
+        row["v2_chat_failures"] = _v2_chat_failures_detail(user_id)
         _ps = store.load_proactive_settings()
         row["perception_permissions"] = {
             # what the device reports it granted (free-form; keys are app-defined,

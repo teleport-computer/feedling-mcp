@@ -3345,6 +3345,84 @@ def recent_token_usage_summary(
     }
 
 
+# ``last_error`` may carry a relay's raw error body (quota figures, request
+# ids). This is an admin-only surface, but keep every reason bounded so one
+# pathological provider string cannot dominate the payload.
+_FAILURE_REASON_MAX_CHARS = 400
+_FAILURE_REASON_TOP_N = 12
+_USER_FAILURE_DETAIL_LIMIT = 20
+
+
+def _truncated_failure_reason(value: object) -> str:
+    text = str(value or "").strip()
+    if len(text) <= _FAILURE_REASON_MAX_CHARS:
+        return text
+    return text[:_FAILURE_REASON_MAX_CHARS] + "…"
+
+
+def _iso_or_empty(value: object) -> str:
+    """A timestamp column rendered for admin, or "" when the row has none."""
+    if value is None:
+        return ""
+    try:
+        return value.isoformat().replace("+00:00", "Z")  # type: ignore[attr-defined]
+    except AttributeError:
+        return str(value)
+
+
+def recent_chat_failures_for_user(
+    user_id: str,
+    *,
+    within_hours: int = 72,
+    limit: int = _USER_FAILURE_DETAIL_LIMIT,
+) -> dict:
+    """Why this one user's V2 turns died, newest first.
+
+    The fleet histogram in ``recent_chat_operational_health`` answers "is V2
+    healthy"; support answers a different question — "this person says the AI
+    stopped replying". The provider-attempt ledger now shows whether V2 reached
+    an upstream model, but only the job row carries the exact terminal code for
+    failures before and after that boundary. Reasons only: no prompts, no
+    replies, no user content.
+    """
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    safe_limit = max(1, min(int(limit), 200))
+    uid = str(user_id or "").strip()
+    if not uid:
+        return {"window_hours": safe_hours, "failures": [], "has_more": False}
+
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id,status,last_error,attempt_count,"
+                "  created_at,finished_at "
+                "FROM agent_jobs "
+                "WHERE user_id=%s AND lane='chat' "
+                "  AND status IN ('failed','expired') "
+                "  AND finished_at >= now() - make_interval(hours => %s) "
+                "ORDER BY finished_at DESC,id DESC LIMIT %s",
+                (uid, safe_hours, safe_limit + 1),
+            )
+            rows = cur.fetchall()
+
+    has_more = len(rows) > safe_limit
+    return {
+        "window_hours": safe_hours,
+        "has_more": has_more,
+        "failures": [
+            {
+                "job_id": int(row["id"]),
+                "status": str(row["status"] or ""),
+                "reason": _truncated_failure_reason(row["last_error"]),
+                "attempt_count": int(row["attempt_count"] or 0),
+                "created_at": _iso_or_empty(row["created_at"]),
+                "finished_at": _iso_or_empty(row["finished_at"]),
+            }
+            for row in rows[:safe_limit]
+        ],
+    }
+
+
 def recent_chat_operational_health(
     *,
     within_hours: int = 24,
@@ -3402,6 +3480,26 @@ def recent_chat_operational_health(
                 (safe_hours, safe_limit, safe_hours, safe_limit),
             )
             job_row = cur.fetchone()
+
+            # WHY a reason histogram: on 2026-07-27 two prod users went
+            # silent for hours on V2 and this endpoint could report a 52.6%
+            # failure rate without a single reason string. `last_error` was
+            # written all along — the CTE above already selects it — but
+            # nothing ever surfaced it, so triage had to infer the cause from
+            # provider-ledger gaps and guess. A count without a reason is a
+            # smoke alarm with no address.
+            cur.execute(
+                "WITH recent_failures AS ("
+                "  SELECT last_error FROM agent_jobs "
+                "  WHERE lane='chat' AND status IN ('failed','expired') "
+                "    AND finished_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY finished_at DESC,id DESC LIMIT %s"
+                ") SELECT COALESCE(NULLIF(last_error,''),'(empty)') AS reason,"
+                "  COUNT(*)::int AS n "
+                "FROM recent_failures GROUP BY 1 ORDER BY n DESC,reason LIMIT %s",
+                (safe_hours, safe_limit, _FAILURE_REASON_TOP_N),
+            )
+            failure_reason_rows = cur.fetchall()
 
             cur.execute(
                 "WITH recent AS ("
@@ -3491,6 +3589,13 @@ def recent_chat_operational_health(
                 if oldest_pending_age is not None
                 else None
             ),
+            "failure_reasons": [
+                {
+                    "reason": _truncated_failure_reason(row["reason"]),
+                    "count": int(row["n"] or 0),
+                }
+                for row in failure_reason_rows
+            ],
         },
         "latency": {
             "sampled_turns": int(latency_row["sampled_turns"] or 0),

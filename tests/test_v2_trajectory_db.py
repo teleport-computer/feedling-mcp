@@ -314,6 +314,14 @@ def test_recent_chat_operational_health_counts_missing_capture_from_jobs():
         "error_or_expiry_rate": pytest.approx(2 / 3),
         "pending": 2,
         "oldest_pending_age_sec": health["jobs"]["oldest_pending_age_sec"],
+        # A failure count with no reason is a smoke alarm with no address:
+        # the failed job carries no last_error and must still be visible as
+        # "(empty)" rather than vanishing from the histogram, and the expired
+        # one must report the reason the column already stored.
+        "failure_reasons": [
+            {"reason": "(empty)", "count": 1},
+            {"reason": "queue_timeout", "count": 1},
+        ],
     }
     assert 172790 <= health["jobs"]["oldest_pending_age_sec"] <= 172860
     assert health["latency"] == {
@@ -329,6 +337,56 @@ def test_recent_chat_operational_health_counts_missing_capture_from_jobs():
         "capture_gap": 1,
         "complete_rate": pytest.approx(1 / 4),
     }
+
+
+def test_recent_chat_failures_for_user_answers_why_this_user_went_silent():
+    """The fleet histogram says "V2 is unhealthy"; support needs "this person".
+
+    Regression for 2026-07-27: two prod users sat silent for hours after a
+    V1→V2 cutover and the provider-attempt ledger alone cannot distinguish a
+    pre-provider runtime failure from a dead relay. The job's terminal code is
+    the authoritative explanation for the failed turn.
+    """
+    def add_job(user_id: str, status: str, *, last_error: str, age_hours: int = 0) -> int:
+        seed_user(user_id)
+        set_v2_runtime_owner(user_id)
+        job_id, _ = jobs_store.enqueue_job(user_id, "chat")
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE agent_jobs SET status=%s,last_error=%s,"
+                "created_at=clock_timestamp()-make_interval(hours => %s),"
+                "finished_at=clock_timestamp()-make_interval(hours => %s) "
+                "WHERE id=%s",
+                (status, last_error, age_hours, age_hours, job_id),
+            )
+        return job_id
+
+    add_job("u_fail_subject", "failed", last_error="prompt_frontier_exhausted")
+    newest = add_job("u_fail_subject", "expired", last_error="lease_timeout")
+    add_job("u_fail_subject", "failed", last_error="ancient", age_hours=200)
+    add_job("u_fail_other", "failed", last_error="someone_elses_problem")
+
+    out = jobs_store.recent_chat_failures_for_user("u_fail_subject")
+
+    assert [f["reason"] for f in out["failures"]] == [
+        "lease_timeout",
+        "prompt_frontier_exhausted",
+    ], "newest first, and another user's failure must never leak in"
+    assert out["failures"][0]["job_id"] == newest
+    assert out["failures"][0]["status"] == "expired"
+    assert out["failures"][0]["finished_at"], "admin needs a timestamp to correlate"
+    assert out["has_more"] is False
+
+    # An over-long relay error body must not be able to dominate the payload.
+    add_job("u_fail_long", "failed", last_error="x" * 5000)
+    long_reason = jobs_store.recent_chat_failures_for_user("u_fail_long")["failures"][0]
+    assert len(long_reason["reason"]) == jobs_store._FAILURE_REASON_MAX_CHARS + 1
+    assert long_reason["reason"].endswith("…")
+
+    # A user with no failures is an explicit empty answer, not an error.
+    seed_user("u_fail_none")
+    assert jobs_store.recent_chat_failures_for_user("u_fail_none")["failures"] == []
+    assert jobs_store.recent_chat_failures_for_user("")["failures"] == []
 
 
 def test_recent_chat_operational_health_is_explicit_without_history():
@@ -350,6 +408,7 @@ def test_recent_chat_operational_health_is_explicit_without_history():
         "error_or_expiry_rate": None,
         "pending": 0,
         "oldest_pending_age_sec": None,
+        "failure_reasons": [],
     }
     assert health["latency"] == {"sampled_turns": 0, "p95_ms": None}
     assert health["trajectory"] == {
