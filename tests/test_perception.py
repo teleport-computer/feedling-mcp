@@ -499,6 +499,15 @@ def test_app_open_requires_app(env):
     assert code == 400 and out["error"] == "app_required"
 
 
+def test_snapshot_exposes_app_state_field(env):
+    """`app_state` 是 app 信号投影的一部分；没人上报时是 None（= 未知），
+    而不是缺键——agent 侧的投影按字段清单取值，缺键会读成 KeyError。"""
+    fake, _ = env
+    snap = service.snapshot(UID)
+    assert "app_state" in snap
+    assert snap["app_state"] is None
+
+
 def test_app_open_via_get_route(env, monkeypatch):
     """End-to-end: GET with everything (incl. key) in the URL query string."""
 

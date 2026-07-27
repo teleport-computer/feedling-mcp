@@ -18,10 +18,12 @@ SLOW_AGENT_PERCEPTION_SIGNALS = (
     "steps", "sleep", "workout", "vitals",
     "activity", "body", "metabolic", "cycle", "mood", "reminders",
 )
-# `app` = the LAST app-open we observed, within its TTL. The Shortcut fires on
-# open and never on close, so this is "last seen opening X", NOT "X is on screen
-# now" — don't let the agent phrase it as certainty about the present.
-# App-open HISTORY is deliberately not a signal: it returns a list, takes
+# `app` = the last app event we observed, within its TTL. `app_state` says which
+# kind it was: "foreground" (the user opened it) or "closed" (the user left it).
+# Both come from iOS Shortcut automations the user configures per app, so a user
+# who only wired the open automation never produces "closed" — treat a missing
+# app_state as unknown, not as "still in the app".
+# App-event HISTORY is deliberately not a signal: it returns a list, takes
 # limit/hours, and doesn't fit project_signal's state-field projection. It's a
 # query tool -- perception.recent_apps / io_cli perception-recent-apps.
 PULL_ONLY_AGENT_PERCEPTION_SIGNALS = ("focus", "audio_route", "app")
@@ -45,7 +47,7 @@ AGENT_SIGNAL_FIELDS: dict[str, tuple[str, ...]] = {
     "calendar": ("calendar_next_event", "calendar_events", "calendar_events_truncated"),
     "focus": ("focus_authorization_status", "in_focus"),
     "audio_route": ("output_type", "is_bluetooth", "device_name"),
-    "app": ("app_name", "app_category"),
+    "app": ("app_name", "app_category", "app_state"),
     "steps": ("step_count",),
     "sleep": ("asleep_minutes", "core_minutes", "deep_minutes", "rem_minutes"),
     "workout": ("workout_type", "duration_min", "count_today"),
