@@ -220,6 +220,8 @@ def set_v2_runtime_owner(user_id: str, *, generation: int | None = None) -> None
     low-level worker/job tests intentionally bypass that assembly path and
     therefore opt in through this helper before claiming work.
     """
+    import db
+
     with db.get_pool().connection() as conn:
         conn.execute(
             "INSERT INTO v2_runtime_state "
