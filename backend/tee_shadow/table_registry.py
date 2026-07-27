@@ -50,7 +50,115 @@ class Entry:
 
 
 REGISTRY: dict[str, Entry] = {
-    # Task 3 填充。
+    # ---------------------------------------------------------------- #
+    # MIRROR —— 明文运维表，热路径双写（db.py 的 mirror.execute 写点）。
+    # 这 13 张是 alembic_tee 0001 baseline 的"13 张明文运维表"，加 0002 的
+    # notify_relay 两张。列定义与 RDS 逐列对齐。
+    # ---------------------------------------------------------------- #
+    "server_config": Entry(MIRROR, "全局配置，低频写；reconciler.TABLES 已覆盖"),
+    "global_blobs": Entry(MIRROR, "全局 blob，低频写；reconciler.TABLES 已覆盖"),
+    "users": Entry(MIRROR, "账号父表，所有 per-user 表的 FK 目标，必须最先同步"),
+    "user_blobs": Entry(MIRROR, "per-user 杂项；kind='identity' 归 CIPHERTEXT、"
+                                "kind='consumer_state' 有意不镜像（见 reconciler._SCOPE_WHERE）"),
+    "user_logs": Entry(MIRROR, "per-user 日志流；seq 是 IDENTITY 列，靠 OVERRIDING SYSTEM VALUE 搬"),
+    "perception_items": Entry(MIRROR, "感知条目，明文；reconciler.TABLES 已覆盖"),
+    "perception_daily": Entry(MIRROR, "感知日聚合，明文；reconciler.TABLES 已覆盖"),
+    "copytext_strings": Entry(MIRROR, "文案表，明文；reconciler.TABLES 已覆盖"),
+    "copytext_meta": Entry(MIRROR, "文案版本哨兵单行表；reconciler.TABLES 已覆盖"),
+    "genesis_import_jobs": Entry(MIRROR, "入住导入作业元数据，明文；reconciler.TABLES 已覆盖"),
+    "genesis_import_outputs": Entry(MIRROR, "入住导入产物，明文；reconciler.TABLES 已覆盖"),
+    "agent_runtime_instances": Entry(MIRROR, "runtime 实例登记，明文运维表"),
+    "agent_runtime_supervisor_heartbeats": Entry(MIRROR, "supervisor 心跳，明文运维表"),
+    "notify_relay_configs": Entry(MIRROR, "自部署推送中继配置；alembic_tee 0002 已建表"),
+    "notify_relay_logs": Entry(MIRROR, "推送中继日志；id 是 IDENTITY 列"),
+
+    # ---------------------------------------------------------------- #
+    # CIPHERTEXT —— 装信封的表，经 enclave 解密成明文写进 TEE。
+    # ---------------------------------------------------------------- #
+    "chat_messages": Entry(CIPHERTEXT, "对话正文信封 doc；worker._TABLES 已覆盖"),
+    "memory_moments": Entry(CIPHERTEXT, "记忆信封 doc；worker._TABLES 已覆盖"),
+    "world_book_entries": Entry(CIPHERTEXT, "世界书信封 doc；worker._TABLES 已覆盖"),
+    "frame_envelopes": Entry(
+        CIPHERTEXT,
+        "帧信封；TEE 侧对应物是形状不同的 frames（R2 存储层指针），由 worker "
+        "的 frames row_writer 处理，不是同名表",
+    ),
+    # 以下 7 张是 2026-07-27 全量对齐新增（用户拍板解密成明文存）。
+    "chat_message_archive": Entry(
+        CIPHERTEXT,
+        "归档对话，doc 与 chat_messages.doc 完全同形（prod 897 行中 896 行是完整"
+        "信封、1 行是 R2 offload 指针需先水合 body_ct）；复用 plaintext_chat_doc",
+    ),
+    "v2_trajectory_events": Entry(
+        CIPHERTEXT,
+        "V2 轨迹事件 payload_envelope；表级 CHECK ck_v2_trajectory_envelope 强制 "
+        "K_enclave + visibility='shared'，故服务端可解",
+    ),
+    "model_api_credentials": Entry(
+        CIPHERTEXT,
+        "BYOK provider key 信封 api_key_envelope。2026-07-27 用户拍板解密成明文存"
+        "（设计文档 §8 已记录其安全含义：TEE owner 角色可读全库）",
+    ),
+    "v2_conversation_summary": Entry(CIPHERTEXT, "V2 对话摘要 summary_envelope，标准单信封"),
+    "v2_conversation_summary_segments": Entry(CIPHERTEXT, "V2 摘要分段 summary_envelope，标准单信封"),
+    "v2_trajectory_reviews": Entry(
+        CIPHERTEXT,
+        "V2 轨迹复核 review_envelope（可空，CHECK 允许 NULL）；prod 当前 0 行",
+    ),
+    "v2_workspace_entries": Entry(CIPHERTEXT, "V2 工作区条目 content_envelope；prod 当前 0 行"),
+
+    # ---------------------------------------------------------------- #
+    # SNAPSHOT —— 明文、数据量小、但有 UPDATE/DELETE 的表。整表原子替换。
+    # 已实测确认这批表的 jsonb 列（payload_json / result_json / detail_json /
+    # state_json / actions_json / v2_effect_outbox.payload）装的是明文，不含信封。
+    # ---------------------------------------------------------------- #
+    "agent_action_queue": Entry(SNAPSHOT, "动作队列，行状态流转（UPDATE 密集），明文 payload_json"),
+    "agent_jobs": Entry(SNAPSHOT, "agent 作业表，status 流转，明文"),
+    "agent_status_events": Entry(SNAPSHOT, "agent 状态事件，明文 detail_json"),
+    "chat_r2_cleanup": Entry(SNAPSHOT, "R2 清理队列，行会被删，明文"),
+    "chat_r2_lifecycle": Entry(SNAPSHOT, "R2 生命周期状态，UPDATE 密集，明文"),
+    "dau_daily_snapshot": Entry(SNAPSHOT, "DAU 日快照，每日批量写，明文"),
+    "model_api_routes": Entry(SNAPSHOT, "BYOK 路由配置（不含凭证，凭证在 model_api_credentials），明文"),
+    "provider_health": Entry(SNAPSHOT, "provider 健康状态，UPDATE 密集，明文"),
+    "retention_cohort_snapshot": Entry(SNAPSHOT, "留存 cohort 快照，批量写，明文"),
+    "runtime_state": Entry(SNAPSHOT, "runtime 状态 state_json，UPDATE 密集，明文"),
+    "user_growth_daily_snapshot": Entry(SNAPSHOT, "增长日快照，批量写，明文"),
+    "v2_capture_batches": Entry(SNAPSHOT, "V2 捕获批次 actions_json，status 流转，明文"),
+    "v2_effect_outbox": Entry(SNAPSHOT, "V2 效果 outbox，投递后删行，明文 payload（实测非信封）"),
+    "v2_effect_sink_applied": Entry(SNAPSHOT, "V2 效果幂等标记，明文"),
+    "v2_mcp_mutation_attempts": Entry(SNAPSHOT, "V2 MCP 变更尝试记录，明文"),
+    "v2_runtime_control": Entry(SNAPSHOT, "V2 运行时总控单行表，明文"),
+    "v2_runtime_state": Entry(SNAPSHOT, "V2 per-user 运行时 fence，UPDATE 密集，明文"),
+    "v2_sandbox_usage_events": Entry(SNAPSHOT, "V2 sandbox 用量事件，明文"),
+    "v2_terminal_failure_outbox": Entry(SNAPSHOT, "V2 终态失败 outbox，投递后删行，明文"),
+    "v2_trajectory_access_audit": Entry(SNAPSHOT, "V2 轨迹访问审计（审计元数据本身是明文）"),
+    "v2_trajectory_streams": Entry(SNAPSHOT, "V2 轨迹流游标，UPDATE 密集，明文"),
+    "v2_turn_metrics": Entry(SNAPSHOT, "V2 回合指标，明文"),
+    "v2_user_allowlist": Entry(SNAPSHOT, "V2 灰度名单，UPDATE 密集，明文"),
+    "v2_wake_schedule": Entry(SNAPSHOT, "V2 唤醒排程，UPDATE 密集，明文"),
+    "v2_worker_heartbeats": Entry(SNAPSHOT, "V2 worker 心跳，UPDATE 密集，明文"),
+
+    # ---------------------------------------------------------------- #
+    # SKIP —— 永远不进 TEE。理由必须具体。
+    # ---------------------------------------------------------------- #
+    "alembic_version": Entry(
+        SKIP, "RDS 迁移链自己的版本表；TEE 有独立的 alembic_tee_version，两条链互不感知"),
+    "genesis_import_chunks": Entry(
+        SKIP, "入住导入的 staging 数据，冻结窗口内处理完即弃，非用户资产（上游 plan 已决定不复制）"),
+    "tee_sync_runs": Entry(
+        SKIP, "TEE 同步自身的控制面/指标表，必须住在 RDS——复制到被它监控的库里没有意义"),
+    "tee_reconcile_state": Entry(SKIP, "TEE reconcile 的控制面状态，同上，必须住 RDS"),
+    "tee_reconcile_cursors": Entry(SKIP, "TEE reconcile 的游标，同上，必须住 RDS"),
+    "bak_20260710_usr450_blobs": Entry(
+        SKIP, "2026-07-10 单用户事故的一次性人工备份表，非生产数据", manual=True),
+    "bak_20260710_usr450_chat": Entry(
+        SKIP, "2026-07-10 单用户事故的一次性人工备份表，非生产数据", manual=True),
+    "bak_20260710_usr450_memory": Entry(
+        SKIP, "2026-07-10 单用户事故的一次性人工备份表，非生产数据", manual=True),
+    "bak_20260710_usr450_users": Entry(
+        SKIP, "2026-07-10 单用户事故的一次性人工备份表，非生产数据", manual=True),
+    "bak_20260710_usr5d4a_users": Entry(
+        SKIP, "2026-07-10 单用户事故的一次性人工备份表，非生产数据", manual=True),
 }
 
 
