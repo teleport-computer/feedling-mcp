@@ -501,6 +501,18 @@ def cmd_memory_fetch(args):
     ids = list(args.ids)
     if not ids:
         _emit({"ok": False, "error": "memory-fetch needs at least one id"}, 2)
+    placeholder_ids = {
+        "id", "ids", "memory_id", "memory_ids",
+        "<id>", "<ids>", "<memory_id>", "<memory_ids>",
+    }
+    if any(str(memory_id).strip().lower() in placeholder_ids for memory_id in ids):
+        _emit({
+            "ok": False,
+            "error": (
+                "memory-fetch received a placeholder instead of a real card id; "
+                "run memory-index first and pass values from items[].id"
+            ),
+        }, 2)
     payload = {"ids": ids, "limit": args.limit}
     if args.include_archived:
         payload["include_archived"] = True

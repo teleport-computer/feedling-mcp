@@ -94,6 +94,34 @@ def test_schedule_instant_keeps_event_timezone_wall_clock_across_dst():
     assert due_at > 0
 
 
+def test_schedule_instant_accepts_english_and_chinese_relative_times():
+    now = 1_800_000_000.0
+
+    for value in ("in 1 minute", "1m", "1 分钟后", "一分钟后"):
+        wall, tz, due_at = schedule_instant_v2(value, "Asia/Shanghai", now=now)
+
+        assert wall == datetime.fromtimestamp(now + 60.0, timezone.utc).astimezone(
+            scheduled_wake_v2.ZoneInfo("Asia/Shanghai")
+        ).replace(tzinfo=None).isoformat()
+        assert tz == "Asia/Shanghai"
+        assert due_at == now + 60.0
+
+
+def test_schedule_action_uses_turn_time_for_relative_schedule():
+    store, service = _service()
+    now = 1_800_000_000.0
+
+    result = service.apply_turn_actions(
+        "u1",
+        [{"type": "schedule_wake", "at": "一分钟后", "tz": "Asia/Shanghai"}],
+        now=now,
+    )[0]
+    record = store.list_records("u1")[0]
+
+    assert result.status == "scheduled"
+    assert record.due_at == now + 60.0
+
+
 def test_schedule_action_clamps_near_self_wake_to_min_lead():
     store, service = _service(self_wake_min_lead=300.0)
     now = 1_800_000_000.0

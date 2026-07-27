@@ -1572,6 +1572,22 @@ def _pi_stream_with_thinking(reply: str, thinking: str) -> str:
     ])
 
 
+def test_pi_thinking_projects_step_heading_without_internal_monologue():
+    stream = _pi_stream_with_thinking(
+        "文件已生成。",
+        "**Preparing to generate markdown**\n"
+        "It looks like the user confirmed option A. I need to inspect all "
+        "five memories and decide what to include before writing the file.",
+    )
+
+    reply, thinking = crc._pi_turn_from_stream(stream)
+
+    assert reply == "文件已生成。"
+    assert thinking == "Preparing to generate markdown"
+    assert "confirmed option A" not in thinking
+    assert "decide what to include" not in thinking
+
+
 def test_call_agent_body_round_trips_thinking_back_through_split(monkeypatch):
     """The turn is parsed TWICE: call_agent parses the CLI output into an AgentTurn
     and re-emits it as a body dict, which the chat/proactive lanes then run through
@@ -5311,6 +5327,35 @@ def test_message_for_proactive_job_instructs_multi_bubble_without_gate_context()
     assert "possible_connections" not in message
     assert "Feedling Gate decided" not in message
     assert "screen: dense paragraph" in message
+
+
+def test_scheduled_wake_message_requires_exact_reminder_instead_of_generic_presence():
+    message = crc._message_for_proactive_job(
+        {
+            "trigger": "scheduled_wake",
+            "wake_kind": "scheduled_wake",
+            "scheduled_note": "提醒用户喝水",
+            "timezone": "Asia/Shanghai",
+        },
+        recent_chat_context="- user: 2 分钟之后提醒我喝水",
+    )
+
+    assert "[Feedling scheduled reminder]" in message
+    assert "<reminder_note>提醒用户喝水</reminder_note>" in message
+    assert "You must send the reminder now" in message
+    assert "do not replace it with a greeting" in message
+    assert "[Feedling proactive wake]" not in message
+    assert "staying quiet" not in message.lower()
+    assert "recent_chat_context" not in message
+
+
+def test_scheduled_wake_message_falls_back_to_change_digest():
+    message = crc._message_for_proactive_job({
+        "intent_label": "scheduled_wake",
+        "change_digest": "提醒用户休息",
+    })
+
+    assert "<reminder_note>提醒用户休息</reminder_note>" in message
 
 
 def test_photo_added_wake_surfaces_pullable_photo_hint(monkeypatch):

@@ -22,6 +22,29 @@ def test_auth_headers_empty_without_api_key(monkeypatch):
     assert io_cli._auth_headers() == {}
 
 
+def test_memory_fetch_rejects_literal_placeholder_before_request(monkeypatch, capsys):
+    monkeypatch.setattr(io_cli, "_require_backend", lambda: ("http://backend.test", {}))
+
+    def _unexpected_http(*_args, **_kwargs):
+        raise AssertionError("placeholder ids must not reach the backend")
+
+    monkeypatch.setattr(io_cli, "_http_json", _unexpected_http)
+    args = types.SimpleNamespace(
+        ids=["ids"],
+        limit=20,
+        include_archived=False,
+        include_superseded=False,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        io_cli.cmd_memory_fetch(args)
+
+    assert exc.value.code == 2
+    body = json.loads(capsys.readouterr().out.strip())
+    assert body["ok"] is False
+    assert "run memory-index first" in body["error"]
+
+
 def test_emit_tool_trace_posts_agent_tool_call_with_redacted_args(monkeypatch):
     calls = []
     monkeypatch.setenv("FEEDLING_TRACE_ID", "trace-1")

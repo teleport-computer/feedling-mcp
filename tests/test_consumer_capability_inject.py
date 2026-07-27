@@ -124,7 +124,10 @@ def _make_msg(role="user", content="hello", ts=None):
 
 
 def _with_download_delivery_prompt(prefix: str, content: str) -> str:
-    return f"{prefix}\n{crc._outbound_file_prompt_block()}\n\n{content}"
+    return (
+        f"{prefix}\n{crc._memory_read_prompt_block()}\n"
+        f"{crc._outbound_file_prompt_block()}\n\n{content}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +169,9 @@ def test_cli_mode_first_turn_injects_and_marks_pending_not_committed(monkeypatch
     assert result == _with_download_delivery_prompt("CATALOG_TEXT", "user turn 1")
     assert "send-file" in result
     assert str(crc.OUTBOUND_FILE_DIR) in result
+    assert "memory-index" in result
+    assert "items[].id" in result
+    assert "memory-fetch" in result
     assert len(calls) == 1
     assert crc._io_cli_catalog_cache == "CATALOG_TEXT"
     # Injected into the prompt, but NOT yet confirmed — the caller has not

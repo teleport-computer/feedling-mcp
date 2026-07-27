@@ -607,11 +607,46 @@ def test_v1_visible_reply_strips_codex_local_file_citation():
     assert "codex-file-citation" not in cleaned
 
 
+def test_v1_staged_file_replaces_pi_sandbox_path_with_download_copy():
+    cleaned, removed = resident._sanitize_outbound_file_reply(
+        "已生成文件，可下载：\n"
+        "sandbox:/Users/example/Library/Application%20Support/IO/outbound-files/report.md\n"
+        "需要我把内容贴出来吗？",
+        attachment_staged=True,
+    )
+
+    assert removed is True
+    assert cleaned == "文件已生成，可在下方下载。"
+    assert "sandbox:" not in cleaned
+    assert "/Users/" not in cleaned
+
+
+def test_v1_unstaged_internal_path_is_detected_for_failure_handling():
+    cleaned, removed = resident._sanitize_outbound_file_reply(
+        "Download: file:///private/tmp/report.pdf"
+    )
+
+    assert removed is True
+    assert "file://" not in cleaned
+    assert "/private/tmp" not in cleaned
+
+
 def test_v1_outbound_prompt_limits_expensive_document_qa():
     prompt = resident._outbound_file_prompt_block()
 
     assert "at most one lightweight check" in prompt
     assert "do not repeatedly render" in prompt
+
+
+def test_v1_memory_read_prompt_requires_index_then_fetch():
+    prompt = resident._memory_read_prompt_block()
+
+    assert "memory-index" in prompt
+    assert "items[].id" in prompt
+    assert "memory-fetch" in prompt
+    assert f"python {resident._IO_CLI_PATH} memory-index" in prompt
+    assert f"python {resident._IO_CLI_PATH} memory-fetch" in prompt
+    assert "Never claim memories are unavailable" in prompt
 
 
 def test_foreground_agent_call_keeps_resident_fresh_without_claiming(monkeypatch):

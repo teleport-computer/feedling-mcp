@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -78,7 +79,76 @@ def _zone(tz: Any) -> ZoneInfo:
         return ZoneInfo(DEFAULT_TIMEZONE_V2)
 
 
-def schedule_instant_v2(at: Any, tz: Any) -> tuple[str, str, float]:
+_ENGLISH_RELATIVE_AT_V2 = re.compile(
+    r"^(?:in\s+|\+\s*)?(?P<amount>\d+(?:\.\d+)?)\s*"
+    r"(?P<unit>seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)"
+    r"(?:\s+(?:later|from\s+now))?$",
+    re.IGNORECASE,
+)
+_CHINESE_RELATIVE_AT_V2 = re.compile(
+    r"^(?P<amount>\d+(?:\.\d+)?|[零〇一二两三四五六七八九十百半]+)\s*"
+    r"(?P<unit>秒钟?|分钟|分|小时|钟头|天)(?:以?后)?$"
+)
+
+
+def _chinese_number_v2(raw: str) -> float | None:
+    if raw == "半":
+        return 0.5
+    digits = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if all(char in digits for char in raw):
+        return float("".join(str(digits[char]) for char in raw))
+    total = 0
+    current = 0
+    for char in raw:
+        if char in digits:
+            current = digits[char]
+        elif char == "十":
+            total += (current or 1) * 10
+            current = 0
+        elif char == "百":
+            total += (current or 1) * 100
+            current = 0
+        else:
+            return None
+    return float(total + current)
+
+
+def _relative_delay_seconds_v2(raw_at: str) -> float | None:
+    match = _ENGLISH_RELATIVE_AT_V2.fullmatch(raw_at)
+    if match:
+        amount = float(match.group("amount"))
+        unit = match.group("unit").lower()
+        if unit.startswith(("s", "sec")):
+            multiplier = 1.0
+        elif unit.startswith(("m", "min")):
+            multiplier = 60.0
+        elif unit.startswith(("h", "hr")):
+            multiplier = 3600.0
+        else:
+            multiplier = 86400.0
+        return amount * multiplier
+
+    match = _CHINESE_RELATIVE_AT_V2.fullmatch(raw_at)
+    if not match:
+        return None
+    amount_raw = match.group("amount")
+    amount = float(amount_raw) if amount_raw[0].isdigit() else _chinese_number_v2(amount_raw)
+    if amount is None:
+        return None
+    unit = match.group("unit")
+    if unit.startswith("秒"):
+        multiplier = 1.0
+    elif unit in {"分钟", "分"}:
+        multiplier = 60.0
+    elif unit in {"小时", "钟头"}:
+        multiplier = 3600.0
+    else:
+        multiplier = 86400.0
+    return amount * multiplier
+
+
+def schedule_instant_v2(at: Any, tz: Any, *, now: float | None = None) -> tuple[str, str, float]:
     """Return (wall_time, timezone_name, due_at_epoch).
 
     The durable record keeps wall-clock time plus event timezone. `due_at` is a
@@ -88,6 +158,13 @@ def schedule_instant_v2(at: Any, tz: Any) -> tuple[str, str, float]:
     if not raw_at:
         raise ValueError("missing_at")
     zone = _zone(tz)
+    relative_delay = _relative_delay_seconds_v2(raw_at)
+    if relative_delay is not None:
+        if relative_delay <= 0:
+            raise ValueError("invalid_at")
+        due_at = _now(now) + relative_delay
+        local = datetime.fromtimestamp(due_at, timezone.utc).astimezone(zone)
+        return local.replace(tzinfo=None).isoformat(), zone.key, due_at
     normalized = raw_at[:-1] + "+00:00" if raw_at.endswith("Z") else raw_at
     try:
         parsed = datetime.fromisoformat(normalized)
@@ -614,7 +691,11 @@ class ScheduledWakeServiceV2:
         now: float,
     ) -> ScheduledWakeActionResultV2:
         try:
-            wall_time, tz_name, due_at = schedule_instant_v2(action.get("at"), action.get("tz") or settings.timezone)
+            wall_time, tz_name, due_at = schedule_instant_v2(
+                action.get("at"),
+                action.get("tz") or settings.timezone,
+                now=now,
+            )
         except ValueError as exc:
             return ScheduledWakeActionResultV2("schedule_wake", "invalid", reason=str(exc))
         clamped = False
