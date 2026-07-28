@@ -648,3 +648,89 @@ def test_plaintext_envelope_column_rejects_local_only():
     with pytest.raises(transforms.PendingDeviceMigration):
         transforms.plaintext_envelope_column(
             env, lambda e, purpose: b"x", purpose="tee_replicate:probe")
+
+
+def _envelope(uid, item_id, body_ct="CT"):
+    return {"v": 1, "id": item_id, "owner_user_id": uid, "visibility": "shared",
+            "body_ct": body_ct, "nonce": "n", "K_user": "ku", "K_enclave": "ke"}
+
+
+def test_cold_start_copies_new_ciphertext_tables_without_a_prior_cursor_row(backend_env):
+    """2026-07-28 审查抓到的 Critical：``_read_cursor`` 对从未跑过的表返回
+    ``wm_id=""``，``_decode_cursor`` 把这个空串原样当参数塞进
+    ``WHERE (sort_col, id_col) > (%s, %s)``。既有 5 张表的排序列都是 TEXT，空串
+    是合法下界，安全；但本轮新增的 7 张表排序列是 TIMESTAMPTZ / BIGINT / UUID，
+    空串直接 cast 失败——SELECT 本身报错，一行都同步不进去，而 scheduler 的
+    per-table try/except 会把这个错误吞掉计入退避，每个 tick 静默重复失败、不会
+    有任何人从日志之外发现。这个 bug 能活下来正是因为在此之前没有任何测试真正
+    调用过 ``worker.run_table()`` 走一遍"这张表从未同步过"的冷启动路径——本测试
+    专门补上这一条：不预先写游标行，直接对每张新表跑一次真实 ``run_table()``。
+    """
+    uid = f"usr_{uuid.uuid4().hex[:8]}"
+    _seed(uid)
+
+    with db.get_pool().connection() as c:
+        job_id = c.execute(
+            "INSERT INTO agent_jobs (user_id, lane, status) VALUES (%s,'chat','pending') "
+            "RETURNING id", (uid,)
+        ).fetchone()[0]
+        c.execute("INSERT INTO v2_trajectory_streams (job_id, user_id) VALUES (%s,%s)",
+                  (job_id, uid))
+
+    seed_sql = {
+        "chat_message_archive": (
+            "INSERT INTO chat_message_archive "
+            "(user_id, source_seq, msg_id, ts, doc, clear_generation) "
+            "VALUES (%s,%s,%s,%s,%s,1)",
+            (uid, 1, "m1", 10.0, Jsonb(_envelope(uid, "m1")))),
+        "v2_trajectory_events": (
+            "INSERT INTO v2_trajectory_events "
+            "(job_id, user_id, event_index, event_kind, idempotency_key, "
+            "payload_envelope, payload_bytes) VALUES (%s,%s,0,'turn_started','idem1',%s,10)",
+            (job_id, uid, Jsonb(_envelope(uid, "e1")))),
+        "model_api_credentials": (
+            "INSERT INTO model_api_credentials (id, user_id, provider, api_key_envelope) "
+            "VALUES (gen_random_uuid(),%s,'openrouter',%s)",
+            (uid, Jsonb(_envelope(uid, "cred1")))),
+        "v2_conversation_summary": (
+            "INSERT INTO v2_conversation_summary (user_id, summary_envelope) VALUES (%s,%s)",
+            (uid, Jsonb(_envelope(uid, "sum1")))),
+        # coverage_kind defaults to 'exact', whose CHECK constraint
+        # (ck_v2_summary_segment_coverage) requires start_seq > 0.
+        "v2_conversation_summary_segments": (
+            "INSERT INTO v2_conversation_summary_segments "
+            "(user_id, level, start_seq, end_seq, source_message_count, summary_envelope) "
+            "VALUES (%s,0,1,10,5,%s)",
+            (uid, Jsonb(_envelope(uid, "seg1")))),
+        # review_envelope left NULL — also exercises the has_envelope=False cold
+        # path (a review row is created before it's ever run).
+        "v2_trajectory_reviews": (
+            "INSERT INTO v2_trajectory_reviews (source_job_id, user_id) VALUES (%s,%s)",
+            (job_id, uid)),
+        "v2_workspace_entries": (
+            "INSERT INTO v2_workspace_entries (user_id, path, kind, content_envelope) "
+            "VALUES (%s,'/notes.md','artifact',%s)",
+            (uid, Jsonb(_envelope(uid, "ws1")))),
+    }
+
+    for table, (sql, params) in seed_sql.items():
+        _reset_cursor(table)  # belt-and-suspenders: guarantee no prior cursor row
+        with db.get_pool().connection() as c:
+            c.execute(sql, params)
+
+    for table in seed_sql:
+        report = worker.run_table(table, qps=1000)
+        assert report["errors"] == 0, f"{table}: {report}"
+        assert report["copied"] == 1, f"{table}: {report}"
+
+    # spot-check TEE actually has the rows (not just a "copied" counter fiction).
+    assert _tee("SELECT count(*) FROM chat_message_archive WHERE user_id=%s", (uid,))[0][0] == 1
+    assert _tee("SELECT count(*) FROM v2_trajectory_events WHERE user_id=%s", (uid,))[0][0] == 1
+    assert _tee("SELECT count(*) FROM model_api_credentials WHERE user_id=%s", (uid,))[0][0] == 1
+    assert _tee("SELECT count(*) FROM v2_conversation_summary WHERE user_id=%s", (uid,))[0][0] == 1
+    assert _tee("SELECT count(*) FROM v2_conversation_summary_segments WHERE user_id=%s",
+                (uid,))[0][0] == 1
+    assert _tee("SELECT count(*) FROM v2_trajectory_reviews WHERE user_id=%s", (uid,))[0][0] == 1
+    assert _tee("SELECT review_envelope FROM v2_trajectory_reviews WHERE user_id=%s",
+                (uid,))[0][0] is None
+    assert _tee("SELECT count(*) FROM v2_workspace_entries WHERE user_id=%s", (uid,))[0][0] == 1

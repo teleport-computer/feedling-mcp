@@ -130,6 +130,15 @@ class _Table:
     requeue_fetch_sql: str | None = None       # params: (user_id, item_id) or (user_id,)
     requeue_delete_tee_sql: str | None = None  # drop the TEE row when RDS row is gone
     requeue_by_user_only: bool = False          # identity: key on user_id alone
+    # 冷启动（tee_replication_cursors 里还没有本表的行）时喂给 select_sql 的参数
+    # 元组。None = 沿用通用逻辑：_read_cursor 对未跑过的表返回 ("", 0.0)，
+    # _decode_cursor 把空串原样当参数——这对既有表安全，因为它们的排序列都是
+    # TEXT（空串是合法文本下界）。排序列是 TIMESTAMPTZ / BIGINT 的表**必须**显式
+    # 给一个该类型能接受的下界，否则空串在 WHERE (sort_col, id_col) > (%s, %s)
+    # 里 cast 失败，SELECT 本身报错、整表永不同步（scheduler 的 per-table
+    # try/except 会把这个错误吞掉计入退避，每个 tick 静默重复失败，见
+    # 2026-07-28 审查记录）。
+    cursor_zero: tuple | None = None
 
 
 _SEQ_KEY = "_replicator_seq"  # smuggled through the plaintext doc dict, see below
@@ -540,6 +549,9 @@ _TABLES["chat_message_archive"] = _Table(
     # 归档即不可变，不需要 requeue（同 chat_message_archive 自身没有原地改写）。
     requeue_fetch_sql=None,
     requeue_delete_tee_sql=None,
+    # 冷启动：cleared_at 是 TIMESTAMPTZ，"-infinity" 是合法字面量；source_seq 是
+    # BIGINT（WHERE 里没有 ::text 转型），空串不是合法 bigint，必须给数字串。
+    cursor_zero=("-infinity", "0"),
 )
 
 
@@ -606,6 +618,9 @@ _TABLES["v2_trajectory_events"] = _Table(
     # 原地改写路径，不需要 requeue。
     requeue_fetch_sql=None,
     requeue_delete_tee_sql=None,
+    # 冷启动：created_at 是 TIMESTAMPTZ，"-infinity" 合法；第二列在 SQL 里已经
+    # ::text 转型成字符串拼接，空串本身就是合法 TEXT 且排在任何非空拼接结果之前。
+    cursor_zero=("-infinity", ""),
 )
 
 
@@ -664,6 +679,10 @@ _TABLES["model_api_credentials"] = _Table(
     # updated_at 全覆盖（见 unpack 文档），不需要 requeue。
     requeue_fetch_sql=None,
     requeue_delete_tee_sql=None,
+    # 冷启动：updated_at 是 TIMESTAMPTZ，"-infinity" 合法；id 是 UUID（WHERE 里
+    # 没有 ::text 转型），空串不是合法 uuid，用全零 nil UUID 当下界（Postgres 按
+    # 128 位整数比较 uuid，全零是可能的最小值）。
+    cursor_zero=("-infinity", "00000000-0000-0000-0000-000000000000"),
 )
 
 
@@ -720,28 +739,40 @@ _TABLES["v2_conversation_summary"] = _Table(
     # 不需要 requeue。
     requeue_fetch_sql=None,
     requeue_delete_tee_sql=None,
+    # 冷启动：updated_at 是 TIMESTAMPTZ，"-infinity" 合法；第二列是 user_id
+    # （TEXT），空串本身合法且排在任何真实 user_id（都以 "usr_" 开头，非空）之前。
+    cursor_zero=("-infinity", ""),
 )
 
 
 # ---- v2_conversation_summary_segments：segment_id 是 GENERATED ALWAYS AS
 # IDENTITY，upsert 必须 OVERRIDING SYSTEM VALUE；ON CONFLICT DO UPDATE 分支绝不
 # 能碰 segment_id（UPDATE 语境没有等价写法，写了是硬错误——同 chat_messages.seq
-# 的坑，见 worker.py:172 起的注释）。纯 INSERT-only（全仓搜索没有一条 UPDATE），
-# segment_id 本身单列全局唯一且严格递增，直接当游标用，不需要复合 tie-break。
+# 的坑，见 worker.py:172 起的注释）。纯 INSERT-only（全仓搜索没有一条 UPDATE）。
+#
+# ⚠️ 不能只用裸 segment_id 当游标（2026-07-28 审查抓到）：它是 GENERATED ALWAYS
+# AS IDENTITY，但 nextval() 的**取号顺序不等于事务提交顺序**——拿到 5 号的事务
+# 比拿到 6 号的事务晚提交，而扫描恰好落在两次提交之间，游标推过 6 之后 5 就永远
+# 不满足 "segment_id > 6"，永久跳过、不报错、不冻结。这正是本仓库已经在
+# chat_messages.seq 上避过的坑（该表的游标用 (ts, msg_id)，seq 只用于事后
+# setval 对齐，从不参与游标比较）；segments 的写路径同样是 per-user 并发的多处
+# INSERT（jobs_store.py 多个调用点），具备触发条件。改用 (created_at, segment_id)
+# 复合游标，与其余 6 张表统一：created_at 是写入这一行那一刻的真实时间，序列号的
+# 取号/提交倒挂问题不再影响游标是否漏行（即使两行 created_at 恰好相同，
+# segment_id 仍然全局唯一，tie-break 不会漏）。
 def _summary_segments_unpack(r: tuple) -> tuple:
     (segment_id, uid, format_version, coverage_kind, level, start_seq, end_seq,
      source_message_count, legacy_opaque_through_seq, child_segment_ids,
      envelope, created_at) = r
     item_id = str(segment_id)
+    sort_val = _iso(created_at) or ""
     doc = _pack_extra(
         envelope, segment_id=segment_id, format_version=format_version,
         coverage_kind=coverage_kind, level=level, start_seq=start_seq,
         end_seq=end_seq, source_message_count=source_message_count,
         legacy_opaque_through_seq=legacy_opaque_through_seq,
         child_segment_ids=child_segment_ids, created_at=_iso(created_at))
-    # cursor_kind="single" 的游标推进用的是 sort_val（不是 item_id，见
-    # _encode_cursor），这里直接给 segment_id 本身（int）。
-    return (uid, item_id, segment_id, doc)
+    return (uid, item_id, sort_val, doc)
 
 
 def _summary_segments_upsert_args(uid: str, iid: str, sort, doc: dict) -> tuple:
@@ -761,8 +792,9 @@ _TABLES["v2_conversation_summary_segments"] = _Table(
                 "start_seq, end_seq, source_message_count, legacy_opaque_through_seq, "
                 "child_segment_ids, summary_envelope, created_at "
                 "FROM v2_conversation_summary_segments "
-                "WHERE segment_id > %s ORDER BY segment_id LIMIT %s"),
-    cursor_kind="single",
+                "WHERE (created_at, segment_id) > (%s, %s) "
+                "ORDER BY created_at, segment_id LIMIT %s"),
+    cursor_kind="text",
     transform=lambda doc, decrypt: transforms.plaintext_envelope_column(
         doc, decrypt,
         purpose=f"tee_replicate:v2_conversation_summary_segments:{doc.get('id', '')}"),
@@ -784,6 +816,9 @@ _TABLES["v2_conversation_summary_segments"] = _Table(
     upsert_args=_summary_segments_upsert_args,
     requeue_fetch_sql=None,
     requeue_delete_tee_sql=None,
+    # 冷启动：created_at 是 TIMESTAMPTZ，"-infinity" 合法；segment_id 是 BIGINT
+    # （WHERE 里没有 ::text 转型），空串不是合法 bigint，用数字串 "0"。
+    cursor_zero=("-infinity", "0"),
 )
 
 
@@ -856,6 +891,9 @@ _TABLES["v2_trajectory_reviews"] = _Table(
                        "WHERE user_id = %s AND source_job_id = %s"),
     requeue_delete_tee_sql=("DELETE FROM v2_trajectory_reviews "
                             "WHERE user_id = %s AND source_job_id = %s"),
+    # 冷启动：created_at 是 TIMESTAMPTZ，"-infinity" 合法；source_job_id 是
+    # BIGINT（WHERE 里没有 ::text 转型），空串不是合法 bigint，用数字串 "0"。
+    cursor_zero=("-infinity", "0"),
 )
 
 
@@ -902,6 +940,9 @@ _TABLES["v2_workspace_entries"] = _Table(
     # 友好，不需要 requeue。
     requeue_fetch_sql=None,
     requeue_delete_tee_sql=None,
+    # 冷启动：updated_at 是 TIMESTAMPTZ，"-infinity" 合法；第二列在 SQL 里已经
+    # 用 || 拼成字符串，空串本身就是合法 TEXT 且排在任何非空拼接结果之前。
+    cursor_zero=("-infinity", ""),
 )
 
 
@@ -928,7 +969,19 @@ def _encode_cursor(cfg: _Table, sort_val, item_id: str) -> tuple[float, str]:
 
 
 def _decode_cursor(cfg: _Table, wm_ts: float, wm_id: str) -> tuple:
-    """返回喂给 select WHERE 占位符的参数元组（arity 与该表 cursor 列数匹配）。"""
+    """返回喂给 select WHERE 占位符的参数元组（arity 与该表 cursor 列数匹配）。
+
+    冷启动短路：_read_cursor 对从未跑过的表返回 wm_id=""，下面几个分支会把这个
+    空串原样当参数塞进 WHERE (sort_col, id_col) > (%s, %s)。既有 5 张表的排序列
+    都是 TEXT，空串是合法下界，没问题；但本轮新增的 7 张表排序列是 TIMESTAMPTZ /
+    BIGINT，空串在那两种类型上 cast 直接报错（InvalidDatetimeFormat /
+    InvalidTextRepresentation）——SELECT 本身就失败，一行都同步不进去，而
+    scheduler 的 per-table try/except 会把这个错误吞掉计入退避，每个 tick 静默
+    重复失败、没有任何人能从日志之外发现（2026-07-28 审查抓到）。cursor_zero
+    就是给这类表配的、该类型能接受的下界参数元组。
+    """
+    if not wm_id and cfg.cursor_zero is not None:
+        return cfg.cursor_zero
     if cfg.cursor_kind == "numeric":
         return (wm_ts, wm_id)
     if cfg.cursor_kind == "single":
