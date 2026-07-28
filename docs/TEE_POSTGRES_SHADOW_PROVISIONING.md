@@ -159,6 +159,38 @@ CI 部署步骤把 `<ENV_PREFIX>_TEE_DATABASE_URL` / `_FEEDLING_TEE_DUAL_WRITE` 
   同时看主服务 5xx 率 + enclave 是否被争用。**kill switch**：`FEEDLING_TEE_DUAL_WRITE`
   置空 + 重部署 → 双写和回填立即停（不影响主服务）。
 
+### 2.9 迁移落地通道（alembic_tee revision 上线）
+
+alembic_tee 曾经**无 CI 钩子、纯人工执行**——0002/0003 合并后从未在 test/prod 实库
+跑过，两库停在 0001 直到 2026-07-27 才发现（见 Task 0.6）。现在有了固定通道：
+
+```bash
+gh workflow run "TEE migrate" -f environment=test -f confirm=MIGRATE-TEE
+# prod 需要 confirm=MIGRATE-TEE-PROD（typo guard，防误触）
+```
+
+`.github/workflows/tee-migrate.yml`（`workflow_dispatch`，仿 `pg-deploy.yml` 的
+typo-guard 模式）：
+- test 跑 `test` 分支、prod 跑 `main`——与 app 发布流向一致。
+- 在 **GitHub runner**（公网）上直连 TEE，用 **owner 角色**
+  `TEE_MIGRATION_DATABASE_URL`（CVM 里的 backend 只有 app 角色，没有 DDL 权限，
+  所以不能走 `tee-replicate.yml` 那种「admin 端点遥控 CVM 内进程」的模式）。
+- 连接**强制 `sslmode=verify-full` + CA**（`<ENV>_TEE_PG_CA_PEM` secret），不照抄
+  生产 backend 的 `sslmode=require`——那是因为 backend 与 TEE 同在 Phala 内网且只有
+  无 DDL 的 app 角色；这里是公网 + owner 角色执行 DDL，必须验证服务端身份。
+- 两套环境的机密（`TEST_*`/`PROD_*`）**都注入，在 shell 里按 `environment` 挑**，
+  绝不用 GitHub 表达式 `${{ environment == 'prod' && secrets.PROD_X || secrets.TEST_X }}`
+  ——GH 的 `&&`/`||` 是 JS 语义（空串是 falsy），`PROD_X` 恰好为空时会静默 fallback 到
+  `TEST_X`，一次标记为 prod 的 dispatch 会实际跑在 test 库上而 job 仍然绿灯（`pg-deploy.yml`
+  已有过同款教训：注进 prod CVM 的却是 test 的密码）。按环境在 shell 里挑错只会挑到
+  空值，`test -n "$DSN"` 会 fail-closed。
+- **最后一步强制断言** `alembic_tee_version == 代码里 ScriptDirectory 的 head`——
+  这条 assert 就是为了根治「revision 合并了但从未在实库执行」这类问题，对不上直接红。
+
+2026-07-27 全量对齐落地时，Step 7.1（prod）已经在本地手动跑完（先于本通道成型），
+两个 TEE 实库都已 `0001→0004`、各 54 张表；日后的新 revision 一律走这个通道，不再
+手动执行。
+
 ---
 
 ## 3. 关键决策与坑（血泪）

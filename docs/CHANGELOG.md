@@ -47,6 +47,64 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-28 — TEE 影子库全量对齐：51 张表归类落地 + verify/registry 双守卫
+
+**[DONE] `2026-07-27-tee-full-table-alignment` 计划全部代码 Task（1-8）完成**。
+起点：2026-07-27 实测 RDS 61 张基表里只有 20 张镜进了 TEE 影子库，且这套三层
+手工白名单（`db.py` 双写点 / `tee_replicator.worker._TABLES` / `tee_shadow.
+reconciler.TABLES`）互不校验，谁都不是全集——Runtime V2 的 19 张新表就是这样
+在无人发现的情况下漏掉的。
+
+- **新增 `backend/tee_shadow/table_registry.py` 作为单一真源**：61 张 RDS 表
+  逐条登记 lane（`MIRROR` 13 / `CIPHERTEXT` 11 / `SNAPSHOT` 27 / `SKIP` 10 /
+  `LOGICAL` 0，预留给尚未开通的 PG 原生逻辑复制），51 张非 SKIP 表全部进 TEE。
+  `tests/test_tee_table_registry.py` 守完备性：RDS 迁移链建出的每一张表必须
+  有且只有一条登记（漏登记直接红），且非 SKIP 登记必须能在 `alembic_tee` 的
+  真实库里找到对应表（专治"revision 合并了但从未在实库执行"）。
+- **新增 SNAPSHOT lane**（`tee_shadow/snapshot.py`）：给"明文、数据量小、但有
+  UPDATE/DELETE"的 27 张表（`agent_action_queue`/`v2_turn_metrics`/`v2_runtime_
+  control` 等）用 `TRUNCATE`+`COPY` 整表原子替换，不必像 CIPHERTEXT 那样为每
+  张可变表单独接 requeue 补偿。`agent_runtime_instances`/`agent_runtime_
+  supervisor_heartbeats` 最初按"双写热路径"标了 MIRROR，实测这两张表两边都
+  没有真实的写路径（`leases.py` 8 处租约热路径写点只写 RDS）——改判 SNAPSHOT，
+  0004 迁移已建表、prod 实测 230+1 行且 0 孤儿，FK 前提满足。
+- **`tee_replicator.worker._TABLES` 接入 7 张新密文表**（`chat_message_
+  archive`/`model_api_credentials`/`v2_conversation_summary(+_segments)`/
+  `v2_trajectory_events`/`v2_trajectory_reviews`/`v2_workspace_entries`）。
+  test 环境 CVM 容器内探针 gate：7 张表 100% PASS（0 pending_device / 0
+  permanent_fail / 0 异常），`v2_trajectory_events` 实测 124/124（`enclave_pk_
+  fpr` 全空仍全部解得开）；`chat_message_archive`/`v2_trajectory_reviews` 当时
+  test 环境 0 行，未被真实数据覆盖，接线按合成行验证补了这个盲区。冷启动有一个
+  Critical 修复：`_decode_cursor` 对从未跑过的新表返回空串水位线，遇到排序列是
+  TIMESTAMPTZ/BIGINT/UUID 的表（而非既有表的 TEXT 排序列）直接 cast 失败、
+  scheduler 逐表 try/except 静默吞掉、每 tick 无声重复失败——修法是给 `_Table`
+  加 `cursor_zero` 字段，逐表配出各自类型能 parse 的下界。
+- **`tee_shadow/verify.py` 覆盖范围从 18 张扩到全部 51 张（新增 `covered_
+  tables()`）**：SNAPSHOT lane 只核行数（整表替换对增量抽样没有信息量）；7 张
+  新密文表因信封列名各不相同（`payload_envelope`/`api_key_envelope`/
+  `summary_envelope`/`review_envelope`/`content_envelope`，`_sample_ciphertext_
+  content` 写死读 `doc`）暂只做行数核算，内容抽样参数化列为独立后续工作。新增
+  `_rows_ok_advisory`：SNAPSHOT/新密文表是"tick 级快照"或"游标增量"，天生会与
+  持续在写的 RDS 有瞬时行数差，不能像老表那样要求 `rds==tee` 精确相等（会让
+  gate 永久红、没人再看）——判据收窄成"RDS 有行而 TEE 一行都没有"，真正抓的是
+  "这张表从没同步成功过"。`tests/test_tee_verify.py::test_verify_covers_every_
+  synced_table` 守住"注册表新增表 = verify 范围自动跟上"，否则 `verify_ok=true`
+  但新表压根没被核对会是一次"全绿假象"。
+- **补上 alembic_tee 的迁移落地通道**（`.github/workflows/tee-migrate.yml`）：
+  之前完全靠人工执行，已合并的 0002/0003 在 2026-07-27 之前从未在 test/prod
+  实库跑过（两库停在 0001）。新通道手动触发、typo guard、owner 角色 direct-TLS
+  连接、落地后强制断言 `alembic_tee_version == 代码 head`。2026-07-27 已用它
+  （加一次本地手动执行）把两个实库从 0001 推到 0004 head，各 54 张表。
+- prod 解密探针（`scripts/tee/decrypt_probe.py --dsn PROD ...`）与 prod 部署
+  验收（`snapshot_failures=0`/`verify_ok=t`/`unconverged_tables=0`）按分工由
+  controller 在本次之外单独执行，本条记录只覆盖代码 Task 的落地范围。
+
+文档：本文件 + `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md`（新增 §2.9 迁移落地
+通道）+ 上游 `docs/superpowers/plans/2026-07-23-tee-promotion-decrypt-removal.md`
+（Task 0.6 两个 checkbox 勾掉，Task 1.5 v2 表迁移策略处标注由本计划完成）。
+公开文档（`docs-site/`）与 OpenAPI 不涉及：不碰公开 API 契约、不改架构对外
+叙事、不改信任边界（TEE 库定位与可见性没变）。
+
 ## 2026-07-27 — 退役 `responses_unsupported`：一条对着 Kimi 用户空放了很久的警告
 
 **[DECISION] 删除 `/responses` 探测与 `responses_unsupported` 警告**。用户配

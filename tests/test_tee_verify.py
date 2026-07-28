@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
 from tee_replicator import transforms  # noqa: E402
 from tee_shadow import mirror, reconciler, verify  # noqa: E402
+from tee_shadow import table_registry as reg  # noqa: E402
 from conftest import seed_user  # noqa: E402
 
 
@@ -54,25 +55,48 @@ def _patch(monkeypatch):
 
 # Full set of tables verify.py reads, per DB side (see module docstring: a
 # whole-DB job needs a whole-DB clean slate for deterministic assertions).
-_RDS_TABLES = list(reconciler.TABLES) + [
-    "chat_messages", "memory_moments", "world_book_entries", "frame_envelopes",
-]
-_TEE_TABLES = list(reconciler.TABLES) + [
-    "chat_messages", "memory_moments", "world_book_entries", "frames",
-    "tee_pending_device_migration",
-]
+#
+# Derived from verify.covered_tables() (rather than hand-listed) so this list
+# can't silently drift out of sync with verify's actual scope again — Task 8
+# widened that scope from 18 to 52 tables (7 new CIPHERTEXT + 27 SNAPSHOT),
+# and a stale hand-list here would leave leftover rows in the newly-covered
+# tables from earlier tests in the shared session DB, permanently flipping
+# report["ok"] to False for the rest of the run regardless of what a given
+# test actually seeded. "identity" is a pseudo key (see
+# table_registry.PSEUDO_CIPHERTEXT_TABLES) — its physical table (user_blobs)
+# is already covered via reconciler.TABLES.
+_TEE_ALIAS = {cfg["rds_table"]: cfg["tee_table"] for cfg in verify._CIPHERTEXT_TABLES.values()}
+_RDS_TABLES = sorted(t for t in verify.covered_tables()
+                      if t not in reg.PSEUDO_CIPHERTEXT_TABLES)
+_TEE_TABLES = [_TEE_ALIAS.get(t, t) for t in _RDS_TABLES] + ["tee_pending_device_migration"]
 
 
 @pytest.fixture(autouse=True)
 def _clean(backend_env):
+    # v2_runtime_control is a migration-seeded SINGLETON row (0030_v2_runtime_
+    # control.py: `INSERT ... VALUES (1) ON CONFLICT DO NOTHING`, never
+    # reinserted by app code) that many V2 tests (test_v2_kill_switch*.py,
+    # test_v2_capture_batch_protocol.py, ...) mutate with UPDATE-only
+    # statements assuming `id=1` always exists. It's the one SNAPSHOT-lane
+    # table with that property among the newly-covered set (checked: the
+    # other 26 SNAPSHOT tables + 7 new CIPHERTEXT tables have no unconditional
+    # migration seed — their only INSERTs are backfills FROM other tables,
+    # which are empty on a fresh test DB). Truncating it here without
+    # reseeding on BOTH sides would permanently delete that row for the rest
+    # of the shared session DB (breaking every later-alphabetical V2 test
+    # file) and/or leave RDS/TEE row counts mismatched (rds=1,tee=0) forever,
+    # tripping every subsequent report["ok"] assertion in this file — same
+    # class of problem `copytext_meta`'s reseed below already solves.
     with db.get_pool().connection() as c:
         c.execute("TRUNCATE " + ", ".join(_RDS_TABLES) + " CASCADE")
         c.execute("INSERT INTO copytext_meta (id, revision) VALUES (TRUE, 0) "
                   "ON CONFLICT (id) DO NOTHING")
+        c.execute("INSERT INTO v2_runtime_control (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
     with mirror.get_tee_pool().connection() as c:
         c.execute("TRUNCATE " + ", ".join(_TEE_TABLES) + " CASCADE")
         c.execute("INSERT INTO copytext_meta (id, revision) VALUES (TRUE, 0) "
                   "ON CONFLICT (id) DO NOTHING")
+        c.execute("INSERT INTO v2_runtime_control (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
     yield
 
 
@@ -384,3 +408,14 @@ def test_pending_race_window_local_only_row_silently_skipped_in_sample(backend_e
     assert report["ok"] is False
 
     assert [m for m in report["mismatches"] if m["item_id"] == "loc2"] == []
+
+
+def test_verify_covers_every_synced_table():
+    """verify 范围必须随注册表扩展——否则新增表会产生'全绿假象'：
+    verify_ok=true 但那些表压根没被核对过。这是上游 plan 的 Phase 1 出口 gate。"""
+    from tee_shadow import table_registry as reg
+    from tee_shadow import verify
+
+    covered = set(verify.covered_tables())
+    missing = sorted(set(reg.synced_tables()) - covered)
+    assert not missing, f"这些表进了 TEE 但 verify 不核对它们：{missing}"

@@ -177,13 +177,18 @@ agent 回合、记忆蒸馏、proactive 感知、genesis 导入、VLM caption �
 
 ### Task 0.6: TEE 迁移落地机制（v3.1 新增，07-26 发现的机制缺口）
 
-- [ ] 先还账：把已合并未执行的 alembic_tee 0002/0003 应用到 test 与 prod TEE
-      实库（撤 V1 supervisor 两表镜像），核对 `alembic_tee_version`。
-- [ ] 再建通道：alembic_tee 目前**无 CI 钩子、纯人工执行**——Phase 1 会新增
+- [x] 先还账：把已合并未执行的 alembic_tee 0002/0003 应用到 test 与 prod TEE
+      实库（撤 V1 supervisor 两表镜像），核对 `alembic_tee_version`。—— 由
+      `2026-07-27-tee-full-table-alignment` 完成：0004 落地时一并把两个实库
+      从 0001 推到 0004 head（各 54 张表），`alembic_tee_version` 已核对。
+- [x] 再建通道：alembic_tee 目前**无 CI 钩子、纯人工执行**——Phase 1 会新增
       多个 revision，必须先定落地机制（二选一）：接一个手动触发的 GitHub
       workflow（仿 pg-deploy，带 typo guard），或写成 runbook 固定步骤进
       `TEE_POSTGRES_SHADOW_PROVISIONING.md`。没有这个通道，Phase 1 的建表
-      任务全是空转。
+      任务全是空转。—— 由 `2026-07-27-tee-full-table-alignment` 完成：新增
+      `.github/workflows/tee-migrate.yml`（手动触发、typo guard、owner 角色
+      direct-TLS、落地后强制断言 `alembic_tee_version == 代码 head`），用法
+      见 `TEE_POSTGRES_SHADOW_PROVISIONING.md` §"迁移落地通道"。
 
 ### Task 0.4: 尾账量化（只读查询，填附录 A）
 
@@ -236,6 +241,15 @@ Task 1.1/1.4/1.5 新增的全部必迁表**（verify 只查白名单，不扩范
 - [ ] 确认 `genesis_import_chunks` 无在途 job 后弃。
 
 ### Task 1.5: v2_* 表 + V2 队列/归档表的镜像/迁移策略（v3 新增）
+
+> **由 `2026-07-27-tee-full-table-alignment` 完成**：39 张未镜像表已全部登记进
+> `backend/tee_shadow/table_registry.py`（新增的单一真源），分入 MIRROR/
+> CIPHERTEXT/SNAPSHOT 三条 lane（`v2_*` 队列/运行时状态大多落 SNAPSHOT 整表
+> 快照替换；`chat_message_archive`/`model_api_credentials`/`v2_conversation_
+> summary(+_segments)`/`v2_trajectory_events`/`v2_trajectory_reviews`/
+> `v2_workspace_entries` 落 CIPHERTEXT），alembic_tee 0004 已建表、`verify`
+> 覆盖范围已随之扩到全部 51 张非 SKIP 表。以下按持久性分类的初判清单保留作为
+> 历史决策记录，实际 lane 归类以 `table_registry.py` 为准。
 
 - [ ] 按持久性给 39 张未镜像表中的 V2/运行时部分分类（细案逐表定，初判）：
       **新发现必迁**——`chat_message_archive`（归档聊天，用户数据）；

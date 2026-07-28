@@ -67,8 +67,6 @@ REGISTRY: dict[str, Entry] = {
     "copytext_meta": Entry(MIRROR, "文案版本哨兵单行表；reconciler.TABLES 已覆盖"),
     "genesis_import_jobs": Entry(MIRROR, "入住导入作业元数据，明文；reconciler.TABLES 已覆盖"),
     "genesis_import_outputs": Entry(MIRROR, "入住导入产物，明文；reconciler.TABLES 已覆盖"),
-    "agent_runtime_instances": Entry(MIRROR, "runtime 实例登记，明文运维表"),
-    "agent_runtime_supervisor_heartbeats": Entry(MIRROR, "supervisor 心跳，明文运维表"),
     "notify_relay_configs": Entry(MIRROR, "自部署推送中继配置；alembic_tee 0002 已建表"),
     "notify_relay_logs": Entry(MIRROR, "推送中继日志；id 是 IDENTITY 列"),
 
@@ -114,6 +112,13 @@ REGISTRY: dict[str, Entry] = {
     # ---------------------------------------------------------------- #
     "agent_action_queue": Entry(SNAPSHOT, "动作队列，行状态流转（UPDATE 密集），明文 payload_json"),
     "agent_jobs": Entry(SNAPSHOT, "agent 作业表，status 流转，明文"),
+    "agent_runtime_instances": Entry(
+        SNAPSHOT,
+        "V1 runtime 实例登记（租约/状态高频原地 UPDATE）。不走 MIRROR：leases.py 有 8 处"
+        "租约热路径写点，逐个挂双写的代价和风险都高于整表刷；prod 实测 230 行 0 孤儿"),
+    "agent_runtime_supervisor_heartbeats": Entry(
+        SNAPSHOT,
+        "V1 supervisor 心跳（单行，每次心跳原地 UPDATE），同上走整表刷"),
     "agent_status_events": Entry(SNAPSHOT, "agent 状态事件，明文 detail_json"),
     "chat_r2_cleanup": Entry(SNAPSHOT, "R2 清理队列，行会被删，明文"),
     "chat_r2_lifecycle": Entry(SNAPSHOT, "R2 生命周期状态，UPDATE 密集，明文"),

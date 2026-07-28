@@ -65,6 +65,8 @@ _TRANSFORM: dict[str, Callable[[dict, Callable], dict]] = {
 #   identity 用 "identity"，其余同表名）。
 # - pending_by_user_only：identity 的 pending 行 item_id 是常量 "identity"
 #   （worker.py 的 unpack 把它写死），不对应 RDS 侧的 item 值，只能按 user_id 判定。
+# - kind=None：只核行数不做内容抽样，见下方 run() 的分支注释。
+# - strict=False：行数不进硬 gate，见 _rows_ok_advisory 的注释。
 _CIPHERTEXT_TABLES: dict[str, dict] = {
     "chat_messages": dict(
         rds_table="chat_messages", tee_table="chat_messages",
@@ -83,6 +85,35 @@ _CIPHERTEXT_TABLES: dict[str, dict] = {
         rds_where="kind = 'identity'", tee_where="kind = 'identity'",
         item_col="user_id", pending_table="identity", kind="identity",
         pending_by_user_only=True),
+    "chat_message_archive": dict(
+        rds_table="chat_message_archive", tee_table="chat_message_archive",
+        item_col="msg_id", pending_table="chat_message_archive",
+        kind=None, strict=False),
+    "model_api_credentials": dict(
+        rds_table="model_api_credentials", tee_table="model_api_credentials",
+        item_col="id", pending_table="model_api_credentials",
+        kind=None, strict=False),
+    "v2_conversation_summary": dict(
+        rds_table="v2_conversation_summary", tee_table="v2_conversation_summary",
+        item_col="user_id", pending_table="v2_conversation_summary",
+        kind=None, strict=False, pending_by_user_only=True),
+    "v2_conversation_summary_segments": dict(
+        rds_table="v2_conversation_summary_segments",
+        tee_table="v2_conversation_summary_segments",
+        item_col="segment_id", pending_table="v2_conversation_summary_segments",
+        kind=None, strict=False),
+    "v2_trajectory_events": dict(
+        rds_table="v2_trajectory_events", tee_table="v2_trajectory_events",
+        item_col="job_id", pending_table="v2_trajectory_events",
+        kind=None, strict=False),
+    "v2_trajectory_reviews": dict(
+        rds_table="v2_trajectory_reviews", tee_table="v2_trajectory_reviews",
+        item_col="source_job_id", pending_table="v2_trajectory_reviews",
+        kind=None, strict=False),
+    "v2_workspace_entries": dict(
+        rds_table="v2_workspace_entries", tee_table="v2_workspace_entries",
+        item_col="path", pending_table="v2_workspace_entries",
+        kind=None, strict=False),
 }
 
 
@@ -363,6 +394,36 @@ def _sample_frames(key: str, cfg: dict, sample_rate: float,
     return mismatches
 
 
+def _rows_ok_advisory(rds_rows: int, tee_rows: int) -> bool:
+    """新增 lane 的行数硬判据：只抓"这张表从没被同步过 / 一直在失败"。
+
+    不能用 rds_rows == tee_rows。SNAPSHOT 是 tick 级整表替换、CIPHERTEXT 是游标
+    增量，两者都在"上一趟同步的瞬间"与 RDS 一致，而 RDS 一直在变——
+    agent_action_queue / v2_turn_metrics / v2_trajectory_events 这类表每分钟都在写。
+    严格相等会让 verify_ok 永久为 false，把 gate 变成没人再看的红灯，这跟
+    "全绿假象"是同一个病的两面。真正的"这趟同步失败了"由
+    tee_sync_runs.snapshot_failures / replicate 的错误计数负责，不该由 verify 兜。
+
+    保留严格结果供人看：调用方把它写进报告的 strict_rows_ok 字段。
+    """
+    return not (rds_rows > 0 and tee_rows == 0)
+
+
+def covered_tables() -> tuple[str, ...]:
+    """verify 实际会核对的表名集合。
+
+    抽成函数是为了让守卫测试能断言它覆盖了注册表里所有非 SKIP 的表——verify
+    漏掉一张表不会让任何东西变红，只会让那张表悄悄不被核对（"全绿假象"）。
+    """
+    from tee_shadow import table_registry as reg
+
+    return tuple(sorted(
+        set(reconciler.TABLES)
+        | set(_CIPHERTEXT_TABLES)
+        | set(reg.tables_in_lane(reg.SNAPSHOT))
+    ))
+
+
 def run(*, sample_rate: float = 0.02) -> dict:
     """RDS↔TEE 一致性验证：只读扫描，返回
     ``{"tables": {...}, "mismatches": [...], "ok": bool}``。
@@ -378,6 +439,21 @@ def run(*, sample_rate: float = 0.02) -> dict:
         tables[table] = _plaintext_table_report(table)
         mismatches.extend(_sample_plaintext(table, sample_rate))
 
+    # SNAPSHOT lane：整表替换，只核行数（字段抽样对全量替换没有增量信息——
+    # 两侧要么整表一致，要么上一趟 snapshot 整个失败了）。
+    from tee_shadow import table_registry as reg
+
+    for table in reg.tables_in_lane(reg.SNAPSHOT):
+        with db.get_pool().connection() as src, mirror.get_tee_pool().connection() as dst:
+            rds_n = src.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            tee_n = dst.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        tables[table] = {
+            "rds_rows": rds_n, "tee_rows": tee_n, "row_drift": rds_n - tee_n,
+            "user_diffs": {},
+            "strict_rows_ok": rds_n == tee_n,
+            "rows_ok": _rows_ok_advisory(rds_n, tee_n),
+        }
+
     for key, cfg in _CIPHERTEXT_TABLES.items():
         pending_rows = _pending_rows(cfg)
         terminal_rows, requeue_backlog = _split_pending(pending_rows)
@@ -386,7 +462,15 @@ def run(*, sample_rate: float = 0.02) -> dict:
         # docstring for why requeue rows are excluded from the row-count
         # equation itself).
         table_report["requeue_backlog"] = requeue_backlog
+        if not cfg.get("strict", True):
+            table_report["strict_rows_ok"] = table_report["rows_ok"]
+            table_report["rows_ok"] = _rows_ok_advisory(
+                table_report["rds_rows"], table_report["tee_rows"])
         tables[key] = table_report
+        if cfg["kind"] is None:
+            # Task 7 新接入的 7 张表：信封列名各不相同，_sample_ciphertext_content
+            # 写死读 doc，参数化是独立一档工作。行数核算已能抓住整表失联。
+            continue
         if cfg["kind"] == "frames":
             mismatches.extend(_sample_frames(key, cfg, sample_rate, terminal_rows))
         else:
