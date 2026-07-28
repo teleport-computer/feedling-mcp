@@ -108,9 +108,10 @@ def card_text_rejection(*, summary: str, content: str, guard: bool = True) -> st
     if reason:
         return f"content_{reason}"
     if guard:
-        if card_guard.field_pollution_reason(summary):
+        # 硬字段用从严判据(强证据 / ≥2弱共现)—— 误杀=整卡丢弃,代价高。
+        if card_guard.hard_field_pollution_reason(summary):
             return "summary_protocol_leak"
-        if card_guard.field_pollution_reason(content):
+        if card_guard.hard_field_pollution_reason(content):
             return "content_protocol_leak"
     if substantive_len(summary) < MIN_SUMMARY_CHARS:
         return "summary_too_short"

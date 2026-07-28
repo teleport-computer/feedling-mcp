@@ -160,9 +160,13 @@ def parse_migrated_cards(
             continue
         threads_raw = row.get("threads")
         threads = [str(t).strip()[:80] for t in threads_raw if str(t).strip()][:8] if isinstance(threads_raw, list) else []
-        bucket, threads, _label_reasons = sanitize_card_labels(
+        bucket, threads, label_reasons = sanitize_card_labels(
             bucket=str(row.get("bucket") or "").strip()[:80], threads=threads, guard=_guard_on
         )
+        if "bucket_protocol_leak" in label_reasons:
+            # migrate 走 prebuilt-envelope upgrade、不过 _memory_inner_from_action,空桶不会被下游
+            # 默认 —— 必须在此就地降级到按语言的默认桶(codex code_review Important)。
+            bucket = card_guard.default_bucket_for_text(f"{summary}\n{content}")
         seen.add(mid)
         out.append({
             "id": mid,

@@ -252,12 +252,20 @@ def test_capture_retry_prompt_offers_the_empty_answer():
 
 def test_hard_field_protocol_leak_rejects_card():
     # summary/content 混进协议残片 → 整卡打回(走同一个 invalid_card_content 重问路)。
+    # 硬字段从严:强证据(通道前缀+route)或 ≥2 弱证据共现。
     assert card_text_rejection(
         summary="analysis to=functions.memory_write", content="正常的一段正文内容"
     ) == "summary_protocol_leak"
     assert card_text_rejection(
-        summary="用户今天很开心", content='垃圾 relationship"}]}'
+        summary="用户今天很开心", content='analysis to=functions.memory_write 乱码 output error code: 400'
     ) == "content_protocol_leak"
+
+
+def test_hard_field_single_weak_not_rejected():
+    # 单个弱证据(开发者贴 JSON 尾巴 / 字面提 to=functions)→ 不误杀整卡(codex code_review)。
+    assert card_text_rejection(
+        summary="用户在调 parser", content='他说要保留 to=functions.memory_write 这个串'
+    ) is None
 
 
 def test_hard_field_guard_off_bypasses():

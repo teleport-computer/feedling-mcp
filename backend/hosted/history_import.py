@@ -2479,9 +2479,11 @@ def _append_import_memory_cards(store: UserStore, cards: list[dict]) -> list[dic
             continue
         bucket = str(card.get("bucket") or "").strip()[:80]
         if _guard_on and bucket and card_guard.bucket_pollution_reason(bucket):
-            bucket = ""
-        if not bucket:
+            # 污染桶 → 按语言的本地化默认桶。
             bucket = card_guard.default_bucket_for_text(f"{summary}\n{content}")
+        elif not bucket:
+            # 干净但缺桶 → 保留旧行为「未分类」(不改动正常路径,kill switch 也能完整回滚)。
+            bucket = "未分类"
         threads_in = [str(item).strip()[:80] for item in (card.get("threads") or []) if str(item or "").strip()]
         if _guard_on:
             threads_in = [t for t in threads_in if not card_guard.field_pollution_reason(t)]

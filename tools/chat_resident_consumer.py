@@ -141,6 +141,7 @@ from memory.capture_prompt_v1 import (
     sanitize_user_name,
 )
 from identity.user_naming import transcript_speaker_label
+from memory import card_guard
 from memory.card_text import (
     count_user_token_residuals,
     is_card_format_error,
@@ -13963,7 +13964,23 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
     # this tail never yields (yielding here would risk double memory.add on resume).
     now_iso = datetime.now(_tzmod.utc).isoformat()
     actions: list[dict] = []
+    _guard_on = card_guard.guard_enabled()
     for card in state["memories"]:
+        # genesis-resident 蒸馏卡直接来自 build_memory_output_from_fact_candidates(不过
+        # parse_capture_cards/actions),会在下面 _capture_build_envelope 提前封信封、绕过所有
+        # guard —— 这是 codex code_review 抓到的活跃 pre-seal 缺口。在封之前套同一套判据:
+        # 硬字段脏 → 跳整卡;桶脏 → 按语言默认桶;threads 逐项滤脏。
+        if _guard_on:
+            _summary = str(card.get("summary") or "")
+            _content = str(card.get("content") or "")
+            if card_guard.hard_field_pollution_reason(_summary) or card_guard.hard_field_pollution_reason(_content):
+                continue
+            _bucket = str(card.get("bucket") or "").strip()
+            if _bucket and card_guard.bucket_pollution_reason(_bucket):
+                card["bucket"] = card_guard.default_bucket_for_text(f"{_summary}\n{_content}")
+            _threads = card.get("threads")
+            if isinstance(_threads, list):
+                card["threads"] = [t for t in _threads if not card_guard.field_pollution_reason(str(t or ""))]
         # Long-term-memory distill (keep_all ← material_kind == "memory_summary") carries the
         # user's original per-card date through fact_write. Preserve it so decades of uploaded
         # memories don't all collapse onto today. Chat-history distill keeps the "now" stamp;

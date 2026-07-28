@@ -37,11 +37,14 @@ def guard_enabled() -> bool:
         "0", "false", "off", "no",
     )
 
-# harmony tool-route:``to=functions.<name>``(通道前缀 analysis/commentary/final 可有可无)。
-_HARMONY_TOOL_ROUTE_RE = re.compile(r"\bto=functions\.\w+")
-# harmony 特殊 token:``<|channel|>`` / ``<|message|>`` / ``<|start|>`` 等。
+# harmony 特殊 token(强证据):``<|channel|>`` / ``<|message|>`` / ``<|start|>`` 等。
 _HARMONY_SPECIAL_RE = re.compile(r"<\|(?:channel|message|start|end|constrain|return)\|>")
-# provider 报错回显 —— 仅作组合信号(见模块 docstring),不单独判脏。
+# 通道前缀 + tool-route(强证据):analysis/commentary/final 通道词紧邻 ``to=functions.<name>``。
+# 这正是本次事故串的形态,也是「模型把内部通道文本漏成字段值」的高置信指纹。
+_CHANNEL_ROUTE_RE = re.compile(r"\b(?:analysis|commentary|final)\b[^\n]{0,40}?\bto=functions\.\w+")
+# 裸 tool-route(弱证据):单独一个 ``to=functions.x`` —— 正常 prose 也可能字面提到它。
+_BARE_ROUTE_RE = re.compile(r"\bto=functions\.\w+")
+# provider 报错回显(弱证据):``output error code: NNN``。
 _PROVIDER_ERROR_RE = re.compile(r"output error code:\s*\d{3}", re.IGNORECASE)
 
 # 已知机器 taxonomy 残片(精确匹配)。形状无法区分合法自定义桶,故只精确列举。
@@ -50,30 +53,67 @@ _BUCKET_DENYLIST = frozenset({
 })
 
 
-def field_pollution_reason(text) -> str | None:
-    """字段值是协议/harmony/报错泄漏时返回一个短码,否则 ``None``。
+def _strong_signal(t: str) -> bool:
+    """强证据:harmony 特殊 token,或通道前缀紧邻 tool-route。正常内容几乎不可能出现。"""
+    return bool(_HARMONY_SPECIAL_RE.search(t) or _CHANNEL_ROUTE_RE.search(t))
 
-    强证据(单独即判脏):harmony tool-route、harmony 特殊 token、协议头、撕裂 JSON 尾巴。
-    组合证据:provider 报错回显 + 协议前缀/撕裂尾巴共现。
+
+def _weak_signal_count(t: str) -> int:
+    """弱证据个数。**单独一个弱证据不足以判硬字段脏** —— 用户贴 JSON / 讨论 400 /
+    字面提到 ``to=functions.x`` 都会命中单个弱证据(codex code_review:``ORPHAN_JSON_TAIL``
+    自身就被 protocol_leak 标注为「无法和用户贴 JSON 区分」的弱信号)。"""
+    n = 0
+    if _BARE_ROUTE_RE.search(t):
+        n += 1
+    if protocol_leak.looks_like_protocol_head(t):
+        n += 1
+    if protocol_leak.is_orphan_json_tail(t):
+        n += 1
+    if _PROVIDER_ERROR_RE.search(t):
+        n += 1
+    return n
+
+
+def hard_field_pollution_reason(text) -> str | None:
+    """**硬字段(summary/content)**判据 —— 误杀代价高(整卡丢弃 / 400),故从严:
+    只在**强证据**、或**≥2 个弱证据共现**时判脏。本次事故串含通道前缀+route(强),仍被抓。
+
+    这样 ``The API fixture is {"cards": []}``、``preserve to=functions.x literally``、
+    ``尾部多了 "enabled": true}]}`` 这类开发者正常记忆(各只命中一个弱证据)不会被误杀。
     """
     t = str(text or "")
     if not t.strip():
         return None
-    if _HARMONY_TOOL_ROUTE_RE.search(t):
-        return "harmony_tool_route"
-    if _HARMONY_SPECIAL_RE.search(t):
-        return "harmony_special_token"
+    if _strong_signal(t):
+        return "harmony_marker"
+    if _weak_signal_count(t) >= 2:
+        return "multi_weak_leak"
+    return None
+
+
+def field_pollution_reason(text) -> str | None:
+    """**软字段(bucket/threads)**判据 —— 都是短标签,误杀=就地清洗/丢弃、代价低,故从宽:
+    强证据或**任一弱证据**即判脏。正常短标签(``工作`` / ``user_onboarding``)不会命中弱证据。
+    """
+    t = str(text or "")
+    if not t.strip():
+        return None
+    if _strong_signal(t):
+        return "harmony_marker"
+    if _BARE_ROUTE_RE.search(t):
+        return "bare_tool_route"
     if protocol_leak.looks_like_protocol_head(t):
         return "protocol_head"
     if protocol_leak.is_orphan_json_tail(t):
         return "torn_json_tail"
-    if _PROVIDER_ERROR_RE.search(t) and ("to=" in t or protocol_leak.is_orphan_json_tail(t)):
-        return "provider_error_echo"
+    # 注:报错回显不在软字段单独判脏 —— 到这里真正的 to=functions / 撕裂尾巴已被上面返回,
+    # 剩下的 "output error code" + 松散 "to=" 子串(redirect_to=/邮箱)几乎全是假阳性
+    # (codex code_review)。报错回显只在 _weak_signal_count 里作为「需第二个弱证据」的一票。
     return None
 
 
 def bucket_pollution_reason(text) -> str | None:
-    """桶专用:字段级泄漏 + 精确 taxonomy denylist。**不含形状规则**(见 docstring)。"""
+    """桶专用:软字段级泄漏 + 精确 taxonomy denylist。**不含形状规则**(见 docstring)。"""
     t = str(text or "").strip()
     if not t:
         return None

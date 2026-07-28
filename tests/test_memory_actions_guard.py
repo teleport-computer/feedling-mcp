@@ -66,7 +66,7 @@ def test_supersede_rejects_polluted_content():
         "memory": {
             "type": "fact",
             "summary": "用户今天很开心",
-            "content": 'garbage relationship"}]}',
+            "content": '<|channel|>analysis<|message|> garbage relationship"}]}',
             "title": "用户今天很开心",
         },
     })
@@ -98,3 +98,38 @@ def test_add_clean_card_not_rejected_by_guard():
         # 到了 DB 层(store=None)抛错 = 已越过 guard,符合预期。
         return
     assert body.get("error") != "memory_card_polluted"
+
+
+# --- round-2(codex code_review):threads 过滤 / 语言判定 / migrate 桶默认 -------
+
+def test_inner_filters_polluted_threads():
+    # proactive/genesis/继承旧卡的 threads 也过 _memory_inner_from_action —— 脏项必须被滤掉。
+    inner = actions._memory_inner_from_action({
+        "summary": "用户在排查后端问题",
+        "content": "今天下午定位了一个解析 bug",
+        "threads": ["排查", "analysis to=functions.memory_write", "后端"],
+    })
+    assert inner["threads"] == ["排查", "后端"]
+
+
+def test_inner_default_bucket_english_description_only():
+    # 纯英文、只有 description(无 content)、脏桶 → 默认桶应是 Uncategorized 而非中文未分类
+    # (语言判定用原始文本,不用带中文标签的合成 content)。
+    inner = actions._memory_inner_from_action({
+        "summary": "The user prefers tea over coffee",
+        "description": "Mentioned during an evening chat",
+        "bucket": "analysis to=functions.memory_write",
+    })
+    assert inner["bucket"] == "Uncategorized"
+
+
+def test_migrate_polluted_bucket_gets_localized_default():
+    from memory.migrate_prompt_v1 import parse_migrated_cards
+    upgrades, _unmigrated, err = parse_migrated_cards(
+        '{"upgrades": [{"id": "m1", "summary": "用户喜欢普洱茶",'
+        ' "content": "上次视频里提到", "bucket": "long_term_preference_or_event_v1"}]}',
+        allowed_ids={"m1"},
+    )
+    assert err is None
+    assert len(upgrades) == 1
+    assert upgrades[0]["bucket"] == "未分类"       # 脏桶 → 就地降级(不是空串)
