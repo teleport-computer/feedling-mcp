@@ -7284,6 +7284,90 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/voice/chat/completions": {
+      "post": {
+        "summary": "Voice Chat Completions",
+        "operationId": "voice_chat_completions_v1_voice_chat_completions_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreeFormJsonObject"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "compatibility"
+      }
+    },
+    "/v1/voice/sessions": {
+      "post": {
+        "summary": "Create Voice Session",
+        "operationId": "create_voice_session_v1_voice_sessions_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreeFormJsonObject"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "compatibility"
+      }
+    },
     "/v1/web/settings": {
       "get": {
         "summary": "Web Settings Get",

@@ -26,6 +26,16 @@ from enclave.routes._json import json_response_offthread
 router = APIRouter()
 
 
+def _attach_voice_metadata(source: dict, target: dict) -> None:
+    """Carry bounded plaintext routing IDs into the resident decrypt view."""
+    for key, limit in (("voice_call_id", 96), ("voice_turn_id", 128)):
+        value = source.get(key)
+        if isinstance(value, str):
+            value = value.strip()
+            if value and len(value) <= limit:
+                target[key] = value
+
+
 def _decrypt_caption(m, authorized_user_id, content_sk, errors):
     """Decrypt the optional caption envelope (user text sent alongside an
     image/file). Returns the caption string, or "" when absent/failed."""
@@ -62,7 +72,7 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
         ctype = m.get("content_type", "text")
         # v1+ envelope (v0 plaintext paths were stripped post-migration).
         if m.get("visibility") == "local_only":
-            decrypted.append({
+            entry = {
                 "id": m["id"],
                 "seq": m.get("seq"),
                 "role": m["role"],
@@ -73,7 +83,9 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
                 "v": v,
                 "visibility": "local_only",
                 "decrypt_status": "local_only_agent_cannot_read",
-            })
+            }
+            _attach_voice_metadata(m, entry)
+            decrypted.append(entry)
             continue
 
         if m.get("body_omitted"):
@@ -112,6 +124,7 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
             qmids = m.get("quoted_memory_ids")
             if isinstance(qmids, str) and qmids.strip():
                 entry["quoted_memory_ids"] = qmids.strip()
+            _attach_voice_metadata(m, entry)
             decrypted.append(entry)
             continue
 
@@ -154,12 +167,13 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
                 entry["file_name"] = m.get("file_name") or "file"
             else:
                 entry["content"] = plaintext.decode("utf-8", errors="replace")
+            _attach_voice_metadata(m, entry)
             decrypted.append(entry)
         except envelope.DecryptFailure as e:
             # Surface the failure per-item so the agent sees partial
             # progress rather than a blanket 500 on one bad blob.
             errors.append({"id": m.get("id"), "reason": e.reason})
-            decrypted.append({
+            entry = {
                 "id": m["id"],
                 "seq": m.get("seq"),
                 "role": m["role"],
@@ -168,7 +182,9 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
                 "content_type": ctype,
                 "v": v,
                 "decrypt_status": f"error: {e.reason}",
-            })
+            }
+            _attach_voice_metadata(m, entry)
+            decrypted.append(entry)
 
     return decrypted, errors
 

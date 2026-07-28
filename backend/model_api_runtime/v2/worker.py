@@ -1169,6 +1169,10 @@ class TurnDeps:
     # 的做法 —— 之前这里硬编码 source="heartbeat"/manual=False，导致关了
     # reminders_delivery 的用户在 V2 手动唤醒收不到推送（V1 会走 manual_bypass）。
     send_reply_push: Callable[..., None] | None = None
+    # Final voice replies cross from the worker to the public Custom LLM gateway
+    # through a narrow internal endpoint. The callback receives routing ids plus
+    # plaintext only in memory; the backend encrypts it before temporary storage.
+    publish_voice_reply: Callable[..., None] | None = None
     # (store, *, api_key, runtime_token, enclave_sem) -> awaitable McpTurn: build this chat
     # turn's user-MCP tool surface. Implemented in `hosted.mcp_tools.load_turn_mcp`
     # and injected by `serve_worker.build_production_deps`, because loading a user's
@@ -4003,6 +4007,15 @@ def _write_encrypted_reply(store, text: str, *, extra: dict | None = None) -> di
     row = store.append_chat("openclaw", "model_api", env, strict=True, **kwargs)
     store.notify_chat_waiters()
     return row
+
+
+def _voice_context_for_seq(user_id: str, seq: int) -> dict | None:
+    row = db.chat_doc_for_seq(str(user_id), int(seq)) or {}
+    call_id = str(row.get("voice_call_id") or "")
+    turn_id = str(row.get("voice_turn_id") or "")
+    if not call_id or not turn_id:
+        return None
+    return {"call_id": call_id, "turn_id": turn_id}
 
 
 def _build_encrypted_reply_effect_payload(
@@ -7687,6 +7700,8 @@ async def process_job(
         tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
     tm.bind_provider(provider_config)
     push_slot: dict | None = None
+    voice_reply_slot: dict | None = None
+    voice_reply_parts: list[str] = []
     lease_keepalive_stop = asyncio.Event()
     lease_keepalive_task: asyncio.Task | None = None
 
@@ -8644,7 +8659,7 @@ async def process_job(
             final: bool,
             reasoning: str = "",
         ) -> None:
-            nonlocal final_job_completed_atomically
+            nonlocal final_job_completed_atomically, voice_reply_slot
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             text = "" if file_reply is not None else str(text or "").strip()
             if file_reply is not None and final:
@@ -8892,6 +8907,22 @@ async def process_job(
                         log.warning(
                             "[v2.worker] chat reply push slot build failed user=%s: %s",
                             user_id, e)
+                    spoken_part = str(text or "").strip()
+                    if file_reply is None and spoken_part:
+                        voice_reply_parts.append(spoken_part)
+                    if final:
+                        voice_context = await asyncio.to_thread(
+                            _voice_context_for_seq,
+                            user_id,
+                            cursor_box["seq"],
+                        )
+                        spoken_reply = "\n\n".join(voice_reply_parts)
+                        if voice_context is not None and spoken_reply:
+                            voice_reply_slot = {
+                                **voice_context,
+                                "message_id": str(payload["envelope"]["id"]),
+                                "text": spoken_reply,
+                            }
                 if status == "applied" and not final:
                     return
                 if status == "applied":
@@ -9442,6 +9473,22 @@ async def process_job(
             except Exception as e:  # noqa: BLE001 — 推送绝不能影响回合结果
                 log.warning(
                     "[v2.worker] chat reply push failed user=%s: %s", user_id, e)
+        if voice_reply_slot is not None and deps.publish_voice_reply is not None:
+            try:
+                await asyncio.to_thread(
+                    deps.publish_voice_reply,
+                    user_id,
+                    call_id=voice_reply_slot["call_id"],
+                    turn_id=voice_reply_slot["turn_id"],
+                    message_id=voice_reply_slot["message_id"],
+                    text=voice_reply_slot["text"],
+                )
+            except Exception as e:  # noqa: BLE001 — chat reply is already durable
+                log.warning(
+                    "[v2.worker] voice reply publish failed user=%s: %s",
+                    user_id,
+                    type(e).__name__,
+                )
 
 
 async def _run_turn(job: dict, deps: TurnDeps) -> str:

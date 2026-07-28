@@ -515,6 +515,7 @@ def _mint_genesis_token(user_id: str, scopes: list[str] | None = None) -> str:
 # (see the comment above it: the enclave's local check ignores scope, so that list
 # must stay stable).
 _PUSH_TOKEN_SCOPE = ["chat_push"]
+_VOICE_REPLY_TOKEN_SCOPE = ["voice_reply"]
 
 
 def _mint_push_token(user_id: str) -> str:
@@ -528,6 +529,57 @@ def _mint_push_token(user_id: str) -> str:
         scope=_PUSH_TOKEN_SCOPE,
         ttl=60.0,
     )
+
+
+def _mint_voice_reply_token(user_id: str) -> str:
+    secret = os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").strip().encode("utf-8")
+    if not secret:
+        raise RuntimeError("FEEDLING_RUNTIME_TOKEN_SECRET not set")
+    return runtime_token.mint(
+        secret,
+        user_id=user_id,
+        runtime_instance_id="v2-voice-reply",
+        scope=_VOICE_REPLY_TOKEN_SCOPE,
+        ttl=60.0,
+    )
+
+
+def _publish_voice_reply(
+    user_id: str,
+    *,
+    call_id: str,
+    turn_id: str,
+    message_id: str,
+    text: str,
+) -> None:
+    api_url = os.environ.get("FEEDLING_API_URL", "").strip()
+    if not api_url:
+        raise RuntimeError("FEEDLING_API_URL not set")
+    payload = {
+        "call_id": call_id,
+        "turn_id": turn_id,
+        "message_id": message_id,
+        "text": text,
+    }
+    last_error = "voice reply publish failed"
+    for attempt in range(3):
+        try:
+            response = httpx.post(
+                f"{api_url}/v1/internal/voice/reply",
+                json=payload,
+                headers={
+                    "X-Feedling-Runtime-Token": _mint_voice_reply_token(user_id)
+                },
+                timeout=3.0,
+            )
+            if response.status_code < 400:
+                return
+            last_error = f"voice reply rejected status={response.status_code}"
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"voice reply transport failed type={type(exc).__name__}"
+        if attempt < 2:
+            time.sleep(0.15 * (attempt + 1))
+    raise RuntimeError(last_error)
 
 
 def _send_reply_push(
@@ -3094,6 +3146,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
             if os.environ.get("FEEDLING_V2_PUSH_ENABLED", "1").strip() != "0"
             else None
         ),
+        publish_voice_reply=_publish_voice_reply,
     )
 
 

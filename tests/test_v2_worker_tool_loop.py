@@ -538,6 +538,67 @@ def test_chat_mixed_valid_invalid_workspace_batch_applies_valid_call(
     assert captured["results"][1].content.startswith("error: unparseable args")
 
 
+def test_voice_turn_publishes_all_applied_bubbles_once_in_order(monkeypatch):
+    uid = "u_toolloop_voice_multi_bubble"
+    conftest.seed_user(uid)
+    _reset(uid)
+    user_doc = _user_doc("voice-user-1", "给我分两条回答")
+    user_doc.update(
+        voice_call_id="voice-call-1",
+        voice_turn_id="voice-turn-1",
+    )
+    db.chat_append_strict(uid, "voice-user-1", 10.0, user_doc, 5_000)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-voice-multi")
+    _patch_tool_effect_encryption(monkeypatch)
+    written: list[str] = []
+    published: list[tuple[str, dict]] = []
+
+    async def direct_loop(**kwargs):
+        await kwargs["on_reply"]("这是第一条。", final=False)
+        await kwargs["on_reply"]("这是第二条。", final=True)
+        return worker.v2_tool_loop.LoopOutcome(
+            final_text="这是第二条。",
+            rounds=1,
+            stop_reason="final_text",
+            replied_intermediate=True,
+        )
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", direct_loop)
+    base_deps = _late_input_deps(uid, written)
+    deps = worker.TurnDeps(
+        read_messages=base_deps.read_messages,
+        read_messages_after_seq=base_deps.read_messages_after_seq,
+        resolve_provider=base_deps.resolve_provider,
+        mint_enclave_token=base_deps.mint_enclave_token,
+        apply_pending_effects=base_deps.apply_pending_effects,
+        web_tools_enabled=base_deps.web_tools_enabled,
+        publish_voice_reply=lambda user_id, **kwargs: published.append(
+            (user_id, kwargs)
+        ),
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert written == ["这是第一条。", "这是第二条。"]
+    assert len(published) == 1
+    published_user, published_turn = published[0]
+    assert published_user == uid
+    assert published_turn["call_id"] == "voice-call-1"
+    assert published_turn["turn_id"] == "voice-turn-1"
+    assert published_turn["message_id"]
+    assert published_turn["text"] == "这是第一条。\n\n这是第二条。"
+
+
 def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     monkeypatch,
 ):

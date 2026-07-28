@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **ElevenLabs calls can now use the same Chat model and context as typed
+  messages.** An authenticated client creates a short-lived, call-bound voice
+  session, then ElevenLabs sends transcribed turns to an OpenAI-compatible
+  streaming endpoint. Feedling routes each turn through the user's current
+  resident or Hosted Runtime V2 path, preserving persona, memory, tools, and
+  chronological Chat history. ElevenLabs continues to handle transcription,
+  interruption, and speech synthesis, but never receives the user's model API
+  key. Voice reply handoff state is encrypted and expires automatically.
+
 - **A new `GET /v1/perception/app_close` endpoint reports app closures,
   mirroring the existing `app_open` shortcut.** It accepts the same `app`
   (required, `bundle_id` remains a deprecated alias), `category`, and `ts`

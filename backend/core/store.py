@@ -496,6 +496,8 @@ class UserStore:
                 # only: it identifies a logical send retry but carries no
                 # message content and is not part of the E2EE envelope.
                 "client_msg_id",
+                "voice_call_id",
+                "voice_turn_id",
                 "caption_v",
                 "caption_id",
                 "caption_body_ct",
@@ -678,6 +680,8 @@ class UserStore:
                 # only: it identifies a logical send retry but carries no
                 # message content and is not part of the E2EE envelope.
                 "client_msg_id",
+                "voice_call_id",
+                "voice_turn_id",
                 "caption_v",
                 "caption_id",
                 "caption_body_ct",

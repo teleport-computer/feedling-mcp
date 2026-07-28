@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 # full backend suite, the backend needs the real module; poisoning sys.modules here
 # makes later envelope tests import a fake build_envelope.
 try:
-    import content_encryption  # noqa: F401
+    __import__("content_encryption")
 except ModuleNotFoundError:
     _fake_enc = types.ModuleType("content_encryption")
     _fake_enc.build_envelope = lambda **kw: {"v": 1, "stub": True}
@@ -206,7 +206,14 @@ def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monk
     msg = {"id": "user-msg-v2", "role": "user", "content": "天气怎么样？", "ts": 1112.0}
     captured = {}
 
-    def fake_call(message, images=None, image_paths=None, trace_id="", lane="background"):
+    def fake_call(
+        message,
+        images=None,
+        image_paths=None,
+        trace_id="",
+        lane="background",
+        stream_update=None,
+    ):
         captured["message"] = message
         return {"messages": ["外面下雨。"]}
 
@@ -237,7 +244,14 @@ def test_process_messages_prompt_does_not_request_custom_thinking_summary(monkey
     msg = {"id": "user-msg-thinking", "role": "user", "content": "刚才怎么没思考过程？", "ts": 1112.5}
     captured = {}
 
-    def fake_call(message, images=None, image_paths=None, trace_id="", lane="background"):
+    def fake_call(
+        message,
+        images=None,
+        image_paths=None,
+        trace_id="",
+        lane="background",
+        stream_update=None,
+    ):
         captured["message"] = message
         return {"messages": ["我查一下。"]}
 
@@ -5960,6 +5974,79 @@ def _pi_chatty_stream(reply: str, thinking: str = "", *, tokens: int = 120) -> s
                    "message": {"role": "assistant", "content": content,
                                "usage": {"input": 1200, "output": 40}}})
     return _pi_stream_lines(*events)
+
+
+def test_pi_stream_observer_emits_monotonic_text_without_thinking():
+    published = []
+    observer = crc._PiStreamObserver(
+        lambda segment, text, final: published.append((segment, text, final))
+    )
+    lines = _pi_stream_lines(
+        {"type": "message_start", "message": {"role": "assistant", "content": []}},
+        {"type": "message_update", "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "不能说出来"},
+            {"type": "text", "text": "你"},
+        ]}},
+        {"type": "message_update", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "你好"},
+        ]}},
+        {"type": "message_end", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "你好呀"},
+        ]}},
+    )
+
+    for line in lines.splitlines():
+        observer.feed(line)
+
+    assert published == [
+        (0, "你", False),
+        (0, "你好", False),
+        (0, "你好呀", True),
+    ]
+
+
+def test_voice_delta_publisher_marks_latest_segment_complete(monkeypatch):
+    posted = []
+
+    class _Response:
+        status_code = 200
+
+    monkeypatch.setattr(
+        crc._HTTP,
+        "post",
+        lambda url, **kwargs: posted.append(kwargs["json"]) or _Response(),
+    )
+    publisher = crc._VoiceDeltaPublisher("parent-1")
+
+    publisher(0, "第一段", False)
+    publisher(1, "最终回答", True)
+    publisher.complete()
+
+    assert posted[-1] == {
+        "parent_message_id": "parent-1",
+        "segment": 1,
+        "text": "最终回答",
+        "final": True,
+    }
+
+
+def test_run_cli_subprocess_streams_lines_and_keeps_complete_output():
+    seen = []
+    result = crc._run_cli_subprocess(
+        [sys.executable, "-c", "print('one', flush=True); print('two', flush=True)"],
+        {
+            "capture_output": True,
+            "text": True,
+            "timeout": 2,
+            "encoding": "utf-8",
+            "errors": "replace",
+        },
+        stdout_line=seen.append,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "one\ntwo\n"
+    assert seen == ["one\n", "two\n"]
 
 
 def test_turn_content_bytes_excludes_pi_delta_frames(monkeypatch):

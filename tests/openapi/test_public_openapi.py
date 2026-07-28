@@ -172,8 +172,10 @@ def test_public_operation_and_parameter_inventory(
     # 149 since GET /v1/model_api/usage (provider balance/usage snapshot).
     # 150 since POST /v1/model_api/models (BYOK model catalog listing, has a body).
     # 151 since GET /v1/perception/app_close (app_open's "is closed" trigger counterpart).
-    assert len(operations) == 151
-    assert sum("requestBody" in operation for operation in operations.values()) == 69
+    # 153 since the voice session and OpenAI-compatible Custom LLM endpoints;
+    # both accept compatibility JSON envelopes, hence 69 -> 71 bodies.
+    assert len(operations) == 153
+    assert sum("requestBody" in operation for operation in operations.values()) == 71
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")
