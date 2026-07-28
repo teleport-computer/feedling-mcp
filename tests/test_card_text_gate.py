@@ -246,3 +246,52 @@ def test_capture_retry_prompt_offers_the_empty_answer():
     retry = build_capture_retry_prompt("原始 prompt", "invalid_card_content:summary_empty")
     assert '{"cards": []}' in retry  # 空结果永远是可接受的出路,好过再交一份占位符
     assert "summary 是空的" in retry
+
+
+# --- 模型原始输出泄漏(2026-07-28 加):harmony 标记 / 报错回显 / 撕裂尾巴 -------
+
+def test_hard_field_protocol_leak_rejects_card():
+    # summary/content 混进协议残片 → 整卡打回(走同一个 invalid_card_content 重问路)。
+    assert card_text_rejection(
+        summary="analysis to=functions.memory_write", content="正常的一段正文内容"
+    ) == "summary_protocol_leak"
+    assert card_text_rejection(
+        summary="用户今天很开心", content='垃圾 relationship"}]}'
+    ) == "content_protocol_leak"
+
+
+def test_hard_field_guard_off_bypasses():
+    # kill switch:guard=False 时不跑泄漏检测(只留原有占位符判据)。
+    assert card_text_rejection(
+        summary="analysis to=functions.memory_write", content="正常的一段正文内容", guard=False
+    ) is None
+
+
+def test_soft_bucket_protocol_leak_is_cleaned_not_rejected():
+    bucket, threads, reasons = sanitize_card_labels(
+        bucket="relationship'}]}analysis to=functions.memory_write output error code: 400", threads=[]
+    )
+    assert bucket == ""                       # 脏桶就地清空(降级默认桶由调用层做)
+    assert "bucket_protocol_leak" in reasons
+
+
+def test_soft_bucket_known_taxonomy_residue_cleaned():
+    bucket, _t, reasons = sanitize_card_labels(bucket="long_term_preference_or_event_v1", threads=[])
+    assert bucket == ""
+    assert "bucket_protocol_leak" in reasons
+
+
+def test_soft_threads_drop_dirty_keep_clean():
+    _b, threads, reasons = sanitize_card_labels(
+        bucket="工作", threads=["家庭", "to=functions.memory_write", "健康"]
+    )
+    assert threads == ["家庭", "健康"]          # 脏条目丢、干净条目留
+    assert "threads_protocol_leak" in reasons
+
+
+def test_legit_bucket_not_cleaned():
+    # 合法自定义桶(含 snake_case)不能被误清。
+    for b in ("妈妈", "health_diet_log_2026", "project_feedling_v1"):
+        bucket, _t, reasons = sanitize_card_labels(bucket=b, threads=[])
+        assert bucket == b, b
+        assert not reasons, b

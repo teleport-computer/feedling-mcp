@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+from memory import card_guard
+from memory.card_text import sanitize_card_labels
 from memory.prompts_v1 import COMMON_BUCKETS_GUIDANCE_V1
 
 _MIGRATE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。现在是一段安静的时间，没人在和你说话。
@@ -137,6 +139,7 @@ def parse_migrated_cards(
 
     out: list[dict] = []
     seen: set[str] = set()
+    _guard_on = card_guard.guard_enabled()
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -149,12 +152,21 @@ def parse_migrated_cards(
         content = str(row.get("content") or "").strip()
         if not summary and not content:
             continue  # empty result — skip rather than write a hollow card
+        # 模型原始输出/协议残片:硬字段脏 → 跳过(计入 unmigrated,下轮重试);桶脏 → 清空
+        # (走下游的空桶默认);threads 逐项滤脏。此路径提前封信封、绕过 actions 层,故在此接。
+        if _guard_on and (
+            card_guard.field_pollution_reason(summary) or card_guard.field_pollution_reason(content)
+        ):
+            continue
         threads_raw = row.get("threads")
         threads = [str(t).strip()[:80] for t in threads_raw if str(t).strip()][:8] if isinstance(threads_raw, list) else []
+        bucket, threads, _label_reasons = sanitize_card_labels(
+            bucket=str(row.get("bucket") or "").strip()[:80], threads=threads, guard=_guard_on
+        )
         seen.add(mid)
         out.append({
             "id": mid,
-            "bucket": str(row.get("bucket") or "").strip()[:80],
+            "bucket": bucket,
             "threads": threads,
             "summary": summary,
             "content": content,

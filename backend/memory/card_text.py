@@ -19,6 +19,8 @@ from __future__ import annotations
 import re
 import unicodedata
 
+from memory import card_guard
+
 # 卡上会被用户亲眼看到的文字字段(bucket/threads 也显示在花园里)。
 _VISIBLE_TEXT_FIELDS = ("summary", "content", "bucket")
 
@@ -89,11 +91,15 @@ def placeholder_reason(text: str) -> str | None:
     return None
 
 
-def card_text_rejection(*, summary: str, content: str) -> str | None:
+def card_text_rejection(*, summary: str, content: str, guard: bool = True) -> str | None:
     """硬字段体检。返回 ``None``=可以落库,否则 ``"<字段>_<原因>"``。
 
     与旧判据的差别:旧的是「两个都空才拦」,现在是**两个都必须是真内容**。
     「长标题 + 空正文」正是用户看到的第一类垃圾卡。
+
+    ``guard``:是否额外跑「模型原始输出泄漏」检测(harmony 标记 / 报错回显 / 撕裂尾巴)。
+    硬字段命中泄漏 = 整卡打回(与占位符同待遇,走同一个 ``invalid_card_content:*`` 重问路)。
+    调用层传入 ``card_guard.guard_enabled()`` 作 kill switch;默认 ON。
     """
     reason = placeholder_reason(summary)
     if reason:
@@ -101,6 +107,11 @@ def card_text_rejection(*, summary: str, content: str) -> str | None:
     reason = placeholder_reason(content)
     if reason:
         return f"content_{reason}"
+    if guard:
+        if card_guard.field_pollution_reason(summary):
+            return "summary_protocol_leak"
+        if card_guard.field_pollution_reason(content):
+            return "content_protocol_leak"
     if substantive_len(summary) < MIN_SUMMARY_CHARS:
         return "summary_too_short"
     if substantive_len(content) < MIN_CONTENT_CHARS:
@@ -109,7 +120,7 @@ def card_text_rejection(*, summary: str, content: str) -> str | None:
 
 
 def sanitize_card_labels(
-    *, bucket: str, threads: list[str]
+    *, bucket: str, threads: list[str], guard: bool = True
 ) -> tuple[str, list[str], list[str]]:
     """清洗软字段。返回 ``(bucket, threads, reasons)``,``reasons`` 供调用方观测。
 
@@ -125,6 +136,11 @@ def sanitize_card_labels(
     if reason:
         reasons.append(f"bucket_{reason}")
         clean_bucket = ""
+    # 软字段的「模型原始输出泄漏」:桶另查精确 taxonomy denylist,命中即丢(降级到默认桶
+    # 由调用层做);threads 逐项丢脏项、留干净项。硬字段(summary/content)才整卡打回。
+    elif guard and clean_bucket and card_guard.bucket_pollution_reason(clean_bucket):
+        reasons.append("bucket_protocol_leak")
+        clean_bucket = ""
     clean_threads: list[str] = []
     for thread in threads or []:
         text = str(thread or "").strip()
@@ -133,6 +149,9 @@ def sanitize_card_labels(
         reason = placeholder_reason(text)
         if reason:
             reasons.append(f"threads_{reason}")
+            continue
+        if guard and card_guard.field_pollution_reason(text):
+            reasons.append("threads_protocol_leak")
             continue
         clean_threads.append(text)
     return clean_bucket, clean_threads, reasons
@@ -209,6 +228,10 @@ _REASON_TEXT = {
     "content_template_fragment": "content 抄了输出示例里的说明文字(例如「一段厚的正文」)",
     "content_no_substantive_chars": "content 只有省略号/标点,没有正文",
     "content_too_short": "content 太短,不是一段正文",
+    "summary_protocol_leak": "summary 里混进了模型的原始输出/协议残片(harmony 标记、报错回显或撕裂的 JSON),不是真正的记忆内容",
+    "content_protocol_leak": "content 里混进了模型的原始输出/协议残片,不是真正的记忆内容",
+    "bucket_protocol_leak": "bucket 混进了协议残片/机器分类串",
+    "threads_protocol_leak": "threads 里有条目混进了协议残片",
     "bucket_bracket_placeholder": "bucket 是占位符",
     "bucket_placeholder_word": "bucket 只填了一个占位词",
     "bucket_no_substantive_chars": "bucket 只有标点",
