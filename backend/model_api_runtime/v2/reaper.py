@@ -32,14 +32,19 @@ def reap_once(*, record_terminal_error: Callable[[str, str], None] | None = None
     rows = jobs_store.reap_stuck_job_rows()
     # Drain *all* outstanding markers, not just rows terminalized by this pass.
     # That is the crash recovery contract: a prior worker/reaper may have died
-    # immediately after the atomic job+marker commit, or either sink may have
+    # immediately after the atomic job+marker commit, or any sink may have
     # failed transiently.  The reconciler is independently idempotent.
     reconciled = reconcile_once(record_terminal_error=record_terminal_error)
-    if reconciled["status_delivered"] or reconciled["runtime_error_delivered"]:
+    if (
+        reconciled["status_delivered"]
+        or reconciled["runtime_error_delivered"]
+        or reconciled["reply_delivered"]
+    ):
         log.info(
-            "reconciled V2 terminal failures status=%d runtime_error=%d",
+            "reconciled V2 terminal failures status=%d runtime_error=%d reply=%d",
             reconciled["status_delivered"],
             reconciled["runtime_error_delivered"],
+            reconciled["reply_delivered"],
         )
     return len(rows)
 

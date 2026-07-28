@@ -269,6 +269,7 @@ def test_prompt_coverage_after_catchup_no_message_falls_in_gap(monkeypatch):
 
     async def _fake_compact(
         *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
     ):
         compact_calls.append(list(old_messages))
         return (current_summary + "\n- folded").strip()

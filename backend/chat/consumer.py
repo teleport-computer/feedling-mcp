@@ -35,6 +35,7 @@ _RESIDENT_BINDING_SEEN_INTERVAL_SEC = max(
     1, int(os.environ.get("FEEDLING_RESIDENT_BINDING_SEEN_INTERVAL_SEC", "60"))
 )
 _CONSUMER_STATE_CAS_ATTEMPTS = 5
+_POLL_CONSUMER_HISTORY_LIMIT = 16
 _ConsumerStateResult = TypeVar("_ConsumerStateResult")
 
 
@@ -169,6 +170,40 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
         if event_type == "poll":
             state["last_poll_at"] = now_iso
             state["last_poll_epoch"] = now_epoch
+            # The legacy top-level consumer_id is last-writer-wins. Hosted V1
+            # and a resident can alternate polls, continually hiding one
+            # another. Keep a bounded per-identity last-poll record so the
+            # admin plane can report both observations without treating the
+            # latest sample as proof that the other consumer stopped.
+            consumer_id = str(event_info.get("consumer_id") or "").strip()
+            consumer_name = str(event_info.get("consumer_name") or "").strip()
+            identity = consumer_id or consumer_name or "unknown"
+            if consumer_id.startswith("agent-runner:"):
+                responder = "hosted_v1"
+            elif consumer_id == "hosted_runtime_v2":
+                responder = "hosted_v2"
+            else:
+                responder = "resident"
+            raw_pollers = state.get("poll_consumers")
+            raw_pollers = raw_pollers if isinstance(raw_pollers, dict) else {}
+            pollers = {
+                str(key): dict(value)
+                for key, value in raw_pollers.items()
+                if isinstance(value, dict)
+            }
+            pollers[identity] = {
+                "consumer_id": consumer_id,
+                "consumer_name": consumer_name,
+                "responder": responder,
+                "last_poll_at": now_iso,
+                "last_poll_epoch": now_epoch,
+            }
+            newest = sorted(
+                pollers.items(),
+                key=lambda item: float(item[1].get("last_poll_epoch") or 0),
+                reverse=True,
+            )[:_POLL_CONSUMER_HISTORY_LIMIT]
+            state["poll_consumers"] = dict(newest)
             if state.get("official"):
                 health = _decrypt_health_from_state(state, now_epoch=now_epoch)
                 if health["status"] == "unknown":

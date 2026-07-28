@@ -1232,6 +1232,67 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
 
             rows = conn.execute(
                 """
+                SELECT wanted.user_id,
+                       COALESCE(vrs.hosted_runtime_state, 'resident'),
+                       route.id::text,
+                       route.is_active,
+                       route.test_status,
+                       ari.status,
+                       ari.lease_owner,
+                       COALESCE(
+                         to_char(
+                           ari.lease_expires_at AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+                         ),
+                         ''
+                       ),
+                       (
+                         ari.lease_owner IS NOT NULL
+                         AND ari.lease_expires_at IS NOT NULL
+                         AND ari.lease_expires_at >= now()
+                       ) AS runner_lease_active
+                FROM unnest(%s::text[]) AS wanted(user_id)
+                LEFT JOIN v2_runtime_state vrs ON vrs.user_id = wanted.user_id
+                LEFT JOIN LATERAL (
+                  SELECT id, is_active, test_status
+                  FROM model_api_routes
+                  WHERE user_id = wanted.user_id AND is_active
+                  ORDER BY updated_at DESC, id
+                  LIMIT 1
+                ) route ON TRUE
+                LEFT JOIN agent_runtime_instances ari
+                  ON ari.user_id = wanted.user_id
+                """,
+                (ids,),
+            ).fetchall()
+            for (
+                uid,
+                runtime_state,
+                route_id,
+                route_active,
+                route_test_status,
+                runner_status,
+                lease_owner,
+                lease_expires_at,
+                lease_active,
+            ) in rows:
+                ensure(out, uid)["responder_runtime"] = {
+                    "hosted_runtime_state": str(runtime_state or "resident"),
+                    "model_api_route": {
+                        "id": str(route_id or ""),
+                        "is_active": bool(route_active),
+                        "test_status": str(route_test_status or ""),
+                    },
+                    "runner_lease": {
+                        "active": bool(lease_active),
+                        "status": str(runner_status or ""),
+                        "lease_owner": str(lease_owner or ""),
+                        "lease_expires_at": str(lease_expires_at or ""),
+                    },
+                }
+
+            rows = conn.execute(
+                """
                 SELECT user_id, provider_state,
                        COALESCE(to_char(
                          last_provider_success_at AT TIME ZONE 'UTC',
@@ -2847,6 +2908,63 @@ def set_blob_strict(user_id: str, kind: str, doc) -> None:
                 )
 
 
+def set_onboarding_route_strict(user_id: str, doc: dict) -> str | None:
+    """Persist the route selector and reconcile the V1 model route atomically.
+
+    ``onboarding_route`` is the ownership selector.  A non-model-api route must
+    not leave an active V1 route behind; switching back to ``model_api`` restores
+    the most recently updated tested-ok route when one exists.  The blob and
+    route-row updates share one transaction so readers cannot observe a committed
+    selector whose auxiliary kill switch still has the previous value.
+
+    Returns the active route id after the transaction, or ``None`` when the
+    selected access mode is not model_api / no tested-ok route can be restored.
+    Raises on primary persistence failure.
+    """
+    route = str((doc or {}).get("route") or "").strip().lower()
+    active_route_id: str | None = None
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtextextended('onboarding-route:' || %s, 0))",
+                    (str(user_id),),
+                )
+                cur.execute(
+                    "INSERT INTO user_blobs (user_id, kind, doc) "
+                    "VALUES (%s, 'onboarding_route', %s) "
+                    "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc",
+                    (user_id, Jsonb(doc)),
+                )
+                if route == "model_api":
+                    # Deactivate first: the partial unique index is not deferrable,
+                    # so a one-statement boolean flip can transiently collide.
+                    cur.execute(
+                        "UPDATE model_api_routes SET is_active = FALSE, updated_at = now() "
+                        "WHERE user_id = %s AND is_active",
+                        (user_id,),
+                    )
+                    row = cur.execute(
+                        "UPDATE model_api_routes SET is_active = TRUE, updated_at = now() "
+                        "WHERE id = ("
+                        "  SELECT id FROM model_api_routes "
+                        "  WHERE user_id = %s AND test_status = 'ok' "
+                        "  ORDER BY updated_at DESC, id LIMIT 1"
+                        ") RETURNING id::text",
+                        (user_id,),
+                    ).fetchone()
+                    active_route_id = str(row[0]) if row else None
+                else:
+                    cur.execute(
+                        "UPDATE model_api_routes SET is_active = FALSE, updated_at = now() "
+                        "WHERE user_id = %s AND is_active",
+                        (user_id,),
+                    )
+    _mirror_persisted_blob(user_id, "onboarding_route", doc)
+    return active_route_id
+
+
 def patch_proactive_settings_strict(
     user_id: str,
     patch: dict,
@@ -3606,6 +3724,90 @@ def list_hosted_runtime_nonresident_controls() -> list[tuple[str, str, str, int]
     ]
 
 
+def audit_resident_active_model_routes(*, apply: bool = False) -> list[dict]:
+    """List route-selector/V1-route conflicts; optionally deactivate them.
+
+    This deliberately does *not* use ``consumer_state.consumer_id``: that field
+    is last-writer-wins and alternating hosted/resident pollers overwrite one
+    another.  The model route is the configured V1 eligibility signal and
+    ``agent_runtime_instances.lease_expires_at`` is the authoritative current
+    hosted-process lease.  ``apply=False`` is the safe default used by the
+    operator CLI.
+
+    Apply returns the exact pre-change rows selected in its transaction, making
+    a reviewed dry-run directly comparable with the eventual mutation.
+    """
+    query = """
+        SELECT r.user_id,
+               route_blob.doc,
+               LOWER(COALESCE(NULLIF(route_blob.doc->>'route', ''), 'resident'))
+                   AS onboarding_route,
+               r.id::text,
+               r.is_active,
+               r.test_status,
+               LOWER(c.provider),
+               r.model,
+               COALESCE(vrs.hosted_runtime_state, 'resident'),
+               ari.status,
+               ari.lease_owner,
+               ari.lease_expires_at,
+               (
+                 ari.lease_owner IS NOT NULL
+                 AND ari.lease_expires_at IS NOT NULL
+                 AND ari.lease_expires_at >= now()
+               ) AS runner_lease_active
+        FROM model_api_routes r
+        JOIN model_api_credentials c ON c.id = r.credential_id
+        LEFT JOIN user_blobs route_blob
+          ON route_blob.user_id = r.user_id
+         AND route_blob.kind = 'onboarding_route'
+        LEFT JOIN v2_runtime_state vrs ON vrs.user_id = r.user_id
+        LEFT JOIN agent_runtime_instances ari ON ari.user_id = r.user_id
+        WHERE r.is_active
+          AND r.test_status = 'ok'
+          AND LOWER(COALESCE(NULLIF(route_blob.doc->>'route', ''), 'resident'))
+                <> 'model_api'
+        ORDER BY r.user_id, r.id
+        FOR UPDATE OF r
+    """
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            rows = conn.execute(query).fetchall()
+            if apply and rows:
+                conn.execute(
+                    "UPDATE model_api_routes "
+                    "SET is_active = FALSE, updated_at = now() "
+                    "WHERE id::text = ANY(%s) AND is_active",
+                    ([str(row[3]) for row in rows],),
+                )
+
+    def _iso(value) -> str:
+        return value.isoformat() if value is not None else ""
+
+    return [
+        {
+            "user_id": str(row[0]),
+            "route_blob": row[1] if isinstance(row[1], dict) else None,
+            "onboarding_route": str(row[2]),
+            "model_api_route": {
+                "id": str(row[3]),
+                "is_active": bool(row[4]),
+                "test_status": str(row[5]),
+                "provider": str(row[6]),
+                "model": str(row[7]),
+            },
+            "hosted_runtime_state": str(row[8]),
+            "runner_lease": {
+                "active": bool(row[12]),
+                "status": str(row[9] or ""),
+                "lease_owner": str(row[10] or ""),
+                "lease_expires_at": _iso(row[11]),
+            },
+        }
+        for row in rows
+    ]
+
+
 def list_agent_runtime_enabled_users() -> list[dict]:
     """有 active route 且该 route test_status='ok'、其 credential 的 provider 能
     fit 的用户都纳入托管（与 hosted/agent_runtime_cutover.resolve_driver 一致——
@@ -3622,12 +3824,12 @@ def list_agent_runtime_enabled_users() -> list[dict]:
     /v1/responses capability, set at setup; selects native passthrough vs the
     LiteLLM chat-completions bridge)。
 
-    Anti-double-run gate (dual-runtime coexistence, spec §6): a user whose
-    hosted-runtime fence (``v2_runtime_state.hosted_runtime_state``) reads
-    ``v2`` or ``draining`` is excluded — the V2 fleet already owns them, and
-    the V1 supervisor spawning a consumer too would double the reply and the
-    BYOK spend. Absence of a fence row (never cut over) defaults to resident,
-    same COALESCE default as ``db.get_hosted_runtime_control_strict``."""
+    Anti-double-run gates: the committed onboarding selector must positively be
+    ``model_api`` and the hosted-runtime fence must not read ``v2``/``draining``.
+    Missing/legacy route blobs therefore fail closed instead of silently
+    spawning V1 beside a resident consumer.  V2 ownership remains the second,
+    independent fence.
+    """
     providers = ["anthropic", "claude", "deepseek", "openai",
                  "gemini", "openrouter", "openai_compatible"]
     try:
@@ -3652,6 +3854,12 @@ def list_agent_runtime_enabled_users() -> list[dict]:
                 WHERE r.is_active
                   AND r.test_status = 'ok'
                   AND LOWER(c.provider) = ANY(%s)
+                  AND EXISTS (
+                    SELECT 1 FROM user_blobs route_blob
+                    WHERE route_blob.user_id = r.user_id
+                      AND route_blob.kind = 'onboarding_route'
+                      AND LOWER(COALESCE(route_blob.doc->>'route', '')) = 'model_api'
+                  )
                   AND NOT EXISTS (
                     SELECT 1 FROM v2_runtime_state vrs
                     WHERE vrs.user_id = r.user_id
@@ -6702,6 +6910,7 @@ def chat_append_effect_with_cursor(
     *,
     connection=None,
     defer_post_commit: bool = False,
+    require_cursor_advance: bool = False,
 ):
     """Atomically persist one deterministic V2 reply and optionally advance its cursor.
 
@@ -6716,6 +6925,10 @@ def chat_append_effect_with_cursor(
     ``defer_post_commit`` returns a thunk for R2/mirror work; callers must invoke
     it only after that outer commit.  The default wrapper behavior is unchanged.
 
+    ``require_cursor_advance`` is reserved for delayed terminal-failure
+    delivery. It suppresses the candidate atomically when a newer terminal
+    reply already advanced the cursor through the captured failure frontier.
+
     Returns ``(seq, inserted)`` by default, or
     ``(seq, inserted, post_commit)`` when ``defer_post_commit`` is true. A
     replay returns the existing seq and still monotonically advances a terminal
@@ -6729,6 +6942,10 @@ def chat_append_effect_with_cursor(
     )
     if cursor_seq is not None and cursor_seq < 0:
         raise ValueError("reply_through_seq must be >= 0")
+    if require_cursor_advance and cursor_seq is None:
+        raise ValueError(
+            "require_cursor_advance requires a terminal reply cursor"
+        )
 
     effect_doc = _normalize_chat_body_doc(doc)
     replied_user_ids: list[str] = []
@@ -6792,6 +7009,10 @@ def chat_append_effect_with_cursor(
                     if not raw_previous_cursor.isdigit():
                         raise RuntimeError("invalid persisted V2 reply cursor")
                     previous_cursor = int(raw_previous_cursor)
+                    if require_cursor_advance and cursor_seq <= previous_cursor:
+                        if defer_post_commit:
+                            return 0, False, lambda: None
+                        return 0, False
                 storage_generation = _lock_chat_r2_lifecycle_on_cursor(
                     cur, user_id,
                 )

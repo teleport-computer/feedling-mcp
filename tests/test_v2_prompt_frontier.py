@@ -772,6 +772,7 @@ def test_adaptive_required_exhaustion_is_counted_and_still_raised(monkeypatch):
                 input_budget_tokens=8_000,
                 context_window_tokens=12_000,
                 required_components=("message_context",),
+                limit_source="provider_metadata",
             )
 
     async def provider(_config, messages, *, tools=None):

@@ -36,6 +36,7 @@ from asgi_test_client import make_client  # noqa: E402
 from content import content_core  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+from conftest import configure_model_api_route  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 
 ADMIN_TOKEN = "admin-test-token"
@@ -149,6 +150,52 @@ def _norm_html(text: str) -> str:
 # --------------------------------------------------------------------------- #
 # JSON routes — parity
 # --------------------------------------------------------------------------- #
+
+
+def test_route_fence_audit_is_admin_only_and_read_only(env):
+    uid, _api_key = _register()
+    _credential_id, route_id = configure_model_api_route(
+        uid,
+        provider="anthropic",
+        model="claude-3-5-sonnet-latest",
+    )
+    # Recreate the historical mismatch without using the fixed route writer.
+    db.set_blob(
+        uid,
+        "onboarding_route",
+        {"route": "resident", "selected_at": "2026-07-27T00:00:00Z"},
+    )
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO agent_runtime_instances "
+            "(user_id,driver,status,pid,lease_owner,lease_expires_at,runtime_home) "
+            "VALUES (%s,'claude','running',123,'supervisor-test',"
+            "now()+interval '5 minutes','/tmp/runtime') "
+            "ON CONFLICT (user_id) DO UPDATE SET "
+            "status='running', lease_owner='supervisor-test', "
+            "lease_expires_at=now()+interval '5 minutes'",
+            (uid,),
+        )
+
+    assert _asgi_json("GET", "/v1/admin/route-fence-audit") == (
+        401,
+        {"error": "unauthorized"},
+    )
+    status, body = _asgi_json(
+        "GET",
+        "/v1/admin/route-fence-audit",
+        headers=_admin(),
+    )
+    assert status == 200
+    assert body["mode"] == "dry_run"
+    row = next(item for item in body["rows"] if item["user_id"] == uid)
+    assert row["onboarding_route"] == "resident"
+    assert row["model_api_route"]["id"] == route_id
+    assert row["runner_lease"]["active"] is True
+    assert body["lease_source"]["cardinality"].startswith("one row per user")
+    # GET cannot remediate; route stays active until the separately gated CLI
+    # is explicitly invoked with --apply.
+    assert db.model_api_route_get(uid, route_id)["is_active"] is True
 
 def test_summary_parity_empty(env):
     f = _flask_get_json("/v1/admin/data-track/summary", headers=_admin())

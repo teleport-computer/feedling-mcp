@@ -66,24 +66,39 @@ def _bullet_key(text: str) -> str:
     return " ".join(text.split()).casefold()
 
 
-def _validated_new_bullets(reply: Any, *, current_summary: str) -> str | None:
-    """Return a normalized, bounded bullet-only append or ``None``.
+def _validate_new_bullets(
+    reply: Any, *, current_summary: str
+) -> tuple[str | None, str]:
+    """Return ``(normalized_append, reject_code)``; exactly one side is set.
 
     Validation is deliberately all-or-nothing.  Salvaging the valid-looking
     subset of a malformed response would let the compaction caller advance its
     watermark even though the rejected portion may be the only representation
     of some old messages.
+
+    A rejection is a *silent* watermark stall for the caller, and an identical
+    retry re-reads the identical batch, so a rejected fold repeats forever
+    until something changes (usr_7f30…, 2026-07-24 → 07-27: three days of
+    turns, none of which reached the model that answers the user).  The reject
+    code therefore names WHICH rule fired and, where a bound was crossed, by
+    how much.  It carries counts only — never a line, a fragment, or any other
+    summarized content — because it flows out to the worker's trajectory and
+    terminal-status surfaces.
     """
     if not isinstance(reply, str):
-        return None
+        return None, "reply_not_text"
 
     candidate = reply.strip()
-    if not candidate or len(candidate) > _MAX_NEW_BULLETS_CHARS:
-        return None
+    if not candidate:
+        return None, "reply_empty"
+    if len(candidate) > _MAX_NEW_BULLETS_CHARS:
+        return None, f"reply_chars_over_budget:{len(candidate)}"
 
     lines = candidate.splitlines()
-    if not lines or len(lines) > _MAX_NEW_BULLETS:
-        return None
+    if not lines:
+        return None, "reply_empty"
+    if len(lines) > _MAX_NEW_BULLETS:
+        return None, f"line_count_over_budget:{len(lines)}"
 
     existing_keys: set[str] = set()
     for existing_line in current_summary.splitlines():
@@ -95,24 +110,52 @@ def _validated_new_bullets(reply: Any, *, current_summary: str) -> str | None:
 
     new_keys: set[str] = set()
     normalized: list[str] = []
-    for line in lines:
+    for index, line in enumerate(lines):
         # No prose, alternate Markdown markers, blank bullets, or continuation
         # lines: every physical line must be one complete item.
         if not line.startswith("- "):
-            return None
+            return None, f"line_not_bullet:{index}"
         body = line[2:].strip()
-        if not body or len(body) > _MAX_NEW_BULLET_CHARS:
-            return None
+        if not body:
+            return None, f"bullet_body_empty:{index}"
+        if len(body) > _MAX_NEW_BULLET_CHARS:
+            return None, f"bullet_chars_over_budget:{len(body)}"
         key = _bullet_key(body)
-        if not key or key in existing_keys or key in new_keys:
-            return None
+        if not key:
+            return None, f"bullet_body_empty:{index}"
+        if key in existing_keys:
+            return None, f"duplicate_of_existing_summary:{index}"
+        if key in new_keys:
+            return None, f"duplicate_within_batch:{index}"
         new_keys.add(key)
         normalized.append(f"- {body}")
 
     rendered = "\n".join(normalized)
     if len(rendered) > _MAX_NEW_BULLETS_CHARS:
-        return None
+        return None, f"rendered_chars_over_budget:{len(rendered)}"
+    return rendered, ""
+
+
+def _validated_new_bullets(reply: Any, *, current_summary: str) -> str | None:
+    """Bullet-only append or ``None`` — see :func:`_validate_new_bullets`."""
+    rendered, _reject = _validate_new_bullets(
+        reply, current_summary=current_summary
+    )
     return rendered
+
+
+def _report_reject(reject_out: Callable[[str], None] | None, code: str) -> None:
+    """Hand one content-free reject code to the caller, never raising.
+
+    Diagnostics must not be able to fail a fold that would otherwise succeed,
+    nor mask the real outcome of one that failed.
+    """
+    if reject_out is None or not code:
+        return
+    try:
+        reject_out(code)
+    except Exception:
+        pass
 
 
 def _render_old_messages(old_messages: list[dict[str, Any]]) -> str:
@@ -131,6 +174,7 @@ async def compact(
     old_messages: list[dict[str, Any]],
     llm: Callable[..., Awaitable[Any]],
     usage_out: Callable[[dict | None], None] | None = None,
+    reject_out: Callable[[str], None] | None = None,
 ) -> str:
     """把 `old_messages` 折叠成新 bullet 行，append 到 `current_summary` 后返回。
 
@@ -161,8 +205,11 @@ async def compact(
     if usage_out is not None:
         usage_out(result.get("usage") if isinstance(result, dict) else None)
     raw_reply = result.get("reply") if isinstance(result, dict) else None
-    new_bullets = _validated_new_bullets(raw_reply, current_summary=current_summary)
+    new_bullets, reject = _validate_new_bullets(
+        raw_reply, current_summary=current_summary
+    )
     if new_bullets is None:
+        _report_reject(reject_out, reject)
         return current_summary
     if not current_summary.strip():
         return new_bullets
@@ -176,6 +223,7 @@ async def compact_segment(
     old_messages: list[dict[str, Any]],
     llm: Callable[..., Awaitable[Any]],
     usage_out: Callable[[dict | None], None] | None = None,
+    reject_out: Callable[[str], None] | None = None,
 ) -> str | None:
     """Summarize one exact source batch into one immutable leaf payload.
 
@@ -206,7 +254,10 @@ async def compact_segment(
     if usage_out is not None:
         usage_out(result.get("usage") if isinstance(result, dict) else None)
     raw_reply = result.get("reply") if isinstance(result, dict) else None
-    return _validated_new_bullets(raw_reply, current_summary="")
+    rendered, reject = _validate_new_bullets(raw_reply, current_summary="")
+    if rendered is None:
+        _report_reject(reject_out, reject)
+    return rendered
 
 
 async def compact_checkpoint(
@@ -215,6 +266,7 @@ async def compact_checkpoint(
     child_summaries: list[str],
     llm: Callable[..., Awaitable[Any]],
     usage_out: Callable[[dict | None], None] | None = None,
+    reject_out: Callable[[str], None] | None = None,
     max_source_chars: int = _DEFAULT_CHECKPOINT_SOURCE_CHARS,
 ) -> str | None:
     """Create one immutable parent for an exact ordered child list.
@@ -275,7 +327,10 @@ async def compact_checkpoint(
         if usage_out is not None:
             usage_out(result.get("usage") if isinstance(result, dict) else None)
         raw_reply = result.get("reply") if isinstance(result, dict) else None
-        return _validated_new_bullets(raw_reply, current_summary="")
+        rendered, reject = _validate_new_bullets(raw_reply, current_summary="")
+        if rendered is None:
+            _report_reject(reject_out, reject)
+        return rendered
 
     def _fragments(text: str) -> list[str]:
         """Split without dropping or reordering any source character."""

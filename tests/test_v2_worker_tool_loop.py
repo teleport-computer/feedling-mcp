@@ -820,7 +820,7 @@ def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
     )
 
 
-def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
+def test_new_turn_after_intermediate_failure_starts_after_failure_cursor(
     monkeypatch,
 ):
     """An assistant-only prompt snapshot advance cannot poison the final fence.
@@ -967,20 +967,29 @@ def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
         )
     )
     assert first_status == "failed"
-    assert v2_cursor.load_seq(core_store.get_store(uid)) == 0
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == user_seq
     with db.get_pool().connection() as conn:
-        intermediate_seq = conn.execute(
+        assistant_rows = conn.execute(
             "SELECT MAX(seq) FROM chat_messages "
             "WHERE user_id=%s AND doc->>'role'='openclaw'",
             (uid,),
         ).fetchone()[0]
-    assert int(intermediate_seq) > user_seq
+        failure_rows = conn.execute(
+            "SELECT COUNT(*) FROM chat_messages "
+            "WHERE user_id=%s AND COALESCE(doc->>'terminal_failure_job_id','')=%s",
+            (uid, str(first_job_id)),
+        ).fetchone()[0]
+    assert int(assistant_rows) > user_seq
+    assert failure_rows == 1
 
     phase = "retry"
-    retry_job_id, _ = jobs_store.enqueue_job(
+    new_user_seq, retry_job_id = db.chat_append_and_enqueue(
         uid,
+        "user-after-failure",
+        20.0,
+        _user_doc("user-after-failure", "please try once more"),
+        5000,
         "chat",
-        reason="retry_after_worker_crash",
         expected_generation=generation,
     )
     retry_job = jobs_store.claim_next_job("w-intermediate-retry")
@@ -999,7 +1008,8 @@ def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
     assert retry_status == "completed"
     assert len(retry_messages) == 1
     assert "I am still checking." in str(retry_messages[0])
-    assert v2_cursor.load_seq(core_store.get_store(uid)) == user_seq
+    assert "please try once more" in str(retry_messages[0])
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == new_user_seq
     assert _job_status_row(retry_job_id) == ("completed", None)
     with db.get_pool().connection() as conn:
         final_effect = conn.execute(
@@ -1017,8 +1027,8 @@ def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
             "WHERE user_id=%s AND doc->>'role'='openclaw'",
             (uid,),
         ).fetchone()[0]
-    assert final_effect == ("applied", "", user_seq)
-    assert int(final_seq) > int(intermediate_seq)
+    assert final_effect == ("applied", "", new_user_seq)
+    assert int(final_seq) > int(assistant_rows)
 
 
 @pytest.mark.parametrize(
