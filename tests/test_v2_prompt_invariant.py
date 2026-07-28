@@ -1026,3 +1026,99 @@ def test_oversized_row_still_fails_closed_when_quarantine_is_off(monkeypatch):
         asyncio.run(worker._ensure_prompt_coverage(
             uid, deps, provider_config=_BYOK, enclave_sem=None,
             tail_limit=tail_limit, max_retries=3))
+
+
+def test_quarantine_never_claims_a_seq_the_user_does_not_own(monkeypatch):
+    """The seq written into a quarantine segment must come from the DB.
+
+    `chat_messages.seq` is a table-wide identity shared by every user, and a
+    segment's seq range is an immutable coverage claim. On test (2026-07-28) a
+    reader row produced seq 20090 while the user's oldest row was 20091 and
+    20090 belonged to no row at all; the resulting segment made
+    `validate_canonical_frontier` fail on EVERY later turn — strictly worse
+    than the stall it escaped. Trusting the reader's row shape here is the bug.
+    """
+    uid = "u_prompt_inv_q_seq"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 25, 10
+    messages = _seed_messages(uid, n)
+    seeded = _seed_summary(uid, covers=5, messages=messages, summary="- old")
+    real_head_seq = next(m["seq"] for m in messages if m["seq"] > seeded)
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+
+    def _lying_reader(uid_, after, limit):
+        """Same rows, but every seq is off by one — the shape seen on test."""
+        rows = read_compaction_tail(uid_, after, limit)
+        return [dict(r, seq=int(r["seq"]) - 1) if r.get("seq") else dict(r)
+                for r in rows]
+
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=_lying_reader,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    ok = asyncio.run(worker._quarantine_unfoldable_head(
+        uid, deps,
+        enclave_sem=None,
+        seq_callbacks=False,
+        watermark_seq=seeded,
+        compact_through_seq=None,
+        reject_code="line_not_bullet:0",
+        within_deadline=lambda start: start(),
+        renew_lease=_noop_async,
+    ))
+
+    assert ok is True
+    row = jobs_store.get_summary_row(uid)
+    # The authoritative seq, not the reader's lie.
+    assert row["watermark_seq"] == real_head_seq
+    assert row["watermark_seq"] > seeded
+
+
+def test_quarantine_refuses_a_row_at_or_behind_the_watermark(monkeypatch):
+    """A stale head must not rewrite coverage that is already claimed."""
+    uid = "u_prompt_inv_q_stale"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 25, 10
+    messages = _seed_messages(uid, n)
+    seeded = _seed_summary(uid, covers=5, messages=messages, summary="- old")
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+
+    def _stale_reader(uid_, after, limit):
+        # Hand back a row that is already covered by the watermark.
+        return [dict(messages[0])]
+
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=_stale_reader,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    ok = asyncio.run(worker._quarantine_unfoldable_head(
+        uid, deps,
+        enclave_sem=None,
+        seq_callbacks=False,
+        watermark_seq=seeded,
+        compact_through_seq=None,
+        reject_code="line_not_bullet:0",
+        within_deadline=lambda start: start(),
+        renew_lease=_noop_async,
+    ))
+
+    assert ok is False
+    assert jobs_store.get_summary_row(uid)["watermark_seq"] == seeded

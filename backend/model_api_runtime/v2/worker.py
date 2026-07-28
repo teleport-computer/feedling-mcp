@@ -5086,17 +5086,28 @@ async def _quarantine_unfoldable_head(
         return False
 
     row = head[0]
-    row_seq = row.get("seq")
-    if row_seq is None:
-        row_id = row.get("id")
-        if row_id is None:
-            return False
+    # Resolve the seq from chat_messages by (user_id, msg_id) rather than
+    # trusting whatever the decrypted reader row carries. This value becomes
+    # an IMMUTABLE coverage claim, and `chat_messages.seq` is a table-wide
+    # identity shared by every user: a segment claiming a seq this user does
+    # not own permanently breaks `validate_canonical_frontier`, failing every
+    # later turn — strictly worse than the stall being escaped. Caught on test
+    # 2026-07-28, where a reader row produced 20090 while the user's oldest
+    # row was 20091 and 20090 belonged to no row at all.
+    row_id = row.get("id")
+    row_seq = None
+    if row_id is not None:
         row_seq = await within_deadline(
             lambda: asyncio.to_thread(db.chat_seq_for_msg_id, user_id, row_id)
         )
     if row_seq is None:
         return False
     row_seq = int(row_seq)
+    if row_seq <= int(watermark_seq):
+        # Not actually the head of the backlog (a concurrent compactor moved
+        # the frontier, or the reader handed back a stale row). Advancing here
+        # would rewrite coverage that is already claimed.
+        return False
     row_ts = row["ts"]
     text = _quarantine_segment_text(reject_code)
 
