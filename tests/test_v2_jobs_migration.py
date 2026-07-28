@@ -255,6 +255,22 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0062_v2_failure_reply").down_revision == (
         "0061_v2_adaptive_tail_metrics"
     )
+    assert script.get_revision("0063_tee_sync_snapshot_metrics").down_revision == (
+        "0062_v2_failure_reply"
+    )
+    assert set(script.get_revision("0064_merge_legacy_chat_activity").down_revision) == {
+        "0063_tee_sync_snapshot_metrics",
+        "0059_chat_activity_lookup_idx",
+    }
+    assert script.get_revision("0065_chat_activity_lookup_idx").down_revision == (
+        "0064_merge_legacy_chat_activity"
+    )
+    assert script.get_revision("0066_model_api_vision_route").down_revision == (
+        "0065_chat_activity_lookup_idx"
+    )
+    assert script.get_revision("0067_voice_turn_state").down_revision == (
+        "0066_model_api_vision_route"
+    )
     # 刻意不断言 head 的具体 revision 名：每合入一个 migration 就要回来改这一行，
     # 而"当前 head 叫什么"本身没有约束价值。真正要防的"链分叉成多头"已由
     # tests/test_genesis_worker_claim_migration.py::test_alembic_single_head 专门守着。

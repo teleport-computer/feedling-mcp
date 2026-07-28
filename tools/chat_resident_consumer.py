@@ -114,7 +114,7 @@ import urllib.parse
 import xml.etree.ElementTree as _ET
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -3707,8 +3707,8 @@ def _reply_from_json_obj(obj: Any) -> str:
     if marker in _JSON_NON_FINAL_EVENTS:
         return ""
 
-    for field in _JSON_REPLY_FIELDS:
-        value = obj.get(field)
+    for field_name in _JSON_REPLY_FIELDS:
+        value = obj.get(field_name)
         if isinstance(value, str) and value.strip():
             return value.strip()
         if isinstance(value, (dict, list)):
@@ -4717,6 +4717,130 @@ def _pi_turn_from_stream(raw: str) -> tuple[str, str]:
     return reply, "\n\n".join(thinking)
 
 
+def _pi_message_text(message: Any) -> str:
+    if not isinstance(message, dict) or str(message.get("role") or "") != "assistant":
+        return ""
+    texts: list[str] = []
+    for block in message.get("content") or []:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        value = block.get("text")
+        if isinstance(value, str) and value:
+            texts.append(value)
+    return "\n\n".join(texts)
+
+
+class _PiStreamObserver:
+    """Project Pi's cumulative JSONL snapshots into monotonic answer segments."""
+
+    def __init__(self, publish: Callable[[int, str, bool], None]):
+        self._publish = publish
+        self._segment = -1
+        self._seen: dict[int, str] = {}
+
+    def feed(self, line: str) -> None:
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if not isinstance(event, dict):
+            return
+        event_type = str(event.get("type") or "")
+        message = event.get("message")
+        if event_type == "message_start":
+            if isinstance(message, dict) and str(message.get("role") or "") == "assistant":
+                self._segment += 1
+            return
+        if event_type not in {"message_update", "message_end"}:
+            return
+        text = _pi_message_text(message)
+        if not text:
+            return
+        if self._segment < 0:
+            self._segment = 0
+        previous = self._seen.get(self._segment, "")
+        if text == previous:
+            return
+        # Pi updates are full text-so-far snapshots. Ignore non-monotonic rewrites:
+        # speech already emitted by ElevenLabs cannot be retracted.
+        if previous and not text.startswith(previous):
+            return
+        self._seen[self._segment] = text
+        self._publish(self._segment, text, event_type == "message_end")
+
+
+def _run_cli_subprocess(
+    cmd: list[str],
+    run_kwargs: dict,
+    *,
+    stdout_line: Callable[[str], None] | None = None,
+) -> subprocess.CompletedProcess:
+    if stdout_line is None:
+        return subprocess.run(cmd, **run_kwargs)
+
+    kwargs = dict(run_kwargs)
+    input_text = kwargs.pop("input", None)
+    timeout = kwargs.pop("timeout", None)
+    kwargs.pop("capture_output", None)
+    process = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1,
+        **kwargs,
+    )
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+
+    def _drain(stream, sink: list[str], callback=None) -> None:
+        if stream is None:
+            return
+        for line in iter(stream.readline, ""):
+            sink.append(line)
+            if callback is not None:
+                callback(line)
+        stream.close()
+
+    stdout_thread = threading.Thread(
+        target=_drain,
+        args=(process.stdout, stdout_parts, stdout_line),
+        name="feedling-agent-stdout",
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_drain,
+        args=(process.stderr, stderr_parts),
+        name="feedling-agent-stderr",
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    if process.stdin is not None:
+        try:
+            process.stdin.write(str(input_text or ""))
+        finally:
+            process.stdin.close()
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        process.wait()
+        stdout_thread.join(timeout=1.0)
+        stderr_thread.join(timeout=1.0)
+        exc.stdout = "".join(stdout_parts)
+        exc.stderr = "".join(stderr_parts)
+        raise
+    stdout_thread.join(timeout=1.0)
+    stderr_thread.join(timeout=1.0)
+    return subprocess.CompletedProcess(
+        cmd,
+        returncode,
+        stdout="".join(stdout_parts),
+        stderr="".join(stderr_parts),
+    )
+
+
 def _pi_display_thinking_summary(text: str) -> str:
     """Project one provider thinking block into its own short step heading."""
     value = str(text or "").replace("\r\n", "\n").strip()
@@ -5519,8 +5643,8 @@ def _extract_session_id(raw: str) -> str:
 
 def _session_id_from_obj(obj: Any) -> str:
     if isinstance(obj, dict):
-        for field in ("session_id", "sessionId", "session"):
-            value = obj.get(field)
+        for field_name in ("session_id", "sessionId", "session"):
+            value = obj.get(field_name)
             if isinstance(value, str) and value.strip():
                 return value.strip()
         for value in obj.values():
@@ -6542,6 +6666,7 @@ def call_agent_cli(
     trace_id: str = "",
     lane: str = "background",
     attempt_trigger: str = "first",
+    stream_update: Callable[[int, str, bool], None] | None = None,
 ) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
@@ -6614,8 +6739,17 @@ def call_agent_cli(
     normalized_attempt_trigger = (
         attempt_trigger if attempt_trigger in _PROVIDER_ATTEMPT_TRIGGERS else "first"
     )
+    pi_stream = (
+        _PiStreamObserver(stream_update)
+        if stream_update is not None and _is_pi_cmd(cmd)
+        else None
+    )
     try:
-        result = subprocess.run(cmd, **_run_kwargs)
+        result = _run_cli_subprocess(
+            cmd,
+            _run_kwargs,
+            stdout_line=pi_stream.feed if pi_stream is not None else None,
+        )
     except subprocess.TimeoutExpired as exc:
         if ledger_enabled:
             def _timeout_text(value: Any) -> str:
@@ -6774,7 +6908,11 @@ def call_agent_cli(
             command_sid = _cli_flag_value(cmd, "--session-id")
             if stdin_msg is not None:
                 _run_kwargs["input"] = stdin_msg
-            result = subprocess.run(cmd, **_run_kwargs)
+            result = _run_cli_subprocess(
+                cmd,
+                _run_kwargs,
+                stdout_line=pi_stream.feed if pi_stream is not None else None,
+            )
             if ledger_enabled:
                 _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
                     cmd,
@@ -6827,7 +6965,11 @@ def call_agent_cli(
                 summary="pi stream cut; single retry",
                 explain="上游把流式回复中途掐断(无 finish_reason)——立即重试本轮一次",
             )
-            result = subprocess.run(cmd, **_run_kwargs)
+            result = _run_cli_subprocess(
+                cmd,
+                _run_kwargs,
+                stdout_line=pi_stream.feed if pi_stream is not None else None,
+            )
             if ledger_enabled:
                 _queue_provider_attempt_ledger(_provider_attempt_rows_for_result(
                     cmd,
@@ -7125,6 +7267,7 @@ def call_agent(
     trace_id: str = "",
     lane: str = "background",
     attempt_trigger: str = "first",
+    stream_update: Callable[[int, str, bool], None] | None = None,
 ) -> Any:
     def _invoke() -> Any:
         if AGENT_MODE == "http":
@@ -7135,7 +7278,8 @@ def call_agent(
         if AGENT_MODE == "cli":
             return call_agent_cli(
                 message, image_paths=image_paths, raw_text=raw_text,
-                trace_id=trace_id, lane=lane, attempt_trigger=attempt_trigger)
+                trace_id=trace_id, lane=lane, attempt_trigger=attempt_trigger,
+                stream_update=stream_update)
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
     raw = _call_with_resident_busy_poll(_invoke, lane=lane)
@@ -7877,9 +8021,9 @@ def execute_agent_actions(actions: list[dict]) -> dict:
             # actual JSON body sent to the server, not just this read-only
             # validation check.
             effective_patch = dict(patch_dict) if patch_dict is not None else {}
-            for field in _card_policy.PROFILE_FIELDS:
-                if field in action and field not in effective_patch:
-                    effective_patch[field] = action[field]
+            for field_name in _card_policy.PROFILE_FIELDS:
+                if field_name in action and field_name not in effective_patch:
+                    effective_patch[field_name] = action[field_name]
             pairing_ok, pairing_err = _card_policy.validate_rename_pairing(effective_patch)
             if not pairing_ok:
                 log.warning(
@@ -9083,6 +9227,99 @@ def execute_scheduled_wake_actions(actions: list[dict], job: dict) -> dict:
     resp.raise_for_status()
     parsed = resp.json()
     return parsed if isinstance(parsed, dict) else {"results": []}
+
+
+class _VoiceDeltaPublisher:
+    """Throttle Pi snapshots before handing them to the encrypted voice stream."""
+
+    def __init__(self, parent_message_id: str):
+        self.parent_message_id = parent_message_id
+        self._published: dict[int, str] = {}
+        self._last_post_at = 0.0
+        self._warned = False
+
+    def __call__(self, segment: int, text: str, final: bool) -> None:
+        previous = self._published.get(segment, "")
+        if previous and not text.startswith(previous):
+            return
+        if text == previous:
+            return
+        now = time.monotonic()
+        appended = text[len(previous) :] if text.startswith(previous) else text
+        sentence_boundary = bool(re.search(r"[。！？!?，,；;：:\n]$", text))
+        if not final:
+            if not previous and len(text.strip()) < 2:
+                return
+            if (
+                now - self._last_post_at < 0.18
+                and len(appended) < 8
+                and not sentence_boundary
+            ):
+                return
+        try:
+            response = _HTTP.post(
+                f"{FEEDLING_API_URL}/v1/internal/voice/delta",
+                json={
+                    "parent_message_id": self.parent_message_id,
+                    "segment": segment,
+                    "text": text,
+                    "final": False,
+                },
+                headers=_HEADERS,
+                timeout=3.0,
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(f"status={response.status_code}")
+        except Exception as exc:
+            if not self._warned:
+                log.warning(
+                    "voice stream handoff unavailable parent=%s type=%s",
+                    self.parent_message_id[:12],
+                    type(exc).__name__,
+                )
+                self._warned = True
+            return
+        self._published[segment] = text
+        self._last_post_at = now
+
+    def complete(self) -> None:
+        if not self._published:
+            return
+        segment = max(self._published)
+        text = self._published[segment]
+        try:
+            response = _HTTP.post(
+                f"{FEEDLING_API_URL}/v1/internal/voice/delta",
+                json={
+                    "parent_message_id": self.parent_message_id,
+                    "segment": segment,
+                    "text": text,
+                    "final": True,
+                },
+                headers=_HEADERS,
+                timeout=3.0,
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(f"status={response.status_code}")
+        except Exception as exc:
+            if not self._warned:
+                log.warning(
+                    "voice stream completion unavailable parent=%s type=%s",
+                    self.parent_message_id[:12],
+                    type(exc).__name__,
+                )
+                self._warned = True
+
+
+def _voice_delta_publisher(message: dict) -> _VoiceDeltaPublisher | None:
+    call_id = str(message.get("voice_call_id") or "").strip()
+    turn_id = str(message.get("voice_turn_id") or "").strip()
+    parent_message_id = str(
+        message.get("id") or message.get("message_id") or ""
+    ).strip()
+    if not call_id or not turn_id or not parent_message_id:
+        return None
+    return _VoiceDeltaPublisher(parent_message_id)
 
 
 def post_reply(
@@ -12461,6 +12698,7 @@ def _process_messages(messages: list) -> float:
             log.info("user message [ts=%.3f]: %s", ts, content[:80])
 
         trace_id = str(msg.get("id") or msg.get("message_id") or "").strip()
+        voice_stream_update = _voice_delta_publisher(msg)
         attempt_trigger = str(msg.get("_provider_attempt_trigger") or "first")
         if attempt_trigger not in _PROVIDER_ATTEMPT_TRIGGERS:
             attempt_trigger = "first"
@@ -12573,6 +12811,7 @@ def _process_messages(messages: list) -> float:
                 agent_result = call_agent(
                     _resident_foreground_chat_message_v2(content),
                     trace_id=trace_id, lane="chat",
+                    stream_update=voice_stream_update,
                     **attempt_kwargs)
             elif image_payloads or image_paths:
                 agent_result = call_agent(
@@ -12581,6 +12820,7 @@ def _process_messages(messages: list) -> float:
                     image_paths=image_paths,
                     trace_id=trace_id,
                     lane="chat",
+                    stream_update=voice_stream_update,
                     **attempt_kwargs,
                 )
             else:
@@ -12588,6 +12828,7 @@ def _process_messages(messages: list) -> float:
                     content,
                     trace_id=trace_id,
                     lane="chat",
+                    stream_update=voice_stream_update,
                     **attempt_kwargs,
                 )
         except Exception as e:
@@ -12627,6 +12868,8 @@ def _process_messages(messages: list) -> float:
             # success.
             if not vision_observer_failed:
                 _commit_io_cli_catalog_injection()
+            if voice_stream_update is not None:
+                voice_stream_update.complete()
             if not vision_observer_failed and _consume_reply_parse_failed():
                 pending_failure_notice = ValueError(
                     "agent produced no usable reply after sanitization"
@@ -13648,6 +13891,7 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
     from genesis import worker as genesis_worker  # lazy: heavy import only when a job runs
     from genesis.llm_client import GenesisLLMClient
     import provider_client
+
     llm = GenesisLLMClient(completion_fn=_genesis_agent_completion_fn, persist_output=False)
     runtime = provider_client.ProviderConfig(provider="resident_agent", model="local", api_key="")
     uid = str(_whoami_cache.get("user_id") or "resident")

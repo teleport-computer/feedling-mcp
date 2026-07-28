@@ -115,6 +115,7 @@ if not _provisioned:
         "test_chat_idempotency_unit.py",
         "test_chat_activity_projection.py",
         "test_chat_turn_activity_unit.py",
+        "test_access_mode_runtime_sync_unit.py",
         "test_semantic_analysis.py",
         "test_proactive_runtime_v2.py",
         "test_proactive_observability_v2.py",

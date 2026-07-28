@@ -42,7 +42,13 @@ def access_modes_switch(store: UserStore, payload: dict):
     mode = registry._normalize_access_mode(str(payload.get("access_mode") or payload.get("route") or ""))
     if mode not in registry.ACCESS_MODES:
         return {"error": "access_mode must be resident, model_api, or official_import"}, 400
+    previous_mode = onboarding._load_onboarding_route(store)
     data = onboarding._save_onboarding_route(store, mode)
+    try:
+        _sync_hosted_runtime_for_access_mode(store, mode)
+    except Exception:
+        onboarding._save_onboarding_route(store, previous_mode)
+        return {"error": "runtime_control_unavailable"}, 503
     with registry._users_lock:
         user_entry = registry._find_user_entry_locked(store.user_id)
         if user_entry:
@@ -50,6 +56,20 @@ def access_modes_switch(store: UserStore, payload: dict):
             registry.persist_user(user_entry)
     print(f"[access:{store.user_id}] active_route={data['route']}")
     return accounts_access._access_modes_payload(store), 200
+
+
+def _sync_hosted_runtime_for_access_mode(store: UserStore, mode: str) -> None:
+    from hosted import config_store
+
+    if mode == "model_api":
+        if config_store.load_active_route(store) is None:
+            return
+        target = config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
+    elif mode == "resident":
+        target = config_store.HOSTED_RUNTIME_MODE_RESIDENT
+    else:
+        return
+    config_store.set_hosted_runtime_mode(store, target)
 
 
 def access_link_token_create(store: UserStore, payload: dict):

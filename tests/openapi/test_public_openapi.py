@@ -183,8 +183,10 @@ def test_public_operation_and_parameter_inventory(
     # 153 and 70 bodies since V1 resident tool-activity event ingest.
     # Vision routing adds GET/PUT/POST config, POST route test, and the
     # authenticated resident observer exchange; three mutations carry bodies.
-    assert len(operations) == 158
-    assert sum("requestBody" in operation for operation in operations.values()) == 73
+    # 160 since the voice session and OpenAI-compatible Custom LLM endpoints;
+    # both accept compatibility JSON envelopes, hence 73 -> 75 bodies.
+    assert len(operations) == 160
+    assert sum("requestBody" in operation for operation in operations.values()) == 75
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")

@@ -59,6 +59,7 @@ _ASGI_PACKAGES = (
     "hosted.onboarding_validation_asgi",
     "notices.routes_asgi",
     "notify_relay.routes_asgi",
+    "voice.routes_asgi",
 )
 
 # Disable the auto OpenAPI/docs routes so the ASGI route surface is exactly the
@@ -134,13 +135,16 @@ for _mod_name in _ASGI_PACKAGES:
 # unwired, so Live Activity identity and admin data-track import/validation
 # stats were silently empty in production.
 from admin import data_track as _admin_data_track  # noqa: E402
+from chat import chat_core as _chat_core  # noqa: E402
 from hosted import onboarding_validation as _hosted_onboarding_validation  # noqa: E402
 from identity import service as _identity_service  # noqa: E402
 from model_api_runtime.v2 import jobs_store as _v2_jobs_store  # noqa: E402
 from push import live_activity as _push_live_activity  # noqa: E402
+from voice import results as _voice_results  # noqa: E402
 
 _push_live_activity.load_identity = _identity_service._load_identity
 _admin_data_track._latest_history_import_job = _hosted_onboarding_validation._latest_history_import_job
 _admin_data_track._onboarding_validation_payload = _hosted_onboarding_validation._onboarding_validation_payload
 _admin_data_track._runtime_token_usage_summary = _v2_jobs_store.recent_token_usage_summary
 _admin_data_track._runtime_health_summary = _v2_jobs_store.recent_runtime_health
+_chat_core.publish_voice_reply = _voice_results.store_reply_for_parent

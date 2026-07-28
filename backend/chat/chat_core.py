@@ -50,6 +50,15 @@ from push import service as push_service
 
 log = logging.getLogger(__name__)
 
+
+def _ignore_voice_reply(*_args, **_kwargs) -> bool:
+    return False
+
+
+# Assembly injects voice.results.store_reply_for_parent. Keeping the seam here
+# avoids making the foundational chat package depend on the voice feature.
+publish_voice_reply = _ignore_voice_reply
+
 _ENVELOPE_REQUIRED = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
 _FILE_NAME_BIDI_CONTROLS = frozenset(
     chr(code) for code in (*range(0x202A, 0x202F), *range(0x2066, 0x206A))
@@ -1101,6 +1110,21 @@ def write_response(
         updated = store.update_chat_message_metadata(msg["id"], delivery_fields)
         if updated:
             msg = updated
+    voice_text = (push_body or alert_body).strip()
+    if reply_to_message_id and voice_text:
+        try:
+            publish_voice_reply(
+                store.user_id,
+                parent_message_id=reply_to_message_id,
+                message_id=str(msg.get("id") or ""),
+                text=voice_text,
+            )
+        except Exception as exc:  # noqa: BLE001 — persisted reply remains authoritative
+            log.warning(
+                "[voice.gateway] resident reply publish failed user=%s type=%s",
+                store.user_id,
+                type(exc).__name__,
+            )
     debug_trace.trace_event(
         store,
         subsystem="route",

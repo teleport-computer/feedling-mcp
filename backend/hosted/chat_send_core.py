@@ -30,12 +30,23 @@ from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import kill_switch
 
 
+def _voice_metadata(voice_context: dict | None) -> dict[str, str]:
+    if not isinstance(voice_context, dict):
+        return {}
+    call_id = str(voice_context.get("call_id") or "").strip()
+    turn_id = str(voice_context.get("turn_id") or "").strip()
+    if not call_id or not turn_id or len(call_id) > 96 or len(turn_id) > 128:
+        return {}
+    return {"voice_call_id": call_id, "voice_turn_id": turn_id}
+
+
 def model_api_chat_send_core(
     store,
     *,
     api_key: str | None,
     runtime_tok: str,
     payload: dict,
+    voice_context: dict | None = None,
 ) -> tuple[dict, int]:
     """Run a hosted chat send. Returns ``(body, status)``; the caller renders it.
 
@@ -145,6 +156,7 @@ def model_api_chat_send_core(
                 file_parse=file_parse,
                 context_refs=context_refs,
                 client_msg_id=client_msg_id,
+                voice_context=voice_context,
             )
         else:
             debug_trace.trace_event(
@@ -247,7 +259,7 @@ def model_api_chat_send_core(
     except agent_runtime_cutover.UnsupportedProviderError:
         return {"error": "provider_not_configured"}, 409
 
-    extra: dict = {}
+    extra: dict = _voice_metadata(voice_context)
     if client_msg_id is not None:
         # Plain routing metadata only; the message body remains ciphertext.
         # The database uses this UUID to serialize iOS transport retries across
@@ -361,6 +373,7 @@ def _send_resident(
     file_parse,
     context_refs,
     client_msg_id,
+    voice_context: dict | None = None,
 ) -> tuple[dict, int]:
     """Restored V1 resident send path (dual policy, ``resident_cli``/``resident``).
 
@@ -437,7 +450,7 @@ def _send_resident(
         )
         return {"error": "hosting_runtime_unavailable", "reason": reason}, 503
 
-    extra: dict = {}
+    extra: dict = _voice_metadata(voice_context)
     if has_image and image_mime:
         extra["image_mime"] = image_mime
     if has_image and vision_route_id:
