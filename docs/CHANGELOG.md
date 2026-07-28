@@ -170,6 +170,14 @@ tail 预算 20→50 是更上游的一刀：**它决定一个 turn 是否进入�
 32768 的时期，07-25 12:31 已改为 131072。若将来有用户自配小 context_window 或中转
 真实窗口偏小，这两个值仍是首先要回调的旋钮（都是 `${VAR:-}` 形式，改 env 即可）。
 
+**[FIX] 这些旋钮的 `-e` 接线补齐（2026-07-28）**。之前只把它们写进了 compose，
+CI 的 `phala deploy` 没传值，等于**只能用默认值**——"改 env 就能救急"这句话当时并
+不成立。现在三个环境的 5 个旋钮（batch msgs/chars、catchup deadline、tail budget、
+quarantine 开关）都接了 `-e` + `vars.<ENV>_<KNOB>`。刻意不写 `|| 默认值`：repo var
+未设时必须传空，让 compose 的 `${VAR:-默认}` 生效；设了才覆盖。这也是确定性复现
+隔离路径的前提——把 `COMPACTION_BATCH_CHARS` 临时调到几百，任何一条消息都能触发
+超预算隔离，不必去凑一个 R2 大文件。
+
 **[ADD] `tools/v2_user_triage.py`** —— 把这次的排查路径固化成一条命令（只读、不
 解密）：runtime / jobs / metrics / summary / backlog head / trajectory / provider
 ledger / peers。四个判据是事故的直接产物：水位停滞时长、队头 R2 指针是否超批次
