@@ -4900,17 +4900,26 @@ async def _unsummarized_count(
     scoped by ``user_id``. Replaces the old ``max_seq - watermark_seq``
     global-seq-span estimate — see ``_gap_from_count``'s docstring for why
     that was wrong."""
+    # Exclude GC-able synthetic rows (verify_ping/resident_maintenance) from the
+    # gap: the fold reader (serve_worker._read_compaction_tail_after_seq) and
+    # both frontier witnesses exclude them, so the gap/coverage math must too —
+    # otherwise a lone synthetic row after the watermark reports a phantom gap
+    # that no fold can close (its row is never returned to be folded), and the
+    # post-assembly _assert_prompt_covers would raise on a row that is not a
+    # real coverage hole.
     if through_seq is None:
         return await asyncio.to_thread(
             db.count_messages_after_seq,
             user_id,
             watermark_seq,
+            exclude_synthetic_sources=True,
         )
     return await asyncio.to_thread(
         db.count_messages_after_seq,
         user_id,
         watermark_seq,
         through_seq=through_seq,
+        exclude_synthetic_sources=True,
     )
 
 

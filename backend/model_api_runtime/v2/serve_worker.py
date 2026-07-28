@@ -861,6 +861,7 @@ def _read_tail_window_after_seq(
     oldest_first: bool,
     through_seq: int | None = None,
     include_capture_metadata: bool = False,
+    exclude_synthetic_sources: bool = False,
 ) -> list[dict]:
     """Strict bounded two-role prompt window selected by exact seq identity."""
     rows = db.chat_messages_after_seq(
@@ -869,6 +870,7 @@ def _read_tail_window_after_seq(
         limit=(int(limit) if limit is not None else None),
         oldest_first=oldest_first,
         through_seq=through_seq,
+        exclude_synthetic_sources=exclude_synthetic_sources,
     )
     return _decrypt_chat_rows(
         user_id,
@@ -915,6 +917,13 @@ def _read_compaction_tail_after_seq(
         # and internal rows from provider disclosure; ordinary chat readers
         # retain their existing exact output contract.
         include_capture_metadata=True,
+        # The compaction fold turns these rows into an IMMUTABLE coverage
+        # claim, so a GC-able synthetic row (verify_ping/resident_maintenance)
+        # must never be folded — deleting it later permanently corrupts the
+        # frontier. The gap counter and both witnesses exclude the same set.
+        # (The verbatim tail reader, _read_tail_after_seq, does NOT exclude
+        # them: it only displays recent rows and never freezes coverage.)
+        exclude_synthetic_sources=True,
     )
 
 

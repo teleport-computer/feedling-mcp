@@ -4480,7 +4480,15 @@ def get_summary_frontier_state(user_id) -> dict | None:
                     cur.execute(
                         "SELECT COALESCE(MIN(seq),0) AS first_seq,"
                         "COUNT(*) AS source_count FROM chat_messages "
-                        "WHERE user_id=%s AND seq>%s AND seq<=%s",
+                        "WHERE user_id=%s AND seq>%s AND seq<=%s "
+                        # GC-able synthetic rows (verify_ping/resident_maintenance,
+                        # see db.chat_messages_after_seq) never enter the fold, so
+                        # they must be excluded from the canonical witness too —
+                        # otherwise deleting one leaves the leaf's frozen source
+                        # count above this live count and every later turn fails
+                        # validate_canonical_frontier.
+                        "AND COALESCE(doc->>'source','') "
+                        "NOT IN ('verify_ping','resident_maintenance')",
                         (user_id, opaque_through, watermark_seq),
                     )
                     witness = cur.fetchone()
@@ -4553,10 +4561,19 @@ def append_summary_leaf_cas(
 
                 # Exact retained-row witness: a seq range may contain other
                 # users' global identities, so count only this user's rows.
+                # GC-able synthetic rows (verify_ping/resident_maintenance) are
+                # excluded here for the same reason the fold reader and the
+                # read-time witness exclude them: a leaf must never claim
+                # coverage of a row a later verify_loop deletes (permanent
+                # v2_summary_frontier_integrity_error). This write-time witness
+                # must count the SAME set the fold saw, or a correct
+                # synthetic-excluded leaf would be refused here.
                 cur.execute(
                     "SELECT COALESCE(MIN(seq),0) AS first_seq,"
                     "COALESCE(MAX(seq),0) AS last_seq,COUNT(*) AS n "
-                    "FROM chat_messages WHERE user_id=%s AND seq>%s AND seq<=%s",
+                    "FROM chat_messages WHERE user_id=%s AND seq>%s AND seq<=%s "
+                    "AND COALESCE(doc->>'source','') "
+                    "NOT IN ('verify_ping','resident_maintenance')",
                     (user_id, previous, end),
                 )
                 source = cur.fetchone()

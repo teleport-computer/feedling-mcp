@@ -594,3 +594,97 @@ def test_frontier_survives_any_mix_of_fold_failures(monkeypatch, seed):
     for seg in validated:
         if seg.coverage_kind == "exact" and seg.source_message_count == 1:
             assert seg.start_seq == seg.end_seq
+
+
+# --- verify_ping / resident_maintenance synthetic rows must never enter the
+# --- immutable summary coverage (found on test 2026-07-28) -----------------
+# A `verify_ping`/`resident_maintenance` row IS stored in `chat_messages`
+# (see core/store.py), but a verify_ping is DELETED once /v1/chat/verify_loop
+# completes. If the compaction fold folds one into an immutable level-0 leaf,
+# its seq becomes a permanent coverage claim; the moment the row is GC'd the
+# canonical witness (a LIVE `COUNT`/`MIN` over `chat_messages`) stops matching
+# the leaf's frozen `source_message_count`/`start_seq`, so
+# `validate_canonical_frontier` raises `v2_summary_frontier_integrity_error` on
+# EVERY later turn — the permanent multi-turn brick reproduced end to end. These
+# rows must be invisible to the whole coverage machinery consistently: the fold
+# reader, the gap counter, and BOTH the write-time and read-time witnesses.
+
+
+def _append_row(uid: str, msg_id: str, ts: float, *, source: str | None = None) -> int:
+    doc = {"id": msg_id, "role": "user", "body_ct": f"ct-{msg_id}"}
+    if source is not None:
+        doc["source"] = source
+    db.chat_append_strict(uid, msg_id, ts, doc, core_store.MAX_CHAT_MESSAGES)
+    seq = db.chat_seq_for_msg_id(uid, msg_id)
+    assert seq is not None
+    return int(seq)
+
+
+def test_coverage_readers_exclude_synthetic_sources():
+    """`chat_messages_after_seq`/`count_messages_after_seq` opt out of the two
+    GC-able synthetic sources, so the fold never even sees a row that a later
+    verify_loop will delete out from under an immutable leaf. The default stays
+    all-inclusive for every non-coverage caller (reply coalescing, etc.)."""
+    uid = "u_coverage_excl_synthetic_readers"
+    _reset(uid)
+    _append_row(uid, f"{uid}-r0", 1.0)
+    _append_row(uid, f"{uid}-r1", 2.0)
+    _append_row(uid, f"{uid}-vp", 3.0, source="verify_ping")
+    _append_row(uid, f"{uid}-rm", 4.0, source="resident_maintenance")
+
+    # Default behaviour is unchanged: callers that must see every row still do.
+    assert len(db.chat_messages_after_seq(uid, 0)) == 4
+    assert db.count_messages_after_seq(uid, 0) == 4
+
+    # Coverage callers opt out of the synthetic rows.
+    real = db.chat_messages_after_seq(uid, 0, exclude_synthetic_sources=True)
+    assert [row["id"] for row in real] == [f"{uid}-r0", f"{uid}-r1"]
+    assert db.count_messages_after_seq(uid, 0, exclude_synthetic_sources=True) == 2
+
+
+def test_summary_leaf_survives_gc_of_a_folded_synthetic_row():
+    """The permanent-brick repro, at the store layer.
+
+    A leaf covering three REAL rows, with a `verify_ping` row interleaved in
+    its seq range, must (a) be writable — the write-time witness counts only
+    real rows, so `source_message_count=3` is accepted — and (b) keep passing
+    the production validator BOTH while the synthetic row is present AND after
+    verify_loop deletes it. Before the fix the write-time witness counted the
+    synthetic row (n=4 != 3, so the leaf was refused); and had it been written
+    the old way (folding the synthetic row in, count=4), the read witness would
+    mismatch the instant the row was GC'd — the brick this test pins down."""
+    uid = "u_summary_synthetic_row_gc"
+    _reset(uid)
+    r0 = _append_row(uid, f"{uid}-r0", 1.0)
+    r1 = _append_row(uid, f"{uid}-r1", 2.0)
+    _append_row(uid, f"{uid}-vp", 3.0, source="verify_ping")  # interleaved: r1 < vp < r2
+    r2 = _append_row(uid, f"{uid}-r2", 4.0)
+    assert r0 < r1 < r2
+
+    assert jobs_store.append_summary_leaf_cas(
+        uid,
+        summary_envelope={"plaintext": "- folded three real rows"},
+        start_seq=r0,
+        end_seq=r2,
+        source_message_count=3,
+        watermark_ts=4.0,
+        expected_version=0,
+        previous_watermark_seq=0,
+    ), "a leaf covering only the real rows must be writable despite an interleaved synthetic row"
+
+    # Valid with the synthetic row still present (read witness excludes it)...
+    _assert_frontier_passes_production_validator(uid)
+
+    # ...verify_loop then deletes the synthetic ping...
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM chat_messages WHERE user_id=%s AND msg_id=%s",
+            (uid, f"{uid}-vp"),
+        )
+
+    # ...and the frontier is STILL valid: no v2_summary_frontier_integrity_error.
+    validated = _assert_frontier_passes_production_validator(uid)
+    covered = sum(
+        seg.source_message_count for seg in validated if seg.coverage_kind == "exact"
+    )
+    assert covered == 3

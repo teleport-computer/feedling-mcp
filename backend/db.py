@@ -5295,6 +5295,7 @@ def chat_messages_after_seq(
     limit: int | None = None,
     oldest_first: bool = True,
     through_seq: int | None = None,
+    exclude_synthetic_sources: bool = False,
 ) -> list[dict]:
     """Return one exact per-user ``seq`` window strictly after ``after_seq``.
 
@@ -5325,6 +5326,16 @@ def chat_messages_after_seq(
     if upper_seq is not None:
         predicate += " AND seq <= %s"
         params.append(upper_seq)
+    if exclude_synthetic_sources:
+        # Summary-coverage callers only. `verify_ping`/`resident_maintenance`
+        # rows are GC-able (a verify_ping is deleted once verify_loop completes,
+        # see core/store.py), so folding one into an immutable leaf leaves a
+        # coverage claim over a seq that later vanishes — the permanent
+        # `v2_summary_frontier_integrity_error` brick. The gap counter
+        # (count_messages_after_seq) and both frontier witnesses
+        # (jobs_store.get_summary_frontier_state / append_summary_leaf_cas)
+        # exclude the SAME set, so coverage stays consistent under GC.
+        predicate += " AND COALESCE(doc->>'source','') NOT IN ('verify_ping','resident_maintenance')"
     with get_pool().connection() as conn:
         if limit is None:
             rows = conn.execute(
@@ -5521,6 +5532,7 @@ def count_messages_after_seq(
     after_seq: int,
     *,
     through_seq: int | None = None,
+    exclude_synthetic_sources: bool = False,
 ) -> int:
     """COUNT of THIS USER's own ``chat_messages`` rows with ``seq > after_seq``
     — scoped by ``user_id``, unlike a bare ``chat_max_seq(...) - after_seq``
@@ -5544,6 +5556,11 @@ def count_messages_after_seq(
     if upper is not None:
         predicate += " AND seq <= %s"
         params.append(upper)
+    if exclude_synthetic_sources:
+        # See chat_messages_after_seq: coverage gap detection must not count
+        # GC-able synthetic rows, or it would demand folding a row that
+        # verify_loop is about to delete (permanent frontier corruption).
+        predicate += " AND COALESCE(doc->>'source','') NOT IN ('verify_ping','resident_maintenance')"
     with get_pool().connection() as conn:
         row = conn.execute(
             f"SELECT COUNT(*) FROM chat_messages {predicate}",

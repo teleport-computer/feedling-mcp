@@ -495,7 +495,8 @@ def test_compaction_reader_decrypts_every_selected_media_caption_past_eight(
     selected = []
     decrypted = []
 
-    def _read(uid, after_seq, *, limit, oldest_first=True, through_seq=None):
+    def _read(uid, after_seq, *, limit, oldest_first=True, through_seq=None,
+              exclude_synthetic_sources=False):
         selected.append((uid, after_seq, limit, oldest_first, through_seq))
         return rows
 
@@ -677,7 +678,8 @@ def test_media_caption_failure_does_not_advance_compaction_watermark(monkeypatch
 def test_seq_tail_readers_request_exact_oldest_and_newest_windows(monkeypatch):
     calls = []
 
-    def _rows(uid, after_seq, *, limit, oldest_first=True, through_seq=None):
+    def _rows(uid, after_seq, *, limit, oldest_first=True, through_seq=None,
+              exclude_synthetic_sources=False):
         calls.append((uid, after_seq, limit, oldest_first, through_seq))
         return [{"id": "m", "seq": 21, "ts": 5.0, "role": "user",
                  "body_ct": "x", "K_enclave": "k"}]
