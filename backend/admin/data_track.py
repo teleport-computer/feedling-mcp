@@ -2187,7 +2187,7 @@ def _runtime_health_summary(*, within_hours: int = 24) -> dict:
 # 各自内联的 style——那是独立重构，不该混在功能改动里。
 # 普通字符串（非 f-string），花括号无需转义。
 _RUNTIME_PAGE_CSS = """
-    :root { color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; }
+    :root { color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }
     body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
     main { max-width:1280px; margin:0 auto; padding:28px 24px 48px; }
     h1 { font-size:26px; margin:0 0 4px; }
@@ -2195,6 +2195,7 @@ _RUNTIME_PAGE_CSS = """
     .muted { color:var(--muted); }
     .ok { color:var(--ok); }
     .warn { color:var(--warn); }
+    .bad { color:var(--bad); }
     .metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:22px 0; }
     .metric { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }
     .metric-value { font-size:24px; font-weight:700; }
@@ -2203,7 +2204,7 @@ _RUNTIME_PAGE_CSS = """
     .sort-button { display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }
     .sort-button.active { border-color:var(--accent); color:var(--accent); background:#fff1ed; }
     .note-box { background:#fff8ef; border:1px solid #e8d8be; border-radius:8px; padding:12px 14px; margin:16px 0 4px; font-size:13px; line-height:1.6; color:#5a4d3c; }
-    table { border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; margin-bottom:18px; }
+    table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; margin-bottom:18px; }
     th,td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
     th { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }
     tr:last-child td { border-bottom:0; }
@@ -2212,6 +2213,7 @@ _RUNTIME_PAGE_CSS = """
     .pill { display:inline-flex; border-radius:999px; padding:2px 8px; font-size:12px; background:#efe7df; color:var(--muted); }
     .pill.ok { color:var(--ok); background:#e7f3ed; }
     .pill.warn { color:var(--warn); background:#fff1db; }
+    .pill.bad { color:var(--bad); background:#fff1ed; }
 """
 
 
@@ -2247,7 +2249,7 @@ def _render_runtime_health_page(payload: dict) -> str:
         _render_metric("可执行槽位", _fmt_count(pool.get("capacity"))),
         _render_metric(
             "最老 pending 年龄",
-            _fmt_duration_sec(pool_age) if pool_age is not None else "—",
+            _fmt_duration_sec(pool_age),
         ),
     ])
 
@@ -2263,16 +2265,21 @@ def _render_runtime_health_page(payload: dict) -> str:
         if rate is None:
             rate_cell = "<td class='muted'>—</td>"
         else:
-            cls = (
-                "warn" if rate >= _RUNTIME_HEALTH_FAILURE_WARN else "ok"
-            )
+            if rate >= _RUNTIME_HEALTH_FAILURE_BAD:
+                cls = "bad"
+            elif rate >= _RUNTIME_HEALTH_FAILURE_WARN:
+                cls = "warn"
+            else:
+                cls = "ok"
             rate_cell = f"<td><span class='pill {cls}'>{rate * 100:.0f}%</span></td>"
         capture = lane.get("capture") or {}
         missing = int(capture.get("missing") or 0)
+        open_count = int(capture.get("open") or 0)
         capture_cell = (
             f"<td>{int(capture.get('complete') or 0)} / "
             f"{int(capture.get('partial') or 0)} / "
-            f"<b class='{'warn' if missing else ''}'>{missing}</b></td>"
+            f"<b class='{'bad' if missing else ''}'>{missing}</b> / "
+            f"{open_count}</td>"
         )
         lane_label = html.escape(name)
         if name == "heartbeat":
@@ -2344,7 +2351,7 @@ def _render_runtime_health_page(payload: dict) -> str:
   <section class="metrics">{pool_metrics}</section>
   <h2>各 lane 健康</h2>
   <table>
-    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>失败</th><th>过期</th><th>superseded</th><th>失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 完整/部分/漏写</th></tr></thead>
+    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>失败</th><th>过期</th><th>superseded</th><th>失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 完整/部分/漏写/在飞</th></tr></thead>
     <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='10' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
   </table>
   <h2>失败原因 Top</h2>

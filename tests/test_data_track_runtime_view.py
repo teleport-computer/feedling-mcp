@@ -228,7 +228,10 @@ def test_render_runtime_health_page_renders_na_not_fake_zero(bound_request):
         p50_ok_ms=None, p95_ok_ms=None,
         capture={"complete": 0, "partial": 0, "missing": 0, "open": 0},
     )]))
-    assert "0%" not in html_out          # 假红 0% 绝不能出现
+    # 零样本时指标值应显示"—"而非数字 0 或"0%"；CSS 的"100%"不是数据渲染，允许存在
+    # 检查失败率列是否无 pill（当样本为 0 且 rate 为 None 时）
+    assert "<span class='pill" not in html_out   # 零样本时不应有失败率 pill
+    assert "class='muted'>—</td>" in html_out    # 失败率应显示"—"
     assert "当前窗口无样本" in html_out
 
 
@@ -264,3 +267,26 @@ def test_render_runtime_health_page_declares_scope_split(bound_request):
     html_out = _dt._render_runtime_health_page(_payload())
     assert "运行时视角" in html_out
     assert "Proactive 日报" in html_out
+
+
+def test_render_runtime_health_page_failure_rate_three_tiers(bound_request):
+    # 失败率应该分三档：<5% 绿、5%-15% 黄、≥15% 红
+    good = _dt._render_runtime_health_page(_payload([_lane(failure_rate=0.03, failed=1, completed=33)]))
+    warn = _dt._render_runtime_health_page(_payload([_lane(failure_rate=0.08, failed=4, completed=50)]))
+    bad = _dt._render_runtime_health_page(_payload([_lane(failure_rate=0.20, failed=20, completed=80)]))
+
+    assert "pill ok" in good      # 3% 应显示绿色 pill
+    assert "pill warn" in warn    # 8% 应显示黄色 pill
+    assert "pill bad" in bad      # 20% 应显示红色 pill
+
+
+def test_render_runtime_health_page_shows_capture_open_bucket(bound_request):
+    # 捕获列要显示四个桶：完整/部分/漏写/在飞；在飞不染色，仅数字显示
+    html_out = _dt._render_runtime_health_page(_payload([_lane(
+        failure_rate=0.0, failed=0, completed=100,
+        capture={"complete": 80, "partial": 15, "missing": 2, "open": 3},
+    )]))
+    # 表格行应包含四个数字，用"/"分隔
+    assert "80 / 15 /" in html_out           # 完整 / 部分 /
+    assert "<b class='bad'>2</b>" in html_out   # 漏写 用 bad class 标记
+    assert "/ 3</td>" in html_out            # 在飞 无特殊标记
