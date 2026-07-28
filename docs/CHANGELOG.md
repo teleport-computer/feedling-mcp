@@ -47,6 +47,49 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-28 — Admin Runtime 健康值班台：收尾修复最终 code review 的三个 Important 项
+
+**[DONE] `/admin/data-track?view=runtime` 值班台过审前的三条修复 + 一处文档更正**。这是
+该功能五个任务全部实现（9 commit）之后、最终 review 判「Ready to merge: With fixes」的
+收尾工作。前三条缺陷原样存在于设计与实施计划文档里（实现是忠实照抄的），因此代码与文档
+一并改：
+
+- **I-1（页顶结论永远不会真正变红）**：`_render_runtime_health_page` 里
+  `level_cls = {"ok": "ok", "warn": "warn", "bad": "warn"}[level]` 把 `bad` 映射成
+  CSS class `"warn"`——100% 失败率与 6% 失败率在页顶显示成同一个橙色，人眼分诊能力在
+  第一眼就被抹掉，而 per-lane 表反而认真做了三档。改成 `"bad": "bad"`。
+- **I-2（失败码白名单太窄，非 chat lane 塌成 `other`）**：`_runtime_failure_code` 原来只
+  放行精确匹配 `queue_timeout`/`lease_timeout` 和无条件的 `turn_failed:` 前缀（不校验
+  冒号后内容形状）。但 `mark_failed`/`mark_expired` 落库的真实码还有 `wake_failed:*`
+  （heartbeat/proactive lane）、`extraction_failed:*`、`compaction_failed:*`、
+  `mcp_mutation_outcome_unknown`、`runtime_expired`——旧白名单下这些码在 chat 之外每条
+  lane 都塌成 `other`，而 heartbeat 恰恰是本页专门加了「（日报口径）」链接、明确要给人
+  看的 lane。改为按形状放行（`^[a-z0-9_]+(:[a-z0-9_]+)?$`，admin 层自定义常量，不
+  import `model_api_runtime`），同时渲染层清洗后按 `(lane, code)` 重新合并计数——否则
+  同一 lane 的两个不同原始码清洗成同一个桶会渲染成两行都叫 `other`。
+- **I-3（claimed/running 卡死时页面明文说「这不是故障」）**：`_runtime_health_level` 对
+  job 全部卡在 `claimed`/`running`（无 pending、worker 心跳还活着）的 lane 全部指标都
+  跳过，误判 `("ok", [])`；`empty_note` 只看「所有 lane sampled_jobs 都为 0」，把「真的
+  没数据」和「卡死」混为一谈。reviewer 实证过这个具体形状（`inflight=57/capacity=8`）：
+  页面显示「这不是故障」+ 总体结论「正常」。修正：`sampled_jobs==0 and capture.open>0`
+  → 至少 `warn`；`pool.inflight > pool.capacity` → `bad`（矛盾态）；`empty_note` 只在
+  终态样本、`capture.open`、`pool.inflight`、`pool.pending` 全为 0 时才说「这不是
+  故障」，否则改为「窗口内无终态 job，但有 N 个回合在飞——可能是卡死」。
+- **I-4（文档修正，不改代码）**：设计文档 §8 原先写「索引够用」，实查
+  `agent_jobs.finished_at` 无任何索引、`agent_jobs` 无保留策略、新增的三条 CTE
+  （outcome/failure/capture）在全 lane 范围都拿不到有效索引，`LIMIT 1000` 只截结果不
+  减扫描。本分支承诺不含迁移，故不加索引，只把错误结论改正并把
+  `CREATE INDEX CONCURRENTLY ix_agent_jobs_finished_at ...` + `agent_jobs` 保留策略
+  记为设计文档 §10 的明确 follow-up（含「上线前在 prod 规模跑一次 EXPLAIN」）。
+- 死代码清理：`tests/test_data_track_runtime_view.py` 里未使用的 `import base64`、
+  `import db`、`_route_pk_counter = itertools.count(9_000)`（连带其 `itertools` 导入）
+  一并删除。
+
+改动范围：`backend/admin/data_track.py`（`_runtime_failure_code` / `_runtime_health_level`
+/ `_render_runtime_health_page`）、`tests/test_data_track_runtime_view.py`（8 条新用例覆盖
+上述三个 Important 项 + 死代码清理）、设计文档 §5/§6/§8/§10、实施计划里对应的三处代码块
+（均加了「最终 code review 修正」批注，保留原文作历史记录）。不涉及迁移、不改
+`recent_runtime_health()` 的 SQL 口径、不动既有 6 个视图页。
 ## 2026-07-27 — 摘要折叠死锁：一个 V2 用户被自己的一批消息卡了三天
 
 **[FIX] 折叠被拒的原因不再是黑的；`prompt_coverage_incomplete` 从
