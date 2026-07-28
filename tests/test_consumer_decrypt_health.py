@@ -35,11 +35,17 @@ def test_consumer_headers_parse_poll_health_and_compat_commit_and_clear_missing_
             "X-Feedling-Consumer-Compat-Commit": " abcdef123456 ",
             "X-Feedling-Decrypt-Status": " DeGrAdEd ",
             "X-Feedling-Decrypt-Checked-At": "123.5",
+            "X-Feedling-Agent-Provider": "openrouter",
+            "X-Feedling-Agent-Model": "deepseek/deepseek-v4-flash",
+            "X-Feedling-Agent-Input-Modalities": "text,invalid",
         }
     )
     assert info["consumer_compat_commit"] == "abcdef123456"
     assert info["decrypt_status"] == "degraded"
     assert info["decrypt_checked_at_epoch"] == "123.5"
+    assert info["agent_provider"] == "openrouter"
+    assert info["agent_model"] == "deepseek/deepseek-v4-flash"
+    assert info["agent_input_modalities"] == ["text"]
 
     old_consumer = consumer._consumer_headers_from_map(
         {"X-Feedling-Consumer": "feedling-chat-resident"}
@@ -47,6 +53,33 @@ def test_consumer_headers_parse_poll_health_and_compat_commit_and_clear_missing_
     assert old_consumer["consumer_compat_commit"] == ""
     assert old_consumer["decrypt_status"] == ""
     assert old_consumer["decrypt_checked_at_epoch"] == ""
+    assert old_consumer["agent_model"] == ""
+    assert old_consumer["agent_input_modalities"] == []
+
+
+def test_consumer_agent_runtime_requires_fresh_official_poll(monkeypatch):
+    store = _Store()
+    monkeypatch.setattr(
+        consumer,
+        "_load_consumer_state",
+        lambda _store: {
+            "official": True,
+            "last_poll_epoch": 999.0,
+            "agent_provider": "openrouter",
+            "agent_model": "deepseek/deepseek-v4-flash",
+            "agent_input_modalities": ["text"],
+        },
+    )
+
+    assert consumer.consumer_agent_runtime(store, now_epoch=1_000.0) == {
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-flash",
+        "input_modalities": ["text"],
+    }
+    assert consumer.consumer_agent_runtime(
+        store,
+        now_epoch=1_000.0 + consumer._CONSUMER_RECENT_SEC + 1,
+    ) == {"provider": "", "model": "", "input_modalities": []}
 
 
 def test_fresh_ok_decrypt_health_passes_independently_of_poll_freshness(monkeypatch):

@@ -22,6 +22,29 @@ def test_auth_headers_empty_without_api_key(monkeypatch):
     assert io_cli._auth_headers() == {}
 
 
+def test_memory_fetch_rejects_literal_placeholder_before_request(monkeypatch, capsys):
+    monkeypatch.setattr(io_cli, "_require_backend", lambda: ("http://backend.test", {}))
+
+    def _unexpected_http(*_args, **_kwargs):
+        raise AssertionError("placeholder ids must not reach the backend")
+
+    monkeypatch.setattr(io_cli, "_http_json", _unexpected_http)
+    args = types.SimpleNamespace(
+        ids=["ids"],
+        limit=20,
+        include_archived=False,
+        include_superseded=False,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        io_cli.cmd_memory_fetch(args)
+
+    assert exc.value.code == 2
+    body = json.loads(capsys.readouterr().out.strip())
+    assert body["ok"] is False
+    assert "run memory-index first" in body["error"]
+
+
 def test_emit_tool_trace_posts_agent_tool_call_with_redacted_args(monkeypatch):
     calls = []
     monkeypatch.setenv("FEEDLING_TRACE_ID", "trace-1")
@@ -103,9 +126,45 @@ def test_main_emits_tool_trace_after_command_exit(monkeypatch, capsys):
     assert exc.value.code == 0
     stdout = json.loads(capsys.readouterr().out.strip())
     assert stdout["ok"] is True
-    assert [call["method"] for call in calls] == ["GET", "POST"]
-    event = calls[1]["payload"]["event"]
+    assert [call["method"] for call in calls] == ["POST", "GET", "POST", "POST"]
+    assert calls[0]["payload"]["state"] == "running"
+    assert calls[2]["payload"]["state"] == "success"
+    event = calls[3]["payload"]["event"]
     assert event["type"] == "agent.tool.call"
     assert event["detail"]["tool"] == "perception"
     assert event["detail"]["args"] == {"signals": "1 item(s): now"}
     assert event["detail"]["result_status"] == "ok"
+
+
+def test_memory_activity_metadata_uses_actual_items_and_complete_categories():
+    assert io_cli._memory_activity_metadata(
+        "memory_search",
+        {
+            "ok": True,
+            "items": [
+                {"id": "m1", "bucket": "我们的关系", "summary": "private"},
+                {"id": "m2", "bucket": "Our relationship"},
+                {"id": "m3", "bucket": "我们的关系"},
+                {"id": "m4", "bucket": "家庭"},
+            ],
+        },
+    ) == {
+        "memory_count": 4,
+        "memory_categories": [
+            {"key": "relationship", "count": 3},
+            {"key": "family", "count": 1},
+        ],
+    }
+
+
+def test_memory_activity_metadata_custom_bucket_falls_back_to_total():
+    assert io_cli._memory_activity_metadata(
+        "memory_fetch",
+        {
+            "ok": True,
+            "items": [
+                {"id": f"m{index}", "bucket": "妈妈" if index == 0 else "家庭"}
+                for index in range(11)
+            ],
+        },
+    ) == {"memory_count": 11}

@@ -1,0 +1,291 @@
+"""Display-safe projection of runtime-neutral chat activity.
+
+The authoritative records are V2 ``agent_jobs`` / ``agent_status_events`` and
+V1 ``chat_turn_activity_events``. This module only projects their fixed
+metadata; it never accepts model prose, tool arguments, tool result bodies, or
+chain-of-thought.
+"""
+from __future__ import annotations
+
+import math
+import re
+from typing import Any, Iterable, Mapping
+
+
+TOOL_ACTIVITY_KIND = "tool_activity"
+MAX_ACTIVITY_EVENTS = 100
+MEMORY_CATEGORY_KEYS = frozenset({
+    "work", "growth", "family", "friends", "pets", "relationship", "feelings",
+    "preferences", "values", "health", "interests", "money", "food", "travel",
+})
+_SAFE_TOKEN_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
+_TERMINAL_JOB_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "discarded", "expired"}
+)
+_FAILED_JOB_STATUSES = frozenset({"failed", "cancelled", "discarded", "expired"})
+_MEMORY_DISCOVERY_TOOLS = frozenset({"memory_index", "memory_search"})
+
+
+def safe_token(value: Any, *, max_len: int = 128) -> str:
+    """Return a bounded identifier token, never arbitrary content."""
+    cleaned = _SAFE_TOKEN_RE.sub("_", str(value or "").strip())
+    return cleaned[:max_len]
+
+
+def safe_duration_ms(value: Any) -> float | None:
+    try:
+        duration = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(duration) or duration < 0:
+        return None
+    return round(min(duration, 86_400_000.0), 3)
+
+
+def result_code(result_content: Any, effect: Mapping[str, Any] | None = None) -> str:
+    """Classify a tool result without retaining its body."""
+    effect_status = safe_token((effect or {}).get("status"), max_len=40).lower()
+    if effect_status:
+        return effect_status
+    text = str(result_content or "").strip()
+    lowered = text.lower()
+    if lowered.startswith("error:"):
+        return "tool_error"
+    if lowered.startswith("queued:"):
+        return "queued"
+    return "ok"
+
+
+def event_state(event_kind: str, result_content: Any = "") -> str:
+    if event_kind == "tool_call_started":
+        return "running"
+    if event_kind == "tool_call_error":
+        return "failure"
+    return "failure" if str(result_content or "").strip().lower().startswith("error:") else "success"
+
+
+def safe_memory_metadata(value: Any) -> dict:
+    """Keep only a confirmed count and complete canonical category breakdown."""
+    if not isinstance(value, Mapping):
+        return {}
+    count = value.get("memory_count")
+    if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 1000:
+        return {}
+    safe: dict[str, Any] = {"memory_count": count}
+    categories = value.get("memory_categories")
+    if not isinstance(categories, list) or not categories:
+        return safe
+    projected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in categories[: len(MEMORY_CATEGORY_KEYS)]:
+        if not isinstance(item, Mapping):
+            return safe
+        key = str(item.get("key") or "")
+        item_count = item.get("count")
+        if (
+            key not in MEMORY_CATEGORY_KEYS
+            or key in seen
+            or isinstance(item_count, bool)
+            or not isinstance(item_count, int)
+            or item_count <= 0
+        ):
+            return safe
+        seen.add(key)
+        projected.append({"key": key, "count": item_count})
+    if sum(item["count"] for item in projected) == count:
+        safe["memory_categories"] = projected
+    return safe
+
+
+def safe_schedule_metadata(value: Any) -> dict:
+    """Keep only backend-confirmed scheduled-task identity and state."""
+    if not isinstance(value, Mapping):
+        return {}
+    operation = safe_token(
+        value.get("schedule_operation") or value.get("operation"),
+        max_len=40,
+    )
+    status = safe_token(
+        value.get("schedule_status") or value.get("status"),
+        max_len=40,
+    )
+    if operation not in {"schedule_wake", "cancel_wake", "scheduled_wake"}:
+        return {}
+    if status not in {"scheduled", "canceled", "not_found", "invalid", "rejected", "fired"}:
+        return {}
+    safe: dict[str, Any] = {
+        "schedule_operation": operation,
+        "schedule_status": status,
+    }
+    task_id = safe_token(
+        value.get("schedule_task_id") or value.get("task_id"),
+        max_len=200,
+    )
+    if task_id:
+        safe["schedule_task_id"] = task_id
+    next_trigger = str(
+        value.get("schedule_next_trigger_at") or value.get("next_trigger_at") or ""
+    ).strip()
+    if (
+        1 <= len(next_trigger) <= 80
+        and all(char in "0123456789-:T.+ " for char in next_trigger)
+    ):
+        safe["schedule_next_trigger_at"] = next_trigger
+    timezone_name = str(
+        value.get("schedule_timezone") or value.get("timezone") or ""
+    ).strip()
+    if (
+        1 <= len(timezone_name) <= 80
+        and all(
+            char.isascii() and (char.isalnum() or char in "_+./-")
+            for char in timezone_name
+        )
+    ):
+        safe["schedule_timezone"] = timezone_name
+    return safe
+
+
+def _collapse_memory_discovery(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Hide contradictory/repeated zero-result discovery rows.
+
+    Search and index use different matching semantics, so a zero keyword search
+    followed by a positive index is not contradictory backend data. Presenting
+    both as separate user-facing conclusions is nevertheless misleading.
+    """
+    has_positive_memory = any(
+        event.get("status") == "success"
+        and isinstance(event.get("memory_count"), int)
+        and int(event["memory_count"]) > 0
+        for event in events
+    )
+    zero_discovery_indexes = [
+        index
+        for index, event in enumerate(events)
+        if event.get("name") in _MEMORY_DISCOVERY_TOOLS
+        and event.get("status") == "success"
+        and event.get("memory_count") == 0
+    ]
+    if not zero_discovery_indexes:
+        return events
+    suppressed = set(zero_discovery_indexes)
+    if not has_positive_memory:
+        suppressed.discard(zero_discovery_indexes[-1])
+    return [event for index, event in enumerate(events) if index not in suppressed]
+
+
+def project_tool_events(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse start/result status rows into one event per confirmed invocation."""
+    ordered: list[str] = []
+    projected: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if str(row.get("kind") or "") != TOOL_ACTIVITY_KIND:
+            continue
+        detail = row.get("detail_json")
+        if not isinstance(detail, Mapping):
+            continue
+        activity_id = safe_token(detail.get("activity_id"), max_len=160)
+        tool_name = safe_token(detail.get("tool_name"), max_len=120)
+        state = safe_token(detail.get("state"), max_len=24).lower()
+        if not activity_id or not tool_name or state not in {"running", "success", "failure"}:
+            continue
+        created_at = row.get("created_at")
+        try:
+            created = float(created_at)
+        except (TypeError, ValueError, OverflowError):
+            created = 0.0
+        if activity_id not in projected:
+            if len(ordered) >= MAX_ACTIVITY_EVENTS:
+                continue
+            ordered.append(activity_id)
+            projected[activity_id] = {
+                "id": activity_id,
+                "kind": "tool",
+                "name": tool_name,
+                "status": state,
+                "job_id": str(row.get("job_id") or ""),
+                "call_id": safe_token(detail.get("call_id"), max_len=160),
+                "started_at": created or None,
+            }
+        event = projected[activity_id]
+        event["status"] = state
+        if state != "running":
+            event["finished_at"] = created or None
+        duration = safe_duration_ms(detail.get("duration_ms"))
+        if duration is not None:
+            event["duration_ms"] = duration
+        for source, target, limit in (
+            ("effect_id", "effect_id", 160),
+            ("effect_type", "effect_type", 80),
+            ("effect_status", "effect_status", 40),
+            ("result_code", "result_code", 64),
+        ):
+            token = safe_token(detail.get(source), max_len=limit)
+            if token:
+                event[target] = token
+        event.update(safe_memory_metadata(detail))
+        event.update(safe_schedule_metadata(detail))
+    return _collapse_memory_discovery([projected[event_id] for event_id in ordered])
+
+
+def _turn_failure(jobs: list[Mapping[str, Any]]) -> dict[str, Any] | None:
+    for job in reversed(jobs):
+        status = safe_token(job.get("status"), max_len=32).lower()
+        if status not in _FAILED_JOB_STATUSES:
+            continue
+        raw_code = str(job.get("last_error") or "").strip().lower()
+        code = (
+            raw_code
+            if re.fullmatch(r"[a-z0-9_.:-]{1,96}", raw_code) is not None
+            else ""
+        )
+        if not code:
+            code = f"turn_failed:{status}"
+        return {
+            "code": code,
+            "job_id": safe_token(job.get("id"), max_len=64),
+        }
+    return None
+
+
+def turn_response(turn_id: str, jobs: Iterable[Mapping[str, Any]], rows: Iterable[Mapping[str, Any]]) -> dict:
+    source_jobs = list(jobs)
+    job_list = [
+        {
+            "job_id": str(job.get("id") or ""),
+            "status": safe_token(job.get("status"), max_len=32),
+        }
+        for job in source_jobs
+    ]
+    row_list = list(rows)
+    phases = [str(row.get("kind") or "") for row in row_list if row.get("kind") != TOOL_ACTIVITY_KIND]
+    statuses = {job["status"] for job in job_list if job["status"]}
+    complete = bool(statuses) and statuses.issubset(_TERMINAL_JOB_STATUSES)
+    response = {
+        "turn_id": turn_id,
+        "runtime": "v2",
+        "complete": complete,
+        "phase": safe_token(phases[-1], max_len=40) if phases else "queued",
+        "jobs": job_list,
+        "events": project_tool_events(row_list),
+    }
+    failure = _turn_failure(source_jobs)
+    if failure is not None:
+        response["failure"] = failure
+    return response
+
+
+def resident_turn_response(turn_id: str, parent: Mapping[str, Any], rows: Iterable[Mapping[str, Any]]) -> dict:
+    """Project a V1 resident turn from its durable parent and tool evidence."""
+    complete = (
+        str(parent.get("reply_status") or "") == "replied"
+        or bool(str(parent.get("reply_message_id") or ""))
+    )
+    status = "completed" if complete else "running"
+    return {
+        "turn_id": turn_id,
+        "runtime": "v1",
+        "complete": complete,
+        "phase": "done" if complete else "processing",
+        "jobs": [{"job_id": f"v1:{turn_id}", "status": status}],
+        "events": project_tool_events(rows),
+    }

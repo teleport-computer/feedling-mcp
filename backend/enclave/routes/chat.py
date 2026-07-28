@@ -102,6 +102,8 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
                 entry["content"] = _decrypt_caption(m, authorized_user_id, content_sk, errors)
                 entry["image_omitted"] = True
                 entry["image_mime"] = m.get("image_mime") or "image/jpeg"
+                if m.get("vision_route_id"):
+                    entry["vision_route_id"] = str(m["vision_route_id"])
             elif ctype == "file":
                 entry["content"] = _decrypt_caption(m, authorized_user_id, content_sk, errors)
                 entry["file_omitted"] = True
@@ -143,6 +145,8 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
                 entry["content"] = _decrypt_caption(m, authorized_user_id, content_sk, errors)
                 entry["image_b64"] = base64.b64encode(plaintext).decode("ascii")
                 entry["image_mime"] = m.get("image_mime") or "image/jpeg"
+                if m.get("vision_route_id"):
+                    entry["vision_route_id"] = str(m["vision_route_id"])
             elif ctype == "file":
                 # File plaintext is the raw file bytes — surface as base64 so the
                 # resident consumer can land it on disk / inline it. Caption

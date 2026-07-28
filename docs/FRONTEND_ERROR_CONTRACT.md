@@ -100,8 +100,8 @@
 > Phase A 会把残存的自由文本错误（如 `envelope missing fields: [...]`）收敛成 slug + detail，届时更新本表。
 
 - **认证/账号**：`unauthorized`(401) · `forbidden`(403) · `user_not_found` · `account_not_found` · `no_recoverable_account` · `invalid_or_expired_challenge` · `challenge_failed` · `token_expired` · `token_already_used` · `invalid_token`
-- **model_api / provider 配置**（设置页）：`model_api_not_configured` · `model_api_not_tested` · `model_api_config_invalid` · `model_api_key_decrypt_failed`(blame=system) · `model_api_key_envelope_missing` · `model_api_runtime_profile_missing`（feat/upstream-error-surfacing 合入后生效） · `provider_not_configured` · `provider_not_hostable` · `hosting_runtime_unavailable`
-- **聊天**：`already_answered`(409,静默) · `message_not_found` · `user_message_envelope_failed` · `bootstrap_incomplete`(引导未完成)
+- **model_api / provider 配置**（设置页）：`model_api_not_configured` · `model_api_not_tested` · `model_api_config_invalid` · `model_api_key_decrypt_failed`(blame=system) · `model_api_key_envelope_missing` · `model_api_runtime_profile_missing`（feat/upstream-error-surfacing 合入后生效） · `provider_not_configured` · `provider_not_hostable` · `hosting_runtime_unavailable` · `vision_runtime_v2_required`（旧版兼容） · `vision_resident_update_required` · `vision_model_unsupported` · `vision_model_test_failed`
+- **聊天**：`already_answered`(409,静默) · `message_not_found` · `user_message_envelope_failed` · `bootstrap_incomplete`(引导未完成) · `vision_model_required`(409,打开视觉模型设置) · `vision_resident_update_required`(409,提示更新并重启 resident)
 - **导入/蒸馏**：`job_not_found` · `missing_file` · `empty_file` · `payload_too_large` · `archive_failed` · `archive_unavailable`
 - **通用**：`invalid_payload` · `not_found` · `not_owned` · `service_busy` · `service_unavailable` · `invalid_image` · `internal_error`(500 兜底)
 

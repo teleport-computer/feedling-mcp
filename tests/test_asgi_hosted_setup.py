@@ -1,7 +1,7 @@
 """Native hosted-setup parity (ASGI-migration plan §5.3 / §9).
 
 Asserts the FastAPI routes (``hosted.setup_routes_asgi``) return the expected
-status/body for all 10 routes:
+status/body for the hosted setup and vision-routing surfaces:
 model_api get/setup/driver/key_envelope/test/delete/runtime + memory/repair,
 state/receipts, memory/capture_jobs. The routes call the framework-neutral
 ``hosted.setup_core``, so provider/enclave stubs are installed once on the shared
@@ -113,6 +113,10 @@ _ENDPOINTS = [
     ("GET", "/v1/model_api/get"),
     ("POST", "/v1/model_api/driver"),
     ("GET", "/v1/model_api/key_envelope"),
+    ("GET", "/v1/vision/config"),
+    ("PUT", "/v1/vision/config"),
+    ("POST", "/v1/vision/config"),
+    ("POST", "/v1/vision/routes/00000000-0000-0000-0000-000000000000/test"),
     ("POST", "/v1/model_api/test"),
     ("DELETE", "/v1/model_api/delete"),
     ("GET", "/v1/model_api/runtime"),
@@ -129,7 +133,7 @@ _ENDPOINTS = [
 @pytest.mark.parametrize("method,path", _ENDPOINTS)
 def test_no_auth_is_401_parity(make_user, method, path):
     make_user()  # seed the registry (fresh FEEDLING_DIR)
-    json_body = {} if method == "POST" else None
+    json_body = {} if method in {"POST", "PUT", "PATCH"} else None
     f = _flask(method, path, json_body=json_body)
     a = _asgi(method, path, json_body=json_body)
     assert f == a == (401, {"error": "unauthorized"})

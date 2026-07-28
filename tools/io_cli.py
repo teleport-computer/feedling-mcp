@@ -71,8 +71,29 @@ PERCEPTION_SIGNALS = FAST_SIGNALS + SLOW_SIGNALS + EXTRA_SIGNALS
 # graceful no-op stubs so an agent that tries to call them degrades cleanly.
 PHASE2_VERBS = ("send", "wait-for-wake")
 
+_LAST_TOOL_OUTPUT = None
+
+_MEMORY_BUCKET_CATEGORY = {
+    "工作": "work", "work": "work",
+    "目标与成长": "growth", "goals & growth": "growth",
+    "家庭": "family", "family": "family",
+    "朋友": "friends", "friends": "friends",
+    "宠物": "pets", "pets": "pets",
+    "我们的关系": "relationship", "our relationship": "relationship",
+    "情绪与安抚": "feelings", "feelings & comfort": "feelings",
+    "偏好与边界": "preferences", "preferences & boundaries": "preferences",
+    "个性与价值观": "values", "personality & values": "values",
+    "健康": "health", "health": "health",
+    "爱好": "interests", "interests": "interests",
+    "金钱": "money", "money": "money",
+    "饮食": "food", "food": "food",
+    "地点与旅行": "travel", "places & travel": "travel",
+}
+
 
 def _emit(obj, code=0):
+    global _LAST_TOOL_OUTPUT
+    _LAST_TOOL_OUTPUT = obj
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
     sys.stdout.flush()
     sys.exit(code)
@@ -276,6 +297,78 @@ def _emit_tool_trace(args, exit_code, dur_ms):
         pass
 
 
+def _activity_tool_name(args):
+    verb = str(getattr(args, "verb", "") or "").strip().lower()
+    if verb == "memory-index":
+        return "memory_search"
+    return verb.replace("-", "_")
+
+
+def _memory_activity_metadata(tool_name, output):
+    if tool_name not in {"memory_search", "memory_fetch"}:
+        return {}
+    if not isinstance(output, dict) or output.get("ok") is not True:
+        return {}
+    items = output.get("items")
+    if not isinstance(items, list):
+        return {}
+    metadata = {"memory_count": len(items)}
+    if not items:
+        return metadata
+    counts = {}
+    order = []
+    for item in items:
+        if not isinstance(item, dict):
+            return metadata
+        category = _MEMORY_BUCKET_CATEGORY.get(
+            str(item.get("bucket") or "").strip().casefold()
+        )
+        if not category:
+            return metadata
+        if category not in counts:
+            order.append(category)
+            counts[category] = 0
+        counts[category] += 1
+    metadata["memory_categories"] = [
+        {"key": category, "count": counts[category]} for category in order
+    ]
+    return metadata
+
+
+def _emit_turn_activity(args, activity_id, state, *, dur_ms=None, exit_code=0):
+    """Best-effort V1 activity event; never sends arguments or result bodies."""
+    try:
+        turn_id = _trace_id()
+        api_url = _env("FEEDLING_API_URL")
+        auth = _auth_headers()
+        if not turn_id or not api_url or not auth:
+            return
+        tool_name = _activity_tool_name(args)
+        if not tool_name:
+            return
+        payload = {
+            "activity_id": activity_id,
+            "call_id": activity_id,
+            "tool_name": tool_name,
+            "state": state,
+        }
+        if dur_ms is not None:
+            payload["duration_ms"] = round(float(dur_ms), 1)
+        if state != "running":
+            payload["result_code"] = "ok" if int(exit_code or 0) == 0 else "tool_error"
+            if int(exit_code or 0) == 0:
+                payload.update(_memory_activity_metadata(tool_name, _LAST_TOOL_OUTPUT))
+        _http_json(
+            "POST",
+            f"{api_url.rstrip('/')}/v1/chat/turn-activity/{urllib.parse.quote(turn_id, safe='')}/events",
+            auth,
+            payload=payload,
+            timeout=1.0,
+        )
+    except Exception:
+        pass
+
+
 def cmd_perception(args):
     api_url = _env("FEEDLING_API_URL")
     auth = _auth_headers()
@@ -408,6 +501,18 @@ def cmd_memory_fetch(args):
     ids = list(args.ids)
     if not ids:
         _emit({"ok": False, "error": "memory-fetch needs at least one id"}, 2)
+    placeholder_ids = {
+        "id", "ids", "memory_id", "memory_ids",
+        "<id>", "<ids>", "<memory_id>", "<memory_ids>",
+    }
+    if any(str(memory_id).strip().lower() in placeholder_ids for memory_id in ids):
+        _emit({
+            "ok": False,
+            "error": (
+                "memory-fetch received a placeholder instead of a real card id; "
+                "run memory-index first and pass values from items[].id"
+            ),
+        }, 2)
     payload = {"ids": ids, "limit": args.limit}
     if args.include_archived:
         payload["include_archived"] = True
@@ -1445,6 +1550,7 @@ def cmd_phase2(args):
 
 
 def main():
+    global _LAST_TOOL_OUTPUT
     p = argparse.ArgumentParser(
         prog="io_cli",
         description="Feedling resident-agent tool client. Outputs JSON.",
@@ -1758,8 +1864,11 @@ def main():
         sp.set_defaults(func=cmd_phase2)
 
     args = p.parse_args()
+    _LAST_TOOL_OUTPUT = None
     started = time.monotonic()
+    activity_id = f"v1:{uuid.uuid4().hex}"
     exit_code = 0
+    _emit_turn_activity(args, activity_id, "running")
     try:
         args.func(args)
     except SystemExit as e:
@@ -1769,7 +1878,15 @@ def main():
         exit_code = 1
         raise
     finally:
-        _emit_tool_trace(args, exit_code, (time.monotonic() - started) * 1000)
+        duration_ms = (time.monotonic() - started) * 1000
+        _emit_turn_activity(
+            args,
+            activity_id,
+            "success" if int(exit_code or 0) == 0 else "failure",
+            dur_ms=duration_ms,
+            exit_code=exit_code,
+        )
+        _emit_tool_trace(args, exit_code, duration_ms)
 
 
 if __name__ == "__main__":

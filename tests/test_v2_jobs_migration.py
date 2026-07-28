@@ -243,6 +243,9 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0059_v2_incident_wake_guards").down_revision == (
         "0058_provider_usage_halted"
     )
+    assert script.get_revision("0059_chat_activity_lookup_idx").down_revision == (
+        "0058_provider_usage_halted"
+    )
     assert script.get_revision("0060_v2_wake_failure_backoff").down_revision == (
         "0059_v2_incident_wake_guards"
     )

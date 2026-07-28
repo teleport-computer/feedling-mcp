@@ -90,6 +90,75 @@ def _make_image_msg(ts=1.0, image_bytes=b"fake-jpeg"):
     return msg
 
 
+def test_pi_runtime_metadata_reads_exact_model_modalities(tmp_path, monkeypatch):
+    models_file = tmp_path / "models.json"
+    models_file.write_text(json.dumps({
+        "providers": {
+            "feedling": {
+                "baseUrl": "https://openrouter.ai/api/v1",
+                "models": [
+                    {
+                        "id": "deepseek/deepseek-v4-flash",
+                        "input": ["text"],
+                    }
+                ]
+            }
+        }
+    }))
+    monkeypatch.delenv("FEEDLING_AGENT_MODEL_ID", raising=False)
+    monkeypatch.delenv("FEEDLING_AGENT_PROVIDER", raising=False)
+    monkeypatch.delenv("FEEDLING_AGENT_INPUT_MODALITIES", raising=False)
+
+    metadata = crc._agent_runtime_metadata(
+        cli_cmd=(
+            "pi --mode json --model "
+            "feedling/deepseek/deepseek-v4-flash"
+        ),
+        models_file=models_file,
+    )
+
+    assert metadata == {
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-flash",
+        "input_modalities": ["text"],
+    }
+
+
+def test_runtime_model_identity_uses_configured_fact(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "AGENT_RUNTIME_METADATA",
+        {
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-flash",
+            "input_modalities": ["text"],
+        },
+    )
+
+    prompt = crc._prepend_runtime_model_identity("你是什么模型？")
+
+    assert "deepseek/deepseek-v4-flash" in prompt
+    assert "Do not infer a different model" in prompt
+    assert prompt.endswith("你是什么模型？")
+
+
+def test_agent_session_rotates_when_configured_model_entry_changes(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        "pi --model feedling/openai/gpt-5-mini --session-id {session_id}",
+    )
+    old_meta = crc._empty_agent_session_meta("session-1")
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        "pi --model feedling/deepseek/deepseek-v4-flash --session-id {session_id}",
+    )
+
+    assert crc._agent_session_meta_entry_changed(old_meta) is True
+
+
 # ---------------------------------------------------------------------------
 # Case 1: user message with empty content → no fallback, checkpoint advances
 # ---------------------------------------------------------------------------
@@ -1570,6 +1639,22 @@ def _pi_stream_with_thinking(reply: str, thinking: str) -> str:
                         {"type": "text", "text": reply}],
         }},
     ])
+
+
+def test_pi_thinking_projects_step_heading_without_internal_monologue():
+    stream = _pi_stream_with_thinking(
+        "文件已生成。",
+        "**Preparing to generate markdown**\n"
+        "It looks like the user confirmed option A. I need to inspect all "
+        "five memories and decide what to include before writing the file.",
+    )
+
+    reply, thinking = crc._pi_turn_from_stream(stream)
+
+    assert reply == "文件已生成。"
+    assert thinking == "Preparing to generate markdown"
+    assert "confirmed option A" not in thinking
+    assert "decide what to include" not in thinking
 
 
 def test_call_agent_body_round_trips_thinking_back_through_split(monkeypatch):
@@ -5313,6 +5398,35 @@ def test_message_for_proactive_job_instructs_multi_bubble_without_gate_context()
     assert "screen: dense paragraph" in message
 
 
+def test_scheduled_wake_message_requires_exact_reminder_instead_of_generic_presence():
+    message = crc._message_for_proactive_job(
+        {
+            "trigger": "scheduled_wake",
+            "wake_kind": "scheduled_wake",
+            "scheduled_note": "提醒用户喝水",
+            "timezone": "Asia/Shanghai",
+        },
+        recent_chat_context="- user: 2 分钟之后提醒我喝水",
+    )
+
+    assert "[Feedling scheduled reminder]" in message
+    assert "<reminder_note>提醒用户喝水</reminder_note>" in message
+    assert "You must send the reminder now" in message
+    assert "do not replace it with a greeting" in message
+    assert "[Feedling proactive wake]" not in message
+    assert "staying quiet" not in message.lower()
+    assert "recent_chat_context" not in message
+
+
+def test_scheduled_wake_message_falls_back_to_change_digest():
+    message = crc._message_for_proactive_job({
+        "intent_label": "scheduled_wake",
+        "change_digest": "提醒用户休息",
+    })
+
+    assert "<reminder_note>提醒用户休息</reminder_note>" in message
+
+
 def test_photo_added_wake_surfaces_pullable_photo_hint(monkeypatch):
     class _Resp:
         status_code = 200
@@ -8467,6 +8581,7 @@ def test_cwd_resolution_failure_preserves_existing_session(monkeypatch, tmp_path
     _bridge_session_env(monkeypatch, tmp_path, "usr_cwd_err")
     monkeypatch.setattr(crc, "AGENT_MODE", "cli")
     _reset_cli_cwd_cache(monkeypatch)
+    _generic_cli_env(monkeypatch)
     old_home = tmp_path / "old-home"
     monkeypatch.setenv("FEEDLING_AGENT_CLI_CWD", str(old_home))
 
@@ -8479,7 +8594,6 @@ def test_cwd_resolution_failure_preserves_existing_session(monkeypatch, tmp_path
     crc._agent_session_id_cache.clear()
     crc._agent_session_meta_cache.clear()
     _reset_cli_cwd_cache(monkeypatch)
-    _generic_cli_env(monkeypatch)
 
     with pytest.raises(RuntimeError, match="restart the consumer"):
         crc.call_agent_cli("hi")
