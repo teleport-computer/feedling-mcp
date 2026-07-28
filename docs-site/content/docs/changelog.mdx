@@ -10,6 +10,20 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **A new `GET /v1/perception/app_close` endpoint reports app closures,
+  mirroring the existing `app_open` shortcut.** It accepts the same `app`
+  (required, `bundle_id` remains a deprecated alias), `category`, and `ts`
+  (`client_ts` remains a deprecated alias) parameters, and — like
+  `app_open` — is a GET with a write side effect: it records an event and
+  is not read-only. A close only updates the current-app state when the
+  closed app matches the app currently recorded as foreground, so an older
+  app killed in the background cannot clobber whichever app is actually
+  current. The two endpoints correspond to the "is opened" / "is closed"
+  trigger options on the same iOS Shortcuts automation; a client can wire up
+  only one of them, and the other being absent is a benign degradation.
+  The Perception snapshot gains a corresponding `app_state` field, valued
+  `"foreground"` or `"closed"`, and `null` when no open has been reported yet.
+
 - **Chat route selection now fences Hosted Runtime V1 from independent
   residents.** The onboarding route is the execution-ownership source of truth:
   V1 discovery requires an explicit `model_api` selector in addition to a
@@ -32,6 +46,7 @@ change must not be interpreted as an API guarantee.
   durable outbox after worker crashes and lease timeouts, while a newer
   successful reply atomically suppresses a stale failure bubble. Proactive and
   maintenance lanes remain silent.
+
 
 - **V1 CLI residents can now return generated documents as native download
   cards.** Claude, Codex, and Pi residents receive a `send-file` command backed

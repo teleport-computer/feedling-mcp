@@ -55,9 +55,11 @@ class _PerceptionClient:
 
     def get(self, path):
         u = urlparse(path)
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
         if u.path == "/v1/perception/app_open":
-            q = {k: v[0] for k, v in parse_qs(u.query).items()}
             return _PResp(*perception_read_core.app_open(self._store, q))
+        if u.path == "/v1/perception/app_close":
+            return _PResp(*perception_read_core.app_close(self._store, q))
         raise AssertionError(f"unrouted path: {u.path}")
 
 
@@ -72,6 +74,7 @@ class FakeStore:
         self.events = {}  # uid -> [event...]
         self.frames = {}  # (uid, frame_id) -> envelope
         self.app_opens = {}  # uid -> [event...]
+        self.app_closes = {}  # uid -> [event...]
 
     # singletons
     def get_state(self, uid): return {k: dict(v) for k, v in self.state.get(uid, {}).items()}
@@ -146,6 +149,15 @@ class FakeStore:
         if since_epoch:
             rows = [r for r in rows if (r.get("ts") or 0) > since_epoch]
         return [dict(r) for r in rows[-limit:]]
+
+    # app-close time series
+    def append_app_close(self, uid, doc, ts):
+        self.app_closes.setdefault(uid, []).append(dict(doc))
+    def read_app_closes(self, uid, limit=100, since_epoch=0.0):
+        rows = self.app_closes.get(uid, [])
+        if since_epoch:
+            rows = [r for r in rows if float(r.get("ts") or 0.0) > since_epoch]
+        return rows[-limit:] if limit else list(rows)
 
     # photo ciphertext channel (reuses frame_envelopes in prod)
     def put_photo_envelope(self, uid, frame_id, ts, env):
@@ -489,6 +501,88 @@ def test_app_open_requires_app(env):
     assert code == 400 and out["error"] == "app_required"
 
 
+def test_snapshot_exposes_app_state_field(env):
+    """`app_state` 是 app 信号投影的一部分；没人上报时是 None（= 未知），
+    而不是缺键——agent 侧的投影按字段清单取值，缺键会读成 KeyError。"""
+    fake, _ = env
+    snap = service.snapshot(UID)
+    assert "app_state" in snap
+    assert snap["app_state"] is None
+
+
+def test_app_open_marks_foreground(env):
+    fake, _ = env
+    service.app_open(UID, "Instagram", category="social", client_ts=1000.0)
+    state = fake.get_state(UID)
+    assert state["app_name"]["v"] == "Instagram"
+    assert state["app_state"]["v"] == "foreground"
+
+
+def test_app_close_records_event_and_marks_closed(env):
+    """关闭当前 app：事件进 app_close 流，状态保留 app_name 但转 closed —— TA
+    要能说「你刚从 Instagram 出来」，而不是「你刚离开了一个 null」。"""
+    fake, _ = env
+    service.app_open(UID, "Instagram", category="social", client_ts=1000.0)
+    out, code = service.app_close(UID, "Instagram", category="social", client_ts=1600.0)
+    assert code == 200 and out["app"] == "Instagram" and out["ts"] == 1600.0
+    assert fake.read_app_closes(UID)[-1]["app"] == "Instagram"
+    state = fake.get_state(UID)
+    assert state["app_name"]["v"] == "Instagram"
+    assert state["app_state"]["v"] == "closed"
+    # open 那条事件行不受影响
+    assert fake.read_app_opens(UID)[-1]["app"] == "Instagram"
+
+
+def test_app_close_aligns_all_three_timestamps(env):
+    """三格 ts 必须一起刷新到 close 时刻：否则 900s TTL 到点时 app_name 先
+    过期而 app_state 还在，agent 会看到「关闭了一个 null」。"""
+    fake, _ = env
+    service.app_open(UID, "Instagram", category="social", client_ts=1000.0)
+    service.app_close(UID, "Instagram", category="social", client_ts=1600.0)
+    state = fake.get_state(UID)
+    assert state["app_name"]["ts"] == 1600.0
+    assert state["app_category"]["ts"] == 1600.0
+    assert state["app_state"]["ts"] == 1600.0
+
+
+def test_app_close_ignores_a_non_current_app(env):
+    """后台被系统杀掉的旧 app，其 close 的 ts 比新 app 的 open 更新（ts 守卫
+    放行），绝不能把当前前台覆盖掉。"""
+    fake, _ = env
+    service.app_open(UID, "douyin", category="social", client_ts=1000.0)
+    service.app_open(UID, "wechat", category="social", client_ts=2000.0)
+    out, code = service.app_close(UID, "douyin", category="social", client_ts=2100.0)
+    assert code == 200
+    state = fake.get_state(UID)
+    assert state["app_name"]["v"] == "wechat"          # 当前前台不动
+    assert state["app_state"]["v"] == "foreground"     # 也没被改成 closed
+    assert fake.read_app_closes(UID)[-1]["app"] == "douyin"   # 事件照记
+
+
+def test_app_close_matches_app_name_case_insensitively(env):
+    """快捷指令里用户手填的 app 名大小写/空格不稳定。"""
+    fake, _ = env
+    service.app_open(UID, "Instagram", category="social", client_ts=1000.0)
+    service.app_close(UID, "  instagram ", client_ts=1600.0)
+    assert fake.get_state(UID)["app_state"]["v"] == "closed"
+
+
+def test_app_close_keeps_category_when_not_supplied(env):
+    """close 的 URL 不带 category（iOS 生成的 URL 只有 key+app），不能把已知
+    category 抹成 None。"""
+    fake, _ = env
+    service.app_open(UID, "Instagram", category="social", client_ts=1000.0)
+    service.app_close(UID, "Instagram", client_ts=1600.0)
+    assert fake.get_state(UID)["app_category"]["v"] == "social"
+
+
+def test_app_close_requires_app(env):
+    fake, _ = env
+    out, code = service.app_close(UID, "")
+    assert code == 400 and out["error"] == "app_required"
+    assert fake.read_app_closes(UID) == []
+
+
 def test_app_open_via_get_route(env, monkeypatch):
     """End-to-end: GET with everything (incl. key) in the URL query string."""
 
@@ -500,6 +594,17 @@ def test_app_open_via_get_route(env, monkeypatch):
     r = client.get("/v1/perception/app_open?key=APIKEY&app=Instagram&category=social&ts=1000")
     assert r.status_code == 200 and r.get_json()["app"] == "Instagram"
     assert fake.get_state(UID)["app_name"]["v"] == "Instagram"
+
+
+def test_app_close_via_get_route(env, monkeypatch):
+    """走真实的 read_core 参数提取（含 bundle_id / client_ts 两组别名）。"""
+    fake, _ = env
+    client = _PerceptionClient(fake)
+    client.get("/v1/perception/app_open?key=APIKEY&app=Instagram&ts=1000")
+    r = client.get("/v1/perception/app_close?key=APIKEY&bundle_id=Instagram&client_ts=1600")
+    assert r.status_code == 200
+    assert r.get_json()["app"] == "Instagram"
+    assert fake.get_state(UID)["app_state"]["v"] == "closed"
 
 
 def test_future_client_ts_clamped(env):

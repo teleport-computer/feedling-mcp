@@ -238,6 +238,7 @@ def test_agent_perception_app_signal_reads_shortcut_snapshot(monkeypatch):
     assert body["signals"]["app"] == {
         "app_name": "Spotify",
         "app_category": "music",
+        "app_state": None,
     }
 
 
