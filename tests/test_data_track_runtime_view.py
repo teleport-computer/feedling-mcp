@@ -12,17 +12,10 @@ import pytest  # noqa: E402
 
 from admin import admin_core as _admin_core  # noqa: E402
 
-import base64  # noqa: E402
-import itertools  # noqa: E402
-
-import db  # noqa: E402
 from accounts import registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
-
-
-_route_pk_counter = itertools.count(9_000)
 
 
 @pytest.fixture()
@@ -170,6 +163,30 @@ def test_runtime_health_level_ignores_empty_samples():
     assert reasons == []
 
 
+def test_runtime_health_level_warns_on_wedged_lane_with_no_terminal_jobs():
+    # I-3: worker 活着、job 全卡在 claimed/running（无 pending，无 missing/p95
+    # 触发），当前实现全部指标点跳过 → "ok"。这条 lane 的 open>0 却 sampled_jobs
+    # ==0 本身就是矛盾态，必须至少 warn。
+    level, reasons = _dt._runtime_health_level(
+        _payload([_lane(
+            sampled_jobs=0, completed=0, failed=0, expired=0,
+            failure_rate=None, p50_ok_ms=None, p95_ok_ms=None,
+            capture={"complete": 0, "partial": 0, "missing": 0, "open": 57},
+        )])
+    )
+    assert level != "ok"
+    assert any("在飞" in r or "终态" in r for r in reasons)
+
+
+def test_runtime_health_level_bad_on_inflight_exceeding_capacity():
+    # I-3: inflight > capacity 是明确的矛盾态（池账目对不上），必须判 bad。
+    level, reasons = _dt._runtime_health_level(
+        _payload(inflight=57, capacity=8)
+    )
+    assert level == "bad"
+    assert any("容量" in r or "capacity" in r.lower() for r in reasons)
+
+
 def test_runtime_health_level_takes_worst_across_lanes():
     level, _ = _dt._runtime_health_level(_payload([
         _lane(lane="chat"),
@@ -192,9 +209,41 @@ def test_runtime_failure_code_buckets_unknown_free_text():
     assert _dt._runtime_failure_code(None) == "other"
 
 
-def test_runtime_failure_code_truncates_long_known_prefix():
-    long_code = "turn_failed:" + ("x" * 200)
-    assert len(_dt._runtime_failure_code(long_code)) == 64
+def test_runtime_failure_code_truncates_long_valid_code():
+    # 新语义：形状合法（scope:kind，只含 [a-z0-9_]）的码无论多长都放行、截断到 64。
+    long_code = "wake_failed:" + ("x" * 200)
+    result = _dt._runtime_failure_code(long_code)
+    assert result == long_code[:64]
+    assert len(result) == 64
+
+
+def test_runtime_failure_code_rejects_free_text_after_known_prefix():
+    # 这是被移除的行为：旧实现只要 startswith("turn_failed:") 就无条件放行 +
+    # 截断，哪怕冒号后是含空格/中文的自由文本（"turn_failed: 我的身份证号是
+    # 1234" 这种）。新实现按形状校验，冒号后必须仍是 [a-z0-9_]+，自由文本一律
+    # 落 other。
+    leaked = "turn_failed:" + ("我的身份证号是 1234 " * 20)
+    assert _dt._runtime_failure_code(leaked) == "other"
+
+
+def test_runtime_failure_code_covers_non_chat_lane_shapes():
+    # I-2: 白名单曾经只放行 turn_failed:/queue_timeout/lease_timeout 三种形状，
+    # 其余全部写入点（wake_failed:*/extraction_failed:*/compaction_failed:*/
+    # mcp_mutation_outcome_unknown/runtime_expired）塌成 other。heartbeat lane
+    # 的失败码正是 wake_failed:*，本页专门给 heartbeat 加了日报口径链接，不能
+    # 让它的失败原因永远只显示 other。
+    assert _dt._runtime_failure_code("wake_failed:timeouterror") == "wake_failed:timeouterror"
+    assert _dt._runtime_failure_code("extraction_failed:valueerror") == "extraction_failed:valueerror"
+    assert _dt._runtime_failure_code("compaction_failed:keyerror") == "compaction_failed:keyerror"
+    assert _dt._runtime_failure_code("mcp_mutation_outcome_unknown") == "mcp_mutation_outcome_unknown"
+    assert _dt._runtime_failure_code("runtime_expired") == "runtime_expired"
+
+
+def test_runtime_failure_code_rejects_malformed_shapes():
+    # 含空格/中文/大写的串一律落 other，即便"看起来像"一个已知码。
+    assert _dt._runtime_failure_code("Wake_Failed:TimeoutError") == "other"
+    assert _dt._runtime_failure_code("wake failed: timeout") == "other"
+    assert _dt._runtime_failure_code("wake_failed: 超时") == "other"
 
 
 # ---- 边界值测试：精确阈值 ----
@@ -295,6 +344,21 @@ def test_render_runtime_health_page_escapes_and_buckets_failure_codes(bound_requ
     assert "other" in html_out
 
 
+def test_render_runtime_health_page_merges_duplicate_other_rows(bound_request):
+    # I-2: 清洗发生在渲染层且不重新聚合——同一 lane 的两个不同原始码若都被清洗
+    # 成 other，会渲染成两行都叫 other（reviewer 实证：('other','3') 和
+    # ('other','2') 两行）。渲染前必须按 (lane, code) 重新合并计数。
+    html_out = _dt._render_runtime_health_page(_payload([
+        _lane(failure_rate=0.5, failed=5, completed=5, top_failures=[
+            {"code": "some free text A", "count": 3},
+            {"code": "some free text B", "count": 2},
+        ]),
+    ]))
+    # 只应该出现一行 other，计数合并为 5
+    assert html_out.count("<code>other</code>") == 1
+    assert "<td>5</td>" in html_out
+
+
 def test_render_runtime_health_page_points_at_break_glass_inspector(bound_request):
     html_out = _dt._render_runtime_health_page(_payload([
         _lane(failure_rate=0.5, failed=1, completed=1,
@@ -327,6 +391,34 @@ def test_render_runtime_health_page_failure_rate_three_tiers(bound_request):
     assert "pill ok" in good      # 3% 应显示绿色 pill
     assert "pill warn" in warn    # 8% 应显示黄色 pill
     assert "pill bad" in bad      # 20% 应显示红色 pill
+
+
+def test_render_runtime_health_page_uses_bad_class_for_bad_conclusion(bound_request):
+    # I-1: level="bad" 曾被映射到 CSS class "warn"，页顶总体结论永远不会真正
+    # 变红——100% 失败率与 6% 失败率在页顶显示成同一个橙色。
+    html_out = _dt._render_runtime_health_page(_payload([
+        _lane(failure_rate=1.0, failed=20, completed=0),
+    ]))
+    assert "<span class=\"bad\">" in html_out or "<span class='bad'>" in html_out
+    assert "总体结论" in html_out
+    # 不应该把 bad 结论渲染成 warn class
+    import re as _re
+    m = _re.search(r"总体结论：<span class=\"([a-z]+)\">", html_out)
+    assert m is not None, html_out
+    assert m.group(1) == "bad"
+
+
+def test_render_runtime_health_page_does_not_claim_ok_when_wedged(bound_request):
+    # I-3: reviewer 实证——lane 全部 job 在飞（无 pending，worker 心跳还活着），
+    # 页面之前会显示「这不是故障」+ 总体结论「正常」。这是本分支专门要修的洞:
+    # 数据在页面上，但人被页面告知没事。
+    html_out = _dt._render_runtime_health_page(_payload([_lane(
+        sampled_jobs=0, completed=0, failed=0, expired=0,
+        failure_rate=None, p50_ok_ms=None, p95_ok_ms=None,
+        capture={"complete": 0, "partial": 0, "missing": 0, "open": 57},
+    )], inflight=57, capacity=8))
+    assert "这不是故障" not in html_out
+    assert "正常" not in html_out
 
 
 def test_render_runtime_health_page_shows_capture_open_bucket(bound_request):

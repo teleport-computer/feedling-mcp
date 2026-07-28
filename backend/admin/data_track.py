@@ -2088,24 +2088,28 @@ _RUNTIME_HEALTH_P95_BAD_MS = 120_000
 _RUNTIME_HEALTH_PENDING_WARN_SEC = 60
 _RUNTIME_HEALTH_PENDING_BAD_SEC = 180
 _RUNTIME_FAILURE_CODE_MAX = 64
-_RUNTIME_FAILURE_KNOWN_EXACT = frozenset({"queue_timeout", "lease_timeout"})
-_RUNTIME_FAILURE_KNOWN_PREFIX = "turn_failed:"
+# 按形状放行，不按枚举前缀放行。agent_jobs.last_error 的真实写入点远不止
+# turn_failed:/queue_timeout/lease_timeout 三种（wake_failed:*、
+# extraction_failed:*、compaction_failed:*、mcp_mutation_outcome_unknown、
+# runtime_expired 都是 mark_failed/mark_expired 落库的合法码），枚举前缀白名单
+# 会把 chat 之外每条 lane 的失败原因塌成 other。所有已知写入点产出的码都是
+# "scope:kind" 或裸 "snake_case"，且只含小写字母/数字/下划线——照此收紧，而不
+# 是照 jobs_store._TERMINAL_ERROR_CODE_RE（那个更宽松的 `:`/`-` 全字符集是给
+# outbox 用的，admin 层不 import model_api_runtime，故在此单独定义）。
+_RUNTIME_FAILURE_CODE_RE = re.compile(r"^[a-z0-9_]+(:[a-z0-9_]+)?$")
 
 
 def _runtime_failure_code(raw) -> str:
-    """失败码白名单化：只放行已知枚举形状，其余归入 other。
+    """失败码白名单化：只放行已知形状（scope:kind 或裸 snake_case），其余归入
+    other。
 
-    实测 agent_jobs.last_error 当前全是干净枚举码，本函数是为将来有人往该字段
-    写自由文本时页面仍不渗内容——data-track 是 metadata-only 面。
+    形状校验而非前缀校验：`turn_failed:` 前缀曾经无条件放行 + 截断，哪怕冒号
+    后是含空格/中文的自由文本也会被截断显示——这是本函数要堵住的口子。
     """
     code = str(raw or "").strip()
-    if not code:
+    if not code or not _RUNTIME_FAILURE_CODE_RE.fullmatch(code):
         return "other"
-    if code in _RUNTIME_FAILURE_KNOWN_EXACT:
-        return code
-    if code.startswith(_RUNTIME_FAILURE_KNOWN_PREFIX):
-        return code[:_RUNTIME_FAILURE_CODE_MAX]
-    return "other"
+    return code[:_RUNTIME_FAILURE_CODE_MAX]
 
 
 def _runtime_health_level(payload: dict) -> tuple[str, list[str]]:
@@ -2128,8 +2132,9 @@ def _runtime_health_level(payload: dict) -> tuple[str, list[str]]:
 
     for lane in payload.get("lanes") or []:
         name = str(lane.get("lane") or "unknown")
+        sampled = int(lane.get("sampled_jobs") or 0)
         rate = lane.get("failure_rate")
-        if rate is not None and int(lane.get("sampled_jobs") or 0) > 0:
+        if rate is not None and sampled > 0:
             if rate >= _RUNTIME_HEALTH_FAILURE_BAD:
                 escalate("bad", f"{name} 失败率 {rate * 100:.0f}%")
             elif rate >= _RUNTIME_HEALTH_FAILURE_WARN:
@@ -2146,9 +2151,27 @@ def _runtime_health_level(payload: dict) -> tuple[str, list[str]]:
         if missing > 0:
             escalate("bad", f"{name} trajectory capture missing {missing} 条")
 
+        # 卡死形态（claimed/running，无 pending，worker 心跳还活着）：这条 lane
+        # 的 job 全部还没到终态，rate/p95/missing 全部为空/0，池层面也看不出
+        # 异常——除了这一件事本身就是矛盾态。sampled_jobs==0 却 capture.open>0
+        # 意味着窗口内有回合在飞但一个都没走到终态，必须至少 warn，否则值班台
+        # 会在卡死时告诉人「没事」（本分支专门修过一次"卡死 lane 不消失"，但判
+        # 定层和文案层此前没跟上）。
+        open_count = int((lane.get("capture") or {}).get("open") or 0)
+        if sampled == 0 and open_count > 0:
+            escalate(
+                "warn",
+                f"{name} 有 {open_count} 个回合在飞但无一终态（可能卡死）",
+            )
+
     pool = payload.get("pool") or {}
     if int(pool.get("live_workers") or 0) <= 0:
         escalate("bad", "无存活 worker")
+
+    inflight = int(pool.get("inflight") or 0)
+    capacity = int(pool.get("capacity") or 0)
+    if inflight > capacity:
+        escalate("bad", f"在飞 {inflight} 超过容量 {capacity}（矛盾态）")
 
     age = pool.get("oldest_pending_age_sec")
     if age is not None:
@@ -2230,7 +2253,7 @@ def _render_runtime_health_page(payload: dict) -> str:
     pool = payload.get("pool") or {}
 
     level_text = {"ok": "正常", "warn": "注意", "bad": "异常"}[level]
-    level_cls = {"ok": "ok", "warn": "warn", "bad": "warn"}[level]
+    level_cls = {"ok": "ok", "warn": "warn", "bad": "bad"}[level]
     reason_text = ("：" + "；".join(html.escape(r) for r in reasons)) if reasons else ""
 
     window_labels = {24: "24 小时", 168: "7 天", 720: "30 天"}
@@ -2306,22 +2329,44 @@ def _render_runtime_health_page(payload: dict) -> str:
     failure_rows = []
     for lane in lanes:
         name = html.escape(str(lane.get("lane") or "unknown"))
+        # 清洗发生在渲染层且不重新聚合：同一 lane 的两个不同原始码若都被清洗成
+        # 同一个桶（most commonly "other"），必须在渲染前按清洗后的码合并计数，
+        # 否则会渲染成两行都叫 other（reviewer 实证：('other',3) 和
+        # ('other',2) 两行，看起来像两个不同故障）。
+        merged: dict[str, int] = {}
         for item in lane.get("top_failures") or []:
             code = _runtime_failure_code(item.get("code"))
+            merged[code] = merged.get(code, 0) + int(item.get("count") or 0)
+        for code, count in sorted(merged.items(), key=lambda kv: kv[1], reverse=True):
             failure_rows.append(
                 "<tr>"
                 f"<td>{name}</td>"
                 f"<td><code>{html.escape(code)}</code></td>"
-                f"<td>{_fmt_count(item.get('count'))}</td>"
+                f"<td>{_fmt_count(count)}</td>"
                 "</tr>"
             )
 
-    empty_note = (
-        "<div class='muted'>当前窗口无样本——这不是故障，是这条口径当天没有数据。"
-        "可切到 7 天或 30 天。</div>"
-        if not any(int(l.get("sampled_jobs") or 0) for l in lanes)
-        else ""
-    )
+    # "这不是故障" 只在真的什么都没发生时才说得出口：没有终态样本、没有在飞的
+    # 回合（capture.open）、池里也没有 inflight/pending。若窗口内无终态 job 但
+    # 有回合在飞，那不是"没数据"，是卡死的形状——I-3 的教训：之前这两种情形共
+    # 用同一句"这不是故障"，把卡死误报成正常的空窗口。
+    no_terminal_samples = not any(int(l.get("sampled_jobs") or 0) for l in lanes)
+    total_open = sum(int((l.get("capture") or {}).get("open") or 0) for l in lanes)
+    pool_inflight = int(pool.get("inflight") or 0)
+    pool_pending = int(pool.get("pending") or 0)
+    if not no_terminal_samples:
+        empty_note = ""
+    elif total_open == 0 and pool_inflight == 0 and pool_pending == 0:
+        empty_note = (
+            "<div class='muted'>当前窗口无样本——这不是故障，是这条口径当天没有数据。"
+            "可切到 7 天或 30 天。</div>"
+        )
+    else:
+        empty_note = (
+            "<div class='muted bad'>窗口内无终态 job，但有 "
+            f"{total_open} 个回合在飞（在飞 {pool_inflight} / 排队 {pool_pending}）"
+            "——可能是卡死，不是「当天没数据」。</div>"
+        )
 
     return f"""<!doctype html>
 <html>
