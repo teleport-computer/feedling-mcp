@@ -152,6 +152,24 @@ token 数、provider/model、错误**类名**，不含 prompt、回复、上游�
 四条（成功/失败字段映射、非 provider 事件不记、原始错误体不进台账、写入失败不影响
 turn）。
 
+**[DECISION] 折叠批次 200→50、tail 预算 20→50（2026-07-28）**。解密 usr_90184 的
+`provider_error` 后确认：他和 usr_7f30 挂在**同一条 lane（prompt_catchup）**，是同
+一个「批次过大」的两种表现——usr_7f30 的 200 条渲染不成合规 bullet（折叠被拒 →
+死锁），usr_90184 的 200 条在 compaction 的 `timeout=60.0` 内答不完
+（`duration_ms=60340`、`error_class=transient`、`status=null`，即根本没收到 HTTP
+响应，不是中转拒绝）。四分之一大小的请求两头都缓解。
+
+tail 预算 20→50 是更上游的一刀：**它决定一个 turn 是否进入折叠路径**。积压不超过它
+就整批留在逐字 tail 里，一次折叠都不做。20 太低，几乎每个活跃用户每回合都在折叠；
+而全程健康的那两个 prod 用户（21/21、13/15）恰恰是因为历史从没到过这个线。
+
+⚠️ 权衡：`plan_provider_round` 里**对话消息是 required 组件，超预算不会被裁而是直接
+`prompt_frontier_exhausted`**（只有 tool schema 是 optional）。多带 30 条逐字消息约
+数千 token；prod 健康用户 prompt 峰值 22,768 / 15,554，对 120k 可用预算安全。唯一
+的 frontier_exhausted 记录（usr_5adeef，07-24 17:42）发生在 unaudited default 还是
+32768 的时期，07-25 12:31 已改为 131072。若将来有用户自配小 context_window 或中转
+真实窗口偏小，这两个值仍是首先要回调的旋钮（都是 `${VAR:-}` 形式，改 env 即可）。
+
 **[ADD] `tools/v2_user_triage.py`** —— 把这次的排查路径固化成一条命令（只读、不
 解密）：runtime / jobs / metrics / summary / backlog head / trajectory / provider
 ledger / peers。四个判据是事故的直接产物：水位停滞时长、队头 R2 指针是否超批次
