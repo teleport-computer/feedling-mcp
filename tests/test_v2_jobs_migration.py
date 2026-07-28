@@ -252,7 +252,13 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0062_v2_failure_reply").down_revision == (
         "0061_v2_adaptive_tail_metrics"
     )
-    assert script.get_current_head() == "0062_v2_failure_reply"
+    # 刻意不断言 head 的具体 revision 名：每合入一个 migration 就要回来改这一行，
+    # 而"当前 head 叫什么"本身没有约束价值。真正要防的"链分叉成多头"已由
+    # tests/test_genesis_worker_claim_migration.py::test_alembic_single_head 专门守着。
+    # 2026-07-28：本行原钉死 "0061_v2_adaptive_tail_metrics"，被 0062 合入撞红——
+    # 与 test_v2_summary_watermark_seq 当初那次是同一类脆弱断言。合 test 分支时
+    # 保留了它新增的 0062 down_revision 断言（守拓扑，有价值），只丢掉钉 head 名那行。
+    # 上面逐条 down_revision 的断言保留：它们守的是链的**拓扑**，那才是这个测试的价值。
 
 
 def test_provider_health_schema_is_runtime_neutral():

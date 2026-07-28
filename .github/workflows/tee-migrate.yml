@@ -1,0 +1,115 @@
+# .github/workflows/tee-migrate.yml — alembic_tee 迁移落地通道
+#
+# 为什么不套 tee-replicate.yml 的 admin-端点遥控器模式：alembic_tee 要 owner
+# 角色（TEE_MIGRATION_DATABASE_URL），CVM 里的 backend 只有 app 角色。故本
+# workflow 在 runner 上直连 TEE 跑迁移。TEE 走 dstack 网关 direct-TLS，需要
+# libpq >= 17（psycopg[binary] 3.2 自带的 libpq 满足）+ sslnegotiation=direct。
+#
+# ⚠️ 这里刻意用 sslmode=verify-full + CA，**不照抄生产 backend 的 sslmode=require**
+# （docker-compose.phala.yaml 里 TEE_DATABASE_URL 的注释说明它因"无 CA 分发"而用
+# require）。两者处境不同：backend 与 TEE 同在 Phala prod9 内网、且只有 app 角色
+# （无 DDL 权限）；而本 workflow 从**公网**的 GitHub runner 连过去、拿的是 **owner
+# 角色**执行 DDL。对这种权限的连接不验证服务端身份，等于给 MITM 开一扇能改 schema
+# 的门。CA 从机密文件取（见 Step 3），两环境各一套、不通用。
+#
+# 历史教训：0002/0003 合并后从未在实库执行（2026-07-27 实测两环境都停在 0001）。
+# 故最后一步强制断言 alembic_tee_version == 代码里的 head，对不上就红。
+name: TEE migrate
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 目标环境
+        type: choice
+        options: [test, prod]
+        required: true
+      confirm:
+        description: '输入 MIGRATE-TEE（prod 需输入 MIGRATE-TEE-PROD）确认（防误触）'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-24.04
+    concurrency: tee-migrate
+    steps:
+      - name: Typo guard
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          if [ "$ENVIRONMENT" = "prod" ]; then WANT=MIGRATE-TEE-PROD; else WANT=MIGRATE-TEE; fi
+          test "$CONFIRM" = "$WANT" || { echo "::error::confirm mismatch — ${ENVIRONMENT} 需要输入 ${WANT}"; exit 1; }
+
+      - uses: actions/checkout@v4
+        # test 环境跑 test 分支、prod 跑 main：与 app 发布流向一致。
+        with:
+          ref: ${{ inputs.environment == 'prod' && 'main' || 'test' }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install alembic + psycopg
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r backend/requirements.lock
+
+      # ⚠️ 下面三个 step 一律「两套机密都注入、在 shell 里按环境挑」，**绝不**写成
+      # `${{ inputs.environment == 'prod' && secrets.PROD_X || secrets.TEST_X }}`。
+      # GH 表达式的 &&/|| 是 JS 语义（返回值而非布尔，空串是 falsy）：PROD_X 恰好
+      # 为空时会静默短路 fallback 到 TEST_X，于是非空校验照样通过，而一次标记为
+      # prod 的 dispatch 实际跑在 test 库上、Assert 还全部匹配、job 绿灯——正好复现
+      # 本 workflow 要根治的那类「以为执行了其实没执行」的故障，只是换了个方向。
+      # 本仓库已有同款教训与既定写法：见 pg-deploy.yml:96-99（那次是注进 prod CVM
+      # 的却是 test 的密码）。按环境挑错只会挑到空值 → fail-closed。
+      # 注意 pg-deploy.yml:43 的 `ref: ${{ ... && 'main' || 'test' }}` 不受此影响：
+      # 它的两个分支是字面量，永远非空。危险的只是把它用在可能为空的 secrets 上。
+      - name: Write CA cert
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          TEST_CA_PEM: ${{ secrets.TEST_TEE_PG_CA_PEM }}
+          PROD_CA_PEM: ${{ secrets.PROD_TEE_PG_CA_PEM }}
+        run: |
+          umask 077
+          if [ "$ENVIRONMENT" = "prod" ]; then CA_PEM="$PROD_CA_PEM"; else CA_PEM="$TEST_CA_PEM"; fi
+          printf '%s' "$CA_PEM" > /tmp/tee-ca.crt
+          test -s /tmp/tee-ca.crt || { echo "::error::${ENVIRONMENT} 的 CA cert secret 为空或未创建"; exit 1; }
+
+      - name: Run alembic_tee upgrade head
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          TEST_DSN: ${{ secrets.TEST_TEE_MIGRATION_DSN }}
+          PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
+        run: |
+          if [ "$ENVIRONMENT" = "prod" ]; then DSN="$PROD_DSN"; else DSN="$TEST_DSN"; fi
+          test -n "$DSN" || { echo "::error::${ENVIRONMENT} 的 TEE_MIGRATION_DSN secret 为空或未创建"; exit 1; }
+          # DSN 里必须已含 sslmode=verify-full&sslnegotiation=direct；这里只补 CA 路径。
+          export TEE_MIGRATION_DATABASE_URL="${DSN}&sslrootcert=/tmp/tee-ca.crt"
+          python -m backend.alembic_tee upgrade
+
+      - name: Assert version == code head
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          TEST_DSN: ${{ secrets.TEST_TEE_MIGRATION_DSN }}
+          PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
+        run: |
+          if [ "$ENVIRONMENT" = "prod" ]; then DSN="$PROD_DSN"; else DSN="$TEST_DSN"; fi
+          test -n "$DSN" || { echo "::error::${ENVIRONMENT} 的 TEE_MIGRATION_DSN secret 为空或未创建"; exit 1; }
+          export TEE_MIGRATION_DATABASE_URL="${DSN}&sslrootcert=/tmp/tee-ca.crt"
+          python - <<'PY'
+          import os, sys, psycopg
+          sys.path.insert(0, "backend")
+          from alembic.config import Config
+          from alembic.script import ScriptDirectory
+          cfg = Config("backend/alembic_tee/alembic.ini")
+          cfg.set_main_option("script_location", "backend/alembic_tee")
+          want = ScriptDirectory.from_config(cfg).get_current_head()
+          with psycopg.connect(os.environ["TEE_MIGRATION_DATABASE_URL"]) as c:
+              got = c.execute("select version_num from alembic_tee_version").fetchone()[0]
+          print(f"code head={want} db={got}")
+          assert got == want, f"alembic_tee 未落到 head: db={got} want={want}"
+          PY
