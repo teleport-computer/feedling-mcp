@@ -114,11 +114,20 @@ REGISTRY: dict[str, Entry] = {
     "agent_jobs": Entry(SNAPSHOT, "agent 作业表，status 流转，明文"),
     "agent_runtime_instances": Entry(
         SNAPSHOT,
-        "V1 runtime 实例登记（租约/状态高频原地 UPDATE）。不走 MIRROR：leases.py 有 8 处"
-        "租约热路径写点，逐个挂双写的代价和风险都高于整表刷；prod 实测 230 行 0 孤儿"),
+        "V1 runtime 实例登记（租约/状态高频原地 UPDATE）。agent_runtime/leases.py 的 8 处"
+        "租约热路径写点在文件顶部明确注明有意不镜像（ephemeral TTL 锁，与 proactive "
+        "store_v2 的 user_blobs lease 同规则）；补齐 MIRROR 要逐点接线且价值有限，整表"
+        "快照刷代价更低；prod 实测 230 行 0 孤儿，SNAPSHOT 的 FK 前提满足"),
     "agent_runtime_supervisor_heartbeats": Entry(
         SNAPSHOT,
-        "V1 supervisor 心跳（单行，每次心跳原地 UPDATE），同上走整表刷"),
+        "V1 supervisor 心跳（单行，每次心跳原地 UPDATE）。⚠️ 这张表其实有 MIRROR 双写："
+        "db.py 的 set_supervisor_instance_heartbeat（upsert）/ "
+        "prune_supervisor_instance_heartbeats（delete）两个写点都在主写之后调了 "
+        "mirror.execute，两处保留不动（tick 之间更新鲜，删除只省两次写、无收益）。但不"
+        "登记 MIRROR：这条镜像没有 reconciler.TABLES 兜底，漂了没人拉回来；若改登记 "
+        "MIRROR 并接 reconciler，_sample_plaintext 会逐列比对 updated_at——这一列每次"
+        "心跳都在动，会把它变成 strict gate 上的永久红。SNAPSHOT 每 tick 整表替换天然"
+        "收敛，不需要按行比对"),
     "agent_status_events": Entry(SNAPSHOT, "agent 状态事件，明文 detail_json"),
     "chat_r2_cleanup": Entry(SNAPSHOT, "R2 清理队列，行会被删，明文"),
     "chat_r2_lifecycle": Entry(SNAPSHOT, "R2 生命周期状态，UPDATE 密集，明文"),

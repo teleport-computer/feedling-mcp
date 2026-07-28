@@ -65,9 +65,16 @@ reconciler.TABLES`）互不校验，谁都不是全集——Runtime V2 的 19 �
   UPDATE/DELETE"的 27 张表（`agent_action_queue`/`v2_turn_metrics`/`v2_runtime_
   control` 等）用 `TRUNCATE`+`COPY` 整表原子替换，不必像 CIPHERTEXT 那样为每
   张可变表单独接 requeue 补偿。`agent_runtime_instances`/`agent_runtime_
-  supervisor_heartbeats` 最初按"双写热路径"标了 MIRROR，实测这两张表两边都
-  没有真实的写路径（`leases.py` 8 处租约热路径写点只写 RDS）——改判 SNAPSHOT，
-  0004 迁移已建表、prod 实测 230+1 行且 0 孤儿，FK 前提满足。
+  supervisor_heartbeats` 最初按"双写热路径"标了 MIRROR，实测两张表情况不同但
+  结论一致——都改判 SNAPSHOT：`agent_runtime_instances` 的 8 处租约热路径写点
+  （`agent_runtime/leases.py`）确实只写 RDS（文件顶部注明有意不镜像，ephemeral
+  TTL 锁）；`agent_runtime_supervisor_heartbeats` 其实**有** `db.py` 的 mirror
+  双写（upsert/prune 两个写点都调了 `mirror.execute`，原样保留不动），但这条
+  镜像没有 `reconciler.TABLES` 兜底、漂了没人拉回来，且心跳每次都改
+  `updated_at`，接 reconciler 会在 strict 逐列比对上变成永久红——SNAPSHOT 每
+  tick 整表替换天然收敛，不需要这些。0004 迁移已建表、prod 2026-07-28 复测
+  230+1 行且 0 孤儿（0004 迁移里写的 220 行是 07-27 写迁移时的旧值），FK 前提
+  满足。
 - **`tee_replicator.worker._TABLES` 接入 7 张新密文表**（`chat_message_
   archive`/`model_api_credentials`/`v2_conversation_summary(+_segments)`/
   `v2_trajectory_events`/`v2_trajectory_reviews`/`v2_workspace_entries`）。

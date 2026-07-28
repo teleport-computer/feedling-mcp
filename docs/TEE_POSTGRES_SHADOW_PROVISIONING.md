@@ -191,6 +191,29 @@ typo-guard 模式）：
 两个 TEE 实库都已 `0001→0004`、各 54 张表；日后的新 revision 一律走这个通道，不再
 手动执行。
 
+**迁移落地后核对 SNAPSHOT/新密文表的收敛情况**：`verify.run()` 对这些新 lane 用的
+是 advisory 判据（只抓"RDS 有行、TEE 一行都没有"，见 `tee_shadow/verify.py` 的
+`_rows_ok_advisory`），`verify_ok=true` 不等于两侧行数逐 tick 精确相等——那个更严格
+的结果存在每张表报告的 `strict_rows_ok` 字段里，只进日志和 `tee_sync_runs.report`
+的 JSONB，没有专门的扁平列。排障时（比如怀疑某张 SNAPSHOT 表的 TRUNCATE+COPY 一直
+没生效、TEE 侧留着孤儿行）用这条 SQL 从最近一次 tick 的 JSONB 里捞出 strict 判据
+为假的表：
+
+```sql
+SELECT ran_at, t.key AS table_name,
+       t.value->>'rds_rows' AS rds_rows,
+       t.value->>'tee_rows' AS tee_rows,
+       t.value->>'strict_rows_ok' AS strict_rows_ok
+FROM tee_sync_runs, jsonb_each(report->'verify'->'tables') AS t(key, value)
+WHERE ran_at = (SELECT max(ran_at) FROM tee_sync_runs)
+  AND (t.value->>'strict_rows_ok') = 'false'
+ORDER BY table_name;
+```
+
+`verify.run()` 的返回值也带了一个顶层 `strict_ok`（全表严格判据是否全过）和一行
+`[verify]` 日志里的 `strict_fail=[...]` 列表，二者与上面这条 SQL 是同一份数据的
+不同视角，任选其一即可。
+
 ---
 
 ## 3. 关键决策与坑（血泪）

@@ -40,6 +40,7 @@ import db
 from tee_replicator import transforms
 from tee_replicator import worker as _worker
 from tee_shadow import mirror, reconciler
+from tee_shadow import table_registry as reg
 
 log = logging.getLogger("feedling.tee_shadow")
 
@@ -405,18 +406,33 @@ def _rows_ok_advisory(rds_rows: int, tee_rows: int) -> bool:
     tee_sync_runs.snapshot_failures / replicate 的错误计数负责，不该由 verify 兜。
 
     保留严格结果供人看：调用方把它写进报告的 strict_rows_ok 字段。
+
+    **不变量：advisory 必须比 strict（``rds == tee`` 或密文表的 ``rds == tee +
+    pending``）更宽松，不能更严**。调用方对密文表必须传 ``tee_rows +
+    pending_rows``（SNAPSHOT 没有 pending 概念，直接传 ``tee_rows``）——只传
+    ``tee_rows`` 会让本函数在终态 pending 场景下反而比 strict 更严：一张表
+    第一批行恰好全是 ``local_only``/无 ``K_enclave``，worker 按设计把它们全部
+    打成终态 pending（``tee_rows`` 恒为 0，这是预期行为，``_split_pending`` 的
+    文档已经承诺过"它们本就不该有 TEE 对应行"），此时 ``rds_rows=1,
+    tee_rows=0`` 会被误判为"从没同步过"而永久拖红 ``rows_ok``——这正是本函数
+    要避免的那种没人再看的红灯，只是从"要求精确相等"换了个姿势重新发生。
     """
     return not (rds_rows > 0 and tee_rows == 0)
 
 
 def covered_tables() -> tuple[str, ...]:
-    """verify 实际会核对的表名集合。
+    """verify 实际会核对的报告 key 集合（不是纯粹的 RDS 表名集合——见下）。
 
     抽成函数是为了让守卫测试能断言它覆盖了注册表里所有非 SKIP 的表——verify
     漏掉一张表不会让任何东西变红，只会让那张表悄悄不被核对（"全绿假象"）。
-    """
-    from tee_shadow import table_registry as reg
 
+    ⚠️ 返回值里混着 ``_CIPHERTEXT_TABLES`` 的伪 key（目前只有 ``"identity"``，
+    见 ``table_registry.PSEUDO_CIPHERTEXT_TABLES``）——它不是一张真实的 RDS
+    表，是 ``user_blobs WHERE kind='identity'`` 这个子集的报告 key。拿本函数
+    的返回值直接拼 SQL（比如 ``FROM {t}``）的调用方必须自己先按
+    ``PSEUDO_CIPHERTEXT_TABLES`` 过滤掉它，否则会撞上 ``relation "identity"
+    does not exist``。
+    """
     return tuple(sorted(
         set(reconciler.TABLES)
         | set(_CIPHERTEXT_TABLES)
@@ -440,19 +456,18 @@ def run(*, sample_rate: float = 0.02) -> dict:
         mismatches.extend(_sample_plaintext(table, sample_rate))
 
     # SNAPSHOT lane：整表替换，只核行数（字段抽样对全量替换没有增量信息——
-    # 两侧要么整表一致，要么上一趟 snapshot 整个失败了）。
-    from tee_shadow import table_registry as reg
-
-    for table in reg.tables_in_lane(reg.SNAPSHOT):
-        with db.get_pool().connection() as src, mirror.get_tee_pool().connection() as dst:
+    # 两侧要么整表一致，要么上一趟 snapshot 整个失败了）。一对连接复用于全部
+    # 27 张表（而不是每张表各开一对）——这只是行数计数，不需要每表隔离事务。
+    with db.get_pool().connection() as src, mirror.get_tee_pool().connection() as dst:
+        for table in reg.tables_in_lane(reg.SNAPSHOT):
             rds_n = src.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
             tee_n = dst.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-        tables[table] = {
-            "rds_rows": rds_n, "tee_rows": tee_n, "row_drift": rds_n - tee_n,
-            "user_diffs": {},
-            "strict_rows_ok": rds_n == tee_n,
-            "rows_ok": _rows_ok_advisory(rds_n, tee_n),
-        }
+            tables[table] = {
+                "rds_rows": rds_n, "tee_rows": tee_n, "row_drift": rds_n - tee_n,
+                "user_diffs": {},
+                "strict_rows_ok": rds_n == tee_n,
+                "rows_ok": _rows_ok_advisory(rds_n, tee_n),
+            }
 
     for key, cfg in _CIPHERTEXT_TABLES.items():
         pending_rows = _pending_rows(cfg)
@@ -464,8 +479,21 @@ def run(*, sample_rate: float = 0.02) -> dict:
         table_report["requeue_backlog"] = requeue_backlog
         if not cfg.get("strict", True):
             table_report["strict_rows_ok"] = table_report["rows_ok"]
+            # 终态 pending 行本就不该有 TEE 对应行（_split_pending 的承诺）——
+            # 必须把 pending_rows 算进"这张表算不算已同步"里，否则一张表第一批
+            # 行恰好全被 worker 打成终态 pending（tee_rows 恒 0）会被这里误判
+            # 成"从没同步过"，advisory 反而比 strict 更严（见 _rows_ok_advisory
+            # 的不变量说明）。
             table_report["rows_ok"] = _rows_ok_advisory(
-                table_report["rds_rows"], table_report["tee_rows"])
+                table_report["rds_rows"],
+                table_report["tee_rows"] + table_report["pending_rows"])
+            # 把 per-user 明细挪去 advisory_user_diffs，user_diffs 置空：advisory
+            # 表的行数差异是"tick 之间的正常滞后"，不是需要人工介入的收敛问题，
+            # 不该被 tee_sync_scheduler 无差别累加进 unconverged_users（那会把
+            # "永久红灯没人看"的病从 rows_ok 挪到 unconverged_users，而验收判据
+            # 恰好只看 verify_ok/unconverged_tables，不看这一列）。
+            table_report["advisory_user_diffs"] = table_report["user_diffs"]
+            table_report["user_diffs"] = {}
         tables[key] = table_report
         if cfg["kind"] is None:
             # Task 7 新接入的 7 张表：信封列名各不相同，_sample_ciphertext_content
@@ -478,6 +506,21 @@ def run(*, sample_rate: float = 0.02) -> dict:
                 _sample_ciphertext_content(key, cfg, sample_rate, terminal_rows, decrypt_cache))
 
     rows_ok = all(t["rows_ok"] for t in tables.values())
-    report = {"tables": tables, "mismatches": mismatches, "ok": rows_ok and not mismatches}
-    log.info("[verify] ok=%s tables=%d mismatches=%d", report["ok"], len(tables), len(mismatches))
+    # strict_ok：忽略 advisory 放宽，逐表的严格判据是否全过。表没有单独的
+    # "strict_rows_ok" 字段时说明它本来就没被放宽过（reconciler 明文表、
+    # strict=True 的密文表），此时 rows_ok 本身就是严格结果。这一列目前只进
+    # 日志 + report 顶层——它的唯一消费方是人（排障时想知道"放宽之前到底红没
+    # 红"），advisory 的 rds=0/tee>0（SNAPSHOT 该删的没删、TEE 侧留孤儿）
+    # _rows_ok_advisory 完全无感，只有这个信号能暴露；见
+    # docs/TEE_POSTGRES_SHADOW_PROVISIONING.md 里查询 tee_sync_runs JSONB 的
+    # SQL 片段。
+    strict_fail_tables = sorted(
+        k for k, t in tables.items() if not t.get("strict_rows_ok", t["rows_ok"]))
+    strict_ok = not strict_fail_tables
+    report = {
+        "tables": tables, "mismatches": mismatches, "ok": rows_ok and not mismatches,
+        "strict_ok": strict_ok,
+    }
+    log.info("[verify] ok=%s strict_ok=%s tables=%d mismatches=%d strict_fail=%s",
+              report["ok"], strict_ok, len(tables), len(mismatches), strict_fail_tables)
     return report

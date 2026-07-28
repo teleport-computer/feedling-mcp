@@ -11,8 +11,10 @@ DDL 由 scripts/tee/derive_tee_ddl.py 从 prod RDS 实库派生后人工审校�
 （agent_runtime_instances / agent_runtime_supervisor_heartbeats）。这**不是**误操作，
 是 2026-07-27 用户在"TEE 全量对齐"目标下的明确决定：0002 当时按"V1 supervisor 已退役"
 撤销了这两张镜像，但实测 V1 在 RDS 侧仍然活着——prod 有 220 行 agent_runtime_instances
-和 1 行心跳，backend 也仍在写（db.py:335 / agent_runtime/leases.py:51）。既然目标是让
-TEE 成为 RDS 的完整副本以备扶正，就不能留这个缺口。
+和 1 行心跳（2026-07-27 写本 revision 时的实测值；2026-07-28 复测为 230 行，见
+`table_registry.py` 对应 Entry 的 reason，此处的历史数字不回改），backend 也仍在写
+（db.py:335 / agent_runtime/leases.py:51）。既然目标是让 TEE 成为 RDS 的完整副本以备
+扶正，就不能留这个缺口。
 已知代价（用户接受）：V1 真正退役后这两张表会在 RDS 侧消失，届时 TEE 侧需要再删一次。
 两表的列定义 + 索引原样复用 0001 baseline / 0002_drop_retired_supervisor 的 downgrade
 定义（经与 prod 当前实际 schema 核对逐列一致）。
