@@ -8182,8 +8182,17 @@ async def process_job(
             ):
                 raise LostJobLease("job lease expired or ownership changed")
 
-        async def _settle_failed_reply_target(code: str) -> None:
-            if lane != "chat" or not reply_parent_message_id:
+        async def _settle_legacy_failed_reply_target(code: str) -> None:
+            # The seq-native terminal-failure outbox owns cursor settlement.
+            # Calling the legacy helper there advances the input cursor before
+            # the encrypted failure reply commits and breaks retry/fence
+            # ordering. Timestamp-only callers still need the compatibility
+            # settlement because they have no transactional seq cursor.
+            if (
+                lane != "chat"
+                or seq_native
+                or not reply_parent_message_id
+            ):
                 return
             try:
                 await asyncio.to_thread(
@@ -8192,9 +8201,10 @@ async def process_job(
                     reply_parent_message_id,
                     code,
                 )
-            except Exception as exc:  # noqa: BLE001 — failure marker remains visible
+            except Exception as exc:  # noqa: BLE001 — status remains visible
                 log.warning(
-                    "[v2.worker] failed-input settlement failed user=%s job=%s code=%s",
+                    "[v2.worker] legacy failed-input settlement failed "
+                    "user=%s job=%s code=%s",
                     user_id,
                     job_id,
                     type(exc).__name__.lower(),
@@ -8214,7 +8224,7 @@ async def process_job(
                 claimed_by=claimed_by,
             )
             if owned and lane == "chat":
-                await _settle_failed_reply_target(code)
+                await _settle_legacy_failed_reply_target(code)
                 await asyncio.to_thread(
                     _surface_terminal_error,
                     deps,
@@ -9752,9 +9762,16 @@ async def process_job(
             on_file_reply=(
                 _on_file_reply if deps.load_workspace_file is not None else None
             ),
+            on_tool_event=chat_tool_activity_callback,
             required_file_suffixes=required_file_suffixes,
-            file_requirement_messages=coalesced,
-            resolve_required_file_suffixes=context.required_file_suffixes,
+            file_requirement_messages=(
+                coalesced if mutation_recovery_barrier is None else ()
+            ),
+            resolve_required_file_suffixes=(
+                context.required_file_suffixes
+                if mutation_recovery_barrier is None
+                else None
+            ),
             on_file_requirement_changed=_on_file_requirement_changed,
             fold_new_messages=fold_new_messages,
             add_usage=tm.add_call,
@@ -10068,7 +10085,7 @@ async def process_job(
             error_class=_turn_failure_error_class(e),
         )
         if owned and lane == "chat":
-            await _settle_failed_reply_target(message)
+            await _settle_legacy_failed_reply_target(message)
             await asyncio.to_thread(
                 _surface_terminal_error, deps, user_id, job_id, message
             )
@@ -10126,9 +10143,13 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
     lane = str(job.get("lane") or "chat")
     tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
 
-    async def _settle_traced_chat_failure(code: str) -> None:
+    async def _settle_legacy_traced_chat_failure(code: str) -> None:
         trace_id = str(job.get("trace_id") or "")
-        if lane != "chat" or not trace_id:
+        if (
+            lane != "chat"
+            or deps.read_messages_after_seq is not None
+            or not trace_id
+        ):
             return
         try:
             await asyncio.to_thread(
@@ -10137,13 +10158,15 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
                 trace_id,
                 code,
             )
-        except Exception as exc:  # noqa: BLE001 — failure marker remains visible
+        except Exception as exc:  # noqa: BLE001 — status remains visible
             log.warning(
-                "[v2.worker] traced failure settlement failed user=%s job=%s code=%s",
+                "[v2.worker] legacy traced failure settlement failed "
+                "user=%s job=%s code=%s",
                 user_id,
                 job_id,
                 type(exc).__name__.lower(),
             )
+
     if lane == _TRAJECTORY_REVIEW_LANE:
         return await _run_trajectory_review_turn(job, deps, tm)
     if lane in _EXTRACTION_LANES:
@@ -10351,7 +10374,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
                 jobs_store.mark_failed, job_id, err, claimed_by=claimed_by
             )
             if owned and lane == "chat":
-                await _settle_traced_chat_failure(err)
+                await _settle_legacy_traced_chat_failure(err)
                 await asyncio.to_thread(
                     _surface_terminal_error, deps, user_id, job_id, err
                 )
@@ -10404,7 +10427,7 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
             error_class=_turn_failure_error_class(e),
         )
         if owned and lane == "chat":
-            await _settle_traced_chat_failure(message)
+            await _settle_legacy_traced_chat_failure(message)
             await asyncio.to_thread(
                 _surface_terminal_error, deps, user_id, job_id, message
             )

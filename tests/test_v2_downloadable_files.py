@@ -66,6 +66,7 @@ def _run_loop(
     fold_batches=(),
     max_calls=3,
     trajectory_events=None,
+    tool_events=None,
 ):
     calls = []
     replies = []
@@ -96,6 +97,10 @@ def _run_loop(
         if trajectory_events is not None:
             trajectory_events.append((event_kind, payload))
 
+    async def record_tool(tc, event_kind, payload):
+        if tool_events is not None:
+            tool_events.append((tc.id, tc.name, event_kind, payload))
+
     monkeypatch.setattr(provider_client, "chat_completion_async", fake_chat)
     outcome = asyncio.run(
         tool_loop.run_tool_loop(
@@ -114,6 +119,7 @@ def _run_loop(
             on_trajectory_event=(
                 record_trajectory if trajectory_events is not None else None
             ),
+            on_tool_event=(record_tool if tool_events is not None else None),
         )
     )
     return outcome, calls, replies, messages_seen
@@ -182,6 +188,7 @@ def test_file_capable_chat_uses_v2_output_budget_without_changing_global_default
 
 def test_send_file_is_chat_only_and_invokes_explicit_callback(monkeypatch):
     files = []
+    tool_events = []
 
     async def on_file(path, revision):
         files.append((path, revision))
@@ -203,12 +210,20 @@ def test_send_file_is_chat_only_and_invokes_explicit_callback(monkeypatch):
             {"reply": "文件已经发给你了。", "tool_calls": [], "usage": {}},
         ],
         on_file_reply=on_file,
+        tool_events=tool_events,
     )
 
     assert "send_file" in calls[0]
     assert files == [("/workspace/计划.md", 2)]
     assert replies == [("文件已经发给你了。", True)]
     assert outcome.replied_intermediate is True
+    assert [
+        (call_id, name, event_kind)
+        for call_id, name, event_kind, _payload in tool_events
+    ] == [
+        ("f1", "send_file", "tool_call_started"),
+        ("f1", "send_file", "tool_call_result"),
+    ]
 
 
 def test_required_file_turn_offers_only_delivery_pipeline_tools(monkeypatch):

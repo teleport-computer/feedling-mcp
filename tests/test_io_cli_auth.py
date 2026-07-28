@@ -138,7 +138,7 @@ def test_main_emits_tool_trace_after_command_exit(monkeypatch, capsys):
 
 def test_memory_activity_metadata_uses_actual_items_and_complete_categories():
     assert io_cli._memory_activity_metadata(
-        "memory_search",
+        "memory_index",
         {
             "ok": True,
             "items": [
@@ -155,6 +155,12 @@ def test_memory_activity_metadata_uses_actual_items_and_complete_categories():
             {"key": "family", "count": 1},
         ],
     }
+
+
+def test_memory_index_keeps_its_own_activity_identity():
+    assert io_cli._activity_tool_name(
+        types.SimpleNamespace(verb="memory-index")
+    ) == "memory_index"
 
 
 def test_memory_activity_metadata_custom_bucket_falls_back_to_total():

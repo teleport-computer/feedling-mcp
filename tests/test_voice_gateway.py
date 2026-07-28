@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import sys
 import time
@@ -20,6 +21,17 @@ from enclave.routes import chat as enclave_chat
 from hosted import chat_send_core
 from voice import results
 from voice import routes_asgi
+
+
+def test_internal_voice_delta_requires_voice_reply_scope():
+    dependency = inspect.signature(
+        routes_asgi.internal_voice_delta
+    ).parameters["auth"].default.dependency
+
+    assert getattr(dependency, "__name__", "") == "_dep"
+    assert [cell.cell_contents for cell in dependency.__closure__ or ()] == [
+        "voice_reply"
+    ]
 
 
 def test_voice_token_is_scoped_signed_and_expires():

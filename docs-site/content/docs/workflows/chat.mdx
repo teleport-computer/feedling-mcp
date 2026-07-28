@@ -91,9 +91,10 @@ saved model route as an image observer. Read the current choice with `GET
 IO sends the candidate a generated image whose answer is not known in advance
 and records whether the returned observation proves image understanding.
 Selection and capability are separate: a reachable text-only model may remain
-selected with `effective_status: "unsupported"`, but an image send then returns
-`409 vision_model_required` before storing the turn. `mode: "follow_main"`
-performs the same check for a model-API main route.
+selected with `effective_status: "unsupported"` as settings feedback, but image
+sends are not blocked by probe state. `mode: "follow_main"` preserves the
+existing main-model image path, while a selected dedicated route is pinned for
+delivery even if its latest probe is stale or unsuccessful.
 
 Use `POST /v1/vision/config` when adding a dedicated image model. It creates or
 reuses the saved route, runs the generated-image check, and selects the route
@@ -115,12 +116,12 @@ consumer reads that exact route and decrypts its credential through the enclave.
 If the pinned route was deleted, the turn fails instead of exposing raw pixels
 to the main model.
 
-Runtime V1 and VPS enable separate routing only after a fresh official resident
-poll advertises `vision_observer_v1`. Until then, follow-main keeps the existing
-image path unchanged. An already-selected dedicated route fails before storing a
-new image with `409 vision_resident_update_required`; it never silently falls
-back to the main model. `POST /v1/vision/observe` is the authenticated
-resident-facing observer exchange for the message's pinned route.
+Runtime V1 and VPS report whether a fresh official resident poll advertises
+`vision_observer_v1`, but that capability signal does not block image ingestion.
+Follow-main keeps the existing image path unchanged; a selected dedicated route
+stays pinned rather than silently falling back to the main model. `POST
+/v1/vision/observe` is the authenticated resident-facing observer exchange for
+the message's pinned route.
 
 For a document, use `file_b64`, `file_name`, and `file_mime` instead. The decoded
 file limit is 25 MiB. PDF, DOCX, XLSX, supported images, and UTF-8 text/source
@@ -250,7 +251,7 @@ X-API-Key: YOUR_FEEDLING_API_KEY
     {
       "id": "v1:4be4dce72b0a4f76bff3ec2c601598ce",
       "kind": "tool",
-      "name": "memory_search",
+      "name": "memory_index",
       "status": "success",
       "job_id": "",
       "call_id": "v1:4be4dce72b0a4f76bff3ec2c601598ce",
@@ -273,13 +274,20 @@ existing user turn. Neither path returns tool arguments, tool result bodies, or
 reasoning. Durable V2 effects may add `effect_id`, `effect_type`, and
 `effect_status` only after the dispatcher has confirmed their disposition.
 
-For successful `memory_search` and `memory_fetch`, `memory_count` is derived
+For successful `memory_index`, `memory_search`, and `memory_fetch`,
+`memory_count` is derived
 from the actual V2 capability result or V1 `io_cli` response before any
 provider-facing truncation. `memory_categories` is optional: it is present only when every
 returned item has one of the canonical bilingual memory buckets and its counts
 sum to `memory_count`. If any bucket is custom or unknown, the category list is
 omitted and clients should show the total only. Raw bucket labels, summaries,
 memory content, and query text never enter activity metadata.
+
+Every executed Runtime V2 platform, MCP, `reply`, and `send_file` call uses the
+same started/result/error activity boundary. Repeated memory-discovery calls
+that are deterministically rejected by the loop are recorded as confirmed
+results too. Zero-result discovery is retained, and each turn returns at most
+100 projected events.
 
 Completed tool events are also attached to the assistant history item's
 `activity_events` metadata, so clients can render the execution record below

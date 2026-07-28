@@ -280,6 +280,22 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     # 上面逐条 down_revision 的断言保留：它们守的是链的**拓扑**，那才是这个测试的价值。
 
 
+def test_voice_turn_streams_user_fk_cascades():
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT constraint_type, delete_rule "
+            "FROM information_schema.referential_constraints rc "
+            "JOIN information_schema.table_constraints tc "
+            "  ON tc.constraint_catalog=rc.constraint_catalog "
+            " AND tc.constraint_schema=rc.constraint_schema "
+            " AND tc.constraint_name=rc.constraint_name "
+            "WHERE tc.table_schema='public' "
+            "  AND tc.table_name='voice_turn_streams'"
+        ).fetchone()
+
+    assert row == ("FOREIGN KEY", "CASCADE")
+
+
 def test_provider_health_schema_is_runtime_neutral():
     with db.get_pool().connection() as conn:
         columns = {

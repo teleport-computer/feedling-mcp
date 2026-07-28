@@ -299,13 +299,11 @@ def _emit_tool_trace(args, exit_code, dur_ms):
 
 def _activity_tool_name(args):
     verb = str(getattr(args, "verb", "") or "").strip().lower()
-    if verb == "memory-index":
-        return "memory_search"
     return verb.replace("-", "_")
 
 
 def _memory_activity_metadata(tool_name, output):
-    if tool_name not in {"memory_search", "memory_fetch"}:
+    if tool_name not in {"memory_index", "memory_search", "memory_fetch"}:
         return {}
     if not isinstance(output, dict) or output.get("ok") is not True:
         return {}

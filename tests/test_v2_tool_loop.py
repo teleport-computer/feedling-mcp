@@ -955,17 +955,26 @@ def test_reply_tool_also_gets_call_id_matched_result(monkeypatch):
     ])
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
     build_messages = _RecordingBuildMessages()
+    activity = []
+
+    async def on_tool_event(tc, kind, payload):
+        activity.append((tc.id, tc.name, kind, payload.get("result")))
 
     asyncio.run(tool_loop.run_tool_loop(
         provider_config=_TEST_PROVIDER_CONFIG, build_messages=build_messages,
         dispatch_tools=_RecordingDispatch(), on_reply=_RecordingReply(),
         fold_new_messages=_RecordingFold([[]]), add_usage=_noop_add_usage,
-        max_calls=5,
+        max_calls=5, on_tool_event=on_tool_event,
     ))
 
     exchange = build_messages.calls[1][0]
     assert [r.call_id for r in exchange.results] == ["r1"]
     assert exchange.results[0].content.startswith("ok:")
+    assert [(call_id, name, kind) for call_id, name, kind, _ in activity] == [
+        ("r1", "reply", "tool_call_started"),
+        ("r1", "reply", "tool_call_result"),
+    ]
+    assert activity[-1][3].content == "ok: reply delivered"
 
 
 def test_malformed_args_gets_one_tools_disabled_fallback_without_dispatch(monkeypatch):

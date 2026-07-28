@@ -34,7 +34,7 @@ def upgrade() -> None:
           call_id TEXT NOT NULL,
           turn_id TEXT NOT NULL,
           segment INTEGER NOT NULL,
-          user_id TEXT NOT NULL,
+          user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
           text_len INTEGER NOT NULL,
           nonce BYTEA NOT NULL,
           ciphertext BYTEA NOT NULL,

@@ -10,6 +10,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Access-mode changes no longer bypass the Hosted Runtime V2 rollout
+  reconciler.** Selecting `model_api` records the user's route choice but does
+  not directly move the execution fence to V2; the `v2_user_allowlist` desired
+  state and reconciler remain the only authority for the resident-to-V2
+  transition. Selecting `resident` still demotes immediately, and a failed
+  runtime-control update now restores both the prior runtime mode and the prior
+  onboarding route.
+
 - **ElevenLabs calls can now use the same Chat model and context as typed
   messages.** An authenticated client creates a short-lived, call-bound voice
   session, then ElevenLabs sends transcribed turns to an OpenAI-compatible
@@ -148,17 +156,20 @@ change must not be interpreted as an API guarantee.
   classification, and confirmed durable-effect disposition; it excludes tool
   arguments, result bodies, assistant prose, and reasoning. Completed events
   also appear as `activity_events` on the assistant history item. Confirmed
-  memory-search/fetch results include a total count and include canonical
+  memory-index/search/fetch results include a total count and include canonical
   category counts only when the complete classification is reliable; custom or
   unknown buckets fall back to total-only. The shipped V1 resident `io_cli`
   records the same fixed-shape invocation transitions through an authenticated,
   turn-scoped write boundary; tool arguments and result bodies are never sent.
+  Zero-result discovery remains visible, and Runtime V2 protocol calls such as
+  `reply` and `send_file` use the same activity boundary. A turn exposes at
+  most 100 projected activity events.
 - **Separate vision models now work on Hosted Runtime V1 and VPS residents as
   well as Runtime V2.** The official resident advertises a fresh
   `vision_observer_v1` capability, accepted image turns pin the selected route,
-  and only a neutral untrusted observation reaches the main model. Dedicated
-  routing fails closed when the resident is outdated or the observer fails;
-  follow-main keeps the existing image path.
+  and only a neutral untrusted observation reaches the main model. Resident
+  capability and probe state remain settings feedback and do not block image
+  ingestion; follow-main keeps the existing image path.
 
 - **Runtime V2 now honors the Dream and screen-watch consent switches at
   execution time.** Disabling Dream prevents queued Dream work from making a
@@ -428,12 +439,14 @@ change must not be interpreted as an API guarantee.
   Reachable text-only candidates remain selectable with an `unsupported`
   status, while operationally invalid new routes and credentials are removed; `POST
   /v1/vision/routes/{route_id}/test` verifies real image understanding. Dedicated vision output is passed to the
-  main model as untrusted observation text, and known text-only main routes now
-  return `409 vision_model_required` for image sends until a usable vision route
-  is selected. Concurrent selection changes cannot reroute an accepted image; a
+  main model as untrusted observation text, while follow-main preserves the
+  pre-existing image path without requiring a dedicated-route probe. Image
+  ingestion is not blocked by probe or resident-capability state; those values
+  remain settings feedback. Concurrent selection changes cannot reroute an accepted image; a
   deleted pinned route fails closed instead of falling back to the main model.
-  Runtime V1 and self-hosted VPS image routing are unchanged; mutation endpoints
-  return `409 vision_runtime_v2_required` outside Hosted Runtime V2.
+  Runtime V1 and self-hosted VPS preserve their existing image delivery paths;
+  mutation endpoints return `409 vision_runtime_v2_required` outside Hosted
+  Runtime V2.
 - Self-hosted resident polls may now receive server-generated maintenance turns
   with `role: "user"` and `source: "resident_maintenance"` when the resident
   consumer appears stale or is not claiming resident-only distill jobs. These

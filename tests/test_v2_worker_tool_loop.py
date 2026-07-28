@@ -107,7 +107,11 @@ def _patch_tool_effect_encryption(monkeypatch):
             {
                 "id": item_id,
                 "owner_user_id": store.user_id,
+                "v": 1,
                 "body_ct": base64.b64encode(plaintext).decode("ascii"),
+                "nonce": "nonce",
+                "K_user": "sealed-user-key",
+                "K_enclave": "sealed-enclave-key",
             },
             "",
         )
@@ -551,7 +555,6 @@ def test_voice_turn_publishes_all_applied_bubbles_once_in_order(monkeypatch):
     jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w-voice-multi")
     _patch_tool_effect_encryption(monkeypatch)
-    written: list[str] = []
     published: list[tuple[str, dict]] = []
 
     async def direct_loop(**kwargs):
@@ -565,13 +568,13 @@ def test_voice_turn_publishes_all_applied_bubbles_once_in_order(monkeypatch):
         )
 
     monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", direct_loop)
-    base_deps = _late_input_deps(uid, written)
+    base_deps = _late_input_deps(uid, [])
     deps = worker.TurnDeps(
         read_messages=base_deps.read_messages,
         read_messages_after_seq=base_deps.read_messages_after_seq,
         resolve_provider=base_deps.resolve_provider,
         mint_enclave_token=base_deps.mint_enclave_token,
-        apply_pending_effects=base_deps.apply_pending_effects,
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
         web_tools_enabled=base_deps.web_tools_enabled,
         publish_voice_reply=lambda user_id, **kwargs: published.append(
             (user_id, kwargs)
@@ -589,7 +592,10 @@ def test_voice_turn_publishes_all_applied_bubbles_once_in_order(monkeypatch):
     )
 
     assert status == "completed"
-    assert written == ["这是第一条。", "这是第二条。"]
+    bubbles = _bubbles(uid)
+    assert [
+        base64.b64decode(row["body_ct"]).decode("utf-8") for row in bubbles
+    ] == ["这是第一条。", "这是第二条。"]
     assert len(published) == 1
     published_user, published_turn = published[0]
     assert published_user == uid

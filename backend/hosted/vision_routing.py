@@ -40,17 +40,10 @@ def runtime_capability(store) -> dict:
 
 
 def dedicated_route_for_send(store) -> tuple[dict | None, tuple[dict, int] | None]:
-    """Return the pinned observer route, or a fail-closed pre-append error."""
-    route = db.model_api_vision_route(store.user_id)
-    if route is None:
-        return None, None
+    """Return the optional dedicated route without blocking image ingestion.
 
-    capability = runtime_capability(store)
-    if not capability["available"]:
-        return None, ({
-            "error": "vision_resident_update_required",
-            "runtime": capability["runtime"],
-        }, 409)
-    if str(route.get("vision_test_status") or "untested") != "ok":
-        return None, ({"error": "vision_model_required"}, 409)
-    return route, None
+    Follow-main is the compatibility default. A manually selected dedicated
+    route is pinned for downstream delivery, but capability/test state remains
+    settings feedback rather than a send-time gate.
+    """
+    return db.model_api_vision_route(store.user_id), None

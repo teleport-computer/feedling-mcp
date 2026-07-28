@@ -263,7 +263,7 @@ def test_auth_and_validation_parity(env):
     assert body == {"error": "unauthorized"}
 
 
-def test_v2_image_requires_verified_route_before_append(env):
+def test_v2_image_follow_main_does_not_require_dedicated_probe(env):
     monkeypatch = env
     user_id, api_key = _register()
     _setup(api_key, monkeypatch)
@@ -274,15 +274,17 @@ def test_v2_image_requires_verified_route_before_append(env):
         status="untested",
     )
 
-    before = list(core_store.get_store(user_id).chat_messages)
     status, body = _asgi_post({
         "image_b64": _b64(b"image"),
         "image_mime": "image/png",
     }, api_key)
 
-    assert status == 409
-    assert body == {"error": "vision_model_required"}
-    assert core_store.get_store(user_id).chat_messages == before
+    assert status == 202, body
+    rows = [
+        row for row in core_store.get_store(user_id).chat_messages
+        if row.get("role") == "user"
+    ]
+    assert rows[-1].get("vision_route_id", "") == ""
 
 
 def test_v2_image_pins_dedicated_route_on_accepted_row(env):

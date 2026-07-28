@@ -521,7 +521,7 @@ def test_run_scheduled_wake_prompts_with_the_exact_due_reminders(monkeypatch):
     claimed_by = _claim(job_id)
     seen = {}
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
         return _text_round("该喝水了，也记得拉伸一下。")
 

@@ -441,10 +441,15 @@ def _vision_config_payload(store) -> dict:
         effective_status = "resident_update_required"
     elif dedicated:
         effective_status = dedicated.get("vision_test_status", "untested")
+    elif onboarding_route == "model_api":
+        # Follow-main predates dedicated vision routing and does not have a
+        # separate capability probe. Preserve that legacy image path: the
+        # dedicated-only status columns default to "untested" for every
+        # existing main route and must not turn migration into a fleet-wide
+        # image-send gate.
+        effective_status = "ok" if active else "not_configured"
     else:
-        effective_status = (
-            main["vision_test_status"]
-        )
+        effective_status = main["vision_test_status"]
     return {
         "available": routing_available,
         "runtime": capability["runtime"],

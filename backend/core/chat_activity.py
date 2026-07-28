@@ -23,9 +23,6 @@ _TERMINAL_JOB_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "discarded", "expired"}
 )
 _FAILED_JOB_STATUSES = frozenset({"failed", "cancelled", "discarded", "expired"})
-_MEMORY_DISCOVERY_TOOLS = frozenset({"memory_index", "memory_search"})
-
-
 def safe_token(value: Any, *, max_len: int = 128) -> str:
     """Return a bounded identifier token, never arbitrary content."""
     cleaned = _SAFE_TOKEN_RE.sub("_", str(value or "").strip())
@@ -145,34 +142,6 @@ def safe_schedule_metadata(value: Any) -> dict:
     return safe
 
 
-def _collapse_memory_discovery(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Hide contradictory/repeated zero-result discovery rows.
-
-    Search and index use different matching semantics, so a zero keyword search
-    followed by a positive index is not contradictory backend data. Presenting
-    both as separate user-facing conclusions is nevertheless misleading.
-    """
-    has_positive_memory = any(
-        event.get("status") == "success"
-        and isinstance(event.get("memory_count"), int)
-        and int(event["memory_count"]) > 0
-        for event in events
-    )
-    zero_discovery_indexes = [
-        index
-        for index, event in enumerate(events)
-        if event.get("name") in _MEMORY_DISCOVERY_TOOLS
-        and event.get("status") == "success"
-        and event.get("memory_count") == 0
-    ]
-    if not zero_discovery_indexes:
-        return events
-    suppressed = set(zero_discovery_indexes)
-    if not has_positive_memory:
-        suppressed.discard(zero_discovery_indexes[-1])
-    return [event for index, event in enumerate(events) if index not in suppressed]
-
-
 def project_tool_events(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Collapse start/result status rows into one event per confirmed invocation."""
     ordered: list[str] = []
@@ -224,7 +193,7 @@ def project_tool_events(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any
                 event[target] = token
         event.update(safe_memory_metadata(detail))
         event.update(safe_schedule_metadata(detail))
-    return _collapse_memory_discovery([projected[event_id] for event_id in ordered])
+    return [projected[event_id] for event_id in ordered]
 
 
 def _turn_failure(jobs: list[Mapping[str, Any]]) -> dict[str, Any] | None:

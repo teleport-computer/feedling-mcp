@@ -246,7 +246,7 @@ def test_turn_response_exposes_only_bounded_failure_identity():
     assert response["complete"] is True
 
 
-def test_memory_projection_suppresses_repeated_zero_discovery_before_positive():
+def test_memory_projection_keeps_every_zero_discovery_before_positive():
     rows = []
     for index, (name, count) in enumerate(
         [("memory_search", 0), ("memory_search", 0), ("memory_index", 2)],
@@ -268,11 +268,13 @@ def test_memory_projection_suppresses_repeated_zero_discovery_before_positive():
 
     events = chat_activity.project_tool_events(rows)
     assert [(event["name"], event["memory_count"]) for event in events] == [
+        ("memory_search", 0),
+        ("memory_search", 0),
         ("memory_index", 2),
     ]
 
 
-def test_memory_projection_keeps_only_latest_zero_without_positive_result():
+def test_memory_projection_keeps_every_zero_without_positive_result():
     rows = [
         {
             "id": index,
@@ -291,7 +293,7 @@ def test_memory_projection_keeps_only_latest_zero_without_positive_result():
     ]
 
     events = chat_activity.project_tool_events(rows)
-    assert [event["call_id"] for event in events] == ["call-2"]
+    assert [event["call_id"] for event in events] == ["call-1", "call-2"]
 
 
 def test_result_classifier_never_turns_error_body_into_metadata():

@@ -495,7 +495,7 @@ async def internal_voice_reply(
 
 @router.post("/v1/internal/voice/delta")
 async def internal_voice_delta(
-    request: Request, auth: AuthResult = Depends(require_auth)
+    request: Request, auth: AuthResult = Depends(require_scope("voice_reply"))
 ):
     payload = (await asgi_http.read_json_silent(request)) or {}
     stored = await threadpool.run_db(

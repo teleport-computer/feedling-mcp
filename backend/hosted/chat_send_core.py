@@ -171,13 +171,10 @@ def model_api_chat_send_core(
     # change cannot redirect already-accepted pixels.
     vision_route_id = ""
     if has_image:
-        vision_route = db.model_api_vision_route(store.user_id)
-        effective_route = vision_route or db.model_api_active_route(store.user_id)
-        if not effective_route or str(
-            effective_route.get("vision_test_status") or "untested"
-        ) != "ok":
-            return {"error": "vision_model_required"}, 409
-        if vision_route:
+        vision_route, vision_error = vision_routing.dedicated_route_for_send(store)
+        if vision_error is not None:
+            return vision_error
+        if vision_route is not None:
             vision_route_id = str(vision_route.get("id") or "")
 
     # V2 liveness guard: if every serve_worker

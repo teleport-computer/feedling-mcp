@@ -28,14 +28,14 @@ def _stub_access_switch(monkeypatch, *, previous: str = "resident"):
     return SimpleNamespace(user_id="usr_test"), saved
 
 
-def test_model_api_switch_moves_configured_runtime_to_v2(monkeypatch):
+def test_model_api_switch_never_bypasses_allowlist_reconciler(monkeypatch):
     store, saved = _stub_access_switch(monkeypatch)
-    selected: list[str] = []
-    monkeypatch.setattr(config_store, "load_active_route", lambda _store: {"id": "r1"})
     monkeypatch.setattr(
         config_store,
         "set_hosted_runtime_mode",
-        lambda _store, mode: selected.append(mode) or mode,
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("access-mode must not directly flip V2")
+        ),
     )
 
     body, status = accounts_core.access_modes_switch(
@@ -45,12 +45,10 @@ def test_model_api_switch_moves_configured_runtime_to_v2(monkeypatch):
     assert status == 200
     assert body["active_route"] == "model_api"
     assert saved == ["model_api"]
-    assert selected == [config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2]
 
 
-def test_model_api_onboarding_without_route_does_not_flip_runtime(monkeypatch):
+def test_model_api_switch_does_not_require_an_active_route(monkeypatch):
     store, saved = _stub_access_switch(monkeypatch)
-    monkeypatch.setattr(config_store, "load_active_route", lambda _store: None)
     monkeypatch.setattr(
         config_store,
         "set_hosted_runtime_mode",
@@ -71,6 +69,15 @@ def test_resident_switch_moves_runtime_back_to_resident(monkeypatch):
     selected: list[str] = []
     monkeypatch.setattr(
         config_store,
+        "get_hosted_runtime_control_strict",
+        lambda _store: (
+            config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
+            "v2",
+            9,
+        ),
+    )
+    monkeypatch.setattr(
+        config_store,
         "set_hosted_runtime_mode",
         lambda _store, mode: selected.append(mode) or mode,
     )
@@ -85,19 +92,37 @@ def test_resident_switch_moves_runtime_back_to_resident(monkeypatch):
     assert selected == [config_store.HOSTED_RUNTIME_MODE_RESIDENT]
 
 
-def test_runtime_failure_rolls_back_access_mode(monkeypatch):
-    store, saved = _stub_access_switch(monkeypatch)
-    monkeypatch.setattr(config_store, "load_active_route", lambda _store: {"id": "r1"})
+def test_partial_runtime_failure_rolls_back_runtime_and_access_mode(monkeypatch):
+    store, saved = _stub_access_switch(monkeypatch, previous="model_api")
+    selected: list[str] = []
+    monkeypatch.setattr(
+        config_store,
+        "get_hosted_runtime_control_strict",
+        lambda _store: (
+            config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
+            "v2",
+            9,
+        ),
+    )
 
-    def fail(_store, _mode):
-        raise RuntimeError("db unavailable")
+    def fail_after_partial_write(_store, mode):
+        selected.append(mode)
+        if len(selected) == 1:
+            raise RuntimeError("state write failed after blob write")
+        return mode
 
-    monkeypatch.setattr(config_store, "set_hosted_runtime_mode", fail)
+    monkeypatch.setattr(
+        config_store, "set_hosted_runtime_mode", fail_after_partial_write
+    )
 
     body, status = accounts_core.access_modes_switch(
-        store, {"access_mode": "model_api"}
+        store, {"access_mode": "resident"}
     )
 
     assert status == 503
     assert body == {"error": "runtime_control_unavailable"}
-    assert saved == ["model_api", "resident"]
+    assert selected == [
+        config_store.HOSTED_RUNTIME_MODE_RESIDENT,
+        config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
+    ]
+    assert saved == ["resident", "model_api"]

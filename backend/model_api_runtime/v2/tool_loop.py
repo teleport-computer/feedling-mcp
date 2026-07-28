@@ -218,6 +218,7 @@ async def run_tool_loop(
     # tool_calls`), and the wake fails silently.
     require_reply: bool = True,
     on_file_reply=None,
+    on_tool_event=None,
     required_file_suffixes: tuple[str, ...] | None = None,
     file_requirement_messages=(),
     resolve_required_file_suffixes=None,
@@ -266,6 +267,10 @@ async def run_tool_loop(
     ``send_file`` tool is removed from the offered catalog. Production resolves
     only encrypted ``/workspace`` entries through this callback; the loop never
     interprets a model string as a host filesystem path.
+
+    ``on_tool_event`` receives the same started/result/error boundary events
+    for protocol-level ``reply`` and ``send_file`` calls that the worker's
+    dispatcher emits for platform and MCP tools.
 
     ``required_file_suffixes`` is a completion guard for explicit output formats.
     ``None`` and ``()`` disable the hard guard; a non-empty tuple gets one bounded
@@ -465,6 +470,10 @@ async def run_tool_loop(
 
     def _merged_reasoning() -> str:
         return "\n\n".join(reasoning_fragments)
+
+    async def _tool_event(tc, event_kind: str, payload: dict) -> None:
+        if on_tool_event is not None:
+            await on_tool_event(tc, event_kind, payload)
 
     while attempts < max_calls:
         _progress("round_boundary")
@@ -1048,15 +1057,21 @@ async def run_tool_loop(
             if tc.name in _MEMORY_DISCOVERY_TOOLS:
                 discovery_names_in_batch.add(tc.name)
         for tc in repeated_memory_calls:
-            reply_results[tc.id] = ToolResult(
+            await _tool_event(tc, "tool_call_started", {})
+            repeated_result = ToolResult(
                 call_id=tc.id,
                 content=(
                     "ok: this memory discovery was already completed; use its "
                     "prior result and continue without calling it again"
                 ),
             )
+            reply_results[tc.id] = repeated_result
+            await _tool_event(
+                tc, "tool_call_result", {"result": repeated_result}
+            )
         for tc in reply_calls:
             reply_text = str(tc.args.get("text") or "")
+            await _tool_event(tc, "tool_call_started", {})
             await _trajectory(
                 "reply_planned",
                 {
@@ -1066,17 +1081,30 @@ async def run_tool_loop(
                     "text": reply_text,
                 },
             )
-            await on_reply(reply_text, final=False)  # immediate intermediate bubble
+            try:
+                await on_reply(
+                    reply_text, final=False
+                )  # immediate intermediate bubble
+            except Exception as exc:
+                await _tool_event(
+                    tc, "tool_call_error", {"error": type(exc).__name__}
+                )
+                raise
             if reply_text.strip():
                 replied_intermediate = True
                 content = "ok: reply delivered"
             else:
                 content = "ok: empty reply ignored"
-            reply_results[tc.id] = ToolResult(call_id=tc.id, content=content)
+            reply_result = ToolResult(call_id=tc.id, content=content)
+            reply_results[tc.id] = reply_result
+            await _tool_event(
+                tc, "tool_call_result", {"result": reply_result}
+            )
 
         for tc in file_reply_calls:
             workspace_path = str(tc.args.get("path") or "").strip()
             workspace_revision = int(tc.args["revision"])
+            await _tool_event(tc, "tool_call_started", {})
             await _trajectory(
                 "file_reply_planned",
                 {"round": attempts, "call_id": tc.id},
@@ -1090,20 +1118,34 @@ async def run_tool_loop(
                 normalized_required_suffixes
                 and file_suffix not in normalized_required_suffixes
             ):
-                reply_results[tc.id] = ToolResult(
+                file_result = ToolResult(
                     call_id=tc.id,
                     content=(
                         "error: wrong file format; required suffixes: "
                         + ", ".join(sorted(normalized_required_suffixes))
                     ),
                 )
+                reply_results[tc.id] = file_result
+                await _tool_event(
+                    tc, "tool_call_result", {"result": file_result}
+                )
                 continue
-            await on_file_reply(workspace_path, workspace_revision)
+            try:
+                await on_file_reply(workspace_path, workspace_revision)
+            except Exception as exc:
+                await _tool_event(
+                    tc, "tool_call_error", {"error": type(exc).__name__}
+                )
+                raise
             delivered_file_suffixes.add(file_suffix)
             replied_intermediate = True
-            reply_results[tc.id] = ToolResult(
+            file_result = ToolResult(
                 call_id=tc.id,
                 content="ok: file delivered",
+            )
+            reply_results[tc.id] = file_result
+            await _tool_event(
+                tc, "tool_call_result", {"result": file_result}
             )
 
         if other_calls:

@@ -97,7 +97,7 @@ def test_config_reports_model_api_v1_as_available_with_resident_observer(monkeyp
             "id": "main",
             "provider": "openai",
             "model": "gpt-4.1-mini",
-            "vision_test_status": "ok",
+            "vision_test_status": "untested",
             "last_vision_test_error": "",
         },
     )
@@ -109,6 +109,7 @@ def test_config_reports_model_api_v1_as_available_with_resident_observer(monkeyp
     assert config["runtime"] == "hosted_v1"
     assert config["effective_status"] == "ok"
     assert config["mode"] == "follow_main"
+    assert config["main_model"]["vision_test_status"] == "untested"
 
 
 def test_config_reports_model_api_v1_without_main_as_not_configured(monkeypatch):
@@ -301,7 +302,7 @@ def test_dedicated_route_for_send_pins_ready_route(monkeypatch):
     assert error is None
 
 
-def test_dedicated_route_for_send_fails_closed_before_resident_update(monkeypatch):
+def test_dedicated_route_for_send_does_not_gate_on_resident_capability(monkeypatch):
     route = {"id": "vision", "vision_test_status": "ok"}
     monkeypatch.setattr(vision_routing.db, "model_api_vision_route", lambda _uid: route)
     monkeypatch.setattr(
@@ -312,5 +313,5 @@ def test_dedicated_route_for_send_fails_closed_before_resident_update(monkeypatc
 
     selected, error = vision_routing.dedicated_route_for_send(_store())
 
-    assert selected is None
-    assert error == ({"error": "vision_resident_update_required", "runtime": "vps"}, 409)
+    assert selected == route
+    assert error is None
