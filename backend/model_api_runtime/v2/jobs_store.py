@@ -3645,23 +3645,37 @@ def recent_runtime_health(
             return None
         return float(row[key])
 
-    lanes = []
+    # 收集所有 lane 的并集：即使全部 job 都未终态的 lane 也要保留，
+    # 防止 worker 卡死时该 lane 从健康视图消失。
+    all_lanes = set()
     for row in outcome_rows:
-        lane = str(row["lane"] or "unknown")
-        completed = int(row["completed"] or 0)
-        failed = int(row["failed"] or 0)
-        expired = int(row["expired"] or 0)
+        all_lanes.add(str(row["lane"] or ""))
+    all_lanes.update(latency_by_lane.keys())
+    all_lanes.update(capture_by_lane.keys())
+    all_lanes.update(failures_by_lane.keys())
+
+    # 为了排序和记录目的，也建立 outcome 索引
+    outcome_by_lane = {
+        str(row["lane"] or ""): row for row in outcome_rows
+    }
+
+    lanes = []
+    for lane in all_lanes:
+        outcome = outcome_by_lane.get(lane)
+        completed = int((outcome or {}).get("completed") or 0)
+        failed = int((outcome or {}).get("failed") or 0)
+        expired = int((outcome or {}).get("expired") or 0)
         resolved = completed + failed + expired
         capture = capture_by_lane.get(lane)
         lanes.append({
-            "lane": lane,
+            "lane": lane or "unknown",
             "sampled_jobs": resolved,
             "completed": completed,
             "failed": failed,
             "expired": expired,
-            "superseded": int(row["superseded"] or 0),
-            "queue_expired": int(row["queue_expired"] or 0),
-            "lease_expired": int(row["lease_expired"] or 0),
+            "superseded": int((outcome or {}).get("superseded") or 0),
+            "queue_expired": int((outcome or {}).get("queue_expired") or 0),
+            "lease_expired": int((outcome or {}).get("lease_expired") or 0),
             "failure_rate": (
                 float(failed + expired) / float(resolved) if resolved else None
             ),

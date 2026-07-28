@@ -211,3 +211,24 @@ def test_recent_runtime_health_pool_pending_age_is_none_when_idle():
 
     assert pool["pending"] == 0
     assert pool["oldest_pending_age_sec"] is None
+
+
+def test_recent_runtime_health_includes_nonterminal_only_lanes():
+    # 回归测试：lane 在窗口内全部 job 都未终态（pending/running）时，
+    # 不应从健康视图消失。这是 worker 卡死时最需要看到的症状。
+    seed_user("u_rh_nonterminal_only")
+    set_v2_runtime_owner("u_rh_nonterminal_only")
+    # 直接创建 pending job，不经过 _add_job（它会把 job 标记为终态）
+    job_id, _ = jobs_store.enqueue_job("u_rh_nonterminal_only", "capture")
+
+    health = jobs_store.recent_runtime_health()
+    lanes = {r["lane"]: r for r in health["lanes"]}
+
+    # capture lane 只有 pending job，无任何终态，但必须出现
+    assert "capture" in lanes
+    # sampled_jobs = 0（无终态 job）
+    assert lanes["capture"]["sampled_jobs"] == 0
+    # failure_rate = None（零样本，不是零失败）
+    assert lanes["capture"]["failure_rate"] is None
+    # capture["open"] >= 1（证明 capture 数据被保住了）
+    assert lanes["capture"]["capture"]["open"] >= 1
