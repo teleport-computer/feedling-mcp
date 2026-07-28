@@ -2075,6 +2075,114 @@ def _fmt_ratio(value) -> str:
         return "—"
 
 
+# ---- Runtime 健康值班台 ----------------------------------------------------
+# 阈值集中在此，便于以后一处调整。定阈依据（2026-07-27 三环境实测）：
+#   失败率 —— prod 07-26 为 0%、07-27 为 100%，两端都能正确点亮
+#   p95    —— pre 健康态 chat p95 = 38.1s，留约 1.5× 余量
+#   pending 年龄 —— 对应 claim lag 退化；健康时该值为空
+_RUNTIME_HEALTH_WINDOWS = (24, 168, 720)
+_RUNTIME_HEALTH_FAILURE_WARN = 0.05
+_RUNTIME_HEALTH_FAILURE_BAD = 0.15
+_RUNTIME_HEALTH_P95_WARN_MS = 60_000
+_RUNTIME_HEALTH_P95_BAD_MS = 120_000
+_RUNTIME_HEALTH_PENDING_WARN_SEC = 60
+_RUNTIME_HEALTH_PENDING_BAD_SEC = 180
+_RUNTIME_FAILURE_CODE_MAX = 64
+_RUNTIME_FAILURE_KNOWN_EXACT = frozenset({"queue_timeout", "lease_timeout"})
+_RUNTIME_FAILURE_KNOWN_PREFIX = "turn_failed:"
+
+
+def _runtime_failure_code(raw) -> str:
+    """失败码白名单化：只放行已知枚举形状，其余归入 other。
+
+    实测 agent_jobs.last_error 当前全是干净枚举码，本函数是为将来有人往该字段
+    写自由文本时页面仍不渗内容——data-track 是 metadata-only 面。
+    """
+    code = str(raw or "").strip()
+    if not code:
+        return "other"
+    if code in _RUNTIME_FAILURE_KNOWN_EXACT:
+        return code
+    if code.startswith(_RUNTIME_FAILURE_KNOWN_PREFIX):
+        return code[:_RUNTIME_FAILURE_CODE_MAX]
+    return "other"
+
+
+def _runtime_health_level(payload: dict) -> tuple[str, list[str]]:
+    """(总体档位, 中文原因列表)。档位取所有指标里最差的一档。
+
+    分母为 0 的指标一律跳过、不参与判定：零样本不是故障。commit 2795537a 的
+    re-review 教训——V2-only 合成行的 legacy 分母为 0 曾被渲染成红 0%，3 条健康
+    心跳看起来像全挂。
+    """
+    rank = {"ok": 0, "warn": 1, "bad": 2}
+    worst = "ok"
+    reasons: list[str] = []
+
+    def escalate(level: str, reason: str) -> None:
+        nonlocal worst
+        if rank[level] > rank[worst]:
+            worst = level
+        if level != "ok":
+            reasons.append(reason)
+
+    for lane in payload.get("lanes") or []:
+        name = str(lane.get("lane") or "unknown")
+        rate = lane.get("failure_rate")
+        if rate is not None and int(lane.get("sampled_jobs") or 0) > 0:
+            if rate >= _RUNTIME_HEALTH_FAILURE_BAD:
+                escalate("bad", f"{name} 失败率 {rate * 100:.0f}%")
+            elif rate >= _RUNTIME_HEALTH_FAILURE_WARN:
+                escalate("warn", f"{name} 失败率 {rate * 100:.0f}%")
+
+        p95 = lane.get("p95_ok_ms")
+        if p95 is not None:
+            if p95 >= _RUNTIME_HEALTH_P95_BAD_MS:
+                escalate("bad", f"{name} 成功回合 p95 {p95 / 1000:.0f}s")
+            elif p95 >= _RUNTIME_HEALTH_P95_WARN_MS:
+                escalate("warn", f"{name} 成功回合 p95 {p95 / 1000:.0f}s")
+
+        missing = int((lane.get("capture") or {}).get("missing") or 0)
+        if missing > 0:
+            escalate("bad", f"{name} trajectory capture missing {missing} 条")
+
+    pool = payload.get("pool") or {}
+    if int(pool.get("live_workers") or 0) <= 0:
+        escalate("bad", "无存活 worker")
+
+    age = pool.get("oldest_pending_age_sec")
+    if age is not None:
+        if age >= _RUNTIME_HEALTH_PENDING_BAD_SEC:
+            escalate("bad", f"最老 pending 已排队 {age / 60:.0f} 分钟")
+        elif age >= _RUNTIME_HEALTH_PENDING_WARN_SEC:
+            escalate("warn", f"最老 pending 已排队 {age:.0f} 秒")
+
+    return worst, reasons
+
+
+def _runtime_health_window_hours() -> int:
+    """窗口枚举白名单（照 view 参数的写法），非法值一律回落 24。"""
+    try:
+        value = int(request.args.get("hours", 24))
+    except (TypeError, ValueError):
+        return 24
+    return value if value in _RUNTIME_HEALTH_WINDOWS else 24
+
+
+# Injected by the assembly layer (asgi_app.py); the real implementation is
+# model_api_runtime.v2.jobs_store.recent_runtime_health.
+def _runtime_health_summary(*, within_hours: int = 24) -> dict:
+    return {
+        "window_hours": within_hours,
+        "generated_at": 0.0,
+        "lanes": [],
+        "pool": {
+            "inflight": 0, "pending": 0, "live_workers": 0,
+            "capacity": 0, "oldest_pending_age_sec": None,
+        },
+    }
+
+
 def _render_admin_login_page(error: bool = False, next_url: str = "/admin/data-track") -> str:
     """Password-gate login page for the admin dashboard. Posts to /admin/login,
     which validates FEEDLING_ADMIN_PASSWORD and sets the signed admin_session
