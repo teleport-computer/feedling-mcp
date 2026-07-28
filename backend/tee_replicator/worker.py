@@ -896,7 +896,9 @@ _TABLES["v2_trajectory_reviews"] = _Table(
                 "started_at=EXCLUDED.started_at, finished_at=EXCLUDED.finished_at"),
     unpack=_trajectory_reviews_unpack,
     upsert_args=_trajectory_reviews_upsert_args,
-    # 防御性接线，目前是死代码——见上方大段注释，写侧从未 mark_pending 过这张表。
+    # 读侧配置（Task 7 防御性接的）；写侧 mark_pending 已在 Task 9 补上
+    # （db.py:chat_clear + jobs_store.py 的 claim/finish/reopen/recover 各处
+    # UPDATE，见上方大段注释），两半齐了，不再是死代码。
     requeue_fetch_sql=("SELECT user_id, source_job_id, status, attempt_count, "
                        "claimed_by_job_id, review_envelope, last_error, created_at, "
                        "started_at, finished_at FROM v2_trajectory_reviews "

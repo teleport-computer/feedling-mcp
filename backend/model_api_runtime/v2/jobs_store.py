@@ -279,8 +279,31 @@ def _queue_failure_review_on_cursor(cur, source_job_id: int | str) -> bool:
     return False
 
 
-def _recover_review_runner_on_cursor(cur, runner_job_id: int | str) -> None:
-    """Release a review claim whose generic runner terminalized unexpectedly."""
+def _recover_review_runner_on_cursor(
+    cur, runner_job_id: int | str,
+) -> list[tuple[str, str]]:
+    """Release a review claim whose generic runner terminalized unexpectedly.
+
+    Returns the ``[(user_id, source_job_id), ...]`` pairs this UPDATE actually
+    touched. The caller MUST mark_pending these for TEE requeue itself, and
+    MUST NOT do so until its own outer ``with _pool().connection()`` block has
+    exited (i.e. the transaction containing this UPDATE has committed).
+
+    Marking from inside this shared cursor, before that commit, would be a
+    genuine race, not just a hypothetical one: mirror.mark_pending writes
+    through an independent autocommit connection to the TEE shadow DB, so the
+    marker can land and be *consumed* before this transaction commits. The
+    requeue consumer's fetch is a plain SELECT with no FOR UPDATE, so under
+    READ COMMITTED it does not block on this transaction's row lock — it
+    simply reads whatever was last committed, i.e. the pre-UPDATE row — and,
+    finding a row, deletes the just-created pending marker as "done". When
+    this transaction then commits moments later, there is no marker left to
+    trigger a re-fetch, so the real state change (running -> pending/failed)
+    never reaches TEE. That is silent and permanent, and worse than never
+    marking at all: requeue_backlog even looks healthy (the marker was
+    "consumed"), with no error anywhere. This is exactly the class of bug
+    this task exists to close, reintroduced via a different trigger path.
+    """
     cur.execute(
         "UPDATE v2_trajectory_reviews r SET "
         "status=CASE WHEN r.attempt_count<%s THEN 'pending' ELSE 'failed' END, "
@@ -300,23 +323,13 @@ def _recover_review_runner_on_cursor(cur, runner_job_id: int | str) -> None:
         ),
     )
     rows = cur.fetchall()
-    if rows:
-        # Same-PK in-place rewrite (running -> pending/failed release) — the
-        # append-only replicator cursor never revisits it. This helper shares
-        # one cursor with three different outer transactions (mark_failed/
-        # mark_expired/reap_stuck_job_rows); marking here rather than
-        # threading the affected-row set back through each caller's own
-        # post-commit tail is safe because mark_pending only ever causes the
-        # requeue lane to re-fetch whatever the RDS row *currently* holds —
-        # if this transaction later rolled back, the requeue would just
-        # re-copy the unchanged prior state, a harmless no-op.
-        from tee_shadow import mirror
-        for row in rows:
-            user_id = row["user_id"] if isinstance(row, dict) else row[0]
-            source_job_id = row["source_job_id"] if isinstance(row, dict) else row[1]
-            mirror.mark_pending(
-                str(user_id), "v2_trajectory_reviews", str(source_job_id), "requeue")
-            _ensure_review_runner_on_cursor(cur, str(user_id))
+    recovered: list[tuple[str, str]] = []
+    for row in rows:
+        user_id = row["user_id"] if isinstance(row, dict) else row[0]
+        source_job_id = row["source_job_id"] if isinstance(row, dict) else row[1]
+        _ensure_review_runner_on_cursor(cur, str(user_id))
+        recovered.append((str(user_id), str(source_job_id)))
+    return recovered
 
 
 def reconcile_failure_review_runners(*, limit: int = 64) -> int:
@@ -953,6 +966,7 @@ def mark_failed(
     outbox row.
     """
     visible_error = _terminal_error_code(error)
+    recovered_reviews: list[tuple[str, str]] = []
     with _pool().connection() as conn:
         with conn.transaction():
             cur = conn.execute(
@@ -992,13 +1006,23 @@ def mark_failed(
                     base_sec=float(wake_backoff_base_sec),
                     cap_sec=float(wake_backoff_cap_sec),
                 )
-            _recover_review_runner_on_cursor(cur, job_id)
+            recovered_reviews = _recover_review_runner_on_cursor(cur, job_id)
             _queue_failure_review_on_cursor(cur, job_id)
-            return True
+    if recovered_reviews:
+        # Must wait until the transaction above has committed — see the
+        # docstring on _recover_review_runner_on_cursor for the race this
+        # avoids (a requeue consumer reading the pre-commit row and deleting
+        # the marker before the real UPDATE lands).
+        from tee_shadow import mirror
+        for user_id, source_job_id in recovered_reviews:
+            mirror.mark_pending(
+                user_id, "v2_trajectory_reviews", source_job_id, "requeue")
+    return True
 
 
 def mark_expired(job_id, error: str = "runtime_expired") -> None:
     visible_error = _terminal_error_code(error)
+    recovered_reviews: list[tuple[str, str]] = []
     with _pool().connection() as conn:
         with conn.transaction():
             cur = conn.execute(
@@ -1016,8 +1040,13 @@ def mark_expired(job_id, error: str = "runtime_expired") -> None:
                 (str(error)[:500], job_id, visible_error),
             )
             if cur.fetchone() is not None:
-                _recover_review_runner_on_cursor(cur, job_id)
+                recovered_reviews = _recover_review_runner_on_cursor(cur, job_id)
                 _queue_failure_review_on_cursor(cur, job_id)
+    if recovered_reviews:
+        from tee_shadow import mirror
+        for user_id, source_job_id in recovered_reviews:
+            mirror.mark_pending(
+                user_id, "v2_trajectory_reviews", source_job_id, "requeue")
 
 
 def reap_stuck_job_rows(now=None) -> list[dict]:
@@ -1028,6 +1057,7 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
     Returned rows let the independent watchdog surface chat timeouts.
     """
     ts = float(now) if now is not None else None
+    recovered_reviews: list[tuple[str, str]] = []
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
@@ -1070,7 +1100,8 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
                 )
                 rows = [dict(row) for row in cur.fetchall()]
                 for row in rows:
-                    _recover_review_runner_on_cursor(cur, row["id"])
+                    recovered_reviews.extend(
+                        _recover_review_runner_on_cursor(cur, row["id"]))
                     _queue_failure_review_on_cursor(cur, row["id"])
                 # Prepared Capture journals are retry-only encrypted content.
                 # Retire obsolete runtime generations immediately and bound a
@@ -1086,7 +1117,12 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
                     " ORDER BY b.created_at LIMIT 100"
                     ")"
                 )
-                return rows
+    if recovered_reviews:
+        from tee_shadow import mirror
+        for user_id, source_job_id in recovered_reviews:
+            mirror.mark_pending(
+                user_id, "v2_trajectory_reviews", source_job_id, "requeue")
+    return rows
 
 
 def ensure_terminal_failure_outbox(job_id, user_id: str, error: str) -> bool:
