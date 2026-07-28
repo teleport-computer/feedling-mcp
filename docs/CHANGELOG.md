@@ -47,6 +47,175 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-27 — 摘要折叠死锁：一个 V2 用户被自己的一批消息卡了三天
+
+**[FIX] 折叠被拒的原因不再是黑的；`prompt_coverage_incomplete` 从
+`responder_error` 桶里单列出来**。
+
+`usr_7f30…`（prod，3146 条历史）自 07-24 17:31 起在 V2 下**每一个 turn 都失败**，
+14/14，零成功。取证链：
+
+- 摘要水位 `v2_conversation_summary.watermark_seq` 冻结在 682015，其后 1946 条
+  未摘要；同期其他 V2 用户水位都在正常推进。
+- 一个 turn 内（job 9）**连折 6 批成功**（段 3/4/6/7/8/9，各 200 条，每批
+  14–22 秒），第 7 批开始三连败，每次只要 2.5–4 秒。三次 `provider_request` 的
+  `payload_bytes` **逐字相同**——同一批消息被反复发送。
+- 每次调用的 completion tokens 呈双峰：26–53（一两句话）或 500（打满被截断）。
+  26–53 tokens 不可能超行数/超长，所以否决只能来自格式类规则。
+- **规模不是原因**：卡住那批的可折叠内容（body_ct 合计 21,804 B / 200 条）与
+  成功折过的段 3（21,292 B / 199 条）相差 2%。两批都含 R2 外置大文件，成功那批
+  的还更大（4.73 MB vs 2.78 MB）——外置正文是懒加载的，从没进过 prompt。
+
+机制：`compaction._validated_new_bullets` 是**全有或全无**校验，任一行违规整批
+返回 `None` → 折叠 no-op → 水位不推进（这一步是对的，宁可卡住也不能假装覆盖）→
+下一轮读到**逐字相同**的同一批 → 同样被否。失败的后果恰好保证了下次输入不变，
+**没有任何自愈路径**。`_ensure_prompt_coverage` 耗尽 3 次无进展预算后抛
+`TurnError("prompt_coverage_incomplete")`，又被 `_safe_failure_code` 折进
+`responder_error` —— 一个和另外 11 个抛点共用的桶。用户侧表现为完全静默：turn
+从未走到回答用户的那次模型调用。
+
+本次改动（**只加可观测性，不改判据**）：
+
+- `compaction`：拆出 `_validate_new_bullets`，返回 `(rendered, reject_code)`。
+  reject_code 只含规则名与计数（`duplicate_within_batch:3`、
+  `line_count_over_budget:40`、`line_not_bullet:0` …），**绝不含任何被摘要的内容**
+  ——它要流到 worker 的明文状态面。`compact`/`compact_segment`/`compact_checkpoint`
+  新增可选 `reject_out` 回调；回调抛错不会影响折叠结果。
+- `worker`：catch-up 记录最后一次否决码，耗尽重试时抛
+  `TurnError("prompt_coverage_incomplete:<reject_code>")`；`_safe_failure_code`
+  为该码单列一档。于是**不解密、不读代码**，只看明文 `agent_jobs.last_error` /
+  `v2_turn_metrics.status` 就能知道是哪条规则卡住了谁。no-op 分支另记一条
+  `compaction_rejected` trajectory 事件（含批次大小与已重试次数）。
+- `deploy/docker-compose.phala.yaml`（serve-worker）：把
+  `FEEDLING_V2_COMPACTION_BATCH_MSGS` / `_BATCH_CHARS` /
+  `FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC` / `FEEDLING_V2_TAIL_BUDGET_MSGS`
+  以 `${VAR:-码内默认}` 形式接出来（值即当前默认，**不是行为变更**），这样下次
+  卡住可以用加密 env 缩批解卡，不必再发一次版；另接出
+  `FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED`（默认 `0`）。
+
+⚠️ **`responder_error` 的统计口径变了**：以前所有 coverage 停滞都记在
+`responder_error` 名下，现在改记 `prompt_coverage_incomplete[:code]`。按该字段
+分组的看板需要同步。
+
+**[FIX] 死锁本身：缩批 → 隔离 → 越过（quarantine-and-advance）**。参数怎么调都
+绕不开「全有全无 + 输入确定性」这个自锁结构，出路只能是给它一条出路。两级升级：
+
+1. **先缩批**。连续 `max_retries` 次无进展后，批次上限除以 4（200→50→12→3→1），
+   每个尺寸拿到自己的重试预算（它是一个真正不同的请求，不是失败请求的重复）。
+   多数拒绝是**批次**的属性而非某一条消息的属性——行数超预算、两条消息归纳出同一
+   条 bullet——换个尺寸就不再发生。健康路径完全不变（第一次就成功时永不缩批）。
+2. **缩到 1 条仍被拒 → 隔离那一条**。写一个确定性的替身段（`coverage_kind` 仍是
+   `exact`，seq 范围正好是它替换的那一行，所以 `validate_canonical_frontier` 的
+   三个见证依旧成立），文本明说「此处有 1 条消息未能被自动摘要，其内容不在本摘要
+   覆盖范围内，原文仍完整保留在聊天记录中」。**一次只越过一行，绝不牺牲整批**——
+   为解锁一行而丢掉 199 行完全折得动的消息是不可接受的。
+
+隔离**损失的是摘要覆盖，不是数据**：`chat_messages` 是不可变原文表，一行都没动，
+历史照常可读，将来更聪明的压缩器可以回头重折。每次隔离都打一行明文日志
+（`[v2-compaction] quarantined unfoldable row user=… seq=… reject=…`）并记一条
+`compaction_quarantined` trajectory 事件。开关
+`FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED`（默认开），置 `0` 恢复严格 fail-closed。
+
+**另一条同样致命、但走不同代码路径的形状也一并修了**：`_bounded_compaction_prefix`
+遇到「首行单条就超过整批字符预算」时抛 `ValueError`（它拒绝跳过超大首行，因为跳过
+会让 seq 覆盖不诚实）——这条路径**根本到不了 provider**，所以缩批对它毫无作用。
+`usr_7f30…` 真正的墙就是这个：seq 682632 是一条 R2 外置、hydrate 后 798,262 字符
+的消息，卡在积压队头。现在这条路径直接走隔离。**如果只修了折叠被拒那一半，这个
+用户部署后仍然会卡在原地。**
+
+**[FIX] V2 的 provider 尝试也写明文台账**。V1 的常驻 consumer 一直往
+`user_logs.provider_attempts` 写一份纯元数据台账（outcome / usage / trigger），
+所以「这个用户的中转到底通不通」是一条 SQL。**V2 把同样的事实只记在加密
+trajectory 里**，于是同一个问题在 V2 侧要走 break-glass 解密。
+
+这个缺口在 usr_90184ac4 上直接变成了误诊：他 14/14 `providererror`，看起来像
+「中转扛不住 V2」。查了 V1 台账才发现——**同一套凭证、同一个中转，V1 侧 902 次
+成功、峰值 70,926 input tokens、最近一次成功就在今天**，而 V2 单次调用才约 43k。
+中转没坏，prompt 也不比 V1 大，差异在我们发出去的请求形状。**这个结论完全来自
+V1 那份明文台账**；如果 V2 也有，第一分钟就能得出。
+
+`provider_attempt_ledger.record_runtime_attempt()`：同一个 stream、同一套字段名，
+额外带 `runtime`/`lane`/`provider`/`model`/`error_class`（V1 从 consumer 自己的
+配置拿，V2 得自己声明）。写入点是 trajectory sink 的一层旁路（`_record_trajectory`
++ 前台 turn 的 `_ledger_tapped_sink`，两条 lane 都覆盖），只取元数据——outcome、
+token 数、provider/model、错误**类名**，不含 prompt、回复、上游原始错误文本。
+
+⚠️ 两个刻意的防御，都是被测试打出来的：telemetry 失败一律吞掉（写台账不能让一个
+本该成功的 turn 失败），且对 trajectory sink 的形状保持宽容——没有 `user_id` 的
+窄 recorder 就不写台账、不抛异常（前台 turn 也走这条包装，一个 AttributeError
+会炸掉它本该解释的那些 turn，wake lane 的测试替身当场证明了这一点）。
+
+回归：`4 failed / 6741 passed`（干净 HEAD 基线）→ `3 failed / 6770 passed`，失败
+集合是基线的子集（`e2b_template` 那条本身是 flaky，这次自己绿了）。新增测试覆盖：
+缩批优先于牺牲覆盖、单行隔离后用户解锁、一次只推进一行、隔离文本确定性且无内容、
+超大单行被隔离而非永久卡死、关掉开关后两条路径都仍然 fail-closed，以及台账镜像的
+四条（成功/失败字段映射、非 provider 事件不记、原始错误体不进台账、写入失败不影响
+turn）。
+
+**[ADD] `tools/v2_user_triage.py`** —— 把这次的排查路径固化成一条命令（只读、不
+解密）：runtime / jobs / metrics / summary / backlog head / trajectory / provider
+ledger / peers。四个判据是事故的直接产物：水位停滞时长、队头 R2 指针是否超批次
+预算、重试间 `payload_bytes` 是否逐字相同、V1↔V2 provider 结果对照。⚠️ 告警判据
+改过两版才不误报：只看「停滞时长」会把 21/21 全绿但一天没说话的用户标黄；加上
+「有积压 + 有失败」仍会误报 usr_90184（他的 frontier 是健康的）。最终判据是
+**停滞 + 有积压 + 失败是 coverage 形状的**，三者缺一不可，并对「有失败但 frontier
+健康」主动提示去看 provider。
+
+## 2026-07-27 — 退役 `responses_unsupported`：一条对着 Kimi 用户空放了很久的警告
+
+**[DECISION] 删除 `/responses` 探测与 `responses_unsupported` 警告**。用户配
+Kimi/Moonshot（`openai_compatible`）时，setup 会返回一条 warning：「你选的中转
+不支持 Responses 协议，AI 的记忆和工具调用可能不稳定，建议换一个中转」。这条
+警告是误报，代码取证与真机实测两头闭合：
+
+- 它的因由（`setup_core._emit_responses_support_notice` 的注释）是「中转不实现
+  `/v1/responses` → LiteLLM 强制 responses→chat-completions 桥接 → mangle codex
+  工具循环」。**三个前提全部失效**：① LiteLLM 网关早已退役（`db.py` 自己写着
+  「pi 走 openai-completions wire，不经 LiteLLM 网关」）；② `openai_compatible`
+  派生的 driver label 是 `pi` 而非 `codex`（`hosted/agent_runtime_cutover.py`），
+  而 warning 的触发条件恰恰限死在 `openai_compatible`——只在**永远用不到 codex
+  的那类 provider 上**报警；③ Runtime V2 全程 `chat_completion_async`，
+  `provider_client` 里 `/responses` 的唯一入口条件是 `provider == "openai"`。
+- `supports_responses` 在整个 backend **没有任何行为消费点**（`consumer_env` 也
+  不读它），唯一下游就是这条 warning。
+- test 环境实测四个临时账号（`kimi-k2.5` + `https://api.moonshot.cn/v1`）：V1(pi)
+  路径 3 轮、V2 路径 1 轮，记忆写入 4/4、下一轮回读 4/4、错误气泡 0；V2 的
+  `v2_trajectory_events` 记到 `tool_call_started` / `tool_call_result` /
+  `tool_batch_planned` / `tool_batch_result` **各 3 次**，`turn_terminal` 2 次。
+  即：警告声称会不稳的两件事，在它自己声称会出问题的路径上都是好的。
+
+改动：删 `provider_client.probe_responses_support`（省掉每次 openai_compatible
+setup 一次最多 20s 的网络往返）、删 `setup_core._emit_responses_support_notice`
+与两处 probe 调用、setup 响应不再有 `warnings` 字段、`notices/catalog` 移除该
+error class。`supports_responses` **列保留**并钉死 false——V1 roster payload 仍
+带着它，删列要迁移而收益为零。
+
+存量已 emit 的通知走**读侧过滤**下架（`catalog.RETIRED_ERROR_CLASSES` +
+`notices.core.list_notices` 跳过），不做 SQL 回填：`user_logs` 有 TEE 影子库
+镜像，回填只改主库会让两边分叉。
+
+文档：`docs/FRONTEND_ERROR_CONTRACT.md` 删该行；`docs/testing/TESTING.md` §6 与
+`RELEASE_TESTING_PROTOCOL.md` 第 5 格改口径——**「能回话 ≠ 记忆/工具能用」这条
+测试纪律保留且加强，但没有任何配置字段能替代跑一轮真回合**（旧文写的「验一家新
+中转必须读 `warnings[]` 和 `supports_responses`」是错的指引）。公开文档与
+OpenAPI 不涉及（零命中）。
+
+同期确认的一条独立事实（与本条无关，仍成立）：Moonshot 的 key 有**区域锁**，
+`.cn` 签发的 key 打 `api.moonshot.ai` 直接 `401 Invalid Authentication`；用户报
+`provider_test_failed`/401 时先核 `base_url` 与 key 签发区是否配对。
+
+## 2026-07-26 — V1 resident 补齐可下载文件
+
+### [DONE] Claude / Codex / Pi 共用文件生成与原子回复
+- V1 CLI resident 新增 `io_cli send-file`：模型把 UTF-8 源文件写进每用户隔离的
+  `outbound-files`，Word/PDF 在投递时渲染成真实 `.docx` / `.pdf`。
+- 明确格式请求沿用 V2 的完成保护：错误后缀会被拒绝，首轮漏发文件会再补一次，仍
+  未生成时保留模型正文，不再把整轮替换成固定失败话术；未指定格式的请求只走语义
+  prompt，不参与硬性终态阻塞。
+- `/v1/chat/response` 新增加密 `file_followups`；文字主回复、文件 Card 与父消息 CAS
+  在同一个 PostgreSQL 事务提交，保证文字在上、Card 在下，且不会出现半成功。
+- 同时覆盖 VPS/self-hosted 与 API-key hosted resident；未推送、未建 PR、未合并。
+
 ## 2026-07-25 — TEE Redis：三台 CVM 开通 + 砍掉离线备份
 
 三套 Redis CVM（test/pre/prod）全部开通、running、冒烟 ALL GREEN，落在
@@ -520,9 +689,18 @@ cvm-id fail-closed、永不并入 merge 自动部署。
 
 ### [DONE] Runtime V2 harness parity lands in source with explicit live gates
 
-- The unified model-visible catalog now has 23 built-in tools: 21 platform
-  capabilities plus bounded `task` subagents and loop-native `reply`. Independent
-  reads/tasks run concurrently; disjoint workspace writes may commit in
+- The unified model-visible catalog now has 24 built-in tools: 21 platform
+  capabilities plus bounded `task` subagents, loop-native `reply`, and chat-only
+  `send_file`. `send_file` publishes only an explicit, current-user encrypted
+  `/workspace` entry through the idempotent reply outbox; UTF-8 text formats are
+  delivered directly, while `.docx` and `.pdf` targets are rendered into real
+  Word/PDF bytes instead of renaming Markdown. Final text and file cards commit
+  as one ordered reply bundle. Explicit formats get one bounded completion
+  recovery and reject a Markdown substitution. If the file is still missing, the
+  model's non-empty terminal text is preserved and the turn completes with a
+  `required_file_missing` trajectory event. It never scans or accepts a host
+  filesystem path.
+  Independent reads/tasks run concurrently; disjoint workspace writes may commit in
   conflict-free waves, while conflicting paths and external effects remain
   provider-ordered.
 - Added the encrypted, backend-pluggable VFS: read-only `/artifacts` and

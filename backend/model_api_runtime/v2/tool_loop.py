@@ -4,6 +4,7 @@ all side effects injected. One loop for every model — no is_official branch.""
 from __future__ import annotations
 from dataclasses import dataclass
 import json
+import posixpath
 import re
 from provider_types import ProviderResponse, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
@@ -195,6 +196,11 @@ async def run_tool_loop(
     extra_mutating_tool_names=None,
     disabled_tool_names=None,
     allow_reply_tool: bool = True,
+    on_file_reply=None,
+    required_file_suffixes: tuple[str, ...] | None = None,
+    file_requirement_messages=(),
+    resolve_required_file_suffixes=None,
+    on_file_requirement_changed=None,
     outbound_blocking_read_tool_names=None,
     outbound_blocking_read_tool_predicate=None,
     max_tool_calls_per_round: int = DEFAULT_MAX_TOOL_CALLS_PER_ROUND,
@@ -210,6 +216,8 @@ async def run_tool_loop(
     prompt_safety_margin_tokens: int | None = None,
     prompt_estimator_utf8_bytes_per_token: float = prompt_frontier.DEFAULT_ESTIMATOR_UTF8_BYTES_PER_TOKEN,
     prompt_image_reserve_tokens: int = prompt_frontier.DEFAULT_IMAGE_RESERVE_TOKENS,
+    on_tail_window=None,
+    on_prompt_frontier_exhaustion=None,
 ) -> LoopOutcome:
     """Run one chronological, provider-native tool transcript.
 
@@ -231,7 +239,19 @@ async def run_tool_loop(
     `deps.apply_pending_effects`, whose reply sink does an enclave-bound encrypted
     write; the drain itself is `asyncio.to_thread`-offloaded on the caller's side, so
     ``on_reply`` must be awaited here, never called synchronously (a sync call would
-    reintroduce the event-loop-blocking write the offload is meant to avoid)."""
+    reintroduce the event-loop-blocking write the offload is meant to avoid).
+
+    ``on_file_reply`` is an optional async chat-lane callback. When absent, the
+    ``send_file`` tool is removed from the offered catalog. Production resolves
+    only encrypted ``/workspace`` entries through this callback; the loop never
+    interprets a model string as a host filesystem path.
+
+    ``required_file_suffixes`` is a completion guard for explicit output formats.
+    ``None`` and ``()`` disable the hard guard; a non-empty tuple gets one bounded
+    completion retry before the provider's terminal text is published normally.
+    Chat callers may also provide ``file_requirement_messages`` plus a resolver;
+    newly folded user messages then update or cancel the requirement before each
+    later provider round."""
     max_tool_calls_per_round = _positive_limit(
         max_tool_calls_per_round, name="max_tool_calls_per_round"
     )
@@ -290,6 +310,37 @@ async def run_tool_loop(
     external_content_seen = False
     mutation_outcome_unknown = False
     outbound_tools_blocked = False
+    file_requirement_message_state = [
+        dict(message)
+        for message in file_requirement_messages
+        if isinstance(message, dict)
+    ]
+
+    def _normalize_file_requirement(value) -> tuple[bool, frozenset[str]]:
+        suffixes = frozenset(
+            str(suffix).strip().casefold() for suffix in (value or ())
+        )
+        if any(
+            re.fullmatch(r"\.[a-z0-9]{1,16}", suffix) is None
+            for suffix in suffixes
+        ):
+            raise ValueError("required_file_suffixes contains an invalid suffix")
+        return bool(suffixes), suffixes
+
+    resolved_file_requirement = required_file_suffixes
+    if resolve_required_file_suffixes is not None:
+        resolved_file_requirement = resolve_required_file_suffixes(
+            file_requirement_message_state
+        )
+    file_delivery_required, normalized_required_suffixes = (
+        _normalize_file_requirement(resolved_file_requirement)
+    )
+    delivered_file_suffixes: set[str] = set()
+    delivery_retry_instruction = ""
+    file_delivery_retry_used = False
+    required_file_missing_recorded = False
+    file_delivery_fallback_text = ""
+    file_delivery_fallback_reasoning = ""
     outbound_blocking_reads = {
         str(name) for name in (outbound_blocking_read_tool_names or ()) if str(name)
     }
@@ -331,6 +382,8 @@ async def run_tool_loop(
         disabled_names.discard(tool_schema.REPLY_TOOL)
     else:
         disabled_names.add(tool_schema.REPLY_TOOL)
+    if on_file_reply is None:
+        disabled_names.add(tool_schema.FILE_REPLY_TOOL)
     turn_catalog = [
         spec
         for spec in (_catalog() + list(extra_tool_specs or []))
@@ -360,6 +413,20 @@ async def run_tool_loop(
         if on_trajectory_event is not None:
             await on_trajectory_event(event_kind, payload)
 
+    async def _record_required_file_missing(round_number: int) -> None:
+        nonlocal required_file_missing_recorded
+        if required_file_missing_recorded:
+            return
+        await _trajectory(
+            "required_file_missing",
+            {
+                "round": round_number,
+                "required_suffixes": sorted(normalized_required_suffixes),
+                "delivered_suffixes": sorted(delivered_file_suffixes),
+            },
+        )
+        required_file_missing_recorded = True
+
     while attempts < max_calls:
         _progress("round_boundary")
         if attempts > 0 or fold_before_first:
@@ -373,8 +440,50 @@ async def run_tool_loop(
                     {"round": attempts + 1, "messages": folded},
                 )
                 transcript.extend(folded)
+                if resolve_required_file_suffixes is not None:
+                    file_requirement_message_state.extend(
+                        dict(message)
+                        for message in folded
+                        if isinstance(message, dict)
+                    )
+                    (
+                        next_file_delivery_required,
+                        next_required_suffixes,
+                    ) = _normalize_file_requirement(
+                        resolve_required_file_suffixes(
+                            file_requirement_message_state
+                        )
+                    )
+                    if (
+                        next_file_delivery_required != file_delivery_required
+                        or next_required_suffixes
+                        != normalized_required_suffixes
+                    ):
+                        file_delivery_required = next_file_delivery_required
+                        normalized_required_suffixes = next_required_suffixes
+                        delivered_file_suffixes.clear()
+                        delivery_retry_instruction = ""
+                        file_delivery_retry_used = False
+                        required_file_missing_recorded = False
+                        file_delivery_fallback_text = ""
+                        file_delivery_fallback_reasoning = ""
+                        if on_file_requirement_changed is not None:
+                            await on_file_requirement_changed()
 
         messages = build_messages(list(transcript))
+        if delivery_retry_instruction:
+            messages = [dict(message) for message in messages]
+            if messages and messages[0].get("role") == "system":
+                messages[0]["content"] = (
+                    str(messages[0].get("content") or "").rstrip()
+                    + "\n\n"
+                    + delivery_retry_instruction
+                )
+            else:
+                messages.insert(
+                    0,
+                    {"role": "system", "content": delivery_retry_instruction},
+                )
         # Reserve the final provider attempt for a tools-disabled terminal reply.
         # A 400/422 tool-schema rejection or repeated malformed call also forces
         # this same one-shot fallback; the fallback itself is never retried.
@@ -421,15 +530,41 @@ async def run_tool_loop(
             tools = [spec for spec in turn_catalog if spec.name not in blocked_tools]
         else:
             tools = turn_catalog
-        frontier_plan = prompt_frontier.plan_provider_round(
-            model_limit=model_prompt_limit,
-            messages=messages,
-            tools=tools,
-            output_reserve_tokens=prompt_output_reserve_tokens,
-            safety_margin_tokens=prompt_safety_margin_tokens,
-            utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
-            image_reserve_tokens=prompt_image_reserve_tokens,
-        )
+        tail_window = None
+        adaptive_planner = getattr(build_messages, "plan_provider_round", None)
+        try:
+            if callable(adaptive_planner):
+                messages, frontier_plan, tail_window = adaptive_planner(
+                    transcript=list(transcript),
+                    tools=tools,
+                    model_limit=model_prompt_limit,
+                    output_reserve_tokens=prompt_output_reserve_tokens,
+                    safety_margin_tokens=prompt_safety_margin_tokens,
+                    utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
+                    image_reserve_tokens=prompt_image_reserve_tokens,
+                )
+            else:
+                frontier_plan = prompt_frontier.plan_provider_round(
+                    model_limit=model_prompt_limit,
+                    messages=messages,
+                    tools=tools,
+                    output_reserve_tokens=prompt_output_reserve_tokens,
+                    safety_margin_tokens=prompt_safety_margin_tokens,
+                    utf8_bytes_per_token=prompt_estimator_utf8_bytes_per_token,
+                    image_reserve_tokens=prompt_image_reserve_tokens,
+                )
+        except prompt_frontier.PromptFrontierExhausted:
+            if on_prompt_frontier_exhaustion is not None:
+                try:
+                    on_prompt_frontier_exhaustion()
+                except Exception:
+                    pass
+            raise
+        if tail_window is not None and on_tail_window is not None:
+            try:
+                on_tail_window(dict(tail_window))
+            except Exception:
+                pass
         if "tool_schemas" in frontier_plan.omitted_optional_components:
             # Schemas are atomic and optional: omitting the whole catalog is a
             # valid weak-model/text-only degradation. Required conversation and
@@ -444,13 +579,24 @@ async def run_tool_loop(
                 "messages": messages,
                 "tools": tools,
                 "prompt_frontier": frontier_plan,
+                "tail_window": tail_window,
             },
         )
         attempts += 1
         _progress("provider_start")
         try:
+            provider_kwargs = {"tools": tools}
+            if on_file_reply is not None:
+                # File-capable foreground chat may need to place an entire
+                # generated document inside workspace_write arguments. The
+                # provider client's historical 700-token default predates V2
+                # tools and truncates even modest documents into malformed
+                # JSON. Use the output budget already reserved by V2's prompt
+                # frontier; wake/child/screen lanes omit on_file_reply and keep
+                # their existing limits unchanged.
+                provider_kwargs["max_tokens"] = prompt_output_reserve_tokens
             result = await provider_client.chat_completion_async(
-                provider_config, messages, tools=tools
+                provider_config, messages, **provider_kwargs
             )
         except Exception as exc:
             attempt_trace = provider_client.runtime_provider_attempt_trace(exc)
@@ -472,6 +618,54 @@ async def run_tool_loop(
                     await on_provider_failure(exc)
                 except Exception:
                     pass
+            if (
+                file_delivery_retry_used
+                and not normalized_required_suffixes.issubset(
+                    delivered_file_suffixes
+                )
+            ):
+                # The extra completion attempt is best-effort. A provider error
+                # here must not retroactively discard the usable text from the
+                # original terminal response that triggered the retry.
+                await _record_required_file_missing(attempts)
+                await _trajectory(
+                    "reply_planned",
+                    {
+                        "round": attempts,
+                        "final": True,
+                        "text": file_delivery_fallback_text,
+                        "reason": "required_file_missing",
+                    },
+                )
+                if file_delivery_fallback_text.strip():
+                    try:
+                        await on_reply(
+                            file_delivery_fallback_text,
+                            final=True,
+                            reasoning=file_delivery_fallback_reasoning,
+                        )
+                    except FinalReplySuperseded:
+                        _progress("final_reply_superseded")
+                        await _trajectory(
+                            "final_reply_superseded",
+                            {"round": attempts},
+                        )
+                        if attempts < max_calls:
+                            delivery_retry_instruction = ""
+                            file_delivery_retry_used = False
+                            required_file_missing_recorded = False
+                            file_delivery_fallback_text = ""
+                            file_delivery_fallback_reasoning = ""
+                            continue
+                        return LoopOutcome(
+                            "", attempts, "input_advanced", replied_intermediate
+                        )
+                return LoopOutcome(
+                    file_delivery_fallback_text,
+                    attempts,
+                    "required_file_missing",
+                    replied_intermediate,
+                )
             if (
                 tools is not None
                 and isinstance(exc, provider_client.ProviderError)
@@ -507,6 +701,95 @@ async def run_tool_loop(
         # A tools-disabled request is terminal even if a broken relay invents a
         # tool call anyway.  Never execute an undeclared call; use only its text.
         if tools is None or not pr.tool_calls:
+            requirement_met = (
+                not file_delivery_required
+                or (
+                    bool(delivered_file_suffixes)
+                    if not normalized_required_suffixes
+                    else normalized_required_suffixes.issubset(
+                        delivered_file_suffixes
+                    )
+                )
+            )
+            if not requirement_met:
+                missing_suffixes = sorted(
+                    normalized_required_suffixes - delivered_file_suffixes
+                )
+                if pr.text.strip() and not file_delivery_fallback_text:
+                    file_delivery_fallback_text = pr.text
+                    file_delivery_fallback_reasoning = str(
+                        pr.raw.get("reasoning") or ""
+                    )
+                if missing_suffixes:
+                    target = ", ".join(missing_suffixes)
+                    delivery_retry_instruction = (
+                        "REQUIRED FILE DELIVERY: The user explicitly requested "
+                        f"downloadable output in {target}. Do not finish with "
+                        "plain text. Create editable source with workspace_write, "
+                        "then call send_file for every missing format before the "
+                        "terminal reply."
+                    )
+                else:
+                    delivery_retry_instruction = (
+                        "REQUIRED FILE DELIVERY: The user explicitly requested a "
+                        "downloadable file. Do not finish with plain text. Create "
+                        "it with workspace_write, then call send_file before the "
+                        "terminal reply."
+                    )
+                force_text_fallback = False
+                # One guard-triggered recovery is enough. Tool calls emitted by
+                # that recovery may still take later rounds to write, deliver,
+                # and finish; the guard itself must not keep re-arming or consume
+                # the tools-disabled final round when delivery is impossible.
+                if not file_delivery_retry_used and attempts < max_calls - 1:
+                    file_delivery_retry_used = True
+                    _progress("required_file_retry_boundary")
+                    continue
+                await _record_required_file_missing(attempts)
+                terminal_text = file_delivery_fallback_text or pr.text
+                terminal_reasoning = (
+                    file_delivery_fallback_reasoning
+                    if file_delivery_fallback_text
+                    else str(pr.raw.get("reasoning") or "")
+                )
+                await _trajectory(
+                    "reply_planned",
+                    {
+                        "round": attempts,
+                        "final": True,
+                        "text": terminal_text,
+                        "reason": "required_file_missing",
+                    },
+                )
+                if terminal_text.strip():
+                    try:
+                        await on_reply(
+                            terminal_text,
+                            final=True,
+                            reasoning=terminal_reasoning,
+                        )
+                    except FinalReplySuperseded:
+                        _progress("final_reply_superseded")
+                        await _trajectory(
+                            "final_reply_superseded",
+                            {"round": attempts},
+                        )
+                        if attempts < max_calls:
+                            delivery_retry_instruction = ""
+                            file_delivery_retry_used = False
+                            required_file_missing_recorded = False
+                            file_delivery_fallback_text = ""
+                            file_delivery_fallback_reasoning = ""
+                            continue
+                        return LoopOutcome(
+                            "", attempts, "input_advanced", replied_intermediate
+                        )
+                return LoopOutcome(
+                    terminal_text,
+                    attempts,
+                    "required_file_missing",
+                    replied_intermediate,
+                )
             await _trajectory(
                 "reply_planned",
                 {
@@ -578,7 +861,8 @@ async def run_tool_loop(
             for tc in pr.tool_calls
         )
         mixed_reply_write = any(
-            tc.name == tool_schema.REPLY_TOOL for tc in pr.tool_calls
+            tc.name in {tool_schema.REPLY_TOOL, tool_schema.FILE_REPLY_TOOL}
+            for tc in pr.tool_calls
         ) and any(
             tc.name in cap_registry.WRITE_ACTIONS or tc.name in mutating_mcp_names
             for tc in pr.tool_calls
@@ -619,7 +903,11 @@ async def run_tool_loop(
 
         # text accompanying tool_calls = preamble/thinking, NOT a bubble.
         reply_calls = [tc for tc in pr.tool_calls if tc.name == tool_schema.REPLY_TOOL]
-        other_calls = [tc for tc in pr.tool_calls if tc.name != tool_schema.REPLY_TOOL]
+        file_reply_calls = [
+            tc for tc in pr.tool_calls if tc.name == tool_schema.FILE_REPLY_TOOL
+        ]
+        loop_reply_tools = {tool_schema.REPLY_TOOL, tool_schema.FILE_REPLY_TOOL}
+        other_calls = [tc for tc in pr.tool_calls if tc.name not in loop_reply_tools]
         reply_results: dict[str, ToolResult] = {}
         for tc in reply_calls:
             reply_text = str(tc.args.get("text") or "")
@@ -639,6 +927,38 @@ async def run_tool_loop(
             else:
                 content = "ok: empty reply ignored"
             reply_results[tc.id] = ToolResult(call_id=tc.id, content=content)
+
+        for tc in file_reply_calls:
+            workspace_path = str(tc.args.get("path") or "").strip()
+            workspace_revision = int(tc.args["revision"])
+            await _trajectory(
+                "file_reply_planned",
+                {"round": attempts, "call_id": tc.id},
+            )
+            # Presence is guaranteed by the offer gate above. Keep the explicit
+            # check as a defense for direct/internal callers.
+            if on_file_reply is None:
+                raise RuntimeError("send_file callback is unavailable")
+            file_suffix = posixpath.splitext(workspace_path)[1].casefold()
+            if (
+                normalized_required_suffixes
+                and file_suffix not in normalized_required_suffixes
+            ):
+                reply_results[tc.id] = ToolResult(
+                    call_id=tc.id,
+                    content=(
+                        "error: wrong file format; required suffixes: "
+                        + ", ".join(sorted(normalized_required_suffixes))
+                    ),
+                )
+                continue
+            await on_file_reply(workspace_path, workspace_revision)
+            delivered_file_suffixes.add(file_suffix)
+            replied_intermediate = True
+            reply_results[tc.id] = ToolResult(
+                call_id=tc.id,
+                content="ok: file delivered",
+            )
 
         if other_calls:
             await _trajectory(

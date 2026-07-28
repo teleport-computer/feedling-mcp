@@ -137,6 +137,47 @@ def test_final_v2_reply_marks_consumed_user_rows_answered_for_resident_rollback(
         ) is None
 
 
+def test_final_v2_fallback_copies_failure_attribution_to_consumed_user_rows():
+    uid = "u_atomic_reply_failure_bridge"
+    conftest.seed_user(uid)
+    _reset(uid)
+    db.chat_append(
+        uid,
+        "user-failed",
+        1.0,
+        {"id": "user-failed", "role": "user", "body_ct": "ct"},
+        0,
+    )
+    through_seq = db.chat_seq_for_msg_id(uid, "user-failed")
+    assert through_seq is not None
+
+    db.chat_append_effect_with_cursor(
+        uid,
+        "v2-fallback",
+        2.0,
+        {
+            "id": "v2-fallback",
+            "role": "openclaw",
+            "source": "model_api",
+            "body_ct": "fallback",
+            "turn_failure_error_class": "upstream_unavailable",
+            "turn_failure_blame": "provider_transient",
+            "turn_failure_user_text": "你的模型服务暂时不可用，稍后会自动恢复。",
+        },
+        0,
+        through_seq,
+    )
+
+    with db.get_pool().connection() as conn:
+        doc = conn.execute(
+            "SELECT doc FROM chat_messages WHERE user_id=%s AND msg_id=%s",
+            (uid, "user-failed"),
+        ).fetchone()[0]
+    assert doc["reply_error_class"] == "upstream_unavailable"
+    assert doc["reply_blame"] == "provider_transient"
+    assert "模型服务暂时不可用" in doc["reply_user_text"]
+
+
 def test_v2_final_reply_aborts_if_resident_won_after_prompt_snapshot():
     uid = "u_atomic_reply_resident_race"
     conftest.seed_user(uid)
@@ -863,7 +904,7 @@ def test_wake_yields_snapshot_race_input_to_chat_without_duplicate_reply(
 
     provider_calls: list[list[dict]] = []
 
-    async def _provider(_config, messages, *, tools=None):
+    async def _provider(_config, messages, *, tools=None, **_kwargs):
         provider_calls.append(messages)
         return {"reply": "chat answered once", "tool_calls": [], "usage": {}}
 
@@ -1061,7 +1102,7 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
         {"reply": "answered-three", "tool_calls": [], "usage": {}},
     ])
 
-    async def _provider(config, messages, *, tools=None):
+    async def _provider(config, messages, *, tools=None, **_kwargs):
         provider_calls.append(messages)
         return next(scripted)
 
@@ -1118,7 +1159,7 @@ def test_same_timestamp_initial_midturn_and_successor_inputs_are_consumed_once(m
     seq5 = _append_user("m5", "fifth-same-ts")
     calls_after = []
 
-    async def _fourth_provider(config, messages, *, tools=None):
+    async def _fourth_provider(config, messages, *, tools=None, **_kwargs):
         calls_after.append(messages)
         return {"reply": "answered-fourth", "tool_calls": [], "usage": {}}
 
@@ -1241,7 +1282,7 @@ def test_push_transport_failure_does_not_fail_the_turn(monkeypatch):
     reply_text = "answered-boom-" + ("x" * 300)
     assert len(reply_text) > 240
 
-    async def _provider(config, messages, *, tools=None):
+    async def _provider(config, messages, *, tools=None, **_kwargs):
         return {"reply": reply_text, "tool_calls": [], "usage": {}}
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _provider)

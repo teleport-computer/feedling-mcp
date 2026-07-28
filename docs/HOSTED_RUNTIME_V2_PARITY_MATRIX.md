@@ -1,6 +1,6 @@
 # Hosted Runtime V2 — Current Parity and Completion Matrix
 
-> **CURRENT SOURCE OF TRUTH — 2026-07-20.** This page describes the current
+> **CURRENT SOURCE OF TRUTH — 2026-07-27.** This page describes the current
 > Runtime V2 source and managed deployment manifests. A live environment changes
 > only after this source is deployed. Use
 > [`deploy/HOSTED_RUNTIME_V2_ROLLOUT.md`](../deploy/HOSTED_RUNTIME_V2_ROLLOUT.md)
@@ -23,7 +23,7 @@
 
 | Requirement | Current status | Evidence and remaining gap |
 |---|---|---|
-| No silent wedges | ✅ | Admission checks the turn-worker heartbeat; pending jobs have queue deadlines and a reaper; terminal failures publish `error` status and `last_runtime_error`; the worker contains turn exceptions; provider I/O is async. A dead pool must fail visibly rather than leave a message in `processing` forever. |
+| No silent wedges | ✅ | Admission checks the turn-worker heartbeat; pending jobs have queue deadlines and a reaper; terminal Chat failures publish a parent-linked encrypted failure bubble plus `error` status and `last_runtime_error`; the worker contains turn exceptions; provider I/O is async. All three failure sinks replay durably after crashes. A dead pool must fail visibly rather than leave a message in `processing` forever. |
 | Full conversation, not a fixed message window | ✅ | The prompt is built from an encrypted hierarchical summary frontier plus a verbatim tail. Raw encrypted chat rows and attached R2 bodies are retained independently of compaction; Clear Chat moves them to an immutable non-prompt archive rather than erasing them, and account deletion is the full retention boundary. The former 5,000-row value bounds only the process hot window. Exact immutable leaf segments and immutable higher-level checkpoints keep the model-facing view bounded without deleting children or rewriting the source transcript. |
 | One native agent loop for every model | ✅ | Chat and wake use the same in-process provider-native tool loop. There is no `official`/`rule` tier, planner, or separate responder. A model that does not call a tool naturally returns once; malformed tool output gets bounded compatibility handling, not pre-assigned model routing. |
 | Reply inside the loop; eager late-message folding | ✅ | `reply` is a loop tool, so the model may acknowledge the user and continue working. New user messages are claimed without debounce and folded at every round boundary. |
@@ -96,6 +96,29 @@ or arbitrary code-execution tool. The detailed facade and enclave mapping lives 
 | Memory Dream | ➖ | Native `op/card_ids/result` consolidations map to multi-card supersede actions and pass the real Garden validator, but activation is a separate optional product lane rather than a Runtime V2 release requirement. All managed defaults keep it off. This Dream organizes memory cards and is not runtime failure replay. |
 | Genesis import | ✅ | Rehomed under `serve-worker` with a dedicated heartbeat |
 | Trajectory review | ✅ | Encrypted capture is always on and retained until account deletion; Chat Clear preserves it. Provider-backed offline review is opt-in/default-off, globally capped, tools-disabled, and has no live effect surfaces; operators have a separate default-off, exact-job, runner-local audited inspector. |
+
+## Incident-hardened guards — ported?
+
+Lane parity above means that work can execute; it does not by itself prove that
+the incident-driven interruption, retry, and publication guards from Runtime V1
+survived the pooled Runtime V2 rewrite. This table tracks that second dimension
+explicitly.
+
+| Guard | Runtime V1 source / incident | Runtime V2 counterpart | Status |
+|---|---|---|---|
+| Consecutive AI self-wake limit | `tools/chat_resident_consumer.py:527-558`; `ee81d317` (2026-07-21 self-wake loop) | Wake-turn `schedule_wake` effects carry encrypted internal provenance; `jobs_store.reserve_self_wake` persists a per-user streak and idempotent effect decision; `_sink_schedule` rejects the fourth schedule until genuine user input advances. Heartbeat, screen/event, and user/chat scheduling never consume the counter. | ✅ |
+| Post-time proactive/chat collision gate | `tools/chat_resident_consumer.py:536,9011-9055,11157-11187`; `0c5daa6b` / `usr_a0b7` duplicate wake+chat reply | `effect_outbox._wake_reply_chat_collision` runs inside the reply publication transaction after the model turn. Fresh user or foreground-agent chat within 90 seconds discards heartbeat/manual/screen-watch replies without folding and retrying. User-requested scheduled reminders retain V1's exemption. | ✅ |
+| Provider payment cooldown | V1 600-second cooldown;欠费 retry storm (`usr_d98b`) | `v2_wake_schedule.payment_cooldown_until`, `_WAKE_COOLDOWN_SEC`, and due-user filtering | ✅ |
+| Wake job coalescing | `c635d87d` duplicate proactive work | `jobs_store.coalesce_or_insert_on_cursor` and the per-user active-job uniqueness boundary | ✅ |
+| Short-horizon proactive failure backoff | `tools/chat_resident_consumer.py:518-589,10898-10945`; `PROACTIVE_FAIL_BACKOFF_*`; transient upstream storms (Seven, 2026-07-16/21) | Runtime V2 persists `proactive_fail_streak`, the genuine-user sequence frontier, and `proactive_backoff_until` in `v2_wake_schedule`. Owned heartbeat/scheduled failures atomically arm a 60s exponential delay capped at 3600s; owned success clears it. V1 arms its streak for any failed proactive job, including screen-watch and introduction jobs, while V2 deliberately narrows arming to heartbeat/scheduled failures. Both runtimes defer only idle heartbeat/scheduled work: manual/introduction and screen-watch wakes remain immediately eligible. A newer genuine user row invalidates the V2 delay immediately; provider health remains the separate long-horizon circuit. | ✅ |
+| Foreground failure notice throttling / background silence | `FOREGROUND_NOTICE_WINDOW_SEC` three-bucket fixed window; `usr_6f5a`; 2026-07-27 V2 silent-turn incident | V2 satisfies the required property through architecture rather than copying the timer: wake, Capture, Dream, and maintenance failures never create a terminal-failure marker. A foreground Chat failure atomically queues one marker whose independent idempotent sinks publish an encrypted parent-linked failure bubble, an error status, and the route-fenced `last_runtime_error`. The bubble uses `notices.catalog` attribution, is suppressed after a newer cursor success, and survives worker crashes and lease expiry without duplication. | ✅ |
+| Stale proactive context fallback | `PROACTIVE_STALE_CHAT_FALLBACK_LIMIT`; offline backlog talking past the user | The encrypted summary frontier plus adaptive complete-turn replay preserves the newest 40 genuine user-seeded Chat turns and 16 wake turns. Every provider round receives one immutable temporal snapshot with current UTC/user-local time, latest genuine-user-message age, and an index-aligned timestamp for each verbatim tail row. A deployed `deepseek-v4-flash` probe read the exact current UTC time and measured a 240-second silent gap as four minutes after the larger tail shipped. Wake also rechecks unanswered user input after context assembly and yields to Chat before provider work; the publication-time collision gate covers later arrivals. | ✅ |
+| Stale WHOAMI/content-key rejection | `WHOAMI_STALE_KEYS_MAX_AGE_SEC`; `usr_f13f` replies sealed to a retired key | V2 does not cache consumer WHOAMI keys: reply/tool envelopes resolve the current account/enclave keys at write time. The V1 cache-age mechanism is therefore not applicable. | ➖ |
+| Degenerate punctuation fragment drop | `tools/chat_resident_consumer.py:9192-9220,10900-10928,12025-12068`; stream-cut incident `usr_6f5a` emitted punctuation-only bubbles | `worker._is_degenerate_reply` preserves V1's Unicode-category decision. Chat replaces a terminal fragment with the standard fallback and `upstream_unavailable` / `provider_transient` attribution; intermediate fragments are dropped before a later real reply. Wake lanes fail silently with `degenerate_reply_suppressed`, without a bubble or error chip (`worker.py:5143-5163,7335-7359`). | ✅ |
+| `verify_ping` garbage collection by source | `7941eeb2` real reply accidentally collected | Shared backend `chat_core._verify_synthetic_ids_to_gc` and `_verify_reply_matches_ping` require `source == "verify_ping"` (`backend/chat/chat_core.py:1003-1033`); both runtimes use this route. | ✅ |
+| Reply finalize compare-and-swap | V1 `a5296ef7` finalization race | V2 has the stronger ownership/generation/source-job/seq frontier in `effect_outbox._reply_fence_matches` (`effect_outbox.py:275-519`) plus atomic job completion in `_complete_final_reply_job_on_cursor` (`effect_outbox.py:522-564`). | ✅ |
+| Dream execution consent | Dream could run after opt-out during queued work | `_dream_enabled_for_user` reads the current per-user switch and `process_job` re-checks the extraction gate before provider work (`serve_worker.py:257-266`; `worker.py:6453-6483`). | ✅ |
+| Screen-watch canonical trigger and consent | Screen-watch queried the wrong proactive control during the V2 rewrite | `_tick_screen_watch_for_user` asks `_wake_decision_for_user(..., trigger="screen_watch")` before enqueue (`serve_worker.py:1727-1782`), preserving independent screen-watch consent. | ✅ |
 
 ## Workspace, working memory, and subagents
 

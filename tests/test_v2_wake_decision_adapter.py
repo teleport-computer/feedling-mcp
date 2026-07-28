@@ -9,12 +9,15 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from conftest import seed_user, set_v2_runtime_owner  # noqa: E402
 import db  # noqa: E402
 from core import store as core_store  # noqa: E402
 from hosted import config_store as hosted_config_store  # noqa: E402
+from model_api_runtime.v2 import jobs_store, serve_worker  # noqa: E402
 from proactive import gate as proactive_gate  # noqa: E402
 from model_api_runtime.v2.serve_worker import _wake_decision_for_user  # noqa: E402
 
@@ -65,3 +68,102 @@ def test_wake_decision_activated_user_wakes():
     assert decision["should_wake"] is True
     assert decision["block_reason"] == "wake_created"
     assert decision["wake_interval_sec"] > 0
+
+
+def test_screen_watch_decision_requires_its_user_switch():
+    uid = "usr_wake_decision_screen_disabled"
+    seed_user(uid)
+    _enable_v2(uid)
+    store = core_store.get_store(uid)
+    store.mark_first_chat_ok(at_iso="2026-07-01T00:00:00")
+    store.save_proactive_settings({
+        "ambient": True,
+        "screen_watch_enabled": False,
+    })
+
+    decision = _wake_decision_for_user(uid, trigger="screen_watch")
+
+    assert decision["should_wake"] is False
+    assert decision["block_reason"] == "screen_watch_disabled"
+
+
+def test_screen_watch_decision_is_independent_from_ambient():
+    uid = "usr_wake_decision_ambient_disabled"
+    seed_user(uid)
+    _enable_v2(uid)
+    store = core_store.get_store(uid)
+    store.mark_first_chat_ok(at_iso="2026-07-01T00:00:00")
+    store.save_proactive_settings({
+        "ambient": False,
+        "screen_watch_enabled": True,
+    })
+
+    decision = _wake_decision_for_user(uid, trigger="screen_watch")
+
+    assert decision["should_wake"] is True
+    assert decision["block_reason"] == "wake_created"
+
+
+@pytest.mark.parametrize(
+    ("settings", "expected_enqueued"),
+    [
+        ({"ambient": True, "screen_watch_enabled": False}, False),
+        ({"ambient": False, "screen_watch_enabled": True}, True),
+    ],
+)
+def test_screen_watch_switches_block_the_production_enqueue(
+    monkeypatch,
+    settings,
+    expected_enqueued,
+):
+    uid = (
+        "usr_screen_producer_screen_disabled"
+        if settings["ambient"]
+        else "usr_screen_producer_ambient_disabled"
+    )
+    seed_user(uid)
+    _enable_v2(uid)
+    store = core_store.get_store(uid)
+    store.mark_first_chat_ok(at_iso="2026-07-01T00:00:00")
+    store.save_proactive_settings(settings)
+    monkeypatch.setattr(
+        proactive_gate.provider_health,
+        "proactive_admission",
+        lambda *_args, **_kwargs: proactive_gate.provider_health.ProactiveAdmission(
+            allowed=True,
+        ),
+    )
+
+    now = 10_000.0
+    monkeypatch.setattr(serve_worker.time, "time", lambda: now)
+    monkeypatch.setattr(
+        serve_worker.db,
+        "frame_list_meta",
+        lambda _uid: [{"filename": "frameNEW.env.json", "ts": now}],
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "get_wake_schedule",
+        lambda _uid: {"last_screen_watch_frame_id": "frameOLD"},
+    )
+    enqueue_calls = []
+    monkeypatch.setattr(
+        jobs_store,
+        "enqueue_job",
+        lambda *args, **kwargs: enqueue_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "upsert_wake_schedule",
+        lambda *_args, **_kwargs: None,
+    )
+    notify_calls = []
+    monkeypatch.setattr(
+        serve_worker.core_wake_bus,
+        "notify",
+        lambda *args: notify_calls.append(args),
+    )
+
+    assert serve_worker._tick_screen_watch_for_user(uid) == int(expected_enqueued)
+    assert len(enqueue_calls) == int(expected_enqueued)
+    assert len(notify_calls) == int(expected_enqueued)

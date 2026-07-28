@@ -97,10 +97,60 @@ Resident runtimes report provider outcomes through
 An error fallback generated without a usable provider reply must not be
 reported as a success.
 
+Runtime V2 treats output containing only whitespace, punctuation, or separator
+characters as a truncated provider reply rather than assistant content.
+Foreground Chat replaces that fragment with the standard visible fallback and
+attributes it to a temporary upstream-provider failure. Automatic wake lanes
+fail silently instead: they write neither a chat bubble nor an error chip.
+Letters, numbers, CJK text, and emoji count as usable reply content.
+
+For a custom or otherwise unaudited model route without an explicit context
+window, Runtime V2 uses a 65,536-token default. With the standard 4,096-token
+output reserve and 5% safety margin (3,277 tokens), 58,163 tokens remain for
+input.
+Self-hosted operators can override the default with
+`FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS`; setting it to `0`
+restores fail-closed configuration. Explicit route metadata, audited model
+families, and deployment overrides keep precedence over this fallback.
+
+Runtime V2 takes one temporal snapshot for each chat or wake turn.
+The prompt receives the current UTC time, the user's local IANA timezone and
+local time, the age of the latest genuine user message, and timestamp metadata
+for the verbatim conversation tail. The registered account timezone takes
+precedence over the latest stable device-perception timezone; users without
+either value fall back to UTC. Temporal metadata is appended as untrusted
+application data and does not change the original conversation messages.
+
+Runtime V2 selects recent context in complete user-seeded turns rather than a
+raw message count. Foreground Chat targets up to 40 turns; heartbeat,
+agent-scheduled, manual, and screen-watch wakes target up to 16. A smaller
+provider window may reduce the replay to the largest newest suffix that fits,
+but only after those rows are durably represented by the encrypted summary.
+The summary, every uncovered source row, the current request or wake nudge, and
+the provider-native tool transcript remain required and are never clipped.
+This keeps the union of summary coverage and exact rows complete even when
+optional replay shrinks between provider rounds.
+
+The previous wake window was 20 messages, approximately 10 ordinary
+user/assistant turns. A 16-turn wake can therefore replay about 60% more
+conversation in the common two-message shape. Relative to the 40-turn Chat
+target, it replays 60% fewer turns. Provider and compaction calls use the
+account's configured BYOK credential, so the account owner bears those token
+costs. Actual usage depends on message size, summary size, tools, and the
+provider's context limit.
+
+Automatic Runtime V2 heartbeat and agent-scheduled wake failures use a
+persistent per-user exponential retry delay. The delay starts at 60 seconds
+and is capped at one hour; a successful automatic wake clears it. A new
+genuine user message invalidates an older delay immediately. Manual wakes and
+screen-watch events bypass this short-horizon guard. Sustained provider
+failures remain the responsibility of the separate provider health circuit.
+
 ## Retry safety
 
 Classify by operation semantics, not only by HTTP method. In particular,
-`GET /v1/perception/app_open` records an event and is not read-only.
+`GET /v1/perception/app_open` and `GET /v1/perception/app_close` record an
+event and are not read-only.
 
 | Situation | Safe default |
 | --- | --- |
@@ -125,7 +175,7 @@ otherwise.
 Common consequences:
 
 - Retrying `/v1/chat/response`, `/v1/memory/add`, a Perception collection
-  upload, or `app_open` can create duplicate effects.
+  upload, `app_open`, or `app_close` can create duplicate effects.
 - A client-generated envelope or memory ID helps reconciliation but is not a
   documented create-if-absent guarantee.
 - `POST /v1/model_api/chat/send` and `POST /v1/chat/message` accept an optional

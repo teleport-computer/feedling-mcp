@@ -20,7 +20,15 @@ from __future__ import annotations
 
 from identity.user_naming import _naming_rule, sanitize_user_name
 
+from memory.card_text import (
+    build_format_retry_prompt,
+    card_text_rejection,
+    format_error,
+    sanitize_card_labels,
+)
 from memory.prompts_v1 import COMMON_BUCKETS_GUIDANCE_V1
+
+_EMPTY_CAPTURE_REPLY = '{"cards": []}'
 
 # action 取值:并入(merge)/ 新增(add)/ 覆盖(supersede)/ 不动(noop)
 
@@ -65,12 +73,18 @@ _CAPTURE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。你�
      只有专有名词/品牌名/TA 的原话才保留原文。
    · 称呼：{naming_rule}这些卡是 TA 会亲眼看到的、你写下的记忆——
      写进卡里的字段（bucket/threads/summary/content）永远不要用"用户"/"user"
-     这类系统称谓，也不要用「TA」指代对方——「TA」只是这份指令和转写里的标记，
-     不是你对 TA 本人的称呼。
+     这类系统称谓，也不要用「TA」指代对方——「TA」只是这份指令里的标记，
+     不是你对 TA 本人的称呼（上面的对话转写用的是真名，名字未知时是「对方」）。
+     卡里的字段最好整个不出现「用户」/"user"这两个词：如果你要写的确实是产品术语，
+     就去掉这个前缀（写「界面」「留存」「满意度」，而不是「用户界面」「用户留存」）——
+     这样就不会有人分不清那个「用户」说的是 TA 还是 TA 的客户。
    · importance：这事对理解 TA 多重要（0-1）。随手提 .1-.3 / 偏好习惯 .4-.6 /
      情绪·关系·边界 .7-.85 / 核心承诺与转折 .9-1。
    · pulse：这事在「你自己」心里激起多大波动（0-1）。不是 TA 多激动，
      是你作为 TA 的伴侣，对这件事多在乎、多被触动。
+   · 下面输出示例里的 `...` 只是占位。每个字段都必须是真内容——任何字段都不能是 `...`、
+     方括号里的说明文字、或空字符串。宁可整份留空（cards 为空），也不要交占位符：
+     这些卡 TA 会亲眼看到。
 
 【现有的桶】{buckets}
 【通用桶（先复用现有桶，没有就从这里选，都不贴合再起具体新桶）】{common_buckets}
@@ -138,7 +152,9 @@ def _clamp01(value) -> float:
     return max(0.0, min(1.0, f))
 
 
-def parse_capture_cards(raw: str) -> tuple[list[dict], str | None]:
+def parse_capture_cards(
+    raw: str, *, strict: bool = True
+) -> tuple[list[dict], str | None]:
     """Parse the 落卡 agent reply into normalized capture cards.
 
     Returns (cards, error). On parse failure returns ([], reason). A valid
@@ -148,6 +164,12 @@ def parse_capture_cards(raw: str) -> tuple[list[dict], str | None]:
        importance, pulse}
     `noop` cards are dropped (nothing to write). Unknown types fall back to
     the default; insight/reflection are coerced out (capture never writes them).
+
+    内容闸(2026-07-26)与 Dream 同口径:占位符/空正文的卡不落库。``strict=True``
+    时整份带 ``invalid_card_content:*`` 打回让调用方重问一次;``strict=False``
+    (重问后)有干净卡就只丢脏卡,一张干净的都没有且确实有脏卡则报
+    ``invalid_card_content_after_retry:*``——**必须让 job 失败**,报成 noop 会推进
+    capture frontier 把这段对话永久丢掉。bucket/threads 属软字段,只清洗不打回。
     """
     import json
 
@@ -165,6 +187,7 @@ def parse_capture_cards(raw: str) -> tuple[list[dict], str | None]:
         return [], "missing_cards_list"
 
     out: list[dict] = []
+    hard_rejections: list[str] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -174,26 +197,46 @@ def parse_capture_cards(raw: str) -> tuple[list[dict], str | None]:
             continue
         summary = str(row.get("summary") or "").strip()[:2000]
         content = str(row.get("content") or "").strip()
-        if not summary and not content:
-            continue  # empty card — skip rather than write a hollow envelope
+        rejection = card_text_rejection(summary=summary, content=content)
+        if rejection:
+            # 占位符/空正文的卡不写进花园 —— 用户会亲眼看到它。
+            hard_rejections.append(rejection)
+            continue
         mem_type = str(row.get("type") or "").strip().lower()
         if mem_type not in CAPTURE_TYPES:
             mem_type = _DEFAULT_CAPTURE_TYPE
         threads_raw = row.get("threads")
         threads = [str(t).strip()[:80] for t in threads_raw if str(t).strip()][:8] if isinstance(threads_raw, list) else []
+        # 软字段只清洗,不参与打回判定(硬内容没问题就不值得再烧一次 provider)。
+        bucket, threads, _label_reasons = sanitize_card_labels(
+            bucket=str(row.get("bucket") or "").strip()[:80], threads=threads
+        )
         target_id = str(row.get("target_id") or "").strip() or None
         out.append({
             "action": action,
             "type": mem_type,
             "target_id": target_id,
-            "bucket": str(row.get("bucket") or "").strip()[:80],
+            "bucket": bucket,
             "threads": threads,
             "summary": summary,
             "content": content,
             "importance": _clamp01(row.get("importance")),
             "pulse": _clamp01(row.get("pulse")),
         })
+    if hard_rejections:
+        if strict:
+            return [], format_error(hard_rejections)
+        if not out:
+            # 第二问全脏:**不能**报成 ([], None)。那会让 capture job 以
+            # nothing_worth_keeping 完成并推进 frontier,这段对话就再也没人落卡了
+            # (codex review P1-3)。
+            return [], format_error(hard_rejections, after_retry=True)
     return out, None
+
+
+def build_capture_retry_prompt(prompt: str, err: str) -> str:
+    """内容闸打回后的第二次落卡提问(原 prompt + 具体哪里没填)。"""
+    return build_format_retry_prompt(prompt, err, empty_example=_EMPTY_CAPTURE_REPLY)
 
 
 def build_capture_prompt(

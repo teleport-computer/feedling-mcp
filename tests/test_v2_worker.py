@@ -63,6 +63,14 @@ def test_prompt_frontier_failures_use_stable_content_free_status_codes():
         input_budget_tokens=8_000,
         context_window_tokens=12_000,
         required_components=("message_context",),
+        limit_source="audited_family",
+    )
+    unaudited_exhausted = v2_prompt_frontier.PromptFrontierExhausted(
+        required_tokens=9_000,
+        input_budget_tokens=8_000,
+        context_window_tokens=12_000,
+        required_components=("message_context",),
+        limit_source="unaudited_default",
     )
 
     assert worker._safe_failure_code("turn_failed", unconfigured) == (
@@ -72,6 +80,39 @@ def test_prompt_frontier_failures_use_stable_content_free_status_codes():
     assert worker._safe_failure_code("turn_failed", exhausted) == (
         "turn_failed:prompt_frontier_exhausted"
     )
+    assert worker._turn_failure_error_class(unconfigured) == "unknown"
+    assert worker._turn_failure_error_class(exhausted) == "context_overflow"
+    assert worker._turn_failure_error_class(unaudited_exhausted) == "unknown"
+    assert worker._turn_failure_error_class(
+        worker.TurnError("prompt_coverage_incomplete:reply_empty")
+    ) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (
+            provider_client.ProviderError("credit balance exhausted", status_code=402),
+            "quota_insufficient",
+        ),
+        (
+            provider_client.ProviderError("bad key", status_code=401),
+            "auth_invalid",
+        ),
+        (
+            provider_client.ProviderError("too many requests", status_code=429),
+            "rate_limited",
+        ),
+        (
+            provider_client.ProviderError("relay unavailable", status_code=503),
+            "upstream_unavailable",
+        ),
+        (worker.TurnError("empty_reply"), "reply_parse_failed"),
+        (RuntimeError("opaque internal failure"), "unknown"),
+    ],
+)
+def test_v2_turn_failure_classification_uses_shared_notice_vocabulary(exc, expected):
+    assert worker._turn_failure_error_class(exc) == expected
 
 
 class _FakeCapResult:
@@ -124,7 +165,7 @@ def _script_provider(monkeypatch, responses):
     it = iter(responses)
     calls = []
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         calls.append({"messages": messages, "tools": tools})
         return next(it)
 
@@ -333,7 +374,7 @@ def test_message_coalesced_during_provider_call_creates_successor(monkeypatch):
         lambda action_type, store, **kwargs: _FakeCapResult({}),
     )
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         same_id, coalesced = jobs_store.enqueue_job(uid, "chat", reason="late-B")
         assert (same_id, coalesced) == (job_id, True)
         return _text_round("reply to A")
@@ -468,9 +509,9 @@ def test_coalesce_inputs_and_cap_data_tolerate_enclave_sem_none(monkeypatch):
 
 def test_process_job_empty_terminal_reply_marks_failed_no_filler(monkeypatch):
     """An empty terminal reply (no tool_calls, blank text) must mark the job
-    failed and must NEVER write a placeholder bubble — the no-filler invariant
-    (BUG-4: chat lane always replies; an empty final text is a model/provider
-    failure here, not legitimate silence)."""
+    failed without treating blank provider output as a successful model reply.
+    Durable foreground failure visibility is tested at the terminal-outbox
+    boundary; this direct unit has no stored parent message."""
     uid = "u_w_resperr"
     conftest.seed_user(uid)
     _reset(uid)
@@ -664,15 +705,16 @@ def test_process_job_terminal_failure_emits_error_status_and_calls_callback(monk
     agent_jobs.last_error — an "error"-kind status event goes on the stream
     (iOS's poll surface) AND the injected TurnDeps.record_terminal_error
     callback fires with (user_id, message), so serve_worker can also patch
-    hosted's last_runtime_error. No chat reply must ever be written on failure
-    (no-filler)."""
+    hosted's last_runtime_error. The direct unit has no durable parent row, so
+    the terminal reply sink acknowledges an empty frontier; linked encrypted
+    failure bubbles are covered in test_v2_jobs_store."""
     uid = "u_w_terminalerr"
     conftest.seed_user(uid)
     _reset(uid)
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    async def _boom(config, messages, *, tools=None):
+    async def _boom(config, messages, *, tools=None, **_kwargs):
         raise RuntimeError("provider blew up")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
@@ -720,7 +762,7 @@ def test_process_job_terminal_failure_tolerates_missing_callback(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "chat")
     job = jobs_store.claim_next_job("w")
 
-    async def _boom(config, messages, *, tools=None):
+    async def _boom(config, messages, *, tools=None, **_kwargs):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _boom)

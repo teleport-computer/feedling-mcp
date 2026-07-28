@@ -10,6 +10,141 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **A new `GET /v1/perception/app_close` endpoint reports app closures,
+  mirroring the existing `app_open` shortcut.** It accepts the same `app`
+  (required, `bundle_id` remains a deprecated alias), `category`, and `ts`
+  (`client_ts` remains a deprecated alias) parameters, and — like
+  `app_open` — is a GET with a write side effect: it records an event and
+  is not read-only. A close only updates the current-app state when the
+  closed app matches the app currently recorded as foreground, so an older
+  app killed in the background cannot clobber whichever app is actually
+  current. The two endpoints correspond to the "is opened" / "is closed"
+  trigger options on the same iOS Shortcuts automation; a client can wire up
+  only one of them, and the other being absent is a benign degradation.
+  The Perception snapshot gains a corresponding `app_state` field, valued
+  `"foreground"` or `"closed"`, and `null` when no open has been reported yet.
+
+- **Chat route selection now fences Hosted Runtime V1 from independent
+  residents.** The onboarding route is the execution-ownership source of truth:
+  V1 discovery requires an explicit `model_api` selector in addition to a
+  tested active model route and the existing Runtime V2 fence. Switching to
+  `resident` or `official_import` deactivates the V1 route atomically; switching
+  back restores the most recently updated tested-ok route. Missing selector
+  state fails closed. Operations telemetry now keeps recent polls per consumer
+  identity, reports the effective responder and its evidence, and marks
+  route/lease/poll conflicts instead of treating the last poller as proof that
+  another process stopped.
+
+- **Runtime V2 Chat failures no longer leave the sender waiting silently.**
+  A failed or expired foreground turn now commits a parent-linked encrypted
+  failure reply carrying the same `turn_failure_error_class`,
+  `turn_failure_blame`, and `turn_failure_user_text` metadata as the resident
+  path. Actionable provider configuration failures show their specific recovery
+  text; transient provider and system failures use the standard retry-later
+  fallback. A conservative internal context-window default is attributed to the
+  system, not misreported as the user's model limit. Delivery is replayed from a
+  durable outbox after worker crashes and lease timeouts, while a newer
+  successful reply atomically suppresses a stale failure bubble. Proactive and
+  maintenance lanes remain silent.
+
+
+- **V1 CLI residents can now return generated documents as native download
+  cards.** Claude, Codex, and Pi residents receive a `send-file` command backed
+  by a private per-user staging directory. Word and PDF requests render real
+  `.docx`/`.pdf` bytes, and explicit formats cannot fall back to Markdown. Named
+  formats receive one bounded completion retry; no-format requests remain
+  semantic prompt guidance, and a missing file no longer replaces or fails the
+  model's text reply. When a file is delivered, the text primary and its encrypted
+  `file_followups` commit atomically through `POST /v1/chat/response`, preserving
+  text-first/card-below ordering.
+
+- **Memory cards are no longer written with unfilled template placeholders.**
+  Capture and Dream now validate card *content*, not just field presence: a
+  `summary` or `content` that is a bracketed placeholder (`[thickened summary]`),
+  a bare ellipsis, a copied instruction fragment, or empty is rejected, and both
+  fields must carry real text. A reply containing any such card is returned to
+  the model once with an explicit note about which field was unfilled; the second
+  attempt keeps whatever cards are clean. If nothing usable survives the retry,
+  the extraction job fails and its conversation window is left for a later
+  attempt instead of being silently consumed. Substantive-character detection is
+  language-neutral (Arabic, Cyrillic, Hebrew, accented Latin, and CJK all count),
+  so non-Latin cards are unaffected.
+- **Memory cards are less likely to refer to the account holder as "user".** The
+  conversation transcript given to the Capture and Dream models now labels
+  speakers with the person's own name — or the neutral `对方` when no name is
+  known — instead of the raw `user` / `assistant` roles, which is what taught
+  models to copy the system label into cards. The prompts also ask for the
+  `用户` / `user` prefix to be dropped from product vocabulary, so a card says
+  `界面` rather than `用户界面`. Card text is deliberately **not** post-edited by
+  a rewriter: only the model can tell whether a given "user" means the account
+  holder or that person's own customers, and guessing wrong would silently
+  rewrite a true memory into a false one.
+- **Runtime V2 now selects recent conversation context in complete turns.**
+  Foreground Chat targets the newest 40 user-seeded turns and proactive wake
+  lanes target 16. Before every provider round, smaller model windows can
+  reduce only summary-covered verbatim replay to the largest newest suffix that
+  fits; the summary, uncovered exact rows, current request or wake nudge, and
+  native tool transcript are never clipped. Budget pressure can first compact
+  a safe answered prefix and then rebuild from the new durable watermark, so
+  every stored row remains represented by either summary coverage or exact
+  prompt content. New turn-based environment settings control the two targets;
+  the legacy message-count setting keeps its old compaction meaning.
+- **Runtime V2 chat and wake turns now receive explicit temporal context.**
+  Each turn gets one snapshot containing UTC and user-local time, the latest
+  genuine user-message age, and timestamps for the verbatim conversation tail.
+  Account timezone, stable device timezone, and UTC are used in that order.
+- **Runtime V2 now gives unaudited model routes a 65,536-token default context
+  window.** The existing environment override remains available, and setting it
+  to `0` still restores fail-closed configuration. Explicit route metadata,
+  audited model families, and deployment overrides continue to take
+  precedence.
+- **Runtime V2 now applies a persistent per-user retry delay after automatic
+  wake failures.** Consecutive heartbeat or agent-scheduled wake failures back
+  off from 60 seconds to a maximum of one hour, and a successful automatic
+  wake clears the streak. A new user message resumes automatic wakes
+  immediately. Manual wakes and screen-watch events remain available, while
+  the longer-horizon provider health circuit continues to handle sustained
+  provider outages.
+- **Runtime V2 no longer publishes punctuation-only provider fragments as
+  assistant messages.** A foreground Chat turn replaces a truncated fragment
+  such as `.` or `。` with the standard visible fallback and classifies it as a
+  temporary upstream-provider failure. Background wake lanes record the failed
+  turn silently and do not create a chat bubble or error chip. Emoji, letters,
+  digits, and CJK text remain valid replies.
+- **Runtime V2 now carries forward the incident-hardened proactive interruption
+  guards from Runtime V1.** After three consecutive AI-authored follow-up wake
+  schedules without genuine user input, the fourth schedule is suppressed until
+  the user speaks; heartbeat and screen/event wakes do not consume this budget.
+  Heartbeat, manual, and screen-watch replies also perform a final 90-second
+  chat-collision check inside publication, so a user message or foreground
+  agent reply that lands while the wake model call is running makes that wake
+  sleep instead of posting or folding and retrying. User-requested scheduled
+  reminders remain deliverable during active chat.
+- **New `POST /v1/model_api/models` lists a provider's live model catalog (BYOK
+  setup).** Supply the credential exactly one of two ways — a fresh `api_key`, or
+  a stored `credential_id` whose provider/base_url are the source of truth (any
+  `provider`/`base_url` sent alongside a `credential_id` is ignored). Supplying
+  both, neither, an empty string, or a null is a `400 api_key_or_credential_id_required`.
+  The response returns `models` (each `{id, display_name}`), `complete`, and
+  `catalog_supported`. `complete: false` with `warnings` means the list was
+  truncated (page/size/time budget). `catalog_supported: false` means the
+  provider has no listable catalog (e.g. Bedrock, or a custom endpoint with no
+  `/models` route) and the client should fall back to manual model entry.
+  Provider auth failures are mapped to `400`/`429`/`503` catalog slugs — never
+  `401` — so an expired Feedling login is never confused with a bad provider key.
+- **Runtime V2 now honors the Dream and screen-watch consent switches at
+  execution time.** Disabling Dream prevents queued Dream work from making a
+  provider call even when the deployment-wide Dream feature flag is enabled.
+  Disabling screen watch prevents its producer from enqueueing background work;
+  Heartbeat and the other proactive controls remain independent. Runtime V1
+  behavior is unchanged.
+- **Legacy perception wakes now honor the same dedicated controls as Runtime
+  V2.** Photo, arrival, and unlock events map to their canonical triggers and
+  are governed only by their corresponding switches; disabling Heartbeat no
+  longer suppresses them. Motion-state changes remain readable perception
+  context but no longer create proactive wakes. DND and Away remain global
+  suppressors.
+
 - **Long-term provider configuration failures now pause proactive model work.**
   When an account has gone 48 hours without a usable provider response and its
   latest failures have continuously required user action for at least one hour,
@@ -32,7 +167,7 @@ change must not be interpreted as an API guarantee.
   sends without a caption are unchanged; `content_type: "text"` ignores the field.
 
 - **The `identity_patch` tool can recalibrate the relationship day count.** Put a
-  positive integer `relationship_days` inside the `patch` object (for example
+  whole number `relationship_days` inside the `patch` object (for example
   `patch: {"relationship_days": 300}`) and the persona's relationship start anchor is
   recalibrated so the app shows that day count. `relationship_days` is the **1-based,
   user-facing** count — the "day N" the client displays, where the day you met is
@@ -247,6 +382,17 @@ change must not be interpreted as an API guarantee.
   replies must now use `source: "verify_ping"` and point
   `reply_to_message_id` at the exact pending ping; `loop_alive` can therefore be
   true while `passing` is false when decrypt policy blocks sticky verification.
+- Hosted Runtime V2 can now publish a generated `/workspace` document as a
+  native download card through the explicit `send_file` tool. Text formats are
+  delivered directly, while `.docx` and `.pdf` requests produce real Word and
+  PDF bytes instead of Markdown with a renamed suffix. Explicit formats get one
+  bounded completion recovery and cannot be replaced with a different suffix;
+  requests without a named format remain prompt-level semantic guidance. If
+  delivery still fails, Runtime V2 records `required_file_missing` and preserves
+  a non-empty terminal reply instead of failing the turn. The entry remains
+  user-scoped and encrypted; final assistant text and its file cards commit as
+  one ordered, idempotent reply bundle; host filesystem paths are never scanned
+  or accepted.
 - Self-hosted resident polls may now receive server-generated maintenance turns
   with `role: "user"` and `source: "resident_maintenance"` when the resident
   consumer appears stale or is not claiming resident-only distill jobs. These

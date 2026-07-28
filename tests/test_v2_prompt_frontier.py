@@ -111,36 +111,40 @@ def test_unaudited_route_gets_conservative_default(monkeypatch):
     monkeypatch.delenv(frontier._UNAUDITED_DEFAULT_ENV, raising=False)
     resolved = frontier.resolve_model_limit("some-relay", "mystery-model")
     assert resolved.source == "unaudited_default"
-    assert resolved.context_window_tokens == 32768
+    assert resolved.context_window_tokens == 65536
     # A first-party provider NAME pointed at a custom base_url is still unaudited.
     custom = frontier.resolve_model_limit(
         "openai", "gpt-4o-mini", base_url="https://llm-proxy.example/v1"
     )
     assert custom.source == "unaudited_default"
-    assert custom.context_window_tokens == 32768
+    assert custom.context_window_tokens == 65536
 
 
-def test_raised_default_fits_persona_sized_required_prompt(monkeypatch):
-    """Regression: a persona/world-book-sized REQUIRED set (~20k tokens) that
-    overflowed the old 16384 default's input budget now fits under the raised
-    default, so a custom-relay user with a real persona is served instead of
-    getting ``prompt_frontier_exhausted`` before any provider call (the prod
-    failure mode for world-book users on unaudited relays)."""
+def test_raised_default_provides_target_58163_input_budget(monkeypatch):
+    """The 64K default reserves 4K output + 5% safety and leaves 58,163 input."""
     monkeypatch.delenv(frontier._UNAUDITED_DEFAULT_ENV, raising=False)
-    # One indivisible required component larger than the old ~11.5k input budget
-    # but smaller than the new ~27k one — i.e. it straddles the raise.
     persona = frontier.PromptComponent(
-        name="persona", estimated_tokens=20_000, required=True
+        name="target_history", estimated_tokens=58_163, required=True
     )
     limit = frontier.resolve_model_limit("some-relay", "mystery-model")
-    plan = frontier.plan_prompt(model_limit=limit, components=[persona])
-    assert "persona" in plan.included_components  # planned, no exhaustion
+    plan = frontier.plan_prompt(
+        model_limit=limit,
+        components=[persona],
+        output_reserve_tokens=4_096,
+    )
+    assert "target_history" in plan.included_components
+    assert plan.budget.safety_margin_tokens == 3_277
+    assert plan.budget.input_budget_tokens == 58_163
 
-    # The old 16384 default (opt back in via env) would reject the same set.
-    monkeypatch.setenv(frontier._UNAUDITED_DEFAULT_ENV, "16384")
+    # The old 32K default (opt back in via env) rejects the same required set.
+    monkeypatch.setenv(frontier._UNAUDITED_DEFAULT_ENV, "32768")
     old_limit = frontier.resolve_model_limit("some-relay", "mystery-model")
     with pytest.raises(frontier.PromptFrontierExhausted):
-        frontier.plan_prompt(model_limit=old_limit, components=[persona])
+        frontier.plan_prompt(
+            model_limit=old_limit,
+            components=[persona],
+            output_reserve_tokens=4_096,
+        )
 
 
 def test_unaudited_default_is_env_tunable_and_zero_restores_fail_closed(monkeypatch):
@@ -684,3 +688,114 @@ def test_tool_catalog_is_counted_and_omitted_whole_when_only_it_does_not_fit(
     assert len(calls) == 1
     assert calls[0][1] is None
     assert calls[0][0] == [{"role": "system", "content": "stable prefix"}]
+
+
+def test_adaptive_round_reports_tail_window_to_metrics_and_trajectory(monkeypatch):
+    calls = []
+    metric_windows = []
+    trajectory = []
+
+    class AdaptiveBuilder:
+        def __call__(self, transcript):
+            return [{"role": "user", "content": "fallback"}, *transcript]
+
+        def plan_provider_round(self, **kwargs):
+            messages = [{"role": "user", "content": "adaptive"}]
+            plan = frontier.plan_provider_round(
+                model_limit=kwargs["model_limit"],
+                messages=messages,
+                tools=kwargs["tools"],
+                output_reserve_tokens=kwargs["output_reserve_tokens"],
+                safety_margin_tokens=kwargs["safety_margin_tokens"],
+                utf8_bytes_per_token=kwargs["utf8_bytes_per_token"],
+                image_reserve_tokens=kwargs["image_reserve_tokens"],
+            )
+            return messages, plan, {
+                "lane": "chat",
+                "target_turns": 40,
+                "available_turns": 40,
+                "effective_turns": 23,
+                "fallback": True,
+                "source_truncated": False,
+            }
+
+    async def provider(_config, messages, *, tools=None):
+        calls.append((messages, tools))
+        return {"reply": "ok", "tool_calls": [], "usage": {}}
+
+    async def fold():
+        return []
+
+    async def record(kind, payload):
+        trajectory.append((kind, payload))
+
+    outcome = _run_loop(
+        monkeypatch=monkeypatch,
+        provider=provider,
+        fold=fold,
+        build_messages=AdaptiveBuilder(),
+        provider_config=provider_client.ProviderConfig(
+            "custom",
+            "adaptive",
+            "key",
+            context_window_tokens=32_768,
+        ),
+        on_tail_window=lambda item: metric_windows.append(item),
+        on_trajectory_event=record,
+    )
+
+    assert outcome.final_text == "ok"
+    assert calls[0][0] == [{"role": "user", "content": "adaptive"}]
+    assert metric_windows == [{
+        "lane": "chat",
+        "target_turns": 40,
+        "available_turns": 40,
+        "effective_turns": 23,
+        "fallback": True,
+        "source_truncated": False,
+    }]
+    request = next(payload for kind, payload in trajectory if kind == "provider_request")
+    assert request["tail_window"] == metric_windows[0]
+
+
+def test_adaptive_required_exhaustion_is_counted_and_still_raised(monkeypatch):
+    counted = []
+    provider_calls = []
+
+    class ExhaustedBuilder:
+        def __call__(self, transcript):
+            return []
+
+        def plan_provider_round(self, **kwargs):
+            raise frontier.PromptFrontierExhausted(
+                required_tokens=10_000,
+                input_budget_tokens=8_000,
+                context_window_tokens=12_000,
+                required_components=("message_context",),
+                limit_source="provider_metadata",
+            )
+
+    async def provider(_config, messages, *, tools=None):
+        provider_calls.append(messages)
+        return {"reply": "not reached", "tool_calls": [], "usage": {}}
+
+    async def fold():
+        return []
+
+    with pytest.raises(frontier.PromptFrontierExhausted):
+        _run_loop(
+            monkeypatch=monkeypatch,
+            provider=provider,
+            fold=fold,
+            build_messages=ExhaustedBuilder(),
+            provider_config=provider_client.ProviderConfig(
+                "custom",
+                "adaptive",
+                "key",
+                context_window_tokens=12_000,
+            ),
+            on_prompt_frontier_exhaustion=lambda: counted.append(True),
+        )
+
+    assert counted == [True]
+    assert provider_calls == []

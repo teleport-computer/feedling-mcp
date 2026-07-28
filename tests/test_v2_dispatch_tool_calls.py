@@ -466,8 +466,42 @@ def test_write_tool_effect_payload_freezes_relationship_anchor():
     assert payload["patch"]["relationship_days"] == 300
 
 
+def test_write_tool_effect_payload_freezes_top_level_relationship_days():
+    # Regression: relationship_days is a FIRST-CLASS top-level arg (like agent_name),
+    # not only reachable inside `patch`. A weak model naturally calls
+    # identity_patch(relationship_days=N) — the same shape it uses for agent_name.
+    # The producer must freeze the anchor for THIS shape too (it used to read only
+    # payload["patch"], so a top-level call skipped the freeze). 1-based: N=300 → 299.
+    from datetime import date, timedelta
+    from model_api_runtime.v2 import worker as v2_worker
+    tc = ToolCall(id="ftl", name="identity_patch", args={"relationship_days": 300})
+    effect_type, payload = v2_worker._write_tool_effect_payload(tc)
+    assert effect_type == "identity"
+    assert payload["relationship_started_at"] == (date.today() - timedelta(days=299)).isoformat()
+
+
 def test_write_tool_effect_payload_no_freeze_without_relationship_days():
     from model_api_runtime.v2 import worker as v2_worker
     tc = ToolCall(id="f2", name="identity_patch", args={"patch": {"signature": ["x"]}})
     _effect_type, payload = v2_worker._write_tool_effect_payload(tc)
     assert "relationship_started_at" not in payload  # byte-identical to a pre-item-1 row
+
+
+def test_frozen_and_resolve_agree_on_same_relationship_days():
+    # Item 1 invariant LOCK: the V2 producer (worker._frozen_relationship_anchor,
+    # frozen at enqueue) and the direct/fallback consumer
+    # (actions._resolve_relationship_anchor) must resolve the SAME 1-based N to the
+    # SAME absolute anchor — else a V2 replay that re-derives from N drifts off the
+    # frozen date. The other tests pin each side to a hand-written today-(N-1); this
+    # one ties the two REAL ends together, so a future one-sided edit to the -1
+    # (only worker, or only actions) can no longer pass silently.
+    from model_api_runtime.v2 import worker as v2_worker
+    from identity import actions as identity_actions
+    from identity import card_policy
+    MAX = card_policy.MAX_RELATIONSHIP_DAYS
+    for n in (1, 45, MAX):
+        frozen = v2_worker._frozen_relationship_anchor({"relationship_days": n})
+        # handed the producer's frozen date, the consumer returns it verbatim…
+        assert identity_actions._resolve_relationship_anchor(n, trusted_frozen=frozen) == frozen
+        # …and with NO trusted value it recomputes from N to the SAME anchor.
+        assert identity_actions._resolve_relationship_anchor(n, trusted_frozen=None) == frozen

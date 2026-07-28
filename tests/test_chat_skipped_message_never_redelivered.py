@@ -73,6 +73,19 @@ def _add_user_msg(store, msg_id: str, ts: float, uid: str, **extra) -> dict:
     return doc
 
 
+def _add_agent_msg(store, msg_id: str, ts: float, uid: str, **extra) -> dict:
+    doc = {
+        "id": msg_id, "role": "openclaw", "source": "chat", "ts": ts, "v": 1,
+        "content_type": "text", "visibility": "shared", "owner_user_id": uid,
+        "body_ct": "x", "nonce": "x", "K_user": "x",
+    }
+    doc.update(extra)
+    db.chat_append(uid, msg_id, ts, doc, core_store.MAX_CHAT_MESSAGES)
+    with store.chat_lock:
+        store.chat_messages.append(doc)
+    return doc
+
+
 @pytest.fixture()
 def user(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
@@ -157,6 +170,57 @@ def test_backstop_does_redeliver_when_no_later_turn_was_answered(user):
     assert "m_skipped_only" in [m.get("id") for m in pending], (
         "没有更新的已回复消息时，backstop 应当把 A 重新投递回来"
     )
+
+
+def test_legacy_adjacent_reply_settles_abandoned_parent_without_rerunning(user):
+    uid = user
+    store = core_store.get_store(uid)
+    now = time.time()
+    parent_ts = now - 300
+    _add_user_msg(
+        store, "m_legacy_parent", parent_ts, uid,
+        reply_claimed_by=CONSUMER,
+        reply_claimed_at=f"{parent_ts:.3f}",
+        reply_claim_expires_at=f"{parent_ts:.3f}",
+    )
+    _add_agent_msg(store, "m_legacy_reply", parent_ts + 30, uid)
+    _add_user_msg(
+        store, "m_newer_done", parent_ts + 60, uid,
+        reply_status="replied", reply_message_id="r_newer",
+    )
+
+    pending = chat_service._pending_chat_messages_for_poll(
+        store, since=now, consumer_id=CONSUMER, claim=True,
+    )
+
+    assert "m_legacy_parent" not in [m.get("id") for m in pending]
+    parent = db.chat_get_strict(uid, "m_legacy_parent")
+    reply = db.chat_get_strict(uid, "m_legacy_reply")
+    assert parent["reply_status"] == "replied"
+    assert parent["reply_message_id"] == "m_legacy_reply"
+    assert reply["reply_to_message_id"] == "m_legacy_parent"
+
+
+def test_legacy_reply_is_not_guessed_across_consecutive_user_messages(user):
+    uid = user
+    store = core_store.get_store(uid)
+    now = time.time()
+    parent_ts = now - 300
+    _add_user_msg(
+        store, "m_first_user", parent_ts, uid,
+        reply_claimed_by=CONSUMER,
+        reply_claimed_at=f"{parent_ts:.3f}",
+        reply_claim_expires_at=f"{parent_ts:.3f}",
+    )
+    _add_user_msg(store, "m_second_user", parent_ts + 20, uid)
+    _add_agent_msg(store, "m_reply_for_second", parent_ts + 40, uid)
+
+    pending = chat_service._pending_chat_messages_for_poll(
+        store, since=now, consumer_id=CONSUMER, claim=True,
+    )
+
+    assert "m_first_user" in [m.get("id") for m in pending]
+    assert db.chat_get_strict(uid, "m_first_user").get("reply_message_id") in (None, "")
 
 
 def test_abandoned_message_older_than_the_window_is_not_retried_forever(user):

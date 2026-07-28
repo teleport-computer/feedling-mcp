@@ -318,6 +318,9 @@ def test_wake_empty_tail_still_completes_no_no_user_messages_guard(monkeypatch):
         and not str(message.get("content") or "").startswith(
             v2_context.RUNTIME_CONTEXT_HEADER
         )
+        and not str(message.get("content") or "").startswith(
+            v2_context.TEMPORAL_CONTEXT_HEADER
+        )
     ]
     assert len(conversation_messages) == 1
     assert conversation_messages[0]["role"] == "user"

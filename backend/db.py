@@ -1232,6 +1232,67 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
 
             rows = conn.execute(
                 """
+                SELECT wanted.user_id,
+                       COALESCE(vrs.hosted_runtime_state, 'resident'),
+                       route.id::text,
+                       route.is_active,
+                       route.test_status,
+                       ari.status,
+                       ari.lease_owner,
+                       COALESCE(
+                         to_char(
+                           ari.lease_expires_at AT TIME ZONE 'UTC',
+                           'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+                         ),
+                         ''
+                       ),
+                       (
+                         ari.lease_owner IS NOT NULL
+                         AND ari.lease_expires_at IS NOT NULL
+                         AND ari.lease_expires_at >= now()
+                       ) AS runner_lease_active
+                FROM unnest(%s::text[]) AS wanted(user_id)
+                LEFT JOIN v2_runtime_state vrs ON vrs.user_id = wanted.user_id
+                LEFT JOIN LATERAL (
+                  SELECT id, is_active, test_status
+                  FROM model_api_routes
+                  WHERE user_id = wanted.user_id AND is_active
+                  ORDER BY updated_at DESC, id
+                  LIMIT 1
+                ) route ON TRUE
+                LEFT JOIN agent_runtime_instances ari
+                  ON ari.user_id = wanted.user_id
+                """,
+                (ids,),
+            ).fetchall()
+            for (
+                uid,
+                runtime_state,
+                route_id,
+                route_active,
+                route_test_status,
+                runner_status,
+                lease_owner,
+                lease_expires_at,
+                lease_active,
+            ) in rows:
+                ensure(out, uid)["responder_runtime"] = {
+                    "hosted_runtime_state": str(runtime_state or "resident"),
+                    "model_api_route": {
+                        "id": str(route_id or ""),
+                        "is_active": bool(route_active),
+                        "test_status": str(route_test_status or ""),
+                    },
+                    "runner_lease": {
+                        "active": bool(lease_active),
+                        "status": str(runner_status or ""),
+                        "lease_owner": str(lease_owner or ""),
+                        "lease_expires_at": str(lease_expires_at or ""),
+                    },
+                }
+
+            rows = conn.execute(
+                """
                 SELECT user_id, provider_state,
                        COALESCE(to_char(
                          last_provider_success_at AT TIME ZONE 'UTC',
@@ -1583,6 +1644,126 @@ def admin_data_track_usage_histogram(
         log.error(
             "[db] admin_data_track_usage_histogram failed day=%s: %s",
             day_text,
+            e,
+        )
+        return empty
+
+
+def admin_data_track_user_daily_usage(
+    *,
+    user_id: str,
+    days: int = 14,
+    tz: str = "Asia/Shanghai",
+) -> list[dict]:
+    """Return one user's app usage for the latest ``days`` local dates.
+
+    The series includes today and explicitly backfills dates without a
+    session-end report. Duration parsing is intentionally identical to the
+    all-time data-track snapshot: decimal ``payload.duration_sec`` contributes
+    to foreground time; malformed values count as sessions but contribute zero.
+    """
+    try:
+        day_limit = max(1, min(int(14 if days is None else days), 90))
+    except (TypeError, ValueError):
+        day_limit = 14
+
+    # Keep the read-helper fail-soft contract while still returning the useful
+    # zero-filled shape if PostgreSQL is temporarily unavailable.
+    try:
+        zone = ZoneInfo(tz)
+    except Exception:
+        zone = ZoneInfo("Asia/Shanghai")
+    today = datetime.now(zone).date()
+    empty = [
+        {
+            "day": (today - timedelta(days=offset)).isoformat(),
+            "foreground_sec": 0,
+            "sessions": 0,
+            "max_session_sec": 0,
+        }
+        for offset in range(day_limit)
+    ]
+    empty.reverse()
+
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                """
+                WITH local_clock AS (
+                    SELECT timezone(%s, CURRENT_TIMESTAMP)::date AS today
+                ),
+                bounds AS (
+                    SELECT
+                        today,
+                        EXTRACT(EPOCH FROM (
+                            (today - (%s::int - 1))::timestamp AT TIME ZONE %s
+                        ))::double precision AS start_epoch,
+                        EXTRACT(EPOCH FROM (
+                            (today + 1)::timestamp AT TIME ZONE %s
+                        ))::double precision AS end_epoch
+                    FROM local_clock
+                ),
+                calendar AS (
+                    SELECT generate_series(
+                        (b.today - (%s::int - 1))::timestamp,
+                        b.today::timestamp,
+                        interval '1 day'
+                    )::date AS day
+                    FROM bounds b
+                ),
+                usage AS (
+                    SELECT
+                        timezone(%s, to_timestamp(l.ts))::date AS day,
+                        COALESCE(SUM(
+                            CASE
+                              WHEN l.doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
+                              THEN (l.doc->'payload'->>'duration_sec')::bigint
+                              ELSE 0
+                            END
+                        ), 0)::bigint AS foreground_sec,
+                        COUNT(*)::int AS sessions,
+                        COALESCE(MAX(
+                            CASE
+                              WHEN l.doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
+                              THEN (l.doc->'payload'->>'duration_sec')::bigint
+                              ELSE 0
+                            END
+                        ), 0)::bigint AS max_session_sec
+                    FROM user_logs l
+                    CROSS JOIN bounds b
+                    WHERE l.user_id = %s
+                      AND l.stream = 'tracking_events'
+                      AND l.doc->>'type' = 'app_session_end'
+                      AND l.ts IS NOT NULL
+                      AND l.ts >= b.start_epoch
+                      AND l.ts < b.end_epoch
+                    GROUP BY day
+                )
+                SELECT
+                    to_char(c.day, 'YYYY-MM-DD') AS day,
+                    COALESCE(u.foreground_sec, 0)::bigint AS foreground_sec,
+                    COALESCE(u.sessions, 0)::int AS sessions,
+                    COALESCE(u.max_session_sec, 0)::bigint AS max_session_sec
+                FROM calendar c
+                LEFT JOIN usage u USING (day)
+                ORDER BY c.day
+                """,
+                (tz, day_limit, tz, tz, day_limit, tz, str(user_id or "")),
+            ).fetchall()
+        return [
+            {
+                "day": str(row[0]),
+                "foreground_sec": int(row[1] or 0),
+                "sessions": int(row[2] or 0),
+                "max_session_sec": int(row[3] or 0),
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        log.error(
+            "[db] admin_data_track_user_daily_usage failed user_id=%s days=%s: %s",
+            user_id,
+            day_limit,
             e,
         )
         return empty
@@ -2727,6 +2908,63 @@ def set_blob_strict(user_id: str, kind: str, doc) -> None:
                 )
 
 
+def set_onboarding_route_strict(user_id: str, doc: dict) -> str | None:
+    """Persist the route selector and reconcile the V1 model route atomically.
+
+    ``onboarding_route`` is the ownership selector.  A non-model-api route must
+    not leave an active V1 route behind; switching back to ``model_api`` restores
+    the most recently updated tested-ok route when one exists.  The blob and
+    route-row updates share one transaction so readers cannot observe a committed
+    selector whose auxiliary kill switch still has the previous value.
+
+    Returns the active route id after the transaction, or ``None`` when the
+    selected access mode is not model_api / no tested-ok route can be restored.
+    Raises on primary persistence failure.
+    """
+    route = str((doc or {}).get("route") or "").strip().lower()
+    active_route_id: str | None = None
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtextextended('onboarding-route:' || %s, 0))",
+                    (str(user_id),),
+                )
+                cur.execute(
+                    "INSERT INTO user_blobs (user_id, kind, doc) "
+                    "VALUES (%s, 'onboarding_route', %s) "
+                    "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc",
+                    (user_id, Jsonb(doc)),
+                )
+                if route == "model_api":
+                    # Deactivate first: the partial unique index is not deferrable,
+                    # so a one-statement boolean flip can transiently collide.
+                    cur.execute(
+                        "UPDATE model_api_routes SET is_active = FALSE, updated_at = now() "
+                        "WHERE user_id = %s AND is_active",
+                        (user_id,),
+                    )
+                    row = cur.execute(
+                        "UPDATE model_api_routes SET is_active = TRUE, updated_at = now() "
+                        "WHERE id = ("
+                        "  SELECT id FROM model_api_routes "
+                        "  WHERE user_id = %s AND test_status = 'ok' "
+                        "  ORDER BY updated_at DESC, id LIMIT 1"
+                        ") RETURNING id::text",
+                        (user_id,),
+                    ).fetchone()
+                    active_route_id = str(row[0]) if row else None
+                else:
+                    cur.execute(
+                        "UPDATE model_api_routes SET is_active = FALSE, updated_at = now() "
+                        "WHERE user_id = %s AND is_active",
+                        (user_id,),
+                    )
+    _mirror_persisted_blob(user_id, "onboarding_route", doc)
+    return active_route_id
+
+
 def patch_proactive_settings_strict(
     user_id: str,
     patch: dict,
@@ -3486,6 +3724,90 @@ def list_hosted_runtime_nonresident_controls() -> list[tuple[str, str, str, int]
     ]
 
 
+def audit_resident_active_model_routes(*, apply: bool = False) -> list[dict]:
+    """List route-selector/V1-route conflicts; optionally deactivate them.
+
+    This deliberately does *not* use ``consumer_state.consumer_id``: that field
+    is last-writer-wins and alternating hosted/resident pollers overwrite one
+    another.  The model route is the configured V1 eligibility signal and
+    ``agent_runtime_instances.lease_expires_at`` is the authoritative current
+    hosted-process lease.  ``apply=False`` is the safe default used by the
+    operator CLI.
+
+    Apply returns the exact pre-change rows selected in its transaction, making
+    a reviewed dry-run directly comparable with the eventual mutation.
+    """
+    query = """
+        SELECT r.user_id,
+               route_blob.doc,
+               LOWER(COALESCE(NULLIF(route_blob.doc->>'route', ''), 'resident'))
+                   AS onboarding_route,
+               r.id::text,
+               r.is_active,
+               r.test_status,
+               LOWER(c.provider),
+               r.model,
+               COALESCE(vrs.hosted_runtime_state, 'resident'),
+               ari.status,
+               ari.lease_owner,
+               ari.lease_expires_at,
+               (
+                 ari.lease_owner IS NOT NULL
+                 AND ari.lease_expires_at IS NOT NULL
+                 AND ari.lease_expires_at >= now()
+               ) AS runner_lease_active
+        FROM model_api_routes r
+        JOIN model_api_credentials c ON c.id = r.credential_id
+        LEFT JOIN user_blobs route_blob
+          ON route_blob.user_id = r.user_id
+         AND route_blob.kind = 'onboarding_route'
+        LEFT JOIN v2_runtime_state vrs ON vrs.user_id = r.user_id
+        LEFT JOIN agent_runtime_instances ari ON ari.user_id = r.user_id
+        WHERE r.is_active
+          AND r.test_status = 'ok'
+          AND LOWER(COALESCE(NULLIF(route_blob.doc->>'route', ''), 'resident'))
+                <> 'model_api'
+        ORDER BY r.user_id, r.id
+        FOR UPDATE OF r
+    """
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            rows = conn.execute(query).fetchall()
+            if apply and rows:
+                conn.execute(
+                    "UPDATE model_api_routes "
+                    "SET is_active = FALSE, updated_at = now() "
+                    "WHERE id::text = ANY(%s) AND is_active",
+                    ([str(row[3]) for row in rows],),
+                )
+
+    def _iso(value) -> str:
+        return value.isoformat() if value is not None else ""
+
+    return [
+        {
+            "user_id": str(row[0]),
+            "route_blob": row[1] if isinstance(row[1], dict) else None,
+            "onboarding_route": str(row[2]),
+            "model_api_route": {
+                "id": str(row[3]),
+                "is_active": bool(row[4]),
+                "test_status": str(row[5]),
+                "provider": str(row[6]),
+                "model": str(row[7]),
+            },
+            "hosted_runtime_state": str(row[8]),
+            "runner_lease": {
+                "active": bool(row[12]),
+                "status": str(row[9] or ""),
+                "lease_owner": str(row[10] or ""),
+                "lease_expires_at": _iso(row[11]),
+            },
+        }
+        for row in rows
+    ]
+
+
 def list_agent_runtime_enabled_users() -> list[dict]:
     """有 active route 且该 route test_status='ok'、其 credential 的 provider 能
     fit 的用户都纳入托管（与 hosted/agent_runtime_cutover.resolve_driver 一致——
@@ -3502,12 +3824,12 @@ def list_agent_runtime_enabled_users() -> list[dict]:
     /v1/responses capability, set at setup; selects native passthrough vs the
     LiteLLM chat-completions bridge)。
 
-    Anti-double-run gate (dual-runtime coexistence, spec §6): a user whose
-    hosted-runtime fence (``v2_runtime_state.hosted_runtime_state``) reads
-    ``v2`` or ``draining`` is excluded — the V2 fleet already owns them, and
-    the V1 supervisor spawning a consumer too would double the reply and the
-    BYOK spend. Absence of a fence row (never cut over) defaults to resident,
-    same COALESCE default as ``db.get_hosted_runtime_control_strict``."""
+    Anti-double-run gates: the committed onboarding selector must positively be
+    ``model_api`` and the hosted-runtime fence must not read ``v2``/``draining``.
+    Missing/legacy route blobs therefore fail closed instead of silently
+    spawning V1 beside a resident consumer.  V2 ownership remains the second,
+    independent fence.
+    """
     providers = ["anthropic", "claude", "deepseek", "openai",
                  "gemini", "openrouter", "openai_compatible"]
     try:
@@ -3532,6 +3854,12 @@ def list_agent_runtime_enabled_users() -> list[dict]:
                 WHERE r.is_active
                   AND r.test_status = 'ok'
                   AND LOWER(c.provider) = ANY(%s)
+                  AND EXISTS (
+                    SELECT 1 FROM user_blobs route_blob
+                    WHERE route_blob.user_id = r.user_id
+                      AND route_blob.kind = 'onboarding_route'
+                      AND LOWER(COALESCE(route_blob.doc->>'route', '')) = 'model_api'
+                  )
                   AND NOT EXISTS (
                     SELECT 1 FROM v2_runtime_state vrs
                     WHERE vrs.user_id = r.user_id
@@ -4904,6 +5232,33 @@ def chat_max_seq(user_id: str) -> int:
     return int(row[0]) if row and row[0] is not None else 0
 
 
+def chat_latest_genuine_user_ts(
+    user_id: str,
+    *,
+    through_seq: int | None = None,
+) -> float | None:
+    """Latest real user-message timestamp inside an optional frozen frontier."""
+    params: list = [str(user_id)]
+    upper_predicate = ""
+    if through_seq is not None:
+        upper = int(through_seq)
+        if upper < 0:
+            raise ValueError("through_seq must be >= 0")
+        upper_predicate = "AND seq <= %s "
+        params.append(upper)
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT ts FROM chat_messages "
+            "WHERE user_id=%s AND doc->>'role' IN ('user','human') "
+            "AND COALESCE(doc->>'source','') "
+            "NOT IN ('verify_ping','resident_maintenance') "
+            + upper_predicate
+            + "ORDER BY seq DESC LIMIT 1",
+            tuple(params),
+        ).fetchone()
+    return float(row[0]) if row and row[0] is not None else None
+
+
 def chat_max_user_seq_between(
     user_id: str,
     after_seq: int,
@@ -5003,6 +5358,69 @@ def chat_messages_after_seq(
     ]
 
 
+def chat_recent_turn_rows(
+    user_id: str,
+    *,
+    max_turns: int,
+    row_cap: int,
+    through_seq: int | None = None,
+) -> dict:
+    """Newest bounded rows anchored at genuine user turn seeds.
+
+    ``max_turns`` bounds the seed search while ``row_cap`` bounds encrypted row
+    disclosure. The newest-row scan may begin inside the oldest selected turn;
+    callers must drop that partial prefix before rendering. ``window_rows``
+    reports the pre-cap row count without exposing content.
+    """
+    bounded_turns = max(1, min(int(max_turns), 1000))
+    bounded_rows = max(1, min(int(row_cap), 10_000))
+    upper = int(through_seq) if through_seq is not None else chat_max_seq(user_id)
+    if upper < 0:
+        raise ValueError("through_seq must be >= 0")
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "WITH seeds AS ("
+            " SELECT seq FROM chat_messages "
+            " WHERE user_id=%s AND seq<=%s "
+            " AND doc->>'role' IN ('user','human') "
+            " AND COALESCE(doc->>'source','') "
+            " NOT IN ('verify_ping','resident_maintenance') "
+            " ORDER BY seq DESC LIMIT %s"
+            "), boundary AS (SELECT MIN(seq) AS first_seq FROM seeds), "
+            "windowed AS ("
+            " SELECT cm.seq,cm.msg_id,cm.ts,cm.doc,count(*) OVER() AS window_rows "
+            " FROM chat_messages cm CROSS JOIN boundary b "
+            " WHERE cm.user_id=%s AND b.first_seq IS NOT NULL "
+            " AND cm.seq>=b.first_seq AND cm.seq<=%s"
+            ") SELECT seq,msg_id,ts,doc,window_rows FROM windowed "
+            "ORDER BY seq DESC LIMIT %s",
+            (
+                str(user_id),
+                upper,
+                bounded_turns,
+                str(user_id),
+                upper,
+                bounded_rows,
+            ),
+        ).fetchall()
+    chronological = list(reversed(rows))
+    window_rows = int(rows[0][4]) if rows else 0
+    return {
+        "rows": [
+            {
+                **dict(row[3] or {}),
+                "id": str(row[1]),
+                "ts": float(row[2]),
+                "seq": int(row[0]),
+            }
+            for row in chronological
+        ],
+        "requested_turns": bounded_turns,
+        "window_rows": window_rows,
+        "source_truncated": window_rows > len(rows),
+    }
+
+
 def chat_capture_messages_after_seq(
     user_id: str,
     after_seq: int,
@@ -5097,7 +5515,12 @@ def chat_seqs_after_seq(
     return [int(r[0]) for r in rows]
 
 
-def count_messages_after_seq(user_id: str, after_seq: int) -> int:
+def count_messages_after_seq(
+    user_id: str,
+    after_seq: int,
+    *,
+    through_seq: int | None = None,
+) -> int:
     """COUNT of THIS USER's own ``chat_messages`` rows with ``seq > after_seq``
     — scoped by ``user_id``, unlike a bare ``chat_max_seq(...) - after_seq``
     seq-arithmetic estimate. ``chat_messages.seq`` is a TABLE-WIDE ``BIGINT
@@ -5112,12 +5535,46 @@ def count_messages_after_seq(user_id: str, after_seq: int) -> int:
     ``tail_limit`` using a real per-user count, not a global-seq guess — a
     one-shot ``COUNT(*)`` on the existing ``(user_id, seq)`` index, exactly
     as cheap as :func:`chat_max_seq`."""
+    upper = int(through_seq) if through_seq is not None else None
+    if upper is not None and upper <= int(after_seq):
+        return 0
+    predicate = "WHERE user_id = %s AND seq > %s"
+    params: list = [user_id, after_seq]
+    if upper is not None:
+        predicate += " AND seq <= %s"
+        params.append(upper)
     with get_pool().connection() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) FROM chat_messages WHERE user_id = %s AND seq > %s",
-            (user_id, after_seq),
+            f"SELECT COUNT(*) FROM chat_messages {predicate}",
+            tuple(params),
         ).fetchone()
     return int(row[0]) if row and row[0] is not None else 0
+
+
+def chat_recent_genuine_turn_boundary_seq(
+    user_id: str,
+    *,
+    max_turns: int,
+    through_seq: int,
+) -> int | None:
+    """Oldest seed seq among the newest ``max_turns`` genuine user turns."""
+    bounded = max(1, min(int(max_turns), 1000))
+    upper = int(through_seq)
+    if upper < 0:
+        raise ValueError("through_seq must be >= 0")
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT MIN(seq) FROM ("
+            " SELECT seq FROM chat_messages "
+            " WHERE user_id=%s AND seq<=%s "
+            " AND doc->>'role' IN ('user','human') "
+            " AND COALESCE(doc->>'source','') "
+            " NOT IN ('verify_ping','resident_maintenance') "
+            " ORDER BY seq DESC LIMIT %s"
+            ") recent_seeds",
+            (str(user_id), upper, bounded),
+        ).fetchone()
+    return int(row[0]) if row and row[0] is not None else None
 
 
 def chat_seq_for_msg_id(user_id: str, msg_id: str) -> int | None:
@@ -6453,6 +6910,7 @@ def chat_append_effect_with_cursor(
     *,
     connection=None,
     defer_post_commit: bool = False,
+    require_cursor_advance: bool = False,
 ):
     """Atomically persist one deterministic V2 reply and optionally advance its cursor.
 
@@ -6467,6 +6925,10 @@ def chat_append_effect_with_cursor(
     ``defer_post_commit`` returns a thunk for R2/mirror work; callers must invoke
     it only after that outer commit.  The default wrapper behavior is unchanged.
 
+    ``require_cursor_advance`` is reserved for delayed terminal-failure
+    delivery. It suppresses the candidate atomically when a newer terminal
+    reply already advanced the cursor through the captured failure frontier.
+
     Returns ``(seq, inserted)`` by default, or
     ``(seq, inserted, post_commit)`` when ``defer_post_commit`` is true. A
     replay returns the existing seq and still monotonically advances a terminal
@@ -6480,6 +6942,10 @@ def chat_append_effect_with_cursor(
     )
     if cursor_seq is not None and cursor_seq < 0:
         raise ValueError("reply_through_seq must be >= 0")
+    if require_cursor_advance and cursor_seq is None:
+        raise ValueError(
+            "require_cursor_advance requires a terminal reply cursor"
+        )
 
     effect_doc = _normalize_chat_body_doc(doc)
     replied_user_ids: list[str] = []
@@ -6490,6 +6956,19 @@ def chat_append_effect_with_cursor(
         "replied_by": "hosted_runtime_v2",
         "replied_at": f"{float(ts):.3f}",
     }
+    failure_error_class = str(
+        effect_doc.get("turn_failure_error_class") or ""
+    ).strip()
+    if failure_error_class:
+        replied_fields.update(
+            {
+                "reply_error_class": failure_error_class,
+                "reply_blame": str(effect_doc.get("turn_failure_blame") or "").strip(),
+                "reply_user_text": str(
+                    effect_doc.get("turn_failure_user_text") or ""
+                ).strip(),
+            }
+        )
     connection_scope = (
         nullcontext(connection)
         if connection is not None
@@ -6530,6 +7009,10 @@ def chat_append_effect_with_cursor(
                     if not raw_previous_cursor.isdigit():
                         raise RuntimeError("invalid persisted V2 reply cursor")
                     previous_cursor = int(raw_previous_cursor)
+                    if require_cursor_advance and cursor_seq <= previous_cursor:
+                        if defer_post_commit:
+                            return 0, False, lambda: None
+                        return 0, False
                 storage_generation = _lock_chat_r2_lifecycle_on_cursor(
                     cur, user_id,
                 )
@@ -6619,6 +7102,8 @@ def chat_append_effect_with_cursor(
                         "id", "role", "source", "v", "body_ct", "nonce",
                         "K_user", "K_enclave", "enclave_pk_fpr", "visibility",
                         "owner_user_id", "content_type",
+                        "turn_failure_error_class", "turn_failure_blame",
+                        "turn_failure_user_text",
                     )
                     if not isinstance(existing_doc, dict) or any(
                         existing_doc.get(field) != effect_doc.get(field)
@@ -7197,6 +7682,117 @@ def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None
     return row[0] if row is not None else None
 
 
+def chat_reconcile_legacy_adjacent_reply(
+    user_id: str,
+    parent_msg_id: str,
+    reply_msg_id: str,
+) -> tuple[dict, dict] | None:
+    """Atomically link one legacy chat reply to its immediately preceding turn.
+
+    Older consumers could append an ordinary ``source=chat`` assistant message
+    without ``reply_to_message_id`` and without settling the parent user row.
+    The lost-turn backstop then treated that visibly answered turn as abandoned
+    and ran the model again. Reconcile only the unambiguous legacy shape: both
+    rows still exist, the parent is unanswered, the assistant reply is unlinked,
+    and no conversation user message sits between their timestamps.
+    """
+    parent_fields = {
+        "reply_status": "replied",
+        "reply_message_id": reply_msg_id,
+        "replied_by": "legacy_adjacent_reconcile",
+    }
+    reply_fields = {"reply_to_message_id": parent_msg_id}
+    parent_doc: dict | None = None
+    reply_doc: dict | None = None
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+                    cur.execute(
+                        "SELECT msg_id, ts, doc FROM chat_messages "
+                        "WHERE user_id=%s AND msg_id=ANY(%s) "
+                        "ORDER BY msg_id FOR UPDATE",
+                        (user_id, [parent_msg_id, reply_msg_id]),
+                    )
+                    rows = {str(row[0]): (float(row[1]), row[2]) for row in cur.fetchall()}
+                    if parent_msg_id not in rows or reply_msg_id not in rows:
+                        return None
+                    parent_ts, parent = rows[parent_msg_id]
+                    reply_ts, reply = rows[reply_msg_id]
+                    if (
+                        parent.get("role") != "user"
+                        or str(parent.get("source") or "") in (
+                            "verify_ping", "resident_maintenance"
+                        )
+                        or parent.get("reply_status") == "replied"
+                        or str(parent.get("reply_message_id") or "").strip()
+                        or str(reply.get("role") or "") not in (
+                            "openclaw", "assistant", "agent"
+                        )
+                        or str(reply.get("source") or "") not in ("", "chat")
+                        or str(reply.get("reply_to_message_id") or "").strip()
+                        or reply_ts <= parent_ts
+                    ):
+                        return None
+                    cur.execute(
+                        "SELECT 1 FROM chat_messages "
+                        "WHERE user_id=%s AND ts>%s AND ts<%s "
+                        "  AND doc->>'role'='user' "
+                        "  AND COALESCE(doc->>'source','') "
+                        "      NOT IN ('verify_ping','resident_maintenance') "
+                        "LIMIT 1",
+                        (user_id, parent_ts, reply_ts),
+                    )
+                    if cur.fetchone() is not None:
+                        return None
+                    cur.execute(
+                        "UPDATE chat_messages SET doc=doc || %s "
+                        "WHERE user_id=%s AND msg_id=%s "
+                        "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+                        "  AND COALESCE(doc->>'reply_message_id','')='' "
+                        "RETURNING doc",
+                        (Jsonb(parent_fields), user_id, parent_msg_id),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        return None
+                    parent_doc = row[0]
+                    cur.execute(
+                        "UPDATE chat_messages SET doc=doc || %s "
+                        "WHERE user_id=%s AND msg_id=%s "
+                        "  AND COALESCE(doc->>'reply_to_message_id','')='' "
+                        "RETURNING doc",
+                        (Jsonb(reply_fields), user_id, reply_msg_id),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        raise RuntimeError("legacy adjacent reply changed during reconcile")
+                    reply_doc = row[0]
+    except Exception as e:
+        log.error(
+            "[db] chat_reconcile_legacy_adjacent_reply(%s,%s,%s) failed: %s",
+            user_id,
+            parent_msg_id,
+            reply_msg_id,
+            e,
+        )
+        return None
+
+    if parent_doc is None or reply_doc is None:
+        return None
+    from tee_shadow import mirror
+    mirror.execute(
+        "UPDATE chat_messages SET doc=doc || %s WHERE user_id=%s AND msg_id=%s",
+        (Jsonb(parent_fields), user_id, parent_msg_id),
+    )
+    mirror.execute(
+        "UPDATE chat_messages SET doc=doc || %s WHERE user_id=%s AND msg_id=%s",
+        (Jsonb(reply_fields), user_id, reply_msg_id),
+    )
+    return parent_doc, reply_doc
+
+
 _CHAT_FINALIZE_REPLY_ONCE_SQL = (
     "WITH won AS ("
     "  UPDATE chat_messages SET doc = doc || %s "
@@ -7266,6 +7862,62 @@ def chat_finalize_reply_once(
         (Jsonb(replied_fields), user_id, parent_msg_id),
     )
     return row[0], row[1]
+
+
+def chat_finalize_reply_sequence_once(
+    user_id: str,
+    parent_msg_id: str,
+    replies: list[tuple[str, float, dict]],
+    replied_fields: dict,
+) -> tuple[dict, list[dict]] | None:
+    """Atomically answer one parent with a text primary and file follow-ups.
+
+    The parent CAS and every reply INSERT share one transaction.  A duplicate
+    id or malformed follow-up rolls the whole sequence back, so clients never
+    observe a success bubble without the downloadable cards that belong below
+    it.  Losing the parent CAS is the only normal ``None`` result.
+    """
+    if not replies:
+        raise ValueError("reply sequence must not be empty")
+
+    parent_doc = None
+    inserted_docs: list[dict] = []
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+                cur.execute(
+                    "UPDATE chat_messages SET doc = doc || %s "
+                    "WHERE user_id = %s AND msg_id = %s "
+                    "AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+                    "AND COALESCE(doc->>'reply_message_id','') = '' "
+                    "RETURNING doc",
+                    (Jsonb(replied_fields), user_id, parent_msg_id),
+                )
+                parent_row = cur.fetchone()
+                if parent_row is None:
+                    return None
+                parent_doc = parent_row[0]
+                for reply_msg_id, reply_ts, reply_doc in replies:
+                    cur.execute(
+                        "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
+                        "VALUES (%s, %s, %s, %s) RETURNING doc",
+                        (
+                            user_id,
+                            reply_msg_id,
+                            reply_ts,
+                            Jsonb(reply_doc),
+                        ),
+                    )
+                    inserted_docs.append(cur.fetchone()[0])
+
+    from tee_shadow import mirror
+
+    mirror.execute(
+        _CHAT_FINALIZE_REPLY_PARENT_MIRROR_SQL,
+        (Jsonb(replied_fields), user_id, parent_msg_id),
+    )
+    return parent_doc, inserted_docs
 
 
 def chat_finalize_reply_post_commit(

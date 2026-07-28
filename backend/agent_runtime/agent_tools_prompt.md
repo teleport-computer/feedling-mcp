@@ -19,6 +19,25 @@ Run (the absolute path is provided by the host):
 - No signals given → a fast default set (now, location, weather, motion, calendar).
 - Same JSON contract for every verb.
 
+## Downloadable files
+
+Interpret file requests by meaning, not by a fixed phrase. When the user wants
+a reusable result they can save, open, download, share, or use outside chat,
+create UTF-8 Markdown-like source under:
+
+```
+<outbound_file_dir>
+```
+
+Then call `send-file --path <source_path> --name <download_name>`. The visible
+name must use the requested suffix: Word means `.docx`, PDF means `.pdf`;
+those two formats are rendered from the UTF-8 source after staging. Never send
+Markdown when the user explicitly requested Word, PDF, or another supported
+format. If no format was specified, choose a useful safe name and format. Do
+not ask the user for an internal path, and do not claim the file is ready unless
+`send-file` returns `{"ok": true}`. A tutorial question such as “how do I make a
+Word document?” is not itself a request to create one.
+
 ## Signals
 
 - Fast: `now`, `location`, `weather`, `motion`, `calendar`
@@ -80,6 +99,16 @@ keeps showing the old name, and you will have told the user you changed somethin
 that visibly did not change. Say it's done only after the command returns
 `{"ok": true}`; if it returns an error, tell the user plainly that the rename did
 not go through.
+
+**When the user asks to change how long you two have been together — the
+relationship day count, the "第 N 天" shown in the app (e.g. "把相处天数改成 30 天",
+"相处日期改到 45 天", "我们其实认识两年了") — pass `--relationship-days N`**, where `N`
+is the number the user states (the count they see in the app; the day you met is
+day 1). `days_with_user` derives from a relationship-start anchor and auto-increments
+daily, but `--relationship-days` is exactly how you recalibrate it — so do NOT tell
+the user it's "auto-computed" and you can't change it, and do NOT fake it by only
+writing text into another field. Only recalibrate on an explicit request; say it's
+done only after the command returns `{"ok": true}`.
 
 - Use it for what the user actually asked. A rename changes `--agent-name`; a
   change to how you describe yourself changes `--self-introduction`. When the new

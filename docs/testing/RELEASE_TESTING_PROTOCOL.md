@@ -43,7 +43,7 @@
 | 2 | OpenAI 官方 | codex | |
 | 3 | Gemini 官方 | pi | |
 | 4 | OpenRouter | pi | 官方聚合器代表 |
-| 5 | 中转站代表（openai_compatible） | pi | 流不稳/模型名带标签的典型场景（usr_6f5a 类）；选一家真实用户在用的 |
+| 5 | 中转站代表（openai_compatible） | pi | 流不稳/模型名带标签的典型场景（usr_6f5a 类）；选一家真实用户在用的。`test_status:ok`+能回话 ≠ 记忆/工具 OK，**须单独验一轮带记忆写入/工具调用的回合**（详 TESTING §6；没有任何配置字段能替代跑真回合——`responses_unsupported` 探测已于 2026-07-27 删除）；注意区域锁 key（`.cn` key 打 `.ai` 直接 401） |
 | 6 | DeepSeek 官方 | claude(base override) | `ANTHROPIC_BASE_URL={base}/anthropic` 路线 |
 
 - 存放：本地 `~/.feedling-e2e-keys.env`（chmod 600，**永不入 git**）；格式
@@ -62,7 +62,10 @@ openai_compatible 代理主动注入（见 §4.7 故障注入四连）。
 - keypair 用 `tools/e2e/` 生成并只存本轮临时目录；
 - 绝不复用真实用户账号，绝不在 prod 建号。
 - teardown 失败会打 WARNING——**看到必须手动删**（无 admin 删除口）；
-  崩溃留下的凭据在 `~/.feedling-e2e-orphans/`，`p0.py --cleanup-orphans` 清扫。
+  崩溃留下的凭据在 `~/.feedling-e2e-orphans/`，`p0.py --cleanup-orphans` 清扫
+  （`temporal_probe.py` 同款开关，会先 unpin allowlist 再删号）。
+- **teardown 必须和主流程一样带传输重试**：test 网关 TLS 偶发抖动，主流程重试活了、
+  cleanup 一击即死 = 静默漏号（2026-07-26 漏两个）。新写探针照抄 `_retry_transport` 覆盖**所有**调用。
 
 ### 1.4 harness 已知坑（拿来即用）
 
@@ -133,6 +136,14 @@ SHA/文件集/净 diff。
 **提交纪律**（提交者）：commit 前 `git diff --cached` 与审定 diff **逐 hunk** 比对
 （文件名一致不够）；进行中工作放专属 worktree；mailbox 脚本从主仓根跑，
 pytest/build 必须在被审的树里跑。
+
+> **`git add <路径>` 挡不住同事的 hunk**：两个 agent 共用一个工作树时，按路径 add
+> 会把**同一个文件里别人的改动**整个带走。2026-07-27 我的 `0d437b40`（admin 直方图）
+> 就这样裹进了 codex2 的 `mark_failed` / `_terminal_error_class` / 失败 outbox 逻辑，
+> 而提交信息一个字没提——后果是谁想 revert 我这个改动，会连他的失败管线一起撤掉，
+> 且没有任何警告。**唯一可靠的是 `git diff --cached` 逐 hunk 看完**，"我只 add 了自己的
+> 文件"不构成防线。发现裹错了：只要还没 push 就重切，别靠提交信息补说明。
+> 同理，commit 前先 `git status` 看一眼有没有**别人的**未提交改动，有就说明你们在同一棵树上。
 
 ## 3. P0 冒烟集（全自动，Claude 执行，~30-45 分钟）
 
@@ -287,7 +298,6 @@ model_api + resident **两路都跑**，不许一路代表全部。自查话术�
 | resident 假掉线 | P1 #14 |
 | DAU 历史缩水 | 快照冻结测试（已入 pytest） |
 | 单点 CVM 部署断连（usr_ed21） | §6 固定项 |
-
 | 重发双份/lost-202（usr_9f5d） | P1 #14.5 重试路径专项（幂等窗 cbecec05 + ios 重试路由 9f33d65 + 幂等键 49afa7a） |
 | 同秒双回复竞态（usr_a0b7） | §2.5 并发自查 + TESTING §2-F 确定性并发测试；reply 侧原子 CAS 仍未完成——"缓解"≠"已修" |
 | debug_trace 写后读竞态 | TESTING §6 flaky 规范（e4b38e39，bounded best-effort 契约） |
@@ -296,11 +306,20 @@ model_api + resident **两路都跑**，不许一路代表全部。自查话术�
 | resident 旧版 consumer 永不认领蒸馏任务（usr_f13f，5 连失败+错怪网络/模型设置） | 已入 pytest（test_resident_maintenance 6 DB 例 + unit 节流/措辞例）；`tools/e2e/resident_maintenance_smoke.py`（触碰 consumer 识别/poll/notice/genesis claim 时加跑，~17min：模拟无 commit header poll→15min 注入→用户密钥解密→notice+copyable_prompt→封信封回复→限流→收敛 resolve）；P1 #12 归因抽查含 resident_never_claimed→"resident 端过旧/离线"（blame=user_environment，不再引导查网络/模型设置） |
 | app 感知断供 + 读侧缺口（usr_7f30，快捷指令停报 2 天 AI 只字未提） | 已入 pytest（perception recent_apps 权限/TTL/route 共 85 项）；**io_cli allowlist parity test**（防"verb 实现了但没进 _IO_CLI_VERBS"——driver=pi 用户才踩得到的暗坑，两次都是它）；排查口径：客户端快捷指令断供属用户侧，先查 user_logs 对应 stream 最后上报时间再谈后端 |
 | **hosted OpenAI 多轮静默掉回复（pre V2，driver=codex）** | 2026-07-22 深度探针 + 手测 3/3 发现：`provider=openai model=gpt-5.2 driver=codex` **第 1 轮有回复、第 2 轮起无任何 agent row**（非空回复、非迟到、无气泡）。anthropic(claude)/relay(openai_compatible) 同探针多轮全绿→**codex driver 跨轮续接嫌疑**。handoff `docs/HANDOFF_openai_codex_multiturn_2026-07-22.md`（pre 分支），交后端。**教训①：多 provider 必分 driver 跑——换 driver 才暴此 bug，anthropic 永远碰不到；教训②：V2 agent_jobs(聊天)失败无用户/admin 可见信号=静默，该补错误气泡+admin 失败原因（观测缺口）** |
-
 | **一句话双回复+一轮最多三份计费+十几分钟延迟（usr_36038，prod，pi+低价中转）** | 2026-07-23 用户截图报障，admin data-track + iOS 诊断日志分诊（mailbox 20260723T204313Z）。**三层叠加**：① pi stream-cut 立即重跑（计费）；② 300s cap×2 恰好耗尽 600s claim TTL→lost-turn redelivery 第三跑（`chat/service.py:71`）；③ iOS 传输错误（-1001/-1005=结果未知）回填输入框→用户重发铸新 client_msg_id，幂等窗折叠不了。修复（Seven 裁决只做两条）：iOS fleet/p2 `5444842`+`1e48845`（不回填+重试前收据核验——**600s 幂等窗贴着事故 9m26s 延迟的边**，超窗重试同 id 也算新发送，必须先核收据）；后端最小 provider attempt ledger（#4，chat lane only，V2 与心跳暂不入账=已知覆盖边界）。**教训①：分诊先看 runtime.driver + 中转站质量（0.08 折中转 401/403/502/503 一堆=失败重跑土壤）；教训②：17:22 事故 trace 被 200-event ring 淘汰，第二次因 ring 无法复盘——ledger 落地前退款只能按截图人工赔；教训③：客户端"send failed"≠服务端没收到——两个发送端点都同步写行后才响应，一次 history sync 就是可靠收据**。follow-up：图片路径 `sendModelAPIChatImage` 无 client_msg_id（同族敞口）；heartbeat 55min vs 设置 2h 偏频待 `c635d87d` coalescing 版本复测 |
+| **自定义中转全线"验证不上"（usr_fee1dfed，prod，2026-07-19→07-25 静默六天）** | 后端 V2 prompt frontier（`4c745d07`）要求非白名单路线显式传 `context_window_tokens`，**iOS 从来没有这个字段的 UI** → 所有 `openai_compatible` 配置一律 400 `prompt_context_limit_unconfigured`，存量 NULL 行的 V2 turn 也一起挂；六家白名单官方直连完全无感，所以没人报。修复 zhihao `e8edbf7a`/`f250dabd`（未审计默认窗，后升至 64k `e7e552ca`）。**回归落点：TESTING §2-Q「契约收紧 / fail-closed 门禁」**——后端加"没这个字段就拒"的门禁，发版必须验客户端真能传 + 存量行有出路 + 拒绝分支可观测。分诊配方：iOS 诊断日志 grep `model-api.routes` 看 slug，比猜中转质量快 |
+| **"AI 一直说没接上"（usr_a40e，prod）** | 用户抱怨的原句就是我们自己的 `FALLBACK_REPLY` 硬编码文案。真因：错误分类 regex 没覆盖 DeepSeek/OpenAI 的 model-not-found 措辞（"supported model names…"/"model … does not exist"）→ 本该是 `user_provider`（"模型名不可用，请检查设置"）的错被静默降级成 system 兜底，用户永远不知道该改模型名。修复=扩规则 + 两侧同改 + 兜底改为按 blame 路由。**回归落点：TESTING §2-F3**。**教训：分类规则是开集，漏判不报错只掉进兜底；用户投诉原话先全仓 grep** |
+| **"接不上"其实是中转挂了（usr_1baf，prod，2026-07-26）** | 分诊铁三角，admin data-track user detail 一次看齐：① `chat.last_user_at > last_agent_at`（发得出、不回复=典型"接不上"，非真断连）；② `provider_attempt_ledger` 尾部 `outcome=timeout`（无 token 产出）；③ `runtime.{provider,model,driver}` 是自定义中转 → 不是我们。⚠️ **`runtime.test_status=ok` 只证轻量 ping 通**，真实生成仍可全 timeout，别被它骗。定族先对当天部署时间线（provider `timeout` ≠ 部署窗的 `503`） |
+| **（近失，无人报障）V2 重写带走了 V1 的事故守卫** | 07-26 按"每条 V1 事故硬化守卫在 V2 在不在"逐条核对，一次挖出 5 处：dream 不过同意门、屏幕共享开关接了空实现（6/44 用户刻意开着，实际不生效）、唤醒失败退避不落库、无逐字历史、无时间锚点。**根因不是漏写代码，是 parity 矩阵只跟踪"lane 跑不跑"、不跟踪"守卫迁没迁"**。修复=`docs/HOSTED_RUNTIME_V2_PARITY_MATRIX.md` 增设 `Incident-hardened guards — ported?` 表（13 行）+ TESTING §2-O。**教训：重写会带走功能，也会带走当初为事故加的那道坎——那道坎往往只有三行 if，最不像"功能"，所以最容易在重写时蒸发** |
+| **维护消息注入循环 + 假阳性（usr_6c1971 35 条 @5-13s；usr_98306ae2 老号被误判）** | 2026-07-22。**两个独立故障**：①**循环**——`consumer_state` 是裸 `db.set_blob`（读整 blob→改→写回），进程内锁管不到多 worker，poll 心跳写与 maintenance 的 `last_reminder_epoch` 互相覆盖 → 24h 冷却记录被抹 → 每 poll 重注入；二次放大器是旧 `append` 同 `client_msg_id` 整行 upsert，会清掉 `reply_status` 把已回复的维护 parent 重新打开。②**假阳性**——consumer 太旧不上报解密健康 → `unknown`，注入路径**没接** `_decrypt_health_enforcement_state` 的 cohort 政策，老号（有 `first_chat_ok`）被当成"解密源坏了"。修复 `3d1f98c1`（统一 `_mutate_consumer_state` CAS + `append_chat_idempotent` 双保险）、`97d19151`（注入接 policy + 严格 24h + reason_key 剔除易变字段）。已入 pytest：`tests/test_consumer_state_cas.py`（真 PG 双连接强制过期快照，覆盖 `3d1` 的跨 worker CAS）+ `tests/test_resident_maintenance.py`（`3d1` 的消息幂等：同桶单行/保留 reply 元数据/跨桶新行，以及 `97d` 的 cohort 与严格 24h）+ `tests/test_resident_maintenance_unit.py`（`97d` 的 reason_key 去抖与文案分流单测）；合计 9 类边界矩阵。**教训①：逻辑层去重必须问一句"它的持久化会不会被并发覆盖"——`97d19151` 的 24h 冷却逻辑本身是对的，死在存储层丢失更新；教训②：副作用要有独立于状态的幂等兜底（同桶只落一行），状态丢了也不能刷屏；教训③：`unknown`≠故障，新增健康信号时先想清楚"没上报"该归哪一档** |
+| **resident 自更新「缴械」——进程静默跑旧代码数天（Seven VPS，07-14→07-22）** | 2026-07-22 SSH + journal/reflog 交叉实证。链条：consumer 故意跳过无关发布（`_relevant_changed`，特性）→ 后端不知情，6h 后注入"你版本旧了"→ 用户侧 agent 照做 `git checkout` 目标 commit → **回合被当时 120s 上限杀死在"重启"之前** → 而 `_consumer_commit()` **实时读磁盘 git HEAD**，于是老进程对外汇报新 commit（后端误判已修复）、自更新的 `local==target` 永久短路 → 从此隐身跑旧代码，无人可见。修复 `956848fd`（`RUNNING_COMMIT` import 时冻结为进程身份 + 磁盘已在 target 则免 fetch 直接 re-exec 自愈 + diff 失败 fail-closed）、`6db26b2d`（后端接收 `X-Feedling-Consumer-Compat-Commit`，故意跳过不再当滞后）。已入 `tests/test_chat_resident_self_update.py`（consumer 侧：外部 checkout 自愈 / irrelevant 签 compat / dirty 拒绝 / diff 失败不签）+ `tests/test_resident_maintenance.py`（backend 侧 compat 分类矩阵：匹配即抑制、无 compat 回归、旧 compat 遇新 expected、compat 不掩盖 missing）。**教训①：上报的 commit ≠ 正在运行的代码——进程身份必须在 import 时冻结，任何"实时读盘取自身版本"都是假的；教训②：疑似停摆先比 journal 最后一次 `applied; re-exec` 与 `git reflog` checkout 的时间戳，对不上就是这一类；教训③：给用户 agent 的修复指引，每一步都要能在一个回合内做完，否则会卡在半截并制造更难查的中间态** |
+| **onboarding 失败文案指错方向导致用户放弃（usr_9037eaa8，五连败）** | 2026-07-24。用户配的是中转 **thinking 版模型**，蒸馏调用 15+ 次 `ReadTimeout`，`history_import` 五连失败；而引导页 `required` 是写死的 `Genesis import failed. Start onboarding again with the latest app build.` —— 与真因无关且指向"更新 App"，用户照做无效后弃用（注册后至今 0 条聊天）。修复 `4b672ef9`：`genesis_failure_required_text()` 按 `classify_genesis_error` 的 9 类错误码/分类结果给**中英双语「原因 + 正确动作」**（其中 `internal` 是兜底档，`consumer_offline` 当前无可区分的 emit path），行动统一为"处理后重新发起导入，已上传材料不会丢"；`provider_timeout` 点名 thinking/慢模型与不稳中转；本次 onboarding 失败/进行中态文案弃用内部术语"蒸馏"，并把 `genesis_failed`/`genesis_partial` 两条横幅改为"文件解读"（**注意：其余路径如 resident maintenance、`io_cli` 帮助文本仍有"蒸馏"，未全量清理**）。已入 `test_onboarding_validation_genesis.py`（断言含真因、无 `app build`、无"蒸馏"）+ `test_genesis_failure_codes.py`（中英键镜像）。**教训①：失败文案必须按真因分流，静态兜底文案在 9 类原因里最多只对 1 类；教训②：对"永不自愈"的配置类错误说"稍后重试"是骗用户重试，每次重试都是又一次注定失败且照样计费的调用；教训③：新增用户可见文案时，同 PR 检查是否泄漏内部术语** |
+| **观测缺口：无法回答"某用户每天用多久"（分诊被迫手工拼表）** | 2026-07-25/26。不是 bug 但真卡分诊：用户页只有**全时段总计**（无日期窗口）、DAU 页只有**全体按天**（无法下钻到人），且 `tracking.latest` 硬编码 `[:50]`，事件多的用户拉不出完整一周。补齐 `3c635fb8`（DAU 页每日使用时长分布直方图，8 固定桶 + median/mean/P90/max）、`38c24521`（用户页最近 N 天逐日 + UID 直查框 + `?events_limit=` 可调至 500）。两批的用例都落在 `tests/test_db.py`（真 PG 聚合/边界/clamp）+ `tests/test_data_track.py`（JSON 与 SSR 渲染）+ `tests/test_asgi_admin.py`（路由与鉴权）。**教训①：零使用日必须显式补零成行并可见——"这天一次没打开"本身是关键信息，缺行等于丢信息；教训②：窗口合计必须与全时段合计并排——usr_98306ae2 全时段 2h20m 而本周仅 16 分钟，"冷下来了"这个判断单看任一数字都得不出；教训③：口径要写在页面上（中位数样本=当天有上报的用户，没打开的不计入也不补 0）** |
+| **切到 V2 后彻底静默（usr_7f30 / usr_90184，prod，2026-07-27）** | 用户被切 V2 后完全收不到回复（usr_7f30 三天 14/14 回合失败），唯一可见症状是 `turn_failed:responder_error`——约 12 个 TurnError 站点共用的桶。真因 = **compaction 自锁**（`_validated_new_bullets` 全有全无 → 一行坏掉整批 fold 作废 → watermark 不前进 → 下轮读到逐字节相同的批次 → 同样被拒），zhihao `30793ab4` 修（批次 200→50→12→3→1 降级 + 单行隔离）。**三条教训**：① 我基于**代码常量** 32768 推出"上下文超限"，而 prod 的 env 早覆盖成 131072（`27c76414`）——prod 配置只能读运行时，见 TESTING §6；② `provider_attempt_ledger` 当时是 V1-only，V2 用户的 ledger 在切换瞬间静默，和"中转挂了""没到 provider"三者同形，zhihao 已让 V2 也写同一 stream；③ **同一天三个人（我 / codex2 / zhihao）各自在改同一片 `worker.py` 失败分类**，靠人问了一句才发现——排查 prod 事故前必须先扫 `git log origin/test --since` |
 
 **规则**：以后每个 prod 事故结案时，必须在本表加一行 + 在对应层落一条用例，
-否则不算结案。
+否则不算结案。**"没有用户报障"不是免检理由**——上面两条（中转全线 400、V2 空开关）
+都是零投诉六天/两周，因为受害面正好是不吵的那批人。
 
 **分诊前置**：用户报障先确认接入路线（①API 托管 / ②自有服务器 / ③完全自部署），
 三条排查路径完全不同——权威定义见 `docs/ACCESS_ROUTES.md`。
@@ -318,7 +337,7 @@ model_api + resident **两路都跑**，不许一路代表全部。自查话术�
   ② 绿重试救不回 `PRODUCT_FAIL`（复现的产品失败不因后一次偶然成功变 PASS，两次都留档）；
   ③ 缺证据 ≠ 通过（拿不到 trace/解密/运行时证明 = `BLOCKED_EVIDENCE`，不是绿）。**
 
-## 8.5 发版前六问（快速自检）
+## 8.5 发版前自检问句（逐条自问，答不上就别发）
 
 1. 体感：语言对吗？会刷屏吗？用户**真能解密**吗？（§4.5 / §3-2）
 2. 蒸馏：日期/标签保住了吗？两入口两通道都验了吗？（§4.6）
@@ -331,6 +350,9 @@ model_api + resident **两路都跑**，不许一路代表全部。自查话术�
 9. 喂词：这次改动往模型嘴里塞了什么新词？会照搬到用户屏幕吗？（§4.7）
 10. 工具：现在出事故，admin 读得动、trace 还在窗口内吗？（§6）
 11. 归因：新增错误路径，气泡怪对人了吗？（P1 #14.6）
+12. 收紧：这次新增了什么"没有就拒"的必填？**客户端真发得出吗、存量行怎么办、堵住了有人看得见吗**？（§2-Q）
+13. 重写：新 lane 把老 lane 的**事故守卫**都带过去了吗？（§2-O + parity 矩阵的 ported 表）
+14. 静默：这次的失败模式，用户会**报障**还是只会**流失**？零投诉 ≠ 没坏
 
 ## 9. 落地顺序（待办）
 

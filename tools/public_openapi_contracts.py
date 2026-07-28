@@ -258,6 +258,19 @@ OPERATION_PARAMETERS: dict[Operation, list[dict[str, Any]]] = {
         _query("ts", TIMESTAMP, "Client event Unix timestamp.", example=1783962000.0),
         _query("client_ts", TIMESTAMP, "Compatibility alias for ts.", deprecated=True),
     ],
+    ("get", "/v1/perception/app_close"): [
+        _query(
+            "app",
+            _schema("string", minLength=1),
+            "Application name or identifier. The public contract requires this canonical parameter; bundle_id remains a deprecated runtime alias.",
+            required=True,
+            example="com.apple.MobileSafari",
+        ),
+        _query("bundle_id", _schema("string"), "Compatibility alias for app.", deprecated=True),
+        _query("category", _schema("string"), "Optional application category.", example="browser"),
+        _query("ts", TIMESTAMP, "Client event Unix timestamp.", example=1783962000.0),
+        _query("client_ts", TIMESTAMP, "Compatibility alias for ts.", deprecated=True),
+    ],
     ("get", "/v1/proactive/jobs/poll"): [
         _query("since", TIMESTAMP, "Return jobs newer than this Unix timestamp.", example=1783962000.0),
         _query("timeout", _schema("number", minimum=0, maximum=60, default=30), "Long-poll wait in seconds.", example=30),
@@ -331,6 +344,95 @@ OPERATION_PARAMETERS[("put", "/v1/genesis/imports/{job_id}/chunks/{seq}")] = [
 
 
 COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "ModelApiModelsRequest": {
+        "type": "object",
+        "description": (
+            "List a provider's live model catalog. Supply the credential "
+            "**exactly one** of two ways: a fresh `api_key`, or a stored "
+            "`credential_id` whose provider/base_url are the source of truth "
+            "(any provider/base_url sent alongside a credential_id is ignored)."
+        ),
+        "required": ["provider"],
+        "additionalProperties": True,
+        # Strict XOR that matches the runtime (setup_core.model_api_models):
+        # exactly one of api_key / credential_id must be PRESENT and non-empty.
+        # `oneOf` on `required` gives "exactly one present"; `minLength: 1` on the
+        # value gives "non-empty"; dropping OpenAPI-3.0 `nullable` forbids an
+        # explicit null (this document is 3.1.0, where null is a JSON-Schema type,
+        # not a `nullable` flag). So {"api_key":"k","credential_id":null} — which
+        # a presence-only oneOf + nullable used to accept while the runtime
+        # rejected it — is now invalid on BOTH sides.
+        "oneOf": [
+            {"required": ["api_key"]},
+            {"required": ["credential_id"]},
+        ],
+        "properties": {
+            "provider": {
+                "type": "string",
+                "enum": [
+                    "openai",
+                    "openrouter",
+                    "anthropic",
+                    "bedrock",
+                    "gemini",
+                    "deepseek",
+                    "openai_compatible",
+                ],
+                "description": "Provider to enumerate. `openai_compatible` requires `base_url`.",
+            },
+            "base_url": {
+                "type": "string",
+                "description": (
+                    "Override base URL. Required for `openai_compatible`; must be "
+                    "`https://` or local `http://127.0.0.1`."
+                ),
+            },
+            "api_key": {
+                "type": "string",
+                "writeOnly": True,
+                "minLength": 1,
+                "description": "Fresh provider key. Mutually exclusive with `credential_id`.",
+            },
+            "credential_id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Stored credential id. Mutually exclusive with `api_key`.",
+            },
+        },
+        "example": {"provider": "openai", "api_key": "sk-..."},
+    },
+    "ModelApiModelItem": {
+        "type": "object",
+        "required": ["id", "display_name"],
+        "additionalProperties": False,
+        "properties": {
+            "id": {"type": "string", "description": "Provider model id (≤160 chars)."},
+            "display_name": {"type": "string", "description": "Human label; falls back to id."},
+        },
+    },
+    "ModelApiModelsResponse": {
+        "type": "object",
+        "description": (
+            "The account's visible model catalog for this provider — a live "
+            "pull, NOT an io compatibility guarantee. `complete=false` means the "
+            "list was truncated (see `warnings`); `catalog_supported=false` means "
+            "the provider has no listable catalog (e.g. bedrock, or a custom "
+            "endpoint with no `/models`) and the client should fall back to "
+            "manual model entry."
+        ),
+        "required": ["provider", "models", "complete", "catalog_supported", "warnings"],
+        "additionalProperties": False,
+        "properties": {
+            "provider": {"type": "string"},
+            "models": {
+                "type": "array",
+                "items": {"$ref": "#/components/schemas/ModelApiModelItem"},
+            },
+            "complete": {"type": "boolean"},
+            "catalog_supported": {"type": "boolean"},
+            "warnings": {"type": "array", "items": {"type": "string"}},
+        },
+    },
     "WebSettingsUpdateRequest": {
         "type": "object",
         "description": (
@@ -842,6 +944,21 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "additionalProperties": True,
     },
+    "ChatFileFollowup": {
+        "type": "object",
+        "required": ["envelope", "file_name", "file_mime", "file_byte_count"],
+        "properties": {
+            "envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
+            "file_name": {"type": "string", "minLength": 1, "maxLength": 120},
+            "file_mime": {"type": "string", "minLength": 1, "maxLength": 120},
+            "file_byte_count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000,
+            },
+        },
+        "additionalProperties": False,
+    },
     "ChatResponseRequest": {
         "type": "object",
         "required": ["envelope"],
@@ -862,6 +979,13 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "reply_to_message_id": {"type": "string", "description": "Parent user message; strongly recommended for duplicate-reply protection."},
             "content_type": {"type": "string", "enum": ["text", "image"], "default": "text"},
+            "file_followups": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {"$ref": "#/components/schemas/ChatFileFollowup"},
+                "description": "Optional encrypted download cards committed atomically after a text primary. Chat source only; reply_to_message_id is required. The order in this array is the display order below the primary reply.",
+            },
             "turn_failure_error_class": {
                 "type": "string",
                 "maxLength": 64,
@@ -1439,6 +1563,7 @@ PRECISE_JSON_BODIES: dict[Operation, str] = {
     ("post", "/v1/account/recover/verify"): "RecoverVerifyRequest",
     ("post", "/v1/account/reset"): "AccountResetRequest",
     ("post", "/v1/model_api/chat/send"): "HostedChatSendRequest",
+    ("post", "/v1/model_api/models"): "ModelApiModelsRequest",
     ("post", "/v1/model_api/runtime_error"): "ModelApiRuntimeErrorRequest",
     ("post", "/v1/chat/message"): "ChatTransportRequest",
     ("post", "/v1/chat/response"): "ChatResponseRequest",
@@ -1521,9 +1646,10 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("get", "/v1/onboarding/validate"): "Return ordered onboarding checks. Resident routes include a decrypt_source step between resident_consumer and live_loop, with status, checked_at_epoch, reason, policy, and remediation fields.",
     ("get", "/v1/chat/poll"): "Long-poll and optionally claim resident chat work. Official residents report their running commit and may report an intentionally skipped compatible backend target with X-Feedling-Consumer-Compat-Commit. They also report decrypt-source status and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At.",
     ("post", "/v1/chat/message"): "Store a user chat message as a v1 ciphertext envelope; the server never decrypts it. If the envelope carries a content_pk_fpr label that does not match the user's currently registered content key, the write is rejected with 409 content_pk_fpr_mismatch (re-fetch whoami and re-seal); unlabeled envelopes are accepted for compatibility.",
-    ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope). Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
+    ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope and encrypted file_followups). A text primary and its file cards commit as one ordered transaction. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/chat/verify_loop"): "Insert a hidden liveness ping and wait for its exact hidden reply (source=verify_ping and reply_to_message_id equal to this ping). loop_alive reports whether the reply arrived; passing additionally requires resident decrypt health to satisfy the onboarding policy before sticky live-loop verification is recorded.",
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
+    ("post", "/v1/model_api/models"): "列出某 provider 在该凭据下可见的模型清单（实时拉取，非 io 兼容性保证）。unsupported / partial 时客户端退回手填。",
     ("post", "/v1/model_api/runtime_error"): "Record or clear the resident runtime's latest provider error. provider_result=success refreshes provider health immediately; provider_result=failure applies error_class to the provider-health policy.",
     ("get", "/v1/model_api/usage"): (
         "Query the caller's active model_api provider for balance/usage, live on every call — "
@@ -1541,6 +1667,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/memory/actions"): "Apply up to 20 memory actions in order. The batch is not transactional and Idempotency-Key is not supported.",
     ("post", "/v1/perception/report"): "Submit device context. Sensitive signals must use encrypted envelopes; inspect each results entry even when HTTP status is 200.",
     ("get", "/v1/perception/app_open"): "Legacy iOS Shortcut compatibility endpoint. This GET records an event and therefore has side effects.",
+    ("get", "/v1/perception/app_close"): "iOS Shortcut compatibility endpoint for the automation's \"is closed\" trigger. This GET records an event and therefore has side effects.",
     ("post", "/v1/users/register"): "Create a Feedling user and issue its first API key. The key is returned once and this operation is not idempotent.",
     ("post", "/v1/access/claim-token"): "Consume a one-time link token and issue an additional API key. Existing keys remain active.",
     ("post", "/v1/account/recover/verify"): "Verify keypair possession and issue an additional API key for the existing account. Existing keys remain active.",
@@ -1702,6 +1829,12 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
         "202": {
             "description": "Turn accepted for asynchronous processing.",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HostedChatAcceptedResponse"}}},
+        }
+    },
+    ("post", "/v1/model_api/models"): {
+        "200": {
+            "description": "The account's visible model catalog for this provider.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ModelApiModelsResponse"}}},
         }
     },
     ("post", "/v1/notify-relay/register"): {

@@ -169,6 +169,8 @@ jobs:
             tests/test_runtime_v2_default_flag.py \
             tests/test_capture_prompt_v1.py \
             tests/test_dream_prompt_v1.py \
+            tests/test_card_text_gate.py \
+            tests/test_card_user_referent.py \
             tests/test_pi_mcp_bridge.py \
             -v
 
@@ -214,6 +216,7 @@ jobs:
             tests/test_user_mcp_routes.py \
             tests/test_v2_prompt_cache_key.py \
             tests/test_v2_prompt_frontier.py \
+            tests/test_v2_adaptive_tail.py \
             tests/test_v2_metrics_endpoint.py \
             tests/test_prod_runner_fleet_gate.py \
             tests/test_v2_turn_metrics.py \
@@ -234,9 +237,15 @@ jobs:
             tests/test_v2_tool_loop_mcp.py \
             tests/test_v2_worker_mcp.py \
             tests/test_v2_worker_tool_loop.py \
+            tests/test_v2_wake_worker.py \
+            tests/test_v2_wake_schedule.py \
+            tests/test_v2_scheduled_due.py \
             tests/test_v2_atomic_reply_cursor.py \
             tests/test_v2_effect_outbox.py \
             tests/test_v2_watchdog.py \
+            tests/test_v2_extraction.py \
+            tests/test_v2_extraction_lanes.py \
+            tests/test_v2_extraction_memory_integration.py \
             -v
 
   # -------------------------------------------------------------------------
@@ -1026,6 +1035,11 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.PROD_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
+          # Break-glass trajectory inspection (audited runner-local CLI inside
+          # serve-worker). Default '0'; set the repo var to '1' only for the
+          # duration of an incident, then back. Encrypted env — flipping it
+          # needs a redeploy but NOT a new compose_hash / on-chain publish.
+          FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED: ${{ vars.PROD_FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED || '0' }}
           # gunicorn worker counts (compose reads them; empty → compose default
           # 4/backend, 2/enclave). Encrypted env, NOT baked into compose_hash —
           # flip via repo var without on-chain re-auth. Gate: the deployed image
@@ -1068,6 +1082,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
+            -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             -e "FEEDLING_ENCLAVE_WORKERS=$FEEDLING_ENCLAVE_WORKERS" \
             -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
@@ -1256,6 +1271,11 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.TEST_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
+          # Break-glass trajectory inspection (audited runner-local CLI inside
+          # serve-worker). Default '0'; set the repo var to '1' only for the
+          # duration of an incident, then back. Encrypted env — flipping it
+          # needs a redeploy but NOT a new compose_hash / on-chain publish.
+          FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED: ${{ vars.TEST_FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED || '0' }}
           # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
           # Encrypted env channel, NOT baked into compose_hash — flip without
           # on-chain re-auth. Gate: the deployed image must contain the leader-
@@ -1296,6 +1316,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
+            -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
             -e "FEEDLING_V2_DEPLOYED_BUILD=${GITHUB_SHA:0:7}"
@@ -1603,6 +1624,11 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.PRE_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
+          # Break-glass trajectory inspection (audited runner-local CLI inside
+          # serve-worker). Default '0'; set the repo var to '1' only for the
+          # duration of an incident, then back. Encrypted env — flipping it
+          # needs a redeploy but NOT a new compose_hash / on-chain publish.
+          FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED: ${{ vars.PRE_FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED || '0' }}
           # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
           # Encrypted env channel, NOT baked into compose_hash — flip without
           # on-chain re-auth. Gate: the deployed image must contain the leader-
@@ -1640,6 +1666,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
+            -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             -e "FEEDLING_V2_RUNNER_CVM_ID=$CVM_ID" \
             -e "FEEDLING_V2_DEPLOYED_BUILD=${GITHUB_SHA:0:7}" \

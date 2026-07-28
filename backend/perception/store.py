@@ -367,9 +367,19 @@ def read_decrypt_failures(user_id: str, limit: int = 50) -> list[dict]:
     return log_read(user_id, DECRYPT_FAILURE_STREAM, limit=limit)
 
 
-# App-usage time series (one append per app-open from the iOS Shortcut endpoint).
+# App-usage time series, one stream per event kind. The `stream` column IS the
+# flat event dimension (both logs_stream_seq_idx and logs_stream_ts_idx are
+# keyed on (user_id, stream, …)), so open/close need neither a doc field nor a
+# schema change, and every old row stays valid as-is.
+#
+# NOTE: "app_usage" holds app *OPEN* events only — the name predates the close
+# stream and is kept to avoid migrating old rows. It is also UNRELATED to the
+# `app_usage` in admin/data_track.py, which is IO's own foreground time derived
+# from the tracking_events stream.
 APP_USAGE_STREAM = "app_usage"
 APP_USAGE_MAX = int(os.environ.get("FEEDLING_APP_USAGE_MAX", 2000))
+APP_CLOSE_STREAM = "app_close"
+APP_CLOSE_MAX = int(os.environ.get("FEEDLING_APP_CLOSE_MAX", 2000))
 
 
 def append_app_open(user_id: str, doc: dict, ts: float) -> None:
@@ -379,6 +389,15 @@ def append_app_open(user_id: str, doc: dict, ts: float) -> None:
 
 def read_app_opens(user_id: str, limit: int = 100, since_epoch: float = 0.0) -> list[dict]:
     return log_read(user_id, APP_USAGE_STREAM, limit=limit, since_epoch=since_epoch)
+
+
+def append_app_close(user_id: str, doc: dict, ts: float) -> None:
+    log_append(user_id, APP_CLOSE_STREAM, doc, ts=ts)
+    log_trim(user_id, APP_CLOSE_STREAM, APP_CLOSE_MAX)
+
+
+def read_app_closes(user_id: str, limit: int = 100, since_epoch: float = 0.0) -> list[dict]:
+    return log_read(user_id, APP_CLOSE_STREAM, limit=limit, since_epoch=since_epoch)
 
 
 # ---------------------------------------------------------------------------

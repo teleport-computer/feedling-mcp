@@ -87,7 +87,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:0ca5bf9
+    image: ghcr.io/teleport-computer/feedling:fbce70e
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -146,7 +146,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:0ca5bf9
+    image: ghcr.io/teleport-computer/feedling:fbce70e
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -308,7 +308,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:0ca5bf9
+    image: ghcr.io/teleport-computer/feedling:fbce70e
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -333,6 +333,30 @@ services:
       # Default ON — a rollback lever, not a feature gate. Set to "0" to fall back
       # to the plain tag-strip; takes effect on the next serve-worker restart.
       FEEDLING_WEB_EXTRACT_ARTICLE: "${FEEDLING_WEB_EXTRACT_ARTICLE:-1}"
+      # Break-glass trajectory inspection (audited, runner-local CLI — never an
+      # HTTP route). Default OFF: enabling it lets an operator inside this
+      # container decrypt one user's one job. Turn it on via encrypted env for
+      # the duration of an incident and back to "0" afterwards — the ${VAR:-}
+      # form means neither flip needs a new compose_hash / on-chain publish.
+      FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED: "${FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED:-0}"
+      # Prompt catch-up compaction budgets. Declared here (rather than left to
+      # the code defaults) so a stuck summary frontier can be unwedged by
+      # shrinking the batch from an encrypted env instead of shipping a build:
+      # a batch is folded all-or-nothing, so a batch whose summary the model
+      # cannot render as valid bullets never advances the watermark and blocks
+      # every later message for that user (usr_7f30..., 2026-07-24 -> 07-27).
+      # Values below are the code defaults — this is wiring, not a change.
+      FEEDLING_V2_COMPACTION_BATCH_MSGS: "${FEEDLING_V2_COMPACTION_BATCH_MSGS:-200}"
+      FEEDLING_V2_COMPACTION_BATCH_CHARS: "${FEEDLING_V2_COMPACTION_BATCH_CHARS:-120000}"
+      FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: "${FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC:-600}"
+      FEEDLING_V2_TAIL_BUDGET_MSGS: "${FEEDLING_V2_TAIL_BUDGET_MSGS:-20}"
+      # Head-of-line escape hatch: after shrinking the batch all the way to a
+      # single message the catch-up still cannot fold it, cover that ONE row
+      # with a deterministic stand-in segment and advance past it. Losing
+      # summary coverage of one row beats blocking every later message for
+      # that user indefinitely; `chat_messages` still holds the transcript.
+      # "0" restores the strict fail-closed behaviour (turn fails instead).
+      FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED: "${FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED:-1}"
       FEEDLING_HOSTED_RUNTIME_POLICY: "dual"
       FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
     depends_on:

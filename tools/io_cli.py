@@ -27,6 +27,7 @@ import base64
 import json
 import hashlib
 import os
+from pathlib import Path
 import re
 import socket
 import ssl
@@ -702,8 +703,9 @@ def _identity_write_payload_v2(ns) -> dict | None:
 
     # relationship_days:重新校准"和用户认识/相处多少天"。days_with_user 是服务端从
     # 关系起始锚点现算的派生值,不是普通字符串字段,所以单独处理:塞进同一个
-    # profile_patch,服务端把锚点挪到 today - N(见
-    # backend/identity/actions.py::_resolve_relationship_anchor)。报错前置:非负整数,
+    # profile_patch。relationship_days 是用户看到的 1-based「第 N 天」,服务端把锚点挪到
+    # today - (N-1)(第1天=今天认识;见 backend/identity/actions.py::_resolve_relationship_anchor)。
+    # 报错前置:非负整数,
     # 服务端 card_policy 也会拦(relationship_days_must_be_non_negative_int /
     # relationship_days_out_of_range),这里先给个清晰的本地错、不打服务端。
     rel_days = getattr(ns, "relationship_days", None)
@@ -711,7 +713,7 @@ def _identity_write_payload_v2(ns) -> dict | None:
         if rel_days < 0:
             raise _IdentityWritePrecheckError({
                 "ok": False, "error": "relationship_days_must_be_non_negative_int",
-                "hint": "相处天数必须是非负整数(0 = 今天刚认识)",
+                "hint": "相处天数必须是非负整数;传用户看到的第 N 天(第 1 天 = 今天刚认识)",
             })
         patch["relationship_days"] = rel_days
 
@@ -972,6 +974,84 @@ def _resident_ipc_request(material, *, timeout=30.0):
         "hint": "两次等待都超时,蒸馏任务可能仍在后台运行——记下 request_id,"
                 "稍后可再次确认或联系用户查看",
     }
+
+
+def _resident_ipc_call(op, payload, *, timeout=30.0):
+    """Generic resident IPC request used by foreground file staging."""
+    sock_path = _resident_ipc_sock_path()
+    request_id = str(uuid.uuid4())
+    line = (
+        json.dumps(
+            {"op": op, "request_id": request_id, **dict(payload or {})},
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+    def _attempt():
+        try:
+            raw = _resident_ipc_round_trip(sock_path, line, timeout)
+        except (FileNotFoundError, ConnectionRefusedError):
+            return {
+                "ok": False,
+                "error": "consumer_not_running",
+                "request_id": request_id,
+                "hint": f"resident consumer IPC unavailable: {sock_path}",
+            }, False
+        except socket.timeout:
+            return None, True
+        except OSError as exc:
+            return {
+                "ok": False,
+                "error": f"ipc_failed:{type(exc).__name__}:{exc}",
+                "request_id": request_id,
+            }, False
+        text = raw.decode("utf-8", errors="replace").strip()
+        if not text:
+            return None, True
+        try:
+            reply = json.loads(text.splitlines()[0])
+        except Exception:
+            return None, True
+        if isinstance(reply, dict):
+            reply.setdefault("request_id", request_id)
+            return reply, False
+        return None, True
+
+    reply, retry = _attempt()
+    if reply is not None or not retry:
+        return reply
+    reply, _retry = _attempt()
+    if reply is not None:
+        return reply
+    return {
+        "ok": False,
+        "error": "timeout_uncertain",
+        "request_id": request_id,
+        "hint": "resident consumer did not confirm the operation",
+    }
+
+
+def cmd_send_file(args):
+    """Stage one generated UTF-8 source file for this foreground chat turn."""
+    raw_path = str(args.path or "").strip()
+    if not raw_path:
+        _emit({"ok": False, "error": "path_required"}, 2)
+    source_path = Path(raw_path)
+    if not source_path.is_absolute():
+        source_path = Path(_resident_ipc_home()) / "outbound-files" / source_path
+    reply = _resident_ipc_call(
+        "stage_file",
+        {"path": str(source_path), "name": str(args.name or "").strip()},
+    )
+    if reply.get("ok"):
+        _emit({"ok": True, **{key: value for key, value in reply.items() if key != "ok"}})
+    exit_code = 2 if reply.get("error") in {
+        "consumer_not_running",
+        "no_active_chat_turn",
+        "path_outside_outbound_dir",
+    } else 1
+    _emit({"ok": False, **{key: value for key, value in reply.items() if key != "ok"}}, exit_code)
 
 
 def cmd_identity_redistill(args):
@@ -1440,6 +1520,21 @@ def main():
     ci.add_argument("--limit", type=int, default=20, help="how many recent messages to search for the id")
     ci.set_defaults(func=cmd_chat_image)
 
+    sf = sub.add_parser(
+        "send-file",
+        help="Stage a generated document for download in the current chat reply.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Write UTF-8 Markdown-like source under $FEEDLING_HOME/outbound-files, "
+            "then pass its path here. --name is the user-visible output name; "
+            "Word (.docx) and PDF (.pdf) are rendered from the UTF-8 source.\n"
+            f"{D3_SOURCING_RULE}"
+        ),
+    )
+    sf.add_argument("--path", required=True, help="UTF-8 source path inside the outbound-files directory")
+    sf.add_argument("--name", required=True, help="download filename with the requested suffix")
+    sf.set_defaults(func=cmd_send_file)
+
     sw = sub.add_parser("schedule-wake", help="Ask to be woken at a later time (native self-wake).")
     sw.add_argument("--at", required=True, help="When to wake: ISO time (e.g. 2026-06-29T18:00) or a relative spec.")
     sw.add_argument("--tz", default="", help="IANA timezone (optional; defaults to the user's).")
@@ -1470,7 +1565,9 @@ def main():
             "  相处天数: --relationship-days N 重新校准显示的相处天数。N 是【用户看到/说出的\n"
             "    那个数】——app 里的\"第 N 天\"(认识当天=第 1 天,不是第 0 天)。用户说\"改成\n"
             "    第45天/相处45天\"就传 45,app 就显示 45。服务端内部存 elapsed(=N-1)、iOS 显示\n"
-            "    时 +1,你只管传用户说的数。仅用户明确要求时改;超上限服务端拦下。\n"
+            "    时 +1,你只管传用户说的数。天数虽自动按锚点每天递增,但这条命令就是校准它的\n"
+            "    正路——别告诉用户\"自动算的、我改不了\",也别只往别的字段写文字假装改了。\n"
+            "    仅用户明确要求时改;超上限服务端拦下。\n"
             "  list 三操作: 每个 list 字段(signature/boundary/do-not-say/\n"
             "    stable-definition)一次调用只能用一种操作——legacy 整体赋值(仅\n"
             "    --signature 保留)/ --add-* / --remove-* / --replace-* 四选一,混用报错。\n"

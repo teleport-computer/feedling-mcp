@@ -32,6 +32,27 @@ def test_turn_metrics_persist_provider_http_retries(monkeypatch) -> None:
     assert captured["kwargs"]["retries"] == 1002
 
 
+def test_turn_metrics_keep_worst_adaptive_tail_outcome(monkeypatch) -> None:
+    captured: dict = {}
+    monkeypatch.setattr(
+        jobs_store,
+        "record_whole_turn_metric",
+        lambda *args, **kwargs: captured.update(args=args, kwargs=kwargs),
+    )
+    tm = worker.TurnMetrics(job_id=124, user_id="u", lane="chat")
+
+    tm.record_tail_window(effective_turns=40, fallback=False)
+    tm.record_tail_window(effective_turns=24, fallback=True)
+    tm.record_tail_window(effective_turns=32, fallback=False)
+    tm.record_prompt_frontier_exhaustion()
+    tm.record_prompt_frontier_exhaustion()
+    tm.flush(failed=True, status="provider_error")
+
+    assert captured["kwargs"]["effective_tail_turns"] == 24
+    assert captured["kwargs"]["tail_fallback"] is True
+    assert captured["kwargs"]["prompt_frontier_exhaustion_count"] == 2
+
+
 def test_cache_turn_details_select_persisted_retry_count(monkeypatch) -> None:
     captured: dict = {}
 

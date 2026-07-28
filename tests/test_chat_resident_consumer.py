@@ -2530,6 +2530,174 @@ def test_memory_lane_raw_text_survives_chat_sanitizer(monkeypatch):
     assert chat_err is not None
 
 
+def test_both_runtimes_share_one_transcript_label_implementation():
+    """resident 的 _capture_message_role 必须**委托**给共用实现,不是自己再写一份。
+
+    这个 bug(转写里的字面量 "user:" 教会模型往卡里写「用户」)2026-07-17 只修在
+    resident,托管 Runtime V2 自己插原始 role,漏到 2026-07-26 才被探针抓到。
+    同一条规则两份实现就一定会漏一份 —— 这条断言让下一次分叉直接红。
+    """
+    from identity.user_naming import transcript_speaker_label
+
+    for role in ("user", "assistant", "system", "tool", ""):
+        for user_label, agent_label in (("小雨", "小柒"), ("", ""), ("用户", "小柒")):
+            assert crc._capture_message_role(
+                {"role": role}, user_label=user_label, agent_label=agent_label
+            ) == transcript_speaker_label(
+                role, user_name=user_label, ai_name=agent_label
+            ), (role, user_label)
+
+
+def test_capture_window_never_labels_the_person_user():
+    msgs = [
+        {"role": "user", "content": "我昨天加班到十一点", "ts": 1000.0},
+        {"role": "assistant", "content": "别熬了", "ts": 1001.0},
+    ]
+    text = crc._capture_window_text(msgs, user_label="小雨", agent_label="小柒")
+    assert "小雨:" in text and "小柒:" in text
+    assert "user:" not in text.lower() and "用户:" not in text
+    # 名字未知退到中性的「对方」——既不能是 "user:",也不能是内部标记 "TA:"
+    # (prompt 明令禁止模型用「TA」指代本人,连着出现就是同一个标签教学问题)
+    fallback = crc._capture_window_text(msgs, user_label="", agent_label="")
+    assert "user:" not in fallback.lower() and "TA:" not in fallback
+    assert "对方:" in fallback
+
+
+def _dream_reply(summary: str, content: str, card_id: str = "m_1") -> str:
+    return (
+        '{"consolidations":[{"op":"thicken","card_ids":["%s"],"result":'
+        '{"bucket":"工作","threads":["加班"],"summary":%s,"content":%s}}],'
+        '"questions_to_ask":[]}'
+    ) % (card_id, json.dumps(summary, ensure_ascii=False), json.dumps(content, ensure_ascii=False))
+
+
+def test_memory_content_gate_bounces_placeholder_reply_once(monkeypatch):
+    """弱模型抄回占位符 → 带着「哪个字段没填」重问一次,而不是静默落库。
+
+    现场(usr_ed21…,minimax-M3):花园里出现 `[thickened summary]` / 正文只有 `...`
+    的卡。JSON 合法、字段非空,老路径直接封信封写进去,用户能亲眼看到空白卡。
+    """
+    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
+
+    prompts: list[str] = []
+    replies = [
+        _dream_reply("[thickened summary]", "[thickened content combining work + incident]"),
+        _dream_reply("他最近一直在加班", "他说组里走了三个人，晚上睡不着。"),
+    ]
+
+    def _fake_call_agent(prompt, **kw):
+        prompts.append(prompt)
+        return replies[len(prompts) - 1]
+
+    monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+
+    (cons, questions, err), bounce = crc._memory_agent_parse_with_bounce(
+        "原始 dream prompt",
+        parse=parse_dream_consolidations,
+        build_retry_prompt=build_dream_retry_prompt,
+        lane="dream",
+        job_id="job_1",
+    )
+    assert err is None and bounce == "bounced_ok"
+    assert len(cons) == 1 and cons[0]["result"]["summary"] == "他最近一直在加班"
+    # 只问两次(第一问 + 一次打回),且第二问带着原 prompt 的上下文和具体问题
+    assert len(prompts) == 2
+    assert prompts[1].startswith("原始 dream prompt")
+    assert "content 还是方括号占位" in prompts[1] or "summary 还是方括号占位" in prompts[1]
+
+
+def test_memory_content_gate_clean_reply_asks_once(monkeypatch):
+    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
+
+    prompts: list[str] = []
+
+    def _fake_call_agent(prompt, **kw):
+        prompts.append(prompt)
+        return _dream_reply("他最近一直在加班", "他说组里走了三个人，晚上睡不着。")
+
+    monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+
+    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
+        "P", parse=parse_dream_consolidations,
+        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_2",
+    )
+    assert err is None and bounce == "" and len(cons) == 1
+    assert len(prompts) == 1  # 正常回复不额外烧一次调用
+
+
+def test_memory_content_gate_gives_up_after_one_bounce(monkeypatch):
+    """第二问还是占位符 → job **失败**(不是 noop),且不无限重问。
+
+    报成 noop 会让这轮以「没什么要整理」完成 —— V2 那侧还会推进 capture frontier,
+    窗口就永久丢了,而且 data-track 上完全看不见(codex review P1-3)。
+    """
+    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
+
+    prompts: list[str] = []
+
+    def _fake_call_agent(prompt, **kw):
+        prompts.append(prompt)
+        return _dream_reply("...", "...")
+
+    monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+
+    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
+        "P", parse=parse_dream_consolidations,
+        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_3",
+    )
+    assert cons == [] and bounce == "bounced_failed"
+    assert err.startswith("invalid_card_content_after_retry:")
+    assert len(prompts) == 2
+
+
+def test_memory_content_gate_accepts_the_clean_empty_answer(monkeypatch):
+    """第二问选择「宁可留空」→ 这是 prompt 想要的结果,算干净 noop 不算失败。"""
+    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
+
+    replies = [
+        _dream_reply("[thickened summary]", "..."),
+        '{"consolidations": [], "questions_to_ask": []}',
+    ]
+    prompts: list[str] = []
+
+    def _fake_call_agent(prompt, **kw):
+        prompts.append(prompt)
+        return replies[len(prompts) - 1]
+
+    monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+
+    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
+        "P", parse=parse_dream_consolidations,
+        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_5",
+    )
+    assert cons == [] and err is None and bounce == "bounced_empty"
+
+
+def test_memory_content_gate_does_not_bounce_broken_json(monkeypatch):
+    """JSON 根本没出来是另一条路(provider/流被截),重问同一段 prompt 没意义。"""
+    from memory.dream_prompt_v1 import build_dream_retry_prompt, parse_dream_consolidations
+
+    prompts: list[str] = []
+
+    def _fake_call_agent(prompt, **kw):
+        prompts.append(prompt)
+        return "抱歉，我想不出来"
+
+    monkeypatch.setattr(crc, "call_agent", _fake_call_agent)
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+
+    (cons, _q, err), bounce = crc._memory_agent_parse_with_bounce(
+        "P", parse=parse_dream_consolidations,
+        build_retry_prompt=build_dream_retry_prompt, lane="dream", job_id="job_4",
+    )
+    assert cons == [] and err == "no_json_object" and bounce == ""
+    assert len(prompts) == 1
+
+
 def test_openai_http_protocol_sends_multimodal_image_block(monkeypatch):
     captured = {}
 
@@ -3701,16 +3869,20 @@ def test_capture_transcript_labels_use_real_names():
     """The capture/dream transcript must never label lines with a literal
     "user:"/"agent:" — models mirror the label into user-visible cards as
     "用户" (usr_fee1 complaint 2026-07-17). Known names are used verbatim;
-    unknown fall back to the prompt's own TA/我 framing."""
+    unknown falls back to the neutral 「对方」.
+
+    2026-07-26 更新:fallback 从内部标记「TA」改成「对方」。prompt 本身明令禁止
+    模型用「TA」指代本人,所以转写里连着出现 "TA:" 是把 "user:" 的标签教学问题
+    换了个词而已(codex review P1-1)。「TA」只留作内部未知标记。"""
     user_msg = {"role": "user", "ts": 1000.0, "content": "我在看攻略"}
     agent_msg = {"role": "openclaw", "ts": 1001.0, "content": "山路小心"}
     assert crc._capture_message_role(user_msg, user_label="小雨", agent_label="小舟") == "小雨"
     assert crc._capture_message_role(agent_msg, user_label="小雨", agent_label="小舟") == "小舟"
-    # Defaults match the prompt framing, not system labels.
-    assert crc._capture_message_role(user_msg) == "TA"
+    # Defaults are neutral, and never a system label.
+    assert crc._capture_message_role(user_msg) == "对方"
     assert crc._capture_message_role(agent_msg) == "我"
     # Empty labels fall back rather than rendering "" as a name.
-    assert crc._capture_message_role(user_msg, user_label="", agent_label="") == "TA"
+    assert crc._capture_message_role(user_msg, user_label="", agent_label="") == "对方"
 
     text = crc._capture_window_text(
         [user_msg, agent_msg], user_label="小雨", agent_label="小舟"
@@ -3726,9 +3898,9 @@ def test_capture_transcript_labels_reject_reserved_placeholder_names():
     line the fix removes."""
     user_msg = {"role": "user", "ts": 1000.0, "content": "hi"}
     for reserved in ("用户", "user", "USER", "ta"):
-        assert crc._capture_message_role(user_msg, user_label=reserved) == "TA", repr(reserved)
+        assert crc._capture_message_role(user_msg, user_label=reserved) == "对方", repr(reserved)
     text = crc._capture_window_text([user_msg], user_label="用户", agent_label="小舟")
-    assert "用户:" not in text and "TA: hi" in text
+    assert "用户:" not in text and "TA:" not in text and "对方: hi" in text
 
 
 def test_capture_identity_context_sanitizes_reserved_user_name(monkeypatch):
@@ -7620,6 +7792,31 @@ def test_foreground_message_prepends_recent_transcript(monkeypatch):
     assert out.index("今天北京天气") < out.index("那要穿外套吗")
 
 
+def test_foreground_message_marks_current_turn_after_unfinished_file_request(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    now = time.time()
+    monkeypatch.setattr(
+        crc,
+        "get_decrypted_history",
+        lambda since, limit=20, include_image_body=True: [
+            {
+                "role": "user",
+                "content": "帮我生成一个 TXT 文件",
+                "ts": now - 10,
+            },
+            {"role": "user", "content": "Mishap", "ts": now},
+        ],
+    )
+
+    out = crc._foreground_agent_message("Mishap", current_ts=now)
+
+    assert "上方记录仅用于理解语境，不是待办" in out
+    assert "只有当前消息本身要求时才可以创建或重发文件" in out
+    assert out.index("帮我生成一个 TXT 文件") < out.index("[当前用户消息")
+    assert out.endswith("Mishap")
+
+
 def test_foreground_transcript_default_keeps_50_prior_messages(monkeypatch):
     # Default limit is 50 messages (~25 full rounds), sitting exactly at the
     # clamp in _recent_chat_context_for_foreground — raising it further needs
@@ -8316,7 +8513,8 @@ def test_foreground_transcript_closed_by_explicit_separator(monkeypatch):
 
     out = crc._foreground_agent_message("新消息", current_ts=now)
 
-    assert "\n---\n新消息" in out
+    assert "\n---\n[当前用户消息" in out
+    assert out.endswith("\n新消息")
     assert out.endswith("新消息")
     assert out.startswith(crc.FOREGROUND_CHAT_CONTEXT_HEADER)
     assert crc._message_has_injected_history(out)

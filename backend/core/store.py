@@ -413,7 +413,8 @@ class UserStore:
         "file". Used by clients/enclave to render the decrypted bytes
         correctly — the envelope itself only carries opaque bytes; the type
         tag tells the renderer to show a string, decode JPEG, or offer a
-        file download (with `file_name`/`file_mime` extras, see below).
+        file download (with `file_name`/`file_mime`/`file_byte_count` extras,
+        see below).
         """
         msg_id = envelope.get("id") if isinstance(envelope.get("id"), str) and envelope["id"] else uuid.uuid4().hex
         ct = content_type if content_type in ("text", "image", "file") else "text"
@@ -490,6 +491,7 @@ class UserStore:
                 "image_mime",
                 "file_name",
                 "file_mime",
+                "file_byte_count",
                 # Optional client operation UUID. Plaintext routing metadata
                 # only: it identifies a logical send retry but carries no
                 # message content and is not part of the E2EE envelope.
@@ -531,12 +533,15 @@ class UserStore:
                 "turn_failure_error_class",
                 "turn_failure_blame",
                 "turn_failure_user_text",
+                "terminal_failure_job_id",
                 "reply_to_message_id",
             ):
                 value = extra.get(key)
                 if isinstance(value, str) and value.strip():
                     msg[key] = value.strip()
                 elif isinstance(value, bool):
+                    msg[key] = value
+                elif key == "file_byte_count" and isinstance(value, int) and value > 0:
                     msg[key] = value
         return msg
 
@@ -565,7 +570,8 @@ class UserStore:
         "file". Used by clients/enclave to render the decrypted bytes
         correctly — the envelope itself only carries opaque bytes; the type
         tag tells the renderer to show a string, decode JPEG, or offer a
-        file download (with `file_name`/`file_mime` extras, see below).
+        file download (with `file_name`/`file_mime`/`file_byte_count` extras,
+        see below).
 
         `enqueue` (v2 send path only, requires `strict=True`): when provided,
         the message INSERT and its V2 job enqueue/coalesce happen in ONE DB
@@ -667,6 +673,7 @@ class UserStore:
                 "image_mime",
                 "file_name",
                 "file_mime",
+                "file_byte_count",
                 # Optional client operation UUID. Plaintext routing metadata
                 # only: it identifies a logical send retry but carries no
                 # message content and is not part of the E2EE envelope.
@@ -703,11 +710,20 @@ class UserStore:
                 "replied_by",
                 "replied_at",
                 "resident_delivery_id",
+                # Turn-failure metadata carried by a visible fallback reply.
+                # Keep this subset aligned with `_build_chat_message`, which
+                # the transactional V2 sink uses.
+                "turn_failure_error_class",
+                "turn_failure_blame",
+                "turn_failure_user_text",
+                "terminal_failure_job_id",
             ):
                 value = extra.get(key)
                 if isinstance(value, str) and value.strip():
                     msg[key] = value.strip()
                 elif isinstance(value, bool):
+                    msg[key] = value
+                elif key == "file_byte_count" and isinstance(value, int) and value > 0:
                     msg[key] = value
         if resident_reply_to is not None:
             msg["reply_to_message_id"] = str(resident_reply_to)
@@ -901,6 +917,60 @@ class UserStore:
         )
         return parent_doc, cached_reply
 
+    def finalize_chat_reply_sequence_once(
+        self,
+        parent_msg_id: str,
+        candidates: list[dict],
+        replied_fields: dict,
+    ) -> tuple[dict, list[dict]] | None:
+        """Persist one primary reply plus ordered file cards atomically."""
+        finalized = db.chat_finalize_reply_sequence_once(
+            self.user_id,
+            parent_msg_id,
+            [
+                (
+                    str(candidate.get("id") or ""),
+                    float(candidate.get("ts") or 0),
+                    candidate,
+                )
+                for candidate in candidates
+            ],
+            replied_fields,
+        )
+        if finalized is None:
+            return None
+        parent_doc, reply_docs = finalized
+        for reply_doc in reply_docs:
+            db.chat_finalize_reply_post_commit(
+                self.user_id, reply_doc, MAX_CHAT_MESSAGES
+            )
+
+        cached_docs = [dict(reply_doc) for reply_doc in reply_docs]
+        with self.chat_lock:
+            for index, existing in enumerate(self.chat_messages):
+                if str(existing.get("id") or "") == parent_msg_id:
+                    self.chat_messages[index] = dict(parent_doc)
+                    break
+            for cached in cached_docs:
+                for index, existing in enumerate(self.chat_messages):
+                    if str(existing.get("id") or "") == str(cached.get("id") or ""):
+                        self.chat_messages[index] = cached
+                        break
+                else:
+                    self.chat_messages.append(cached)
+            if len(self.chat_messages) > MAX_CHAT_MESSAGES:
+                self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
+
+        wake_bus.notify("chat", self.user_id)
+        try:
+            from proactive import capture_scheduler
+
+            for cached in cached_docs:
+                capture_scheduler.record_chat_append(self, cached)
+        except Exception as e:
+            print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
+        return parent_doc, cached_docs
+
     def append_chat_idempotent(
         self,
         role: str,
@@ -1050,6 +1120,8 @@ class UserStore:
     def load_proactive_settings(self) -> dict:
         default = {
             "version": 2,
+            # Heartbeat-only switch, shown as "心跳" / "Heartbeat" in the app.
+            # `enabled` is its historical alias, not a proactive master switch.
             "enabled": True,
             "dnd": False,
             "scheduled": True,

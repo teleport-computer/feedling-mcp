@@ -126,10 +126,11 @@ def _reply_effect_dispatch(user_id):
 
     def dispatch(effect_type, payload):
         if effect_type == "reply":
+            extra = worker._reply_effect_extra(payload)
             worker._write_encrypted_reply(
                 core_store.get_store(user_id),
                 str(payload.get("text") or ""),
-                extra=worker._thinking_extra(payload.get("thinking")),
+                **({"extra": extra} if extra else {}),
             )
 
     return dispatch
@@ -145,7 +146,7 @@ def _script_provider(monkeypatch, responses):
     it = iter(responses)
     calls = []
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         calls.append({"messages": messages, "tools": tools})
         return next(it)
 
@@ -311,6 +312,79 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert row[1] is False  # not failed
     assert row[2] == "ok"
     assert _job_status_row(job_id)[0] == "completed"
+
+
+def test_degenerate_terminal_reply_becomes_attributed_fallback(monkeypatch):
+    uid = "u_toolloop_degenerate_fallback"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-degenerate")
+    _patch_real_write(monkeypatch)
+    persisted_extra = {}
+    real_write = worker._write_encrypted_reply
+
+    def _capture_write(store, text, *, extra=None):
+        persisted_extra.update(extra or {})
+        return real_write(store, text, extra=extra)
+
+    monkeypatch.setattr(worker, "_write_encrypted_reply", _capture_write)
+    _script_provider(monkeypatch, [_text_round("。")])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "晚安呀"}]
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    bubbles = _bubbles(uid)
+    assert len(bubbles) == 1
+    assert bubbles[0]["body_ct"] == worker._DEGENERATE_REPLY_FALLBACK
+    assert persisted_extra["turn_failure_error_class"] == "upstream_unavailable"
+    assert bubbles[0]["turn_failure_error_class"] == "upstream_unavailable"
+    assert bubbles[0]["turn_failure_blame"] == "provider_transient"
+    assert "模型服务暂时不可用" in bubbles[0]["turn_failure_user_text"]
+    assert _job_status_row(job_id)[0] == "completed"
+
+
+def test_degenerate_intermediate_is_dropped_before_real_final_reply(monkeypatch):
+    uid = "u_toolloop_degenerate_intermediate"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-degenerate-mixed")
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda action_type, store, **kwargs: _FakeCapResult({"snippet": "result"}),
+    )
+    _patch_real_write(monkeypatch)
+    _script_provider(
+        monkeypatch,
+        [
+            _tool_round(
+                _tc("r1", "reply", text="."),
+                _tc("s1", "web_search", query="x"),
+            ),
+            _text_round("在的，怎么了"),
+        ],
+    )
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}]
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert [bubble["body_ct"] for bubble in _bubbles(uid)] == ["在的，怎么了"]
 
 
 def _stub_envelope_build(monkeypatch):
@@ -597,7 +671,7 @@ def test_chat_native_task_runs_child_then_returns_result_to_parent(
     )
     calls = []
 
-    async def provider(config, messages, *, tools=None):
+    async def provider(config, messages, *, tools=None, **_kwargs):
         calls.append(
             {
                 "config": config,
@@ -688,7 +762,7 @@ def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
     deps = _late_input_deps(uid, written)
     calls = []
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **_kwargs):
         calls.append(list(messages))
         if len(calls) == 1:
             # This is the production send invariant: B and the running job's
@@ -746,7 +820,7 @@ def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
     )
 
 
-def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
+def test_new_turn_after_intermediate_failure_starts_after_failure_cursor(
     monkeypatch,
 ):
     """An assistant-only prompt snapshot advance cannot poison the final fence.
@@ -869,7 +943,7 @@ def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
     first_attempt_calls = 0
     retry_messages = []
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **_kwargs):
         nonlocal first_attempt_calls
         if phase == "crash":
             first_attempt_calls += 1
@@ -893,20 +967,29 @@ def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
         )
     )
     assert first_status == "failed"
-    assert v2_cursor.load_seq(core_store.get_store(uid)) == 0
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == user_seq
     with db.get_pool().connection() as conn:
-        intermediate_seq = conn.execute(
+        assistant_rows = conn.execute(
             "SELECT MAX(seq) FROM chat_messages "
             "WHERE user_id=%s AND doc->>'role'='openclaw'",
             (uid,),
         ).fetchone()[0]
-    assert int(intermediate_seq) > user_seq
+        failure_rows = conn.execute(
+            "SELECT COUNT(*) FROM chat_messages "
+            "WHERE user_id=%s AND COALESCE(doc->>'terminal_failure_job_id','')=%s",
+            (uid, str(first_job_id)),
+        ).fetchone()[0]
+    assert int(assistant_rows) > user_seq
+    assert failure_rows == 1
 
     phase = "retry"
-    retry_job_id, _ = jobs_store.enqueue_job(
+    new_user_seq, retry_job_id = db.chat_append_and_enqueue(
         uid,
+        "user-after-failure",
+        20.0,
+        _user_doc("user-after-failure", "please try once more"),
+        5000,
         "chat",
-        reason="retry_after_worker_crash",
         expected_generation=generation,
     )
     retry_job = jobs_store.claim_next_job("w-intermediate-retry")
@@ -925,7 +1008,8 @@ def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
     assert retry_status == "completed"
     assert len(retry_messages) == 1
     assert "I am still checking." in str(retry_messages[0])
-    assert v2_cursor.load_seq(core_store.get_store(uid)) == user_seq
+    assert "please try once more" in str(retry_messages[0])
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == new_user_seq
     assert _job_status_row(retry_job_id) == ("completed", None)
     with db.get_pool().connection() as conn:
         final_effect = conn.execute(
@@ -943,8 +1027,8 @@ def test_retry_after_intermediate_bubble_keeps_cursor_at_latest_user_seq(
             "WHERE user_id=%s AND doc->>'role'='openclaw'",
             (uid,),
         ).fetchone()[0]
-    assert final_effect == ("applied", "", user_seq)
-    assert int(final_seq) > int(intermediate_seq)
+    assert final_effect == ("applied", "", new_user_seq)
+    assert int(final_seq) > int(assistant_rows)
 
 
 @pytest.mark.parametrize(
@@ -1212,7 +1296,7 @@ def test_sweeper_wins_final_effect_before_producer_drain_and_loop_still_retries(
     deps.apply_pending_effects = sweep_before_producer
     calls = []
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **_kwargs):
         calls.append(list(messages))
         if len(calls) == 1:
             _seq, same_job_id = db.chat_append_and_enqueue(
@@ -1302,7 +1386,7 @@ def test_last_call_late_input_hands_off_without_reply_or_error_chip(
         cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({})
     )
 
-    async def provider(_config, _messages, *, tools=None):
+    async def provider(_config, _messages, *, tools=None, **_kwargs):
         _seq, same_job_id = db.chat_append_and_enqueue(
             uid,
             "B",
@@ -1398,7 +1482,7 @@ def test_invalid_final_fence_fails_visibly_without_reply_or_retry_loop(monkeypat
 
     deps.apply_pending_effects = corrupt_terminal_before_apply
 
-    async def provider(_config, _messages, *, tools=None):
+    async def provider(_config, _messages, *, tools=None, **_kwargs):
         return _text_round("must never be visible")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
@@ -1584,6 +1668,49 @@ def test_chat_turn_with_no_reply_produced_marks_job_failed_not_completed(monkeyp
     row = _turn_metric_row(job_id)
     assert row is not None
     assert row[1] is True  # failed=True in the metric row too
+
+
+def test_required_file_missing_with_empty_provider_text_gets_terminal_reply(
+    monkeypatch,
+):
+    uid = "u_toolloop_required_file_missing"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-required-file-missing")
+    _patch_real_write(monkeypatch)
+
+    async def direct_loop(**_kwargs):
+        return worker.v2_tool_loop.LoopOutcome(
+            final_text="",
+            rounds=2,
+            stop_reason="required_file_missing",
+            replied_intermediate=False,
+        )
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", direct_loop)
+    deps = _deps(
+        messages=[
+            {
+                "id": "m1",
+                "ts": 10.0,
+                "role": "user",
+                "content": "请生成一份 PDF 报告",
+            }
+        ]
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert [bubble["body_ct"] for bubble in _bubbles(uid)] == [
+        "这次没能生成你要求的可下载文件，请稍后再试。"
+    ]
+    assert _job_status_row(job_id)[0] == "completed"
 
 
 # --------------------------------------------------------------- web gate

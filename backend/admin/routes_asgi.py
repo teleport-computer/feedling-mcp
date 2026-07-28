@@ -24,11 +24,12 @@ import hmac
 import math
 import os
 import time
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote, urlencode
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
+import db
 from admin import admin_core
 from admin import tee_replication as admin_tee_replication
 from asgi import threadpool
@@ -197,6 +198,28 @@ async def data_track_debug(request: Request):
     return JSONResponse(payload)
 
 
+@router.get("/v1/admin/route-fence-audit")
+async def route_fence_audit(request: Request):
+    """Read-only L1 inventory; remediation intentionally remains CLI-only."""
+    _require_admin(request)
+    rows = await threadpool.run_db(
+        db.audit_resident_active_model_routes,
+        apply=False,
+    )
+    return JSONResponse(
+        {
+            "mode": "dry_run",
+            "conflicts": len(rows),
+            "rows": rows,
+            "lease_source": {
+                "table": "agent_runtime_instances",
+                "cardinality": "one row per user (user_id primary key)",
+                "live_when": "lease_owner is set and lease_expires_at >= database now()",
+            },
+        }
+    )
+
+
 @router.get("/v1/admin/data-track/users/{user_id}")
 async def data_track_user(user_id: str, request: Request):
     _require_admin(request)
@@ -212,6 +235,31 @@ async def data_track_page(request: Request):
     except admin_core.InvalidDauDay:
         return PlainTextResponse("invalid day", status_code=400)
     return HTMLResponse(html)
+
+
+@router.get("/admin/data-track/users")
+async def data_track_user_lookup(request: Request):
+    _require_admin(request)
+    raw_user_id = request.query_params.get("uid", "")
+    try:
+        user_id = admin_core.normalize_data_track_user_id(raw_user_id)
+    except admin_core.InvalidDataTrackUserId:
+        body = await threadpool.run_db(
+            admin_core.invalid_user_id_page,
+            request.url.query,
+            raw_user_id,
+        )
+        return HTMLResponse(body, status_code=400)
+
+    passthrough = []
+    for name in ("admin_key", "days", "events_limit"):
+        value = str(request.query_params.get(name, "") or "").strip()
+        if value:
+            passthrough.append((name, value))
+    target = f"/admin/data-track/users/{quote(user_id, safe='')}"
+    if passthrough:
+        target = f"{target}?{urlencode(passthrough)}"
+    return RedirectResponse(target, status_code=303)
 
 
 @router.get("/admin/data-track/users/{user_id}")

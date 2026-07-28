@@ -175,7 +175,6 @@ GET /v1/notices?include_resolved=<bool, 默认 true>
 | `memory` | `memory_backoff` | 记忆整理连续失败进入退避 | 设置页 provider 区 |
 | `runner` | `runner_spawn_failed` / `runner_key_decrypt_failed` | AI 进程起不来（用户表现为「永远没回复」） | 设置页 |
 | `runner` | `runner_degraded`（warning） | AI 在跑但部分能力受损 | 设置页 |
-| `model_api` | `responses_unsupported`（warning，blame=user_provider） | openai_compatible 中转不支持 `/v1/responses`，codex 工具循环被桥接 mangle→记忆/工具静默不可靠（回合仍 rc=0，AI 嘴上说调工具却从不真调）。**setup 探测时发**，非回合失败时 | 设置页 |
 | `chat` | `resident_consumer_stale`（warning，blame=user_environment） | 自托管 resident consumer 仍在 poll，但 commit 缺失/不匹配，或 resident-only 蒸馏任务迟迟没被 claim。通知可带 `copyable_prompt`，同时可能有一条 `source=resident_maintenance` 的维护消息进入聊天 | 聊天/设置页 |
 | `chat` | `resident_decrypt_source_unavailable`（warning，blame=user_environment） | resident 明确报告 `degraded`/`unconfigured`/`unreachable`。通知可先于维护消息出现；老用户仅在持续失败超过宽限期后收到维护消息 | 聊天/设置页 |
 | `chat` | `resident_decrypt_health_unreported`（warning，blame=user_environment） | resident 缺少有效、近期的 decrypt-health 上报。仅显示通知，不注入解密修复消息 | 聊天/设置页 |

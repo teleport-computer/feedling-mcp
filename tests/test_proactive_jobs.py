@@ -710,7 +710,7 @@ def test_perception_direct_wake_respects_proactive_activation_gate(tmp_path, mon
     perception_service._fire_wake(user_id, "device", "unlock after absence", 1001.0)
     jobs = store.list_proactive_jobs(since_epoch=0)
     assert len(jobs) == 1
-    assert jobs[0]["trigger"] == "perception_device"
+    assert jobs[0]["trigger"] == "unlock_after_absence"
 
 
 def test_proactive_tick_delivery_off_still_allows_presence_wake(tmp_path, monkeypatch):

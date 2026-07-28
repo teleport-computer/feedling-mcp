@@ -135,6 +135,76 @@ def test_recent_token_usage_summary_preserves_unknown_token_totals():
     assert usage["usage_telemetry_coverage"] is None
 
 
+def test_recent_tail_window_stats_are_lane_scoped_and_preserve_unknowns():
+    seed_user("u_tm_tail")
+    common = {
+        "prompt_tokens": 100,
+        "completion_tokens": 10,
+        "latency_ms": 100,
+        "model_calls": 1,
+        "retries": 0,
+        "failed": False,
+        "status": "ok",
+    }
+    jobs_store.record_whole_turn_metric(
+        98501, "u_tm_tail", "chat",
+        effective_tail_turns=40,
+        tail_fallback=False,
+        prompt_frontier_exhaustion_count=0,
+        **common,
+    )
+    jobs_store.record_whole_turn_metric(
+        98502, "u_tm_tail", "chat",
+        effective_tail_turns=12,
+        tail_fallback=True,
+        prompt_frontier_exhaustion_count=2,
+        **common,
+    )
+    jobs_store.record_whole_turn_metric(
+        98503, "u_tm_tail", "chat",
+        prompt_tokens=None,
+        completion_tokens=None,
+        effective_tail_turns=None,
+        tail_fallback=False,
+        prompt_frontier_exhaustion_count=0,
+        latency_ms=100,
+        model_calls=0,
+        retries=0,
+        failed=True,
+        status="provider_error",
+    )
+    jobs_store.record_whole_turn_metric(
+        98504, "u_tm_tail", "heartbeat",
+        effective_tail_turns=16,
+        **common,
+    )
+
+    stats = jobs_store.recent_tail_window_stats(lane="chat")
+
+    assert stats == {
+        "lane": "chat",
+        "sample_limit": 1000,
+        "sampled_turns": 3,
+        "measured_turns": 2,
+        "measurement_coverage": pytest.approx(2 / 3),
+        "effective_tail_turns_min": 12,
+        "effective_tail_turns_avg": 26.0,
+        "effective_tail_turns_max": 40,
+        "fallback_turns": 1,
+        "fallback_rate": 0.5,
+        "prompt_frontier_exhaustion_count": 2,
+        "prompt_tokens": 200,
+    }
+
+    empty = jobs_store.recent_tail_window_stats(lane="no-such-lane")
+    assert empty["sampled_turns"] == 0
+    assert empty["measured_turns"] == 0
+    assert empty["measurement_coverage"] is None
+    assert empty["effective_tail_turns_min"] is None
+    assert empty["fallback_rate"] is None
+    assert empty["prompt_tokens"] is None
+
+
 def test_recent_prompt_cache_stats_preserve_unknowns_and_report_coverage():
     seed_user("u_tm_cache")
     jobs_store.record_whole_turn_metric(

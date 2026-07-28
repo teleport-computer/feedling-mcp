@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 import itertools
 import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -334,6 +336,137 @@ def test_admin_data_track_dau_histogram_json_and_page(client):
     assert "样本=当天有上报的 3 位用户" in page_html
 
 
+def test_user_detail_daily_usage_json_page_and_events_limit(client):
+    user_id, _ = _register(client)
+    zone = ZoneInfo("Asia/Shanghai")
+    today = datetime.now(zone).date()
+    first_day = today - timedelta(days=2)
+    first_midnight = datetime.combine(
+        first_day, datetime.min.time(), tzinfo=zone
+    ).timestamp()
+    today_midnight = datetime.combine(
+        today, datetime.min.time(), tzinfo=zone
+    ).timestamp()
+    for index, (ts, duration) in enumerate((
+        (first_midnight, 40),
+        (today_midnight, 80),
+        (today_midnight + 1, "bad"),
+        (today_midnight + 2, 20),
+        (today_midnight + 3, 30),
+    )):
+        db.log_append(
+            user_id,
+            "tracking_events",
+            {
+                "event_id": f"daily_{index}",
+                "type": "app_session_end",
+                "ts": ts,
+                "payload": {"duration_sec": duration},
+            },
+            ts=ts,
+        )
+
+    res = client.get(
+        f"/v1/admin/data-track/users/{user_id}?days=3&events_limit=2",
+        headers=_admin_headers(),
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+    user = res.get_json()["user"]
+    assert user["daily_usage_days"] == 3
+    assert len(user["daily_usage"]) == 3
+    assert user["daily_usage"][0]["foreground_sec"] == 40
+    assert user["daily_usage"][1]["foreground_sec"] == 0
+    assert user["daily_usage"][1]["sessions"] == 0
+    assert user["daily_usage"][2]["foreground_sec"] == 130
+    assert user["daily_usage"][2]["sessions"] == 4
+    assert sum(row["foreground_sec"] for row in user["daily_usage"]) == user["app_usage"]["foreground_sec"] == 170
+    assert sum(row["sessions"] for row in user["daily_usage"]) == user["app_usage"]["sessions"] == 5
+    assert user["tracking"]["events_limit"] == 2
+    assert len(user["tracking"]["latest"]) == 2
+
+    capped = client.get(
+        f"/v1/admin/data-track/users/{user_id}?days=999&events_limit=999",
+        headers=_admin_headers(),
+    ).get_json()["user"]
+    assert capped["daily_usage_days"] == 90
+    assert len(capped["daily_usage"]) == 90
+    assert capped["tracking"]["events_limit"] == 500
+    assert len(capped["tracking"]["latest"]) == 5
+
+    page = client.get(
+        f"/admin/data-track/users/{user_id}?days=3&events_limit=2",
+        headers=_admin_headers(),
+    )
+    assert page.status_code == 200, page.get_data(as_text=True)
+    body = page.get_data(as_text=True)
+    assert "最近 3 天使用时长" in body
+    assert "窗口合计" in body and "全时段合计" in body
+    assert "未打开" in body
+    assert first_day.isoformat() in body
+    assert (first_day + timedelta(days=1)).isoformat() in body
+
+
+def test_uid_lookup_form_strip_validation_and_admin_key_passthrough(client):
+    user_id, _ = _register(client)
+    page = client.get(
+        "/admin/data-track?admin_key=admin-test-token",
+        headers=_admin_headers(),
+    )
+    body = page.get_data(as_text=True)
+    assert 'action="/admin/data-track/users"' in body
+    assert 'name="uid"' in body
+    assert 'name="admin_key" type="hidden" value="admin-test-token"' in body
+
+    lookup = client.get(
+        f"/admin/data-track/users?uid=%20%0A{user_id}%09&admin_key=admin-test-token",
+        headers=_admin_headers(),
+    )
+    assert lookup.status_code == 303
+    assert lookup.headers["location"] == (
+        f"/admin/data-track/users/{user_id}?admin_key=admin-test-token"
+    )
+
+    invalid_json = client.get(
+        "/v1/admin/data-track/users/not-a-user",
+        headers=_admin_headers(),
+    )
+    assert invalid_json.status_code == 400
+    assert invalid_json.get_json() == {"error": "invalid_user_id"}
+
+    invalid_page = client.get(
+        "/admin/data-track/users?uid=%3Cscript%3E",
+        headers=_admin_headers(),
+    )
+    assert invalid_page.status_code == 400
+    invalid_body = invalid_page.get_data(as_text=True)
+    assert "UID 格式不正确" in invalid_body
+    assert "<script>" not in invalid_body
+    assert "&lt;script&gt;" in invalid_body
+
+    invalid_path = client.get(
+        f"/admin/data-track/users/{quote('<script>', safe='')}",
+        headers=_admin_headers(),
+    )
+    assert invalid_path.status_code == 400
+    assert "UID 格式不正确" in invalid_path.get_data(as_text=True)
+
+
+def test_tracking_stats_events_limit_clamps_to_500():
+    events = [
+        {"event_id": str(index), "type": "app_open", "ts": float(index)}
+        for index in range(600)
+    ]
+    store = SimpleNamespace(list_tracking_events=lambda limit=0: events)
+
+    short = _dt._tracking_stats(store, include_events=True, events_limit=3)
+    assert short["events_limit"] == 3
+    assert [row["event_id"] for row in short["latest"]] == ["599", "598", "597"]
+
+    capped = _dt._tracking_stats(store, include_events=True, events_limit=999)
+    assert capped["events_limit"] == 500
+    assert len(capped["latest"]) == 500
+
+
 def test_admin_data_track_supports_since_filter_and_pagination(client):
     old_user, _ = _register(client)
     new_user, _ = _register(client)
@@ -479,6 +612,120 @@ def test_fast_validation_genesis_user_is_complete_despite_empty_tabs():
     assert v["stage"] == "complete"
     mg = next(s for s in v["steps"] if s["id"] == "memory")
     assert mg["passing"] is True  # cards exist -> garden satisfied (bucket-agnostic)
+
+
+def test_effective_responder_uses_current_fences_before_poll_samples():
+    now = 1_000.0
+    result = _dt._effective_responder(
+        route="resident",
+        consumer_state={
+            "poll_consumers": {
+                "resident-vps": {
+                    "responder": "resident",
+                    "last_poll_epoch": 999.0,
+                    "last_poll_at": "recent",
+                },
+                "agent-runner:u": {
+                    "responder": "hosted_v1",
+                    "last_poll_epoch": 998.0,
+                    "last_poll_at": "also recent",
+                },
+            }
+        },
+        runtime={
+            "hosted_runtime_state": "resident",
+            "model_api_route": {"is_active": True, "test_status": "ok"},
+            "runner_lease": {"active": True},
+        },
+        now_epoch=now,
+    )
+    assert result["effective_responder"] == "hosted_v1"
+    assert result["basis"] == "live_agent_runtime_lease"
+    assert result["mismatch"] is True
+    assert "non_model_api_route_with_hosted_responder" in result["mismatch_reasons"]
+    assert "multiple_responder_classes_detected" in result["mismatch_reasons"]
+    assert {item["responder"] for item in result["recent_poll_observations"]} == {
+        "hosted_v1",
+        "resident",
+    }
+
+
+def test_effective_responder_covers_v2_resident_and_none_states():
+    hosted_v2 = _dt._effective_responder(
+        route="model_api",
+        consumer_state=None,
+        runtime={
+            "hosted_runtime_state": "v2",
+            "model_api_route": {"is_active": True, "test_status": "ok"},
+            "runner_lease": {"active": False},
+        },
+        now_epoch=1_000.0,
+    )
+    assert hosted_v2["effective_responder"] == "hosted_v2"
+    assert hosted_v2["mismatch"] is False
+
+    resident = _dt._effective_responder(
+        route="resident",
+        consumer_state={
+            "poll_consumers": {
+                "resident-vps": {
+                    "responder": "resident",
+                    "last_poll_epoch": 999.0,
+                }
+            }
+        },
+        runtime={"hosted_runtime_state": "resident", "runner_lease": {"active": False}},
+        now_epoch=1_000.0,
+    )
+    assert resident["effective_responder"] == "resident"
+    assert resident["mismatch"] is False
+
+    none = _dt._effective_responder(
+        route="resident",
+        consumer_state=None,
+        runtime=None,
+        now_epoch=1_000.0,
+    )
+    assert none["effective_responder"] == "none"
+    assert none["mismatch"] is False
+
+    official_import = _dt._effective_responder(
+        route="official_import",
+        consumer_state={
+            "poll_consumers": {
+                "resident-vps": {
+                    "responder": "resident",
+                    "last_poll_epoch": 999.0,
+                }
+            }
+        },
+        runtime=None,
+        now_epoch=1_000.0,
+    )
+    assert official_import["effective_responder"] == "resident"
+    assert official_import["mismatch"] is True
+    assert (
+        "official_import_route_with_resident_poll"
+        in official_import["mismatch_reasons"]
+    )
+
+    stale_hosted = _dt._effective_responder(
+        route="resident",
+        consumer_state={
+            "poll_consumers": {
+                "agent-runner:u": {
+                    "responder": "hosted_v1",
+                    "last_poll_epoch": 1.0,
+                }
+            }
+        },
+        runtime=None,
+        now_epoch=1_000.0,
+    )
+    assert stale_hosted["effective_responder"] == "none"
+    assert stale_hosted["mismatch"] is False
+    assert stale_hosted["poll_observations"][0]["recent"] is False
+    assert stale_hosted["recent_poll_observations"] == []
 
 
 # App usage-duration rendering (app_session_end aggregation surfaced in the overview).
@@ -820,6 +1067,8 @@ def test_detail_payload_exposes_permission_metadata_without_private_directive(cl
     row = _dt._build_data_track_user(user_entry, include_detail=True)
     pp = row["perception_permissions"]
     assert pp["permission_states"]["photos"] == "authorized"
+    assert pp["switches"]["ambient_心跳"] is True
+    assert "ambient_陪伴" not in pp["switches"]
     assert pp["switches"]["photo_wake_照片唤醒"] is False
     assert pp["wake_directive_configured"] is True
     assert pp["wake_interval_sec"] == 3600
@@ -830,3 +1079,41 @@ def test_detail_payload_exposes_permission_metadata_without_private_directive(cl
     assert "<private>" not in rendered
     assert "&lt;script&gt;" in rendered
     assert "&lt;private&gt;" in rendered
+
+
+def test_connection_health_separates_never_connected_from_went_offline():
+    """`connected` means "a binding row exists", not "a consumer is alive".
+
+    Access bindings are append-only: the backend upserts one for the active
+    route on every whoami and never clears the old ones, so the flag stays
+    true forever once a user has merely *selected* the resident route. Reading
+    it as liveness labelled 103 of 278 prod resident users 掉线 — "it broke, go
+    debug their consumer" — when the truth was 未连接, "they never ran one".
+    Support acts differently on those two, so the panel must not merge them.
+    """
+    from admin import data_track as _dt
+
+    def health(last_seen_at: str, *, connected: bool = True) -> dict:
+        return _dt._connection_health(
+            "resident",
+            [{"access_mode": "resident", "connected": connected,
+              "last_seen_at": last_seen_at}],
+            {},
+        )
+
+    never = health("")
+    assert (never["status"], never["label"]) == ("idle", "未连接")
+    assert never["stale_h"] is None, "no sighting means no age to report"
+
+    # Same append-only binding, but this consumer really did phone home once.
+    long_ago = (datetime.now() - timedelta(hours=_dt._CONN_STALE_H + 3)).isoformat()
+    gone = health(long_ago)
+    assert (gone["status"], gone["label"]) == ("offline", "掉线")
+    assert gone["stale_h"] > _dt._CONN_STALE_H
+
+    fresh = health(datetime.now().isoformat())
+    assert (fresh["status"], fresh["label"]) == ("ok", "在线")
+
+    # A live sighting outranks a missing/false binding flag: liveness is the
+    # heartbeat, and the flag is the thing we stopped trusting.
+    assert health(datetime.now().isoformat(), connected=False)["status"] == "ok"

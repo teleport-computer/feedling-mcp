@@ -15,6 +15,34 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import serve_worker
 from model_api_runtime.v2 import worker
 from enclave import envelope as enclave_envelope
+from incident_guard_reference import legacy_reply_is_degenerate
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (None, True),
+        ("", True),
+        ("   \n", True),
+        (".", True),
+        ("。", True),
+        ("……", True),
+        ("?!", True),
+        ("——", True),
+        (". .", True),
+        ("、", True),
+        ("嗯", False),
+        ("在忙吗?", False),
+        ("ok.", False),
+        ("1", False),
+        ("🌙", False),
+        ("好~", False),
+        ("Hi", False),
+    ],
+)
+def test_degenerate_reply_decision_matches_runtime_v1(text, expected):
+    assert legacy_reply_is_degenerate(text) is expected
+    assert worker._is_degenerate_reply(text) is expected
 
 
 @pytest.mark.parametrize(

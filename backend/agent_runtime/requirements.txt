@@ -12,3 +12,6 @@ psycopg[binary]>=3.1.0
 psycopg-pool>=3.2.0
 cryptography>=42.0.0
 PyNaCl>=1.5.0
+# Required when a local supervisor/resident renders a requested PDF download.
+# Hosted agent-runner images receive the same pin from backend/requirements.lock.
+reportlab==5.0.0

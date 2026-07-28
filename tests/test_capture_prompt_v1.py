@@ -107,20 +107,20 @@ def test_parse_drops_noop():
 def test_parse_coerces_insight_reflection_out():
     # capture never writes insight/reflection (those need anchors / are Dream's job)
     for bad in ("insight", "reflection", "weird"):
-        raw = '{"cards":[{"action":"add","type":"%s","summary":"s","content":"c"}]}' % bad
+        raw = '{"cards":[{"action":"add","type":"%s","summary":"标题","content":"正文"}]}' % bad
         cards, err = parse_capture_cards(raw)
         assert len(cards) == 1 and cards[0]["type"] in CAPTURE_TYPES
         assert cards[0]["type"] == "event"  # default
 
 
 def test_parse_handles_json_fence():
-    raw = "好的\n" + _FENCE + 'json\n{"cards":[{"action":"add","summary":"s","content":"c"}]}\n' + _FENCE
+    raw = "好的\n" + _FENCE + 'json\n{"cards":[{"action":"add","summary":"标题","content":"正文"}]}\n' + _FENCE
     cards, err = parse_capture_cards(raw)
     assert err is None and len(cards) == 1
 
 
 def test_parse_handles_prose_wrapped_and_clamps():
-    raw = '我想了想：{"cards":[{"action":"merge","target_id":"mom_1","summary":"s","content":"c","importance":2.0,"pulse":-1}]} 就这些'
+    raw = '我想了想：{"cards":[{"action":"merge","target_id":"mom_1","summary":"标题","content":"正文","importance":2.0,"pulse":-1}]} 就这些'
     cards, err = parse_capture_cards(raw)
     assert err is None and len(cards) == 1
     assert cards[0]["action"] == "merge" and cards[0]["target_id"] == "mom_1"
@@ -132,13 +132,18 @@ def test_parse_garbage_returns_reason():
     assert cards == [] and err == "no_json_object"
 
 
-def test_parse_drops_hollow_card():
-    cards, err = parse_capture_cards('{"cards":[{"action":"add","type":"event"}]}')
-    assert cards == [] and err is None
+def test_parse_bounces_hollow_card():
+    # 无 summary/content 的空壳卡以前静默丢弃;现在严格模式打回,放宽模式才只丢这一张。
+    raw = '{"cards":[{"action":"add","type":"event"}]}'
+    cards, err = parse_capture_cards(raw)
+    assert cards == [] and err == "invalid_card_content:summary_empty"
+    # 放宽的第二问里它是唯一一张 → 全脏,报 after_retry 让 job 失败(别推进 frontier)
+    cards, err = parse_capture_cards(raw, strict=False)
+    assert cards == [] and err == "invalid_card_content_after_retry:summary_empty"
 
 
 def test_parse_caps_threads_at_eight():
-    raw = ('{"cards":[{"action":"add","summary":"s","content":"c",'
+    raw = ('{"cards":[{"action":"add","summary":"标题","content":"正文",'
            '"threads":["a","b","c","d","e","f","g","h","i","j"]}]}')
     cards, err = parse_capture_cards(raw)
     assert len(cards[0]["threads"]) == 8

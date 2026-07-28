@@ -113,6 +113,24 @@ def env(monkeypatch):
             "hit_ratio": 0.6,
         },
     )
+    monkeypatch.setattr(
+        jobs_store,
+        "recent_tail_window_stats",
+        lambda **kw: {
+            "lane": kw["lane"],
+            "sample_limit": 1000,
+            "sampled_turns": 4,
+            "measured_turns": 4,
+            "measurement_coverage": 1.0,
+            "effective_tail_turns_min": 12,
+            "effective_tail_turns_avg": 24.0,
+            "effective_tail_turns_max": 40,
+            "fallback_turns": 1,
+            "fallback_rate": 0.25,
+            "prompt_frontier_exhaustion_count": 0,
+            "prompt_tokens": 1000,
+        },
+    )
     monkeypatch.setattr(jobs_store, "genesis_worker_alive", lambda **kw: True)
     monkeypatch.setattr(
         admin_core.config_store,
@@ -244,6 +262,29 @@ def test_v2_metrics_returns_every_field(env):
             "cache_miss_tokens": 400,
             "effective_input_tokens": 1000,
             "hit_ratio": 0.6,
+        },
+        "tail_window": {
+            lane: {
+                "lane": lane,
+                "sample_limit": 1000,
+                "sampled_turns": 4,
+                "measured_turns": 4,
+                "measurement_coverage": 1.0,
+                "effective_tail_turns_min": 12,
+                "effective_tail_turns_avg": 24.0,
+                "effective_tail_turns_max": 40,
+                "fallback_turns": 1,
+                "fallback_rate": 0.25,
+                "prompt_frontier_exhaustion_count": 0,
+                "prompt_tokens": 1000,
+            }
+            for lane in (
+                "chat",
+                "heartbeat",
+                "scheduled",
+                "manual_wake",
+                "screen_watch",
+            )
         },
         "wake": {
             "completed": 4,
