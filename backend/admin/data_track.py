@@ -95,7 +95,7 @@ def _data_track_qs(**updates) -> str:
     for key in (
         "admin_key", "since", "registered_since", "q", "limit", "offset", "sort",
         "dir", "view", "days", "user_id", "subsystem", "status", "trace_id",
-        "mode", "reveal", "page", "event", "day", "events_limit",
+        "mode", "reveal", "page", "event", "day", "events_limit", "hours",
     ):
         value = request.args.get(key, "").strip()
         if value:
@@ -1219,7 +1219,7 @@ def _data_track_request_filters() -> dict:
     if raw_dir not in {"asc", "desc"}:
         raw_dir = "desc"
     raw_view = (request.args.get("view") or "users").strip().lower()
-    if raw_view not in {"users", "dau", "proactive", "debug", "events"}:
+    if raw_view not in {"users", "dau", "proactive", "debug", "events", "runtime"}:
         raw_view = "users"
 
     def read_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -2367,6 +2367,30 @@ def _render_runtime_health_page(payload: dict) -> str:
 </html>"""
 
 
+def _render_runtime_health_error_page() -> str:
+    """数据取不到时的降级页：保留 nav，不外泄异常细节。"""
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Runtime 健康 · Feedling Data Track</title>
+  <style>{_RUNTIME_PAGE_CSS}</style>
+</head>
+<body>
+<main>
+  <h1>Runtime 健康</h1>
+  {_render_data_track_view_nav("runtime")}
+  <div class="note-box">
+    <b>Runtime 健康数据暂时取不到。</b>
+    多半是数据库连接池或 V2 表访问出了问题——这本身就是一个值得查的信号。
+    其他视图不受影响，可继续使用上面的导航。具体异常见后端日志。
+  </div>
+</main>
+</body>
+</html>"""
+
+
 def _render_admin_login_page(error: bool = False, next_url: str = "/admin/data-track") -> str:
     """Password-gate login page for the admin dashboard. Posts to /admin/login,
     which validates FEEDLING_ADMIN_PASSWORD and sets the signed admin_session
@@ -2423,6 +2447,7 @@ def _render_data_track_view_nav(active: str) -> str:
         f"{nav_item('growth', '增长 & 留存')}"
         f"{nav_item('proactive', 'Proactive 日报')}"
         f"{nav_item('events', '事件健康度')}"
+        f"{nav_item('runtime', 'Runtime 健康')}"
         f"{nav_item('debug', 'Debug')}"
         "</div>"
     )

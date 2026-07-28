@@ -94,6 +94,15 @@ def page_html(query_string: str) -> str:
             return data_track._render_proactive_daily_page(data_track._data_track_proactive_daily_payload())
         if view == "debug":
             return data_track._render_data_track_debug_page(data_track._data_track_debug_payload())
+        if view == "runtime":
+            try:
+                payload = data_track._runtime_health_summary(
+                    within_hours=data_track._runtime_health_window_hours()
+                )
+            except Exception:
+                logging.exception("runtime health summary failed")
+                return data_track._render_runtime_health_error_page()
+            return data_track._render_runtime_health_page(payload)
         if view == "events":
             event = (request.args.get("event") or "").strip()
             if event == "onboarding":

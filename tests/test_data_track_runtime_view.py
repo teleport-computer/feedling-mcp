@@ -12,6 +12,55 @@ import pytest  # noqa: E402
 
 from admin import admin_core as _admin_core  # noqa: E402
 
+import base64  # noqa: E402
+import itertools  # noqa: E402
+
+import db  # noqa: E402
+from accounts import registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
+from core import config as core_config  # noqa: E402
+from core import store as core_store  # noqa: E402
+
+
+_route_pk_counter = itertools.count(9_000)
+
+
+@pytest.fixture()
+def client(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", "admin-test-token")
+    registry._users[:] = []
+    registry._key_to_user.clear()
+    core_store._stores.clear()
+    registry._save_users()
+    with make_client() as c:
+        yield c
+
+
+def _admin_headers() -> dict[str, str]:
+    # NOTE: brief text says "X-Admin-Key"; the real admin auth (routes_asgi.py
+    # _extract_admin_token) only reads "X-Admin-Token" (matches every other
+    # test file in this repo, e.g. test_data_track.py::_admin_headers).
+    return {"X-Admin-Token": "admin-test-token"}
+
+
+def _fake_summary(**_kw) -> dict:
+    return {
+        "window_hours": _kw.get("within_hours", 24),
+        "generated_at": 1_800_000_000.0,
+        "lanes": [{
+            "lane": "chat", "sampled_jobs": 10, "completed": 9, "failed": 1,
+            "expired": 0, "superseded": 0, "queue_expired": 0, "lease_expired": 0,
+            "failure_rate": 0.1, "p50_ok_ms": 18_000, "p95_ok_ms": 38_000,
+            "capture": {"complete": 10, "partial": 0, "missing": 0, "open": 0},
+            "top_failures": [{"code": "turn_failed:providererror", "count": 1}],
+        }],
+        "pool": {
+            "inflight": 1, "pending": 0, "live_workers": 2,
+            "capacity": 8, "oldest_pending_age_sec": None,
+        },
+    }
+
 
 @pytest.fixture()
 def bound_request():
@@ -290,3 +339,77 @@ def test_render_runtime_health_page_shows_capture_open_bucket(bound_request):
     assert "80 / 15 /" in html_out           # 完整 / 部分 /
     assert "<b class='bad'>2</b>" in html_out   # 漏写 用 bad class 标记
     assert "/ 3</td>" in html_out            # 在飞 无特殊标记
+
+
+def test_runtime_view_renders_and_highlights_nav(client, monkeypatch):
+    monkeypatch.setattr(_dt, "_runtime_health_summary", _fake_summary)
+    page = client.get(
+        "/admin/data-track?view=runtime", headers=_admin_headers()
+    ).get_data(as_text=True)
+    assert "Runtime 健康" in page
+    assert "各 lane 健康" in page
+    assert "turn_failed:providererror" in page
+
+
+def test_runtime_view_appears_in_nav_of_other_views(client, monkeypatch):
+    monkeypatch.setattr(_dt, "_runtime_health_summary", _fake_summary)
+    page = client.get("/admin/data-track", headers=_admin_headers()).get_data(as_text=True)
+    assert "view=runtime" in page
+
+
+def test_runtime_view_falls_back_on_invalid_hours(client, monkeypatch):
+    seen = {}
+
+    def _capture(**kw):
+        seen.update(kw)
+        return _fake_summary(**kw)
+
+    monkeypatch.setattr(_dt, "_runtime_health_summary", _capture)
+    client.get("/admin/data-track?view=runtime&hours=99999", headers=_admin_headers())
+    assert seen["within_hours"] == 24
+    client.get("/admin/data-track?view=runtime&hours=abc", headers=_admin_headers())
+    assert seen["within_hours"] == 24
+    client.get("/admin/data-track?view=runtime&hours=168", headers=_admin_headers())
+    assert seen["within_hours"] == 168
+
+
+def test_runtime_view_requires_admin(client):
+    res = client.get("/admin/data-track?view=runtime")
+    assert res.status_code in (401, 302, 303)
+
+
+def test_runtime_health_summary_is_wired_to_jobs_store():
+    # 装配段必须把桩换成真实实现，否则页面永远空白（asgi-lifespan 漏接线的老坑）
+    import asgi_app  # noqa: F401
+    from model_api_runtime.v2 import jobs_store
+
+    assert _dt._runtime_health_summary is jobs_store.recent_runtime_health
+
+
+def test_runtime_view_degrades_to_error_card_not_500(client, monkeypatch):
+    # 数据函数炸了不能把整页打成 500——值班台恰恰是出事时才被打开的那一页。
+    def _boom(**_kw):
+        raise RuntimeError("pool exhausted")
+
+    monkeypatch.setattr(_dt, "_runtime_health_summary", _boom)
+    res = client.get("/admin/data-track?view=runtime", headers=_admin_headers())
+    body = res.get_data(as_text=True)
+    assert res.status_code == 200
+    assert "Runtime 健康数据暂时取不到" in body
+    # NOTE: brief text asserted "view=users", but the existing nav_item()
+    # implementation (data_track.py::_render_data_track_view_nav, unchanged
+    # by this task) omits the `view=` query param for the default "users"
+    # view — every other nav test in this repo relies on that same
+    # behavior. "view=dau" is a stable, non-default nav link that proves the
+    # nav bar (and thus the escape hatch to other views) is still present.
+    assert "view=dau" in body            # nav 仍在，其他视图还能点
+    assert "pool exhausted" not in body  # 异常细节不外泄到页面
+
+
+def test_runtime_pages_share_one_stylesheet(bound_request):
+    # 两个新页共用 _RUNTIME_PAGE_CSS（Task 4 Step 3a 抽出的常量）；
+    # 这条测试防止将来有人又复制粘贴出第三份。
+    main_page = _dt._render_runtime_health_page(_payload())
+    error_page = _dt._render_runtime_health_error_page()
+    assert _dt._RUNTIME_PAGE_CSS in main_page
+    assert _dt._RUNTIME_PAGE_CSS in error_page
