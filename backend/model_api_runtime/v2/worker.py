@@ -8155,6 +8155,7 @@ async def process_job(
     claimed_by = str(job.get("claimed_by") or "")
     observed_generation = int(job.get("input_generation") or 0)
     reply_parent_message_id = ""
+    seq_native = deps.read_messages_after_seq is not None
     if tm is None:
         tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
     tm.bind_provider(provider_config)
@@ -8351,7 +8352,6 @@ async def process_job(
         runtime_state = await asyncio.to_thread(jobs_store.get_runtime_state, user_id)
         await asyncio.to_thread(_emit_status, user_id, job_id, "processing")
 
-        seq_native = deps.read_messages_after_seq is not None
         if seq_native:
             # Recovery comes before cursor load/provider work. A previous process
             # may have durably enqueued its final compound reply but crashed before
