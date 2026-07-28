@@ -112,7 +112,7 @@ def _text_round(text):
 
 
 def _spy_provider(monkeypatch, seen):
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
         seen["tools"] = tools
         return _text_round("ok")
@@ -311,7 +311,7 @@ def test_chat_and_wake_fence_outbound_after_text_perception_read(
 
     provider_calls = []
 
-    async def _provider(config, messages, *, tools=None):
+    async def _provider(config, messages, *, tools=None, **_kwargs):
         provider_calls.append({"messages": messages, "tools": tools})
         if len(provider_calls) == 1:
             return {

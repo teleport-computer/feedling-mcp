@@ -6762,6 +6762,13 @@ async def _run_wake(
                 fold_new_messages=fold_new_messages,
                 add_usage=_add_usage,
                 max_calls=_TURN_MAX_LLM_CALLS,
+                # "Weak wake sleeps": staying silent is this lane's documented
+                # success case (`_on_reply` no-ops on empty text), so a
+                # text-free provider reply must come back as "" rather than
+                # raising. Without this the lane failed 100% of the time on
+                # test with `wake_failed:providererror` while the provider
+                # answered 200 OK — the model simply had nothing to say.
+                require_reply=False,
                 on_provider_success=lambda: _record_provider_success(user_id),
                 on_provider_failure=lambda exc: _record_provider_failure(
                     user_id,

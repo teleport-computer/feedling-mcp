@@ -128,7 +128,7 @@ def _script_provider(monkeypatch, responses):
     it = iter(responses)
     calls = []
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         calls.append({"messages": messages, "tools": tools})
         return next(it)
 
@@ -300,7 +300,7 @@ def test_wake_empty_tail_still_completes_no_no_user_messages_guard(monkeypatch):
     _patch_real_write(monkeypatch)
     seen = {}
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
         return _text_round("")
 
@@ -500,7 +500,7 @@ def test_wake_provider_error_silent_mark_failed(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
     job = jobs_store.claim_next_job("w")
 
-    async def _boom(config, messages, *, tools=None):
+    async def _boom(config, messages, *, tools=None, **_kwargs):
         raise provider_client.ProviderError("boom", status_code=500)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
@@ -536,7 +536,7 @@ def test_wake_provider_config_error_still_sets_payment_cooldown(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     job = jobs_store.claim_next_job("w")
 
-    async def _boom(config, messages, *, tools=None):
+    async def _boom(config, messages, *, tools=None, **_kwargs):
         raise provider_client.ProviderError("out of credits", status_code=402)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
@@ -575,7 +575,7 @@ def test_wake_transient_error_does_not_set_payment_cooldown(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     job = jobs_store.claim_next_job("w")
 
-    async def _boom(config, messages, *, tools=None):
+    async def _boom(config, messages, *, tools=None, **_kwargs):
         raise provider_client.ProviderError("timeout-ish", status_code=503)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
@@ -620,7 +620,7 @@ def test_screen_watch_lane_uses_its_own_prompt_and_screen_context(monkeypatch):
 
     seen = {}
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
         seen["tools"] = tools
         return _text_round("你在看这个报错？")

@@ -196,6 +196,15 @@ async def run_tool_loop(
     extra_mutating_tool_names=None,
     disabled_tool_names=None,
     allow_reply_tool: bool = True,
+    # Whether a text-free provider reply is an ERROR. Defaults to True, which
+    # is the chat lane's rule (a terminal turn with no text is the no-filler
+    # failure). The wake lane is the opposite — "weak wake sleeps": a model
+    # that chooses to stay silent is a legitimate outcome, not a failure — and
+    # must pass False, otherwise provider_client raises
+    # ProviderError("provider response had no usable reply text") on the very
+    # response that means "nothing to say" (`required = require_reply and not
+    # tool_calls`), and the wake fails silently.
+    require_reply: bool = True,
     on_file_reply=None,
     required_file_suffixes: tuple[str, ...] | None = None,
     file_requirement_messages=(),
@@ -586,6 +595,10 @@ async def run_tool_loop(
         _progress("provider_start")
         try:
             provider_kwargs = {"tools": tools}
+            if not require_reply:
+                # Only send the non-default so every existing caller's wire
+                # stays byte-identical.
+                provider_kwargs["require_reply"] = False
             if on_file_reply is not None:
                 # File-capable foreground chat may need to place an entire
                 # generated document inside workspace_write arguments. The
