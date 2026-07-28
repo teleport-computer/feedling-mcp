@@ -5291,6 +5291,10 @@ async def _ensure_prompt_coverage(
     # name plus a count) and overwritten each attempt: what matters is the
     # reason the batch that finally exhausted the retry budget was rejected.
     last_reject_code = ""
+    # Set when the most recent attempt failed because the PROVIDER did not
+    # answer (timeout/5xx), cleared by any attempt that did get an answer.
+    # Gates quarantine: see the escalation below.
+    last_provider_exc: BaseException | None = None
     # Shrinks on repeated refusal (see the escalation below).  Starts at the
     # configured batch size so the healthy path is unchanged.
     batch_cap = _COMPACTION_BATCH
@@ -5381,6 +5385,15 @@ async def _ensure_prompt_coverage(
             # Down to a single message and still refused: no smaller request
             # exists. Without an escape hatch this user's every later message
             # is blocked forever behind this one row (usr_7f30…, three days).
+            if last_provider_exc is not None:
+                # …but only a row we actually SAW and could not fold may be
+                # written off. The provider never answered here, so it said
+                # nothing about this row: quarantining now would permanently
+                # drop a message the next turn (once the provider recovers)
+                # would have folded fine. Fail honestly and leave the frontier
+                # untouched — a stalled catch-up is recoverable, a summary
+                # that silently omits a real message is not.
+                raise last_provider_exc
             if not _QUARANTINE_ENABLED:
                 raise TurnError(_coverage_incomplete_reason(last_reject_code))
             quarantined = await _quarantine_unfoldable_head(
@@ -5548,28 +5561,95 @@ async def _ensure_prompt_coverage(
             )
             return result
 
-        if segmented_write:
-            segment_text = await _within_deadline(
-                lambda: v2_compaction.compact_segment(
-                    provider_config=provider_config,
-                    old_messages=old,
-                    llm=_recording_catchup_llm,
-                    usage_out=add_usage,
-                    reject_out=_note_reject,
+        try:
+            if segmented_write:
+                segment_text = await _within_deadline(
+                    lambda: v2_compaction.compact_segment(
+                        provider_config=provider_config,
+                        old_messages=old,
+                        llm=_recording_catchup_llm,
+                        usage_out=add_usage,
+                        reject_out=_note_reject,
+                    )
                 )
-            )
-            new_summary = segment_text or ""
-        else:
-            new_summary = await _within_deadline(
-                lambda: v2_compaction.compact(
-                    provider_config=provider_config,
-                    current_summary=summary,
-                    old_messages=old,
-                    llm=_recording_catchup_llm,
-                    usage_out=add_usage,
-                    reject_out=_note_reject,
+                new_summary = segment_text or ""
+            else:
+                new_summary = await _within_deadline(
+                    lambda: v2_compaction.compact(
+                        provider_config=provider_config,
+                        current_summary=summary,
+                        old_messages=old,
+                        llm=_recording_catchup_llm,
+                        usage_out=add_usage,
+                        reject_out=_note_reject,
+                    )
                 )
+        except (LostJobLease, TurnError):
+            # Lease loss and this catch-up's own deadline are about US, not
+            # about the batch — a smaller retry cannot help and must not be
+            # attempted with a lease we may no longer hold.
+            raise
+        except Exception as exc:
+            # The provider never answered this batch (compaction's own
+            # `timeout=60.0`, a 5xx, a dropped connection), so it returned no
+            # text to reject and never reached the no-op guard below. Left
+            # alone it re-raises identically on every later turn at full size
+            # forever — usr_90184…'s stall.
+            if provider_client.classify_provider_error(exc) == "provider_config":
+                # A bad key / no credits is a property of the USER'S CONFIG,
+                # not of the batch: every smaller retry fails the same way
+                # while burning another round-trip and another deadline slice.
+                raise
+            # Anything else (transient/unknown) may well be "this batch was
+            # too big to finish in time" — take the same escalation ladder a
+            # refusal takes. `attempted_since_observation` is already set, so
+            # the next loop's fresh watermark read consumes one no-progress
+            # attempt and eventually shrinks `batch_cap`.
+            last_provider_exc = exc
+            _note_reject(f"provider_{provider_client.classify_provider_error(exc)}")
+            _report_turn_progress("prompt_catchup_batch_provider_error")
+            await _record_trajectory(
+                trajectory_recorder,
+                "compaction_provider_failed",
+                {
+                    "lane": "prompt_catchup",
+                    "error_class": type(exc).__name__,
+                    "batch_messages": len(old),
+                    "batch_cap": batch_cap,
+                    "no_progress_attempts": no_progress_attempts,
+                },
+                best_effort=True,
             )
+            # A 60s timeout ate most of a lease TTL; renew before looping.
+            await _renew_catchup_lease()
+            # Shrink on the FIRST timeout rather than after `max_retries` of
+            # them. A refusal gets retried at the same size because the model
+            # is nondeterministic and often folds the identical batch on the
+            # next try; a timeout is not like that — it says this batch cannot
+            # finish in the time allowed, and re-sending it just burns another
+            # full provider timeout. Spending the retry budget at each rung
+            # costs 4 rungs × max_retries × 60s = 720s against a 600s deadline,
+            # so the ladder never reaches the small batches that would have
+            # worked, and `batch_cap` (a local) restarts at the top on the next
+            # turn — the stall would survive the fix. Shrinking immediately
+            # walks the whole ladder in ~4 timeouts instead.
+            if batch_cap > 1:
+                batch_cap = max(1, batch_cap // 4)
+                no_progress_attempts = 0
+                last_observed_watermark = None
+                _report_turn_progress(f"prompt_catchup_shrink_{batch_cap}")
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "compaction_batch_shrunk",
+                    {
+                        "lane": "prompt_catchup",
+                        "batch_cap": batch_cap,
+                        "reject_code": last_reject_code,
+                    },
+                    best_effort=True,
+                )
+            continue
+        last_provider_exc = None
         _report_turn_progress("prompt_catchup_batch_complete")
         if (
             (segmented_write and not new_summary.strip())
