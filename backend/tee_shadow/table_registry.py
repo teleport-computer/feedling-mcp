@@ -115,7 +115,7 @@ REGISTRY: dict[str, Entry] = {
     "agent_runtime_instances": Entry(
         SNAPSHOT,
         "V1 runtime 实例登记（租约/状态高频原地 UPDATE）。agent_runtime/leases.py 的 8 处"
-        "租约热路径写点在文件顶部明确注明有意不镜像（ephemeral TTL 锁，与 proactive "
+        "租约热路径写点在 acquire() 里明确注明有意不镜像（ephemeral TTL 锁，与 proactive "
         "store_v2 的 user_blobs lease 同规则）；补齐 MIRROR 要逐点接线且价值有限，整表"
         "快照刷代价更低；prod 实测 230 行 0 孤儿，SNAPSHOT 的 FK 前提满足"),
     "agent_runtime_supervisor_heartbeats": Entry(

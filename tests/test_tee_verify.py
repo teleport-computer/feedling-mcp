@@ -111,13 +111,18 @@ _INSERT_RE = re.compile(r"INSERT\s+INTO\s+(\w+)\s*\([^()]*\)\s*(VALUES|SELECT)\b
 
 
 def _tables_with_unconditional_seed_inserts() -> set[str]:
-    root = Path(__file__).parent.parent / "backend" / "alembic" / "versions"
+    # 两条迁移链都要扫：_clean 在 RDS 和 TEE 两侧各 TRUNCATE 一次，所以任何一侧
+    # 的迁移期播种都会被清掉。TEE 侧目前只有 0001_tee_baseline 播 copytext_meta
+    # （RDS 链同样播它，所以扫不扫 alembic_tee 今天结果一样），但将来 TEE 侧单独
+    # 新增一张播种表时，只扫 RDS 链会漏掉它。
+    backend = Path(__file__).parent.parent / "backend"
     seeded: set[str] = set()
-    for path in root.glob("*.py"):
-        text = _DOLLAR_QUOTED_BODY_RE.sub("", path.read_text())
-        for table, verb in _INSERT_RE.findall(text):
-            if verb.upper() == "VALUES":
-                seeded.add(table)
+    for root in (backend / "alembic" / "versions", backend / "alembic_tee" / "versions"):
+        for path in root.glob("*.py"):
+            text = _DOLLAR_QUOTED_BODY_RE.sub("", path.read_text())
+            for table, verb in _INSERT_RE.findall(text):
+                if verb.upper() == "VALUES":
+                    seeded.add(table)
     return seeded
 
 

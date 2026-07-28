@@ -213,7 +213,17 @@ world_book_entries 等）；TEE 侧另有 4 张本地表（`alembic_tee_version`
 | `tee_reconcile_state` | 同上 |
 | `tee_reconcile_cursors` | 同上 |
 | `genesis_import_chunks` | staging 数据，冻结窗口处理，上游 plan 已决定不复制 |
-| `frame_envelopes` | TEE 对应物是形状不同的 `frames`，已由 CIPHERTEXT lane 覆盖 |
+
+> **2026-07-28 实施期修正（两处，以实现为准）：**
+>
+> 1. `frame_envelopes` originally 列在本表（SKIP）。实际归 **CIPHERTEXT**——它确实走
+>    replicator 通道，只是 TEE 侧落点是形状不同的 `frames`（R2 存储层指针），由
+>    `worker` 的 frames `row_writer` 处理。归 SKIP 会让人误以为它不同步。
+>    故 SKIP 实为 **10 张**，CIPHERTEXT 实为 **11 张**（4 张既有 + 7 张本次新增）。
+> 2. `agent_runtime_instances` / `agent_runtime_supervisor_heartbeats` 需要在
+>    `alembic_tee 0004` **重新建表**——`0002_drop_retired_supervisor` 曾按"V1 已退役"
+>    撤销这两张镜像，但实测 V1 在 RDS 侧仍活着（prod 220 行 + backend 仍在写）。
+>    用户 2026-07-27 拍板：全量对齐不留这个缺口。故 Task 4 的建表数是 **34** 而非 32。
 
 ### 已登记欠执行 — 2 张
 

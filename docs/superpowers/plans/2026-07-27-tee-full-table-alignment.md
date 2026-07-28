@@ -70,7 +70,7 @@
 | `tests/test_tee_registry_guard_enforced.py` | **新建**。元守卫：CI 上 PG 必须可用，否则红。纯单元，无 PG 也跑。 |
 | `backend/tee_shadow/snapshot.py` | **新建**。SNAPSHOT lane：整表 `TRUNCATE`+`COPY` 原子替换。 |
 | `tests/test_tee_snapshot.py` | **新建**。snapshot 的幂等性、事务原子性、FK 顺序。 |
-| `backend/alembic_tee/versions/0004_*.py` | **新建**。32 张表的 TEE 侧 DDL。 |
+| `backend/alembic_tee/versions/0004_*.py` | **新建**。34 张表的 TEE 侧 DDL。 |
 | `scripts/tee/derive_tee_ddl.py` | **新建**。从 RDS 实库派生 TEE DDL 草稿，人工审校后落进 revision。 |
 | `.github/workflows/tee-migrate.yml` | **新建**。alembic_tee 落地通道（含 head 断言）。 |
 | `backend/tee_replicator/transforms.py` | 修改。新增通用单信封 transform。 |
@@ -326,8 +326,8 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-
 import psycopg
+
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -764,7 +764,7 @@ python -m pytest tests/test_tee_table_registry.py -v
 - `test_lanes_are_valid_and_reasons_nonempty` PASS
 - `test_skip_entries_must_justify` PASS
 - `test_logical_lane_is_empty_for_now` PASS
-- `test_tee_schema_covers_every_synced_table` **FAIL** —— 列出 32 张登记了非 SKIP lane 但 alembic_tee 还没建的表。这是预期的，Task 4 修它。
+- `test_tee_schema_covers_every_synced_table` **FAIL** —— 列出 34 张登记了非 SKIP lane 但 alembic_tee 还没建的表。这是预期的，Task 4 修它。
 
 - [ ] **Step 4: 跑全量 L1，确认没引入回归**
 
@@ -779,7 +779,7 @@ python -m pytest tests/ -q --ignore=tests/e2e_model_api_test.py --ignore=tests/t
 
 ---
 
-## Task 4: 派生并落地 32 张表的 TEE DDL
+## Task 4: 派生并落地 34 张表的 TEE DDL
 
 **Files:**
 - Create: `scripts/tee/derive_tee_ddl.py`
@@ -787,7 +787,7 @@ python -m pytest tests/ -q --ignore=tests/e2e_model_api_test.py --ignore=tests/t
 
 **Interfaces:**
 - Consumes: `table_registry.synced_tables()`（Task 3）
-- Produces: TEE 库多出 32 张表 → Task 2 的 `test_tee_schema_covers_every_synced_table` 转绿；Task 5/7 有表可写。
+- Produces: TEE 库多出 34 张表 → Task 2 的 `test_tee_schema_covers_every_synced_table` 转绿；Task 5/7 有表可写。
 
 - [ ] **Step 1: 写派生脚本**
 
@@ -844,6 +844,27 @@ def _columns(conn, table: str) -> list[str]:
     return out
 
 
+def _has_user_fk(conn, table: str) -> bool:
+    """RDS 侧这张表有没有 user_id → users 的外键。
+
+    TEE 的 FK 必须与 RDS 一致，不能"有 user_id 列就加"——见 main() 里的详细说明。
+    """
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM pg_constraint con
+        JOIN pg_class child ON child.oid = con.conrelid
+        JOIN pg_class parent ON parent.oid = con.confrelid
+        WHERE con.contype = 'f'
+          AND child.relname = %s
+          AND parent.relname = 'users'
+        LIMIT 1
+        """,
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
 def _pk(conn, table: str) -> list[str]:
     rows = conn.execute(
         """
@@ -882,8 +903,17 @@ def main() -> int:
             body = list(cols)
             if pk:
                 body.append(f"    PRIMARY KEY ({', '.join(pk)})")
-            has_user = any(c.strip().startswith("user_id ") for c in cols)
-            if has_user:
+            # FK 规则：**照搬 RDS 实际有的 user_id→users 外键，RDS 没有就不加**。
+            #
+            # 绝不能写成"有 user_id 列就补一条 CASCADE FK"（本计划初版就是这么写的，
+            # 2026-07-28 Task 4 审查抓出）：那会让 TEE 副本比源库更严格，而复制系统里
+            # 副本一旦比源严格，源里合法的数据到副本就插不进去。实测 6 张表在 RDS 侧
+            # 根本没有 user_id→users 的 FK（agent_action_queue / chat_r2_cleanup /
+            # chat_r2_lifecycle / v2_terminal_failure_outbox / v2_trajectory_events /
+            # v2_user_allowlist），其中 chat_r2_lifecycle 在 prod 有 32/344 行孤儿
+            # （user_id 在 users 里已不存在）——给它加 FK，SNAPSHOT 的
+            # TRUNCATE+COPY 单事务会因这 32 行整表失败，且每个 tick 都失败。
+            if _has_user_fk(conn, table):
                 body.append(
                     "    FOREIGN KEY (user_id) REFERENCES users (user_id) ON DELETE CASCADE")
             print(",\n".join(body))
@@ -911,7 +941,19 @@ wc -l /tmp/tee_ddl_draft.sql
 逐张过 `/tmp/tee_ddl_draft.sql`，改这三类：
 
 1. **CIPHERTEXT lane 的信封列改成明文列。** 7 张表里带 `*_envelope` / `doc` 的列，在 TEE 侧存的是解密后的明文 JSONB，列类型不变（仍是 `JSONB`）但**必须删掉派生出来的信封 CHECK 约束**（`ck_v2_trajectory_envelope` 等要求 `body_ct`/`K_enclave` 存在，明文行必然违反）。派生脚本不导出 CHECK，所以这里主要是确认没有漏带。
-2. **`user_id` 外键**：脚本已自动补 `ON DELETE CASCADE` 指向 TEE 自己的 `users`。核对每张有 `user_id` 的表都补上了，且**没有**给没有 `user_id` 的表（`dau_daily_snapshot` / `retention_cohort_snapshot` / `user_growth_daily_snapshot` / `v2_effect_sink_applied` / `v2_runtime_control` / `v2_worker_heartbeats`）误加。
+2. **`user_id` 外键：以 RDS 实际有没有为准，不是以"有没有 user_id 列"为准。**
+   脚本的 `_has_user_fk()` 已按 RDS 的 `pg_constraint` 判定。核对时确认这 6 张
+   **RDS 侧无 user_id→users FK 的表，TEE 侧也没有**：`agent_action_queue`、
+   `chat_r2_cleanup`、`chat_r2_lifecycle`、`v2_terminal_failure_outbox`、
+   `v2_trajectory_events`、`v2_user_allowlist`。
+
+   > 为什么这条是硬性的：TEE 是 RDS 的副本，副本比源库更严格就意味着"源里合法、
+   > 副本插不进"。实测 `chat_r2_lifecycle` 在 prod 有 **32/344 行孤儿**（`user_id`
+   > 在 `users` 里已不存在，疑似账号 reset 未清净的残留，与 memory
+   > `sql-delete-account-misses-worldbook-and-r2` 同类）。给它加 FK，SNAPSHOT 的
+   > `TRUNCATE`+`COPY` 单事务会因这 32 行整表失败，而且**每个 tick 都失败**。
+   >
+   > 孤儿本身是个独立问题，值得单独处理，但不该由 TEE 复制来暴露和阻塞。
 3. **IDENTITY 列**：带 `GENERATED ALWAYS AS IDENTITY` 的列要与 RDS 一致（复制时靠 `OVERRIDING SYSTEM VALUE` 原样搬 seq，见 `reconciler._IDENTITY_TABLES` 的注释）。
 
 - [ ] **Step 4: 写 revision**
@@ -919,7 +961,7 @@ wc -l /tmp/tee_ddl_draft.sql
 创建 `backend/alembic_tee/versions/0004_full_table_alignment.py`：
 
 ```python
-"""TEE 全量对齐：补齐 32 张缺失表（spec 2026-07-27-tee-full-table-alignment）
+"""TEE 全量对齐：补齐 34 张缺失表（spec 2026-07-27-tee-full-table-alignment）
 
 Revision ID: 0004_full_table_alignment
 Revises: 0003_merge_tee_heads
@@ -927,6 +969,14 @@ Create Date: 2026-07-27
 
 DDL 由 scripts/tee/derive_tee_ddl.py 从 prod RDS 实库派生后人工审校，不是手抄
 （手抄失真有前科，见 reconciler.TABLES 的注释）。
+
+⚠️ 本 revision 会重新创建 0002_drop_retired_supervisor 刚删掉的两张表
+（agent_runtime_instances / agent_runtime_supervisor_heartbeats）。这**不是**误操作，
+是 2026-07-27 用户在"TEE 全量对齐"目标下的明确决定：0002 当时按"V1 supervisor 已退役"
+撤销了这两张镜像，但实测 V1 在 RDS 侧仍然活着——prod 有 220 行 agent_runtime_instances
+和 1 行心跳，backend 也仍在写（db.py:335 / agent_runtime/leases.py:51）。既然目标是让
+TEE 成为 RDS 的完整副本以备扶正，就不能留这个缺口。
+已知代价（用户接受）：V1 真正退役后这两张表会在 RDS 侧消失，届时 TEE 侧需要再删一次。
 
 三类改动相对 RDS 原始 DDL：
 1. CIPHERTEXT lane（7 张）的信封列在 TEE 侧存明文，故不带 RDS 那边的信封 CHECK
@@ -1026,7 +1076,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import psycopg
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -1092,7 +1141,18 @@ def test_snapshot_propagates_update_and_delete(sample_table):
 
 def test_failed_snapshot_leaves_old_data_intact(sample_table, monkeypatch):
     """TRUNCATE + COPY 必须在同一事务：中途失败时 TEE 侧保留旧的完整快照，
-    绝不出现空表窗口（读路径会读到空表 = 用户数据凭空消失）。"""
+    绝不出现空表窗口（读路径会读到空表 = 用户数据凭空消失）。
+
+    ⚠️ 注入点必须落在 **dst 侧、TRUNCATE 之后、COPY 执行中途**，否则这条测试
+    是假阳性。本计划初版把 `_stream_rows` 整个换成抛异常的桩——那是**源库读取
+    阶段**就失败，异常从未到达 TEE 侧，`TRUNCATE` 和 `with dst.transaction():`
+    根本没被执行过。2026-07-28 审查实测证实：把 `with dst.transaction():` 整个
+    删掉，那一版测试**照样全绿**，对它声称守护的性质完全不敏感。
+
+    改法：让 `_stream_rows` 正常返回一段**损坏的 COPY 二进制载荷**，使失败真实
+    发生在 dst 的 `COPY FROM STDIN` 执行中途（此时 TRUNCATE 已经跑完）。这样
+    一旦有人拿掉事务边界，TEE 侧就会变成空表，本测试立刻变红。
+    """
     with db.get_pool().connection() as c:
         c.execute("INSERT INTO _snap_probe (k, v) VALUES ('a','1')")
     snapshot.snapshot_table(sample_table)
@@ -1101,14 +1161,32 @@ def test_failed_snapshot_leaves_old_data_intact(sample_table, monkeypatch):
     with db.get_pool().connection() as c:
         c.execute("UPDATE _snap_probe SET v='2' WHERE k='a'")
 
-    def boom(*a, **kw):
-        raise RuntimeError("injected mid-copy failure")
-
-    monkeypatch.setattr(snapshot, "_stream_rows", boom)
+    # 合法的 PGCOPY 签名开头 + 垃圾字节：COPY FROM 会在 TRUNCATE 之后解析失败。
+    monkeypatch.setattr(
+        snapshot, "_stream_rows",
+        lambda *a, **kw: b"PGCOPY\n\xff\r\n\x00\x00\x00\x00\x00GARBAGE")
     rep = snapshot.snapshot_table(sample_table)
     assert rep["ok"] is False
-    assert "injected" in (rep["error"] or "")
-    # 旧快照原样还在，没被 TRUNCATE 掉。
+    # 旧快照原样还在，没被 TRUNCATE 掉——证明事务回滚真的生效了。
+    assert _tee_rows(sample_table) == [("a", "1")]
+
+
+def test_snapshot_refuses_when_table_exceeds_max_rows(sample_table, monkeypatch):
+    """超限必须失败，且**不能碰 TEE**。
+
+    静默截断会让 TEE 缺数据而无人察觉；正确的处理是干净失败，由人把这张表改判到
+    CIPHERTEXT（游标增量）或 LOGICAL（逻辑复制）lane。
+    """
+    with db.get_pool().connection() as c:
+        c.execute("INSERT INTO _snap_probe (k, v) VALUES ('a','1')")
+    snapshot.snapshot_table(sample_table)          # 先放一份旧快照进去
+    assert _tee_rows(sample_table) == [("a", "1")]
+
+    monkeypatch.setattr(snapshot, "_row_count", lambda *a, **kw: snapshot.MAX_ROWS + 1)
+    rep = snapshot.snapshot_table(sample_table)
+    assert rep["ok"] is False
+    assert "MAX_ROWS" in (rep["error"] or "")
+    # 早退分支绝不能清源或碰 TEE：旧快照必须原样保留。
     assert _tee_rows(sample_table) == [("a", "1")]
 
 
@@ -1282,6 +1360,7 @@ python -m pytest tests/ -q --ignore=tests/e2e_model_api_test.py --ignore=tests/t
 ## Task 6: 把 SNAPSHOT 接进调度器与 admin 通道
 
 **Files:**
+- Modify: `backend/tee_shadow/table_registry.py`（新增 `PSEUDO_CIPHERTEXT_TABLES` 常量）
 - Modify: `backend/admin/tee_replication.py:36`（`_ACTIONS`）、`:64`（`_validate`）、`:110`（`run_action` 分派）
 - Modify: `backend/admin/tee_sync_scheduler.py`（`_CIPHERTEXT_TABLES` 改为派生；新增 snapshot 段；`_LOG_KEYS` / `_blank_summary` 补字段）
 - Test: `tests/test_tee_sync_scheduler.py`（已存在，增补用例）
@@ -1316,7 +1395,28 @@ def test_ciphertext_tables_are_derived_from_registry():
     from admin import tee_sync_scheduler as sched
     from tee_shadow import table_registry as reg
 
-    assert set(sched._ciphertext_tables()) == set(reg.tables_in_lane(reg.CIPHERTEXT))
+    want = set(reg.tables_in_lane(reg.CIPHERTEXT)) | set(reg.PSEUDO_CIPHERTEXT_TABLES)
+    assert set(sched._ciphertext_tables()) == want
+
+
+def test_scheduler_covers_every_worker_table():
+    """调度器必须覆盖 worker._TABLES 的**每一个 key**，包括非表名的伪 key。
+
+    这条是上一条的反向守卫，缺了它就会重演 2026-07-28 的回归：把写死的
+    _CIPHERTEXT_TABLES 改成"按 lane 派生"时，静默丢掉了 "identity" 这个伪表名
+    （它实际操作 user_blobs WHERE kind='identity'，而 user_blobs 整表登记在
+    MIRROR lane，因此永远不会出现在 CIPHERTEXT lane 里）。后果是整条用户身份/
+    人设的同步路径消失，而上一条测试是同义反复、抓不到。
+    """
+    from admin import tee_sync_scheduler as sched
+    from tee_replicator import worker
+
+    missing = sorted(set(worker._TABLES) - set(sched._ciphertext_tables()))
+    assert not missing, (
+        f"worker 配了这些复制目标，但调度器不会去跑它们：{missing}\n"
+        "若某个 key 不是 RDS 表名（伪表名），把它加进 "
+        "table_registry.PSEUDO_CIPHERTEXT_TABLES。"
+    )
 
 
 def test_sync_tick_records_snapshot_metrics(monkeypatch):
@@ -1377,8 +1477,22 @@ _ACTIONS = ("reconcile", "replicate", "verify", "snapshot")
         elif action == "snapshot":
             from tee_shadow import snapshot as tee_snapshot
 
-            report = (tee_snapshot.snapshot_all() if table is None
-                      else {"tables": [tee_snapshot.snapshot_table(table)]})
+            if dry_run:
+                # dry-run 短路，与 _run_reconcile 同款：只回计划、绝不碰 TEE。
+                #
+                # ⚠️ 这条分支是**安全必需**，不是锦上添花。confirm 门的条件是
+                # `action != "verify" and not dry_run and confirm != "MIGRATE"`——
+                # 也就是说 dry_run=True 时**根本不检查 confirm**。而 HTTP 端点
+                # `POST /v1/admin/tee-replication/run`（routes_asgi.py:286）是
+                # `dry_run=payload.get("dry_run", True)`，默认 True。
+                # 少了这条短路，一个 `{"action": "snapshot"}` 的探测请求（admin 按
+                # reconcile/replicate 的既有习惯，会以为这是安全的演练）就会直接对
+                # TEE 侧 25 张表做真实 TRUNCATE+COPY，且绕过全部确认门。
+                tables = list(tee_snapshot.snapshot_order()) if table is None else [table]
+                report = {"planned": tables, "tables": [], "copied": 0, "failures": 0}
+            else:
+                report = (tee_snapshot.snapshot_all() if table is None
+                          else {"tables": [tee_snapshot.snapshot_table(table)]})
 ```
 
 同时把模块顶部 docstring 里列的三个入口补上 snapshot 一行。
@@ -1392,13 +1506,129 @@ _ACTIONS = ("reconcile", "replicate", "verify", "snapshot")
 ```python
 # 密文表 —— 经 enclave 解密成明文。**从注册表派生**，不再手工维护：手工清单正是
 # "加了表但某一处没登记"的老问题的来源（2026-07-27 之前 V2 的 19 张表一处都没登记）。
+#
+# ⚠️ 必须并上 PSEUDO_CIPHERTEXT_TABLES。worker._TABLES 的 key 不全是 RDS 表名——
+# "identity" 是个伪表名，实际操作的是 `user_blobs WHERE kind='identity'`
+# （RDS 侧密文信封 → enclave 解密 → TEE 侧 user_blobs 明文行）。注册表按表名登记，
+# user_blobs 整表归 MIRROR lane（reconciler 的 _SCOPE_WHERE 又特意排除 kind='identity'
+# 把它让给 replicator），所以 CIPHERTEXT lane 里**不会**出现 "identity" 这个 key。
+# 只按 lane 派生会静默丢掉整条用户身份/人设的同步路径（2026-07-28 Task 6 实施期发现）。
 def _ciphertext_tables() -> tuple[str, ...]:
     from tee_shadow import table_registry as reg
 
-    return reg.tables_in_lane(reg.CIPHERTEXT)
+    return tuple(sorted(
+        set(reg.tables_in_lane(reg.CIPHERTEXT)) | set(reg.PSEUDO_CIPHERTEXT_TABLES)
+    ))
 ```
 
-并把 `_sync_tick` 里 `for table in _CIPHERTEXT_TABLES:` 改成 `for table in _ciphertext_tables():`。
+同时在 `backend/tee_shadow/table_registry.py` 末尾（`synced_tables()` 之后）加这个常量：
+
+```python
+# worker._TABLES 里那些**不是 RDS 表名**的 key。
+#
+# "identity" 实际操作 `user_blobs WHERE kind='identity'`：RDS 侧是密文信封，经 enclave
+# 解密后写进 TEE 侧 user_blobs 的明文行。它没法作为 REGISTRY 的一条登记——REGISTRY 按
+# 表名索引，而 user_blobs 整表已登记为 MIRROR（reconciler 的 _SCOPE_WHERE 排除了
+# kind='identity'，正是把这部分让给 replicator）。
+#
+# 放在这里而不是散落在调度器里，是为了让"CIPHERTEXT 通道要跑哪些东西"仍然只有一个出处。
+# 它刻意不进 REGISTRY，因此不受完备性守卫约束（守卫比的是真实表名）。
+PSEUDO_CIPHERTEXT_TABLES: tuple[str, ...] = ("identity",)
+```
+
+并在它下面再加一个函数，供 replicate 循环使用：
+
+```python
+def _replicable_tables() -> tuple[str, ...]:
+    """本 tick 真正要 replicate 的表 = 调度清单 ∩ worker 已配置的表。
+
+    取交集而不是直接用 _ciphertext_tables()：注册表可能已经把某张表登记为 CIPHERTEXT，
+    而 tee_replicator.worker._TABLES 里还没有它的复制配置（跨 Task 的中间态，或有人
+    先登记后接线）。直接调过去会让 tee_replication._validate 抛
+    BadRequest("unknown_table")，被兜底 except 吞掉后计入 replicate_table_failures
+    并触发指数退避（封顶 1 小时）——每个 tick 白报错一次，既污染失败率指标，又让
+    "真失败"和"还没接线"在指标里混成一团。
+
+    取了交集之后，未接线的表被静默跳过、接线后自动被吸收，不需要任何跨 Task 的部署
+    时序协调（否则就得靠"某某 Task 完成前不要部署"这种人工记忆——本仓库已经有多次
+    "改完忘了部署/提交"的前科）。反向守卫 test_scheduler_covers_every_worker_table
+    的语义不受影响：它管的是"worker 配了的表调度器不能漏"，方向相反。
+    """
+    from tee_replicator import worker as tee_worker
+
+    return tuple(t for t in _ciphertext_tables() if t in tee_worker._TABLES)
+```
+
+并把 `_sync_tick` 里 `for table in _CIPHERTEXT_TABLES:` 改成 `for table in _replicable_tables():`。
+
+> ⚠️ **同时必须更新既有测试里对这个名字的全部引用**，否则它们会集体 `AttributeError`
+> （2026-07-28 实测：漏掉这步会让 `tests/test_tee_sync_scheduler.py` 从全绿变成 6 failed）。
+> 常量变成函数是个破坏性改名，`grep -rn "_CIPHERTEXT_TABLES" --include="*.py" .` 找全部引用：
+>
+> - `tests/test_tee_sync_scheduler.py:44` 与 `:121` — `list(sched._CIPHERTEXT_TABLES)`
+>   → `list(sched._replicable_tables())`（它们断言的是 replicate 循环**实际遍历**的表，
+>   所以用交集那个，不是调度清单那个）
+> - `tests/test_tee_sync_metrics.py:114` 与 `:147` — `len(sched._CIPHERTEXT_TABLES)`
+>   → `len(sched._replicable_tables())`；`:147` 旁边"其余 4 张各 1"的注释也要跟着改
+>   （密文表已从 5 张增到 12 张）
+>
+> `backend/tee_shadow/verify.py` 里也有个 `_CIPHERTEXT_TABLES`，但那是 verify 自己的 dict、
+> 与调度器无关，**不要动**；`backend/db.py:8955` 那处只是注释里提到它，也不要动。
+
+> ⚠️ **还要更新 5 个既有测试对 tick 行为契约的断言**（2026-07-28 实测：漏掉会剩 5 failed）。
+> 本 Task 改变了两件可观测的事：① tick 多了一个 snapshot 阶段；② 密文表从 5 张增到 12 张。
+> 这些测试把两者都写死了：
+>
+> | 测试 | 原断言 | 改成 |
+> |---|---|---|
+> | `test_reconcile_runs_before_replicate_then_verify` | `["reconcile"] + ["replicate"]*5 + ["verify"]` | `["reconcile", "snapshot"] + ["replicate"]*len(sched._replicable_tables()) + ["verify"]` |
+> | `test_reconcile_failure_does_not_block_replicate` | `calls.count("replicate") == 5` | `== len(sched._replicable_tables())` |
+> | `test_one_table_error_does_not_stop_the_pass` | `seen == list(...)` | `seen == ["snapshot"] + list(sched._replicable_tables())` |
+> | `test_already_running_aborts_replicate_phase` | `[("reconcile",None), ("replicate","chat_messages")]` | 见下方代码块（**不要写死表名**） |
+> | `test_unconfigured_aborts_silently` | `["reconcile", "replicate"]` | `["reconcile", "snapshot"]` |
+>
+> 最后两条有**语义变化**，不是简单插一项，改的时候要理解为什么：
+> - `AlreadyRunning`：snapshot 段只 log 不 return（与 replicate 循环里会 return 不同），
+>   所以流程继续走到 replicate，仍在第一张表上中止。
+> - `Unconfigured`：snapshot 段 `return reconcile_ok`，**replicate 根本不会被调用**——
+>   中止点从"第一次 replicate"提前到了"snapshot"。测试名所表达的"Unconfigured 时静默中止"
+>   这个意图不变，变的只是在哪一步中止。
+>
+> `test_already_running_aborts_replicate_phase` 的正确写法——**首张表名不能写死**：
+>
+> ```python
+>     # 中止发生在 replicate 循环的第一张表上；表名随注册表内容变化，别写死。
+>     # （2026-07-28：密文表从手写元组改为按字母序派生后，首张已从 chat_messages
+>     #  变成 chat_message_archive。）
+>     first = sched._replicable_tables()[0]
+>     assert calls == [("reconcile", None), ("snapshot", None), ("replicate", first)]
+> ```
+>
+> 另外**新增一条测试守住交集语义**（否则谁把 `_replicable_tables()` 改回
+> `_ciphertext_tables()` 都不会红）：
+>
+> ```python
+> def test_replicate_skips_tables_without_a_worker_config():
+>     """replicate 只跑 worker 真正配了的表。
+>
+>     注册表可能先登记、worker 后接线（跨 Task 的中间态）。若直接对全部
+>     CIPHERTEXT lane 调 replicate，未接线的表会让 _validate 抛 unknown_table，
+>     被吞掉后计入 replicate_table_failures 并触发指数退避——每 tick 白报错，
+>     还把"真失败"和"没接线"混进同一个指标。
+>     """
+>     from admin import tee_sync_scheduler as sched
+>     from tee_replicator import worker
+>
+>     replicable = set(sched._replicable_tables())
+>     assert replicable <= set(worker._TABLES), "replicate 目标必须都有 worker 配置"
+>     # 已登记但未接线的表必须被跳过，不能出现在 replicate 目标里。
+>     unwired = set(sched._ciphertext_tables()) - set(worker._TABLES)
+>     assert not (replicable & unwired)
+> ```
+>
+> 顺带把硬编码的 `5` 全部换成 `len(sched._replicable_tables())`，免得 Task 7 往
+> `worker._TABLES` 里加表时这些测试又集体变红。同理，凡是断言里出现具体密文表名的地方，
+> 都改成从 `sched._ciphertext_tables()` 取——这批清单以后还会变。
 
 在 `_blank_summary` 的 dict 里补两个字段（放在 `"reconcile_skipped": 0,` 之后）：
 
@@ -1412,7 +1642,37 @@ def _ciphertext_tables() -> tuple[str, ...]:
     "snapshot_copied", "snapshot_failures",
 ```
 
+**还要让这两个指标真正落库**，否则它们只出现在日志行里、永远不是 `tee_sync_runs` 的可查询列
+（与 `reconcile_copied` / `replicate_copied` 等同类字段的既有约定不一致，按列做趋势查询的人
+看不到 snapshot 数据）。两处：
+
+1. `backend/db.py:737` 的 `_TEE_SYNC_RUN_COLS` 末尾补上这两个列名——`record_tee_sync_run()`
+   只按这个常量取值插库，不在清单里的 summary key 会被静默丢弃。
+2. 新建 RDS 侧 alembic revision（`backend/alembic/versions/`，**不是 alembic_tee**——
+   `tee_sync_runs` 登记在 SKIP lane，是同步机制自己的控制面表，住在 RDS）：
+
+```sql
+ALTER TABLE tee_sync_runs ADD COLUMN IF NOT EXISTS snapshot_copied   INTEGER;
+ALTER TABLE tee_sync_runs ADD COLUMN IF NOT EXISTS snapshot_failures INTEGER;
+```
+
+revision 的 `down_revision` 要指向当时 RDS 链的 head（用
+`python -c "import sys; sys.path.insert(0,'backend'); from alembic.config import Config; from alembic.script import ScriptDirectory; c=Config('backend/alembic.ini'); c.set_main_option('script_location','backend/alembic'); print(ScriptDirectory.from_config(c).get_heads())"`
+现查，**不要照抄本文里的任何 revision 号**）。
+
 在 `_sync_tick` 里，**(1) reconcile 之后、(2) replicate 之前**插入 snapshot 段。位置是刻意的：snapshot 表带指向 `users` 的 FK，必须在 reconcile 灌完父表之后；而它比 replicate 便宜得多（无 enclave 往返），放前面能让它不被慢的密文复制饿死。
+
+> **这个顺序是一条真实风险的缓解措施，不要随意调整（2026-07-28 Task 5 审查发现）**：
+> SNAPSHOT lane 的 25 张表里有 21 张带指向 `users` 的 FK，而 `users` 归 MIRROR lane、
+> 由独立的异步路径灌入 TEE。若某新用户的 `users` 行尚未镜像过去，而 ta 在某张 SNAPSHOT 表
+> （如 `agent_jobs`）里已有行，该表整个 `COPY FROM STDIN` 会因 FK 违反而回滚——
+> **爆炸半径是这张表全体用户的快照，不只是那一个新用户**。
+>
+> 把 snapshot 排在 reconcile（灌 `users` 的那一步）之后，绝大多数情况下父行已就位。
+> 残余窗口是"reconcile 跑完到 snapshot 跑完之间新注册的用户"，代价是该表这一轮快照失败、
+> 下一轮自动追平（全量刷天然幂等，无需断点续传），属可接受的最终一致退化。
+>
+> 排查提示：某张 SNAPSHOT 表长期追不平时，第一个要查的就是它有没有 FK 违反、`users` 是否落后。
 
 ```python
     # (1.5) snapshot 明文小表 —— 在 reconcile 之后（FK 父表已在）、replicate 之前
@@ -1458,6 +1718,98 @@ pyflakes 全仓恒剩 1 条 unused 是预期（见 memory `autoflake-kills-modul
 ## Task 7: CIPHERTEXT lane 扩展 + 解密探针 gate
 
 7 张密文表并入 replicator。**这个 Task 有一个硬 gate：探针不过就停下来找用户，不要自行改判 lane。**
+
+> ### ⚠️ 执行顺序：探针必须先做（2026-07-28 修订）
+>
+> 下面的 Step 编号是按"实现→验证"写的，但**实际执行顺序要反过来**：
+> **先做 Step 6（写探针脚本）+ Step 7（跑 gate），过了再回头做 Step 1-5 的接线。**
+>
+> **一个必须先行的例外**：探针会调用 `transforms.plaintext_envelope_column`（Step 3 的产出）。
+> 所以顺序是 **Step 3 的那个纯函数 → Step 6 探针 → Step 7 gate → Step 1/2/4/5 接线**。
+> 先落地那个函数是安全的：它是无副作用的纯函数、此刻还没有任何调用者，加进去不改变
+> 任何现有行为。（2026-07-28 实施期发现——重排 Step 顺序时漏看了这条依赖。）
+>
+> 理由：探针是唯一能推翻整个 lane 归类的 gate。`v2_trajectory_events` 的
+> `enclave_pk_fpr` 实测**全部为空**（prod 567/567、test 124/124）——没有任何字段记录它是用
+> 哪把 enclave 钥封的，解不解得开只能实跑。若解不开，这张表（乃至其它几张）就要回退成
+> "密文原样搬"，届时 Step 1-5 写的 transform 与 `_TABLES` 配置全部作废。先花十几分钟跑探针，
+> 好过先写几百行注定要删的接线代码。
+>
+> ### 这 7 张表的真实结构（实测，**不要照抄下文示例**）
+>
+> | 表 | PK | 信封列 | 备注 |
+> |---|---|---|---|
+> | `chat_message_archive` | `(user_id, source_seq)` | `doc` | 有 `msg_id`/`ts`，与 `chat_messages` 同形，可复用 `plaintext_chat_doc` + `_chat_unpack` |
+> | `v2_trajectory_events` | `(job_id, event_index)` | `payload_envelope` | **PK 不含 user_id**（表里有该列）；无单一 id 列 |
+> | `model_api_credentials` | `(id uuid)` | `api_key_envelope` | **无单一 doc 列**，另有 provider/label/base_url 等业务列 |
+> | `v2_conversation_summary` | `(user_id)` | `summary_envelope` | 每用户一行 |
+> | `v2_conversation_summary_segments` | `(segment_id)` | `summary_envelope` | `segment_id` 是 **IDENTITY ALWAYS**，upsert 必须带 `OVERRIDING SYSTEM VALUE` |
+> | `v2_trajectory_reviews` | `(source_job_id)` | `review_envelope` | 信封可为 NULL |
+> | `v2_workspace_entries` | `(user_id, path)` | `content_envelope` | |
+>
+> ### ⚠️⚠️ 冷启动游标必须给类型安全的下界（2026-07-28 审查发现，7 张表曾 100% 必崩）
+>
+> `_read_cursor()` 对**从未跑过的表**返回 `(0.0, "")`，而 `_decode_cursor()` 的
+> `text`/`single` 分支会把那个**空字符串原样**当 SQL 参数塞进
+> `WHERE (sort_col, id_col) > (%s, %s)`。
+>
+> 这对既有 5 张表恰好是安全的——它们的排序列/id 列在 RDS 里都是 **TEXT**，空串是合法的
+> 文本下界。但本次新增的 7 张表排序列是 **TIMESTAMPTZ**（`created_at`/`cleared_at`/
+> `updated_at`）或 **BIGINT**，空串无法 cast，**第一次执行 select_sql 就抛
+> `InvalidDatetimeFormat` / `InvalidTextRepresentation`**。
+>
+> 实测（用真实 `_TABLES` + `_decode_cursor` 对 test RDS 跑冷启动游标）：新增 7 张
+> **全部 FAIL**，既有 5 张**全部 OK**。后果不是"漏几行"，是**一行都进不去**；而且
+> scheduler 的 per-table try/except 会把它吞掉并计入退避，于是每个 tick 永远失败、
+> 永远 0 行同步，没有任何人会发现。
+>
+> **为什么之前没抓到**：所有验证（包括实施者的实库链路验证和我跑的 45 passed）都假设
+> "游标已存在"，没有一条覆盖 `(0.0, "")` 这个新表必经的初始态；新增的单元测试也没有
+> 一条真正调用 `worker.run_table()`。这是整片验证盲区，不是某个人的疏忽。
+>
+> **修法**：给 `_Table` 加一个字段，让每张表显式声明自己"从头开始"时的游标参数：
+>
+> ```python
+>     # 冷启动（tee_replication_cursors 里还没有本表的行）时喂给 select_sql 的参数元组。
+>     # None = 沿用通用逻辑（既有表：排序列是 TEXT，空串就是合法下界）。
+>     # 排序列是 TIMESTAMPTZ / BIGINT 的表**必须**显式给，否则空串 cast 失败、整表永不同步。
+>     cursor_zero: tuple | None = None
+> ```
+>
+> `_decode_cursor` 开头加一句短路：
+>
+> ```python
+>     if not wm_id and cfg.cursor_zero is not None:
+>         return cfg.cursor_zero
+> ```
+>
+> 7 张新表的取值（已实测可用）：TIMESTAMPTZ 排序列用 `("-infinity", "")`，
+> `v2_conversation_summary_segments` 用 `("0",)`。实测 `select … where (created_at, job_id)
+> > ('-infinity', 0)` 返回全部 124 行、`where segment_id > '0'` 返回全部 6 行。
+>
+> **并且必须补一条真正跑 `run_table()` 冷启动的测试**——这个 bug 能活下来，正是因为没有
+> 任何测试走过那条路径。
+>
+> ### ⚠️ `v2_conversation_summary_segments` 不要用裸序列值当游标（同次审查发现）
+>
+> 用 `segment_id`（`GENERATED ALWAYS AS IDENTITY`）本身排序有经典竞态：`nextval()` 的
+> **取号顺序不等于事务提交顺序**。若拿到 `segment_id=5` 的事务比拿到 `6` 的晚提交，而扫描
+> 恰好落在两次提交之间，游标会先推过 6，等 5 提交时已不满足 `segment_id > 6` → **永久跳过、
+> 不报错、不冻结游标**。
+>
+> 本仓库其实已经避过这个坑一次：`chat_messages.seq` 同样是全局 IDENTITY，但 worker 明确用
+> `(ts, msg_id)` 而非 `seq` 做游标（`seq` 只用于事后 setval 对齐）。该表写路径是 per-user
+> 并发的多处 INSERT，具备触发条件。
+>
+> **改成 `(created_at, segment_id)` 复合游标**（`cursor_kind` 从 `single` 改为 `text`），
+> 与其余 6 张新表统一。该表确有 `created_at` 列（已核实）。
+>
+> **replicator 的 `_Table` 契约是 `(user_id, item_id, sort_val, doc)` 四元组 + `(sort, item_id)`
+> 两列游标**，而上面几张表要么 PK 不含 `user_id`、要么是复合 PK、要么没有单一 doc 列。
+> 套进契约的既有手法是 **`chat_messages` 的 `_SEQ_KEY` 走私**（见 `worker.py:135-164`）：
+> 把塞不进四元组的额外列作为保留键放进 doc dict，`transform` 会原样透传（它只剥
+> `_ENVELOPE_KEYS`），`upsert_args` 再 `pop` 出来拼进 SQL。每张表都要按自己的形状设计
+> `unpack`/`upsert_args`，**没有通用模板**。
 
 **Files:**
 - Modify: `backend/tee_replicator/transforms.py`（新增通用单信封 transform）
@@ -1566,6 +1918,22 @@ def plaintext_envelope_column(env: dict, decrypt, *, purpose: str) -> dict:
     ),
 ```
 
+> ⚠️ **`v2_conversation_summary_segments` 有 IDENTITY 陷阱（2026-07-28 Task 4 实施期发现）**：
+> 它的 `segment_id` 在 RDS 侧是 `GENERATED ALWAYS AS IDENTITY`（实测 `is_identity=YES,
+> identity_generation=ALWAYS`），`alembic_tee 0004` 已如实照搬为 ALWAYS。PostgreSQL **禁止**
+> 对 ALWAYS 列显式赋值，除非 INSERT 带 `OVERRIDING SYSTEM VALUE`。所以这张表的 `upsert_sql`
+> 必须写成 `INSERT INTO ... OVERRIDING SYSTEM VALUE VALUES (...)`，否则每行都会硬报错。
+>
+> 参照现成的 `chat_messages` 配置（`worker.py:185`）——它正是这么做的，且注释解释了另一半：
+> `ON CONFLICT DO UPDATE` 分支**绝不能**再赋值该列（`OVERRIDING SYSTEM VALUE` 在 UPDATE 语境
+> 没有等价物，写了就是 SQL 硬错误）；冲突意味着该行首次插入时 id 已正确，保留即可。
+>
+> 其余带自增列的表（`agent_jobs` / `v2_turn_metrics` / `agent_action_queue` /
+> `agent_status_events` / `v2_capture_batches` / `v2_sandbox_usage_events` /
+> `v2_trajectory_access_audit`）在 RDS 侧是 `DEFAULT nextval(...)` 而非真 IDENTITY，
+> 0004 建成了 `GENERATED BY DEFAULT AS IDENTITY`，**允许显式插值、不需要 OVERRIDING**。
+> 它们都在 SNAPSHOT lane，走 `COPY FROM`，不受影响。
+
 **每条的列名/PK 必须先从实库查准，不要照抄上面的示例**：
 
 ```bash
@@ -1612,8 +1980,8 @@ import argparse
 import sys
 from collections import Counter
 from pathlib import Path
-
 import psycopg
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend"))
 
@@ -1661,10 +2029,18 @@ def probe_table(dsn: str, table: str, column: str, limit: int) -> Counter:
             tally["ok"] += 1
         except transforms.PendingDeviceMigration:
             tally["pending_device"] += 1
-        except transforms.PermanentDecryptFailure:
-            tally["permanent_fail"] += 1
         except Exception as exc:  # noqa: BLE001
-            tally[f"other:{type(exc).__name__}"] += 1
+            # ⚠️ 不能写成 `except transforms.PermanentDecryptFailure`——那个异常
+            # **transforms 自己从不抛**。把"裸 403 decrypt_failed"重分类成它的逻辑长在
+            # worker._transform_with_retry（worker.py:366/386），而探针刻意不走那一层
+            # （它需要 _TABLES 里的 _Table 配置，而这 7 张表在探针阶段还没接线）。
+            # 所以这里直接复用 worker 的判定函数，否则「enclave 确定性拒解」会和网络抖动
+            # 一起落进 other:*——而这两类的处置完全相反：前者是毒行、要隔离并从 lane 里
+            # 剔除，后者重试就好。混在一桶里，gate 的结论就没有意义了。
+            if worker._is_permanent_decrypt_failure(exc):
+                tally["permanent_fail"] += 1
+            else:
+                tally[f"other:{type(exc).__name__}"] += 1
     return tally
 
 
@@ -1731,15 +2107,37 @@ done
 
 ## Task 8: verify 扩范围 + 端到端验收 + prod 落地
 
-没有这一步，新增的 32 张表不进 `verify`，就会出现上游 plan 点名的"**全绿假象**"——`tee_sync_runs.verify_ok=true` 但那 32 张表压根没被核对过。
+没有这一步，新增的 34 张表不进 `verify`，就会出现上游 plan 点名的"**全绿假象**"——`tee_sync_runs.verify_ok=true` 但那 34 张表压根没被核对过。
+
+> **⚠️ 2026-07-28 开工前实测修订（controller）**：本 Task 的原文低估了缺口，实测
+> `covered = reconciler.TABLES ∪ verify._CIPHERTEXT_TABLES ∪ SNAPSHOT` 相对
+> `registry.synced_tables()`（51 张）**缺 9 张**，不是原文假设的"只差 SNAPSHOT 25 张"：
+>
+> 1. **7 张 Task 7 新接入的 CIPHERTEXT 表**（`chat_message_archive` /
+>    `model_api_credentials` / `v2_conversation_summary` /
+>    `v2_conversation_summary_segments` / `v2_trajectory_events` /
+>    `v2_trajectory_reviews` / `v2_workspace_entries`）——它们进了
+>    `worker._TABLES`，但 `verify._CIPHERTEXT_TABLES` 仍是老的 5 条。
+> 2. **2 张登记成 MIRROR 但根本没有同步路径的表**（`agent_runtime_instances` /
+>    `agent_runtime_supervisor_heartbeats`）：MIRROR lane 的含义是"`db.py` 热路径双写
+>    + `reconciler.TABLES` 兜底"，实测这两张表**两边都没有**——`db.py:335` 与
+>    `agent_runtime/leases.py:51` 只写 RDS，`reconciler.TABLES` 里也没有它们。
+>    0004 把表建出来了，但没有任何东西往里灌数据。
+>
+> **修订决定（controller 判断，非用户新决策）**：这两张表改判 **SNAPSHOT lane**。
+> 用户当初的决定是"这两张表要在 TEE 里有数据"，lane 标签是我在以为存在双写路径时
+> 贴的；实际要补 MIRROR 就得给 `leases.py` 的 8 处租约热路径写点逐个挂双写，代价和
+> 风险都远高于每 tick 整表刷一遍（prod 实测 230 行 + 1 行，且 **0 孤儿**，SNAPSHOT
+> 的 FK 前提满足）。SNAPSHOT 同样满足"TEE 里有数据且持续跟进"的原始意图。
 
 **Files:**
-- Modify: `backend/tee_shadow/verify.py`（`run()` 覆盖 SNAPSHOT lane）
+- Modify: `backend/tee_shadow/verify.py`（`covered_tables()` + SNAPSHOT lane + 7 张新密文表）
+- Modify: `backend/tee_shadow/table_registry.py`（2 张 supervisor 表 MIRROR → SNAPSHOT）
 - Test: `tests/test_tee_verify.py`（增补）
 
 **Interfaces:**
-- Consumes: `table_registry.tables_in_lane(SNAPSHOT)`、`verify._table_report`（已有）
-- Produces: `verify.run()` 的 `tables` 字典多出 25 个 key
+- Consumes: `table_registry.tables_in_lane(SNAPSHOT)`、`verify._ciphertext_table_report`（已有）
+- Produces: `verify.covered_tables()`；`verify.run()` 的 `tables` 字典多出 34 个 key
 
 - [ ] **Step 1: 写失败测试**
 
@@ -1753,9 +2151,7 @@ def test_verify_covers_every_synced_table():
     from tee_shadow import verify
 
     covered = set(verify.covered_tables())
-    want = set(reg.synced_tables())
-    # frame_envelopes 在 verify 里的 key 是密文表配置的 key，单独放行。
-    missing = sorted(want - covered - {"frame_envelopes"})
+    missing = sorted(set(reg.synced_tables()) - covered)
     assert not missing, f"这些表进了 TEE 但 verify 不核对它们：{missing}"
 ```
 
@@ -1766,11 +2162,86 @@ python -m pytest tests/test_tee_verify.py -k covers_every -v
 ```
 预期 `AttributeError: module 'tee_shadow.verify' has no attribute 'covered_tables'`。
 
-- [ ] **Step 3: 实现**
+- [ ] **Step 3a: 两张 supervisor 表改判 SNAPSHOT**
 
-在 `backend/tee_shadow/verify.py` 里，`run()` 之前加：
+`backend/tee_shadow/table_registry.py`，把这两条从 `MIRROR` 改成 `SNAPSHOT`，理由写进
+`reason`（注册表的 `reason` 是给未来的人看的，不能只写 lane 名）：
 
 ```python
+    "agent_runtime_instances": Entry(
+        SNAPSHOT,
+        "V1 runtime 实例登记（租约/状态高频原地 UPDATE）。不走 MIRROR：leases.py 有 8 处"
+        "租约热路径写点，逐个挂双写的代价和风险都高于整表刷；prod 实测 230 行 0 孤儿"),
+    "agent_runtime_supervisor_heartbeats": Entry(
+        SNAPSHOT,
+        "V1 supervisor 心跳（单行，每次心跳原地 UPDATE），同上走整表刷"),
+```
+
+- [ ] **Step 3b: verify 覆盖 7 张新密文表 + 25+2 张 SNAPSHOT 表**
+
+`backend/tee_shadow/verify.py`。
+
+先给 `_CIPHERTEXT_TABLES` 的注释块补一条 key 说明，然后追加 7 条配置。**`kind=None`
+表示不做内容抽样**——`_sample_ciphertext_content` 写死了读 `doc` 列，而这 7 张表的信封
+列各不相同（`payload_envelope` / `api_key_envelope` / `summary_envelope` /
+`review_envelope` / `content_envelope`），要抽样得先把列名参数化，那是独立一档工作；
+本 Task 只做行数核算（`rds == tee + pending`），已经足以抓住"整张表没被同步"：
+
+```python
+    # kind=None：只核行数不做内容抽样，见下方 run() 的分支注释。
+    # strict=False：行数不进硬 gate，见 _rows_ok_advisory 的注释。
+    "chat_message_archive": dict(
+        rds_table="chat_message_archive", tee_table="chat_message_archive",
+        item_col="msg_id", pending_table="chat_message_archive",
+        kind=None, strict=False),
+    "model_api_credentials": dict(
+        rds_table="model_api_credentials", tee_table="model_api_credentials",
+        item_col="id", pending_table="model_api_credentials",
+        kind=None, strict=False),
+    "v2_conversation_summary": dict(
+        rds_table="v2_conversation_summary", tee_table="v2_conversation_summary",
+        item_col="user_id", pending_table="v2_conversation_summary",
+        kind=None, strict=False, pending_by_user_only=True),
+    "v2_conversation_summary_segments": dict(
+        rds_table="v2_conversation_summary_segments",
+        tee_table="v2_conversation_summary_segments",
+        item_col="segment_id", pending_table="v2_conversation_summary_segments",
+        kind=None, strict=False),
+    "v2_trajectory_events": dict(
+        rds_table="v2_trajectory_events", tee_table="v2_trajectory_events",
+        item_col="job_id", pending_table="v2_trajectory_events",
+        kind=None, strict=False),
+    "v2_trajectory_reviews": dict(
+        rds_table="v2_trajectory_reviews", tee_table="v2_trajectory_reviews",
+        item_col="source_job_id", pending_table="v2_trajectory_reviews",
+        kind=None, strict=False),
+    "v2_workspace_entries": dict(
+        rds_table="v2_workspace_entries", tee_table="v2_workspace_entries",
+        item_col="path", pending_table="v2_workspace_entries",
+        kind=None, strict=False),
+```
+
+`v2_conversation_summary` 的 `pending_by_user_only=True` 与 Task 9 给它配的
+`requeue_by_user_only=True` 是同一回事（一行/用户，item_id 就是 user_id）。
+
+在 `run()` 之前加两个函数：
+
+```python
+def _rows_ok_advisory(rds_rows: int, tee_rows: int) -> bool:
+    """新增 lane 的行数硬判据：只抓"这张表从没被同步过 / 一直在失败"。
+
+    不能用 rds_rows == tee_rows。SNAPSHOT 是 tick 级整表替换、CIPHERTEXT 是游标
+    增量，两者都在"上一趟同步的瞬间"与 RDS 一致，而 RDS 一直在变——
+    agent_action_queue / v2_turn_metrics / v2_trajectory_events 这类表每分钟都在写。
+    严格相等会让 verify_ok 永久为 false，把 gate 变成没人再看的红灯，这跟
+    "全绿假象"是同一个病的两面。真正的"这趟同步失败了"由
+    tee_sync_runs.snapshot_failures / replicate 的错误计数负责，不该由 verify 兜。
+
+    保留严格结果供人看：调用方把它写进报告的 strict_rows_ok 字段。
+    """
+    return not (rds_rows > 0 and tee_rows == 0)
+
+
 def covered_tables() -> tuple[str, ...]:
     """verify 实际会核对的表名集合。
 
@@ -1786,7 +2257,8 @@ def covered_tables() -> tuple[str, ...]:
     ))
 ```
 
-在 `run()` 里，`for table in reconciler.TABLES:` 那个循环之后、密文表循环之前，插入 SNAPSHOT lane 的行数核对：
+在 `run()` 里，`for table in reconciler.TABLES:` 那个循环之后、密文表循环之前，插入
+SNAPSHOT lane 的行数核对：
 
 ```python
     # SNAPSHOT lane：整表替换，只核行数（字段抽样对全量替换没有增量信息——
@@ -1798,16 +2270,48 @@ def covered_tables() -> tuple[str, ...]:
             rds_n = src.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
             tee_n = dst.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
         tables[table] = {
-            "rds_rows": rds_n, "tee_rows": tee_n, "rows_ok": rds_n == tee_n,
+            "rds_rows": rds_n, "tee_rows": tee_n, "row_drift": rds_n - tee_n,
             "user_diffs": {},
+            "strict_rows_ok": rds_n == tee_n,
+            "rows_ok": _rows_ok_advisory(rds_n, tee_n),
         }
 ```
+
+再改密文表循环，让 `kind=None` 的表跳过抽样、`strict=False` 的表走 advisory 判据。
+把现有的 `if cfg["kind"] == "frames": ... else: ...` 改成：
+
+```python
+        if not cfg.get("strict", True):
+            table_report["strict_rows_ok"] = table_report["rows_ok"]
+            table_report["rows_ok"] = _rows_ok_advisory(
+                table_report["rds_rows"], table_report["tee_rows"])
+        tables[key] = table_report
+        if cfg["kind"] is None:
+            # Task 7 新接入的 7 张表：信封列名各不相同，_sample_ciphertext_content
+            # 写死读 doc，参数化是独立一档工作。行数核算已能抓住整表失联。
+            continue
+        if cfg["kind"] == "frames":
+            ...
+```
+
+⚠️ 注意 `tables[key] = table_report` 与 `table_report["requeue_backlog"] = ...` 的既有
+顺序：advisory 覆写必须发生在 `tables[key] = table_report` **之前**（dict 是引用，
+之后改也生效，但读代码的人会以为报告已经定稿——按上面的顺序写）。
 
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-python -m pytest tests/test_tee_verify.py -v
+python -m pytest tests/test_tee_verify.py tests/test_tee_table_registry.py tests/test_tee_snapshot.py -v
 ```
+
+顺带确认 `snapshot_order()` 自动带上了新改判的两张表（它从注册表派生，无需改代码）：
+
+```bash
+python -c "import sys; sys.path.insert(0,'backend'); from tee_shadow import snapshot; \
+o=snapshot.snapshot_order(); print(len(o), 'agent_runtime_instances' in o, \
+'agent_runtime_supervisor_heartbeats' in o)"
+```
+预期 `27 True True`。
 
 - [ ] **Step 5: 跑全量 L1**
 
@@ -1817,7 +2321,13 @@ python -m pyflakes backend/tee_shadow backend/admin backend/tee_replicator
 ```
 预期**零失败**。
 
-- [ ] **Step 6: test 端到端验收**
+> **⚠️ Step 6-7 由 controller 亲自执行，implementer 不做**：这两步是部署 + 生产操作
+> （push 分支触发 CVM 部署、跑 prod 解密探针、读写 prod 库），implementer 只做到
+> Step 5 + Step 8 的文档 + commit。另外 **Step 7.1 的 prod alembic_tee 迁移已经在
+> 2026-07-27 由 controller 在本地跑完了**（两个 TEE 实库都已 0001→0004、各 54 张表），
+> 不要重复 dispatch workflow。
+
+- [ ] **Step 6: test 端到端验收**（controller）
 
 部署到 test（push `test` 分支触发 `deploy-test-cvm`），等一个完整 tick 后：
 
@@ -1828,19 +2338,20 @@ psql "$url" -tA -F'|' -c "select ran_at, snapshot_copied, snapshot_failures, ver
 
 验收判据（全部要满足）：
 - `snapshot_failures = 0`
-- `verify_ok = t`
+- `verify_ok = t`（含新增的 advisory 判据：任何一张表 RDS 有行而 TEE 空 → false）
 - `unconverged_tables = 0`
-- TEE test 库表数 = 52
+- TEE test 库表数 = 54（实测已对齐值，非 52）
 
 ```bash
 ftee test "select count(*) from information_schema.tables where table_schema='public' and table_type='BASE TABLE';"
 ```
 
-- [ ] **Step 7: prod 落地**
+- [ ] **Step 7: prod 落地**（controller）
 
 顺序不能反：
 
-1. dispatch `TEE migrate`，`environment=prod`、`confirm=MIGRATE-TEE-PROD`（建 32 张表）。
+1. ~~dispatch `TEE migrate`，`environment=prod`~~ —— **已于 2026-07-27 本地跑完**，
+   prod TEE 库已是 0004 head / 54 张表。此步跳过。
 2. 在 prod 跑解密探针（**先只读探，不回填**）：
    ```bash
    python scripts/tee/decrypt_probe.py \
@@ -1863,6 +2374,195 @@ ftee test "select count(*) from information_schema.tables where table_schema='pu
 公开文档（`docs-site/`）与 OpenAPI **不涉及**：本改动不碰公开 API 契约、不改架构对外叙事、不改信任边界（TEE 库的定位与可见性没变）。
 
 - [ ] **Step 9: commit 并报告改动**
+
+---
+
+## Task 9: CIPHERTEXT 可变表补 requeue 双写
+
+**2026-07-28 新增**（Task 7 实施期发现，用户拍板单独立 Task）。
+
+CIPHERTEXT lane 是 **append-only 游标**模型，游标永不回头。行被**原地 UPDATE** 后，必须靠
+`mirror.mark_pending(user_id, table, item_id, "requeue")` 打标记，replicator 下一趟才会
+按 PK 重新拉取（见 `worker._consume_requeue`）。没有这个标记，TEE 侧就**永久停在首次复制
+时的状态**。
+
+实测这 4 张表有 UPDATE 写路径但**零 requeue 双写**：
+
+| 表 | UPDATE 写点 | prod 行数 | 后果 |
+|---|---|---|---|
+| `model_api_credentials` | `db.py:8571` | **365** | **最严重**：BYOK 凭证轮换后 TEE 里仍是旧 key |
+| `v2_conversation_summary` | `jobs_store.py:3843, 4113, 4201, 4405` | 4 | 对话摘要更新不同步 |
+| `v2_trajectory_reviews` | `db.py:7998`；`jobs_store.py:285, 4796, 5133, 5223` | 0 | 审阅完成态永不进 TEE |
+| `v2_workspace_entries` | `jobs_store.py:4566` | 0 | 工作区内容更新不同步 |
+
+另 3 张（`chat_message_archive` / `v2_trajectory_events` /
+`v2_conversation_summary_segments`）实测是 append-only，不需要。
+
+> **根因（计划缺陷）**：设计 CIPHERTEXT lane 扩展时只考虑了读侧复制，没检查这些表是否
+> UPDATE 密集。SNAPSHOT lane 明确论证过"整表替换天然处理 UPDATE/DELETE"，CIPHERTEXT lane
+> 漏了对偶的那一问。
+
+> ### ⚠️ 光补 `mark_pending` 不够——消费端也得配（2026-07-28 实测）
+>
+> requeue 是**两半**：写侧 `mirror.mark_pending()` 打标记，读侧 `worker._consume_requeue()`
+> 按 `_Table.requeue_fetch_sql` 把该 PK 的当前行重新拉回来。
+>
+> 实测这 4 张表里**只有 `v2_trajectory_reviews` 配了 `requeue_fetch_sql`**（Task 7 的实施者
+> 防御性地加的），其余 3 张是 `None`。而 `_consume_requeue` 在
+> `requeue_fetch_sql is None` 时**直接 `return (0,0,0,0)` 静默跳过**（`worker.py:1040-1041`）。
+>
+> 所以只补写侧会比不补更糟：pending 行永远堆积在 `tee_pending_device_migration` 里没人消费，
+> 还会把 `requeue_backlog` 指标顶上去，让人以为复制在积压。
+>
+> **两半必须一起补**，且守卫要同时守住两边。
+
+**Files:**
+- Modify: `backend/tee_replicator/worker.py`（给 3 张表补 `requeue_fetch_sql` /
+  `requeue_delete_tee_sql`：`model_api_credentials`、`v2_conversation_summary`、
+  `v2_workspace_entries`；`v2_trajectory_reviews` 已有）
+- Modify: `backend/db.py:8571`、`backend/db.py:7998`
+- Modify: `backend/model_api_runtime/v2/jobs_store.py`（上表 6 个写点）
+- Modify: `backend/tee_shadow/table_registry.py`（新增 `MUTABLE_CIPHERTEXT_TABLES`）
+- Create: `tests/test_tee_requeue_coverage.py`
+
+**Interfaces:**
+- Consumes: `tee_shadow.mirror.mark_pending(user_id, table_name, item_id, reason)`（已存在）
+- Produces: `table_registry.MUTABLE_CIPHERTEXT_TABLES: tuple[str, ...]`
+
+- [ ] **Step 1: 先写守卫测试（会红）**
+
+创建 `tests/test_tee_requeue_coverage.py`。守卫用 grep 源码的方式，仿
+`test_no_flask_anywhere` 的既有写法——它要防的是"以后有人给 CIPHERTEXT lane 加了可变表却
+忘了打 requeue 标记"，那种遗漏不会让任何现有测试变红。
+
+```python
+"""守卫：CIPHERTEXT lane 里的可变表必须有 requeue 双写。
+
+CIPHERTEXT lane 是 append-only 游标模型（tee_replicator.worker），游标永不回头。
+被原地 UPDATE 的行只有靠 mirror.mark_pending(..., "requeue") 打标记，下一趟
+_consume_requeue 才会按 PK 重新拉取。少了这一步，TEE 侧永久停在首次复制的状态——
+而且不会有任何测试变红、不会有任何日志报错，只是数据悄悄陈旧。
+
+2026-07-28 实测发现 4 张表处于这个状态（model_api_credentials 最严重：365 行 BYOK
+凭证，轮换后 TEE 里还是旧 key）。本守卫防止它再次发生。
+"""
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+BACKEND = Path(__file__).parent.parent / "backend"
+sys.path.insert(0, str(BACKEND))
+
+from tee_shadow import table_registry as reg
+
+
+def _mark_pending_context() -> str:
+    """所有 mark_pending 调用点及其后 4 行。
+
+    抓后续行是因为这类调用常常跨行写：
+        mirror.mark_pending(
+            str(user_id), "memory_moments", memory_id, "requeue"
+        )
+    只匹配调用所在那一行会漏掉表名。
+    """
+    out = subprocess.run(
+        ["grep", "-rn", "-A", "4", "mark_pending", str(BACKEND), "--include=*.py"],
+        capture_output=True, text=True)
+    return out.stdout
+
+
+def test_every_mutable_ciphertext_table_has_requeue_writes():
+    """登记为可变的 CIPHERTEXT 表，必须能在源码里找到给它打 requeue 的调用。"""
+    ctx = _mark_pending_context()
+    missing = [t for t in reg.MUTABLE_CIPHERTEXT_TABLES if f'"{t}"' not in ctx]
+    assert not missing, (
+        "这些表登记为可变 CIPHERTEXT，但源码里找不到给它们打 requeue 的 "
+        f"mark_pending 调用：{missing}\n"
+        "后果：它们被 UPDATE 之后，TEE 侧会永久停在首次复制时的状态——"
+        "没有报错、没有红灯，只是数据悄悄陈旧。"
+    )
+
+
+def test_mutable_list_only_contains_ciphertext_lane_tables():
+    """可变清单里不该混进别的 lane 的表——SNAPSHOT lane 用整表替换，天然处理 UPDATE，
+    登记进来只会造成误导。"""
+    ciphertext = set(reg.tables_in_lane(reg.CIPHERTEXT))
+    stray = sorted(set(reg.MUTABLE_CIPHERTEXT_TABLES) - ciphertext)
+    assert not stray, f"这些表不在 CIPHERTEXT lane，不该出现在可变清单里：{stray}"
+
+
+def test_every_mutable_table_has_a_requeue_consumer():
+    """写侧打了标记，读侧也必须能消费——否则 pending 行永远堆积、没人处理。
+
+    requeue 是两半：mirror.mark_pending() 打标记，worker._consume_requeue() 按
+    _Table.requeue_fetch_sql 把该 PK 的当前行重新拉回来。而 _consume_requeue 在
+    requeue_fetch_sql 为 None 时**直接 return 静默跳过**（worker.py:1040-1041）——
+    只补写侧比不补更糟：pending 行堆在 tee_pending_device_migration 里没人消费，
+    还会把 requeue_backlog 指标顶上去，让人误以为复制在积压。
+    """
+    from tee_replicator import worker
+
+    missing = sorted(
+        t for t in reg.MUTABLE_CIPHERTEXT_TABLES
+        if worker._TABLES[t].requeue_fetch_sql is None
+    )
+    assert not missing, (
+        f"这些表登记为可变、写侧会打 requeue 标记，但 worker._TABLES 里没配 "
+        f"requeue_fetch_sql，标记永远不会被消费：{missing}"
+    )
+```
+
+- [ ] **Step 2: 在注册表登记可变表**
+
+`backend/tee_shadow/table_registry.py` 末尾（`PSEUDO_CIPHERTEXT_TABLES` 之后）加：
+
+```python
+# CIPHERTEXT lane 里会被**原地 UPDATE** 的表。
+#
+# 这条清单存在的理由：CIPHERTEXT lane 是 append-only 游标模型，游标永不回头，所以
+# 原地改写的行必须由写侧显式 mirror.mark_pending(..., "requeue") 打标记，replicator
+# 下一趟才会按 PK 重新拉取。漏打标记不会有任何报错或红灯——TEE 侧只是永久停在首次
+# 复制时的状态，数据悄悄陈旧。
+#
+# tests/test_tee_requeue_coverage.py 守着这条清单与实际 mark_pending 调用的一致性。
+# 给 CIPHERTEXT lane 加了会被 UPDATE 的表时，登记到这里并在写点补上 mark_pending。
+MUTABLE_CIPHERTEXT_TABLES: tuple[str, ...] = (
+    "model_api_credentials",
+    "v2_conversation_summary",
+    "v2_trajectory_reviews",
+    "v2_workspace_entries",
+)
+```
+
+- [ ] **Step 3: 在 6 个写点补 mark_pending**
+
+每个写点在 UPDATE 成功之后（同一函数内、拿得到 user_id 与该表 PK 的位置）补一行：
+
+```python
+    mirror.mark_pending(user_id, "<表名>", "<item_id>", "requeue")
+```
+
+`item_id` 取值必须与该表在 `worker._TABLES` 里的 `requeue_fetch_sql` 参数**一致**
+（Task 7 已配好，逐表核对：`model_api_credentials` 用 `id`、`v2_conversation_summary`
+用 `user_id`、`v2_trajectory_reviews` 用 `source_job_id`、`v2_workspace_entries` 用 `path`），
+否则 requeue 行拉不回正确的源行。
+
+`mirror.mark_pending` 内部已是尽力而为（失败只计数不抛），符合影子期铁律，
+**不要**再包一层 try/except。
+
+写点清单见本节开头的表格。注意 `jobs_store.py:285` 那处是批量 UPDATE
+（`UPDATE ... r SET ... FROM ...`），要按返回的行集逐行打标记，不是打一次。
+
+- [ ] **Step 4: 验证**
+
+- `python -m pytest tests/test_tee_requeue_coverage.py -v` → 全绿
+- 全量回归零失败
+- 人工核对：每个写点补的 `item_id` 与 `worker._TABLES` 对应表的 `requeue_fetch_sql`
+  参数一致
+
+- [ ] **Step 5: commit 并报告改动**
 
 ---
 

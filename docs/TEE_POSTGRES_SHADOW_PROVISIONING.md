@@ -196,8 +196,14 @@ typo-guard 模式）：
 `_rows_ok_advisory`），`verify_ok=true` 不等于两侧行数逐 tick 精确相等——那个更严格
 的结果存在每张表报告的 `strict_rows_ok` 字段里，只进日志和 `tee_sync_runs.report`
 的 JSONB，没有专门的扁平列。排障时（比如怀疑某张 SNAPSHOT 表的 TRUNCATE+COPY 一直
-没生效、TEE 侧留着孤儿行）用这条 SQL 从最近一次 tick 的 JSONB 里捞出 strict 判据
-为假的表：
+没生效、TEE 侧留着孤儿行）用这条 SQL 从最近一次**真正跑过 verify 的** tick 的
+JSONB 里捞出 strict 判据为假的表。
+
+⚠️ `WHERE` 里的 `verify_ran` 不能省：sync tick 每 `FEEDLING_TEE_SYNC_INTERVAL_SEC`
+（默认 300s）落一行，而 verify 只在 reconcile tick 才跑（`FEEDLING_TEE_RECONCILE_INTERVAL_SEC`
+默认 86400s），即约 288 行里只有 1 行的 `report` 带 `'verify'` 键。按 `max(ran_at)`
+取最近一行，绝大多数时候 `report->'verify'->'tables'` 是 NULL，`jsonb_each(NULL)`
+静默返回 0 行——查询不报错、看着像"全绿"，正是这套改动一直在防的那个病。
 
 ```sql
 SELECT ran_at, t.key AS table_name,
@@ -205,7 +211,7 @@ SELECT ran_at, t.key AS table_name,
        t.value->>'tee_rows' AS tee_rows,
        t.value->>'strict_rows_ok' AS strict_rows_ok
 FROM tee_sync_runs, jsonb_each(report->'verify'->'tables') AS t(key, value)
-WHERE ran_at = (SELECT max(ran_at) FROM tee_sync_runs)
+WHERE ran_at = (SELECT max(ran_at) FROM tee_sync_runs WHERE verify_ran)
   AND (t.value->>'strict_rows_ok') = 'false'
 ORDER BY table_name;
 ```
