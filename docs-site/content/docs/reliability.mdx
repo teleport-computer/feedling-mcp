@@ -104,6 +104,19 @@ attributes it to a temporary upstream-provider failure. Automatic wake lanes
 fail silently instead: they write neither a chat bubble nor an error chip.
 Letters, numbers, CJK text, and emoji count as usable reply content.
 
+A relay that cuts the provider stream can also split one internal control
+envelope across the reasoning and content channels, leaving a bare JSON tail
+(for example `…"reason":"…"}]}`) in the visible reply while its head sits in the
+reasoning channel. Such torn fragments are never delivered as assistant content:
+when the two channels rejoin to a complete control envelope, or the reasoning
+channel independently carries the envelope's head, the visible fragment and its
+paired reasoning are both dropped. Foreground Chat then uses the standard visible
+fallback; automatic wake lanes fail silently and record the suppression. The
+reconstructed control action is used only to confirm the split — it is never
+executed, since a turn corrupted in transit is not a trustworthy instruction. A
+message that merely looks JSON-like on its own (a user discussing code or
+configuration) is preserved in Foreground Chat.
+
 For a custom or otherwise unaudited model route without an explicit context
 window, Runtime V2 uses a 65,536-token default. With the standard 4,096-token
 output reserve and 5% safety margin (3,277 tokens), 58,163 tokens remain for
