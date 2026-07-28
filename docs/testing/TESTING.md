@@ -109,6 +109,19 @@
 - **孤儿清单是全局共享的，并行 session 会互删**：`~/.feedling-e2e-orphans` 所有 session 共用，别人跑一次 `p0.py --cleanup-orphans` 就会把**你正在用**的账号当孤儿删掉——表现是长跑探针中途莫名 401 / admin 查 `user_not_found`。撞到就先怀疑这个，别去查鉴权。
 - **探针轮询非 200 必须硬失败**（`raise SystemExit`），不许忽略继续循环：否则"账号半路没了"这类事故会被静默藏十几分钟，再以别的形状炸出来。这是 e2e 假 PASS 的同一个形状，2026-07-26 又犯了一次。
 - **用户投诉的原话，先全仓 grep 一遍**：usr_a40e 报"AI 一直说没接上"，那句话根本不是模型生成的，是我们自己的 `FALLBACK_REPLY` 硬编码文案（`chat_resident_consumer.py:448`）。**先确认这句话是谁写的，再谈模型有没有问题**——省掉整轮跑偏的 provider 排查。
+- **prod 的配置值只能从运行时读，读代码常量必错**：2026-07-27 我拿
+  `_UNAUDITED_DEFAULT_FALLBACK_TOKENS = 32768`（代码默认）算 prod 预算，推出"上下文
+  装不下"这个根因；实际 `deploy/docker-compose.phala.yaml` 早把
+  `FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS` 覆盖成 **131072**（`27c76414`），
+  预算是我算的 4 倍多，假设完全不成立。**凡是"env > 配置 > 代码默认"这种优先级链，
+  分诊时必须从最高优先级那层查起**——`deploy/docker-compose*.yaml`、CVM 注入的加密 env，
+  代码里那个常量是最后才轮到的。同族：`runtime.test_status=ok` 也只是"轻量 ping 通"，
+  不是"真实生成能过"。
+- **别人可能已经查过同一个 bug**：同一天 zhihao 在 origin/test 上已定位并修复了这次事故的
+  真因（compaction 自锁 `30793ab4`），而我在旧基线上独立查了半天还查错了方向。
+  **动手排查 prod 事故前先 `git fetch && git log origin/test --since=<事故日> --oneline`
+  扫一遍**，尤其看提交信息里有没有出现同一个 user_id——一次 grep 省掉整轮重复劳动，
+  也避免两个人各修一半在同一个文件里撞车。
 - **`runtime.test_status=ok` 骗人**：它只证明轻量 ping 通了，真实生成仍可能全部 timeout（廉价中转限流/欠费/过载）。判"中转是否真活着"要看 `provider_attempt_ledger` 尾部的 `outcome`。
 - **openai_compatible 中转验证，`test_status:ok` 之外还有两个独立坑**（2026-07-27 Kimi/Moonshot 验证）：
   ① **key 有区域锁**——同一家中转多个区域 endpoint，key 只在签发区有效：Moonshot 的 key 在 `api.moonshot.cn` 返 200，同 key 打 `api.moonshot.ai` 直接 `401 Invalid Authentication`。用户报 `provider_test_failed` / 401，**先核 `base_url` 区域是否配对 key 的签发区，再谈 key 废没废**（先 `curl {base_url}/models -H "Authorization: Bearer <key>"` 隔离 provider 侧）。

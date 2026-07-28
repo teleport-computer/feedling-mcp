@@ -533,6 +533,7 @@ class UserStore:
                 "turn_failure_error_class",
                 "turn_failure_blame",
                 "turn_failure_user_text",
+                "terminal_failure_job_id",
                 "reply_to_message_id",
             ):
                 value = extra.get(key)
@@ -715,6 +716,7 @@ class UserStore:
                 "turn_failure_error_class",
                 "turn_failure_blame",
                 "turn_failure_user_text",
+                "terminal_failure_job_id",
             ):
                 value = extra.get(key)
                 if isinstance(value, str) and value.strip():

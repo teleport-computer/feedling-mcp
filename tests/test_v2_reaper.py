@@ -37,6 +37,7 @@ def test_reap_once_surfaces_chat_timeout_but_keeps_background_silent(monkeypatch
             "examined": 1,
             "status_delivered": 1,
             "runtime_error_delivered": 1,
+            "reply_delivered": 1,
         },
     )
 
@@ -61,6 +62,7 @@ def test_reap_once_reconciles_old_marker_even_when_no_job_expires(monkeypatch):
             "examined": 1,
             "status_delivered": 1,
             "runtime_error_delivered": 1,
+            "reply_delivered": 1,
         },
     )
     def sink(_uid, _code):

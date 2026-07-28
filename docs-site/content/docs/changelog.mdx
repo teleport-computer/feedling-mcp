@@ -10,6 +10,29 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Chat route selection now fences Hosted Runtime V1 from independent
+  residents.** The onboarding route is the execution-ownership source of truth:
+  V1 discovery requires an explicit `model_api` selector in addition to a
+  tested active model route and the existing Runtime V2 fence. Switching to
+  `resident` or `official_import` deactivates the V1 route atomically; switching
+  back restores the most recently updated tested-ok route. Missing selector
+  state fails closed. Operations telemetry now keeps recent polls per consumer
+  identity, reports the effective responder and its evidence, and marks
+  route/lease/poll conflicts instead of treating the last poller as proof that
+  another process stopped.
+
+- **Runtime V2 Chat failures no longer leave the sender waiting silently.**
+  A failed or expired foreground turn now commits a parent-linked encrypted
+  failure reply carrying the same `turn_failure_error_class`,
+  `turn_failure_blame`, and `turn_failure_user_text` metadata as the resident
+  path. Actionable provider configuration failures show their specific recovery
+  text; transient provider and system failures use the standard retry-later
+  fallback. A conservative internal context-window default is attributed to the
+  system, not misreported as the user's model limit. Delivery is replayed from a
+  durable outbox after worker crashes and lease timeouts, while a newer
+  successful reply atomically suppresses a stale failure bubble. Proactive and
+  maintenance lanes remain silent.
+
 - **V1 CLI residents can now return generated documents as native download
   cards.** Claude, Codex, and Pi residents receive a `send-file` command backed
   by a private per-user staging directory. Word and PDF requests render real

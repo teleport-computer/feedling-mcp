@@ -106,6 +106,10 @@ def three_users_with_routes():
                 (uid,),
             )
         configure_model_api_route(uid, provider="anthropic", model="claude-3-5-sonnet-latest")
+        db.set_onboarding_route_strict(
+            uid,
+            {"route": "model_api", "selected_at": "2026-07-27T00:00:00Z"},
+        )
         uids.append(uid)
     return uids
 
@@ -119,6 +123,79 @@ def test_v1_roster_excludes_v2_and_draining_users(three_users_with_routes):
     assert u_resident in roster_ids
     assert u_v2 not in roster_ids
     assert u_draining not in roster_ids
+
+
+def test_route_control_plane_selects_at_most_one_responder_class(fresh_user):
+    """The primary responder invariant is ownership eligibility, not claim CAS.
+
+    At each supported control state exactly one of Hosted V1, Hosted V2, or the
+    route-declared independent resident is eligible. An already-running process
+    is reaped asynchronously; the positive roster gate prevents it from being
+    selected again while the resident route owns the account.
+    """
+    uid = fresh_user
+    configure_model_api_route(
+        uid,
+        provider="anthropic",
+        model="claude-3-5-sonnet-latest",
+    )
+
+    def eligibility() -> dict[str, bool]:
+        route_doc = db.get_blob(uid, "onboarding_route")
+        route = (
+            str(route_doc.get("route") or "")
+            if isinstance(route_doc, dict)
+            else ""
+        )
+        _mode, runtime_state, _generation = db.get_hosted_runtime_control_strict(uid)
+        roster = {row["user_id"] for row in db.list_agent_runtime_enabled_users()}
+        return {
+            "hosted_v1": uid in roster,
+            "hosted_v2": runtime_state in {"v2", "draining"},
+            "resident": route == "resident",
+        }
+
+    no_route_blob = eligibility()
+    assert no_route_blob == {
+        "hosted_v1": False,
+        "hosted_v2": False,
+        "resident": False,
+    }
+    assert sum(no_route_blob.values()) == 0
+
+    db.set_onboarding_route_strict(
+        uid,
+        {"route": "model_api", "selected_at": "2026-07-27T00:00:00Z"},
+    )
+    model_api_v1 = eligibility()
+    assert model_api_v1 == {
+        "hosted_v1": True,
+        "hosted_v2": False,
+        "resident": False,
+    }
+    assert sum(model_api_v1.values()) == 1
+
+    _force_fence(uid, mode="db_action_v2", state="v2")
+    model_api_v2 = eligibility()
+    assert model_api_v2 == {
+        "hosted_v1": False,
+        "hosted_v2": True,
+        "resident": False,
+    }
+    assert sum(model_api_v2.values()) == 1
+
+    _force_fence(uid, mode="resident_cli", state="resident")
+    db.set_onboarding_route_strict(
+        uid,
+        {"route": "resident", "selected_at": "2026-07-27T00:01:00Z"},
+    )
+    resident = eligibility()
+    assert resident == {
+        "hosted_v1": False,
+        "hosted_v2": False,
+        "resident": True,
+    }
+    assert sum(resident.values()) == 1
 
 
 def test_perception_flag_follows_fence_after_flip(fresh_user):
