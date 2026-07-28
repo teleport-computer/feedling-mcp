@@ -740,6 +740,7 @@ _TEE_SYNC_RUN_COLS = (
     "replicate_copied", "replicate_pending", "replicate_errors", "replicate_skipped",
     "replicate_table_failures",
     "reconcile_copied", "reconcile_pruned", "reconcile_skipped",
+    "snapshot_copied", "snapshot_failures",
     "mirror_failures", "tee_healthy", "tee_probe_ms", "duration_ms",
 )
 
@@ -5294,6 +5295,7 @@ def chat_messages_after_seq(
     limit: int | None = None,
     oldest_first: bool = True,
     through_seq: int | None = None,
+    exclude_synthetic_sources: bool = False,
 ) -> list[dict]:
     """Return one exact per-user ``seq`` window strictly after ``after_seq``.
 
@@ -5324,6 +5326,16 @@ def chat_messages_after_seq(
     if upper_seq is not None:
         predicate += " AND seq <= %s"
         params.append(upper_seq)
+    if exclude_synthetic_sources:
+        # Summary-coverage callers only. `verify_ping`/`resident_maintenance`
+        # rows are GC-able (a verify_ping is deleted once verify_loop completes,
+        # see core/store.py), so folding one into an immutable leaf leaves a
+        # coverage claim over a seq that later vanishes — the permanent
+        # `v2_summary_frontier_integrity_error` brick. The gap counter
+        # (count_messages_after_seq) and both frontier witnesses
+        # (jobs_store.get_summary_frontier_state / append_summary_leaf_cas)
+        # exclude the SAME set, so coverage stays consistent under GC.
+        predicate += " AND COALESCE(doc->>'source','') NOT IN ('verify_ping','resident_maintenance')"
     with get_pool().connection() as conn:
         if limit is None:
             rows = conn.execute(
@@ -5520,6 +5532,7 @@ def count_messages_after_seq(
     after_seq: int,
     *,
     through_seq: int | None = None,
+    exclude_synthetic_sources: bool = False,
 ) -> int:
     """COUNT of THIS USER's own ``chat_messages`` rows with ``seq > after_seq``
     — scoped by ``user_id``, unlike a bare ``chat_max_seq(...) - after_seq``
@@ -5543,6 +5556,11 @@ def count_messages_after_seq(
     if upper is not None:
         predicate += " AND seq <= %s"
         params.append(upper)
+    if exclude_synthetic_sources:
+        # See chat_messages_after_seq: coverage gap detection must not count
+        # GC-able synthetic rows, or it would demand folding a row that
+        # verify_loop is about to delete (permanent frontier corruption).
+        predicate += " AND COALESCE(doc->>'source','') NOT IN ('verify_ping','resident_maintenance')"
     with get_pool().connection() as conn:
         row = conn.execute(
             f"SELECT COUNT(*) FROM chat_messages {predicate}",
@@ -8144,6 +8162,7 @@ def chat_clear(user_id: str) -> int | None:
     """
     sql = "DELETE FROM chat_messages WHERE user_id = %s"
     persisted_runtime_doc: dict | None = None
+    cleared_review_job_ids: list = []
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
@@ -8218,9 +8237,11 @@ def chat_clear(user_id: str) -> int | None:
                         "UPDATE v2_trajectory_reviews SET status='failed',"
                         "claimed_by_job_id=NULL,last_error='chat_history_cleared',"
                         "finished_at=COALESCE(finished_at,now()) "
-                        "WHERE user_id=%s AND status IN ('pending','running')",
+                        "WHERE user_id=%s AND status IN ('pending','running') "
+                        "RETURNING source_job_id",
                         (user_id,),
                     )
+                    cleared_review_job_ids = [r[0] for r in cur.fetchall()]
 
                     # A terminal-failure reconciler may already own one of
                     # these rows.  Deleting it here waits for that transaction;
@@ -8349,6 +8370,11 @@ def chat_clear(user_id: str) -> int | None:
         ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
          "AND table_name = 'chat_messages'", (user_id,)),
     ])
+    # v2_trajectory_reviews rows fenced to 'failed' above are same-PK in-place
+    # rewrites the append-only replicator cursor never revisits — requeue each
+    # one so the next replicator pass re-derives the TEE plaintext.
+    for source_job_id in cleared_review_job_ids:
+        mirror.mark_pending(user_id, "v2_trajectory_reviews", str(source_job_id), "requeue")
     if persisted_runtime_doc is not None:
         _mirror_persisted_blob(
             user_id, "model_api_runtime", persisted_runtime_doc,
@@ -8792,10 +8818,18 @@ def model_api_credential_update(user_id: str, credential_id: str, *,
                 "WHERE user_id = %s AND id = %s",
                 tuple(params),
             )
-        return cur.rowcount > 0
+        updated = cur.rowcount > 0
     except Exception as e:
         log.error("[db] model_api_credential_update(%s,%s) failed: %s", user_id, credential_id, e)
         return False
+    # Primary committed. Same-PK in-place rewrite (BYOK key rotation, label
+    # edit, ...) that the append-only replicator cursor never revisits once
+    # this row's PK has been seen — same requeue-lane pattern as
+    # memory_upsert/world_book_upsert. Best-effort: mirror swallows failures.
+    if updated:
+        from tee_shadow import mirror
+        mirror.mark_pending(user_id, "model_api_credentials", credential_id, "requeue")
+    return updated
 
 
 def model_api_credential_delete(user_id: str, credential_id: str) -> bool:

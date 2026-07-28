@@ -8,6 +8,8 @@ tested by earlier tasks:
   - ``tee_replicator.worker.run_table`` — cursor-driven ciphertext→plaintext
     replication (hits the enclave for real decrypts).
   - ``tee_shadow.verify.run`` — read-only sampled consistency check.
+  - ``tee_shadow.snapshot.snapshot_all`` / ``snapshot_table`` — SNAPSHOT lane
+    full-table TRUNCATE+COPY atomic replace.
 
 This module owns no business logic of its own beyond the execution
 guardrails (spec §5 四要素): a literal ``confirm == "MIGRATE"`` gate on any
@@ -33,7 +35,7 @@ from tee_shadow import mirror
 from tee_shadow import reconciler as tee_reconciler
 from tee_shadow import verify as tee_verify
 
-_ACTIONS = ("reconcile", "replicate", "verify")
+_ACTIONS = ("reconcile", "replicate", "verify", "snapshot")
 
 # Non-blocking guard: two concurrent /run calls must not stomp on each other
 # (reconcile/replicate both do multi-statement writes against the TEE pool).
@@ -81,6 +83,11 @@ def _validate(action: str, table: str | None, dry_run) -> None:
             raise BadRequest("table_required")
         if table not in tee_worker._TABLES:
             raise BadRequest("unknown_table")
+    if action == "snapshot" and table is not None:
+        from tee_shadow import table_registry as reg
+
+        if table not in reg.tables_in_lane(reg.SNAPSHOT):
+            raise BadRequest("unknown_table")
 
 
 def run_action(
@@ -114,6 +121,25 @@ def run_action(
             report = _run_reconcile(table=table, dry_run=dry_run)
         elif action == "replicate":
             report = _run_replicate(table=table, dry_run=dry_run, qps=qps)
+        elif action == "snapshot":
+            from tee_shadow import snapshot as tee_snapshot
+
+            if dry_run:
+                # dry-run 短路，与 _run_reconcile 同款：只回计划、绝不碰 TEE。
+                #
+                # ⚠️ 这条分支是**安全必需**，不是锦上添花。confirm 门的条件是
+                # `action != "verify" and not dry_run and confirm != "MIGRATE"`——
+                # 也就是说 dry_run=True 时**根本不检查 confirm**。而 HTTP 端点
+                # `POST /v1/admin/tee-replication/run`（routes_asgi.py:286）是
+                # `dry_run=payload.get("dry_run", True)`，默认 True。
+                # 少了这条短路，一个 `{"action": "snapshot"}` 的探测请求（admin 按
+                # reconcile/replicate 的既有习惯，会以为这是安全的演练）就会直接对
+                # TEE 侧 25 张表做真实 TRUNCATE+COPY，且绕过全部确认门。
+                tables = list(tee_snapshot.snapshot_order()) if table is None else [table]
+                report = {"planned": tables, "tables": [], "copied": 0, "failures": 0}
+            else:
+                report = (tee_snapshot.snapshot_all() if table is None
+                          else {"tables": [tee_snapshot.snapshot_table(table)]})
         else:
             report = _run_verify(sample_rate=sample_rate)
     finally:

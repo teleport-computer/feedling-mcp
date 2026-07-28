@@ -1199,8 +1199,13 @@ def _record_app_event(user_id: str, app: str, category: str | None,
         store.append_app_close(user_id, {"app": app, "category": category, "ts": now}, now)
         current_app, current_category = _current_app_cells(user_id)
         if current_app and str(current_app).strip().casefold() == app.casefold():
+            # Keep the spelling the OPEN recorded, not the one this close
+            # happened to use: the two Shortcut automations are typed by hand,
+            # so "  instagram " closing "Instagram" must not rewrite the name
+            # the agent will read back. The match above is already
+            # case-insensitive; only the stored label is at stake here.
             store.merge_state_guarded(user_id, {
-                "app_name": _cell(app, now, None),
+                "app_name": _cell(str(current_app).strip(), now, None),
                 "app_category": _cell(category if category is not None else current_category,
                                       now, None),
                 "app_state": _cell("closed", now, None),

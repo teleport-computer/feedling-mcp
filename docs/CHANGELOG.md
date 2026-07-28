@@ -47,6 +47,114 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-28 — TEE 影子库全量对齐：51 张表归类落地 + verify/registry 双守卫
+
+**[DONE] `2026-07-27-tee-full-table-alignment` 计划全部代码 Task（1-8）完成**。
+起点：2026-07-27 实测 RDS 61 张基表里只有 20 张镜进了 TEE 影子库，且这套三层
+手工白名单（`db.py` 双写点 / `tee_replicator.worker._TABLES` / `tee_shadow.
+reconciler.TABLES`）互不校验，谁都不是全集——Runtime V2 的 19 张新表就是这样
+在无人发现的情况下漏掉的。
+
+- **新增 `backend/tee_shadow/table_registry.py` 作为单一真源**：61 张 RDS 表
+  逐条登记 lane（`MIRROR` 13 / `CIPHERTEXT` 11 / `SNAPSHOT` 27 / `SKIP` 10 /
+  `LOGICAL` 0，预留给尚未开通的 PG 原生逻辑复制），51 张非 SKIP 表全部进 TEE。
+  `tests/test_tee_table_registry.py` 守完备性：RDS 迁移链建出的每一张表必须
+  有且只有一条登记（漏登记直接红），且非 SKIP 登记必须能在 `alembic_tee` 的
+  真实库里找到对应表（专治"revision 合并了但从未在实库执行"）。
+- **新增 SNAPSHOT lane**（`tee_shadow/snapshot.py`）：给"明文、数据量小、但有
+  UPDATE/DELETE"的 27 张表（`agent_action_queue`/`v2_turn_metrics`/`v2_runtime_
+  control` 等）用 `TRUNCATE`+`COPY` 整表原子替换，不必像 CIPHERTEXT 那样为每
+  张可变表单独接 requeue 补偿。`agent_runtime_instances`/`agent_runtime_
+  supervisor_heartbeats` 最初按"双写热路径"标了 MIRROR，实测两张表情况不同但
+  结论一致——都改判 SNAPSHOT：`agent_runtime_instances` 的 8 处租约热路径写点
+  （`agent_runtime/leases.py`）确实只写 RDS（文件顶部注明有意不镜像，ephemeral
+  TTL 锁）；`agent_runtime_supervisor_heartbeats` 其实**有** `db.py` 的 mirror
+  双写（upsert/prune 两个写点都调了 `mirror.execute`，原样保留不动），但这条
+  镜像没有 `reconciler.TABLES` 兜底、漂了没人拉回来，且心跳每次都改
+  `updated_at`，接 reconciler 会在 strict 逐列比对上变成永久红——SNAPSHOT 每
+  tick 整表替换天然收敛，不需要这些。0004 迁移已建表、prod 2026-07-28 复测
+  230+1 行且 0 孤儿（0004 迁移里写的 220 行是 07-27 写迁移时的旧值），FK 前提
+  满足。
+- **`tee_replicator.worker._TABLES` 接入 7 张新密文表**（`chat_message_
+  archive`/`model_api_credentials`/`v2_conversation_summary(+_segments)`/
+  `v2_trajectory_events`/`v2_trajectory_reviews`/`v2_workspace_entries`）。
+  test 环境 CVM 容器内探针 gate：7 张表 100% PASS（0 pending_device / 0
+  permanent_fail / 0 异常），`v2_trajectory_events` 实测 124/124（`enclave_pk_
+  fpr` 全空仍全部解得开）；`chat_message_archive`/`v2_trajectory_reviews` 当时
+  test 环境 0 行，未被真实数据覆盖，接线按合成行验证补了这个盲区。冷启动有一个
+  Critical 修复：`_decode_cursor` 对从未跑过的新表返回空串水位线，遇到排序列是
+  TIMESTAMPTZ/BIGINT/UUID 的表（而非既有表的 TEXT 排序列）直接 cast 失败、
+  scheduler 逐表 try/except 静默吞掉、每 tick 无声重复失败——修法是给 `_Table`
+  加 `cursor_zero` 字段，逐表配出各自类型能 parse 的下界。
+- **`tee_shadow/verify.py` 覆盖范围从 18 张扩到全部 51 张（新增 `covered_
+  tables()`）**：SNAPSHOT lane 只核行数（整表替换对增量抽样没有信息量）；7 张
+  新密文表因信封列名各不相同（`payload_envelope`/`api_key_envelope`/
+  `summary_envelope`/`review_envelope`/`content_envelope`，`_sample_ciphertext_
+  content` 写死读 `doc`）暂只做行数核算，内容抽样参数化列为独立后续工作。新增
+  `_rows_ok_advisory`：SNAPSHOT/新密文表是"tick 级快照"或"游标增量"，天生会与
+  持续在写的 RDS 有瞬时行数差，不能像老表那样要求 `rds==tee` 精确相等（会让
+  gate 永久红、没人再看）——判据收窄成"RDS 有行而 TEE 一行都没有"，真正抓的是
+  "这张表从没同步成功过"。`tests/test_tee_verify.py::test_verify_covers_every_
+  synced_table` 守住"注册表新增表 = verify 范围自动跟上"，否则 `verify_ok=true`
+  但新表压根没被核对会是一次"全绿假象"。
+- **补上 alembic_tee 的迁移落地通道**（`.github/workflows/tee-migrate.yml`）：
+  之前完全靠人工执行，已合并的 0002/0003 在 2026-07-27 之前从未在 test/prod
+  实库跑过（两库停在 0001）。新通道手动触发、typo guard、owner 角色 direct-TLS
+  连接、落地后强制断言 `alembic_tee_version == 代码 head`。2026-07-27 已用它
+  （加一次本地手动执行）把两个实库从 0001 推到 0004 head，各 54 张表。
+- prod 解密探针（`scripts/tee/decrypt_probe.py --dsn PROD ...`）与 prod 部署
+  验收（`snapshot_failures=0`/`verify_ok=t`/`unconverged_tables=0`）按分工由
+  controller 在本次之外单独执行，本条记录只覆盖代码 Task 的落地范围。
+
+文档：本文件 + `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md`（新增 §2.9 迁移落地
+通道）+ 上游 `docs/superpowers/plans/2026-07-23-tee-promotion-decrypt-removal.md`
+（Task 0.6 两个 checkbox 勾掉，Task 1.5 v2 表迁移策略处标注由本计划完成）。
+公开文档（`docs-site/`）与 OpenAPI 不涉及：不碰公开 API 契约、不改架构对外
+叙事、不改信任边界（TEE 库定位与可见性没变）。
+
+## 2026-07-28 — Admin Runtime 健康值班台：收尾修复最终 code review 的三个 Important 项
+
+**[DONE] `/admin/data-track?view=runtime` 值班台过审前的三条修复 + 一处文档更正**。这是
+该功能五个任务全部实现（9 commit）之后、最终 review 判「Ready to merge: With fixes」的
+收尾工作。前三条缺陷原样存在于设计与实施计划文档里（实现是忠实照抄的），因此代码与文档
+一并改：
+
+- **I-1（页顶结论永远不会真正变红）**：`_render_runtime_health_page` 里
+  `level_cls = {"ok": "ok", "warn": "warn", "bad": "warn"}[level]` 把 `bad` 映射成
+  CSS class `"warn"`——100% 失败率与 6% 失败率在页顶显示成同一个橙色，人眼分诊能力在
+  第一眼就被抹掉，而 per-lane 表反而认真做了三档。改成 `"bad": "bad"`。
+- **I-2（失败码白名单太窄，非 chat lane 塌成 `other`）**：`_runtime_failure_code` 原来只
+  放行精确匹配 `queue_timeout`/`lease_timeout` 和无条件的 `turn_failed:` 前缀（不校验
+  冒号后内容形状）。但 `mark_failed`/`mark_expired` 落库的真实码还有 `wake_failed:*`
+  （heartbeat/proactive lane）、`extraction_failed:*`、`compaction_failed:*`、
+  `mcp_mutation_outcome_unknown`、`runtime_expired`——旧白名单下这些码在 chat 之外每条
+  lane 都塌成 `other`，而 heartbeat 恰恰是本页专门加了「（日报口径）」链接、明确要给人
+  看的 lane。改为按形状放行（`^[a-z0-9_]+(:[a-z0-9_]+)?$`，admin 层自定义常量，不
+  import `model_api_runtime`），同时渲染层清洗后按 `(lane, code)` 重新合并计数——否则
+  同一 lane 的两个不同原始码清洗成同一个桶会渲染成两行都叫 `other`。
+- **I-3（claimed/running 卡死时页面明文说「这不是故障」）**：`_runtime_health_level` 对
+  job 全部卡在 `claimed`/`running`（无 pending、worker 心跳还活着）的 lane 全部指标都
+  跳过，误判 `("ok", [])`；`empty_note` 只看「所有 lane sampled_jobs 都为 0」，把「真的
+  没数据」和「卡死」混为一谈。reviewer 实证过这个具体形状（`inflight=57/capacity=8`）：
+  页面显示「这不是故障」+ 总体结论「正常」。修正：`sampled_jobs==0 and capture.open>0`
+  → 至少 `warn`；`pool.inflight > pool.capacity` → `bad`（矛盾态）；`empty_note` 只在
+  终态样本、`capture.open`、`pool.inflight`、`pool.pending` 全为 0 时才说「这不是
+  故障」，否则改为「窗口内无终态 job，但有 N 个回合在飞——可能是卡死」。
+- **I-4（文档修正，不改代码）**：设计文档 §8 原先写「索引够用」，实查
+  `agent_jobs.finished_at` 无任何索引、`agent_jobs` 无保留策略、新增的三条 CTE
+  （outcome/failure/capture）在全 lane 范围都拿不到有效索引，`LIMIT 1000` 只截结果不
+  减扫描。本分支承诺不含迁移，故不加索引，只把错误结论改正并把
+  `CREATE INDEX CONCURRENTLY ix_agent_jobs_finished_at ...` + `agent_jobs` 保留策略
+  记为设计文档 §10 的明确 follow-up（含「上线前在 prod 规模跑一次 EXPLAIN」）。
+- 死代码清理：`tests/test_data_track_runtime_view.py` 里未使用的 `import base64`、
+  `import db`、`_route_pk_counter = itertools.count(9_000)`（连带其 `itertools` 导入）
+  一并删除。
+
+改动范围：`backend/admin/data_track.py`（`_runtime_failure_code` / `_runtime_health_level`
+/ `_render_runtime_health_page`）、`tests/test_data_track_runtime_view.py`（8 条新用例覆盖
+上述三个 Important 项 + 死代码清理）、设计文档 §5/§6/§8/§10、实施计划里对应的三处代码块
+（均加了「最终 code review 修正」批注，保留原文作历史记录）。不涉及迁移、不改
+`recent_runtime_health()` 的 SQL 口径、不动既有 6 个视图页。
 ## 2026-07-27 — 摘要折叠死锁：一个 V2 用户被自己的一批消息卡了三天
 
 **[FIX] 折叠被拒的原因不再是黑的；`prompt_coverage_incomplete` 从
@@ -151,6 +259,32 @@ token 数、provider/model、错误**类名**，不含 prompt、回复、上游�
 超大单行被隔离而非永久卡死、关掉开关后两条路径都仍然 fail-closed，以及台账镜像的
 四条（成功/失败字段映射、非 provider 事件不记、原始错误体不进台账、写入失败不影响
 turn）。
+
+**[DECISION] 折叠批次 200→50、tail 预算 20→50（2026-07-28）**。解密 usr_90184 的
+`provider_error` 后确认：他和 usr_7f30 挂在**同一条 lane（prompt_catchup）**，是同
+一个「批次过大」的两种表现——usr_7f30 的 200 条渲染不成合规 bullet（折叠被拒 →
+死锁），usr_90184 的 200 条在 compaction 的 `timeout=60.0` 内答不完
+（`duration_ms=60340`、`error_class=transient`、`status=null`，即根本没收到 HTTP
+响应，不是中转拒绝）。四分之一大小的请求两头都缓解。
+
+tail 预算 20→50 是更上游的一刀：**它决定一个 turn 是否进入折叠路径**。积压不超过它
+就整批留在逐字 tail 里，一次折叠都不做。20 太低，几乎每个活跃用户每回合都在折叠；
+而全程健康的那两个 prod 用户（21/21、13/15）恰恰是因为历史从没到过这个线。
+
+⚠️ 权衡：`plan_provider_round` 里**对话消息是 required 组件，超预算不会被裁而是直接
+`prompt_frontier_exhausted`**（只有 tool schema 是 optional）。多带 30 条逐字消息约
+数千 token；prod 健康用户 prompt 峰值 22,768 / 15,554，对 120k 可用预算安全。唯一
+的 frontier_exhausted 记录（usr_5adeef，07-24 17:42）发生在 unaudited default 还是
+32768 的时期，07-25 12:31 已改为 131072。若将来有用户自配小 context_window 或中转
+真实窗口偏小，这两个值仍是首先要回调的旋钮（都是 `${VAR:-}` 形式，改 env 即可）。
+
+**[FIX] 这些旋钮的 `-e` 接线补齐（2026-07-28）**。之前只把它们写进了 compose，
+CI 的 `phala deploy` 没传值，等于**只能用默认值**——"改 env 就能救急"这句话当时并
+不成立。现在三个环境的 5 个旋钮（batch msgs/chars、catchup deadline、tail budget、
+quarantine 开关）都接了 `-e` + `vars.<ENV>_<KNOB>`。刻意不写 `|| 默认值`：repo var
+未设时必须传空，让 compose 的 `${VAR:-默认}` 生效；设了才覆盖。这也是确定性复现
+隔离路径的前提——把 `COMPACTION_BATCH_CHARS` 临时调到几百，任何一条消息都能触发
+超预算隔离，不必去凑一个 R2 大文件。
 
 **[ADD] `tools/v2_user_triage.py`** —— 把这次的排查路径固化成一条命令（只读、不
 解密）：runtime / jobs / metrics / summary / backlog head / trajectory / provider

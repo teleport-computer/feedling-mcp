@@ -116,12 +116,20 @@ def test_exact_v2_chat_send_and_reply_refresh_without_legacy_enqueue(monkeypatch
 
 def test_transactional_v2_reply_refreshes_without_legacy_enqueue(monkeypatch):
     class _ReplyStore(_Store):
-        def _build_chat_message(self, role, source, envelope):
+        # 签名必须跟住 core.store.Store._build_chat_message —— 它是
+        # (role, source, envelope, content_type="text", extra=None)，
+        # serve_worker._sink_reply_in_transaction 按这个形状调用。桩少参数时
+        # 失败信息是 TypeError: unexpected keyword argument 'content_type'，
+        # 看起来像生产 bug，其实是桩没跟上签名变更。
+        def _build_chat_message(
+            self, role, source, envelope, content_type="text", extra=None
+        ):
             return {
                 "id": envelope["id"],
                 "role": role,
                 "source": source,
                 "ts": 10.0,
+                "content_type": content_type,
             }
 
         def reload_chat_strict(self):

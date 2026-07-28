@@ -4900,17 +4900,26 @@ async def _unsummarized_count(
     scoped by ``user_id``. Replaces the old ``max_seq - watermark_seq``
     global-seq-span estimate — see ``_gap_from_count``'s docstring for why
     that was wrong."""
+    # Exclude GC-able synthetic rows (verify_ping/resident_maintenance) from the
+    # gap: the fold reader (serve_worker._read_compaction_tail_after_seq) and
+    # both frontier witnesses exclude them, so the gap/coverage math must too —
+    # otherwise a lone synthetic row after the watermark reports a phantom gap
+    # that no fold can close (its row is never returned to be folded), and the
+    # post-assembly _assert_prompt_covers would raise on a row that is not a
+    # real coverage hole.
     if through_seq is None:
         return await asyncio.to_thread(
             db.count_messages_after_seq,
             user_id,
             watermark_seq,
+            exclude_synthetic_sources=True,
         )
     return await asyncio.to_thread(
         db.count_messages_after_seq,
         user_id,
         watermark_seq,
         through_seq=through_seq,
+        exclude_synthetic_sources=True,
     )
 
 
@@ -5086,17 +5095,28 @@ async def _quarantine_unfoldable_head(
         return False
 
     row = head[0]
-    row_seq = row.get("seq")
-    if row_seq is None:
-        row_id = row.get("id")
-        if row_id is None:
-            return False
+    # Resolve the seq from chat_messages by (user_id, msg_id) rather than
+    # trusting whatever the decrypted reader row carries. This value becomes
+    # an IMMUTABLE coverage claim, and `chat_messages.seq` is a table-wide
+    # identity shared by every user: a segment claiming a seq this user does
+    # not own permanently breaks `validate_canonical_frontier`, failing every
+    # later turn — strictly worse than the stall being escaped. Caught on test
+    # 2026-07-28, where a reader row produced 20090 while the user's oldest
+    # row was 20091 and 20090 belonged to no row at all.
+    row_id = row.get("id")
+    row_seq = None
+    if row_id is not None:
         row_seq = await within_deadline(
             lambda: asyncio.to_thread(db.chat_seq_for_msg_id, user_id, row_id)
         )
     if row_seq is None:
         return False
     row_seq = int(row_seq)
+    if row_seq <= int(watermark_seq):
+        # Not actually the head of the backlog (a concurrent compactor moved
+        # the frontier, or the reader handed back a stale row). Advancing here
+        # would rewrite coverage that is already claimed.
+        return False
     row_ts = row["ts"]
     text = _quarantine_segment_text(reject_code)
 
@@ -5280,6 +5300,10 @@ async def _ensure_prompt_coverage(
     # name plus a count) and overwritten each attempt: what matters is the
     # reason the batch that finally exhausted the retry budget was rejected.
     last_reject_code = ""
+    # Set when the most recent attempt failed because the PROVIDER did not
+    # answer (timeout/5xx), cleared by any attempt that did get an answer.
+    # Gates quarantine: see the escalation below.
+    last_provider_exc: BaseException | None = None
     # Shrinks on repeated refusal (see the escalation below).  Starts at the
     # configured batch size so the healthy path is unchanged.
     batch_cap = _COMPACTION_BATCH
@@ -5370,6 +5394,15 @@ async def _ensure_prompt_coverage(
             # Down to a single message and still refused: no smaller request
             # exists. Without an escape hatch this user's every later message
             # is blocked forever behind this one row (usr_7f30…, three days).
+            if last_provider_exc is not None:
+                # …but only a row we actually SAW and could not fold may be
+                # written off. The provider never answered here, so it said
+                # nothing about this row: quarantining now would permanently
+                # drop a message the next turn (once the provider recovers)
+                # would have folded fine. Fail honestly and leave the frontier
+                # untouched — a stalled catch-up is recoverable, a summary
+                # that silently omits a real message is not.
+                raise last_provider_exc
             if not _QUARANTINE_ENABLED:
                 raise TurnError(_coverage_incomplete_reason(last_reject_code))
             quarantined = await _quarantine_unfoldable_head(
@@ -5537,28 +5570,95 @@ async def _ensure_prompt_coverage(
             )
             return result
 
-        if segmented_write:
-            segment_text = await _within_deadline(
-                lambda: v2_compaction.compact_segment(
-                    provider_config=provider_config,
-                    old_messages=old,
-                    llm=_recording_catchup_llm,
-                    usage_out=add_usage,
-                    reject_out=_note_reject,
+        try:
+            if segmented_write:
+                segment_text = await _within_deadline(
+                    lambda: v2_compaction.compact_segment(
+                        provider_config=provider_config,
+                        old_messages=old,
+                        llm=_recording_catchup_llm,
+                        usage_out=add_usage,
+                        reject_out=_note_reject,
+                    )
                 )
-            )
-            new_summary = segment_text or ""
-        else:
-            new_summary = await _within_deadline(
-                lambda: v2_compaction.compact(
-                    provider_config=provider_config,
-                    current_summary=summary,
-                    old_messages=old,
-                    llm=_recording_catchup_llm,
-                    usage_out=add_usage,
-                    reject_out=_note_reject,
+                new_summary = segment_text or ""
+            else:
+                new_summary = await _within_deadline(
+                    lambda: v2_compaction.compact(
+                        provider_config=provider_config,
+                        current_summary=summary,
+                        old_messages=old,
+                        llm=_recording_catchup_llm,
+                        usage_out=add_usage,
+                        reject_out=_note_reject,
+                    )
                 )
+        except (LostJobLease, TurnError):
+            # Lease loss and this catch-up's own deadline are about US, not
+            # about the batch — a smaller retry cannot help and must not be
+            # attempted with a lease we may no longer hold.
+            raise
+        except Exception as exc:
+            # The provider never answered this batch (compaction's own
+            # `timeout=60.0`, a 5xx, a dropped connection), so it returned no
+            # text to reject and never reached the no-op guard below. Left
+            # alone it re-raises identically on every later turn at full size
+            # forever — usr_90184…'s stall.
+            if provider_client.classify_provider_error(exc) == "provider_config":
+                # A bad key / no credits is a property of the USER'S CONFIG,
+                # not of the batch: every smaller retry fails the same way
+                # while burning another round-trip and another deadline slice.
+                raise
+            # Anything else (transient/unknown) may well be "this batch was
+            # too big to finish in time" — take the same escalation ladder a
+            # refusal takes. `attempted_since_observation` is already set, so
+            # the next loop's fresh watermark read consumes one no-progress
+            # attempt and eventually shrinks `batch_cap`.
+            last_provider_exc = exc
+            _note_reject(f"provider_{provider_client.classify_provider_error(exc)}")
+            _report_turn_progress("prompt_catchup_batch_provider_error")
+            await _record_trajectory(
+                trajectory_recorder,
+                "compaction_provider_failed",
+                {
+                    "lane": "prompt_catchup",
+                    "error_class": type(exc).__name__,
+                    "batch_messages": len(old),
+                    "batch_cap": batch_cap,
+                    "no_progress_attempts": no_progress_attempts,
+                },
+                best_effort=True,
             )
+            # A 60s timeout ate most of a lease TTL; renew before looping.
+            await _renew_catchup_lease()
+            # Shrink on the FIRST timeout rather than after `max_retries` of
+            # them. A refusal gets retried at the same size because the model
+            # is nondeterministic and often folds the identical batch on the
+            # next try; a timeout is not like that — it says this batch cannot
+            # finish in the time allowed, and re-sending it just burns another
+            # full provider timeout. Spending the retry budget at each rung
+            # costs 4 rungs × max_retries × 60s = 720s against a 600s deadline,
+            # so the ladder never reaches the small batches that would have
+            # worked, and `batch_cap` (a local) restarts at the top on the next
+            # turn — the stall would survive the fix. Shrinking immediately
+            # walks the whole ladder in ~4 timeouts instead.
+            if batch_cap > 1:
+                batch_cap = max(1, batch_cap // 4)
+                no_progress_attempts = 0
+                last_observed_watermark = None
+                _report_turn_progress(f"prompt_catchup_shrink_{batch_cap}")
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "compaction_batch_shrunk",
+                    {
+                        "lane": "prompt_catchup",
+                        "batch_cap": batch_cap,
+                        "reject_code": last_reject_code,
+                    },
+                    best_effort=True,
+                )
+            continue
+        last_provider_exc = None
         _report_turn_progress("prompt_catchup_batch_complete")
         if (
             (segmented_write and not new_summary.strip())
@@ -6662,6 +6762,13 @@ async def _run_wake(
                 fold_new_messages=fold_new_messages,
                 add_usage=_add_usage,
                 max_calls=_TURN_MAX_LLM_CALLS,
+                # "Weak wake sleeps": staying silent is this lane's documented
+                # success case (`_on_reply` no-ops on empty text), so a
+                # text-free provider reply must come back as "" rather than
+                # raising. Without this the lane failed 100% of the time on
+                # test with `wake_failed:providererror` while the provider
+                # answered 200 OK — the model simply had nothing to say.
+                require_reply=False,
                 on_provider_success=lambda: _record_provider_success(user_id),
                 on_provider_failure=lambda exc: _record_provider_failure(
                     user_id,

@@ -336,8 +336,31 @@ def _queue_failure_review_on_cursor(cur, source_job_id: int | str) -> bool:
     return False
 
 
-def _recover_review_runner_on_cursor(cur, runner_job_id: int | str) -> None:
-    """Release a review claim whose generic runner terminalized unexpectedly."""
+def _recover_review_runner_on_cursor(
+    cur, runner_job_id: int | str,
+) -> list[tuple[str, str]]:
+    """Release a review claim whose generic runner terminalized unexpectedly.
+
+    Returns the ``[(user_id, source_job_id), ...]`` pairs this UPDATE actually
+    touched. The caller MUST mark_pending these for TEE requeue itself, and
+    MUST NOT do so until its own outer ``with _pool().connection()`` block has
+    exited (i.e. the transaction containing this UPDATE has committed).
+
+    Marking from inside this shared cursor, before that commit, would be a
+    genuine race, not just a hypothetical one: mirror.mark_pending writes
+    through an independent autocommit connection to the TEE shadow DB, so the
+    marker can land and be *consumed* before this transaction commits. The
+    requeue consumer's fetch is a plain SELECT with no FOR UPDATE, so under
+    READ COMMITTED it does not block on this transaction's row lock — it
+    simply reads whatever was last committed, i.e. the pre-UPDATE row — and,
+    finding a row, deletes the just-created pending marker as "done". When
+    this transaction then commits moments later, there is no marker left to
+    trigger a re-fetch, so the real state change (running -> pending/failed)
+    never reaches TEE. That is silent and permanent, and worse than never
+    marking at all: requeue_backlog even looks healthy (the marker was
+    "consumed"), with no error anywhere. This is exactly the class of bug
+    this task exists to close, reintroduced via a different trigger path.
+    """
     cur.execute(
         "UPDATE v2_trajectory_reviews r SET "
         "status=CASE WHEN r.attempt_count<%s THEN 'pending' ELSE 'failed' END, "
@@ -347,7 +370,7 @@ def _recover_review_runner_on_cursor(cur, runner_job_id: int | str) -> None:
         "finished_at=CASE WHEN r.attempt_count<%s THEN NULL ELSE now() END "
         "FROM agent_jobs j WHERE j.id=%s AND j.lane=%s "
         "AND r.claimed_by_job_id=j.id AND r.status='running' "
-        "RETURNING r.user_id",
+        "RETURNING r.user_id, r.source_job_id",
         (
             _TRAJECTORY_REVIEW_MAX_ATTEMPTS,
             _TRAJECTORY_REVIEW_MAX_ATTEMPTS,
@@ -357,9 +380,13 @@ def _recover_review_runner_on_cursor(cur, runner_job_id: int | str) -> None:
         ),
     )
     rows = cur.fetchall()
+    recovered: list[tuple[str, str]] = []
     for row in rows:
         user_id = row["user_id"] if isinstance(row, dict) else row[0]
+        source_job_id = row["source_job_id"] if isinstance(row, dict) else row[1]
         _ensure_review_runner_on_cursor(cur, str(user_id))
+        recovered.append((str(user_id), str(source_job_id)))
+    return recovered
 
 
 def reconcile_failure_review_runners(*, limit: int = 64) -> int:
@@ -991,6 +1018,7 @@ def mark_failed(
     window between them. Background lanes remain silent and do not get an
     outbox row.
     """
+    recovered_reviews: list[tuple[str, str]] = []
     with _pool().connection() as conn:
         with conn.transaction():
             cur = conn.execute(
@@ -1028,12 +1056,22 @@ def mark_failed(
                     base_sec=float(wake_backoff_base_sec),
                     cap_sec=float(wake_backoff_cap_sec),
                 )
-            _recover_review_runner_on_cursor(cur, job_id)
+            recovered_reviews = _recover_review_runner_on_cursor(cur, job_id)
             _queue_failure_review_on_cursor(cur, job_id)
-            return True
+    if recovered_reviews:
+        # Must wait until the transaction above has committed — see the
+        # docstring on _recover_review_runner_on_cursor for the race this
+        # avoids (a requeue consumer reading the pre-commit row and deleting
+        # the marker before the real UPDATE lands).
+        from tee_shadow import mirror
+        for user_id, source_job_id in recovered_reviews:
+            mirror.mark_pending(
+                user_id, "v2_trajectory_reviews", source_job_id, "requeue")
+    return True
 
 
 def mark_expired(job_id, error: str = "runtime_expired") -> None:
+    recovered_reviews: list[tuple[str, str]] = []
     with _pool().connection() as conn:
         with conn.transaction():
             cur = conn.execute(
@@ -1047,8 +1085,13 @@ def mark_expired(job_id, error: str = "runtime_expired") -> None:
                     _queue_terminal_failure_on_cursor(
                         cur, row[0], str(row[1]), error
                     )
-                _recover_review_runner_on_cursor(cur, job_id)
+                recovered_reviews = _recover_review_runner_on_cursor(cur, job_id)
                 _queue_failure_review_on_cursor(cur, job_id)
+    if recovered_reviews:
+        from tee_shadow import mirror
+        for user_id, source_job_id in recovered_reviews:
+            mirror.mark_pending(
+                user_id, "v2_trajectory_reviews", source_job_id, "requeue")
 
 
 def reap_stuck_job_rows(now=None) -> list[dict]:
@@ -1059,6 +1102,7 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
     Returned rows let the independent watchdog surface chat timeouts.
     """
     ts = float(now) if now is not None else None
+    recovered_reviews: list[tuple[str, str]] = []
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
@@ -1100,7 +1144,8 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
                             str(row["user_id"]),
                             str(row["last_error"]),
                         )
-                    _recover_review_runner_on_cursor(cur, row["id"])
+                    recovered_reviews.extend(
+                        _recover_review_runner_on_cursor(cur, row["id"]))
                     _queue_failure_review_on_cursor(cur, row["id"])
                 # Prepared Capture journals are retry-only encrypted content.
                 # Retire obsolete runtime generations immediately and bound a
@@ -1116,7 +1161,12 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
                     " ORDER BY b.created_at LIMIT 100"
                     ")"
                 )
-                return rows
+    if recovered_reviews:
+        from tee_shadow import mirror
+        for user_id, source_job_id in recovered_reviews:
+            mirror.mark_pending(
+                user_id, "v2_trajectory_reviews", source_job_id, "requeue")
+    return rows
 
 
 def ensure_terminal_failure_outbox(
@@ -3804,6 +3854,195 @@ def recent_chat_operational_health(
     }
 
 
+def recent_runtime_health(
+    *,
+    within_hours: int = 24,
+    limit: int = 1000,
+) -> dict:
+    """全 lane 运行时健康快照（content-free），喂 admin 值班台。
+
+    分母刻意从 ``agent_jobs`` 起算而非从 metrics/trajectory 起算：一次完全漏写
+    若同时消失于分子和分母，就会报出虚假健康的机群。``superseded`` 单列、不进
+    失败率——运行时代际切换不是故障。延迟分位数只取成功回合（``failed IS NOT
+    TRUE``）：失败超时回合会把 p95 拉到与故障同源的高位，让一个故障看起来像两个。
+    """
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    safe_limit = max(1, min(int(limit), 1000))
+    terminal_statuses = ("completed", "failed", "expired", "superseded")
+
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "WITH recent AS ("
+                "  SELECT lane,status,last_error FROM agent_jobs "
+                "  WHERE status IN ('completed','failed','expired','superseded') "
+                "    AND finished_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY finished_at DESC,id DESC LIMIT %s"
+                ") SELECT lane,"
+                "  COUNT(*) FILTER (WHERE status='completed')::int AS completed,"
+                "  COUNT(*) FILTER (WHERE status='failed')::int AS failed,"
+                "  COUNT(*) FILTER (WHERE status='expired')::int AS expired,"
+                "  COUNT(*) FILTER (WHERE status='superseded')::int AS superseded,"
+                "  COUNT(*) FILTER (WHERE status='expired' "
+                "    AND last_error='queue_timeout')::int AS queue_expired,"
+                "  COUNT(*) FILTER (WHERE status='expired' "
+                "    AND last_error='lease_timeout')::int AS lease_expired "
+                "FROM recent GROUP BY lane",
+                (safe_hours, safe_limit),
+            )
+            outcome_rows = cur.fetchall()
+
+            cur.execute(
+                "WITH recent AS ("
+                "  SELECT lane,latency_ms FROM v2_turn_metrics "
+                "  WHERE failed IS NOT TRUE AND latency_ms IS NOT NULL "
+                "    AND latency_ms >= 0 "
+                "    AND created_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY created_at DESC,id DESC LIMIT %s"
+                ") SELECT lane,"
+                "  percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms) AS p50_ms,"
+                "  percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms "
+                "FROM recent GROUP BY lane",
+                (safe_hours, safe_limit),
+            )
+            latency_rows = cur.fetchall()
+
+            cur.execute(
+                "WITH recent_jobs AS ("
+                "  SELECT id,lane,status FROM agent_jobs "
+                "  WHERE created_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY id DESC LIMIT %s"
+                "), classified AS ("
+                "  SELECT job.lane,"
+                "    CASE "
+                "      WHEN stream.job_id IS NULL "
+                "        AND job.status=ANY(%s::text[]) THEN 'missing' "
+                "      WHEN stream.job_id IS NULL THEN 'open' "
+                "      WHEN EXISTS (SELECT 1 FROM v2_trajectory_events gap "
+                "        WHERE gap.job_id=job.id "
+                "          AND gap.event_kind='capture_gap') THEN 'partial' "
+                "      WHEN EXISTS (SELECT 1 FROM v2_trajectory_events terminal "
+                "        WHERE terminal.job_id=job.id "
+                "          AND terminal.event_kind='turn_terminal') THEN 'complete' "
+                "      WHEN job.status=ANY(%s::text[]) THEN 'partial' "
+                "      ELSE 'open' "
+                "    END AS capture_status "
+                "  FROM recent_jobs job "
+                "  LEFT JOIN v2_trajectory_streams stream ON stream.job_id=job.id"
+                ") SELECT lane,"
+                "  COUNT(*) FILTER (WHERE capture_status='complete')::int AS complete,"
+                "  COUNT(*) FILTER (WHERE capture_status='partial')::int AS partial,"
+                "  COUNT(*) FILTER (WHERE capture_status='missing')::int AS missing,"
+                "  COUNT(*) FILTER (WHERE capture_status='open')::int AS open "
+                "FROM classified GROUP BY lane",
+                (
+                    safe_hours,
+                    safe_limit,
+                    list(terminal_statuses),
+                    list(terminal_statuses),
+                ),
+            )
+            capture_rows = cur.fetchall()
+
+            cur.execute(
+                "WITH recent AS ("
+                "  SELECT lane,last_error FROM agent_jobs "
+                "  WHERE status IN ('failed','expired') AND last_error IS NOT NULL "
+                "    AND finished_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY finished_at DESC,id DESC LIMIT %s"
+                ") SELECT lane,last_error,COUNT(*)::int AS count "
+                "FROM recent GROUP BY lane,last_error ORDER BY count DESC",
+                (safe_hours, safe_limit),
+            )
+            failure_rows = cur.fetchall()
+
+            cur.execute(
+                "SELECT COUNT(*)::int AS pending,"
+                "  EXTRACT(EPOCH FROM "
+                "    (clock_timestamp()-MIN(created_at))) AS oldest_pending_age_sec "
+                "FROM agent_jobs WHERE status='pending'"
+            )
+            pending_row = cur.fetchone()
+
+    latency_by_lane = {str(row["lane"] or ""): row for row in latency_rows}
+    capture_by_lane = {str(row["lane"] or ""): row for row in capture_rows}
+    failures_by_lane: dict[str, list[dict]] = {}
+    for row in failure_rows:
+        failures_by_lane.setdefault(str(row["lane"] or ""), []).append({
+            "code": str(row["last_error"] or ""),
+            "count": int(row["count"] or 0),
+        })
+
+    def _optional_ms(row, key):
+        if row is None or row.get(key) is None:
+            return None
+        return float(row[key])
+
+    # 收集所有 lane 的并集：即使全部 job 都未终态的 lane 也要保留，
+    # 防止 worker 卡死时该 lane 从健康视图消失。
+    all_lanes = set()
+    for row in outcome_rows:
+        all_lanes.add(str(row["lane"] or ""))
+    all_lanes.update(latency_by_lane.keys())
+    all_lanes.update(capture_by_lane.keys())
+    all_lanes.update(failures_by_lane.keys())
+
+    # 为了排序和记录目的，也建立 outcome 索引
+    outcome_by_lane = {
+        str(row["lane"] or ""): row for row in outcome_rows
+    }
+
+    lanes = []
+    for lane in all_lanes:
+        outcome = outcome_by_lane.get(lane)
+        completed = int((outcome or {}).get("completed") or 0)
+        failed = int((outcome or {}).get("failed") or 0)
+        expired = int((outcome or {}).get("expired") or 0)
+        resolved = completed + failed + expired
+        capture = capture_by_lane.get(lane)
+        lanes.append({
+            "lane": lane or "unknown",
+            "sampled_jobs": resolved,
+            "completed": completed,
+            "failed": failed,
+            "expired": expired,
+            "superseded": int((outcome or {}).get("superseded") or 0),
+            "queue_expired": int((outcome or {}).get("queue_expired") or 0),
+            "lease_expired": int((outcome or {}).get("lease_expired") or 0),
+            "failure_rate": (
+                float(failed + expired) / float(resolved) if resolved else None
+            ),
+            "p50_ok_ms": _optional_ms(latency_by_lane.get(lane), "p50_ms"),
+            "p95_ok_ms": _optional_ms(latency_by_lane.get(lane), "p95_ms"),
+            "capture": {
+                "complete": int((capture or {}).get("complete") or 0),
+                "partial": int((capture or {}).get("partial") or 0),
+                "missing": int((capture or {}).get("missing") or 0),
+                "open": int((capture or {}).get("open") or 0),
+            },
+            "top_failures": failures_by_lane.get(lane, [])[:5],
+        })
+
+    lanes.sort(key=lambda item: (item["sampled_jobs"], item["lane"]), reverse=True)
+    oldest_pending = (
+        pending_row.get("oldest_pending_age_sec") if pending_row else None
+    )
+    return {
+        "window_hours": safe_hours,
+        "generated_at": time.time(),
+        "lanes": lanes,
+        "pool": {
+            "inflight": inflight_job_count(),
+            "pending": int((pending_row or {}).get("pending") or 0),
+            "live_workers": live_worker_count(),
+            "capacity": live_worker_capacity(),
+            "oldest_pending_age_sec": (
+                float(oldest_pending) if oldest_pending is not None else None
+            ),
+        },
+    }
+
+
 def recent_prompt_cache_stats(
     *,
     lane: str = "chat",
@@ -4088,6 +4327,8 @@ def upsert_summary_row_cas(
     ``COALESCE`` 保留该行原有的 watermark_seq（不清零、不误伤未真正推进
     seq 的调用方）；INSERT 分支没有旧值可留，落 0（与迁移 0031 的列默认值
     一致）。"""
+    is_cas_update = int(expected_version) != 0
+    success = False
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
@@ -4135,7 +4376,16 @@ def upsert_summary_row_cas(
                             int(expected_version),
                         ),
                     )
-                return cur.rowcount == 1
+                success = cur.rowcount == 1
+    if success and is_cas_update:
+        # Same-PK in-place rewrite (the row already existed, this CAS just
+        # advanced its version) — the append-only replicator cursor never
+        # revisits it. The INSERT branch above (expected_version==0, first
+        # creation) needs no requeue: it is a brand-new PK the forward cursor
+        # scan will pick up normally.
+        from tee_shadow import mirror
+        mirror.mark_pending(str(user_id), "v2_conversation_summary", str(user_id), "requeue")
+    return success
 
 
 def get_summary_frontier_state(user_id) -> dict | None:
@@ -4230,7 +4480,15 @@ def get_summary_frontier_state(user_id) -> dict | None:
                     cur.execute(
                         "SELECT COALESCE(MIN(seq),0) AS first_seq,"
                         "COUNT(*) AS source_count FROM chat_messages "
-                        "WHERE user_id=%s AND seq>%s AND seq<=%s",
+                        "WHERE user_id=%s AND seq>%s AND seq<=%s "
+                        # GC-able synthetic rows (verify_ping/resident_maintenance,
+                        # see db.chat_messages_after_seq) never enter the fold, so
+                        # they must be excluded from the canonical witness too —
+                        # otherwise deleting one leaves the leaf's frozen source
+                        # count above this live count and every later turn fails
+                        # validate_canonical_frontier.
+                        "AND COALESCE(doc->>'source','') "
+                        "NOT IN ('verify_ping','resident_maintenance')",
                         (user_id, opaque_through, watermark_seq),
                     )
                     witness = cur.fetchone()
@@ -4280,6 +4538,7 @@ def append_summary_leaf_cas(
         raise ValueError("invalid summary leaf metadata")
     if previous and start <= previous:
         raise ValueError("summary leaf does not advance the watermark")
+    is_head_update = False
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
@@ -4302,10 +4561,19 @@ def append_summary_leaf_cas(
 
                 # Exact retained-row witness: a seq range may contain other
                 # users' global identities, so count only this user's rows.
+                # GC-able synthetic rows (verify_ping/resident_maintenance) are
+                # excluded here for the same reason the fold reader and the
+                # read-time witness exclude them: a leaf must never claim
+                # coverage of a row a later verify_loop deletes (permanent
+                # v2_summary_frontier_integrity_error). This write-time witness
+                # must count the SAME set the fold saw, or a correct
+                # synthetic-excluded leaf would be refused here.
                 cur.execute(
                     "SELECT COALESCE(MIN(seq),0) AS first_seq,"
                     "COALESCE(MAX(seq),0) AS last_seq,COUNT(*) AS n "
-                    "FROM chat_messages WHERE user_id=%s AND seq>%s AND seq<=%s",
+                    "FROM chat_messages WHERE user_id=%s AND seq>%s AND seq<=%s "
+                    "AND COALESCE(doc->>'source','') "
+                    "NOT IN ('verify_ping','resident_maintenance')",
                     (user_id, previous, end),
                 )
                 source = cur.fetchone()
@@ -4392,6 +4660,7 @@ def append_summary_leaf_cas(
                         ),
                     )
                 else:
+                    is_head_update = True
                     cur.execute(
                         "UPDATE v2_conversation_summary SET summary_envelope=%s,"
                         "watermark_ts=%s,watermark_seq=%s,version=version+1,"
@@ -4408,7 +4677,14 @@ def append_summary_leaf_cas(
                     )
                     if cur.rowcount != 1:
                         raise RuntimeError("summary head lock lost")
-                return True
+    if is_head_update:
+        # Same-PK in-place rewrite of the existing summary head row — the
+        # append-only replicator cursor never revisits it. The head-is-None
+        # branch above is a brand-new PK the forward cursor scan picks up
+        # normally, no requeue needed.
+        from tee_shadow import mirror
+        mirror.mark_pending(str(user_id), "v2_conversation_summary", str(user_id), "requeue")
+    return True
 
 
 def seed_legacy_summary_segment(
@@ -4488,7 +4764,12 @@ def seed_legacy_summary_segment(
                 )
                 if cur.rowcount != 1:
                     raise RuntimeError("legacy summary seed CAS lost")
-                return True
+    # Same-PK in-place rewrite of the existing summary head row (this function
+    # only ever reaches here when `head` already existed) — the append-only
+    # replicator cursor never revisits it.
+    from tee_shadow import mirror
+    mirror.mark_pending(str(user_id), "v2_conversation_summary", str(user_id), "requeue")
+    return True
 
 
 def insert_summary_checkpoint(
@@ -4698,7 +4979,12 @@ def insert_summary_checkpoint(
                 )
                 if cur.rowcount != 1:
                     raise RuntimeError("summary head checkpoint CAS lost")
-                return True
+    # Same-PK in-place rewrite of the existing summary head row (head must
+    # already exist for this function to reach here) — the append-only
+    # replicator cursor never revisits it.
+    from tee_shadow import mirror
+    mirror.mark_pending(str(user_id), "v2_conversation_summary", str(user_id), "requeue")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -4807,6 +5093,8 @@ def put_workspace_entry_cas(
     """
     if type(expected_revision) is not int or expected_revision < 0:
         raise ValueError("expected_revision must be a non-negative integer")
+    is_rewrite = False
+    result: dict | None = None
     try:
         with _pool().connection() as conn:
             with conn.transaction():
@@ -4845,6 +5133,7 @@ def put_workspace_entry_cas(
                             ),
                         )
                     else:
+                        is_rewrite = True
                         cur.execute(
                             "UPDATE v2_workspace_entries SET kind=%s,content_envelope=%s,"
                             "mime_type=%s,source_ref=%s,revision=revision+1,updated_at=now() "
@@ -4861,11 +5150,19 @@ def put_workspace_entry_cas(
                             ),
                         )
                     row = cur.fetchone()
-                    return dict(row) if row is not None else None
+                    result = dict(row) if row is not None else None
     except psycopg.errors.UniqueViolation:
         # Concurrent revision-0 creators: one wins; the loser observes a clean
         # conflict rather than surfacing a database exception to the model.
         return None
+    if result is not None and is_rewrite:
+        # Same-PK (user_id,path) in-place rewrite — the append-only replicator
+        # cursor never revisits it. The INSERT branch (current is None, first
+        # write at revision 0) needs no requeue: brand-new PK, forward cursor
+        # scan picks it up normally.
+        from tee_shadow import mirror
+        mirror.mark_pending(str(user_id), "v2_workspace_entries", str(path), "requeue")
+    return result
 
 
 def delete_workspace_entry_cas(
@@ -4945,6 +5242,7 @@ def append_trajectory_events_batch(
     """
     if not isinstance(events, list) or not 1 <= len(events) <= 4096:
         raise ValueError("invalid trajectory event batch")
+    reopened_review = False
     normalized: list[dict] = []
     seen_keys: set[str] = set()
     for event in events:
@@ -5091,9 +5389,16 @@ def append_trajectory_events_batch(
                             str(user_id),
                         ),
                     )
-                    if admitted and cur.rowcount:
+                    reopened_review = bool(cur.rowcount)
+                    if admitted and reopened_review:
                         _ensure_review_runner_on_cursor(cur, str(user_id))
-                return event_indices
+    if reopened_review:
+        # Same-PK in-place rewrite of the completed review row (reopened back
+        # to pending/failed) — the append-only replicator cursor never
+        # revisits it.
+        from tee_shadow import mirror
+        mirror.mark_pending(str(user_id), "v2_trajectory_reviews", str(job_id), "requeue")
+    return event_indices
 
 
 def append_trajectory_event(
@@ -5419,7 +5724,12 @@ def claim_failure_review(
                     "WHERE source_job_id=%s RETURNING *",
                     (runner_job_id, source_job_id),
                 )
-                return dict(cur.fetchone())
+                claimed = dict(cur.fetchone())
+    # Same-PK in-place rewrite (pending -> running claim) — the append-only
+    # replicator cursor never revisits it.
+    from tee_shadow import mirror
+    mirror.mark_pending(str(user_id), "v2_trajectory_reviews", str(source_job_id), "requeue")
+    return claimed
 
 
 def finish_failure_review(
@@ -5535,11 +5845,15 @@ def finish_failure_review(
                 if cur.rowcount != 1:
                     raise RuntimeError("trajectory review runner ownership lost")
                 _ensure_review_runner_on_cursor(cur, str(user_id))
-                return {
-                    "settled": True,
-                    "review_status": review_status,
-                    "frontier_advanced": frontier_advanced,
-                }
+    # Same-PK in-place rewrite (running -> completed/pending/failed settle) —
+    # the append-only replicator cursor never revisits it.
+    from tee_shadow import mirror
+    mirror.mark_pending(str(user_id), "v2_trajectory_reviews", str(source_job_id), "requeue")
+    return {
+        "settled": True,
+        "review_status": review_status,
+        "frontier_advanced": frontier_advanced,
+    }
 
 
 def finish_empty_failure_review_runner(

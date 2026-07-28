@@ -122,7 +122,7 @@ def _script_provider(monkeypatch, responses):
     it = iter(responses)
     calls = []
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         calls.append({"messages": messages, "tools": tools})
         return next(it)
 
@@ -148,7 +148,7 @@ def test_run_wake_reply_written_and_job_completed(monkeypatch):
 
     seen = {}
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
         return _text_round("hey, how did that go?")
 
@@ -218,7 +218,7 @@ def test_run_wake_reply_push_carries_is_wake_true_and_manual_wake_lane(monkeypat
     reply_text = "hey, thinking of you — " + ("x" * 300)
     assert len(reply_text) > 240
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         return _text_round(reply_text)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
@@ -280,7 +280,7 @@ def test_wake_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     ])
     provider_calls = []
 
-    async def fake_provider(_config, messages, *, tools=None):
+    async def fake_provider(_config, messages, *, tools=None, **_kwargs):
         provider_calls.append({"messages": messages, "tools": tools})
         return next(responses)
 
@@ -433,7 +433,7 @@ def test_run_wake_empty_tail_also_sleeps_silently(monkeypatch):
 
     seen = {}
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
         return _text_round("")
 
@@ -524,7 +524,7 @@ def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
     claimed_by = _claim(job_id)
 
-    async def _boom(config, messages, *, tools=None):
+    async def _boom(config, messages, *, tools=None, **_kwargs):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
@@ -608,7 +608,7 @@ def test_run_wake_tolerates_missing_read_summary_read_tail(monkeypatch):
 
     seen = {}
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
         return _text_round("")
 
@@ -662,7 +662,7 @@ def test_run_wake_provider_config_error_sets_payment_cooldown(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
 
-    async def _boom(config, messages, *, tools=None):
+    async def _boom(config, messages, *, tools=None, **_kwargs):
         raise provider_client.ProviderError("out of credits", status_code=402)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
@@ -715,7 +715,7 @@ def test_run_wake_rollback_blocks_provider_cooldown_write(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
 
-    async def _boom(config, messages, *, tools=None):
+    async def _boom(config, messages, *, tools=None, **_kwargs):
         raise provider_client.ProviderError("credits", status_code=402)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
@@ -747,7 +747,7 @@ def test_run_wake_lost_lease_blocks_provider_cooldown_write(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
 
-    async def _boom(config, messages, *, tools=None):
+    async def _boom(config, messages, *, tools=None, **_kwargs):
         raise provider_client.ProviderError("credits", status_code=402)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
@@ -775,7 +775,7 @@ def test_run_wake_transient_error_does_not_set_payment_cooldown(monkeypatch):
     job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
     claimed_by = _claim(job_id)
 
-    async def _boom(config, messages, *, tools=None):
+    async def _boom(config, messages, *, tools=None, **_kwargs):
         raise provider_client.ProviderError("timed out", status_code=503)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
@@ -846,3 +846,58 @@ def test_process_job_dispatches_wake_lanes_to_run_wake_not_chat_path(monkeypatch
     assert coalesce_calls["n"] == 0
     assert written["text"] == "a proactive nudge"
     assert _job_status(job_id)[0] == "completed"
+
+
+def test_wake_tells_the_provider_that_an_empty_reply_is_acceptable(monkeypatch):
+    """The "weak wake sleeps" contract only holds if the lane ASKS for it.
+
+    Every other wake test stubs `chat_completion_async` to hand back an empty
+    reply, which silently assumes provider_client would do that. It does not:
+    with the default `require_reply=True`, `_extract_anthropic_reply` (and its
+    openai/gemini/bedrock siblings) RAISE
+    `ProviderError("provider response had no usable reply text")` on a 2xx
+    whose content carries no text — `required = require_reply and not
+    tool_calls`. So a model that chooses to stay silent, which is the entire
+    point of a wake, is reported as a provider failure.
+
+    Observed on test 2026-07-28: manual_wake failed 3/3 with
+    `wake_failed:providererror` while anthropic returned 200 OK on every call.
+    Nobody noticed because `_run_wake` fails silently by design (background
+    job: no error chip, no bubble) — users just experience a companion that
+    never reaches out.
+
+    This stub mirrors provider_client's REAL contract instead of assuming it.
+    """
+    uid = "u_wake_require_reply"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "heartbeat")
+    claimed_by = _claim(job_id)
+
+    seen = {}
+
+    async def _contract_faithful(config, messages, *, tools=None,
+                                 require_reply=True, **kwargs):
+        seen["require_reply"] = require_reply
+        if require_reply:
+            # What the real client does with a text-free 2xx body.
+            raise provider_client.ProviderError(
+                "provider response had no usable reply text")
+        return _text_round("")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _contract_faithful)
+    write_called = {"n": 0}
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply",
+        lambda store, text: write_called.update(n=write_called["n"] + 1) or {"id": "r"})
+
+    deps = _wake_deps(tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}])
+    status = asyncio.run(worker._run_wake(
+        job_id, uid, "heartbeat", deps, _BYOK, worker.ENCLAVE_SEMAPHORE, claimed_by))
+
+    # The lane must have told the provider that silence is a valid outcome…
+    assert seen.get("require_reply") is False, seen
+    # …and therefore slept instead of failing.
+    assert status == "completed"
+    assert _job_status(job_id)[0] == "completed"
+    assert write_called["n"] == 0

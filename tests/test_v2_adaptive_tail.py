@@ -215,7 +215,10 @@ def test_targeted_catchup_compacts_exactly_through_safe_boundary(monkeypatch):
         lambda _uid: {"watermark_seq": state["watermark_seq"]},
     )
 
-    def count(_uid, after_seq, *, through_seq=None):
+    def count(_uid, after_seq, *, through_seq=None, exclude_synthetic_sources=False):
+        # These fixture rows carry no synthetic sources, so the coverage-path
+        # exclusion is a no-op here; accept the kwarg to mirror the production
+        # signature (worker._unsummarized_count now always passes it).
         return len([
             row
             for row in rows
