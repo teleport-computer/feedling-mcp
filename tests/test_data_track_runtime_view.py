@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from admin import data_track as _dt  # noqa: E402
+from core import reqctx  # noqa: E402
 
 
 def _lane(**overrides) -> dict:
@@ -134,3 +135,62 @@ def test_runtime_failure_code_buckets_unknown_free_text():
 def test_runtime_failure_code_truncates_long_known_prefix():
     long_code = "turn_failed:" + ("x" * 200)
     assert len(_dt._runtime_failure_code(long_code)) == 64
+
+
+# ---- 边界值测试：精确阈值 ----
+
+def test_runtime_health_level_boundary_failure_rate_warn():
+    # 失败率恰好 5% 进黄区
+    level, reasons = _dt._runtime_health_level(
+        _payload([_lane(failure_rate=0.05, failed=5, completed=95)])
+    )
+    assert level == "warn"
+    assert any("失败率" in r for r in reasons)
+
+
+def test_runtime_health_level_boundary_failure_rate_bad():
+    # 失败率恰好 15% 进红区
+    level, reasons = _dt._runtime_health_level(
+        _payload([_lane(failure_rate=0.15, failed=15, completed=85)])
+    )
+    assert level == "bad"
+    assert any("失败率" in r for r in reasons)
+
+
+def test_runtime_health_level_boundary_p95_warn():
+    # p95 恰好 60000ms 进黄区
+    level, _ = _dt._runtime_health_level(_payload([_lane(p95_ok_ms=60_000)]))
+    assert level == "warn"
+
+
+def test_runtime_health_level_boundary_p95_bad():
+    # p95 恰好 120000ms 进红区
+    level, _ = _dt._runtime_health_level(_payload([_lane(p95_ok_ms=120_000)]))
+    assert level == "bad"
+
+
+def test_runtime_health_level_boundary_pending_warn():
+    # pending 年龄恰好 60s 进黄区
+    level, _ = _dt._runtime_health_level(_payload(pending=1, oldest_pending_age_sec=60))
+    assert level == "warn"
+
+
+def test_runtime_health_level_boundary_pending_bad():
+    # pending 年龄恰好 180s 进红区
+    level, _ = _dt._runtime_health_level(_payload(pending=1, oldest_pending_age_sec=180))
+    assert level == "bad"
+
+
+# ---- window_hours 参数解析测试 ----
+
+def test_runtime_health_window_hours_accepts_whitelisted_values():
+    for hours in (24, 168, 720):
+        with reqctx.bind(f"hours={hours}"):
+            assert _dt._runtime_health_window_hours() == hours
+
+
+def test_runtime_health_window_hours_falls_back_on_bad_input():
+    # 非白名单值、非数字、负数、缺失 —— 一律回落 24，不抛异常
+    for qs in ("hours=99999", "hours=0", "hours=-5", "hours=abc", "hours=", ""):
+        with reqctx.bind(qs):
+            assert _dt._runtime_health_window_hours() == 24
