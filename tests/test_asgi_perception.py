@@ -146,6 +146,7 @@ def _both(method, path, **kw):
     ("GET", "/v1/perception/photo/p1/content"),
     ("GET", "/v1/perception/items/workout"),
     ("GET", "/v1/perception/app_open"),
+    ("GET", "/v1/perception/app_close"),
 ])
 def test_no_auth_is_401_parity(monkeypatch, method, path):
     # No env fixture -> real resolve_user runs; no credential -> AuthError(401).
@@ -369,5 +370,29 @@ def test_app_open_bundle_id_fallback_parity(env):
 
 def test_app_open_requires_app_400_parity(env):
     status, out, _ct = _both("GET", "/v1/perception/app_open")
+    assert status == 400
+    assert out["error"] == "app_required"
+
+
+def test_app_close_parity(env):
+    fake, _ = env
+    _both("GET", "/v1/perception/app_open?app=Instagram&category=social&ts=1000")
+    status, out, _ct = _both("GET",
+                             "/v1/perception/app_close?app=Instagram&category=social&ts=1600")
+    assert status == 200
+    assert out["app"] == "Instagram" and out["category"] == "social"
+    assert fake.get_state(UID)["app_state"]["v"] == "closed"
+    assert fake.read_app_closes(UID)[-1]["app"] == "Instagram"
+
+
+def test_app_close_bundle_id_fallback_parity(env):
+    fake, _ = env
+    status, out, _ct = _both("GET", "/v1/perception/app_close?bundle_id=com.foo.bar")
+    assert status == 200
+    assert out["app"] == "com.foo.bar"
+
+
+def test_app_close_requires_app_400_parity(env):
+    status, out, _ct = _both("GET", "/v1/perception/app_close")
     assert status == 400
     assert out["error"] == "app_required"

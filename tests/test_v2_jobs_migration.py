@@ -249,11 +249,15 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0061_v2_adaptive_tail_metrics").down_revision == (
         "0060_v2_wake_failure_backoff"
     )
+    assert script.get_revision("0062_v2_failure_reply").down_revision == (
+        "0061_v2_adaptive_tail_metrics"
+    )
     # 刻意不断言 head 的具体 revision 名：每合入一个 migration 就要回来改这一行，
     # 而"当前 head 叫什么"本身没有约束价值。真正要防的"链分叉成多头"已由
     # tests/test_genesis_worker_claim_migration.py::test_alembic_single_head 专门守着。
     # 2026-07-28：本行原钉死 "0061_v2_adaptive_tail_metrics"，被 0062 合入撞红——
-    # 与 test_v2_summary_watermark_seq 当初那次是同一类脆弱断言。
+    # 与 test_v2_summary_watermark_seq 当初那次是同一类脆弱断言。合 test 分支时
+    # 保留了它新增的 0062 down_revision 断言（守拓扑，有价值），只丢掉钉 head 名那行。
     # 上面逐条 down_revision 的断言保留：它们守的是链的**拓扑**，那才是这个测试的价值。
 
 
@@ -653,7 +657,8 @@ def test_terminal_failure_outbox_schema_and_error_event_idempotency_guard_exist(
         ).fetchall()
         indexes = conn.execute(
             "SELECT indexname FROM pg_indexes "
-            "WHERE tablename IN ('v2_terminal_failure_outbox','agent_status_events')"
+            "WHERE tablename IN ("
+            "'v2_terminal_failure_outbox','agent_status_events','agent_jobs')"
         ).fetchall()
     assert {
         "job_id",
@@ -665,11 +670,19 @@ def test_terminal_failure_outbox_schema_and_error_event_idempotency_guard_exist(
         "runtime_error_delivered_at",
         "status_next_attempt_at",
         "runtime_error_next_attempt_at",
+        "error_class",
+        "reply_frontier_seq",
+        "reply_parent_message_id",
+        "reply_delivered_at",
+        "reply_next_attempt_at",
     }.issubset({row[0] for row in columns})
     assert {
         "v2_terminal_failure_status_pending_idx",
         "v2_terminal_failure_runtime_pending_idx",
+        "v2_terminal_failure_reply_pending_idx",
         "ux_agent_status_events_job_error",
+        "ix_agent_jobs_chat_terminal_finished",
+        "ix_agent_jobs_user_chat_failure_finished",
     }.issubset({row[0] for row in indexes})
 
 

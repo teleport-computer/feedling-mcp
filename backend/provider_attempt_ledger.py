@@ -2,6 +2,13 @@
 
 The resident consumer reports metadata only. Provider prompts, responses,
 headers, credentials, and raw errors never enter this stream.
+
+Two writers share this one stream on purpose. V1's resident consumer POSTs its
+attempts (``record_attempts_payload``); Runtime V2 writes its own server-side
+(``record_runtime_attempt``). Keeping both in ``provider_attempts`` with the
+same field names is what makes "the same relay works under V1 and fails under
+V2" a single query instead of a break-glass trajectory decrypt — exactly the
+comparison that took a decrypt to answer for usr_90184… on 2026-07-27.
 """
 
 from __future__ import annotations
@@ -15,7 +22,19 @@ import db
 
 
 STREAM = "provider_attempts"
-VALID_TRIGGERS = frozenset({"first", "stream_cut_retry", "redelivery"})
+# "first"/"stream_cut_retry"/"redelivery" are the resident consumer's own
+# vocabulary. The v2_* values are written server-side by Runtime V2 and name
+# the lane whose provider call this was, so one stream can still be split by
+# runtime when reading.
+VALID_TRIGGERS = frozenset(
+    {
+        "first",
+        "stream_cut_retry",
+        "redelivery",
+        "v2_turn",
+        "v2_catchup",
+    }
+)
 _SAFE_OUTCOME_RE = re.compile(r"[^a-z0-9_.-]+")
 _MAX_BATCH = 64
 
@@ -103,3 +122,70 @@ def record_attempts_payload(store, payload: dict) -> tuple[dict, int]:
         "recorded": len(recorded),
         "attempt_n": [row["attempt_n"] for row in recorded],
     }, 200
+
+
+def record_runtime_attempt(
+    user_id: str,
+    *,
+    parent_key: str,
+    trigger: str,
+    outcome: str,
+    provider: str = "",
+    model: str = "",
+    lane: str = "",
+    input_tokens: Any = None,
+    output_tokens: Any = None,
+    error_class: str = "",
+    provider_request_id: str = "",
+    ts: float | None = None,
+) -> bool:
+    """Append one Runtime V2 provider attempt. Never raises.
+
+    Same stream and same field names as the resident consumer's ledger, plus
+    ``provider``/``model``/``lane``/``error_class`` — V1 gets those from the
+    consumer's own config, V2 has to state them itself.
+
+    Telemetry must never be able to fail a turn that would otherwise succeed,
+    so every failure here is swallowed and reported as ``False``.
+    """
+    try:
+        uid = str(user_id or "").strip()
+        key = _bounded_text(parent_key, 256)
+        if not uid or not key:
+            return False
+        safe_trigger = _bounded_text(trigger, 32)
+        if safe_trigger not in VALID_TRIGGERS:
+            return False
+        safe_outcome = _bounded_text(outcome, 64).lower() or "unknown"
+        safe_outcome = (
+            _SAFE_OUTCOME_RE.sub("_", safe_outcome).strip("_.-") or "unknown"
+        )
+        doc = {
+            "parent_message_id": key,
+            "trigger": safe_trigger,
+            "provider_request_id": _bounded_text(provider_request_id, 256),
+            "usage": {
+                "input_tokens": _usage_count(input_tokens),
+                "output_tokens": _usage_count(output_tokens),
+            },
+            "outcome": safe_outcome,
+            "ts": _timestamp(ts),
+            # V2-only additions. Absent on resident rows, which is itself a
+            # useful discriminator when reading the merged stream.
+            "runtime": "v2",
+            "lane": _bounded_text(lane, 32),
+            "provider": _bounded_text(provider, 64),
+            "model": _bounded_text(model, 128),
+            "error_class": _bounded_text(error_class, 64),
+        }
+        stored = db.log_append_numbered(
+            uid,
+            STREAM,
+            doc,
+            number_field="attempt_n",
+            ts=doc["ts"],
+            item_key=key,
+        )
+        return stored is not None
+    except Exception:  # noqa: BLE001 - telemetry must not break a turn
+        return False

@@ -145,12 +145,23 @@ SIGNALS: dict[str, Signal] = {s.input: s for s in [
     Signal("health_mood", "health_mood",
            ("valence", "valence_classification", "kind", "label_count", "recorded_today"),
            ttl_sec=86400.0, significant=False),
-    # `app` is reported via the GET /app_open shortcut endpoint (not /report); this
-    # entry exists so app_name/app_category appear in the snapshot with a TTL.
-    # 900s, not the 300s this used to be: the Shortcut only fires on app OPEN,
-    # so a 5-minute window meant the agent saw app_name=None for any turn that
-    # wasn't right after a launch. `recent_apps` covers anything older.
-    Signal("app", "app", ("app_name", "app_category"),
+    # `app` is reported via the GET /app_open + /app_close shortcut endpoints
+    # (not /report); this entry exists so app_name/app_category/app_state appear
+    # in the snapshot with a TTL. 900s, not the 300s this used to be: an app
+    # session routinely outlives a 5-minute window, so a shorter TTL made the
+    # agent see app_name=None for any turn that wasn't right after a launch.
+    # `app_state` is what distinguishes "still in it" (foreground) from "just
+    # left it" (closed); `recent_apps` covers anything older.
+    #
+    # NOTE: this `app_state` (values "foreground" / "closed" / null) is about
+    # some OTHER app on the user's phone — the one the iOS Shortcut just
+    # opened or closed. It is UNRELATED to the `app_state` field found in
+    # device_events / proactive scene-phase code (backend/proactive/service.py,
+    # backend/push/service.py, backend/proactive/capture_scheduler.py), which
+    # tracks IO's OWN foreground/background/inactive phase. Same name,
+    # different namespace (perception_state field vs. device_events payload),
+    # no functional overlap.
+    Signal("app", "app", ("app_name", "app_category", "app_state"),
            ttl_sec=900.0, significant=False),
 ]}
 

@@ -159,7 +159,8 @@ def test_migration_head_and_watermark_seq_column():
     # （多头会让部署时的 alembic upgrade head 失败，本仓库有过多头事故）。
     # get_current_head() 在多头时本就会抛错，这里再显式断言一次单头，失败信息更直白。
     # 2026-07-27：本行原钉死 "0058_provider_usage_halted"，被 0059/0060/0061 合入后
-    # 撞红——那是测试维护滞后，不是迁移链有问题。
+    # 撞红；合 test 时又见它被挪到 "0062_v2_failure_reply"——同一类维护滞后，
+    # 正是拆掉它的理由。
     assert len(script.get_heads()) == 1, f"迁移链分叉成多头：{script.get_heads()}"
     assert script.get_revision("0031_v2_summary_watermark_seq").down_revision == (
         "0030_v2_runtime_control"

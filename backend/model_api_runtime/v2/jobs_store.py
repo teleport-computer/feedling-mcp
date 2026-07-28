@@ -25,6 +25,7 @@ from psycopg.types.json import Jsonb
 
 import db
 from core import wake_bus
+from notices import catalog as notices_catalog
 
 log = logging.getLogger("feedling.runtime_v2.jobs_store")
 
@@ -77,6 +78,13 @@ PENDING_CHAT_TTL_SEC = _positive_float_env("FEEDLING_V2_CHAT_PENDING_TTL_SEC", "
 RUNNING_TTL_SEC = _positive_float_env("FEEDLING_V2_LEASE_TTL_SEC", "300")
 
 _ACTIVE_STATUSES = ("pending", "claimed", "running")
+_TERMINAL_FAILURE_FALLBACK_REPLY = (
+    os.environ.get(
+        "FALLBACK_REPLY",
+        "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。",
+    ).strip()
+    or "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
+)
 
 # Migration 0041's database trigger rejects pending->claimed transitions from
 # pre-0041 workers. This transaction-local protocol marker is deliberately set
@@ -97,8 +105,57 @@ def _terminal_error_code(error: object) -> str:
     return value if _TERMINAL_ERROR_CODE_RE.fullmatch(value) else "runtime_failed"
 
 
+def _terminal_error_class(error: object, error_class: object = "") -> str:
+    candidate = str(error_class or "").strip()
+    if candidate in notices_catalog.ERROR_CLASSES:
+        return candidate
+    code = _terminal_error_code(error)
+    if code in {"queue_timeout", "lease_timeout", "runtime_expired"}:
+        return "turn_timeout"
+    if "prompt_frontier_exhausted" in code:
+        return "context_overflow"
+    if code.endswith(":empty_reply"):
+        return "reply_parse_failed"
+    return "unknown"
+
+
 def _pool():
     return db.get_pool()
+
+
+def _queue_terminal_failure_on_cursor(
+    cur,
+    job_id,
+    user_id: str,
+    error: object,
+    *,
+    error_class: object = "",
+) -> bool:
+    """Capture one chat failure's route and input frontier in its transaction."""
+    cur.execute(
+        "INSERT INTO v2_terminal_failure_outbox "
+        "(job_id,user_id,error_code,error_class,"
+        " target_route_id,target_route_updated_at,"
+        " reply_frontier_seq,reply_parent_message_id) "
+        "SELECT j.id,j.user_id,%s,%s,r.id,r.updated_at,"
+        " input.seq,input.msg_id FROM agent_jobs j "
+        "LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
+        "  WHERE user_id=j.user_id AND is_active LIMIT 1) r ON TRUE "
+        "LEFT JOIN LATERAL (SELECT seq,msg_id FROM chat_messages "
+        "  WHERE user_id=j.user_id AND doc->>'role' IN ('user','human') "
+        "  AND COALESCE(doc->>'source','') "
+        "    NOT IN ('verify_ping','resident_maintenance') "
+        "  ORDER BY seq DESC LIMIT 1) input ON TRUE "
+        "WHERE j.id=%s AND j.user_id=%s AND j.lane='chat' "
+        "ON CONFLICT (job_id) DO NOTHING",
+        (
+            _terminal_error_code(error),
+            _terminal_error_class(error, error_class),
+            job_id,
+            str(user_id),
+        ),
+    )
+    return cur.rowcount == 1
 
 
 _TRAJECTORY_REVIEW_LANE = "trajectory_review"
@@ -453,16 +510,11 @@ def coalesce_or_insert_on_cursor(
             # reaper sees this row.  Queue the same visibility obligation in
             # this caller-owned transaction; generation supersession above is
             # intentional/silent and must not create an error marker.
-            cur.execute(
-                "INSERT INTO v2_terminal_failure_outbox "
-                "(job_id,user_id,error_code,target_route_id,target_route_updated_at) "
-                "SELECT j.id,j.user_id,j.last_error,r.id,r.updated_at "
-                "FROM agent_jobs j LEFT JOIN LATERAL ("
-                "  SELECT id,updated_at FROM model_api_routes "
-                "  WHERE user_id=j.user_id AND is_active LIMIT 1"
-                ") r ON TRUE WHERE j.id=%s AND j.lane='chat' "
-                "ON CONFLICT (job_id) DO NOTHING",
-                (existing["id"],),
+            _queue_terminal_failure_on_cursor(
+                cur,
+                existing["id"],
+                str(user_id),
+                "queue_timeout" if existing["status"] == "pending" else "lease_timeout",
             )
             _queue_failure_review_on_cursor(cur, existing["id"])
     cur.execute(
@@ -954,6 +1006,7 @@ def mark_failed(
     error: str,
     *,
     claimed_by: str,
+    error_class: str = "",
     wake_backoff_base_sec: float | None = None,
     wake_backoff_cap_sec: float | None = None,
     wake_backoff_now: float | None = None,
@@ -965,31 +1018,28 @@ def mark_failed(
     window between them. Background lanes remain silent and do not get an
     outbox row.
     """
-    visible_error = _terminal_error_code(error)
     recovered_reviews: list[tuple[str, str]] = []
     with _pool().connection() as conn:
         with conn.transaction():
             cur = conn.execute(
-                "WITH terminal AS ("
-                "  UPDATE agent_jobs SET status='failed', finished_at=now(), "
-                "    last_error=%s, attempt_count=attempt_count+1 "
-                "  WHERE id=%s AND status IN ('claimed','running') "
-                "    AND claimed_by=%s AND lease_expires_at > now() "
-                "  RETURNING id,user_id,lane"
-                "), queued AS ("
-                "  INSERT INTO v2_terminal_failure_outbox "
-                "  (job_id,user_id,error_code,target_route_id,target_route_updated_at) "
-                "  SELECT t.id,t.user_id,%s,r.id,r.updated_at FROM terminal t "
-                "  LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
-                "    WHERE user_id=t.user_id AND is_active LIMIT 1) r ON TRUE "
-                "  WHERE t.lane='chat' "
-                "  ON CONFLICT (job_id) DO NOTHING RETURNING job_id"
-                ") SELECT id,user_id,lane FROM terminal",
-                (str(error)[:500], job_id, str(claimed_by), visible_error),
+                "UPDATE agent_jobs SET status='failed', finished_at=now(), "
+                "last_error=%s, attempt_count=attempt_count+1 "
+                "WHERE id=%s AND status IN ('claimed','running') "
+                "AND claimed_by=%s AND lease_expires_at > now() "
+                "RETURNING id,user_id,lane",
+                (str(error)[:500], job_id, str(claimed_by)),
             )
             row = cur.fetchone()
             if row is None:
                 return False
+            if str(row[2]) == "chat":
+                _queue_terminal_failure_on_cursor(
+                    cur,
+                    row[0],
+                    str(row[1]),
+                    error,
+                    error_class=error_class,
+                )
             if (
                 str(row[2]) in _FAIL_BACKOFF_WAKE_LANES
                 and wake_backoff_base_sec is not None
@@ -1021,25 +1071,20 @@ def mark_failed(
 
 
 def mark_expired(job_id, error: str = "runtime_expired") -> None:
-    visible_error = _terminal_error_code(error)
     recovered_reviews: list[tuple[str, str]] = []
     with _pool().connection() as conn:
         with conn.transaction():
             cur = conn.execute(
-                "WITH terminal AS ("
-                "  UPDATE agent_jobs SET status='expired',finished_at=now(),last_error=%s "
-                "  WHERE id=%s RETURNING id,user_id,lane"
-                "), queued AS ("
-                "  INSERT INTO v2_terminal_failure_outbox "
-                "  (job_id,user_id,error_code,target_route_id,target_route_updated_at) "
-                "  SELECT t.id,t.user_id,%s,r.id,r.updated_at FROM terminal t "
-                "  LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
-                "    WHERE user_id=t.user_id AND is_active LIMIT 1) r ON TRUE "
-                "  WHERE t.lane='chat' ON CONFLICT (job_id) DO NOTHING"
-                ") SELECT id,user_id,lane FROM terminal",
-                (str(error)[:500], job_id, visible_error),
+                "UPDATE agent_jobs SET status='expired',finished_at=now(),last_error=%s "
+                "WHERE id=%s RETURNING id,user_id,lane",
+                (str(error)[:500], job_id),
             )
-            if cur.fetchone() is not None:
+            row = cur.fetchone()
+            if row is not None:
+                if str(row[2]) == "chat":
+                    _queue_terminal_failure_on_cursor(
+                        cur, row[0], str(row[1]), error
+                    )
                 recovered_reviews = _recover_review_runner_on_cursor(cur, job_id)
                 _queue_failure_review_on_cursor(cur, job_id)
     if recovered_reviews:
@@ -1087,19 +1132,18 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
                     "  SET outcome='unknown',resolved_at=clock_timestamp() "
                     "  FROM terminal t WHERE a.job_id=t.id AND a.outcome IS NULL "
                     "  RETURNING a.job_id"
-                    "), queued AS ("
-                    "  INSERT INTO v2_terminal_failure_outbox "
-                    "  (job_id,user_id,error_code,target_route_id,target_route_updated_at) "
-                    "  SELECT t.id,t.user_id,t.last_error,r.id,r.updated_at FROM terminal t "
-                    "  LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
-                    "    WHERE user_id=t.user_id AND is_active LIMIT 1) r ON TRUE "
-                    "  WHERE t.lane='chat' "
-                    "  ON CONFLICT (job_id) DO NOTHING RETURNING job_id"
                     ") SELECT id,user_id,lane,last_error,claimed_by FROM terminal",
                     (float(PENDING_CHAT_TTL_SEC), ts, ts),
                 )
                 rows = [dict(row) for row in cur.fetchall()]
                 for row in rows:
+                    if str(row["lane"]) == "chat":
+                        _queue_terminal_failure_on_cursor(
+                            cur,
+                            row["id"],
+                            str(row["user_id"]),
+                            str(row["last_error"]),
+                        )
                     recovered_reviews.extend(
                         _recover_review_runner_on_cursor(cur, row["id"]))
                     _queue_failure_review_on_cursor(cur, row["id"])
@@ -1125,7 +1169,13 @@ def reap_stuck_job_rows(now=None) -> list[dict]:
     return rows
 
 
-def ensure_terminal_failure_outbox(job_id, user_id: str, error: str) -> bool:
+def ensure_terminal_failure_outbox(
+    job_id,
+    user_id: str,
+    error: str,
+    *,
+    error_class: str = "",
+) -> bool:
     """Idempotently ensure a durable visibility marker exists for ``job_id``.
 
     ``mark_failed`` and the timeout reaper create this in the terminal
@@ -1143,19 +1193,22 @@ def ensure_terminal_failure_outbox(job_id, user_id: str, error: str) -> bool:
                 # clear deleted the old obligation.
                 db._lock_chat_user_fence_on_cursor(cur, str(user_id))
                 cur.execute(
-                    "INSERT INTO v2_terminal_failure_outbox "
-                    "(job_id,user_id,error_code,target_route_id,target_route_updated_at) "
-                    "SELECT j.id,j.user_id,%s,r.id,r.updated_at FROM agent_jobs j "
+                    "SELECT j.id FROM agent_jobs j "
                     "JOIN v2_runtime_state s ON s.user_id=j.user_id "
-                    "LEFT JOIN LATERAL (SELECT id,updated_at FROM model_api_routes "
-                    "  WHERE user_id=j.user_id AND is_active LIMIT 1) r ON TRUE "
                     "WHERE j.id=%s AND j.user_id=%s "
                     "AND s.hosted_runtime_state='v2' "
-                    "AND j.expected_runtime_generation=s.runtime_generation "
-                    "ON CONFLICT (job_id) DO NOTHING",
-                    (_terminal_error_code(error), job_id, str(user_id)),
+                    "AND j.expected_runtime_generation=s.runtime_generation",
+                    (job_id, str(user_id)),
                 )
-                return cur.rowcount == 1
+                if cur.fetchone() is None:
+                    return False
+                return _queue_terminal_failure_on_cursor(
+                    cur,
+                    job_id,
+                    str(user_id),
+                    error,
+                    error_class=error_class,
+                )
 
 
 _CAPTURE_STATE_KIND = "capture_state"
@@ -2304,6 +2357,10 @@ def _pending_terminal_failure_rows(
         delivered_column = "runtime_error_delivered_at"
         next_column = "runtime_error_next_attempt_at"
         last_column = "runtime_error_last_attempt_at"
+    elif sink == "reply":
+        delivered_column = "reply_delivered_at"
+        next_column = "reply_next_attempt_at"
+        last_column = "reply_last_attempt_at"
     else:
         raise ValueError(f"unknown terminal failure sink: {sink!r}")
     bounded = max(1, min(int(limit), 1000))
@@ -2315,7 +2372,9 @@ def _pending_terminal_failure_rows(
             cur.execute(
                 "SELECT job_id,user_id,error_code,target_route_id,"
                 "target_route_updated_at,status_delivered_at,"
-                "runtime_error_delivered_at FROM v2_terminal_failure_outbox "
+                "runtime_error_delivered_at,error_class,reply_frontier_seq,"
+                "reply_parent_message_id,reply_delivered_at "
+                "FROM v2_terminal_failure_outbox "
                 f"WHERE {delivered_column} IS NULL "
                 f"AND {next_column} <= COALESCE(to_timestamp(%s),now())"
                 f"{where_job} ORDER BY {last_column} NULLS FIRST,"
@@ -2337,6 +2396,11 @@ def _defer_terminal_failure_sink(job_id, sink: str, *, now=None) -> None:
         last_column = "runtime_error_last_attempt_at"
         next_column = "runtime_error_next_attempt_at"
         delivered_column = "runtime_error_delivered_at"
+    elif sink == "reply":
+        attempt_column = "reply_attempt_count"
+        last_column = "reply_last_attempt_at"
+        next_column = "reply_next_attempt_at"
+        delivered_column = "reply_delivered_at"
     else:
         raise ValueError(f"unknown terminal failure sink: {sink!r}")
     ts = float(now) if now is not None else None
@@ -2434,6 +2498,94 @@ def _ack_terminal_runtime_error(job_id) -> bool:
         return cur.rowcount == 1
 
 
+def _ack_terminal_failure_reply(job_id) -> bool:
+    with _pool().connection() as conn:
+        cur = conn.execute(
+            "UPDATE v2_terminal_failure_outbox "
+            "SET reply_delivered_at=now(),updated_at=now() "
+            "WHERE job_id=%s AND reply_delivered_at IS NULL",
+            (job_id,),
+        )
+        return cur.rowcount == 1
+
+
+def _deliver_terminal_failure_reply(row: dict) -> bool:
+    """Write one encrypted, parent-linked failure bubble exactly once."""
+    from core import envelope as core_envelope
+    from core import store as core_store
+
+    job_id = row["job_id"]
+    user_id = str(row["user_id"])
+    frontier = int(row.get("reply_frontier_seq") or 0)
+    parent_id = str(row.get("reply_parent_message_id") or "").strip()
+    if frontier <= 0 or not parent_id:
+        return _ack_terminal_failure_reply(job_id)
+
+    message_id = hashlib.sha256(
+        f"v2-terminal-failure:{job_id}".encode("utf-8")
+    ).hexdigest()[:32]
+    existing = db.chat_get_strict(user_id, message_id)
+    if existing is not None:
+        if str(existing.get("terminal_failure_job_id") or "") != str(job_id):
+            raise RuntimeError("terminal failure reply id collision")
+        return _ack_terminal_failure_reply(job_id)
+
+    error_class = _terminal_error_class(
+        row.get("error_code"), row.get("error_class")
+    )
+    blame = notices_catalog.blame_for(error_class)
+    user_text = notices_catalog.user_text_for(error_class)
+    reply_text = (
+        user_text
+        if blame == "user_provider"
+        else _TERMINAL_FAILURE_FALLBACK_REPLY
+    )
+    store = core_store.get_store(user_id)
+    envelope, error = core_envelope._build_shared_envelope_for_store(
+        store,
+        reply_text.encode("utf-8"),
+        item_id=message_id,
+    )
+    if envelope is None:
+        raise RuntimeError(error or "terminal failure envelope build failed")
+    message = store._build_chat_message(
+        "openclaw",
+        "model_api",
+        envelope,
+        extra={
+            "turn_failure_error_class": error_class,
+            "turn_failure_blame": blame,
+            "turn_failure_user_text": user_text,
+            "terminal_failure_job_id": str(job_id),
+            "reply_to_message_id": parent_id,
+        },
+    )
+    seq, inserted = db.chat_append_effect_with_cursor(
+        user_id,
+        message_id,
+        float(message["ts"]),
+        message,
+        core_store.MAX_CHAT_MESSAGES,
+        frontier,
+        require_cursor_advance=True,
+    )
+    if seq:
+        store.reload()
+        store.notify_chat_waiters()
+        try:
+            wake_bus.notify("chat", user_id)
+        except Exception:  # noqa: BLE001 - poll timeout remains the fallback
+            pass
+    if not inserted and seq:
+        persisted = db.chat_get_strict(user_id, message_id)
+        if (
+            persisted is None
+            or str(persisted.get("terminal_failure_job_id") or "") != str(job_id)
+        ):
+            raise RuntimeError("terminal failure reply delivery was not adopted")
+    return _ack_terminal_failure_reply(job_id)
+
+
 def _deliver_terminal_failure_runtime_error(job_id) -> bool:
     """Atomically set the captured active route and acknowledge the marker.
 
@@ -2491,7 +2643,7 @@ def reconcile_terminal_failure_outbox(
     limit: int = 100,
     now=None,
 ) -> dict[str, int]:
-    """Best-effort replay of both user-visible terminal failure sinks.
+    """Best-effort replay of all user-visible terminal failure sinks.
 
     Each sink has an independent due queue, so poisoned route delivery cannot
     hide newer status errors.  Production leaves ``record_terminal_error``
@@ -2508,8 +2660,12 @@ def reconcile_terminal_failure_outbox(
     runtime_rows = _pending_terminal_failure_rows(
         "runtime_error", job_id=job_id, limit=limit, now=now
     )
+    reply_rows = _pending_terminal_failure_rows(
+        "reply", job_id=job_id, limit=limit, now=now
+    )
     status_count = 0
     runtime_error_count = 0
+    reply_count = 0
     event = status_stream.redact_status("error")
     for row in status_rows:
         current_job_id = row["job_id"]
@@ -2554,12 +2710,29 @@ def reconcile_terminal_failure_outbox(
                 current_job_id,
                 type(exc).__name__.lower(),
             )
+    for row in reply_rows:
+        current_job_id = row["job_id"]
+        try:
+            if _deliver_terminal_failure_reply(row):
+                reply_count += 1
+        except Exception as exc:  # noqa: BLE001 - marker remains pending
+            try:
+                _defer_terminal_failure_sink(current_job_id, "reply", now=now)
+            except Exception:  # noqa: BLE001 - original outage may persist
+                pass
+            log.warning(
+                "terminal reply reconciliation failed job=%s code=%s",
+                current_job_id,
+                type(exc).__name__.lower(),
+            )
     examined = {row["job_id"] for row in status_rows}
     examined.update(row["job_id"] for row in runtime_rows)
+    examined.update(row["job_id"] for row in reply_rows)
     return {
         "examined": len(examined),
         "status_delivered": status_count,
         "runtime_error_delivered": runtime_error_count,
+        "reply_delivered": reply_count,
     }
 
 
@@ -3395,6 +3568,84 @@ def recent_token_usage_summary(
     }
 
 
+# ``last_error`` may carry a relay's raw error body (quota figures, request
+# ids). This is an admin-only surface, but keep every reason bounded so one
+# pathological provider string cannot dominate the payload.
+_FAILURE_REASON_MAX_CHARS = 400
+_FAILURE_REASON_TOP_N = 12
+_USER_FAILURE_DETAIL_LIMIT = 20
+
+
+def _truncated_failure_reason(value: object) -> str:
+    text = str(value or "").strip()
+    if len(text) <= _FAILURE_REASON_MAX_CHARS:
+        return text
+    return text[:_FAILURE_REASON_MAX_CHARS] + "…"
+
+
+def _iso_or_empty(value: object) -> str:
+    """A timestamp column rendered for admin, or "" when the row has none."""
+    if value is None:
+        return ""
+    try:
+        return value.isoformat().replace("+00:00", "Z")  # type: ignore[attr-defined]
+    except AttributeError:
+        return str(value)
+
+
+def recent_chat_failures_for_user(
+    user_id: str,
+    *,
+    within_hours: int = 72,
+    limit: int = _USER_FAILURE_DETAIL_LIMIT,
+) -> dict:
+    """Why this one user's V2 turns died, newest first.
+
+    The fleet histogram in ``recent_chat_operational_health`` answers "is V2
+    healthy"; support answers a different question — "this person says the AI
+    stopped replying". The provider-attempt ledger now shows whether V2 reached
+    an upstream model, but only the job row carries the exact terminal code for
+    failures before and after that boundary. Reasons only: no prompts, no
+    replies, no user content.
+    """
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    safe_limit = max(1, min(int(limit), 200))
+    uid = str(user_id or "").strip()
+    if not uid:
+        return {"window_hours": safe_hours, "failures": [], "has_more": False}
+
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id,status,last_error,attempt_count,"
+                "  created_at,finished_at "
+                "FROM agent_jobs "
+                "WHERE user_id=%s AND lane='chat' "
+                "  AND status IN ('failed','expired') "
+                "  AND finished_at >= now() - make_interval(hours => %s) "
+                "ORDER BY finished_at DESC,id DESC LIMIT %s",
+                (uid, safe_hours, safe_limit + 1),
+            )
+            rows = cur.fetchall()
+
+    has_more = len(rows) > safe_limit
+    return {
+        "window_hours": safe_hours,
+        "has_more": has_more,
+        "failures": [
+            {
+                "job_id": int(row["id"]),
+                "status": str(row["status"] or ""),
+                "reason": _truncated_failure_reason(row["last_error"]),
+                "attempt_count": int(row["attempt_count"] or 0),
+                "created_at": _iso_or_empty(row["created_at"]),
+                "finished_at": _iso_or_empty(row["finished_at"]),
+            }
+            for row in rows[:safe_limit]
+        ],
+    }
+
+
 def recent_chat_operational_health(
     *,
     within_hours: int = 24,
@@ -3439,6 +3690,22 @@ def recent_chat_operational_health(
                 "    COUNT(*) FILTER (WHERE status='expired' "
                 "      AND last_error='lease_timeout')::int AS lease_expired "
                 "  FROM recent_outcomes"
+                # Reasons MUST come out of recent_outcomes, not a second scan
+                # of agent_jobs. A separate "most recent N failures" query
+                # samples a different set than the "most recent N terminal
+                # jobs" the counts above are computed from, so once the window
+                # holds more than `limit` terminal jobs the histogram stops
+                # summing to `failed + expired` and the panel contradicts
+                # itself. Sharing the CTE also keeps this to one index scan.
+                "), failure_reasons AS ("
+                "  SELECT COALESCE(json_agg(json_build_object("
+                "    'reason',reason,'count',n) ORDER BY n DESC,reason),"
+                "    '[]'::json) AS reasons FROM ("
+                "    SELECT COALESCE(NULLIF(last_error,''),'(empty)') AS reason,"
+                "      COUNT(*)::int AS n FROM recent_outcomes "
+                "    WHERE status IN ('failed','expired') "
+                "    GROUP BY 1 ORDER BY n DESC,reason LIMIT %s"
+                "  ) ranked"
                 "), superseded AS ("
                 "  SELECT COUNT(*)::int AS superseded FROM recent_superseded"
                 "), pending AS ("
@@ -3447,9 +3714,16 @@ def recent_chat_operational_health(
                 "      (clock_timestamp()-MIN(created_at))) AS oldest_pending_age_sec "
                 "  FROM agent_jobs WHERE lane='chat' AND status='pending'"
                 ") SELECT outcomes.*,superseded.superseded,pending.pending,"
-                "pending.oldest_pending_age_sec "
-                "FROM outcomes CROSS JOIN superseded CROSS JOIN pending",
-                (safe_hours, safe_limit, safe_hours, safe_limit),
+                "pending.oldest_pending_age_sec,failure_reasons.reasons "
+                "FROM outcomes CROSS JOIN failure_reasons "
+                "CROSS JOIN superseded CROSS JOIN pending",
+                (
+                    safe_hours,
+                    safe_limit,
+                    safe_hours,
+                    safe_limit,
+                    _FAILURE_REASON_TOP_N,
+                ),
             )
             job_row = cur.fetchone()
 
@@ -3541,6 +3815,15 @@ def recent_chat_operational_health(
                 if oldest_pending_age is not None
                 else None
             ),
+            # Reasons come from the same recent_outcomes sample as the counts
+            # above, so this list always reconciles with failed + expired.
+            "failure_reasons": [
+                {
+                    "reason": _truncated_failure_reason(entry.get("reason")),
+                    "count": int(entry.get("count") or 0),
+                }
+                for entry in (job_row["reasons"] or [])
+            ],
         },
         "latency": {
             "sampled_turns": int(latency_row["sampled_turns"] or 0),
@@ -3566,6 +3849,195 @@ def recent_chat_operational_health(
                     + int(trajectory_row["missing"] or 0)
                 )
                 else None
+            ),
+        },
+    }
+
+
+def recent_runtime_health(
+    *,
+    within_hours: int = 24,
+    limit: int = 1000,
+) -> dict:
+    """全 lane 运行时健康快照（content-free），喂 admin 值班台。
+
+    分母刻意从 ``agent_jobs`` 起算而非从 metrics/trajectory 起算：一次完全漏写
+    若同时消失于分子和分母，就会报出虚假健康的机群。``superseded`` 单列、不进
+    失败率——运行时代际切换不是故障。延迟分位数只取成功回合（``failed IS NOT
+    TRUE``）：失败超时回合会把 p95 拉到与故障同源的高位，让一个故障看起来像两个。
+    """
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    safe_limit = max(1, min(int(limit), 1000))
+    terminal_statuses = ("completed", "failed", "expired", "superseded")
+
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "WITH recent AS ("
+                "  SELECT lane,status,last_error FROM agent_jobs "
+                "  WHERE status IN ('completed','failed','expired','superseded') "
+                "    AND finished_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY finished_at DESC,id DESC LIMIT %s"
+                ") SELECT lane,"
+                "  COUNT(*) FILTER (WHERE status='completed')::int AS completed,"
+                "  COUNT(*) FILTER (WHERE status='failed')::int AS failed,"
+                "  COUNT(*) FILTER (WHERE status='expired')::int AS expired,"
+                "  COUNT(*) FILTER (WHERE status='superseded')::int AS superseded,"
+                "  COUNT(*) FILTER (WHERE status='expired' "
+                "    AND last_error='queue_timeout')::int AS queue_expired,"
+                "  COUNT(*) FILTER (WHERE status='expired' "
+                "    AND last_error='lease_timeout')::int AS lease_expired "
+                "FROM recent GROUP BY lane",
+                (safe_hours, safe_limit),
+            )
+            outcome_rows = cur.fetchall()
+
+            cur.execute(
+                "WITH recent AS ("
+                "  SELECT lane,latency_ms FROM v2_turn_metrics "
+                "  WHERE failed IS NOT TRUE AND latency_ms IS NOT NULL "
+                "    AND latency_ms >= 0 "
+                "    AND created_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY created_at DESC,id DESC LIMIT %s"
+                ") SELECT lane,"
+                "  percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms) AS p50_ms,"
+                "  percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms "
+                "FROM recent GROUP BY lane",
+                (safe_hours, safe_limit),
+            )
+            latency_rows = cur.fetchall()
+
+            cur.execute(
+                "WITH recent_jobs AS ("
+                "  SELECT id,lane,status FROM agent_jobs "
+                "  WHERE created_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY id DESC LIMIT %s"
+                "), classified AS ("
+                "  SELECT job.lane,"
+                "    CASE "
+                "      WHEN stream.job_id IS NULL "
+                "        AND job.status=ANY(%s::text[]) THEN 'missing' "
+                "      WHEN stream.job_id IS NULL THEN 'open' "
+                "      WHEN EXISTS (SELECT 1 FROM v2_trajectory_events gap "
+                "        WHERE gap.job_id=job.id "
+                "          AND gap.event_kind='capture_gap') THEN 'partial' "
+                "      WHEN EXISTS (SELECT 1 FROM v2_trajectory_events terminal "
+                "        WHERE terminal.job_id=job.id "
+                "          AND terminal.event_kind='turn_terminal') THEN 'complete' "
+                "      WHEN job.status=ANY(%s::text[]) THEN 'partial' "
+                "      ELSE 'open' "
+                "    END AS capture_status "
+                "  FROM recent_jobs job "
+                "  LEFT JOIN v2_trajectory_streams stream ON stream.job_id=job.id"
+                ") SELECT lane,"
+                "  COUNT(*) FILTER (WHERE capture_status='complete')::int AS complete,"
+                "  COUNT(*) FILTER (WHERE capture_status='partial')::int AS partial,"
+                "  COUNT(*) FILTER (WHERE capture_status='missing')::int AS missing,"
+                "  COUNT(*) FILTER (WHERE capture_status='open')::int AS open "
+                "FROM classified GROUP BY lane",
+                (
+                    safe_hours,
+                    safe_limit,
+                    list(terminal_statuses),
+                    list(terminal_statuses),
+                ),
+            )
+            capture_rows = cur.fetchall()
+
+            cur.execute(
+                "WITH recent AS ("
+                "  SELECT lane,last_error FROM agent_jobs "
+                "  WHERE status IN ('failed','expired') AND last_error IS NOT NULL "
+                "    AND finished_at >= now() - make_interval(hours => %s) "
+                "  ORDER BY finished_at DESC,id DESC LIMIT %s"
+                ") SELECT lane,last_error,COUNT(*)::int AS count "
+                "FROM recent GROUP BY lane,last_error ORDER BY count DESC",
+                (safe_hours, safe_limit),
+            )
+            failure_rows = cur.fetchall()
+
+            cur.execute(
+                "SELECT COUNT(*)::int AS pending,"
+                "  EXTRACT(EPOCH FROM "
+                "    (clock_timestamp()-MIN(created_at))) AS oldest_pending_age_sec "
+                "FROM agent_jobs WHERE status='pending'"
+            )
+            pending_row = cur.fetchone()
+
+    latency_by_lane = {str(row["lane"] or ""): row for row in latency_rows}
+    capture_by_lane = {str(row["lane"] or ""): row for row in capture_rows}
+    failures_by_lane: dict[str, list[dict]] = {}
+    for row in failure_rows:
+        failures_by_lane.setdefault(str(row["lane"] or ""), []).append({
+            "code": str(row["last_error"] or ""),
+            "count": int(row["count"] or 0),
+        })
+
+    def _optional_ms(row, key):
+        if row is None or row.get(key) is None:
+            return None
+        return float(row[key])
+
+    # 收集所有 lane 的并集：即使全部 job 都未终态的 lane 也要保留，
+    # 防止 worker 卡死时该 lane 从健康视图消失。
+    all_lanes = set()
+    for row in outcome_rows:
+        all_lanes.add(str(row["lane"] or ""))
+    all_lanes.update(latency_by_lane.keys())
+    all_lanes.update(capture_by_lane.keys())
+    all_lanes.update(failures_by_lane.keys())
+
+    # 为了排序和记录目的，也建立 outcome 索引
+    outcome_by_lane = {
+        str(row["lane"] or ""): row for row in outcome_rows
+    }
+
+    lanes = []
+    for lane in all_lanes:
+        outcome = outcome_by_lane.get(lane)
+        completed = int((outcome or {}).get("completed") or 0)
+        failed = int((outcome or {}).get("failed") or 0)
+        expired = int((outcome or {}).get("expired") or 0)
+        resolved = completed + failed + expired
+        capture = capture_by_lane.get(lane)
+        lanes.append({
+            "lane": lane or "unknown",
+            "sampled_jobs": resolved,
+            "completed": completed,
+            "failed": failed,
+            "expired": expired,
+            "superseded": int((outcome or {}).get("superseded") or 0),
+            "queue_expired": int((outcome or {}).get("queue_expired") or 0),
+            "lease_expired": int((outcome or {}).get("lease_expired") or 0),
+            "failure_rate": (
+                float(failed + expired) / float(resolved) if resolved else None
+            ),
+            "p50_ok_ms": _optional_ms(latency_by_lane.get(lane), "p50_ms"),
+            "p95_ok_ms": _optional_ms(latency_by_lane.get(lane), "p95_ms"),
+            "capture": {
+                "complete": int((capture or {}).get("complete") or 0),
+                "partial": int((capture or {}).get("partial") or 0),
+                "missing": int((capture or {}).get("missing") or 0),
+                "open": int((capture or {}).get("open") or 0),
+            },
+            "top_failures": failures_by_lane.get(lane, [])[:5],
+        })
+
+    lanes.sort(key=lambda item: (item["sampled_jobs"], item["lane"]), reverse=True)
+    oldest_pending = (
+        pending_row.get("oldest_pending_age_sec") if pending_row else None
+    )
+    return {
+        "window_hours": safe_hours,
+        "generated_at": time.time(),
+        "lanes": lanes,
+        "pool": {
+            "inflight": inflight_job_count(),
+            "pending": int((pending_row or {}).get("pending") or 0),
+            "live_workers": live_worker_count(),
+            "capacity": live_worker_capacity(),
+            "oldest_pending_age_sec": (
+                float(oldest_pending) if oldest_pending is not None else None
             ),
         },
     }

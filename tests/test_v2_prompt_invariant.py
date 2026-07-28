@@ -145,6 +145,7 @@ def test_ensure_prompt_coverage_runs_inline_catchup_and_closes_gap(monkeypatch):
 
     async def _fake_compact(
         *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
     ):
         compact_calls.append(list(old_messages))
         return (current_summary + "\n- folded").strip()
@@ -217,6 +218,7 @@ def test_prompt_catchup_allows_many_bounded_batches_and_renews_lease(monkeypatch
 
     async def _fake_compact(
         *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
     ):
         compact_calls.append(list(old_messages))
         return (current_summary + f"\n- folded-{len(compact_calls)}").strip()
@@ -321,12 +323,22 @@ def test_ensure_prompt_coverage_no_gap_is_a_noop(monkeypatch):
     asyncio.run(worker._assert_prompt_covers(uid, tail_limit))
 
 
+async def _noop_async() -> None:
+    """Lease renewal stub for direct helper calls."""
+    return None
+
+
 def test_prompt_coverage_hole_that_survives_the_retry_budget_raises(monkeypatch):
     """Construct a gap the bounded retry cannot close: compaction.compact
     always produces a genuine no-op fold (unchanged summary text), so
     write_summary's CAS never actually advances watermark_seq. After the
     bounded retries are exhausted, `_ensure_prompt_coverage` must raise
-    ResponderError rather than silently proceeding with a coverage hole."""
+    ResponderError rather than silently proceeding with a coverage hole.
+
+    Quarantine is disabled here on purpose: this pins the FAIL-CLOSED half of
+    the contract, i.e. what must still happen when no escape hatch is allowed.
+    The unblocking half is pinned by the quarantine tests below."""
+    monkeypatch.setattr(worker, "_QUARANTINE_ENABLED", False)
     uid = "u_prompt_inv_stuck"
     conftest.seed_user(uid)
     _reset(uid)
@@ -337,6 +349,7 @@ def test_prompt_coverage_hole_that_survives_the_retry_budget_raises(monkeypatch)
 
     async def _noop_compact(
         *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
     ):
         return current_summary  # unchanged -> watermark never advances
 
@@ -601,6 +614,7 @@ def test_process_job_chat_turn_runs_inline_catchup_before_replying(monkeypatch):
 
     async def _fake_compact(
         *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
     ):
         return (current_summary + "\n- folded").strip()
 
@@ -654,3 +668,457 @@ def test_process_job_chat_turn_runs_inline_catchup_before_replying(monkeypatch):
     # The gap was closed INLINE this turn (before the provider call ever
     # ran), not just left for the best-effort background enqueue.
     assert row is not None and row["watermark_seq"] > seeded_watermark_seq
+
+
+def test_exhausted_catchup_surfaces_the_compaction_reject_code(monkeypatch):
+    """The stall must be diagnosable from plaintext `agent_jobs.last_error`.
+
+    usr_7f30… spent three days (2026-07-24 → 07-27) in this exact loop with
+    `turn_failed:responder_error` as the only visible symptom — a bucket
+    shared with eleven other TurnError sites. Diagnosing it required reading
+    the source and a break-glass trajectory decrypt. The reject code that
+    stalled the watermark must ride out to the terminal status instead, and
+    the status must no longer collapse into `responder_error`.
+    """
+    monkeypatch.setattr(worker, "_QUARANTINE_ENABLED", False)
+    uid = "u_prompt_inv_reject_code"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 25, 10
+    messages = _seed_messages(uid, n)
+    _seed_summary(uid, covers=5, messages=messages, summary="- old")
+
+    async def _rejecting_compact(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
+    ):
+        # A refused fold: the model answered, nothing was valid, so the
+        # watermark must not move (mirrors compaction.compact's own contract).
+        if reject_out is not None:
+            reject_out("duplicate_within_batch:3")
+        return current_summary
+
+    monkeypatch.setattr(v2_compaction, "compact", _rejecting_compact)
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=read_compaction_tail,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    with pytest.raises(worker.TurnError) as excinfo:
+        asyncio.run(worker._ensure_prompt_coverage(
+            uid, deps, provider_config=_BYOK, enclave_sem=None,
+            tail_limit=tail_limit, max_retries=3))
+
+    assert str(excinfo.value) == (
+        "prompt_coverage_incomplete:duplicate_within_batch:3"
+    )
+    # And it reaches the persisted status as itself — NOT as responder_error.
+    persisted = worker._safe_failure_code("turn_failed", excinfo.value)
+    assert persisted == (
+        "turn_failed:prompt_coverage_incomplete:duplicate_within_batch:3"
+    )
+
+
+def test_coverage_incomplete_no_longer_collapses_into_responder_error():
+    """Pure check on the status mapping, no DB or provider needed."""
+    plain = worker.TurnError("prompt_coverage_incomplete")
+    assert worker._safe_failure_code("turn_failed", plain) == (
+        "turn_failed:prompt_coverage_incomplete"
+    )
+
+    coded = worker.TurnError("prompt_coverage_incomplete:line_not_bullet:0")
+    assert worker._safe_failure_code("turn_failed", coded) == (
+        "turn_failed:prompt_coverage_incomplete:line_not_bullet:0"
+    )
+
+    # Every other TurnError still shares the established bucket.
+    assert worker._safe_failure_code(
+        "turn_failed", worker.TurnError("something_else")
+    ) == "turn_failed:responder_error"
+
+    # The persisted code stays within the column's bound.
+    long_code = worker.TurnError(
+        "prompt_coverage_incomplete:" + "x" * 400
+    )
+    assert len(worker._safe_failure_code("turn_failed", long_code)) <= 120
+
+
+def test_repeated_refusal_shrinks_the_batch_before_giving_up(monkeypatch):
+    """A refusal is usually a property of the BATCH, not of any one message.
+
+    Before any coverage is sacrificed, the catch-up must retry at smaller
+    sizes: most real refusals (too many bullet lines for the output budget,
+    two messages folding to the same bullet) simply stop happening once the
+    request is smaller. Only a batch of one that is STILL refused has no
+    smaller form left to try.
+    """
+    uid = "u_prompt_inv_shrink"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 25, 10
+    messages = _seed_messages(uid, n)
+    _seed_summary(uid, covers=5, messages=messages, summary="- old")
+
+    sizes = []
+
+    async def _fold_only_small(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
+    ):
+        sizes.append(len(old_messages))
+        if len(old_messages) > 2:
+            if reject_out is not None:
+                reject_out("line_count_over_budget:40")
+            return current_summary  # refused: batch too big to render
+        return (current_summary + "\n- folded").strip()
+
+    monkeypatch.setattr(v2_compaction, "compact", _fold_only_small)
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=read_compaction_tail,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    watermark_seq, _max_seq = asyncio.run(worker._ensure_prompt_coverage(
+        uid, deps, provider_config=_BYOK, enclave_sem=None,
+        tail_limit=tail_limit, max_retries=3))
+
+    # It shrank rather than surrendering, and finished the backlog.
+    assert max(sizes) > 2, sizes
+    assert min(sizes) <= 2, sizes
+    assert not asyncio.run(worker._prompt_coverage_gap(
+        uid, watermark_seq=watermark_seq, tail_limit=tail_limit))
+    # Nothing had to be quarantined: every message was folded for real.
+    assert "未能被自动摘要" not in read_summary(uid)[0]
+
+
+def test_single_unfoldable_row_is_quarantined_and_the_user_is_unblocked(
+    monkeypatch
+):
+    """The head-of-line fix: one row nobody can fold must not block the rest.
+
+    usr_7f30… was stuck behind exactly this — every later message waited on a
+    batch whose fold was refused every time, and the turn never reached the
+    model that answers the user. Advancing past the row costs summary
+    coverage of that ONE row (recorded, in plaintext); `chat_messages` keeps
+    the transcript itself.
+    """
+    uid = "u_prompt_inv_quarantine"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 25, 10
+    messages = _seed_messages(uid, n)
+    seeded = _seed_summary(uid, covers=5, messages=messages, summary="- old")
+
+    async def _never_folds(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
+    ):
+        if reject_out is not None:
+            reject_out("line_not_bullet:0")
+        return current_summary
+
+    monkeypatch.setattr(v2_compaction, "compact", _never_folds)
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=read_compaction_tail,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    watermark_seq, _max_seq = asyncio.run(worker._ensure_prompt_coverage(
+        uid, deps, provider_config=_BYOK, enclave_sem=None,
+        tail_limit=tail_limit, max_retries=3))
+
+    # The user is unblocked: the gap is closed and the turn may proceed.
+    assert watermark_seq > seeded
+    assert not asyncio.run(worker._prompt_coverage_gap(
+        uid, watermark_seq=watermark_seq, tail_limit=tail_limit))
+    asyncio.run(worker._assert_prompt_covers(uid, tail_limit))
+
+    # The cost is recorded rather than hidden: the stand-in says plainly that
+    # those rows are not represented, and names no message content.
+    summary_text = read_summary(uid)[0]
+    assert "未能被自动摘要" in summary_text
+    assert "line_not_bullet:0" in summary_text
+
+    # The transcript itself is untouched — quarantine costs summary coverage,
+    # never data.
+    assert len(db.chat_load_strict(uid)) == n
+
+
+def test_quarantine_advances_one_row_at_a_time(monkeypatch):
+    """Never sacrifice the whole failed batch to unblock one row.
+
+    Quarantining the 200-message batch that failed would discard 199 rows
+    that fold perfectly well. Each escape-hatch write must cover exactly the
+    single oldest unsummarized row.
+    """
+    uid = "u_prompt_inv_quarantine_one"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 25, 10
+    messages = _seed_messages(uid, n)
+    seeded = _seed_summary(uid, covers=5, messages=messages, summary="- old")
+    first_gap_seq = next(m["seq"] for m in messages if m["seq"] > seeded)
+
+    async def _never_folds(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
+    ):
+        if reject_out is not None:
+            reject_out("line_not_bullet:0")
+        return current_summary
+
+    monkeypatch.setattr(v2_compaction, "compact", _never_folds)
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=read_compaction_tail,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    quarantined = asyncio.run(worker._quarantine_unfoldable_head(
+        uid, deps,
+        enclave_sem=None,
+        seq_callbacks=False,
+        watermark_seq=seeded,
+        compact_through_seq=None,
+        reject_code="line_not_bullet:0",
+        within_deadline=lambda start: start(),
+        renew_lease=_noop_async,
+    ))
+
+    assert quarantined is True
+    row = jobs_store.get_summary_row(uid)
+    assert row["watermark_seq"] == first_gap_seq  # exactly one row, not the batch
+
+
+def test_quarantine_text_is_deterministic_and_content_free():
+    """It is written by us, not a provider — every attempt was refused."""
+    text = worker._quarantine_segment_text("duplicate_within_batch:3")
+    assert text == worker._quarantine_segment_text("duplicate_within_batch:3")
+    assert text.startswith("- ")  # a valid bullet in the summary it joins
+    assert "duplicate_within_batch:3" in text
+    # Degenerate reject codes still produce a usable line.
+    assert worker._quarantine_segment_text("").startswith("- ")
+    assert "unknown" in worker._quarantine_segment_text("")
+
+
+def test_oversized_single_row_is_quarantined_not_a_permanent_stall(monkeypatch):
+    """The shape that actually stalled usr_7f30…: seq 682632.
+
+    An R2-offloaded row whose hydrated body is larger than the entire batch
+    char budget takes a DIFFERENT path from a refused fold — it never reaches
+    the provider at all, because `_bounded_compaction_prefix` refuses to skip
+    an oversized head row (skipping would make seq coverage dishonest). No
+    batch size can contain it, so shrinking cannot help and only quarantine
+    can move the frontier past it.
+    """
+    uid = "u_prompt_inv_oversized"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 25, 10
+    messages = _seed_messages(uid, n)
+    seeded = _seed_summary(uid, covers=5, messages=messages, summary="- old")
+    blocking_seq = next(m["seq"] for m in messages if m["seq"] > seeded)
+
+    # The oldest unsummarized row alone blows the char budget.
+    monkeypatch.setattr(worker, "_COMPACTION_BATCH_CHARS", 50)
+
+    folded = []
+
+    async def _fold(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
+    ):
+        folded.append(len(old_messages))
+        return (current_summary + "\n- folded").strip()
+
+    monkeypatch.setattr(v2_compaction, "compact", _fold)
+    monkeypatch.setattr(
+        worker, "_compaction_message_chars",
+        lambda m: 5_000 if m["seq"] == blocking_seq else 10,
+    )
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=read_compaction_tail,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    watermark_seq, _max_seq = asyncio.run(worker._ensure_prompt_coverage(
+        uid, deps, provider_config=_BYOK, enclave_sem=None,
+        tail_limit=tail_limit, max_retries=3))
+
+    # Moved past the blocking row and finished the rest of the backlog.
+    assert watermark_seq > blocking_seq
+    assert not asyncio.run(worker._prompt_coverage_gap(
+        uid, watermark_seq=watermark_seq, tail_limit=tail_limit))
+    summary_text = read_summary(uid)[0]
+    assert "message_exceeds_char_budget" in summary_text
+    # Everything after it still folded normally — one row skipped, not a batch.
+    assert folded, "later rows must still be folded for real"
+
+
+def test_oversized_row_still_fails_closed_when_quarantine_is_off(monkeypatch):
+    uid = "u_prompt_inv_oversized_closed"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 25, 10
+    messages = _seed_messages(uid, n)
+    seeded = _seed_summary(uid, covers=5, messages=messages, summary="- old")
+    blocking_seq = next(m["seq"] for m in messages if m["seq"] > seeded)
+
+    monkeypatch.setattr(worker, "_QUARANTINE_ENABLED", False)
+    monkeypatch.setattr(worker, "_COMPACTION_BATCH_CHARS", 50)
+    monkeypatch.setattr(
+        worker, "_compaction_message_chars",
+        lambda m: 5_000 if m["seq"] == blocking_seq else 10,
+    )
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=read_compaction_tail,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    with pytest.raises(worker.TurnError, match="message_exceeds_char_budget"):
+        asyncio.run(worker._ensure_prompt_coverage(
+            uid, deps, provider_config=_BYOK, enclave_sem=None,
+            tail_limit=tail_limit, max_retries=3))
+
+
+def test_quarantine_never_claims_a_seq_the_user_does_not_own(monkeypatch):
+    """The seq written into a quarantine segment must come from the DB.
+
+    `chat_messages.seq` is a table-wide identity shared by every user, and a
+    segment's seq range is an immutable coverage claim. On test (2026-07-28) a
+    reader row produced seq 20090 while the user's oldest row was 20091 and
+    20090 belonged to no row at all; the resulting segment made
+    `validate_canonical_frontier` fail on EVERY later turn — strictly worse
+    than the stall it escaped. Trusting the reader's row shape here is the bug.
+    """
+    uid = "u_prompt_inv_q_seq"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 25, 10
+    messages = _seed_messages(uid, n)
+    seeded = _seed_summary(uid, covers=5, messages=messages, summary="- old")
+    real_head_seq = next(m["seq"] for m in messages if m["seq"] > seeded)
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+
+    def _lying_reader(uid_, after, limit):
+        """Same rows, but every seq is off by one — the shape seen on test."""
+        rows = read_compaction_tail(uid_, after, limit)
+        return [dict(r, seq=int(r["seq"]) - 1) if r.get("seq") else dict(r)
+                for r in rows]
+
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=_lying_reader,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    ok = asyncio.run(worker._quarantine_unfoldable_head(
+        uid, deps,
+        enclave_sem=None,
+        seq_callbacks=False,
+        watermark_seq=seeded,
+        compact_through_seq=None,
+        reject_code="line_not_bullet:0",
+        within_deadline=lambda start: start(),
+        renew_lease=_noop_async,
+    ))
+
+    assert ok is True
+    row = jobs_store.get_summary_row(uid)
+    # The authoritative seq, not the reader's lie.
+    assert row["watermark_seq"] == real_head_seq
+    assert row["watermark_seq"] > seeded
+
+
+def test_quarantine_refuses_a_row_at_or_behind_the_watermark(monkeypatch):
+    """A stale head must not rewrite coverage that is already claimed."""
+    uid = "u_prompt_inv_q_stale"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 25, 10
+    messages = _seed_messages(uid, n)
+    seeded = _seed_summary(uid, covers=5, messages=messages, summary="- old")
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+
+    def _stale_reader(uid_, after, limit):
+        # Hand back a row that is already covered by the watermark.
+        return [dict(messages[0])]
+
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=_stale_reader,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    ok = asyncio.run(worker._quarantine_unfoldable_head(
+        uid, deps,
+        enclave_sem=None,
+        seq_callbacks=False,
+        watermark_seq=seeded,
+        compact_through_seq=None,
+        reject_code="line_not_bullet:0",
+        within_deadline=lambda start: start(),
+        renew_lease=_noop_async,
+    ))
+
+    assert ok is False
+    assert jobs_store.get_summary_row(uid)["watermark_seq"] == seeded

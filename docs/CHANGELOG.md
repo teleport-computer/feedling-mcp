@@ -112,6 +112,189 @@ reconciler.TABLES`）互不校验，谁都不是全集——Runtime V2 的 19 �
 公开文档（`docs-site/`）与 OpenAPI 不涉及：不碰公开 API 契约、不改架构对外
 叙事、不改信任边界（TEE 库定位与可见性没变）。
 
+## 2026-07-28 — Admin Runtime 健康值班台：收尾修复最终 code review 的三个 Important 项
+
+**[DONE] `/admin/data-track?view=runtime` 值班台过审前的三条修复 + 一处文档更正**。这是
+该功能五个任务全部实现（9 commit）之后、最终 review 判「Ready to merge: With fixes」的
+收尾工作。前三条缺陷原样存在于设计与实施计划文档里（实现是忠实照抄的），因此代码与文档
+一并改：
+
+- **I-1（页顶结论永远不会真正变红）**：`_render_runtime_health_page` 里
+  `level_cls = {"ok": "ok", "warn": "warn", "bad": "warn"}[level]` 把 `bad` 映射成
+  CSS class `"warn"`——100% 失败率与 6% 失败率在页顶显示成同一个橙色，人眼分诊能力在
+  第一眼就被抹掉，而 per-lane 表反而认真做了三档。改成 `"bad": "bad"`。
+- **I-2（失败码白名单太窄，非 chat lane 塌成 `other`）**：`_runtime_failure_code` 原来只
+  放行精确匹配 `queue_timeout`/`lease_timeout` 和无条件的 `turn_failed:` 前缀（不校验
+  冒号后内容形状）。但 `mark_failed`/`mark_expired` 落库的真实码还有 `wake_failed:*`
+  （heartbeat/proactive lane）、`extraction_failed:*`、`compaction_failed:*`、
+  `mcp_mutation_outcome_unknown`、`runtime_expired`——旧白名单下这些码在 chat 之外每条
+  lane 都塌成 `other`，而 heartbeat 恰恰是本页专门加了「（日报口径）」链接、明确要给人
+  看的 lane。改为按形状放行（`^[a-z0-9_]+(:[a-z0-9_]+)?$`，admin 层自定义常量，不
+  import `model_api_runtime`），同时渲染层清洗后按 `(lane, code)` 重新合并计数——否则
+  同一 lane 的两个不同原始码清洗成同一个桶会渲染成两行都叫 `other`。
+- **I-3（claimed/running 卡死时页面明文说「这不是故障」）**：`_runtime_health_level` 对
+  job 全部卡在 `claimed`/`running`（无 pending、worker 心跳还活着）的 lane 全部指标都
+  跳过，误判 `("ok", [])`；`empty_note` 只看「所有 lane sampled_jobs 都为 0」，把「真的
+  没数据」和「卡死」混为一谈。reviewer 实证过这个具体形状（`inflight=57/capacity=8`）：
+  页面显示「这不是故障」+ 总体结论「正常」。修正：`sampled_jobs==0 and capture.open>0`
+  → 至少 `warn`；`pool.inflight > pool.capacity` → `bad`（矛盾态）；`empty_note` 只在
+  终态样本、`capture.open`、`pool.inflight`、`pool.pending` 全为 0 时才说「这不是
+  故障」，否则改为「窗口内无终态 job，但有 N 个回合在飞——可能是卡死」。
+- **I-4（文档修正，不改代码）**：设计文档 §8 原先写「索引够用」，实查
+  `agent_jobs.finished_at` 无任何索引、`agent_jobs` 无保留策略、新增的三条 CTE
+  （outcome/failure/capture）在全 lane 范围都拿不到有效索引，`LIMIT 1000` 只截结果不
+  减扫描。本分支承诺不含迁移，故不加索引，只把错误结论改正并把
+  `CREATE INDEX CONCURRENTLY ix_agent_jobs_finished_at ...` + `agent_jobs` 保留策略
+  记为设计文档 §10 的明确 follow-up（含「上线前在 prod 规模跑一次 EXPLAIN」）。
+- 死代码清理：`tests/test_data_track_runtime_view.py` 里未使用的 `import base64`、
+  `import db`、`_route_pk_counter = itertools.count(9_000)`（连带其 `itertools` 导入）
+  一并删除。
+
+改动范围：`backend/admin/data_track.py`（`_runtime_failure_code` / `_runtime_health_level`
+/ `_render_runtime_health_page`）、`tests/test_data_track_runtime_view.py`（8 条新用例覆盖
+上述三个 Important 项 + 死代码清理）、设计文档 §5/§6/§8/§10、实施计划里对应的三处代码块
+（均加了「最终 code review 修正」批注，保留原文作历史记录）。不涉及迁移、不改
+`recent_runtime_health()` 的 SQL 口径、不动既有 6 个视图页。
+## 2026-07-27 — 摘要折叠死锁：一个 V2 用户被自己的一批消息卡了三天
+
+**[FIX] 折叠被拒的原因不再是黑的；`prompt_coverage_incomplete` 从
+`responder_error` 桶里单列出来**。
+
+`usr_7f30…`（prod，3146 条历史）自 07-24 17:31 起在 V2 下**每一个 turn 都失败**，
+14/14，零成功。取证链：
+
+- 摘要水位 `v2_conversation_summary.watermark_seq` 冻结在 682015，其后 1946 条
+  未摘要；同期其他 V2 用户水位都在正常推进。
+- 一个 turn 内（job 9）**连折 6 批成功**（段 3/4/6/7/8/9，各 200 条，每批
+  14–22 秒），第 7 批开始三连败，每次只要 2.5–4 秒。三次 `provider_request` 的
+  `payload_bytes` **逐字相同**——同一批消息被反复发送。
+- 每次调用的 completion tokens 呈双峰：26–53（一两句话）或 500（打满被截断）。
+  26–53 tokens 不可能超行数/超长，所以否决只能来自格式类规则。
+- **规模不是原因**：卡住那批的可折叠内容（body_ct 合计 21,804 B / 200 条）与
+  成功折过的段 3（21,292 B / 199 条）相差 2%。两批都含 R2 外置大文件，成功那批
+  的还更大（4.73 MB vs 2.78 MB）——外置正文是懒加载的，从没进过 prompt。
+
+机制：`compaction._validated_new_bullets` 是**全有或全无**校验，任一行违规整批
+返回 `None` → 折叠 no-op → 水位不推进（这一步是对的，宁可卡住也不能假装覆盖）→
+下一轮读到**逐字相同**的同一批 → 同样被否。失败的后果恰好保证了下次输入不变，
+**没有任何自愈路径**。`_ensure_prompt_coverage` 耗尽 3 次无进展预算后抛
+`TurnError("prompt_coverage_incomplete")`，又被 `_safe_failure_code` 折进
+`responder_error` —— 一个和另外 11 个抛点共用的桶。用户侧表现为完全静默：turn
+从未走到回答用户的那次模型调用。
+
+本次改动（**只加可观测性，不改判据**）：
+
+- `compaction`：拆出 `_validate_new_bullets`，返回 `(rendered, reject_code)`。
+  reject_code 只含规则名与计数（`duplicate_within_batch:3`、
+  `line_count_over_budget:40`、`line_not_bullet:0` …），**绝不含任何被摘要的内容**
+  ——它要流到 worker 的明文状态面。`compact`/`compact_segment`/`compact_checkpoint`
+  新增可选 `reject_out` 回调；回调抛错不会影响折叠结果。
+- `worker`：catch-up 记录最后一次否决码，耗尽重试时抛
+  `TurnError("prompt_coverage_incomplete:<reject_code>")`；`_safe_failure_code`
+  为该码单列一档。于是**不解密、不读代码**，只看明文 `agent_jobs.last_error` /
+  `v2_turn_metrics.status` 就能知道是哪条规则卡住了谁。no-op 分支另记一条
+  `compaction_rejected` trajectory 事件（含批次大小与已重试次数）。
+- `deploy/docker-compose.phala.yaml`（serve-worker）：把
+  `FEEDLING_V2_COMPACTION_BATCH_MSGS` / `_BATCH_CHARS` /
+  `FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC` / `FEEDLING_V2_TAIL_BUDGET_MSGS`
+  以 `${VAR:-码内默认}` 形式接出来（值即当前默认，**不是行为变更**），这样下次
+  卡住可以用加密 env 缩批解卡，不必再发一次版；另接出
+  `FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED`（默认 `0`）。
+
+⚠️ **`responder_error` 的统计口径变了**：以前所有 coverage 停滞都记在
+`responder_error` 名下，现在改记 `prompt_coverage_incomplete[:code]`。按该字段
+分组的看板需要同步。
+
+**[FIX] 死锁本身：缩批 → 隔离 → 越过（quarantine-and-advance）**。参数怎么调都
+绕不开「全有全无 + 输入确定性」这个自锁结构，出路只能是给它一条出路。两级升级：
+
+1. **先缩批**。连续 `max_retries` 次无进展后，批次上限除以 4（200→50→12→3→1），
+   每个尺寸拿到自己的重试预算（它是一个真正不同的请求，不是失败请求的重复）。
+   多数拒绝是**批次**的属性而非某一条消息的属性——行数超预算、两条消息归纳出同一
+   条 bullet——换个尺寸就不再发生。健康路径完全不变（第一次就成功时永不缩批）。
+2. **缩到 1 条仍被拒 → 隔离那一条**。写一个确定性的替身段（`coverage_kind` 仍是
+   `exact`，seq 范围正好是它替换的那一行，所以 `validate_canonical_frontier` 的
+   三个见证依旧成立），文本明说「此处有 1 条消息未能被自动摘要，其内容不在本摘要
+   覆盖范围内，原文仍完整保留在聊天记录中」。**一次只越过一行，绝不牺牲整批**——
+   为解锁一行而丢掉 199 行完全折得动的消息是不可接受的。
+
+隔离**损失的是摘要覆盖，不是数据**：`chat_messages` 是不可变原文表，一行都没动，
+历史照常可读，将来更聪明的压缩器可以回头重折。每次隔离都打一行明文日志
+（`[v2-compaction] quarantined unfoldable row user=… seq=… reject=…`）并记一条
+`compaction_quarantined` trajectory 事件。开关
+`FEEDLING_V2_COMPACTION_QUARANTINE_ENABLED`（默认开），置 `0` 恢复严格 fail-closed。
+
+**另一条同样致命、但走不同代码路径的形状也一并修了**：`_bounded_compaction_prefix`
+遇到「首行单条就超过整批字符预算」时抛 `ValueError`（它拒绝跳过超大首行，因为跳过
+会让 seq 覆盖不诚实）——这条路径**根本到不了 provider**，所以缩批对它毫无作用。
+`usr_7f30…` 真正的墙就是这个：seq 682632 是一条 R2 外置、hydrate 后 798,262 字符
+的消息，卡在积压队头。现在这条路径直接走隔离。**如果只修了折叠被拒那一半，这个
+用户部署后仍然会卡在原地。**
+
+**[FIX] V2 的 provider 尝试也写明文台账**。V1 的常驻 consumer 一直往
+`user_logs.provider_attempts` 写一份纯元数据台账（outcome / usage / trigger），
+所以「这个用户的中转到底通不通」是一条 SQL。**V2 把同样的事实只记在加密
+trajectory 里**，于是同一个问题在 V2 侧要走 break-glass 解密。
+
+这个缺口在 usr_90184ac4 上直接变成了误诊：他 14/14 `providererror`，看起来像
+「中转扛不住 V2」。查了 V1 台账才发现——**同一套凭证、同一个中转，V1 侧 902 次
+成功、峰值 70,926 input tokens、最近一次成功就在今天**，而 V2 单次调用才约 43k。
+中转没坏，prompt 也不比 V1 大，差异在我们发出去的请求形状。**这个结论完全来自
+V1 那份明文台账**；如果 V2 也有，第一分钟就能得出。
+
+`provider_attempt_ledger.record_runtime_attempt()`：同一个 stream、同一套字段名，
+额外带 `runtime`/`lane`/`provider`/`model`/`error_class`（V1 从 consumer 自己的
+配置拿，V2 得自己声明）。写入点是 trajectory sink 的一层旁路（`_record_trajectory`
++ 前台 turn 的 `_ledger_tapped_sink`，两条 lane 都覆盖），只取元数据——outcome、
+token 数、provider/model、错误**类名**，不含 prompt、回复、上游原始错误文本。
+
+⚠️ 两个刻意的防御，都是被测试打出来的：telemetry 失败一律吞掉（写台账不能让一个
+本该成功的 turn 失败），且对 trajectory sink 的形状保持宽容——没有 `user_id` 的
+窄 recorder 就不写台账、不抛异常（前台 turn 也走这条包装，一个 AttributeError
+会炸掉它本该解释的那些 turn，wake lane 的测试替身当场证明了这一点）。
+
+回归：`4 failed / 6741 passed`（干净 HEAD 基线）→ `3 failed / 6770 passed`，失败
+集合是基线的子集（`e2b_template` 那条本身是 flaky，这次自己绿了）。新增测试覆盖：
+缩批优先于牺牲覆盖、单行隔离后用户解锁、一次只推进一行、隔离文本确定性且无内容、
+超大单行被隔离而非永久卡死、关掉开关后两条路径都仍然 fail-closed，以及台账镜像的
+四条（成功/失败字段映射、非 provider 事件不记、原始错误体不进台账、写入失败不影响
+turn）。
+
+**[DECISION] 折叠批次 200→50、tail 预算 20→50（2026-07-28）**。解密 usr_90184 的
+`provider_error` 后确认：他和 usr_7f30 挂在**同一条 lane（prompt_catchup）**，是同
+一个「批次过大」的两种表现——usr_7f30 的 200 条渲染不成合规 bullet（折叠被拒 →
+死锁），usr_90184 的 200 条在 compaction 的 `timeout=60.0` 内答不完
+（`duration_ms=60340`、`error_class=transient`、`status=null`，即根本没收到 HTTP
+响应，不是中转拒绝）。四分之一大小的请求两头都缓解。
+
+tail 预算 20→50 是更上游的一刀：**它决定一个 turn 是否进入折叠路径**。积压不超过它
+就整批留在逐字 tail 里，一次折叠都不做。20 太低，几乎每个活跃用户每回合都在折叠；
+而全程健康的那两个 prod 用户（21/21、13/15）恰恰是因为历史从没到过这个线。
+
+⚠️ 权衡：`plan_provider_round` 里**对话消息是 required 组件，超预算不会被裁而是直接
+`prompt_frontier_exhausted`**（只有 tool schema 是 optional）。多带 30 条逐字消息约
+数千 token；prod 健康用户 prompt 峰值 22,768 / 15,554，对 120k 可用预算安全。唯一
+的 frontier_exhausted 记录（usr_5adeef，07-24 17:42）发生在 unaudited default 还是
+32768 的时期，07-25 12:31 已改为 131072。若将来有用户自配小 context_window 或中转
+真实窗口偏小，这两个值仍是首先要回调的旋钮（都是 `${VAR:-}` 形式，改 env 即可）。
+
+**[FIX] 这些旋钮的 `-e` 接线补齐（2026-07-28）**。之前只把它们写进了 compose，
+CI 的 `phala deploy` 没传值，等于**只能用默认值**——"改 env 就能救急"这句话当时并
+不成立。现在三个环境的 5 个旋钮（batch msgs/chars、catchup deadline、tail budget、
+quarantine 开关）都接了 `-e` + `vars.<ENV>_<KNOB>`。刻意不写 `|| 默认值`：repo var
+未设时必须传空，让 compose 的 `${VAR:-默认}` 生效；设了才覆盖。这也是确定性复现
+隔离路径的前提——把 `COMPACTION_BATCH_CHARS` 临时调到几百，任何一条消息都能触发
+超预算隔离，不必去凑一个 R2 大文件。
+
+**[ADD] `tools/v2_user_triage.py`** —— 把这次的排查路径固化成一条命令（只读、不
+解密）：runtime / jobs / metrics / summary / backlog head / trajectory / provider
+ledger / peers。四个判据是事故的直接产物：水位停滞时长、队头 R2 指针是否超批次
+预算、重试间 `payload_bytes` 是否逐字相同、V1↔V2 provider 结果对照。⚠️ 告警判据
+改过两版才不误报：只看「停滞时长」会把 21/21 全绿但一天没说话的用户标黄；加上
+「有积压 + 有失败」仍会误报 usr_90184（他的 frontier 是健康的）。最终判据是
+**停滞 + 有积压 + 失败是 coverage 形状的**，三者缺一不可，并对「有失败但 frontier
+健康」主动提示去看 provider。
+
 ## 2026-07-27 — 退役 `responses_unsupported`：一条对着 Kimi 用户空放了很久的警告
 
 **[DECISION] 删除 `/responses` 探测与 `responses_unsupported` 警告**。用户配

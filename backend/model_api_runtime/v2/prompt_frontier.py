@@ -172,11 +172,13 @@ class PromptFrontierExhausted(RuntimeError):
         input_budget_tokens: int,
         context_window_tokens: int,
         required_components: Sequence[str],
+        limit_source: LimitSource,
     ) -> None:
         self.required_tokens = int(required_tokens)
         self.input_budget_tokens = int(input_budget_tokens)
         self.context_window_tokens = int(context_window_tokens)
         self.required_components = tuple(str(name) for name in required_components)
+        self.limit_source = limit_source
         super().__init__(
             f"{self.code}: required_tokens={self.required_tokens} "
             f"input_budget_tokens={self.input_budget_tokens} "
@@ -866,6 +868,7 @@ def plan_prompt(
             input_budget_tokens=budget.input_budget_tokens,
             context_window_tokens=budget.context_window_tokens,
             required_components=[component.name for component in required],
+            limit_source=model_limit.source,
         )
 
     optional_by_admission_order = sorted(

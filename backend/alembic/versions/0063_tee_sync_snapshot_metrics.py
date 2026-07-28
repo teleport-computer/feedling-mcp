@@ -1,7 +1,7 @@
 """tee-pg: record SNAPSHOT-lane metrics on tee_sync_runs
 
-Revision ID: 0062_tee_sync_snapshot_metrics
-Revises: 0061_v2_adaptive_tail_metrics
+Revision ID: 0063_tee_sync_snapshot_metrics
+Revises: 0062_v2_failure_reply
 Create Date: 2026-07-28
 
 Task 6 wired the SNAPSHOT lane (backend/tee_shadow/snapshot.py — full-table
@@ -18,13 +18,17 @@ mirrored to the TEE it's monitoring), so this is an RDS-side (``alembic``, not
 ``alembic_tee``) revision, same as 0015/0016/0019 before it.
 
 DDL is idempotent (IF NOT EXISTS) to match the baseline's safety property.
+
+2026-07-28：合 test 分支时本条从 0062 改名为 0063 并改挂到 0062_v2_failure_reply
+之后——两个分支各自从 0061 长出一条 0062，合并即多头，alembic upgrade head 会直接
+报 CommandError（本仓库有过多头事故）。本条从未部署到任何环境，改名零代价。
 """
 
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision = "0062_tee_sync_snapshot_metrics"
-down_revision = "0061_v2_adaptive_tail_metrics"
+revision = "0063_tee_sync_snapshot_metrics"
+down_revision = "0062_v2_failure_reply"
 branch_labels = None
 depends_on = None
 

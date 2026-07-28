@@ -614,6 +614,120 @@ def test_fast_validation_genesis_user_is_complete_despite_empty_tabs():
     assert mg["passing"] is True  # cards exist -> garden satisfied (bucket-agnostic)
 
 
+def test_effective_responder_uses_current_fences_before_poll_samples():
+    now = 1_000.0
+    result = _dt._effective_responder(
+        route="resident",
+        consumer_state={
+            "poll_consumers": {
+                "resident-vps": {
+                    "responder": "resident",
+                    "last_poll_epoch": 999.0,
+                    "last_poll_at": "recent",
+                },
+                "agent-runner:u": {
+                    "responder": "hosted_v1",
+                    "last_poll_epoch": 998.0,
+                    "last_poll_at": "also recent",
+                },
+            }
+        },
+        runtime={
+            "hosted_runtime_state": "resident",
+            "model_api_route": {"is_active": True, "test_status": "ok"},
+            "runner_lease": {"active": True},
+        },
+        now_epoch=now,
+    )
+    assert result["effective_responder"] == "hosted_v1"
+    assert result["basis"] == "live_agent_runtime_lease"
+    assert result["mismatch"] is True
+    assert "non_model_api_route_with_hosted_responder" in result["mismatch_reasons"]
+    assert "multiple_responder_classes_detected" in result["mismatch_reasons"]
+    assert {item["responder"] for item in result["recent_poll_observations"]} == {
+        "hosted_v1",
+        "resident",
+    }
+
+
+def test_effective_responder_covers_v2_resident_and_none_states():
+    hosted_v2 = _dt._effective_responder(
+        route="model_api",
+        consumer_state=None,
+        runtime={
+            "hosted_runtime_state": "v2",
+            "model_api_route": {"is_active": True, "test_status": "ok"},
+            "runner_lease": {"active": False},
+        },
+        now_epoch=1_000.0,
+    )
+    assert hosted_v2["effective_responder"] == "hosted_v2"
+    assert hosted_v2["mismatch"] is False
+
+    resident = _dt._effective_responder(
+        route="resident",
+        consumer_state={
+            "poll_consumers": {
+                "resident-vps": {
+                    "responder": "resident",
+                    "last_poll_epoch": 999.0,
+                }
+            }
+        },
+        runtime={"hosted_runtime_state": "resident", "runner_lease": {"active": False}},
+        now_epoch=1_000.0,
+    )
+    assert resident["effective_responder"] == "resident"
+    assert resident["mismatch"] is False
+
+    none = _dt._effective_responder(
+        route="resident",
+        consumer_state=None,
+        runtime=None,
+        now_epoch=1_000.0,
+    )
+    assert none["effective_responder"] == "none"
+    assert none["mismatch"] is False
+
+    official_import = _dt._effective_responder(
+        route="official_import",
+        consumer_state={
+            "poll_consumers": {
+                "resident-vps": {
+                    "responder": "resident",
+                    "last_poll_epoch": 999.0,
+                }
+            }
+        },
+        runtime=None,
+        now_epoch=1_000.0,
+    )
+    assert official_import["effective_responder"] == "resident"
+    assert official_import["mismatch"] is True
+    assert (
+        "official_import_route_with_resident_poll"
+        in official_import["mismatch_reasons"]
+    )
+
+    stale_hosted = _dt._effective_responder(
+        route="resident",
+        consumer_state={
+            "poll_consumers": {
+                "agent-runner:u": {
+                    "responder": "hosted_v1",
+                    "last_poll_epoch": 1.0,
+                }
+            }
+        },
+        runtime=None,
+        now_epoch=1_000.0,
+    )
+    assert stale_hosted["effective_responder"] == "none"
+    assert stale_hosted["mismatch"] is False
+    assert stale_hosted["poll_observations"][0]["recent"] is False
+    assert stale_hosted["recent_poll_observations"] == []
+
+
 # App usage-duration rendering (app_session_end aggregation surfaced in the overview).
 def test_fmt_duration_sec_compact_human_readable():
     assert _dt._fmt_duration_sec(0) == "0s"
@@ -965,3 +1079,41 @@ def test_detail_payload_exposes_permission_metadata_without_private_directive(cl
     assert "<private>" not in rendered
     assert "&lt;script&gt;" in rendered
     assert "&lt;private&gt;" in rendered
+
+
+def test_connection_health_separates_never_connected_from_went_offline():
+    """`connected` means "a binding row exists", not "a consumer is alive".
+
+    Access bindings are append-only: the backend upserts one for the active
+    route on every whoami and never clears the old ones, so the flag stays
+    true forever once a user has merely *selected* the resident route. Reading
+    it as liveness labelled 103 of 278 prod resident users 掉线 — "it broke, go
+    debug their consumer" — when the truth was 未连接, "they never ran one".
+    Support acts differently on those two, so the panel must not merge them.
+    """
+    from admin import data_track as _dt
+
+    def health(last_seen_at: str, *, connected: bool = True) -> dict:
+        return _dt._connection_health(
+            "resident",
+            [{"access_mode": "resident", "connected": connected,
+              "last_seen_at": last_seen_at}],
+            {},
+        )
+
+    never = health("")
+    assert (never["status"], never["label"]) == ("idle", "未连接")
+    assert never["stale_h"] is None, "no sighting means no age to report"
+
+    # Same append-only binding, but this consumer really did phone home once.
+    long_ago = (datetime.now() - timedelta(hours=_dt._CONN_STALE_H + 3)).isoformat()
+    gone = health(long_ago)
+    assert (gone["status"], gone["label"]) == ("offline", "掉线")
+    assert gone["stale_h"] > _dt._CONN_STALE_H
+
+    fresh = health(datetime.now().isoformat())
+    assert (fresh["status"], fresh["label"]) == ("ok", "在线")
+
+    # A live sighting outranks a missing/false binding flag: liveness is the
+    # heartbeat, and the flag is the thing we stopped trusting.
+    assert health(datetime.now().isoformat(), connected=False)["status"] == "ok"
