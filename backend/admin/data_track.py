@@ -2183,6 +2183,183 @@ def _runtime_health_summary(*, within_hours: int = 24) -> dict:
     }
 
 
+# 本次新增的两个 Runtime 视图页共用这一份样式。刻意没有去改造既有 6 个视图页
+# 各自内联的 style——那是独立重构，不该混在功能改动里。
+# 普通字符串（非 f-string），花括号无需转义。
+_RUNTIME_PAGE_CSS = """
+    :root { color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; }
+    body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:1280px; margin:0 auto; padding:28px 24px 48px; }
+    h1 { font-size:26px; margin:0 0 4px; }
+    h2 { font-size:16px; margin:28px 0 12px; }
+    .muted { color:var(--muted); }
+    .ok { color:var(--ok); }
+    .warn { color:var(--warn); }
+    .metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:22px 0; }
+    .metric { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }
+    .metric-value { font-size:24px; font-weight:700; }
+    .metric-label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+    .viewbar,.sortbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 18px; }
+    .sort-button { display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }
+    .sort-button.active { border-color:var(--accent); color:var(--accent); background:#fff1ed; }
+    .note-box { background:#fff8ef; border:1px solid #e8d8be; border-radius:8px; padding:12px 14px; margin:16px 0 4px; font-size:13px; line-height:1.6; color:#5a4d3c; }
+    table { border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; margin-bottom:18px; }
+    th,td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+    th { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }
+    tr:last-child td { border-bottom:0; }
+    a { color:var(--accent); text-decoration:none; }
+    code { font-size:12px; }
+    .pill { display:inline-flex; border-radius:999px; padding:2px 8px; font-size:12px; background:#efe7df; color:var(--muted); }
+    .pill.ok { color:var(--ok); background:#e7f3ed; }
+    .pill.warn { color:var(--warn); background:#fff1db; }
+"""
+
+
+def _render_runtime_health_page(payload: dict) -> str:
+    """Runtime V2 全 lane 运行时健康值班台（?view=runtime）。
+
+    本页 = 运行时视角（job 生命周期，窗口可切）；「Proactive 日报」= 产品视角
+    （日报送达率，按天）。heartbeat lane 两页都出现但口径不同，故本页该行给出
+    指向日报页的链接。
+    """
+    level, reasons = _runtime_health_level(payload)
+    window_hours = int(payload.get("window_hours") or 24)
+    lanes = payload.get("lanes") or []
+    pool = payload.get("pool") or {}
+
+    level_text = {"ok": "正常", "warn": "注意", "bad": "异常"}[level]
+    level_cls = {"ok": "ok", "warn": "warn", "bad": "warn"}[level]
+    reason_text = ("：" + "；".join(html.escape(r) for r in reasons)) if reasons else ""
+
+    window_labels = {24: "24 小时", 168: "7 天", 720: "30 天"}
+    window_links = "".join(
+        f"<a class='sort-button{' active' if hours == window_hours else ''}' "
+        f"href='{html.escape(_data_track_page_href(view='runtime', hours=hours), quote=True)}'>"
+        f"{html.escape(window_labels[hours])}</a>"
+        for hours in _RUNTIME_HEALTH_WINDOWS
+    )
+
+    pool_age = pool.get("oldest_pending_age_sec")
+    pool_metrics = "".join([
+        _render_metric("在飞 job", _fmt_count(pool.get("inflight"))),
+        _render_metric("排队 pending", _fmt_count(pool.get("pending"))),
+        _render_metric("存活 worker", _fmt_count(pool.get("live_workers"))),
+        _render_metric("可执行槽位", _fmt_count(pool.get("capacity"))),
+        _render_metric(
+            "最老 pending 年龄",
+            _fmt_duration_sec(pool_age) if pool_age is not None else "—",
+        ),
+    ])
+
+    def _ms_cell(value) -> str:
+        if value is None:
+            return "<td class='muted'>—</td>"
+        return f"<td>{value / 1000:.1f}s</td>"
+
+    lane_rows = []
+    for lane in lanes:
+        name = str(lane.get("lane") or "unknown")
+        rate = lane.get("failure_rate")
+        if rate is None:
+            rate_cell = "<td class='muted'>—</td>"
+        else:
+            cls = (
+                "warn" if rate >= _RUNTIME_HEALTH_FAILURE_WARN else "ok"
+            )
+            rate_cell = f"<td><span class='pill {cls}'>{rate * 100:.0f}%</span></td>"
+        capture = lane.get("capture") or {}
+        missing = int(capture.get("missing") or 0)
+        capture_cell = (
+            f"<td>{int(capture.get('complete') or 0)} / "
+            f"{int(capture.get('partial') or 0)} / "
+            f"<b class='{'warn' if missing else ''}'>{missing}</b></td>"
+        )
+        lane_label = html.escape(name)
+        if name == "heartbeat":
+            hb_href = _data_track_page_href(view="proactive", hours=None, offset=0)
+            lane_label += (
+                f" <a class='muted' style='font-size:12px' "
+                f"href='{html.escape(hb_href, quote=True)}'>（日报口径）</a>"
+            )
+        lane_rows.append(
+            "<tr>"
+            f"<td><b>{lane_label}</b></td>"
+            f"<td>{_fmt_count(lane.get('sampled_jobs'))}</td>"
+            f"<td>{_fmt_count(lane.get('completed'))}</td>"
+            f"<td>{_fmt_count(lane.get('failed'))}</td>"
+            f"<td>{_fmt_count(lane.get('expired'))}</td>"
+            f"<td class='muted'>{_fmt_count(lane.get('superseded'))}</td>"
+            + rate_cell
+            + _ms_cell(lane.get("p50_ok_ms"))
+            + _ms_cell(lane.get("p95_ok_ms"))
+            + capture_cell
+            + "</tr>"
+        )
+
+    failure_rows = []
+    for lane in lanes:
+        name = html.escape(str(lane.get("lane") or "unknown"))
+        for item in lane.get("top_failures") or []:
+            code = _runtime_failure_code(item.get("code"))
+            failure_rows.append(
+                "<tr>"
+                f"<td>{name}</td>"
+                f"<td><code>{html.escape(code)}</code></td>"
+                f"<td>{_fmt_count(item.get('count'))}</td>"
+                "</tr>"
+            )
+
+    empty_note = (
+        "<div class='muted'>当前窗口无样本——这不是故障，是这条口径当天没有数据。"
+        "可切到 7 天或 30 天。</div>"
+        if not any(int(l.get("sampled_jobs") or 0) for l in lanes)
+        else ""
+    )
+
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Runtime 健康 · Feedling Data Track</title>
+  <style>{_RUNTIME_PAGE_CSS}</style>
+</head>
+<body>
+<main>
+  <h1>Runtime 健康</h1>
+  <div class="muted">Generated {html.escape(_bj_iso(payload.get("generated_at")))}. Metadata only; encrypted content is not read or rendered.</div>
+  <h2>总体结论：<span class="{level_cls}">{html.escape(level_text)}</span></h2>
+  <div class="muted">窗口 {window_hours} 小时{reason_text}</div>
+  <div class="sortbar">{window_links}</div>
+  {_render_data_track_view_nav("runtime")}
+  <div class="note-box">
+    <b>口径分工：</b>本页是<b>运行时视角</b>——按 job 生命周期统计，窗口可切。
+    「<b>Proactive 日报</b>」是产品视角——按天统计日报送达率。
+    heartbeat lane 两页都会出现，但口径不同，别直接对数。
+    分母一律从 agent_jobs 起算，因此「完全没写 metrics」的回合不会从统计里消失。
+    延迟只算成功回合：失败超时会把 p95 拉高，混在一起会让一个故障看起来像两个。
+  </div>
+  {empty_note}
+  <h2>Worker 池</h2>
+  <section class="metrics">{pool_metrics}</section>
+  <h2>各 lane 健康</h2>
+  <table>
+    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>失败</th><th>过期</th><th>superseded</th><th>失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 完整/部分/漏写</th></tr></thead>
+    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='10' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
+  </table>
+  <h2>失败原因 Top</h2>
+  <table>
+    <thead><tr><th>Lane</th><th>失败码</th><th>次数</th></tr></thead>
+    <tbody>{''.join(failure_rows) if failure_rows else "<tr><td colspan='3' class='muted'>当前窗口无失败。</td></tr>"}</tbody>
+  </table>
+  <div class="muted">失败码只是分类，不含上游细节。<b>上游原始错</b>（403 余额不足 / 429 / 超时）
+  留在加密 trajectory 里，需走 default-off 的 break-glass trajectory inspector 查看，
+  且每次访问都会写审计。本页只有 metadata。</div>
+</main>
+</body>
+</html>"""
+
+
 def _render_admin_login_page(error: bool = False, next_url: str = "/admin/data-track") -> str:
     """Password-gate login page for the admin dashboard. Posts to /admin/login,
     which validates FEEDLING_ADMIN_PASSWORD and sets the signed admin_session

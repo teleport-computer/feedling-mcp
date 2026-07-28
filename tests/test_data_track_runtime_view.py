@@ -8,6 +8,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from admin import data_track as _dt  # noqa: E402
 from core import reqctx  # noqa: E402
+import pytest  # noqa: E402
+
+from admin import admin_core as _admin_core  # noqa: E402
+
+
+@pytest.fixture()
+def bound_request():
+    """渲染纯函数需要 request 上下文才能拼 href。刻意不设 autouse——
+    Task 5 的 client 测试自己会 bind，嵌套 bind 会让请求上下文互相覆盖。"""
+    with _admin_core.bind(""):
+        yield
 
 
 def _lane(**overrides) -> dict:
@@ -194,3 +205,62 @@ def test_runtime_health_window_hours_falls_back_on_bad_input():
     for qs in ("hours=99999", "hours=0", "hours=-5", "hours=abc", "hours=", ""):
         with reqctx.bind(qs):
             assert _dt._runtime_health_window_hours() == 24
+
+
+# ---- Task 4: 渲染 Runtime 健康页 ----
+
+
+def test_render_runtime_health_page_shows_conclusion_and_lanes(bound_request):
+    html_out = _dt._render_runtime_health_page(_payload([
+        _lane(lane="chat"),
+        _lane(lane="heartbeat", sampled_jobs=12, completed=12),
+    ]))
+    assert "Runtime 健康" in html_out
+    assert "正常" in html_out
+    assert "chat" in html_out
+    assert "heartbeat" in html_out
+    assert "Worker 池" in html_out
+
+
+def test_render_runtime_health_page_renders_na_not_fake_zero(bound_request):
+    html_out = _dt._render_runtime_health_page(_payload([_lane(
+        sampled_jobs=0, completed=0, failure_rate=None,
+        p50_ok_ms=None, p95_ok_ms=None,
+        capture={"complete": 0, "partial": 0, "missing": 0, "open": 0},
+    )]))
+    assert "0%" not in html_out          # 假红 0% 绝不能出现
+    assert "当前窗口无样本" in html_out
+
+
+def test_render_runtime_health_page_escapes_and_buckets_failure_codes(bound_request):
+    leaked = "<script>alert(1)</script> 我的身份证号是 1234"
+    html_out = _dt._render_runtime_health_page(_payload([
+        _lane(failure_rate=0.5, failed=1, completed=1,
+              top_failures=[{"code": leaked, "count": 1}]),
+    ]))
+    assert "<script>" not in html_out
+    assert "身份证号" not in html_out
+    assert "other" in html_out
+
+
+def test_render_runtime_health_page_points_at_break_glass_inspector(bound_request):
+    html_out = _dt._render_runtime_health_page(_payload([
+        _lane(failure_rate=0.5, failed=1, completed=1,
+              top_failures=[{"code": "turn_failed:providererror", "count": 1}]),
+    ]))
+    assert "上游原始错" in html_out
+    assert "trajectory inspector" in html_out
+
+
+def test_render_runtime_health_page_offers_window_switches(bound_request):
+    html_out = _dt._render_runtime_health_page(_payload())
+    assert "hours=24" in html_out
+    assert "hours=168" in html_out
+    assert "hours=720" in html_out
+
+
+def test_render_runtime_health_page_declares_scope_split(bound_request):
+    # 与 Proactive 日报页的口径分工必须写在页面上，否则两页数字打架时无从判断
+    html_out = _dt._render_runtime_health_page(_payload())
+    assert "运行时视角" in html_out
+    assert "Proactive 日报" in html_out
