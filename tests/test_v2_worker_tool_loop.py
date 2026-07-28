@@ -387,6 +387,88 @@ def test_degenerate_intermediate_is_dropped_before_real_final_reply(monkeypatch)
     assert [bubble["body_ct"] for bubble in _bubbles(uid)] == ["在的，怎么了"]
 
 
+# ---------------------------------------------------------------------------
+# Torn protocol-JSON leak (B3): a stream-cut relay splits one protocol envelope
+# across the reasoning/content channels. The head lands in `reasoning`, the tail
+# in `reply`. Strong cross-channel evidence must never reach a chat bubble.
+# ---------------------------------------------------------------------------
+
+# One envelope torn at the channel boundary.
+_TORN_HEAD = '{"messages":[],"actions":[{"type":"pro'
+_TORN_TAIL = 'active.sleep","reason":"7点了 还在睡 不打扰了 醒了会找我"}]}'
+
+
+def test_torn_protocol_tail_with_reasoning_head_becomes_fallback(monkeypatch):
+    """Chat: reply=tail + reasoning=head is STRONG cross-channel evidence. The
+    bubble must be the honest fallback, not the leaked JSON tail, and the torn
+    head must NOT surface as a thinking bubble."""
+    uid = "u_toolloop_torn_fallback"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-torn")
+    _patch_real_write(monkeypatch)
+    _script_provider(
+        monkeypatch,
+        [{
+            "reply": _TORN_TAIL,
+            "reasoning": _TORN_HEAD,
+            "tool_calls": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }],
+    )
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}])
+
+    status = asyncio.run(
+        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
+    )
+
+    assert status == "completed"
+    bubbles = _bubbles(uid)
+    assert len(bubbles) == 1
+    assert bubbles[0]["body_ct"] == worker._DEGENERATE_REPLY_FALLBACK
+    assert _TORN_TAIL not in bubbles[0]["body_ct"]
+    assert bubbles[0]["turn_failure_error_class"] == "upstream_unavailable"
+    # Reasoning head must not ride along as a thinking bubble.
+    assert not bubbles[0].get("thinking_body_ct")
+
+
+def test_foreground_keeps_user_json_talk_without_reasoning(monkeypatch):
+    """Chat: a bracket-heavy message with NO reasoning head is WEAK evidence —
+    it could be the user discussing code/JSON. Foreground must deliver it, never
+    eat a real message on the bracket heuristic alone."""
+    uid = "u_toolloop_user_json"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-userjson")
+    _patch_real_write(monkeypatch)
+    user_json_talk = '删掉多余的 }，把 "port": 8080 改成 8081'
+    _script_provider(monkeypatch, [_text_round(user_json_talk)])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "配置怎么改"}])
+
+    status = asyncio.run(
+        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
+    )
+
+    assert status == "completed"
+    assert [b["body_ct"] for b in _bubbles(uid)] == [user_json_talk]
+
+
+def test_torn_protocol_evidence_lane_policy():
+    """Pure-unit: the worker's lane-policy helper. Proactive suppresses any leak;
+    foreground only strong cross-channel evidence."""
+    # Weak orphan tail, no reasoning.
+    assert worker._torn_protocol_evidence(_TORN_TAIL, "", lane="proactive")
+    assert not worker._torn_protocol_evidence(_TORN_TAIL, "", lane="foreground")
+    # Strong: head in reasoning rejoins to a complete envelope.
+    assert worker._torn_protocol_evidence(_TORN_TAIL, _TORN_HEAD, lane="proactive")
+    assert worker._torn_protocol_evidence(_TORN_TAIL, _TORN_HEAD, lane="foreground")
+    # Normal reply: never suppressed.
+    assert not worker._torn_protocol_evidence("晚安，做个好梦", "在想她累不累", lane="proactive")
+    assert not worker._torn_protocol_evidence("晚安，做个好梦", "", lane="foreground")
+
+
 def _stub_envelope_build(monkeypatch):
     """Deterministic stand-in for the enclave envelope round-trip so a test can
     read the sealed plaintext straight off the row's ``*_body_ct``. Applies to

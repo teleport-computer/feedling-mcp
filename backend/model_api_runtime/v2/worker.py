@@ -61,6 +61,7 @@ from provider_types import MCP_TRANSPORT_FAILURE_ERROR, ToolExchange, ToolResult
 from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
 from core import envelope as core_envelope
+from core import protocol_leak
 from core import provider_usage
 from core import store as core_store
 from core import wake_bus as core_wake_bus
@@ -872,6 +873,23 @@ _DEGENERATE_REPLY_FALLBACK = (
     or "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
 )
 _DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
+# A torn/leaked protocol-JSON fragment (stream-cut relay split the envelope
+# across reasoning/content). Same blame as a degenerate reply — the relay, not
+# us — but a distinct failure reason keeps flaky-relay users visible in the
+# job_failed_reasons aggregation instead of hiding behind a plain sleep.
+_PROTOCOL_FRAGMENT_ERROR_CLASS = "upstream_unavailable"
+_PROTOCOL_FRAGMENT_REASON = "protocol_fragment_suppressed"
+
+
+def _torn_protocol_evidence(text: str, reasoning: str, *, lane: str) -> str:
+    """Classify a V2 reply-tool / free-text reply for a torn protocol leak, then
+    apply the lane policy. Returns the evidence enum when it should be suppressed,
+    or "" to deliver. `lane` here is the detector policy ("proactive"/"foreground"),
+    not the wake lane."""
+    evidence = protocol_leak.classify(text, reasoning_text=reasoning)
+    if protocol_leak.should_suppress(evidence, lane=lane):
+        return evidence
+    return ""
 
 
 class LostJobLease(RuntimeError):
@@ -6397,6 +6415,20 @@ async def _run_wake(
                 if final:
                     raise TurnError("degenerate_reply_suppressed")
                 return
+            # Torn protocol-JSON leak (stream-cut relay split the envelope across
+            # reasoning/content). Proactive policy suppresses any leak — silence
+            # is the correct wake outcome anyway. Mirror the degenerate lifecycle:
+            # final fails the turn (recorded, no bubble), intermediate is a no-op.
+            torn = _torn_protocol_evidence(text, reasoning, lane="proactive") if text else ""
+            if torn:
+                log.warning(
+                    "[v2.worker] wake torn protocol fragment suppressed user=%s "
+                    "job=%s lane=%s final=%s evidence=%s fragment=%r",
+                    user_id, job_id, lane, final, torn, text[:32],
+                )
+                if final:
+                    raise TurnError(_PROTOCOL_FRAGMENT_REASON)
+                return
             if not text:
                 # Silence is a legitimate wake outcome — both mid-loop (an empty
                 # `reply{}` call) and terminal ("weak wake sleeps"): unlike the chat
@@ -8770,6 +8802,23 @@ async def process_job(
                     return
                 text = _DEGENERATE_REPLY_FALLBACK
                 turn_failure_error_class = _DEGENERATE_REPLY_ERROR_CLASS
+                reasoning = ""
+            # Torn protocol-JSON leak. Foreground policy: only STRONG cross-channel
+            # evidence drops (a weak orphan tail might be the user pasting JSON). On
+            # a strong hit, substitute the honest fallback and drop the reasoning —
+            # never render a torn protocol head next to the fallback bubble.
+            elif file_reply is None and text and _torn_protocol_evidence(
+                text, reasoning, lane="foreground"
+            ):
+                log.warning(
+                    "[v2.worker] chat torn protocol fragment suppressed user=%s "
+                    "job=%s final=%s fragment=%r",
+                    user_id, job_id, final, text[:32],
+                )
+                if not final:
+                    return
+                text = _DEGENERATE_REPLY_FALLBACK
+                turn_failure_error_class = _PROTOCOL_FRAGMENT_ERROR_CLASS
                 reasoning = ""
             if final and not text:
                 # BUG-4 no-filler: chat lane always replies — an empty terminal
