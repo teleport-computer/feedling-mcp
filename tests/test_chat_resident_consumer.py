@@ -60,14 +60,18 @@ def _reset_proactive_guard_state_between_tests():
     ``_last_proactive_turn_ts`` belongs to the same family: it opens the
     across-batch wake-coalescing window, so without a reset here the first test
     to realize a turn would make every later test's wake fold into it and skip
-    the agent call entirely."""
+    the agent call entirely. The foreground notice throttle is also process
+    global; clear it both before and after each test so this module cannot
+    suppress notices in a subsequently collected test module."""
     crc._self_wake_streak = 0
     crc._proactive_fail_streak = 0
     crc._proactive_backoff_until = 0.0
     crc._provider_payment_cooldown_until = 0.0
     crc._last_proactive_turn_ts = 0.0
     crc._last_proactive_turn_job_id = ""
+    crc._reset_system_notice_state()
     yield
+    crc._reset_system_notice_state()
 
 
 # ---------------------------------------------------------------------------
