@@ -27,5 +27,5 @@ def _save_onboarding_route(store: UserStore, route: str) -> dict:
     if normalized not in MODEL_API_ROUTES:
         raise ValueError("route must be resident, official_import, or model_api")
     data = {"route": normalized, "selected_at": util._now_iso()}
-    db.set_blob(store.user_id, "onboarding_route", data)
+    db.set_onboarding_route_strict(store.user_id, data)
     return data

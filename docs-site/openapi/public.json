@@ -5088,6 +5088,94 @@
         "description": "Return ordered onboarding checks. Resident routes include a decrypt_source step between resident_consumer and live_loop, with status, checked_at_epoch, reason, policy, and remediation fields."
       }
     },
+    "/v1/perception/app_close": {
+      "get": {
+        "summary": "App Close",
+        "operationId": "app_close_v1_perception_app_close_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Perception"
+        ],
+        "parameters": [
+          {
+            "name": "app",
+            "in": "query",
+            "required": true,
+            "description": "Application name or identifier. The public contract requires this canonical parameter; bundle_id remains a deprecated runtime alias.",
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            },
+            "example": "com.apple.MobileSafari"
+          },
+          {
+            "name": "bundle_id",
+            "in": "query",
+            "required": false,
+            "description": "Compatibility alias for app.",
+            "schema": {
+              "type": "string"
+            },
+            "deprecated": true
+          },
+          {
+            "name": "category",
+            "in": "query",
+            "required": false,
+            "description": "Optional application category.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "browser"
+          },
+          {
+            "name": "ts",
+            "in": "query",
+            "required": false,
+            "description": "Client event Unix timestamp.",
+            "schema": {
+              "type": "number",
+              "minimum": 0
+            },
+            "example": 1783962000.0
+          },
+          {
+            "name": "client_ts",
+            "in": "query",
+            "required": false,
+            "description": "Compatibility alias for ts.",
+            "schema": {
+              "type": "number",
+              "minimum": 0
+            },
+            "deprecated": true
+          }
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "iOS Shortcut compatibility endpoint for the automation's \"is closed\" trigger. This GET records an event and therefore has side effects."
+      }
+    },
     "/v1/perception/app_open": {
       "get": {
         "summary": "App Open",

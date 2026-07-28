@@ -90,5 +90,12 @@ async def app_open(request: Request, auth: AuthResult = Depends(require_auth)):
     return JSONResponse(body, status_code=status)
 
 
+@router.get("/v1/perception/app_close")
+async def app_close(request: Request, auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(
+        perception_read_core.app_close, auth.store, request.query_params)
+    return JSONResponse(body, status_code=status)
+
+
 def register_asgi(app) -> None:
     app.include_router(router)

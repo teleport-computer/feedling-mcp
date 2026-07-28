@@ -249,7 +249,10 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0061_v2_adaptive_tail_metrics").down_revision == (
         "0060_v2_wake_failure_backoff"
     )
-    assert script.get_current_head() == "0061_v2_adaptive_tail_metrics"
+    assert script.get_revision("0062_v2_failure_reply").down_revision == (
+        "0061_v2_adaptive_tail_metrics"
+    )
+    assert script.get_current_head() == "0062_v2_failure_reply"
 
 
 def test_provider_health_schema_is_runtime_neutral():
@@ -648,7 +651,8 @@ def test_terminal_failure_outbox_schema_and_error_event_idempotency_guard_exist(
         ).fetchall()
         indexes = conn.execute(
             "SELECT indexname FROM pg_indexes "
-            "WHERE tablename IN ('v2_terminal_failure_outbox','agent_status_events')"
+            "WHERE tablename IN ("
+            "'v2_terminal_failure_outbox','agent_status_events','agent_jobs')"
         ).fetchall()
     assert {
         "job_id",
@@ -660,11 +664,19 @@ def test_terminal_failure_outbox_schema_and_error_event_idempotency_guard_exist(
         "runtime_error_delivered_at",
         "status_next_attempt_at",
         "runtime_error_next_attempt_at",
+        "error_class",
+        "reply_frontier_seq",
+        "reply_parent_message_id",
+        "reply_delivered_at",
+        "reply_next_attempt_at",
     }.issubset({row[0] for row in columns})
     assert {
         "v2_terminal_failure_status_pending_idx",
         "v2_terminal_failure_runtime_pending_idx",
+        "v2_terminal_failure_reply_pending_idx",
         "ux_agent_status_events_job_error",
+        "ix_agent_jobs_chat_terminal_finished",
+        "ix_agent_jobs_user_chat_failure_finished",
     }.issubset({row[0] for row in indexes})
 
 

@@ -66,6 +66,31 @@ def test_pending_messages_claim_is_exclusive(store):
     assert "m2" not in [m["id"] for m in second]
 
 
+def test_same_parent_claim_is_exclusive_across_poll_responder_classes(store):
+    """Secondary per-parent fence, not the route-ownership invariant.
+
+    This proves hosted V1 and an independent resident cannot both claim the
+    *same* parent. It does not stop two concurrently running consumers from
+    claiming different parents; the roster/route ownership test is what keeps
+    those responder classes from being started together.
+    """
+    _append_user_message(store, "m_responder_invariant")
+    delivered = []
+    for consumer_id in (
+        f"agent-runner:{store.user_id}",
+        "resident-vps:123",
+    ):
+        pending = chat_poll_core.pending_messages(
+            store,
+            since=0.0,
+            consumer_id=consumer_id,
+            claim=True,
+        )
+        if "m_responder_invariant" in [message["id"] for message in pending]:
+            delivered.append(consumer_id)
+    assert len(delivered) == 1
+
+
 def test_pending_messages_no_claim_leaves_it_pending(store):
     _append_user_message(store, "m3")
     peek = chat_poll_core.pending_messages(store, since=0.0, consumer_id="c-A", claim=False)

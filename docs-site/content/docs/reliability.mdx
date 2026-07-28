@@ -149,7 +149,8 @@ failures remain the responsibility of the separate provider health circuit.
 ## Retry safety
 
 Classify by operation semantics, not only by HTTP method. In particular,
-`GET /v1/perception/app_open` records an event and is not read-only.
+`GET /v1/perception/app_open` and `GET /v1/perception/app_close` record an
+event and are not read-only.
 
 | Situation | Safe default |
 | --- | --- |
@@ -174,7 +175,7 @@ otherwise.
 Common consequences:
 
 - Retrying `/v1/chat/response`, `/v1/memory/add`, a Perception collection
-  upload, or `app_open` can create duplicate effects.
+  upload, `app_open`, or `app_close` can create duplicate effects.
 - A client-generated envelope or memory ID helps reconciliation but is not a
   documented create-if-absent guarantee.
 - `POST /v1/model_api/chat/send` and `POST /v1/chat/message` accept an optional
