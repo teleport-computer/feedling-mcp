@@ -95,7 +95,7 @@ def _data_track_qs(**updates) -> str:
     for key in (
         "admin_key", "since", "registered_since", "q", "limit", "offset", "sort",
         "dir", "view", "days", "user_id", "subsystem", "status", "trace_id",
-        "mode", "reveal", "page", "event", "day", "events_limit",
+        "mode", "reveal", "page", "event", "day", "events_limit", "hours",
     ):
         value = request.args.get(key, "").strip()
         if value:
@@ -1401,7 +1401,7 @@ def _data_track_request_filters() -> dict:
     if raw_dir not in {"asc", "desc"}:
         raw_dir = "desc"
     raw_view = (request.args.get("view") or "users").strip().lower()
-    if raw_view not in {"users", "dau", "proactive", "debug", "events"}:
+    if raw_view not in {"users", "dau", "proactive", "debug", "events", "runtime"}:
         raw_view = "users"
 
     def read_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -2257,6 +2257,367 @@ def _fmt_ratio(value) -> str:
         return "—"
 
 
+# ---- Runtime 健康值班台 ----------------------------------------------------
+# 阈值集中在此，便于以后一处调整。定阈依据（2026-07-27 三环境实测）：
+#   失败率 —— prod 07-26 为 0%、07-27 为 100%，两端都能正确点亮
+#   p95    —— pre 健康态 chat p95 = 38.1s，留约 1.5× 余量
+#   pending 年龄 —— 对应 claim lag 退化；健康时该值为空
+_RUNTIME_HEALTH_WINDOWS = (24, 168, 720)
+_RUNTIME_HEALTH_FAILURE_WARN = 0.05
+_RUNTIME_HEALTH_FAILURE_BAD = 0.15
+_RUNTIME_HEALTH_P95_WARN_MS = 60_000
+_RUNTIME_HEALTH_P95_BAD_MS = 120_000
+_RUNTIME_HEALTH_PENDING_WARN_SEC = 60
+_RUNTIME_HEALTH_PENDING_BAD_SEC = 180
+_RUNTIME_FAILURE_CODE_MAX = 64
+# 按形状放行，不按枚举前缀放行。agent_jobs.last_error 的真实写入点远不止
+# turn_failed:/queue_timeout/lease_timeout 三种（wake_failed:*、
+# extraction_failed:*、compaction_failed:*、mcp_mutation_outcome_unknown、
+# runtime_expired 都是 mark_failed/mark_expired 落库的合法码），枚举前缀白名单
+# 会把 chat 之外每条 lane 的失败原因塌成 other。所有已知写入点产出的码都是
+# "scope:kind" 或裸 "snake_case"，且只含小写字母/数字/下划线——照此收紧，而不
+# 是照 jobs_store._TERMINAL_ERROR_CODE_RE（那个更宽松的 `:`/`-` 全字符集是给
+# outbox 用的，admin 层不 import model_api_runtime，故在此单独定义）。
+_RUNTIME_FAILURE_CODE_RE = re.compile(r"^[a-z0-9_]+(:[a-z0-9_]+)?$")
+
+
+def _runtime_failure_code(raw) -> str:
+    """失败码白名单化：只放行已知形状（scope:kind 或裸 snake_case），其余归入
+    other。
+
+    形状校验而非前缀校验：`turn_failed:` 前缀曾经无条件放行 + 截断，哪怕冒号
+    后是含空格/中文的自由文本也会被截断显示——这是本函数要堵住的口子。
+    """
+    code = str(raw or "").strip()
+    if not code or not _RUNTIME_FAILURE_CODE_RE.fullmatch(code):
+        return "other"
+    return code[:_RUNTIME_FAILURE_CODE_MAX]
+
+
+def _runtime_health_level(payload: dict) -> tuple[str, list[str]]:
+    """(总体档位, 中文原因列表)。档位取所有指标里最差的一档。
+
+    分母为 0 的指标一律跳过、不参与判定：零样本不是故障。commit 2795537a 的
+    re-review 教训——V2-only 合成行的 legacy 分母为 0 曾被渲染成红 0%，3 条健康
+    心跳看起来像全挂。
+    """
+    rank = {"ok": 0, "warn": 1, "bad": 2}
+    worst = "ok"
+    reasons: list[str] = []
+
+    def escalate(level: str, reason: str) -> None:
+        nonlocal worst
+        if rank[level] > rank[worst]:
+            worst = level
+        if level != "ok":
+            reasons.append(reason)
+
+    for lane in payload.get("lanes") or []:
+        name = str(lane.get("lane") or "unknown")
+        sampled = int(lane.get("sampled_jobs") or 0)
+        rate = lane.get("failure_rate")
+        if rate is not None and sampled > 0:
+            if rate >= _RUNTIME_HEALTH_FAILURE_BAD:
+                escalate("bad", f"{name} 失败率 {rate * 100:.0f}%")
+            elif rate >= _RUNTIME_HEALTH_FAILURE_WARN:
+                escalate("warn", f"{name} 失败率 {rate * 100:.0f}%")
+
+        p95 = lane.get("p95_ok_ms")
+        if p95 is not None:
+            if p95 >= _RUNTIME_HEALTH_P95_BAD_MS:
+                escalate("bad", f"{name} 成功回合 p95 {p95 / 1000:.0f}s")
+            elif p95 >= _RUNTIME_HEALTH_P95_WARN_MS:
+                escalate("warn", f"{name} 成功回合 p95 {p95 / 1000:.0f}s")
+
+        missing = int((lane.get("capture") or {}).get("missing") or 0)
+        if missing > 0:
+            escalate("bad", f"{name} trajectory capture missing {missing} 条")
+
+        # 卡死形态（claimed/running，无 pending，worker 心跳还活着）：这条 lane
+        # 的 job 全部还没到终态，rate/p95/missing 全部为空/0，池层面也看不出
+        # 异常——除了这一件事本身就是矛盾态。sampled_jobs==0 却 capture.open>0
+        # 意味着窗口内有回合在飞但一个都没走到终态，必须至少 warn，否则值班台
+        # 会在卡死时告诉人「没事」（本分支专门修过一次"卡死 lane 不消失"，但判
+        # 定层和文案层此前没跟上）。
+        open_count = int((lane.get("capture") or {}).get("open") or 0)
+        if sampled == 0 and open_count > 0:
+            escalate(
+                "warn",
+                f"{name} 有 {open_count} 个回合在飞但无一终态（可能卡死）",
+            )
+
+    pool = payload.get("pool") or {}
+    if int(pool.get("live_workers") or 0) <= 0:
+        escalate("bad", "无存活 worker")
+
+    inflight = int(pool.get("inflight") or 0)
+    capacity = int(pool.get("capacity") or 0)
+    if inflight > capacity:
+        escalate("bad", f"在飞 {inflight} 超过容量 {capacity}（矛盾态）")
+
+    age = pool.get("oldest_pending_age_sec")
+    if age is not None:
+        if age >= _RUNTIME_HEALTH_PENDING_BAD_SEC:
+            escalate("bad", f"最老 pending 已排队 {age / 60:.0f} 分钟")
+        elif age >= _RUNTIME_HEALTH_PENDING_WARN_SEC:
+            escalate("warn", f"最老 pending 已排队 {age:.0f} 秒")
+
+    return worst, reasons
+
+
+def _runtime_health_window_hours() -> int:
+    """窗口枚举白名单（照 view 参数的写法），非法值一律回落 24。"""
+    try:
+        value = int(request.args.get("hours", 24))
+    except (TypeError, ValueError):
+        return 24
+    return value if value in _RUNTIME_HEALTH_WINDOWS else 24
+
+
+# Injected by the assembly layer (asgi_app.py); the real implementation is
+# model_api_runtime.v2.jobs_store.recent_runtime_health.
+def _runtime_health_summary(*, within_hours: int = 24) -> dict:
+    return {
+        "window_hours": within_hours,
+        "generated_at": 0.0,
+        "lanes": [],
+        "pool": {
+            "inflight": 0, "pending": 0, "live_workers": 0,
+            "capacity": 0, "oldest_pending_age_sec": None,
+        },
+    }
+
+
+# 本次新增的两个 Runtime 视图页共用这一份样式。刻意没有去改造既有 6 个视图页
+# 各自内联的 style——那是独立重构，不该混在功能改动里。
+# 普通字符串（非 f-string），花括号无需转义。
+_RUNTIME_PAGE_CSS = """
+    :root { color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }
+    body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:1280px; margin:0 auto; padding:28px 24px 48px; }
+    h1 { font-size:26px; margin:0 0 4px; }
+    h2 { font-size:16px; margin:28px 0 12px; }
+    .muted { color:var(--muted); }
+    .ok { color:var(--ok); }
+    .warn { color:var(--warn); }
+    .bad { color:var(--bad); }
+    .metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:22px 0; }
+    .metric { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }
+    .metric-value { font-size:24px; font-weight:700; }
+    .metric-label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+    .viewbar,.sortbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 18px; }
+    .sort-button { display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }
+    .sort-button.active { border-color:var(--accent); color:var(--accent); background:#fff1ed; }
+    .note-box { background:#fff8ef; border:1px solid #e8d8be; border-radius:8px; padding:12px 14px; margin:16px 0 4px; font-size:13px; line-height:1.6; color:#5a4d3c; }
+    table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; margin-bottom:18px; }
+    th,td { text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
+    th { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }
+    tr:last-child td { border-bottom:0; }
+    a { color:var(--accent); text-decoration:none; }
+    code { font-size:12px; }
+    .pill { display:inline-flex; border-radius:999px; padding:2px 8px; font-size:12px; background:#efe7df; color:var(--muted); }
+    .pill.ok { color:var(--ok); background:#e7f3ed; }
+    .pill.warn { color:var(--warn); background:#fff1db; }
+    .pill.bad { color:var(--bad); background:#fff1ed; }
+"""
+
+
+def _render_runtime_health_page(payload: dict) -> str:
+    """Runtime V2 全 lane 运行时健康值班台（?view=runtime）。
+
+    本页 = 运行时视角（job 生命周期，窗口可切）；「Proactive 日报」= 产品视角
+    （日报送达率，按天）。heartbeat lane 两页都出现但口径不同，故本页该行给出
+    指向日报页的链接。
+    """
+    level, reasons = _runtime_health_level(payload)
+    window_hours = int(payload.get("window_hours") or 24)
+    lanes = payload.get("lanes") or []
+    pool = payload.get("pool") or {}
+
+    level_text = {"ok": "正常", "warn": "注意", "bad": "异常"}[level]
+    level_cls = {"ok": "ok", "warn": "warn", "bad": "bad"}[level]
+    reason_text = ("：" + "；".join(html.escape(r) for r in reasons)) if reasons else ""
+
+    window_labels = {24: "24 小时", 168: "7 天", 720: "30 天"}
+    window_links = "".join(
+        f"<a class='sort-button{' active' if hours == window_hours else ''}' "
+        f"href='{html.escape(_data_track_page_href(view='runtime', hours=hours), quote=True)}'>"
+        f"{html.escape(window_labels[hours])}</a>"
+        for hours in _RUNTIME_HEALTH_WINDOWS
+    )
+
+    pool_age = pool.get("oldest_pending_age_sec")
+    pool_metrics = "".join([
+        _render_metric("在飞 job", _fmt_count(pool.get("inflight"))),
+        _render_metric("排队 pending", _fmt_count(pool.get("pending"))),
+        _render_metric("存活 worker", _fmt_count(pool.get("live_workers"))),
+        _render_metric("可执行槽位", _fmt_count(pool.get("capacity"))),
+        _render_metric(
+            "最老 pending 年龄",
+            _fmt_duration_sec(pool_age),
+        ),
+    ])
+
+    def _ms_cell(value) -> str:
+        if value is None:
+            return "<td class='muted'>—</td>"
+        return f"<td>{value / 1000:.1f}s</td>"
+
+    lane_rows = []
+    for lane in lanes:
+        name = str(lane.get("lane") or "unknown")
+        rate = lane.get("failure_rate")
+        if rate is None:
+            rate_cell = "<td class='muted'>—</td>"
+        else:
+            if rate >= _RUNTIME_HEALTH_FAILURE_BAD:
+                cls = "bad"
+            elif rate >= _RUNTIME_HEALTH_FAILURE_WARN:
+                cls = "warn"
+            else:
+                cls = "ok"
+            rate_cell = f"<td><span class='pill {cls}'>{rate * 100:.0f}%</span></td>"
+        capture = lane.get("capture") or {}
+        missing = int(capture.get("missing") or 0)
+        open_count = int(capture.get("open") or 0)
+        capture_cell = (
+            f"<td>{int(capture.get('complete') or 0)} / "
+            f"{int(capture.get('partial') or 0)} / "
+            f"<b class='{'bad' if missing else ''}'>{missing}</b> / "
+            f"{open_count}</td>"
+        )
+        lane_label = html.escape(name)
+        if name == "heartbeat":
+            hb_href = _data_track_page_href(view="proactive", hours=None, offset=0)
+            lane_label += (
+                f" <a class='muted' style='font-size:12px' "
+                f"href='{html.escape(hb_href, quote=True)}'>（日报口径）</a>"
+            )
+        lane_rows.append(
+            "<tr>"
+            f"<td><b>{lane_label}</b></td>"
+            f"<td>{_fmt_count(lane.get('sampled_jobs'))}</td>"
+            f"<td>{_fmt_count(lane.get('completed'))}</td>"
+            f"<td>{_fmt_count(lane.get('failed'))}</td>"
+            f"<td>{_fmt_count(lane.get('expired'))}</td>"
+            f"<td class='muted'>{_fmt_count(lane.get('superseded'))}</td>"
+            + rate_cell
+            + _ms_cell(lane.get("p50_ok_ms"))
+            + _ms_cell(lane.get("p95_ok_ms"))
+            + capture_cell
+            + "</tr>"
+        )
+
+    failure_rows = []
+    for lane in lanes:
+        name = html.escape(str(lane.get("lane") or "unknown"))
+        # 清洗发生在渲染层且不重新聚合：同一 lane 的两个不同原始码若都被清洗成
+        # 同一个桶（most commonly "other"），必须在渲染前按清洗后的码合并计数，
+        # 否则会渲染成两行都叫 other（reviewer 实证：('other',3) 和
+        # ('other',2) 两行，看起来像两个不同故障）。
+        merged: dict[str, int] = {}
+        for item in lane.get("top_failures") or []:
+            code = _runtime_failure_code(item.get("code"))
+            merged[code] = merged.get(code, 0) + int(item.get("count") or 0)
+        for code, count in sorted(merged.items(), key=lambda kv: kv[1], reverse=True):
+            failure_rows.append(
+                "<tr>"
+                f"<td>{name}</td>"
+                f"<td><code>{html.escape(code)}</code></td>"
+                f"<td>{_fmt_count(count)}</td>"
+                "</tr>"
+            )
+
+    # "这不是故障" 只在真的什么都没发生时才说得出口：没有终态样本、没有在飞的
+    # 回合（capture.open）、池里也没有 inflight/pending。若窗口内无终态 job 但
+    # 有回合在飞，那不是"没数据"，是卡死的形状——I-3 的教训：之前这两种情形共
+    # 用同一句"这不是故障"，把卡死误报成正常的空窗口。
+    no_terminal_samples = not any(int(l.get("sampled_jobs") or 0) for l in lanes)
+    total_open = sum(int((l.get("capture") or {}).get("open") or 0) for l in lanes)
+    pool_inflight = int(pool.get("inflight") or 0)
+    pool_pending = int(pool.get("pending") or 0)
+    if not no_terminal_samples:
+        empty_note = ""
+    elif total_open == 0 and pool_inflight == 0 and pool_pending == 0:
+        empty_note = (
+            "<div class='muted'>当前窗口无样本——这不是故障，是这条口径当天没有数据。"
+            "可切到 7 天或 30 天。</div>"
+        )
+    else:
+        empty_note = (
+            "<div class='muted bad'>窗口内无终态 job，但有 "
+            f"{total_open} 个回合在飞（在飞 {pool_inflight} / 排队 {pool_pending}）"
+            "——可能是卡死，不是「当天没数据」。</div>"
+        )
+
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Runtime 健康 · Feedling Data Track</title>
+  <style>{_RUNTIME_PAGE_CSS}</style>
+</head>
+<body>
+<main>
+  <h1>Runtime 健康</h1>
+  <div class="muted">Generated {html.escape(_bj_iso(payload.get("generated_at")))}. Metadata only; encrypted content is not read or rendered.</div>
+  <h2>总体结论：<span class="{level_cls}">{html.escape(level_text)}</span></h2>
+  <div class="muted">窗口 {window_hours} 小时{reason_text}</div>
+  <div class="sortbar">{window_links}</div>
+  {_render_data_track_view_nav("runtime")}
+  <div class="note-box">
+    <b>口径分工：</b>本页是<b>运行时视角</b>——按 job 生命周期统计，窗口可切。
+    「<b>Proactive 日报</b>」是产品视角——按天统计日报送达率。
+    heartbeat lane 两页都会出现，但口径不同，别直接对数。
+    分母一律从 agent_jobs 起算，因此「完全没写 metrics」的回合不会从统计里消失。
+    延迟只算成功回合：失败超时会把 p95 拉高，混在一起会让一个故障看起来像两个。
+  </div>
+  {empty_note}
+  <h2>Worker 池</h2>
+  <section class="metrics">{pool_metrics}</section>
+  <h2>各 lane 健康</h2>
+  <table>
+    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>失败</th><th>过期</th><th>superseded</th><th>失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 完整/部分/漏写/在飞</th></tr></thead>
+    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='10' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
+  </table>
+  <h2>失败原因 Top</h2>
+  <table>
+    <thead><tr><th>Lane</th><th>失败码</th><th>次数</th></tr></thead>
+    <tbody>{''.join(failure_rows) if failure_rows else "<tr><td colspan='3' class='muted'>当前窗口无失败。</td></tr>"}</tbody>
+  </table>
+  <div class="muted">失败码只是分类，不含上游细节。<b>上游原始错</b>（403 余额不足 / 429 / 超时）
+  留在加密 trajectory 里，需走 default-off 的 break-glass trajectory inspector 查看，
+  且每次访问都会写审计。本页只有 metadata。</div>
+</main>
+</body>
+</html>"""
+
+
+def _render_runtime_health_error_page() -> str:
+    """数据取不到时的降级页：保留 nav，不外泄异常细节。"""
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Runtime 健康 · Feedling Data Track</title>
+  <style>{_RUNTIME_PAGE_CSS}</style>
+</head>
+<body>
+<main>
+  <h1>Runtime 健康</h1>
+  {_render_data_track_view_nav("runtime")}
+  <div class="note-box">
+    <b>Runtime 健康数据暂时取不到。</b>
+    多半是数据库连接池或 V2 表访问出了问题——这本身就是一个值得查的信号。
+    其他视图不受影响，可继续使用上面的导航。具体异常见后端日志。
+  </div>
+</main>
+</body>
+</html>"""
+
+
 def _render_admin_login_page(error: bool = False, next_url: str = "/admin/data-track") -> str:
     """Password-gate login page for the admin dashboard. Posts to /admin/login,
     which validates FEEDLING_ADMIN_PASSWORD and sets the signed admin_session
@@ -2313,6 +2674,7 @@ def _render_data_track_view_nav(active: str) -> str:
         f"{nav_item('growth', '增长 & 留存')}"
         f"{nav_item('proactive', 'Proactive 日报')}"
         f"{nav_item('events', '事件健康度')}"
+        f"{nav_item('runtime', 'Runtime 健康')}"
         f"{nav_item('debug', 'Debug')}"
         "</div>"
     )
