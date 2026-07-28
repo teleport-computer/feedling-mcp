@@ -560,11 +560,17 @@ def test_app_close_ignores_a_non_current_app(env):
 
 
 def test_app_close_matches_app_name_case_insensitively(env):
-    """快捷指令里用户手填的 app 名大小写/空格不稳定。"""
+    """快捷指令里用户手填的 app 名大小写/空格不稳定。
+
+    匹配必须大小写无关，但**存下来的名字仍是 open 记的那个拼写** —— agent 复述
+    时看到的是 "Instagram"，不该因为用户在关闭那条自动化里打成小写而变样。
+    """
     fake, _ = env
     service.app_open(UID, "Instagram", category="social", client_ts=1000.0)
     service.app_close(UID, "  instagram ", client_ts=1600.0)
-    assert fake.get_state(UID)["app_state"]["v"] == "closed"
+    state = fake.get_state(UID)
+    assert state["app_state"]["v"] == "closed"
+    assert state["app_name"]["v"] == "Instagram"
 
 
 def test_app_close_keeps_category_when_not_supplied(env):
