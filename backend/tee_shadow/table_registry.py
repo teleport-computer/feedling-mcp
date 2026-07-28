@@ -182,3 +182,20 @@ def synced_tables() -> tuple[str, ...]:
 # 放在这里而不是散落在调度器里，是为了让"CIPHERTEXT 通道要跑哪些东西"仍然只有一个出处。
 # 它刻意不进 REGISTRY，因此不受完备性守卫约束（守卫比的是真实表名）。
 PSEUDO_CIPHERTEXT_TABLES: tuple[str, ...] = ("identity",)
+
+
+# CIPHERTEXT lane 里会被**原地 UPDATE** 的表。
+#
+# 这条清单存在的理由：CIPHERTEXT lane 是 append-only 游标模型，游标永不回头，所以
+# 原地改写的行必须由写侧显式 mirror.mark_pending(..., "requeue") 打标记，replicator
+# 下一趟才会按 PK 重新拉取。漏打标记不会有任何报错或红灯——TEE 侧只是永久停在首次
+# 复制时的状态，数据悄悄陈旧。
+#
+# tests/test_tee_requeue_coverage.py 守着这条清单与实际 mark_pending 调用的一致性。
+# 给 CIPHERTEXT lane 加了会被 UPDATE 的表时，登记到这里并在写点补上 mark_pending。
+MUTABLE_CIPHERTEXT_TABLES: tuple[str, ...] = (
+    "model_api_credentials",
+    "v2_conversation_summary",
+    "v2_trajectory_reviews",
+    "v2_workspace_entries",
+)

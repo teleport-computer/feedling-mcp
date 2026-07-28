@@ -290,7 +290,7 @@ def _recover_review_runner_on_cursor(cur, runner_job_id: int | str) -> None:
         "finished_at=CASE WHEN r.attempt_count<%s THEN NULL ELSE now() END "
         "FROM agent_jobs j WHERE j.id=%s AND j.lane=%s "
         "AND r.claimed_by_job_id=j.id AND r.status='running' "
-        "RETURNING r.user_id",
+        "RETURNING r.user_id, r.source_job_id",
         (
             _TRAJECTORY_REVIEW_MAX_ATTEMPTS,
             _TRAJECTORY_REVIEW_MAX_ATTEMPTS,
@@ -300,9 +300,23 @@ def _recover_review_runner_on_cursor(cur, runner_job_id: int | str) -> None:
         ),
     )
     rows = cur.fetchall()
-    for row in rows:
-        user_id = row["user_id"] if isinstance(row, dict) else row[0]
-        _ensure_review_runner_on_cursor(cur, str(user_id))
+    if rows:
+        # Same-PK in-place rewrite (running -> pending/failed release) — the
+        # append-only replicator cursor never revisits it. This helper shares
+        # one cursor with three different outer transactions (mark_failed/
+        # mark_expired/reap_stuck_job_rows); marking here rather than
+        # threading the affected-row set back through each caller's own
+        # post-commit tail is safe because mark_pending only ever causes the
+        # requeue lane to re-fetch whatever the RDS row *currently* holds —
+        # if this transaction later rolled back, the requeue would just
+        # re-copy the unchanged prior state, a harmless no-op.
+        from tee_shadow import mirror
+        for row in rows:
+            user_id = row["user_id"] if isinstance(row, dict) else row[0]
+            source_job_id = row["source_job_id"] if isinstance(row, dict) else row[1]
+            mirror.mark_pending(
+                str(user_id), "v2_trajectory_reviews", str(source_job_id), "requeue")
+            _ensure_review_runner_on_cursor(cur, str(user_id))
 
 
 def reconcile_failure_review_runners(*, limit: int = 64) -> int:
@@ -3805,6 +3819,8 @@ def upsert_summary_row_cas(
     ``COALESCE`` 保留该行原有的 watermark_seq（不清零、不误伤未真正推进
     seq 的调用方）；INSERT 分支没有旧值可留，落 0（与迁移 0031 的列默认值
     一致）。"""
+    is_cas_update = int(expected_version) != 0
+    success = False
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
@@ -3852,7 +3868,16 @@ def upsert_summary_row_cas(
                             int(expected_version),
                         ),
                     )
-                return cur.rowcount == 1
+                success = cur.rowcount == 1
+    if success and is_cas_update:
+        # Same-PK in-place rewrite (the row already existed, this CAS just
+        # advanced its version) — the append-only replicator cursor never
+        # revisits it. The INSERT branch above (expected_version==0, first
+        # creation) needs no requeue: it is a brand-new PK the forward cursor
+        # scan will pick up normally.
+        from tee_shadow import mirror
+        mirror.mark_pending(str(user_id), "v2_conversation_summary", str(user_id), "requeue")
+    return success
 
 
 def get_summary_frontier_state(user_id) -> dict | None:
@@ -3997,6 +4022,7 @@ def append_summary_leaf_cas(
         raise ValueError("invalid summary leaf metadata")
     if previous and start <= previous:
         raise ValueError("summary leaf does not advance the watermark")
+    is_head_update = False
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
@@ -4109,6 +4135,7 @@ def append_summary_leaf_cas(
                         ),
                     )
                 else:
+                    is_head_update = True
                     cur.execute(
                         "UPDATE v2_conversation_summary SET summary_envelope=%s,"
                         "watermark_ts=%s,watermark_seq=%s,version=version+1,"
@@ -4125,7 +4152,14 @@ def append_summary_leaf_cas(
                     )
                     if cur.rowcount != 1:
                         raise RuntimeError("summary head lock lost")
-                return True
+    if is_head_update:
+        # Same-PK in-place rewrite of the existing summary head row — the
+        # append-only replicator cursor never revisits it. The head-is-None
+        # branch above is a brand-new PK the forward cursor scan picks up
+        # normally, no requeue needed.
+        from tee_shadow import mirror
+        mirror.mark_pending(str(user_id), "v2_conversation_summary", str(user_id), "requeue")
+    return True
 
 
 def seed_legacy_summary_segment(
@@ -4205,7 +4239,12 @@ def seed_legacy_summary_segment(
                 )
                 if cur.rowcount != 1:
                     raise RuntimeError("legacy summary seed CAS lost")
-                return True
+    # Same-PK in-place rewrite of the existing summary head row (this function
+    # only ever reaches here when `head` already existed) — the append-only
+    # replicator cursor never revisits it.
+    from tee_shadow import mirror
+    mirror.mark_pending(str(user_id), "v2_conversation_summary", str(user_id), "requeue")
+    return True
 
 
 def insert_summary_checkpoint(
@@ -4415,7 +4454,12 @@ def insert_summary_checkpoint(
                 )
                 if cur.rowcount != 1:
                     raise RuntimeError("summary head checkpoint CAS lost")
-                return True
+    # Same-PK in-place rewrite of the existing summary head row (head must
+    # already exist for this function to reach here) — the append-only
+    # replicator cursor never revisits it.
+    from tee_shadow import mirror
+    mirror.mark_pending(str(user_id), "v2_conversation_summary", str(user_id), "requeue")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -4524,6 +4568,8 @@ def put_workspace_entry_cas(
     """
     if type(expected_revision) is not int or expected_revision < 0:
         raise ValueError("expected_revision must be a non-negative integer")
+    is_rewrite = False
+    result: dict | None = None
     try:
         with _pool().connection() as conn:
             with conn.transaction():
@@ -4562,6 +4608,7 @@ def put_workspace_entry_cas(
                             ),
                         )
                     else:
+                        is_rewrite = True
                         cur.execute(
                             "UPDATE v2_workspace_entries SET kind=%s,content_envelope=%s,"
                             "mime_type=%s,source_ref=%s,revision=revision+1,updated_at=now() "
@@ -4578,11 +4625,19 @@ def put_workspace_entry_cas(
                             ),
                         )
                     row = cur.fetchone()
-                    return dict(row) if row is not None else None
+                    result = dict(row) if row is not None else None
     except psycopg.errors.UniqueViolation:
         # Concurrent revision-0 creators: one wins; the loser observes a clean
         # conflict rather than surfacing a database exception to the model.
         return None
+    if result is not None and is_rewrite:
+        # Same-PK (user_id,path) in-place rewrite — the append-only replicator
+        # cursor never revisits it. The INSERT branch (current is None, first
+        # write at revision 0) needs no requeue: brand-new PK, forward cursor
+        # scan picks it up normally.
+        from tee_shadow import mirror
+        mirror.mark_pending(str(user_id), "v2_workspace_entries", str(path), "requeue")
+    return result
 
 
 def delete_workspace_entry_cas(
@@ -4662,6 +4717,7 @@ def append_trajectory_events_batch(
     """
     if not isinstance(events, list) or not 1 <= len(events) <= 4096:
         raise ValueError("invalid trajectory event batch")
+    reopened_review = False
     normalized: list[dict] = []
     seen_keys: set[str] = set()
     for event in events:
@@ -4808,9 +4864,16 @@ def append_trajectory_events_batch(
                             str(user_id),
                         ),
                     )
-                    if admitted and cur.rowcount:
+                    reopened_review = bool(cur.rowcount)
+                    if admitted and reopened_review:
                         _ensure_review_runner_on_cursor(cur, str(user_id))
-                return event_indices
+    if reopened_review:
+        # Same-PK in-place rewrite of the completed review row (reopened back
+        # to pending/failed) — the append-only replicator cursor never
+        # revisits it.
+        from tee_shadow import mirror
+        mirror.mark_pending(str(user_id), "v2_trajectory_reviews", str(job_id), "requeue")
+    return event_indices
 
 
 def append_trajectory_event(
@@ -5136,7 +5199,12 @@ def claim_failure_review(
                     "WHERE source_job_id=%s RETURNING *",
                     (runner_job_id, source_job_id),
                 )
-                return dict(cur.fetchone())
+                claimed = dict(cur.fetchone())
+    # Same-PK in-place rewrite (pending -> running claim) — the append-only
+    # replicator cursor never revisits it.
+    from tee_shadow import mirror
+    mirror.mark_pending(str(user_id), "v2_trajectory_reviews", str(source_job_id), "requeue")
+    return claimed
 
 
 def finish_failure_review(
@@ -5252,11 +5320,15 @@ def finish_failure_review(
                 if cur.rowcount != 1:
                     raise RuntimeError("trajectory review runner ownership lost")
                 _ensure_review_runner_on_cursor(cur, str(user_id))
-                return {
-                    "settled": True,
-                    "review_status": review_status,
-                    "frontier_advanced": frontier_advanced,
-                }
+    # Same-PK in-place rewrite (running -> completed/pending/failed settle) —
+    # the append-only replicator cursor never revisits it.
+    from tee_shadow import mirror
+    mirror.mark_pending(str(user_id), "v2_trajectory_reviews", str(source_job_id), "requeue")
+    return {
+        "settled": True,
+        "review_status": review_status,
+        "frontier_advanced": frontier_advanced,
+    }
 
 
 def finish_empty_failure_review_runner(

@@ -633,9 +633,12 @@ def _model_api_credentials_unpack(r: tuple) -> tuple:
     item_id 是 id（uuid 本身单列全局唯一，不需要复合）。
 
     sort_val 是 updated_at：db.model_api_credential_update 的每一条 UPDATE 分支
-    都硬编码 "updated_at = now()"（backend/db.py:8566 起验证），从不会出现
-    "改了内容但 updated_at 没动"的情况，所以这张表天然是追加友好的——不像
-    memory/world_book 那样需要 requeue 兜底原地改写。
+    都硬编码 "updated_at = now()"（backend/db.py 验证过），但这只保证"改了内容
+    updated_at 一定跟着动"，不保证"游标一定能追上"——并发写下，晚提交但更早
+    拿到 now() 的事务可能被别的写入推过的水位线永久跳过，是时间戳型 CDC 游标的
+    通病（chat_messages 自己都不敢只靠这一点）。db.model_api_credential_update
+    已接 mirror.mark_pending(..., "model_api_credentials", ...) requeue 兜底
+    （2026-07-28，与 memory/world_book 同一套机制）。
     """
     (cred_id, uid, provider, label, base_url, envelope, api_key_hint,
      supports_responses, created_at, updated_at) = r
@@ -676,9 +679,16 @@ _TABLES["model_api_credentials"] = _Table(
                 "updated_at=EXCLUDED.updated_at"),
     unpack=_model_api_credentials_unpack,
     upsert_args=_model_api_credentials_upsert_args,
-    # updated_at 全覆盖（见 unpack 文档），不需要 requeue。
-    requeue_fetch_sql=None,
-    requeue_delete_tee_sql=None,
+    # 2026-07-28 修正：unpack 文档原先论证 updated_at 全覆盖故不需要 requeue——
+    # 这个论证只在"没有并发写"的理想情况下成立（时间戳游标下，晚提交但更早
+    # 拿到 now() 的事务可能被并发写推过的水位线永久跳过，是时间戳型 CDC 游标的
+    # 通病，chat_messages 自己都不敢只靠这一点，见 worker.py:172 起的注释）。
+    # model_api_credential_update（db.py）已接 mirror.mark_pending 兜底。
+    requeue_fetch_sql=("SELECT id, user_id, provider, label, base_url, "
+                       "api_key_envelope, api_key_hint, supports_responses, "
+                       "created_at, updated_at FROM model_api_credentials "
+                       "WHERE user_id = %s AND id = %s"),
+    requeue_delete_tee_sql="DELETE FROM model_api_credentials WHERE user_id = %s AND id = %s",
     # 冷启动：updated_at 是 TIMESTAMPTZ，"-infinity" 合法；id 是 UUID（WHERE 里
     # 没有 ::text 转型），空串不是合法 uuid，用全零 nil UUID 当下界（Postgres 按
     # 128 位整数比较 uuid，全零是可能的最小值）。
@@ -735,10 +745,15 @@ _TABLES["v2_conversation_summary"] = _Table(
                 "materialized_segment_ids=EXCLUDED.materialized_segment_ids"),
     unpack=_summary_unpack,
     upsert_args=_summary_upsert_args,
-    # 每条 UPDATE 都带 updated_at=now()（jobs_store.py 四处写路径逐一核对过），
-    # 不需要 requeue。
-    requeue_fetch_sql=None,
-    requeue_delete_tee_sql=None,
+    # 2026-07-28 修正：原注释"每条 UPDATE 都带 updated_at=now()，不需要 requeue"
+    # 只在无并发写时成立，见 model_api_credentials 同日修正的同一条理由。
+    # jobs_store.py 四处 CAS UPDATE 已接 mirror.mark_pending 兜底。PK 是单列
+    # user_id（一行/用户），按 user_id 取回即可，不需要复合 item_id。
+    requeue_fetch_sql=("SELECT user_id, summary_envelope, watermark_ts, version, "
+                       "updated_at, watermark_seq, materialized_segment_ids "
+                       "FROM v2_conversation_summary WHERE user_id = %s"),
+    requeue_delete_tee_sql="DELETE FROM v2_conversation_summary WHERE user_id = %s",
+    requeue_by_user_only=True,
     # 冷启动：updated_at 是 TIMESTAMPTZ，"-infinity" 合法；第二列是 user_id
     # （TEXT），空串本身合法且排在任何真实 user_id（都以 "usr_" 开头，非空）之前。
     cursor_zero=("-infinity", ""),
@@ -823,16 +838,13 @@ _TABLES["v2_conversation_summary_segments"] = _Table(
 
 
 # ---- v2_trajectory_reviews：PK 单列 source_job_id，review_envelope 可为 NULL
-# （审阅还没跑）。⚠️ 已知缺口：这张表没有 updated_at 之类的列，status/
-# review_envelope/claimed_by_job_id 等字段在创建之后由 jobs_store.py 多处 UPDATE
-# 原地改写（例如 "UPDATE v2_trajectory_reviews SET status=%s,...review_envelope=%s..."），
-# 但全仓搜索 mirror.mark_pending(..., "v2_trajectory_reviews", ...) 零命中——也就
-# 是说 requeue lane 的写侧标记从未被接上。下面仍按标准 requeue 形状把
-# requeue_fetch_sql/requeue_delete_tee_sql 配好（防御性、与其余表接口一致，一旦
-# 未来给 jobs_store.py 补上 mark_pending 调用就能直接生效），但**在双写补上之前，
-# 这张表的审阅完成态（status 变化、review_envelope 填充）不会被复制进 TEE**——
-# 游标只会看到创建时刻的初始行（status='pending', review_envelope=NULL）。
-# 已在 task-7-report.md 里向协调者/用户报告，不在本次任务范围内自行接双写。
+# （审阅还没跑）。这张表没有 updated_at 之类的列，status/review_envelope/
+# claimed_by_job_id 等字段在创建之后由 jobs_store.py/db.py 多处 UPDATE 原地改写，
+# 单靠 created_at 排序的追加游标永远看不到这些改写。requeue_fetch_sql/
+# requeue_delete_tee_sql 配好之后（Task 7 防御性接的），写侧的
+# mirror.mark_pending(..., "v2_trajectory_reviews", ...) 双写已在 Task 9 补上
+# （db.py:chat_clear + jobs_store.py 的 claim/finish/reopen/recover 各处 UPDATE），
+# 两半齐了这张表才真正吃到 requeue 补偿。
 def _trajectory_reviews_unpack(r: tuple) -> tuple:
     (uid, source_job_id, status, attempt_count, claimed_by_job_id, envelope,
      last_error, created_at, started_at, finished_at) = r
@@ -936,10 +948,17 @@ _TABLES["v2_workspace_entries"] = _Table(
                 "revision=EXCLUDED.revision, updated_at=EXCLUDED.updated_at"),
     unpack=_workspace_entries_unpack,
     upsert_args=_workspace_entries_upsert_args,
-    # revision UPDATE 分支硬编码 updated_at=now()（jobs_store.py 验证过），追加
-    # 友好，不需要 requeue。
-    requeue_fetch_sql=None,
-    requeue_delete_tee_sql=None,
+    # 2026-07-28 修正：原注释"revision UPDATE 分支硬编码 updated_at=now()，追加
+    # 友好，不需要 requeue"只在无并发写时成立，见 model_api_credentials 同日
+    # 修正的同一条理由。jobs_store.py:put_workspace_entry_cas 的 UPDATE 分支已接
+    # mirror.mark_pending 兜底。PK 是 (user_id, path)：requeue 的 pending 行已经
+    # 单独带 user_id 列，item_id 只需存裸 path（不需要 unpack 那种 user_id+path
+    # 复合键——那是给全局游标 tie-break 用的，跟这里按 (user_id, path) 两列做
+    # WHERE 是两回事）。
+    requeue_fetch_sql=("SELECT user_id, path, kind, content_envelope, mime_type, "
+                       "source_ref, revision, created_at, updated_at "
+                       "FROM v2_workspace_entries WHERE user_id = %s AND path = %s"),
+    requeue_delete_tee_sql="DELETE FROM v2_workspace_entries WHERE user_id = %s AND path = %s",
     # 冷启动：updated_at 是 TIMESTAMPTZ，"-infinity" 合法；第二列在 SQL 里已经
     # 用 || 拼成字符串，空串本身就是合法 TEXT 且排在任何非空拼接结果之前。
     cursor_zero=("-infinity", ""),
