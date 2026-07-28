@@ -93,6 +93,29 @@ def test_head_in_reasoning_multicut_join_fails_but_head_recognizable():
     assert pl.is_leak(ev)
 
 
+def test_reasoning_quoting_schema_does_not_upgrade_weak_visible(monkeypatch=None):
+    """Codex code-review #4: a reasoning model may QUOTE a closed protocol snippet
+    while thinking. That must NOT upgrade a weak JSON-like visible reply (a user
+    discussing config) to strong HEAD_IN_REASONING evidence — foreground would
+    then eat a real message. Only an UNCLOSED head dangling at the end of the
+    reasoning counts."""
+    reasoning = 'The protocol has {"actions": [...]} but this user asks about config.'
+    visible = '删掉多余的 }，把 "port": 8080 改成 8081'
+    ev = pl.classify(visible, reasoning_text=reasoning)
+    assert ev != pl.HEAD_IN_REASONING
+    assert not pl.is_strong(ev)
+    assert not pl.should_suppress(ev, lane="foreground")
+
+
+def test_unclosed_head_at_end_of_reasoning_is_strong():
+    """The genuine tear: reasoning ENDS mid-envelope (net-open brackets)."""
+    reasoning = 'weighing whether to wake her… {"messages":[],"actions":[{"type":"pro'
+    visible = 'active.sleep","reason":"7点了 还在睡"}]}'
+    assert pl.classify(visible, reasoning_text=reasoning) in (
+        pl.JOINED_KNOWN_PROTOCOL, pl.HEAD_IN_REASONING,
+    )
+
+
 def test_transport_cut_plus_jsonish_tail():
     # No reasoning head available, but the transport itself reported a cut and the
     # visible text is a JSON-ish fragment -> independent proof the pipe broke.

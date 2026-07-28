@@ -6863,34 +6863,63 @@ def _suppress_torn_protocol_leaks(turn: "AgentTurn", *, lane: str) -> None:
     summary keep an otherwise-empty turn looking 'valid', which would make a
     foreground turn silently vanish instead of surfacing the honest fallback.
     """
-    if not turn.messages:
-        return
     policy = _leak_lane_policy(lane)
     reasoning = turn.thinking_summary or ""
-    kept: list[str] = []
     reasoning_implicated = False
-    for msg in turn.messages:
-        evidence = _protocol_leak.classify(msg, reasoning_text=reasoning)
-        if _protocol_leak.should_suppress(evidence, lane=policy):
-            log.warning(
-                "torn protocol fragment dropped lane=%s evidence=%s frag=%r",
-                lane, evidence, str(msg)[:48],
-            )
-            if evidence in (
-                _protocol_leak.JOINED_KNOWN_PROTOCOL,
-                _protocol_leak.HEAD_IN_REASONING,
-            ):
-                reasoning_implicated = True
-            continue
-        kept.append(msg)
-    if len(kept) == len(turn.messages):
+    changed = False
+
+    def _is_leak(text: Any) -> bool:
+        nonlocal reasoning_implicated
+        evidence = _protocol_leak.classify(text, reasoning_text=reasoning)
+        if not _protocol_leak.should_suppress(evidence, lane=policy):
+            return False
+        if evidence in (
+            _protocol_leak.JOINED_KNOWN_PROTOCOL,
+            _protocol_leak.HEAD_IN_REASONING,
+        ):
+            reasoning_implicated = True
+        log.warning(
+            "torn protocol fragment dropped lane=%s evidence=%s frag=%r",
+            lane, evidence, str(text)[:48],
+        )
+        return True
+
+    if turn.messages:
+        kept = [m for m in turn.messages if not _is_leak(m)]
+        if len(kept) != len(turn.messages):
+            turn.messages = kept
+            changed = True
+
+    # Action-derived send_message text is a SECOND visible exit: the proactive
+    # lane turns a `send_message` action into a bubble via
+    # _send_message_replies_from_actions, bypassing the message scan above
+    # (Codex code-review #3). Drop torn ones here too.
+    if turn.actions:
+        kept_actions: list[dict] = []
+        for action in turn.actions:
+            if isinstance(action, dict) and _proactive_action_type(
+                action
+            ).removeprefix("proactive.") == "send_message":
+                text = str(action.get("text") or action.get("message") or "").strip()
+                if text and _is_leak(text):
+                    changed = True
+                    continue
+            kept_actions.append(action)
+        turn.actions = kept_actions
+
+    if not changed:
         return  # nothing suppressed — leave the turn (and normal path) untouched
-    turn.messages = kept
+
     # Clear reasoning when the head itself was torn (garbage, never real
     # reasoning) or when nothing user-facing survives (so the turn reads as
     # cleanly empty and the existing fallback path in call_agent fires: fore-
     # ground -> FALLBACK_REPLY, proactive -> recorded parse-failed, never silent).
-    if reasoning_implicated or not turn.messages:
+    has_visible = bool(turn.messages) or any(
+        isinstance(a, dict)
+        and _proactive_action_type(a).removeprefix("proactive.") == "send_message"
+        for a in turn.actions
+    )
+    if reasoning_implicated or not has_visible:
         turn.thinking_summary = ""
         turn.thinking_kind = ""
         turn.thinking_source = ""

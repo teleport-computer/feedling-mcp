@@ -455,6 +455,46 @@ def test_foreground_keeps_user_json_talk_without_reasoning(monkeypatch):
     assert [b["body_ct"] for b in _bubbles(uid)] == [user_json_talk]
 
 
+def test_chat_intermediate_reply_tool_tail_with_reasoning_suppressed(monkeypatch):
+    """Codex code-review #1: an intermediate `reply` tool call carrying a torn
+    tail, with the head in the round's reasoning, must not produce a leaked
+    bubble. The reasoning is now passed to the intermediate sink so the chat lane
+    sees STRONG evidence; the following real terminal reply still lands."""
+    uid = "u_toolloop_torn_intermediate"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-torn-mid")
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda action_type, store, **kwargs: _FakeCapResult({"snippet": "r"}),
+    )
+    _patch_real_write(monkeypatch)
+    _script_provider(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [_tc("r1", "reply", text=_TORN_TAIL)],
+                "reasoning": _TORN_HEAD,
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+            _text_round("在的，怎么了"),
+        ],
+    )
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}])
+
+    status = asyncio.run(
+        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
+    )
+
+    assert status == "completed"
+    bubbles = [b["body_ct"] for b in _bubbles(uid)]
+    assert _TORN_TAIL not in bubbles
+    assert bubbles == ["在的，怎么了"]
+
+
 def test_torn_protocol_evidence_lane_policy():
     """Pure-unit: the worker's lane-policy helper. Proactive suppresses any leak;
     foreground only strong cross-channel evidence."""

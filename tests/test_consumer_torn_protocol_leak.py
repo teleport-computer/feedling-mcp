@@ -104,3 +104,39 @@ def test_empty_turn_is_noop():
     t = _turn([], thinking="")
     crc._suppress_torn_protocol_leaks(t, lane="chat")
     assert t.messages == []
+
+
+# ---------------------------------------------------------------------------
+# Action-derived send_message is a second visible exit (Codex code-review #3):
+# the proactive lane renders a send_message action into a bubble, bypassing the
+# message scan. Torn tails there must be dropped too.
+# ---------------------------------------------------------------------------
+
+def test_action_derived_send_message_tail_is_dropped():
+    t = crc.AgentTurn()
+    t.messages = []
+    t.actions = [{"type": "send_message", "text": TAIL}]
+    t.thinking_summary = HEAD
+    crc._suppress_torn_protocol_leaks(t, lane="background")
+    assert crc._send_message_replies_from_actions(t.actions) == []
+    assert t.thinking_summary == ""  # torn head cleared
+
+
+def test_action_derived_real_send_message_survives():
+    t = crc.AgentTurn()
+    t.messages = []
+    t.actions = [{"type": "send_message", "text": "宝贝早上好呀"}]
+    crc._suppress_torn_protocol_leaks(t, lane="background")
+    assert crc._send_message_replies_from_actions(t.actions) == ["宝贝早上好呀"]
+
+
+def test_sleep_action_untouched_when_message_dropped():
+    # A leaked message alongside a genuine sleep action: drop the message, keep
+    # the sleep (proactive stays quiet, not a parse failure).
+    t = crc.AgentTurn()
+    t.messages = [TAIL]
+    t.actions = [{"type": "sleep", "reason": "resting"}]
+    t.thinking_summary = HEAD
+    crc._suppress_torn_protocol_leaks(t, lane="background")
+    assert t.messages == []
+    assert t.actions == [{"type": "sleep", "reason": "resting"}]

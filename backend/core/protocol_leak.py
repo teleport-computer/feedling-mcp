@@ -98,13 +98,41 @@ def is_orphan_json_tail(text: Any) -> bool:
 
 def looks_like_protocol_head(text: Any) -> bool:
     """Structural evidence of a protocol payload's HEAD: a protocol key in a JSON
-    key position, or an identity/memory/proactive typed action. Used on the
-    reasoning channel (model-authored thinking), where a match is a reliable
-    fingerprint of a torn envelope."""
+    key position, or an identity/memory/proactive typed action."""
     t = str(text or "")
     if not (_HEAD_KEY_RE.search(t) or _HEAD_TYPED_RE.search(t)):
         return False
     return "{" in t or "[" in t
+
+
+def _naive_end_depth(text: str) -> int:
+    """String-ignoring bracket balance over the whole string. > 0 means the text
+    ends with more opens than closes — i.e. an unclosed structure dangling at the
+    end."""
+    depth = 0
+    for ch in text:
+        if ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+    return depth
+
+
+def reasoning_ends_with_unclosed_head(text: Any) -> bool:
+    """A torn protocol head left in the reasoning channel: the reasoning ENDS with
+    an unclosed protocol structure (net-open brackets) that carries a protocol
+    key/typed token.
+
+    This is the precise fingerprint of a relay tear — the head is the dangling,
+    never-closed suffix of the reasoning stream. It deliberately does NOT match a
+    model that merely *quotes* a closed protocol snippet mid-thought
+    (`the schema is {"actions": [...]} but ...`): that balances to a non-positive
+    depth, so a normal reasoning model discussing the schema cannot upgrade a
+    weak visible fragment to strong evidence (Codex code-review #4)."""
+    t = str(text or "")
+    if _naive_end_depth(t) <= 0:
+        return False
+    return looks_like_protocol_head(t)
 
 
 def _is_supported_action(action: Any) -> bool:
@@ -167,7 +195,7 @@ def classify(visible_text: Any, *, reasoning_text: Any = "", transport_cut: bool
     r = str(reasoning_text or "")
     if r and _rejoins_to_protocol(r, v):
         return JOINED_KNOWN_PROTOCOL
-    if r and looks_like_protocol_head(r) and _visible_is_fragmentish(v):
+    if r and reasoning_ends_with_unclosed_head(r) and _visible_is_fragmentish(v):
         return HEAD_IN_REASONING
     if transport_cut and _visible_is_fragmentish(v):
         return TRANSPORT_CUT
