@@ -66,10 +66,21 @@ def probe_table(dsn: str, table: str, column: str, limit: int) -> Counter:
             tally["ok"] += 1
         except transforms.PendingDeviceMigration:
             tally["pending_device"] += 1
-        except transforms.PermanentDecryptFailure:
-            tally["permanent_fail"] += 1
         except Exception as exc:  # noqa: BLE001
-            tally[f"other:{type(exc).__name__}"] += 1
+            # transforms.plaintext_chat_doc / plaintext_envelope_column 从不自己
+            # raise PermanentDecryptFailure——那个重分类只发生在 worker._transform_
+            # with_retry（真实 replicate 主循环）里：裸 decrypt() 失败先抛
+            # RuntimeError("enclave_http_403:...decrypt_failed...")，
+            # _transform_with_retry 用 _is_permanent_decrypt_failure 判定后才转成
+            # PermanentDecryptFailure。探针不经过 _TABLES/_transform_with_retry
+            # （这 7 张表还没接线），所以必须在这里直接复用同一个判定函数，否则
+            # enclave 确定性拒解会和网络抖动一起落进 other:*——这两类处置相反
+            # （前者是毒行、该表要回退成密文原样搬；后者重试就好），混在一起
+            # gate 就问不出正确结论。
+            if worker._is_permanent_decrypt_failure(exc):
+                tally["permanent_fail"] += 1
+            else:
+                tally[f"other:{type(exc).__name__}"] += 1
     return tally
 
 
