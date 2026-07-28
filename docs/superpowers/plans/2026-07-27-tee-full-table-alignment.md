@@ -2572,3 +2572,112 @@ MUTABLE_CIPHERTEXT_TABLES: tuple[str, ...] = (
 
 1. **`reconcile_ok` 长期 false + `requeue_backlog` 增长**（2026-07-27 prod 实测 717 → 776 → 3028，单趟 reconcile 耗时 11 分钟）。这是上游 plan 的 Phase 0 Task 0.2。本计划给 tick 增加了 snapshot 段（虽然便宜），建议紧接着处理这个慢性病。实施期间每个 Task 的 prod 验收都要顺带记一次 `requeue_backlog`，观察趋势有没有被本计划恶化。
 2. **PG 逻辑复制（`LOGICAL` lane）**。需要把 RDS 的 `rds.logical_replication` 改为 on 并重启实例（静态参数），属独立运维窗口。通道打通后，把 SNAPSHOT lane 的表逐张改判为 LOGICAL 即可——注册表就是为这个切换而设计的。
+
+---
+
+## Task 10: SNAPSHOT 列漂移容错（2026-07-28 test 实测暴露）
+
+**为什么加这个 Task**：Task 8 部署到 test 后，27 张 SNAPSHOT 表先是全部 `permission
+denied`（`TRUNCATE` 是 PG 里独立于 DML 四件套的权限，`ensure-roles.sh` 从没授过，已在
+Task 8 收尾修掉）；补授权后剩 3 张仍失败，错误是 `row field count is 15, expected 14`。
+
+根因不是那三张表，而是 `snapshot_table` 用 `COPY <table> TO/FROM STDIN (FORMAT BINARY)`
+——**按列位置严格匹配整表**。只要 RDS 与 TEE 的列集有任何差异，那张表就**永久**同步
+失败。实测差异有两种来源，都不是一次性修列能解决的：
+
+1. **滚动部署的时间窗**：0059/0060/0061 给 `v2_turn_metrics` / `v2_wake_schedule` 加了
+   列，07-27 派生 DDL 时是从 prod 取的，而 test RDS 跑在前面 → TEE 少 10 列。
+2. **环境自身的历史残留**：test RDS 的 `model_api_routes.thinking_fallback` 全仓零命中
+   （没有任何代码创建它），是某次废弃迁移留下的。TEE 侧反而是与代码一致的那个。
+
+⇒ 只要 RDS 侧还会加列（它必然会），严格位置匹配就会周期性地把整张表打死。
+
+**Files:**
+- Modify: `backend/tee_shadow/snapshot.py`
+- Create: `backend/alembic_tee/versions/0005_snapshot_column_catchup.py`
+- Test: `tests/test_tee_snapshot.py`（增补）
+
+**Interfaces:**
+- Produces: `snapshot_table()` 的返回 dict 多出 `missing_in_tee` / `missing_in_rds` 两个键
+
+- [ ] **Step 1: 写失败测试**
+
+在 `tests/test_tee_snapshot.py` 追加两条（沿用文件里既有的建表/清理 fixture 写法）：
+
+```python
+def test_snapshot_survives_rds_only_column():
+    """RDS 多一列时，该表必须仍然同步（只是那列同步不过去并被报出来），
+    而不是整张表永久失败。真实来源：滚动部署窗口 + 环境历史残留列
+    （test RDS 的 model_api_routes.thinking_fallback 全仓零命中）。"""
+    # RDS 侧多一列 extra_col，TEE 侧没有
+    ...
+    rep = snapshot.snapshot_table("t_drift")
+    assert rep["ok"] is True
+    assert rep["rows"] == 2
+    assert rep["missing_in_tee"] == ["extra_col"]
+
+
+def test_snapshot_survives_tee_only_column():
+    """TEE 多一列时同样要能同步（该列留默认值/NULL），并报出来。
+    来源：alembic_tee 先于 RDS 迁移落地的窗口。"""
+    rep = snapshot.snapshot_table("t_drift2")
+    assert rep["ok"] is True
+    assert rep["missing_in_rds"] == ["tee_only_col"]
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+```bash
+python -m pytest tests/test_tee_snapshot.py -k drift -v
+```
+预期失败信息里出现 `row field count is N, expected M`。
+
+- [ ] **Step 3: 实现**
+
+`backend/tee_shadow/snapshot.py`。新增列集查询 + 改 `_stream_rows` / `snapshot_table`
+用**显式列名**而不是裸表名：
+
+```python
+def _columns(conn, table: str) -> list[str]:
+    rows = conn.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema='public' AND table_name=%s ORDER BY ordinal_position",
+        (table,)).fetchall()
+    return [r[0] for r in rows]
+```
+
+`snapshot_table` 里先取两侧列集，用交集做 COPY，两侧独有的列各自报出来：
+
+```python
+    # 为什么用交集而不是裸表名：COPY 的 BINARY 格式按列位置严格匹配，两侧列集
+    # 差一列就整表失败——而 RDS 侧加列是常态（滚动部署窗口、环境历史残留列）。
+    # 严格失败看起来"更安全"，实际后果是那张表永久不同步，而影子库的价值恰恰在
+    # 于持续跟进。交集 + 把差异逐列报进 missing_in_tee / missing_in_rds，既保住
+    # 同步、又让漂移可见（scheduler 会把它落进 tee_sync_runs.report）。
+    common = [c for c in rds_cols if c in set(tee_cols)]
+    rep["missing_in_tee"] = [c for c in rds_cols if c not in set(tee_cols)]
+    rep["missing_in_rds"] = [c for c in tee_cols if c not in set(rds_cols)]
+    if not common:
+        rep["error"] = "两侧无公共列，拒绝整表清空"   # 防止把 TEE 表清空后写不进任何东西
+        return rep
+```
+
+COPY 两侧都带列名：`COPY {table} ({cols}) TO STDOUT (FORMAT BINARY)` 与
+`COPY {table} ({cols}) FROM STDIN (FORMAT BINARY)`。
+
+⚠️ `missing_in_tee` 非空时要 `log.warning`——这是"TEE 落后于 RDS，有一列的数据没在
+同步"的信号，不能只躺在返回值里。
+
+- [ ] **Step 4: 迁移补齐真实缺的列**
+
+`backend/alembic_tee/versions/0005_snapshot_column_catchup.py`，`ADD COLUMN IF NOT EXISTS`
+补 0059/0060/0061 加的 10 列（`v2_turn_metrics` 3 列、`v2_wake_schedule` 7 列）。
+**不要**补 `model_api_routes.thinking_fallback`——那列全仓零命中，是 test RDS 的历史
+残留，TEE 不该跟着长歪；它由 Step 3 的交集逻辑消化（报进 `missing_in_tee`）。
+
+列定义从 `backend/alembic/versions/0059_*.py` / `0060_*.py` / `0061_*.py` 逐列照抄。
+
+- [ ] **Step 5: 跑全量 L1 + pyflakes**
+
+- [ ] **Step 6: commit**
+

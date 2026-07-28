@@ -142,6 +142,109 @@ def test_snapshot_all_continues_past_a_failing_table(monkeypatch):
     assert len(calls) == len(reg.tables_in_lane(reg.SNAPSHOT))
 
 
+@pytest.fixture
+def drift_table_rds_extra():
+    """RDS 侧比 TEE 侧多一列 extra_col。真实来源：滚动部署窗口（新列先落 RDS
+    后落 TEE）+ 环境历史残留列（test RDS 的 model_api_routes.thinking_fallback
+    全仓零命中）。"""
+    with db.get_pool().connection() as c:
+        c.execute("DROP TABLE IF EXISTS t_drift")
+        c.execute("CREATE TABLE t_drift (k TEXT PRIMARY KEY, v TEXT NOT NULL, extra_col TEXT)")
+    with mirror.get_tee_pool().connection() as c:
+        c.execute("DROP TABLE IF EXISTS t_drift")
+        c.execute("CREATE TABLE t_drift (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+    yield "t_drift"
+    with db.get_pool().connection() as c:
+        c.execute("DROP TABLE IF EXISTS t_drift")
+    with mirror.get_tee_pool().connection() as c:
+        c.execute("DROP TABLE IF EXISTS t_drift")
+
+
+@pytest.fixture
+def drift_table_tee_extra():
+    """TEE 侧比 RDS 侧多一列 tee_only_col。真实来源：alembic_tee 先于 RDS 迁移
+    落地的窗口。"""
+    with db.get_pool().connection() as c:
+        c.execute("DROP TABLE IF EXISTS t_drift2")
+        c.execute("CREATE TABLE t_drift2 (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+    with mirror.get_tee_pool().connection() as c:
+        c.execute("DROP TABLE IF EXISTS t_drift2")
+        c.execute(
+            "CREATE TABLE t_drift2 (k TEXT PRIMARY KEY, v TEXT NOT NULL, tee_only_col TEXT)")
+    yield "t_drift2"
+    with db.get_pool().connection() as c:
+        c.execute("DROP TABLE IF EXISTS t_drift2")
+    with mirror.get_tee_pool().connection() as c:
+        c.execute("DROP TABLE IF EXISTS t_drift2")
+
+
+def test_snapshot_survives_rds_only_column(drift_table_rds_extra):
+    """RDS 多一列时，该表必须仍然同步（只是那列同步不过去并被报出来），
+    而不是整张表永久失败。真实来源：滚动部署窗口 + 环境历史残留列
+    （test RDS 的 model_api_routes.thinking_fallback 全仓零命中）。"""
+    with db.get_pool().connection() as c:
+        c.execute("INSERT INTO t_drift (k, v, extra_col) VALUES ('a','1','x'), ('b','2','y')")
+    rep = snapshot.snapshot_table(drift_table_rds_extra)
+    assert rep["ok"] is True
+    assert rep["rows"] == 2
+    assert rep["missing_in_tee"] == ["extra_col"]
+    with mirror.get_tee_pool().connection() as c:
+        rows = c.execute("SELECT k, v FROM t_drift ORDER BY k").fetchall()
+    assert rows == [("a", "1"), ("b", "2")]
+
+
+def test_snapshot_survives_tee_only_column(drift_table_tee_extra):
+    """TEE 多一列时同样要能同步（该列留默认值/NULL），并报出来。
+    来源：alembic_tee 先于 RDS 迁移落地的窗口。"""
+    with db.get_pool().connection() as c:
+        c.execute("INSERT INTO t_drift2 (k, v) VALUES ('a','1')")
+    rep = snapshot.snapshot_table(drift_table_tee_extra)
+    assert rep["ok"] is True
+    assert rep["missing_in_rds"] == ["tee_only_col"]
+    with mirror.get_tee_pool().connection() as c:
+        rows = c.execute("SELECT k, v FROM t_drift2 ORDER BY k").fetchall()
+    assert rows == [("a", "1")]
+
+
+@pytest.fixture
+def drift_table_disjoint():
+    """两侧列集完全不相交——整表被重建成了另一个东西（改名/重设计），或者
+    某次迁移只落到了一侧。"""
+    with db.get_pool().connection() as c:
+        c.execute("DROP TABLE IF EXISTS t_drift3")
+        c.execute("CREATE TABLE t_drift3 (rds_only TEXT PRIMARY KEY)")
+    with mirror.get_tee_pool().connection() as c:
+        c.execute("DROP TABLE IF EXISTS t_drift3")
+        c.execute("CREATE TABLE t_drift3 (tee_only TEXT PRIMARY KEY)")
+    yield "t_drift3"
+    with db.get_pool().connection() as c:
+        c.execute("DROP TABLE IF EXISTS t_drift3")
+    with mirror.get_tee_pool().connection() as c:
+        c.execute("DROP TABLE IF EXISTS t_drift3")
+
+
+def test_snapshot_refuses_to_truncate_when_no_common_columns(drift_table_disjoint):
+    """列集完全不相交时必须拒绝执行，而不是 TRUNCATE 完再写不回任何东西。
+
+    没有这条护栏，交集逻辑会把"两侧完全对不上"降级成"共同列为空的正常快照"：
+    TEE 那张表被清空、一行都写不回去，而报告还是 ok=True——比原先的整表失败
+    更糟（原先只是不同步，现在是把已有的影子数据也弄没了）。TEE 侧存量必须
+    原样还在。
+    """
+    with db.get_pool().connection() as c:
+        c.execute("INSERT INTO t_drift3 (rds_only) VALUES ('r')")
+    with mirror.get_tee_pool().connection() as c:
+        c.execute("INSERT INTO t_drift3 (tee_only) VALUES ('t')")
+
+    rep = snapshot.snapshot_table(drift_table_disjoint)
+
+    assert rep["ok"] is False
+    assert "无公共列" in (rep["error"] or "")
+    with mirror.get_tee_pool().connection() as c:
+        rows = c.execute("SELECT tee_only FROM t_drift3").fetchall()
+    assert rows == [("t",)], "TEE 侧存量被清空了——护栏没生效"
+
+
 def test_users_is_snapshotted_before_per_user_tables():
     """FK 顺序：TEE 侧这些表带指向 users 的 CASCADE FK。users 归 MIRROR lane
     （由 reconcile 灌），所以 SNAPSHOT lane 自己不含 users——但顺序断言仍然要有，
