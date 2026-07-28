@@ -119,6 +119,12 @@ def _setup_openrouter(client, api_key: str, monkeypatch) -> None:
     assert res.status_code == 200, res.get_data(as_text=True)
 
 
+def _mark_active_route_vision_ready(user_id: str) -> None:
+    route = db.model_api_active_route(user_id)
+    assert route is not None
+    assert db.model_api_route_mark_vision_test(user_id, route["id"], status="ok")
+
+
 def test_pre_v2_only_fresh_setup_sends_through_v2_without_admin_flip(
     client, monkeypatch
 ):
@@ -479,6 +485,7 @@ def test_send_image_turn_also_routes(client, monkeypatch):
 
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder())
     _setup_openrouter(client, api_key, monkeypatch)
+    _mark_active_route_vision_ready(user_id)
 
     # 最小 JPEG 头（2 字节），不需要完整图片，只要能通过 base64 解码即可
     tiny_image_b64 = _b64(b"\xff\xd8\xff\xe0" + b"\x00" * 10)
@@ -507,6 +514,7 @@ def test_send_image_turn_persists_real_mime(client, monkeypatch):
 
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder())
     _setup_openrouter(client, api_key, monkeypatch)
+    _mark_active_route_vision_ready(user_id)
     tiny_png_b64 = _b64(b"\x89PNG\r\n\x1a\n" + b"\x00" * 10)
     res = client.post(
         "/v1/model_api/chat/send",
@@ -563,6 +571,7 @@ def test_send_image_with_caption_persists_caption_envelope(client, monkeypatch):
 
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder())
     _setup_openrouter(client, api_key, monkeypatch)
+    _mark_active_route_vision_ready(user_id)
     monkeypatch.setattr(
         core_enclave,
         "_decrypt_envelope_via_enclave",

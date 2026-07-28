@@ -17,6 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import asgi_app  # noqa: E402
+import db  # noqa: E402
 import provider_client  # noqa: E402
 from accounts import registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
@@ -133,6 +134,14 @@ def _setup(api_key: str, monkeypatch) -> None:
         headers={"X-API-Key": api_key},
     )
     assert response.status_code == 200, response.get_data(as_text=True)
+    user_id = registry._resolve_user(api_key)
+    route = db.model_api_active_route(user_id)
+    assert route is not None
+    assert db.model_api_route_mark_vision_test(
+        user_id,
+        route["id"],
+        status="ok",
+    )
 
 
 def _flask_post(payload, api_key: str):
@@ -252,3 +261,58 @@ def test_auth_and_validation_parity(env):
     status, body = _asgi_post({"message": "x"}, "not-a-key")
     assert status == 401
     assert body == {"error": "unauthorized"}
+
+
+def test_v2_image_follow_main_does_not_require_dedicated_probe(env):
+    monkeypatch = env
+    user_id, api_key = _register()
+    _setup(api_key, monkeypatch)
+    active = db.model_api_active_route(user_id)
+    assert db.model_api_route_mark_vision_test(
+        user_id,
+        active["id"],
+        status="untested",
+    )
+
+    status, body = _asgi_post({
+        "image_b64": _b64(b"image"),
+        "image_mime": "image/png",
+    }, api_key)
+
+    assert status == 202, body
+    rows = [
+        row for row in core_store.get_store(user_id).chat_messages
+        if row.get("role") == "user"
+    ]
+    assert rows[-1].get("vision_route_id", "") == ""
+
+
+def test_v2_image_pins_dedicated_route_on_accepted_row(env):
+    monkeypatch = env
+    user_id, api_key = _register()
+    _setup(api_key, monkeypatch)
+    active = db.model_api_active_route(user_id)
+    dedicated_id = db.model_api_route_upsert(
+        user_id,
+        active["credential_id"],
+        "openai/gpt-4.1-mini",
+        None,
+    )
+    assert db.model_api_route_mark_vision_test(
+        user_id,
+        dedicated_id,
+        status="ok",
+    )
+    assert db.model_api_route_set_vision(user_id, dedicated_id)
+
+    status, body = _asgi_post({
+        "image_b64": _b64(b"image"),
+        "image_mime": "image/png",
+    }, api_key)
+
+    assert status == 202, body
+    rows = [
+        row for row in core_store.get_store(user_id).chat_messages
+        if row.get("role") == "user"
+    ]
+    assert rows[-1]["vision_route_id"] == dedicated_id

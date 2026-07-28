@@ -124,6 +124,82 @@ def test_v1_text_and_file_followup_commit_as_one_ordered_reply(
     assert float(card["ts"]) > float(primary["ts"])
 
 
+def test_v1_text_file_and_confirmed_memory_activity_commit_together(
+    store, monkeypatch
+):
+    _quiet_response_side_effects(monkeypatch)
+    parent = store.append_chat(
+        "user", "chat", _envelope(store.user_id, "v1_memory_file_parent")
+    )
+    monkeypatch.setattr(
+        chat_core.chat_activity_store,
+        "resident_activity_rows",
+        lambda *_args: [
+            {
+                "id": 1,
+                "job_id": None,
+                "kind": "tool_activity",
+                "created_at": 10.0,
+                "detail_json": {
+                    "activity_id": "v1:memory-call-1",
+                    "tool_name": "memory_search",
+                    "call_id": "v1:memory-call-1",
+                    "state": "success",
+                    "memory_count": 4,
+                    "memory_categories": [
+                        {"key": "relationship", "count": 3},
+                        {"key": "family", "count": 1},
+                    ],
+                },
+            }
+        ],
+    )
+
+    body, status = chat_core.write_response(
+        store,
+        {
+            "envelope": _envelope(store.user_id, "v1_memory_file_primary"),
+            "reply_to_message_id": parent["id"],
+            "file_followups": [
+                {
+                    "envelope": _envelope(store.user_id, "v1_memory_file_card"),
+                    "file_name": "我们的关系小档案.pdf",
+                    "file_mime": document_render.PDF_MIME,
+                    "file_byte_count": 2048,
+                }
+            ],
+        },
+        consumer_id="resident-v1",
+        consumer_info={},
+        allow_verify_reply=False,
+    )
+
+    assert status == 200, body
+    rows = db.chat_load(store.user_id)
+    primary = next(row for row in rows if row["id"] == "v1_memory_file_primary")
+    card = next(row for row in rows if row["id"] == "v1_memory_file_card")
+    assert primary["reply_to_message_id"] == parent["id"]
+    assert primary["activity_events"] == [
+        {
+            "id": "v1:memory-call-1",
+            "kind": "tool",
+            "name": "memory_search",
+            "status": "success",
+            "job_id": "",
+            "call_id": "v1:memory-call-1",
+            "started_at": 10.0,
+            "finished_at": 10.0,
+            "memory_count": 4,
+            "memory_categories": [
+                {"key": "relationship", "count": 3},
+                {"key": "family", "count": 1},
+            ],
+        }
+    ]
+    assert card["reply_to_message_id"] == parent["id"]
+    assert card["file_name"] == "我们的关系小档案.pdf"
+
+
 def test_v1_file_sequence_rolls_back_if_followup_insert_fails(store, monkeypatch):
     _quiet_response_side_effects(monkeypatch)
     parent = store.append_chat(
@@ -531,11 +607,46 @@ def test_v1_visible_reply_strips_codex_local_file_citation():
     assert "codex-file-citation" not in cleaned
 
 
+def test_v1_staged_file_replaces_pi_sandbox_path_with_download_copy():
+    cleaned, removed = resident._sanitize_outbound_file_reply(
+        "已生成文件，可下载：\n"
+        "sandbox:/Users/example/Library/Application%20Support/IO/outbound-files/report.md\n"
+        "需要我把内容贴出来吗？",
+        attachment_staged=True,
+    )
+
+    assert removed is True
+    assert cleaned == "文件已生成，可在下方下载。"
+    assert "sandbox:" not in cleaned
+    assert "/Users/" not in cleaned
+
+
+def test_v1_unstaged_internal_path_is_detected_for_failure_handling():
+    cleaned, removed = resident._sanitize_outbound_file_reply(
+        "Download: file:///private/tmp/report.pdf"
+    )
+
+    assert removed is True
+    assert "file://" not in cleaned
+    assert "/private/tmp" not in cleaned
+
+
 def test_v1_outbound_prompt_limits_expensive_document_qa():
     prompt = resident._outbound_file_prompt_block()
 
     assert "at most one lightweight check" in prompt
     assert "do not repeatedly render" in prompt
+
+
+def test_v1_memory_read_prompt_requires_index_then_fetch():
+    prompt = resident._memory_read_prompt_block()
+
+    assert "memory-index" in prompt
+    assert "items[].id" in prompt
+    assert "memory-fetch" in prompt
+    assert f"python {resident._IO_CLI_PATH} memory-index" in prompt
+    assert f"python {resident._IO_CLI_PATH} memory-fetch" in prompt
+    assert "Never claim memories are unavailable" in prompt
 
 
 def test_foreground_agent_call_keeps_resident_fresh_without_claiming(monkeypatch):

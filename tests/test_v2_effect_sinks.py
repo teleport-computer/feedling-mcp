@@ -440,7 +440,13 @@ def test_sink_schedule_routes_schedule_wake_op_through_run_capability(pg_clean, 
     def fake_run_capability(action_type, store, *, api_key=None, runtime_token=None, params=None):
         calls.append((action_type, store.user_id, api_key, params))
         from capabilities.types import ok
-        return ok(data={})
+        return ok(data={"results": [{
+            "type": "schedule_wake_result",
+            "status": "scheduled",
+            "timer_id": "sched_real_1",
+            "next_trigger_at": "2026-07-11T17:00:00",
+            "timezone": "Asia/Shanghai",
+        }]})
 
     monkeypatch.setattr(serve_worker.cap_registry, "run_capability", fake_run_capability)
     monkeypatch.setattr(
@@ -448,7 +454,7 @@ def test_sink_schedule_routes_schedule_wake_op_through_run_capability(pg_clean, 
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not touch wake-timing table")))
 
     dispatch = serve_worker.build_production_effect_dispatch("u_sink_sched_wake")
-    dispatch("schedule", {
+    applied = dispatch("schedule", {
         "effect_id": "job_sw:schedule:0", "op": "schedule_wake",
         "at": "2026-07-11T09:00:00Z", "tz": "Asia/Shanghai", "reason": "remind me",
     })
@@ -460,6 +466,14 @@ def test_sink_schedule_routes_schedule_wake_op_through_run_capability(pg_clean, 
     assert api_key is None
     assert params == {
         "at": "2026-07-11T09:00:00Z", "tz": "Asia/Shanghai", "reason": "remind me",
+    }
+    assert applied.result == {
+        "kind": "schedule_v1",
+        "operation": "schedule_wake",
+        "status": "scheduled",
+        "task_id": "sched_real_1",
+        "next_trigger_at": "2026-07-11T17:00:00",
+        "timezone": "Asia/Shanghai",
     }
 
 

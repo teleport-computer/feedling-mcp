@@ -103,6 +103,60 @@ def test_apply_dispatches_when_generation_matches(pg_clean):
     assert db.effect_pending("u_ob2") == []
 
 
+def test_schedule_result_is_durably_bounded_and_readable(pg_clean):
+    uid = "u_ob_schedule_result"
+    seed_user(uid)
+    generation = db.get_runtime_generation(uid)
+    _set_v2_owner(uid)
+    eid = effect_id.derive(job_id=22, effect_type="schedule", ordinal=0)
+    assert db.effect_enqueue(
+        eid,
+        uid,
+        22,
+        "schedule",
+        generation,
+        {"effect_envelope": {"id": "opaque"}},
+    )
+    expected = {
+        "kind": effect_outbox.SCHEDULE_RESULT_KIND,
+        "operation": "schedule_wake",
+        "status": "scheduled",
+        "task_id": "sched_real_22",
+        "next_trigger_at": "2026-07-27T08:00:00",
+        "timezone": "Asia/Shanghai",
+    }
+
+    assert effect_outbox.apply_pending_effects(
+        uid,
+        dispatch=lambda _kind, _payload: effect_outbox.ScheduleAppliedResult(
+            expected
+        ),
+    ) == {"applied": 1, "discarded": 0}
+    assert effect_outbox.get_effect_disposition(
+        eid,
+        user_id=uid,
+        job_id=22,
+        effect_type="schedule",
+    ) == {
+        "status": "applied",
+        "last_error": "",
+        "result": expected,
+    }
+
+
+def test_schedule_result_rejects_unbounded_or_private_fields():
+    with pytest.raises(RuntimeError, match="shape is invalid"):
+        effect_outbox._serialized_applied_result(
+            effect_outbox.ScheduleAppliedResult({
+                "kind": effect_outbox.SCHEDULE_RESULT_KIND,
+                "operation": "schedule_wake",
+                "status": "scheduled",
+                "task_id": "sched_1",
+                "note": "private reminder body",
+            })
+        )
+
+
 def _running_chat_job(uid: str, generation: int, *, owner: str = "owner") -> int:
     job_id, coalesced = jobs_store.enqueue_job(
         uid, "chat", expected_generation=generation)

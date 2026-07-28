@@ -1,0 +1,216 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+
+import conftest  # noqa: E402
+from core import store as core_store  # noqa: E402
+from model_api_runtime.v2 import jobs_store, serve_worker  # noqa: E402
+
+
+def _env(user_id: str, message_id: str) -> dict:
+    return {
+        "v": 1,
+        "id": message_id,
+        "body_ct": "ct",
+        "nonce": "nonce",
+        "K_user": "key",
+        "K_enclave": "enclave-key",
+        "visibility": "shared",
+        "owner_user_id": user_id,
+    }
+
+
+def test_turn_activity_route_reads_only_the_authenticated_v2_job(client, backend_env):
+    conftest.seed_user("usr_activity_a")
+    conftest.set_v2_runtime_owner("usr_activity_a")
+    key_a = conftest.seed_api_key("usr_activity_a")
+    job_id, _ = jobs_store.enqueue_job(
+        "usr_activity_a", "chat", reason="chat_send", trace_id="turn-a"
+    )
+    jobs_store.append_status_event(
+        "usr_activity_a",
+        "tool_activity",
+        job_id=job_id,
+        label="memory_search",
+        detail={
+            "activity_id": f"{job_id}:1:1",
+            "tool_name": "memory_search",
+            "call_id": "call-a",
+            "state": "success",
+            "result_code": "ok",
+        },
+    )
+
+    conftest.seed_user("usr_activity_b")
+    conftest.set_v2_runtime_owner("usr_activity_b")
+    key_b = conftest.seed_api_key("usr_activity_b")
+
+    response = client.get(
+        "/v1/chat/turn-activity/turn-a",
+        headers={"Authorization": f"Bearer {key_a}"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json
+    assert body["runtime"] == "v2"
+    assert body["jobs"] == [{"job_id": str(job_id), "status": "pending"}]
+    assert body["events"][0]["call_id"] == "call-a"
+    assert body["events"][0]["result_code"] == "ok"
+
+    hidden = client.get(
+        "/v1/chat/turn-activity/turn-a",
+        headers={"Authorization": f"Bearer {key_b}"},
+    )
+    assert hidden.status_code == 404
+    assert hidden.json["error"] == "turn_activity_not_found"
+
+
+def test_turn_activity_route_rejects_invalid_turn_id(client, backend_env):
+    conftest.seed_user("usr_activity_invalid")
+    key = conftest.seed_api_key("usr_activity_invalid")
+    response = client.get(
+        "/v1/chat/turn-activity/%20",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    assert response.status_code == 400
+    assert response.json["error"] == "invalid_turn_id"
+
+
+def test_turn_activity_route_accepts_and_reads_v1_resident_events(client, backend_env):
+    user_id = "usr_activity_v1"
+    conftest.seed_user(user_id)
+    key = conftest.seed_api_key(user_id)
+    store = core_store.get_store(user_id)
+    store.append_chat("user", "chat", _env(user_id, "turn-v1"))
+    headers = {"Authorization": f"Bearer {key}"}
+
+    running = client.post(
+        "/v1/chat/turn-activity/turn-v1/events",
+        headers=headers,
+        json={
+            "activity_id": "v1:call-1",
+            "call_id": "v1:call-1",
+            "tool_name": "memory_search",
+            "state": "running",
+        },
+    )
+    assert running.status_code == 200, running.text
+    finished = client.post(
+        "/v1/chat/turn-activity/turn-v1/events",
+        headers=headers,
+        json={
+            "activity_id": "v1:call-1",
+            "call_id": "v1:call-1",
+            "tool_name": "memory_search",
+            "state": "success",
+            "result_code": "ok",
+            "memory_count": 4,
+            "memory_categories": [
+                {"key": "relationship", "count": 3},
+                {"key": "family", "count": 1},
+            ],
+        },
+    )
+    assert finished.status_code == 200, finished.text
+
+    response = client.get(
+        "/v1/chat/turn-activity/turn-v1", headers=headers
+    )
+    assert response.status_code == 200, response.text
+    body = response.json
+    assert body["runtime"] == "v1"
+    assert body["complete"] is False
+    assert body["phase"] == "processing"
+    assert body["events"][0]["status"] == "success"
+    assert body["events"][0]["memory_categories"] == [
+        {"key": "relationship", "count": 3},
+        {"key": "family", "count": 1},
+    ]
+
+
+def test_v1_activity_event_rejects_v2_owned_turn(client, backend_env):
+    user_id = "usr_activity_v2_reject"
+    conftest.seed_user(user_id)
+    key = conftest.seed_api_key(user_id)
+    store = core_store.get_store(user_id)
+    store.append_chat("user", "chat", _env(user_id, "turn-v2-reject"))
+    conftest.set_v2_runtime_owner(user_id)
+
+    response = client.post(
+        "/v1/chat/turn-activity/turn-v2-reject/events",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "activity_id": "v1:call-1",
+            "tool_name": "memory_search",
+            "state": "running",
+        },
+    )
+    assert response.status_code == 409
+    assert response.json["error"] == "activity_event_rejected"
+
+
+def test_transactional_reply_sink_persists_completed_v2_activity(monkeypatch):
+    captured = {}
+
+    class Store:
+        def _build_chat_message(
+            self, role, source, envelope, content_type="text", extra=None
+        ):
+            captured.update(
+                role=role,
+                source=source,
+                envelope=envelope,
+                content_type=content_type,
+                extra=extra,
+            )
+            return {"id": envelope["id"], "ts": 1.0}
+
+    class Connection:
+        def execute(self, *_args):
+            return None
+
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda _user_id: Store())
+    monkeypatch.setattr(
+        serve_worker.db,
+        "chat_append_effect_with_cursor",
+        lambda *args, **kwargs: (7, False, lambda: None),
+    )
+
+    post_commit = serve_worker._sink_reply_in_transaction(
+        "usr_activity_tx",
+        {
+            "envelope": {"id": "a" * 32},
+            "activity_turn_id": "turn-v2",
+            "activity_job_id": "42",
+            "activity_events": [
+                {
+                    "id": "42:0:1",
+                    "kind": "tool",
+                    "name": "schedule_wake",
+                    "status": "success",
+                    "schedule_operation": "schedule_wake",
+                    "schedule_task_id": "sched-test",
+                    "schedule_status": "scheduled",
+                }
+            ],
+        },
+        Connection(),
+    )
+
+    assert callable(post_commit)
+    assert captured["extra"]["activity_turn_id"] == "turn-v2"
+    assert captured["extra"]["activity_job_id"] == "42"
+    assert captured["extra"]["activity_events"] == [
+        {
+            "id": "42:0:1",
+            "kind": "tool",
+            "name": "schedule_wake",
+            "status": "success",
+            "job_id": "42",
+            "schedule_operation": "schedule_wake",
+            "schedule_task_id": "sched-test",
+            "schedule_status": "scheduled",
+        }
+    ]

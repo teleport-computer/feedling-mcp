@@ -1167,6 +1167,68 @@ def test_openrouter_reasoning_rejection_preserves_supported_cache_fields(
     assert seen[1]["tools"] == seen[0]["tools"]
 
 
+def test_openrouter_region_rejection_retries_without_session_affinity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict] = []
+    responses = [
+        _response(
+            403,
+            {"error": {"message": "This model is not available in your region."}},
+        ),
+        _response(
+            403,
+            {"error": {"message": "This model is not available in your region."}},
+        ),
+        _response(
+            403,
+            {"error": {"message": "This model is not available in your region."}},
+        ),
+        _openai_chat_success(),
+    ]
+
+    class AsyncClient:
+        async def post(self, *args, json=None, **kwargs):
+            seen.append(copy.deepcopy(json))
+            return responses.pop(0)
+
+    monkeypatch.setattr(pc, "_async_http_client", lambda: AsyncClient())
+    config = pc.ProviderConfig(
+        provider="openrouter",
+        model="anthropic/claude-sonnet-4",
+        api_key="sk-test",
+        prompt_cache_key=CACHE_KEY,
+    )
+
+    result = asyncio.run(
+        pc.chat_completion_async(
+            config,
+            MESSAGES,
+            include_reasoning=True,
+            tools=TOOLS,
+        )
+    )
+
+    assert len(seen) == 4
+    assert seen[0]["session_id"] == CACHE_KEY
+    assert "session_id" not in seen[1]
+    assert seen[1]["reasoning"] == seen[0]["reasoning"]
+    assert "session_id" not in seen[2]
+    assert "reasoning" not in seen[2]
+    assert _nested_cache_controls(seen[2]["messages"]) == [{"type": "ephemeral"}]
+    assert _nested_cache_controls(seen[3]["messages"]) == []
+    assert _without_cache_metadata(seen[3]["messages"]) == _without_cache_metadata(
+        seen[0]["messages"]
+    )
+    assert seen[3]["tools"] == seen[0]["tools"]
+    assert result["usage"]["provider_retry_count"] == 3
+    assert result["usage"]["compatibility_fallbacks"] == [
+        "region_route_rejected:session_id",
+        "region_route_rejected:reasoning",
+        "region_route_rejected:cache_control",
+    ]
+
+
 def test_async_runtime_default_omits_temperature(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

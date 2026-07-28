@@ -41,7 +41,8 @@ def test_schedule_forwards_the_action_shape_apply_turn_actions_expects(monkeypat
     assert res["ok"] is True
     assert seen["user_id"] == "u_cap_wake"
     assert seen["actions"] == [{"type": "schedule_wake", "at": "2026-07-11T18:00",
-                                "tz": "Asia/Shanghai", "reason": "check in"}]
+                                "tz": "Asia/Shanghai", "reason": "check in",
+                                "note": "check in"}]
 
 
 def test_submit_wake_does_not_enqueue(monkeypatch):

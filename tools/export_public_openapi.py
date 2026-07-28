@@ -85,7 +85,7 @@ TAG_RULES = (
     (("/v1/users", "/v1/account", "/v1/access"), "Accounts"),
     (("/v1/bootstrap", "/v1/onboarding", "/v1/genesis", "/v1/history_import"), "Onboarding"),
     (("/v1/model_api/chat", "/v1/chat"), "Chat"),
-    (("/v1/model_api",), "Model API"),
+    (("/v1/model_api", "/v1/vision"), "Model API"),
     (("/v1/mcp",), "MCP"),
     (("/v1/memory",), "Memory"),
     (("/v1/identity",), "Identity"),
