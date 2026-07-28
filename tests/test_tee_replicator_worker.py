@@ -610,3 +610,41 @@ def test_permanent_decrypt_failure_not_retried(backend_env, monkeypatch):
 
     assert report["quarantined"] == 1
     assert calls == ["POISON"]  # exactly one decrypt attempt, no retry storm
+
+
+def test_every_ciphertext_lane_table_has_a_worker_config():
+    """注册表登记了 CIPHERTEXT，worker 就必须有对应配置——否则 scheduler 会拿着
+    一个 worker 不认识的表名调 run_action，每 tick 报 unknown_table。"""
+    from tee_replicator import worker
+    from tee_shadow import table_registry as reg
+
+    missing = sorted(set(reg.tables_in_lane(reg.CIPHERTEXT)) - set(worker._TABLES))
+    assert not missing, f"CIPHERTEXT lane 的这些表在 worker._TABLES 里没有配置：{missing}"
+
+
+def test_plaintext_envelope_column_strips_crypto_keys():
+    from tee_replicator import transforms
+
+    env = {
+        "v": 1, "id": "e1", "owner_user_id": "usr_x", "visibility": "shared",
+        "body_ct": "ct", "nonce": "n", "K_user": "ku", "K_enclave": "ke",
+        "event_kind": "tool_call_started",
+    }
+    out = transforms.plaintext_envelope_column(
+        env, lambda e, purpose: b"decrypted", purpose="tee_replicate:probe")
+    # 加密学字段一个都不许残留。
+    for k in ("body_ct", "nonce", "K_user", "K_enclave", "v"):
+        assert k not in out
+    # 语义字段原样保留。
+    assert out["event_kind"] == "tool_call_started"
+    assert out["body"] == "decrypted"
+
+
+def test_plaintext_envelope_column_rejects_local_only():
+    from tee_replicator import transforms
+
+    env = {"id": "e1", "visibility": "local_only", "body_ct": "ct", "nonce": "n",
+           "K_user": "ku", "owner_user_id": "usr_x"}
+    with pytest.raises(transforms.PendingDeviceMigration):
+        transforms.plaintext_envelope_column(
+            env, lambda e, purpose: b"x", purpose="tee_replicate:probe")

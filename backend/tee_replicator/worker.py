@@ -439,6 +439,472 @@ _TABLES["frame_envelopes"] = _Table(
 )
 
 
+# --------------------------------------------------------------------------- #
+# 2026-07-27 全量对齐新增的 7 张密文表。真实结构（实测，非照抄示例）：见
+# .superpowers/sdd/2026-07-27-tee-full-table-alignment/task-7-brief.md 开头表格。
+# _Table 的四元组契约 (user_id, item_id, sort_val, doc) 装不下这些表的额外列
+# （复合 PK 的另一半 / 不属于信封 JSON 的业务列），统一用 _pack_extra/_pop_extra
+# 走私——是 chat_messages._SEQ_KEY 手法的泛化版（同一个保留键前缀，任意个键），
+# 供本轮全部 7 张表共用，而不是每张表各发明一套命名。
+# --------------------------------------------------------------------------- #
+_EXTRA_PREFIX = "_replicator_extra:"
+
+
+def _pack_extra(doc: dict, **extra) -> dict:
+    """把塞不进 (user_id, item_id, sort_val, doc) 四元组的额外列，走私进 doc dict。
+
+    transform 只剥 _ENVELOPE_KEYS（见 transforms.py 顶部），这些前缀键原样穿透
+    解密/去壳，upsert_args 用 _pop_extra 在写库前取回、绝不落进明文信封 JSONB。
+    """
+    return {**doc, **{f"{_EXTRA_PREFIX}{k}": v for k, v in extra.items()}}
+
+
+def _pop_extra(doc: dict, *names: str) -> tuple:
+    """从 doc 里取回 _pack_extra 走私的值（原地 pop，doc 剩下的就是信封本体）。"""
+    return tuple(doc.pop(f"{_EXTRA_PREFIX}{n}") for n in names)
+
+
+def _iso(ts) -> str | None:
+    """TIMESTAMPTZ → ISO 文本（"text" 游标 sort_val 与写库前的智能透传都要）。None 原样保留。"""
+    return ts.isoformat() if ts is not None else None
+
+
+# ---- chat_message_archive：doc 与 chat_messages 同形，复用 plaintext_chat_doc，
+# 但 unpack/游标/upsert 必须自己设计——PK 是 (user_id, source_seq)，不是
+# (user_id, msg_id)。 ------------------------------------------------------- #
+def _chat_archive_unpack(r: tuple) -> tuple:
+    """(user_id, source_seq, msg_id, ts, doc, storage_generation, clear_generation,
+    cleared_at) row -> (user_id, item_id, sort_val, doc')。
+
+    item_id 是 source_seq，不是 msg_id：真实 PK 是 (user_id, source_seq)（见
+    alembic_tee 0004）。source_seq 是用户清空历史时从 chat_messages.seq 原样
+    搬过来的值（db.py 的 "INSERT INTO chat_message_archive ... SELECT
+    user_id,seq,... FROM chat_messages"），而 chat_messages.seq 是全表级
+    GENERATED ALWAYS AS IDENTITY——所以 source_seq *可证* 全局唯一；msg_id 只在
+    某一时刻的 live chat_messages 里保证唯一，同一 msg_id 理论上可能出现在两次
+    不同的清空周期里（概率上因为 msg_id 通常是 UUID 而可忽略，但 source_seq 是
+    唯一有数学保证的那个，游标 tie-break 优先用它）。
+
+    sort_val 是 cleared_at，不是 ts：ts 是原始消息的聊天时间戳，随消息原样搬过
+    来，反映的是消息最初发出的时间，不是"这行何时被归档"。两个不同用户可以在
+    任意真实时刻清空聊天记录、而各自消息的原始 ts 可能相差数年——如果用 ts 驱动
+    全局游标，后清空的用户（消息 ts 更早）的归档行会排在已经推进过的水位线*之
+    前*，被永久跳过。这与 job_id 驱动 v2_trajectory_events 游标会导致的追加序
+    违规是同一类错误（见 _trajectory_events_unpack）。cleared_at 由
+    clock_timestamp() 在归档 INSERT 发生的那一刻写入（0004 DDL），因此和
+    chat_messages.ts 一样，与"写入这张表的真实顺序"相关。
+
+    msg_id / ts / storage_generation / clear_generation 是普通列，不在 doc 自己
+    的 JSON 里（与 chat_messages.seq 处境相同）——用 _pack_extra/_pop_extra 走私。
+
+    R2-offloaded 行（content_type="file"，doc 只带 body_key 指针）的水合与
+    _chat_unpack 对 live 表的处理完全一致，复用同一个 db helper。
+    """
+    (uid, source_seq, msg_id, ts, doc, storage_generation, clear_generation,
+     cleared_at) = r
+    if db._is_chat_file_pointer(doc):
+        doc = db.hydrate_chat_file_body(uid, doc)
+    item_id = str(source_seq)
+    sort_val = _iso(cleared_at) or ""
+    packed = _pack_extra(doc, msg_id=msg_id, ts=ts,
+                          storage_generation=storage_generation,
+                          clear_generation=clear_generation)
+    return (uid, item_id, sort_val, packed)
+
+
+def _chat_archive_upsert_args(uid: str, iid: str, sort, doc: dict) -> tuple:
+    msg_id, ts, storage_generation, clear_generation = _pop_extra(
+        doc, "msg_id", "ts", "storage_generation", "clear_generation")
+    return (uid, int(iid), msg_id, ts, Jsonb(doc), storage_generation,
+            clear_generation, sort)
+
+
+_TABLES["chat_message_archive"] = _Table(
+    select_sql=("SELECT user_id, source_seq, msg_id, ts, doc, storage_generation, "
+                "clear_generation, cleared_at FROM chat_message_archive "
+                "WHERE (cleared_at, source_seq) > (%s, %s) "
+                "ORDER BY cleared_at, source_seq LIMIT %s"),
+    cursor_kind="text",
+    transform=transforms.plaintext_chat_doc,
+    upsert_sql=("INSERT INTO chat_message_archive "
+                "(user_id, source_seq, msg_id, ts, doc, storage_generation, "
+                "clear_generation, cleared_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (user_id, source_seq) DO UPDATE SET "
+                "msg_id=EXCLUDED.msg_id, ts=EXCLUDED.ts, doc=EXCLUDED.doc, "
+                "storage_generation=EXCLUDED.storage_generation, "
+                "clear_generation=EXCLUDED.clear_generation, "
+                "cleared_at=EXCLUDED.cleared_at"),
+    unpack=_chat_archive_unpack,
+    upsert_args=_chat_archive_upsert_args,
+    # 归档表只有一条 INSERT 写路径（db.py 清空历史时），没有任何 UPDATE——一旦
+    # 归档即不可变，不需要 requeue（同 chat_message_archive 自身没有原地改写）。
+    requeue_fetch_sql=None,
+    requeue_delete_tee_sql=None,
+)
+
+
+# ---- v2_trajectory_events：PK (job_id, event_index)，无 user_id FK、无单一 id 列。
+def _trajectory_events_unpack(r: tuple) -> tuple:
+    """(user_id, job_id, event_index, event_kind, idempotency_key, payload_bytes,
+    truncated, created_at, payload_envelope) row -> (user_id, item_id, sort_val, doc')。
+
+    item_id 是 "job_id:event_index"（真实 PK 的字符串拼接，两者都是纯数字，
+    ":" 绝不会出现在其中，故可无歧义还原）——这个组合本身就全局唯一，不依赖
+    created_at 是否恰好撞车。
+
+    sort_val 是 created_at，不是 job_id：job_id 只反映 job *创建* 顺序，而一个
+    长期运行的 job 可能在更晚创建、但更快跑完的 job 已经把全局游标推过去之后，
+    才追加新事件。若用 job_id 排序，这类晚到事件的 key 会落在已推进的水位线
+    *之后* 的 job_id 更小处，被 "(job_id,event_index) > 水位线" 的比较条件永久
+    跳过。created_at 由 clock_timestamp() 在每条事件自己的 INSERT 时刻写入
+    （alembic_tee 0004 DDL），与 chat_messages.ts / memory_moments.occurred_at
+    一样和真实写入顺序相关。
+
+    event_kind / idempotency_key / payload_bytes / truncated 是普通 SQL 列，不在
+    payload_envelope 自己的 JSON 里——实测一行真实 envelope 只有
+    crypto 字段 + id/visibility/owner_user_id，没有这几个键（2026-07-28 对
+    test 环境一行实测验证）。用 _pack_extra/_pop_extra 走私。
+    """
+    (uid, job_id, event_index, event_kind, idempotency_key, payload_bytes,
+     truncated, created_at, envelope) = r
+    item_id = f"{job_id}:{event_index}"
+    sort_val = _iso(created_at) or ""
+    doc = _pack_extra(envelope, job_id=job_id, event_index=event_index,
+                       event_kind=event_kind, idempotency_key=idempotency_key,
+                       payload_bytes=payload_bytes, truncated=truncated)
+    return (uid, item_id, sort_val, doc)
+
+
+def _trajectory_events_upsert_args(uid: str, iid: str, sort, doc: dict) -> tuple:
+    (job_id, event_index, event_kind, idempotency_key, payload_bytes,
+     truncated) = _pop_extra(doc, "job_id", "event_index", "event_kind",
+                              "idempotency_key", "payload_bytes", "truncated")
+    return (uid, job_id, event_index, event_kind, idempotency_key,
+            payload_bytes, truncated, sort, Jsonb(doc))
+
+
+_TABLES["v2_trajectory_events"] = _Table(
+    select_sql=("SELECT user_id, job_id, event_index, event_kind, idempotency_key, "
+                "payload_bytes, truncated, created_at, payload_envelope "
+                "FROM v2_trajectory_events "
+                "WHERE (created_at, job_id::text || ':' || event_index::text) > (%s, %s) "
+                "ORDER BY created_at, job_id::text || ':' || event_index::text LIMIT %s"),
+    cursor_kind="text",
+    transform=lambda doc, decrypt: transforms.plaintext_envelope_column(
+        doc, decrypt, purpose=f"tee_replicate:v2_trajectory_events:{doc.get('id', '')}"),
+    upsert_sql=("INSERT INTO v2_trajectory_events "
+                "(user_id, job_id, event_index, event_kind, idempotency_key, "
+                "payload_bytes, truncated, created_at, payload_envelope) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (job_id, event_index) DO UPDATE SET "
+                "event_kind=EXCLUDED.event_kind, idempotency_key=EXCLUDED.idempotency_key, "
+                "payload_bytes=EXCLUDED.payload_bytes, truncated=EXCLUDED.truncated, "
+                "created_at=EXCLUDED.created_at, payload_envelope=EXCLUDED.payload_envelope"),
+    unpack=_trajectory_events_unpack,
+    upsert_args=_trajectory_events_upsert_args,
+    # 全仓搜索 "UPDATE v2_trajectory_events" 零命中——纯追加的轨迹事件日志，没有
+    # 原地改写路径，不需要 requeue。
+    requeue_fetch_sql=None,
+    requeue_delete_tee_sql=None,
+)
+
+
+# ---- model_api_credentials：PK 是单列 id(uuid)，无单一 doc 列（envelope 只是
+# 众多业务列之一）。
+def _model_api_credentials_unpack(r: tuple) -> tuple:
+    """(id, user_id, provider, label, base_url, api_key_envelope, api_key_hint,
+    supports_responses, created_at, updated_at) row -> (user_id, item_id, sort_val, doc')。
+
+    item_id 是 id（uuid 本身单列全局唯一，不需要复合）。
+
+    sort_val 是 updated_at：db.model_api_credential_update 的每一条 UPDATE 分支
+    都硬编码 "updated_at = now()"（backend/db.py:8566 起验证），从不会出现
+    "改了内容但 updated_at 没动"的情况，所以这张表天然是追加友好的——不像
+    memory/world_book 那样需要 requeue 兜底原地改写。
+    """
+    (cred_id, uid, provider, label, base_url, envelope, api_key_hint,
+     supports_responses, created_at, updated_at) = r
+    item_id = str(cred_id)
+    sort_val = _iso(updated_at) or ""
+    doc = _pack_extra(envelope, cred_id=cred_id, provider=provider, label=label,
+                       base_url=base_url, api_key_hint=api_key_hint,
+                       supports_responses=supports_responses,
+                       created_at=_iso(created_at))
+    return (uid, item_id, sort_val, doc)
+
+
+def _model_api_credentials_upsert_args(uid: str, iid: str, sort, doc: dict) -> tuple:
+    (cred_id, provider, label, base_url, api_key_hint, supports_responses,
+     created_at) = _pop_extra(doc, "cred_id", "provider", "label", "base_url",
+                               "api_key_hint", "supports_responses", "created_at")
+    return (cred_id, uid, provider, label, base_url, Jsonb(doc), api_key_hint,
+            supports_responses, created_at, sort)
+
+
+_TABLES["model_api_credentials"] = _Table(
+    select_sql=("SELECT id, user_id, provider, label, base_url, api_key_envelope, "
+                "api_key_hint, supports_responses, created_at, updated_at "
+                "FROM model_api_credentials WHERE (updated_at, id) > (%s, %s) "
+                "ORDER BY updated_at, id LIMIT %s"),
+    cursor_kind="text",
+    transform=lambda doc, decrypt: transforms.plaintext_envelope_column(
+        doc, decrypt, purpose=f"tee_replicate:model_api_credentials:{doc.get('id', '')}"),
+    upsert_sql=("INSERT INTO model_api_credentials "
+                "(id, user_id, provider, label, base_url, api_key_envelope, "
+                "api_key_hint, supports_responses, created_at, updated_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (id) DO UPDATE SET "
+                "provider=EXCLUDED.provider, label=EXCLUDED.label, "
+                "base_url=EXCLUDED.base_url, api_key_envelope=EXCLUDED.api_key_envelope, "
+                "api_key_hint=EXCLUDED.api_key_hint, "
+                "supports_responses=EXCLUDED.supports_responses, "
+                "updated_at=EXCLUDED.updated_at"),
+    unpack=_model_api_credentials_unpack,
+    upsert_args=_model_api_credentials_upsert_args,
+    # updated_at 全覆盖（见 unpack 文档），不需要 requeue。
+    requeue_fetch_sql=None,
+    requeue_delete_tee_sql=None,
+)
+
+
+# ---- v2_conversation_summary：PK 单列 user_id（一行/用户），summary_envelope
+# 可为 NULL（还没生成过摘要）——通用 plaintext_envelope_column 假设信封总存在，
+# 直接调用会在 doc=None 时于 transforms._decryptable 里 NPE，需要一层判空。
+def _summary_unpack(r: tuple) -> tuple:
+    (uid, envelope, watermark_ts, version, updated_at, watermark_seq,
+     materialized_segment_ids) = r
+    item_id = uid
+    sort_val = _iso(updated_at) or ""
+    doc = _pack_extra(
+        envelope or {}, has_envelope=envelope is not None,
+        watermark_ts=watermark_ts, version=version, watermark_seq=watermark_seq,
+        materialized_segment_ids=materialized_segment_ids)
+    return (uid, item_id, sort_val, doc)
+
+
+def _summary_transform(doc: dict, decrypt) -> dict:
+    (has_envelope,) = _pop_extra(doc, "has_envelope")
+    if has_envelope:
+        return transforms.plaintext_envelope_column(
+            doc, decrypt, purpose=f"tee_replicate:v2_conversation_summary:{doc.get('id', '')}")
+    # summary_envelope 本就是 NULL（这个用户还没被生成过摘要）——不是"待解密"，
+    # 原样返回（此时 doc 只剩 _pack_extra 塞进来的保留键），upsert_args 据此写 NULL。
+    return doc
+
+
+def _summary_upsert_args(uid: str, iid: str, sort, doc: dict) -> tuple:
+    watermark_ts, version, watermark_seq, materialized_segment_ids = _pop_extra(
+        doc, "watermark_ts", "version", "watermark_seq", "materialized_segment_ids")
+    envelope_col = Jsonb(doc) if doc else None
+    return (uid, envelope_col, watermark_ts, version, sort, watermark_seq,
+            materialized_segment_ids)
+
+
+_TABLES["v2_conversation_summary"] = _Table(
+    select_sql=("SELECT user_id, summary_envelope, watermark_ts, version, updated_at, "
+                "watermark_seq, materialized_segment_ids FROM v2_conversation_summary "
+                "WHERE (updated_at, user_id) > (%s, %s) ORDER BY updated_at, user_id LIMIT %s"),
+    cursor_kind="text",
+    transform=_summary_transform,
+    upsert_sql=("INSERT INTO v2_conversation_summary "
+                "(user_id, summary_envelope, watermark_ts, version, updated_at, "
+                "watermark_seq, materialized_segment_ids) VALUES (%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (user_id) DO UPDATE SET "
+                "summary_envelope=EXCLUDED.summary_envelope, "
+                "watermark_ts=EXCLUDED.watermark_ts, version=EXCLUDED.version, "
+                "updated_at=EXCLUDED.updated_at, watermark_seq=EXCLUDED.watermark_seq, "
+                "materialized_segment_ids=EXCLUDED.materialized_segment_ids"),
+    unpack=_summary_unpack,
+    upsert_args=_summary_upsert_args,
+    # 每条 UPDATE 都带 updated_at=now()（jobs_store.py 四处写路径逐一核对过），
+    # 不需要 requeue。
+    requeue_fetch_sql=None,
+    requeue_delete_tee_sql=None,
+)
+
+
+# ---- v2_conversation_summary_segments：segment_id 是 GENERATED ALWAYS AS
+# IDENTITY，upsert 必须 OVERRIDING SYSTEM VALUE；ON CONFLICT DO UPDATE 分支绝不
+# 能碰 segment_id（UPDATE 语境没有等价写法，写了是硬错误——同 chat_messages.seq
+# 的坑，见 worker.py:172 起的注释）。纯 INSERT-only（全仓搜索没有一条 UPDATE），
+# segment_id 本身单列全局唯一且严格递增，直接当游标用，不需要复合 tie-break。
+def _summary_segments_unpack(r: tuple) -> tuple:
+    (segment_id, uid, format_version, coverage_kind, level, start_seq, end_seq,
+     source_message_count, legacy_opaque_through_seq, child_segment_ids,
+     envelope, created_at) = r
+    item_id = str(segment_id)
+    doc = _pack_extra(
+        envelope, segment_id=segment_id, format_version=format_version,
+        coverage_kind=coverage_kind, level=level, start_seq=start_seq,
+        end_seq=end_seq, source_message_count=source_message_count,
+        legacy_opaque_through_seq=legacy_opaque_through_seq,
+        child_segment_ids=child_segment_ids, created_at=_iso(created_at))
+    # cursor_kind="single" 的游标推进用的是 sort_val（不是 item_id，见
+    # _encode_cursor），这里直接给 segment_id 本身（int）。
+    return (uid, item_id, segment_id, doc)
+
+
+def _summary_segments_upsert_args(uid: str, iid: str, sort, doc: dict) -> tuple:
+    (segment_id, format_version, coverage_kind, level, start_seq, end_seq,
+     source_message_count, legacy_opaque_through_seq, child_segment_ids,
+     created_at) = _pop_extra(
+        doc, "segment_id", "format_version", "coverage_kind", "level",
+        "start_seq", "end_seq", "source_message_count",
+        "legacy_opaque_through_seq", "child_segment_ids", "created_at")
+    return (segment_id, uid, format_version, coverage_kind, level, start_seq,
+            end_seq, source_message_count, legacy_opaque_through_seq,
+            child_segment_ids, Jsonb(doc), created_at)
+
+
+_TABLES["v2_conversation_summary_segments"] = _Table(
+    select_sql=("SELECT segment_id, user_id, format_version, coverage_kind, level, "
+                "start_seq, end_seq, source_message_count, legacy_opaque_through_seq, "
+                "child_segment_ids, summary_envelope, created_at "
+                "FROM v2_conversation_summary_segments "
+                "WHERE segment_id > %s ORDER BY segment_id LIMIT %s"),
+    cursor_kind="single",
+    transform=lambda doc, decrypt: transforms.plaintext_envelope_column(
+        doc, decrypt,
+        purpose=f"tee_replicate:v2_conversation_summary_segments:{doc.get('id', '')}"),
+    upsert_sql=("INSERT INTO v2_conversation_summary_segments "
+                "(segment_id, user_id, format_version, coverage_kind, level, start_seq, "
+                "end_seq, source_message_count, legacy_opaque_through_seq, "
+                "child_segment_ids, summary_envelope, created_at) "
+                "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (segment_id) DO UPDATE SET "
+                "user_id=EXCLUDED.user_id, format_version=EXCLUDED.format_version, "
+                "coverage_kind=EXCLUDED.coverage_kind, level=EXCLUDED.level, "
+                "start_seq=EXCLUDED.start_seq, end_seq=EXCLUDED.end_seq, "
+                "source_message_count=EXCLUDED.source_message_count, "
+                "legacy_opaque_through_seq=EXCLUDED.legacy_opaque_through_seq, "
+                "child_segment_ids=EXCLUDED.child_segment_ids, "
+                "summary_envelope=EXCLUDED.summary_envelope, "
+                "created_at=EXCLUDED.created_at"),
+    unpack=_summary_segments_unpack,
+    upsert_args=_summary_segments_upsert_args,
+    requeue_fetch_sql=None,
+    requeue_delete_tee_sql=None,
+)
+
+
+# ---- v2_trajectory_reviews：PK 单列 source_job_id，review_envelope 可为 NULL
+# （审阅还没跑）。⚠️ 已知缺口：这张表没有 updated_at 之类的列，status/
+# review_envelope/claimed_by_job_id 等字段在创建之后由 jobs_store.py 多处 UPDATE
+# 原地改写（例如 "UPDATE v2_trajectory_reviews SET status=%s,...review_envelope=%s..."），
+# 但全仓搜索 mirror.mark_pending(..., "v2_trajectory_reviews", ...) 零命中——也就
+# 是说 requeue lane 的写侧标记从未被接上。下面仍按标准 requeue 形状把
+# requeue_fetch_sql/requeue_delete_tee_sql 配好（防御性、与其余表接口一致，一旦
+# 未来给 jobs_store.py 补上 mark_pending 调用就能直接生效），但**在双写补上之前，
+# 这张表的审阅完成态（status 变化、review_envelope 填充）不会被复制进 TEE**——
+# 游标只会看到创建时刻的初始行（status='pending', review_envelope=NULL）。
+# 已在 task-7-report.md 里向协调者/用户报告，不在本次任务范围内自行接双写。
+def _trajectory_reviews_unpack(r: tuple) -> tuple:
+    (uid, source_job_id, status, attempt_count, claimed_by_job_id, envelope,
+     last_error, created_at, started_at, finished_at) = r
+    item_id = str(source_job_id)
+    sort_val = _iso(created_at) or ""
+    doc = _pack_extra(
+        envelope or {}, has_envelope=envelope is not None,
+        source_job_id=source_job_id, status=status, attempt_count=attempt_count,
+        claimed_by_job_id=claimed_by_job_id, last_error=last_error,
+        started_at=_iso(started_at), finished_at=_iso(finished_at))
+    return (uid, item_id, sort_val, doc)
+
+
+def _trajectory_reviews_transform(doc: dict, decrypt) -> dict:
+    (has_envelope,) = _pop_extra(doc, "has_envelope")
+    if has_envelope:
+        return transforms.plaintext_envelope_column(
+            doc, decrypt, purpose=f"tee_replicate:v2_trajectory_reviews:{doc.get('id', '')}")
+    return doc
+
+
+def _trajectory_reviews_upsert_args(uid: str, iid: str, sort, doc: dict) -> tuple:
+    (source_job_id, status, attempt_count, claimed_by_job_id, last_error,
+     started_at, finished_at) = _pop_extra(
+        doc, "source_job_id", "status", "attempt_count", "claimed_by_job_id",
+        "last_error", "started_at", "finished_at")
+    envelope_col = Jsonb(doc) if doc else None
+    return (source_job_id, uid, status, attempt_count, claimed_by_job_id,
+            envelope_col, last_error, sort, started_at, finished_at)
+
+
+_TABLES["v2_trajectory_reviews"] = _Table(
+    select_sql=("SELECT user_id, source_job_id, status, attempt_count, "
+                "claimed_by_job_id, review_envelope, last_error, created_at, "
+                "started_at, finished_at FROM v2_trajectory_reviews "
+                "WHERE (created_at, source_job_id) > (%s, %s) "
+                "ORDER BY created_at, source_job_id LIMIT %s"),
+    cursor_kind="text",
+    transform=_trajectory_reviews_transform,
+    upsert_sql=("INSERT INTO v2_trajectory_reviews "
+                "(source_job_id, user_id, status, attempt_count, claimed_by_job_id, "
+                "review_envelope, last_error, created_at, started_at, finished_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (source_job_id) DO UPDATE SET "
+                "status=EXCLUDED.status, attempt_count=EXCLUDED.attempt_count, "
+                "claimed_by_job_id=EXCLUDED.claimed_by_job_id, "
+                "review_envelope=EXCLUDED.review_envelope, "
+                "last_error=EXCLUDED.last_error, created_at=EXCLUDED.created_at, "
+                "started_at=EXCLUDED.started_at, finished_at=EXCLUDED.finished_at"),
+    unpack=_trajectory_reviews_unpack,
+    upsert_args=_trajectory_reviews_upsert_args,
+    # 防御性接线，目前是死代码——见上方大段注释，写侧从未 mark_pending 过这张表。
+    requeue_fetch_sql=("SELECT user_id, source_job_id, status, attempt_count, "
+                       "claimed_by_job_id, review_envelope, last_error, created_at, "
+                       "started_at, finished_at FROM v2_trajectory_reviews "
+                       "WHERE user_id = %s AND source_job_id = %s"),
+    requeue_delete_tee_sql=("DELETE FROM v2_trajectory_reviews "
+                            "WHERE user_id = %s AND source_job_id = %s"),
+)
+
+
+# ---- v2_workspace_entries：PK (user_id, path)。path 只在单个 user 内唯一，两个
+# 不同用户可能取同名 path，item_id 必须把 user_id 也编进去才能全局唯一。
+def _workspace_entries_unpack(r: tuple) -> tuple:
+    (uid, path, kind, envelope, mime_type, source_ref, revision, created_at,
+     updated_at) = r
+    # 用 _SEP（\x1f，"text" 游标本来就用它分隔 sort_val/item_id）复合 user_id+path
+    # ——与 SQL 侧 "user_id || chr(31) || path" 是同一个字符（十进制 31）。
+    item_id = f"{uid}{_SEP}{path}"
+    sort_val = _iso(updated_at) or ""
+    doc = _pack_extra(envelope, path=path, kind=kind, mime_type=mime_type,
+                       source_ref=source_ref, revision=revision,
+                       created_at=_iso(created_at))
+    return (uid, item_id, sort_val, doc)
+
+
+def _workspace_entries_upsert_args(uid: str, iid: str, sort, doc: dict) -> tuple:
+    path, kind, mime_type, source_ref, revision, created_at = _pop_extra(
+        doc, "path", "kind", "mime_type", "source_ref", "revision", "created_at")
+    return (uid, path, kind, Jsonb(doc), mime_type, source_ref, revision,
+            created_at, sort)
+
+
+_TABLES["v2_workspace_entries"] = _Table(
+    select_sql=("SELECT user_id, path, kind, content_envelope, mime_type, source_ref, "
+                "revision, created_at, updated_at FROM v2_workspace_entries "
+                "WHERE (updated_at, user_id || chr(31) || path) > (%s, %s) "
+                "ORDER BY updated_at, user_id || chr(31) || path LIMIT %s"),
+    cursor_kind="text",
+    transform=lambda doc, decrypt: transforms.plaintext_envelope_column(
+        doc, decrypt, purpose=f"tee_replicate:v2_workspace_entries:{doc.get('id', '')}"),
+    upsert_sql=("INSERT INTO v2_workspace_entries "
+                "(user_id, path, kind, content_envelope, mime_type, source_ref, "
+                "revision, created_at, updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (user_id, path) DO UPDATE SET "
+                "kind=EXCLUDED.kind, content_envelope=EXCLUDED.content_envelope, "
+                "mime_type=EXCLUDED.mime_type, source_ref=EXCLUDED.source_ref, "
+                "revision=EXCLUDED.revision, updated_at=EXCLUDED.updated_at"),
+    unpack=_workspace_entries_unpack,
+    upsert_args=_workspace_entries_upsert_args,
+    # revision UPDATE 分支硬编码 updated_at=now()（jobs_store.py 验证过），追加
+    # 友好，不需要 requeue。
+    requeue_fetch_sql=None,
+    requeue_delete_tee_sql=None,
+)
+
+
 def _produce_write(cfg: _Table, user_id: str, item_id: str, sort_val, doc: dict,
                    dry_run: bool):
     """一行 → TEE upsert 参数元组（或 None=已计数但不写，frames dry_run 用）。
