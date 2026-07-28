@@ -245,6 +245,39 @@ ORDER BY table_name;
   是小时级，`tee_sync_runs` 迟迟不落行 ≠ 没在跑（游标推进才是判据）。
 - **验证走真信号**：备份看 R2 对象、复制看游标 `updated_at`、健康看 5xx 率——别只信
   日志/心跳。
+- **`TRUNCATE` 是独立权限，不含在 DML 四件套里**（2026-07-28 实测）：SNAPSHOT lane
+  用 `TRUNCATE + COPY` 做整表原子替换，而 `ensure-roles.sh` 原先只授
+  `SELECT, INSERT, UPDATE, DELETE` → 27 张表全数失败，报的是
+  `permission denied for table X`。**排查时特别容易误判**：
+  `has_table_privilege(role, tbl, 'INSERT')` 查出来全绿，只有 `TRUNCATE` 那一项是 0，
+  逐权限查才看得见：
+  ```sql
+  select r, p, count(*) filter (where has_table_privilege(r,'public.'||tablename,p))
+  from pg_tables, unnest(array['app','tee_replicator']) r,
+       unnest(array['SELECT','INSERT','UPDATE','DELETE','TRUNCATE']) p
+  where schemaname='public' group by r,p order by r,p;
+  ```
+  本地 pytest 跑的是 `postgres` 超级用户，**这类角色权限缺口在本地永远绿**，只有真
+  环境才暴露。`ensure-roles.sh` 已补 `TRUNCATE`（含 `ALTER DEFAULT PRIVILEGES`），但
+  它只在 PG CVM 启动时跑——**给既有库补权限要直接连库执行 GRANT**，不能等重部署。
+- **列漂移会让整张表永久失败**（2026-07-28 实测）：`COPY (FORMAT BINARY)` 按列位置
+  严格匹配，两侧列集差一列就报 `row field count is N, expected M`，而且是**每个 tick
+  都失败**。两种来源都是常态、不是异常：①滚动部署时间窗（新列先落 RDS，TEE 的
+  `alembic_tee` 还没跟上）；②环境自身的历史残留列（test RDS 的
+  `model_api_routes.thinking_fallback` 全仓 grep 零命中，没有任何代码创建它）。
+  `snapshot.py` 现在用两侧列集的**交集**做 COPY，差异逐列报进
+  `tee_sync_runs.report` 的 `missing_in_tee` / `missing_in_rds`，并对
+  `missing_in_tee` 打 `log.warning`。**排查列漂移看这两个字段**：
+  ```sql
+  select ran_at, t->>'table', t->'missing_in_tee', t->'missing_in_rds'
+  from tee_sync_runs, jsonb_array_elements(report->'snapshot') t
+  where jsonb_array_length(coalesce(t->'missing_in_tee','[]'::jsonb)) > 0
+     or jsonb_array_length(coalesce(t->'missing_in_rds','[]'::jsonb)) > 0
+  order by ran_at desc limit 20;
+  ```
+  `missing_in_tee` 非空 = **有一列的数据没在同步**，该补 `alembic_tee` revision；
+  除非那列是某个环境长歪的产物（如上面的 `thinking_fallback`），那就该让它一直报着，
+  TEE 不跟着歪。
 
 ---
 

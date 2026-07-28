@@ -47,6 +47,47 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-28 — TEE SNAPSHOT lane 上真环境后炸出的两个坑：TRUNCATE 权限 + 列漂移
+
+**[DONE] Task 10（计划外追加）+ Task 8 收尾**。全量对齐的代码合进 `test` 部署后，
+SNAPSHOT lane 一行都没同步成功。两个根因**本地测试库结构上都覆盖不到**，记在这里
+是因为它们会重复发生在任何"本地绿了就以为能上"的改动上。
+
+**坑一：`TRUNCATE` 是 PostgreSQL 里独立于 DML 四件套的权限。**
+`deploy/postgres/ensure-roles.sh` 给 `app` / `tee_replicator` 授的是
+`SELECT, INSERT, UPDATE, DELETE`，而 SNAPSHOT lane 的整表原子替换是
+`TRUNCATE + COPY` → 27 张表全数 `permission denied for table X`。
+本地 pytest 跑的是 `postgres` 超级用户，**这类角色权限缺口在本地永远绿**。
+排查时极易误判：`has_table_privilege(role, tbl, 'INSERT')` 查出来 54/54 全绿，
+只有 `TRUNCATE` 那一项是 0，必须逐权限查才看得见。
+修法两层：`ensure-roles.sh` 补上（长期，PG CVM 重部署带着走）+ 直连两个 TEE 实库
+执行 GRANT（脚本只在 CVM 启动时跑，既有库等不到）。
+
+**坑二：列漂移会让整张表永久失败。**
+`snapshot_table` 原先用裸表名 `COPY (FORMAT BINARY)`——按列位置严格匹配整表，
+两侧列集差一列就 `row field count is N, expected M`，且**每个 tick 都失败**。
+两种来源都是常态而非异常：①滚动部署时间窗（`0059`/`0060`/`0061` 给
+`v2_turn_metrics` / `v2_wake_schedule` 加的 10 列，`0004` 的 DDL 是 07-27 从 prod
+派生的，test RDS 跑在前面）；②环境自身的历史残留（test RDS 的
+`model_api_routes.thinking_fallback` 全仓 grep 零命中，没有任何代码创建它——TEE
+侧反而是与代码一致的那个）。
+修法：`COPY` 两侧改用列集**交集**，两侧独有的列分别报进 `missing_in_tee` /
+`missing_in_rds`（落进 `tee_sync_runs.report`），`missing_in_tee` 非空时
+`log.warning`。外加 `alembic_tee 0005` 补齐真实缺的 10 列——但**不补**
+`thinking_fallback`：TEE 不该跟着某个环境长歪，让它一直报着才对。
+护栏：两侧无公共列时拒绝执行。没有它，交集逻辑会把"完全对不上"降级成"共同列为空
+的正常快照"——`TRUNCATE` 照跑、一行写不回、报告仍是 `ok=True`，比原先的整表失败
+更糟（原先只是不同步，那样把已有影子数据也抹了）。
+
+test 实测曲线：`snapshot_failures` 27（部署后）→ 3（补授权）→ 1（落 0005）→ 0
+（部署 Task 10）。prod 解密探针 **2921/2921 = 100% PASS**（28 秒，零毒行）。
+
+**这一轮补上了原始诉求里漏掉的一层**：表注册表守的是"表存在"，守不住"列一致"。
+而列漂移在有滚动部署的系统里是常态。现在漂移是可观测的量，不是某张表悄悄停摆。
+排查配方见 `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md` §3。
+
+---
+
 ## 2026-07-28 — TEE 影子库全量对齐：51 张表归类落地 + verify/registry 双守卫
 
 **[DONE] `2026-07-27-tee-full-table-alignment` 计划全部代码 Task（1-8）完成**。
