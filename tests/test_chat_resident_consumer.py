@@ -7861,10 +7861,16 @@ def test_call_agent_cli_foreign_pinned_resume_not_healed(monkeypatch, tmp_path):
     # An operator-pinned --resume with a sid that is NOT ours is their config —
     # never rotate it, even on a missing-session error.
     _stale_resume_env(monkeypatch, tmp_path, "usr_stale_foreign")
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
     monkeypatch.setattr(
         crc, "AGENT_CLI_CMD",
         'claude --resume 99999999-9999-9999-9999-999999999999 -p "{message}"',
     )
+    # Stamp the local session under the final configured entry. Saving it
+    # before changing AGENT_CLI_CMD makes the entry-signature guard correctly
+    # rotate it, which used to make this test depend on another module having
+    # imported the shared consumer with AGENT_MODE=http.
+    crc._save_agent_session_id(_STALE_SID)
     runs = []
 
     def fake_run(cmd, **kw):
