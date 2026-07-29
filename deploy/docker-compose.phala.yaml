@@ -189,6 +189,11 @@ services:
       # See asgi/lifespan.py.
       FEEDLING_ASGI_BACKGROUND: "true"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
+      # Public HTTPS origin returned by POST /v1/voice/sessions for the
+      # ElevenLabs Custom LLM callback. Keep this literal aligned with ingress
+      # ROUTING_MAP above: the callback host is a trust decision and therefore
+      # belongs in the measured compose_hash, not the mutable encrypted env.
+      FEEDLING_VOICE_GATEWAY_PUBLIC_URL: "https://api.feedling.app"
       # External Postgres holding all (E2E-encrypted) user data + plaintext
       # metadata. Injected via the encrypted env channel (`phala deploy -e
       # DATABASE_URL=...`) because it carries DB credentials. MUST include

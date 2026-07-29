@@ -215,6 +215,19 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
 > 搬运信封），新建表 envelope 列做成明文/信封自识别、**不带强制 K_enclave
 > CHECK**；verify 白名单随新表扩展。
 
+**✅ 已完成**（承接方 `2026-07-27-tee-full-table-alignment` 交付，状态自 test 分支
+`c756ec2a` 合入 v6，2026-07-29）：
+
+- [x] **先还账**：已合并未执行的 alembic_tee 0002/0003 应用到 test 与 prod 实库
+      （撤 V1 supervisor 两表镜像）。0004 落地时一并把两个实库从 0001 推到 0004
+      head（**各 54 张表**），`alembic_tee_version` 已核对。
+- [x] **再建通道**：新增 `.github/workflows/tee-migrate.yml`（手动触发、typo
+      guard、owner 角色 direct-TLS、落地后强制断言 `alembic_tee_version == 代码
+      head`），alembic_tee 从此不再是「纯人工执行、无 CI 钩子」。
+
+> 这两条正是 Task 0.2 根因 1（reconcile 撞 TEE 缺表）得以自愈的原因——排序约束
+> 「0.2 必须先于表同步」的方向因此被证反，见 Task 0.2。
+
 ### Task 0.3: WAL-G restore 演练（扶正的硬前置）
 
 - [x] test 环境按 `deploy/postgres/restore.sh` 从 R2 全量恢复到一次性容器，

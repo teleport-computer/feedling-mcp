@@ -136,6 +136,20 @@ def coalesce_pending(
         if mid:
             seen.add(mid)
         item = {"id": mid, "ts": ts, "content": content}
+        # Image/file routing metadata is part of the current input identity.
+        # Dropping it here leaves the prompt tail unable to distinguish the
+        # active attachment from historical ones, so the worker omits the
+        # current pixels/visual observation and the model answers from history.
+        for key in (
+            "has_image",
+            "image_mime",
+            "vision_route_id",
+            "has_file",
+            "file_name",
+            "file_mime",
+        ):
+            if key in m:
+                item[key] = m[key]
         # Preserve the stable database identity whenever the reader supplied
         # one, including on the compatibility timestamp path.  The timestamp
         # cursor remains a timestamp; callers that are migrating can still

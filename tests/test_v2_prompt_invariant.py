@@ -1122,3 +1122,329 @@ def test_quarantine_refuses_a_row_at_or_behind_the_watermark(monkeypatch):
 
     assert ok is False
     assert jobs_store.get_summary_row(uid)["watermark_seq"] == seeded
+
+
+# --- provider-failure escalation (usr_90184…'s shape) ------------------------
+# The refusal path above covers folds the provider ANSWERED and we rejected.
+# A fold the provider never answers at all (compaction's own `timeout=60.0`,
+# a 5xx, a dropped connection) raises straight out of `v2_compaction.compact`
+# instead of returning unchanged text, so it never reaches the no-op guard
+# that consumes a no-progress attempt. Without its own escalation an oversized
+# batch that cannot finish inside the provider timeout fails the SAME way on
+# every later turn, forever, at full size — usr_90184…'s stall: lane
+# `prompt_catchup`, error_class `transient`, duration_ms 60340.
+
+
+def test_catchup_provider_timeout_shrinks_the_batch_instead_of_failing_the_turn(
+    monkeypatch
+):
+    """A batch too big to fold inside the provider timeout must be retried
+    smaller, not retried identically forever.
+
+    usr_90184… sat here: every turn sent the same oversized catch-up batch,
+    waited out compaction's 60s timeout, and failed. The batch was foldable —
+    just not all at once — so the fix is the same escalation a refusal gets.
+    """
+    uid = "u_prompt_inv_provider_timeout"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 25, 10
+    messages = _seed_messages(uid, n)
+    _seed_summary(uid, covers=5, messages=messages, summary="- old")
+
+    sizes = []
+
+    async def _times_out_on_big_batches(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
+    ):
+        sizes.append(len(old_messages))
+        if len(old_messages) > 2:
+            # What compaction's own `timeout=60.0` surfaces as: no status code,
+            # classified "transient" — the provider never answered.
+            raise provider_client.ProviderError("read timeout", status_code=None)
+        return (current_summary + "\n- folded").strip()
+
+    monkeypatch.setattr(v2_compaction, "compact", _times_out_on_big_batches)
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=read_compaction_tail,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    watermark_seq, _max_seq = asyncio.run(worker._ensure_prompt_coverage(
+        uid, deps, provider_config=_BYOK, enclave_sem=None,
+        tail_limit=tail_limit, max_retries=3))
+
+    # It shrank past the timeout threshold and drained the backlog for real.
+    assert max(sizes) > 2, sizes
+    assert min(sizes) <= 2, sizes
+    assert not asyncio.run(worker._prompt_coverage_gap(
+        uid, watermark_seq=watermark_seq, tail_limit=tail_limit))
+    # Nothing was sacrificed: a timeout says the BATCH was too big, never that
+    # any row is unfoldable, so no row may be quarantined on this path.
+    assert "未能被自动摘要" not in read_summary(uid)[0]
+
+
+def test_catchup_bad_key_fails_fast_without_burning_the_shrink_ladder(monkeypatch):
+    """`provider_config` failures must NOT shrink.
+
+    A 401/402/403 is a property of the user's key, not of the batch: every
+    smaller retry costs another round-trip and another deadline slice while
+    failing identically. Fail on the first one so the turn surfaces the real
+    reason while the user can still act on it.
+    """
+    uid = "u_prompt_inv_bad_key"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 25, 10
+    messages = _seed_messages(uid, n)
+    _seed_summary(uid, covers=5, messages=messages, summary="- old")
+
+    sizes = []
+
+    async def _always_402(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
+    ):
+        sizes.append(len(old_messages))
+        raise provider_client.ProviderError("insufficient balance", status_code=402)
+
+    monkeypatch.setattr(v2_compaction, "compact", _always_402)
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=read_compaction_tail,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    with pytest.raises(provider_client.ProviderError):
+        asyncio.run(worker._ensure_prompt_coverage(
+            uid, deps, provider_config=_BYOK, enclave_sem=None,
+            tail_limit=tail_limit, max_retries=3))
+
+    # One call, one failure — no ladder, no quarantine.
+    assert sizes == sizes[:1], sizes
+    assert "未能被自动摘要" not in read_summary(uid)[0]
+
+
+def test_total_provider_outage_never_quarantines_a_healthy_row(monkeypatch):
+    """Down to a batch of one and STILL timing out: fail, do not quarantine.
+
+    Quarantine trades one row's summary coverage for everyone else's
+    unblocking, and that trade is only honest when the row itself is
+    unfoldable. A provider outage says nothing about the row — sacrificing it
+    would drop a perfectly good message from the summary permanently, and the
+    next turn (after the provider recovers) would have folded it fine.
+    """
+    uid = "u_prompt_inv_outage"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 25, 10
+    messages = _seed_messages(uid, n)
+    seeded = _seed_summary(uid, covers=5, messages=messages, summary="- old")
+
+    async def _always_times_out(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
+    ):
+        raise provider_client.ProviderError("read timeout", status_code=None)
+
+    monkeypatch.setattr(v2_compaction, "compact", _always_times_out)
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=read_compaction_tail,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    with pytest.raises((worker.TurnError, provider_client.ProviderError)):
+        asyncio.run(worker._ensure_prompt_coverage(
+            uid, deps, provider_config=_BYOK, enclave_sem=None,
+            tail_limit=tail_limit, max_retries=3))
+
+    # The frontier stayed exactly where it was: no coverage was invented, and
+    # no healthy row was written off.
+    assert jobs_store.get_summary_row(uid)["watermark_seq"] == seeded
+    assert "未能被自动摘要" not in read_summary(uid)[0]
+
+
+def test_timeout_shrinks_on_the_first_failure_not_after_the_retry_budget(
+    monkeypatch
+):
+    """The ladder has to fit inside the catch-up deadline.
+
+    Spending `max_retries` timeouts at each rung costs 4 rungs × 3 × the 60s
+    provider timeout = 720s against a 600s deadline, so the run dies before
+    reaching the small batches that would have folded — and because
+    `batch_cap` is a local, the next turn starts over at the top. Retrying an
+    identical batch is only worth it when the model ANSWERED (it is
+    nondeterministic, so the same batch often folds next time); a timeout says
+    the batch is too big, and re-sending it just buys another full timeout.
+    """
+    uid = "u_prompt_inv_fast_shrink"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 40, 10
+    messages = _seed_messages(uid, n)
+    _seed_summary(uid, covers=5, messages=messages, summary="- old")
+    monkeypatch.setattr(worker, "_COMPACTION_BATCH", 16)
+
+    sizes = []
+
+    async def _always_times_out(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
+    ):
+        sizes.append(len(old_messages))
+        raise provider_client.ProviderError("read timeout", status_code=None)
+
+    monkeypatch.setattr(v2_compaction, "compact", _always_times_out)
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=read_compaction_tail,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    with pytest.raises((worker.TurnError, provider_client.ProviderError)):
+        asyncio.run(worker._ensure_prompt_coverage(
+            uid, deps, provider_config=_BYOK, enclave_sem=None,
+            tail_limit=tail_limit, max_retries=3))
+
+    # The very next attempt after the first timeout is already smaller.
+    assert len(sizes) >= 2, sizes
+    assert sizes[1] < sizes[0], sizes
+    # The whole ladder (16 → 4 → 1) is walked in far fewer provider calls than
+    # the retry budget alone would allow: 3 rungs × 3 retries would be 9.
+    assert len(sizes) <= 6, sizes
+    assert min(sizes) == 1, sizes
+
+
+def test_a_refusal_still_gets_its_full_retry_budget_at_each_size(monkeypatch):
+    """The counterpart to the test above — don't over-generalise the fix.
+
+    A batch the model ANSWERED and we rejected is worth re-sending unchanged:
+    generation is nondeterministic, and the identical batch frequently folds
+    on the next attempt. Only timeouts (no answer at all) skip the budget.
+    """
+    uid = "u_prompt_inv_refusal_budget"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 40, 10
+    messages = _seed_messages(uid, n)
+    _seed_summary(uid, covers=5, messages=messages, summary="- old")
+    monkeypatch.setattr(worker, "_COMPACTION_BATCH", 16)
+
+    sizes = []
+
+    async def _always_refuses(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
+    ):
+        sizes.append(len(old_messages))
+        if reject_out is not None:
+            reject_out("line_not_bullet:0")
+        return current_summary  # answered, but rejected
+
+    monkeypatch.setattr(v2_compaction, "compact", _always_refuses)
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=read_compaction_tail,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    asyncio.run(worker._ensure_prompt_coverage(
+        uid, deps, provider_config=_BYOK, enclave_sem=None,
+        tail_limit=tail_limit, max_retries=3))
+
+    # The first size was tried more than once before anything shrank.
+    assert sizes.count(sizes[0]) > 1, sizes
+
+
+def test_a_timeout_earlier_in_the_run_does_not_block_a_later_quarantine(
+    monkeypatch
+):
+    """The `last_provider_exc` gate must be cleared by any answered fold.
+
+    Real runs mix failure modes: a big batch times out, the shrunk batch
+    reaches the model, and the model refuses it all the way down to a single
+    row. That final state is a CONTENT problem — the row is genuinely
+    unfoldable and quarantine is the honest escape. If the earlier timeout
+    were still latched, the run would raise instead, and the user would stay
+    blocked behind a row that quarantine was built to get past.
+    """
+    uid = "u_prompt_inv_timeout_then_refusal"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n, tail_limit = 25, 10
+    messages = _seed_messages(uid, n)
+    seeded = _seed_summary(uid, covers=5, messages=messages, summary="- old")
+    monkeypatch.setattr(worker, "_COMPACTION_BATCH", 8)
+
+    calls = {"n": 0}
+
+    async def _timeout_once_then_always_refuse(
+        *, provider_config, current_summary, old_messages, llm, usage_out=None,
+        reject_out=None,
+    ):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise provider_client.ProviderError("read timeout", status_code=None)
+        if reject_out is not None:
+            reject_out("line_not_bullet:0")
+        return current_summary  # answered, refused, at every size
+
+    monkeypatch.setattr(v2_compaction, "compact", _timeout_once_then_always_refuse)
+
+    read_summary, read_compaction_tail, read_tail, write_summary = _make_deps(messages)
+    deps = worker.TurnDeps(
+        read_messages=lambda uid_: [],
+        resolve_provider=lambda uid_: (_BYOK, {}),
+        mint_enclave_token=lambda uid_: "rt",
+        read_summary=read_summary,
+        read_compaction_tail=read_compaction_tail,
+        read_tail=read_tail,
+        write_summary=write_summary,
+    )
+
+    watermark_seq, _max_seq = asyncio.run(worker._ensure_prompt_coverage(
+        uid, deps, provider_config=_BYOK, enclave_sem=None,
+        tail_limit=tail_limit, max_retries=3))
+
+    # It quarantined its way forward rather than re-raising the stale timeout.
+    assert watermark_seq > seeded
+    assert "未能被自动摘要" in read_summary(uid)[0]

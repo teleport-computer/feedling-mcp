@@ -111,7 +111,7 @@ def test_sync_tick_persists_one_row(backend_env, monkeypatch):
     row = new_rows[0]
     assert row["did_reconcile"] is True
     assert row["reconcile_copied"] == 3
-    assert row["replicate_copied"] == len(sched._CIPHERTEXT_TABLES)  # 每表 copied=1
+    assert row["replicate_copied"] == len(sched._replicable_tables())  # 每表 copied=1
     assert row["verify_ran"] is True and row["verify_ok"] is True
     assert row["unconverged_tables"] == 0 and row["unconverged_users"] == 0
     assert row["tee_healthy"] is True
@@ -144,7 +144,7 @@ def test_sync_tick_records_whole_table_replicate_failure(backend_env, monkeypatc
     assert len(new) == 1
     row = new[0]
     assert row["replicate_table_failures"] == 1          # chat_messages 整表挂被计数
-    assert row["replicate_copied"] == len(sched._CIPHERTEXT_TABLES) - 1  # 其余 4 张各 1
+    assert row["replicate_copied"] == len(sched._replicable_tables()) - 1  # 其余 4 张各 1
     assert row["report"]["replicate_failed"]["chat_messages"] == "the connection is lost"
     assert "chat_messages" not in (row["report"].get("replicate") or {})  # 挂的表不在成功明细里
 

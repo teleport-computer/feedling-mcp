@@ -47,6 +47,173 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-29 — Runtime 值班台加上开销：各 lane 的 token 与缓存效率
+
+**[DONE] `/admin/data-track?view=runtime` 的 lane 健康表增加 token 两列**，窗口跟随
+页面切换（24h / 7天 / 30天）。此前值班台只回答"跑得好不好"，不回答"花了多少"；而
+token 统计只存在于 users 页的「运营 Telemetry」区块，且是**全站 chat lane、固定 30 天**
+的单一口径——非 chat lane 的开销完全不可见。心跳 lane 烧闲置用户 BYOK 是出过事的
+（`usr_57c24d0d` 零聊天、65 个回合全是 sleep），当前口径恰恰看不到它。
+
+- `jobs_store.recent_token_usage_by_lane(within_hours)`：按 lane 的 `GROUP BY` 聚合。
+  三条口径写进了 docstring：**统计全部回合、不过滤 `failed`**（失败回合照样烧钱，
+  provider 已经算过钱了——这与同文件 `recent_runtime_health` 的延迟分位数只算成功回合
+  正好相反，两者过滤条件相反是刻意的）；**无上报是 `None` 不是 `0`**（靠 `sum()` 的
+  NULL 传播，计数列用 `coalesce(...,0)`、token 列裸 `sum`，否则"provider 没回 usage"
+  会伪装成"用了 0 个 token"）；**不加 `LIMIT`**（sum 聚合加采样上界会静默少报总量——
+  这条决策本身仍然正确；扫描路径当时以为由 `ix_v2_turn_metrics_lane_created_at` 的
+  lane 前缀控制，这句话后来被 review 实测证伪，见下面 07-29 review 修复条目）。
+- 渲染两列：「token 入/出」`951.2k / 40.5k`、「缓存命中 · 上报」`49% · 87%`。某条 lane
+  不在返回的 `lanes` 字典里时（有 job 但一个回合都没终态）两列显 `—`，不 `KeyError`、
+  也不显 0——判据一律 `is None` 而非 falsy，否则真实的 `0` token 会被误显成"无数据"。
+- 接线：窗口在 `page_html` 里**算一次、传给两个数据函数**，而不是让它们各自读
+  `request.args`——后者会让同一页出现一个 24 小时、一个 720 小时的窗口，且几乎看不出来。
+  `try/except` 同时覆盖两次数据调用、但不包住渲染调用（渲染层的 bug 不该被误吞成
+  "数据源故障"降级页）。
+
+⚠️ **users 页那块保留不动，两处窗口口径不同**（users 固定近 30 天、本页跟随窗口），
+页面说明里写明了"两处数字不一致是窗口不同、不是 bug，切到 30 天时应当一致"。
+
+L1 全量 7086 passed / 0 failed（基线 7068 + 新增 18）。无迁移、未改
+`recent_token_usage_summary`、未动其余视图页。
+
+### [DONE] 整分支 code review 后的 4 个 Important + 2 个 Minor 修复（同日）
+
+- **索引论证反了（docstring/design §3）**：`ix_v2_turn_metrics_lane_created_at` 是
+  `(lane, created_at DESC)`，`lane` 打头恰恰意味着它服务不了本查询（无 lane 等值谓词，
+  PG 16 无 skip scan）。本地 PG 16 实测走 Parallel Seq Scan。改写 docstring 说实话，
+  「不加 LIMIT」的决策保留，只换掉依据；把补索引记为 design 里的明确 follow-up。
+- **渲染层漏掉 token-only 的 lane**：`_render_runtime_health_page` 现在遍历
+  `payload["lanes"]` ∪ `tokens["lanes"]` 的并集——一条窗口内有 token 开销、但 job 没
+  挤进健康侧 `LIMIT 1000` 采样的 lane，此前不显示也不报错，现在会以健康列全 `—`、
+  token 列正常数字的合成行出现。页顶补一句采样上界差异的说明。
+- **窗口不一致的"不可能"只是巧合**：`recent_runtime_health` 钳 `24*30`，
+  `recent_token_usage_by_lane` 钳 `24*366`，今天恰好都等于 720。加了白名单守卫测试
+  `max(_RUNTIME_HEALTH_WINDOWS) <= 24*30`，把巧合钉成会红的约束。
+  `_RUNTIME_HEALTH_WINDOWS` 加超过 720 小时的档位时这条测试会先红。
+- **`cache_hit_ratio` 与 users 页算法不一致**：只上报一侧（`cache_read=None,
+  cache_miss=500` 或反过来）时旧算法显 `0.0%` / `100.0%`（假装完美命中），users 页显
+  `—`。已对齐 users 页：任一为 `None` → ratio 为 `None`。Anthropic 只有 cache write
+  无 cache read 的回合是真实路径，不是理论构造。
+- Minor：`_fmt_tokens_compact` 在 `[999_950, 1e6)` / `[999_950_000, 1e9)` 两个区间
+  会显示成上一档的 `"1000.0k"` / `"1000.0M"`（先除后 `.1f` 进位）；真实边界是 999_950，
+  不是 999_500。新增 B 档并按格式化结果收紧阈值。
+- Minor：`test_render_runtime_health_page_token_columns_are_dash_without_data` 的
+  `>= 2` 收紧为按 lane 行精确断言 `== 2`。
+
+无迁移、无索引改动（记为 follow-up）。design/plan 两份文档同步更正，plan 文档保留原始
+代码片段、在末尾追加 Post-review 修正记录不改写历史。
+
+L1 全量 7092 passed / 0 failed（基线 7086 + 本轮新增 6：cache_hit_ratio 部分上报两个方向、
+窗口白名单守卫、`_fmt_tokens_compact` 真实进位边界、token-only lane 出现在渲染结果里、
+token-only lane 不参与健康结论判定）。1 skipped / 9 xfailed 与基线一致，非本轮引入。
+
+## 2026-07-28 — TEE SNAPSHOT lane 上真环境后炸出的两个坑：TRUNCATE 权限 + 列漂移
+
+**[DONE] Task 10（计划外追加）+ Task 8 收尾**。全量对齐的代码合进 `test` 部署后，
+SNAPSHOT lane 一行都没同步成功。两个根因**本地测试库结构上都覆盖不到**，记在这里
+是因为它们会重复发生在任何"本地绿了就以为能上"的改动上。
+
+**坑一：`TRUNCATE` 是 PostgreSQL 里独立于 DML 四件套的权限。**
+`deploy/postgres/ensure-roles.sh` 给 `app` / `tee_replicator` 授的是
+`SELECT, INSERT, UPDATE, DELETE`，而 SNAPSHOT lane 的整表原子替换是
+`TRUNCATE + COPY` → 27 张表全数 `permission denied for table X`。
+本地 pytest 跑的是 `postgres` 超级用户，**这类角色权限缺口在本地永远绿**。
+排查时极易误判：`has_table_privilege(role, tbl, 'INSERT')` 查出来 54/54 全绿，
+只有 `TRUNCATE` 那一项是 0，必须逐权限查才看得见。
+修法两层：`ensure-roles.sh` 补上（长期，PG CVM 重部署带着走）+ 直连两个 TEE 实库
+执行 GRANT（脚本只在 CVM 启动时跑，既有库等不到）。
+
+**坑二：列漂移会让整张表永久失败。**
+`snapshot_table` 原先用裸表名 `COPY (FORMAT BINARY)`——按列位置严格匹配整表，
+两侧列集差一列就 `row field count is N, expected M`，且**每个 tick 都失败**。
+两种来源都是常态而非异常：①滚动部署时间窗（`0059`/`0060`/`0061` 给
+`v2_turn_metrics` / `v2_wake_schedule` 加的 10 列，`0004` 的 DDL 是 07-27 从 prod
+派生的，test RDS 跑在前面）；②环境自身的历史残留（test RDS 的
+`model_api_routes.thinking_fallback` 全仓 grep 零命中，没有任何代码创建它——TEE
+侧反而是与代码一致的那个）。
+修法：`COPY` 两侧改用列集**交集**，两侧独有的列分别报进 `missing_in_tee` /
+`missing_in_rds`（落进 `tee_sync_runs.report`），`missing_in_tee` 非空时
+`log.warning`。外加 `alembic_tee 0005` 补齐真实缺的 10 列——但**不补**
+`thinking_fallback`：TEE 不该跟着某个环境长歪，让它一直报着才对。
+护栏：两侧无公共列时拒绝执行。没有它，交集逻辑会把"完全对不上"降级成"共同列为空
+的正常快照"——`TRUNCATE` 照跑、一行写不回、报告仍是 `ok=True`，比原先的整表失败
+更糟（原先只是不同步，那样把已有影子数据也抹了）。
+
+test 实测曲线：`snapshot_failures` 27（部署后）→ 3（补授权）→ 1（落 0005）→ 0
+（部署 Task 10）。prod 解密探针 **2921/2921 = 100% PASS**（28 秒，零毒行）。
+
+**这一轮补上了原始诉求里漏掉的一层**：表注册表守的是"表存在"，守不住"列一致"。
+而列漂移在有滚动部署的系统里是常态。现在漂移是可观测的量，不是某张表悄悄停摆。
+排查配方见 `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md` §3。
+
+---
+
+## 2026-07-28 — TEE 影子库全量对齐：51 张表归类落地 + verify/registry 双守卫
+
+**[DONE] `2026-07-27-tee-full-table-alignment` 计划全部代码 Task（1-8）完成**。
+起点：2026-07-27 实测 RDS 61 张基表里只有 20 张镜进了 TEE 影子库，且这套三层
+手工白名单（`db.py` 双写点 / `tee_replicator.worker._TABLES` / `tee_shadow.
+reconciler.TABLES`）互不校验，谁都不是全集——Runtime V2 的 19 张新表就是这样
+在无人发现的情况下漏掉的。
+
+- **新增 `backend/tee_shadow/table_registry.py` 作为单一真源**：61 张 RDS 表
+  逐条登记 lane（`MIRROR` 13 / `CIPHERTEXT` 11 / `SNAPSHOT` 27 / `SKIP` 10 /
+  `LOGICAL` 0，预留给尚未开通的 PG 原生逻辑复制），51 张非 SKIP 表全部进 TEE。
+  `tests/test_tee_table_registry.py` 守完备性：RDS 迁移链建出的每一张表必须
+  有且只有一条登记（漏登记直接红），且非 SKIP 登记必须能在 `alembic_tee` 的
+  真实库里找到对应表（专治"revision 合并了但从未在实库执行"）。
+- **新增 SNAPSHOT lane**（`tee_shadow/snapshot.py`）：给"明文、数据量小、但有
+  UPDATE/DELETE"的 27 张表（`agent_action_queue`/`v2_turn_metrics`/`v2_runtime_
+  control` 等）用 `TRUNCATE`+`COPY` 整表原子替换，不必像 CIPHERTEXT 那样为每
+  张可变表单独接 requeue 补偿。`agent_runtime_instances`/`agent_runtime_
+  supervisor_heartbeats` 最初按"双写热路径"标了 MIRROR，实测两张表情况不同但
+  结论一致——都改判 SNAPSHOT：`agent_runtime_instances` 的 8 处租约热路径写点
+  （`agent_runtime/leases.py`）确实只写 RDS（文件顶部注明有意不镜像，ephemeral
+  TTL 锁）；`agent_runtime_supervisor_heartbeats` 其实**有** `db.py` 的 mirror
+  双写（upsert/prune 两个写点都调了 `mirror.execute`，原样保留不动），但这条
+  镜像没有 `reconciler.TABLES` 兜底、漂了没人拉回来，且心跳每次都改
+  `updated_at`，接 reconciler 会在 strict 逐列比对上变成永久红——SNAPSHOT 每
+  tick 整表替换天然收敛，不需要这些。0004 迁移已建表、prod 2026-07-28 复测
+  230+1 行且 0 孤儿（0004 迁移里写的 220 行是 07-27 写迁移时的旧值），FK 前提
+  满足。
+- **`tee_replicator.worker._TABLES` 接入 7 张新密文表**（`chat_message_
+  archive`/`model_api_credentials`/`v2_conversation_summary(+_segments)`/
+  `v2_trajectory_events`/`v2_trajectory_reviews`/`v2_workspace_entries`）。
+  test 环境 CVM 容器内探针 gate：7 张表 100% PASS（0 pending_device / 0
+  permanent_fail / 0 异常），`v2_trajectory_events` 实测 124/124（`enclave_pk_
+  fpr` 全空仍全部解得开）；`chat_message_archive`/`v2_trajectory_reviews` 当时
+  test 环境 0 行，未被真实数据覆盖，接线按合成行验证补了这个盲区。冷启动有一个
+  Critical 修复：`_decode_cursor` 对从未跑过的新表返回空串水位线，遇到排序列是
+  TIMESTAMPTZ/BIGINT/UUID 的表（而非既有表的 TEXT 排序列）直接 cast 失败、
+  scheduler 逐表 try/except 静默吞掉、每 tick 无声重复失败——修法是给 `_Table`
+  加 `cursor_zero` 字段，逐表配出各自类型能 parse 的下界。
+- **`tee_shadow/verify.py` 覆盖范围从 18 张扩到全部 51 张（新增 `covered_
+  tables()`）**：SNAPSHOT lane 只核行数（整表替换对增量抽样没有信息量）；7 张
+  新密文表因信封列名各不相同（`payload_envelope`/`api_key_envelope`/
+  `summary_envelope`/`review_envelope`/`content_envelope`，`_sample_ciphertext_
+  content` 写死读 `doc`）暂只做行数核算，内容抽样参数化列为独立后续工作。新增
+  `_rows_ok_advisory`：SNAPSHOT/新密文表是"tick 级快照"或"游标增量"，天生会与
+  持续在写的 RDS 有瞬时行数差，不能像老表那样要求 `rds==tee` 精确相等（会让
+  gate 永久红、没人再看）——判据收窄成"RDS 有行而 TEE 一行都没有"，真正抓的是
+  "这张表从没同步成功过"。`tests/test_tee_verify.py::test_verify_covers_every_
+  synced_table` 守住"注册表新增表 = verify 范围自动跟上"，否则 `verify_ok=true`
+  但新表压根没被核对会是一次"全绿假象"。
+- **补上 alembic_tee 的迁移落地通道**（`.github/workflows/tee-migrate.yml`）：
+  之前完全靠人工执行，已合并的 0002/0003 在 2026-07-27 之前从未在 test/prod
+  实库跑过（两库停在 0001）。新通道手动触发、typo guard、owner 角色 direct-TLS
+  连接、落地后强制断言 `alembic_tee_version == 代码 head`。2026-07-27 已用它
+  （加一次本地手动执行）把两个实库从 0001 推到 0004 head，各 54 张表。
+- prod 解密探针（`scripts/tee/decrypt_probe.py --dsn PROD ...`）与 prod 部署
+  验收（`snapshot_failures=0`/`verify_ok=t`/`unconverged_tables=0`）按分工由
+  controller 在本次之外单独执行，本条记录只覆盖代码 Task 的落地范围。
+
+文档：本文件 + `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md`（新增 §2.9 迁移落地
+通道）+ 上游 `docs/superpowers/plans/2026-07-23-tee-promotion-decrypt-removal.md`
+（Task 0.6 两个 checkbox 勾掉，Task 1.5 v2 表迁移策略处标注由本计划完成）。
+公开文档（`docs-site/`）与 OpenAPI 不涉及：不碰公开 API 契约、不改架构对外
+叙事、不改信任边界（TEE 库定位与可见性没变）。
+
 ## 2026-07-28 — Admin Runtime 健康值班台：收尾修复最终 code review 的三个 Important 项
 
 **[DONE] `/admin/data-track?view=runtime` 值班台过审前的三条修复 + 一处文档更正**。这是
@@ -273,7 +440,24 @@ OpenAPI 不涉及（零命中）。
 `.cn` 签发的 key 打 `api.moonshot.ai` 直接 `401 Invalid Authentication`；用户报
 `provider_test_failed`/401 时先核 `base_url` 与 key 签发区是否配对。
 
-## 2026-07-26 — V1 resident 补齐可下载文件
+## 2026-07-26
+
+### [DONE] V1/V2 聊天执行记录统一为可信投影
+- V2 provider-native 工具调度在调用开始和真实结果/异常边界写入 display-safe
+  `agent_status_events`；只保留受限的工具名、call/job/effect id、状态、耗时和结果
+  分类，不保存参数、结果正文、助手文案或推理。
+- V1 resident 的 `io_cli` 也在真实命令开始/结束边界写同一份按 turn 持久化的
+  fixed-shape 事件；记忆分类只从 `memory-index` / `memory-fetch` 实际返回项统计，
+  自定义分类时只给总数。
+- 用户鉴权的 `GET /v1/chat/turn-activity/{turn_id}` 现在同时读取 V1/V2；新增
+  resident 专用写入口，只接受已存在 user turn 下的固定字段，V2 所有权会拒绝该写入。
+- 最终回复把同一份受限工具事件附在 `activity_events` metadata；provider-native
+  reasoning 继续走独立加密 thinking envelope，二者不混合。
+- `memory_search` / `memory_fetch` 在 capability 真实结果还未截断时提取返回总数；
+  只有每一项都命中固定双语通用桶时才附完整分类计数，任一自定义/未知桶则只保留总数。
+  记忆摘要、正文、搜索词和原始桶名都不进入活动记录。
+
+### [DONE] V1 resident 补齐可下载文件
 
 ### [DONE] Claude / Codex / Pi 共用文件生成与原子回复
 - V1 CLI resident 新增 `io_cli send-file`：模型把 UTF-8 源文件写进每用户隔离的

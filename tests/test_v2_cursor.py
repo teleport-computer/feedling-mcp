@@ -54,6 +54,36 @@ def test_after_seq_respects_after_and_limit(pg_clean):
     assert db.chat_max_seq("u_cur2") == first_seq + 4
 
 
+def test_terminal_failure_settles_only_its_user_row_and_advances_cursor(pg_clean):
+    uid = "u_cur_failed_turn"
+    seed_user(uid)
+    db.chat_append(
+        uid,
+        "failed-image",
+        1.0,
+        {"id": "failed-image", "ts": 1.0, "role": "user", "content_type": "image"},
+        5000,
+    )
+    db.chat_append(
+        uid,
+        "new-image",
+        2.0,
+        {"id": "new-image", "ts": 2.0, "role": "user", "content_type": "image"},
+        5000,
+    )
+    failed_seq = db.chat_messages_after_seq(uid, 0, limit=1)[0]["seq"]
+
+    assert db.chat_settle_failed_input(uid, "failed-image", "turn_failed:providererror")
+
+    failed = db.chat_messages_after_seq(uid, 0, limit=1)[0]
+    assert failed["reply_status"] == "failed"
+    assert failed["reply_failure_code"] == "turn_failed:providererror"
+    assert cursor.load_seq(type("Store", (), {"user_id": uid})()) == failed_seq
+    assert [row["id"] for row in db.chat_messages_after_seq(uid, failed_seq)] == [
+        "new-image"
+    ]
+
+
 def test_newest_seq_window_is_bounded_then_restored_to_ascending(pg_clean):
     seed_user("u_cur_newest")
     for i in range(5):

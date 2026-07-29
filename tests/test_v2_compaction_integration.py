@@ -35,6 +35,7 @@ from capabilities import registry as cap_registry
 from core import store as core_store
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
 from model_api_runtime.v2 import worker
 
 _BYOK = provider_client.ProviderConfig(
@@ -228,3 +229,197 @@ def test_chat_turn_over_budget_enqueues_maintenance_then_compaction_advances_wat
     assert len(new_tail) < len(full_tail)
     assert len(new_tail) == worker._TAIL_KEEP
     assert db.chat_count_strict(uid) == durable_count_before == len(messages)
+
+
+# --- maintenance must not be blocked by its own optimisations ---------------
+# Both cases below were observed wedging real prod users on 2026-07-29 after a
+# V2 cutover: the backlog could not drain, and manually re-enqueuing
+# maintenance did nothing (the watermark did not move across repeated rounds).
+
+
+def _minimal_compaction_deps(messages: list[dict], *, with_frontier: bool):
+    """Just enough deps for `_run_compaction`'s legacy (ts) write path."""
+    _read_messages, _read_tail, _read_summary, _write_summary = (
+        _make_fake_conversation_deps(messages)
+    )
+    ordered = sorted(messages, key=lambda m: m["ts"])
+
+    def _read_compaction_tail(uid, after_ts, limit):
+        out = [m for m in ordered if m["ts"] > after_ts]
+        return out[:limit] if limit > 0 else []
+
+    kwargs = dict(
+        read_messages=_read_messages,
+        resolve_provider=lambda uid: (_BYOK, {}),
+        mint_enclave_token=lambda uid: "rt",
+        read_summary=_read_summary,
+        read_tail=_read_tail,
+        read_compaction_tail=_read_compaction_tail,
+        write_summary=_write_summary,
+    )
+    if with_frontier:
+        # Presence of this callback is what makes `_run_compaction` attempt a
+        # checkpoint rebalance before folding.
+        kwargs["read_summary_frontier"] = lambda uid: None
+    return worker.TurnDeps(**kwargs)
+
+
+def test_checkpoint_failure_must_not_block_the_fold(monkeypatch):
+    """A failed checkpoint must cost the checkpoint, not the fold.
+
+    `_run_compaction` rebalances the summary frontier BEFORE reading the tail.
+    That call raising (`SummaryFrontierExhausted` when no safe roll-up batch
+    can be formed) skips the entire fold below it, so the backlog can never
+    drain — and because the roll-up input doesn't change, it raises again on
+    every retry. usr_7f30 on prod sat at a frozen watermark through repeated
+    manual re-enqueues for exactly this reason.
+
+    A checkpoint only reduces how many nodes a later prompt must read; the
+    fold is the actual work. Losing the former must not cost the latter.
+    """
+    uid = "u_v2_checkpoint_blocks_fold"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n = worker._TAIL_KEEP + 12
+    messages = [
+        {"id": f"m{i}", "ts": float(i + 1),
+         "role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(n)
+    ]
+
+    async def _rebalance_always_exhausted(*args, **kwargs):
+        raise v2_summary_frontier.SummaryFrontierExhausted(
+            "fanout_run_exceeds_rollup_input"
+        )
+
+    monkeypatch.setattr(
+        worker, "_rebalance_summary_frontier", _rebalance_always_exhausted
+    )
+
+    async def _fake_llm(_config, _messages, **_kwargs):
+        return {"reply": "- folded bullet"}
+
+    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", _fake_llm)
+
+    deps = _minimal_compaction_deps(messages, with_frontier=True)
+    job_id, _ = jobs_store.enqueue_job(uid, "maintenance", reason="compaction")
+    job = jobs_store.claim_next_job("compaction-test")
+    assert job is not None and job["id"] == job_id
+
+    status = asyncio.run(worker._run_compaction(
+        job_id, uid, deps, _BYOK, worker.ENCLAVE_SEMAPHORE,
+        claimed_by=str(job["claimed_by"])))
+
+    # The fold ran despite the checkpoint failing, and the watermark moved.
+    row = jobs_store.get_summary_row(uid)
+    assert status == "completed", status
+    assert row is not None and row["watermark_ts"] > 0, row
+    assert "folded bullet" in str((row["summary_envelope"] or {}).get("plaintext") or "")
+
+
+def test_refused_fold_shrinks_instead_of_reporting_success(monkeypatch):
+    """A refused fold must be retried smaller, not silently written off.
+
+    `_run_compaction`'s no-op guard treats "the model returned nothing usable"
+    as success: it marks the job completed with `status="ok"` and returns
+    WITHOUT advancing the watermark, retrying, shrinking or chaining a
+    follow-up. The backlog is then permanently stuck while every dashboard
+    reports healthy maintenance.
+
+    usr_90184 on prod: job 130 recorded `model_calls=1, status=ok` while
+    `v2_conversation_summary.updated_at` stayed an hour old — a 7393-char fold
+    request came back as 95 chars (too short to pass bullet validation),
+    presumably a refusal on that batch's content. The inline catch-up already
+    handles this by shrinking the batch and, at a batch of one, quarantining
+    the row; maintenance had none of that.
+    """
+    uid = "u_v2_refused_fold_shrinks"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n = worker._TAIL_KEEP + 12
+    messages = [
+        {"id": f"m{i}", "ts": float(i + 1),
+         "role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(n)
+    ]
+
+    sizes = []
+
+    async def _refuse_big_batches(_config, msgs, **_kwargs):
+        # `compact` renders the whole batch into one user turn; count the rows
+        # it was asked to fold from the caller side instead.
+        sizes.append(_refuse_big_batches.pending)
+        if _refuse_big_batches.pending > 2:
+            return {"reply": ""}          # refused: nothing usable came back
+        return {"reply": "- folded small"}
+
+    _refuse_big_batches.pending = 0
+
+    real_prefix = worker._bounded_compaction_prefix
+
+    def _spy_prefix(rows, **kwargs):
+        out = real_prefix(rows, **kwargs)
+        _refuse_big_batches.pending = len(out)
+        return out
+
+    monkeypatch.setattr(worker, "_bounded_compaction_prefix", _spy_prefix)
+    monkeypatch.setattr(
+        provider_client, "reliable_chat_completion_async", _refuse_big_batches
+    )
+
+    deps = _minimal_compaction_deps(messages, with_frontier=False)
+    job_id, _ = jobs_store.enqueue_job(uid, "maintenance", reason="compaction")
+    job = jobs_store.claim_next_job("compaction-test")
+    assert job is not None and job["id"] == job_id
+
+    status = asyncio.run(worker._run_compaction(
+        job_id, uid, deps, _BYOK, worker.ENCLAVE_SEMAPHORE,
+        claimed_by=str(job["claimed_by"])))
+
+    row = jobs_store.get_summary_row(uid)
+    # It shrank past the refusal threshold rather than declaring victory.
+    assert max(sizes) > 2, sizes
+    assert min(sizes) <= 2, sizes
+    # And the watermark actually moved, which is the whole point of the job.
+    assert row is not None and row["watermark_ts"] > 0, (status, row)
+
+
+def test_legacy_compaction_reader_also_excludes_gc_able_rows(monkeypatch):
+    """Both compaction readers must agree on what may be folded.
+
+    A `verify_ping` row lives in chat_messages only until its probe completes.
+    Folding one into an immutable leaf freezes a coverage claim the row will
+    not honour, and `validate_canonical_frontier` then fails on EVERY later
+    turn. The seq-based reader passes `exclude_synthetic_sources=True`; its
+    ts-based sibling did not, leaving the same hole open for any caller that
+    still reaches it.
+    """
+    from model_api_runtime.v2 import serve_worker as v2_serve_worker
+
+    uid = "u_v2_legacy_reader_excludes"
+    rows = [
+        {"id": "a", "ts": 1.0, "role": "user", "source": "chat", "body_ct": "x",
+         "K_enclave": "k"},
+        {"id": "ping", "ts": 2.0, "role": "user", "source": "verify_ping",
+         "body_ct": "x", "K_enclave": "k"},
+        {"id": "b", "ts": 3.0, "role": "openclaw", "source": "model_api",
+         "body_ct": "x", "K_enclave": "k"},
+    ]
+
+    class _Store:
+        user_id = uid
+        chat_messages = rows
+
+        def reload_chat_strict(self):
+            return rows
+
+    monkeypatch.setattr(v2_serve_worker.core_store, "get_store", lambda _u: _Store())
+    monkeypatch.setattr(
+        v2_serve_worker, "_decrypt_chat_rows",
+        lambda _uid, sel, **_kw: [dict(r) for r in sel],
+    )
+
+    folded = v2_serve_worker._read_compaction_tail(uid, 0.0, 10)
+    assert [r["id"] for r in folded] == ["a", "b"], folded

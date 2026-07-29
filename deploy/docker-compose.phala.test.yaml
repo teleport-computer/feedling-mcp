@@ -87,7 +87,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:5331dea
+    image: ghcr.io/teleport-computer/feedling:2b44a26
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -146,7 +146,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:5331dea
+    image: ghcr.io/teleport-computer/feedling:2b44a26
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -198,6 +198,11 @@ services:
       # conns/worker → -w2≈36, safe.
       FEEDLING_BACKEND_WORKERS: "${FEEDLING_BACKEND_WORKERS:-1}"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
+      # Public HTTPS origin returned by POST /v1/voice/sessions for the
+      # ElevenLabs Custom LLM callback. Keep this literal aligned with ingress
+      # ROUTING_MAP above: the callback host is a trust decision and therefore
+      # belongs in the measured compose_hash, not the mutable encrypted env.
+      FEEDLING_VOICE_GATEWAY_PUBLIC_URL: "https://test-api.feedling.app"
       # This deploy serves test-api, so skill_url must point at io-onboarding's
       # test branch. Code defaults to "main" (so prod just works); the test
       # deploy overrides it here. See core/util.io_onboarding_branch().
@@ -308,7 +313,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:5331dea
+    image: ghcr.io/teleport-computer/feedling:2b44a26
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped

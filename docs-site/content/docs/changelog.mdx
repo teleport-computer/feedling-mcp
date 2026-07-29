@@ -10,6 +10,26 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Access-mode changes no longer bypass the Hosted Runtime V2 rollout
+  reconciler.** Selecting `model_api` records the user's route choice but does
+  not directly move the execution fence to V2; the `v2_user_allowlist` desired
+  state and reconciler remain the only authority for the resident-to-V2
+  transition. Selecting `resident` still demotes immediately, and a failed
+  runtime-control update now restores both the prior runtime mode and the prior
+  onboarding route.
+
+- **ElevenLabs calls can now use the same Chat model and context as typed
+  messages.** An authenticated client creates a short-lived, call-bound voice
+  session, then ElevenLabs sends transcribed turns to an OpenAI-compatible
+  streaming endpoint. Feedling routes each turn through the user's current
+  resident or Hosted Runtime V2 path, preserving persona, memory, tools, and
+  chronological Chat history. ElevenLabs continues to handle transcription,
+  interruption, and speech synthesis, but never receives the user's model API
+  key. Voice reply handoff state is encrypted and expires automatically.
+  Deployments must set `FEEDLING_VOICE_GATEWAY_PUBLIC_URL` to the public HTTPS
+  API origin; missing, private, or non-HTTPS values cause voice-session
+  creation to fail closed with `503 voice_gateway_not_configured`.
+
 - **A new `GET /v1/perception/app_close` endpoint reports app closures,
   mirroring the existing `app_open` shortcut.** It accepts the same `app`
   (required, `bundle_id` remains a deprecated alias), `category`, and `ts`
@@ -132,6 +152,28 @@ change must not be interpreted as an API guarantee.
   `/models` route) and the client should fall back to manual model entry.
   Provider auth failures are mapped to `400`/`429`/`503` catalog slugs — never
   `401` — so an expired Feedling login is never confused with a bad provider key.
+- **V1 resident and Hosted Runtime V2 chat now expose confirmed execution activity.**
+  `GET /v1/chat/turn-activity/{turn_id}` returns a user-scoped, read-only
+  projection of backend job and tool-dispatch records while a turn runs. The
+  projection contains only bounded identifiers, state, timing, result
+  classification, and confirmed durable-effect disposition; it excludes tool
+  arguments, result bodies, assistant prose, and reasoning. Completed events
+  also appear as `activity_events` on the assistant history item. Confirmed
+  memory-index/search/fetch results include a total count and include canonical
+  category counts only when the complete classification is reliable; custom or
+  unknown buckets fall back to total-only. The shipped V1 resident `io_cli`
+  records the same fixed-shape invocation transitions through an authenticated,
+  turn-scoped write boundary; tool arguments and result bodies are never sent.
+  Zero-result discovery remains visible, and Runtime V2 protocol calls such as
+  `reply` and `send_file` use the same activity boundary. A turn exposes at
+  most 100 projected activity events.
+- **Separate vision models now work on Hosted Runtime V1 and VPS residents as
+  well as Runtime V2.** The official resident advertises a fresh
+  `vision_observer_v1` capability, accepted image turns pin the selected route,
+  and only a neutral untrusted observation reaches the main model. Resident
+  capability and probe state remain settings feedback and do not block image
+  ingestion; follow-main keeps the existing image path.
+
 - **Runtime V2 now honors the Dream and screen-watch consent switches at
   execution time.** Disabling Dream prevents queued Dream work from making a
   provider call even when the deployment-wide Dream feature flag is enabled.
@@ -393,6 +435,21 @@ change must not be interpreted as an API guarantee.
   user-scoped and encrypted; final assistant text and its file cards commit as
   one ordered, idempotent reply bundle; host filesystem paths are never scanned
   or accepted.
+- Add account-scoped vision-model routing for Hosted Runtime V2 model-API
+  users. `GET/PUT /v1/vision/config` reads or changes
+  whether images use the main model or a dedicated saved route; `POST
+  /v1/vision/config` atomically creates, image-tests, and selects a candidate.
+  Reachable text-only candidates remain selectable with an `unsupported`
+  status, while operationally invalid new routes and credentials are removed; `POST
+  /v1/vision/routes/{route_id}/test` verifies real image understanding. Dedicated vision output is passed to the
+  main model as untrusted observation text, while follow-main preserves the
+  pre-existing image path without requiring a dedicated-route probe. Image
+  ingestion is not blocked by probe or resident-capability state; those values
+  remain settings feedback. Concurrent selection changes cannot reroute an accepted image; a
+  deleted pinned route fails closed instead of falling back to the main model.
+  Runtime V1 and self-hosted VPS preserve their existing image delivery paths;
+  mutation endpoints return `409 vision_runtime_v2_required` outside Hosted
+  Runtime V2.
 - Self-hosted resident polls may now receive server-generated maintenance turns
   with `role: "user"` and `source: "resident_maintenance"` when the resident
   consumer appears stale or is not claiming resident-only distill jobs. These
@@ -521,6 +578,18 @@ change must not be interpreted as an API guarantee.
   See [MCP servers workflow](/docs/workflows/mcp).
 
 ### Behavior
+
+- Torn control-envelope JSON no longer leaks into chat. When a relay cuts the
+  provider stream and splits one internal control envelope across the reasoning
+  and content channels, the bare JSON tail left in the visible reply is
+  suppressed across all runtimes (resident consumer, Proactive Runtime V2, and
+  Model API Runtime V2) instead of being posted as an assistant bubble. Detection
+  rejoins the two channels — or uses a protocol head observed independently in
+  the reasoning channel, or a reported stream cut — as evidence; the
+  reconstructed action is used only to confirm the split and is never executed.
+  Foreground Chat substitutes the standard visible fallback and preserves a
+  message that merely looks JSON-like on its own; automatic wake lanes stay
+  silent and record the suppression.
 
 - Runtime V2 now persists an immutable encrypted turn trajectory alongside its
   aggregate token telemetry. Provider prompts and responses, late input folds,

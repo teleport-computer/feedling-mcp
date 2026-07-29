@@ -31,14 +31,41 @@ from tee_shadow import mirror
 
 log = logging.getLogger("feedling.tee_sync")
 
-# 密文表 —— 经 enclave 解密成明文。与 tee_replicator.worker._TABLES 对齐。
-_CIPHERTEXT_TABLES = (
-    "chat_messages",
-    "memory_moments",
-    "world_book_entries",
-    "identity",
-    "frame_envelopes",
-)
+# 密文表 —— 经 enclave 解密成明文。**从注册表派生**，不再手工维护：手工清单正是
+# "加了表但某一处没登记"的老问题的来源（2026-07-27 之前 V2 的 19 张表一处都没登记）。
+#
+# ⚠️ 必须并上 PSEUDO_CIPHERTEXT_TABLES。worker._TABLES 的 key 不全是 RDS 表名——
+# "identity" 是个伪表名，实际操作的是 `user_blobs WHERE kind='identity'`
+# （RDS 侧密文信封 → enclave 解密 → TEE 侧 user_blobs 明文行）。注册表按表名登记，
+# user_blobs 整表归 MIRROR lane（reconciler 的 _SCOPE_WHERE 又特意排除 kind='identity'
+# 把它让给 replicator），所以 CIPHERTEXT lane 里**不会**出现 "identity" 这个 key。
+# 只按 lane 派生会静默丢掉整条用户身份/人设的同步路径（2026-07-28 Task 6 实施期发现）。
+def _ciphertext_tables() -> tuple[str, ...]:
+    from tee_shadow import table_registry as reg
+
+    return tuple(sorted(
+        set(reg.tables_in_lane(reg.CIPHERTEXT)) | set(reg.PSEUDO_CIPHERTEXT_TABLES)
+    ))
+
+
+def _replicable_tables() -> tuple[str, ...]:
+    """本 tick 真正要 replicate 的表 = 调度清单 ∩ worker 已配置的表。
+
+    取交集而不是直接用 _ciphertext_tables()：注册表可能已经把某张表登记为 CIPHERTEXT，
+    而 tee_replicator.worker._TABLES 里还没有它的复制配置（跨 Task 的中间态，或有人
+    先登记后接线）。直接调过去会让 tee_replication._validate 抛
+    BadRequest("unknown_table")，被兜底 except 吞掉后计入 replicate_table_failures
+    并触发指数退避（封顶 1 小时）——每个 tick 白报错一次，既污染失败率指标，又让
+    "真失败"和"还没接线"在指标里混成一团。
+
+    取了交集之后，未接线的表被静默跳过、接线后自动被吸收，不需要任何跨 Task 的部署
+    时序协调（否则就得靠"某某 Task 完成前不要部署"这种人工记忆——本仓库已经有多次
+    "改完忘了部署/提交"的前科）。反向守卫 test_scheduler_covers_every_worker_table
+    的语义不受影响：它管的是"worker 配了的表调度器不能漏"，方向相反。
+    """
+    from tee_replicator import worker as tee_worker
+
+    return tuple(t for t in _ciphertext_tables() if t in tee_worker._TABLES)
 
 # 首个 tick 的启动延迟（秒）：短于常规间隔，让父表回填尽快发生（见 _loop）。
 _FIRST_DELAY = 30.0
@@ -50,6 +77,7 @@ _LOG_KEYS = (
     "unconverged_users", "requeue_backlog", "replicate_copied", "replicate_pending",
     "replicate_errors", "replicate_skipped", "replicate_table_failures",
     "reconcile_copied", "reconcile_pruned",
+    "snapshot_copied", "snapshot_failures",
     "reconcile_skipped", "mirror_failures", "tee_healthy",
     "tee_probe_ms", "duration_ms",
 )
@@ -68,7 +96,9 @@ def _blank_summary(do_reconcile: bool) -> dict:
         "replicate_copied": 0, "replicate_pending": 0, "replicate_errors": 0,
         "replicate_skipped": 0, "replicate_table_failures": 0,
         "reconcile_copied": 0, "reconcile_pruned": 0,
-        "reconcile_skipped": 0, "mirror_failures": 0,
+        "reconcile_skipped": 0,
+        "snapshot_copied": 0, "snapshot_failures": 0,
+        "mirror_failures": 0,
         "tee_healthy": False, "tee_probe_ms": None, "duration_ms": None,
         "report": {},
     }
@@ -149,8 +179,29 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
             log.warning("[tee-sync] reconcile 失败: %s", e)  # reconcile_ok 保持 False → 尽快重试
     summary["reconcile_ok"] = reconcile_ok if do_reconcile else None
 
+    # (1.5) snapshot 明文小表 —— 在 reconcile 之后（FK 父表已在）、replicate 之前
+    # （不被慢的密文复制饿死；snapshot 无 enclave 往返，是整个 tick 里最便宜的一段）。
+    try:
+        rep = tr.run_action(action="snapshot", dry_run=False, confirm="MIGRATE")
+        summary["snapshot_copied"] = rep.get("copied") or 0
+        summary["snapshot_failures"] = rep.get("failures") or 0
+        summary["report"]["snapshot"] = rep.get("tables") or []
+        if summary["snapshot_failures"]:
+            failed = [t.get("table") for t in (rep.get("tables") or [])
+                      if isinstance(t, dict) and not t.get("ok")]
+            log.warning("[tee-sync] snapshot 有 %d 张表失败: %s",
+                        summary["snapshot_failures"], failed)
+        else:
+            log.info("[tee-sync] snapshot done: copied=%s", summary["snapshot_copied"])
+    except tr.AlreadyRunning:
+        log.info("[tee-sync] 手动 run 持锁中 — 跳过本 tick 的 snapshot")
+    except tr.Unconfigured:
+        return reconcile_ok
+    except Exception as e:  # noqa: BLE001 — 影子期铁律：绝不传染主路径
+        log.warning("[tee-sync] snapshot 失败: %s", e)
+
     # (2) replicate 密文子表在后 —— 父表已在，不再 FK 失败。
-    for table in _CIPHERTEXT_TABLES:
+    for table in _replicable_tables():
         fails, retry_at = _table_backoff.get(table, (0, 0.0))
         if retry_at > time.monotonic():
             # 连败退避中 → 本 tick 跳过这张表（其余表照常），到点自动恢复重试。

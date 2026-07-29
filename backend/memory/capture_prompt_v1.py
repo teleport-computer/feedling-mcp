@@ -26,6 +26,7 @@ from memory.card_text import (
     format_error,
     sanitize_card_labels,
 )
+from memory import card_guard
 from memory.prompts_v1 import COMMON_BUCKETS_GUIDANCE_V1
 
 _EMPTY_CAPTURE_REPLY = '{"cards": []}'
@@ -188,6 +189,7 @@ def parse_capture_cards(
 
     out: list[dict] = []
     hard_rejections: list[str] = []
+    _guard_on = card_guard.guard_enabled()
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -197,9 +199,9 @@ def parse_capture_cards(
             continue
         summary = str(row.get("summary") or "").strip()[:2000]
         content = str(row.get("content") or "").strip()
-        rejection = card_text_rejection(summary=summary, content=content)
+        rejection = card_text_rejection(summary=summary, content=content, guard=_guard_on)
         if rejection:
-            # 占位符/空正文的卡不写进花园 —— 用户会亲眼看到它。
+            # 占位符/空正文/协议残片的卡不写进花园 —— 用户会亲眼看到它。
             hard_rejections.append(rejection)
             continue
         mem_type = str(row.get("type") or "").strip().lower()
@@ -209,7 +211,8 @@ def parse_capture_cards(
         threads = [str(t).strip()[:80] for t in threads_raw if str(t).strip()][:8] if isinstance(threads_raw, list) else []
         # 软字段只清洗,不参与打回判定(硬内容没问题就不值得再烧一次 provider)。
         bucket, threads, _label_reasons = sanitize_card_labels(
-            bucket=str(row.get("bucket") or "").strip()[:80], threads=threads
+            bucket=str(row.get("bucket") or "").strip()[:80], threads=threads, guard=_guard_on,
+            lang_text=f"{summary}\n{content}",
         )
         target_id = str(row.get("target_id") or "").strip() or None
         out.append({

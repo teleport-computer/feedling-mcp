@@ -15,6 +15,7 @@ import conftest
 import db
 import provider_client
 from capabilities import registry as cap_registry
+from capabilities import tool_schema as cap_tool_schema
 from core import store as core_store
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import cursor as v2_cursor
@@ -198,6 +199,61 @@ def test_known_mcp_and_applied_platform_write_remain_barriers_until_cursor():
     ) is None
 
 
+def test_all_discarded_workspace_batch_does_not_leave_mutation_barrier():
+    uid = "u_discarded_workspace_batch_barrier"
+    conftest.seed_user(uid)
+    _reset(uid)
+    seq, job_id = db.chat_append_and_enqueue(
+        uid, "first", 1.0, _user_doc("first", "create a file"), 5000, "chat"
+    )
+    effect_id = effect_outbox.enqueue_effect(
+        job_id=job_id,
+        user_id=uid,
+        effect_type="workspace_batch_encrypted_v1",
+        ordinal=0,
+        expected_generation=db.get_runtime_generation(uid),
+        payload={"effect_envelope": {"ciphertext": "opaque"}},
+        input_frontier_seq=seq,
+    )
+    result = {
+        "kind": effect_outbox.WORKSPACE_BATCH_RESULT_KIND,
+        "items": [{
+            "effect_id": f"{effect_id}:item:0",
+            "status": "discarded",
+            "error": "workspace_revision_conflict",
+        }],
+    }
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_effect_outbox SET status=%s,payload=%s WHERE effect_id=%s",
+            (
+                effect_outbox.APPLIED_WITH_RESULTS_STATUS,
+                db.Jsonb({effect_outbox.APPLIED_RESULT_PAYLOAD_KEY: result}),
+                effect_id,
+            ),
+        )
+
+    assert jobs_store.get_chat_mutation_recovery_barrier(uid, after_seq=0) is None
+
+    result["items"].append({
+        "effect_id": f"{effect_id}:item:1",
+        "status": "applied",
+        "revision": 1,
+    })
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_effect_outbox SET payload=%s WHERE effect_id=%s",
+            (db.Jsonb({effect_outbox.APPLIED_RESULT_PAYLOAD_KEY: result}), effect_id),
+        )
+    assert jobs_store.get_chat_mutation_recovery_barrier(
+        uid, after_seq=0
+    ) == {
+        "through_seq": seq,
+        "has_mcp": False,
+        "has_platform": True,
+    }
+
+
 def test_new_user_send_after_crashed_mutation_runs_one_text_only_recovery_turn(
     monkeypatch,
 ):
@@ -245,7 +301,7 @@ def test_new_user_send_after_crashed_mutation_runs_one_text_only_recovery_turn(
         uid,
         "second",
         2.0,
-        _user_doc("second", "hello?"),
+        _user_doc("second", "please generate a PDF"),
         5000,
         "chat",
     )
@@ -275,7 +331,7 @@ def test_new_user_send_after_crashed_mutation_runs_one_text_only_recovery_turn(
     mcp_turn = _PolicyMcpTurn()
     provider_calls: list[dict] = []
 
-    async def provider(_config, messages, *, tools=None):
+    async def provider(_config, messages, *, tools=None, **_kwargs):
         names = {spec.name for spec in (tools or [])}
         provider_calls.append({"messages": list(messages), "names": names})
         assert any(
@@ -305,6 +361,7 @@ def test_new_user_send_after_crashed_mutation_runs_one_text_only_recovery_turn(
             assert _MCP_MUTATION.name not in names
             assert _MCP_READ.name in names
             assert "reply" in names
+            assert cap_tool_schema.FILE_REPLY_TOOL not in names
             # Simulate a broken relay inventing a call for the omitted schema.
             # The loop rejects it before dispatch; the worker also has an
             # independent fail-closed dispatcher gate.
@@ -333,6 +390,12 @@ def test_new_user_send_after_crashed_mutation_runs_one_text_only_recovery_turn(
         resolve_provider=lambda _uid: (_BYOK, {}),
         mint_enclave_token=lambda _uid: "rt",
         apply_pending_effects=apply_pending,
+        load_workspace_file=lambda *_args, **_kwargs: {
+            "path": "/workspace/existing.pdf",
+            "content": "unused",
+            "mime_type": "application/pdf",
+            "revision": 1,
+        },
         load_mcp_turn=lambda *args, **kwargs: _load_mcp(
             mcp_turn, *args, **kwargs
         ),

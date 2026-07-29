@@ -112,7 +112,7 @@ def _text_round(text):
 
 
 def _spy_provider(monkeypatch, seen):
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
         seen["tools"] = tools
         return _text_round("ok")
@@ -223,6 +223,55 @@ def test_chat_turn_injects_only_safe_typed_perception_grounding(monkeypatch):
     assert {"web_search", "web_fetch", "task"} <= first_round_tools
 
 
+def test_chat_turn_injects_pending_schedule_identity(monkeypatch):
+    uid = "u_pending_schedule_context"
+    conftest.seed_user(uid)
+    _reset(uid)
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    seen, calls = {}, []
+    _spy_provider(monkeypatch, seen)
+    _spy_cap_data(monkeypatch, calls, data={"ok": True, "signals": {}})
+    deps = _chat_deps([
+        {"id": "m1", "ts": 1.0, "role": "user", "content": "取消刚才的提醒"}
+    ])
+    deps.read_pending_scheduled_wake_context = lambda _uid: {
+        "pending_count": 1,
+        "pending_cap": 20,
+        "timers": [{
+            "wake_id": "sched_real_1",
+            "at": "2026-07-27T10:09:41+08:00",
+            "tz": "Asia/Shanghai",
+            "note": "提醒用户休息",
+            "origin_refs": [],
+        }],
+    }
+
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+    status = asyncio.run(worker.process_job(
+        job,
+        deps,
+        provider_config=_BYOK,
+        api_key=None,
+        runtime_token="rt",
+    ))
+
+    assert status == "completed"
+    payload = _runtime_payload(seen)
+    timers = payload["runtime_data"]["scheduled_wakes"]["timers"]
+    assert timers[0]["wake_id"] == "sched_real_1"
+    assert timers[0]["note"] == "提醒用户休息"
+    system = next(
+        message["content"]
+        for message in seen["messages"]
+        if message.get("role") == "system"
+    )
+    assert "call cancel_wake" in system
+    assert "do not search memories" in system
+
+
 def test_stable_perception_policy_does_not_hide_null_signals(monkeypatch):
     """Trusted interpretation policy keeps null observations visible as data."""
     uid = "u_pg_guide"
@@ -311,7 +360,7 @@ def test_chat_and_wake_fence_outbound_after_text_perception_read(
 
     provider_calls = []
 
-    async def _provider(config, messages, *, tools=None):
+    async def _provider(config, messages, *, tools=None, **_kwargs):
         provider_calls.append({"messages": messages, "tools": tools})
         if len(provider_calls) == 1:
             return {

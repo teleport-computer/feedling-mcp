@@ -107,12 +107,20 @@ if not _provisioned:
     # Pure-unit modules that don't touch the DB — keep them collectable so a
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
+        "test_card_guard.py",
+        "test_bucket_lang_normalize.py",
+        "test_memory_actions_guard.py",
+        "test_protocol_leak.py",
+        "test_memory_lane_torn_protocol_no_write.py",
         "test_web_settings_store.py",
         "test_v2_web_gate.py",
         "test_web_settings_core.py",
         "test_object_storage.py",
         "test_wake_bus.py",
         "test_chat_idempotency_unit.py",
+        "test_chat_activity_projection.py",
+        "test_chat_turn_activity_unit.py",
+        "test_access_mode_runtime_sync_unit.py",
         "test_semantic_analysis.py",
         "test_proactive_runtime_v2.py",
         "test_proactive_observability_v2.py",
@@ -178,6 +186,10 @@ if not _provisioned:
         # （构造不建连接，无 DB）。
         "test_redis_cvm_config.py",
         "test_redis_pool.py",
+        # TEE 注册表守卫的元守卫：断言 CI 上 PG 真的起了（守卫本体需要 PG，
+        # 无 PG 时会被下面的 collect_ignore 静默忽略）。它自己不碰 DB，必须
+        # 留在可收集列表里，否则连它也会被忽略。
+        "test_tee_registry_guard_enforced.py",
     }
     collect_ignore = sorted(
         f
@@ -218,6 +230,8 @@ def set_v2_runtime_owner(user_id: str, *, generation: int | None = None) -> None
     low-level worker/job tests intentionally bypass that assembly path and
     therefore opt in through this helper before claiming work.
     """
+    import db
+
     with db.get_pool().connection() as conn:
         conn.execute(
             "INSERT INTO v2_runtime_state "

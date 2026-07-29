@@ -42,7 +42,29 @@ def access_modes_switch(store: UserStore, payload: dict):
     mode = registry._normalize_access_mode(str(payload.get("access_mode") or payload.get("route") or ""))
     if mode not in registry.ACCESS_MODES:
         return {"error": "access_mode must be resident, model_api, or official_import"}, 400
+    previous_mode = onboarding._load_onboarding_route(store)
     data = onboarding._save_onboarding_route(store, mode)
+    previous_runtime_mode = None
+    try:
+        if mode == "resident":
+            from hosted import config_store
+
+            previous_runtime_mode = (
+                config_store.get_hosted_runtime_control_strict(store)[0]
+            )
+        _sync_hosted_runtime_for_access_mode(store, mode)
+    except Exception:
+        if previous_runtime_mode is not None:
+            try:
+                from hosted import config_store
+
+                config_store.set_hosted_runtime_mode(
+                    store, previous_runtime_mode
+                )
+            except Exception:
+                pass
+        onboarding._save_onboarding_route(store, previous_mode)
+        return {"error": "runtime_control_unavailable"}, 503
     with registry._users_lock:
         user_entry = registry._find_user_entry_locked(store.user_id)
         if user_entry:
@@ -50,6 +72,26 @@ def access_modes_switch(store: UserStore, payload: dict):
             registry.persist_user(user_entry)
     print(f"[access:{store.user_id}] active_route={data['route']}")
     return accounts_access._access_modes_payload(store), 200
+
+
+def _sync_hosted_runtime_for_access_mode(store: UserStore, mode: str) -> None:
+    from hosted import config_store
+
+    if mode == "model_api":
+        # Selecting a provider route is not rollout authority. The allowlist
+        # reconciler is the sole writer for the resident -> V2 transition, so
+        # an unallowlisted user (and an allowlisted user not yet reconciled)
+        # remains on the resident fence.
+        return
+    if mode != "resident":
+        return
+
+    # Resident is the safe rollback direction and should take effect
+    # immediately. The caller snapshots the prior tuple before invoking this
+    # setter so a partial mutation can be compensated.
+    config_store.set_hosted_runtime_mode(
+        store, config_store.HOSTED_RUNTIME_MODE_RESIDENT
+    )
 
 
 def access_link_token_create(store: UserStore, payload: dict):

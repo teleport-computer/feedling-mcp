@@ -305,6 +305,18 @@ def test_runtime_health_window_hours_falls_back_on_bad_input():
             assert _dt._runtime_health_window_hours() == 24
 
 
+def test_runtime_health_windows_stay_within_jobs_store_health_clamp():
+    # I-3：design §4 说"两个函数不各自读 request.args，因此不可能出现窗口
+    # 不一致"——这句话只覆盖了调用方，没覆盖被调方各自的钳制上界。
+    # jobs_store.recent_runtime_health 把 within_hours 钳到 24*30（720），
+    # recent_token_usage_by_lane 钳到 24*366。今天 max(_RUNTIME_HEALTH_WINDOWS)
+    # == 720 == 24*30，两边钳制结果恰好相同——这是巧合，不是不变量。
+    # 谁往白名单加一档 > 720 小时（比如 90 天 = 2160），健康列会被静默钳到
+    # 720、token 列却查满新值，同一行两个窗口，页顶还标着新窗口数——且没有
+    # 任何测试会红。这条断言就是那个会红的守卫：把巧合钉成显式约束。
+    assert max(_dt._RUNTIME_HEALTH_WINDOWS) <= 24 * 30
+
+
 # ---- Task 4: 渲染 Runtime 健康页 ----
 
 
@@ -505,3 +517,203 @@ def test_runtime_pages_share_one_stylesheet(bound_request):
     error_page = _dt._render_runtime_health_error_page()
     assert _dt._RUNTIME_PAGE_CSS in main_page
     assert _dt._RUNTIME_PAGE_CSS in error_page
+
+
+# ---- Task 2: 渲染两列 token ----
+
+
+def _tokens(lane_name: str = "chat", **overrides) -> dict:
+    base = {
+        "model_calls": 118,
+        "usage_reported_calls": 103,
+        "usage_coverage": 0.873,
+        "prompt_tokens": 951_161,
+        "completion_tokens": 40_473,
+        "total_tokens": 991_634,
+        "cache_read_tokens": 469_353,
+        "cache_miss_tokens": 482_000,
+        "cache_hit_ratio": 0.493,
+    }
+    base.update(overrides)
+    return {"window_hours": 24, "lanes": {lane_name: base}}
+
+
+def test_fmt_tokens_compact_covers_all_branches():
+    assert _dt._fmt_tokens_compact(None) == "—"
+    assert _dt._fmt_tokens_compact(951) == "951"
+    assert _dt._fmt_tokens_compact(951_161) == "951.2k"
+    assert _dt._fmt_tokens_compact(1_200_000) == "1.2M"
+
+
+def test_fmt_tokens_compact_promotes_at_true_rounding_boundary():
+    # 真实边界是 999_950（.1f 在 999.95 处四舍五入进位），不是天真猜测的
+    # 999_500。[999_950, 1_000_000) 必须显示成 M 而非 "1000.0k"；
+    # M→B 是同一个 bug 的更高一档，[999_950_000, 1_000_000_000) 必须显示
+    # 成 B 而非 "1000.0M"。
+    assert _dt._fmt_tokens_compact(999_949) == "999.9k"    # 刚好在边界之下
+    assert _dt._fmt_tokens_compact(999_950) == "1.0M"      # 边界值本身：升档
+    assert _dt._fmt_tokens_compact(999_949_999) == "999.9M"
+    assert _dt._fmt_tokens_compact(999_950_000) == "1.0B"
+
+
+def _lane_row_html(html_out: str, lane_name: str) -> str:
+    """抽取给定 lane 那一行 `<tr>...</tr>` 的 HTML。
+
+    避免"整页里有没有这个子串"这种宽断言——多 lane 共存时，另一行的数字
+    串到这行里也会让宽断言误判为通过（I-2 的教训：heartbeat 的数字必须只
+    出现在 heartbeat 自己那行，不能出现在 chat 行里）。
+    """
+    marker = f"<b>{lane_name}"
+    start = html_out.index(marker)
+    row_start = html_out.rindex("<tr>", 0, start)
+    row_end = html_out.index("</tr>", start) + len("</tr>")
+    return html_out[row_start:row_end]
+
+
+def test_render_runtime_health_page_shows_token_columns(bound_request):
+    html_out = _dt._render_runtime_health_page(_payload(), _tokens())
+    assert "951.2k" in html_out          # prompt
+    assert "40.5k" in html_out           # completion
+    assert "49.3%" in html_out           # cache 命中率
+    assert "87.3%" in html_out           # 上报覆盖率
+    assert "token 入/出" in html_out      # 表头
+    assert "缓存命中 · 上报" in html_out  # 表头
+
+
+def test_render_runtime_health_page_token_columns_are_dash_without_data(bound_request):
+    # 某 lane 有 job 但无任何 turn metric 行——两列显 —，且不得抛 KeyError。
+    # payload 里的 lane 是 chat，tokens 里只有 maintenance 的开销数据（一个
+    # payload 里完全没有的 lane，用来同时验证 I-2 的并集不会把它的数字串到
+    # chat 行上；maintenance 本身如何渲染见
+    # test_render_runtime_health_page_includes_token_only_lane）。
+    html_out = _dt._render_runtime_health_page(_payload(), _tokens(lane_name="maintenance"))
+    assert "token 入/出" in html_out
+    chat_row = _lane_row_html(html_out, "chat")
+    # 精确断言：chat 行的 token 与 cache 两列都渲染成 muted 的 —。
+    # 只写 `assert "—" in html_out` 是无效断言——页面别处本来就有 —。
+    assert chat_row.count("<td class='muted'>—</td>") == 2
+    # maintenance 的数字绝不能串到 chat 行上
+    assert "951.2k" not in chat_row
+
+
+def test_render_runtime_health_page_includes_token_only_lane(bound_request):
+    # I-2：recent_runtime_health 的每条子查询共享 LIMIT 1000 配额，
+    # recent_token_usage_by_lane 是窗口内全量、无 LIMIT——一条"窗口内有 token
+    # 开销、但 job 没挤进最近 1000 条"的 lane，若渲染层只遍历 payload["lanes"]，
+    # 它的开销不显示也不报错，而消灭这类盲区正是本功能存在的理由。
+    # payload 里只有 chat；tokens 里额外有一个 payload 完全不知道的 maintenance。
+    html_out = _dt._render_runtime_health_page(_payload(), _tokens(lane_name="maintenance"))
+    row = _lane_row_html(html_out, "maintenance")
+    # token 两列必须正常显示真实数字，不是 —
+    assert "951.2k" in row
+    assert "40.5k" in row
+    assert "49.3%" in row
+    assert "87.3%" in row
+    # 健康列（样本/成功/失败/过期/superseded/失败率/p50/p95/capture）没有
+    # 任何数据来源——必须显 —，不得显 0（0 意味着"确认过是零"，这里是
+    # "压根没被健康查询看见"）。5 个 muted 的 — 来自 superseded/失败率/
+    # p50/p95/capture（这几列本来就带 muted class 或在无数据时切换成
+    # muted）；样本/成功/失败/过期四列不带 muted class，但内容也必须是 —
+    # 而非 0。
+    assert row.count("<td class='muted'>—</td>") == 5
+    assert "<td>—</td>" in row  # 样本/成功/失败/过期这几列（不带 muted class）
+    assert ">0<" not in row and "0 / 0" not in row
+
+
+def test_render_runtime_health_page_token_only_lane_does_not_affect_health_level(bound_request):
+    # token-only 的合成行不该参与 _runtime_health_level 的判定——那是纯 job
+    # 结局层面的判断，这条 lane 没有任何 job 结局信息可供判定。
+    payload = _payload([_lane(lane="chat", failure_rate=0.0)])
+    html_out = _dt._render_runtime_health_page(payload, _tokens(lane_name="maintenance"))
+    assert "总体结论：<span class=\"ok\">正常</span>" in html_out
+
+
+def test_render_runtime_health_page_tolerates_missing_tokens_arg(bound_request):
+    # 不传 tokens（Task 3 接线前的中间状态）必须仍可渲染
+    html_out = _dt._render_runtime_health_page(_payload())
+    assert "各 lane 健康" in html_out
+    assert "token 入/出" in html_out
+
+
+def test_render_runtime_health_page_explains_token_scope(bound_request):
+    html_out = _dt._render_runtime_health_page(_payload(), _tokens())
+    assert "失败回合" in html_out        # token 含失败回合
+    assert "不要与缓存列相加" in html_out  # prompt 已含 cache read/write
+
+
+def test_render_runtime_health_page_declares_window_difference(bound_request):
+    # spec §6：两页口径不同必须写明，否则数字对不上会被当成 bug
+    html_out = _dt._render_runtime_health_page(_payload(), _tokens())
+    assert "固定近 30 天" in html_out
+    assert "不是 bug" in html_out
+
+
+# ---- Task 3: 接线 —— 窗口算一次传两处 ----
+
+
+def _fake_tokens(**kw) -> dict:
+    return {
+        "window_hours": kw.get("within_hours", 24),
+        "lanes": {"chat": {
+            "model_calls": 10, "usage_reported_calls": 9, "usage_coverage": 0.9,
+            "prompt_tokens": 500_000, "completion_tokens": 20_000,
+            "total_tokens": 520_000, "cache_read_tokens": 300_000,
+            "cache_miss_tokens": 200_000, "cache_hit_ratio": 0.6,
+        }},
+    }
+
+
+def test_runtime_view_passes_same_window_to_both_data_functions(client, monkeypatch):
+    # 方案 B 的核心风险：两个数据函数的窗口必须同步。窗口在 page_html 里算一次、
+    # 传给两处，因此不可能出现一个 24 小时、一个 720 小时。
+    seen = {}
+
+    def _health(**kw):
+        seen["health"] = kw.get("within_hours")
+        return _fake_summary(**kw)
+
+    def _tokens(**kw):
+        seen["tokens"] = kw.get("within_hours")
+        return _fake_tokens(**kw)
+
+    monkeypatch.setattr(_dt, "_runtime_health_summary", _health)
+    monkeypatch.setattr(_dt, "_runtime_token_by_lane", _tokens)
+
+    client.get("/admin/data-track?view=runtime&hours=168", headers=_admin_headers())
+    assert seen["health"] == 168
+    assert seen["tokens"] == 168
+
+    client.get("/admin/data-track?view=runtime&hours=99999", headers=_admin_headers())
+    assert seen["health"] == 24      # 非法值两处一起回落
+    assert seen["tokens"] == 24
+
+
+def test_runtime_view_renders_token_columns_end_to_end(client, monkeypatch):
+    monkeypatch.setattr(_dt, "_runtime_health_summary", _fake_summary)
+    monkeypatch.setattr(_dt, "_runtime_token_by_lane", _fake_tokens)
+    page = client.get("/admin/data-track?view=runtime", headers=_admin_headers()).get_data(as_text=True)
+    assert "token 入/出" in page
+    assert "500.0k" in page
+    assert "60.0%" in page
+
+
+def test_runtime_view_degrades_when_token_function_fails(client, monkeypatch):
+    # 任一数据源炸掉都走同一个降级页，且不外泄异常细节
+    def _boom(**_kw):
+        raise RuntimeError("token pool exhausted")
+
+    monkeypatch.setattr(_dt, "_runtime_health_summary", _fake_summary)
+    monkeypatch.setattr(_dt, "_runtime_token_by_lane", _boom)
+    res = client.get("/admin/data-track?view=runtime", headers=_admin_headers())
+    body = res.get_data(as_text=True)
+    assert res.status_code == 200
+    assert "Runtime 健康数据暂时取不到" in body
+    assert "token pool exhausted" not in body
+
+
+def test_runtime_token_by_lane_is_wired_to_jobs_store():
+    # 装配段必须把桩换成真实实现，否则 token 列永远空白而不报任何错
+    import asgi_app  # noqa: F401
+    from model_api_runtime.v2 import jobs_store
+
+    assert _dt._runtime_token_by_lane is jobs_store.recent_token_usage_by_lane

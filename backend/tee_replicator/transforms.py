@@ -122,3 +122,19 @@ def plaintext_world_book_doc(doc: dict, decrypt) -> dict:
 def plaintext_identity_doc(doc: dict, decrypt) -> dict:
     """user_blobs kind=identity 的信封，与 memory 同型（单信封）。"""
     return _plaintext_single(doc, decrypt, "tee_replicate:identity")
+
+
+def plaintext_envelope_column(env: dict, decrypt, *, purpose: str) -> dict:
+    """通用单信封列 → 明文 dict。
+
+    与 plaintext_memory_doc / plaintext_world_book_doc 同型，区别只在 purpose 由
+    调用方给（这些表的信封住在专用列里而不是通用 doc 列，purpose 串要能区分）。
+    2026-07-27 全量对齐新增的 6 张 v2/archive 表用它；chat_message_archive 不用
+    ——它的 doc 与 chat_messages.doc 完全同形，直接复用 plaintext_chat_doc（含
+    thinking/caption 子信封处理）。
+    """
+    if not _decryptable(env):
+        raise PendingDeviceMigration(str(env.get("id", "")))
+    out = _strip_envelope(env)
+    out["body"] = _decrypt_body(decrypt, env, purpose)
+    return _scrub_nul(out)

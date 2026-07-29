@@ -127,7 +127,7 @@ def test_screen_watch_turn_passes_safe_screen_context_and_its_own_prompt(monkeyp
 
     seen = {}
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         seen["messages"] = messages
         seen["tools"] = tools
         return _text_round("你在看这个报错？")
@@ -180,7 +180,7 @@ def test_screen_watch_silence_completes_without_a_bubble(monkeypatch):
 
     _script_calls = []
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         _script_calls.append(messages)
         return _text_round("")
 
@@ -241,7 +241,7 @@ def test_screen_watch_does_not_deadlock_when_cap_data_reacquires_enclave_sem(mon
     monkeypatch.setattr(
         cap_registry, "run_capability", lambda action_type, store, **k: _FakeCapResult())
 
-    async def _fake(config, messages, *, tools=None):
+    async def _fake(config, messages, *, tools=None, **_kwargs):
         return _text_round("spotted it")
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)

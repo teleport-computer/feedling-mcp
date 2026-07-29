@@ -41,7 +41,7 @@ def calls(monkeypatch):
 def test_replicate_tick_hits_every_ciphertext_table(calls):
     sched._sync_tick(do_reconcile=False)
     replicated = [c for c in calls if c[0] == "replicate"]
-    assert [c[1] for c in replicated] == list(sched._CIPHERTEXT_TABLES)
+    assert [c[1] for c in replicated] == list(sched._replicable_tables())
     # non-dry-run + confirm gate carried on every replicate
     assert all(c[2] is False and c[3] == "MIGRATE" for c in replicated)
     # do_reconcile=False → no reconcile/verify
@@ -53,7 +53,8 @@ def test_reconcile_runs_before_replicate_then_verify(calls):
     # BEFORE any ciphertext child replicate, or the children FK-fail.
     sched._sync_tick(do_reconcile=True)
     actions = [c[0] for c in calls]
-    assert actions == ["reconcile"] + ["replicate"] * 5 + ["verify"]
+    assert actions == (["reconcile", "snapshot"]
+                       + ["replicate"] * len(sched._replicable_tables()) + ["verify"])
     reconcile = next(c for c in calls if c[0] == "reconcile")
     verify = next(c for c in calls if c[0] == "verify")
     assert reconcile[3] == "MIGRATE"
@@ -74,7 +75,7 @@ def test_reconcile_failure_does_not_block_replicate(monkeypatch):
     monkeypatch.setattr(tr, "run_action", fake)
     sched._sync_tick(do_reconcile=True)
     assert calls[0] == "reconcile"
-    assert calls.count("replicate") == 5
+    assert calls.count("replicate") == len(sched._replicable_tables())
 
 
 def test_already_running_aborts_replicate_phase(monkeypatch):
@@ -88,8 +89,14 @@ def test_already_running_aborts_replicate_phase(monkeypatch):
 
     monkeypatch.setattr(tr, "run_action", fake)
     sched._sync_tick(do_reconcile=True)
-    # reconcile ran; first replicate raises AlreadyRunning → return before the rest
-    assert calls == [("reconcile", None), ("replicate", "chat_messages")]
+    # reconcile ran; snapshot also raises AlreadyRunning but only logs (no return,
+    # unlike the replicate loop) so the tick proceeds to replicate, which then
+    # raises AlreadyRunning on the first table → return before the rest.
+    # 中止发生在 replicate 循环的第一张表上；表名随注册表/worker 接线内容变化，别写死。
+    # replicate 循环遍历的是 _replicable_tables()（调度清单 ∩ worker 已配置的表），
+    # 不是 _ciphertext_tables()——后者含尚未接线的表，直接用会对不上循环实际遍历顺序。
+    first = sched._replicable_tables()[0]
+    assert calls == [("reconcile", None), ("snapshot", None), ("replicate", first)]
 
 
 def test_unconfigured_aborts_silently(monkeypatch):
@@ -103,7 +110,10 @@ def test_unconfigured_aborts_silently(monkeypatch):
 
     monkeypatch.setattr(tr, "run_action", fake)
     sched._sync_tick(do_reconcile=True)
-    assert calls == ["reconcile", "replicate"]  # stopped on first replicate Unconfigured
+    # snapshot's Unconfigured handler does `return reconcile_ok` (unlike its
+    # AlreadyRunning handler, which only logs) — so the abort point is snapshot
+    # itself, not the first replicate call; replicate is never reached.
+    assert calls == ["reconcile", "snapshot"]
 
 
 def test_one_table_error_does_not_stop_the_pass(monkeypatch):
@@ -117,8 +127,9 @@ def test_one_table_error_does_not_stop_the_pass(monkeypatch):
 
     monkeypatch.setattr(tr, "run_action", fake)
     sched._sync_tick(do_reconcile=False)
-    # memory_moments raised a generic error but the loop continued past it
-    assert seen == list(sched._CIPHERTEXT_TABLES)
+    # memory_moments raised a generic error but the loop continued past it;
+    # snapshot runs unconditionally (not gated by do_reconcile) and comes first.
+    assert seen == ["snapshot"] + list(sched._replicable_tables())
 
 
 def test_start_spawns_a_daemon_thread(monkeypatch):
@@ -287,3 +298,91 @@ def test_reconcile_failure_does_not_mark(monkeypatch):
     monkeypatch.setattr(tr, "run_action", fake)
     sched._sync_tick(do_reconcile=True)
     assert marks == []
+
+
+def test_snapshot_action_is_accepted():
+    from admin import tee_replication as tr
+
+    # 不触发真实运行——只验证校验层放行 snapshot 这个 action。
+    tr._validate("snapshot", None, True)
+
+
+def test_snapshot_action_rejects_unknown_table():
+    from admin import tee_replication as tr
+
+    with pytest.raises(tr.BadRequest) as e:
+        tr._validate("snapshot", "not_a_real_table", True)
+    assert e.value.error == "unknown_table"
+
+
+def test_ciphertext_tables_are_derived_from_registry():
+    """scheduler 不再手工维护密文表清单——它必须来自注册表，否则又会出现
+    '加了表但某一处没登记' 的老问题。"""
+    from admin import tee_sync_scheduler as sched
+    from tee_shadow import table_registry as reg
+
+    want = set(reg.tables_in_lane(reg.CIPHERTEXT)) | set(reg.PSEUDO_CIPHERTEXT_TABLES)
+    assert set(sched._ciphertext_tables()) == want
+
+
+def test_scheduler_covers_every_worker_table():
+    """调度器必须覆盖 worker._TABLES 的**每一个 key**，包括非表名的伪 key。
+
+    这条是上一条的反向守卫，缺了它就会重演 2026-07-28 的回归：把写死的
+    _CIPHERTEXT_TABLES 改成"按 lane 派生"时，静默丢掉了 "identity" 这个伪表名
+    （它实际操作 user_blobs WHERE kind='identity'，而 user_blobs 整表登记在
+    MIRROR lane，因此永远不会出现在 CIPHERTEXT lane 里）。后果是整条用户身份/
+    人设的同步路径消失，而上一条测试是同义反复、抓不到。
+    """
+    from admin import tee_sync_scheduler as sched
+    from tee_replicator import worker
+
+    missing = sorted(set(worker._TABLES) - set(sched._ciphertext_tables()))
+    assert not missing, (
+        f"worker 配了这些复制目标，但调度器不会去跑它们：{missing}\n"
+        "若某个 key 不是 RDS 表名（伪表名），把它加进 "
+        "table_registry.PSEUDO_CIPHERTEXT_TABLES。"
+    )
+
+
+def test_replicate_skips_tables_without_a_worker_config():
+    """replicate 只跑 worker 真正配了的表。
+
+    注册表可能先登记、worker 后接线（跨 Task 的中间态）。若直接对全部
+    CIPHERTEXT lane 调 replicate，未接线的表会让 _validate 抛 unknown_table，
+    被吞掉后计入 replicate_table_failures 并触发指数退避——每 tick 白报错，
+    还把"真失败"和"没接线"混进同一个指标。
+    """
+    from admin import tee_sync_scheduler as sched
+    from tee_replicator import worker
+
+    replicable = set(sched._replicable_tables())
+    assert replicable <= set(worker._TABLES), "replicate 目标必须都有 worker 配置"
+    # 已登记但未接线的表必须被跳过，不能出现在 replicate 目标里。
+    unwired = set(sched._ciphertext_tables()) - set(worker._TABLES)
+    assert not (replicable & unwired)
+
+
+def test_sync_tick_records_snapshot_metrics(monkeypatch):
+    from admin import tee_sync_scheduler as sched
+
+    monkeypatch.setattr(sched, "_ciphertext_tables", lambda: ())
+
+    calls = {}
+
+    def fake_run_action(**kw):
+        calls[kw["action"]] = kw
+        if kw["action"] == "snapshot":
+            return {"tables": [{"table": "provider_health", "rows": 3, "ok": True}],
+                    "copied": 3, "failures": 0}
+        return {"tables": []}
+
+    from admin import tee_replication as tr
+
+    monkeypatch.setattr(tr, "run_action", fake_run_action)
+    monkeypatch.setattr(sched.mirror, "probe", lambda: {"ok": True, "latency_ms": 1.0})
+    monkeypatch.setattr(sched.db, "record_tee_sync_run", lambda s: None)
+    monkeypatch.setattr(sched.db, "mark_reconcile_success", lambda: None)
+
+    sched._sync_tick(do_reconcile=True)
+    assert "snapshot" in calls

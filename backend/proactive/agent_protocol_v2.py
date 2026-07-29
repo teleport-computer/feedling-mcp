@@ -13,6 +13,8 @@ import re
 from typing import Any, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from core import protocol_leak
+
 MAX_MESSAGE_CHARS_V2 = 4000
 MAX_ACTION_NOTE_CHARS_V2 = 1000
 MAX_REASON_CHARS_V2 = 500
@@ -76,11 +78,20 @@ def sanitize_visible_message_text_v2(value: Any) -> str:
     ``reason: ...`` into fields that the runtime would otherwise treat as
     user-visible text. Proactive delivery is fail-closed: only explicit,
     natural-language ``send_message.text`` survives this check.
+
+    `_looks_like_protocol_fragment` is head-anchored; a stream-cut relay can tear
+    the head into the reasoning channel and leave a bare *tail* here
+    (``active.sleep","reason":"..."}]}``) with no recognizable head. The shared
+    orphan-tail check (string-ignoring bracket balance going negative + a JSON
+    token) closes that gap. Proactive is fail-closed, so a weak tail is dropped
+    here without needing the reasoning channel for corroboration.
     """
     if not isinstance(value, str):
         return ""
     text = _clean_text(value, MAX_MESSAGE_CHARS_V2)
     if not text or _looks_like_protocol_fragment(text):
+        return ""
+    if protocol_leak.is_orphan_json_tail(text):
         return ""
     return text
 

@@ -82,22 +82,31 @@ ensure_role() {  # $1=role $2=password $3=extra grant SQL（可空）
 }
 
 # app：业务 CRUD，非 owner（DDL 会被拒 → Phase 1 负向验收）
+#
+# TRUNCATE 是 PostgreSQL 里独立于 DML 四件套的一项权限，必须显式授予：
+# SNAPSHOT lane（tee_shadow/snapshot.py）用 TRUNCATE+COPY 在单个事务里做整表原子
+# 替换，缺这一项时报的是 "permission denied for table X"——2026-07-28 test 上
+# 27 张 SNAPSHOT 表全数失败就是这个原因，而 has_table_privilege(...,'INSERT')
+# 查出来是全绿的，很容易误判成"权限没问题"。
+# 授予范围是 ALL TABLES 而不是只给 SNAPSHOT lane 那几张：app 本来就有 DELETE，
+# 破坏力等价，不构成实质提权；而按 lane 逐表授权会在将来某张表被改判进 SNAPSHOT
+# 时静默失效。
 ensure_role app "${APP_DB_PASSWORD}" \
   "GRANT USAGE ON SCHEMA public TO app;
-   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app;
+   GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public TO app;
    GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO app;
    ALTER DEFAULT PRIVILEGES FOR ROLE \\\"${POSTGRES_USER}\\\" IN SCHEMA public
-     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app;
+     GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLES TO app;
    ALTER DEFAULT PRIVILEGES FOR ROLE \\\"${POSTGRES_USER}\\\" IN SCHEMA public
      GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO app;"
 
 # tee_replicator：与 app 同权（写明文表 + 游标表；游标表由 alembic_tee 建）
 ensure_role tee_replicator "${REPLICATOR_DB_PASSWORD}" \
   "GRANT USAGE ON SCHEMA public TO tee_replicator;
-   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO tee_replicator;
+   GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public TO tee_replicator;
    GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO tee_replicator;
    ALTER DEFAULT PRIVILEGES FOR ROLE \\\"${POSTGRES_USER}\\\" IN SCHEMA public
-     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO tee_replicator;
+     GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLES TO tee_replicator;
    ALTER DEFAULT PRIVILEGES FOR ROLE \\\"${POSTGRES_USER}\\\" IN SCHEMA public
      GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO tee_replicator;"
 

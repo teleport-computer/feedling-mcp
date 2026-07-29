@@ -33,6 +33,10 @@ Content-Type: application/json
 ```
 
 `access_mode` is one of `resident`, `model_api`, or `official_import`.
+Selecting `model_api` does not itself opt the account into Hosted Runtime V2.
+The deployment's V2 allowlist and reconciler own that execution transition;
+until reconciliation completes, the account remains on its current resident
+fence. Selecting `resident` demotes the hosted runtime immediately.
 
 ```http
 HTTP/1.1 201 Created
