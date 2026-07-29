@@ -211,7 +211,8 @@ def parse_capture_cards(
         threads = [str(t).strip()[:80] for t in threads_raw if str(t).strip()][:8] if isinstance(threads_raw, list) else []
         # 软字段只清洗,不参与打回判定(硬内容没问题就不值得再烧一次 provider)。
         bucket, threads, _label_reasons = sanitize_card_labels(
-            bucket=str(row.get("bucket") or "").strip()[:80], threads=threads, guard=_guard_on
+            bucket=str(row.get("bucket") or "").strip()[:80], threads=threads, guard=_guard_on,
+            lang_text=f"{summary}\n{content}",
         )
         target_id = str(row.get("target_id") or "").strip() or None
         out.append({

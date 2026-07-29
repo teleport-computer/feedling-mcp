@@ -108,6 +108,7 @@ if not _provisioned:
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
         "test_card_guard.py",
+        "test_bucket_lang_normalize.py",
         "test_memory_actions_guard.py",
         "test_protocol_leak.py",
         "test_memory_lane_torn_protocol_no_write.py",

@@ -20,6 +20,7 @@ import re
 import unicodedata
 
 from memory import card_guard
+from memory.prompts_v1 import normalize_bucket_language
 
 # 卡上会被用户亲眼看到的文字字段(bucket/threads 也显示在花园里)。
 _VISIBLE_TEXT_FIELDS = ("summary", "content", "bucket")
@@ -121,7 +122,7 @@ def card_text_rejection(*, summary: str, content: str, guard: bool = True) -> st
 
 
 def sanitize_card_labels(
-    *, bucket: str, threads: list[str], guard: bool = True
+    *, bucket: str, threads: list[str], guard: bool = True, lang_text: str = ""
 ) -> tuple[str, list[str], list[str]]:
     """清洗软字段。返回 ``(bucket, threads, reasons)``,``reasons`` 供调用方观测。
 
@@ -130,6 +131,11 @@ def sanitize_card_labels(
     「能就地修好」(codex 07-26 review P1-2)。当前两个 parser 都只取清洗结果、
     不消费 ``reasons``(纯模块无 logger),所以线上暂时看不到软字段洗了什么;
     要观测就在调用侧接进 trajectory,别改成打回条件。
+
+    ``lang_text``:卡片正文(summary+content),用来把 COMMON 桶归到卡片语言(中文卡的
+    "Pets" → "宠物")。**这是 Q3 的收口点**:``normalize_bucket_language`` 原来只在明文
+    actions 路径跑,capture/dream/migrate 提前封信封、绕过了它;现在软字段清洗这层(三条路
+    共用)统一跑一次。留空则不归一(向后兼容旧调用)。自定义/未知桶原样通过。
     """
     reasons: list[str] = []
     clean_bucket = (bucket or "").strip()
@@ -142,6 +148,9 @@ def sanitize_card_labels(
     elif guard and clean_bucket and card_guard.bucket_pollution_reason(clean_bucket):
         reasons.append("bucket_protocol_leak")
         clean_bucket = ""
+    # Q3:干净桶按卡片语言归一(COMMON 桶换语言;自定义桶不动)。
+    if clean_bucket and lang_text:
+        clean_bucket = normalize_bucket_language(clean_bucket, lang_text)
     clean_threads: list[str] = []
     for thread in threads or []:
         text = str(thread or "").strip()

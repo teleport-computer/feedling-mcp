@@ -24,6 +24,7 @@ from memory.card_text import (
     format_error,
     sanitize_card_labels,
 )
+from memory.prompts_v1 import COMMON_BUCKETS_GUIDANCE_V1
 
 _EMPTY_DREAM_REPLY = '{"consolidations": [], "questions_to_ask": []}'
 
@@ -56,6 +57,9 @@ _DREAM_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。现在
 · 你不在和 TA 对话，不要生成任何要发给 TA 的消息——你只整理记忆。
 · 整理出的字段（bucket/threads/summary/content）用 TA 跟你对话的语言——中文就用中文
   （用「宠物」不是「pets」），别把中文的事归成英文桶/线索；专有名词/原话保留原文。
+· 桶尽量复用，别制造近义桶：先看上面现有卡已经在用的桶，能归进去就用同一个；现有桶都不
+  贴合，再从这些通用桶里挑，仍不贴合才起一个具体的新桶——
+  {common_buckets}
 · 称呼：{naming_rule}这些卡是 TA 会亲眼看到的记忆——写进卡里的字段永远不要用
   "用户"/"user"这类系统称谓，也不要用「TA」指代对方（「TA」只是这份指令里的标记）；
   整理旧卡时顺手把指代对方本人的"用户"/"user"/「TA」/「你」/猜测性别的他或她
@@ -109,6 +113,7 @@ def build_dream_prompt(
         naming_rule=_naming_rule(user_name),
         cards=cards or "（暂无卡）",
         recent_conversations=recent_conversations or "（这几天没有新对话）",
+        common_buckets=COMMON_BUCKETS_GUIDANCE_V1,
     )
 
 
@@ -206,7 +211,8 @@ def parse_dream_consolidations(
         threads = [str(t).strip()[:80] for t in threads_raw if str(t).strip()][:8] if isinstance(threads_raw, list) else []
         # 软字段只清洗,不参与打回判定(硬内容没问题就不值得再烧一次 provider)。
         bucket, threads, _label_reasons = sanitize_card_labels(
-            bucket=str(result.get("bucket") or "").strip()[:80], threads=threads, guard=_guard_on
+            bucket=str(result.get("bucket") or "").strip()[:80], threads=threads, guard=_guard_on,
+            lang_text=f"{summary}\n{content}",
         )
         out.append({
             "op": op,

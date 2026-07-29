@@ -1749,8 +1749,10 @@ _MEMORY_CARDS_LIMIT = int(os.environ.get("FEEDLING_V2_MEMORY_CARDS_LIMIT", "60")
 
 
 def _render_card_line(item: dict) -> str:
-    """一张记忆卡渲染成一行（title/summary/content 里第一个非空的），仅供 dream prompt 参考。
-    卡内容经 enclave readside 解出明文（见 memory_index_core），服务器本地不再解密。"""
+    """一张记忆卡渲染成一行（title/summary/content 里第一个非空的）+ 它现在的桶，仅供 dream
+    prompt 参考。带上桶是为了让 dream 能**复用已有桶**、别造近义桶（Q2；capture 已有此上下文，
+    V2 dream 此前只渲染正文、丢了桶）。卡内容经 enclave readside 解出明文（见 memory_index_core），
+    服务器本地不再解密。"""
     if not isinstance(item, dict):
         return ""
     text = str(
@@ -1759,7 +1761,14 @@ def _render_card_line(item: dict) -> str:
     mid = str(item.get("id") or "").strip()
     if not text:
         return ""
-    return f"- [{mid}] {text}" if mid else f"- {text}"
+    bucket = str(item.get("bucket") or "").strip()
+    parts = []
+    if mid:
+        parts.append(f"[{mid}]")
+    if bucket:
+        parts.append(f"（桶：{bucket}）")
+    parts.append(text)
+    return "- " + " ".join(parts)
 
 
 def _read_memory_context(user_id: str) -> dict:

@@ -23,6 +23,7 @@ from core import util as core_util
 from identity import service as identity_service
 from identity.user_naming import _naming_rule, rewrite_user_reference, sanitize_user_name
 from memory import card_guard
+from memory.prompts_v1 import normalize_bucket_language
 from memory import service as memory_service
 import provider_client
 from hosted import config_store as hosted_config_store
@@ -2484,6 +2485,9 @@ def _append_import_memory_cards(store: UserStore, cards: list[dict]) -> list[dic
         elif not bucket:
             # 干净但缺桶 → 保留旧行为「未分类」(不改动正常路径,kill switch 也能完整回滚)。
             bucket = "未分类"
+        else:
+            # Q3:干净桶按卡片语言归一(COMMON 桶换语言;自定义桶不动)。
+            bucket = normalize_bucket_language(bucket, f"{summary}\n{content}")
         threads_in = [str(item).strip()[:80] for item in (card.get("threads") or []) if str(item or "").strip()]
         if _guard_on:
             threads_in = [t for t in threads_in if not card_guard.field_pollution_reason(t)]
