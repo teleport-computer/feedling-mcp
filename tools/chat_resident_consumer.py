@@ -495,8 +495,10 @@ try:
     )
 except (TypeError, ValueError):
     RESIDENT_BUSY_POLL_INTERVAL_SEC = 30.0
-# Enclave decrypt-fetch resilience. The enclave is a single-threaded decrypt proxy
-# shared by every user + the main backend; under load it intermittently maps a
+# Enclave decrypt-fetch resilience. The enclave is a shared, capacity-bounded
+# decrypt proxy (prod: FEEDLING_ENCLAVE_WORKERS=4 gunicorn workers, each with a
+# 32-thread decrypt pool; the crypto itself is GIL-bound) shared by every user +
+# the main backend; under load it intermittently maps a
 # reentrant dependency failure to HTTP 502/503. A foreground poll that hits one used
 # to skip the WHOLE cycle ("all decrypt sources failed"), deferring the waiting user
 # message to the next 30 s+ cycle — the mechanism behind prod's 6-13 min reply tails.
@@ -2071,7 +2073,7 @@ def _fetch_from_enclave(
             )
             return None
         except httpx.TransportError as e:
-            # Connection / timeout blips (single-threaded enclave, slow CVM egress)
+            # Connection / timeout blips (saturated enclave pool, slow CVM egress)
             # are transient too — retry rather than skip the whole poll cycle.
             if not last:
                 delay = ENCLAVE_FETCH_BACKOFF_SEC * (2 ** attempt)
@@ -2463,8 +2465,8 @@ def _maybe_refresh_decrypt_health() -> None:
     # the actual enclave probe behind the SAME per-consumer throttle the
     # non-shared path uses: fail-open must not turn "shared file unwritable /
     # never fresh" into a probe on every idle cycle (an O(users)/30s storm
-    # against the single-threaded enclave — worse than the baseline this feature
-    # reduces). Reuse of a fresh peer reading above stays unthrottled (a free
+    # against the shared, capacity-bounded enclave — worse than the baseline this
+    # feature reduces). Reuse of a fresh peer reading above stays unthrottled (a free
     # file read); only real probes are throttled.
     if now - _decrypt_health_last_refresh["at"] < DECRYPT_HEALTH_REFRESH_SEC:
         return

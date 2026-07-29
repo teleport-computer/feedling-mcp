@@ -878,7 +878,7 @@ def test_enclave_fetch_logs_response_body_on_http_error(monkeypatch, caplog):
 
 
 def test_fetch_from_enclave_retries_transient_502(monkeypatch):
-    # Prod (2026-07-15): the enclave decrypt proxy (single-threaded, shared by ~295
+    # Prod (2026-07-15): the enclave decrypt proxy (capacity-bounded, shared by ~295
     # users) intermittently 502s under load. Before this fix a single 502 skipped the
     # WHOLE poll cycle ("all decrypt sources failed"), deferring a waiting user message
     # to the next 30 s+ cycle and stacking into 6-13 min tails. A transient 502 must be

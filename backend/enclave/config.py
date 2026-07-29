@@ -88,7 +88,8 @@ def env_flag_enabled(name: str, default: str = "false") -> bool:
     return str(os.environ.get(name, default) or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-# Number of worker threads in the single gunicorn worker. The enclave's
+# Number of worker threads inside EACH gunicorn worker process (prod runs 4 of
+# them — see enclave_worker_count below). The enclave's
 # concurrency profile is I/O-bound: every decrypt-and-serve request calls
 # back into the backend over httpx and parks the thread on that round-trip,
 # so a generously sized thread pool (not CPU count) is what keeps the pool
@@ -99,12 +100,16 @@ ENCLAVE_THREADS = int(os.environ.get("FEEDLING_ENCLAVE_THREADS", 32))
 
 
 def enclave_worker_count() -> int:
-    """gunicorn worker (process) count. Default 1 preserves the historical
-    single-worker model where the process-local whoami/content-sk caches stay
-    coherent. On a multi-vCPU CVM (prod = 8 vCPU) the decrypt crypto is GIL-bound,
-    so once the enclave→backend I/O reentrancy is out of the way, additional
-    worker PROCESSES parallelize decrypts across cores. Read from env so a deploy
-    can flip it without a code change; clamped to ≥1."""
+    """gunicorn worker (process) count. The code default of 1 preserves the
+    historical single-worker model where the process-local whoami/content-sk
+    caches stay coherent, but it is only the fallback: **prod deploys 4**
+    (deploy/docker-compose.phala.yaml sets FEEDLING_ENCLAVE_WORKERS=4). On a
+    multi-vCPU CVM (prod = 8 vCPU) the decrypt crypto is GIL-bound, so once the
+    enclave→backend I/O reentrancy is out of the way, additional worker PROCESSES
+    parallelize decrypts across cores. Each process also serves on an
+    ENCLAVE_THREADS-sized pool, so "the enclave is single-threaded" is false in
+    every environment. Read from env so a deploy can flip it without a code
+    change; clamped to ≥1."""
     # ``or "1"`` guards the empty string CI injects for an unset var (int("")
     # would crash enclave boot).
     return max(1, int((os.environ.get("FEEDLING_ENCLAVE_WORKERS") or "").strip() or "1"))

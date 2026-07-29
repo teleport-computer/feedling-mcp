@@ -415,7 +415,7 @@ def test_process_job_acquires_enclave_semaphore_for_read_messages_and_prefetch(m
     capability calls (_run_one). Before this fix, _coalesce_inputs's call to
     deps.read_messages (per-message chat decrypt) and the two _cap_data prefetch
     calls (memory_index/perception_snapshot) ran unbounded -> N concurrent
-    workers could hit the single-threaded enclave without ever passing through
+    workers could hit the shared, capacity-bounded enclave without ever passing through
     the shared gate. Uses a real (counting) Semaphore, not a mock, so the
     assertion exercises actual async acquire/release semantics.
 

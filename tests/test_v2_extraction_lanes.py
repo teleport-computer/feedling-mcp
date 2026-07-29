@@ -334,8 +334,9 @@ def test_capture_prompt_degrades_when_memory_context_is_missing(monkeypatch):
 
 def test_extraction_reads_go_through_the_enclave_semaphore(monkeypatch):
     """spec §4: read_memory_context (3 post_enclave round-trips) and read_tail (per-message
-    decrypt) are BOTH enclave-bound. The enclave is single-threaded — the whole point of this
-    subproject — so both must sit inside the turn's enclave_sem. A background lane that
+    decrypt) are BOTH enclave-bound. The enclave is a shared, capacity-bounded decrypt proxy
+    (prod: 4 workers x 32 threads, GIL-bound crypto) — protecting it is the whole point of
+    this subproject — so both must sit inside the turn's enclave_sem. A background lane that
     bypasses the gate can starve the interactive chat path."""
     import asyncio as _asyncio
 

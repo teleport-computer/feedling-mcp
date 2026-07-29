@@ -25,7 +25,9 @@ this module so the worker never imports the hosted layer.
 四种 provider wire 全部 await 原生 async HTTP transport；provider 并发不再受默认线程池
 大小限制。
 ENCLAVE_SEMAPHORE 框住 turn 里所有 enclave-bound 调用（provider-key 解密 + 逐条 chat 解密
-+ capability 调用），治 spec R3（enclave 单线程瓶颈，多 worker 齐打会放大 502）。
++ capability 调用），治 spec R3。enclave 不是单线程（prod = 4 个 gunicorn worker，每个
+32 线程解密池），但它是全系统共享、容量有限、且解密 GIL-bound 的代理——多 worker 齐打
+照样会放大 502，闸门因此仍然必要。
 """
 
 from __future__ import annotations
@@ -506,7 +508,7 @@ _PROMPT_CATCHUP_DEADLINE_SEC = float(
 if not math.isfinite(_PROMPT_CATCHUP_DEADLINE_SEC) or _PROMPT_CATCHUP_DEADLINE_SEC <= 0:
     raise RuntimeError("FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC must be positive")
 
-# 每回合最多注入最近 N 张图。enclave 单线程（每张图一次往返），且无 prompt caching ——
+# 每回合最多注入最近 N 张图。enclave 容量有限（每张图一次往返），且无 prompt caching ——
 # tail 里的图片每个回合都要重发，token 成本随图片数线性上升。
 _TAIL_IMAGE_LIMIT = int(os.environ.get("FEEDLING_V2_TAIL_IMAGE_LIMIT", "2"))
 # 单张图 b64 上限；超限跳过注入、退化成文本标记（不引入图像缩放依赖）。
@@ -2697,7 +2699,7 @@ async def _cap_data(
 
     enclave-bound（spec §11 R3）：capability 调用可能触达 enclave（如 perception_snapshot
     的解密读），跟 executor._run_one 的 capability 调用一样必须过 enclave_sem，否则多 worker
-    并发预取会绕开闸门直接打单线程 enclave。enclave_sem 为 None（部分单测直调）时不设闸——
+    并发预取会绕开闸门直接打容量有限的共享 enclave。enclave_sem 为 None（部分单测直调）时不设闸——
     与 executor._run_one/process_job 对 enclave_sem 的处理口径一致。"""
 
     async def _call():
@@ -2883,7 +2885,7 @@ def _make_fold_new_messages(
     R3). This closure must do the same: it is called once per round by
     `tool_loop.run_tool_loop`, which `await`s it, so calling the sync reader directly here
     (no thread offload, no semaphore) would block the loop thread for the enclave round-trip
-    AND let concurrent workers hit the single-threaded enclave ungated. `enclave_sem` defaults
+    AND let concurrent workers hit the shared, capacity-bounded enclave ungated. `enclave_sem` defaults
     to the module-level `ENCLAVE_SEMAPHORE` (the same shared gate `process_job` uses); tests
     that want to exercise the closure with no gating pass `enclave_sem=None` (mirrors
     `_coalesce_inputs`/`_cap_data`'s own `enclave_sem is None` no-gate tolerance).
@@ -7513,7 +7515,7 @@ async def _run_extraction(
                 raise LostJobLease("capture ownership lost during prepared retry")
         # 两次读都是 enclave-bound（read_memory_context 内部 buckets/threads/index 各走一次
         # post_enclave 往返；read_tail 逐条解密），所以**必须同在 enclave_sem 闸内**——enclave
-        # 是单线程瓶颈，正是整个子项目要保护的东西（spec §4）。
+        # 是全系统共享、容量有限的解密代理，正是整个子项目要保护的东西（spec §4）。
         async with enclave_sem:
             if deps.read_memory_context is not None:
                 try:

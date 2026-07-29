@@ -2028,7 +2028,7 @@ def _tick_screen_watch_for_user(user_id: str) -> int:
     预激活烧钱不变量）。两关都过才 enqueue 一个 `screen_watch` lane 的 background job。
 
     两个 gate 输入都在服务端明文可得，**绝不碰 enclave**（这条每 120s 对每个 db_action_v2
-    用户跑一次，一次 enclave 往返会锤死本子项目要保护的单线程瓶颈）：最新帧 id/ts 走
+    用户跑一次，一次 enclave 往返会锤死本子项目要保护的共享解密代理容量）：最新帧 id/ts 走
     `db.frame_list_meta`（不解密），last_screen_watch_frame_id 走 `get_wake_schedule`，
     last-user-msg ts 直接读 `store.chat_messages` 的明文 role/ts。
 
