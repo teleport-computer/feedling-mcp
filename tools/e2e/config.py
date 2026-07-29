@@ -52,7 +52,7 @@ HOSTED_CELLS: list[HostedCell] = [
     HostedCell("openai-official", "openai", "E2E_KEY_OPENAI",
                ["gpt-5.2", "gpt-5.2-mini"]),
     HostedCell("gemini-official", "gemini", "E2E_KEY_GEMINI",
-               ["gemini-3.1-flash", "gemini-3.1-pro"]),
+               ["gemini-3.6-flash", "gemini-3.1-pro-preview"]),
     HostedCell("openrouter", "openrouter", "E2E_KEY_OPENROUTER",
                ["anthropic/claude-sonnet-4.6", "deepseek/deepseek-chat"]),
     HostedCell("relay-openai-compatible", "openai_compatible", "E2E_KEY_RELAY",
