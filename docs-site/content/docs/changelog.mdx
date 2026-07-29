@@ -26,6 +26,9 @@ change must not be interpreted as an API guarantee.
   chronological Chat history. ElevenLabs continues to handle transcription,
   interruption, and speech synthesis, but never receives the user's model API
   key. Voice reply handoff state is encrypted and expires automatically.
+  Deployments must set `FEEDLING_VOICE_GATEWAY_PUBLIC_URL` to the public HTTPS
+  API origin; missing, private, or non-HTTPS values cause voice-session
+  creation to fail closed with `503 voice_gateway_not_configured`.
 
 - **A new `GET /v1/perception/app_close` endpoint reports app closures,
   mirroring the existing `app_open` shortcut.** It accepts the same `app`
@@ -575,6 +578,18 @@ change must not be interpreted as an API guarantee.
   See [MCP servers workflow](/docs/workflows/mcp).
 
 ### Behavior
+
+- Torn control-envelope JSON no longer leaks into chat. When a relay cuts the
+  provider stream and splits one internal control envelope across the reasoning
+  and content channels, the bare JSON tail left in the visible reply is
+  suppressed across all runtimes (resident consumer, Proactive Runtime V2, and
+  Model API Runtime V2) instead of being posted as an assistant bubble. Detection
+  rejoins the two channels — or uses a protocol head observed independently in
+  the reasoning channel, or a reported stream cut — as evidence; the
+  reconstructed action is used only to confirm the split and is never executed.
+  Foreground Chat substitutes the standard visible fallback and preserves a
+  message that merely looks JSON-like on its own; automatic wake lanes stay
+  silent and record the suppression.
 
 - Runtime V2 now persists an immutable encrypted turn trajectory alongside its
   aggregate token telemetry. Provider prompts and responses, late input folds,

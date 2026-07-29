@@ -89,6 +89,28 @@ def test_agent_protocol_malformed_or_internal_fragments_sleep_invisibly():
         assert parsed.actions == ({"type": "sleep", "reason": "invalid_protocol"},), raw
 
 
+def test_agent_protocol_torn_tail_fragments_sleep_invisibly():
+    """Stream-cut relay tears one envelope: the head goes to the reasoning
+    channel, a bare tail lands in a visible message. The head-anchored guard
+    misses these; the shared orphan-tail check must drop them (proactive is
+    fail-closed, so no reasoning-channel corroboration is needed here)."""
+    tails = [
+        'active.sleep","reason":"4:34 了她睡得很沉 早上再说"}]}',
+        '":"5点了她还在睡 没动静"}]}',
+        'type":"proactive.sleep","reason":"7点了 还在睡 不打扰了 醒了会找我"}]}',
+    ]
+    for tail in tails:
+        parsed = parse_agent_response_v2(json.dumps({"messages": [tail]}))
+        assert parsed.messages == (), tail
+        assert parsed.actions == ({"type": "sleep", "reason": "invalid_protocol"},), tail
+
+
+def test_agent_protocol_real_message_still_delivered():
+    """Guard against over-dropping: an ordinary reply must still pass."""
+    parsed = parse_agent_response_v2(json.dumps({"messages": ["宝贝早上好呀，睡得好吗"]}))
+    assert parsed.messages == ("宝贝早上好呀，睡得好吗",)
+
+
 def test_agent_protocol_non_message_structures_stay_invisible():
     parsed = parse_agent_response_v2(json.dumps({"cards": []}))
 

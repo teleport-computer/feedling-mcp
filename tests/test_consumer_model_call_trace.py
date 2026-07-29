@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 try:
-    import content_encryption  # noqa: F401
+    __import__("content_encryption")
 except ModuleNotFoundError:
     _fake_enc = types.ModuleType("content_encryption")
     _fake_enc.build_envelope = lambda **kw: {"v": 1, "stub": True}
@@ -227,6 +227,7 @@ def test_call_agent_threads_trace_id_to_cli(monkeypatch):
         trace_id="",
         lane="background",
         attempt_trigger="first",
+        stream_update=None,
     ):
         seen["trace_id"] = trace_id
         return "ok reply"

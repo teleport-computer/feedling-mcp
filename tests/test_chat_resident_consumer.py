@@ -69,6 +69,10 @@ def _reset_proactive_guard_state_between_tests():
     crc._provider_payment_cooldown_until = 0.0
     crc._last_proactive_turn_ts = 0.0
     crc._last_proactive_turn_job_id = ""
+    # Per-turn reply-parse-failed flag. Real call_agent resets it at entry, but a
+    # test that monkeypatches call_agent bypasses that; without this a prior
+    # test's suppressed-leak / parse failure leaks in and fails a later wake.
+    crc._turn_reply_parse_failed = False
     crc._reset_system_notice_state()
     yield
     crc._reset_system_notice_state()
@@ -7861,10 +7865,16 @@ def test_call_agent_cli_foreign_pinned_resume_not_healed(monkeypatch, tmp_path):
     # An operator-pinned --resume with a sid that is NOT ours is their config —
     # never rotate it, even on a missing-session error.
     _stale_resume_env(monkeypatch, tmp_path, "usr_stale_foreign")
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
     monkeypatch.setattr(
         crc, "AGENT_CLI_CMD",
         'claude --resume 99999999-9999-9999-9999-999999999999 -p "{message}"',
     )
+    # Stamp the local session under the final configured entry. Saving it
+    # before changing AGENT_CLI_CMD makes the entry-signature guard correctly
+    # rotate it, which used to make this test depend on another module having
+    # imported the shared consumer with AGENT_MODE=http.
+    crc._save_agent_session_id(_STALE_SID)
     runs = []
 
     def fake_run(cmd, **kw):

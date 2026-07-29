@@ -109,6 +109,8 @@ if not _provisioned:
     _PURE_UNIT = {
         "test_card_guard.py",
         "test_memory_actions_guard.py",
+        "test_protocol_leak.py",
+        "test_memory_lane_torn_protocol_no_write.py",
         "test_web_settings_store.py",
         "test_v2_web_gate.py",
         "test_web_settings_core.py",

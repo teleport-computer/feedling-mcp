@@ -134,6 +134,10 @@ except ImportError:
 
 import provider_client
 
+# Shared torn-protocol-JSON leak detector (backend/core, pure). backend/ is on
+# sys.path via the insert above, so it imports as a top-level `core.*` name.
+from core import protocol_leak as _protocol_leak
+
 from memory.capture_prompt_v1 import (
     build_capture_prompt,
     build_capture_retry_prompt,
@@ -7260,6 +7264,94 @@ def _call_with_resident_busy_poll(invoke, *, lane: str) -> Any:
         thread.join(timeout=0.25)
 
 
+def _leak_lane_policy(lane: str) -> str:
+    """Map the consumer's call_agent lane to the detector's lane policy.
+    Foreground chat (`lane="chat"`) protects real messages: only STRONG
+    cross-channel evidence drops. Everything else (proactive/background wakes)
+    suppresses any leak — a bracket-junky bubble on an autonomous wake is never
+    a real message, and silence is the correct proactive outcome anyway."""
+    return "foreground" if lane == "chat" else "proactive"
+
+
+def _suppress_torn_protocol_leaks(turn: "AgentTurn", *, lane: str) -> None:
+    """Drop visible messages that are torn / leaked agent-protocol JSON.
+
+    A stream-cutting relay splits one protocol envelope across the provider's
+    reasoning/content channels: the head lands in `turn.thinking_summary`, the
+    tail in `turn.messages`. Every head-anchored guard misses the tail. Here both
+    channels are in hand, so the shared detector can use the reasoning head as
+    corroboration (see backend/core/protocol_leak.py). Mutates `turn` in place;
+    a no-op (normal path byte-for-byte unchanged) unless an actual leak is found.
+
+    On drop, the paired reasoning is cleared too: never render a protocol head,
+    and — the subtle one (Codex Critical 2) — never let a leftover thinking_
+    summary keep an otherwise-empty turn looking 'valid', which would make a
+    foreground turn silently vanish instead of surfacing the honest fallback.
+    """
+    policy = _leak_lane_policy(lane)
+    reasoning = turn.thinking_summary or ""
+    reasoning_implicated = False
+    changed = False
+
+    def _is_leak(text: Any) -> bool:
+        nonlocal reasoning_implicated
+        evidence = _protocol_leak.classify(text, reasoning_text=reasoning)
+        if not _protocol_leak.should_suppress(evidence, lane=policy):
+            return False
+        if evidence in (
+            _protocol_leak.JOINED_KNOWN_PROTOCOL,
+            _protocol_leak.HEAD_IN_REASONING,
+        ):
+            reasoning_implicated = True
+        log.warning(
+            "torn protocol fragment dropped lane=%s evidence=%s frag=%r",
+            lane, evidence, str(text)[:48],
+        )
+        return True
+
+    if turn.messages:
+        kept = [m for m in turn.messages if not _is_leak(m)]
+        if len(kept) != len(turn.messages):
+            turn.messages = kept
+            changed = True
+
+    # Action-derived send_message text is a SECOND visible exit: the proactive
+    # lane turns a `send_message` action into a bubble via
+    # _send_message_replies_from_actions, bypassing the message scan above
+    # (Codex code-review #3). Drop torn ones here too.
+    if turn.actions:
+        kept_actions: list[dict] = []
+        for action in turn.actions:
+            if isinstance(action, dict) and _proactive_action_type(
+                action
+            ).removeprefix("proactive.") == "send_message":
+                text = str(action.get("text") or action.get("message") or "").strip()
+                if text and _is_leak(text):
+                    changed = True
+                    continue
+            kept_actions.append(action)
+        turn.actions = kept_actions
+
+    if not changed:
+        return  # nothing suppressed — leave the turn (and normal path) untouched
+
+    # Clear reasoning when the head itself was torn (garbage, never real
+    # reasoning) or when nothing user-facing survives (so the turn reads as
+    # cleanly empty and the existing fallback path in call_agent fires: fore-
+    # ground -> FALLBACK_REPLY, proactive -> recorded parse-failed, never silent).
+    has_visible = bool(turn.messages) or any(
+        isinstance(a, dict)
+        and _proactive_action_type(a).removeprefix("proactive.") == "send_message"
+        for a in turn.actions
+    )
+    if reasoning_implicated or not has_visible:
+        turn.thinking_summary = ""
+        turn.thinking_kind = ""
+        turn.thinking_source = ""
+        turn.thinking_model = ""
+        turn.thinking_native = None
+
+
 def call_agent(
     message: str,
     images: list[dict[str, str]] | None = None,
@@ -7270,6 +7362,13 @@ def call_agent(
     attempt_trigger: str = "first",
     stream_update: Callable[[int, str, bool], None] | None = None,
 ) -> Any:
+    # `_turn_reply_parse_failed` is a per-turn signal: reset it at entry so a
+    # prior turn's failure (or a suppressed leak below) never bleeds into this
+    # one. Previously only ever SET here; leak suppression now empties turns more
+    # often, so an explicit per-turn reset keeps the signal turn-scoped.
+    global _turn_reply_parse_failed
+    _turn_reply_parse_failed = False
+
     def _invoke() -> Any:
         if AGENT_MODE == "http":
             # http path metrics/timing are out of scope for this event pair (cli-only);
@@ -7293,6 +7392,7 @@ def call_agent(
         return raw if isinstance(raw, str) else _raw_assistant_text(raw)
 
     turn = _agent_turn_from_raw(raw)
+    _suppress_torn_protocol_leaks(turn, lane=lane)
     if turn.actions or turn.messages or turn.thinking_summary or turn.tool_calls:
         body: dict[str, Any] = {
             "actions": turn.actions,
@@ -7322,7 +7422,6 @@ def call_agent(
             log.debug("agent runtime debug keys: %s", sorted(turn.runtime_debug.keys()))
         return body
     if SEND_FALLBACK_ON_AGENT_ERROR:
-        global _turn_reply_parse_failed
         _turn_reply_parse_failed = True
         return [FALLBACK_REPLY]
     raise ValueError("agent produced no usable reply after sanitization")

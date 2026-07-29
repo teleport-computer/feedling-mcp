@@ -109,6 +109,14 @@ user or integrator controls instead of Feedling's hosted runner.
    Chat history in their original order, so the call is not imported a second
    time after hang-up.
 
+Deployment prerequisite: the API service must set
+`FEEDLING_VOICE_GATEWAY_PUBLIC_URL` to the externally reachable HTTPS origin
+that serves `/v1/voice`. Feedling returns this origin to ElevenLabs as the
+Custom LLM endpoint; a private, non-HTTPS, missing, or otherwise invalid value
+causes `POST /v1/voice/sessions` to fail closed with
+`503 voice_gateway_not_configured` instead of returning an unusable internal
+address.
+
 ElevenLabs is an external plaintext recipient for call audio, transcripts, and
 assistant speech text. It does not receive the user's model API key. Voice
 session tokens are short-lived, signed, bound to one user and call, and are not

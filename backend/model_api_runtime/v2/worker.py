@@ -62,6 +62,7 @@ from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
 from core import chat_activity as core_chat_activity
 from core import envelope as core_envelope
+from core import protocol_leak
 from core import provider_usage
 from core import store as core_store
 from core import wake_bus as core_wake_bus
@@ -883,6 +884,23 @@ _DEGENERATE_REPLY_FALLBACK = (
     or "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
 )
 _DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
+# A torn/leaked protocol-JSON fragment (stream-cut relay split the envelope
+# across reasoning/content). Same blame as a degenerate reply — the relay, not
+# us — but a distinct failure reason keeps flaky-relay users visible in the
+# job_failed_reasons aggregation instead of hiding behind a plain sleep.
+_PROTOCOL_FRAGMENT_ERROR_CLASS = "upstream_unavailable"
+_PROTOCOL_FRAGMENT_REASON = "protocol_fragment_suppressed"
+
+
+def _torn_protocol_evidence(text: str, reasoning: str, *, lane: str) -> str:
+    """Classify a V2 reply-tool / free-text reply for a torn protocol leak, then
+    apply the lane policy. Returns the evidence enum when it should be suppressed,
+    or "" to deliver. `lane` here is the detector policy ("proactive"/"foreground"),
+    not the wake lane."""
+    evidence = protocol_leak.classify(text, reasoning_text=reasoning)
+    if protocol_leak.should_suppress(evidence, lane=lane):
+        return evidence
+    return ""
 
 
 class LostJobLease(RuntimeError):
@@ -4670,6 +4688,25 @@ async def _bound_materialized_summary(
     return bounded
 
 
+def _with_coverage_hole_notice(summary: str, hole_count: int) -> str:
+    """Disclose that older messages were dropped from the bounded prompt window.
+
+    Option A serves a bounded recency tail when compaction is behind, leaving a
+    gap between the summary and the recent messages. Stating it plainly stops the
+    model from assuming the omitted span never happened; the durable facts remain
+    in long-term memory, and the background maintenance compaction chain shrinks
+    the gap over time. Rendered into the existing summary/context block, so it
+    never enters the seq-exact tail machinery.
+    """
+    notice = (
+        f"\n\n[Context note: {hole_count} earlier message(s) between the summary "
+        "above and the recent messages below are omitted here to fit the context "
+        "window. Their durable facts are retained in long-term memory — ask the "
+        "user if you need older details.]"
+    )
+    return ((summary or "").rstrip() + notice).strip()
+
+
 async def _read_seq_adaptive_prompt_context(
     *,
     user_id: str,
@@ -4683,8 +4720,18 @@ async def _read_seq_adaptive_prompt_context(
     add_usage: Callable[[dict | None], None] | None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
     active_image_ids: set[str] | None = None,
+    tail_cap: int | None = None,
 ) -> tuple[str, list[dict], list[list[dict]], bool, int]:
-    """Read one exact core plus summary-covered complete-turn replay."""
+    """Read one exact core plus summary-covered complete-turn replay.
+
+    ``tail_cap`` (Option A / graceful degradation): when set, the verbatim tail
+    is bounded to the newest ``tail_cap`` rows after the summary watermark
+    instead of REQUIRING every post-watermark row. If compaction has fallen
+    behind, the oldest uncompacted rows are dropped from the prompt (a "coverage
+    hole", disclosed in the summary text) and the turn still answers from recent
+    context rather than failing. ``None`` keeps the historical exact-coverage
+    contract (used by paths that must never drop a row, e.g. wake replay).
+    """
     async with enclave_sem:
         (
             summary,
@@ -4696,9 +4743,38 @@ async def _read_seq_adaptive_prompt_context(
             deps.read_tail_after_seq,
             user_id,
             watermark_seq,
-            None,
+            tail_cap,
             through_seq=through_seq,
         )
+        # The lower seq boundary the prompt actually covers verbatim. Equal to the
+        # watermark on the exact-coverage path; raised to just below the oldest
+        # bounded-tail row when a hole is dropped, so `_assert_prompt_tail_exact`
+        # checks membership over the WINDOW the prompt claims, not the whole gap.
+        prompt_floor_seq = int(watermark_seq)
+        coverage_hole_count = 0
+        if tail_cap is not None and tail:
+            candidate_floor = int(tail[0]["seq"]) - 1
+            if candidate_floor > int(watermark_seq):
+                prompt_floor_seq = candidate_floor
+                # Count only real (non-synthetic) rows so the disclosed number
+                # matches messages a user would recognize as missing.
+                coverage_hole_count = max(
+                    0,
+                    await asyncio.to_thread(
+                        db.count_messages_after_seq,
+                        user_id,
+                        int(watermark_seq),
+                        through_seq=int(through_seq),
+                        exclude_synthetic_sources=True,
+                    )
+                    - await asyncio.to_thread(
+                        db.count_messages_after_seq,
+                        user_id,
+                        prompt_floor_seq,
+                        through_seq=int(through_seq),
+                        exclude_synthetic_sources=True,
+                    ),
+                )
         optional_tail_turns: list[list[dict]] = []
         tail_source_truncated = False
         if deps.read_recent_turns is not None:
@@ -4761,10 +4837,12 @@ async def _read_seq_adaptive_prompt_context(
     )
     await _assert_prompt_tail_exact(
         user_id,
-        watermark_seq=watermark_seq,
+        watermark_seq=prompt_floor_seq,
         through_seq=through_seq,
         tail=tail,
     )
+    if coverage_hole_count > 0:
+        summary = _with_coverage_hole_notice(summary, coverage_hole_count)
     return (
         summary,
         tail,
@@ -4821,16 +4899,53 @@ async def _run_compaction(
         # A checkpoint increments the head version; reading first would waste
         # one provider call on a predictably stale leaf and force a retry job.
         if deps.read_summary_frontier is not None:
-            await _rebalance_summary_frontier(
-                user_id,
-                deps,
-                provider_config=provider_config,
-                enclave_sem=enclave_sem,
-                claimed_by=claimed_by,
-                job_id=job_id,
-                add_usage=tm.add_call if tm is not None else None,
-                trajectory_recorder=trajectory_recorder,
-            )
+            try:
+                await _rebalance_summary_frontier(
+                    user_id,
+                    deps,
+                    provider_config=provider_config,
+                    enclave_sem=enclave_sem,
+                    claimed_by=claimed_by,
+                    job_id=job_id,
+                    add_usage=tm.add_call if tm is not None else None,
+                    trajectory_recorder=trajectory_recorder,
+                )
+            except (LostJobLease, RuntimeModeChanged, asyncio.CancelledError):
+                # Lifecycle, not the checkpoint's own failure — this worker no
+                # longer owns the job and must not keep folding.
+                raise
+            except v2_summary_frontier.SummaryFrontierIntegrityError:
+                # The persisted cover cannot prove complete coverage. Folding on
+                # top of a frontier we cannot trust would extend the damage, so
+                # this one stays fatal.
+                raise
+            except Exception as rebalance_exc:  # noqa: BLE001 — see below
+                # A checkpoint only reduces how many nodes a later prompt has to
+                # read; the fold below is the actual work. Letting a failed
+                # checkpoint skip it (it sits ABOVE the tail read) meant the
+                # backlog could never drain, and since the roll-up input does
+                # not change, it failed identically on every retry — including
+                # manual re-enqueues. usr_7f30 on prod sat at a frozen watermark
+                # for days on exactly this, with `model_calls=1` proving the one
+                # provider call was the checkpoint, never the fold.
+                _report_turn_progress("compaction_checkpoint_degraded")
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "compaction_checkpoint_degraded",
+                    {
+                        "lane": "maintenance",
+                        "error_class": type(rebalance_exc).__name__,
+                        "detail": str(
+                            getattr(rebalance_exc, "detail", "") or ""
+                        )[:80],
+                    },
+                    best_effort=True,
+                )
+                log.warning(
+                    "[v2.worker] checkpoint rebalance degraded for %s: %s",
+                    user_id,
+                    type(rebalance_exc).__name__,
+                )
         async with enclave_sem:
             if deps.read_summary_with_seq is not None and (
                 deps.read_compaction_tail_after_seq is not None
@@ -4863,100 +4978,128 @@ async def _run_compaction(
             if tm is not None:
                 tm.flush(failed=False, status="ok")
             return "completed"
-        old = _bounded_compaction_prefix(tail[: max(0, len(tail) - _TAIL_KEEP)])
-        if not old:
-            raise RuntimeError("compaction_batch_empty")
-        new_watermark = old[-1]["ts"]
-        # D5/Task 9: also advance the seq watermark, atomically, in the same CAS
-        # write as new_watermark below. The tail row dict itself may already carry
-        # "seq" (a seq-aware reader); if not (e.g. today's ts-windowed
-        # _read_compaction_tail, or a narrow test double), fall back to an exact
-        # by-id lookup — never a ts-range estimate, which would be ambiguous
-        # under same-ts ties (see db.chat_seq_for_msg_id's docstring). A tail row
-        # with no "id" at all (only synthetic test doubles) leaves the seq
-        # watermark unadvanced this round rather than guessing.
-        new_watermark_seq = old[-1].get("seq")
-        if new_watermark_seq is None:
-            last_id = old[-1].get("id")
-            if last_id is not None:
-                new_watermark_seq = await asyncio.to_thread(
-                    db.chat_seq_for_msg_id, user_id, last_id
-                )
-        first_watermark_seq = old[0].get("seq")
-        if first_watermark_seq is None:
-            first_id = old[0].get("id")
-            if first_id is not None:
-                first_watermark_seq = await asyncio.to_thread(
-                    db.chat_seq_for_msg_id, user_id, first_id
-                )
-        _report_turn_progress("compaction_batch_start")
+        # A refused fold is a property of the BATCH, not a verdict on the
+        # backlog: shrink and retry before giving up, mirroring the inline
+        # catch-up's ladder. Reporting success without advancing (the old
+        # behaviour) left the watermark frozen while metrics said ok —
+        # usr_90184 on prod, job 130: model_calls=1, status=ok, summary
+        # untouched for an hour.
+        candidate_rows = tail[: max(0, len(tail) - _TAIL_KEEP)]
+        fold_limit = len(candidate_rows)
+        while True:
+            old = _bounded_compaction_prefix(candidate_rows[:fold_limit])
+            if not old:
+                raise RuntimeError("compaction_batch_empty")
+            new_watermark = old[-1]["ts"]
+            # D5/Task 9: also advance the seq watermark, atomically, in the same CAS
+            # write as new_watermark below. The tail row dict itself may already carry
+            # "seq" (a seq-aware reader); if not (e.g. today's ts-windowed
+            # _read_compaction_tail, or a narrow test double), fall back to an exact
+            # by-id lookup — never a ts-range estimate, which would be ambiguous
+            # under same-ts ties (see db.chat_seq_for_msg_id's docstring). A tail row
+            # with no "id" at all (only synthetic test doubles) leaves the seq
+            # watermark unadvanced this round rather than guessing.
+            new_watermark_seq = old[-1].get("seq")
+            if new_watermark_seq is None:
+                last_id = old[-1].get("id")
+                if last_id is not None:
+                    new_watermark_seq = await asyncio.to_thread(
+                        db.chat_seq_for_msg_id, user_id, last_id
+                    )
+            first_watermark_seq = old[0].get("seq")
+            if first_watermark_seq is None:
+                first_id = old[0].get("id")
+                if first_id is not None:
+                    first_watermark_seq = await asyncio.to_thread(
+                        db.chat_seq_for_msg_id, user_id, first_id
+                    )
+            _report_turn_progress("compaction_batch_start")
 
-        async def _recording_compaction_llm(*args: Any, **kwargs: Any) -> Any:
-            messages = args[1] if len(args) > 1 else kwargs.get("messages", [])
-            await _record_trajectory(
-                trajectory_recorder,
-                "provider_request",
-                {"lane": "maintenance", "messages": messages, "tools": None},
-            )
-            try:
-                result = await _compaction_llm_with_progress(
-                    user_id,
-                    *args,
-                    **kwargs,
-                )
-            except Exception as exc:
+            async def _recording_compaction_llm(*args: Any, **kwargs: Any) -> Any:
+                messages = args[1] if len(args) > 1 else kwargs.get("messages", [])
                 await _record_trajectory(
                     trajectory_recorder,
-                    "provider_error",
-                    {
-                        "error_class": type(exc).__name__,
-                        "provider_attempt_trace": (
-                            provider_client.runtime_provider_attempt_trace(exc)
-                        ),
-                    },
-                    best_effort=True,
+                    "provider_request",
+                    {"lane": "maintenance", "messages": messages, "tools": None},
                 )
-                raise
-            await _record_trajectory(
-                trajectory_recorder,
-                "provider_response",
-                {"response": result},
-            )
-            return result
+                try:
+                    result = await _compaction_llm_with_progress(
+                        user_id,
+                        *args,
+                        **kwargs,
+                    )
+                except Exception as exc:
+                    await _record_trajectory(
+                        trajectory_recorder,
+                        "provider_error",
+                        {
+                            "error_class": type(exc).__name__,
+                            "provider_attempt_trace": (
+                                provider_client.runtime_provider_attempt_trace(exc)
+                            ),
+                        },
+                        best_effort=True,
+                    )
+                    raise
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "provider_response",
+                    {"response": result},
+                )
+                return result
 
-        segmented_write = (
-            deps.append_summary_segment is not None
-            and new_watermark_seq is not None
-            and first_watermark_seq is not None
-            and deps.read_summary_with_seq is not None
-        )
-        if segmented_write:
-            segment_text = await v2_compaction.compact_segment(
-                provider_config=provider_config,
-                old_messages=old,
-                llm=_recording_compaction_llm,
-                usage_out=tm.add_call if tm is not None else None,
+            segmented_write = (
+                deps.append_summary_segment is not None
+                and new_watermark_seq is not None
+                and first_watermark_seq is not None
+                and deps.read_summary_with_seq is not None
             )
-            new_summary = segment_text or ""
-        else:
-            new_summary = await v2_compaction.compact(
-                provider_config=provider_config,
-                current_summary=summary,
-                old_messages=old,
-                llm=_recording_compaction_llm,
-                usage_out=tm.add_call if tm is not None else None,
-            )
-        _report_turn_progress("compaction_batch_complete")
-        if (
-            (segmented_write and not new_summary.strip())
-            or (not segmented_write and new_summary.strip() == summary.strip())
-        ):  # 空/no-op 折叠 → 不推进 watermark/version
-            await asyncio.to_thread(
-                jobs_store.mark_completed, job_id, claimed_by=claimed_by
-            )
-            if tm is not None:
-                tm.flush(failed=False, status="ok")
-            return "completed"
+            if segmented_write:
+                segment_text = await v2_compaction.compact_segment(
+                    provider_config=provider_config,
+                    old_messages=old,
+                    llm=_recording_compaction_llm,
+                    usage_out=tm.add_call if tm is not None else None,
+                )
+                new_summary = segment_text or ""
+            else:
+                new_summary = await v2_compaction.compact(
+                    provider_config=provider_config,
+                    current_summary=summary,
+                    old_messages=old,
+                    llm=_recording_compaction_llm,
+                    usage_out=tm.add_call if tm is not None else None,
+                )
+            _report_turn_progress("compaction_batch_complete")
+            if (
+                (segmented_write and not new_summary.strip())
+                or (not segmented_write and new_summary.strip() == summary.strip())
+            ):  # 空/no-op 折叠 → 不推进 watermark/version
+                if len(old) > 1:
+                    fold_limit = max(1, len(old) // 4)
+                    _report_turn_progress(
+                        f"compaction_batch_shrunk_{fold_limit}"
+                    )
+                    await _record_trajectory(
+                        trajectory_recorder,
+                        "compaction_batch_shrunk",
+                        {
+                            "lane": "maintenance",
+                            "fold_limit": fold_limit,
+                        },
+                        best_effort=True,
+                    )
+                    continue
+                # A single row that still folds to nothing is genuinely
+                # unfoldable here. Leave it to the inline catch-up, which
+                # owns the quarantine path, rather than inventing coverage.
+                await asyncio.to_thread(
+                    jobs_store.mark_completed, job_id, claimed_by=claimed_by
+                )
+                if tm is not None:
+                    tm.flush(failed=False, status="ok")
+                return "completed"
+            break
         if claimed_by and not await asyncio.to_thread(
             jobs_store.renew_job_lease,
             job_id,
@@ -6688,6 +6831,20 @@ async def _run_wake(
                 if final:
                     raise TurnError("degenerate_reply_suppressed")
                 return
+            # Torn protocol-JSON leak (stream-cut relay split the envelope across
+            # reasoning/content). Proactive policy suppresses any leak — silence
+            # is the correct wake outcome anyway. Mirror the degenerate lifecycle:
+            # final fails the turn (recorded, no bubble), intermediate is a no-op.
+            torn = _torn_protocol_evidence(text, reasoning, lane="proactive") if text else ""
+            if torn:
+                log.warning(
+                    "[v2.worker] wake torn protocol fragment suppressed user=%s "
+                    "job=%s lane=%s final=%s evidence=%s fragment=%r",
+                    user_id, job_id, lane, final, torn, text[:32],
+                )
+                if final:
+                    raise TurnError(_PROTOCOL_FRAGMENT_REASON)
+                return
             if not text:
                 # Silence is a legitimate wake outcome — both mid-loop (an empty
                 # `reply{}` call) and terminal ("weak wake sleeps"): unlike the chat
@@ -8117,6 +8274,70 @@ def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[di
     return out
 
 
+async def _ensure_prompt_coverage_or_degrade(
+    user_id: str,
+    deps: TurnDeps,
+    *,
+    provider_config: Any,
+    enclave_sem: "asyncio.Semaphore",
+    tail_limit: int,
+    job_id,
+    claimed_by: str | None,
+    add_usage: Callable[[dict | None], None] | None,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
+    compact_through_seq: int | None,
+) -> None:
+    """Option A: run the inline catch-up, but NEVER fail a user reply because
+    compaction is behind.
+
+    On any non-control-flow failure (coverage exhaustion, a summary-frontier
+    exhaustion, a transient provider error during a fold), kick the
+    self-sustaining background maintenance-compaction chain and return, so the
+    turn serves the bounded recency tail (+ coverage-hole notice) that
+    ``_read_seq_adaptive_prompt_context`` produces. Control-flow signals
+    (``LostJobLease``/``RuntimeModeChanged``/cancellation) still propagate.
+
+    This breaks the deadlock where a user whose gap exceeds what one turn's
+    bounded catch-up can close fails EVERY turn, which also starves the
+    post-reply enqueue that would have drained the backlog (usr_7f30 / usr_81a0
+    / usr_90184 on prod, stuck for days).
+    """
+    try:
+        await _ensure_prompt_coverage(
+            user_id,
+            deps,
+            provider_config=provider_config,
+            enclave_sem=enclave_sem,
+            tail_limit=tail_limit,
+            job_id=job_id,
+            claimed_by=claimed_by,
+            add_usage=add_usage,
+            trajectory_recorder=trajectory_recorder,
+            compact_through_seq=compact_through_seq,
+        )
+    except (LostJobLease, RuntimeModeChanged, asyncio.CancelledError):
+        raise
+    except Exception as coverage_exc:  # noqa: BLE001 — degrade, never fail the reply
+        _report_turn_progress("prompt_catchup_degraded")
+        try:
+            await asyncio.to_thread(
+                jobs_store.enqueue_job, user_id, "maintenance", reason="compaction"
+            )
+            await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+        except Exception as enqueue_exc:  # noqa: BLE001
+            log.warning(
+                "[v2.worker] degraded-coverage compaction enqueue failed for %s: %s",
+                user_id,
+                enqueue_exc,
+            )
+        await _record_trajectory(
+            trajectory_recorder,
+            "prompt_catchup_degraded",
+            {"lane": "chat", "error_class": type(coverage_exc).__name__},
+            best_effort=True,
+        )
+
+
 async def process_job(
     job: dict,
     deps: TurnDeps,
@@ -8571,7 +8792,9 @@ async def process_job(
             # actual prompt content — see `_ensure_prompt_coverage`'s
             # docstring. Common case (no gap) costs two cheap indexed reads
             # and returns immediately without touching the enclave/LLM.
-            await _ensure_prompt_coverage(
+            # Option A: degrade instead of failing the reply when catch-up can't
+            # finish — the bounded tail below carries the turn.
+            await _ensure_prompt_coverage_or_degrade(
                 user_id,
                 deps,
                 provider_config=provider_config,
@@ -8613,6 +8836,9 @@ async def process_job(
                         for row in coalesced
                         if row.get("has_image") and row.get("id")
                     },
+                    # Option A: bound the verbatim tail; drop-oldest with a
+                    # disclosed hole rather than requiring a drained backlog.
+                    tail_cap=_TAIL_HARD_CAP,
                 )
                 if ordered_chat_replies:
                     tail = context.ordered_reply_tail(
@@ -9227,6 +9453,23 @@ async def process_job(
                 text = _DEGENERATE_REPLY_FALLBACK
                 turn_failure_error_class = _DEGENERATE_REPLY_ERROR_CLASS
                 reasoning = ""
+            # Torn protocol-JSON leak. Foreground policy: only STRONG cross-channel
+            # evidence drops (a weak orphan tail might be the user pasting JSON). On
+            # a strong hit, substitute the honest fallback and drop the reasoning —
+            # never render a torn protocol head next to the fallback bubble.
+            elif file_reply is None and text and _torn_protocol_evidence(
+                text, reasoning, lane="foreground"
+            ):
+                log.warning(
+                    "[v2.worker] chat torn protocol fragment suppressed user=%s "
+                    "job=%s final=%s fragment=%r",
+                    user_id, job_id, final, text[:32],
+                )
+                if not final:
+                    return
+                text = _DEGENERATE_REPLY_FALLBACK
+                turn_failure_error_class = _PROTOCOL_FRAGMENT_ERROR_CLASS
+                reasoning = ""
             if final and not text:
                 # BUG-4 no-filler: chat lane always replies — an empty terminal
                 # text is a model/provider failure here (unlike wake, where
@@ -9735,6 +9978,7 @@ async def process_job(
                         for row in coalesced
                         if row.get("has_image") and row.get("id")
                     },
+                    tail_cap=_TAIL_HARD_CAP,
                 )
                 if ordered_chat_replies:
                     tail = context.ordered_reply_tail(

@@ -12,8 +12,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT / "backend"))
 
 from core import voice_token
 import db
@@ -69,6 +71,40 @@ def test_gateway_uses_public_https_and_rejects_private_default(monkeypatch):
         "https://voice.example.test/v1/voice/chat/completions",
     )
     assert routes_asgi._gateway_url(request) == "https://voice.example.test/v1/voice"
+
+
+@pytest.mark.parametrize(
+    ("compose_name", "expected_origin"),
+    [
+        ("docker-compose.phala.yaml", "https://api.feedling.app"),
+        ("docker-compose.phala.test.yaml", "https://test-api.feedling.app"),
+        ("docker-compose.phala.pre.yaml", "https://pre-api.feedling.app"),
+    ],
+)
+def test_managed_composes_pin_public_voice_gateway(
+    compose_name, expected_origin
+):
+    compose = yaml.safe_load((ROOT / "deploy" / compose_name).read_text())
+
+    assert (
+        compose["services"]["backend"]["environment"][
+            "FEEDLING_VOICE_GATEWAY_PUBLIC_URL"
+        ]
+        == expected_origin
+    )
+
+
+def test_self_host_compose_forwards_public_voice_gateway_setting():
+    compose = yaml.safe_load(
+        (ROOT / "deploy" / "docker-compose.yaml").read_text()
+    )
+
+    assert (
+        compose["services"]["backend"]["environment"][
+            "FEEDLING_VOICE_GATEWAY_PUBLIC_URL"
+        ]
+        == "${FEEDLING_VOICE_GATEWAY_PUBLIC_URL:-}"
+    )
 
 
 def test_gateway_extracts_only_latest_user_turn():
