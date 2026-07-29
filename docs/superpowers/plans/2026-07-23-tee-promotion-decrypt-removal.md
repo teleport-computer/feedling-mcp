@@ -580,6 +580,42 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
 - [ ] **V2 存储改按偏好**：`0043` 等迁移的 envelope 列放宽 CHECK 为「明文或
       信封」；`serve_worker.py` 写路径按用户偏好选明文/信封。与 Task 1.5 联动。
 
+#### 2026-07-30：下游拆包点普查（第一步，已完成）
+
+AST 扫全仓 `X["body_ct"]`，把每处反向定位到其所属函数，再判断该函数内是否含
+生产者调用（`_build_shared_envelope_for_store` / `build_envelope`）：
+
+**硬拆包点 29 处**（软判别 `.get("body_ct")` 另有 38 处，天然形状无关，不计）。
+
+| 类 | 数量 | 处理 |
+|---|---|---|
+| **A. 与生产者同函数** | 7 | ✅ 已迁移 |
+| **B1. callee，服务端写路径** | 6 | ✅ 已迁移 |
+| **B2. 前缀子信封**（`thinking_body_ct` / `caption_body_ct`） | 3 | ⏳ helper 需加 prefix 变体 |
+| **B3. swap 通道**（`content_core.py` ×4） | 4 | ⏳ 属**客户端上传**路径，有独立硬校验，随 Task 2.3 一起改 |
+| **B4. R2 卸载/注水**（`db.py` ×7） | 7 | ⏳ 需要的是**形状守卫**（明文行不该走卸载），不是字段拼接 |
+| **B5. 不该动** | 2 | `enclave/envelope.py:109`（解密实现本身）、`genesis/genesis_core.py:365`（赋值构造） |
+
+**已交付的形状无关 helper**：`core.envelope.envelope_storage_fields(envelope,
+*, default_owner_user_id="")` —— 只返回**信封落库字段**（信封行给
+`body_ct/nonce/K_user/[K_enclave]/…`，明文行给 `body`），站点自有字段
+（id/role/ts/type/source…）仍由调用方写。所以迁移是纯机械的，且**在写侧形状真
+正切换前行为逐字不变**（生产者此刻仍恒出信封）。
+
+两个刻意的设计点：缺失的可选字段**整键省略**而非写 `None`（尾账判据「有
+K_user 无 K_enclave = 孤岛」靠的正是键在不在）；`body_ct` 优先于 `body`。
+
+**已迁移的 13 处**：`core/store.py`（`_build_chat_message` / `append_chat`）、
+`memory/memory_core.py:add`、`memory/actions.py:_memory_record_from_envelope`、
+`identity/identity_core.py` ×2、`identity/actions.py` ×2、
+`hosted/history_import.py` ×3、`genesis/service.py` ×2、
+`v2/jobs_store.py:_capture_memory_doc`。
+
+L1 **7213 passed / 0 failed**（含 `tests/test_envelope_storage_fields.py` 10 例）。
+
+> 注意这一步**没有**改变任何写入形状——它只是把「切形状」这件事从「会炸 13
+> 处」变成「改一个 helper」。写侧真正切换仍需先做完 B2–B4。
+
 ### Task 2.3: 读侧明文旁路（enclave 保留给信封行）
 
 - [ ] `core/enclave.py` 调用点改「按行格式路由」：明文行直读 doc；**信封行仍走

@@ -301,12 +301,8 @@ def _save_identity_action_payload(
     identity = {
         "v": 1,
         "id": envelope.get("id") or existing.get("id") or uuid.uuid4().hex,
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
         "created_at": existing.get("created_at") or now,
         "updated_at": now,
         # replaced_at is the P5 concurrency baseline: it is stamped ONLY by
@@ -447,12 +443,8 @@ def _create_identity_action_payload(
     identity = {
         "v": 1,
         "id": envelope.get("id") or core_util._new_public_id("identity"),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
         "created_at": now,
         "updated_at": now,
         # A create IS a full-card write, so it stamps the replaced_at baseline

@@ -274,15 +274,9 @@ def _memory_record_from_envelope(store: UserStore, envelope: dict, *, existing: 
         "created_at": (existing or {}).get("created_at") or now,
         "updated_at": now,
         "source": str(envelope.get("source") or (existing or {}).get("source") or "live_conversation"),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
-        "visibility": envelope["visibility"],
-        "owner_user_id": envelope["owner_user_id"],
+        "enclave_pk_fpr": "",
+        **core_envelope.envelope_storage_fields(envelope),
     }
-    if envelope.get("K_enclave"):
-        moment["K_enclave"] = envelope["K_enclave"]
     for key in (
         "status",
         "importance",

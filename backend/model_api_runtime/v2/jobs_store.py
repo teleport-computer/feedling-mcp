@@ -1600,6 +1600,8 @@ def get_prepared_capture_batch(
 
 
 def _capture_memory_doc(user_id: str, action: dict) -> dict:
+    from core import envelope as core_envelope  # 延迟导入：与本模块既有惯例一致
+
     envelope = dict(action["envelope"])
     occurred_at = str(envelope["occurred_at"])
     now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -1611,11 +1613,11 @@ def _capture_memory_doc(user_id: str, action: dict) -> dict:
         "created_at": now_iso,
         "updated_at": now_iso,
         "source": str(envelope.get("source") or "memory_capture"),
-        "body_ct": envelope["body_ct"],
-        "nonce": envelope["nonce"],
-        "K_user": envelope["K_user"],
-        "K_enclave": envelope["K_enclave"],
-        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+        "enclave_pk_fpr": "",
+        # splice 之后再钉死 visibility/owner：本站点刻意忽略信封里的值。
+        # 注意 K_enclave 由 splice 决定「在不在」——信封行必带（shared 封装
+        # 一定有），明文行本就没有。
+        **core_envelope.envelope_storage_fields(envelope),
         "visibility": "shared",
         "owner_user_id": str(user_id),
         "status": str(envelope.get("status") or "active"),

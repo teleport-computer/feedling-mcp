@@ -103,6 +103,45 @@ def decrypt_provider_key_envelope(envelope: dict, api_key: str | None, *,
     raise ValueError("envelope_shape_unrecognized")
 
 
+_SEALED_FIELDS = ("body_ct", "nonce", "K_user", "K_enclave",
+                  "enclave_pk_fpr", "content_pk_fpr")
+
+
+def envelope_storage_fields(envelope: dict, *,
+                            default_owner_user_id: str = "") -> dict:
+    """取出信封的**落库字段**，供各写入点合进自己的 doc。
+
+    各写入点原本都硬拆 ``envelope["body_ct"]`` 等固定字段名，一旦写侧改出明文
+    形状就 KeyError。本函数按行形状路由，让那些站点变成形状无关：
+
+      - 信封行 → ``body_ct/nonce/K_user/[K_enclave]/[enclave_pk_fpr]/…``
+      - 明文行 → ``body``
+
+    站点自有字段（id / role / ts / type / source…）仍由调用方写——迁移因此是纯
+    机械的，且在写侧形状真正切换前**行为逐字不变**。
+
+    ``body_ct`` 优先于 ``body``：两者并存只出现在迁移中间态，此时密文是真源。
+    缺失的可选字段**整键省略**而不是写 None——尾账判据「有 K_user 无 K_enclave
+    = 孤岛」靠的正是键在不在。
+    """
+    if not isinstance(envelope, dict):
+        raise ValueError("envelope_shape_unrecognized")
+
+    out: dict = {}
+    if envelope.get("body_ct"):
+        for key in _SEALED_FIELDS:
+            if envelope.get(key) is not None:
+                out[key] = envelope[key]
+    elif envelope.get("body") is not None:
+        out["body"] = envelope["body"]
+    else:
+        raise ValueError("envelope_shape_unrecognized")
+
+    out["owner_user_id"] = envelope.get("owner_user_id") or default_owner_user_id
+    out["visibility"] = envelope.get("visibility") or "shared"
+    return out
+
+
 def _build_shared_envelope_for_store(
     store,
     plaintext: bytes,
