@@ -7,10 +7,16 @@ background fold hit compaction's 60 s timeout, the backlog grew past 1200, and
 no column in this table ever changed to say why.
 
 Shadow-DB note: provider_health is on the SNAPSHOT lane, which copies the
-INTERSECTION of both sides' columns and reports the difference as drift
-(tee_shadow/snapshot.py). Adding a column here is therefore safe without a
-matching alembic_tee revision; the column simply shows up in `missing_in_tee`
-until one is written.
+INTERSECTION of both sides' columns (tee_shadow/snapshot.py). That makes a new
+column safe in the sense that it cannot break replication — but NOT in the
+sense that it can be skipped: the intersection keeps reporting `ok: true` with
+the right row count while this column's data silently never reaches the shadow,
+and `missing_in_tee` is the only signal. Adding a column does not trip the
+"no common columns" guard the way adding a table does, so it is invisible to
+snapshot failures and to CI (see TEE_POSTGRES_SHADOW_PROVISIONING.md §3).
+The matching alembic_tee revision is 0009_provider_latency, in this same batch,
+and it still needs a manual run — the migration workflow's secrets do not exist
+yet.
 
 Revision ID: 0068_provider_latency
 Revises: 0067_voice_turn_state

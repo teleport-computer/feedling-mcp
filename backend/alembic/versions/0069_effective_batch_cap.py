@@ -15,8 +15,16 @@ NULL means "never measured" and reads as the configured default, so existing
 rows and brand-new users are unchanged.
 
 Shadow-DB note: v2_conversation_summary is on the CIPHERTEXT lane, whose
-replicator selects an explicit column list (tee_replicator/worker.py). A new
-column here is simply not copied and needs no alembic_tee counterpart.
+replicator selects an explicit column list (tee_replicator/worker.py), so a new
+column is simply never selected — unlike the SNAPSHOT lane, where a new column
+silently drifts (see 0068 and TEE_POSTGRES_SHADOW_PROVISIONING.md §3).
+
+Deliberately given no alembic_tee counterpart. This is local tuning state — how
+large a fold this worker last got away with — not user content and not part of
+any coverage claim. The shadow exists to hold the plaintext record; replicating
+a scheduler's scratch value there would add drift surface for nothing. If it
+ever becomes worth inspecting in the shadow, add the column AND the explicit
+select, since one without the other does nothing.
 
 Revision ID: 0069_batch_cap
 Revises: 0068_provider_latency
