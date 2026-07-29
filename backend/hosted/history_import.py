@@ -22,6 +22,7 @@ from bootstrap import gates as boot_gates
 from core import util as core_util
 from identity import service as identity_service
 from identity.user_naming import _naming_rule, rewrite_user_reference, sanitize_user_name
+from memory import card_guard
 from memory import service as memory_service
 import provider_client
 from hosted import config_store as hosted_config_store
@@ -2463,16 +2464,34 @@ def _moment_from_memory_card(store: UserStore, card: dict, envelope: dict) -> di
 
 def _append_import_memory_cards(store: UserStore, cards: list[dict]) -> list[dict]:
     created: list[dict] = []
+    _guard_on = card_guard.guard_enabled()
     for card in _sort_memory_cards_newest_first(cards):
         summary = str(card.get("summary") or "").strip()[:500]
         content = _memory_card_content(card)[:5000]
         if not summary or not content:
             continue
+        # 模型原始输出/协议残片防护(与 capture/dream/actions 同一套判据)。硬字段脏 → 跳过
+        # 整卡;桶脏 → 降级到按语言的默认桶;threads 逐项丢脏留净。history-import 是绕过
+        # actions 层的直写路径(codex plan_review 抓到的第 14 条 producer lane)。
+        if _guard_on and (
+            card_guard.field_pollution_reason(summary) or card_guard.field_pollution_reason(content)
+        ):
+            continue
+        bucket = str(card.get("bucket") or "").strip()[:80]
+        if _guard_on and bucket and card_guard.bucket_pollution_reason(bucket):
+            # 污染桶 → 按语言的本地化默认桶。
+            bucket = card_guard.default_bucket_for_text(f"{summary}\n{content}")
+        elif not bucket:
+            # 干净但缺桶 → 保留旧行为「未分类」(不改动正常路径,kill switch 也能完整回滚)。
+            bucket = "未分类"
+        threads_in = [str(item).strip()[:80] for item in (card.get("threads") or []) if str(item or "").strip()]
+        if _guard_on:
+            threads_in = [t for t in threads_in if not card_guard.field_pollution_reason(t)]
         body = {
             "summary": summary,
             "content": content,
-            "bucket": str(card.get("bucket") or "未分类")[:80],
-            "threads": [str(item).strip()[:80] for item in (card.get("threads") or []) if str(item or "").strip()][:8],
+            "bucket": bucket,
+            "threads": threads_in[:8],
         }
         envelope, err = core_envelope._build_shared_envelope_for_store(
             store,

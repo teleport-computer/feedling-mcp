@@ -579,6 +579,18 @@ change must not be interpreted as an API guarantee.
 
 ### Behavior
 
+- Torn control-envelope JSON no longer leaks into chat. When a relay cuts the
+  provider stream and splits one internal control envelope across the reasoning
+  and content channels, the bare JSON tail left in the visible reply is
+  suppressed across all runtimes (resident consumer, Proactive Runtime V2, and
+  Model API Runtime V2) instead of being posted as an assistant bubble. Detection
+  rejoins the two channels — or uses a protocol head observed independently in
+  the reasoning channel, or a reported stream cut — as evidence; the
+  reconstructed action is used only to confirm the split and is never executed.
+  Foreground Chat substitutes the standard visible fallback and preserves a
+  message that merely looks JSON-like on its own; automatic wake lanes stay
+  silent and record the suppression.
+
 - Runtime V2 now persists an immutable encrypted turn trajectory alongside its
   aggregate token telemetry. Provider prompts and responses, late input folds,
   tool calls and results, planned replies, and failure details are compressed

@@ -69,6 +69,10 @@ def _reset_proactive_guard_state_between_tests():
     crc._provider_payment_cooldown_until = 0.0
     crc._last_proactive_turn_ts = 0.0
     crc._last_proactive_turn_job_id = ""
+    # Per-turn reply-parse-failed flag. Real call_agent resets it at entry, but a
+    # test that monkeypatches call_agent bypasses that; without this a prior
+    # test's suppressed-leak / parse failure leaks in and fails a later wake.
+    crc._turn_reply_parse_failed = False
     crc._reset_system_notice_state()
     yield
     crc._reset_system_notice_state()

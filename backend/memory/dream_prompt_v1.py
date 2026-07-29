@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from identity.user_naming import _naming_rule, sanitize_user_name
 
+from memory import card_guard
 from memory.card_text import (
     build_format_retry_prompt,
     card_text_rejection,
@@ -182,6 +183,7 @@ def parse_dream_consolidations(
 
     out: list[dict] = []
     hard_rejections: list[str] = []
+    _guard_on = card_guard.guard_enabled()
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -195,16 +197,16 @@ def parse_dream_consolidations(
         result = row.get("result") if isinstance(row.get("result"), dict) else {}
         summary = str(result.get("summary") or "").strip()[:2000]
         content = str(result.get("content") or "").strip()
-        rejection = card_text_rejection(summary=summary, content=content)
+        rejection = card_text_rejection(summary=summary, content=content, guard=_guard_on)
         if rejection:
-            # 占位符/空正文的卡不写进花园 —— 用户会亲眼看到它。
+            # 占位符/空正文/协议残片的卡不写进花园 —— 用户会亲眼看到它。
             hard_rejections.append(rejection)
             continue
         threads_raw = result.get("threads")
         threads = [str(t).strip()[:80] for t in threads_raw if str(t).strip()][:8] if isinstance(threads_raw, list) else []
         # 软字段只清洗,不参与打回判定(硬内容没问题就不值得再烧一次 provider)。
         bucket, threads, _label_reasons = sanitize_card_labels(
-            bucket=str(result.get("bucket") or "").strip()[:80], threads=threads
+            bucket=str(result.get("bucket") or "").strip()[:80], threads=threads, guard=_guard_on
         )
         out.append({
             "op": op,

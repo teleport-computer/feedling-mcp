@@ -1081,9 +1081,17 @@ async def run_tool_loop(
                     "text": reply_text,
                 },
             )
+            # Pass this round's reasoning so the sink can detect a cross-channel
+            # torn-protocol leak on the intermediate reply too (Codex code-review
+            # #1): without it a chat-lane tail is only ever weak evidence and
+            # would be delivered. NOTE: the delivery-confirmation contract below
+            # still marks a non-empty reply as delivered even when the sink
+            # suppresses it — a pre-existing gap (degenerate replies hit it too);
+            # tightening on_reply to report published/suppressed is a separate,
+            # wider change left for review.
             try:
                 await on_reply(
-                    reply_text, final=False
+                    reply_text, final=False, reasoning=str(pr.raw.get("reasoning") or "")
                 )  # immediate intermediate bubble
             except Exception as exc:
                 await _tool_event(
