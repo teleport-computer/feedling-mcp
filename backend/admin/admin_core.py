@@ -95,14 +95,16 @@ def page_html(query_string: str) -> str:
         if view == "debug":
             return data_track._render_data_track_debug_page(data_track._data_track_debug_payload())
         if view == "runtime":
+            # 窗口算一次、传给两个数据函数——两处各自读 request.args 会让窗口
+            # 有机会不一致（同页一个 24 小时、一个 720 小时）。
+            hours = data_track._runtime_health_window_hours()
             try:
-                payload = data_track._runtime_health_summary(
-                    within_hours=data_track._runtime_health_window_hours()
-                )
+                payload = data_track._runtime_health_summary(within_hours=hours)
+                tokens = data_track._runtime_token_by_lane(within_hours=hours)
             except Exception:
                 logging.exception("runtime health summary failed")
                 return data_track._render_runtime_health_error_page()
-            return data_track._render_runtime_health_page(payload)
+            return data_track._render_runtime_health_page(payload, tokens)
         if view == "events":
             event = (request.args.get("event") or "").strip()
             if event == "onboarding":

@@ -47,6 +47,67 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-29 — Runtime 值班台加上开销：各 lane 的 token 与缓存效率
+
+**[DONE] `/admin/data-track?view=runtime` 的 lane 健康表增加 token 两列**，窗口跟随
+页面切换（24h / 7天 / 30天）。此前值班台只回答"跑得好不好"，不回答"花了多少"；而
+token 统计只存在于 users 页的「运营 Telemetry」区块，且是**全站 chat lane、固定 30 天**
+的单一口径——非 chat lane 的开销完全不可见。心跳 lane 烧闲置用户 BYOK 是出过事的
+（`usr_57c24d0d` 零聊天、65 个回合全是 sleep），当前口径恰恰看不到它。
+
+- `jobs_store.recent_token_usage_by_lane(within_hours)`：按 lane 的 `GROUP BY` 聚合。
+  三条口径写进了 docstring：**统计全部回合、不过滤 `failed`**（失败回合照样烧钱，
+  provider 已经算过钱了——这与同文件 `recent_runtime_health` 的延迟分位数只算成功回合
+  正好相反，两者过滤条件相反是刻意的）；**无上报是 `None` 不是 `0`**（靠 `sum()` 的
+  NULL 传播，计数列用 `coalesce(...,0)`、token 列裸 `sum`，否则"provider 没回 usage"
+  会伪装成"用了 0 个 token"）；**不加 `LIMIT`**（sum 聚合加采样上界会静默少报总量——
+  这条决策本身仍然正确；扫描路径当时以为由 `ix_v2_turn_metrics_lane_created_at` 的
+  lane 前缀控制，这句话后来被 review 实测证伪，见下面 07-29 review 修复条目）。
+- 渲染两列：「token 入/出」`951.2k / 40.5k`、「缓存命中 · 上报」`49% · 87%`。某条 lane
+  不在返回的 `lanes` 字典里时（有 job 但一个回合都没终态）两列显 `—`，不 `KeyError`、
+  也不显 0——判据一律 `is None` 而非 falsy，否则真实的 `0` token 会被误显成"无数据"。
+- 接线：窗口在 `page_html` 里**算一次、传给两个数据函数**，而不是让它们各自读
+  `request.args`——后者会让同一页出现一个 24 小时、一个 720 小时的窗口，且几乎看不出来。
+  `try/except` 同时覆盖两次数据调用、但不包住渲染调用（渲染层的 bug 不该被误吞成
+  "数据源故障"降级页）。
+
+⚠️ **users 页那块保留不动，两处窗口口径不同**（users 固定近 30 天、本页跟随窗口），
+页面说明里写明了"两处数字不一致是窗口不同、不是 bug，切到 30 天时应当一致"。
+
+L1 全量 7086 passed / 0 failed（基线 7068 + 新增 18）。无迁移、未改
+`recent_token_usage_summary`、未动其余视图页。
+
+### [DONE] 整分支 code review 后的 4 个 Important + 2 个 Minor 修复（同日）
+
+- **索引论证反了（docstring/design §3）**：`ix_v2_turn_metrics_lane_created_at` 是
+  `(lane, created_at DESC)`，`lane` 打头恰恰意味着它服务不了本查询（无 lane 等值谓词，
+  PG 16 无 skip scan）。本地 PG 16 实测走 Parallel Seq Scan。改写 docstring 说实话，
+  「不加 LIMIT」的决策保留，只换掉依据；把补索引记为 design 里的明确 follow-up。
+- **渲染层漏掉 token-only 的 lane**：`_render_runtime_health_page` 现在遍历
+  `payload["lanes"]` ∪ `tokens["lanes"]` 的并集——一条窗口内有 token 开销、但 job 没
+  挤进健康侧 `LIMIT 1000` 采样的 lane，此前不显示也不报错，现在会以健康列全 `—`、
+  token 列正常数字的合成行出现。页顶补一句采样上界差异的说明。
+- **窗口不一致的"不可能"只是巧合**：`recent_runtime_health` 钳 `24*30`，
+  `recent_token_usage_by_lane` 钳 `24*366`，今天恰好都等于 720。加了白名单守卫测试
+  `max(_RUNTIME_HEALTH_WINDOWS) <= 24*30`，把巧合钉成会红的约束。
+  `_RUNTIME_HEALTH_WINDOWS` 加超过 720 小时的档位时这条测试会先红。
+- **`cache_hit_ratio` 与 users 页算法不一致**：只上报一侧（`cache_read=None,
+  cache_miss=500` 或反过来）时旧算法显 `0.0%` / `100.0%`（假装完美命中），users 页显
+  `—`。已对齐 users 页：任一为 `None` → ratio 为 `None`。Anthropic 只有 cache write
+  无 cache read 的回合是真实路径，不是理论构造。
+- Minor：`_fmt_tokens_compact` 在 `[999_950, 1e6)` / `[999_950_000, 1e9)` 两个区间
+  会显示成上一档的 `"1000.0k"` / `"1000.0M"`（先除后 `.1f` 进位）；真实边界是 999_950，
+  不是 999_500。新增 B 档并按格式化结果收紧阈值。
+- Minor：`test_render_runtime_health_page_token_columns_are_dash_without_data` 的
+  `>= 2` 收紧为按 lane 行精确断言 `== 2`。
+
+无迁移、无索引改动（记为 follow-up）。design/plan 两份文档同步更正，plan 文档保留原始
+代码片段、在末尾追加 Post-review 修正记录不改写历史。
+
+L1 全量 7092 passed / 0 failed（基线 7086 + 本轮新增 6：cache_hit_ratio 部分上报两个方向、
+窗口白名单守卫、`_fmt_tokens_compact` 真实进位边界、token-only lane 出现在渲染结果里、
+token-only lane 不参与健康结论判定）。1 skipped / 9 xfailed 与基线一致，非本轮引入。
+
 ## 2026-07-28 — TEE SNAPSHOT lane 上真环境后炸出的两个坑：TRUNCATE 权限 + 列漂移
 
 **[DONE] Task 10（计划外追加）+ Task 8 收尾**。全量对齐的代码合进 `test` 部署后，

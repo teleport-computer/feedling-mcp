@@ -4098,6 +4098,103 @@ def recent_runtime_health(
     }
 
 
+def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
+    """按 lane 的 token 开销汇总（content-free），喂 admin 值班台。
+
+    与 ``recent_runtime_health`` 的延迟分位数口径**相反**：那里只算成功回合
+    （失败超时会把 p95 拉到与故障同源的高位），这里算全部回合——失败回合照样
+    烧 token，provider 已经算过钱了。
+
+    刻意不加 ``LIMIT``：sum 聚合加采样上界会静默少报总量（"最新 N 条的 token
+    和"不是任何人想要的数字）——这个决策本身仍然正确，但下面这句话曾经写的
+    依据是错的，且方向反了：本查询**没有** ``WHERE lane = ...`` 等值谓词，
+    只有 ``created_at >= ...`` 加 ``GROUP BY lane``。
+    ``ix_v2_turn_metrics_lane_created_at`` 是 ``(lane, created_at DESC)``，
+    ``lane`` 是前缀这件事恰恰意味着它**服务不了**这条查询——PG 16 没有 B-tree
+    skip scan（PG 18 才有），前导列没有等值谓词时用不上索引。本地 PG 16
+    （50 万行、5 个 lane）实测：本查询走 Parallel Seq Scan（
+    ``Rows Removed by Filter`` 随窗口内行数线性增长，`shared hit` 六千+
+    buffer）；而有 ``lane = 'chat'`` 等值谓词的既有
+    ``recent_token_usage_summary`` 才真正吃到该索引的 Bitmap Index Scan
+    （`shared read=35`）。``v2_turn_metrics`` 是 append-only 表，本查询的扫描
+    量因此随表增长单调变大；增长到不可接受时需要补一条单列索引
+    ``CREATE INDEX CONCURRENTLY ix_v2_turn_metrics_created_at ON
+    v2_turn_metrics (created_at DESC)``——记为明确的 follow-up，本次不加。
+
+    token 为空一律 ``None`` 而非 ``0``：provider 未回 usage 的调用应当降低
+    ``usage_coverage``，而不是被记成零 token 混进总量假装正常。
+    """
+    safe_hours = max(1, min(int(within_hours), 24 * 366))
+
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT lane,"
+                "  coalesce(sum(model_calls), 0)::bigint AS model_calls,"
+                "  coalesce(sum(usage_reported_calls), 0)::bigint"
+                "    AS usage_reported_calls,"
+                "  sum(prompt_tokens)::bigint AS prompt_tokens,"
+                "  sum(completion_tokens)::bigint AS completion_tokens,"
+                "  sum(cache_read_tokens)::bigint AS cache_read_tokens,"
+                "  sum(cache_miss_tokens)::bigint AS cache_miss_tokens "
+                "FROM v2_turn_metrics "
+                "WHERE created_at >= now() - make_interval(hours => %s) "
+                "GROUP BY lane",
+                (safe_hours,),
+            )
+            rows = cur.fetchall()
+
+    def _optional_int(row, key):
+        value = row.get(key)
+        return int(value) if value is not None else None
+
+    lanes: dict[str, dict] = {}
+    for row in rows:
+        model_calls = int(row["model_calls"] or 0)
+        usage_calls = int(row["usage_reported_calls"] or 0)
+        prompt_tokens = _optional_int(row, "prompt_tokens")
+        completion_tokens = _optional_int(row, "completion_tokens")
+        cache_read = _optional_int(row, "cache_read_tokens")
+        cache_miss = _optional_int(row, "cache_miss_tokens")
+        # 任一为 None 时分母按 0 算 → ratio 为 None（"不知道"），不是 0.0 或
+        # 1.0（"完美命中"/"零命中"）。对齐 users 页既有的 admin/data_track.py
+        # 「运营 Telemetry」区块同名指标的算法——Anthropic 只有 cache write、
+        # 无 cache read 的回合会产出 cache_read=None, cache_miss=500 这种真实
+        # 组合（provider_client.py 已核实）；若用 `or 0` 兜底，这种情况会显示
+        # 成 "0.0%"，反过来 cache_read=500, cache_miss=None 会显示成 "100.0%"
+        # （假装缓存完美命中，而真相是 miss 根本没上报）。两页必须可对账，
+        # 否则页顶"窗口不同"的免责声明会被拿来误导运维把真实的算法差异当成
+        # 窗口差异。
+        cache_denominator = (
+            cache_read + cache_miss
+            if cache_read is not None and cache_miss is not None
+            else 0
+        )
+        lanes[str(row["lane"] or "unknown")] = {
+            "model_calls": model_calls,
+            "usage_reported_calls": usage_calls,
+            "usage_coverage": (
+                float(usage_calls) / float(model_calls) if model_calls else None
+            ),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": (
+                prompt_tokens + completion_tokens
+                if prompt_tokens is not None and completion_tokens is not None
+                else None
+            ),
+            "cache_read_tokens": cache_read,
+            "cache_miss_tokens": cache_miss,
+            "cache_hit_ratio": (
+                float(cache_read or 0) / float(cache_denominator)
+                if cache_denominator
+                else None
+            ),
+        }
+
+    return {"window_hours": safe_hours, "lanes": lanes}
+
+
 def recent_prompt_cache_stats(
     *,
     lane: str = "chat",
