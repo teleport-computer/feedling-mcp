@@ -12934,7 +12934,9 @@ def _process_messages(messages: list) -> float:
             if attempt_trigger != "first"
             else {}
         )
-        outbound_file_turn_active = source == "chat" and AGENT_MODE == "cli"
+        outbound_file_turn_active = (
+            source in {"chat", "model_api"} and AGENT_MODE == "cli"
+        )
         outbound_file_requirement = (
             _required_outbound_file_suffixes(raw_user_content_for_lang)
             if outbound_file_turn_active

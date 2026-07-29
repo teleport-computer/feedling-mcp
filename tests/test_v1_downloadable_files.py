@@ -331,7 +331,10 @@ def test_resident_stages_and_renders_real_pdf(tmp_path, monkeypatch):
     assert not source.exists()
 
 
-def test_file_only_cli_result_is_success_not_parse_failure(tmp_path, monkeypatch):
+@pytest.mark.parametrize("source", ["chat", "model_api"])
+def test_file_only_cli_result_is_success_not_parse_failure(
+    tmp_path, monkeypatch, source
+):
     outbox = tmp_path / "outbound-files"
     monkeypatch.setattr(resident, "OUTBOUND_FILE_DIR", outbox)
     monkeypatch.setattr(resident, "AGENT_MODE", "cli")
@@ -391,7 +394,7 @@ def test_file_only_cli_result_is_success_not_parse_failure(tmp_path, monkeypatch
             {
                 "id": "user-file-only",
                 "role": "user",
-                "source": "chat",
+                "source": source,
                 "content": "给我生成一个一日计划 Word 文档。",
                 "ts": 1234.0,
             }
