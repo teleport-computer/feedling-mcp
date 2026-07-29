@@ -146,6 +146,7 @@ from memory.capture_prompt_v1 import (
 )
 from identity.user_naming import transcript_speaker_label
 from memory import card_guard
+from memory.prompts_v1 import normalize_bucket_language
 from memory.card_text import (
     count_user_token_residuals,
     is_card_format_error,
@@ -14079,6 +14080,9 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
             _bucket = str(card.get("bucket") or "").strip()
             if _bucket and card_guard.bucket_pollution_reason(_bucket):
                 card["bucket"] = card_guard.default_bucket_for_text(f"{_summary}\n{_content}")
+            elif _bucket:
+                # Q3:干净桶按卡片语言归一(与 capture/dream/migrate/history 一致;此前漏了这条路)。
+                card["bucket"] = normalize_bucket_language(_bucket, f"{_summary}\n{_content}")
             _threads = card.get("threads")
             if isinstance(_threads, list):
                 card["threads"] = [t for t in _threads if not card_guard.field_pollution_reason(str(t or ""))]
