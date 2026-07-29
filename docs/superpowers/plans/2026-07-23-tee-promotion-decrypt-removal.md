@@ -438,7 +438,15 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
       > 跳过验证直接动实现。另需确认 `0043` 的表级 CHECK 已放宽，否则明文行会被
       > DB 拒掉（`v2_trajectory_events` / `v2_trajectory_reviews` 两个约束）。
       >
-      > 🟡 **以下按文件的粗分类仅保留作非-V2 部分的起步参考，同样需逐调用点复核：**
+      > **非-V2 的 27 处（2026-07-29，⚠️ 核实深度分三档，动手前按档次补足）：**
+      >
+      > | 处数 | 调用点 | 类别 | 核实深度 |
+      > |---|---|---|---|
+      > | 6 | `hosted/mcp_core.py`(3)：封 `json.dumps(secret_doc)`（**含鉴权头**）；`hosted/setup_core.py`(3)：封 **provider 凭证** | **B 始终加密** | 🟢 **已读实际代码**——这两处是凭证不是用户内容，用户关掉加密开关≠愿意把 API key 明文存服务端 |
+      > | 20 | `chat_send_core`(6，其中 2 处是 caption)、`genesis/service`(4)、`history_import`(3)、`identity/actions`(2)、`chat/service`(1，`_chat_plaintext_thinking_extra_for_store`)、`chat/resident_maintenance`(1，`_append_maintenance_message`)、`memory/actions`(1)、`identity/identity_core`(1)、`genesis/persona_backfill`(1) | **A 用户内容**（倾向） | 🟡 **仅凭函数名与所在模块语义判定，未逐行读**——聊天正文 / 图片 caption / thinking / 维护消息 / 记忆 / 身份卡 / 入住产出。动手前需照 V2 那样逐条核实 |
+      > | 1 | `workspace/service.py` 的 `seal(self, path, plaintext)` | ⚠️ **待判** | 🔴 只看到签名，未确认写入内容与目标表 |
+      >
+      > 🟡 **以下是最初按文件的粗分类，已被上面两张表取代，仅作历史留存：**
       > 复核时发现：`v2/serve_worker.py` 的 7 处写的是 `summary` / `turn` / `payload`
       > （对话摘要与回合，**用户内容衍生**）、`v2/worker.py` 的 5 处含 `reply`
       > （AI 回复，也是用户内容）与 `effect_*`（工具效果，可能含凭证）——**V2 内部
