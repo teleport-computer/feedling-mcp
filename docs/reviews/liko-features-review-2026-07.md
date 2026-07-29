@@ -105,3 +105,26 @@
 ## 附：审计出处
 - 三份独立 agent 审计（general-purpose），2026-07-28。P0/P2 均带 `file:line`，见各功能小节。
 - 迁移 DAG 多 head 与 re-parent 方案：交 codex4 处理（`codex4/integrate-vision-voice-fence`），claude4 gatekeep。
+
+---
+
+## 7. 落地记录 & 部署态 e2e（2026-07-29）
+
+**已落 test**：merge `0e19ce83` → origin/test，部署态 `7eb75193`（healthz 已翻）。iOS 发图修复 PR#150 已合 iOS main。
+
+**gatekeep 拦下并修复的 4 类问题**（合进 test 前后）：
+1. P0 runtime-mode fence NameError（`seq_native` 用在绑定前）→ `60ae5d00`。
+2. 跨文件测试隔离 flaky（notice throttle 残留）→ `8404bf1c`。
+3. TEE table_registry 未登记 3 张新表（CI 守卫）→ `9cb9fb90`（activity→SNAPSHOT + alembic_tee 0007；voice→SKIP）。
+4. consumer 耦合回归 2 失败（`stream_update` mock 缺口 + resume 隔离）→ `7eb75193`。
+（教训已折进 `docs/testing/TESTING.md` §6：加表/改共享签名必须跑 CI 耦合套件，别只跑 changed files。）
+
+**部署态 e2e 结果**：
+| 功能 | 结果 |
+|------|------|
+| Vision | ✅ 完整通过：`vision/config effective_status=ok`、发图 202 不被拦、模型认出「Red」。P0 端到端修复生效 |
+| Access-mode | ✅ 切 model_api 后 `runtime mode=hosted_resident`，不硬翻 V2（尊重 v2_allowlist） |
+| 活动时间线 | ✅ 端点正常（200，`{turn_id,runtime,complete,phase,jobs,events}`）；tool-events 为 V2 主打，V1 测试号 events=0（符合预期，代码审计已确认覆盖） |
+| Voice | ⚠️ 端点正确但 **test 未配 `FEEDLING_VOICE_GATEWAY_PUBLIC_URL`** → 503 `voice_gateway_not_configured`。非代码 bug，是部署配置缺（半成品漏的部署那块）。已交 codex4 补 test 部署 env + 文档前提；真机 ElevenLabs 拨入待 Seven 安排 |
+
+**未完（不阻断）**：`ordered_chat_replies=True` 全局排序 soak；voice 部署 env + 真机；活动时间线 tool-events 建议用 V2 账号补验一次。
