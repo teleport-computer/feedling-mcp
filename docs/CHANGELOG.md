@@ -47,6 +47,52 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-29 — TEE 迁移链补到 0008：写了迁移不等于执行了迁移
+
+**[DONE] `alembic_tee 0008`** 补 `model_api_routes` 落后 RDS 的 4 个 vision 列
+（`is_vision` / `vision_test_status` / `last_vision_test_at` /
+`last_vision_test_error`，来自 RDS `0066_model_api_vision_route`）。同时把两个
+环境的 TEE 库从 **0006 升到 0008**（含别人写好但一直没执行的 `0007`）。
+
+**[GOTCHA] 这次暴露的不是代码缺陷，是流程缺口。** 07-27 那批工作交付后，别人
+接手新功能时**正确地**用上了这套机制：登记了 `chat_turn_activity_events`
+（SNAPSHOT）、把两张 voice 临时表登记成 SKIP、还写了 `alembic_tee 0007`。但
+**没有人执行它**——`tee-migrate` workflow 需要的 4 个 repo secret 至今没建，
+`alembic_tee` 目前只能手工跑。后果是 test 的 TEE 库停在 0006，`chat_turn_activity_events`
+在 TEE 侧根本不存在，snapshot lane 每个 tick 报一次
+`两侧无公共列，拒绝整表清空`（护栏正确拦住了整表清空，没有误删任何数据）。
+
+**两种漂移的可见性差异，值得记住：**
+
+| 漂移 | 表现 | 可见性 |
+|---|---|---|
+| RDS 新建表、TEE 没有 | `snapshot_failures = 1`，每 tick 一次 | **有红灯** |
+| RDS 加列、TEE 没有 | `ok: true`，行数照样对得上 | **只在 `missing_in_tee` 里，无红灯** |
+
+`model_api_routes` 的这 4 列就属于后者——整表一直在同步、行数一直是 27、
+`snapshot_failures` 一直是 0，只有这 4 列的数据静静地没进 TEE。加列不建表就撞不上
+"无公共列"护栏，在 CI 和失败计数上都是静默的。**`missing_in_tee` 是这类漂移唯一的
+信号，必须有人定期看**（查询见 `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md` §3）。
+
+**几处刻意不做的：**
+- **不搬** `0066` 的 `model_api_routes_one_vision` partial unique index。与 `0004`
+  baseline 政策一致（`0004` 同样没搬 `0014` 的 `one_active` / `uniq`）：TEE 是
+  SNAPSHOT 整表替换的只读影子，业务唯一约束在这里没有防护价值（RDS 侧已保证），
+  却会把任何 RDS 侧的边界数据问题放大成 TEE 侧的整表停止同步。
+- **不补** `thinking_fallback`（`0005` 已这么裁决过）：test RDS 的历史残留列，
+  全仓 grep 零命中，prod RDS 没有。TEE 不跟着某一个环境长歪，让它一直报着。
+- prod TEE 提前有了这 4 列和那张空表，而 prod RDS 还停在 `0063`（那批新迁移没上
+  prod）。这是无害的：`missing_in_rds` 只入报告，不触发 warning、不影响 `ok`；
+  而 prod 跑的 registry 里还没有 `chat_turn_activity_events` 这一条，SNAPSHOT lane
+  根本不会碰那张空表。
+
+**[GOTCHA] 顺带查出、本次未动：`monitoring` 角色对 TEE 库 55 张表全部零权限。**
+`pg_default_acl` 里只有 `app` 和 `tee_replicator`，从来没配过 `monitoring`。不是这次
+引入的，是既有状态——这个"只读角色"实际上是废的。改角色权限是安全边界动作，
+留给单独决策。
+
+---
+
 ## 2026-07-29 — Runtime 值班台加上开销：各 lane 的 token 与缓存效率
 
 **[DONE] `/admin/data-track?view=runtime` 的 lane 健康表增加 token 两列**，窗口跟随
