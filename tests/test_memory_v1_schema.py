@@ -113,6 +113,106 @@ def test_memory_add_preserves_explicit_empty_occurred_at(monkeypatch):
     assert "last_referenced_at" not in saved[0]
 
 
+def test_memory_action_rejects_invented_source_and_capture_mode(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    saved = _install_memory_action_fakes(monkeypatch, [])
+    base_memory = {
+        "summary": "用户喜欢咖啡。",
+        "content": "记忆: 用户喜欢咖啡。",
+    }
+
+    body, status = memory_actions._execute_memory_actions(store, "api_key", [{
+        "type": "memory.add",
+        "memory": {**base_memory, "source": "对话"},
+    }])
+    assert status == 400
+    assert body["error"] == "source_invalid"
+    assert saved == []
+
+    body, status = memory_actions._execute_memory_actions(store, "api_key", [{
+        "type": "memory.add",
+        "memory": {**base_memory, "source": "chat"},
+        "capture_mode": "conversation_2026",
+    }])
+    assert status == 400
+    assert body["error"] == "capture_mode_invalid"
+    assert saved == []
+
+
+def test_memory_action_accepts_all_declared_source_and_capture_mode_values(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    for index, source in enumerate(sorted(memory_actions.MEMORY_SOURCE_VALUES)):
+        saved = _install_memory_action_fakes(monkeypatch, [])
+        body, status = memory_actions._execute_memory_actions(store, "api_key", [{
+            "type": "memory.add",
+            "memory": {
+                "summary": f"legal source {index}",
+                "content": f"legal source body {index}",
+                "source": source,
+            },
+        }])
+        assert status == 200, (source, body)
+        assert len(saved) == 1
+
+    for index, capture_mode in enumerate(
+        sorted(memory_actions.MEMORY_CAPTURE_MODE_VALUES)
+    ):
+        saved = _install_memory_action_fakes(monkeypatch, [])
+        body, status = memory_actions._execute_memory_actions(store, "api_key", [{
+            "type": "memory.add",
+            "memory": {
+                "summary": f"legal capture mode {index}",
+                "content": f"legal capture body {index}",
+                "source": "chat",
+            },
+            "capture_mode": capture_mode,
+        }])
+        assert status == 200, (capture_mode, body)
+        assert len(saved) == 1
+
+
+def test_memory_add_skips_normalized_duplicate_but_keeps_distinct_content(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    moments: list[dict] = []
+    saved = _install_memory_action_fakes(monkeypatch, moments)
+    monkeypatch.setattr(
+        memory_actions,
+        "_memory_plain_from_envelope",
+        lambda moment, _api_key, runtime_token="": (
+            json.loads(moment["body_ct"]),
+            "",
+        ),
+    )
+
+    def add(summary: str, content: str):
+        return memory_actions._execute_memory_actions(store, "api_key", [{
+            "type": "memory.add",
+            "memory": {
+                "summary": summary,
+                "content": content,
+                "source": "chat",
+            },
+        }])
+
+    first, first_status = add("Coffee Preference", "Likes oat milk.")
+    duplicate, duplicate_status = add(
+        "  Ｃｏｆｆｅｅ   Preference ",
+        "LIKES   OAT MILK.",
+    )
+    distinct, distinct_status = add(
+        "Coffee Preference",
+        "Likes espresso without milk.",
+    )
+
+    assert first_status == duplicate_status == distinct_status == 200
+    assert first["results"][0]["status"] == "ok"
+    assert duplicate["results"][0]["skipped"] == "duplicate_active"
+    assert duplicate["results"][0]["noop"] is True
+    assert duplicate["effects"] == []
+    assert distinct["results"][0].get("skipped") is None
+    assert len(saved) == 2
+
+
 def test_backend_envelope_adapter_normalizes_only_plaintext_fields():
     old_doc = {
         "id": "mem_old",

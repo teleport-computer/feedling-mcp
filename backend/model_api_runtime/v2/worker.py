@@ -3616,8 +3616,14 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             or a.get("memory_id")
             or ""
         ).strip()
-        if op in ("delete", "remove") and target:
-            out.append({"type": "memory.delete", "memory_id": target})
+        if op in ("delete", "remove"):
+            if target:
+                out.append({"type": "memory.delete", "memory_id": target})
+            continue
+        if op in ("update", "supersede", "merge", "patch") and not target:
+            # Never turn an invalid targeted mutation into a new memory.add.
+            continue
+        if op not in ("add", "create", "update", "supersede", "merge", "patch"):
             continue
         inner = {
             "summary": summary,
@@ -3635,7 +3641,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             "reason": "Written by the agent via the memory_write tool.",
             "capture_mode": "agent_tool",
         }
-        if op in ("update", "supersede", "merge", "patch") and target:
+        if op in ("update", "supersede", "merge", "patch"):
             out.append(
                 {
                     "type": "memory.supersede",

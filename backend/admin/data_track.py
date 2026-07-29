@@ -232,6 +232,86 @@ def _memory_stats(store: UserStore) -> dict:
     }
 
 
+def _data_track_capture_doc(value, *, max_items: int = 20):
+    if isinstance(value, dict):
+        return {
+            str(key)[:80]: _data_track_capture_doc(item, max_items=max_items)
+            for key, item in list(value.items())[:max_items]
+        }
+    if isinstance(value, list):
+        return [
+            _data_track_capture_doc(item, max_items=max_items)
+            for item in value[:max_items]
+        ]
+    if isinstance(value, str):
+        return value[:1000]
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    return str(value)[:500]
+
+
+def _memory_capture_validation_detail(store: UserStore, *, limit: int = 50) -> dict:
+    """Expose bounded capture write decisions on the per-user Data Track page."""
+    jobs = [
+        job
+        for job in store.list_proactive_jobs(limit=0)
+        if isinstance(job, dict)
+        and isinstance(job.get("capture_result"), dict)
+        and (
+            str(job.get("job_kind") or "") == "memory_capture"
+            or str((job.get("capture_result") or {}).get("job_kind") or "")
+            == "memory_capture"
+        )
+    ]
+    jobs.sort(
+        key=lambda job: core_util._to_epoch(
+            job.get("updated_at") or job.get("ts") or job.get("timestamp")
+        ),
+        reverse=True,
+    )
+    skipped: dict[str, int] = {}
+    applied = {"added": 0, "superseded": 0}
+    rows: list[dict] = []
+    for job in jobs:
+        result = job.get("capture_result") or {}
+        for reason, count in (result.get("skipped") or {}).items():
+            try:
+                skipped[str(reason)] = skipped.get(str(reason), 0) + max(
+                    0, int(count or 0)
+                )
+            except (TypeError, ValueError):
+                continue
+        for action in applied:
+            try:
+                applied[action] += max(
+                    0, int((result.get("applied") or {}).get(action) or 0)
+                )
+            except (TypeError, ValueError):
+                continue
+        if len(rows) < limit:
+            rows.append({
+                "job_id": str(job.get("job_id") or ""),
+                "status": str(job.get("status") or ""),
+                "status_reason": str(job.get("status_reason") or ""),
+                "updated_at": str(
+                    job.get("updated_at")
+                    or job.get("ts")
+                    or job.get("timestamp")
+                    or ""
+                ),
+                "capture_result": _data_track_capture_doc(result, max_items=20),
+                "memory_action_status": _data_track_capture_doc(
+                    job.get("memory_action_status") or {}, max_items=20
+                ),
+            })
+    return {
+        "jobs_total": len(jobs),
+        "applied": applied,
+        "skipped": skipped,
+        "jobs": rows,
+    }
+
+
 def _proactive_stats(store: UserStore) -> dict:
     decisions = store.list_gate_decisions(limit=0)
     jobs = store.list_proactive_jobs(limit=0)
@@ -1340,6 +1420,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         row["runtime"] = _runtime_summary(store)
         row["provider_attempt_ledger"] = _provider_attempts_detail(store)
         row["v2_chat_failures"] = _v2_chat_failures_detail(user_id)
+        row["memory_capture_validation"] = _memory_capture_validation_detail(store)
         _ps = store.load_proactive_settings()
         row["perception_permissions"] = {
             # what the device reports it granted (free-form; keys are app-defined,

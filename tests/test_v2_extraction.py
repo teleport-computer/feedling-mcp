@@ -209,13 +209,28 @@ def test_cards_to_actions_add_and_supersede():
     assert actions[0]["envelope"]["_inner"]["threads"] == ["t"]
 
 
-def test_merge_or_supersede_without_target_degrades_to_add():
-    """Ported verbatim from the resident: a merge with no target_id is an add."""
+def test_merge_or_supersede_without_target_is_discarded():
+    """An invalid merge must never be rewritten into a different legal action."""
     actions, added, superseded = extraction.cards_to_actions(
         [{"action": "merge", "summary": "s"}],
         occurred_at="T", source_ids=[], build_envelope=_env)
+    assert added == 0 and superseded == 0
+    assert actions == []
+
+
+def test_missing_target_is_discarded_while_valid_card_is_preserved():
+    actions, added, superseded = extraction.cards_to_actions(
+        [
+            {"action": "supersede", "summary": "invalid"},
+            {"action": "add", "summary": "valid", "content": "valid body"},
+        ],
+        occurred_at="T",
+        source_ids=[],
+        build_envelope=_env,
+    )
     assert added == 1 and superseded == 0
-    assert actions[0]["type"] == "memory.add"
+    assert [action["type"] for action in actions] == ["memory.add"]
+    assert actions[0]["envelope"]["_inner"]["summary"] == "valid"
 
 
 def test_unknown_action_yields_nothing_and_nonempty_cards_raise():

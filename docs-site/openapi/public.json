@@ -8421,6 +8421,19 @@
           },
           "source": {
             "type": "string",
+            "enum": [
+              "chat",
+              "genesis_import",
+              "genesis_resident_distill",
+              "hosted_runtime_state",
+              "live_conversation",
+              "memory_capture",
+              "memory_dream",
+              "memory_migrate",
+              "model_api_capture",
+              "model_api_correction",
+              "model_api_repair"
+            ],
             "default": "live_conversation"
           },
           "anchor_memory_ids": {
@@ -9537,6 +9550,22 @@
             "items": {
               "type": "string"
             }
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "chat",
+              "genesis_import",
+              "genesis_resident_distill",
+              "hosted_runtime_state",
+              "live_conversation",
+              "memory_capture",
+              "memory_dream",
+              "memory_migrate",
+              "model_api_capture",
+              "model_api_correction",
+              "model_api_repair"
+            ]
           }
         },
         "additionalProperties": true
@@ -9606,6 +9635,17 @@
           },
           "reason": {
             "type": "string"
+          },
+          "capture_mode": {
+            "type": "string",
+            "enum": [
+              "agent_tool",
+              "genesis_resident_distill",
+              "memory_capture",
+              "memory_dream",
+              "repair",
+              "state"
+            ]
           },
           "source_chat_message_ids": {
             "type": "array",

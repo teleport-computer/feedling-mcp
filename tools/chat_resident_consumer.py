@@ -11172,6 +11172,11 @@ def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[
     for card in cards:
         action = str(card.get("action") or "").strip().lower()
         target_id = str(card.get("target_id") or "").strip()
+        # A merge/supersede without an explicit target is not an add.  Treating
+        # it as one silently changes the model's requested operation and is the
+        # source of repeated duplicate cards.
+        if action in {"merge", "supersede"} and not target_id:
+            continue
         envelope = _capture_build_envelope(card, occurred_at=occurred_at)
         base = {
             "envelope": envelope,
@@ -11179,14 +11184,20 @@ def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[
             "capture_mode": "memory_capture",
             "source_chat_message_ids": source_ids,
         }
-        if action == "add" or (action in {"merge", "supersede"} and not target_id):
+        if action == "add":
             actions.append({"type": "memory.add", **base})
             cards_added += 1
             continue
         if action in {"merge", "supersede"} and target_id:
             actions.append({"type": "memory.supersede", "supersedes": target_id, **base})
             cards_superseded += 1
-    if cards and not actions:
+    rejected_without_target = sum(
+        1
+        for card in cards
+        if str(card.get("action") or "").strip().lower() in {"merge", "supersede"}
+        and not str(card.get("target_id") or "").strip()
+    )
+    if cards and not actions and rejected_without_target != len(cards):
         raise ValueError("capture_no_memory_actions")
     return actions, cards_added, cards_superseded
 
@@ -11317,6 +11328,13 @@ def _process_capture_jobs(jobs: list) -> float:
                 job=job,
                 messages=messages,
             )
+            rejected_without_target = sum(
+                1
+                for card in cards
+                if str(card.get("action") or "").strip().lower()
+                in {"merge", "supersede"}
+                and not str(card.get("target_id") or "").strip()
+            )
             memory_result = execute_memory_actions(actions)
         except ValueError as e:
             reason = str(e) or "capture_invalid_memory_action"
@@ -11352,15 +11370,38 @@ def _process_capture_jobs(jobs: list) -> float:
                 },
             )
             continue
+        result_rows = memory_result.get("results") or []
+        duplicate_skips = sum(
+            1
+            for result in result_rows
+            if isinstance(result, dict)
+            and str(result.get("skipped") or "") == "duplicate_active"
+        )
+        applied_added = max(0, cards_added - duplicate_skips)
+        capture_status = "ok" if actions else "noop"
+        capture_reason = (
+            "supersede_without_target"
+            if not actions and rejected_without_target
+            else ""
+        )
         update_proactive_job_status(
             job_id,
             "completed",
-            "capture_memory_actions_applied",
+            capture_reason or "capture_memory_actions_applied",
             extra={
                 "capture_result": {
-                    "status": "ok",
+                    "status": capture_status,
                     "cards": len(cards),
                     "job_kind": "memory_capture",
+                    "reason": capture_reason or None,
+                    "applied": {
+                        "added": applied_added,
+                        "superseded": cards_superseded,
+                    },
+                    "skipped": {
+                        "supersede_without_target": rejected_without_target,
+                        "duplicate_active": duplicate_skips,
+                    },
                 },
                 "capture_window": window,
                 "memory_action_status": {
@@ -11369,7 +11410,7 @@ def _process_capture_jobs(jobs: list) -> float:
                     "effects": len(memory_result.get("effects") or []),
                 },
                 "memory_results": memory_result.get("results") or [],
-                "cards_added": cards_added,
+                "cards_added": applied_added,
                 "cards_superseded": cards_superseded,
             },
         )

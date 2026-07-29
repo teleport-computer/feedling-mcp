@@ -3,6 +3,7 @@
 import hashlib
 import json
 import re
+import unicodedata
 import uuid
 
 
@@ -17,6 +18,105 @@ from identity import service as identity_service
 from memory import card_guard
 from memory import service as memory_service
 from memory.prompts_v1 import normalize_bucket_language
+
+MEMORY_SOURCE_VALUES = frozenset({
+    "chat",
+    "genesis_import",
+    "genesis_resident_distill",
+    "hosted_runtime_state",
+    "live_conversation",
+    "memory_capture",
+    "memory_dream",
+    "memory_migrate",
+    "model_api_capture",
+    "model_api_correction",
+    "model_api_repair",
+})
+MEMORY_CAPTURE_MODE_VALUES = frozenset({
+    "agent_tool",
+    "genesis_resident_distill",
+    "memory_capture",
+    "memory_dream",
+    "repair",
+    "state",
+})
+
+
+def _memory_action_metadata_error(action: dict) -> dict | None:
+    """Reject invented enum values instead of persisting/model-normalizing them."""
+    holders = [action]
+    if isinstance(action.get("memory"), dict):
+        holders.append(action["memory"])
+    if isinstance(action.get("patch"), dict):
+        holders.append(action["patch"])
+    if isinstance(action.get("envelope"), dict):
+        holders.append(action["envelope"])
+    for holder in holders:
+        if "source" not in holder:
+            continue
+        source = str(holder.get("source") or "").strip()
+        if source not in MEMORY_SOURCE_VALUES:
+            return {
+                "error": "source_invalid",
+                "got": source,
+                "allowed": sorted(MEMORY_SOURCE_VALUES),
+            }
+    if "capture_mode" in action:
+        capture_mode = str(action.get("capture_mode") or "").strip()
+        if capture_mode not in MEMORY_CAPTURE_MODE_VALUES:
+            return {
+                "error": "capture_mode_invalid",
+                "got": capture_mode,
+                "allowed": sorted(MEMORY_CAPTURE_MODE_VALUES),
+            }
+    return None
+
+
+def _memory_normalized_identity(inner: dict | None) -> tuple[str, str]:
+    if not isinstance(inner, dict):
+        return "", ""
+
+    def normalize(value) -> str:
+        text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+        return " ".join(text.split())
+
+    title = normalize(
+        inner.get("summary") or inner.get("title") or inner.get("description")
+    )
+    content = normalize(inner.get("content") or inner.get("description"))
+    return title, content
+
+
+def _memory_active_duplicate(
+    moments: list,
+    inner: dict,
+    api_key: str | None,
+    *,
+    runtime_token: str = "",
+) -> dict | None:
+    identity = _memory_normalized_identity(inner)
+    if not all(identity):
+        return None
+    for moment in memory_service._active_memory_moments(moments):
+        if moment.get("visibility") == "local_only":
+            continue
+        existing_inner, _err = _memory_plain_from_envelope(
+            moment, api_key, runtime_token=runtime_token
+        )
+        if existing_inner is not None and _memory_normalized_identity(existing_inner) == identity:
+            return moment
+    return None
+
+
+def _memory_duplicate_result(duplicate: dict) -> tuple[dict, list[dict], int]:
+    return {
+        "status": "ok",
+        "action": "memory.add",
+        "noop": True,
+        "skipped": "duplicate_active",
+        "duplicate_of": str(duplicate.get("id") or ""),
+    }, [], 200
+
 
 def _memory_action_text(value, max_chars: int) -> str:
     text = str(value or "").strip()
@@ -328,9 +428,17 @@ def _memory_action_effect(action: str, memory_id: str, fields: list[str] | None 
     }
 
 
-def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
+def _memory_add_action(
+    store: UserStore,
+    action: dict,
+    *,
+    api_key: str | None = None,
+    runtime_token: str = "",
+) -> tuple[dict, list[dict], int]:
     if isinstance(action.get("envelope"), dict):
-        return _memory_add_envelope_action(store, action)
+        return _memory_add_envelope_action(
+            store, action, api_key=api_key, runtime_token=runtime_token
+        )
 
     raw = action.get("memory") if isinstance(action.get("memory"), dict) else action
     mem_type = str(raw.get("type") or "fact").strip().lower()
@@ -372,6 +480,11 @@ def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict]
     # validation only) so a concurrent same-user write can't lost-update.
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
+        duplicate = _memory_active_duplicate(
+            moments, inner, api_key, runtime_token=runtime_token
+        )
+        if duplicate is not None:
+            return _memory_duplicate_result(duplicate)
         moments.append(moment)
         memory_service._save_moments(store, moments)
     boot_gates._log_bootstrap_event(store, "memory_action_added_v1", success=True)
@@ -393,7 +506,13 @@ def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict]
     }, [effect], 201
 
 
-def _memory_add_envelope_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
+def _memory_add_envelope_action(
+    store: UserStore,
+    action: dict,
+    *,
+    api_key: str | None = None,
+    runtime_token: str = "",
+) -> tuple[dict, list[dict], int]:
     envelope = dict(action.get("envelope") or {})
     moments = memory_service._load_moments(store)
     ok, err = _memory_validate_prebuilt_envelope(
@@ -405,9 +524,26 @@ def _memory_add_envelope_action(store: UserStore, action: dict) -> tuple[dict, l
     if not ok:
         return {"status": "error", **(err or {}), "action": "memory.add"}, [], 400
 
+    incoming_inner = None
+    if api_key or runtime_token:
+        incoming_inner, incoming_err = _memory_plain_from_envelope(
+            envelope, api_key, runtime_token=runtime_token
+        )
+        if incoming_inner is None:
+            return {
+                "status": "error",
+                "error": incoming_err or "memory_plaintext_unavailable",
+                "action": "memory.add",
+            }, [], 409
     moment = _memory_record_from_prebuilt_envelope(store, envelope)
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
+        if incoming_inner is not None:
+            duplicate = _memory_active_duplicate(
+                moments, incoming_inner, api_key, runtime_token=runtime_token
+            )
+            if duplicate is not None:
+                return _memory_duplicate_result(duplicate)
         moments.append(moment)
         memory_service._save_moments(store, moments)
     boot_gates._log_bootstrap_event(store, "memory_action_added_envelope_v1", success=True)
@@ -885,11 +1021,19 @@ def _execute_memory_action(
 ) -> tuple[dict, list[dict], int]:
     if not isinstance(action, dict):
         return {"status": "error", "error": "action_must_be_object"}, [], 400
+    metadata_error = _memory_action_metadata_error(action)
+    if metadata_error:
+        return {"status": "error", **metadata_error}, [], 400
     action_type = str(action.get("type") or action.get("action") or "").strip()
     if action_type in {"memory.create", "memory.add", "memory.add_correction"}:
         normalized = dict(action)
         normalized["type"] = "memory.add"
-        return _memory_add_action(store, normalized)
+        return _memory_add_action(
+            store,
+            normalized,
+            api_key=api_key,
+            runtime_token=runtime_token,
+        )
     if action_type in {"memory.patch", "memory.content_patch"}:
         target = action.get("target") if isinstance(action.get("target"), dict) else {}
         memory_id = _memory_action_text(

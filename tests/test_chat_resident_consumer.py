@@ -3368,7 +3368,7 @@ def test_capture_job_supersede_card_writes_supersede_action(monkeypatch):
     assert extra["cards_superseded"] == 1
 
 
-def test_capture_job_supersede_without_target_falls_back_to_add(monkeypatch):
+def test_capture_job_supersede_without_target_is_noop(monkeypatch):
     reply = json.dumps({
         "cards": [{
             "action": "supersede",
@@ -3384,15 +3384,57 @@ def test_capture_job_supersede_without_target_falls_back_to_add(monkeypatch):
     captured, job = _install_capture_job_harness(monkeypatch, reply)
 
     assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
-    assert captured["actions"][0]["type"] == "memory.add"
+    assert captured["actions"] == []
     assert _capture_final_status(captured)[:3] == (
         "cap_dispatch",
         "completed",
-        "capture_memory_actions_applied",
+        "supersede_without_target",
     )
     extra = _capture_final_status(captured)[3]["extra"]
-    assert extra["cards_added"] == 1
+    assert extra["cards_added"] == 0
     assert extra["cards_superseded"] == 0
+    assert extra["capture_result"]["status"] == "noop"
+    assert extra["capture_result"]["reason"] == "supersede_without_target"
+    assert extra["capture_result"]["skipped"]["supersede_without_target"] == 1
+
+
+def test_capture_job_reports_server_duplicate_skip(monkeypatch):
+    reply = json.dumps({
+        "cards": [{
+            "action": "add",
+            "type": "event",
+            "summary": "Already active.",
+            "content": "This exact card already exists.",
+        }]
+    })
+    captured, job = _install_capture_job_harness(monkeypatch, reply)
+
+    def duplicate_result(actions):
+        captured["actions"].extend(actions)
+        return {
+            "status": "ok",
+            "results": [{
+                "status": "ok",
+                "action": "memory.add",
+                "noop": True,
+                "skipped": "duplicate_active",
+                "duplicate_of": "mem_existing",
+            }],
+            "effects": [],
+        }
+
+    monkeypatch.setattr(crc, "execute_memory_actions", duplicate_result)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    extra = _capture_final_status(captured)[3]["extra"]
+    assert extra["cards_added"] == 0
+    assert extra["capture_result"]["applied"]["added"] == 0
+    assert extra["capture_result"]["skipped"]["duplicate_active"] == 1
+    assert extra["memory_action_status"] == {
+        "status": "ok",
+        "results": 1,
+        "effects": 0,
+    }
 
 
 def test_capture_job_empty_cards_completes_noop_without_memory_write(monkeypatch):

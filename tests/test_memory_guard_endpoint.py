@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 import base64
+import json
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,8 @@ from accounts import registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+import db  # noqa: E402
+from memory import actions as memory_actions  # noqa: E402
 
 
 @pytest.fixture()
@@ -65,3 +68,157 @@ def test_clean_card_passes_the_guard(api_key):
         "title": "用户喜欢先看地图再看路线",
     })
     assert "memory_card_polluted" not in str(body), (status, body)
+
+
+def test_write_validation_and_duplicate_skip_at_real_endpoint(api_key, monkeypatch):
+    counter = {"n": 0}
+
+    def build_envelope(store, inner, *, item_id=None):
+        counter["n"] += 1
+        memory_id = item_id or f"mem_endpoint_{counter['n']}"
+        return {
+            "id": memory_id,
+            "body_ct": json.dumps(inner, ensure_ascii=False),
+                "nonce": f"nonce_{memory_id}",
+                "K_user": f"ku_{memory_id}",
+                "K_enclave": f"ke_{memory_id}",
+                "visibility": "shared",
+            "owner_user_id": store.user_id,
+        }, ""
+
+    monkeypatch.setattr(
+        memory_actions, "_build_memory_envelope_for_store", build_envelope
+    )
+    monkeypatch.setattr(
+        memory_actions,
+        "_memory_plain_from_envelope",
+        lambda moment, _api_key, runtime_token="": (
+            json.loads(moment["body_ct"]),
+            "",
+        ),
+    )
+
+    client = make_client()
+    headers = {"X-API-Key": api_key}
+
+    invalid_source = client.post(
+        "/v1/memory/actions",
+        headers=headers,
+        json={"actions": [{
+            "type": "memory.add",
+            "memory": {
+                "summary": "invalid source",
+                "content": "invalid source body",
+                "source": "对话",
+            },
+        }]},
+    )
+    assert invalid_source.status_code == 400
+    assert invalid_source.get_json()["error"] == "source_invalid"
+
+    invalid_mode = client.post(
+        "/v1/memory/actions",
+        headers=headers,
+        json={"actions": [{
+            "type": "memory.add",
+            "memory": {
+                "summary": "invalid mode",
+                "content": "invalid mode body",
+                "source": "chat",
+            },
+            "capture_mode": "conversation_2026",
+        }]},
+    )
+    assert invalid_mode.status_code == 400
+    assert invalid_mode.get_json()["error"] == "capture_mode_invalid"
+
+    def post(summary: str, content: str):
+        return client.post(
+            "/v1/memory/actions",
+            headers=headers,
+            json={"actions": [{
+                "type": "memory.add",
+                "memory": {
+                    "summary": summary,
+                    "content": content,
+                    "source": "chat",
+                },
+                "capture_mode": "memory_capture",
+            }]},
+        )
+
+    first = post("Coffee Preference", "Likes oat milk.")
+    duplicate = post(" Ｃｏｆｆｅｅ  Preference ", "LIKES   OAT MILK.")
+    distinct = post("Coffee Preference", "Likes espresso.")
+
+    assert first.status_code == 200, first.get_data(as_text=True)
+    assert duplicate.status_code == 200, duplicate.get_data(as_text=True)
+    assert duplicate.get_json()["results"][0]["skipped"] == "duplicate_active"
+    assert duplicate.get_json()["effects"] == []
+    assert distinct.status_code == 200, distinct.get_data(as_text=True)
+
+    store = core_store.get_store(registry._resolve_user(api_key))
+    active = memory_actions.memory_service._active_memory_moments(
+        memory_actions.memory_service._load_moments(store)
+    )
+    assert len(active) == 2
+
+
+def test_supersede_target_errors_remain_404_and_403(api_key):
+    client = make_client()
+    headers = {"X-API-Key": api_key}
+    memory = {
+        "summary": "Corrected fact",
+        "content": "Corrected fact body",
+        "source": "hosted_runtime_state",
+    }
+
+    no_target = client.post(
+        "/v1/memory/actions",
+        headers=headers,
+        json={"actions": [{
+            "type": "memory.supersede",
+            "memory": memory,
+            "capture_mode": "state",
+        }]},
+    )
+    assert no_target.status_code == 400
+    assert no_target.get_json()["error"] == "supersedes_required"
+
+    missing = client.post(
+        "/v1/memory/actions",
+        headers=headers,
+        json={"actions": [{
+            "type": "memory.supersede",
+            "supersedes": "mem_missing",
+            "memory": memory,
+            "capture_mode": "state",
+        }]},
+    )
+    assert missing.status_code == 404
+    assert missing.get_json()["error"] == "not_found"
+
+    user_id = registry._resolve_user(api_key)
+    db.memory_upsert(user_id, "mem_other_owner", "2026-07-29T00:00:00Z", {
+        "id": "mem_other_owner",
+        "type": "fact",
+        "status": "active",
+        "occurred_at": "2026-07-29T00:00:00Z",
+        "owner_user_id": "usr_someone_else",
+        "body_ct": "ciphertext",
+        "nonce": "nonce",
+        "K_user": "wrapped",
+        "visibility": "shared",
+    })
+    not_owned = client.post(
+        "/v1/memory/actions",
+        headers=headers,
+        json={"actions": [{
+            "type": "memory.supersede",
+            "supersedes": "mem_other_owner",
+            "memory": memory,
+            "capture_mode": "state",
+        }]},
+    )
+    assert not_owned.status_code == 403
+    assert not_owned.get_json()["error"] == "not_owned"

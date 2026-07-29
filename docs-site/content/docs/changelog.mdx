@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Memory writes now fail closed on invented metadata and skip exact active
+  duplicates.** `POST /v1/memory/actions` rejects unknown `source` and
+  `capture_mode` values with HTTP `400`. Before `memory.add`, the server
+  compares Unicode-NFKC/case/whitespace-normalized title and content with
+  readable active shared cards; an exact match returns a successful
+  `duplicate_active` no-op with the existing card ID and emits no write effect.
+  Capture clients no longer rewrite `merge` or `supersede` cards that lack a
+  target into `memory.add`.
+
 - **Image turns rejected by a text-only main model now return actionable
   failure metadata.** Resident V1, Runtime V2, and current VPS residents classify
   the provider rejection as `vision_model_required` and direct the user to add
