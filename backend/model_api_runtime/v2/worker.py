@@ -4670,6 +4670,25 @@ async def _bound_materialized_summary(
     return bounded
 
 
+def _with_coverage_hole_notice(summary: str, hole_count: int) -> str:
+    """Disclose that older messages were dropped from the bounded prompt window.
+
+    Option A serves a bounded recency tail when compaction is behind, leaving a
+    gap between the summary and the recent messages. Stating it plainly stops the
+    model from assuming the omitted span never happened; the durable facts remain
+    in long-term memory, and the background maintenance compaction chain shrinks
+    the gap over time. Rendered into the existing summary/context block, so it
+    never enters the seq-exact tail machinery.
+    """
+    notice = (
+        f"\n\n[Context note: {hole_count} earlier message(s) between the summary "
+        "above and the recent messages below are omitted here to fit the context "
+        "window. Their durable facts are retained in long-term memory — ask the "
+        "user if you need older details.]"
+    )
+    return ((summary or "").rstrip() + notice).strip()
+
+
 async def _read_seq_adaptive_prompt_context(
     *,
     user_id: str,
@@ -4683,8 +4702,18 @@ async def _read_seq_adaptive_prompt_context(
     add_usage: Callable[[dict | None], None] | None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
     active_image_ids: set[str] | None = None,
+    tail_cap: int | None = None,
 ) -> tuple[str, list[dict], list[list[dict]], bool, int]:
-    """Read one exact core plus summary-covered complete-turn replay."""
+    """Read one exact core plus summary-covered complete-turn replay.
+
+    ``tail_cap`` (Option A / graceful degradation): when set, the verbatim tail
+    is bounded to the newest ``tail_cap`` rows after the summary watermark
+    instead of REQUIRING every post-watermark row. If compaction has fallen
+    behind, the oldest uncompacted rows are dropped from the prompt (a "coverage
+    hole", disclosed in the summary text) and the turn still answers from recent
+    context rather than failing. ``None`` keeps the historical exact-coverage
+    contract (used by paths that must never drop a row, e.g. wake replay).
+    """
     async with enclave_sem:
         (
             summary,
@@ -4696,9 +4725,38 @@ async def _read_seq_adaptive_prompt_context(
             deps.read_tail_after_seq,
             user_id,
             watermark_seq,
-            None,
+            tail_cap,
             through_seq=through_seq,
         )
+        # The lower seq boundary the prompt actually covers verbatim. Equal to the
+        # watermark on the exact-coverage path; raised to just below the oldest
+        # bounded-tail row when a hole is dropped, so `_assert_prompt_tail_exact`
+        # checks membership over the WINDOW the prompt claims, not the whole gap.
+        prompt_floor_seq = int(watermark_seq)
+        coverage_hole_count = 0
+        if tail_cap is not None and tail:
+            candidate_floor = int(tail[0]["seq"]) - 1
+            if candidate_floor > int(watermark_seq):
+                prompt_floor_seq = candidate_floor
+                # Count only real (non-synthetic) rows so the disclosed number
+                # matches messages a user would recognize as missing.
+                coverage_hole_count = max(
+                    0,
+                    await asyncio.to_thread(
+                        db.count_messages_after_seq,
+                        user_id,
+                        int(watermark_seq),
+                        through_seq=int(through_seq),
+                        exclude_synthetic_sources=True,
+                    )
+                    - await asyncio.to_thread(
+                        db.count_messages_after_seq,
+                        user_id,
+                        prompt_floor_seq,
+                        through_seq=int(through_seq),
+                        exclude_synthetic_sources=True,
+                    ),
+                )
         optional_tail_turns: list[list[dict]] = []
         tail_source_truncated = False
         if deps.read_recent_turns is not None:
@@ -4761,10 +4819,12 @@ async def _read_seq_adaptive_prompt_context(
     )
     await _assert_prompt_tail_exact(
         user_id,
-        watermark_seq=watermark_seq,
+        watermark_seq=prompt_floor_seq,
         through_seq=through_seq,
         tail=tail,
     )
+    if coverage_hole_count > 0:
+        summary = _with_coverage_hole_notice(summary, coverage_hole_count)
     return (
         summary,
         tail,
@@ -8117,6 +8177,70 @@ def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[di
     return out
 
 
+async def _ensure_prompt_coverage_or_degrade(
+    user_id: str,
+    deps: TurnDeps,
+    *,
+    provider_config: Any,
+    enclave_sem: "asyncio.Semaphore",
+    tail_limit: int,
+    job_id,
+    claimed_by: str | None,
+    add_usage: Callable[[dict | None], None] | None,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
+    compact_through_seq: int | None,
+) -> None:
+    """Option A: run the inline catch-up, but NEVER fail a user reply because
+    compaction is behind.
+
+    On any non-control-flow failure (coverage exhaustion, a summary-frontier
+    exhaustion, a transient provider error during a fold), kick the
+    self-sustaining background maintenance-compaction chain and return, so the
+    turn serves the bounded recency tail (+ coverage-hole notice) that
+    ``_read_seq_adaptive_prompt_context`` produces. Control-flow signals
+    (``LostJobLease``/``RuntimeModeChanged``/cancellation) still propagate.
+
+    This breaks the deadlock where a user whose gap exceeds what one turn's
+    bounded catch-up can close fails EVERY turn, which also starves the
+    post-reply enqueue that would have drained the backlog (usr_7f30 / usr_81a0
+    / usr_90184 on prod, stuck for days).
+    """
+    try:
+        await _ensure_prompt_coverage(
+            user_id,
+            deps,
+            provider_config=provider_config,
+            enclave_sem=enclave_sem,
+            tail_limit=tail_limit,
+            job_id=job_id,
+            claimed_by=claimed_by,
+            add_usage=add_usage,
+            trajectory_recorder=trajectory_recorder,
+            compact_through_seq=compact_through_seq,
+        )
+    except (LostJobLease, RuntimeModeChanged, asyncio.CancelledError):
+        raise
+    except Exception as coverage_exc:  # noqa: BLE001 — degrade, never fail the reply
+        _report_turn_progress("prompt_catchup_degraded")
+        try:
+            await asyncio.to_thread(
+                jobs_store.enqueue_job, user_id, "maintenance", reason="compaction"
+            )
+            await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+        except Exception as enqueue_exc:  # noqa: BLE001
+            log.warning(
+                "[v2.worker] degraded-coverage compaction enqueue failed for %s: %s",
+                user_id,
+                enqueue_exc,
+            )
+        await _record_trajectory(
+            trajectory_recorder,
+            "prompt_catchup_degraded",
+            {"lane": "chat", "error_class": type(coverage_exc).__name__},
+            best_effort=True,
+        )
+
+
 async def process_job(
     job: dict,
     deps: TurnDeps,
@@ -8571,7 +8695,9 @@ async def process_job(
             # actual prompt content — see `_ensure_prompt_coverage`'s
             # docstring. Common case (no gap) costs two cheap indexed reads
             # and returns immediately without touching the enclave/LLM.
-            await _ensure_prompt_coverage(
+            # Option A: degrade instead of failing the reply when catch-up can't
+            # finish — the bounded tail below carries the turn.
+            await _ensure_prompt_coverage_or_degrade(
                 user_id,
                 deps,
                 provider_config=provider_config,
@@ -8613,6 +8739,9 @@ async def process_job(
                         for row in coalesced
                         if row.get("has_image") and row.get("id")
                     },
+                    # Option A: bound the verbatim tail; drop-oldest with a
+                    # disclosed hole rather than requiring a drained backlog.
+                    tail_cap=_TAIL_HARD_CAP,
                 )
                 if ordered_chat_replies:
                     tail = context.ordered_reply_tail(
@@ -9735,6 +9864,7 @@ async def process_job(
                         for row in coalesced
                         if row.get("has_image") and row.get("id")
                     },
+                    tail_cap=_TAIL_HARD_CAP,
                 )
                 if ordered_chat_replies:
                     tail = context.ordered_reply_tail(
