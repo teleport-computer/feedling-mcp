@@ -26,8 +26,23 @@ def uid(backend_env):
     return user_id
 
 
-def test_unset_preference_reads_as_none(uid):
-    assert registry._get_user_content_encryption(uid) is None
+def test_unset_preference_reads_as_off(uid):
+    """用户存在但未设 → "off"（v6 默认明文），**不是** None。
+
+    None 必须专门留给「用户查不到记录」这一态，见下一条测试。
+    """
+    assert registry._get_user_content_encryption(uid) == "off"
+
+
+def test_unknown_user_reads_as_none_not_off(backend_env):
+    """用户查不到记录 → None，调用方必须 fail-safe 走加密。
+
+    这是写侧的安全边界：若与「未设偏好」一样返回 "off"，任何 registry 未命中
+    （新用户竞态、缓存未加载、纯单元测试用户）都会静默降级成明文写入。
+    实证样本：test_v2_encrypted_effect_payload 的 u_effect_real_crypto 就是这类
+    ——不在 registry 里、只 monkeypatch 了公钥。
+    """
+    assert registry._get_user_content_encryption("usr_definitely_not_here") is None
 
 
 def test_set_on_then_read_back(uid):
@@ -54,9 +69,13 @@ def test_invalid_value_rejected_and_not_written(uid):
 
 
 def test_empty_value_clears(uid):
+    """清除偏好后回到默认档 "off"——用户仍然存在，所以不是 None。
+
+    None 只表示「查不到这个用户」，见 test_unknown_user_reads_as_none_not_off。
+    """
     registry._set_user_content_encryption(uid, "on")
     assert registry._set_user_content_encryption(uid, "") is True
-    assert registry._get_user_content_encryption(uid) is None
+    assert registry._get_user_content_encryption(uid) == "off"
 
 
 def test_unknown_user_returns_false(backend_env):

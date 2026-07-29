@@ -803,14 +803,28 @@ _CONTENT_ENCRYPTION_VALUES = ("on", "off")
 
 
 def _get_user_content_encryption(user_id: str) -> str | None:
-    """Return the user's stored content_encryption preference ("on"/"off"),
-    or None when unset. Thin read mirroring _get_user_timezone; the caller owns
-    the default (v6: unset == plaintext == "off")."""
+    """Return the user's content_encryption preference as a THREE-state value:
+
+      - ``"on"``  — user opted into encryption.
+      - ``"off"`` — user exists and has not opted in (v6 default: plaintext).
+      - ``None``  — **the user record was not found**.
+
+    The third state is deliberately distinct from ``"off"``: a caller on the
+    write path must treat "unknown user" as **fail-safe → encrypt**, never as
+    plaintext. Collapsing the two would make every registry miss (new-user
+    race, registry not yet loaded, pure-unit-test user) silently downgrade a
+    write to plaintext — see the plan's Task 2.2 note and
+    tests/test_v2_encrypted_effect_payload.py's ``u_effect_real_crypto``, which
+    is exactly such a user.
+
+    (Note this differs from _get_user_timezone's two-state contract on purpose:
+    an unknown timezone is harmless, an unknown encryption preference is not.)
+    """
     with _users_lock:
         for u in _users:
             if u.get("user_id") == user_id:
                 value = str(u.get("content_encryption") or "").strip().lower()
-                return value if value in _CONTENT_ENCRYPTION_VALUES else None
+                return value if value in _CONTENT_ENCRYPTION_VALUES else "off"
     return None
 
 
