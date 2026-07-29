@@ -10,6 +10,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Image turns rejected by a text-only main model now return actionable
+  failure metadata.** Resident V1, Runtime V2, and current VPS residents classify
+  the provider rejection as `vision_model_required` and direct the user to add
+  or select a vision-capable model instead of showing the generic retry-later
+  reply. Image sends remain ungated: probe status does not block delivery.
+
 - **Hosted Runtime V2 chat sends can request provider reasoning per turn.**
   `POST /v1/model_api/chat/send` accepts the optional boolean
   `include_reasoning`; omission preserves the previous disabled behavior. The

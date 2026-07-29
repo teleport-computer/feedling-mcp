@@ -93,6 +93,11 @@ def test_classify_upstream_mirrors_consumer_on_samples():
         "401 invalid x-api-key",
         "429 too many requests",
         "503 overloaded, please retry",
+        # Real DeepSeek image rejection observed 2026-07-30. This must stay
+        # ahead of the generic "unknown variant" provider_incompatible rule.
+        "provider_http_400: Failed to deserialize the JSON body into the target "
+        "type: messages[0]: unknown variant `image_url`, expected `text` at line "
+        "1 column 295",
         "400 unsupported parameter 'tool_choice'",
         "maximum context length exceeded",
         "blocked by content policy",

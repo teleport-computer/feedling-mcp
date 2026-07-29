@@ -709,6 +709,15 @@ _ERROR_CLASS_RULES = (
     ("cli_config_invalid", "user_provider",
      "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。",
      re.compile(r"missing the \{message\} placeholder", re.I)),
+    # Real DeepSeek chat/completions response observed 2026-07-30 when
+    # deepseek-v4-flash received an image_url block:
+    #   provider_http_400: Failed to deserialize ... unknown variant
+    #   `image_url`, expected `text`
+    # Keep this ahead of provider_incompatible's broad "unknown variant" rule
+    # so a text-only main model gets the dedicated Settings guidance.
+    ("vision_model_required", "user_provider",
+     "当前主模型不支持看图，请前往设置添加或切换支持视觉的模型。",
+     re.compile(r"unknown variant `image_url`, expected `text`", re.I)),
     ("provider_incompatible", "user_provider",
      "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。",
      re.compile(r"unknown variant|not supported|unsupported (parameter|tool)"
@@ -736,7 +745,7 @@ _ERROR_CLASS_RULES = (
 )
 
 # 机读全集导出，供 backend/notices/catalog.py 的一致性测试比对（spec Phase B /
-# B3）：_ERROR_CLASS_RULES 里的 8 类 + classify_agent_error 硬编码分支里的
+# B3）：_ERROR_CLASS_RULES 里的规则类 + classify_agent_error 硬编码分支里的
 # turn_timeout / reply_parse_failed / model_not_found（裸 404+model）/ unknown。
 # 只是把已有分类逻辑的 error_class 取值收成集合，不改分类逻辑本身。
 CONSUMER_ERROR_CLASSES = frozenset(

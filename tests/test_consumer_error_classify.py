@@ -364,6 +364,25 @@ def test_provider_incompatible_classified():
     assert n.error_class == "provider_incompatible" and n.blame == "user_provider"
 
 
+def test_deepseek_text_only_image_error_requires_vision_model():
+    """Real DeepSeek error must not fall into generic provider_incompatible.
+
+    Observed 2026-07-30 by sending a 1x1 PNG to deepseek-v4-flash through the
+    production provider_client wire. The provider returned HTTP 400 with this
+    exact deserialization message.
+    """
+    n = _cls(RuntimeError(
+        "provider_http_400: Failed to deserialize the JSON body into the target "
+        "type: messages[0]: unknown variant `image_url`, expected `text` at line "
+        "1 column 295"))
+
+    assert n.error_class == "vision_model_required"
+    assert n.blame == "user_provider"
+    assert "视觉" in n.user_text
+    assert crc._turn_failure_reply_text(n) == n.user_text
+    assert crc._turn_failure_reply_text(n) != crc.FALLBACK_REPLY
+
+
 def test_context_overflow_classified():
     from chat_resident_consumer import classify_agent_error
     n = classify_agent_error(RuntimeError("prompt is too long: 210000 tokens > maximum context length"))

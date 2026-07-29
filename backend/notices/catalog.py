@@ -1,6 +1,6 @@
 """chat 通道 error_class → (blame, user_text) 目录（spec Phase B / B3）。
 
-同源纪律：这 11 类（chat 上游类）、blame、user_text 一字不差搬自
+同源纪律：chat 上游类的 blame、user_text 一字不差搬自
 ``tools/chat_resident_consumer.py`` 的 ``_ERROR_CLASS_RULES`` +
 ``classify_agent_error`` 硬编码分支（turn_timeout / reply_parse_failed /
 model_not_found[裸404] / unknown）。两处各自维护（consumer 在 tools/ 不能
@@ -21,6 +21,7 @@ ERROR_CLASSES = frozenset({
     "auth_invalid",
     "model_not_found",
     "cli_config_invalid",
+    "vision_model_required",
     "provider_incompatible",
     "context_overflow",
     "content_filtered",
@@ -61,6 +62,8 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "user_provider", "模型名不可用，请检查设置里的模型名。"),
     "cli_config_invalid": (
         "user_provider", "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。"),
+    "vision_model_required": (
+        "user_provider", "当前主模型不支持看图，请前往设置添加或切换支持视觉的模型。"),
     "provider_incompatible": (
         "user_provider", "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。"),
     "context_overflow": (
@@ -159,6 +162,10 @@ _UPSTREAM_RULES = (
         r"|model[ _]not[ _]found", re.I)),
     ("cli_config_invalid", re.compile(
         r"missing the \{message\} placeholder", re.I)),
+    # DeepSeek chat/completions, observed 2026-07-30. Keep this before
+    # provider_incompatible's broader "unknown variant" fallback.
+    ("vision_model_required", re.compile(
+        r"unknown variant `image_url`, expected `text`", re.I)),
     ("provider_incompatible", re.compile(
         r"unknown variant|not supported|unsupported (parameter|tool)"
         r"|invalid_request_error.*tool", re.I)),

@@ -1209,6 +1209,41 @@ def test_user_provider_failure_posts_actionable_line_not_fallback(monkeypatch):
     assert banners == []
 
 
+def test_text_only_image_failure_posts_vision_model_guidance(monkeypatch, tmp_path):
+    """A provider's explicit image rejection is actionable on V1 and VPS.
+
+    This is the exact DeepSeek error observed on the native image wire. The
+    resident must preserve the dedicated slug for iOS and must not claim that a
+    retry will recover a model-capability mismatch.
+    """
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
+    monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: True)
+    monkeypatch.setattr(crc, "IMAGE_TEMP_DIR", tmp_path)
+    crc._reset_system_notice_state()
+    upstream = RuntimeError(
+        "provider_http_400: Failed to deserialize the JSON body into the target "
+        "type: messages[0]: unknown variant `image_url`, expected `text` at line "
+        "1 column 295"
+    )
+
+    with patch.object(crc, "call_agent", side_effect=upstream), \
+         patch.object(crc, "post_reply") as mock_post:
+        message = _make_image_msg(ts=100.0)
+        message["id"] = "text-only-image-1"
+        crc._process_messages([message])
+
+    visible = [
+        call for call in mock_post.call_args_list
+        if call.kwargs.get("role") != "system"
+    ]
+    assert len(visible) == 1
+    assert visible[0].args[0] != crc.FALLBACK_REPLY
+    assert visible[0].kwargs["turn_failure_error_class"] == "vision_model_required"
+    assert visible[0].kwargs["turn_failure_blame"] == "user_provider"
+
+
 def test_no_error_notice_when_fallback_rejected_already_answered(monkeypatch):
     """Failover 去重（Codex review）：claim 过期后另一家已回复，本家兜底被
     already_answered 409 拒 → system 错误通知也必须一并压掉，不许出现

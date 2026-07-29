@@ -107,6 +107,15 @@ def test_prompt_frontier_failures_use_stable_content_free_status_codes():
             provider_client.ProviderError("relay unavailable", status_code=503),
             "upstream_unavailable",
         ),
+        (
+            provider_client.ProviderError(
+                "provider_http_400: Failed to deserialize the JSON body into "
+                "the target type: messages[0]: unknown variant `image_url`, "
+                "expected `text` at line 1 column 295",
+                status_code=400,
+            ),
+            "vision_model_required",
+        ),
         (worker.TurnError("empty_reply"), "reply_parse_failed"),
         (RuntimeError("opaque internal failure"), "unknown"),
     ],
