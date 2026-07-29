@@ -7,7 +7,8 @@ import logging
 import db
 import provider_client
 from capabilities import registry as cap_registry
-from core import enclave as core_enclave
+from core import enclave as core_enclave  # noqa: F401 — 供测试 monkeypatch，见 setup_core 同款
+from core import envelope as core_envelope
 
 
 log = logging.getLogger(__name__)
@@ -107,10 +108,9 @@ def load_provider_config(
     if not isinstance(envelope, dict):
         raise RuntimeError("vision_key_envelope_missing")
     decrypt_kwargs = {"runtime_token": runtime_token} if runtime_token else {}
-    provider_key = core_enclave._decrypt_envelope_via_enclave(
+    provider_key = core_envelope.decrypt_provider_key_envelope(
         envelope,
         api_key,
-        purpose="model_api_provider_key",
         **decrypt_kwargs,
     ).decode("utf-8")
     return provider_client.ProviderConfig(

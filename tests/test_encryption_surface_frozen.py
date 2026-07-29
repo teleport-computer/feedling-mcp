@@ -89,6 +89,10 @@ WRITE_SITE_BASELINE = {
     "backend/model_api_runtime/v2/extraction.py": 1,
     "backend/model_api_runtime/v2/jobs_store.py": 1,
     "backend/workspace/service.py": 1,
+    # 2026-07-29 合并 test 分支时由本守卫抓出的新增点（voice 模块是 test 侧新功能）。
+    # 分类：A 类用户内容（语音），Task 2.2 按偏好路由时一并处理。
+    # 登记而非放行——守卫的作用就是让新增点必须经过一次人工分类。
+    "backend/voice/routes_asgi.py": 1,
 }
 
 

@@ -314,10 +314,9 @@ def _run_route_vision_test_or_error(
         return {"error": "model_api_key_envelope_missing"}, 404
     decrypt_kwargs = {"runtime_token": runtime_token} if runtime_token else {}
     try:
-        provider_key = core_enclave._decrypt_envelope_via_enclave(
+        provider_key = core_envelope.decrypt_provider_key_envelope(
             envelope,
             caller_api_key,
-            purpose="model_api_provider_key",
             **decrypt_kwargs,
         ).decode("utf-8")
     except Exception as exc:
