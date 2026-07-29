@@ -451,7 +451,39 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
       > 跳过验证直接动实现。另需确认 `0043` 的表级 CHECK 已放宽，否则明文行会被
       > DB 拒掉（`v2_trajectory_events` / `v2_trajectory_reviews` 两个约束）。
       >
-      > **非-V2 的 27 处（2026-07-29，⚠️ 核实深度分三档，动手前按档次补足）：**
+      > ## ✅ 40 处分类已全部完成（2026-07-29，全部逐调用点核实）
+      >
+      > **结论：A 类 34 处 / B 类 6 处。**
+      >
+      > **B 类（6 处，始终加密，绝不按偏好降级）**——它们封的是**凭证**不是用户内容：
+      > `hosted/mcp_core.py`(3，`json.dumps(secret_doc)` 含鉴权头)、
+      > `hosted/setup_core.py`(3，provider 凭证)。用户关掉加密开关 ≠ 愿意把自己的
+      > API key 明文存在服务端。
+      >
+      > **A 类（34 处，按 `content_encryption` 偏好路由）**：
+      > - V2 13 处：对话摘要 CAS 5、记忆卡 1、thinking 子信封 2、AI 回复与附件卡 2、
+      >   兜底回复 1、flight-recorder 1、tool effect payload 1
+      > - 聊天 6 处：`chat_send_core` 的 `user_env`/`caption_env`/`cap_env`
+      >   （`model_api_chat_send_core` 与 `_send_resident` 各 3）
+      > - 入住 5 处：`genesis/service` 的 `init_identity_if_absent` /
+      >   `replace_identity_preserving_anchor` / `write_persona_artifact` /
+      >   `write_voice_artifact`、`persona_backfill.run_persona_backfill`
+      > - 历史导入 3 处：`_append_import_memory_cards` / `_store_identity_payload` /
+      >   `_append_model_api_onboarding_greeting`
+      > - 身份 3 处：`identity/actions` 的 `_save/_create_identity_action_payload`、
+      >   `identity_core.init_identity`
+      > - 其余 4 处：`chat/service._chat_plaintext_thinking_extra_for_store`、
+      >   `chat/resident_maintenance._append_maintenance_message`、
+      >   `memory/actions._build_memory_envelope_for_store`、
+      >   `workspace/service.seal`
+      > - （另有 test 侧新增的 `voice/routes_asgi.py` 1 处，已登记进守卫基线，同属 A）
+      >
+      > ⚠️ **`workspace/service.seal` 有配对约束**：同类里唯一一个有对称 `open()`
+      > 的——`open()` 目前**无条件**走 `_decrypt_envelope_via_enclave`（`service.py:49`
+      > 附近），**改 seal 必须同时给 open 加形状路由**，否则写下去的明文行读不回来。
+      > 其余 A 类调用点的读侧走各自的读路径（Task 2.3 统一处理）。
+      >
+      > **非-V2 的 27 处明细（保留原三档标注以备追溯；🟡 档已于同日补齐为逐条核实）：**
       >
       > | 处数 | 调用点 | 类别 | 核实深度 |
       > |---|---|---|---|
