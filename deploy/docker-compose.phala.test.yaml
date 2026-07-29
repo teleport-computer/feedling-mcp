@@ -361,7 +361,6 @@ services:
       FEEDLING_V2_COMPACTION_BATCH_MSGS: "${FEEDLING_V2_COMPACTION_BATCH_MSGS:-50}"
       FEEDLING_V2_COMPACTION_BATCH_CHARS: "${FEEDLING_V2_COMPACTION_BATCH_CHARS:-120000}"
       FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: "${FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC:-600}"
-      # (temp 2026-07-29 #2) deadline=5s via repo var — 验证 Option A 自愈恢复 + wake 撞 backlog 边界；验证后删 var + revert。
       # 20 -> 50 (2026-07-28). This threshold decides whether a turn enters
       # the catch-up fold path AT ALL: a backlog at or under it fits in the
       # verbatim tail and nothing is folded. At 20 nearly every active user
