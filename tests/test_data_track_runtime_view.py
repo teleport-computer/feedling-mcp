@@ -505,3 +505,71 @@ def test_runtime_pages_share_one_stylesheet(bound_request):
     error_page = _dt._render_runtime_health_error_page()
     assert _dt._RUNTIME_PAGE_CSS in main_page
     assert _dt._RUNTIME_PAGE_CSS in error_page
+
+
+# ---- Task 2: 渲染两列 token ----
+
+
+def _tokens(lane_name: str = "chat", **overrides) -> dict:
+    base = {
+        "model_calls": 118,
+        "usage_reported_calls": 103,
+        "usage_coverage": 0.873,
+        "prompt_tokens": 951_161,
+        "completion_tokens": 40_473,
+        "total_tokens": 991_634,
+        "cache_read_tokens": 469_353,
+        "cache_miss_tokens": 482_000,
+        "cache_hit_ratio": 0.493,
+    }
+    base.update(overrides)
+    return {"window_hours": 24, "lanes": {lane_name: base}}
+
+
+def test_fmt_tokens_compact_covers_all_branches():
+    assert _dt._fmt_tokens_compact(None) == "—"
+    assert _dt._fmt_tokens_compact(951) == "951"
+    assert _dt._fmt_tokens_compact(951_161) == "951.2k"
+    assert _dt._fmt_tokens_compact(1_200_000) == "1.2M"
+
+
+def test_render_runtime_health_page_shows_token_columns(bound_request):
+    html_out = _dt._render_runtime_health_page(_payload(), _tokens())
+    assert "951.2k" in html_out          # prompt
+    assert "40.5k" in html_out           # completion
+    assert "49.3%" in html_out           # cache 命中率
+    assert "87.3%" in html_out           # 上报覆盖率
+    assert "token 入/出" in html_out      # 表头
+    assert "缓存命中 · 上报" in html_out  # 表头
+
+
+def test_render_runtime_health_page_token_columns_are_dash_without_data(bound_request):
+    # 某 lane 有 job 但无任何 turn metric 行——两列显 —，且不得抛 KeyError。
+    # payload 里的 lane 是 chat，tokens 里只有 heartbeat，所以 chat 行取不到数据。
+    html_out = _dt._render_runtime_health_page(_payload(), _tokens(lane_name="heartbeat"))
+    assert "token 入/出" in html_out
+    # 精确断言：token 与 cache 两列都渲染成 muted 的 —。
+    # 只写 `assert "—" in html_out` 是无效断言——页面别处本来就有 —。
+    assert html_out.count("<td class='muted'>—</td>") >= 2
+    # heartbeat 的数字绝不能串到 chat 行上
+    assert "951.2k" not in html_out
+
+
+def test_render_runtime_health_page_tolerates_missing_tokens_arg(bound_request):
+    # 不传 tokens（Task 3 接线前的中间状态）必须仍可渲染
+    html_out = _dt._render_runtime_health_page(_payload())
+    assert "各 lane 健康" in html_out
+    assert "token 入/出" in html_out
+
+
+def test_render_runtime_health_page_explains_token_scope(bound_request):
+    html_out = _dt._render_runtime_health_page(_payload(), _tokens())
+    assert "失败回合" in html_out        # token 含失败回合
+    assert "不要与缓存列相加" in html_out  # prompt 已含 cache read/write
+
+
+def test_render_runtime_health_page_declares_window_difference(bound_request):
+    # spec §6：两页口径不同必须写明，否则数字对不上会被当成 bug
+    html_out = _dt._render_runtime_health_page(_payload(), _tokens())
+    assert "固定近 30 天" in html_out
+    assert "不是 bug" in html_out

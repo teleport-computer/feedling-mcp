@@ -2257,6 +2257,21 @@ def _fmt_ratio(value) -> str:
         return "—"
 
 
+def _fmt_tokens_compact(value) -> str:
+    """Token 计数的紧凑写法。lane 健康表已有 10 列，千分位会把列宽撑爆。"""
+    if value is None:
+        return "—"
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return "—"
+    if abs(n) >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if abs(n) >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
 # ---- Runtime 健康值班台 ----------------------------------------------------
 # 阈值集中在此，便于以后一处调整。定阈依据（2026-07-27 三环境实测）：
 #   失败率 —— prod 07-26 为 0%、07-27 为 100%，两端都能正确点亮
@@ -2422,7 +2437,7 @@ _RUNTIME_PAGE_CSS = """
 """
 
 
-def _render_runtime_health_page(payload: dict) -> str:
+def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> str:
     """Runtime V2 全 lane 运行时健康值班台（?view=runtime）。
 
     本页 = 运行时视角（job 生命周期，窗口可切）；「Proactive 日报」= 产品视角
@@ -2486,6 +2501,26 @@ def _render_runtime_health_page(payload: dict) -> str:
             f"<b class='{'bad' if missing else ''}'>{missing}</b> / "
             f"{open_count}</td>"
         )
+        # 某 lane 有 job 但无 turn metric 行时（例如全部回合都还没终态），
+        # tokens["lanes"] 里没有这个键——两列显 —，不得 KeyError、也不得显 0。
+        lane_tokens = ((tokens or {}).get("lanes") or {}).get(name) or {}
+        prompt_tok = lane_tokens.get("prompt_tokens")
+        completion_tok = lane_tokens.get("completion_tokens")
+        if prompt_tok is None and completion_tok is None:
+            token_cell = "<td class='muted'>—</td>"
+        else:
+            token_cell = (
+                f"<td>{_fmt_tokens_compact(prompt_tok)} / "
+                f"{_fmt_tokens_compact(completion_tok)}</td>"
+            )
+        hit_ratio = lane_tokens.get("cache_hit_ratio")
+        coverage = lane_tokens.get("usage_coverage")
+        if hit_ratio is None and coverage is None:
+            cache_cell = "<td class='muted'>—</td>"
+        else:
+            cache_cell = (
+                f"<td>{_fmt_ratio(hit_ratio)} · {_fmt_ratio(coverage)}</td>"
+            )
         lane_label = html.escape(name)
         if name == "heartbeat":
             hb_href = _data_track_page_href(view="proactive", hours=None, offset=0)
@@ -2505,6 +2540,8 @@ def _render_runtime_health_page(payload: dict) -> str:
             + _ms_cell(lane.get("p50_ok_ms"))
             + _ms_cell(lane.get("p95_ok_ms"))
             + capture_cell
+            + token_cell
+            + cache_cell
             + "</tr>"
         )
 
@@ -2572,14 +2609,18 @@ def _render_runtime_health_page(payload: dict) -> str:
     heartbeat lane 两页都会出现，但口径不同，别直接对数。
     分母一律从 agent_jobs 起算，因此「完全没写 metrics」的回合不会从统计里消失。
     延迟只算成功回合：失败超时会把 p95 拉高，混在一起会让一个故障看起来像两个。
+    token 含<b>失败回合</b>——失败也烧钱，与上方失败率不是同一批样本的筛选口径。
+    prompt token 已包含 cache read/write，<b>不要与缓存列相加</b>，否则重复计数。
+    本页 token 跟随上方窗口；users 页「运营 Telemetry」固定近 30 天，
+    两处数字不一致是<b>窗口不同</b>，不是 bug——切到 30 天时应当一致。
   </div>
   {empty_note}
   <h2>Worker 池</h2>
   <section class="metrics">{pool_metrics}</section>
   <h2>各 lane 健康</h2>
   <table>
-    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>失败</th><th>过期</th><th>superseded</th><th>失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 完整/部分/漏写/在飞</th></tr></thead>
-    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='10' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
+    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>失败</th><th>过期</th><th>superseded</th><th>失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 完整/部分/漏写/在飞</th><th>token 入/出</th><th>缓存命中 · 上报</th></tr></thead>
+    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='12' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
   </table>
   <h2>失败原因 Top</h2>
   <table>
