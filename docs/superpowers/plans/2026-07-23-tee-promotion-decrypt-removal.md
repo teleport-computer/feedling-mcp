@@ -610,18 +610,57 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
 **出口 gate：** 发版；强制升级窗口启动；那 3 用户的 local_only 经 swap 转明文
 （或到期归丢弃）。
 
-- [ ] 写侧：默认明文直传；`content_encryption=on` 走**双收件人信封**（保留
-      `ContentEncryption.envelope` 的 K_enclave 封装，**不删**
-      `ContentEncryption.swift:52`）；**不再产生 local_only**。
-- [ ] 读侧：按行自识别——有 `body_ct` 走 `unseal`（保留），有 `body` 直读。
+> **2026-07-29 进展（分支 `feat/content-encryption-toggle`，iOS 仓）**
+>
+> 入口 gate **未达成**就先开工了（Task 2.2 未完成）。为此加了一个 enabler，让
+> 两仓的发版顺序互不依赖——**这是本轮最重要的设计决定**：
+>
+> whoami 现在下发**两个**字段：
+>   - `content_encryption`——用户**意图**，设置页开关绑它；
+>   - `content_encryption_effective`——客户端**写侧必须遵守**的形状。
+>
+> 生效值由 `registry.effective_content_encryption()` 算：只要
+> `core.envelope.PLAINTEXT_WRITES_ACCEPTED is False`（Task 2.2 完成前恒 False），
+> 一律返回 `"on"`。**因为客户端写闸此刻仍硬校验 K_enclave**
+> （`worldbook_core._validate_envelope:51` 等），iOS 若按意图直接走明文，全量写入
+> 会 400。分成意图/生效两个字段后，iOS 先发版也写不坏；后端把那个常量翻成 True
+> 才真正开始产生明文行。翻之前**必须确认所有写闸都已接受明文形状**。
+>
+> 后端侧改动（本 worktree，L1 **7203 passed / 0 failed**）：
+> `core/envelope.py` 新增 `PLAINTEXT_WRITES_ACCEPTED`、`accounts/registry.py`
+> 新增 `effective_content_encryption()`、`whoami_core.py` 下发新字段，
+> `tests/test_content_encryption_preference.py` +4 例覆盖四个边界。
+
+- [x] 写侧：`ContentWire.envelope(format:)` 一处收口，明文出
+      `{body,id,owner_user_id,visibility}`（与 TEE 侧实测字段集逐字一致）、加密出
+      双收件人信封。`ContentWriteFormat(serverEffectiveValue:)` **fail-safe 到加密**
+      ——字段缺失/空值/不认识的值一律加密，且整值相等匹配（`offline` 不会被当
+      `off`）。`FeedlingAPI.wireEnvelopeForCurrentUser` 是应用侧入口；加密档缺
+      enclave 公钥才报错，明文档不被 enclave 抖动连坐。
+- [x] 读侧：`ContentWire.readBody` 按行自识别，`body_ct` 优先于 `body`（迁移中间
+      态密文是真源）；解不开抛错、绝不静默返回空 Data。
+      `ContentEncryption.Envelope.init?(wire:)` 负责从 wire 字典重建信封。
+- [x] 世界书读写已迁到形状无关：`fetchWorldBookRows()` 改回原始 wire 行——原来的
+      Codable 把 `body_ct` 声明成必填，**混格式表会让整个响应解码失败**。
+- [x] 回归 `Tests/ContentWireFormatRegression.swift`（10 例，独立 `swiftc` 跑，
+      与仓内既有 regression 同模式）；`xcodebuild` BUILD SUCCEEDED。
+- [ ] **其余写入路径尚未迁移**：genesis（`sealForCurrentUser`，payload 标
+      `format: "sealed_v1"` 且服务端 enclave 必须能读，明文语义要另定）、chat/
+      memory/perception 各写闸。迁移前先照 Task 2.2 的教训做一遍**下游拆包点
+      普查**——iOS 侧同样有直接吃 `Envelope.bodyCT` 的消费者。
+- [ ] **`local_only` 仍在产生**：`flipMemoryVisibility(toLocalOnly:)` 未动。停产
+      = 砍掉现有的可见性开关功能，属产品决策，未擅自做。
 - [ ] **local_only 存量自解**：App 检测到本地 local_only 历史 → 设备端解密 →
       swap 通道明文重传。目标仅 3 用户 7 条，无覆盖率压力。
 - [ ] **保留**（服务加密用户）：`ContentKeyStore` 全部、`ContentEncryption`
       信封构建/解封、`FrameEnvelope` 的 K_enclave 分支、rewrap 自愈、
       attestation 拉取与 Audit 卡、register/recover。
-- [ ] 新增：设置页加密开关 UI + 文案（加密 = 更强隐私/稍慢，非功能降级）；写
-      whoami 偏好。
-- [ ] pbxproj 手工登记新文件（历史坑）。
+- [x] 新增：设置页加密开关 UI + 文案（`ContentEncryptionCard`，挂在隐私页）。
+      开关位置绑**意图**、说明文字反映**生效**值；意图=关但服务端还没开闸时显示
+      专门的「加密仍然生效」文案，不让用户误以为已经切过去了。zh/en 六条文案入
+      `Localizable.xcstrings`，品牌名用 `IO`。
+- [x] pbxproj 手工登记新文件（历史坑）：两个新文件 × 4 处（PBXBuildFile /
+      PBXFileReference / group children / Sources phase）全部登记，build 已验证。
 
 > v6 下 iOS 几乎不删加密代码——现状是人人加密，新方案是加密变可选、默认明文，
 > 主要工作是「加一条明文快路径 + 一个开关」，风险远小于删整个加密体系。

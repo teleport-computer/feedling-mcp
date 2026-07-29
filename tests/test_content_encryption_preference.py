@@ -168,3 +168,59 @@ def test_unchanged_value_is_a_noop(uid, monkeypatch):
 
     assert registry._set_user_content_encryption(uid, "off") is True
     assert len(calls) == 1, "值真的变了才 persist 一次"
+
+
+# ---------------------------------------------------------------------------
+# 生效值（effective）——供客户端**写侧**使用的那一个
+#
+# 偏好本身是「用户意图」，可以随时被设成 off；但服务端在 Task 2.2 完成前
+# **仍然拒收明文写入**（客户端写闸硬校验 K_enclave，见 worldbook_core.
+# _validate_envelope:51）。若 iOS 直接按意图走明文，全量写入会 400。
+#
+# 故 whoami 同时下发两个字段：
+#   content_encryption            = 用户意图（设置页开关绑这个）
+#   content_encryption_effective  = 客户端写侧必须遵守的形状
+#
+# 这样 iOS 与后端的发版顺序互不依赖：iOS 先发版也不会写坏，等后端把
+# PLAINTEXT_WRITES_ACCEPTED 翻成 True 才真正开始产生明文行。
+
+
+def test_effective_is_on_while_plaintext_writes_are_rejected(uid):
+    """服务端还不收明文时，即便用户意图 off，生效值也必须是 "on"。"""
+    from core import envelope as core_envelope
+
+    assert core_envelope.PLAINTEXT_WRITES_ACCEPTED is False, (
+        "Task 2.2 尚未完成；翻成 True 前请先确认所有写闸都接受明文形状")
+
+    registry._set_user_content_encryption(uid, "off")
+
+    assert registry.effective_content_encryption(uid) == "on"
+
+
+def test_effective_follows_intent_once_plaintext_writes_are_accepted(uid, monkeypatch):
+    """后端开闸后，off 意图才真正生效成明文。"""
+    from core import envelope as core_envelope
+
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
+    registry._set_user_content_encryption(uid, "off")
+
+    assert registry.effective_content_encryption(uid) == "off"
+
+
+def test_effective_stays_on_for_opted_in_user_even_after_gate_opens(uid, monkeypatch):
+    """开闸不影响显式选择加密的用户。"""
+    from core import envelope as core_envelope
+
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
+    registry._set_user_content_encryption(uid, "on")
+
+    assert registry.effective_content_encryption(uid) == "on"
+
+
+def test_effective_is_on_for_unknown_user(backend_env, monkeypatch):
+    """查不到用户 → 加密。与 _get_user_content_encryption 的 fail-safe 一致。"""
+    from core import envelope as core_envelope
+
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
+
+    assert registry.effective_content_encryption("usr_definitely_not_here") == "on"

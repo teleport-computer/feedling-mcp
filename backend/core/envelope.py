@@ -19,6 +19,12 @@ def get_user_public_key(user_id: str) -> str:
     raise RuntimeError("core.envelope.get_user_public_key not wired by assembly layer")
 
 
+# 服务端是否接受明文形状的内容写入。**Task 2.2 完成前必须是 False**：客户端
+# 写闸仍硬校验 K_enclave（worldbook_core._validate_envelope:51 等），明文写入
+# 会 400。这里是唯一的开关点——翻成 True 前先确认所有写闸都已接受明文。
+PLAINTEXT_WRITES_ACCEPTED = False
+
+
 def _decode_content_public_key(public_key: str) -> tuple[bytes | None, str]:
     raw = (public_key or "").strip()
     if not raw:
