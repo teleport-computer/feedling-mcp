@@ -47,6 +47,35 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-29 — Runtime 值班台加上开销：各 lane 的 token 与缓存效率
+
+**[DONE] `/admin/data-track?view=runtime` 的 lane 健康表增加 token 两列**，窗口跟随
+页面切换（24h / 7天 / 30天）。此前值班台只回答"跑得好不好"，不回答"花了多少"；而
+token 统计只存在于 users 页的「运营 Telemetry」区块，且是**全站 chat lane、固定 30 天**
+的单一口径——非 chat lane 的开销完全不可见。心跳 lane 烧闲置用户 BYOK 是出过事的
+（`usr_57c24d0d` 零聊天、65 个回合全是 sleep），当前口径恰恰看不到它。
+
+- `jobs_store.recent_token_usage_by_lane(within_hours)`：按 lane 的 `GROUP BY` 聚合。
+  三条口径写进了 docstring：**统计全部回合、不过滤 `failed`**（失败回合照样烧钱，
+  provider 已经算过钱了——这与同文件 `recent_runtime_health` 的延迟分位数只算成功回合
+  正好相反，两者过滤条件相反是刻意的）；**无上报是 `None` 不是 `0`**（靠 `sum()` 的
+  NULL 传播，计数列用 `coalesce(...,0)`、token 列裸 `sum`，否则"provider 没回 usage"
+  会伪装成"用了 0 个 token"）；**不加 `LIMIT`**（sum 聚合加采样上界会静默少报总量，
+  扫描量由 `ix_v2_turn_metrics_lane_created_at` 的 lane 前缀控制）。
+- 渲染两列：「token 入/出」`951.2k / 40.5k`、「缓存命中 · 上报」`49% · 87%`。某条 lane
+  不在返回的 `lanes` 字典里时（有 job 但一个回合都没终态）两列显 `—`，不 `KeyError`、
+  也不显 0——判据一律 `is None` 而非 falsy，否则真实的 `0` token 会被误显成"无数据"。
+- 接线：窗口在 `page_html` 里**算一次、传给两个数据函数**，而不是让它们各自读
+  `request.args`——后者会让同一页出现一个 24 小时、一个 720 小时的窗口，且几乎看不出来。
+  `try/except` 同时覆盖两次数据调用、但不包住渲染调用（渲染层的 bug 不该被误吞成
+  "数据源故障"降级页）。
+
+⚠️ **users 页那块保留不动，两处窗口口径不同**（users 固定近 30 天、本页跟随窗口），
+页面说明里写明了"两处数字不一致是窗口不同、不是 bug，切到 30 天时应当一致"。
+
+L1 全量 7086 passed / 0 failed（基线 7068 + 新增 18）。无迁移、未改
+`recent_token_usage_summary`、未动其余视图页。
+
 ## 2026-07-28 — TEE SNAPSHOT lane 上真环境后炸出的两个坑：TRUNCATE 权限 + 列漂移
 
 **[DONE] Task 10（计划外追加）+ Task 8 收尾**。全量对齐的代码合进 `test` 部署后，
