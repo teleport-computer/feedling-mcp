@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted Runtime V2 chat sends can request provider reasoning per turn.**
+  `POST /v1/model_api/chat/send` accepts the optional boolean
+  `include_reasoning`; omission preserves the previous disabled behavior. The
+  request applies only to the accepted V2 user turn. Resident runtimes ignore
+  it, and provider/tool-loop fallbacks remain text-only when reasoning is not
+  supported or tools have been disabled for the terminal round.
+
 - **Access-mode changes no longer bypass the Hosted Runtime V2 rollout
   reconciler.** Selecting `model_api` records the user's route choice but does
   not directly move the execution fence to V2; the `v2_user_allowlist` desired

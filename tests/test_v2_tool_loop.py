@@ -204,6 +204,42 @@ def test_reasoning_route_requests_and_publishes_provider_reasoning(monkeypatch):
     assert outcome.final_text == "answer"
 
 
+def test_turn_reasoning_request_works_without_route_effort_and_keeps_fallback_text_only(
+    monkeypatch,
+):
+    provider = _ScriptedProvider([
+        {
+            "reply": "",
+            "tool_calls": [{
+                "id": "broken",
+                "name": "memory_search",
+                "args": {},
+                "args_raw": "{",
+                "args_ok": False,
+            }],
+            "usage": {},
+        },
+        {"reply": "plain fallback", "tool_calls": [], "usage": {}},
+    ])
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    outcome = asyncio.run(tool_loop.run_tool_loop(
+        provider_config=_TEST_PROVIDER_CONFIG,
+        include_reasoning=True,
+        build_messages=_RecordingBuildMessages(),
+        dispatch_tools=_RecordingDispatch(),
+        on_reply=_RecordingReply(),
+        fold_new_messages=_RecordingFold([[]]),
+        add_usage=_noop_add_usage,
+        max_calls=3,
+    ))
+
+    assert provider.calls[0]["include_reasoning"] is True
+    assert provider.calls[1]["tools"] is None
+    assert "include_reasoning" not in provider.calls[1]
+    assert outcome.final_text == "plain fallback"
+
+
 def test_reasoning_from_tool_rounds_survives_a_plain_final_round(monkeypatch):
     provider = _ScriptedProvider([
         {

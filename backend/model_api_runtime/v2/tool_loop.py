@@ -208,6 +208,7 @@ async def run_tool_loop(
     extra_mutating_tool_names=None,
     disabled_tool_names=None,
     allow_reply_tool: bool = True,
+    include_reasoning: bool = False,
     # Whether a text-free provider reply is an ERROR. Defaults to True, which
     # is the chat lane's rule (a terminal turn with no text is the no-filler
     # failure). The wake lane is the opposite — "weak wake sleeps": a model
@@ -702,8 +703,13 @@ async def run_tool_loop(
             # provider failure. Earlier rounds already captured reasoning, so the
             # tools-disabled correction round intentionally asks for text only.
             if (
-                reasoning_effort
-                and reasoning_effort not in {"off", "none"}
+                (
+                    include_reasoning
+                    or (
+                        reasoning_effort
+                        and reasoning_effort not in {"off", "none"}
+                    )
+                )
                 and not terminal_text_round
             ):
                 provider_kwargs["include_reasoning"] = True

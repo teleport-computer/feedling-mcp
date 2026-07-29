@@ -374,6 +374,63 @@ def test_send_configured_routes_to_v2_worker_pool(client, monkeypatch):
         ).fetchone()[0] == 1
 
 
+@pytest.mark.parametrize(
+    ("request_value", "expected"),
+    [("missing", False), (True, True), (False, False)],
+)
+def test_send_persists_strict_include_reasoning_on_v2_turn(
+    client, monkeypatch, request_value, expected
+):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder()
+    )
+    _setup_openrouter(client, api_key, monkeypatch)
+    payload = {"message": "hello"}
+    if request_value != "missing":
+        payload["include_reasoning"] = request_value
+
+    response = client.post(
+        "/v1/model_api/chat/send", json=payload, headers=_headers(api_key)
+    )
+
+    assert response.status_code == 202, response.get_data(as_text=True)
+    row_id = response.get_json()["user_message"]["id"]
+    row = next(
+        item
+        for item in core_store.get_store(user_id).chat_messages
+        if item.get("id") == row_id
+    )
+    assert row["include_reasoning"] is expected
+
+
+@pytest.mark.parametrize("invalid", [None, 1, "true", [], {}])
+def test_send_rejects_non_boolean_include_reasoning_on_v2(
+    client, monkeypatch, invalid
+):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder()
+    )
+    _setup_openrouter(client, api_key, monkeypatch)
+
+    response = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "hello", "include_reasoning": invalid},
+        headers=_headers(api_key),
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "error": "invalid_include_reasoning",
+        "detail": "include_reasoning must be a boolean",
+    }
+    store = core_store._stores.get(user_id)
+    assert store is None or not [
+        row for row in store.chat_messages if row.get("role") == "user"
+    ]
+
+
 def test_send_client_msg_id_deduplicates_hosted_and_cross_route_retry(client, monkeypatch):
     """The incident path (hosted send, lost response, resident-route retry)
     must keep one user row and return the first row pointer from both APIs."""

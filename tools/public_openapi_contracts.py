@@ -779,6 +779,11 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "message": {"type": "string", "maxLength": 12000, "example": "Help me plan tomorrow."},
             "content": {"type": "string", "maxLength": 12000, "deprecated": True, "description": "Compatibility alias for message."},
             "context_refs": {"type": "array", "maxItems": 8, "items": {"$ref": "#/components/schemas/ChatContextReference"}},
+            "include_reasoning": {
+                "type": "boolean",
+                "default": False,
+                "description": "Request provider reasoning for this Hosted Runtime V2 turn. Omitted values preserve the historical disabled behavior; resident runtimes ignore this field.",
+            },
             "image_b64": {"type": "string", "contentEncoding": "base64", "description": "Image data; decoded size must not exceed 2,000,000 bytes."},
             "image_base64": {"type": "string", "contentEncoding": "base64", "deprecated": True},
             "image_mime": {"type": "string", "enum": ["image/jpeg", "image/png", "image/webp", "image/gif"]},
