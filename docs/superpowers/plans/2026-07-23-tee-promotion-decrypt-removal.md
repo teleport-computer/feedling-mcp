@@ -408,7 +408,37 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
       > 规格已留在 `tests/test_write_side_format_routing.py`（当前整文件
       > `pytest.mark.skip`，含回退原因），下一轮开工直接启用。
       >
-      > 🟡 **下表是初步分类，按「文件」做的，已确认过粗——下一轮必须按「调用点」重做。**
+      > ✅ **V2 的 13 处已按调用点逐条核实完（2026-07-29），结论与按文件的粗分类
+      > 几乎相反——13 处里 11 处是用户内容：**
+      >
+      > | 调用点 | 写的是什么 | 类别 |
+      > |---|---|---|
+      > | `serve_worker.py` 1163 / 1207 / 1221 / 1261 / 1271 | 对话摘要的 leaf / head / parent CAS 封装 | **A 用户内容** |
+      > | `serve_worker.py` 1699 | 记忆卡（`memory.actions` 入口） | **A 用户内容** |
+      > | `worker.py` 3914 / 3991 | thinking / chain-of-thought 子信封 | **A 用户内容** |
+      > | `worker.py` 4024 / 4063 | AI 回复、附件卡 | **A 用户内容** |
+      > | `jobs_store.py` 2494 | 兜底回复 `_TERMINAL_FAILURE_FALLBACK_REPLY` | **A 用户内容** |
+      > | `serve_worker.py` 2991 | flight-recorder（"Seal flight-recorder content"，轨迹诊断） | ⚠️ **待判** |
+      > | `worker.py` 4112 | tool effect payload（`_tool_effect_item_id`）——**上一轮回退的肇事者** | ⚠️ **待判** |
+      >
+      > **待判 2 处的初步结论（2026-07-29 查证，⚠️ 尚未经实现验证）：两处都倾向 A 类。**
+      > 依据：`test_v2_encrypted_effect_payload::test_tool_effect_payload_real_crypto_round_trip`
+      > 的断言是 `plaintext_payload["signature"] not in json.dumps(stored)`
+      > **配合** `json.loads(decrypted) == plaintext_payload`——它测的是
+      > **「加密确实生效且能还原」**（函数名 `real_crypto_round_trip` 也是这个意思），
+      > **不是**「无论偏好都必须加密」。它之所以在上一轮变红，只是因为其建的用户
+      > 没设偏好（默认 `off`）而走了明文分支。
+      > 同理 flight-recorder 是对话轨迹的诊断副本，明文档用户本就该服务端可读
+      > （v6 的卖点之一就是便于排查）。
+      >
+      > **若结论成立，V2 这 13 处全属 A 类**，Task 2.2 的 V2 部分可整体按偏好路由，
+      > 相关测试改为**显式设 `content_encryption=on`** 后其断言依然成立。
+      > ⚠️ **但必须先验证再动手**：先只改测试（给它显式设 on）跑一遍确认它仍绿，
+      > 证明「该测试与偏好无关、只验加密正确性」，再改实现。上一轮的教训就是
+      > 跳过验证直接动实现。另需确认 `0043` 的表级 CHECK 已放宽，否则明文行会被
+      > DB 拒掉（`v2_trajectory_events` / `v2_trajectory_reviews` 两个约束）。
+      >
+      > 🟡 **以下按文件的粗分类仅保留作非-V2 部分的起步参考，同样需逐调用点复核：**
       > 复核时发现：`v2/serve_worker.py` 的 7 处写的是 `summary` / `turn` / `payload`
       > （对话摘要与回合，**用户内容衍生**）、`v2/worker.py` 的 5 处含 `reply`
       > （AI 回复，也是用户内容）与 `effect_*`（工具效果，可能含凭证）——**V2 内部
