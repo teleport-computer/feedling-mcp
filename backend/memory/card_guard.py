@@ -6,9 +6,13 @@
 ``core/protocol_leak`` 的 payload 级拒绝(整条解析失败才拒)拦不住;``card_text`` 的占位符
 检测也拦不住(这些残片有实义字符)。
 
-本模块只回答一件事:**这段字段值是不是协议/harmony/报错泄漏**。它是纯函数、零 I/O,
-复用 ``core/protocol_leak`` 的通用证据原语(撕裂尾巴 / 协议头),不重复实现;记忆侧的
+本模块只回答一件事:**这段字段值是不是协议/harmony/报错泄漏**。它是纯函数、零 I/O;记忆侧的
 「硬字段拒卡 / 软字段清洗」路由仍在 ``card_text``,本模块不碰。
+
+⚠️ 下面的 ``_orphan_json_tail`` / ``_looks_like_protocol_head`` 两个纯判据**内联自**
+``core/protocol_leak``(撕裂尾巴 / 协议头证据)。刻意内联而非 import,是为了让本功能能
+**独立落在 test 上**、不依赖尚未合入的 ``fix/json-tail-leak``。等那条分支合了 test,
+这两个函数应改回 ``from core import protocol_leak`` 去重(行为逐字节相同)。
 
 设计取舍(codex plan_review 2026-07-28 拍板):
 - **报错回显(``output error code: NNN``)只作组合信号**,绝不单独判脏 —— 用户可能在正当
@@ -23,8 +27,55 @@ from __future__ import annotations
 import os
 import re
 
-from core import protocol_leak
 from memory.prompts_v1 import _text_is_chinese
+
+
+# --- 内联自 core/protocol_leak(见模块 docstring;合 json-tail-leak 后改回 import 去重)---
+
+# 协议闭合尾:引号值紧跟两个结构闭合符,如 ``..."}]}``。
+_TAIL_CLOSE_RE = re.compile(r'"\s*[}\]]\s*[}\]]')
+# 协议头键(键位):``"actions"/"messages"/"tool_calls"/"cards":`` —— 搜任意位置,但要求
+# 前面是 ``{`` / ``,`` / 行首(prose 里的 `the "actions" field` 不会命中)。
+_HEAD_KEY_RE = re.compile(r'(?:[{,]|^|\n)\s*"(?:actions|messages|tool_calls|cards)"\s*:')
+# 协议头 typed action:``"type":"identity|memory|proactive.xxx"``。
+_HEAD_TYPED_RE = re.compile(r'"type"\s*:\s*"(?:identity|memory|proactive)\.\w+"')
+
+
+def _naive_min_depth(text: str) -> int:
+    """无视字符串上下文的括号平衡最小值。撕裂尾巴会闭合它没开的括号 → 跌破 0。
+    刻意不做字符串感知计数:从字符串值中间被撕开的尾巴(``active.sleep","reason":...``)
+    会让引号奇偶错位、读成平衡,反而藏住要抓的泄漏。"""
+    depth = 0
+    mind = 0
+    for ch in text:
+        if ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+            if depth < mind:
+                mind = depth
+    return mind
+
+
+def _has_json_token(text: str) -> bool:
+    return ('":' in text) or bool(_TAIL_CLOSE_RE.search(text))
+
+
+def _orphan_json_tail(text) -> bool:
+    """弱信号:可见文本本身是个结构性 JSON 残片 —— 闭合的括号多于开的,且带 JSON token。
+    高召回(有些正常贴 JSON 也命中),调用侧按硬/软字段分级使用。"""
+    t = str(text or "")
+    if _naive_min_depth(t) >= 0:
+        return False
+    return _has_json_token(t)
+
+
+def _looks_like_protocol_head(text) -> bool:
+    """协议 payload 头部的结构证据:键位上的协议键,或 identity/memory/proactive typed action。"""
+    t = str(text or "")
+    if not (_HEAD_KEY_RE.search(t) or _HEAD_TYPED_RE.search(t)):
+        return False
+    return "{" in t or "[" in t
 
 
 def guard_enabled() -> bool:
@@ -65,9 +116,9 @@ def _weak_signal_count(t: str) -> int:
     n = 0
     if _BARE_ROUTE_RE.search(t):
         n += 1
-    if protocol_leak.looks_like_protocol_head(t):
+    if _looks_like_protocol_head(t):
         n += 1
-    if protocol_leak.is_orphan_json_tail(t):
+    if _orphan_json_tail(t):
         n += 1
     if _PROVIDER_ERROR_RE.search(t):
         n += 1
@@ -102,9 +153,9 @@ def field_pollution_reason(text) -> str | None:
         return "harmony_marker"
     if _BARE_ROUTE_RE.search(t):
         return "bare_tool_route"
-    if protocol_leak.looks_like_protocol_head(t):
+    if _looks_like_protocol_head(t):
         return "protocol_head"
-    if protocol_leak.is_orphan_json_tail(t):
+    if _orphan_json_tail(t):
         return "torn_json_tail"
     # 注:报错回显不在软字段单独判脏 —— 到这里真正的 to=functions / 撕裂尾巴已被上面返回,
     # 剩下的 "output error code" + 松散 "to=" 子串(redirect_to=/邮箱)几乎全是假阳性
