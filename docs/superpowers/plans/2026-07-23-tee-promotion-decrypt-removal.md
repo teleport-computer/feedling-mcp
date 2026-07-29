@@ -451,6 +451,32 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
       > 跳过验证直接动实现。另需确认 `0043` 的表级 CHECK 已放宽，否则明文行会被
       > DB 拒掉（`v2_trajectory_events` / `v2_trajectory_reviews` 两个约束）。
       >
+      > ## 🔑 实现前必须先解决的设计问题（2026-07-29 验证时发现）
+      >
+      > **`registry._get_user_content_encryption` 对「用户不存在」与「用户存在但
+      > 未设偏好」都返回 `None`，两者无法区分**——而它们的正确处置**相反**：
+      >
+      > | 情形 | 正确行为 | 理由 |
+      > |---|---|---|
+      > | 用户存在、未设偏好 | **明文** | v6 默认就是明文档 |
+      > | 用户查不到记录 | **加密**（fail-safe） | 查不到就写明文 = 任何 registry 未命中都静默降级成明文，这是安全事故 |
+      >
+      > 实证：`test_v2_encrypted_effect_payload::test_tool_effect_payload_real_crypto_round_trip`
+      > 的用户 `u_effect_real_crypto` 是**纯单元测试用户、不在 registry 里**（只
+      > monkeypatch 了公钥与 enclave info）。所以它既不能靠「设 `content_encryption=on`」
+      > 走加密分支，也正好是「查不到记录」这一类的活样本——上一轮回退时它变红，
+      > 根因其实就是这个未区分的缺口，而不只是「测试没设偏好」。
+      >
+      > **实现方案（二选一，动手前定）**：
+      > 1. 新增 `registry.user_exists(user_id)`，helper 先判存在性：不存在 → 加密；
+      >    存在且偏好 != "on" → 明文。
+      > 2. 让 `_get_user_content_encryption` 返回三态（`"on"` / `"off"` / `None`=用户
+      >    不存在），helper 对 `None` 走加密。**推荐这个**——改动集中在一个函数，
+      >    且调用方被迫显式处理第三态，不会像布尔那样被无意中吞掉。
+      >
+      > ⚠️ 无论选哪个，都要给「用户不存在 → 加密」单独写一条测试锁死。这是
+      > fail-safe 方向的落点：**写侧任何拿不准的情况都必须偏向加密**。
+      >
       > ## ✅ 40 处分类已全部完成（2026-07-29，全部逐调用点核实）
       >
       > **结论：A 类 34 处 / B 类 6 处。**
