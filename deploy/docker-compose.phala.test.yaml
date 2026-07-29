@@ -361,6 +361,8 @@ services:
       FEEDLING_V2_COMPACTION_BATCH_MSGS: "${FEEDLING_V2_COMPACTION_BATCH_MSGS:-50}"
       FEEDLING_V2_COMPACTION_BATCH_CHARS: "${FEEDLING_V2_COMPACTION_BATCH_CHARS:-120000}"
       FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: "${FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC:-600}"
+      # (temp 2026-07-29) TEST_FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC repo var
+      # 临时置 5s 以端到端验证 Option A 的 degrade 降级路径；验证完删该 var 并 revert 本注释。
       # 20 -> 50 (2026-07-28). This threshold decides whether a turn enters
       # the catch-up fold path AT ALL: a backlog at or under it fits in the
       # verbatim tail and nothing is folded. At 20 nearly every active user
