@@ -150,6 +150,8 @@ def coalesce_pending(
         ):
             if key in m:
                 item[key] = m[key]
+        if m.get("include_reasoning") is True:
+            item["include_reasoning"] = True
         # Preserve the stable database identity whenever the reader supplied
         # one, including on the compatibility timestamp path.  The timestamp
         # cursor remains a timestamp; callers that are migrating can still
