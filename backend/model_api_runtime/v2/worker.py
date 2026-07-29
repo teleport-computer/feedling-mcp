@@ -8786,6 +8786,9 @@ async def process_job(
             coalesced = coalesced[:1]
             cursor_seq = int(coalesced[0]["seq"])
             cursor_ts = float(coalesced[0].get("ts") or 0.0)
+        turn_include_reasoning = any(
+            row.get("include_reasoning") is True for row in coalesced
+        )
         reply_parent_message_id = (
             str(coalesced[0].get("id") or "") if coalesced else ""
         )
@@ -10088,6 +10091,7 @@ async def process_job(
         await asyncio.to_thread(_emit_status, user_id, job_id, "writing_reply")
         outcome = await v2_tool_loop.run_tool_loop(
             provider_config=provider_config,
+            include_reasoning=turn_include_reasoning,
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
             on_reply=_on_reply,

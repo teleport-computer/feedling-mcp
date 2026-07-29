@@ -319,6 +319,11 @@ def test_chat_memory_and_perception_contracts_are_concrete(
         assert client_msg_id["type"] == "string"
         assert client_msg_id["format"] == "uuid"
         assert "600 seconds" in client_msg_id["description"]
+    include_reasoning = schemas["HostedChatSendRequest"]["properties"][
+        "include_reasoning"
+    ]
+    assert include_reasoning["type"] == "boolean"
+    assert include_reasoning["default"] is False
 
     response_sources = schemas["ChatResponseRequest"]["properties"]["source"]["enum"]
     assert "resident_maintenance" in response_sources

@@ -8753,6 +8753,11 @@
               "$ref": "#/components/schemas/ChatContextReference"
             }
           },
+          "include_reasoning": {
+            "type": "boolean",
+            "default": false,
+            "description": "Request provider reasoning for this Hosted Runtime V2 turn. Omitted values preserve the historical disabled behavior; resident runtimes ignore this field."
+          },
           "image_b64": {
             "type": "string",
             "contentEncoding": "base64",

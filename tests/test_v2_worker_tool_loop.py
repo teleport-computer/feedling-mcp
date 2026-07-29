@@ -150,8 +150,8 @@ def _script_provider(monkeypatch, responses):
     it = iter(responses)
     calls = []
 
-    async def _fake(config, messages, *, tools=None, **_kwargs):
-        calls.append({"messages": messages, "tools": tools})
+    async def _fake(config, messages, *, tools=None, **kwargs):
+        calls.append({"messages": messages, "tools": tools, **kwargs})
         return next(it)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
@@ -297,7 +297,13 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     _patch_real_write(monkeypatch)
 
     calls = _script_provider(monkeypatch, [_text_round("hello from the model")])
-    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+    deps = _deps(messages=[{
+        "id": "m1",
+        "ts": 10.0,
+        "role": "user",
+        "content": "hi",
+        "include_reasoning": True,
+    }])
 
     status = asyncio.run(
         worker.process_job(
@@ -307,6 +313,7 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
 
     assert status == "completed"
     assert len(calls) == 1
+    assert calls[0]["include_reasoning"] is True
     bubbles = _bubbles(uid)
     assert len(bubbles) == 1
     assert bubbles[0]["body_ct"] == "hello from the model"

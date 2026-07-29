@@ -167,6 +167,13 @@ def model_api_chat_send_core(
             )
             return {"error": "runtime_control_invalid"}, 503
 
+    include_reasoning = payload.get("include_reasoning", False)
+    if type(include_reasoning) is not bool:
+        return {
+            "error": "invalid_include_reasoning",
+            "detail": "include_reasoning must be a boolean",
+        }, 400
+
     # Resolve and pin V2 image routing before persistence so a later Settings
     # change cannot redirect already-accepted pixels.
     vision_route_id = ""
@@ -257,6 +264,9 @@ def model_api_chat_send_core(
         return {"error": "provider_not_configured"}, 409
 
     extra: dict = _voice_metadata(voice_context)
+    # V2-only per-turn routing metadata. Resident/VPS paths never consume or
+    # persist this field; old clients omit it and keep the historical false path.
+    extra["include_reasoning"] = include_reasoning
     if client_msg_id is not None:
         # Plain routing metadata only; the message body remains ciphertext.
         # The database uses this UUID to serialize iOS transport retries across
