@@ -396,6 +396,42 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
       > `_ENVELOPE_REQUIRED`/`required = \[` 重扫为准。
       > 好消息：**DB 层不拦**——`chat_messages` 等表的 `doc` 列没有 body_ct 级
       > CHECK 约束（只有 V2 的 0043 有，见下条）。
+      >
+      > 🔴 **2026-07-29 实测：一刀切收口会造成安全退化，已回退。**
+      > 在 helper 里只按「用户偏好」路由是**错的**——该 helper 被 V2 trajectory /
+      > effect payload 等**本该始终加密**的系统内部路径共用。改完之后
+      > `test_v2_encrypted_effect_payload::test_tool_effect_payload_real_crypto_round_trip`
+      > 直接抓到**明文出现在存储内容里**，L1 从 2 failed 涨到 16 failed。
+      > **正确做法是按两个维度路由**：先逐条把 40 个封装点分成「用户内容（可按
+      > 偏好明文）」与「系统内部必须加密」（V2 轨迹/effect/review 等），再叠加
+      > 用户偏好；且必须**先**放宽 0043 的表级 CHECK。
+      > 规格已留在 `tests/test_write_side_format_routing.py`（当前整文件
+      > `pytest.mark.skip`，含回退原因），下一轮开工直接启用。
+      >
+      > 🟡 **下表是初步分类，按「文件」做的，已确认过粗——下一轮必须按「调用点」重做。**
+      > 复核时发现：`v2/serve_worker.py` 的 7 处写的是 `summary` / `turn` / `payload`
+      > （对话摘要与回合，**用户内容衍生**）、`v2/worker.py` 的 5 处含 `reply`
+      > （AI 回复，也是用户内容）与 `effect_*`（工具效果，可能含凭证）——**V2 内部
+      > 本身就是混合的**。把 V2 一律归入「始终加密」会正中风险登记簿那条高风险
+      > 「V2 强制加密未改按偏好 → 明文档用户 V2 数据无法直读」。
+      > 正确粒度是**逐调用点判定**，尤其要把 `effect payload`（上一轮回退的肇事者）
+      > 与 `summary`/`turn`/`reply` 分开。
+      >
+      > **40 个封装点的初步分类（2026-07-29，按文件；A/B 边界仅供起步参考）：**
+      >
+      > | 类别 | 文件（处数） | 处置 |
+      > |---|---|---|
+      > | **A：用户内容**——可按 `content_encryption` 偏好选明文/信封 | `hosted/chat_send_core.py`(6)、`genesis/service.py`(4)、`hosted/history_import.py`(3)、`identity/actions.py`(2)、`memory/actions.py`(1)、`identity/identity_core.py`(1)、`genesis/persona_backfill.py`(1)、`chat/service.py`(1)、`chat/resident_maintenance.py`(1) | 合计 **20 处**，按偏好路由 |
+      > | **B：凭证 / 系统内部**——**始终加密，绝不按偏好降级** | `model_api_runtime/v2/serve_worker.py`(7)、`v2/worker.py`(5)、`v2/jobs_store.py`(1)（V2 轨迹/effect，另受 0043 表级 CHECK 约束）；`hosted/setup_core.py`(3)（**provider 凭证**）；`hosted/mcp_core.py`(3)（**MCP secret，含鉴权头**）；`workspace/service.py`(1)（V2 工作区 `seal()`） | 合计 **20 处**，维持信封 |
+      >
+      > 判据不是「谁写的」而是「写的是什么」：B 类里 `mcp_core` 封的是
+      > `json.dumps(secret_doc)`（鉴权头）、`setup_core` 封的是 provider 凭证——
+      > 这些是**凭证**不是用户内容，用户把加密开关关掉不代表他要把自己的
+      > API key 明文存在服务端。上一轮回退正是因为漏了这层区分。
+      >
+      > 实现建议：helper 增加显式参数（如 `system_internal: bool = False`）由调用点
+      > 声明类别，**默认 False 但 B 类 20 处必须显式传 True**；或反过来默认加密、
+      > A 类显式声明可明文（更 fail-safe，推荐后者）。
 - [ ] **V2 存储改按偏好**：`0043` 等迁移的 envelope 列放宽 CHECK 为「明文或
       信封」；`serve_worker.py` 写路径按用户偏好选明文/信封。与 Task 1.5 联动。
 
