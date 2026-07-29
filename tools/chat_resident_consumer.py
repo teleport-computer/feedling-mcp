@@ -7585,8 +7585,34 @@ def _memory_read_prompt_block() -> str:
 
 
 def _required_outbound_file_suffixes(text: str) -> tuple[str, ...] | None:
-    return downloadable_file_context.required_file_suffixes(
+    requirement = downloadable_file_context.required_file_suffixes(
         [{"role": "user", "content": str(text or "")}]
+    )
+    if requirement is not None:
+        return requirement
+
+    # V1 compatibility: natural Chinese requests commonly say "下载成一份
+    # Markdown 文档". The shared conservative detector does not treat 下载成 as
+    # a creation verb, so the resident otherwise skips its bounded file retry
+    # when the model forgets send-file. Keep this fallback local to V1.
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    if re.search(
+        r"(?:如何|怎么|怎样|教程|步骤|方法|"
+        r"\bhow\s+(?:do|can|should|to)\b)",
+        normalized,
+    ):
+        return None
+    match = re.search(
+        r"(?:下载|download)\s*(?:成|为|as)?\s*"
+        r"(?:一份|一个|这份|这个|a|an)?\s*"
+        r"(?P<format>markdown|md|word|docx|pdf|txt|csv|html|json|xml|yaml|yml|rtf)"
+        r"(?![a-z0-9_])",
+        normalized,
+    )
+    if match is None:
+        return None
+    return downloadable_file_context.required_file_suffixes(
+        [{"role": "user", "content": f"帮我生成一份 {match.group('format')} 文档"}]
     )
 
 
