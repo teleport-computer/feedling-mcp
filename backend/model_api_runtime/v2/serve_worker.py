@@ -790,10 +790,10 @@ def _decrypt_chat_rows(
                 item = {"id": mid, "ts": ts, "role": role, "content": plaintext}
         if m.get("seq") is not None:
             item["seq"] = int(m["seq"])
-        if role == "user":
-            # Plain V2 turn-routing metadata, never message content. Strictly
-            # recognize JSON booleans so legacy/malformed rows degrade to false.
-            item["include_reasoning"] = m.get("include_reasoning") is True
+        if role == "user" and m.get("include_reasoning") is True:
+            # Plain V2 turn-routing metadata, never message content. Preserve
+            # only an explicit true so legacy rows keep their historical shape.
+            item["include_reasoning"] = True
         reply_to_message_id = str(m.get("reply_to_message_id") or "").strip()
         if role == "assistant" and reply_to_message_id:
             item["reply_to_message_id"] = reply_to_message_id

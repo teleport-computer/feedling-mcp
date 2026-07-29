@@ -138,7 +138,9 @@ def test_decrypted_user_row_preserves_only_strict_reasoning_boolean(
         user_only=True,
     )
 
-    assert rows[0]["include_reasoning"] is expected
+    assert rows[0].get("include_reasoning", False) is expected
+    if not expected:
+        assert "include_reasoning" not in rows[0]
 
 
 def test_dedicated_observer_uses_exact_pinned_route_and_returns_text(monkeypatch):
