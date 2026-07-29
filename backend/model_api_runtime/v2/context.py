@@ -162,11 +162,12 @@ _FILE_ARTIFACT_RE = re.compile(
     r"\b(?:document|file|attachment|downloadable|download)\b)"
 )
 _FILE_CREATE_RE = re.compile(
-    r"(?:生成|创建|制作|导出|下载(?:成|为)?|保存(?:成|为)?|转换?(?:成|为)|转成|改(?:成|为)|"
+    r"(?:生成|创建|制作|导出|下载(?:成|为)|保存(?:成|为)?|转换?(?:成|为)|转成|改(?:成|为)|"
     r"整理(?:成|为|一个|一份)?|写成|做成|制成|发给我|提供(?:下载|给我)|交给我|"
     r"给我(?:一个|一份|生成|创建|制作|导出|保存|转换|转成|整理|写成|做成)|"
     r"给我\s*(?:word|pdf|markdown|md|docx)|"
-    r"\b(?:create|generate|make|produce|export|download|save|convert|send|give|provide)\b)"
+    r"\b(?:create|generate|make|produce|export|save|convert|send|give|provide)\b|"
+    r"\bdownload\b[^.!?\n]{0,48}?\bas\b)"
 )
 _FILE_DESIRE_RE = re.compile(
     r"(?:我(?:想要|要|需要)(?:一个|一份|这份|这个)?\s*(?:"
@@ -191,7 +192,7 @@ _FILE_INFORMATION_RE = re.compile(
     r"(?:是否)?支持[^。！？\n]{0,96}(?:吗|么|[?？])|"
     r"\b(?:how (?:do|can|should|to)|tutorial|steps?|explain|describe|"
     r"tell me how|what is|what are|difference between|is it possible|"
-    r"do you support)\b)"
+    r"do you support|when should i|can i)\b)"
 )
 _FILE_CANCEL_RE = re.compile(
     r"(?:(?:不要|不用|无需|不需要|别)(?:替我|帮我|为我)?"
@@ -214,8 +215,9 @@ _FILE_NEGATED_FORMAT_RE = re.compile(
     r"转成|改(?:成|为)|整理(?:成|为)?|写成|做成|制成)[^。！？\n]{0,40}?"
     r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)"
     r"\s*(?:格式|文档|文件)?|"
-    r"\b(?:do not|don't|no need to)\s+"
+    r"\b(?:(?:do not|don't)(?:\s+want\s+to)?|no need to)\s+"
     r"(?:(?:create|generate|make|export|download|send|provide)\s+)?"
+    r"(?:as\s+)?"
     r"(?:(?:a|an|any|the)\s+)?"
     r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)"
     r"(?:\s+(?:format|document|file))?\b)"

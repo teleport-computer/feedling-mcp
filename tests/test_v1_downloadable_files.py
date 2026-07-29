@@ -461,6 +461,12 @@ def test_v1_completion_guard_matches_natural_markdown_download_request():
         "请介绍一下把记忆下载成 Markdown 文档",
         "What are the steps to download as Markdown?",
         "Is it possible to download as Markdown?",
+        "我刚下载了一份 PDF，帮我总结一下",
+        "我应该去哪里下载 PDF？",
+        "Where can I download a PDF?",
+        "I do not want to download as Markdown.",
+        "When should I download as Markdown?",
+        "Can I download this as Markdown?",
     ],
 )
 def test_v1_completion_guard_ignores_conversational_requests(text):
