@@ -2258,16 +2258,28 @@ def _fmt_ratio(value) -> str:
 
 
 def _fmt_tokens_compact(value) -> str:
-    """Token 计数的紧凑写法。lane 健康表已有 10 列，千分位会把列宽撑爆。"""
+    """Token 计数的紧凑写法。lane 健康表已有 10 列，千分位会把列宽撑爆。
+
+    先除后 `.1f` 会在四舍五入进位时把数字撑回到下一档的整千——例如
+    999_950 若按 `abs(n) >= 1_000_000` 才升到 M 档，会先算出 999.95k、
+    格式化成 "1000.0k"（视觉上像 100 万却挂着 k 后缀，且违反"紧凑格式
+    只显 3 位数"的设计意图）。真实的进位边界是 999_950，不是天真地猜
+    999_500——`.1f` 在小数点后第二位 >= 5 时进位，999_950 / 1000 == 999.95
+    正好是那个边界值本身。M→B 是同一个 bug 的更高一档（999_950_000 会被
+    格式化成 "1000.0M"），按同样的边界收紧。
+    """
     if value is None:
         return "—"
     try:
         n = int(value)
     except (TypeError, ValueError):
         return "—"
-    if abs(n) >= 1_000_000:
+    abs_n = abs(n)
+    if abs_n >= 999_950_000:
+        return f"{n / 1_000_000_000:.1f}B"
+    if abs_n >= 999_950:
         return f"{n / 1_000_000:.1f}M"
-    if abs(n) >= 1_000:
+    if abs_n >= 1_000:
         return f"{n / 1_000:.1f}k"
     return str(n)
 
@@ -2455,6 +2467,39 @@ def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> st
     lanes = payload.get("lanes") or []
     pool = payload.get("pool") or {}
 
+    # I-2：recent_runtime_health 的每条子查询共享 LIMIT 1000 的配额，
+    # recent_token_usage_by_lane 是窗口内全量、无 LIMIT。只遍历
+    # payload["lanes"] 会让"窗口内有 token 开销、但 job 没挤进最近 1000 条"
+    # 的 lane 不显示也不报错——而消灭这类非 chat lane 的开销盲区正是本功能
+    # 存在的理由。取 tokens["lanes"] 里健康侧看不到的 lane 名，补成健康列
+    # 全部为 None（走既有的"无数据"渲染逻辑显 —，不是 0——0 意味着"确认过
+    # 是零"，这里是"压根没被健康查询看见"，两者不能混）的合成行；不参与
+    # 上面已经算完的 _runtime_health_level 判定（那是纯 job 结局层面的判断，
+    # token-only 的 lane 没有任何 job 结局信息可供判定）。跟 jobs_store 里
+    # recent_runtime_health 自己的 all_lanes 是同一个哲学，只是补在渲染层。
+    token_lanes = (tokens or {}).get("lanes") or {}
+    known_lane_names = {str(lane.get("lane") or "unknown") for lane in lanes}
+    token_only_lane_names = sorted(
+        name for name in token_lanes if name not in known_lane_names
+    )
+    if token_only_lane_names:
+        lanes = list(lanes) + [
+            {
+                "lane": name,
+                "sampled_jobs": None,
+                "completed": None,
+                "failed": None,
+                "expired": None,
+                "superseded": None,
+                "failure_rate": None,
+                "p50_ok_ms": None,
+                "p95_ok_ms": None,
+                "capture": None,
+                "top_failures": [],
+            }
+            for name in token_only_lane_names
+        ]
+
     level_text = {"ok": "正常", "warn": "注意", "bad": "异常"}[level]
     level_cls = {"ok": "ok", "warn": "warn", "bad": "bad"}[level]
     reason_text = ("：" + "；".join(html.escape(r) for r in reasons)) if reasons else ""
@@ -2498,15 +2543,20 @@ def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> st
             else:
                 cls = "ok"
             rate_cell = f"<td><span class='pill {cls}'>{rate * 100:.0f}%</span></td>"
-        capture = lane.get("capture") or {}
-        missing = int(capture.get("missing") or 0)
-        open_count = int(capture.get("open") or 0)
-        capture_cell = (
-            f"<td>{int(capture.get('complete') or 0)} / "
-            f"{int(capture.get('partial') or 0)} / "
-            f"<b class='{'bad' if missing else ''}'>{missing}</b> / "
-            f"{open_count}</td>"
-        )
+        capture = lane.get("capture")
+        if capture is None:
+            # token-only 的合成行（I-2）：健康侧压根没见过这条 lane，捕获状态
+            # 未知，不是"0 个漏写"——显 —，不显 0。
+            capture_cell = "<td class='muted'>—</td>"
+        else:
+            missing = int(capture.get("missing") or 0)
+            open_count = int(capture.get("open") or 0)
+            capture_cell = (
+                f"<td>{int(capture.get('complete') or 0)} / "
+                f"{int(capture.get('partial') or 0)} / "
+                f"<b class='{'bad' if missing else ''}'>{missing}</b> / "
+                f"{open_count}</td>"
+            )
         # 某 lane 有 job 但无 turn metric 行时（例如全部回合都还没终态），
         # tokens["lanes"] 里没有这个键——两列显 —，不得 KeyError、也不得显 0。
         lane_tokens = ((tokens or {}).get("lanes") or {}).get(name) or {}
@@ -2616,6 +2666,8 @@ def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> st
     分母一律从 agent_jobs 起算，因此「完全没写 metrics」的回合不会从统计里消失。
     延迟只算成功回合：失败超时会把 p95 拉高，混在一起会让一个故障看起来像两个。
     token 含<b>失败回合</b>——失败也烧钱，与上方失败率不是同一批样本的筛选口径。
+    每条 lane 的健康列还各自共享<b>最近 1000 个 job 的采样上界</b>，token 列
+    是窗口内全量、无采样上界——长窗口下两者覆盖的时间跨度可能不同。
     prompt token 已包含 cache read/write，<b>不要与缓存列相加</b>，否则重复计数。
     本页 token 跟随上方窗口；users 页「运营 Telemetry」固定近 30 天，
     两处数字不一致是<b>窗口不同</b>，不是 bug——切到 30 天时应当一致。

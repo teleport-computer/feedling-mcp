@@ -337,6 +337,36 @@ def test_token_usage_by_lane_cache_ratio_is_none_without_cache_data():
     assert chat["cache_hit_ratio"] is None
 
 
+def test_token_usage_by_lane_cache_ratio_is_none_on_partial_report_miss_only():
+    # I-4：cache_read=None、cache_miss=500——只有 miss 上报、read 没上报。
+    # 必须是 None（"不知道"），不是 0.0（"零命中"，反而误导成缓存完全没生效）。
+    # 对齐 users 页既有算法：任一为 None，ratio 就是 None。
+    _add_metric("u_tok_partial_miss", "chat", prompt=1000, completion=100,
+                cache_read=None, cache_miss=500)
+
+    chat = jobs_store.recent_token_usage_by_lane()["lanes"]["chat"]
+
+    assert chat["cache_miss_tokens"] == 500
+    assert chat["cache_read_tokens"] is None
+    assert chat["cache_hit_ratio"] is None
+
+
+def test_token_usage_by_lane_cache_ratio_is_none_on_partial_report_read_only():
+    # I-4 反向：cache_read=500、cache_miss=None——只有 read 上报。旧算法用
+    # `or 0` 兜底会把分母算成 500、分子 500，显示 "100.0%"（缓存完美命中）,
+    # 而真相是 miss 根本没上报，不知道真实命中率。reviewer 核过
+    # provider_client.py:721-780，Anthropic 只有 cache write 无 cache read 的
+    # 回合确实会产出这种组合，是真实路径。
+    _add_metric("u_tok_partial_read", "chat", prompt=1000, completion=100,
+                cache_read=500, cache_miss=None)
+
+    chat = jobs_store.recent_token_usage_by_lane()["lanes"]["chat"]
+
+    assert chat["cache_read_tokens"] == 500
+    assert chat["cache_miss_tokens"] is None
+    assert chat["cache_hit_ratio"] is None
+
+
 def test_token_usage_by_lane_respects_window():
     _add_metric("u_tok_recent", "chat", prompt=1000, completion=100)
     _add_metric("u_tok_old", "chat", prompt=9000, completion=900, age_hours=48)

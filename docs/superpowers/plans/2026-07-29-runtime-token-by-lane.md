@@ -666,3 +666,32 @@ git commit -m "feat(admin): 接线 Runtime 值班台的 token 数据源"
 - 趋势图与历史对比
 - 修改 `recent_token_usage_summary` 或 users 页现有区块
 - 统一两页的窗口口径（刻意保留差异，仅要求标注清楚）
+
+## Post-review 修正记录（2026-07-29，整分支 code review 后）
+
+本计划 Task 1 / Task 3 里贴出的代码片段照抄进了实现，但下列内容后来被 review 证伪或判定
+不够充分。**这里不改历史代码片段本身**（那是当时怎么写的忠实记录），只记录哪里错了、真相
+是什么——完整的修正版本见
+`docs/superpowers/specs/2026-07-29-runtime-token-by-lane-design.md`（已同步更新）与实际
+提交的代码。
+
+- **Task 1 Step 3 的 docstring**（"扫描量由 `ix_v2_turn_metrics_lane_created_at` 控制，
+  其前缀正是 `lane`"）**方向反了**：该索引是 `(lane, created_at DESC)`，`lane` 打头恰恰
+  意味着它服务不了这条无 lane 等值谓词的查询（PG 16 无 skip scan）。本地 PG 16 实测走
+  Parallel Seq Scan。"不加 LIMIT"的决策本身没错，只是原先的依据错了。见 design §3。
+- **Task 1 Step 3 的 `cache_hit_ratio` 算法**（`cache_denominator = (cache_read or 0) +
+  (cache_miss or 0)`）与 users 页既有同名指标算法不一致：`cache_read=None,
+  cache_miss=500` 会显 `0.0%`，反向 `cache_read=500, cache_miss=None` 会显
+  **`100.0%`**（假装缓存完美命中，真相是 miss 没上报）——Anthropic 只有 cache write 无
+  cache read 的回合确实会产出这种组合。已改为与 users 页对齐：任一为 `None` → ratio 为
+  `None`。见 design §6。
+- **Task 3 Step 3b 注释**（"两个函数不各自读 `request.args`，因此不可能出现窗口不一致"）
+  只覆盖了调用方，没覆盖被调方各自的钳制上界（`recent_runtime_health` 钳 `24*30`，
+  `recent_token_usage_by_lane` 钳 `24*366`）。今天两者巧合相等（`720 == 24*30`），不是
+  不变量。已加白名单守卫测试把这个巧合钉死。见 design §4。
+- **Task 2 的渲染逻辑**遍历的 lane 集合只来自 `payload["lanes"]`，没有与
+  `tokens["lanes"]` 取并集——一条"窗口内有 token 开销、但 job 没挤进健康侧
+  `LIMIT 1000` 采样"的 lane 会不显示也不报错。已补并集逻辑，见 design §5。
+- **Task 2 的 `_fmt_tokens_compact`** 在 `[999_950, 1_000_000)` 与
+  `[999_950_000, 1_000_000_000)` 两个区间会因"先除后 `.1f`"错误显示成上一档的
+  `"1000.0k"` / `"1000.0M"`。真实边界是 999_950，不是 999_500。已按格式化结果收紧阈值。

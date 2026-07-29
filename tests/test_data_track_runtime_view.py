@@ -305,6 +305,18 @@ def test_runtime_health_window_hours_falls_back_on_bad_input():
             assert _dt._runtime_health_window_hours() == 24
 
 
+def test_runtime_health_windows_stay_within_jobs_store_health_clamp():
+    # I-3：design §4 说"两个函数不各自读 request.args，因此不可能出现窗口
+    # 不一致"——这句话只覆盖了调用方，没覆盖被调方各自的钳制上界。
+    # jobs_store.recent_runtime_health 把 within_hours 钳到 24*30（720），
+    # recent_token_usage_by_lane 钳到 24*366。今天 max(_RUNTIME_HEALTH_WINDOWS)
+    # == 720 == 24*30，两边钳制结果恰好相同——这是巧合，不是不变量。
+    # 谁往白名单加一档 > 720 小时（比如 90 天 = 2160），健康列会被静默钳到
+    # 720、token 列却查满新值，同一行两个窗口，页顶还标着新窗口数——且没有
+    # 任何测试会红。这条断言就是那个会红的守卫：把巧合钉成显式约束。
+    assert max(_dt._RUNTIME_HEALTH_WINDOWS) <= 24 * 30
+
+
 # ---- Task 4: 渲染 Runtime 健康页 ----
 
 
@@ -533,6 +545,31 @@ def test_fmt_tokens_compact_covers_all_branches():
     assert _dt._fmt_tokens_compact(1_200_000) == "1.2M"
 
 
+def test_fmt_tokens_compact_promotes_at_true_rounding_boundary():
+    # 真实边界是 999_950（.1f 在 999.95 处四舍五入进位），不是天真猜测的
+    # 999_500。[999_950, 1_000_000) 必须显示成 M 而非 "1000.0k"；
+    # M→B 是同一个 bug 的更高一档，[999_950_000, 1_000_000_000) 必须显示
+    # 成 B 而非 "1000.0M"。
+    assert _dt._fmt_tokens_compact(999_949) == "999.9k"    # 刚好在边界之下
+    assert _dt._fmt_tokens_compact(999_950) == "1.0M"      # 边界值本身：升档
+    assert _dt._fmt_tokens_compact(999_949_999) == "999.9M"
+    assert _dt._fmt_tokens_compact(999_950_000) == "1.0B"
+
+
+def _lane_row_html(html_out: str, lane_name: str) -> str:
+    """抽取给定 lane 那一行 `<tr>...</tr>` 的 HTML。
+
+    避免"整页里有没有这个子串"这种宽断言——多 lane 共存时，另一行的数字
+    串到这行里也会让宽断言误判为通过（I-2 的教训：heartbeat 的数字必须只
+    出现在 heartbeat 自己那行，不能出现在 chat 行里）。
+    """
+    marker = f"<b>{lane_name}"
+    start = html_out.index(marker)
+    row_start = html_out.rindex("<tr>", 0, start)
+    row_end = html_out.index("</tr>", start) + len("</tr>")
+    return html_out[row_start:row_end]
+
+
 def test_render_runtime_health_page_shows_token_columns(bound_request):
     html_out = _dt._render_runtime_health_page(_payload(), _tokens())
     assert "951.2k" in html_out          # prompt
@@ -545,14 +582,50 @@ def test_render_runtime_health_page_shows_token_columns(bound_request):
 
 def test_render_runtime_health_page_token_columns_are_dash_without_data(bound_request):
     # 某 lane 有 job 但无任何 turn metric 行——两列显 —，且不得抛 KeyError。
-    # payload 里的 lane 是 chat，tokens 里只有 heartbeat，所以 chat 行取不到数据。
-    html_out = _dt._render_runtime_health_page(_payload(), _tokens(lane_name="heartbeat"))
+    # payload 里的 lane 是 chat，tokens 里只有 maintenance 的开销数据（一个
+    # payload 里完全没有的 lane，用来同时验证 I-2 的并集不会把它的数字串到
+    # chat 行上；maintenance 本身如何渲染见
+    # test_render_runtime_health_page_includes_token_only_lane）。
+    html_out = _dt._render_runtime_health_page(_payload(), _tokens(lane_name="maintenance"))
     assert "token 入/出" in html_out
-    # 精确断言：token 与 cache 两列都渲染成 muted 的 —。
+    chat_row = _lane_row_html(html_out, "chat")
+    # 精确断言：chat 行的 token 与 cache 两列都渲染成 muted 的 —。
     # 只写 `assert "—" in html_out` 是无效断言——页面别处本来就有 —。
-    assert html_out.count("<td class='muted'>—</td>") >= 2
-    # heartbeat 的数字绝不能串到 chat 行上
-    assert "951.2k" not in html_out
+    assert chat_row.count("<td class='muted'>—</td>") == 2
+    # maintenance 的数字绝不能串到 chat 行上
+    assert "951.2k" not in chat_row
+
+
+def test_render_runtime_health_page_includes_token_only_lane(bound_request):
+    # I-2：recent_runtime_health 的每条子查询共享 LIMIT 1000 配额，
+    # recent_token_usage_by_lane 是窗口内全量、无 LIMIT——一条"窗口内有 token
+    # 开销、但 job 没挤进最近 1000 条"的 lane，若渲染层只遍历 payload["lanes"]，
+    # 它的开销不显示也不报错，而消灭这类盲区正是本功能存在的理由。
+    # payload 里只有 chat；tokens 里额外有一个 payload 完全不知道的 maintenance。
+    html_out = _dt._render_runtime_health_page(_payload(), _tokens(lane_name="maintenance"))
+    row = _lane_row_html(html_out, "maintenance")
+    # token 两列必须正常显示真实数字，不是 —
+    assert "951.2k" in row
+    assert "40.5k" in row
+    assert "49.3%" in row
+    assert "87.3%" in row
+    # 健康列（样本/成功/失败/过期/superseded/失败率/p50/p95/capture）没有
+    # 任何数据来源——必须显 —，不得显 0（0 意味着"确认过是零"，这里是
+    # "压根没被健康查询看见"）。5 个 muted 的 — 来自 superseded/失败率/
+    # p50/p95/capture（这几列本来就带 muted class 或在无数据时切换成
+    # muted）；样本/成功/失败/过期四列不带 muted class，但内容也必须是 —
+    # 而非 0。
+    assert row.count("<td class='muted'>—</td>") == 5
+    assert "<td>—</td>" in row  # 样本/成功/失败/过期这几列（不带 muted class）
+    assert ">0<" not in row and "0 / 0" not in row
+
+
+def test_render_runtime_health_page_token_only_lane_does_not_affect_health_level(bound_request):
+    # token-only 的合成行不该参与 _runtime_health_level 的判定——那是纯 job
+    # 结局层面的判断，这条 lane 没有任何 job 结局信息可供判定。
+    payload = _payload([_lane(lane="chat", failure_rate=0.0)])
+    html_out = _dt._render_runtime_health_page(payload, _tokens(lane_name="maintenance"))
+    assert "总体结论：<span class=\"ok\">正常</span>" in html_out
 
 
 def test_render_runtime_health_page_tolerates_missing_tokens_arg(bound_request):

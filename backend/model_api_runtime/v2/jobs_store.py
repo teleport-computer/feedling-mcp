@@ -4106,8 +4106,20 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
     烧 token，provider 已经算过钱了。
 
     刻意不加 ``LIMIT``：sum 聚合加采样上界会静默少报总量（"最新 N 条的 token
-    和"不是任何人想要的数字）。扫描量由 ``ix_v2_turn_metrics_lane_created_at``
-    控制，其前缀正是 ``lane``。
+    和"不是任何人想要的数字）——这个决策本身仍然正确，但下面这句话曾经写的
+    依据是错的，且方向反了：本查询**没有** ``WHERE lane = ...`` 等值谓词，
+    只有 ``created_at >= ...`` 加 ``GROUP BY lane``。
+    ``ix_v2_turn_metrics_lane_created_at`` 是 ``(lane, created_at DESC)``，
+    ``lane`` 是前缀这件事恰恰意味着它**服务不了**这条查询——PG 16 没有 B-tree
+    skip scan（PG 18 才有），前导列没有等值谓词时用不上索引。本地 PG 16
+    （50 万行、5 个 lane）实测：本查询走 Parallel Seq Scan（
+    ``Rows Removed by Filter`` 随窗口内行数线性增长，`shared hit` 六千+
+    buffer）；而有 ``lane = 'chat'`` 等值谓词的既有
+    ``recent_token_usage_summary`` 才真正吃到该索引的 Bitmap Index Scan
+    （`shared read=35`）。``v2_turn_metrics`` 是 append-only 表，本查询的扫描
+    量因此随表增长单调变大；增长到不可接受时需要补一条单列索引
+    ``CREATE INDEX CONCURRENTLY ix_v2_turn_metrics_created_at ON
+    v2_turn_metrics (created_at DESC)``——记为明确的 follow-up，本次不加。
 
     token 为空一律 ``None`` 而非 ``0``：provider 未回 usage 的调用应当降低
     ``usage_coverage``，而不是被记成零 token 混进总量假装正常。
@@ -4144,7 +4156,20 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
         completion_tokens = _optional_int(row, "completion_tokens")
         cache_read = _optional_int(row, "cache_read_tokens")
         cache_miss = _optional_int(row, "cache_miss_tokens")
-        cache_denominator = (cache_read or 0) + (cache_miss or 0)
+        # 任一为 None 时分母按 0 算 → ratio 为 None（"不知道"），不是 0.0 或
+        # 1.0（"完美命中"/"零命中"）。对齐 users 页既有的 admin/data_track.py
+        # 「运营 Telemetry」区块同名指标的算法——Anthropic 只有 cache write、
+        # 无 cache read 的回合会产出 cache_read=None, cache_miss=500 这种真实
+        # 组合（provider_client.py 已核实）；若用 `or 0` 兜底，这种情况会显示
+        # 成 "0.0%"，反过来 cache_read=500, cache_miss=None 会显示成 "100.0%"
+        # （假装缓存完美命中，而真相是 miss 根本没上报）。两页必须可对账，
+        # 否则页顶"窗口不同"的免责声明会被拿来误导运维把真实的算法差异当成
+        # 窗口差异。
+        cache_denominator = (
+            cache_read + cache_miss
+            if cache_read is not None and cache_miss is not None
+            else 0
+        )
         lanes[str(row["lane"] or "unknown")] = {
             "model_calls": model_calls,
             "usage_reported_calls": usage_calls,
