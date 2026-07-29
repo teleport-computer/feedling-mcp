@@ -437,6 +437,7 @@ AGENT_SESSION_MAX_TURNS = int(os.environ.get("AGENT_SESSION_MAX_TURNS", "40"))
 AGENT_SESSION_MAX_BYTES = int(os.environ.get("AGENT_SESSION_MAX_BYTES", "250000"))
 AGENT_SESSION_ROTATE_PREFIX = os.environ.get("AGENT_SESSION_ROTATE_PREFIX", "feedling-io")
 HERMES_SESSION_REASONING_MAX_BYTES = int(os.environ.get("HERMES_SESSION_REASONING_MAX_BYTES", "2000000"))
+CODEX_SESSION_REASONING_MAX_BYTES = int(os.environ.get("CODEX_SESSION_REASONING_MAX_BYTES", "8000000"))
 IMAGE_TEMP_DIR = Path(os.environ.get(
     "IMAGE_TEMP_DIR",
     f"/tmp/feedling_chat_images_{CHECKPOINT_API_KEY_FINGERPRINT}"))
@@ -4583,6 +4584,59 @@ def _codex_reply_from_stream(raw: str) -> str:
     return _codex_turn_from_stream(raw)[0]
 
 
+def _codex_thread_id_from_stream(raw: str) -> str:
+    """Return the Codex thread id without treating it as a resumable CLI session."""
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict) or obj.get("type") != "thread.started":
+            continue
+        thread_id = str(obj.get("thread_id") or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,200}", thread_id):
+            return thread_id
+    return ""
+
+
+def _codex_session_reasoning(thread_id: str) -> str:
+    """Read Codex's public reasoning summary when ``exec --json`` omits it."""
+    sid = (thread_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", sid):
+        return ""
+    codex_home = Path(os.environ.get("CODEX_HOME", "").strip() or (Path.home() / ".codex"))
+    try:
+        candidates = list((codex_home / "sessions").glob(f"*/*/*/rollout-*-{sid}.jsonl"))
+        if not candidates:
+            return ""
+        path = max(candidates, key=lambda candidate: candidate.stat().st_mtime)
+        size = path.stat().st_size
+        if size < 0 or size > CODEX_SESSION_REASONING_MAX_BYTES:
+            return ""
+        public_summaries: list[str] = []
+        structured_summaries: list[str] = []
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            payload = obj.get("payload") if isinstance(obj, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            event_type = str(payload.get("type") or "").strip()
+            if event_type == "agent_reasoning":
+                text = payload.get("text")
+                if isinstance(text, str) and text.strip():
+                    public_summaries.append(text.strip())
+            elif event_type == "reasoning":
+                for item in payload.get("summary") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        structured_summaries.append(text.strip())
+        summaries = public_summaries or structured_summaries
+        return _sanitize_thinking_summary("\n\n".join(dict.fromkeys(summaries)))
+    except Exception:
+        return ""
+
+
 def _claude_turn_from_stream(raw: str) -> tuple[str, str]:
     """Split a ``claude -p --output-format stream-json`` event stream into
     (reply, reasoning_summary).
@@ -7042,6 +7096,10 @@ def call_agent_cli(
     # reply, or — on codex 0.142 — leak the reasoning summary as a chat bubble).
     if _is_codex_cmd(cmd):
         codex_reply, codex_reasoning = _codex_turn_from_stream(result.stdout)
+        if not codex_reasoning:
+            codex_reasoning = _codex_session_reasoning(
+                _codex_thread_id_from_stream(result.stdout)
+            )
         if codex_reply:
             # Background memory lanes (raw_text) parse the model's literal output
             # with their own extractors — hand them the bare reply untouched. Only
@@ -12876,7 +12934,9 @@ def _process_messages(messages: list) -> float:
             if attempt_trigger != "first"
             else {}
         )
-        outbound_file_turn_active = source == "chat" and AGENT_MODE == "cli"
+        outbound_file_turn_active = (
+            source in {"chat", "model_api"} and AGENT_MODE == "cli"
+        )
         outbound_file_requirement = (
             _required_outbound_file_suffixes(raw_user_content_for_lang)
             if outbound_file_turn_active

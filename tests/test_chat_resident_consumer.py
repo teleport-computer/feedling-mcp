@@ -5872,6 +5872,45 @@ def test_codex_turn_from_stream_0136_item_protocol_still_works():
     assert reasoning == "thinking…"
 
 
+def test_codex_session_reasoning_reads_public_summary(monkeypatch, tmp_path):
+    thread_id = "019fad75-fdac-7012-b4fb-d414f9b08302"
+    session_dir = tmp_path / "sessions" / "2026" / "07" / "29"
+    session_dir.mkdir(parents=True)
+    session_path = session_dir / f"rollout-2026-07-29T04-40-18-{thread_id}.jsonl"
+    session_path.write_text(
+        "\n".join([
+            json.dumps({"payload": {"type": "reasoning", "encrypted_content": "opaque", "summary": []}}),
+            json.dumps({"payload": {"type": "agent_reasoning", "text": "先读取记忆索引，再生成文件。"}}, ensure_ascii=False),
+        ]),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    assert crc._codex_session_reasoning(thread_id) == "先读取记忆索引，再生成文件。"
+
+
+def test_codex_thread_id_and_session_reasoning_fallback(monkeypatch, tmp_path):
+    thread_id = "019fad75-fdac-7012-b4fb-d414f9b08302"
+    raw = (
+        json.dumps({"type": "thread.started", "thread_id": thread_id}) + "\n"
+        + json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "文件已生成。"}}, ensure_ascii=False)
+    )
+    session_dir = tmp_path / "sessions" / "2026" / "07" / "29"
+    session_dir.mkdir(parents=True)
+    (session_dir / f"rollout-2026-07-29T04-40-18-{thread_id}.jsonl").write_text(
+        json.dumps({"payload": {"type": "agent_reasoning", "text": "正在整理可下载内容。"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    reply, reasoning = crc._codex_turn_from_stream(raw)
+    if not reasoning:
+        reasoning = crc._codex_session_reasoning(crc._codex_thread_id_from_stream(raw))
+
+    assert reply == "文件已生成。"
+    assert reasoning == "正在整理可下载内容。"
+
+
 # ---------------------------------------------------------------------------
 # When a codex turn calls tools, a *preamble* agent_message ("let me check…")
 # precedes the tool call and the real answer arrives in a LATER agent_message —
