@@ -456,6 +456,11 @@ def test_v1_completion_guard_matches_natural_markdown_download_request():
         "help me make a checklist for packing",
         "给我一个报告",
         "如何把记忆下载成一份 Markdown 文档？",
+        "不要把记忆下载成 Markdown 文档",
+        "支持把记忆下载成 Markdown 文档吗？",
+        "请介绍一下把记忆下载成 Markdown 文档",
+        "What are the steps to download as Markdown?",
+        "Is it possible to download as Markdown?",
     ],
 )
 def test_v1_completion_guard_ignores_conversational_requests(text):
