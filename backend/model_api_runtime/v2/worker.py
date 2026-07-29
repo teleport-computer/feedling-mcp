@@ -4881,16 +4881,53 @@ async def _run_compaction(
         # A checkpoint increments the head version; reading first would waste
         # one provider call on a predictably stale leaf and force a retry job.
         if deps.read_summary_frontier is not None:
-            await _rebalance_summary_frontier(
-                user_id,
-                deps,
-                provider_config=provider_config,
-                enclave_sem=enclave_sem,
-                claimed_by=claimed_by,
-                job_id=job_id,
-                add_usage=tm.add_call if tm is not None else None,
-                trajectory_recorder=trajectory_recorder,
-            )
+            try:
+                await _rebalance_summary_frontier(
+                    user_id,
+                    deps,
+                    provider_config=provider_config,
+                    enclave_sem=enclave_sem,
+                    claimed_by=claimed_by,
+                    job_id=job_id,
+                    add_usage=tm.add_call if tm is not None else None,
+                    trajectory_recorder=trajectory_recorder,
+                )
+            except (LostJobLease, RuntimeModeChanged, asyncio.CancelledError):
+                # Lifecycle, not the checkpoint's own failure — this worker no
+                # longer owns the job and must not keep folding.
+                raise
+            except v2_summary_frontier.SummaryFrontierIntegrityError:
+                # The persisted cover cannot prove complete coverage. Folding on
+                # top of a frontier we cannot trust would extend the damage, so
+                # this one stays fatal.
+                raise
+            except Exception as rebalance_exc:  # noqa: BLE001 — see below
+                # A checkpoint only reduces how many nodes a later prompt has to
+                # read; the fold below is the actual work. Letting a failed
+                # checkpoint skip it (it sits ABOVE the tail read) meant the
+                # backlog could never drain, and since the roll-up input does
+                # not change, it failed identically on every retry — including
+                # manual re-enqueues. usr_7f30 on prod sat at a frozen watermark
+                # for days on exactly this, with `model_calls=1` proving the one
+                # provider call was the checkpoint, never the fold.
+                _report_turn_progress("compaction_checkpoint_degraded")
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "compaction_checkpoint_degraded",
+                    {
+                        "lane": "maintenance",
+                        "error_class": type(rebalance_exc).__name__,
+                        "detail": str(
+                            getattr(rebalance_exc, "detail", "") or ""
+                        )[:80],
+                    },
+                    best_effort=True,
+                )
+                log.warning(
+                    "[v2.worker] checkpoint rebalance degraded for %s: %s",
+                    user_id,
+                    type(rebalance_exc).__name__,
+                )
         async with enclave_sem:
             if deps.read_summary_with_seq is not None and (
                 deps.read_compaction_tail_after_seq is not None
@@ -4923,100 +4960,128 @@ async def _run_compaction(
             if tm is not None:
                 tm.flush(failed=False, status="ok")
             return "completed"
-        old = _bounded_compaction_prefix(tail[: max(0, len(tail) - _TAIL_KEEP)])
-        if not old:
-            raise RuntimeError("compaction_batch_empty")
-        new_watermark = old[-1]["ts"]
-        # D5/Task 9: also advance the seq watermark, atomically, in the same CAS
-        # write as new_watermark below. The tail row dict itself may already carry
-        # "seq" (a seq-aware reader); if not (e.g. today's ts-windowed
-        # _read_compaction_tail, or a narrow test double), fall back to an exact
-        # by-id lookup — never a ts-range estimate, which would be ambiguous
-        # under same-ts ties (see db.chat_seq_for_msg_id's docstring). A tail row
-        # with no "id" at all (only synthetic test doubles) leaves the seq
-        # watermark unadvanced this round rather than guessing.
-        new_watermark_seq = old[-1].get("seq")
-        if new_watermark_seq is None:
-            last_id = old[-1].get("id")
-            if last_id is not None:
-                new_watermark_seq = await asyncio.to_thread(
-                    db.chat_seq_for_msg_id, user_id, last_id
-                )
-        first_watermark_seq = old[0].get("seq")
-        if first_watermark_seq is None:
-            first_id = old[0].get("id")
-            if first_id is not None:
-                first_watermark_seq = await asyncio.to_thread(
-                    db.chat_seq_for_msg_id, user_id, first_id
-                )
-        _report_turn_progress("compaction_batch_start")
+        # A refused fold is a property of the BATCH, not a verdict on the
+        # backlog: shrink and retry before giving up, mirroring the inline
+        # catch-up's ladder. Reporting success without advancing (the old
+        # behaviour) left the watermark frozen while metrics said ok —
+        # usr_90184 on prod, job 130: model_calls=1, status=ok, summary
+        # untouched for an hour.
+        candidate_rows = tail[: max(0, len(tail) - _TAIL_KEEP)]
+        fold_limit = len(candidate_rows)
+        while True:
+            old = _bounded_compaction_prefix(candidate_rows[:fold_limit])
+            if not old:
+                raise RuntimeError("compaction_batch_empty")
+            new_watermark = old[-1]["ts"]
+            # D5/Task 9: also advance the seq watermark, atomically, in the same CAS
+            # write as new_watermark below. The tail row dict itself may already carry
+            # "seq" (a seq-aware reader); if not (e.g. today's ts-windowed
+            # _read_compaction_tail, or a narrow test double), fall back to an exact
+            # by-id lookup — never a ts-range estimate, which would be ambiguous
+            # under same-ts ties (see db.chat_seq_for_msg_id's docstring). A tail row
+            # with no "id" at all (only synthetic test doubles) leaves the seq
+            # watermark unadvanced this round rather than guessing.
+            new_watermark_seq = old[-1].get("seq")
+            if new_watermark_seq is None:
+                last_id = old[-1].get("id")
+                if last_id is not None:
+                    new_watermark_seq = await asyncio.to_thread(
+                        db.chat_seq_for_msg_id, user_id, last_id
+                    )
+            first_watermark_seq = old[0].get("seq")
+            if first_watermark_seq is None:
+                first_id = old[0].get("id")
+                if first_id is not None:
+                    first_watermark_seq = await asyncio.to_thread(
+                        db.chat_seq_for_msg_id, user_id, first_id
+                    )
+            _report_turn_progress("compaction_batch_start")
 
-        async def _recording_compaction_llm(*args: Any, **kwargs: Any) -> Any:
-            messages = args[1] if len(args) > 1 else kwargs.get("messages", [])
-            await _record_trajectory(
-                trajectory_recorder,
-                "provider_request",
-                {"lane": "maintenance", "messages": messages, "tools": None},
-            )
-            try:
-                result = await _compaction_llm_with_progress(
-                    user_id,
-                    *args,
-                    **kwargs,
-                )
-            except Exception as exc:
+            async def _recording_compaction_llm(*args: Any, **kwargs: Any) -> Any:
+                messages = args[1] if len(args) > 1 else kwargs.get("messages", [])
                 await _record_trajectory(
                     trajectory_recorder,
-                    "provider_error",
-                    {
-                        "error_class": type(exc).__name__,
-                        "provider_attempt_trace": (
-                            provider_client.runtime_provider_attempt_trace(exc)
-                        ),
-                    },
-                    best_effort=True,
+                    "provider_request",
+                    {"lane": "maintenance", "messages": messages, "tools": None},
                 )
-                raise
-            await _record_trajectory(
-                trajectory_recorder,
-                "provider_response",
-                {"response": result},
-            )
-            return result
+                try:
+                    result = await _compaction_llm_with_progress(
+                        user_id,
+                        *args,
+                        **kwargs,
+                    )
+                except Exception as exc:
+                    await _record_trajectory(
+                        trajectory_recorder,
+                        "provider_error",
+                        {
+                            "error_class": type(exc).__name__,
+                            "provider_attempt_trace": (
+                                provider_client.runtime_provider_attempt_trace(exc)
+                            ),
+                        },
+                        best_effort=True,
+                    )
+                    raise
+                await _record_trajectory(
+                    trajectory_recorder,
+                    "provider_response",
+                    {"response": result},
+                )
+                return result
 
-        segmented_write = (
-            deps.append_summary_segment is not None
-            and new_watermark_seq is not None
-            and first_watermark_seq is not None
-            and deps.read_summary_with_seq is not None
-        )
-        if segmented_write:
-            segment_text = await v2_compaction.compact_segment(
-                provider_config=provider_config,
-                old_messages=old,
-                llm=_recording_compaction_llm,
-                usage_out=tm.add_call if tm is not None else None,
+            segmented_write = (
+                deps.append_summary_segment is not None
+                and new_watermark_seq is not None
+                and first_watermark_seq is not None
+                and deps.read_summary_with_seq is not None
             )
-            new_summary = segment_text or ""
-        else:
-            new_summary = await v2_compaction.compact(
-                provider_config=provider_config,
-                current_summary=summary,
-                old_messages=old,
-                llm=_recording_compaction_llm,
-                usage_out=tm.add_call if tm is not None else None,
-            )
-        _report_turn_progress("compaction_batch_complete")
-        if (
-            (segmented_write and not new_summary.strip())
-            or (not segmented_write and new_summary.strip() == summary.strip())
-        ):  # 空/no-op 折叠 → 不推进 watermark/version
-            await asyncio.to_thread(
-                jobs_store.mark_completed, job_id, claimed_by=claimed_by
-            )
-            if tm is not None:
-                tm.flush(failed=False, status="ok")
-            return "completed"
+            if segmented_write:
+                segment_text = await v2_compaction.compact_segment(
+                    provider_config=provider_config,
+                    old_messages=old,
+                    llm=_recording_compaction_llm,
+                    usage_out=tm.add_call if tm is not None else None,
+                )
+                new_summary = segment_text or ""
+            else:
+                new_summary = await v2_compaction.compact(
+                    provider_config=provider_config,
+                    current_summary=summary,
+                    old_messages=old,
+                    llm=_recording_compaction_llm,
+                    usage_out=tm.add_call if tm is not None else None,
+                )
+            _report_turn_progress("compaction_batch_complete")
+            if (
+                (segmented_write and not new_summary.strip())
+                or (not segmented_write and new_summary.strip() == summary.strip())
+            ):  # 空/no-op 折叠 → 不推进 watermark/version
+                if len(old) > 1:
+                    fold_limit = max(1, len(old) // 4)
+                    _report_turn_progress(
+                        f"compaction_batch_shrunk_{fold_limit}"
+                    )
+                    await _record_trajectory(
+                        trajectory_recorder,
+                        "compaction_batch_shrunk",
+                        {
+                            "lane": "maintenance",
+                            "fold_limit": fold_limit,
+                        },
+                        best_effort=True,
+                    )
+                    continue
+                # A single row that still folds to nothing is genuinely
+                # unfoldable here. Leave it to the inline catch-up, which
+                # owns the quarantine path, rather than inventing coverage.
+                await asyncio.to_thread(
+                    jobs_store.mark_completed, job_id, claimed_by=claimed_by
+                )
+                if tm is not None:
+                    tm.flush(failed=False, status="ok")
+                return "completed"
+            break
         if claimed_by and not await asyncio.to_thread(
             jobs_store.renew_job_lease,
             job_id,

@@ -878,7 +878,12 @@ def _read_messages(user_id: str, after_seq: int = 0) -> list[dict]:
 
 
 def _read_tail_window(
-    user_id: str, after_ts: float, limit: int, *, oldest_first: bool
+    user_id: str,
+    after_ts: float,
+    limit: int,
+    *,
+    oldest_first: bool,
+    exclude_synthetic_sources: bool = False,
 ) -> list[dict]:
     """读该用户最近一个窗口内的消息（BOTH roles），逐条经 enclave 解密取明文（D1）。
 
@@ -906,6 +911,18 @@ def _read_tail_window(
     if limit <= 0:
         return []
     candidates = [m for m in rows if m.get("ts") is not None and m.get("ts") > after_ts]
+    if exclude_synthetic_sources:
+        # Summary-coverage callers only: `verify_ping`/`resident_maintenance`
+        # rows are deleted once their probe completes, so folding one into an
+        # IMMUTABLE leaf freezes a coverage claim that the row itself will not
+        # honour — validate_canonical_frontier then fails every later turn.
+        # The seq-based reader already excludes them; this ts-based sibling
+        # kept the hole open for whichever caller still reaches it.
+        candidates = [
+            m for m in candidates
+            if str(m.get("source") or "")
+            not in ("verify_ping", "resident_maintenance")
+        ]
     # Bound enclave work before decrypting, so every selected caption can be
     # preserved without an independent cap that silently changes row content.
     rows = candidates[:limit] if oldest_first else candidates[-limit:]
@@ -1029,7 +1046,16 @@ def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
 
 def _read_compaction_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
     """Oldest contiguous batch so summary watermarks never skip backlog rows."""
-    return _read_tail_window(user_id, after_ts, limit, oldest_first=True)
+    return _read_tail_window(
+        user_id,
+        after_ts,
+        limit,
+        oldest_first=True,
+        # Coverage claims made from this batch are immutable — never let a
+        # GC-able synthetic row into one (mirrors
+        # `_read_compaction_tail_after_seq`).
+        exclude_synthetic_sources=True,
+    )
 
 
 def _read_temporal_snapshot(
