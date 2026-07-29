@@ -20,21 +20,21 @@ from core import envelope as core_envelope  # noqa: E402
 from core import store as core_store  # noqa: E402
 
 
-pytestmark = pytest.mark.skip(
-    reason="Phase 2 Task 2.2 未完成：写侧收口的实现已于 2026-07-29 回退。"
-           "本文件作为该 Task 的规格保留，放宽 0043 CHECK、确定哪些路径可明文之后启用。"
-)
+# 2026-07-29 的一次回退与最终解法（留作后来者的上下文）：
+# 初版直接按用户偏好一刀切改明文，导致 test_v2_encrypted_effect_payload 抓到明文
+# 出现在存储内容里、L1 从 2 failed 涨到 16 failed，已回退。真实根因不是「该路径
+# 必须始终加密」，而是 _get_user_content_encryption 当时把「用户不存在」与「未设
+# 偏好」都返回 None，helper 把前者也当成了明文档——那个测试的 u_effect_real_crypto
+# 正是不在 registry 里的纯单元测试用户。
+# 最终解法：偏好改三态（on / off / None=查不到用户），helper 只在明确 "off" 时
+# 走明文，None 一律 fail-safe 加密；并由 0068 放宽 0043 的表级 CHECK 让明文行
+# 能入库。B 类（凭证）的特殊处理经用户 2026-07-29 拍板取消，40 处统一按偏好。
 
-# ⚠️ 2026-07-29 实测教训（回退原因，下一轮务必先解决）：
-# 直接在 _build_shared_envelope_for_store 里按用户偏好一刀切改明文会造成**安全退化**。
-# 该 helper 是通用入口，被 V2 trajectory / effect payload 等**本该始终加密**的路径共用
-# （它们还有 0043 的表级强制 CHECK）。一刀切之后：
-#   - tests/test_v2_encrypted_effect_payload.py::test_tool_effect_payload_real_crypto_round_trip
-#     直接抓到明文出现在存储内容里（该测试断言的正是「明文不得出现」）；
-#   - 全量 L1 从基线 2 failed 涨到 16 failed。
-# 正确顺序：先按 Task 2.2 第三条放宽 0043 的表级 CHECK、并逐条确定哪些封装点属于
-# 「用户内容（可按偏好明文）」、哪些属于「系统内部必须加密」（V2 轨迹/effect 等），
-# 再让 helper 按**路径类别 + 用户偏好**两个维度路由——不能只看用户偏好。
+
+pytestmark = pytest.mark.skip(
+    reason="Task 2.2 未完成：helper 写侧路由第二次回退（2026-07-29）。"
+           "真实阻塞是下游消费者硬编码 envelope['body_ct'] 拆包，见文件头注释。"
+)
 
 
 @pytest.fixture()

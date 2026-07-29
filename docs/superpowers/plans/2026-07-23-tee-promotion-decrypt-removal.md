@@ -451,6 +451,35 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
       > 跳过验证直接动实现。另需确认 `0043` 的表级 CHECK 已放宽，否则明文行会被
       > DB 拒掉（`v2_trajectory_events` / `v2_trajectory_reviews` 两个约束）。
       >
+      > ## 🔴 第二次回退（2026-07-29）：真实阻塞是**下游消费者**，不是 helper 本身
+      >
+      > 三态 fail-safe 与 0068 放宽 CHECK 都就位后再次实现 helper 路由，L1 仍
+      > **15 failed**。查到失败点在 **`backend/hosted/history_import.py:3024`——
+      > 生产代码，不是测试**：
+      >
+      > ```python
+      > "body_ct": envelope["body_ct"],        # ← KeyError，helper 已返回明文形状
+      > "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+      > ...
+      > ```
+      >
+      > **调用点拿到 helper 的返回值后会把它拆开重组成 doc**，字段名硬编码。
+      > 所以 Task 2.2 的真实范围是「40 个调用点 **× 各自的下游消费代码**」，
+      > 而不是「helper 一处收口」。15 个 L1 失败 ≈ 15 个这样的下游拆包点。
+      >
+      > **这是本 Task 第三次范围低估**（一刀切 → 按文件粗分类 → 以为一处收口）。
+      > 下一轮的正确做法：
+      > 1. 先 `grep -rn 'envelope\["body_ct"\]\|envelope\.get("body_ct"' backend/`
+      >    列出所有**下游拆包点**，与 40 个调用点做交叉；
+      > 2. 给拆包处统一提供一个形状无关的取值 helper（如
+      >    `core.envelope.read_body(envelope) -> str`，明文读 `body`、信封走 enclave），
+      >    **先把拆包点全部迁到它**、L1 保持绿；
+      > 3. **最后**才切 helper 的写侧形状——那时下游已经形状无关，切换才是安全的。
+      >
+      > 已保住的绿色成果（均已提交、L1 绿）：`0068` 放宽 CHECK、偏好三态
+      > fail-safe、40 处分类、规格测试（`test_write_side_format_routing.py`，
+      > 当前 `pytest.mark.skip`）。
+      >
       > ## 🔑 实现前必须先解决的设计问题（2026-07-29 验证时发现）
       >
       > **`registry._get_user_content_encryption` 对「用户不存在」与「用户存在但
@@ -481,10 +510,17 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
       >
       > **结论：A 类 34 处 / B 类 6 处。**
       >
-      > **B 类（6 处，始终加密，绝不按偏好降级）**——它们封的是**凭证**不是用户内容：
-      > `hosted/mcp_core.py`(3，`json.dumps(secret_doc)` 含鉴权头)、
-      > `hosted/setup_core.py`(3，provider 凭证)。用户关掉加密开关 ≠ 愿意把自己的
-      > API key 明文存在服务端。
+      > **~~B 类（6 处，始终加密）~~ —— 2026-07-29 经用户拍板取消，40 处统一按偏好。**
+      >
+      > 原提案是把 `hosted/mcp_core.py`(3，`json.dumps(secret_doc)` 含鉴权头) 与
+      > `hosted/setup_core.py`(3，provider 凭证) 列为「始终加密、绝不按偏好降级」，
+      > 理由是它们封的是**凭证**而非用户内容。**该提案已被否决**：用户明确要求
+      > B 类也不加密。
+      >
+      > 📌 **决策留痕（不是待办，无需再争）**：明文档用户的 **MCP 鉴权头与
+      > provider API key 将以明文存于服务端**。这是产品有意接受的权衡——v6 的
+      > 「明文档 = 服务端可读」贯彻到底，不为凭证开特例。若日后要收回这个决定，
+      > 改动点就是这 6 处（在 helper 里加类别参数即可，分类清单仍保留在下方）。
       >
       > **A 类（34 处，按 `content_encryption` 偏好路由）**：
       > - V2 13 处：对话摘要 CAS 5、记忆卡 1、thinking 子信封 2、AI 回复与附件卡 2、

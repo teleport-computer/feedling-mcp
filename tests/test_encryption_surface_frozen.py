@@ -56,7 +56,14 @@ FORCED_ENVELOPE_PATTERNS = (
 # 0043 的两个约束（ck_v2_trajectory_envelope / ck_v2_trajectory_review_envelope，
 # 合计 4 处断言）是 Phase 2 Task 2.2 的待改造对象，暂列白名单。**不要**为通过
 # CI 而随手往这里加文件——新增项必须先在计划 Task 2.2 登记为待改造。
-ALLOWLISTED_MIGRATIONS = {"0043_v2_encrypted_trajectories.py"}
+ALLOWLISTED_MIGRATIONS = {
+    "0043_v2_encrypted_trajectories.py",
+    # 0068 是**放宽**：把 0043 的「必须是信封」改成「信封 OR 明文」，正是本守卫
+    # 想要的方向。它之所以被扫到，只是因为放宽后的 CHECK 里仍保留了信封分支
+    # （加密档用户的行仍须完整），而守卫做的是文本匹配、认不出 `OR 明文分支`。
+    # 登记在此而非放松 pattern：pattern 一旦放松，真正的新增强制约束也会溜过去。
+    "0068_relax_v2_envelope_shape.py",
+}
 
 # 服务端封装点：调用即产生「双收件人信封」，没有 content_encryption 偏好分支
 # 就等于强制加密。`build_envelope` 的定义处（content_encryption.py）不算。
