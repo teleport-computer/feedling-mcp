@@ -18,28 +18,10 @@ from identity import service as identity_service
 from memory import card_guard
 from memory import service as memory_service
 from memory.prompts_v1 import normalize_bucket_language
-
-MEMORY_SOURCE_VALUES = frozenset({
-    "chat",
-    "genesis_import",
-    "genesis_resident_distill",
-    "hosted_runtime_state",
-    "live_conversation",
-    "memory_capture",
-    "memory_dream",
-    "memory_migrate",
-    "model_api_capture",
-    "model_api_correction",
-    "model_api_repair",
-})
-MEMORY_CAPTURE_MODE_VALUES = frozenset({
-    "agent_tool",
-    "genesis_resident_distill",
-    "memory_capture",
-    "memory_dream",
-    "repair",
-    "state",
-})
+from memory.source_policy import (
+    MEMORY_CAPTURE_MODE_VALUES,
+    MEMORY_SOURCE_VALUES,
+)
 
 
 def _memory_action_metadata_error(action: dict) -> dict | None:

@@ -11,6 +11,29 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from enclave import readside  # noqa: E402
 from memory import actions as memory_actions  # noqa: E402
 from memory import service as memory_service  # noqa: E402
+from memory.source_policy import MEMORY_SOURCE_VALUES  # noqa: E402
+
+
+# Known values observed in the 2026-07-29 production 500-user source sample.
+# Keep this hard-coded so a policy edit cannot silently remove a live value.
+PROD_MEMORY_SOURCE_VALUES_2026_07_29 = {
+    "bootstrap",
+    "chat",
+    "genesis_import",
+    "genesis_resident_distill",
+    "history_import",
+    "hosted_runtime_state",
+    "live_conversation",
+    "memory_capture",
+    "memory_dream",
+    "memory_migrate",
+    "model_api_capture",
+    "model_api_correction",
+    "model_api_repair",
+    "ombre_brain_sync",
+    "resident_absorb",
+    "resident_patch",
+}
 
 
 def _install_memory_action_fakes(monkeypatch, moments: list[dict]) -> list[dict]:
@@ -169,6 +192,10 @@ def test_memory_action_accepts_all_declared_source_and_capture_mode_values(monke
         }])
         assert status == 200, (capture_mode, body)
         assert len(saved) == 1
+
+
+def test_memory_source_policy_covers_known_production_values():
+    assert PROD_MEMORY_SOURCE_VALUES_2026_07_29 <= MEMORY_SOURCE_VALUES
 
 
 def test_memory_add_skips_normalized_duplicate_but_keeps_distinct_content(monkeypatch):

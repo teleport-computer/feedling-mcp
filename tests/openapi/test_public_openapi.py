@@ -19,9 +19,12 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / "tools"
+BACKEND = ROOT / "backend"
 sys.path.insert(0, str(TOOLS))
+sys.path.insert(0, str(BACKEND))
 
 from export_public_openapi import _build_public_schema, _load_schema  # noqa: E402
+from memory.source_policy import MEMORY_SOURCE_VALUES  # noqa: E402
 
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "options", "head", "trace"}
@@ -408,6 +411,17 @@ def test_conditional_payloads_and_review_contract_match_runtime(
         assert review_content[media_type]["schema"] == {
             "$ref": "#/components/schemas/ProactiveDecisionReviewRequest"
         }
+
+
+def test_memory_source_enums_match_runtime_policy(
+    public_schema: dict[str, Any],
+) -> None:
+    schemas = public_schema["components"]["schemas"]
+    envelope_sources = schemas["MemoryEnvelope"]["properties"]["source"]["enum"]
+    record_sources = schemas["MemoryRecordInput"]["properties"]["source"]["enum"]
+
+    assert set(envelope_sources) == MEMORY_SOURCE_VALUES
+    assert set(record_sources) == MEMORY_SOURCE_VALUES
 
 
 def test_model_catalog_request_schema_expresses_strict_xor(

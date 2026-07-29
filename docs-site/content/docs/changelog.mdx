@@ -16,6 +16,8 @@ change must not be interpreted as an API guarantee.
   compares Unicode-NFKC/case/whitespace-normalized title and content with
   readable active shared cards; an exact match returns a successful
   `duplicate_active` no-op with the existing card ID and emits no write effect.
+  The published source enum includes existing bootstrap, history-import,
+  resident-write, and Ombre sync provenance values.
   Capture clients no longer rewrite `merge` or `supersede` cards that lack a
   target into `memory.add`.
 

@@ -635,9 +635,11 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "source": {
                 "type": "string",
                 "enum": [
+                    "bootstrap",
                     "chat",
                     "genesis_import",
                     "genesis_resident_distill",
+                    "history_import",
                     "hosted_runtime_state",
                     "live_conversation",
                     "memory_capture",
@@ -646,6 +648,9 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                     "model_api_capture",
                     "model_api_correction",
                     "model_api_repair",
+                    "ombre_brain_sync",
+                    "resident_absorb",
+                    "resident_patch",
                 ],
                 "default": "live_conversation",
             },
@@ -1174,9 +1179,11 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "source": {
                 "type": "string",
                 "enum": [
+                    "bootstrap",
                     "chat",
                     "genesis_import",
                     "genesis_resident_distill",
+                    "history_import",
                     "hosted_runtime_state",
                     "live_conversation",
                     "memory_capture",
@@ -1185,6 +1192,9 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                     "model_api_capture",
                     "model_api_correction",
                     "model_api_repair",
+                    "ombre_brain_sync",
+                    "resident_absorb",
+                    "resident_patch",
                 ],
             },
         },

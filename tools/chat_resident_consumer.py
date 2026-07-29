@@ -1429,6 +1429,10 @@ def _runtime_repo_files() -> set[str]:
     files.update(
         {
             "tools/io_cli.py",
+            # io_cli imports this pure policy module for its closed --source
+            # choices. It runs as a subprocess, so its imports are invisible
+            # to this process's sys.modules-derived dependency list.
+            "backend/memory/source_policy.py",
             # Imported lazily inside _prepend_io_cli_capability_catalog, so it
             # may not yet be in sys.modules when a release-diff check runs;
             # register it explicitly so a release that only touches the

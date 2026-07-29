@@ -39,6 +39,12 @@ import urllib.request
 import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend"))
+from memory.source_policy import (  # noqa: E402
+    MEMORY_SOURCE_VALUES,
+    RESIDENT_ABSORB_SOURCE,
+    RESIDENT_PATCH_SOURCE,
+)
+
 try:
     from identity import card_policy as _card_policy  # single source, pure stdlib
 except Exception:
@@ -1280,13 +1286,16 @@ def _memory_write_payload(*, summary, content, bucket, threads, importance, puls
     content = str(content or "").strip()
     if not summary and not content:
         return None
+    source = str(source or RESIDENT_ABSORB_SOURCE).strip()
+    if source not in MEMORY_SOURCE_VALUES:
+        raise ValueError(f"memory source is not allowed: {source!r}")
     memory = {
         "type": (mem_type or "fact").strip().lower(),
         "summary": summary or content[:180],
         "title": summary or content[:180],
         "content": content or summary,
         "description": content or summary,
-        "source": (source or "resident_absorb").strip()[:80],
+        "source": source,
     }
     if bucket:
         memory["bucket"] = str(bucket).strip()
@@ -1336,13 +1345,16 @@ def _memory_patch_payload(*, memory_id, summary, content, bucket, threads, impor
     content = str(content or "").strip()
     if not summary and not content:
         return None
+    source = str(source or RESIDENT_PATCH_SOURCE).strip()
+    if source not in MEMORY_SOURCE_VALUES:
+        raise ValueError(f"memory source is not allowed: {source!r}")
     memory = {
         "type": (mem_type or "fact").strip().lower(),
         "summary": summary or content[:180],
         "title": summary or content[:180],
         "content": content or summary,
         "description": content or summary,
-        "source": (source or "resident_patch").strip()[:80],
+        "source": source,
     }
     if bucket:
         memory["bucket"] = str(bucket).strip()
@@ -1809,7 +1821,12 @@ def main():
     mw.add_argument("--importance", type=float, default=None, help="0-1")
     mw.add_argument("--pulse", type=float, default=None, help="0-1")
     mw.add_argument("--type", default="fact", help="fact|event|quote|moment")
-    mw.add_argument("--source", default="resident_absorb", help="source label (e.g. resident_absorb)")
+    mw.add_argument(
+        "--source",
+        choices=sorted(MEMORY_SOURCE_VALUES),
+        default=RESIDENT_ABSORB_SOURCE,
+        help="closed provenance value (default: resident_absorb)",
+    )
     mw.set_defaults(func=cmd_memory_write)
 
     md = sub.add_parser(
@@ -1836,7 +1853,12 @@ def main():
     mp.add_argument("--importance", type=float, default=None, help="0-1 (else inherits)")
     mp.add_argument("--pulse", type=float, default=None, help="0-1 (else inherits)")
     mp.add_argument("--type", default="fact", help="fact|event|quote|moment")
-    mp.add_argument("--source", default="resident_patch", help="source label (e.g. resident_patch)")
+    mp.add_argument(
+        "--source",
+        choices=sorted(MEMORY_SOURCE_VALUES),
+        default=RESIDENT_PATCH_SOURCE,
+        help="closed provenance value (default: resident_patch)",
+    )
     mp.add_argument("--reason", default=None, help="why (optional, audit trail)")
     mp.set_defaults(func=cmd_memory_patch)
     ov = sub.add_parser("onboarding-validate",
