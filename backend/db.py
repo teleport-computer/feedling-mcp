@@ -1304,7 +1304,8 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                          'YYYY-MM-DD"T"HH24:MI:SS"Z"'
                        ), ''),
                        last_provider_error_class,
-                       last_provider_error_blame
+                       last_provider_error_blame,
+                       COALESCE(recent_latency_ms, 0)
                 FROM provider_health
                 WHERE user_id = ANY(%s)
                 """,
@@ -1317,6 +1318,7 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                 failure_at,
                 error_class,
                 error_blame,
+                recent_latency_ms,
             ) in rows:
                 ensure(out, uid)["provider_health"] = {
                     "provider_state": provider_state or "ok",
@@ -1324,6 +1326,12 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                     "last_provider_failure_at": failure_at or "",
                     "last_provider_error_class": error_class or "",
                     "last_provider_error_blame": error_blame or "",
+                    # A slow-but-working route explains "everything takes
+                    # minutes", which none of the failure fields above can.
+                    # Raw value only: the slow/not-slow verdict lives in
+                    # provider_health, which imports db and so cannot be
+                    # imported back from here.
+                    "recent_latency_ms": round(float(recent_latency_ms or 0.0)),
                 }
 
             rows = conn.execute(
@@ -5593,6 +5601,52 @@ def chat_recent_genuine_turn_boundary_seq(
             (str(user_id), upper, bounded),
         ).fetchone()
     return int(row[0]) if row and row[0] is not None else None
+
+
+def v2_effective_batch_cap(user_id: str) -> int | None:
+    """The fold batch size this conversation was last observed to digest.
+
+    ``None`` means never measured — callers fall back to their configured
+    default, so existing rows and brand-new users behave exactly as before.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT effective_batch_cap FROM v2_conversation_summary "
+            "WHERE user_id = %s",
+            (str(user_id),),
+        ).fetchone()
+    if not row or row[0] is None:
+        return None
+    return int(row[0])
+
+
+def v2_set_effective_batch_cap(user_id: str, value: int) -> None:
+    """Persist the working fold batch size (floored at 1).
+
+    Writes ONLY this column, and ONLY into a row that already exists.
+
+    Both restrictions are load-bearing. The watermark and its CAS ``version``
+    are fold coverage and must never move as a side effect of bookkeeping.
+    And inserting a row here would fabricate a ``version = 0`` summary for a
+    conversation that has never been folded — the fold then reads "no summary",
+    computes its write against that absence, and its CAS collides with the row
+    this bookkeeping call invented, failing the whole job with
+    ``summary_cas_lost``.
+
+    A conversation with no summary row therefore silently keeps no memory. It
+    gets one as soon as its first fold lands, which is also the first moment
+    the memory could be worth anything.
+
+    Zero or negative is floored rather than stored: a batch of zero would wedge
+    the fold on an empty slice forever.
+    """
+    capped = max(1, int(value))
+    with get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_conversation_summary SET effective_batch_cap = %s "
+            "WHERE user_id = %s",
+            (capped, str(user_id)),
+        )
 
 
 def chat_seq_for_msg_id(user_id: str, msg_id: str) -> int | None:

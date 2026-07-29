@@ -2181,7 +2181,7 @@ def test_compaction_reliable_attempts_refresh_turn_progress(monkeypatch):
     progress = []
     monkeypatch.setattr(worker, "_report_turn_progress", progress.append)
 
-    async def _ignore_health(_user_id):
+    async def _ignore_health(_user_id, **_kwargs):
         return None
 
     async def _fake_reliable(*args, progress_cb=None, **kwargs):

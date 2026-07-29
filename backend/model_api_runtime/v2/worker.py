@@ -142,8 +142,20 @@ def _report_turn_progress(stage: str) -> None:
         log.debug("[v2.worker] turn progress callback failed stage=%s: %s", stage, exc)
 
 
-async def _record_provider_success(user_id: str) -> None:
-    await asyncio.to_thread(provider_health.record_success, user_id)
+async def _record_provider_success(
+    user_id: str, *, latency_ms: float | None = None
+) -> None:
+    """Record one usable provider response, optionally with how long it took.
+
+    ``latency_ms`` is the wall time of the whole reliable call INCLUDING its
+    internal retries — that is what this worker actually waited, and it is the
+    number that decides whether a background fold can finish before its own
+    timeout. Call sites that cannot measure omit it and the stored average is
+    carried forward unchanged.
+    """
+    await asyncio.to_thread(
+        provider_health.record_success, user_id, latency_ms=latency_ms
+    )
 
 
 async def _record_provider_failure(
@@ -161,12 +173,15 @@ async def _extract_with_provider_health(
     user_id: str,
     **kwargs: Any,
 ) -> tuple[Any, str | None]:
+    started = time.monotonic()
     try:
         result = await v2_extraction.extract(**kwargs)
     except Exception as exc:
         await _record_provider_failure(user_id, exc)
         raise
-    await _record_provider_success(user_id)
+    await _record_provider_success(
+        user_id, latency_ms=(time.monotonic() - started) * 1000.0
+    )
     return result
 
 
@@ -4422,6 +4437,40 @@ def _compaction_message_chars(message: dict) -> int:
     )
 
 
+# Additive-increase step for the persisted fold batch size. Deliberately a
+# small CONSTANT rather than a fraction of the configured batch: the decrease
+# is multiplicative (//4), so an increment anywhere near that ratio walks
+# straight back up the ladder and re-pays the very refusal it just learned
+# from. Slow recovery is the point — a conversation whose content is uniformly
+# thin should not keep rediscovering that the full batch does not fold.
+_BATCH_CAP_INCREMENT = 2
+
+
+async def _load_batch_cap(user_id: str) -> int:
+    """The batch size this conversation last digested, clamped to config.
+
+    Never larger than ``_COMPACTION_BATCH``: the persisted value is a memory of
+    what worked, not a licence to exceed the configured budget (which may have
+    been lowered since it was written).
+    """
+    try:
+        stored = await asyncio.to_thread(db.v2_effective_batch_cap, user_id)
+    except Exception as exc:  # noqa: BLE001 — bookkeeping never blocks a fold
+        log.debug("[v2.worker] batch cap read failed for %s: %s", user_id, exc)
+        return _COMPACTION_BATCH
+    if not stored:
+        return _COMPACTION_BATCH
+    return max(1, min(_COMPACTION_BATCH, int(stored)))
+
+
+async def _persist_batch_cap(user_id: str, value: int) -> None:
+    """Best-effort write — a failed bookkeeping write must not fail the fold."""
+    try:
+        await asyncio.to_thread(db.v2_set_effective_batch_cap, user_id, int(value))
+    except Exception as exc:  # noqa: BLE001
+        log.debug("[v2.worker] batch cap persist failed for %s: %s", user_id, exc)
+
+
 def _bounded_compaction_prefix(
     messages: list[dict],
     *,
@@ -4460,6 +4509,7 @@ async def _compaction_llm_with_progress(
     def _attempt_progress(stage: str, attempt: int) -> None:
         _report_turn_progress(f"compaction_provider_{stage}_{attempt}")
 
+    started = time.monotonic()
     try:
         result = await provider_client.reliable_chat_completion_async(
             *args, progress_cb=_attempt_progress, **kwargs
@@ -4467,7 +4517,9 @@ async def _compaction_llm_with_progress(
     except Exception as exc:
         await _record_provider_failure(user_id, exc)
         raise
-    await _record_provider_success(user_id)
+    await _record_provider_success(
+        user_id, latency_ms=(time.monotonic() - started) * 1000.0
+    )
     return result
 
 
@@ -4987,7 +5039,12 @@ async def _run_compaction(
         # usr_90184 on prod, job 130: model_calls=1, status=ok, summary
         # untouched for an hour.
         candidate_rows = tail[: max(0, len(tail) - _TAIL_KEEP)]
-        fold_limit = len(candidate_rows)
+        # Start at the size this conversation was last observed to digest.
+        # Draining a backlog runs this job over and over via compaction_catchup;
+        # without the memory each one re-pays a guaranteed refusal to relearn
+        # the same limit (~100 wasted model calls for a 1200-message backlog,
+        # billed to the user's own key).
+        fold_limit = min(len(candidate_rows), await _load_batch_cap(user_id))
         while True:
             old = _bounded_compaction_prefix(candidate_rows[:fold_limit])
             if not old:
@@ -5079,6 +5136,7 @@ async def _run_compaction(
             ):  # 空/no-op 折叠 → 不推进 watermark/version
                 if len(old) > 1:
                     fold_limit = max(1, len(old) // 4)
+                    await _persist_batch_cap(user_id, fold_limit)
                     _report_turn_progress(
                         f"compaction_batch_shrunk_{fold_limit}"
                     )
@@ -5144,6 +5202,14 @@ async def _run_compaction(
                 deps.write_summary, user_id, new_summary, new_watermark, version
             )
         if ok:
+            # That batch folded and landed: earn back a little headroom, so a
+            # conversation that recovers is not pinned at its worst size
+            # forever. Additive against the multiplicative decrease above.
+            if fold_limit < _COMPACTION_BATCH:
+                await _persist_batch_cap(
+                    user_id,
+                    min(_COMPACTION_BATCH, fold_limit + _BATCH_CAP_INCREMENT),
+                )
             if segmented_write:
                 await _rebalance_summary_frontier(
                     user_id,
@@ -5679,8 +5745,11 @@ async def _ensure_prompt_coverage(
     # Gates quarantine: see the escalation below.
     last_provider_exc: BaseException | None = None
     # Shrinks on repeated refusal (see the escalation below).  Starts at the
-    # configured batch size so the healthy path is unchanged.
-    batch_cap = _COMPACTION_BATCH
+    # size this conversation was last observed to digest, so a user whose
+    # content is uniformly thin does not re-pay one guaranteed-to-fail model
+    # call per job rediscovering the same limit.  Unmeasured conversations get
+    # the configured batch size, so the healthy path is unchanged.
+    batch_cap = await _load_batch_cap(user_id)
 
     def _note_reject(code: str) -> None:
         nonlocal last_reject_code
@@ -5695,6 +5764,14 @@ async def _ensure_prompt_coverage(
         if last_observed_watermark is not None:
             if watermark_seq > last_observed_watermark:
                 no_progress_attempts = 0
+                # That batch folded: earn back a little headroom (additive
+                # increase against the multiplicative decrease below), so a
+                # conversation that recovers is not stuck at its worst size.
+                if batch_cap < _COMPACTION_BATCH:
+                    batch_cap = min(
+                        _COMPACTION_BATCH, batch_cap + _BATCH_CAP_INCREMENT
+                    )
+                    await _persist_batch_cap(user_id, batch_cap)
             elif attempted_since_observation:
                 no_progress_attempts += 1
         last_observed_watermark = watermark_seq
@@ -5751,6 +5828,9 @@ async def _ensure_prompt_coverage(
                 # gets its own retry budget because it is a genuinely
                 # different request, not a repeat of the failed one.
                 batch_cap = max(1, batch_cap // 4)
+                # Remember it: the next job would otherwise start at the full
+                # batch and spend another refusal relearning this same limit.
+                await _persist_batch_cap(user_id, batch_cap)
                 no_progress_attempts = 0
                 last_observed_watermark = None
                 _report_turn_progress(f"prompt_catchup_shrink_{batch_cap}")
@@ -5799,8 +5879,10 @@ async def _ensure_prompt_coverage(
                 )
             # Advance past it and keep going: the rest of the backlog is
             # almost certainly foldable, and the batch cap resets because the
-            # blocking row is behind us now.
+            # blocking row is behind us now — persisted too, so the next job
+            # does not inherit a small cap that only that one row justified.
             batch_cap = _COMPACTION_BATCH
+            await _persist_batch_cap(user_id, batch_cap)
             no_progress_attempts = 0
             last_observed_watermark = None
             last_reject_code = ""
@@ -5891,7 +5973,10 @@ async def _ensure_prompt_coverage(
                 raise TurnError(
                     _coverage_incomplete_reason("message_exceeds_char_budget")
                 ) from exc
+            # The oversized row is behind us; the small cap was about that row,
+            # not about this conversation, so restore and remember the full one.
             batch_cap = _COMPACTION_BATCH
+            await _persist_batch_cap(user_id, batch_cap)
             no_progress_attempts = 0
             last_observed_watermark = None
             last_reject_code = ""
@@ -6013,11 +6098,12 @@ async def _ensure_prompt_coverage(
             # full provider timeout. Spending the retry budget at each rung
             # costs 4 rungs × max_retries × 60s = 720s against a 600s deadline,
             # so the ladder never reaches the small batches that would have
-            # worked, and `batch_cap` (a local) restarts at the top on the next
-            # turn — the stall would survive the fix. Shrinking immediately
-            # walks the whole ladder in ~4 timeouts instead.
+            # worked. Shrinking immediately walks the whole ladder in ~4
+            # timeouts instead, and the rung that worked is persisted below so
+            # the next job starts there rather than at the top again.
             if batch_cap > 1:
                 batch_cap = max(1, batch_cap // 4)
+                await _persist_batch_cap(user_id, batch_cap)
                 no_progress_attempts = 0
                 last_observed_watermark = None
                 _report_turn_progress(f"prompt_catchup_shrink_{batch_cap}")

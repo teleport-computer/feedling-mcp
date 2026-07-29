@@ -423,3 +423,63 @@ def test_legacy_compaction_reader_also_excludes_gc_able_rows(monkeypatch):
 
     folded = v2_serve_worker._read_compaction_tail(uid, 0.0, 10)
     assert [r["id"] for r in folded] == ["a", "b"], folded
+
+
+def test_a_shrunk_fold_is_remembered_by_the_next_job(monkeypatch):
+    """The rung that worked must outlive the job that found it.
+
+    Draining a backlog runs `_run_compaction` over and over via chained
+    compaction_catchup jobs. `fold_limit` used to be a local starting at the
+    full batch, so every one of those jobs re-paid a guaranteed refusal to
+    rediscover the same limit — roughly 100 wasted provider calls to drain a
+    1200-message backlog, billed to the user's own key.
+    """
+    uid = "u_v2_batch_cap_is_remembered"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    n = worker._TAIL_KEEP + 40
+    messages = [
+        {"id": f"m{i}", "ts": float(i + 1),
+         "role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+        for i in range(n)
+    ]
+
+    refusals: list[int] = []
+
+    async def _refuse_large_batches(_config, sent_messages, **_kwargs):
+        # Count the rows the fold actually sent this call.
+        rendered = str(sent_messages[-1].get("content") if sent_messages else "")
+        rows = rendered.count("\n") + 1
+        refusals.append(rows)
+        # Anything above 8 rows is refused; smaller folds succeed.
+        return {"reply": "" if rows > 8 else "- folded bullet"}
+
+    monkeypatch.setattr(
+        provider_client, "reliable_chat_completion_async", _refuse_large_batches
+    )
+
+    def _run_one_job():
+        deps = _minimal_compaction_deps(messages, with_frontier=False)
+        job_id, _ = jobs_store.enqueue_job(uid, "maintenance", reason="compaction")
+        job = jobs_store.claim_next_job("compaction-test")
+        assert job is not None
+        return asyncio.run(worker._run_compaction(
+            job_id, uid, deps, _BYOK, worker.ENCLAVE_SEMAPHORE,
+            claimed_by=str(job["claimed_by"])))
+
+    _run_one_job()
+    first_job_calls = len(refusals)
+    assert first_job_calls > 1, "first job should have had to shrink at least once"
+
+    # Well below the configured batch: the additive increase on the winning
+    # fold nudges it back up, so this is not the exact rung that succeeded.
+    stored = db.v2_effective_batch_cap(uid)
+    assert stored is not None and stored < worker._COMPACTION_BATCH, stored
+
+    refusals.clear()
+    _run_one_job()
+
+    # The second job starts from the remembered rung instead of the top, so it
+    # does not repeat the first job's ladder of refusals.
+    assert len(refusals) < first_job_calls, (first_job_calls, len(refusals))

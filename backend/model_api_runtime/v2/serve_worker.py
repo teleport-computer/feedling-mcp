@@ -3819,6 +3819,66 @@ async def _scheduler_loop(
             pass
 
 
+_BACKLOG_SCAN_INTERVAL_SEC = _positive_float_env(
+    "FEEDLING_V2_BACKLOG_SCAN_INTERVAL_SEC", "300"
+)
+_BACKLOG_SCAN_MIN = _positive_int_env("FEEDLING_V2_BACKLOG_SCAN_MIN", "200")
+_BACKLOG_SCAN_LIMIT = _positive_int_env("FEEDLING_V2_BACKLOG_SCAN_LIMIT", "200")
+
+
+async def _backlog_scan_loop(
+    stop_event: asyncio.Event, *, interval: float = _BACKLOG_SCAN_INTERVAL_SEC
+) -> None:
+    """周期性给积压过大的 V2 用户补一个 maintenance job。
+
+    其余四个 maintenance 入队点全部挂在 turn 上（回复成功后、coverage 降级、
+    自链 catchup、CAS 重试），所以「用户不说话 → 不折叠 → 积压不降 → 下次 turn
+    要跑更长的 catch-up → 更容易失败」是个闭环；刚切到 V2 的大积压用户更是没有
+    任何东西会踢第一脚。这个循环是唯一不需要用户开口的入口。
+
+    只入队、不做别的：`_run_compaction` 成功后会自己链下一个 `compaction_catchup`，
+    所以一个 job 就能把一整段积压折完（prod 实测手动入队一次把 1569 折到 10）。
+
+    候选筛选（含所有口径细节）在 `jobs_store.due_compaction_users`。这里同样
+    不做 leader-election，理由与 `_scheduler_loop` 完全一致：`enqueue_job` 的
+    single-flight 唯一索引让重复入队 coalesce 成同一行。
+    """
+    while not stop_event.is_set():
+        try:
+            due = await asyncio.to_thread(
+                jobs_store.due_compaction_users,
+                min_backlog=_BACKLOG_SCAN_MIN,
+                limit=_BACKLOG_SCAN_LIMIT,
+            )
+            for user_id, backlog in due:
+                try:
+                    await asyncio.to_thread(
+                        jobs_store.enqueue_job,
+                        user_id,
+                        "maintenance",
+                        reason="backlog_scan",
+                    )
+                    await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+                except Exception as enqueue_exc:  # noqa: BLE001 — 一个用户不拖累其余
+                    log.warning(
+                        "[v2.serve_worker] backlog scan enqueue failed user=%s: %s",
+                        user_id,
+                        enqueue_exc,
+                    )
+            if due:
+                log.info(
+                    "[v2.serve_worker] backlog scan enqueued=%s worst=%s",
+                    len(due),
+                    due[0][1],
+                )
+        except Exception as e:  # noqa: BLE001 — 瞬时故障绝不能杀掉这个循环
+            log.warning("[v2.serve_worker] backlog scan failed: %s", e)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
 _RECONCILE_INTERVAL_SEC = _positive_float_env(
     "FEEDLING_V2_RECONCILE_INTERVAL_SEC", "60"
 )
@@ -4075,6 +4135,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
         asyncio.create_task(_scheduler_loop(stop_event)),
         asyncio.create_task(_watchdog_loop(supervisor, worker_id, stop_event)),
         asyncio.create_task(_reconcile_loop(stop_event)),
+        asyncio.create_task(_backlog_scan_loop(stop_event)),
     ]
     try:
         # Each loop handles recoverable iteration failures internally.  An
