@@ -248,11 +248,19 @@ def test_compact_reports_reject_code_to_caller():
     assert seen == ["duplicate_of_existing_summary:0"]
 
 
+def _summarizable_batch():
+    """A batch above the verbatim threshold, so the provider path is exercised."""
+    return [
+        {"role": "user", "content": "y" * 500}
+        for _ in range(compaction._VERBATIM_FOLD_MAX_CHARS // 500 + 2)
+    ]
+
+
 def test_compact_segment_reports_reject_code_to_caller():
     seen = []
     out = asyncio.run(compaction.compact_segment(
         provider_config=object(),
-        old_messages=[{"role": "user", "content": "x"}],
+        old_messages=_summarizable_batch(),
         llm=_fake_llm_returning("抱歉，这些消息没有实质内容。"),
         reject_out=seen.append,
     ))
@@ -264,7 +272,7 @@ def test_accepted_fold_reports_no_reject_code():
     seen = []
     out = asyncio.run(compaction.compact_segment(
         provider_config=object(),
-        old_messages=[{"role": "user", "content": "x"}],
+        old_messages=_summarizable_batch(),
         llm=_fake_llm_returning("- summarized"),
         reject_out=seen.append,
     ))
@@ -447,3 +455,136 @@ def test_ledger_carries_the_route_announced_at_turn_start():
     assert seen[0]["provider"] == "anthropic"
     assert seen[0]["model"] == "claude-sonnet-4-6"
     assert seen[0]["input_tokens"] == 5059
+
+
+# --- thin batches: fold without a provider call -----------------------------
+#
+# usr_7f30 on prod sat at a frozen watermark 2026-07-24 → 07-27 because its
+# oldest pending batch was 60 rows of near-contentless chat (27 user rows of
+# 3-24 chars, 30 assistant rows of 4-71 chars, ~1.3 KB total). Any honest
+# summary of that is a handful of near-identical lines, so the all-or-nothing
+# bullet validator rejected the fold; the retry re-read the identical batch and
+# rejected it again, and shrinking the batch only made it MORE homogeneous.
+# A batch this small does not need to be summarized at all — keeping it verbatim
+# costs less than the summary would and cannot be refused.
+
+
+def _thin_prod_shaped_batch():
+    """usr_7f30's actual wedge shape: many rows, almost no content."""
+    rows = []
+    for i in range(27):
+        rows.append({"role": "user", "content": ["嗯", "好", "哈哈", "在的"][i % 4]})
+        rows.append({"role": "assistant", "content": ["好的～", "收到", "嗯嗯"][i % 3]})
+    return rows
+
+
+def test_thin_batch_folds_without_calling_the_provider():
+    calls = []
+
+    async def _llm(cfg, messages, **kw):
+        calls.append(messages)
+        return {"reply": "- unreachable"}
+
+    out = asyncio.run(compaction.compact_segment(
+        provider_config=object(),
+        old_messages=_thin_prod_shaped_batch(),
+        llm=_llm,
+    ))
+    assert calls == [], "a thin batch must never reach the provider"
+    assert out, "a thin batch must still produce a leaf so coverage advances"
+
+
+def test_thin_batch_leaf_passes_the_same_validator_as_a_model_reply():
+    # The verbatim leaf is stored exactly where a validated model reply would
+    # be, so it has to satisfy every rule that gates a model reply — otherwise
+    # we have merely moved the rejection downstream.
+    out = asyncio.run(compaction.compact_segment(
+        provider_config=object(),
+        old_messages=_thin_prod_shaped_batch(),
+        llm=_fake_llm_returning("- unreachable"),
+    ))
+    rendered, reject = compaction._validate_new_bullets(out, current_summary="")
+    assert reject == "", f"verbatim leaf rejected by its own validator: {reject}"
+    assert rendered == out
+
+
+def test_thin_batch_keeps_every_message_verbatim():
+    rows = [
+        {"role": "user", "content": "周五那家店"},
+        {"role": "assistant", "content": "订好了"},
+        {"role": "user", "content": "几点"},
+    ]
+    out = asyncio.run(compaction.compact_segment(
+        provider_config=object(),
+        old_messages=rows,
+        llm=_fake_llm_returning("- unreachable"),
+    ))
+    for row in rows:
+        assert row["content"] in out, f"verbatim fold dropped {row['content']!r}"
+
+
+def test_homogeneous_thin_batch_does_not_collide_with_itself():
+    # 40 byte-identical rows: the failure mode that makes a MODEL summary trip
+    # duplicate_within_batch. The verbatim leaf must not reproduce it.
+    rows = [{"role": "user", "content": "嗯"} for _ in range(40)]
+    out = asyncio.run(compaction.compact_segment(
+        provider_config=object(),
+        old_messages=rows,
+        llm=_fake_llm_returning("- unreachable"),
+    ))
+    _, reject = compaction._validate_new_bullets(out, current_summary="")
+    assert reject == "", f"verbatim leaf self-collided: {reject}"
+
+
+def test_batch_above_the_threshold_still_goes_to_the_provider():
+    calls = []
+
+    async def _llm(cfg, messages, **kw):
+        calls.append(messages)
+        return {"reply": "- summarized"}
+
+    fat = [
+        {"role": "user", "content": "x" * 400}
+        for _ in range(compaction._VERBATIM_FOLD_MAX_CHARS // 400 + 2)
+    ]
+    out = asyncio.run(compaction.compact_segment(
+        provider_config=object(), old_messages=fat, llm=_llm,
+    ))
+    assert len(calls) == 1, "a normal batch must still be summarized by the model"
+    assert out == "- summarized"
+
+
+def test_attachment_only_batch_folds_verbatim():
+    """Attachment rows reach compaction as short placeholders, never as bytes.
+
+    ``serve_worker._image_row`` / ``_file_row`` replace a multi-hundred-KB
+    payload with the caption or ``[image]``/``[file: name]``, so a batch of
+    attachments is exactly the thin, homogeneous shape a model summary cannot
+    express without repeating itself. Preserving it costs a few hundred chars
+    and no provider call at all.
+    """
+    calls = []
+
+    async def _llm(cfg, messages, **kw):
+        calls.append(messages)
+        return {"reply": "- unreachable"}
+
+    rows = [{"role": "user", "content": "[image]"} for _ in range(50)]
+    out = asyncio.run(compaction.compact_segment(
+        provider_config=object(), old_messages=rows, llm=_llm,
+    ))
+    assert calls == []
+    _, reject = compaction._validate_new_bullets(out, current_summary="")
+    assert reject == ""
+    assert "[image]" in out
+
+
+def test_empty_batch_is_not_rescued_by_the_verbatim_path():
+    # Contentless rows must keep their existing outcome (no leaf), so the
+    # caller's quarantine path still owns them.
+    out = asyncio.run(compaction.compact_segment(
+        provider_config=object(),
+        old_messages=[{"role": "user", "content": "  "}],
+        llm=_fake_llm_returning(""),
+    ))
+    assert out is None

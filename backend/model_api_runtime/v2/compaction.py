@@ -24,6 +24,14 @@ _MAX_NEW_BULLETS = 32
 _MAX_NEW_BULLET_CHARS = 1_000
 _MAX_NEW_BULLETS_CHARS = 8_000
 _DEFAULT_CHECKPOINT_SOURCE_CHARS = 120_000
+# Batches at or below this rendered size are folded verbatim instead of being
+# summarized — see :func:`_verbatim_fold`.  Sized against the shape that wedged
+# usr_7f30 on prod: 60 rows rendering to ~1.9 KB, so a 2 KB ceiling would have
+# turned on the estimate's error bar.  Still only ~3% of one fold's input budget
+# (``worker._COMPACTION_BATCH_CHARS``) and well under ``_MAX_NEW_BULLETS_CHARS``,
+# so a preserved batch always fits inside one storable leaf.  Above this, a
+# batch averages >65 chars per row and is worth a real summary.
+_VERBATIM_FOLD_MAX_CHARS = 4_000
 _MAX_CHECKPOINT_REDUCTION_LEVELS = 32
 _MAX_CHECKPOINT_PROVIDER_CALLS = 64
 
@@ -158,13 +166,79 @@ def _report_reject(reject_out: Callable[[str], None] | None, code: str) -> None:
         pass
 
 
-def _render_old_messages(old_messages: list[dict[str, Any]]) -> str:
+def _render_message_lines(old_messages: list[dict[str, Any]]) -> list[str]:
+    """One ``role: content`` line per source row — the single rendering of record.
+
+    ``worker._compaction_message_chars`` sizes batches against this exact shape,
+    and :func:`_verbatim_fold` reuses it so a deterministic leaf and a model
+    summary are built from byte-identical source text.
+    """
     lines = []
     for m in old_messages:
         role = str(m.get("role") or "")
         content = str(m.get("content") or "")
         lines.append(f"{role}: {content}")
-    return "\n".join(lines)
+    return lines
+
+
+def _render_old_messages(old_messages: list[dict[str, Any]]) -> str:
+    return "\n".join(_render_message_lines(old_messages))
+
+
+def _verbatim_fold(
+    old_messages: list[dict[str, Any]], *, max_chars: int
+) -> str | None:
+    """Deterministic leaf for a batch too thin to be worth summarizing.
+
+    Returns ``None`` whenever the batch should take the normal provider path:
+    nothing to preserve, or enough content that a real summary earns its cost.
+
+    A batch of a few dozen near-contentless turns ("嗯" / "好的～") has no honest
+    summary that a strict bullet validator will accept — every candidate is a
+    handful of near-identical lines, which trips ``duplicate_within_batch``, and
+    the retry re-reads the identical batch forever.  Shrinking makes it worse:
+    a smaller slice of the same chatter is *more* homogeneous.  usr_7f30 on prod
+    froze this way for three days (see ``_validate_new_bullets``).
+
+    Below ``max_chars`` the whole batch is smaller than the summary machinery
+    around it, so keeping it verbatim is both cheaper and lossless — and it
+    cannot be refused, because no model is asked.  The ordinal prefix keeps
+    byte-identical groups distinct, so the leaf cannot self-collide the way a
+    summary of the same batch does.  The result is validated before it is
+    returned: anything the validator would refuse falls back to the provider
+    rather than becoming an unstorable leaf.
+    """
+    if not old_messages:
+        return None
+    if not any(str(m.get("content") or "").strip() for m in old_messages):
+        # Contentless rows keep their existing outcome so the caller's
+        # quarantine path — not this shortcut — decides what happens to them.
+        return None
+    lines = _render_message_lines(old_messages)
+    if sum(len(line) + 1 for line in lines) > max_chars:
+        return None
+
+    # Leave headroom for the ordinal prefix and the " / " joins.
+    room = _MAX_NEW_BULLET_CHARS - 32
+    bullets: list[str] = []
+    group: list[str] = []
+    group_len = 0
+    for line in lines:
+        piece = line[:room]
+        if group and group_len + len(piece) + 3 > room:
+            bullets.append(" / ".join(group))
+            group, group_len = [], 0
+        group.append(piece)
+        group_len += len(piece) + 3
+    if group:
+        bullets.append(" / ".join(group))
+
+    total = len(bullets)
+    rendered = "\n".join(
+        f"- [{index}/{total}] {body}" for index, body in enumerate(bullets, 1)
+    )
+    validated, _reject = _validate_new_bullets(rendered, current_summary="")
+    return validated
 
 
 async def compact(
@@ -224,13 +298,23 @@ async def compact_segment(
     llm: Callable[..., Awaitable[Any]],
     usage_out: Callable[[dict | None], None] | None = None,
     reject_out: Callable[[str], None] | None = None,
+    verbatim_max_chars: int = _VERBATIM_FOLD_MAX_CHARS,
 ) -> str | None:
     """Summarize one exact source batch into one immutable leaf payload.
 
     Unlike :func:`compact`, this never sends the historical summary back to the
     provider and never returns a rewritten aggregate blob.  The caller advances
     coverage only when a complete, bounded bullet payload is returned.
+
+    A batch small enough to keep verbatim takes :func:`_verbatim_fold` and never
+    reaches the provider — no call, no usage, and no rejection are possible for
+    it.  Callers that count model calls therefore see 0 for such a fold, which
+    is accurate rather than a missing measurement.
     """
+
+    verbatim = _verbatim_fold(old_messages, max_chars=verbatim_max_chars)
+    if verbatim is not None:
+        return verbatim
 
     messages = [
         {"role": "system", "content": _SEGMENT_SYSTEM_PROMPT},
