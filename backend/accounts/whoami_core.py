@@ -49,4 +49,8 @@ def whoami_payload(store: UserStore) -> dict:
             tz = None
     if tz:
         resp["timezone"] = tz
+    # v6 加密开关：未设置 == 明文档。显式下发 "off" 而不是省略字段，免得各客户端
+    # 自己猜默认值。⚠️ 这里**不**按偏好裁剪 enclave_content_public_key_hex——
+    # 现役 iOS 用它封双收件人信封，Phase 3 发版前停发 = 全量写入中断。
+    resp["content_encryption"] = registry._get_user_content_encryption(store.user_id) or "off"
     return resp

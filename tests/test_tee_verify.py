@@ -384,3 +384,46 @@ def test_pending_race_window_local_only_row_silently_skipped_in_sample(backend_e
     assert report["ok"] is False
 
     assert [m for m in report["mismatches"] if m["item_id"] == "loc2"] == []
+
+
+def test_undecryptable_row_is_reported_not_fatal(backend_env, monkeypatch):
+    """一条解不开的密文行必须被记成 mismatch，而不能炸掉整趟 verify。
+
+    prod 2026-07-28 实测：某条 envelope 让 enclave 返回
+    ``enclave_http_403:{"error":"decrypt_failed: envelope missing body_ct"}``。
+    该异常不在抽样循环的 catch 列表里（当时只 catch PendingDeviceMigration）
+    → 冒泡冲垮整趟 verify → 再被 tee_sync_scheduler 的兜底 except 静默吞掉
+    → 24h 内 ``verify_ran`` 恒 false，unconverged_tables / requeue_backlog
+    全线失去量测能力，而外部只看得到一条 warning 日志。
+
+    与 replicate 侧 2026-07-15 已修的毒行是同一模式：一条坏行做队头阻塞。
+    修复语义：坏行计入 mismatch 并继续，**不得**当成「两库一致」而跳过——
+    那会用虚假的全绿换来更危险的静默。
+    """
+    uid = f"usr_{uuid.uuid4().hex[:8]}"
+    _seed(uid)
+    # 一条正常行（两侧一致）+ 一条解密必失败的毒行。两侧都放行，避免行数缺口
+    # 掩盖了「内容抽样阶段」的行为——本测试断言的正是抽样阶段不能夭折。
+    good_rds = _insert_rds_chat(uid, "good1", 10.0, "AAA")
+    _insert_tee_chat(uid, "good1", 10.0,
+                     transforms.plaintext_chat_doc(good_rds, _stub_decrypt))
+    _insert_rds_chat(uid, "poison1", 11.0, "POISON")
+    _insert_tee_chat(uid, "poison1", 11.0, {"body": "whatever", "ts": 11.0})
+
+    def _poison_decrypt(envelope, purpose):
+        if envelope.get("body_ct") == "POISON":
+            raise RuntimeError(
+                'enclave_http_403:{"error":"decrypt_failed: envelope missing body_ct"}')
+        return _stub_decrypt(envelope, purpose)
+
+    monkeypatch.setattr(verify, "_make_decrypt", lambda _uid: _poison_decrypt)
+
+    # 修复前：这一行直接抛 RuntimeError，整趟 verify 夭折。
+    report = verify.run(sample_rate=1.0)
+
+    bad = [m for m in report["mismatches"] if m["item_id"] == "poison1"]
+    assert bad, "解不开的行必须被记成 mismatch，而不是让整趟 verify 崩掉"
+    assert bad[0]["field"] == "<decrypt-failed>"
+    assert report["ok"] is False
+    # 毒行之外的对账照常完成 —— 证明 verify 没有半途夭折。
+    assert report["tables"]["chat_messages"]["rds_rows"] == 2

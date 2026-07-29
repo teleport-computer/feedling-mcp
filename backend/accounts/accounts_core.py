@@ -289,9 +289,15 @@ def users_set_preferences(store: UserStore, payload: dict):
     if has_tz and tz_raw is not None and not isinstance(tz_raw, str):
         return {"error": "timezone must be a string or null"}, 400
 
-    if not has_lang and not has_tz:
+    ce_raw = payload.get("content_encryption")
+    has_ce = "content_encryption" in payload
+    if has_ce and ce_raw is not None and not isinstance(ce_raw, str):
+        return {"error": "content_encryption must be a string or null"}, 400
+
+    if not has_lang and not has_tz and not has_ce:
         return {
-            "error": "provide archive_language and/or timezone (string or null)",
+            "error": "provide archive_language, timezone, and/or content_encryption "
+                     "(string or null)",
         }, 400
 
     # Validate timezone up front so an invalid zone can't half-apply the
@@ -320,12 +326,21 @@ def users_set_preferences(store: UserStore, payload: dict):
         if not registry._set_user_timezone(store.user_id, tz_raw):
             return {"error": "timezone must be a valid IANA zone or null"}, 400
 
+    if has_ce:
+        # v6 加密开关：只认 "on"/"off"（空=清除）。非法值整条请求 400，不半应用。
+        if not registry._set_user_content_encryption(store.user_id, ce_raw):
+            return {"error": 'content_encryption must be "on", "off", or null'}, 400
+
     tz_now = registry._get_user_timezone(store.user_id)
-    print(f"[users] {store.user_id} prefs archive_language={new_value or 'unchanged'} timezone={tz_now or 'unset'}")
+    ce_now = registry._get_user_content_encryption(store.user_id)
+    print(f"[users] {store.user_id} prefs archive_language={new_value or 'unchanged'} "
+          f"timezone={tz_now or 'unset'} content_encryption={ce_now or 'off(default)'}")
     return {
         "status": "updated",
         "archive_language": registry._get_user_archive_language(store.user_id),
         "timezone": tz_now or None,
+        # 未设置时回显 "off"：v6 默认明文，别让客户端自己猜缺字段的含义。
+        "content_encryption": ce_now or "off",
     }, 200
 
 

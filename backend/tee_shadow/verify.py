@@ -309,6 +309,20 @@ def _sample_ciphertext_content(key: str, cfg: dict, sample_rate: float,
                 # 得及落 pending 行——不是一个真实的内容 mismatch，跳过（行数
                 # 核算那一侧会照实反映出 rds>tee，若确实不该发生会在那里报出）。
                 continue
+            except Exception as e:  # noqa: BLE001
+                # 解不开（enclave 403 decrypt_failed / 网关抖动 / 毒行等）：**只
+                # 让这一行失败，不能冲垮整趟 verify**。2026-07-28 prod：一条
+                # "envelope missing body_ct" 让 verify 整趟抛异常，再被
+                # tee_sync_scheduler 的兜底 except 静默吞掉 → verify_ran 24h 恒
+                # false，收敛度彻底失去量测。与 replicate 侧 2026-07-15 已修的
+                # 毒行队头阻塞是同一模式。
+                #
+                # 记成 mismatch 而**不是** continue-skip：跳过等于宣称「两库一
+                # 致」，会用虚假的全绿掩盖真问题，比崩掉更危险。
+                mismatches.append({"table": key, "user_id": user_id,
+                                   "item_id": item_id, "field": "<decrypt-failed>",
+                                   "error": str(e)[:200]})
+                continue
             params = (user_id,) if item_col == "user_id" else (user_id, item_id)
             tee_row = dst.execute(
                 f"SELECT doc FROM {cfg['tee_table']} WHERE {item_cond}{tee_where_extra}",

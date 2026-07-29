@@ -720,7 +720,17 @@ def _decrypt_provider_key(enclave_url: str, api_key: str = "", envelope: dict | 
                           *, runtime_token: str = "") -> str:
     """JIT-decrypt a provider-key envelope via the enclave (purpose reuses the
     model_api config scheme). Plaintext is handed to the child via env. Auth is
-    the api_key, or a runtime token (Stage D zero-roster) when provided."""
+    the api_key, or a runtime token (Stage D zero-roster) when provided.
+
+    明文行（TEE 主库形态）本地直读：cutover 后 ``model_api_credentials`` 的
+    ``api_key_envelope`` 是 ``{body,…}``、没有 ``body_ct``，发给 enclave 只会拿回
+    ``decrypt_failed: envelope missing body_ct``，再被下面的 except 吞成空串——
+    空 key 一路带到 provider 就变成 401，根因彻底看不见。判据与
+    ``core.envelope.decrypt_provider_key_envelope`` 一致（``body_ct`` 优先）。"""
+    if isinstance(envelope, dict) and not envelope.get("body_ct"):
+        body = envelope.get("body")
+        if isinstance(body, str):
+            return body
     try:
         resp = _ENCLAVE_HTTP.post(f"{enclave_url.rstrip('/')}/v1/envelope/decrypt",
                                   headers=_auth_headers(api_key=api_key, runtime_token=runtime_token),

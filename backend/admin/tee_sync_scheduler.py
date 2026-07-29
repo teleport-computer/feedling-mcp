@@ -203,11 +203,21 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
                 len(v.get("user_diffs") or {}) for v in tables.values() if isinstance(v, dict))
             summary["requeue_backlog"] = sum(
                 v.get("requeue_backlog", 0) or 0 for v in tables.values() if isinstance(v, dict))
+            mism = rep.get("mismatches") or []
+            # 「解不开」与「内容不一致」处置完全不同：前者是 enclave/信封出事
+            # （2026-07-28 prod 的 missing body_ct），要立刻处理；后者是复制逻辑
+            # 问题。混在一个 mismatches 总数里等于把告警埋掉。
+            decrypt_failures = sum(
+                1 for m in mism
+                if isinstance(m, dict) and m.get("field") == "<decrypt-failed>")
             summary["report"]["verify"] = {
                 "ok": rep.get("ok"), "unconverged": unconv_tbls,
-                "mismatches": len(rep.get("mismatches") or []), "tables": tables}
-            log.info("[tee-sync] verify ok=%s unconverged_tables=%s unconverged_users=%s",
-                     summary["verify_ok"], summary["unconverged_tables"], summary["unconverged_users"])
+                "mismatches": len(mism), "decrypt_failures": decrypt_failures,
+                "tables": tables}
+            log.info("[tee-sync] verify ok=%s unconverged_tables=%s unconverged_users=%s "
+                     "decrypt_failures=%s",
+                     summary["verify_ok"], summary["unconverged_tables"],
+                     summary["unconverged_users"], decrypt_failures)
         except Exception as e:  # noqa: BLE001
             log.warning("[tee-sync] verify 失败: %s", e)
 

@@ -438,6 +438,28 @@ def _fetch_provider_key(api_url: str, enclave_url: str, runtime_token: str, *, s
         raise GenesisWorkerError(f"provider_key_envelope_fetch_failed:{type(e).__name__}") from e
     if not isinstance(envelope, dict):
         raise GenesisWorkerError("provider_key_envelope_missing")
+    return _provider_key_from_envelope(
+        envelope, enclave_url=enclave_url, runtime_token=runtime_token,
+        store=store, job_id=job_id)
+
+
+def _provider_key_from_envelope(envelope: dict, *, enclave_url: str,
+                                runtime_token: str, store=None,
+                                job_id: str = "") -> str:
+    """取 provider key：明文行本地直读，信封行才走 enclave。
+
+    cutover 后 ``model_api_credentials`` 的 ``api_key_envelope`` 是
+    ``{body,…}``、无 ``body_ct``（表同步在复制时已解密）。原样发给 enclave 会拿回
+    ``decrypt_failed: envelope missing body_ct``，genesis 入住流程直接失败。
+    判据与 ``core.envelope.decrypt_provider_key_envelope`` 一致（``body_ct`` 优先）。
+
+    这里不复用 core 那个函数：genesis worker 与 enclave 只经 HTTP 打交道，
+    走的是本模块自己的 ``_decrypt_envelope``（带 store/job_id 的审计参数）。
+    """
+    if not envelope.get("body_ct"):
+        body = envelope.get("body")
+        if isinstance(body, str):
+            return body
     return _decrypt_envelope(
         enclave_url,
         runtime_token,

@@ -799,6 +799,47 @@ def _set_user_timezone(user_id: str, tz: str | None) -> bool:
     return False
 
 
+_CONTENT_ENCRYPTION_VALUES = ("on", "off")
+
+
+def _get_user_content_encryption(user_id: str) -> str | None:
+    """Return the user's stored content_encryption preference ("on"/"off"),
+    or None when unset. Thin read mirroring _get_user_timezone; the caller owns
+    the default (v6: unset == plaintext == "off")."""
+    with _users_lock:
+        for u in _users:
+            if u.get("user_id") == user_id:
+                value = str(u.get("content_encryption") or "").strip().lower()
+                return value if value in _CONTENT_ENCRYPTION_VALUES else None
+    return None
+
+
+def _set_user_content_encryption(user_id: str, value: str | None) -> bool:
+    """Set (or clear, when value is falsy) the user's content_encryption
+    preference. Only "on"/"off" are accepted — an unrecognized value is rejected
+    rather than stored, so downstream format routing never sees a third state.
+    Returns True when the record was found and updated, False when the user is
+    unknown or the value is non-empty and invalid."""
+    normalized = str(value or "").strip().lower()
+    if normalized and normalized not in _CONTENT_ENCRYPTION_VALUES:
+        return False
+    with _users_lock:
+        for u in _users:
+            if u.get("user_id") == user_id:
+                # Unchanged value is a pure no-op — persist_user is a users-row
+                # upsert + TEE mirror + a cross-worker broadcast that makes EVERY
+                # worker reload the whole registry (see _set_user_timezone).
+                if normalized == str(u.get("content_encryption") or "").strip().lower():
+                    return True
+                if normalized:
+                    u["content_encryption"] = normalized
+                else:
+                    u.pop("content_encryption", None)
+                persist_user(u)
+                return True
+    return False
+
+
 def _find_user_entry_locked(user_id: str) -> dict | None:
     for user_entry in _users:
         if user_entry.get("user_id") == user_id:

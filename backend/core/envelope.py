@@ -67,6 +67,36 @@ def _model_api_key_encryption_material(store) -> tuple[bytes, bytes] | tuple[Non
     return user_pk, enclave_pk
 
 
+def decrypt_provider_key_envelope(envelope: dict, api_key: str | None, *,
+                                  runtime_token: str = "") -> bytes:
+    """取出 BYOK provider key，按行形状路由。
+
+    两种形状并存是 TEE 扶正期的常态：
+      - RDS（现状真源）：双收件人信封，有 ``body_ct`` → 走 enclave 解密。
+      - TEE 主库：表同步在复制时已解密，形状是
+        ``{body, id, owner_user_id, visibility}``、无 ``body_ct`` → **本地直读**。
+
+    明文分支绝不打 enclave：cutover 后 enclave 只服务加密档用户，明文档的读路径
+    不该再依赖它（也是「读路径不经 enclave 更快」的兑现点）。
+
+    ``body_ct`` 优先于 ``body``：两者并存只可能出现在迁移中间态，此时密文是真源，
+    反过来会读到过期的明文残留。
+    """
+    if not isinstance(envelope, dict):
+        raise ValueError("envelope_shape_unrecognized")
+    if envelope.get("body_ct"):
+        # 只在 runtime_token 非空时透传：api-key 调用方的下游入参必须与改造前
+        # 逐字一致（原调用点用 `**decrypt_kwargs` 达到同样效果）。无脑传空串会
+        # 让 tests/test_model_api_profiles_config_store.py 的断言失败。
+        kwargs = {"runtime_token": runtime_token} if runtime_token else {}
+        return enclave._decrypt_envelope_via_enclave(
+            envelope, api_key, purpose="model_api_provider_key", **kwargs)
+    body = envelope.get("body")
+    if isinstance(body, str):
+        return body.encode("utf-8")
+    raise ValueError("envelope_shape_unrecognized")
+
+
 def _build_shared_envelope_for_store(
     store,
     plaintext: bytes,

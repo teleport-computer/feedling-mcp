@@ -194,3 +194,129 @@ CI 部署步骤把 `<ENV_PREFIX>_TEE_DATABASE_URL` / `_FEEDLING_TEE_DUAL_WRITE` 
   restore 演练成功前 CVM 磁盘是数据唯一副本。
 - **重签证书**：用冷存的 `ca.key` 重跑 gen-certs 的 server 证书部分，redeploy 注入新
   `PG_SERVER_CERT_B64/KEY_B64`。
+
+## 5. 恢复演练与 RTO（2026-07-28 首次实测，test 环境）
+
+> 对应主计划 `docs/superpowers/plans/2026-07-23-tee-promotion-decrypt-removal.md`
+> Phase 0 Task 0.3。**演练结论：备份链可恢复、RPO≈0，但 `restore.sh` 现状下无法
+> 一把跑通**——三处需要人工干预（见 §5.3），扶正为唯一主库前应先修 §5.3 第 1 条。
+
+### 5.1 演练方法
+
+test 备份 → 本机一次性容器（**非** TEE 内，只验证备份可恢复性）：
+
+```bash
+docker run -d --name feedling-restore-drill --entrypoint /bin/bash \
+  -e WALG_LIBSODIUM_KEY=… -e WALG_S3_PREFIX=… \
+  -e AWS_ENDPOINT=… -e AWS_ACCESS_KEY_ID=… -e AWS_SECRET_ACCESS_KEY=… \
+  -e AWS_S3_FORCE_PATH_STYLE=true -e AWS_REGION=auto \
+  -e PGDATA=/var/lib/postgresql/data \
+  ghcr.io/teleport-computer/feedling-postgres:<prod 同款 tag> -c 'sleep infinity'
+docker exec -u postgres feedling-restore-drill restore.sh          # 取 LATEST
+docker exec -u postgres feedling-restore-drill \
+  /usr/lib/postgresql/17/bin/pg_ctl -D "$PGDATA" -l /tmp/pg.log start -w
+```
+
+机密取自 `~/documents/teleport/feedling-pg-test-secrets.txt` 的
+`TEST_WALG_*` / `TEST_PG_BACKUP_R2_*`（注意有 `TEST_` 前缀，且 compose 侧变量名是
+`PG_BACKUP_R2_*` → 容器内要映射成 wal-g 认的 `AWS_*`）。
+
+### 5.2 RTO / RPO 实测
+
+| 阶段 | 耗时 | 说明 |
+|---|---|---|
+| `wal-g backup-fetch`（130M） | **141s** | 从 R2 拉最新 base backup + 解密解压 |
+| WAL 回放至 promote | **240s** | PG 自报 `redo done … elapsed: 240.37 s`，跨 ~1 天 WAL |
+| 启动 + 参数修正 | ~30s | 含 §5.3 的人工干预 |
+| **RTO 合计** | **≈ 7 分钟** | ⚠️ 本机为 arm64 跑 amd64 镜像（Rosetta 模拟），**属上限**；原生 x86 应更快 |
+| **RPO** | **≈ 0** | 恢复点 `13:34:36 UTC`，演练启动为 `13:25` —— WAL 归档及时，几乎无数据损失 |
+
+### 5.3 演练发现的三个卡点（都需人工干预，建议修掉）
+
+1. **⚠️ `max_connections` 不足会让回放直接 FATAL（唯一的真缺陷，应修）**
+
+   ```
+   FATAL:  recovery aborted because of insufficient parameter settings
+   DETAIL: max_connections = 100 is a lower setting than on the primary server,
+           where its value was 400.
+   ```
+
+   线上 `max_connections=400` 是**部署参数注入的，不在备份的 `postgresql.conf` 里**，
+   恢复端起来是默认 100 → PG 拒绝回放。演练中靠手工往 `postgresql.conf` 追加
+   `max_connections = 400` 才继续。**建议 `restore.sh` 在写 recovery 配置那段
+   一并写入 `max_connections`（以及同类的 `max_worker_processes` /
+   `max_prepared_transactions` / `max_locks_per_transaction`，PG 对这些都有
+   "≥ primary" 的硬要求）**，否则真出事时会在这里卡住。
+
+2. **`pg_ctl` 不在默认 PATH**：交互式 `docker exec` 拿不到 `/usr/lib/postgresql/17/bin`，
+   直接敲 `pg_ctl` 得到 `exit 127`。必须用绝对路径。（与 §3 记的 cron PATH 坑同源。）
+
+3. **恢复出来的实例没有 `postgres` 角色**：备份来自 TEE 库，角色是
+   `feedling_owner` / `app` / `monitoring`。用 `psql -U postgres` 会得到
+   `FATAL: role "postgres" does not exist`；本地 socket 要用
+   `psql -U feedling_owner -d feedling`。**写恢复脚本/健康探针时别默认 postgres 角色。**
+
+### 5.4 一致性核对结果
+
+| 核对项 | 实库（test） | 恢复库 | 结论 |
+|---|---|---|---|
+| `alembic_tee_version` | `0005_snapshot_column_catchup` | 同 | ✅ 一致 |
+| public 表数 | 54 | 54 | ✅ 一致 |
+| 逐表行数 | — | — | ✅ **50/54 逐行一致** |
+
+有差异的 4 张全部是持续写入表，差量与「实库仍在写、恢复库停在 13:34:36」完全吻合，
+非数据丢失：`user_logs`(16123→16082)、`v2_worker_heartbeats`(130→128)、
+`agent_runtime_supervisor_heartbeats`(4→3)、`chat_r2_lifecycle`(227→226)。
+全部用户内容表（`chat_messages` 1097、`memory_moments` 133、`users` 69、`frames` 115
+等）逐行一致。
+
+### 5.5 收尾
+
+演练容器是一次性的，核完即删：`docker rm -f feedling-restore-drill`。
+**不要**把演练容器留着——它持有可解密备份的 `WALG_LIBSODIUM_KEY`。
+
+## 6. 本地原地重部署（机密轮换用；2026-07-29 test 实测通过）
+
+轮换 R2 / WAL-G 机密**不必走 GitHub Actions**——本地 `phala deploy` 直接注入即可
+（`pg-deploy.yml` 的本地等价物）。test 上完整跑通一次，**服务中断 < 1 分钟**
+（容器 `Exited (0)` → `Up (healthy)`，两次 15s 轮询之内）。
+
+### 6.1 四个必须守住的前提
+
+1. **镜像 tag 抄现役值，绝不抄旧的**。compose 里是 `REPLACE_SHA` 占位符，本地部署
+   要 sed 成 CVM 内 `docker ps` 显示的现役 tag（test 与 prod 的 tag **不同**）。
+   2026-07-24 base backup 全断就是重部署抄了旧 tag、丢掉 PATH 修复。替换后要断言
+   无 `REPLACE_SHA` 残留。
+2. **整份机密重带（11 个）**：原地更新漏一个就会被清空 → entrypoint fail-closed
+   起不来。部署前断言「11 行、无空值、无换行破坏」（证书是单行 base64，约
+   1579 / 2272 字符；`WALG_LIBSODIUM_KEY` 恰 64 hex）。
+3. **机密只落 0600 临时文件**，用 `phala deploy -e` 读，不拼进命令行（`ps`/日志
+   里不留明文）。
+4. **先确认 phala profile 与 CVM 身份**。test 在 `amiller-users-projects`、prod 在
+   `sxysuns-projects`；`phala switch` 可能没生效（实测踩到过停在 prod profile）。
+   脚本里把目标 uuid **写死**、并用 `phala cvms get <uuid>` 核对回显的 Name/App ID
+   再动手——不要依赖「当前选中的 profile 是对的」。
+
+### 6.2 命令
+
+```bash
+sed -E "s|feedling-postgres:REPLACE_SHA|feedling-postgres:${TAG}|" \
+  deploy/docker-compose.phala.postgres.yaml > /tmp/compose.yaml
+# 11 个机密写进 0600 的 /tmp/env（去掉机密文件里的 TEST_/PROD_ 前缀）
+phala deploy --cvm-id "$CVM_UUID" -c /tmp/compose.yaml -e /tmp/env
+```
+
+本地**不加** `--wait`（会假报超时），改为轮询 `phala ps <cvm>` 等 `healthy`。
+
+### 6.3 部署后验证清单（缺一不可）
+
+| 检查 | 命令 | 通过判据 |
+|---|---|---|
+| 容器恢复 | `phala ps <cvm>` | `Up … (healthy)`，且**镜像 tag 未变** |
+| **WAL 归档**（最关键） | `select * from pg_stat_archiver` | `last_archived_time` 是**部署之后**的时刻，`failed_count` 无新增 |
+| 备份链 | `wal-g backup-list` | 最新 base backup 与部署前一致，链未断 |
+| 库可用 | 连库查 | 表数、`alembic_tee_version`、`max_connections` 与部署前基线一致 |
+
+⚠️ `pg_stat_archiver` 是判断「机密注入是否正确」的**硬证据**——容器 healthy 只说明
+postgres 起来了，不代表 wal-g 拿到了可用的 R2 凭证。2026-07-24 那次就是容器健康、
+归档却在静默失败。轮换机密后必须看这一项。
