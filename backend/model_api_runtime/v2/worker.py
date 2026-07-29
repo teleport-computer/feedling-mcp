@@ -2058,6 +2058,18 @@ class TurnMetrics:
         if self._flushed:
             return
         self._flushed = True
+        # 终态 status 是 exhaustion 是否发生过的唯一确定事实来源。
+        # record_prompt_frontier_exhaustion() 的埋点分散在多条抛出路径上
+        # （_preflight_adaptive_builder / _run_wake / tool_loop 的 planner），
+        # prod 实测存在漏记：status 为 exhausted 而 count 仍为 0，使该列无法
+        # 用于判断是否触发过。以 status 兜底一次，且绝不覆盖已记录的真实次数。
+        if (
+            self.prompt_frontier_exhaustion_count == 0
+            and str(status).endswith(
+                v2_prompt_frontier.PromptFrontierExhausted.code
+            )
+        ):
+            self.prompt_frontier_exhaustion_count = 1
         latency_ms = int((time.monotonic() - self._started) * 1000)
         jobs_store.record_whole_turn_metric(
             self.job_id,
