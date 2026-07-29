@@ -4098,6 +4098,78 @@ def recent_runtime_health(
     }
 
 
+def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
+    """按 lane 的 token 开销汇总（content-free），喂 admin 值班台。
+
+    与 ``recent_runtime_health`` 的延迟分位数口径**相反**：那里只算成功回合
+    （失败超时会把 p95 拉到与故障同源的高位），这里算全部回合——失败回合照样
+    烧 token，provider 已经算过钱了。
+
+    刻意不加 ``LIMIT``：sum 聚合加采样上界会静默少报总量（"最新 N 条的 token
+    和"不是任何人想要的数字）。扫描量由 ``ix_v2_turn_metrics_lane_created_at``
+    控制，其前缀正是 ``lane``。
+
+    token 为空一律 ``None`` 而非 ``0``：provider 未回 usage 的调用应当降低
+    ``usage_coverage``，而不是被记成零 token 混进总量假装正常。
+    """
+    safe_hours = max(1, min(int(within_hours), 24 * 366))
+
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT lane,"
+                "  coalesce(sum(model_calls), 0)::bigint AS model_calls,"
+                "  coalesce(sum(usage_reported_calls), 0)::bigint"
+                "    AS usage_reported_calls,"
+                "  sum(prompt_tokens)::bigint AS prompt_tokens,"
+                "  sum(completion_tokens)::bigint AS completion_tokens,"
+                "  sum(cache_read_tokens)::bigint AS cache_read_tokens,"
+                "  sum(cache_miss_tokens)::bigint AS cache_miss_tokens "
+                "FROM v2_turn_metrics "
+                "WHERE created_at >= now() - make_interval(hours => %s) "
+                "GROUP BY lane",
+                (safe_hours,),
+            )
+            rows = cur.fetchall()
+
+    def _optional_int(row, key):
+        value = row.get(key)
+        return int(value) if value is not None else None
+
+    lanes: dict[str, dict] = {}
+    for row in rows:
+        model_calls = int(row["model_calls"] or 0)
+        usage_calls = int(row["usage_reported_calls"] or 0)
+        prompt_tokens = _optional_int(row, "prompt_tokens")
+        completion_tokens = _optional_int(row, "completion_tokens")
+        cache_read = _optional_int(row, "cache_read_tokens")
+        cache_miss = _optional_int(row, "cache_miss_tokens")
+        cache_denominator = (cache_read or 0) + (cache_miss or 0)
+        lanes[str(row["lane"] or "unknown")] = {
+            "model_calls": model_calls,
+            "usage_reported_calls": usage_calls,
+            "usage_coverage": (
+                float(usage_calls) / float(model_calls) if model_calls else None
+            ),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": (
+                prompt_tokens + completion_tokens
+                if prompt_tokens is not None and completion_tokens is not None
+                else None
+            ),
+            "cache_read_tokens": cache_read,
+            "cache_miss_tokens": cache_miss,
+            "cache_hit_ratio": (
+                float(cache_read or 0) / float(cache_denominator)
+                if cache_denominator
+                else None
+            ),
+        }
+
+    return {"window_hours": safe_hours, "lanes": lanes}
+
+
 def recent_prompt_cache_stats(
     *,
     lane: str = "chat",

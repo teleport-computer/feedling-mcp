@@ -232,3 +232,123 @@ def test_recent_runtime_health_includes_nonterminal_only_lanes():
     assert lanes["capture"]["failure_rate"] is None
     # capture["open"] >= 1（证明 capture 数据被保住了）
     assert lanes["capture"]["capture"]["open"] >= 1
+
+
+def _add_metric(
+    user_id: str,
+    lane: str,
+    *,
+    prompt: int | None,
+    completion: int | None,
+    failed: bool = False,
+    model_calls: int = 1,
+    usage_reported: int = 1,
+    cache_read: int | None = None,
+    cache_miss: int | None = None,
+    age_hours: int = 0,
+) -> None:
+    """直接写一行 v2_turn_metrics。job_id 传 None——该列的唯一索引允许多个 NULL。"""
+    seed_user(user_id)
+    jobs_store.record_whole_turn_metric(
+        None, user_id, lane,
+        prompt_tokens=prompt, completion_tokens=completion, latency_ms=1000,
+        model_calls=model_calls, retries=0, failed=failed,
+        status="turn_failed:providererror" if failed else "ok",
+        cache_read_tokens=cache_read, cache_miss_tokens=cache_miss,
+        usage_reported_calls=usage_reported,
+    )
+    if age_hours:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE v2_turn_metrics SET created_at=clock_timestamp()"
+                "-make_interval(hours => %s) WHERE user_id=%s",
+                (age_hours, user_id),
+            )
+
+
+def test_token_usage_by_lane_groups_by_lane():
+    _add_metric("u_tok_chat_1", "chat", prompt=1000, completion=100)
+    _add_metric("u_tok_chat_2", "chat", prompt=2000, completion=200)
+    _add_metric("u_tok_hb", "heartbeat", prompt=500, completion=50)
+
+    lanes = jobs_store.recent_token_usage_by_lane(within_hours=24)["lanes"]
+
+    assert lanes["chat"]["prompt_tokens"] == 3000
+    assert lanes["chat"]["completion_tokens"] == 300
+    assert lanes["chat"]["total_tokens"] == 3300
+    assert lanes["heartbeat"]["prompt_tokens"] == 500
+    assert lanes["heartbeat"]["total_tokens"] == 550
+
+
+def test_token_usage_by_lane_counts_failed_turns():
+    # 失败回合照样烧 token（provider 已经算过钱了），必须计入——这是它与延迟
+    # 分位数（只算成功回合）口径相反的地方。
+    _add_metric("u_tok_ok", "chat", prompt=1000, completion=100, failed=False)
+    _add_metric("u_tok_bad", "chat", prompt=3000, completion=0, failed=True)
+
+    lanes = jobs_store.recent_token_usage_by_lane()["lanes"]
+
+    assert lanes["chat"]["prompt_tokens"] == 4000     # 两条都算
+    assert lanes["chat"]["model_calls"] == 2
+
+
+def test_token_usage_by_lane_reports_none_not_zero_without_usage():
+    # provider 没回 usage 时不得记成 0 token 混进总量假装正常
+    _add_metric("u_tok_nousage", "chat", prompt=None, completion=None, usage_reported=0)
+
+    chat = jobs_store.recent_token_usage_by_lane()["lanes"]["chat"]
+
+    assert chat["prompt_tokens"] is None
+    assert chat["completion_tokens"] is None
+    assert chat["total_tokens"] is None
+    assert chat["model_calls"] == 1
+    assert chat["usage_reported_calls"] == 0
+    assert chat["usage_coverage"] == pytest.approx(0.0)
+
+
+def test_token_usage_by_lane_coverage_is_none_without_calls():
+    # model_calls 为 0 → 覆盖率没有分母，必须是 None 而非 0.0
+    _add_metric("u_tok_nocalls", "chat", prompt=None, completion=None,
+                model_calls=0, usage_reported=0)
+
+    chat = jobs_store.recent_token_usage_by_lane()["lanes"]["chat"]
+
+    assert chat["model_calls"] == 0
+    assert chat["usage_coverage"] is None
+
+
+def test_token_usage_by_lane_cache_hit_ratio():
+    _add_metric("u_tok_cache", "chat", prompt=1000, completion=100,
+                cache_read=600, cache_miss=400)
+
+    chat = jobs_store.recent_token_usage_by_lane()["lanes"]["chat"]
+
+    assert chat["cache_read_tokens"] == 600
+    assert chat["cache_miss_tokens"] == 400
+    assert chat["cache_hit_ratio"] == pytest.approx(0.6)
+
+
+def test_token_usage_by_lane_cache_ratio_is_none_without_cache_data():
+    _add_metric("u_tok_nocache", "chat", prompt=1000, completion=100,
+                cache_read=None, cache_miss=None)
+
+    chat = jobs_store.recent_token_usage_by_lane()["lanes"]["chat"]
+
+    assert chat["cache_hit_ratio"] is None
+
+
+def test_token_usage_by_lane_respects_window():
+    _add_metric("u_tok_recent", "chat", prompt=1000, completion=100)
+    _add_metric("u_tok_old", "chat", prompt=9000, completion=900, age_hours=48)
+
+    lanes_24 = jobs_store.recent_token_usage_by_lane(within_hours=24)["lanes"]
+    lanes_168 = jobs_store.recent_token_usage_by_lane(within_hours=168)["lanes"]
+
+    assert lanes_24["chat"]["prompt_tokens"] == 1000
+    assert lanes_168["chat"]["prompt_tokens"] == 10000
+
+
+def test_token_usage_by_lane_is_empty_without_history():
+    out = jobs_store.recent_token_usage_by_lane()
+    assert out["lanes"] == {}
+    assert out["window_hours"] == 24
