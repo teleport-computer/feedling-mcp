@@ -117,6 +117,42 @@ def test_activate_leaves_exactly_one_active(backend_env):
     assert actives[0]["id"] == r2
 
 
+def test_vision_selection_leaves_exactly_one_dedicated_route(backend_env):
+    uid = _uid()
+    seed_user(uid)
+    cid = _cred(uid)
+    r1 = db.model_api_route_upsert(uid, cid, "claude-sonnet-4-5", None)
+    r2 = db.model_api_route_upsert(uid, cid, "claude-haiku-4-5", None)
+
+    assert db.model_api_route_set_vision(uid, r1) is True
+    assert db.model_api_route_set_vision(uid, r2) is True
+
+    selected = [r for r in db.model_api_routes_list(uid) if r["is_vision"]]
+    assert [r["id"] for r in selected] == [r2]
+
+
+def test_credential_key_rotation_revokes_all_vision_proofs(backend_env):
+    uid = _uid()
+    seed_user(uid)
+    cid = _cred(uid)
+    r1 = db.model_api_route_upsert(uid, cid, "claude-sonnet-4-5", None)
+    r2 = db.model_api_route_upsert(uid, cid, "claude-haiku-4-5", None)
+    assert db.model_api_route_mark_vision_test(uid, r1, status="ok")
+    assert db.model_api_route_mark_vision_test(uid, r2, status="unsupported")
+
+    assert db.model_api_credential_update(
+        uid,
+        cid,
+        api_key_envelope={"v": 1, "body_ct": "rotated", "nonce": "n"},
+        api_key_hint="sk-a...999",
+    )
+
+    routes = db.model_api_routes_list(uid)
+    assert {route["vision_test_status"] for route in routes} == {"untested"}
+    assert {route["last_vision_test_error"] for route in routes} == {""}
+    assert {route["last_vision_test_at"] for route in routes} == {""}
+
+
 def test_active_route_carries_envelope_but_list_does_not(backend_env):
     uid = _uid()
     seed_user(uid)
@@ -446,17 +482,22 @@ def test_route_columns_timestamps_are_utc_invariant_under_session_timezone(backe
 
         conn.execute("RESET TIME ZONE")
 
-    # _ROUTE_COLUMNS' 0-indexed order: 12=last_test_at, 16=created_at, 17=updated_at
-    # (9 is context_window_tokens; 13/14/15 are the three error fields).
-    for idx, name in ((12, "last_test_at"), (16, "created_at"), (17, "updated_at")):
+    # _ROUTE_COLUMNS' 0-indexed order after the V2 vision fields:
+    # 13=last_test_at, 16=last_vision_test_at, 20=created_at, 21=updated_at.
+    for idx, name in (
+        (13, "last_test_at"),
+        (16, "last_vision_test_at"),
+        (20, "created_at"),
+        (21, "updated_at"),
+    ):
         assert baseline[idx] == shifted[idx], (
             f"{name} changed under SET TIME ZONE — to_char is reading the "
             f"session GUC instead of a fixed UTC offset: "
             f"{baseline[idx]!r} != {shifted[idx]!r}"
         )
     # created_at/updated_at are never blank for a freshly-created route.
-    assert baseline[16] and baseline[16].endswith("Z")
-    assert baseline[17] and baseline[17].endswith("Z")
+    assert baseline[20] and baseline[20].endswith("Z")
+    assert baseline[21] and baseline[21].endswith("Z")
 
 
 def test_roster_supports_responses_bool_conversion_from_real_column(backend_env):

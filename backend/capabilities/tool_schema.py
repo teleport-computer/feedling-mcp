@@ -294,8 +294,15 @@ DESCRIPTIONS: dict[str, str] = {
                        "must name a dimension that already exists — call identity_get "
                        "first to see the current dimensions and values. Optional "
                        "'reason'. To add or rename dimensions, use identity_patch."),
-    "memory_index": "List recent memory cards, optionally capped by limit.",
-    "memory_search": "Keyword-search memory cards by a required query string.",
+    "memory_index": ("List recent memory cards, optionally capped by limit. Use this "
+                     "once for an open-ended overview such as all memories or an "
+                     "overall relationship summary; do not pair it with or repeat "
+                     "memory_search in the same turn."),
+    "memory_search": ("Keyword-search memory cards by a required query string. Use "
+                      "this only when the user asks about a specific remembered "
+                      "subject, person, phrase, or event. Never use it for ordinary "
+                      "conversation, model/runtime identity, or an all-memory "
+                      "overview, and do not repeat it after one discovery result."),
     "memory_fetch": "Fetch specific memory cards by their ids.",
     "memory_write": ("Write, update, or delete memory cards. Each action needs an "
                      "'op': 'add' (supply a one-line 'summary' AND full 'content', "
@@ -322,7 +329,9 @@ DESCRIPTIONS: dict[str, str] = {
                         "revision control. For a downloadable .docx or .pdf target, "
                         "write clear Markdown-like source at that exact target path; "
                         "send_file renders the binary document. Use expected_revision=0 "
-                        "to create; /artifacts and /skills are read-only."),
+                        "to create. Generated files must use /workspace/<filename>; "
+                        "never write them under /artifacts or /skills because those "
+                        "namespaces are read-only."),
     "workspace_delete": ("Delete an editable virtual file at its exact revision. "
                          "Artifacts and skills cannot be deleted by the model."),
     TASK_TOOL: ("Run a bounded isolated subagent on one focused task. The child can "

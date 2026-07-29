@@ -43,6 +43,49 @@ def _envelope(user_id: str, msg_id: str) -> dict:
     }
 
 
+def test_v1_reply_persists_confirmed_activity_events(store, monkeypatch):
+    parent = store.append_chat(
+        "user", "chat", _envelope(store.user_id, "parent_v1_activity")
+    )
+    monkeypatch.setattr(
+        chat_core.chat_consumer, "_record_consumer_event", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        chat_core.chat_activity_store,
+        "resident_activity_rows",
+        lambda *_args: [{
+            "id": 1,
+            "job_id": None,
+            "kind": "tool_activity",
+            "created_at": 10.0,
+            "detail_json": {
+                "activity_id": "v1:call-1",
+                "tool_name": "memory_search",
+                "call_id": "v1:call-1",
+                "state": "success",
+                "memory_count": 2,
+            },
+        }],
+    )
+
+    body, status = chat_core.write_response(
+        store,
+        {
+            "envelope": _envelope(store.user_id, "reply_v1_activity"),
+            "source": "chat",
+            "reply_to_message_id": parent["id"],
+        },
+        consumer_id="resident-test",
+        consumer_info={},
+        allow_verify_reply=False,
+    )
+
+    assert status == 200, body
+    persisted = db.chat_get_strict(store.user_id, body["id"])
+    assert persisted["activity_events"][0]["name"] == "memory_search"
+    assert persisted["activity_events"][0]["memory_count"] == 2
+
+
 @pytest.fixture()
 def store(backend_env):
     res = make_client().post(

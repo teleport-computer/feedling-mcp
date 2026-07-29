@@ -132,6 +132,7 @@
 - **上下文注入了新成分，就要证明模型真读到了**：问一个**答案只存在于新注入段**的问题，判分（`tools/e2e/temporal_probe.py` 的做法：问"距上一条多久"，答"刚刚"判 FAIL）。"prompt 里有这段字符串"≠"模型用上了"。
 - **index 对齐的旁路数组必须喂毒样本**：任何"按消息序号对齐"的附加结构（时间戳块、引用表），它的 skip 分支必须和渲染循环**逐字一致**；用空 content、NaN 时间戳跑一遍——错开一位就是给每条消息标错时间，而且全程不报错。
 - **枚举"合法的东西"在开集上必然失败**：判据靠白名单/锚点列举时，先问这是闭集还是开集。称谓改写器四轮补白名单全被新反例推翻，最后连"产品复合词不接限定词"这个前提本身都被证伪——开集上唯一正确的动作是**不做**，换成 prompt 约束 + 遥测度量。
+- **gatekeep/自测"只跑改动到的文件"会漏——加表 / 改共享函数签名会触发 changed-file 集之外的守卫**（2026-07-29 vision/voice/activity 大整合，合进 test 后被 CI 连挂两轮）：① 新增 DB 表 → `test_tee_table_registry.py::test_every_rds_table_is_registered`（每张 RDS 表必须在 `tee_shadow/table_registry.py` 声明 lane）——迁移文件在 diff 里、但这个守卫测试不在；② 改了共享函数签名（如 voice 给 `call_agent_cli` 加 `stream_update`）→ 波及**所有** mock 它的测试，其中很多不 import 被改文件、不在 changed set 里。**对策：改动含"加表 / 改共享签名 / 平行运行时"时，gatekeep 必须按 CI 原命令跑这几套**——`test_tee_table_registry` + `test_tee_registry_guard_enforced`、`grep -l chat_resident_consumer tests/test_*.py | pytest`（consumer 耦合集）、Round-3 V2 套、Hosted V2 safety 套（命令见 `.github/workflows/ci.yml`）——**别只跑 changed files，那正是 CI 反复抓你的地方**。另：本机 Python 3.10、CI 是 3.12，签名/行为差异也可能只在 CI 冒出。
 
 ---
 

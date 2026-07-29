@@ -2893,6 +2893,23 @@ def get_chat_mutation_recovery_barrier(
             "  WHERE effect.user_id=%s AND job.lane='chat' "
             "    AND effect.input_frontier_seq>%s "
             "    AND (%s::bigint IS NULL OR effect.job_id<>%s)"
+            "    AND NOT ("
+            "      effect.effect_type='workspace_batch_encrypted_v1' "
+            "      AND effect.status='applied_with_results' "
+            "      AND effect.payload->'_applied_result_v1'->>'kind'="
+            "          'workspace_batch_v1' "
+            "      AND jsonb_typeof("
+            "          effect.payload->'_applied_result_v1'->'items'"
+            "      )='array' "
+            "      AND jsonb_array_length("
+            "          effect.payload->'_applied_result_v1'->'items'"
+            "      )>0 "
+            "      AND NOT EXISTS ("
+            "        SELECT 1 FROM jsonb_array_elements("
+            "          effect.payload->'_applied_result_v1'->'items'"
+            "        ) item WHERE item->>'status'<>'discarded'"
+            "      )"
+            "    )"
             ") SELECT MAX(input_frontier_seq),"
             "         COALESCE(bool_or(kind='mcp'),false),"
             "         COALESCE(bool_or(kind='platform'),false) "
@@ -3121,6 +3138,44 @@ def append_status_event(
     except Exception:  # noqa: BLE001 — best-effort; the INSERT already committed
         pass
     return event_id
+
+
+def chat_turn_activity_rows(user_id: str, turn_id: str) -> tuple[list[dict], list[dict]]:
+    """Return V2 jobs and display-safe status rows for one chat message id."""
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id, status, last_error FROM agent_jobs "
+                "WHERE user_id=%s AND lane='chat' AND trace_id=%s ORDER BY id ASC",
+                (str(user_id), str(turn_id)),
+            )
+            jobs = [dict(row) for row in cur.fetchall()]
+            cur.execute(
+                "SELECT event.id,event.job_id,event.user_id,event.kind,event.label,"
+                "event.detail_json,event.seq,"
+                "extract(epoch FROM event.created_at)::float8 AS created_at "
+                "FROM agent_status_events AS event "
+                "JOIN agent_jobs AS job ON job.id=event.job_id "
+                "WHERE event.user_id=%s AND job.user_id=%s AND job.lane='chat' "
+                "AND job.trace_id=%s ORDER BY event.id ASC LIMIT 500",
+                (str(user_id), str(user_id), str(turn_id)),
+            )
+            events = [dict(row) for row in cur.fetchall()]
+    return jobs, events
+
+
+def status_events_for_job(user_id: str, job_id: int) -> list[dict]:
+    """Read one V2 job's status stream for final reply projection."""
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT id,job_id,user_id,kind,label,detail_json,seq,"
+                "extract(epoch FROM created_at)::float8 AS created_at "
+                "FROM agent_status_events WHERE user_id=%s AND job_id=%s "
+                "ORDER BY id ASC LIMIT 500",
+                (str(user_id), int(job_id)),
+            )
+            return [dict(row) for row in cur.fetchall()]
 
 
 def list_status_events(user_id, *, after_id=0, limit=50) -> list[dict]:

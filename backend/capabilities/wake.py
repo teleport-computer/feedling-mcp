@@ -52,6 +52,8 @@ def schedule(store, *, api_key=None, runtime_token=None, params=None) -> Capabil
         value = str(params.get(key) or "").strip()
         if value:
             action[key] = value
+    if action.get("reason"):
+        action["note"] = action["reason"]
     return _apply(
         store.user_id,
         action,

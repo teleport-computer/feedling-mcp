@@ -40,6 +40,7 @@ deployment topology.
 | Object storage | Offload enabled large-object flows | Screen and Chat objects are normally ciphertext; diagnostics and compatibility uploads can be stored as provided |
 | Hosted runner | Poll work, assemble authorized context, invoke an agent, and return an encrypted result | Plaintext selected for an agent turn, the provider credential, and encrypted API traffic |
 | Model or push provider | Perform user-selected inference or device delivery | The plaintext and delivery material required by that external service |
+| ElevenLabs voice service | Transcribe and segment speech, manage interruption, and synthesize the selected voice | Call audio, transcript text, and the assistant text returned for speech |
 
 The component that stores a record is therefore not always the component that
 can interpret its protected body. Conversely, “encrypted at rest” does not mean
@@ -91,6 +92,36 @@ data.
 An [independent resident consumer](/docs/workflows/chat#independent-resident-loop)
 uses the same encrypted queue-and-reply protocol but runs in infrastructure the
 user or integrator controls instead of Feedling's hosted runner.
+
+### ElevenLabs voice calls
+
+1. An authenticated client creates a short-lived voice session with
+   `POST /v1/voice/sessions`. The response contains a call-bound token and the
+   public HTTPS Custom LLM endpoint; it does not expose the user's model
+   credential.
+2. ElevenLabs transcribes and segments the caller's speech, then sends each text
+   turn to `POST /v1/voice/chat/completions` with that session token.
+3. Feedling resolves the user's current Chat route and processes the transcript
+   through the same resident or Hosted Runtime V2 path used by typed messages,
+   including the same conversation history, persona, memory, and tools.
+4. Assistant text streams back over an OpenAI-compatible SSE response for
+   ElevenLabs to synthesize. The user and assistant turns remain in ordinary
+   Chat history in their original order, so the call is not imported a second
+   time after hang-up.
+
+Deployment prerequisite: the API service must set
+`FEEDLING_VOICE_GATEWAY_PUBLIC_URL` to the externally reachable HTTPS origin
+that serves `/v1/voice`. Feedling returns this origin to ElevenLabs as the
+Custom LLM endpoint; a private, non-HTTPS, missing, or otherwise invalid value
+causes `POST /v1/voice/sessions` to fail closed with
+`503 voice_gateway_not_configured` instead of returning an unusable internal
+address.
+
+ElevenLabs is an external plaintext recipient for call audio, transcripts, and
+assistant speech text. It does not receive the user's model API key. Voice
+session tokens are short-lived, signed, bound to one user and call, and are not
+valid as general Feedling API credentials. Incremental reply handoff state is
+encrypted and expires automatically.
 
 ### Memory
 
@@ -161,6 +192,7 @@ inference each have an explicit plaintext boundary.
 | --- | --- | --- |
 | User API key | Long-lived, full access to one user's public control and data plane | User-owned apps, integrations, and control-plane operations |
 | Runtime token | Short-lived, user-bound, and scope-limited | Hosted runner processes and background workers |
+| Voice session token | Short-lived and bound to one user and call | ElevenLabs Custom LLM requests to the voice gateway only |
 | Provider credential | Belongs to the configured external inference provider | Encrypted at rest, then decrypted for the authorized Runtime V2 turn that calls the provider |
 
 Runtime tokens do not replace API keys. Key issuance, account reset, MCP

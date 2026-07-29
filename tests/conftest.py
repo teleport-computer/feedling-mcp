@@ -115,6 +115,9 @@ if not _provisioned:
         "test_object_storage.py",
         "test_wake_bus.py",
         "test_chat_idempotency_unit.py",
+        "test_chat_activity_projection.py",
+        "test_chat_turn_activity_unit.py",
+        "test_access_mode_runtime_sync_unit.py",
         "test_semantic_analysis.py",
         "test_proactive_runtime_v2.py",
         "test_proactive_observability_v2.py",
@@ -224,6 +227,8 @@ def set_v2_runtime_owner(user_id: str, *, generation: int | None = None) -> None
     low-level worker/job tests intentionally bypass that assembly path and
     therefore opt in through this helper before claiming work.
     """
+    import db
+
     with db.get_pool().connection() as conn:
         conn.execute(
             "INSERT INTO v2_runtime_state "

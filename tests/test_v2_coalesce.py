@@ -75,6 +75,29 @@ def test_seq_native_path_keeps_same_timestamp_messages_in_db_order():
     assert cursor == 12
 
 
+def test_seq_native_path_preserves_current_image_routing_metadata():
+    image = {
+        **_msg("image-1", "user", 100.0, "这是什么东西"),
+        "seq": 11,
+        "has_image": True,
+        "image_mime": "image/jpeg",
+        "vision_route_id": "vision-route-1",
+    }
+
+    coalesced, cursor = v2_coalesce.coalesce_pending([image], since_seq=10)
+
+    assert cursor == 11
+    assert coalesced == [{
+        "id": "image-1",
+        "ts": 100.0,
+        "content": "这是什么东西",
+        "seq": 11,
+        "has_image": True,
+        "image_mime": "image/jpeg",
+        "vision_route_id": "vision-route-1",
+    }]
+
+
 def test_seq_native_path_fails_closed_on_missing_identity():
     import pytest
 

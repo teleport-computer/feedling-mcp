@@ -107,7 +107,11 @@ def _patch_tool_effect_encryption(monkeypatch):
             {
                 "id": item_id,
                 "owner_user_id": store.user_id,
+                "v": 1,
                 "body_ct": base64.b64encode(plaintext).decode("ascii"),
+                "nonce": "nonce",
+                "K_user": "sealed-user-key",
+                "K_enclave": "sealed-enclave-key",
             },
             "",
         )
@@ -470,13 +474,22 @@ def test_chat_intermediate_reply_tool_tail_with_reasoning_suppressed(monkeypatch
         "run_capability",
         lambda action_type, store, **kwargs: _FakeCapResult({"snippet": "r"}),
     )
-    _patch_real_write(monkeypatch)
+    # The round carries reasoning (the torn head), which the worker surfaces via
+    # the envelope path — stub it (as the reasoning-surfacing test does) so the
+    # sealed bodies are readable and no unwired-assembly error masks the check.
+    _stub_envelope_build(monkeypatch)
+    # Same structure as test_degenerate_intermediate_is_dropped_before_real_final_
+    # reply: a real tool call (web_search) rides alongside the suppressed reply so
+    # the loop continues to the terminal reply, isolating the suppression itself.
     _script_provider(
         monkeypatch,
         [
             {
                 "reply": "",
-                "tool_calls": [_tc("r1", "reply", text=_TORN_TAIL)],
+                "tool_calls": [
+                    _tc("r1", "reply", text=_TORN_TAIL),
+                    _tc("s1", "web_search", query="x"),
+                ],
                 "reasoning": _TORN_HEAD,
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1},
             },
@@ -491,6 +504,7 @@ def test_chat_intermediate_reply_tool_tail_with_reasoning_suppressed(monkeypatch
 
     assert status == "completed"
     bubbles = [b["body_ct"] for b in _bubbles(uid)]
+    # THE invariant: the torn tail never reaches a bubble; the real terminal does.
     assert _TORN_TAIL not in bubbles
     assert bubbles == ["在的，怎么了"]
 
@@ -658,6 +672,69 @@ def test_chat_mixed_valid_invalid_workspace_batch_applies_valid_call(
     ]
     assert captured["results"][0].content == "ok: workspace_write applied"
     assert captured["results"][1].content.startswith("error: unparseable args")
+
+
+def test_voice_turn_publishes_all_applied_bubbles_once_in_order(monkeypatch):
+    uid = "u_toolloop_voice_multi_bubble"
+    conftest.seed_user(uid)
+    _reset(uid)
+    user_doc = _user_doc("voice-user-1", "给我分两条回答")
+    user_doc.update(
+        voice_call_id="voice-call-1",
+        voice_turn_id="voice-turn-1",
+    )
+    db.chat_append_strict(uid, "voice-user-1", 10.0, user_doc, 5_000)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-voice-multi")
+    _patch_tool_effect_encryption(monkeypatch)
+    published: list[tuple[str, dict]] = []
+
+    async def direct_loop(**kwargs):
+        await kwargs["on_reply"]("这是第一条。", final=False)
+        await kwargs["on_reply"]("这是第二条。", final=True)
+        return worker.v2_tool_loop.LoopOutcome(
+            final_text="这是第二条。",
+            rounds=1,
+            stop_reason="final_text",
+            replied_intermediate=True,
+        )
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", direct_loop)
+    base_deps = _late_input_deps(uid, [])
+    deps = worker.TurnDeps(
+        read_messages=base_deps.read_messages,
+        read_messages_after_seq=base_deps.read_messages_after_seq,
+        resolve_provider=base_deps.resolve_provider,
+        mint_enclave_token=base_deps.mint_enclave_token,
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+        web_tools_enabled=base_deps.web_tools_enabled,
+        publish_voice_reply=lambda user_id, **kwargs: published.append(
+            (user_id, kwargs)
+        ),
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    bubbles = _bubbles(uid)
+    assert [
+        base64.b64decode(row["body_ct"]).decode("utf-8") for row in bubbles
+    ] == ["这是第一条。", "这是第二条。"]
+    assert len(published) == 1
+    published_user, published_turn = published[0]
+    assert published_user == uid
+    assert published_turn["call_id"] == "voice-call-1"
+    assert published_turn["turn_id"] == "voice-turn-1"
+    assert published_turn["message_id"]
+    assert published_turn["text"] == "这是第一条。\n\n这是第二条。"
 
 
 def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
@@ -940,6 +1017,96 @@ def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
     assert v2_cursor.load_seq(core_store.get_store(uid)) == db.chat_seq_for_msg_id(
         uid, "B"
     )
+
+
+def test_ordered_chat_replies_settle_each_user_message_separately(monkeypatch):
+    uid = "u_toolloop_ordered_replies"
+    conftest.seed_user(uid)
+    _reset(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM user_blobs WHERE user_id=%s AND kind='model_api_runtime'",
+            (uid,),
+        )
+    db.chat_append_strict(uid, "A", 10.0, _user_doc("A", "first A"), 5000)
+    generation = db.get_runtime_generation(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat", expected_generation=generation)
+    job = jobs_store.claim_next_job("w-ordered-replies")
+
+    monkeypatch.setattr(
+        worker,
+        "_build_encrypted_reply_effect_payload",
+        lambda _store, text, *, effect_id, reply_through_seq=None: {
+            "text": text,
+            "reply_through_seq": reply_through_seq,
+        },
+    )
+    monkeypatch.setattr(
+        cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({})
+    )
+    written: list[str] = []
+    deps = _late_input_deps(uid, written)
+    deps.ordered_chat_replies = True
+    deps.read_summary = lambda _uid: ("", 0.0, 0)
+    deps.read_tail = lambda _uid, _watermark, _limit: [
+        {"id": "A", "ts": 10.0, "role": "user", "content": "first A"}
+    ]
+    calls = []
+
+    async def provider(_config, messages, *, tools=None, **_kwargs):
+        calls.append(list(messages))
+        assert worker.context.ORDERED_REPLY_TARGET_POLICY in messages[0]["content"]
+        assert any(
+            isinstance(message, dict) and message.get("content") == "first A"
+            for message in messages
+        )
+        assert not any(
+            isinstance(message, dict) and message.get("content") == "late B"
+            for message in messages
+        )
+        seq, same_job_id = db.chat_append_and_enqueue(
+            uid,
+            "B",
+            20.0,
+            _user_doc("B", "late B"),
+            5000,
+            "chat",
+            expected_generation=generation,
+        )
+        assert seq > 0 and same_job_id == job_id
+        return _text_round("answer A")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 1
+    assert written == ["answer A"]
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == db.chat_seq_for_msg_id(
+        uid, "A"
+    )
+    with db.get_pool().connection() as conn:
+        successor = conn.execute(
+            "SELECT status,reason FROM agent_jobs "
+            "WHERE user_id=%s AND id<>%s ORDER BY id DESC LIMIT 1",
+            (uid, job_id),
+        ).fetchone()
+        reply_payload = conn.execute(
+            "SELECT payload FROM v2_effect_outbox "
+            "WHERE user_id=%s AND effect_type=%s ORDER BY enqueue_seq DESC LIMIT 1",
+            (uid, v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE),
+        ).fetchone()[0]
+    assert successor == ("pending", "ordered_followup")
+    assert reply_payload["reply_to_message_id"] == "A"
 
 
 def test_new_turn_after_intermediate_failure_starts_after_failure_cursor(

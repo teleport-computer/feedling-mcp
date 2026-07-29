@@ -36,6 +36,7 @@ EXPECTED_BODYLESS_POSTS = {
     ("post", "/v1/model_api/test"),
     ("post", "/v1/model_api/routes/{route_id}/activate"),
     ("post", "/v1/model_api/routes/{route_id}/test"),
+    ("post", "/v1/vision/routes/{route_id}/test"),
     ("post", "/v1/proactive/scheduled/fire"),
 }
 
@@ -64,8 +65,12 @@ EXPECTED_API_KEY_ONLY_OPERATIONS = {
 
 EXPECTED_CORE_BODY_REFS = {
     ("post", "/v1/model_api/chat/send"): "HostedChatSendRequest",
+    ("put", "/v1/vision/config"): "VisionConfigUpdateRequest",
+    ("post", "/v1/vision/config"): "VisionRouteCreateRequest",
+    ("post", "/v1/vision/observe"): "VisionObserveRequest",
     ("post", "/v1/chat/message"): "ChatTransportRequest",
     ("post", "/v1/chat/response"): "ChatResponseRequest",
+    ("post", "/v1/chat/turn-activity/{turn_id}/events"): "ChatActivityEventRequest",
     ("delete", "/v1/chat/history"): "ChatHistoryClearRequest",
     ("post", "/v1/memory/index"): "MemoryIndexRequest",
     ("post", "/v1/memory/fetch"): "MemoryFetchRequest",
@@ -82,6 +87,7 @@ EXPECTED_HEADER_OPERATIONS = {
         "x-feedling-consumer-id",
         "x-feedling-consumer-version",
         "x-feedling-consumer-commit",
+        "x-feedling-consumer-capabilities",
         "x-feedling-consumer-compat-commit",
         "x-feedling-decrypt-status",
         "x-feedling-decrypt-checked-at",
@@ -91,6 +97,7 @@ EXPECTED_HEADER_OPERATIONS = {
         "x-feedling-consumer-id",
         "x-feedling-consumer-version",
         "x-feedling-consumer-commit",
+        "x-feedling-consumer-capabilities",
     },
     ("put", "/v1/genesis/imports/{job_id}/chunks/{seq}"): {
         "x-envelope-meta",
@@ -172,8 +179,14 @@ def test_public_operation_and_parameter_inventory(
     # 149 since GET /v1/model_api/usage (provider balance/usage snapshot).
     # 150 since POST /v1/model_api/models (BYOK model catalog listing, has a body).
     # 151 since GET /v1/perception/app_close (app_open's "is closed" trigger counterpart).
-    assert len(operations) == 151
-    assert sum("requestBody" in operation for operation in operations.values()) == 69
+    # 152 since GET /v1/chat/turn-activity/{turn_id} (V2 activity read model).
+    # 153 and 70 bodies since V1 resident tool-activity event ingest.
+    # Vision routing adds GET/PUT/POST config, POST route test, and the
+    # authenticated resident observer exchange; three mutations carry bodies.
+    # 160 since the voice session and OpenAI-compatible Custom LLM endpoints;
+    # both accept compatibility JSON envelopes, hence 73 -> 75 bodies.
+    assert len(operations) == 160
+    assert sum("requestBody" in operation for operation in operations.values()) == 75
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")
