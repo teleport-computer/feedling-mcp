@@ -2403,6 +2403,12 @@ def _runtime_health_summary(*, within_hours: int = 24) -> dict:
     }
 
 
+# Injected by the assembly layer (asgi_app.py); the real implementation is
+# model_api_runtime.v2.jobs_store.recent_token_usage_by_lane.
+def _runtime_token_by_lane(*, within_hours: int = 24) -> dict:
+    return {"window_hours": within_hours, "lanes": {}}
+
+
 # 本次新增的两个 Runtime 视图页共用这一份样式。刻意没有去改造既有 6 个视图页
 # 各自内联的 style——那是独立重构，不该混在功能改动里。
 # 普通字符串（非 f-string），花括号无需转义。

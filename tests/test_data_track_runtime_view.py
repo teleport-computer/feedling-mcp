@@ -573,3 +573,74 @@ def test_render_runtime_health_page_declares_window_difference(bound_request):
     html_out = _dt._render_runtime_health_page(_payload(), _tokens())
     assert "固定近 30 天" in html_out
     assert "不是 bug" in html_out
+
+
+# ---- Task 3: 接线 —— 窗口算一次传两处 ----
+
+
+def _fake_tokens(**kw) -> dict:
+    return {
+        "window_hours": kw.get("within_hours", 24),
+        "lanes": {"chat": {
+            "model_calls": 10, "usage_reported_calls": 9, "usage_coverage": 0.9,
+            "prompt_tokens": 500_000, "completion_tokens": 20_000,
+            "total_tokens": 520_000, "cache_read_tokens": 300_000,
+            "cache_miss_tokens": 200_000, "cache_hit_ratio": 0.6,
+        }},
+    }
+
+
+def test_runtime_view_passes_same_window_to_both_data_functions(client, monkeypatch):
+    # 方案 B 的核心风险：两个数据函数的窗口必须同步。窗口在 page_html 里算一次、
+    # 传给两处，因此不可能出现一个 24 小时、一个 720 小时。
+    seen = {}
+
+    def _health(**kw):
+        seen["health"] = kw.get("within_hours")
+        return _fake_summary(**kw)
+
+    def _tokens(**kw):
+        seen["tokens"] = kw.get("within_hours")
+        return _fake_tokens(**kw)
+
+    monkeypatch.setattr(_dt, "_runtime_health_summary", _health)
+    monkeypatch.setattr(_dt, "_runtime_token_by_lane", _tokens)
+
+    client.get("/admin/data-track?view=runtime&hours=168", headers=_admin_headers())
+    assert seen["health"] == 168
+    assert seen["tokens"] == 168
+
+    client.get("/admin/data-track?view=runtime&hours=99999", headers=_admin_headers())
+    assert seen["health"] == 24      # 非法值两处一起回落
+    assert seen["tokens"] == 24
+
+
+def test_runtime_view_renders_token_columns_end_to_end(client, monkeypatch):
+    monkeypatch.setattr(_dt, "_runtime_health_summary", _fake_summary)
+    monkeypatch.setattr(_dt, "_runtime_token_by_lane", _fake_tokens)
+    page = client.get("/admin/data-track?view=runtime", headers=_admin_headers()).get_data(as_text=True)
+    assert "token 入/出" in page
+    assert "500.0k" in page
+    assert "60.0%" in page
+
+
+def test_runtime_view_degrades_when_token_function_fails(client, monkeypatch):
+    # 任一数据源炸掉都走同一个降级页，且不外泄异常细节
+    def _boom(**_kw):
+        raise RuntimeError("token pool exhausted")
+
+    monkeypatch.setattr(_dt, "_runtime_health_summary", _fake_summary)
+    monkeypatch.setattr(_dt, "_runtime_token_by_lane", _boom)
+    res = client.get("/admin/data-track?view=runtime", headers=_admin_headers())
+    body = res.get_data(as_text=True)
+    assert res.status_code == 200
+    assert "Runtime 健康数据暂时取不到" in body
+    assert "token pool exhausted" not in body
+
+
+def test_runtime_token_by_lane_is_wired_to_jobs_store():
+    # 装配段必须把桩换成真实实现，否则 token 列永远空白而不报任何错
+    import asgi_app  # noqa: F401
+    from model_api_runtime.v2 import jobs_store
+
+    assert _dt._runtime_token_by_lane is jobs_store.recent_token_usage_by_lane
