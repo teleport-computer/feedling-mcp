@@ -105,8 +105,10 @@ async def whoami_cached(ctx: AuthContext) -> dict:
 
     # inflight 注册表按 (当前事件循环, h) 隔离。asyncio.Future 绑定创建它的 loop，
     # 跨 loop `await` 会抛 RuntimeError（got Future attached to a different loop）。
-    # 生产是单 worker 单事件循环，key 里的 loop 恒定 → singleflight 照常把同凭证
-    # 并发冷 miss 收敛为一次；多 loop 嵌入（如线程各自 asyncio.run）时各 loop 各自
+    # 生产是多 worker 进程（prod FEEDLING_ENCLAVE_WORKERS=4），但 _whoami_cache /
+    # _whoami_inflight 都是进程本地的，每个 worker 进程内只有一个事件循环 → key 里的
+    # loop 在进程内恒定，singleflight 照常把同凭证并发冷 miss 收敛为一次（代价只是
+    # 每进程各付一次冷 miss，无跨进程共享）；多 loop 嵌入（如线程各自 asyncio.run）时各 loop 各自
     # 独立飞，正确性优先（跨 loop 本就无法共享同一个 Future）。缓存字典
     # _whoami_cache 是纯数据、loop 无关，仍按 h 共享。entry 在 finally 弹出，
     # 不会把 loop 引用留过一次 flight。
