@@ -291,7 +291,7 @@ def _emit_tool_trace(args, exit_code, dur_ms):
                 "actor": "vps_resident",
                 "dur_ms": rounded_ms,
             }},
-            timeout=1.0,
+            timeout=5.0,
         )
     except Exception:
         pass
@@ -356,13 +356,29 @@ def _emit_turn_activity(args, activity_id, state, *, dur_ms=None, exit_code=0):
             payload["result_code"] = "ok" if int(exit_code or 0) == 0 else "tool_error"
             if int(exit_code or 0) == 0:
                 payload.update(_memory_activity_metadata(tool_name, _LAST_TOOL_OUTPUT))
-        _http_json(
-            "POST",
-            f"{api_url.rstrip('/')}/v1/chat/turn-activity/{urllib.parse.quote(turn_id, safe='')}/events",
-            auth,
-            payload=payload,
-            timeout=1.0,
+        url = (
+            f"{api_url.rstrip('/')}/v1/chat/turn-activity/"
+            f"{urllib.parse.quote(turn_id, safe='')}/events"
         )
+        # The terminal transition is the durable evidence the completed chat
+        # bubble needs. Test/VPS round trips can legitimately exceed one second,
+        # so give it a bounded retry instead of silently dropping the tool from
+        # the timeline. The running transition stays fire-once to avoid delaying
+        # the tool before its real work begins.
+        attempts = 2 if state != "running" else 1
+        timeout = 5.0 if state != "running" else 2.0
+        for attempt in range(attempts):
+            status, _body = _http_json(
+                "POST",
+                url,
+                auth,
+                payload=payload,
+                timeout=timeout,
+            )
+            if 200 <= int(status or 0) < 300:
+                break
+            if attempt + 1 < attempts:
+                time.sleep(0.15)
     except Exception:
         pass
 
