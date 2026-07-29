@@ -26,6 +26,9 @@ change must not be interpreted as an API guarantee.
   chronological Chat history. ElevenLabs continues to handle transcription,
   interruption, and speech synthesis, but never receives the user's model API
   key. Voice reply handoff state is encrypted and expires automatically.
+  Deployments must set `FEEDLING_VOICE_GATEWAY_PUBLIC_URL` to the public HTTPS
+  API origin; missing, private, or non-HTTPS values cause voice-session
+  creation to fail closed with `503 voice_gateway_not_configured`.
 
 - **A new `GET /v1/perception/app_close` endpoint reports app closures,
   mirroring the existing `app_open` shortcut.** It accepts the same `app`

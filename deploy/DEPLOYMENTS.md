@@ -148,6 +148,16 @@ runner 侧的 serve-worker 完全一致。
 | `FEEDLING_HOSTED_RUNTIME_POLICY` | `"dual"` | backend 与 serve-worker 都设，取代旧的 `"v2_only"` 字面量 |
 | `FEEDLING_RUNTIME_DEFAULT_DESIRED` | `"resident"` | 无 allowlist 记录的账号默认 fence；保证部署瞬间行为与部署前一致 |
 
+**Voice 公网回调**：主 CVM 的 `backend` 还必须设置
+`FEEDLING_VOICE_GATEWAY_PUBLIC_URL`，并与同一 compose 的 ingress 域名一致：
+prod=`https://api.feedling.app`、test=`https://test-api.feedling.app`、
+pre=`https://pre-api.feedling.app`。这三个值是 compose 字面量而非加密 env：
+它们决定 voice session 返回给 ElevenLabs 的 Custom LLM 目标，属于信任配置，
+必须进入 measured `compose_hash`。改域名时按正常主 CVM 发布流程重部署，并由
+CI 把 dstack 实际计算的新 hash 发布到对应 Sepolia AppAuth 合约；不能只改 live
+env 绕过 attestation。缺失或不是公网 HTTPS 时，`POST /v1/voice/sessions`
+fail closed 为 `503 voice_gateway_not_configured`。
+
 **P3 部署序（prod）**（design doc §7b）：
 
 1. **Migration 先行**：alembic 跑 V2 表（0017/0018 系）+ `v2_user_allowlist`。

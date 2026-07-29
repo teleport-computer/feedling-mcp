@@ -198,6 +198,11 @@ services:
       # conns/worker → -w2≈36, safe.
       FEEDLING_BACKEND_WORKERS: "${FEEDLING_BACKEND_WORKERS:-1}"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
+      # Public HTTPS origin returned by POST /v1/voice/sessions for the
+      # ElevenLabs Custom LLM callback. Keep this literal aligned with ingress
+      # ROUTING_MAP above: the callback host is a trust decision and therefore
+      # belongs in the measured compose_hash, not the mutable encrypted env.
+      FEEDLING_VOICE_GATEWAY_PUBLIC_URL: "https://test-api.feedling.app"
       # This deploy serves test-api, so skill_url must point at io-onboarding's
       # test branch. Code defaults to "main" (so prod just works); the test
       # deploy overrides it here. See core/util.io_onboarding_branch().
