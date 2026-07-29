@@ -191,6 +191,48 @@ typo-guard 模式）：
 两个 TEE 实库都已 `0001→0004`、各 54 张表；日后的新 revision 一律走这个通道，不再
 手动执行。
 
+> ⚠️ **通道写好 ≠ 通道能用。** `tee-migrate.yml` 依赖 4 个 repo secret
+> （`{TEST,PROD}_TEE_MIGRATION_DATABASE_URL`、`{TEST,PROD}_TEE_PG_CA_PEM`），
+> **截至 2026-07-29 这 4 个还没建**，所以 workflow 目前跑不起来，`alembic_tee`
+> 实际仍是手工执行。
+>
+> 这个缺口已经吃过一次：`0007_chat_activity_snapshot` 在 07-29 随新功能合进
+> `test`，登记、迁移、SKIP 判定全都写对了，但**没有人执行它**。TEE 库停在 0006，
+> `chat_turn_activity_events` 在 TEE 侧根本不存在，snapshot lane 每个 tick 报一次
+> `两侧无公共列，拒绝整表清空`（护栏正确拦住了整表清空，没误删数据），一直到
+> 巡检时才发现。同一批里 `model_api_routes` 的 4 个 vision 列更隐蔽——见 §3 的
+> 「加列漂移没有红灯」。
+
+**写了 alembic_tee revision 之后，必须做的一步**（secret 建好之前）：
+
+```bash
+# 本地手工执行（owner 凭证，libpq≥17 才支持 direct-TLS）
+cd backend
+export TEE_MIGRATION_DATABASE_URL="postgresql://feedling_owner:<PW>@<APP_ID>-5432s.dstack-pha-prod9.phala.network:443/feedling?sslmode=verify-full&sslnegotiation=direct&sslrootcert=<CA>"
+python -c "import alembic_tee; alembic_tee.upgrade_head()"
+```
+
+上真库前先在临时库演练整条链，这一步能挡住绝大多数低级错误：
+
+```bash
+psql "postgresql://postgres:test@127.0.0.1:55432/postgres" -c "CREATE DATABASE tee_dryrun;"
+TEE_MIGRATION_DATABASE_URL="postgresql://postgres:test@127.0.0.1:55432/tee_dryrun" \
+  python -c "import alembic_tee; alembic_tee.upgrade_head()"
+```
+
+**新建表的话，跑完要验角色权限**——`ALTER DEFAULT PRIVILEGES` 只对配过的角色生效：
+
+```sql
+SELECT p.priv, has_table_privilege('app','<新表>',p.priv)
+FROM (VALUES ('SELECT'),('INSERT'),('UPDATE'),('DELETE'),('TRUNCATE')) p(priv);
+```
+
+`app` 五项应当全 `t`（2026-07-29 实测 `chat_turn_activity_events` 在两库都自动继承，
+说明 `ensure-roles.sh` 的 default privileges 对新表生效）。⚠️ 同一次实测顺带发现
+**`monitoring` 角色对 55 张表全部零权限**——`pg_default_acl` 里只有 `app` 和
+`tee_replicator`，从来没配过 `monitoring`，这个"只读角色"实际是废的。不是新表的
+问题，是既有状态，尚未处理。
+
 **迁移落地后核对 SNAPSHOT/新密文表的收敛情况**：`verify.run()` 对这些新 lane 用的
 是 advisory 判据（只抓"RDS 有行、TEE 一行都没有"，见 `tee_shadow/verify.py` 的
 `_rows_ok_advisory`），`verify_ok=true` 不等于两侧行数逐 tick 精确相等——那个更严格
@@ -278,6 +320,21 @@ ORDER BY table_name;
   `missing_in_tee` 非空 = **有一列的数据没在同步**，该补 `alembic_tee` revision；
   除非那列是某个环境长歪的产物（如上面的 `thinking_fallback`），那就该让它一直报着，
   TEE 不跟着歪。
+- **⚠️ 交集 COPY 修好了「整表永久失败」，代价是加列漂移从此没有红灯**
+  （2026-07-29 实测）。上一条描述的 `row field count is N, expected M` 是**修复前**的
+  行为；交集逻辑落地后，两类漂移的可见性天差地别：
+
+  | 漂移 | 表现 | 可见性 |
+  |---|---|---|
+  | RDS 新建表、TEE 没有 | `not common` → `snapshot_failures = 1`，每 tick 一次 | **有红灯** |
+  | RDS 加列、TEE 没有 | 交集照常 COPY，`ok: true` | **只在 `missing_in_tee` 里** |
+
+  实例：RDS `0066` 给 `model_api_routes` 加了 4 个 vision 列，TEE 没跟上。整表一直在
+  同步、行数一直是 27、`snapshot_failures` 一直是 0、CI 全绿——只有那 4 列的数据静静
+  地没进 TEE，潜伏到巡检才发现（修法 `alembic_tee 0008`）。**加列不建表就撞不上
+  「无公共列」护栏，在失败计数和 CI 上都是静默的。`missing_in_tee` 是这类漂移唯一的
+  信号，必须有人定期看**——上面那条 SQL 应当进值班巡检，而不是只在排障时才跑。
+  （建表漂移不需要靠它：`snapshot_failures` 会一直响。）
 
 ---
 
