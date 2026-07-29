@@ -162,12 +162,11 @@ _FILE_ARTIFACT_RE = re.compile(
     r"\b(?:document|file|attachment|downloadable|download)\b)"
 )
 _FILE_CREATE_RE = re.compile(
-    r"(?:生成|创建|制作|导出|下载(?:成|为)|保存(?:成|为)?|转换?(?:成|为)|转成|改(?:成|为)|"
+    r"(?:生成|创建|制作|导出|保存(?:成|为)?|转换?(?:成|为)|转成|改(?:成|为)|"
     r"整理(?:成|为|一个|一份)?|写成|做成|制成|发给我|提供(?:下载|给我)|交给我|"
     r"给我(?:一个|一份|生成|创建|制作|导出|保存|转换|转成|整理|写成|做成)|"
     r"给我\s*(?:word|pdf|markdown|md|docx)|"
-    r"\b(?:create|generate|make|produce|export|save|convert|send|give|provide)\b|"
-    r"\bdownload\b[^.!?\n]{0,48}?\bas\b)"
+    r"\b(?:create|generate|make|produce|export|save|convert|send|give|provide)\b)"
 )
 _FILE_DESIRE_RE = re.compile(
     r"(?:我(?:想要|要|需要)(?:一个|一份|这份|这个)?\s*(?:"
@@ -189,35 +188,27 @@ _FILE_EXPLICIT_REQUEST_RE = re.compile(
 _FILE_INFORMATION_RE = re.compile(
     r"(?:如何|怎么|怎样|教程|步骤|方法|请(?:解释|介绍|说明|告诉我)|"
     r"解释一下|介绍一下|讲讲|了解|有什么区别|"
-    r"(?:是否)?支持[^。！？\n]{0,96}(?:吗|么|[?？])|"
     r"\b(?:how (?:do|can|should|to)|tutorial|steps?|explain|describe|"
-    r"tell me how|what is|what are|difference between|is it possible|"
-    r"do you support|when should i|can i)\b)"
+    r"tell me how|what is|what are|difference between)\b)"
 )
 _FILE_CANCEL_RE = re.compile(
     r"(?:(?:不要|不用|无需|不需要|别)(?:替我|帮我|为我)?"
-    r"(?:生成|创建|制作|导出|下载|发送|发|提供)?(?:任何|这个|该)?"
+    r"(?:生成|创建|制作|导出|发送|发|提供)?(?:任何|这个|该)?"
     r"\s*(?:文档|文件|附件)|"
     r"取消(?:生成|创建|制作|导出|发送)?(?:文档|文件|附件)|"
     r"直接(?:在这里)?回答|只(?:要|需)(?:文字|文本|回答)|不(?:用|要)(?:下载|附件)|"
     r"\b(?:do not|don't|no need to)\s+"
-    r"(?:(?:create|generate|make|export|download|send|provide)\s+)?"
+    r"(?:(?:create|generate|make|export|send|provide)\s+)?"
     r"(?:(?:a|an|any|the)\s+)?(?:file|document|attachment)\b|"
     r"\bjust answer(?: in (?:text|chat))?\b)"
 )
 _FILE_NEGATED_FORMAT_RE = re.compile(
     r"(?:(?:不要|不用|无需|不需要|别)(?:替我|帮我|为我)?\s*"
-    r"(?:生成|创建|制作|导出|下载(?:成|为)?|发送|发|提供)?\s*"
+    r"(?:生成|创建|制作|导出|发送|发|提供)?\s*"
     r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)"
     r"\s*(?:格式|文档|文件)?|"
-    r"(?:不要|不用|无需|不需要|别)(?:把|将)[^。！？\n]{0,80}?"
-    r"(?:生成|创建|制作|导出|下载(?:成|为)?|保存(?:成|为)?|转换?(?:成|为)|"
-    r"转成|改(?:成|为)|整理(?:成|为)?|写成|做成|制成)[^。！？\n]{0,40}?"
-    r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)"
-    r"\s*(?:格式|文档|文件)?|"
-    r"\b(?:(?:do not|don't)(?:\s+want\s+to)?|no need to)\s+"
-    r"(?:(?:create|generate|make|export|download|send|provide)\s+)?"
-    r"(?:as\s+)?"
+    r"\b(?:do not|don't|no need to)\s+"
+    r"(?:(?:create|generate|make|export|send|provide)\s+)?"
     r"(?:(?:a|an|any|the)\s+)?"
     r"(?:word|pdf|markdown|md|docx|txt|csv|html|json|xml|yaml|yml|rtf)"
     r"(?:\s+(?:format|document|file))?\b)"
@@ -227,8 +218,8 @@ _FILE_ADDITIVE_RE = re.compile(
     r"\b(?:also|as well|in addition|and another)\b)"
 )
 _CONVERSION_TARGET_RE = re.compile(
-    r"(?:转换?(?:成|为)|转成|改(?:成|为)|导出(?:成|为)|下载(?:成|为)|保存(?:成|为)|"
-    r"\b(?:convert|export|download|save)\b.{0,24}?\b(?:to|as)\b)"
+    r"(?:转换?(?:成|为)|转成|改(?:成|为)|导出(?:成|为)|保存(?:成|为)|"
+    r"\b(?:convert|export|save)\b.{0,24}?\b(?:to|as)\b)"
 )
 _FILE_FORMAT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (

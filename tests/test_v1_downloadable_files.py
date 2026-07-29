@@ -438,15 +438,6 @@ def test_v1_completion_guard_matches_natural_word_request():
     assert resident._missing_outbound_file_suffixes(requirement, []) == (".docx",)
 
 
-def test_v1_completion_guard_matches_natural_markdown_download_request():
-    requirement = resident._required_outbound_file_suffixes(
-        "把我们的记忆下载成一份 Markdown 文档"
-    )
-
-    assert requirement == (".md",)
-    assert resident._missing_outbound_file_suffixes(requirement, []) == (".md",)
-
-
 @pytest.mark.parametrize(
     "text",
     [
@@ -455,18 +446,6 @@ def test_v1_completion_guard_matches_natural_markdown_download_request():
         "give me a report on how I slept",
         "help me make a checklist for packing",
         "给我一个报告",
-        "如何把记忆下载成一份 Markdown 文档？",
-        "不要把记忆下载成 Markdown 文档",
-        "支持把记忆下载成 Markdown 文档吗？",
-        "请介绍一下把记忆下载成 Markdown 文档",
-        "What are the steps to download as Markdown?",
-        "Is it possible to download as Markdown?",
-        "我刚下载了一份 PDF，帮我总结一下",
-        "我应该去哪里下载 PDF？",
-        "Where can I download a PDF?",
-        "I do not want to download as Markdown.",
-        "When should I download as Markdown?",
-        "Can I download this as Markdown?",
     ],
 )
 def test_v1_completion_guard_ignores_conversational_requests(text):
