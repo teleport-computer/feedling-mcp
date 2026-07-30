@@ -365,15 +365,38 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
       直读；列改名要同时动 replicator upsert、verify 表登记与 alembic_tee，收益仅
       「清爽」，风险却压在 cutover 关键路径上。留到 RDS 退役、不必维护双形状时再做。
 
+> ⚠️ **本 Phase 的 R2 两条写于 v5「彻底删加密」时代，v6 下必须重新划范围**：
+> 加密是每用户偏好了，所以**绝不能全量明文化**——加密档用户的 R2 重体必须原样保留
+> 密文。两个工具都按档位过滤（只处理显式 `content_encryption="off"` 的用户），
+> 判据与 `tee_replicator.worker._carries_verbatim` 一致、失败方向同样是「宁可多
+> 留密文」。
+
 ### Task 1.2: R2 storage-key 密文重写（frames-tee/）
 
-- [ ] 工具遍历 `frames-tee/<user_id>/<frame_id>` → enclave storage key `open_`
-      解密 → 明文写回 → TEE `frames` 表指针列同步。断点续跑 + 限速（502 前科）。
+- [ ] ⛔ **阻塞：需要一个新的 enclave 端点，属信任边界改动，需拍板。**
+      `frames-tee/` 里的对象是用 **enclave 存储钥**加密的（`/v1/storage/reencrypt-frame`
+      派生的 AES-256-GCM），而那个端点的设计原则白纸黑字写着**「明文不出 enclave」
+      ——只有存储密文离开**。要「解密→明文写回 R2」，就必须新增一个会吐明文帧正文
+      的端点，这与现有 enclave 设计直接冲突。
+      **不要绕过它**（比如在 backend 侧另存一份钥），那会让 enclave 的度量与
+      attestation 叙事失去意义。先决定：v6 下 frames 是否也分档、明文档的帧是否
+      干脆不再经存储层加密（写入时就明文进 R2）。后者可能比"先加密再解密回来"更对。
 
 ### Task 1.3: R2 聊天重体明文化（带 K_enclave 的）
 
-- [ ] 从 RDS `chat_messages.doc` 找 `body_key` 指 R2 且带 `K_enclave` 的行 →
-      `/v1/envelope/decrypt` 解密 → R2 明文重写 + TEE 行指针核对。
+- [x] **工具已写**（2026-07-31）：`backend/backfill_chat_bodies_to_plaintext.py`。
+      不受 1.2 的阻塞——聊天重体走 `/v1/envelope/decrypt`，那个端点本来就回明文。
+
+      性质：默认 **dry-run**（真跑要 `--apply`）；按档位过滤（只处理显式明文档，
+      查不到用户按加密档跳过）；幂等（已是明文的对象直接跳过，判据是"能否严格
+      base64 解码"）；限速默认 20 rows/s（enclave 被迁移工具打爆有前科）；单行
+      失败记清单继续跑，毒行不冻整趟。
+
+      已知不覆盖：**二进制重体（图片）** —— 明文列是 text，二进制无法以明文承载，
+      工具会 `skipped_binary_body` 而不是写成乱码。这类要单独定方案，与 1.2 的
+      frames 问题同源。
+
+- [ ] 真跑（生产数据操作，需拍板）：先 dry-run 盘点 → 小批 `--limit` → 全量。
 
 ### Task 1.4: 分析表与杂项
 
