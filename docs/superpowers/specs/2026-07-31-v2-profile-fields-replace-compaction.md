@@ -104,7 +104,7 @@ db.chat_coverage_bounds_after_seq(user_id, after_seq, *, limit, through_seq)
   "state": "ok" | "pending" | "degraded" | "empty",
   "memory": {"envelope": {...}, "chars": 2118},
   "user":   {"envelope": {...}, "chars": 1301},
-  "source": {"card_count": 137, "fingerprint": "sha256:...", "generated_at": "..."},
+  "source": {"card_count": 137, "max_updated_at": "2026-07-31T...", "generated_at": "..."},
   "last_attempt": {"at": "...", "reject_code": "user_chars_over_budget:1502",
                    "attempts": 2, "retry_not_before": 1785000000.0},
   "disabled": false
@@ -115,7 +115,7 @@ db.chat_coverage_bounds_after_seq(user_id, after_seq, *, limit, through_seq)
 - `chars` 放在信封**外**(是长度不是内容),让 admin/指标不解密就能看合规。
 - 解密读照 `_read_summary_with_seq`(serve_worker.py:1218-1226)的写法。
 - **CAS**:`db.set_blob_if_unchanged(user_id, "v2_agent_profile", expected, new, insert_if_missing=True)`(:3039)。注意 `insert_if_missing` 只在 `expected_doc == {}` 时生效(:3078),首写必须传 `{}`。
-- ⚠️ **CAS 失败必须重读 + 重算,不能重放**(`docs/testing/TESTING.md` §2-M2 是硬规矩)。具体:失败后重读,若胜出方的 `source.fingerprint` 覆盖的卡集是我们的超集、或 `generated_at` 更新 → **丢弃我们的结果**(按构造已陈旧);否则拿新 `expected` 重试一次;**第二次失败即失败退出,不写**。绝不逐字段合并。
+- ⚠️ **CAS 失败必须重读 + 重算,不能重放**(`docs/testing/TESTING.md` §2-M2 是硬规矩)。具体:失败后重读,若胜出方的 `source.generated_at` 比我们的新(或 `card_count`/`max_updated_at` 覆盖了更新的花园)→ **丢弃我们的结果**(按构造已陈旧);否则拿新 `expected` 重试一次;**第二次失败即失败退出,不写**。绝不逐字段合并。
 - ⚠️ **turn 路径读用 `get_blob_strict` 不是 `get_blob`** —— 后者吞异常返回 `None`(:2867),会让一次 DB 抖动伪装成"这个用户没有画像"而静默走回摘要。strict 读异常 → 退回注入摘要 **且**记一个可观测事件 + 计数(§2-Q:降级必须看得见)。
 - `set_blob_if_unchanged` 会把胜出写镜像到 TEE 影子库(:3086)。内容是密文,可接受,但**要把新 kind 加进 `tests/test_account_reset_purges_all_tables.py`**。
 
@@ -125,16 +125,41 @@ db.chat_coverage_bounds_after_seq(user_id, after_seq, *, limit, through_seq)
 
 ⚠️ `_run_profile` 必须复制 `_run_compaction` 的失败契约:自包含 try/except、静默 `mark_failed`、**绝不** `_surface_terminal_error`、**绝不**冒聊天气泡。
 
-**四个触发器**(都走 `enqueue_job` 的 per-user 单飞合并):
+**三个触发器**(都走 `enqueue_job` 的 per-user 单飞合并):
 
 | # | 位置 | 说明 |
 |---|---|---|
 | 1 | `hosted/config_store.py:536-542` | 切换到 V2 时,种 wake schedule 旁边 enqueue。**不要在锁内做蒸馏**(那段在 `hosted_runtime_config_mutation_lock` 里) |
 | 2 | `worker.py:8114-8124` | dream 提交后,`apply_memory_actions` 与 `_complete_extraction` 之间 enqueue,**不内联重算**。**这是 Seven 定的刷新主路** |
-| 3 | `worker.py:10359-10365` 同款 | 回合后尽力而为(try/except、只 log、绝不拖垮已写成的回复),画像缺失 / `state != "ok"` 时触发 |
-| 4 | 兜底扫描 | **仅**针对"缺失,或失败且已过 `retry_not_before`"的用户,**不做定期重算**。照 `_backlog_scan_loop`(serve_worker.py:3860)+ `due_compaction_users`(jobs_store.py:6455)的形状 |
+| 3 | `worker.py:10359-10365` 同款 | 回合后尽力而为(try/except、只 log、绝不拖垮已写成的回复)。**两种情况入队,见下** |
 
-> 触发器 4 的理由:刷新主路是 dream,但 dream 用户可在 App 里关(`dream_enabled`),而 Seven 定过「各开关完全独立无连带」—— 关做梦不该连带永久失去画像。这不是第二套刷新,是**只在缺失/失败时**的安全地板。
+**触发器 3 的两个条件**(满足其一即入队):
+
+1. **补生成** —— 画像缺失,或 `state != "ok"` 且已过 `last_attempt.retry_not_before`。
+   ⚠️ **必须尊重 `retry_not_before`**,否则一把永久坏掉的 BYOK key 会让用户每回合烧一次蒸馏调用。
+
+2. **陈旧地板(刷新兜底)** —— **两个条件同时成立**才入队:
+   - `now - source.generated_at >= PROFILE_MAX_AGE_SEC`(**Seven 定:7 天**,做成可调)
+   - **且**花园确实变过
+
+   "花园变过"用一条不解密、不走 enclave 的聚合判断(`memory_moments`,`0001_baseline.py:57`,独立表,PK `(user_id, moment_id)`):
+
+   ```sql
+   SELECT count(*) AS n, max(doc->>'updated_at') AS mu
+   FROM memory_moments WHERE user_id = %s
+   ```
+
+   与画像 blob 的 `source.card_count` / `source.max_updated_at` 比,**任一不同**即视为变过。在一次模型调用旁边这条聚合可以忽略。
+
+   > 加"花园变过"这一条,是为了**花园没变时不白烧调用** —— 重算出来会是同一份东西。
+
+**设计取舍(别退回去)**:
+
+> **不做定期扫描循环。** 早期设计有第四个触发器(定期扫"缺失/失败"的用户),已砍 —— 它能兜的场景触发器 3 全覆盖;唯一它独占的是"切过来后一直不说话的用户",而**不说话的用户根本用不到画像**。等他开口,那一回合走摘要(过渡规则本就兜底),回合后入队,下一回合就有。
+>
+> **不按"新卡数 ≥ K"触发。** 那是被否掉的一版:爱聊的用户一两天就攒够 K,等于造了个高频刷新。Seven 明确:**画像不需要频繁更新,低频就行**。所以刷新节奏由**一个** `PROFILE_MAX_AGE_SEC` 说了算,不引入需要凭空拍的卡数阈值。N=7 天时每用户最多约 4 次蒸馏/月,且只在花园真变过时发生。
+>
+> **陈旧地板与做梦开关完全无关。** 刷新主路是 dream(触发器 2),但用户可以在 App 里关做梦(`dream_enabled`),而 Seven 定过「各开关完全独立无连带」。地板挂在**时间 + 花园本身**,不挂任何开关上:做梦开着就更新得更勤,关掉了也保证陈旧不超过 7 天。
 
 **读全部卡,不静默截断** —— 新写 `serve_worker._read_profile_cards(user_id) -> (rendered, card_count)`:
 
@@ -203,7 +228,7 @@ db.chat_coverage_bounds_after_seq(user_id, after_seq, *, limit, through_seq)
 
 - provider 失败 → 只 CAS 写元数据(`state="degraded"`、reject code、`retry_not_before = now + backoff`),信封不动。
 - 首次就失败 → `state="pending"`、无信封 → 过渡规则继续注入摘要。**这正是摘要不能删的原因。**
-- 重试由兜底扫描按 `retry_not_before` 驱动,**不走 wake backoff**(`_FAIL_BACKOFF_WAKE_LANES`,jobs_store.py:917,是 heartbeat/scheduled 专用)—— 避免一把永久坏掉的 key 每个 tick 烧一次调用。
+- 重试由**触发器 3 的条件 1** 驱动(回合后、且已过 `retry_not_before`),**不走 wake backoff**(`_FAIL_BACKOFF_WAKE_LANES`,jobs_store.py:917,是 heartbeat/scheduled 专用)—— 避免一把永久坏掉的 key 每回合烧一次调用。`retry_not_before` 用指数退避。
 
 ### 2.7 顺带修
 
@@ -247,7 +272,7 @@ prompt、JSON 契约、校验器、一次打回、有界 map/reduce。无接线�
 
 ### M4 lane + 触发器 + 漏配修复
 
-LANES/优先级/分发、`_run_profile`、全量卡读取 + 截断断言、四个触发器;同批补 compose 环境变量。
+LANES/优先级/分发、`_run_profile`、全量卡读取 + 截断断言、三个触发器(含陈旧地板);同批补 compose 环境变量。
 
 **验收**:test 环境 L3 跑通真实账号 —— 两字段存在且未超限、正常花园 `model_calls == 1`;故意坏 BYOK key → `state="degraded"` 且**零**回合失败;确认 capture/dream job 真的开始入队。
 
@@ -268,6 +293,7 @@ headers、`build_turn_messages` 参数、worker 接线、摘要抑制、coverage
 对照 `docs/testing/TESTING.md` 的 A / D / G / M2 / N / O / P / Q / R 行。
 
 - **`tests/test_v2_profile.py`** —— 校验矩阵:缺字段、正好卡上限、上限+1、非 JSON、占位符、重叠比值三档;**断言每个 reject code 不含输入的任何子串**;断言打回只多花一次调用、且只对形状错误。
+- **`tests/test_v2_profile_refresh.py`**(真 PG)—— 陈旧地板的四象限:①未满 7 天 + 花园变了 → **不**入队 ②满 7 天 + 花园没变 → **不**入队 ③满 7 天 + 卡数变了 → 入队 ④满 7 天 + 卡数没变但 `max_updated_at` 前进 → 入队。外加:`state="degraded"` 且未过 `retry_not_before` → **不**入队(坏 key 不得每回合烧调用);`dream_enabled=false` 的用户照样能被地板触发(证明与开关无连带)。
 - **`tests/test_v2_profile_storage.py`**(真 PG)—— 首写 `expected={}` + `insert_if_missing`;两连接制造陈旧快照,败方重读**重算**;`ok→degraded→ok`;strict 读失败退回摘要**且**发出可观测事件。
 - **`tests/test_v2_profile_cards.py`** —— 0 卡(完成、`state="empty"`、**零**次 provider 调用)、1 卡、1000 卡、只有 `content` 的卡;`user_card_count > len(items)` → 失败且**不写**。
   ⚠️ **必须用 runtime token 而非 api-key 打 readside**(§2-R)—— 现有套件几乎全跑 api-key,而这正是 2026-07-30 事故的形状。
