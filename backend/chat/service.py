@@ -95,18 +95,12 @@ def is_conversation_user_message(msg: dict) -> bool:
 def _chat_thinking_extra_from_envelope(envelope: dict | None) -> dict:
     if not isinstance(envelope, dict):
         return {}
-    out = {
-        "thinking_v": str(envelope.get("v", 1)),
-        "thinking_id": str(envelope.get("id") or ""),
-        "thinking_body_ct": str(envelope.get("body_ct") or ""),
-        "thinking_nonce": str(envelope.get("nonce") or ""),
-        "thinking_K_user": str(envelope.get("K_user") or ""),
-        "thinking_visibility": str(envelope.get("visibility") or "shared"),
-        "thinking_owner_user_id": str(envelope.get("owner_user_id") or ""),
-        "thinking_enclave_pk_fpr": str(envelope.get("enclave_pk_fpr") or ""),
-    }
-    if envelope.get("K_enclave"):
-        out["thinking_K_enclave"] = str(envelope.get("K_enclave") or "")
+    try:
+        out = core_envelope.envelope_prefixed_fields(envelope, "thinking")
+    except ValueError:
+        # 形状不认识（既无 body_ct 也无 body）：本函数历来对残缺信封宽容——
+        # 空值会被下面的过滤丢掉，调用方按「没有 thinking」处理。
+        return {}
     return {k: v for k, v in out.items() if str(v).strip()}
 
 
@@ -121,18 +115,10 @@ def _chat_caption_extra_from_envelope(envelope: dict | None) -> dict:
     """
     if not isinstance(envelope, dict):
         return {}
-    out = {
-        "caption_v": str(envelope.get("v", 1)),
-        "caption_id": str(envelope.get("id") or ""),
-        "caption_body_ct": str(envelope.get("body_ct") or ""),
-        "caption_nonce": str(envelope.get("nonce") or ""),
-        "caption_K_user": str(envelope.get("K_user") or ""),
-        "caption_visibility": str(envelope.get("visibility") or "shared"),
-        "caption_owner_user_id": str(envelope.get("owner_user_id") or ""),
-        "caption_enclave_pk_fpr": str(envelope.get("enclave_pk_fpr") or ""),
-    }
-    if envelope.get("K_enclave"):
-        out["caption_K_enclave"] = str(envelope.get("K_enclave") or "")
+    try:
+        out = core_envelope.envelope_prefixed_fields(envelope, "caption")
+    except ValueError:
+        return {}
     return {k: v for k, v in out.items() if str(v).strip()}
 
 

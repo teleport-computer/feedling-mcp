@@ -885,18 +885,12 @@ def write_response(
         if conflict is not None:
             return conflict
         thinking_extra = {
-            "thinking_v": str(thinking_envelope.get("v", 1)),
-            "thinking_id": str(thinking_envelope.get("id") or ""),
-            "thinking_body_ct": str(thinking_envelope["body_ct"]),
-            "thinking_nonce": str(thinking_envelope["nonce"]),
-            "thinking_K_user": str(thinking_envelope["K_user"]),
-            "thinking_visibility": str(thinking_envelope["visibility"]),
-            "thinking_owner_user_id": str(thinking_envelope["owner_user_id"]),
-            "thinking_enclave_pk_fpr": str(thinking_envelope.get("enclave_pk_fpr") or ""),
-            "thinking_content_pk_fpr": str(thinking_envelope.get("content_pk_fpr") or ""),
+            # 这两个指纹保持「键恒在、缺省空串」的既有行为；下面的 splice 只在
+            # 信封真带了值时覆盖。
+            "thinking_enclave_pk_fpr": "",
+            "thinking_content_pk_fpr": "",
+            **core_envelope.envelope_prefixed_fields(thinking_envelope, "thinking"),
         }
-        if thinking_envelope.get("K_enclave"):
-            thinking_extra["thinking_K_enclave"] = str(thinking_envelope["K_enclave"])
         thinking_extra.update(chat_service._chat_thinking_metadata_from_payload(payload))
     else:
         thinking_extra.update(chat_service._chat_plaintext_thinking_extra_for_store(store, payload))

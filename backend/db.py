@@ -6565,6 +6565,9 @@ def _same_reply_envelope(existing_doc, requested_doc) -> bool:
         "id", "role", "source", "v", "body_ct", "nonce",
         "K_user", "K_enclave", "enclave_pk_fpr", "visibility",
         "owner_user_id", "content_type", "reply_to_message_id",
+        # 明文行的正文（v6）。密文行有 body_ct 在清单里兜着，明文行漏了它就会
+        # 把「同 id 不同正文」判成同一条而静默丢弃后者。
+        "body",
     )
     if not isinstance(existing_doc, dict) or not isinstance(requested_doc, dict):
         return False

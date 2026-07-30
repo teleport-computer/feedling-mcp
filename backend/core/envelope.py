@@ -142,6 +142,31 @@ def envelope_storage_fields(envelope: dict, *,
     return out
 
 
+def envelope_prefixed_fields(envelope: dict, prefix: str) -> dict:
+    """把**子信封**摊平成 ``<prefix>_*`` 字段，合进父聊天行（thinking / caption）。
+
+    与 ``envelope_storage_fields`` 的两个区别：
+
+    1. 子信封没有独立的行，``v`` 与 ``id`` 也必须摊进来（普通信封的这两个字段
+       由站点自己写）。
+    2. 值一律 str 化——父行的 extra 是 str→str 映射。
+
+    ⚠️ 新增的 ``<prefix>_body``（明文形状）必须同时登记进 ``core/store.py`` 的
+    extra 白名单，否则会被**静默丢掉**：thinking/caption 正文凭空消失且不报错。
+    """
+    if not isinstance(envelope, dict):
+        raise ValueError("envelope_shape_unrecognized")
+
+    fields = envelope_storage_fields(envelope)
+    out = {
+        f"{prefix}_v": str(envelope.get("v", 1)),
+        f"{prefix}_id": str(envelope.get("id") or ""),
+    }
+    for key, value in fields.items():
+        out[f"{prefix}_{key}"] = str(value)
+    return out
+
+
 def _build_shared_envelope_for_store(
     store,
     plaintext: bytes,

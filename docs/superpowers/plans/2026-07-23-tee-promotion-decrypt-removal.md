@@ -591,10 +591,24 @@ AST 扫全仓 `X["body_ct"]`，把每处反向定位到其所属函数，再判�
 |---|---|---|
 | **A. 与生产者同函数** | 7 | ✅ 已迁移 |
 | **B1. callee，服务端写路径** | 6 | ✅ 已迁移 |
-| **B2. 前缀子信封**（`thinking_body_ct` / `caption_body_ct`） | 3 | ⏳ helper 需加 prefix 变体 |
+| **B2. 前缀子信封**（`thinking_*` / `caption_*`） | 3 | ✅ 已迁移（`envelope_prefixed_fields`） |
 | **B3. swap 通道**（`content_core.py` ×4） | 4 | ⏳ 属**客户端上传**路径，有独立硬校验，随 Task 2.3 一起改 |
-| **B4. R2 卸载/注水**（`db.py` ×7） | 7 | ⏳ 需要的是**形状守卫**（明文行不该走卸载），不是字段拼接 |
+| **B4. R2 卸载/注水**（`db.py`） | 4 | ✅ 核实全部已被 `body_ct is not None` 守卫，明文行只跳过、不会炸 |
 | **B5. 不该动** | 2 | `enclave/envelope.py:109`（解密实现本身）、`genesis/genesis_core.py:365`（赋值构造） |
+
+**B2 顺带抓到一个静默数据丢失**：`core/store.py` 的 extra 白名单是硬编码元组，
+里面**没有** `thinking_body` / `caption_body`。一旦出现明文子信封，thinking /
+caption 正文会被白名单**静默丢掉且不报错**。两份白名单都已补上，并加了守卫测试
+（照 `test_no_flask_anywhere` 的文本扫描模式，防后人再漏）。
+
+**B4 核实结论**：4 处硬拆包全在 `doc.get("body_ct") is not None` 的分支里，所以
+明文行只是**跳过 R2 卸载**、正文留在行内——不崩、不丢。但由此引出一条**新待办**：
+明文档用户的图片/文件正文会一直内联在 Postgres 行里，行膨胀问题绕过了 R2 卸载
+这条设计。归到 Task 1.3（R2 明文化）一并解决。
+
+**B4 顺带修一个真 bug**：`db._same_reply_envelope` 的 `immutable_reply_fields`
+漏了 `body`。密文行有 `body_ct` 在清单里兜着，明文行什么都没兜——「同 id 不同
+正文」的两条回复会被判成同一条而**静默丢弃后者**。已补 `body` + 守卫测试。
 
 **已交付的形状无关 helper**：`core.envelope.envelope_storage_fields(envelope,
 *, default_owner_user_id="")` —— 只返回**信封落库字段**（信封行给
@@ -611,10 +625,13 @@ K_user 无 K_enclave = 孤岛」靠的正是键在不在）；`body_ct` 优先�
 `hosted/history_import.py` ×3、`genesis/service.py` ×2、
 `v2/jobs_store.py:_capture_memory_doc`。
 
-L1 **7213 passed / 0 failed**（含 `tests/test_envelope_storage_fields.py` 10 例）。
+L1 **7219 passed / 0 failed**（含 `tests/test_envelope_storage_fields.py` 16 例）。
 
-> 注意这一步**没有**改变任何写入形状——它只是把「切形状」这件事从「会炸 13
-> 处」变成「改一个 helper」。写侧真正切换仍需先做完 B2–B4。
+> 注意这一步**没有**改变任何写入形状——它只是把「切形状」这件事从「会炸 16
+> 处」变成「改一个 helper」。
+>
+> **写侧真正切换的剩余前置只有 B3（swap 通道，属 Task 2.3）。** 服务端自产内容
+> 的写路径已经形状无关了。
 
 ### Task 2.3: 读侧明文旁路（enclave 保留给信封行）
 

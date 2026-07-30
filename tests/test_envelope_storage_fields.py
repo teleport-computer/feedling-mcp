@@ -122,3 +122,92 @@ def test_empty_string_body_is_still_a_plaintext_row():
     不能用真值判——否则空串会被当成「形状不认识」而抛错。"""
     out = envelope_storage_fields({"body": "", "owner_user_id": "u", "visibility": "shared"})
     assert out["body"] == ""
+
+
+# ---------------------------------------------------------------------------
+# 前缀子信封（thinking / caption）
+#
+# 子信封没有独立的行，整个被摊平成 `<prefix>_*` 字段合进父聊天行。所以 `v` 与
+# `id` 也必须摊进来（普通信封的这两个字段由站点自己写）。
+
+
+def test_prefixed_sealed_envelope_flattens_with_prefix():
+    from core.envelope import envelope_prefixed_fields
+
+    out = envelope_prefixed_fields(_sealed(), "thinking")
+
+    assert out == {
+        "thinking_v": "1",
+        "thinking_id": "itm-1",
+        "thinking_body_ct": "Y3Q=",
+        "thinking_nonce": "bm9uY2U=",
+        "thinking_K_user": "a3U=",
+        "thinking_K_enclave": "a2U=",
+        "thinking_enclave_pk_fpr": "fpr-enclave",
+        "thinking_owner_user_id": "usr_owner",
+        "thinking_visibility": "shared",
+    }
+
+
+def test_prefixed_values_are_all_strings():
+    """父行的 extra 是 str→str 映射，非字符串值会在下游被白名单类型检查丢掉。"""
+    from core.envelope import envelope_prefixed_fields
+
+    out = envelope_prefixed_fields(_sealed(v=2), "caption")
+
+    assert out["caption_v"] == "2"
+    assert all(isinstance(v, str) for v in out.values())
+
+
+def test_prefixed_plaintext_envelope_yields_body_key():
+    from core.envelope import envelope_prefixed_fields
+
+    out = envelope_prefixed_fields(
+        {"body": "thought", "id": "itm-9", "owner_user_id": "u", "visibility": "shared"},
+        "thinking")
+
+    assert out["thinking_body"] == "thought"
+    assert "thinking_body_ct" not in out
+
+
+def test_prefixed_body_key_is_whitelisted_by_the_chat_store():
+    """回归守卫：`core/store.py` 的 extra 白名单是硬编码元组，明文子信封的
+    `<prefix>_body` 若不在里面会被**静默丢掉**——thinking/caption 正文凭空消失，
+    而且不报错。普查时实测确认原本就漏了这两个键。"""
+    import inspect
+
+    from core import store as core_store
+
+    src = inspect.getsource(core_store)
+    for key in ("thinking_body", "caption_body"):
+        # 两份白名单（_build_chat_message 与 append_chat）都必须有。
+        assert src.count(f'"{key}",') >= 2, f"{key} 不在 extra 白名单里"
+
+
+def test_prefixed_unrecognized_shape_raises():
+    from core.envelope import envelope_prefixed_fields
+
+    with pytest.raises(ValueError, match="envelope_shape_unrecognized"):
+        envelope_prefixed_fields({"id": "x", "owner_user_id": "u"}, "thinking")
+
+
+# ---------------------------------------------------------------------------
+# R2 卸载 / 幂等比对（普查 B4 类）
+#
+# B4 的 4 处硬拆包全都已经被 `body_ct is not None` 守卫，明文行只会**跳过**
+# R2 卸载，不会炸。但幂等比对的不变字段清单漏了明文正文。
+
+
+def test_reply_idempotency_compares_plaintext_body():
+    """`_same_reply_envelope` 的不变字段清单必须含 `body`。
+
+    否则明文行的两条「同 id 不同正文」的回复会被判成同一条而静默丢弃后者——
+    密文行有 body_ct 在清单里兜着，明文行原本什么都没兜。
+    """
+    import inspect
+
+    import db
+
+    src = inspect.getsource(db._same_reply_envelope)
+    head = src[:src.index("if not isinstance")]
+    assert '"body"' in head, "immutable_reply_fields 漏了 body"

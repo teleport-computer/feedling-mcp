@@ -508,6 +508,9 @@ class UserStore:
                 "caption_K_enclave",
                 "caption_enclave_pk_fpr",
                 "caption_content_pk_fpr",
+                # 明文形状的子信封正文（v6）。漏登记会被静默丢掉——正文凭空
+                # 消失且不报错，见 tests/test_envelope_storage_fields.py。
+                "caption_body",
                 "caption_visibility",
                 "caption_owner_user_id",
                 "thinking_v",
@@ -518,6 +521,7 @@ class UserStore:
                 "thinking_K_enclave",
                 "thinking_enclave_pk_fpr",
                 "thinking_content_pk_fpr",
+                "thinking_body",
                 "thinking_visibility",
                 "thinking_owner_user_id",
                 "thinking_kind",
@@ -706,6 +710,9 @@ class UserStore:
                 "caption_K_enclave",
                 "caption_enclave_pk_fpr",
                 "caption_content_pk_fpr",
+                # 明文形状的子信封正文（v6）。漏登记会被静默丢掉——正文凭空
+                # 消失且不报错，见 tests/test_envelope_storage_fields.py。
+                "caption_body",
                 "caption_visibility",
                 "caption_owner_user_id",
                 "thinking_v",
@@ -716,6 +723,7 @@ class UserStore:
                 "thinking_K_enclave",
                 "thinking_enclave_pk_fpr",
                 "thinking_content_pk_fpr",
+                "thinking_body",
                 "thinking_visibility",
                 "thinking_owner_user_id",
                 "thinking_kind",
