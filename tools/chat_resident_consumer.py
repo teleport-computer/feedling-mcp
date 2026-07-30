@@ -12920,6 +12920,16 @@ def _process_messages(messages: list) -> float:
                 _quoted_present, ts,
             )
 
+        # Self-authored thinking — FOREGROUND-CHAT-only (this dispatch; background
+        # lanes build their prompts elsewhere and are never asked to emit <think>).
+        # Prepended so the user's current message stays LAST (the "answer only the
+        # last message" framing) and the transcript header added below stays
+        # topmost. The consumer's existing tagged-thinking extraction peels the
+        # <think> block into thinking_summary. Same kill switch as V2.
+        from core import self_thinking as _self_thinking_v1
+
+        if _self_thinking_v1.enabled():
+            content = f"{_self_thinking_v1.INSTRUCTION.strip()}\n\n{content}"
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
         content = _prepend_time_anchor_foreground(content, ts)
