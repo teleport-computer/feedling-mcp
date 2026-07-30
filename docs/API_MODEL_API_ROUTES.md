@@ -173,6 +173,11 @@ resident/VPS 路径启动隔离、隐藏的双图 probe 并返回 `202 testing`�
 时仍固定走该 route。所有 `untested / testing / failed / unsupported` 状态都进入真实调用，
 最终回合结果以 provider 的真实响应为准。
 
+Runtime V2 的真实图片回合若收到明确的 text-only provider 拒绝（稳定分类为
+`vision_model_required`），后端会把该回合捕获的 active provider/model route 写为
+`unsupported`。这只更新后续 `GET /v1/vision/config` 的提示信号，不重试、不改路由，
+也不改变已接受回合的终态结果；route 已切换或已有更新时，旧失败不会覆盖新配置。
+
 ### `DELETE /v1/model_api/routes/{route_id}` —— 删除 route
 
 ```json

@@ -2631,7 +2631,7 @@ def _deliver_terminal_failure_runtime_error(job_id) -> bool:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    "SELECT user_id,error_code,target_route_id,"
+                    "SELECT user_id,error_code,error_class,target_route_id,"
                     "target_route_updated_at,runtime_error_delivered_at "
                     "FROM v2_terminal_failure_outbox WHERE job_id=%s FOR UPDATE",
                     (job_id,),
@@ -2641,9 +2641,21 @@ def _deliver_terminal_failure_runtime_error(job_id) -> bool:
                     return False
                 route_id = row.get("target_route_id")
                 if route_id is not None:
+                    learns_vision_unsupported = (
+                        str(row.get("error_class") or "")
+                        == "vision_model_required"
+                    )
                     cur.execute(
                         "UPDATE model_api_routes SET last_runtime_error=%s,"
-                        "last_runtime_error_class='',updated_at=now() "
+                        "last_runtime_error_class='',"
+                        "vision_test_status=CASE WHEN %s THEN 'unsupported' "
+                        "  ELSE vision_test_status END,"
+                        "last_vision_test_error=CASE WHEN %s "
+                        "  THEN 'vision_model_required' "
+                        "  ELSE last_vision_test_error END,"
+                        "last_vision_test_at=CASE WHEN %s THEN now() "
+                        "  ELSE last_vision_test_at END,"
+                        "updated_at=now() "
                         "WHERE id=%s AND user_id=%s AND is_active "
                         "AND updated_at IS NOT DISTINCT FROM %s "
                         "AND NOT EXISTS (SELECT 1 FROM agent_jobs newer "
@@ -2651,6 +2663,9 @@ def _deliver_terminal_failure_runtime_error(job_id) -> bool:
                         "  AND newer.status='completed' AND newer.id>%s)",
                         (
                             str(row["error_code"]),
+                            learns_vision_unsupported,
+                            learns_vision_unsupported,
+                            learns_vision_unsupported,
                             route_id,
                             str(row["user_id"]),
                             row.get("target_route_updated_at"),
