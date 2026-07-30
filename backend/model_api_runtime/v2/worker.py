@@ -87,6 +87,7 @@ from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
 from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import subagents as v2_subagents
 from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
+from model_api_runtime.v2 import tail_anchor as v2_tail_anchor
 from model_api_runtime.v2 import tool_loop as v2_tool_loop
 from model_api_runtime.v2 import trajectory as v2_trajectory
 
@@ -3040,6 +3041,7 @@ def _make_build_messages_fn(
     tail_target_turns: int | None = None,
     tail_source_truncated: bool = False,
     tail_lane: str = "",
+    tail_anchor_seq: int | None = None,
 ) -> Callable[[list], list]:
     """Build the fixed base prompt plus the loop's chronological native transcript.
 
@@ -3117,10 +3119,29 @@ def _make_build_messages_fn(
         required_turn_count = sum(
             1 for row in required_tail if _is_genuine_user_seed(row)
         )
-        optional_limit = max(0, target_turns - required_turn_count)
-        eligible_optional = (
-            optional_turns[-optional_limit:] if optional_limit else []
-        )
+        if tail_anchor_seq is not None and int(tail_anchor_seq) > 0:
+            # 锚点决定起点：滞后区内它逐轮不变，前缀因此逐字节稳定。
+            anchor = int(tail_anchor_seq)
+
+            def _group_start_seq(group: list[dict]) -> int | None:
+                seqs = [
+                    int(row["seq"])
+                    for row in group
+                    if row.get("seq") is not None
+                ]
+                return min(seqs) if seqs else None
+
+            eligible_optional = [
+                group
+                for group in optional_turns
+                if (_group_start_seq(group) or 0) >= anchor
+            ]
+        else:
+            # 无锚点（老用户首次进入）：保持原有行为，与改动前逐字等价。
+            optional_limit = max(0, target_turns - required_turn_count)
+            eligible_optional = (
+                optional_turns[-optional_limit:] if optional_limit else []
+            )
 
         def plan_provider_round(
             *,
@@ -8888,6 +8909,7 @@ async def process_job(
         tail_source_truncated = False
         through_seq = 0
         compact_through_seq = None
+        optional_anchor_seq: int | None = None
         if seq_context:
             through_seq = await asyncio.to_thread(db.chat_max_seq, user_id)
             oldest_retained_seed = await asyncio.to_thread(
@@ -8898,6 +8920,49 @@ async def process_job(
             )
             if oldest_retained_seed is not None and oldest_retained_seed > 1:
                 compact_through_seq = oldest_retained_seed - 1
+            stored_anchor = await asyncio.to_thread(
+                jobs_store.get_chat_tail_anchor, user_id
+            )
+            turns_after_anchor = (
+                await asyncio.to_thread(
+                    db.chat_genuine_turn_count_after_seq,
+                    user_id,
+                    after_seq=int(stored_anchor),
+                    through_seq=through_seq,
+                )
+                if stored_anchor is not None
+                else 0
+            )
+            # 滞后区内跳过最重的那次边界查询（仍需读锚点与计数）。
+            anchor_boundary_seq = None
+            if (
+                stored_anchor is None
+                or turns_after_anchor >= _CHAT_TAIL_ANCHOR_MAX_TURNS
+            ):
+                anchor_boundary_seq = await asyncio.to_thread(
+                    db.chat_recent_genuine_turn_boundary_seq,
+                    user_id,
+                    max_turns=_CHAT_TAIL_MAX_TURNS,
+                    through_seq=through_seq,
+                )
+            anchor_decision = v2_tail_anchor.decide_anchor(
+                current_anchor=stored_anchor,
+                turns_after_anchor=turns_after_anchor,
+                boundary_seq_for_target=anchor_boundary_seq,
+                target_turns=_CHAT_TAIL_MAX_TURNS,
+                max_turns_before_advance=_CHAT_TAIL_ANCHOR_MAX_TURNS,
+            )
+            if anchor_decision.advanced and anchor_decision.anchor_seq > 0:
+                await asyncio.to_thread(
+                    jobs_store.set_chat_tail_anchor,
+                    user_id,
+                    anchor_decision.anchor_seq,
+                )
+            optional_anchor_seq = (
+                anchor_decision.anchor_seq
+                if anchor_decision.anchor_seq > 0
+                else None
+            )
         if seq_context or legacy_context:
             # D6/Task 10: close a compaction backlog gap BEFORE reading the
             # actual prompt content — see `_ensure_prompt_coverage`'s
@@ -8935,7 +9000,7 @@ async def process_job(
                     user_id=user_id,
                     deps=deps,
                     through_seq=through_seq,
-                    target_turns=_CHAT_TAIL_MAX_TURNS,
+                    target_turns=_CHAT_TAIL_ANCHOR_MAX_TURNS,
                     provider_config=provider_config,
                     enclave_sem=enclave_sem,
                     claimed_by=claimed_by,
@@ -10033,6 +10098,7 @@ async def process_job(
                 ),
                 tail_source_truncated=tail_source_truncated,
                 tail_lane=lane,
+                tail_anchor_seq=optional_anchor_seq,
             )
 
         build_messages = _chat_builder()
@@ -10077,7 +10143,7 @@ async def process_job(
                     user_id=user_id,
                     deps=deps,
                     through_seq=through_seq,
-                    target_turns=_CHAT_TAIL_MAX_TURNS,
+                    target_turns=_CHAT_TAIL_ANCHOR_MAX_TURNS,
                     provider_config=provider_config,
                     enclave_sem=enclave_sem,
                     claimed_by=claimed_by,
