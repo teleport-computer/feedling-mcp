@@ -256,11 +256,46 @@ def _install_fake_stream(monkeypatch, pages):
 
 
 def test_list_models_openrouter_single_page(monkeypatch):
-    calls = _install_fake_stream(monkeypatch, [(200, {"data": [{"id": "a"}, {"id": "b"}]})])
+    # openrouter now probes the auth endpoint (/key) FIRST, then fetches /models.
+    calls = _install_fake_stream(monkeypatch, [
+        (200, {"data": {"label": "ok"}}),               # /key probe (valid key)
+        (200, {"data": [{"id": "a"}, {"id": "b"}]}),     # /models catalog
+    ])
     res = pc.list_provider_models("openrouter", "k", "")
     assert res["catalog_supported"] is True and res["complete"] is True
     assert [m["id"] for m in res["models"]] == ["a", "b"]
-    assert calls[0]["params"].get("output_modalities") == "all"
+    assert calls[0]["url"].endswith("/key")             # probe hit first
+    assert calls[1]["url"].endswith("/models")
+    assert calls[1]["params"].get("output_modalities") == "all"
+
+
+def test_list_models_openrouter_bogus_key_blocked_before_catalog(monkeypatch):
+    # OpenRouter's /models is PUBLIC → a bogus key would otherwise return a full
+    # catalog. The /key probe must 401 and block BEFORE any catalog is returned.
+    calls = _install_fake_stream(monkeypatch, [
+        (401, {"error": "invalid api key"}),            # /key probe rejects
+        (200, {"data": [{"id": "a"}, {"id": "b"}]}),     # /models — must NOT be reached
+    ])
+    with pytest.raises(pc.ProviderError) as ei:
+        pc.list_provider_models("openrouter", "bogus", "")
+    assert ei.value.status_code == 401
+    # Only the probe ran; the catalog fetch never happened.
+    assert len(calls) == 1
+    assert calls[0]["url"].endswith("/key")
+    # And the route maps a bogus openrouter key to the auth-failed slug.
+    assert pc.model_catalog_error_slug(ei.value) == "model_catalog_auth_failed"
+
+
+def test_list_models_openai_issues_no_key_probe(monkeypatch):
+    # Providers whose /models already authenticates must NOT get an extra /key
+    # probe — the fix is scoped to public-catalog providers only.
+    calls = _install_fake_stream(monkeypatch, [(200, {"data": [{"id": "a"}]})])
+    res = pc.list_provider_models("openai", "k", "")
+    assert res["catalog_supported"] is True
+    assert [m["id"] for m in res["models"]] == ["a"]
+    assert len(calls) == 1                               # single call: /models
+    assert calls[0]["url"].endswith("/models")
+    assert not any(c["url"].endswith("/key") for c in calls)
 
 
 def test_list_models_per_phase_timeouts_are_tight_and_bounded(monkeypatch):
