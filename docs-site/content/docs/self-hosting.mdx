@@ -31,8 +31,12 @@ per-tenant secrets and storage, or keep the deployment single-tenant.
 
 On a generic VPS, the local enclave service is software/process separation. It
 does not provide Intel TDX attestation or protection from the machine operator.
-Envelope encryption still protects backups and accidental storage exposure, but
-the host operator controls the processes that can request decryption.
+For accounts on the encrypted tier, envelope encryption still protects backups and
+accidental storage exposure, but the host operator controls the processes that can
+request decryption. Accounts on the plaintext tier get no such protection: their
+protected bodies are readable in the database and in any backup of it. Decide the
+tier deliberately for the deployment, not per user, when the host operator is not
+the data subject.
 
 A resident consumer can also re-run identity extraction (a "redistill") directly
 from a local terminal conversation, without going through the app's plaintext

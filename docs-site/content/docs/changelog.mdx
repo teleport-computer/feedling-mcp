@@ -10,6 +10,24 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Content encryption is becoming a per-user preference with two storage
+  tiers.** `whoami` now returns `content_encryption` (the user's stated
+  preference) and `content_encryption_effective` (the shape a client must
+  actually write). `POST /v1/users/preferences` accepts `content_encryption`
+  with `"on"`, `"off"`, or `null`. Write paths must act on the *effective*
+  field only, and must treat an absent, empty, or unrecognized value as `on`;
+  a deployment that has not enabled plaintext storage reports `on` regardless
+  of the preference, so a client can ship support ahead of the server without
+  writing an unsupported shape. Read paths must route per record — a row
+  carrying `body_ct` is opened through the decrypt service, a row carrying
+  `body` is read directly — because both shapes coexist for a user who changes
+  the preference. `/v1/content/swap` converts existing records between shapes
+  in place. Two boundaries are enforced server-side: a record is never silently
+  downgraded to plaintext, and `local_only` visibility still requires
+  encryption. No deployment has enabled plaintext storage yet, so the effective
+  value is currently `on` everywhere. See
+  [architecture](/docs/architecture#content-encryption-is-a-per-user-preference).
+
 - **Access-mode changes no longer bypass the Hosted Runtime V2 rollout
   reconciler.** Selecting `model_api` records the user's route choice but does
   not directly move the execution fence to V2; the `v2_user_allowlist` desired

@@ -7303,7 +7303,8 @@
             }
           }
         },
-        "x-feedling-contract-level": "compatibility"
+        "x-feedling-contract-level": "compatibility",
+        "description": "Update first-class user preferences. Accepts archive_language, timezone, and/or content_encryption (\"on\", \"off\", or null to clear). Setting content_encryption records intent only; it neither converts existing records nor changes what a client must write until content_encryption_effective follows. Use /v1/content/swap to convert existing records between shapes."
       }
     },
     "/v1/users/public-key": {
@@ -7421,7 +7422,8 @@
         "tags": [
           "Accounts"
         ],
-        "x-feedling-contract-level": "documented"
+        "x-feedling-contract-level": "documented",
+        "description": "Return the authenticated user's identifiers, registered content public key, attested decrypt-service material, and first-class preferences. content_encryption is the user's stated content-encryption preference; content_encryption_effective is the shape a client must actually write and is the only one a write path may act on. Treat an absent, empty, or unrecognized effective value as \"on\" — a deployment that has not enabled plaintext storage reports \"on\" regardless of the preference."
       }
     },
     "/v1/vision/config": {
@@ -8278,9 +8280,6 @@
       "EncryptedEnvelope": {
         "type": "object",
         "required": [
-          "body_ct",
-          "nonce",
-          "K_user",
           "visibility",
           "owner_user_id"
         ],
@@ -8296,6 +8295,10 @@
           "body_ct": {
             "type": "string",
             "description": "Base64 ciphertext."
+          },
+          "body": {
+            "type": "string",
+            "description": "Plaintext body. Only valid when the caller's content_encryption_effective (see /v1/users/whoami) is \"off\"; otherwise the write is rejected with plaintext_envelope_not_enabled_for_this_account. Mutually exclusive with body_ct."
           },
           "nonce": {
             "type": "string",
@@ -8327,21 +8330,43 @@
             "description": "Optional label: first 16 hex chars of SHA-256 of the user public key K_user was sealed to. When present on a chat write and it does not match the user's currently registered content key, the write is rejected with 409 content_pk_fpr_mismatch — re-fetch whoami and re-seal."
           }
         },
-        "if": {
-          "properties": {
-            "visibility": {
-              "const": "shared"
+        "oneOf": [
+          {
+            "title": "Encrypted body",
+            "required": [
+              "body_ct",
+              "nonce",
+              "K_user"
+            ],
+            "if": {
+              "properties": {
+                "visibility": {
+                  "const": "shared"
+                }
+              },
+              "required": [
+                "visibility"
+              ]
+            },
+            "then": {
+              "required": [
+                "K_enclave"
+              ]
             }
           },
-          "required": [
-            "visibility"
-          ]
-        },
-        "then": {
-          "required": [
-            "K_enclave"
-          ]
-        },
+          {
+            "title": "Plaintext body",
+            "description": "local_only requires encryption, so this branch pins visibility to shared.",
+            "required": [
+              "body"
+            ],
+            "properties": {
+              "visibility": {
+                "const": "shared"
+              }
+            }
+          }
+        ],
         "additionalProperties": true,
         "example": {
           "v": 1,
@@ -8357,9 +8382,6 @@
       "MemoryEnvelope": {
         "type": "object",
         "required": [
-          "body_ct",
-          "nonce",
-          "K_user",
           "visibility",
           "owner_user_id",
           "type",
@@ -8377,6 +8399,10 @@
           "body_ct": {
             "type": "string",
             "description": "Base64 ciphertext."
+          },
+          "body": {
+            "type": "string",
+            "description": "Plaintext body. Only valid when the caller's content_encryption_effective (see /v1/users/whoami) is \"off\"; otherwise the write is rejected with plaintext_envelope_not_enabled_for_this_account. Mutually exclusive with body_ct."
           },
           "nonce": {
             "type": "string",
@@ -8431,21 +8457,43 @@
             }
           }
         },
-        "if": {
-          "properties": {
-            "visibility": {
-              "const": "shared"
+        "oneOf": [
+          {
+            "title": "Encrypted body",
+            "required": [
+              "body_ct",
+              "nonce",
+              "K_user"
+            ],
+            "if": {
+              "properties": {
+                "visibility": {
+                  "const": "shared"
+                }
+              },
+              "required": [
+                "visibility"
+              ]
+            },
+            "then": {
+              "required": [
+                "K_enclave"
+              ]
             }
           },
-          "required": [
-            "visibility"
-          ]
-        },
-        "then": {
-          "required": [
-            "K_enclave"
-          ]
-        },
+          {
+            "title": "Plaintext body",
+            "description": "local_only requires encryption, so this branch pins visibility to shared.",
+            "required": [
+              "body"
+            ],
+            "properties": {
+              "visibility": {
+                "const": "shared"
+              }
+            }
+          }
+        ],
         "additionalProperties": true,
         "example": {
           "v": 1,

@@ -580,11 +580,19 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "EncryptedEnvelope": {
         "type": "object",
-        "required": ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"],
+        "required": ["visibility", "owner_user_id"],
         "properties": {
             "v": {"type": "integer", "const": 1, "default": 1},
             "id": {"type": "string"},
             "body_ct": {"type": "string", "description": "Base64 ciphertext."},
+            "body": {
+                "type": "string",
+                "description": "Plaintext body. Only valid when the caller's "
+                               "content_encryption_effective (see /v1/users/whoami) "
+                               "is \"off\"; otherwise the write is rejected with "
+                               "plaintext_envelope_not_enabled_for_this_account. "
+                               "Mutually exclusive with body_ct.",
+            },
             "nonce": {"type": "string", "description": "Base64 nonce."},
             "K_user": {"type": "string", "description": "Content key wrapped for the user."},
             "K_enclave": {"type": "string", "description": "Content key wrapped for the enclave; required for shared visibility."},
@@ -600,11 +608,24 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                                "content_pk_fpr_mismatch — re-fetch whoami and re-seal.",
             },
         },
-        "if": {
-            "properties": {"visibility": {"const": "shared"}},
-            "required": ["visibility"],
-        },
-        "then": {"required": ["K_enclave"]},
+        "oneOf": [
+            {
+                "title": "Encrypted body",
+                "required": ["body_ct", "nonce", "K_user"],
+                "if": {
+                    "properties": {"visibility": {"const": "shared"}},
+                    "required": ["visibility"],
+                },
+                "then": {"required": ["K_enclave"]},
+            },
+            {
+                "title": "Plaintext body",
+                "description": "local_only requires encryption, so this branch pins "
+                               "visibility to shared.",
+                "required": ["body"],
+                "properties": {"visibility": {"const": "shared"}},
+            },
+        ],
         "additionalProperties": True,
         "example": {
             "v": 1,
@@ -619,11 +640,19 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "MemoryEnvelope": {
         "type": "object",
-        "required": ["body_ct", "nonce", "K_user", "visibility", "owner_user_id", "type", "occurred_at"],
+        "required": ["visibility", "owner_user_id", "type", "occurred_at"],
         "properties": {
             "v": {"type": "integer", "const": 1, "default": 1},
             "id": {"type": "string"},
             "body_ct": {"type": "string", "description": "Base64 ciphertext."},
+            "body": {
+                "type": "string",
+                "description": "Plaintext body. Only valid when the caller's "
+                               "content_encryption_effective (see /v1/users/whoami) "
+                               "is \"off\"; otherwise the write is rejected with "
+                               "plaintext_envelope_not_enabled_for_this_account. "
+                               "Mutually exclusive with body_ct.",
+            },
             "nonce": {"type": "string", "description": "Base64 nonce."},
             "K_user": {"type": "string", "description": "Content key wrapped for the user."},
             "K_enclave": {"type": "string", "description": "Content key wrapped for the enclave; required for shared visibility."},
@@ -635,11 +664,24 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "source": {"type": "string", "default": "live_conversation"},
             "anchor_memory_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
         },
-        "if": {
-            "properties": {"visibility": {"const": "shared"}},
-            "required": ["visibility"],
-        },
-        "then": {"required": ["K_enclave"]},
+        "oneOf": [
+            {
+                "title": "Encrypted body",
+                "required": ["body_ct", "nonce", "K_user"],
+                "if": {
+                    "properties": {"visibility": {"const": "shared"}},
+                    "required": ["visibility"],
+                },
+                "then": {"required": ["K_enclave"]},
+            },
+            {
+                "title": "Plaintext body",
+                "description": "local_only requires encryption, so this branch pins "
+                               "visibility to shared.",
+                "required": ["body"],
+                "properties": {"visibility": {"const": "shared"}},
+            },
+        ],
         "additionalProperties": True,
         "example": {
             "v": 1,
@@ -1758,6 +1800,8 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("get", "/v1/perception/app_open"): "Legacy iOS Shortcut compatibility endpoint. This GET records an event and therefore has side effects.",
     ("get", "/v1/perception/app_close"): "iOS Shortcut compatibility endpoint for the automation's \"is closed\" trigger. This GET records an event and therefore has side effects.",
     ("post", "/v1/users/register"): "Create a Feedling user and issue its first API key. The key is returned once and this operation is not idempotent.",
+    ("get", "/v1/users/whoami"): "Return the authenticated user's identifiers, registered content public key, attested decrypt-service material, and first-class preferences. content_encryption is the user's stated content-encryption preference; content_encryption_effective is the shape a client must actually write and is the only one a write path may act on. Treat an absent, empty, or unrecognized effective value as \"on\" — a deployment that has not enabled plaintext storage reports \"on\" regardless of the preference.",
+    ("post", "/v1/users/preferences"): "Update first-class user preferences. Accepts archive_language, timezone, and/or content_encryption (\"on\", \"off\", or null to clear). Setting content_encryption records intent only; it neither converts existing records nor changes what a client must write until content_encryption_effective follows. Use /v1/content/swap to convert existing records between shapes.",
     ("post", "/v1/access/claim-token"): "Consume a one-time link token and issue an additional API key. Existing keys remain active.",
     ("post", "/v1/account/recover/verify"): "Verify keypair possession and issue an additional API key for the existing account. Existing keys remain active.",
     ("post", "/v1/account/reset"): "Permanently delete the account, its data, and all of its API keys. This is not a per-key revocation endpoint.",

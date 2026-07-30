@@ -36,7 +36,7 @@ deployment topology.
 | TLS ingress | Terminate the public API certificate and route configured traffic | Transport plaintext inside the managed confidential-VM boundary |
 | ASGI API | Authenticate, enforce user ownership, validate requests, coordinate workflows, and persist state | Envelopes and metadata; transient plaintext for operations that explicitly accept plaintext |
 | Attested decrypt service | Own the content private key and authorize envelope decryption or read-side projection | Plaintext while servicing an authorized operation |
-| PostgreSQL | Persist account, workflow, queue, and user-scoped state | Encrypted protected bodies plus plaintext IDs, timestamps, types, status, and other operational metadata |
+| PostgreSQL | Persist account, workflow, queue, and user-scoped state | Protected bodies in whichever shape the owning user's tier selects, plus plaintext IDs, timestamps, types, status, and other operational metadata |
 | Object storage | Offload enabled large-object flows | Screen and Chat objects are normally ciphertext; diagnostics and compatibility uploads can be stored as provided |
 | Hosted runner | Poll work, assemble authorized context, invoke an agent, and return an encrypted result | Plaintext selected for an agent turn, the provider credential, and encrypted API traffic |
 | Model or push provider | Perform user-selected inference or device delivery | The plaintext and delivery material required by that external service |
@@ -45,7 +45,8 @@ deployment topology.
 The component that stores a record is therefore not always the component that
 can interpret its protected body. Conversely, “encrypted at rest” does not mean
 that every identifier, status field, compatibility payload, normalized signal,
-or diagnostic upload is encrypted.
+or diagnostic upload is encrypted — nor that every protected body is encrypted,
+since [content encryption is a per-user preference](#content-encryption-is-a-per-user-preference).
 
 ## Core data flows
 
@@ -185,6 +186,42 @@ This is dual-recipient envelope encryption, not a claim that no server-side
 component ever sees plaintext. Hosted Chat, enclave-backed read projections,
 normalized Perception processing, user-approved diagnostics, and external
 inference each have an explicit plaintext boundary.
+
+### Content encryption is a per-user preference
+
+Protected-body encryption is moving from an always-on property to a per-user
+choice with two storage tiers:
+
+| Tier | Stored shape | Who can read the body |
+| --- | --- | --- |
+| Encrypted | Dual-recipient envelope (`body_ct`, `K_user`, `K_enclave`) | The user's device, and the measured decrypt service for `shared` records |
+| Plaintext | `body` alongside `id`, `owner_user_id`, and `visibility` | The service, within the same tenant-isolation boundary as every other row |
+
+Two `whoami` fields describe this. `content_encryption` is the user's stated
+preference. `content_encryption_effective` is the shape a client must actually
+write, and it is the only one a write path may act on — a deployment that has
+not enabled plaintext storage reports `on` regardless of the preference, so a
+client that ships support for plaintext ahead of the server still writes
+envelopes. Treat an absent, empty, or unrecognized value as `on`.
+
+Two boundaries hold in both tiers:
+
+- A record is never silently downgraded. If a user's effective shape is `on` and
+  the decrypt service is unreachable, the write fails rather than falling back to
+  plaintext, and an upload carrying a plaintext body is rejected rather than
+  quietly accepted.
+- `local_only` requires encryption. That visibility means only the user's device
+  holds a usable key, which a plaintext body cannot express, so the combination is
+  rejected on both the upload and swap paths.
+
+Reads route per record rather than per user: a row carrying `body_ct` is opened
+through the decrypt service, a row carrying `body` is read directly. Mixed rows
+therefore coexist for a user who changes the preference, and `body_ct` wins when
+a row somehow carries both. The [`/v1/content/swap`](/docs/workflows/memory)
+endpoint converts existing records between the two shapes in place.
+
+Changing the preference does not re-encrypt or decrypt history on its own; it
+governs new writes, and existing records convert only through the swap endpoint.
 
 ## Authentication and credential roles
 
