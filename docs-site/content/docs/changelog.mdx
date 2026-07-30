@@ -10,6 +10,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Encrypted Runtime V2 profile storage is staged for the bounded
+  Memory/User rollout.** Both fields share one `v2_agent_profile` CAS document
+  but remain separate shared encrypted envelopes. PostgreSQL and the TEE shadow
+  receive the same ciphertext document; only state, character counts, source
+  counts, and generation/retry timestamps remain plaintext metadata. This
+  storage milestone does not enable prompt injection, which remains behind the
+  later default-off rollout.
+
 - **Runtime V2 can advance conversation coverage without steady-state
   background model calls.** The default-off
   `FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC` worker switch replaces

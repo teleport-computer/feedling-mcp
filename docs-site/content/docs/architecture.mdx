@@ -97,6 +97,17 @@ checkpoints keep the frontier bounded without sending historical Chat plaintext
 to a model provider. The source ledger and rollback-compatible summary storage
 remain unchanged.
 
+The bounded Memory/User profile storage contract uses one
+`v2_agent_profile` document so both fields advance under one compare-and-swap.
+The two field bodies are separate shared encrypted envelopes; PostgreSQL and
+the TEE shadow see the same ciphertext document. Field character counts,
+state, disabled status, source-card counts, and generation/retry timestamps
+remain plaintext routing and observability metadata. A stale CAS loser must
+re-read and recompute rather than replaying its earlier result. This storage
+contract does not by itself enable profile prompt injection: turns continue to
+use the rollback-compatible summary until that later, default-off rollout is
+deployed.
+
 An [independent resident consumer](/docs/workflows/chat#independent-resident-loop)
 uses the same encrypted queue-and-reply protocol but runs in infrastructure the
 user or integrator controls instead of Feedling's hosted runner.

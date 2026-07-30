@@ -86,6 +86,7 @@ from model_api_runtime.v2 import child_supervisor as v2_child_supervisor
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import reaper as v2_reaper
 from model_api_runtime.v2 import runner_identity
 from model_api_runtime.v2 import scheduler
@@ -1291,6 +1292,41 @@ def _read_summary(user_id: str) -> tuple[str, float, int]:
     """
     summary, watermark_ts, version, _watermark_seq = _read_summary_with_seq(user_id)
     return summary, watermark_ts, version
+
+
+def _select_agent_profile_for_turn(
+    user_id: str,
+    summary: str,
+    *,
+    enabled: bool,
+) -> v2_profile_store.ProfilePromptSelection:
+    """Production strict-read/decrypt adapter for M5 prompt selection.
+
+    M2 lands and tests this trust/storage boundary before prompt wiring.  M5
+    consumes the returned selection; a DB/decrypt failure already has the final
+    safe behavior here: keep the summary and emit a content-free observable
+    fallback event/counter.
+    """
+    token: str | None = None
+
+    def _decrypt(envelope: dict, field: str) -> bytes:
+        nonlocal token
+        if token is None:
+            token = _mint_runtime_token(user_id)
+        return core_enclave._decrypt_envelope_via_enclave(
+            envelope,
+            None,
+            purpose=f"v2_profile_{field}_read",
+            runtime_token=token,
+        )
+
+    return v2_profile_store.select_profile_for_turn(
+        user_id,
+        summary,
+        enabled=enabled,
+        decrypt_envelope=_decrypt,
+        read_blob=db.get_blob_strict,
+    )
 
 
 def _write_summary(
