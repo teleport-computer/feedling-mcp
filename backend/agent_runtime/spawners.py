@@ -798,14 +798,6 @@ def agent_home_files(
     identity = _identity_override_block(provider, identity_model or model, base_url)
     if identity:
         system_append = f"{identity}\n\n---\n\n{system_append}"
-    # v1 self-authored thinking (runtime V1): append the 💭 instruction so the
-    # resident agent narrates a thinking line the consumer peels into the thinking
-    # channel. Gated → off = prompt byte-identical to today. Shared source of truth
-    # with V2 (core.self_thinking); the consumer's capture is gated by the same flag.
-    from core import self_thinking
-
-    if self_thinking.enabled():
-        system_append = f"{system_append}\n\n{self_thinking.INSTRUCTION.strip()}"
     files = {f"{home}/{_AGENT_PROMPT_BASENAME}": system_append}
     if driver == "codex":
         # codex is native-only now (LiteLLM gateway retired) — it reads AGENTS.md
