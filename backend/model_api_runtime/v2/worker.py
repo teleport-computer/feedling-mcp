@@ -3627,8 +3627,14 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             or a.get("memory_id")
             or ""
         ).strip()
-        if op in ("delete", "remove") and target:
-            out.append({"type": "memory.delete", "memory_id": target})
+        if op in ("delete", "remove"):
+            if target:
+                out.append({"type": "memory.delete", "memory_id": target})
+            continue
+        if op in ("update", "supersede", "merge", "patch") and not target:
+            # Never turn an invalid targeted mutation into a new memory.add.
+            continue
+        if op not in ("add", "create", "update", "supersede", "merge", "patch"):
             continue
         inner = {
             "summary": summary,
@@ -3646,7 +3652,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             "reason": "Written by the agent via the memory_write tool.",
             "capture_mode": "agent_tool",
         }
-        if op in ("update", "supersede", "merge", "patch") and target:
+        if op in ("update", "supersede", "merge", "patch"):
             out.append(
                 {
                     "type": "memory.supersede",
@@ -7460,6 +7466,58 @@ async def _run_wake(
                     "[v2.worker] wake reply push failed user=%s: %s", user_id, e)
 
 
+def _memory_write_result_counts(
+    actions: list[dict], write_result: Any
+) -> tuple[int, int, int, str]:
+    """Return applied/skipped/failed plus the first item error for a V2 batch."""
+    result_rows = (
+        write_result.get("results")
+        if isinstance(write_result, dict)
+        else None
+    )
+    legacy_ok = (
+        isinstance(write_result, dict)
+        and str(write_result.get("status") or "").strip().lower() == "ok"
+        and result_rows is None
+    )
+    if not isinstance(write_result, dict) or (
+        not isinstance(result_rows, list) and not legacy_ok
+    ):
+        error = (
+            str(write_result.get("error") or "memory_action_failed")
+            if isinstance(write_result, dict)
+            else "memory_action_result_invalid"
+        )
+        return 0, 0, len(actions), error
+    if legacy_ok:
+        result_rows = [
+            {"status": "ok", "action": action.get("type")}
+            for action in actions
+        ]
+    failed_count = sum(
+        1
+        for row in result_rows
+        if not isinstance(row, dict)
+        or str(row.get("status") or "").strip().lower() == "error"
+    ) + max(0, len(actions) - len(result_rows))
+    skipped_count = sum(
+        1
+        for row in result_rows
+        if isinstance(row, dict) and (row.get("noop") or row.get("skipped"))
+    )
+    applied_count = max(0, len(actions) - failed_count - skipped_count)
+    first_error = next(
+        (
+            str(row.get("error") or "memory_action_failed")
+            for row in result_rows
+            if isinstance(row, dict)
+            and str(row.get("status") or "").strip().lower() == "error"
+        ),
+        "memory_action_failed",
+    )
+    return applied_count, skipped_count, failed_count, first_error
+
+
 async def _run_extraction(
     job_id,
     user_id: str,
@@ -8056,17 +8114,24 @@ async def _run_extraction(
         write_result = await asyncio.to_thread(
             deps.apply_memory_actions, user_id, actions
         )
-        if (
-            not isinstance(write_result, dict)
-            or str(write_result.get("status") or "").strip().lower() != "ok"
-        ):
-            error = (
-                str(write_result.get("error") or "memory_action_failed")
-                if isinstance(write_result, dict)
-                else "memory_action_result_invalid"
+        applied_count, skipped_count, failed_count, first_error = (
+            _memory_write_result_counts(actions, write_result)
+        )
+        if failed_count == len(actions) and actions:
+            raise RuntimeError(
+                f"extraction_memory_write_rejected:{first_error}"
             )
-            raise RuntimeError(f"extraction_memory_write_rejected:{error}")
-        await _complete_extraction(item_count=len(items))
+        await _complete_extraction(item_count=applied_count + skipped_count)
+        if failed_count:
+            log.warning(
+                "[v2.worker] extraction batch partial user=%s lane=%s "
+                "applied=%d skipped=%d failed=%d",
+                user_id,
+                lane,
+                applied_count,
+                skipped_count,
+                failed_count,
+            )
         if tm is not None:
             tm.flush(failed=False, status="ok")
         return "completed"

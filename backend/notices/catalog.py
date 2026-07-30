@@ -72,7 +72,8 @@ _CATALOG: dict[str, tuple[str, str]] = {
     "cli_config_invalid": (
         "user_provider", "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。"),
     "vision_model_required": (
-        "user_provider", "当前主模型不支持看图，请前往设置添加或切换支持视觉的模型。"),
+        "user_provider",
+        "由于当前模型没有视觉能力，模型无法收到图片信息，建议更改模型或在设置页单独添加视觉模型"),
     "provider_incompatible": (
         "user_provider", "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。"),
     "context_overflow": (
@@ -160,8 +161,15 @@ def blame_for(error_class: str) -> str:
 
 
 def user_text_for(error_class: str, **ctx) -> str:
-    """``**ctx`` 为未来动态占位（如失败次数）预留——当前类均静态文案，
-    ctx 暂被忽略；保留形参使接口稳定，未来加占位不必改调用方签名。"""
+    """Return stable fallback text, localized where the caller has a locale."""
+    if (
+        error_class == "vision_model_required"
+        and str(ctx.get("language") or "").strip().lower().startswith("en")
+    ):
+        return (
+            "Your current model can't process images, so it didn't receive this "
+            "picture. Switch models, or add a dedicated vision model in Settings."
+        )
     entry = _CATALOG.get(error_class)
     return entry[1] if entry is not None else _FALLBACK_USER_TEXT
 

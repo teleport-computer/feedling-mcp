@@ -3468,11 +3468,11 @@
         "operationId": "memory_actions_v1_memory_actions_post",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "The structurally valid batch was processed item by item. Inspect status, counts, and every results entry; item failures do not change the batch HTTP status.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/MemoryActionsResponse"
                 }
               }
             }
@@ -3502,7 +3502,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Apply up to 20 memory actions in order. The batch is not transactional and Idempotency-Key is not supported."
+        "description": "Apply up to 20 memory actions independently and in order. A structurally valid batch returns HTTP 200 even when some or all items fail; inspect every result and the applied/skipped/failed counts. The batch is not transactional and Idempotency-Key is not supported."
       }
     },
     "/v1/memory/add": {
@@ -8474,6 +8474,24 @@
           },
           "source": {
             "type": "string",
+            "enum": [
+              "bootstrap",
+              "chat",
+              "genesis_import",
+              "genesis_resident_distill",
+              "history_import",
+              "hosted_runtime_state",
+              "live_conversation",
+              "memory_capture",
+              "memory_dream",
+              "memory_migrate",
+              "model_api_capture",
+              "model_api_correction",
+              "model_api_repair",
+              "ombre_brain_sync",
+              "resident_absorb",
+              "resident_patch"
+            ],
             "default": "live_conversation"
           },
           "anchor_memory_ids": {
@@ -9647,6 +9665,27 @@
             "items": {
               "type": "string"
             }
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "bootstrap",
+              "chat",
+              "genesis_import",
+              "genesis_resident_distill",
+              "history_import",
+              "hosted_runtime_state",
+              "live_conversation",
+              "memory_capture",
+              "memory_dream",
+              "memory_migrate",
+              "model_api_capture",
+              "model_api_correction",
+              "model_api_repair",
+              "ombre_brain_sync",
+              "resident_absorb",
+              "resident_patch"
+            ]
           }
         },
         "additionalProperties": true
@@ -9717,6 +9756,17 @@
           "reason": {
             "type": "string"
           },
+          "capture_mode": {
+            "type": "string",
+            "enum": [
+              "agent_tool",
+              "genesis_resident_distill",
+              "memory_capture",
+              "memory_dream",
+              "repair",
+              "state"
+            ]
+          },
           "source_chat_message_ids": {
             "type": "array",
             "items": {
@@ -9763,6 +9813,96 @@
             }
           ]
         }
+      },
+      "MemoryActionResult": {
+        "type": "object",
+        "required": [
+          "status",
+          "http_status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "error"
+            ]
+          },
+          "http_status": {
+            "type": "integer",
+            "description": "Per-item execution status; inspect it even when the batch HTTP status is 200."
+          },
+          "action": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "memory_id": {
+            "type": "string"
+          },
+          "noop": {
+            "type": "boolean"
+          },
+          "skipped": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "MemoryActionsResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "results",
+          "effects",
+          "total_count",
+          "applied_count",
+          "skipped_count",
+          "failed_count"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "partial",
+              "failed"
+            ]
+          },
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MemoryActionResult"
+            }
+          },
+          "effects": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "total_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "applied_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "skipped_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failed_count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "MemoryAddRequest": {
         "type": "object",

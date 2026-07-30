@@ -148,8 +148,17 @@ T1 前写入它，而 replicator 只搬 RDS 中存在的行 ⇒ 该行 T1 前就
 才发真实双图探测；resident 走隔离 session 的隐藏双图 side-channel，测试内容不进入
 Chat、推送、摘要、Live Activity 或 capture。配置状态统一为
 `testing / ok / unsupported / failed / untested`，绑定的 provider、model 或 resident
-入口变化会使旧结果失效。已明确缓存为 `unsupported` 的图片发送会在写消息前返回
-`vision_model_incompatible` 与精确 provider/model；未知状态仍允许真实调用。
+入口变化会使旧结果失效。每次主模型 setup 成功后也会异步启动同一套探测，不等待
+catalog 或双图调用，因此用户不打开视觉设置、不发图也能通过
+`GET /v1/vision/config` 提前得到 verdict；期间 route 再次变化时旧结果由版本围栏
+丢弃。setup、探测失败和所有探测状态都不阻塞配置或发送：图片始终沿用户配置的主模型
+或 dedicated route 进入真实调用。只有 provider
+真正以明确的 text-only 图片错误拒绝本回合时，才返回 `vision_model_required` 与可操作
+的中英双语换模型提示；Runtime V2 同时把该回合捕获的 active route 写为
+`unsupported`，让后续 config 查询触发非阻断提示，且用 route 版本 fence 防止旧失败
+覆盖用户刚切换的新配置。Hosted V1 同样在发图时捕获 route 版本，并在接收 terminal
+failure 回复的原子事务中写回 `unsupported`，避免 allowlist 外 V1 用户长期停在
+`untested`。
 
 **[DONE] 图片失败归属只在证据明确时挂到视觉模型。** auth、quota、model、provider、
 rate limit、upstream、timeout、reply parse 和 dedicated observer 失败映射到稳定

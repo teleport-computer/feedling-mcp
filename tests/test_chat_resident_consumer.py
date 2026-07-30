@@ -1222,6 +1222,7 @@ def test_text_only_image_failure_posts_vision_model_guidance(monkeypatch, tmp_pa
     monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
     monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: True)
     monkeypatch.setattr(crc, "IMAGE_TEMP_DIR", tmp_path)
+    monkeypatch.setitem(crc._whoami_cache, "archive_language", "zh-Hans")
     crc._reset_system_notice_state()
     upstream = RuntimeError(
         "provider_http_400: Failed to deserialize the JSON body into the target "
@@ -1240,7 +1241,10 @@ def test_text_only_image_failure_posts_vision_model_guidance(monkeypatch, tmp_pa
         if call.kwargs.get("role") != "system"
     ]
     assert len(visible) == 1
-    assert visible[0].args[0] != crc.FALLBACK_REPLY
+    assert visible[0].args[0] == (
+        "由于当前模型没有视觉能力，模型无法收到图片信息，"
+        "建议更改模型或在设置页单独添加视觉模型"
+    )
     assert visible[0].kwargs["turn_failure_error_class"] == "vision_model_required"
     assert visible[0].kwargs["turn_failure_blame"] == "user_provider"
 
@@ -3063,6 +3067,10 @@ def _install_capture_job_harness(monkeypatch, agent_reply):
 
     def _agent(prompt, *_args, **_kwargs):
         captured["prompts"].append(prompt)
+        if callable(agent_reply):
+            return agent_reply(prompt, len(captured["prompts"]))
+        if isinstance(agent_reply, list):
+            return agent_reply[len(captured["prompts"]) - 1]
         return agent_reply
 
     def _fail_post(*_args, **_kwargs):
@@ -3425,7 +3433,10 @@ def test_capture_job_add_card_writes_envelope_without_chat_or_delivery(monkeypat
     extra = _capture_final_status(captured)[3]["extra"]
     assert extra["cards_added"] == 1
     assert extra["cards_superseded"] == 0
-    assert extra["memory_action_status"] == {"status": "ok", "results": 1, "effects": 1}
+    assert extra["memory_action_status"] == {
+        "status": "ok", "results": 1, "effects": 1,
+        "applied_count": 1, "skipped_count": 0, "failed_count": 0,
+    }
 
 
 def test_capture_job_supersede_card_writes_supersede_action(monkeypatch):
@@ -3453,7 +3464,7 @@ def test_capture_job_supersede_card_writes_supersede_action(monkeypatch):
     assert extra["cards_superseded"] == 1
 
 
-def test_capture_job_supersede_without_target_falls_back_to_add(monkeypatch):
+def test_capture_job_supersede_without_target_is_noop(monkeypatch):
     reply = json.dumps({
         "cards": [{
             "action": "supersede",
@@ -3469,15 +3480,246 @@ def test_capture_job_supersede_without_target_falls_back_to_add(monkeypatch):
     captured, job = _install_capture_job_harness(monkeypatch, reply)
 
     assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
-    assert captured["actions"][0]["type"] == "memory.add"
+    assert captured["actions"] == []
     assert _capture_final_status(captured)[:3] == (
         "cap_dispatch",
         "completed",
-        "capture_memory_actions_applied",
+        "supersede_without_target",
     )
     extra = _capture_final_status(captured)[3]["extra"]
-    assert extra["cards_added"] == 1
+    assert extra["cards_added"] == 0
     assert extra["cards_superseded"] == 0
+    assert extra["capture_result"]["status"] == "noop"
+    assert extra["capture_result"]["reason"] == "supersede_without_target"
+    assert extra["capture_result"]["skipped"]["supersede_without_target"] == 1
+
+
+def test_capture_semantic_reask_recovers_missing_target_once(monkeypatch):
+    missing = json.dumps({"cards": [{
+        "action": "supersede",
+        "summary": "Correct the meeting memory.",
+        "content": "Seven clarified that the meeting issue was about boundaries.",
+    }]})
+    corrected = json.dumps({"cards": [{
+        "action": "supersede",
+        "target_id": "mem_old",
+        "summary": "Corrected meeting memory.",
+        "content": "Seven clarified that the meeting issue was about boundaries.",
+    }]})
+    captured, job = _install_capture_job_harness(
+        monkeypatch, [missing, corrected]
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert len(captured["prompts"]) == 2
+    assert "记忆操作无法执行" in captured["prompts"][1]
+    assert captured["actions"][0]["type"] == "memory.supersede"
+    assert captured["actions"][0]["supersedes"] == "mem_old"
+    result = _capture_final_status(captured)[3]["extra"]["capture_result"]
+    assert result["reask_count"] == 1
+    assert result["reask_trigger"] == "semantic"
+    assert result["reask_outcome"] == "recovered"
+    assert result["applied"]["superseded"] == 1
+
+
+def test_capture_semantic_reask_still_bad_stops_after_second_call(monkeypatch):
+    missing = json.dumps({"cards": [{
+        "action": "supersede",
+        "summary": "Correct the meeting memory.",
+        "content": "Seven clarified that the meeting issue was about boundaries.",
+    }]})
+    captured, job = _install_capture_job_harness(
+        monkeypatch, [missing, missing]
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert len(captured["prompts"]) == 2
+    assert captured["actions"] == []
+    result = _capture_final_status(captured)[3]["extra"]["capture_result"]
+    assert result["reask_count"] == 1
+    assert result["reask_trigger"] == "semantic"
+    assert result["reask_outcome"] == "failed"
+    assert result["skipped"]["supersede_without_target"] == 1
+
+
+def test_capture_server_semantic_rejection_reasks_once_and_recovers(monkeypatch):
+    stale_target = json.dumps({"cards": [{
+        "action": "supersede",
+        "target_id": "mem_gone",
+        "summary": "Correct the meeting memory.",
+        "content": "Seven clarified that the meeting issue was about boundaries.",
+    }]})
+    corrected_add = json.dumps({"cards": [{
+        "action": "add",
+        "summary": "Corrected meeting memory.",
+        "content": "Seven clarified that the meeting issue was about boundaries.",
+    }]})
+    captured, job = _install_capture_job_harness(
+        monkeypatch, [stale_target, corrected_add]
+    )
+    writes = {"count": 0}
+
+    def write(actions):
+        writes["count"] += 1
+        captured["actions"].extend(actions)
+        if writes["count"] == 1:
+            return {
+                "status": "failed",
+                "results": [{
+                    "status": "error",
+                    "error": "not_found",
+                    "http_status": 404,
+                }],
+                "effects": [],
+                "total_count": 1,
+                "applied_count": 0,
+                "skipped_count": 0,
+                "failed_count": 1,
+            }
+        return {
+            "status": "ok",
+            "results": [{
+                "status": "ok",
+                "action": "memory.add",
+                "http_status": 200,
+            }],
+            "effects": [{"type": "memory_added", "memory_id": "mem_new"}],
+            "total_count": 1,
+            "applied_count": 1,
+            "skipped_count": 0,
+            "failed_count": 0,
+        }
+
+    monkeypatch.setattr(crc, "execute_memory_actions", write)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert len(captured["prompts"]) == 2
+    assert writes["count"] == 2
+    result = _capture_final_status(captured)[3]["extra"]["capture_result"]
+    assert result["reask_count"] == 1
+    assert result["reask_trigger"] == "semantic"
+    assert result["reask_outcome"] == "recovered"
+    assert result["applied"]["added"] == 1
+    assert result["failed"]["by_error"]["not_found"] == 1
+
+
+def test_capture_format_bounce_consumes_shared_semantic_reask_budget(monkeypatch):
+    format_bad = json.dumps({"cards": [{
+        "action": "add",
+        "summary": "...",
+        "content": "[thickened summary]",
+    }]})
+    missing_target = json.dumps({"cards": [{
+        "action": "supersede",
+        "summary": "Correct the meeting memory.",
+        "content": "Seven clarified that the meeting issue was about boundaries.",
+    }]})
+    captured, job = _install_capture_job_harness(
+        monkeypatch, [format_bad, missing_target]
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert len(captured["prompts"]) == 2
+    assert captured["actions"] == []
+    result = _capture_final_status(captured)[3]["extra"]["capture_result"]
+    assert result["reask_count"] == 1
+    assert result["reask_trigger"] == "format"
+    assert result["reask_outcome"] == "failed"
+
+
+def test_capture_job_reports_server_duplicate_skip(monkeypatch):
+    reply = json.dumps({
+        "cards": [{
+            "action": "add",
+            "type": "event",
+            "summary": "Already active.",
+            "content": "This exact card already exists.",
+        }]
+    })
+    captured, job = _install_capture_job_harness(monkeypatch, reply)
+
+    def duplicate_result(actions):
+        captured["actions"].extend(actions)
+        return {
+            "status": "ok",
+            "results": [{
+                "status": "ok",
+                "action": "memory.add",
+                "noop": True,
+                "skipped": "duplicate_active",
+                "duplicate_of": "mem_existing",
+            }],
+            "effects": [],
+        }
+
+    monkeypatch.setattr(crc, "execute_memory_actions", duplicate_result)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    extra = _capture_final_status(captured)[3]["extra"]
+    assert extra["cards_added"] == 0
+    assert extra["capture_result"]["applied"]["added"] == 0
+    assert extra["capture_result"]["skipped"]["duplicate_active"] == 1
+    assert extra["memory_action_status"] == {
+        "status": "ok",
+        "results": 1,
+        "effects": 0,
+        "applied_count": 0,
+        "skipped_count": 1,
+        "failed_count": 0,
+    }
+
+
+def test_capture_partial_server_batch_completes_with_failed_bucket(monkeypatch):
+    reply = json.dumps({"cards": [
+        {
+            "action": "add",
+            "summary": "First memory.",
+            "content": "This item is rejected by the server in the test.",
+        },
+        {
+            "action": "add",
+            "summary": "Second memory.",
+            "content": "This valid item must still count as applied.",
+        },
+    ]})
+    captured, job = _install_capture_job_harness(monkeypatch, reply)
+
+    def partial_result(actions):
+        captured["actions"].extend(actions)
+        return {
+            "status": "partial",
+            "results": [
+                {"status": "error", "error": "source_invalid", "http_status": 400},
+                {"status": "ok", "action": "memory.add", "http_status": 200},
+            ],
+            "effects": [{"type": "memory_added", "memory_id": "mem_2"}],
+            "total_count": 2,
+            "applied_count": 1,
+            "skipped_count": 0,
+            "failed_count": 1,
+        }
+
+    monkeypatch.setattr(crc, "execute_memory_actions", partial_result)
+    # The server error would normally trigger the one semantic re-ask. Consume
+    # the shared budget as a prior format bounce marker so this test isolates
+    # partial-result accounting rather than retry behavior.
+    monkeypatch.setattr(
+        crc,
+        "_memory_agent_parse_with_bounce",
+        lambda *args, **kwargs: ((json.loads(reply)["cards"], None), "bounced_ok"),
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    final = _capture_final_status(captured)
+    assert final[1:3] == ("completed", "capture_memory_actions_partial")
+    result = final[3]["extra"]["capture_result"]
+    assert result["status"] == "partial"
+    assert result["applied"]["added"] == 1
+    assert result["failed"] == {
+        "count": 1,
+        "by_error": {"source_invalid": 1},
+    }
+    assert final[3]["extra"]["cards_added"] == 1
 
 
 def test_capture_job_empty_cards_completes_noop_without_memory_write(monkeypatch):

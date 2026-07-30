@@ -7956,6 +7956,20 @@ _CHAT_FINALIZE_REPLY_ONCE_SQL = (
     "  INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
     "  SELECT %s, %s, %s, %s FROM won "
     "  RETURNING doc AS reply_doc"
+    "), learned_vision AS ("
+    "  UPDATE model_api_routes r SET "
+    "    vision_test_status='unsupported',"
+    "    last_vision_test_error='vision_model_required',"
+    "    last_vision_test_at=now(),updated_at=now() "
+    "  FROM won, inserted "
+    "  WHERE inserted.reply_doc->>'turn_failure_error_class'="
+    "    'vision_model_required' "
+    "    AND r.user_id=%s AND r.is_active "
+    "    AND r.id::text=COALESCE("
+    "      won.parent_doc->>'vision_main_route_id','') "
+    "    AND r.updated_at=NULLIF("
+    "      won.parent_doc->>'vision_main_route_updated_at','')::timestamptz "
+    "  RETURNING r.id"
     ") "
     "SELECT won.parent_doc, inserted.reply_doc FROM won CROSS JOIN inserted"
 )
@@ -7999,6 +8013,7 @@ def chat_finalize_reply_once(
                 reply_msg_id,
                 reply_ts,
                 Jsonb(reply_doc),
+                user_id,
             ),
         ).fetchone()
     if row is None:
@@ -9076,6 +9091,38 @@ def model_api_active_route(user_id: str) -> dict | None:
         return None
 
 
+def model_api_active_route_version(user_id: str) -> dict | None:
+    """Return the active route's exact visual-capability fence.
+
+    The microsecond timestamp is an internal compare-and-swap token, not a public
+    route field. Setup probes and Hosted V1 failure learning use it so delayed
+    provider results cannot mark a route the user changed in the meantime.
+    """
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT r.id::text,c.provider,r.model,c.base_url,"
+                "to_char(r.updated_at AT TIME ZONE 'UTC',"
+                "  'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+                "FROM model_api_routes r "
+                "JOIN model_api_credentials c ON c.id=r.credential_id "
+                "WHERE r.user_id=%s AND r.is_active",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "route_id": str(row[0]),
+            "provider": str(row[1] or ""),
+            "model": str(row[2] or ""),
+            "base_url": str(row[3] or ""),
+            "updated_at_token": str(row[4] or ""),
+        }
+    except Exception as e:
+        log.error("[db] model_api_active_route_version(%s) failed: %s", user_id, e)
+        return None
+
+
 def model_api_vision_route(user_id: str) -> dict | None:
     """Return the dedicated vision route with its encrypted credential."""
     try:
@@ -9213,15 +9260,33 @@ def model_api_route_mark_vision_test(
     *,
     status: str,
     error: str = "",
+    expected_updated_at: str = "",
 ) -> bool:
     try:
         with get_pool().connection() as conn:
-            cur = conn.execute(
-                "UPDATE model_api_routes SET vision_test_status = %s, "
-                "       last_vision_test_error = %s, last_vision_test_at = now(), "
-                "       updated_at = now() WHERE user_id = %s AND id = %s",
-                (status, str(error or "")[:300], user_id, route_id),
-            )
+            if expected_updated_at:
+                cur = conn.execute(
+                    "UPDATE model_api_routes SET vision_test_status = %s, "
+                    "       last_vision_test_error = %s, "
+                    "       last_vision_test_at = now(), updated_at = now() "
+                    "WHERE user_id = %s AND id = %s "
+                    "AND updated_at = %s::timestamptz",
+                    (
+                        status,
+                        str(error or "")[:300],
+                        user_id,
+                        route_id,
+                        expected_updated_at,
+                    ),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE model_api_routes SET vision_test_status = %s, "
+                    "       last_vision_test_error = %s, "
+                    "       last_vision_test_at = now(), updated_at = now() "
+                    "WHERE user_id = %s AND id = %s",
+                    (status, str(error or "")[:300], user_id, route_id),
+                )
         return cur.rowcount > 0
     except Exception as e:
         log.error(

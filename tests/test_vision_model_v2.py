@@ -12,6 +12,93 @@ def _store(user_id="u1"):
     return SimpleNamespace(user_id=user_id)
 
 
+def test_setup_vision_probe_kick_is_daemonized_and_nonblocking(
+    monkeypatch,
+    enable_setup_auto_vision_probe,
+):
+    created = {}
+
+    class FakeThread:
+        def __init__(self, *, target, args, daemon, name):
+            created.update(
+                target=target,
+                args=args,
+                daemon=daemon,
+                name=name,
+                started=False,
+            )
+
+        def start(self):
+            created["started"] = True
+
+    monkeypatch.setattr(setup_core.threading, "Thread", FakeThread)
+
+    setup_core._kick_setup_main_vision_test(
+        _store("user-auto-probe"),
+        "route-1",
+        "2026-07-30T12:00:00.123456Z",
+        "caller-key",
+    )
+
+    assert created["target"] is setup_core._run_setup_main_vision_test
+    assert created["args"][1:] == (
+        "route-1",
+        "2026-07-30T12:00:00.123456Z",
+        "caller-key",
+    )
+    assert created["daemon"] is True
+    assert created["started"] is True
+
+
+def test_setup_vision_probe_reuses_main_test_with_route_version_fence(
+    monkeypatch,
+    enable_setup_auto_vision_probe,
+):
+    route = {"id": "route-1", "is_active": True}
+    captured = {}
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_route_get",
+        lambda user_id, route_id: route,
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_active_route_version",
+        lambda user_id: {
+            "route_id": "route-1",
+            "updated_at_token": "2026-07-30T12:00:00.123456Z",
+        },
+    )
+    monkeypatch.setattr(
+        setup_core,
+        "_test_route_vision_or_error",
+        lambda store, current, caller_api_key, **kwargs: captured.update(
+            {
+                "store": store,
+                "route": current,
+                "caller_api_key": caller_api_key,
+                **kwargs,
+            }
+        ),
+    )
+
+    store = _store("user-auto-probe")
+    setup_core._run_setup_main_vision_test(
+        store,
+        "route-1",
+        "2026-07-30T12:00:00.123456Z",
+        "caller-key",
+    )
+
+    assert captured == {
+        "store": store,
+        "route": route,
+        "caller_api_key": "caller-key",
+        "reuse_cached": False,
+        "expected_updated_at": "2026-07-30T12:00:00.123456Z",
+    }
+
+
 def test_config_reports_text_only_vps_main_as_unsupported(monkeypatch):
     monkeypatch.setattr(
         setup_core.accounts_onboarding,
@@ -113,6 +200,41 @@ def test_config_reports_model_api_v1_as_available_with_resident_observer(monkeyp
     assert config["effective_status"] == "untested"
     assert config["mode"] == "follow_main"
     assert config["main_model"]["vision_test_status"] == "untested"
+
+
+def test_config_reports_model_api_follow_main_unsupported_signal(monkeypatch):
+    monkeypatch.setattr(
+        setup_core.accounts_onboarding,
+        "_load_onboarding_route",
+        lambda _store: "model_api",
+    )
+    monkeypatch.setattr(
+        setup_core.hosted_config_store,
+        "hosted_runtime_v2_enabled_strict",
+        lambda _store: True,
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_active_route",
+        lambda _uid: {
+            "id": "main",
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "vision_test_status": "unsupported",
+            "last_vision_test_error": "vision_model_incompatible",
+        },
+    )
+    monkeypatch.setattr(setup_core.db, "model_api_vision_route", lambda _uid: None)
+
+    config = setup_core._vision_config_payload(_store())
+
+    assert config["available"] is True
+    assert config["runtime"] == "v2"
+    assert config["mode"] == "follow_main"
+    assert config["effective_status"] == "unsupported"
+    assert config["main_model"]["vision_test_status"] == "unsupported"
+    assert config["main_model"]["provider"] == "openrouter"
+    assert config["main_model"]["model"] == "deepseek/deepseek-v4-pro"
 
 
 def test_config_reports_model_api_v1_without_main_as_not_configured(monkeypatch):
@@ -581,7 +703,7 @@ def test_dedicated_route_for_send_does_not_gate_on_resident_capability(monkeypat
     assert error is None
 
 
-def test_follow_main_cached_unsupported_blocks_with_exact_model(monkeypatch):
+def test_follow_main_cached_unsupported_does_not_block_send(monkeypatch):
     route = {
         "id": "main",
         "provider": "anthropic",
@@ -599,12 +721,7 @@ def test_follow_main_cached_unsupported_blocks_with_exact_model(monkeypatch):
     selected, error = vision_routing.dedicated_route_for_send(_store())
 
     assert selected is None
-    assert error == ({
-        "error": "vision_model_incompatible",
-        "retryable": False,
-        "provider": "anthropic",
-        "model": "claude-text-only",
-    }, 400)
+    assert error is None
 
 
 def test_follow_main_untested_still_allows_real_image_call(monkeypatch):
@@ -628,7 +745,7 @@ def test_follow_main_untested_still_allows_real_image_call(monkeypatch):
     assert error is None
 
 
-def test_resident_cached_unsupported_blocks_with_exact_model(monkeypatch):
+def test_resident_cached_unsupported_does_not_block_send(monkeypatch):
     monkeypatch.setattr(vision_routing.db, "model_api_vision_route", lambda _uid: None)
     monkeypatch.setattr(
         vision_routing.accounts_onboarding,
@@ -648,9 +765,21 @@ def test_resident_cached_unsupported_blocks_with_exact_model(monkeypatch):
     selected, error = vision_routing.dedicated_route_for_send(_store())
 
     assert selected is None
-    assert error == ({
-        "error": "vision_model_incompatible",
-        "retryable": False,
+    assert error is None
+
+
+def test_selected_unsupported_dedicated_route_stays_pinned(monkeypatch):
+    route = {
+        "id": "vision",
         "provider": "openrouter",
         "model": "text/model",
-    }, 400)
+        "vision_test_status": "unsupported",
+    }
+    monkeypatch.setattr(
+        vision_routing.db, "model_api_vision_route", lambda _uid: route
+    )
+
+    selected, error = vision_routing.dedicated_route_for_send(_store())
+
+    assert selected == route
+    assert error is None

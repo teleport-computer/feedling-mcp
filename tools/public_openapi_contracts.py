@@ -633,7 +633,28 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "enclave_pk_fpr": {"type": "string"},
             "type": {"type": "string", "enum": ["moment", "quote", "fact", "event", "insight", "reflection"]},
             "occurred_at": {"type": "string", "minLength": 1, "description": "Plaintext ISO-8601 ordering metadata."},
-            "source": {"type": "string", "default": "live_conversation"},
+            "source": {
+                "type": "string",
+                "enum": [
+                    "bootstrap",
+                    "chat",
+                    "genesis_import",
+                    "genesis_resident_distill",
+                    "history_import",
+                    "hosted_runtime_state",
+                    "live_conversation",
+                    "memory_capture",
+                    "memory_dream",
+                    "memory_migrate",
+                    "model_api_capture",
+                    "model_api_correction",
+                    "model_api_repair",
+                    "ombre_brain_sync",
+                    "resident_absorb",
+                    "resident_patch",
+                ],
+                "default": "live_conversation",
+            },
             "anchor_memory_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
         },
         "if": {
@@ -1177,6 +1198,27 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "pulse": {"type": "number", "minimum": 0, "maximum": 1},
             "occurred_at": {"type": "string", "maxLength": 80},
             "anchor_memory_ids": {"type": "array", "items": {"type": "string"}},
+            "source": {
+                "type": "string",
+                "enum": [
+                    "bootstrap",
+                    "chat",
+                    "genesis_import",
+                    "genesis_resident_distill",
+                    "history_import",
+                    "hosted_runtime_state",
+                    "live_conversation",
+                    "memory_capture",
+                    "memory_dream",
+                    "memory_migrate",
+                    "model_api_capture",
+                    "model_api_correction",
+                    "model_api_repair",
+                    "ombre_brain_sync",
+                    "resident_absorb",
+                    "resident_patch",
+                ],
+            },
         },
         "additionalProperties": True,
     },
@@ -1201,6 +1243,17 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "anchor_memory_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
             "reason": {"type": "string"},
+            "capture_mode": {
+                "type": "string",
+                "enum": [
+                    "agent_tool",
+                    "genesis_resident_distill",
+                    "memory_capture",
+                    "memory_dream",
+                    "repair",
+                    "state",
+                ],
+            },
             "source_chat_message_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
         },
         "additionalProperties": True,
@@ -1230,6 +1283,35 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 }
             ]
         },
+    },
+    "MemoryActionResult": {
+        "type": "object",
+        "required": ["status", "http_status"],
+        "properties": {
+            "status": {"type": "string", "enum": ["ok", "error"]},
+            "http_status": {"type": "integer", "description": "Per-item execution status; inspect it even when the batch HTTP status is 200."},
+            "action": {"type": "string"},
+            "error": {"type": "string"},
+            "id": {"type": "string"},
+            "memory_id": {"type": "string"},
+            "noop": {"type": "boolean"},
+            "skipped": {"type": "string"},
+        },
+        "additionalProperties": True,
+    },
+    "MemoryActionsResponse": {
+        "type": "object",
+        "required": ["status", "results", "effects", "total_count", "applied_count", "skipped_count", "failed_count"],
+        "properties": {
+            "status": {"type": "string", "enum": ["ok", "partial", "failed"]},
+            "results": {"type": "array", "items": {"$ref": "#/components/schemas/MemoryActionResult"}},
+            "effects": {"type": "array", "items": {"type": "object"}},
+            "total_count": {"type": "integer", "minimum": 0},
+            "applied_count": {"type": "integer", "minimum": 0},
+            "skipped_count": {"type": "integer", "minimum": 0},
+            "failed_count": {"type": "integer", "minimum": 0},
+        },
+        "additionalProperties": False,
     },
     "MemoryAddRequest": {
         "type": "object",
@@ -1781,7 +1863,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/chat/turn-activity/{turn_id}/events"): "Append one authenticated V1 resident tool transition. This endpoint is used by the shipped resident io_cli runtime, accepts only running/success/failure plus display-safe fixed metadata, rejects V2-owned users, and never accepts tool arguments, model prose, or result bodies.",
     ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",
     ("post", "/v1/memory/fetch"): "Fetch full records for selected memory IDs. Sensitive fetch behavior is not part of the current public contract.",
-    ("post", "/v1/memory/actions"): "Apply up to 20 memory actions in order. The batch is not transactional and Idempotency-Key is not supported.",
+    ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. A structurally valid batch returns HTTP 200 even when some or all items fail; inspect every result and the applied/skipped/failed counts. The batch is not transactional and Idempotency-Key is not supported.",
     ("post", "/v1/perception/report"): "Submit device context. Sensitive signals must use encrypted envelopes; inspect each results entry even when HTTP status is 200.",
     ("get", "/v1/perception/app_open"): "Legacy iOS Shortcut compatibility endpoint. This GET records an event and therefore has side effects.",
     ("get", "/v1/perception/app_close"): "iOS Shortcut compatibility endpoint for the automation's \"is closed\" trigger. This GET records an event and therefore has side effects.",
@@ -1872,6 +1954,20 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("post", "/v1/memory/actions"): {
+        "200": {
+            "description": (
+                "The structurally valid batch was processed item by item. "
+                "Inspect status, counts, and every results entry; item failures "
+                "do not change the batch HTTP status."
+            ),
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/MemoryActionsResponse"}
+                }
+            },
+        },
+    },
     ("get", "/v1/web/settings"): {
         "200": {
             "description": "Current web-search state for the authenticated user.",

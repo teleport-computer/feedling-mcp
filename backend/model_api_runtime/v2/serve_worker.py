@@ -1899,6 +1899,16 @@ def _apply_memory_actions(
             status,
             str(body)[:300],
         )
+    elif int(body.get("failed_count") or 0) > 0:
+        log.warning(
+            "[v2.serve_worker] memory batch had item failures user=%s "
+            "applied=%s skipped=%s failed=%s body=%s",
+            user_id,
+            body.get("applied_count"),
+            body.get("skipped_count"),
+            body.get("failed_count"),
+            str(body)[:500],
+        )
     return body
 
 

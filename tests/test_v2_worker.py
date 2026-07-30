@@ -812,6 +812,48 @@ def test_image_turn_unrelated_failure_keeps_original_failure_owner(monkeypatch):
     assert recorded == [(uid, "turn_failed:runtimeerror")]
 
 
+def test_image_turn_explicit_openrouter_rejection_keeps_vision_required_slug(
+    monkeypatch,
+):
+    uid = "u_w_image_openrouter_unsupported"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    async def _boom(config, messages, *, tools=None, **_kwargs):
+        raise provider_client.ProviderError(
+            "provider_http_404: No endpoints found that support image input",
+            status_code=404,
+        )
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [{
+            "id": "image-parent",
+            "ts": 5.0,
+            "role": "user",
+            "content": "What is in this image?",
+            "has_image": True,
+            "image_mime": "image/png",
+        }],
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "failed"
+    with db.get_pool().connection() as conn:
+        marker = conn.execute(
+            "SELECT error_class FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert marker == ("vision_model_required",)
+
+
 def test_process_job_terminal_failure_tolerates_missing_callback(monkeypatch):
     """record_terminal_error defaults to None (dependency boundary preserved for
     callers that don't supply it) — the failure path must not crash when it's
