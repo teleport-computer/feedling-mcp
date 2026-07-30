@@ -12,8 +12,8 @@ a direct column-for-column replica, same as ``v2_runtime_state``.
 from alembic import op
 
 
-revision = "0008_v2_chat_tail_anchor"
-down_revision = "0007_chat_activity_snapshot"
+revision = "0010_v2_chat_tail_anchor"
+down_revision = "0009_provider_latency"
 branch_labels = None
 depends_on = None
 
