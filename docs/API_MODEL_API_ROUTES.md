@@ -167,9 +167,11 @@ resident/VPS 路径启动隔离、隐藏的双图 probe 并返回 `202 testing`�
 推送、摘要、Live Activity 或 capture。旧 resident 不具备该 side-channel 时返回
 `409 vision_resident_update_required`。probe 回传端点位于 `/v1/internal/**`，不是公开 API。
 
-一旦精确 provider/model 的缓存 verdict 已是 `unsupported`，图片仍可在客户端被选择，
-但发送入口会在持久化前同步返回 `vision_model_incompatible` 与精确 provider/model；
-`untested / testing / failed` 不会被这个缓存闸拦截，仍进入真实调用。
+精确 provider/model 的缓存 verdict（包括 `unsupported`）只通过
+`GET /v1/vision/config` 的 `main_model.vision_test_status / effective_status` 提供给客户端
+展示提示，不参与发送门禁。`follow_main` 图片继续走当前主模型；已选择 dedicated route
+时仍固定走该 route。所有 `untested / testing / failed / unsupported` 状态都进入真实调用，
+最终回合结果以 provider 的真实响应为准。
 
 ### `DELETE /v1/model_api/routes/{route_id}` —— 删除 route
 

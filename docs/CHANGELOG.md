@@ -148,8 +148,10 @@ T1 前写入它，而 replicator 只搬 RDS 中存在的行 ⇒ 该行 T1 前就
 才发真实双图探测；resident 走隔离 session 的隐藏双图 side-channel，测试内容不进入
 Chat、推送、摘要、Live Activity 或 capture。配置状态统一为
 `testing / ok / unsupported / failed / untested`，绑定的 provider、model 或 resident
-入口变化会使旧结果失效。已明确缓存为 `unsupported` 的图片发送会在写消息前返回
-`vision_model_incompatible` 与精确 provider/model；未知状态仍允许真实调用。
+入口变化会使旧结果失效。最终决策是所有探测状态都只作为客户端提示信号，不做发送
+门禁：图片始终沿用户配置的主模型或 dedicated route 进入真实调用。只有 provider
+真正以明确的 text-only 图片错误拒绝本回合时，才返回 `vision_model_required` 与可操作
+的中英双语换模型提示。
 
 **[DONE] 图片失败归属只在证据明确时挂到视觉模型。** auth、quota、model、provider、
 rate limit、upstream、timeout、reply parse 和 dedicated observer 失败映射到稳定

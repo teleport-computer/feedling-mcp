@@ -2555,7 +2555,16 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
         row.get("error_code"), row.get("error_class")
     )
     blame = notices_catalog.blame_for(error_class)
-    user_text = notices_catalog.user_text_for(error_class)
+    try:
+        from accounts import registry as accounts_registry
+
+        language = accounts_registry._get_user_archive_language(user_id) or ""
+    except Exception:  # noqa: BLE001 — locale lookup must not block failure delivery
+        language = ""
+    user_text = notices_catalog.user_text_for(
+        error_class,
+        language=language,
+    )
     reply_text = (
         user_text
         if blame == "user_provider"

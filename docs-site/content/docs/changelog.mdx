@@ -46,10 +46,10 @@ change must not be interpreted as an API guarantee.
   Model API routes return a terminal `ok`, `unsupported`, `failed`, or
   `untested` result. Resident runtimes return `202 testing` while an isolated,
   hidden probe runs; clients then refresh `GET /v1/vision/config`. Known
-  `unsupported` provider/model bindings reject image sends immediately with
-  `vision_model_incompatible`, while untested bindings still receive a real
-  call. Runtime failures expose stable visual error codes and the exact
-  provider/model without putting probe traffic into Chat history or activity.
+  `unsupported` verdicts are non-blocking signals for client guidance: image
+  sends still follow the user's configured main or dedicated route unchanged.
+  Runtime failures expose stable visual error codes and the exact provider/model
+  without putting probe traffic into Chat history or activity.
 
 - **Hosted Runtime V2 chat sends can request provider reasoning per turn.**
   `POST /v1/model_api/chat/send` accepts the optional boolean

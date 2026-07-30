@@ -1222,6 +1222,7 @@ def test_text_only_image_failure_posts_vision_model_guidance(monkeypatch, tmp_pa
     monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
     monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: True)
     monkeypatch.setattr(crc, "IMAGE_TEMP_DIR", tmp_path)
+    monkeypatch.setitem(crc._whoami_cache, "archive_language", "zh-Hans")
     crc._reset_system_notice_state()
     upstream = RuntimeError(
         "provider_http_400: Failed to deserialize the JSON body into the target "
@@ -1240,7 +1241,10 @@ def test_text_only_image_failure_posts_vision_model_guidance(monkeypatch, tmp_pa
         if call.kwargs.get("role") != "system"
     ]
     assert len(visible) == 1
-    assert visible[0].args[0] != crc.FALLBACK_REPLY
+    assert visible[0].args[0] == (
+        "由于当前模型没有视觉能力，模型无法收到图片信息，"
+        "建议更改模型或在设置页单独添加视觉模型"
+    )
     assert visible[0].kwargs["turn_failure_error_class"] == "vision_model_required"
     assert visible[0].kwargs["turn_failure_blame"] == "user_provider"
 

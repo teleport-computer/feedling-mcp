@@ -665,8 +665,20 @@ class VisionObserverFailure(RuntimeError):
 
 
 def _vision_failure_user_text(error_class: str, raw_user_text: str) -> str:
-    chinese = bool(re.search(r"[\u4e00-\u9fff]", raw_user_text or ""))
+    raw = raw_user_text or ""
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", raw))
+    has_latin = bool(re.search(r"[A-Za-z]", raw))
+    archive_language = str(
+        globals().get("_whoami_cache", {}).get("archive_language") or ""
+    ).strip().lower()
+    chinese = has_cjk or (
+        not has_latin and archive_language.startswith("zh")
+    )
     zh = {
+        "vision_model_required": (
+            "由于当前模型没有视觉能力，模型无法收到图片信息，"
+            "建议更改模型或在设置页单独添加视觉模型"
+        ),
         "vision_model_auth_invalid": "视觉模型的 API Key 无效或已过期，请到设置里重新保存。",
         "vision_model_quota_insufficient": "视觉模型服务额度不足，充值后再试。",
         "vision_model_not_found": "当前视觉模型不可用，请到设置里更换模型。",
@@ -679,6 +691,10 @@ def _vision_failure_user_text(error_class: str, raw_user_text: str) -> str:
         "vision_model_failed": "视觉模型处理失败，请重试；如果仍失败，请更换模型。",
     }
     en = {
+        "vision_model_required": (
+            "Your current model can't process images, so it didn't receive this "
+            "picture. Switch models, or add a dedicated vision model in Settings."
+        ),
         "vision_model_auth_invalid": "The vision model API key is invalid or expired. Save it again in Settings.",
         "vision_model_quota_insufficient": "The vision model service is out of quota. Top it up, then try again.",
         "vision_model_not_found": "The selected vision model is unavailable. Choose another model in Settings.",
@@ -728,7 +744,7 @@ _ERROR_CLASS_RULES = (
     # and the broad 404+model fallback in classify_agent_error so a text-only
     # main model gets the dedicated Settings guidance.
     ("vision_model_required", "user_provider",
-     "当前主模型不支持看图，请前往设置添加或切换支持视觉的模型。",
+     "由于当前模型没有视觉能力，模型无法收到图片信息，建议更改模型或在设置页单独添加视觉模型",
      re.compile(r"unknown variant `image_url`, expected `text`"
                 r"|no endpoints found that support image input", re.I)),
     ("provider_incompatible", "user_provider",
@@ -774,6 +790,7 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
         blame = (
             "user_provider"
             if exc.error_class in {
+                "vision_model_required",
                 "vision_model_auth_invalid",
                 "vision_model_quota_insufficient",
                 "vision_model_not_found",
@@ -9280,6 +9297,7 @@ def poll_proactive_jobs(since: float) -> dict:
 def _vision_probe_error_code(exc: BaseException) -> str:
     notice = classify_agent_error(exc)
     return {
+        "vision_model_required": "vision_model_required",
         "auth_invalid": "vision_model_auth_invalid",
         "quota_insufficient": "vision_model_quota_insufficient",
         "model_not_found": "vision_model_not_found",
@@ -13303,11 +13321,7 @@ def _process_messages(messages: list) -> float:
                 )
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
-            if (
-                content_type == "image"
-                and not isinstance(e, VisionObserverFailure)
-                and classify_agent_error(e).error_class != "vision_model_required"
-            ):
+            if content_type == "image" and not isinstance(e, VisionObserverFailure):
                 e = VisionObserverFailure(
                     _vision_probe_error_code(e),
                     detail=type(e).__name__,
