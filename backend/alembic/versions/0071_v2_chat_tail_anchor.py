@@ -1,4 +1,4 @@
-"""v2 chat tail anchor: pinned verbatim-tail start seq per user.
+"""v2 chat tail anchor: pinned start seq of the optional replay window per user.
 
 Kept in its own table rather than as a column on v2_conversation_summary:
 that head row is guarded by trg_v2_segmented_summary_head, which rejects any

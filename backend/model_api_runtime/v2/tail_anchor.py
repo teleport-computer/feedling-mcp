@@ -1,13 +1,14 @@
-"""Hysteresis anchor for the V2 verbatim chat tail.
+"""Hysteresis anchor for the V2 optional chat replay window.
 
-The tail's start seq used to be recomputed every turn from the newest
-``max_turns`` genuine user turns, so the window slid forward on every new
-message and the prompt prefix after the summary changed each round — provider
-prompt caches require an exact prefix match, so that is a guaranteed miss.
+The optional (pre-required-tail) replay window's start seq used to be
+recomputed every turn from the newest ``max_turns`` genuine user turns, so
+the window slid forward on every new message and the prompt prefix after the
+summary changed each round — provider prompt caches require an exact prefix
+match, so that is a guaranteed miss.
 
 This module keeps the start seq *pinned* until enough new turns accumulate,
 then advances it once.  Most turns are therefore pure appends behind a
-byte-identical prefix; the cost is that the verbatim tail floats between
+byte-identical prefix; the cost is that the optional window floats between
 ``target_turns`` and ``max_turns_before_advance``.
 
 Deliberately pure: no DB, no envelope, no provider.  The advance policy can be
@@ -26,7 +27,8 @@ DEFAULT_MAX_TURNS_BEFORE_ADVANCE = 60
 
 @dataclass(frozen=True)
 class TailAnchorDecision:
-    """Where the verbatim tail starts this turn, and whether it just moved."""
+    """Where the optional replay window starts this turn, and whether it just
+    moved."""
 
     anchor_seq: int
     advanced: bool

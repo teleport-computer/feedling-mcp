@@ -269,6 +269,168 @@ def _optional_anchor_deps(uid: str, monkeypatch, *, watermark_seq: int) -> "work
     )
 
 
+def _spy_on_boundary_query(monkeypatch):
+    """Wrap (not stub) ``db.chat_recent_genuine_turn_boundary_seq`` so calls
+    are counted while the real implementation still runs — a stub would hide
+    whether the wiring under test paid for a real boundary query or not.
+
+    Copied verbatim from
+    archive/v2-tail-anchor-wrong-wiring:tests/test_v2_tail_anchor_store.py.
+    """
+    calls: list[tuple[tuple, dict]] = []
+    original = db.chat_recent_genuine_turn_boundary_seq
+
+    def _spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(db, "chat_recent_genuine_turn_boundary_seq", _spy)
+    return calls
+
+
+def _run_one_turn(uid, deps, monkeypatch, *, tag: str) -> None:
+    """追加一条新用户消息并完整跑一个 chat 回合。
+
+    调用形态照抄
+    ``test_prompt_prefix_is_byte_identical_across_consecutive_turns`` 里已经
+    跑通的写法（enqueue_job(uid, "chat") / claim_next_job(worker_id) /
+    process_job(job, deps, provider_config=..., api_key=None,
+    runtime_token=...)) —— 不套用本文件旧版 docstring 里示意性的参数拼法。
+    """
+    _seed_chat_row(uid, f"{uid}-{tag}", 3000.0 + hash(tag) % 1000, "user")
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job(f"turn-worker-{tag}")
+    assert job is not None, f"job 未被 claim（tag={tag}）——rig 没搭对"
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt",
+    ))
+    assert status == "completed", f"回合 tag={tag} 未 completed：{status!r}"
+
+
+def test_anchor_holds_within_hysteresis_band(monkeypatch):
+    """滞后区内：锚点值不变，且不额外付出锚点专属的那次边界查询代价。
+
+    ``db.chat_recent_genuine_turn_boundary_seq`` 在 worker.py 里被调用两处：
+    一处为 ``compact_through_seq`` 服务，每回合无条件调用一次（与本设计无关，
+    改动前后都存在）；另一处仅在 ``stored_anchor is None or turns_after_anchor
+    >= _CHAT_TAIL_ANCHOR_MAX_TURNS`` 时才调用，这才是滞后区设计声称要跳过的
+    那次。因此滞后区内的期望调用次数是 1（只有前者），不是 0——断言 0 会把
+    这条测试钉死在与当前实现不符的期望上，对着一个正确实现报红。
+    """
+    uid = "u_optanchor_hold"
+    seed_user(uid)
+    _reset_anchor_hotpath_user(uid)
+
+    seqs = [
+        _seed_chat_row(uid, f"{uid}-h{i}", 1000.0 + i,
+                       "user" if i % 2 == 0 else "openclaw")
+        for i in range(60)
+    ]
+    watermark = seqs[-1]
+    # 锚点落在滞后区内：其后的真实用户轮数远小于 _CHAT_TAIL_ANCHOR_MAX_TURNS
+    jobs_store.set_chat_tail_anchor(uid, seqs[-6])
+    before = jobs_store.get_chat_tail_anchor(uid)
+
+    deps = _optional_anchor_deps(uid, monkeypatch, watermark_seq=watermark)
+    boundary_calls = _spy_on_boundary_query(monkeypatch)
+    _run_one_turn(uid, deps, monkeypatch, tag="hold")
+
+    assert jobs_store.get_chat_tail_anchor(uid) == before, "滞后区内锚点不应移动"
+    assert len(boundary_calls) == 1, (
+        f"滞后区内只应付出 compact_through_seq 那次无条件边界查询，"
+        f"锚点专属的那次不应触发；实际被调用 {len(boundary_calls)} 次"
+    )
+
+
+def test_anchor_advances_once_past_the_ceiling(monkeypatch):
+    """越过滞后上限：锚点前移一次，且锚点专属的那次边界查询确实被调用。
+
+    期望调用次数是 2：``compact_through_seq`` 的无条件那次，加上越过滞后
+    上限后触发的锚点专属那次（见上面 hold 测试的说明）。只断言「非空」
+    区分不出这两种情形——hold 场景本身也会有 1 次非零调用。
+    """
+    uid = "u_optanchor_advance"
+    seed_user(uid)
+    _reset_anchor_hotpath_user(uid)
+
+    # 制造远超滞后上限的用户轮数：锚点钉在最早，其后累积 > 上限
+    total_turns = worker._CHAT_TAIL_ANCHOR_MAX_TURNS + 10
+    seqs = []
+    for i in range(total_turns * 2):
+        seqs.append(_seed_chat_row(uid, f"{uid}-a{i}", 1000.0 + i,
+                                   "user" if i % 2 == 0 else "openclaw"))
+    watermark = seqs[-1]
+    jobs_store.set_chat_tail_anchor(uid, seqs[0])
+    before = jobs_store.get_chat_tail_anchor(uid)
+
+    deps = _optional_anchor_deps(uid, monkeypatch, watermark_seq=watermark)
+    boundary_calls = _spy_on_boundary_query(monkeypatch)
+    _run_one_turn(uid, deps, monkeypatch, tag="advance")
+
+    after = jobs_store.get_chat_tail_anchor(uid)
+    assert after > before, f"越过上限后锚点应前移（{before} -> {after}）"
+    assert len(boundary_calls) == 2, (
+        f"越过上限时锚点专属的那次边界查询必须真的触发（预期 2 次，含 "
+        f"compact_through_seq 的无条件那次）；实际 {len(boundary_calls)} 次"
+    )
+
+
+def test_prefix_stable_again_after_an_advance(monkeypatch):
+    """前移那一轮前缀变化是设计内的；此后必须重新稳定。
+
+    这条防的是「锚点每轮都在前移」——那样每轮都合法地变，但等于没修。
+
+    同 ``test_prompt_prefix_is_byte_identical_across_consecutive_turns``：把
+    ``_CHAT_TAIL_MAX_TURNS`` 下调到 3。历史只有 30 轮时，若不下调，
+    ``target_turns - required_turn_count`` 算出来的 ``optional_limit`` 在
+    s1/s2 两轮之间虽然不同，但两者都远大于候选池的 30 轮，切片会截断到同一个
+    「全量池」而"碰巧"长得一样——旧公式的退化不会被观察到，测试就测不出
+    正在验收的那个 bug（用短路禁用锚点分支实测验证过：不下调时这条测试
+    对着错误实现仍然全绿）。
+    """
+    import json
+
+    uid = "u_optanchor_restable"
+    seed_user(uid)
+    _reset_anchor_hotpath_user(uid)
+    monkeypatch.setattr(worker, "_CHAT_TAIL_MAX_TURNS", 3)
+
+    seqs = [
+        _seed_chat_row(uid, f"{uid}-r{i}", 1000.0 + i,
+                       "user" if i % 2 == 0 else "openclaw")
+        for i in range(60)
+    ]
+    watermark = seqs[-1]
+    jobs_store.set_chat_tail_anchor(uid, seqs[0])  # 立刻会触发一次前移
+
+    captured: list[list[dict]] = []
+
+    async def _capture(config, messages, *, tools=None, **_kw):
+        captured.append(json.loads(json.dumps(messages, ensure_ascii=False,
+                                              sort_keys=True, default=str)))
+        return {"reply": "ok", "tool_calls": [],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+    deps = _optional_anchor_deps(uid, monkeypatch, watermark_seq=watermark)
+    monkeypatch.setattr(provider_client, "chat_completion_async", _capture)
+
+    _run_one_turn(uid, deps, monkeypatch, tag="adv")   # 第 1 轮：可能前移
+    anchor_after_advance = jobs_store.get_chat_tail_anchor(uid)
+    _run_one_turn(uid, deps, monkeypatch, tag="s1")    # 第 2 轮
+    _run_one_turn(uid, deps, monkeypatch, tag="s2")    # 第 3 轮
+
+    assert jobs_store.get_chat_tail_anchor(uid) == anchor_after_advance, (
+        "前移之后锚点必须重新稳定，不能每轮都动"
+    )
+    assert len(captured) == 3
+    prefix_2 = _prefix_before_required(captured[1], f"plaintext-{uid}-s1")
+    prefix_3 = _prefix_before_required(captured[2], f"plaintext-{uid}-s1")
+    assert json.dumps(prefix_2, sort_keys=True, ensure_ascii=False) == \
+           json.dumps(prefix_3, sort_keys=True, ensure_ascii=False), (
+        "前移之后的连续两轮，前缀应重新逐字节一致"
+    )
+
+
 def _prefix_before_required(messages, required_first_content):
     """messages 中 required tail 第一条之前的全部消息（含 system 与摘要块）。"""
     for index, message in enumerate(messages):

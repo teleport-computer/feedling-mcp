@@ -6418,7 +6418,8 @@ def upsert_runtime_state(
 
 
 def get_chat_tail_anchor(user_id: str) -> int | None:
-    """Pinned verbatim-tail start seq, or None when this user has no anchor yet."""
+    """Pinned start seq of the optional replay window, or None when this user
+    has no anchor yet."""
     with _pool().connection() as conn:
         row = conn.execute(
             "SELECT anchor_seq FROM v2_chat_tail_anchor WHERE user_id=%s",
@@ -6430,8 +6431,8 @@ def get_chat_tail_anchor(user_id: str) -> int | None:
 def set_chat_tail_anchor(user_id: str, anchor_seq: int) -> None:
     """Advance the anchor.  Monotonic by construction: a concurrent turn
     holding a stale value can only lose, never drag the anchor backwards
-    (a regressing anchor would lengthen the tail and reorder the cached
-    prefix — precisely what the anchor exists to prevent)."""
+    (a regressing anchor would widen the optional replay window and reorder
+    the cached prompt prefix — precisely what the anchor exists to prevent)."""
     value = max(0, int(anchor_seq))
     with _pool().connection() as conn:
         conn.execute(

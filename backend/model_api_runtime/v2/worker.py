@@ -3137,7 +3137,12 @@ def _make_build_messages_fn(
                 if (_group_start_seq(group) or 0) >= anchor
             ]
         else:
-            # 无锚点（老用户首次进入）：保持原有行为，与改动前逐字等价。
+            # 零历史兜底：只有当这个用户完全没有任何 genuine user 历史时才会走到
+            # 这里——只要历史里有过任意一条，`decide_anchor` 在 stored_anchor 为
+            # None 时也会在本回合内 bootstrap 出一个正数锚点并直接走上面的
+            # if 分支（见 v2_tail_anchor.decide_anchor 与其调用点：
+            # boundary_seq_for_target 为 None 才返回 anchor_seq=0）。因此这条
+            # 分支保持原有的逐轮滑动行为，与改动前逐字等价。
             optional_limit = max(0, target_turns - required_turn_count)
             eligible_optional = (
                 optional_turns[-optional_limit:] if optional_limit else []
