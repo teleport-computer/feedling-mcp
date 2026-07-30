@@ -38,7 +38,10 @@ change must not be interpreted as an API guarantee.
   failure metadata.** Resident V1, Runtime V2, and current VPS residents classify
   the provider rejection as `vision_model_required` and direct the user to add
   or select a vision-capable model instead of showing the generic retry-later
-  reply. Image sends remain ungated: probe status does not block delivery.
+  reply. Runtime V2 also records that exact active provider/model binding as
+  `unsupported`, so later `GET /v1/vision/config` responses can show the
+  non-blocking client hint without requiring a separate Settings probe. Image
+  sends remain ungated: probe status does not block delivery.
 
 - **Main-model image validation now uses one runtime-neutral endpoint.**
   `POST /v1/vision/main/test` trusts only explicit provider catalog modalities;

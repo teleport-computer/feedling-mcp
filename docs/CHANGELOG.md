@@ -151,7 +151,9 @@ Chat、推送、摘要、Live Activity 或 capture。配置状态统一为
 入口变化会使旧结果失效。最终决策是所有探测状态都只作为客户端提示信号，不做发送
 门禁：图片始终沿用户配置的主模型或 dedicated route 进入真实调用。只有 provider
 真正以明确的 text-only 图片错误拒绝本回合时，才返回 `vision_model_required` 与可操作
-的中英双语换模型提示。
+的中英双语换模型提示；Runtime V2 同时把该回合捕获的 active route 写为
+`unsupported`，让后续 config 查询触发非阻断提示，且用 route 版本 fence 防止旧失败
+覆盖用户刚切换的新配置。
 
 **[DONE] 图片失败归属只在证据明确时挂到视觉模型。** auth、quota、model、provider、
 rate limit、upstream、timeout、reply parse 和 dedicated observer 失败映射到稳定
