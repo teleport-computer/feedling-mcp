@@ -116,6 +116,13 @@ def test_prompt_frontier_failures_use_stable_content_free_status_codes():
             ),
             "vision_model_required",
         ),
+        (
+            provider_client.ProviderError(
+                "provider_http_404: No endpoints found that support image input",
+                status_code=404,
+            ),
+            "vision_model_required",
+        ),
         (worker.TurnError("empty_reply"), "reply_parse_failed"),
         (RuntimeError("opaque internal failure"), "unknown"),
     ],

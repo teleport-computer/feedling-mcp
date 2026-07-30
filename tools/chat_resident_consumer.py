@@ -713,15 +713,18 @@ _ERROR_CLASS_RULES = (
     ("cli_config_invalid", "user_provider",
      "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。",
      re.compile(r"missing the \{message\} placeholder", re.I)),
-    # Real DeepSeek chat/completions response observed 2026-07-30 when
-    # deepseek-v4-flash received an image_url block:
+    # Real provider responses observed 2026-07-30 when text-only models received
+    # an image_url block:
     #   provider_http_400: Failed to deserialize ... unknown variant
-    #   `image_url`, expected `text`
+    #   `image_url`, expected `text`                  (DeepSeek native)
+    #   No endpoints found that support image input  (OpenRouter)
     # Keep this ahead of provider_incompatible's broad "unknown variant" rule
-    # so a text-only main model gets the dedicated Settings guidance.
+    # and the broad 404+model fallback in classify_agent_error so a text-only
+    # main model gets the dedicated Settings guidance.
     ("vision_model_required", "user_provider",
      "当前主模型不支持看图，请前往设置添加或切换支持视觉的模型。",
-     re.compile(r"unknown variant `image_url`, expected `text`", re.I)),
+     re.compile(r"unknown variant `image_url`, expected `text`"
+                r"|no endpoints found that support image input", re.I)),
     ("provider_incompatible", "user_provider",
      "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。",
      re.compile(r"unknown variant|not supported|unsupported (parameter|tool)"
@@ -794,13 +797,17 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
         return AgentErrorNotice("reply_parse_failed", "system",
                                 "系统处理回复时出了问题，我们会尽快排查。", detail)
     lowered = text.lower()
+    # Specific semantic rules must run before the broad 404+model compatibility
+    # fallback. OpenRouter's image rejection is a 404 and wrappers may include
+    # the model id; classifying that as model_not_found would send the user to
+    # edit a valid model name instead of adding a vision route.
+    for klass, blame, user_text, pat in _ERROR_CLASS_RULES:
+        if pat.search(text):
+            return AgentErrorNotice(klass, blame, user_text, detail)
     # 404 需与 model 同现才算模型错（裸 404 归 upstream_unavailable 太粗、归 auth 又错）
     if re.search(r"\b404\b", text) and "model" in lowered:
         return AgentErrorNotice("model_not_found", "user_provider",
                                 "模型名不可用，请检查设置里的模型名。", detail)
-    for klass, blame, user_text, pat in _ERROR_CLASS_RULES:
-        if pat.search(text):
-            return AgentErrorNotice(klass, blame, user_text, detail)
     return AgentErrorNotice("unknown", "system", "连接模型服务时出了问题。", detail)
 
 

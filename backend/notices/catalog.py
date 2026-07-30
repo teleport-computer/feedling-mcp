@@ -189,10 +189,11 @@ _UPSTREAM_RULES = (
         r"|model[ _]not[ _]found", re.I)),
     ("cli_config_invalid", re.compile(
         r"missing the \{message\} placeholder", re.I)),
-    # DeepSeek chat/completions, observed 2026-07-30. Keep this before
-    # provider_incompatible's broader "unknown variant" fallback.
+    # DeepSeek chat/completions and OpenRouter, observed 2026-07-30. Keep this
+    # before provider_incompatible and the broad 404+model fallback below.
     ("vision_model_required", re.compile(
-        r"unknown variant `image_url`, expected `text`", re.I)),
+        r"unknown variant `image_url`, expected `text`"
+        r"|no endpoints found that support image input", re.I)),
     ("provider_incompatible", re.compile(
         r"unknown variant|not supported|unsupported (parameter|tool)"
         r"|invalid_request_error.*tool", re.I)),
@@ -220,9 +221,9 @@ def classify_upstream(text: str) -> str:
     lowered = t.lower()
     if "resident_never_claimed" in lowered:
         return "resident_never_claimed"
-    if re.search(r"\b404\b", t) and "model" in lowered:   # 与 consumer 裸404+model 分支对齐
-        return "model_not_found"
     for klass, pat in _UPSTREAM_RULES:
         if pat.search(t):
             return klass
+    if re.search(r"\b404\b", t) and "model" in lowered:   # 与 consumer 裸404+model 分支对齐
+        return "model_not_found"
     return ""

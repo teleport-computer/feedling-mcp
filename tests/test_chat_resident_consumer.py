@@ -6599,6 +6599,37 @@ def test_cli_failure_surfaces_pi_error_message():
     assert "401 invalid key" in crc._cli_error_detail(raw, "")
 
 
+def test_pi_deepseek_image_error_reaches_vision_classifier():
+    """Lock the real pi 0.80.3 wrapper shape, not only the raw HTTP body."""
+    raw = _pi_stream_lines(
+        _PI_HEADER,
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": (
+                    '400: {"message":"Failed to deserialize the JSON body into '
+                    "the target type: messages[1]: unknown variant `image_url`, "
+                    'expected `text` at line 1 column 3626","type":'
+                    '"invalid_request_error","param":null,'
+                    '"code":"invalid_request_error"}'
+                ),
+            },
+        },
+    )
+
+    detail = crc._cli_error_detail(raw, "")
+    notice = crc.classify_agent_error(
+        RuntimeError(f"pi agent produced no reply: {detail}")
+    )
+
+    assert "unknown variant `image_url`, expected `text`" in detail
+    assert notice.error_class == "vision_model_required"
+    assert notice.blame == "user_provider"
+
+
 def test_pi_intermediate_events_are_non_final():
     for etype in ("message_start", "message_update", "turn_start", "turn_end",
                   "agent_start", "agent_end", "session",
