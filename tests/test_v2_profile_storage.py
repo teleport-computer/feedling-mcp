@@ -297,6 +297,62 @@ def test_newer_winner_discards_stale_candidate_without_replay(monkeypatch):
     assert calls == [{}]
 
 
+def test_metadata_only_winner_cannot_supersede_successful_candidate(monkeypatch):
+    uid = "u-profile-metadata-winner"
+    winner = profile_store.build_profile_document(
+        uid,
+        state="degraded",
+        source=_source(5, generated_at=""),
+        last_attempt=_attempt(2, reject_code="provider_unavailable"),
+        seal_text=_seal,
+    )
+    reads = iter([{}, winner])
+    cas_calls: list[tuple[dict, dict]] = []
+    cas_results = iter([False, True])
+    recomputations: list[dict] = []
+    monkeypatch.setattr(
+        profile_store.db,
+        "get_blob_strict",
+        lambda *_args: next(reads),
+    )
+
+    def _cas(_uid, _kind, expected, candidate, **_kwargs):
+        cas_calls.append((expected, candidate))
+        return next(cas_results)
+
+    monkeypatch.setattr(profile_store.db, "set_blob_if_unchanged", _cas)
+
+    result = profile_store.update_profile_cas(
+        uid,
+        lambda expected: (
+            recomputations.append(dict(expected))
+            or _ok_doc(uid, 5, suffix=f"-try{len(recomputations)}")
+        ),
+    )
+
+    assert result.status == "written"
+    assert result.cas_attempts == 2
+    assert result.recomputations == 2
+    assert recomputations == [{}, winner]
+    assert cas_calls[1][0] == winner
+    assert cas_calls[1][1] == result.document
+    assert result.document["state"] == "ok"
+    assert "memory" in result.document
+    # Symmetric cases intentionally remain superseding: an envelope-bearing
+    # winner may replace an equivalent envelope-bearing or metadata candidate.
+    assert profile_store._winner_supersedes(_ok_doc(uid, 5), _ok_doc(uid, 5))
+    assert profile_store._winner_supersedes(
+        _ok_doc(uid, 5),
+        profile_store.build_profile_document(
+            uid,
+            state="degraded",
+            source=_source(5),
+            last_attempt=_attempt(2, reject_code="provider_unavailable"),
+            seal_text=_seal,
+        ),
+    )
+
+
 def test_second_cas_loss_fails_without_a_third_write_or_field_merge(monkeypatch):
     uid = "u-profile-double-cas-loss"
     reads = iter([{}, {}, {}])

@@ -239,6 +239,8 @@ def _winner_supersedes(winner: dict, candidate: dict) -> bool:
         candidate_doc = validate_profile_document(candidate)
     except ProfileStorageError:
         return False
+    if candidate_doc.get("memory") is not None and winner_doc.get("memory") is None:
+        return False
     winner_source = winner_doc["source"]
     candidate_source = candidate_doc["source"]
     if _timestamp_rank(winner_source["generated_at"]) > _timestamp_rank(
