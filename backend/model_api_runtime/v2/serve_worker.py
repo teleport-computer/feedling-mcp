@@ -1582,11 +1582,18 @@ def _read_vision_observations(
             configs[route_id] = config
 
         mime = str(image.get("image_mime") or "image/jpeg")
-        observations[message_id] = vision_observer.observe_image(
-            config,
-            image_mime=mime,
-            image_b64=image_b64,
-        )
+        try:
+            observations[message_id] = vision_observer.observe_image(
+                config,
+                image_mime=mime,
+                image_b64=image_b64,
+            )
+        except vision_observer.VisionObserverError as exc:
+            # Fixed route metadata, never inferred from model prose. The worker
+            # can carry it to the terminal activity/fallback projection.
+            exc.model = str(config.model or "")[:96]
+            exc.provider = str(config.provider or "")[:80]
+            raise
     return observations
 
 

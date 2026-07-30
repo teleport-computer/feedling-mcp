@@ -3538,7 +3538,11 @@ def _parse_catalog_page(provider: str, body: Any) -> tuple[list[dict], str | Non
         if not mid or len(mid) > _CATALOG_MAX_ID_LEN:
             continue
         display = disp if isinstance(disp, str) and disp else mid
-        out.append({"id": mid, "display_name": display})
+        model = {"id": mid, "display_name": display}
+        input_modalities = _catalog_input_modalities(provider, m)
+        if input_modalities is not None:
+            model["input_modalities"] = input_modalities
+        out.append(model)
 
     nxt: str | None = None
     if provider == "gemini":
@@ -3551,6 +3555,51 @@ def _parse_catalog_page(provider: str, body: Any) -> tuple[list[dict], str | Non
         else:
             raise ProviderError("model_catalog_invalid_response")
     return out, nxt
+
+
+def _catalog_input_modalities(provider: str, model: dict) -> list[str] | None:
+    """Return only explicit provider metadata; never infer from a model id.
+
+    OpenRouter publishes ``architecture.input_modalities``. Anthropic publishes
+    ``capabilities.image_input.supported``. OpenAI-compatible relays may expose
+    a direct ``input_modalities`` extension. Other catalog shapes currently do
+    not make image input support explicit enough to trust, so ``None`` means the
+    caller must use a real visual probe.
+    """
+    provider = normalize_provider(provider)
+    raw = None
+    if provider == "openrouter":
+        architecture = model.get("architecture")
+        if isinstance(architecture, dict):
+            raw = architecture.get("input_modalities")
+    elif provider == "anthropic":
+        capabilities = model.get("capabilities")
+        image_input = (
+            capabilities.get("image_input")
+            if isinstance(capabilities, dict)
+            else None
+        )
+        supported = (
+            image_input.get("supported")
+            if isinstance(image_input, dict)
+            else None
+        )
+        if isinstance(supported, bool):
+            return ["text", "image"] if supported else ["text"]
+    elif provider in {"openai_compatible"}:
+        raw = model.get("input_modalities")
+
+    if not isinstance(raw, list):
+        return None
+    allowed = {"text", "image", "audio", "video"}
+    cleaned = sorted({
+        str(item).strip().lower()
+        for item in raw
+        if isinstance(item, str) and str(item).strip().lower() in allowed
+    })
+    # Preserve an explicit empty field as an explicit "no supported inputs"
+    # declaration. Missing/malformed fields remain None and fall back to probe.
+    return cleaned
 
 
 def _fetch_catalog_page(client: httpx.Client, url: str, headers: dict,

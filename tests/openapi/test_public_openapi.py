@@ -36,6 +36,7 @@ EXPECTED_BODYLESS_POSTS = {
     ("post", "/v1/model_api/test"),
     ("post", "/v1/model_api/routes/{route_id}/activate"),
     ("post", "/v1/model_api/routes/{route_id}/test"),
+    ("post", "/v1/vision/main/test"),
     ("post", "/v1/vision/routes/{route_id}/test"),
     ("post", "/v1/proactive/scheduled/fire"),
 }
@@ -185,7 +186,8 @@ def test_public_operation_and_parameter_inventory(
     # authenticated resident observer exchange; three mutations carry bodies.
     # 160 since the voice session and OpenAI-compatible Custom LLM endpoints;
     # both accept compatibility JSON envelopes, hence 73 -> 75 bodies.
-    assert len(operations) == 160
+    # 161 adds the bodyless unified main-model vision validator.
+    assert len(operations) == 161
     assert sum("requestBody" in operation for operation in operations.values()) == 75
 
     query_operations = {
@@ -280,6 +282,7 @@ def test_runtime_success_statuses_and_non_json_media_are_explicit(
         ("post", "/v1/genesis/persona_backfill"): {"200", "202"},
         ("post", "/v1/history_import/upload"): {"200", "202"},
         ("post", "/v1/model_api/memory/repair"): {"200", "202"},
+        ("post", "/v1/vision/main/test"): {"200", "202"},
     }
     for key, expected in expected_success_statuses.items():
         actual = {
@@ -746,3 +749,9 @@ def test_internal_prefix_is_never_public() -> None:
     from export_public_openapi import EXCLUDED_PREFIXES
 
     assert "/v1/internal" in EXCLUDED_PREFIXES
+
+
+def test_resident_vision_probe_result_is_not_public(
+    operations: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    assert ("post", "/v1/internal/vision/main/test/result") not in operations

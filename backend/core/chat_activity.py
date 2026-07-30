@@ -19,6 +19,7 @@ MEMORY_CATEGORY_KEYS = frozenset({
     "preferences", "values", "health", "interests", "money", "food", "travel",
 })
 _SAFE_TOKEN_RE = re.compile(r"[^A-Za-z0-9_.:-]+")
+_SAFE_IDENTITY_RE = re.compile(r"[^A-Za-z0-9_./:@+-]+")
 _TERMINAL_JOB_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "discarded", "expired"}
 )
@@ -27,6 +28,10 @@ def safe_token(value: Any, *, max_len: int = 128) -> str:
     """Return a bounded identifier token, never arbitrary content."""
     cleaned = _SAFE_TOKEN_RE.sub("_", str(value or "").strip())
     return cleaned[:max_len]
+
+
+def safe_identity(value: Any, *, max_len: int) -> str:
+    return _SAFE_IDENTITY_RE.sub("_", str(value or "").strip())[:max_len]
 
 
 def safe_duration_ms(value: Any) -> float | None:
@@ -196,7 +201,9 @@ def project_tool_events(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any
     return [projected[event_id] for event_id in ordered]
 
 
-def _turn_failure(jobs: list[Mapping[str, Any]]) -> dict[str, Any] | None:
+def _turn_failure(
+    jobs: list[Mapping[str, Any]], rows: list[Mapping[str, Any]]
+) -> dict[str, Any] | None:
     for job in reversed(jobs):
         status = safe_token(job.get("status"), max_len=32).lower()
         if status not in _FAILED_JOB_STATUSES:
@@ -209,10 +216,27 @@ def _turn_failure(jobs: list[Mapping[str, Any]]) -> dict[str, Any] | None:
         )
         if not code:
             code = f"turn_failed:{status}"
-        return {
+        failure = {
             "code": code,
             "job_id": safe_token(job.get("id"), max_len=64),
         }
+        for row in reversed(rows):
+            if (
+                str(row.get("kind") or "") != "error"
+                or str(row.get("job_id") or "") != str(job.get("id") or "")
+            ):
+                continue
+            detail = row.get("detail_json")
+            if not isinstance(detail, Mapping):
+                continue
+            model = safe_identity(detail.get("failure_model"), max_len=96)
+            provider = safe_identity(detail.get("failure_provider"), max_len=80)
+            if model:
+                failure["model"] = model
+            if provider:
+                failure["provider"] = provider
+            break
+        return failure
     return None
 
 
@@ -237,8 +261,9 @@ def turn_response(turn_id: str, jobs: Iterable[Mapping[str, Any]], rows: Iterabl
         "jobs": job_list,
         "events": project_tool_events(row_list),
     }
-    failure = _turn_failure(source_jobs)
+    failure = _turn_failure(source_jobs, row_list)
     if failure is not None:
+        failure["message_id"] = turn_id
         response["failure"] = failure
     return response
 
@@ -250,7 +275,7 @@ def resident_turn_response(turn_id: str, parent: Mapping[str, Any], rows: Iterab
         or bool(str(parent.get("reply_message_id") or ""))
     )
     status = "completed" if complete else "running"
-    return {
+    response = {
         "turn_id": turn_id,
         "runtime": "v1",
         "complete": complete,
@@ -258,3 +283,18 @@ def resident_turn_response(turn_id: str, parent: Mapping[str, Any], rows: Iterab
         "jobs": [{"job_id": f"v1:{turn_id}", "status": status}],
         "events": project_tool_events(rows),
     }
+    code = safe_token(parent.get("reply_error_class"), max_len=96)
+    if code:
+        failure = {
+            "code": code,
+            "job_id": f"v1:{turn_id}",
+            "message_id": turn_id,
+        }
+        model = safe_identity(parent.get("reply_failure_model"), max_len=96)
+        provider = safe_identity(parent.get("reply_failure_provider"), max_len=80)
+        if model:
+            failure["model"] = model
+        if provider:
+            failure["provider"] = provider
+        response["failure"] = failure
+    return response

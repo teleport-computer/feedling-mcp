@@ -768,6 +768,43 @@ def test_process_job_terminal_failure_emits_error_status_and_calls_callback(monk
     assert settled == [(uid, "m1", rec_msg)]
 
 
+def test_image_turn_unrelated_failure_keeps_original_failure_owner(monkeypatch):
+    """An image must not make an unrelated internal failure look visual."""
+    uid = "u_w_image_unrelated_failure"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    async def _boom(config, messages, *, tools=None, **_kwargs):
+        raise RuntimeError("unrelated internal failure")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
+    recorded = []
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [{
+            "id": "image-parent",
+            "ts": 5.0,
+            "role": "user",
+            "content": "看看这张图",
+            "has_image": True,
+            "image_mime": "image/png",
+        }],
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        record_terminal_error=lambda user_id, message: recorded.append(
+            (user_id, message)
+        ),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    assert _job_status(job_id) == ("failed", "turn_failed:runtimeerror")
+    assert recorded == [(uid, "turn_failed:runtimeerror")]
+
+
 def test_process_job_terminal_failure_tolerates_missing_callback(monkeypatch):
     """record_terminal_error defaults to None (dependency boundary preserved for
     callers that don't supply it) — the failure path must not crash when it's
