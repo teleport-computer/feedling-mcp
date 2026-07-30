@@ -242,8 +242,36 @@ def test_turn_response_exposes_only_bounded_failure_identity():
     assert response["failure"] == {
         "code": "turn_failed:failed",
         "job_id": "41",
+        "message_id": "turn-failed",
     }
     assert response["complete"] is True
+
+
+def test_visual_failure_projects_exact_message_model_and_provider():
+    response = chat_activity.turn_response(
+        "user-message-1",
+        [{
+            "id": 42,
+            "status": "failed",
+            "last_error": "turn_failed:vision_model_auth_invalid",
+        }],
+        [{
+            "job_id": 42,
+            "kind": "error",
+            "detail_json": {
+                "failure_model": "openai/gpt-vision",
+                "failure_provider": "openrouter",
+            },
+        }],
+    )
+
+    assert response["failure"] == {
+        "code": "turn_failed:vision_model_auth_invalid",
+        "job_id": "42",
+        "message_id": "user-message-1",
+        "model": "openai/gpt-vision",
+        "provider": "openrouter",
+    }
 
 
 def test_memory_projection_keeps_every_zero_discovery_before_positive():

@@ -972,9 +972,18 @@ def _is_degenerate_reply(text: Any) -> bool:
 class DedicatedVisionUnavailable(RuntimeError):
     """A pinned V2 image observer failed before the main model saw pixels."""
 
-    def __init__(self, message: str, *, error_code: str = "vision_model_failed"):
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = "vision_model_failed",
+        model: str = "",
+        provider: str = "",
+    ):
         super().__init__(message)
         self.error_code = error_code
+        self.model = str(model or "")[:96]
+        self.provider = str(provider or "")[:80]
 
 
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
@@ -1026,6 +1035,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
 
 def _turn_failure_error_class(exc: BaseException) -> str:
     """Classify V2 foreground failures through the shared notice catalog."""
+    if isinstance(exc, DedicatedVisionUnavailable):
+        return exc.error_code
     if isinstance(exc, v2_prompt_frontier.PromptFrontierExhausted):
         # An unaudited default is our conservative local ceiling, not the
         # provider's model limit. Never blame the user or tell them to shorten
@@ -4135,7 +4146,14 @@ def _sanitize_reasoning(text: str) -> str:
 
 
 def _build_thinking_payload(
-    store, reasoning: str, *, effect_id: str, provider_config
+    store,
+    reasoning: str,
+    *,
+    effect_id: str,
+    provider_config,
+    kind: str = "provider_reasoning",
+    source: str | None = None,
+    native: bool = True,
 ) -> dict | None:
     """Seal provider reasoning into its own shared envelope + routing metadata.
 
@@ -4158,10 +4176,11 @@ def _build_thinking_payload(
     return {
         "envelope": envelope,
         "metadata": {
-            "thinking_kind": "provider_reasoning",
-            "thinking_source": f"v2.{getattr(provider_config, 'provider', '') or ''}",
+            "thinking_kind": kind,
+            "thinking_source": source
+            or f"v2.{getattr(provider_config, 'provider', '') or ''}",
             "thinking_model": str(getattr(provider_config, "model", "") or ""),
-            "thinking_native": True,
+            "thinking_native": native,
         },
     }
 
@@ -8257,6 +8276,8 @@ def _inject_tail_images(
             raise DedicatedVisionUnavailable(
                 "vision observer failed",
                 error_code=safe_code,
+                model=str(getattr(exc, "model", "") or ""),
+                provider=str(getattr(exc, "provider", "") or ""),
             ) from exc
         if any(
             not str(observations.get(item["message_id"]) or "").strip()
@@ -8470,6 +8491,7 @@ async def process_job(
     claimed_by = str(job.get("claimed_by") or "")
     observed_generation = int(job.get("input_generation") or 0)
     reply_parent_message_id = ""
+    coalesced: list[dict] = []
     seq_native = deps.read_messages_after_seq is not None
     if tm is None:
         tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
@@ -9533,9 +9555,35 @@ async def process_job(
             nonlocal final_job_completed_atomically, voice_reply_slot
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             text = "" if file_reply is not None else str(text or "").strip()
+            # Self-authored thinking (all models incl. relay). Peel a leading
+            # <think> block into a SEPARATE channel and reply with the clean body.
+            # The provider's native ``reasoning`` is left UNCHANGED here so the
+            # torn-protocol / degenerate guards below still inspect the real native
+            # text; which thinking to surface (self-authored vs native) and its
+            # provenance are decided at seal time. Fail-closed on malformed <think>:
+            # never leak a raw tag, never promote private thinking to the reply.
+            from core import self_thinking
+
+            self_thinking_on = self_thinking.enabled()
+            self_thinking_text = ""
+            self_thinking_failed = False
+            if self_thinking_on and file_reply is None and text:
+                _st_status, _st_thinking, _st_reply = self_thinking.split_thinking(text)
+                if _st_status == self_thinking.COMPLETE:
+                    text = _st_reply
+                    self_thinking_text = _st_thinking
+                elif _st_status == self_thinking.FAILED:
+                    # Untrustworthy structure → honest fallback bubble + a marker in
+                    # the thinking channel. Non-empty text keeps it off the
+                    # empty_reply failure path so the marker rides the reply effect.
+                    text = _DEGENERATE_REPLY_FALLBACK
+                    self_thinking_failed = True
+                # ABSENT: text unchanged
             if file_reply is not None and final:
                 raise RuntimeError("a file reply cannot be terminal")
-            turn_failure_error_class = ""
+            turn_failure_error_class = (
+                _DEGENERATE_REPLY_ERROR_CLASS if self_thinking_failed else ""
+            )
             if file_reply is None and text and _is_degenerate_reply(text):
                 log.warning(
                     "[v2.worker] chat degenerate reply suppressed user=%s "
@@ -9689,13 +9737,33 @@ async def process_job(
             # only ciphertext and a retry re-addresses the same thinking row. Only
             # final replies carry it — intermediate reply{} bubbles are
             # agent-authored text, not provider reasoning.
-            if final and reasoning and file_reply is None:
+            # Decide which thinking to seal and its provenance. Self-authored
+            # <think> (or a "thinking failed" marker) is an agent summary, NOT
+            # provider-native chain-of-thought; the provider's native reasoning
+            # keeps its native metadata. Never mislabel one as the other.
+            _display_reasoning = reasoning
+            _thinking_kind, _thinking_source, _thinking_native = (
+                "provider_reasoning", None, True,
+            )
+            if self_thinking_on and (self_thinking_text or self_thinking_failed):
+                _display_reasoning = (
+                    self_thinking.THINKING_FAILED_MARKER
+                    if self_thinking_failed
+                    else self_thinking_text
+                )
+                _thinking_kind, _thinking_source, _thinking_native = (
+                    "agent_summary", "self_thinking", False,
+                )
+            if final and _display_reasoning and file_reply is None:
                 thinking_payload = await asyncio.to_thread(
                     _build_thinking_payload,
                     store,
-                    reasoning,
+                    _display_reasoning,
                     effect_id=effect_id,
                     provider_config=provider_config,
+                    kind=_thinking_kind,
+                    source=_thinking_source,
+                    native=_thinking_native,
                 )
                 if thinking_payload:
                     payload["thinking"] = thinking_payload
@@ -10004,7 +10072,7 @@ async def process_job(
 
         def _chat_builder():
             return _make_build_messages_fn(
-                system_prompt=context.CHAT_SYSTEM_PROMPT,
+                system_prompt=context.chat_system_prompt(),
                 summary=summary,
                 tail=tail,
                 extra_context=turn_extra_context,
@@ -10095,6 +10163,13 @@ async def process_job(
         await _ensure_runtime_mode()
         await _renew_lease()
         await asyncio.to_thread(_emit_status, user_id, job_id, "writing_reply")
+        # Self-authored thinking does NOT suppress the model's native reasoning: the
+        # model keeps thinking natively (so answer quality is unchanged) and is
+        # additionally asked to open its reply with a <think> block. At seal time we
+        # PREFER that <think> (clean, io-voice); if the model didn't write one we fall
+        # back to the shaped native reasoning. So native reasoning must still flow when
+        # the model's thinking switch is on — which run_tool_loop already does via
+        # reasoning_effort. include_reasoning stays the explicit public-contract path.
         outcome = await v2_tool_loop.run_tool_loop(
             provider_config=provider_config,
             include_reasoning=turn_include_reasoning,
@@ -10407,13 +10482,39 @@ async def process_job(
         log.info("[v2.worker] job %s stopped at rollout fence: %s", job_id, e)
         return "failed"
     except Exception as e:  # noqa: BLE001 - terminal outbox owns failure visibility
-        message = _safe_failure_code("turn_failed", e)
+        failure_exc: BaseException = e
+        if (
+            not isinstance(e, DedicatedVisionUnavailable)
+            and any(bool(row.get("has_image")) for row in coalesced)
+        ):
+            classified = _turn_failure_error_class(e)
+            vision_code = {
+                "auth_invalid": "vision_model_auth_invalid",
+                "quota_insufficient": "vision_model_quota_insufficient",
+                "model_not_found": "vision_model_not_found",
+                "provider_incompatible": "vision_model_incompatible",
+                "rate_limited": "vision_model_rate_limited",
+                "upstream_unavailable": "vision_model_unavailable",
+                "turn_timeout": "vision_model_unavailable",
+                "reply_parse_failed": "vision_model_empty_response",
+            }.get(classified)
+            # Pixels being present does not prove an unrelated tool, storage,
+            # or internal failure belongs to vision. Only remap failures whose
+            # provider-facing classification is explicit.
+            if vision_code:
+                failure_exc = DedicatedVisionUnavailable(
+                    "visual turn failed",
+                    error_code=vision_code,
+                    model=str(getattr(provider_config, "model", "") or ""),
+                    provider=str(getattr(provider_config, "provider", "") or ""),
+                )
+        message = _safe_failure_code("turn_failed", failure_exc)
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",
             {
                 "stage": "process_job",
-                "error_class": type(e).__name__,
+                "error_class": type(failure_exc).__name__,
                 "error_code": message,
             },
             best_effort=True,
@@ -10424,8 +10525,30 @@ async def process_job(
             job_id,
             message,
             claimed_by=claimed_by,
-            error_class=_turn_failure_error_class(e),
+            error_class=_turn_failure_error_class(failure_exc),
         )
+        if owned and isinstance(failure_exc, DedicatedVisionUnavailable):
+            identity = {}
+            if failure_exc.model:
+                identity["failure_model"] = failure_exc.model
+            if failure_exc.provider:
+                identity["failure_provider"] = failure_exc.provider
+            if identity:
+                try:
+                    await asyncio.to_thread(
+                        jobs_store.append_status_event,
+                        user_id,
+                        "error",
+                        job_id=job_id,
+                        label="视觉模型调用失败",
+                        detail=identity,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- outbox still owns visibility
+                    log.warning(
+                        "[v2.worker] vision failure identity event failed job=%s code=%s",
+                        job_id,
+                        type(exc).__name__.lower(),
+                    )
         if owned and lane == "chat":
             await _settle_legacy_failed_reply_target(message)
             await asyncio.to_thread(

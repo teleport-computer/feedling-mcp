@@ -7536,6 +7536,59 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/vision/main/test": {
+      "post": {
+        "summary": "Vision Main Test",
+        "operationId": "vision_main_test_v1_vision_main_test_post",
+        "responses": {
+          "200": {
+            "description": "Main-model image capability reached a terminal verdict.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VisionMainTestResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "A hidden resident image-capability probe is in progress.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VisionMainTestResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The resident must be updated before hidden validation is available.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "Validate the effective main model's image-input capability. Model API routes use explicit catalog metadata when available and otherwise perform a real two-image probe, returning a terminal 200 status. Resident runtimes start a hidden isolated two-image probe and return 202 testing; poll GET /v1/vision/config until effective_status leaves testing. Residents without the hidden-probe capability receive 409 vision_resident_update_required."
+      }
+    },
     "/v1/vision/observe": {
       "post": {
         "summary": "Vision Observe",
@@ -8774,7 +8827,7 @@
           "include_reasoning": {
             "type": "boolean",
             "default": false,
-            "description": "Request provider reasoning for this Hosted Runtime V2 turn. Omitted values preserve the historical disabled behavior; resident runtimes ignore this field."
+            "description": "Request the assistant's per-turn thinking for this Hosted Runtime V2 turn. With the self-authored thinking chain enabled (the default), the returned thinking is io's own first-person summary rather than the provider's raw chain-of-thought, falling back to native reasoning when no self-authored block was produced. Omitted values preserve the historical disabled behavior; resident runtimes ignore this field."
           },
           "image_b64": {
             "type": "string",
@@ -8984,6 +9037,63 @@
           "route_id": {
             "type": "string",
             "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "VisionMainTestResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "source",
+          "provider",
+          "model"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unsupported",
+              "failed",
+              "untested",
+              "testing"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "model_api",
+              "resident"
+            ]
+          },
+          "provider": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "error_code": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "status_code": {
+            "type": "integer"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "probe_id": {
+            "type": "string"
+          },
+          "expires_at_epoch": {
+            "type": "number"
+          },
+          "poll_after_ms": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "additionalProperties": false

@@ -163,3 +163,28 @@ def test_access_log_redacts_key_param():
     assert "SUPERSECRET" not in middleware._display_path(scope_upper)
     # no query string → bare path
     assert middleware._display_path({"path": "/v1/x", "query_string": b""}) == "/v1/x"
+
+
+def test_access_log_redacts_all_secret_bearing_param_names():
+    """精确匹配 ``key`` 会漏掉每一个真实在用的别名。
+
+    2026-07-30 审计实证：admin 后台把 ``admin_key`` 放进每个链接的 query string
+    （``data_track._data_track_qs`` 的保留列表第一项），而当时的判据是
+    ``k.lower() == "key"``——``admin_key`` != ``key``，于是可复用的 admin 凭据
+    原样进了服务端访问日志。``admin_token`` / ``api_key`` 同理。
+    """
+    for name in ("admin_key", "admin_token", "api_key", "API_KEY", "X-Admin-Key",
+                 "access_token", "session_token", "secret", "password"):
+        scope = {
+            "path": "/admin/data-track",
+            "query_string": f"{name}=SUPERSECRET&view=runtime".encode(),
+        }
+        disp = middleware._display_path(scope)
+        assert "SUPERSECRET" not in disp, f"{name} 未脱敏"
+        assert "REDACTED" in disp, f"{name} 未脱敏"
+        # 非敏感参数必须原样保留——脱敏不能把日志变成无法排查
+        assert "view=runtime" in disp
+
+    # 不含敏感名的 query string 完整保留，一个字符都不改
+    plain = {"path": "/admin/data-track", "query_string": b"view=runtime&hours=168"}
+    assert middleware._display_path(plain) == "/admin/data-track?view=runtime&hours=168"

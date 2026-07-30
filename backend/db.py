@@ -741,6 +741,7 @@ _TEE_SYNC_RUN_COLS = (
     "replicate_table_failures",
     "reconcile_copied", "reconcile_pruned", "reconcile_skipped",
     "snapshot_copied", "snapshot_failures",
+    "prune_stale", "prune_deleted", "prune_refused",
     "mirror_failures", "tee_healthy", "tee_probe_ms", "duration_ms",
 )
 

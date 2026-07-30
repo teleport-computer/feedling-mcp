@@ -196,6 +196,12 @@ class AgentTurn:
     thinking_source: str = ""
     thinking_model: str = ""
     thinking_native: bool | None = None
+    # TRUE only when this thinking was parsed out of a leading <think> block by our
+    # own local parser (_split_tagged_thinking) on THIS host — never set from any
+    # provider/CLI JSON field. This is the spoof-proof provenance the self-authored
+    # precedence keys off: an upstream turn that merely *declares*
+    # reasoning_source="self_thinking" in its JSON cannot flip this flag.
+    thinking_self_authored: bool = False
     actions: list[dict] = field(default_factory=list)
     runtime_debug: dict = field(default_factory=dict)
     tool_calls: list[dict] = field(default_factory=list)
@@ -646,12 +652,16 @@ class VisionObserverFailure(RuntimeError):
         status_code: int | None = None,
         detail: str = "",
         raw_user_text: str = "",
+        model: str = "",
+        provider: str = "",
     ):
         super().__init__(error_class)
         self.error_class = error_class[:64] or "vision_model_failed"
         self.status_code = status_code
         self.detail = detail[:160]
         self.raw_user_text = raw_user_text
+        self.model = _sanitize_thinking_meta(model, max_len=96)
+        self.provider = _sanitize_thinking_meta(provider, max_len=80)
 
 
 def _vision_failure_user_text(error_class: str, raw_user_text: str) -> str:
@@ -709,15 +719,18 @@ _ERROR_CLASS_RULES = (
     ("cli_config_invalid", "user_provider",
      "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。",
      re.compile(r"missing the \{message\} placeholder", re.I)),
-    # Real DeepSeek chat/completions response observed 2026-07-30 when
-    # deepseek-v4-flash received an image_url block:
+    # Real provider responses observed 2026-07-30 when text-only models received
+    # an image_url block:
     #   provider_http_400: Failed to deserialize ... unknown variant
-    #   `image_url`, expected `text`
+    #   `image_url`, expected `text`                  (DeepSeek native)
+    #   No endpoints found that support image input  (OpenRouter)
     # Keep this ahead of provider_incompatible's broad "unknown variant" rule
-    # so a text-only main model gets the dedicated Settings guidance.
+    # and the broad 404+model fallback in classify_agent_error so a text-only
+    # main model gets the dedicated Settings guidance.
     ("vision_model_required", "user_provider",
      "当前主模型不支持看图，请前往设置添加或切换支持视觉的模型。",
-     re.compile(r"unknown variant `image_url`, expected `text`", re.I)),
+     re.compile(r"unknown variant `image_url`, expected `text`"
+                r"|no endpoints found that support image input", re.I)),
     ("provider_incompatible", "user_provider",
      "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。",
      re.compile(r"unknown variant|not supported|unsupported (parameter|tool)"
@@ -790,13 +803,17 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
         return AgentErrorNotice("reply_parse_failed", "system",
                                 "系统处理回复时出了问题，我们会尽快排查。", detail)
     lowered = text.lower()
+    # Specific semantic rules must run before the broad 404+model compatibility
+    # fallback. OpenRouter's image rejection is a 404 and wrappers may include
+    # the model id; classifying that as model_not_found would send the user to
+    # edit a valid model name instead of adding a vision route.
+    for klass, blame, user_text, pat in _ERROR_CLASS_RULES:
+        if pat.search(text):
+            return AgentErrorNotice(klass, blame, user_text, detail)
     # 404 需与 model 同现才算模型错（裸 404 归 upstream_unavailable 太粗、归 auth 又错）
     if re.search(r"\b404\b", text) and "model" in lowered:
         return AgentErrorNotice("model_not_found", "user_provider",
                                 "模型名不可用，请检查设置里的模型名。", detail)
-    for klass, blame, user_text, pat in _ERROR_CLASS_RULES:
-        if pat.search(text):
-            return AgentErrorNotice(klass, blame, user_text, detail)
     return AgentErrorNotice("unknown", "system", "连接模型服务时出了问题。", detail)
 
 
@@ -804,7 +821,11 @@ def _system_notice_body(notice: AgentErrorNotice) -> str:
     return f"⚠️ {notice.user_text}\n详情: {notice.detail}"
 
 
-def turn_failure_post_kwargs(notice: "AgentErrorNotice | None") -> dict:
+def turn_failure_post_kwargs(
+    notice: "AgentErrorNotice | None",
+    *,
+    failure: BaseException | None = None,
+) -> dict:
     """把分类结果转成 post_reply 的 turn-failure kwargs（spec 2026-07-18 §2.2）。
 
     只带 error_class / blame / user_text —— detail 绝不下发（可能夹带 provider
@@ -812,11 +833,23 @@ def turn_failure_post_kwargs(notice: "AgentErrorNotice | None") -> dict:
     无失败时返回空 dict，成功路径零变化。"""
     if notice is None:
         return {}
-    return {
+    body = {
         "turn_failure_error_class": notice.error_class[:64],
         "turn_failure_blame": notice.blame[:32],
         "turn_failure_user_text": notice.user_text[:500],
     }
+    if failure is not None:
+        model = _sanitize_thinking_meta(
+            getattr(failure, "model", ""), max_len=96
+        )
+        provider = _sanitize_thinking_meta(
+            getattr(failure, "provider", ""), max_len=80
+        )
+        if model:
+            body["turn_failure_model"] = model
+        if provider:
+            body["turn_failure_provider"] = provider
+    return body
 
 
 # 聊天流失败横幅节流（Seven 定稿 2026-07-11）：
@@ -1115,6 +1148,9 @@ def _agent_runtime_metadata(
     provider = _safe_runtime_header(os.environ.get("FEEDLING_AGENT_PROVIDER"))
     provider_is_explicit = bool(provider)
     explicit_modalities = os.environ.get("FEEDLING_AGENT_INPUT_MODALITIES", "")
+    modalities_source = (
+        "explicit" if "FEEDLING_AGENT_INPUT_MODALITIES" in os.environ else ""
+    )
     modalities = sorted({
         item.strip().lower()
         for item in explicit_modalities.split(",")
@@ -1172,6 +1208,7 @@ def _agent_runtime_metadata(
                             "text", "image", "audio", "video"
                         }
                     })
+                    modalities_source = "pi_catalog"
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
 
@@ -1179,19 +1216,36 @@ def _agent_runtime_metadata(
         "provider": provider,
         "model": model,
         "input_modalities": modalities,
+        "input_modalities_source": modalities_source,
     }
 
 
 AGENT_RUNTIME_METADATA = _agent_runtime_metadata()
 
 
+def _agent_entry_signature() -> str:
+    """Stable, secret-free identity for the configured model entry."""
+    payload = json.dumps(
+        {
+            "mode": AGENT_MODE,
+            "command": AGENT_CLI_CMD,
+            "http_model": AGENT_HTTP_MODEL,
+            "runtime": AGENT_RUNTIME_METADATA,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 _HEADERS = {
     "X-API-Key": FEEDLING_API_KEY,
     "X-Feedling-Consumer": "feedling-chat-resident",
-    "X-Feedling-Consumer-Capabilities": "vision_observer_v1",
+    "X-Feedling-Consumer-Capabilities": "vision_observer_v1,vision_probe_v2",
     "X-Feedling-Consumer-Id": CONSUMER_ID,
     "X-Feedling-Consumer-Version": "resident-v1",
     "X-Feedling-Consumer-Commit": RUNNING_COMMIT,
+    "X-Feedling-Agent-Entry-Signature": _agent_entry_signature(),
 }
 if AGENT_RUNTIME_METADATA["provider"]:
     _HEADERS["X-Feedling-Agent-Provider"] = AGENT_RUNTIME_METADATA["provider"]
@@ -1200,6 +1254,10 @@ if AGENT_RUNTIME_METADATA["model"]:
 if AGENT_RUNTIME_METADATA["input_modalities"]:
     _HEADERS["X-Feedling-Agent-Input-Modalities"] = ",".join(
         AGENT_RUNTIME_METADATA["input_modalities"]
+    )
+if AGENT_RUNTIME_METADATA["input_modalities_source"]:
+    _HEADERS["X-Feedling-Agent-Input-Modalities-Source"] = (
+        AGENT_RUNTIME_METADATA["input_modalities_source"]
     )
 
 
@@ -2696,6 +2754,8 @@ def _vision_observation(message_id: str, route_id: str) -> str:
             str(body.get("error_class") or body.get("error") or "vision_model_unavailable"),
             status_code=status_code,
             detail=str(body.get("detail") or "")[:160],
+            model=str(body.get("model") or ""),
+            provider=str(body.get("provider") or ""),
         )
     observation = str(body.get("observation") or "").strip()
     if not observation:
@@ -3912,20 +3972,43 @@ def _thinking_summary_from_value(value: Any) -> str:
     return ""
 
 
-def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
-    dst.actions.extend(src.actions)
-    dst.messages.extend(src.messages)
-    dst.tool_calls.extend(src.tool_calls)
-    prefer_src_thinking = bool(src.thinking_summary) and (
-        not dst.thinking_summary
-        or (src.thinking_native is True and dst.thinking_native is not True)
-    )
-    if prefer_src_thinking:
+def _prefer_thinking(dst: AgentTurn, src: AgentTurn) -> None:
+    """Adopt ``src``'s thinking into ``dst`` per the self-authored precedence.
+
+    THE single decision point for "whose thinking wins" — every path that can
+    carry thinking (object merge, stream fallback, …) routes through here so no
+    arrival order silently bypasses the rule.
+
+    Feature ON: a locally-parsed self-authored <think> (``thinking_self_authored``,
+    which upstream JSON cannot forge) wins over provider-native reasoning; within
+    the same provenance class the first-seen thinking is kept. Feature OFF: legacy
+    rule — provider-native reasoning wins over inlined content.
+    """
+    if not src.thinking_summary:
+        return
+    if not dst.thinking_summary:
+        take = True
+    else:
+        from core import self_thinking as _self_thinking_v1
+
+        if _self_thinking_v1.enabled():
+            take = src.thinking_self_authored and not dst.thinking_self_authored
+        else:
+            take = src.thinking_native is True and dst.thinking_native is not True
+    if take:
         dst.thinking_summary = src.thinking_summary
         dst.thinking_kind = src.thinking_kind
         dst.thinking_source = src.thinking_source
         dst.thinking_model = src.thinking_model
         dst.thinking_native = src.thinking_native
+        dst.thinking_self_authored = src.thinking_self_authored
+
+
+def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
+    dst.actions.extend(src.actions)
+    dst.messages.extend(src.messages)
+    dst.tool_calls.extend(src.tool_calls)
+    _prefer_thinking(dst, src)
     dst.runtime_debug.update(src.runtime_debug)
     return dst
 
@@ -4175,12 +4258,11 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
             for item in json_objects:
                 _merge_agent_turn(turn, _agent_turn_from_obj(item))
             stream_turn = _agent_turn_from_stream_json_events(json_objects)
-            if stream_turn.thinking_summary and not turn.thinking_summary:
-                turn.thinking_summary = stream_turn.thinking_summary
-                turn.thinking_kind = stream_turn.thinking_kind
-                turn.thinking_source = stream_turn.thinking_source
-                turn.thinking_model = stream_turn.thinking_model
-                turn.thinking_native = stream_turn.thinking_native
+            # Route through the shared precedence, NOT a bare "only if empty" copy:
+            # when a full assistant block already landed native reasoning and the
+            # <think> only shows up in later text_delta events, stream_turn is the
+            # self-authored one and must be able to win over that native (feature on).
+            _prefer_thinking(turn, stream_turn)
             if stream_turn.messages and not turn.messages:
                 turn.messages = stream_turn.messages
             # It WAS transport — return its result even when empty (e.g. a lone
@@ -4193,13 +4275,17 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         raw, tagged_thinking = _split_tagged_thinking(raw)
         raw = _truncate_at_unclosed_thinking(raw)
         if tagged_thinking:
-            # Inlined reasoning is NOT provider-native — keep it as a non-native
-            # fallback so a genuine provider-native reasoning still wins in
-            # _merge_agent_turn.
+            # Our self-authored <think> block, parsed locally on THIS host. With the
+            # feature on, the precedence in _merge_agent_turn PREFERS this over the
+            # model's native reasoning ("有 <think> 就用它"); with the feature off,
+            # native still wins (legacy behavior). thinking_self_authored is the
+            # spoof-proof marker (set ONLY here); native-ness is recorded honestly as
+            # False — it is io's own thought, not provider CoT.
             turn.thinking_summary = _sanitize_thinking_summary(tagged_thinking)
             turn.thinking_kind = "provider_reasoning_summary"
             turn.thinking_source = "tagged_content"
             turn.thinking_native = False
+            turn.thinking_self_authored = True
         if not raw.strip():
             return turn
         decision, payload = _scan_visible_protocol(raw)
@@ -5126,13 +5212,19 @@ def _provider_attempt_rows_for_result(
     }]
 
 
-def _extract_text_from_cli_output(raw: str) -> str:
+def _extract_text_from_cli_output(raw: str, *, preserve_tagged: bool = False) -> str:
     """Best-effort extraction from raw CLI stdout.
 
     1. Try JSON parse first when a runtime provides structured output.
     2. Remove explicit reasoning/code sections.
     3. Strip known headers/footers.
     4. Return the full remaining answer, preserving multi-paragraph replies.
+
+    ``preserve_tagged``: when True, a leading self-authored ``<think>`` block is
+    left in the returned text instead of being stripped and discarded. The chat
+    lane sets this so a downstream parse can still recover the self-authored
+    thinking; memory lanes keep the default (strip) so their own extractors see
+    clean text.
     """
     raw = raw.strip()
     if not raw:
@@ -5146,7 +5238,8 @@ def _extract_text_from_cli_output(raw: str) -> str:
         if text:
             return text
 
-    raw, _tagged_thinking = _split_tagged_thinking(raw)
+    if not preserve_tagged:
+        raw, _tagged_thinking = _split_tagged_thinking(raw)
     raw = _strip_reasoning_sections(raw)
     clean = [ln.rstrip() for ln in raw.splitlines() if not _NOISE_LINE_RE.match(ln)]
     text = "\n".join(clean).strip()
@@ -5248,18 +5341,25 @@ def _bare_cards_json(body: Any) -> str:
     return ""
 
 
-def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = None, raw_text: bool = False) -> Any:
+def _call_agent_http_simple(
+    message: str,
+    images: list[dict[str, str]] | None = None,
+    raw_text: bool = False,
+    *,
+    isolated_session: bool = False,
+) -> Any:
     headers = _agent_http_headers()
     payload = {"message": message}
     if images:
         payload["images"] = images
     resp = _HTTP.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=60)
     resp.raise_for_status()
-    _remember_http_session(
-        resp,
-        sent_bytes=len(message.encode("utf-8")),
-        received_bytes=_response_text_len(resp),
-    )
+    if not isolated_session:
+        _remember_http_session(
+            resp,
+            sent_bytes=len(message.encode("utf-8")),
+            received_bytes=_response_text_len(resp),
+        )
     body = resp.json()
     if raw_text:
         text = _raw_assistant_text(body)
@@ -5280,12 +5380,18 @@ def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = 
     raise ValueError(f"unexpected response type: {type(body)}")
 
 
-def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = None, raw_text: bool = False) -> Any:
+def _call_agent_http_openai(
+    message: str,
+    images: list[dict[str, str]] | None = None,
+    raw_text: bool = False,
+    *,
+    isolated_session: bool = False,
+) -> Any:
     headers = _agent_http_headers()
-    sid = _load_agent_session_id()
+    sid = "" if isolated_session else _load_agent_session_id()
     if sid:
         headers[AGENT_HTTP_SESSION_HEADER] = sid
-    session_key = _agent_session_key()
+    session_key = "" if isolated_session else _agent_session_key()
     if session_key:
         headers[AGENT_HTTP_SESSION_KEY_HEADER] = session_key
 
@@ -5305,11 +5411,12 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
     }
     resp = _HTTP.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=120)
     resp.raise_for_status()
-    _remember_http_session(
-        resp,
-        sent_bytes=len(str(content).encode("utf-8")),
-        received_bytes=_response_text_len(resp),
-    )
+    if not isolated_session:
+        _remember_http_session(
+            resp,
+            sent_bytes=len(str(content).encode("utf-8")),
+            received_bytes=_response_text_len(resp),
+        )
     body = resp.json()
     if not isinstance(body, dict):
         raise ValueError(f"unexpected OpenAI response type: {type(body)}")
@@ -5328,13 +5435,25 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
     raise ValueError("OpenAI-compatible response has no usable reply text")
 
 
-def call_agent_http(message: str, images: list[dict[str, str]] | None = None, raw_text: bool = False) -> Any:
+def call_agent_http(
+    message: str,
+    images: list[dict[str, str]] | None = None,
+    raw_text: bool = False,
+    *,
+    isolated_session: bool = False,
+) -> Any:
     if not AGENT_HTTP_URL:
         raise ValueError("AGENT_HTTP_URL is not set for http mode")
     if AGENT_HTTP_PROTOCOL in {"openai", "hermes", "chat_completions", "chat-completions"}:
-        return _call_agent_http_openai(message, images=images, raw_text=raw_text)
+        return _call_agent_http_openai(
+            message, images=images, raw_text=raw_text,
+            isolated_session=isolated_session,
+        )
     if AGENT_HTTP_PROTOCOL in {"simple", "generic", "json"}:
-        return _call_agent_http_simple(message, images=images, raw_text=raw_text)
+        return _call_agent_http_simple(
+            message, images=images, raw_text=raw_text,
+            isolated_session=isolated_session,
+        )
     raise ValueError(f"unknown AGENT_HTTP_PROTOCOL: {AGENT_HTTP_PROTOCOL!r}")
 
 
@@ -5422,21 +5541,6 @@ def _agent_session_file_for_user() -> Path:
 
 def _agent_session_user_id() -> str:
     return (_whoami_cache.get("user_id") or "unknown").strip() or "unknown"
-
-
-def _agent_entry_signature() -> str:
-    """Stable, secret-free identity for the configured model entry."""
-    payload = json.dumps(
-        {
-            "mode": AGENT_MODE,
-            "command": AGENT_CLI_CMD,
-            "http_model": AGENT_HTTP_MODEL,
-            "runtime": AGENT_RUNTIME_METADATA,
-        },
-        ensure_ascii=True,
-        sort_keys=True,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _empty_agent_session_meta(session_id: str = "") -> dict[str, Any]:
@@ -6329,8 +6433,14 @@ def _prepare_cli_command(
     message: str,
     image_paths: list[str] | None = None,
     lane: str = "background",
+    *,
+    session_id_override: str | None = None,
 ) -> tuple[list[str], str | None]:
-    sid = _load_agent_session_id()
+    sid = (
+        _load_agent_session_id()
+        if session_id_override is None
+        else session_id_override
+    )
     template_has_image_slot = "{image_path" in AGENT_CLI_CMD
     # codex gets pixels natively via injected --image= flags (_inject_codex_images);
     # skip the file-path prose that only makes sense for a runtime that must open
@@ -6742,6 +6852,7 @@ def call_agent_cli(
     lane: str = "background",
     attempt_trigger: str = "first",
     stream_update: Callable[[int, str, bool], None] | None = None,
+    isolated_session: bool = False,
 ) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
@@ -6766,7 +6877,19 @@ def call_agent_cli(
             "message cannot reach the agent. Add {message} to the command "
             "template (e.g. claude -p \"{message}\")."
         )
-    cmd, stdin_msg = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
+    isolated_sid = _new_agent_session_id() if isolated_session else None
+    prepare_kwargs: dict[str, Any] = {
+        "image_paths": image_paths,
+        "lane": lane,
+    }
+    if isolated_sid is not None:
+        prepare_kwargs["session_id_override"] = isolated_sid
+    cmd, stdin_msg = _prepare_cli_command(message, **prepare_kwargs)
+    # Self-authored thinking does NOT strip the driver's native reasoning flags: the
+    # model keeps thinking natively (answer quality unchanged), and we additionally
+    # ask it to open its reply with a <think> block (see the prompt injection on the
+    # chat dispatch path). When the model writes that block we prefer it; otherwise we
+    # display the shaped native reasoning. So native reasoning stays on here.
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     _turn_t0 = time.monotonic()
@@ -6942,7 +7065,7 @@ def call_agent_cli(
         observed_sid = command_sid or _extract_session_id(raw_transport)
     else:
         observed_sid = _extract_session_id(raw_transport) or command_sid
-    if observed_sid:
+    if observed_sid and not isolated_session:
         _save_agent_session_id(observed_sid)
         _record_agent_session_turn(
             observed_sid,
@@ -6963,6 +7086,7 @@ def call_agent_cli(
         if (
             _is_claude_code_cmd(cmd)
             and _resume_sid
+            and not isolated_session
             and _resume_sid == _load_agent_session_id()
             and _CLAUDE_MISSING_SESSION_RE.search(raw_transport)
         ):
@@ -7054,7 +7178,7 @@ def call_agent_cli(
                 ))
             _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
             raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
-            if observed_sid:
+            if observed_sid and not isolated_session:
                 _record_agent_session_turn(
                     observed_sid,
                     sent_bytes=len((message or "").encode("utf-8")),
@@ -7077,7 +7201,11 @@ def call_agent_cli(
             # 0 EVEN ON API ERRORS (see the raise below), so returncode is not pi's
             # success signal. A failed turn must not eat the bridge, or the retry
             # faces a blank session with no history and the user drops out.
-            if observed_sid and _message_has_injected_history(message):
+            if (
+                observed_sid
+                and not isolated_session
+                and _message_has_injected_history(message)
+            ):
                 _mark_agent_session_bridged(observed_sid)
             # Same lane discipline as codex: background memory lanes (raw_text)
             # get the bare reply; only foreground chat folds thinking into the
@@ -7134,7 +7262,11 @@ def call_agent_cli(
     if _is_hermes_chat_cmd(cmd) and observed_sid:
         hermes_reasoning = _hermes_session_reasoning(observed_sid)
     if hermes_reasoning:
-        text = _extract_text_from_cli_output(raw)
+        # Keep a leading self-authored <think> in the reply text: the downstream
+        # re-parse recovers it and (feature on) prefers it over this hermes native
+        # reasoning. Without preserve_tagged the <think> was stripped and discarded
+        # here, so hermes turns could never show self-authored thinking.
+        text = _extract_text_from_cli_output(raw, preserve_tagged=True)
         if text.strip():
             return _attach_provider_reasoning(
                 text,
@@ -7435,6 +7567,7 @@ def call_agent(
     lane: str = "background",
     attempt_trigger: str = "first",
     stream_update: Callable[[int, str, bool], None] | None = None,
+    isolated_session: bool = False,
 ) -> Any:
     # `_turn_reply_parse_failed` is a per-turn signal: reset it at entry so a
     # prior turn's failure (or a suppressed leak below) never bleeds into this
@@ -7448,12 +7581,25 @@ def call_agent(
             # http path metrics/timing are out of scope for this event pair (cli-only);
             # trace_id is accepted here for a uniform call signature but unused.
             # lane gates MCP injection, which only exists on the cli path — unused here.
-            return call_agent_http(message, images=images, raw_text=raw_text)
+            http_kwargs: dict[str, Any] = {
+                "images": images,
+                "raw_text": raw_text,
+            }
+            if isolated_session:
+                http_kwargs["isolated_session"] = True
+            return call_agent_http(message, **http_kwargs)
         if AGENT_MODE == "cli":
-            return call_agent_cli(
-                message, image_paths=image_paths, raw_text=raw_text,
-                trace_id=trace_id, lane=lane, attempt_trigger=attempt_trigger,
-                stream_update=stream_update)
+            cli_kwargs: dict[str, Any] = {
+                "image_paths": image_paths,
+                "raw_text": raw_text,
+                "trace_id": trace_id,
+                "lane": lane,
+                "attempt_trigger": attempt_trigger,
+                "stream_update": stream_update,
+            }
+            if isolated_session:
+                cli_kwargs["isolated_session"] = True
+            return call_agent_cli(message, **cli_kwargs)
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
     raw = _call_with_resident_busy_poll(_invoke, lane=lane)
@@ -9131,6 +9277,91 @@ def poll_proactive_jobs(since: float) -> dict:
     return body
 
 
+def _vision_probe_error_code(exc: BaseException) -> str:
+    notice = classify_agent_error(exc)
+    return {
+        "auth_invalid": "vision_model_auth_invalid",
+        "quota_insufficient": "vision_model_quota_insufficient",
+        "model_not_found": "vision_model_not_found",
+        "provider_incompatible": "vision_model_incompatible",
+        "rate_limited": "vision_model_rate_limited",
+        "upstream_unavailable": "vision_model_unavailable",
+        "turn_timeout": "vision_model_unavailable",
+        "reply_parse_failed": "vision_model_empty_response",
+    }.get(notice.error_class, "vision_model_failed")
+
+
+def _process_vision_probe(result: dict) -> None:
+    """Run the hidden two-image control probe outside chat/session state."""
+    probe = result.get("vision_probe")
+    if not isinstance(probe, dict):
+        return
+    probe_id = str(probe.get("probe_id") or "").strip()
+    images = probe.get("images") if isinstance(probe.get("images"), list) else []
+    if not probe_id or len(images) != 2:
+        return
+    payload: dict[str, Any] = {"probe_id": probe_id, "status": "failed"}
+    temp_paths: list[str] = []
+    try:
+        runtime_images: list[dict[str, str]] = []
+        for index, image in enumerate(images):
+            if not isinstance(image, dict):
+                raise ValueError("invalid vision probe image")
+            data_url = str(image.get("data_url") or "").strip()
+            if not data_url.startswith("data:image/png;base64,"):
+                raise ValueError("invalid vision probe image")
+            raw = base64.b64decode(data_url.split(",", 1)[1], validate=True)
+            runtime_images.append({"data_url": data_url, "mime_type": "image/png"})
+            fd, path = tempfile.mkstemp(prefix=f"io-vision-probe-{index}-", suffix=".png")
+            try:
+                os.write(fd, raw)
+            finally:
+                os.close(fd)
+            temp_paths.append(path)
+        prompt = (
+            "Private capability check. Inspect both attached images. Each has four "
+            "solid stripes. Reply with exactly two lines, one per image in order, "
+            "using only four lowercase color names separated by commas."
+        )
+        raw_reply = call_agent(
+            prompt,
+            images=runtime_images,
+            image_paths=temp_paths,
+            raw_text=True,
+            lane="background",
+            isolated_session=True,
+        )
+        colors = re.findall(
+            r"red|green|blue|yellow", str(raw_reply or "").lower()
+        )[:8]
+        if len(colors) != 8:
+            payload["error_code"] = "vision_model_empty_response"
+        else:
+            payload = {
+                "probe_id": probe_id,
+                "status": "ok",
+                "observed": [",".join(colors[:4]), ",".join(colors[4:8])],
+            }
+    except Exception as exc:  # noqa: BLE001 -- result must reach server
+        payload["error_code"] = _vision_probe_error_code(exc)
+    finally:
+        for path in temp_paths:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+    try:
+        response = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/internal/vision/main/test/result",
+            json=payload,
+            headers=_HEADERS,
+            timeout=15,
+        )
+        response.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 -- later polls can re-deliver pending probe
+        log.warning("vision control probe result post failed: %s", type(exc).__name__)
+
+
 def _proactive_tick_trigger_for_broadcast_state(broadcast_state: str) -> str:
     state = str(broadcast_state or "").strip().lower()
     if not state or state == "off":
@@ -9514,6 +9745,8 @@ def post_reply(
     turn_failure_error_class: str = "",
     turn_failure_blame: str = "",
     turn_failure_user_text: str = "",
+    turn_failure_model: str = "",
+    turn_failure_provider: str = "",
     file_followups: list[StagedChatFile] | None = None,
 ) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
@@ -9609,6 +9842,16 @@ def post_reply(
                 body["turn_failure_error_class"] = turn_failure_error_class
                 body["turn_failure_blame"] = turn_failure_blame
                 body["turn_failure_user_text"] = turn_failure_user_text
+                failure_model = _sanitize_thinking_meta(
+                    turn_failure_model, max_len=96
+                )
+                failure_provider = _sanitize_thinking_meta(
+                    turn_failure_provider, max_len=80
+                )
+                if failure_model:
+                    body["turn_failure_model"] = failure_model
+                if failure_provider:
+                    body["turn_failure_provider"] = failure_provider
             if reply_to_message_id:
                 body["reply_to_message_id"] = reply_to_message_id
             if sealed_file_followups:
@@ -12965,6 +13208,16 @@ def _process_messages(messages: list) -> float:
                 _quoted_present, ts,
             )
 
+        # Self-authored thinking — FOREGROUND-CHAT-only (this dispatch; background
+        # lanes build their prompts elsewhere and are never asked to emit <think>).
+        # Prepended so the user's current message stays LAST (the "answer only the
+        # last message" framing) and the transcript header added below stays
+        # topmost. The consumer's existing tagged-thinking extraction peels the
+        # <think> block into thinking_summary. Same kill switch as V2.
+        from core import self_thinking as _self_thinking_v1
+
+        if _self_thinking_v1.enabled():
+            content = f"{_self_thinking_v1.INSTRUCTION.strip()}\n\n{content}"
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
         content = _prepend_time_anchor_foreground(content, ts)
@@ -13050,6 +13303,18 @@ def _process_messages(messages: list) -> float:
                 )
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
+            if (
+                content_type == "image"
+                and not isinstance(e, VisionObserverFailure)
+                and classify_agent_error(e).error_class != "vision_model_required"
+            ):
+                e = VisionObserverFailure(
+                    _vision_probe_error_code(e),
+                    detail=type(e).__name__,
+                    raw_user_text=raw_user_content_for_lang,
+                    model=str(AGENT_RUNTIME_METADATA.get("model") or ""),
+                    provider=str(AGENT_RUNTIME_METADATA.get("provider") or ""),
+                )
             # Codex review I10: call_agent raised, so the prompt (catalog
             # included, if _prepend_io_cli_capability_catalog injected it
             # above) never reached the model this turn — drop the pending
@@ -13299,7 +13564,10 @@ def _process_messages(messages: list) -> float:
                 # post_kwargs（proactive 那处）刻意不带——后台失败不进聊天流。
                 if idx == 0 and pending_failure_notice is not None:
                     post_kwargs.update(
-                        turn_failure_post_kwargs(classify_agent_error(pending_failure_notice))
+                        turn_failure_post_kwargs(
+                            classify_agent_error(pending_failure_notice),
+                            failure=pending_failure_notice,
+                        )
                     )
                 if idx == 0 and staged_outbound_files:
                     post_kwargs["file_followups"] = staged_outbound_files
@@ -14780,6 +15048,10 @@ def run() -> None:
             # turn. No-op when the fingerprint hasn't moved (best-effort;
             # failures log and retry on a later poll).
             _maybe_apply_user_mcp()
+
+            # Hidden control-plane capability probe. It never becomes a chat
+            # message and uses a fresh isolated model session.
+            _process_vision_probe(result)
 
             if result.get("timed_out"):
                 # Idle moment: safe to swap to the backend's commit and re-exec

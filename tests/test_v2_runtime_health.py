@@ -245,6 +245,7 @@ def _add_metric(
     usage_reported: int = 1,
     cache_read: int | None = None,
     cache_miss: int | None = None,
+    cache_reported: int = 0,
     age_hours: int = 0,
 ) -> None:
     """直接写一行 v2_turn_metrics。job_id 传 None——该列的唯一索引允许多个 NULL。"""
@@ -255,7 +256,7 @@ def _add_metric(
         model_calls=model_calls, retries=0, failed=failed,
         status="turn_failed:providererror" if failed else "ok",
         cache_read_tokens=cache_read, cache_miss_tokens=cache_miss,
-        usage_reported_calls=usage_reported,
+        usage_reported_calls=usage_reported, cache_reported_calls=cache_reported,
     )
     if age_hours:
         with db.get_pool().connection() as conn:
@@ -382,3 +383,39 @@ def test_token_usage_by_lane_is_empty_without_history():
     out = jobs_store.recent_token_usage_by_lane()
     assert out["lanes"] == {}
     assert out["window_hours"] == 24
+
+
+def test_token_usage_by_lane_reports_cache_coverage_separately():
+    """cache coverage 与 usage coverage 是两个不同的东西，必须分别可得。
+
+    2026-07-30 审计指出：页面把 `cache_hit_ratio · usage_coverage` 挤在一列、标签
+    写成「缓存命中 · 上报」，读者会把那个「上报」理解成 cache 上报，而它其实是
+    token usage 上报。`cache_reported_calls` 一直在写入路径里采集、聚合查询却从没
+    取过它——真正的 cache coverage 此前不可得。
+    """
+    # 2 次调用：1 次报了 cache 指标、1 次没报；usage 则两次都报了
+    _add_metric("u_cov_a", "chat", prompt=1000, completion=100,
+                usage_reported=1, cache_reported=1,
+                cache_read=600, cache_miss=400)
+    _add_metric("u_cov_b", "chat", prompt=500, completion=50,
+                usage_reported=1, cache_reported=0)
+
+    chat = jobs_store.recent_token_usage_by_lane()["lanes"]["chat"]
+
+    assert chat["model_calls"] == 2
+    assert chat["usage_reported_calls"] == 2
+    assert chat["usage_coverage"] == pytest.approx(1.0)      # usage 全报了
+    assert chat["cache_reported_calls"] == 1
+    assert chat["cache_coverage"] == pytest.approx(0.5)      # cache 只报了一半
+    # 两个 coverage 不是同一个数——这正是要拆开的理由
+    assert chat["cache_coverage"] != chat["usage_coverage"]
+
+
+def test_token_usage_by_lane_cache_coverage_is_none_without_calls():
+    _add_metric("u_cov_none", "chat", prompt=None, completion=None,
+                model_calls=0, usage_reported=0, cache_reported=0)
+
+    chat = jobs_store.recent_token_usage_by_lane()["lanes"]["chat"]
+
+    assert chat["model_calls"] == 0
+    assert chat["cache_coverage"] is None

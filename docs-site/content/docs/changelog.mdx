@@ -20,12 +20,36 @@ change must not be interpreted as an API guarantee.
   resident-write, and Ombre sync provenance values.
   Capture clients no longer rewrite `merge` or `supersede` cards that lack a
   target into `memory.add`.
+- **The thinking chain is now io's own first-person reasoning, not raw provider
+  chain-of-thought.** When the thinking display is enabled, io is prompted to open
+  each reply with a short self-authored `<think>` block (its own train of thought,
+  in the user's language, with no tool/internal names); the runtime prefers that
+  block and shows the model's native reasoning only as a fallback when no block was
+  written. The model still reasons natively for answer quality — only what is
+  *displayed* changes. This spans both Runtime V2 and resident V1. It is on by
+  default and controlled by a single kill switch, `FEEDLING_V2_SELF_THINKING`
+  (unset/`1` = on; `0`/`false`/`no`/`off` = revert to showing native reasoning
+  verbatim). Because the displayed thinking may now be this self-authored summary,
+  `include_reasoning` requests "the assistant's per-turn thinking," which may be
+  either the self-authored block or native reasoning, rather than strictly the
+  provider's raw chain-of-thought.
 
 - **Image turns rejected by a text-only main model now return actionable
   failure metadata.** Resident V1, Runtime V2, and current VPS residents classify
   the provider rejection as `vision_model_required` and direct the user to add
   or select a vision-capable model instead of showing the generic retry-later
   reply. Image sends remain ungated: probe status does not block delivery.
+
+- **Main-model image validation now uses one runtime-neutral endpoint.**
+  `POST /v1/vision/main/test` trusts only explicit provider catalog modalities;
+  when metadata is missing, it performs a real two-image capability probe.
+  Model API routes return a terminal `ok`, `unsupported`, `failed`, or
+  `untested` result. Resident runtimes return `202 testing` while an isolated,
+  hidden probe runs; clients then refresh `GET /v1/vision/config`. Known
+  `unsupported` provider/model bindings reject image sends immediately with
+  `vision_model_incompatible`, while untested bindings still receive a real
+  call. Runtime failures expose stable visual error codes and the exact
+  provider/model without putting probe traffic into Chat history or activity.
 
 - **Hosted Runtime V2 chat sends can request provider reasoning per turn.**
   `POST /v1/model_api/chat/send` accepts the optional boolean

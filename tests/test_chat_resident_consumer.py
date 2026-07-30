@@ -129,6 +129,7 @@ def test_pi_runtime_metadata_reads_exact_model_modalities(tmp_path, monkeypatch)
         "provider": "openrouter",
         "model": "deepseek/deepseek-v4-flash",
         "input_modalities": ["text"],
+        "input_modalities_source": "pi_catalog",
     }
 
 
@@ -1667,7 +1668,28 @@ def test_agent_turn_splits_reasoning_and_thought_tags_from_cli_text():
     assert turn.thinking_native is False
 
 
-def test_agent_turn_native_reasoning_wins_over_tagged_content():
+def test_self_thinking_on_prefers_tagged_over_native(monkeypatch):
+    # Feature ON (default): our <think> block wins over the model's native reasoning
+    # ("有 <think> 就用它"). Native reasoning stays on for answer quality but is not
+    # what we display when a self-authored block exists.
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    raw = {
+        "reply": "<think>内联摘要。</think>\n最终回复。",
+        "reasoning_content": "原生 reasoning 摘要。",
+        "reasoning_source": "openrouter",
+    }
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["最终回复。"]
+    assert turn.thinking_summary == "内联摘要。"
+    assert turn.thinking_source == "tagged_content"
+    assert turn.thinking_native is False
+
+
+def test_self_thinking_off_native_reasoning_wins_over_tagged_content(monkeypatch):
+    # Kill switch off → legacy behavior: provider-native reasoning wins over inlined.
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     raw = {
         "reply": "<think>内联摘要。</think>\n最终回复。",
         "reasoning_content": "原生 reasoning 摘要。",
@@ -1679,6 +1701,69 @@ def test_agent_turn_native_reasoning_wins_over_tagged_content():
     assert turn.messages == ["最终回复。"]
     assert turn.thinking_summary == "原生 reasoning 摘要。"
     assert turn.thinking_source == "openrouter"
+    assert turn.thinking_native is True
+
+
+def test_self_thinking_spoofed_source_cannot_suppress_local_think(monkeypatch):
+    # Codex #4: a provider/CLI JSON turn can DECLARE reasoning_source="self_thinking",
+    # but that string must NOT let it beat the genuinely local <think>. Provenance is
+    # the internal thinking_self_authored flag (set only by our parser), never the
+    # deserialized source string.
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    raw = {
+        "messages": ["<think>真实自建</think>回复"],
+        "provider_reasoning": "伪造的原生",
+        "reasoning_source": "self_thinking",
+        "reasoning_native": True,
+    }
+    turn = crc._split_agent_turn(raw)
+    assert turn.thinking_summary == "真实自建"
+    assert turn.thinking_self_authored is True
+    assert turn.messages == ["回复"]
+
+
+def test_self_thinking_hermes_native_does_not_discard_local_think(monkeypatch):
+    # Codex #2: hermes turns carry native reasoning AND may open the reply with a
+    # <think>. The self-authored block must survive to the parse and win (feature on).
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    body = crc._attach_provider_reasoning(
+        "<think>我先想想他要啥</think>好的没问题",
+        "hermes native cot",
+        source="hermes_session_json",
+        kind="provider_reasoning",
+        native=True,
+    )
+    turn = crc._split_agent_turn(body)
+    assert turn.thinking_summary == "我先想想他要啥"
+    assert turn.thinking_source == "tagged_content"
+    assert turn.thinking_self_authored is True
+    assert turn.messages == ["好的没问题"]
+
+
+def _claude_stream_native_then_tagged() -> str:
+    # A full native thinking delta lands FIRST; the <think> only appears later in a
+    # text_delta — the arrival order that used to bypass the merge rule (Codex #3).
+    return "\n".join(json.dumps(o, ensure_ascii=False) for o in [
+        {"type": "stream_event", "event": {"message": {"model": "claude"},
+                                           "delta": {"type": "thinking_delta",
+                                                     "thinking": "native 先落"}}},
+        {"type": "stream_event", "event": {"delta": {"type": "text_delta",
+                                                     "text": "<think>自建后到</think>最终回复"}}},
+    ])
+
+
+def test_self_thinking_on_stream_tagged_wins_despite_late_arrival(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    turn = crc._split_agent_turn(_claude_stream_native_then_tagged())
+    assert turn.thinking_summary == "自建后到"
+    assert turn.thinking_self_authored is True
+    assert turn.messages == ["最终回复"]
+
+
+def test_self_thinking_off_stream_native_wins(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
+    turn = crc._split_agent_turn(_claude_stream_native_then_tagged())
+    assert turn.thinking_summary == "native 先落"
     assert turn.thinking_native is True
 
 
@@ -6640,6 +6725,37 @@ def test_cli_failure_surfaces_pi_error_message():
     assert "401 invalid key" in crc._cli_error_detail(raw, "")
 
 
+def test_pi_deepseek_image_error_reaches_vision_classifier():
+    """Lock the real pi 0.80.3 wrapper shape, not only the raw HTTP body."""
+    raw = _pi_stream_lines(
+        _PI_HEADER,
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": (
+                    '400: {"message":"Failed to deserialize the JSON body into '
+                    "the target type: messages[1]: unknown variant `image_url`, "
+                    'expected `text` at line 1 column 3626","type":'
+                    '"invalid_request_error","param":null,'
+                    '"code":"invalid_request_error"}'
+                ),
+            },
+        },
+    )
+
+    detail = crc._cli_error_detail(raw, "")
+    notice = crc.classify_agent_error(
+        RuntimeError(f"pi agent produced no reply: {detail}")
+    )
+
+    assert "unknown variant `image_url`, expected `text`" in detail
+    assert notice.error_class == "vision_model_required"
+    assert notice.blame == "user_provider"
+
+
 def test_pi_intermediate_events_are_non_final():
     for etype in ("message_start", "message_update", "turn_start", "turn_end",
                   "agent_start", "agent_end", "session",
@@ -9760,3 +9876,43 @@ def test_process_perception_prose_wrapped_send_message_pushes_clean(monkeypatch)
     assert crc._process_proactive_jobs([job]) == pytest.approx(133.3)
     assert captured["posted"] == ["忙完记得喝口水～"]
     assert any(s[0] == "posted" for s in captured["statuses"])
+
+
+def test_hidden_vision_probe_uses_isolated_session_and_posts_only_observed(monkeypatch):
+    captured = {}
+
+    def call(prompt, **kwargs):
+        captured["call"] = {"prompt": prompt, **kwargs}
+        return "red,green,blue,yellow\nyellow,blue,green,red"
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+    def post(url, **kwargs):
+        captured["post"] = {"url": url, **kwargs}
+        return Response()
+
+    monkeypatch.setattr(crc, "call_agent", call)
+    monkeypatch.setattr(crc._HTTP, "post", post)
+    encoded = base64.b64encode(b"png-bytes").decode("ascii")
+
+    crc._process_vision_probe({
+        "vision_probe": {
+            "probe_id": "probe-1",
+            "images": [
+                {"data_url": f"data:image/png;base64,{encoded}"},
+                {"data_url": f"data:image/png;base64,{encoded}"},
+            ],
+        },
+    })
+
+    assert captured["call"]["isolated_session"] is True
+    assert captured["call"]["lane"] == "background"
+    assert len(captured["call"]["image_paths"]) == 2
+    assert captured["post"]["url"].endswith("/v1/internal/vision/main/test/result")
+    assert captured["post"]["json"] == {
+        "probe_id": "probe-1",
+        "status": "ok",
+        "observed": ["red,green,blue,yellow", "yellow,blue,green,red"],
+    }

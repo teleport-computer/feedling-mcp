@@ -48,7 +48,9 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
         consumer_info,
         runtime_token_auth=bool(auth.runtime_token_claims),
     )
-    context = await threadpool.run_db(chat_poll_core.poll_context, store)
+    context = await threadpool.run_db(
+        chat_poll_core.poll_context, store, consumer_info
+    )
 
     try:
         since = float(request.query_params.get("since", 0))
@@ -107,7 +109,7 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
         # Either a new chat message OR a new status event (§9 tool-call
         # progress) is enough to return — a status-only update must wake a
         # parked waiter too, not just chat messages.
-        if pending or status_events:
+        if pending or status_events or context.get("vision_probe"):
             # Immediate delivery before parking: the pre-park context is still
             # the freshest snapshot, so reuse it (no extra DB read).
             return _response(pending, status_events, timed_out=False, ctx=context)
@@ -124,7 +126,9 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
     # Refresh the context after the wait: config changes that landed while we
     # were parked (a moved user_mcp fingerprint etc.) must be reflected in this
     # response rather than the stale pre-park snapshot.
-    fresh = await threadpool.run_db(chat_poll_core.poll_context, store)
+    fresh = await threadpool.run_db(
+        chat_poll_core.poll_context, store, consumer_info
+    )
     if notified:
         return _response(await _check(), await _status(), timed_out=False, ctx=fresh)
     return _response([], await _status(), timed_out=True, ctx=fresh)
