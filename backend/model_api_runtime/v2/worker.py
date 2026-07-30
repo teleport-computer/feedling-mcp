@@ -9532,7 +9532,7 @@ async def process_job(
             # with the clean body. Fail-open — no marker → reply byte-identical and
             # the native reasoning (if any) is kept.
             if file_reply is None and text:
-                from model_api_runtime.v2 import self_thinking
+                from core import self_thinking
 
                 if self_thinking.enabled():
                     _self_thinking, _clean_reply = self_thinking.split_thinking(text)
