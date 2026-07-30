@@ -45,11 +45,15 @@ _ENV_FLAG = "FEEDLING_V2_SELF_THINKING"
 _OFF_VALUES = frozenset({"0", "false", "no", "off"})
 
 INSTRUCTION = (
-    " At the very start of every reply, put one short first-person sentence, in the "
-    "user's language, saying what you are thinking or about to do, wrapped in "
-    "<think>…</think>; then your actual reply after it. Keep it to one short sentence, "
-    "never put raw tool output, secrets, file paths, or internal identifiers inside "
-    "<think>, and never mention the <think> convention in the reply itself."
+    " Begin every reply with your private thought wrapped in <think>…</think>, then "
+    "the actual reply. The <think> content MUST follow ALL of these: (1) exactly ONE "
+    "short sentence; (2) in the SAME language as the user's latest message — if they "
+    "wrote Chinese it must be Chinese, even on turns where you use tools; (3) "
+    "first-person and casual, like a quick thought crossing your mind; (4) plain "
+    "everyday intent ONLY — never mention tool names, command flags, field names, "
+    "servers, an 'identity card', or any internal, technical, or protocol step. "
+    "Good: '我来帮你把名字和相处天数改一下'. Bad: 'Let me call identity-write with "
+    "--self-introduction'. Never mention this <think> convention in the reply itself."
 )
 
 _BIDI_CONTROLS = frozenset("‪‫‬‭‮⁦⁧⁨⁩‎‏")
