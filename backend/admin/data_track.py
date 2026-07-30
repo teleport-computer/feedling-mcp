@@ -2290,6 +2290,13 @@ def _fmt_tokens_compact(value) -> str:
 #   p95    —— pre 健康态 chat p95 = 38.1s，留约 1.5× 余量
 #   pending 年龄 —— 对应 claim lag 退化；健康时该值为空
 _RUNTIME_HEALTH_WINDOWS = (24, 168, 720)
+# 本页只按 hours 取窗口，这几个共享参数它一概读不到。`_data_track_qs` 的保留列表
+# 是全视图共用的，所以从别的视图带过来的 day/limit/offset/page 会一路跟着 URL 走、
+# 看着生效实则被无视。2026-07-30 审计实证了它的代价：有人拿
+# `?view=runtime&day=2026-07-25` 的截图当成"7 月 25 日的数据"，而页面渲染的其实是
+# 生成时刻向前 24 小时——参数被静默忽略比参数报错危险，因为页顶还写着「窗口 24
+# 小时」，读者不会怀疑自己看错了日期。本页自己生成的链接一律把它们清掉。
+_RUNTIME_IGNORED_PARAMS = {"day": None, "limit": None, "offset": None, "page": None}
 _RUNTIME_HEALTH_FAILURE_WARN = 0.05
 _RUNTIME_HEALTH_FAILURE_BAD = 0.15
 _RUNTIME_HEALTH_P95_WARN_MS = 60_000
@@ -2507,7 +2514,7 @@ def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> st
     window_labels = {24: "24 小时", 168: "7 天", 720: "30 天"}
     window_links = "".join(
         f"<a class='sort-button{' active' if hours == window_hours else ''}' "
-        f"href='{html.escape(_data_track_page_href(view='runtime', hours=hours), quote=True)}'>"
+        f"href='{html.escape(_data_track_page_href(view='runtime', hours=hours, **_RUNTIME_IGNORED_PARAMS), quote=True)}'>"
         f"{html.escape(window_labels[hours])}</a>"
         for hours in _RUNTIME_HEALTH_WINDOWS
     )
@@ -2569,17 +2576,31 @@ def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> st
                 f"<td>{_fmt_tokens_compact(prompt_tok)} / "
                 f"{_fmt_tokens_compact(completion_tok)}</td>"
             )
+        # 缓存命中率与两种上报覆盖率分列。此前它们挤在一列、标签写「缓存命中 ·
+        # 上报」，那个"上报"指的是 token usage 上报，读者却会当成 cache 上报
+        # （2026-07-30 审计）。cache coverage 与 usage coverage 是两个独立的量。
         hit_ratio = lane_tokens.get("cache_hit_ratio")
-        coverage = lane_tokens.get("usage_coverage")
-        if hit_ratio is None and coverage is None:
-            cache_cell = "<td class='muted'>—</td>"
+        cache_cell = (
+            "<td class='muted'>—</td>" if hit_ratio is None
+            else f"<td>{_fmt_ratio(hit_ratio)}</td>"
+        )
+        usage_cov = lane_tokens.get("usage_coverage")
+        cache_cov = lane_tokens.get("cache_coverage")
+        if usage_cov is None and cache_cov is None:
+            coverage_cell = "<td class='muted'>—</td>"
         else:
-            cache_cell = (
-                f"<td>{_fmt_ratio(hit_ratio)} · {_fmt_ratio(coverage)}</td>"
+            coverage_cell = (
+                f"<td>{_fmt_ratio(usage_cov)} / {_fmt_ratio(cache_cov)}</td>"
             )
         lane_label = html.escape(name)
         if name == "heartbeat":
-            hb_href = _data_track_page_href(view="proactive", hours=None, offset=0)
+            # 同样清掉本页忽略的参数。目标页（Proactive 日报）只读
+            # since/registered_since/days（**复数**），从不读单数 day；limit/offset
+            # 在它的 payload 里也没用——不清的话那些参数会跟着跳过去，在新页面上
+            # 照样是"看着生效实则被无视"，只是换了一跳、可见度更低。
+            hb_href = _data_track_page_href(
+                view="proactive", hours=None, **_RUNTIME_IGNORED_PARAMS
+            )
             lane_label += (
                 f" <a class='muted' style='font-size:12px' "
                 f"href='{html.escape(hb_href, quote=True)}'>（日报口径）</a>"
@@ -2598,6 +2619,7 @@ def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> st
             + capture_cell
             + token_cell
             + cache_cell
+            + coverage_cell
             + "</tr>"
         )
 
@@ -2671,14 +2693,17 @@ def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> st
     prompt token 已包含 cache read/write，<b>不要与缓存列相加</b>，否则重复计数。
     本页 token 跟随上方窗口；users 页「运营 Telemetry」固定近 30 天，
     两处数字不一致是<b>窗口不同</b>，不是 bug——切到 30 天时应当一致。
-  </div>
+    「上报 usage/cache」是两种<b>不同</b>的覆盖率：前者指有多少次调用回报了 token
+    usage、后者指有多少次回报了缓存指标，不要当成同一个数。
+    <b>本页只按 hours 取窗口</b>（24 / 168 / 720），URL 里的 day / limit / offset
+    在这一页<b>不生效</b>——想看某一天请用 DAU 或 Proactive 日报页。</div>
   {empty_note}
   <h2>Worker 池</h2>
   <section class="metrics">{pool_metrics}</section>
   <h2>各 lane 健康</h2>
   <table>
-    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>失败</th><th>过期</th><th>superseded</th><th>失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 完整/部分/漏写/在飞</th><th>token 入/出</th><th>缓存命中 · 上报</th></tr></thead>
-    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='12' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
+    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>失败</th><th>过期</th><th>superseded</th><th>失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 完整/部分/漏写/在飞</th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
+    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='13' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
   </table>
   <h2>失败原因 Top</h2>
   <table>
