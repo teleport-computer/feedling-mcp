@@ -226,3 +226,130 @@ def test_relationship_days_error_live_check():
         "relationship_days_must_be_non_negative_int"
     assert ci.relationship_days_error({"patch": {"relationship_days": 10 ** 9}}) == \
         "relationship_days_out_of_range"
+
+
+# --------------------------------------------------------------------------- #
+# get() must DECRYPT — the model is not an iOS client
+# --------------------------------------------------------------------------- #
+#
+# `identity_core.get_identity` returns the raw E2E envelope on purpose: the
+# public GET /v1/identity/get exists for iOS, which decrypts locally. The V2
+# capability shares that core but has no local key — so it has to go through the
+# enclave, exactly like every memory readside does. It didn't: `get()` accepted
+# api_key/runtime_token and dropped both, handing the model `body_ct` and no
+# agent_name/self_introduction on every single call (prod: usr_81a0645d, V2).
+
+import json  # noqa: E402
+
+from core import enclave as core_enclave  # noqa: E402
+
+
+def _envelope(**overrides) -> dict:
+    env = {
+        "v": 1, "id": "idc_1",
+        "body_ct": "CIPHERTEXT", "nonce": "n", "K_user": "ku", "K_enclave": "ke",
+        "owner_user_id": "usr_x", "visibility": "shared",
+        "created_at": "2026-07-14T13:35:35", "updated_at": "2026-07-22T18:00:29",
+        "enclave_pk_fpr": "fpr",
+        # get_identity injects this live-computed field alongside the envelope
+        "days_with_user": 47,
+    }
+    env.update(overrides)
+    return env
+
+
+_INNER = {
+    "agent_name": "裴晟",
+    "self_introduction": "我陪你写代码",
+    "dimensions": [{"name": "温度", "value": 70}],
+    "category": "companion",
+    "signature": ["直接", "不哄"],
+    "custom_persona_prompt": "别叫我宝宝",
+}
+
+
+def test_get_decrypts_the_card_instead_of_handing_the_model_ciphertext(monkeypatch):
+    monkeypatch.setattr(identity_core, "get_identity",
+                        lambda store: ({"identity": _envelope()}, 200))
+    seen = {}
+
+    def fake_decrypt(env, api_key, *, purpose, runtime_token=""):
+        seen["api_key"], seen["runtime_token"] = api_key, runtime_token
+        seen["envelope"] = env
+        return json.dumps(_INNER).encode("utf-8")
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)
+
+    r = cap_identity.get("STORE", api_key=None, runtime_token="rt")
+
+    assert r.ok is True
+    card = r.data["identity"]
+    assert card["agent_name"] == "裴晟"
+    assert card["self_introduction"] == "我陪你写代码"
+    assert card["decrypt_status"] == "ok"
+    assert card["days_with_user"] == 47          # live value survives the decrypt
+    assert "body_ct" not in json.dumps(r.data, ensure_ascii=False)
+    # a hosted worker has no api_key — the token is the only usable credential
+    assert seen["runtime_token"] == "rt" and seen["api_key"] is None
+
+
+def test_get_forwards_every_profile_field_not_just_the_headline_ones(monkeypatch):
+    """card_policy owns the field list; a hand-copied subset silently ERASES the
+    rest on the next partial update (this exact drift once dropped
+    custom_persona_prompt from the enclave's own route)."""
+    monkeypatch.setattr(identity_core, "get_identity",
+                        lambda store: ({"identity": _envelope()}, 200))
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave",
+                        lambda *a, **k: json.dumps(_INNER).encode("utf-8"))
+
+    card = cap_identity.get("STORE", runtime_token="rt").data["identity"]
+
+    assert card["custom_persona_prompt"] == "别叫我宝宝"
+    assert card["signature"] == ["直接", "不哄"]
+
+
+def test_get_reports_failure_rather_than_falling_back_to_ciphertext(monkeypatch):
+    """The one thing worse than "I can't read your card" is handing the model
+    ciphertext under ok=True: the agent then reports the card as unreadable
+    garbage and the real cause is destroyed."""
+    monkeypatch.setattr(identity_core, "get_identity",
+                        lambda store: ({"identity": _envelope()}, 200))
+
+    def boom(*_a, **_k):
+        raise RuntimeError("enclave_unavailable")
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", boom)
+
+    r = cap_identity.get("STORE", runtime_token="rt")
+
+    assert r.ok is False
+    assert "CIPHERTEXT" not in json.dumps(r.error, ensure_ascii=False)
+    assert "enclave_unavailable" in r.error["message"]
+
+
+def test_get_does_not_call_the_enclave_for_a_local_only_card(monkeypatch):
+    """local_only means the user opted the agent OUT. Spending an enclave decrypt
+    on it would be both wasteful and a policy violation."""
+    monkeypatch.setattr(identity_core, "get_identity",
+                        lambda store: ({"identity": _envelope(visibility="local_only")}, 200))
+    calls = {"n": 0}
+
+    def counted(*_a, **_k):
+        calls["n"] += 1
+        raise AssertionError("must not decrypt a local_only card")
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", counted)
+
+    r = cap_identity.get("STORE", runtime_token="rt")
+
+    assert calls["n"] == 0
+    assert r.ok is True
+    assert r.data["identity"]["decrypt_status"] == "local_only_agent_cannot_read"
+    assert "body_ct" not in json.dumps(r.data, ensure_ascii=False)
+
+
+def test_get_passes_through_an_absent_card(monkeypatch):
+    monkeypatch.setattr(identity_core, "get_identity",
+                        lambda store: ({"identity": None}, 200))
+    r = cap_identity.get("STORE", runtime_token="rt")
+    assert r.ok is True and r.data["identity"] is None
