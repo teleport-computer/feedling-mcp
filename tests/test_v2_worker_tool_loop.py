@@ -288,6 +288,11 @@ def _late_input_deps(uid: str, written: list[str]) -> worker.TurnDeps:
 def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     """Round 1: no tool_calls, plain text -> that text IS the final reply
     (Global Constraints)."""
+    # Legacy include_reasoning path: with self-authored thinking OFF, an explicit
+    # include_reasoning request flows through to the provider. (With it ON — the
+    # shipped default — native reasoning is suppressed so the model emits a <think>
+    # instead; see test_self_thinking_on_suppresses_native_reasoning below.)
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     uid = "u_toolloop_happy"
     conftest.seed_user(uid)
     _reset(uid)
@@ -323,6 +328,41 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert row[1] is False  # not failed
     assert row[2] == "ok"
     assert _job_status_row(job_id)[0] == "completed"
+
+
+def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
+    """Self-authored thinking ON (shipped default): even an explicit
+    include_reasoning request is suppressed at the provider, so a reasoning-capable
+    model emits its thought in the reply's <think> instead of a raw native CoT. This
+    is what aligns V2 with the V1 resident (see worker.py suppress_native_reasoning)."""
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)  # default = ON
+    uid = "u_toolloop_selfthink_suppress"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-selfthink")
+
+    _patch_real_write(monkeypatch)
+
+    calls = _script_provider(monkeypatch, [_text_round("hello from the model")])
+    deps = _deps(messages=[{
+        "id": "m1",
+        "ts": 10.0,
+        "role": "user",
+        "content": "hi",
+        "include_reasoning": True,
+    }])
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 1
+    # The point: native reasoning was NOT requested despite include_reasoning=True.
+    assert calls[0].get("include_reasoning") is not True
 
 
 def test_degenerate_terminal_reply_becomes_attributed_fallback(monkeypatch):

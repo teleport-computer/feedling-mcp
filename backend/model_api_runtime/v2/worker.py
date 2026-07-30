@@ -10222,16 +10222,20 @@ async def process_job(
         await _ensure_runtime_mode()
         await _renew_lease()
         await asyncio.to_thread(_emit_status, user_id, job_id, "writing_reply")
-        # Self-authored thinking does NOT suppress the model's native reasoning: the
-        # model keeps thinking natively (so answer quality is unchanged) and is
-        # additionally asked to open its reply with a <think> block. At seal time we
-        # PREFER that <think> (clean, io-voice); if the model didn't write one we fall
-        # back to the shaped native reasoning. So native reasoning must still flow when
-        # the model's thinking switch is on — which run_tool_loop already does via
-        # reasoning_effort. include_reasoning stays the explicit public-contract path.
+        # Self-authored thinking: when on, do NOT request provider-native reasoning
+        # (this aligns V2 with the V1 resident). A reasoning-capable model like sonnet,
+        # if asked for native reasoning, puts its thought in that channel — surfaced
+        # raw and often in the wrong language — and skips our <think>. Suppressing the
+        # native request forces it to emit the thinking in the reply's <think> block,
+        # which the seal surfaces cleanly (same as V1). Gated on the same kill switch;
+        # when self-thinking is OFF this is False and the old include_reasoning path is
+        # unchanged.
+        from core import self_thinking as _self_thinking_v2
+
         outcome = await v2_tool_loop.run_tool_loop(
             provider_config=provider_config,
             include_reasoning=turn_include_reasoning,
+            suppress_native_reasoning=_self_thinking_v2.enabled(),
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
             on_reply=_on_reply,
