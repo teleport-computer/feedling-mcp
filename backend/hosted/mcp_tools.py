@@ -290,9 +290,9 @@ def _read_only_hint(tool: dict) -> bool:
 
 
 def _decrypt(envelope, api_key, runtime_token) -> dict:
-    from core import enclave as core_enclave
+    from core import envelope as core_envelope
     kwargs = {"runtime_token": runtime_token} if runtime_token else {}
-    raw = core_enclave._decrypt_envelope_via_enclave(
+    raw = core_envelope.read_envelope_body(
         envelope, api_key, purpose="mcp_server_config", **kwargs)
     secret = json.loads(raw.decode("utf-8"))
     if not isinstance(secret, dict) or not secret.get("url"):

@@ -7,7 +7,6 @@ import logging
 import db
 import provider_client
 from capabilities import registry as cap_registry
-from core import enclave as core_enclave  # noqa: F401 — 供测试 monkeypatch，见 setup_core 同款
 from core import envelope as core_envelope
 
 

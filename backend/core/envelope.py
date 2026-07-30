@@ -73,17 +73,17 @@ def _model_api_key_encryption_material(store) -> tuple[bytes, bytes] | tuple[Non
     return user_pk, enclave_pk
 
 
-def decrypt_provider_key_envelope(envelope: dict, api_key: str | None, *,
-                                  runtime_token: str = "") -> bytes:
-    """取出 BYOK provider key，按行形状路由。
+def read_envelope_body(envelope: dict, api_key: str | None, *,
+                       purpose: str, runtime_token: str = "") -> bytes:
+    """读出内容行的正文，按行形状路由。
 
-    两种形状并存是 TEE 扶正期的常态：
-      - RDS（现状真源）：双收件人信封，有 ``body_ct`` → 走 enclave 解密。
-      - TEE 主库：表同步在复制时已解密，形状是
-        ``{body, id, owner_user_id, visibility}``、无 ``body_ct`` → **本地直读**。
+    两种形状并存是 TEE 扶正期与 v6 加密可选之后的常态：
+      - 信封行（加密档 / 现存量）：有 ``body_ct`` → 走 enclave 解密。
+      - 明文行（默认档）：``{body, id, owner_user_id, visibility}`` → **本地直读**。
 
     明文分支绝不打 enclave：cutover 后 enclave 只服务加密档用户，明文档的读路径
-    不该再依赖它（也是「读路径不经 enclave 更快」的兑现点）。
+    不该再依赖它——这既是「读路径不经 enclave 更快」的兑现点，也让 enclave 故障
+    不再连坐明文档用户。
 
     ``body_ct`` 优先于 ``body``：两者并存只可能出现在迁移中间态，此时密文是真源，
     反过来会读到过期的明文残留。
@@ -96,11 +96,19 @@ def decrypt_provider_key_envelope(envelope: dict, api_key: str | None, *,
         # 让 tests/test_model_api_profiles_config_store.py 的断言失败。
         kwargs = {"runtime_token": runtime_token} if runtime_token else {}
         return enclave._decrypt_envelope_via_enclave(
-            envelope, api_key, purpose="model_api_provider_key", **kwargs)
+            envelope, api_key, purpose=purpose, **kwargs)
     body = envelope.get("body")
     if isinstance(body, str):
         return body.encode("utf-8")
     raise ValueError("envelope_shape_unrecognized")
+
+
+def decrypt_provider_key_envelope(envelope: dict, api_key: str | None, *,
+                                  runtime_token: str = "") -> bytes:
+    """取出 BYOK provider key（Task 1.1）。purpose 钉死的薄 wrapper。"""
+    return read_envelope_body(envelope, api_key,
+                              purpose="model_api_provider_key",
+                              runtime_token=runtime_token)
 
 
 _SEALED_FIELDS = ("body_ct", "nonce", "K_user", "K_enclave",

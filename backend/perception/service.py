@@ -24,7 +24,10 @@ from datetime import datetime
 from typing import Any, Callable, Mapping
 
 from content_encryption import random_item_id
-from core import enclave as core_enclave
+from core import envelope as core_envelope
+from core import enclave as core_enclave  # noqa: F401 — 读侧已改走 core_envelope.read_envelope_body；
+# 这行保留是因为测试 monkeypatch `<module>.core_enclave` 上的
+# _decrypt_envelope_via_enclave（patch 的是共享模块对象，仍然生效）。
 
 from . import catalog, history, permissions, resolve, store
 from .ingress_v2 import device_event_observations_v2, operation_observations_v2, observe_signal_v2
@@ -141,7 +144,9 @@ def _decrypt_signal_payload_v2(
     if not api_key and decrypt_envelope is None:
         return None, "decrypt_skipped"
     try:
-        decrypt = decrypt_envelope or core_enclave._decrypt_envelope_via_enclave
+        # 默认走形状路由：明文行直读、信封行才打 enclave。签名与
+        # _decrypt_envelope_via_enclave 逐字一致，注入方（测试/上层）不受影响。
+        decrypt = decrypt_envelope or core_envelope.read_envelope_body
         raw = decrypt(dict(envelope), api_key, purpose=f"perception:{key}")
         return _decode_decrypted_payload_v2(raw), ""
     except Exception as e:

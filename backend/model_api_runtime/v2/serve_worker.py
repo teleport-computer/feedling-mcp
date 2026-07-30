@@ -68,10 +68,12 @@ from accounts import registry as accounts_registry  # noqa: E402
 from admin import admin_core
 from capabilities import registry as cap_registry
 from capabilities import tool_schema as cap_tool_schema
-from core import enclave as core_enclave
 from core import envelope as core_envelope
 from core import runtime_token
 from core import store as core_store
+from core import enclave as core_enclave  # noqa: F401 — 读侧已改走 core_envelope.read_envelope_body；
+# 这行保留是因为测试 monkeypatch `<module>.core_enclave` 上的
+# _decrypt_envelope_via_enclave（patch 的是共享模块对象，仍然生效）。
 from core import wake_bus as core_wake_bus
 from genesis import daemon as genesis_daemon
 from hosted import config_store as hosted_config_store
@@ -421,7 +423,7 @@ def _caption_text(m, *, mid, token, fallback: str) -> str:
     if cap_env is None:
         return fallback
     caption = (
-        core_enclave._decrypt_envelope_via_enclave(
+        core_envelope.read_envelope_body(
             cap_env, None, purpose="v2_caption_read", runtime_token=token
         )
         .decode("utf-8")
@@ -780,7 +782,7 @@ def _decrypt_chat_rows(
                     "content": _UNAVAILABLE_CHAT_MARKER,
                 }
             else:
-                plaintext = core_enclave._decrypt_envelope_via_enclave(
+                plaintext = core_envelope.read_envelope_body(
                     m, None, purpose="v2_chat_read", runtime_token=token
                 ).decode("utf-8")
                 if not plaintext.strip():
@@ -1136,7 +1138,7 @@ def _open_summary_frontier_state(user_id: str) -> tuple[dict | None, list]:
             raise RuntimeError(
                 f"{_SUMMARY_INTEGRITY_ERROR}: segment without encrypted envelope"
             )
-        plaintext = core_enclave._decrypt_envelope_via_enclave(
+        plaintext = core_envelope.read_envelope_body(
             env,
             None,
             purpose="v2_summary_segment_read",
@@ -1217,7 +1219,7 @@ def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
             )
         return "", watermark_ts, version, watermark_seq
     token = _mint_runtime_token(user_id)
-    plaintext = core_enclave._decrypt_envelope_via_enclave(
+    plaintext = core_envelope.read_envelope_body(
         env, None, purpose="v2_summary_read", runtime_token=token
     ).decode("utf-8")
     if has_durable_coverage and not plaintext.strip():
@@ -3023,7 +3025,7 @@ def _decrypt_tool_effect_payload(
     if owner_user_id != user_id:
         raise RuntimeError("encrypted effect owner mismatch")
     try:
-        plaintext = core_enclave._decrypt_envelope_via_enclave(
+        plaintext = core_envelope.read_envelope_body(
             envelope,
             None,
             purpose="v2_effect_apply",
@@ -3305,7 +3307,7 @@ def _open_trajectory_payload(
     """Open one event only inside the trusted worker for offline review."""
     if str(envelope.get("owner_user_id") or "") != str(user_id):
         raise RuntimeError("trajectory_owner_mismatch")
-    return core_enclave._decrypt_envelope_via_enclave(
+    return core_envelope.read_envelope_body(
         envelope,
         None,
         purpose="runtime_v2_trajectory_review",

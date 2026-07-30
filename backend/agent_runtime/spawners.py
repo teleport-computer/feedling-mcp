@@ -930,8 +930,8 @@ def _genesis_persona_content(user_id: str, api_key: str | None = None,
         return ""
 
     def _decrypt(env: dict) -> str:
-        from core import enclave as core_enclave
-        raw = core_enclave._decrypt_envelope_via_enclave(
+        from core import envelope as core_envelope
+        raw = core_envelope.read_envelope_body(
             env, api_key, purpose="genesis_persona", runtime_token=runtime_token)
         return raw.decode("utf-8")
 

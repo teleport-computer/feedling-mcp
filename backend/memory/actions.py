@@ -10,7 +10,6 @@ import db
 from core.store import UserStore
 
 from bootstrap import gates as boot_gates
-from core import enclave as core_enclave
 from core import envelope as core_envelope
 from core import util as core_util
 from identity import service as identity_service
@@ -114,7 +113,7 @@ def _memory_plain_from_envelope(moment: dict, api_key: str | None, runtime_token
     if moment.get("visibility") == "local_only":
         return None, "memory_local_only_agent_cannot_read"
     try:
-        raw = core_enclave._decrypt_envelope_via_enclave(
+        raw = core_envelope.read_envelope_body(
             moment, api_key, purpose="memory_action", runtime_token=runtime_token)
         inner = json.loads(raw.decode("utf-8"))
         if not isinstance(inner, dict):

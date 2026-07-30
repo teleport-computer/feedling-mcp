@@ -338,9 +338,7 @@ def set_enabled(
         if approvals_error:
             return approvals_error, 400
         try:
-            from core import enclave as core_enclave
-
-            plaintext = core_enclave._decrypt_envelope_via_enclave(
+            plaintext = core_envelope.read_envelope_body(
                 srv["config_envelope"],
                 caller_api_key,
                 purpose="mcp_server_config",
@@ -403,7 +401,6 @@ def _user_driver(store: UserStore, caller_api_key: str | None) -> str:
 
 
 def test_server(store: UserStore, name: str, caller_api_key: str | None) -> tuple[dict, int]:
-    from core import enclave as core_enclave
     from hosted import mcp_probe
     # Snapshot the WHOLE blob up front — this is the CAS expectation. The probe
     # below can take tens of seconds; any upsert/delete/toggle that lands in
@@ -415,7 +412,7 @@ def test_server(store: UserStore, name: str, caller_api_key: str | None) -> tupl
     if srv is None:
         return _err("not_found", name), 404
     try:
-        secret = json.loads(core_enclave._decrypt_envelope_via_enclave(
+        secret = json.loads(core_envelope.read_envelope_body(
             srv["config_envelope"], caller_api_key,
             purpose="mcp_server_config").decode("utf-8"))
         if (

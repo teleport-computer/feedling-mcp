@@ -18,7 +18,7 @@ from typing import Any
 
 import db
 import debug_trace
-from core import enclave as core_enclave
+from core import envelope as core_envelope
 from genesis import dedup, foreground, foreground_identity, lightweight_identity, service, worker
 from hosted import config_store as hosted_config_store
 from hosted import history_import
@@ -604,7 +604,7 @@ def _plaintext_existing_voice_workset_for_update(store, api_key: str | None) -> 
         envelope = blob.get("content_envelope")
         if not isinstance(envelope, dict):
             return {}
-        raw = core_enclave._decrypt_envelope_via_enclave(envelope, api_key, purpose="genesis_voice")
+        raw = core_envelope.read_envelope_body(envelope, api_key, purpose="genesis_voice")
         parsed = json.loads(raw.decode("utf-8"))
         if not isinstance(parsed, dict):
             return {}
@@ -623,7 +623,7 @@ def _plaintext_existing_identity_for_update(store, api_key: str | None) -> dict:
         blob = identity_service._load_identity(store)
         if not isinstance(blob, dict) or not blob.get("body_ct"):
             return {}
-        raw = core_enclave._decrypt_envelope_via_enclave(blob, api_key, purpose="identity_update_merge")
+        raw = core_envelope.read_envelope_body(blob, api_key, purpose="identity_update_merge")
         parsed = json.loads(raw.decode("utf-8"))
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
@@ -714,7 +714,7 @@ def _plaintext_existing_persona_for_update(store, api_key: str | None) -> str:
         envelope = blob.get("content_envelope")
         if not isinstance(envelope, dict):
             return ""
-        raw = core_enclave._decrypt_envelope_via_enclave(envelope, api_key, purpose="genesis_persona")
+        raw = core_envelope.read_envelope_body(envelope, api_key, purpose="genesis_persona")
         return raw.decode("utf-8")
     except Exception:
         return ""

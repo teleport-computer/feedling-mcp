@@ -848,11 +848,11 @@ def test_resolve_roster_self_fetches_envelope_when_entry_has_only_api_key(monkey
     monkeypatch.setattr(supervisor_mod, "_whoami", lambda api_url, api_key: "usr_1")
     monkeypatch.setattr(
         supervisor_mod, "_fetch_key_envelope",
-        lambda api_url, api_key: {"ct": "cipher"} if api_key == "k1" else None,
+        lambda api_url, api_key: {"body_ct": "cipher"} if api_key == "k1" else None,
     )
     monkeypatch.setattr(
         supervisor_mod, "_decrypt_provider_key",
-        lambda enclave_url, api_key, env: "sk-real" if env == {"ct": "cipher"} else "",
+        lambda enclave_url, api_key, env: "sk-real" if env == {"body_ct": "cipher"} else "",
     )
     out = supervisor_mod._resolve_roster([{"api_key": "k1"}])
     assert out[0]["user_id"] == "usr_1"
@@ -957,7 +957,7 @@ def test_resolve_discovered_builds_entries_via_token_without_api_key(monkeypatch
         return minted[uid]
 
     monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope",
-                        lambda api_url, api_key="", runtime_token="": ({"ct": "x"} if runtime_token else None))
+                        lambda api_url, api_key="", runtime_token="": ({"body_ct": "x"} if runtime_token else None))
     monkeypatch.setattr(supervisor_mod, "_decrypt_provider_key",
                         lambda enclave_url, api_key="", envelope=None, runtime_token="": ("sk-ant" if runtime_token else ""))
     out = supervisor_mod._resolve_discovered(enabled, mint_token=fake_mint,
@@ -974,7 +974,7 @@ def test_resolve_discovered_caches_by_user_and_envelope(monkeypatch):
     enabled = {"u1": {"driver": "claude", "provider": "anthropic", "model": "m", "base_url": ""}}
     calls = {"n": 0}
     monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope",
-                        lambda api_url, api_key="", runtime_token="": {"ct": "same"})
+                        lambda api_url, api_key="", runtime_token="": {"body_ct": "same"})
 
     def dec(enclave_url, api_key="", envelope=None, runtime_token=""):
         calls["n"] += 1
@@ -1003,7 +1003,7 @@ def test_resolve_discovered_isolates_per_user_failure(monkeypatch):
         return f"tok-{uid}"
 
     monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope",
-                        lambda api_url, api_key="", runtime_token="": {"ct": "x"})
+                        lambda api_url, api_key="", runtime_token="": {"body_ct": "x"})
     monkeypatch.setattr(supervisor_mod, "_decrypt_provider_key",
                         lambda enclave_url, api_key="", envelope=None, runtime_token="": "sk")
     out = supervisor_mod._resolve_discovered(enabled, mint_token=mint,
@@ -1061,7 +1061,7 @@ def test_discover_enabled_calls_db_with_no_args(monkeypatch):
 
 def test_resolve_discovered_keeps_cached_key_on_transient_fetch_failure(monkeypatch):
     enabled = {"u1": {"driver": "claude", "provider": "anthropic", "model": "m", "base_url": ""}}
-    state = {"env": {"ct": "x"}}
+    state = {"env": {"body_ct": "x"}}
     monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope",
                         lambda api_url, api_key="", runtime_token="": state["env"])
     monkeypatch.setattr(supervisor_mod, "_decrypt_provider_key",
@@ -1080,7 +1080,7 @@ def test_resolve_discovered_keeps_cached_key_on_transient_fetch_failure(monkeypa
 
 def test_resolve_discovered_keeps_cached_key_on_decrypt_failure(monkeypatch):
     enabled = {"u1": {"driver": "claude", "provider": "anthropic", "model": "m", "base_url": ""}}
-    envs = iter([{"ct": "x"}, {"ct": "y"}])   # envelope changes → forces a re-decrypt
+    envs = iter([{"body_ct": "x"}, {"body_ct": "y"}])   # envelope changes → forces a re-decrypt
     monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope",
                         lambda api_url, api_key="", runtime_token="": next(envs))
     decs = iter(["sk-good", ""])              # 2nd decrypt fails

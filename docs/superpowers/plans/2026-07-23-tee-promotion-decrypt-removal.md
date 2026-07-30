@@ -635,16 +635,51 @@ L1 **7219 passed / 0 failed**（含 `tests/test_envelope_storage_fields.py` 16 �
 
 ### Task 2.3: 读侧明文旁路（enclave 保留给信封行）
 
-- [ ] `core/enclave.py` 调用点改「按行格式路由」：明文行直读 doc；**信封行仍走
-      `_decrypt_envelope_via_enclave`**（enclave 保留，服务加密用户）。这是加
-      快路径，不是删 enclave。（memory/actions.py、hosted/config_store.py、
-      genesis/plaintext.py、`serve_worker.py` 等；~~supervisor.py:527~~ 随 V1
-      删除——grep 重扫。）BYOK 读侧改读 TEE 明文列（Task 1.1）。
+- [x] `core/enclave.py` 调用点改「按行格式路由」（2026-07-30 完成）。
+
+      **helper**：`core.envelope.read_envelope_body(envelope, api_key, *,
+      purpose, runtime_token="")` —— 由 Task 1.1 的
+      `decrypt_provider_key_envelope` **泛化**而来（唯一区别是 purpose 可传），
+      后者保留为薄 wrapper，故 1.1 的调用点逐字不变、没造第二个 helper。
+
+      **普查**：23 个真实调用点（另有 6 处是 docstring 提及）。已迁 19 处：
+      memory/actions、serve_worker ×6、trajectory_inspect、workspace/service、
+      history_import、mcp_core ×2、mcp_tools、spawners、genesis/plaintext ×3、
+      perception/service（注入默认值）、tee_replicator/worker（回调）。
+
+      **刻意不改的 2 处**：
+      - `content/content_core.py:416` rewrap —— 已被上面的
+        `if not record.get("K_enclave"): return "skipped_missing_enclave_key"`
+        守住，明文行天然跳过。rewrap 对明文行本就无意义。**核实无需改动。**
+      - `core/envelope.py` 内部 —— 就是 helper 的实现本身。
+
+      > ⚠️ **踩了 memory `autoflake-kills-module-attr-reexports` 那个坑**：迁移
+      > 后 12 个 `core_enclave` import 变成 unused，我删了，结果 17 个测试红——
+      > 它们 monkeypatch 的是**导入方模块**上的 `<module>.core_enclave`
+      > （patch 的其实是共享的 `core.enclave` 模块对象，仍然生效）。已恢复
+      > serve_worker / perception.service / history_import 三处并加
+      > `noqa: F401` + 原因注释。`hosted/setup_core.py:34` 早就有同样的注释，
+      > 我当时没照着做。判据：删 unused import 前要 grep **测试里的
+      > `<module>.<alias>`**，不能只看本文件内的引用。
+
+      **顺带修 17 个「造假信封」测试**：fixture 用 `{"ct": ...}` 或
+      `{"envelope": {"id": ...}}` —— 这两种形状生产里**不存在**
+      （`_build_shared_envelope_for_store` 恒出 `body_ct`）。老代码把整个 dict
+      直接甩给被 patch 的解密函数、从不检查形状，所以这些测试一直"绿"着却没验
+      证过真实形状。已统一改成带 `body_ct`（27 + 16 处）。**这是 Task 1.1 抓到
+      的 `{"ciphertext": "x"}` 同一类问题的第二次出现。**
+
+      BYOK 读侧改读 TEE 明文列（Task 1.1）已完成。
 - [ ] 两处 enclave 内计算（VLM caption、memory index）**保留**——服务加密用户；
       明文用户可选走 backend 内联明文版（性能优化，细案定，非必须）。
-- [ ] `content/content_core.py`：rewrap **保留**（加密用户设备钥漂移自愈仍需）；
-      swap 保留，作为加密开关切换 + 那 7 条 local_only 转明文的通道。
-- [ ] `tee_replicator/worker.py`：明文行走 mirror 双写；密文行（加密用户）继续
+- [x] `content/content_core.py`：rewrap **保留**且已核实对明文行安全（见上）。
+- [ ] swap 通道本体（普查 B3 类，`content_core.py` 的 4 处硬拆包）仍待改——它是
+      加密开关切换 + 那 7 条 local_only 转明文的通道，**属客户端上传路径**，有
+      独立的硬形状校验，要连同 `_swap_chat` / `_swap_memory_inplace` /
+      `_apply_envelope_fields` / `_apply_sub_envelope_fields` 一起设计。
+      **这是写侧形状真正切换的最后一个前置。**
+- [ ] `tee_replicator/worker.py`：~~decrypt 回调~~已改形状路由（明文行不白跑一趟
+      enclave）；明文行走 mirror 双写；密文行（加密用户）继续
       经 enclave 解密复制进 TEE 或原样搬运信封（细案定 cutover 后 TEE 主库里
       加密用户存密文、明文用户存明文的共存形态，见 Task 2.4）。
 

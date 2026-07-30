@@ -12,8 +12,10 @@ from typing import Any
 
 
 import db
-from core import enclave as core_enclave
 from core import envelope as core_envelope
+from core import enclave as core_enclave  # noqa: F401 — 读侧已改走 core_envelope.read_envelope_body；
+# 这行保留是因为测试 monkeypatch `<module>.core_enclave` 上的
+# _decrypt_envelope_via_enclave（patch 的是共享模块对象，仍然生效）。
 from core.store import UserStore
 
 
@@ -945,7 +947,7 @@ def _existing_import_user_name(store: UserStore, api_key: str | None) -> str:
         identity = identity_service._load_identity(store)
         if not isinstance(identity, dict) or not identity.get("body_ct"):
             return "TA"
-        raw = core_enclave._decrypt_envelope_via_enclave(
+        raw = core_envelope.read_envelope_body(
             identity,
             api_key,
             purpose="identity_update_merge",

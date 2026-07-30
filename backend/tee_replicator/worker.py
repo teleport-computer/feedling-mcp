@@ -260,12 +260,14 @@ def _make_decrypt(user_id: str) -> Callable[[dict, str], bytes]:
     Runtime V2 下没有 per-user api_key，只能用 runtime token
     （scope=envelope_decrypt，见 supervisor.py 的 mint_token 用法）。
     """
-    from core import enclave as core_enclave
+    from core import envelope as core_envelope
 
     token = _mint_runtime_token(user_id)
 
     def decrypt(envelope: dict, purpose: str) -> bytes:
-        return core_enclave._decrypt_envelope_via_enclave(
+        # 形状路由：明文行直读、不白跑一趟 enclave。cutover 后 TEE 主库里
+        # 密文/明文行的共存形态仍由 Task 2.4 定，这里只是不再假设行一定是信封。
+        return core_envelope.read_envelope_body(
             envelope, None, purpose=purpose, runtime_token=token)
 
     return decrypt
