@@ -84,8 +84,10 @@ L1 全量 7250 passed / 0 failed。无迁移。
 审计同时给出的方向性判断（**未在本次实施**，作为后续依据）：当前 Runtime 页是"值班摘要"
 而非完整 telemetry dashboard，约展示了后端已采集数据的 45%；delivery/outbox、MCP unknown
 outcome、wake 成功率、worker build/heartbeat age、self-host 覆盖标注均尚未上页；建议最终
-拆成 Runtime Health / Usage / Trace Coverage / Private Trace Viewer 四层。基线文档见
-`docs/superpowers/specs/2026-07-11-agent-trajectory-telemetry-requirements.md`。
+拆成 Runtime Health / Usage / Trace Coverage / Private Trace Viewer 四层。⚠️ 审计引用的
+基线文档 `2026-07-11-agent-trajectory-telemetry-requirements.md` **不在本仓库**（`find` +
+`git log --all` 均无，它在审计者本机路径下）——想按那份愿景推进的人需要先向审计方索取，
+不要在本仓库里找。
 
 ## 2026-07-30 — CIPHERTEXT lane 补上删除传播的兜底：853 行"已删还在"
 

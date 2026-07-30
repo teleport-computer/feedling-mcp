@@ -802,3 +802,24 @@ def test_runtime_page_links_drop_params_it_ignores():
 def test_runtime_page_explains_it_only_reads_hours(bound_request):
     html_out = _dt._render_runtime_health_page(_payload(), _tokens())
     assert "本页只按 hours" in html_out
+
+
+def test_runtime_page_heartbeat_link_also_drops_ignored_params(bound_request):
+    """heartbeat → Proactive 日报的链接同样不得传播本页忽略的参数。
+
+    review 指出：常量注释写的是"本页自己生成的链接一律清掉"，但最初只在三个窗口
+    按钮上做了，同一函数里的 hb_href 漏了。而目标页 Proactive 日报只读
+    since/registered_since/days（复数），**从不读单数 day**，limit/offset 在它的
+    payload 里也没用——所以带过去之后照样是"看着生效实则被无视"，只是换了一跳、
+    可见度更低。要么清掉，要么把注释里的"一律"改成如实描述；这里选清掉。
+    """
+    with _admin_core.bind("view=runtime&day=2026-07-25&limit=50&offset=100&hours=168"):
+        html_out = _dt._render_runtime_health_page(
+            _payload([_lane(lane="heartbeat")]), _tokens(lane_name="heartbeat")
+        )
+    idx = html_out.index("（日报口径）")
+    href = html_out[html_out.rindex("href='", 0, idx):idx]
+    assert "view=proactive" in href
+    assert "day=" not in href, f"day 被带去日报页: {href}"
+    assert "limit=" not in href, f"limit 被带去日报页: {href}"
+    assert "offset=" not in href, f"offset 被带去日报页: {href}"

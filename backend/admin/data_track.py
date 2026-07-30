@@ -2594,7 +2594,13 @@ def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> st
             )
         lane_label = html.escape(name)
         if name == "heartbeat":
-            hb_href = _data_track_page_href(view="proactive", hours=None, offset=0)
+            # 同样清掉本页忽略的参数。目标页（Proactive 日报）只读
+            # since/registered_since/days（**复数**），从不读单数 day；limit/offset
+            # 在它的 payload 里也没用——不清的话那些参数会跟着跳过去，在新页面上
+            # 照样是"看着生效实则被无视"，只是换了一跳、可见度更低。
+            hb_href = _data_track_page_href(
+                view="proactive", hours=None, **_RUNTIME_IGNORED_PARAMS
+            )
             lane_label += (
                 f" <a class='muted' style='font-size:12px' "
                 f"href='{html.escape(hb_href, quote=True)}'>（日报口径）</a>"
