@@ -755,10 +755,32 @@ L1 **7219 passed / 0 failed**（含 `tests/test_envelope_storage_fields.py` 16 �
 
 ### Task 2.4: 加密用户在 TEE 主库的存储形态（v6 关键设计）
 
-- [ ] 定 cutover 后 TEE 主库里加密用户数据的形态：**原样双收件人信封**（DB 密文，
-      读时 enclave 解）。这要求 TEE 库能存信封行（不只是明文）——影响 alembic_tee
-      表形状（envelope 列保留）与 replicator/mirror 的密文行搬运语义。与 Task
-      0.6 表同步工作流对齐。
+- [x] **设计已定**（2026-07-31）：`docs/superpowers/specs/2026-07-31-tee-encrypted-tier-storage-design.md`
+
+      决策 = **按行原样搬运**：一行进来什么形状、出去就什么形状，复制层不再做
+      任何加解密。Task 2.3 的读侧按行路由是本决策的前置（此前 TEE 读路径假定
+      「行一定是明文」，所以复制时非解密不可）。
+
+      **schema 无需改动**：TEE 内容表的 `doc` 是裸 `JSONB`、**没有任何 CHECK**
+      （已核对 `0001_tee_baseline` 及后续全部迁移），信封行结构上直接存得进去。
+      不要与 RDS 侧 V2 轨迹表那个由 `0068` 放宽的表级 CHECK 混淆。
+
+      **两个必须处理的既有事实**（详见 spec §2）：
+
+      1. **今天直接 cutover 会把加密档用户的数据静默变明文** ——
+         `transforms.py` 对每一行无条件调 enclave 解密并丢弃全部加密学字段，
+         `_decryptable()` 只看 local_only / K_enclave，**跟用户档位无关**。
+      2. **影子库里现在就已经有全体用户的明文副本** ——这不是 cutover 才产生的。
+         用户一旦选加密档，其此前内容的明文副本仍在影子库、并会随 cutover 进入
+         主库。**必须显式重放清理，不能靠「以后不再解密」自然消化。**
+         顺序硬约束：先改 `transforms.py` → 再重放 → 最后才 cutover。
+
+      **好副作用**：毒行隔离机制（quarantine-and-advance）在 carry-verbatim 下
+      不再需要——毒行之所以是毒行，正因为复制时非解密不可。但存量清理还要用它，
+      退役放到 Phase 5。
+
+- [ ] 实现（spec §6 已拆成清单）：`transforms.py` 改透传、`verify.py` 按形状分流
+      对账、四象限回归、opt-in 用户重放。
 
 ---
 
