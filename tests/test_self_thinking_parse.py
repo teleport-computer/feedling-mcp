@@ -53,10 +53,18 @@ def test_empty_marker_yields_no_thinking_but_strips_bare_marker_line():
     assert reply == "正文在这"
 
 
-def test_marker_only_no_reply_body():
+def test_marker_only_becomes_reply_never_empty():
+    # e2e-driven: some models put the whole answer on the 💭 line. Peeling would
+    # empty the reply, so treat the line AS the reply, no thinking (fail-open).
     thinking, reply = st.split_thinking("💭 只想了一下")
-    assert thinking == "只想了一下"
-    assert reply == ""
+    assert thinking == ""
+    assert reply == "只想了一下"
+
+
+def test_marker_with_blank_body_uses_marker_line_as_reply():
+    thinking, reply = st.split_thinking("💭 我很好谢谢关心\n   ")
+    assert thinking == ""
+    assert reply == "我很好谢谢关心"
 
 
 def test_thinking_sanitized_no_control_or_bidi():

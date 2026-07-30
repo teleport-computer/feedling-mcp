@@ -70,7 +70,13 @@ def split_thinking(text: str) -> tuple[str, str]:
     after = stripped[len(MARKER):]
     nl = after.find("\n")
     if nl == -1:
-        thinking_raw, body = after, ""
+        marker_line, body = after, ""
     else:
-        thinking_raw, body = after[:nl], after[nl + 1:]
-    return _sanitize(thinking_raw), body
+        marker_line, body = after[:nl], after[nl + 1:]
+    if not body.strip():
+        # No real reply body: the model put its whole answer on the 💭 line (a
+        # real failure mode seen in e2e — some models emit "💭 <entire answer>").
+        # Peeling would leave an EMPTY reply, so fail-open: surface the marker-line
+        # content AS the reply, with no thinking.
+        return "", marker_line.strip()
+    return _sanitize(marker_line), body
