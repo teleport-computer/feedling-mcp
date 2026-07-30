@@ -114,7 +114,33 @@ def test_resident_poll_persists_seen_throttles_repeat_and_reports_online(client,
     assert _binding(_persisted_user(user_id), "resident")["last_seen_at"] == first_seen
 
 
-def test_resident_binding_auto_probe_drives_unsupported_config(client, monkeypatch):
+@pytest.mark.parametrize(
+    ("provider_error_code", "expected_status", "expected_error_code"),
+    [
+        (
+            "vision_model_required",
+            "unsupported",
+            "vision_model_incompatible",
+        ),
+        (
+            "vision_model_incompatible",
+            "unsupported",
+            "vision_model_incompatible",
+        ),
+        (
+            "vision_model_auth_invalid",
+            "failed",
+            "vision_model_auth_invalid",
+        ),
+    ],
+)
+def test_resident_binding_auto_probe_maps_provider_verdict_to_config(
+    client,
+    monkeypatch,
+    provider_error_code,
+    expected_status,
+    expected_error_code,
+):
     _user_id, api_key = _register(client)
     headers = {
         **_poll_headers(api_key),
@@ -150,19 +176,24 @@ def test_resident_binding_auto_probe_drives_unsupported_config(client, monkeypat
         headers=headers,
         json={
             "probe_id": probe["probe_id"],
-            "status": "ok",
-            "observed": ["wrong", "answer"],
+            "status": "failed",
+            "error_code": provider_error_code,
         },
     )
     assert completed.status_code == 200, completed.get_data(as_text=True)
-    assert completed.get_json()["status"] == "unsupported"
+    assert completed.get_json()["status"] == expected_status
+    assert completed.get_json()["error_code"] == expected_error_code
 
     config = client.get("/v1/vision/config", headers={"X-API-Key": api_key})
     assert config.status_code == 200
     vision = config.get_json()["config"]
-    assert vision["effective_status"] == "unsupported"
+    assert vision["effective_status"] == expected_status
     assert vision["main_model"]["provider"] == "openrouter"
     assert vision["main_model"]["model"] == "deepseek/text-only"
+    assert (
+        vision["main_model"]["last_vision_test_error"]
+        == expected_error_code
+    )
 
 
 @pytest.mark.parametrize("route", ["model_api", "official_import"])

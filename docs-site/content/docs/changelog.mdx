@@ -68,8 +68,11 @@ change must not be interpreted as an API guarantee.
   automatically when their consumer/entry/provider/model binding first appears
   or changes. Matching pending or completed bindings are not re-probed, and
   explicit modality metadata still avoids the model call. Polling and image
-  delivery remain non-blocking. Known `unsupported` verdicts are non-blocking
-  signals for client guidance: image
+  delivery remain non-blocking. Explicit resident rejections
+  (`vision_model_required` or `vision_model_incompatible`) normalize to the
+  same cached `unsupported` verdict, while authentication, quota, rate-limit,
+  timeout, upstream, and empty-response failures remain `failed`. Known
+  `unsupported` verdicts are non-blocking signals for client guidance: image
   sends still follow the user's configured main or dedicated route unchanged.
   Runtime failures expose stable visual error codes and the exact provider/model
   without putting probe traffic into Chat history or activity.

@@ -203,7 +203,9 @@ catalog 或双图调用，因此用户不打开视觉设置、不发图也能通
 或 dedicated route 进入真实调用。VPS resident 也在官方 consumer 首次上报或更换
 `consumer_id / entry_signature / provider / model` binding 时自动入队现有隐藏 probe；
 同一 binding 的 pending/终态 verdict 不重复探测，显式 catalog/modalities 已能判定时
-不额外调用模型，poll 与发送均不等待 provider I/O。只有 provider
+不额外调用模型，poll 与发送均不等待 provider I/O。resident 回报的明确图片拒绝
+`vision_model_required / vision_model_incompatible` 统一落为 `unsupported`；
+auth、quota、rate limit、timeout、upstream 与空回复仍保留 `failed`。只有 provider
 真正以明确的 text-only 图片错误拒绝本回合时，才返回 `vision_model_required` 与可操作
 的中英双语换模型提示；Runtime V2 同时把该回合捕获的 active route 写为
 `unsupported`，让后续 config 查询触发非阻断提示，且用 route 版本 fence 防止旧失败

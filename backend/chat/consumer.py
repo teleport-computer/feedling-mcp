@@ -29,6 +29,10 @@ _VISION_FAILURE_CODES = frozenset({
     "vision_model_empty_response",
     "vision_model_failed",
 })
+_VISION_UNSUPPORTED_CODES = frozenset({
+    "vision_model_required",
+    "vision_model_incompatible",
+})
 _CONSUMER_RECENT_SEC = int(os.environ.get("FEEDLING_CONSUMER_RECENT_SEC", "180"))
 _DECRYPT_HEALTH_STATUSES = frozenset(
     {"ok", "degraded", "unconfigured", "unreachable"}
@@ -816,9 +820,17 @@ def complete_vision_probe(
         reported_status = str(payload.get("status") or "ok").strip().lower()
         if reported_status == "failed":
             error_code = str(payload.get("error_code") or "vision_model_failed")
-            if error_code not in _VISION_FAILURE_CODES:
-                error_code = "vision_model_failed"
-            status = "failed"
+            if error_code in _VISION_UNSUPPORTED_CODES:
+                # Consumer turn classification uses vision_model_required for
+                # an explicit provider rejection, while Model API probes use
+                # vision_model_incompatible. They are the same capability
+                # verdict here; normalize the persisted config-facing signal.
+                error_code = "vision_model_incompatible"
+                status = "unsupported"
+            else:
+                if error_code not in _VISION_FAILURE_CODES:
+                    error_code = "vision_model_failed"
+                status = "failed"
         else:
             observed = payload.get("observed")
             expected = probe.get("expected")

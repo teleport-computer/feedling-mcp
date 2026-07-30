@@ -179,6 +179,9 @@ probe；当前 poll 立即拿到任务，provider 调用仍在 resident 的隔�
 同一 binding 的 pending/终态结果不会重复探测，binding 变化会使旧 verdict 失效。
 显式 catalog/modalities 已足以判定时不额外发 probe。整个触发过程仅为 advisory，
 不等待 provider I/O，也不阻塞聊天 poll 或图片发送。
+resident 回报的明确图片拒绝 `vision_model_required / vision_model_incompatible`
+统一缓存为 `unsupported / vision_model_incompatible`；auth、quota、rate limit、
+timeout、upstream 与空回复仍缓存为 `failed`，不把瞬时故障误报成模型能力结论。
 
 精确 provider/model 的缓存 verdict（包括 `unsupported`）只通过
 `GET /v1/vision/config` 的 `main_model.vision_test_status / effective_status` 提供给客户端
