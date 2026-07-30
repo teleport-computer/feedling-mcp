@@ -162,6 +162,13 @@ Model API 路径同步返回 `200`，`status` 为 `ok / unsupported / failed / u
 始终带当前的 `source / provider / model`；失败时还可能带稳定 `error_code`、
 `retryable / status_code / detail`。
 
+成功的 `POST /v1/model_api/setup` 还会在响应返回后自动启动同一套 Model API 主模型
+探测。setup 本身不等待 catalog 或双图调用，仍立即返回原有的 `200 configured`；
+后台 verdict 写入同一条 route 的 `vision_test_status`，客户端轮询
+`GET /v1/vision/config` 即可在用户打开视觉设置或首次发图前看到结果。若探测期间
+用户再次修改 route，旧探测结果会被版本围栏丢弃。探测启动或执行失败不回滚配置，
+也不阻塞发送。
+
 resident/VPS 路径启动隔离、隐藏的双图 probe 并返回 `202 testing`；客户端随后轮询
 `GET /v1/vision/config`，直到 `effective_status` 不再是 `testing`。probe 不进入聊天记录、
 推送、摘要、Live Activity 或 capture。旧 resident 不具备该 side-channel 时返回
@@ -177,6 +184,8 @@ Runtime V2 的真实图片回合若收到明确的 text-only provider 拒绝（�
 `vision_model_required`），后端会把该回合捕获的 active provider/model route 写为
 `unsupported`。这只更新后续 `GET /v1/vision/config` 的提示信号，不重试、不改路由，
 也不改变已接受回合的终态结果；route 已切换或已有更新时，旧失败不会覆盖新配置。
+Hosted V1 使用相同语义：发图入库时捕获 follow-main route 版本，接收 terminal failure
+回复的同一事务内完成版本围栏写回。
 
 ### `DELETE /v1/model_api/routes/{route_id}` —— 删除 route
 

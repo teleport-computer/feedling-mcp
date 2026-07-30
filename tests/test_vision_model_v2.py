@@ -12,6 +12,93 @@ def _store(user_id="u1"):
     return SimpleNamespace(user_id=user_id)
 
 
+def test_setup_vision_probe_kick_is_daemonized_and_nonblocking(
+    monkeypatch,
+    enable_setup_auto_vision_probe,
+):
+    created = {}
+
+    class FakeThread:
+        def __init__(self, *, target, args, daemon, name):
+            created.update(
+                target=target,
+                args=args,
+                daemon=daemon,
+                name=name,
+                started=False,
+            )
+
+        def start(self):
+            created["started"] = True
+
+    monkeypatch.setattr(setup_core.threading, "Thread", FakeThread)
+
+    setup_core._kick_setup_main_vision_test(
+        _store("user-auto-probe"),
+        "route-1",
+        "2026-07-30T12:00:00.123456Z",
+        "caller-key",
+    )
+
+    assert created["target"] is setup_core._run_setup_main_vision_test
+    assert created["args"][1:] == (
+        "route-1",
+        "2026-07-30T12:00:00.123456Z",
+        "caller-key",
+    )
+    assert created["daemon"] is True
+    assert created["started"] is True
+
+
+def test_setup_vision_probe_reuses_main_test_with_route_version_fence(
+    monkeypatch,
+    enable_setup_auto_vision_probe,
+):
+    route = {"id": "route-1", "is_active": True}
+    captured = {}
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_route_get",
+        lambda user_id, route_id: route,
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_active_route_version",
+        lambda user_id: {
+            "route_id": "route-1",
+            "updated_at_token": "2026-07-30T12:00:00.123456Z",
+        },
+    )
+    monkeypatch.setattr(
+        setup_core,
+        "_test_route_vision_or_error",
+        lambda store, current, caller_api_key, **kwargs: captured.update(
+            {
+                "store": store,
+                "route": current,
+                "caller_api_key": caller_api_key,
+                **kwargs,
+            }
+        ),
+    )
+
+    store = _store("user-auto-probe")
+    setup_core._run_setup_main_vision_test(
+        store,
+        "route-1",
+        "2026-07-30T12:00:00.123456Z",
+        "caller-key",
+    )
+
+    assert captured == {
+        "store": store,
+        "route": route,
+        "caller_api_key": "caller-key",
+        "reuse_cached": False,
+        "expected_updated_at": "2026-07-30T12:00:00.123456Z",
+    }
+
+
 def test_config_reports_text_only_vps_main_as_unsupported(monkeypatch):
     monkeypatch.setattr(
         setup_core.accounts_onboarding,

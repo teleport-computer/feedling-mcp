@@ -489,6 +489,11 @@ class UserStore:
                 # enclave expands them into decrypted memory context on read.
                 "quoted_memory_ids",
                 "image_mime",
+                # Hosted V1 follow-main capability-learning fence. The terminal
+                # reply transaction consumes both fields only for the stable
+                # vision_model_required class; they never alter image routing.
+                "vision_main_route_id",
+                "vision_main_route_updated_at",
                 "file_name",
                 "file_mime",
                 "file_byte_count",
@@ -689,6 +694,8 @@ class UserStore:
                 # resolves this exact caller-owned route so a concurrent Settings
                 # change cannot reroute pixels or expose them to the main model.
                 "vision_route_id",
+                "vision_main_route_id",
+                "vision_main_route_updated_at",
                 "file_name",
                 "file_mime",
                 "file_byte_count",

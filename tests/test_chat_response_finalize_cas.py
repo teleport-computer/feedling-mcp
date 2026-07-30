@@ -653,6 +653,7 @@ def test_finalize_reply_once_explain_uses_parent_primary_key(store):
                 candidate["id"],
                 float(candidate["ts"]),
                 db.Jsonb(candidate),
+                store.user_id,
             ),
         ).fetchall()
 

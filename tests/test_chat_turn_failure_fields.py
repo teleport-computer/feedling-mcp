@@ -17,6 +17,9 @@ from asgi_test_client import make_client  # noqa: E402
 from bootstrap import gates as boot_gates  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
+import db  # noqa: E402
+
+from conftest import configure_model_api_route  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -180,6 +183,61 @@ def test_user_text_is_server_authored_not_payload(client):
     assert reply["turn_failure_user_text"] == "模型服务额度不足，充值后再发消息即可恢复。"
     assert "x" * 20 not in reply["turn_failure_user_text"]
     assert len(reply["turn_failure_user_text"]) <= 500
+
+
+@pytest.mark.parametrize("stale_route", [False, True])
+def test_v1_vision_required_learns_only_pinned_active_route(
+    client,
+    stale_route,
+):
+    user_id, api_key = _register(client)
+    _credential_id, route_id = configure_model_api_route(
+        user_id,
+        provider="openai_compatible",
+        model="deepseek-v4-pro",
+        base_url="https://example.test/v1",
+    )
+    binding = db.model_api_active_route_version(user_id)
+    assert binding is not None and binding["route_id"] == route_id
+    parent_id = _send_user_msg(client, user_id, api_key, "u_vision_learn")
+    assert db.chat_update_metadata(
+        user_id,
+        parent_id,
+        {
+            "content_type": "image",
+            "vision_main_route_id": binding["route_id"],
+            "vision_main_route_updated_at": binding["updated_at_token"],
+        },
+    )
+    if stale_route:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE model_api_routes SET updated_at=updated_at + "
+                "interval '1 second' WHERE id=%s",
+                (route_id,),
+            )
+
+    response = client.post(
+        "/v1/chat/response",
+        json={
+            "envelope": _env(user_id, f"r_vision_{stale_route}"),
+            "source": "chat",
+            "reply_to_message_id": parent_id,
+            "turn_failure_error_class": "vision_model_required",
+        },
+        headers=_headers(api_key),
+    )
+
+    assert response.status_code in (200, 201), response.get_data(as_text=True)
+    route = db.model_api_active_route(user_id)
+    assert route is not None
+    if stale_route:
+        assert route["vision_test_status"] == "untested"
+        assert route["last_vision_test_error"] == ""
+    else:
+        assert route["vision_test_status"] == "unsupported"
+        assert route["last_vision_test_error"] == "vision_model_required"
+        assert route["last_vision_test_at"]
 
 
 def test_payload_cannot_blame_user_for_our_failure(client):

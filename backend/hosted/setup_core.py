@@ -251,6 +251,23 @@ def _vision_test_lock(user_id: str, route_id: str):
     return _VISION_TEST_LOCKS[hash((user_id, route_id)) % len(_VISION_TEST_LOCKS)]
 
 
+def _mark_route_vision_test(
+    user_id: str,
+    route_id: str,
+    *,
+    status: str,
+    error: str | None = None,
+    expected_updated_at: str = "",
+) -> bool:
+    """Persist one verdict, optionally fenced to the setup route snapshot."""
+    kwargs = {"status": status}
+    if error is not None:
+        kwargs["error"] = error
+    if expected_updated_at:
+        kwargs["expected_updated_at"] = expected_updated_at
+    return db.model_api_route_mark_vision_test(user_id, route_id, **kwargs)
+
+
 def _vision_runtime_v2_enabled(store) -> bool:
     """Compatibility helper for callers that still inspect V2 directly."""
     try:
@@ -293,6 +310,7 @@ def _test_route_vision_or_error(
     *,
     runtime_token: str = "",
     reuse_cached: bool = False,
+    expected_updated_at: str = "",
 ):
     """Serialize a route's visual probe and reuse an already-known verdict."""
     route_id = str(route.get("id") or "")
@@ -316,6 +334,7 @@ def _test_route_vision_or_error(
             current,
             caller_api_key,
             runtime_token=runtime_token,
+            expected_updated_at=expected_updated_at,
         )
 
 
@@ -325,6 +344,7 @@ def _run_route_vision_test_or_error(
     caller_api_key: str | None,
     *,
     runtime_token: str = "",
+    expected_updated_at: str = "",
 ):
     """Prove that a saved route can inspect pixels, not merely answer text."""
     envelope = route.get("api_key_envelope")
@@ -364,11 +384,12 @@ def _run_route_vision_test_or_error(
         )
         if not catalog_shape_missing:
             stable = vision_observer.classify_vision_error(exc)
-            if not db.model_api_route_mark_vision_test(
+            if not _mark_route_vision_test(
                 store.user_id,
                 route["id"],
                 status="failed",
                 error=stable.error_code,
+                expected_updated_at=expected_updated_at,
             ):
                 return {"error": "model_api_route_write_failed"}, 500
             return {
@@ -389,8 +410,12 @@ def _run_route_vision_test_or_error(
         supported = "image" in set(exact.get("input_modalities") or [])
         status = "ok" if supported else "unsupported"
         detail = "" if supported else "Provider catalog reports a text-only model."
-        if not db.model_api_route_mark_vision_test(
-            store.user_id, route["id"], status=status, error=detail
+        if not _mark_route_vision_test(
+            store.user_id,
+            route["id"],
+            status=status,
+            error=detail,
+            expected_updated_at=expected_updated_at,
         ):
             return {"error": "model_api_route_write_failed"}, 500
         if supported:
@@ -438,11 +463,12 @@ def _run_route_vision_test_or_error(
         stable = vision_observer.classify_vision_error(exc)
         unsupported = stable.error_code == "vision_model_incompatible"
         status = "unsupported" if unsupported else "failed"
-        if not db.model_api_route_mark_vision_test(
+        if not _mark_route_vision_test(
             store.user_id,
             route["id"],
             status=status,
             error=stable.error_code,
+            expected_updated_at=expected_updated_at,
         ):
             return {"error": "model_api_route_write_failed"}, 500
         return {
@@ -457,11 +483,12 @@ def _run_route_vision_test_or_error(
     observed = [",".join(colors[:4]), ",".join(colors[4:8])]
     if observed != expected:
         detail = "The model did not identify the visual test image correctly."
-        if not db.model_api_route_mark_vision_test(
+        if not _mark_route_vision_test(
             store.user_id,
             route["id"],
             status="unsupported",
             error=detail,
+            expected_updated_at=expected_updated_at,
         ):
             return {"error": "model_api_route_write_failed"}, 500
         return {
@@ -469,13 +496,72 @@ def _run_route_vision_test_or_error(
             "detail": detail,
             "retryable": False,
         }, 400
-    if not db.model_api_route_mark_vision_test(
+    if not _mark_route_vision_test(
         store.user_id,
         route["id"],
         status="ok",
+        expected_updated_at=expected_updated_at,
     ):
         return {"error": "model_api_route_write_failed"}, 500
     return None
+
+
+def _run_setup_main_vision_test(
+    store,
+    route_id: str,
+    route_updated_at: str,
+    caller_api_key: str | None,
+) -> None:
+    """Run the existing main-model probe after setup without owning the request."""
+    try:
+        binding = db.model_api_active_route_version(store.user_id)
+        if (
+            not binding
+            or binding["route_id"] != route_id
+            or binding["updated_at_token"] != route_updated_at
+        ):
+            return
+        route = db.model_api_route_get(store.user_id, route_id)
+        if not route or not route.get("is_active"):
+            return
+        result = _test_route_vision_or_error(
+            store,
+            route,
+            caller_api_key,
+            reuse_cached=False,
+            expected_updated_at=route_updated_at,
+        )
+        if result is not None and result[0].get("error") == "model_api_route_write_failed":
+            # A newer setup changed the route version while this provider call
+            # was in flight. Its verdict belongs to the old snapshot and is
+            # intentionally discarded.
+            print(
+                f"[model_api:{store.user_id}] setup vision probe discarded "
+                f"route={route_id} reason=stale_route_version"
+            )
+    except Exception as exc:
+        # Capability detection is advisory. It must never turn a successful
+        # provider setup into a failure or disturb image delivery.
+        print(
+            f"[model_api:{store.user_id}] setup vision probe failed "
+            f"route={route_id} detail={type(exc).__name__}:{str(exc)[:160]}"
+        )
+
+
+def _kick_setup_main_vision_test(
+    store,
+    route_id: str,
+    route_updated_at: str,
+    caller_api_key: str | None,
+) -> None:
+    """Start the setup-triggered probe and return without waiting for provider I/O."""
+    thread = threading.Thread(
+        target=_run_setup_main_vision_test,
+        args=(store, route_id, route_updated_at, caller_api_key),
+        daemon=True,
+        name=f"vision-setup-{str(store.user_id)[:12]}",
+    )
+    thread.start()
 
 
 def _vision_config_payload(store) -> dict:
@@ -884,6 +970,26 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     print(f"[model_api:{store.user_id}] setup provider={provider} model={model}")
 
     route = hosted_config_store.load_active_route(store)
+    route_version = db.model_api_active_route_version(store.user_id)
+    if (
+        route
+        and route_version
+        and str(route.get("id") or "") == route_version["route_id"]
+    ):
+        try:
+            _kick_setup_main_vision_test(
+                store,
+                route_version["route_id"],
+                route_version["updated_at_token"],
+                caller_api_key,
+            )
+        except Exception as exc:
+            # Thread construction itself is also advisory: setup succeeded and
+            # must remain successful even if the automatic probe cannot start.
+            print(
+                f"[model_api:{store.user_id}] setup vision probe not started "
+                f"detail={type(exc).__name__}:{str(exc)[:160]}"
+            )
     return {"status": "configured", "config": _public_route(route)}, 200
 
 
