@@ -47,8 +47,10 @@ _OFF_VALUES = frozenset({"0", "false", "no", "off"})
 INSTRUCTION = (
     " Begin every reply with your private thought wrapped in <think>…</think>, then "
     "the actual reply. The <think> content MUST follow ALL of these: (1) exactly ONE "
-    "short sentence; (2) in the SAME language as the user's latest message — if they "
-    "wrote Chinese it must be Chinese, even on turns where you use tools; (3) "
+    "short sentence; (2) in the SAME language as the user's latest message for the "
+    "WHOLE thought — if they wrote Chinese it must be Chinese from start to finish, "
+    "even on tool turns; never switch to English partway and never append an English "
+    "status or summary line (no 'Done...', no 'The ... has been updated'); (3) "
     "first-person and casual, like a quick thought crossing your mind; (4) plain "
     "everyday intent ONLY — never mention tool names, command flags, field names, "
     "servers, an 'identity card', or any internal, technical, or protocol step. "
