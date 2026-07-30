@@ -318,6 +318,37 @@ def _get_reencrypt(user_id: str, *, fresh: bool = False) -> Callable[[dict, str]
     return fn
 
 
+# 判据是**用户意图**而不是行形状。设计初稿写的是「按行形状搬运」，实现时发现有
+# 洞：现在 PLAINTEXT_WRITES_ACCEPTED 是 False、effective 恒 "on"，所有行都是信封，
+# 按形状搬运会让影子库立刻整体变密文、明文排查通道当场失效。那是过渡期回归，不是
+# 终态。平台放开明文后意图与形状自然一致，本分流退化成「按行形状搬运」。
+_CARRY_VERBATIM_TTL_SEC = 60.0
+_carry_verbatim_cache: dict[str, tuple[float, bool]] = {}
+
+
+def _carries_verbatim(user_id: str) -> bool:
+    """该用户的行是否原样搬运（= 显式选了加密档）。
+
+    fail-safe 方向与写侧一致：**查不到用户就不解密**。搬运的失败方向是「多留了
+    密文」，事后重放可修；解密的失败方向是「明文泄漏」，不可逆。
+
+    带 TTL 缓存：``_get_user_content_encryption`` 是 O(用户数) 的全表扫描，按行
+    调用会拖垮长跑 pass；但不能永久缓存，否则用户切档后要等进程重启才生效。
+    """
+    now = time.time()
+    hit = _carry_verbatim_cache.get(user_id)
+    if hit is not None and now - hit[0] <= _CARRY_VERBATIM_TTL_SEC:
+        return hit[1]
+
+    from accounts import registry  # 延迟导入：复制层不该在模块期拉起 accounts
+
+    # 三态：`"on"` 加密档 → 搬运；`"off"` 明文档 → 解密；`None` 查不到用户 →
+    # fail-safe 搬运。所以「不等于 off」正是判据。
+    verbatim = registry._get_user_content_encryption(user_id) != "off"
+    _carry_verbatim_cache[user_id] = (now, verbatim)
+    return verbatim
+
+
 def _get_decrypt(user_id: str, *, fresh: bool = False) -> Callable[[dict, str], bytes]:
     """TTL 感知的 per-user decrypt 缓存。
 
@@ -362,6 +393,10 @@ def _transform_with_retry(cfg: _Table, doc: dict, user_id: str) -> dict:
     auth 形状的失败（401/token 过期）在重试前强制重铸 token——同一枚 stale token
     重试多少次都是白试。
     """
+    if _carries_verbatim(user_id):
+        # 加密档：整行原样搬运，复制层不解密（Task 2.4）。
+        return transforms.carry_verbatim(doc)
+
     decrypt = _get_decrypt(user_id)
     last: Exception | None = None
     for _ in range(_RETRIES + 1):

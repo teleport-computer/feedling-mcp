@@ -779,8 +779,17 @@ L1 **7219 passed / 0 failed**（含 `tests/test_envelope_storage_fields.py` 16 �
       不再需要——毒行之所以是毒行，正因为复制时非解密不可。但存量清理还要用它，
       退役放到 Phase 5。
 
-- [ ] 实现（spec §6 已拆成清单）：`transforms.py` 改透传、`verify.py` 按形状分流
-      对账、四象限回归、opt-in 用户重放。
+- [x] **复制侧已实现**（2026-07-31）：`transforms.carry_verbatim()` +
+      `worker._carries_verbatim()`，收口在 `_transform_with_retry` 这一处（所有表
+      的 transform 都过它）。判据是**用户意图**而非行形状——见 spec 里的修正说明。
+      fail-safe 方向：查不到用户就**不解密**（搬运的失败方向是「多留了密文」可事后
+      重放修，解密的失败方向是「明文泄漏」不可逆）。带 60s TTL 缓存，因为
+      `_get_user_content_encryption` 是 O(用户数) 全表扫描、按行调用会拖垮长跑 pass。
+      `tests/test_tee_carry_verbatim.py` 7 例；L1 7281 passed / 0 failed。
+
+- [ ] `verify.py` 按行形状分流对账（加密档密文逐字比对、明文档维持现状）
+- [ ] cutover 前：盘点 opt-in 加密档用户 → 「清空 + 重置水位线 + 重放」清理其
+      存量明文副本 → 核对 `doc ? 'body_ct'` 行数与 RDS 侧一致
 
 ---
 

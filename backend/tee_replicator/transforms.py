@@ -80,6 +80,18 @@ def _scrub_nul(obj):
     return obj
 
 
+def carry_verbatim(doc: dict) -> dict:
+    """加密档用户的行：原样搬进 TEE，不解密、不剥任何字段（Task 2.4）。
+
+    只做 NUL 清理——PostgreSQL 的 text/JSONB 存不了 0x00，这是历史事故
+    （tee-sync NUL 卡死重试循环），搬运路径不能重新引入。
+
+    注意本函数**不看行形状**：加密档用户切档前的存量明文行同样原样搬运，去解密
+    一行没有 body_ct 的「信封」只会白跑一趟 enclave。
+    """
+    return _scrub_nul(doc)
+
+
 def plaintext_chat_doc(doc: dict, decrypt) -> dict:
     """chat 行：主信封 + 可选 thinking / caption 子信封，全部明文化。"""
     if not _decryptable(doc):
