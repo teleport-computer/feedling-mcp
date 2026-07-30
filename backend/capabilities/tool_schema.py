@@ -316,8 +316,8 @@ DESCRIPTIONS: dict[str, str] = {
     "screen_read": "Read (decrypt) a specific screen-share frame, or the latest one if no frame_id is given.",
     "photo_recent": "List recent photos, optionally capped by limit.",
     "photo_read": "Read a specific photo by id, optionally including its decrypted image.",
-    "web_search": "Search the public web (keyless DuckDuckGo scrape) for a query.",
-    "web_fetch": "Fetch a URL and return its stripped text content.",
+    "web_search": "Search the live public web for current information such as news, weather, prices, or recent events, or anything past your training data that you are not sure is current. Prefer this over guessing or telling the user you cannot access the internet.",
+    "web_fetch": "Fetch a specific URL and return its main text content. Use when the user provides a link, or to read a page found through web_search.",
     "schedule_wake": "Schedule a future self-wake at a given time, with optional timezone and reason.",
     "cancel_wake": "Cancel a previously scheduled self-wake by its wake_id.",
     "workspace_list": ("List encrypted virtual workspace entries and revisions. "
