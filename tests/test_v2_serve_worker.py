@@ -11,6 +11,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import jobs_store, reaper as v2_reaper, serve_worker, worker
 
 
+@pytest.fixture(autouse=True)
+def _provider_backed_compaction_mode(monkeypatch):
+    # This suite's compaction case specifies media-decrypt failure behavior in
+    # the provider-backed fallback path.
+    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
+
+
 def _fake_serve_from_script(script, calls):
     """Return an async _serve fake that raises/returns each scripted item."""
     it = iter(script)

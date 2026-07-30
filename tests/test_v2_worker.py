@@ -28,7 +28,7 @@ from model_api_runtime.v2 import worker
 
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
     """claim_next_job() is a GLOBAL work-queue claim (by design it doesn't filter
     by user_id — see jobs_store.claim_next_job docstring). A pending job left
     behind by another test module (e.g. test_v2_jobs_store.py, which runs
@@ -36,6 +36,10 @@ def _clean_agent_jobs_table():
     claimed here instead of the row a given test just enqueued. Truncate
     before each test so claim_next_job only ever sees this test's own row —
     mirrors the identical fixture in test_v2_jobs_store.py."""
+    # Compaction cases in this long-standing worker suite specify the
+    # provider-backed fallback; rollout-mode behavior lives in the dedicated
+    # deterministic suite.
+    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield

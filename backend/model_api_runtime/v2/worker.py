@@ -196,6 +196,16 @@ def _positive_int_env(name: str, default: str) -> int:
     return value
 
 
+def _allowlisted_bool_env(name: str, default: str = "0") -> bool:
+    """Enable a rollout flag only for an explicit affirmative value."""
+    return str(os.environ.get(name, default)).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _nonnegative_int_env(name: str, default: str) -> int:
     raw = os.environ.get(name, default)
     try:
@@ -498,6 +508,12 @@ _COMPACTION_BATCH = _positive_int_env("FEEDLING_V2_COMPACTION_BATCH_MSGS", "200"
 # loudly instead of advancing the watermark past content the model never saw.
 _COMPACTION_BATCH_CHARS = _positive_int_env(
     "FEEDLING_V2_COMPACTION_BATCH_CHARS", "120000"
+)
+# Operational dependency: DO NOT enable this before M5 MEMORY/USER prompt
+# injection is deployed. Until then, deterministic count sentinels replace the
+# model-written summary head without supplying the long-term context elsewhere.
+_PROFILE_COVERAGE_DETERMINISTIC = _allowlisted_bool_env(
+    "FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC"
 )
 _SUMMARY_ROLLUP_FANOUT = _positive_int_env(
     "FEEDLING_V2_SUMMARY_ROLLUP_FANOUT", "8"
@@ -1168,6 +1184,12 @@ class TurnDeps:
     # validated canonical cover. Legacy write_summary remains for isolated
     # callers and rolling rollback compatibility.
     read_summary_frontier: Callable[
+        [str], "v2_summary_frontier.SummaryFrontierSnapshot | None"
+    ] | None = None
+    # Content-free equivalent used by deterministic coverage mode. Exact
+    # segment payloads are reconstructed from their persisted row counts, so
+    # normal roll-up never needs to decrypt historical summaries.
+    read_summary_frontier_metadata: Callable[
         [str], "v2_summary_frontier.SummaryFrontierSnapshot | None"
     ] | None = None
     append_summary_segment: Callable[..., bool] | None = None
@@ -4558,6 +4580,7 @@ async def _rebalance_summary_frontier(
     job_id=None,
     add_usage: Callable[[dict | None], None] | None = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+    deterministic_coverage: bool = False,
 ) -> list:
     """Roll immutable canonical nodes up until the prompt frontier is bounded.
 
@@ -4566,17 +4589,20 @@ async def _rebalance_summary_frontier(
     the canonical cover. Exhaustion is loud so no caller can substitute silent
     truncation for a complete historical representation.
     """
-    if (
-        deps.read_summary_frontier is None
-        or deps.append_summary_checkpoint is None
-    ):
+    frontier_reader = (
+        deps.read_summary_frontier_metadata
+        if deterministic_coverage
+        and deps.read_summary_frontier_metadata is not None
+        else deps.read_summary_frontier
+    )
+    if frontier_reader is None or deps.append_summary_checkpoint is None:
         return []
 
     async def _read_frontier():
         if enclave_sem is None:
-            return await asyncio.to_thread(deps.read_summary_frontier, user_id)
+            return await asyncio.to_thread(frontier_reader, user_id)
         async with enclave_sem:
-            return await asyncio.to_thread(deps.read_summary_frontier, user_id)
+            return await asyncio.to_thread(frontier_reader, user_id)
 
     no_progress = 0
     for _pass in range(_SUMMARY_ROLLUP_MAX_PASSES):
@@ -4658,26 +4684,41 @@ async def _rebalance_summary_frontier(
             )
             return result
 
-        try:
-            checkpoint = await v2_compaction.compact_checkpoint(
-                provider_config=provider_config,
-                child_summaries=checkpoint_messages,
-                llm=_recording_checkpoint_llm,
-                usage_out=add_usage,
-            )
-        except v2_compaction.CheckpointCompactionExhausted as exc:
-            raise v2_summary_frontier.SummaryFrontierExhausted(
-                "checkpoint_work_budget_exhausted"
-            ) from exc
+        checkpoint = (
+            v2_compaction.deterministic_checkpoint(checkpoint_messages)
+            if deterministic_coverage
+            else None
+        )
+        if checkpoint is None:
+            try:
+                checkpoint = await v2_compaction.compact_checkpoint(
+                    provider_config=provider_config,
+                    child_summaries=checkpoint_messages,
+                    llm=_recording_checkpoint_llm,
+                    usage_out=add_usage,
+                )
+            except v2_compaction.CheckpointCompactionExhausted as exc:
+                raise v2_summary_frontier.SummaryFrontierExhausted(
+                    "checkpoint_work_budget_exhausted"
+                ) from exc
         if checkpoint is None:
             raise v2_summary_frontier.SummaryFrontierExhausted(
                 "invalid_checkpoint_output"
             )
-        materialized_head = v2_summary_frontier.render_replacement(
-            frontier,
-            child_segment_ids=candidate.child_segment_ids,
-            parent_text=checkpoint,
-        )
+        if deterministic_coverage and not any(
+            item.coverage_kind == "legacy_opaque" for item in frontier
+        ):
+            materialized_head = v2_compaction.deterministic_fold(
+                source_message_count=sum(
+                    item.source_message_count for item in frontier
+                )
+            )
+        else:
+            materialized_head = v2_summary_frontier.render_replacement(
+                frontier,
+                child_segment_ids=candidate.child_segment_ids,
+                parent_text=checkpoint,
+            )
         if claimed_by and job_id is not None:
             renewed = await asyncio.to_thread(
                 jobs_store.renew_job_lease,
@@ -4974,6 +5015,158 @@ async def _run_compaction(
     静默 `mark_failed`，跟 chat turn 的用户可见失败路径彻底分开。
     """
     try:
+        if _PROFILE_COVERAGE_DETERMINISTIC:
+            if deps.append_summary_segment is None:
+                raise RuntimeError("deterministic_compaction_unwired")
+            summary_row = await asyncio.to_thread(
+                jobs_store.get_summary_row,
+                user_id,
+            )
+            watermark_seq = int(summary_row["watermark_seq"]) if summary_row else 0
+            watermark_ts = (
+                float(summary_row["watermark_ts"]) if summary_row else 0.0
+            )
+            version = int(summary_row["version"]) if summary_row else 0
+            unsummarized_count = await _unsummarized_count(
+                user_id,
+                watermark_seq,
+            )
+            if unsummarized_count <= _TAIL_KEEP:
+                await asyncio.to_thread(
+                    jobs_store.mark_completed,
+                    job_id,
+                    claimed_by=claimed_by,
+                )
+                if tm is not None:
+                    tm.flush(failed=False, status="ok")
+                return "completed"
+
+            fold_count = min(
+                _COMPACTION_BATCH,
+                unsummarized_count - _TAIL_KEEP,
+            )
+            first_seq, last_seq, source_count = await asyncio.to_thread(
+                db.chat_coverage_bounds_after_seq,
+                user_id,
+                watermark_seq,
+                limit=fold_count,
+                through_seq=None,
+            )
+            if (
+                source_count != fold_count
+                or first_seq <= watermark_seq
+                or last_seq < first_seq
+            ):
+                raise RuntimeError("deterministic_coverage_bounds_incomplete")
+            segment_text = v2_compaction.deterministic_fold(
+                source_message_count=source_count
+            )
+            covered_count = await asyncio.to_thread(
+                db.count_messages_after_seq,
+                user_id,
+                0,
+                through_seq=last_seq,
+                exclude_synthetic_sources=True,
+            )
+            head_text = v2_compaction.deterministic_fold(
+                source_message_count=covered_count
+            )
+            _report_turn_progress("deterministic_compaction_batch_start")
+            await _record_trajectory(
+                trajectory_recorder,
+                "deterministic_compaction_batch",
+                {
+                    "lane": "maintenance",
+                    "start_seq": first_seq,
+                    "end_seq": last_seq,
+                    "source_message_count": source_count,
+                },
+                best_effort=True,
+            )
+            if claimed_by and not await asyncio.to_thread(
+                jobs_store.renew_job_lease,
+                job_id,
+                claimed_by,
+                ttl_sec=jobs_store.RUNNING_TTL_SEC,
+            ):
+                raise LostJobLease(
+                    "compaction lease lost before deterministic summary write"
+                )
+            if deps.runtime_mode_enabled is not None and not await asyncio.to_thread(
+                deps.runtime_mode_enabled,
+                user_id,
+            ):
+                raise RuntimeModeChanged(
+                    "user rolled back before deterministic summary write"
+                )
+            ok = await asyncio.to_thread(
+                deps.append_summary_segment,
+                user_id,
+                segment_text,
+                current_summary="",
+                head_summary=head_text,
+                start_seq=first_seq,
+                end_seq=last_seq,
+                source_message_count=source_count,
+                watermark_ts=watermark_ts,
+                expected_version=version,
+                previous_watermark_seq=watermark_seq,
+            )
+            _report_turn_progress("deterministic_compaction_batch_complete")
+            if ok:
+                await _rebalance_summary_frontier(
+                    user_id,
+                    deps,
+                    provider_config=provider_config,
+                    enclave_sem=enclave_sem,
+                    claimed_by=claimed_by,
+                    job_id=job_id,
+                    add_usage=tm.add_call if tm is not None else None,
+                    trajectory_recorder=trajectory_recorder,
+                    deterministic_coverage=True,
+                )
+                remaining_count = await _unsummarized_count(
+                    user_id,
+                    last_seq,
+                )
+                completed = await asyncio.to_thread(
+                    jobs_store.mark_completed,
+                    job_id,
+                    claimed_by=claimed_by,
+                )
+                if completed and remaining_count > _TAIL_KEEP:
+                    await asyncio.to_thread(
+                        jobs_store.enqueue_job,
+                        user_id,
+                        "maintenance",
+                        reason="compaction_catchup",
+                    )
+                    await asyncio.to_thread(
+                        core_wake_bus.notify,
+                        "v2_jobs",
+                        user_id,
+                    )
+                if tm is not None:
+                    tm.flush(failed=False, status="ok")
+                return "completed"
+            failed_owned = await asyncio.to_thread(
+                jobs_store.mark_failed,
+                job_id,
+                "summary_cas_lost",
+                claimed_by=claimed_by,
+            )
+            if failed_owned:
+                await asyncio.to_thread(
+                    jobs_store.enqueue_job,
+                    user_id,
+                    "maintenance",
+                    reason="cas_lost_retry",
+                )
+                await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+            if tm is not None:
+                tm.flush(failed=True, status="summary_cas_lost")
+            return "failed"
+
         # Rebalance first, then read the head/version used by this leaf CAS.
         # A checkpoint increments the head version; reading first would waste
         # one provider call on a predictably stale leaf and force a retry job.
@@ -5832,12 +6025,20 @@ async def _ensure_prompt_coverage(
                 or deps.read_tail is not None
             )
         )
+        deterministic_callbacks = (
+            _PROFILE_COVERAGE_DETERMINISTIC
+            and deps.append_summary_segment is not None
+        )
         if (
             (
                 deps.write_summary is None
                 and deps.append_summary_segment is None
             )
-            or not (seq_callbacks or legacy_callbacks)
+            or not (
+                deterministic_callbacks
+                or seq_callbacks
+                or legacy_callbacks
+            )
         ):
             raise TurnError(_coverage_incomplete_reason("catchup_unwired"))
         if no_progress_attempts >= max_retries:
@@ -5921,6 +6122,89 @@ async def _ensure_prompt_coverage(
             batch_cap,
         )
         if fold_count <= 0:
+            continue
+        if deterministic_callbacks:
+            first_seq, last_seq, source_count = await _within_deadline(
+                lambda: asyncio.to_thread(
+                    db.chat_coverage_bounds_after_seq,
+                    user_id,
+                    watermark_seq,
+                    limit=fold_count,
+                    through_seq=compact_through_seq,
+                )
+            )
+            if (
+                source_count != fold_count
+                or first_seq <= watermark_seq
+                or last_seq < first_seq
+            ):
+                raise TurnError("prompt_coverage_incomplete")
+            segment_text = v2_compaction.deterministic_fold(
+                source_message_count=source_count
+            )
+            covered_count = await _within_deadline(
+                lambda: asyncio.to_thread(
+                    db.count_messages_after_seq,
+                    user_id,
+                    0,
+                    through_seq=last_seq,
+                    exclude_synthetic_sources=True,
+                )
+            )
+            head_text = v2_compaction.deterministic_fold(
+                source_message_count=covered_count
+            )
+            attempted_since_observation = True
+            _report_turn_progress("prompt_deterministic_catchup_batch_start")
+            await _renew_catchup_lease()
+            wrote = await _within_deadline(
+                lambda: asyncio.to_thread(
+                    deps.append_summary_segment,
+                    user_id,
+                    segment_text,
+                    current_summary="",
+                    head_summary=head_text,
+                    start_seq=first_seq,
+                    end_seq=last_seq,
+                    source_message_count=source_count,
+                    watermark_ts=(
+                        float(summary_row["watermark_ts"])
+                        if summary_row
+                        else 0.0
+                    ),
+                    expected_version=(
+                        int(summary_row["version"]) if summary_row else 0
+                    ),
+                    previous_watermark_seq=watermark_seq,
+                )
+            )
+            if wrote:
+                await _within_deadline(
+                    lambda: _rebalance_summary_frontier(
+                        user_id,
+                        deps,
+                        provider_config=provider_config,
+                        enclave_sem=enclave_sem,
+                        claimed_by=claimed_by,
+                        job_id=job_id,
+                        add_usage=add_usage,
+                        trajectory_recorder=trajectory_recorder,
+                        deterministic_coverage=True,
+                    )
+                )
+            _report_turn_progress("prompt_deterministic_catchup_batch_complete")
+            await _record_trajectory(
+                trajectory_recorder,
+                "deterministic_compaction_batch",
+                {
+                    "lane": "prompt_catchup",
+                    "start_seq": first_seq,
+                    "end_seq": last_seq,
+                    "source_message_count": source_count,
+                    "written": bool(wrote),
+                },
+                best_effort=True,
+            )
             continue
 
         async def _read_gap():

@@ -250,6 +250,61 @@ jobs:
             tests/test_v2_extraction_memory_integration.py \
             -v
 
+  # The rollout switch is default-off, so ordinary CI cannot exercise its
+  # TurnDeps contract. Keep both states live until M6 removes the switch.
+  runtime-v2-compaction-matrix:
+    name: Runtime V2 compaction (deterministic=${{ matrix.deterministic }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        deterministic: ["0", "1"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: feedling_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r backend/requirements.lock
+          pip install pytest-asyncio
+
+      - name: Run deterministic coverage matrix
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+          FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: "${{ matrix.deterministic }}"
+        run: |
+          python -m pytest \
+            tests/test_v2_adaptive_tail.py \
+            tests/test_v2_compaction.py \
+            tests/test_v2_compaction_integration.py \
+            tests/test_v2_compaction_cas_requeue.py \
+            tests/test_v2_p0_history_safety.py \
+            tests/test_v2_serve_worker.py \
+            tests/test_v2_summary_frontier_store.py \
+            tests/test_v2_summary_watermark_seq.py \
+            tests/test_v2_wake_worker.py \
+            tests/test_v2_worker.py \
+            tests/test_v2_deterministic_compaction.py \
+            -v
+
   # -------------------------------------------------------------------------
   # Docker — confirm the hash-pinned build stays reproducible
   # -------------------------------------------------------------------------
