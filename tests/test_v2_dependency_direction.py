@@ -1,6 +1,8 @@
 """Guard: V2 runtime CORE modules must not import `hosted`/`agent_runtime`.
 Only serve_worker.py (the injection/entrypoint layer) may. Mirrors the
-test_no_flask_anywhere guard pattern. AST-based so it can't be fooled by comments/strings."""
+test_no_flask_anywhere guard pattern. AST-based so it can't be fooled by comments/strings.
+"""
+
 import ast
 import pathlib
 
@@ -45,3 +47,16 @@ def test_v2_core_modules_do_not_import_hosted_or_agent_runtime():
         "V2 core modules must not import hosted/agent_runtime "
         f"(dependency direction); offenders: {offenders}"
     )
+
+
+def test_profile_generation_module_has_only_pure_stdlib_dependencies():
+    imported = _top_level_imports(_V2 / "profile.py")
+    assert imported <= {
+        "__future__",
+        "dataclasses",
+        "json",
+        "math",
+        "re",
+        "typing",
+        "unicodedata",
+    }
