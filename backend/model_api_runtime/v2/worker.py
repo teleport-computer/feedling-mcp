@@ -476,6 +476,14 @@ _CHAT_TAIL_MAX_TURNS = _positive_int_env(
 _WAKE_TAIL_MAX_TURNS = _positive_int_env(
     "FEEDLING_V2_WAKE_TAIL_MAX_TURNS", "16"
 )
+# optional 重放窗口的滞后上限：eligible_optional 的轮数在 _CHAT_TAIL_MAX_TURNS
+# 与本值之间浮动。必须严格大于 _CHAT_TAIL_MAX_TURNS，否则没有滞后区、退化回
+# 逐轮滑动窗口（即本次要修的 bug 本身）。
+_CHAT_TAIL_ANCHOR_MAX_TURNS = _positive_int_env(
+    "FEEDLING_V2_CHAT_TAIL_ANCHOR_MAX_TURNS", "60"
+)
+if _CHAT_TAIL_ANCHOR_MAX_TURNS <= _CHAT_TAIL_MAX_TURNS:
+    _CHAT_TAIL_ANCHOR_MAX_TURNS = _CHAT_TAIL_MAX_TURNS + 20
 _RECENT_TURN_ROW_CAP = _positive_int_env(
     "FEEDLING_V2_RECENT_TURN_ROW_CAP", "512"
 )
