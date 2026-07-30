@@ -258,6 +258,9 @@ db.chat_coverage_bounds_after_seq(user_id, after_seq, *, limit, through_seq)
 
 > 即使 profile 整体延期也应先发这段 —— 它独立关掉 usr_7f30 / usr_90184 / usr_81a0 那一族事故。
 
+⚠️ **代码可先合先发,但旗子必须锁到 M5 之后**:开关一开,确定性路径会立刻把用户 prompt 里的摘要替换成一句纯计数哨兵(「N 条更早的消息已由长期记忆覆盖」)。在 MEMORY/USER 注入(M5)上线之前打开 = 用户直接失去全部长期上下文而无任何接替。此前置条件必须同时写死在:①开关定义处的代码注释 ②三个 compose 文件的注释(已有测试钉住注释不被误删)。
+(审 M1 时另确认:「零模型调用」是**稳态**说法 —— 老用户 frontier 里模型写的既有节点参与 roll-up 时仍会触发 provider 调用,新确定性叶子成组 fanout=8 后才真零;prod 现有 V2 用户全部处于前一种状态,changelog 措辞已限定为 steady-state。)
+
 ### M2 存储
 
 blob kind、信封建/读、CAS(失败重读重算)、state 机、strict 读 + 可观测降级。
@@ -284,7 +287,7 @@ headers、`build_turn_messages` 参数、worker 接线、摘要抑制、coverage
 
 ### M6 放量 + 定阈值
 
-打开确定性记账,观察 maintenance `model_calls` 归零、每回合 prompt token 下降;攒够真实画像后把重叠校验从观测切成拒绝,并回头锁字符上限。
+**前置硬条件:M5 已部署且画像注入已在真实用户上验证** —— 见 M1 的警告框,这个开关会立即替换掉摘要。满足后:打开确定性记账,观察 maintenance `model_calls` 收敛到稳态零(老 frontier 混有模型节点期间仍会有少量 roll-up 调用)、每回合 prompt token 下降;攒够真实画像后把重叠校验从观测切成拒绝,并回头锁字符上限。
 
 ---
 
