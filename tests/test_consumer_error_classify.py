@@ -383,6 +383,17 @@ def test_deepseek_text_only_image_error_requires_vision_model():
     assert crc._turn_failure_reply_text(n) != crc.FALLBACK_REPLY
 
 
+def test_openrouter_text_only_image_404_requires_vision_model_before_model_fallback():
+    """Liko's exact OpenRouter rejection must beat the broad 404+model branch."""
+    n = _cls(RuntimeError(
+        "provider_http_404: model deepseek/deepseek-v4-pro: "
+        "No endpoints found that support image input"))
+
+    assert n.error_class == "vision_model_required"
+    assert n.blame == "user_provider"
+    assert crc._turn_failure_reply_text(n) != crc.FALLBACK_REPLY
+
+
 def test_context_overflow_classified():
     from chat_resident_consumer import classify_agent_error
     n = classify_agent_error(RuntimeError("prompt is too long: 210000 tokens > maximum context length"))

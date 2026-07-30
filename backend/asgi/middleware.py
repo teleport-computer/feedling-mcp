@@ -38,15 +38,34 @@ except Exception:  # pragma: no cover
 log = logging.getLogger("feedling.asgi")
 
 
+_SECRET_QUERY_SUBSTRINGS = ("key", "token", "secret", "password", "passwd", "auth")
+
+
+def _is_secret_param(name: str) -> bool:
+    """按**子串**判定参数名是否携带凭据，而不是精确等于 ``key``。
+
+    2026-07-30 审计实证：admin 后台把 ``admin_key`` 放进每个链接的 query string
+    （``data_track._data_track_qs`` 的保留列表第一项），而原判据是
+    ``k.lower() == "key"``——``admin_key`` != ``key``，于是可复用的 admin 凭据
+    原样进了访问日志。精确匹配单个名字，等于把"以后不会出现别的别名"当作前提，
+    而这个前提在同一个仓库里当时就已经不成立：``admin_key`` / ``admin_token``
+    / ``api_key`` 三个都在用。宁可多脱敏一个无害参数，也不能漏一个凭据。
+    """
+    lowered = name.lower()
+    return any(needle in lowered for needle in _SECRET_QUERY_SUBSTRINGS)
+
+
 def _display_path(scope) -> str:
-    """path (+ query), with any ``key`` param redacted case-insensitively."""
+    """path (+ query)，参数名含凭据语义的一律脱敏（大小写无关）。"""
     path = scope.get("path", "")
     qs = scope.get("query_string", b"").decode("latin-1")
     if not qs:
         return path
     pairs = parse_qsl(qs, keep_blank_values=True)
-    if any(k.lower() == "key" for k, _ in pairs):
-        redacted = [(k, "REDACTED" if k.lower() == "key" else v) for k, v in pairs]
+    if any(_is_secret_param(k) for k, _ in pairs):
+        redacted = [
+            (k, "REDACTED" if _is_secret_param(k) else v) for k, v in pairs
+        ]
         return f"{path}?{urlencode(redacted)}"
     return f"{path}?{qs}"
 

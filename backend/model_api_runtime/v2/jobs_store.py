@@ -2530,6 +2530,27 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
             raise RuntimeError("terminal failure reply id collision")
         return _ack_terminal_failure_reply(job_id)
 
+    failure_identity: dict[str, str] = {}
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT detail_json FROM agent_status_events "
+                "WHERE job_id=%s AND kind='error' ORDER BY id DESC LIMIT 1",
+                (job_id,),
+            )
+            identity_row = cur.fetchone()
+    detail = (identity_row or {}).get("detail_json")
+    if isinstance(detail, dict):
+        for source, target, limit in (
+            ("failure_model", "turn_failure_model", 96),
+            ("failure_provider", "turn_failure_provider", 80),
+        ):
+            value = re.sub(
+                r"[^A-Za-z0-9_./:@+-]+", "_", str(detail.get(source) or "").strip()
+            )[:limit]
+            if value:
+                failure_identity[target] = value
+
     error_class = _terminal_error_class(
         row.get("error_code"), row.get("error_class")
     )
@@ -2558,6 +2579,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
             "turn_failure_user_text": user_text,
             "terminal_failure_job_id": str(job_id),
             "reply_to_message_id": parent_id,
+            **failure_identity,
         },
     )
     seq, inserted = db.chat_append_effect_with_cursor(
@@ -4133,6 +4155,8 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
                 "  coalesce(sum(model_calls), 0)::bigint AS model_calls,"
                 "  coalesce(sum(usage_reported_calls), 0)::bigint"
                 "    AS usage_reported_calls,"
+                "  coalesce(sum(cache_reported_calls), 0)::bigint"
+                "    AS cache_reported_calls,"
                 "  sum(prompt_tokens)::bigint AS prompt_tokens,"
                 "  sum(completion_tokens)::bigint AS completion_tokens,"
                 "  sum(cache_read_tokens)::bigint AS cache_read_tokens,"
@@ -4152,6 +4176,7 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
     for row in rows:
         model_calls = int(row["model_calls"] or 0)
         usage_calls = int(row["usage_reported_calls"] or 0)
+        cache_calls = int(row["cache_reported_calls"] or 0)
         prompt_tokens = _optional_int(row, "prompt_tokens")
         completion_tokens = _optional_int(row, "completion_tokens")
         cache_read = _optional_int(row, "cache_read_tokens")
@@ -4173,6 +4198,14 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
         lanes[str(row["lane"] or "unknown")] = {
             "model_calls": model_calls,
             "usage_reported_calls": usage_calls,
+            # cache coverage 与 usage coverage 是两个不同的东西：前者是"有多少次
+            # 调用报了缓存指标"，后者是"有多少次调用报了 token usage"。页面此前把
+            # cache_hit_ratio 与 usage_coverage 挤在一列、标签写「缓存命中 · 上报」，
+            # 读者会把那个"上报"当成 cache 上报（2026-07-30 审计指出）。
+            "cache_reported_calls": cache_calls,
+            "cache_coverage": (
+                float(cache_calls) / float(model_calls) if model_calls else None
+            ),
             "usage_coverage": (
                 float(usage_calls) / float(model_calls) if model_calls else None
             ),

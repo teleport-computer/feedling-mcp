@@ -129,6 +129,7 @@ def test_pi_runtime_metadata_reads_exact_model_modalities(tmp_path, monkeypatch)
         "provider": "openrouter",
         "model": "deepseek/deepseek-v4-flash",
         "input_modalities": ["text"],
+        "input_modalities_source": "pi_catalog",
     }
 
 
@@ -6682,6 +6683,37 @@ def test_cli_failure_surfaces_pi_error_message():
     assert "401 invalid key" in crc._cli_error_detail(raw, "")
 
 
+def test_pi_deepseek_image_error_reaches_vision_classifier():
+    """Lock the real pi 0.80.3 wrapper shape, not only the raw HTTP body."""
+    raw = _pi_stream_lines(
+        _PI_HEADER,
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": (
+                    '400: {"message":"Failed to deserialize the JSON body into '
+                    "the target type: messages[1]: unknown variant `image_url`, "
+                    'expected `text` at line 1 column 3626","type":'
+                    '"invalid_request_error","param":null,'
+                    '"code":"invalid_request_error"}'
+                ),
+            },
+        },
+    )
+
+    detail = crc._cli_error_detail(raw, "")
+    notice = crc.classify_agent_error(
+        RuntimeError(f"pi agent produced no reply: {detail}")
+    )
+
+    assert "unknown variant `image_url`, expected `text`" in detail
+    assert notice.error_class == "vision_model_required"
+    assert notice.blame == "user_provider"
+
+
 def test_pi_intermediate_events_are_non_final():
     for etype in ("message_start", "message_update", "turn_start", "turn_end",
                   "agent_start", "agent_end", "session",
@@ -9802,3 +9834,43 @@ def test_process_perception_prose_wrapped_send_message_pushes_clean(monkeypatch)
     assert crc._process_proactive_jobs([job]) == pytest.approx(133.3)
     assert captured["posted"] == ["忙完记得喝口水～"]
     assert any(s[0] == "posted" for s in captured["statuses"])
+
+
+def test_hidden_vision_probe_uses_isolated_session_and_posts_only_observed(monkeypatch):
+    captured = {}
+
+    def call(prompt, **kwargs):
+        captured["call"] = {"prompt": prompt, **kwargs}
+        return "red,green,blue,yellow\nyellow,blue,green,red"
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+    def post(url, **kwargs):
+        captured["post"] = {"url": url, **kwargs}
+        return Response()
+
+    monkeypatch.setattr(crc, "call_agent", call)
+    monkeypatch.setattr(crc._HTTP, "post", post)
+    encoded = base64.b64encode(b"png-bytes").decode("ascii")
+
+    crc._process_vision_probe({
+        "vision_probe": {
+            "probe_id": "probe-1",
+            "images": [
+                {"data_url": f"data:image/png;base64,{encoded}"},
+                {"data_url": f"data:image/png;base64,{encoded}"},
+            ],
+        },
+    })
+
+    assert captured["call"]["isolated_session"] is True
+    assert captured["call"]["lane"] == "background"
+    assert len(captured["call"]["image_paths"]) == 2
+    assert captured["post"]["url"].endswith("/v1/internal/vision/main/test/result")
+    assert captured["post"]["json"] == {
+        "probe_id": "probe-1",
+        "status": "ok",
+        "observed": ["red,green,blue,yellow", "yellow,blue,green,red"],
+    }

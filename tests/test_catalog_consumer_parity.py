@@ -98,6 +98,8 @@ def test_classify_upstream_mirrors_consumer_on_samples():
         "provider_http_400: Failed to deserialize the JSON body into the target "
         "type: messages[0]: unknown variant `image_url`, expected `text` at line "
         "1 column 295",
+        "provider_http_404: model deepseek/deepseek-v4-pro: "
+        "No endpoints found that support image input",
         "400 unsupported parameter 'tool_choice'",
         "maximum context length exceeded",
         "blocked by content policy",

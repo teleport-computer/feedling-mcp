@@ -368,6 +368,8 @@ def test_dedicated_vision_observer_failure_never_calls_main_model(tmp_path):
                  "vision_model_unavailable",
                  status_code=502,
                  detail="ProviderError",
+                 model="vision/model-1",
+                 provider="openrouter",
              ),
          ), \
          patch.object(crc, "call_agent") as mock_call, \
@@ -385,6 +387,9 @@ def test_dedicated_vision_observer_failure_never_calls_main_model(tmp_path):
     assert "视觉模型" in carrier_text or "vision model" in carrier_text.lower()
     assert carrier_kwargs["turn_failure_error_class"] == "vision_model_unavailable"
     assert carrier_kwargs["turn_failure_blame"] == "provider_transient"
+    assert carrier_kwargs["reply_to_message_id"] == "img-observe-fail-01"
+    assert carrier_kwargs["turn_failure_model"] == "vision/model-1"
+    assert carrier_kwargs["turn_failure_provider"] == "openrouter"
     notice_text, notice_kwargs = replies[1]
     assert "vision_model_unavailable" in notice_text
     assert "HTTP 502" in notice_text

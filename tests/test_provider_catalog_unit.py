@@ -128,6 +128,41 @@ def test_parse_catalog_page_anthropic_has_more():
     assert nxt == "claude-opus-5"
 
 
+def test_parse_catalog_page_openrouter_preserves_explicit_input_modalities():
+    body = {"data": [{
+        "id": "vendor/model",
+        "architecture": {"input_modalities": ["text", "image"]},
+    }]}
+    models, _ = pc._parse_catalog_page("openrouter", body)
+    assert models == [{
+        "id": "vendor/model",
+        "display_name": "vendor/model",
+        "input_modalities": ["image", "text"],
+    }]
+
+
+def test_parse_catalog_page_anthropic_maps_image_capability_without_guessing():
+    body = {"data": [
+        {"id": "vision", "capabilities": {"image_input": {"supported": True}}},
+        {"id": "text", "capabilities": {"image_input": {"supported": False}}},
+        {"id": "unknown"},
+    ]}
+    models, _ = pc._parse_catalog_page("anthropic", body)
+    assert models[0]["input_modalities"] == ["text", "image"]
+    assert models[1]["input_modalities"] == ["text"]
+    assert "input_modalities" not in models[2]
+
+
+def test_parse_catalog_page_compatible_accepts_only_explicit_safe_modalities():
+    body = {"data": [
+        {"id": "explicit", "input_modalities": ["IMAGE", "text", "secret"]},
+        {"id": "name-only"},
+    ]}
+    models, _ = pc._parse_catalog_page("openai_compatible", body)
+    assert models[0]["input_modalities"] == ["image", "text"]
+    assert "input_modalities" not in models[1]
+
+
 def test_catalog_request_bedrock_unsupported():
     with pytest.raises(pc.ProviderError) as ei:
         pc._catalog_request("bedrock", "k", "", None)

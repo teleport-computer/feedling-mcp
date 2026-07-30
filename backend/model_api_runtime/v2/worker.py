@@ -972,9 +972,18 @@ def _is_degenerate_reply(text: Any) -> bool:
 class DedicatedVisionUnavailable(RuntimeError):
     """A pinned V2 image observer failed before the main model saw pixels."""
 
-    def __init__(self, message: str, *, error_code: str = "vision_model_failed"):
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = "vision_model_failed",
+        model: str = "",
+        provider: str = "",
+    ):
         super().__init__(message)
         self.error_code = error_code
+        self.model = str(model or "")[:96]
+        self.provider = str(provider or "")[:80]
 
 
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
@@ -1026,6 +1035,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
 
 def _turn_failure_error_class(exc: BaseException) -> str:
     """Classify V2 foreground failures through the shared notice catalog."""
+    if isinstance(exc, DedicatedVisionUnavailable):
+        return exc.error_code
     if isinstance(exc, v2_prompt_frontier.PromptFrontierExhausted):
         # An unaudited default is our conservative local ceiling, not the
         # provider's model limit. Never blame the user or tell them to shorten
@@ -8259,6 +8270,8 @@ def _inject_tail_images(
             raise DedicatedVisionUnavailable(
                 "vision observer failed",
                 error_code=safe_code,
+                model=str(getattr(exc, "model", "") or ""),
+                provider=str(getattr(exc, "provider", "") or ""),
             ) from exc
         if any(
             not str(observations.get(item["message_id"]) or "").strip()
@@ -8472,6 +8485,7 @@ async def process_job(
     claimed_by = str(job.get("claimed_by") or "")
     observed_generation = int(job.get("input_generation") or 0)
     reply_parent_message_id = ""
+    coalesced: list[dict] = []
     seq_native = deps.read_messages_after_seq is not None
     if tm is None:
         tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
@@ -10462,13 +10476,39 @@ async def process_job(
         log.info("[v2.worker] job %s stopped at rollout fence: %s", job_id, e)
         return "failed"
     except Exception as e:  # noqa: BLE001 - terminal outbox owns failure visibility
-        message = _safe_failure_code("turn_failed", e)
+        failure_exc: BaseException = e
+        if (
+            not isinstance(e, DedicatedVisionUnavailable)
+            and any(bool(row.get("has_image")) for row in coalesced)
+        ):
+            classified = _turn_failure_error_class(e)
+            vision_code = {
+                "auth_invalid": "vision_model_auth_invalid",
+                "quota_insufficient": "vision_model_quota_insufficient",
+                "model_not_found": "vision_model_not_found",
+                "provider_incompatible": "vision_model_incompatible",
+                "rate_limited": "vision_model_rate_limited",
+                "upstream_unavailable": "vision_model_unavailable",
+                "turn_timeout": "vision_model_unavailable",
+                "reply_parse_failed": "vision_model_empty_response",
+            }.get(classified)
+            # Pixels being present does not prove an unrelated tool, storage,
+            # or internal failure belongs to vision. Only remap failures whose
+            # provider-facing classification is explicit.
+            if vision_code:
+                failure_exc = DedicatedVisionUnavailable(
+                    "visual turn failed",
+                    error_code=vision_code,
+                    model=str(getattr(provider_config, "model", "") or ""),
+                    provider=str(getattr(provider_config, "provider", "") or ""),
+                )
+        message = _safe_failure_code("turn_failed", failure_exc)
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",
             {
                 "stage": "process_job",
-                "error_class": type(e).__name__,
+                "error_class": type(failure_exc).__name__,
                 "error_code": message,
             },
             best_effort=True,
@@ -10479,8 +10519,30 @@ async def process_job(
             job_id,
             message,
             claimed_by=claimed_by,
-            error_class=_turn_failure_error_class(e),
+            error_class=_turn_failure_error_class(failure_exc),
         )
+        if owned and isinstance(failure_exc, DedicatedVisionUnavailable):
+            identity = {}
+            if failure_exc.model:
+                identity["failure_model"] = failure_exc.model
+            if failure_exc.provider:
+                identity["failure_provider"] = failure_exc.provider
+            if identity:
+                try:
+                    await asyncio.to_thread(
+                        jobs_store.append_status_event,
+                        user_id,
+                        "error",
+                        job_id=job_id,
+                        label="视觉模型调用失败",
+                        detail=identity,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- outbox still owns visibility
+                    log.warning(
+                        "[v2.worker] vision failure identity event failed job=%s code=%s",
+                        job_id,
+                        type(exc).__name__.lower(),
+                    )
         if owned and lane == "chat":
             await _settle_legacy_failed_reply_target(message)
             await asyncio.to_thread(

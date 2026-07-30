@@ -98,12 +98,21 @@ def page_html(query_string: str) -> str:
             # 窗口算一次、传给两个数据函数——两处各自读 request.args 会让窗口
             # 有机会不一致（同页一个 24 小时、一个 720 小时）。
             hours = data_track._runtime_health_window_hours()
+            # 两次调用是**独立的失败域**，不共用一个 try。健康数据是这页的核心，
+            # 它没了才该降级；token 是附加信息，它的查询无 LIMIT、走 seq scan、
+            # 扫描量随表增长单调变大，是两者中先超时的那个——让它把明明可用的
+            # 健康数据一起拖进降级页，是这页最坏的失败模式（它恰恰是出事时才被
+            # 打开的那一页）。token 挂掉只让两列显 —。
             try:
                 payload = data_track._runtime_health_summary(within_hours=hours)
-                tokens = data_track._runtime_token_by_lane(within_hours=hours)
             except Exception:
                 logging.exception("runtime health summary failed")
                 return data_track._render_runtime_health_error_page()
+            try:
+                tokens = data_track._runtime_token_by_lane(within_hours=hours)
+            except Exception:
+                logging.exception("runtime token usage failed (health still served)")
+                tokens = None
             return data_track._render_runtime_health_page(payload, tokens)
         if view == "events":
             event = (request.args.get("event") or "").strip()

@@ -174,6 +174,13 @@ def _turn_failure_attribution(error_class: str, payload: dict) -> tuple[str, str
     return blame, user_text
 
 
+def _failure_identity(value, *, limit: int) -> str:
+    """Bound model/provider labels; never derive them from assistant prose."""
+    raw = str(value or "").strip()
+    safe = "".join(ch for ch in raw if ch.isascii() and (ch.isalnum() or ch in "._:/@+-"))
+    return safe[:limit]
+
+
 def _reply_to_message_id(payload: dict) -> str:
     """The reply target id from any of the accepted payload aliases (trimmed)."""
     return str(
@@ -989,6 +996,16 @@ def write_response(
             extra["turn_failure_error_class"] = turn_failure_error_class
             extra["turn_failure_blame"] = turn_failure_blame
             extra["turn_failure_user_text"] = turn_failure_user_text
+            failure_model = _failure_identity(
+                payload.get("turn_failure_model"), limit=96
+            )
+            failure_provider = _failure_identity(
+                payload.get("turn_failure_provider"), limit=80
+            )
+            if failure_model:
+                extra["turn_failure_model"] = failure_model
+            if failure_provider:
+                extra["turn_failure_provider"] = failure_provider
         # Build the exact append_chat row immediately before the one-statement
         # parent-CAS + reply-INSERT.  No slow work belongs in this gap: two workers
         # may arrive together, and PostgreSQL decides the sole winner.
@@ -1012,6 +1029,10 @@ def write_response(
             replied_fields["reply_error_class"] = turn_failure_error_class
             replied_fields["reply_blame"] = turn_failure_blame
             replied_fields["reply_user_text"] = turn_failure_user_text
+            if failure_model:
+                replied_fields["reply_failure_model"] = failure_model
+            if failure_provider:
+                replied_fields["reply_failure_provider"] = failure_provider
         candidates = [candidate]
         previous_ts = float(candidate["ts"])
         for followup_envelope, followup_extra in file_followups:
