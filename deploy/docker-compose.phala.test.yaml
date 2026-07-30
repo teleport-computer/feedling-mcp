@@ -279,6 +279,8 @@ services:
       FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
       # Automatic Memory Capture stays explicit opt-in (default off).
       FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-0}"
+      # Nightly memory Dream lane (provider-backed). Explicit opt-in, default off.
+      FEEDLING_V2_DREAM_ENABLED: "${FEEDLING_V2_DREAM_ENABLED:-0}"
       # TEST-ONLY: genesis v2 (foreground-fast onboarding). Greet on 3-5 core +
       # identity baseline, push the heavy reduce (the ~37% prod failure surface)
       # to the background. Prod compose deliberately omits this (keeps the v1
