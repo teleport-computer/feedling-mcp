@@ -5,6 +5,7 @@ CASCADE），这里测锚点如何影响 prompt 组装。
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -14,8 +15,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
+import provider_client
+from capabilities import registry as cap_registry
+from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import worker
 
-from conftest import seed_user
+from conftest import seed_user, set_v2_runtime_owner
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"),
@@ -79,3 +84,242 @@ def test_anchor_hysteresis_ceiling_exceeds_target():
     from model_api_runtime.v2 import worker
 
     assert worker._CHAT_TAIL_ANCHOR_MAX_TURNS > worker._CHAT_TAIL_MAX_TURNS
+
+
+# --- Hot-path acceptance rig, copied from
+# archive/v2-tail-anchor-wrong-wiring:tests/test_v2_tail_anchor_store.py (the
+# helpers there are already proven to exercise a real `worker.process_job`
+# call end to end). Kept together with their original comments because those
+# comments record the exact pitfalls that make a rig silently no-op instead
+# of exercising the code under test. -----------------------------------------
+
+_BYOK = provider_client.ProviderConfig(
+    provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user-byok", base_url="",
+)
+
+
+class _FakeCapResult:
+    def to_dict(self):
+        return {"ok": True, "data": {}, "error": None, "trace": {}, "warnings": []}
+
+
+def _reset_anchor_hotpath_user(uid: str) -> None:
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM chat_messages WHERE user_id=%s", (uid,))
+        conn.execute("DELETE FROM agent_jobs WHERE user_id=%s", (uid,))
+        conn.execute("DELETE FROM v2_conversation_summary WHERE user_id=%s", (uid,))
+        conn.execute("DELETE FROM v2_chat_tail_anchor WHERE user_id=%s", (uid,))
+    # claim_next_job's candidate query INNER JOINs v2_runtime_state — without
+    # an authoritative v2-owned row here the job is unclaimable and
+    # claim_next_job silently returns None (mirrors
+    # tests/test_v2_atomic_reply_cursor.py's `_reset`).
+    set_v2_runtime_owner(uid)
+
+
+def _seed_chat_row(uid: str, msg_id: str, ts: float, role: str) -> int:
+    """Real ``chat_messages`` row (plaintext-shaped — no live enclave in this
+    test process, same convention as ``_append`` above), via the strict
+    write path the production chat lane itself uses. Returns the real seq.
+
+    Carries a plaintext ``content`` field (in addition to the usual
+    ``body_ct`` ciphertext placeholder) because
+    ``model_api_runtime.v2.coalesce.coalesce_pending``'s default decrypt
+    reads ``row["content"]`` — without it every "pending" row looks empty
+    and gets silently dropped, so the chat lane takes the "no coalesced
+    input" shortcut and returns before ever reaching the code this test
+    exists to exercise (caught by asserting the anchor/boundary spies were
+    actually invoked, not just trusting a "completed" status)."""
+    db.chat_append_strict(
+        uid, msg_id, ts,
+        {
+            "id": msg_id, "role": role, "ts": ts,
+            "body_ct": f"cipher-{msg_id}", "nonce": "n",
+            "K_user": "k", "K_enclave": "e",
+            "content": f"plaintext-{msg_id}",
+        },
+        5000,
+    )
+    seq = db.chat_seq_for_msg_id(uid, msg_id)
+    assert seq is not None
+    return seq
+
+
+def _fake_sealed_envelope(item_id: str, *, body: str = "reply-ciphertext") -> dict:
+    """Same shape as tests/test_v2_atomic_reply_cursor.py's ``_envelope``."""
+    return {
+        "v": 1,
+        "id": item_id,
+        "owner_user_id": "ignored-by-store",
+        "visibility": "shared",
+        "body_ct": body,
+        "nonce": "nonce",
+        "K_user": "sealed-user-key",
+        "K_enclave": "sealed-enclave-key",
+    }
+
+
+def _optional_anchor_deps(uid: str, monkeypatch, *, watermark_seq: int) -> "worker.TurnDeps":
+    """Same rig as the archive's ``_seq_native_chat_deps``, with two changes
+    needed to actually make the optional window non-empty (the trap called
+    out in the task brief):
+
+    1. ``_summary_with_seq`` returns a CONFIGURABLE watermark instead of the
+       archive's hard-coded ``("", 0.0, 0, 0)``. Watermark=0 means "never
+       compacted" -> every row in history is strictly after the watermark ->
+       every row lands in the REQUIRED tail and the optional-replay window is
+       permanently empty. A test built on that rig cannot observe window
+       sliding no matter what the production code does — it would pass for
+       the wrong reason.
+
+    2. ``read_recent_turns`` is wired (the archive rig left it ``None``).
+       ``worker._read_seq_adaptive_prompt_context`` only populates
+       ``optional_tail_turns`` when ``deps.read_recent_turns is not None``
+       (see worker.py's call site guard) — without it, optional replay is
+       empty regardless of the watermark, for a second, independent reason.
+       The real production wiring is ``serve_worker._read_recent_turns``,
+       which additionally runs rows through the live-enclave decrypt path;
+       this test process has no live enclave, so this fake instead calls
+       ``db.chat_recent_turn_rows`` directly — the rows seeded by
+       ``_seed_chat_row`` already carry plaintext ``content``, so no decrypt
+       step is needed to exercise the real turn-grouping/windowing SQL and
+       the real ``worker._adaptive_replay_parts`` split logic downstream.
+    """
+    from model_api_runtime.v2 import serve_worker
+
+    def _rows(after_seq, *, limit=None, oldest_first=True, through_seq=None):
+        return db.chat_messages_after_seq(
+            uid, after_seq, limit=limit, oldest_first=oldest_first,
+            through_seq=through_seq,
+        )
+
+    def _messages_after(_uid, after_seq):
+        return [r for r in _rows(after_seq) if r.get("role") in {"user", "human"}]
+
+    def _tail_after(_uid, after_seq, limit, *, through_seq=None):
+        return _rows(after_seq, limit=limit, oldest_first=False, through_seq=through_seq)
+
+    def _summary_with_seq(_uid):
+        return "PRIOR SUMMARY", 0.0, 1, int(watermark_seq)
+
+    def _recent_turns(_uid, max_turns, row_cap, *, through_seq=None):
+        return db.chat_recent_turn_rows(
+            _uid, max_turns=max_turns, row_cap=row_cap, through_seq=through_seq,
+        )
+
+    async def _fake_chat_completion(config, messages, *, tools=None, **_kwargs):
+        return {
+            "reply": "anchor hot-path reply", "tool_calls": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _fake_chat_completion)
+    monkeypatch.setattr(cap_registry, "run_capability", lambda *a, **k: _FakeCapResult())
+    # Bypass the live-enclave envelope build (none in this test process) —
+    # same fake as test_v2_atomic_reply_cursor.py.
+    monkeypatch.setattr(
+        worker.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda _store, _text, *, item_id=None: (_fake_sealed_envelope(str(item_id)), ""),
+    )
+
+    return worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        read_messages_after_seq=_messages_after,
+        read_tail_after_seq=_tail_after,
+        read_compaction_tail_after_seq=_tail_after,
+        read_summary_with_seq=_summary_with_seq,
+        read_recent_turns=_recent_turns,
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+    )
+
+
+def _prefix_before_required(messages, required_first_content):
+    """messages 中 required tail 第一条之前的全部消息（含 system 与摘要块）。"""
+    for index, message in enumerate(messages):
+        if message.get("content") == required_first_content:
+            return messages[:index]
+    raise AssertionError("required tail 的第一条未出现在 prompt 中")
+
+
+def test_prompt_prefix_is_byte_identical_across_consecutive_turns(monkeypatch):
+    """验收标准本身：锚点不变期间，连续两回合的 prompt 前缀逐字节一致。
+
+    这条测试存在的唯一理由，是上一次实施把锚点接到了不影响 prompt 的
+    compact_through_seq 上，而当时的测试（只断言锚点保持/前移、边界查询被跳过）
+    照样全绿。任何「看起来接上了」的实现，都必须先过这一关。
+
+    ``worker._CHAT_TAIL_MAX_TURNS`` 被下调到 3：optional 候选池有 30 轮历史
+    （远大于 3），这样 ``db.chat_recent_turn_rows`` 的 "最近 N 轮" 窗口才会
+    在两个连续回合之间真的移动一整轮——用默认的 40 轮上限、只有 30 轮历史，
+    窗口根本填不满、永远等于全量历史，两回合会碰巧长得一样，测试就测不出
+    正在验收的那个 bug（同样是"看起来测了、其实没测到"的陷阱）。
+    """
+    import json
+
+    uid = "u_optanchor_prefix"
+    seed_user(uid)
+    _reset_anchor_hotpath_user(uid)
+    monkeypatch.setattr(worker, "_CHAT_TAIL_MAX_TURNS", 3)
+
+    # 30 轮历史（60 行，user/openclaw 交替）落在 watermark 之下 → 成为 optional
+    # 重放素材。watermark = 这批历史里最后一行的 seq，即"从未压缩过、但已经有
+    # 一版摘要覆盖到这里"的口径（配合上面改造过的 _summary_with_seq）。
+    seqs = []
+    for i in range(60):
+        role = "user" if i % 2 == 0 else "openclaw"
+        seqs.append(_seed_chat_row(uid, f"{uid}-h{i}", 1000.0 + i, role))
+    watermark = seqs[-1]
+
+    captured: list[list[dict]] = []
+
+    async def _capture_chat_completion(config, messages, *, tools=None, **_kw):
+        captured.append(json.loads(json.dumps(messages, ensure_ascii=False,
+                                              sort_keys=True, default=str)))
+        return {"reply": "ok", "tool_calls": [],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+    deps = _optional_anchor_deps(uid, monkeypatch, watermark_seq=watermark)
+    monkeypatch.setattr(provider_client, "chat_completion_async",
+                        _capture_chat_completion)
+
+    # 两个连续回合，中间只追加一条新用户消息——调用形态照抄归档分支
+    # test_process_job_chat_lane_* 两个集成测试里已经跑通过的写法
+    # （enqueue_job(uid, "chat") / claim_next_job(worker_id) /
+    # process_job(job, deps, provider_config=..., api_key=None,
+    # runtime_token=...)），不套用本文件旧版 docstring 里示意性的参数拼法。
+    for turn in range(2):
+        _seed_chat_row(uid, f"{uid}-new{turn}", 2000.0 + turn, "user")
+        jobs_store.enqueue_job(uid, "chat")
+        job = jobs_store.claim_next_job(f"prefix-worker-{turn}")
+        assert job is not None, "job 未被 claim——rig 没搭对"
+        status = asyncio.run(worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt",
+        ))
+        assert status == "completed", f"回合 {turn} 未 completed：{status!r}"
+
+    assert len(captured) == 2, f"期望两次 provider 调用，实到 {len(captured)}"
+
+    # 陷阱自检：optional 候选池必须真的非空，否则本测试什么也没测到就"通过"了
+    # （见 _optional_anchor_deps 的 docstring）。两个回合的 prompt 里都应该能
+    # 找到至少一条 watermark 之前的历史消息（`_CHAT_TAIL_MAX_TURNS=3` 只留最近
+    # 几轮，所以出现的是 h5x 附近而非最老的 h0——只要有任意一条 "-h" 历史行，
+    # 就证明 optional 候选池非空；一条都没有则说明 rig 又退化回了"全部落进
+    # required"的陷阱状态）。
+    for turn_index, prompt in enumerate(captured):
+        contents = {m.get("content") for m in prompt if isinstance(m, dict)}
+        history_rows = [c for c in contents if isinstance(c, str) and f"{uid}-h" in c]
+        assert history_rows, (
+            f"回合 {turn_index} 的 prompt 里没有任何历史行——optional 候选池为空，"
+            "掉进了 watermark=0 同款陷阱，测试测不到任何东西"
+        )
+
+    first_required = f"plaintext-{uid}-new0"
+    prefix_a = _prefix_before_required(captured[0], first_required)
+    prefix_b = _prefix_before_required(captured[1], first_required)
+
+    assert json.dumps(prefix_a, sort_keys=True, ensure_ascii=False) == \
+           json.dumps(prefix_b, sort_keys=True, ensure_ascii=False), (
+        "两回合之间 prompt 前缀发生了变化——optional 窗口仍在逐轮滑动"
+    )
