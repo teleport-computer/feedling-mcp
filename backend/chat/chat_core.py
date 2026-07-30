@@ -632,13 +632,9 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
     envelope = payload.get("envelope")
     if envelope is None:
         return {"error": "envelope required"}, 400
-    missing = [f for f in _ENVELOPE_REQUIRED if not envelope.get(f)]
-    if missing:
-        return {"error": "envelope_missing_fields", "detail": missing}, 400
-    if envelope["visibility"] not in ("shared", "local_only"):
-        return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
-    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
-        return {"error": "envelope with visibility=shared requires K_enclave"}, 400
+    gate_err = core_envelope.validate_uploaded_envelope(envelope, user_id=store.user_id)
+    if gate_err is not None:
+        return gate_err, 400
     conflict = _stale_key_conflict(store, envelope)
     if conflict is not None:
         return conflict
@@ -783,13 +779,9 @@ def write_response(
     envelope = payload.get("envelope")
     if envelope is None:
         return {"error": "envelope required"}, 400
-    missing = [f for f in _ENVELOPE_REQUIRED if not envelope.get(f)]
-    if missing:
-        return {"error": "envelope_missing_fields", "detail": missing}, 400
-    if envelope["visibility"] not in ("shared", "local_only"):
-        return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
-    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
-        return {"error": "envelope with visibility=shared requires K_enclave"}, 400
+    gate_err = core_envelope.validate_uploaded_envelope(envelope, user_id=store.user_id)
+    if gate_err is not None:
+        return gate_err, 400
     conflict = _stale_key_conflict(store, envelope)
     if conflict is not None:
         return conflict
@@ -812,8 +804,12 @@ def write_response(
             followup_envelope = raw_followup.get("envelope")
             if not isinstance(followup_envelope, dict):
                 return {"error": "file_followup envelope required"}, 400
+            required, shape_err = core_envelope.upload_shape_gate(
+                followup_envelope, user_id=store.user_id)
+            if shape_err is not None:
+                return shape_err, 400
             missing = [
-                field for field in _ENVELOPE_REQUIRED
+                field for field in required
                 if not followup_envelope.get(field)
             ]
             if missing:
@@ -823,10 +819,7 @@ def write_response(
                 }, 400
             if followup_envelope["visibility"] not in ("shared", "local_only"):
                 return {"error": "invalid file_followup visibility"}, 400
-            if (
-                followup_envelope["visibility"] == "shared"
-                and not followup_envelope.get("K_enclave")
-            ):
+            if core_envelope.requires_enclave_key(followup_envelope):
                 return {
                     "error": "shared file_followup requires K_enclave"
                 }, 400
@@ -874,12 +867,16 @@ def write_response(
     if thinking_envelope is not None:
         if not isinstance(thinking_envelope, dict):
             return {"error": "thinking_envelope must be an object"}, 400
-        missing = [f for f in _ENVELOPE_REQUIRED if not thinking_envelope.get(f)]
+        required, shape_err = core_envelope.upload_shape_gate(
+            thinking_envelope, user_id=store.user_id)
+        if shape_err is not None:
+            return shape_err, 400
+        missing = [f for f in required if not thinking_envelope.get(f)]
         if missing:
             return {"error": "thinking_envelope_missing_fields", "detail": missing}, 400
         if thinking_envelope["visibility"] not in ("shared", "local_only"):
             return {"error": "thinking_envelope.visibility must be 'shared' or 'local_only'"}, 400
-        if thinking_envelope["visibility"] == "shared" and not thinking_envelope.get("K_enclave"):
+        if core_envelope.requires_enclave_key(thinking_envelope):
             return {"error": "thinking_envelope with visibility=shared requires K_enclave"}, 400
         conflict = _stale_key_conflict(store, thinking_envelope)
         if conflict is not None:

@@ -161,6 +161,73 @@ def envelope_storage_fields(envelope: dict, *,
     return out
 
 
+_UPLOAD_COMMON_REQUIRED = ("visibility", "owner_user_id")
+_UPLOAD_SEALED_REQUIRED = ("body_ct", "nonce", "K_user", *_UPLOAD_COMMON_REQUIRED)
+
+
+def upload_shape_gate(envelope, *, user_id: str) -> tuple[tuple[str, ...], dict | None]:
+    """客户端上传信封的**形状策略**：返回 ``(该校验的必填字段, 拒绝原因或 None)``。
+
+    抽出来单独一个是因为各写闸的错误消息**格式互不相同**（``envelope_missing_fields``
+    带 ``detail`` / 带 ``missing`` / f-string / 加前缀四种方言），而客户端按各自
+    的格式读。策略集中在这里，消息仍由各站点自己写。
+
+    形状不认识（既无 ``body_ct`` 也无 ``body``）时按信封报必填——「想传信封但漏了
+    字段」是更常见的意图。
+    """
+    if not isinstance(envelope, dict):
+        return _UPLOAD_SEALED_REQUIRED, None
+    if envelope.get("body_ct") or envelope.get("body") is None:
+        return _UPLOAD_SEALED_REQUIRED, None
+    if resolve_content_encryption(user_id) != "off":
+        # 否则任何客户端都能单方面把自己的加密档降级成明文——用户在设置页开着
+        # 加密、内容却已明文落库。这是本计划最严重失败模式的客户端版本。
+        return _UPLOAD_COMMON_REQUIRED, {
+            "error": "plaintext_envelope_not_enabled_for_this_account"}
+    if envelope.get("visibility") == "local_only":
+        # local_only 靠的是没有 K_enclave；一行明文服务端天然读得到，标成
+        # local_only 等于给用户一个假的隐私承诺。与 swap 通道同一条边界。
+        return _UPLOAD_COMMON_REQUIRED, {
+            "error": "plaintext_envelope_cannot_be_local_only"}
+    return _UPLOAD_COMMON_REQUIRED, None
+
+
+def requires_enclave_key(envelope) -> bool:
+    """这一行是否受「shared 必须有 K_enclave」那道闸约束（只有信封行受）。"""
+    return (isinstance(envelope, dict)
+            and bool(envelope.get("body_ct"))
+            and envelope.get("visibility") == "shared"
+            and not envelope.get("K_enclave"))
+
+
+def validate_uploaded_envelope(envelope, *, user_id: str) -> dict | None:
+    """校验**客户端上传**的内容信封，按行形状路由。
+
+    返回 ``None`` 表示通过，否则是错误 body（调用方补 400）。chat / memory /
+    identity 的 9 处写闸原本消息逐字相同，故收成这一个；**信封分支的判据与消息
+    全部沿用改造前**，明文分支是新增的。
+
+    明文分支默认**关闭**：只有生效形状为 ``"off"`` 才收。否则任何客户端都能
+    单方面把自己的加密档降级成明文——用户在设置页开着加密、内容却已明文落库，
+    这是本计划最严重失败模式的客户端版本。
+    """
+    if not isinstance(envelope, dict):
+        return {"error": "envelope required"}
+
+    required, shape_err = upload_shape_gate(envelope, user_id=user_id)
+    if shape_err is not None:
+        return shape_err
+
+    missing = [f for f in required if not envelope.get(f)]
+    if missing:
+        return {"error": "envelope_missing_fields", "detail": missing}
+    if envelope["visibility"] not in ("shared", "local_only"):
+        return {"error": "envelope.visibility must be 'shared' or 'local_only'"}
+    if requires_enclave_key(envelope):
+        return {"error": "envelope with visibility=shared requires K_enclave"}
+    return None
+
+
 def replace_record_shape(record: dict, envelope: dict) -> None:
     """原地把 ``record`` 的内容字段换成 ``envelope`` 的形状（swap / rewrap 用）。
 

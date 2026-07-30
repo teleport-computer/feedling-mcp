@@ -381,6 +381,33 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
 
 ### Task 2.2: 写侧格式路由
 
+#### 2026-07-30：客户端写闸按形状路由（10 处，Task 2.2 最后一步）
+
+写闸原本一律硬要 `body_ct/nonce/K_user` 且「shared 必须有 K_enclave」——明文信封
+会被拦死。普查到 **10 处**，全部迁完：`chat_core` ×4（主 send / 另一条 send /
+file_followup / thinking_envelope）、`memory_core` ×1、`memory/actions` ×2、
+`identity_core` ×2、`worldbook_core` ×1。
+
+**策略集中、消息分散**：这些写闸的错误消息有**四种方言**
+（`envelope_missing_fields` 带 `detail` / 带 `missing` / f-string / 加前缀），
+客户端各按自己那套读。所以形状策略抽成 `core.envelope.upload_shape_gate()` +
+`requires_enclave_key()`，**各站点的消息逐字不动**；只有 chat/memory 那三处消息
+本来就完全相同的，才真收口成 `validate_uploaded_envelope()`。
+
+**明文分支默认关闭**：`upload_shape_gate` 只在生效形状为 `"off"` 时才收明文。
+否则任何客户端都能**单方面把自己的加密档降级成明文**——用户在设置页开着加密、
+内容却已明文落库。这是本计划最严重失败模式的客户端版本，
+`tests/test_uploaded_envelope_gate.py` 有专门一条锁它。
+
+明文 + `local_only` 同样拒（与 swap 通道同一条边界）。
+
+L1 **7262 passed / 0 failed**。
+
+> **至此 Task 2.2 / 2.3 全部完成，现网仍然一行明文都不会产生。**
+> 唯一剩下的动作是把 `core.envelope.PLAINTEXT_WRITES_ACCEPTED` 翻成 `True`
+> ——那一刻服务端自产内容、客户端上传、whoami 下发的 effective 值**同时**切换。
+> **这是上线开关，需要人拍板**，不是代码收尾。
+
 - [ ] 各写闸（`chat/chat_core.py` 含 `caption_envelope`、`memory/memory_core.py`、
       `identity/identity_core.py`、`worldbook/worldbook_core.py`、
       `genesis/genesis_core.py`，07-23 快照行号细案重扫）：明文档用户接受

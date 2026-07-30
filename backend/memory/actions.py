@@ -199,13 +199,16 @@ def _memory_validate_prebuilt_envelope(
     memory_id: str = "",
     enforce_reflection_cap: bool = True,
 ) -> tuple[bool, dict | None]:
-    required = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
+    required, shape_err = core_envelope.upload_shape_gate(
+        envelope, user_id=store.user_id)
+    if shape_err is not None:
+        return False, shape_err
     missing = [field for field in required if not envelope.get(field)]
     if missing:
         return False, {"error": "envelope_missing_fields", "missing": missing}
     if envelope["visibility"] not in ("shared", "local_only"):
         return False, {"error": "envelope_visibility_invalid", "allowed": ["shared", "local_only"]}
-    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
+    if core_envelope.requires_enclave_key(envelope):
         return False, {"error": "envelope_shared_requires_K_enclave"}
     occurred_at = _memory_action_text(envelope.get("occurred_at"), 80)
     if not occurred_at:
@@ -536,12 +539,16 @@ def _memory_upgrade_envelope_action(store: UserStore, action: dict) -> tuple[dic
     if not memory_id:
         return {"status": "error", "error": "memory_id_required", "action": "memory.upgrade"}, [], 400
     envelope = dict(action.get("envelope") or {})
-    missing = [f for f in ("body_ct", "nonce", "K_user", "visibility", "owner_user_id") if not envelope.get(f)]
+    required, shape_err = core_envelope.upload_shape_gate(
+        envelope, user_id=store.user_id)
+    if shape_err is not None:
+        return {"status": "error", **shape_err, "action": "memory.upgrade"}, [], 400
+    missing = [f for f in required if not envelope.get(f)]
     if missing:
         return {"status": "error", "error": "envelope_missing_fields", "missing": missing, "action": "memory.upgrade"}, [], 400
     if envelope["owner_user_id"] != store.user_id:
         return {"status": "error", "error": "not_owned", "action": "memory.upgrade"}, [], 403
-    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
+    if core_envelope.requires_enclave_key(envelope):
         return {"status": "error", "error": "envelope_shared_requires_K_enclave", "action": "memory.upgrade"}, [], 400
     old_body_hash = _memory_action_text(action.get("old_body_hash"), 80)
     return _memory_upgrade_apply(store, memory_id=memory_id, envelope=envelope, old_body_hash=old_body_hash)

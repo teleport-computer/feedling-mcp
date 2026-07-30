@@ -20,6 +20,7 @@ from datetime import datetime
 import os
 
 from content.content_core import _apply_envelope_fields, _swap_envelope_missing
+from core import envelope as core_envelope
 import debug_trace
 import worldbook_readside_core
 
@@ -40,6 +41,10 @@ def _request_envelope(payload: dict) -> tuple[dict | None, str | None]:
 
 
 def _validate_envelope(env: dict, owner_user_id: str) -> str | None:
+    # 明文形状的准入（_swap_envelope_missing 只管字段齐不齐，不管准不准）。
+    _, shape_err = core_envelope.upload_shape_gate(env, user_id=owner_user_id)
+    if shape_err is not None:
+        return str(shape_err.get("error") or "envelope_shape_rejected")
     missing = _swap_envelope_missing(env)
     if missing:
         return f"envelope missing {missing}"
@@ -48,7 +53,7 @@ def _validate_envelope(env: dict, owner_user_id: str) -> str | None:
         return "id required"
     if str(env.get("visibility") or "") not in {"shared", "local_only"}:
         return "envelope.visibility must be 'shared' or 'local_only'"
-    if env.get("visibility") == "shared" and not env.get("K_enclave"):
+    if core_envelope.requires_enclave_key(env):
         return "shared visibility requires K_enclave"
     if env.get("owner_user_id") != owner_user_id:
         return "owner_user_id does not match caller"

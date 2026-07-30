@@ -111,13 +111,16 @@ def init_identity(store, payload: dict) -> tuple[dict, int]:
             # public-key material, not a malformed request -> 409, not 400.
             return {"error": build_err or "identity_envelope_failed"}, 409
         envelope = built
-    required = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
+    required, shape_err = core_envelope.upload_shape_gate(
+        envelope, user_id=store.user_id)
+    if shape_err is not None:
+        return shape_err, 400
     missing = [f for f in required if not envelope.get(f)]
     if missing:
         return {"error": f"envelope missing fields: {missing}"}, 400
     if envelope["visibility"] not in ("shared", "local_only"):
         return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
-    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
+    if core_envelope.requires_enclave_key(envelope):
         return {"error": "envelope with visibility=shared requires K_enclave"}, 400
     # Defense-in-depth: refuse envelopes whose claimed owner_user_id doesn't
     # match the authenticated caller. The enclave's AEAD AAD check would also
@@ -197,13 +200,16 @@ def replace_identity(store, payload: dict) -> tuple[dict, int]:
     if envelope is None:
         return {"error": "envelope required for replace; use /v1/identity/init for plaintext"}, 400
 
-    required = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
+    required, shape_err = core_envelope.upload_shape_gate(
+        envelope, user_id=store.user_id)
+    if shape_err is not None:
+        return shape_err, 400
     missing = [f for f in required if not envelope.get(f)]
     if missing:
         return {"error": f"envelope missing fields: {missing}"}, 400
     if envelope["visibility"] not in ("shared", "local_only"):
         return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
-    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
+    if core_envelope.requires_enclave_key(envelope):
         return {"error": "envelope with visibility=shared requires K_enclave"}, 400
     # Defense-in-depth: same owner check identity_init now does. See comment
     # there for why.
