@@ -153,6 +153,17 @@ ORDERED_REPLY_TARGET_POLICY = (
     "answers to those earlier messages."
 )
 
+
+def chat_system_prompt() -> str:
+    """CHAT_SYSTEM_PROMPT, plus the self-authored-thinking instruction when the
+    self-thinking kill switch is on (v1). Appended as a suffix so the cache-stable
+    prefix is unchanged when the switch is off (byte-identical to today)."""
+    from model_api_runtime.v2 import self_thinking
+
+    if self_thinking.enabled():
+        return CHAT_SYSTEM_PROMPT + self_thinking.INSTRUCTION
+    return CHAT_SYSTEM_PROMPT
+
 ACTION_CONTEXT_CHAR_CAP = 8000
 PER_ACTION_CHAR_CAP = 2000
 _BLOB_KEYS = frozenset({"image_b64"})

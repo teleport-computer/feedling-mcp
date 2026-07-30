@@ -190,6 +190,7 @@ if not _provisioned:
         # 无 PG 时会被下面的 collect_ignore 静默忽略）。它自己不碰 DB，必须
         # 留在可收集列表里，否则连它也会被忽略。
         "test_tee_registry_guard_enforced.py",
+        "test_self_thinking_parse.py",
     }
     collect_ignore = sorted(
         f

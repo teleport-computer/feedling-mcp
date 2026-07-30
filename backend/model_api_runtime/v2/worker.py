@@ -9527,6 +9527,18 @@ async def process_job(
             nonlocal final_job_completed_atomically, voice_reply_slot
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             text = "" if file_reply is not None else str(text or "").strip()
+            # v1 self-authored thinking (all models, incl. relay): when enabled,
+            # peel the model's leading 💭 line into the thinking channel and reply
+            # with the clean body. Fail-open — no marker → reply byte-identical and
+            # the native reasoning (if any) is kept.
+            if file_reply is None and text:
+                from model_api_runtime.v2 import self_thinking
+
+                if self_thinking.enabled():
+                    _self_thinking, _clean_reply = self_thinking.split_thinking(text)
+                    text = _clean_reply.strip()
+                    if _self_thinking:
+                        reasoning = _self_thinking
             if file_reply is not None and final:
                 raise RuntimeError("a file reply cannot be terminal")
             turn_failure_error_class = ""
@@ -9998,7 +10010,7 @@ async def process_job(
 
         def _chat_builder():
             return _make_build_messages_fn(
-                system_prompt=context.CHAT_SYSTEM_PROMPT,
+                system_prompt=context.chat_system_prompt(),
                 summary=summary,
                 tail=tail,
                 extra_context=turn_extra_context,
