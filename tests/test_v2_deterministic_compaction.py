@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import pathlib
 import sys
 
@@ -314,10 +315,34 @@ def test_metadata_frontier_reconstructs_exact_text_without_decrypt(monkeypatch):
     ]
 
 
+def test_deterministic_coverage_flag_is_strictly_allowlisted(monkeypatch):
+    name = "FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC"
+    monkeypatch.delenv(name, raising=False)
+    assert worker._allowlisted_bool_env(name) is False
+    for value in ("", "0", "false", "no", "off", "garbage", "2"):
+        monkeypatch.setenv(name, value)
+        assert worker._allowlisted_bool_env(name) is False
+    for value in ("1", "true", "TRUE", "yes", "on", " On "):
+        monkeypatch.setenv(name, value)
+        assert worker._allowlisted_bool_env(name) is True
+
+
+def test_coverage_queries_share_one_synthetic_source_predicate():
+    for query in (
+        worker.db.chat_messages_after_seq,
+        worker.db.chat_coverage_bounds_after_seq,
+        worker.db.count_messages_after_seq,
+    ):
+        assert "_CHAT_COVERAGE_SOURCE_PREDICATE" in inspect.getsource(query)
+
+
 def test_phala_worker_composes_wire_deterministic_flag_default_off():
     setting = (
         'FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: '
         '"${FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC:-0}"'
+    )
+    deployment_guard = (
+        "# DO NOT set to 1 before M5 MEMORY/USER prompt injection is deployed."
     )
     for name in (
         "docker-compose.phala.yaml",
@@ -326,3 +351,4 @@ def test_phala_worker_composes_wire_deterministic_flag_default_off():
     ):
         text = (ROOT / "deploy" / name).read_text()
         assert text.count(setting) == 1, name
+        assert text.count(deployment_guard) == 1, name

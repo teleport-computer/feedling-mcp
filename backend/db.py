@@ -5297,6 +5297,12 @@ def chat_max_user_seq_between(
     return int(row[0]) if row and row[0] is not None else 0
 
 
+_CHAT_COVERAGE_SOURCE_PREDICATE = (
+    "COALESCE(doc->>'source','') "
+    "NOT IN ('verify_ping','resident_maintenance')"
+)
+
+
 def chat_messages_after_seq(
     user_id: str,
     after_seq: int,
@@ -5344,7 +5350,7 @@ def chat_messages_after_seq(
         # (count_messages_after_seq) and both frontier witnesses
         # (jobs_store.get_summary_frontier_state / append_summary_leaf_cas)
         # exclude the SAME set, so coverage stays consistent under GC.
-        predicate += " AND COALESCE(doc->>'source','') NOT IN ('verify_ping','resident_maintenance')"
+        predicate += f" AND {_CHAT_COVERAGE_SOURCE_PREDICATE}"
     with get_pool().connection() as conn:
         if limit is None:
             rows = conn.execute(
@@ -5409,8 +5415,7 @@ def chat_coverage_bounds_after_seq(
 
     predicate = (
         "WHERE user_id=%s AND seq>%s "
-        "AND COALESCE(doc->>'source','') "
-        "NOT IN ('verify_ping','resident_maintenance') "
+        f"AND {_CHAT_COVERAGE_SOURCE_PREDICATE} "
     )
     params: list = [str(user_id), cursor_seq]
     if upper_seq is not None:
@@ -5621,7 +5626,7 @@ def count_messages_after_seq(
         # See chat_messages_after_seq: coverage gap detection must not count
         # GC-able synthetic rows, or it would demand folding a row that
         # verify_loop is about to delete (permanent frontier corruption).
-        predicate += " AND COALESCE(doc->>'source','') NOT IN ('verify_ping','resident_maintenance')"
+        predicate += f" AND {_CHAT_COVERAGE_SOURCE_PREDICATE}"
     with get_pool().connection() as conn:
         row = conn.execute(
             f"SELECT COUNT(*) FROM chat_messages {predicate}",

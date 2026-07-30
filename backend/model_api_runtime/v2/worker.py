@@ -196,6 +196,16 @@ def _positive_int_env(name: str, default: str) -> int:
     return value
 
 
+def _allowlisted_bool_env(name: str, default: str = "0") -> bool:
+    """Enable a rollout flag only for an explicit affirmative value."""
+    return str(os.environ.get(name, default)).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _nonnegative_int_env(name: str, default: str) -> int:
     raw = os.environ.get(name, default)
     try:
@@ -499,9 +509,12 @@ _COMPACTION_BATCH = _positive_int_env("FEEDLING_V2_COMPACTION_BATCH_MSGS", "200"
 _COMPACTION_BATCH_CHARS = _positive_int_env(
     "FEEDLING_V2_COMPACTION_BATCH_CHARS", "120000"
 )
-_PROFILE_COVERAGE_DETERMINISTIC = os.environ.get(
-    "FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC", "0"
-).strip().lower() not in {"0", "false", "no", "off"}
+# Operational dependency: DO NOT enable this before M5 MEMORY/USER prompt
+# injection is deployed. Until then, deterministic count sentinels replace the
+# model-written summary head without supplying the long-term context elsewhere.
+_PROFILE_COVERAGE_DETERMINISTIC = _allowlisted_bool_env(
+    "FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC"
+)
 _SUMMARY_ROLLUP_FANOUT = _positive_int_env(
     "FEEDLING_V2_SUMMARY_ROLLUP_FANOUT", "8"
 )

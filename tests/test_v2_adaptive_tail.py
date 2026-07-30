@@ -14,6 +14,13 @@ from model_api_runtime.v2 import jobs_store  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _provider_backed_targeted_catchup(monkeypatch):
+    # Targeted catch-up in this suite specifies the provider-backed fold path;
+    # deterministic metadata catch-up has its own rollout-mode suite.
+    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
+
+
 def _row(seq: int, role: str, content: str, *, genuine: bool | None = None) -> dict:
     row = {
         "seq": seq,

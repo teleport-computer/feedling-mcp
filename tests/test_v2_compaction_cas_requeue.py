@@ -31,7 +31,11 @@ _BYOK = provider_client.ProviderConfig(
 
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
+    # These tests specify the legacy provider-fold CAS branch. The
+    # deterministic CAS branch has dedicated coverage in
+    # test_v2_deterministic_compaction.py.
+    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
     # claim_next_job claims globally (no user_id filter) — truncate so a
     # leftover pending job from another test file can't get claimed here.
     with db.get_pool().connection() as conn:

@@ -49,7 +49,11 @@ class _FakeCapResult:
 
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
+    # This file primarily specifies the provider-backed fallback path. Keep
+    # those assertions stable when the CI matrix sets the rollout flag ON;
+    # the deterministic integration test below opts back in explicitly.
+    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
     # claim_next_job is a GLOBAL claim (no user_id filter, by design). A pending
     # job left behind by another test file (e.g. the D3 claim-reservation / wake
     # tests enqueue jobs for other users) would pollute this test's global claim
