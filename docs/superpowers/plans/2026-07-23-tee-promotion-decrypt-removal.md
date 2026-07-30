@@ -200,12 +200,35 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
         `test_sync_tick_surfaces_verify_decrypt_failures`，均先验证过 RED
         （分别是 `RuntimeError` 冒泡、`KeyError: 'decrypt_failures'`）。
       - 未加 DB 列：计数走已有的 `report` JSONB，避免与在途分支抢 alembic 版本号。
-- [ ] ⚠️ **验收标准需改写**（原标准不可执行）：`FEEDLING_TEE_RECONCILE_INTERVAL_SEC`
-      默认 86400s，reconcile 成功后 24h 内 `reconcile_ok` 恒为 NULL——「连续 3 个
-      tick `reconcile_ok=t`」要等 3 天，且只在**反复失败重试**时才可能连续出现，
-      自相矛盾。改判见细案 §4：连续 3 趟 `did_reconcile=t` 的 tick 全 ok，**并
-      新增 verify 侧验收**「`verify_ran=t` 且 `decrypt_failures=0`、
-      `unconverged_tables=0`」——后者才是本 Task 真正要保证的东西。
+- [x] **验收标准已改写**（2026-07-31）。原标准「连续 3 个 tick `reconcile_ok=t`」
+      不可执行：`FEEDLING_TEE_RECONCILE_INTERVAL_SEC` 默认 86400s，reconcile 成功
+      后 24h 内 `reconcile_ok` 恒为 NULL，所以「连续 3 个 tick 都为 t」要么等 3 天、
+      要么只可能出现在**反复失败重试**时——把「健康」定义成了「刚失败过」，自相矛盾。
+
+      **新验收标准**（三条全过才算 Task 0.2 出口）：
+
+      1. **reconcile 侧**：最近 3 趟**真的执行了** reconcile 的 tick
+         （`did_reconcile = true`）全部 `reconcile_ok = true`。
+         判据 SQL：
+         ```sql
+         SELECT started_at, reconcile_ok
+         FROM tee_sync_runs
+         WHERE did_reconcile
+         ORDER BY started_at DESC
+         LIMIT 3;
+         ```
+      2. **verify 侧（本 Task 真正要保证的东西）**：最近一趟 `verify_ran = true`
+         的 tick 满足 `report->'verify'->>'decrypt_failures' = '0'` 且
+         `report->'verify'->'unconverged'` 为空数组。
+         —— 毒行修复的**直接**判据就是它：`decrypt_failures` 是本 Task 新加的指标，
+         原标准里根本没有它，而「reconcile 没报错」并不能证明毒行不再冲垮 verify。
+      3. **不再被静默吞掉**：`verify_ran` 在最近 24h 内至少为 true 一次。
+         2026-07-28 prod 的病征正是 `verify_ran` 恒 false——一条毒行让 verify 整趟
+         抛异常、被 scheduler 的兜底 except 吞掉，收敛度彻底失去量测却毫无告警。
+
+      ⚠️ Task 2.4 的 carry-verbatim 上线后，**加密档用户的行不再解密**，
+      `decrypt_failures` 对他们恒为 0。届时第 2 条只能证明「明文档用户没毒行」，
+      加密档的对账健康要看密文逐字比对的 mismatch 数（`verify._expected_doc`）。
 
 ### Task 0.6: TEE 迁移落地机制（**已由独立工作流承接**）
 
@@ -243,14 +266,24 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
       **RTO ≈ 7 分钟**（backup-fetch 141s + WAL 回放 240s + 启动/修正 ~30s；
       本机 arm64 跑 amd64 镜像走模拟，属**上限**）；**RPO ≈ 0**（恢复点
       13:34:36，演练 13:25 启动 —— WAL 归档及时）。
-- [ ] ⚠️ **演练发现 `restore.sh` 有一处真缺陷，扶正前应修**：线上
-      `max_connections=400` 是部署参数注入的、**不在备份的 `postgresql.conf` 里**，
-      恢复端默认 100 → 回放直接 `FATAL: recovery aborted because of insufficient
-      parameter settings`。演练靠手工追加参数才继续。建议 `restore.sh` 写 recovery
-      配置时一并写入 `max_connections`（及同类 `max_worker_processes` /
-      `max_prepared_transactions` / `max_locks_per_transaction`，PG 对这些都有
-      「≥ primary」硬要求）。另两处非阻塞坑（`pg_ctl` 不在 PATH、恢复实例无
-      `postgres` 角色）见 §5.3。
+- [x] **`restore.sh` 缺陷已修**（2026-07-31）。原缺陷：线上 `max_connections=400`
+      是部署参数注入的（compose `-c max_connections=400`）、**不在备份带出来的
+      `postgresql.conf` 里**，恢复端默认 100 → 回放直接
+      `FATAL: recovery aborted because of insufficient parameter settings`。
+      演练当时是手工追加参数才继续的。
+
+      **修法不是写死 400**，而是从刚取回的 backup 的 `pg_control` 里读主库当时的
+      真实值（`pg_controldata`）—— 主库调参后脚本自动跟上，不会漂移。覆盖 PG 有
+      「≥ primary」硬要求的全部五个参数，并处理了标签与参数名不同名的映射
+      （`max_prepared_xacts` → `max_prepared_transactions`、
+      `max_locks_per_xact` → `max_locks_per_transaction`）。
+
+      已用真 `postgres:18` 实测：注入 `max_connections=400 max_locks_per_transaction=128`
+      起停一次后，提取逻辑从 pg_control 读回 400 / 128，正是演练撞的场景。
+
+      另两处非阻塞坑一并处理：`pg_ctl` 不在 PATH（从 `pg_controldata` 反推 PGBIN
+      并前置到 PATH）、恢复实例无 `postgres` 角色（脚本末尾打印提示，要用
+      `-U <owner>` 连）。
 - [x] prod 备份链健康核查：`wal-g backup-list` 最新 base backup < 24h。
       **（2026-07-28 完成）** 最新 `base_00000001000001E3000000D3 @
       2026-07-28T03:00:22Z`，距核查约 8.8h；07-25/26/27/28 每天 03:00 各一条，
