@@ -75,3 +75,48 @@ def test_reply_with_stray_close_tag_is_failopen():
     thinking, reply = st.split_thinking(original)
     assert thinking == ""
     assert reply == original
+
+
+# --- 残缺/截断防泄漏(hx: 同 JSON 尾巴泄露那类风险) --------------------------
+
+def test_unclosed_think_never_leaks_tag():
+    # 模型写了 <think> 但没闭合(截断/忘了收尾) → 绝不能把 <think 漏进正文
+    t, r = st.split_thinking("<think>我在想怎么回答，但是被截断了")
+    assert "<think" not in r and "</think" not in r
+
+
+def test_truncated_inside_open_tag_no_leak():
+    # 连开标签都没写完 "<think"(没有 '>') → 不能漏 '<think'
+    for frag in ("<think", "<thin", "<think ", "  <think"):
+        t, r = st.split_thinking(frag)
+        assert "<think" not in r.lower()
+
+
+def test_unclosed_with_body_shows_body_not_tag():
+    # <think>思考...(截断) → 内容当正文, 不留标签, 不空气泡
+    t, r = st.split_thinking("<think>我先想想怎么回你")
+    assert r == "我先想想怎么回你"
+    assert "<" not in r
+
+
+def test_stray_close_after_leading_open_scrubbed():
+    # 开标签在前 + 正文里混了个孤立 </think> → 正文里不能留 </think>
+    t, r = st.split_thinking("<think>想</think>正文里不该有 </think> 这个")
+    assert "</think" not in r
+    assert t == "想"
+
+
+def test_malformed_never_leaks_any_think_tag_property():
+    # 一批畸形输入, 断言正文里永远不出现裸 <think 或 </think
+    for s in [
+        "<think>a</think>b",
+        "<think>a",
+        "<think",
+        "<thinking>x",
+        "<think></think>",
+        "<think>only</think>",
+        "正常回复没有标签",
+    ]:
+        _t, r = st.split_thinking(s)
+        assert "<think" not in r.lower(), f"leaked open in: {s!r} -> {r!r}"
+        assert "</think" not in r.lower(), f"leaked close in: {s!r} -> {r!r}"

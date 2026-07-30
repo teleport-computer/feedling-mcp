@@ -26,13 +26,17 @@ import unicodedata
 MAX_THINKING_CHARS = 240
 
 # Same tag set the V1 consumer's _split_tagged_thinking accepts, so whichever tag
-# a model emits is handled identically on both runtimes.
-_THINK_RE = re.compile(
-    r"<\s*(?P<tag>think|thinking|reasoning|thought)\s*>\s*"
-    r"(?P<body>.*?)"
-    r"\s*<\s*/\s*(?P=tag)\s*>",
-    re.IGNORECASE | re.DOTALL,
-)
+# a model emits is handled identically on both runtimes. Longest alternatives
+# first so "thinking" is not shadowed by the "think" prefix.
+_TAGS = r"thinking|reasoning|thought|think"
+# A leading opener, possibly still truncated (no '>' yet): only the START of the
+# reply is treated as ours (the instruction says "at the very start"), so a
+# ``<think>`` deep inside legitimate reply text is left untouched.
+_OPEN_ANY = re.compile(rf"^\s*<\s*(?:{_TAGS})\b", re.IGNORECASE)
+_OPEN_FULL = re.compile(rf"^\s*<\s*({_TAGS})\s*>", re.IGNORECASE)
+# Any think tag fragment — used to SCRUB the reply so a stray/torn tag can never
+# render to the user (same class of defense as the protocol-JSON tail-leak fix).
+_TAG_FRAG = re.compile(rf"</?\s*(?:{_TAGS})\s*>?", re.IGNORECASE)
 
 # Kill switch, DEFAULT ON (hx: this feature ships enabled — tested on test, on in
 # main). It is a rollback闸, not a feature gate: set the env var to 0/false/off to
@@ -67,29 +71,51 @@ def _sanitize(value: str) -> str:
     return " ".join("".join(out).split()).strip()[:MAX_THINKING_CHARS]
 
 
+def _scrub(text: str) -> str:
+    """Remove any think-tag fragment so a torn/stray tag can never reach the user."""
+    return _TAG_FRAG.sub("", text)
+
+
 def split_thinking(text: str) -> tuple[str, str]:
     """Return ``(thinking, reply)``.
 
-    Peels ``<think>…</think>`` block(s) into ``thinking``; ``reply`` is the
-    remaining text. No block → ``("", original)`` unchanged (fail-open). If
-    peeling would leave an empty reply (model put everything inside the block),
-    the block content becomes the reply and thinking is empty.
+    Peels a LEADING ``<think>…</think>`` block into ``thinking`` and returns the
+    remaining ``reply``. Only a leading opener is treated as ours (the instruction
+    says "at the very start"), so a ``<think>`` deep inside a legitimate reply is
+    left alone.
+
+    Robust against malformed / truncated output (same risk class as the
+    protocol-JSON tail leak): a raw ``<think>``/``</think>`` fragment must NEVER
+    render to the user.
+
+    - no leading opener            → ``("", original)`` byte-identical (fail-open)
+    - opener truncated before '>'  → ``("", "")`` (nothing usable; no tag leaks)
+    - opener with no closing tag   → all content is the reply, tag stripped
+    - complete block               → body is thinking, remainder is reply
+    - empty reply after peeling    → the block content becomes the reply (never an
+                                     empty bubble), tags scrubbed either way
     """
     raw = str(text or "")
-    blocks: list[str] = []
-
-    def _collect(m: "re.Match") -> str:
-        body = (m.group("body") or "").strip()
-        if body:
-            blocks.append(body)
-        return ""
-
-    stripped = _THINK_RE.sub(_collect, raw)
-    if not blocks:
-        return "", raw  # fail-open: reply byte-identical to the original
-    reply = re.sub(r"\n{3,}", "\n\n", stripped).strip()
-    joined = " ".join(blocks)
+    if not _OPEN_ANY.match(raw):
+        return "", raw  # fail-open: no leading think opener → reply untouched
+    m = _OPEN_FULL.match(raw)
+    if not m:
+        # The opener itself is truncated ("<think" with no '>') — drop it entirely
+        # so the partial tag never leaks; the turn's degenerate/empty handling
+        # produces a proper fallback.
+        return "", ""
+    tag = m.group(1)
+    after = raw[m.end():]
+    close = re.search(rf"<\s*/\s*{re.escape(tag)}\s*>", after, re.IGNORECASE)
+    if close:
+        thinking_raw, reply = after[: close.start()], after[close.end():]
+    else:
+        # Opener present, closing tag missing (truncated) — treat all content as
+        # thinking; there is no separate reply body.
+        thinking_raw, reply = after, ""
+    reply = re.sub(r"\n{3,}", "\n\n", _scrub(reply)).strip()
     if not reply:
-        # Everything was inside the block — don't emit an empty reply.
-        return "", joined.strip()
-    return _sanitize(joined), reply
+        # No reply body → surface the think content as the reply (never empty,
+        # never a leaked tag).
+        return "", _scrub(thinking_raw).strip()
+    return _sanitize(thinking_raw), reply
