@@ -6828,12 +6828,13 @@ def call_agent_cli(
             "template (e.g. claude -p \"{message}\")."
         )
     isolated_sid = _new_agent_session_id() if isolated_session else None
-    cmd, stdin_msg = _prepare_cli_command(
-        message,
-        image_paths=image_paths,
-        lane=lane,
-        session_id_override=isolated_sid,
-    )
+    prepare_kwargs: dict[str, Any] = {
+        "image_paths": image_paths,
+        "lane": lane,
+    }
+    if isolated_sid is not None:
+        prepare_kwargs["session_id_override"] = isolated_sid
+    cmd, stdin_msg = _prepare_cli_command(message, **prepare_kwargs)
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     _turn_t0 = time.monotonic()
@@ -7521,18 +7522,25 @@ def call_agent(
             # http path metrics/timing are out of scope for this event pair (cli-only);
             # trace_id is accepted here for a uniform call signature but unused.
             # lane gates MCP injection, which only exists on the cli path — unused here.
-            return call_agent_http(
-                message,
-                images=images,
-                raw_text=raw_text,
-                isolated_session=isolated_session,
-            )
+            http_kwargs: dict[str, Any] = {
+                "images": images,
+                "raw_text": raw_text,
+            }
+            if isolated_session:
+                http_kwargs["isolated_session"] = True
+            return call_agent_http(message, **http_kwargs)
         if AGENT_MODE == "cli":
-            return call_agent_cli(
-                message, image_paths=image_paths, raw_text=raw_text,
-                trace_id=trace_id, lane=lane, attempt_trigger=attempt_trigger,
-                stream_update=stream_update,
-                isolated_session=isolated_session)
+            cli_kwargs: dict[str, Any] = {
+                "image_paths": image_paths,
+                "raw_text": raw_text,
+                "trace_id": trace_id,
+                "lane": lane,
+                "attempt_trigger": attempt_trigger,
+                "stream_update": stream_update,
+            }
+            if isolated_session:
+                cli_kwargs["isolated_session"] = True
+            return call_agent_cli(message, **cli_kwargs)
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
     raw = _call_with_resident_busy_poll(_invoke, lane=lane)
@@ -13185,7 +13193,11 @@ def _process_messages(messages: list) -> float:
                 )
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
-            if content_type == "image" and not isinstance(e, VisionObserverFailure):
+            if (
+                content_type == "image"
+                and not isinstance(e, VisionObserverFailure)
+                and classify_agent_error(e).error_class != "vision_model_required"
+            ):
                 e = VisionObserverFailure(
                     _vision_probe_error_code(e),
                     detail=type(e).__name__,
