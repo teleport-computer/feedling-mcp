@@ -302,6 +302,33 @@ def _diff_docs(table: str, user_id: str, item_id: str, expected: dict, actual, p
     return out
 
 
+def _expected_doc(user_id: str, doc: dict, transform, decrypt_cache: dict):
+    """RDS 行 → TEE 里**应当**是什么。返回 ``(expected, decrypt_error)``。
+
+    对账口径必须跟着搬运口径走（Task 2.4）：加密档的行复制层不解密，verify 若还
+    按「密文解开 == TEE 明文」比对，每一行都会报 mismatch——一趟全红等于失去量测。
+    加密档改成**密文逐字比对**，比解密后比对更快也更可靠，且不占 enclave。
+
+    ``(None, None)``  = PendingDeviceMigration：RDS 侧刚变成不可解（local_only /
+    无 K_enclave）、worker 还没来得及落 pending 行。不是真实的内容 mismatch，跳过
+    （行数核算那一侧会照实反映 rds>tee，真不该发生会在那里报出来）。
+
+    ``(None, "...")`` = 解不开。调用方记成 mismatch 而**不是**跳过：跳过等于宣称
+    「两库一致」，会用虚假的全绿掩盖真问题，比崩掉更危险。2026-07-28 prod 就是
+    一条 "envelope missing body_ct" 让 verify 整趟抛异常、再被 tee_sync_scheduler
+    的兜底 except 静默吞掉 → verify_ran 24h 恒 false。
+    """
+    if _worker._carries_verbatim(user_id):
+        return transforms.carry_verbatim(doc), None
+    decrypt = _get_decrypt(decrypt_cache, user_id)
+    try:
+        return transform(doc, decrypt), None
+    except transforms.PendingDeviceMigration:
+        return None, None
+    except Exception as e:  # noqa: BLE001
+        return None, str(e)
+
+
 def _sample_ciphertext_content(key: str, cfg: dict, sample_rate: float,
                                 pending_rows: list[tuple[str, str]],
                                 decrypt_cache: dict[str, Callable]) -> list[dict]:
@@ -333,27 +360,14 @@ def _sample_ciphertext_content(key: str, cfg: dict, sample_rate: float,
                     continue
             elif (user_id, item_id) in skip:
                 continue
-            decrypt = _get_decrypt(decrypt_cache, user_id)
-            try:
-                expected = transform(doc, decrypt)
-            except transforms.PendingDeviceMigration:
-                # RDS 侧刚变成不可解（local_only/无 K_enclave），worker 还没来
-                # 得及落 pending 行——不是一个真实的内容 mismatch，跳过（行数
-                # 核算那一侧会照实反映出 rds>tee，若确实不该发生会在那里报出）。
-                continue
-            except Exception as e:  # noqa: BLE001
-                # 解不开（enclave 403 decrypt_failed / 网关抖动 / 毒行等）：**只
-                # 让这一行失败，不能冲垮整趟 verify**。2026-07-28 prod：一条
-                # "envelope missing body_ct" 让 verify 整趟抛异常，再被
-                # tee_sync_scheduler 的兜底 except 静默吞掉 → verify_ran 24h 恒
-                # false，收敛度彻底失去量测。与 replicate 侧 2026-07-15 已修的
-                # 毒行队头阻塞是同一模式。
-                #
-                # 记成 mismatch 而**不是** continue-skip：跳过等于宣称「两库一
-                # 致」，会用虚假的全绿掩盖真问题，比崩掉更危险。
+            expected, decrypt_error = _expected_doc(
+                user_id, doc, transform, decrypt_cache)
+            if expected is None:
+                if decrypt_error is None:
+                    continue  # PendingDeviceMigration：跳过，理由见 _expected_doc
                 mismatches.append({"table": key, "user_id": user_id,
                                    "item_id": item_id, "field": "<decrypt-failed>",
-                                   "error": str(e)[:200]})
+                                   "error": decrypt_error[:200]})
                 continue
             params = (user_id,) if item_col == "user_id" else (user_id, item_id)
             tee_row = dst.execute(

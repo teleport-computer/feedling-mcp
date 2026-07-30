@@ -169,3 +169,75 @@ def test_preference_is_cached_but_bounded(uid, monkeypatch):
 
     assert len(calls) == 1, "同一用户连续多行只应查一次偏好"
     assert tee_worker._CARRY_VERBATIM_TTL_SEC > 0
+
+
+# ---------------------------------------------------------------------------
+# verify 侧：对账口径必须跟着搬运口径走
+#
+# 复制层对加密档不解密了，verify 若还按「RDS 密文解开 == TEE 明文」比对，
+# 每一行都会报 mismatch——一趟全红，等于失去量测。加密档应当**密文逐字比对**，
+# 反而比解密后比对更快也更可靠。
+
+def test_verify_compares_encrypted_tier_ciphertext_verbatim(uid, monkeypatch):
+    from tee_shadow import verify
+
+    registry._set_user_content_encryption(uid, "on")
+    tee_worker._carry_verbatim_cache.clear()
+
+    def boom(*_a, **_kw):
+        raise AssertionError("加密档对账不该调 enclave")
+
+    monkeypatch.setattr(verify, "_get_decrypt", boom)
+
+    doc = _sealed_chat_doc()
+    expected, err = verify._expected_doc(
+        uid, doc, transforms.plaintext_chat_doc, {})
+
+    assert err is None
+    assert expected == doc, "加密档应当密文逐字比对"
+
+
+def test_verify_still_decrypts_for_default_tier(uid, monkeypatch):
+    from tee_shadow import verify
+
+    monkeypatch.setattr(verify, "_get_decrypt",
+                        lambda cache, user_id: lambda env, purpose: b"hello")
+
+    expected, err = verify._expected_doc(
+        uid, _sealed_chat_doc(), transforms.plaintext_chat_doc, {})
+
+    assert err is None and expected["body"] == "hello"
+
+
+def test_verify_reports_decrypt_failure_without_aborting(uid, monkeypatch):
+    """解不开只让这一行失败，不能冲垮整趟 verify（2026-07-28 prod 事故）。"""
+    from tee_shadow import verify
+
+    def failing(cache, user_id):
+        def _d(env, purpose):
+            raise RuntimeError("enclave 403 decrypt_failed")
+        return _d
+
+    monkeypatch.setattr(verify, "_get_decrypt", failing)
+
+    expected, err = verify._expected_doc(
+        uid, _sealed_chat_doc(), transforms.plaintext_chat_doc, {})
+
+    assert expected is None
+    assert err == "enclave 403 decrypt_failed"
+
+
+def test_verify_skips_rows_pending_device_migration(uid, monkeypatch):
+    """local_only / 无 K_enclave：不是内容 mismatch，跳过而不是记错。"""
+    from tee_shadow import verify
+
+    monkeypatch.setattr(verify, "_get_decrypt",
+                        lambda cache, user_id: lambda env, purpose: b"x")
+
+    doc = _sealed_chat_doc()
+    doc.pop("K_enclave")
+
+    expected, err = verify._expected_doc(
+        uid, doc, transforms.plaintext_chat_doc, {})
+
+    assert expected is None and err is None, "PendingDeviceMigration 应表示为跳过"

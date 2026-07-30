@@ -787,7 +787,11 @@ L1 **7219 passed / 0 failed**（含 `tests/test_envelope_storage_fields.py` 16 �
       `_get_user_content_encryption` 是 O(用户数) 全表扫描、按行调用会拖垮长跑 pass。
       `tests/test_tee_carry_verbatim.py` 7 例；L1 7281 passed / 0 failed。
 
-- [ ] `verify.py` 按行形状分流对账（加密档密文逐字比对、明文档维持现状）
+- [x] `verify.py` 按档位分流对账（2026-07-31）：抽出 `_expected_doc()`，加密档
+      走密文逐字比对（不占 enclave、比解密后比对更快更可靠），明文档维持现状。
+      三态返回把「跳过」与「解不开」分清：`(None, None)` = PendingDeviceMigration
+      跳过；`(None, err)` = 记 mismatch 而非跳过——跳过等于宣称两库一致，会用虚假
+      的全绿掩盖真问题。
 - [ ] cutover 前：盘点 opt-in 加密档用户 → 「清空 + 重置水位线 + 重放」清理其
       存量明文副本 → 核对 `doc ? 'body_ct'` 行数与 RDS 侧一致
 
