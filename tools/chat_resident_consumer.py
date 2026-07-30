@@ -6236,6 +6236,29 @@ def _strip_cli_flags(cmd: list[str], flags: set[str]) -> tuple[list[str], bool]:
     return out, removed
 
 
+# Driver native-reasoning flags (value-bearing) — dropped for self-authored
+# thinking on chat turns so the model emits our <think> instead of hidden native
+# CoT: claude ``--effort <level>``, pi ``--thinking <level>``.
+_NATIVE_THINKING_VALUE_FLAGS = frozenset({"--effort", "--thinking", "--reasoning-effort"})
+
+
+def _strip_cli_value_flags(cmd: list[str], flags: set[str]) -> tuple[list[str], bool]:
+    """Drop each ``--flag VALUE`` pair whose flag is in ``flags``."""
+    out: list[str] = []
+    removed = False
+    skip_next = False
+    for token in cmd:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in flags:
+            removed = True
+            skip_next = True  # also drop the value token that follows
+            continue
+        out.append(token)
+    return out, removed
+
+
 def _has_cli_resume(cmd: list[str]) -> bool:
     return "--resume" in cmd or "-r" in cmd
 
@@ -6763,6 +6786,18 @@ def call_agent_cli(
             "template (e.g. claude -p \"{message}\")."
         )
     cmd, stdin_msg = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
+    # Self-authored thinking: on a foreground CHAT turn, drop the driver's native
+    # reasoning flags so the model emits OUR parseable <think> block instead of
+    # hidden native CoT (which would otherwise win over the tagged block). Chat lane
+    # only + gated on the same kill switch as the prompt injection. Universal —
+    # cloud-V1 and VPS both build the command here.
+    if lane == "chat":
+        from core import self_thinking as _self_thinking_v1
+
+        if _self_thinking_v1.enabled():
+            cmd, _stripped_native = _strip_cli_value_flags(
+                cmd, _NATIVE_THINKING_VALUE_FLAGS
+            )
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     _turn_t0 = time.monotonic()
