@@ -63,8 +63,13 @@ change must not be interpreted as an API guarantee.
   result if the user reconfigures the route while provider I/O is in flight.
   Model API routes return a terminal `ok`, `unsupported`, `failed`, or
   `untested` result. Resident runtimes return `202 testing` while an isolated,
-  hidden probe runs; clients then refresh `GET /v1/vision/config`. Known
-  `unsupported` verdicts are non-blocking signals for client guidance: image
+  hidden probe runs; clients then refresh `GET /v1/vision/config`.
+  VPS residents with the probe capability now enqueue that same hidden check
+  automatically when their consumer/entry/provider/model binding first appears
+  or changes. Matching pending or completed bindings are not re-probed, and
+  explicit modality metadata still avoids the model call. Polling and image
+  delivery remain non-blocking. Known `unsupported` verdicts are non-blocking
+  signals for client guidance: image
   sends still follow the user's configured main or dedicated route unchanged.
   Runtime failures expose stable visual error codes and the exact provider/model
   without putting probe traffic into Chat history or activity.

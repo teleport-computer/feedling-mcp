@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
 from accounts import registry  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
+from chat import consumer as chat_consumer  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
 
@@ -111,6 +112,57 @@ def test_resident_poll_persists_seen_throttles_repeat_and_reports_online(client,
     assert second.status_code == 200, second.get_data(as_text=True)
     assert upserts == [], "a repeat poll inside 60s must not persist the user row"
     assert _binding(_persisted_user(user_id), "resident")["last_seen_at"] == first_seen
+
+
+def test_resident_binding_auto_probe_drives_unsupported_config(client, monkeypatch):
+    _user_id, api_key = _register(client)
+    headers = {
+        **_poll_headers(api_key),
+        "X-Feedling-Consumer-Capabilities": "vision_probe_v2",
+        "X-Feedling-Agent-Entry-Signature": "entry-auto-probe",
+        "X-Feedling-Agent-Provider": "openrouter",
+        "X-Feedling-Agent-Model": "deepseek/text-only",
+    }
+    monkeypatch.setattr(
+        chat_consumer.vision_probe_capability,
+        "generate_images",
+        lambda: (
+            [
+                {"data_url": "data:image/png;base64,aW1hZ2UtYQ=="},
+                {"data_url": "data:image/png;base64,aW1hZ2UtYg=="},
+            ],
+            ["red,green,blue,yellow", "yellow,blue,green,red"],
+        ),
+    )
+
+    first = client.get("/v1/chat/poll?timeout=0", headers=headers)
+    assert first.status_code == 200, first.get_data(as_text=True)
+    probe = first.get_json()["vision_probe"]
+    assert probe["probe_id"]
+    assert len(probe["images"]) == 2
+
+    second = client.get("/v1/chat/poll?timeout=0", headers=headers)
+    assert second.status_code == 200
+    assert second.get_json()["vision_probe"]["probe_id"] == probe["probe_id"]
+
+    completed = client.post(
+        "/v1/internal/vision/main/test/result",
+        headers=headers,
+        json={
+            "probe_id": probe["probe_id"],
+            "status": "ok",
+            "observed": ["wrong", "answer"],
+        },
+    )
+    assert completed.status_code == 200, completed.get_data(as_text=True)
+    assert completed.get_json()["status"] == "unsupported"
+
+    config = client.get("/v1/vision/config", headers={"X-API-Key": api_key})
+    assert config.status_code == 200
+    vision = config.get_json()["config"]
+    assert vision["effective_status"] == "unsupported"
+    assert vision["main_model"]["provider"] == "openrouter"
+    assert vision["main_model"]["model"] == "deepseek/text-only"
 
 
 @pytest.mark.parametrize("route", ["model_api", "official_import"])

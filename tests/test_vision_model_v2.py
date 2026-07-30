@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+from accounts import onboarding as accounts_onboarding
 from hosted import setup_core, vision_routing
 from chat import consumer as chat_consumer
 
@@ -630,6 +631,134 @@ def test_resident_probe_side_channel_hides_expected_and_pending_beats_old_ok(mon
     assert chat_consumer.resident_vision_validation(
         store, now_epoch=103
     )["status"] == "ok"
+
+
+def test_resident_poll_auto_probes_new_binding_once_and_reprobes_on_change(
+    monkeypatch,
+):
+    state = {
+        "consumer_id": "resident-1",
+        "consumer_name": "feedling-chat-resident",
+        "official": True,
+        "last_poll_epoch": 100,
+        "consumer_capabilities": [chat_consumer.VISION_PROBE_CAPABILITY],
+        "agent_entry_signature": "entry-1",
+        "agent_provider": "openrouter",
+        "agent_model": "deepseek/text-only",
+        "agent_input_modalities": [],
+        "agent_input_modalities_source": "",
+    }
+    store = _store("resident-auto")
+
+    def validation(_store, *, now_epoch=None):
+        return {
+            "passing": True,
+            "official": True,
+            "consumer_id": state["consumer_id"],
+            "consumer_capabilities": list(state["consumer_capabilities"]),
+            "agent_entry_signature": state["agent_entry_signature"],
+            "agent_provider": state["agent_provider"],
+            "agent_model": state["agent_model"],
+            "agent_input_modalities": [],
+            "agent_input_modalities_source": "",
+        }
+
+    def mutate(_store, fn):
+        result = fn(state)
+        return state, result
+
+    monkeypatch.setattr(chat_consumer, "_consumer_validation_state", validation)
+    monkeypatch.setattr(chat_consumer, "_load_consumer_state", lambda _store: state)
+    monkeypatch.setattr(chat_consumer, "_mutate_consumer_state", mutate)
+    monkeypatch.setattr(
+        accounts_onboarding,
+        "_load_onboarding_route",
+        lambda _store: "resident",
+    )
+    monkeypatch.setattr(
+        chat_consumer.vision_probe_capability,
+        "generate_images",
+        lambda: (
+            [
+                {"data_url": "data:image/png;base64,image-a"},
+                {"data_url": "data:image/png;base64,image-b"},
+            ],
+            ["red,green,blue,yellow", "yellow,blue,green,red"],
+        ),
+    )
+
+    info = validation(store)
+    assert chat_consumer._maybe_begin_resident_vision_probe(
+        store, info=info, now_epoch=100
+    )
+    first_probe = dict(state["resident_vision_probe"])
+    assert not chat_consumer._maybe_begin_resident_vision_probe(
+        store, info=info, now_epoch=101
+    )
+    projected = chat_consumer.vision_probe_for_poll(
+        store, info, now_epoch=101
+    )
+    assert projected["probe_id"] == first_probe["probe_id"]
+    assert "expected" not in projected
+
+    result, status = chat_consumer.complete_vision_probe(
+        store,
+        {
+            "probe_id": first_probe["probe_id"],
+            "status": "ok",
+            "observed": ["wrong", "answer"],
+        },
+        info,
+        now_epoch=102,
+    )
+    assert status == 200
+    assert result["status"] == "unsupported"
+    assert not chat_consumer._maybe_begin_resident_vision_probe(
+        store, info=info, now_epoch=103
+    )
+
+    state["agent_entry_signature"] = "entry-2"
+    state["agent_model"] = "deepseek/another-text-only"
+    changed_info = validation(store)
+    assert chat_consumer._maybe_begin_resident_vision_probe(
+        store, info=changed_info, now_epoch=104
+    )
+    assert state["resident_vision_probe"]["probe_id"] != first_probe["probe_id"]
+    assert state["resident_vision_probe"]["model"] == "deepseek/another-text-only"
+
+
+def test_poll_heartbeat_invokes_resident_auto_probe_only_for_poll(monkeypatch):
+    state = {}
+    calls = []
+
+    def mutate(_store, fn):
+        result = fn(state)
+        return state, result
+
+    monkeypatch.setattr(chat_consumer, "_mutate_consumer_state", mutate)
+    monkeypatch.setattr(
+        chat_consumer,
+        "_touch_resident_binding_seen",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        chat_consumer,
+        "_maybe_begin_resident_vision_probe",
+        lambda store, **kwargs: calls.append((store, kwargs)) or True,
+    )
+    store = _store("resident-auto")
+    info = {
+        "official": True,
+        "consumer_name": "feedling-chat-resident",
+        "consumer_id": "resident-1",
+    }
+
+    chat_consumer._record_consumer_event(store, "poll", info=info)
+    chat_consumer._record_consumer_event(store, "response", info=info)
+
+    assert len(calls) == 1
+    assert calls[0][0] is store
+    assert calls[0][1]["info"] is info
 
 
 def test_unified_main_test_returns_model_identity_and_stable_status(monkeypatch):

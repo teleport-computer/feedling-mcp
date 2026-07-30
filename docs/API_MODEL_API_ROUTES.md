@@ -173,6 +173,12 @@ resident/VPS 路径启动隔离、隐藏的双图 probe 并返回 `202 testing`�
 `GET /v1/vision/config`，直到 `effective_status` 不再是 `testing`。probe 不进入聊天记录、
 推送、摘要、Live Activity 或 capture。旧 resident 不具备该 side-channel 时返回
 `409 vision_resident_update_required`。probe 回传端点位于 `/v1/internal/**`，不是公开 API。
+具备 side-channel 的官方 resident 在首次上报或更换
+`consumer_id / entry_signature / provider / model` binding 时，后端也会自动入队同一
+probe；当前 poll 立即拿到任务，provider 调用仍在 resident 的隔离后台 lane 执行。
+同一 binding 的 pending/终态结果不会重复探测，binding 变化会使旧 verdict 失效。
+显式 catalog/modalities 已足以判定时不额外发 probe。整个触发过程仅为 advisory，
+不等待 provider I/O，也不阻塞聊天 poll 或图片发送。
 
 精确 provider/model 的缓存 verdict（包括 `unsupported`）只通过
 `GET /v1/vision/config` 的 `main_model.vision_test_status / effective_status` 提供给客户端
