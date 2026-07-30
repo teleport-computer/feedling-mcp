@@ -47,6 +47,54 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-30 — Runtime 值班台补审计的三条实质缺口：capture 语义、完整窗口、端到端交付
+
+**[FIX] 同一份外部审计里剩下的三条（前四条见下一条记录），按"页面自信地报绿最危险"排序做掉。**
+分支 `fix/runtime-health-p1`，L1 `7280 passed / 0 failed`（基线 7251 + 新增 29 条）。
+
+- **`capture.complete` 改名 `terminal_seen_no_gap`，且 `partial` 开始参与降级**。
+  那个桶只证明"找到了 `turn_terminal` 事件且没有 `capture_gap`"，**不**证明 prompt /
+  provider 往返 / tool call / 最终回复这些 artifact 齐全——叫 `complete` 会让人（和下一个
+  改这段代码的人）以为轨迹可以完整回放。更严重的是 `_runtime_health_level` 此前**只看
+  `missing`**：一个带 capture_gap 的回合在页面上既显示了 partial 计数、总体结论又写"正常"，
+  审计截图里就是这个组合。缺口是真实的取证损失，现在至少 `warn`（`missing` 仍是 `bad`，
+  取最差档，有测试钉住"warn 不会盖住 bad"）。
+  姊妹函数 `recent_chat_operational_health` 仍用 `complete`/`complete_rate` 未改——那是
+  `/model_api` 指标端点的对外契约，改名要单独走版本沟通。
+- **健康侧去掉 `LIMIT 1000` 采样上界，与 token 列口径对齐**。四条子查询此前各带 1000 行
+  上界，于是 24h 档写着"24 小时"、实际是"最近 1000 个 job"；而同页 token 查询从一开始就是
+  窗口内全量。两列因此在 168h / 720h 档覆盖不同的时间跨度，**放在一行读却不是同一批样本**，
+  且故障总量被静默少报。采样上界在这里不是性能旋钮而是正确性缺陷。回归测试插 1200 行
+  （> 旧上界）断言 `sampled_jobs == 1200`，并已实测：把 LIMIT 加回去这条立刻变红。
+  扫描量由新迁移 **0071** 的三条索引承担（`ix_agent_jobs_terminal_finished_at` /
+  `ix_agent_jobs_created_at` / `ix_v2_turn_metrics_created_at`，全部 `CONCURRENTLY`，
+  照 0048 的 invalid-空壳 重试处置）。
+  ⚠️ **顺带修正一条此前写反的性能结论**：`ix_v2_turn_metrics_lane_created_at` 不是
+  "用不上"，而是"对非前导列的范围谓词给不出范围收窄"。本机 PG 16 实测（30 万行 / 摊 60 天）：
+  24h 档无新索引走 Seq Scan（4226 buffer）、有新索引走 Index Scan（1454 buffer）；720h 档
+  规划器**确实会**去用那条复合索引，但退化成全索引扫描（21k+ buffer）。数字记在 0071 注释里。
+- **新增「端到端交付」区块（`recent_delivery_health`）**。这是审计最实的一条：`agent_jobs`
+  判 `completed` 只证明回合跑完了，不证明产物到达用户——副作用走 `v2_effect_outbox` 异步
+  apply、用户可见的终态失败走 `v2_terminal_failure_outbox` 投递，这两条队列堵住时 job 层面
+  一切正常，页面此前照样报绿。三块的窗口语义**刻意不同**：两个 outbox 是**当前积压状态**
+  （不随窗口变化——三天前该 apply 的 effect 还堵着，那是现在的故障），`v2_mcp_mutation_attempts`
+  的 unknown/unresolved 才是窗口内计数。判定只按**堵了多久**、不按积压条数（高吞吐下瞬时
+  积压 5000 条是健康的）；MCP 结果未知不设阈值、见一条就 warn（稀有、不可自愈）。
+  阈值刻意保守（1h warn / 6h bad）：稳态基线还没实测，值班台最不能犯的错是长期挂一条误报的
+  红——那会训练出"这页的红不用看"。收紧前不要当灵敏告警使。
+- **页面写明覆盖范围**：本页只统计本实例托管的 V2 回合，self-host consumer 只 best-effort
+  上报部分元数据、离线实例完全不可见，所以 token 与失败率**不是全体用户的总量**。这一条是
+  成本最低、防的却是最贵的误用（拿这页数字当全量用量账）。
+- `admin_core` 的 runtime 分支现在是**三个独立失败域**：健康挂了才降级整页，token 或交付
+  挂了各自只让对应区块显"取不到"（不是显 0——0 的含义是"确认过是零"，与"取不到"相反）。
+
+**未做**（审计提到、本轮没碰）：worker build / heartbeat age（`recent_worker_heartbeats()`
+已有数据，只差渲染）、provider health 参与判定、wake/proactive lane 健康、hourly rollup、
+四层拆分（Runtime Health / Usage / Trace Coverage / Private Trace Viewer）。admin key 轮换与
+移除 query-string auth 按产品决定不做。
+
+---
+
 ## 2026-07-30 — 外部审计打回 Runtime 值班台的四处：日志漏脱敏、失败域过宽、参数假生效、两种 coverage 混列
 
 **[FIX] 一次外部只读审计（针对 PR #124 + #129 上线后的生产页）指出四条，全部实测复现后修掉。**
