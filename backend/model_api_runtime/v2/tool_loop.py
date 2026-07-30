@@ -209,6 +209,10 @@ async def run_tool_loop(
     disabled_tool_names=None,
     allow_reply_tool: bool = True,
     include_reasoning: bool = False,
+    # Self-authored thinking (<think>) replaces provider-native reasoning for the
+    # chat lane; when True, never request native reasoning so the model emits its
+    # thinking in the reply instead. Default False → other lanes unchanged.
+    suppress_native_reasoning: bool = False,
     # Whether a text-free provider reply is an ERROR. Defaults to True, which
     # is the chat lane's rule (a terminal turn with no text is the no-filler
     # failure). The wake lane is the opposite — "weak wake sleeps": a model
@@ -711,6 +715,7 @@ async def run_tool_loop(
                     )
                 )
                 and not terminal_text_round
+                and not suppress_native_reasoning
             ):
                 provider_kwargs["include_reasoning"] = True
             if on_file_reply is not None:

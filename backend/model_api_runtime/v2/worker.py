@@ -10101,9 +10101,16 @@ async def process_job(
         await _ensure_runtime_mode()
         await _renew_lease()
         await asyncio.to_thread(_emit_status, user_id, job_id, "writing_reply")
+        # Self-authored thinking replaces provider-native reasoning: when the
+        # feature is on, suppress the native reasoning request so the model puts
+        # its thinking in the parseable <think> block instead (a reasoning model
+        # given native reasoning ignores <think> and its native CoT would show).
+        from core import self_thinking as _self_thinking_mod
+
         outcome = await v2_tool_loop.run_tool_loop(
             provider_config=provider_config,
             include_reasoning=turn_include_reasoning,
+            suppress_native_reasoning=_self_thinking_mod.enabled(),
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
             on_reply=_on_reply,
