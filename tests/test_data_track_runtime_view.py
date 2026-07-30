@@ -533,6 +533,8 @@ def _tokens(lane_name: str = "chat", **overrides) -> dict:
         "cache_read_tokens": 469_353,
         "cache_miss_tokens": 482_000,
         "cache_hit_ratio": 0.493,
+        "cache_reported_calls": 59,
+        "cache_coverage": 0.5,
     }
     base.update(overrides)
     return {"window_hours": 24, "lanes": {lane_name: base}}
@@ -575,9 +577,12 @@ def test_render_runtime_health_page_shows_token_columns(bound_request):
     assert "951.2k" in html_out          # prompt
     assert "40.5k" in html_out           # completion
     assert "49.3%" in html_out           # cache 命中率
-    assert "87.3%" in html_out           # 上报覆盖率
+    assert "87.3%" in html_out           # usage 上报覆盖率
     assert "token 入/出" in html_out      # 表头
-    assert "缓存命中 · 上报" in html_out  # 表头
+    # 命中率与两种上报覆盖率分列（2026-07-30 审计：原先混在一列里的「上报」
+    # 指 usage 上报，读者会误解成 cache 上报）
+    assert "缓存命中" in html_out
+    assert "上报 usage/cache" in html_out
 
 
 def test_render_runtime_health_page_token_columns_are_dash_without_data(bound_request):
@@ -589,9 +594,10 @@ def test_render_runtime_health_page_token_columns_are_dash_without_data(bound_re
     html_out = _dt._render_runtime_health_page(_payload(), _tokens(lane_name="maintenance"))
     assert "token 入/出" in html_out
     chat_row = _lane_row_html(html_out, "chat")
-    # 精确断言：chat 行的 token 与 cache 两列都渲染成 muted 的 —。
+    # 精确断言：chat 行的 token / 缓存命中 / 上报覆盖 三列都渲染成 muted 的 —。
     # 只写 `assert "—" in html_out` 是无效断言——页面别处本来就有 —。
-    assert chat_row.count("<td class='muted'>—</td>") == 2
+    # 数量是 3 而非 2：命中率与上报覆盖率已拆成两列（2026-07-30 审计）。
+    assert chat_row.count("<td class='muted'>—</td>") == 3
     # maintenance 的数字绝不能串到 chat 行上
     assert "951.2k" not in chat_row
 
@@ -697,8 +703,14 @@ def test_runtime_view_renders_token_columns_end_to_end(client, monkeypatch):
     assert "60.0%" in page
 
 
-def test_runtime_view_degrades_when_token_function_fails(client, monkeypatch):
-    # 任一数据源炸掉都走同一个降级页，且不外泄异常细节
+def test_runtime_view_keeps_health_when_only_token_query_fails(client, monkeypatch):
+    """token 查询炸掉**不得**拖垮整张健康页。
+
+    2026-07-30 审计指出的设计缺陷：原先两次数据调用共用一个 try，于是 token 聚合
+    （无 LIMIT、走 seq scan、扫描量随表增长单调变大的那条查询）一旦超时，健康数据
+    明明是好的、整页也会退化成降级页。而这一页恰恰是出事时才被打开的——把核心
+    可用信息一起丢掉是最坏的失败模式。token 是附加信息：它挂了应该只让两列显 —。
+    """
     def _boom(**_kw):
         raise RuntimeError("token pool exhausted")
 
@@ -707,8 +719,27 @@ def test_runtime_view_degrades_when_token_function_fails(client, monkeypatch):
     res = client.get("/admin/data-track?view=runtime", headers=_admin_headers())
     body = res.get_data(as_text=True)
     assert res.status_code == 200
-    assert "Runtime 健康数据暂时取不到" in body
+    # 核心健康数据仍在
+    assert "各 lane 健康" in body
+    assert "Runtime 健康数据暂时取不到" not in body
+    # token 列退化成无数据，而不是 0
+    assert "token 入/出" in body
+    # 异常细节不外泄
     assert "token pool exhausted" not in body
+
+
+def test_runtime_view_degrades_when_health_query_fails(client, monkeypatch):
+    # 健康数据是这页的核心，它没了才走降级页
+    def _boom(**_kw):
+        raise RuntimeError("health pool exhausted")
+
+    monkeypatch.setattr(_dt, "_runtime_health_summary", _boom)
+    monkeypatch.setattr(_dt, "_runtime_token_by_lane", _fake_tokens)
+    res = client.get("/admin/data-track?view=runtime", headers=_admin_headers())
+    body = res.get_data(as_text=True)
+    assert res.status_code == 200
+    assert "Runtime 健康数据暂时取不到" in body
+    assert "health pool exhausted" not in body
 
 
 def test_runtime_token_by_lane_is_wired_to_jobs_store():
@@ -717,3 +748,57 @@ def test_runtime_token_by_lane_is_wired_to_jobs_store():
     from model_api_runtime.v2 import jobs_store
 
     assert _dt._runtime_token_by_lane is jobs_store.recent_token_usage_by_lane
+
+
+def test_render_runtime_health_page_separates_two_coverages(bound_request):
+    """两种 coverage 必须分别标注，不能混在一个「上报」里。
+
+    2026-07-30 审计：原先那一列是 `cache_hit_ratio · usage_coverage`、表头写
+    「缓存命中 · 上报」——读者会把"上报"理解成 cache 上报，而它其实是 token usage
+    上报。两者是不同的量（实测 prod 上 usage 覆盖 87% 而 cache 覆盖可能只有一半）。
+    """
+    html_out = _dt._render_runtime_health_page(_payload(), _tokens())
+    # 三个数各自可见
+    assert "49.3%" in html_out      # 缓存命中率
+    assert "87.3%" in html_out      # usage 上报覆盖
+    assert "50.0%" in html_out      # cache 上报覆盖
+    # 表头把两种 coverage 分开写明，不再是笼统的「上报」
+    assert "缓存命中" in html_out
+    assert "上报 usage/cache" in html_out
+    assert "缓存命中 · 上报</th>" not in html_out   # 旧的混淆写法必须消失
+
+
+def test_render_runtime_health_page_coverage_columns_dash_without_data(bound_request):
+    html_out = _dt._render_runtime_health_page(_payload(), _tokens(lane_name="other"))
+    # chat 行三列全无数据 → token 列 + 命中列 + 覆盖列各一个 muted dash
+    assert _lane_row_html(html_out, "chat").count("<td class='muted'>—</td>") == 3
+
+
+def test_runtime_page_links_drop_params_it_ignores():
+    """runtime 页只读 hours；它自己生成的链接不得传播它无视的参数。
+
+    2026-07-30 审计实证：有人拿着 `?view=runtime&day=2026-07-25&limit=...&offset=...`
+    的 URL 截图，据此以为看的是 7 月 25 日的数据——而这一页只读 hours，实际渲染的是
+    "生成时刻向前 24 小时"。参数看着生效、其实被忽略，比参数报错更危险：页顶还写着
+    「窗口 24 小时」，读者却相信自己在看某一天。
+    """
+    # 范围：**本页自己的控件**（三个窗口切换按钮）不得传播它读不到的参数。
+    # 顶部 nav 由全视图共用的 `_render_data_track_view_nav` 生成，给它开 runtime
+    # 特例等于把单页面的参数知识塞进通用组件——从别处带进来的 URL 由说明文字兜
+    # （见 test_runtime_page_explains_it_only_reads_hours）。
+    with _admin_core.bind("view=runtime&day=2026-07-25&limit=50&offset=100&hours=168"):
+        html_out = _dt._render_runtime_health_page(_payload(), _tokens())
+
+    for label in ("24 小时", "7 天", "30 天"):
+        # 取该按钮 <a ...>label</a> 里的 href
+        idx = html_out.index(f">{label}</a>")
+        href = html_out[html_out.rindex("href='", 0, idx):idx]
+        assert "hours=" in href, f"{label} 按钮丢了 hours: {href}"
+        assert "day=" not in href, f"{label} 按钮带上了 day: {href}"
+        assert "limit=" not in href, f"{label} 按钮带上了 limit: {href}"
+        assert "offset=" not in href, f"{label} 按钮带上了 offset: {href}"
+
+
+def test_runtime_page_explains_it_only_reads_hours(bound_request):
+    html_out = _dt._render_runtime_health_page(_payload(), _tokens())
+    assert "本页只按 hours" in html_out
