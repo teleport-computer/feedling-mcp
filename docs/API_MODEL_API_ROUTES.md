@@ -153,6 +153,24 @@
 
 失败：404 `route_not_found` / 400 `provider_test_failed`（可能带 `active_route_id`，见上）。
 
+### `POST /v1/vision/main/test` —— 验证当前主模型是否真的能看图
+
+请求无 body。它不按模型名猜能力，只采用 provider 返回的显式模态字段；catalog 没有
+提供可判定字段时，才发送两张随机色块图做真实探测。
+
+Model API 路径同步返回 `200`，`status` 为 `ok / unsupported / failed / untested`，并
+始终带当前的 `source / provider / model`；失败时还可能带稳定 `error_code`、
+`retryable / status_code / detail`。
+
+resident/VPS 路径启动隔离、隐藏的双图 probe 并返回 `202 testing`；客户端随后轮询
+`GET /v1/vision/config`，直到 `effective_status` 不再是 `testing`。probe 不进入聊天记录、
+推送、摘要、Live Activity 或 capture。旧 resident 不具备该 side-channel 时返回
+`409 vision_resident_update_required`。probe 回传端点位于 `/v1/internal/**`，不是公开 API。
+
+一旦精确 provider/model 的缓存 verdict 已是 `unsupported`，图片仍可在客户端被选择，
+但发送入口会在持久化前同步返回 `vision_model_incompatible` 与精确 provider/model；
+`untested / testing / failed` 不会被这个缓存闸拦截，仍进入真实调用。
+
 ### `DELETE /v1/model_api/routes/{route_id}` —— 删除 route
 
 ```json

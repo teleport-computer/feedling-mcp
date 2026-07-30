@@ -108,6 +108,8 @@ def test_fallback_reply_carries_turn_failure_and_parent_link(client):
             "turn_failure_error_class": "quota_insufficient",
             "turn_failure_blame": "user_provider",
             "turn_failure_user_text": "模型服务额度不足，充值后再发消息即可恢复。",
+            "turn_failure_model": "openai/gpt-vision",
+            "turn_failure_provider": "openrouter",
         },
         headers=_headers(api_key),
     )
@@ -119,6 +121,8 @@ def test_fallback_reply_carries_turn_failure_and_parent_link(client):
     assert reply["turn_failure_blame"] == "user_provider"
     assert reply["turn_failure_user_text"].startswith("模型服务额度不足")
     assert reply["reply_to_message_id"] == parent_id
+    assert reply["turn_failure_model"] == "openai/gpt-vision"
+    assert reply["turn_failure_provider"] == "openrouter"
 
 
 def test_normal_reply_has_no_turn_failure_fields(client):

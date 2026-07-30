@@ -27,6 +27,7 @@ BODYLESS_OPERATIONS: set[Operation] = {
     ("post", "/v1/model_api/test"),
     ("post", "/v1/model_api/routes/{route_id}/activate"),
     ("post", "/v1/model_api/routes/{route_id}/test"),
+    ("post", "/v1/vision/main/test"),
     ("post", "/v1/vision/routes/{route_id}/test"),
     ("post", "/v1/proactive/scheduled/fire"),
 }
@@ -872,6 +873,27 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "properties": {
             "message_id": {"type": "string", "minLength": 1},
             "route_id": {"type": "string", "minLength": 1},
+        },
+        "additionalProperties": False,
+    },
+    "VisionMainTestResponse": {
+        "type": "object",
+        "required": ["status", "source", "provider", "model"],
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["ok", "unsupported", "failed", "untested", "testing"],
+            },
+            "source": {"type": "string", "enum": ["model_api", "resident"]},
+            "provider": {"type": "string"},
+            "model": {"type": "string"},
+            "error_code": {"type": "string"},
+            "retryable": {"type": "boolean"},
+            "status_code": {"type": "integer"},
+            "detail": {"type": "string"},
+            "probe_id": {"type": "string"},
+            "expires_at_epoch": {"type": "number"},
+            "poll_after_ms": {"type": "integer", "minimum": 0},
         },
         "additionalProperties": False,
     },
@@ -1743,6 +1765,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
     ("post", "/v1/model_api/models"): "列出某 provider 在该凭据下可见的模型清单（实时拉取，非 io 兼容性保证）。unsupported / partial 时客户端退回手填。",
     ("post", "/v1/model_api/runtime_error"): "Record or clear the resident runtime's latest provider error. provider_result=success refreshes provider health immediately; provider_result=failure applies error_class to the provider-health policy.",
+    ("post", "/v1/vision/main/test"): "Validate the effective main model's image-input capability. Model API routes use explicit catalog metadata when available and otherwise perform a real two-image probe, returning a terminal 200 status. Resident runtimes start a hidden isolated two-image probe and return 202 testing; poll GET /v1/vision/config until effective_status leaves testing. Residents without the hidden-probe capability receive 409 vision_resident_update_required.",
     ("get", "/v1/model_api/usage"): (
         "Query the caller's active model_api provider for balance/usage, live on every call — "
         "never cached and never stored. Uses the same decrypted provider key as chat, decrypted "
@@ -1930,6 +1953,20 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
             "description": "The account's visible model catalog for this provider.",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ModelApiModelsResponse"}}},
         }
+    },
+    ("post", "/v1/vision/main/test"): {
+        "200": {
+            "description": "Main-model image capability reached a terminal verdict.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/VisionMainTestResponse"}}},
+        },
+        "202": {
+            "description": "A hidden resident image-capability probe is in progress.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/VisionMainTestResponse"}}},
+        },
+        "409": {
+            "description": "The resident must be updated before hidden validation is available.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
+        },
     },
     ("post", "/v1/notify-relay/register"): {
         "200": {

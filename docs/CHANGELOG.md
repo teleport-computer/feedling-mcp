@@ -141,6 +141,25 @@ T1 前写入它，而 replicator 只搬 RDS 中存在的行 ⇒ 该行 T1 前就
 
 ---
 
+## 2026-07-30 — 主模型看图验证统一为显式 catalog + 隐藏双图 probe
+
+**[DONE] 视觉能力验证与实际失败归属收口。** 新增公开的
+`POST /v1/vision/main/test`：Model API 只信 provider catalog 的显式模态字段，缺字段
+才发真实双图探测；resident 走隔离 session 的隐藏双图 side-channel，测试内容不进入
+Chat、推送、摘要、Live Activity 或 capture。配置状态统一为
+`testing / ok / unsupported / failed / untested`，绑定的 provider、model 或 resident
+入口变化会使旧结果失效。已明确缓存为 `unsupported` 的图片发送会在写消息前返回
+`vision_model_incompatible` 与精确 provider/model；未知状态仍允许真实调用。
+
+**[DONE] 图片失败归属只在证据明确时挂到视觉模型。** auth、quota、model、provider、
+rate limit、upstream、timeout、reply parse 和 dedicated observer 失败映射到稳定
+`vision_model_*` 码；图片回合里的工具、存储或其他未知内部异常保留原失败归属。
+
+公开 OpenAPI 已登记 main-test 端点；resident probe 回传留在
+`/v1/internal/vision/main/test/result`，不进入公开契约。
+
+---
+
 ## 2026-07-29 — TEE 迁移链补到 0008：写了迁移不等于执行了迁移
 
 **[DONE] `alembic_tee 0008`** 补 `model_api_routes` 落后 RDS 的 4 个 vision 列

@@ -646,12 +646,16 @@ class VisionObserverFailure(RuntimeError):
         status_code: int | None = None,
         detail: str = "",
         raw_user_text: str = "",
+        model: str = "",
+        provider: str = "",
     ):
         super().__init__(error_class)
         self.error_class = error_class[:64] or "vision_model_failed"
         self.status_code = status_code
         self.detail = detail[:160]
         self.raw_user_text = raw_user_text
+        self.model = _sanitize_thinking_meta(model, max_len=96)
+        self.provider = _sanitize_thinking_meta(provider, max_len=80)
 
 
 def _vision_failure_user_text(error_class: str, raw_user_text: str) -> str:
@@ -804,7 +808,11 @@ def _system_notice_body(notice: AgentErrorNotice) -> str:
     return f"⚠️ {notice.user_text}\n详情: {notice.detail}"
 
 
-def turn_failure_post_kwargs(notice: "AgentErrorNotice | None") -> dict:
+def turn_failure_post_kwargs(
+    notice: "AgentErrorNotice | None",
+    *,
+    failure: BaseException | None = None,
+) -> dict:
     """把分类结果转成 post_reply 的 turn-failure kwargs（spec 2026-07-18 §2.2）。
 
     只带 error_class / blame / user_text —— detail 绝不下发（可能夹带 provider
@@ -812,11 +820,23 @@ def turn_failure_post_kwargs(notice: "AgentErrorNotice | None") -> dict:
     无失败时返回空 dict，成功路径零变化。"""
     if notice is None:
         return {}
-    return {
+    body = {
         "turn_failure_error_class": notice.error_class[:64],
         "turn_failure_blame": notice.blame[:32],
         "turn_failure_user_text": notice.user_text[:500],
     }
+    if failure is not None:
+        model = _sanitize_thinking_meta(
+            getattr(failure, "model", ""), max_len=96
+        )
+        provider = _sanitize_thinking_meta(
+            getattr(failure, "provider", ""), max_len=80
+        )
+        if model:
+            body["turn_failure_model"] = model
+        if provider:
+            body["turn_failure_provider"] = provider
+    return body
 
 
 # 聊天流失败横幅节流（Seven 定稿 2026-07-11）：
@@ -1115,6 +1135,9 @@ def _agent_runtime_metadata(
     provider = _safe_runtime_header(os.environ.get("FEEDLING_AGENT_PROVIDER"))
     provider_is_explicit = bool(provider)
     explicit_modalities = os.environ.get("FEEDLING_AGENT_INPUT_MODALITIES", "")
+    modalities_source = (
+        "explicit" if "FEEDLING_AGENT_INPUT_MODALITIES" in os.environ else ""
+    )
     modalities = sorted({
         item.strip().lower()
         for item in explicit_modalities.split(",")
@@ -1172,6 +1195,7 @@ def _agent_runtime_metadata(
                             "text", "image", "audio", "video"
                         }
                     })
+                    modalities_source = "pi_catalog"
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
 
@@ -1179,19 +1203,36 @@ def _agent_runtime_metadata(
         "provider": provider,
         "model": model,
         "input_modalities": modalities,
+        "input_modalities_source": modalities_source,
     }
 
 
 AGENT_RUNTIME_METADATA = _agent_runtime_metadata()
 
 
+def _agent_entry_signature() -> str:
+    """Stable, secret-free identity for the configured model entry."""
+    payload = json.dumps(
+        {
+            "mode": AGENT_MODE,
+            "command": AGENT_CLI_CMD,
+            "http_model": AGENT_HTTP_MODEL,
+            "runtime": AGENT_RUNTIME_METADATA,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 _HEADERS = {
     "X-API-Key": FEEDLING_API_KEY,
     "X-Feedling-Consumer": "feedling-chat-resident",
-    "X-Feedling-Consumer-Capabilities": "vision_observer_v1",
+    "X-Feedling-Consumer-Capabilities": "vision_observer_v1,vision_probe_v2",
     "X-Feedling-Consumer-Id": CONSUMER_ID,
     "X-Feedling-Consumer-Version": "resident-v1",
     "X-Feedling-Consumer-Commit": RUNNING_COMMIT,
+    "X-Feedling-Agent-Entry-Signature": _agent_entry_signature(),
 }
 if AGENT_RUNTIME_METADATA["provider"]:
     _HEADERS["X-Feedling-Agent-Provider"] = AGENT_RUNTIME_METADATA["provider"]
@@ -1200,6 +1241,10 @@ if AGENT_RUNTIME_METADATA["model"]:
 if AGENT_RUNTIME_METADATA["input_modalities"]:
     _HEADERS["X-Feedling-Agent-Input-Modalities"] = ",".join(
         AGENT_RUNTIME_METADATA["input_modalities"]
+    )
+if AGENT_RUNTIME_METADATA["input_modalities_source"]:
+    _HEADERS["X-Feedling-Agent-Input-Modalities-Source"] = (
+        AGENT_RUNTIME_METADATA["input_modalities_source"]
     )
 
 
@@ -2692,6 +2737,8 @@ def _vision_observation(message_id: str, route_id: str) -> str:
             str(body.get("error_class") or body.get("error") or "vision_model_unavailable"),
             status_code=status_code,
             detail=str(body.get("detail") or "")[:160],
+            model=str(body.get("model") or ""),
+            provider=str(body.get("provider") or ""),
         )
     observation = str(body.get("observation") or "").strip()
     if not observation:
@@ -5244,18 +5291,25 @@ def _bare_cards_json(body: Any) -> str:
     return ""
 
 
-def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = None, raw_text: bool = False) -> Any:
+def _call_agent_http_simple(
+    message: str,
+    images: list[dict[str, str]] | None = None,
+    raw_text: bool = False,
+    *,
+    isolated_session: bool = False,
+) -> Any:
     headers = _agent_http_headers()
     payload = {"message": message}
     if images:
         payload["images"] = images
     resp = _HTTP.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=60)
     resp.raise_for_status()
-    _remember_http_session(
-        resp,
-        sent_bytes=len(message.encode("utf-8")),
-        received_bytes=_response_text_len(resp),
-    )
+    if not isolated_session:
+        _remember_http_session(
+            resp,
+            sent_bytes=len(message.encode("utf-8")),
+            received_bytes=_response_text_len(resp),
+        )
     body = resp.json()
     if raw_text:
         text = _raw_assistant_text(body)
@@ -5276,12 +5330,18 @@ def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = 
     raise ValueError(f"unexpected response type: {type(body)}")
 
 
-def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = None, raw_text: bool = False) -> Any:
+def _call_agent_http_openai(
+    message: str,
+    images: list[dict[str, str]] | None = None,
+    raw_text: bool = False,
+    *,
+    isolated_session: bool = False,
+) -> Any:
     headers = _agent_http_headers()
-    sid = _load_agent_session_id()
+    sid = "" if isolated_session else _load_agent_session_id()
     if sid:
         headers[AGENT_HTTP_SESSION_HEADER] = sid
-    session_key = _agent_session_key()
+    session_key = "" if isolated_session else _agent_session_key()
     if session_key:
         headers[AGENT_HTTP_SESSION_KEY_HEADER] = session_key
 
@@ -5301,11 +5361,12 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
     }
     resp = _HTTP.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=120)
     resp.raise_for_status()
-    _remember_http_session(
-        resp,
-        sent_bytes=len(str(content).encode("utf-8")),
-        received_bytes=_response_text_len(resp),
-    )
+    if not isolated_session:
+        _remember_http_session(
+            resp,
+            sent_bytes=len(str(content).encode("utf-8")),
+            received_bytes=_response_text_len(resp),
+        )
     body = resp.json()
     if not isinstance(body, dict):
         raise ValueError(f"unexpected OpenAI response type: {type(body)}")
@@ -5324,13 +5385,25 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
     raise ValueError("OpenAI-compatible response has no usable reply text")
 
 
-def call_agent_http(message: str, images: list[dict[str, str]] | None = None, raw_text: bool = False) -> Any:
+def call_agent_http(
+    message: str,
+    images: list[dict[str, str]] | None = None,
+    raw_text: bool = False,
+    *,
+    isolated_session: bool = False,
+) -> Any:
     if not AGENT_HTTP_URL:
         raise ValueError("AGENT_HTTP_URL is not set for http mode")
     if AGENT_HTTP_PROTOCOL in {"openai", "hermes", "chat_completions", "chat-completions"}:
-        return _call_agent_http_openai(message, images=images, raw_text=raw_text)
+        return _call_agent_http_openai(
+            message, images=images, raw_text=raw_text,
+            isolated_session=isolated_session,
+        )
     if AGENT_HTTP_PROTOCOL in {"simple", "generic", "json"}:
-        return _call_agent_http_simple(message, images=images, raw_text=raw_text)
+        return _call_agent_http_simple(
+            message, images=images, raw_text=raw_text,
+            isolated_session=isolated_session,
+        )
     raise ValueError(f"unknown AGENT_HTTP_PROTOCOL: {AGENT_HTTP_PROTOCOL!r}")
 
 
@@ -5418,21 +5491,6 @@ def _agent_session_file_for_user() -> Path:
 
 def _agent_session_user_id() -> str:
     return (_whoami_cache.get("user_id") or "unknown").strip() or "unknown"
-
-
-def _agent_entry_signature() -> str:
-    """Stable, secret-free identity for the configured model entry."""
-    payload = json.dumps(
-        {
-            "mode": AGENT_MODE,
-            "command": AGENT_CLI_CMD,
-            "http_model": AGENT_HTTP_MODEL,
-            "runtime": AGENT_RUNTIME_METADATA,
-        },
-        ensure_ascii=True,
-        sort_keys=True,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _empty_agent_session_meta(session_id: str = "") -> dict[str, Any]:
@@ -6325,8 +6383,14 @@ def _prepare_cli_command(
     message: str,
     image_paths: list[str] | None = None,
     lane: str = "background",
+    *,
+    session_id_override: str | None = None,
 ) -> tuple[list[str], str | None]:
-    sid = _load_agent_session_id()
+    sid = (
+        _load_agent_session_id()
+        if session_id_override is None
+        else session_id_override
+    )
     template_has_image_slot = "{image_path" in AGENT_CLI_CMD
     # codex gets pixels natively via injected --image= flags (_inject_codex_images);
     # skip the file-path prose that only makes sense for a runtime that must open
@@ -6738,6 +6802,7 @@ def call_agent_cli(
     lane: str = "background",
     attempt_trigger: str = "first",
     stream_update: Callable[[int, str, bool], None] | None = None,
+    isolated_session: bool = False,
 ) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
@@ -6762,7 +6827,13 @@ def call_agent_cli(
             "message cannot reach the agent. Add {message} to the command "
             "template (e.g. claude -p \"{message}\")."
         )
-    cmd, stdin_msg = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
+    isolated_sid = _new_agent_session_id() if isolated_session else None
+    cmd, stdin_msg = _prepare_cli_command(
+        message,
+        image_paths=image_paths,
+        lane=lane,
+        session_id_override=isolated_sid,
+    )
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     _turn_t0 = time.monotonic()
@@ -6938,7 +7009,7 @@ def call_agent_cli(
         observed_sid = command_sid or _extract_session_id(raw_transport)
     else:
         observed_sid = _extract_session_id(raw_transport) or command_sid
-    if observed_sid:
+    if observed_sid and not isolated_session:
         _save_agent_session_id(observed_sid)
         _record_agent_session_turn(
             observed_sid,
@@ -6959,6 +7030,7 @@ def call_agent_cli(
         if (
             _is_claude_code_cmd(cmd)
             and _resume_sid
+            and not isolated_session
             and _resume_sid == _load_agent_session_id()
             and _CLAUDE_MISSING_SESSION_RE.search(raw_transport)
         ):
@@ -7050,7 +7122,7 @@ def call_agent_cli(
                 ))
             _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
             raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
-            if observed_sid:
+            if observed_sid and not isolated_session:
                 _record_agent_session_turn(
                     observed_sid,
                     sent_bytes=len((message or "").encode("utf-8")),
@@ -7073,7 +7145,11 @@ def call_agent_cli(
             # 0 EVEN ON API ERRORS (see the raise below), so returncode is not pi's
             # success signal. A failed turn must not eat the bridge, or the retry
             # faces a blank session with no history and the user drops out.
-            if observed_sid and _message_has_injected_history(message):
+            if (
+                observed_sid
+                and not isolated_session
+                and _message_has_injected_history(message)
+            ):
                 _mark_agent_session_bridged(observed_sid)
             # Same lane discipline as codex: background memory lanes (raw_text)
             # get the bare reply; only foreground chat folds thinking into the
@@ -7431,6 +7507,7 @@ def call_agent(
     lane: str = "background",
     attempt_trigger: str = "first",
     stream_update: Callable[[int, str, bool], None] | None = None,
+    isolated_session: bool = False,
 ) -> Any:
     # `_turn_reply_parse_failed` is a per-turn signal: reset it at entry so a
     # prior turn's failure (or a suppressed leak below) never bleeds into this
@@ -7444,12 +7521,18 @@ def call_agent(
             # http path metrics/timing are out of scope for this event pair (cli-only);
             # trace_id is accepted here for a uniform call signature but unused.
             # lane gates MCP injection, which only exists on the cli path — unused here.
-            return call_agent_http(message, images=images, raw_text=raw_text)
+            return call_agent_http(
+                message,
+                images=images,
+                raw_text=raw_text,
+                isolated_session=isolated_session,
+            )
         if AGENT_MODE == "cli":
             return call_agent_cli(
                 message, image_paths=image_paths, raw_text=raw_text,
                 trace_id=trace_id, lane=lane, attempt_trigger=attempt_trigger,
-                stream_update=stream_update)
+                stream_update=stream_update,
+                isolated_session=isolated_session)
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
     raw = _call_with_resident_busy_poll(_invoke, lane=lane)
@@ -9127,6 +9210,91 @@ def poll_proactive_jobs(since: float) -> dict:
     return body
 
 
+def _vision_probe_error_code(exc: BaseException) -> str:
+    notice = classify_agent_error(exc)
+    return {
+        "auth_invalid": "vision_model_auth_invalid",
+        "quota_insufficient": "vision_model_quota_insufficient",
+        "model_not_found": "vision_model_not_found",
+        "provider_incompatible": "vision_model_incompatible",
+        "rate_limited": "vision_model_rate_limited",
+        "upstream_unavailable": "vision_model_unavailable",
+        "turn_timeout": "vision_model_unavailable",
+        "reply_parse_failed": "vision_model_empty_response",
+    }.get(notice.error_class, "vision_model_failed")
+
+
+def _process_vision_probe(result: dict) -> None:
+    """Run the hidden two-image control probe outside chat/session state."""
+    probe = result.get("vision_probe")
+    if not isinstance(probe, dict):
+        return
+    probe_id = str(probe.get("probe_id") or "").strip()
+    images = probe.get("images") if isinstance(probe.get("images"), list) else []
+    if not probe_id or len(images) != 2:
+        return
+    payload: dict[str, Any] = {"probe_id": probe_id, "status": "failed"}
+    temp_paths: list[str] = []
+    try:
+        runtime_images: list[dict[str, str]] = []
+        for index, image in enumerate(images):
+            if not isinstance(image, dict):
+                raise ValueError("invalid vision probe image")
+            data_url = str(image.get("data_url") or "").strip()
+            if not data_url.startswith("data:image/png;base64,"):
+                raise ValueError("invalid vision probe image")
+            raw = base64.b64decode(data_url.split(",", 1)[1], validate=True)
+            runtime_images.append({"data_url": data_url, "mime_type": "image/png"})
+            fd, path = tempfile.mkstemp(prefix=f"io-vision-probe-{index}-", suffix=".png")
+            try:
+                os.write(fd, raw)
+            finally:
+                os.close(fd)
+            temp_paths.append(path)
+        prompt = (
+            "Private capability check. Inspect both attached images. Each has four "
+            "solid stripes. Reply with exactly two lines, one per image in order, "
+            "using only four lowercase color names separated by commas."
+        )
+        raw_reply = call_agent(
+            prompt,
+            images=runtime_images,
+            image_paths=temp_paths,
+            raw_text=True,
+            lane="background",
+            isolated_session=True,
+        )
+        colors = re.findall(
+            r"red|green|blue|yellow", str(raw_reply or "").lower()
+        )[:8]
+        if len(colors) != 8:
+            payload["error_code"] = "vision_model_empty_response"
+        else:
+            payload = {
+                "probe_id": probe_id,
+                "status": "ok",
+                "observed": [",".join(colors[:4]), ",".join(colors[4:8])],
+            }
+    except Exception as exc:  # noqa: BLE001 -- result must reach server
+        payload["error_code"] = _vision_probe_error_code(exc)
+    finally:
+        for path in temp_paths:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+    try:
+        response = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/internal/vision/main/test/result",
+            json=payload,
+            headers=_HEADERS,
+            timeout=15,
+        )
+        response.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 -- later polls can re-deliver pending probe
+        log.warning("vision control probe result post failed: %s", type(exc).__name__)
+
+
 def _proactive_tick_trigger_for_broadcast_state(broadcast_state: str) -> str:
     state = str(broadcast_state or "").strip().lower()
     if not state or state == "off":
@@ -9510,6 +9678,8 @@ def post_reply(
     turn_failure_error_class: str = "",
     turn_failure_blame: str = "",
     turn_failure_user_text: str = "",
+    turn_failure_model: str = "",
+    turn_failure_provider: str = "",
     file_followups: list[StagedChatFile] | None = None,
 ) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
@@ -9605,6 +9775,16 @@ def post_reply(
                 body["turn_failure_error_class"] = turn_failure_error_class
                 body["turn_failure_blame"] = turn_failure_blame
                 body["turn_failure_user_text"] = turn_failure_user_text
+                failure_model = _sanitize_thinking_meta(
+                    turn_failure_model, max_len=96
+                )
+                failure_provider = _sanitize_thinking_meta(
+                    turn_failure_provider, max_len=80
+                )
+                if failure_model:
+                    body["turn_failure_model"] = failure_model
+                if failure_provider:
+                    body["turn_failure_provider"] = failure_provider
             if reply_to_message_id:
                 body["reply_to_message_id"] = reply_to_message_id
             if sealed_file_followups:
@@ -13005,6 +13185,14 @@ def _process_messages(messages: list) -> float:
                 )
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
+            if content_type == "image" and not isinstance(e, VisionObserverFailure):
+                e = VisionObserverFailure(
+                    _vision_probe_error_code(e),
+                    detail=type(e).__name__,
+                    raw_user_text=raw_user_content_for_lang,
+                    model=str(AGENT_RUNTIME_METADATA.get("model") or ""),
+                    provider=str(AGENT_RUNTIME_METADATA.get("provider") or ""),
+                )
             # Codex review I10: call_agent raised, so the prompt (catalog
             # included, if _prepend_io_cli_capability_catalog injected it
             # above) never reached the model this turn — drop the pending
@@ -13254,7 +13442,10 @@ def _process_messages(messages: list) -> float:
                 # post_kwargs（proactive 那处）刻意不带——后台失败不进聊天流。
                 if idx == 0 and pending_failure_notice is not None:
                     post_kwargs.update(
-                        turn_failure_post_kwargs(classify_agent_error(pending_failure_notice))
+                        turn_failure_post_kwargs(
+                            classify_agent_error(pending_failure_notice),
+                            failure=pending_failure_notice,
+                        )
                     )
                 if idx == 0 and staged_outbound_files:
                     post_kwargs["file_followups"] = staged_outbound_files
@@ -14735,6 +14926,10 @@ def run() -> None:
             # turn. No-op when the fingerprint hasn't moved (best-effort;
             # failures log and retry on a later poll).
             _maybe_apply_user_mcp()
+
+            # Hidden control-plane capability probe. It never becomes a chat
+            # message and uses a fresh isolated model session.
+            _process_vision_probe(result)
 
             if result.get("timed_out"):
                 # Idle moment: safe to swap to the backend's commit and re-exec

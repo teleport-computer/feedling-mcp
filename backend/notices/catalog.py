@@ -50,6 +50,15 @@ ERROR_CLASSES = frozenset({
     "resident_decrypt_source_unavailable",
     "resident_decrypt_health_unreported",
     "resident_never_claimed",
+    "vision_model_auth_invalid",
+    "vision_model_quota_insufficient",
+    "vision_model_not_found",
+    "vision_model_incompatible",
+    "vision_model_rate_limited",
+    "vision_model_unavailable",
+    "vision_model_empty_response",
+    "vision_model_not_ready",
+    "vision_model_failed",
 })
 
 # error_class -> (blame, user_text)
@@ -105,6 +114,24 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "user_environment", "你的 VPS resident 端没有上报可验证的解密健康状态,通常是 consumer 版本太旧,请更新并重启。"),
     "resident_never_claimed": (
         "user_environment", "你的 VPS resident consumer 长时间没有接走入住/记忆蒸馏任务，请更新并重启。"),
+    "vision_model_auth_invalid": (
+        "user_provider", "视觉模型的 API Key 无效或已过期，请到设置里重新保存。"),
+    "vision_model_quota_insufficient": (
+        "user_provider", "视觉模型服务额度不足，充值后再试。"),
+    "vision_model_not_found": (
+        "user_provider", "当前视觉模型不可用，请到设置里更换模型。"),
+    "vision_model_incompatible": (
+        "user_provider", "当前视觉模型无法读取这张图片，请到设置里更换模型。"),
+    "vision_model_rate_limited": (
+        "provider_transient", "视觉模型请求太多，请稍等几分钟再试。"),
+    "vision_model_unavailable": (
+        "provider_transient", "视觉模型暂时无法连接，请稍后重试。"),
+    "vision_model_empty_response": (
+        "provider_transient", "视觉模型没有返回图片内容，请重试或更换模型。"),
+    "vision_model_not_ready": (
+        "user_provider", "视觉模型尚未准备好，请到设置里重新保存或更换模型。"),
+    "vision_model_failed": (
+        "provider_transient", "视觉模型处理失败，请重试；如果仍失败，请更换模型。"),
 }
 
 _FALLBACK_BLAME = "system"

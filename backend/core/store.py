@@ -541,6 +541,8 @@ class UserStore:
                 "turn_failure_error_class",
                 "turn_failure_blame",
                 "turn_failure_user_text",
+                "turn_failure_model",
+                "turn_failure_provider",
                 "terminal_failure_job_id",
                 "reply_to_message_id",
             ):
@@ -738,6 +740,8 @@ class UserStore:
                 "turn_failure_error_class",
                 "turn_failure_blame",
                 "turn_failure_user_text",
+                "turn_failure_model",
+                "turn_failure_provider",
                 "terminal_failure_job_id",
             ):
                 value = extra.get(key)
@@ -1115,6 +1119,8 @@ class UserStore:
             # 回合失败冗余持久化（spec 2026-07-18 §2.2）。权威载体是兜底回复消息；
             # 这里是全量 history / 重启后的恢复路径。
             "reply_error_class",
+            "reply_failure_model",
+            "reply_failure_provider",
             "reply_blame",
             "reply_user_text",
         }

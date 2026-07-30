@@ -40,10 +40,35 @@ def runtime_capability(store) -> dict:
 
 
 def dedicated_route_for_send(store) -> tuple[dict | None, tuple[dict, int] | None]:
-    """Return the optional dedicated route without blocking image ingestion.
+    """Return the optional dedicated route and reject only a known text-only route.
 
-    Follow-main is the compatibility default. A manually selected dedicated
-    route is pinned for downstream delivery, but capability/test state remains
-    settings feedback rather than a send-time gate.
+    Untested/failed/testing verdicts still flow to the real call. A cached
+    ``unsupported`` verdict is definitive for its exact provider/model binding,
+    so reject it before persisting pixels while keeping image selection enabled.
     """
-    return db.model_api_vision_route(store.user_id), None
+    selected = db.model_api_vision_route(store.user_id)
+    if selected is not None:
+        route = selected
+    elif accounts_onboarding._load_onboarding_route(store) == "model_api":
+        route = db.model_api_active_route(store.user_id)
+    else:
+        resident = chat_consumer.resident_vision_validation(store)
+        if str(resident.get("status") or "") != "unsupported":
+            return None, None
+        return None, ({
+            "error": "vision_model_incompatible",
+            "retryable": False,
+            "provider": str(resident.get("provider") or ""),
+            "model": str(resident.get("model") or ""),
+        }, 400)
+
+    if not isinstance(route, dict) or str(
+        route.get("vision_test_status") or "untested"
+    ) != "unsupported":
+        return selected, None
+    return None, ({
+        "error": "vision_model_incompatible",
+        "retryable": False,
+        "provider": str(route.get("provider") or ""),
+        "model": str(route.get("model") or ""),
+    }, 400)

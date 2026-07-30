@@ -16,6 +16,17 @@ change must not be interpreted as an API guarantee.
   or select a vision-capable model instead of showing the generic retry-later
   reply. Image sends remain ungated: probe status does not block delivery.
 
+- **Main-model image validation now uses one runtime-neutral endpoint.**
+  `POST /v1/vision/main/test` trusts only explicit provider catalog modalities;
+  when metadata is missing, it performs a real two-image capability probe.
+  Model API routes return a terminal `ok`, `unsupported`, `failed`, or
+  `untested` result. Resident runtimes return `202 testing` while an isolated,
+  hidden probe runs; clients then refresh `GET /v1/vision/config`. Known
+  `unsupported` provider/model bindings reject image sends immediately with
+  `vision_model_incompatible`, while untested bindings still receive a real
+  call. Runtime failures expose stable visual error codes and the exact
+  provider/model without putting probe traffic into Chat history or activity.
+
 - **Hosted Runtime V2 chat sends can request provider reasoning per turn.**
   `POST /v1/model_api/chat/send` accepts the optional boolean
   `include_reasoning`; omission preserves the previous disabled behavior. The

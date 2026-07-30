@@ -172,6 +172,11 @@ def observe_pinned_message(
     route_id = str(payload.get("route_id") or "").strip()
     if not message_id or not route_id:
         return {"error": "vision_observer_invalid_request"}, 400
+    route = db.model_api_route_get(store.user_id, route_id) or {}
+    identity = {
+        "provider": str(route.get("provider") or "")[:80],
+        "model": str(route.get("model") or "")[:96],
+    }
 
     try:
         rows = store.reload_chat_strict()
@@ -246,9 +251,11 @@ def observe_pinned_message(
             "error_class": failure.error_code,
             "status_code": failure.status_code,
             "retryable": failure.retryable,
+            **identity,
         }, 502
     return {
         "message_id": message_id,
         "route_id": route_id,
         "observation": observation,
+        **identity,
     }, 200
