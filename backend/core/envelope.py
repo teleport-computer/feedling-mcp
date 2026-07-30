@@ -8,6 +8,7 @@ ABOVE core in the dependency stack — the assembly layer (asgi/lifespan.py) inj
 import base64
 import hashlib
 
+import content_encryption
 from content_encryption import build_envelope
 
 from core import enclave
@@ -17,6 +18,16 @@ from core import enclave
 # pubkey, or "" if the user predates v1 registration.
 def get_user_public_key(user_id: str) -> str:
     raise RuntimeError("core.envelope.get_user_public_key not wired by assembly layer")
+
+
+# Injected by the assembly layer (accounts sits ABOVE core, so core must not
+# import it): the user's **生效**内容形状，"on" | "off"。
+#
+# 默认 "on" 而不是 raise：写侧的安全失败方向是**加密**。装配层没接线（纯单元测试、
+# 某个 worker 进程漏接）时全体走加密，行为与改造前逐字一致；绝不能因为一处漏接线
+# 就把用户内容明文落库。
+def resolve_content_encryption(user_id: str) -> str:
+    return "on"
 
 
 # 服务端是否接受明文形状的内容写入。**Task 2.2 完成前必须是 False**：客户端
@@ -150,6 +161,25 @@ def envelope_storage_fields(envelope: dict, *,
     return out
 
 
+def replace_record_shape(record: dict, envelope: dict) -> None:
+    """原地把 ``record`` 的内容字段换成 ``envelope`` 的形状（swap / rewrap 用）。
+
+    与 ``envelope_storage_fields`` 的关键区别：这里要**跨形状**。信封转明文时必须
+    把所有密文字段删干净——读侧的规则是 ``body_ct`` 优先于 ``body``，留下一个旧
+    ``body_ct`` 就会让读到的永远是换之前的过期内容，而且完全静默。反向同理，
+    留下 ``body`` 等于服务端仍能读到本该被加密的正文。
+
+    只碰内容字段：站点自有字段（role / ts / type / content_type…）原样保留。
+    """
+    for key in _SEALED_FIELDS:
+        record.pop(key, None)
+    record.pop("body", None)
+    record.update(envelope_storage_fields(envelope))
+    if envelope.get("body_ct"):
+        # 落库行历来恒有此键（缺省空串）：rewrap 的跳过逻辑直接从行上读它。
+        record.setdefault("enclave_pk_fpr", "")
+
+
 def envelope_prefixed_fields(envelope: dict, prefix: str) -> dict:
     """把**子信封**摊平成 ``<prefix>_*`` 字段，合进父聊天行（thinking / caption）。
 
@@ -181,6 +211,20 @@ def _build_shared_envelope_for_store(
     *,
     item_id: str | None = None,
 ) -> tuple[dict | None, str]:
+    if resolve_content_encryption(store.user_id) == "off":
+        # 明文档：不取 enclave 公钥，因此 enclave 故障不连坐明文档用户的写入。
+        try:
+            body = plaintext.decode("utf-8")
+        except UnicodeDecodeError:
+            # 明文列是 text；二进制正文走 R2 指针，不该到这里。
+            return None, "plaintext_body_not_utf8"
+        return {
+            "body": body,
+            "id": item_id or content_encryption.random_item_id(),
+            "owner_user_id": store.user_id,
+            "visibility": "shared",
+        }, ""
+
     material = _model_api_key_encryption_material(store)
     if material[0] is None:
         return None, str(material[1])

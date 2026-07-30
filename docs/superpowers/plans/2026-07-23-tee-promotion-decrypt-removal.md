@@ -386,6 +386,34 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
       `genesis/genesis_core.py`，07-23 快照行号细案重扫）：明文档用户接受
       `{body:...}` 明文直存；加密档用户接受双收件人信封（K_user+K_enclave）
       原样存。按行存原样，服务端不转换。
+#### 2026-07-30：写侧路由第三次尝试 —— 成了
+
+前两次回退的记录留在 `tests/test_write_side_format_routing.py` 的模块 docstring 里。
+这次先做完 29 个拆包点的普查与迁移（见下节）+ B3 swap 通道，才动写侧。
+**L1 7249 passed / 0 failed**，且 skip 从 6 降到 1（那 5 条一直被跳过的 spec 测试
+终于真跑了）。
+
+**依赖方向的解法**：`core` 不能 import `accounts`，所以用本文件已有的装配层注入
+模式（`get_user_public_key` 就是这么做的）新增
+`core.envelope.resolve_content_encryption(user_id) -> "on"|"off"`，由
+`asgi/lifespan.py` (4c) 接到 `registry.effective_content_encryption`。
+
+三个刻意的设计点：
+
+- **未接线时默认 `"on"` 而不是 raise。** 写侧的安全失败方向是加密：某个 worker
+  漏接线不能变成「把用户内容明文落库」。副作用是所有不接装配层的纯单元测试行为
+  与改造前逐字一致——这也是这次 L1 一把过的原因之一。
+- **接的是 effective 而不是原始偏好。** 于是服务端自产内容与客户端上传闸受
+  **同一个开关**（`PLAINTEXT_WRITES_ACCEPTED`）管，不可能一边放开一边没放。
+- **明文分支完全不取 enclave 公钥、也不取用户内容公钥。** 明文档因此不被 enclave
+  故障或「老账号没有内容公钥」连坐（有测试把这两个都换成 raise 来锁）。
+
+二进制正文（非 UTF-8）在明文分支返回 `plaintext_body_not_utf8` 而不是静默乱码——
+明文列是 text，二进制走 R2 指针，走到这里说明调用方错了。
+
+> **现网仍然一行明文都不会产生**：`PLAINTEXT_WRITES_ACCEPTED is False` ⇒ effective
+> 恒 `"on"`。剩下的是**放开客户端各写闸**（下面那条），然后翻那个常量。
+
 - [ ] 服务端封装点：**按目标用户偏好** —— 明文用户直写明文，加密用户仍封双收件人
       信封（服务端自产内容如 agent 回复，对加密用户经 enclave 公钥封存）。
       > **2026-07-29 侦察：不必逐个改。** 实测 43 个封装点里 **40 处都经
@@ -592,7 +620,7 @@ AST 扫全仓 `X["body_ct"]`，把每处反向定位到其所属函数，再判�
 | **A. 与生产者同函数** | 7 | ✅ 已迁移 |
 | **B1. callee，服务端写路径** | 6 | ✅ 已迁移 |
 | **B2. 前缀子信封**（`thinking_*` / `caption_*`） | 3 | ✅ 已迁移（`envelope_prefixed_fields`） |
-| **B3. swap 通道**（`content_core.py` ×4） | 4 | ⏳ 属**客户端上传**路径，有独立硬校验，随 Task 2.3 一起改 |
+| **B3. swap 通道**（`content_core.py` ×4） | 4 | ✅ 3 处已迁（`replace_record_shape`）；第 4 处 `_apply_sub_envelope_fields` 是 rewrap 专用、输入恒为重封信封，硬拆包在那里是正确的断言，**核实无需改动** |
 | **B4. R2 卸载/注水**（`db.py`） | 4 | ✅ 核实全部已被 `body_ct is not None` 守卫，明文行只跳过、不会炸 |
 | **B5. 不该动** | 2 | `enclave/envelope.py:109`（解密实现本身）、`genesis/genesis_core.py:365`（赋值构造） |
 
@@ -673,11 +701,26 @@ L1 **7219 passed / 0 failed**（含 `tests/test_envelope_storage_fields.py` 16 �
 - [ ] 两处 enclave 内计算（VLM caption、memory index）**保留**——服务加密用户；
       明文用户可选走 backend 内联明文版（性能优化，细案定，非必须）。
 - [x] `content/content_core.py`：rewrap **保留**且已核实对明文行安全（见上）。
-- [ ] swap 通道本体（普查 B3 类，`content_core.py` 的 4 处硬拆包）仍待改——它是
-      加密开关切换 + 那 7 条 local_only 转明文的通道，**属客户端上传路径**，有
-      独立的硬形状校验，要连同 `_swap_chat` / `_swap_memory_inplace` /
-      `_apply_envelope_fields` / `_apply_sub_envelope_fields` 一起设计。
-      **这是写侧形状真正切换的最后一个前置。**
+- [x] **swap 通道跨形状替换**（2026-07-30 完成）。它是加密开关切换的执行通道：
+      偏好 on→off，存量行要逐条从双收件人信封换成明文；也是那 7 条 local_only
+      转明文的通道。
+
+      新增 `core.envelope.replace_record_shape(record, envelope)`：**先把两种形状
+      的内容字段全删掉，再合入新形状**。要害不是「写新字段」而是「删对面残留」
+      ——读侧规则是 `body_ct` 优先于 `body`，信封转明文时若留下旧 `body_ct`，
+      读到的永远是换之前的过期内容，**而且完全静默**。反向留下 `body` 则等于
+      服务端仍能读到本该被加密的正文。三处（`_swap_chat` /
+      `_swap_memory_inplace` / `_apply_envelope_fields`）收敛到它，各自原本略有
+      差异的 `enclave_pk_fpr` / `content_pk_fpr` 处理也在 helper 里统一了。
+
+      `_swap_envelope_missing` 改成两种形状都收；`shared 必须有 K_enclave` 这道闸
+      **只对信封行生效**（明文行没有 K_enclave 会被它拦死）。
+
+      **新增一条安全边界**：明文 + `local_only` 必须拒。`local_only` 的含义是
+      「只有设备解得开」，靠的就是没有 K_enclave；一行明文服务端天然读得到，
+      标成 local_only 等于给用户一个**假的隐私承诺**。
+
+      `tests/test_swap_shape_transition.py` 14 例，含四象限残留检查与该边界。
 - [ ] `tee_replicator/worker.py`：~~decrypt 回调~~已改形状路由（明文行不白跑一趟
       enclave）；明文行走 mirror 双写；密文行（加密用户）继续
       经 enclave 解密复制进 TEE 或原样搬运信封（细案定 cutover 后 TEE 主库里
