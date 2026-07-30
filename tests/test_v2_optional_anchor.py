@@ -394,6 +394,10 @@ def test_prefix_stable_again_after_an_advance(monkeypatch):
     seed_user(uid)
     _reset_anchor_hotpath_user(uid)
     monkeypatch.setattr(worker, "_CHAT_TAIL_MAX_TURNS", 3)
+    # 同时下调锚点滞后窗口本身（喂给 `read_recent_turns` 的路径①），否则默认
+    # 60 轮 > 这里播的 30 轮历史，窗口永远装得下全部历史、永远不滑动——路径①
+    # 在测试里根本不存在（全分支评审 C1 抓到的鉴别力缺口）。
+    monkeypatch.setattr(worker, "_CHAT_TAIL_ANCHOR_MAX_TURNS", 10)
 
     seqs = [
         _seed_chat_row(uid, f"{uid}-r{i}", 1000.0 + i,
@@ -458,6 +462,10 @@ def test_prompt_prefix_is_byte_identical_across_consecutive_turns(monkeypatch):
     seed_user(uid)
     _reset_anchor_hotpath_user(uid)
     monkeypatch.setattr(worker, "_CHAT_TAIL_MAX_TURNS", 3)
+    # 同时下调锚点滞后窗口本身（喂给 `read_recent_turns` 的路径①），否则默认
+    # 60 轮 > 这里播的 30 轮历史，窗口永远装得下全部历史、永远不滑动——路径①
+    # 在测试里根本不存在（全分支评审 C1 抓到的鉴别力缺口）。
+    monkeypatch.setattr(worker, "_CHAT_TAIL_ANCHOR_MAX_TURNS", 10)
 
     # 30 轮历史（60 行，user/openclaw 交替）落在 watermark 之下 → 成为 optional
     # 重放素材。watermark = 这批历史里最后一行的 seq，即"从未压缩过、但已经有
