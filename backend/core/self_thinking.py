@@ -34,7 +34,11 @@ _THINK_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Kill switch, DEFAULT ON (hx: this feature ships enabled — tested on test, on in
+# main). It is a rollback闸, not a feature gate: set the env var to 0/false/off to
+# disable and restore byte-identical prior behaviour on both runtimes.
 _ENV_FLAG = "FEEDLING_V2_SELF_THINKING"
+_OFF_VALUES = frozenset({"0", "false", "no", "off"})
 
 INSTRUCTION = (
     " At the very start of every reply, put one short first-person sentence, in the "
@@ -48,7 +52,7 @@ _BIDI_CONTROLS = frozenset("‪‫‬‭‮⁦⁧⁨⁩‎‏")
 
 
 def enabled() -> bool:
-    return os.environ.get(_ENV_FLAG, "0").strip().lower() in {"1", "true", "yes", "on"}
+    return os.environ.get(_ENV_FLAG, "1").strip().lower() not in _OFF_VALUES
 
 
 def _sanitize(value: str) -> str:
