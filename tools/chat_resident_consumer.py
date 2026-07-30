@@ -196,6 +196,12 @@ class AgentTurn:
     thinking_source: str = ""
     thinking_model: str = ""
     thinking_native: bool | None = None
+    # TRUE only when this thinking was parsed out of a leading <think> block by our
+    # own local parser (_split_tagged_thinking) on THIS host — never set from any
+    # provider/CLI JSON field. This is the spoof-proof provenance the self-authored
+    # precedence keys off: an upstream turn that merely *declares*
+    # reasoning_source="self_thinking" in its JSON cannot flip this flag.
+    thinking_self_authored: bool = False
     actions: list[dict] = field(default_factory=list)
     runtime_debug: dict = field(default_factory=dict)
     tool_calls: list[dict] = field(default_factory=list)
@@ -3908,20 +3914,43 @@ def _thinking_summary_from_value(value: Any) -> str:
     return ""
 
 
-def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
-    dst.actions.extend(src.actions)
-    dst.messages.extend(src.messages)
-    dst.tool_calls.extend(src.tool_calls)
-    prefer_src_thinking = bool(src.thinking_summary) and (
-        not dst.thinking_summary
-        or (src.thinking_native is True and dst.thinking_native is not True)
-    )
-    if prefer_src_thinking:
+def _prefer_thinking(dst: AgentTurn, src: AgentTurn) -> None:
+    """Adopt ``src``'s thinking into ``dst`` per the self-authored precedence.
+
+    THE single decision point for "whose thinking wins" — every path that can
+    carry thinking (object merge, stream fallback, …) routes through here so no
+    arrival order silently bypasses the rule.
+
+    Feature ON: a locally-parsed self-authored <think> (``thinking_self_authored``,
+    which upstream JSON cannot forge) wins over provider-native reasoning; within
+    the same provenance class the first-seen thinking is kept. Feature OFF: legacy
+    rule — provider-native reasoning wins over inlined content.
+    """
+    if not src.thinking_summary:
+        return
+    if not dst.thinking_summary:
+        take = True
+    else:
+        from core import self_thinking as _self_thinking_v1
+
+        if _self_thinking_v1.enabled():
+            take = src.thinking_self_authored and not dst.thinking_self_authored
+        else:
+            take = src.thinking_native is True and dst.thinking_native is not True
+    if take:
         dst.thinking_summary = src.thinking_summary
         dst.thinking_kind = src.thinking_kind
         dst.thinking_source = src.thinking_source
         dst.thinking_model = src.thinking_model
         dst.thinking_native = src.thinking_native
+        dst.thinking_self_authored = src.thinking_self_authored
+
+
+def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
+    dst.actions.extend(src.actions)
+    dst.messages.extend(src.messages)
+    dst.tool_calls.extend(src.tool_calls)
+    _prefer_thinking(dst, src)
     dst.runtime_debug.update(src.runtime_debug)
     return dst
 
@@ -4171,12 +4200,11 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
             for item in json_objects:
                 _merge_agent_turn(turn, _agent_turn_from_obj(item))
             stream_turn = _agent_turn_from_stream_json_events(json_objects)
-            if stream_turn.thinking_summary and not turn.thinking_summary:
-                turn.thinking_summary = stream_turn.thinking_summary
-                turn.thinking_kind = stream_turn.thinking_kind
-                turn.thinking_source = stream_turn.thinking_source
-                turn.thinking_model = stream_turn.thinking_model
-                turn.thinking_native = stream_turn.thinking_native
+            # Route through the shared precedence, NOT a bare "only if empty" copy:
+            # when a full assistant block already landed native reasoning and the
+            # <think> only shows up in later text_delta events, stream_turn is the
+            # self-authored one and must be able to win over that native (feature on).
+            _prefer_thinking(turn, stream_turn)
             if stream_turn.messages and not turn.messages:
                 turn.messages = stream_turn.messages
             # It WAS transport — return its result even when empty (e.g. a lone
@@ -4189,13 +4217,17 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         raw, tagged_thinking = _split_tagged_thinking(raw)
         raw = _truncate_at_unclosed_thinking(raw)
         if tagged_thinking:
-            # Inlined reasoning is NOT provider-native — keep it as a non-native
-            # fallback so a genuine provider-native reasoning still wins in
-            # _merge_agent_turn.
+            # Our self-authored <think> block, parsed locally on THIS host. With the
+            # feature on, the precedence in _merge_agent_turn PREFERS this over the
+            # model's native reasoning ("有 <think> 就用它"); with the feature off,
+            # native still wins (legacy behavior). thinking_self_authored is the
+            # spoof-proof marker (set ONLY here); native-ness is recorded honestly as
+            # False — it is io's own thought, not provider CoT.
             turn.thinking_summary = _sanitize_thinking_summary(tagged_thinking)
             turn.thinking_kind = "provider_reasoning_summary"
             turn.thinking_source = "tagged_content"
             turn.thinking_native = False
+            turn.thinking_self_authored = True
         if not raw.strip():
             return turn
         decision, payload = _scan_visible_protocol(raw)
@@ -5122,13 +5154,19 @@ def _provider_attempt_rows_for_result(
     }]
 
 
-def _extract_text_from_cli_output(raw: str) -> str:
+def _extract_text_from_cli_output(raw: str, *, preserve_tagged: bool = False) -> str:
     """Best-effort extraction from raw CLI stdout.
 
     1. Try JSON parse first when a runtime provides structured output.
     2. Remove explicit reasoning/code sections.
     3. Strip known headers/footers.
     4. Return the full remaining answer, preserving multi-paragraph replies.
+
+    ``preserve_tagged``: when True, a leading self-authored ``<think>`` block is
+    left in the returned text instead of being stripped and discarded. The chat
+    lane sets this so a downstream parse can still recover the self-authored
+    thinking; memory lanes keep the default (strip) so their own extractors see
+    clean text.
     """
     raw = raw.strip()
     if not raw:
@@ -5142,7 +5180,8 @@ def _extract_text_from_cli_output(raw: str) -> str:
         if text:
             return text
 
-    raw, _tagged_thinking = _split_tagged_thinking(raw)
+    if not preserve_tagged:
+        raw, _tagged_thinking = _split_tagged_thinking(raw)
     raw = _strip_reasoning_sections(raw)
     clean = [ln.rstrip() for ln in raw.splitlines() if not _NOISE_LINE_RE.match(ln)]
     text = "\n".join(clean).strip()
@@ -6236,29 +6275,6 @@ def _strip_cli_flags(cmd: list[str], flags: set[str]) -> tuple[list[str], bool]:
     return out, removed
 
 
-# Driver native-reasoning flags (value-bearing) — dropped for self-authored
-# thinking on chat turns so the model emits our <think> instead of hidden native
-# CoT: claude ``--effort <level>``, pi ``--thinking <level>``.
-_NATIVE_THINKING_VALUE_FLAGS = frozenset({"--effort", "--thinking", "--reasoning-effort"})
-
-
-def _strip_cli_value_flags(cmd: list[str], flags: set[str]) -> tuple[list[str], bool]:
-    """Drop each ``--flag VALUE`` pair whose flag is in ``flags``."""
-    out: list[str] = []
-    removed = False
-    skip_next = False
-    for token in cmd:
-        if skip_next:
-            skip_next = False
-            continue
-        if token in flags:
-            removed = True
-            skip_next = True  # also drop the value token that follows
-            continue
-        out.append(token)
-    return out, removed
-
-
 def _has_cli_resume(cmd: list[str]) -> bool:
     return "--resume" in cmd or "-r" in cmd
 
@@ -6786,18 +6802,11 @@ def call_agent_cli(
             "template (e.g. claude -p \"{message}\")."
         )
     cmd, stdin_msg = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
-    # Self-authored thinking: on a foreground CHAT turn, drop the driver's native
-    # reasoning flags so the model emits OUR parseable <think> block instead of
-    # hidden native CoT (which would otherwise win over the tagged block). Chat lane
-    # only + gated on the same kill switch as the prompt injection. Universal —
-    # cloud-V1 and VPS both build the command here.
-    if lane == "chat":
-        from core import self_thinking as _self_thinking_v1
-
-        if _self_thinking_v1.enabled():
-            cmd, _stripped_native = _strip_cli_value_flags(
-                cmd, _NATIVE_THINKING_VALUE_FLAGS
-            )
+    # Self-authored thinking does NOT strip the driver's native reasoning flags: the
+    # model keeps thinking natively (answer quality unchanged), and we additionally
+    # ask it to open its reply with a <think> block (see the prompt injection on the
+    # chat dispatch path). When the model writes that block we prefer it; otherwise we
+    # display the shaped native reasoning. So native reasoning stays on here.
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     _turn_t0 = time.monotonic()
@@ -7165,7 +7174,11 @@ def call_agent_cli(
     if _is_hermes_chat_cmd(cmd) and observed_sid:
         hermes_reasoning = _hermes_session_reasoning(observed_sid)
     if hermes_reasoning:
-        text = _extract_text_from_cli_output(raw)
+        # Keep a leading self-authored <think> in the reply text: the downstream
+        # re-parse recovers it and (feature on) prefers it over this hermes native
+        # reasoning. Without preserve_tagged the <think> was stripped and discarded
+        # here, so hermes turns could never show self-authored thinking.
+        text = _extract_text_from_cli_output(raw, preserve_tagged=True)
         if text.strip():
             return _attach_provider_reasoning(
                 text,

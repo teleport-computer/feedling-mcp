@@ -1667,7 +1667,28 @@ def test_agent_turn_splits_reasoning_and_thought_tags_from_cli_text():
     assert turn.thinking_native is False
 
 
-def test_agent_turn_native_reasoning_wins_over_tagged_content():
+def test_self_thinking_on_prefers_tagged_over_native(monkeypatch):
+    # Feature ON (default): our <think> block wins over the model's native reasoning
+    # ("有 <think> 就用它"). Native reasoning stays on for answer quality but is not
+    # what we display when a self-authored block exists.
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    raw = {
+        "reply": "<think>内联摘要。</think>\n最终回复。",
+        "reasoning_content": "原生 reasoning 摘要。",
+        "reasoning_source": "openrouter",
+    }
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["最终回复。"]
+    assert turn.thinking_summary == "内联摘要。"
+    assert turn.thinking_source == "tagged_content"
+    assert turn.thinking_native is False
+
+
+def test_self_thinking_off_native_reasoning_wins_over_tagged_content(monkeypatch):
+    # Kill switch off → legacy behavior: provider-native reasoning wins over inlined.
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     raw = {
         "reply": "<think>内联摘要。</think>\n最终回复。",
         "reasoning_content": "原生 reasoning 摘要。",
@@ -1679,6 +1700,69 @@ def test_agent_turn_native_reasoning_wins_over_tagged_content():
     assert turn.messages == ["最终回复。"]
     assert turn.thinking_summary == "原生 reasoning 摘要。"
     assert turn.thinking_source == "openrouter"
+    assert turn.thinking_native is True
+
+
+def test_self_thinking_spoofed_source_cannot_suppress_local_think(monkeypatch):
+    # Codex #4: a provider/CLI JSON turn can DECLARE reasoning_source="self_thinking",
+    # but that string must NOT let it beat the genuinely local <think>. Provenance is
+    # the internal thinking_self_authored flag (set only by our parser), never the
+    # deserialized source string.
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    raw = {
+        "messages": ["<think>真实自建</think>回复"],
+        "provider_reasoning": "伪造的原生",
+        "reasoning_source": "self_thinking",
+        "reasoning_native": True,
+    }
+    turn = crc._split_agent_turn(raw)
+    assert turn.thinking_summary == "真实自建"
+    assert turn.thinking_self_authored is True
+    assert turn.messages == ["回复"]
+
+
+def test_self_thinking_hermes_native_does_not_discard_local_think(monkeypatch):
+    # Codex #2: hermes turns carry native reasoning AND may open the reply with a
+    # <think>. The self-authored block must survive to the parse and win (feature on).
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    body = crc._attach_provider_reasoning(
+        "<think>我先想想他要啥</think>好的没问题",
+        "hermes native cot",
+        source="hermes_session_json",
+        kind="provider_reasoning",
+        native=True,
+    )
+    turn = crc._split_agent_turn(body)
+    assert turn.thinking_summary == "我先想想他要啥"
+    assert turn.thinking_source == "tagged_content"
+    assert turn.thinking_self_authored is True
+    assert turn.messages == ["好的没问题"]
+
+
+def _claude_stream_native_then_tagged() -> str:
+    # A full native thinking delta lands FIRST; the <think> only appears later in a
+    # text_delta — the arrival order that used to bypass the merge rule (Codex #3).
+    return "\n".join(json.dumps(o, ensure_ascii=False) for o in [
+        {"type": "stream_event", "event": {"message": {"model": "claude"},
+                                           "delta": {"type": "thinking_delta",
+                                                     "thinking": "native 先落"}}},
+        {"type": "stream_event", "event": {"delta": {"type": "text_delta",
+                                                     "text": "<think>自建后到</think>最终回复"}}},
+    ])
+
+
+def test_self_thinking_on_stream_tagged_wins_despite_late_arrival(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    turn = crc._split_agent_turn(_claude_stream_native_then_tagged())
+    assert turn.thinking_summary == "自建后到"
+    assert turn.thinking_self_authored is True
+    assert turn.messages == ["最终回复"]
+
+
+def test_self_thinking_off_stream_native_wins(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
+    turn = crc._split_agent_turn(_claude_stream_native_then_tagged())
+    assert turn.thinking_summary == "native 先落"
     assert turn.thinking_native is True
 
 

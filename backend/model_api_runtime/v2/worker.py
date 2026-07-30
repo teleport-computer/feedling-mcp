@@ -10143,18 +10143,16 @@ async def process_job(
         await _ensure_runtime_mode()
         await _renew_lease()
         await asyncio.to_thread(_emit_status, user_id, job_id, "writing_reply")
-        # Self-authored thinking replaces provider-native reasoning by default so a
-        # reasoning model emits its thought in the parseable <think> block instead
-        # of hidden native CoT. But an EXPLICIT ``include_reasoning=true`` request
-        # is a public contract and wins — only the default path is suppressed.
-        from core import self_thinking as _self_thinking_mod
-
+        # Self-authored thinking does NOT suppress the model's native reasoning: the
+        # model keeps thinking natively (so answer quality is unchanged) and is
+        # additionally asked to open its reply with a <think> block. At seal time we
+        # PREFER that <think> (clean, io-voice); if the model didn't write one we fall
+        # back to the shaped native reasoning. So native reasoning must still flow when
+        # the model's thinking switch is on — which run_tool_loop already does via
+        # reasoning_effort. include_reasoning stays the explicit public-contract path.
         outcome = await v2_tool_loop.run_tool_loop(
             provider_config=provider_config,
             include_reasoning=turn_include_reasoning,
-            suppress_native_reasoning=(
-                _self_thinking_mod.enabled() and not turn_include_reasoning
-            ),
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
             on_reply=_on_reply,
