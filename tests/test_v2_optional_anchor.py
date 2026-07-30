@@ -202,9 +202,43 @@ def _optional_anchor_deps(uid: str, monkeypatch, *, watermark_seq: int) -> "work
         return "PRIOR SUMMARY", 0.0, 1, int(watermark_seq)
 
     def _recent_turns(_uid, max_turns, row_cap, *, through_seq=None):
-        return db.chat_recent_turn_rows(
+        """Mirrors ``serve_worker._read_recent_turns``'s ``_genuine_user``
+        annotation (production derives it from the raw row's role/source
+        before decrypt overwrites content; this test process has no live
+        enclave, so the row is already plaintext-shaped, but the annotation
+        logic must still be copied — NOT left unset.
+
+        Why this matters: ``worker._adaptive_replay_parts`` (worker.py
+        ~2824-2836) unconditionally overwrites every REQUIRED-tail row's
+        ``_genuine_user`` with whatever this window observed for the same
+        seq. Leaving every row unannotated pins that value to ``False`` for
+        every row this window covers, including the genuine new user rows in
+        the required tail — so ``required_turn_count``
+        (worker.py:3119, ``sum(1 for row in required_tail if
+        _is_genuine_user_seed(row))``) reads as 0 on every turn regardless of
+        how many real user turns are actually in the required tail. That in
+        turn froze the OLD (pre-anchor) formula's
+        ``optional_limit = target_turns - required_turn_count`` to a
+        constant, making ``optional_turns[-optional_limit:]`` identical
+        across turns by construction — independent of whether the code under
+        test anchors the window or still slides it. A mutation test that
+        force-disables the anchor branch (falls back to the old formula)
+        exposed this: the acceptance test kept passing. Real production
+        behavior needs this row correctly labelled so ``required_turn_count``
+        actually reflects the two new genuine user turns seeded mid-test.
+        """
+        window = db.chat_recent_turn_rows(
             _uid, max_turns=max_turns, row_cap=row_cap, through_seq=through_seq,
         )
+        rows = list(window.get("rows") or [])
+        for row in rows:
+            role = str(row.get("role") or "").strip().lower()
+            source = str(row.get("source") or "")
+            row["_genuine_user"] = (
+                role in {"user", "human"}
+                and source not in {"verify_ping", "resident_maintenance"}
+            )
+        return {**window, "rows": rows}
 
     async def _fake_chat_completion(config, messages, *, tools=None, **_kwargs):
         return {
