@@ -141,6 +141,7 @@ from core import protocol_leak as _protocol_leak
 from memory.capture_prompt_v1 import (
     build_capture_prompt,
     build_capture_retry_prompt,
+    build_capture_semantic_retry_prompt,
     parse_capture_cards,
     sanitize_user_name,
 )
@@ -424,6 +425,9 @@ PROACTIVE_STALE_CHAT_FALLBACK_LIMIT = int(os.environ.get("PROACTIVE_STALE_CHAT_F
 MAINTENANCE_IDLE_SEC = int(os.environ.get("FEEDLING_MAINTENANCE_IDLE_SEC", "300"))
 MAINTENANCE_MAX_DEFER_SEC = int(os.environ.get("FEEDLING_MAINTENANCE_MAX_DEFER_SEC", "7200"))
 CAPTURE_HISTORY_LIMIT = int(os.environ.get("FEEDLING_CAPTURE_HISTORY_LIMIT", "160"))
+# One shared budget across format and semantic correction. A format bounce
+# consumes it, so semantic validation can never multiply a job into four calls.
+CAPTURE_AGENT_REASK_BUDGET = 1
 CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "12000"))
 CAPTURE_CONTEXT_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_CONTEXT_MAX_CHARS", "4000"))
 DREAM_MEMORY_INDEX_LIMIT = int(os.environ.get("FEEDLING_DREAM_MEMORY_INDEX_LIMIT", "0"))
@@ -8020,11 +8024,11 @@ class ActionsHTTPError(RuntimeError):
     completely unaffected; this only ADDS an attribute for callers that want
     it.
 
-    C2: both backends write a batch SERIALLY and stop at the first failing
-    item (backend/identity/actions.py's ``_execute_identity_actions`` /
-    backend/memory/actions.py's ``_execute_memory_actions``), so a 4xx body
-    still carries the real ``results``/``effects`` of any leading actions
-    that DID apply before the failure. Treating the whole bucket as
+    C2: identity batches and older memory servers may stop at the first failing
+    item, so a 4xx body can still carry the real ``results``/``effects`` of
+    leading actions that DID apply before the failure. Current memory servers
+    instead return 200 with one result per item. Treating a recovered 4xx
+    bucket as
     uniformly failed would invite a caller to retry the ENTIRE batch,
     re-applying those already-applied, possibly non-idempotent leading
     actions a second time (e.g. a dimension_nudge applied twice). ``body``
@@ -8083,8 +8087,12 @@ def execute_memory_actions(actions: list[dict]) -> dict:
             body=_parse_actions_error_body(resp),
         )
     body = resp.json()
-    if not isinstance(body, dict) or body.get("status") not in {"ok", "created", "replaced"}:
+    if not isinstance(body, dict) or body.get("status") not in {
+        "ok", "partial", "failed", "created", "replaced"
+    }:
         raise RuntimeError(f"memory_actions_unexpected_response:{str(body)[:500]}")
+    if not isinstance(body.get("results"), list):
+        raise RuntimeError(f"memory_actions_results_missing:{str(body)[:500]}")
     return body
 
 
@@ -8194,6 +8202,97 @@ def _action_result_outcome(item: Any) -> tuple[str, str]:
     return "failed_execution", "invalid_result"
 
 
+def _memory_batch_observation(actions: list[dict], body: dict) -> dict:
+    """Count actual per-item memory outcomes; never infer success from HTTP 200."""
+    results = body.get("results") if isinstance(body, dict) else None
+    rows = results if isinstance(results, list) else []
+    applied: dict[str, int] = {
+        "added": 0,
+        "superseded": 0,
+        "upgraded": 0,
+        "deleted": 0,
+        "retyped": 0,
+    }
+    skipped: dict[str, int] = {}
+    failed_by_error: dict[str, int] = {}
+    for index, action in enumerate(actions):
+        row = rows[index] if index < len(rows) else None
+        outcome, error = _action_result_outcome(row)
+        if outcome == "applied":
+            action_type = canonicalize_action_type(
+                str(action.get("type") or action.get("action") or "")
+            )
+            key = {
+                "memory.add": "added",
+                "memory.supersede": "superseded",
+                "memory.upgrade": "upgraded",
+                "memory.delete": "deleted",
+                "memory.retype": "retyped",
+            }.get(action_type, "other")
+            applied[key] = applied.get(key, 0) + 1
+        elif outcome == "noop":
+            reason = str(
+                row.get("skipped") if isinstance(row, dict) else ""
+            ).strip() or "noop"
+            skipped[reason] = skipped.get(reason, 0) + 1
+        else:
+            reason = error or "memory_action_failed"
+            failed_by_error[reason] = failed_by_error.get(reason, 0) + 1
+    applied_count = sum(applied.values())
+    skipped_count = sum(skipped.values())
+    failed_count = sum(failed_by_error.values())
+    return {
+        "status": (
+            "failed"
+            if failed_count == len(actions) and actions
+            else "partial"
+            if failed_count
+            else "noop"
+            if not applied_count
+            else "ok"
+        ),
+        "applied": applied,
+        "skipped": skipped,
+        "failed": {
+            "count": failed_count,
+            "by_error": failed_by_error,
+        },
+        "applied_count": applied_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+    }
+
+
+def _merge_memory_batch_results(first: dict, second: dict) -> dict:
+    results = list(first.get("results") or []) + list(second.get("results") or [])
+    effects = list(first.get("effects") or []) + list(second.get("effects") or [])
+    applied_count = int(first.get("applied_count") or 0) + int(
+        second.get("applied_count") or 0
+    )
+    skipped_count = int(first.get("skipped_count") or 0) + int(
+        second.get("skipped_count") or 0
+    )
+    failed_count = int(first.get("failed_count") or 0) + int(
+        second.get("failed_count") or 0
+    )
+    total_count = len(results)
+    return {
+        "status": (
+            "failed"
+            if failed_count == total_count and total_count
+            else "partial"
+            if failed_count
+            else "ok"
+        ),
+        "results": results,
+        "effects": effects,
+        "total_count": total_count,
+        "applied_count": applied_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+    }
+
+
 def _outcomes_for_bucket(
     entries: list[tuple[str, str]],
     *,
@@ -8281,10 +8380,10 @@ def execute_agent_actions(actions: list[dict]) -> dict:
     RuntimeError for a garbage action type that is neither identity.* nor
     memory.* — that is a caller/prompt bug, not a server-side outcome.
 
-    C2 (双写风险 / no-retry-double-apply): both backends write a batch
-    SERIALLY and stop at the first failing item, so a 4xx response body
-    still carries the results/effects of any leading actions that DID
-    apply. A 4xx is therefore mapped PER-ITEM (via ActionsHTTPError.body)
+    C2 (双写风险 / no-retry-double-apply): identity and rolling-version older
+    memory servers can stop at the first failing item, so a 4xx response body
+    may carry results/effects of leading actions that DID apply. A recovered
+    4xx is therefore mapped PER-ITEM (via ActionsHTTPError.body)
     instead of marking the whole bucket failed_execution — the leading
     items get their real applied/noop outcome, the failing item gets its
     real error, and the never-reached tail is not_attempted. Only a
@@ -11467,6 +11566,45 @@ def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[
     return actions, cards_added, cards_superseded
 
 
+def _capture_semantic_retry_reasons(
+    cards: list[dict],
+    memory_result: dict | None = None,
+) -> list[str]:
+    reasons: list[str] = []
+    if any(
+        str(card.get("action") or "").strip().lower() in {"merge", "supersede"}
+        and not str(card.get("target_id") or "").strip()
+        for card in cards
+    ):
+        reasons.append(
+            "你要求覆盖旧卡，但没有给 target_id；请给出确切 ID，或改成 action=add。"
+        )
+    rows = (
+        memory_result.get("results")
+        if isinstance(memory_result, dict)
+        else []
+    )
+    error_codes = {
+        str(row.get("error") or "").strip()
+        for row in rows or []
+        if isinstance(row, dict)
+        and str(row.get("status") or "").strip().lower() == "error"
+    }
+    if "source_invalid" in error_codes:
+        reasons.append(
+            "source 不在服务端允许的 provenance 白名单内；不要自造 source。"
+        )
+    if error_codes & {"not_found", "not_owned"}:
+        reasons.append(
+            "target_id 不存在或不属于当前用户；请重新确认现有卡 ID，或改成 action=add。"
+        )
+    for code in sorted(
+        error_codes - {"source_invalid", "not_found", "not_owned"}
+    ):
+        reasons.append(f"服务端拒绝了记忆操作：{code}；请修正或改成新增。")
+    return reasons
+
+
 def _process_capture_jobs(jobs: list) -> float:
     """Realize memory_capture jobs through the native resident agent.
 
@@ -11551,13 +11689,30 @@ def _process_capture_jobs(jobs: list) -> float:
                 },
             )
             continue
+        reask_count = 1 if bounce else 0
+        reask_trigger = "format" if bounce else ""
+        reask_outcome = (
+            "recovered"
+            if bounce == "bounced_ok"
+            else "failed"
+            if bounce == "bounced_failed"
+            else "empty"
+            if bounce == "bounced_empty"
+            else "not_needed"
+        )
         if err:
             update_proactive_job_status(
                 job_id,
                 "failed",
                 err,
                 extra={
-                    "capture_result": {"status": "failed", "reason": err},
+                    "capture_result": {
+                        "status": "failed",
+                        "reason": err,
+                        "reask_count": reask_count,
+                        "reask_trigger": reask_trigger or None,
+                        "reask_outcome": reask_outcome,
+                    },
                     "capture_window": window,
                     "cards_added": 0,
                     "cards_superseded": 0,
@@ -11565,6 +11720,43 @@ def _process_capture_jobs(jobs: list) -> float:
                 },
             )
             continue
+        semantic_reasons = _capture_semantic_retry_reasons(cards)
+        if semantic_reasons and reask_count < CAPTURE_AGENT_REASK_BUDGET:
+            reask_count += 1
+            reask_trigger = "semantic"
+            try:
+                retry_text = _capture_agent_reply_text(
+                    call_agent(
+                        build_capture_semantic_retry_prompt(
+                            prompt, semantic_reasons
+                        ),
+                        raw_text=True,
+                    )
+                )
+                _note_agent_turn_success()
+                retried_cards, retry_err = parse_capture_cards(
+                    retry_text, strict=False
+                )
+            except Exception as retry_exc:
+                log.warning(
+                    "capture semantic reask failed id=%s: %s",
+                    job_id,
+                    retry_exc,
+                )
+                retried_cards, retry_err = [], "semantic_reask_failed"
+            if retry_err:
+                reask_outcome = "failed"
+            else:
+                cards = retried_cards
+                reask_outcome = (
+                    "failed"
+                    if _capture_semantic_retry_reasons(cards)
+                    else "recovered"
+                    if cards
+                    else "empty"
+                )
+        elif semantic_reasons:
+            reask_outcome = "failed"
         # 残留计数(与 V2 同口径)。**刻意不在这里跑确定性改写** —— 那个改写器
         # 现有的锚点在产品语境下会改坏真内容(见 test_card_user_referent.py)。
         user_token_residual = sum(count_user_token_residuals(c) for c in cards)
@@ -11578,7 +11770,13 @@ def _process_capture_jobs(jobs: list) -> float:
                     # 「真的没什么值得记」在 admin 上长得一模一样。
                     "content_gate": bounce or None,
                     "user_token_residual": user_token_residual or None,
-                    "capture_result": {"status": "noop", "reason": "nothing_worth_keeping"},
+                    "capture_result": {
+                        "status": "noop",
+                        "reason": "nothing_worth_keeping",
+                        "reask_count": reask_count,
+                        "reask_trigger": reask_trigger or None,
+                        "reask_outcome": reask_outcome,
+                    },
                     "capture_window": window,
                     "cards_added": 0,
                     "cards_superseded": 0,
@@ -11601,6 +11799,61 @@ def _process_capture_jobs(jobs: list) -> float:
                 and not str(card.get("target_id") or "").strip()
             )
             memory_result = execute_memory_actions(actions)
+            server_semantic_reasons = _capture_semantic_retry_reasons(
+                [], memory_result
+            )
+            if (
+                server_semantic_reasons
+                and reask_count < CAPTURE_AGENT_REASK_BUDGET
+            ):
+                reask_count += 1
+                reask_trigger = "semantic"
+                try:
+                    retry_text = _capture_agent_reply_text(
+                        call_agent(
+                            build_capture_semantic_retry_prompt(
+                                prompt, server_semantic_reasons
+                            ),
+                            raw_text=True,
+                        )
+                    )
+                    _note_agent_turn_success()
+                    retried_cards, retry_err = parse_capture_cards(
+                        retry_text, strict=False
+                    )
+                except Exception as retry_exc:
+                    log.warning(
+                        "capture server-semantic reask failed id=%s: %s",
+                        job_id,
+                        retry_exc,
+                    )
+                    retried_cards, retry_err = [], "semantic_reask_failed"
+                if retry_err:
+                    reask_outcome = "failed"
+                else:
+                    retry_actions, _retry_added, _retry_superseded = (
+                        _capture_actions_from_cards(
+                            retried_cards,
+                            job=job,
+                            messages=messages,
+                        )
+                    )
+                    if not retry_actions:
+                        reask_outcome = "failed"
+                    else:
+                        retry_result = execute_memory_actions(retry_actions)
+                        actions.extend(retry_actions)
+                        memory_result = _merge_memory_batch_results(
+                            memory_result, retry_result
+                        )
+                        retry_observation = _memory_batch_observation(
+                            retry_actions, retry_result
+                        )
+                        reask_outcome = (
+                            "failed"
+                            if retry_observation["failed_count"]
+                            else "recovered"
+                        )
         except ValueError as e:
             reason = str(e) or "capture_invalid_memory_action"
             log.error("capture memory action invalid id=%s: %s", job_id, e)
@@ -11635,20 +11888,54 @@ def _process_capture_jobs(jobs: list) -> float:
                 },
             )
             continue
-        result_rows = memory_result.get("results") or []
-        duplicate_skips = sum(
-            1
-            for result in result_rows
-            if isinstance(result, dict)
-            and str(result.get("skipped") or "") == "duplicate_active"
-        )
-        applied_added = max(0, cards_added - duplicate_skips)
-        capture_status = "ok" if actions else "noop"
+        observation = _memory_batch_observation(actions, memory_result)
+        if rejected_without_target:
+            observation["skipped"]["supersede_without_target"] = (
+                observation["skipped"].get("supersede_without_target", 0)
+                + rejected_without_target
+            )
+            observation["skipped_count"] += rejected_without_target
+        applied_added = observation["applied"].get("added", 0)
+        applied_superseded = observation["applied"].get("superseded", 0)
+        capture_status = observation["status"] if actions else "noop"
         capture_reason = (
             "supersede_without_target"
             if not actions and rejected_without_target
+            else "capture_memory_actions_partial"
+            if observation["failed_count"]
             else ""
         )
+        if capture_status == "failed":
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                "capture_memory_actions_failed",
+                extra={
+                    "capture_result": {
+                        **observation,
+                        "cards": len(cards),
+                        "job_kind": "memory_capture",
+                        "reason": "capture_memory_actions_failed",
+                        "reask_count": reask_count,
+                        "reask_trigger": reask_trigger or None,
+                        "reask_outcome": reask_outcome,
+                    },
+                    "capture_window": window,
+                    "memory_action_status": {
+                        "status": memory_result.get("status", "failed"),
+                        "results": len(memory_result.get("results") or []),
+                        "effects": len(memory_result.get("effects") or []),
+                        "applied_count": observation["applied_count"],
+                        "skipped_count": observation["skipped_count"],
+                        "failed_count": observation["failed_count"],
+                    },
+                    "memory_results": memory_result.get("results") or [],
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": "capture_memory_actions_failed",
+                },
+            )
+            continue
         update_proactive_job_status(
             job_id,
             "completed",
@@ -11659,32 +11946,33 @@ def _process_capture_jobs(jobs: list) -> float:
                     "cards": len(cards),
                     "job_kind": "memory_capture",
                     "reason": capture_reason or None,
-                    "applied": {
-                        "added": applied_added,
-                        "superseded": cards_superseded,
-                    },
-                    "skipped": {
-                        "supersede_without_target": rejected_without_target,
-                        "duplicate_active": duplicate_skips,
-                    },
+                    "applied": observation["applied"],
+                    "skipped": observation["skipped"],
+                    "failed": observation["failed"],
+                    "reask_count": reask_count,
+                    "reask_trigger": reask_trigger or None,
+                    "reask_outcome": reask_outcome,
                 },
                 "capture_window": window,
                 "memory_action_status": {
                     "status": memory_result.get("status", "ok"),
                     "results": len(memory_result.get("results") or []),
                     "effects": len(memory_result.get("effects") or []),
+                    "applied_count": observation["applied_count"],
+                    "skipped_count": observation["skipped_count"],
+                    "failed_count": observation["failed_count"],
                 },
                 "memory_results": memory_result.get("results") or [],
                 "cards_added": applied_added,
-                "cards_superseded": cards_superseded,
+                "cards_superseded": applied_superseded,
             },
         )
         log.info(
             "capture job completed id=%s cards=%d added=%d superseded=%d identity=%s",
             job_id,
             len(cards),
-            cards_added,
-            cards_superseded,
+            applied_added,
+            applied_superseded,
             bool(identity),
         )
     return latest
@@ -12031,13 +12319,45 @@ def _process_dream_jobs(jobs: list) -> float:
                 },
             )
             continue
+        observation = _memory_batch_observation(actions, memory_result)
+        if observation["status"] == "failed":
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                "dream_memory_actions_failed",
+                extra={
+                    "dream_result": {
+                        **observation,
+                        "job_kind": "memory_dream",
+                        "reason": "dream_memory_actions_failed",
+                    },
+                    "memory_action_status": {
+                        "status": memory_result.get("status", "failed"),
+                        "results": len(memory_result.get("results") or []),
+                        "effects": len(memory_result.get("effects") or []),
+                        "applied_count": observation["applied_count"],
+                        "skipped_count": observation["skipped_count"],
+                        "failed_count": observation["failed_count"],
+                    },
+                    "memory_results": memory_result.get("results") or [],
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": questions,
+                    "noop_reason": "dream_memory_actions_failed",
+                },
+            )
+            continue
         update_proactive_job_status(
             job_id,
             "completed",
-            "dream_memory_actions_applied",
+            (
+                "dream_memory_actions_partial"
+                if observation["failed_count"]
+                else "dream_memory_actions_applied"
+            ),
             extra={
                 "dream_result": {
-                    "status": "ok",
+                    "status": observation["status"],
                     "job_kind": "memory_dream",
                     "consolidations": len(consolidations),
                     "actions": len(actions),
@@ -12045,11 +12365,17 @@ def _process_dream_jobs(jobs: list) -> float:
                     "cards_thickened": cards_thickened,
                     "organized_count": organized_count,
                     "merged_count": merged_count,
+                    "applied": observation["applied"],
+                    "skipped": observation["skipped"],
+                    "failed": observation["failed"],
                 },
                 "memory_action_status": {
                     "status": memory_result.get("status", "ok"),
                     "results": len(memory_result.get("results") or []),
                     "effects": len(memory_result.get("effects") or []),
+                    "applied_count": observation["applied_count"],
+                    "skipped_count": observation["skipped_count"],
+                    "failed_count": observation["failed_count"],
                 },
                 "memory_results": memory_result.get("results") or [],
                 "cards_merged": cards_merged,
@@ -14499,14 +14825,35 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
             "capture_mode": "genesis_resident_distill",
             "source_chat_message_ids": [],
         })
+    applied_count = 0
     if actions:
-        execute_memory_actions(actions)
+        memory_result = execute_memory_actions(actions)
+        if isinstance(memory_result, dict) and isinstance(
+            memory_result.get("results"), list
+        ):
+            observation = _memory_batch_observation(actions, memory_result)
+            applied_count = observation["applied_count"]
+            if observation["status"] == "failed":
+                raise RuntimeError("genesis_resident_memory_actions_failed")
+            if observation["failed_count"]:
+                log.warning(
+                    "resident distill memory batch partial job=%s applied=%d "
+                    "skipped=%d failed=%d",
+                    job_id,
+                    observation["applied_count"],
+                    observation["skipped_count"],
+                    observation["failed_count"],
+                )
+        else:
+            # Compatibility for old injected resident writers during rolling
+            # updates; the shipped execute_memory_actions always returns rows.
+            applied_count = len(actions)
     genesis_resident_complete(
-        job_id, memory_action_count=len(actions), identity_status="skipped"
+        job_id, memory_action_count=applied_count, identity_status="skipped"
     )
     log.info(
         "resident distill done job=%s mode=%s memories=%d identity=%s",
-        job_id, state["mode"], len(actions), "skipped",
+        job_id, state["mode"], applied_count, "skipped",
     )
     return "done"
 

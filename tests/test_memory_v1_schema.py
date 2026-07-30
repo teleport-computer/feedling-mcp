@@ -148,8 +148,9 @@ def test_memory_action_rejects_invented_source_and_capture_mode(monkeypatch):
         "type": "memory.add",
         "memory": {**base_memory, "source": "对话"},
     }])
-    assert status == 400
-    assert body["error"] == "source_invalid"
+    assert status == 200
+    assert body["status"] == "failed"
+    assert body["results"][0]["error"] == "source_invalid"
     assert saved == []
 
     body, status = memory_actions._execute_memory_actions(store, "api_key", [{
@@ -157,8 +158,9 @@ def test_memory_action_rejects_invented_source_and_capture_mode(monkeypatch):
         "memory": {**base_memory, "source": "chat"},
         "capture_mode": "conversation_2026",
     }])
-    assert status == 400
-    assert body["error"] == "capture_mode_invalid"
+    assert status == 200
+    assert body["status"] == "failed"
+    assert body["results"][0]["error"] == "capture_mode_invalid"
     assert saved == []
 
 
@@ -196,6 +198,77 @@ def test_memory_action_accepts_all_declared_source_and_capture_mode_values(monke
 
 def test_memory_source_policy_covers_known_production_values():
     assert PROD_MEMORY_SOURCE_VALUES_2026_07_29 <= MEMORY_SOURCE_VALUES
+
+
+def test_memory_batch_all_item_failures_return_200_with_complete_results(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    calls = []
+
+    def fail_one(_store, _api_key, action, *, runtime_token=""):
+        calls.append(action["marker"])
+        return {
+            "status": "error",
+            "error": f"bad_{action['marker']}",
+        }, [{"type": "must_not_escape_failed_item"}], 400
+
+    monkeypatch.setattr(memory_actions, "_execute_memory_action", fail_one)
+    body, status = memory_actions._execute_memory_actions(
+        store,
+        "api_key",
+        [{"marker": "one"}, {"marker": "two"}],
+    )
+
+    assert status == 200
+    assert calls == ["one", "two"]
+    assert body["status"] == "failed"
+    assert body["total_count"] == 2
+    assert body["applied_count"] == 0
+    assert body["skipped_count"] == 0
+    assert body["failed_count"] == 2
+    assert [row["error"] for row in body["results"]] == ["bad_one", "bad_two"]
+    assert body["effects"] == []
+
+
+def test_memory_batch_mixed_failures_and_noop_do_not_affect_neighbors(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    calls = []
+    outcomes = {
+        "good_1": ({"status": "ok", "id": "mem_1"}, [{"memory_id": "mem_1"}], 200),
+        "source": ({"status": "error", "error": "source_invalid"}, [], 400),
+        "missing": ({"status": "error", "error": "not_found"}, [], 404),
+        "foreign": ({"status": "error", "error": "not_owned"}, [], 403),
+        "polluted": ({"status": "error", "error": "memory_card_polluted"}, [], 400),
+        "duplicate": (
+            {"status": "ok", "noop": True, "skipped": "duplicate_active"},
+            [],
+            200,
+        ),
+        "good_2": ({"status": "ok", "id": "mem_2"}, [{"memory_id": "mem_2"}], 200),
+    }
+
+    def execute_one(_store, _api_key, action, *, runtime_token=""):
+        marker = action["marker"]
+        calls.append(marker)
+        return outcomes[marker]
+
+    monkeypatch.setattr(memory_actions, "_execute_memory_action", execute_one)
+    markers = list(outcomes)
+    body, status = memory_actions._execute_memory_actions(
+        store, "api_key", [{"marker": marker} for marker in markers]
+    )
+
+    assert status == 200
+    assert calls == markers
+    assert body["status"] == "partial"
+    assert body["applied_count"] == 2
+    assert body["skipped_count"] == 1
+    assert body["failed_count"] == 4
+    assert [effect["memory_id"] for effect in body["effects"]] == [
+        "mem_1", "mem_2"
+    ]
+    assert [row["http_status"] for row in body["results"]] == [
+        200, 400, 404, 403, 400, 200, 200
+    ]
 
 
 def test_memory_add_skips_normalized_duplicate_but_keeps_distinct_content(monkeypatch):

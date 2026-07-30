@@ -427,6 +427,23 @@ def test_memory_source_enums_match_runtime_policy(
     assert set(record_sources) == MEMORY_SOURCE_VALUES
 
 
+def test_memory_actions_response_exposes_independent_item_outcomes(
+    public_schema: dict[str, Any],
+    operations: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    response = operations[("post", "/v1/memory/actions")]["responses"]["200"]
+    assert response["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/MemoryActionsResponse"
+    }
+    schema = public_schema["components"]["schemas"]["MemoryActionsResponse"]
+    assert schema["properties"]["status"]["enum"] == ["ok", "partial", "failed"]
+    assert {
+        "total_count", "applied_count", "skipped_count", "failed_count"
+    } <= set(schema["required"])
+    result_schema = public_schema["components"]["schemas"]["MemoryActionResult"]
+    assert {"status", "http_status"} <= set(result_schema["required"])
+
+
 def test_model_catalog_request_schema_expresses_strict_xor(
     public_schema: dict[str, Any],
     operations: dict[tuple[str, str], dict[str, Any]],

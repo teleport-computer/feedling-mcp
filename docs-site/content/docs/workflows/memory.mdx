@@ -212,10 +212,19 @@ After selecting with `index` and reading the necessary cards with `fetch`, use
 between 1 and 20 actions. The implementation processes only the first 20, so a
 client must reject an oversized batch before sending it.
 
-`source` and `capture_mode` are closed enums. Unknown values are rejected with
-HTTP `400` (`source_invalid` or `capture_mode_invalid`) rather than stored or
-rewritten. Use the values published in the OpenAPI schema; omit optional
-metadata when none applies.
+The server executes every item independently and does not stop after one item
+fails. A structurally valid, non-empty batch returns HTTP `200` even when some
+or all actions fail. Read every `results` entry and the batch
+`applied_count`, `skipped_count`, and `failed_count`; top-level `status` is
+`ok`, `partial`, or `failed`. Each result includes its own `http_status`.
+Only a malformed request body, a non-array `actions` value, or an empty batch
+uses a request-level `4xx`.
+
+`source` and `capture_mode` are closed enums. Unknown values produce an
+item-level failure (`source_invalid` or `capture_mode_invalid`) rather than
+being stored or rewritten, while later valid actions in the same batch still
+run. Use the values published in the OpenAPI schema; omit optional metadata
+when none applies.
 
 This example adds one encrypted card, retypes an existing card, supersedes an
 outdated card with a new encrypted card, and deletes a fourth card:

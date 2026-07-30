@@ -1065,19 +1065,59 @@ def _execute_memory_actions(
     runtime_token: str = "",
 ) -> tuple[dict, int]:
     if not isinstance(actions, list) or not actions:
-        return {"status": "error", "error": "actions_required", "results": [], "effects": []}, 400
+        return {
+            "status": "error",
+            "error": "actions_required",
+            "results": [],
+            "effects": [],
+            "total_count": 0,
+            "applied_count": 0,
+            "skipped_count": 0,
+            "failed_count": 0,
+        }, 400
     results: list[dict] = []
     effects: list[dict] = []
+    applied_count = 0
+    skipped_count = 0
+    failed_count = 0
     for action in actions[:20]:
+        if not isinstance(action, dict):
+            results.append({
+                "status": "error",
+                "error": "memory_action_invalid",
+                "http_status": 400,
+            })
+            failed_count += 1
+            continue
         result, action_effects, status = _execute_memory_action(
             store, api_key, action, runtime_token=runtime_token)
-        results.append(result)
-        effects.extend(action_effects)
+        item = dict(result) if isinstance(result, dict) else {
+            "status": "error",
+            "error": "memory_action_result_invalid",
+        }
+        item["http_status"] = int(status)
         if status >= 400:
-            return {
-                "status": "error",
-                "error": result.get("error", "memory_action_failed"),
-                "results": results,
-                "effects": effects,
-            }, status
-    return {"status": "ok", "results": results, "effects": effects}, 200
+            failed_count += 1
+        else:
+            effects.extend(action_effects)
+            if item.get("noop") or item.get("skipped"):
+                skipped_count += 1
+            else:
+                applied_count += 1
+        results.append(item)
+    total_count = len(results)
+    if failed_count == 0:
+        batch_status = "ok"
+    elif failed_count == total_count:
+        batch_status = "failed"
+    else:
+        batch_status = "partial"
+    return {
+        "status": batch_status,
+        "results": results,
+        "effects": effects,
+        "total_count": total_count,
+        "applied_count": applied_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+    }, 200
