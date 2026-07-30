@@ -4129,7 +4129,14 @@ def _sanitize_reasoning(text: str) -> str:
 
 
 def _build_thinking_payload(
-    store, reasoning: str, *, effect_id: str, provider_config
+    store,
+    reasoning: str,
+    *,
+    effect_id: str,
+    provider_config,
+    kind: str = "provider_reasoning",
+    source: str | None = None,
+    native: bool = True,
 ) -> dict | None:
     """Seal provider reasoning into its own shared envelope + routing metadata.
 
@@ -4152,10 +4159,11 @@ def _build_thinking_payload(
     return {
         "envelope": envelope,
         "metadata": {
-            "thinking_kind": "provider_reasoning",
-            "thinking_source": f"v2.{getattr(provider_config, 'provider', '') or ''}",
+            "thinking_kind": kind,
+            "thinking_source": source
+            or f"v2.{getattr(provider_config, 'provider', '') or ''}",
             "thinking_model": str(getattr(provider_config, "model", "") or ""),
-            "thinking_native": True,
+            "thinking_native": native,
         },
     }
 
@@ -9527,21 +9535,35 @@ async def process_job(
             nonlocal final_job_completed_atomically, voice_reply_slot
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             text = "" if file_reply is not None else str(text or "").strip()
-            # v1 self-authored thinking (all models, incl. relay): when enabled,
-            # peel the model's leading 💭 line into the thinking channel and reply
-            # with the clean body. Fail-open — no marker → reply byte-identical and
-            # the native reasoning (if any) is kept.
-            if file_reply is None and text:
-                from core import self_thinking
+            # Self-authored thinking (all models incl. relay). Peel a leading
+            # <think> block into a SEPARATE channel and reply with the clean body.
+            # The provider's native ``reasoning`` is left UNCHANGED here so the
+            # torn-protocol / degenerate guards below still inspect the real native
+            # text; which thinking to surface (self-authored vs native) and its
+            # provenance are decided at seal time. Fail-closed on malformed <think>:
+            # never leak a raw tag, never promote private thinking to the reply.
+            from core import self_thinking
 
-                if self_thinking.enabled():
-                    _self_thinking, _clean_reply = self_thinking.split_thinking(text)
-                    text = _clean_reply.strip()
-                    if _self_thinking:
-                        reasoning = _self_thinking
+            self_thinking_on = self_thinking.enabled()
+            self_thinking_text = ""
+            self_thinking_failed = False
+            if self_thinking_on and file_reply is None and text:
+                _st_status, _st_thinking, _st_reply = self_thinking.split_thinking(text)
+                if _st_status == self_thinking.COMPLETE:
+                    text = _st_reply
+                    self_thinking_text = _st_thinking
+                elif _st_status == self_thinking.FAILED:
+                    # Untrustworthy structure → honest fallback bubble + a marker in
+                    # the thinking channel. Non-empty text keeps it off the
+                    # empty_reply failure path so the marker rides the reply effect.
+                    text = _DEGENERATE_REPLY_FALLBACK
+                    self_thinking_failed = True
+                # ABSENT: text unchanged
             if file_reply is not None and final:
                 raise RuntimeError("a file reply cannot be terminal")
-            turn_failure_error_class = ""
+            turn_failure_error_class = (
+                _DEGENERATE_REPLY_ERROR_CLASS if self_thinking_failed else ""
+            )
             if file_reply is None and text and _is_degenerate_reply(text):
                 log.warning(
                     "[v2.worker] chat degenerate reply suppressed user=%s "
@@ -9695,13 +9717,33 @@ async def process_job(
             # only ciphertext and a retry re-addresses the same thinking row. Only
             # final replies carry it — intermediate reply{} bubbles are
             # agent-authored text, not provider reasoning.
-            if final and reasoning and file_reply is None:
+            # Decide which thinking to seal and its provenance. Self-authored
+            # <think> (or a "thinking failed" marker) is an agent summary, NOT
+            # provider-native chain-of-thought; the provider's native reasoning
+            # keeps its native metadata. Never mislabel one as the other.
+            _display_reasoning = reasoning
+            _thinking_kind, _thinking_source, _thinking_native = (
+                "provider_reasoning", None, True,
+            )
+            if self_thinking_on and (self_thinking_text or self_thinking_failed):
+                _display_reasoning = (
+                    self_thinking.THINKING_FAILED_MARKER
+                    if self_thinking_failed
+                    else self_thinking_text
+                )
+                _thinking_kind, _thinking_source, _thinking_native = (
+                    "agent_summary", "self_thinking", False,
+                )
+            if final and _display_reasoning and file_reply is None:
                 thinking_payload = await asyncio.to_thread(
                     _build_thinking_payload,
                     store,
-                    reasoning,
+                    _display_reasoning,
                     effect_id=effect_id,
                     provider_config=provider_config,
+                    kind=_thinking_kind,
+                    source=_thinking_source,
+                    native=_thinking_native,
                 )
                 if thinking_payload:
                     payload["thinking"] = thinking_payload
@@ -10101,16 +10143,18 @@ async def process_job(
         await _ensure_runtime_mode()
         await _renew_lease()
         await asyncio.to_thread(_emit_status, user_id, job_id, "writing_reply")
-        # Self-authored thinking replaces provider-native reasoning: when the
-        # feature is on, suppress the native reasoning request so the model puts
-        # its thinking in the parseable <think> block instead (a reasoning model
-        # given native reasoning ignores <think> and its native CoT would show).
+        # Self-authored thinking replaces provider-native reasoning by default so a
+        # reasoning model emits its thought in the parseable <think> block instead
+        # of hidden native CoT. But an EXPLICIT ``include_reasoning=true`` request
+        # is a public contract and wins — only the default path is suppressed.
         from core import self_thinking as _self_thinking_mod
 
         outcome = await v2_tool_loop.run_tool_loop(
             provider_config=provider_config,
             include_reasoning=turn_include_reasoning,
-            suppress_native_reasoning=_self_thinking_mod.enabled(),
+            suppress_native_reasoning=(
+                _self_thinking_mod.enabled() and not turn_include_reasoning
+            ),
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
             on_reply=_on_reply,

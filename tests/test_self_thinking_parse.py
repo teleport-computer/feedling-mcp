@@ -1,13 +1,24 @@
-"""v1 self-authored thinking — <think> block parser (runtime-neutral).
+"""v1 self-authored thinking — leading <think> parser (runtime-neutral).
 
-io is prompted to wrap a short thinking line in <think>…</think> at the start of
-its reply. split_thinking peels that block into the thinking channel and returns
-the clean reply. Fail-open: no block → reply byte-identical, no thinking; a block
-that would empty the reply becomes the reply instead (never an empty bubble).
+Contract (hardened after Codex review — the parser is a mini state machine, not a
+regex scrub):
 
-The same <think> marker is what the V1 resident consumer already extracts, so V1
-needs no consumer change — only the gated prompt instruction. Pure logic here;
-whether real models emit the block is validated by real-model e2e.
+  split_thinking(text) -> (status, thinking, reply)
+
+  ABSENT   : no leading <think> protocol candidate → reply is the ORIGINAL text
+             byte-identical, thinking "" (UI shows no thinking block).
+  COMPLETE : exactly one clean leading <tag>…</tag>, matched, non-nested, followed
+             by a NON-empty reply → thinking = sanitized block, reply = the rest.
+  FAILED   : anything the parser cannot resolve to a clean (thinking, reply) split
+             — truncation anywhere in the opener/closer, mismatched/nested tags, a
+             clean block with no public reply, a leading close tag. thinking "" and
+             reply "" (the caller shows a "thinking failed" marker + a generic
+             failure bubble). A raw <think fragment or private thinking content
+             must NEVER surface as the reply.
+
+The invariant is narrowed (Codex): once the text is a *leading* protocol
+candidate, no protocol fragment of it reaches the reply; a <think> that legitimately
+appears LATER in a normal reply (e.g. discussing HTML) is left untouched.
 """
 from __future__ import annotations
 
@@ -17,106 +28,144 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 from core import self_thinking as st  # noqa: E402
 
-
-def test_leading_block_split_into_thinking_and_clean_reply():
-    thinking, reply = st.split_thinking("<think>我先查下天气</think>今天北京晴，25°")
-    assert thinking == "我先查下天气"
-    assert reply == "今天北京晴，25°"
+ABSENT, COMPLETE, FAILED = st.ABSENT, st.COMPLETE, st.FAILED
 
 
-def test_block_with_newline_before_reply():
-    thinking, reply = st.split_thinking("<think>我先查下天气</think>\n今天北京晴")
-    assert thinking == "我先查下天气"
-    assert reply == "今天北京晴"
+# --- ABSENT: no leading protocol → reply untouched ---------------------------
 
-
-def test_no_block_is_failopen_reply_unchanged():
+def test_no_tag_absent_reply_byte_identical():
     original = "今天北京晴，25°"
-    thinking, reply = st.split_thinking(original)
-    assert thinking == ""
-    assert reply == original
+    assert st.split_thinking(original) == (ABSENT, "", original)
 
 
-def test_block_only_becomes_reply_never_empty():
-    # Model put the whole answer inside <think> → don't empty the reply; use it
-    # AS the reply, no thinking (fail-open, e2e-driven guard).
-    thinking, reply = st.split_thinking("<think>只想了一下</think>")
-    assert thinking == ""
-    assert reply == "只想了一下"
+def test_leading_non_think_tag_is_absent_and_kept():
+    # user content that starts with some other tag must be left alone
+    for s in ("<div>hi</div>", "<3 你", "<foo>bar"):
+        status, thinking, reply = st.split_thinking(s)
+        assert status == ABSENT
+        assert reply == s
 
 
-def test_alternate_tag_thinking_accepted():
-    thinking, reply = st.split_thinking("<thinking>想一下</thinking>正文")
-    assert thinking == "想一下"
-    assert reply == "正文"
+def test_think_tag_later_in_reply_is_kept_not_failed():
+    # a legit <think> deep in a normal reply (discussing the tag) is NOT ours
+    s = "HTML 里的 <think> 标签这样写：<think>x</think>"
+    assert st.split_thinking(s) == (ABSENT, "", s)
 
 
-def test_thinking_sanitized_no_control_or_bidi():
-    thinking, _ = st.split_thinking("<think>想\x00一下‮坏</think>正文")
-    assert "\x00" not in thinking
-    assert "‮" not in thinking
+# --- COMPLETE: clean block + reply ------------------------------------------
+
+def test_complete_block():
+    assert st.split_thinking("<think>我先查下天气</think>今天北京晴") == (
+        COMPLETE, "我先查下天气", "今天北京晴")
 
 
-def test_thinking_length_capped():
+def test_complete_alternate_tag_and_spacing_and_case():
+    assert st.split_thinking("<Thinking >想一下</ Thinking >正文")[0] == COMPLETE
+    st_, t, r = st.split_thinking("<reasoning>算一下</reasoning>结果是3")
+    assert (st_, t, r) == (COMPLETE, "算一下", "结果是3")
+
+
+def test_complete_reply_may_contain_later_think_text():
+    # once the leading block is clean, whatever follows is reply — even a <think>
+    status, thinking, reply = st.split_thinking(
+        "<think>先解释</think>HTML 用 <think> 表示思考")
+    assert status == COMPLETE
+    assert thinking == "先解释"
+    assert reply == "HTML 用 <think> 表示思考"
+
+
+def test_complete_thinking_is_sanitized():
+    status, thinking, _ = st.split_thinking("<think>想\x00一下‮坏​</think>正文")
+    assert status == COMPLETE
+    assert "\x00" not in thinking and "‮" not in thinking and "​" not in thinking
+
+
+def test_complete_thinking_length_capped():
     long = "很长" * 500
-    thinking, _ = st.split_thinking(f"<think>{long}</think>正文")
+    _, thinking, _ = st.split_thinking(f"<think>{long}</think>正文")
     assert len(thinking) <= st.MAX_THINKING_CHARS
 
 
-def test_case_insensitive_and_spaced_tag():
-    thinking, reply = st.split_thinking("<Think >想</ Think>正文")
-    assert thinking == "想"
-    assert reply == "正文"
+# --- FAILED: never leak a tag, never promote private thinking to reply -------
+
+def _prefixes(word):
+    return [word[:i] for i in range(1, len(word) + 1)]
 
 
-def test_reply_with_stray_close_tag_is_failopen():
-    # No opening tag → no block → reply unchanged.
-    original = "答案 </think> 混进来了"
-    thinking, reply = st.split_thinking(original)
-    assert thinking == ""
-    assert reply == original
+def test_truncated_opener_prefix_matrix_all_failed_no_leak():
+    # every non-empty prefix of every tag word, opener truncated before '>'
+    for word in ("think", "thinking", "reasoning", "thought"):
+        for p in _prefixes(word):
+            for frag in (f"<{p}", f"< {p}", f"  <{p}", f"<{p} "):
+                status, thinking, reply = st.split_thinking(frag)
+                assert status in (ABSENT, FAILED)
+                # the crucial invariant: no raw opener fragment reaches the reply
+                assert "<" not in reply, f"leak on {frag!r} -> {reply!r}"
+                assert thinking == "" and (reply == "" or status == ABSENT)
 
 
-# --- 残缺/截断防泄漏(hx: 同 JSON 尾巴泄露那类风险) --------------------------
-
-def test_unclosed_think_never_leaks_tag():
-    # 模型写了 <think> 但没闭合(截断/忘了收尾) → 绝不能把 <think 漏进正文
-    t, r = st.split_thinking("<think>我在想怎么回答，但是被截断了")
-    assert "<think" not in r and "</think" not in r
-
-
-def test_truncated_inside_open_tag_no_leak():
-    # 连开标签都没写完 "<think"(没有 '>') → 不能漏 '<think'
-    for frag in ("<think", "<thin", "<think ", "  <think"):
-        t, r = st.split_thinking(frag)
-        assert "<think" not in r.lower()
+def test_truncated_closer_never_leaks():
+    for s in ("<think>secret</thin", "<think>secret</think",
+              "<think>secret</ think", "<thinking>x</thinkin"):
+        status, thinking, reply = st.split_thinking(s)
+        assert status == FAILED
+        assert reply == "" and thinking == ""
 
 
-def test_unclosed_with_body_shows_body_not_tag():
-    # <think>思考...(截断) → 内容当正文, 不留标签, 不空气泡
-    t, r = st.split_thinking("<think>我先想想怎么回你")
-    assert r == "我先想想怎么回你"
-    assert "<" not in r
+def test_mismatched_close_tag_is_failed():
+    status, thinking, reply = st.split_thinking("<think>secret</thinking>PUBLIC")
+    assert status == FAILED
+    assert reply == "" and "secret" not in reply
 
 
-def test_stray_close_after_leading_open_scrubbed():
-    # 开标签在前 + 正文里混了个孤立 </think> → 正文里不能留 </think>
-    t, r = st.split_thinking("<think>想</think>正文里不该有 </think> 这个")
-    assert "</think" not in r
-    assert t == "想"
+def test_nested_same_tag_is_failed():
+    s = "<think>a<think>b</think>c</think>PUBLIC"
+    status, thinking, reply = st.split_thinking(s)
+    assert status == FAILED
+    assert reply == "" and "a" not in reply and "b" not in reply
 
 
-def test_malformed_never_leaks_any_think_tag_property():
-    # 一批畸形输入, 断言正文里永远不出现裸 <think 或 </think
-    for s in [
-        "<think>a</think>b",
-        "<think>a",
-        "<think",
-        "<thinking>x",
-        "<think></think>",
-        "<think>only</think>",
-        "正常回复没有标签",
-    ]:
-        _t, r = st.split_thinking(s)
-        assert "<think" not in r.lower(), f"leaked open in: {s!r} -> {r!r}"
-        assert "</think" not in r.lower(), f"leaked close in: {s!r} -> {r!r}"
+def test_unclosed_block_is_failed_not_promoted_to_reply():
+    # the big privacy bug: unclosed <think> must NOT surface its content as reply
+    status, thinking, reply = st.split_thinking("<think>secret plan, still going")
+    assert status == FAILED
+    assert reply == "" and "secret" not in reply
+
+
+def test_clean_block_but_no_reply_is_failed():
+    status, thinking, reply = st.split_thinking("<think>只想了一下</think>")
+    assert status == FAILED
+    assert reply == ""
+
+
+def test_leading_close_tag_is_failed():
+    status, _, reply = st.split_thinking("</think>somehow")
+    assert status == FAILED
+    assert reply == ""
+
+
+def test_zero_width_and_bom_prefix_cannot_bypass():
+    for pre in ("﻿", "​", "⁠", "​﻿ "):
+        # truncated opener hidden behind invisibles must still be caught
+        status, _, reply = st.split_thinking(f"{pre}<thin")
+        assert status == FAILED
+        assert "<" not in reply
+
+
+def test_property_no_raw_think_tag_ever_in_reply():
+    cases = [
+        "<think>a</think>b", "<think>a", "<thin", "<think", "<thinking>x",
+        "<think></think>", "<think>x</thinking>y", "<think>a<think>b</think>c</think>d",
+        "</think>", "<think>secret</thin", "正常回复", "<div>x</div>",
+        "<think>plan</think>literal <thinkable> and <thinking-cap>",
+        "<think>ok</think>tail < /think> more",
+    ]
+    for s in cases:
+        status, thinking, reply = st.split_thinking(s)
+        # a raw opener/closer of OUR protocol must never appear at the start of the
+        # reply as a leaked fragment; FAILED replies are always empty.
+        if status == FAILED:
+            assert reply == "" and thinking == ""
+        # thinking is never surfaced as reply verbatim on non-complete parses
+        if status != COMPLETE:
+            assert not reply.lstrip().startswith("<think")
