@@ -10,6 +10,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 can advance conversation coverage without background model
+  calls.** The default-off
+  `FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC` worker switch replaces
+  provider-backed maintenance and inline catch-up folds with exact,
+  content-free count leaves. Deterministic fan-out checkpoints keep the
+  canonical frontier and encrypted materialized head bounded. Synthetic
+  `verify_ping` and `resident_maintenance` rows remain excluded from both the
+  source bounds and immutable coverage witnesses; encrypted Chat rows remain
+  the durable source ledger. Disabling the switch restores the existing
+  provider-backed summary path.
+
 - **Memory action batches now isolate item failures.** A structurally valid
   `POST /v1/memory/actions` batch processes every item and returns HTTP `200`
   with `status: ok|partial|failed`, per-item `http_status`, and

@@ -70,6 +70,54 @@ def test_compact_reports_unknown_usage_when_provider_raises():
         ))
     assert seen == [None]
 
+
+def test_deterministic_fold_uses_the_normal_bullet_validator(monkeypatch):
+    seen = []
+    real_validate = compaction._validate_new_bullets
+
+    def _spy(reply, *, current_summary):
+        seen.append((reply, current_summary))
+        return real_validate(reply, current_summary=current_summary)
+
+    monkeypatch.setattr(compaction, "_validate_new_bullets", _spy)
+
+    rendered = compaction.deterministic_fold(source_message_count=37)
+
+    assert rendered == "- [37 条更早的消息已由长期记忆覆盖]"
+    assert seen == [(rendered, "")]
+
+
+@pytest.mark.parametrize("count", [0, -1])
+def test_deterministic_fold_requires_positive_source_count(count):
+    with pytest.raises(ValueError, match="source_message_count"):
+        compaction.deterministic_fold(source_message_count=count)
+
+
+def test_deterministic_checkpoint_sums_nested_sentinels():
+    leaf_a = compaction.deterministic_fold(source_message_count=3)
+    leaf_b = compaction.deterministic_fold(source_message_count=11)
+
+    parent = compaction.deterministic_checkpoint([leaf_a, leaf_b])
+
+    assert parent == "- [14 条更早的消息已由长期记忆覆盖]"
+
+
+@pytest.mark.parametrize(
+    "children",
+    [
+        [],
+        ["- model-authored fact"],
+        [
+            compaction.deterministic_fold(source_message_count=2),
+            "- model-authored fact",
+        ],
+        ["- [0 条更早的消息已由长期记忆覆盖]"],
+    ],
+)
+def test_deterministic_checkpoint_refuses_non_sentinel_children(children):
+    assert compaction.deterministic_checkpoint(children) is None
+
+
 def test_compact_empty_summary_is_just_new():
     llm = _fake_llm_returning("- first thing")
     out = asyncio.run(compaction.compact(provider_config=object(), current_summary="",

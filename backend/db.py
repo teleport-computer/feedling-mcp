@@ -5379,6 +5379,58 @@ def chat_messages_after_seq(
     ]
 
 
+def chat_coverage_bounds_after_seq(
+    user_id: str,
+    after_seq: int,
+    *,
+    limit: int,
+    through_seq: int | None = None,
+) -> tuple[int, int, int]:
+    """Return exact bounds/count for one oldest metadata-only coverage batch.
+
+    This is the plaintext-free sibling of ``chat_messages_after_seq`` used by
+    deterministic V2 coverage accounting.  Its eligible-row predicate is
+    deliberately identical to ``_read_compaction_tail_after_seq``: GC-able
+    ``verify_ping`` and ``resident_maintenance`` rows can never enter an
+    immutable coverage claim.
+    """
+
+    cursor_seq = int(after_seq)
+    bounded = int(limit)
+    upper_seq = int(through_seq) if through_seq is not None else None
+    if cursor_seq < 0:
+        raise ValueError("after_seq must be >= 0")
+    if bounded <= 0:
+        return 0, 0, 0
+    if upper_seq is not None and upper_seq < 0:
+        raise ValueError("through_seq must be >= 0")
+    if upper_seq is not None and upper_seq <= cursor_seq:
+        return 0, 0, 0
+
+    predicate = (
+        "WHERE user_id=%s AND seq>%s "
+        "AND COALESCE(doc->>'source','') "
+        "NOT IN ('verify_ping','resident_maintenance') "
+    )
+    params: list = [str(user_id), cursor_seq]
+    if upper_seq is not None:
+        predicate += "AND seq<=%s "
+        params.append(upper_seq)
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "WITH selected AS ("
+            " SELECT seq FROM chat_messages "
+            + predicate
+            + "ORDER BY seq ASC LIMIT %s"
+            ") SELECT COALESCE(MIN(seq),0),COALESCE(MAX(seq),0),COUNT(*) "
+            "FROM selected",
+            (*params, bounded),
+        ).fetchone()
+    if not row:
+        return 0, 0, 0
+    return int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+
+
 def chat_recent_turn_rows(
     user_id: str,
     *,

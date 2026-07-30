@@ -89,6 +89,14 @@ deletes them, and the 5,000-message constant bounds only a process-local hot
 window. Only explicit Chat clear or account deletion removes this conversation
 data.
 
+Deployments may opt into deterministic Runtime V2 coverage accounting as an
+independent precursor to the bounded Memory/User profile rollout. In that mode,
+maintenance and synchronous prompt catch-up advance the same exact source
+witnesses using content-free count sentinels, and deterministic fan-out
+checkpoints keep the frontier bounded without sending historical Chat plaintext
+to a model provider. The source ledger and rollback-compatible summary storage
+remain unchanged.
+
 An [independent resident consumer](/docs/workflows/chat#independent-resident-loop)
 uses the same encrypted queue-and-reply protocol but runs in infrastructure the
 user or integrator controls instead of Feedling's hosted runner.

@@ -80,6 +80,7 @@ from hosted import vision_observer
 from identity import identity_core
 from memory import memory_core
 from model_api_runtime.v2 import context as v2_context
+from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import child_supervisor as v2_child_supervisor
 from model_api_runtime.v2 import effect_id as v2_effect_id
@@ -1192,6 +1193,56 @@ def _read_summary_frontier(user_id: str):
     )
 
 
+def _read_summary_frontier_metadata(user_id: str):
+    """Read a deterministic canonical cover without opening exact segments.
+
+    Exact-node text is fully determined by its authenticated row count.  A
+    legacy opaque node has no such witness, so the one migration case falls
+    back to the existing decrypting reader rather than inventing coverage.
+    """
+
+    state = jobs_store.get_summary_frontier_state(user_id)
+    if state is None:
+        return None
+    if not state.get("segments") and state.get("summary_envelope"):
+        seeded = jobs_store.seed_legacy_summary_segment(
+            user_id,
+            expected_version=int(state.get("version") or 0),
+            translated_watermark_seq=int(state.get("watermark_seq") or 0),
+        )
+        if not seeded:
+            raise v2_summary_frontier.SummaryFrontierIntegrityError(
+                "legacy_summary_seed_race"
+            )
+        state = jobs_store.get_summary_frontier_state(user_id)
+    if state is None or not state.get("segments"):
+        return None
+    metadata = _summary_metadata_frontier(state)
+    if any(item.coverage_kind == "legacy_opaque" for item in metadata):
+        return _read_summary_frontier(user_id)
+    deterministic = tuple(
+        v2_summary_frontier.SummarySegment(
+            segment_id=item.segment_id,
+            coverage_kind=item.coverage_kind,
+            level=item.level,
+            start_seq=item.start_seq,
+            end_seq=item.end_seq,
+            source_message_count=item.source_message_count,
+            legacy_opaque_through_seq=item.legacy_opaque_through_seq,
+            child_segment_ids=item.child_segment_ids,
+            text=v2_compaction.deterministic_fold(
+                source_message_count=item.source_message_count
+            ),
+        )
+        for item in metadata
+    )
+    return v2_summary_frontier.SummaryFrontierSnapshot(
+        segments=deterministic,
+        head_version=int(state.get("version") or 0),
+        watermark_seq=int(state.get("watermark_seq") or 0),
+    )
+
+
 def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
     """Read/decrypt summary plus its exact seq coverage watermark.
 
@@ -1293,6 +1344,7 @@ def _append_summary_segment(
     segment_text: str,
     *,
     current_summary: str,
+    head_summary: str | None = None,
     start_seq: int,
     end_seq: int,
     source_message_count: int,
@@ -1312,10 +1364,15 @@ def _append_summary_segment(
             err,
         )
         return False
-    compatibility_text = str(current_summary or "").rstrip()
-    if compatibility_text:
-        compatibility_text += "\n"
-    compatibility_text += str(segment_text).strip()
+    if head_summary is None:
+        compatibility_text = str(current_summary or "").rstrip()
+        if compatibility_text:
+            compatibility_text += "\n"
+        compatibility_text += str(segment_text).strip()
+    else:
+        compatibility_text = str(head_summary).strip()
+        if not compatibility_text:
+            return False
     head_env, head_err = core_envelope._build_shared_envelope_for_store(
         store, compatibility_text.encode("utf-8")
     )
@@ -3387,6 +3444,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_summary_with_seq=_read_summary_with_seq,
         write_summary=_write_summary,
         read_summary_frontier=_read_summary_frontier,
+        read_summary_frontier_metadata=_read_summary_frontier_metadata,
         append_summary_segment=_append_summary_segment,
         append_summary_checkpoint=_append_summary_checkpoint,
         read_images=_read_images,
