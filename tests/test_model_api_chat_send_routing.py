@@ -25,6 +25,12 @@ from push import service as push_service  # noqa: E402
 from conftest import configure_model_api_route  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _legacy_exact_job_shapes_profile_off(monkeypatch):
+    """Keep exact routing queue counts on the profile-off contract."""
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
+
+
 def _b64(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
 
@@ -164,8 +170,7 @@ def test_pre_v2_only_fresh_setup_sends_through_v2_without_admin_flip(
     assert response.get_json()["status"] == "processing"
     with db.get_pool().connection() as conn:
         jobs = conn.execute(
-            "SELECT lane,status,reason FROM agent_jobs "
-            "WHERE user_id=%s AND lane='chat'",
+            "SELECT lane,status,reason FROM agent_jobs WHERE user_id=%s",
             (user_id,),
         ).fetchall()
     assert jobs == [("chat", "pending", "chat_send")]
@@ -371,8 +376,7 @@ def test_send_configured_routes_to_v2_worker_pool(client, monkeypatch):
     assert body["runtime"]["driver"] == "pi"
     with db.get_pool().connection() as conn:
         assert conn.execute(
-            "SELECT count(*) FROM agent_jobs WHERE user_id=%s AND lane='chat'",
-            (user_id,)
+            "SELECT count(*) FROM agent_jobs WHERE user_id=%s", (user_id,)
         ).fetchone()[0] == 1
 
 
@@ -562,8 +566,7 @@ def test_send_image_turn_also_routes(client, monkeypatch):
     assert res.status_code == 202, res.get_data(as_text=True)
     with db.get_pool().connection() as conn:
         assert conn.execute(
-            "SELECT count(*) FROM agent_jobs WHERE user_id=%s AND lane='chat'",
-            (user_id,)
+            "SELECT count(*) FROM agent_jobs WHERE user_id=%s", (user_id,)
         ).fetchone()[0] == 1
 
 

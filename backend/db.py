@@ -8621,6 +8621,23 @@ def chat_clear(user_id: str) -> int | None:
 # ---------------------------------------------------------------------------
 
 
+def memory_profile_source_stats(user_id: str) -> tuple[int, str]:
+    """Return content-free Garden freshness metadata for profile scheduling.
+
+    This reads only row count and the envelope's plaintext ``updated_at``
+    metadata. It never decrypts card content and fails loud so a DB outage
+    cannot masquerade as an unchanged Garden.
+    """
+
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT count(*), COALESCE(max(doc->>'updated_at'), '') "
+            "FROM memory_moments WHERE user_id = %s",
+            (str(user_id),),
+        ).fetchone()
+    return int(row[0] or 0), str(row[1] or "")
+
+
 def memory_load(user_id: str) -> list[dict]:
     try:
         context = _memory_mutation_context(user_id)

@@ -38,6 +38,12 @@ V2 = hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2
 RESIDENT = hosted_config_store.HOSTED_RUNTIME_MODE_RESIDENT
 
 
+@pytest.fixture(autouse=True)
+def _legacy_exact_job_shapes_profile_off(monkeypatch):
+    """Keep the routing matrix's exact Chat queue shape profile-independent."""
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
+
+
 def _seed(uid: str) -> None:
     with db.get_pool().connection() as conn:
         conn.execute(
@@ -307,8 +313,7 @@ def test_dual_v2_tuple_with_live_workers_processes(monkeypatch):
     assert body["status"] == "processing"
     with db.get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT lane, status, reason FROM agent_jobs "
-            "WHERE user_id=%s AND lane='chat'",
+            "SELECT lane, status, reason FROM agent_jobs WHERE user_id=%s",
             ("u_dr_v2_live",),
         ).fetchall()
     assert rows == [("chat", "pending", "chat_send")]

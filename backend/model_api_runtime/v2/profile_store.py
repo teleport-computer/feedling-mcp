@@ -7,17 +7,16 @@ hands a document to the blob CAS or its TEE mirror.
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 import logging
 import math
-import os
 import re
 import threading
-import time
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import db
 from core import envelope as core_envelope
@@ -29,10 +28,6 @@ log = logging.getLogger("feedling.runtime_v2.profile_store")
 PROFILE_BLOB_KIND = "v2_agent_profile"
 PROFILE_VERSION = 1
 PROFILE_STATES = frozenset({"ok", "pending", "degraded", "empty"})
-PROFILE_MAX_AGE_SEC = max(
-    1,
-    int(os.environ.get("FEEDLING_V2_PROFILE_MAX_AGE_SEC", str(7 * 24 * 60 * 60))),
-)
 _REJECT_CODE_RE = re.compile(r"^[A-Za-z0-9_.:-]{0,160}$")
 
 
@@ -260,56 +255,6 @@ def _winner_supersedes(winner: dict, candidate: dict) -> bool:
     )
 
 
-def profile_refresh_due(
-    user_id: str,
-    *,
-    now: float | None = None,
-    max_age_sec: float = PROFILE_MAX_AGE_SEC,
-    read_blob: Callable[[str, str], Any] = db.get_blob_strict,
-    read_source: Callable[[str], dict] = db.memory_profile_source_snapshot,
-) -> bool:
-    """Whether a post-turn best-effort trigger should enqueue profile work.
-
-    Missing/failed profiles retry as soon as their explicit backoff permits.
-    Successful profiles refresh only after the age floor *and* a content-free
-    Garden fingerprint change.  ``empty`` is special: the first new card should
-    trigger immediately, while a still-empty Garden must not enqueue after
-    every chat turn.
-    """
-    current_time = time.time() if now is None else float(now)
-    raw = read_blob(str(user_id), PROFILE_BLOB_KIND)
-    if raw is None:
-        return True
-    try:
-        document = validate_profile_document(raw)
-    except ProfileStorageError:
-        return True
-    if document["disabled"]:
-        return False
-
-    state = document["state"]
-    retry_not_before = float(
-        document["last_attempt"].get("retry_not_before") or 0.0
-    )
-    if state in {"pending", "degraded"}:
-        return current_time >= retry_not_before
-
-    source = document["source"]
-    if state == "ok":
-        generated_at = _timestamp_rank(source.get("generated_at"))
-        if not math.isfinite(generated_at):
-            return True
-        if current_time - generated_at < max(1.0, float(max_age_sec)):
-            return False
-
-    snapshot = read_source(str(user_id)) or {}
-    return (
-        int(snapshot.get("card_count") or 0) != int(source.get("card_count") or 0)
-        or str(snapshot.get("max_updated_at") or "")
-        != str(source.get("max_updated_at") or "")
-    )
-
-
 def update_profile_cas(
     user_id: str,
     recompute: Callable[[dict], dict],
@@ -369,6 +314,67 @@ def _update_profile_cas_from_expected(
     raise AssertionError("unreachable")
 
 
+async def update_profile_cas_async(
+    user_id: str,
+    recompute: Callable[[dict], Awaitable[dict]],
+) -> ProfileCasResult:
+    """Async-provider counterpart of :func:`update_profile_cas`.
+
+    A CAS loss awaits ``recompute`` again against the winning document. The
+    first provider result is never replayed with a new expected value.
+    """
+
+    expected_raw = await asyncio.to_thread(
+        db.get_blob_strict,
+        str(user_id),
+        PROFILE_BLOB_KIND,
+    )
+    expected = deepcopy(expected_raw) if isinstance(expected_raw, dict) else {}
+    recomputations = 0
+    for cas_attempt in (1, 2):
+        candidate = validate_profile_document(
+            await recompute(deepcopy(expected))
+        )
+        recomputations += 1
+        landed = await asyncio.to_thread(
+            db.set_blob_if_unchanged,
+            str(user_id),
+            PROFILE_BLOB_KIND,
+            expected,
+            candidate,
+            insert_if_missing=(expected == {}),
+        )
+        if landed:
+            return ProfileCasResult(
+                status="written",
+                document=candidate,
+                cas_attempts=cas_attempt,
+                recomputations=recomputations,
+            )
+        winner_raw = await asyncio.to_thread(
+            db.get_blob_strict,
+            str(user_id),
+            PROFILE_BLOB_KIND,
+        )
+        winner = deepcopy(winner_raw) if isinstance(winner_raw, dict) else {}
+        if winner and _winner_supersedes(winner, candidate):
+            return ProfileCasResult(
+                status="superseded",
+                document=validate_profile_document(winner),
+                cas_attempts=cas_attempt,
+                recomputations=recomputations,
+            )
+        if cas_attempt == 2:
+            return ProfileCasResult(
+                status="cas_failed",
+                document=winner,
+                cas_attempts=cas_attempt,
+                recomputations=recomputations,
+            )
+        expected = winner
+    raise AssertionError("unreachable")
+
+
 def select_profile_for_turn(
     user_id: str,
     summary: str,
@@ -398,7 +404,11 @@ def select_profile_for_turn(
         return ProfilePromptSelection(
             summary=str(summary), fallback_reason=reason
         )
-    if document["state"] != "ok" or document["disabled"]:
+    if document["disabled"]:
+        return ProfilePromptSelection(
+            summary=str(summary), fallback_reason="disabled"
+        )
+    if document["state"] != "ok":
         return ProfilePromptSelection(
             summary=str(summary), fallback_reason=f"state:{document['state']}"
         )

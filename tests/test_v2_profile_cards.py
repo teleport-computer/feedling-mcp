@@ -1,7 +1,4 @@
-from __future__ import annotations
-
 import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -11,129 +8,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from model_api_runtime.v2 import serve_worker
 
 
-def _wire_reader(monkeypatch, body: dict, *, exercise_post: bool = False):
-    monkeypatch.setattr(
-        serve_worker.core_store,
-        "get_store",
-        lambda uid: types.SimpleNamespace(user_id=uid),
-    )
-    monkeypatch.setattr(
-        serve_worker,
-        "_mint_runtime_token",
-        lambda _uid: "runtime-token",
-    )
-    monkeypatch.setattr(
-        serve_worker.db,
-        "memory_profile_source_snapshot",
-        lambda _uid: {
-            "card_count": int(body.get("source_card_count", body.get("user_card_count", 0))),
-            "max_updated_at": "2026-07-31T00:00:00Z",
-        },
-    )
-    observed = {}
+def _wire(monkeypatch, *, index_body, fetched_items=()):
+    monkeypatch.setattr(serve_worker.core_store, "get_store", lambda _uid: object())
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt-profile")
+    auth = []
 
-    def _index(_store, api_key, params, *, post_enclave):
-        observed.update(api_key=api_key, params=params)
-        if exercise_post:
-            post_enclave(
-                api_key,
-                [{"id": "candidate"}],
-                operation="memory.index",
-                payload={"limit": 0},
-            )
-        return body, 200
-
-    monkeypatch.setattr(serve_worker.memory_core, "index", _index)
-    return observed
-
-
-def test_profile_reader_keeps_summary_and_bounded_content(monkeypatch):
-    body = {
-        "items": [
-            {
-                "id": "m1",
-                "bucket": "关系",
-                "occurred_at": "2026-07-01",
-                "summary": "Seven 喜欢直接反馈",
-                "content": "不要使用空泛套话",
-            }
-        ],
-        "user_card_count": 1,
-        "truncated": False,
-    }
-    _wire_reader(monkeypatch, body)
-
-    result = serve_worker._read_profile_cards("u-cards")
-
-    assert result["eligible_card_count"] == 1
-    assert result["card_count"] == 1
-    assert "关系" in result["rendered"]
-    assert "Seven 喜欢直接反馈" in result["rendered"]
-    assert "不要使用空泛套话" in result["rendered"]
-
-
-def test_profile_reader_accepts_content_only_card(monkeypatch):
-    body = {
-        "items": [{"id": "m1", "content": "只有正文也必须进入画像输入"}],
-        "user_card_count": 1,
-        "truncated": False,
-    }
-    _wire_reader(monkeypatch, body)
-    assert "只有正文也必须进入画像输入" in serve_worker._read_profile_cards(
-        "u-content"
-    )["rendered"]
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        {"items": [], "user_card_count": 1, "truncated": True},
-        {"items": [], "user_card_count": 1, "truncated": False},
-    ],
-)
-def test_profile_reader_rejects_any_partial_garden(monkeypatch, body):
-    _wire_reader(monkeypatch, body)
-    with pytest.raises(RuntimeError, match=r"profile_cards_truncated:1/0"):
-        serve_worker._read_profile_cards("u-truncated")
-
-
-def test_profile_reader_empty_garden_is_complete(monkeypatch):
-    body = {"items": [], "user_card_count": 0, "truncated": False}
-    _wire_reader(monkeypatch, body)
-    result = serve_worker._read_profile_cards("u-empty")
-    assert result["eligible_card_count"] == 0
-    assert result["rendered"] == ""
-
-
-def test_profile_reader_accepts_full_default_hard_max(monkeypatch):
-    items = [
-        {"id": f"m{i}", "content": f"card {i}"}
-        for i in range(1000)
-    ]
-    body = {"items": items, "user_card_count": 1000, "truncated": False}
-    _wire_reader(monkeypatch, body)
-
-    result = serve_worker._read_profile_cards("u-thousand")
-
-    assert result["eligible_card_count"] == 1000
-    assert "[card m0]" in result["rendered"]
-    assert "[card m999]" in result["rendered"]
-
-
-def test_profile_reader_authenticates_readside_with_runtime_token(monkeypatch):
-    body = {"items": [], "user_card_count": 0, "truncated": False}
-    observed = _wire_reader(monkeypatch, body, exercise_post=True)
-    readside = {}
-
-    def _post(api_key, candidates, *, operation, payload, runtime_token):
-        readside.update(
-            api_key=api_key,
-            candidates=candidates,
-            operation=operation,
-            payload=payload,
-            runtime_token=runtime_token,
-        )
-        return {"items": []}, 200
+    def _post(_api_key, _candidates, *, operation, payload=None, runtime_token=None):
+        auth.append((operation, runtime_token))
+        return {"items": []}
 
     monkeypatch.setattr(
         serve_worker.memory_readside_core,
@@ -141,8 +23,99 @@ def test_profile_reader_authenticates_readside_with_runtime_token(monkeypatch):
         _post,
     )
 
-    serve_worker._read_profile_cards("u-runtime-token")
+    def _index(_store, api_key, payload, *, post_enclave):
+        assert api_key is None
+        assert payload == {"limit": 0, "include_sensitive": True}
+        post_enclave(None, [], operation="index", payload={})
+        return index_body, 200
 
-    assert observed == {"api_key": None, "params": {"limit": 0}}
-    assert readside["api_key"] is None
-    assert readside["runtime_token"] == "runtime-token"
+    def _fetch(_store, api_key, payload, *, post_enclave):
+        assert api_key is None
+        post_enclave(None, [], operation="fetch", payload={})
+        return {"items": list(fetched_items)}, 200
+
+    monkeypatch.setattr(serve_worker.memory_core, "index", _index)
+    monkeypatch.setattr(serve_worker.memory_core, "fetch", _fetch)
+    return auth
+
+
+def test_profile_cards_zero_is_complete_without_fetch(monkeypatch):
+    auth = _wire(
+        monkeypatch,
+        index_body={"items": [], "user_card_count": 0, "truncated": False},
+    )
+    monkeypatch.setattr(
+        serve_worker.memory_core,
+        "fetch",
+        lambda *_args, **_kwargs: pytest.fail("zero cards must not fetch"),
+    )
+
+    assert serve_worker._read_profile_cards("u") == ("", 0)
+    assert auth == [("index", "rt-profile")]
+
+
+def test_profile_cards_include_summary_content_bucket_and_time(monkeypatch):
+    item = {"id": "m1"}
+    fetched = {
+        "id": "m1",
+        "summary": "一句总结",
+        "content": "完整正文",
+        "bucket": "我们的关系",
+        "occurred_at": "2026-07-01T00:00:00Z",
+    }
+    auth = _wire(
+        monkeypatch,
+        index_body={"items": [item], "user_card_count": 1, "truncated": False},
+        fetched_items=[fetched],
+    )
+
+    rendered, count = serve_worker._read_profile_cards("u")
+
+    assert count == 1
+    assert "summary=一句总结" in rendered
+    assert "content=完整正文" in rendered
+    assert "bucket=我们的关系" in rendered
+    assert "occurred_at=2026-07-01T00:00:00Z" in rendered
+    assert auth == [("index", "rt-profile"), ("fetch", "rt-profile")]
+
+
+def test_profile_cards_content_only_fallback_and_1000_cards(monkeypatch):
+    items = [{"id": f"m{i}"} for i in range(1000)]
+    fetched = [{"id": f"m{i}", "content": f"正文{i}"} for i in range(1000)]
+    _wire(
+        monkeypatch,
+        index_body={
+            "items": items,
+            "user_card_count": 1000,
+            "truncated": False,
+        },
+        fetched_items=fetched,
+    )
+
+    rendered, count = serve_worker._read_profile_cards("u")
+
+    assert count == 1000
+    assert len(rendered.splitlines()) == 1000
+    assert "content=正文999" in rendered
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"items": [{"id": "m1"}], "user_card_count": 2, "truncated": True},
+        {"items": [{"id": "m1"}], "user_card_count": 2, "truncated": False},
+    ],
+)
+def test_profile_cards_truncation_fails_before_generation(monkeypatch, body):
+    _wire(monkeypatch, index_body=body)
+
+    with pytest.raises(RuntimeError, match=r"^profile_cards_truncated:2/1$"):
+        serve_worker._read_profile_cards("u")
+
+
+def test_profile_card_content_has_explicit_per_card_bound():
+    rendered = serve_worker._render_profile_card(
+        {"id": "m", "content": "中" * 3000}
+    )
+    assert rendered.count("中") == serve_worker._PROFILE_CARD_CONTENT_MAX_CHARS
+

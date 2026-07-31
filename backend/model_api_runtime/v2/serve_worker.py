@@ -1584,6 +1584,55 @@ def _read_scheduled_wake_context(user_id: str, job_id: int) -> list[dict]:
     return context
 
 
+def _read_perception_wake_context(user_id: str, job_id: int) -> list[dict]:
+    """Return a bounded, scalar-only projection for the wake prompt."""
+    from perception import store as perception_store
+
+    context: list[dict] = []
+    for raw in perception_store.read_v2_wake_context(user_id, job_id, limit=10):
+        if not isinstance(raw, dict):
+            continue
+        item: dict[str, Any] = {
+            "wake_id": str(raw.get("wake_id") or "")[:160],
+            "source": str(raw.get("source") or "")[:120],
+            "trigger": str(raw.get("trigger") or "")[:120],
+            "change_digest": str(raw.get("change_digest") or "")[:2000],
+            "origin_refs": [
+                str(ref)[:200]
+                for ref in list(raw.get("origin_refs") or [])[:10]
+            ],
+        }
+        hints: dict[str, bool | int | float | str] = {}
+        raw_hints = raw.get("presence_hints")
+        if isinstance(raw_hints, dict):
+            for key, value in list(raw_hints.items())[:10]:
+                safe_key = str(key)[:80]
+                if isinstance(value, bool):
+                    hints[safe_key] = value
+                elif isinstance(value, int):
+                    hints[safe_key] = value
+                elif isinstance(value, float) and math.isfinite(value):
+                    hints[safe_key] = value
+                elif isinstance(value, str):
+                    hints[safe_key] = value[:200]
+        item["presence_hints"] = hints
+        try:
+            created_at = float(raw.get("created_at") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            created_at = 0.0
+        item["created_at"] = created_at if math.isfinite(created_at) else 0.0
+        try:
+            item["_context_seq"] = max(0, int(raw.get("_context_seq") or 0))
+            item["_input_generation"] = max(
+                0, int(raw.get("_input_generation") or 0)
+            )
+        except (TypeError, ValueError, OverflowError):
+            item["_context_seq"] = 0
+            item["_input_generation"] = 0
+        context.append(item)
+    return context
+
+
 def _read_pending_scheduled_wake_context(user_id: str) -> dict:
     """Return the bounded pending-timer list used by ordinary chat turns."""
     from proactive.scheduled_wake_v2 import (
@@ -1850,10 +1899,6 @@ def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
 # 记忆抽取上下文一次拉多少张卡喂 dream prompt。dream 只需要一份粗粒度的现有卡片清单
 # 供模型判断哪些能合并；不是全量导出，控制 prompt 体积 + 一次 enclave 往返的候选数。
 _MEMORY_CARDS_LIMIT = int(os.environ.get("FEEDLING_V2_MEMORY_CARDS_LIMIT", "60"))
-_PROFILE_CARD_CONTENT_MAX_CHARS = max(
-    1,
-    int(os.environ.get("FEEDLING_V2_PROFILE_CARD_CONTENT_MAX_CHARS", "4000")),
-)
 
 
 def _render_card_line(item: dict) -> str:
@@ -1877,6 +1922,98 @@ def _render_card_line(item: dict) -> str:
         parts.append(f"（桶：{bucket}）")
     parts.append(text)
     return "- " + " ".join(parts)
+
+
+_PROFILE_CARD_CONTENT_MAX_CHARS = 2_000
+
+
+def _render_profile_card(item: dict) -> str:
+    """Render one complete Garden card for profile distillation."""
+
+    if not isinstance(item, dict):
+        return ""
+    summary = str(item.get("summary") or item.get("title") or "").strip()
+    content = str(item.get("content") or "").strip()
+    if not summary and not content:
+        return ""
+    parts = [
+        f"id={str(item.get('id') or '').strip()}",
+        f"bucket={str(item.get('bucket') or '').strip()}",
+        f"occurred_at={str(item.get('occurred_at') or '').strip()}",
+        f"summary={summary}",
+        f"content={content[:_PROFILE_CARD_CONTENT_MAX_CHARS]}",
+    ]
+    return "- " + " | ".join(parts)
+
+
+def _read_profile_cards(user_id: str) -> tuple[str, int]:
+    """Read every eligible Garden card or fail loudly on any truncation.
+
+    The lightweight index proves the complete cardinality, then fetch obtains
+    each card's bounded content. Both use the scoped runtime token; no API key
+    or server-side envelope decryption is involved.
+    """
+
+    store = core_store.get_store(user_id)
+    token = _mint_runtime_token(user_id)
+
+    def _post(api_key, candidates, *, operation, payload=None):
+        return memory_readside_core.post_enclave_readside(
+            api_key,
+            candidates,
+            operation=operation,
+            payload=payload,
+            runtime_token=token,
+        )
+
+    body, status = memory_core.index(
+        store,
+        None,
+        {"limit": 0, "include_sensitive": True},
+        post_enclave=_post,
+    )
+    if status != 200 or not isinstance(body, dict):
+        raise RuntimeError(f"profile_cards_index_failed:{status}")
+    items = body.get("items")
+    if not isinstance(items, list):
+        raise RuntimeError("profile_cards_index_invalid")
+    try:
+        user_card_count = int(body.get("user_card_count"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("profile_cards_count_invalid") from exc
+    if body.get("truncated") is not False or user_card_count != len(items):
+        raise RuntimeError(
+            f"profile_cards_truncated:{user_card_count}/{len(items)}"
+        )
+    if not items:
+        return "", 0
+    ids = [str(item.get("id") or "").strip() for item in items]
+    if any(not memory_id for memory_id in ids):
+        raise RuntimeError("profile_cards_id_missing")
+    fetched, fetch_status = memory_core.fetch(
+        store,
+        None,
+        {"ids": ids, "limit": 0, "include_sensitive": True},
+        post_enclave=_post,
+    )
+    fetched_items = (
+        fetched.get("items") if isinstance(fetched, dict) else None
+    )
+    if fetch_status != 200 or not isinstance(fetched_items, list):
+        raise RuntimeError(f"profile_cards_fetch_failed:{fetch_status}")
+    by_id = {
+        str(item.get("id") or ""): item
+        for item in fetched_items
+        if isinstance(item, dict)
+    }
+    if len(by_id) != user_card_count or any(memory_id not in by_id for memory_id in ids):
+        raise RuntimeError(
+            f"profile_cards_truncated:{user_card_count}/{len(by_id)}"
+        )
+    rendered = [_render_profile_card(by_id[memory_id]) for memory_id in ids]
+    if any(not line for line in rendered):
+        raise RuntimeError("profile_cards_render_incomplete")
+    return "\n".join(rendered), user_card_count
 
 
 def _read_memory_context(user_id: str) -> dict:
@@ -1952,78 +2089,6 @@ def _read_memory_context(user_id: str) -> dict:
     except Exception as e:  # noqa: BLE001 — 单项降级
         log.warning("[v2.serve_worker] identity unavailable for %s: %s", user_id, e)
     return ctx
-
-
-def _render_profile_card(item: dict) -> str:
-    """Render one decrypted Garden card without dropping its useful body."""
-    if not isinstance(item, dict):
-        return ""
-    card_id = str(item.get("id") or "").strip()
-    bucket = str(item.get("bucket") or "").strip()
-    occurred_at = str(item.get("occurred_at") or "").strip()
-    title = str(item.get("title") or "").strip()
-    summary = str(item.get("summary") or "").strip()
-    content = str(item.get("content") or "").strip()
-    if not (title or summary or content):
-        return ""
-    header_parts = [part for part in (card_id, bucket, occurred_at) if part]
-    lines = ["[card " + " | ".join(header_parts) + "]"]
-    if title:
-        lines.append("title: " + title)
-    if summary and summary != title:
-        lines.append("summary: " + summary)
-    if content:
-        lines.append("content: " + content[:_PROFILE_CARD_CONTENT_MAX_CHARS])
-    return "\n".join(lines)
-
-
-def _read_profile_cards(user_id: str) -> dict:
-    """Read every eligible Garden card or fail loudly without partial output.
-
-    Unlike ``_read_memory_context`` this path has no 60-card cap and no
-    per-component fail-open behavior: a partial Garden would produce a
-    confidently wrong long-lived profile.  The runtime token authenticates the
-    enclave readside; plaintext remains inside the worker process.
-    """
-    store = core_store.get_store(user_id)
-    token = _mint_runtime_token(user_id)
-    source_before = db.memory_profile_source_snapshot(user_id)
-
-    def _post(api_key, candidates, *, operation, payload=None):
-        return memory_readside_core.post_enclave_readside(
-            api_key,
-            candidates,
-            operation=operation,
-            payload=payload,
-            runtime_token=token,
-        )
-
-    body, status = memory_core.index(
-        store,
-        None,
-        {"limit": 0},
-        post_enclave=_post,
-    )
-    if status != 200 or not isinstance(body, dict):
-        raise RuntimeError(f"profile_cards_read_failed:{int(status)}")
-    items = body.get("items")
-    if not isinstance(items, list):
-        raise RuntimeError("profile_cards_invalid_response")
-    user_card_count = int(body.get("user_card_count") or 0)
-    if body.get("truncated") is not False or user_card_count != len(items):
-        raise RuntimeError(
-            f"profile_cards_truncated:{user_card_count}/{len(items)}"
-        )
-    source_after = db.memory_profile_source_snapshot(user_id)
-    if source_after != source_before:
-        raise RuntimeError("profile_cards_changed_during_read")
-    rendered = [_render_profile_card(item) for item in items]
-    return {
-        "rendered": "\n\n".join(text for text in rendered if text),
-        "card_count": int(source_after.get("card_count") or 0),
-        "max_updated_at": str(source_after.get("max_updated_at") or ""),
-        "eligible_card_count": user_card_count,
-    }
 
 
 def _apply_memory_actions(
@@ -3566,6 +3631,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_profile_cards=_read_profile_cards,
         select_profile_for_turn=_select_agent_profile_for_turn,
         read_scheduled_wake_context=_read_scheduled_wake_context,
+        read_perception_wake_context=_read_perception_wake_context,
         read_pending_scheduled_wake_context=_read_pending_scheduled_wake_context,
         apply_memory_actions=_apply_memory_actions,
         build_memory_envelope=_build_memory_envelope,
@@ -3650,14 +3716,22 @@ def _build_scheduler_deps():
 
 
 def _seed_existing_v2_wake_schedules(*, now: float | None = None) -> int:
-    """Idempotent startup backfill for users flipped before seeding existed."""
+    """Idempotent startup repair for V2 users without an armed heartbeat.
+
+    A row can already exist because another producer (self-wake, screen watch,
+    payment cooldown, etc.) touched ``v2_wake_schedule`` while leaving
+    ``next_heartbeat_at`` NULL.  Treating any existing row as "seeded" makes
+    that user permanently invisible to ``due_heartbeat_users``.  Only a
+    non-NULL heartbeat timestamp proves that the heartbeat lane is armed.
+    """
     due_at = time.time() if now is None else float(now)
     users = admin_core.list_runtime_modes().get(
         hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []
     )
     seeded = 0
     for user_id in users:
-        if jobs_store.get_wake_schedule(user_id) is not None:
+        schedule = jobs_store.get_wake_schedule(user_id)
+        if schedule is not None and schedule.get("next_heartbeat_at") is not None:
             continue
         jobs_store.upsert_wake_schedule(user_id, next_heartbeat_at=due_at)
         seeded += 1

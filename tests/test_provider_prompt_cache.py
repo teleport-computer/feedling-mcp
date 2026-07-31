@@ -397,61 +397,83 @@ def test_stable_skills_and_working_memory_precede_dynamic_cache_frontier() -> No
     assert not any("cachePoint" in block for block in merged[runtime_index + 1 :])
 
 
-def test_profile_gets_openrouter_and_three_slot_anthropic_breakpoint() -> None:
+def test_profile_header_contract_and_cache_priority_on_openai_and_anthropic():
+    assert pc._PROFILE_HEADER == v2_context.AGENT_MEMORY_HEADER.splitlines()[0]
     messages = v2_context.build_turn_messages(
-        system_prompt=v2_context.CHAT_SYSTEM_PROMPT,
-        agent_memory="stable durable facts",
-        user_profile="stable interaction guidance",
+        system_prompt="stable system",
+        working_memory="- editable state",
+        agent_memory="stable relationship facts",
+        user_profile="stable interaction style",
         summary="",
         tail=[
             {"role": "user", "content": "older request"},
-            {"role": "assistant", "content": "older reply"},
-            {"role": "user", "content": "current request"},
+            {"role": "assistant", "content": "older response"},
+            {"role": "user", "content": "newest request"},
         ],
+        coverage_hole_notice="7 earlier messages omitted",
+        action_context="live=dynamic",
     )
 
-    openrouter = pc._build_openai_compat_payload(
-        provider="openrouter",
-        model="anthropic/claude-sonnet-4",
-        messages=messages,
-        temperature=None,
-        max_tokens=256,
-        response_format=None,
-        extra_body=None,
-        include_reasoning=False,
-        tools=TOOLS,
-        prompt_cache_key=CACHE_KEY,
+    marked_openai = pc._mark_openai_chat_cache_breakpoint(messages)
+    openai_profile = next(
+        message
+        for message in marked_openai
+        if pc._is_profile_message(message)
     )
-    openrouter_profile = next(
-        message for message in openrouter["messages"]
-        if v2_context.AGENT_MEMORY_HEADER in str(message.get("content"))
+    assert _nested_cache_controls(openai_profile) == [{"type": "ephemeral"}]
+    assert _nested_cache_controls(marked_openai[0]) == [{"type": "ephemeral"}]
+    openai_newest = next(
+        message
+        for message in marked_openai
+        if pc._content_text(message.get("content")) == "newest request"
     )
-    assert _nested_cache_controls(openrouter_profile["content"]) == [
-        {"type": "ephemeral"}
-    ]
+    openai_older = next(
+        message
+        for message in marked_openai
+        if pc._content_text(message.get("content")) == "older request"
+    )
+    assert _nested_cache_controls(openai_newest) == [{"type": "ephemeral"}]
+    assert _nested_cache_controls(openai_older) == []
+    assert not any(
+        _nested_cache_controls(message)
+        for message in marked_openai
+        if str(message.get("role") or "").lower() == "user"
+        and (
+            pc._is_coverage_hole_message(message)
+            or pc._is_runtime_context_message(message)
+        )
+    )
 
-    anthropic, _, _ = pc._build_anthropic_payload(
-        model="claude-sonnet-4-5",
-        base_url="https://api.anthropic.com/v1",
-        key="sk-test",
-        messages=messages,
-        max_tokens=256,
-        temperature=None,
-        response_format=None,
-        tools=TOOLS,
-        prompt_cache_key=CACHE_KEY,
+    system = str(messages[0]["content"])
+    anthropic_system, marked_anthropic = pc._mark_anthropic_cache_breakpoint(
+        system,
+        messages[1:],
     )
+    assert _nested_cache_controls(anthropic_system) == [{"type": "ephemeral"}]
     anthropic_profile = next(
-        message for message in anthropic["messages"]
-        if v2_context.AGENT_MEMORY_HEADER in str(message.get("content"))
+        message
+        for message in marked_anthropic
+        if pc._is_profile_message(message)
     )
-    assert _nested_cache_controls(anthropic_profile["content"]) == [
-        {"type": "ephemeral"}
-    ]
-    assert sum(
-        len(_nested_cache_controls(message.get("content")))
-        for message in anthropic["messages"]
-    ) == 2
+    newest_user = next(
+        message
+        for message in marked_anthropic
+        if pc._content_text(message.get("content")) == "newest request"
+    )
+    older_user = next(
+        message
+        for message in marked_anthropic
+        if pc._content_text(message.get("content")) == "older request"
+    )
+    assert _nested_cache_controls(anthropic_profile) == [{"type": "ephemeral"}]
+    assert _nested_cache_controls(newest_user) == [{"type": "ephemeral"}]
+    assert _nested_cache_controls(older_user) == []
+    assert not any(
+        _nested_cache_controls(message)
+        for message in marked_anthropic
+        if pc._is_coverage_hole_message(message)
+        or pc._is_runtime_context_message(message)
+    )
 
 
 def test_working_memory_revision_preserves_skill_prefix_on_all_cache_wires():

@@ -2,7 +2,7 @@
 proactive.gate._build_proactive_v2_wake_decision（只读，读 settings/frames/
 device-events 判断该不该唤醒，不做 enqueue）包一层薄壳，供 D3 的 V2 proactive
 scheduler 复用。真 DB（真 store + 真 gate），不打桩 gate 内部逻辑——这样激活门
-（activation gate）/broadcast 抑制/其余地雷都零漂移保留。
+（activation gate）/屏幕信号抑制/其余地雷都零漂移保留。
 """
 from __future__ import annotations
 
@@ -68,6 +68,24 @@ def test_wake_decision_activated_user_wakes():
     assert decision["should_wake"] is True
     assert decision["block_reason"] == "wake_created"
     assert decision["wake_interval_sec"] > 0
+
+
+def test_plain_heartbeat_is_independent_from_screen_broadcast_state():
+    """The pooled scheduler emits plain heartbeat, which is a presence wake."""
+    uid = "usr_wake_decision_broadcast_off"
+    seed_user(uid)
+    _enable_v2(uid)
+    store = core_store.get_store(uid)
+    store.mark_first_chat_ok(at_iso="2026-07-01T00:00:00")
+    store.save_proactive_settings({
+        "ambient": True,
+        "broadcast_state": "off",
+    })
+
+    decision = _wake_decision_for_user(uid)
+
+    assert decision["should_wake"] is True
+    assert decision["block_reason"] == "wake_created"
 
 
 def test_screen_watch_decision_requires_its_user_switch():

@@ -316,8 +316,6 @@ def test_build_production_deps_returns_turndeps():
     assert callable(deps.read_compaction_tail_after_seq)
     assert callable(deps.read_temporal_snapshot)
     assert callable(deps.read_summary_with_seq)
-    assert callable(deps.read_profile_cards)
-    assert callable(deps.select_profile_for_turn)
 
 
 def test_wire_assembly_injects_envelope_pubkey_getter():

@@ -285,6 +285,10 @@ def v2_metrics(
         "mean_service_sec": jobs_store.recent_mean_service_sec(lane="chat"),
         "recent_mean_tokens_per_turn": jobs_store.recent_mean_tokens_per_turn(lane="chat"),
         "turn_health": jobs_store.recent_chat_operational_health(),
+        # All-lane view, including dream/capture.  The legacy ``wake`` field is
+        # intentionally narrower (heartbeat/scheduled/manual_wake) and cannot
+        # reveal a silent extraction lane.
+        "runtime_health": jobs_store.recent_runtime_health(),
         "prompt_cache": jobs_store.recent_prompt_cache_stats(
             lane="chat",
             provider=cache_provider,

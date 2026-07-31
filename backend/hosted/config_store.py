@@ -19,6 +19,20 @@ from provider_client import validate_config as validate_provider_config
 log = logging.getLogger("feedling.hosted.config_store")
 
 
+def _profile_generation_enabled() -> bool:
+    """Backend-side gate for the V2-cutover profile trigger.
+
+    The profile worker has its own copy of this deployment flag. Keeping this
+    read local avoids importing the worker into the hosted configuration layer,
+    and the explicit allowlist preserves default-off byte-for-byte behavior.
+    """
+
+    return os.environ.get(
+        "FEEDLING_V2_PROFILE_ENABLED",
+        "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _load_model_api_config(store: UserStore) -> dict | None:
     """The user's active model_api config, projected to the legacy blob shape.
 
@@ -508,32 +522,39 @@ def _set_hosted_runtime_mode_for_user_id(
 ) -> str:
     """Serialize ownership changes with provider-config mutation for this user."""
     with db.hosted_runtime_config_mutation_lock(user_id):
-        before_mode, before_state, _before_generation = (
-            db.get_hosted_runtime_control_strict(user_id)
+        raw_mode, state, _generation = db.get_hosted_runtime_control_strict(
+            user_id
+        )
+        was_v2 = (
+            raw_mode == HOSTED_RUNTIME_MODE_DB_ACTION_V2 and state == "v2"
         )
         result = _set_hosted_runtime_mode_for_user_id_locked(
             user_id, mode, store=store
         )
-    # Profile generation is queued only after releasing the ownership/config
-    # lock. It is provider-backed background work and must never extend this
-    # control-plane critical section.
-    if (
-        result == HOSTED_RUNTIME_MODE_DB_ACTION_V2
-        and not (
-            effective_hosted_runtime_mode(before_mode)
-            == HOSTED_RUNTIME_MODE_DB_ACTION_V2
-            and before_state == "v2"
+        should_enqueue_profile = (
+            _profile_generation_enabled()
+            and not was_v2
+            and result == HOSTED_RUNTIME_MODE_DB_ACTION_V2
         )
-    ):
+    # Profile enqueue is deliberately outside the per-user config mutation
+    # lock: generation can read provider/runtime state and must never nest work
+    # behind the ownership transaction.
+    if should_enqueue_profile:
         try:
             from core import wake_bus
             from model_api_runtime.v2 import jobs_store
 
-            jobs_store.enqueue_job(user_id, "profile", reason="runtime_enabled")
-            wake_bus.notify("v2_jobs", user_id)
-        except Exception as exc:  # noqa: BLE001 — ownership flip already committed
+            _job_id, coalesced = jobs_store.enqueue_job(
+                user_id,
+                "profile",
+                reason="runtime_v2_cutover",
+            )
+            if not coalesced:
+                wake_bus.notify("v2_jobs", user_id)
+        except Exception as exc:  # noqa: BLE001 — ownership already committed
             log.warning(
-                "post-cutover profile enqueue failed user=%s code=%s",
+                "[hosted.config_store] profile enqueue after V2 cutover failed "
+                "user=%s code=%s",
                 user_id,
                 type(exc).__name__.lower(),
             )

@@ -57,11 +57,6 @@ def test_smoke_5_users_simulated_drain_produces_full_report():
     with MockProvider(prompt_tokens=111, completion_tokens=33) as mock:
         user_ids = run_loadtest.seed_synthetic_users(5, mock_base_url=mock.base_url)
         assert len(user_ids) == 5
-        # Runtime entry now schedules one independent profile refresh per user.
-        # This smoke test measures the five-chat burst only; profile behavior has
-        # its own lane tests and must not double the simulated workload.
-        with db.get_pool().connection() as conn:
-            conn.execute("DELETE FROM agent_jobs WHERE lane='profile'")
 
         enqueued = run_loadtest.enqueue_chat_burst(user_ids)
         assert enqueued == 5

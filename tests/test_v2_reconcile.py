@@ -36,7 +36,9 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def pg_clean():
+def pg_clean(monkeypatch):
+    # These exact catch-up queue shapes specify the profile-off contract.
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
     with db.get_pool().connection() as conn:
         conn.execute(
             "TRUNCATE chat_messages, agent_jobs, v2_runtime_state, user_blobs, "
@@ -51,13 +53,6 @@ def _mark_db_action_v2(uid: str) -> None:
     configure_model_api_route(uid, provider="anthropic", model="m", test_status="ok")
     store = core_store.get_store(uid)
     hosted_config_store.set_hosted_runtime_mode(store, "db_action_v2")
-    # These tests isolate the chat reconciliation backstop. Runtime entry's
-    # independent profile refresh is covered by profile/cutover tests.
-    with db.get_pool().connection() as conn:
-        conn.execute(
-            "DELETE FROM agent_jobs WHERE user_id=%s AND lane='profile'",
-            (uid,),
-        )
 
 
 def _insert_user_message(uid: str, msg_id: str) -> None:

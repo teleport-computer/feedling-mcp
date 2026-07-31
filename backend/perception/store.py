@@ -25,6 +25,7 @@ CONFIG = "perception_config"          # geofences / ssid_labels / ...
 USER_STATE = "perception_user_state"  # {"manual": "default"}
 
 EVENT_STREAM = "perception_events"
+V2_WAKE_CONTEXT_STREAM = "v2_perception_wake_context"
 # Wake/change audit trail: one append per perception evaluation (wake /
 # suppressed / debounced) — high frequency. Cap the stream so it can't grow
 # without bound; kept above the dashboard's event read cap.
@@ -347,6 +348,106 @@ def append_event(user_id: str, event: dict, ts: float) -> None:
 
 def read_events(user_id: str, limit: int = 50) -> list[dict]:
     return log_read(user_id, EVENT_STREAM, limit=limit)
+
+
+def append_v2_wake_context(
+    user_id: str,
+    agent_job_id: int,
+    context: dict,
+    *,
+    ts: float,
+) -> None:
+    """Durably associate one perception wake with its pooled V2 job.
+
+    Multiple perception events may coalesce into the same active heartbeat
+    job, so this is an append-only stream keyed by ``agent_job_id`` rather than
+    a single field on ``agent_jobs``. The worker reads the bounded set after
+    claim and merges it into untrusted runtime context.
+    """
+    payload = dict(context)
+    payload["agent_job_id"] = int(agent_job_id)
+    sql = (
+        "INSERT INTO user_logs (user_id,stream,ts,item_key,doc) "
+        "VALUES (%s,%s,%s,%s,%s) RETURNING seq"
+    )
+    params = (
+        str(user_id),
+        V2_WAKE_CONTEXT_STREAM,
+        float(ts),
+        str(int(agent_job_id)),
+        Jsonb(payload),
+    )
+    with get_pool().connection() as conn:
+        row = conn.execute(sql, params).fetchone()
+    if row is None:
+        raise RuntimeError("v2 perception wake context insert returned no row")
+
+    from tee_shadow import mirror
+
+    mirror.execute(
+        "INSERT INTO user_logs (user_id,stream,seq,ts,item_key,doc) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (user_id,stream,seq) DO NOTHING",
+        (
+            str(user_id),
+            V2_WAKE_CONTEXT_STREAM,
+            int(row[0]),
+            float(ts),
+            str(int(agent_job_id)),
+            Jsonb(payload),
+        ),
+    )
+    log_trim(str(user_id), V2_WAKE_CONTEXT_STREAM, EVENT_MAX)
+
+
+def read_v2_wake_context(
+    user_id: str,
+    agent_job_id: int,
+    *,
+    limit: int = 10,
+) -> list[dict]:
+    """Return attached events plus the job generation/cursor, oldest first.
+
+    The job share lock makes the returned context rows and input generation one
+    consistent boundary against atomic perception enqueue and wake finalization.
+    Underscore-prefixed metadata is consumed by the worker and never reaches the
+    model prompt.
+    """
+    safe_limit = max(1, min(int(limit), 10))
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            generation_row = conn.execute(
+                "SELECT input_generation FROM agent_jobs "
+                "WHERE id=%s AND user_id=%s FOR SHARE",
+                (int(agent_job_id), str(user_id)),
+            ).fetchone()
+            input_generation = int(generation_row[0] or 0) if generation_row else 0
+            rows = conn.execute(
+                "SELECT doc,seq FROM ("
+                " SELECT doc,seq FROM user_logs "
+                " WHERE user_id=%s AND stream=%s AND item_key=%s "
+                " ORDER BY seq DESC LIMIT %s"
+                ") recent ORDER BY seq ASC",
+                (
+                    str(user_id),
+                    V2_WAKE_CONTEXT_STREAM,
+                    str(int(agent_job_id)),
+                    safe_limit,
+                ),
+            ).fetchall()
+    context: list[dict] = []
+    for row in rows:
+        if not isinstance(row[0], dict):
+            continue
+        item = dict(row[0])
+        item["_context_seq"] = int(row[1])
+        item["_input_generation"] = input_generation
+        context.append(item)
+    return context
+
+
+def trim_v2_wake_context(user_id: str) -> None:
+    log_trim(str(user_id), V2_WAKE_CONTEXT_STREAM, EVENT_MAX)
 
 
 # Sensitive-signal decrypt failures. A SEPARATE stream on purpose: the wake

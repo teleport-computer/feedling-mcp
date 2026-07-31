@@ -14,6 +14,12 @@ from hosted import chat_send_core, config_store as hosted_config_store
 from conftest import configure_model_api_route
 
 
+@pytest.fixture(autouse=True)
+def _legacy_exact_job_shapes_profile_off(monkeypatch):
+    """Keep exact Chat-only queue assertions independent of profile rollout."""
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
+
+
 def _seed(uid):
     with db.get_pool().connection() as conn:
         conn.execute(
@@ -69,8 +75,7 @@ def test_db_action_v2_enqueues_job_and_skips_resident(monkeypatch):
     # carrying the send's reason and the envelope id as trace_id.
     with db.get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT lane, status, reason, trace_id FROM agent_jobs "
-            "WHERE user_id=%s AND lane='chat'",
+            "SELECT lane, status, reason, trace_id FROM agent_jobs WHERE user_id=%s",
             ("u_send_v2",),
         ).fetchall()
     assert len(rows) == 1
@@ -244,8 +249,7 @@ def test_db_action_v2_with_no_live_workers_refuses_before_persist(monkeypatch):
             "SELECT count(*) FROM chat_messages WHERE user_id=%s", ("u_send_v2_dead_pool",)
         ).fetchone()[0]
         jobs_after = conn.execute(
-            "SELECT count(*) FROM agent_jobs WHERE user_id=%s AND lane='chat'",
-            ("u_send_v2_dead_pool",)
+            "SELECT count(*) FROM agent_jobs WHERE user_id=%s", ("u_send_v2_dead_pool",)
         ).fetchone()[0]
     assert after == before  # nothing persisted on refusal
     assert jobs_after == 0
@@ -343,8 +347,7 @@ def test_db_action_v2_admission_check_fails_open_on_exception(monkeypatch):
     assert notified["channel"] == "v2_jobs"
     with db.get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT lane, status, reason FROM agent_jobs "
-            "WHERE user_id=%s AND lane='chat'",
+            "SELECT lane, status, reason FROM agent_jobs WHERE user_id=%s",
             ("u_send_v2_admission_failopen",),
         ).fetchall()
     assert len(rows) == 1
@@ -388,8 +391,7 @@ def test_db_action_v2_admission_admits_under_sla(monkeypatch):
     assert notified["channel"] == "v2_jobs"
     with db.get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT lane, status, reason FROM agent_jobs "
-            "WHERE user_id=%s AND lane='chat'",
+            "SELECT lane, status, reason FROM agent_jobs WHERE user_id=%s",
             ("u_send_v2_admission_ok",),
         ).fetchall()
     assert len(rows) == 1

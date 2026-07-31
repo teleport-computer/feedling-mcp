@@ -98,13 +98,13 @@ def test_bounded_tail_drops_backlog_and_discloses_the_hole():
 
     (
         summary,
-        _memory,
-        _user,
-        coverage_notice,
         tail,
         _optional,
         _trunc,
         watermark_seq,
+        _memory,
+        _profile,
+        coverage_notice,
     ) = _run(uid, through, tail_cap=10)
 
     # The tail is bounded to the newest 10 — the 15-row hole is NOT in the prompt.
@@ -128,19 +128,20 @@ def test_no_hole_when_backlog_fits_the_cap():
 
     (
         summary,
-        _memory,
-        _user,
-        coverage_notice,
         tail,
         _optional,
         _trunc,
         _wm,
+        _memory,
+        _profile,
+        coverage_notice,
     ) = _run(uid, through, tail_cap=60)
 
     # 10 rows after the watermark, cap is 60 → everything fits, no hole disclosed.
     assert len(tail) == 10
-    assert coverage_notice == ""
+    assert "omitted" not in summary
     assert summary == "- older summary"
+    assert coverage_notice == ""
 
 
 def _degrade(uid):

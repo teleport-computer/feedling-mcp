@@ -40,6 +40,9 @@ def _clean_agent_jobs_table(monkeypatch):
     # provider-backed fallback; rollout-mode behavior lives in the dedicated
     # deterministic suite.
     monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
+    # Exact successor/enqueue assertions predate the independent profile lane.
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
+    monkeypatch.setattr(worker, "_PROFILE_ENABLED", False)
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield
@@ -1423,8 +1426,7 @@ def test_process_job_reply_skips_compaction_enqueue_when_under_budget(monkeypatc
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
-    assert (uid, "maintenance", "compaction") not in enqueue_calls
-    assert enqueue_calls == [(uid, "profile", "turn_refresh")]
+    assert enqueue_calls == []
 
 
 def test_run_compaction_folds_oldest_batch_and_advances_watermark(monkeypatch):

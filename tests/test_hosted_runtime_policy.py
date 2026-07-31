@@ -24,6 +24,12 @@ from model_api_runtime.v2 import jobs_store  # noqa: E402
 ROOT = Path(__file__).parent.parent
 
 
+@pytest.fixture(autouse=True)
+def _legacy_exact_job_shapes_profile_off(monkeypatch):
+    """This suite's exact queue assertions describe the profile-off contract."""
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
+
+
 def _uid(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
@@ -356,7 +362,7 @@ def test_v2_cutover_immediately_enqueues_resident_unanswered_message(
     with db.get_pool().connection() as conn:
         jobs = conn.execute(
             "SELECT lane,status,reason,trace_id,expected_runtime_generation "
-            "FROM agent_jobs WHERE user_id=%s AND lane='chat'",
+            "FROM agent_jobs WHERE user_id=%s",
             (user_id,),
         ).fetchall()
     assert jobs == [(
@@ -404,7 +410,7 @@ def test_v2_recutover_replaces_stale_generation_recovery_job(monkeypatch):
     with db.get_pool().connection() as conn:
         jobs = conn.execute(
             "SELECT status,trace_id,expected_runtime_generation "
-            "FROM agent_jobs WHERE user_id=%s AND lane='chat' ORDER BY id",
+            "FROM agent_jobs WHERE user_id=%s ORDER BY id",
             (user_id,),
         ).fetchall()
     assert jobs == [
@@ -455,8 +461,7 @@ def test_v2_recutover_does_not_fall_back_behind_newest_terminal_marker(
 
     with db.get_pool().connection() as conn:
         jobs = conn.execute(
-            "SELECT status,trace_id FROM agent_jobs "
-            "WHERE user_id=%s AND lane='chat' ORDER BY id",
+            "SELECT status,trace_id FROM agent_jobs WHERE user_id=%s ORDER BY id",
             (user_id,),
         ).fetchall()
     assert jobs == [("failed", "newest-terminal")]
@@ -482,8 +487,7 @@ def test_v2_verify_loop_uses_worker_liveness_without_resident_ping(monkeypatch):
         )
     with db.get_pool().connection() as conn:
         assert conn.execute(
-            "SELECT count(*) FROM agent_jobs WHERE user_id=%s AND lane='chat'",
-            (user_id,)
+            "SELECT count(*) FROM agent_jobs WHERE user_id=%s", (user_id,)
         ).fetchone()[0] == 0
 
 
@@ -583,6 +587,23 @@ def test_main_compose_serve_worker_shares_the_backend_image_and_stays_internal()
         env = worker["environment"]
         assert env["FEEDLING_API_URL"] == "http://backend:5001"
         assert env["FEEDLING_ENCLAVE_URL"] == "https://enclave:5003"
+
+
+def test_main_compose_serve_worker_enables_memory_maintenance_producers():
+    """The scheduler lives in serve-worker; backend-only flags are inert."""
+    for name in (
+        "docker-compose.phala.yaml",
+        "docker-compose.phala.test.yaml",
+        "docker-compose.phala.pre.yaml",
+    ):
+        compose = yaml.safe_load((ROOT / "deploy" / name).read_text())
+        env = compose["services"]["serve-worker"]["environment"]
+        assert env["FEEDLING_V2_CAPTURE_ENABLED"] == (
+            "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
+        ), name
+        assert env["FEEDLING_V2_DREAM_ENABLED"] == (
+            "${FEEDLING_V2_DREAM_ENABLED:-1}"
+        ), name
 
 
 def test_all_three_standalone_runner_composes_are_v1_agent_runner_only():

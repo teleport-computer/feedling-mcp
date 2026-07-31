@@ -10,32 +10,46 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
-- **Runtime V2 now schedules bounded profile distillation as background work.**
-  The pooled worker reads the complete eligible Memory Garden through the
-  enclave readside, rejects truncated snapshots, and atomically refreshes the
-  encrypted `MEMORY` and `USER` fields. A refresh is queued when a user enters
-  Runtime V2, after a dream applies memory changes, or after a chat turn when a
-  missing/failed profile is retryable or a changed Garden has exceeded the
-  seven-day age floor. Empty Gardens make no provider call, and provider
-  failures remain silent background failures with bounded retry metadata.
-  The prompt path is staged behind the default-off
-  `FEEDLING_V2_PROFILE_ENABLED` switch. When enabled, both fields decrypt
-  together into one unprivileged user-role data block; an unavailable or
-  invalid profile keeps the existing conversation summary path. The separate
-  deterministic-coverage switch remains off pending real-user rollout
-  validation.
+- **Runtime V2 can replace its legacy summary with a bounded Memory/User
+  profile.** The default-off `FEEDLING_V2_PROFILE_ENABLED` switch now gates
+  both generation and turn-time selection. Only an `ok`, non-disabled profile
+  whose two encrypted fields both validate and decrypt is injected, as one
+  early user-role block explicitly labeled model-derived untrusted data.
+  Missing, pending, degraded, disabled, invalid, or undecryptable profiles keep
+  the rollback-compatible summary. Verbatim replay wins on conflict, coverage
+  gaps remain a separate late data notice, and OpenAI Chat and Anthropic cache
+  breakpoints prioritize the stable profile ahead of an older recent-user
+  boundary.
 
-- **Pooled Runtime V2 deployments now enable capture and dream scheduling by
-  default in the serve worker.** These switches belong to the worker process;
-  setting only the backend service environment did not schedule either lane.
-  Operators can still disable either independent switch explicitly.
+- **Runtime V2 stages bounded profile generation and restores the pooled
+  worker's Memory lanes.** A new low-priority `profile` job reads the complete
+  eligible Memory Garden with a scoped runtime token, rejects truncated views,
+  generates Memory/User fields with a bounded provider-call budget, and writes
+  them through the encrypted profile CAS. Runtime V2 cutover, successful dream
+  writes, and best-effort post-Chat freshness checks can enqueue the job;
+  degraded profiles respect exponential retry metadata, and the seven-day
+  stale floor runs independently of the dream setting. Profile failures remain
+  background-only and never create a Chat bubble or terminal turn error.
+  Managed production, pre-production, and test Compose configurations now
+  explicitly enable capture and dream in `serve-worker`. Profile generation
+  and injection stay default-off under the same worker switch.
+
+- **Runtime V2 restores proactive presence and memory maintenance.** Ambient
+  heartbeats no longer require screen broadcasting to be active: an enabled,
+  activated companion may wake for a presence turn while screen sharing is
+  off, while the ambient consent switch still blocks the lane. Perception
+  events such as photo, arrival, and unlock changes now enter the pooled V2
+  job queue instead of the resident-only legacy queue, and their bounded
+  trigger context follows the wake as untrusted runtime data so the turn can
+  respond to the actual change. The pooled worker also runs the independently
+  consent-gated Memory Capture and Dream producers; each fleet lane remains
+  independently reversible through deployment configuration.
 
 - **Encrypted Runtime V2 profile storage is staged for the bounded
   Memory/User rollout.** Both fields share one `v2_agent_profile` CAS document
   but remain separate shared encrypted envelopes. PostgreSQL and the TEE shadow
   receive the same ciphertext document; only state, character counts, source
-  counts, and generation/retry timestamps remain plaintext metadata. This
-  prompt injection remains behind a separate default-off rollout switch.
+  counts, and generation/retry timestamps remain plaintext metadata.
 
 - **Runtime V2 can advance conversation coverage without steady-state
   background model calls.** The default-off
@@ -46,11 +60,10 @@ change must not be interpreted as an API guarantee.
   `verify_ping` and `resident_maintenance` rows remain excluded from both the
   source bounds and immutable coverage witnesses; encrypted Chat rows remain
   the durable source ledger. Disabling the switch restores the existing
-  provider-backed summary path. Keep this switch off until bounded
-  MEMORY/USER prompt injection is deployed; otherwise count sentinels replace
-  the existing summary context before its replacement is available. Existing
-  legacy model-written frontier nodes can still require a provider-backed
-  rollup during migration, so zero background calls is the steady state.
+  provider-backed summary path. Enable it only after the bounded Memory/User
+  prompt path is deployed and verified. Existing legacy model-written frontier
+  nodes can still require a provider-backed rollup during migration, so zero
+  background calls is the steady state.
 
 - **Memory action batches now isolate item failures.** A structurally valid
   `POST /v1/memory/actions` batch processes every item and returns HTTP `200`
