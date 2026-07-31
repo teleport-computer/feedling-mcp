@@ -276,9 +276,12 @@ def test_terminal_child_preserves_successful_sibling_in_ordered_parent_result(
         if params["path"].endswith("conflict.md"):
             return SimpleNamespace(
                 ok=False,
-                error={"retryable": False},
+                error={
+                    "message": "workspace revision conflict",
+                    "retryable": False,
+                },
             )
-        return SimpleNamespace(ok=True, error=None)
+        return SimpleNamespace(ok=True, error=None, data={"revision": 3})
 
     monkeypatch.setattr(
         serve_worker.cap_registry,
@@ -299,11 +302,12 @@ def test_terminal_child_preserves_successful_sibling_in_ordered_parent_result(
                 {
                     "effect_id": operations[0]["sub_effect_id"],
                     "status": "applied",
+                    "revision": 3,
                 },
                 {
                     "effect_id": operations[1]["sub_effect_id"],
                     "status": "discarded",
-                    "error": "workspace_write_failed",
+                    "error": "workspace_revision_conflict",
                 },
             ],
         },
@@ -339,8 +343,17 @@ def test_terminal_child_preserves_successful_sibling_in_ordered_parent_result(
         },
     )
     assert [(item.call_id, item.content) for item in mapped] == [
-        ("applied", "ok: workspace_write applied"),
-        ("conflict", "error: workspace_write_failed"),
+        (
+            "applied",
+            "ok: workspace_write applied at revision 3; use the same path and "
+            "revision 3 with send_file",
+        ),
+        (
+            "conflict",
+            "error: workspace_revision_conflict; choose a new /workspace path and "
+            "retry with expected_revision=0, or read the existing entry and replace "
+            "its exact revision",
+        ),
     ]
 
 
@@ -766,6 +779,62 @@ def test_executor_emits_one_batch_effect_for_contiguous_workspace_writes():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/artifacts/memory_summary.md",
+        "/skills/memory_summary.md",
+        "/workspace/../artifacts/memory_summary.md",
+    ],
+)
+def test_executor_returns_fixable_error_before_enqueuing_invalid_workspace_path(
+    path,
+):
+    async def scenario():
+        call = ToolCall(
+            id="bad-path",
+            name="workspace_write",
+            args={
+                "path": path,
+                "content": "# Memory summary",
+                "expected_revision": 0,
+            },
+        )
+        singles = []
+        batches = []
+        fences = []
+
+        async def enqueue_single(candidate):
+            singles.append(candidate.id)
+
+        async def enqueue_batch(candidates):
+            batches.append([candidate.id for candidate in candidates])
+
+        async def before_write():
+            fences.append("fence")
+
+        results = await executor.dispatch_tool_calls(
+            [call],
+            store=None,
+            api_key=None,
+            runtime_token="",
+            enclave_sem=asyncio.Semaphore(1),
+            turn_authorization=True,
+            enqueue_write_effect=enqueue_single,
+            enqueue_workspace_batch_effect=enqueue_batch,
+            before_write=before_write,
+        )
+
+        assert singles == []
+        assert batches == []
+        assert fences == []
+        assert results[0].call_id == "bad-path"
+        assert "/workspace/<filename>" in results[0].content
+        assert "/artifacts and /skills are read-only" in results[0].content
+
+    asyncio.run(scenario())
+
+
 def test_workspace_batch_reservation_consumes_one_ordered_parent_identity():
     async def scenario():
         reservations = worker._PlatformEffectReservations(
@@ -869,6 +938,15 @@ def test_scheduler_reserves_only_valid_batch_children_and_records_each_call():
                 args_ok=False,
             ),
             ToolCall(
+                id="invalid-path",
+                name="workspace_write",
+                args={
+                    "path": "/artifacts/not-writable.md",
+                    "content": "no",
+                    "expected_revision": 0,
+                },
+            ),
+            ToolCall(
                 id="valid-b",
                 name="workspace_delete",
                 args={
@@ -935,10 +1013,12 @@ def test_scheduler_reserves_only_valid_batch_children_and_records_each_call():
         assert [result.call_id for result in results] == [
             "valid-a",
             "invalid",
+            "invalid-path",
             "valid-b",
         ]
         assert results[1].content.startswith("error: unparseable args")
-        parent = reservations.get_batch([calls[0], calls[2]])
+        assert "/workspace/<filename>" in results[2].content
+        parent = reservations.get_batch([calls[0], calls[3]])
         assert enqueued_children == [[
             effect_id.derive_batch_item(
                 parent_effect_id=parent.effect_id,
@@ -952,9 +1032,11 @@ def test_scheduler_reserves_only_valid_batch_children_and_records_each_call():
         assert events == [
             ("valid-a", "tool_call_started"),
             ("invalid", "tool_call_started"),
+            ("invalid-path", "tool_call_started"),
             ("valid-b", "tool_call_started"),
             ("valid-a", "tool_call_result"),
             ("invalid", "tool_call_result"),
+            ("invalid-path", "tool_call_result"),
             ("valid-b", "tool_call_result"),
         ]
 

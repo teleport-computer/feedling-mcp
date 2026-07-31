@@ -37,7 +37,9 @@ from asgi.deps import require_auth
 from core import provider_usage
 from hosted import config_store
 from hosted import setup_core
+from chat import consumer as chat_consumer
 from hosted import usage_core
+from hosted import vision_observer
 
 router = APIRouter()
 
@@ -66,6 +68,94 @@ async def model_api_set_hosting(auth: AuthResult = Depends(require_auth)):
 @router.get("/v1/model_api/key_envelope")
 async def model_api_key_envelope(auth: AuthResult = Depends(require_auth)):
     body, status = await threadpool.run_db(setup_core.model_api_key_envelope, auth.store)
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/vision/config")
+async def vision_config_get(auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(setup_core.vision_config_get, auth.store)
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/vision/main/test")
+async def vision_main_test(request: Request, auth: AuthResult = Depends(require_auth)):
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.vision_main_test,
+        auth.store,
+        caller_api_key=caller_api_key,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/internal/vision/main/test/result")
+async def vision_main_test_result(
+    request: Request,
+    auth: AuthResult = Depends(require_auth),
+):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    consumer_info = chat_consumer._consumer_headers_from_map(
+        request.headers,
+        request.client.host if request.client else "",
+    )
+    body, status = await threadpool.run_db(
+        setup_core.vision_main_test_result,
+        auth.store,
+        payload,
+        consumer_info=consumer_info,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.put("/v1/vision/config")
+async def vision_config_set(request: Request, auth: AuthResult = Depends(require_auth)):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.vision_config_set,
+        auth.store,
+        payload,
+        caller_api_key=caller_api_key,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/vision/config")
+async def vision_route_configure(request: Request, auth: AuthResult = Depends(require_auth)):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.vision_route_configure,
+        auth.store,
+        payload,
+        caller_api_key=caller_api_key,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/vision/routes/{route_id}/test")
+async def vision_route_test(route_id: str, request: Request,
+                            auth: AuthResult = Depends(require_auth)):
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.vision_route_test,
+        auth.store,
+        route_id,
+        caller_api_key=caller_api_key,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/vision/observe")
+async def vision_observe(request: Request, auth: AuthResult = Depends(require_auth)):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        vision_observer.observe_pinned_message,
+        auth.store,
+        payload,
+        caller_api_key=caller_api_key,
+    )
     return JSONResponse(body, status_code=status)
 
 

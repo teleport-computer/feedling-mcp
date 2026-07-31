@@ -129,6 +129,11 @@ REGISTRY: dict[str, Entry] = {
         "心跳都在动，会把它变成 strict gate 上的永久红。SNAPSHOT 每 tick 整表替换天然"
         "收敛，不需要按行比对"),
     "agent_status_events": Entry(SNAPSHOT, "agent 状态事件，明文 detail_json"),
+    "chat_turn_activity_events": Entry(
+        SNAPSHOT,
+        "V1 工具活动时间线的固定标识、状态与展示安全 detail_json；持久用户回合元数据，"
+        "有追加与级联删除，整表快照天然收敛",
+    ),
     "chat_r2_cleanup": Entry(SNAPSHOT, "R2 清理队列，行会被删，明文"),
     "chat_r2_lifecycle": Entry(SNAPSHOT, "R2 生命周期状态，UPDATE 密集，明文"),
     "dau_daily_snapshot": Entry(SNAPSHOT, "DAU 日快照，每日批量写，明文"),
@@ -163,6 +168,16 @@ REGISTRY: dict[str, Entry] = {
         SKIP, "TEE 同步自身的控制面/指标表，必须住在 RDS——复制到被它监控的库里没有意义"),
     "tee_reconcile_state": Entry(SKIP, "TEE reconcile 的控制面状态，同上，必须住 RDS"),
     "tee_reconcile_cursors": Entry(SKIP, "TEE reconcile 的游标，同上，必须住 RDS"),
+    "voice_turn_results": Entry(
+        SKIP,
+        "voice SSE 的 900 秒 AES-GCM 临时交接缓冲；非标准 content envelope，过期即删，"
+        "不是持久用户资产，复制只会制造不可消费的陈旧密文",
+    ),
+    "voice_turn_streams": Entry(
+        SKIP,
+        "voice SSE 增量的 900 秒 AES-GCM 临时流状态；非标准 content envelope，持续覆写"
+        "且过期即删，复制只会制造不可消费的陈旧密文",
+    ),
     "bak_20260710_usr450_blobs": Entry(
         SKIP, "2026-07-10 单用户事故的一次性人工备份表，非生产数据", manual=True),
     "bak_20260710_usr450_chat": Entry(

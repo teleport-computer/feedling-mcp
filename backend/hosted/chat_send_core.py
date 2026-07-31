@@ -24,9 +24,20 @@ from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
 from hosted import context as hosted_context
 from hosted import turn as hosted_turn
+from hosted import vision_routing
 from model_api_runtime.v2 import admission
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import kill_switch
+
+
+def _voice_metadata(voice_context: dict | None) -> dict[str, str]:
+    if not isinstance(voice_context, dict):
+        return {}
+    call_id = str(voice_context.get("call_id") or "").strip()
+    turn_id = str(voice_context.get("turn_id") or "").strip()
+    if not call_id or not turn_id or len(call_id) > 96 or len(turn_id) > 128:
+        return {}
+    return {"voice_call_id": call_id, "voice_turn_id": turn_id}
 
 
 def model_api_chat_send_core(
@@ -35,6 +46,7 @@ def model_api_chat_send_core(
     api_key: str | None,
     runtime_tok: str,
     payload: dict,
+    voice_context: dict | None = None,
 ) -> tuple[dict, int]:
     """Run a hosted chat send. Returns ``(body, status)``; the caller renders it.
 
@@ -144,6 +156,7 @@ def model_api_chat_send_core(
                 file_parse=file_parse,
                 context_refs=context_refs,
                 client_msg_id=client_msg_id,
+                voice_context=voice_context,
             )
         else:
             debug_trace.trace_event(
@@ -153,6 +166,23 @@ def model_api_chat_send_core(
                 detail={"mode": "blocked", "reason": "runtime_control_invalid"},
             )
             return {"error": "runtime_control_invalid"}, 503
+
+    include_reasoning = payload.get("include_reasoning", False)
+    if type(include_reasoning) is not bool:
+        return {
+            "error": "invalid_include_reasoning",
+            "detail": "include_reasoning must be a boolean",
+        }, 400
+
+    # Resolve and pin V2 image routing before persistence so a later Settings
+    # change cannot redirect already-accepted pixels.
+    vision_route_id = ""
+    if has_image:
+        vision_route, vision_error = vision_routing.dedicated_route_for_send(store)
+        if vision_error is not None:
+            return vision_error
+        if vision_route is not None:
+            vision_route_id = str(vision_route.get("id") or "")
 
     # V2 liveness guard: if every serve_worker
     # process is dead (crashed, not yet deployed, scaled to zero), enqueue_job
@@ -233,7 +263,10 @@ def model_api_chat_send_core(
     except agent_runtime_cutover.UnsupportedProviderError:
         return {"error": "provider_not_configured"}, 409
 
-    extra: dict = {}
+    extra: dict = _voice_metadata(voice_context)
+    # V2-only per-turn routing metadata. Resident/VPS paths never consume or
+    # persist this field; old clients omit it and keep the historical false path.
+    extra["include_reasoning"] = include_reasoning
     if client_msg_id is not None:
         # Plain routing metadata only; the message body remains ciphertext.
         # The database uses this UUID to serialize iOS transport retries across
@@ -241,6 +274,8 @@ def model_api_chat_send_core(
         extra["client_msg_id"] = client_msg_id
     if has_image and image_mime:
         extra["image_mime"] = image_mime
+    if has_image and vision_route_id:
+        extra["vision_route_id"] = vision_route_id
     if has_image and message:
         # 带文字说明的图片：独立加密 caption，enclave history 解后填 content。
         caption_env, caption_err = core_envelope._build_shared_envelope_for_store(
@@ -345,6 +380,7 @@ def _send_resident(
     file_parse,
     context_refs,
     client_msg_id,
+    voice_context: dict | None = None,
 ) -> tuple[dict, int]:
     """Restored V1 resident send path (dual policy, ``resident_cli``/``resident``).
 
@@ -363,6 +399,14 @@ def _send_resident(
     ``summary`` stays ``supervisor_unavailable`` (that is how the two were split
     historically).
     """
+    vision_route_id = ""
+    if has_image:
+        vision_route, vision_error = vision_routing.dedicated_route_for_send(store)
+        if vision_error is not None:
+            return vision_error
+        if vision_route is not None:
+            vision_route_id = str(vision_route.get("id") or "")
+
     trace_start = time.time()
     config = hosted_config_store._load_model_api_config(store)
     runtime = hosted_config_store._load_runtime_provider_config(
@@ -378,6 +422,36 @@ def _send_resident(
         })
         return err, 400
     hosted_config_store._ensure_model_api_runtime_profile(store, config, touch=True)
+
+    # Hosted V1 learns visual capability only from the exact provider failure.
+    # Capture the main route/version as inert metadata on this accepted image;
+    # the terminal reply transaction later consumes it with a strict CAS. A
+    # missing/racing binding never blocks or reroutes the send.
+    main_vision_binding = None
+    if has_image and not vision_route_id:
+        candidate = db.model_api_active_route_version(store.user_id)
+        if isinstance(candidate, dict):
+            runtime_provider = str(getattr(runtime, "provider", "") or "")
+            runtime_model = str(getattr(runtime, "model", "") or "")
+            runtime_base_url = str(
+                getattr(runtime, "base_url", "") or ""
+            ).rstrip("/")
+            candidate_base_url = str(
+                candidate.get("base_url") or ""
+            ).rstrip("/")
+            if (
+                str(candidate.get("provider") or "") == runtime_provider
+                and (
+                    not runtime_model
+                    or str(candidate.get("model") or "") == runtime_model
+                )
+                and (
+                    not runtime_base_url
+                    or not candidate_base_url
+                    or candidate_base_url == runtime_base_url
+                )
+            ):
+                main_vision_binding = candidate
 
     if has_image:
         user_plaintext = image_bytes
@@ -413,9 +487,18 @@ def _send_resident(
         )
         return {"error": "hosting_runtime_unavailable", "reason": reason}, 503
 
-    extra: dict = {}
+    extra: dict = _voice_metadata(voice_context)
     if has_image and image_mime:
         extra["image_mime"] = image_mime
+    if has_image and vision_route_id:
+        extra["vision_route_id"] = vision_route_id
+    if has_image and main_vision_binding is not None:
+        extra["vision_main_route_id"] = str(
+            main_vision_binding.get("route_id") or ""
+        )
+        extra["vision_main_route_updated_at"] = str(
+            main_vision_binding.get("updated_at_token") or ""
+        )
     if has_image and message:
         # 带文字说明的图片：独立加密 caption，enclave history 解后填 content。
         caption_env, caption_err = core_envelope._build_shared_envelope_for_store(

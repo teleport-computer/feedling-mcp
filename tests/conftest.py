@@ -107,12 +107,20 @@ if not _provisioned:
     # Pure-unit modules that don't touch the DB — keep them collectable so a
     # no-Postgres dev machine still runs something useful.
     _PURE_UNIT = {
+        "test_card_guard.py",
+        "test_bucket_lang_normalize.py",
+        "test_memory_actions_guard.py",
+        "test_protocol_leak.py",
+        "test_memory_lane_torn_protocol_no_write.py",
         "test_web_settings_store.py",
         "test_v2_web_gate.py",
         "test_web_settings_core.py",
         "test_object_storage.py",
         "test_wake_bus.py",
         "test_chat_idempotency_unit.py",
+        "test_chat_activity_projection.py",
+        "test_chat_turn_activity_unit.py",
+        "test_access_mode_runtime_sync_unit.py",
         "test_semantic_analysis.py",
         "test_proactive_runtime_v2.py",
         "test_proactive_observability_v2.py",
@@ -182,6 +190,7 @@ if not _provisioned:
         # 无 PG 时会被下面的 collect_ignore 静默忽略）。它自己不碰 DB，必须
         # 留在可收集列表里，否则连它也会被忽略。
         "test_tee_registry_guard_enforced.py",
+        "test_self_thinking_parse.py",
     }
     collect_ignore = sorted(
         f
@@ -222,6 +231,8 @@ def set_v2_runtime_owner(user_id: str, *, generation: int | None = None) -> None
     low-level worker/job tests intentionally bypass that assembly path and
     therefore opt in through this helper before claiming work.
     """
+    import db
+
     with db.get_pool().connection() as conn:
         conn.execute(
             "INSERT INTO v2_runtime_state "
@@ -347,6 +358,30 @@ def _reset_enclave_http_client():
     core_enclave.reset_http_client()
     yield
     core_enclave.reset_http_client()
+
+
+@pytest.fixture(autouse=True)
+def _disable_setup_auto_vision_probe(monkeypatch, request):
+    """Keep setup tests from starting real provider calls in daemon threads.
+
+    Tests for the scheduler override this stub explicitly. Production has no
+    such fixture, so every successful setup still launches the probe.
+    """
+    if "enable_setup_auto_vision_probe" in request.fixturenames:
+        return
+
+    from hosted import setup_core
+
+    monkeypatch.setattr(
+        setup_core,
+        "_kick_setup_main_vision_test",
+        lambda *_args, **_kwargs: None,
+    )
+
+
+@pytest.fixture()
+def enable_setup_auto_vision_probe():
+    """Opt a focused scheduler test into the production background runner."""
 
 
 @pytest.fixture()

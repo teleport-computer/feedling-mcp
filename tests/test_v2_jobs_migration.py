@@ -243,6 +243,9 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0059_v2_incident_wake_guards").down_revision == (
         "0058_provider_usage_halted"
     )
+    assert script.get_revision("0059_chat_activity_lookup_idx").down_revision == (
+        "0058_provider_usage_halted"
+    )
     assert script.get_revision("0060_v2_wake_failure_backoff").down_revision == (
         "0059_v2_incident_wake_guards"
     )
@@ -252,6 +255,22 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     assert script.get_revision("0062_v2_failure_reply").down_revision == (
         "0061_v2_adaptive_tail_metrics"
     )
+    assert script.get_revision("0063_tee_sync_snapshot_metrics").down_revision == (
+        "0062_v2_failure_reply"
+    )
+    assert set(script.get_revision("0064_merge_legacy_chat_activity").down_revision) == {
+        "0063_tee_sync_snapshot_metrics",
+        "0059_chat_activity_lookup_idx",
+    }
+    assert script.get_revision("0065_chat_activity_lookup_idx").down_revision == (
+        "0064_merge_legacy_chat_activity"
+    )
+    assert script.get_revision("0066_model_api_vision_route").down_revision == (
+        "0065_chat_activity_lookup_idx"
+    )
+    assert script.get_revision("0067_voice_turn_state").down_revision == (
+        "0066_model_api_vision_route"
+    )
     # 刻意不断言 head 的具体 revision 名：每合入一个 migration 就要回来改这一行，
     # 而"当前 head 叫什么"本身没有约束价值。真正要防的"链分叉成多头"已由
     # tests/test_genesis_worker_claim_migration.py::test_alembic_single_head 专门守着。
@@ -259,6 +278,22 @@ def test_migration_graph_preserves_deployed_v2_history_and_merges_profiles():
     # 与 test_v2_summary_watermark_seq 当初那次是同一类脆弱断言。合 test 分支时
     # 保留了它新增的 0062 down_revision 断言（守拓扑，有价值），只丢掉钉 head 名那行。
     # 上面逐条 down_revision 的断言保留：它们守的是链的**拓扑**，那才是这个测试的价值。
+
+
+def test_voice_turn_streams_user_fk_cascades():
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT constraint_type, delete_rule "
+            "FROM information_schema.referential_constraints rc "
+            "JOIN information_schema.table_constraints tc "
+            "  ON tc.constraint_catalog=rc.constraint_catalog "
+            " AND tc.constraint_schema=rc.constraint_schema "
+            " AND tc.constraint_name=rc.constraint_name "
+            "WHERE tc.table_schema='public' "
+            "  AND tc.table_name='voice_turn_streams'"
+        ).fetchone()
+
+    assert row == ("FOREIGN KEY", "CASCADE")
 
 
 def test_provider_health_schema_is_runtime_neutral():

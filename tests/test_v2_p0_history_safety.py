@@ -57,7 +57,10 @@ def _reset(uid: str) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
+    # The compaction acceptance case in this legacy safety suite specifies the
+    # provider-fold CAS/requeue path.
+    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
     # claim_next_job claims globally (no user_id filter) — a leftover pending
     # job from another test module could get claimed by this file's tests.
     with db.get_pool().connection() as conn:
@@ -584,6 +587,7 @@ def test_compaction_cas_loss_requeues_never_permanently_abandons_tail(monkeypatc
     # Un-patch the CAS and drive the requeued job to a real completion — the
     # requeue must eventually terminate in actual coverage, not just exist.
     monkeypatch.undo()
+    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
     monkeypatch.setattr(provider_client, "reliable_chat_completion_async", _fake_llm)
     job2 = jobs_store.claim_next_job("w-p0-maint-2")
     assert job2 is not None and job2["id"] == pending[0][0]

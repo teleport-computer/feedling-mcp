@@ -25,6 +25,7 @@ from core import store as core_store  # noqa: E402
 from hosted import chat_send_core  # noqa: E402
 from hosted import config_store as hosted_config_store  # noqa: E402
 from hosted import history_import  # noqa: E402
+from hosted import setup_core  # noqa: E402
 from identity import service as identity_service  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 
@@ -188,11 +189,24 @@ def test_chat_response_plaintext_reasoning_default_is_summary(monkeypatch):
 def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     user_id, api_key = _register(client)
     raw_provider_key = "sk-test-secret"
+    scheduled = {}
 
     monkeypatch.setattr(
         provider_client,
         "test_provider_key",
         lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
+    )
+    monkeypatch.setattr(
+        setup_core,
+        "_kick_setup_main_vision_test",
+        lambda store, route_id, route_updated_at, caller_api_key: scheduled.update(
+            {
+                "user_id": store.user_id,
+                "route_id": route_id,
+                "route_updated_at": route_updated_at,
+                "caller_api_key": caller_api_key,
+            }
+        ),
     )
 
     route_res = client.post(
@@ -218,6 +232,10 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     assert public["context_window_tokens"] == 128_000
     assert "api_key" not in public
     assert "api_key_envelope" not in public
+    assert scheduled["user_id"] == user_id
+    assert scheduled["route_id"] == db.model_api_active_route(user_id)["id"]
+    assert scheduled["route_updated_at"].endswith("Z")
+    assert scheduled["caller_api_key"] == api_key
 
     get_res = client.get("/v1/model_api/get", headers=_headers(api_key))
     assert get_res.status_code == 200
@@ -239,6 +257,82 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     assert runtime["runtime_mode"] == "hosted_resident"
     assert runtime["tool_action_enabled"] is True
     assert any(step["id"] == "hosted_runtime" and step["passing"] for step in body["steps"])
+
+
+def test_model_api_setup_auto_probe_is_nonblocking_and_updates_config(
+    client,
+    monkeypatch,
+    enable_setup_auto_vision_probe,
+):
+    _user_id, api_key = _register(client)
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+
+    monkeypatch.setattr(
+        provider_client,
+        "test_provider_key",
+        lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
+    )
+    monkeypatch.setattr(
+        core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: b"provider-key",
+    )
+
+    def text_only_catalog(*_args):
+        probe_started.set()
+        assert release_probe.wait(timeout=2)
+        return {
+            "models": [
+                {
+                    "id": "vendor/text-only",
+                    "input_modalities": ["text"],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(provider_client, "list_provider_models", text_only_catalog)
+    monkeypatch.setattr(
+        provider_client,
+        "chat_completion",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("explicit text-only catalog must avoid the pixel probe")
+        ),
+    )
+    route_res = client.post(
+        "/v1/onboarding/route",
+        json={"route": "model_api"},
+        headers=_headers(api_key),
+    )
+    assert route_res.status_code == 200
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openrouter",
+            "model": "vendor/text-only",
+            "api_key": "sk-test-secret",
+            "context_window_tokens": 32_768,
+        },
+        headers=_headers(api_key),
+    )
+
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+    assert probe_started.wait(timeout=1)
+    before = client.get("/v1/vision/config", headers=_headers(api_key)).get_json()
+    assert before["config"]["effective_status"] == "untested"
+
+    release_probe.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        after = client.get("/v1/vision/config", headers=_headers(api_key)).get_json()
+        if after["config"]["effective_status"] == "unsupported":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("setup-triggered vision probe did not publish its verdict")
+
+    assert after["config"]["main_model"]["vision_test_status"] == "unsupported"
 
 
 @pytest.mark.parametrize(
@@ -354,6 +448,7 @@ def test_model_api_setup_persists_explicit_custom_prompt_frontier(
     assert route["context_window_tokens"] == 32_768
     runtime = hosted_config_store._provider_config_from_plain(route, "sk-relay")
     assert runtime.context_window_tokens == 32_768
+    assert runtime.reasoning_effort == ""
 
     # Exact idempotent setup may reuse the persisted contract, so a client does
     # not have to resend the field on every key/model health refresh.
@@ -446,6 +541,8 @@ def test_model_api_setup_persists_reasoning_effort(client, monkeypatch):
     assert setup.get_json()["config"]["reasoning_effort"] == "medium"
     route = db.model_api_active_route(user_id)
     assert route["reasoning_effort"] == "medium"
+    runtime = hosted_config_store._provider_config_from_plain(route, "sk-or")
+    assert runtime.reasoning_effort == "medium"
 
     mode, state, _generation = db.get_hosted_runtime_control_strict(user_id)
     assert (mode, state) == ("db_action_v2", "v2")
@@ -1026,7 +1123,7 @@ def test_history_import_reuses_inflight_client_job(client, monkeypatch):
 
 
 def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
-    _, api_key = _register(client)
+    user_id, api_key = _register(client)
 
     monkeypatch.setattr(
         provider_client,
@@ -1044,6 +1141,9 @@ def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
         headers=_headers(api_key),
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
+    active = db.model_api_active_route(user_id)
+    assert active is not None
+    assert db.model_api_route_mark_vision_test(user_id, active["id"], status="ok")
 
     # 图片 turn 和文本 turn 一样进入 pooled V2 lane。
     chat = client.post(

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -78,7 +79,76 @@ def _zone(tz: Any) -> ZoneInfo:
         return ZoneInfo(DEFAULT_TIMEZONE_V2)
 
 
-def schedule_instant_v2(at: Any, tz: Any) -> tuple[str, str, float]:
+_ENGLISH_RELATIVE_AT_V2 = re.compile(
+    r"^(?:in\s+|\+\s*)?(?P<amount>\d+(?:\.\d+)?)\s*"
+    r"(?P<unit>seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)"
+    r"(?:\s+(?:later|from\s+now))?$",
+    re.IGNORECASE,
+)
+_CHINESE_RELATIVE_AT_V2 = re.compile(
+    r"^(?P<amount>\d+(?:\.\d+)?|[零〇一二两三四五六七八九十百半]+)\s*"
+    r"(?P<unit>秒钟?|分钟|分|小时|钟头|天)(?:以?后)?$"
+)
+
+
+def _chinese_number_v2(raw: str) -> float | None:
+    if raw == "半":
+        return 0.5
+    digits = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if all(char in digits for char in raw):
+        return float("".join(str(digits[char]) for char in raw))
+    total = 0
+    current = 0
+    for char in raw:
+        if char in digits:
+            current = digits[char]
+        elif char == "十":
+            total += (current or 1) * 10
+            current = 0
+        elif char == "百":
+            total += (current or 1) * 100
+            current = 0
+        else:
+            return None
+    return float(total + current)
+
+
+def _relative_delay_seconds_v2(raw_at: str) -> float | None:
+    match = _ENGLISH_RELATIVE_AT_V2.fullmatch(raw_at)
+    if match:
+        amount = float(match.group("amount"))
+        unit = match.group("unit").lower()
+        if unit.startswith(("s", "sec")):
+            multiplier = 1.0
+        elif unit.startswith(("m", "min")):
+            multiplier = 60.0
+        elif unit.startswith(("h", "hr")):
+            multiplier = 3600.0
+        else:
+            multiplier = 86400.0
+        return amount * multiplier
+
+    match = _CHINESE_RELATIVE_AT_V2.fullmatch(raw_at)
+    if not match:
+        return None
+    amount_raw = match.group("amount")
+    amount = float(amount_raw) if amount_raw[0].isdigit() else _chinese_number_v2(amount_raw)
+    if amount is None:
+        return None
+    unit = match.group("unit")
+    if unit.startswith("秒"):
+        multiplier = 1.0
+    elif unit in {"分钟", "分"}:
+        multiplier = 60.0
+    elif unit in {"小时", "钟头"}:
+        multiplier = 3600.0
+    else:
+        multiplier = 86400.0
+    return amount * multiplier
+
+
+def schedule_instant_v2(at: Any, tz: Any, *, now: float | None = None) -> tuple[str, str, float]:
     """Return (wall_time, timezone_name, due_at_epoch).
 
     The durable record keeps wall-clock time plus event timezone. `due_at` is a
@@ -88,6 +158,13 @@ def schedule_instant_v2(at: Any, tz: Any) -> tuple[str, str, float]:
     if not raw_at:
         raise ValueError("missing_at")
     zone = _zone(tz)
+    relative_delay = _relative_delay_seconds_v2(raw_at)
+    if relative_delay is not None:
+        if relative_delay <= 0:
+            raise ValueError("invalid_at")
+        due_at = _now(now) + relative_delay
+        local = datetime.fromtimestamp(due_at, timezone.utc).astimezone(zone)
+        return local.replace(tzinfo=None).isoformat(), zone.key, due_at
     normalized = raw_at[:-1] + "+00:00" if raw_at.endswith("Z") else raw_at
     try:
         parsed = datetime.fromisoformat(normalized)
@@ -126,6 +203,7 @@ class ScheduledWakeRecordV2:
     claim_expires_at: float = 0.0
     fired_at: float = 0.0
     fired_wake_id: str = ""
+    fired_job_id: int = 0
     canceled_at: float = 0.0
     cancel_reason: str = ""
     blocked_at: float = 0.0
@@ -147,6 +225,8 @@ class ScheduledWakeActionResultV2:
     transparency_required: bool = False
     transparency_wake_id: str = ""
     evicted_timer_ids: tuple[str, ...] = ()
+    next_trigger_at: str = ""
+    timezone: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         out = {
@@ -163,6 +243,10 @@ class ScheduledWakeActionResultV2:
             out["transparency_wake_id"] = self.transparency_wake_id
         if self.evicted_timer_ids:
             out["evicted_timer_ids"] = list(self.evicted_timer_ids)
+        if self.next_trigger_at:
+            out["next_trigger_at"] = self.next_trigger_at
+        if self.timezone:
+            out["timezone"] = self.timezone
         return out
 
 
@@ -205,6 +289,7 @@ def scheduled_record_to_doc_v2(record: ScheduledWakeRecordV2) -> dict[str, Any]:
         "claim_expires_at": float(record.claim_expires_at),
         "fired_at": float(record.fired_at),
         "fired_wake_id": record.fired_wake_id,
+        "fired_job_id": int(record.fired_job_id),
         "canceled_at": float(record.canceled_at),
         "cancel_reason": record.cancel_reason,
         "blocked_at": float(record.blocked_at),
@@ -232,6 +317,7 @@ def scheduled_record_from_doc_v2(doc: Mapping[str, Any]) -> ScheduledWakeRecordV
         claim_expires_at=float(doc.get("claim_expires_at") or 0.0),
         fired_at=float(doc.get("fired_at") or 0.0),
         fired_wake_id=str(doc.get("fired_wake_id") or ""),
+        fired_job_id=int(doc.get("fired_job_id") or 0),
         canceled_at=float(doc.get("canceled_at") or 0.0),
         cancel_reason=str(doc.get("cancel_reason") or ""),
         blocked_at=float(doc.get("blocked_at") or 0.0),
@@ -308,7 +394,16 @@ class InMemoryScheduledWakeStoreV2:
             })
             return scheduled_record_from_doc_v2(doc)
 
-    def mark_fired(self, user_id: str, timer_id: str, claim_id: str, *, wake_id: str, now: float) -> ScheduledWakeRecordV2 | None:
+    def mark_fired(
+        self,
+        user_id: str,
+        timer_id: str,
+        claim_id: str,
+        *,
+        wake_id: str,
+        job_id: int = 0,
+        now: float,
+    ) -> ScheduledWakeRecordV2 | None:
         return self._mark_terminal(
             user_id,
             timer_id,
@@ -317,6 +412,7 @@ class InMemoryScheduledWakeStoreV2:
                 "status": SCHEDULED_FIRED,
                 "fired_at": now,
                 "fired_wake_id": wake_id,
+                "fired_job_id": int(job_id),
                 "updated_at": now,
             },
         )
@@ -424,7 +520,16 @@ class DBScheduledWakeStoreV2:
             mirror.execute(sql, tuple(params))
         return scheduled_record_from_doc_v2(row[0]) if row is not None else None
 
-    def mark_fired(self, user_id: str, timer_id: str, claim_id: str, *, wake_id: str, now: float) -> ScheduledWakeRecordV2 | None:
+    def mark_fired(
+        self,
+        user_id: str,
+        timer_id: str,
+        claim_id: str,
+        *,
+        wake_id: str,
+        job_id: int = 0,
+        now: float,
+    ) -> ScheduledWakeRecordV2 | None:
         doc = self._patch_guarded(
             user_id,
             timer_id,
@@ -432,6 +537,7 @@ class DBScheduledWakeStoreV2:
                 "status": SCHEDULED_FIRED,
                 "fired_at": now,
                 "fired_wake_id": wake_id,
+                "fired_job_id": int(job_id),
                 "updated_at": now,
             },
             statuses={SCHEDULED_CLAIMED},
@@ -598,6 +704,8 @@ class ScheduledWakeServiceV2:
                     status="canceled" if canceled else "not_found",
                     timer_id=timer_id,
                     reason=reason if canceled else "timer_not_found",
+                    next_trigger_at=canceled.at if canceled else "",
+                    timezone=canceled.timezone if canceled else "",
                 ))
         return tuple(results)
 
@@ -614,7 +722,11 @@ class ScheduledWakeServiceV2:
         now: float,
     ) -> ScheduledWakeActionResultV2:
         try:
-            wall_time, tz_name, due_at = schedule_instant_v2(action.get("at"), action.get("tz") or settings.timezone)
+            wall_time, tz_name, due_at = schedule_instant_v2(
+                action.get("at"),
+                action.get("tz") or settings.timezone,
+                now=now,
+            )
         except ValueError as exc:
             return ScheduledWakeActionResultV2("schedule_wake", "invalid", reason=str(exc))
         clamped = False
@@ -647,6 +759,8 @@ class ScheduledWakeServiceV2:
             timer_id=timer_id,
             reason="self_wake_min_lead_clamped" if clamped else "",
             evicted_timer_ids=tuple(record.timer_id for record in evicted),
+            next_trigger_at=wall_time,
+            timezone=tz_name,
         )
 
     def _enforce_pending_cap(self, user_id: str, *, now: float, keep_timer_id: str) -> list[ScheduledWakeRecordV2]:
@@ -694,7 +808,14 @@ class ScheduledWakeServiceV2:
             if decision.accepted:
                 submitted = submit_wake(event)
                 if getattr(submitted, "accepted", True):
-                    self.store.mark_fired(user_id, claimed.timer_id, claimed.claim_id, wake_id=event.wake_id, now=now)
+                    self.store.mark_fired(
+                        user_id,
+                        claimed.timer_id,
+                        claimed.claim_id,
+                        wake_id=event.wake_id,
+                        job_id=int(getattr(submitted, "job_id", 0) or 0),
+                        now=now,
+                    )
                     results.append(ScheduledWakeFireResultV2("fired", claimed.timer_id, wake_id=event.wake_id))
                     continue
                 decision = submitted

@@ -107,10 +107,15 @@ def test_compact_segment_never_resends_an_existing_aggregate_summary():
         seen.extend(messages)
         return {"reply": "- covered new batch"}
 
+    # Above the verbatim-fold threshold, so this exercises the provider path
+    # whose prompt shape is what this test is about.
     result = asyncio.run(
         compaction.compact_segment(
             provider_config=object(),
-            old_messages=[{"role": "user", "content": "NEW_BATCH_ONLY"}],
+            old_messages=[
+                {"role": "user", "content": "NEW_BATCH_ONLY " + "x" * 500}
+                for _ in range(compaction._VERBATIM_FOLD_MAX_CHARS // 500 + 2)
+            ],
             llm=_llm,
         )
     )

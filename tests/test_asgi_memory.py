@@ -474,3 +474,40 @@ def test_legacy_batch_parity(user, monkeypatch):
     assert f[0] == 200
     assert [r["id"] for r in f[1]["batch"]] == ["m1"]
     assert f[1]["legacy_remaining"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# actions — runtime-token forwarding (hosted callers have no api_key)
+# --------------------------------------------------------------------------- #
+
+def test_actions_forwards_runtime_token_to_core(user, monkeypatch):
+    """A hosted caller authenticating with a runtime token must be able to EDIT an
+    existing card.
+
+    Stage D swaps ``X-API-Key`` for ``X-Feedling-Runtime-Token`` in the resident
+    consumer, so ``auth.api_key`` is None on this path. ``/actions`` was the only
+    route in this file that never extracted the token (its four readside siblings
+    and ``legacy_batch`` all did), so the enclave decrypt of the OLD card raised
+    ``api_key_unavailable`` and every supersede/patch/upgrade came back
+    ``409 memory_decrypt_failed`` — for every hosted user, V1 and V2 alike.
+    """
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", _SECRET)
+    uid, _api_key = user
+    tok = _token(uid, ["memory"])
+    seen: dict = {}
+
+    def fake_actions(store, api_key, payload, *, runtime_token=""):
+        seen["api_key"] = api_key
+        seen["runtime_token"] = runtime_token
+        return {"applied": 1}, 200
+
+    monkeypatch.setattr(memory_core, "actions", fake_actions)
+    status, body = _asgi(
+        "POST", "/v1/memory/actions",
+        headers={"X-Feedling-Runtime-Token": tok},
+        json_body={"actions": [{"type": "memory.profile_patch"}]},
+    )
+
+    assert status == 200 and body == {"applied": 1}
+    assert seen["api_key"] is None      # hosted callers have no per-user api key
+    assert seen["runtime_token"] == tok  # ...so the token is the ONLY usable credential

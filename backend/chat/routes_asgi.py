@@ -23,6 +23,7 @@ from asgi import threadpool
 from asgi.deps import require_auth
 from asgi.settings import settings
 from bootstrap import gates as boot_gates
+from chat import activity_core as chat_activity_core
 from chat import chat_core
 from chat import consumer as chat_consumer
 from chat import poll_core as chat_poll_core
@@ -47,7 +48,9 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
         consumer_info,
         runtime_token_auth=bool(auth.runtime_token_claims),
     )
-    context = await threadpool.run_db(chat_poll_core.poll_context, store)
+    context = await threadpool.run_db(
+        chat_poll_core.poll_context, store, consumer_info
+    )
 
     try:
         since = float(request.query_params.get("since", 0))
@@ -106,7 +109,7 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
         # Either a new chat message OR a new status event (§9 tool-call
         # progress) is enough to return — a status-only update must wake a
         # parked waiter too, not just chat messages.
-        if pending or status_events:
+        if pending or status_events or context.get("vision_probe"):
             # Immediate delivery before parking: the pre-park context is still
             # the freshest snapshot, so reuse it (no extra DB read).
             return _response(pending, status_events, timed_out=False, ctx=context)
@@ -123,7 +126,9 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
     # Refresh the context after the wait: config changes that landed while we
     # were parked (a moved user_mcp fingerprint etc.) must be reflected in this
     # response rather than the stale pre-park snapshot.
-    fresh = await threadpool.run_db(chat_poll_core.poll_context, store)
+    fresh = await threadpool.run_db(
+        chat_poll_core.poll_context, store, consumer_info
+    )
     if notified:
         return _response(await _check(), await _status(), timed_out=False, ctx=fresh)
     return _response([], await _status(), timed_out=True, ctx=fresh)
@@ -205,6 +210,25 @@ async def chat_history(request: Request, auth: AuthResult = Depends(require_auth
         query=dict(request.query_params),
         user_agent=request.headers.get("User-Agent", ""),
         remote_addr=request.client.host if request.client else "",
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/chat/turn-activity/{turn_id}")
+async def chat_turn_activity(turn_id: str, auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(
+        chat_activity_core.read_turn_activity, auth.store, turn_id
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/chat/turn-activity/{turn_id}/events")
+async def chat_turn_activity_event(
+    turn_id: str, request: Request, auth: AuthResult = Depends(require_auth)
+):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    body, status = await threadpool.run_db(
+        chat_activity_core.write_turn_activity, auth.store, turn_id, payload
     )
     return JSONResponse(body, status_code=status)
 

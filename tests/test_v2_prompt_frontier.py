@@ -558,9 +558,9 @@ def test_round_frontier_stops_aggregate_native_transcript_before_provider_call(
             "reply": "",
             "tool_calls": [
                 {
-                    "id": f"c{index}",
-                    "name": "memory_search",
-                    "args": {"query": "q"},
+                        "id": f"c{index}",
+                        "name": "identity_get",
+                        "args": {},
                 }
             ],
             "usage": {},

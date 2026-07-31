@@ -115,6 +115,10 @@ services:
       # (asgi/settings.py) for the dev A/B parallel instance; a REAL deploy MUST
       # enable it or the iOS broadcast-extension frame ingest on :9998 never binds.
       FEEDLING_ASGI_BACKGROUND: "true"
+      # Public HTTPS origin returned to ElevenLabs for Custom LLM callbacks.
+      # Empty keeps voice sessions fail-closed; production deployments must set
+      # this to the externally reachable origin serving /v1/voice.
+      FEEDLING_VOICE_GATEWAY_PUBLIC_URL: "${FEEDLING_VOICE_GATEWAY_PUBLIC_URL:-}"
       # --- ATTESTED CONFIG: security-relevant external data store. See the
       #     §ENV-VAR HYGIENE AUDIT note above. Must include sslmode=require.
       #     Defaulted to empty (not `:?`) so `docker compose build`, which

@@ -10,6 +10,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 from io_cli_catalog import build_catalog
 
 
+def test_catalog_explains_verbs_require_io_cli_invocation():
+    io_cli_path = os.path.join(
+        os.path.dirname(__file__), "..", "tools", "io_cli.py"
+    )
+    catalog = build_catalog(io_cli_path)
+    assert catalog is not None
+
+    assert f"python {io_cli_path} memory-index --limit 20" in catalog
+    assert "verbs are not standalone shell commands" in catalog
+    assert "never bare `memory-index --limit 20`" in catalog
+
+
 def test_catalog_contains_identity_write_with_agent_name():
     """Catalog should include identity-write verb with --agent-name flag."""
     io_cli_path = os.path.join(
@@ -77,9 +89,9 @@ def test_catalog_perception_trend_has_signal_positional():
         "perception-trend line should contain the required 'signal' positional"
 
 
-def test_catalog_memory_fetch_has_ids_positional():
-    """I6: memory-fetch's required positional `ids` (nargs='+') must survive
-    extraction, not just its optional --limit/--include-* flags."""
+def test_catalog_memory_fetch_marks_ids_as_placeholders():
+    """memory-fetch must keep its required repeated positional without making
+    the argparse name look like a real card id the model should copy."""
     io_cli_path = os.path.join(
         os.path.dirname(__file__), "..", "tools", "io_cli.py"
     )
@@ -88,8 +100,23 @@ def test_catalog_memory_fetch_has_ids_positional():
 
     lines = [l for l in catalog.split("\n") if l.startswith("memory-fetch ")]
     assert len(lines) == 1, "Catalog should contain exactly one memory-fetch line"
-    assert "ids" in lines[0].split(), \
-        "memory-fetch line should contain the required 'ids' positional"
+    assert "memory-fetch <memory_id> [<memory_id> ...]" in lines[0]
+    assert "returned by memory-index" in lines[0]
+    assert "never pass literal placeholder" in lines[0]
+    assert not lines[0].startswith("memory-fetch ids ")
+
+
+def test_catalog_memory_index_requires_index_then_fetch_order():
+    io_cli_path = os.path.join(
+        os.path.dirname(__file__), "..", "tools", "io_cli.py"
+    )
+    catalog = build_catalog(io_cli_path)
+    assert catalog is not None, "build_catalog should not return None"
+
+    lines = [l for l in catalog.split("\n") if l.startswith("memory-index ")]
+    assert len(lines) == 1, "Catalog should contain exactly one memory-index line"
+    assert "Use this first for any memory request" in lines[0]
+    assert "items[].id" in lines[0]
 
 
 def test_catalog_required_positionals_sweep():
@@ -119,7 +146,7 @@ def test_catalog_required_positionals_sweep():
         "identity-read": [],
         "identity-write": [],
         "memory-delete": [],
-        "memory-fetch": ["ids"],
+        "memory-fetch": ["<memory_id>", "[<memory_id>", "...]"],
         "memory-index": [],
         "memory-patch": [],
         "memory-write": [],

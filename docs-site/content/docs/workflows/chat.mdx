@@ -74,6 +74,55 @@ For an image turn, add `image_b64` and `image_mime`. The decoded image limit is
 }
 ```
 
+### Image model selection
+
+On Hosted Runtime V1 or V2, and on a VPS with the current IO resident, an
+account can either keep its existing main-model image path or select a separate
+saved model route as an image observer. Read the current choice with `GET
+/v1/vision/config`, and change it with `PUT /v1/vision/config`:
+
+```json
+{
+  "mode": "dedicated",
+  "route_id": "a0a51b3f-35e0-4335-bf46-fac40bff3789"
+}
+```
+
+IO sends the candidate a generated image whose answer is not known in advance
+and records whether the returned observation proves image understanding.
+Selection and capability are separate: a reachable text-only model may remain
+selected with `effective_status: "unsupported"` as settings feedback, but image
+sends are not blocked by probe state. `mode: "follow_main"` preserves the
+existing main-model image path, while a selected dedicated route is pinned for
+delivery even if its latest probe is stale or unsuccessful.
+
+Use `POST /v1/vision/config` when adding a dedicated image model. It creates or
+reuses the saved route, runs the generated-image check, and selects the route
+as one server-owned operation. A reachable model that proves text-only remains
+saved and selected with an `unsupported` warning, while authentication,
+provider, quota, and other operational failures remove only the route or
+credential created by that request.
+
+When a dedicated route is configured, IO records that exact route before the
+image turn is stored. Runtime V2 or the official resident then sends pixels only
+to that route, asks for a neutral visual observation, marks the result as
+untrusted data, and passes only that text to the main agent. A vision-call
+failure does not fall back to sending the raw image to the main model.
+
+`POST /v1/vision/routes/{route_id}/test` repeats the capability check without
+changing the selection. Each accepted image turn records the dedicated route it
+preflighted, so changing Settings cannot reroute an already queued image. The
+consumer reads that exact route and decrypts its credential through the enclave.
+If the pinned route was deleted, the turn fails instead of exposing raw pixels
+to the main model.
+
+Runtime V1 and VPS report whether a fresh official resident poll advertises
+`vision_observer_v1`, but that capability signal does not block image ingestion.
+Follow-main keeps the existing image path unchanged; a selected dedicated route
+stays pinned rather than silently falling back to the main model. `POST
+/v1/vision/observe` is the authenticated resident-facing observer exchange for
+the message's pinned route.
+
 For a document, use `file_b64`, `file_name`, and `file_mime` instead. The decoded
 file limit is 25 MiB. PDF, DOCX, XLSX, supported images, and UTF-8 text/source
 files are accepted. Send only one binary attachment per turn.
@@ -179,6 +228,71 @@ download cards as one idempotent reply bundle. It stores `content_type: "file"`
 plus a bounded filename, MIME, and byte count. The worker never scans a runtime
 directory, and `send_file` rejects host paths and non-`/workspace` namespaces.
 Both editable source and rendered output are limited to 1,000,000 bytes.
+
+### 3. Read confirmed V1 or V2 activity
+
+Use the accepted user message id as `turn_id` while waiting for either a
+resident V1 or hosted V2 reply:
+
+~~~http
+GET /v1/chat/turn-activity/msg_user_123 HTTP/1.1
+Host: api.feedling.app
+X-API-Key: YOUR_FEEDLING_API_KEY
+~~~
+
+~~~json
+{
+  "turn_id": "msg_user_123",
+  "runtime": "v1",
+  "complete": false,
+  "phase": "processing",
+  "jobs": [{ "job_id": "v1:msg_user_123", "status": "running" }],
+  "events": [
+    {
+      "id": "v1:4be4dce72b0a4f76bff3ec2c601598ce",
+      "kind": "tool",
+      "name": "memory_index",
+      "status": "success",
+      "job_id": "",
+      "call_id": "v1:4be4dce72b0a4f76bff3ec2c601598ce",
+      "duration_ms": 18.4,
+      "result_code": "ok",
+      "memory_count": 4,
+      "memory_categories": [
+        { "key": "relationship", "count": 3 },
+        { "key": "family", "count": 1 }
+      ]
+    }
+  ]
+}
+~~~
+
+This is a runtime-neutral projection, not a reconstruction of assistant text.
+V2 uses backend-owned job and tool-dispatch records. V1 accepts fixed-shape
+events from the authenticated shipped resident runtime and binds them to an
+existing user turn. Neither path returns tool arguments, tool result bodies, or
+reasoning. Durable V2 effects may add `effect_id`, `effect_type`, and
+`effect_status` only after the dispatcher has confirmed their disposition.
+
+For successful `memory_index`, `memory_search`, and `memory_fetch`,
+`memory_count` is derived
+from the actual V2 capability result or V1 `io_cli` response before any
+provider-facing truncation. `memory_categories` is optional: it is present only when every
+returned item has one of the canonical bilingual memory buckets and its counts
+sum to `memory_count`. If any bucket is custom or unknown, the category list is
+omitted and clients should show the total only. Raw bucket labels, summaries,
+memory content, and query text never enter activity metadata.
+
+Every executed Runtime V2 platform, MCP, `reply`, and `send_file` call uses the
+same started/result/error activity boundary. Repeated memory-discovery calls
+that are deterministically rejected by the loop are recorded as confirmed
+results too. Zero-result discovery is retained, and each turn returns at most
+100 projected events.
+
+Completed tool events are also attached to the assistant history item's
+`activity_events` metadata, so clients can render the execution record below
+the final reply. A separately encrypted `thinking_*` envelope remains the only
+source for display-safe reasoning and must not be merged with tool activity.
 
 ## Independent resident loop
 
@@ -487,6 +601,9 @@ reply is linked through `reply_to_message_id` and carries
 `turn_failure_user_text`. Provider-configuration failures use actionable text
 from the shared error catalog; transient provider and system failures use the
 standard retry-later fallback while preserving the classified metadata.
+If the main model explicitly rejects image input, the failure is classified as
+`vision_model_required`, allowing clients to direct the user to add or select a
+vision-capable model instead of presenting the generic retry-later fallback.
 If an internal conservative context-window default rejects a turn, Chat treats
 that as a system failure rather than blaming the user's provider configuration.
 

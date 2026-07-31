@@ -130,6 +130,21 @@ class _Table:
     requeue_fetch_sql: str | None = None       # params: (user_id, item_id) or (user_id,)
     requeue_delete_tee_sql: str | None = None  # drop the TEE row when RDS row is gone
     requeue_by_user_only: bool = False          # identity: key on user_id alone
+    # prune lane（删除传播的兜底对账，见 tee_shadow/ciphertext_prune.py）。两条
+    # SELECT 必须返回**同构**的主键元组，且元组顺序与 requeue_delete_tee_sql 的
+    # 参数顺序逐位对齐——prune 就是把差集里的元组原样喂给那条 DELETE。
+    #
+    # 为什么两侧要分别给一条而不是共用：表名和辖区在两侧不一定相同。
+    # frame_envelopes（RDS）在 TEE 侧叫 frames；identity 是伪表，两侧都要
+    # `WHERE kind='identity'` 的辖区限定，否则会把 user_blobs 的其它 kind
+    # （归 MIRROR lane 的 reconciler 管）卷进来当孤儿删掉。
+    #
+    # 留空 = 本表不参与 prune。纯 append-only、连 requeue_delete_tee_sql 都没有的
+    # 表（chat_message_archive / v2_trajectory_events /
+    # v2_conversation_summary_segments）就该留空：它们没有删除语义，prune 无从
+    # 判断"消失"是删除还是尚未复制。
+    prune_rds_keys_sql: str | None = None
+    prune_tee_keys_sql: str | None = None
     # 冷启动（tee_replication_cursors 里还没有本表的行）时喂给 select_sql 的参数
     # 元组。None = 沿用通用逻辑：_read_cursor 对未跑过的表返回 ("", 0.0)，
     # _decode_cursor 把空串原样当参数——这对既有表安全，因为它们的排序列都是
@@ -199,6 +214,8 @@ _TABLES: dict[str, _Table] = {
         requeue_fetch_sql=("SELECT user_id, msg_id, ts, doc, seq FROM chat_messages "
                            "WHERE user_id = %s AND msg_id = %s"),
         requeue_delete_tee_sql="DELETE FROM chat_messages WHERE user_id = %s AND msg_id = %s",
+        prune_rds_keys_sql="SELECT user_id, msg_id FROM chat_messages",
+        prune_tee_keys_sql="SELECT user_id, msg_id FROM chat_messages",
     ),
     "memory_moments": _Table(
         select_sql=("SELECT user_id, moment_id, occurred_at, doc FROM memory_moments "
@@ -214,6 +231,8 @@ _TABLES: dict[str, _Table] = {
         requeue_fetch_sql=("SELECT user_id, moment_id, occurred_at, doc FROM memory_moments "
                            "WHERE user_id = %s AND moment_id = %s"),
         requeue_delete_tee_sql="DELETE FROM memory_moments WHERE user_id = %s AND moment_id = %s",
+        prune_rds_keys_sql="SELECT user_id, moment_id FROM memory_moments",
+        prune_tee_keys_sql="SELECT user_id, moment_id FROM memory_moments",
     ),
     "world_book_entries": _Table(
         select_sql=("SELECT user_id, entry_id, updated_at, doc FROM world_book_entries "
@@ -229,6 +248,8 @@ _TABLES: dict[str, _Table] = {
         requeue_fetch_sql=("SELECT user_id, entry_id, updated_at, doc FROM world_book_entries "
                            "WHERE user_id = %s AND entry_id = %s"),
         requeue_delete_tee_sql="DELETE FROM world_book_entries WHERE user_id = %s AND entry_id = %s",
+        prune_rds_keys_sql="SELECT user_id, entry_id FROM world_book_entries",
+        prune_tee_keys_sql="SELECT user_id, entry_id FROM world_book_entries",
     ),
     # identity：user_blobs kind=identity，一行/用户，无排序列 → 单列 user_id 游标。
     "identity": _Table(
@@ -244,6 +265,11 @@ _TABLES: dict[str, _Table] = {
                            "WHERE kind = 'identity' AND user_id = %s"),
         requeue_delete_tee_sql="DELETE FROM user_blobs WHERE user_id = %s AND kind = 'identity'",
         requeue_by_user_only=True,
+        # 辖区限定不可省：user_blobs 整表归 MIRROR lane，reconciler 只是把
+        # kind='identity' 让给了 replicator（见 reconciler._SCOPE_WHERE）。不带
+        # WHERE 就会把其它 kind 的行当成本 lane 的孤儿删掉——那些行归 reconciler 管。
+        prune_rds_keys_sql="SELECT user_id FROM user_blobs WHERE kind = 'identity'",
+        prune_tee_keys_sql="SELECT user_id FROM user_blobs WHERE kind = 'identity'",
     ),
 }
 
@@ -445,6 +471,12 @@ _TABLES["frame_envelopes"] = _Table(
     unpack=lambda r: (r[0], r[1], r[2], {"doc": r[3], "env_meta": r[4], "body_key": r[5]}),
     row_writer=_frames_row_writer,
     requeue_delete_tee_sql="DELETE FROM frames WHERE user_id = %s AND frame_id = %s",
+    # ⚠️ 两侧表名不同：RDS 是 frame_envelopes，TEE 侧叫 frames。
+    # 遗留风险与上面 requeue_delete_tee_sql 那段注释同源：prune 删掉 TEE 明文指针
+    # 行时，不清理该行 body_storage_key 指向的 frames-tee R2 对象，会留下孤儿对象。
+    # 与 requeue lane 的既有行为一致（那条 DELETE 同样不碰 R2），不在本次修复范围。
+    prune_rds_keys_sql="SELECT user_id, frame_id FROM frame_envelopes",
+    prune_tee_keys_sql="SELECT user_id, frame_id FROM frames",
 )
 
 
@@ -689,6 +721,8 @@ _TABLES["model_api_credentials"] = _Table(
                        "created_at, updated_at FROM model_api_credentials "
                        "WHERE user_id = %s AND id = %s"),
     requeue_delete_tee_sql="DELETE FROM model_api_credentials WHERE user_id = %s AND id = %s",
+    prune_rds_keys_sql="SELECT user_id, id FROM model_api_credentials",
+    prune_tee_keys_sql="SELECT user_id, id FROM model_api_credentials",
     # 冷启动：updated_at 是 TIMESTAMPTZ，"-infinity" 合法；id 是 UUID（WHERE 里
     # 没有 ::text 转型），空串不是合法 uuid，用全零 nil UUID 当下界（Postgres 按
     # 128 位整数比较 uuid，全零是可能的最小值）。
@@ -753,6 +787,8 @@ _TABLES["v2_conversation_summary"] = _Table(
                        "updated_at, watermark_seq, materialized_segment_ids "
                        "FROM v2_conversation_summary WHERE user_id = %s"),
     requeue_delete_tee_sql="DELETE FROM v2_conversation_summary WHERE user_id = %s",
+    prune_rds_keys_sql="SELECT user_id FROM v2_conversation_summary",
+    prune_tee_keys_sql="SELECT user_id FROM v2_conversation_summary",
     requeue_by_user_only=True,
     # 冷启动：updated_at 是 TIMESTAMPTZ，"-infinity" 合法；第二列是 user_id
     # （TEXT），空串本身合法且排在任何真实 user_id（都以 "usr_" 开头，非空）之前。
@@ -905,6 +941,8 @@ _TABLES["v2_trajectory_reviews"] = _Table(
                        "WHERE user_id = %s AND source_job_id = %s"),
     requeue_delete_tee_sql=("DELETE FROM v2_trajectory_reviews "
                             "WHERE user_id = %s AND source_job_id = %s"),
+    prune_rds_keys_sql="SELECT user_id, source_job_id FROM v2_trajectory_reviews",
+    prune_tee_keys_sql="SELECT user_id, source_job_id FROM v2_trajectory_reviews",
     # 冷启动：created_at 是 TIMESTAMPTZ，"-infinity" 合法；source_job_id 是
     # BIGINT（WHERE 里没有 ::text 转型），空串不是合法 bigint，用数字串 "0"。
     cursor_zero=("-infinity", "0"),
@@ -961,6 +999,8 @@ _TABLES["v2_workspace_entries"] = _Table(
                        "source_ref, revision, created_at, updated_at "
                        "FROM v2_workspace_entries WHERE user_id = %s AND path = %s"),
     requeue_delete_tee_sql="DELETE FROM v2_workspace_entries WHERE user_id = %s AND path = %s",
+    prune_rds_keys_sql="SELECT user_id, path FROM v2_workspace_entries",
+    prune_tee_keys_sql="SELECT user_id, path FROM v2_workspace_entries",
     # 冷启动：updated_at 是 TIMESTAMPTZ，"-infinity" 合法；第二列在 SQL 里已经
     # 用 || 拼成字符串，空串本身就是合法 TEXT 且排在任何非空拼接结果之前。
     cursor_zero=("-infinity", ""),

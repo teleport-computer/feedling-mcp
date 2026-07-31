@@ -513,6 +513,87 @@ def test_run_wake_degenerate_reply_fails_silently(monkeypatch):
     assert not any(event["kind"] == "error" for event in _status_events(uid))
 
 
+def test_run_scheduled_wake_prompts_with_the_exact_due_reminders(monkeypatch):
+    uid = "u_wake_scheduled_notes"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "scheduled")
+    claimed_by = _claim(job_id)
+    seen = {}
+
+    async def _fake(config, messages, *, tools=None, **_kwargs):
+        seen["messages"] = messages
+        return _text_round("该喝水了，也记得拉伸一下。")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
+    monkeypatch.setattr(
+        worker,
+        "_write_encrypted_reply",
+        lambda _store, _text: {"id": "scheduled-reply"},
+    )
+    deps = _wake_deps(tail=[])
+    deps.read_scheduled_wake_context = lambda user_id, scheduled_job_id: [
+        {
+            "note": "提醒我喝水",
+            "operation": "scheduled_wake",
+            "status": "fired",
+            "task_id": "timer-water",
+            "next_trigger_at": "2026-07-27T08:00:00",
+            "timezone": "Asia/Shanghai",
+            "fired_at": 123.0,
+        },
+        {
+            "note": "提醒我拉伸",
+            "operation": "scheduled_wake",
+            "status": "fired",
+            "task_id": "timer-stretch",
+            "next_trigger_at": "2026-07-27T08:00:00",
+            "timezone": "Asia/Shanghai",
+            "fired_at": 123.0,
+        },
+    ]
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "scheduled",
+        deps,
+        _BYOK,
+        worker.ENCLAVE_SEMAPHORE,
+        claimed_by,
+    ))
+
+    assert status == "completed"
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in seen["messages"]
+        if message.get("role") == "system"
+    )
+    assert worker._SCHEDULED_WAKE_SYSTEM_PROMPT in system_text
+    user_text = "\n".join(
+        str(message.get("content") or "")
+        for message in seen["messages"]
+        if message.get("role") == "user"
+    )
+    assert "提醒我喝水" in user_text
+    assert "提醒我拉伸" in user_text
+    assert worker._WAKE_NUDGE not in user_text
+    with db.get_pool().connection() as conn:
+        payload = conn.execute(
+            "SELECT payload FROM v2_effect_outbox "
+            "WHERE user_id=%s AND job_id=%s AND effect_type='reply'",
+            (uid, job_id),
+        ).fetchone()[0]
+    events = payload["activity_events"]
+    assert [event["schedule_task_id"] for event in events] == [
+        "timer-water",
+        "timer-stretch",
+    ]
+    assert all(event["schedule_status"] == "fired" for event in events)
+    assert "提醒我喝水" not in repr(events)
+    assert "提醒我拉伸" not in repr(events)
+
+
 def test_run_wake_provider_error_silent_mark_failed(monkeypatch):
     """A real provider failure (BYOK 402, enclave hiccup, etc.) must NOT be
     confused with a weak-wake sleep — it's a real failure, silently marked,

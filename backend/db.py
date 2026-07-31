@@ -741,6 +741,7 @@ _TEE_SYNC_RUN_COLS = (
     "replicate_table_failures",
     "reconcile_copied", "reconcile_pruned", "reconcile_skipped",
     "snapshot_copied", "snapshot_failures",
+    "prune_stale", "prune_deleted", "prune_refused",
     "mirror_failures", "tee_healthy", "tee_probe_ms", "duration_ms",
 )
 
@@ -1304,7 +1305,8 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                          'YYYY-MM-DD"T"HH24:MI:SS"Z"'
                        ), ''),
                        last_provider_error_class,
-                       last_provider_error_blame
+                       last_provider_error_blame,
+                       COALESCE(recent_latency_ms, 0)
                 FROM provider_health
                 WHERE user_id = ANY(%s)
                 """,
@@ -1317,6 +1319,7 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                 failure_at,
                 error_class,
                 error_blame,
+                recent_latency_ms,
             ) in rows:
                 ensure(out, uid)["provider_health"] = {
                     "provider_state": provider_state or "ok",
@@ -1324,6 +1327,12 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                     "last_provider_failure_at": failure_at or "",
                     "last_provider_error_class": error_class or "",
                     "last_provider_error_blame": error_blame or "",
+                    # A slow-but-working route explains "everything takes
+                    # minutes", which none of the failure fields above can.
+                    # Raw value only: the slow/not-slow verdict lives in
+                    # provider_health, which imports db and so cannot be
+                    # imported back from here.
+                    "recent_latency_ms": round(float(recent_latency_ms or 0.0)),
                 }
 
             rows = conn.execute(
@@ -5288,6 +5297,12 @@ def chat_max_user_seq_between(
     return int(row[0]) if row and row[0] is not None else 0
 
 
+_CHAT_COVERAGE_SOURCE_PREDICATE = (
+    "COALESCE(doc->>'source','') "
+    "NOT IN ('verify_ping','resident_maintenance')"
+)
+
+
 def chat_messages_after_seq(
     user_id: str,
     after_seq: int,
@@ -5335,7 +5350,7 @@ def chat_messages_after_seq(
         # (count_messages_after_seq) and both frontier witnesses
         # (jobs_store.get_summary_frontier_state / append_summary_leaf_cas)
         # exclude the SAME set, so coverage stays consistent under GC.
-        predicate += " AND COALESCE(doc->>'source','') NOT IN ('verify_ping','resident_maintenance')"
+        predicate += f" AND {_CHAT_COVERAGE_SOURCE_PREDICATE}"
     with get_pool().connection() as conn:
         if limit is None:
             rows = conn.execute(
@@ -5368,6 +5383,57 @@ def chat_messages_after_seq(
         }
         for r in rows
     ]
+
+
+def chat_coverage_bounds_after_seq(
+    user_id: str,
+    after_seq: int,
+    *,
+    limit: int,
+    through_seq: int | None = None,
+) -> tuple[int, int, int]:
+    """Return exact bounds/count for one oldest metadata-only coverage batch.
+
+    This is the plaintext-free sibling of ``chat_messages_after_seq`` used by
+    deterministic V2 coverage accounting.  Its eligible-row predicate is
+    deliberately identical to ``_read_compaction_tail_after_seq``: GC-able
+    ``verify_ping`` and ``resident_maintenance`` rows can never enter an
+    immutable coverage claim.
+    """
+
+    cursor_seq = int(after_seq)
+    bounded = int(limit)
+    upper_seq = int(through_seq) if through_seq is not None else None
+    if cursor_seq < 0:
+        raise ValueError("after_seq must be >= 0")
+    if bounded <= 0:
+        return 0, 0, 0
+    if upper_seq is not None and upper_seq < 0:
+        raise ValueError("through_seq must be >= 0")
+    if upper_seq is not None and upper_seq <= cursor_seq:
+        return 0, 0, 0
+
+    predicate = (
+        "WHERE user_id=%s AND seq>%s "
+        f"AND {_CHAT_COVERAGE_SOURCE_PREDICATE} "
+    )
+    params: list = [str(user_id), cursor_seq]
+    if upper_seq is not None:
+        predicate += "AND seq<=%s "
+        params.append(upper_seq)
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "WITH selected AS ("
+            " SELECT seq FROM chat_messages "
+            + predicate
+            + "ORDER BY seq ASC LIMIT %s"
+            ") SELECT COALESCE(MIN(seq),0),COALESCE(MAX(seq),0),COUNT(*) "
+            "FROM selected",
+            (*params, bounded),
+        ).fetchone()
+    if not row:
+        return 0, 0, 0
+    return int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
 
 
 def chat_recent_turn_rows(
@@ -5560,7 +5626,7 @@ def count_messages_after_seq(
         # See chat_messages_after_seq: coverage gap detection must not count
         # GC-able synthetic rows, or it would demand folding a row that
         # verify_loop is about to delete (permanent frontier corruption).
-        predicate += " AND COALESCE(doc->>'source','') NOT IN ('verify_ping','resident_maintenance')"
+        predicate += f" AND {_CHAT_COVERAGE_SOURCE_PREDICATE}"
     with get_pool().connection() as conn:
         row = conn.execute(
             f"SELECT COUNT(*) FROM chat_messages {predicate}",
@@ -5593,6 +5659,52 @@ def chat_recent_genuine_turn_boundary_seq(
             (str(user_id), upper, bounded),
         ).fetchone()
     return int(row[0]) if row and row[0] is not None else None
+
+
+def v2_effective_batch_cap(user_id: str) -> int | None:
+    """The fold batch size this conversation was last observed to digest.
+
+    ``None`` means never measured — callers fall back to their configured
+    default, so existing rows and brand-new users behave exactly as before.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT effective_batch_cap FROM v2_conversation_summary "
+            "WHERE user_id = %s",
+            (str(user_id),),
+        ).fetchone()
+    if not row or row[0] is None:
+        return None
+    return int(row[0])
+
+
+def v2_set_effective_batch_cap(user_id: str, value: int) -> None:
+    """Persist the working fold batch size (floored at 1).
+
+    Writes ONLY this column, and ONLY into a row that already exists.
+
+    Both restrictions are load-bearing. The watermark and its CAS ``version``
+    are fold coverage and must never move as a side effect of bookkeeping.
+    And inserting a row here would fabricate a ``version = 0`` summary for a
+    conversation that has never been folded — the fold then reads "no summary",
+    computes its write against that absence, and its CAS collides with the row
+    this bookkeeping call invented, failing the whole job with
+    ``summary_cas_lost``.
+
+    A conversation with no summary row therefore silently keeps no memory. It
+    gets one as soon as its first fold lands, which is also the first moment
+    the memory could be worth anything.
+
+    Zero or negative is floored rather than stored: a batch of zero would wedge
+    the fold on an empty slice forever.
+    """
+    capped = max(1, int(value))
+    with get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_conversation_summary SET effective_batch_cap = %s "
+            "WHERE user_id = %s",
+            (capped, str(user_id)),
+        )
 
 
 def chat_seq_for_msg_id(user_id: str, msg_id: str) -> int | None:
@@ -6918,6 +7030,85 @@ def chat_append_resident_message(
     return seq, inserted, persisted_doc
 
 
+def chat_settle_failed_input(
+    user_id: str,
+    msg_id: str,
+    error_code: str,
+) -> bool:
+    """Mark one failed user turn settled and advance the V2 reply cursor.
+
+    A terminal provider failure is still a completed settlement decision for
+    ordering purposes. Leaving its user row beyond the durable cursor makes the
+    next chat job answer that old row before the newly submitted message.
+    """
+    from model_api_runtime.v2 import cursor as v2_cursor
+
+    message_id = str(msg_id or "").strip()
+    if not message_id:
+        return False
+    persisted_runtime_doc: dict | None = None
+    failed_fields = {
+        "reply_status": "failed",
+        "reply_failure_code": str(error_code or "turn_failed")[:200],
+        "replied_by": "hosted_runtime_v2",
+        "replied_at": f"{time.time():.3f}",
+    }
+    updated = False
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                _lock_chat_user_fence_on_cursor(cur, user_id)
+                cur.execute(
+                    "SELECT seq,doc FROM chat_messages "
+                    "WHERE user_id=%s AND msg_id=%s FOR UPDATE",
+                    (user_id, message_id),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return False
+                seq = int(row["seq"] if isinstance(row, dict) else row[0])
+                doc = row["doc"] if isinstance(row, dict) else row[1]
+                if not isinstance(doc, dict) or str(doc.get("role") or "") not in {
+                    "user",
+                    "human",
+                }:
+                    return False
+                already_replied = (
+                    str(doc.get("reply_status") or "") == "replied"
+                    or bool(str(doc.get("reply_message_id") or ""))
+                )
+                if not already_replied:
+                    cur.execute(
+                        "UPDATE chat_messages SET doc=doc || %s "
+                        "WHERE user_id=%s AND msg_id=%s",
+                        (Jsonb(failed_fields), user_id, message_id),
+                    )
+                    updated = True
+                persisted_runtime_doc = _advance_blob_int_on_cursor(
+                    cur,
+                    user_id,
+                    "model_api_runtime",
+                    v2_cursor.CURSOR_KEY,
+                    seq,
+                )
+
+    if updated:
+        from tee_shadow import mirror
+
+        mirror.execute(
+            "UPDATE chat_messages SET doc=doc || %s "
+            "WHERE user_id=%s AND msg_id=%s",
+            (Jsonb(failed_fields), user_id, message_id),
+        )
+    if persisted_runtime_doc is not None:
+        _mirror_persisted_blob(
+            user_id,
+            "model_api_runtime",
+            persisted_runtime_doc,
+        )
+    return True
+
+
 def chat_append_effect_with_cursor(
     user_id: str,
     msg_id: str,
@@ -7822,6 +8013,20 @@ _CHAT_FINALIZE_REPLY_ONCE_SQL = (
     "  INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
     "  SELECT %s, %s, %s, %s FROM won "
     "  RETURNING doc AS reply_doc"
+    "), learned_vision AS ("
+    "  UPDATE model_api_routes r SET "
+    "    vision_test_status='unsupported',"
+    "    last_vision_test_error='vision_model_required',"
+    "    last_vision_test_at=now(),updated_at=now() "
+    "  FROM won, inserted "
+    "  WHERE inserted.reply_doc->>'turn_failure_error_class'="
+    "    'vision_model_required' "
+    "    AND r.user_id=%s AND r.is_active "
+    "    AND r.id::text=COALESCE("
+    "      won.parent_doc->>'vision_main_route_id','') "
+    "    AND r.updated_at=NULLIF("
+    "      won.parent_doc->>'vision_main_route_updated_at','')::timestamptz "
+    "  RETURNING r.id"
     ") "
     "SELECT won.parent_doc, inserted.reply_doc FROM won CROSS JOIN inserted"
 )
@@ -7865,6 +8070,7 @@ def chat_finalize_reply_once(
                 reply_msg_id,
                 reply_ts,
                 Jsonb(reply_doc),
+                user_id,
             ),
         ).fetchone()
     if row is None:
@@ -8680,9 +8886,11 @@ _ROUTE_COLUMNS = """
     r.id::text, r.credential_id::text, c.provider, r.model, c.label,
     c.api_key_hint, c.base_url, c.supports_responses,
     COALESCE(r.reasoning_effort, ''), r.context_window_tokens,
-    r.is_active, r.test_status,
+    r.is_active, r.is_vision, r.test_status,
     COALESCE(to_char(r.last_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
-    r.last_test_error, r.last_runtime_error, r.last_runtime_error_class,
+    r.last_test_error, r.vision_test_status,
+    COALESCE(to_char(r.last_vision_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
+    r.last_vision_test_error, r.last_runtime_error, r.last_runtime_error_class,
     COALESCE(to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
     COALESCE(to_char(r.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '')
 """
@@ -8694,10 +8902,12 @@ def _route_row_to_dict(row: tuple) -> dict:
         "credential_label": row[4], "api_key_hint": row[5], "base_url": row[6],
         "supports_responses": bool(row[7]), "reasoning_effort": row[8],
         "context_window_tokens": int(row[9]) if row[9] is not None else None,
-        "is_active": bool(row[10]), "test_status": row[11], "last_test_at": row[12],
-        "last_test_error": row[13], "last_runtime_error": row[14],
-        "last_runtime_error_class": row[15],
-        "created_at": row[16], "updated_at": row[17],
+        "is_active": bool(row[10]), "is_vision": bool(row[11]),
+        "test_status": row[12], "last_test_at": row[13], "last_test_error": row[14],
+        "vision_test_status": row[15], "last_vision_test_at": row[16],
+        "last_vision_test_error": row[17], "last_runtime_error": row[18],
+        "last_runtime_error_class": row[19],
+        "created_at": row[20], "updated_at": row[21],
     }
 
 
@@ -8813,11 +9023,21 @@ def model_api_credential_update(user_id: str, credential_id: str, *,
     params += [user_id, credential_id]
     try:
         with get_pool().connection() as conn:
-            cur = conn.execute(
-                f"UPDATE model_api_credentials SET {', '.join(sets)} "
-                "WHERE user_id = %s AND id = %s",
-                tuple(params),
-            )
+            with conn.transaction():
+                cur = conn.execute(
+                    f"UPDATE model_api_credentials SET {', '.join(sets)} "
+                    "WHERE user_id = %s AND id = %s",
+                    tuple(params),
+                )
+                if api_key_envelope is not None and cur.rowcount > 0:
+                    conn.execute(
+                        "UPDATE model_api_routes SET "
+                        "vision_test_status = 'untested', "
+                        "last_vision_test_error = '', last_vision_test_at = NULL, "
+                        "updated_at = now() "
+                        "WHERE user_id = %s AND credential_id = %s",
+                        (user_id, credential_id),
+                    )
         updated = cur.rowcount > 0
     except Exception as e:
         log.error("[db] model_api_credential_update(%s,%s) failed: %s", user_id, credential_id, e)
@@ -8878,6 +9098,32 @@ def model_api_route_get(user_id: str, route_id: str) -> dict | None:
         return None
 
 
+def model_api_route_get_with_envelope(user_id: str, route_id: str) -> dict | None:
+    """Return one caller-owned route with its encrypted provider credential."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                f"SELECT {_ROUTE_COLUMNS}, c.api_key_envelope "
+                "FROM model_api_routes r "
+                "JOIN model_api_credentials c ON c.id = r.credential_id "
+                "WHERE r.user_id = %s AND r.id = %s",
+                (user_id, route_id),
+            ).fetchone()
+        if row is None:
+            return None
+        out = _route_row_to_dict(row)
+        out["api_key_envelope"] = row[-1]
+        return out
+    except Exception as e:
+        log.error(
+            "[db] model_api_route_get_with_envelope(%s,%s) failed: %s",
+            user_id,
+            route_id,
+            e,
+        )
+        return None
+
+
 def model_api_active_route(user_id: str) -> dict | None:
     """带 api_key_envelope —— 供 config_store 走 enclave 解密。"""
     try:
@@ -8899,6 +9145,59 @@ def model_api_active_route(user_id: str) -> dict | None:
         return out
     except Exception as e:
         log.error("[db] model_api_active_route(%s) failed: %s", user_id, e)
+        return None
+
+
+def model_api_active_route_version(user_id: str) -> dict | None:
+    """Return the active route's exact visual-capability fence.
+
+    The microsecond timestamp is an internal compare-and-swap token, not a public
+    route field. Setup probes and Hosted V1 failure learning use it so delayed
+    provider results cannot mark a route the user changed in the meantime.
+    """
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT r.id::text,c.provider,r.model,c.base_url,"
+                "to_char(r.updated_at AT TIME ZONE 'UTC',"
+                "  'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+                "FROM model_api_routes r "
+                "JOIN model_api_credentials c ON c.id=r.credential_id "
+                "WHERE r.user_id=%s AND r.is_active",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "route_id": str(row[0]),
+            "provider": str(row[1] or ""),
+            "model": str(row[2] or ""),
+            "base_url": str(row[3] or ""),
+            "updated_at_token": str(row[4] or ""),
+        }
+    except Exception as e:
+        log.error("[db] model_api_active_route_version(%s) failed: %s", user_id, e)
+        return None
+
+
+def model_api_vision_route(user_id: str) -> dict | None:
+    """Return the dedicated vision route with its encrypted credential."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                f"SELECT {_ROUTE_COLUMNS}, c.api_key_envelope "
+                "FROM model_api_routes r "
+                "JOIN model_api_credentials c ON c.id = r.credential_id "
+                "WHERE r.user_id = %s AND r.is_vision",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        out = _route_row_to_dict(row)
+        out["api_key_envelope"] = row[-1]
+        return out
+    except Exception as e:
+        log.error("[db] model_api_vision_route(%s) failed: %s", user_id, e)
         return None
 
 
@@ -9009,6 +9308,92 @@ def model_api_route_mark_test(user_id: str, route_id: str, *, status: str, error
         return cur.rowcount > 0
     except Exception as e:
         log.error("[db] model_api_route_mark_test(%s,%s) failed: %s", user_id, route_id, e)
+        return False
+
+
+def model_api_route_mark_vision_test(
+    user_id: str,
+    route_id: str,
+    *,
+    status: str,
+    error: str = "",
+    expected_updated_at: str = "",
+) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            if expected_updated_at:
+                cur = conn.execute(
+                    "UPDATE model_api_routes SET vision_test_status = %s, "
+                    "       last_vision_test_error = %s, "
+                    "       last_vision_test_at = now(), updated_at = now() "
+                    "WHERE user_id = %s AND id = %s "
+                    "AND updated_at = %s::timestamptz",
+                    (
+                        status,
+                        str(error or "")[:300],
+                        user_id,
+                        route_id,
+                        expected_updated_at,
+                    ),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE model_api_routes SET vision_test_status = %s, "
+                    "       last_vision_test_error = %s, "
+                    "       last_vision_test_at = now(), updated_at = now() "
+                    "WHERE user_id = %s AND id = %s",
+                    (status, str(error or "")[:300], user_id, route_id),
+                )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error(
+            "[db] model_api_route_mark_vision_test(%s,%s) failed: %s",
+            user_id,
+            route_id,
+            e,
+        )
+        return False
+
+
+def model_api_route_set_vision(user_id: str, route_id: str) -> bool:
+    """Atomically assign one saved route as the user's V2 image observer."""
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                target = conn.execute(
+                    "SELECT 1 FROM model_api_routes "
+                    "WHERE user_id = %s AND id = %s FOR UPDATE",
+                    (user_id, route_id),
+                ).fetchone()
+                if target is None:
+                    return False
+                conn.execute(
+                    "UPDATE model_api_routes SET is_vision = FALSE, updated_at = now() "
+                    "WHERE user_id = %s AND is_vision AND id != %s",
+                    (user_id, route_id),
+                )
+                cur = conn.execute(
+                    "UPDATE model_api_routes SET is_vision = TRUE, updated_at = now() "
+                    "WHERE user_id = %s AND id = %s",
+                    (user_id, route_id),
+                )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error("[db] model_api_route_set_vision(%s,%s) failed: %s", user_id, route_id, e)
+        return False
+
+
+def model_api_route_clear_vision(user_id: str) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE model_api_routes SET is_vision = FALSE, updated_at = now() "
+                "WHERE user_id = %s AND is_vision",
+                (user_id,),
+            )
+        return True
+    except Exception as e:
+        log.error("[db] model_api_route_clear_vision(%s) failed: %s", user_id, e)
         return False
 
 

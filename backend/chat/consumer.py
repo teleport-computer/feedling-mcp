@@ -4,14 +4,35 @@ import copy
 import math
 import os
 import time
+import uuid
 from datetime import datetime
 from typing import Callable, TypeVar
 
 import db
+from capabilities import vision_probe as vision_probe_capability
 from core.store import UserStore
 
 
 _OFFICIAL_CONSUMER_NAME = "feedling-chat-resident"
+VISION_OBSERVER_CAPABILITY = "vision_observer_v1"
+VISION_PROBE_CAPABILITY = "vision_probe_v2"
+_VISION_PROBE_TTL_SEC = max(
+    30, min(300, int(os.environ.get("FEEDLING_VISION_PROBE_TTL_SEC", "120")))
+)
+_VISION_FAILURE_CODES = frozenset({
+    "vision_model_auth_invalid",
+    "vision_model_quota_insufficient",
+    "vision_model_not_found",
+    "vision_model_incompatible",
+    "vision_model_rate_limited",
+    "vision_model_unavailable",
+    "vision_model_empty_response",
+    "vision_model_failed",
+})
+_VISION_UNSUPPORTED_CODES = frozenset({
+    "vision_model_required",
+    "vision_model_incompatible",
+})
 _CONSUMER_RECENT_SEC = int(os.environ.get("FEEDLING_CONSUMER_RECENT_SEC", "180"))
 _DECRYPT_HEALTH_STATUSES = frozenset(
     {"ok", "degraded", "unconfigured", "unreachable"}
@@ -111,10 +132,38 @@ def _consumer_headers_from_map(headers, remote_addr: str = "") -> dict:
     name = (headers.get("X-Feedling-Consumer") or "").strip()
     if not name:
         return {}
+    capabilities = sorted({
+        item.strip().lower()
+        for item in str(
+            headers.get("X-Feedling-Consumer-Capabilities") or ""
+        ).split(",")
+        if item.strip()
+    })
+    input_modalities = sorted({
+        item.strip().lower()
+        for item in str(
+            headers.get("X-Feedling-Agent-Input-Modalities") or ""
+        ).split(",")
+        if item.strip().lower() in {"text", "image", "audio", "video"}
+    })
     return {
         "consumer_name": name,
         "consumer_id": (headers.get("X-Feedling-Consumer-Id") or "").strip(),
         "consumer_version": (headers.get("X-Feedling-Consumer-Version") or "").strip(),
+        "consumer_capabilities": capabilities,
+        "agent_provider": (
+            headers.get("X-Feedling-Agent-Provider") or ""
+        ).strip()[:120],
+        "agent_model": (
+            headers.get("X-Feedling-Agent-Model") or ""
+        ).strip()[:240],
+        "agent_input_modalities": input_modalities,
+        "agent_input_modalities_source": (
+            headers.get("X-Feedling-Agent-Input-Modalities-Source") or ""
+        ).strip().lower()[:32],
+        "agent_entry_signature": (
+            headers.get("X-Feedling-Agent-Entry-Signature") or ""
+        ).strip().lower()[:64],
         "consumer_commit": (headers.get("X-Feedling-Consumer-Commit") or "").strip(),
         # Poll-only compatibility claim: the running image intentionally
         # skipped an irrelevant target while remaining protocol-compatible.
@@ -162,6 +211,12 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
             event_info.pop("decrypt_status", None)
             event_info.pop("decrypt_checked_at_epoch", None)
             event_info.pop("consumer_compat_commit", None)
+            event_info.pop("consumer_capabilities", None)
+            event_info.pop("agent_provider", None)
+            event_info.pop("agent_model", None)
+            event_info.pop("agent_input_modalities", None)
+            event_info.pop("agent_input_modalities_source", None)
+            event_info.pop("agent_entry_signature", None)
             event_info.pop("update_stall_reason", None)
         state.update(event_info)
         state["last_event"] = event_type
@@ -217,6 +272,11 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
     _mutate_consumer_state(store, mutate)
     if event_type == "poll":
         _touch_resident_binding_seen(store, info=info, now_epoch=now_epoch)
+        _maybe_begin_resident_vision_probe(
+            store,
+            info=info,
+            now_epoch=now_epoch,
+        )
 
 
 def _safe_epoch(value) -> float:
@@ -451,6 +511,16 @@ def _consumer_validation_state(
         "consumer_name": state.get("consumer_name", ""),
         "consumer_id": state.get("consumer_id", ""),
         "consumer_version": state.get("consumer_version", ""),
+        "consumer_capabilities": list(state.get("consumer_capabilities") or []),
+        "agent_provider": state.get("agent_provider", ""),
+        "agent_model": state.get("agent_model", ""),
+        "agent_input_modalities": list(
+            state.get("agent_input_modalities") or []
+        ),
+        "agent_input_modalities_source": state.get(
+            "agent_input_modalities_source", ""
+        ),
+        "agent_entry_signature": state.get("agent_entry_signature", ""),
         "consumer_commit": state.get("consumer_commit", ""),
         "consumer_compat_commit": state.get("consumer_compat_commit", ""),
         "update_stall_reason": state.get("update_stall_reason", ""),
@@ -466,3 +536,378 @@ def _consumer_validation_state(
             "X-Feedling-Consumer headers."
         ),
     }
+
+
+def consumer_supports_capability(
+    store: UserStore,
+    capability: str,
+    *,
+    now_epoch: float | None = None,
+) -> bool:
+    """Require a fresh official poll before trusting a resident capability."""
+    validation = _consumer_validation_state(store, now_epoch=now_epoch)
+    advertised = {
+        str(item).strip().lower()
+        for item in validation.get("consumer_capabilities") or []
+        if str(item).strip()
+    }
+    return bool(validation.get("passing") and capability.lower() in advertised)
+
+
+def consumer_agent_runtime(
+    store: UserStore,
+    *,
+    now_epoch: float | None = None,
+) -> dict:
+    """Return fresh model metadata advertised by the official resident."""
+    validation = _consumer_validation_state(store, now_epoch=now_epoch)
+    if not validation.get("passing"):
+        return {
+            "provider": "",
+            "model": "",
+            "input_modalities": [],
+            "input_modalities_source": "",
+            "entry_signature": "",
+            "consumer_id": "",
+        }
+    return {
+        "provider": str(validation.get("agent_provider") or ""),
+        "model": str(validation.get("agent_model") or ""),
+        "input_modalities": sorted({
+            str(item).strip().lower()
+            for item in validation.get("agent_input_modalities") or []
+            if str(item).strip().lower() in {"text", "image", "audio", "video"}
+        }),
+        "input_modalities_source": str(
+            validation.get("agent_input_modalities_source") or ""
+        ),
+        "entry_signature": str(validation.get("agent_entry_signature") or ""),
+        "consumer_id": str(validation.get("consumer_id") or ""),
+    }
+
+
+def _vision_binding(validation: dict) -> dict:
+    return {
+        "consumer_id": str(validation.get("consumer_id") or ""),
+        "agent_entry_signature": str(
+            validation.get("agent_entry_signature") or ""
+        ),
+        "provider": str(validation.get("agent_provider") or ""),
+        "model": str(validation.get("agent_model") or ""),
+    }
+
+
+def _vision_binding_matches(binding: dict, current: dict) -> bool:
+    return all(
+        str(binding.get(key) or "") == str(current.get(key) or "")
+        for key in ("consumer_id", "agent_entry_signature", "provider", "model")
+    )
+
+
+def _maybe_begin_resident_vision_probe(
+    store: UserStore,
+    *,
+    info: dict | None,
+    now_epoch: float | None = None,
+) -> bool:
+    """Best-effort auto-probe for a new or changed VPS resident binding.
+
+    Polling only enqueues the existing hidden side-channel; provider I/O stays
+    inside the resident's isolated background lane. A matching pending probe or
+    terminal verdict suppresses repeats until the binding changes.
+    """
+    if not isinstance(info, dict) or not info.get("official"):
+        return False
+    advertised = {
+        str(item).strip().lower()
+        for item in info.get("consumer_capabilities") or []
+    }
+    if VISION_PROBE_CAPABILITY not in advertised:
+        return False
+    source = str(info.get("agent_input_modalities_source") or "").strip().lower()
+    if source in {"pi_catalog", "explicit"}:
+        # resident_vision_validation already derives a deterministic verdict
+        # from these authoritative modality declarations.
+        return False
+    binding = _vision_binding(info)
+    if not all(binding.values()):
+        return False
+
+    try:
+        from accounts import onboarding
+
+        if onboarding._load_onboarding_route(store) != "resident":
+            return False
+        now = time.time() if now_epoch is None else float(now_epoch)
+        state = _load_consumer_state(store)
+        pending = state.get("resident_vision_probe")
+        if (
+            isinstance(pending, dict)
+            and _vision_binding_matches(binding, pending)
+            and float(pending.get("expires_at_epoch") or 0) > now
+        ):
+            return False
+        saved = state.get("resident_vision_validation")
+        if isinstance(saved, dict) and _vision_binding_matches(binding, saved):
+            return False
+
+        probe_images, expected = vision_probe_capability.generate_images()
+        encoded = [
+            image["data_url"].split(",", 1)[1]
+            for image in probe_images
+        ]
+        probe, _error_code = begin_vision_probe(
+            store,
+            images=encoded,
+            expected=expected,
+            now_epoch=now,
+        )
+        return probe is not None
+    except Exception as exc:
+        # Binding telemetry and probe generation are advisory. A failure here
+        # must never break or delay normal chat polling/sending.
+        print(
+            f"[{store.user_id}/vision-probe] auto-start failed: "
+            f"{type(exc).__name__}:{str(exc)[:160]}"
+        )
+        return False
+
+
+def begin_vision_probe(
+    store: UserStore,
+    *,
+    images: list[str],
+    expected: list[str],
+    now_epoch: float | None = None,
+) -> tuple[dict | None, str]:
+    """Persist a hidden two-image probe bound to one fresh resident entry."""
+    now = time.time() if now_epoch is None else float(now_epoch)
+    validation = _consumer_validation_state(store, now_epoch=now)
+    advertised = {
+        str(item).strip().lower()
+        for item in validation.get("consumer_capabilities") or []
+    }
+    binding = _vision_binding(validation)
+    if (
+        not validation.get("passing")
+        or VISION_PROBE_CAPABILITY not in advertised
+        or not binding["consumer_id"]
+        or not binding["agent_entry_signature"]
+    ):
+        return None, "vision_resident_update_required"
+    if len(images) != 2 or len(expected) != 2:
+        return None, "vision_probe_invalid"
+
+    created: dict = {}
+
+    def mutate(state: dict) -> bool:
+        current = _vision_binding({
+            "consumer_id": state.get("consumer_id"),
+            "agent_entry_signature": state.get("agent_entry_signature"),
+            "agent_provider": state.get("agent_provider"),
+            "agent_model": state.get("agent_model"),
+        })
+        if not _vision_binding_matches(binding, current):
+            return False
+        probe = state.get("resident_vision_probe")
+        if (
+            isinstance(probe, dict)
+            and float(probe.get("expires_at_epoch") or 0) > now
+            and _vision_binding_matches(binding, probe)
+        ):
+            created.update(probe)
+            return True
+        probe = {
+            "probe_id": uuid.uuid4().hex,
+            **binding,
+            "created_at_epoch": now,
+            "expires_at_epoch": now + _VISION_PROBE_TTL_SEC,
+            "images": list(images),
+            "expected": list(expected),
+        }
+        state["resident_vision_probe"] = probe
+        created.update(probe)
+        return True
+
+    mutated = _mutate_consumer_state(store, mutate)
+    if mutated is None or not mutated[1] or not created:
+        return None, "vision_resident_changed"
+    return created, ""
+
+
+def vision_probe_for_poll(
+    store: UserStore,
+    consumer_info: dict | None,
+    *,
+    now_epoch: float | None = None,
+) -> dict | None:
+    """Project the pending probe without its server-only expected answers."""
+    if not isinstance(consumer_info, dict) or not consumer_info.get("official"):
+        return None
+    advertised = {
+        str(item).strip().lower()
+        for item in consumer_info.get("consumer_capabilities") or []
+    }
+    if VISION_PROBE_CAPABILITY not in advertised:
+        return None
+    now = time.time() if now_epoch is None else float(now_epoch)
+    state = _load_consumer_state(store)
+    probe = state.get("resident_vision_probe")
+    if not isinstance(probe, dict) or float(probe.get("expires_at_epoch") or 0) <= now:
+        return None
+    binding = _vision_binding({
+        "consumer_id": consumer_info.get("consumer_id"),
+        "agent_entry_signature": consumer_info.get("agent_entry_signature"),
+        "agent_provider": consumer_info.get("agent_provider"),
+        "agent_model": consumer_info.get("agent_model"),
+    })
+    if not _vision_binding_matches(binding, probe):
+        return None
+    images = probe.get("images")
+    if not isinstance(images, list) or len(images) != 2:
+        return None
+    return {
+        "probe_id": str(probe.get("probe_id") or ""),
+        "expires_at_epoch": float(probe.get("expires_at_epoch") or 0),
+        "images": [
+            {
+                "mime_type": "image/png",
+                "data_url": f"data:image/png;base64,{image}",
+            }
+            for image in images
+        ],
+    }
+
+
+def complete_vision_probe(
+    store: UserStore,
+    payload: dict,
+    consumer_info: dict | None,
+    *,
+    now_epoch: float | None = None,
+) -> tuple[dict, int]:
+    """Validate the exact resident/entry/expiry tuple and persist its verdict."""
+    if not isinstance(consumer_info, dict) or not consumer_info.get("official"):
+        return {"error": "vision_probe_consumer_mismatch"}, 409
+    now = time.time() if now_epoch is None else float(now_epoch)
+    probe_id = str(payload.get("probe_id") or "").strip()
+    binding = _vision_binding({
+        "consumer_id": consumer_info.get("consumer_id"),
+        "agent_entry_signature": consumer_info.get("agent_entry_signature"),
+        "agent_provider": consumer_info.get("agent_provider"),
+        "agent_model": consumer_info.get("agent_model"),
+    })
+    outcome: dict = {}
+
+    def mutate(state: dict) -> str:
+        probe = state.get("resident_vision_probe")
+        previous = state.get("resident_vision_validation")
+        if (
+            not isinstance(probe, dict)
+            and isinstance(previous, dict)
+            and str(previous.get("probe_id") or "") == probe_id
+            and _vision_binding_matches(binding, previous)
+        ):
+            outcome.update(previous)
+            return "idempotent"
+        if not isinstance(probe, dict) or str(probe.get("probe_id") or "") != probe_id:
+            return "probe_mismatch"
+        if not _vision_binding_matches(binding, probe):
+            return "consumer_mismatch"
+        if float(probe.get("expires_at_epoch") or 0) <= now:
+            return "expired"
+
+        reported_status = str(payload.get("status") or "ok").strip().lower()
+        if reported_status == "failed":
+            error_code = str(payload.get("error_code") or "vision_model_failed")
+            if error_code in _VISION_UNSUPPORTED_CODES:
+                # Consumer turn classification uses vision_model_required for
+                # an explicit provider rejection, while Model API probes use
+                # vision_model_incompatible. They are the same capability
+                # verdict here; normalize the persisted config-facing signal.
+                error_code = "vision_model_incompatible"
+                status = "unsupported"
+            else:
+                if error_code not in _VISION_FAILURE_CODES:
+                    error_code = "vision_model_failed"
+                status = "failed"
+        else:
+            observed = payload.get("observed")
+            expected = probe.get("expected")
+            matched = (
+                isinstance(observed, list)
+                and len(observed) == 2
+                and all(isinstance(item, str) for item in observed)
+                and observed == expected
+            )
+            status = "ok" if matched else "unsupported"
+            error_code = "" if matched else "vision_model_incompatible"
+        result = {
+            "probe_id": probe_id,
+            **binding,
+            "status": status,
+            "error_code": error_code,
+            "tested_at_epoch": now,
+        }
+        state["resident_vision_validation"] = result
+        state.pop("resident_vision_probe", None)
+        outcome.update(result)
+        return "completed"
+
+    mutated = _mutate_consumer_state(store, mutate)
+    if mutated is None:
+        return {"error": "vision_probe_state_unavailable"}, 503
+    result = mutated[1]
+    if result == "probe_mismatch":
+        return {"error": "vision_probe_not_found"}, 404
+    if result == "consumer_mismatch":
+        return {"error": "vision_probe_consumer_mismatch"}, 409
+    if result == "expired":
+        return {"error": "vision_probe_expired"}, 410
+    return {
+        "status": str(outcome.get("status") or "failed"),
+        "probe_id": probe_id,
+        "error_code": str(outcome.get("error_code") or ""),
+    }, 200
+
+
+def resident_vision_validation(
+    store: UserStore,
+    *,
+    now_epoch: float | None = None,
+) -> dict:
+    """Return a four-state verdict, invalidating it on any entry change."""
+    now = time.time() if now_epoch is None else float(now_epoch)
+    validation = _consumer_validation_state(store, now_epoch=now)
+    runtime = consumer_agent_runtime(store, now_epoch=now)
+    current = {
+        "consumer_id": runtime.get("consumer_id", ""),
+        "agent_entry_signature": runtime.get("entry_signature", ""),
+        "provider": runtime.get("provider", ""),
+        "model": runtime.get("model", ""),
+    }
+    if not validation.get("passing"):
+        return {"status": "untested", "error_code": "resident_unavailable", **runtime}
+    state = _load_consumer_state(store)
+    probe = state.get("resident_vision_probe")
+    if isinstance(probe, dict) and _vision_binding_matches(current, probe):
+        if float(probe.get("expires_at_epoch") or 0) <= now:
+            return {"status": "failed", "error_code": "vision_probe_expired", **runtime}
+        return {"status": "testing", "error_code": "", "pending": True, **runtime}
+    saved = state.get("resident_vision_validation")
+    if isinstance(saved, dict) and _vision_binding_matches(current, saved):
+        return {
+            "status": str(saved.get("status") or "untested"),
+            "error_code": str(saved.get("error_code") or ""),
+            "tested_at_epoch": float(saved.get("tested_at_epoch") or 0),
+            **runtime,
+        }
+    source = str(runtime.get("input_modalities_source") or "")
+    if source in {"pi_catalog", "explicit"}:
+        modalities = set(runtime.get("input_modalities") or [])
+        return {
+            "status": "ok" if "image" in modalities else "unsupported",
+            "error_code": "" if "image" in modalities else "vision_model_incompatible",
+            **runtime,
+        }
+    return {"status": "untested", "error_code": "", **runtime}

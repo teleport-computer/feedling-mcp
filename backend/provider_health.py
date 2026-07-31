@@ -22,6 +22,14 @@ UNHEALTHY_AFTER_SEC = 48 * 60 * 60
 USER_PROVIDER_CONFIRM_SEC = 60 * 60
 PROBE_INTERVAL_SEC = 24 * 60 * 60
 
+# A provider that answers slowly never fails, so none of the fields above can
+# describe it.  60 s is compaction's own per-call timeout: once the smoothed
+# round-trip crosses it, background folds start timing out and a backlog can
+# only grow.  The average is exponential so one slow answer cannot trip it and
+# one fast answer cannot clear it.
+SLOW_PROVIDER_MS = 60_000
+_LATENCY_EWMA_ALPHA = 0.3
+
 
 @dataclass(frozen=True)
 class ProactiveAdmission:
@@ -51,6 +59,9 @@ def _current_dict(row: Any) -> dict:
         "last_provider_error_blame": str(row[4] or ""),
         "user_provider_failure_started_at": _epoch(row[5]),
         "last_probe_at": _epoch(row[6]),
+        # Optional tail: rows read by callers that predate the latency column
+        # (or select fewer fields) simply carry no sample.
+        "recent_latency_ms": float(row[7] or 0.0) if len(row) > 7 else 0.0,
     }
 
 
@@ -115,7 +126,26 @@ def evolve_failure(
     return out
 
 
-def evolve_success(current: dict, *, now: float) -> dict:
+def _latency_ewma(previous: Any, sample_ms: float) -> float:
+    prior = float(previous or 0.0)
+    if prior <= 0:
+        return float(sample_ms)
+    return _LATENCY_EWMA_ALPHA * float(sample_ms) + (1.0 - _LATENCY_EWMA_ALPHA) * prior
+
+
+def provider_is_slow(state: dict) -> bool:
+    """Whether this route's smoothed round-trip is past the fold timeout.
+
+    Deliberately independent of ``provider_state``: a slow provider is still
+    usable and must not be blocked from admission.  This answers "why is
+    everything taking minutes", which the failure fields cannot.
+    """
+    return float((state or {}).get("recent_latency_ms") or 0.0) > SLOW_PROVIDER_MS
+
+
+def evolve_success(
+    current: dict, *, now: float, latency_ms: float | None = None
+) -> dict:
     out = dict(current or {})
     out.update(
         {
@@ -125,6 +155,10 @@ def evolve_success(current: dict, *, now: float) -> dict:
             "last_probe_at": 0.0,
         }
     )
+    if latency_ms is not None and float(latency_ms) >= 0:
+        out["recent_latency_ms"] = _latency_ewma(
+            out.get("recent_latency_ms"), float(latency_ms)
+        )
     return out
 
 
@@ -140,26 +174,58 @@ def _route_selected_at(user_id: str) -> float:
     return core_util._to_epoch(active.get("created_at"))
 
 
-def record_success(user_id: str, *, now: float | None = None) -> bool:
-    """Record one usable provider response and immediately restore health."""
+def record_success(
+    user_id: str, *, now: float | None = None, latency_ms: float | None = None
+) -> bool:
+    """Record one usable provider response and immediately restore health.
+
+    ``latency_ms`` folds into an exponential average (see :func:`evolve_success`)
+    so a slow-but-working route is visible. Callers that cannot measure omit it,
+    and the stored average is then carried forward untouched — a caller without
+    a stopwatch must not be able to erase the signal.
+    """
     ts = float(time.time() if now is None else now)
+    sample = None if latency_ms is None else max(0.0, float(latency_ms))
+    # The EWMA is folded inside the UPSERT rather than read-modify-written, so
+    # concurrent turns for one user cannot lose a sample to a lost update.
+    latency_clause = "recent_latency_ms = provider_health.recent_latency_ms"
+    params: tuple = (user_id, _utc_datetime(ts), _utc_datetime(ts), None)
+    if sample is not None:
+        latency_clause = (
+            "recent_latency_ms = CASE"
+            "  WHEN COALESCE(provider_health.recent_latency_ms, 0) <= 0 THEN %s"
+            "  ELSE %s * %s + (1 - %s) * provider_health.recent_latency_ms"
+            " END"
+        )
+        params = (
+            user_id,
+            _utc_datetime(ts),
+            _utc_datetime(ts),
+            sample,
+            sample,
+            _LATENCY_EWMA_ALPHA,
+            sample,
+            _LATENCY_EWMA_ALPHA,
+        )
     try:
         with db.get_pool().connection() as conn:
             conn.execute(
-                """
+                f"""
                 INSERT INTO provider_health (
                   user_id, provider_state, last_provider_success_at,
-                  user_provider_failure_started_at, last_probe_at, updated_at
+                  user_provider_failure_started_at, last_probe_at, updated_at,
+                  recent_latency_ms
                 )
-                VALUES (%s, 'ok', %s, NULL, NULL, %s)
+                VALUES (%s, 'ok', %s, NULL, NULL, %s, %s)
                 ON CONFLICT (user_id) DO UPDATE SET
                   provider_state = 'ok',
                   last_provider_success_at = EXCLUDED.last_provider_success_at,
                   user_provider_failure_started_at = NULL,
                   last_probe_at = NULL,
-                  updated_at = EXCLUDED.updated_at
+                  updated_at = EXCLUDED.updated_at,
+                  {latency_clause}
                 """,
-                (user_id, _utc_datetime(ts), _utc_datetime(ts)),
+                params,
             )
         return True
     except Exception as exc:  # observability must never fail a provider turn
@@ -203,7 +269,8 @@ def record_failure(
                     SELECT provider_state, last_provider_success_at,
                            last_provider_failure_at, last_provider_error_class,
                            last_provider_error_blame,
-                           user_provider_failure_started_at, last_probe_at
+                           user_provider_failure_started_at, last_probe_at,
+                           recent_latency_ms
                     FROM provider_health
                     WHERE user_id = %s
                     FOR UPDATE

@@ -107,7 +107,11 @@ def _patch_tool_effect_encryption(monkeypatch):
             {
                 "id": item_id,
                 "owner_user_id": store.user_id,
+                "v": 1,
                 "body_ct": base64.b64encode(plaintext).decode("ascii"),
+                "nonce": "nonce",
+                "K_user": "sealed-user-key",
+                "K_enclave": "sealed-enclave-key",
             },
             "",
         )
@@ -146,8 +150,8 @@ def _script_provider(monkeypatch, responses):
     it = iter(responses)
     calls = []
 
-    async def _fake(config, messages, *, tools=None, **_kwargs):
-        calls.append({"messages": messages, "tools": tools})
+    async def _fake(config, messages, *, tools=None, **kwargs):
+        calls.append({"messages": messages, "tools": tools, **kwargs})
         return next(it)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
@@ -284,6 +288,11 @@ def _late_input_deps(uid: str, written: list[str]) -> worker.TurnDeps:
 def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     """Round 1: no tool_calls, plain text -> that text IS the final reply
     (Global Constraints)."""
+    # Legacy include_reasoning path: with self-authored thinking OFF, an explicit
+    # include_reasoning request flows through to the provider. (With it ON — the
+    # shipped default — native reasoning is suppressed so the model emits a <think>
+    # instead; see test_self_thinking_on_suppresses_native_reasoning below.)
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     uid = "u_toolloop_happy"
     conftest.seed_user(uid)
     _reset(uid)
@@ -293,7 +302,13 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     _patch_real_write(monkeypatch)
 
     calls = _script_provider(monkeypatch, [_text_round("hello from the model")])
-    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+    deps = _deps(messages=[{
+        "id": "m1",
+        "ts": 10.0,
+        "role": "user",
+        "content": "hi",
+        "include_reasoning": True,
+    }])
 
     status = asyncio.run(
         worker.process_job(
@@ -303,6 +318,7 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
 
     assert status == "completed"
     assert len(calls) == 1
+    assert calls[0]["include_reasoning"] is True
     bubbles = _bubbles(uid)
     assert len(bubbles) == 1
     assert bubbles[0]["body_ct"] == "hello from the model"
@@ -312,6 +328,41 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert row[1] is False  # not failed
     assert row[2] == "ok"
     assert _job_status_row(job_id)[0] == "completed"
+
+
+def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
+    """Self-authored thinking ON (shipped default): even an explicit
+    include_reasoning request is suppressed at the provider, so a reasoning-capable
+    model emits its thought in the reply's <think> instead of a raw native CoT. This
+    is what aligns V2 with the V1 resident (see worker.py suppress_native_reasoning)."""
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)  # default = ON
+    uid = "u_toolloop_selfthink_suppress"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-selfthink")
+
+    _patch_real_write(monkeypatch)
+
+    calls = _script_provider(monkeypatch, [_text_round("hello from the model")])
+    deps = _deps(messages=[{
+        "id": "m1",
+        "ts": 10.0,
+        "role": "user",
+        "content": "hi",
+        "include_reasoning": True,
+    }])
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 1
+    # The point: native reasoning was NOT requested despite include_reasoning=True.
+    assert calls[0].get("include_reasoning") is not True
 
 
 def test_degenerate_terminal_reply_becomes_attributed_fallback(monkeypatch):
@@ -385,6 +436,138 @@ def test_degenerate_intermediate_is_dropped_before_real_final_reply(monkeypatch)
 
     assert status == "completed"
     assert [bubble["body_ct"] for bubble in _bubbles(uid)] == ["在的，怎么了"]
+
+
+# ---------------------------------------------------------------------------
+# Torn protocol-JSON leak (B3): a stream-cut relay splits one protocol envelope
+# across the reasoning/content channels. The head lands in `reasoning`, the tail
+# in `reply`. Strong cross-channel evidence must never reach a chat bubble.
+# ---------------------------------------------------------------------------
+
+# One envelope torn at the channel boundary.
+_TORN_HEAD = '{"messages":[],"actions":[{"type":"pro'
+_TORN_TAIL = 'active.sleep","reason":"7点了 还在睡 不打扰了 醒了会找我"}]}'
+
+
+def test_torn_protocol_tail_with_reasoning_head_becomes_fallback(monkeypatch):
+    """Chat: reply=tail + reasoning=head is STRONG cross-channel evidence. The
+    bubble must be the honest fallback, not the leaked JSON tail, and the torn
+    head must NOT surface as a thinking bubble."""
+    uid = "u_toolloop_torn_fallback"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-torn")
+    _patch_real_write(monkeypatch)
+    _script_provider(
+        monkeypatch,
+        [{
+            "reply": _TORN_TAIL,
+            "reasoning": _TORN_HEAD,
+            "tool_calls": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }],
+    )
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}])
+
+    status = asyncio.run(
+        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
+    )
+
+    assert status == "completed"
+    bubbles = _bubbles(uid)
+    assert len(bubbles) == 1
+    assert bubbles[0]["body_ct"] == worker._DEGENERATE_REPLY_FALLBACK
+    assert _TORN_TAIL not in bubbles[0]["body_ct"]
+    assert bubbles[0]["turn_failure_error_class"] == "upstream_unavailable"
+    # Reasoning head must not ride along as a thinking bubble.
+    assert not bubbles[0].get("thinking_body_ct")
+
+
+def test_foreground_keeps_user_json_talk_without_reasoning(monkeypatch):
+    """Chat: a bracket-heavy message with NO reasoning head is WEAK evidence —
+    it could be the user discussing code/JSON. Foreground must deliver it, never
+    eat a real message on the bracket heuristic alone."""
+    uid = "u_toolloop_user_json"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-userjson")
+    _patch_real_write(monkeypatch)
+    user_json_talk = '删掉多余的 }，把 "port": 8080 改成 8081'
+    _script_provider(monkeypatch, [_text_round(user_json_talk)])
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "配置怎么改"}])
+
+    status = asyncio.run(
+        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
+    )
+
+    assert status == "completed"
+    assert [b["body_ct"] for b in _bubbles(uid)] == [user_json_talk]
+
+
+def test_chat_intermediate_reply_tool_tail_with_reasoning_suppressed(monkeypatch):
+    """Codex code-review #1: an intermediate `reply` tool call carrying a torn
+    tail, with the head in the round's reasoning, must not produce a leaked
+    bubble. The reasoning is now passed to the intermediate sink so the chat lane
+    sees STRONG evidence; the following real terminal reply still lands."""
+    uid = "u_toolloop_torn_intermediate"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-torn-mid")
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda action_type, store, **kwargs: _FakeCapResult({"snippet": "r"}),
+    )
+    # The round carries reasoning (the torn head), which the worker surfaces via
+    # the envelope path — stub it (as the reasoning-surfacing test does) so the
+    # sealed bodies are readable and no unwired-assembly error masks the check.
+    _stub_envelope_build(monkeypatch)
+    # Same structure as test_degenerate_intermediate_is_dropped_before_real_final_
+    # reply: a real tool call (web_search) rides alongside the suppressed reply so
+    # the loop continues to the terminal reply, isolating the suppression itself.
+    _script_provider(
+        monkeypatch,
+        [
+            {
+                "reply": "",
+                "tool_calls": [
+                    _tc("r1", "reply", text=_TORN_TAIL),
+                    _tc("s1", "web_search", query="x"),
+                ],
+                "reasoning": _TORN_HEAD,
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+            _text_round("在的，怎么了"),
+        ],
+    )
+    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "在吗"}])
+
+    status = asyncio.run(
+        worker.process_job(job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt")
+    )
+
+    assert status == "completed"
+    bubbles = [b["body_ct"] for b in _bubbles(uid)]
+    # THE invariant: the torn tail never reaches a bubble; the real terminal does.
+    assert _TORN_TAIL not in bubbles
+    assert bubbles == ["在的，怎么了"]
+
+
+def test_torn_protocol_evidence_lane_policy():
+    """Pure-unit: the worker's lane-policy helper. Proactive suppresses any leak;
+    foreground only strong cross-channel evidence."""
+    # Weak orphan tail, no reasoning.
+    assert worker._torn_protocol_evidence(_TORN_TAIL, "", lane="proactive")
+    assert not worker._torn_protocol_evidence(_TORN_TAIL, "", lane="foreground")
+    # Strong: head in reasoning rejoins to a complete envelope.
+    assert worker._torn_protocol_evidence(_TORN_TAIL, _TORN_HEAD, lane="proactive")
+    assert worker._torn_protocol_evidence(_TORN_TAIL, _TORN_HEAD, lane="foreground")
+    # Normal reply: never suppressed.
+    assert not worker._torn_protocol_evidence("晚安，做个好梦", "在想她累不累", lane="proactive")
+    assert not worker._torn_protocol_evidence("晚安，做个好梦", "", lane="foreground")
 
 
 def _stub_envelope_build(monkeypatch):
@@ -538,6 +721,69 @@ def test_chat_mixed_valid_invalid_workspace_batch_applies_valid_call(
     assert captured["results"][1].content.startswith("error: unparseable args")
 
 
+def test_voice_turn_publishes_all_applied_bubbles_once_in_order(monkeypatch):
+    uid = "u_toolloop_voice_multi_bubble"
+    conftest.seed_user(uid)
+    _reset(uid)
+    user_doc = _user_doc("voice-user-1", "给我分两条回答")
+    user_doc.update(
+        voice_call_id="voice-call-1",
+        voice_turn_id="voice-turn-1",
+    )
+    db.chat_append_strict(uid, "voice-user-1", 10.0, user_doc, 5_000)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-voice-multi")
+    _patch_tool_effect_encryption(monkeypatch)
+    published: list[tuple[str, dict]] = []
+
+    async def direct_loop(**kwargs):
+        await kwargs["on_reply"]("这是第一条。", final=False)
+        await kwargs["on_reply"]("这是第二条。", final=True)
+        return worker.v2_tool_loop.LoopOutcome(
+            final_text="这是第二条。",
+            rounds=1,
+            stop_reason="final_text",
+            replied_intermediate=True,
+        )
+
+    monkeypatch.setattr(worker.v2_tool_loop, "run_tool_loop", direct_loop)
+    base_deps = _late_input_deps(uid, [])
+    deps = worker.TurnDeps(
+        read_messages=base_deps.read_messages,
+        read_messages_after_seq=base_deps.read_messages_after_seq,
+        resolve_provider=base_deps.resolve_provider,
+        mint_enclave_token=base_deps.mint_enclave_token,
+        apply_pending_effects=serve_worker._apply_pending_effects_for_user,
+        web_tools_enabled=base_deps.web_tools_enabled,
+        publish_voice_reply=lambda user_id, **kwargs: published.append(
+            (user_id, kwargs)
+        ),
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    bubbles = _bubbles(uid)
+    assert [
+        base64.b64decode(row["body_ct"]).decode("utf-8") for row in bubbles
+    ] == ["这是第一条。", "这是第二条。"]
+    assert len(published) == 1
+    published_user, published_turn = published[0]
+    assert published_user == uid
+    assert published_turn["call_id"] == "voice-call-1"
+    assert published_turn["turn_id"] == "voice-turn-1"
+    assert published_turn["message_id"]
+    assert published_turn["text"] == "这是第一条。\n\n这是第二条。"
+
+
 def test_chat_workspace_prompt_snapshot_is_loaded_once_across_rounds(
     monkeypatch,
 ):
@@ -645,6 +891,110 @@ def test_chat_workspace_prompt_failure_is_visible_before_provider(
         "failed",
         "turn_failed:workspace_prompt_unavailable",
     )
+
+
+def test_explicit_openrouter_image_rejection_writes_terminal_history_guidance(
+    monkeypatch,
+):
+    """Production-shaped seq-native failure: exact provider rejection reaches
+    the durable terminal outbox and becomes a decryptable, parent-linked Chat
+    bubble rather than stopping at the status stream."""
+    uid = "u_toolloop_openrouter_image_unsupported"
+    conftest.seed_user(uid, archive_language="en-US")
+    _reset(uid)
+    generation = db.get_runtime_generation(uid)
+    input_doc = {
+        **_user_doc("image-parent", "What is in this image?"),
+        "content_type": "image",
+        "image_mime": "image/png",
+    }
+    input_seq, job_id = db.chat_append_and_enqueue(
+        uid,
+        "image-parent",
+        10.0,
+        input_doc,
+        5000,
+        "chat",
+        expected_generation=generation,
+    )
+    job = jobs_store.claim_next_job("w-openrouter-image-unsupported")
+    assert job is not None and job["id"] == job_id
+    _patch_tool_effect_encryption(monkeypatch)
+
+    def _read_after_seq(_user_id: str, after_seq: int):
+        return [
+            {
+                "id": row["id"],
+                "seq": int(row["seq"]),
+                "ts": float(row.get("ts") or 0),
+                "role": row.get("role"),
+                "content": row.get("test_plaintext") or "",
+                "has_image": row.get("content_type") == "image",
+                "image_mime": row.get("image_mime") or "",
+            }
+            for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
+            if row.get("role") == "user"
+        ]
+
+    def _read_tail_after_seq(
+        _user_id: str,
+        after_seq: int,
+        limit: int,
+        *,
+        through_seq: int | None = None,
+    ):
+        return _read_after_seq(_user_id, after_seq)
+
+    async def _reject_image(_config, _messages, *, tools=None, **_kwargs):
+        raise provider_client.ProviderError(
+            "provider_http_404: No endpoints found that support image input",
+            status_code=404,
+        )
+
+    monkeypatch.setattr(
+        provider_client, "chat_completion_async", _reject_image
+    )
+    deps = worker.TurnDeps(
+        read_messages=lambda _user_id: _read_after_seq(uid, 0),
+        read_messages_after_seq=_read_after_seq,
+        read_tail_after_seq=_read_tail_after_seq,
+        read_images=lambda _user_id, message_ids: {
+            message_id: {
+                "image_b64": "iVBORw0KGgo=",
+                "image_mime": "image/png",
+            }
+            for message_id in message_ids
+        },
+        read_summary_with_seq=lambda _user_id: ("", 0.0, 0, 0),
+        resolve_provider=lambda _user_id: (_BYOK, {}),
+        mint_enclave_token=lambda _user_id: "rt",
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    failures = [
+        row for row in db.chat_load_strict(uid)
+        if str(row.get("terminal_failure_job_id") or "") == str(job_id)
+    ]
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure["role"] == "openclaw"
+    assert failure["reply_to_message_id"] == "image-parent"
+    assert failure["turn_failure_error_class"] == "vision_model_required"
+    assert base64.b64decode(failure["body_ct"]).decode() == (
+        "Your current model can't process images, so it didn't receive this "
+        "picture. Switch models, or add a dedicated vision model in Settings."
+    )
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == input_seq
 
 
 def test_chat_native_task_runs_child_then_returns_result_to_parent(
@@ -818,6 +1168,96 @@ def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
     assert v2_cursor.load_seq(core_store.get_store(uid)) == db.chat_seq_for_msg_id(
         uid, "B"
     )
+
+
+def test_ordered_chat_replies_settle_each_user_message_separately(monkeypatch):
+    uid = "u_toolloop_ordered_replies"
+    conftest.seed_user(uid)
+    _reset(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM user_blobs WHERE user_id=%s AND kind='model_api_runtime'",
+            (uid,),
+        )
+    db.chat_append_strict(uid, "A", 10.0, _user_doc("A", "first A"), 5000)
+    generation = db.get_runtime_generation(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat", expected_generation=generation)
+    job = jobs_store.claim_next_job("w-ordered-replies")
+
+    monkeypatch.setattr(
+        worker,
+        "_build_encrypted_reply_effect_payload",
+        lambda _store, text, *, effect_id, reply_through_seq=None: {
+            "text": text,
+            "reply_through_seq": reply_through_seq,
+        },
+    )
+    monkeypatch.setattr(
+        cap_registry, "run_capability", lambda *args, **kwargs: _FakeCapResult({})
+    )
+    written: list[str] = []
+    deps = _late_input_deps(uid, written)
+    deps.ordered_chat_replies = True
+    deps.read_summary = lambda _uid: ("", 0.0, 0)
+    deps.read_tail = lambda _uid, _watermark, _limit: [
+        {"id": "A", "ts": 10.0, "role": "user", "content": "first A"}
+    ]
+    calls = []
+
+    async def provider(_config, messages, *, tools=None, **_kwargs):
+        calls.append(list(messages))
+        assert worker.context.ORDERED_REPLY_TARGET_POLICY in messages[0]["content"]
+        assert any(
+            isinstance(message, dict) and message.get("content") == "first A"
+            for message in messages
+        )
+        assert not any(
+            isinstance(message, dict) and message.get("content") == "late B"
+            for message in messages
+        )
+        seq, same_job_id = db.chat_append_and_enqueue(
+            uid,
+            "B",
+            20.0,
+            _user_doc("B", "late B"),
+            5000,
+            "chat",
+            expected_generation=generation,
+        )
+        assert seq > 0 and same_job_id == job_id
+        return _text_round("answer A")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 1
+    assert written == ["answer A"]
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == db.chat_seq_for_msg_id(
+        uid, "A"
+    )
+    with db.get_pool().connection() as conn:
+        successor = conn.execute(
+            "SELECT status,reason FROM agent_jobs "
+            "WHERE user_id=%s AND id<>%s ORDER BY id DESC LIMIT 1",
+            (uid, job_id),
+        ).fetchone()
+        reply_payload = conn.execute(
+            "SELECT payload FROM v2_effect_outbox "
+            "WHERE user_id=%s AND effect_type=%s ORDER BY enqueue_seq DESC LIMIT 1",
+            (uid, v2_effect_outbox.FINAL_REPLY_EFFECT_TYPE),
+        ).fetchone()[0]
+    assert successor == ("pending", "ordered_followup")
+    assert reply_payload["reply_to_message_id"] == "A"
 
 
 def test_new_turn_after_intermediate_failure_starts_after_failure_cursor(

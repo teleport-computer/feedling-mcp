@@ -92,10 +92,12 @@ def run_enclave_server(tls: tuple[str, str] | None) -> None:
     `python -u backend/enclave_app.py` and the published compose_hash is
     unaffected (CONTRIBUTING.md §7).
 
-    Worker count defaults to 1 (``FEEDLING_ENCLAVE_WORKERS``) — mirroring the
-    previous single-process model where the process-local whoami/content-key
-    caches stay coherent — and can be raised on a multi-vCPU CVM to parallelize
-    GIL-bound decrypts across processes.
+    Worker count comes from ``FEEDLING_ENCLAVE_WORKERS``. The code default is 1
+    (mirroring the pre-ASGI single-process model, where the process-local
+    whoami/content-key caches stay trivially coherent), but PROD DEPLOYS 4 —
+    see deploy/docker-compose.phala.yaml — to parallelize the GIL-bound decrypts
+    across cores. Each worker additionally serves requests on a 32-thread pool
+    (``config.ENCLAVE_THREADS``), so the enclave is never single-threaded.
     """
     # Imported lazily so that `import enclave_app` in the test suite (which
     # never reaches this entrypoint) does not hard-require gunicorn, and so

@@ -76,14 +76,17 @@ from core import wake_bus as core_wake_bus
 from genesis import daemon as genesis_daemon
 from hosted import config_store as hosted_config_store
 from hosted import mcp_tools
+from hosted import vision_observer
 from identity import identity_core
 from memory import memory_core
 from model_api_runtime.v2 import context as v2_context
+from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import child_supervisor as v2_child_supervisor
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import reaper as v2_reaper
 from model_api_runtime.v2 import runner_identity
 from model_api_runtime.v2 import scheduler
@@ -432,7 +435,7 @@ def _caption_text(m, *, mid, token, fallback: str) -> str:
 def _image_row(m, *, mid, ts, role, token) -> dict:
     """图片行 -> **纯文本** tail 行 + 两个非敏感标记。绝不放 b64——compaction 共用这条读路径。"""
     text = _caption_text(m, mid=mid, token=token, fallback=_IMAGE_MARKER)
-    return {
+    row = {
         "id": mid,
         "ts": ts,
         "role": role,
@@ -440,6 +443,9 @@ def _image_row(m, *, mid, ts, role, token) -> dict:
         "has_image": True,
         "image_mime": m.get("image_mime") or "image/jpeg",
     }
+    if m.get("vision_route_id"):
+        row["vision_route_id"] = str(m["vision_route_id"])
+    return row
 
 
 def _file_row(m, *, mid, ts, role, token) -> dict:
@@ -515,6 +521,7 @@ def _mint_genesis_token(user_id: str, scopes: list[str] | None = None) -> str:
 # (see the comment above it: the enclave's local check ignores scope, so that list
 # must stay stable).
 _PUSH_TOKEN_SCOPE = ["chat_push"]
+_VOICE_REPLY_TOKEN_SCOPE = ["voice_reply"]
 
 
 def _mint_push_token(user_id: str) -> str:
@@ -528,6 +535,57 @@ def _mint_push_token(user_id: str) -> str:
         scope=_PUSH_TOKEN_SCOPE,
         ttl=60.0,
     )
+
+
+def _mint_voice_reply_token(user_id: str) -> str:
+    secret = os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").strip().encode("utf-8")
+    if not secret:
+        raise RuntimeError("FEEDLING_RUNTIME_TOKEN_SECRET not set")
+    return runtime_token.mint(
+        secret,
+        user_id=user_id,
+        runtime_instance_id="v2-voice-reply",
+        scope=_VOICE_REPLY_TOKEN_SCOPE,
+        ttl=60.0,
+    )
+
+
+def _publish_voice_reply(
+    user_id: str,
+    *,
+    call_id: str,
+    turn_id: str,
+    message_id: str,
+    text: str,
+) -> None:
+    api_url = os.environ.get("FEEDLING_API_URL", "").strip()
+    if not api_url:
+        raise RuntimeError("FEEDLING_API_URL not set")
+    payload = {
+        "call_id": call_id,
+        "turn_id": turn_id,
+        "message_id": message_id,
+        "text": text,
+    }
+    last_error = "voice reply publish failed"
+    for attempt in range(3):
+        try:
+            response = httpx.post(
+                f"{api_url}/v1/internal/voice/reply",
+                json=payload,
+                headers={
+                    "X-Feedling-Runtime-Token": _mint_voice_reply_token(user_id)
+                },
+                timeout=3.0,
+            )
+            if response.status_code < 400:
+                return
+            last_error = f"voice reply rejected status={response.status_code}"
+        except Exception as exc:  # noqa: BLE001
+            last_error = f"voice reply transport failed type={type(exc).__name__}"
+        if attempt < 2:
+            time.sleep(0.15 * (attempt + 1))
+    raise RuntimeError(last_error)
 
 
 def _send_reply_push(
@@ -734,6 +792,13 @@ def _decrypt_chat_rows(
                 item = {"id": mid, "ts": ts, "role": role, "content": plaintext}
         if m.get("seq") is not None:
             item["seq"] = int(m["seq"])
+        if role == "user" and m.get("include_reasoning") is True:
+            # Plain V2 turn-routing metadata, never message content. Preserve
+            # only an explicit true so legacy rows keep their historical shape.
+            item["include_reasoning"] = True
+        reply_to_message_id = str(m.get("reply_to_message_id") or "").strip()
+        if role == "assistant" and reply_to_message_id:
+            item["reply_to_message_id"] = reply_to_message_id
         if include_capture_metadata:
             source = str(m.get("source") or "")
             item["source"] = source
@@ -819,7 +884,12 @@ def _read_messages(user_id: str, after_seq: int = 0) -> list[dict]:
 
 
 def _read_tail_window(
-    user_id: str, after_ts: float, limit: int, *, oldest_first: bool
+    user_id: str,
+    after_ts: float,
+    limit: int,
+    *,
+    oldest_first: bool,
+    exclude_synthetic_sources: bool = False,
 ) -> list[dict]:
     """读该用户最近一个窗口内的消息（BOTH roles），逐条经 enclave 解密取明文（D1）。
 
@@ -847,6 +917,18 @@ def _read_tail_window(
     if limit <= 0:
         return []
     candidates = [m for m in rows if m.get("ts") is not None and m.get("ts") > after_ts]
+    if exclude_synthetic_sources:
+        # Summary-coverage callers only: `verify_ping`/`resident_maintenance`
+        # rows are deleted once their probe completes, so folding one into an
+        # IMMUTABLE leaf freezes a coverage claim that the row itself will not
+        # honour — validate_canonical_frontier then fails every later turn.
+        # The seq-based reader already excludes them; this ts-based sibling
+        # kept the hole open for whichever caller still reaches it.
+        candidates = [
+            m for m in candidates
+            if str(m.get("source") or "")
+            not in ("verify_ping", "resident_maintenance")
+        ]
     # Bound enclave work before decrypting, so every selected caption can be
     # preserved without an independent cap that silently changes row content.
     rows = candidates[:limit] if oldest_first else candidates[-limit:]
@@ -970,7 +1052,16 @@ def _read_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
 
 def _read_compaction_tail(user_id: str, after_ts: float, limit: int) -> list[dict]:
     """Oldest contiguous batch so summary watermarks never skip backlog rows."""
-    return _read_tail_window(user_id, after_ts, limit, oldest_first=True)
+    return _read_tail_window(
+        user_id,
+        after_ts,
+        limit,
+        oldest_first=True,
+        # Coverage claims made from this batch are immutable — never let a
+        # GC-able synthetic row into one (mirrors
+        # `_read_compaction_tail_after_seq`).
+        exclude_synthetic_sources=True,
+    )
 
 
 def _read_temporal_snapshot(
@@ -1103,6 +1194,56 @@ def _read_summary_frontier(user_id: str):
     )
 
 
+def _read_summary_frontier_metadata(user_id: str):
+    """Read a deterministic canonical cover without opening exact segments.
+
+    Exact-node text is fully determined by its authenticated row count.  A
+    legacy opaque node has no such witness, so the one migration case falls
+    back to the existing decrypting reader rather than inventing coverage.
+    """
+
+    state = jobs_store.get_summary_frontier_state(user_id)
+    if state is None:
+        return None
+    if not state.get("segments") and state.get("summary_envelope"):
+        seeded = jobs_store.seed_legacy_summary_segment(
+            user_id,
+            expected_version=int(state.get("version") or 0),
+            translated_watermark_seq=int(state.get("watermark_seq") or 0),
+        )
+        if not seeded:
+            raise v2_summary_frontier.SummaryFrontierIntegrityError(
+                "legacy_summary_seed_race"
+            )
+        state = jobs_store.get_summary_frontier_state(user_id)
+    if state is None or not state.get("segments"):
+        return None
+    metadata = _summary_metadata_frontier(state)
+    if any(item.coverage_kind == "legacy_opaque" for item in metadata):
+        return _read_summary_frontier(user_id)
+    deterministic = tuple(
+        v2_summary_frontier.SummarySegment(
+            segment_id=item.segment_id,
+            coverage_kind=item.coverage_kind,
+            level=item.level,
+            start_seq=item.start_seq,
+            end_seq=item.end_seq,
+            source_message_count=item.source_message_count,
+            legacy_opaque_through_seq=item.legacy_opaque_through_seq,
+            child_segment_ids=item.child_segment_ids,
+            text=v2_compaction.deterministic_fold(
+                source_message_count=item.source_message_count
+            ),
+        )
+        for item in metadata
+    )
+    return v2_summary_frontier.SummaryFrontierSnapshot(
+        segments=deterministic,
+        head_version=int(state.get("version") or 0),
+        watermark_seq=int(state.get("watermark_seq") or 0),
+    )
+
+
 def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
     """Read/decrypt summary plus its exact seq coverage watermark.
 
@@ -1151,6 +1292,41 @@ def _read_summary(user_id: str) -> tuple[str, float, int]:
     """
     summary, watermark_ts, version, _watermark_seq = _read_summary_with_seq(user_id)
     return summary, watermark_ts, version
+
+
+def _select_agent_profile_for_turn(
+    user_id: str,
+    summary: str,
+    *,
+    enabled: bool,
+) -> v2_profile_store.ProfilePromptSelection:
+    """Production strict-read/decrypt adapter for M5 prompt selection.
+
+    M2 lands and tests this trust/storage boundary before prompt wiring.  M5
+    consumes the returned selection; a DB/decrypt failure already has the final
+    safe behavior here: keep the summary and emit a content-free observable
+    fallback event/counter.
+    """
+    token: str | None = None
+
+    def _decrypt(envelope: dict, field: str) -> bytes:
+        nonlocal token
+        if token is None:
+            token = _mint_runtime_token(user_id)
+        return core_enclave._decrypt_envelope_via_enclave(
+            envelope,
+            None,
+            purpose=f"v2_profile_{field}_read",
+            runtime_token=token,
+        )
+
+    return v2_profile_store.select_profile_for_turn(
+        user_id,
+        summary,
+        enabled=enabled,
+        decrypt_envelope=_decrypt,
+        read_blob=db.get_blob_strict,
+    )
 
 
 def _write_summary(
@@ -1204,6 +1380,7 @@ def _append_summary_segment(
     segment_text: str,
     *,
     current_summary: str,
+    head_summary: str | None = None,
     start_seq: int,
     end_seq: int,
     source_message_count: int,
@@ -1223,10 +1400,15 @@ def _append_summary_segment(
             err,
         )
         return False
-    compatibility_text = str(current_summary or "").rstrip()
-    if compatibility_text:
-        compatibility_text += "\n"
-    compatibility_text += str(segment_text).strip()
+    if head_summary is None:
+        compatibility_text = str(current_summary or "").rstrip()
+        if compatibility_text:
+            compatibility_text += "\n"
+        compatibility_text += str(segment_text).strip()
+    else:
+        compatibility_text = str(head_summary).strip()
+        if not compatibility_text:
+            return False
     head_env, head_err = core_envelope._build_shared_envelope_for_store(
         store, compatibility_text.encode("utf-8")
     )
@@ -1354,15 +1536,66 @@ def _fire_scheduled_for_user(user_id: str) -> int:
 
     def _submit(event):
         nonlocal fired
-        jobs_store.enqueue_job(user_id, "scheduled", reason="scheduled_wake")
-        core_wake_bus.notify("v2_jobs", user_id)
+        job_id, _ = jobs_store.enqueue_job(
+            user_id,
+            "scheduled",
+            reason="scheduled_wake",
+        )
         fired += 1
-        return WakeControlDecisionV2(True, "queued_v2", settings)
+        return types.SimpleNamespace(
+            accepted=True,
+            reason="queued_v2",
+            settings=settings,
+            job_id=int(job_id),
+        )
 
     service.fire_due_timers(
         user_id, settings=settings, submit_wake=_submit, owner_id=_V2_WAKE_OWNER_ID
     )
+    if fired:
+        # Notify only after fire_due_timers has attached every accepted timer to
+        # the job. This keeps a woken worker from racing the reminder context.
+        core_wake_bus.notify("v2_jobs", user_id)
     return fired
+
+
+def _read_scheduled_wake_context(user_id: str, job_id: int) -> list[dict]:
+    """Return reminder content plus backend-confirmed trigger metadata."""
+    from proactive.scheduled_wake_v2 import DBScheduledWakeStoreV2, SCHEDULED_FIRED
+
+    context: list[dict] = []
+    for record in DBScheduledWakeStoreV2().list_records(user_id):
+        if record.status != SCHEDULED_FIRED or record.fired_job_id != int(job_id):
+            continue
+        note = str(record.note or "").strip()
+        if not note:
+            continue
+        context.append({
+            "note": note[:1000],
+            "operation": "scheduled_wake",
+            "status": "fired",
+            "task_id": str(record.timer_id or ""),
+            "next_trigger_at": str(record.at or ""),
+            "timezone": str(record.timezone or ""),
+            "fired_at": float(record.fired_at or 0.0),
+        })
+        if len(context) >= 10:
+            break
+    return context
+
+
+def _read_pending_scheduled_wake_context(user_id: str) -> dict:
+    """Return the bounded pending-timer list used by ordinary chat turns."""
+    from proactive.scheduled_wake_v2 import (
+        DBScheduledWakeStoreV2,
+        ScheduledWakeServiceV2,
+    )
+
+    service = ScheduledWakeServiceV2(
+        DBScheduledWakeStoreV2(),
+        owner_id=_V2_WAKE_OWNER_ID,
+    )
+    return service.agent_context_for_user(user_id)
 
 
 def _read_images(user_id: str, message_ids: list[str]) -> dict[str, dict]:
@@ -1395,6 +1628,66 @@ def _read_images(user_id: str, message_ids: list[str]) -> dict[str, dict]:
                 "image_b64": data["image_b64"],
             }
     return out
+
+
+def _read_vision_observations(
+    user_id: str,
+    targets: list[dict],
+) -> dict[str, str]:
+    """Send pinned V2 images to their observer and return text-only data.
+
+    The route id was stored with the accepted chat row. Missing/deleted/stale
+    routes fail the turn; raw pixels never fall through to the main provider.
+    """
+    normalized = [
+        {
+            "message_id": str(item.get("message_id") or "").strip(),
+            "route_id": str(item.get("route_id") or "").strip(),
+        }
+        for item in targets
+        if isinstance(item, dict)
+    ]
+    if not normalized or any(
+        not item["message_id"] or not item["route_id"] for item in normalized
+    ):
+        raise RuntimeError("vision_targets_invalid")
+
+    images = _read_images(user_id, [item["message_id"] for item in normalized])
+    token = _mint_runtime_token(user_id)
+    configs: dict[str, provider_client.ProviderConfig] = {}
+    observations: dict[str, str] = {}
+    for item in normalized:
+        message_id = item["message_id"]
+        route_id = item["route_id"]
+        image = images.get(message_id) or {}
+        image_b64 = str(image.get("image_b64") or "")
+        if not image_b64:
+            raise RuntimeError("vision_image_payload_missing")
+
+        config = configs.get(route_id)
+        if config is None:
+            config = vision_observer.load_provider_config(
+                user_id,
+                route_id,
+                api_key=None,
+                runtime_token=token,
+            )
+            configs[route_id] = config
+
+        mime = str(image.get("image_mime") or "image/jpeg")
+        try:
+            observations[message_id] = vision_observer.observe_image(
+                config,
+                image_mime=mime,
+                image_b64=image_b64,
+            )
+        except vision_observer.VisionObserverError as exc:
+            # Fixed route metadata, never inferred from model prose. The worker
+            # can carry it to the terminal activity/fallback projection.
+            exc.model = str(config.model or "")[:96]
+            exc.provider = str(config.provider or "")[:80]
+            raise
+    return observations
 
 
 def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
@@ -1560,8 +1853,10 @@ _MEMORY_CARDS_LIMIT = int(os.environ.get("FEEDLING_V2_MEMORY_CARDS_LIMIT", "60")
 
 
 def _render_card_line(item: dict) -> str:
-    """一张记忆卡渲染成一行（title/summary/content 里第一个非空的），仅供 dream prompt 参考。
-    卡内容经 enclave readside 解出明文（见 memory_index_core），服务器本地不再解密。"""
+    """一张记忆卡渲染成一行（title/summary/content 里第一个非空的）+ 它现在的桶，仅供 dream
+    prompt 参考。带上桶是为了让 dream 能**复用已有桶**、别造近义桶（Q2；capture 已有此上下文，
+    V2 dream 此前只渲染正文、丢了桶）。卡内容经 enclave readside 解出明文（见 memory_index_core），
+    服务器本地不再解密。"""
     if not isinstance(item, dict):
         return ""
     text = str(
@@ -1570,7 +1865,14 @@ def _render_card_line(item: dict) -> str:
     mid = str(item.get("id") or "").strip()
     if not text:
         return ""
-    return f"- [{mid}] {text}" if mid else f"- {text}"
+    bucket = str(item.get("bucket") or "").strip()
+    parts = []
+    if mid:
+        parts.append(f"[{mid}]")
+    if bucket:
+        parts.append(f"（桶：{bucket}）")
+    parts.append(text)
+    return "- " + " ".join(parts)
 
 
 def _read_memory_context(user_id: str) -> dict:
@@ -1689,6 +1991,16 @@ def _apply_memory_actions(
             user_id,
             status,
             str(body)[:300],
+        )
+    elif int(body.get("failed_count") or 0) > 0:
+        log.warning(
+            "[v2.serve_worker] memory batch had item failures user=%s "
+            "applied=%s skipped=%s failed=%s body=%s",
+            user_id,
+            body.get("applied_count"),
+            body.get("skipped_count"),
+            body.get("failed_count"),
+            str(body)[:500],
         )
     return body
 
@@ -1830,7 +2142,7 @@ def _tick_screen_watch_for_user(user_id: str) -> int:
     预激活烧钱不变量）。两关都过才 enqueue 一个 `screen_watch` lane 的 background job。
 
     两个 gate 输入都在服务端明文可得，**绝不碰 enclave**（这条每 120s 对每个 db_action_v2
-    用户跑一次，一次 enclave 往返会锤死本子项目要保护的单线程瓶颈）：最新帧 id/ts 走
+    用户跑一次，一次 enclave 往返会锤死本子项目要保护的共享解密代理容量）：最新帧 id/ts 走
     `db.frame_list_meta`（不解密），last_screen_watch_frame_id 走 `get_wake_schedule`，
     last-user-msg ts 直接读 `store.chat_messages` 的明文 role/ts。
 
@@ -1905,7 +2217,7 @@ class EffectSinkDeps:
     workspace: Callable[[dict], None]
 
 
-def build_effect_dispatch(deps: EffectSinkDeps) -> Callable[[str, dict], None]:
+def build_effect_dispatch(deps: EffectSinkDeps) -> Callable[[str, dict], object]:
     """Pure router (spec A6): `dispatch(effect_type, payload) -> None`. Side-
     effect-free at construction — building the dispatch closure touches no DB;
     effects happen only when `dispatch(...)` is actually called. Unknown
@@ -1922,11 +2234,11 @@ def build_effect_dispatch(deps: EffectSinkDeps) -> Callable[[str, dict], None]:
         "workspace": deps.workspace,
     }
 
-    def dispatch(effect_type: str, payload: dict) -> None:
+    def dispatch(effect_type: str, payload: dict) -> object:
         sink = routes.get(effect_type)
         if sink is None:
             raise ValueError(f"unknown effect_type: {effect_type!r}")
-        sink(payload)
+        return sink(payload)
 
     return dispatch
 
@@ -2001,6 +2313,22 @@ def _reply_payload_sequence(payload: dict) -> list[dict]:
     return sequence
 
 
+def _reply_parent_message_id(payload: dict) -> str:
+    value = payload.get("reply_to_message_id")
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise RuntimeError("invalid reply parent message id")
+    normalized = value.strip()
+    if (
+        not normalized
+        or len(normalized) > 160
+        or any(not char.isprintable() for char in normalized)
+    ):
+        raise RuntimeError("invalid reply parent message id")
+    return normalized
+
+
 def _sink_reply(user_id: str, payload: dict) -> None:
     """Persist a naturally-idempotent encrypted reply effect.
 
@@ -2023,12 +2351,23 @@ def _sink_reply(user_id: str, payload: dict) -> None:
     if v2_worker.REPLY_FOLLOWUPS_KEY in payload:
         raise RuntimeError("reply followups require the transactional sink")
 
-    # Only forward ``extra`` when thinking, failure, or file metadata is present,
-    # so an ordinary reply keeps its exact prior sink call shape.
+    # Keep all reply metadata on the same authoritative row. File content,
+    # thinking, failure, and confirmed activity use disjoint keys.
     content_type, message_extra = _reply_message_fields(payload)
-    reply_extra = v2_worker._reply_effect_extra(payload)
-    combined_extra = {**reply_extra, **message_extra}
-    extra_kwargs = {"extra": combined_extra} if combined_extra else {}
+    extra = v2_worker._reply_effect_extra(payload)
+    if payload.get("activity_job_id"):
+        extra.update(
+            v2_worker._activity_extra(
+                payload.get("activity_events"),
+                turn_id=str(payload.get("activity_turn_id") or ""),
+                job_id=int(payload["activity_job_id"]),
+            )
+        )
+    extra.update(message_extra)
+    reply_parent_id = _reply_parent_message_id(payload)
+    if reply_parent_id:
+        extra["reply_to_message_id"] = reply_parent_id
+    extra_kwargs = {"extra": extra} if extra else {}
     envelope = payload.get("envelope")
     if isinstance(envelope, dict):
         store = core_store.get_store(user_id)
@@ -2068,6 +2407,7 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
     reply/job/effect into a reported failure.
     """
     message_payloads = _reply_payload_sequence(payload)
+    reply_parent_id = _reply_parent_message_id(payload)
     store = core_store.get_store(user_id)
     records = []
     previous_ts: float | None = None
@@ -2078,7 +2418,16 @@ def _sink_reply_in_transaction(user_id: str, payload: dict, connection):
             raise RuntimeError("transactional reply requires encrypted envelope")
         content_type, message_extra = _reply_message_fields(message_payload)
         reply_extra = v2_worker._reply_effect_extra(message_payload)
-        build_extra = {**reply_extra, **message_extra}
+        activity_extra: dict[str, Any] = {}
+        if message_payload.get("activity_job_id"):
+            activity_extra = v2_worker._activity_extra(
+                message_payload.get("activity_events"),
+                turn_id=str(message_payload.get("activity_turn_id") or ""),
+                job_id=int(message_payload["activity_job_id"]),
+            )
+        build_extra = {**reply_extra, **activity_extra, **message_extra}
+        if reply_parent_id:
+            build_extra["reply_to_message_id"] = reply_parent_id
         wake_kind = str(message_payload.get("wake_kind") or "")
         if wake_kind:
             build_extra["wake_kind"] = wake_kind
@@ -2381,7 +2730,7 @@ except ValueError as exc:
     ) from exc
 
 
-def _sink_schedule(user_id: str, payload: dict) -> None:
+def _sink_schedule(user_id: str, payload: dict) -> object:
     """`schedule` sink — two distinct producers share this one effect_type:
 
     1. Worker's write-tool-call mapping (`worker.process_job`'s
@@ -2406,7 +2755,8 @@ def _sink_schedule(user_id: str, payload: dict) -> None:
     """
     eid = payload["effect_id"]
     if not db.effect_sink_claim(eid):
-        return
+        return None
+    applied_result = None
     try:
         op = payload.get("op")
         if op in _SCHEDULE_CAPABILITY_OPS:
@@ -2445,6 +2795,23 @@ def _sink_schedule(user_id: str, payload: dict) -> None:
                 # Same retryable-honoring contract as _sink_identity: a
                 # deterministic 4xx terminal-discards instead of wedging.
                 raise _capability_effect_error(result, f"{op}_failed")
+            rows = result.data.get("results") if isinstance(result.data, dict) else None
+            row = rows[0] if isinstance(rows, list) and rows else None
+            if isinstance(row, dict):
+                applied = {
+                    "kind": v2_effect_outbox.SCHEDULE_RESULT_KIND,
+                    "operation": str(op),
+                    "status": str(row.get("status") or ""),
+                }
+                for source, target in (
+                    ("timer_id", "task_id"),
+                    ("next_trigger_at", "next_trigger_at"),
+                    ("timezone", "timezone"),
+                ):
+                    value = str(row.get(source) or "").strip()
+                    if value:
+                        applied[target] = value
+                applied_result = v2_effect_outbox.ScheduleAppliedResult(applied)
         else:
             kwargs = {k: v for k, v in payload.items() if k in _SCHEDULE_PAYLOAD_KEYS}
             jobs_store.upsert_wake_schedule(user_id, **kwargs)
@@ -2454,6 +2821,7 @@ def _sink_schedule(user_id: str, payload: dict) -> None:
         )  # write failed -> undo the claim so replay re-does it
         raise
     db.effect_sink_complete(eid)
+    return applied_result
 
 
 def _sink_workspace(user_id: str, payload: dict, *, runtime_token: str) -> None:
@@ -2475,6 +2843,13 @@ def _sink_workspace(user_id: str, payload: dict, *, runtime_token: str) -> None:
             params=params,
         )
         if not result.ok:
+            error = result.error if isinstance(result.error, dict) else {}
+            if (
+                op == "workspace_write"
+                and str(error.get("message") or "")
+                == "workspace revision conflict"
+            ):
+                raise db.EffectTerminalError("workspace_revision_conflict")
             raise _capability_effect_error(result, f"{op}_failed")
     except Exception:
         db.effect_sink_release(eid)
@@ -2554,6 +2929,13 @@ def _apply_workspace_batch_operation(
             params=params,
         )
         if not result.ok:
+            error = result.error if isinstance(result.error, dict) else {}
+            if (
+                op == "workspace_write"
+                and str(error.get("message") or "")
+                == "workspace revision conflict"
+            ):
+                raise db.EffectTerminalError("workspace_revision_conflict")
             raise _capability_effect_error(result, f"{op}_failed")
     except Exception:
         # Only a write that raised is safe to retry.  A hard process death after
@@ -2562,7 +2944,12 @@ def _apply_workspace_batch_operation(
         db.effect_sink_release(child_effect_id)
         raise
     db.effect_sink_complete(child_effect_id)
-    return {"effect_id": child_effect_id, "status": "applied"}
+    outcome = {"effect_id": child_effect_id, "status": "applied"}
+    data = result.data if isinstance(getattr(result, "data", None), dict) else {}
+    revision = data.get("revision")
+    if op == "workspace_write" and type(revision) is int and revision > 0:
+        outcome["revision"] = revision
+    return outcome
 
 
 def _sink_workspace_batch(
@@ -2606,26 +2993,44 @@ def _sink_workspace_batch(
                 outcome = future.result()
             except db.EffectDeliveryUncertainError as exc:
                 uncertain_errors.append(exc)
-            except db.EffectTerminalError:
+            except db.EffectTerminalError as exc:
+                terminal_code = str(exc)
+                if terminal_code not in v2_effect_outbox.WORKSPACE_BATCH_TERMINAL_ERRORS:
+                    terminal_code = f"{operation['op']}_failed"
                 outcomes[child_effect_id] = {
                     "effect_id": child_effect_id,
                     "status": "discarded",
                     # The capability adapter deliberately exposes only this
                     # stable code; never persist exception text from a sink.
-                    "error": f"{operation['op']}_failed",
+                    "error": terminal_code,
                 }
             except Exception as exc:  # noqa: BLE001 - re-raised after siblings settle
                 retryable_errors.append(exc)
             else:
-                if not isinstance(outcome, dict) or outcome != {
-                    "effect_id": child_effect_id,
-                    "status": "applied",
-                }:
+                if not isinstance(outcome, dict):
                     retryable_errors.append(
                         RuntimeError("workspace child returned an invalid outcome")
                     )
                 else:
-                    outcomes[child_effect_id] = outcome
+                    outcome_keys = set(outcome)
+                    revision = outcome.get("revision")
+                    if not (
+                        outcome.get("effect_id") == child_effect_id
+                        and outcome.get("status") == "applied"
+                        and (
+                            outcome_keys == {"effect_id", "status"}
+                            or (
+                                outcome_keys == {"effect_id", "status", "revision"}
+                                and type(revision) is int
+                                and revision > 0
+                            )
+                        )
+                    ):
+                        retryable_errors.append(
+                            RuntimeError("workspace child returned an invalid outcome")
+                        )
+                    else:
+                        outcomes[child_effect_id] = outcome
         # Delivery uncertainty dominates every other outcome. Ordinary
         # retryable failures dominate deterministic item rejections so a
         # terminal sibling can never discard work that still needs a replay.
@@ -2976,8 +3381,7 @@ def _apply_pending_effects_for_user(user_id: str) -> dict:
                     runtime_token=get_runtime_token(),
                 )
             effect_type = logical_effect_type
-        production_dispatch(effect_type, payload)
-        return None
+        return production_dispatch(effect_type, payload)
 
     return v2_effect_outbox.apply_pending_effects(
         user_id,
@@ -3053,6 +3457,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_messages=_read_messages,
         read_messages_since=_read_messages,
         read_messages_after_seq=_read_messages_after_seq,
+        ordered_chat_replies=True,
         runtime_mode_enabled=lambda user_id: (
             hosted_config_store.hosted_runtime_v2_enabled_strict(
                 core_store.get_store(user_id)
@@ -3075,11 +3480,15 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_summary_with_seq=_read_summary_with_seq,
         write_summary=_write_summary,
         read_summary_frontier=_read_summary_frontier,
+        read_summary_frontier_metadata=_read_summary_frontier_metadata,
         append_summary_segment=_append_summary_segment,
         append_summary_checkpoint=_append_summary_checkpoint,
         read_images=_read_images,
+        read_vision_observations=_read_vision_observations,
         read_files=_read_files,
         read_memory_context=_read_memory_context,
+        read_scheduled_wake_context=_read_scheduled_wake_context,
+        read_pending_scheduled_wake_context=_read_pending_scheduled_wake_context,
         apply_memory_actions=_apply_memory_actions,
         build_memory_envelope=_build_memory_envelope,
         read_capture_state=_read_capture_state,
@@ -3103,6 +3512,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
             if os.environ.get("FEEDLING_V2_PUSH_ENABLED", "1").strip() != "0"
             else None
         ),
+        publish_voice_reply=_publish_voice_reply,
     )
 
 
@@ -3524,6 +3934,66 @@ async def _scheduler_loop(
             pass
 
 
+_BACKLOG_SCAN_INTERVAL_SEC = _positive_float_env(
+    "FEEDLING_V2_BACKLOG_SCAN_INTERVAL_SEC", "300"
+)
+_BACKLOG_SCAN_MIN = _positive_int_env("FEEDLING_V2_BACKLOG_SCAN_MIN", "200")
+_BACKLOG_SCAN_LIMIT = _positive_int_env("FEEDLING_V2_BACKLOG_SCAN_LIMIT", "200")
+
+
+async def _backlog_scan_loop(
+    stop_event: asyncio.Event, *, interval: float = _BACKLOG_SCAN_INTERVAL_SEC
+) -> None:
+    """周期性给积压过大的 V2 用户补一个 maintenance job。
+
+    其余四个 maintenance 入队点全部挂在 turn 上（回复成功后、coverage 降级、
+    自链 catchup、CAS 重试），所以「用户不说话 → 不折叠 → 积压不降 → 下次 turn
+    要跑更长的 catch-up → 更容易失败」是个闭环；刚切到 V2 的大积压用户更是没有
+    任何东西会踢第一脚。这个循环是唯一不需要用户开口的入口。
+
+    只入队、不做别的：`_run_compaction` 成功后会自己链下一个 `compaction_catchup`，
+    所以一个 job 就能把一整段积压折完（prod 实测手动入队一次把 1569 折到 10）。
+
+    候选筛选（含所有口径细节）在 `jobs_store.due_compaction_users`。这里同样
+    不做 leader-election，理由与 `_scheduler_loop` 完全一致：`enqueue_job` 的
+    single-flight 唯一索引让重复入队 coalesce 成同一行。
+    """
+    while not stop_event.is_set():
+        try:
+            due = await asyncio.to_thread(
+                jobs_store.due_compaction_users,
+                min_backlog=_BACKLOG_SCAN_MIN,
+                limit=_BACKLOG_SCAN_LIMIT,
+            )
+            for user_id, backlog in due:
+                try:
+                    await asyncio.to_thread(
+                        jobs_store.enqueue_job,
+                        user_id,
+                        "maintenance",
+                        reason="backlog_scan",
+                    )
+                    await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+                except Exception as enqueue_exc:  # noqa: BLE001 — 一个用户不拖累其余
+                    log.warning(
+                        "[v2.serve_worker] backlog scan enqueue failed user=%s: %s",
+                        user_id,
+                        enqueue_exc,
+                    )
+            if due:
+                log.info(
+                    "[v2.serve_worker] backlog scan enqueued=%s worst=%s",
+                    len(due),
+                    due[0][1],
+                )
+        except Exception as e:  # noqa: BLE001 — 瞬时故障绝不能杀掉这个循环
+            log.warning("[v2.serve_worker] backlog scan failed: %s", e)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
 _RECONCILE_INTERVAL_SEC = _positive_float_env(
     "FEEDLING_V2_RECONCILE_INTERVAL_SEC", "60"
 )
@@ -3780,6 +4250,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
         asyncio.create_task(_scheduler_loop(stop_event)),
         asyncio.create_task(_watchdog_loop(supervisor, worker_id, stop_event)),
         asyncio.create_task(_reconcile_loop(stop_event)),
+        asyncio.create_task(_backlog_scan_loop(stop_event)),
     ]
     try:
         # Each loop handles recoverable iteration failures internally.  An

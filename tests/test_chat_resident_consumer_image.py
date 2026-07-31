@@ -66,8 +66,9 @@ def _make_image_msg(
     mime: str = "image/jpeg",
     role: str = "user",
     msg_id: str = "test-img-01",
+    vision_route_id: str = "",
 ) -> dict:
-    return {
+    message = {
         "id": msg_id,
         "role": role,
         "content": "",
@@ -76,6 +77,9 @@ def _make_image_msg(
         "image_b64": base64.b64encode(image_bytes).decode("ascii"),
         "image_mime": mime,
     }
+    if vision_route_id:
+        message["vision_route_id"] = vision_route_id
+    return message
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +319,82 @@ def test_process_messages_image_turn_no_caption_uses_placeholder(tmp_path):
     assert crc.IMAGE_PLACEHOLDER in captured.get("message", ""), (
         f"无 caption 时应含占位符，实际 {captured.get('message')!r}"
     )
+
+
+def test_dedicated_vision_sends_only_observation_to_main_model(tmp_path):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = _make_image_msg(
+        ts=9300.0,
+        image_bytes=_JPEG_MAGIC,
+        msg_id="img-observe-01",
+        vision_route_id="vision-route-01",
+    )
+    captured = {}
+
+    def fake_call(message, images=None, image_paths=None, trace_id=None, **kwargs):
+        captured.update(message=message, images=images, image_paths=image_paths)
+        return {"messages": ["The screenshot shows a settings page."]}
+
+    with patch.object(crc, "IMAGE_TEMP_DIR", tmp_path), \
+         patch.object(crc, "_vision_observation", return_value="A settings page is visible."), \
+         patch.object(crc, "call_agent", side_effect=fake_call), \
+         patch.object(crc, "post_reply", return_value={"id": "reply-observe-01"}):
+        result_ts = crc._process_messages([msg])
+
+    assert result_ts == pytest.approx(9300.0)
+    assert "UNTRUSTED VISUAL OBSERVATION" in captured["message"]
+    assert "A settings page is visible." in captured["message"]
+    assert not captured["images"]
+    assert not captured["image_paths"]
+
+
+def test_dedicated_vision_observer_failure_never_calls_main_model(tmp_path):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = _make_image_msg(
+        ts=9400.0,
+        image_bytes=_JPEG_MAGIC,
+        msg_id="img-observe-fail-01",
+        vision_route_id="vision-route-01",
+    )
+    replies = []
+
+    with patch.object(crc, "IMAGE_TEMP_DIR", tmp_path), \
+         patch.object(
+             crc,
+             "_vision_observation",
+             side_effect=crc.VisionObserverFailure(
+                 "vision_model_unavailable",
+                 status_code=502,
+                 detail="ProviderError",
+                 model="vision/model-1",
+                 provider="openrouter",
+             ),
+         ), \
+         patch.object(crc, "call_agent") as mock_call, \
+         patch.object(
+             crc,
+             "post_reply",
+             side_effect=lambda reply, **kwargs: replies.append((reply, kwargs)) or {"id": "reply-fail-01"},
+         ):
+        result_ts = crc._process_messages([msg])
+
+    assert result_ts == pytest.approx(9400.0)
+    mock_call.assert_not_called()
+    assert len(replies) == 2
+    carrier_text, carrier_kwargs = replies[0]
+    assert "视觉模型" in carrier_text or "vision model" in carrier_text.lower()
+    assert carrier_kwargs["turn_failure_error_class"] == "vision_model_unavailable"
+    assert carrier_kwargs["turn_failure_blame"] == "provider_transient"
+    assert carrier_kwargs["reply_to_message_id"] == "img-observe-fail-01"
+    assert carrier_kwargs["turn_failure_model"] == "vision/model-1"
+    assert carrier_kwargs["turn_failure_provider"] == "openrouter"
+    notice_text, notice_kwargs = replies[1]
+    assert "vision_model_unavailable" in notice_text
+    assert "HTTP 502" in notice_text
+    assert notice_kwargs["role"] == "system"
+    assert notice_kwargs["notice_kind"] == "upstream_error"
 
 
 # ---------------------------------------------------------------------------

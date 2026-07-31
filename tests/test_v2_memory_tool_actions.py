@@ -49,10 +49,14 @@ def test_delete_maps_to_memory_delete():
     assert out == [{"type": "memory.delete", "memory_id": "mem_9"}]
 
 
-def test_update_without_target_degrades_to_add():
-    # No target_id -> can't supersede; treat as a fresh add rather than error.
+def test_update_without_target_is_discarded_not_rewritten():
     out = worker._memory_tool_actions([{"op": "update", "summary": "s", "content": "c"}])
-    assert out[0]["type"] == "memory.add"
+    assert out == []
+
+
+def test_delete_without_target_and_unknown_op_are_discarded():
+    assert worker._memory_tool_actions([{"op": "delete", "summary": "s"}]) == []
+    assert worker._memory_tool_actions([{"op": "frobnicate", "summary": "s"}]) == []
 
 
 def test_lenient_synonyms_action_title_description():

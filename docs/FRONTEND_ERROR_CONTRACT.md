@@ -100,8 +100,8 @@
 > Phase A 会把残存的自由文本错误（如 `envelope missing fields: [...]`）收敛成 slug + detail，届时更新本表。
 
 - **认证/账号**：`unauthorized`(401) · `forbidden`(403) · `user_not_found` · `account_not_found` · `no_recoverable_account` · `invalid_or_expired_challenge` · `challenge_failed` · `token_expired` · `token_already_used` · `invalid_token`
-- **model_api / provider 配置**（设置页）：`model_api_not_configured` · `model_api_not_tested` · `model_api_config_invalid` · `model_api_key_decrypt_failed`(blame=system) · `model_api_key_envelope_missing` · `model_api_runtime_profile_missing`（feat/upstream-error-surfacing 合入后生效） · `provider_not_configured` · `provider_not_hostable` · `hosting_runtime_unavailable`
-- **聊天**：`already_answered`(409,静默) · `message_not_found` · `user_message_envelope_failed` · `bootstrap_incomplete`(引导未完成)
+- **model_api / provider 配置**（设置页）：`model_api_not_configured` · `model_api_not_tested` · `model_api_config_invalid` · `model_api_key_decrypt_failed`(blame=system) · `model_api_key_envelope_missing` · `model_api_runtime_profile_missing`（feat/upstream-error-surfacing 合入后生效） · `provider_not_configured` · `provider_not_hostable` · `hosting_runtime_unavailable` · `vision_runtime_v2_required`（旧版兼容） · `vision_resident_update_required` · `vision_model_unsupported` · `vision_model_test_failed`
+- **聊天**：`already_answered`(409,静默) · `message_not_found` · `user_message_envelope_failed` · `bootstrap_incomplete`(引导未完成) · `vision_model_required` / `vision_resident_update_required`（旧版兼容；当前图片发送不按视觉探测或 resident capability 拦截）
 - **导入/蒸馏**：`job_not_found` · `missing_file` · `empty_file` · `payload_too_large` · `archive_failed` · `archive_unavailable`
 - **通用**：`invalid_payload` · `not_found` · `not_owned` · `service_busy` · `service_unavailable` · `invalid_image` · `internal_error`(500 兜底)
 
@@ -193,7 +193,7 @@ GET /v1/notices?include_resolved=<bool, 默认 true>
 - 语义：不算对用户消息的回复（不影响已回复状态）、不推送（兜底话术那条已推过）、失败重试期间不会重复出现（服务端已做排他与去抖）。
 
 回合错误的 error_class 全集（同时会双写进通知中心）：
-`quota_insufficient` · `auth_invalid` · `model_not_found` · `rate_limited` · `upstream_unavailable` · `turn_timeout` · `reply_parse_failed` · `unknown`
+`quota_insufficient` · `auth_invalid` · `model_not_found` · `vision_model_required` · `rate_limited` · `upstream_unavailable` · `turn_timeout` · `reply_parse_failed` · `unknown`
 
 计划新增（Phase C 同批；老版按未知 slug 兜底即可）：
 - `provider_incompatible`（user_provider）——上游不兼容请求格式（如部分中转/xAI 拒收工具 schema）

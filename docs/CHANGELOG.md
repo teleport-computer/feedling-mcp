@@ -47,6 +47,329 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-30 — Runtime 值班台补审计的三条实质缺口：capture 语义、完整窗口、端到端交付
+
+**[FIX] 同一份外部审计里剩下的三条（前四条见下一条记录），按"页面自信地报绿最危险"排序做掉。**
+分支 `fix/runtime-health-p1`，L1 `7280 passed / 0 failed`（基线 7251 + 新增 29 条）。
+
+- **`capture.complete` 改名 `terminal_seen_no_gap`，且 `partial` 开始参与降级**。
+  那个桶只证明"找到了 `turn_terminal` 事件且没有 `capture_gap`"，**不**证明 prompt /
+  provider 往返 / tool call / 最终回复这些 artifact 齐全——叫 `complete` 会让人（和下一个
+  改这段代码的人）以为轨迹可以完整回放。更严重的是 `_runtime_health_level` 此前**只看
+  `missing`**：一个带 capture_gap 的回合在页面上既显示了 partial 计数、总体结论又写"正常"，
+  审计截图里就是这个组合。缺口是真实的取证损失，现在至少 `warn`（`missing` 仍是 `bad`，
+  取最差档，有测试钉住"warn 不会盖住 bad"）。
+  姊妹函数 `recent_chat_operational_health` 仍用 `complete`/`complete_rate` 未改——那是
+  `/model_api` 指标端点的对外契约，改名要单独走版本沟通。
+- **健康侧去掉 `LIMIT 1000` 采样上界，与 token 列口径对齐**。四条子查询此前各带 1000 行
+  上界，于是 24h 档写着"24 小时"、实际是"最近 1000 个 job"；而同页 token 查询从一开始就是
+  窗口内全量。两列因此在 168h / 720h 档覆盖不同的时间跨度，**放在一行读却不是同一批样本**，
+  且故障总量被静默少报。采样上界在这里不是性能旋钮而是正确性缺陷。回归测试插 1200 行
+  （> 旧上界）断言 `sampled_jobs == 1200`，并已实测：把 LIMIT 加回去这条立刻变红。
+  扫描量由新迁移 **0071** 的三条索引承担（`ix_agent_jobs_terminal_finished_at` /
+  `ix_agent_jobs_created_at` / `ix_v2_turn_metrics_created_at`，全部 `CONCURRENTLY`，
+  照 0048 的 invalid-空壳 重试处置）。
+  ⚠️ **顺带修正一条此前写反的性能结论**：`ix_v2_turn_metrics_lane_created_at` 不是
+  "用不上"，而是"对非前导列的范围谓词给不出范围收窄"。本机 PG 16 实测（30 万行 / 摊 60 天）：
+  24h 档无新索引走 Seq Scan（4226 buffer）、有新索引走 Index Scan（1454 buffer）；720h 档
+  规划器**确实会**去用那条复合索引，但退化成全索引扫描（21k+ buffer）。数字记在 0071 注释里。
+- **新增「端到端交付」区块（`recent_delivery_health`）**。这是审计最实的一条：`agent_jobs`
+  判 `completed` 只证明回合跑完了，不证明产物到达用户——副作用走 `v2_effect_outbox` 异步
+  apply、用户可见的终态失败走 `v2_terminal_failure_outbox` 投递，这两条队列堵住时 job 层面
+  一切正常，页面此前照样报绿。三块的窗口语义**刻意不同**：两个 outbox 是**当前积压状态**
+  （不随窗口变化——三天前该 apply 的 effect 还堵着，那是现在的故障），`v2_mcp_mutation_attempts`
+  的 unknown/unresolved 才是窗口内计数。判定只按**堵了多久**、不按积压条数（高吞吐下瞬时
+  积压 5000 条是健康的）；MCP 结果未知不设阈值、见一条就 warn（稀有、不可自愈）。
+  阈值刻意保守（1h warn / 6h bad）：稳态基线还没实测，值班台最不能犯的错是长期挂一条误报的
+  红——那会训练出"这页的红不用看"。收紧前不要当灵敏告警使。
+- **页面写明覆盖范围**：本页只统计本实例托管的 V2 回合，self-host consumer 只 best-effort
+  上报部分元数据、离线实例完全不可见，所以 token 与失败率**不是全体用户的总量**。这一条是
+  成本最低、防的却是最贵的误用（拿这页数字当全量用量账）。
+- `admin_core` 的 runtime 分支现在是**三个独立失败域**：健康挂了才降级整页，token 或交付
+  挂了各自只让对应区块显"取不到"（不是显 0——0 的含义是"确认过是零"，与"取不到"相反）。
+
+**未做**（审计提到、本轮没碰）：worker build / heartbeat age（`recent_worker_heartbeats()`
+已有数据，只差渲染）、provider health 参与判定、wake/proactive lane 健康、hourly rollup、
+四层拆分（Runtime Health / Usage / Trace Coverage / Private Trace Viewer）。admin key 轮换与
+移除 query-string auth 按产品决定不做。
+
+---
+
+## 2026-07-30 — 外部审计打回 Runtime 值班台的四处：日志漏脱敏、失败域过宽、参数假生效、两种 coverage 混列
+
+**[FIX] 一次外部只读审计（针对 PR #124 + #129 上线后的生产页）指出四条，全部实测复现后修掉。**
+前三条的共同形状是**页面自信地显示一个错误或误导性的东西，而不是报错**——值班台上这比崩溃更危险。
+
+- **访问日志漏脱敏 `admin_key`（安全）**。`asgi/middleware.py:_display_path` 的判据是
+  `k.lower() == "key"`，精确等于 `key`——而 admin 后台把凭据放在名为 `admin_key` 的
+  query 参数里（`data_track._data_track_qs` 保留列表第一项，因此它出现在**每个**导航
+  链接上）。于是可复用的 admin 凭据原样进了服务端访问日志，也进浏览器历史。
+  判据改为**子串**匹配 `key/token/secret/password/passwd/auth`：精确匹配单个名字，等于
+  把"以后不会出现别的别名"当前提，而这个前提在同一仓库里当时就不成立（`admin_key` /
+  `admin_token` / `api_key` 三个都在用）。⚠️ 本次只修"以后不再泄漏"；**已经进过日志的
+  那份凭据仍然有效**，轮换是独立的运维决定（按 `admin-password-rotate-needs-redeploy`
+  的教训，改 secret 后必须重新部署才生效）。
+- **token 查询失败会拖垮整张健康页**。`page_html` 的 runtime 分支原先两次数据调用共用
+  一个 `try`，于是 token 聚合（无 LIMIT、走 seq scan、扫描量随表增长单调变大的那条）
+  一旦超时，健康数据明明是好的、整页也退化成降级页——而这一页恰恰是出事时才被打开的。
+  拆成**独立失败域**：health 挂了才降级，token 挂了只让两列显 `—`。这条是 PR #129 的
+  spec §4 明确写的"任一数据源失败都走同一个降级页"，三轮 task review 都照 spec 检查、
+  因此全部放过；只有从"这页什么时候被打开"的运维视角看才发现它错了。
+- **`day` / `limit` / `offset` 在本页假生效**。runtime 页只读 `hours`，但那几个参数在
+  全视图共用的 `_data_track_qs` 保留列表里，会一路跟着 URL 走。审计实证了代价：有人拿
+  `?view=runtime&day=2026-07-25` 的截图当成"7 月 25 日的数据"，而页面渲染的其实是生成
+  时刻向前 24 小时，页顶还写着「窗口 24 小时」，读者不会怀疑自己看错日期。本页自己的
+  控件（三个窗口按钮）不再传播它们，说明区写明"本页只按 hours"。顶部 nav 由共用组件
+  生成，不给它开单页面特例——那会把页面知识倒灌进通用逻辑，改由说明文字兜。
+- **两种 coverage 混在一列**。原先「缓存命中 · 上报」= `cache_hit_ratio · usage_coverage`，
+  那个"上报"指 token usage 上报，读者会当成 cache 上报。而 `cache_reported_calls` 一直
+  在写入路径采集、聚合查询从没取过它——真正的 cache coverage 此前不可得。数据层补
+  `cache_reported_calls` / `cache_coverage`，渲染拆成「缓存命中」+「上报 usage/cache」
+  两列（12 → 13 列，空状态 colspan 同步）。
+
+L1 全量 7250 passed / 0 failed。无迁移。
+
+审计同时给出的方向性判断（**未在本次实施**，作为后续依据）：当前 Runtime 页是"值班摘要"
+而非完整 telemetry dashboard，约展示了后端已采集数据的 45%；delivery/outbox、MCP unknown
+outcome、wake 成功率、worker build/heartbeat age、self-host 覆盖标注均尚未上页；建议最终
+拆成 Runtime Health / Usage / Trace Coverage / Private Trace Viewer 四层。⚠️ 审计引用的
+基线文档 `2026-07-11-agent-trajectory-telemetry-requirements.md` **不在本仓库**（`find` +
+`git log --all` 均无，它在审计者本机路径下）——想按那份愿景推进的人需要先向审计方索取，
+不要在本仓库里找。
+
+## 2026-07-30 — CIPHERTEXT lane 补上删除传播的兜底：853 行"已删还在"
+
+**[DONE] 新增 `tee_shadow/ciphertext_prune.py`**，按主键集合差集删掉 TEE 侧的残留行，
+挂在 `tee_sync_scheduler` 的 reconcile 档（默认每天一次）。配套 `alembic 0068`
+给 `tee_sync_runs` 加三个扁平列（`prune_stale` / `prune_deleted` / `prune_refused`）。
+
+**问题**：CIPHERTEXT lane 的复制是只追加的游标扫描，删除完全靠热路径双写和
+requeue lane 传播。两条都可能漏——`mirror.execute` 按影子期铁律吞掉一切异常
+（它必须如此），而热路径删除失败时不会补落 requeue 标记。漏掉的行就永久留在 TEE，
+游标只前进、绝不回头。**prod 实测 853 行残留，全部在 `chat_messages`**，13 个用户，
+其中 840 行（98%）在 `chat_message_archive` 里能找到对应记录 = 用户主动 clear 过。
+只有这张表中招是有道理的：它是唯一有批量删除热路径的表，一次
+`mirror.execute_many` 失败就留下几百行。这不是"多了几行无害数据"——**用户以为
+删掉的明文对话还留在影子库里**。
+
+**[GOTCHA] 顺序铁律：先查 TEE，再查 RDS。这是正确性的全部，不是性能偏好。**
+
+设 TEE 快照时刻 T1 < RDS 快照时刻 T2。若某行在 T1 已在 TEE，则 replicator 必在
+T1 前写入它，而 replicator 只搬 RDS 中存在的行 ⇒ 该行 T1 前就在 RDS ⇒ T2 时它
+不在 RDS，只可能是期间被删了 ⇒ 删掉 TEE 侧那行正确。
+
+反序则有真实的误删窗口：某行在 RDS 快照后写入、又在 TEE 快照前被搬进 TEE ⇒
+`∈TEE快照` 且 `∉RDS快照` ⇒ 被判成残留删掉。**而游标早已越过它，永远不会搬回来**。
+`reconciler` 的 prune 是反序的，那里可以接受（MIRROR lane 每轮重新全表 copy，
+误删下轮就补回来）；CIPHERTEXT lane 没有这个后悔药。测试里有一条守卫专门盯它。
+
+**[GOTCHA] prod dry-run 抓到一个本地永远测不出的缺陷：连接被网关掐断会连锁全灭。**
+第一版没有重试。真环境 dry-run 的结果是 `chat_messages` 成功（853），**随后 8 张表
+全部 `SSL SYSCALL error: EOF detected`**——因为拉 16 万主键要几分钟，期间池里其它
+连接一直空闲，被 Phala 网关静默掐断。与 `tee_replicator.worker._flush_batch` 治的是
+同一个病（2026-07-14 那次 chat/memory 整表挂），沿用同样的判定与对策：
+`OperationalError` 或连接 broken/closed = 换连接重试（有界 + 小退避）。补上之后
+9 张表全绿、0 错误。**这类缺陷本地测不出来**——本地 PG 不经网关。
+
+**几处设计取舍：**
+- **安全阈值**：单表删除量超过 `max(2000, TEE 行数 × 10%)` 就整表放弃、一行不删。
+  防的是"RDS 侧查询异常返回空集"被当成"用户删光了数据"进而清空 TEE。宁可让残留
+  多留一天等人看，也不做一次自动的大规模不可逆删除。绝对下限是给小表兜底的
+  （`v2_conversation_summary` 只有 6 行，纯按比例算一次正常账号删除就会触发拒绝）。
+- **覆盖 9 张表，从 `worker._TABLES` 派生**，不另立清单（本仓库因"手工清单漏登记"
+  吃过多次亏）。剩下 3 张纯 append-only、连 `requeue_delete_tee_sql` 都没有的表
+  （`chat_message_archive` / `v2_trajectory_events` /
+  `v2_conversation_summary_segments`）**故意不接**：它们没有删除语义，prune 无从判断
+  "消失"是删除还是尚未复制。未覆盖的表进 `uncovered` 报告字段——静默的覆盖缺口正是
+  这套机制要根治的东西，它自己不能再制造一个。
+- **加扁平列而不是只进 JSONB**：前一天刚因为 `missing_in_tee` 只活在 JSONB 里
+  而让 4 列数据静默失同步一整批部署，不重蹈覆辙。`prune_refused` 非 0 就该有人看。
+- 遗留：prune 删掉 frames 的 TEE 明文指针行时不清理对应的 R2 对象，会留孤儿。
+  与 requeue lane 的既有行为一致（那条 DELETE 同样不碰 R2），未处理。
+
+---
+
+## 2026-07-30 — 主模型看图验证统一为显式 catalog + 隐藏双图 probe
+
+**[DONE] 视觉能力验证与实际失败归属收口。** 新增公开的
+`POST /v1/vision/main/test`：Model API 只信 provider catalog 的显式模态字段，缺字段
+才发真实双图探测；resident 走隔离 session 的隐藏双图 side-channel，测试内容不进入
+Chat、推送、摘要、Live Activity 或 capture。配置状态统一为
+`testing / ok / unsupported / failed / untested`，绑定的 provider、model 或 resident
+入口变化会使旧结果失效。每次主模型 setup 成功后也会异步启动同一套探测，不等待
+catalog 或双图调用，因此用户不打开视觉设置、不发图也能通过
+`GET /v1/vision/config` 提前得到 verdict；期间 route 再次变化时旧结果由版本围栏
+丢弃。setup、探测失败和所有探测状态都不阻塞配置或发送：图片始终沿用户配置的主模型
+或 dedicated route 进入真实调用。VPS resident 也在官方 consumer 首次上报或更换
+`consumer_id / entry_signature / provider / model` binding 时自动入队现有隐藏 probe；
+同一 binding 的 pending/终态 verdict 不重复探测，显式 catalog/modalities 已能判定时
+不额外调用模型，poll 与发送均不等待 provider I/O。resident 回报的明确图片拒绝
+`vision_model_required / vision_model_incompatible` 统一落为 `unsupported`；
+auth、quota、rate limit、timeout、upstream 与空回复仍保留 `failed`。只有 provider
+真正以明确的 text-only 图片错误拒绝本回合时，才返回 `vision_model_required` 与可操作
+的中英双语换模型提示；Runtime V2 同时把该回合捕获的 active route 写为
+`unsupported`，让后续 config 查询触发非阻断提示，且用 route 版本 fence 防止旧失败
+覆盖用户刚切换的新配置。Hosted V1 同样在发图时捕获 route 版本，并在接收 terminal
+failure 回复的原子事务中写回 `unsupported`，避免 allowlist 外 V1 用户长期停在
+`untested`。
+
+**[DONE] 图片失败归属只在证据明确时挂到视觉模型。** auth、quota、model、provider、
+rate limit、upstream、timeout、reply parse 和 dedicated observer 失败映射到稳定
+`vision_model_*` 码；图片回合里的工具、存储或其他未知内部异常保留原失败归属。
+
+公开 OpenAPI 已登记 main-test 端点；resident probe 回传留在
+`/v1/internal/vision/main/test/result`，不进入公开契约。
+
+---
+
+## 2026-07-29 — TEE 迁移链补到 0008：写了迁移不等于执行了迁移
+
+**[DONE] `alembic_tee 0008`** 补 `model_api_routes` 落后 RDS 的 4 个 vision 列
+（`is_vision` / `vision_test_status` / `last_vision_test_at` /
+`last_vision_test_error`，来自 RDS `0066_model_api_vision_route`）。同时把两个
+环境的 TEE 库从 **0006 升到 0008**（含别人写好但一直没执行的 `0007`）。
+
+**[GOTCHA] 这次暴露的不是代码缺陷，是流程缺口。** 07-27 那批工作交付后，别人
+接手新功能时**正确地**用上了这套机制：登记了 `chat_turn_activity_events`
+（SNAPSHOT）、把两张 voice 临时表登记成 SKIP、还写了 `alembic_tee 0007`。但
+**没有人执行它**——`tee-migrate` workflow 需要的 4 个 repo secret 至今没建，
+`alembic_tee` 目前只能手工跑。后果是 test 的 TEE 库停在 0006，`chat_turn_activity_events`
+在 TEE 侧根本不存在，snapshot lane 每个 tick 报一次
+`两侧无公共列，拒绝整表清空`（护栏正确拦住了整表清空，没有误删任何数据）。
+
+**两种漂移的可见性差异，值得记住：**
+
+| 漂移 | 表现 | 可见性 |
+|---|---|---|
+| RDS 新建表、TEE 没有 | `snapshot_failures = 1`，每 tick 一次 | **有红灯** |
+| RDS 加列、TEE 没有 | `ok: true`，行数照样对得上 | **只在 `missing_in_tee` 里，无红灯** |
+
+`model_api_routes` 的这 4 列就属于后者——整表一直在同步、行数一直是 27、
+`snapshot_failures` 一直是 0，只有这 4 列的数据静静地没进 TEE。加列不建表就撞不上
+"无公共列"护栏，在 CI 和失败计数上都是静默的。**`missing_in_tee` 是这类漂移唯一的
+信号，必须有人定期看**（查询见 `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md` §3）。
+
+**几处刻意不做的：**
+- **不搬** `0066` 的 `model_api_routes_one_vision` partial unique index。与 `0004`
+  baseline 政策一致（`0004` 同样没搬 `0014` 的 `one_active` / `uniq`）：TEE 是
+  SNAPSHOT 整表替换的只读影子，业务唯一约束在这里没有防护价值（RDS 侧已保证），
+  却会把任何 RDS 侧的边界数据问题放大成 TEE 侧的整表停止同步。
+- **不补** `thinking_fallback`（`0005` 已这么裁决过）：test RDS 的历史残留列，
+  全仓 grep 零命中，prod RDS 没有。TEE 不跟着某一个环境长歪，让它一直报着。
+- prod TEE 提前有了这 4 列和那张空表，而 prod RDS 还停在 `0063`（那批新迁移没上
+  prod）。这是无害的：`missing_in_rds` 只入报告，不触发 warning、不影响 `ok`；
+  而 prod 跑的 registry 里还没有 `chat_turn_activity_events` 这一条，SNAPSHOT lane
+  根本不会碰那张空表。
+
+**[GOTCHA] 顺带查出、本次未动：`monitoring` 角色对 TEE 库 55 张表全部零权限。**
+`pg_default_acl` 里只有 `app` 和 `tee_replicator`，从来没配过 `monitoring`。不是这次
+引入的，是既有状态——这个"只读角色"实际上是废的。改角色权限是安全边界动作，
+留给单独决策。
+
+---
+
+## 2026-07-29 — Runtime 值班台加上开销：各 lane 的 token 与缓存效率
+
+**[DONE] `/admin/data-track?view=runtime` 的 lane 健康表增加 token 两列**，窗口跟随
+页面切换（24h / 7天 / 30天）。此前值班台只回答"跑得好不好"，不回答"花了多少"；而
+token 统计只存在于 users 页的「运营 Telemetry」区块，且是**全站 chat lane、固定 30 天**
+的单一口径——非 chat lane 的开销完全不可见。心跳 lane 烧闲置用户 BYOK 是出过事的
+（`usr_57c24d0d` 零聊天、65 个回合全是 sleep），当前口径恰恰看不到它。
+
+- `jobs_store.recent_token_usage_by_lane(within_hours)`：按 lane 的 `GROUP BY` 聚合。
+  三条口径写进了 docstring：**统计全部回合、不过滤 `failed`**（失败回合照样烧钱，
+  provider 已经算过钱了——这与同文件 `recent_runtime_health` 的延迟分位数只算成功回合
+  正好相反，两者过滤条件相反是刻意的）；**无上报是 `None` 不是 `0`**（靠 `sum()` 的
+  NULL 传播，计数列用 `coalesce(...,0)`、token 列裸 `sum`，否则"provider 没回 usage"
+  会伪装成"用了 0 个 token"）；**不加 `LIMIT`**（sum 聚合加采样上界会静默少报总量——
+  这条决策本身仍然正确；扫描路径当时以为由 `ix_v2_turn_metrics_lane_created_at` 的
+  lane 前缀控制，这句话后来被 review 实测证伪，见下面 07-29 review 修复条目）。
+- 渲染两列：「token 入/出」`951.2k / 40.5k`、「缓存命中 · 上报」`49% · 87%`。某条 lane
+  不在返回的 `lanes` 字典里时（有 job 但一个回合都没终态）两列显 `—`，不 `KeyError`、
+  也不显 0——判据一律 `is None` 而非 falsy，否则真实的 `0` token 会被误显成"无数据"。
+- 接线：窗口在 `page_html` 里**算一次、传给两个数据函数**，而不是让它们各自读
+  `request.args`——后者会让同一页出现一个 24 小时、一个 720 小时的窗口，且几乎看不出来。
+  `try/except` 同时覆盖两次数据调用、但不包住渲染调用（渲染层的 bug 不该被误吞成
+  "数据源故障"降级页）。
+
+⚠️ **users 页那块保留不动，两处窗口口径不同**（users 固定近 30 天、本页跟随窗口），
+页面说明里写明了"两处数字不一致是窗口不同、不是 bug，切到 30 天时应当一致"。
+
+L1 全量 7086 passed / 0 failed（基线 7068 + 新增 18）。无迁移、未改
+`recent_token_usage_summary`、未动其余视图页。
+
+### [DONE] 整分支 code review 后的 4 个 Important + 2 个 Minor 修复（同日）
+
+- **索引论证反了（docstring/design §3）**：`ix_v2_turn_metrics_lane_created_at` 是
+  `(lane, created_at DESC)`，`lane` 打头恰恰意味着它服务不了本查询（无 lane 等值谓词，
+  PG 16 无 skip scan）。本地 PG 16 实测走 Parallel Seq Scan。改写 docstring 说实话，
+  「不加 LIMIT」的决策保留，只换掉依据；把补索引记为 design 里的明确 follow-up。
+- **渲染层漏掉 token-only 的 lane**：`_render_runtime_health_page` 现在遍历
+  `payload["lanes"]` ∪ `tokens["lanes"]` 的并集——一条窗口内有 token 开销、但 job 没
+  挤进健康侧 `LIMIT 1000` 采样的 lane，此前不显示也不报错，现在会以健康列全 `—`、
+  token 列正常数字的合成行出现。页顶补一句采样上界差异的说明。
+- **窗口不一致的"不可能"只是巧合**：`recent_runtime_health` 钳 `24*30`，
+  `recent_token_usage_by_lane` 钳 `24*366`，今天恰好都等于 720。加了白名单守卫测试
+  `max(_RUNTIME_HEALTH_WINDOWS) <= 24*30`，把巧合钉成会红的约束。
+  `_RUNTIME_HEALTH_WINDOWS` 加超过 720 小时的档位时这条测试会先红。
+- **`cache_hit_ratio` 与 users 页算法不一致**：只上报一侧（`cache_read=None,
+  cache_miss=500` 或反过来）时旧算法显 `0.0%` / `100.0%`（假装完美命中），users 页显
+  `—`。已对齐 users 页：任一为 `None` → ratio 为 `None`。Anthropic 只有 cache write
+  无 cache read 的回合是真实路径，不是理论构造。
+- Minor：`_fmt_tokens_compact` 在 `[999_950, 1e6)` / `[999_950_000, 1e9)` 两个区间
+  会显示成上一档的 `"1000.0k"` / `"1000.0M"`（先除后 `.1f` 进位）；真实边界是 999_950，
+  不是 999_500。新增 B 档并按格式化结果收紧阈值。
+- Minor：`test_render_runtime_health_page_token_columns_are_dash_without_data` 的
+  `>= 2` 收紧为按 lane 行精确断言 `== 2`。
+
+无迁移、无索引改动（记为 follow-up）。design/plan 两份文档同步更正，plan 文档保留原始
+代码片段、在末尾追加 Post-review 修正记录不改写历史。
+
+L1 全量 7092 passed / 0 failed（基线 7086 + 本轮新增 6：cache_hit_ratio 部分上报两个方向、
+窗口白名单守卫、`_fmt_tokens_compact` 真实进位边界、token-only lane 出现在渲染结果里、
+token-only lane 不参与健康结论判定）。1 skipped / 9 xfailed 与基线一致，非本轮引入。
+
+## 2026-07-28 — TEE SNAPSHOT lane 上真环境后炸出的两个坑：TRUNCATE 权限 + 列漂移
+
+**[DONE] Task 10（计划外追加）+ Task 8 收尾**。全量对齐的代码合进 `test` 部署后，
+SNAPSHOT lane 一行都没同步成功。两个根因**本地测试库结构上都覆盖不到**，记在这里
+是因为它们会重复发生在任何"本地绿了就以为能上"的改动上。
+
+**坑一：`TRUNCATE` 是 PostgreSQL 里独立于 DML 四件套的权限。**
+`deploy/postgres/ensure-roles.sh` 给 `app` / `tee_replicator` 授的是
+`SELECT, INSERT, UPDATE, DELETE`，而 SNAPSHOT lane 的整表原子替换是
+`TRUNCATE + COPY` → 27 张表全数 `permission denied for table X`。
+本地 pytest 跑的是 `postgres` 超级用户，**这类角色权限缺口在本地永远绿**。
+排查时极易误判：`has_table_privilege(role, tbl, 'INSERT')` 查出来 54/54 全绿，
+只有 `TRUNCATE` 那一项是 0，必须逐权限查才看得见。
+修法两层：`ensure-roles.sh` 补上（长期，PG CVM 重部署带着走）+ 直连两个 TEE 实库
+执行 GRANT（脚本只在 CVM 启动时跑，既有库等不到）。
+
+**坑二：列漂移会让整张表永久失败。**
+`snapshot_table` 原先用裸表名 `COPY (FORMAT BINARY)`——按列位置严格匹配整表，
+两侧列集差一列就 `row field count is N, expected M`，且**每个 tick 都失败**。
+两种来源都是常态而非异常：①滚动部署时间窗（`0059`/`0060`/`0061` 给
+`v2_turn_metrics` / `v2_wake_schedule` 加的 10 列，`0004` 的 DDL 是 07-27 从 prod
+派生的，test RDS 跑在前面）；②环境自身的历史残留（test RDS 的
+`model_api_routes.thinking_fallback` 全仓 grep 零命中，没有任何代码创建它——TEE
+侧反而是与代码一致的那个）。
+修法：`COPY` 两侧改用列集**交集**，两侧独有的列分别报进 `missing_in_tee` /
+`missing_in_rds`（落进 `tee_sync_runs.report`），`missing_in_tee` 非空时
+`log.warning`。外加 `alembic_tee 0005` 补齐真实缺的 10 列——但**不补**
+`thinking_fallback`：TEE 不该跟着某个环境长歪，让它一直报着才对。
+护栏：两侧无公共列时拒绝执行。没有它，交集逻辑会把"完全对不上"降级成"共同列为空
+的正常快照"——`TRUNCATE` 照跑、一行写不回、报告仍是 `ok=True`，比原先的整表失败
+更糟（原先只是不同步，那样把已有影子数据也抹了）。
+
+test 实测曲线：`snapshot_failures` 27（部署后）→ 3（补授权）→ 1（落 0005）→ 0
+（部署 Task 10）。prod 解密探针 **2921/2921 = 100% PASS**（28 秒，零毒行）。
+
+**这一轮补上了原始诉求里漏掉的一层**：表注册表守的是"表存在"，守不住"列一致"。
+而列漂移在有滚动部署的系统里是常态。现在漂移是可观测的量，不是某张表悄悄停摆。
+排查配方见 `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md` §3。
+
+---
+
 ## 2026-07-28 — TEE 影子库全量对齐：51 张表归类落地 + verify/registry 双守卫
 
 **[DONE] `2026-07-27-tee-full-table-alignment` 计划全部代码 Task（1-8）完成**。
@@ -338,7 +661,24 @@ OpenAPI 不涉及（零命中）。
 `.cn` 签发的 key 打 `api.moonshot.ai` 直接 `401 Invalid Authentication`；用户报
 `provider_test_failed`/401 时先核 `base_url` 与 key 签发区是否配对。
 
-## 2026-07-26 — V1 resident 补齐可下载文件
+## 2026-07-26
+
+### [DONE] V1/V2 聊天执行记录统一为可信投影
+- V2 provider-native 工具调度在调用开始和真实结果/异常边界写入 display-safe
+  `agent_status_events`；只保留受限的工具名、call/job/effect id、状态、耗时和结果
+  分类，不保存参数、结果正文、助手文案或推理。
+- V1 resident 的 `io_cli` 也在真实命令开始/结束边界写同一份按 turn 持久化的
+  fixed-shape 事件；记忆分类只从 `memory-index` / `memory-fetch` 实际返回项统计，
+  自定义分类时只给总数。
+- 用户鉴权的 `GET /v1/chat/turn-activity/{turn_id}` 现在同时读取 V1/V2；新增
+  resident 专用写入口，只接受已存在 user turn 下的固定字段，V2 所有权会拒绝该写入。
+- 最终回复把同一份受限工具事件附在 `activity_events` metadata；provider-native
+  reasoning 继续走独立加密 thinking envelope，二者不混合。
+- `memory_search` / `memory_fetch` 在 capability 真实结果还未截断时提取返回总数；
+  只有每一项都命中固定双语通用桶时才附完整分类计数，任一自定义/未知桶则只保留总数。
+  记忆摘要、正文、搜索词和原始桶名都不进入活动记录。
+
+### [DONE] V1 resident 补齐可下载文件
 
 ### [DONE] Claude / Codex / Pi 共用文件生成与原子回复
 - V1 CLI resident 新增 `io_cli send-file`：模型把 UTF-8 源文件写进每用户隔离的

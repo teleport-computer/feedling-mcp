@@ -27,6 +27,8 @@ BODYLESS_OPERATIONS: set[Operation] = {
     ("post", "/v1/model_api/test"),
     ("post", "/v1/model_api/routes/{route_id}/activate"),
     ("post", "/v1/model_api/routes/{route_id}/test"),
+    ("post", "/v1/vision/main/test"),
+    ("post", "/v1/vision/routes/{route_id}/test"),
     ("post", "/v1/proactive/scheduled/fire"),
 }
 
@@ -125,6 +127,12 @@ CONSUMER_HEADERS = [
         _schema("string", maxLength=80),
         "Resident consumer source revision.",
         example="a1b2c3d",
+    ),
+    _header(
+        "X-Feedling-Consumer-Capabilities",
+        _schema("string", maxLength=500),
+        "Comma-separated capabilities advertised by the current official resident poll.",
+        example="vision_observer_v1",
     ),
 ]
 
@@ -625,7 +633,28 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "enclave_pk_fpr": {"type": "string"},
             "type": {"type": "string", "enum": ["moment", "quote", "fact", "event", "insight", "reflection"]},
             "occurred_at": {"type": "string", "minLength": 1, "description": "Plaintext ISO-8601 ordering metadata."},
-            "source": {"type": "string", "default": "live_conversation"},
+            "source": {
+                "type": "string",
+                "enum": [
+                    "bootstrap",
+                    "chat",
+                    "genesis_import",
+                    "genesis_resident_distill",
+                    "history_import",
+                    "hosted_runtime_state",
+                    "live_conversation",
+                    "memory_capture",
+                    "memory_dream",
+                    "memory_migrate",
+                    "model_api_capture",
+                    "model_api_correction",
+                    "model_api_repair",
+                    "ombre_brain_sync",
+                    "resident_absorb",
+                    "resident_patch",
+                ],
+                "default": "live_conversation",
+            },
             "anchor_memory_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
         },
         "if": {
@@ -772,6 +801,11 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "message": {"type": "string", "maxLength": 12000, "example": "Help me plan tomorrow."},
             "content": {"type": "string", "maxLength": 12000, "deprecated": True, "description": "Compatibility alias for message."},
             "context_refs": {"type": "array", "maxItems": 8, "items": {"$ref": "#/components/schemas/ChatContextReference"}},
+            "include_reasoning": {
+                "type": "boolean",
+                "default": False,
+                "description": "Request the assistant's per-turn thinking for this Hosted Runtime V2 turn. With the self-authored thinking chain enabled (the default), the returned thinking is io's own first-person summary rather than the provider's raw chain-of-thought, falling back to native reasoning when no self-authored block was produced. Omitted values preserve the historical disabled behavior; resident runtimes ignore this field.",
+            },
             "image_b64": {"type": "string", "contentEncoding": "base64", "description": "Image data; decoded size must not exceed 2,000,000 bytes."},
             "image_base64": {"type": "string", "contentEncoding": "base64", "deprecated": True},
             "image_mime": {"type": "string", "enum": ["image/jpeg", "image/png", "image/webp", "image/gif"]},
@@ -820,6 +854,69 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "error_class": "quota_insufficient",
             "provider_result": "failure",
         },
+    },
+    "VisionConfigUpdateRequest": {
+        "type": "object",
+        "required": ["mode"],
+        "properties": {
+            "mode": {"type": "string", "enum": ["follow_main", "dedicated"]},
+            "route_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Required when mode is dedicated.",
+            },
+        },
+        "if": {"properties": {"mode": {"const": "dedicated"}}, "required": ["mode"]},
+        "then": {"required": ["route_id"]},
+        "additionalProperties": False,
+    },
+    "VisionRouteCreateRequest": {
+        "type": "object",
+        "required": ["model"],
+        "properties": {
+            "provider": {"type": "string"},
+            "model": {"type": "string", "minLength": 1},
+            "api_key": {"type": "string", "minLength": 1, "writeOnly": True},
+            "credential_id": {"type": "string", "format": "uuid"},
+            "label": {"type": "string"},
+            "base_url": {"type": "string", "format": "uri"},
+            "context_window_tokens": {"type": "integer", "minimum": 8192},
+        },
+        "oneOf": [
+            {"required": ["api_key"], "not": {"required": ["credential_id"]}},
+            {"required": ["credential_id"], "not": {"required": ["api_key"]}},
+        ],
+        "additionalProperties": False,
+    },
+    "VisionObserveRequest": {
+        "type": "object",
+        "required": ["message_id", "route_id"],
+        "properties": {
+            "message_id": {"type": "string", "minLength": 1},
+            "route_id": {"type": "string", "minLength": 1},
+        },
+        "additionalProperties": False,
+    },
+    "VisionMainTestResponse": {
+        "type": "object",
+        "required": ["status", "source", "provider", "model"],
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["ok", "unsupported", "failed", "untested", "testing"],
+            },
+            "source": {"type": "string", "enum": ["model_api", "resident"]},
+            "provider": {"type": "string"},
+            "model": {"type": "string"},
+            "error_code": {"type": "string"},
+            "retryable": {"type": "boolean"},
+            "status_code": {"type": "integer"},
+            "detail": {"type": "string"},
+            "probe_id": {"type": "string"},
+            "expires_at_epoch": {"type": "number"},
+            "poll_after_ms": {"type": "integer", "minimum": 0},
+        },
+        "additionalProperties": False,
     },
     "HostedChatAcceptedResponse": {
         "type": "object",
@@ -1022,6 +1119,40 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         "additionalProperties": True,
     },
+    "ChatActivityEventRequest": {
+        "type": "object",
+        "required": ["activity_id", "tool_name", "state"],
+        "properties": {
+            "activity_id": {"type": "string", "maxLength": 160},
+            "call_id": {"type": "string", "maxLength": 160},
+            "tool_name": {"type": "string", "maxLength": 120},
+            "state": {"type": "string", "enum": ["running", "success", "failure"]},
+            "duration_ms": {"type": "number", "minimum": 0},
+            "result_code": {"type": "string", "maxLength": 64},
+            "memory_count": {"type": "integer", "minimum": 0, "maximum": 1000},
+            "memory_categories": {
+                "type": "array",
+                "description": "Complete canonical breakdown only; counts must sum to memory_count.",
+                "items": {
+                    "type": "object",
+                    "required": ["key", "count"],
+                    "properties": {
+                        "key": {
+                            "type": "string",
+                            "enum": [
+                                "work", "growth", "family", "friends", "pets",
+                                "relationship", "feelings", "preferences", "values",
+                                "health", "interests", "money", "food", "travel",
+                            ],
+                        },
+                        "count": {"type": "integer", "minimum": 1},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "additionalProperties": False,
+    },
     "ChatHistoryClearRequest": {
         "type": "object",
         "required": ["confirm"],
@@ -1067,6 +1198,27 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "pulse": {"type": "number", "minimum": 0, "maximum": 1},
             "occurred_at": {"type": "string", "maxLength": 80},
             "anchor_memory_ids": {"type": "array", "items": {"type": "string"}},
+            "source": {
+                "type": "string",
+                "enum": [
+                    "bootstrap",
+                    "chat",
+                    "genesis_import",
+                    "genesis_resident_distill",
+                    "history_import",
+                    "hosted_runtime_state",
+                    "live_conversation",
+                    "memory_capture",
+                    "memory_dream",
+                    "memory_migrate",
+                    "model_api_capture",
+                    "model_api_correction",
+                    "model_api_repair",
+                    "ombre_brain_sync",
+                    "resident_absorb",
+                    "resident_patch",
+                ],
+            },
         },
         "additionalProperties": True,
     },
@@ -1091,6 +1243,17 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "anchor_memory_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
             "reason": {"type": "string"},
+            "capture_mode": {
+                "type": "string",
+                "enum": [
+                    "agent_tool",
+                    "genesis_resident_distill",
+                    "memory_capture",
+                    "memory_dream",
+                    "repair",
+                    "state",
+                ],
+            },
             "source_chat_message_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
         },
         "additionalProperties": True,
@@ -1120,6 +1283,35 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 }
             ]
         },
+    },
+    "MemoryActionResult": {
+        "type": "object",
+        "required": ["status", "http_status"],
+        "properties": {
+            "status": {"type": "string", "enum": ["ok", "error"]},
+            "http_status": {"type": "integer", "description": "Per-item execution status; inspect it even when the batch HTTP status is 200."},
+            "action": {"type": "string"},
+            "error": {"type": "string"},
+            "id": {"type": "string"},
+            "memory_id": {"type": "string"},
+            "noop": {"type": "boolean"},
+            "skipped": {"type": "string"},
+        },
+        "additionalProperties": True,
+    },
+    "MemoryActionsResponse": {
+        "type": "object",
+        "required": ["status", "results", "effects", "total_count", "applied_count", "skipped_count", "failed_count"],
+        "properties": {
+            "status": {"type": "string", "enum": ["ok", "partial", "failed"]},
+            "results": {"type": "array", "items": {"$ref": "#/components/schemas/MemoryActionResult"}},
+            "effects": {"type": "array", "items": {"type": "object"}},
+            "total_count": {"type": "integer", "minimum": 0},
+            "applied_count": {"type": "integer", "minimum": 0},
+            "skipped_count": {"type": "integer", "minimum": 0},
+            "failed_count": {"type": "integer", "minimum": 0},
+        },
+        "additionalProperties": False,
     },
     "MemoryAddRequest": {
         "type": "object",
@@ -1565,8 +1757,12 @@ PRECISE_JSON_BODIES: dict[Operation, str] = {
     ("post", "/v1/model_api/chat/send"): "HostedChatSendRequest",
     ("post", "/v1/model_api/models"): "ModelApiModelsRequest",
     ("post", "/v1/model_api/runtime_error"): "ModelApiRuntimeErrorRequest",
+    ("put", "/v1/vision/config"): "VisionConfigUpdateRequest",
+    ("post", "/v1/vision/config"): "VisionRouteCreateRequest",
+    ("post", "/v1/vision/observe"): "VisionObserveRequest",
     ("post", "/v1/chat/message"): "ChatTransportRequest",
     ("post", "/v1/chat/response"): "ChatResponseRequest",
+    ("post", "/v1/chat/turn-activity/{turn_id}/events"): "ChatActivityEventRequest",
     ("delete", "/v1/chat/history"): "ChatHistoryClearRequest",
     ("post", "/v1/memory/index"): "MemoryIndexRequest",
     ("post", "/v1/memory/fetch"): "MemoryFetchRequest",
@@ -1651,6 +1847,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/model_api/chat/send"): "Queue an asynchronous hosted-agent turn. A successful response is always 202 and never contains a plaintext assistant reply.",
     ("post", "/v1/model_api/models"): "列出某 provider 在该凭据下可见的模型清单（实时拉取，非 io 兼容性保证）。unsupported / partial 时客户端退回手填。",
     ("post", "/v1/model_api/runtime_error"): "Record or clear the resident runtime's latest provider error. provider_result=success refreshes provider health immediately; provider_result=failure applies error_class to the provider-health policy.",
+    ("post", "/v1/vision/main/test"): "Validate the effective main model's image-input capability. Model API routes use explicit catalog metadata when available and otherwise perform a real two-image probe, returning a terminal 200 status. Resident runtimes start a hidden isolated two-image probe and return 202 testing; poll GET /v1/vision/config until effective_status leaves testing. Residents without the hidden-probe capability receive 409 vision_resident_update_required.",
     ("get", "/v1/model_api/usage"): (
         "Query the caller's active model_api provider for balance/usage, live on every call — "
         "never cached and never stored. Uses the same decrypted provider key as chat, decrypted "
@@ -1662,9 +1859,11 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
         "Metrics the adapter cannot report are status=\"unsupported\", not omitted."
     ),
     ("get", "/v1/chat/history"): "Read encrypted chat history. Use oldest_seq as before_seq for lossless older paging and latest_seq as after_seq for lossless forward paging; timestamp watermarks remain for compatibility.",
+    ("get", "/v1/chat/turn-activity/{turn_id}"): "Read display-safe activity for one V1 resident or Runtime V2 chat turn. V2 events come from backend jobs and tool dispatch; V1 events come from the authenticated resident io_cli boundary and are durably scoped to an existing user message. Both runtimes expose only bounded identifiers, state, timing, and result classification. Successful memory_search/memory_fetch events include the confirmed returned-item count and, only when every item uses the canonical bucket taxonomy, a complete category-count breakdown. Tool arguments, result bodies, assistant prose, reasoning, and custom bucket labels are never returned.",
+    ("post", "/v1/chat/turn-activity/{turn_id}/events"): "Append one authenticated V1 resident tool transition. This endpoint is used by the shipped resident io_cli runtime, accepts only running/success/failure plus display-safe fixed metadata, rejects V2-owned users, and never accepts tool arguments, model prose, or result bodies.",
     ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",
     ("post", "/v1/memory/fetch"): "Fetch full records for selected memory IDs. Sensitive fetch behavior is not part of the current public contract.",
-    ("post", "/v1/memory/actions"): "Apply up to 20 memory actions in order. The batch is not transactional and Idempotency-Key is not supported.",
+    ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. A structurally valid batch returns HTTP 200 even when some or all items fail; inspect every result and the applied/skipped/failed counts. The batch is not transactional and Idempotency-Key is not supported.",
     ("post", "/v1/perception/report"): "Submit device context. Sensitive signals must use encrypted envelopes; inspect each results entry even when HTTP status is 200.",
     ("get", "/v1/perception/app_open"): "Legacy iOS Shortcut compatibility endpoint. This GET records an event and therefore has side effects.",
     ("get", "/v1/perception/app_close"): "iOS Shortcut compatibility endpoint for the automation's \"is closed\" trigger. This GET records an event and therefore has side effects.",
@@ -1755,6 +1954,20 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("post", "/v1/memory/actions"): {
+        "200": {
+            "description": (
+                "The structurally valid batch was processed item by item. "
+                "Inspect status, counts, and every results entry; item failures "
+                "do not change the batch HTTP status."
+            ),
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/MemoryActionsResponse"}
+                }
+            },
+        },
+    },
     ("get", "/v1/web/settings"): {
         "200": {
             "description": "Current web-search state for the authenticated user.",
@@ -1836,6 +2049,20 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
             "description": "The account's visible model catalog for this provider.",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ModelApiModelsResponse"}}},
         }
+    },
+    ("post", "/v1/vision/main/test"): {
+        "200": {
+            "description": "Main-model image capability reached a terminal verdict.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/VisionMainTestResponse"}}},
+        },
+        "202": {
+            "description": "A hidden resident image-capability probe is in progress.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/VisionMainTestResponse"}}},
+        },
+        "409": {
+            "description": "The resident must be updated before hidden validation is available.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
+        },
     },
     ("post", "/v1/notify-relay/register"): {
         "200": {

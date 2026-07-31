@@ -38,6 +38,8 @@ from bootstrap import gates as boot_gates
 from chat import consumer as chat_consumer
 from chat import idempotency as chat_idempotency
 from chat import service as chat_service
+from chat import activity_store as chat_activity_store
+from core import chat_activity as chat_activity_projection
 from core import envelope as core_envelope
 from core import wake_bus
 from core.store import UserStore
@@ -47,6 +49,15 @@ from proactive import service as proactive_service
 from push import service as push_service
 
 log = logging.getLogger(__name__)
+
+
+def _ignore_voice_reply(*_args, **_kwargs) -> bool:
+    return False
+
+
+# Assembly injects voice.results.store_reply_for_parent. Keeping the seam here
+# avoids making the foundational chat package depend on the voice feature.
+publish_voice_reply = _ignore_voice_reply
 
 _ENVELOPE_REQUIRED = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
 _FILE_NAME_BIDI_CONTROLS = frozenset(
@@ -161,6 +172,13 @@ def _turn_failure_attribution(error_class: str, payload: dict) -> tuple[str, str
         if raw_blame in notices_core.VALID_BLAME:
             blame = raw_blame
     return blame, user_text
+
+
+def _failure_identity(value, *, limit: int) -> str:
+    """Bound model/provider labels; never derive them from assistant prose."""
+    raw = str(value or "").strip()
+    safe = "".join(ch for ch in raw if ch.isascii() and (ch.isalnum() or ch in "._:/@+-"))
+    return safe[:limit]
 
 
 def _reply_to_message_id(payload: dict) -> str:
@@ -635,6 +653,15 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
     if content_type not in ("text", "image", "file"):
         return {"error": "content_type must be 'text', 'image', or 'file'"}, 400
     file_extra: dict = {}
+    if content_type == "image":
+        # Lazy import mirrors the existing hosted bridge below.
+        from hosted import vision_routing
+
+        vision_route, vision_error = vision_routing.dedicated_route_for_send(store)
+        if vision_error is not None:
+            return vision_error
+        if vision_route is not None:
+            file_extra["vision_route_id"] = str(vision_route.get("id") or "")
     if content_type == "file":
         fname = str(payload.get("file_name") or "").strip()
         fmime = str(payload.get("file_mime") or "").strip()
@@ -942,6 +969,11 @@ def write_response(
     if file_followups and not reply_to_message_id:
         return {"error": "file_followups require reply_to_message_id"}, 400
     if reply_to_message_id and role != "system":
+        resident_activity = chat_activity_projection.project_tool_events(
+            chat_activity_store.resident_activity_rows(store.user_id, reply_to_message_id)
+        )
+        if resident_activity:
+            extra["activity_events"] = resident_activity
         # Persist the parent link on every ordinary reply, not only failures and
         # file cards. Consecutive user messages can arrive before the first reply;
         # the client needs this exact id to show which earlier turn a late text
@@ -964,6 +996,16 @@ def write_response(
             extra["turn_failure_error_class"] = turn_failure_error_class
             extra["turn_failure_blame"] = turn_failure_blame
             extra["turn_failure_user_text"] = turn_failure_user_text
+            failure_model = _failure_identity(
+                payload.get("turn_failure_model"), limit=96
+            )
+            failure_provider = _failure_identity(
+                payload.get("turn_failure_provider"), limit=80
+            )
+            if failure_model:
+                extra["turn_failure_model"] = failure_model
+            if failure_provider:
+                extra["turn_failure_provider"] = failure_provider
         # Build the exact append_chat row immediately before the one-statement
         # parent-CAS + reply-INSERT.  No slow work belongs in this gap: two workers
         # may arrive together, and PostgreSQL decides the sole winner.
@@ -987,6 +1029,10 @@ def write_response(
             replied_fields["reply_error_class"] = turn_failure_error_class
             replied_fields["reply_blame"] = turn_failure_blame
             replied_fields["reply_user_text"] = turn_failure_user_text
+            if failure_model:
+                replied_fields["reply_failure_model"] = failure_model
+            if failure_provider:
+                replied_fields["reply_failure_provider"] = failure_provider
         candidates = [candidate]
         previous_ts = float(candidate["ts"])
         for followup_envelope, followup_extra in file_followups:
@@ -1085,6 +1131,21 @@ def write_response(
         updated = store.update_chat_message_metadata(msg["id"], delivery_fields)
         if updated:
             msg = updated
+    voice_text = (push_body or alert_body).strip()
+    if reply_to_message_id and voice_text:
+        try:
+            publish_voice_reply(
+                store.user_id,
+                parent_message_id=reply_to_message_id,
+                message_id=str(msg.get("id") or ""),
+                text=voice_text,
+            )
+        except Exception as exc:  # noqa: BLE001 — persisted reply remains authoritative
+            log.warning(
+                "[voice.gateway] resident reply publish failed user=%s type=%s",
+                store.user_id,
+                type(exc).__name__,
+            )
     debug_trace.trace_event(
         store,
         subsystem="route",

@@ -189,7 +189,7 @@ def _job(source: str, name: str, next_name: str) -> str:
 
 def test_workflow_consumes_one_pinned_release_without_runner_branch_writes():
     source = WORKFLOW.read_text()
-    assert source.count("./deploy/pin-runtime-release.sh") == 3
+    assert source.count("./deploy/pin-runtime-release.sh") == 6
     assert "git reset --hard origin/" not in source
 
     main_jobs = (
@@ -199,31 +199,38 @@ def test_workflow_consumes_one_pinned_release_without_runner_branch_writes():
     )
     for name, next_name, branch in main_jobs:
         job = _job(source, name, next_name)
-        assert "pinned_sha: ${{ steps.pin.outputs.pinned_sha }}" in job
         assert f"./deploy/pin-runtime-release.sh {branch}" in job
 
     runner_jobs = (
         (
             "deploy-test-runner-cvm",
             "deploy-pre-cvm",
-            "ref: ${{ needs.deploy-test-cvm.outputs.pinned_sha }}",
+            "test",
+            "deploy/docker-compose.phala.test.yaml",
+            "deploy/docker-compose.phala.runner.yaml",
         ),
         (
             "deploy-pre-runner-cvm",
             "deploy-prod-runner-cvm",
-            "ref: ${{ needs.deploy-pre-cvm.outputs.pinned_sha }}",
+            "pre",
+            "deploy/docker-compose.phala.pre.yaml",
+            "deploy/docker-compose.phala.pre.runner.yaml",
         ),
         (
             "deploy-prod-runner-cvm",
             "notify-lark-prod-deploy",
-            "ref: ${{ needs.deploy-cvm.outputs.pinned_sha }}",
+            "main",
+            "deploy/docker-compose.phala.yaml",
+            "deploy/docker-compose.phala.prod.runner.yaml",
         ),
     )
-    for name, next_name, checkout_ref in runner_jobs:
+    for name, next_name, branch, main_compose, runner_compose in runner_jobs:
         job = _job(source, name, next_name)
         permissions = job.split("\n    concurrency:", 1)[0]
         assert "contents: read" in permissions
         assert "contents: write" not in permissions
-        assert checkout_ref in job
+        assert "ref: ${{ needs." not in job
         assert "git push" not in job
-        assert "pin-runtime-release.sh" not in job
+        assert f"./deploy/pin-runtime-release.sh {branch}" in job
+        assert main_compose in job
+        assert runner_compose in job

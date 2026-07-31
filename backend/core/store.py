@@ -489,6 +489,11 @@ class UserStore:
                 # enclave expands them into decrypted memory context on read.
                 "quoted_memory_ids",
                 "image_mime",
+                # Hosted V1 follow-main capability-learning fence. The terminal
+                # reply transaction consumes both fields only for the stable
+                # vision_model_required class; they never alter image routing.
+                "vision_main_route_id",
+                "vision_main_route_updated_at",
                 "file_name",
                 "file_mime",
                 "file_byte_count",
@@ -496,6 +501,9 @@ class UserStore:
                 # only: it identifies a logical send retry but carries no
                 # message content and is not part of the E2EE envelope.
                 "client_msg_id",
+                "include_reasoning",
+                "voice_call_id",
+                "voice_turn_id",
                 "caption_v",
                 "caption_id",
                 "caption_body_ct",
@@ -520,6 +528,11 @@ class UserStore:
                 "thinking_source",
                 "thinking_model",
                 "thinking_native",
+                # Runtime V2 display-safe execution projection. It contains
+                # fixed identifiers/status codes only, never args/results.
+                "activity_turn_id",
+                "activity_job_id",
+                "activity_events",
                 "reply_claimed_by",
                 "reply_claimed_at",
                 "reply_claim_expires_at",
@@ -533,6 +546,8 @@ class UserStore:
                 "turn_failure_error_class",
                 "turn_failure_blame",
                 "turn_failure_user_text",
+                "turn_failure_model",
+                "turn_failure_provider",
                 "terminal_failure_job_id",
                 "reply_to_message_id",
             ):
@@ -543,6 +558,10 @@ class UserStore:
                     msg[key] = value
                 elif key == "file_byte_count" and isinstance(value, int) and value > 0:
                     msg[key] = value
+                elif key == "activity_events" and isinstance(value, list):
+                    msg[key] = [
+                        dict(item) for item in value if isinstance(item, dict)
+                    ][:100]
         return msg
 
     def append_chat(
@@ -671,6 +690,12 @@ class UserStore:
                 # enclave expands them into decrypted memory context on read.
                 "quoted_memory_ids",
                 "image_mime",
+                # Dedicated visual route proven at image-send time. Runtime V2
+                # resolves this exact caller-owned route so a concurrent Settings
+                # change cannot reroute pixels or expose them to the main model.
+                "vision_route_id",
+                "vision_main_route_id",
+                "vision_main_route_updated_at",
                 "file_name",
                 "file_mime",
                 "file_byte_count",
@@ -678,6 +703,9 @@ class UserStore:
                 # only: it identifies a logical send retry but carries no
                 # message content and is not part of the E2EE envelope.
                 "client_msg_id",
+                "include_reasoning",
+                "voice_call_id",
+                "voice_turn_id",
                 "caption_v",
                 "caption_id",
                 "caption_body_ct",
@@ -702,6 +730,9 @@ class UserStore:
                 "thinking_source",
                 "thinking_model",
                 "thinking_native",
+                "activity_turn_id",
+                "activity_job_id",
+                "activity_events",
                 "reply_claimed_by",
                 "reply_claimed_at",
                 "reply_claim_expires_at",
@@ -716,6 +747,8 @@ class UserStore:
                 "turn_failure_error_class",
                 "turn_failure_blame",
                 "turn_failure_user_text",
+                "turn_failure_model",
+                "turn_failure_provider",
                 "terminal_failure_job_id",
             ):
                 value = extra.get(key)
@@ -725,6 +758,10 @@ class UserStore:
                     msg[key] = value
                 elif key == "file_byte_count" and isinstance(value, int) and value > 0:
                     msg[key] = value
+                elif key == "activity_events" and isinstance(value, list):
+                    msg[key] = [
+                        dict(item) for item in value if isinstance(item, dict)
+                    ][:100]
         if resident_reply_to is not None:
             msg["reply_to_message_id"] = str(resident_reply_to)
 
@@ -1089,6 +1126,8 @@ class UserStore:
             # 回合失败冗余持久化（spec 2026-07-18 §2.2）。权威载体是兜底回复消息；
             # 这里是全量 history / 重启后的恢复路径。
             "reply_error_class",
+            "reply_failure_model",
+            "reply_failure_provider",
             "reply_blame",
             "reply_user_text",
         }

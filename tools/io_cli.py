@@ -39,6 +39,12 @@ import urllib.request
 import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend"))
+from memory.source_policy import (  # noqa: E402
+    MEMORY_SOURCE_VALUES,
+    RESIDENT_ABSORB_SOURCE,
+    RESIDENT_PATCH_SOURCE,
+)
+
 try:
     from identity import card_policy as _card_policy  # single source, pure stdlib
 except Exception:
@@ -71,8 +77,29 @@ PERCEPTION_SIGNALS = FAST_SIGNALS + SLOW_SIGNALS + EXTRA_SIGNALS
 # graceful no-op stubs so an agent that tries to call them degrades cleanly.
 PHASE2_VERBS = ("send", "wait-for-wake")
 
+_LAST_TOOL_OUTPUT = None
+
+_MEMORY_BUCKET_CATEGORY = {
+    "工作": "work", "work": "work",
+    "目标与成长": "growth", "goals & growth": "growth",
+    "家庭": "family", "family": "family",
+    "朋友": "friends", "friends": "friends",
+    "宠物": "pets", "pets": "pets",
+    "我们的关系": "relationship", "our relationship": "relationship",
+    "情绪与安抚": "feelings", "feelings & comfort": "feelings",
+    "偏好与边界": "preferences", "preferences & boundaries": "preferences",
+    "个性与价值观": "values", "personality & values": "values",
+    "健康": "health", "health": "health",
+    "爱好": "interests", "interests": "interests",
+    "金钱": "money", "money": "money",
+    "饮食": "food", "food": "food",
+    "地点与旅行": "travel", "places & travel": "travel",
+}
+
 
 def _emit(obj, code=0):
+    global _LAST_TOOL_OUTPUT
+    _LAST_TOOL_OUTPUT = obj
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
     sys.stdout.flush()
     sys.exit(code)
@@ -270,8 +297,94 @@ def _emit_tool_trace(args, exit_code, dur_ms):
                 "actor": "vps_resident",
                 "dur_ms": rounded_ms,
             }},
-            timeout=1.0,
+            timeout=5.0,
         )
+    except Exception:
+        pass
+
+
+def _activity_tool_name(args):
+    verb = str(getattr(args, "verb", "") or "").strip().lower()
+    return verb.replace("-", "_")
+
+
+def _memory_activity_metadata(tool_name, output):
+    if tool_name not in {"memory_index", "memory_search", "memory_fetch"}:
+        return {}
+    if not isinstance(output, dict) or output.get("ok") is not True:
+        return {}
+    items = output.get("items")
+    if not isinstance(items, list):
+        return {}
+    metadata = {"memory_count": len(items)}
+    if not items:
+        return metadata
+    counts = {}
+    order = []
+    for item in items:
+        if not isinstance(item, dict):
+            return metadata
+        category = _MEMORY_BUCKET_CATEGORY.get(
+            str(item.get("bucket") or "").strip().casefold()
+        )
+        if not category:
+            return metadata
+        if category not in counts:
+            order.append(category)
+            counts[category] = 0
+        counts[category] += 1
+    metadata["memory_categories"] = [
+        {"key": category, "count": counts[category]} for category in order
+    ]
+    return metadata
+
+
+def _emit_turn_activity(args, activity_id, state, *, dur_ms=None, exit_code=0):
+    """Best-effort V1 activity event; never sends arguments or result bodies."""
+    try:
+        turn_id = _trace_id()
+        api_url = _env("FEEDLING_API_URL")
+        auth = _auth_headers()
+        if not turn_id or not api_url or not auth:
+            return
+        tool_name = _activity_tool_name(args)
+        if not tool_name:
+            return
+        payload = {
+            "activity_id": activity_id,
+            "call_id": activity_id,
+            "tool_name": tool_name,
+            "state": state,
+        }
+        if dur_ms is not None:
+            payload["duration_ms"] = round(float(dur_ms), 1)
+        if state != "running":
+            payload["result_code"] = "ok" if int(exit_code or 0) == 0 else "tool_error"
+            if int(exit_code or 0) == 0:
+                payload.update(_memory_activity_metadata(tool_name, _LAST_TOOL_OUTPUT))
+        url = (
+            f"{api_url.rstrip('/')}/v1/chat/turn-activity/"
+            f"{urllib.parse.quote(turn_id, safe='')}/events"
+        )
+        # The terminal transition is the durable evidence the completed chat
+        # bubble needs. Test/VPS round trips can legitimately exceed one second,
+        # so give it a bounded retry instead of silently dropping the tool from
+        # the timeline. The running transition stays fire-once to avoid delaying
+        # the tool before its real work begins.
+        attempts = 2 if state != "running" else 1
+        timeout = 5.0 if state != "running" else 2.0
+        for attempt in range(attempts):
+            status, _body = _http_json(
+                "POST",
+                url,
+                auth,
+                payload=payload,
+                timeout=timeout,
+            )
+            if 200 <= int(status or 0) < 300:
+                break
+            if attempt + 1 < attempts:
+                time.sleep(0.15)
     except Exception:
         pass
 
@@ -408,6 +521,18 @@ def cmd_memory_fetch(args):
     ids = list(args.ids)
     if not ids:
         _emit({"ok": False, "error": "memory-fetch needs at least one id"}, 2)
+    placeholder_ids = {
+        "id", "ids", "memory_id", "memory_ids",
+        "<id>", "<ids>", "<memory_id>", "<memory_ids>",
+    }
+    if any(str(memory_id).strip().lower() in placeholder_ids for memory_id in ids):
+        _emit({
+            "ok": False,
+            "error": (
+                "memory-fetch received a placeholder instead of a real card id; "
+                "run memory-index first and pass values from items[].id"
+            ),
+        }, 2)
     payload = {"ids": ids, "limit": args.limit}
     if args.include_archived:
         payload["include_archived"] = True
@@ -554,6 +679,30 @@ def cmd_chat_image(args):
     _emit({"ok": True, "message_id": mid, **(out if isinstance(out, dict) else {"data": out})})
 
 
+def _is_readable_card(body) -> bool:
+    """True when an /v1/identity/get response is usable by the agent.
+
+    ``body_ct`` present means we were handed the sealed envelope — readable only
+    by the key holder, which the agent is not. A ``local_only`` card counts as
+    readable: "the user opted you out" is a real answer the agent must act on,
+    not a failure to retry. An absent card (``identity: null``) is likewise a
+    valid answer — nothing has been written yet.
+
+    ``decrypt_status: "error: …"`` is the enclave's OTHER failure shape: HTTP 200,
+    envelope metadata only, no ciphertext to give it away. Checking for ciphertext
+    alone would pass that through as a card whose every field just happens to be
+    missing.
+    """
+    if not isinstance(body, dict):
+        return False
+    identity = body.get("identity")
+    if identity is None:
+        return "identity" in body
+    if not isinstance(identity, dict) or identity.get("body_ct"):
+        return False
+    return not str(identity.get("decrypt_status") or "").startswith("error")
+
+
 def cmd_identity_read(args):
     """Read the CURRENT identity card (decrypted) so a rewrite builds ON it, not over it.
 
@@ -561,21 +710,38 @@ def cmd_identity_read(args):
     keep the fields the new material doesn't address (部分补全), only change what it
     does. Decrypt source is the enclave's ``GET /v1/identity/get`` (TEE cert the
     stdlib client doesn't verify → insecure=True, mirrors chat-image), falling back
-    to the backend when no enclave is configured."""
+    to the backend when no enclave is configured.
+
+    The backend's same-named endpoint serves the raw E2E envelope on purpose (iOS
+    holds the user key and decrypts locally), so a fallback response is only
+    useful if it actually came back decrypted — hence ``_is_readable_card``. This
+    used to emit ``ok: True`` for an envelope, which made the agent describe its
+    own persona as unreadable encrypted fields AND discarded the enclave's status
+    code, destroying the evidence for why the decrypt path failed."""
     auth = _auth_headers()
     if not auth:
         _emit({"ok": False, "error": "missing auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
     enclave_url = _env("FEEDLING_ENCLAVE_URL")
     status, body = -1, {}
+    enclave_status, enclave_body = None, None
     if enclave_url:
         status, body = _http_json("GET", f"{enclave_url.rstrip('/')}/v1/identity/get", auth, insecure=True)
-    if status != 200 or not (isinstance(body, dict) and isinstance(body.get("identity"), dict)):
-        api_url = _env("FEEDLING_API_URL")
-        if api_url:
-            status, body = _http_json("GET", f"{api_url.rstrip('/')}/v1/identity/get", auth)
-    if status == 200 and isinstance(body, dict):
-        _emit({"ok": True, **body})
-    _emit({"ok": False, "http_status": status, "error": body}, 1)
+        if status == 200 and _is_readable_card(body):
+            _emit({"ok": True, **body})
+        enclave_status, enclave_body = status, body
+    api_url = _env("FEEDLING_API_URL")
+    if api_url:
+        status, body = _http_json("GET", f"{api_url.rstrip('/')}/v1/identity/get", auth)
+        if status == 200 and _is_readable_card(body):
+            _emit({"ok": True, **body})
+    out = {"ok": False, "http_status": status, "error": body}
+    if enclave_status is not None:
+        # Keep the enclave's own failure alongside the fallback's: the fallback
+        # usually "succeeds" with ciphertext, so without this the 503/401 that
+        # actually broke the read is nowhere in the output.
+        out["enclave_status"] = enclave_status
+        out["enclave_error"] = enclave_body
+    _emit(out, 1)
 
 
 # The 9 free-text profile fields (spec 3.1). Namespace attribute name == patch
@@ -1161,13 +1327,16 @@ def _memory_write_payload(*, summary, content, bucket, threads, importance, puls
     content = str(content or "").strip()
     if not summary and not content:
         return None
+    source = str(source or RESIDENT_ABSORB_SOURCE).strip()
+    if source not in MEMORY_SOURCE_VALUES:
+        raise ValueError(f"memory source is not allowed: {source!r}")
     memory = {
         "type": (mem_type or "fact").strip().lower(),
         "summary": summary or content[:180],
         "title": summary or content[:180],
         "content": content or summary,
         "description": content or summary,
-        "source": (source or "resident_absorb").strip()[:80],
+        "source": source,
     }
     if bucket:
         memory["bucket"] = str(bucket).strip()
@@ -1217,13 +1386,16 @@ def _memory_patch_payload(*, memory_id, summary, content, bucket, threads, impor
     content = str(content or "").strip()
     if not summary and not content:
         return None
+    source = str(source or RESIDENT_PATCH_SOURCE).strip()
+    if source not in MEMORY_SOURCE_VALUES:
+        raise ValueError(f"memory source is not allowed: {source!r}")
     memory = {
         "type": (mem_type or "fact").strip().lower(),
         "summary": summary or content[:180],
         "title": summary or content[:180],
         "content": content or summary,
         "description": content or summary,
-        "source": (source or "resident_patch").strip()[:80],
+        "source": source,
     }
     if bucket:
         memory["bucket"] = str(bucket).strip()
@@ -1445,6 +1617,7 @@ def cmd_phase2(args):
 
 
 def main():
+    global _LAST_TOOL_OUTPUT
     p = argparse.ArgumentParser(
         prog="io_cli",
         description="Feedling resident-agent tool client. Outputs JSON.",
@@ -1689,7 +1862,12 @@ def main():
     mw.add_argument("--importance", type=float, default=None, help="0-1")
     mw.add_argument("--pulse", type=float, default=None, help="0-1")
     mw.add_argument("--type", default="fact", help="fact|event|quote|moment")
-    mw.add_argument("--source", default="resident_absorb", help="source label (e.g. resident_absorb)")
+    mw.add_argument(
+        "--source",
+        choices=sorted(MEMORY_SOURCE_VALUES),
+        default=RESIDENT_ABSORB_SOURCE,
+        help="closed provenance value (default: resident_absorb)",
+    )
     mw.set_defaults(func=cmd_memory_write)
 
     md = sub.add_parser(
@@ -1716,7 +1894,12 @@ def main():
     mp.add_argument("--importance", type=float, default=None, help="0-1 (else inherits)")
     mp.add_argument("--pulse", type=float, default=None, help="0-1 (else inherits)")
     mp.add_argument("--type", default="fact", help="fact|event|quote|moment")
-    mp.add_argument("--source", default="resident_patch", help="source label (e.g. resident_patch)")
+    mp.add_argument(
+        "--source",
+        choices=sorted(MEMORY_SOURCE_VALUES),
+        default=RESIDENT_PATCH_SOURCE,
+        help="closed provenance value (default: resident_patch)",
+    )
     mp.add_argument("--reason", default=None, help="why (optional, audit trail)")
     mp.set_defaults(func=cmd_memory_patch)
     ov = sub.add_parser("onboarding-validate",
@@ -1758,8 +1941,11 @@ def main():
         sp.set_defaults(func=cmd_phase2)
 
     args = p.parse_args()
+    _LAST_TOOL_OUTPUT = None
     started = time.monotonic()
+    activity_id = f"v1:{uuid.uuid4().hex}"
     exit_code = 0
+    _emit_turn_activity(args, activity_id, "running")
     try:
         args.func(args)
     except SystemExit as e:
@@ -1769,7 +1955,15 @@ def main():
         exit_code = 1
         raise
     finally:
-        _emit_tool_trace(args, exit_code, (time.monotonic() - started) * 1000)
+        duration_ms = (time.monotonic() - started) * 1000
+        _emit_turn_activity(
+            args,
+            activity_id,
+            "success" if int(exit_code or 0) == 0 else "failure",
+            dur_ms=duration_ms,
+            exit_code=exit_code,
+        )
+        _emit_tool_trace(args, exit_code, duration_ms)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import re
+import unicodedata
 import uuid
 
 
@@ -14,8 +15,90 @@ from core import enclave as core_enclave
 from core import envelope as core_envelope
 from core import util as core_util
 from identity import service as identity_service
+from memory import card_guard
 from memory import service as memory_service
 from memory.prompts_v1 import normalize_bucket_language
+from memory.source_policy import (
+    MEMORY_CAPTURE_MODE_VALUES,
+    MEMORY_SOURCE_VALUES,
+)
+
+
+def _memory_action_metadata_error(action: dict) -> dict | None:
+    """Reject invented enum values instead of persisting/model-normalizing them."""
+    holders = [action]
+    if isinstance(action.get("memory"), dict):
+        holders.append(action["memory"])
+    if isinstance(action.get("patch"), dict):
+        holders.append(action["patch"])
+    if isinstance(action.get("envelope"), dict):
+        holders.append(action["envelope"])
+    for holder in holders:
+        if "source" not in holder:
+            continue
+        source = str(holder.get("source") or "").strip()
+        if source not in MEMORY_SOURCE_VALUES:
+            return {
+                "error": "source_invalid",
+                "got": source,
+                "allowed": sorted(MEMORY_SOURCE_VALUES),
+            }
+    if "capture_mode" in action:
+        capture_mode = str(action.get("capture_mode") or "").strip()
+        if capture_mode not in MEMORY_CAPTURE_MODE_VALUES:
+            return {
+                "error": "capture_mode_invalid",
+                "got": capture_mode,
+                "allowed": sorted(MEMORY_CAPTURE_MODE_VALUES),
+            }
+    return None
+
+
+def _memory_normalized_identity(inner: dict | None) -> tuple[str, str]:
+    if not isinstance(inner, dict):
+        return "", ""
+
+    def normalize(value) -> str:
+        text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+        return " ".join(text.split())
+
+    title = normalize(
+        inner.get("summary") or inner.get("title") or inner.get("description")
+    )
+    content = normalize(inner.get("content") or inner.get("description"))
+    return title, content
+
+
+def _memory_active_duplicate(
+    moments: list,
+    inner: dict,
+    api_key: str | None,
+    *,
+    runtime_token: str = "",
+) -> dict | None:
+    identity = _memory_normalized_identity(inner)
+    if not all(identity):
+        return None
+    for moment in memory_service._active_memory_moments(moments):
+        if moment.get("visibility") == "local_only":
+            continue
+        existing_inner, _err = _memory_plain_from_envelope(
+            moment, api_key, runtime_token=runtime_token
+        )
+        if existing_inner is not None and _memory_normalized_identity(existing_inner) == identity:
+            return moment
+    return None
+
+
+def _memory_duplicate_result(duplicate: dict) -> tuple[dict, list[dict], int]:
+    return {
+        "status": "ok",
+        "action": "memory.add",
+        "noop": True,
+        "skipped": "duplicate_active",
+        "duplicate_of": str(duplicate.get("id") or ""),
+    }, [], 200
+
 
 def _memory_action_text(value, max_chars: int) -> str:
     text = str(value or "").strip()
@@ -131,10 +214,22 @@ def _memory_inner_from_action(data: dict) -> dict:
         threads.extend(linked)
     content = _memory_content_from_action(data, summary)
     bucket = _memory_action_text(data.get("bucket") or _memory_default_bucket(data.get("type")), 80)
+    if card_guard.guard_enabled():
+        # 桶里混进模型原始输出/机器分类残片(harmony 标记、已知 taxonomy 串等)→ 降级到按卡片
+        # 语言的默认桶。硬字段(summary/content)的泄漏由各 action 函数在这之前打回 400。
+        # add/upgrade 走这条;supersede 的脏桶在合并前已被剔除,这里看到的是继承来的干净桶。
+        # ⚠️ 语言判定用【原始】summary/content(不是合成 content —— 后者带中文「记忆:」标签,
+        # 会把纯英文卡误判成中文,codex code_review Minor)。
+        if card_guard.bucket_pollution_reason(bucket):
+            raw_text = f"{summary}\n{str(data.get('content') or data.get('description') or '')}"
+            bucket = card_guard.default_bucket_for_text(raw_text)
+        # threads 也是用户可见软字段,同样可能承载残片(proactive/genesis/继承旧卡的 threads
+        # 都过这里);逐项滤脏、留净(codex code_review Important:此前只 guard 了 bucket)。
+        threads = [t for t in threads if not card_guard.field_pollution_reason(t)]
     # Backstop: the model still labels a Chinese card with an English common bucket (and
-    # vice versa) despite the guidance. Map it back to the card's own language here — the
-    # single chokepoint every write path funnels through — so no path can leak an
-    # off-language common bucket. Custom buckets pass through unchanged.
+    # vice versa) despite the guidance. Map it back to the card's own language here.
+    # ⚠️ 注意:这并非「所有写入路径的唯一关口」—— capture/dream/migrate/history-import 等
+    # 后台路径提前封信封、绕过本函数(见 card_text/各 pre-seal 点的同源 guard)。
     bucket = normalize_bucket_language(bucket, f"{summary}\n{content}")
     return {
         "summary": summary,
@@ -315,9 +410,17 @@ def _memory_action_effect(action: str, memory_id: str, fields: list[str] | None 
     }
 
 
-def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
+def _memory_add_action(
+    store: UserStore,
+    action: dict,
+    *,
+    api_key: str | None = None,
+    runtime_token: str = "",
+) -> tuple[dict, list[dict], int]:
     if isinstance(action.get("envelope"), dict):
-        return _memory_add_envelope_action(store, action)
+        return _memory_add_envelope_action(
+            store, action, api_key=api_key, runtime_token=runtime_token
+        )
 
     raw = action.get("memory") if isinstance(action.get("memory"), dict) else action
     mem_type = str(raw.get("type") or "fact").strip().lower()
@@ -328,6 +431,14 @@ def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict]
         return {"status": "error", "error": "title_required", "action": "memory.add"}, [], 400
     if not description and mem_type not in {"quote", "event"}:
         return {"status": "error", "error": "description_required", "action": "memory.add"}, [], 400
+    if card_guard.guard_enabled() and (
+        card_guard.hard_field_pollution_reason(summary)
+        or card_guard.hard_field_pollution_reason(_memory_content_from_action(raw, summary))
+    ):
+        # 硬字段混进模型原始输出/协议残片 → 整卡不落(桶脏由 _memory_inner 降级,不到这里)。
+        # 查的是【真正会被存的 content】(_memory_content_from_action 优先取 content 字段),
+        # 不是 description —— 污染常在 content 里。硬字段用从严判据(强证据/≥2弱)防误杀。
+        return {"status": "error", "error": "memory_card_polluted", "action": "memory.add"}, [], 400
     anchor_ids = raw.get("anchor_memory_ids") or action.get("anchor_memory_ids") or []
     if not isinstance(anchor_ids, list):
         return {"status": "error", "error": "anchor_memory_ids_must_be_list", "action": "memory.add"}, [], 400
@@ -351,6 +462,11 @@ def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict]
     # validation only) so a concurrent same-user write can't lost-update.
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
+        duplicate = _memory_active_duplicate(
+            moments, inner, api_key, runtime_token=runtime_token
+        )
+        if duplicate is not None:
+            return _memory_duplicate_result(duplicate)
         moments.append(moment)
         memory_service._save_moments(store, moments)
     boot_gates._log_bootstrap_event(store, "memory_action_added_v1", success=True)
@@ -372,7 +488,13 @@ def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict]
     }, [effect], 201
 
 
-def _memory_add_envelope_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
+def _memory_add_envelope_action(
+    store: UserStore,
+    action: dict,
+    *,
+    api_key: str | None = None,
+    runtime_token: str = "",
+) -> tuple[dict, list[dict], int]:
     envelope = dict(action.get("envelope") or {})
     moments = memory_service._load_moments(store)
     ok, err = _memory_validate_prebuilt_envelope(
@@ -384,9 +506,26 @@ def _memory_add_envelope_action(store: UserStore, action: dict) -> tuple[dict, l
     if not ok:
         return {"status": "error", **(err or {}), "action": "memory.add"}, [], 400
 
+    incoming_inner = None
+    if api_key or runtime_token:
+        incoming_inner, incoming_err = _memory_plain_from_envelope(
+            envelope, api_key, runtime_token=runtime_token
+        )
+        if incoming_inner is None:
+            return {
+                "status": "error",
+                "error": incoming_err or "memory_plaintext_unavailable",
+                "action": "memory.add",
+            }, [], 409
     moment = _memory_record_from_prebuilt_envelope(store, envelope)
     with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
+        if incoming_inner is not None:
+            duplicate = _memory_active_duplicate(
+                moments, incoming_inner, api_key, runtime_token=runtime_token
+            )
+            if duplicate is not None:
+                return _memory_duplicate_result(duplicate)
         moments.append(moment)
         memory_service._save_moments(store, moments)
     boot_gates._log_bootstrap_event(store, "memory_action_added_envelope_v1", success=True)
@@ -502,6 +641,11 @@ def _memory_upgrade_action(store: UserStore, api_key: str | None, action: dict) 
     inner = _memory_inner_from_action(v1)
     if not inner.get("summary"):
         return {"status": "error", "error": "summary_required", "action": "memory.upgrade"}, [], 400
+    if card_guard.guard_enabled() and (
+        card_guard.hard_field_pollution_reason(inner.get("summary"))
+        or card_guard.hard_field_pollution_reason(inner.get("content"))
+    ):
+        return {"status": "error", "error": "memory_card_polluted", "action": "memory.upgrade"}, [], 400
     old_body_hash = _memory_action_text(action.get("old_body_hash"), 80)
     envelope, env_err = _build_memory_envelope_for_store(store, inner, item_id=memory_id)
     if envelope is None:
@@ -616,6 +760,24 @@ def _memory_supersede_action(
         return {"status": "error", "error": "title_required", "action": "memory.supersede"}, [], 400
     if not description and mem_type not in {"quote", "event"}:
         return {"status": "error", "error": "description_required", "action": "memory.supersede"}, [], 400
+    if card_guard.guard_enabled():
+        if card_guard.hard_field_pollution_reason(summary) or card_guard.hard_field_pollution_reason(
+            _memory_content_from_action(raw, summary)
+        ):
+            # 硬字段脏 → 整个 supersede 打回,旧卡保持 active(此处 return 在退休旧卡之前)。
+            # 查真正会存的 content(不是 description),污染常在 content 里。
+            return {"status": "error", "error": "memory_card_polluted", "action": "memory.supersede"}, [], 400
+        if card_guard.bucket_pollution_reason(str(raw.get("bucket") or "")):
+            # 脏桶视为「模型没给桶」→ 从 raw 剔除,让下面的合并继承旧卡的桶,而不是用残片覆盖。
+            raw = {k: v for k, v in raw.items() if k != "bucket"}
+        _raw_threads = raw.get("threads")
+        if isinstance(_raw_threads, list):
+            _clean_threads = [t for t in _raw_threads if not card_guard.field_pollution_reason(str(t or ""))]
+            if not _clean_threads and _raw_threads:
+                # 所给 threads 全是残片 → 视为未提供 → 继承旧卡 threads(与脏桶同待遇,行为显式)。
+                raw = {k: v for k, v in raw.items() if k != "threads"}
+            elif len(_clean_threads) != len(_raw_threads):
+                raw = {**raw, "threads": _clean_threads}
 
     anchor_ids = raw.get("anchor_memory_ids") or action.get("anchor_memory_ids") or []
     if not isinstance(anchor_ids, list):
@@ -841,11 +1003,19 @@ def _execute_memory_action(
 ) -> tuple[dict, list[dict], int]:
     if not isinstance(action, dict):
         return {"status": "error", "error": "action_must_be_object"}, [], 400
+    metadata_error = _memory_action_metadata_error(action)
+    if metadata_error:
+        return {"status": "error", **metadata_error}, [], 400
     action_type = str(action.get("type") or action.get("action") or "").strip()
     if action_type in {"memory.create", "memory.add", "memory.add_correction"}:
         normalized = dict(action)
         normalized["type"] = "memory.add"
-        return _memory_add_action(store, normalized)
+        return _memory_add_action(
+            store,
+            normalized,
+            api_key=api_key,
+            runtime_token=runtime_token,
+        )
     if action_type in {"memory.patch", "memory.content_patch"}:
         target = action.get("target") if isinstance(action.get("target"), dict) else {}
         memory_id = _memory_action_text(
@@ -895,19 +1065,59 @@ def _execute_memory_actions(
     runtime_token: str = "",
 ) -> tuple[dict, int]:
     if not isinstance(actions, list) or not actions:
-        return {"status": "error", "error": "actions_required", "results": [], "effects": []}, 400
+        return {
+            "status": "error",
+            "error": "actions_required",
+            "results": [],
+            "effects": [],
+            "total_count": 0,
+            "applied_count": 0,
+            "skipped_count": 0,
+            "failed_count": 0,
+        }, 400
     results: list[dict] = []
     effects: list[dict] = []
+    applied_count = 0
+    skipped_count = 0
+    failed_count = 0
     for action in actions[:20]:
+        if not isinstance(action, dict):
+            results.append({
+                "status": "error",
+                "error": "memory_action_invalid",
+                "http_status": 400,
+            })
+            failed_count += 1
+            continue
         result, action_effects, status = _execute_memory_action(
             store, api_key, action, runtime_token=runtime_token)
-        results.append(result)
-        effects.extend(action_effects)
+        item = dict(result) if isinstance(result, dict) else {
+            "status": "error",
+            "error": "memory_action_result_invalid",
+        }
+        item["http_status"] = int(status)
         if status >= 400:
-            return {
-                "status": "error",
-                "error": result.get("error", "memory_action_failed"),
-                "results": results,
-                "effects": effects,
-            }, status
-    return {"status": "ok", "results": results, "effects": effects}, 200
+            failed_count += 1
+        else:
+            effects.extend(action_effects)
+            if item.get("noop") or item.get("skipped"):
+                skipped_count += 1
+            else:
+                applied_count += 1
+        results.append(item)
+    total_count = len(results)
+    if failed_count == 0:
+        batch_status = "ok"
+    elif failed_count == total_count:
+        batch_status = "failed"
+    else:
+        batch_status = "partial"
+    return {
+        "status": batch_status,
+        "results": results,
+        "effects": effects,
+        "total_count": total_count,
+        "applied_count": applied_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+    }, 200

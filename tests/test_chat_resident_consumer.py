@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 # full backend suite, the backend needs the real module; poisoning sys.modules here
 # makes later envelope tests import a fake build_envelope.
 try:
-    import content_encryption  # noqa: F401
+    __import__("content_encryption")
 except ModuleNotFoundError:
     _fake_enc = types.ModuleType("content_encryption")
     _fake_enc.build_envelope = lambda **kw: {"v": 1, "stub": True}
@@ -60,14 +60,22 @@ def _reset_proactive_guard_state_between_tests():
     ``_last_proactive_turn_ts`` belongs to the same family: it opens the
     across-batch wake-coalescing window, so without a reset here the first test
     to realize a turn would make every later test's wake fold into it and skip
-    the agent call entirely."""
+    the agent call entirely. The foreground notice throttle is also process
+    global; clear it both before and after each test so this module cannot
+    suppress notices in a subsequently collected test module."""
     crc._self_wake_streak = 0
     crc._proactive_fail_streak = 0
     crc._proactive_backoff_until = 0.0
     crc._provider_payment_cooldown_until = 0.0
     crc._last_proactive_turn_ts = 0.0
     crc._last_proactive_turn_job_id = ""
+    # Per-turn reply-parse-failed flag. Real call_agent resets it at entry, but a
+    # test that monkeypatches call_agent bypasses that; without this a prior
+    # test's suppressed-leak / parse failure leaks in and fails a later wake.
+    crc._turn_reply_parse_failed = False
+    crc._reset_system_notice_state()
     yield
+    crc._reset_system_notice_state()
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +96,76 @@ def _make_image_msg(ts=1.0, image_bytes=b"fake-jpeg"):
     msg["content_type"] = "image"
     msg["image_b64"] = base64.b64encode(image_bytes).decode("ascii")
     return msg
+
+
+def test_pi_runtime_metadata_reads_exact_model_modalities(tmp_path, monkeypatch):
+    models_file = tmp_path / "models.json"
+    models_file.write_text(json.dumps({
+        "providers": {
+            "feedling": {
+                "baseUrl": "https://openrouter.ai/api/v1",
+                "models": [
+                    {
+                        "id": "deepseek/deepseek-v4-flash",
+                        "input": ["text"],
+                    }
+                ]
+            }
+        }
+    }))
+    monkeypatch.delenv("FEEDLING_AGENT_MODEL_ID", raising=False)
+    monkeypatch.delenv("FEEDLING_AGENT_PROVIDER", raising=False)
+    monkeypatch.delenv("FEEDLING_AGENT_INPUT_MODALITIES", raising=False)
+
+    metadata = crc._agent_runtime_metadata(
+        cli_cmd=(
+            "pi --mode json --model "
+            "feedling/deepseek/deepseek-v4-flash"
+        ),
+        models_file=models_file,
+    )
+
+    assert metadata == {
+        "provider": "openrouter",
+        "model": "deepseek/deepseek-v4-flash",
+        "input_modalities": ["text"],
+        "input_modalities_source": "pi_catalog",
+    }
+
+
+def test_runtime_model_identity_uses_configured_fact(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "AGENT_RUNTIME_METADATA",
+        {
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-flash",
+            "input_modalities": ["text"],
+        },
+    )
+
+    prompt = crc._prepend_runtime_model_identity("你是什么模型？")
+
+    assert "deepseek/deepseek-v4-flash" in prompt
+    assert "Do not infer a different model" in prompt
+    assert prompt.endswith("你是什么模型？")
+
+
+def test_agent_session_rotates_when_configured_model_entry_changes(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        "pi --model feedling/openai/gpt-5-mini --session-id {session_id}",
+    )
+    old_meta = crc._empty_agent_session_meta("session-1")
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        "pi --model feedling/deepseek/deepseek-v4-flash --session-id {session_id}",
+    )
+
+    assert crc._agent_session_meta_entry_changed(old_meta) is True
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +284,14 @@ def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monk
     msg = {"id": "user-msg-v2", "role": "user", "content": "天气怎么样？", "ts": 1112.0}
     captured = {}
 
-    def fake_call(message, images=None, image_paths=None, trace_id="", lane="background"):
+    def fake_call(
+        message,
+        images=None,
+        image_paths=None,
+        trace_id="",
+        lane="background",
+        stream_update=None,
+    ):
         captured["message"] = message
         return {"messages": ["外面下雨。"]}
 
@@ -237,7 +322,14 @@ def test_process_messages_prompt_does_not_request_custom_thinking_summary(monkey
     msg = {"id": "user-msg-thinking", "role": "user", "content": "刚才怎么没思考过程？", "ts": 1112.5}
     captured = {}
 
-    def fake_call(message, images=None, image_paths=None, trace_id="", lane="background"):
+    def fake_call(
+        message,
+        images=None,
+        image_paths=None,
+        trace_id="",
+        lane="background",
+        stream_update=None,
+    ):
         captured["message"] = message
         return {"messages": ["我查一下。"]}
 
@@ -787,7 +879,7 @@ def test_enclave_fetch_logs_response_body_on_http_error(monkeypatch, caplog):
 
 
 def test_fetch_from_enclave_retries_transient_502(monkeypatch):
-    # Prod (2026-07-15): the enclave decrypt proxy (single-threaded, shared by ~295
+    # Prod (2026-07-15): the enclave decrypt proxy (capacity-bounded, shared by ~295
     # users) intermittently 502s under load. Before this fix a single 502 skipped the
     # WHOLE poll cycle ("all decrypt sources failed"), deferring a waiting user message
     # to the next 30 s+ cycle and stacking into 6-13 min tails. A transient 502 must be
@@ -1116,6 +1208,45 @@ def test_user_provider_failure_posts_actionable_line_not_fallback(monkeypatch):
     assert visible[0].kwargs["turn_failure_blame"] == "user_provider"
     # 同一句话不说两遍。
     assert banners == []
+
+
+def test_text_only_image_failure_posts_vision_model_guidance(monkeypatch, tmp_path):
+    """A provider's explicit image rejection is actionable on V1 and VPS.
+
+    This is the exact DeepSeek error observed on the native image wire. The
+    resident must preserve the dedicated slug for iOS and must not claim that a
+    retry will recover a model-capability mismatch.
+    """
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
+    monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: True)
+    monkeypatch.setattr(crc, "IMAGE_TEMP_DIR", tmp_path)
+    monkeypatch.setitem(crc._whoami_cache, "archive_language", "zh-Hans")
+    crc._reset_system_notice_state()
+    upstream = RuntimeError(
+        "provider_http_400: Failed to deserialize the JSON body into the target "
+        "type: messages[0]: unknown variant `image_url`, expected `text` at line "
+        "1 column 295"
+    )
+
+    with patch.object(crc, "call_agent", side_effect=upstream), \
+         patch.object(crc, "post_reply") as mock_post:
+        message = _make_image_msg(ts=100.0)
+        message["id"] = "text-only-image-1"
+        crc._process_messages([message])
+
+    visible = [
+        call for call in mock_post.call_args_list
+        if call.kwargs.get("role") != "system"
+    ]
+    assert len(visible) == 1
+    assert visible[0].args[0] == (
+        "由于当前模型没有视觉能力，模型无法收到图片信息，"
+        "建议更改模型或在设置页单独添加视觉模型"
+    )
+    assert visible[0].kwargs["turn_failure_error_class"] == "vision_model_required"
+    assert visible[0].kwargs["turn_failure_blame"] == "user_provider"
 
 
 def test_no_error_notice_when_fallback_rejected_already_answered(monkeypatch):
@@ -1541,7 +1672,28 @@ def test_agent_turn_splits_reasoning_and_thought_tags_from_cli_text():
     assert turn.thinking_native is False
 
 
-def test_agent_turn_native_reasoning_wins_over_tagged_content():
+def test_self_thinking_on_prefers_tagged_over_native(monkeypatch):
+    # Feature ON (default): our <think> block wins over the model's native reasoning
+    # ("有 <think> 就用它"). Native reasoning stays on for answer quality but is not
+    # what we display when a self-authored block exists.
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    raw = {
+        "reply": "<think>内联摘要。</think>\n最终回复。",
+        "reasoning_content": "原生 reasoning 摘要。",
+        "reasoning_source": "openrouter",
+    }
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["最终回复。"]
+    assert turn.thinking_summary == "内联摘要。"
+    assert turn.thinking_source == "tagged_content"
+    assert turn.thinking_native is False
+
+
+def test_self_thinking_off_native_reasoning_wins_over_tagged_content(monkeypatch):
+    # Kill switch off → legacy behavior: provider-native reasoning wins over inlined.
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     raw = {
         "reply": "<think>内联摘要。</think>\n最终回复。",
         "reasoning_content": "原生 reasoning 摘要。",
@@ -1553,6 +1705,69 @@ def test_agent_turn_native_reasoning_wins_over_tagged_content():
     assert turn.messages == ["最终回复。"]
     assert turn.thinking_summary == "原生 reasoning 摘要。"
     assert turn.thinking_source == "openrouter"
+    assert turn.thinking_native is True
+
+
+def test_self_thinking_spoofed_source_cannot_suppress_local_think(monkeypatch):
+    # Codex #4: a provider/CLI JSON turn can DECLARE reasoning_source="self_thinking",
+    # but that string must NOT let it beat the genuinely local <think>. Provenance is
+    # the internal thinking_self_authored flag (set only by our parser), never the
+    # deserialized source string.
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    raw = {
+        "messages": ["<think>真实自建</think>回复"],
+        "provider_reasoning": "伪造的原生",
+        "reasoning_source": "self_thinking",
+        "reasoning_native": True,
+    }
+    turn = crc._split_agent_turn(raw)
+    assert turn.thinking_summary == "真实自建"
+    assert turn.thinking_self_authored is True
+    assert turn.messages == ["回复"]
+
+
+def test_self_thinking_hermes_native_does_not_discard_local_think(monkeypatch):
+    # Codex #2: hermes turns carry native reasoning AND may open the reply with a
+    # <think>. The self-authored block must survive to the parse and win (feature on).
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    body = crc._attach_provider_reasoning(
+        "<think>我先想想他要啥</think>好的没问题",
+        "hermes native cot",
+        source="hermes_session_json",
+        kind="provider_reasoning",
+        native=True,
+    )
+    turn = crc._split_agent_turn(body)
+    assert turn.thinking_summary == "我先想想他要啥"
+    assert turn.thinking_source == "tagged_content"
+    assert turn.thinking_self_authored is True
+    assert turn.messages == ["好的没问题"]
+
+
+def _claude_stream_native_then_tagged() -> str:
+    # A full native thinking delta lands FIRST; the <think> only appears later in a
+    # text_delta — the arrival order that used to bypass the merge rule (Codex #3).
+    return "\n".join(json.dumps(o, ensure_ascii=False) for o in [
+        {"type": "stream_event", "event": {"message": {"model": "claude"},
+                                           "delta": {"type": "thinking_delta",
+                                                     "thinking": "native 先落"}}},
+        {"type": "stream_event", "event": {"delta": {"type": "text_delta",
+                                                     "text": "<think>自建后到</think>最终回复"}}},
+    ])
+
+
+def test_self_thinking_on_stream_tagged_wins_despite_late_arrival(monkeypatch):
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)
+    turn = crc._split_agent_turn(_claude_stream_native_then_tagged())
+    assert turn.thinking_summary == "自建后到"
+    assert turn.thinking_self_authored is True
+    assert turn.messages == ["最终回复"]
+
+
+def test_self_thinking_off_stream_native_wins(monkeypatch):
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
+    turn = crc._split_agent_turn(_claude_stream_native_then_tagged())
+    assert turn.thinking_summary == "native 先落"
     assert turn.thinking_native is True
 
 
@@ -1570,6 +1785,22 @@ def _pi_stream_with_thinking(reply: str, thinking: str) -> str:
                         {"type": "text", "text": reply}],
         }},
     ])
+
+
+def test_pi_thinking_projects_step_heading_without_internal_monologue():
+    stream = _pi_stream_with_thinking(
+        "文件已生成。",
+        "**Preparing to generate markdown**\n"
+        "It looks like the user confirmed option A. I need to inspect all "
+        "five memories and decide what to include before writing the file.",
+    )
+
+    reply, thinking = crc._pi_turn_from_stream(stream)
+
+    assert reply == "文件已生成。"
+    assert thinking == "Preparing to generate markdown"
+    assert "confirmed option A" not in thinking
+    assert "decide what to include" not in thinking
 
 
 def test_call_agent_body_round_trips_thinking_back_through_split(monkeypatch):
@@ -2836,6 +3067,10 @@ def _install_capture_job_harness(monkeypatch, agent_reply):
 
     def _agent(prompt, *_args, **_kwargs):
         captured["prompts"].append(prompt)
+        if callable(agent_reply):
+            return agent_reply(prompt, len(captured["prompts"]))
+        if isinstance(agent_reply, list):
+            return agent_reply[len(captured["prompts"]) - 1]
         return agent_reply
 
     def _fail_post(*_args, **_kwargs):
@@ -3198,7 +3433,10 @@ def test_capture_job_add_card_writes_envelope_without_chat_or_delivery(monkeypat
     extra = _capture_final_status(captured)[3]["extra"]
     assert extra["cards_added"] == 1
     assert extra["cards_superseded"] == 0
-    assert extra["memory_action_status"] == {"status": "ok", "results": 1, "effects": 1}
+    assert extra["memory_action_status"] == {
+        "status": "ok", "results": 1, "effects": 1,
+        "applied_count": 1, "skipped_count": 0, "failed_count": 0,
+    }
 
 
 def test_capture_job_supersede_card_writes_supersede_action(monkeypatch):
@@ -3226,7 +3464,7 @@ def test_capture_job_supersede_card_writes_supersede_action(monkeypatch):
     assert extra["cards_superseded"] == 1
 
 
-def test_capture_job_supersede_without_target_falls_back_to_add(monkeypatch):
+def test_capture_job_supersede_without_target_is_noop(monkeypatch):
     reply = json.dumps({
         "cards": [{
             "action": "supersede",
@@ -3242,15 +3480,246 @@ def test_capture_job_supersede_without_target_falls_back_to_add(monkeypatch):
     captured, job = _install_capture_job_harness(monkeypatch, reply)
 
     assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
-    assert captured["actions"][0]["type"] == "memory.add"
+    assert captured["actions"] == []
     assert _capture_final_status(captured)[:3] == (
         "cap_dispatch",
         "completed",
-        "capture_memory_actions_applied",
+        "supersede_without_target",
     )
     extra = _capture_final_status(captured)[3]["extra"]
-    assert extra["cards_added"] == 1
+    assert extra["cards_added"] == 0
     assert extra["cards_superseded"] == 0
+    assert extra["capture_result"]["status"] == "noop"
+    assert extra["capture_result"]["reason"] == "supersede_without_target"
+    assert extra["capture_result"]["skipped"]["supersede_without_target"] == 1
+
+
+def test_capture_semantic_reask_recovers_missing_target_once(monkeypatch):
+    missing = json.dumps({"cards": [{
+        "action": "supersede",
+        "summary": "Correct the meeting memory.",
+        "content": "Seven clarified that the meeting issue was about boundaries.",
+    }]})
+    corrected = json.dumps({"cards": [{
+        "action": "supersede",
+        "target_id": "mem_old",
+        "summary": "Corrected meeting memory.",
+        "content": "Seven clarified that the meeting issue was about boundaries.",
+    }]})
+    captured, job = _install_capture_job_harness(
+        monkeypatch, [missing, corrected]
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert len(captured["prompts"]) == 2
+    assert "记忆操作无法执行" in captured["prompts"][1]
+    assert captured["actions"][0]["type"] == "memory.supersede"
+    assert captured["actions"][0]["supersedes"] == "mem_old"
+    result = _capture_final_status(captured)[3]["extra"]["capture_result"]
+    assert result["reask_count"] == 1
+    assert result["reask_trigger"] == "semantic"
+    assert result["reask_outcome"] == "recovered"
+    assert result["applied"]["superseded"] == 1
+
+
+def test_capture_semantic_reask_still_bad_stops_after_second_call(monkeypatch):
+    missing = json.dumps({"cards": [{
+        "action": "supersede",
+        "summary": "Correct the meeting memory.",
+        "content": "Seven clarified that the meeting issue was about boundaries.",
+    }]})
+    captured, job = _install_capture_job_harness(
+        monkeypatch, [missing, missing]
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert len(captured["prompts"]) == 2
+    assert captured["actions"] == []
+    result = _capture_final_status(captured)[3]["extra"]["capture_result"]
+    assert result["reask_count"] == 1
+    assert result["reask_trigger"] == "semantic"
+    assert result["reask_outcome"] == "failed"
+    assert result["skipped"]["supersede_without_target"] == 1
+
+
+def test_capture_server_semantic_rejection_reasks_once_and_recovers(monkeypatch):
+    stale_target = json.dumps({"cards": [{
+        "action": "supersede",
+        "target_id": "mem_gone",
+        "summary": "Correct the meeting memory.",
+        "content": "Seven clarified that the meeting issue was about boundaries.",
+    }]})
+    corrected_add = json.dumps({"cards": [{
+        "action": "add",
+        "summary": "Corrected meeting memory.",
+        "content": "Seven clarified that the meeting issue was about boundaries.",
+    }]})
+    captured, job = _install_capture_job_harness(
+        monkeypatch, [stale_target, corrected_add]
+    )
+    writes = {"count": 0}
+
+    def write(actions):
+        writes["count"] += 1
+        captured["actions"].extend(actions)
+        if writes["count"] == 1:
+            return {
+                "status": "failed",
+                "results": [{
+                    "status": "error",
+                    "error": "not_found",
+                    "http_status": 404,
+                }],
+                "effects": [],
+                "total_count": 1,
+                "applied_count": 0,
+                "skipped_count": 0,
+                "failed_count": 1,
+            }
+        return {
+            "status": "ok",
+            "results": [{
+                "status": "ok",
+                "action": "memory.add",
+                "http_status": 200,
+            }],
+            "effects": [{"type": "memory_added", "memory_id": "mem_new"}],
+            "total_count": 1,
+            "applied_count": 1,
+            "skipped_count": 0,
+            "failed_count": 0,
+        }
+
+    monkeypatch.setattr(crc, "execute_memory_actions", write)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert len(captured["prompts"]) == 2
+    assert writes["count"] == 2
+    result = _capture_final_status(captured)[3]["extra"]["capture_result"]
+    assert result["reask_count"] == 1
+    assert result["reask_trigger"] == "semantic"
+    assert result["reask_outcome"] == "recovered"
+    assert result["applied"]["added"] == 1
+    assert result["failed"]["by_error"]["not_found"] == 1
+
+
+def test_capture_format_bounce_consumes_shared_semantic_reask_budget(monkeypatch):
+    format_bad = json.dumps({"cards": [{
+        "action": "add",
+        "summary": "...",
+        "content": "[thickened summary]",
+    }]})
+    missing_target = json.dumps({"cards": [{
+        "action": "supersede",
+        "summary": "Correct the meeting memory.",
+        "content": "Seven clarified that the meeting issue was about boundaries.",
+    }]})
+    captured, job = _install_capture_job_harness(
+        monkeypatch, [format_bad, missing_target]
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert len(captured["prompts"]) == 2
+    assert captured["actions"] == []
+    result = _capture_final_status(captured)[3]["extra"]["capture_result"]
+    assert result["reask_count"] == 1
+    assert result["reask_trigger"] == "format"
+    assert result["reask_outcome"] == "failed"
+
+
+def test_capture_job_reports_server_duplicate_skip(monkeypatch):
+    reply = json.dumps({
+        "cards": [{
+            "action": "add",
+            "type": "event",
+            "summary": "Already active.",
+            "content": "This exact card already exists.",
+        }]
+    })
+    captured, job = _install_capture_job_harness(monkeypatch, reply)
+
+    def duplicate_result(actions):
+        captured["actions"].extend(actions)
+        return {
+            "status": "ok",
+            "results": [{
+                "status": "ok",
+                "action": "memory.add",
+                "noop": True,
+                "skipped": "duplicate_active",
+                "duplicate_of": "mem_existing",
+            }],
+            "effects": [],
+        }
+
+    monkeypatch.setattr(crc, "execute_memory_actions", duplicate_result)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    extra = _capture_final_status(captured)[3]["extra"]
+    assert extra["cards_added"] == 0
+    assert extra["capture_result"]["applied"]["added"] == 0
+    assert extra["capture_result"]["skipped"]["duplicate_active"] == 1
+    assert extra["memory_action_status"] == {
+        "status": "ok",
+        "results": 1,
+        "effects": 0,
+        "applied_count": 0,
+        "skipped_count": 1,
+        "failed_count": 0,
+    }
+
+
+def test_capture_partial_server_batch_completes_with_failed_bucket(monkeypatch):
+    reply = json.dumps({"cards": [
+        {
+            "action": "add",
+            "summary": "First memory.",
+            "content": "This item is rejected by the server in the test.",
+        },
+        {
+            "action": "add",
+            "summary": "Second memory.",
+            "content": "This valid item must still count as applied.",
+        },
+    ]})
+    captured, job = _install_capture_job_harness(monkeypatch, reply)
+
+    def partial_result(actions):
+        captured["actions"].extend(actions)
+        return {
+            "status": "partial",
+            "results": [
+                {"status": "error", "error": "source_invalid", "http_status": 400},
+                {"status": "ok", "action": "memory.add", "http_status": 200},
+            ],
+            "effects": [{"type": "memory_added", "memory_id": "mem_2"}],
+            "total_count": 2,
+            "applied_count": 1,
+            "skipped_count": 0,
+            "failed_count": 1,
+        }
+
+    monkeypatch.setattr(crc, "execute_memory_actions", partial_result)
+    # The server error would normally trigger the one semantic re-ask. Consume
+    # the shared budget as a prior format bounce marker so this test isolates
+    # partial-result accounting rather than retry behavior.
+    monkeypatch.setattr(
+        crc,
+        "_memory_agent_parse_with_bounce",
+        lambda *args, **kwargs: ((json.loads(reply)["cards"], None), "bounced_ok"),
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    final = _capture_final_status(captured)
+    assert final[1:3] == ("completed", "capture_memory_actions_partial")
+    result = final[3]["extra"]["capture_result"]
+    assert result["status"] == "partial"
+    assert result["applied"]["added"] == 1
+    assert result["failed"] == {
+        "count": 1,
+        "by_error": {"source_invalid": 1},
+    }
+    assert final[3]["extra"]["cards_added"] == 1
 
 
 def test_capture_job_empty_cards_completes_noop_without_memory_write(monkeypatch):
@@ -5313,6 +5782,35 @@ def test_message_for_proactive_job_instructs_multi_bubble_without_gate_context()
     assert "screen: dense paragraph" in message
 
 
+def test_scheduled_wake_message_requires_exact_reminder_instead_of_generic_presence():
+    message = crc._message_for_proactive_job(
+        {
+            "trigger": "scheduled_wake",
+            "wake_kind": "scheduled_wake",
+            "scheduled_note": "提醒用户喝水",
+            "timezone": "Asia/Shanghai",
+        },
+        recent_chat_context="- user: 2 分钟之后提醒我喝水",
+    )
+
+    assert "[Feedling scheduled reminder]" in message
+    assert "<reminder_note>提醒用户喝水</reminder_note>" in message
+    assert "You must send the reminder now" in message
+    assert "do not replace it with a greeting" in message
+    assert "[Feedling proactive wake]" not in message
+    assert "staying quiet" not in message.lower()
+    assert "recent_chat_context" not in message
+
+
+def test_scheduled_wake_message_falls_back_to_change_digest():
+    message = crc._message_for_proactive_job({
+        "intent_label": "scheduled_wake",
+        "change_digest": "提醒用户休息",
+    })
+
+    assert "<reminder_note>提醒用户休息</reminder_note>" in message
+
+
 def test_photo_added_wake_surfaces_pullable_photo_hint(monkeypatch):
     class _Resp:
         status_code = 200
@@ -5736,6 +6234,45 @@ def test_codex_turn_from_stream_0136_item_protocol_still_works():
     assert reasoning == "thinking…"
 
 
+def test_codex_session_reasoning_reads_public_summary(monkeypatch, tmp_path):
+    thread_id = "019fad75-fdac-7012-b4fb-d414f9b08302"
+    session_dir = tmp_path / "sessions" / "2026" / "07" / "29"
+    session_dir.mkdir(parents=True)
+    session_path = session_dir / f"rollout-2026-07-29T04-40-18-{thread_id}.jsonl"
+    session_path.write_text(
+        "\n".join([
+            json.dumps({"payload": {"type": "reasoning", "encrypted_content": "opaque", "summary": []}}),
+            json.dumps({"payload": {"type": "agent_reasoning", "text": "先读取记忆索引，再生成文件。"}}, ensure_ascii=False),
+        ]),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    assert crc._codex_session_reasoning(thread_id) == "先读取记忆索引，再生成文件。"
+
+
+def test_codex_thread_id_and_session_reasoning_fallback(monkeypatch, tmp_path):
+    thread_id = "019fad75-fdac-7012-b4fb-d414f9b08302"
+    raw = (
+        json.dumps({"type": "thread.started", "thread_id": thread_id}) + "\n"
+        + json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "文件已生成。"}}, ensure_ascii=False)
+    )
+    session_dir = tmp_path / "sessions" / "2026" / "07" / "29"
+    session_dir.mkdir(parents=True)
+    (session_dir / f"rollout-2026-07-29T04-40-18-{thread_id}.jsonl").write_text(
+        json.dumps({"payload": {"type": "agent_reasoning", "text": "正在整理可下载内容。"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    reply, reasoning = crc._codex_turn_from_stream(raw)
+    if not reasoning:
+        reasoning = crc._codex_session_reasoning(crc._codex_thread_id_from_stream(raw))
+
+    assert reply == "文件已生成。"
+    assert reasoning == "正在整理可下载内容。"
+
+
 # ---------------------------------------------------------------------------
 # When a codex turn calls tools, a *preamble* agent_message ("let me check…")
 # precedes the tool call and the real answer arrives in a LATER agent_message —
@@ -5960,6 +6497,79 @@ def _pi_chatty_stream(reply: str, thinking: str = "", *, tokens: int = 120) -> s
                    "message": {"role": "assistant", "content": content,
                                "usage": {"input": 1200, "output": 40}}})
     return _pi_stream_lines(*events)
+
+
+def test_pi_stream_observer_emits_monotonic_text_without_thinking():
+    published = []
+    observer = crc._PiStreamObserver(
+        lambda segment, text, final: published.append((segment, text, final))
+    )
+    lines = _pi_stream_lines(
+        {"type": "message_start", "message": {"role": "assistant", "content": []}},
+        {"type": "message_update", "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "不能说出来"},
+            {"type": "text", "text": "你"},
+        ]}},
+        {"type": "message_update", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "你好"},
+        ]}},
+        {"type": "message_end", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "你好呀"},
+        ]}},
+    )
+
+    for line in lines.splitlines():
+        observer.feed(line)
+
+    assert published == [
+        (0, "你", False),
+        (0, "你好", False),
+        (0, "你好呀", True),
+    ]
+
+
+def test_voice_delta_publisher_marks_latest_segment_complete(monkeypatch):
+    posted = []
+
+    class _Response:
+        status_code = 200
+
+    monkeypatch.setattr(
+        crc._HTTP,
+        "post",
+        lambda url, **kwargs: posted.append(kwargs["json"]) or _Response(),
+    )
+    publisher = crc._VoiceDeltaPublisher("parent-1")
+
+    publisher(0, "第一段", False)
+    publisher(1, "最终回答", True)
+    publisher.complete()
+
+    assert posted[-1] == {
+        "parent_message_id": "parent-1",
+        "segment": 1,
+        "text": "最终回答",
+        "final": True,
+    }
+
+
+def test_run_cli_subprocess_streams_lines_and_keeps_complete_output():
+    seen = []
+    result = crc._run_cli_subprocess(
+        [sys.executable, "-c", "print('one', flush=True); print('two', flush=True)"],
+        {
+            "capture_output": True,
+            "text": True,
+            "timeout": 2,
+            "encoding": "utf-8",
+            "errors": "replace",
+        },
+        stdout_line=seen.append,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "one\ntwo\n"
+    assert seen == ["one\n", "two\n"]
 
 
 def test_turn_content_bytes_excludes_pi_delta_frames(monkeypatch):
@@ -6313,6 +6923,37 @@ def test_cli_failure_surfaces_pi_error_message():
                                             "errorMessage": "401 invalid key"}},
     )
     assert "401 invalid key" in crc._cli_error_detail(raw, "")
+
+
+def test_pi_deepseek_image_error_reaches_vision_classifier():
+    """Lock the real pi 0.80.3 wrapper shape, not only the raw HTTP body."""
+    raw = _pi_stream_lines(
+        _PI_HEADER,
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": (
+                    '400: {"message":"Failed to deserialize the JSON body into '
+                    "the target type: messages[1]: unknown variant `image_url`, "
+                    'expected `text` at line 1 column 3626","type":'
+                    '"invalid_request_error","param":null,'
+                    '"code":"invalid_request_error"}'
+                ),
+            },
+        },
+    )
+
+    detail = crc._cli_error_detail(raw, "")
+    notice = crc.classify_agent_error(
+        RuntimeError(f"pi agent produced no reply: {detail}")
+    )
+
+    assert "unknown variant `image_url`, expected `text`" in detail
+    assert notice.error_class == "vision_model_required"
+    assert notice.blame == "user_provider"
 
 
 def test_pi_intermediate_events_are_non_final():
@@ -7656,10 +8297,16 @@ def test_call_agent_cli_foreign_pinned_resume_not_healed(monkeypatch, tmp_path):
     # An operator-pinned --resume with a sid that is NOT ours is their config —
     # never rotate it, even on a missing-session error.
     _stale_resume_env(monkeypatch, tmp_path, "usr_stale_foreign")
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
     monkeypatch.setattr(
         crc, "AGENT_CLI_CMD",
         'claude --resume 99999999-9999-9999-9999-999999999999 -p "{message}"',
     )
+    # Stamp the local session under the final configured entry. Saving it
+    # before changing AGENT_CLI_CMD makes the entry-signature guard correctly
+    # rotate it, which used to make this test depend on another module having
+    # imported the shared consumer with AGENT_MODE=http.
+    crc._save_agent_session_id(_STALE_SID)
     runs = []
 
     def fake_run(cmd, **kw):
@@ -8467,6 +9114,7 @@ def test_cwd_resolution_failure_preserves_existing_session(monkeypatch, tmp_path
     _bridge_session_env(monkeypatch, tmp_path, "usr_cwd_err")
     monkeypatch.setattr(crc, "AGENT_MODE", "cli")
     _reset_cli_cwd_cache(monkeypatch)
+    _generic_cli_env(monkeypatch)
     old_home = tmp_path / "old-home"
     monkeypatch.setenv("FEEDLING_AGENT_CLI_CWD", str(old_home))
 
@@ -8479,7 +9127,6 @@ def test_cwd_resolution_failure_preserves_existing_session(monkeypatch, tmp_path
     crc._agent_session_id_cache.clear()
     crc._agent_session_meta_cache.clear()
     _reset_cli_cwd_cache(monkeypatch)
-    _generic_cli_env(monkeypatch)
 
     with pytest.raises(RuntimeError, match="restart the consumer"):
         crc.call_agent_cli("hi")
@@ -9429,3 +10076,43 @@ def test_process_perception_prose_wrapped_send_message_pushes_clean(monkeypatch)
     assert crc._process_proactive_jobs([job]) == pytest.approx(133.3)
     assert captured["posted"] == ["忙完记得喝口水～"]
     assert any(s[0] == "posted" for s in captured["statuses"])
+
+
+def test_hidden_vision_probe_uses_isolated_session_and_posts_only_observed(monkeypatch):
+    captured = {}
+
+    def call(prompt, **kwargs):
+        captured["call"] = {"prompt": prompt, **kwargs}
+        return "red,green,blue,yellow\nyellow,blue,green,red"
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+    def post(url, **kwargs):
+        captured["post"] = {"url": url, **kwargs}
+        return Response()
+
+    monkeypatch.setattr(crc, "call_agent", call)
+    monkeypatch.setattr(crc._HTTP, "post", post)
+    encoded = base64.b64encode(b"png-bytes").decode("ascii")
+
+    crc._process_vision_probe({
+        "vision_probe": {
+            "probe_id": "probe-1",
+            "images": [
+                {"data_url": f"data:image/png;base64,{encoded}"},
+                {"data_url": f"data:image/png;base64,{encoded}"},
+            ],
+        },
+    })
+
+    assert captured["call"]["isolated_session"] is True
+    assert captured["call"]["lane"] == "background"
+    assert len(captured["call"]["image_paths"]) == 2
+    assert captured["post"]["url"].endswith("/v1/internal/vision/main/test/result")
+    assert captured["post"]["json"] == {
+        "probe_id": "probe-1",
+        "status": "ok",
+        "observed": ["red,green,blue,yellow", "yellow,blue,green,red"],
+    }

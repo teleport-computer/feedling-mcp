@@ -78,6 +78,7 @@ _LOG_KEYS = (
     "replicate_errors", "replicate_skipped", "replicate_table_failures",
     "reconcile_copied", "reconcile_pruned",
     "snapshot_copied", "snapshot_failures",
+    "prune_stale", "prune_deleted", "prune_refused",
     "reconcile_skipped", "mirror_failures", "tee_healthy",
     "tee_probe_ms", "duration_ms",
 )
@@ -98,6 +99,7 @@ def _blank_summary(do_reconcile: bool) -> dict:
         "reconcile_copied": 0, "reconcile_pruned": 0,
         "reconcile_skipped": 0,
         "snapshot_copied": 0, "snapshot_failures": 0,
+        "prune_stale": 0, "prune_deleted": 0, "prune_refused": 0,
         "mirror_failures": 0,
         "tee_healthy": False, "tee_probe_ms": None, "duration_ms": None,
         "report": {},
@@ -239,6 +241,33 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
             _table_backoff[table] = (fails, time.monotonic() + _backoff_delay(fails))
             log.warning("[tee-sync] replicate %s 失败(连败%d, 退避%.0fs): %s",
                         table, fails, _backoff_delay(fails), e)
+
+    # (2.5) prune 密文表的残留行 —— 删除传播的兜底对账（tee_shadow/ciphertext_prune）。
+    #
+    # 只在 reconcile 档跑（默认每天一次），不是每 tick：它要两侧全量扫主键
+    # （prod 实测 12 万个键、几十秒），跟 5 分钟的 replicate 档不是一个量级。
+    #
+    # 放在 replicate 之后、verify 之前：先让本 tick 该搬的都搬完，再删残留，
+    # 最后由 verify 量到 prune 之后的真实收敛度。（prune 自身的正确性不依赖这个
+    # 顺序——它靠的是模块内那条"先 TEE 后 RDS"的取数铁律。）
+    if do_reconcile and reconcile_ok:
+        try:
+            from tee_shadow import ciphertext_prune
+
+            rep = ciphertext_prune.prune_all()
+            summary["prune_stale"] = rep.get("stale") or 0
+            summary["prune_deleted"] = rep.get("deleted") or 0
+            summary["prune_refused"] = len(rep.get("refused") or [])
+            summary["report"]["prune"] = rep
+            if rep.get("refused"):
+                log.error("[tee-sync] prune 有 %d 张表因超过安全阈值被拒: %s",
+                          len(rep["refused"]), rep["refused"])
+            if summary["prune_deleted"] or summary["prune_stale"]:
+                log.info("[tee-sync] prune done: stale=%s deleted=%s errors=%s",
+                         summary["prune_stale"], summary["prune_deleted"],
+                         rep.get("errors"))
+        except Exception as e:  # noqa: BLE001 — 影子期铁律：绝不传染主路径
+            log.warning("[tee-sync] prune 失败: %s", e)
 
     # (3) verify 对账 —— reconcile 成功才有意义;这是收敛度的量测来源。
     if do_reconcile and reconcile_ok:

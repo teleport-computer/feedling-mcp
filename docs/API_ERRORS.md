@@ -78,12 +78,23 @@
 | `api_key_or_credential_id_required` | 400 | user_provider | `POST /routes` 与 `POST /v1/model_api/models` 必须且只能给 api_key 与 credential_id 之一（present 且非空；给了 null/空串/两者都给都算违约） | |
 | `nothing_to_update` | 400 | — | PATCH /credentials 两者（label/api_key）都不给 | |
 | `invalid_reasoning_effort` | 400 | — | reasoning effort 取值非法（setup/patch 两处校验） | |
+| `invalid_include_reasoning` | 400 | — | Hosted Runtime V2 chat send 的 `include_reasoning` 不是 JSON boolean | |
 | `model_api_config_delete_failed` | 500 | system | 删除 model_api 配置时 DB 写失败 | |
 | `model_catalog_auth_failed` | 400 | user_provider | `POST /models` 目录拉取：上游 401，provider key 被拒（本接口绝不透传 401，避免 iOS 误判登录失效） | ✅ |
 | `model_catalog_access_denied` | 400 | user_provider | 目录拉取上游 402/403/451：额度/权限/地区/项目限制，非「key 错」 | ✅ |
 | `model_catalog_rate_limited` | 429 | user_provider | 目录拉取上游 429 限流，保留输入可重试 | ✅ |
 | `model_catalog_temporarily_unavailable` | 503 | user_provider | 目录拉取上游超时/网络/408/425/所有 5xx，可重试 | ✅ |
 | `model_catalog_invalid_response` | 400 | user_provider | 目录拉取上游非 JSON/超限/坏 shape/其余 4xx（400/404/422 等），非鉴权问题 | ✅ |
+| `vision_runtime_v2_required` | 409 | user_environment | 旧版兼容 slug；新版 V1/VPS 以 resident capability 判断专用视觉路由 | ✅ |
+| `vision_resident_update_required` | 409 | user_environment | 旧版兼容 slug；当前图片发送不再按 resident capability 拦截 | ✅ |
+| `vision_model_required` | 409 | user_provider | 旧版兼容 slug；当前图片发送不再按视觉探测状态拦截 | ✅ |
+| `vision_model_unsupported` | 400 | user_provider | 候选模型未正确识别随机视觉测试图；可保留选择，状态仅作设置反馈，不拦截图片发送 | ✅ |
+| `vision_model_test_failed` | 400 | user_provider | 视觉能力验证因鉴权、额度、网络或 provider 错误未完成 | ✅ |
+| `vision_observer_invalid_request` | 400 | — | resident 视觉观察请求缺少 message_id 或 route_id | |
+| `vision_route_mismatch` | 409 | system | 请求 route_id 与消息发送时固定的 route 不一致，拒绝重新路由 | |
+| `vision_image_unavailable` | 502 | system | enclave 未能返回该消息的解密图片 | |
+| `vision_observer_failed` | 502 | provider_transient | 专用视觉模型观察失败；fail-closed，不把原图回退给主模型 | |
+| `invalid_vision_mode` | 400 | user_provider | mode 不是 follow_main 或 dedicated | |
 
 ## `GET /v1/model_api/usage`（provider 账单/额度查询）
 
@@ -216,6 +227,10 @@
 | `job_not_found` | 404 | — | resident pending/heartbeat/complete 路径 | ✅ |
 | `heartbeat_rejected` | 409 | — | 非 owner 或 job 已不在 processing | |
 | `invalid_job_id` | 400 | — | | |
+| `invalid_turn_id` | 400 | — | Runtime V2 chat activity turn id is malformed | |
+| `turn_activity_not_found` | 404 | — | No authenticated V1/V2 user turn belongs to this id | |
+| `invalid_activity_event` | 400 | — | V1 resident activity transition has invalid identifiers or state | |
+| `activity_event_rejected` | 409 | — | V1 event conflicts with runtime ownership or an existing invocation | |
 | `genesis_job_not_found` | 404 | — | plaintext job 状态/chunk 上传路径（同语义、不同 slug 名） | |
 | `ciphertext_sha256_mismatch` | 400 | — | | |
 | `chunk_envelope_required` | 400 | — | genesis 分片上传信封校验族（下 9 行同族，见 genesis/service.py raise 点） | |
@@ -351,6 +366,7 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 
 | error_class | 状态码 | blame | severity | 触发场景 |
 |---|---|---|---|---|
+| `vision_model_required` | — | user_provider | error | chat：主模型拒绝图片输入且没有成功产出回复；引导用户添加或切换支持视觉的模型，不误报成服务暂时不可用 |
 | `provider_incompatible` | — | user_provider | error | chat：Runtime V2 provider/tool loop 把上游「不支持某参数/工具」类错误分类上报（`classify_upstream`/`_ERROR_CLASS_RULES` 命中） |
 | `context_overflow` | — | user_provider | error | chat：这轮对话超出模型上下文窗口 |
 | `content_filtered` | — | provider_transient | error | chat：回复被上游内容策略拦截 |

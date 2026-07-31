@@ -1239,6 +1239,17 @@
             "example": "a1b2c3d"
           },
           {
+            "name": "X-Feedling-Consumer-Capabilities",
+            "in": "header",
+            "required": false,
+            "description": "Comma-separated capabilities advertised by the current official resident poll.",
+            "schema": {
+              "type": "string",
+              "maxLength": 500
+            },
+            "example": "vision_observer_v1"
+          },
+          {
             "name": "X-Feedling-Consumer-Compat-Commit",
             "in": "header",
             "required": false,
@@ -1365,6 +1376,17 @@
               "maxLength": 80
             },
             "example": "a1b2c3d"
+          },
+          {
+            "name": "X-Feedling-Consumer-Capabilities",
+            "in": "header",
+            "required": false,
+            "description": "Comma-separated capabilities advertised by the current official resident poll.",
+            "schema": {
+              "type": "string",
+              "maxLength": 500
+            },
+            "example": "vision_observer_v1"
           }
         ],
         "requestBody": {
@@ -1379,6 +1401,124 @@
         },
         "x-feedling-contract-level": "documented",
         "description": "Store an agent reply as a v1 ciphertext envelope (plus optional thinking envelope and encrypted file_followups). A text primary and its file cards commit as one ordered transaction. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once."
+      }
+    },
+    "/v1/chat/turn-activity/{turn_id}": {
+      "get": {
+        "summary": "Chat Turn Activity",
+        "operationId": "chat_turn_activity_v1_chat_turn_activity__turn_id__get",
+        "parameters": [
+          {
+            "name": "turn_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Turn Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid path or request parameter.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "Read display-safe activity for one V1 resident or Runtime V2 chat turn. V2 events come from backend jobs and tool dispatch; V1 events come from the authenticated resident io_cli boundary and are durably scoped to an existing user message. Both runtimes expose only bounded identifiers, state, timing, and result classification. Successful memory_search/memory_fetch events include the confirmed returned-item count and, only when every item uses the canonical bucket taxonomy, a complete category-count breakdown. Tool arguments, result bodies, assistant prose, reasoning, and custom bucket labels are never returned."
+      }
+    },
+    "/v1/chat/turn-activity/{turn_id}/events": {
+      "post": {
+        "summary": "Chat Turn Activity Event",
+        "operationId": "chat_turn_activity_event_v1_chat_turn_activity__turn_id__events_post",
+        "parameters": [
+          {
+            "name": "turn_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Turn Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid path or request parameter.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatActivityEventRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented",
+        "description": "Append one authenticated V1 resident tool transition. This endpoint is used by the shipped resident io_cli runtime, accepts only running/success/failure plus display-safe fixed metadata, rejects V2-owned users, and never accepts tool arguments, model prose, or result bodies."
       }
     },
     "/v1/chat/verify_loop": {
@@ -3328,11 +3468,11 @@
         "operationId": "memory_actions_v1_memory_actions_post",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "The structurally valid batch was processed item by item. Inspect status, counts, and every results entry; item failures do not change the batch HTTP status.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/MemoryActionsResponse"
                 }
               }
             }
@@ -3362,7 +3502,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Apply up to 20 memory actions in order. The batch is not transactional and Idempotency-Key is not supported."
+        "description": "Apply up to 20 memory actions independently and in order. A structurally valid batch returns HTTP 200 even when some or all items fail; inspect every result and the applied/skipped/failed counts. The batch is not transactional and Idempotency-Key is not supported."
       }
     },
     "/v1/memory/add": {
@@ -7284,6 +7424,350 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/vision/config": {
+      "get": {
+        "summary": "Vision Config Get",
+        "operationId": "vision_config_get_v1_vision_config_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ],
+        "x-feedling-contract-level": "documented"
+      },
+      "put": {
+        "summary": "Vision Config Set",
+        "operationId": "vision_config_set_v1_vision_config_put",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VisionConfigUpdateRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented"
+      },
+      "post": {
+        "summary": "Vision Route Configure",
+        "operationId": "vision_route_configure_v1_vision_config_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VisionRouteCreateRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented"
+      }
+    },
+    "/v1/vision/main/test": {
+      "post": {
+        "summary": "Vision Main Test",
+        "operationId": "vision_main_test_v1_vision_main_test_post",
+        "responses": {
+          "200": {
+            "description": "Main-model image capability reached a terminal verdict.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VisionMainTestResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "A hidden resident image-capability probe is in progress.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VisionMainTestResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The resident must be updated before hidden validation is available.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "Validate the effective main model's image-input capability. Model API routes use explicit catalog metadata when available and otherwise perform a real two-image probe, returning a terminal 200 status. Resident runtimes start a hidden isolated two-image probe and return 202 testing; poll GET /v1/vision/config until effective_status leaves testing. Residents without the hidden-probe capability receive 409 vision_resident_update_required."
+      }
+    },
+    "/v1/vision/observe": {
+      "post": {
+        "summary": "Vision Observe",
+        "operationId": "vision_observe_v1_vision_observe_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VisionObserveRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented"
+      }
+    },
+    "/v1/vision/routes/{route_id}/test": {
+      "post": {
+        "summary": "Vision Route Test",
+        "operationId": "vision_route_test_v1_vision_routes__route_id__test_post",
+        "parameters": [
+          {
+            "name": "route_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Route Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid path or request parameter.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ],
+        "x-feedling-contract-level": "documented"
+      }
+    },
+    "/v1/voice/chat/completions": {
+      "post": {
+        "summary": "Voice Chat Completions",
+        "operationId": "voice_chat_completions_v1_voice_chat_completions_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreeFormJsonObject"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "compatibility"
+      }
+    },
+    "/v1/voice/sessions": {
+      "post": {
+        "summary": "Create Voice Session",
+        "operationId": "create_voice_session_v1_voice_sessions_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FreeFormJsonObject"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "compatibility"
+      }
+    },
     "/v1/web/settings": {
       "get": {
         "summary": "Web Settings Get",
@@ -7990,6 +8474,24 @@
           },
           "source": {
             "type": "string",
+            "enum": [
+              "bootstrap",
+              "chat",
+              "genesis_import",
+              "genesis_resident_distill",
+              "history_import",
+              "hosted_runtime_state",
+              "live_conversation",
+              "memory_capture",
+              "memory_dream",
+              "memory_migrate",
+              "model_api_capture",
+              "model_api_correction",
+              "model_api_repair",
+              "ombre_brain_sync",
+              "resident_absorb",
+              "resident_patch"
+            ],
             "default": "live_conversation"
           },
           "anchor_memory_ids": {
@@ -8322,6 +8824,11 @@
               "$ref": "#/components/schemas/ChatContextReference"
             }
           },
+          "include_reasoning": {
+            "type": "boolean",
+            "default": false,
+            "description": "Request the assistant's per-turn thinking for this Hosted Runtime V2 turn. With the self-authored thinking chain enabled (the default), the returned thinking is io's own first-person summary rather than the provider's raw chain-of-thought, falling back to native reasoning when no self-authored block was produced. Omitted values preserve the historical disabled behavior; resident runtimes ignore this field."
+          },
           "image_b64": {
             "type": "string",
             "contentEncoding": "base64",
@@ -8421,6 +8928,175 @@
           "error_class": "quota_insufficient",
           "provider_result": "failure"
         }
+      },
+      "VisionConfigUpdateRequest": {
+        "type": "object",
+        "required": [
+          "mode"
+        ],
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "follow_main",
+              "dedicated"
+            ]
+          },
+          "route_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Required when mode is dedicated."
+          }
+        },
+        "if": {
+          "properties": {
+            "mode": {
+              "const": "dedicated"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        },
+        "then": {
+          "required": [
+            "route_id"
+          ]
+        },
+        "additionalProperties": false
+      },
+      "VisionRouteCreateRequest": {
+        "type": "object",
+        "required": [
+          "model"
+        ],
+        "properties": {
+          "provider": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1
+          },
+          "api_key": {
+            "type": "string",
+            "minLength": 1,
+            "writeOnly": true
+          },
+          "credential_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "label": {
+            "type": "string"
+          },
+          "base_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "context_window_tokens": {
+            "type": "integer",
+            "minimum": 8192
+          }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "api_key"
+            ],
+            "not": {
+              "required": [
+                "credential_id"
+              ]
+            }
+          },
+          {
+            "required": [
+              "credential_id"
+            ],
+            "not": {
+              "required": [
+                "api_key"
+              ]
+            }
+          }
+        ],
+        "additionalProperties": false
+      },
+      "VisionObserveRequest": {
+        "type": "object",
+        "required": [
+          "message_id",
+          "route_id"
+        ],
+        "properties": {
+          "message_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "route_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "VisionMainTestResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "source",
+          "provider",
+          "model"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unsupported",
+              "failed",
+              "untested",
+              "testing"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "model_api",
+              "resident"
+            ]
+          },
+          "provider": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "error_code": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "status_code": {
+            "type": "integer"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "probe_id": {
+            "type": "string"
+          },
+          "expires_at_epoch": {
+            "type": "number"
+          },
+          "poll_after_ms": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "HostedChatAcceptedResponse": {
         "type": "object",
@@ -8762,6 +9438,87 @@
         },
         "additionalProperties": true
       },
+      "ChatActivityEventRequest": {
+        "type": "object",
+        "required": [
+          "activity_id",
+          "tool_name",
+          "state"
+        ],
+        "properties": {
+          "activity_id": {
+            "type": "string",
+            "maxLength": 160
+          },
+          "call_id": {
+            "type": "string",
+            "maxLength": 160
+          },
+          "tool_name": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "running",
+              "success",
+              "failure"
+            ]
+          },
+          "duration_ms": {
+            "type": "number",
+            "minimum": 0
+          },
+          "result_code": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "memory_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000
+          },
+          "memory_categories": {
+            "type": "array",
+            "description": "Complete canonical breakdown only; counts must sum to memory_count.",
+            "items": {
+              "type": "object",
+              "required": [
+                "key",
+                "count"
+              ],
+              "properties": {
+                "key": {
+                  "type": "string",
+                  "enum": [
+                    "work",
+                    "growth",
+                    "family",
+                    "friends",
+                    "pets",
+                    "relationship",
+                    "feelings",
+                    "preferences",
+                    "values",
+                    "health",
+                    "interests",
+                    "money",
+                    "food",
+                    "travel"
+                  ]
+                },
+                "count": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      },
       "ChatHistoryClearRequest": {
         "type": "object",
         "required": [
@@ -8908,6 +9665,27 @@
             "items": {
               "type": "string"
             }
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "bootstrap",
+              "chat",
+              "genesis_import",
+              "genesis_resident_distill",
+              "history_import",
+              "hosted_runtime_state",
+              "live_conversation",
+              "memory_capture",
+              "memory_dream",
+              "memory_migrate",
+              "model_api_capture",
+              "model_api_correction",
+              "model_api_repair",
+              "ombre_brain_sync",
+              "resident_absorb",
+              "resident_patch"
+            ]
           }
         },
         "additionalProperties": true
@@ -8978,6 +9756,17 @@
           "reason": {
             "type": "string"
           },
+          "capture_mode": {
+            "type": "string",
+            "enum": [
+              "agent_tool",
+              "genesis_resident_distill",
+              "memory_capture",
+              "memory_dream",
+              "repair",
+              "state"
+            ]
+          },
           "source_chat_message_ids": {
             "type": "array",
             "items": {
@@ -9024,6 +9813,96 @@
             }
           ]
         }
+      },
+      "MemoryActionResult": {
+        "type": "object",
+        "required": [
+          "status",
+          "http_status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "error"
+            ]
+          },
+          "http_status": {
+            "type": "integer",
+            "description": "Per-item execution status; inspect it even when the batch HTTP status is 200."
+          },
+          "action": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "memory_id": {
+            "type": "string"
+          },
+          "noop": {
+            "type": "boolean"
+          },
+          "skipped": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "MemoryActionsResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "results",
+          "effects",
+          "total_count",
+          "applied_count",
+          "skipped_count",
+          "failed_count"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "partial",
+              "failed"
+            ]
+          },
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MemoryActionResult"
+            }
+          },
+          "effects": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "total_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "applied_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "skipped_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failed_count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "MemoryAddRequest": {
         "type": "object",

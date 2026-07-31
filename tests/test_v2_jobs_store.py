@@ -438,6 +438,48 @@ def test_terminal_failure_reply_is_encrypted_linked_classified_and_idempotent(
     assert v2_cursor.load_seq(core_store.get_store(uid)) == parent_seq
 
 
+def test_terminal_vision_required_reply_uses_user_archive_language(monkeypatch):
+    uid = "u_js_terminal_vision_en"
+    seed_user(uid, archive_language="en-US")
+    _reset(uid)
+    _seed_active_route(uid)
+    _append_user_message(uid)
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        _fake_failure_envelope,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w")
+    assert jobs_store.mark_failed(
+        job_id,
+        "turn_failed:providererror",
+        claimed_by="w",
+        error_class="vision_model_required",
+    )
+
+    result = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
+
+    assert result["reply_delivered"] == 1
+    failure = next(
+        row for row in db.chat_load_strict(uid)
+        if str(row.get("terminal_failure_job_id") or "") == str(job_id)
+    )
+    assert failure["turn_failure_error_class"] == "vision_model_required"
+    assert failure["turn_failure_user_text"] == (
+        "Your current model can't process images, so it didn't receive this "
+        "picture. Switch models, or add a dedicated vision model in Settings."
+    )
+    with db.get_pool().connection() as conn:
+        learned = conn.execute(
+            "SELECT vision_test_status,last_vision_test_error,"
+            "last_vision_test_at IS NOT NULL "
+            "FROM model_api_routes WHERE user_id=%s AND is_active",
+            (uid,),
+        ).fetchone()
+    assert learned == ("unsupported", "vision_model_required", True)
+
+
 def test_terminal_failure_reply_retry_adopts_committed_bubble_after_ack_crash(
     monkeypatch,
 ):
@@ -727,7 +769,12 @@ def test_delayed_failure_never_stamps_newly_active_route(monkeypatch):
     old_route_id = _seed_active_route(uid)
     failed_id, _ = jobs_store.enqueue_job(uid, "chat")
     jobs_store.claim_next_job("w")
-    assert jobs_store.mark_failed(failed_id, "lease_timeout", claimed_by="w")
+    assert jobs_store.mark_failed(
+        failed_id,
+        "turn_failed:providererror",
+        claimed_by="w",
+        error_class="vision_model_required",
+    )
 
     real_runtime_sink = jobs_store._deliver_terminal_failure_runtime_error
     monkeypatch.setattr(
@@ -750,11 +797,15 @@ def test_delayed_failure_never_stamps_newly_active_route(monkeypatch):
     jobs_store.reconcile_terminal_failure_outbox(job_id=failed_id, now=base_now + 2)
     with db.get_pool().connection() as conn:
         errors = conn.execute(
-            "SELECT id::text,last_runtime_error FROM model_api_routes "
+            "SELECT id::text,last_runtime_error,vision_test_status "
+            "FROM model_api_routes "
             "WHERE id IN (%s,%s) ORDER BY id",
             (old_route_id, new_route_id),
         ).fetchall()
-    assert all(error == "" for _route_id, error in errors)
+    assert all(
+        error == "" and vision_status == "untested"
+        for _route_id, error, vision_status in errors
+    )
 
 
 def test_enqueue_after_failed_job_also_coalesces_free(monkeypatch=None):
@@ -1442,3 +1493,222 @@ def test_enqueue_after_generation_aba_replaces_old_pending_job():
         (new_id, "pending", 3),
     ]
     assert marker is None
+
+
+# --- backlog scanner --------------------------------------------------------
+#
+# Every maintenance enqueue point hangs off a turn (post-reply, degraded
+# coverage, self-chain, CAS retry). A user who stops talking therefore stops
+# folding, and a large backlog cut over to V2 has nobody to kick off the first
+# fold. This scanner is the only path that does not need the user to speak.
+
+
+def _scan_rows(uid: str, count: int, *, source: str = "chat", start_ts: float = 1000.0):
+    with db.get_pool().connection() as conn:
+        for index in range(count):
+            conn.execute(
+                "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
+                "VALUES (%s,%s,%s,%s::jsonb)",
+                (
+                    uid,
+                    f"{uid}-scan-{index}-{uuid.uuid4().hex[:8]}",
+                    start_ts + index,
+                    '{"source":"%s","role":"user","body_ct":"x"}' % source,
+                ),
+            )
+
+
+def _set_watermark(uid: str, watermark_seq: int):
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_conversation_summary (user_id, watermark_seq) "
+            "VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET watermark_seq=%s",
+            (uid, watermark_seq, watermark_seq),
+        )
+
+
+def _set_runtime(uid: str, state: str):
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_runtime_state "
+            "(user_id,hosted_runtime_state,runtime_generation) VALUES (%s,%s,1) "
+            "ON CONFLICT (user_id) DO UPDATE SET hosted_runtime_state=%s",
+            (uid, state, state),
+        )
+
+
+def test_backlog_scanner_finds_a_v2_user_who_stopped_talking():
+    uid = f"usr_scan_idle_{uuid.uuid4().hex[:8]}"
+    seed_user(uid)
+    _reset(uid)
+    _scan_rows(uid, 12)
+
+    due = dict(jobs_store.due_compaction_users(min_backlog=10, limit=50))
+
+    assert uid in due
+    assert due[uid] >= 10
+
+
+def test_backlog_scanner_ignores_a_user_below_the_threshold():
+    uid = f"usr_scan_small_{uuid.uuid4().hex[:8]}"
+    seed_user(uid)
+    _reset(uid)
+    _scan_rows(uid, 3)
+
+    due = dict(jobs_store.due_compaction_users(min_backlog=10, limit=50))
+
+    assert uid not in due
+
+
+def test_backlog_scanner_never_touches_a_user_rolled_back_to_v1():
+    """Enqueueing maintenance for a resident user would resurrect V2 work."""
+    uid = f"usr_scan_resident_{uuid.uuid4().hex[:8]}"
+    seed_user(uid)
+    _reset(uid)
+    _scan_rows(uid, 30)
+    _set_runtime(uid, "resident")
+
+    due = dict(jobs_store.due_compaction_users(min_backlog=10, limit=50))
+
+    assert uid not in due
+
+
+def test_backlog_scanner_excludes_gc_able_synthetic_rows():
+    """Same exclusion set as the fold and both frontier witnesses.
+
+    Counting a verify_ping as backlog would schedule a fold over a row that
+    verify_loop is about to delete — the permanent frontier corruption this
+    exclusion exists to prevent.
+    """
+    uid = f"usr_scan_synth_{uuid.uuid4().hex[:8]}"
+    seed_user(uid)
+    _reset(uid)
+    _scan_rows(uid, 30, source="verify_ping")
+
+    due = dict(jobs_store.due_compaction_users(min_backlog=10, limit=50))
+
+    assert uid not in due
+
+
+def test_backlog_scanner_counts_only_rows_past_the_watermark():
+    uid = f"usr_scan_watermark_{uuid.uuid4().hex[:8]}"
+    seed_user(uid)
+    _reset(uid)
+    _scan_rows(uid, 20)
+    with db.get_pool().connection() as conn:
+        top = conn.execute(
+            "SELECT max(seq) FROM chat_messages WHERE user_id=%s", (uid,)
+        ).fetchone()[0]
+    _set_watermark(uid, int(top))
+
+    due = dict(jobs_store.due_compaction_users(min_backlog=1, limit=50))
+
+    assert uid not in due
+
+
+def test_backlog_scanner_skips_a_user_already_being_folded():
+    """A pending maintenance job means the work is already scheduled."""
+    uid = f"usr_scan_busy_{uuid.uuid4().hex[:8]}"
+    seed_user(uid)
+    _reset(uid)
+    _scan_rows(uid, 30)
+    jobs_store.enqueue_job(uid, "maintenance", reason="already_queued")
+
+    due = dict(jobs_store.due_compaction_users(min_backlog=10, limit=50))
+
+    assert uid not in due
+
+
+def test_backlog_scanner_returns_the_worst_backlog_first():
+    small = f"usr_scan_rank_small_{uuid.uuid4().hex[:8]}"
+    large = f"usr_scan_rank_large_{uuid.uuid4().hex[:8]}"
+    for uid, count in ((small, 12), (large, 40)):
+        seed_user(uid)
+        _reset(uid)
+        _scan_rows(uid, count)
+
+    ordered = [
+        uid
+        for uid, _ in jobs_store.due_compaction_users(min_backlog=10, limit=50)
+        if uid in {small, large}
+    ]
+
+    assert ordered == [large, small]
+
+
+# --- persisted effective batch cap ------------------------------------------
+#
+# Both folds shrink their batch on refusal, but the shrunk value used to be a
+# local: the next job started at the full batch again and burned one
+# guaranteed-to-fail model call rediscovering the same limit.
+
+
+def test_effective_batch_cap_is_unset_for_a_new_conversation():
+    uid = f"usr_cap_new_{uuid.uuid4().hex[:8]}"
+    seed_user(uid)
+    assert db.v2_effective_batch_cap(uid) is None
+
+
+def test_effective_batch_cap_round_trips():
+    uid = f"usr_cap_rt_{uuid.uuid4().hex[:8]}"
+    seed_user(uid)
+    _set_watermark(uid, 0)  # the row a first fold would have written
+    db.v2_set_effective_batch_cap(uid, 12)
+    assert db.v2_effective_batch_cap(uid) == 12
+    db.v2_set_effective_batch_cap(uid, 37)
+    assert db.v2_effective_batch_cap(uid) == 37
+
+
+def test_writing_the_cap_never_fabricates_a_summary_row():
+    """Inserting here would wedge the very fold this is meant to help.
+
+    A fabricated row carries version=0. The fold reads "no summary", computes
+    its write against that absence, and its CAS then collides with the row the
+    bookkeeping invented — failing the whole job with summary_cas_lost. So a
+    conversation with no summary keeps no memory until its first fold lands.
+    """
+    uid = f"usr_cap_nosummary_{uuid.uuid4().hex[:8]}"
+    seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM v2_conversation_summary WHERE user_id=%s", (uid,))
+
+    db.v2_set_effective_batch_cap(uid, 8)
+
+    assert db.v2_effective_batch_cap(uid) is None
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT count(*) FROM v2_conversation_summary WHERE user_id=%s", (uid,)
+        ).fetchone()[0]
+    assert rows == 0, "bookkeeping must not create a summary row"
+
+
+def test_effective_batch_cap_never_persists_a_useless_value():
+    """Zero or negative would wedge the fold at an empty batch forever."""
+    uid = f"usr_cap_floor_{uuid.uuid4().hex[:8]}"
+    seed_user(uid)
+    _set_watermark(uid, 0)
+    db.v2_set_effective_batch_cap(uid, 0)
+    assert db.v2_effective_batch_cap(uid) == 1
+    db.v2_set_effective_batch_cap(uid, -5)
+    assert db.v2_effective_batch_cap(uid) == 1
+
+
+def test_writing_the_cap_does_not_disturb_the_watermark():
+    """The cap is bookkeeping; it must never touch fold coverage or its CAS."""
+    uid = f"usr_cap_isolation_{uuid.uuid4().hex[:8]}"
+    seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_conversation_summary (user_id, watermark_seq, version) "
+            "VALUES (%s, 4242, 7) ON CONFLICT (user_id) DO UPDATE "
+            "SET watermark_seq=4242, version=7",
+            (uid,),
+        )
+    db.v2_set_effective_batch_cap(uid, 6)
+    with db.get_pool().connection() as conn:
+        watermark, version = conn.execute(
+            "SELECT watermark_seq, version FROM v2_conversation_summary "
+            "WHERE user_id=%s",
+            (uid,),
+        ).fetchone()
+    assert (watermark, version) == (4242, 7)

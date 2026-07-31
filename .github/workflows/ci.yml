@@ -250,6 +250,61 @@ jobs:
             tests/test_v2_extraction_memory_integration.py \
             -v
 
+  # The rollout switch is default-off, so ordinary CI cannot exercise its
+  # TurnDeps contract. Keep both states live until M6 removes the switch.
+  runtime-v2-compaction-matrix:
+    name: Runtime V2 compaction (deterministic=${{ matrix.deterministic }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        deterministic: ["0", "1"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: feedling_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r backend/requirements.lock
+          pip install pytest-asyncio
+
+      - name: Run deterministic coverage matrix
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+          FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: "${{ matrix.deterministic }}"
+        run: |
+          python -m pytest \
+            tests/test_v2_adaptive_tail.py \
+            tests/test_v2_compaction.py \
+            tests/test_v2_compaction_integration.py \
+            tests/test_v2_compaction_cas_requeue.py \
+            tests/test_v2_p0_history_safety.py \
+            tests/test_v2_serve_worker.py \
+            tests/test_v2_summary_frontier_store.py \
+            tests/test_v2_summary_watermark_seq.py \
+            tests/test_v2_wake_worker.py \
+            tests/test_v2_worker.py \
+            tests/test_v2_deterministic_compaction.py \
+            -v
+
   # -------------------------------------------------------------------------
   # Docker — confirm the hash-pinned build stays reproducible
   # -------------------------------------------------------------------------
@@ -880,7 +935,6 @@ jobs:
       cancel-in-progress: false
     outputs:
       cvm_id: ${{ steps.cvmid.outputs.cvm_id }}
-      pinned_sha: ${{ steps.pin.outputs.pinned_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1208,8 +1262,6 @@ jobs:
     concurrency:
       group: deploy-test-cvm
       cancel-in-progress: false
-    outputs:
-      pinned_sha: ${{ steps.pin.outputs.pinned_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1288,6 +1340,11 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.TEST_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
+          # Nightly memory Dream lane (provider-backed distillation). Explicit
+          # opt-in like Capture; default '0'. serve_worker._tick_dream_for_user
+          # only runs when this is '1'. Encrypted env — flip via repo var +
+          # redeploy, no new compose_hash / on-chain publish.
+          FEEDLING_V2_DREAM_ENABLED:    ${{ vars.TEST_FEEDLING_V2_DREAM_ENABLED || '0' }}
           # Break-glass trajectory inspection (audited runner-local CLI inside
           # serve-worker). Default '0'; set the repo var to '1' only for the
           # duration of an incident, then back. Encrypted env — flipping it
@@ -1343,6 +1400,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
+            -e "FEEDLING_V2_DREAM_ENABLED=$FEEDLING_V2_DREAM_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
             -e "FEEDLING_V2_COMPACTION_BATCH_CHARS=$FEEDLING_V2_COMPACTION_BATCH_CHARS" \
@@ -1451,7 +1509,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ needs.deploy-test-cvm.outputs.pinned_sha }}
+
+      # A commit SHA can be suppressed as a job output when it accidentally
+      # contains a masked-secret substring. Re-resolve the CAS pin from git so
+      # checkout never falls back to the triggering commit's stale compose.
+      - name: Resolve pinned runner release from git
+        env:
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: >-
+          ./deploy/pin-runtime-release.sh test
+          deploy/docker-compose.phala.test.yaml
+          deploy/docker-compose.phala.runner.yaml
 
       - name: Wait for ghcr.io agent-runner image :<sha>
         env:
@@ -1582,8 +1650,6 @@ jobs:
     concurrency:
       group: deploy-pre-cvm
       cancel-in-progress: false
-    outputs:
-      pinned_sha: ${{ steps.pin.outputs.pinned_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1811,7 +1877,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ needs.deploy-pre-cvm.outputs.pinned_sha }}
+
+      - name: Resolve pinned runner release from git
+        env:
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: >-
+          ./deploy/pin-runtime-release.sh pre
+          deploy/docker-compose.phala.pre.yaml
+          deploy/docker-compose.phala.pre.runner.yaml
 
       - name: Wait for ghcr.io agent-runner image :<sha>
         env:
@@ -1964,7 +2037,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ needs.deploy-cvm.outputs.pinned_sha }}
+
+      - name: Resolve pinned runner release from git
+        env:
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: >-
+          ./deploy/pin-runtime-release.sh main
+          deploy/docker-compose.phala.yaml
+          deploy/docker-compose.phala.prod.runner.yaml
 
       - name: Wait for ghcr.io agent-runner image :<sha>
         env:
