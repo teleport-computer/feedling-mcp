@@ -111,9 +111,16 @@ async def memory_threads(request: Request, auth: AuthResult = Depends(require_au
 
 @router.post("/v1/memory/actions")
 async def memory_actions(request: Request, auth: AuthResult = Depends(require_scope("memory"))):
+    # The runtime token is forwarded for the SAME reason as the four readside
+    # routes above: a hosted caller (Stage D swaps X-API-Key for the token) has no
+    # per-user api_key, and supersede/patch/upgrade must decrypt the OLD card via
+    # the enclave before rewriting it. Without it that decrypt raises
+    # api_key_unavailable → 409 memory_decrypt_failed for every hosted user.
+    runtime_token = auth_core.extract_runtime_token(request.headers) or ""
     payload = (await asgi_http.read_json_silent(request)) or {}
     body, status = await threadpool.run_db(
-        memory_core.actions, auth.store, auth.api_key, payload)
+        memory_core.actions, auth.store, auth.api_key, payload,
+        runtime_token=runtime_token)
     return JSONResponse(body, status_code=status)
 
 

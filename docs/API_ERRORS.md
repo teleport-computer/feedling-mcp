@@ -78,6 +78,7 @@
 | `api_key_or_credential_id_required` | 400 | user_provider | `POST /routes` 与 `POST /v1/model_api/models` 必须且只能给 api_key 与 credential_id 之一（present 且非空；给了 null/空串/两者都给都算违约） | |
 | `nothing_to_update` | 400 | — | PATCH /credentials 两者（label/api_key）都不给 | |
 | `invalid_reasoning_effort` | 400 | — | reasoning effort 取值非法（setup/patch 两处校验） | |
+| `invalid_include_reasoning` | 400 | — | Hosted Runtime V2 chat send 的 `include_reasoning` 不是 JSON boolean | |
 | `model_api_config_delete_failed` | 500 | system | 删除 model_api 配置时 DB 写失败 | |
 | `model_catalog_auth_failed` | 400 | user_provider | `POST /models` 目录拉取：上游 401，provider key 被拒（本接口绝不透传 401，避免 iOS 误判登录失效） | ✅ |
 | `model_catalog_access_denied` | 400 | user_provider | 目录拉取上游 402/403/451：额度/权限/地区/项目限制，非「key 错」 | ✅ |
@@ -365,6 +366,7 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 
 | error_class | 状态码 | blame | severity | 触发场景 |
 |---|---|---|---|---|
+| `vision_model_required` | — | user_provider | error | chat：主模型拒绝图片输入且没有成功产出回复；引导用户添加或切换支持视觉的模型，不误报成服务暂时不可用 |
 | `provider_incompatible` | — | user_provider | error | chat：Runtime V2 provider/tool loop 把上游「不支持某参数/工具」类错误分类上报（`classify_upstream`/`_ERROR_CLASS_RULES` 命中） |
 | `context_overflow` | — | user_provider | error | chat：这轮对话超出模型上下文窗口 |
 | `content_filtered` | — | provider_transient | error | chat：回复被上游内容策略拦截 |

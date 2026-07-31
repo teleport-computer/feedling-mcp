@@ -28,7 +28,7 @@ from model_api_runtime.v2 import worker
 
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
     """claim_next_job() is a GLOBAL work-queue claim (by design it doesn't filter
     by user_id — see jobs_store.claim_next_job docstring). A pending job left
     behind by another test module (e.g. test_v2_jobs_store.py, which runs
@@ -36,6 +36,10 @@ def _clean_agent_jobs_table():
     claimed here instead of the row a given test just enqueued. Truncate
     before each test so claim_next_job only ever sees this test's own row —
     mirrors the identical fixture in test_v2_jobs_store.py."""
+    # Compaction cases in this long-standing worker suite specify the
+    # provider-backed fallback; rollout-mode behavior lives in the dedicated
+    # deterministic suite.
+    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield
@@ -106,6 +110,22 @@ def test_prompt_frontier_failures_use_stable_content_free_status_codes():
         (
             provider_client.ProviderError("relay unavailable", status_code=503),
             "upstream_unavailable",
+        ),
+        (
+            provider_client.ProviderError(
+                "provider_http_400: Failed to deserialize the JSON body into "
+                "the target type: messages[0]: unknown variant `image_url`, "
+                "expected `text` at line 1 column 295",
+                status_code=400,
+            ),
+            "vision_model_required",
+        ),
+        (
+            provider_client.ProviderError(
+                "provider_http_404: No endpoints found that support image input",
+                status_code=404,
+            ),
+            "vision_model_required",
         ),
         (worker.TurnError("empty_reply"), "reply_parse_failed"),
         (RuntimeError("opaque internal failure"), "unknown"),
@@ -757,6 +777,85 @@ def test_process_job_terminal_failure_emits_error_status_and_calls_callback(monk
     assert row[1] == rec_msg
     assert "provider blew up" not in rec_msg
     assert settled == [(uid, "m1", rec_msg)]
+
+
+def test_image_turn_unrelated_failure_keeps_original_failure_owner(monkeypatch):
+    """An image must not make an unrelated internal failure look visual."""
+    uid = "u_w_image_unrelated_failure"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    async def _boom(config, messages, *, tools=None, **_kwargs):
+        raise RuntimeError("unrelated internal failure")
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
+    recorded = []
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [{
+            "id": "image-parent",
+            "ts": 5.0,
+            "role": "user",
+            "content": "看看这张图",
+            "has_image": True,
+            "image_mime": "image/png",
+        }],
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        record_terminal_error=lambda user_id, message: recorded.append(
+            (user_id, message)
+        ),
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
+
+    assert status == "failed"
+    assert _job_status(job_id) == ("failed", "turn_failed:runtimeerror")
+    assert recorded == [(uid, "turn_failed:runtimeerror")]
+
+
+def test_image_turn_explicit_openrouter_rejection_keeps_vision_required_slug(
+    monkeypatch,
+):
+    uid = "u_w_image_openrouter_unsupported"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w")
+
+    async def _boom(config, messages, *, tools=None, **_kwargs):
+        raise provider_client.ProviderError(
+            "provider_http_404: No endpoints found that support image input",
+            status_code=404,
+        )
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", _boom)
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [{
+            "id": "image-parent",
+            "ts": 5.0,
+            "role": "user",
+            "content": "What is in this image?",
+            "has_image": True,
+            "image_mime": "image/png",
+        }],
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "failed"
+    with db.get_pool().connection() as conn:
+        marker = conn.execute(
+            "SELECT error_class FROM v2_terminal_failure_outbox WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()
+    assert marker == ("vision_model_required",)
 
 
 def test_process_job_terminal_failure_tolerates_missing_callback(monkeypatch):
@@ -2181,7 +2280,7 @@ def test_compaction_reliable_attempts_refresh_turn_progress(monkeypatch):
     progress = []
     monkeypatch.setattr(worker, "_report_turn_progress", progress.append)
 
-    async def _ignore_health(_user_id):
+    async def _ignore_health(_user_id, **_kwargs):
         return None
 
     async def _fake_reliable(*args, progress_cb=None, **kwargs):

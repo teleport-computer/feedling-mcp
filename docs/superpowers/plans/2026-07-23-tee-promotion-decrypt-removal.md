@@ -578,7 +578,7 @@ L1 **7262 passed / 0 failed**。
       >
       > ## 🔴 第二次回退（2026-07-29）：真实阻塞是**下游消费者**，不是 helper 本身
       >
-      > 三态 fail-safe 与 0068 放宽 CHECK 都就位后再次实现 helper 路由，L1 仍
+      > 三态 fail-safe 与 0072 放宽 CHECK 都就位后再次实现 helper 路由，L1 仍
       > **15 failed**。查到失败点在 **`backend/hosted/history_import.py:3024`——
       > 生产代码，不是测试**：
       >
@@ -601,7 +601,7 @@ L1 **7262 passed / 0 failed**。
       >    **先把拆包点全部迁到它**、L1 保持绿；
       > 3. **最后**才切 helper 的写侧形状——那时下游已经形状无关，切换才是安全的。
       >
-      > 已保住的绿色成果（均已提交、L1 绿）：`0068` 放宽 CHECK、偏好三态
+      > 已保住的绿色成果（均已提交、L1 绿）：`0072` 放宽 CHECK、偏好三态
       > fail-safe、40 处分类、规格测试（`test_write_side_format_routing.py`，
       > 当前 `pytest.mark.skip`）。
       >
@@ -833,7 +833,7 @@ L1 **7219 passed / 0 failed**（含 `tests/test_envelope_storage_fields.py` 16 �
 
       **schema 无需改动**：TEE 内容表的 `doc` 是裸 `JSONB`、**没有任何 CHECK**
       （已核对 `0001_tee_baseline` 及后续全部迁移），信封行结构上直接存得进去。
-      不要与 RDS 侧 V2 轨迹表那个由 `0068` 放宽的表级 CHECK 混淆。
+      不要与 RDS 侧 V2 轨迹表那个由 `0072` 放宽的表级 CHECK 混淆。
 
       **两个必须处理的既有事实**（详见 spec §2）：
 

@@ -19,21 +19,19 @@ is ever introduced here. Module-level references (``provider_client``,
 
 from __future__ import annotations
 
-import base64
 import os
-import random
 import re
-import struct
 import threading
 import uuid
-import zlib
 from functools import wraps
 
 import db
 import provider_health
+from capabilities import vision_probe as vision_probe_capability
 from core import enclave as core_enclave  # noqa: F401 — 见模块 docstring：故意保留供测试 monkeypatch
 from core import envelope as core_envelope
 from core import util as core_util
+from core import wake_bus
 from core.store import UserStore
 from accounts import onboarding as accounts_onboarding
 from memory import service as memory_service
@@ -42,17 +40,13 @@ from hosted import agent_runtime_cutover
 from hosted import config_store as hosted_config_store
 from hosted import turn as hosted_turn
 from hosted import vision_routing
+from hosted import vision_observer
 from model_api_runtime.v2 import prompt_frontier
 
 
+_TEST_PATCHABLE_MODULES = (core_enclave,)
 _REASONING_EFFORT_OFF = {"off", "none", "no", "false", "0", "disabled"}
 _REASONING_EFFORT_LEVELS = {"low", "medium", "high"}
-_VISION_COLORS = {
-    "red": (224, 67, 54),
-    "green": (52, 168, 83),
-    "blue": (66, 133, 244),
-    "yellow": (251, 188, 4),
-}
 _VISION_TEST_LOCKS = tuple(threading.Lock() for _ in range(32))
 
 
@@ -208,30 +202,35 @@ def _public_saved_route(route: dict | None) -> dict | None:
     return {key: value for key, value in route.items() if key != "api_key_envelope"}
 
 
-def _png_chunk(kind: bytes, data: bytes) -> bytes:
-    checksum = zlib.crc32(kind + data)
-    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
-
-
 def _vision_probe_image() -> tuple[str, str]:
-    """Return a random four-stripe PNG and its unpredictable answer."""
-    names = list(_VISION_COLORS)
-    random.SystemRandom().shuffle(names)
-    width, height = 96, 24
-    scanlines = bytearray()
-    for _ in range(height):
-        scanlines.append(0)
-        for x in range(width):
-            scanlines.extend(_VISION_COLORS[names[min(x // 24, 3)]])
-    png = b"\x89PNG\r\n\x1a\n"
-    png += _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-    png += _png_chunk(b"IDAT", zlib.compress(bytes(scanlines), 9))
-    png += _png_chunk(b"IEND", b"")
-    return base64.b64encode(png).decode("ascii"), ",".join(names)
+    """Compatibility wrapper for tests and existing Model API callers."""
+    return vision_probe_capability.generate_image()
+
+
+def _vision_probe_images() -> tuple[list[dict[str, str]], list[str]]:
+    """Compatibility wrapper around the shared two-image control generator."""
+    return vision_probe_capability.generate_images()
 
 
 def _vision_test_lock(user_id: str, route_id: str):
     return _VISION_TEST_LOCKS[hash((user_id, route_id)) % len(_VISION_TEST_LOCKS)]
+
+
+def _mark_route_vision_test(
+    user_id: str,
+    route_id: str,
+    *,
+    status: str,
+    error: str | None = None,
+    expected_updated_at: str = "",
+) -> bool:
+    """Persist one verdict, optionally fenced to the setup route snapshot."""
+    kwargs = {"status": status}
+    if error is not None:
+        kwargs["error"] = error
+    if expected_updated_at:
+        kwargs["expected_updated_at"] = expected_updated_at
+    return db.model_api_route_mark_vision_test(user_id, route_id, **kwargs)
 
 
 def _vision_runtime_v2_enabled(store) -> bool:
@@ -255,7 +254,11 @@ def _cached_vision_verdict(route: dict, *, include_failed: bool):
         return True, None
     detail = str(route.get("last_vision_test_error") or "")
     if status == "unsupported":
-        return True, ({"error": "vision_model_unsupported", "detail": detail}, 400)
+        return True, ({
+            "error": "vision_model_incompatible",
+            "detail": detail,
+            "retryable": False,
+        }, 400)
     if status == "failed" and include_failed:
         body = {"error": "vision_model_test_failed", "detail": detail}
         match = re.search(r"provider_http_(\d{3})", detail)
@@ -272,6 +275,7 @@ def _test_route_vision_or_error(
     *,
     runtime_token: str = "",
     reuse_cached: bool = False,
+    expected_updated_at: str = "",
 ):
     """Serialize a route's visual probe and reuse an already-known verdict."""
     route_id = str(route.get("id") or "")
@@ -295,6 +299,7 @@ def _test_route_vision_or_error(
             current,
             caller_api_key,
             runtime_token=runtime_token,
+            expected_updated_at=expected_updated_at,
         )
 
 
@@ -304,6 +309,7 @@ def _run_route_vision_test_or_error(
     caller_api_key: str | None,
     *,
     runtime_token: str = "",
+    expected_updated_at: str = "",
 ):
     """Prove that a saved route can inspect pixels, not merely answer text."""
     envelope = route.get("api_key_envelope")
@@ -325,11 +331,70 @@ def _run_route_vision_test_or_error(
             "detail": str(exc)[:220],
         }, 400
 
-    image_b64, expected = _vision_probe_image()
+    # Provider catalogs are cheaper and more authoritative than asking a model
+    # about itself. Only explicit modality fields parsed by provider_client are
+    # trusted; missing metadata falls through to the pixel control probe.
+    catalog = None
+    try:
+        catalog = provider_client.list_provider_models(
+            route["provider"], provider_key, route["base_url"]
+        )
+    except provider_client.ProviderError as exc:
+        catalog_status = getattr(exc, "status_code", None)
+        catalog_shape_missing = (
+            catalog_status in {400, 404, 405, 422, 501}
+            or "model_catalog_unsupported" in str(exc)
+            or "model_catalog_invalid_response" in str(exc)
+        )
+        if not catalog_shape_missing:
+            stable = vision_observer.classify_vision_error(exc)
+            if not _mark_route_vision_test(
+                store.user_id,
+                route["id"],
+                status="failed",
+                error=stable.error_code,
+                expected_updated_at=expected_updated_at,
+            ):
+                return {"error": "model_api_route_write_failed"}, 500
+            return {
+                "error": stable.error_code,
+                "detail": stable.detail,
+                "status_code": stable.status_code,
+                "retryable": stable.retryable,
+            }, 400
+
+    exact = next(
+        (
+            row for row in (catalog or {}).get("models") or []
+            if str(row.get("id") or "").strip() == str(route["model"]).strip()
+        ),
+        None,
+    )
+    if isinstance(exact, dict) and "input_modalities" in exact:
+        supported = "image" in set(exact.get("input_modalities") or [])
+        status = "ok" if supported else "unsupported"
+        detail = "" if supported else "Provider catalog reports a text-only model."
+        if not _mark_route_vision_test(
+            store.user_id,
+            route["id"],
+            status=status,
+            error=detail,
+            expected_updated_at=expected_updated_at,
+        ):
+            return {"error": "model_api_route_write_failed"}, 500
+        if supported:
+            return None
+        return {
+            "error": "vision_model_incompatible",
+            "detail": detail,
+            "retryable": False,
+        }, 400
+
+    probe_images, expected = _vision_probe_images()
     prompt = (
-        "This is a capability check. The image has four solid color stripes. "
-        "Reply with only their colors from left to right, using lowercase English "
-        "names separated by commas."
+        "This is a private capability check. Inspect both images. Each has four "
+        "solid color stripes. Reply with exactly two lines, one per image in order, "
+        "using only lowercase color names separated by commas."
     )
     try:
         result = provider_client.chat_completion(
@@ -344,10 +409,13 @@ def _run_route_vision_test_or_error(
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
-                    },
+                    *[
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image["data_url"]},
+                        }
+                        for image in probe_images
+                    ],
                 ],
             }],
             max_tokens=80,
@@ -356,43 +424,108 @@ def _run_route_vision_test_or_error(
             include_reasoning=False,
         )
     except provider_client.ProviderError as exc:
-        unsupported = exc.status_code in {400, 415, 422}
+        stable = vision_observer.classify_vision_error(exc)
+        unsupported = stable.error_code == "vision_model_incompatible"
         status = "unsupported" if unsupported else "failed"
-        error_slug = (
-            "vision_model_unsupported" if unsupported else "vision_model_test_failed"
-        )
-        if not db.model_api_route_mark_vision_test(
+        if not _mark_route_vision_test(
             store.user_id,
             route["id"],
             status=status,
-            error=str(exc),
+            error=stable.error_code,
+            expected_updated_at=expected_updated_at,
         ):
             return {"error": "model_api_route_write_failed"}, 500
         return {
-            "error": error_slug,
-            "detail": str(exc),
-            "status_code": exc.status_code,
+            "error": stable.error_code,
+            "detail": stable.detail,
+            "status_code": stable.status_code,
+            "retryable": stable.retryable,
         }, 400
 
     reply = str(result.get("reply") or "").strip().lower()
-    observed = ",".join(re.findall(r"red|green|blue|yellow", reply)[:4])
+    colors = re.findall(r"red|green|blue|yellow", reply)[:8]
+    observed = [",".join(colors[:4]), ",".join(colors[4:8])]
     if observed != expected:
         detail = "The model did not identify the visual test image correctly."
-        if not db.model_api_route_mark_vision_test(
+        if not _mark_route_vision_test(
             store.user_id,
             route["id"],
             status="unsupported",
             error=detail,
+            expected_updated_at=expected_updated_at,
         ):
             return {"error": "model_api_route_write_failed"}, 500
-        return {"error": "vision_model_unsupported", "detail": detail}, 400
-    if not db.model_api_route_mark_vision_test(
+        return {
+            "error": "vision_model_incompatible",
+            "detail": detail,
+            "retryable": False,
+        }, 400
+    if not _mark_route_vision_test(
         store.user_id,
         route["id"],
         status="ok",
+        expected_updated_at=expected_updated_at,
     ):
         return {"error": "model_api_route_write_failed"}, 500
     return None
+
+
+def _run_setup_main_vision_test(
+    store,
+    route_id: str,
+    route_updated_at: str,
+    caller_api_key: str | None,
+) -> None:
+    """Run the existing main-model probe after setup without owning the request."""
+    try:
+        binding = db.model_api_active_route_version(store.user_id)
+        if (
+            not binding
+            or binding["route_id"] != route_id
+            or binding["updated_at_token"] != route_updated_at
+        ):
+            return
+        route = db.model_api_route_get(store.user_id, route_id)
+        if not route or not route.get("is_active"):
+            return
+        result = _test_route_vision_or_error(
+            store,
+            route,
+            caller_api_key,
+            reuse_cached=False,
+            expected_updated_at=route_updated_at,
+        )
+        if result is not None and result[0].get("error") == "model_api_route_write_failed":
+            # A newer setup changed the route version while this provider call
+            # was in flight. Its verdict belongs to the old snapshot and is
+            # intentionally discarded.
+            print(
+                f"[model_api:{store.user_id}] setup vision probe discarded "
+                f"route={route_id} reason=stale_route_version"
+            )
+    except Exception as exc:
+        # Capability detection is advisory. It must never turn a successful
+        # provider setup into a failure or disturb image delivery.
+        print(
+            f"[model_api:{store.user_id}] setup vision probe failed "
+            f"route={route_id} detail={type(exc).__name__}:{str(exc)[:160]}"
+        )
+
+
+def _kick_setup_main_vision_test(
+    store,
+    route_id: str,
+    route_updated_at: str,
+    caller_api_key: str | None,
+) -> None:
+    """Start the setup-triggered probe and return without waiting for provider I/O."""
+    thread = threading.Thread(
+        target=_run_setup_main_vision_test,
+        args=(store, route_id, route_updated_at, caller_api_key),
+        daemon=True,
+        name=f"vision-setup-{str(store.user_id)[:12]}",
+    )
+    thread.start()
 
 
 def _vision_config_payload(store) -> dict:
@@ -418,35 +551,34 @@ def _vision_config_payload(store) -> dict:
             ),
         }
     else:
-        resident_runtime = vision_routing.chat_consumer.consumer_agent_runtime(store)
-        resident_modalities = set(resident_runtime.get("input_modalities") or [])
-        if "image" in resident_modalities:
-            resident_vision_status = "ok"
-        elif resident_modalities:
-            resident_vision_status = "unsupported"
-        else:
-            resident_vision_status = "untested"
+        resident_runtime = (
+            vision_routing.chat_consumer.resident_vision_validation(store)
+        )
+        resident_vision_status = str(
+            resident_runtime.get("status") or "untested"
+        )
         main = {
             "source": "resident",
             "route_id": None,
             "provider": resident_runtime.get("provider", ""),
             "model": resident_runtime.get("model", ""),
             "vision_test_status": resident_vision_status,
-            "last_vision_test_error": "",
+            "last_vision_test_error": str(
+                resident_runtime.get("error_code") or ""
+            ),
         }
 
     mode = "dedicated" if dedicated else "follow_main"
-    if dedicated and not routing_available:
-        effective_status = "resident_update_required"
-    elif dedicated:
+    if dedicated and routing_available:
         effective_status = dedicated.get("vision_test_status", "untested")
+    elif dedicated:
+        effective_status = "untested"
     elif onboarding_route == "model_api":
-        # Follow-main predates dedicated vision routing and does not have a
-        # separate capability probe. Preserve that legacy image path: the
-        # dedicated-only status columns default to "untested" for every
-        # existing main route and must not turn migration into a fleet-wide
-        # image-send gate.
-        effective_status = "ok" if active else "not_configured"
+        effective_status = (
+            str(active.get("vision_test_status") or "untested")
+            if active
+            else "untested"
+        )
     else:
         effective_status = main["vision_test_status"]
     return {
@@ -458,6 +590,9 @@ def _vision_config_payload(store) -> dict:
         "main_model": main,
         "dedicated_route": _public_saved_route(dedicated),
         "effective_status": effective_status,
+        "test_pending": bool(
+            onboarding_route != "model_api" and resident_runtime.get("pending")
+        ) if onboarding_route != "model_api" else False,
     }
 
 
@@ -799,6 +934,26 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     print(f"[model_api:{store.user_id}] setup provider={provider} model={model}")
 
     route = hosted_config_store.load_active_route(store)
+    route_version = db.model_api_active_route_version(store.user_id)
+    if (
+        route
+        and route_version
+        and str(route.get("id") or "") == route_version["route_id"]
+    ):
+        try:
+            _kick_setup_main_vision_test(
+                store,
+                route_version["route_id"],
+                route_version["updated_at_token"],
+                caller_api_key,
+            )
+        except Exception as exc:
+            # Thread construction itself is also advisory: setup succeeded and
+            # must remain successful even if the automatic probe cannot start.
+            print(
+                f"[model_api:{store.user_id}] setup vision probe not started "
+                f"detail={type(exc).__name__}:{str(exc)[:160]}"
+            )
     return {"status": "configured", "config": _public_route(route)}, 200
 
 
@@ -841,6 +996,87 @@ def model_api_key_envelope(store) -> tuple[dict, int]:
     if not isinstance(envelope, dict):
         return {"error": "model_api_key_envelope_missing"}, 404
     return {"api_key_envelope": envelope}, 200
+
+
+def vision_main_test(
+    store,
+    *,
+    caller_api_key: str | None,
+) -> tuple[dict, int]:
+    """Test the effective main model through one runtime-neutral endpoint."""
+    onboarding_route = accounts_onboarding._load_onboarding_route(store)
+    if onboarding_route == "model_api":
+        route = db.model_api_active_route(store.user_id)
+        if not route:
+            return {
+                "status": "untested",
+                "source": "model_api",
+                "provider": "",
+                "model": "",
+                "error_code": "vision_model_not_ready",
+            }, 200
+        error = _test_route_vision_or_error(
+            store, route, caller_api_key, reuse_cached=False
+        )
+        common = {
+            "source": "model_api",
+            "provider": str(route.get("provider") or ""),
+            "model": str(route.get("model") or ""),
+        }
+        if error is None:
+            return {"status": "ok", **common}, 200
+        error_body, _legacy_status = error
+        error_code = str(error_body.get("error") or "vision_model_failed")
+        unsupported = error_code in {
+            "vision_model_incompatible",
+            "vision_model_unsupported",
+        }
+        body = {
+            "status": "unsupported" if unsupported else "failed",
+            **common,
+            "error_code": (
+                "vision_model_incompatible" if unsupported else error_code
+            ),
+            "retryable": bool(error_body.get("retryable", False)),
+        }
+        for key in ("status_code", "detail"):
+            if error_body.get(key) not in (None, ""):
+                body[key] = error_body[key]
+        return body, 200
+
+    probe_images, expected = _vision_probe_images()
+    encoded = [image["data_url"].split(",", 1)[1] for image in probe_images]
+    probe, error_code = vision_routing.chat_consumer.begin_vision_probe(
+        store, images=encoded, expected=expected
+    )
+    if probe is None:
+        return {
+            "error": "vision_resident_update_required",
+            "status": "untested",
+            "config": _vision_config_payload(store),
+        }, 409
+    store.notify_chat_waiters()
+    wake_bus.notify("chat", store.user_id)
+    return {
+        "status": "testing",
+        "source": "resident",
+        "probe_id": probe["probe_id"],
+        "expires_at_epoch": probe["expires_at_epoch"],
+        "poll_after_ms": 1000,
+        "provider": str(probe.get("provider") or ""),
+        "model": str(probe.get("model") or ""),
+    }, 202
+
+
+def vision_main_test_result(
+    store,
+    payload: dict,
+    *,
+    consumer_info: dict,
+) -> tuple[dict, int]:
+    return vision_routing.chat_consumer.complete_vision_probe(
+        store, payload, consumer_info
+    )
 
 
 def vision_config_get(store) -> tuple[dict, int]:
@@ -889,7 +1125,7 @@ def vision_config_set(
     warning = None
     if test_error is not None:
         error_body, _ = test_error
-        if error_body.get("error") != "vision_model_unsupported":
+        if error_body.get("error") != "vision_model_incompatible":
             return test_error
         # Keep an explicit text-only selection visible while image admission
         # remains fail-closed on its persisted unsupported verdict.

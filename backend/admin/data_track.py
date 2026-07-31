@@ -232,6 +232,86 @@ def _memory_stats(store: UserStore) -> dict:
     }
 
 
+def _data_track_capture_doc(value, *, max_items: int = 20):
+    if isinstance(value, dict):
+        return {
+            str(key)[:80]: _data_track_capture_doc(item, max_items=max_items)
+            for key, item in list(value.items())[:max_items]
+        }
+    if isinstance(value, list):
+        return [
+            _data_track_capture_doc(item, max_items=max_items)
+            for item in value[:max_items]
+        ]
+    if isinstance(value, str):
+        return value[:1000]
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    return str(value)[:500]
+
+
+def _memory_capture_validation_detail(store: UserStore, *, limit: int = 50) -> dict:
+    """Expose bounded capture write decisions on the per-user Data Track page."""
+    jobs = [
+        job
+        for job in store.list_proactive_jobs(limit=0)
+        if isinstance(job, dict)
+        and isinstance(job.get("capture_result"), dict)
+        and (
+            str(job.get("job_kind") or "") == "memory_capture"
+            or str((job.get("capture_result") or {}).get("job_kind") or "")
+            == "memory_capture"
+        )
+    ]
+    jobs.sort(
+        key=lambda job: core_util._to_epoch(
+            job.get("updated_at") or job.get("ts") or job.get("timestamp")
+        ),
+        reverse=True,
+    )
+    skipped: dict[str, int] = {}
+    applied = {"added": 0, "superseded": 0}
+    rows: list[dict] = []
+    for job in jobs:
+        result = job.get("capture_result") or {}
+        for reason, count in (result.get("skipped") or {}).items():
+            try:
+                skipped[str(reason)] = skipped.get(str(reason), 0) + max(
+                    0, int(count or 0)
+                )
+            except (TypeError, ValueError):
+                continue
+        for action in applied:
+            try:
+                applied[action] += max(
+                    0, int((result.get("applied") or {}).get(action) or 0)
+                )
+            except (TypeError, ValueError):
+                continue
+        if len(rows) < limit:
+            rows.append({
+                "job_id": str(job.get("job_id") or ""),
+                "status": str(job.get("status") or ""),
+                "status_reason": str(job.get("status_reason") or ""),
+                "updated_at": str(
+                    job.get("updated_at")
+                    or job.get("ts")
+                    or job.get("timestamp")
+                    or ""
+                ),
+                "capture_result": _data_track_capture_doc(result, max_items=20),
+                "memory_action_status": _data_track_capture_doc(
+                    job.get("memory_action_status") or {}, max_items=20
+                ),
+            })
+    return {
+        "jobs_total": len(jobs),
+        "applied": applied,
+        "skipped": skipped,
+        "jobs": rows,
+    }
+
+
 def _proactive_stats(store: UserStore) -> dict:
     decisions = store.list_gate_decisions(limit=0)
     jobs = store.list_proactive_jobs(limit=0)
@@ -1340,6 +1420,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         row["runtime"] = _runtime_summary(store)
         row["provider_attempt_ledger"] = _provider_attempts_detail(store)
         row["v2_chat_failures"] = _v2_chat_failures_detail(user_id)
+        row["memory_capture_validation"] = _memory_capture_validation_detail(store)
         _ps = store.load_proactive_settings()
         row["perception_permissions"] = {
             # what the device reports it granted (free-form; keys are app-defined,
@@ -2290,12 +2371,26 @@ def _fmt_tokens_compact(value) -> str:
 #   p95    —— pre 健康态 chat p95 = 38.1s，留约 1.5× 余量
 #   pending 年龄 —— 对应 claim lag 退化；健康时该值为空
 _RUNTIME_HEALTH_WINDOWS = (24, 168, 720)
+# 本页只按 hours 取窗口，这几个共享参数它一概读不到。`_data_track_qs` 的保留列表
+# 是全视图共用的，所以从别的视图带过来的 day/limit/offset/page 会一路跟着 URL 走、
+# 看着生效实则被无视。2026-07-30 审计实证了它的代价：有人拿
+# `?view=runtime&day=2026-07-25` 的截图当成"7 月 25 日的数据"，而页面渲染的其实是
+# 生成时刻向前 24 小时——参数被静默忽略比参数报错危险，因为页顶还写着「窗口 24
+# 小时」，读者不会怀疑自己看错了日期。本页自己生成的链接一律把它们清掉。
+_RUNTIME_IGNORED_PARAMS = {"day": None, "limit": None, "offset": None, "page": None}
 _RUNTIME_HEALTH_FAILURE_WARN = 0.05
 _RUNTIME_HEALTH_FAILURE_BAD = 0.15
 _RUNTIME_HEALTH_P95_WARN_MS = 60_000
 _RUNTIME_HEALTH_P95_BAD_MS = 120_000
 _RUNTIME_HEALTH_PENDING_WARN_SEC = 60
 _RUNTIME_HEALTH_PENDING_BAD_SEC = 180
+# 交付积压阈值刻意比上面几档宽得多（1 小时 / 6 小时）。effect outbox 与 terminal
+# failure outbox 的**稳态积压年龄我们还没有实测基线**，而值班台最不能犯的错是长期
+# 挂着一条误报的红——那会训练出"这页的红不用看"。宁可先漏报边缘情形，也要保证亮
+# 起来时一定是真堵塞（一条 effect 堵满一小时，无论如何都该有人看）。等 test/pre
+# 跑出稳态分布后再收紧，收紧前不要把它当灵敏的告警用。
+_RUNTIME_DELIVERY_AGE_WARN_SEC = 3600
+_RUNTIME_DELIVERY_AGE_BAD_SEC = 21600
 _RUNTIME_FAILURE_CODE_MAX = 64
 # 按形状放行，不按枚举前缀放行。agent_jobs.last_error 的真实写入点远不止
 # turn_failed:/queue_timeout/lease_timeout 三种（wake_failed:*、
@@ -2321,12 +2416,18 @@ def _runtime_failure_code(raw) -> str:
     return code[:_RUNTIME_FAILURE_CODE_MAX]
 
 
-def _runtime_health_level(payload: dict) -> tuple[str, list[str]]:
+def _runtime_health_level(
+    payload: dict, delivery: dict | None = None
+) -> tuple[str, list[str]]:
     """(总体档位, 中文原因列表)。档位取所有指标里最差的一档。
 
     分母为 0 的指标一律跳过、不参与判定：零样本不是故障。commit 2795537a 的
     re-review 教训——V2-only 合成行的 legacy 分母为 0 曾被渲染成红 0%，3 条健康
     心跳看起来像全挂。
+
+    ``delivery`` 可选（取不到时为 None，见 admin_core 的三个独立失败域）。它必须
+    参与判定而不是只做展示：job 层面全绿但回复/副作用堵在 outbox，正是审计点出的
+    "页面报正常、用户没收到"那类故障，而这种故障在 lane 表里没有任何投影。
     """
     rank = {"ok": 0, "warn": 1, "bad": 2}
     worst = "ok"
@@ -2360,6 +2461,14 @@ def _runtime_health_level(payload: dict) -> tuple[str, list[str]]:
         if missing > 0:
             escalate("bad", f"{name} trajectory capture missing {missing} 条")
 
+        # partial 此前完全不参与判定：只有 missing 才降级，于是一个带 capture_gap
+        # 的回合（轨迹有洞、无法完整回放）在页面上既显示了 partial 计数、总体结论
+        # 又写「正常」。2026-07-30 审计实证了这个组合的危害——截图里明明有 1 个
+        # partial，读者看到的结论是绿的。缺口是真实的取证损失，至少 warn。
+        partial = int((lane.get("capture") or {}).get("partial") or 0)
+        if partial > 0:
+            escalate("warn", f"{name} trajectory 有缺口 {partial} 条（无法完整回放）")
+
         # 卡死形态（claimed/running，无 pending，worker 心跳还活着）：这条 lane
         # 的 job 全部还没到终态，rate/p95/missing 全部为空/0，池层面也看不出
         # 异常——除了这一件事本身就是矛盾态。sampled_jobs==0 却 capture.open>0
@@ -2388,6 +2497,35 @@ def _runtime_health_level(payload: dict) -> tuple[str, list[str]]:
             escalate("bad", f"最老 pending 已排队 {age / 60:.0f} 分钟")
         elif age >= _RUNTIME_HEALTH_PENDING_WARN_SEC:
             escalate("warn", f"最老 pending 已排队 {age:.0f} 秒")
+
+    if delivery:
+        def _delivery_age(label: str, age_sec) -> None:
+            if age_sec is None:
+                return
+            if age_sec >= _RUNTIME_DELIVERY_AGE_BAD_SEC:
+                escalate("bad", f"{label}已堵 {age_sec / 3600:.1f} 小时")
+            elif age_sec >= _RUNTIME_DELIVERY_AGE_WARN_SEC:
+                escalate("warn", f"{label}已堵 {age_sec / 60:.0f} 分钟")
+
+        effect = delivery.get("effect_outbox") or {}
+        # 只按年龄判定、不按条数：积压 500 条但秒级排空是健康的高吞吐，积压 1 条
+        # 卡了两小时才是故障。条数仍然展示（给人看规模），但不进档位。
+        _delivery_age("副作用 outbox", effect.get("oldest_pending_age_sec"))
+
+        failure_outbox = delivery.get("terminal_failure_outbox") or {}
+        _delivery_age(
+            "终态失败投递", failure_outbox.get("oldest_undelivered_age_sec")
+        )
+
+        mutation = delivery.get("mcp_mutation") or {}
+        # 远端 mutation 结果未知 = 我们可能已经改了用户在第三方的数据却无从确认。
+        # 它稀有且不可自愈，出现即需人看，所以不设阈值、见一条就 warn。
+        unknown = int(mutation.get("unknown") or 0)
+        if unknown > 0:
+            escalate("warn", f"MCP 远端改动结果未知 {unknown} 次")
+        unresolved = int(mutation.get("unresolved") or 0)
+        if unresolved > 0:
+            escalate("warn", f"MCP 远端改动悬空未判定 {unresolved} 次")
 
     return worst, reasons
 
@@ -2419,6 +2557,21 @@ def _runtime_health_summary(*, within_hours: int = 24) -> dict:
 # model_api_runtime.v2.jobs_store.recent_token_usage_by_lane.
 def _runtime_token_by_lane(*, within_hours: int = 24) -> dict:
     return {"window_hours": within_hours, "lanes": {}}
+
+
+# Injected by the assembly layer (asgi_app.py); the real implementation is
+# model_api_runtime.v2.jobs_store.recent_delivery_health.
+def _runtime_delivery_health(*, within_hours: int = 24) -> dict:
+    return {
+        "window_hours": within_hours,
+        "effect_outbox": {"pending": 0, "oldest_pending_age_sec": None},
+        "terminal_failure_outbox": {
+            "status_undelivered": 0,
+            "runtime_error_undelivered": 0,
+            "oldest_undelivered_age_sec": None,
+        },
+        "mcp_mutation": {"unknown": 0, "unresolved": 0},
+    }
 
 
 # 本次新增的两个 Runtime 视图页共用这一份样式。刻意没有去改造既有 6 个视图页
@@ -2455,14 +2608,21 @@ _RUNTIME_PAGE_CSS = """
 """
 
 
-def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> str:
+def _render_runtime_health_page(
+    payload: dict,
+    tokens: dict | None = None,
+    delivery: dict | None = None,
+) -> str:
     """Runtime V2 全 lane 运行时健康值班台（?view=runtime）。
 
     本页 = 运行时视角（job 生命周期，窗口可切）；「Proactive 日报」= 产品视角
     （日报送达率，按天）。heartbeat lane 两页都出现但口径不同，故本页该行给出
     指向日报页的链接。
+
+    ``tokens`` / ``delivery`` 都可能是 None（各自独立的失败域，见 admin_core）：
+    取不到时该区块显「暂不可用」，不得把 None 渲染成 0——0 是"确认过是零"。
     """
-    level, reasons = _runtime_health_level(payload)
+    level, reasons = _runtime_health_level(payload, delivery)
     window_hours = int(payload.get("window_hours") or 24)
     lanes = payload.get("lanes") or []
     pool = payload.get("pool") or {}
@@ -2507,7 +2667,7 @@ def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> st
     window_labels = {24: "24 小时", 168: "7 天", 720: "30 天"}
     window_links = "".join(
         f"<a class='sort-button{' active' if hours == window_hours else ''}' "
-        f"href='{html.escape(_data_track_page_href(view='runtime', hours=hours), quote=True)}'>"
+        f"href='{html.escape(_data_track_page_href(view='runtime', hours=hours, **_RUNTIME_IGNORED_PARAMS), quote=True)}'>"
         f"{html.escape(window_labels[hours])}</a>"
         for hours in _RUNTIME_HEALTH_WINDOWS
     )
@@ -2523,6 +2683,40 @@ def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> st
             _fmt_duration_sec(pool_age),
         ),
     ])
+
+    # 交付区块：唯一能看出「job 判成功但产物没到用户」的地方。取不到时明说取不到，
+    # 不拿 0 顶替——这个区块显示 0 的含义是"队列是空的、一切送达了"，与"数据取不到"
+    # 是相反的结论。
+    if delivery is None:
+        delivery_section = (
+            "<div class='note-box'><b>端到端交付数据暂时取不到。</b>"
+            "本页其余部分不受影响；这一项本身也是值得查的信号。</div>"
+        )
+    else:
+        effect = delivery.get("effect_outbox") or {}
+        failure_outbox = delivery.get("terminal_failure_outbox") or {}
+        mutation = delivery.get("mcp_mutation") or {}
+        delivery_section = "<section class='metrics'>" + "".join([
+            _render_metric("副作用积压", _fmt_count(effect.get("pending"))),
+            _render_metric(
+                "最老未 apply",
+                _fmt_duration_sec(effect.get("oldest_pending_age_sec")),
+            ),
+            _render_metric(
+                "失败待投递 status/error",
+                f"{_fmt_count(failure_outbox.get('status_undelivered'))}"
+                f" / {_fmt_count(failure_outbox.get('runtime_error_undelivered'))}",
+            ),
+            _render_metric(
+                "最老未投递",
+                _fmt_duration_sec(failure_outbox.get("oldest_undelivered_age_sec")),
+            ),
+            _render_metric(
+                "MCP 未知/悬空",
+                f"{_fmt_count(mutation.get('unknown'))}"
+                f" / {_fmt_count(mutation.get('unresolved'))}",
+            ),
+        ]) + "</section>"
 
     def _ms_cell(value) -> str:
         if value is None:
@@ -2551,9 +2745,10 @@ def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> st
         else:
             missing = int(capture.get("missing") or 0)
             open_count = int(capture.get("open") or 0)
+            partial = int(capture.get("partial") or 0)
             capture_cell = (
-                f"<td>{int(capture.get('complete') or 0)} / "
-                f"{int(capture.get('partial') or 0)} / "
+                f"<td>{int(capture.get('terminal_seen_no_gap') or 0)} / "
+                f"<b class='{'warn' if partial else ''}'>{partial}</b> / "
                 f"<b class='{'bad' if missing else ''}'>{missing}</b> / "
                 f"{open_count}</td>"
             )
@@ -2569,17 +2764,31 @@ def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> st
                 f"<td>{_fmt_tokens_compact(prompt_tok)} / "
                 f"{_fmt_tokens_compact(completion_tok)}</td>"
             )
+        # 缓存命中率与两种上报覆盖率分列。此前它们挤在一列、标签写「缓存命中 ·
+        # 上报」，那个"上报"指的是 token usage 上报，读者却会当成 cache 上报
+        # （2026-07-30 审计）。cache coverage 与 usage coverage 是两个独立的量。
         hit_ratio = lane_tokens.get("cache_hit_ratio")
-        coverage = lane_tokens.get("usage_coverage")
-        if hit_ratio is None and coverage is None:
-            cache_cell = "<td class='muted'>—</td>"
+        cache_cell = (
+            "<td class='muted'>—</td>" if hit_ratio is None
+            else f"<td>{_fmt_ratio(hit_ratio)}</td>"
+        )
+        usage_cov = lane_tokens.get("usage_coverage")
+        cache_cov = lane_tokens.get("cache_coverage")
+        if usage_cov is None and cache_cov is None:
+            coverage_cell = "<td class='muted'>—</td>"
         else:
-            cache_cell = (
-                f"<td>{_fmt_ratio(hit_ratio)} · {_fmt_ratio(coverage)}</td>"
+            coverage_cell = (
+                f"<td>{_fmt_ratio(usage_cov)} / {_fmt_ratio(cache_cov)}</td>"
             )
         lane_label = html.escape(name)
         if name == "heartbeat":
-            hb_href = _data_track_page_href(view="proactive", hours=None, offset=0)
+            # 同样清掉本页忽略的参数。目标页（Proactive 日报）只读
+            # since/registered_since/days（**复数**），从不读单数 day；limit/offset
+            # 在它的 payload 里也没用——不清的话那些参数会跟着跳过去，在新页面上
+            # 照样是"看着生效实则被无视"，只是换了一跳、可见度更低。
+            hb_href = _data_track_page_href(
+                view="proactive", hours=None, **_RUNTIME_IGNORED_PARAMS
+            )
             lane_label += (
                 f" <a class='muted' style='font-size:12px' "
                 f"href='{html.escape(hb_href, quote=True)}'>（日报口径）</a>"
@@ -2598,6 +2807,7 @@ def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> st
             + capture_cell
             + token_cell
             + cache_cell
+            + coverage_cell
             + "</tr>"
         )
 
@@ -2666,19 +2876,36 @@ def _render_runtime_health_page(payload: dict, tokens: dict | None = None) -> st
     分母一律从 agent_jobs 起算，因此「完全没写 metrics」的回合不会从统计里消失。
     延迟只算成功回合：失败超时会把 p95 拉高，混在一起会让一个故障看起来像两个。
     token 含<b>失败回合</b>——失败也烧钱，与上方失败率不是同一批样本的筛选口径。
-    每条 lane 的健康列还各自共享<b>最近 1000 个 job 的采样上界</b>，token 列
-    是窗口内全量、无采样上界——长窗口下两者覆盖的时间跨度可能不同。
+    健康列与 token 列<b>都是窗口内全量</b>，无采样上界——两者覆盖同一批样本，
+    可以放在一行对账。
     prompt token 已包含 cache read/write，<b>不要与缓存列相加</b>，否则重复计数。
     本页 token 跟随上方窗口；users 页「运营 Telemetry」固定近 30 天，
     两处数字不一致是<b>窗口不同</b>，不是 bug——切到 30 天时应当一致。
-  </div>
+    「上报 usage/cache」是两种<b>不同</b>的覆盖率：前者指有多少次调用回报了 token
+    usage、后者指有多少次回报了缓存指标，不要当成同一个数。
+    捕获列的第一格是「<b>见终态·无缺口</b>」，它<b>不等于</b>轨迹完整：只表示找到了
+    turn_terminal 事件且没有 capture_gap，不保证 prompt / provider 往返 / tool call
+    / 最终回复这些 artifact 都在。有缺口（第二格）意味着<b>取证已经损失</b>，会把
+    总体结论压到「注意」。
+    <b>覆盖范围：</b>本页只统计<b>本实例托管</b>的 Runtime V2 回合。self-host
+    consumer 只会 best-effort 上报部分 provider-attempt 元数据，离线实例完全不可见
+    ——所以本页的 token 与失败率<b>不是全体用户的总量</b>，不能当作全量用量账。
+    <b>本页只按 hours 取窗口</b>（24 / 168 / 720），URL 里的 day / limit / offset
+    在这一页<b>不生效</b>——想看某一天请用 DAU 或 Proactive 日报页。</div>
   {empty_note}
   <h2>Worker 池</h2>
   <section class="metrics">{pool_metrics}</section>
+  <h2>端到端交付</h2>
+  <div class="muted">job 判 completed 只证明回合跑完了，不证明产物到达用户。
+  这里是副作用与失败回包的投递积压——<b>积压条数不参与总体档位，只有"堵了多久"参与</b>
+  （高吞吐下瞬时积压是正常的）。两个 outbox 是<b>当前积压状态</b>，不随上方窗口变化；
+  MCP 两列才是窗口内计数。阈值目前刻意保守（1 小时注意 / 6 小时异常），稳态基线实测
+  后再收紧。</div>
+  {delivery_section}
   <h2>各 lane 健康</h2>
   <table>
-    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>失败</th><th>过期</th><th>superseded</th><th>失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 完整/部分/漏写/在飞</th><th>token 入/出</th><th>缓存命中 · 上报</th></tr></thead>
-    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='12' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
+    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>失败</th><th>过期</th><th>superseded</th><th>失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
+    <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='13' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
   </table>
   <h2>失败原因 Top</h2>
   <table>

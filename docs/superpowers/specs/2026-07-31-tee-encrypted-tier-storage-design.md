@@ -75,7 +75,7 @@ TEE 内容表的 `doc` 是裸 `JSONB`，**没有任何 CHECK 约束**（已核�
 `alembic_tee/versions/0001_tee_baseline.py` 及后续全部迁移）。信封行结构上直接
 存得进去。这是个好消息：本决策不需要新的 `alembic_tee` revision。
 
-> 对比：RDS 侧的 V2 轨迹表**有**表级 CHECK 强制信封形状，那是 `0068` 要放宽的
+> 对比：RDS 侧的 V2 轨迹表**有**表级 CHECK 强制信封形状，那是 `0072` 要放宽的
 > 对象。TEE 侧没有对应约束，不要混淆这两件事。
 
 ### 4.2 `transforms.py`：从「解密器」退化成「透传器」

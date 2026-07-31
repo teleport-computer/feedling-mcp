@@ -208,6 +208,15 @@ async def run_tool_loop(
     extra_mutating_tool_names=None,
     disabled_tool_names=None,
     allow_reply_tool: bool = True,
+    include_reasoning: bool = False,
+    # Self-authored thinking: when True, NEVER request provider-native reasoning —
+    # not via include_reasoning, and NOT via reasoning_effort either. The model then
+    # has no separate native-CoT channel and emits its thinking in the reply's
+    # <think> block instead (which the seal surfaces). This is what aligns V2 with
+    # the V1 resident: without it a reasoning-capable model (e.g. sonnet) puts its
+    # thought in the native channel — shown raw, often in the wrong language — and
+    # skips the <think>. Default False → other lanes unchanged.
+    suppress_native_reasoning: bool = False,
     # Whether a text-free provider reply is an ERROR. Defaults to True, which
     # is the chat lane's rule (a terminal turn with no text is the no-filler
     # failure). The wake lane is the opposite — "weak wake sleeps": a model
@@ -702,9 +711,15 @@ async def run_tool_loop(
             # provider failure. Earlier rounds already captured reasoning, so the
             # tools-disabled correction round intentionally asks for text only.
             if (
-                reasoning_effort
-                and reasoning_effort not in {"off", "none"}
+                (
+                    include_reasoning
+                    or (
+                        reasoning_effort
+                        and reasoning_effort not in {"off", "none"}
+                    )
+                )
                 and not terminal_text_round
+                and not suppress_native_reasoning
             ):
                 provider_kwargs["include_reasoning"] = True
             if on_file_reply is not None:

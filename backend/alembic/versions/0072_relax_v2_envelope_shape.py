@@ -11,15 +11,15 @@ row identity, non-empty body), so this is a widening, not a removal:
   - envelope shape : body_ct + nonce + K_user + K_enclave (unchanged from 0043)
   - plaintext shape: body (string)
 
-Revision ID: 0068_relax_v2_envelope_shape
-Revises: 0067_voice_turn_state
+Revision ID: 0072_relax_v2_envelope_shape
+Revises: 0071_runtime_health_idx
 """
 
 from alembic import op
 
 
-revision = "0068_relax_v2_envelope_shape"
-down_revision = "0067_voice_turn_state"
+revision = "0072_relax_v2_envelope_shape"
+down_revision = "0071_runtime_health_idx"
 branch_labels = None
 depends_on = None
 

@@ -23,7 +23,7 @@ from chat import service as chat_service
 from core.store import UserStore
 
 
-def poll_context(store: UserStore) -> dict:
+def poll_context(store: UserStore, consumer_info: dict | None = None) -> dict:
     """The runtime/release fields advertised on every poll response.
 
     ``runtime_v2`` tells the consumer which resident runtime profile is active;
@@ -37,6 +37,13 @@ def poll_context(store: UserStore) -> dict:
         "runtime_v2": resident_runtime_v2.resident_runtime_v2_public_profile(store),
         "client_release": {"expected_consumer_commit": chat_consumer.expected_consumer_commit()},
         "user_mcp": {"fingerprint": mcp_core.fingerprint_for_store(store)},
+        # A control-plane side channel for a resident-only visual probe. It is
+        # deliberately not a chat row: no history, push, capture, summary, or
+        # Live Activity can observe it. The expected answer never leaves the
+        # server.
+        "vision_probe": chat_consumer.vision_probe_for_poll(
+            store, consumer_info=consumer_info or {}
+        ),
     }
 
 
@@ -146,6 +153,7 @@ def build_response(
         "runtime_v2": context["runtime_v2"],
         "client_release": context["client_release"],
         "user_mcp": context["user_mcp"],
+        "vision_probe": context.get("vision_probe"),
         "timed_out": timed_out,
         "consumer_id": consumer_id,
         "claimed": claim,

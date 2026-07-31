@@ -167,3 +167,75 @@ def test_success_immediately_restores_ok():
     assert restored["last_provider_success_at"] == 20.0
     assert restored["last_probe_at"] == 0.0
     assert restored["user_provider_failure_started_at"] == 0.0
+
+
+# --- latency health ---------------------------------------------------------
+#
+# The failure fields above catch a provider that BREAKS. They cannot see one
+# that merely answers very slowly, because a slow answer is still a success.
+# usr_90184 on prod ran a relay averaging 293 s for five days: every fold hit
+# compaction's own 60 s timeout, the backlog grew to 1201, and no field in this
+# table ever changed to say why. The latency EWMA is that missing signal.
+
+
+def test_first_success_seeds_the_latency_average():
+    out = provider_health.evolve_success({}, now=10.0, latency_ms=4200)
+    assert out["recent_latency_ms"] == 4200
+
+
+def test_latency_average_smooths_instead_of_tracking_the_last_sample():
+    state = provider_health.evolve_success({}, now=1.0, latency_ms=1000)
+    state = provider_health.evolve_success(state, now=2.0, latency_ms=9000)
+    # A single slow answer must move the average without becoming it.
+    assert 1000 < state["recent_latency_ms"] < 9000
+
+
+def test_a_fast_provider_is_not_slow():
+    state = {}
+    for index in range(8):
+        state = provider_health.evolve_success(
+            state, now=float(index), latency_ms=8_000
+        )
+    assert not provider_health.provider_is_slow(state)
+
+
+def test_a_relay_answering_far_past_the_fold_timeout_is_slow():
+    # usr_90184's shape: every answer takes minutes, none of them fail outright.
+    state = {}
+    for index in range(8):
+        state = provider_health.evolve_success(
+            state, now=float(index), latency_ms=293_000
+        )
+    assert provider_health.provider_is_slow(state)
+    assert state["recent_latency_ms"] > provider_health.SLOW_PROVIDER_MS
+
+
+def test_switching_to_a_fast_provider_clears_slow():
+    state = {}
+    for index in range(8):
+        state = provider_health.evolve_success(
+            state, now=float(index), latency_ms=293_000
+        )
+    assert provider_health.provider_is_slow(state)
+    # The user moves to a fast route (openrouter, ~11 s on prod).
+    for index in range(20):
+        state = provider_health.evolve_success(
+            state, now=float(100 + index), latency_ms=11_000
+        )
+    assert not provider_health.provider_is_slow(state)
+
+
+def test_success_without_a_latency_sample_leaves_the_average_untouched():
+    # Callers that cannot measure must not be able to erase the signal.
+    state = provider_health.evolve_success({}, now=1.0, latency_ms=250_000)
+    carried = provider_health.evolve_success(state, now=2.0)
+    assert carried["recent_latency_ms"] == state["recent_latency_ms"]
+    assert provider_health.provider_is_slow(carried)
+
+
+def test_slow_is_independent_of_provider_state():
+    # A slow provider is still `ok` for admission purposes — this signal
+    # explains latency, it does not gate anything.
+    state = provider_health.evolve_success({}, now=1.0, latency_ms=250_000)
+    assert state["provider_state"] == provider_health.PROVIDER_STATE_OK
+    assert provider_health.provider_is_slow(state)

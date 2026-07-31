@@ -170,10 +170,21 @@ def actions(
     _results = body.get("results") if isinstance(body.get("results"), list) else []
     debug_trace.trace_event(
         store, subsystem="memory", type="memory.write.actions", actor="agent",
-        status="ok" if status < 400 else "failed",
+        status=(
+            "failed"
+            if status >= 400 or int(body.get("failed_count") or 0) == len(_results)
+            else "partial"
+            if int(body.get("failed_count") or 0) > 0
+            else "ok"
+        ),
         summary=f"{len(acts)} action(s): " + ",".join(t.split('.')[-1] for t in _types)[:80],
         detail={
-            "counts": {"actions": len(acts)},
+            "counts": {
+                "actions": len(acts),
+                "applied": int(body.get("applied_count") or 0),
+                "skipped": int(body.get("skipped_count") or 0),
+                "failed": int(body.get("failed_count") or 0),
+            },
             "types": _types,
             "results": [str(r.get("skipped") or r.get("status") or "") for r in _results][:20],
         },

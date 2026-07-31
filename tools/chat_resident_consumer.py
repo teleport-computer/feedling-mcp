@@ -141,6 +141,7 @@ from core import protocol_leak as _protocol_leak
 from memory.capture_prompt_v1 import (
     build_capture_prompt,
     build_capture_retry_prompt,
+    build_capture_semantic_retry_prompt,
     parse_capture_cards,
     sanitize_user_name,
 )
@@ -196,6 +197,12 @@ class AgentTurn:
     thinking_source: str = ""
     thinking_model: str = ""
     thinking_native: bool | None = None
+    # TRUE only when this thinking was parsed out of a leading <think> block by our
+    # own local parser (_split_tagged_thinking) on THIS host — never set from any
+    # provider/CLI JSON field. This is the spoof-proof provenance the self-authored
+    # precedence keys off: an upstream turn that merely *declares*
+    # reasoning_source="self_thinking" in its JSON cannot flip this flag.
+    thinking_self_authored: bool = False
     actions: list[dict] = field(default_factory=list)
     runtime_debug: dict = field(default_factory=dict)
     tool_calls: list[dict] = field(default_factory=list)
@@ -418,6 +425,9 @@ PROACTIVE_STALE_CHAT_FALLBACK_LIMIT = int(os.environ.get("PROACTIVE_STALE_CHAT_F
 MAINTENANCE_IDLE_SEC = int(os.environ.get("FEEDLING_MAINTENANCE_IDLE_SEC", "300"))
 MAINTENANCE_MAX_DEFER_SEC = int(os.environ.get("FEEDLING_MAINTENANCE_MAX_DEFER_SEC", "7200"))
 CAPTURE_HISTORY_LIMIT = int(os.environ.get("FEEDLING_CAPTURE_HISTORY_LIMIT", "160"))
+# One shared budget across format and semantic correction. A format bounce
+# consumes it, so semantic validation can never multiply a job into four calls.
+CAPTURE_AGENT_REASK_BUDGET = 1
 CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "12000"))
 CAPTURE_CONTEXT_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_CONTEXT_MAX_CHARS", "4000"))
 DREAM_MEMORY_INDEX_LIMIT = int(os.environ.get("FEEDLING_DREAM_MEMORY_INDEX_LIMIT", "0"))
@@ -437,6 +447,7 @@ AGENT_SESSION_MAX_TURNS = int(os.environ.get("AGENT_SESSION_MAX_TURNS", "40"))
 AGENT_SESSION_MAX_BYTES = int(os.environ.get("AGENT_SESSION_MAX_BYTES", "250000"))
 AGENT_SESSION_ROTATE_PREFIX = os.environ.get("AGENT_SESSION_ROTATE_PREFIX", "feedling-io")
 HERMES_SESSION_REASONING_MAX_BYTES = int(os.environ.get("HERMES_SESSION_REASONING_MAX_BYTES", "2000000"))
+CODEX_SESSION_REASONING_MAX_BYTES = int(os.environ.get("CODEX_SESSION_REASONING_MAX_BYTES", "8000000"))
 IMAGE_TEMP_DIR = Path(os.environ.get(
     "IMAGE_TEMP_DIR",
     f"/tmp/feedling_chat_images_{CHECKPOINT_API_KEY_FINGERPRINT}"))
@@ -645,17 +656,33 @@ class VisionObserverFailure(RuntimeError):
         status_code: int | None = None,
         detail: str = "",
         raw_user_text: str = "",
+        model: str = "",
+        provider: str = "",
     ):
         super().__init__(error_class)
         self.error_class = error_class[:64] or "vision_model_failed"
         self.status_code = status_code
         self.detail = detail[:160]
         self.raw_user_text = raw_user_text
+        self.model = _sanitize_thinking_meta(model, max_len=96)
+        self.provider = _sanitize_thinking_meta(provider, max_len=80)
 
 
 def _vision_failure_user_text(error_class: str, raw_user_text: str) -> str:
-    chinese = bool(re.search(r"[\u4e00-\u9fff]", raw_user_text or ""))
+    raw = raw_user_text or ""
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", raw))
+    has_latin = bool(re.search(r"[A-Za-z]", raw))
+    archive_language = str(
+        globals().get("_whoami_cache", {}).get("archive_language") or ""
+    ).strip().lower()
+    chinese = has_cjk or (
+        not has_latin and archive_language.startswith("zh")
+    )
     zh = {
+        "vision_model_required": (
+            "由于当前模型没有视觉能力，模型无法收到图片信息，"
+            "建议更改模型或在设置页单独添加视觉模型"
+        ),
         "vision_model_auth_invalid": "视觉模型的 API Key 无效或已过期，请到设置里重新保存。",
         "vision_model_quota_insufficient": "视觉模型服务额度不足，充值后再试。",
         "vision_model_not_found": "当前视觉模型不可用，请到设置里更换模型。",
@@ -668,6 +695,10 @@ def _vision_failure_user_text(error_class: str, raw_user_text: str) -> str:
         "vision_model_failed": "视觉模型处理失败，请重试；如果仍失败，请更换模型。",
     }
     en = {
+        "vision_model_required": (
+            "Your current model can't process images, so it didn't receive this "
+            "picture. Switch models, or add a dedicated vision model in Settings."
+        ),
         "vision_model_auth_invalid": "The vision model API key is invalid or expired. Save it again in Settings.",
         "vision_model_quota_insufficient": "The vision model service is out of quota. Top it up, then try again.",
         "vision_model_not_found": "The selected vision model is unavailable. Choose another model in Settings.",
@@ -708,6 +739,18 @@ _ERROR_CLASS_RULES = (
     ("cli_config_invalid", "user_provider",
      "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。",
      re.compile(r"missing the \{message\} placeholder", re.I)),
+    # Real provider responses observed 2026-07-30 when text-only models received
+    # an image_url block:
+    #   provider_http_400: Failed to deserialize ... unknown variant
+    #   `image_url`, expected `text`                  (DeepSeek native)
+    #   No endpoints found that support image input  (OpenRouter)
+    # Keep this ahead of provider_incompatible's broad "unknown variant" rule
+    # and the broad 404+model fallback in classify_agent_error so a text-only
+    # main model gets the dedicated Settings guidance.
+    ("vision_model_required", "user_provider",
+     "由于当前模型没有视觉能力，模型无法收到图片信息，建议更改模型或在设置页单独添加视觉模型",
+     re.compile(r"unknown variant `image_url`, expected `text`"
+                r"|no endpoints found that support image input", re.I)),
     ("provider_incompatible", "user_provider",
      "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。",
      re.compile(r"unknown variant|not supported|unsupported (parameter|tool)"
@@ -735,7 +778,7 @@ _ERROR_CLASS_RULES = (
 )
 
 # 机读全集导出，供 backend/notices/catalog.py 的一致性测试比对（spec Phase B /
-# B3）：_ERROR_CLASS_RULES 里的 8 类 + classify_agent_error 硬编码分支里的
+# B3）：_ERROR_CLASS_RULES 里的规则类 + classify_agent_error 硬编码分支里的
 # turn_timeout / reply_parse_failed / model_not_found（裸 404+model）/ unknown。
 # 只是把已有分类逻辑的 error_class 取值收成集合，不改分类逻辑本身。
 CONSUMER_ERROR_CLASSES = frozenset(
@@ -751,6 +794,7 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
         blame = (
             "user_provider"
             if exc.error_class in {
+                "vision_model_required",
                 "vision_model_auth_invalid",
                 "vision_model_quota_insufficient",
                 "vision_model_not_found",
@@ -780,13 +824,17 @@ def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
         return AgentErrorNotice("reply_parse_failed", "system",
                                 "系统处理回复时出了问题，我们会尽快排查。", detail)
     lowered = text.lower()
+    # Specific semantic rules must run before the broad 404+model compatibility
+    # fallback. OpenRouter's image rejection is a 404 and wrappers may include
+    # the model id; classifying that as model_not_found would send the user to
+    # edit a valid model name instead of adding a vision route.
+    for klass, blame, user_text, pat in _ERROR_CLASS_RULES:
+        if pat.search(text):
+            return AgentErrorNotice(klass, blame, user_text, detail)
     # 404 需与 model 同现才算模型错（裸 404 归 upstream_unavailable 太粗、归 auth 又错）
     if re.search(r"\b404\b", text) and "model" in lowered:
         return AgentErrorNotice("model_not_found", "user_provider",
                                 "模型名不可用，请检查设置里的模型名。", detail)
-    for klass, blame, user_text, pat in _ERROR_CLASS_RULES:
-        if pat.search(text):
-            return AgentErrorNotice(klass, blame, user_text, detail)
     return AgentErrorNotice("unknown", "system", "连接模型服务时出了问题。", detail)
 
 
@@ -794,7 +842,11 @@ def _system_notice_body(notice: AgentErrorNotice) -> str:
     return f"⚠️ {notice.user_text}\n详情: {notice.detail}"
 
 
-def turn_failure_post_kwargs(notice: "AgentErrorNotice | None") -> dict:
+def turn_failure_post_kwargs(
+    notice: "AgentErrorNotice | None",
+    *,
+    failure: BaseException | None = None,
+) -> dict:
     """把分类结果转成 post_reply 的 turn-failure kwargs（spec 2026-07-18 §2.2）。
 
     只带 error_class / blame / user_text —— detail 绝不下发（可能夹带 provider
@@ -802,11 +854,23 @@ def turn_failure_post_kwargs(notice: "AgentErrorNotice | None") -> dict:
     无失败时返回空 dict，成功路径零变化。"""
     if notice is None:
         return {}
-    return {
+    body = {
         "turn_failure_error_class": notice.error_class[:64],
         "turn_failure_blame": notice.blame[:32],
         "turn_failure_user_text": notice.user_text[:500],
     }
+    if failure is not None:
+        model = _sanitize_thinking_meta(
+            getattr(failure, "model", ""), max_len=96
+        )
+        provider = _sanitize_thinking_meta(
+            getattr(failure, "provider", ""), max_len=80
+        )
+        if model:
+            body["turn_failure_model"] = model
+        if provider:
+            body["turn_failure_provider"] = provider
+    return body
 
 
 # 聊天流失败横幅节流（Seven 定稿 2026-07-11）：
@@ -1105,6 +1169,9 @@ def _agent_runtime_metadata(
     provider = _safe_runtime_header(os.environ.get("FEEDLING_AGENT_PROVIDER"))
     provider_is_explicit = bool(provider)
     explicit_modalities = os.environ.get("FEEDLING_AGENT_INPUT_MODALITIES", "")
+    modalities_source = (
+        "explicit" if "FEEDLING_AGENT_INPUT_MODALITIES" in os.environ else ""
+    )
     modalities = sorted({
         item.strip().lower()
         for item in explicit_modalities.split(",")
@@ -1162,6 +1229,7 @@ def _agent_runtime_metadata(
                             "text", "image", "audio", "video"
                         }
                     })
+                    modalities_source = "pi_catalog"
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
 
@@ -1169,19 +1237,36 @@ def _agent_runtime_metadata(
         "provider": provider,
         "model": model,
         "input_modalities": modalities,
+        "input_modalities_source": modalities_source,
     }
 
 
 AGENT_RUNTIME_METADATA = _agent_runtime_metadata()
 
 
+def _agent_entry_signature() -> str:
+    """Stable, secret-free identity for the configured model entry."""
+    payload = json.dumps(
+        {
+            "mode": AGENT_MODE,
+            "command": AGENT_CLI_CMD,
+            "http_model": AGENT_HTTP_MODEL,
+            "runtime": AGENT_RUNTIME_METADATA,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 _HEADERS = {
     "X-API-Key": FEEDLING_API_KEY,
     "X-Feedling-Consumer": "feedling-chat-resident",
-    "X-Feedling-Consumer-Capabilities": "vision_observer_v1",
+    "X-Feedling-Consumer-Capabilities": "vision_observer_v1,vision_probe_v2",
     "X-Feedling-Consumer-Id": CONSUMER_ID,
     "X-Feedling-Consumer-Version": "resident-v1",
     "X-Feedling-Consumer-Commit": RUNNING_COMMIT,
+    "X-Feedling-Agent-Entry-Signature": _agent_entry_signature(),
 }
 if AGENT_RUNTIME_METADATA["provider"]:
     _HEADERS["X-Feedling-Agent-Provider"] = AGENT_RUNTIME_METADATA["provider"]
@@ -1190,6 +1275,10 @@ if AGENT_RUNTIME_METADATA["model"]:
 if AGENT_RUNTIME_METADATA["input_modalities"]:
     _HEADERS["X-Feedling-Agent-Input-Modalities"] = ",".join(
         AGENT_RUNTIME_METADATA["input_modalities"]
+    )
+if AGENT_RUNTIME_METADATA["input_modalities_source"]:
+    _HEADERS["X-Feedling-Agent-Input-Modalities-Source"] = (
+        AGENT_RUNTIME_METADATA["input_modalities_source"]
     )
 
 
@@ -1419,6 +1508,10 @@ def _runtime_repo_files() -> set[str]:
     files.update(
         {
             "tools/io_cli.py",
+            # io_cli imports this pure policy module for its closed --source
+            # choices. It runs as a subprocess, so its imports are invisible
+            # to this process's sys.modules-derived dependency list.
+            "backend/memory/source_policy.py",
             # Imported lazily inside _prepend_io_cli_capability_catalog, so it
             # may not yet be in sys.modules when a release-diff check runs;
             # register it explicitly so a release that only touches the
@@ -2682,6 +2775,8 @@ def _vision_observation(message_id: str, route_id: str) -> str:
             str(body.get("error_class") or body.get("error") or "vision_model_unavailable"),
             status_code=status_code,
             detail=str(body.get("detail") or "")[:160],
+            model=str(body.get("model") or ""),
+            provider=str(body.get("provider") or ""),
         )
     observation = str(body.get("observation") or "").strip()
     if not observation:
@@ -3898,20 +3993,43 @@ def _thinking_summary_from_value(value: Any) -> str:
     return ""
 
 
-def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
-    dst.actions.extend(src.actions)
-    dst.messages.extend(src.messages)
-    dst.tool_calls.extend(src.tool_calls)
-    prefer_src_thinking = bool(src.thinking_summary) and (
-        not dst.thinking_summary
-        or (src.thinking_native is True and dst.thinking_native is not True)
-    )
-    if prefer_src_thinking:
+def _prefer_thinking(dst: AgentTurn, src: AgentTurn) -> None:
+    """Adopt ``src``'s thinking into ``dst`` per the self-authored precedence.
+
+    THE single decision point for "whose thinking wins" — every path that can
+    carry thinking (object merge, stream fallback, …) routes through here so no
+    arrival order silently bypasses the rule.
+
+    Feature ON: a locally-parsed self-authored <think> (``thinking_self_authored``,
+    which upstream JSON cannot forge) wins over provider-native reasoning; within
+    the same provenance class the first-seen thinking is kept. Feature OFF: legacy
+    rule — provider-native reasoning wins over inlined content.
+    """
+    if not src.thinking_summary:
+        return
+    if not dst.thinking_summary:
+        take = True
+    else:
+        from core import self_thinking as _self_thinking_v1
+
+        if _self_thinking_v1.enabled():
+            take = src.thinking_self_authored and not dst.thinking_self_authored
+        else:
+            take = src.thinking_native is True and dst.thinking_native is not True
+    if take:
         dst.thinking_summary = src.thinking_summary
         dst.thinking_kind = src.thinking_kind
         dst.thinking_source = src.thinking_source
         dst.thinking_model = src.thinking_model
         dst.thinking_native = src.thinking_native
+        dst.thinking_self_authored = src.thinking_self_authored
+
+
+def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
+    dst.actions.extend(src.actions)
+    dst.messages.extend(src.messages)
+    dst.tool_calls.extend(src.tool_calls)
+    _prefer_thinking(dst, src)
     dst.runtime_debug.update(src.runtime_debug)
     return dst
 
@@ -4161,12 +4279,11 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
             for item in json_objects:
                 _merge_agent_turn(turn, _agent_turn_from_obj(item))
             stream_turn = _agent_turn_from_stream_json_events(json_objects)
-            if stream_turn.thinking_summary and not turn.thinking_summary:
-                turn.thinking_summary = stream_turn.thinking_summary
-                turn.thinking_kind = stream_turn.thinking_kind
-                turn.thinking_source = stream_turn.thinking_source
-                turn.thinking_model = stream_turn.thinking_model
-                turn.thinking_native = stream_turn.thinking_native
+            # Route through the shared precedence, NOT a bare "only if empty" copy:
+            # when a full assistant block already landed native reasoning and the
+            # <think> only shows up in later text_delta events, stream_turn is the
+            # self-authored one and must be able to win over that native (feature on).
+            _prefer_thinking(turn, stream_turn)
             if stream_turn.messages and not turn.messages:
                 turn.messages = stream_turn.messages
             # It WAS transport — return its result even when empty (e.g. a lone
@@ -4179,13 +4296,17 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         raw, tagged_thinking = _split_tagged_thinking(raw)
         raw = _truncate_at_unclosed_thinking(raw)
         if tagged_thinking:
-            # Inlined reasoning is NOT provider-native — keep it as a non-native
-            # fallback so a genuine provider-native reasoning still wins in
-            # _merge_agent_turn.
+            # Our self-authored <think> block, parsed locally on THIS host. With the
+            # feature on, the precedence in _merge_agent_turn PREFERS this over the
+            # model's native reasoning ("有 <think> 就用它"); with the feature off,
+            # native still wins (legacy behavior). thinking_self_authored is the
+            # spoof-proof marker (set ONLY here); native-ness is recorded honestly as
+            # False — it is io's own thought, not provider CoT.
             turn.thinking_summary = _sanitize_thinking_summary(tagged_thinking)
             turn.thinking_kind = "provider_reasoning_summary"
             turn.thinking_source = "tagged_content"
             turn.thinking_native = False
+            turn.thinking_self_authored = True
         if not raw.strip():
             return turn
         decision, payload = _scan_visible_protocol(raw)
@@ -4581,6 +4702,59 @@ def _codex_turn_from_stream(raw: str) -> tuple[str, str]:
 def _codex_reply_from_stream(raw: str) -> str:
     """Back-compat shim: the assistant reply only (reasoning dropped)."""
     return _codex_turn_from_stream(raw)[0]
+
+
+def _codex_thread_id_from_stream(raw: str) -> str:
+    """Return the Codex thread id without treating it as a resumable CLI session."""
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict) or obj.get("type") != "thread.started":
+            continue
+        thread_id = str(obj.get("thread_id") or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,200}", thread_id):
+            return thread_id
+    return ""
+
+
+def _codex_session_reasoning(thread_id: str) -> str:
+    """Read Codex's public reasoning summary when ``exec --json`` omits it."""
+    sid = (thread_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", sid):
+        return ""
+    codex_home = Path(os.environ.get("CODEX_HOME", "").strip() or (Path.home() / ".codex"))
+    try:
+        candidates = list((codex_home / "sessions").glob(f"*/*/*/rollout-*-{sid}.jsonl"))
+        if not candidates:
+            return ""
+        path = max(candidates, key=lambda candidate: candidate.stat().st_mtime)
+        size = path.stat().st_size
+        if size < 0 or size > CODEX_SESSION_REASONING_MAX_BYTES:
+            return ""
+        public_summaries: list[str] = []
+        structured_summaries: list[str] = []
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            payload = obj.get("payload") if isinstance(obj, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            event_type = str(payload.get("type") or "").strip()
+            if event_type == "agent_reasoning":
+                text = payload.get("text")
+                if isinstance(text, str) and text.strip():
+                    public_summaries.append(text.strip())
+            elif event_type == "reasoning":
+                for item in payload.get("summary") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        structured_summaries.append(text.strip())
+        summaries = public_summaries or structured_summaries
+        return _sanitize_thinking_summary("\n\n".join(dict.fromkeys(summaries)))
+    except Exception:
+        return ""
 
 
 def _claude_turn_from_stream(raw: str) -> tuple[str, str]:
@@ -5059,13 +5233,19 @@ def _provider_attempt_rows_for_result(
     }]
 
 
-def _extract_text_from_cli_output(raw: str) -> str:
+def _extract_text_from_cli_output(raw: str, *, preserve_tagged: bool = False) -> str:
     """Best-effort extraction from raw CLI stdout.
 
     1. Try JSON parse first when a runtime provides structured output.
     2. Remove explicit reasoning/code sections.
     3. Strip known headers/footers.
     4. Return the full remaining answer, preserving multi-paragraph replies.
+
+    ``preserve_tagged``: when True, a leading self-authored ``<think>`` block is
+    left in the returned text instead of being stripped and discarded. The chat
+    lane sets this so a downstream parse can still recover the self-authored
+    thinking; memory lanes keep the default (strip) so their own extractors see
+    clean text.
     """
     raw = raw.strip()
     if not raw:
@@ -5079,7 +5259,8 @@ def _extract_text_from_cli_output(raw: str) -> str:
         if text:
             return text
 
-    raw, _tagged_thinking = _split_tagged_thinking(raw)
+    if not preserve_tagged:
+        raw, _tagged_thinking = _split_tagged_thinking(raw)
     raw = _strip_reasoning_sections(raw)
     clean = [ln.rstrip() for ln in raw.splitlines() if not _NOISE_LINE_RE.match(ln)]
     text = "\n".join(clean).strip()
@@ -5181,18 +5362,25 @@ def _bare_cards_json(body: Any) -> str:
     return ""
 
 
-def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = None, raw_text: bool = False) -> Any:
+def _call_agent_http_simple(
+    message: str,
+    images: list[dict[str, str]] | None = None,
+    raw_text: bool = False,
+    *,
+    isolated_session: bool = False,
+) -> Any:
     headers = _agent_http_headers()
     payload = {"message": message}
     if images:
         payload["images"] = images
     resp = _HTTP.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=60)
     resp.raise_for_status()
-    _remember_http_session(
-        resp,
-        sent_bytes=len(message.encode("utf-8")),
-        received_bytes=_response_text_len(resp),
-    )
+    if not isolated_session:
+        _remember_http_session(
+            resp,
+            sent_bytes=len(message.encode("utf-8")),
+            received_bytes=_response_text_len(resp),
+        )
     body = resp.json()
     if raw_text:
         text = _raw_assistant_text(body)
@@ -5213,12 +5401,18 @@ def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = 
     raise ValueError(f"unexpected response type: {type(body)}")
 
 
-def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = None, raw_text: bool = False) -> Any:
+def _call_agent_http_openai(
+    message: str,
+    images: list[dict[str, str]] | None = None,
+    raw_text: bool = False,
+    *,
+    isolated_session: bool = False,
+) -> Any:
     headers = _agent_http_headers()
-    sid = _load_agent_session_id()
+    sid = "" if isolated_session else _load_agent_session_id()
     if sid:
         headers[AGENT_HTTP_SESSION_HEADER] = sid
-    session_key = _agent_session_key()
+    session_key = "" if isolated_session else _agent_session_key()
     if session_key:
         headers[AGENT_HTTP_SESSION_KEY_HEADER] = session_key
 
@@ -5238,11 +5432,12 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
     }
     resp = _HTTP.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=120)
     resp.raise_for_status()
-    _remember_http_session(
-        resp,
-        sent_bytes=len(str(content).encode("utf-8")),
-        received_bytes=_response_text_len(resp),
-    )
+    if not isolated_session:
+        _remember_http_session(
+            resp,
+            sent_bytes=len(str(content).encode("utf-8")),
+            received_bytes=_response_text_len(resp),
+        )
     body = resp.json()
     if not isinstance(body, dict):
         raise ValueError(f"unexpected OpenAI response type: {type(body)}")
@@ -5261,13 +5456,25 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
     raise ValueError("OpenAI-compatible response has no usable reply text")
 
 
-def call_agent_http(message: str, images: list[dict[str, str]] | None = None, raw_text: bool = False) -> Any:
+def call_agent_http(
+    message: str,
+    images: list[dict[str, str]] | None = None,
+    raw_text: bool = False,
+    *,
+    isolated_session: bool = False,
+) -> Any:
     if not AGENT_HTTP_URL:
         raise ValueError("AGENT_HTTP_URL is not set for http mode")
     if AGENT_HTTP_PROTOCOL in {"openai", "hermes", "chat_completions", "chat-completions"}:
-        return _call_agent_http_openai(message, images=images, raw_text=raw_text)
+        return _call_agent_http_openai(
+            message, images=images, raw_text=raw_text,
+            isolated_session=isolated_session,
+        )
     if AGENT_HTTP_PROTOCOL in {"simple", "generic", "json"}:
-        return _call_agent_http_simple(message, images=images, raw_text=raw_text)
+        return _call_agent_http_simple(
+            message, images=images, raw_text=raw_text,
+            isolated_session=isolated_session,
+        )
     raise ValueError(f"unknown AGENT_HTTP_PROTOCOL: {AGENT_HTTP_PROTOCOL!r}")
 
 
@@ -5355,21 +5562,6 @@ def _agent_session_file_for_user() -> Path:
 
 def _agent_session_user_id() -> str:
     return (_whoami_cache.get("user_id") or "unknown").strip() or "unknown"
-
-
-def _agent_entry_signature() -> str:
-    """Stable, secret-free identity for the configured model entry."""
-    payload = json.dumps(
-        {
-            "mode": AGENT_MODE,
-            "command": AGENT_CLI_CMD,
-            "http_model": AGENT_HTTP_MODEL,
-            "runtime": AGENT_RUNTIME_METADATA,
-        },
-        ensure_ascii=True,
-        sort_keys=True,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _empty_agent_session_meta(session_id: str = "") -> dict[str, Any]:
@@ -6262,8 +6454,14 @@ def _prepare_cli_command(
     message: str,
     image_paths: list[str] | None = None,
     lane: str = "background",
+    *,
+    session_id_override: str | None = None,
 ) -> tuple[list[str], str | None]:
-    sid = _load_agent_session_id()
+    sid = (
+        _load_agent_session_id()
+        if session_id_override is None
+        else session_id_override
+    )
     template_has_image_slot = "{image_path" in AGENT_CLI_CMD
     # codex gets pixels natively via injected --image= flags (_inject_codex_images);
     # skip the file-path prose that only makes sense for a runtime that must open
@@ -6675,6 +6873,7 @@ def call_agent_cli(
     lane: str = "background",
     attempt_trigger: str = "first",
     stream_update: Callable[[int, str, bool], None] | None = None,
+    isolated_session: bool = False,
 ) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
@@ -6699,7 +6898,19 @@ def call_agent_cli(
             "message cannot reach the agent. Add {message} to the command "
             "template (e.g. claude -p \"{message}\")."
         )
-    cmd, stdin_msg = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
+    isolated_sid = _new_agent_session_id() if isolated_session else None
+    prepare_kwargs: dict[str, Any] = {
+        "image_paths": image_paths,
+        "lane": lane,
+    }
+    if isolated_sid is not None:
+        prepare_kwargs["session_id_override"] = isolated_sid
+    cmd, stdin_msg = _prepare_cli_command(message, **prepare_kwargs)
+    # Self-authored thinking does NOT strip the driver's native reasoning flags: the
+    # model keeps thinking natively (answer quality unchanged), and we additionally
+    # ask it to open its reply with a <think> block (see the prompt injection on the
+    # chat dispatch path). When the model writes that block we prefer it; otherwise we
+    # display the shaped native reasoning. So native reasoning stays on here.
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     _turn_t0 = time.monotonic()
@@ -6875,7 +7086,7 @@ def call_agent_cli(
         observed_sid = command_sid or _extract_session_id(raw_transport)
     else:
         observed_sid = _extract_session_id(raw_transport) or command_sid
-    if observed_sid:
+    if observed_sid and not isolated_session:
         _save_agent_session_id(observed_sid)
         _record_agent_session_turn(
             observed_sid,
@@ -6896,6 +7107,7 @@ def call_agent_cli(
         if (
             _is_claude_code_cmd(cmd)
             and _resume_sid
+            and not isolated_session
             and _resume_sid == _load_agent_session_id()
             and _CLAUDE_MISSING_SESSION_RE.search(raw_transport)
         ):
@@ -6987,7 +7199,7 @@ def call_agent_cli(
                 ))
             _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
             raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
-            if observed_sid:
+            if observed_sid and not isolated_session:
                 _record_agent_session_turn(
                     observed_sid,
                     sent_bytes=len((message or "").encode("utf-8")),
@@ -7010,7 +7222,11 @@ def call_agent_cli(
             # 0 EVEN ON API ERRORS (see the raise below), so returncode is not pi's
             # success signal. A failed turn must not eat the bridge, or the retry
             # faces a blank session with no history and the user drops out.
-            if observed_sid and _message_has_injected_history(message):
+            if (
+                observed_sid
+                and not isolated_session
+                and _message_has_injected_history(message)
+            ):
                 _mark_agent_session_bridged(observed_sid)
             # Same lane discipline as codex: background memory lanes (raw_text)
             # get the bare reply; only foreground chat folds thinking into the
@@ -7042,6 +7258,10 @@ def call_agent_cli(
     # reply, or — on codex 0.142 — leak the reasoning summary as a chat bubble).
     if _is_codex_cmd(cmd):
         codex_reply, codex_reasoning = _codex_turn_from_stream(result.stdout)
+        if not codex_reasoning:
+            codex_reasoning = _codex_session_reasoning(
+                _codex_thread_id_from_stream(result.stdout)
+            )
         if codex_reply:
             # Background memory lanes (raw_text) parse the model's literal output
             # with their own extractors — hand them the bare reply untouched. Only
@@ -7063,7 +7283,11 @@ def call_agent_cli(
     if _is_hermes_chat_cmd(cmd) and observed_sid:
         hermes_reasoning = _hermes_session_reasoning(observed_sid)
     if hermes_reasoning:
-        text = _extract_text_from_cli_output(raw)
+        # Keep a leading self-authored <think> in the reply text: the downstream
+        # re-parse recovers it and (feature on) prefers it over this hermes native
+        # reasoning. Without preserve_tagged the <think> was stripped and discarded
+        # here, so hermes turns could never show self-authored thinking.
+        text = _extract_text_from_cli_output(raw, preserve_tagged=True)
         if text.strip():
             return _attach_provider_reasoning(
                 text,
@@ -7364,6 +7588,7 @@ def call_agent(
     lane: str = "background",
     attempt_trigger: str = "first",
     stream_update: Callable[[int, str, bool], None] | None = None,
+    isolated_session: bool = False,
 ) -> Any:
     # `_turn_reply_parse_failed` is a per-turn signal: reset it at entry so a
     # prior turn's failure (or a suppressed leak below) never bleeds into this
@@ -7377,12 +7602,25 @@ def call_agent(
             # http path metrics/timing are out of scope for this event pair (cli-only);
             # trace_id is accepted here for a uniform call signature but unused.
             # lane gates MCP injection, which only exists on the cli path — unused here.
-            return call_agent_http(message, images=images, raw_text=raw_text)
+            http_kwargs: dict[str, Any] = {
+                "images": images,
+                "raw_text": raw_text,
+            }
+            if isolated_session:
+                http_kwargs["isolated_session"] = True
+            return call_agent_http(message, **http_kwargs)
         if AGENT_MODE == "cli":
-            return call_agent_cli(
-                message, image_paths=image_paths, raw_text=raw_text,
-                trace_id=trace_id, lane=lane, attempt_trigger=attempt_trigger,
-                stream_update=stream_update)
+            cli_kwargs: dict[str, Any] = {
+                "image_paths": image_paths,
+                "raw_text": raw_text,
+                "trace_id": trace_id,
+                "lane": lane,
+                "attempt_trigger": attempt_trigger,
+                "stream_update": stream_update,
+            }
+            if isolated_session:
+                cli_kwargs["isolated_session"] = True
+            return call_agent_cli(message, **cli_kwargs)
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
     raw = _call_with_resident_busy_poll(_invoke, lane=lane)
@@ -7786,11 +8024,11 @@ class ActionsHTTPError(RuntimeError):
     completely unaffected; this only ADDS an attribute for callers that want
     it.
 
-    C2: both backends write a batch SERIALLY and stop at the first failing
-    item (backend/identity/actions.py's ``_execute_identity_actions`` /
-    backend/memory/actions.py's ``_execute_memory_actions``), so a 4xx body
-    still carries the real ``results``/``effects`` of any leading actions
-    that DID apply before the failure. Treating the whole bucket as
+    C2: identity batches and older memory servers may stop at the first failing
+    item, so a 4xx body can still carry the real ``results``/``effects`` of
+    leading actions that DID apply before the failure. Current memory servers
+    instead return 200 with one result per item. Treating a recovered 4xx
+    bucket as
     uniformly failed would invite a caller to retry the ENTIRE batch,
     re-applying those already-applied, possibly non-idempotent leading
     actions a second time (e.g. a dimension_nudge applied twice). ``body``
@@ -7849,8 +8087,12 @@ def execute_memory_actions(actions: list[dict]) -> dict:
             body=_parse_actions_error_body(resp),
         )
     body = resp.json()
-    if not isinstance(body, dict) or body.get("status") not in {"ok", "created", "replaced"}:
+    if not isinstance(body, dict) or body.get("status") not in {
+        "ok", "partial", "failed", "created", "replaced"
+    }:
         raise RuntimeError(f"memory_actions_unexpected_response:{str(body)[:500]}")
+    if not isinstance(body.get("results"), list):
+        raise RuntimeError(f"memory_actions_results_missing:{str(body)[:500]}")
     return body
 
 
@@ -7960,6 +8202,97 @@ def _action_result_outcome(item: Any) -> tuple[str, str]:
     return "failed_execution", "invalid_result"
 
 
+def _memory_batch_observation(actions: list[dict], body: dict) -> dict:
+    """Count actual per-item memory outcomes; never infer success from HTTP 200."""
+    results = body.get("results") if isinstance(body, dict) else None
+    rows = results if isinstance(results, list) else []
+    applied: dict[str, int] = {
+        "added": 0,
+        "superseded": 0,
+        "upgraded": 0,
+        "deleted": 0,
+        "retyped": 0,
+    }
+    skipped: dict[str, int] = {}
+    failed_by_error: dict[str, int] = {}
+    for index, action in enumerate(actions):
+        row = rows[index] if index < len(rows) else None
+        outcome, error = _action_result_outcome(row)
+        if outcome == "applied":
+            action_type = canonicalize_action_type(
+                str(action.get("type") or action.get("action") or "")
+            )
+            key = {
+                "memory.add": "added",
+                "memory.supersede": "superseded",
+                "memory.upgrade": "upgraded",
+                "memory.delete": "deleted",
+                "memory.retype": "retyped",
+            }.get(action_type, "other")
+            applied[key] = applied.get(key, 0) + 1
+        elif outcome == "noop":
+            reason = str(
+                row.get("skipped") if isinstance(row, dict) else ""
+            ).strip() or "noop"
+            skipped[reason] = skipped.get(reason, 0) + 1
+        else:
+            reason = error or "memory_action_failed"
+            failed_by_error[reason] = failed_by_error.get(reason, 0) + 1
+    applied_count = sum(applied.values())
+    skipped_count = sum(skipped.values())
+    failed_count = sum(failed_by_error.values())
+    return {
+        "status": (
+            "failed"
+            if failed_count == len(actions) and actions
+            else "partial"
+            if failed_count
+            else "noop"
+            if not applied_count
+            else "ok"
+        ),
+        "applied": applied,
+        "skipped": skipped,
+        "failed": {
+            "count": failed_count,
+            "by_error": failed_by_error,
+        },
+        "applied_count": applied_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+    }
+
+
+def _merge_memory_batch_results(first: dict, second: dict) -> dict:
+    results = list(first.get("results") or []) + list(second.get("results") or [])
+    effects = list(first.get("effects") or []) + list(second.get("effects") or [])
+    applied_count = int(first.get("applied_count") or 0) + int(
+        second.get("applied_count") or 0
+    )
+    skipped_count = int(first.get("skipped_count") or 0) + int(
+        second.get("skipped_count") or 0
+    )
+    failed_count = int(first.get("failed_count") or 0) + int(
+        second.get("failed_count") or 0
+    )
+    total_count = len(results)
+    return {
+        "status": (
+            "failed"
+            if failed_count == total_count and total_count
+            else "partial"
+            if failed_count
+            else "ok"
+        ),
+        "results": results,
+        "effects": effects,
+        "total_count": total_count,
+        "applied_count": applied_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+    }
+
+
 def _outcomes_for_bucket(
     entries: list[tuple[str, str]],
     *,
@@ -8047,10 +8380,10 @@ def execute_agent_actions(actions: list[dict]) -> dict:
     RuntimeError for a garbage action type that is neither identity.* nor
     memory.* — that is a caller/prompt bug, not a server-side outcome.
 
-    C2 (双写风险 / no-retry-double-apply): both backends write a batch
-    SERIALLY and stop at the first failing item, so a 4xx response body
-    still carries the results/effects of any leading actions that DID
-    apply. A 4xx is therefore mapped PER-ITEM (via ActionsHTTPError.body)
+    C2 (双写风险 / no-retry-double-apply): identity and rolling-version older
+    memory servers can stop at the first failing item, so a 4xx response body
+    may carry results/effects of leading actions that DID apply. A recovered
+    4xx is therefore mapped PER-ITEM (via ActionsHTTPError.body)
     instead of marking the whole bucket failed_execution — the leading
     items get their real applied/noop outcome, the failing item gets its
     real error, and the never-reached tail is not_attempted. Only a
@@ -9060,6 +9393,92 @@ def poll_proactive_jobs(since: float) -> dict:
     return body
 
 
+def _vision_probe_error_code(exc: BaseException) -> str:
+    notice = classify_agent_error(exc)
+    return {
+        "vision_model_required": "vision_model_required",
+        "auth_invalid": "vision_model_auth_invalid",
+        "quota_insufficient": "vision_model_quota_insufficient",
+        "model_not_found": "vision_model_not_found",
+        "provider_incompatible": "vision_model_incompatible",
+        "rate_limited": "vision_model_rate_limited",
+        "upstream_unavailable": "vision_model_unavailable",
+        "turn_timeout": "vision_model_unavailable",
+        "reply_parse_failed": "vision_model_empty_response",
+    }.get(notice.error_class, "vision_model_failed")
+
+
+def _process_vision_probe(result: dict) -> None:
+    """Run the hidden two-image control probe outside chat/session state."""
+    probe = result.get("vision_probe")
+    if not isinstance(probe, dict):
+        return
+    probe_id = str(probe.get("probe_id") or "").strip()
+    images = probe.get("images") if isinstance(probe.get("images"), list) else []
+    if not probe_id or len(images) != 2:
+        return
+    payload: dict[str, Any] = {"probe_id": probe_id, "status": "failed"}
+    temp_paths: list[str] = []
+    try:
+        runtime_images: list[dict[str, str]] = []
+        for index, image in enumerate(images):
+            if not isinstance(image, dict):
+                raise ValueError("invalid vision probe image")
+            data_url = str(image.get("data_url") or "").strip()
+            if not data_url.startswith("data:image/png;base64,"):
+                raise ValueError("invalid vision probe image")
+            raw = base64.b64decode(data_url.split(",", 1)[1], validate=True)
+            runtime_images.append({"data_url": data_url, "mime_type": "image/png"})
+            fd, path = tempfile.mkstemp(prefix=f"io-vision-probe-{index}-", suffix=".png")
+            try:
+                os.write(fd, raw)
+            finally:
+                os.close(fd)
+            temp_paths.append(path)
+        prompt = (
+            "Private capability check. Inspect both attached images. Each has four "
+            "solid stripes. Reply with exactly two lines, one per image in order, "
+            "using only four lowercase color names separated by commas."
+        )
+        raw_reply = call_agent(
+            prompt,
+            images=runtime_images,
+            image_paths=temp_paths,
+            raw_text=True,
+            lane="background",
+            isolated_session=True,
+        )
+        colors = re.findall(
+            r"red|green|blue|yellow", str(raw_reply or "").lower()
+        )[:8]
+        if len(colors) != 8:
+            payload["error_code"] = "vision_model_empty_response"
+        else:
+            payload = {
+                "probe_id": probe_id,
+                "status": "ok",
+                "observed": [",".join(colors[:4]), ",".join(colors[4:8])],
+            }
+    except Exception as exc:  # noqa: BLE001 -- result must reach server
+        payload["error_code"] = _vision_probe_error_code(exc)
+    finally:
+        for path in temp_paths:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
+    try:
+        response = _HTTP.post(
+            f"{FEEDLING_API_URL}/v1/internal/vision/main/test/result",
+            json=payload,
+            headers=_HEADERS,
+            timeout=15,
+        )
+        response.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 -- later polls can re-deliver pending probe
+        log.warning("vision control probe result post failed: %s", type(exc).__name__)
+
+
 def _proactive_tick_trigger_for_broadcast_state(broadcast_state: str) -> str:
     state = str(broadcast_state or "").strip().lower()
     if not state or state == "off":
@@ -9443,6 +9862,8 @@ def post_reply(
     turn_failure_error_class: str = "",
     turn_failure_blame: str = "",
     turn_failure_user_text: str = "",
+    turn_failure_model: str = "",
+    turn_failure_provider: str = "",
     file_followups: list[StagedChatFile] | None = None,
 ) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
@@ -9538,6 +9959,16 @@ def post_reply(
                 body["turn_failure_error_class"] = turn_failure_error_class
                 body["turn_failure_blame"] = turn_failure_blame
                 body["turn_failure_user_text"] = turn_failure_user_text
+                failure_model = _sanitize_thinking_meta(
+                    turn_failure_model, max_len=96
+                )
+                failure_provider = _sanitize_thinking_meta(
+                    turn_failure_provider, max_len=80
+                )
+                if failure_model:
+                    body["turn_failure_model"] = failure_model
+                if failure_provider:
+                    body["turn_failure_provider"] = failure_provider
             if reply_to_message_id:
                 body["reply_to_message_id"] = reply_to_message_id
             if sealed_file_followups:
@@ -11105,6 +11536,11 @@ def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[
     for card in cards:
         action = str(card.get("action") or "").strip().lower()
         target_id = str(card.get("target_id") or "").strip()
+        # A merge/supersede without an explicit target is not an add.  Treating
+        # it as one silently changes the model's requested operation and is the
+        # source of repeated duplicate cards.
+        if action in {"merge", "supersede"} and not target_id:
+            continue
         envelope = _capture_build_envelope(card, occurred_at=occurred_at)
         base = {
             "envelope": envelope,
@@ -11112,16 +11548,61 @@ def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[
             "capture_mode": "memory_capture",
             "source_chat_message_ids": source_ids,
         }
-        if action == "add" or (action in {"merge", "supersede"} and not target_id):
+        if action == "add":
             actions.append({"type": "memory.add", **base})
             cards_added += 1
             continue
         if action in {"merge", "supersede"} and target_id:
             actions.append({"type": "memory.supersede", "supersedes": target_id, **base})
             cards_superseded += 1
-    if cards and not actions:
+    rejected_without_target = sum(
+        1
+        for card in cards
+        if str(card.get("action") or "").strip().lower() in {"merge", "supersede"}
+        and not str(card.get("target_id") or "").strip()
+    )
+    if cards and not actions and rejected_without_target != len(cards):
         raise ValueError("capture_no_memory_actions")
     return actions, cards_added, cards_superseded
+
+
+def _capture_semantic_retry_reasons(
+    cards: list[dict],
+    memory_result: dict | None = None,
+) -> list[str]:
+    reasons: list[str] = []
+    if any(
+        str(card.get("action") or "").strip().lower() in {"merge", "supersede"}
+        and not str(card.get("target_id") or "").strip()
+        for card in cards
+    ):
+        reasons.append(
+            "你要求覆盖旧卡，但没有给 target_id；请给出确切 ID，或改成 action=add。"
+        )
+    rows = (
+        memory_result.get("results")
+        if isinstance(memory_result, dict)
+        else []
+    )
+    error_codes = {
+        str(row.get("error") or "").strip()
+        for row in rows or []
+        if isinstance(row, dict)
+        and str(row.get("status") or "").strip().lower() == "error"
+    }
+    if "source_invalid" in error_codes:
+        reasons.append(
+            "source 不在服务端允许的 provenance 白名单内；不要自造 source。"
+        )
+    if error_codes & {"not_found", "not_owned"}:
+        reasons.append(
+            "target_id 不存在或不属于当前用户；请重新确认现有卡 ID，或改成 action=add。"
+        )
+    for code in sorted(
+        error_codes - {"source_invalid", "not_found", "not_owned"}
+    ):
+        reasons.append(f"服务端拒绝了记忆操作：{code}；请修正或改成新增。")
+    return reasons
 
 
 def _process_capture_jobs(jobs: list) -> float:
@@ -11208,13 +11689,30 @@ def _process_capture_jobs(jobs: list) -> float:
                 },
             )
             continue
+        reask_count = 1 if bounce else 0
+        reask_trigger = "format" if bounce else ""
+        reask_outcome = (
+            "recovered"
+            if bounce == "bounced_ok"
+            else "failed"
+            if bounce == "bounced_failed"
+            else "empty"
+            if bounce == "bounced_empty"
+            else "not_needed"
+        )
         if err:
             update_proactive_job_status(
                 job_id,
                 "failed",
                 err,
                 extra={
-                    "capture_result": {"status": "failed", "reason": err},
+                    "capture_result": {
+                        "status": "failed",
+                        "reason": err,
+                        "reask_count": reask_count,
+                        "reask_trigger": reask_trigger or None,
+                        "reask_outcome": reask_outcome,
+                    },
                     "capture_window": window,
                     "cards_added": 0,
                     "cards_superseded": 0,
@@ -11222,6 +11720,43 @@ def _process_capture_jobs(jobs: list) -> float:
                 },
             )
             continue
+        semantic_reasons = _capture_semantic_retry_reasons(cards)
+        if semantic_reasons and reask_count < CAPTURE_AGENT_REASK_BUDGET:
+            reask_count += 1
+            reask_trigger = "semantic"
+            try:
+                retry_text = _capture_agent_reply_text(
+                    call_agent(
+                        build_capture_semantic_retry_prompt(
+                            prompt, semantic_reasons
+                        ),
+                        raw_text=True,
+                    )
+                )
+                _note_agent_turn_success()
+                retried_cards, retry_err = parse_capture_cards(
+                    retry_text, strict=False
+                )
+            except Exception as retry_exc:
+                log.warning(
+                    "capture semantic reask failed id=%s: %s",
+                    job_id,
+                    retry_exc,
+                )
+                retried_cards, retry_err = [], "semantic_reask_failed"
+            if retry_err:
+                reask_outcome = "failed"
+            else:
+                cards = retried_cards
+                reask_outcome = (
+                    "failed"
+                    if _capture_semantic_retry_reasons(cards)
+                    else "recovered"
+                    if cards
+                    else "empty"
+                )
+        elif semantic_reasons:
+            reask_outcome = "failed"
         # 残留计数(与 V2 同口径)。**刻意不在这里跑确定性改写** —— 那个改写器
         # 现有的锚点在产品语境下会改坏真内容(见 test_card_user_referent.py)。
         user_token_residual = sum(count_user_token_residuals(c) for c in cards)
@@ -11235,7 +11770,13 @@ def _process_capture_jobs(jobs: list) -> float:
                     # 「真的没什么值得记」在 admin 上长得一模一样。
                     "content_gate": bounce or None,
                     "user_token_residual": user_token_residual or None,
-                    "capture_result": {"status": "noop", "reason": "nothing_worth_keeping"},
+                    "capture_result": {
+                        "status": "noop",
+                        "reason": "nothing_worth_keeping",
+                        "reask_count": reask_count,
+                        "reask_trigger": reask_trigger or None,
+                        "reask_outcome": reask_outcome,
+                    },
                     "capture_window": window,
                     "cards_added": 0,
                     "cards_superseded": 0,
@@ -11250,7 +11791,69 @@ def _process_capture_jobs(jobs: list) -> float:
                 job=job,
                 messages=messages,
             )
+            rejected_without_target = sum(
+                1
+                for card in cards
+                if str(card.get("action") or "").strip().lower()
+                in {"merge", "supersede"}
+                and not str(card.get("target_id") or "").strip()
+            )
             memory_result = execute_memory_actions(actions)
+            server_semantic_reasons = _capture_semantic_retry_reasons(
+                [], memory_result
+            )
+            if (
+                server_semantic_reasons
+                and reask_count < CAPTURE_AGENT_REASK_BUDGET
+            ):
+                reask_count += 1
+                reask_trigger = "semantic"
+                try:
+                    retry_text = _capture_agent_reply_text(
+                        call_agent(
+                            build_capture_semantic_retry_prompt(
+                                prompt, server_semantic_reasons
+                            ),
+                            raw_text=True,
+                        )
+                    )
+                    _note_agent_turn_success()
+                    retried_cards, retry_err = parse_capture_cards(
+                        retry_text, strict=False
+                    )
+                except Exception as retry_exc:
+                    log.warning(
+                        "capture server-semantic reask failed id=%s: %s",
+                        job_id,
+                        retry_exc,
+                    )
+                    retried_cards, retry_err = [], "semantic_reask_failed"
+                if retry_err:
+                    reask_outcome = "failed"
+                else:
+                    retry_actions, _retry_added, _retry_superseded = (
+                        _capture_actions_from_cards(
+                            retried_cards,
+                            job=job,
+                            messages=messages,
+                        )
+                    )
+                    if not retry_actions:
+                        reask_outcome = "failed"
+                    else:
+                        retry_result = execute_memory_actions(retry_actions)
+                        actions.extend(retry_actions)
+                        memory_result = _merge_memory_batch_results(
+                            memory_result, retry_result
+                        )
+                        retry_observation = _memory_batch_observation(
+                            retry_actions, retry_result
+                        )
+                        reask_outcome = (
+                            "failed"
+                            if retry_observation["failed_count"]
+                            else "recovered"
+                        )
         except ValueError as e:
             reason = str(e) or "capture_invalid_memory_action"
             log.error("capture memory action invalid id=%s: %s", job_id, e)
@@ -11285,33 +11888,91 @@ def _process_capture_jobs(jobs: list) -> float:
                 },
             )
             continue
+        observation = _memory_batch_observation(actions, memory_result)
+        if rejected_without_target:
+            observation["skipped"]["supersede_without_target"] = (
+                observation["skipped"].get("supersede_without_target", 0)
+                + rejected_without_target
+            )
+            observation["skipped_count"] += rejected_without_target
+        applied_added = observation["applied"].get("added", 0)
+        applied_superseded = observation["applied"].get("superseded", 0)
+        capture_status = observation["status"] if actions else "noop"
+        capture_reason = (
+            "supersede_without_target"
+            if not actions and rejected_without_target
+            else "capture_memory_actions_partial"
+            if observation["failed_count"]
+            else ""
+        )
+        if capture_status == "failed":
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                "capture_memory_actions_failed",
+                extra={
+                    "capture_result": {
+                        **observation,
+                        "cards": len(cards),
+                        "job_kind": "memory_capture",
+                        "reason": "capture_memory_actions_failed",
+                        "reask_count": reask_count,
+                        "reask_trigger": reask_trigger or None,
+                        "reask_outcome": reask_outcome,
+                    },
+                    "capture_window": window,
+                    "memory_action_status": {
+                        "status": memory_result.get("status", "failed"),
+                        "results": len(memory_result.get("results") or []),
+                        "effects": len(memory_result.get("effects") or []),
+                        "applied_count": observation["applied_count"],
+                        "skipped_count": observation["skipped_count"],
+                        "failed_count": observation["failed_count"],
+                    },
+                    "memory_results": memory_result.get("results") or [],
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": "capture_memory_actions_failed",
+                },
+            )
+            continue
         update_proactive_job_status(
             job_id,
             "completed",
-            "capture_memory_actions_applied",
+            capture_reason or "capture_memory_actions_applied",
             extra={
                 "capture_result": {
-                    "status": "ok",
+                    "status": capture_status,
                     "cards": len(cards),
                     "job_kind": "memory_capture",
+                    "reason": capture_reason or None,
+                    "applied": observation["applied"],
+                    "skipped": observation["skipped"],
+                    "failed": observation["failed"],
+                    "reask_count": reask_count,
+                    "reask_trigger": reask_trigger or None,
+                    "reask_outcome": reask_outcome,
                 },
                 "capture_window": window,
                 "memory_action_status": {
                     "status": memory_result.get("status", "ok"),
                     "results": len(memory_result.get("results") or []),
                     "effects": len(memory_result.get("effects") or []),
+                    "applied_count": observation["applied_count"],
+                    "skipped_count": observation["skipped_count"],
+                    "failed_count": observation["failed_count"],
                 },
                 "memory_results": memory_result.get("results") or [],
-                "cards_added": cards_added,
-                "cards_superseded": cards_superseded,
+                "cards_added": applied_added,
+                "cards_superseded": applied_superseded,
             },
         )
         log.info(
             "capture job completed id=%s cards=%d added=%d superseded=%d identity=%s",
             job_id,
             len(cards),
-            cards_added,
-            cards_superseded,
+            applied_added,
+            applied_superseded,
             bool(identity),
         )
     return latest
@@ -11658,13 +12319,45 @@ def _process_dream_jobs(jobs: list) -> float:
                 },
             )
             continue
+        observation = _memory_batch_observation(actions, memory_result)
+        if observation["status"] == "failed":
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                "dream_memory_actions_failed",
+                extra={
+                    "dream_result": {
+                        **observation,
+                        "job_kind": "memory_dream",
+                        "reason": "dream_memory_actions_failed",
+                    },
+                    "memory_action_status": {
+                        "status": memory_result.get("status", "failed"),
+                        "results": len(memory_result.get("results") or []),
+                        "effects": len(memory_result.get("effects") or []),
+                        "applied_count": observation["applied_count"],
+                        "skipped_count": observation["skipped_count"],
+                        "failed_count": observation["failed_count"],
+                    },
+                    "memory_results": memory_result.get("results") or [],
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": questions,
+                    "noop_reason": "dream_memory_actions_failed",
+                },
+            )
+            continue
         update_proactive_job_status(
             job_id,
             "completed",
-            "dream_memory_actions_applied",
+            (
+                "dream_memory_actions_partial"
+                if observation["failed_count"]
+                else "dream_memory_actions_applied"
+            ),
             extra={
                 "dream_result": {
-                    "status": "ok",
+                    "status": observation["status"],
                     "job_kind": "memory_dream",
                     "consolidations": len(consolidations),
                     "actions": len(actions),
@@ -11672,11 +12365,17 @@ def _process_dream_jobs(jobs: list) -> float:
                     "cards_thickened": cards_thickened,
                     "organized_count": organized_count,
                     "merged_count": merged_count,
+                    "applied": observation["applied"],
+                    "skipped": observation["skipped"],
+                    "failed": observation["failed"],
                 },
                 "memory_action_status": {
                     "status": memory_result.get("status", "ok"),
                     "results": len(memory_result.get("results") or []),
                     "effects": len(memory_result.get("effects") or []),
+                    "applied_count": observation["applied_count"],
+                    "skipped_count": observation["skipped_count"],
+                    "failed_count": observation["failed_count"],
                 },
                 "memory_results": memory_result.get("results") or [],
                 "cards_merged": cards_merged,
@@ -12853,6 +13552,16 @@ def _process_messages(messages: list) -> float:
                 _quoted_present, ts,
             )
 
+        # Self-authored thinking — FOREGROUND-CHAT-only (this dispatch; background
+        # lanes build their prompts elsewhere and are never asked to emit <think>).
+        # Prepended so the user's current message stays LAST (the "answer only the
+        # last message" framing) and the transcript header added below stays
+        # topmost. The consumer's existing tagged-thinking extraction peels the
+        # <think> block into thinking_summary. Same kill switch as V2.
+        from core import self_thinking as _self_thinking_v1
+
+        if _self_thinking_v1.enabled():
+            content = f"{_self_thinking_v1.INSTRUCTION.strip()}\n\n{content}"
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
         content = _prepend_time_anchor_foreground(content, ts)
@@ -12876,7 +13585,9 @@ def _process_messages(messages: list) -> float:
             if attempt_trigger != "first"
             else {}
         )
-        outbound_file_turn_active = source == "chat" and AGENT_MODE == "cli"
+        outbound_file_turn_active = (
+            source in {"chat", "model_api"} and AGENT_MODE == "cli"
+        )
         outbound_file_requirement = (
             _required_outbound_file_suffixes(raw_user_content_for_lang)
             if outbound_file_turn_active
@@ -12936,6 +13647,14 @@ def _process_messages(messages: list) -> float:
                 )
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
+            if content_type == "image" and not isinstance(e, VisionObserverFailure):
+                e = VisionObserverFailure(
+                    _vision_probe_error_code(e),
+                    detail=type(e).__name__,
+                    raw_user_text=raw_user_content_for_lang,
+                    model=str(AGENT_RUNTIME_METADATA.get("model") or ""),
+                    provider=str(AGENT_RUNTIME_METADATA.get("provider") or ""),
+                )
             # Codex review I10: call_agent raised, so the prompt (catalog
             # included, if _prepend_io_cli_capability_catalog injected it
             # above) never reached the model this turn — drop the pending
@@ -13185,7 +13904,10 @@ def _process_messages(messages: list) -> float:
                 # post_kwargs（proactive 那处）刻意不带——后台失败不进聊天流。
                 if idx == 0 and pending_failure_notice is not None:
                     post_kwargs.update(
-                        turn_failure_post_kwargs(classify_agent_error(pending_failure_notice))
+                        turn_failure_post_kwargs(
+                            classify_agent_error(pending_failure_notice),
+                            failure=pending_failure_notice,
+                        )
                     )
                 if idx == 0 and staged_outbound_files:
                     post_kwargs["file_followups"] = staged_outbound_files
@@ -14103,14 +14825,35 @@ def _resident_distill_advance_memory(state: dict, chat_since: float | None) -> s
             "capture_mode": "genesis_resident_distill",
             "source_chat_message_ids": [],
         })
+    applied_count = 0
     if actions:
-        execute_memory_actions(actions)
+        memory_result = execute_memory_actions(actions)
+        if isinstance(memory_result, dict) and isinstance(
+            memory_result.get("results"), list
+        ):
+            observation = _memory_batch_observation(actions, memory_result)
+            applied_count = observation["applied_count"]
+            if observation["status"] == "failed":
+                raise RuntimeError("genesis_resident_memory_actions_failed")
+            if observation["failed_count"]:
+                log.warning(
+                    "resident distill memory batch partial job=%s applied=%d "
+                    "skipped=%d failed=%d",
+                    job_id,
+                    observation["applied_count"],
+                    observation["skipped_count"],
+                    observation["failed_count"],
+                )
+        else:
+            # Compatibility for old injected resident writers during rolling
+            # updates; the shipped execute_memory_actions always returns rows.
+            applied_count = len(actions)
     genesis_resident_complete(
-        job_id, memory_action_count=len(actions), identity_status="skipped"
+        job_id, memory_action_count=applied_count, identity_status="skipped"
     )
     log.info(
         "resident distill done job=%s mode=%s memories=%d identity=%s",
-        job_id, state["mode"], len(actions), "skipped",
+        job_id, state["mode"], applied_count, "skipped",
     )
     return "done"
 
@@ -14666,6 +15409,10 @@ def run() -> None:
             # turn. No-op when the fingerprint hasn't moved (best-effort;
             # failures log and retry on a later poll).
             _maybe_apply_user_mcp()
+
+            # Hidden control-plane capability probe. It never becomes a chat
+            # message and uses a fresh isolated model session.
+            _process_vision_probe(result)
 
             if result.get("timed_out"):
                 # Idle moment: safe to swap to the backend's commit and re-exec

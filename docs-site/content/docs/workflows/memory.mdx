@@ -212,6 +212,20 @@ After selecting with `index` and reading the necessary cards with `fetch`, use
 between 1 and 20 actions. The implementation processes only the first 20, so a
 client must reject an oversized batch before sending it.
 
+The server executes every item independently and does not stop after one item
+fails. A structurally valid, non-empty batch returns HTTP `200` even when some
+or all actions fail. Read every `results` entry and the batch
+`applied_count`, `skipped_count`, and `failed_count`; top-level `status` is
+`ok`, `partial`, or `failed`. Each result includes its own `http_status`.
+Only a malformed request body, a non-array `actions` value, or an empty batch
+uses a request-level `4xx`.
+
+`source` and `capture_mode` are closed enums. Unknown values produce an
+item-level failure (`source_invalid` or `capture_mode_invalid`) rather than
+being stored or rewritten, while later valid actions in the same batch still
+run. Use the values published in the OpenAPI schema; omit optional metadata
+when none applies.
+
 This example adds one encrypted card, retypes an existing card, supersedes an
 outdated card with a new encrypted card, and deletes a fourth card:
 
@@ -408,10 +422,15 @@ action and returns that action's HTTP status. Earlier results and effects remain
 committed; they are included in the error response and are not rolled back.
 Split independent writes when partial completion would be hard to reconcile.
 
-There is no `Idempotency-Key` support. In particular, retrying a batch after an
-ambiguous response can repeat `memory.add` and can attempt later actions against
-already changed state. Read `index` or `fetch`, reconcile stable memory IDs, and
-construct a new batch instead of replaying the original blindly.
+There is no `Idempotency-Key` support. Before an add, the server compares the
+normalized title and content with readable active shared cards. An exact
+normalized duplicate is not written: its result has `status: "ok"`, `noop: true`,
+`skipped: "duplicate_active"`, and `duplicate_of` set to the active card ID.
+Normalization applies Unicode NFKC, case folding, and whitespace collapsing.
+This protects exact retries but does not make a mixed batch idempotent: later
+actions can still target state changed by an earlier attempt. Read `index` or
+`fetch`, reconcile stable memory IDs, and construct a new batch instead of
+replaying the original blindly.
 
 `memory.upgrade` exists for controlled legacy migration, but it is not part of
 the public Memory workflow and should not be emitted by ordinary clients.

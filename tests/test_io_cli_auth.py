@@ -76,7 +76,7 @@ def test_emit_tool_trace_posts_agent_tool_call_with_redacted_args(monkeypatch):
     assert calls[0]["method"] == "POST"
     assert calls[0]["url"] == "http://backend.test/v1/debug/trace/event"
     assert calls[0]["auth"] == {"X-API-Key": "k"}
-    assert calls[0]["timeout"] == 1.0
+    assert calls[0]["timeout"] == 5.0
     event = calls[0]["payload"]["event"]
     assert event["subsystem"] == "agent"
     assert event["type"] == "agent.tool.call"
@@ -161,6 +161,74 @@ def test_memory_index_keeps_its_own_activity_identity():
     assert io_cli._activity_tool_name(
         types.SimpleNamespace(verb="memory-index")
     ) == "memory_index"
+
+
+def test_activity_tool_name_is_generic_for_future_io_tools():
+    assert io_cli._activity_tool_name(
+        types.SimpleNamespace(verb="workspace-export")
+    ) == "workspace_export"
+
+
+def test_terminal_activity_retries_with_vps_safe_timeout(monkeypatch):
+    calls = []
+    sleeps = []
+    monkeypatch.setenv("FEEDLING_TRACE_ID", "turn-cancel")
+    monkeypatch.setenv("FEEDLING_API_URL", "http://backend.test")
+    monkeypatch.setenv("FEEDLING_API_KEY", "k")
+
+    def _fake_http(method, url, auth, *, payload=None, insecure=False, timeout=30):
+        calls.append({
+            "method": method,
+            "url": url,
+            "auth": auth,
+            "payload": payload,
+            "timeout": timeout,
+        })
+        return (-1, {"error": "timed_out"}) if len(calls) == 1 else (200, {"status": "ok"})
+
+    monkeypatch.setattr(io_cli, "_http_json", _fake_http)
+    monkeypatch.setattr(io_cli.time, "sleep", sleeps.append)
+
+    io_cli._emit_turn_activity(
+        types.SimpleNamespace(verb="cancel-wake"),
+        "v1:cancel-1",
+        "success",
+        dur_ms=42,
+        exit_code=0,
+    )
+
+    assert len(calls) == 2
+    assert [call["timeout"] for call in calls] == [5.0, 5.0]
+    assert calls[0]["payload"]["tool_name"] == "cancel_wake"
+    assert calls[0]["payload"]["state"] == "success"
+    assert calls[0]["payload"]["result_code"] == "ok"
+    assert sleeps == [0.15]
+
+
+def test_running_activity_does_not_retry_or_delay_tool(monkeypatch):
+    calls = []
+    monkeypatch.setenv("FEEDLING_TRACE_ID", "turn-running")
+    monkeypatch.setenv("FEEDLING_API_URL", "http://backend.test")
+    monkeypatch.setenv("FEEDLING_API_KEY", "k")
+    monkeypatch.setattr(
+        io_cli,
+        "_http_json",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or (-1, {"error": "timed_out"}),
+    )
+    monkeypatch.setattr(
+        io_cli.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(AssertionError("running must not retry")),
+    )
+
+    io_cli._emit_turn_activity(
+        types.SimpleNamespace(verb="memory-index"),
+        "v1:memory-1",
+        "running",
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1]["timeout"] == 2.0
 
 
 def test_memory_activity_metadata_custom_bucket_falls_back_to_total():

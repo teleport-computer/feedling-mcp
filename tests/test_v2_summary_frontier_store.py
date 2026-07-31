@@ -24,6 +24,13 @@ _BYOK = provider_client.ProviderConfig(
 )
 
 
+@pytest.fixture(autouse=True)
+def _provider_backed_frontier_mode(monkeypatch):
+    # This suite exercises provider fold failure/quarantine behavior. Pin that
+    # fallback contract independently of the process-wide rollout setting.
+    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
+
+
 def _reset(uid: str) -> None:
     conftest.seed_user(uid)
     with db.get_pool().connection() as conn:
@@ -218,11 +225,16 @@ def test_inline_prompt_catchup_appends_immutable_leaf_not_legacy_blob(monkeypatc
 
     def _append(user_id, segment, **kwargs):
         current = kwargs.pop("current_summary")
+        head = kwargs.pop("head_summary", None)
         return jobs_store.append_summary_leaf_cas(
             user_id,
             summary_envelope={"plaintext": segment},
             head_summary_envelope={
-                "plaintext": current.rstrip() + "\n" + segment.strip()
+                "plaintext": (
+                    str(head)
+                    if head is not None
+                    else current.rstrip() + "\n" + segment.strip()
+                )
             },
             **kwargs,
         )
@@ -340,11 +352,16 @@ def _seq_aware_deps(uid: str, messages: list[dict], *, tail_limit: int = 2):
 
     def _append(user_id, segment, **kwargs):
         current = kwargs.pop("current_summary")
+        head = kwargs.pop("head_summary", None)
         return jobs_store.append_summary_leaf_cas(
             user_id,
             summary_envelope={"plaintext": segment},
             head_summary_envelope={
-                "plaintext": current.rstrip() + "\n" + segment.strip()
+                "plaintext": (
+                    str(head)
+                    if head is not None
+                    else current.rstrip() + "\n" + segment.strip()
+                )
             },
             **kwargs,
         )

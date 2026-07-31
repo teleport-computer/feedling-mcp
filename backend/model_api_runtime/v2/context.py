@@ -106,6 +106,12 @@ CHAT_SYSTEM_PROMPT = (
     "Use memory or workspace reads only when the current request actually depends "
     "on remembered or stored information. Ordinary conversation and questions "
     "about your model or runtime identity never require memory or workspace reads. "
+    "When the web_search and web_fetch tools are available to you this turn, you "
+    "can reach the live public web through them; use them whenever a request needs "
+    "current, real-time, or post-training information such as news, weather, "
+    "prices, recent events, or anything you are not certain is still up to date, "
+    "rather than answering from training knowledge or telling the user you cannot "
+    "go online. "
     "A current message that is only a greeting, acknowledgement, emoji, "
     "interjection, or casual small talk never requires memory discovery, even "
     "when earlier history discussed memories or files; answer it directly. Once "
@@ -152,6 +158,17 @@ ORDERED_REPLY_TARGET_POLICY = (
     "when their assistant reply was persisted later. Do not repeat or combine "
     "answers to those earlier messages."
 )
+
+
+def chat_system_prompt() -> str:
+    """CHAT_SYSTEM_PROMPT, plus the self-authored-thinking instruction when the
+    self-thinking kill switch is on (v1). Appended as a suffix so the cache-stable
+    prefix is unchanged when the switch is off (byte-identical to today)."""
+    from core import self_thinking
+
+    if self_thinking.enabled():
+        return CHAT_SYSTEM_PROMPT + self_thinking.INSTRUCTION
+    return CHAT_SYSTEM_PROMPT
 
 ACTION_CONTEXT_CHAR_CAP = 8000
 PER_ACTION_CHAR_CAP = 2000

@@ -111,6 +111,38 @@ def test_image_row_preserves_pinned_vision_route(monkeypatch):
     assert row["content"] == "look"
 
 
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [(True, True), (False, False), ("true", False), (1, False), (None, False)],
+)
+def test_decrypted_user_row_preserves_only_strict_reasoning_boolean(
+    monkeypatch, stored, expected
+):
+    monkeypatch.setattr(serve_worker, "_mint_runtime_token", lambda _uid: "rt")
+    monkeypatch.setattr(
+        serve_worker.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: b"hello",
+    )
+    rows = serve_worker._decrypt_chat_rows(
+        "u1",
+        [{
+            "id": "m1",
+            "ts": 1.0,
+            "seq": 4,
+            "role": "user",
+            "body_ct": "ct",
+            "K_enclave": "key",
+            "include_reasoning": stored,
+        }],
+        user_only=True,
+    )
+
+    assert rows[0].get("include_reasoning", False) is expected
+    if not expected:
+        assert "include_reasoning" not in rows[0]
+
+
 def test_dedicated_observer_uses_exact_pinned_route_and_returns_text(monkeypatch):
     route = {
         "id": "route-123",

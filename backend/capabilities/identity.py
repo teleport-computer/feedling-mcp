@@ -1,7 +1,10 @@
 """Identity capabilities — facade over backend/identity/identity_core.py."""
 from __future__ import annotations
 
-from identity import identity_core
+import json
+
+from core import enclave as core_enclave
+from identity import card_view, identity_core
 
 from capabilities import errors
 from capabilities.types import CapabilityResult, ok, err
@@ -17,8 +20,54 @@ def _norm(body, status, *, default_msg) -> CapabilityResult:
 
 
 def get(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
+    """Read the identity card AS PLAINTEXT.
+
+    ``identity_core.get_identity`` returns the raw v1 envelope by design — the
+    public ``GET /v1/identity/get`` serves iOS, which holds the user key and
+    decrypts locally. The model holds no key, so this capability must go through
+    the enclave, exactly like every memory readside already does.
+
+    It used to accept ``api_key``/``runtime_token`` and drop both, returning the
+    envelope untouched: the agent got ``body_ct`` and no agent_name /
+    self_introduction on EVERY call, then truthfully reported that the card was
+    unreadable. Ciphertext is never a valid answer here — a failure is returned
+    as a failure (see the decrypt except-branch) so the cause stays visible
+    instead of being laundered into a "successful" unreadable card.
+    """
     body, status = identity_core.get_identity(store)
-    return _norm(body, status, default_msg="identity unavailable")
+    if status != 200:
+        return _norm(body, status, default_msg="identity unavailable")
+
+    identity = body.get("identity") if isinstance(body, dict) else None
+    if not isinstance(identity, dict):
+        return ok(data=errors.cap_data(body))  # no card written yet
+    if not identity.get("body_ct"):
+        return ok(data=errors.cap_data(body))  # already plaintext; nothing to open
+
+    base = card_view.envelope_base(identity)
+    if identity.get("visibility") == "local_only":
+        return ok(data=errors.cap_data({"identity": card_view.local_only_view(base)}))
+
+    try:
+        raw = core_enclave._decrypt_envelope_via_enclave(
+            identity, api_key, purpose="identity_get", runtime_token=runtime_token or "")
+        inner = json.loads(raw.decode("utf-8"))
+        if not isinstance(inner, dict):
+            raise ValueError("identity_plaintext_not_object")
+    except Exception as e:
+        # Retryable: the dominant causes are enclave restarts / transient
+        # unavailability, and the alternative (a terminal error) would leave the
+        # agent believing it has no persona for the rest of the turn.
+        return err(errors.UPSTREAM,
+                   errors.cap_text(f"identity_decrypt_failed:{type(e).__name__}:{e}"),
+                   retryable=True)
+
+    # days_with_user was computed live by get_identity from the server-side
+    # relationship anchor (with the memory-garden repair applied); the value baked
+    # into the ciphertext is stale by construction, so the outer one wins.
+    view = card_view.plaintext_view(
+        base, inner, identity, days_with_user=identity.get("days_with_user", 0))
+    return ok(data=errors.cap_data({"identity": view}))
 
 
 # Profile fields the model may pass at the top level, as a shorthand for putting

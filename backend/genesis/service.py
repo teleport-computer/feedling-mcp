@@ -758,13 +758,47 @@ def apply_memory_outputs(
     if not actions:
         return 0, []
     results: list[dict] = []
+    written = 0
     for idx in range(0, len(actions), 20):
         batch = actions[idx:idx + 20]
         body, status = memory_actions._execute_memory_actions(store, api_key, batch)
         if status >= 400:
             raise RuntimeError(f"memory_actions_failed:{body.get('error', status)}")
-        results.extend(list(body.get("results") or []))
-    return len(results), results
+        rows = list(body.get("results") or [])
+        results.extend(rows)
+        batch_written = (
+            int(body.get("applied_count") or 0)
+            if "applied_count" in body
+            else sum(
+                1
+                for row in rows
+                if not isinstance(row, dict)
+                or str(row.get("status") or "").strip().lower() != "error"
+            )
+        )
+        written += batch_written
+        batch_failed = (
+            int(body.get("failed_count") or 0)
+            if "failed_count" in body
+            else sum(
+                1
+                for row in rows
+                if isinstance(row, dict)
+                and str(row.get("status") or "").strip().lower() == "error"
+            )
+        )
+        if batch_failed == len(batch):
+            first_error = next(
+                (
+                    str(row.get("error") or "memory_action_failed")
+                    for row in rows
+                    if isinstance(row, dict)
+                    and str(row.get("status") or "") == "error"
+                ),
+                "memory_action_failed",
+            )
+            raise RuntimeError(f"memory_actions_failed:{first_error}")
+    return written, results
 
 
 def _reject_raw_reducer_fields(output: dict) -> None:

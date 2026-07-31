@@ -293,7 +293,7 @@ def _memory_env(user_id: str, memory_id: str, mem_type: str = "fact", *, anchors
         "owner_user_id": user_id,
         "type": mem_type,
         "occurred_at": "2026-06-26T10:00:00Z",
-        "source": "proactive_tool_test",
+        "source": "memory_capture",
     }
     if anchors is not None:
         envelope["anchor_memory_ids"] = list(anchors)
@@ -313,6 +313,17 @@ def _install_memory_action_adapter(monkeypatch, moments: list[dict], *, user_id:
     monkeypatch.setattr(memory_actions.memory_service, "_save_moments", fake_save)
     monkeypatch.setattr(memory_actions.boot_gates, "_log_bootstrap_event", lambda *args, **kwargs: None)
     monkeypatch.setattr(memory_actions.identity_service, "_relationship_age_days", lambda _store: 365)
+    monkeypatch.setattr(
+        memory_actions,
+        "_memory_plain_from_envelope",
+        lambda moment, _api_key, runtime_token="": (
+            {
+                "summary": str(moment.get("id") or ""),
+                "content": str(moment.get("id") or ""),
+            },
+            "",
+        ),
+    )
     monkeypatch.setattr(
         memory_actions.memory_service,
         "_append_memory_change",

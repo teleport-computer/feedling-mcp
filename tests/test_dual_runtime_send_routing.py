@@ -18,6 +18,7 @@ The error strings are an operational contract — asserted exactly. Drives
 (mirrors ``test_chat_send_v2_enqueue.py``); tuples that return before any
 persistence are monkeypatched onto ``get_hosted_runtime_control_strict``.
 """
+import base64
 import sys
 import types
 from pathlib import Path
@@ -175,6 +176,71 @@ def test_dual_resident_tuple_with_live_supervisor_routes_to_resident(monkeypatch
     assert body["status"] == "processing"
     # handle_send is the resident-only tail — proves resident routing, not V2.
     assert called["driver"] == "claude"
+
+
+@pytest.mark.parametrize("idempotent_send", [False, True])
+def test_dual_resident_follow_main_image_pins_active_route_version(
+    monkeypatch,
+    idempotent_send,
+):
+    uid = f"u_dr_resident_image_pin_{idempotent_send}"
+    _seed(uid)
+    store = core_store.get_store(uid)
+    monkeypatch.setenv(POLICY_ENV, "dual")
+    _pin_tuple(monkeypatch, RESIDENT, "resident")
+    _fake_envelope(monkeypatch)
+    monkeypatch.setattr(
+        hosted_config_store,
+        "_load_runtime_provider_config",
+        lambda *a, **k: types.SimpleNamespace(
+            provider="anthropic", model="m", base_url=""
+        ),
+    )
+    monkeypatch.setattr(
+        hosted_config_store,
+        "_ensure_model_api_runtime_profile",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        chat_send_core.agent_runtime_cutover,
+        "check_supervisor_live",
+        lambda **kw: (True, ""),
+    )
+    monkeypatch.setattr(
+        chat_send_core.agent_runtime_cutover,
+        "handle_send",
+        lambda _store, row, driver: (
+            {
+                "status": "processing",
+                "user_message": row,
+                "runtime": {"driver": driver},
+            },
+            202,
+        ),
+    )
+
+    payload = {
+        "image_b64": base64.b64encode(b"\x89PNG\r\n\x1a\n").decode(),
+        "image_mime": "image/png",
+    }
+    if idempotent_send:
+        payload["client_msg_id"] = "11111111-1111-4111-8111-111111111111"
+    body, status = chat_send_core.model_api_chat_send_core(
+        store,
+        api_key="key",
+        runtime_tok="",
+        payload=payload,
+    )
+
+    assert status == 202
+    row = body["user_message"]
+    binding = db.model_api_active_route_version(uid)
+    assert row["vision_main_route_id"] == binding["route_id"]
+    assert (
+        row["vision_main_route_updated_at"]
+        == binding["updated_at_token"]
+    )
+    assert not row.get("vision_route_id")
 
 
 def test_dual_resident_tuple_with_dead_supervisor_is_hosting_runtime_unavailable(monkeypatch):

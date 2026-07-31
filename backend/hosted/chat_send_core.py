@@ -167,6 +167,13 @@ def model_api_chat_send_core(
             )
             return {"error": "runtime_control_invalid"}, 503
 
+    include_reasoning = payload.get("include_reasoning", False)
+    if type(include_reasoning) is not bool:
+        return {
+            "error": "invalid_include_reasoning",
+            "detail": "include_reasoning must be a boolean",
+        }, 400
+
     # Resolve and pin V2 image routing before persistence so a later Settings
     # change cannot redirect already-accepted pixels.
     vision_route_id = ""
@@ -257,6 +264,9 @@ def model_api_chat_send_core(
         return {"error": "provider_not_configured"}, 409
 
     extra: dict = _voice_metadata(voice_context)
+    # V2-only per-turn routing metadata. Resident/VPS paths never consume or
+    # persist this field; old clients omit it and keep the historical false path.
+    extra["include_reasoning"] = include_reasoning
     if client_msg_id is not None:
         # Plain routing metadata only; the message body remains ciphertext.
         # The database uses this UUID to serialize iOS transport retries across
@@ -413,6 +423,36 @@ def _send_resident(
         return err, 400
     hosted_config_store._ensure_model_api_runtime_profile(store, config, touch=True)
 
+    # Hosted V1 learns visual capability only from the exact provider failure.
+    # Capture the main route/version as inert metadata on this accepted image;
+    # the terminal reply transaction later consumes it with a strict CAS. A
+    # missing/racing binding never blocks or reroutes the send.
+    main_vision_binding = None
+    if has_image and not vision_route_id:
+        candidate = db.model_api_active_route_version(store.user_id)
+        if isinstance(candidate, dict):
+            runtime_provider = str(getattr(runtime, "provider", "") or "")
+            runtime_model = str(getattr(runtime, "model", "") or "")
+            runtime_base_url = str(
+                getattr(runtime, "base_url", "") or ""
+            ).rstrip("/")
+            candidate_base_url = str(
+                candidate.get("base_url") or ""
+            ).rstrip("/")
+            if (
+                str(candidate.get("provider") or "") == runtime_provider
+                and (
+                    not runtime_model
+                    or str(candidate.get("model") or "") == runtime_model
+                )
+                and (
+                    not runtime_base_url
+                    or not candidate_base_url
+                    or candidate_base_url == runtime_base_url
+                )
+            ):
+                main_vision_binding = candidate
+
     if has_image:
         user_plaintext = image_bytes
     elif has_file:
@@ -452,6 +492,13 @@ def _send_resident(
         extra["image_mime"] = image_mime
     if has_image and vision_route_id:
         extra["vision_route_id"] = vision_route_id
+    if has_image and main_vision_binding is not None:
+        extra["vision_main_route_id"] = str(
+            main_vision_binding.get("route_id") or ""
+        )
+        extra["vision_main_route_updated_at"] = str(
+            main_vision_binding.get("updated_at_token") or ""
+        )
     if has_image and message:
         # 带文字说明的图片：独立加密 caption，enclave history 解后填 content。
         caption_env, caption_err = core_envelope._build_shared_envelope_for_store(

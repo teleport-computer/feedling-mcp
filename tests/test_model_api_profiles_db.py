@@ -67,6 +67,42 @@ def test_route_upsert_is_idempotent_on_credential_model(backend_env):
     assert db.model_api_route_get(uid, r1)["reasoning_effort"] == "high"
 
 
+def test_vision_verdict_write_is_fenced_to_exact_route_version(backend_env):
+    uid = _uid()
+    seed_user(uid)
+    cid = _cred(uid)
+    route_id = db.model_api_route_upsert(uid, cid, "text-only-model", None)
+    db.model_api_route_activate(uid, route_id)
+    stale = db.model_api_active_route_version(uid)
+
+    # A later setup/configuration mutation invalidates the in-flight probe.
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE model_api_routes SET updated_at=updated_at + interval '1 second' "
+            "WHERE user_id=%s AND id=%s",
+            (uid, route_id),
+        )
+
+    assert not db.model_api_route_mark_vision_test(
+        uid,
+        route_id,
+        status="unsupported",
+        error="vision_model_incompatible",
+        expected_updated_at=stale["updated_at_token"],
+    )
+    assert db.model_api_route_get(uid, route_id)["vision_test_status"] == "untested"
+
+    current = db.model_api_active_route_version(uid)
+    assert db.model_api_route_mark_vision_test(
+        uid,
+        route_id,
+        status="unsupported",
+        error="vision_model_incompatible",
+        expected_updated_at=current["updated_at_token"],
+    )
+    assert db.model_api_route_get(uid, route_id)["vision_test_status"] == "unsupported"
+
+
 def test_route_upsert_persists_and_preserves_context_window(backend_env):
     uid = _uid()
     seed_user(uid)

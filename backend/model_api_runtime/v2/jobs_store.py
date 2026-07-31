@@ -2532,11 +2532,41 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
             raise RuntimeError("terminal failure reply id collision")
         return _ack_terminal_failure_reply(job_id)
 
+    failure_identity: dict[str, str] = {}
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT detail_json FROM agent_status_events "
+                "WHERE job_id=%s AND kind='error' ORDER BY id DESC LIMIT 1",
+                (job_id,),
+            )
+            identity_row = cur.fetchone()
+    detail = (identity_row or {}).get("detail_json")
+    if isinstance(detail, dict):
+        for source, target, limit in (
+            ("failure_model", "turn_failure_model", 96),
+            ("failure_provider", "turn_failure_provider", 80),
+        ):
+            value = re.sub(
+                r"[^A-Za-z0-9_./:@+-]+", "_", str(detail.get(source) or "").strip()
+            )[:limit]
+            if value:
+                failure_identity[target] = value
+
     error_class = _terminal_error_class(
         row.get("error_code"), row.get("error_class")
     )
     blame = notices_catalog.blame_for(error_class)
-    user_text = notices_catalog.user_text_for(error_class)
+    try:
+        from accounts import registry as accounts_registry
+
+        language = accounts_registry._get_user_archive_language(user_id) or ""
+    except Exception:  # noqa: BLE001 — locale lookup must not block failure delivery
+        language = ""
+    user_text = notices_catalog.user_text_for(
+        error_class,
+        language=language,
+    )
     reply_text = (
         user_text
         if blame == "user_provider"
@@ -2560,6 +2590,7 @@ def _deliver_terminal_failure_reply(row: dict) -> bool:
             "turn_failure_user_text": user_text,
             "terminal_failure_job_id": str(job_id),
             "reply_to_message_id": parent_id,
+            **failure_identity,
         },
     )
     seq, inserted = db.chat_append_effect_with_cursor(
@@ -2602,7 +2633,7 @@ def _deliver_terminal_failure_runtime_error(job_id) -> bool:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    "SELECT user_id,error_code,target_route_id,"
+                    "SELECT user_id,error_code,error_class,target_route_id,"
                     "target_route_updated_at,runtime_error_delivered_at "
                     "FROM v2_terminal_failure_outbox WHERE job_id=%s FOR UPDATE",
                     (job_id,),
@@ -2612,9 +2643,21 @@ def _deliver_terminal_failure_runtime_error(job_id) -> bool:
                     return False
                 route_id = row.get("target_route_id")
                 if route_id is not None:
+                    learns_vision_unsupported = (
+                        str(row.get("error_class") or "")
+                        == "vision_model_required"
+                    )
                     cur.execute(
                         "UPDATE model_api_routes SET last_runtime_error=%s,"
-                        "last_runtime_error_class='',updated_at=now() "
+                        "last_runtime_error_class='',"
+                        "vision_test_status=CASE WHEN %s THEN 'unsupported' "
+                        "  ELSE vision_test_status END,"
+                        "last_vision_test_error=CASE WHEN %s "
+                        "  THEN 'vision_model_required' "
+                        "  ELSE last_vision_test_error END,"
+                        "last_vision_test_at=CASE WHEN %s THEN now() "
+                        "  ELSE last_vision_test_at END,"
+                        "updated_at=now() "
                         "WHERE id=%s AND user_id=%s AND is_active "
                         "AND updated_at IS NOT DISTINCT FROM %s "
                         "AND NOT EXISTS (SELECT 1 FROM agent_jobs newer "
@@ -2622,6 +2665,9 @@ def _deliver_terminal_failure_runtime_error(job_id) -> bool:
                         "  AND newer.status='completed' AND newer.id>%s)",
                         (
                             str(row["error_code"]),
+                            learns_vision_unsupported,
+                            learns_vision_unsupported,
+                            learns_vision_unsupported,
                             route_id,
                             str(row["user_id"]),
                             row.get("target_route_updated_at"),
@@ -3911,20 +3957,32 @@ def recent_chat_operational_health(
     }
 
 
-def recent_runtime_health(
-    *,
-    within_hours: int = 24,
-    limit: int = 1000,
-) -> dict:
+def recent_runtime_health(*, within_hours: int = 24) -> dict:
     """全 lane 运行时健康快照（content-free），喂 admin 值班台。
 
     分母刻意从 ``agent_jobs`` 起算而非从 metrics/trajectory 起算：一次完全漏写
     若同时消失于分子和分母，就会报出虚假健康的机群。``superseded`` 单列、不进
     失败率——运行时代际切换不是故障。延迟分位数只取成功回合（``failed IS NOT
     TRUE``）：失败超时回合会把 p95 拉到与故障同源的高位，让一个故障看起来像两个。
+
+    **窗口内全量，不设采样上界**（2026-07-30 审计打回）：本函数曾对四条子查询各
+    加 ``LIMIT 1000``，于是 24h 档写着「24 小时」，实际是「最近 1000 个 job」。
+    同页的 ``recent_token_usage_by_lane`` 从一开始就是窗口内全量，两者在 168h /
+    720h 档覆盖的时间跨度并不相同——值班时把「失败率」和「token」放在一行读，
+    却是两批样本，无法互相对账。采样上界不是性能手段而是正确性缺陷：它让页面
+    在长窗口下**静默少报**故障总量。扫描量改由 0071 的三条 ``created_at`` /
+    ``finished_at`` 索引承担（不是 ``ix_v2_turn_metrics_lane_created_at``——它
+    以 ``lane`` 为前导列，对非前导列的范围谓词只能全索引扫描、给不出范围收窄；
+    0071 的注释里有 24h/720h 两档的 EXPLAIN 实测数字）。
+
+    ``capture`` 的第一个桶叫 ``terminal_seen_no_gap`` 而**不叫** ``complete``：
+    它只证明「找到了 ``turn_terminal`` 事件、且没有 ``capture_gap``」，不证明
+    prompt / provider 往返 / tool call / 最终回复这些 artifact 都齐全。叫
+    ``complete`` 会让读者（和下一个改这段代码的人）以为轨迹可以完整回放。
+    姊妹函数 ``recent_chat_operational_health`` 仍用 ``complete``/``complete_rate``
+    ——那是 /model_api 指标端点的对外契约，改名要单独走版本沟通，不混在本次改动里。
     """
     safe_hours = max(1, min(int(within_hours), 24 * 30))
-    safe_limit = max(1, min(int(limit), 1000))
     terminal_statuses = ("completed", "failed", "expired", "superseded")
 
     with _pool().connection() as conn:
@@ -3933,8 +3991,7 @@ def recent_runtime_health(
                 "WITH recent AS ("
                 "  SELECT lane,status,last_error FROM agent_jobs "
                 "  WHERE status IN ('completed','failed','expired','superseded') "
-                "    AND finished_at >= now() - make_interval(hours => %s) "
-                "  ORDER BY finished_at DESC,id DESC LIMIT %s"
+                "    AND finished_at >= now() - make_interval(hours => %s)"
                 ") SELECT lane,"
                 "  COUNT(*) FILTER (WHERE status='completed')::int AS completed,"
                 "  COUNT(*) FILTER (WHERE status='failed')::int AS failed,"
@@ -3945,7 +4002,7 @@ def recent_runtime_health(
                 "  COUNT(*) FILTER (WHERE status='expired' "
                 "    AND last_error='lease_timeout')::int AS lease_expired "
                 "FROM recent GROUP BY lane",
-                (safe_hours, safe_limit),
+                (safe_hours,),
             )
             outcome_rows = cur.fetchall()
 
@@ -3954,21 +4011,19 @@ def recent_runtime_health(
                 "  SELECT lane,latency_ms FROM v2_turn_metrics "
                 "  WHERE failed IS NOT TRUE AND latency_ms IS NOT NULL "
                 "    AND latency_ms >= 0 "
-                "    AND created_at >= now() - make_interval(hours => %s) "
-                "  ORDER BY created_at DESC,id DESC LIMIT %s"
+                "    AND created_at >= now() - make_interval(hours => %s)"
                 ") SELECT lane,"
                 "  percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms) AS p50_ms,"
                 "  percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms "
                 "FROM recent GROUP BY lane",
-                (safe_hours, safe_limit),
+                (safe_hours,),
             )
             latency_rows = cur.fetchall()
 
             cur.execute(
                 "WITH recent_jobs AS ("
                 "  SELECT id,lane,status FROM agent_jobs "
-                "  WHERE created_at >= now() - make_interval(hours => %s) "
-                "  ORDER BY id DESC LIMIT %s"
+                "  WHERE created_at >= now() - make_interval(hours => %s)"
                 "), classified AS ("
                 "  SELECT job.lane,"
                 "    CASE "
@@ -3980,21 +4035,22 @@ def recent_runtime_health(
                 "          AND gap.event_kind='capture_gap') THEN 'partial' "
                 "      WHEN EXISTS (SELECT 1 FROM v2_trajectory_events terminal "
                 "        WHERE terminal.job_id=job.id "
-                "          AND terminal.event_kind='turn_terminal') THEN 'complete' "
+                "          AND terminal.event_kind='turn_terminal') "
+                "        THEN 'terminal_seen_no_gap' "
                 "      WHEN job.status=ANY(%s::text[]) THEN 'partial' "
                 "      ELSE 'open' "
                 "    END AS capture_status "
                 "  FROM recent_jobs job "
                 "  LEFT JOIN v2_trajectory_streams stream ON stream.job_id=job.id"
                 ") SELECT lane,"
-                "  COUNT(*) FILTER (WHERE capture_status='complete')::int AS complete,"
+                "  COUNT(*) FILTER (WHERE capture_status='terminal_seen_no_gap')::int "
+                "    AS terminal_seen_no_gap,"
                 "  COUNT(*) FILTER (WHERE capture_status='partial')::int AS partial,"
                 "  COUNT(*) FILTER (WHERE capture_status='missing')::int AS missing,"
                 "  COUNT(*) FILTER (WHERE capture_status='open')::int AS open "
                 "FROM classified GROUP BY lane",
                 (
                     safe_hours,
-                    safe_limit,
                     list(terminal_statuses),
                     list(terminal_statuses),
                 ),
@@ -4005,11 +4061,10 @@ def recent_runtime_health(
                 "WITH recent AS ("
                 "  SELECT lane,last_error FROM agent_jobs "
                 "  WHERE status IN ('failed','expired') AND last_error IS NOT NULL "
-                "    AND finished_at >= now() - make_interval(hours => %s) "
-                "  ORDER BY finished_at DESC,id DESC LIMIT %s"
+                "    AND finished_at >= now() - make_interval(hours => %s)"
                 ") SELECT lane,last_error,COUNT(*)::int AS count "
                 "FROM recent GROUP BY lane,last_error ORDER BY count DESC",
-                (safe_hours, safe_limit),
+                (safe_hours,),
             )
             failure_rows = cur.fetchall()
 
@@ -4072,7 +4127,10 @@ def recent_runtime_health(
             "p50_ok_ms": _optional_ms(latency_by_lane.get(lane), "p50_ms"),
             "p95_ok_ms": _optional_ms(latency_by_lane.get(lane), "p95_ms"),
             "capture": {
-                "complete": int((capture or {}).get("complete") or 0),
+                # 只表示「见到 turn_terminal 且无 capture_gap」，不表示 artifact 齐全。
+                "terminal_seen_no_gap": int(
+                    (capture or {}).get("terminal_seen_no_gap") or 0
+                ),
                 "partial": int((capture or {}).get("partial") or 0),
                 "missing": int((capture or {}).get("missing") or 0),
                 "open": int((capture or {}).get("open") or 0),
@@ -4112,16 +4170,17 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
     依据是错的，且方向反了：本查询**没有** ``WHERE lane = ...`` 等值谓词，
     只有 ``created_at >= ...`` 加 ``GROUP BY lane``。
     ``ix_v2_turn_metrics_lane_created_at`` 是 ``(lane, created_at DESC)``，
-    ``lane`` 是前缀这件事恰恰意味着它**服务不了**这条查询——PG 16 没有 B-tree
-    skip scan（PG 18 才有），前导列没有等值谓词时用不上索引。本地 PG 16
+    ``lane`` 是前缀这件事恰恰意味着它**给不出范围收窄**——PG 16 没有 B-tree
+    skip scan（PG 18 才有），前导列缺等值谓词时它最多退化成全索引扫描（720h
+    档实测确实会被选中，但扫满 21k+ buffer，见 0071 注释）。本地 PG 16
     （50 万行、5 个 lane）实测：本查询走 Parallel Seq Scan（
     ``Rows Removed by Filter`` 随窗口内行数线性增长，`shared hit` 六千+
     buffer）；而有 ``lane = 'chat'`` 等值谓词的既有
     ``recent_token_usage_summary`` 才真正吃到该索引的 Bitmap Index Scan
     （`shared read=35`）。``v2_turn_metrics`` 是 append-only 表，本查询的扫描
-    量因此随表增长单调变大；增长到不可接受时需要补一条单列索引
-    ``CREATE INDEX CONCURRENTLY ix_v2_turn_metrics_created_at ON
-    v2_turn_metrics (created_at DESC)``——记为明确的 follow-up，本次不加。
+    量因此随表增长单调变大；该 follow-up 已由迁移 0071 落地
+    （``ix_v2_turn_metrics_created_at``，单列 ``created_at DESC``）——
+    ``recent_runtime_health`` 同期去掉采样上界后，两条查询共用它。
 
     token 为空一律 ``None`` 而非 ``0``：provider 未回 usage 的调用应当降低
     ``usage_coverage``，而不是被记成零 token 混进总量假装正常。
@@ -4135,6 +4194,8 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
                 "  coalesce(sum(model_calls), 0)::bigint AS model_calls,"
                 "  coalesce(sum(usage_reported_calls), 0)::bigint"
                 "    AS usage_reported_calls,"
+                "  coalesce(sum(cache_reported_calls), 0)::bigint"
+                "    AS cache_reported_calls,"
                 "  sum(prompt_tokens)::bigint AS prompt_tokens,"
                 "  sum(completion_tokens)::bigint AS completion_tokens,"
                 "  sum(cache_read_tokens)::bigint AS cache_read_tokens,"
@@ -4154,6 +4215,7 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
     for row in rows:
         model_calls = int(row["model_calls"] or 0)
         usage_calls = int(row["usage_reported_calls"] or 0)
+        cache_calls = int(row["cache_reported_calls"] or 0)
         prompt_tokens = _optional_int(row, "prompt_tokens")
         completion_tokens = _optional_int(row, "completion_tokens")
         cache_read = _optional_int(row, "cache_read_tokens")
@@ -4175,6 +4237,14 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
         lanes[str(row["lane"] or "unknown")] = {
             "model_calls": model_calls,
             "usage_reported_calls": usage_calls,
+            # cache coverage 与 usage coverage 是两个不同的东西：前者是"有多少次
+            # 调用报了缓存指标"，后者是"有多少次调用报了 token usage"。页面此前把
+            # cache_hit_ratio 与 usage_coverage 挤在一列、标签写「缓存命中 · 上报」，
+            # 读者会把那个"上报"当成 cache 上报（2026-07-30 审计指出）。
+            "cache_reported_calls": cache_calls,
+            "cache_coverage": (
+                float(cache_calls) / float(model_calls) if model_calls else None
+            ),
             "usage_coverage": (
                 float(usage_calls) / float(model_calls) if model_calls else None
             ),
@@ -4195,6 +4265,91 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
         }
 
     return {"window_hours": safe_hours, "lanes": lanes}
+
+
+def recent_delivery_health(*, within_hours: int = 24) -> dict:
+    """端到端交付健康（content-free），喂 admin 值班台。
+
+    补的是 2026-07-30 审计里最实的一个盲区：``agent_jobs`` 判 ``completed`` 只
+    证明**回合跑完了**，不证明它的产物到达了用户。副作用走 ``v2_effect_outbox``
+    落库后异步 apply，用户可见的终态失败走 ``v2_terminal_failure_outbox`` 投递；
+    这两条队列堵住时，job 结局层面一切正常——页面此前照样报绿。
+
+    三块的窗口语义**刻意不同**，别当成一套：
+
+    * ``effect_outbox`` / ``terminal_failure_outbox`` 是**当前积压状态量**，不受
+      ``within_hours`` 约束（和 ``pool.pending`` 同类）。一条三天前就该 apply 的
+      effect 如果还堵着，那是现在的故障，不该因为窗口切到 24h 就消失。
+    * ``mcp_mutation`` 是**窗口内计数**：远端 mutation 的结果未知是一次性事件，
+      过去某天出过一次不该永久点亮值班台。
+
+    ``unknown`` 与 ``unresolved`` 分开：前者是**已判定**结果不可知（远端可能已经
+    改了数据，我们不知道），后者是 ``resolved_at IS NULL`` 的悬空记录（进程死在
+    判定之前）。两者都需要人看，但含义不同，合并计数会掩盖后者。
+    """
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT COUNT(*)::int AS pending,"
+                "  EXTRACT(EPOCH FROM (clock_timestamp()-MIN(created_at))) "
+                "    AS oldest_pending_age_sec "
+                "FROM v2_effect_outbox WHERE status='pending'"
+            )
+            effect_row = cur.fetchone() or {}
+
+            # 两种投递义务各自独立退避、各自独立标记完成，所以分别计数；年龄取
+            # 两者中最老的未完成行——值班只需要一个「堵了多久」。
+            cur.execute(
+                "SELECT "
+                "  COUNT(*) FILTER (WHERE status_delivered_at IS NULL)::int "
+                "    AS status_undelivered,"
+                "  COUNT(*) FILTER (WHERE runtime_error_delivered_at IS NULL)::int "
+                "    AS runtime_error_undelivered,"
+                "  EXTRACT(EPOCH FROM (clock_timestamp()-MIN(created_at) FILTER ("
+                "    WHERE status_delivered_at IS NULL "
+                "      OR runtime_error_delivered_at IS NULL))) "
+                "    AS oldest_undelivered_age_sec "
+                "FROM v2_terminal_failure_outbox"
+            )
+            failure_row = cur.fetchone() or {}
+
+            cur.execute(
+                "SELECT "
+                "  COUNT(*) FILTER (WHERE outcome='unknown')::int AS unknown,"
+                "  COUNT(*) FILTER (WHERE outcome IS NULL "
+                "    AND resolved_at IS NULL)::int AS unresolved "
+                "FROM v2_mcp_mutation_attempts "
+                "WHERE started_at >= now() - make_interval(hours => %s)",
+                (safe_hours,),
+            )
+            mutation_row = cur.fetchone() or {}
+
+    def _age(row, key):
+        value = row.get(key)
+        return float(value) if value is not None else None
+
+    return {
+        "window_hours": safe_hours,
+        "effect_outbox": {
+            "pending": int(effect_row.get("pending") or 0),
+            "oldest_pending_age_sec": _age(effect_row, "oldest_pending_age_sec"),
+        },
+        "terminal_failure_outbox": {
+            "status_undelivered": int(failure_row.get("status_undelivered") or 0),
+            "runtime_error_undelivered": int(
+                failure_row.get("runtime_error_undelivered") or 0
+            ),
+            "oldest_undelivered_age_sec": _age(
+                failure_row, "oldest_undelivered_age_sec"
+            ),
+        },
+        "mcp_mutation": {
+            "unknown": int(mutation_row.get("unknown") or 0),
+            "unresolved": int(mutation_row.get("unresolved") or 0),
+        },
+    }
 
 
 def recent_prompt_cache_stats(
@@ -6276,6 +6431,62 @@ def due_screen_watch_users(*, now: float | None = None, limit: int = 500) -> lis
                 (ts, ts, int(limit)),
             )
             return [row[0] for row in cur.fetchall()]
+
+
+def due_compaction_users(
+    *, min_backlog: int, limit: int = 200
+) -> list[tuple[str, int]]:
+    """V2 用户里积压过大、且当前没人在折的 ``[(user_id, backlog)]``，积压降序。
+
+    这是唯一不需要用户开口的 maintenance 入队来源。其余四个入队点都挂在 turn
+    上（回复成功后、coverage 降级、自链 catchup、CAS 重试），所以一个不再说话的
+    用户就此停止折叠，而刚切到 V2 的大积压用户根本没人踢第一脚。
+
+    三条口径必须和折叠本身一致，否则扫出来的用户会空转：
+
+    * **从 ``v2_runtime_state`` 出发**（不是从 summary），因为刚切过来的用户还
+      没有 summary 行，``COALESCE(watermark_seq, 0)`` 让他们的积压等于全部消息
+      ——正是最需要扫的那批。同时天然排除已回滚到 resident 的用户：给 V1 用户
+      入队 maintenance 会把已经停掉的 V2 工作重新拉起来。
+    * **排除 GC-able 合成行**，与 ``db.count_messages_after_seq`` /
+      ``chat_messages_after_seq`` 和两个 frontier 见证同一集合。把 verify_ping
+      当积压会安排一次针对「马上要被 verify_loop 删掉的行」的折叠，那是永久性的
+      frontier 损坏。
+    * **跳过已有在途 maintenance job 的用户**。``enqueue_job`` 自己有 per-user
+      单飞会 coalesce，所以重复入队本身无害；这一条只是不让扫描器每个 tick 都
+      对同一批用户做无用功。
+
+    每个用户的计数走 LATERAL 子查询并 ``LIMIT min_backlog``：只需要判定「够不够
+    阈值」，不需要精确总数，所以一个积压 5 万条的用户也只扫 ``min_backlog`` 行。
+    返回的 backlog 因此是**下界**（等于阈值即「至少这么多」），够排序用。
+    """
+    threshold = max(1, int(min_backlog))
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT rs.user_id, backlog.n FROM v2_runtime_state AS rs "
+                "LEFT JOIN v2_conversation_summary AS s ON s.user_id = rs.user_id "
+                "JOIN LATERAL ("
+                "  SELECT count(*) AS n FROM ("
+                "    SELECT 1 FROM chat_messages AS m "
+                "    WHERE m.user_id = rs.user_id "
+                "      AND m.seq > COALESCE(s.watermark_seq, 0) "
+                "      AND COALESCE(m.doc->>'source','') "
+                "          NOT IN ('verify_ping','resident_maintenance') "
+                "    LIMIT %s"
+                "  ) AS capped"
+                ") AS backlog ON TRUE "
+                "WHERE rs.hosted_runtime_state = 'v2' "
+                "  AND backlog.n >= %s "
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM agent_jobs AS j "
+                "    WHERE j.user_id = rs.user_id AND j.lane = 'maintenance' "
+                "      AND j.status IN ('pending','claimed','running')"
+                "  ) "
+                "ORDER BY backlog.n DESC, rs.user_id LIMIT %s",
+                (threshold, threshold, int(limit)),
+            )
+            return [(row[0], int(row[1])) for row in cur.fetchall()]
 
 
 SCHEDULED_WAKE_STREAM = "proactive_scheduled_wakes_v2"

@@ -11,9 +11,9 @@
 
 冻结两个面（对应计划 Task 0.5 的两条 bullet）：
   1. **表级强制信封 CHECK**（`_scan_migrations`）——数据库层拒绝明文行的证据。
-  2. **服务端封装写入点**（`_scan_write_sites`）——代码层无偏好分支的强制加密
-     写入。Phase 2 Task 2.2 要把这些点逐个改成「按 content_encryption 偏好路由」，
-     在那之前只许减不许增。
+  2. **底层强制封装写入点**（`_scan_write_sites`）——直接调用
+     `content_encryption.build_envelope`、绕过通用 shape router 的站点。安全的
+     `_build_shared_envelope_for_store` 不计入：它已经按 effective preference 路由。
 
 2026-07-28 接手补齐（原实现只覆盖了第 1 面的一部分）：
   - 扫描面从 `alembic` 扩到 **`alembic_tee`**：表同步工作流正在那条链上新建
@@ -58,48 +58,25 @@ FORCED_ENVELOPE_PATTERNS = (
 # CI 而随手往这里加文件——新增项必须先在计划 Task 2.2 登记为待改造。
 ALLOWLISTED_MIGRATIONS = {
     "0043_v2_encrypted_trajectories.py",
-    # 0068 是**放宽**：把 0043 的「必须是信封」改成「信封 OR 明文」，正是本守卫
+    # 0072 是**放宽**：把 0043 的「必须是信封」改成「信封 OR 明文」，正是本守卫
     # 想要的方向。它之所以被扫到，只是因为放宽后的 CHECK 里仍保留了信封分支
     # （加密档用户的行仍须完整），而守卫做的是文本匹配、认不出 `OR 明文分支`。
     # 登记在此而非放松 pattern：pattern 一旦放松，真正的新增强制约束也会溜过去。
-    "0068_relax_v2_envelope_shape.py",
+    "0072_relax_v2_envelope_shape.py",
 }
 
-# 服务端封装点：调用即产生「双收件人信封」，没有 content_encryption 偏好分支
-# 就等于强制加密。`build_envelope` 的定义处（content_encryption.py）不算。
-WRITE_SITE_RE = re.compile(
-    r"(?:core_envelope\.)?_build_shared_envelope_for_store\s*\("
-    r"|(?<![\w.])build_envelope\s*\("
-)
+# 底层封装 primitive：直接调用就产生双收件人信封。通用
+# `_build_shared_envelope_for_store` 已按 effective content_encryption 路由，不是
+# 强制封装点；把它算进去会在每个正确接入的新功能上误报。
+WRITE_SITE_RE = re.compile(r"(?<![\w.])build_envelope\s*\(")
 _DEF_RE = re.compile(r"def\s+_?build_(?:shared_envelope_for_store|envelope)\s*\(")
 
-# 写入点冻结基线（2026-07-28 实测 44 处 / 19 文件）。计划 Task 2.2 记的是
-# 07-23 快照的 14 处——三周内翻了三倍，正是「加密面在扩张」的量化证据。
-# Phase 2 逐点改造时这些数字只应下降；**任何上升都是新的强制加密写入**。
+# 强制 primitive 基线。新增内容写路径应接通用 shape router，不能直接扩大此清单。
 WRITE_SITE_BASELINE = {
-    "backend/model_api_runtime/v2/serve_worker.py": 7,
-    "backend/hosted/chat_send_core.py": 6,
-    "backend/model_api_runtime/v2/worker.py": 5,
-    "backend/genesis/service.py": 4,
-    "backend/hosted/history_import.py": 3,
-    "backend/hosted/mcp_core.py": 3,
-    "backend/hosted/setup_core.py": 3,
-    "backend/identity/actions.py": 2,
     "backend/accounts/accounts_core.py": 1,
-    "backend/chat/resident_maintenance.py": 1,
-    "backend/chat/service.py": 1,
     "backend/content/content_core.py": 1,
     "backend/core/envelope.py": 1,
-    "backend/genesis/persona_backfill.py": 1,
-    "backend/identity/identity_core.py": 1,
-    "backend/memory/actions.py": 1,
     "backend/model_api_runtime/v2/extraction.py": 1,
-    "backend/model_api_runtime/v2/jobs_store.py": 1,
-    "backend/workspace/service.py": 1,
-    # 2026-07-29 合并 test 分支时由本守卫抓出的新增点（voice 模块是 test 侧新功能）。
-    # 分类：A 类用户内容（语音），Task 2.2 按偏好路由时一并处理。
-    # 登记而非放行——守卫的作用就是让新增点必须经过一次人工分类。
-    "backend/voice/routes_asgi.py": 1,
 }
 
 
@@ -133,7 +110,7 @@ def _scan_migrations(version_dirs=VERSION_DIRS,
 
 
 def _scan_write_sites(backend: Path = BACKEND) -> dict[str, int]:
-    """返回 {相对路径: 服务端封装调用点数}。"""
+    """返回 {相对路径: 绕过 shape router 的底层封装调用点数}。"""
     hits: dict[str, int] = {}
     root = backend.parent
     for f in sorted(backend.rglob("*.py")):
@@ -224,7 +201,7 @@ def test_guard_ignores_documentation_mentions(tmp_path):
 # ---------------------------------------------------------- 面 2：写入点冻结
 
 def test_no_new_forced_envelope_write_sites():
-    """服务端封装写入点只许减不许增（计划 Task 0.5 第二条）。"""
+    """底层强制封装 primitive 调用点只许减不许增。"""
     current = _scan_write_sites()
     grown = {
         path: (WRITE_SITE_BASELINE.get(path, 0), n)
@@ -232,12 +209,12 @@ def test_no_new_forced_envelope_write_sites():
         if n > WRITE_SITE_BASELINE.get(path, 0)
     }
     assert not grown, (
-        "检测到新增的『无偏好分支的服务端信封封装点』，与 v6 默认明文冲突"
+        "检测到新增的『绕过 shape router 的底层信封封装点』，与 v6 默认明文冲突"
         "（这些点会无条件产生双收件人信封，明文档用户拿不到明文）：\n"
         + "\n".join(f"  {p}: 基线 {old} → 现在 {new}"
                     for p, (old, new) in sorted(grown.items()))
-        + "\n\n正确做法：新写入按用户 content_encryption 偏好路由——off 写明文、"
-        "on 才走 _build_shared_envelope_for_store。\n若确属加密档专用路径，"
+        + "\n\n正确做法：新写入走 _build_shared_envelope_for_store，由它按用户 "
+        "content_encryption 偏好路由。\n若确属加密档专用路径，"
         "先在计划 Task 2.2 登记，再更新本测试的 WRITE_SITE_BASELINE。"
     )
 

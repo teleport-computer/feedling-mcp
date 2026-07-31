@@ -193,7 +193,7 @@ GET /v1/notices?include_resolved=<bool, 默认 true>
 - 语义：不算对用户消息的回复（不影响已回复状态）、不推送（兜底话术那条已推过）、失败重试期间不会重复出现（服务端已做排他与去抖）。
 
 回合错误的 error_class 全集（同时会双写进通知中心）：
-`quota_insufficient` · `auth_invalid` · `model_not_found` · `rate_limited` · `upstream_unavailable` · `turn_timeout` · `reply_parse_failed` · `unknown`
+`quota_insufficient` · `auth_invalid` · `model_not_found` · `vision_model_required` · `rate_limited` · `upstream_unavailable` · `turn_timeout` · `reply_parse_failed` · `unknown`
 
 计划新增（Phase C 同批；老版按未知 slug 兜底即可）：
 - `provider_incompatible`（user_provider）——上游不兼容请求格式（如部分中转/xAI 拒收工具 schema）

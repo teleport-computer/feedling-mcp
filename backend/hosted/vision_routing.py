@@ -40,10 +40,13 @@ def runtime_capability(store) -> dict:
 
 
 def dedicated_route_for_send(store) -> tuple[dict | None, tuple[dict, int] | None]:
-    """Return the optional dedicated route without blocking image ingestion.
+    """Return the user's optional dedicated route without gating image delivery.
 
-    Follow-main is the compatibility default. A manually selected dedicated
-    route is pinned for downstream delivery, but capability/test state remains
-    settings feedback rather than a send-time gate.
+    Capability verdicts are settings/UI signals only.  ``unsupported``,
+    ``failed``, ``testing``, and ``untested`` all preserve the configured send
+    path: follow-main still sends pixels to the main model, while a selected
+    dedicated route stays pinned for observation.  The provider's real response
+    owns the turn outcome.
     """
-    return db.model_api_vision_route(store.user_id), None
+    selected = db.model_api_vision_route(store.user_id)
+    return selected, None

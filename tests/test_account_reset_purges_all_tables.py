@@ -105,6 +105,27 @@ def _seed_all_per_user_tables(user_id: str) -> None:
             "VALUES (%s,1,'cleared-message',1.0,%s,0,1)",
             (user_id, db.Jsonb({"body_ct": "encrypted-chat-body"})),
         )
+        conn.execute(
+            "INSERT INTO user_blobs (user_id,kind,doc) "
+            "VALUES (%s,'v2_agent_profile',%s)",
+            (
+                user_id,
+                db.Jsonb(
+                    {
+                        "v": 1,
+                        "state": "ok",
+                        "memory": {
+                            "envelope": {"body_ct": "cipher-memory"},
+                            "chars": 6,
+                        },
+                        "user": {
+                            "envelope": {"body_ct": "cipher-user"},
+                            "chars": 4,
+                        },
+                    }
+                ),
+            ),
+        )
     cid = db.model_api_credential_create(
         user_id, provider="anthropic", base_url="", label="k",
         api_key_envelope={"v": 1, "body_ct": "ct", "nonce": "n"},
@@ -125,6 +146,7 @@ _PER_USER_TABLES = (
     "v2_turn_metrics",
     "v2_capture_batches",
     "chat_message_archive",
+    "user_blobs",
 )
 
 

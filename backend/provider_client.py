@@ -3538,7 +3538,11 @@ def _parse_catalog_page(provider: str, body: Any) -> tuple[list[dict], str | Non
         if not mid or len(mid) > _CATALOG_MAX_ID_LEN:
             continue
         display = disp if isinstance(disp, str) and disp else mid
-        out.append({"id": mid, "display_name": display})
+        model = {"id": mid, "display_name": display}
+        input_modalities = _catalog_input_modalities(provider, m)
+        if input_modalities is not None:
+            model["input_modalities"] = input_modalities
+        out.append(model)
 
     nxt: str | None = None
     if provider == "gemini":
@@ -3551,6 +3555,51 @@ def _parse_catalog_page(provider: str, body: Any) -> tuple[list[dict], str | Non
         else:
             raise ProviderError("model_catalog_invalid_response")
     return out, nxt
+
+
+def _catalog_input_modalities(provider: str, model: dict) -> list[str] | None:
+    """Return only explicit provider metadata; never infer from a model id.
+
+    OpenRouter publishes ``architecture.input_modalities``. Anthropic publishes
+    ``capabilities.image_input.supported``. OpenAI-compatible relays may expose
+    a direct ``input_modalities`` extension. Other catalog shapes currently do
+    not make image input support explicit enough to trust, so ``None`` means the
+    caller must use a real visual probe.
+    """
+    provider = normalize_provider(provider)
+    raw = None
+    if provider == "openrouter":
+        architecture = model.get("architecture")
+        if isinstance(architecture, dict):
+            raw = architecture.get("input_modalities")
+    elif provider == "anthropic":
+        capabilities = model.get("capabilities")
+        image_input = (
+            capabilities.get("image_input")
+            if isinstance(capabilities, dict)
+            else None
+        )
+        supported = (
+            image_input.get("supported")
+            if isinstance(image_input, dict)
+            else None
+        )
+        if isinstance(supported, bool):
+            return ["text", "image"] if supported else ["text"]
+    elif provider in {"openai_compatible"}:
+        raw = model.get("input_modalities")
+
+    if not isinstance(raw, list):
+        return None
+    allowed = {"text", "image", "audio", "video"}
+    cleaned = sorted({
+        str(item).strip().lower()
+        for item in raw
+        if isinstance(item, str) and str(item).strip().lower() in allowed
+    })
+    # Preserve an explicit empty field as an explicit "no supported inputs"
+    # declaration. Missing/malformed fields remain None and fall back to probe.
+    return cleaned
 
 
 def _fetch_catalog_page(client: httpx.Client, url: str, headers: dict,
@@ -3613,6 +3662,43 @@ def _fetch_catalog_page(client: httpx.Client, url: str, headers: dict,
     return body, total
 
 
+def _verify_key_for_public_catalog(provider: str, api_key: str,
+                                   base_url: str) -> None:
+    """Reject a bad key for providers whose model *catalog* is PUBLIC.
+
+    OpenRouter's ``GET /models`` needs no auth: a bogus key still returns a full
+    HTTP 200 catalog, so the iOS validate-before-advance gate would wave a wrong
+    key through (both a wrong and a right key "load" a catalog). Probe an
+    AUTHENTICATED endpoint FIRST so a bad key raises before we ever fetch the
+    catalog. A bogus key → 401 → ``ProviderError(status_code=401)`` (mapped to
+    ``model_catalog_auth_failed`` by ``model_catalog_error_slug``); a real key →
+    200 → returns. Only the status matters — the body is intentionally ignored.
+
+    Every OTHER supported provider already requires auth on its own ``/models``
+    (openai/anthropic/gemini/deepseek all 401 on a bad key), so this is a no-op
+    for them.
+
+    Residual edge: ``openai_compatible`` custom relays have no assumable auth-
+    check endpoint, so they are deliberately NOT probed here. A custom relay that
+    exposes a PUBLIC ``/models`` could still accept a bad key at this gate — left
+    as documented behavior rather than guessing an endpoint that may not exist.
+    """
+    provider = normalize_provider(provider)
+    if provider != "openrouter":
+        return
+    # OpenRouter's auth-check endpoint. ``base`` is the normalized openrouter
+    # base (https://openrouter.ai/api/v1), so the probe hits .../v1/key.
+    base = (base_url or default_base_url(provider)).rstrip("/")
+    url = f"{base}/key"
+    headers = {"Authorization": f"Bearer {api_key}",
+               "Content-Type": "application/json"}
+    client = _http_client()
+    deadline = time.monotonic() + _CATALOG_TOTAL_BUDGET
+    # One bounded request via the same streamed/capped helper the catalog pages
+    # use; it RAISES ProviderError on any status >= 400 (carrying status_code).
+    _fetch_catalog_page(client, url, headers, {}, deadline, 0)
+
+
 def list_provider_models(provider: str, api_key: str, base_url: str = "") -> dict:
     provider = normalize_provider(provider)
     warnings: list[str] = []
@@ -3623,6 +3709,14 @@ def list_provider_models(provider: str, api_key: str, base_url: str = "") -> dic
             return {"models": [], "complete": True, "warnings": [],
                     "catalog_supported": False}
         raise
+
+    # For providers whose catalog is PUBLIC (openrouter), verify the key against
+    # an authenticated endpoint BEFORE fetching the catalog, so a bogus key is
+    # rejected instead of returning a full catalog. No-op for every other
+    # provider (their /models already authenticates). Let ProviderError
+    # propagate — setup_core maps it via model_catalog_error_slug (401 →
+    # model_catalog_auth_failed), so the contract is unchanged.
+    _verify_key_for_public_catalog(provider, api_key, base_url)
 
     seen: set[str] = set()
     seen_cursors: set[str] = set()

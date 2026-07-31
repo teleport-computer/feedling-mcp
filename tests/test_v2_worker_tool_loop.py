@@ -150,8 +150,8 @@ def _script_provider(monkeypatch, responses):
     it = iter(responses)
     calls = []
 
-    async def _fake(config, messages, *, tools=None, **_kwargs):
-        calls.append({"messages": messages, "tools": tools})
+    async def _fake(config, messages, *, tools=None, **kwargs):
+        calls.append({"messages": messages, "tools": tools, **kwargs})
         return next(it)
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
@@ -288,6 +288,11 @@ def _late_input_deps(uid: str, written: list[str]) -> worker.TurnDeps:
 def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     """Round 1: no tool_calls, plain text -> that text IS the final reply
     (Global Constraints)."""
+    # Legacy include_reasoning path: with self-authored thinking OFF, an explicit
+    # include_reasoning request flows through to the provider. (With it ON — the
+    # shipped default — native reasoning is suppressed so the model emits a <think>
+    # instead; see test_self_thinking_on_suppresses_native_reasoning below.)
+    monkeypatch.setenv("FEEDLING_V2_SELF_THINKING", "off")
     uid = "u_toolloop_happy"
     conftest.seed_user(uid)
     _reset(uid)
@@ -297,7 +302,13 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     _patch_real_write(monkeypatch)
 
     calls = _script_provider(monkeypatch, [_text_round("hello from the model")])
-    deps = _deps(messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}])
+    deps = _deps(messages=[{
+        "id": "m1",
+        "ts": 10.0,
+        "role": "user",
+        "content": "hi",
+        "include_reasoning": True,
+    }])
 
     status = asyncio.run(
         worker.process_job(
@@ -307,6 +318,7 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
 
     assert status == "completed"
     assert len(calls) == 1
+    assert calls[0]["include_reasoning"] is True
     bubbles = _bubbles(uid)
     assert len(bubbles) == 1
     assert bubbles[0]["body_ct"] == "hello from the model"
@@ -316,6 +328,41 @@ def test_single_round_plain_text_writes_exactly_one_bubble(monkeypatch):
     assert row[1] is False  # not failed
     assert row[2] == "ok"
     assert _job_status_row(job_id)[0] == "completed"
+
+
+def test_self_thinking_on_suppresses_native_reasoning(monkeypatch):
+    """Self-authored thinking ON (shipped default): even an explicit
+    include_reasoning request is suppressed at the provider, so a reasoning-capable
+    model emits its thought in the reply's <think> instead of a raw native CoT. This
+    is what aligns V2 with the V1 resident (see worker.py suppress_native_reasoning)."""
+    monkeypatch.delenv("FEEDLING_V2_SELF_THINKING", raising=False)  # default = ON
+    uid = "u_toolloop_selfthink_suppress"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-selfthink")
+
+    _patch_real_write(monkeypatch)
+
+    calls = _script_provider(monkeypatch, [_text_round("hello from the model")])
+    deps = _deps(messages=[{
+        "id": "m1",
+        "ts": 10.0,
+        "role": "user",
+        "content": "hi",
+        "include_reasoning": True,
+    }])
+
+    status = asyncio.run(
+        worker.process_job(
+            job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+        )
+    )
+
+    assert status == "completed"
+    assert len(calls) == 1
+    # The point: native reasoning was NOT requested despite include_reasoning=True.
+    assert calls[0].get("include_reasoning") is not True
 
 
 def test_degenerate_terminal_reply_becomes_attributed_fallback(monkeypatch):
@@ -844,6 +891,110 @@ def test_chat_workspace_prompt_failure_is_visible_before_provider(
         "failed",
         "turn_failed:workspace_prompt_unavailable",
     )
+
+
+def test_explicit_openrouter_image_rejection_writes_terminal_history_guidance(
+    monkeypatch,
+):
+    """Production-shaped seq-native failure: exact provider rejection reaches
+    the durable terminal outbox and becomes a decryptable, parent-linked Chat
+    bubble rather than stopping at the status stream."""
+    uid = "u_toolloop_openrouter_image_unsupported"
+    conftest.seed_user(uid, archive_language="en-US")
+    _reset(uid)
+    generation = db.get_runtime_generation(uid)
+    input_doc = {
+        **_user_doc("image-parent", "What is in this image?"),
+        "content_type": "image",
+        "image_mime": "image/png",
+    }
+    input_seq, job_id = db.chat_append_and_enqueue(
+        uid,
+        "image-parent",
+        10.0,
+        input_doc,
+        5000,
+        "chat",
+        expected_generation=generation,
+    )
+    job = jobs_store.claim_next_job("w-openrouter-image-unsupported")
+    assert job is not None and job["id"] == job_id
+    _patch_tool_effect_encryption(monkeypatch)
+
+    def _read_after_seq(_user_id: str, after_seq: int):
+        return [
+            {
+                "id": row["id"],
+                "seq": int(row["seq"]),
+                "ts": float(row.get("ts") or 0),
+                "role": row.get("role"),
+                "content": row.get("test_plaintext") or "",
+                "has_image": row.get("content_type") == "image",
+                "image_mime": row.get("image_mime") or "",
+            }
+            for row in db.chat_messages_after_seq(uid, after_seq, limit=None)
+            if row.get("role") == "user"
+        ]
+
+    def _read_tail_after_seq(
+        _user_id: str,
+        after_seq: int,
+        limit: int,
+        *,
+        through_seq: int | None = None,
+    ):
+        return _read_after_seq(_user_id, after_seq)
+
+    async def _reject_image(_config, _messages, *, tools=None, **_kwargs):
+        raise provider_client.ProviderError(
+            "provider_http_404: No endpoints found that support image input",
+            status_code=404,
+        )
+
+    monkeypatch.setattr(
+        provider_client, "chat_completion_async", _reject_image
+    )
+    deps = worker.TurnDeps(
+        read_messages=lambda _user_id: _read_after_seq(uid, 0),
+        read_messages_after_seq=_read_after_seq,
+        read_tail_after_seq=_read_tail_after_seq,
+        read_images=lambda _user_id, message_ids: {
+            message_id: {
+                "image_b64": "iVBORw0KGgo=",
+                "image_mime": "image/png",
+            }
+            for message_id in message_ids
+        },
+        read_summary_with_seq=lambda _user_id: ("", 0.0, 0, 0),
+        resolve_provider=lambda _user_id: (_BYOK, {}),
+        mint_enclave_token=lambda _user_id: "rt",
+    )
+
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    failures = [
+        row for row in db.chat_load_strict(uid)
+        if str(row.get("terminal_failure_job_id") or "") == str(job_id)
+    ]
+    assert len(failures) == 1
+    failure = failures[0]
+    assert failure["role"] == "openclaw"
+    assert failure["reply_to_message_id"] == "image-parent"
+    assert failure["turn_failure_error_class"] == "vision_model_required"
+    assert base64.b64decode(failure["body_ct"]).decode() == (
+        "Your current model can't process images, so it didn't receive this "
+        "picture. Switch models, or add a dedicated vision model in Settings."
+    )
+    assert v2_cursor.load_seq(core_store.get_store(uid)) == input_seq
 
 
 def test_chat_native_task_runs_child_then_returns_result_to_parent(
