@@ -197,7 +197,7 @@ def _tc(call_id, name, **args):
     return {"id": call_id, "name": name, "args": args}
 
 
-def _deps(*, messages, token="rt-enclave", web_enabled=True):
+def _deps(*, messages, token="rt-enclave", web_enabled=True, observe_photo=None):
     return worker.TurnDeps(
         # web_search/web_fetch are gated per user now (default OFF); these
         # tests use them as a generic outbound read, so opt in explicitly.
@@ -205,6 +205,7 @@ def _deps(*, messages, token="rt-enclave", web_enabled=True):
         read_messages=lambda uid: list(messages),
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: token,
+        observe_photo=observe_photo,
         apply_pending_effects=_apply_effects,
     )
 
@@ -722,6 +723,57 @@ def test_chat_mixed_valid_invalid_workspace_batch_applies_valid_call(
     ]
     assert captured["results"][0].content == "ok: workspace_write applied"
     assert captured["results"][1].content.startswith("error: unparseable args")
+
+
+def test_chat_photo_read_observation_reaches_next_model_round_without_base64(
+    monkeypatch,
+):
+    uid = "u_toolloop_photo_observation"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.enqueue_job(uid, "chat")
+    job = jobs_store.claim_next_job("w-photo")
+    _patch_real_write(monkeypatch)
+    monkeypatch.setattr(
+        cap_registry,
+        "run_capability",
+        lambda *_a, **_k: _FakeCapResult({
+            "photo_id": "p1",
+            "has_image": True,
+            "image_media_type": "image/jpeg",
+            "image_b64": "cGl4ZWxz",
+        }),
+    )
+    observed = []
+
+    def _observe_photo(user_id, **kwargs):
+        observed.append((user_id, kwargs))
+        return "a red bicycle beside a wall"
+
+    calls = _script_provider(monkeypatch, [
+        _tool_round(_tc(
+            "photo-1", "photo_read", photo_id="p1", include_image=True
+        )),
+        _text_round("I noticed the bicycle."),
+    ])
+    deps = _deps(
+        messages=[{"id": "m1", "ts": 10.0, "role": "user", "content": "hi"}],
+        observe_photo=_observe_photo,
+    )
+
+    status = asyncio.run(worker.process_job(
+        job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"
+    ))
+
+    assert status == "completed"
+    assert len(observed) == 1
+    assert observed[0][0] == uid
+    assert observed[0][1]["image_mime"] == "image/jpeg"
+    assert observed[0][1]["image_b64"] == "cGl4ZWxz"
+    assert observed[0][1]["main_provider_config"] is _BYOK
+    results = _tool_result_contents(calls[1])
+    assert any("a red bicycle beside a wall" in item for item in results)
+    assert all("cGl4ZWxz" not in item and "image_b64" not in item for item in results)
 
 
 def test_voice_turn_publishes_all_applied_bubbles_once_in_order(monkeypatch):

@@ -1679,6 +1679,35 @@ def _read_images(user_id: str, message_ids: list[str]) -> dict[str, dict]:
     return out
 
 
+def _observe_photo(
+    user_id: str,
+    *,
+    image_mime: str,
+    image_b64: str,
+    main_provider_config: provider_client.ProviderConfig,
+    api_key: str | None,
+    runtime_token: str,
+) -> str:
+    """Observe a pulled library photo through the user's selected vision route."""
+    selected = db.model_api_vision_route(user_id)
+    config = main_provider_config
+    if selected is not None:
+        route_id = str(selected.get("id") or "").strip()
+        if not route_id:
+            raise vision_observer.VisionObserverError("vision_model_not_ready")
+        config = vision_observer.load_provider_config(
+            user_id,
+            route_id,
+            api_key=api_key,
+            runtime_token=runtime_token,
+        )
+    return vision_observer.observe_image(
+        config,
+        image_mime=image_mime,
+        image_b64=image_b64,
+    )
+
+
 def _read_vision_observations(
     user_id: str,
     targets: list[dict],
@@ -3626,6 +3655,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         append_summary_checkpoint=_append_summary_checkpoint,
         read_images=_read_images,
         read_vision_observations=_read_vision_observations,
+        observe_photo=_observe_photo,
         read_files=_read_files,
         read_memory_context=_read_memory_context,
         read_profile_cards=_read_profile_cards,
