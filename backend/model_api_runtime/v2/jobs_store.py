@@ -635,6 +635,100 @@ def enqueue_job(
                 )
 
 
+def enqueue_job_with_context_log(
+    user_id: str,
+    lane: str,
+    *,
+    reason: str | None,
+    trace_id: str | None,
+    context_stream: str,
+    context_doc: dict,
+    context_ts: float,
+    priority: int | None = None,
+) -> tuple[int, bool]:
+    """Atomically enqueue/coalesce one job and attach its input context.
+
+    This closes the enqueue->association crash/race window for externally
+    produced wake inputs. The active job row is locked by
+    ``coalesce_or_insert_on_cursor`` and the context row commits in the same
+    transaction, so finalization can use ``input_generation`` as an exact
+    consumed-input fence.
+    """
+    if lane not in LANES:
+        raise ValueError(f"unknown lane: {lane!r}")
+    if not str(context_stream).strip():
+        raise ValueError("context_stream is required")
+    if priority is None:
+        priority = LANE_PRIORITY.get(lane, 0)
+
+    inserted: tuple[int, bool, int, dict] | None = None
+    for _ in range(4):
+        try:
+            with _pool().connection() as conn:
+                with conn.transaction():
+                    with conn.cursor(row_factory=dict_row) as cur:
+                        cur.execute(
+                            "SELECT hosted_runtime_state,runtime_generation "
+                            "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                            (str(user_id),),
+                        )
+                        control = cur.fetchone()
+                        expected_generation = (
+                            int(control["runtime_generation"])
+                            if control is not None
+                            and str(control["hosted_runtime_state"]) == "v2"
+                            else None
+                        )
+                        job_id, coalesced = coalesce_or_insert_on_cursor(
+                            cur,
+                            str(user_id),
+                            lane,
+                            reason=reason,
+                            trace_id=trace_id,
+                            priority=int(priority),
+                            expected_generation=expected_generation,
+                        )
+                        payload = dict(context_doc)
+                        payload["agent_job_id"] = int(job_id)
+                        cur.execute(
+                            "INSERT INTO user_logs "
+                            "(user_id,stream,ts,item_key,doc) "
+                            "VALUES (%s,%s,%s,%s,%s) RETURNING seq",
+                            (
+                                str(user_id),
+                                str(context_stream),
+                                float(context_ts),
+                                str(int(job_id)),
+                                Jsonb(payload),
+                            ),
+                        )
+                        seq = int(cur.fetchone()["seq"])
+                        inserted = (int(job_id), bool(coalesced), seq, payload)
+            break
+        except psycopg.errors.UniqueViolation:
+            continue
+    if inserted is None:
+        raise RuntimeError("could not atomically enqueue job context")
+
+    job_id, coalesced, seq, payload = inserted
+    from tee_shadow import mirror
+
+    mirror.execute(
+        "INSERT INTO user_logs (user_id,stream,seq,ts,item_key,doc) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (user_id,stream,seq) DO NOTHING",
+        (
+            str(user_id),
+            str(context_stream),
+            seq,
+            float(context_ts),
+            str(job_id),
+            Jsonb(payload),
+        ),
+    )
+    return job_id, coalesced
+
+
 def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | None:
     """抢下一个 pending job（priority DESC, created_at）。先乐观选候选，再按
     runtime-state -> job 的统一锁顺序用 FOR UPDATE SKIP LOCKED 完成独占。
@@ -925,7 +1019,9 @@ def _latest_genuine_user_seq_on_cursor(cur, user_id: str) -> int:
         "NOT IN ('verify_ping','resident_maintenance')",
         (str(user_id),),
     )
-    return int(cur.fetchone()[0] or 0)
+    row = cur.fetchone()
+    value = next(iter(row.values())) if isinstance(row, dict) else row[0]
+    return int(value or 0)
 
 
 def _clear_wake_backoff_on_cursor(cur, user_id: str) -> None:
@@ -999,6 +1095,131 @@ def mark_completed(
             if clear_wake_backoff and str(row[1]) in _FAIL_BACKOFF_WAKE_LANES:
                 _clear_wake_backoff_on_cursor(cur, str(row[0]))
             return True
+
+
+def finish_wake_job(
+    job_id: int,
+    *,
+    claimed_by: str,
+    observed_generation: int,
+    context_stream: str,
+    consumed_context_seq: int,
+    clear_wake_backoff: bool = False,
+) -> tuple[bool, int | None]:
+    """Complete a wake and atomically hand late inputs to one successor.
+
+    Context producers increment ``input_generation`` and append ``user_logs``
+    under the same active-job lock. Rows newer than the worker's consumed
+    context cursor are reassigned to the successor in this transaction. Thus
+    finalization winning creates a fresh job for a later producer, while the
+    producer winning forces this finalizer to preserve its input.
+    """
+    successor_id: int | None = None
+    moved_context = False
+    user_id = ""
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT user_id FROM agent_jobs WHERE id=%s",
+                    (int(job_id),),
+                )
+                identity = cur.fetchone()
+                if identity is None:
+                    return False, None
+                user_id = str(identity["user_id"])
+                cur.execute(
+                    "SELECT hosted_runtime_state,runtime_generation "
+                    "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                    (user_id,),
+                )
+                control = cur.fetchone()
+                if control is None or str(control["hosted_runtime_state"]) != "v2":
+                    return False, None
+                runtime_generation = int(control["runtime_generation"])
+                cur.execute(
+                    "SELECT lane,status,input_generation,priority,"
+                    "expected_runtime_generation,lease_expires_at "
+                    "FROM agent_jobs WHERE id=%s AND claimed_by=%s FOR UPDATE",
+                    (int(job_id), str(claimed_by)),
+                )
+                row = cur.fetchone()
+                if (
+                    row is None
+                    or str(row["lane"]) != "heartbeat"
+                    or row["expected_runtime_generation"] is None
+                    or int(row["expected_runtime_generation"]) != runtime_generation
+                ):
+                    return False, None
+                if str(row["status"]) == "completed":
+                    if clear_wake_backoff:
+                        _clear_wake_backoff_on_cursor(cur, user_id)
+                    return True, None
+                if (
+                    str(row["status"]) not in {"claimed", "running"}
+                    or row["lease_expires_at"] is None
+                    or row["lease_expires_at"] <= datetime.now(timezone.utc)
+                ):
+                    return False, None
+
+                has_late_input = int(row["input_generation"] or 0) > int(
+                    observed_generation
+                )
+                cur.execute(
+                    "UPDATE agent_jobs SET status='completed',finished_at=now() "
+                    "WHERE id=%s",
+                    (int(job_id),),
+                )
+                if clear_wake_backoff:
+                    _clear_wake_backoff_on_cursor(cur, user_id)
+                if has_late_input:
+                    cur.execute(
+                        "INSERT INTO agent_jobs "
+                        "(user_id,lane,status,reason,priority,"
+                        "expected_runtime_generation) "
+                        "VALUES (%s,'heartbeat','pending',"
+                        "'coalesced_perception_followup',%s,%s) RETURNING id",
+                        (
+                            user_id,
+                            int(row["priority"]),
+                            runtime_generation,
+                        ),
+                    )
+                    successor_id = int(cur.fetchone()["id"])
+                    cur.execute(
+                        "UPDATE user_logs SET item_key=%s,"
+                        "doc=jsonb_set(doc,'{agent_job_id}',"
+                        "to_jsonb(%s::bigint),true) "
+                        "WHERE user_id=%s AND stream=%s AND item_key=%s "
+                        "AND seq>%s",
+                        (
+                            str(successor_id),
+                            successor_id,
+                            user_id,
+                            str(context_stream),
+                            str(int(job_id)),
+                            max(0, int(consumed_context_seq)),
+                        ),
+                    )
+                    moved_context = bool(cur.rowcount)
+
+    if successor_id is not None and moved_context:
+        from tee_shadow import mirror
+
+        mirror.execute(
+            "UPDATE user_logs SET item_key=%s,"
+            "doc=jsonb_set(doc,'{agent_job_id}',to_jsonb(%s::bigint),true) "
+            "WHERE user_id=%s AND stream=%s AND item_key=%s AND seq>%s",
+            (
+                str(successor_id),
+                successor_id,
+                user_id,
+                str(context_stream),
+                str(int(job_id)),
+                max(0, int(consumed_context_seq)),
+            ),
+        )
+    return True, successor_id
 
 
 def mark_failed(

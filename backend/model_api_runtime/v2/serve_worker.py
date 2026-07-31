@@ -49,7 +49,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 import httpx
@@ -1581,6 +1581,55 @@ def _read_scheduled_wake_context(user_id: str, job_id: int) -> list[dict]:
         })
         if len(context) >= 10:
             break
+    return context
+
+
+def _read_perception_wake_context(user_id: str, job_id: int) -> list[dict]:
+    """Return a bounded, scalar-only projection for the wake prompt."""
+    from perception import store as perception_store
+
+    context: list[dict] = []
+    for raw in perception_store.read_v2_wake_context(user_id, job_id, limit=10):
+        if not isinstance(raw, dict):
+            continue
+        item: dict[str, Any] = {
+            "wake_id": str(raw.get("wake_id") or "")[:160],
+            "source": str(raw.get("source") or "")[:120],
+            "trigger": str(raw.get("trigger") or "")[:120],
+            "change_digest": str(raw.get("change_digest") or "")[:2000],
+            "origin_refs": [
+                str(ref)[:200]
+                for ref in list(raw.get("origin_refs") or [])[:10]
+            ],
+        }
+        hints: dict[str, bool | int | float | str] = {}
+        raw_hints = raw.get("presence_hints")
+        if isinstance(raw_hints, dict):
+            for key, value in list(raw_hints.items())[:10]:
+                safe_key = str(key)[:80]
+                if isinstance(value, bool):
+                    hints[safe_key] = value
+                elif isinstance(value, int):
+                    hints[safe_key] = value
+                elif isinstance(value, float) and math.isfinite(value):
+                    hints[safe_key] = value
+                elif isinstance(value, str):
+                    hints[safe_key] = value[:200]
+        item["presence_hints"] = hints
+        try:
+            created_at = float(raw.get("created_at") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            created_at = 0.0
+        item["created_at"] = created_at if math.isfinite(created_at) else 0.0
+        try:
+            item["_context_seq"] = max(0, int(raw.get("_context_seq") or 0))
+            item["_input_generation"] = max(
+                0, int(raw.get("_input_generation") or 0)
+            )
+        except (TypeError, ValueError, OverflowError):
+            item["_context_seq"] = 0
+            item["_input_generation"] = 0
+        context.append(item)
     return context
 
 
@@ -3488,6 +3537,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_files=_read_files,
         read_memory_context=_read_memory_context,
         read_scheduled_wake_context=_read_scheduled_wake_context,
+        read_perception_wake_context=_read_perception_wake_context,
         read_pending_scheduled_wake_context=_read_pending_scheduled_wake_context,
         apply_memory_actions=_apply_memory_actions,
         build_memory_envelope=_build_memory_envelope,
@@ -3572,14 +3622,22 @@ def _build_scheduler_deps():
 
 
 def _seed_existing_v2_wake_schedules(*, now: float | None = None) -> int:
-    """Idempotent startup backfill for users flipped before seeding existed."""
+    """Idempotent startup repair for V2 users without an armed heartbeat.
+
+    A row can already exist because another producer (self-wake, screen watch,
+    payment cooldown, etc.) touched ``v2_wake_schedule`` while leaving
+    ``next_heartbeat_at`` NULL.  Treating any existing row as "seeded" makes
+    that user permanently invisible to ``due_heartbeat_users``.  Only a
+    non-NULL heartbeat timestamp proves that the heartbeat lane is armed.
+    """
     due_at = time.time() if now is None else float(now)
     users = admin_core.list_runtime_modes().get(
         hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []
     )
     seeded = 0
     for user_id in users:
-        if jobs_store.get_wake_schedule(user_id) is not None:
+        schedule = jobs_store.get_wake_schedule(user_id)
+        if schedule is not None and schedule.get("next_heartbeat_at") is not None:
             continue
         jobs_store.upsert_wake_schedule(user_id, next_heartbeat_at=due_at)
         seeded += 1
