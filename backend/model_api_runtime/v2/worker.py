@@ -1225,6 +1225,10 @@ class TurnDeps:
     read_vision_observations: Callable[
         [str, list[dict]], dict[str, str]
     ] | None = None
+    # Model-requested perception photo observation. Production resolves the
+    # user's dedicated vision route first, then falls back to this turn's main
+    # provider config. Pixels stay in-process and never enter tool-result text.
+    observe_photo: Callable[..., str] | None = None
     # (user_id, message_ids) -> {message_id: {"file_name","file_mime","text","truncated"}}：
     # 优先读取加密 VFS text view；cache miss 时必须先拿到 sandbox 并记 usage，之后才从
     # enclave 解密文件、交给 sandbox materialize/parse。与 read_images 同理**不能**并进 read_tail
@@ -3374,6 +3378,7 @@ def _make_task_batch_dispatcher(
     enclave_sem: asyncio.Semaphore,
     trusted_system_blocks: tuple[str, ...],
     add_usage: Callable[[dict | None], None],
+    observe_photo=None,
     disabled_web_tool_names: frozenset[str] = v2_web_gate.WEB_TOOL_NAMES,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
 ) -> Callable[[list], Awaitable[list[ToolResult]]]:
@@ -3489,6 +3494,7 @@ def _make_task_batch_dispatcher(
                                 turn_authorization=False,
                                 enqueue_write_effect=_no_child_write,
                                 before_write=None,
+                                observe_photo=observe_photo,
                                 read_parallelism=1,
                             )
                     except Exception as exc:
@@ -3596,6 +3602,34 @@ def _make_task_batch_dispatcher(
             ]
 
     return _dispatch
+
+
+class _PhotoObserverUnavailable(RuntimeError):
+    error_code = "vision_model_unavailable"
+
+
+def _make_photo_observer(
+    deps: TurnDeps,
+    *,
+    user_id: str,
+    provider_config,
+    api_key: str | None,
+    runtime_token: str,
+):
+    async def _observe(image_mime: str, image_b64: str) -> str:
+        if deps.observe_photo is None:
+            raise _PhotoObserverUnavailable("photo observer is not wired")
+        return await asyncio.to_thread(
+            deps.observe_photo,
+            user_id,
+            image_mime=image_mime,
+            image_b64=image_b64,
+            main_provider_config=provider_config,
+            api_key=api_key,
+            runtime_token=runtime_token,
+        )
+
+    return _observe
 
 
 def _make_provider_usage_dispatcher(
@@ -6669,6 +6703,13 @@ async def _run_wake(
         # Load before any prompt-coverage provider call so a broken workspace
         # never produces an under-authorized proactive response.
         token = deps.mint_enclave_token(user_id)
+        observe_photo = _make_photo_observer(
+            deps,
+            user_id=user_id,
+            provider_config=provider_config,
+            api_key=None,
+            runtime_token=token,
+        )
         trusted_system_blocks, working_memory = await _load_workspace_prompt_context(
             deps,
             store,
@@ -7177,6 +7218,7 @@ async def _run_wake(
             enclave_sem=enclave_sem,
             trusted_system_blocks=trusted_system_blocks,
             add_usage=_add_usage,
+            observe_photo=observe_photo,
             trajectory_recorder=trajectory_recorder,
         )
 
@@ -7199,6 +7241,7 @@ async def _run_wake(
                         turn_authorization=True,
                         enqueue_write_effect=_enqueue_write_effect,
                         before_write=_before_write,
+                        observe_photo=observe_photo,
                         read_parallelism=1,
                     )
                 finally:
@@ -7285,6 +7328,7 @@ async def _run_wake(
                             _enqueue_workspace_batch_effect
                         ),
                         before_write=_before_write,
+                        observe_photo=observe_photo,
                         read_parallelism=1,
                     )
                 finally:
@@ -10189,6 +10233,13 @@ async def process_job(
                     user_id,
                     type(exc).__name__.lower(),
                 )
+        observe_photo = _make_photo_observer(
+            deps,
+            user_id=user_id,
+            provider_config=provider_config,
+            api_key=api_key,
+            runtime_token=runtime_token,
+        )
         dispatch_task_batch = _make_task_batch_dispatcher(
             disabled_web_tool_names=disabled_web_tool_names,
             provider_config=provider_config,
@@ -10198,6 +10249,7 @@ async def process_job(
             enclave_sem=enclave_sem,
             trusted_system_blocks=trusted_system_blocks,
             add_usage=tm.add_call,
+            observe_photo=observe_photo,
             trajectory_recorder=trajectory_recorder,
         )
         # Chat-lane only (Task 6): closes over THIS turn's already-decrypted
@@ -10243,6 +10295,7 @@ async def process_job(
                         turn_authorization=(mutation_recovery_barrier is None),
                         enqueue_write_effect=_enqueue_write_effect,
                         before_write=_before_write,
+                        observe_photo=observe_photo,
                         read_parallelism=1,
                     )
                 finally:
@@ -10323,6 +10376,7 @@ async def process_job(
                             _enqueue_workspace_batch_effect
                         ),
                         before_write=_before_write,
+                        observe_photo=observe_photo,
                         read_parallelism=1,
                     )
                 finally:

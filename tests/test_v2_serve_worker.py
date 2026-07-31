@@ -130,6 +130,124 @@ def test_temporal_snapshot_uses_perception_then_china_default(monkeypatch):
     )
 
 
+def test_observe_photo_prefers_selected_dedicated_route(monkeypatch):
+    main_config = object()
+    dedicated_config = object()
+    seen = []
+    monkeypatch.setattr(
+        serve_worker.db,
+        "model_api_vision_route",
+        lambda user_id: {"id": "vision-route"},
+    )
+    monkeypatch.setattr(
+        serve_worker.vision_observer,
+        "load_provider_config",
+        lambda user_id, route_id, *, api_key, runtime_token: (
+            seen.append(("load", user_id, route_id, api_key, runtime_token))
+            or dedicated_config
+        ),
+    )
+    monkeypatch.setattr(
+        serve_worker.vision_observer,
+        "observe_image",
+        lambda config, *, image_mime, image_b64: (
+            seen.append(("observe", config, image_mime, image_b64))
+            or "dedicated observation"
+        ),
+    )
+
+    result = serve_worker._observe_photo(
+        "u-photo",
+        image_mime="image/jpeg",
+        image_b64="cGl4ZWxz",
+        main_provider_config=main_config,
+        api_key=None,
+        runtime_token="rt-photo",
+    )
+
+    assert result == "dedicated observation"
+    assert seen == [
+        ("load", "u-photo", "vision-route", None, "rt-photo"),
+        ("observe", dedicated_config, "image/jpeg", "cGl4ZWxz"),
+    ]
+
+
+def test_observe_photo_falls_back_to_current_main_route(monkeypatch):
+    main_config = object()
+    seen = []
+    monkeypatch.setattr(
+        serve_worker.db, "model_api_vision_route", lambda _user_id: None
+    )
+    monkeypatch.setattr(
+        serve_worker.vision_observer,
+        "load_provider_config",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("main fallback must not reload provider credentials")
+        ),
+    )
+    monkeypatch.setattr(
+        serve_worker.vision_observer,
+        "observe_image",
+        lambda config, *, image_mime, image_b64: (
+            seen.append((config, image_mime, image_b64)) or "main observation"
+        ),
+    )
+
+    result = serve_worker._observe_photo(
+        "u-photo",
+        image_mime="image/png",
+        image_b64="cG5n",
+        main_provider_config=main_config,
+        api_key="api-key",
+        runtime_token="",
+    )
+
+    assert result == "main observation"
+    assert seen == [(main_config, "image/png", "cG5n")]
+
+
+def test_observe_photo_dedicated_failure_never_falls_back(monkeypatch):
+    main_config = object()
+    dedicated_config = object()
+    calls = []
+    failure = serve_worker.vision_observer.VisionObserverError(
+        "vision_model_rate_limited",
+        status_code=429,
+        retryable=True,
+    )
+    monkeypatch.setattr(
+        serve_worker.db,
+        "model_api_vision_route",
+        lambda _user_id: {"id": "vision-route"},
+    )
+    monkeypatch.setattr(
+        serve_worker.vision_observer,
+        "load_provider_config",
+        lambda *_a, **_k: dedicated_config,
+    )
+
+    def _observe(config, **_kwargs):
+        calls.append(config)
+        raise failure
+
+    monkeypatch.setattr(serve_worker.vision_observer, "observe_image", _observe)
+
+    with pytest.raises(
+        serve_worker.vision_observer.VisionObserverError,
+        match="vision_model_rate_limited",
+    ):
+        serve_worker._observe_photo(
+            "u-photo",
+            image_mime="image/jpeg",
+            image_b64="cGl4ZWxz",
+            main_provider_config=main_config,
+            api_key=None,
+            runtime_token="rt-photo",
+        )
+
+    assert calls == [dedicated_config]
+
+
 def test_run_forever_backoff_is_bounded(monkeypatch):
     calls, sleeps = [], []
     script = [RuntimeError(f"boom{i}") for i in range(8)] + [None]
