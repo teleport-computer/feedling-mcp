@@ -14,6 +14,11 @@ TOOLS = Path(__file__).parent.parent / "tools"
 sys.path.insert(0, str(TOOLS))
 
 import io_cli  # noqa: E402
+from memory.source_policy import (  # noqa: E402
+    MEMORY_SOURCE_VALUES,
+    RESIDENT_ABSORB_SOURCE,
+    RESIDENT_PATCH_SOURCE,
+)
 
 IO_CLI = str(TOOLS / "io_cli.py")
 
@@ -105,6 +110,44 @@ def test_memory_patch_payload_builds_supersede_of_the_given_id():
     assert action["supersedes"] == "mem_1"
     assert action["memory"]["summary"] == "dog is actually a cat"
     assert action["reason"] == "user correction"
+
+
+def test_memory_write_and_patch_defaults_share_server_source_policy():
+    write_payload = io_cli._memory_write_payload(
+        summary="a durable fact", content="", bucket=None, threads=[],
+        importance=None, pulse=None, mem_type="fact", source=None,
+    )
+    patch_payload = io_cli._memory_patch_payload(
+        memory_id="mem_1", summary="a correction", content="",
+        bucket=None, threads=[], importance=None, pulse=None,
+        mem_type="fact", source=None, reason=None,
+    )
+
+    assert write_payload["actions"][0]["memory"]["source"] == RESIDENT_ABSORB_SOURCE
+    assert patch_payload["actions"][0]["memory"]["source"] == RESIDENT_PATCH_SOURCE
+    assert RESIDENT_ABSORB_SOURCE in MEMORY_SOURCE_VALUES
+    assert RESIDENT_PATCH_SOURCE in MEMORY_SOURCE_VALUES
+
+
+def test_memory_source_rejects_arbitrary_cli_and_direct_builder_values():
+    result = _run(
+        "memory-write",
+        "--summary", "a durable fact",
+        "--source", "conversation_2026",
+    )
+    assert result.returncode == 2
+    assert "invalid choice" in result.stderr
+
+    try:
+        io_cli._memory_write_payload(
+            summary="a durable fact", content="", bucket=None, threads=[],
+            importance=None, pulse=None, mem_type="fact",
+            source="conversation_2026",
+        )
+    except ValueError as exc:
+        assert "not allowed" in str(exc)
+    else:
+        raise AssertionError("direct payload builder accepted an arbitrary source")
 
 
 def test_memory_patch_payload_is_none_without_id_or_content():

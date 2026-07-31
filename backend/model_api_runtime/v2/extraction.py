@@ -180,6 +180,10 @@ def _to_actions(
     for card in cards or []:
         action = str(card.get("action") or "").strip().lower()
         target_id = str(card.get("target_id") or "").strip()
+        # Never rewrite an invalid merge/supersede into an add.  Missing-target
+        # cards are discarded so valid cards in the same batch can still land.
+        if action in {"merge", "supersede"} and not target_id:
+            continue
         base = {
             "envelope": _memory_envelope_from_card(
                 card,
@@ -192,7 +196,7 @@ def _to_actions(
             "capture_mode": capture_mode,
             "source_chat_message_ids": list(source_ids),
         }
-        if action == "add" or (action in {"merge", "supersede"} and not target_id):
+        if action == "add":
             actions.append({"type": "memory.add", **base})
             added += 1
             continue
@@ -201,7 +205,13 @@ def _to_actions(
                 {"type": "memory.supersede", "supersedes": target_id, **base}
             )
             superseded += 1
-    if cards and not actions:
+    rejected_without_target = sum(
+        1
+        for card in cards
+        if str(card.get("action") or "").strip().lower() in {"merge", "supersede"}
+        and not str(card.get("target_id") or "").strip()
+    )
+    if cards and not actions and rejected_without_target != len(cards):
         # 模型给了卡但一张都没映射成 action —— 说明它返回了我们不认识的 action 名。
         # 静默写零条会把这件事藏起来，所以硬失败（与 resident 同口径）。
         raise ValueError("capture_no_memory_actions")

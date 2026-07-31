@@ -197,6 +197,16 @@ def _positive_int_env(name: str, default: str) -> int:
     return value
 
 
+def _allowlisted_bool_env(name: str, default: str = "0") -> bool:
+    """Enable a rollout flag only for an explicit affirmative value."""
+    return str(os.environ.get(name, default)).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _nonnegative_int_env(name: str, default: str) -> int:
     raw = os.environ.get(name, default)
     try:
@@ -507,6 +517,12 @@ _COMPACTION_BATCH = _positive_int_env("FEEDLING_V2_COMPACTION_BATCH_MSGS", "200"
 # loudly instead of advancing the watermark past content the model never saw.
 _COMPACTION_BATCH_CHARS = _positive_int_env(
     "FEEDLING_V2_COMPACTION_BATCH_CHARS", "120000"
+)
+# Operational dependency: DO NOT enable this before M5 MEMORY/USER prompt
+# injection is deployed. Until then, deterministic count sentinels replace the
+# model-written summary head without supplying the long-term context elsewhere.
+_PROFILE_COVERAGE_DETERMINISTIC = _allowlisted_bool_env(
+    "FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC"
 )
 _SUMMARY_ROLLUP_FANOUT = _positive_int_env(
     "FEEDLING_V2_SUMMARY_ROLLUP_FANOUT", "8"
@@ -981,9 +997,18 @@ def _is_degenerate_reply(text: Any) -> bool:
 class DedicatedVisionUnavailable(RuntimeError):
     """A pinned V2 image observer failed before the main model saw pixels."""
 
-    def __init__(self, message: str, *, error_code: str = "vision_model_failed"):
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = "vision_model_failed",
+        model: str = "",
+        provider: str = "",
+    ):
         super().__init__(message)
         self.error_code = error_code
+        self.model = str(model or "")[:96]
+        self.provider = str(provider or "")[:80]
 
 
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
@@ -1035,6 +1060,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
 
 def _turn_failure_error_class(exc: BaseException) -> str:
     """Classify V2 foreground failures through the shared notice catalog."""
+    if isinstance(exc, DedicatedVisionUnavailable):
+        return exc.error_code
     if isinstance(exc, v2_prompt_frontier.PromptFrontierExhausted):
         # An unaudited default is our conservative local ceiling, not the
         # provider's model limit. Never blame the user or tell them to shorten
@@ -1166,6 +1193,12 @@ class TurnDeps:
     # validated canonical cover. Legacy write_summary remains for isolated
     # callers and rolling rollback compatibility.
     read_summary_frontier: Callable[
+        [str], "v2_summary_frontier.SummaryFrontierSnapshot | None"
+    ] | None = None
+    # Content-free equivalent used by deterministic coverage mode. Exact
+    # segment payloads are reconstructed from their persisted row counts, so
+    # normal roll-up never needs to decrypt historical summaries.
+    read_summary_frontier_metadata: Callable[
         [str], "v2_summary_frontier.SummaryFrontierSnapshot | None"
     ] | None = None
     append_summary_segment: Callable[..., bool] | None = None
@@ -3669,8 +3702,14 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             or a.get("memory_id")
             or ""
         ).strip()
-        if op in ("delete", "remove") and target:
-            out.append({"type": "memory.delete", "memory_id": target})
+        if op in ("delete", "remove"):
+            if target:
+                out.append({"type": "memory.delete", "memory_id": target})
+            continue
+        if op in ("update", "supersede", "merge", "patch") and not target:
+            # Never turn an invalid targeted mutation into a new memory.add.
+            continue
+        if op not in ("add", "create", "update", "supersede", "merge", "patch"):
             continue
         inner = {
             "summary": summary,
@@ -3688,7 +3727,7 @@ def _memory_tool_actions(raw_actions) -> list[dict]:
             "reason": "Written by the agent via the memory_write tool.",
             "capture_mode": "agent_tool",
         }
-        if op in ("update", "supersede", "merge", "patch") and target:
+        if op in ("update", "supersede", "merge", "patch"):
             out.append(
                 {
                     "type": "memory.supersede",
@@ -4182,7 +4221,14 @@ def _sanitize_reasoning(text: str) -> str:
 
 
 def _build_thinking_payload(
-    store, reasoning: str, *, effect_id: str, provider_config
+    store,
+    reasoning: str,
+    *,
+    effect_id: str,
+    provider_config,
+    kind: str = "provider_reasoning",
+    source: str | None = None,
+    native: bool = True,
 ) -> dict | None:
     """Seal provider reasoning into its own shared envelope + routing metadata.
 
@@ -4205,10 +4251,11 @@ def _build_thinking_payload(
     return {
         "envelope": envelope,
         "metadata": {
-            "thinking_kind": "provider_reasoning",
-            "thinking_source": f"v2.{getattr(provider_config, 'provider', '') or ''}",
+            "thinking_kind": kind,
+            "thinking_source": source
+            or f"v2.{getattr(provider_config, 'provider', '') or ''}",
             "thinking_model": str(getattr(provider_config, "model", "") or ""),
-            "thinking_native": True,
+            "thinking_native": native,
         },
     }
 
@@ -4586,6 +4633,7 @@ async def _rebalance_summary_frontier(
     job_id=None,
     add_usage: Callable[[dict | None], None] | None = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+    deterministic_coverage: bool = False,
 ) -> list:
     """Roll immutable canonical nodes up until the prompt frontier is bounded.
 
@@ -4594,17 +4642,20 @@ async def _rebalance_summary_frontier(
     the canonical cover. Exhaustion is loud so no caller can substitute silent
     truncation for a complete historical representation.
     """
-    if (
-        deps.read_summary_frontier is None
-        or deps.append_summary_checkpoint is None
-    ):
+    frontier_reader = (
+        deps.read_summary_frontier_metadata
+        if deterministic_coverage
+        and deps.read_summary_frontier_metadata is not None
+        else deps.read_summary_frontier
+    )
+    if frontier_reader is None or deps.append_summary_checkpoint is None:
         return []
 
     async def _read_frontier():
         if enclave_sem is None:
-            return await asyncio.to_thread(deps.read_summary_frontier, user_id)
+            return await asyncio.to_thread(frontier_reader, user_id)
         async with enclave_sem:
-            return await asyncio.to_thread(deps.read_summary_frontier, user_id)
+            return await asyncio.to_thread(frontier_reader, user_id)
 
     no_progress = 0
     for _pass in range(_SUMMARY_ROLLUP_MAX_PASSES):
@@ -4686,26 +4737,41 @@ async def _rebalance_summary_frontier(
             )
             return result
 
-        try:
-            checkpoint = await v2_compaction.compact_checkpoint(
-                provider_config=provider_config,
-                child_summaries=checkpoint_messages,
-                llm=_recording_checkpoint_llm,
-                usage_out=add_usage,
-            )
-        except v2_compaction.CheckpointCompactionExhausted as exc:
-            raise v2_summary_frontier.SummaryFrontierExhausted(
-                "checkpoint_work_budget_exhausted"
-            ) from exc
+        checkpoint = (
+            v2_compaction.deterministic_checkpoint(checkpoint_messages)
+            if deterministic_coverage
+            else None
+        )
+        if checkpoint is None:
+            try:
+                checkpoint = await v2_compaction.compact_checkpoint(
+                    provider_config=provider_config,
+                    child_summaries=checkpoint_messages,
+                    llm=_recording_checkpoint_llm,
+                    usage_out=add_usage,
+                )
+            except v2_compaction.CheckpointCompactionExhausted as exc:
+                raise v2_summary_frontier.SummaryFrontierExhausted(
+                    "checkpoint_work_budget_exhausted"
+                ) from exc
         if checkpoint is None:
             raise v2_summary_frontier.SummaryFrontierExhausted(
                 "invalid_checkpoint_output"
             )
-        materialized_head = v2_summary_frontier.render_replacement(
-            frontier,
-            child_segment_ids=candidate.child_segment_ids,
-            parent_text=checkpoint,
-        )
+        if deterministic_coverage and not any(
+            item.coverage_kind == "legacy_opaque" for item in frontier
+        ):
+            materialized_head = v2_compaction.deterministic_fold(
+                source_message_count=sum(
+                    item.source_message_count for item in frontier
+                )
+            )
+        else:
+            materialized_head = v2_summary_frontier.render_replacement(
+                frontier,
+                child_segment_ids=candidate.child_segment_ids,
+                parent_text=checkpoint,
+            )
         if claimed_by and job_id is not None:
             renewed = await asyncio.to_thread(
                 jobs_store.renew_job_lease,
@@ -5002,6 +5068,158 @@ async def _run_compaction(
     静默 `mark_failed`，跟 chat turn 的用户可见失败路径彻底分开。
     """
     try:
+        if _PROFILE_COVERAGE_DETERMINISTIC:
+            if deps.append_summary_segment is None:
+                raise RuntimeError("deterministic_compaction_unwired")
+            summary_row = await asyncio.to_thread(
+                jobs_store.get_summary_row,
+                user_id,
+            )
+            watermark_seq = int(summary_row["watermark_seq"]) if summary_row else 0
+            watermark_ts = (
+                float(summary_row["watermark_ts"]) if summary_row else 0.0
+            )
+            version = int(summary_row["version"]) if summary_row else 0
+            unsummarized_count = await _unsummarized_count(
+                user_id,
+                watermark_seq,
+            )
+            if unsummarized_count <= _TAIL_KEEP:
+                await asyncio.to_thread(
+                    jobs_store.mark_completed,
+                    job_id,
+                    claimed_by=claimed_by,
+                )
+                if tm is not None:
+                    tm.flush(failed=False, status="ok")
+                return "completed"
+
+            fold_count = min(
+                _COMPACTION_BATCH,
+                unsummarized_count - _TAIL_KEEP,
+            )
+            first_seq, last_seq, source_count = await asyncio.to_thread(
+                db.chat_coverage_bounds_after_seq,
+                user_id,
+                watermark_seq,
+                limit=fold_count,
+                through_seq=None,
+            )
+            if (
+                source_count != fold_count
+                or first_seq <= watermark_seq
+                or last_seq < first_seq
+            ):
+                raise RuntimeError("deterministic_coverage_bounds_incomplete")
+            segment_text = v2_compaction.deterministic_fold(
+                source_message_count=source_count
+            )
+            covered_count = await asyncio.to_thread(
+                db.count_messages_after_seq,
+                user_id,
+                0,
+                through_seq=last_seq,
+                exclude_synthetic_sources=True,
+            )
+            head_text = v2_compaction.deterministic_fold(
+                source_message_count=covered_count
+            )
+            _report_turn_progress("deterministic_compaction_batch_start")
+            await _record_trajectory(
+                trajectory_recorder,
+                "deterministic_compaction_batch",
+                {
+                    "lane": "maintenance",
+                    "start_seq": first_seq,
+                    "end_seq": last_seq,
+                    "source_message_count": source_count,
+                },
+                best_effort=True,
+            )
+            if claimed_by and not await asyncio.to_thread(
+                jobs_store.renew_job_lease,
+                job_id,
+                claimed_by,
+                ttl_sec=jobs_store.RUNNING_TTL_SEC,
+            ):
+                raise LostJobLease(
+                    "compaction lease lost before deterministic summary write"
+                )
+            if deps.runtime_mode_enabled is not None and not await asyncio.to_thread(
+                deps.runtime_mode_enabled,
+                user_id,
+            ):
+                raise RuntimeModeChanged(
+                    "user rolled back before deterministic summary write"
+                )
+            ok = await asyncio.to_thread(
+                deps.append_summary_segment,
+                user_id,
+                segment_text,
+                current_summary="",
+                head_summary=head_text,
+                start_seq=first_seq,
+                end_seq=last_seq,
+                source_message_count=source_count,
+                watermark_ts=watermark_ts,
+                expected_version=version,
+                previous_watermark_seq=watermark_seq,
+            )
+            _report_turn_progress("deterministic_compaction_batch_complete")
+            if ok:
+                await _rebalance_summary_frontier(
+                    user_id,
+                    deps,
+                    provider_config=provider_config,
+                    enclave_sem=enclave_sem,
+                    claimed_by=claimed_by,
+                    job_id=job_id,
+                    add_usage=tm.add_call if tm is not None else None,
+                    trajectory_recorder=trajectory_recorder,
+                    deterministic_coverage=True,
+                )
+                remaining_count = await _unsummarized_count(
+                    user_id,
+                    last_seq,
+                )
+                completed = await asyncio.to_thread(
+                    jobs_store.mark_completed,
+                    job_id,
+                    claimed_by=claimed_by,
+                )
+                if completed and remaining_count > _TAIL_KEEP:
+                    await asyncio.to_thread(
+                        jobs_store.enqueue_job,
+                        user_id,
+                        "maintenance",
+                        reason="compaction_catchup",
+                    )
+                    await asyncio.to_thread(
+                        core_wake_bus.notify,
+                        "v2_jobs",
+                        user_id,
+                    )
+                if tm is not None:
+                    tm.flush(failed=False, status="ok")
+                return "completed"
+            failed_owned = await asyncio.to_thread(
+                jobs_store.mark_failed,
+                job_id,
+                "summary_cas_lost",
+                claimed_by=claimed_by,
+            )
+            if failed_owned:
+                await asyncio.to_thread(
+                    jobs_store.enqueue_job,
+                    user_id,
+                    "maintenance",
+                    reason="cas_lost_retry",
+                )
+                await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+            if tm is not None:
+                tm.flush(failed=True, status="summary_cas_lost")
+            return "failed"
+
         # Rebalance first, then read the head/version used by this leaf CAS.
         # A checkpoint increments the head version; reading first would waste
         # one provider call on a predictably stale leaf and force a retry job.
@@ -5860,12 +6078,20 @@ async def _ensure_prompt_coverage(
                 or deps.read_tail is not None
             )
         )
+        deterministic_callbacks = (
+            _PROFILE_COVERAGE_DETERMINISTIC
+            and deps.append_summary_segment is not None
+        )
         if (
             (
                 deps.write_summary is None
                 and deps.append_summary_segment is None
             )
-            or not (seq_callbacks or legacy_callbacks)
+            or not (
+                deterministic_callbacks
+                or seq_callbacks
+                or legacy_callbacks
+            )
         ):
             raise TurnError(_coverage_incomplete_reason("catchup_unwired"))
         if no_progress_attempts >= max_retries:
@@ -5949,6 +6175,89 @@ async def _ensure_prompt_coverage(
             batch_cap,
         )
         if fold_count <= 0:
+            continue
+        if deterministic_callbacks:
+            first_seq, last_seq, source_count = await _within_deadline(
+                lambda: asyncio.to_thread(
+                    db.chat_coverage_bounds_after_seq,
+                    user_id,
+                    watermark_seq,
+                    limit=fold_count,
+                    through_seq=compact_through_seq,
+                )
+            )
+            if (
+                source_count != fold_count
+                or first_seq <= watermark_seq
+                or last_seq < first_seq
+            ):
+                raise TurnError("prompt_coverage_incomplete")
+            segment_text = v2_compaction.deterministic_fold(
+                source_message_count=source_count
+            )
+            covered_count = await _within_deadline(
+                lambda: asyncio.to_thread(
+                    db.count_messages_after_seq,
+                    user_id,
+                    0,
+                    through_seq=last_seq,
+                    exclude_synthetic_sources=True,
+                )
+            )
+            head_text = v2_compaction.deterministic_fold(
+                source_message_count=covered_count
+            )
+            attempted_since_observation = True
+            _report_turn_progress("prompt_deterministic_catchup_batch_start")
+            await _renew_catchup_lease()
+            wrote = await _within_deadline(
+                lambda: asyncio.to_thread(
+                    deps.append_summary_segment,
+                    user_id,
+                    segment_text,
+                    current_summary="",
+                    head_summary=head_text,
+                    start_seq=first_seq,
+                    end_seq=last_seq,
+                    source_message_count=source_count,
+                    watermark_ts=(
+                        float(summary_row["watermark_ts"])
+                        if summary_row
+                        else 0.0
+                    ),
+                    expected_version=(
+                        int(summary_row["version"]) if summary_row else 0
+                    ),
+                    previous_watermark_seq=watermark_seq,
+                )
+            )
+            if wrote:
+                await _within_deadline(
+                    lambda: _rebalance_summary_frontier(
+                        user_id,
+                        deps,
+                        provider_config=provider_config,
+                        enclave_sem=enclave_sem,
+                        claimed_by=claimed_by,
+                        job_id=job_id,
+                        add_usage=add_usage,
+                        trajectory_recorder=trajectory_recorder,
+                        deterministic_coverage=True,
+                    )
+                )
+            _report_turn_progress("prompt_deterministic_catchup_batch_complete")
+            await _record_trajectory(
+                trajectory_recorder,
+                "deterministic_compaction_batch",
+                {
+                    "lane": "prompt_catchup",
+                    "start_seq": first_seq,
+                    "end_seq": last_seq,
+                    "source_message_count": source_count,
+                    "written": bool(wrote),
+                },
+                best_effort=True,
+            )
             continue
 
         async def _read_gap():
@@ -7494,6 +7803,58 @@ async def _run_wake(
                     "[v2.worker] wake reply push failed user=%s: %s", user_id, e)
 
 
+def _memory_write_result_counts(
+    actions: list[dict], write_result: Any
+) -> tuple[int, int, int, str]:
+    """Return applied/skipped/failed plus the first item error for a V2 batch."""
+    result_rows = (
+        write_result.get("results")
+        if isinstance(write_result, dict)
+        else None
+    )
+    legacy_ok = (
+        isinstance(write_result, dict)
+        and str(write_result.get("status") or "").strip().lower() == "ok"
+        and result_rows is None
+    )
+    if not isinstance(write_result, dict) or (
+        not isinstance(result_rows, list) and not legacy_ok
+    ):
+        error = (
+            str(write_result.get("error") or "memory_action_failed")
+            if isinstance(write_result, dict)
+            else "memory_action_result_invalid"
+        )
+        return 0, 0, len(actions), error
+    if legacy_ok:
+        result_rows = [
+            {"status": "ok", "action": action.get("type")}
+            for action in actions
+        ]
+    failed_count = sum(
+        1
+        for row in result_rows
+        if not isinstance(row, dict)
+        or str(row.get("status") or "").strip().lower() == "error"
+    ) + max(0, len(actions) - len(result_rows))
+    skipped_count = sum(
+        1
+        for row in result_rows
+        if isinstance(row, dict) and (row.get("noop") or row.get("skipped"))
+    )
+    applied_count = max(0, len(actions) - failed_count - skipped_count)
+    first_error = next(
+        (
+            str(row.get("error") or "memory_action_failed")
+            for row in result_rows
+            if isinstance(row, dict)
+            and str(row.get("status") or "").strip().lower() == "error"
+        ),
+        "memory_action_failed",
+    )
+    return applied_count, skipped_count, failed_count, first_error
+
+
 async def _run_extraction(
     job_id,
     user_id: str,
@@ -8090,17 +8451,24 @@ async def _run_extraction(
         write_result = await asyncio.to_thread(
             deps.apply_memory_actions, user_id, actions
         )
-        if (
-            not isinstance(write_result, dict)
-            or str(write_result.get("status") or "").strip().lower() != "ok"
-        ):
-            error = (
-                str(write_result.get("error") or "memory_action_failed")
-                if isinstance(write_result, dict)
-                else "memory_action_result_invalid"
+        applied_count, skipped_count, failed_count, first_error = (
+            _memory_write_result_counts(actions, write_result)
+        )
+        if failed_count == len(actions) and actions:
+            raise RuntimeError(
+                f"extraction_memory_write_rejected:{first_error}"
             )
-            raise RuntimeError(f"extraction_memory_write_rejected:{error}")
-        await _complete_extraction(item_count=len(items))
+        await _complete_extraction(item_count=applied_count + skipped_count)
+        if failed_count:
+            log.warning(
+                "[v2.worker] extraction batch partial user=%s lane=%s "
+                "applied=%d skipped=%d failed=%d",
+                user_id,
+                lane,
+                applied_count,
+                skipped_count,
+                failed_count,
+            )
         if tm is not None:
             tm.flush(failed=False, status="ok")
         return "completed"
@@ -8304,6 +8672,8 @@ def _inject_tail_images(
             raise DedicatedVisionUnavailable(
                 "vision observer failed",
                 error_code=safe_code,
+                model=str(getattr(exc, "model", "") or ""),
+                provider=str(getattr(exc, "provider", "") or ""),
             ) from exc
         if any(
             not str(observations.get(item["message_id"]) or "").strip()
@@ -8517,6 +8887,7 @@ async def process_job(
     claimed_by = str(job.get("claimed_by") or "")
     observed_generation = int(job.get("input_generation") or 0)
     reply_parent_message_id = ""
+    coalesced: list[dict] = []
     seq_native = deps.read_messages_after_seq is not None
     if tm is None:
         tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
@@ -9637,9 +10008,35 @@ async def process_job(
             nonlocal final_job_completed_atomically, voice_reply_slot
             file_reply = text if isinstance(text, WorkspaceFileReply) else None
             text = "" if file_reply is not None else str(text or "").strip()
+            # Self-authored thinking (all models incl. relay). Peel a leading
+            # <think> block into a SEPARATE channel and reply with the clean body.
+            # The provider's native ``reasoning`` is left UNCHANGED here so the
+            # torn-protocol / degenerate guards below still inspect the real native
+            # text; which thinking to surface (self-authored vs native) and its
+            # provenance are decided at seal time. Fail-closed on malformed <think>:
+            # never leak a raw tag, never promote private thinking to the reply.
+            from core import self_thinking
+
+            self_thinking_on = self_thinking.enabled()
+            self_thinking_text = ""
+            self_thinking_failed = False
+            if self_thinking_on and file_reply is None and text:
+                _st_status, _st_thinking, _st_reply = self_thinking.split_thinking(text)
+                if _st_status == self_thinking.COMPLETE:
+                    text = _st_reply
+                    self_thinking_text = _st_thinking
+                elif _st_status == self_thinking.FAILED:
+                    # Untrustworthy structure → honest fallback bubble + a marker in
+                    # the thinking channel. Non-empty text keeps it off the
+                    # empty_reply failure path so the marker rides the reply effect.
+                    text = _DEGENERATE_REPLY_FALLBACK
+                    self_thinking_failed = True
+                # ABSENT: text unchanged
             if file_reply is not None and final:
                 raise RuntimeError("a file reply cannot be terminal")
-            turn_failure_error_class = ""
+            turn_failure_error_class = (
+                _DEGENERATE_REPLY_ERROR_CLASS if self_thinking_failed else ""
+            )
             if file_reply is None and text and _is_degenerate_reply(text):
                 log.warning(
                     "[v2.worker] chat degenerate reply suppressed user=%s "
@@ -9793,13 +10190,33 @@ async def process_job(
             # only ciphertext and a retry re-addresses the same thinking row. Only
             # final replies carry it — intermediate reply{} bubbles are
             # agent-authored text, not provider reasoning.
-            if final and reasoning and file_reply is None:
+            # Decide which thinking to seal and its provenance. Self-authored
+            # <think> (or a "thinking failed" marker) is an agent summary, NOT
+            # provider-native chain-of-thought; the provider's native reasoning
+            # keeps its native metadata. Never mislabel one as the other.
+            _display_reasoning = reasoning
+            _thinking_kind, _thinking_source, _thinking_native = (
+                "provider_reasoning", None, True,
+            )
+            if self_thinking_on and (self_thinking_text or self_thinking_failed):
+                _display_reasoning = (
+                    self_thinking.THINKING_FAILED_MARKER
+                    if self_thinking_failed
+                    else self_thinking_text
+                )
+                _thinking_kind, _thinking_source, _thinking_native = (
+                    "agent_summary", "self_thinking", False,
+                )
+            if final and _display_reasoning and file_reply is None:
                 thinking_payload = await asyncio.to_thread(
                     _build_thinking_payload,
                     store,
-                    reasoning,
+                    _display_reasoning,
                     effect_id=effect_id,
                     provider_config=provider_config,
+                    kind=_thinking_kind,
+                    source=_thinking_source,
+                    native=_thinking_native,
                 )
                 if thinking_payload:
                     payload["thinking"] = thinking_payload
@@ -10108,7 +10525,7 @@ async def process_job(
 
         def _chat_builder():
             return _make_build_messages_fn(
-                system_prompt=context.CHAT_SYSTEM_PROMPT,
+                system_prompt=context.chat_system_prompt(),
                 summary=summary,
                 tail=tail,
                 extra_context=turn_extra_context,
@@ -10200,9 +10617,20 @@ async def process_job(
         await _ensure_runtime_mode()
         await _renew_lease()
         await asyncio.to_thread(_emit_status, user_id, job_id, "writing_reply")
+        # Self-authored thinking: when on, do NOT request provider-native reasoning
+        # (this aligns V2 with the V1 resident). A reasoning-capable model like sonnet,
+        # if asked for native reasoning, puts its thought in that channel — surfaced
+        # raw and often in the wrong language — and skips our <think>. Suppressing the
+        # native request forces it to emit the thinking in the reply's <think> block,
+        # which the seal surfaces cleanly (same as V1). Gated on the same kill switch;
+        # when self-thinking is OFF this is False and the old include_reasoning path is
+        # unchanged.
+        from core import self_thinking as _self_thinking_v2
+
         outcome = await v2_tool_loop.run_tool_loop(
             provider_config=provider_config,
             include_reasoning=turn_include_reasoning,
+            suppress_native_reasoning=_self_thinking_v2.enabled(),
             build_messages=build_messages,
             dispatch_tools=_dispatch_tools,
             on_reply=_on_reply,
@@ -10512,13 +10940,39 @@ async def process_job(
         log.info("[v2.worker] job %s stopped at rollout fence: %s", job_id, e)
         return "failed"
     except Exception as e:  # noqa: BLE001 - terminal outbox owns failure visibility
-        message = _safe_failure_code("turn_failed", e)
+        failure_exc: BaseException = e
+        if (
+            not isinstance(e, DedicatedVisionUnavailable)
+            and any(bool(row.get("has_image")) for row in coalesced)
+        ):
+            classified = _turn_failure_error_class(e)
+            vision_code = {
+                "auth_invalid": "vision_model_auth_invalid",
+                "quota_insufficient": "vision_model_quota_insufficient",
+                "model_not_found": "vision_model_not_found",
+                "provider_incompatible": "vision_model_incompatible",
+                "rate_limited": "vision_model_rate_limited",
+                "upstream_unavailable": "vision_model_unavailable",
+                "turn_timeout": "vision_model_unavailable",
+                "reply_parse_failed": "vision_model_empty_response",
+            }.get(classified)
+            # Pixels being present does not prove an unrelated tool, storage,
+            # or internal failure belongs to vision. Only remap failures whose
+            # provider-facing classification is explicit.
+            if vision_code:
+                failure_exc = DedicatedVisionUnavailable(
+                    "visual turn failed",
+                    error_code=vision_code,
+                    model=str(getattr(provider_config, "model", "") or ""),
+                    provider=str(getattr(provider_config, "provider", "") or ""),
+                )
+        message = _safe_failure_code("turn_failed", failure_exc)
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",
             {
                 "stage": "process_job",
-                "error_class": type(e).__name__,
+                "error_class": type(failure_exc).__name__,
                 "error_code": message,
             },
             best_effort=True,
@@ -10529,8 +10983,30 @@ async def process_job(
             job_id,
             message,
             claimed_by=claimed_by,
-            error_class=_turn_failure_error_class(e),
+            error_class=_turn_failure_error_class(failure_exc),
         )
+        if owned and isinstance(failure_exc, DedicatedVisionUnavailable):
+            identity = {}
+            if failure_exc.model:
+                identity["failure_model"] = failure_exc.model
+            if failure_exc.provider:
+                identity["failure_provider"] = failure_exc.provider
+            if identity:
+                try:
+                    await asyncio.to_thread(
+                        jobs_store.append_status_event,
+                        user_id,
+                        "error",
+                        job_id=job_id,
+                        label="视觉模型调用失败",
+                        detail=identity,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- outbox still owns visibility
+                    log.warning(
+                        "[v2.worker] vision failure identity event failed job=%s code=%s",
+                        job_id,
+                        type(exc).__name__.lower(),
+                    )
         if owned and lane == "chat":
             await _settle_legacy_failed_reply_target(message)
             await asyncio.to_thread(

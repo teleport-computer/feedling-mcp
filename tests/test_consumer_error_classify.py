@@ -383,6 +383,49 @@ def test_deepseek_text_only_image_error_requires_vision_model():
     assert crc._turn_failure_reply_text(n) != crc.FALLBACK_REPLY
 
 
+def test_openrouter_text_only_image_404_requires_vision_model_before_model_fallback():
+    """Liko's exact OpenRouter rejection must beat the broad 404+model branch."""
+    n = _cls(RuntimeError(
+        "provider_http_404: model deepseek/deepseek-v4-pro: "
+        "No endpoints found that support image input"))
+
+    assert n.error_class == "vision_model_required"
+    assert n.blame == "user_provider"
+    assert crc._turn_failure_reply_text(n) != crc.FALLBACK_REPLY
+
+
+def test_vision_model_required_guidance_uses_turn_language():
+    zh = crc.classify_agent_error(crc.VisionObserverFailure(
+        "vision_model_required",
+        raw_user_text="看看这张图",
+    ))
+    en = crc.classify_agent_error(crc.VisionObserverFailure(
+        "vision_model_required",
+        raw_user_text="What is in this picture?",
+    ))
+
+    assert zh.user_text == (
+        "由于当前模型没有视觉能力，模型无法收到图片信息，"
+        "建议更改模型或在设置页单独添加视觉模型"
+    )
+    assert en.user_text == (
+        "Your current model can't process images, so it didn't receive this "
+        "picture. Switch models, or add a dedicated vision model in Settings."
+    )
+    assert zh.blame == en.blame == "user_provider"
+
+
+def test_vision_model_required_bare_image_uses_archive_language(monkeypatch):
+    monkeypatch.setitem(crc._whoami_cache, "archive_language", "zh-Hans")
+
+    notice = crc.classify_agent_error(crc.VisionObserverFailure(
+        "vision_model_required",
+        raw_user_text="",
+    ))
+
+    assert notice.user_text.startswith("由于当前模型没有视觉能力")
+
+
 def test_context_overflow_classified():
     from chat_resident_consumer import classify_agent_error
     n = classify_agent_error(RuntimeError("prompt is too long: 210000 tokens > maximum context length"))

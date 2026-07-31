@@ -37,6 +37,7 @@ from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
 from model_api_runtime.v2 import worker
+from model_api_runtime.v2 import serve_worker as v2_serve_worker
 
 _BYOK = provider_client.ProviderConfig(
     provider="anthropic", model="claude-sonnet-4-test", api_key="sk-user-byok", base_url="")
@@ -48,7 +49,11 @@ class _FakeCapResult:
 
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
+    # This file primarily specifies the provider-backed fallback path. Keep
+    # those assertions stable when the CI matrix sets the rollout flag ON;
+    # the deterministic integration test below opts back in explicitly.
+    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
     # claim_next_job is a GLOBAL claim (no user_id filter, by design). A pending
     # job left behind by another test file (e.g. the D3 claim-reservation / wake
     # tests enqueue jobs for other users) would pollute this test's global claim
@@ -423,6 +428,180 @@ def test_legacy_compaction_reader_also_excludes_gc_able_rows(monkeypatch):
 
     folded = v2_serve_worker._read_compaction_tail(uid, 0.0, 10)
     assert [r["id"] for r in folded] == ["a", "b"], folded
+
+
+def test_metadata_coverage_bounds_exclude_gc_able_rows_and_honor_limit():
+    uid = "u_v2_metadata_coverage_bounds"
+    conftest.seed_user(uid)
+    _reset(uid)
+    sources = [
+        "model_api",
+        "verify_ping",
+        "model_api",
+        "resident_maintenance",
+        "model_api",
+    ]
+    for index, source in enumerate(sources):
+        db.chat_append_strict(
+            uid,
+            f"bounds-{index}",
+            float(index + 1),
+            {
+                "id": f"bounds-{index}",
+                "role": "user",
+                "source": source,
+                "body_ct": f"cipher-{index}",
+            },
+            core_store.MAX_CHAT_MESSAGES,
+        )
+    eligible = db.chat_messages_after_seq(
+        uid,
+        0,
+        limit=None,
+        exclude_synthetic_sources=True,
+    )
+
+    assert [row["source"] for row in eligible] == [
+        "model_api",
+        "model_api",
+        "model_api",
+    ]
+    assert db.chat_coverage_bounds_after_seq(uid, 0, limit=2) == (
+        eligible[0]["seq"],
+        eligible[1]["seq"],
+        2,
+    )
+    assert db.chat_coverage_bounds_after_seq(
+        uid,
+        eligible[0]["seq"],
+        limit=10,
+        through_seq=eligible[1]["seq"],
+    ) == (eligible[1]["seq"], eligible[1]["seq"], 1)
+
+
+def test_deterministic_maintenance_large_backlog_has_zero_model_calls_and_bounded_frontier(
+    monkeypatch,
+):
+    uid = "u_v2_deterministic_large_backlog"
+    conftest.seed_user(uid)
+    _reset(uid)
+    total = 1_510
+    with db.get_pool().connection() as conn:
+        with conn.transaction():
+            for index in range(total):
+                conn.execute(
+                    "INSERT INTO chat_messages (user_id,msg_id,ts,doc) "
+                    "VALUES (%s,%s,%s,%s)",
+                    (
+                        uid,
+                        f"det-{index}",
+                        float(index + 1),
+                        db.Jsonb({
+                            "id": f"det-{index}",
+                            "role": "user" if index % 2 == 0 else "openclaw",
+                            "source": "model_api",
+                            "body_ct": f"cipher-{index}",
+                        }),
+                    ),
+                )
+
+    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", True)
+    monkeypatch.setattr(worker, "_COMPACTION_BATCH", 200)
+    monkeypatch.setattr(worker, "_SUMMARY_ROLLUP_FANOUT", 8)
+    provider_calls = []
+
+    async def _provider_must_not_run(*args, **kwargs):
+        provider_calls.append((args, kwargs))
+        raise AssertionError("deterministic coverage must not call provider")
+
+    monkeypatch.setattr(
+        provider_client,
+        "reliable_chat_completion_async",
+        _provider_must_not_run,
+    )
+    head_sizes = []
+
+    def _append_segment(uid_, segment_text, **kwargs):
+        head_text = str(kwargs["head_summary"])
+        head_sizes.append(len(head_text))
+        return jobs_store.append_summary_leaf_cas(
+            uid_,
+            summary_envelope={"plaintext": str(segment_text)},
+            head_summary_envelope={"plaintext": head_text},
+            start_seq=kwargs["start_seq"],
+            end_seq=kwargs["end_seq"],
+            source_message_count=kwargs["source_message_count"],
+            watermark_ts=kwargs["watermark_ts"],
+            expected_version=kwargs["expected_version"],
+            previous_watermark_seq=kwargs["previous_watermark_seq"],
+        )
+
+    def _append_checkpoint(uid_, checkpoint_text, **kwargs):
+        head_text = str(kwargs["head_summary"])
+        head_sizes.append(len(head_text))
+        return jobs_store.insert_summary_checkpoint(
+            uid_,
+            summary_envelope={"plaintext": str(checkpoint_text)},
+            head_summary_envelope={"plaintext": head_text},
+            level=kwargs["level"],
+            start_seq=kwargs["start_seq"],
+            end_seq=kwargs["end_seq"],
+            source_message_count=kwargs["source_message_count"],
+            child_segment_ids=kwargs["child_segment_ids"],
+            coverage_kind=kwargs["coverage_kind"],
+            legacy_opaque_through_seq=kwargs["legacy_opaque_through_seq"],
+            expected_version=kwargs["expected_version"],
+            expected_watermark_seq=kwargs["expected_watermark_seq"],
+        )
+
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        runtime_mode_enabled=lambda _uid: True,
+        read_summary_frontier_metadata=v2_serve_worker._read_summary_frontier_metadata,
+        append_summary_segment=_append_segment,
+        append_summary_checkpoint=_append_checkpoint,
+    )
+    expected_jobs = (
+        total
+        - worker._TAIL_KEEP
+        + worker._COMPACTION_BATCH
+        - 1
+    ) // worker._COMPACTION_BATCH
+    jobs_store.enqueue_job(uid, "maintenance", reason="deterministic-test")
+    completed_jobs = 0
+    while completed_jobs < expected_jobs + 2:
+        job = jobs_store.claim_next_job("deterministic-worker")
+        if job is None:
+            break
+        assert job["user_id"] == uid
+        status = asyncio.run(
+            worker._run_compaction(
+                job["id"],
+                uid,
+                deps,
+                _BYOK,
+                asyncio.Semaphore(1),
+                claimed_by=str(job["claimed_by"]),
+            )
+        )
+        assert status == "completed"
+        completed_jobs += 1
+
+    state = jobs_store.get_summary_frontier_state(uid)
+    assert state is not None
+    assert state["watermark_seq"] > 0
+    assert db.count_messages_after_seq(
+        uid,
+        state["watermark_seq"],
+        exclude_synthetic_sources=True,
+    ) == worker._TAIL_KEEP
+    assert completed_jobs == expected_jobs
+    assert provider_calls == []
+    assert len(state["segments"]) <= worker._SUMMARY_FRONTIER_MAX_SEGMENTS
+    assert any(int(row["level"]) > 0 for row in state["segments"])
+    assert head_sizes and max(head_sizes) < 80
 
 
 def test_a_shrunk_fold_is_remembered_by_the_next_job(monkeypatch):

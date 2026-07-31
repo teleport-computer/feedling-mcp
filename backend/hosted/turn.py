@@ -439,8 +439,16 @@ def _run_model_api_memory_repair_job(
                 "warnings": warnings,
             })
             return
+        failed_count = int(body.get("failed_count") or 0)
+        applied_count = int(body.get("applied_count") or 0)
+        if failed_count:
+            warnings.append(
+                f"{failed_count} replacement memory action(s) were rejected"
+            )
         archived = 0
-        if archive_old:
+        # Never archive the old set after a partial replacement batch: doing so
+        # would turn isolated item rejection into real memory loss.
+        if archive_old and failed_count == 0:
             archived = _archive_model_api_memory_cards(
                 store,
                 list(noisy_set),
@@ -451,9 +459,10 @@ def _run_model_api_memory_repair_job(
             "status": "completed",
             "progress": 100,
             "actions_planned": len(actions),
-            "actions_written": len(effects),
-            "new_cards_created": len(effects),
-            "memories_created": len(effects),
+            "actions_written": applied_count,
+            "actions_failed": failed_count,
+            "new_cards_created": applied_count,
+            "memories_created": applied_count,
             "old_cards_archived": archived,
             "effects": effects,
             "warnings": warnings,

@@ -153,6 +153,49 @@
 
 失败：404 `route_not_found` / 400 `provider_test_failed`（可能带 `active_route_id`，见上）。
 
+### `POST /v1/vision/main/test` —— 验证当前主模型是否真的能看图
+
+请求无 body。它不按模型名猜能力，只采用 provider 返回的显式模态字段；catalog 没有
+提供可判定字段时，才发送两张随机色块图做真实探测。
+
+Model API 路径同步返回 `200`，`status` 为 `ok / unsupported / failed / untested`，并
+始终带当前的 `source / provider / model`；失败时还可能带稳定 `error_code`、
+`retryable / status_code / detail`。
+
+成功的 `POST /v1/model_api/setup` 还会在响应返回后自动启动同一套 Model API 主模型
+探测。setup 本身不等待 catalog 或双图调用，仍立即返回原有的 `200 configured`；
+后台 verdict 写入同一条 route 的 `vision_test_status`，客户端轮询
+`GET /v1/vision/config` 即可在用户打开视觉设置或首次发图前看到结果。若探测期间
+用户再次修改 route，旧探测结果会被版本围栏丢弃。探测启动或执行失败不回滚配置，
+也不阻塞发送。
+
+resident/VPS 路径启动隔离、隐藏的双图 probe 并返回 `202 testing`；客户端随后轮询
+`GET /v1/vision/config`，直到 `effective_status` 不再是 `testing`。probe 不进入聊天记录、
+推送、摘要、Live Activity 或 capture。旧 resident 不具备该 side-channel 时返回
+`409 vision_resident_update_required`。probe 回传端点位于 `/v1/internal/**`，不是公开 API。
+具备 side-channel 的官方 resident 在首次上报或更换
+`consumer_id / entry_signature / provider / model` binding 时，后端也会自动入队同一
+probe；当前 poll 立即拿到任务，provider 调用仍在 resident 的隔离后台 lane 执行。
+同一 binding 的 pending/终态结果不会重复探测，binding 变化会使旧 verdict 失效。
+显式 catalog/modalities 已足以判定时不额外发 probe。整个触发过程仅为 advisory，
+不等待 provider I/O，也不阻塞聊天 poll 或图片发送。
+resident 回报的明确图片拒绝 `vision_model_required / vision_model_incompatible`
+统一缓存为 `unsupported / vision_model_incompatible`；auth、quota、rate limit、
+timeout、upstream 与空回复仍缓存为 `failed`，不把瞬时故障误报成模型能力结论。
+
+精确 provider/model 的缓存 verdict（包括 `unsupported`）只通过
+`GET /v1/vision/config` 的 `main_model.vision_test_status / effective_status` 提供给客户端
+展示提示，不参与发送门禁。`follow_main` 图片继续走当前主模型；已选择 dedicated route
+时仍固定走该 route。所有 `untested / testing / failed / unsupported` 状态都进入真实调用，
+最终回合结果以 provider 的真实响应为准。
+
+Runtime V2 的真实图片回合若收到明确的 text-only provider 拒绝（稳定分类为
+`vision_model_required`），后端会把该回合捕获的 active provider/model route 写为
+`unsupported`。这只更新后续 `GET /v1/vision/config` 的提示信号，不重试、不改路由，
+也不改变已接受回合的终态结果；route 已切换或已有更新时，旧失败不会覆盖新配置。
+Hosted V1 使用相同语义：发图入库时捕获 follow-main route 版本，接收 terminal failure
+回复的同一事务内完成版本围栏写回。
+
 ### `DELETE /v1/model_api/routes/{route_id}` —— 删除 route
 
 ```json

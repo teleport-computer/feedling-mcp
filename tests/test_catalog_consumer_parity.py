@@ -50,6 +50,21 @@ def test_every_catalog_blame_is_valid():
         assert catalog.blame_for(ec) in core.VALID_BLAME
 
 
+def test_vision_model_required_catalog_guidance_is_bilingual():
+    assert catalog.user_text_for(
+        "vision_model_required", language="zh-Hans"
+    ) == (
+        "由于当前模型没有视觉能力，模型无法收到图片信息，"
+        "建议更改模型或在设置页单独添加视觉模型"
+    )
+    assert catalog.user_text_for(
+        "vision_model_required", language="en-US"
+    ) == (
+        "Your current model can't process images, so it didn't receive this "
+        "picture. Switch models, or add a dedicated vision model in Settings."
+    )
+
+
 def test_resident_decrypt_maintenance_classes_are_registered_as_user_environment():
     classes = {
         "resident_decrypt_source_unavailable",
@@ -98,6 +113,8 @@ def test_classify_upstream_mirrors_consumer_on_samples():
         "provider_http_400: Failed to deserialize the JSON body into the target "
         "type: messages[0]: unknown variant `image_url`, expected `text` at line "
         "1 column 295",
+        "provider_http_404: model deepseek/deepseek-v4-pro: "
+        "No endpoints found that support image input",
         "400 unsupported parameter 'tool_choice'",
         "maximum context length exceeded",
         "blocked by content policy",

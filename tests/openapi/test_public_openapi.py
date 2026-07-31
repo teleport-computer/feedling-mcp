@@ -19,9 +19,12 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / "tools"
+BACKEND = ROOT / "backend"
 sys.path.insert(0, str(TOOLS))
+sys.path.insert(0, str(BACKEND))
 
 from export_public_openapi import _build_public_schema, _load_schema  # noqa: E402
+from memory.source_policy import MEMORY_SOURCE_VALUES  # noqa: E402
 
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "options", "head", "trace"}
@@ -36,6 +39,7 @@ EXPECTED_BODYLESS_POSTS = {
     ("post", "/v1/model_api/test"),
     ("post", "/v1/model_api/routes/{route_id}/activate"),
     ("post", "/v1/model_api/routes/{route_id}/test"),
+    ("post", "/v1/vision/main/test"),
     ("post", "/v1/vision/routes/{route_id}/test"),
     ("post", "/v1/proactive/scheduled/fire"),
 }
@@ -185,7 +189,8 @@ def test_public_operation_and_parameter_inventory(
     # authenticated resident observer exchange; three mutations carry bodies.
     # 160 since the voice session and OpenAI-compatible Custom LLM endpoints;
     # both accept compatibility JSON envelopes, hence 73 -> 75 bodies.
-    assert len(operations) == 160
+    # 161 adds the bodyless unified main-model vision validator.
+    assert len(operations) == 161
     assert sum("requestBody" in operation for operation in operations.values()) == 75
 
     query_operations = {
@@ -280,6 +285,7 @@ def test_runtime_success_statuses_and_non_json_media_are_explicit(
         ("post", "/v1/genesis/persona_backfill"): {"200", "202"},
         ("post", "/v1/history_import/upload"): {"200", "202"},
         ("post", "/v1/model_api/memory/repair"): {"200", "202"},
+        ("post", "/v1/vision/main/test"): {"200", "202"},
     }
     for key, expected in expected_success_statuses.items():
         actual = {
@@ -408,6 +414,34 @@ def test_conditional_payloads_and_review_contract_match_runtime(
         assert review_content[media_type]["schema"] == {
             "$ref": "#/components/schemas/ProactiveDecisionReviewRequest"
         }
+
+
+def test_memory_source_enums_match_runtime_policy(
+    public_schema: dict[str, Any],
+) -> None:
+    schemas = public_schema["components"]["schemas"]
+    envelope_sources = schemas["MemoryEnvelope"]["properties"]["source"]["enum"]
+    record_sources = schemas["MemoryRecordInput"]["properties"]["source"]["enum"]
+
+    assert set(envelope_sources) == MEMORY_SOURCE_VALUES
+    assert set(record_sources) == MEMORY_SOURCE_VALUES
+
+
+def test_memory_actions_response_exposes_independent_item_outcomes(
+    public_schema: dict[str, Any],
+    operations: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    response = operations[("post", "/v1/memory/actions")]["responses"]["200"]
+    assert response["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/MemoryActionsResponse"
+    }
+    schema = public_schema["components"]["schemas"]["MemoryActionsResponse"]
+    assert schema["properties"]["status"]["enum"] == ["ok", "partial", "failed"]
+    assert {
+        "total_count", "applied_count", "skipped_count", "failed_count"
+    } <= set(schema["required"])
+    result_schema = public_schema["components"]["schemas"]["MemoryActionResult"]
+    assert {"status", "http_status"} <= set(result_schema["required"])
 
 
 def test_model_catalog_request_schema_expresses_strict_xor(
@@ -746,3 +780,9 @@ def test_internal_prefix_is_never_public() -> None:
     from export_public_openapi import EXCLUDED_PREFIXES
 
     assert "/v1/internal" in EXCLUDED_PREFIXES
+
+
+def test_resident_vision_probe_result_is_not_public(
+    operations: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    assert ("post", "/v1/internal/vision/main/test/result") not in operations

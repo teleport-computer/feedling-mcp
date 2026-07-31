@@ -47,6 +47,96 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-30 — Runtime 值班台补审计的三条实质缺口：capture 语义、完整窗口、端到端交付
+
+**[FIX] 同一份外部审计里剩下的三条（前四条见下一条记录），按"页面自信地报绿最危险"排序做掉。**
+分支 `fix/runtime-health-p1`，L1 `7280 passed / 0 failed`（基线 7251 + 新增 29 条）。
+
+- **`capture.complete` 改名 `terminal_seen_no_gap`，且 `partial` 开始参与降级**。
+  那个桶只证明"找到了 `turn_terminal` 事件且没有 `capture_gap`"，**不**证明 prompt /
+  provider 往返 / tool call / 最终回复这些 artifact 齐全——叫 `complete` 会让人（和下一个
+  改这段代码的人）以为轨迹可以完整回放。更严重的是 `_runtime_health_level` 此前**只看
+  `missing`**：一个带 capture_gap 的回合在页面上既显示了 partial 计数、总体结论又写"正常"，
+  审计截图里就是这个组合。缺口是真实的取证损失，现在至少 `warn`（`missing` 仍是 `bad`，
+  取最差档，有测试钉住"warn 不会盖住 bad"）。
+  姊妹函数 `recent_chat_operational_health` 仍用 `complete`/`complete_rate` 未改——那是
+  `/model_api` 指标端点的对外契约，改名要单独走版本沟通。
+- **健康侧去掉 `LIMIT 1000` 采样上界，与 token 列口径对齐**。四条子查询此前各带 1000 行
+  上界，于是 24h 档写着"24 小时"、实际是"最近 1000 个 job"；而同页 token 查询从一开始就是
+  窗口内全量。两列因此在 168h / 720h 档覆盖不同的时间跨度，**放在一行读却不是同一批样本**，
+  且故障总量被静默少报。采样上界在这里不是性能旋钮而是正确性缺陷。回归测试插 1200 行
+  （> 旧上界）断言 `sampled_jobs == 1200`，并已实测：把 LIMIT 加回去这条立刻变红。
+  扫描量由新迁移 **0071** 的三条索引承担（`ix_agent_jobs_terminal_finished_at` /
+  `ix_agent_jobs_created_at` / `ix_v2_turn_metrics_created_at`，全部 `CONCURRENTLY`，
+  照 0048 的 invalid-空壳 重试处置）。
+  ⚠️ **顺带修正一条此前写反的性能结论**：`ix_v2_turn_metrics_lane_created_at` 不是
+  "用不上"，而是"对非前导列的范围谓词给不出范围收窄"。本机 PG 16 实测（30 万行 / 摊 60 天）：
+  24h 档无新索引走 Seq Scan（4226 buffer）、有新索引走 Index Scan（1454 buffer）；720h 档
+  规划器**确实会**去用那条复合索引，但退化成全索引扫描（21k+ buffer）。数字记在 0071 注释里。
+- **新增「端到端交付」区块（`recent_delivery_health`）**。这是审计最实的一条：`agent_jobs`
+  判 `completed` 只证明回合跑完了，不证明产物到达用户——副作用走 `v2_effect_outbox` 异步
+  apply、用户可见的终态失败走 `v2_terminal_failure_outbox` 投递，这两条队列堵住时 job 层面
+  一切正常，页面此前照样报绿。三块的窗口语义**刻意不同**：两个 outbox 是**当前积压状态**
+  （不随窗口变化——三天前该 apply 的 effect 还堵着，那是现在的故障），`v2_mcp_mutation_attempts`
+  的 unknown/unresolved 才是窗口内计数。判定只按**堵了多久**、不按积压条数（高吞吐下瞬时
+  积压 5000 条是健康的）；MCP 结果未知不设阈值、见一条就 warn（稀有、不可自愈）。
+  阈值刻意保守（1h warn / 6h bad）：稳态基线还没实测，值班台最不能犯的错是长期挂一条误报的
+  红——那会训练出"这页的红不用看"。收紧前不要当灵敏告警使。
+- **页面写明覆盖范围**：本页只统计本实例托管的 V2 回合，self-host consumer 只 best-effort
+  上报部分元数据、离线实例完全不可见，所以 token 与失败率**不是全体用户的总量**。这一条是
+  成本最低、防的却是最贵的误用（拿这页数字当全量用量账）。
+- `admin_core` 的 runtime 分支现在是**三个独立失败域**：健康挂了才降级整页，token 或交付
+  挂了各自只让对应区块显"取不到"（不是显 0——0 的含义是"确认过是零"，与"取不到"相反）。
+
+**未做**（审计提到、本轮没碰）：worker build / heartbeat age（`recent_worker_heartbeats()`
+已有数据，只差渲染）、provider health 参与判定、wake/proactive lane 健康、hourly rollup、
+四层拆分（Runtime Health / Usage / Trace Coverage / Private Trace Viewer）。admin key 轮换与
+移除 query-string auth 按产品决定不做。
+
+---
+
+## 2026-07-30 — 外部审计打回 Runtime 值班台的四处：日志漏脱敏、失败域过宽、参数假生效、两种 coverage 混列
+
+**[FIX] 一次外部只读审计（针对 PR #124 + #129 上线后的生产页）指出四条，全部实测复现后修掉。**
+前三条的共同形状是**页面自信地显示一个错误或误导性的东西，而不是报错**——值班台上这比崩溃更危险。
+
+- **访问日志漏脱敏 `admin_key`（安全）**。`asgi/middleware.py:_display_path` 的判据是
+  `k.lower() == "key"`，精确等于 `key`——而 admin 后台把凭据放在名为 `admin_key` 的
+  query 参数里（`data_track._data_track_qs` 保留列表第一项，因此它出现在**每个**导航
+  链接上）。于是可复用的 admin 凭据原样进了服务端访问日志，也进浏览器历史。
+  判据改为**子串**匹配 `key/token/secret/password/passwd/auth`：精确匹配单个名字，等于
+  把"以后不会出现别的别名"当前提，而这个前提在同一仓库里当时就不成立（`admin_key` /
+  `admin_token` / `api_key` 三个都在用）。⚠️ 本次只修"以后不再泄漏"；**已经进过日志的
+  那份凭据仍然有效**，轮换是独立的运维决定（按 `admin-password-rotate-needs-redeploy`
+  的教训，改 secret 后必须重新部署才生效）。
+- **token 查询失败会拖垮整张健康页**。`page_html` 的 runtime 分支原先两次数据调用共用
+  一个 `try`，于是 token 聚合（无 LIMIT、走 seq scan、扫描量随表增长单调变大的那条）
+  一旦超时，健康数据明明是好的、整页也退化成降级页——而这一页恰恰是出事时才被打开的。
+  拆成**独立失败域**：health 挂了才降级，token 挂了只让两列显 `—`。这条是 PR #129 的
+  spec §4 明确写的"任一数据源失败都走同一个降级页"，三轮 task review 都照 spec 检查、
+  因此全部放过；只有从"这页什么时候被打开"的运维视角看才发现它错了。
+- **`day` / `limit` / `offset` 在本页假生效**。runtime 页只读 `hours`，但那几个参数在
+  全视图共用的 `_data_track_qs` 保留列表里，会一路跟着 URL 走。审计实证了代价：有人拿
+  `?view=runtime&day=2026-07-25` 的截图当成"7 月 25 日的数据"，而页面渲染的其实是生成
+  时刻向前 24 小时，页顶还写着「窗口 24 小时」，读者不会怀疑自己看错日期。本页自己的
+  控件（三个窗口按钮）不再传播它们，说明区写明"本页只按 hours"。顶部 nav 由共用组件
+  生成，不给它开单页面特例——那会把页面知识倒灌进通用逻辑，改由说明文字兜。
+- **两种 coverage 混在一列**。原先「缓存命中 · 上报」= `cache_hit_ratio · usage_coverage`，
+  那个"上报"指 token usage 上报，读者会当成 cache 上报。而 `cache_reported_calls` 一直
+  在写入路径采集、聚合查询从没取过它——真正的 cache coverage 此前不可得。数据层补
+  `cache_reported_calls` / `cache_coverage`，渲染拆成「缓存命中」+「上报 usage/cache」
+  两列（12 → 13 列，空状态 colspan 同步）。
+
+L1 全量 7250 passed / 0 failed。无迁移。
+
+审计同时给出的方向性判断（**未在本次实施**，作为后续依据）：当前 Runtime 页是"值班摘要"
+而非完整 telemetry dashboard，约展示了后端已采集数据的 45%；delivery/outbox、MCP unknown
+outcome、wake 成功率、worker build/heartbeat age、self-host 覆盖标注均尚未上页；建议最终
+拆成 Runtime Health / Usage / Trace Coverage / Private Trace Viewer 四层。⚠️ 审计引用的
+基线文档 `2026-07-11-agent-trajectory-telemetry-requirements.md` **不在本仓库**（`find` +
+`git log --all` 均无，它在审计者本机路径下）——想按那份愿景推进的人需要先向审计方索取，
+不要在本仓库里找。
+
 ## 2026-07-30 — CIPHERTEXT lane 补上删除传播的兜底：853 行"已删还在"
 
 **[DONE] 新增 `tee_shadow/ciphertext_prune.py`**，按主键集合差集删掉 TEE 侧的残留行，
@@ -96,6 +186,39 @@ T1 前写入它，而 replicator 只搬 RDS 中存在的行 ⇒ 该行 T1 前就
   而让 4 列数据静默失同步一整批部署，不重蹈覆辙。`prune_refused` 非 0 就该有人看。
 - 遗留：prune 删掉 frames 的 TEE 明文指针行时不清理对应的 R2 对象，会留孤儿。
   与 requeue lane 的既有行为一致（那条 DELETE 同样不碰 R2），未处理。
+
+---
+
+## 2026-07-30 — 主模型看图验证统一为显式 catalog + 隐藏双图 probe
+
+**[DONE] 视觉能力验证与实际失败归属收口。** 新增公开的
+`POST /v1/vision/main/test`：Model API 只信 provider catalog 的显式模态字段，缺字段
+才发真实双图探测；resident 走隔离 session 的隐藏双图 side-channel，测试内容不进入
+Chat、推送、摘要、Live Activity 或 capture。配置状态统一为
+`testing / ok / unsupported / failed / untested`，绑定的 provider、model 或 resident
+入口变化会使旧结果失效。每次主模型 setup 成功后也会异步启动同一套探测，不等待
+catalog 或双图调用，因此用户不打开视觉设置、不发图也能通过
+`GET /v1/vision/config` 提前得到 verdict；期间 route 再次变化时旧结果由版本围栏
+丢弃。setup、探测失败和所有探测状态都不阻塞配置或发送：图片始终沿用户配置的主模型
+或 dedicated route 进入真实调用。VPS resident 也在官方 consumer 首次上报或更换
+`consumer_id / entry_signature / provider / model` binding 时自动入队现有隐藏 probe；
+同一 binding 的 pending/终态 verdict 不重复探测，显式 catalog/modalities 已能判定时
+不额外调用模型，poll 与发送均不等待 provider I/O。resident 回报的明确图片拒绝
+`vision_model_required / vision_model_incompatible` 统一落为 `unsupported`；
+auth、quota、rate limit、timeout、upstream 与空回复仍保留 `failed`。只有 provider
+真正以明确的 text-only 图片错误拒绝本回合时，才返回 `vision_model_required` 与可操作
+的中英双语换模型提示；Runtime V2 同时把该回合捕获的 active route 写为
+`unsupported`，让后续 config 查询触发非阻断提示，且用 route 版本 fence 防止旧失败
+覆盖用户刚切换的新配置。Hosted V1 同样在发图时捕获 route 版本，并在接收 terminal
+failure 回复的原子事务中写回 `unsupported`，避免 allowlist 外 V1 用户长期停在
+`untested`。
+
+**[DONE] 图片失败归属只在证据明确时挂到视觉模型。** auth、quota、model、provider、
+rate limit、upstream、timeout、reply parse 和 dedicated observer 失败映射到稳定
+`vision_model_*` 码；图片回合里的工具、存储或其他未知内部异常保留原失败归属。
+
+公开 OpenAPI 已登记 main-test 端点；resident probe 回传留在
+`/v1/internal/vision/main/test/result`，不进入公开契约。
 
 ---
 

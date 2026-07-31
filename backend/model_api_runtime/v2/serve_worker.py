@@ -80,11 +80,13 @@ from hosted import vision_observer
 from identity import identity_core
 from memory import memory_core
 from model_api_runtime.v2 import context as v2_context
+from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import child_supervisor as v2_child_supervisor
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import reaper as v2_reaper
 from model_api_runtime.v2 import runner_identity
 from model_api_runtime.v2 import scheduler
@@ -1192,6 +1194,56 @@ def _read_summary_frontier(user_id: str):
     )
 
 
+def _read_summary_frontier_metadata(user_id: str):
+    """Read a deterministic canonical cover without opening exact segments.
+
+    Exact-node text is fully determined by its authenticated row count.  A
+    legacy opaque node has no such witness, so the one migration case falls
+    back to the existing decrypting reader rather than inventing coverage.
+    """
+
+    state = jobs_store.get_summary_frontier_state(user_id)
+    if state is None:
+        return None
+    if not state.get("segments") and state.get("summary_envelope"):
+        seeded = jobs_store.seed_legacy_summary_segment(
+            user_id,
+            expected_version=int(state.get("version") or 0),
+            translated_watermark_seq=int(state.get("watermark_seq") or 0),
+        )
+        if not seeded:
+            raise v2_summary_frontier.SummaryFrontierIntegrityError(
+                "legacy_summary_seed_race"
+            )
+        state = jobs_store.get_summary_frontier_state(user_id)
+    if state is None or not state.get("segments"):
+        return None
+    metadata = _summary_metadata_frontier(state)
+    if any(item.coverage_kind == "legacy_opaque" for item in metadata):
+        return _read_summary_frontier(user_id)
+    deterministic = tuple(
+        v2_summary_frontier.SummarySegment(
+            segment_id=item.segment_id,
+            coverage_kind=item.coverage_kind,
+            level=item.level,
+            start_seq=item.start_seq,
+            end_seq=item.end_seq,
+            source_message_count=item.source_message_count,
+            legacy_opaque_through_seq=item.legacy_opaque_through_seq,
+            child_segment_ids=item.child_segment_ids,
+            text=v2_compaction.deterministic_fold(
+                source_message_count=item.source_message_count
+            ),
+        )
+        for item in metadata
+    )
+    return v2_summary_frontier.SummaryFrontierSnapshot(
+        segments=deterministic,
+        head_version=int(state.get("version") or 0),
+        watermark_seq=int(state.get("watermark_seq") or 0),
+    )
+
+
 def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
     """Read/decrypt summary plus its exact seq coverage watermark.
 
@@ -1240,6 +1292,41 @@ def _read_summary(user_id: str) -> tuple[str, float, int]:
     """
     summary, watermark_ts, version, _watermark_seq = _read_summary_with_seq(user_id)
     return summary, watermark_ts, version
+
+
+def _select_agent_profile_for_turn(
+    user_id: str,
+    summary: str,
+    *,
+    enabled: bool,
+) -> v2_profile_store.ProfilePromptSelection:
+    """Production strict-read/decrypt adapter for M5 prompt selection.
+
+    M2 lands and tests this trust/storage boundary before prompt wiring.  M5
+    consumes the returned selection; a DB/decrypt failure already has the final
+    safe behavior here: keep the summary and emit a content-free observable
+    fallback event/counter.
+    """
+    token: str | None = None
+
+    def _decrypt(envelope: dict, field: str) -> bytes:
+        nonlocal token
+        if token is None:
+            token = _mint_runtime_token(user_id)
+        return core_enclave._decrypt_envelope_via_enclave(
+            envelope,
+            None,
+            purpose=f"v2_profile_{field}_read",
+            runtime_token=token,
+        )
+
+    return v2_profile_store.select_profile_for_turn(
+        user_id,
+        summary,
+        enabled=enabled,
+        decrypt_envelope=_decrypt,
+        read_blob=db.get_blob_strict,
+    )
 
 
 def _write_summary(
@@ -1293,6 +1380,7 @@ def _append_summary_segment(
     segment_text: str,
     *,
     current_summary: str,
+    head_summary: str | None = None,
     start_seq: int,
     end_seq: int,
     source_message_count: int,
@@ -1312,10 +1400,15 @@ def _append_summary_segment(
             err,
         )
         return False
-    compatibility_text = str(current_summary or "").rstrip()
-    if compatibility_text:
-        compatibility_text += "\n"
-    compatibility_text += str(segment_text).strip()
+    if head_summary is None:
+        compatibility_text = str(current_summary or "").rstrip()
+        if compatibility_text:
+            compatibility_text += "\n"
+        compatibility_text += str(segment_text).strip()
+    else:
+        compatibility_text = str(head_summary).strip()
+        if not compatibility_text:
+            return False
     head_env, head_err = core_envelope._build_shared_envelope_for_store(
         store, compatibility_text.encode("utf-8")
     )
@@ -1582,11 +1675,18 @@ def _read_vision_observations(
             configs[route_id] = config
 
         mime = str(image.get("image_mime") or "image/jpeg")
-        observations[message_id] = vision_observer.observe_image(
-            config,
-            image_mime=mime,
-            image_b64=image_b64,
-        )
+        try:
+            observations[message_id] = vision_observer.observe_image(
+                config,
+                image_mime=mime,
+                image_b64=image_b64,
+            )
+        except vision_observer.VisionObserverError as exc:
+            # Fixed route metadata, never inferred from model prose. The worker
+            # can carry it to the terminal activity/fallback projection.
+            exc.model = str(config.model or "")[:96]
+            exc.provider = str(config.provider or "")[:80]
+            raise
     return observations
 
 
@@ -1891,6 +1991,16 @@ def _apply_memory_actions(
             user_id,
             status,
             str(body)[:300],
+        )
+    elif int(body.get("failed_count") or 0) > 0:
+        log.warning(
+            "[v2.serve_worker] memory batch had item failures user=%s "
+            "applied=%s skipped=%s failed=%s body=%s",
+            user_id,
+            body.get("applied_count"),
+            body.get("skipped_count"),
+            body.get("failed_count"),
+            str(body)[:500],
         )
     return body
 
@@ -3370,6 +3480,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_summary_with_seq=_read_summary_with_seq,
         write_summary=_write_summary,
         read_summary_frontier=_read_summary_frontier,
+        read_summary_frontier_metadata=_read_summary_frontier_metadata,
         append_summary_segment=_append_summary_segment,
         append_summary_checkpoint=_append_summary_checkpoint,
         read_images=_read_images,

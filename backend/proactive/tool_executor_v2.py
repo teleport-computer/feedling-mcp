@@ -248,7 +248,15 @@ def combined_runtime_adapters_v2(api_key: str, store) -> ToolRuntimeAdaptersV2:
 
         runtime_auth.authorize_scope("memory")
         body, status = memory_actions._execute_memory_actions(store, api_key, [dict(args or {})])
-        return {"status_code": status, **dict(body or {})}
+        rows = body.get("results") if isinstance(body, dict) else None
+        item_status = (
+            int(rows[0].get("http_status") or status)
+            if isinstance(rows, list)
+            and rows
+            and isinstance(rows[0], dict)
+            else status
+        )
+        return {"status_code": item_status, **dict(body or {})}
 
     return dataclasses.replace(base, screen_read=screen.screen_read,
                                screen_recent=screen.screen_recent,
@@ -507,7 +515,9 @@ class ToolExecutorV2:
         assert self.adapters.memory_action is not None
         response = dict(self.adapters.memory_action(call.user_id, action) or {})
         status_code = _int_arg(response.get("status_code"), default=200, lo=100, hi=599)
-        if status_code >= 400 or str(response.get("status") or "").lower() == "error":
+        if status_code >= 400 or str(response.get("status") or "").lower() in {
+            "error", "failed", "partial"
+        }:
             code = _memory_action_error_code(response)
             raise ToolExecutionErrorV2(code, _memory_action_error_message(response, code), result=response)
         return response

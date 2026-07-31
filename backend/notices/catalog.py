@@ -50,6 +50,15 @@ ERROR_CLASSES = frozenset({
     "resident_decrypt_source_unavailable",
     "resident_decrypt_health_unreported",
     "resident_never_claimed",
+    "vision_model_auth_invalid",
+    "vision_model_quota_insufficient",
+    "vision_model_not_found",
+    "vision_model_incompatible",
+    "vision_model_rate_limited",
+    "vision_model_unavailable",
+    "vision_model_empty_response",
+    "vision_model_not_ready",
+    "vision_model_failed",
 })
 
 # error_class -> (blame, user_text)
@@ -63,7 +72,8 @@ _CATALOG: dict[str, tuple[str, str]] = {
     "cli_config_invalid": (
         "user_provider", "Agent 启动命令配置有误（缺少 {message} 占位符），消息传不到模型。请修正 AGENT_CLI_CMD。"),
     "vision_model_required": (
-        "user_provider", "当前主模型不支持看图，请前往设置添加或切换支持视觉的模型。"),
+        "user_provider",
+        "由于当前模型没有视觉能力，模型无法收到图片信息，建议更改模型或在设置页单独添加视觉模型"),
     "provider_incompatible": (
         "user_provider", "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。"),
     "context_overflow": (
@@ -105,6 +115,24 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "user_environment", "你的 VPS resident 端没有上报可验证的解密健康状态,通常是 consumer 版本太旧,请更新并重启。"),
     "resident_never_claimed": (
         "user_environment", "你的 VPS resident consumer 长时间没有接走入住/记忆蒸馏任务，请更新并重启。"),
+    "vision_model_auth_invalid": (
+        "user_provider", "视觉模型的 API Key 无效或已过期，请到设置里重新保存。"),
+    "vision_model_quota_insufficient": (
+        "user_provider", "视觉模型服务额度不足，充值后再试。"),
+    "vision_model_not_found": (
+        "user_provider", "当前视觉模型不可用，请到设置里更换模型。"),
+    "vision_model_incompatible": (
+        "user_provider", "当前视觉模型无法读取这张图片，请到设置里更换模型。"),
+    "vision_model_rate_limited": (
+        "provider_transient", "视觉模型请求太多，请稍等几分钟再试。"),
+    "vision_model_unavailable": (
+        "provider_transient", "视觉模型暂时无法连接，请稍后重试。"),
+    "vision_model_empty_response": (
+        "provider_transient", "视觉模型没有返回图片内容，请重试或更换模型。"),
+    "vision_model_not_ready": (
+        "user_provider", "视觉模型尚未准备好，请到设置里重新保存或更换模型。"),
+    "vision_model_failed": (
+        "provider_transient", "视觉模型处理失败，请重试；如果仍失败，请更换模型。"),
 }
 
 _FALLBACK_BLAME = "system"
@@ -133,8 +161,15 @@ def blame_for(error_class: str) -> str:
 
 
 def user_text_for(error_class: str, **ctx) -> str:
-    """``**ctx`` 为未来动态占位（如失败次数）预留——当前类均静态文案，
-    ctx 暂被忽略；保留形参使接口稳定，未来加占位不必改调用方签名。"""
+    """Return stable fallback text, localized where the caller has a locale."""
+    if (
+        error_class == "vision_model_required"
+        and str(ctx.get("language") or "").strip().lower().startswith("en")
+    ):
+        return (
+            "Your current model can't process images, so it didn't receive this "
+            "picture. Switch models, or add a dedicated vision model in Settings."
+        )
     entry = _CATALOG.get(error_class)
     return entry[1] if entry is not None else _FALLBACK_USER_TEXT
 
@@ -162,10 +197,11 @@ _UPSTREAM_RULES = (
         r"|model[ _]not[ _]found", re.I)),
     ("cli_config_invalid", re.compile(
         r"missing the \{message\} placeholder", re.I)),
-    # DeepSeek chat/completions, observed 2026-07-30. Keep this before
-    # provider_incompatible's broader "unknown variant" fallback.
+    # DeepSeek chat/completions and OpenRouter, observed 2026-07-30. Keep this
+    # before provider_incompatible and the broad 404+model fallback below.
     ("vision_model_required", re.compile(
-        r"unknown variant `image_url`, expected `text`", re.I)),
+        r"unknown variant `image_url`, expected `text`"
+        r"|no endpoints found that support image input", re.I)),
     ("provider_incompatible", re.compile(
         r"unknown variant|not supported|unsupported (parameter|tool)"
         r"|invalid_request_error.*tool", re.I)),
@@ -193,9 +229,9 @@ def classify_upstream(text: str) -> str:
     lowered = t.lower()
     if "resident_never_claimed" in lowered:
         return "resident_never_claimed"
-    if re.search(r"\b404\b", t) and "model" in lowered:   # 与 consumer 裸404+model 分支对齐
-        return "model_not_found"
     for klass, pat in _UPSTREAM_RULES:
         if pat.search(t):
             return klass
+    if re.search(r"\b404\b", t) and "model" in lowered:   # 与 consumer 裸404+model 分支对齐
+        return "model_not_found"
     return ""

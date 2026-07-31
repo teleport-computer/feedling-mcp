@@ -759,12 +759,51 @@ def test_proactive_leaves_silent_background_noop_untouched(monkeypatch):
 # leading, possibly non-idempotent actions).
 # ---------------------------------------------------------------------------
 
+def test_execute_agent_actions_memory_partial_200_maps_every_item(monkeypatch):
+    body = {
+        "status": "partial",
+        "results": [
+            {"status": "ok", "action": "memory.add", "http_status": 200},
+            {
+                "status": "error",
+                "error": "source_invalid",
+                "http_status": 400,
+            },
+            {"status": "ok", "action": "memory.add", "http_status": 200},
+        ],
+        "effects": [
+            {"type": "memory_added", "memory_id": "mom_1"},
+            {"type": "memory_added", "memory_id": "mom_3"},
+        ],
+        "total_count": 3,
+        "applied_count": 2,
+        "skipped_count": 0,
+        "failed_count": 1,
+    }
+    monkeypatch.setattr(
+        crc._HTTP,
+        "post",
+        _http_router(memory=_Resp(200, body)),
+    )
+
+    result = crc.execute_agent_actions([
+        {"type": "memory.add", "memory": {"summary": "one"}},
+        {"type": "memory.add", "memory": {"summary": "bad"}},
+        {"type": "memory.add", "memory": {"summary": "three"}},
+    ])
+
+    assert [row["outcome"] for row in result["outcomes"]] == [
+        "applied", "failed_execution", "applied",
+    ]
+    assert result["outcomes"][1]["error_code"] == "source_invalid"
+    assert result["effects"] == body["effects"]
+
 def test_execute_agent_actions_partial_4xx_maps_leading_success_failing_item_and_tail(monkeypatch):
-    """Fabricated server body matching backend/memory/actions.py's
-    _execute_memory_actions shape EXACTLY: it writes serially, stops at the
-    first failing item, and returns the results/effects accumulated so far
-    (this is also backend/identity/actions.py's _execute_identity_actions
-    shape — same pattern, same code)."""
+    """Rolling-compatibility body from an older memory server.
+
+    Current memory servers return 200 and one result per item; identity and an
+    older memory deployment can still return this serial-abort 4xx shape.
+    """
     # 4 actions submitted; the server applied #0 and #1, #2 failed, and per
     # the server's serial-abort-on-error design #3 (the tail) was NEVER
     # attempted at all — it's simply absent from results.

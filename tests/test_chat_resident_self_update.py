@@ -122,6 +122,7 @@ def test_runtime_files_includes_explicit_subprocess_and_requirements():
     # same checkout; requirements files gate the pip-install fallback.
     files = crc._runtime_repo_files()
     assert "tools/io_cli.py" in files
+    assert "backend/memory/source_policy.py" in files
     assert "tools/chat_resident_requirements.txt" in files
     assert "backend/requirements.txt" in files
 

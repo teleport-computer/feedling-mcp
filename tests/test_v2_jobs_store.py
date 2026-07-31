@@ -438,6 +438,48 @@ def test_terminal_failure_reply_is_encrypted_linked_classified_and_idempotent(
     assert v2_cursor.load_seq(core_store.get_store(uid)) == parent_seq
 
 
+def test_terminal_vision_required_reply_uses_user_archive_language(monkeypatch):
+    uid = "u_js_terminal_vision_en"
+    seed_user(uid, archive_language="en-US")
+    _reset(uid)
+    _seed_active_route(uid)
+    _append_user_message(uid)
+    monkeypatch.setattr(
+        core_envelope,
+        "_build_shared_envelope_for_store",
+        _fake_failure_envelope,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "chat")
+    jobs_store.claim_next_job("w")
+    assert jobs_store.mark_failed(
+        job_id,
+        "turn_failed:providererror",
+        claimed_by="w",
+        error_class="vision_model_required",
+    )
+
+    result = jobs_store.reconcile_terminal_failure_outbox(job_id=job_id)
+
+    assert result["reply_delivered"] == 1
+    failure = next(
+        row for row in db.chat_load_strict(uid)
+        if str(row.get("terminal_failure_job_id") or "") == str(job_id)
+    )
+    assert failure["turn_failure_error_class"] == "vision_model_required"
+    assert failure["turn_failure_user_text"] == (
+        "Your current model can't process images, so it didn't receive this "
+        "picture. Switch models, or add a dedicated vision model in Settings."
+    )
+    with db.get_pool().connection() as conn:
+        learned = conn.execute(
+            "SELECT vision_test_status,last_vision_test_error,"
+            "last_vision_test_at IS NOT NULL "
+            "FROM model_api_routes WHERE user_id=%s AND is_active",
+            (uid,),
+        ).fetchone()
+    assert learned == ("unsupported", "vision_model_required", True)
+
+
 def test_terminal_failure_reply_retry_adopts_committed_bubble_after_ack_crash(
     monkeypatch,
 ):
@@ -727,7 +769,12 @@ def test_delayed_failure_never_stamps_newly_active_route(monkeypatch):
     old_route_id = _seed_active_route(uid)
     failed_id, _ = jobs_store.enqueue_job(uid, "chat")
     jobs_store.claim_next_job("w")
-    assert jobs_store.mark_failed(failed_id, "lease_timeout", claimed_by="w")
+    assert jobs_store.mark_failed(
+        failed_id,
+        "turn_failed:providererror",
+        claimed_by="w",
+        error_class="vision_model_required",
+    )
 
     real_runtime_sink = jobs_store._deliver_terminal_failure_runtime_error
     monkeypatch.setattr(
@@ -750,11 +797,15 @@ def test_delayed_failure_never_stamps_newly_active_route(monkeypatch):
     jobs_store.reconcile_terminal_failure_outbox(job_id=failed_id, now=base_now + 2)
     with db.get_pool().connection() as conn:
         errors = conn.execute(
-            "SELECT id::text,last_runtime_error FROM model_api_routes "
+            "SELECT id::text,last_runtime_error,vision_test_status "
+            "FROM model_api_routes "
             "WHERE id IN (%s,%s) ORDER BY id",
             (old_route_id, new_route_id),
         ).fetchall()
-    assert all(error == "" for _route_id, error in errors)
+    assert all(
+        error == "" and vision_status == "untested"
+        for _route_id, error, vision_status in errors
+    )
 
 
 def test_enqueue_after_failed_job_also_coalesces_free(monkeypatch=None):

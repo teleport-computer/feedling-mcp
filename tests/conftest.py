@@ -190,6 +190,7 @@ if not _provisioned:
         # 无 PG 时会被下面的 collect_ignore 静默忽略）。它自己不碰 DB，必须
         # 留在可收集列表里，否则连它也会被忽略。
         "test_tee_registry_guard_enforced.py",
+        "test_self_thinking_parse.py",
     }
     collect_ignore = sorted(
         f
@@ -357,6 +358,30 @@ def _reset_enclave_http_client():
     core_enclave.reset_http_client()
     yield
     core_enclave.reset_http_client()
+
+
+@pytest.fixture(autouse=True)
+def _disable_setup_auto_vision_probe(monkeypatch, request):
+    """Keep setup tests from starting real provider calls in daemon threads.
+
+    Tests for the scheduler override this stub explicitly. Production has no
+    such fixture, so every successful setup still launches the probe.
+    """
+    if "enable_setup_auto_vision_probe" in request.fixturenames:
+        return
+
+    from hosted import setup_core
+
+    monkeypatch.setattr(
+        setup_core,
+        "_kick_setup_main_vision_test",
+        lambda *_args, **_kwargs: None,
+    )
+
+
+@pytest.fixture()
+def enable_setup_auto_vision_probe():
+    """Opt a focused scheduler test into the production background runner."""
 
 
 @pytest.fixture()

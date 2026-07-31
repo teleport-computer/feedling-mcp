@@ -128,6 +128,41 @@ def test_parse_catalog_page_anthropic_has_more():
     assert nxt == "claude-opus-5"
 
 
+def test_parse_catalog_page_openrouter_preserves_explicit_input_modalities():
+    body = {"data": [{
+        "id": "vendor/model",
+        "architecture": {"input_modalities": ["text", "image"]},
+    }]}
+    models, _ = pc._parse_catalog_page("openrouter", body)
+    assert models == [{
+        "id": "vendor/model",
+        "display_name": "vendor/model",
+        "input_modalities": ["image", "text"],
+    }]
+
+
+def test_parse_catalog_page_anthropic_maps_image_capability_without_guessing():
+    body = {"data": [
+        {"id": "vision", "capabilities": {"image_input": {"supported": True}}},
+        {"id": "text", "capabilities": {"image_input": {"supported": False}}},
+        {"id": "unknown"},
+    ]}
+    models, _ = pc._parse_catalog_page("anthropic", body)
+    assert models[0]["input_modalities"] == ["text", "image"]
+    assert models[1]["input_modalities"] == ["text"]
+    assert "input_modalities" not in models[2]
+
+
+def test_parse_catalog_page_compatible_accepts_only_explicit_safe_modalities():
+    body = {"data": [
+        {"id": "explicit", "input_modalities": ["IMAGE", "text", "secret"]},
+        {"id": "name-only"},
+    ]}
+    models, _ = pc._parse_catalog_page("openai_compatible", body)
+    assert models[0]["input_modalities"] == ["image", "text"]
+    assert "input_modalities" not in models[1]
+
+
 def test_catalog_request_bedrock_unsupported():
     with pytest.raises(pc.ProviderError) as ei:
         pc._catalog_request("bedrock", "k", "", None)
@@ -221,11 +256,46 @@ def _install_fake_stream(monkeypatch, pages):
 
 
 def test_list_models_openrouter_single_page(monkeypatch):
-    calls = _install_fake_stream(monkeypatch, [(200, {"data": [{"id": "a"}, {"id": "b"}]})])
+    # openrouter now probes the auth endpoint (/key) FIRST, then fetches /models.
+    calls = _install_fake_stream(monkeypatch, [
+        (200, {"data": {"label": "ok"}}),               # /key probe (valid key)
+        (200, {"data": [{"id": "a"}, {"id": "b"}]}),     # /models catalog
+    ])
     res = pc.list_provider_models("openrouter", "k", "")
     assert res["catalog_supported"] is True and res["complete"] is True
     assert [m["id"] for m in res["models"]] == ["a", "b"]
-    assert calls[0]["params"].get("output_modalities") == "all"
+    assert calls[0]["url"].endswith("/key")             # probe hit first
+    assert calls[1]["url"].endswith("/models")
+    assert calls[1]["params"].get("output_modalities") == "all"
+
+
+def test_list_models_openrouter_bogus_key_blocked_before_catalog(monkeypatch):
+    # OpenRouter's /models is PUBLIC → a bogus key would otherwise return a full
+    # catalog. The /key probe must 401 and block BEFORE any catalog is returned.
+    calls = _install_fake_stream(monkeypatch, [
+        (401, {"error": "invalid api key"}),            # /key probe rejects
+        (200, {"data": [{"id": "a"}, {"id": "b"}]}),     # /models — must NOT be reached
+    ])
+    with pytest.raises(pc.ProviderError) as ei:
+        pc.list_provider_models("openrouter", "bogus", "")
+    assert ei.value.status_code == 401
+    # Only the probe ran; the catalog fetch never happened.
+    assert len(calls) == 1
+    assert calls[0]["url"].endswith("/key")
+    # And the route maps a bogus openrouter key to the auth-failed slug.
+    assert pc.model_catalog_error_slug(ei.value) == "model_catalog_auth_failed"
+
+
+def test_list_models_openai_issues_no_key_probe(monkeypatch):
+    # Providers whose /models already authenticates must NOT get an extra /key
+    # probe — the fix is scoped to public-catalog providers only.
+    calls = _install_fake_stream(monkeypatch, [(200, {"data": [{"id": "a"}]})])
+    res = pc.list_provider_models("openai", "k", "")
+    assert res["catalog_supported"] is True
+    assert [m["id"] for m in res["models"]] == ["a"]
+    assert len(calls) == 1                               # single call: /models
+    assert calls[0]["url"].endswith("/models")
+    assert not any(c["url"].endswith("/key") for c in calls)
 
 
 def test_list_models_per_phase_timeouts_are_tight_and_bounded(monkeypatch):

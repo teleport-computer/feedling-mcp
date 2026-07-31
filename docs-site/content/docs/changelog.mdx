@@ -10,11 +10,95 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Encrypted Runtime V2 profile storage is staged for the bounded
+  Memory/User rollout.** Both fields share one `v2_agent_profile` CAS document
+  but remain separate shared encrypted envelopes. PostgreSQL and the TEE shadow
+  receive the same ciphertext document; only state, character counts, source
+  counts, and generation/retry timestamps remain plaintext metadata. This
+  storage milestone does not enable prompt injection, which remains behind the
+  later default-off rollout.
+
+- **Runtime V2 can advance conversation coverage without steady-state
+  background model calls.** The default-off
+  `FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC` worker switch replaces
+  provider-backed maintenance and inline catch-up folds with exact,
+  content-free count leaves. Deterministic fan-out checkpoints keep the
+  canonical frontier and encrypted materialized head bounded. Synthetic
+  `verify_ping` and `resident_maintenance` rows remain excluded from both the
+  source bounds and immutable coverage witnesses; encrypted Chat rows remain
+  the durable source ledger. Disabling the switch restores the existing
+  provider-backed summary path. Keep this switch off until bounded
+  MEMORY/USER prompt injection is deployed; otherwise count sentinels replace
+  the existing summary context before its replacement is available. Existing
+  legacy model-written frontier nodes can still require a provider-backed
+  rollup during migration, so zero background calls is the steady state.
+
+- **Memory action batches now isolate item failures.** A structurally valid
+  `POST /v1/memory/actions` batch processes every item and returns HTTP `200`
+  with `status: ok|partial|failed`, per-item `http_status`, and
+  `applied_count`/`skipped_count`/`failed_count`. Older clients that treated
+  every HTTP `200` as full success must inspect these fields. Capture clients
+  record applied, skipped, and failed items separately; partial success no
+  longer marks the whole capture job failed. Resident capture may re-ask the
+  model once after either a format or semantic validation failure, using one
+  shared per-job retry budget so the two layers cannot multiply retries.
+
+- **Memory writes now fail closed on invented metadata and skip exact active
+  duplicates.** `POST /v1/memory/actions` rejects unknown `source` and
+  `capture_mode` values with HTTP `400`. Before `memory.add`, the server
+  compares Unicode-NFKC/case/whitespace-normalized title and content with
+  readable active shared cards; an exact match returns a successful
+  `duplicate_active` no-op with the existing card ID and emits no write effect.
+  The published source enum includes existing bootstrap, history-import,
+  resident-write, and Ombre sync provenance values.
+  Capture clients no longer rewrite `merge` or `supersede` cards that lack a
+  target into `memory.add`.
+- **The thinking chain is now io's own first-person reasoning, not raw provider
+  chain-of-thought.** When the thinking display is enabled, io is prompted to open
+  each reply with a short self-authored `<think>` block (its own train of thought,
+  in the user's language, with no tool/internal names); the runtime prefers that
+  block and shows the model's native reasoning only as a fallback when no block was
+  written. The model still reasons natively for answer quality — only what is
+  *displayed* changes. This spans both Runtime V2 and resident V1. It is on by
+  default and controlled by a single kill switch, `FEEDLING_V2_SELF_THINKING`
+  (unset/`1` = on; `0`/`false`/`no`/`off` = revert to showing native reasoning
+  verbatim). Because the displayed thinking may now be this self-authored summary,
+  `include_reasoning` requests "the assistant's per-turn thinking," which may be
+  either the self-authored block or native reasoning, rather than strictly the
+  provider's raw chain-of-thought.
+
 - **Image turns rejected by a text-only main model now return actionable
   failure metadata.** Resident V1, Runtime V2, and current VPS residents classify
   the provider rejection as `vision_model_required` and direct the user to add
   or select a vision-capable model instead of showing the generic retry-later
-  reply. Image sends remain ungated: probe status does not block delivery.
+  reply. Hosted V1 and Runtime V2 also record that exact active provider/model
+  binding as `unsupported`, so later `GET /v1/vision/config` responses can show
+  the non-blocking client hint without requiring a separate Settings probe.
+  Image sends remain ungated: probe status does not block delivery.
+
+- **Main-model image validation now uses one runtime-neutral endpoint.**
+  `POST /v1/vision/main/test` trusts only explicit provider catalog modalities;
+  when metadata is missing, it performs a real two-image capability probe.
+  Every successful `POST /v1/model_api/setup` now starts that same probe in the
+  background, so `GET /v1/vision/config` can expose an unsupported main model
+  before the user opens visual settings or sends an image. Setup and image
+  delivery never wait for the probe, and a route-version fence discards a
+  result if the user reconfigures the route while provider I/O is in flight.
+  Model API routes return a terminal `ok`, `unsupported`, `failed`, or
+  `untested` result. Resident runtimes return `202 testing` while an isolated,
+  hidden probe runs; clients then refresh `GET /v1/vision/config`.
+  VPS residents with the probe capability now enqueue that same hidden check
+  automatically when their consumer/entry/provider/model binding first appears
+  or changes. Matching pending or completed bindings are not re-probed, and
+  explicit modality metadata still avoids the model call. Polling and image
+  delivery remain non-blocking. Explicit resident rejections
+  (`vision_model_required` or `vision_model_incompatible`) normalize to the
+  same cached `unsupported` verdict, while authentication, quota, rate-limit,
+  timeout, upstream, and empty-response failures remain `failed`. Known
+  `unsupported` verdicts are non-blocking signals for client guidance: image
+  sends still follow the user's configured main or dedicated route unchanged.
+  Runtime failures expose stable visual error codes and the exact provider/model
+  without putting probe traffic into Chat history or activity.
 
 - **Hosted Runtime V2 chat sends can request provider reasoning per turn.**
   `POST /v1/model_api/chat/send` accepts the optional boolean

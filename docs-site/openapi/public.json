@@ -3468,11 +3468,11 @@
         "operationId": "memory_actions_v1_memory_actions_post",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "The structurally valid batch was processed item by item. Inspect status, counts, and every results entry; item failures do not change the batch HTTP status.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/MemoryActionsResponse"
                 }
               }
             }
@@ -3502,7 +3502,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Apply up to 20 memory actions in order. The batch is not transactional and Idempotency-Key is not supported."
+        "description": "Apply up to 20 memory actions independently and in order. A structurally valid batch returns HTTP 200 even when some or all items fail; inspect every result and the applied/skipped/failed counts. The batch is not transactional and Idempotency-Key is not supported."
       }
     },
     "/v1/memory/add": {
@@ -7536,6 +7536,59 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/vision/main/test": {
+      "post": {
+        "summary": "Vision Main Test",
+        "operationId": "vision_main_test_v1_vision_main_test_post",
+        "responses": {
+          "200": {
+            "description": "Main-model image capability reached a terminal verdict.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VisionMainTestResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "A hidden resident image-capability probe is in progress.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VisionMainTestResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The resident must be updated before hidden validation is available.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "Validate the effective main model's image-input capability. Model API routes use explicit catalog metadata when available and otherwise perform a real two-image probe, returning a terminal 200 status. Resident runtimes start a hidden isolated two-image probe and return 202 testing; poll GET /v1/vision/config until effective_status leaves testing. Residents without the hidden-probe capability receive 409 vision_resident_update_required."
+      }
+    },
     "/v1/vision/observe": {
       "post": {
         "summary": "Vision Observe",
@@ -8421,6 +8474,24 @@
           },
           "source": {
             "type": "string",
+            "enum": [
+              "bootstrap",
+              "chat",
+              "genesis_import",
+              "genesis_resident_distill",
+              "history_import",
+              "hosted_runtime_state",
+              "live_conversation",
+              "memory_capture",
+              "memory_dream",
+              "memory_migrate",
+              "model_api_capture",
+              "model_api_correction",
+              "model_api_repair",
+              "ombre_brain_sync",
+              "resident_absorb",
+              "resident_patch"
+            ],
             "default": "live_conversation"
           },
           "anchor_memory_ids": {
@@ -8756,7 +8827,7 @@
           "include_reasoning": {
             "type": "boolean",
             "default": false,
-            "description": "Request provider reasoning for this Hosted Runtime V2 turn. Omitted values preserve the historical disabled behavior; resident runtimes ignore this field."
+            "description": "Request the assistant's per-turn thinking for this Hosted Runtime V2 turn. With the self-authored thinking chain enabled (the default), the returned thinking is io's own first-person summary rather than the provider's raw chain-of-thought, falling back to native reasoning when no self-authored block was produced. Omitted values preserve the historical disabled behavior; resident runtimes ignore this field."
           },
           "image_b64": {
             "type": "string",
@@ -8966,6 +9037,63 @@
           "route_id": {
             "type": "string",
             "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "VisionMainTestResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "source",
+          "provider",
+          "model"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unsupported",
+              "failed",
+              "untested",
+              "testing"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "model_api",
+              "resident"
+            ]
+          },
+          "provider": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          },
+          "error_code": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "status_code": {
+            "type": "integer"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "probe_id": {
+            "type": "string"
+          },
+          "expires_at_epoch": {
+            "type": "number"
+          },
+          "poll_after_ms": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "additionalProperties": false
@@ -9537,6 +9665,27 @@
             "items": {
               "type": "string"
             }
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "bootstrap",
+              "chat",
+              "genesis_import",
+              "genesis_resident_distill",
+              "history_import",
+              "hosted_runtime_state",
+              "live_conversation",
+              "memory_capture",
+              "memory_dream",
+              "memory_migrate",
+              "model_api_capture",
+              "model_api_correction",
+              "model_api_repair",
+              "ombre_brain_sync",
+              "resident_absorb",
+              "resident_patch"
+            ]
           }
         },
         "additionalProperties": true
@@ -9607,6 +9756,17 @@
           "reason": {
             "type": "string"
           },
+          "capture_mode": {
+            "type": "string",
+            "enum": [
+              "agent_tool",
+              "genesis_resident_distill",
+              "memory_capture",
+              "memory_dream",
+              "repair",
+              "state"
+            ]
+          },
           "source_chat_message_ids": {
             "type": "array",
             "items": {
@@ -9653,6 +9813,96 @@
             }
           ]
         }
+      },
+      "MemoryActionResult": {
+        "type": "object",
+        "required": [
+          "status",
+          "http_status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "error"
+            ]
+          },
+          "http_status": {
+            "type": "integer",
+            "description": "Per-item execution status; inspect it even when the batch HTTP status is 200."
+          },
+          "action": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "memory_id": {
+            "type": "string"
+          },
+          "noop": {
+            "type": "boolean"
+          },
+          "skipped": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "MemoryActionsResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "results",
+          "effects",
+          "total_count",
+          "applied_count",
+          "skipped_count",
+          "failed_count"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "partial",
+              "failed"
+            ]
+          },
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MemoryActionResult"
+            }
+          },
+          "effects": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "total_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "applied_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "skipped_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failed_count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "MemoryAddRequest": {
         "type": "object",

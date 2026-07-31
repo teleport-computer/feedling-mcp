@@ -1007,6 +1007,41 @@ def test_detail_payload_runtime_includes_reasoning_effort(client):
     assert row["runtime"]["reasoning_effort"] == "medium"
 
 
+def test_detail_payload_exposes_capture_validation_decisions(client):
+    from admin import data_track as data_track
+
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+    store.append_proactive_job({
+        "job_id": "cap_validation",
+        "job_kind": "memory_capture",
+        "status": "completed",
+        "status_reason": "supersede_without_target",
+        "capture_result": {
+            "status": "noop",
+            "job_kind": "memory_capture",
+            "applied": {"added": 0, "superseded": 0},
+            "skipped": {
+                "supersede_without_target": 1,
+                "duplicate_active": 2,
+            },
+        },
+        "memory_action_status": {"status": "ok", "results": 2, "effects": 0},
+    })
+    user_entry = next(u for u in registry._users if u["user_id"] == user_id)
+
+    row = data_track._build_data_track_user(user_entry, include_detail=True)
+
+    detail = row["memory_capture_validation"]
+    assert detail["jobs_total"] == 1
+    assert detail["skipped"] == {
+        "supersede_without_target": 1,
+        "duplicate_active": 2,
+    }
+    assert detail["jobs"][0]["job_id"] == "cap_validation"
+    assert detail["jobs"][0]["capture_result"]["status"] == "noop"
+
+
 def test_provider_attempts_detail_is_bounded_and_reports_more(monkeypatch):
     rows = [{"attempt_n": n} for n in range(1, 202)]
     calls = []

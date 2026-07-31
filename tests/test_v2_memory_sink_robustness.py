@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-from model_api_runtime.v2 import serve_worker
+from model_api_runtime.v2 import serve_worker, worker
 
 
 @pytest.fixture(autouse=True)
@@ -55,3 +55,38 @@ def test_5xx_transient_raises_for_retry(monkeypatch):
 def test_success_returns_body(monkeypatch):
     _stub_actions(monkeypatch, {"status": "ok", "results": []}, 200)
     assert serve_worker._apply_memory_actions("u1", [{"type": "memory.add"}]) == {"status": "ok", "results": []}
+
+
+def test_partial_200_returns_item_details_instead_of_raising(monkeypatch, caplog):
+    body = {
+        "status": "partial",
+        "results": [
+            {"status": "error", "error": "not_found", "http_status": 404},
+            {"status": "ok", "action": "memory.add", "http_status": 200},
+        ],
+        "effects": [{"type": "memory_added", "memory_id": "mem_ok"}],
+        "applied_count": 1,
+        "skipped_count": 0,
+        "failed_count": 1,
+    }
+    _stub_actions(monkeypatch, body, 200)
+
+    assert serve_worker._apply_memory_actions(
+        "u1",
+        [{"type": "memory.supersede"}, {"type": "memory.add"}],
+    ) == body
+    assert "memory batch had item failures" in caplog.text
+
+
+def test_v2_worker_counts_partial_results_without_failing_successful_items():
+    actions = [{"type": "memory.add"}, {"type": "memory.add"}]
+    result = {
+        "status": "partial",
+        "results": [
+            {"status": "error", "error": "source_invalid", "http_status": 400},
+            {"status": "ok", "action": "memory.add", "http_status": 200},
+        ],
+    }
+    assert worker._memory_write_result_counts(actions, result) == (
+        1, 0, 1, "source_invalid"
+    )
