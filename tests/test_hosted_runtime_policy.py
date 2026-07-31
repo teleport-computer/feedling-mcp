@@ -24,6 +24,12 @@ from model_api_runtime.v2 import jobs_store  # noqa: E402
 ROOT = Path(__file__).parent.parent
 
 
+@pytest.fixture(autouse=True)
+def _legacy_exact_job_shapes_profile_off(monkeypatch):
+    """This suite's exact queue assertions describe the profile-off contract."""
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
+
+
 def _uid(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 

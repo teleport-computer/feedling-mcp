@@ -72,10 +72,13 @@ def _reset(uid):
 
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
     """Mirrors test_v2_worker.py's fixture: claim_next_job() is a global claim,
     not filtered by user_id, so a stray row from another test module would
     otherwise get claimed here instead of this file's own row."""
+    # Exact successor-count assertions describe the profile-off contract.
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
+    monkeypatch.setattr(worker, "_PROFILE_ENABLED", False)
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield
