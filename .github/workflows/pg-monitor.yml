@@ -1,6 +1,7 @@
 # .github/workflows/pg-monitor.yml — 没有监控 = 没有备份（spec §3）
-# 监控 **prod** TEE Postgres 的 WAL-G 备份链（归档新鲜度 + WAL 堆积 + R2 落地）。
-# prod 才是真正要盯的：真实用户数据。test 库数据可弃，故不监控。
+# 监控 **prod + pre** TEE Postgres 的 WAL-G 备份链（归档新鲜度 + WAL 堆积 +
+# R2 落地）。test 库数据可弃，故不监控；pre 是发布验收环境，备份失效会让迁移
+# 演练失真，因此与 prod 一起纳入定时检查。
 name: PG backup monitor
 on:
   schedule: [{ cron: '*/30 * * * *' }]
@@ -8,6 +9,10 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [prod, pre]
     steps:
       - name: Install psql 17 (direct TLS 需要 libpq>=17)
         run: |
@@ -16,8 +21,20 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-17
       - name: Archiver freshness + WAL 堆积（monitoring 角色，pg_monitor-only）
         env:
-          MON_DSN: ${{ secrets.PROD_PG_MONITORING_DSN }}   # host=<prod-pg-app-id>-5432s... port=443 user=monitoring dbname=feedling sslnegotiation=direct sslmode=require
+          ENVIRONMENT: ${{ matrix.environment }}
+          PROD_MON_DSN: ${{ secrets.PROD_PG_MONITORING_DSN }}
+          PRE_MON_DSN: ${{ secrets.PRE_PG_MONITORING_DSN }}
+          PRE_CA_PEM: ${{ secrets.PRE_TEE_PG_CA_PEM }}
         run: |
+          if [ "$ENVIRONMENT" = "prod" ]; then
+            MON_DSN="$PROD_MON_DSN"
+          else
+            umask 077
+            printf '%s' "$PRE_CA_PEM" > /tmp/pre-pg-ca.crt
+            test -s /tmp/pre-pg-ca.crt || { echo "::error::pre monitoring CA is empty"; exit 1; }
+            MON_DSN="$PRE_MON_DSN sslrootcert=/tmp/pre-pg-ca.crt"
+          fi
+          test -n "$MON_DSN" || { echo "::error::${ENVIRONMENT} monitoring DSN is empty"; exit 1; }
           PSQL=/usr/lib/postgresql/17/bin/psql
           AGE=$($PSQL "$MON_DSN" -tAc "SELECT COALESCE(EXTRACT(EPOCH FROM now()-last_archived_time)::int, 999999) FROM pg_stat_archiver;")
           echo "archiver age: ${AGE}s"
@@ -27,15 +44,32 @@ jobs:
           test "$WAL_MB" -lt 4096 || { echo "::error::WAL 堆积 ${WAL_MB}MB (>4GB) — 先修归档，绝不手删 pg_wal/"; exit 1; }
       - name: R2 bucket freshness
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.PROD_PG_BACKUP_R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.PROD_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
+          ENVIRONMENT: ${{ matrix.environment }}
+          PROD_R2_ACCESS_KEY_ID: ${{ secrets.PROD_PG_BACKUP_R2_ACCESS_KEY_ID }}
+          PROD_R2_SECRET_ACCESS_KEY: ${{ secrets.PROD_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
+          PROD_ENDPOINT: ${{ secrets.PROD_PG_BACKUP_R2_ENDPOINT }}
+          PRE_R2_ACCESS_KEY_ID: ${{ secrets.PRE_PG_BACKUP_R2_ACCESS_KEY_ID }}
+          PRE_R2_SECRET_ACCESS_KEY: ${{ secrets.PRE_PG_BACKUP_R2_SECRET_ACCESS_KEY }}
+          PRE_ENDPOINT: ${{ secrets.PRE_PG_BACKUP_R2_ENDPOINT }}
           # GitHub runner has no default AWS region; `aws s3api` still demands
           # one even with --endpoint-url pointed at R2 (which ignores the
           # value but the CLI errors out client-side without it).
           AWS_DEFAULT_REGION: auto
           AWS_REGION: auto
-          ENDPOINT: ${{ secrets.PROD_PG_BACKUP_R2_ENDPOINT }}
         run: |
+          if [ "$ENVIRONMENT" = "prod" ]; then
+            AWS_ACCESS_KEY_ID="$PROD_R2_ACCESS_KEY_ID"
+            AWS_SECRET_ACCESS_KEY="$PROD_R2_SECRET_ACCESS_KEY"
+            ENDPOINT="$PROD_ENDPOINT"
+          else
+            AWS_ACCESS_KEY_ID="$PRE_R2_ACCESS_KEY_ID"
+            AWS_SECRET_ACCESS_KEY="$PRE_R2_SECRET_ACCESS_KEY"
+            ENDPOINT="$PRE_ENDPOINT"
+          fi
+          export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY ENDPOINT
+          test -n "$AWS_ACCESS_KEY_ID" && test -n "$AWS_SECRET_ACCESS_KEY" && test -n "$ENDPOINT" || {
+            echo "::error::${ENVIRONMENT} R2 backup credentials are incomplete"; exit 1;
+          }
           # aws CLI 会自动分页：一个前缀 >1000 对象时，每页各输出一个「本页最新」
           # 时间戳，newest() 于是吐出多行，下游 fromisoformat 直接炸（2026-07-14 prod
           # 实测：wal_005/ 已 >1000 个 WAL 对象）。用 sort|tail 取跨页全局最新——对象
@@ -65,8 +99,8 @@ jobs:
             echo "::error::ListObjectsV2 '${prefix}' 连续 3 次失败 — R2 侧问题，本次无法判定备份新鲜度（不等于备份陈旧）" >&2
             return 1
           }
-          WAL_TS=$(newest "prod/wal-g/wal_005/")
-          BASE_TS=$(newest "prod/wal-g/basebackups_005/")
+          WAL_TS=$(newest "${ENVIRONMENT}/wal-g/wal_005/")
+          BASE_TS=$(newest "${ENVIRONMENT}/wal-g/basebackups_005/")
           echo "newest wal: $WAL_TS | newest base sentinel: $BASE_TS"
 
           check_age() {

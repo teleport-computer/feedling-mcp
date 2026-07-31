@@ -569,10 +569,12 @@ forge script script/DeployFeedlingAppAuth.s.sol \
 After deploy, run `cast send` with `addComposeHash()` for your compose_hash.
 Record the new address + first-tx info in the table above.
 
-## TEE Postgres — ✅ 已开通（test + prod）
+## TEE Postgres — ✅ 已开通（test + pre + prod）
 
-**状态更新（2026-07-18）**：`feedling-io-db-test` 与 `feedling-io-db-prod`
-（2026-07-14 上线，WAL-G 备份 + 双写 + in-process 同步调度器）均已运行。
+**状态更新**：`feedling-io-db-test` 与 `feedling-io-db-prod` 于 2026-07-18 已运行；
+`feedling-io-db-pre` 于 2026-07-31 独立开通，不再复用 test 影子库。三套均使用
+WAL-G 备份；test/prod 已接双写 + in-process 同步调度器，pre 在首次应用部署验证前
+保持双写关闭。
 实际开通流程与踩坑记录见 `docs/TEE_POSTGRES_SHADOW_PROVISIONING.md`——
 **新开实例以那篇为准**。下列原始 runbook 清单保留作核对参考（对应
 `docs/superpowers/plans/2026-07-07-tee-pg-phase0-1-infra.md` 的 Task 编号）：
@@ -595,6 +597,20 @@ Record the new address + first-tx info in the table above.
 
 密码一律用 `openssl rand -hex`（十六进制无特殊字符）——引号 / `$` / 反引号等字符会
 破坏 ensure-roles 的 SQL 与 compose 环境注入。
+
+### Pre TEE Postgres（prod9）
+
+| | |
+|---|---|
+| CVM | `feedling-io-db-pre`，UUID `dc5c8593-0e44-43a9-b018-fe0431ff44d5` |
+| App ID | `ade3cabf133ec3e9ee6220265843c4ac993e1e63` |
+| Placement | prod9 node 18，`tdx.medium`（2 vCPU / 4GB），30GB ZFS |
+| Public PG | `ade3cabf133ec3e9ee6220265843c4ac993e1e63-5432s.dstack-pha-prod9.phala.network:443`（direct TLS） |
+| Backup | `s3://io-in-enclave-db/pre/wal-g`，pre 独立 libsodium key |
+| Schema baseline | `0009_provider_latency`，55 张 public 表（创建日） |
+| Deploy path | `Deploy Postgres CVM` workflow 的 `pre` lane，目标 ID 在 `deploy/pre-pg-cvm-id.txt` |
+| Migration | `TEE migrate` workflow 的 `pre` lane，owner DSN + verify-full CA |
+| App wiring | `PRE_TEE_DATABASE_URL` + `PRE_FEEDLING_TEE_DUAL_WRITE`；后者为空即停双写/回填 |
 
 ### 磁盘 sizing 依据（实测 2026-07-13，prod RDS）
 

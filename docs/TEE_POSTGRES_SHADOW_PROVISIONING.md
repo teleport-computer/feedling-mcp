@@ -3,7 +3,8 @@
 > 一台跑在 TEE CVM（dstack / Phala）里的 PostgreSQL，作为主库（RDS）的**明文影子**：
 > 主库写入时 best-effort 双写到这里，密文表经 enclave 解密后复制成明文，为「切读 →
 > 停 RDS → 拆加解密层」的迁移做准备。本文记录 `feedling-io-db-{test,prod}` 的实际
-> 开通流程 + 踩过的坑，参数化以便别的项目参考。
+> 开通流程 + 踩过的坑，并于 2026-07-31 用同一流程开通独立的
+> `feedling-io-db-pre`，参数化以便别的项目参考。
 >
 > 本仓相关构件：`deploy/postgres/`（镜像全家桶）、`deploy/docker-compose.phala.postgres.yaml`
 > （test/prod 共用 compose）、`backend/alembic_tee/`（明文 schema）、`backend/tee_shadow/`
@@ -51,7 +52,7 @@
 ## 2. 开通流程（逐步，参数化）
 
 约定占位：`<CVM>`=CVM 名（如 `feedling-io-db-prod`）、`<GW>`=网关域名（如
-`dstack-pha-prod9.phala.network`）、`<ENV>`=`test|prod`、`<IMG_TAG>`=pg 镜像 tag、
+`dstack-pha-prod9.phala.network`）、`<ENV>`=`test|pre|prod`、`<IMG_TAG>`=pg 镜像 tag、
 `<BUCKET>`=备份桶。
 
 ### 2.1 生成 TLS 证书（独立 CA，CA 私钥冷存）
@@ -129,7 +130,7 @@ phala deploy --cvm-id <CVM_ID> --compose compose.prod.yaml \
 
 ### 2.6 机密入库（GitHub Secrets）
 
-一整套 `<ENV_PREFIX>_*`（照 test 的 `TEST_*` 命名）：`PG_OWNER/APP/REPLICATOR/MONITORING_DB_PASSWORD`、
+一整套 `<ENV_PREFIX>_*`（照 test 的 `TEST_*` 命名，pre 使用 `PRE_*`）：`PG_OWNER/APP/REPLICATOR/MONITORING_DB_PASSWORD`、
 `PG_SERVER_CERT_B64/KEY_B64`、`WALG_S3_PREFIX/LIBSODIUM_KEY`、`PG_BACKUP_R2_ENDPOINT/ACCESS_KEY_ID/SECRET_ACCESS_KEY`、
 `TEE_DATABASE_URL`（app 角色 DSN）、`FEEDLING_TEE_DUAL_WRITE`、`PHALA_CLOUD_API_KEY`。
 `gh secret set <NAME> --repo <owner>/<repo>`（值从变量引用、别回显）。CVM ID 写进
@@ -262,18 +263,31 @@ ORDER BY table_name;
 `[verify]` 日志里的 `strict_fail=[...]` 列表，二者与上面这条 SQL 是同一份数据的
 不同视角，任选其一即可。
 
+### 2.10 pre 实例（2026-07-31）
+
+- CVM：`feedling-io-db-pre`，UUID `dc5c8593-0e44-43a9-b018-fe0431ff44d5`，
+  App ID `ade3cabf133ec3e9ee6220265843c4ac993e1e63`。
+- 拓扑：prod9 node 18，`tdx.medium`（2 vCPU / 4GB），30GB ZFS；不要省略
+  `--node-id 18`，否则 Phala 默认调度可能落到 prod7，导致 prod9 SAN 和直连域名失配。
+- 备份：`s3://io-in-enclave-db/pre/wal-g`，独立 libsodium key；首次 base backup 与
+  强制 WAL switch 已验证，`archived_count=1`、`failed_count=0`。
+- schema：`0009_provider_latency`，55 张 public 表；app/replicator 的 CRUD +
+  TRUNCATE 为 55/55，monitoring 读取业务表被拒。
+- 日常部署、迁移和监控分别走 `pg-deploy.yml`、`tee-migrate.yml`、
+  `pg-monitor.yml` 的 pre lane。应用双写在所有验证完成前保持关闭。
+
 ---
 
 ## 3. 关键决策与坑（血泪）
 
 - **独立 AppAuth，绝不复用主 app 合约** → 否则翻主 enclave 内容钥。`--kms phala` 下
   pg CVM 靠默认 KMS 授权、**不需要链上 addComposeHash**（和主 app 不同）。
-- **镜像 tag = 完整 40 位 `github.sha`**；镜像环境无关，test/prod 复用同一 tag。
+- **镜像 tag = 完整 40 位 `github.sha`**；镜像环境无关，test/pre/prod 复用同一 tag。
 - **WAL-G 可选起步**：`WALG_S3_PREFIX` 不设就不要求备份钥，空库先起来。但
   `archive_mode=on` + archive 失败会让 WAL 不回收 → **装数据前必须接上备份**。
 - **redeploy 会替换整份 env**：`--cvm-id` 更新时**所有既有机密都要重带**，只带新增会
   把 PG 密码清空、角色崩。
-- **同桶隔离 test/prod**：`s3://<BUCKET>/<ENV>/wal-g`，前缀不可互为父。
+- **同桶隔离 test/pre/prod**：`s3://<BUCKET>/<ENV>/wal-g`，前缀不可互为父。
 - **连接池陈旧 → SSL eof**：网关会静默掐断空闲连接；`min_size` 越大常驻热连接越多、
   越易变陈，下次大写（chat 行最大）撞死连接报 `unexpected eof` / `connection is lost`。
   修法（见 `tee_shadow/mirror.py` + `tee_replicator/worker.py`）：池 `max_lifetime`

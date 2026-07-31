@@ -161,6 +161,12 @@ services:
       # compose synthesis / build never aborts on an unset var; the backend
       # still fails fast at startup (db.py) if it ends up empty at runtime.
       DATABASE_URL: "${DATABASE_URL:-}"
+      # Dedicated pre TEE Postgres shadow. Both values use the encrypted env
+      # channel and do not affect compose_hash. Empty dual-write keeps the
+      # freshly provisioned shadow isolated until schema/backup verification
+      # has passed; TEE_DATABASE_URL uses the non-DDL app role.
+      TEE_DATABASE_URL: "${TEE_DATABASE_URL:-}"
+      FEEDLING_TEE_DUAL_WRITE: "${FEEDLING_TEE_DUAL_WRITE:-}"
       # Cloudflare R2 (S3-compatible) offload for the heavy frame ciphertext
       # (backend/object_storage.py). Injected via `phala deploy -e R2_*=...`
       # (encrypted env channel). Empty default = feature OFF (body_ct stays

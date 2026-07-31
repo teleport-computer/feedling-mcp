@@ -47,6 +47,18 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-31 — Pre 专用 TEE Postgres 开通并纳入发布链
+
+### [DONE] Pre 不再复用 test 影子库
+
+- 新建 `feedling-io-db-pre`（prod9 node 18、2 vCPU / 4GB、30GB），使用独立角色密码、
+  TLS CA/server 证书、WAL-G libsodium key 与 `pre/wal-g` 备份前缀。
+- schema 升至 `0009_provider_latency`（55 张表），app/replicator 的 CRUD + TRUNCATE
+  权限全量验证，monitoring 业务表负向权限验证通过。
+- 首次 base backup、direct-TLS、强制 WAL switch 与归档零失败均已验证。
+- pre compose/CI 接入独立 TEE DSN；PG deploy、TEE migrate、备份监控新增 pre lane。
+  双写默认关闭，等 pre 应用部署与连通验证后再开启回填。
+
 ## 2026-07-31 — V2 照片唤醒按需读取真实图片
 
 **[FIX] V2 模型调用 `photo_read(include_image=true)` 后，现在会看到安全的视觉观察文本，而不再只有照片元数据。**
