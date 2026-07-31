@@ -103,10 +103,17 @@ The two field bodies are separate shared encrypted envelopes; PostgreSQL and
 the TEE shadow see the same ciphertext document. Field character counts,
 state, disabled status, source-card counts, and generation/retry timestamps
 remain plaintext routing and observability metadata. A stale CAS loser must
-re-read and recompute rather than replaying its earlier result. This storage
-contract does not by itself enable profile prompt injection: turns continue to
-use the rollback-compatible summary until that later, default-off rollout is
-deployed.
+re-read and recompute rather than replaying its earlier result.
+
+When the default-off profile switch is enabled, a turn strictly reads that
+document and decrypts both fields together. Only an `ok`, non-disabled document
+whose two fields both validate replaces the rollback-compatible summary. The
+Memory and User fields are serialized into one early user-role block, labeled
+as model-derived untrusted data; they are never system instructions, and later
+verbatim conversation replay wins on conflict. Missing, pending, degraded,
+disabled, invalid, or undecryptable profiles retain the existing summary path.
+Any bounded-tail coverage-hole count is a separate late user-role data block,
+so it cannot perturb the stable profile prefix.
 
 Profile generation is a separate low-priority Runtime V2 job, alongside
 maintenance, capture, and dream rather than foreground Chat or wake work. The
@@ -121,9 +128,9 @@ The staged worker refreshes after a successful dream write, after Runtime V2
 cutover, and best-effort after Chat when a profile is missing, eligible for
 retry, or at least seven days old and the Garden's content-free source witness
 has changed. The seven-day floor is independent of the user's dream setting.
-The profile-generation switch remains off by default until the later prompt
-injection rollout. Managed Compose now explicitly enables capture and dream in
-the pooled `serve-worker`; their user-level consent gates remain independent.
+The profile switch remains off by default and gates both generation and prompt
+selection. Managed Compose now explicitly enables capture and dream in the
+pooled `serve-worker`; their user-level consent gates remain independent.
 
 An [independent resident consumer](/docs/workflows/chat#independent-resident-loop)
 uses the same encrypted queue-and-reply protocol but runs in infrastructure the
@@ -308,6 +315,12 @@ serialized deterministically before dynamic summary, tail, perception, and tool
 results. Provider adapters use route-bound cache affinity or provider-native
 cache controls/checkpoints where supported and normalize cache read/write/miss
 usage into whole-turn telemetry.
+
+An enabled, usable Memory/User profile forms a deterministic early prompt
+prefix after editable working memory. OpenAI Chat and Anthropic cache
+breakpoints prioritize that profile ahead of an older recent-user boundary;
+dynamic runtime context and coverage-hole notices are excluded from the stable
+profile checkpoint.
 
 Editable `/memory/WORKING.md` is encrypted persistent state, but it is pull-only
 through `workspace_read`, not silently injected into future prompts or cache

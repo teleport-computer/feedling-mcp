@@ -1242,6 +1242,10 @@ class TurnDeps:
     # user_id -> (all rendered Garden cards, exact card count). Unlike
     # read_memory_context this is fail-loud and rejects any truncated read.
     read_profile_cards: Callable[[str], tuple[str, int]] | None = None
+    # (user_id, summary, enabled=...) -> ProfilePromptSelection. Production
+    # performs a strict blob read and scoped enclave decrypt; any failure keeps
+    # the rollback-compatible summary and returns a content-free reason.
+    select_profile_for_turn: Callable[..., Any] | None = None
     # (user_id, job_id) -> due reminder content and backend-confirmed trigger
     # metadata. Plaintext remains in the scheduled-wake record; only bounded
     # task identity/state metadata may be attached to the visible activity.
@@ -3073,6 +3077,9 @@ def _make_build_messages_fn(
     mutation_recovery_active: bool = False,
     trusted_system_blocks: tuple[str, ...] = (),
     working_memory: str = "",
+    agent_memory: str = "",
+    user_profile: str = "",
+    coverage_hole_notice: str = "",
     provider_config: Any = None,
     temporal_context: dict[str, Any] | None = None,
     temporal_snapshot: dict[str, Any] | None = None,
@@ -3137,6 +3144,9 @@ def _make_build_messages_fn(
             mutation_recovery_active=mutation_recovery_active,
             trusted_system_blocks=(identity_block, *trusted_system_blocks),
             working_memory=working_memory,
+            agent_memory=agent_memory,
+            user_profile=user_profile,
+            coverage_hole_notice=coverage_hole_notice,
             temporal_context=_temporal_for(rendered_tail),
         )
 
@@ -4835,23 +4845,58 @@ async def _bound_materialized_summary(
     return bounded
 
 
-def _with_coverage_hole_notice(summary: str, hole_count: int) -> str:
+def _coverage_hole_notice(hole_count: int) -> str:
     """Disclose that older messages were dropped from the bounded prompt window.
 
     Option A serves a bounded recency tail when compaction is behind, leaving a
     gap between the summary and the recent messages. Stating it plainly stops the
     model from assuming the omitted span never happened; the durable facts remain
     in long-term memory, and the background maintenance compaction chain shrinks
-    the gap over time. Rendered into the existing summary/context block, so it
-    never enters the seq-exact tail machinery.
+    the gap over time. It is rendered as a separate untrusted data block after
+    replay, so it never mutates the stable profile/summary prefix or seq-exact
+    tail.
     """
-    notice = (
-        f"\n\n[Context note: {hole_count} earlier message(s) between the summary "
+    return (
+        f"{hole_count} earlier message(s) between the historical profile/summary "
         "above and the recent messages below are omitted here to fit the context "
         "window. Their durable facts are retained in long-term memory — ask the "
-        "user if you need older details.]"
+        "user if you need older details."
     )
-    return ((summary or "").rstrip() + notice).strip()
+
+
+async def _select_profile_prompt_for_turn(
+    *,
+    user_id: str,
+    summary: str,
+    deps: TurnDeps,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
+) -> "v2_profile_store.ProfilePromptSelection":
+    if deps.select_profile_for_turn is None:
+        return v2_profile_store.ProfilePromptSelection(summary=str(summary))
+    try:
+        selection = await asyncio.to_thread(
+            deps.select_profile_for_turn,
+            user_id,
+            summary,
+            enabled=_PROFILE_ENABLED,
+        )
+        if not isinstance(selection, v2_profile_store.ProfilePromptSelection):
+            raise TypeError("invalid profile prompt selection")
+    except Exception as exc:  # noqa: BLE001 — turn must retain summary fallback
+        selection = v2_profile_store.ProfilePromptSelection(
+            summary=str(summary),
+            fallback_reason=(
+                "selection_failed:" + type(exc).__name__.lower()
+            ),
+        )
+    if selection.fallback_reason:
+        await _record_trajectory(
+            trajectory_recorder,
+            "profile_prompt_fallback",
+            {"reason": selection.fallback_reason},
+            best_effort=True,
+        )
+    return selection
 
 
 async def _read_seq_adaptive_prompt_context(
@@ -4868,7 +4913,7 @@ async def _read_seq_adaptive_prompt_context(
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
     active_image_ids: set[str] | None = None,
     tail_cap: int | None = None,
-) -> tuple[str, list[dict], list[list[dict]], bool, int]:
+) -> tuple[str, list[dict], list[list[dict]], bool, int, str, str, str]:
     """Read one exact core plus summary-covered complete-turn replay.
 
     ``tail_cap`` (Option A / graceful degradation): when set, the verbatim tail
@@ -4971,31 +5016,44 @@ async def _read_seq_adaptive_prompt_context(
                 read_files=deps.read_files,
             )
             optional_tail_turns = _group_complete_turns(optional_rows)
-    summary = await _bound_materialized_summary(
-        user_id,
-        summary,
-        deps,
-        provider_config=provider_config,
-        enclave_sem=enclave_sem,
-        claimed_by=claimed_by,
-        job_id=job_id,
-        add_usage=add_usage,
+    profile_selection = await _select_profile_prompt_for_turn(
+        user_id=user_id,
+        summary=summary,
+        deps=deps,
         trajectory_recorder=trajectory_recorder,
     )
+    summary = profile_selection.summary
+    if not profile_selection.used_profile:
+        summary = await _bound_materialized_summary(
+            user_id,
+            summary,
+            deps,
+            provider_config=provider_config,
+            enclave_sem=enclave_sem,
+            claimed_by=claimed_by,
+            job_id=job_id,
+            add_usage=add_usage,
+            trajectory_recorder=trajectory_recorder,
+        )
     await _assert_prompt_tail_exact(
         user_id,
         watermark_seq=prompt_floor_seq,
         through_seq=through_seq,
         tail=tail,
     )
-    if coverage_hole_count > 0:
-        summary = _with_coverage_hole_notice(summary, coverage_hole_count)
     return (
         summary,
         tail,
         optional_tail_turns,
         tail_source_truncated,
         int(watermark_seq),
+        profile_selection.memory,
+        profile_selection.user,
+        (
+            _coverage_hole_notice(coverage_hole_count)
+            if coverage_hole_count > 0
+            else ""
+        ),
     )
 
 
@@ -6666,6 +6724,9 @@ async def _run_wake(
         legacy_context = deps.read_summary is not None and deps.read_tail is not None
         optional_tail_turns: list[list[dict]] = []
         tail_source_truncated = False
+        agent_memory = ""
+        user_profile = ""
+        coverage_hole_notice = ""
         wake_snapshot_seq = 0
         compact_through_seq = None
         if seq_context:
@@ -6700,6 +6761,9 @@ async def _run_wake(
                 optional_tail_turns,
                 tail_source_truncated,
                 watermark_seq,
+                agent_memory,
+                user_profile,
+                coverage_hole_notice,
             ) = await _read_seq_adaptive_prompt_context(
                 user_id=user_id,
                 deps=deps,
@@ -6737,17 +6801,27 @@ async def _run_wake(
                     user_id=user_id,
                     read_files=deps.read_files,
                 )
-            summary = await _bound_materialized_summary(
-                user_id,
-                summary,
-                deps,
-                provider_config=provider_config,
-                enclave_sem=enclave_sem,
-                claimed_by=claimed_by,
-                job_id=job_id,
-                add_usage=tm.add_call if tm is not None else None,
+            profile_selection = await _select_profile_prompt_for_turn(
+                user_id=user_id,
+                summary=summary,
+                deps=deps,
                 trajectory_recorder=trajectory_recorder,
             )
+            summary = profile_selection.summary
+            agent_memory = profile_selection.memory
+            user_profile = profile_selection.user
+            if not profile_selection.used_profile:
+                summary = await _bound_materialized_summary(
+                    user_id,
+                    summary,
+                    deps,
+                    provider_config=provider_config,
+                    enclave_sem=enclave_sem,
+                    claimed_by=claimed_by,
+                    job_id=job_id,
+                    add_usage=tm.add_call if tm is not None else None,
+                    trajectory_recorder=trajectory_recorder,
+                )
         if seq_context:
             # A wake is proactive work only while there is no unanswered user
             # input.  Keep the frozen prompt snapshot boundary separate from
@@ -7563,6 +7637,9 @@ async def _run_wake(
                 ),
                 trusted_system_blocks=trusted_system_blocks,
                 working_memory=working_memory,
+                agent_memory=agent_memory,
+                user_profile=user_profile,
+                coverage_hole_notice=coverage_hole_notice,
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,
                 optional_tail_turns=optional_tail_turns,
@@ -7603,6 +7680,9 @@ async def _run_wake(
                     optional_tail_turns,
                     tail_source_truncated,
                     watermark_seq,
+                    agent_memory,
+                    user_profile,
+                    coverage_hole_notice,
                 ) = await _read_seq_adaptive_prompt_context(
                     user_id=user_id,
                     deps=deps,
@@ -9632,6 +9712,9 @@ async def process_job(
         legacy_context = deps.read_summary is not None and deps.read_tail is not None
         optional_tail_turns: list[list[dict]] = []
         tail_source_truncated = False
+        agent_memory = ""
+        user_profile = ""
+        coverage_hole_notice = ""
         through_seq = 0
         compact_through_seq = None
         if seq_context:
@@ -9677,6 +9760,9 @@ async def process_job(
                     optional_tail_turns,
                     tail_source_truncated,
                     watermark_seq,
+                    agent_memory,
+                    user_profile,
+                    coverage_hole_notice,
                 ) = await _read_seq_adaptive_prompt_context(
                     user_id=user_id,
                     deps=deps,
@@ -9728,17 +9814,27 @@ async def process_job(
                         user_id=user_id,
                         read_files=deps.read_files,
                     )
-                summary = await _bound_materialized_summary(
-                    user_id,
-                    summary,
-                    deps,
-                    provider_config=provider_config,
-                    enclave_sem=enclave_sem,
-                    claimed_by=claimed_by,
-                    job_id=job_id,
-                    add_usage=tm.add_call,
+                profile_selection = await _select_profile_prompt_for_turn(
+                    user_id=user_id,
+                    summary=summary,
+                    deps=deps,
                     trajectory_recorder=trajectory_recorder,
                 )
+                summary = profile_selection.summary
+                agent_memory = profile_selection.memory
+                user_profile = profile_selection.user
+                if not profile_selection.used_profile:
+                    summary = await _bound_materialized_summary(
+                        user_id,
+                        summary,
+                        deps,
+                        provider_config=provider_config,
+                        enclave_sem=enclave_sem,
+                        claimed_by=claimed_by,
+                        job_id=job_id,
+                        add_usage=tm.add_call,
+                        trajectory_recorder=trajectory_recorder,
+                    )
             # Post-assembly hard assertion (D6): independent re-derivation,
             # not a reuse of `_ensure_prompt_coverage`'s return — see
             # `_assert_prompt_covers`'s docstring for why.
@@ -10817,6 +10913,9 @@ async def process_job(
                 mutation_recovery_active=(mutation_recovery_barrier is not None),
                 trusted_system_blocks=turn_trusted_system_blocks,
                 working_memory=working_memory,
+                agent_memory=agent_memory,
+                user_profile=user_profile,
+                coverage_hole_notice=coverage_hole_notice,
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,
                 optional_tail_turns=optional_tail_turns,
@@ -10865,6 +10964,9 @@ async def process_job(
                     optional_tail_turns,
                     tail_source_truncated,
                     watermark_seq,
+                    agent_memory,
+                    user_profile,
+                    coverage_hole_notice,
                 ) = await _read_seq_adaptive_prompt_context(
                     user_id=user_id,
                     deps=deps,

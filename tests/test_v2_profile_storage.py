@@ -540,6 +540,34 @@ def test_ok_profile_suppresses_summary_only_after_both_fields_decrypt():
     assert selection.user == "user-1"
 
 
+def test_disabled_ok_profile_keeps_summary_without_decrypting_fields():
+    doc = profile_store.build_profile_document(
+        "u-profile-disabled",
+        state="ok",
+        source=_source(1),
+        last_attempt=_attempt(),
+        memory_text="memory-disabled",
+        user_text="user-disabled",
+        disabled=True,
+        seal_text=_seal,
+    )
+
+    selection = profile_store.select_profile_for_turn(
+        "u-profile-disabled",
+        "- old summary",
+        enabled=True,
+        read_blob=lambda *_args: doc,
+        decrypt_envelope=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("disabled profile must not decrypt")
+        ),
+    )
+
+    assert selection == profile_store.ProfilePromptSelection(
+        summary="- old summary",
+        fallback_reason="disabled",
+    )
+
+
 def test_winning_cas_mirrors_only_ciphertext_to_real_tee_shadow(monkeypatch):
     uid = "u-profile-tee-shadow"
     _reset(uid)

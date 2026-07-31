@@ -3580,6 +3580,7 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_files=_read_files,
         read_memory_context=_read_memory_context,
         read_profile_cards=_read_profile_cards,
+        select_profile_for_turn=_select_agent_profile_for_turn,
         read_scheduled_wake_context=_read_scheduled_wake_context,
         read_pending_scheduled_wake_context=_read_pending_scheduled_wake_context,
         apply_memory_actions=_apply_memory_actions,
