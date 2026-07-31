@@ -108,6 +108,23 @@ contract does not by itself enable profile prompt injection: turns continue to
 use the rollback-compatible summary until that later, default-off rollout is
 deployed.
 
+Profile generation is a separate low-priority Runtime V2 job, alongside
+maintenance, capture, and dream rather than foreground Chat or wake work. The
+worker reads the complete eligible Memory Garden through a user-bound runtime
+token and fails loudly if the read-side response is truncated or incomplete.
+It sends that plaintext Garden view to the user's configured model provider,
+then seals the generated Memory/User fields before the compare-and-swap write.
+Generation failure only updates bounded retry metadata and fails the background
+job; it does not publish a Chat bubble or terminal turn error.
+
+The staged worker refreshes after a successful dream write, after Runtime V2
+cutover, and best-effort after Chat when a profile is missing, eligible for
+retry, or at least seven days old and the Garden's content-free source witness
+has changed. The seven-day floor is independent of the user's dream setting.
+The profile-generation switch remains off by default until the later prompt
+injection rollout. Managed Compose now explicitly enables capture and dream in
+the pooled `serve-worker`; their user-level consent gates remain independent.
+
 An [independent resident consumer](/docs/workflows/chat#independent-resident-loop)
 uses the same encrypted queue-and-reply protocol but runs in infrastructure the
 user or integrator controls instead of Feedling's hosted runner.
