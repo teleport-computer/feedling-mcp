@@ -166,6 +166,7 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
           CVM_ID: ${{ steps.cvm.outputs.id }}
           TEST_PHALA_TOKEN: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          PRE_PHALA_TOKEN: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
           PROD_PHALA_TOKEN: ${{ secrets.PHALA_CLOUD_API_KEY }}
         run: |
           UP=$(echo "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')
