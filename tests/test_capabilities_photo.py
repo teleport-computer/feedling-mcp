@@ -1,3 +1,4 @@
+import base64
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))  # noqa: E402
 
@@ -19,14 +20,37 @@ def test_read_requires_id():
     assert r.ok is False and r.error["code"] == "capability_invalid_input"
 
 
-def test_read_augments_with_image_meta_when_requested(monkeypatch):
+def test_read_carries_decrypted_pixels_when_requested(monkeypatch):
     monkeypatch.setattr(perception_read_core, "photo_content",
                         lambda store, pid: ({"id": "p1", "frame_id": "f9"}, 200))
     monkeypatch.setattr(screen_read_core, "frame_decrypt",
-                        lambda *a, **k: ScreenResult(status=200, raw_body=b"x", media_type="image/png"))
+                        lambda *a, **k: ScreenResult(
+                            status=200,
+                            raw_body=b"\xff\xd8photo-bytes",
+                            media_type="image/jpeg",
+                        ))
     r = cap_photo.read("STORE", params={"id": "p1", "include_image": True})
     assert r.ok is True
-    assert r.data["image_media_type"] == "image/png" and r.data["has_image"] is True
+    assert r.data["image_media_type"] == "image/jpeg"
+    assert r.data["has_image"] is True
+    assert base64.b64decode(r.data["image_b64"]) == b"\xff\xd8photo-bytes"
+
+
+def test_read_without_include_image_never_decrypts(monkeypatch):
+    monkeypatch.setattr(perception_read_core, "photo_content",
+                        lambda store, pid: ({"id": "p1", "frame_id": "f9"}, 200))
+    monkeypatch.setattr(
+        screen_read_core,
+        "frame_decrypt",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("metadata-only read must not decrypt pixels")
+        ),
+    )
+
+    r = cap_photo.read("STORE", params={"id": "p1"})
+
+    assert r.ok is True
+    assert "image_b64" not in r.data
 
 
 def test_recent_caps_large_photo_list(monkeypatch):
