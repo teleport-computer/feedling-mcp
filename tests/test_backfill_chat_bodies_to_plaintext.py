@@ -13,7 +13,7 @@ import object_storage  # noqa: E402
 
 
 def test_apply_is_rejected_before_any_database_or_r2_access(monkeypatch):
-    """缺少原子 pointer 协议时，--apply 必须在碰数据之前硬失败。"""
+    """缺 rollout 双闸时，--apply 必须在碰数据之前硬失败。"""
     monkeypatch.setattr(sys, "argv", ["backfill", "--apply"])
     monkeypatch.setattr(
         tool, "_rows_to_process",
@@ -24,6 +24,18 @@ def test_apply_is_rejected_before_any_database_or_r2_access(monkeypatch):
         tool.main()
 
     assert exc.value.code == 2
+
+
+def test_apply_double_gate_can_enter_without_touching_rows(monkeypatch):
+    monkeypatch.setenv(tool._APPLY_ENV, "1")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["backfill", "--apply", "--allow-plaintext-r2-rewrite"],
+    )
+    monkeypatch.setattr(tool, "_iter_rows", lambda *_a, **_kw: iter(()))
+
+    assert tool.main() == 0
 
 
 def test_inventory_refuses_foreign_pointer(monkeypatch):

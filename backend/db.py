@@ -5224,6 +5224,21 @@ _CHAT_BODY_CAS_PREDICATE = " AND ".join(
     f"(doc->'{field}') IS NOT DISTINCT FROM %s"
     for field in _CHAT_BODY_CAS_FIELDS
 )
+_CHAT_POINTER_REPLACED_FIELDS = (
+    "body_ct",
+    "body_b64",
+    "body",
+    "body_key",
+    "body_ct_len",
+    "body_object_format",
+    "body_size_bytes",
+    "body_sha256",
+    "nonce",
+    "K_user",
+    "K_enclave",
+    "enclave_pk_fpr",
+    "content_pk_fpr",
+)
 
 
 class ChatPointerReplayConflict(RuntimeError):
@@ -6566,6 +6581,275 @@ def _offload_chat_body_after_commit(
         # The upload guard was committed before PUT. Never perform network
         # cleanup on this write path: the isolated cleanup worker owns retries,
         # including ambiguous PUT/COMMIT outcomes.
+
+
+def migrate_chat_r2_pointer_to_plaintext(
+    user_id: str,
+    *,
+    table: str,
+    item_id: str | int,
+    old_body_key: str,
+    storage_generation: int,
+    plaintext: bytes,
+    content_type: str,
+) -> bool:
+    """Atomically replace one sealed R2 pointer with a plaintext-v1 pointer.
+
+    The plaintext is written to a fresh private key under an upload guard.  A
+    successful database CAS removes that guard in the same transaction; the
+    existing row-retirement trigger durably queues the old key.  Any failure or
+    CAS loss leaves the new-key guard intact for the normal cleanup worker.
+
+    ``table`` is ``"live"`` (``item_id`` = msg_id) or ``"archive"``
+    (``item_id`` = source_seq).  Archive replacement uses delete+insert so the
+    immutable UPDATE trigger remains load-bearing.
+    """
+    if table not in ("live", "archive"):
+        raise ValueError("table must be live or archive")
+    if not isinstance(plaintext, bytes):
+        raise TypeError("plaintext must be bytes")
+    if content_type not in _R2_OFFLOAD_CONTENT_TYPES:
+        raise ValueError("chat plaintext R2 migration requires file/image")
+    if not object_storage.chat_key_owned_by(old_body_key, user_id):
+        raise ValueError("chat plaintext R2 migration foreign body key")
+
+    generation = int(storage_generation)
+    upload_version = object_storage.new_chat_body_upload_version()
+    new_key = object_storage.chat_body_key(
+        user_id,
+        str(item_id) if table == "live" else "",
+        content_type,
+        upload_version=upload_version,
+        storage_generation=generation,
+    )
+    if table == "archive":
+        # Archive item_id is source_seq, not msg_id. Resolve the current msg_id
+        # under the initial row lock before deriving the destination key.
+        new_key = ""
+
+    def _select_current(cur, *, for_update: bool = True):
+        suffix = " FOR UPDATE" if for_update else ""
+        if table == "live":
+            cur.execute(
+                "SELECT msg_id,doc FROM chat_messages "
+                "WHERE user_id=%s AND msg_id=%s AND storage_generation=%s "
+                "AND doc->>'body_key'=%s "
+                "AND COALESCE(doc->>'body_object_format','sealed_v1')='sealed_v1' "
+                "AND doc ? 'K_enclave'"
+                + suffix,
+                (user_id, str(item_id), generation, old_body_key),
+            )
+        else:
+            cur.execute(
+                "SELECT msg_id,doc FROM chat_message_archive "
+                "WHERE user_id=%s AND source_seq=%s AND storage_generation=%s "
+                "AND doc->>'body_key'=%s "
+                "AND COALESCE(doc->>'body_object_format','sealed_v1')='sealed_v1' "
+                "AND doc ? 'K_enclave'"
+                + suffix,
+                (user_id, int(item_id), generation, old_body_key),
+            )
+        return cur.fetchone()
+
+    # S0 -> S1: validate the authoritative row/tier and commit a durable guard.
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                current_generation = _lock_chat_r2_lifecycle_on_cursor(cur, user_id)
+                if current_generation != generation:
+                    return False
+                cur.execute(
+                    "SELECT 1 FROM users WHERE user_id=%s "
+                    "AND doc->>'content_encryption'='off'",
+                    (user_id,),
+                )
+                if cur.fetchone() is None:
+                    return False
+                current = _select_current(cur)
+                if current is None:
+                    return False
+                current_msg_id = str(current[0])
+                if not new_key:
+                    new_key = object_storage.chat_body_key(
+                        user_id,
+                        current_msg_id,
+                        content_type,
+                        upload_version=upload_version,
+                        storage_generation=generation,
+                    )
+                _enqueue_chat_r2_cleanup_on_cursor(
+                    cur,
+                    user_id,
+                    new_key,
+                    generation,
+                    "upload_guard",
+                )
+
+    pointer = {
+        "body_key": new_key,
+        "body_object_format": "plaintext_v1",
+        "body_size_bytes": len(plaintext),
+        "body_sha256": hashlib.sha256(plaintext).hexdigest(),
+    }
+    promoted = False
+    with get_pool().connection() as conn:
+        conn.execute(
+            "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+            (new_key,),
+        )
+        try:
+            # Revalidate after the committed guard and before network I/O.
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    current_generation = _lock_chat_r2_lifecycle_on_cursor(
+                        cur, user_id,
+                    )
+                    cur.execute(
+                        "SELECT 1 FROM chat_r2_cleanup "
+                        "WHERE body_key=%s AND user_id=%s FOR UPDATE",
+                        (new_key, user_id),
+                    )
+                    guard_exists = cur.fetchone() is not None
+                    cur.execute(
+                        "SELECT 1 FROM users WHERE user_id=%s "
+                        "AND doc->>'content_encryption'='off'",
+                        (user_id,),
+                    )
+                    tier_allows = cur.fetchone() is not None
+                    row_matches = _select_current(cur) is not None
+                    upload_allowed = (
+                        guard_exists
+                        and tier_allows
+                        and row_matches
+                        and current_generation == generation
+                    )
+            if not upload_allowed:
+                return False
+
+            object_storage.put_chat_body_bytes(
+                user_id,
+                current_msg_id,
+                plaintext,
+                content_type,
+                upload_version=upload_version,
+                storage_generation=generation,
+            )
+
+            # S2 -> S3: CAS pointer and delete the new-key guard atomically.
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    current_generation = _lock_chat_r2_lifecycle_on_cursor(
+                        cur, user_id,
+                    )
+                    cur.execute(
+                        "SELECT 1 FROM chat_r2_cleanup "
+                        "WHERE body_key=%s AND user_id=%s FOR UPDATE",
+                        (new_key, user_id),
+                    )
+                    guard_exists = cur.fetchone() is not None
+                    cur.execute(
+                        "SELECT 1 FROM users WHERE user_id=%s "
+                        "AND doc->>'content_encryption'='off'",
+                        (user_id,),
+                    )
+                    tier_allows = cur.fetchone() is not None
+                    if (
+                        not guard_exists
+                        or not tier_allows
+                        or current_generation != generation
+                    ):
+                        return False
+
+                    if table == "live":
+                        subtraction = " ".join(
+                            f"- '{field}'" for field in _CHAT_POINTER_REPLACED_FIELDS
+                        )
+                        cur.execute(
+                            "UPDATE chat_messages SET doc = (doc "
+                            f"{subtraction}) || %s "
+                            "WHERE user_id=%s AND msg_id=%s "
+                            "AND storage_generation=%s "
+                            "AND doc->>'body_key'=%s "
+                            "AND COALESCE(doc->>'body_object_format','sealed_v1')="
+                            "'sealed_v1' AND doc ? 'K_enclave' RETURNING 1",
+                            (
+                                Jsonb(pointer),
+                                user_id,
+                                str(item_id),
+                                generation,
+                                old_body_key,
+                            ),
+                        )
+                        promoted = cur.fetchone() is not None
+                    else:
+                        # Lock/current-shape check precedes DELETE. DELETE
+                        # RETURNING supplies every immutable column so reinsertion
+                        # cannot accidentally regenerate timestamps/generations.
+                        if _select_current(cur) is None:
+                            promoted = False
+                        else:
+                            cur.execute(
+                                "DELETE FROM chat_message_archive "
+                                "WHERE user_id=%s AND source_seq=%s "
+                                "AND storage_generation=%s "
+                                "AND doc->>'body_key'=%s "
+                                "RETURNING user_id,source_seq,msg_id,ts,doc,"
+                                "storage_generation,clear_generation,cleared_at",
+                                (
+                                    user_id,
+                                    int(item_id),
+                                    generation,
+                                    old_body_key,
+                                ),
+                            )
+                            retired = cur.fetchone()
+                            if retired is not None:
+                                new_doc = dict(retired[4])
+                                for field in _CHAT_POINTER_REPLACED_FIELDS:
+                                    new_doc.pop(field, None)
+                                new_doc.update(pointer)
+                                cur.execute(
+                                    "INSERT INTO chat_message_archive "
+                                    "(user_id,source_seq,msg_id,ts,doc,"
+                                    "storage_generation,clear_generation,cleared_at) "
+                                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                                    (
+                                        retired[0],
+                                        retired[1],
+                                        retired[2],
+                                        retired[3],
+                                        Jsonb(new_doc),
+                                        retired[5],
+                                        retired[6],
+                                        retired[7],
+                                    ),
+                                )
+                                promoted = True
+                    if promoted:
+                        cur.execute(
+                            "DELETE FROM chat_r2_cleanup "
+                            "WHERE body_key=%s AND user_id=%s",
+                            (new_key, user_id),
+                        )
+        finally:
+            conn.execute(
+                "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                (new_key,),
+            )
+
+    if promoted:
+        from tee_shadow import mirror
+
+        tee_table = (
+            "chat_messages" if table == "live" else "chat_message_archive"
+        )
+        mirror.mark_pending(
+            user_id,
+            tee_table,
+            str(item_id),
+            "requeue_r2_plaintext_pointer",
+        )
+    return promoted
 
 
 def _chat_insert_on_cursor(
