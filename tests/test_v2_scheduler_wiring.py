@@ -103,12 +103,18 @@ def test_existing_v2_schedule_backfill_is_idempotent(monkeypatch):
     monkeypatch.setattr(
         serve_worker.admin_core,
         "list_runtime_modes",
-        lambda: {"db_action_v2": ["new", "existing"]},
+        lambda: {"db_action_v2": ["new", "null-heartbeat", "existing"]},
     )
     monkeypatch.setattr(
         jobs_store,
         "get_wake_schedule",
-        lambda uid: {"user_id": uid} if uid == "existing" else None,
+        lambda uid: (
+            {"user_id": uid, "next_heartbeat_at": 456.0}
+            if uid == "existing"
+            else {"user_id": uid, "next_heartbeat_at": None}
+            if uid == "null-heartbeat"
+            else None
+        ),
     )
     writes = []
     monkeypatch.setattr(
@@ -117,8 +123,11 @@ def test_existing_v2_schedule_backfill_is_idempotent(monkeypatch):
         lambda uid, **kwargs: writes.append((uid, kwargs)),
     )
 
-    assert serve_worker._seed_existing_v2_wake_schedules(now=123.0) == 1
-    assert writes == [("new", {"next_heartbeat_at": 123.0})]
+    assert serve_worker._seed_existing_v2_wake_schedules(now=123.0) == 2
+    assert writes == [
+        ("new", {"next_heartbeat_at": 123.0}),
+        ("null-heartbeat", {"next_heartbeat_at": 123.0}),
+    ]
 
 
 # --- backlog scan loop wiring ----------------------------------------------

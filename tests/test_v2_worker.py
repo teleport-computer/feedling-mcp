@@ -40,6 +40,9 @@ def _clean_agent_jobs_table(monkeypatch):
     # provider-backed fallback; rollout-mode behavior lives in the dedicated
     # deterministic suite.
     monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
+    # Exact successor/enqueue assertions predate the independent profile lane.
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
+    monkeypatch.setattr(worker, "_PROFILE_ENABLED", False)
     with db.get_pool().connection() as conn:
         conn.execute("DELETE FROM agent_jobs")
     yield

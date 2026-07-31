@@ -198,6 +198,7 @@ jobs:
         run: |
           python -m pytest \
             tests/test_ci_image_tag_width.py \
+            tests/test_deploy_yaml_strict.py \
             tests/test_hosted_runtime_policy.py \
             tests/test_dual_runtime_coexistence.py \
             tests/test_dual_runtime_send_routing.py \
@@ -250,15 +251,16 @@ jobs:
             tests/test_v2_extraction_memory_integration.py \
             -v
 
-  # The rollout switch is default-off, so ordinary CI cannot exercise its
-  # TurnDeps contract. Keep both states live until M6 removes the switch.
+  # Both rollout switches are default-off, so ordinary CI cannot exercise
+  # their combined contract. Keep every state pair live until M6 removes them.
   runtime-v2-compaction-matrix:
-    name: Runtime V2 compaction (deterministic=${{ matrix.deterministic }})
+    name: Runtime V2 rollout (det=${{ matrix.deterministic }}, profile=${{ matrix.profile_enabled }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         deterministic: ["0", "1"]
+        profile_enabled: ["0", "1"]
     services:
       postgres:
         image: postgres:16
@@ -290,18 +292,33 @@ jobs:
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
           FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: "${{ matrix.deterministic }}"
+          FEEDLING_V2_PROFILE_ENABLED: "${{ matrix.profile_enabled }}"
         run: |
           python -m pytest \
+            tests/test_chat_send_v2_enqueue.py \
+            tests/test_dual_runtime_flip_no_loss.py \
+            tests/test_dual_runtime_send_routing.py \
+            tests/test_hosted_runtime_policy.py \
+            tests/test_model_api_chat_send_routing.py \
+            tests/test_provider_prompt_cache.py \
             tests/test_v2_adaptive_tail.py \
             tests/test_v2_compaction.py \
             tests/test_v2_compaction_integration.py \
             tests/test_v2_compaction_cas_requeue.py \
+            tests/test_v2_context.py \
             tests/test_v2_p0_history_safety.py \
+            tests/test_v2_profile_lane.py \
+            tests/test_v2_profile_prompt.py \
+            tests/test_v2_profile_refresh.py \
+            tests/test_v2_profile_storage.py \
+            tests/test_v2_reconcile.py \
+            tests/test_v2_reconcile_sweeper.py \
             tests/test_v2_serve_worker.py \
             tests/test_v2_summary_frontier_store.py \
             tests/test_v2_summary_watermark_seq.py \
             tests/test_v2_wake_worker.py \
             tests/test_v2_worker.py \
+            tests/test_v2_worker_tool_loop.py \
             tests/test_v2_deterministic_compaction.py \
             -v
 

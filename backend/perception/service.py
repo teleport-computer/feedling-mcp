@@ -12,8 +12,8 @@ All the generic machinery driven by catalog.py:
   - generic collection ingest/read kept for legacy Tier 2 health clients.
 
 No business logic lives in the assembly layer. The only upward coupling is a
-lazy import in _fire_wake_event_v2() (core.store / proactive.service) to
-enqueue a compatibility proactive job during cutover.
+lazy import in _fire_wake_event_v2(): resident users enqueue the compatibility
+proactive job, while pooled Runtime V2 users enqueue an ``agent_jobs`` wake.
 """
 from __future__ import annotations
 
@@ -724,6 +724,7 @@ def _submit_wake_event_v2_compat(event) -> None:
     store.append_event(event.user_id, {
         "cap": "runtime_v2",
         "type": "wake",
+        "wake_id": str(event.wake_id or ""),
         "source": event.source,
         "trigger": event.trigger,
         "change_digest": event.change_digest,
@@ -741,9 +742,42 @@ def _fire_wake_event_v2(event) -> None:
     try:
         from core import store as core_store  # lazy
         from core import util as core_util  # lazy
+        from core import wake_bus as core_wake_bus  # lazy
+        from hosted import config_store as hosted_config_store  # lazy
+        from model_api_runtime.v2 import jobs_store  # lazy
         from proactive import service as proactive_service  # lazy
         s = core_store.get_store(event.user_id)
         if not event.manual and not s.proactive_activation_ready():
+            return
+        # Strict fence before selecting the queue. A failed control-plane read
+        # must not silently strand a V2 event in resident ``proactive_jobs``.
+        runtime_mode = hosted_config_store.get_hosted_runtime_mode_strict(s)
+        if runtime_mode == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+            job_id, _ = jobs_store.enqueue_job_with_context_log(
+                event.user_id,
+                "heartbeat",
+                reason=str(event.trigger or event.source or "perception_event")[:120],
+                trace_id=str(event.wake_id or "")[:160] or None,
+                context_stream=store.V2_WAKE_CONTEXT_STREAM,
+                context_doc={
+                    "wake_id": str(event.wake_id or "")[:160],
+                    "source": str(event.source or "")[:120],
+                    "trigger": str(event.trigger or "")[:120],
+                    "change_digest": str(event.change_digest or "")[:2000],
+                    "origin_refs": [
+                        str(ref)[:200]
+                        for ref in list(event.origin_refs or ())[:10]
+                    ],
+                    "presence_hints": dict(event.presence_hints or {}),
+                    "created_at": float(event.created_at or _now()),
+                },
+                context_ts=float(event.created_at or _now()),
+            )
+            store.trim_v2_wake_context(event.user_id)
+            # A coalesced pending job may have been discovered only through a
+            # slow poll. Notify after every successful association so the new
+            # context is visible promptly; duplicate NOTIFY is harmless.
+            core_wake_bus.notify("v2_jobs", event.user_id)
             return
         job = {
             "job_id": core_util._new_public_id("pj"),
