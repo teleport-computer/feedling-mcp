@@ -9017,11 +9017,20 @@ def model_api_credential_create(user_id: str, *, provider: str, base_url: str,
 
 
 def model_api_credential_update(user_id: str, credential_id: str, *,
+                               provider: str | None = None,
+                               base_url: str | None = None,
                                label: str | None = None,
                                api_key_envelope: dict | None = None,
                                api_key_hint: str | None = None,
                                supports_responses: bool | None = None) -> bool:
+    """Update one credential and invalidate visual proof when its target changes."""
     sets, params = [], []
+    if provider is not None:
+        sets.append("provider = %s")
+        params.append(provider)
+    if base_url is not None:
+        sets.append("base_url = %s")
+        params.append(base_url)
     if label is not None:
         sets.append("label = %s")
         params.append(label)
@@ -9041,12 +9050,29 @@ def model_api_credential_update(user_id: str, credential_id: str, *,
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
+                prior_identity = None
+                if provider is not None or base_url is not None:
+                    prior_identity = conn.execute(
+                        "SELECT provider, base_url FROM model_api_credentials "
+                        "WHERE user_id = %s AND id = %s FOR UPDATE",
+                        (user_id, credential_id),
+                    ).fetchone()
                 cur = conn.execute(
                     f"UPDATE model_api_credentials SET {', '.join(sets)} "
                     "WHERE user_id = %s AND id = %s",
                     tuple(params),
                 )
-                if api_key_envelope is not None and cur.rowcount > 0:
+                identity_changed = bool(
+                    prior_identity
+                    and (
+                        (provider is not None and provider != prior_identity[0])
+                        or (base_url is not None and base_url != prior_identity[1])
+                    )
+                )
+                if (
+                    (api_key_envelope is not None or identity_changed)
+                    and cur.rowcount > 0
+                ):
                     conn.execute(
                         "UPDATE model_api_routes SET "
                         "vision_test_status = 'untested', "

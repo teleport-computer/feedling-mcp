@@ -1228,6 +1228,15 @@ def _model_api_route_summaries(user_id: str) -> list[dict]:
             "purpose": purposes,
             "provider": str(route.get("provider") or "")[:80],
             "model": str(route.get("model") or "")[:160],
+            "vision_test_status": str(
+                route.get("vision_test_status") or "untested"
+            )[:40],
+            "last_vision_test_error": str(
+                route.get("last_vision_test_error") or ""
+            )[:300],
+            "last_vision_test_at": str(
+                route.get("last_vision_test_at") or ""
+            )[:40],
             "last_runtime_error_class": str(
                 route.get("last_runtime_error_class") or ""
             )[:160],

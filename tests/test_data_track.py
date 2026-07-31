@@ -1016,6 +1016,9 @@ def test_admin_route_and_notice_summary_helpers_are_explicit_allowlists(monkeypa
             "is_vision": True,
             "provider": "openrouter",
             "model": "vision/model-test",
+            "vision_test_status": "unsupported",
+            "last_vision_test_error": "v" * 350,
+            "last_vision_test_at": "2026-07-31T19:59:00Z",
             "last_runtime_error_class": "provider_transient",
             "last_runtime_error": "vision_model_unavailable",
             "updated_at": "2026-07-31T20:00:00Z",
@@ -1051,6 +1054,9 @@ def test_admin_route_and_notice_summary_helpers_are_explicit_allowlists(monkeypa
         "purpose": ["chat", "vision"],
         "provider": "openrouter",
         "model": "vision/model-test",
+        "vision_test_status": "unsupported",
+        "last_vision_test_error": "v" * 300,
+        "last_vision_test_at": "2026-07-31T19:59:00Z",
         "last_runtime_error_class": "provider_transient",
         "last_runtime_error": "vision_model_unavailable",
         "updated_at": "2026-07-31T20:00:00Z",
@@ -1083,6 +1089,12 @@ def test_detail_payload_exposes_content_free_route_errors_and_notice_summaries(c
         test_status="ok",
     )
     assert db.model_api_route_set_vision(user_id, route_id)
+    assert db.model_api_route_mark_vision_test(
+        user_id,
+        route_id,
+        status="unsupported",
+        error="v" * 350,
+    )
     assert db.model_api_route_mark_runtime_error(
         user_id,
         error="vision_model_unavailable",
@@ -1117,6 +1129,9 @@ def test_detail_payload_exposes_content_free_route_errors_and_notice_summaries(c
         "purpose": ["chat", "vision"],
         "provider": "openrouter",
         "model": "vision/model-test",
+        "vision_test_status": "unsupported",
+        "last_vision_test_error": "v" * 300,
+        "last_vision_test_at": row["model_api_routes"][0]["last_vision_test_at"],
         "last_runtime_error_class": "provider_transient",
         "last_runtime_error": "vision_model_unavailable",
         "updated_at": row["model_api_routes"][0]["updated_at"],
@@ -1125,6 +1140,9 @@ def test_detail_payload_exposes_content_free_route_errors_and_notice_summaries(c
         "purpose",
         "provider",
         "model",
+        "vision_test_status",
+        "last_vision_test_error",
+        "last_vision_test_at",
         "last_runtime_error_class",
         "last_runtime_error",
         "updated_at",

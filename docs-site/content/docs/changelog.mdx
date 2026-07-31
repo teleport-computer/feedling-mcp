@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Visual capability checks no longer misclassify truncated thinking-model
+  replies as proof of incompatibility.** Hosted provider probes now use a
+  larger model-agnostic output budget. An empty reply, or one with no color
+  evidence, records a retryable failed check rather than an unsupported
+  verdict; a non-empty, demonstrably incorrect color answer remains
+  unsupported. Changing a saved credential's provider or endpoint invalidates
+  its prior visual verdict, and per-user admin detail now exposes bounded
+  visual-test status, error, and timestamp metadata without endpoint URLs.
+
 - **Hosted visual failures are easier to diagnose without exposing user
   content.** Per-user admin detail now includes bounded model-route runtime
   error metadata and the newest 20 notice summaries through explicit
