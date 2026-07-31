@@ -34,6 +34,17 @@ change must not be interpreted as an API guarantee.
   explicitly enable capture and dream in `serve-worker`. Profile generation
   and injection stay default-off under the same worker switch.
 
+- **Runtime V2 restores proactive presence and memory maintenance.** Ambient
+  heartbeats no longer require screen broadcasting to be active: an enabled,
+  activated companion may wake for a presence turn while screen sharing is
+  off, while the ambient consent switch still blocks the lane. Perception
+  events such as photo, arrival, and unlock changes now enter the pooled V2
+  job queue instead of the resident-only legacy queue, and their bounded
+  trigger context follows the wake as untrusted runtime data so the turn can
+  respond to the actual change. The pooled worker also runs the independently
+  consent-gated Memory Capture and Dream producers; each fleet lane remains
+  independently reversible through deployment configuration.
+
 - **Encrypted Runtime V2 profile storage is staged for the bounded
   Memory/User rollout.** Both fields share one `v2_agent_profile` CAS document
   but remain separate shared encrypted envelopes. PostgreSQL and the TEE shadow

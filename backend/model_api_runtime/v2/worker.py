@@ -1250,6 +1250,9 @@ class TurnDeps:
     # metadata. Plaintext remains in the scheduled-wake record; only bounded
     # task identity/state metadata may be attached to the visible activity.
     read_scheduled_wake_context: Callable[[str, int], list[dict]] | None = None
+    # (user_id, job_id) -> bounded perception events routed into this heartbeat
+    # job. These are untrusted runtime observations, never system instructions.
+    read_perception_wake_context: Callable[[str, int], list[dict]] | None = None
     # Pending timer identity lets follow-ups use a backend-confirmed wake_id.
     read_pending_scheduled_wake_context: Callable[[str], dict] | None = None
     # (user_id, actions) -> result dict：把抽取产出的 memory.add/memory.supersede action 落库
@@ -6652,9 +6655,10 @@ async def _run_wake(
 
     prompt 组装：读 summary+tail（同 chat 路径的 D1 读法）+ 固定的 `_WAKE_NUDGE`。
     `system_prompt`：`_SCREEN_WATCH_SYSTEM_PROMPT`（screen_watch lane）或
-    `_WAKE_SYSTEM_PROMPT`（其余三条 wake lane）。screen_watch 的 `screen_recent` 预取
-    结果通过 `_make_build_messages_fn` 的 `extra_context` 参数（复用
-    `context.action_context_str` 的渲染）注入——它是回合开始时取一次的静态
+    `_WAKE_SYSTEM_PROMPT`（其余三条 wake lane）。screen_watch 的 `screen_recent`、
+    普通 wake 的 perception snapshot，以及由感知事件路由进 heartbeat job 的触发上下文，
+    都通过 `_make_build_messages_fn` 的 `extra_context` 参数（复用
+    `context.action_context_str` 的渲染）注入。它们是回合开始时取一次的低信任静态
     grounding，不随 tool-loop 轮次增长，跟 `prior_tool_results`（每轮动态积累的工具
     观测）是两回事。
     """
@@ -6845,11 +6849,25 @@ async def _run_wake(
                 pending_check_through_seq,
             )
             if base_prompt_user_frontier > wake_reply_cursor_seq:
-                completed = await asyncio.to_thread(
-                    jobs_store.mark_completed,
-                    job_id,
-                    claimed_by=claimed_by,
-                )
+                successor_id = None
+                if (
+                    lane == "heartbeat"
+                    and deps.read_perception_wake_context is not None
+                ):
+                    completed, successor_id = await asyncio.to_thread(
+                        jobs_store.finish_wake_job,
+                        job_id,
+                        claimed_by=claimed_by,
+                        observed_generation=observed_generation,
+                        context_stream="v2_perception_wake_context",
+                        consumed_context_seq=0,
+                    )
+                else:
+                    completed = await asyncio.to_thread(
+                        jobs_store.mark_completed,
+                        job_id,
+                        claimed_by=claimed_by,
+                    )
                 if not completed:
                     raise LostJobLease(
                         "wake job ownership lost while yielding to chat input"
@@ -6866,6 +6884,9 @@ async def _run_wake(
         wake_nudge = _WAKE_NUDGE
         wake_system_prompt = _WAKE_SYSTEM_PROMPT
         scheduled_activity_events: list[dict] = []
+        perception_wake_context: list[dict] = []
+        wake_observed_generation = observed_generation
+        consumed_perception_context_seq = 0
         if lane == "scheduled" and deps.read_scheduled_wake_context is not None:
             scheduled_context: list[dict] = []
             # The scheduler notifies after associating the records, but a worker
@@ -6911,6 +6932,46 @@ async def _run_wake(
                 wake_nudge = (
                     "The following user-scheduled reminders are due now:\n"
                     + "\n".join(f"- {note}" for note in scheduled_notes)
+                )
+        elif lane == "heartbeat" and deps.read_perception_wake_context is not None:
+            # The producer attaches context before notifying, but a polling
+            # worker can claim the job between enqueue and association.
+            for attempt in range(3):
+                perception_wake_context = await asyncio.to_thread(
+                    deps.read_perception_wake_context,
+                    user_id,
+                    int(job_id),
+                )
+                if perception_wake_context or attempt == 2:
+                    break
+                await asyncio.sleep(0.05)
+            if perception_wake_context:
+                prompt_context: list[dict] = []
+                for raw_item in perception_wake_context[:10]:
+                    if not isinstance(raw_item, dict):
+                        continue
+                    item = dict(raw_item)
+                    try:
+                        consumed_perception_context_seq = max(
+                            consumed_perception_context_seq,
+                            int(item.pop("_context_seq", 0) or 0),
+                        )
+                        wake_observed_generation = max(
+                            wake_observed_generation,
+                            int(item.pop("_input_generation", 0) or 0),
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        item.pop("_context_seq", None)
+                        item.pop("_input_generation", None)
+                    prompt_context.append(item)
+                perception_wake_context = prompt_context
+                # Keep event-controlled text out of the authoritative nudge.
+                # The actual digest/origins are rendered below as explicitly
+                # untrusted runtime data.
+                wake_nudge = (
+                    "A recent perception change may be worth responding to. "
+                    "Use the untrusted runtime context below, and stay silent "
+                    "if it is not meaningful."
                 )
         temporal_snapshot = await _capture_turn_temporal_snapshot(
             user_id=user_id,
@@ -6959,6 +7020,14 @@ async def _run_wake(
             screen_results = await _perception_grounding_results(
                 store, runtime_token=token, enclave_sem=enclave_sem
             )
+        if perception_wake_context:
+            if screen_results is None:
+                screen_results = {}
+            screen_results["perception_wake"] = [
+                {"ok": True, "data": item}
+                for item in perception_wake_context[:10]
+                if isinstance(item, dict)
+            ]
 
         # Pin effects to the generation admitted/claimed for this job, never a
         # fresh read. A resident->v2 ABA during a long provider call can leave
@@ -7387,13 +7456,13 @@ async def _run_wake(
                 if consumed_seq is not None:
                     payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
                         "claimed_by": claimed_by,
-                        "input_generation": observed_generation,
+                        "input_generation": wake_observed_generation,
                         "through_seq": consumed_seq,
                     }
                 elif final:
                     payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
                         "claimed_by": claimed_by,
-                        "input_generation": observed_generation,
+                        "input_generation": wake_observed_generation,
                         "observed_user_seq": int(cursor_box["seq"]),
                     }
                 else:
@@ -7575,6 +7644,15 @@ async def _run_wake(
                     status == "discarded"
                     and last_error == v2_effect_outbox.FINAL_REPLY_INPUT_ADVANCED
                 ):
+                    if (
+                        lane == "heartbeat"
+                        and deps.read_perception_wake_context is not None
+                    ):
+                        # A perception event landed after this prompt's
+                        # generation fence. Suppress the now-stale proactive
+                        # bubble; successor-aware finalization below transfers
+                        # the unread context to a fresh heartbeat job.
+                        return
                     raise v2_tool_loop.FinalReplySuperseded()
                 if (
                     status == "discarded"
@@ -7784,12 +7862,34 @@ async def _run_wake(
                 )
             raise
 
-        await asyncio.to_thread(
-            jobs_store.mark_completed,
-            job_id,
-            claimed_by=claimed_by,
-            clear_wake_backoff=(lane in _FAIL_BACKOFF_WAKE_LANES),
-        )
+        successor_id = None
+        if lane == "heartbeat" and deps.read_perception_wake_context is not None:
+            completed, successor_id = await asyncio.to_thread(
+                jobs_store.finish_wake_job,
+                job_id,
+                claimed_by=claimed_by,
+                observed_generation=wake_observed_generation,
+                context_stream="v2_perception_wake_context",
+                consumed_context_seq=consumed_perception_context_seq,
+                clear_wake_backoff=(lane in _FAIL_BACKOFF_WAKE_LANES),
+            )
+        else:
+            # Some reply-effect sinks terminalize the source job atomically
+            # with final publication. Preserve the established non-heartbeat
+            # behavior: a false return here is therefore not necessarily lease
+            # loss. Heartbeat's successor-aware path above owns its own exact
+            # terminalization and must return true.
+            await asyncio.to_thread(
+                jobs_store.mark_completed,
+                job_id,
+                claimed_by=claimed_by,
+                clear_wake_backoff=(lane in _FAIL_BACKOFF_WAKE_LANES),
+            )
+            completed = True
+        if not completed:
+            raise LostJobLease("wake job ownership lost during completion")
+        if successor_id is not None:
+            await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
         # End-of-turn drain (mirrors process_job's chat-branch finalize): a write
         # tool_call in the LAST round has no subsequent on_reply to trigger a drain,
         # so flush whatever's still pending. Best-effort — the job is already

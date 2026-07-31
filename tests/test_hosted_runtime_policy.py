@@ -589,6 +589,23 @@ def test_main_compose_serve_worker_shares_the_backend_image_and_stays_internal()
         assert env["FEEDLING_ENCLAVE_URL"] == "https://enclave:5003"
 
 
+def test_main_compose_serve_worker_enables_memory_maintenance_producers():
+    """The scheduler lives in serve-worker; backend-only flags are inert."""
+    for name in (
+        "docker-compose.phala.yaml",
+        "docker-compose.phala.test.yaml",
+        "docker-compose.phala.pre.yaml",
+    ):
+        compose = yaml.safe_load((ROOT / "deploy" / name).read_text())
+        env = compose["services"]["serve-worker"]["environment"]
+        assert env["FEEDLING_V2_CAPTURE_ENABLED"] == (
+            "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
+        ), name
+        assert env["FEEDLING_V2_DREAM_ENABLED"] == (
+            "${FEEDLING_V2_DREAM_ENABLED:-1}"
+        ), name
+
+
 def test_all_three_standalone_runner_composes_are_v1_agent_runner_only():
     # Dual-runtime coexistence (Task 11, post-review correction): all three
     # environments are topologically identical — main CVM is `dual` (backend

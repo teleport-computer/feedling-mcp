@@ -94,6 +94,35 @@ def env(monkeypatch):
     )
     monkeypatch.setattr(
         jobs_store,
+        "recent_runtime_health",
+        lambda **kw: {
+            "window_hours": 24,
+            "pending": 1,
+            "oldest_pending_age_sec": 12.5,
+            "lanes": [
+                {
+                    "lane": "capture",
+                    "sampled_jobs": 3,
+                    "completed": 2,
+                    "failed": 1,
+                    "expired": 0,
+                    "superseded": 0,
+                    "failure_rate": 1 / 3,
+                },
+                {
+                    "lane": "dream",
+                    "sampled_jobs": 1,
+                    "completed": 1,
+                    "failed": 0,
+                    "expired": 0,
+                    "superseded": 0,
+                    "failure_rate": 0.0,
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        jobs_store,
         "recent_prompt_cache_stats",
         lambda **kw: {
             "sampled_turns": 4,
@@ -245,6 +274,31 @@ def test_v2_metrics_returns_every_field(env):
                 "capture_gap": 1,
                 "complete_rate": 10 / 12,
             },
+        },
+        "runtime_health": {
+            "window_hours": 24,
+            "pending": 1,
+            "oldest_pending_age_sec": 12.5,
+            "lanes": [
+                {
+                    "lane": "capture",
+                    "sampled_jobs": 3,
+                    "completed": 2,
+                    "failed": 1,
+                    "expired": 0,
+                    "superseded": 0,
+                    "failure_rate": 1 / 3,
+                },
+                {
+                    "lane": "dream",
+                    "sampled_jobs": 1,
+                    "completed": 1,
+                    "failed": 0,
+                    "expired": 0,
+                    "superseded": 0,
+                    "failure_rate": 0.0,
+                },
+            ],
         },
         "prompt_cache": {
             "sampled_turns": 4,
