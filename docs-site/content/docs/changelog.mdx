@@ -10,6 +10,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Hosted visual failures are easier to diagnose without exposing user
+  content.** Per-user admin detail now includes bounded model-route runtime
+  error metadata and the newest 20 notice summaries through explicit
+  content-free field allowlists; provider endpoint URLs, notice text, notice
+  detail, and copyable prompts are excluded. Visual observation also emits
+  metadata-only debug trace events for image-read failures and provider-call
+  outcomes, without image data, observations, or raw provider responses.
+
 - **Hosted visual observation now works for zero-roster Runtime V1 users.**
   The authenticated request's short-lived, user-bound runtime token is
   forwarded through both the exact image-body read and visual provider-key

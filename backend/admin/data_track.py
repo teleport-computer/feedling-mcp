@@ -22,6 +22,7 @@ from accounts import onboarding as accounts_onboarding
 from accounts import registry
 from chat import consumer as chat_consumer
 from memory import service as memory_service
+from notices import core as notices_core
 from proactive import service as proactive_service
 from bootstrap import gates as boot_gates
 from core import store as core_store
@@ -31,6 +32,7 @@ from identity import service as identity_service
 
 _PROVIDER_ATTEMPT_STREAM = "provider_attempts"
 _PROVIDER_ATTEMPT_DETAIL_LIMIT = 200
+_NOTICE_SUMMARY_LIMIT = 20
 _DATA_TRACK_USER_ID_RE = re.compile(r"^usr_[0-9a-f]{16}$")
 
 
@@ -1213,6 +1215,57 @@ def _push_stats_from_user_entry(user_entry: dict) -> dict:
     }
 
 
+def _model_api_route_summaries(user_id: str) -> list[dict]:
+    """Return support-safe route state without credentials or endpoint URLs."""
+    out = []
+    for route in db.model_api_routes_list(user_id):
+        purposes = []
+        if route.get("is_active"):
+            purposes.append("chat")
+        if route.get("is_vision"):
+            purposes.append("vision")
+        out.append({
+            "purpose": purposes,
+            "provider": str(route.get("provider") or "")[:80],
+            "model": str(route.get("model") or "")[:160],
+            "last_runtime_error_class": str(
+                route.get("last_runtime_error_class") or ""
+            )[:160],
+            "last_runtime_error": str(route.get("last_runtime_error") or "")[:300],
+            "updated_at": str(route.get("updated_at") or "")[:40],
+        })
+    return out
+
+
+def _notice_summaries(user_id: str, *, limit: int = _NOTICE_SUMMARY_LIMIT) -> list[dict]:
+    """Return recent notice metadata using an explicit content-free allowlist."""
+    def _count(value) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _last_ts(row: dict) -> float:
+        return float(core_util._to_epoch(row.get("last_ts")) or 0)
+
+    rows = db.log_read_all(user_id, notices_core.NOTICES_STREAM)
+    rows = sorted(
+        rows,
+        key=_last_ts,
+        reverse=True,
+    )[: max(0, int(limit))]
+    return [
+        {
+            "error_class": str(row.get("error_class") or "")[:160],
+            "blame": str(row.get("blame") or "")[:80],
+            "severity": str(row.get("severity") or "")[:40],
+            "occurrences": _count(row.get("occurrences")),
+            "last_ts": _last_ts(row),
+        }
+        for row in rows
+    ]
+
+
 def _bootstrap_event_stats(store: UserStore, *, include_events: bool = False) -> dict:
     events = boot_gates._load_bootstrap_events(store)
     by_type = _count_rows(events, "event_type")
@@ -1418,6 +1471,8 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         )
         row["daily_usage_days"] = daily_days
         row["runtime"] = _runtime_summary(store)
+        row["model_api_routes"] = _model_api_route_summaries(user_id)
+        row["notice_summaries"] = _notice_summaries(user_id)
         row["provider_attempt_ledger"] = _provider_attempts_detail(store)
         row["v2_chat_failures"] = _v2_chat_failures_detail(user_id)
         row["memory_capture_validation"] = _memory_capture_validation_detail(store)

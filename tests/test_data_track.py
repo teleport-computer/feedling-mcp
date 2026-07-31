@@ -1007,6 +1007,147 @@ def test_detail_payload_runtime_includes_reasoning_effort(client):
     assert row["runtime"]["reasoning_effort"] == "medium"
 
 
+def test_admin_route_and_notice_summary_helpers_are_explicit_allowlists(monkeypatch):
+    monkeypatch.setattr(
+        _dt.db,
+        "model_api_routes_list",
+        lambda _uid: [{
+            "is_active": True,
+            "is_vision": True,
+            "provider": "openrouter",
+            "model": "vision/model-test",
+            "last_runtime_error_class": "provider_transient",
+            "last_runtime_error": "vision_model_unavailable",
+            "updated_at": "2026-07-31T20:00:00Z",
+            "base_url": "https://private-relay.example/secret-path",
+            "api_key_hint": "private-key-hint",
+        }],
+    )
+    monkeypatch.setattr(
+        _dt.db,
+        "log_read_all",
+        lambda _uid, _stream: [{
+            "error_class": "vision_model_unavailable",
+            "blame": "provider_transient",
+            "severity": "warning",
+            "occurrences": 3,
+            "last_ts": 2.0,
+            "user_text": "private user text",
+            "detail": "private free-form detail",
+        }, {
+            "error_class": "older_error",
+            "blame": "system",
+            "severity": "error",
+            "occurrences": 1,
+            "last_ts": 1.0,
+            "copyable_prompt": "private prompt",
+        }],
+    )
+
+    routes = _dt._model_api_route_summaries("usr_test")
+    notices = _dt._notice_summaries("usr_test", limit=1)
+
+    assert routes == [{
+        "purpose": ["chat", "vision"],
+        "provider": "openrouter",
+        "model": "vision/model-test",
+        "last_runtime_error_class": "provider_transient",
+        "last_runtime_error": "vision_model_unavailable",
+        "updated_at": "2026-07-31T20:00:00Z",
+    }]
+    assert notices == [{
+        "error_class": "vision_model_unavailable",
+        "blame": "provider_transient",
+        "severity": "warning",
+        "occurrences": 3,
+        "last_ts": 2.0,
+    }]
+    serialized = json.dumps({"routes": routes, "notices": notices})
+    assert "private-relay.example" not in serialized
+    assert "private-key-hint" not in serialized
+    assert "private user text" not in serialized
+    assert "private free-form detail" not in serialized
+    assert "private prompt" not in serialized
+
+
+def test_detail_payload_exposes_content_free_route_errors_and_notice_summaries(client):
+    from conftest import configure_model_api_route
+    from notices import core as notices_core
+
+    user_id, _api_key = _register(client)
+    _credential_id, route_id = configure_model_api_route(
+        user_id,
+        provider="openrouter",
+        model="vision/model-test",
+        base_url="https://private-relay.example/secret-path",
+        test_status="ok",
+    )
+    assert db.model_api_route_set_vision(user_id, route_id)
+    assert db.model_api_route_mark_runtime_error(
+        user_id,
+        error="vision_model_unavailable",
+        error_class="provider_transient",
+    )
+    for index in range(22):
+        db.log_append(
+            user_id,
+            notices_core.NOTICES_STREAM,
+            {
+                "error_class": f"error_{index:02d}",
+                "blame": "provider_transient",
+                "severity": "warning",
+                "occurrences": index + 1,
+                "last_ts": float(index + 1),
+                "user_text": f"private-user-text-{index}",
+                "detail": f"private-free-form-detail-{index}",
+                "copyable_prompt": f"private-prompt-{index}",
+                "dedupe_key": f"private-dedupe-{index}",
+            },
+            ts=float(index + 1),
+        )
+
+    response = client.get(
+        f"/v1/admin/data-track/users/{user_id}",
+        headers=_admin_headers(),
+    )
+    assert response.status_code == 200
+    row = response.get_json()["user"]
+
+    assert row["model_api_routes"] == [{
+        "purpose": ["chat", "vision"],
+        "provider": "openrouter",
+        "model": "vision/model-test",
+        "last_runtime_error_class": "provider_transient",
+        "last_runtime_error": "vision_model_unavailable",
+        "updated_at": row["model_api_routes"][0]["updated_at"],
+    }]
+    assert set(row["model_api_routes"][0]) == {
+        "purpose",
+        "provider",
+        "model",
+        "last_runtime_error_class",
+        "last_runtime_error",
+        "updated_at",
+    }
+    assert len(row["notice_summaries"]) == 20
+    assert row["notice_summaries"][0] == {
+        "error_class": "error_21",
+        "blame": "provider_transient",
+        "severity": "warning",
+        "occurrences": 22,
+        "last_ts": 22.0,
+    }
+    assert all(set(item) == {
+        "error_class", "blame", "severity", "occurrences", "last_ts"
+    } for item in row["notice_summaries"])
+    serialized = json.dumps(row)
+    assert "private-relay.example" not in serialized
+    assert "private-user-text" not in serialized
+    assert "private-free-form-detail" not in serialized
+    assert "private-prompt" not in serialized
+    assert "private-dedupe" not in serialized
+
+
 def test_detail_payload_exposes_capture_validation_decisions(client):
     from admin import data_track as data_track
 
