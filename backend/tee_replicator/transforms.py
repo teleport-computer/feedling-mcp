@@ -55,10 +55,18 @@ def _strip_envelope(doc: dict) -> dict:
 
 
 def _sub_envelope(doc: dict, prefix: str) -> dict | None:
-    """把 ``thinking_*`` / ``caption_*`` 前缀展开成独立信封 dict；缺 body_ct 视为不存在。"""
-    if f"{prefix}body_ct" not in doc:
+    """把 ``thinking_*`` / ``caption_*`` 前缀展开成独立内容 dict。"""
+    if f"{prefix}body_ct" not in doc and f"{prefix}body" not in doc:
         return None
     return {k[len(prefix):]: v for k, v in doc.items() if k.startswith(prefix)}
+
+
+def needs_decrypt(doc: dict) -> bool:
+    """这个内容文档是否仍有任一信封正文需要 enclave。"""
+    return bool(
+        doc.get("body_ct")
+        or any(doc.get(f"{prefix}body_ct") for prefix, _key in _SUB_PREFIXES)
+    )
 
 
 def _decrypt_body(decrypt, env: dict, purpose: str) -> str:
@@ -94,28 +102,50 @@ def carry_verbatim(doc: dict) -> dict:
 
 def plaintext_chat_doc(doc: dict, decrypt) -> dict:
     """chat 行：主信封 + 可选 thinking / caption 子信封，全部明文化。"""
-    if not _decryptable(doc):
-        raise PendingDeviceMigration(str(doc.get("id", "")))
     msg_id = str(doc.get("id", ""))
+    if doc.get("body_key") and not doc.get("body_ct") and not isinstance(
+        doc.get("body"), str
+    ):
+        # R2 pointer 本应在 worker.unpack 先水合。走到这里说明对象暂时取不到；
+        # 必须作为传输错误冻结游标重试，不能伪装成 PendingDeviceMigration 后越过。
+        raise RuntimeError(f"chat_r2_body_not_hydrated:{msg_id}")
+    if doc.get("body_ct"):
+        if not _decryptable(doc):
+            raise PendingDeviceMigration(msg_id)
+        main_body = _decrypt_body(decrypt, doc, f"tee_replicate:chat:{msg_id}")
+    elif isinstance(doc.get("body"), str):
+        main_body = doc["body"]
+    else:
+        raise PendingDeviceMigration(msg_id)
+
     out = _strip_envelope(doc)
     # 子信封的前缀字段不该留在顶层——它们各自嵌套进 out[key]。
     out = {k: v for k, v in out.items()
            if not (k.startswith("thinking_") or k.startswith("caption_"))}
-    out["body"] = _decrypt_body(decrypt, doc, f"tee_replicate:chat:{msg_id}")
+    out["body"] = main_body
     for prefix, key in _SUB_PREFIXES:
         sub = _sub_envelope(doc, prefix)
         if sub is None:
             continue
-        if not _decryptable(sub):
+        if sub.get("body_ct"):
+            if not _decryptable(sub):
+                raise PendingDeviceMigration(f"{msg_id}:{key}")
+            sub_body = _decrypt_body(
+                decrypt, sub, f"tee_replicate:chat_{key}:{msg_id}")
+        elif isinstance(sub.get("body"), str):
+            sub_body = sub["body"]
+        else:
             raise PendingDeviceMigration(f"{msg_id}:{key}")
         meta = {k: v for k, v in sub.items() if k not in _ENVELOPE_KEYS}
-        meta["body"] = _decrypt_body(decrypt, sub, f"tee_replicate:chat_{key}:{msg_id}")
+        meta["body"] = sub_body
         meta.setdefault("visibility", out.get("visibility", "shared"))
         out[key] = meta
     return _scrub_nul(out)
 
 
 def _plaintext_single(doc: dict, decrypt, purpose_prefix: str) -> dict:
+    if isinstance(doc.get("body"), str):
+        return _scrub_nul(doc)
     if not _decryptable(doc):
         raise PendingDeviceMigration(str(doc.get("id", "")))
     out = _strip_envelope(doc)
@@ -145,6 +175,8 @@ def plaintext_envelope_column(env: dict, decrypt, *, purpose: str) -> dict:
     ——它的 doc 与 chat_messages.doc 完全同形，直接复用 plaintext_chat_doc（含
     thinking/caption 子信封处理）。
     """
+    if isinstance(env.get("body"), str):
+        return _scrub_nul(env)
     if not _decryptable(env):
         raise PendingDeviceMigration(str(env.get("id", "")))
     out = _strip_envelope(env)

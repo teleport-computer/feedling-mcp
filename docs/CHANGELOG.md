@@ -47,6 +47,34 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-31 — Task 1.3 回退为只读盘点；补明文行复制终态
+
+### [BLOCKER] R2 聊天重体不能靠原地覆盖完成明文化
+
+- 接手审计发现 `backfill_chat_bodies_to_plaintext.py` 首版不能安全真跑：
+  `get_chat_body()` 返回重新 base64 的密文，`put_chat_body()` 又会 base64 解码并生成
+  另一个 key，既可能改坏普通文本，也覆盖不到数据库里持久化的 versioned
+  `body_key`。更关键的是，数据库行仍是密文 pointer 形状，读侧会继续把对象装回
+  `body_ct`；原地覆盖还有「对象已改、行未改」时不可恢复的崩溃窗口。
+- 工具改成 inventory-only，`--apply` 在任何数据库/R2 访问前硬拒绝。Task 1.3 重新
+  标为 blocker：先定义明文 pointer（含二进制策略），再实现
+  「新 key 写明文 → CAS 切 pointer/形状 → 旧 key durable cleanup」，并同时覆盖
+  `chat_messages` / `chat_message_archive`、app 读侧、replicator 与 verify。
+- **设计草案已形成**：推荐持久化
+  `body_object_format="plaintext_v1" + body_size_bytes + body_sha256`，读取线形新增
+  `body_b64` 承载 file/image 明文字节；迁移逐 key 复用现有 upload guard、advisory
+  lock、CAS 与 cleanup。archive 保持 UPDATE 不可变，迁移用事务内 delete+insert。
+  由此修正阶段顺序：代码可先落，生产 apply 必须等 iOS 支持 `body_b64` 并完成强更。
+- **[DECISION] 2026-07-31 四项推荐方案全部拍板**：允许明文档 image/file raw
+  bytes 明文存在 R2；采用 `body_b64` public wire shape；archive 用事务内
+  delete+insert；plaintext pointer 强制 size + SHA-256 校验。批准设计不等于批准
+  生产数据操作，apply gate 不变。
+- 同轮补上 Phase 2 终态漏测：显式明文档的新 `body` 行进入 TEE replicator 时直搬，
+  不铸 token、不触碰 enclave；chat 的 plaintext thinking/caption 会规范化成嵌套
+  形状，混合的加密子信封仍会解密。R2 瞬时水合失败继续按既有语义冻结游标重试，
+  不会被误分成 `PendingDeviceMigration` 后跳过。
+- 定向回归 80 passed；相关文件 pyflakes 干净。
+
 ## 2026-07-29 — Runtime 值班台加上开销：各 lane 的 token 与缓存效率
 
 **[DONE] `/admin/data-track?view=runtime` 的 lane 健康表增加 token 两列**，窗口跟随

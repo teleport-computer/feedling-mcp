@@ -396,6 +396,11 @@ def _transform_with_retry(cfg: _Table, doc: dict, user_id: str) -> dict:
     if _carries_verbatim(user_id):
         # 加密档：整行原样搬运，复制层不解密（Task 2.4）。
         return transforms.carry_verbatim(doc)
+    if isinstance(doc.get("body"), str) and not transforms.needs_decrypt(doc):
+        # 明文档的终态行已经是 transform 的目标形状。旁路必须放在
+        # _get_decrypt 之前，否则即使 transform 本身不调用 decrypt，复制层仍会
+        # 无意义地铸 token/准备 enclave，并在 enclave 故障时连坐明文用户。
+        return cfg.transform(doc, None)
 
     decrypt = _get_decrypt(user_id)
     last: Exception | None = None

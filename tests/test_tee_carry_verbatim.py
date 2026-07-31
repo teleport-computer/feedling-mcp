@@ -104,6 +104,48 @@ def test_explicit_off_is_also_decrypted(uid, monkeypatch):
     assert out["body"] == "hi"
 
 
+def test_explicit_off_plaintext_row_bypasses_enclave(uid, monkeypatch):
+    """明文闸放开后的新行已经是目标形状，复制层应原样搬运。
+
+    旧测试只覆盖了 off 用户的历史信封行，漏掉终态的 off + 明文行；后者若继续走
+    ``_decryptable`` 会被误报 PendingDeviceMigration，复制游标永久卡在第一条新行。
+    """
+    registry._set_user_content_encryption(uid, "off")
+    tee_worker._carry_verbatim_cache.clear()
+    monkeypatch.setattr(tee_worker, "_get_decrypt", _boom)
+    doc = {"id": "msg-plain", "body": "hello\x00world",
+           "owner_user_id": uid, "visibility": "shared",
+           "role": "user", "ts": 3.0}
+
+    out = tee_worker._transform_with_retry(
+        _Cfg(transforms.plaintext_chat_doc), doc, uid)
+
+    assert out == {**doc, "body": "helloworld"}
+
+
+@pytest.mark.parametrize(
+    "transform",
+    [
+        transforms.plaintext_memory_doc,
+        transforms.plaintext_world_book_doc,
+        transforms.plaintext_identity_doc,
+    ],
+)
+def test_explicit_off_plaintext_single_rows_bypass_enclave(
+    uid, monkeypatch, transform,
+):
+    """memory/worldbook/identity 的明文终态与 chat 服从同一形状路由。"""
+    registry._set_user_content_encryption(uid, "off")
+    tee_worker._carry_verbatim_cache.clear()
+    monkeypatch.setattr(tee_worker, "_get_decrypt", _boom)
+    doc = {"id": "plain-1", "body": "plain", "owner_user_id": uid,
+           "visibility": "shared"}
+
+    out = tee_worker._transform_with_retry(_Cfg(transform), doc, uid)
+
+    assert out == doc
+
+
 def test_unknown_user_is_carried_verbatim(backend_env, monkeypatch):
     """查不到用户 → 原样搬运（fail-safe 不解密）。
 

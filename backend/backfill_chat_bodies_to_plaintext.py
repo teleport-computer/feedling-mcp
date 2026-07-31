@@ -1,4 +1,4 @@
-"""One-off: rewrite R2-offloaded chat bodies from ciphertext to plaintext.
+"""Inventory R2-offloaded chat bodies before a ciphertext-to-plaintext rewrite.
 
 母计划 Task 1.3。重体（图片/文件/长文）不内联在 ``chat_messages.doc`` 里，而是
 以指针形状 ``{body_key, body_ct_len}`` 指向 R2；R2 对象里存的是信封的
@@ -15,54 +15,43 @@
 与 ``tee_replicator.worker._carries_verbatim`` 同一条判据、同一个失败方向：
 「多留了密文」可以事后再跑本工具补上，「明文泄漏」不可逆。
 
-## 安全与可重入
+## 当前状态：只读盘点，apply 被硬禁用
 
-- **默认 dry-run。** 真跑要显式 ``--apply``。
-- **断点续跑**：每行独立事务；已是明文的对象直接跳过（幂等）。判据是解密不再需要
-  ——即 R2 对象内容不是 base64 密文而是明文正文。
-- **限速**：每行之间 sleep，默认 20 rows/s。enclave 有 502 前科（迁移工具打爆
-  enclave），不限速会重演。
-- **失败不阻塞**：单行失败记进清单继续跑，最后打印汇总。毒行不该冻住整趟。
+R2 helper 的公开契约是「对象里存 raw ciphertext，读出时重新 base64 成
+``body_ct``」；数据库指针也只有密文形状 ``{body_key, body_ct_len, K_enclave...}``。
+因此只覆盖 R2 对象会同时破坏三件事：
+
+1. 普通上传 helper 会生成另一个 key，覆盖不到行里持久化的 versioned ``body_key``；
+2. 原地覆盖在「对象已改、数据库未改」的崩溃窗口会不可逆地丢掉原密文；
+3. 读侧仍会把对象装回 ``body_ct``，客户端继续按密文解，明文对象必然读坏。
+
+在定义并实现「新 key 写明文 → CAS 切数据库指针/形状 → 旧 key 异步清理」之前，
+``--apply`` 会直接拒绝执行。本文件暂时只做默认 dry-run 盘点：确认候选行所属档位、
+指针归属和 R2 对象是否存在。它不会调用 enclave，也不会写 R2/数据库。
 
 ## 用法
 
     # 从 backend 目录，加载目标环境的 DATABASE_URL + R2_* + enclave 配置
-    python backfill_chat_bodies_to_plaintext.py                    # dry-run 全量盘点
+    python backfill_chat_bodies_to_plaintext.py                    # 全量盘点
     python backfill_chat_bodies_to_plaintext.py --user usr_x       # 单用户
-    python backfill_chat_bodies_to_plaintext.py --apply --limit 50 # 小批真跑
-    python backfill_chat_bodies_to_plaintext.py --apply            # 全量
+    python backfill_chat_bodies_to_plaintext.py --limit 50         # 小批盘点
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
-import binascii
 import sys
 import time
 
 import db
 import object_storage
 from accounts import registry
-from core import enclave as core_enclave
 
 _DEFAULT_RATE = 20.0  # rows/sec；enclave 有被迁移工具打爆的前科
-
-
-def _is_probably_ciphertext(body: str) -> bool:
-    """R2 对象里放的还是密文吗？
-
-    明文重写后对象内容是正文本身；重写前是信封 ``body_ct`` 的 base64。用「能否
-    严格 base64 解码」判别：正文极少恰好是合法 base64，而 ``body_ct`` 必然是。
-    判错的方向是安全的——误判成密文只会多走一次解密，解不开则记失败不写坏数据。
-    """
-    if not body:
-        return False
-    try:
-        base64.b64decode(body, validate=True)
-    except (binascii.Error, ValueError):
-        return False
-    return True
+_APPLY_BLOCKED = (
+    "--apply is disabled: plaintext R2 pointers need an atomic "
+    "new-key/CAS/old-key-cleanup protocol before writes are safe"
+)
 
 
 def _tier_allows_plaintext(user_id: str) -> bool:
@@ -86,47 +75,19 @@ def _rows_to_process(user_filter: str | None, limit: int) -> list[tuple]:
         return conn.execute(sql, tuple(params)).fetchall()
 
 
-def _rewrite_one(user_id: str, msg_id: str, doc: dict, *, apply: bool) -> str:
-    """返回状态字符串：ok / skipped_* / failed_*。"""
+def _inspect_one(user_id: str, msg_id: str, doc: dict) -> str:
+    """只读检查一条候选；绝不解密、绝不写对象。"""
     key = str(doc.get("body_key") or "")
     if not key:
         return "skipped_no_body_key"
 
+    if not object_storage.chat_key_owned_by(key, user_id):
+        return "failed_foreign_body_key"
     body = object_storage.get_chat_body(key, user_id)
     if body is None:
         # 孤儿指针：R2 对象已不在。不是本工具能修的，交给对账。
         return "skipped_r2_object_missing"
-    if not _is_probably_ciphertext(body):
-        return "skipped_already_plaintext"
-
-    if not apply:
-        return "would_rewrite"
-
-    envelope = {**{k: v for k, v in doc.items() if k != "body_key"},
-                "body_ct": body}
-    try:
-        plaintext = core_enclave._decrypt_envelope_via_enclave(
-            envelope, None, purpose=f"backfill_chat_body_plaintext:{msg_id}",
-            runtime_token=_runtime_token(user_id))
-    except Exception as e:  # noqa: BLE001
-        return f"failed_decrypt:{type(e).__name__}:{str(e)[:120]}"
-
-    try:
-        text = plaintext.decode("utf-8")
-    except UnicodeDecodeError:
-        # 二进制重体（图片）无法以明文 text 形式承载——这类留给单独的方案，
-        # 不在本工具范围内，且绝不能写成乱码。
-        return "skipped_binary_body"
-
-    object_storage.put_chat_body(user_id, msg_id, text,
-                                 str(doc.get("content_type") or "file"))
-    return "ok"
-
-
-def _runtime_token(user_id: str) -> str:
-    from tee_replicator import worker as tee_worker
-
-    return tee_worker._mint_runtime_token(user_id)
+    return "would_rewrite_after_protocol"
 
 
 def main() -> int:
@@ -138,10 +99,12 @@ def main() -> int:
     ap.add_argument("--rate", type=float, default=_DEFAULT_RATE,
                     help=f"每秒处理行数上限（默认 {_DEFAULT_RATE}）")
     args = ap.parse_args()
+    if args.apply:
+        ap.error(_APPLY_BLOCKED)
 
     rows = _rows_to_process(args.user, args.limit)
     print(f"[backfill] candidate rows: {len(rows)}"
-          f"{'' if args.apply else '  (DRY-RUN — 加 --apply 才写)'}")
+          "  (INVENTORY ONLY — apply is disabled)")
 
     tallies: dict[str, int] = {}
     failures: list[str] = []
@@ -152,7 +115,7 @@ def main() -> int:
             status = "skipped_encrypted_tier"
         else:
             try:
-                status = _rewrite_one(user_id, msg_id, doc, apply=args.apply)
+                status = _inspect_one(user_id, msg_id, doc)
             except Exception as e:  # noqa: BLE001  单行失败不阻塞整趟
                 status = f"failed_unexpected:{type(e).__name__}"
         bucket = status.split(":", 1)[0]

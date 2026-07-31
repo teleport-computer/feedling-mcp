@@ -384,19 +384,33 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
 
 ### Task 1.3: R2 聊天重体明文化（带 K_enclave 的）
 
-- [x] **工具已写**（2026-07-31）：`backend/backfill_chat_bodies_to_plaintext.py`。
-      不受 1.2 的阻塞——聊天重体走 `/v1/envelope/decrypt`，那个端点本来就回明文。
+- [ ] ⛔ **阻塞：缺少明文 R2 指针协议与原子切换流程。**
+      `backend/backfill_chat_bodies_to_plaintext.py` 目前只保留**只读盘点**，
+      `--apply` 硬拒绝。2026-07-31 接手审计发现首版工具不能安全执行：
 
-      性质：默认 **dry-run**（真跑要 `--apply`）；按档位过滤（只处理显式明文档，
-      查不到用户按加密档跳过）；幂等（已是明文的对象直接跳过，判据是"能否严格
-      base64 解码"）；限速默认 20 rows/s（enclave 被迁移工具打爆有前科）；单行
-      失败记清单继续跑，毒行不冻整趟。
+      1. `object_storage.get_chat_body()` 返回的是重新 base64 后的 `body_ct`；
+         `put_chat_body()` 又会 base64 解码并按参数生成 key。首版把明文字符串交给
+         后者，普通正文会报错，恰好长得像 base64 的正文会被静默改坏。
+      2. 现网指针是带 generation/version 的持久化 `body_key`，普通 put 生成另一
+         个 legacy key；不更新数据库指针就等于写了一个永远读不到的对象。
+      3. 即使原地覆盖成功，行仍是 `{body_key, body_ct_len, K_enclave...}` 密文
+         形状；`hydrate_chat_file_body()` 会把对象装回 `body_ct`，客户端仍按密文解。
+      4. 原地覆盖还有不可恢复的崩溃窗口：R2 已变明文、数据库尚未切形状时，原密文
+         已丢失，重跑无法恢复。
 
-      已知不覆盖：**二进制重体（图片）** —— 明文列是 text，二进制无法以明文承载，
-      工具会 `skipped_binary_body` 而不是写成乱码。这类要单独定方案，与 1.2 的
-      frames 问题同源。
+      正确实现必须先定义明文 pointer 形状（含二进制策略），再做：
+      **新 key 写明文 → CAS 切数据库 pointer/形状 → 旧 key 进入 durable cleanup**。
+      还要同时覆盖 `chat_messages` 与保留历史的 `chat_message_archive`，并让 app
+      读侧、TEE replicator/verify 对这个形状按行路由。完成该协议前不得真跑。
 
-- [ ] 真跑（生产数据操作，需拍板）：先 dry-run 盘点 → 小批 `--limit` → 全量。
+      **设计草案已补**：
+      `docs/superpowers/specs/2026-07-31-r2-plaintext-body-pointer-design.md`。
+      推荐新 pointer 用 `body_object_format="plaintext_v1"` + size/hash，水合后以
+      `body_b64` 传 raw 明文字节；迁移复用现有 upload_guard/advisory-lock/CAS/
+      cleanup 状态机，绝不原地覆盖。这个新 wire shape 也证明原 Phase 顺序需要调整：
+      代码可先做，但存量 apply 必须后移到 iOS 支持 `body_b64` 且完成强更之后。
+      **2026-07-31：spec §14 四项推荐方案已全部拍板。** 允许开始代码实现；
+      这不等于批准生产 apply，后者仍受 iOS 强更与 rollout gate 约束。
 
 ### Task 1.4: 分析表与杂项
 

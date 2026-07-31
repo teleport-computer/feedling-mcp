@@ -57,6 +57,37 @@ def test_chat_doc_plain_main_only():
     _assert_no_crypto_leak(out)
 
 
+def test_chat_doc_plain_main_and_plain_subcontent():
+    doc = {
+        "id": "m-plain", "role": "assistant", "ts": 2.5,
+        "visibility": "shared", "owner_user_id": "u", "body": "answer",
+        "thinking_body": "reason", "thinking_kind": "reasoning",
+        "thinking_visibility": "shared",
+    }
+    out = transforms.plaintext_chat_doc(
+        doc, lambda *_a, **_kw: (_ for _ in ()).throw(
+            AssertionError("plaintext row must not decrypt")))
+    assert out["body"] == "answer"
+    assert out["thinking"] == {
+        "body": "reason", "kind": "reasoning", "visibility": "shared",
+    }
+    assert "thinking_body" not in out
+
+
+def test_chat_doc_plain_main_with_encrypted_subcontent_still_decrypts():
+    doc = {
+        "id": "m-mixed", "role": "assistant", "ts": 2.6,
+        "visibility": "shared", "owner_user_id": "u", "body": "answer",
+        "thinking_body_ct": "BBB", "thinking_nonce": "n",
+        "thinking_K_user": "k", "thinking_K_enclave": "ke",
+        "thinking_visibility": "shared",
+    }
+    assert transforms.needs_decrypt(doc) is True
+    out = transforms.plaintext_chat_doc(doc, _decrypt_stub)
+    assert out["body"] == "answer"
+    assert out["thinking"]["body"] == "PT:BBB"
+
+
 def test_local_only_raises_pending():
     doc = {"id": "m3", "visibility": "local_only", "body_ct": "X", "nonce": "n",
            "K_user": "k", "v": 1, "owner_user_id": "u", "ts": 3.0, "role": "user"}
