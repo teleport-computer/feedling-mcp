@@ -8643,6 +8643,27 @@ def memory_load(user_id: str) -> list[dict]:
         return []
 
 
+def memory_profile_source_snapshot(user_id: str) -> dict:
+    """Content-free Memory Garden fingerprint used by profile refresh policy.
+
+    The profile generator itself still reads/decrypts every eligible card
+    through the enclave readside.  This aggregate is deliberately DB-only so a
+    normal chat turn can decide whether a seven-day-old profile is stale
+    without disclosing or loading any card plaintext.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT count(*)::bigint, "
+            "COALESCE(max(doc->>'updated_at'), '') "
+            "FROM memory_moments WHERE user_id=%s",
+            (str(user_id),),
+        ).fetchone()
+    return {
+        "card_count": int(row[0]) if row and row[0] is not None else 0,
+        "max_updated_at": str(row[1] or "") if row else "",
+    }
+
+
 def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> bool:
     """Single-row upsert. Returns True iff the write committed — callers that
     advance state on success (e.g. memory.upgrade / migration) MUST check it."""

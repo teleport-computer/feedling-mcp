@@ -49,7 +49,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 import httpx
@@ -1850,6 +1850,10 @@ def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
 # 记忆抽取上下文一次拉多少张卡喂 dream prompt。dream 只需要一份粗粒度的现有卡片清单
 # 供模型判断哪些能合并；不是全量导出，控制 prompt 体积 + 一次 enclave 往返的候选数。
 _MEMORY_CARDS_LIMIT = int(os.environ.get("FEEDLING_V2_MEMORY_CARDS_LIMIT", "60"))
+_PROFILE_CARD_CONTENT_MAX_CHARS = max(
+    1,
+    int(os.environ.get("FEEDLING_V2_PROFILE_CARD_CONTENT_MAX_CHARS", "4000")),
+)
 
 
 def _render_card_line(item: dict) -> str:
@@ -1948,6 +1952,78 @@ def _read_memory_context(user_id: str) -> dict:
     except Exception as e:  # noqa: BLE001 — 单项降级
         log.warning("[v2.serve_worker] identity unavailable for %s: %s", user_id, e)
     return ctx
+
+
+def _render_profile_card(item: dict) -> str:
+    """Render one decrypted Garden card without dropping its useful body."""
+    if not isinstance(item, dict):
+        return ""
+    card_id = str(item.get("id") or "").strip()
+    bucket = str(item.get("bucket") or "").strip()
+    occurred_at = str(item.get("occurred_at") or "").strip()
+    title = str(item.get("title") or "").strip()
+    summary = str(item.get("summary") or "").strip()
+    content = str(item.get("content") or "").strip()
+    if not (title or summary or content):
+        return ""
+    header_parts = [part for part in (card_id, bucket, occurred_at) if part]
+    lines = ["[card " + " | ".join(header_parts) + "]"]
+    if title:
+        lines.append("title: " + title)
+    if summary and summary != title:
+        lines.append("summary: " + summary)
+    if content:
+        lines.append("content: " + content[:_PROFILE_CARD_CONTENT_MAX_CHARS])
+    return "\n".join(lines)
+
+
+def _read_profile_cards(user_id: str) -> dict:
+    """Read every eligible Garden card or fail loudly without partial output.
+
+    Unlike ``_read_memory_context`` this path has no 60-card cap and no
+    per-component fail-open behavior: a partial Garden would produce a
+    confidently wrong long-lived profile.  The runtime token authenticates the
+    enclave readside; plaintext remains inside the worker process.
+    """
+    store = core_store.get_store(user_id)
+    token = _mint_runtime_token(user_id)
+    source_before = db.memory_profile_source_snapshot(user_id)
+
+    def _post(api_key, candidates, *, operation, payload=None):
+        return memory_readside_core.post_enclave_readside(
+            api_key,
+            candidates,
+            operation=operation,
+            payload=payload,
+            runtime_token=token,
+        )
+
+    body, status = memory_core.index(
+        store,
+        None,
+        {"limit": 0},
+        post_enclave=_post,
+    )
+    if status != 200 or not isinstance(body, dict):
+        raise RuntimeError(f"profile_cards_read_failed:{int(status)}")
+    items = body.get("items")
+    if not isinstance(items, list):
+        raise RuntimeError("profile_cards_invalid_response")
+    user_card_count = int(body.get("user_card_count") or 0)
+    if body.get("truncated") is not False or user_card_count != len(items):
+        raise RuntimeError(
+            f"profile_cards_truncated:{user_card_count}/{len(items)}"
+        )
+    source_after = db.memory_profile_source_snapshot(user_id)
+    if source_after != source_before:
+        raise RuntimeError("profile_cards_changed_during_read")
+    rendered = [_render_profile_card(item) for item in items]
+    return {
+        "rendered": "\n\n".join(text for text in rendered if text),
+        "card_count": int(source_after.get("card_count") or 0),
+        "max_updated_at": str(source_after.get("max_updated_at") or ""),
+        "eligible_card_count": user_card_count,
+    }
 
 
 def _apply_memory_actions(
@@ -3487,6 +3563,8 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_vision_observations=_read_vision_observations,
         read_files=_read_files,
         read_memory_context=_read_memory_context,
+        read_profile_cards=_read_profile_cards,
+        select_profile_for_turn=_select_agent_profile_for_turn,
         read_scheduled_wake_context=_read_scheduled_wake_context,
         read_pending_scheduled_wake_context=_read_pending_scheduled_wake_context,
         apply_memory_actions=_apply_memory_actions,

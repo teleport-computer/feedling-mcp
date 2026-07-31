@@ -1423,7 +1423,8 @@ def test_process_job_reply_skips_compaction_enqueue_when_under_budget(monkeypatc
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
-    assert enqueue_calls == []
+    assert (uid, "maintenance", "compaction") not in enqueue_calls
+    assert enqueue_calls == [(uid, "profile", "turn_refresh")]
 
 
 def test_run_compaction_folds_oldest_batch_and_advances_watermark(monkeypatch):

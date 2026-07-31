@@ -307,7 +307,8 @@ def test_dual_v2_tuple_with_live_workers_processes(monkeypatch):
     assert body["status"] == "processing"
     with db.get_pool().connection() as conn:
         rows = conn.execute(
-            "SELECT lane, status, reason FROM agent_jobs WHERE user_id=%s",
+            "SELECT lane, status, reason FROM agent_jobs "
+            "WHERE user_id=%s AND lane='chat'",
             ("u_dr_v2_live",),
         ).fetchall()
     assert rows == [("chat", "pending", "chat_send")]

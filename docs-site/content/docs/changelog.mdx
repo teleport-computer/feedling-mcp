@@ -10,13 +10,32 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 now schedules bounded profile distillation as background work.**
+  The pooled worker reads the complete eligible Memory Garden through the
+  enclave readside, rejects truncated snapshots, and atomically refreshes the
+  encrypted `MEMORY` and `USER` fields. A refresh is queued when a user enters
+  Runtime V2, after a dream applies memory changes, or after a chat turn when a
+  missing/failed profile is retryable or a changed Garden has exceeded the
+  seven-day age floor. Empty Gardens make no provider call, and provider
+  failures remain silent background failures with bounded retry metadata.
+  The prompt path is staged behind the default-off
+  `FEEDLING_V2_PROFILE_ENABLED` switch. When enabled, both fields decrypt
+  together into one unprivileged user-role data block; an unavailable or
+  invalid profile keeps the existing conversation summary path. The separate
+  deterministic-coverage switch remains off pending real-user rollout
+  validation.
+
+- **Pooled Runtime V2 deployments now enable capture and dream scheduling by
+  default in the serve worker.** These switches belong to the worker process;
+  setting only the backend service environment did not schedule either lane.
+  Operators can still disable either independent switch explicitly.
+
 - **Encrypted Runtime V2 profile storage is staged for the bounded
   Memory/User rollout.** Both fields share one `v2_agent_profile` CAS document
   but remain separate shared encrypted envelopes. PostgreSQL and the TEE shadow
   receive the same ciphertext document; only state, character counts, source
   counts, and generation/retry timestamps remain plaintext metadata. This
-  storage milestone does not enable prompt injection, which remains behind the
-  later default-off rollout.
+  prompt injection remains behind a separate default-off rollout switch.
 
 - **Runtime V2 can advance conversation coverage without steady-state
   background model calls.** The default-off

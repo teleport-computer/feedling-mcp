@@ -1152,7 +1152,8 @@ def test_user_input_during_final_provider_call_is_folded_before_visible_reply(
     assert _job_status_row(job_id)[0] == "completed"
     with db.get_pool().connection() as conn:
         successors = conn.execute(
-            "SELECT COUNT(*) FROM agent_jobs WHERE user_id=%s AND id<>%s",
+            "SELECT COUNT(*) FROM agent_jobs "
+            "WHERE user_id=%s AND id<>%s AND lane='chat'",
             (uid, job_id),
         ).fetchone()[0]
         effects = conn.execute(
@@ -1248,7 +1249,8 @@ def test_ordered_chat_replies_settle_each_user_message_separately(monkeypatch):
     with db.get_pool().connection() as conn:
         successor = conn.execute(
             "SELECT status,reason FROM agent_jobs "
-            "WHERE user_id=%s AND id<>%s ORDER BY id DESC LIMIT 1",
+            "WHERE user_id=%s AND id<>%s AND lane='chat' "
+            "ORDER BY id DESC LIMIT 1",
             (uid, job_id),
         ).fetchone()
         reply_payload = conn.execute(

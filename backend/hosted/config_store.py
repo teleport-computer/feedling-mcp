@@ -1,5 +1,6 @@
 """Model API config / runtime profile / action traces (hosted line)."""
 
+import logging
 import os
 import time
 import types
@@ -14,6 +15,8 @@ from notices import catalog as notices_catalog
 from notices import core as notices_core
 import provider_client
 from provider_client import validate_config as validate_provider_config
+
+log = logging.getLogger("feedling.hosted.config_store")
 
 
 def _load_model_api_config(store: UserStore) -> dict | None:
@@ -505,9 +508,36 @@ def _set_hosted_runtime_mode_for_user_id(
 ) -> str:
     """Serialize ownership changes with provider-config mutation for this user."""
     with db.hosted_runtime_config_mutation_lock(user_id):
-        return _set_hosted_runtime_mode_for_user_id_locked(
+        before_mode, before_state, _before_generation = (
+            db.get_hosted_runtime_control_strict(user_id)
+        )
+        result = _set_hosted_runtime_mode_for_user_id_locked(
             user_id, mode, store=store
         )
+    # Profile generation is queued only after releasing the ownership/config
+    # lock. It is provider-backed background work and must never extend this
+    # control-plane critical section.
+    if (
+        result == HOSTED_RUNTIME_MODE_DB_ACTION_V2
+        and not (
+            effective_hosted_runtime_mode(before_mode)
+            == HOSTED_RUNTIME_MODE_DB_ACTION_V2
+            and before_state == "v2"
+        )
+    ):
+        try:
+            from core import wake_bus
+            from model_api_runtime.v2 import jobs_store
+
+            jobs_store.enqueue_job(user_id, "profile", reason="runtime_enabled")
+            wake_bus.notify("v2_jobs", user_id)
+        except Exception as exc:  # noqa: BLE001 — ownership flip already committed
+            log.warning(
+                "post-cutover profile enqueue failed user=%s code=%s",
+                user_id,
+                type(exc).__name__.lower(),
+            )
+    return result
 
 
 def _set_hosted_runtime_mode_for_user_id_locked(

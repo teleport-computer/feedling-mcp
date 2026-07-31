@@ -356,7 +356,7 @@ def test_v2_cutover_immediately_enqueues_resident_unanswered_message(
     with db.get_pool().connection() as conn:
         jobs = conn.execute(
             "SELECT lane,status,reason,trace_id,expected_runtime_generation "
-            "FROM agent_jobs WHERE user_id=%s",
+            "FROM agent_jobs WHERE user_id=%s AND lane='chat'",
             (user_id,),
         ).fetchall()
     assert jobs == [(
@@ -404,7 +404,7 @@ def test_v2_recutover_replaces_stale_generation_recovery_job(monkeypatch):
     with db.get_pool().connection() as conn:
         jobs = conn.execute(
             "SELECT status,trace_id,expected_runtime_generation "
-            "FROM agent_jobs WHERE user_id=%s ORDER BY id",
+            "FROM agent_jobs WHERE user_id=%s AND lane='chat' ORDER BY id",
             (user_id,),
         ).fetchall()
     assert jobs == [
@@ -455,7 +455,8 @@ def test_v2_recutover_does_not_fall_back_behind_newest_terminal_marker(
 
     with db.get_pool().connection() as conn:
         jobs = conn.execute(
-            "SELECT status,trace_id FROM agent_jobs WHERE user_id=%s ORDER BY id",
+            "SELECT status,trace_id FROM agent_jobs "
+            "WHERE user_id=%s AND lane='chat' ORDER BY id",
             (user_id,),
         ).fetchall()
     assert jobs == [("failed", "newest-terminal")]
@@ -481,7 +482,8 @@ def test_v2_verify_loop_uses_worker_liveness_without_resident_ping(monkeypatch):
         )
     with db.get_pool().connection() as conn:
         assert conn.execute(
-            "SELECT count(*) FROM agent_jobs WHERE user_id=%s", (user_id,)
+            "SELECT count(*) FROM agent_jobs WHERE user_id=%s AND lane='chat'",
+            (user_id,)
         ).fetchone()[0] == 0
 
 

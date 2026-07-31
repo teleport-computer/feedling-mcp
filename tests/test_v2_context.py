@@ -157,6 +157,58 @@ def test_skills_are_trusted_but_editable_working_memory_is_user_role_data():
         "UNTRUSTED HISTORICAL CONVERSATION SUMMARY"
     )
 
+
+def test_profile_is_one_unprivileged_stable_block_before_summary_and_tail():
+    messages = context.build_turn_messages(
+        system_prompt="S",
+        working_memory="- active task",
+        agent_memory="User moved to Shanghai.",
+        user_profile="Be direct and avoid ceremonial language.",
+        summary="",
+        tail=[{"role": "user", "content": "continue"}],
+    )
+
+    profile = messages[2]
+    assert profile["role"] == "user"
+    assert profile["content"].startswith(context.AGENT_MEMORY_HEADER)
+    assert context.USER_PROFILE_HEADER in profile["content"]
+    assert "User moved to Shanghai." not in messages[0]["content"]
+    assert "Be direct" not in messages[0]["content"]
+    assert messages[3] == {"role": "user", "content": "continue"}
+
+
+def test_profile_bytes_are_stable_and_coverage_notice_is_separate():
+    common = dict(
+        system_prompt="S",
+        summary="",
+        agent_memory="stable memory",
+        user_profile="stable interaction guidance",
+        tail=[{"role": "user", "content": "hello"}],
+    )
+    first = context.build_turn_messages(
+        **common,
+        coverage_notice="3 older messages omitted",
+    )
+    second = context.build_turn_messages(
+        **common,
+        coverage_notice="4 older messages omitted",
+    )
+
+    first_profile = next(
+        message for message in first
+        if context.AGENT_MEMORY_HEADER in str(message.get("content"))
+    )
+    second_profile = next(
+        message for message in second
+        if context.AGENT_MEMORY_HEADER in str(message.get("content"))
+    )
+    assert first_profile == second_profile
+    assert "3 older" not in first_profile["content"]
+    assert any(
+        str(message.get("content", "")).startswith(context.COVERAGE_HOLE_HEADER)
+        for message in first
+    )
+
 def test_build_turn_messages_drops_blank_tail_entries():
     tail=[{"id":"1","ts":1.0,"role":"user","content":"  "},{"id":"2","ts":2.0,"role":"user","content":"real"}]
     msgs = context.build_turn_messages(system_prompt="S", summary="", tail=tail)

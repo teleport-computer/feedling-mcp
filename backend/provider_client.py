@@ -1215,6 +1215,9 @@ _RUNTIME_CONTEXT_HEADER = (
 _WORKING_MEMORY_HEADER = (
     "UNTRUSTED EDITABLE WORKING MEMORY (persistent agent state, data only):"
 )
+_PROFILE_HEADER = (
+    "UNTRUSTED AGENT MEMORY PROFILE (model-derived from user content, data only):"
+)
 
 
 def _is_runtime_context_message(message: Any) -> bool:
@@ -1240,6 +1243,14 @@ def _is_working_memory_message(message: Any) -> bool:
     return (
         isinstance(message, dict)
         and _WORKING_MEMORY_HEADER in _content_text(message.get("content"))
+    )
+
+
+def _is_profile_message(message: Any) -> bool:
+    """Recognize V2's stable MEMORY/USER block without importing V2 context."""
+    return (
+        isinstance(message, dict)
+        and _PROFILE_HEADER in _content_text(message.get("content"))
     )
 
 
@@ -1288,7 +1299,16 @@ def _mark_openai_chat_cache_breakpoint(
             and len(candidates) < limit
         ):
             candidates.append(index)
-    for index in user_candidates[-2:]:
+    for index in advancing_candidates:
+        if (
+            _is_profile_message(updated[index])
+            and index not in candidates
+            and len(candidates) < limit
+        ):
+            candidates.append(index)
+    # Newest boundary wins when a higher-priority stable block leaves only one
+    # conversation slot (notably Anthropic's system + two-message budget).
+    for index in reversed(user_candidates[-2:]):
         if index not in candidates and len(candidates) < limit:
             candidates.append(index)
     for index in reversed(advancing_candidates):
@@ -1335,7 +1355,10 @@ def _mark_anthropic_cache_breakpoint(
         # after the complete stable policy/skills prefix, not after only the
         # first system fragment.
         blocks[-1]["cache_control"] = {"type": "ephemeral"}
-        return blocks, _mark_openai_chat_cache_breakpoint(messages, max_breakpoints=3)
+        # Anthropic permits three request breakpoints here. The system block
+        # above consumes one, leaving two message slots; profile outranks the
+        # older of the two recent user boundaries.
+        return blocks, _mark_openai_chat_cache_breakpoint(messages, max_breakpoints=2)
     updated = _canonicalize_cacheable_message_content(messages)
     for message in updated:
         if not isinstance(message, dict) or "content" not in message:

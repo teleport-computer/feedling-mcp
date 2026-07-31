@@ -15,6 +15,31 @@ Memory separates ciphertext storage from enclave-authorized read projections.
 `local_only` records can be stored and synchronized, but the enclave has no
 wrapped key for them, so they are unavailable from `index` and `fetch`.
 
+## Runtime V2 derived profile
+
+Runtime V2 can distill the complete eligible Memory Garden into two bounded,
+encrypted fields:
+
+- `MEMORY` contains durable facts, events, preferences, and commitments.
+- `USER` describes interaction guidance: how the agent should communicate and
+  collaborate with this user.
+
+This is a background lane, so profile generation and provider failures do not
+block a chat response or create a user-visible failure message. The worker
+refuses to generate from a truncated Garden, makes no provider call for an
+empty Garden, and stores both fields atomically in one versioned profile
+document. Refreshes are triggered when Runtime V2 is enabled, after dream
+updates memory, and after chat turns when retry or age-and-change conditions
+are met.
+
+The prompt integration is staged behind the default-off
+`FEEDLING_V2_PROFILE_ENABLED` switch. When enabled, `MEMORY` and `USER` decrypt
+together into one unprivileged user-role data block before the verbatim
+conversation. If the profile is missing, disabled, invalid, or cannot be read
+or decrypted strictly, Runtime V2 retains the existing conversation summary
+instead. `USER` is an encrypted profile field rather than a client-visible
+`USER.md` file.
+
 ## 1. Build and store a card
 
 The card's meaningful text is an encrypted JSON object. A typical plaintext

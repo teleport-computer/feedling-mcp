@@ -342,7 +342,7 @@ def test_phala_worker_composes_wire_deterministic_flag_default_off():
         '"${FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC:-0}"'
     )
     deployment_guard = (
-        "# DO NOT set to 1 before M5 MEMORY/USER prompt injection is deployed."
+        "# Keep deterministic coverage off until profile injection is enabled and"
     )
     for name in (
         "docker-compose.phala.yaml",

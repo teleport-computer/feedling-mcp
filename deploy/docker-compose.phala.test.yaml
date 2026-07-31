@@ -332,6 +332,10 @@ services:
       FEEDLING_V2_RUNNER_CVM_ID: "${FEEDLING_V2_RUNNER_CVM_ID:-main-cvm}"
       FEEDLING_V2_DEPLOYED_BUILD: "${FEEDLING_V2_DEPLOYED_BUILD:-}"
       FEEDLING_GENESIS_WORKER_ENABLED: "1"
+      # Capture/Dream scheduling belongs to this process; backend-side flags do
+      # not reach the pooled worker.
+      FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
+      FEEDLING_V2_DREAM_ENABLED: "${FEEDLING_V2_DREAM_ENABLED:-1}"
       # CVM-local in-process sandbox: PDF/DOCX/XLSX materialize + extract inside
       # the serve-worker (no E2B), staying within the TDX trust boundary.
       FEEDLING_V2_SANDBOX_PROVIDER: "local"
@@ -362,8 +366,11 @@ services:
       # return; the cost is more fold calls per backlog, which is bounded.
       FEEDLING_V2_COMPACTION_BATCH_MSGS: "${FEEDLING_V2_COMPACTION_BATCH_MSGS:-50}"
       FEEDLING_V2_COMPACTION_BATCH_CHARS: "${FEEDLING_V2_COMPACTION_BATCH_CHARS:-120000}"
-      # DO NOT set to 1 before M5 MEMORY/USER prompt injection is deployed.
+      # Keep deterministic coverage off until profile injection is enabled and
+      # verified on real users; otherwise count sentinels replace the summary.
       FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: "${FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC:-0}"
+      # M5 prompt path is staged separately from background profile generation.
+      FEEDLING_V2_PROFILE_ENABLED: "${FEEDLING_V2_PROFILE_ENABLED:-0}"
       FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: "${FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC:-600}"
       # 20 -> 50 (2026-07-28). This threshold decides whether a turn enters
       # the catch-up fold path AT ALL: a backlog at or under it fits in the

@@ -37,7 +37,7 @@
 | `backend/db.py` | 新增锚点后真实用户轮数计数 | 修改 |
 | `backend/model_api_runtime/v2/worker.py` | 常量、chat lane 接线、窗口放大、optional 过滤 | 修改 |
 | `tests/test_v2_optional_anchor.py` | 验收测试 + 配套测试（新建，与 Task 3 的存储层测试分开） | 创建 |
-| `backend/alembic/versions/0071_v2_chat_tail_anchor.py` | 表注释语义更正 | 修改 |
+| `backend/alembic/versions/0072_v2_chat_tail_anchor.py` | 表注释语义更正 | 修改 |
 
 新建测试文件而不是追加进 `tests/test_v2_tail_anchor_store.py`：后者是存储层单测（读写、单调、CASCADE），本计划的测试是热路径行为测试，两者关注点不同。
 
@@ -544,7 +544,7 @@ git commit -m "perf(v2): anchor the optional-replay window to stabilize the prom
 
 **Files:**
 - Modify: `tests/test_v2_optional_anchor.py`
-- Modify: `backend/alembic/versions/0071_v2_chat_tail_anchor.py`（注释）
+- Modify: `backend/alembic/versions/0072_v2_chat_tail_anchor.py`（注释）
 
 - [ ] **Step 1: 变异验证（手工，必做）**
 
@@ -696,7 +696,7 @@ def test_prefix_stable_again_after_an_advance(monkeypatch):
 
 - [ ] **Step 3: 更正表注释的语义**
 
-`backend/alembic/versions/0071_v2_chat_tail_anchor.py` 的 docstring 与建表注释里
+`backend/alembic/versions/0072_v2_chat_tail_anchor.py` 的 docstring 与建表注释里
 「pinned verbatim-tail start seq」的说法已过时——锚点现在钉的是 **optional 重放的起点**。
 改为准确表述。**只改注释文本，不要改 DDL、revision、down_revision。**
 
@@ -713,7 +713,7 @@ python -m pytest tests/ -q --ignore=tests/e2e_model_api_test.py --ignore=tests/t
 - [ ] **Step 5: 提交（仅在用户明确要求时执行）**
 
 ```bash
-git add tests/test_v2_optional_anchor.py backend/alembic/versions/0071_v2_chat_tail_anchor.py \
+git add tests/test_v2_optional_anchor.py backend/alembic/versions/0072_v2_chat_tail_anchor.py \
         backend/model_api_runtime/v2/jobs_store.py
 git commit -m "test(v2): prove prefix test discriminates; correct anchor semantics in docs"
 ```

@@ -8,8 +8,8 @@ An anchor advance carries no segment provenance, so it would always trip it.
 from alembic import op
 
 
-revision = "0071_v2_chat_tail_anchor"
-down_revision = "0070_tee_sync_prune"
+revision = "0072_v2_chat_tail_anchor"
+down_revision = "0071_runtime_health_idx"
 branch_labels = None
 depends_on = None
 

@@ -96,15 +96,25 @@ def test_bounded_tail_drops_backlog_and_discloses_the_hole():
         watermark_ts=rows[4]["ts"], expected_version=0, watermark_seq=rows[4]["seq"])
     through = rows[-1]["seq"]
 
-    summary, tail, _optional, _trunc, watermark_seq = _run(uid, through, tail_cap=10)
+    (
+        summary,
+        _memory,
+        _user,
+        coverage_notice,
+        tail,
+        _optional,
+        _trunc,
+        watermark_seq,
+    ) = _run(uid, through, tail_cap=10)
 
     # The tail is bounded to the newest 10 — the 15-row hole is NOT in the prompt.
     assert len(tail) == 10
     assert [r["seq"] for r in tail] == [r["seq"] for r in rows[-10:]]
     assert watermark_seq == rows[4]["seq"]
     # ...and the drop is disclosed to the model (25 backlog - 10 kept = 15).
-    assert "15 earlier message" in summary
-    assert "omitted" in summary and "long-term memory" in summary
+    assert summary == "- older summary"
+    assert "15 earlier message" in coverage_notice
+    assert "omitted" in coverage_notice and "long-term memory" in coverage_notice
 
 
 def test_no_hole_when_backlog_fits_the_cap():
@@ -116,11 +126,20 @@ def test_no_hole_when_backlog_fits_the_cap():
         watermark_ts=rows[1]["ts"], expected_version=0, watermark_seq=rows[1]["seq"])
     through = rows[-1]["seq"]
 
-    summary, tail, _optional, _trunc, _wm = _run(uid, through, tail_cap=60)
+    (
+        summary,
+        _memory,
+        _user,
+        coverage_notice,
+        tail,
+        _optional,
+        _trunc,
+        _wm,
+    ) = _run(uid, through, tail_cap=60)
 
     # 10 rows after the watermark, cap is 60 → everything fits, no hole disclosed.
     assert len(tail) == 10
-    assert "omitted" not in summary
+    assert coverage_notice == ""
     assert summary == "- older summary"
 
 

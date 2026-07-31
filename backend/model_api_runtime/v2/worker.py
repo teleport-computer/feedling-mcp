@@ -84,6 +84,8 @@ from model_api_runtime.v2 import kill_switch
 from model_api_runtime.v2 import model_identity as v2_model_identity
 from model_api_runtime.v2 import web_gate as v2_web_gate
 from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
+from model_api_runtime.v2 import profile as v2_profile
+from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import subagents as v2_subagents
 from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
@@ -523,6 +525,14 @@ _COMPACTION_BATCH_CHARS = _positive_int_env(
 # model-written summary head without supplying the long-term context elsewhere.
 _PROFILE_COVERAGE_DETERMINISTIC = _allowlisted_bool_env(
     "FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC"
+)
+# Prompt replacement stays default-off until M5 is explicitly rolled out.
+_PROFILE_ENABLED = _allowlisted_bool_env("FEEDLING_V2_PROFILE_ENABLED")
+_PROFILE_RETRY_BASE_SEC = _positive_float_env(
+    "FEEDLING_V2_PROFILE_RETRY_BASE_SEC", "900"
+)
+_PROFILE_RETRY_MAX_SEC = _positive_float_env(
+    "FEEDLING_V2_PROFILE_RETRY_MAX_SEC", "86400"
 )
 _SUMMARY_ROLLUP_FANOUT = _positive_int_env(
     "FEEDLING_V2_SUMMARY_ROLLUP_FANOUT", "8"
@@ -1227,6 +1237,13 @@ class TurnDeps:
     # 任意一项可为 ""）：capture/dream prompt 需要的记忆上下文（enclave 解密明文）。取数失败
     # → 降级为空上下文，不失败 job（spec §3.5）。
     read_memory_context: Callable[[str], dict] | None = None
+    # user_id -> {rendered, card_count, max_updated_at, eligible_card_count}.
+    # Profile generation is all-or-nothing: the production adapter raises when
+    # the enclave readside reports truncation or a concurrent Garden change.
+    read_profile_cards: Callable[[str], dict] | None = None
+    # Strict profile prompt selector injected by serve_worker. It decrypts both
+    # fields or returns the original summary with a content-free fallback reason.
+    select_profile_for_turn: Callable[..., Any] | None = None
     # (user_id, job_id) -> due reminder content and backend-confirmed trigger
     # metadata. Plaintext remains in the scheduled-wake record; only bounded
     # task identity/state metadata may be attached to the visible activity.
@@ -3067,6 +3084,9 @@ def _make_build_messages_fn(
     mutation_recovery_active: bool = False,
     trusted_system_blocks: tuple[str, ...] = (),
     working_memory: str = "",
+    agent_memory: str = "",
+    user_profile: str = "",
+    coverage_notice: str = "",
     provider_config: Any = None,
     temporal_context: dict[str, Any] | None = None,
     temporal_snapshot: dict[str, Any] | None = None,
@@ -3132,6 +3152,9 @@ def _make_build_messages_fn(
             mutation_recovery_active=mutation_recovery_active,
             trusted_system_blocks=(identity_block, *trusted_system_blocks),
             working_memory=working_memory,
+            agent_memory=agent_memory,
+            user_profile=user_profile,
+            coverage_notice=coverage_notice,
             temporal_context=_temporal_for(rendered_tail),
         )
 
@@ -4861,6 +4884,16 @@ async def _bound_materialized_summary(
     return bounded
 
 
+def _coverage_hole_notice(hole_count: int) -> str:
+    """Return the changing coverage notice without contaminating stable profile."""
+    return (
+        f"{hole_count} earlier message(s) between the durable context and the "
+        "recent messages below are omitted here to fit the context window. "
+        "Their durable facts are retained in long-term memory; ask the user if "
+        "you need older details."
+    )
+
+
 def _with_coverage_hole_notice(summary: str, hole_count: int) -> str:
     """Disclose that older messages were dropped from the bounded prompt window.
 
@@ -4871,13 +4904,44 @@ def _with_coverage_hole_notice(summary: str, hole_count: int) -> str:
     the gap over time. Rendered into the existing summary/context block, so it
     never enters the seq-exact tail machinery.
     """
-    notice = (
-        f"\n\n[Context note: {hole_count} earlier message(s) between the summary "
-        "above and the recent messages below are omitted here to fit the context "
-        "window. Their durable facts are retained in long-term memory — ask the "
-        "user if you need older details.]"
-    )
+    notice = "\n\n[Context note: " + _coverage_hole_notice(hole_count) + "]"
     return ((summary or "").rstrip() + notice).strip()
+
+
+async def _select_profile_prompt_context(
+    *,
+    user_id: str,
+    summary: str,
+    deps: TurnDeps,
+    enclave_sem: "asyncio.Semaphore",
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
+) -> v2_profile_store.ProfilePromptSelection:
+    if not _PROFILE_ENABLED or deps.select_profile_for_turn is None:
+        return v2_profile_store.ProfilePromptSelection(summary=str(summary))
+    try:
+        async with enclave_sem:
+            selection = await asyncio.to_thread(
+                deps.select_profile_for_turn,
+                user_id,
+                summary,
+                enabled=True,
+            )
+        if not isinstance(selection, v2_profile_store.ProfilePromptSelection):
+            raise TypeError("invalid profile prompt selection")
+    except Exception as exc:  # assembly failures preserve the summary
+        reason = f"adapter_failed:{type(exc).__name__.lower()}"
+        selection = v2_profile_store.ProfilePromptSelection(
+            summary=str(summary),
+            fallback_reason=reason,
+        )
+    if selection.fallback_reason:
+        await _record_trajectory(
+            trajectory_recorder,
+            "profile_fallback",
+            {"reason": selection.fallback_reason[:80]},
+            best_effort=True,
+        )
+    return selection
 
 
 async def _read_seq_adaptive_prompt_context(
@@ -4894,7 +4958,7 @@ async def _read_seq_adaptive_prompt_context(
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
     active_image_ids: set[str] | None = None,
     tail_cap: int | None = None,
-) -> tuple[str, list[dict], list[list[dict]], bool, int]:
+) -> tuple[str, str, str, str, list[dict], list[list[dict]], bool, int]:
     """Read one exact core plus summary-covered complete-turn replay.
 
     ``tail_cap`` (Option A / graceful degradation): when set, the verbatim tail
@@ -4997,27 +5061,42 @@ async def _read_seq_adaptive_prompt_context(
                 read_files=deps.read_files,
             )
             optional_tail_turns = _group_complete_turns(optional_rows)
-    summary = await _bound_materialized_summary(
-        user_id,
-        summary,
-        deps,
-        provider_config=provider_config,
+    profile = await _select_profile_prompt_context(
+        user_id=user_id,
+        summary=summary,
+        deps=deps,
         enclave_sem=enclave_sem,
-        claimed_by=claimed_by,
-        job_id=job_id,
-        add_usage=add_usage,
         trajectory_recorder=trajectory_recorder,
     )
+    summary = profile.summary
+    if not profile.used_profile:
+        summary = await _bound_materialized_summary(
+            user_id,
+            summary,
+            deps,
+            provider_config=provider_config,
+            enclave_sem=enclave_sem,
+            claimed_by=claimed_by,
+            job_id=job_id,
+            add_usage=add_usage,
+            trajectory_recorder=trajectory_recorder,
+        )
     await _assert_prompt_tail_exact(
         user_id,
         watermark_seq=prompt_floor_seq,
         through_seq=through_seq,
         tail=tail,
     )
-    if coverage_hole_count > 0:
-        summary = _with_coverage_hole_notice(summary, coverage_hole_count)
+    coverage_notice = (
+        _coverage_hole_notice(coverage_hole_count)
+        if coverage_hole_count > 0
+        else ""
+    )
     return (
         summary,
+        profile.memory,
+        profile.user,
+        coverage_notice,
         tail,
         optional_tail_turns,
         tail_source_truncated,
@@ -6692,6 +6771,9 @@ async def _run_wake(
         legacy_context = deps.read_summary is not None and deps.read_tail is not None
         optional_tail_turns: list[list[dict]] = []
         tail_source_truncated = False
+        agent_memory = ""
+        user_profile = ""
+        coverage_notice = ""
         wake_snapshot_seq = 0
         compact_through_seq = None
         if seq_context:
@@ -6722,6 +6804,9 @@ async def _run_wake(
         if seq_context:
             (
                 summary,
+                agent_memory,
+                user_profile,
+                coverage_notice,
                 tail,
                 optional_tail_turns,
                 tail_source_truncated,
@@ -6763,17 +6848,28 @@ async def _run_wake(
                     user_id=user_id,
                     read_files=deps.read_files,
                 )
-            summary = await _bound_materialized_summary(
-                user_id,
-                summary,
-                deps,
-                provider_config=provider_config,
+            profile = await _select_profile_prompt_context(
+                user_id=user_id,
+                summary=summary,
+                deps=deps,
                 enclave_sem=enclave_sem,
-                claimed_by=claimed_by,
-                job_id=job_id,
-                add_usage=tm.add_call if tm is not None else None,
                 trajectory_recorder=trajectory_recorder,
             )
+            summary = profile.summary
+            agent_memory = profile.memory
+            user_profile = profile.user
+            if not profile.used_profile:
+                summary = await _bound_materialized_summary(
+                    user_id,
+                    summary,
+                    deps,
+                    provider_config=provider_config,
+                    enclave_sem=enclave_sem,
+                    claimed_by=claimed_by,
+                    job_id=job_id,
+                    add_usage=tm.add_call if tm is not None else None,
+                    trajectory_recorder=trajectory_recorder,
+                )
         if seq_context:
             # A wake is proactive work only while there is no unanswered user
             # input.  Keep the frozen prompt snapshot boundary separate from
@@ -7589,6 +7685,9 @@ async def _run_wake(
                 ),
                 trusted_system_blocks=trusted_system_blocks,
                 working_memory=working_memory,
+                agent_memory=agent_memory,
+                user_profile=user_profile,
+                coverage_notice=coverage_notice,
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,
                 optional_tail_turns=optional_tail_turns,
@@ -7625,6 +7724,9 @@ async def _run_wake(
                 )
                 (
                     summary,
+                    agent_memory,
+                    user_profile,
+                    coverage_notice,
                     tail,
                     optional_tail_turns,
                     tail_source_truncated,
@@ -8458,6 +8560,21 @@ async def _run_extraction(
             raise RuntimeError(
                 f"extraction_memory_write_rejected:{first_error}"
             )
+        if lane == "dream" and applied_count > 0:
+            try:
+                await asyncio.to_thread(
+                    jobs_store.enqueue_job,
+                    user_id,
+                    "profile",
+                    reason="dream_refresh",
+                )
+            except Exception as enqueue_exc:  # noqa: BLE001 — dream already committed
+                log.warning(
+                    "[v2.worker] post-dream profile enqueue failed "
+                    "user=%s code=%s",
+                    user_id,
+                    type(enqueue_exc).__name__.lower(),
+                )
         await _complete_extraction(item_count=applied_count + skipped_count)
         if failed_count:
             log.warning(
@@ -8587,6 +8704,236 @@ async def _terminalize_extraction_gate(
         )
     tm.flush(failed=True, status=code)
     return "failed"
+
+
+def _profile_valid_document(value: Any) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    try:
+        return v2_profile_store.validate_profile_document(value)
+    except v2_profile_store.ProfileStorageError:
+        return {}
+
+
+def _profile_retry_delay(attempts: int) -> float:
+    exponent = min(20, max(0, int(attempts) - 1))
+    return min(
+        float(_PROFILE_RETRY_MAX_SEC),
+        float(_PROFILE_RETRY_BASE_SEC) * (2**exponent),
+    )
+
+
+async def _run_profile(
+    job_id,
+    user_id: str,
+    deps: TurnDeps,
+    provider_config: Any,
+    claimed_by: str | None = None,
+    tm: "TurnMetrics | None" = None,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+    renew_lease: Callable[[], Awaitable[None]] | None = None,
+) -> str:
+    """Generate the bounded MEMORY/USER profile as a silent background lane."""
+
+    cards_snapshot: dict[str, Any] = {}
+
+    async def _terminal_completed() -> str:
+        landed = await asyncio.to_thread(
+            jobs_store.mark_completed,
+            job_id,
+            claimed_by=claimed_by,
+        )
+        if claimed_by and not landed:
+            raise LostJobLease("profile lease lost before terminalization")
+        if tm is not None:
+            tm.flush(failed=False, status="ok")
+        return "completed"
+
+    async def _write_failure(code: str) -> str:
+        safe_code = str(code or "profile_generation_failed")[:160]
+        now_ts = time.time()
+        now_iso = (
+            datetime.fromtimestamp(now_ts, timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+        def _recompute(expected: dict) -> dict:
+            previous = _profile_valid_document(expected)
+            previous_attempts = int(
+                (previous.get("last_attempt") or {}).get("attempts") or 0
+            )
+            attempts = previous_attempts + 1
+            prior_source = previous.get("source") or {}
+            source = {
+                "card_count": int(
+                    cards_snapshot.get(
+                        "card_count", prior_source.get("card_count", 0)
+                    )
+                    or 0
+                ),
+                "max_updated_at": str(
+                    cards_snapshot.get(
+                        "max_updated_at",
+                        prior_source.get("max_updated_at", ""),
+                    )
+                    or ""
+                ),
+                "generated_at": str(prior_source.get("generated_at") or ""),
+            }
+            return v2_profile_store.build_profile_document(
+                user_id,
+                state=("degraded" if previous.get("memory") else "pending"),
+                source=source,
+                last_attempt={
+                    "at": now_iso,
+                    "reject_code": safe_code,
+                    "attempts": attempts,
+                    "retry_not_before": now_ts + _profile_retry_delay(attempts),
+                },
+                previous=previous,
+                disabled=bool(previous.get("disabled", False)),
+            )
+
+        try:
+            if renew_lease is not None:
+                await renew_lease()
+            await asyncio.to_thread(
+                v2_profile_store.update_profile_cas,
+                user_id,
+                _recompute,
+            )
+        except Exception as persist_exc:  # noqa: BLE001 — original failure wins
+            log.warning(
+                "[v2.worker] profile failure metadata deferred user=%s code=%s",
+                user_id,
+                type(persist_exc).__name__.lower(),
+            )
+        landed = await asyncio.to_thread(
+            jobs_store.mark_failed,
+            job_id,
+            safe_code,
+            claimed_by=claimed_by,
+        )
+        if claimed_by and not landed:
+            raise LostJobLease("profile lease lost before failure terminalization")
+        if tm is not None:
+            tm.flush(failed=True, status=safe_code)
+        return "failed"
+
+    try:
+        if deps.read_profile_cards is None:
+            raise RuntimeError("profile_cards_reader_unavailable")
+        existing_raw = await asyncio.to_thread(
+            db.get_blob_strict,
+            user_id,
+            v2_profile_store.PROFILE_BLOB_KIND,
+        )
+        existing = _profile_valid_document(existing_raw)
+        if existing.get("disabled") is True:
+            return await _terminal_completed()
+
+        cards_snapshot = (
+            await asyncio.to_thread(deps.read_profile_cards, user_id) or {}
+        )
+        rendered_cards = str(cards_snapshot.get("rendered") or "")
+        eligible_count = int(cards_snapshot.get("eligible_card_count") or 0)
+        now_ts = time.time()
+        now_iso = (
+            datetime.fromtimestamp(now_ts, timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        source = {
+            "card_count": int(cards_snapshot.get("card_count") or 0),
+            "max_updated_at": str(cards_snapshot.get("max_updated_at") or ""),
+            "generated_at": now_iso,
+        }
+
+        if eligible_count == 0:
+            if renew_lease is not None:
+                await renew_lease()
+            result = await asyncio.to_thread(
+                v2_profile_store.update_profile_cas,
+                user_id,
+                lambda expected: v2_profile_store.build_profile_document(
+                    user_id,
+                    state="empty",
+                    source=source,
+                    last_attempt={
+                        "at": now_iso,
+                        "reject_code": "",
+                        "attempts": 0,
+                        "retry_not_before": 0,
+                    },
+                    previous=_profile_valid_document(expected),
+                    disabled=bool(
+                        _profile_valid_document(expected).get("disabled", False)
+                    ),
+                ),
+            )
+            if result.status == "cas_failed":
+                return await _write_failure("profile_cas_failed")
+            return await _terminal_completed()
+
+        generation = await v2_profile.generate_profile(
+            provider_config=provider_config,
+            rendered_cards=rendered_cards,
+            llm=provider_client.chat_completion_async,
+            usage_out=tm.add_call if tm is not None else None,
+            trajectory_out=(
+                trajectory_recorder.record
+                if trajectory_recorder is not None
+                else None
+            ),
+        )
+        if generation.fields is None:
+            return await _write_failure(
+                generation.reject_code or "profile_generation_rejected"
+            )
+
+        def _success(expected: dict) -> dict:
+            previous = _profile_valid_document(expected)
+            return v2_profile_store.build_profile_document(
+                user_id,
+                state="ok",
+                source=source,
+                last_attempt={
+                    "at": now_iso,
+                    "reject_code": "",
+                    "attempts": 0,
+                    "retry_not_before": 0,
+                },
+                memory_text=generation.fields["memory"],
+                user_text=generation.fields["user"],
+                previous=previous,
+                disabled=bool(previous.get("disabled", False)),
+            )
+
+        if renew_lease is not None:
+            await renew_lease()
+        result = await asyncio.to_thread(
+            v2_profile_store.update_profile_cas,
+            user_id,
+            _success,
+        )
+        if result.status == "cas_failed":
+            return await _write_failure("profile_cas_failed")
+        return await _terminal_completed()
+    except LostJobLease:
+        raise
+    except Exception as exc:  # noqa: BLE001 — background lane stays silent
+        await _record_trajectory(
+            trajectory_recorder,
+            "turn_exception",
+            {
+                "stage": "profile",
+                "error_class": type(exc).__name__,
+                "error_code": _safe_failure_code("profile_failed", exc),
+            },
+            best_effort=True,
+        )
+        return await _write_failure(_safe_failure_code("profile_failed", exc))
 
 
 _LEASE_KEEPALIVE_INTERVAL_SEC = max(
@@ -9002,6 +9349,20 @@ async def process_job(
                 tm,
                 trajectory_recorder,
             )
+        if lane == "profile":
+            # Profile distillation is background-only. Its handler owns every
+            # failure transition and never reaches the chat exception path that
+            # publishes a user-visible error bubble.
+            return await _run_profile(
+                job_id,
+                user_id,
+                deps,
+                provider_config,
+                claimed_by,
+                tm,
+                trajectory_recorder,
+                _renew_lease,
+            )
         if lane in _WAKE_LANES:
             # Self-contained wake path (D3 Task 6): proactive turn, not a reply to a
             # just-sent user message. Own try/except inside `_run_wake` — never falls
@@ -9065,8 +9426,9 @@ async def process_job(
                 trajectory_recorder,
             )
         if lane != "chat":
-            # 真·未注册 lane 的兜底：maintenance/wake（heartbeat/scheduled/manual_wake）/
-            # capture/dream 都已在上面各自的 handler 里分派完；能落到这里的只剩既不是 chat、
+            # 真·未注册 lane 的兜底：maintenance/profile/wake
+            # （heartbeat/scheduled/manual_wake）/capture/dream 都已在上面各自的
+            # handler 里分派完；能落到这里的只剩既不是 chat、
             # 又没有对应 handler 的 lane（配置错误 / 未来新增但未接线的 lane）。若放它掉进下面
             # 的 chat 回合，模型一旦回复就会写出用户可见的聊天气泡、失败还弹 error chip。
             #
@@ -9290,6 +9652,9 @@ async def process_job(
         legacy_context = deps.read_summary is not None and deps.read_tail is not None
         optional_tail_turns: list[list[dict]] = []
         tail_source_truncated = False
+        agent_memory = ""
+        user_profile = ""
+        coverage_notice = ""
         through_seq = 0
         compact_through_seq = None
         optional_anchor_seq: int | None = None
@@ -9388,6 +9753,9 @@ async def process_job(
                 )
                 (
                     summary,
+                    agent_memory,
+                    user_profile,
+                    coverage_notice,
                     tail,
                     optional_tail_turns,
                     tail_source_truncated,
@@ -9443,17 +9811,28 @@ async def process_job(
                         user_id=user_id,
                         read_files=deps.read_files,
                     )
-                summary = await _bound_materialized_summary(
-                    user_id,
-                    summary,
-                    deps,
-                    provider_config=provider_config,
+                profile = await _select_profile_prompt_context(
+                    user_id=user_id,
+                    summary=summary,
+                    deps=deps,
                     enclave_sem=enclave_sem,
-                    claimed_by=claimed_by,
-                    job_id=job_id,
-                    add_usage=tm.add_call,
                     trajectory_recorder=trajectory_recorder,
                 )
+                summary = profile.summary
+                agent_memory = profile.memory
+                user_profile = profile.user
+                if not profile.used_profile:
+                    summary = await _bound_materialized_summary(
+                        user_id,
+                        summary,
+                        deps,
+                        provider_config=provider_config,
+                        enclave_sem=enclave_sem,
+                        claimed_by=claimed_by,
+                        job_id=job_id,
+                        add_usage=tm.add_call,
+                        trajectory_recorder=trajectory_recorder,
+                    )
             # Post-assembly hard assertion (D6): independent re-derivation,
             # not a reuse of `_ensure_prompt_coverage`'s return — see
             # `_assert_prompt_covers`'s docstring for why.
@@ -10532,6 +10911,9 @@ async def process_job(
                 mutation_recovery_active=(mutation_recovery_barrier is not None),
                 trusted_system_blocks=turn_trusted_system_blocks,
                 working_memory=working_memory,
+                agent_memory=agent_memory,
+                user_profile=user_profile,
+                coverage_notice=coverage_notice,
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,
                 optional_tail_turns=optional_tail_turns,
@@ -10577,6 +10959,9 @@ async def process_job(
                 )
                 (
                     summary,
+                    agent_memory,
+                    user_profile,
+                    coverage_notice,
                     tail,
                     optional_tail_turns,
                     tail_source_truncated,
@@ -10915,6 +11300,27 @@ async def process_job(
                 log.warning(
                     "[v2.worker] apply_pending_effects failed user=%s: %s", user_id, e
                 )
+        # Missing/failed profiles retry only after their explicit backoff.
+        # Healthy profiles use a seven-day age floor and enqueue only when the
+        # content-free Garden fingerprint changed. This is best-effort after
+        # the reply/job commit and can never rewrite a successful chat turn.
+        try:
+            if await asyncio.to_thread(
+                v2_profile_store.profile_refresh_due,
+                user_id,
+            ):
+                await asyncio.to_thread(
+                    jobs_store.enqueue_job,
+                    user_id,
+                    "profile",
+                    reason="turn_refresh",
+                )
+        except Exception as exc:  # noqa: BLE001 — committed reply is authoritative
+            log.warning(
+                "[v2.worker] post-turn profile enqueue failed user=%s code=%s",
+                user_id,
+                type(exc).__name__.lower(),
+            )
         try:
             tm.flush(failed=False, status="ok")
         except Exception as exc:  # noqa: BLE001 — post-commit telemetry only
