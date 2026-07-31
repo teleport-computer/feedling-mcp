@@ -37,6 +37,7 @@ LANES = {
     "capture",
     "maintenance",
     "dream",
+    "profile",
     "screen_watch",
     "trajectory_review",
 }
@@ -65,6 +66,7 @@ LANE_PRIORITY = {
     "capture": 10,
     "maintenance": 10,
     "dream": 10,
+    "profile": 10,
     # Offline analysis must never contend with foreground chat/wake or memory
     # maintenance. One generic job drains one encrypted failed-turn review.
     "trajectory_review": 1,

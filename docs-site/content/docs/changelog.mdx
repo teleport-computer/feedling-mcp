@@ -10,6 +10,20 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Runtime V2 stages bounded profile generation and restores the pooled
+  worker's Memory lanes.** A new low-priority `profile` job reads the complete
+  eligible Memory Garden with a scoped runtime token, rejects truncated views,
+  generates Memory/User fields with a bounded provider-call budget, and writes
+  them through the encrypted profile CAS. Runtime V2 cutover, successful dream
+  writes, and best-effort post-Chat freshness checks can enqueue the job;
+  degraded profiles respect exponential retry metadata, and the seven-day
+  stale floor runs independently of the dream setting. Profile failures remain
+  background-only and never create a Chat bubble or terminal turn error.
+  Managed production, pre-production, and test Compose configurations now
+  explicitly enable capture and dream in `serve-worker`. Profile generation
+  stays default-off, and profile prompt injection is still reserved for the
+  later rollout.
+
 - **Encrypted Runtime V2 profile storage is staged for the bounded
   Memory/User rollout.** Both fields share one `v2_agent_profile` CAS document
   but remain separate shared encrypted envelopes. PostgreSQL and the TEE shadow
