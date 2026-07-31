@@ -167,6 +167,7 @@ def observe_pinned_message(
     payload: dict,
     *,
     caller_api_key: str | None,
+    caller_runtime_token: str = "",
 ) -> tuple[dict, int]:
     message_id = str(payload.get("message_id") or "").strip()
     route_id = str(payload.get("route_id") or "").strip()
@@ -177,7 +178,6 @@ def observe_pinned_message(
         "provider": str(route.get("provider") or "")[:80],
         "model": str(route.get("model") or "")[:96],
     }
-
     try:
         rows = store.reload_chat_strict()
     except Exception as exc:
@@ -201,6 +201,7 @@ def observe_pinned_message(
         "chat_image_read",
         store,
         api_key=caller_api_key,
+        runtime_token=caller_runtime_token or None,
         params={"message_id": message_id},
     )
     if not image_result.ok:
@@ -228,6 +229,7 @@ def observe_pinned_message(
             store.user_id,
             route_id,
             api_key=caller_api_key,
+            runtime_token=caller_runtime_token,
         )
         observation = observe_image(
             config,
