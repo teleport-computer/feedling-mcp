@@ -397,6 +397,85 @@ def test_stable_skills_and_working_memory_precede_dynamic_cache_frontier() -> No
     assert not any("cachePoint" in block for block in merged[runtime_index + 1 :])
 
 
+def test_profile_header_contract_and_cache_priority_on_openai_and_anthropic():
+    assert pc._PROFILE_HEADER == v2_context.AGENT_MEMORY_HEADER.splitlines()[0]
+    messages = v2_context.build_turn_messages(
+        system_prompt="stable system",
+        working_memory="- editable state",
+        agent_memory="stable relationship facts",
+        user_profile="stable interaction style",
+        summary="",
+        tail=[
+            {"role": "user", "content": "older request"},
+            {"role": "assistant", "content": "older response"},
+            {"role": "user", "content": "newest request"},
+        ],
+        coverage_hole_notice="7 earlier messages omitted",
+        action_context="live=dynamic",
+    )
+
+    marked_openai = pc._mark_openai_chat_cache_breakpoint(messages)
+    openai_profile = next(
+        message
+        for message in marked_openai
+        if pc._is_profile_message(message)
+    )
+    assert _nested_cache_controls(openai_profile) == [{"type": "ephemeral"}]
+    assert _nested_cache_controls(marked_openai[0]) == [{"type": "ephemeral"}]
+    openai_newest = next(
+        message
+        for message in marked_openai
+        if pc._content_text(message.get("content")) == "newest request"
+    )
+    openai_older = next(
+        message
+        for message in marked_openai
+        if pc._content_text(message.get("content")) == "older request"
+    )
+    assert _nested_cache_controls(openai_newest) == [{"type": "ephemeral"}]
+    assert _nested_cache_controls(openai_older) == []
+    assert not any(
+        _nested_cache_controls(message)
+        for message in marked_openai
+        if str(message.get("role") or "").lower() == "user"
+        and (
+            pc._is_coverage_hole_message(message)
+            or pc._is_runtime_context_message(message)
+        )
+    )
+
+    system = str(messages[0]["content"])
+    anthropic_system, marked_anthropic = pc._mark_anthropic_cache_breakpoint(
+        system,
+        messages[1:],
+    )
+    assert _nested_cache_controls(anthropic_system) == [{"type": "ephemeral"}]
+    anthropic_profile = next(
+        message
+        for message in marked_anthropic
+        if pc._is_profile_message(message)
+    )
+    newest_user = next(
+        message
+        for message in marked_anthropic
+        if pc._content_text(message.get("content")) == "newest request"
+    )
+    older_user = next(
+        message
+        for message in marked_anthropic
+        if pc._content_text(message.get("content")) == "older request"
+    )
+    assert _nested_cache_controls(anthropic_profile) == [{"type": "ephemeral"}]
+    assert _nested_cache_controls(newest_user) == [{"type": "ephemeral"}]
+    assert _nested_cache_controls(older_user) == []
+    assert not any(
+        _nested_cache_controls(message)
+        for message in marked_anthropic
+        if pc._is_coverage_hole_message(message)
+        or pc._is_runtime_context_message(message)
+    )
+
+
 def test_working_memory_revision_preserves_skill_prefix_on_all_cache_wires():
     backend = InMemoryWorkspaceBackend()
     backend.put_read_only(

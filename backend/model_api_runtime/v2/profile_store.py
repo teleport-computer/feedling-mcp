@@ -404,7 +404,11 @@ def select_profile_for_turn(
         return ProfilePromptSelection(
             summary=str(summary), fallback_reason=reason
         )
-    if document["state"] != "ok" or document["disabled"]:
+    if document["disabled"]:
+        return ProfilePromptSelection(
+            summary=str(summary), fallback_reason="disabled"
+        )
+    if document["state"] != "ok":
         return ProfilePromptSelection(
             summary=str(summary), fallback_reason=f"state:{document['state']}"
         )
