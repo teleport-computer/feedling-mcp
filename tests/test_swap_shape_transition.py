@@ -74,6 +74,33 @@ def test_plaintext_to_sealed_clears_body():
     assert record["role"] == "user"
 
 
+def test_plaintext_pointer_to_binary_plaintext_clears_internal_fields():
+    record = {
+        "body_key": "chatfiles/usr_owner/g1/itm-1/version",
+        "body_object_format": "plaintext_v1",
+        "body_sha256": "a" * 64,
+        "body_size_bytes": 2,
+        "owner_user_id": "usr_owner",
+        "visibility": "shared",
+        "role": "user",
+    }
+
+    core_envelope.replace_record_shape(
+        record,
+        {
+            "body_b64": "AAE=",
+            "body_size_bytes": 2,
+            "owner_user_id": "usr_owner",
+            "visibility": "shared",
+        },
+    )
+
+    assert record["body_b64"] == "AAE="
+    assert record["body_size_bytes"] == 2
+    assert not ({"body_key", "body_object_format", "body_sha256"} & set(record))
+    assert record["role"] == "user"
+
+
 def test_sealed_rows_always_carry_an_enclave_pk_fpr_key():
     """老客户端不传这个指纹，但落库行历来恒有此键（缺省空串）——rewrap 的跳过
     逻辑直接从行上读它，键不在会让判断走空。"""

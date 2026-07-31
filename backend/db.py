@@ -29,6 +29,8 @@ behavior identical to the file era. Read helpers return empty/None on failure.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -5744,16 +5746,32 @@ def seq_for_watermark_ts(user_id: str, watermark_ts: float) -> int:
 
 
 def _is_chat_file_pointer(doc) -> bool:
-    return isinstance(doc, dict) and bool(doc.get("body_key")) and doc.get("body_ct") is None
+    return (
+        isinstance(doc, dict)
+        and bool(doc.get("body_key"))
+        and doc.get("body_ct") is None
+        and doc.get("body_b64") is None
+    )
+
+
+def _chat_body_object_format(doc: dict) -> str:
+    """Classify an R2 pointer without guessing an unknown marker."""
+    if "body_object_format" not in doc or doc.get("body_object_format") is None:
+        return "sealed_v1"
+    marker = doc.get("body_object_format")
+    if marker == "plaintext_v1":
+        return marker
+    raise ValueError("chat_body_object_format_unrecognized")
 
 
 def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
-    """Return a doc guaranteed to carry ``body_ct``. If ``doc`` is an R2 pointer
-    (``body_key`` set, ``body_ct`` absent) the ciphertext is fetched from R2 and
-    inlined into a COPY (the stored/cached row stays slim). Non-pointers and, when
-    R2 is unconfigured, everything are returned unchanged. A missing/failed fetch
-    returns the doc as-is (``body_ct`` still absent) so the enclave surfaces a
-    per-item decrypt error for that one message rather than crashing the read.
+    """Hydrate a sealed or plaintext R2 pointer according to its marker.
+
+    Legacy pointers (marker absent) produce ``body_ct`` exactly as before.
+    ``plaintext_v1`` pointers validate raw size and SHA-256 before producing
+    ``body_b64``.  Unknown markers and corrupt plaintext objects fail closed;
+    missing/unavailable objects retain the pointer so the caller can surface an
+    absent body or retry without misclassifying its bytes.
 
     Call this ONLY at exits that actually deliver a body (poll delivery, a
     history page that includes the body, single message-body fetch) — never in
@@ -5764,11 +5782,54 @@ def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
     so object_storage refuses one that isn't under this user's own prefix."""
     if not _is_chat_file_pointer(doc) or not object_storage.chat_files_enabled():
         return doc
-    body = object_storage.get_chat_body(str(doc.get("body_key") or ""), user_id)
-    if body is None:
+    body_format = _chat_body_object_format(doc)
+    if body_format == "sealed_v1":
+        body = object_storage.get_chat_body(
+            str(doc.get("body_key") or ""),
+            user_id,
+        )
+        if body is None:
+            return doc
+        out = {
+            k: v
+            for k, v in doc.items()
+            if k not in ("body_key", "body_object_format", "body_sha256")
+        }
+        out["body_ct"] = body
+        return out
+
+    raw = object_storage.get_chat_body_bytes(
+        str(doc.get("body_key") or ""),
+        user_id,
+    )
+    if raw is None:
         return doc
-    out = {k: v for k, v in doc.items() if k != "body_key"}
-    out["body_ct"] = body
+    out = {
+        k: v
+        for k, v in doc.items()
+        if k not in ("body_key", "body_object_format", "body_sha256")
+    }
+    encoded = base64.b64encode(raw).decode("ascii")
+
+    try:
+        expected_size = int(doc["body_size_bytes"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("chat_plaintext_body_size_invalid") from exc
+    expected_sha256 = doc.get("body_sha256")
+    if (
+        expected_size < 0
+        or len(raw) != expected_size
+        or not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or expected_sha256.lower() != expected_sha256
+        or any(ch not in "0123456789abcdef" for ch in expected_sha256)
+    ):
+        raise ValueError("chat_plaintext_body_integrity_mismatch")
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("chat_plaintext_body_integrity_mismatch")
+    out.pop("body_ct_len", None)
+    out["body_b64"] = encoded
+    out["body_size_bytes"] = expected_size
     return out
 
 
@@ -5790,8 +5851,10 @@ def _normalize_chat_body_doc(doc: dict) -> dict:
     branch in :func:`_chat_insert_on_cursor`.
     """
     out = dict(doc or {})
-    if out.get("body_ct") is not None:
+    if out.get("body_ct") is not None or out.get("body_b64") is not None:
         out.pop("body_key", None)
+        out.pop("body_object_format", None)
+        out.pop("body_sha256", None)
         out.pop("body_ct_len", None)
     return out
 

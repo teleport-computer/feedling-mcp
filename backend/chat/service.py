@@ -256,18 +256,31 @@ def _is_r2_pointer(m: dict) -> bool:
 
 
 def _body_omit_decision(m: dict, *, include_image_body: bool) -> tuple[bool, str, int]:
-    """(omit?, reason, body_ct_len) for one message. Shared by the page pre-fetch
+    """(omit?, reason, encoded-or-raw size) for one message. Shared by pre-fetch
     and the item renderer so the two can never disagree about which bodies this
-    page delivers. A pointer's length is read off the row (``body_ct_len``), so
-    the omit path can report a size without fetching from R2."""
+    page delivers. Pointer size is read off the row, so the omit path can report
+    it without fetching from R2. Plaintext pointers use raw ``body_size_bytes``;
+    sealed pointers retain the legacy base64 ``body_ct_len``."""
     is_pointer = _is_r2_pointer(m)
-    body_ct_len = int(m.get("body_ct_len") or 0) if is_pointer else len(m.get("body_ct") or "")
+    is_plaintext_pointer = (
+        is_pointer and m.get("body_object_format") == "plaintext_v1"
+    )
+    body_size = (
+        int(m.get("body_size_bytes") or 0)
+        if is_plaintext_pointer
+        else (
+            int(m.get("body_ct_len") or 0)
+            if is_pointer
+            else len(m.get("body_ct") or m.get("body_b64") or "")
+        )
+    )
     if not include_image_body:
         if m.get("content_type", "text") == "image":
-            return True, "image_body", body_ct_len
-        if body_ct_len > CHAT_HISTORY_INLINE_BODY_CT_MAX:
-            return True, "large_body_ct", body_ct_len
-    return False, "", body_ct_len
+            return True, "image_body", body_size
+        if body_size > CHAT_HISTORY_INLINE_BODY_CT_MAX:
+            reason = "large_body" if is_plaintext_pointer else "large_body_ct"
+            return True, reason, body_size
+    return False, "", body_size
 
 
 def hydrate_history_page(msgs: list[dict], *, include_image_body: bool) -> list[dict]:
@@ -319,15 +332,28 @@ def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
 
     content_type = item.get("content_type", "text")
     is_pointer = _is_r2_pointer(item)
-    should_omit_body, body_omitted_reason, body_ct_len = _body_omit_decision(
+    should_omit_body, body_omitted_reason, body_size = _body_omit_decision(
         item, include_image_body=include_image_body
+    )
+    is_plaintext_pointer = (
+        is_pointer and item.get("body_object_format") == "plaintext_v1"
     )
 
     if should_omit_body:
-        item["body_ct_len"] = body_ct_len
+        size_field = "body_size_bytes" if is_plaintext_pointer else "body_ct_len"
+        item[size_field] = body_size
         item["body_omitted"] = True
         item["body_omitted_reason"] = body_omitted_reason
-        for key in ("body_ct", "nonce", "K_user", "K_enclave", "body_key"):
+        for key in (
+            "body_ct",
+            "body_b64",
+            "nonce",
+            "K_user",
+            "K_enclave",
+            "body_key",
+            "body_object_format",
+            "body_sha256",
+        ):
             item.pop(key, None)
     else:
         # Body is being delivered — if it lives in R2, fetch it now. This is the
@@ -336,8 +362,13 @@ def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
         if is_pointer:
             item = dict(db.hydrate_chat_file_body(str(item.get("owner_user_id") or ""), item))
             item.setdefault("content", "")
-        if content_type == "image" or body_ct_len > CHAT_HISTORY_INLINE_BODY_CT_MAX:
-            item["body_ct_len"] = body_ct_len
+            # A failed fetch leaves the pointer in place. Never expose internal
+            # storage coordinates or integrity metadata on the public response.
+            for key in ("body_key", "body_object_format", "body_sha256"):
+                item.pop(key, None)
+        if content_type == "image" or body_size > CHAT_HISTORY_INLINE_BODY_CT_MAX:
+            size_field = "body_size_bytes" if is_plaintext_pointer else "body_ct_len"
+            item[size_field] = body_size
             item["body_omitted"] = False
 
     role = item.get("role")

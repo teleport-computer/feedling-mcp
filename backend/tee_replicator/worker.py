@@ -178,7 +178,10 @@ def _chat_unpack(r: tuple) -> tuple:
     unpack 同时服务 run_table 游标环和 _consume_requeue，两条路径一并覆盖。
     """
     uid, msg_id, ts, doc, seq = r
-    if db._is_chat_file_pointer(doc):
+    if (
+        db._is_chat_file_pointer(doc)
+        and db._chat_body_object_format(doc) == "sealed_v1"
+    ):
         doc = db.hydrate_chat_file_body(uid, doc)
     return (uid, msg_id, ts, {**doc, _SEQ_KEY: seq})
 
@@ -422,7 +425,14 @@ def _transform_with_retry(cfg: _Table, doc: dict, user_id: str) -> dict:
     if _carries_verbatim(user_id):
         # 加密档：整行原样搬运，复制层不解密（Task 2.4）。
         return transforms.carry_verbatim(doc)
-    if isinstance(doc.get("body"), str) and not transforms.needs_decrypt(doc):
+    main_is_plaintext = (
+        isinstance(doc.get("body"), str)
+        or (
+            bool(doc.get("body_key"))
+            and doc.get("body_object_format") == "plaintext_v1"
+        )
+    )
+    if main_is_plaintext and not transforms.needs_decrypt(doc):
         # 明文档的终态行已经是 transform 的目标形状。旁路必须放在
         # _get_decrypt 之前，否则即使 transform 本身不调用 decrypt，复制层仍会
         # 无意义地铸 token/准备 enclave，并在 enclave 故障时连坐明文用户。
@@ -585,7 +595,10 @@ def _chat_archive_unpack(r: tuple) -> tuple:
     """
     (uid, source_seq, msg_id, ts, doc, storage_generation, clear_generation,
      cleared_at) = r
-    if db._is_chat_file_pointer(doc):
+    if (
+        db._is_chat_file_pointer(doc)
+        and db._chat_body_object_format(doc) == "sealed_v1"
+    ):
         doc = db.hydrate_chat_file_body(uid, doc)
     item_id = str(source_seq)
     sort_val = _iso(cleared_at) or ""
@@ -619,10 +632,15 @@ _TABLES["chat_message_archive"] = _Table(
                 "cleared_at=EXCLUDED.cleared_at"),
     unpack=_chat_archive_unpack,
     upsert_args=_chat_archive_upsert_args,
-    # 归档表只有一条 INSERT 写路径（db.py 清空历史时），没有任何 UPDATE——一旦
-    # 归档即不可变，不需要 requeue（同 chat_message_archive 自身没有原地改写）。
-    requeue_fetch_sql=None,
-    requeue_delete_tee_sql=None,
+    # 常规产品路径仍是 append-only；R2 plaintext pointer backfill 会在 RDS 事务内
+    # delete+insert 同一 source_seq（保留 cleared_at），因此普通游标不会再看见它。
+    # 迁移完成后用 requeue lane 取回当前行，保证 TEE pointer 同步切换。
+    requeue_fetch_sql=("SELECT user_id, source_seq, msg_id, ts, doc, "
+                       "storage_generation, clear_generation, cleared_at "
+                       "FROM chat_message_archive "
+                       "WHERE user_id = %s AND source_seq = %s"),
+    requeue_delete_tee_sql=("DELETE FROM chat_message_archive "
+                            "WHERE user_id = %s AND source_seq = %s"),
     # 冷启动：cleared_at 是 TIMESTAMPTZ，"-infinity" 是合法字面量；source_seq 是
     # BIGINT（WHERE 里没有 ::text 转型），空串不是合法 bigint，必须给数字串。
     cursor_zero=("-infinity", "0"),

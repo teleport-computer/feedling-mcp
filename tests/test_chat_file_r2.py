@@ -11,6 +11,7 @@ stands in for boto3 (reuses test_frame_r2).
 """
 
 import base64
+import hashlib
 import sys
 import threading
 import time
@@ -323,6 +324,146 @@ def test_hydrate_helper_reconstitutes(backend_env, monkeypatch):
     full = db.hydrate_chat_file_body(uid, pointer)
     assert base64.b64decode(full["body_ct"]) == body
     assert "body_key" not in full
+
+
+def test_raw_chat_body_helpers_preserve_bytes_and_legacy_wrapper(
+    backend_env, monkeypatch,
+):
+    client = _FakeS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid()
+    raw = b"\x00\xffplaintext-file"
+    key = object_storage.put_chat_body_bytes(
+        uid,
+        "msg-raw",
+        raw,
+        "file",
+        upload_version="version",
+        storage_generation=7,
+    )
+
+    assert key == f"chatfiles/{uid}/g7/msg-raw/version"
+    assert object_storage.get_chat_body_bytes(key, uid) == raw
+    assert base64.b64decode(object_storage.get_chat_body(key, uid)) == raw
+
+
+def test_legacy_put_chat_body_rejects_noncanonical_base64(
+    backend_env, monkeypatch,
+):
+    client = _FakeS3()
+    _enable_r2(monkeypatch, client)
+
+    with pytest.raises(ValueError, match="chat_body_invalid_base64"):
+        object_storage.put_chat_body(
+            _uid(),
+            "msg-invalid",
+            "not base64!",
+            upload_version="version",
+            storage_generation=1,
+        )
+    assert client.store == {}
+
+
+def test_plaintext_pointer_hydrates_to_verified_body_b64(
+    backend_env, monkeypatch,
+):
+    client = _FakeS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid()
+    raw = b"\x00plaintext-image\xff"
+    key = object_storage.put_chat_body_bytes(
+        uid,
+        "msg-plain",
+        raw,
+        "image",
+        upload_version="version",
+        storage_generation=2,
+    )
+    pointer = {
+        "id": "msg-plain",
+        "content_type": "image",
+        "owner_user_id": uid,
+        "visibility": "shared",
+        "body_key": key,
+        "body_object_format": "plaintext_v1",
+        "body_size_bytes": len(raw),
+        "body_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+    full = db.hydrate_chat_file_body(uid, pointer)
+
+    assert base64.b64decode(full["body_b64"], validate=True) == raw
+    assert full["body_size_bytes"] == len(raw)
+    assert not ({"body_key", "body_object_format", "body_sha256"} & set(full))
+    assert "body_ct" not in full
+
+
+@pytest.mark.parametrize("mutation", ["size", "hash", "unknown_format"])
+def test_plaintext_pointer_fails_closed_on_bad_metadata(
+    backend_env, monkeypatch, mutation,
+):
+    client = _CountingS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid()
+    raw = b"verified"
+    key = object_storage.put_chat_body_bytes(
+        uid,
+        "msg-bad",
+        raw,
+        upload_version="version",
+        storage_generation=1,
+    )
+    pointer = {
+        "body_key": key,
+        "body_object_format": "plaintext_v1",
+        "body_size_bytes": len(raw),
+        "body_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    if mutation == "size":
+        pointer["body_size_bytes"] += 1
+    elif mutation == "hash":
+        pointer["body_sha256"] = "0" * 64
+    else:
+        pointer["body_object_format"] = "future_v2"
+
+    with pytest.raises(ValueError):
+        db.hydrate_chat_file_body(uid, pointer)
+    if mutation == "unknown_format":
+        assert client.gets == [], "未知 marker 必须在 GET 前拒绝"
+
+
+def test_history_plaintext_pointer_omits_without_leaking_internal_fields(
+    backend_env, monkeypatch,
+):
+    client = _CountingS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid()
+    raw = b"x" * 300_000
+    key = object_storage.put_chat_body_bytes(
+        uid,
+        "msg-large-plain",
+        raw,
+        upload_version="version",
+        storage_generation=1,
+    )
+    pointer = {
+        "id": "msg-large-plain",
+        "content_type": "file",
+        "owner_user_id": uid,
+        "visibility": "shared",
+        "body_key": key,
+        "body_object_format": "plaintext_v1",
+        "body_size_bytes": len(raw),
+        "body_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+    item = chat_service._chat_history_item(pointer, include_image_body=False)
+
+    assert item["body_omitted"] is True
+    assert item["body_omitted_reason"] == "large_body"
+    assert item["body_size_bytes"] == len(raw)
+    assert not ({"body_key", "body_object_format", "body_sha256"} & set(item))
+    assert client.gets == []
 
 
 def test_history_item_hydrates_when_body_included(backend_env, monkeypatch):

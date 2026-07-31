@@ -80,6 +80,22 @@ def test_plaintext_envelope_yields_body_and_no_crypto_fields():
     assert not ({"body_ct", "nonce", "K_user", "K_enclave"} & set(out))
 
 
+def test_binary_plaintext_envelope_yields_wire_body_and_size():
+    out = envelope_storage_fields({
+        "body_b64": "AAE=",
+        "body_size_bytes": 2,
+        "owner_user_id": "usr_owner",
+        "visibility": "shared",
+    })
+
+    assert out == {
+        "body_b64": "AAE=",
+        "body_size_bytes": 2,
+        "owner_user_id": "usr_owner",
+        "visibility": "shared",
+    }
+
+
 def test_body_ct_wins_when_both_shapes_present():
     """迁移中间态：密文是真源。反过来会把过期的明文残留落成新行。"""
     env = _sealed(body="stale plaintext")

@@ -90,7 +90,8 @@ def read_envelope_body(envelope: dict, api_key: str | None, *,
 
     两种形状并存是 TEE 扶正期与 v6 加密可选之后的常态：
       - 信封行（加密档 / 现存量）：有 ``body_ct`` → 走 enclave 解密。
-      - 明文行（默认档）：``{body, id, owner_user_id, visibility}`` → **本地直读**。
+      - 二进制明文行：有 ``body_b64`` → 严格 base64 解码，本地直读。
+      - UTF-8 明文行：``{body, id, owner_user_id, visibility}`` → **本地直读**。
 
     明文分支绝不打 enclave：cutover 后 enclave 只服务加密档用户，明文档的读路径
     不该再依赖它——这既是「读路径不经 enclave 更快」的兑现点，也让 enclave 故障
@@ -108,6 +109,11 @@ def read_envelope_body(envelope: dict, api_key: str | None, *,
         kwargs = {"runtime_token": runtime_token} if runtime_token else {}
         return enclave._decrypt_envelope_via_enclave(
             envelope, api_key, purpose=purpose, **kwargs)
+    if envelope.get("body_b64") is not None:
+        try:
+            return base64.b64decode(envelope["body_b64"], validate=True)
+        except Exception as exc:
+            raise ValueError("envelope_body_b64_invalid") from exc
     body = envelope.get("body")
     if isinstance(body, str):
         return body.encode("utf-8")
@@ -124,6 +130,9 @@ def decrypt_provider_key_envelope(envelope: dict, api_key: str | None, *,
 
 _SEALED_FIELDS = ("body_ct", "nonce", "K_user", "K_enclave",
                   "enclave_pk_fpr", "content_pk_fpr")
+_PLAINTEXT_BINARY_FIELDS = ("body_b64", "body_size_bytes")
+_POINTER_FIELDS = ("body_key", "body_object_format", "body_sha256",
+                   "body_ct_len", "body_size_bytes")
 
 
 def envelope_storage_fields(envelope: dict, *,
@@ -134,7 +143,8 @@ def envelope_storage_fields(envelope: dict, *,
     形状就 KeyError。本函数按行形状路由，让那些站点变成形状无关：
 
       - 信封行 → ``body_ct/nonce/K_user/[K_enclave]/[enclave_pk_fpr]/…``
-      - 明文行 → ``body``
+      - 二进制明文行 → ``body_b64/[body_size_bytes]``
+      - UTF-8 明文行 → ``body``
 
     站点自有字段（id / role / ts / type / source…）仍由调用方写——迁移因此是纯
     机械的，且在写侧形状真正切换前**行为逐字不变**。
@@ -149,6 +159,10 @@ def envelope_storage_fields(envelope: dict, *,
     out: dict = {}
     if envelope.get("body_ct"):
         for key in _SEALED_FIELDS:
+            if envelope.get(key) is not None:
+                out[key] = envelope[key]
+    elif envelope.get("body_b64") is not None:
+        for key in _PLAINTEXT_BINARY_FIELDS:
             if envelope.get(key) is not None:
                 out[key] = envelope[key]
     elif envelope.get("body") is not None:
@@ -241,6 +255,9 @@ def replace_record_shape(record: dict, envelope: dict) -> None:
     for key in _SEALED_FIELDS:
         record.pop(key, None)
     record.pop("body", None)
+    record.pop("body_b64", None)
+    for key in _POINTER_FIELDS:
+        record.pop(key, None)
     record.update(envelope_storage_fields(envelope))
     if envelope.get("body_ct"):
         # 落库行历来恒有此键（缺省空串）：rewrap 的跳过逻辑直接从行上读它。

@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import base64
 import os
 import sys
 
@@ -50,6 +51,27 @@ def test_plaintext_row_never_touches_enclave(spy):
 
     assert out == b"hello"
     assert spy == [], "明文行不应打 enclave"
+
+
+def test_binary_plaintext_row_strictly_decodes_without_enclave(spy):
+    out = core_envelope.read_envelope_body(
+        {"body_b64": base64.b64encode(b"\x00binary").decode("ascii")},
+        "ak",
+        purpose="chat_file_read",
+    )
+
+    assert out == b"\x00binary"
+    assert spy == []
+
+
+def test_binary_plaintext_rejects_invalid_base64(spy):
+    with pytest.raises(ValueError, match="envelope_body_b64_invalid"):
+        core_envelope.read_envelope_body(
+            {"body_b64": "not base64!"},
+            "ak",
+            purpose="chat_file_read",
+        )
+    assert spy == []
 
 
 def test_body_ct_wins_when_both_present(spy):

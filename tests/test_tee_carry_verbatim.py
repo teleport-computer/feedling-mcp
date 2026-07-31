@@ -123,6 +123,28 @@ def test_explicit_off_plaintext_row_bypasses_enclave(uid, monkeypatch):
     assert out == {**doc, "body": "helloworld"}
 
 
+def test_explicit_off_plaintext_pointer_bypasses_enclave(uid, monkeypatch):
+    registry._set_user_content_encryption(uid, "off")
+    tee_worker._carry_verbatim_cache.clear()
+    monkeypatch.setattr(tee_worker, "_get_decrypt", _boom)
+    doc = {
+        "id": "msg-pointer",
+        "body_key": f"chatfiles/{uid}/g1/msg-pointer/version",
+        "body_object_format": "plaintext_v1",
+        "body_size_bytes": 4,
+        "body_sha256": "a" * 64,
+        "owner_user_id": uid,
+        "visibility": "shared",
+        "role": "user",
+        "content_type": "file",
+    }
+
+    out = tee_worker._transform_with_retry(
+        _Cfg(transforms.plaintext_chat_doc), doc, uid)
+
+    assert out == doc
+
+
 @pytest.mark.parametrize(
     "transform",
     [

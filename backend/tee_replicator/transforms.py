@@ -103,8 +103,15 @@ def carry_verbatim(doc: dict) -> dict:
 def plaintext_chat_doc(doc: dict, decrypt) -> dict:
     """chat 行：主信封 + 可选 thinking / caption 子信封，全部明文化。"""
     msg_id = str(doc.get("id", ""))
-    if doc.get("body_key") and not doc.get("body_ct") and not isinstance(
-        doc.get("body"), str
+    is_plaintext_pointer = (
+        bool(doc.get("body_key"))
+        and doc.get("body_object_format") == "plaintext_v1"
+    )
+    if (
+        doc.get("body_key")
+        and not is_plaintext_pointer
+        and not doc.get("body_ct")
+        and not isinstance(doc.get("body"), str)
     ):
         # R2 pointer 本应在 worker.unpack 先水合。走到这里说明对象暂时取不到；
         # 必须作为传输错误冻结游标重试，不能伪装成 PendingDeviceMigration 后越过。
@@ -115,6 +122,8 @@ def plaintext_chat_doc(doc: dict, decrypt) -> dict:
         main_body = _decrypt_body(decrypt, doc, f"tee_replicate:chat:{msg_id}")
     elif isinstance(doc.get("body"), str):
         main_body = doc["body"]
+    elif is_plaintext_pointer:
+        main_body = None
     else:
         raise PendingDeviceMigration(msg_id)
 
@@ -122,7 +131,8 @@ def plaintext_chat_doc(doc: dict, decrypt) -> dict:
     # 子信封的前缀字段不该留在顶层——它们各自嵌套进 out[key]。
     out = {k: v for k, v in out.items()
            if not (k.startswith("thinking_") or k.startswith("caption_"))}
-    out["body"] = main_body
+    if main_body is not None:
+        out["body"] = main_body
     for prefix, key in _SUB_PREFIXES:
         sub = _sub_envelope(doc, prefix)
         if sub is None:

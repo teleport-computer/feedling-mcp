@@ -37,11 +37,12 @@ from core import envelope as core_envelope  # noqa: E402
 
 TESTS_DIR = pathlib.Path(__file__).resolve().parent
 
-# 生产里可能出现的三种正文承载方式。任何 helper 都必须只认这三种。
+# 生产里可能出现的四种正文承载方式。任何 helper 都必须只认这四种。
 #   body_ct  —— 双收件人信封
+#   body_b64 —— 二进制明文字节的线编码
 #   body     —— 明文行
 #   body_key —— R2 指针行（正文在对象存储，行内两者皆无）
-_REAL_SHAPE_KEYS = frozenset({"body_ct", "body", "body_key"})
+_REAL_SHAPE_KEYS = frozenset({"body_ct", "body_b64", "body", "body_key"})
 
 _UNRECOGNIZED = "envelope_shape_unrecognized"
 
@@ -101,7 +102,9 @@ def test_helpers_agree_on_which_keys_carry_a_body():
         and node.value.startswith("body")
     }
 
-    unexpected = referenced - _REAL_SHAPE_KEYS - {"body_ct_len"}
+    unexpected = referenced - _REAL_SHAPE_KEYS - {
+        "body_ct_len", "body_object_format", "body_sha256", "body_size_bytes",
+    }
     assert not unexpected, (
         f"core/envelope.py 里出现了新的 body* 键 {sorted(unexpected)}——"
         "新增正文承载方式要同时更新读侧/写侧/落库/swap 四处判别，"

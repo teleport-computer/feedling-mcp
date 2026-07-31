@@ -88,6 +88,34 @@ def test_chat_doc_plain_main_with_encrypted_subcontent_still_decrypts():
     assert out["thinking"]["body"] == "PT:BBB"
 
 
+def test_chat_plaintext_pointer_stays_pointer_and_decrypts_subcontent():
+    doc = {
+        "id": "m-pointer",
+        "role": "assistant",
+        "content_type": "image",
+        "visibility": "shared",
+        "owner_user_id": "u",
+        "body_key": "chatimages/u/g1/m-pointer/version",
+        "body_object_format": "plaintext_v1",
+        "body_size_bytes": 123,
+        "body_sha256": "a" * 64,
+        "caption_body_ct": "CCC",
+        "caption_nonce": "n",
+        "caption_K_user": "k",
+        "caption_K_enclave": "ke",
+        "caption_visibility": "shared",
+    }
+
+    out = transforms.plaintext_chat_doc(doc, _decrypt_stub)
+
+    assert out["body_key"] == doc["body_key"]
+    assert out["body_object_format"] == "plaintext_v1"
+    assert out["body_size_bytes"] == 123
+    assert out["body_sha256"] == "a" * 64
+    assert "body" not in out and "body_b64" not in out
+    assert out["caption"]["body"] == "PT:CCC"
+
+
 def test_local_only_raises_pending():
     doc = {"id": "m3", "visibility": "local_only", "body_ct": "X", "nonce": "n",
            "K_user": "k", "v": 1, "owner_user_id": "u", "ts": 3.0, "role": "user"}

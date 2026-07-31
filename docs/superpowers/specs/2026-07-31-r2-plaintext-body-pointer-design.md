@@ -278,6 +278,22 @@ clear_generation / cleared_at
 account delete 与本事务依靠 row lock/FK 串行化；若 delete 赢，迁移 CAS 失败并保留
 new-key guard，不得重新创造 archive 行。
 
+### 7.3 TEE requeue（实现审查补充）
+
+`chat_message_archive` 的复制游标按 `(cleared_at, source_seq)` 单向推进，而上述
+delete+insert 必须逐字保留 `cleared_at`。所以一个已经复制过的 archive 行完成替换后，
+**不会**被普通游标再次看见。live 表的同 PK UPDATE 也有同一类问题。
+
+每次成功切 pointer 后必须为对应行写 TEE requeue：
+
+- live：`table_name=chat_messages, item_id=msg_id`；
+- archive：`table_name=chat_message_archive, item_id=source_seq`。
+
+replicator 的 archive 配置因此必须新增按 `(user_id, source_seq)` re-fetch/upsert/delete
+能力。工具重跑遇到已经是 `plaintext_v1` 的行时也要补写 requeue，作为「RDS commit
+成功、进程在写 TEE marker 前崩溃」的恢复路径；验收 verify 在 requeue 清空前不得判绿。
+这不改变 archive 在 RDS 的不可 UPDATE 约束。
+
 ## 8. 读取、复制与 verify
 
 ### 8.1 app/backend 读取
