@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -194,6 +195,48 @@ def test_initial_insert_and_ok_degraded_ok_state_machine_true_pg():
     assert stored_ok["memory"]["envelope"] != first_memory_envelope
 
 
+def test_profile_source_stats_tracks_count_and_latest_update_true_pg():
+    uid = "u-profile-source-stats"
+    _reset(uid)
+
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO memory_moments (user_id, moment_id, occurred_at, doc) "
+            "VALUES (%s, %s, %s, %s::jsonb), (%s, %s, %s, %s::jsonb)",
+            (
+                uid,
+                "m1",
+                "2026-07-01T00:00:00Z",
+                json.dumps({"updated_at": "2026-07-10T00:00:00Z"}),
+                uid,
+                "m2",
+                "2026-07-02T00:00:00Z",
+                json.dumps({"updated_at": "2026-07-20T00:00:00Z"}),
+            ),
+        )
+
+    assert db.memory_profile_source_stats(uid) == (
+        2,
+        "2026-07-20T00:00:00Z",
+    )
+
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE memory_moments SET doc=%s::jsonb "
+            "WHERE user_id=%s AND moment_id=%s",
+            (
+                json.dumps({"updated_at": "2026-07-31T00:00:00Z"}),
+                uid,
+                "m1",
+            ),
+        )
+
+    assert db.memory_profile_source_stats(uid) == (
+        2,
+        "2026-07-31T00:00:00Z",
+    )
+
+
 def test_first_write_uses_empty_expected_and_insert_if_missing(monkeypatch):
     captured = {}
     monkeypatch.setattr(profile_store.db, "get_blob_strict", lambda *_args: None)
@@ -260,6 +303,41 @@ def test_two_connection_stale_snapshot_recomputes_instead_of_replaying():
     final = db.get_blob_strict(uid, profile_store.PROFILE_BLOB_KIND)
     assert final == result_b.document
     assert final["memory"]["envelope"] == _seal(uid, "memory-2-b2")
+
+
+def test_async_cas_recomputes_after_loss_instead_of_replaying(monkeypatch):
+    uid = "u-profile-async-cas-race"
+    winner = _ok_doc(uid, 1, suffix="-winner")
+    reads = iter([{}, winner])
+    landed = iter([False, True])
+    candidates = []
+    recompute_inputs = []
+
+    monkeypatch.setattr(
+        profile_store.db,
+        "get_blob_strict",
+        lambda *_args: next(reads),
+    )
+
+    def _cas(_uid, _kind, _expected, candidate, **_kwargs):
+        candidates.append(candidate)
+        return next(landed)
+
+    monkeypatch.setattr(profile_store.db, "set_blob_if_unchanged", _cas)
+
+    async def _recompute(expected):
+        recompute_inputs.append(expected)
+        return _ok_doc(uid, len(recompute_inputs) + 1, suffix="-async")
+
+    result = asyncio.run(profile_store.update_profile_cas_async(uid, _recompute))
+
+    assert result.status == "written"
+    assert result.cas_attempts == 2
+    assert result.recomputations == 2
+    assert recompute_inputs[0] == {}
+    assert recompute_inputs[1] == winner
+    assert candidates[0] != candidates[1]
+    assert result.document == candidates[1]
 
 
 def test_newer_winner_discards_stale_candidate_without_replay(monkeypatch):
@@ -460,6 +538,34 @@ def test_ok_profile_suppresses_summary_only_after_both_fields_decrypt():
     assert selection.summary == ""
     assert selection.memory == "memory-1"
     assert selection.user == "user-1"
+
+
+def test_disabled_ok_profile_keeps_summary_without_decrypting_fields():
+    doc = profile_store.build_profile_document(
+        "u-profile-disabled",
+        state="ok",
+        source=_source(1),
+        last_attempt=_attempt(),
+        memory_text="memory-disabled",
+        user_text="user-disabled",
+        disabled=True,
+        seal_text=_seal,
+    )
+
+    selection = profile_store.select_profile_for_turn(
+        "u-profile-disabled",
+        "- old summary",
+        enabled=True,
+        read_blob=lambda *_args: doc,
+        decrypt_envelope=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("disabled profile must not decrypt")
+        ),
+    )
+
+    assert selection == profile_store.ProfilePromptSelection(
+        summary="- old summary",
+        fallback_reason="disabled",
+    )
 
 
 def test_winning_cas_mirrors_only_ciphertext_to_real_tee_shadow(monkeypatch):

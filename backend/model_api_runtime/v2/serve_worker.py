@@ -1924,6 +1924,98 @@ def _render_card_line(item: dict) -> str:
     return "- " + " ".join(parts)
 
 
+_PROFILE_CARD_CONTENT_MAX_CHARS = 2_000
+
+
+def _render_profile_card(item: dict) -> str:
+    """Render one complete Garden card for profile distillation."""
+
+    if not isinstance(item, dict):
+        return ""
+    summary = str(item.get("summary") or item.get("title") or "").strip()
+    content = str(item.get("content") or "").strip()
+    if not summary and not content:
+        return ""
+    parts = [
+        f"id={str(item.get('id') or '').strip()}",
+        f"bucket={str(item.get('bucket') or '').strip()}",
+        f"occurred_at={str(item.get('occurred_at') or '').strip()}",
+        f"summary={summary}",
+        f"content={content[:_PROFILE_CARD_CONTENT_MAX_CHARS]}",
+    ]
+    return "- " + " | ".join(parts)
+
+
+def _read_profile_cards(user_id: str) -> tuple[str, int]:
+    """Read every eligible Garden card or fail loudly on any truncation.
+
+    The lightweight index proves the complete cardinality, then fetch obtains
+    each card's bounded content. Both use the scoped runtime token; no API key
+    or server-side envelope decryption is involved.
+    """
+
+    store = core_store.get_store(user_id)
+    token = _mint_runtime_token(user_id)
+
+    def _post(api_key, candidates, *, operation, payload=None):
+        return memory_readside_core.post_enclave_readside(
+            api_key,
+            candidates,
+            operation=operation,
+            payload=payload,
+            runtime_token=token,
+        )
+
+    body, status = memory_core.index(
+        store,
+        None,
+        {"limit": 0, "include_sensitive": True},
+        post_enclave=_post,
+    )
+    if status != 200 or not isinstance(body, dict):
+        raise RuntimeError(f"profile_cards_index_failed:{status}")
+    items = body.get("items")
+    if not isinstance(items, list):
+        raise RuntimeError("profile_cards_index_invalid")
+    try:
+        user_card_count = int(body.get("user_card_count"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("profile_cards_count_invalid") from exc
+    if body.get("truncated") is not False or user_card_count != len(items):
+        raise RuntimeError(
+            f"profile_cards_truncated:{user_card_count}/{len(items)}"
+        )
+    if not items:
+        return "", 0
+    ids = [str(item.get("id") or "").strip() for item in items]
+    if any(not memory_id for memory_id in ids):
+        raise RuntimeError("profile_cards_id_missing")
+    fetched, fetch_status = memory_core.fetch(
+        store,
+        None,
+        {"ids": ids, "limit": 0, "include_sensitive": True},
+        post_enclave=_post,
+    )
+    fetched_items = (
+        fetched.get("items") if isinstance(fetched, dict) else None
+    )
+    if fetch_status != 200 or not isinstance(fetched_items, list):
+        raise RuntimeError(f"profile_cards_fetch_failed:{fetch_status}")
+    by_id = {
+        str(item.get("id") or ""): item
+        for item in fetched_items
+        if isinstance(item, dict)
+    }
+    if len(by_id) != user_card_count or any(memory_id not in by_id for memory_id in ids):
+        raise RuntimeError(
+            f"profile_cards_truncated:{user_card_count}/{len(by_id)}"
+        )
+    rendered = [_render_profile_card(by_id[memory_id]) for memory_id in ids]
+    if any(not line for line in rendered):
+        raise RuntimeError("profile_cards_render_incomplete")
+    return "\n".join(rendered), user_card_count
+
+
 def _read_memory_context(user_id: str) -> dict:
     """capture/dream prompt 要的记忆上下文（buckets/threads/identity/cards 明文串）。
 
@@ -3536,6 +3628,8 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_vision_observations=_read_vision_observations,
         read_files=_read_files,
         read_memory_context=_read_memory_context,
+        read_profile_cards=_read_profile_cards,
+        select_profile_for_turn=_select_agent_profile_for_turn,
         read_scheduled_wake_context=_read_scheduled_wake_context,
         read_perception_wake_context=_read_perception_wake_context,
         read_pending_scheduled_wake_context=_read_pending_scheduled_wake_context,

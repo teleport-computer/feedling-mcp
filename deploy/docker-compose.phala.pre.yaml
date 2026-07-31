@@ -205,8 +205,12 @@ services:
       # "resident" keeps day-1 behavior identical to pre-dual-runtime pre; the
       # allowlisted P1 dual-fleet test accounts override this default.
       FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
-      # Automatic Memory Capture stays explicit opt-in (default off).
-      FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-0}"
+      # Backend owns capture admission/triggers; serve-worker executes the lane.
+      # Keep both deployment gates aligned. User consent remains independent.
+      FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
+      # Backend owns the V2-cutover profile trigger; serve-worker executes it.
+      # Keep both copies default-off until profile generation is enabled.
+      FEEDLING_V2_PROFILE_ENABLED: "${FEEDLING_V2_PROFILE_ENABLED:-0}"
       # TEST-ONLY: genesis v2 (foreground-fast onboarding). Greet on 3-5 core +
       # identity baseline, push the heavy reduce (the ~37% prod failure surface)
       # to the background. Prod compose deliberately omits this (keeps the v1
@@ -262,6 +266,9 @@ services:
       FEEDLING_V2_RUNNER_CVM_ID: "${FEEDLING_V2_RUNNER_CVM_ID:-main-cvm}"
       FEEDLING_V2_DEPLOYED_BUILD: "${FEEDLING_V2_DEPLOYED_BUILD:-}"
       FEEDLING_GENESIS_WORKER_ENABLED: "1"
+      # Runtime V2 background memory lanes execute in this worker, not backend.
+      FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
+      FEEDLING_V2_DREAM_ENABLED: "${FEEDLING_V2_DREAM_ENABLED:-1}"
       # In-process document reader (docx/xlsx/pdf/text): parses attachment bytes
       # inside serve-worker via workspace.local_sandbox — plaintext stays in the
       # CVM, no external sandbox/egress. Reverses the isolation gate for reads;
@@ -294,6 +301,9 @@ services:
       # return; the cost is more fold calls per backlog, which is bounded.
       FEEDLING_V2_COMPACTION_BATCH_MSGS: "${FEEDLING_V2_COMPACTION_BATCH_MSGS:-50}"
       FEEDLING_V2_COMPACTION_BATCH_CHARS: "${FEEDLING_V2_COMPACTION_BATCH_CHARS:-120000}"
+      # Generation may be enabled for M4 validation; prompt replacement stays
+      # locked until M5 has deployed and been verified.
+      FEEDLING_V2_PROFILE_ENABLED: "${FEEDLING_V2_PROFILE_ENABLED:-0}"
       # DO NOT set to 1 before M5 MEMORY/USER prompt injection is deployed.
       FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: "${FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC:-0}"
       FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: "${FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC:-600}"

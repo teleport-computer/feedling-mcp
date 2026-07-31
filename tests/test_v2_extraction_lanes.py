@@ -125,14 +125,31 @@ def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
 
     monkeypatch.setattr(extraction, "extract", _fake_extract)
     applied = {}
-    deps = _deps(apply_memory_actions=lambda uid_, actions: (
-        applied.update(n=len(actions)) or {"status": "ok"}))
+    ordering = []
+
+    def _apply(uid_, actions):
+        ordering.append("memory_write")
+        applied.update(n=len(actions))
+        return {"status": "ok"}
+
+    async def _profile_enqueue(uid_, *, reason, force):
+        ordering.append("profile_enqueue")
+        assert uid_ == uid
+        assert reason == "dream_refresh"
+        assert force is True
+        return True
+
+    monkeypatch.setattr(worker, "_enqueue_profile_if_due", _profile_enqueue)
+    deps = _deps(apply_memory_actions=_apply)
 
     status = asyncio.run(worker.process_job(
         job, deps, provider_config=_BYOK, api_key=None, runtime_token="rt"))
 
     assert status == "completed"
     assert applied == ({"n": 1} if lane == "dream" else {})
+    assert ordering == (
+        ["memory_write", "profile_enqueue"] if lane == "dream" else []
+    )
     assert _job_row(job_id)[0] == "completed"
 
 

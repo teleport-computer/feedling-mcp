@@ -14,6 +14,12 @@ from hosted import chat_send_core, config_store as hosted_config_store
 from conftest import configure_model_api_route
 
 
+@pytest.fixture(autouse=True)
+def _legacy_exact_job_shapes_profile_off(monkeypatch):
+    """Keep exact Chat-only queue assertions independent of profile rollout."""
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
+
+
 def _seed(uid):
     with db.get_pool().connection() as conn:
         conn.execute(
