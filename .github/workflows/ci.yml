@@ -198,6 +198,7 @@ jobs:
         run: |
           python -m pytest \
             tests/test_ci_image_tag_width.py \
+            tests/test_deploy_yaml_strict.py \
             tests/test_hosted_runtime_policy.py \
             tests/test_dual_runtime_coexistence.py \
             tests/test_dual_runtime_send_routing.py \

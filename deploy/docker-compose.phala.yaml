@@ -365,10 +365,6 @@ services:
       DATABASE_URL: "${DATABASE_URL:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_V2_MAX_WORKERS: "4"
-      # Capture/dream producers run here, not in backend. User switches remain
-      # the consent gates; encrypted env can independently roll either lane back.
-      FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
-      FEEDLING_V2_DREAM_ENABLED: "${FEEDLING_V2_DREAM_ENABLED:-1}"
       FEEDLING_V2_FLEET_IDENTITY_REQUIRED: "1"
       FEEDLING_V2_RUNNER_CVM_ID: "${FEEDLING_V2_RUNNER_CVM_ID:-main-cvm}"
       FEEDLING_V2_DEPLOYED_BUILD: "${FEEDLING_V2_DEPLOYED_BUILD:-}"
