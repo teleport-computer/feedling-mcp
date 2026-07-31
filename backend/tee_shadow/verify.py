@@ -32,11 +32,13 @@ requeue 行则**不**跳过——backlog 未清空时，当前 RDS 明文与尚�
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 from typing import Callable
 
 import db
+import object_storage
 from tee_replicator import transforms
 from tee_replicator import worker as _worker
 from tee_shadow import mirror, reconciler
@@ -88,8 +90,8 @@ _CIPHERTEXT_TABLES: dict[str, dict] = {
         pending_by_user_only=True),
     "chat_message_archive": dict(
         rds_table="chat_message_archive", tee_table="chat_message_archive",
-        item_col="msg_id", pending_table="chat_message_archive",
-        kind=None, strict=False),
+        item_col="source_seq", pending_table="chat_message_archive",
+        kind="chat", strict=False),
     "model_api_credentials": dict(
         rds_table="model_api_credentials", tee_table="model_api_credentials",
         item_col="id", pending_table="model_api_credentials",
@@ -329,6 +331,31 @@ def _expected_doc(user_id: str, doc: dict, transform, decrypt_cache: dict):
         return None, str(e)
 
 
+def _plaintext_pointer_integrity_error(user_id: str, doc: dict) -> str | None:
+    """Validate one sampled plaintext pointer without returning/logging bytes."""
+    if doc.get("body_object_format") != "plaintext_v1":
+        return None
+    key = str(doc.get("body_key") or "")
+    if not object_storage.chat_key_owned_by(key, user_id):
+        return "foreign_body_key"
+    raw = object_storage.get_chat_body_bytes(key, user_id)
+    if raw is None:
+        return "r2_object_missing"
+    try:
+        expected_size = int(doc["body_size_bytes"])
+    except (KeyError, TypeError, ValueError):
+        return "body_size_invalid"
+    expected_hash = doc.get("body_sha256")
+    if len(raw) != expected_size:
+        return "body_size_mismatch"
+    if (
+        not isinstance(expected_hash, str)
+        or hashlib.sha256(raw).hexdigest() != expected_hash
+    ):
+        return "body_sha256_mismatch"
+    return None
+
+
 def _sample_ciphertext_content(key: str, cfg: dict, sample_rate: float,
                                 pending_rows: list[tuple[str, str]],
                                 decrypt_cache: dict[str, Callable]) -> list[dict]:
@@ -360,6 +387,19 @@ def _sample_ciphertext_content(key: str, cfg: dict, sample_rate: float,
                     continue
             elif (user_id, item_id) in skip:
                 continue
+            integrity_error = (
+                _plaintext_pointer_integrity_error(user_id, doc)
+                if cfg["kind"] == "chat"
+                else None
+            )
+            if integrity_error is not None:
+                mismatches.append({
+                    "table": key,
+                    "user_id": user_id,
+                    "item_id": item_id,
+                    "field": "<r2-object-integrity>",
+                    "error": integrity_error,
+                })
             expected, decrypt_error = _expected_doc(
                 user_id, doc, transform, decrypt_cache)
             if expected is None:

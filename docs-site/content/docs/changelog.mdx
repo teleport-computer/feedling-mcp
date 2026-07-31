@@ -10,6 +10,18 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Plaintext-tier Chat image/file bodies now have an explicit binary wire and
+  object-storage shape.** Main Chat envelopes may carry strict-base64
+  `body_b64` (and optional matching `body_size_bytes`) only for `image` or
+  `file` while `content_encryption_effective` is `"off"`. Heavy bodies are
+  offloaded as raw bytes behind a `plaintext_v1` pointer and verified by
+  SHA-256 and byte length before delivery; public responses never expose the
+  object key or stored hash. Encrypted-tier attachments retain the existing
+  `body_ct` envelope and ciphertext object. This expands the plaintext tier's
+  trust boundary to object storage and its backups. Existing ciphertext
+  attachment migration remains rollout-gated until supported clients are in
+  the forced-upgrade window.
+
 - **Content encryption is becoming a per-user preference with two storage
   tiers.** `whoami` now returns `content_encryption` (the user's stated
   preference) and `content_encryption_effective` (the shape a client must

@@ -2,7 +2,8 @@
 
 > 母计划：`docs/superpowers/plans/2026-07-23-tee-promotion-decrypt-removal.md`
 >
-> 状态：**2026-07-31 四项推荐方案已拍板**；未实现，禁止生产 apply。
+> 状态：**2026-07-31 四项推荐方案已拍板并完成 backend 协议实现**；生产 apply
+> 仍受 iOS 支持、强更窗口与部署 feature gate 约束。
 >
 > 范围：`chat_messages` / `chat_message_archive` 的 file/image R2 重体。
 > `frames-tee/` 使用 enclave storage key，是 Task 1.2，不在本设计内。

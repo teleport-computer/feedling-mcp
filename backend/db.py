@@ -5211,6 +5211,7 @@ _CHAT_BODY_CAS_FIELDS = (
     "id",
     "v",
     "body_ct",
+    "body_b64",
     "nonce",
     "K_user",
     "K_enclave",
@@ -6439,7 +6440,10 @@ def _offload_chat_body_after_commit(
         object_storage.chat_files_enabled()
         and isinstance(doc, dict)
         and doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
-        and doc.get("body_ct") is not None
+        and (
+            doc.get("body_ct") is not None
+            or doc.get("body_b64") is not None
+        )
     ):
         return
     normalized_doc = _normalize_chat_body_doc(doc)
@@ -6483,8 +6487,25 @@ def _offload_chat_body_after_commit(
                         expected_generation,
                         "upload_guard",
                     )
-        body_ct_len = len(normalized_doc["body_ct"])
-        pointer = {"body_key": key, "body_ct_len": body_ct_len}
+        is_plaintext = normalized_doc.get("body_b64") is not None
+        if is_plaintext:
+            raw_plaintext = base64.b64decode(
+                normalized_doc["body_b64"],
+                validate=True,
+            )
+            pointer = {
+                "body_key": key,
+                "body_object_format": "plaintext_v1",
+                "body_size_bytes": len(raw_plaintext),
+                "body_sha256": hashlib.sha256(raw_plaintext).hexdigest(),
+            }
+            inline_field = "body_b64"
+        else:
+            pointer = {
+                "body_key": key,
+                "body_ct_len": len(normalized_doc["body_ct"]),
+            }
+            inline_field = "body_ct"
         with get_pool().connection() as conn:
             conn.execute(
                 "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
@@ -6522,14 +6543,24 @@ def _offload_chat_body_after_commit(
                             and current_generation == int(expected_generation)
                         )
                 if upload_allowed:
-                    object_storage.put_chat_body(
-                        user_id,
-                        msg_id,
-                        normalized_doc["body_ct"],
-                        content_type,
-                        upload_version=upload_version,
-                        storage_generation=expected_generation,
-                    )
+                    if is_plaintext:
+                        object_storage.put_chat_body_bytes(
+                            user_id,
+                            msg_id,
+                            raw_plaintext,
+                            content_type,
+                            upload_version=upload_version,
+                            storage_generation=expected_generation,
+                        )
+                    else:
+                        object_storage.put_chat_body(
+                            user_id,
+                            msg_id,
+                            normalized_doc["body_ct"],
+                            content_type,
+                            upload_version=upload_version,
+                            storage_generation=expected_generation,
+                        )
                     with conn.transaction():
                         with conn.cursor() as cur:
                             current_generation = _lock_chat_r2_lifecycle_on_cursor(
@@ -6547,7 +6578,7 @@ def _offload_chat_body_after_commit(
                             ):
                                 cur.execute(
                                     "UPDATE chat_messages "
-                                    "SET doc = (doc - 'body_ct') || %s "
+                                    f"SET doc = (doc - '{inline_field}') || %s "
                                     "WHERE user_id=%s AND msg_id=%s "
                                     "  AND storage_generation=%s AND "
                                     f"{_CHAT_BODY_CAS_PREDICATE} RETURNING 1",
@@ -7021,7 +7052,7 @@ def _same_reply_envelope(existing_doc, requested_doc) -> bool:
             )
         )
     immutable_reply_fields = (
-        "id", "role", "source", "v", "body_ct", "nonce",
+        "id", "role", "source", "v", "body_ct", "body_b64", "nonce",
         "K_user", "K_enclave", "enclave_pk_fpr", "visibility",
         "owner_user_id", "content_type", "reply_to_message_id",
         # 明文行的正文（v6）。密文行有 body_ct 在清单里兜着，明文行漏了它就会
@@ -7030,20 +7061,46 @@ def _same_reply_envelope(existing_doc, requested_doc) -> bool:
     )
     if not isinstance(existing_doc, dict) or not isinstance(requested_doc, dict):
         return False
-    if _is_chat_file_pointer(existing_doc) and requested_doc.get("body_ct") is not None:
-        # Post-commit R2 offload intentionally replaces body_ct with a pointer.
-        # A retry still has the original inline envelope, so compare every other
-        # immutable crypto/routing field and use the persisted ciphertext length
-        # to bridge the one deliberate shape change.
+    requested_inline_field = (
+        "body_ct"
+        if requested_doc.get("body_ct") is not None
+        else "body_b64"
+        if requested_doc.get("body_b64") is not None
+        else ""
+    )
+    if _is_chat_file_pointer(existing_doc) and requested_inline_field:
+        # Post-commit R2 offload intentionally replaces the inline body with a
+        # pointer. A retry still carries that inline body, so compare every
+        # other immutable field and bridge the deliberate shape change using
+        # the pointer's format-specific length/hash metadata.
         pointer_fields = tuple(
-            field for field in immutable_reply_fields if field != "body_ct"
+            field
+            for field in immutable_reply_fields
+            if field != requested_inline_field
         )
-        return (
-            all(
-                existing_doc.get(field) == requested_doc.get(field)
-                for field in pointer_fields
+        fields_match = all(
+            existing_doc.get(field) == requested_doc.get(field)
+            for field in pointer_fields
+        )
+        if not fields_match:
+            return False
+        if requested_inline_field == "body_ct":
+            return (
+                existing_doc.get("body_object_format") in (None, "")
+                and existing_doc.get("body_ct_len")
+                == len(requested_doc["body_ct"])
             )
-            and existing_doc.get("body_ct_len") == len(requested_doc["body_ct"])
+        try:
+            raw = base64.b64decode(
+                requested_doc["body_b64"],
+                validate=True,
+            )
+        except Exception:
+            return False
+        return (
+            existing_doc.get("body_object_format") == "plaintext_v1"
+            and existing_doc.get("body_size_bytes") == len(raw)
+            and existing_doc.get("body_sha256") == hashlib.sha256(raw).hexdigest()
         )
     return all(
         existing_doc.get(field) == requested_doc.get(field)
@@ -8506,37 +8563,20 @@ def chat_finalize_reply_post_commit(
     committed inline reply readable.
     """
     reply_msg_id = str(reply_doc.get("id") or "")
-    offload = (
-        object_storage.chat_files_enabled()
-        and reply_doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
-        and reply_doc.get("body_ct") is not None
-    )
     try:
-        if offload:
-            try:
-                body_ct_len = len(reply_doc["body_ct"])
-                key = object_storage.put_chat_body(
-                    user_id,
-                    reply_msg_id,
-                    reply_doc["body_ct"],
-                    str(reply_doc.get("content_type") or "file"),
-                )
-                pointer = {"body_key": key, "body_ct_len": body_ct_len}
-                with get_pool().connection() as conn:
-                    conn.execute(
-                        "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
-                        "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
-                        (Jsonb(pointer), user_id, reply_msg_id),
-                    )
-            except Exception as e:  # noqa: BLE001
-                log.error(
-                    "[db] chat_finalize_reply_post_commit(%s,%s) R2 offload "
-                    "failed, left inline: %s",
-                    user_id,
-                    reply_msg_id,
-                    e,
-                )
-
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT storage_generation FROM chat_messages "
+                "WHERE user_id=%s AND msg_id=%s",
+                (user_id, reply_msg_id),
+            ).fetchone()
+        if row is not None:
+            _offload_chat_body_after_commit(
+                user_id,
+                reply_msg_id,
+                reply_doc,
+                int(row[0]),
+            )
     except Exception as e:  # noqa: BLE001
         log.error(
             "[db] chat_finalize_reply_post_commit(%s,%s) failed: %s",

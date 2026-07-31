@@ -34,6 +34,18 @@ def _plain(**extra) -> dict:
     return env
 
 
+def _binary_plain(**extra) -> dict:
+    env = {
+        "body_b64": "AAE=",
+        "body_size_bytes": 2,
+        "id": "itm-binary",
+        "owner_user_id": "usr_owner",
+        "visibility": "shared",
+    }
+    env.update(extra)
+    return env
+
+
 def _prefer(monkeypatch, value: str) -> None:
     monkeypatch.setattr(core_envelope, "resolve_content_encryption",
                         lambda uid: value)
@@ -151,3 +163,59 @@ def test_sealed_wins_when_both_shapes_present(monkeypatch):
     """两者并存按信封校验——与读侧 body_ct 优先一致。"""
     _prefer(monkeypatch, "on")
     assert _check(_sealed(body="stale")) is None
+
+
+# --------------------------------------------------------------------------- #
+# Chat-only binary plaintext shape
+# --------------------------------------------------------------------------- #
+
+def _check_chat(envelope, content_type="file"):
+    return core_envelope.validate_uploaded_chat_envelope(
+        envelope,
+        user_id="usr_owner",
+        content_type=content_type,
+    )
+
+
+def test_binary_plaintext_is_chat_file_image_only(monkeypatch):
+    _prefer(monkeypatch, "off")
+
+    assert _check_chat(_binary_plain(), "file") is None
+    assert _check_chat(_binary_plain(), "image") is None
+    assert _check_chat(_binary_plain(), "text") == {
+        "error": "body_b64_requires_file_or_image"
+    }
+    assert _check(_binary_plain())["error"] == "envelope_missing_fields"
+
+
+def test_binary_plaintext_respects_effective_encryption_gate(monkeypatch):
+    _prefer(monkeypatch, "on")
+    assert _check_chat(_binary_plain()) == {
+        "error": "plaintext_envelope_not_enabled_for_this_account"
+    }
+
+
+@pytest.mark.parametrize(
+    ("env", "error"),
+    [
+        (_binary_plain(body_b64="not base64!"), "body_b64_invalid_base64"),
+        (_binary_plain(body="mixed"), "envelope_body_shapes_are_mutually_exclusive"),
+        (_binary_plain(nonce="n"), "plaintext_envelope_cannot_include_crypto_fields"),
+        (_binary_plain(visibility="local_only"), "plaintext_envelope_cannot_be_local_only"),
+        (_binary_plain(body_size_bytes=3), "body_size_bytes_mismatch"),
+    ],
+)
+def test_binary_plaintext_rejects_invalid_shapes(monkeypatch, env, error):
+    _prefer(monkeypatch, "off")
+    assert _check_chat(env)["error"] == error
+
+
+def test_binary_plaintext_enforces_decoded_byte_limit(monkeypatch):
+    _prefer(monkeypatch, "off")
+    err = core_envelope.validate_uploaded_chat_envelope(
+        _binary_plain(),
+        user_id="usr_owner",
+        content_type="file",
+        max_binary_bytes=1,
+    )
+    assert err == {"error": "body_b64_too_large", "max_bytes": 1}

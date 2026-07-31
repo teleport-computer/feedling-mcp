@@ -255,6 +255,14 @@ def _is_r2_pointer(m: dict) -> bool:
     return bool(m.get("body_key")) and m.get("body_ct") is None
 
 
+def _strip_body_storage_fields(m: dict) -> dict:
+    """Remove server-internal R2 coordinates from a delivered chat document."""
+    out = dict(m)
+    for key in ("body_key", "body_object_format", "body_sha256"):
+        out.pop(key, None)
+    return out
+
+
 def _body_omit_decision(m: dict, *, include_image_body: bool) -> tuple[bool, str, int]:
     """(omit?, reason, encoded-or-raw size) for one message. Shared by pre-fetch
     and the item renderer so the two can never disagree about which bodies this
@@ -364,8 +372,7 @@ def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
             item.setdefault("content", "")
             # A failed fetch leaves the pointer in place. Never expose internal
             # storage coordinates or integrity metadata on the public response.
-            for key in ("body_key", "body_object_format", "body_sha256"):
-                item.pop(key, None)
+            item = _strip_body_storage_fields(item)
         if content_type == "image" or body_size > CHAT_HISTORY_INLINE_BODY_CT_MAX:
             size_field = "body_size_bytes" if is_plaintext_pointer else "body_ct_len"
             item[size_field] = body_size
@@ -611,7 +618,9 @@ def _pending_chat_messages_for_poll(
                 # read-only peek — hydrate an R2-offloaded file body so the
                 # delivered message carries its ciphertext (claim path below gets
                 # this via chat_try_claim_reply).
-                claimed.append(db.hydrate_chat_file_body(store.user_id, dict(msg)))
+                claimed.append(_strip_body_storage_fields(
+                    db.hydrate_chat_file_body(store.user_id, dict(msg))
+                ))
                 if ts <= since:
                     redelivered += 1
                 continue
@@ -653,7 +662,7 @@ def _pending_chat_messages_for_poll(
                     f"prev_claim={prev_claimed_by} consumer={consumer_id}"
                 )
             msg.update(fields)  # keep this worker's cache copy consistent
-            claimed.append(dict(merged))
+            claimed.append(_strip_body_storage_fields(merged))
             if ts <= since:
                 redelivered += 1
     return claimed

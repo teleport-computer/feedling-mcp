@@ -208,9 +208,11 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 }
 ```
 
-Decrypt `body_ct` on the authorized client. When a history item has
+Decrypt `body_ct` on the authorized client. A `body_b64` field is already
+plaintext bytes and must only be strict-base64-decoded. When a history item has
 `body_omitted: true`, fetch `/v1/chat/messages/{message_id}/body` instead of
-assuming the message is empty.
+assuming the message is empty. Omitted plaintext pointers report
+`body_size_bytes`; legacy encrypted pointers retain `body_ct_len`.
 
 Hosted Runtime V2 can return a generated document as a native attachment. The
 model first creates or replaces editable UTF-8 source in an encrypted
@@ -354,6 +356,33 @@ does not wake the resident consumer again. An invalid UUID returns
 `400 client_msg_id_invalid`.
 
 For `content_type: "file"`, `file_name` and `file_mime` are optional metadata.
+
+When `content_encryption_effective` is `"off"`, an image or file can instead use
+the binary plaintext shape. `body_b64` is strict base64 of the original bytes,
+not ciphertext; `body_size_bytes` is optional but must match when present.
+`body_b64` is rejected for text messages and for accounts whose effective tier
+is `"on"`.
+
+```json
+{
+  "envelope": {
+    "v": 1,
+    "id": "env_file_123",
+    "body_b64": "BASE64_PLAINTEXT_FILE_BYTES",
+    "body_size_bytes": 48231,
+    "visibility": "shared",
+    "owner_user_id": "usr_0123456789abcdef"
+  },
+  "content_type": "file",
+  "file_name": "plan.pdf",
+  "file_mime": "application/pdf"
+}
+```
+
+The service may offload those decoded bytes to object storage as a
+`plaintext_v1` pointer. It verifies the persisted SHA-256 and byte length on
+read, then returns `body_b64`; internal object keys and hashes are never part of
+the public response.
 
 To send **text alongside an image or file** (a caption), encrypt that text as its
 own envelope and pass it as `caption_envelope` — the same E2E `EncryptedEnvelope`

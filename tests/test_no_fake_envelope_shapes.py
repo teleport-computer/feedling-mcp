@@ -104,6 +104,8 @@ def test_helpers_agree_on_which_keys_carry_a_body():
 
     unexpected = referenced - _REAL_SHAPE_KEYS - {
         "body_ct_len", "body_object_format", "body_sha256", "body_size_bytes",
+        "body_b64_invalid_base64", "body_b64_requires_file_or_image",
+        "body_b64_too_large", "body_size_bytes_mismatch",
     }
     assert not unexpected, (
         f"core/envelope.py 里出现了新的 body* 键 {sorted(unexpected)}——"

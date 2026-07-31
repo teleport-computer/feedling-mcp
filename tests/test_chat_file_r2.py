@@ -71,6 +71,26 @@ def _file_doc(uid: str, mid: str, body: bytes = b"PK\x03\x04docx-bytes") -> dict
     }
 
 
+def _plaintext_file_doc(
+    uid: str,
+    mid: str,
+    body: bytes = b"PK\x03\x04plaintext-docx",
+) -> dict:
+    return {
+        "id": mid,
+        "role": "user",
+        "ts": 1.0,
+        "source": "model_api",
+        "content_type": "file",
+        "file_name": "报告.docx",
+        "file_mime": "application/octet-stream",
+        "body_b64": base64.b64encode(body).decode("ascii"),
+        "body_size_bytes": len(body),
+        "visibility": "shared",
+        "owner_user_id": uid,
+    }
+
+
 def _raw_doc(uid: str, mid: str) -> dict | None:
     with db.get_pool().connection() as conn:
         row = conn.execute(
@@ -184,6 +204,30 @@ def test_offload_stores_pointer_and_chat_load_is_lazy(backend_env, monkeypatch):
     # chat_load is LAZY: returns the pointer, does NOT reconstitute.
     loaded = {m["id"]: m for m in db.chat_load(uid)}
     assert loaded[mid].get("body_key") and loaded[mid].get("body_ct") is None
+
+
+def test_new_plaintext_file_write_offloads_to_verified_plaintext_pointer(
+    backend_env, monkeypatch,
+):
+    client = _FakeS3()
+    _enable_r2(monkeypatch, client)
+    uid = _uid()
+    seed_user(uid)
+    mid = uuid.uuid4().hex
+    body = b"\x00new-plaintext-file\xff"
+
+    db.chat_append(uid, mid, 1.0, _plaintext_file_doc(uid, mid, body), 100)
+
+    raw = _raw_doc(uid, mid)
+    key = str(raw["body_key"])
+    _assert_versioned_key(key, uid, mid, "file")
+    assert raw["body_object_format"] == "plaintext_v1"
+    assert raw["body_size_bytes"] == len(body)
+    assert raw["body_sha256"] == hashlib.sha256(body).hexdigest()
+    assert "body_b64" not in raw and "body_ct" not in raw
+    assert client.store[(_BUCKET, key)] == body
+    hydrated = db.hydrate_chat_file_body(uid, raw)
+    assert base64.b64decode(hydrated["body_b64"], validate=True) == body
 
 
 def test_idempotent_retry_offloads_winner_only_once(backend_env, monkeypatch):

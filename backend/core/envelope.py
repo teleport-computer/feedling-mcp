@@ -242,6 +242,54 @@ def validate_uploaded_envelope(envelope, *, user_id: str) -> dict | None:
     return None
 
 
+def validate_uploaded_chat_envelope(
+    envelope,
+    *,
+    user_id: str,
+    content_type: str,
+    max_binary_bytes: int = 10 * 1024 * 1024,
+) -> dict | None:
+    """Validate chat's file/image-only ``body_b64`` plaintext wire shape.
+
+    Other content families keep using :func:`validate_uploaded_envelope` and
+    therefore cannot acquire a binary plaintext shape accidentally.
+    """
+    if not isinstance(envelope, dict) or envelope.get("body_b64") is None:
+        return validate_uploaded_envelope(envelope, user_id=user_id)
+    if content_type not in ("file", "image"):
+        return {"error": "body_b64_requires_file_or_image"}
+    if envelope.get("body_ct") is not None or envelope.get("body") is not None:
+        return {"error": "envelope_body_shapes_are_mutually_exclusive"}
+    if any(envelope.get(key) is not None for key in _SEALED_FIELDS[1:]):
+        return {"error": "plaintext_envelope_cannot_include_crypto_fields"}
+    if resolve_content_encryption(user_id) != "off":
+        return {"error": "plaintext_envelope_not_enabled_for_this_account"}
+    missing = [
+        field
+        for field in _UPLOAD_COMMON_REQUIRED
+        if not envelope.get(field)
+    ]
+    if missing:
+        return {"error": "envelope_missing_fields", "detail": missing}
+    if envelope.get("visibility") != "shared":
+        return {"error": "plaintext_envelope_cannot_be_local_only"}
+    try:
+        raw = base64.b64decode(envelope["body_b64"], validate=True)
+    except Exception:
+        return {"error": "body_b64_invalid_base64"}
+    if len(raw) > int(max_binary_bytes):
+        return {
+            "error": "body_b64_too_large",
+            "max_bytes": int(max_binary_bytes),
+        }
+    declared_size = envelope.get("body_size_bytes")
+    if declared_size is not None and (
+        type(declared_size) is not int or declared_size != len(raw)
+    ):
+        return {"error": "body_size_bytes_mismatch"}
+    return None
+
+
 def replace_record_shape(record: dict, envelope: dict) -> None:
     """原地把 ``record`` 的内容字段换成 ``envelope`` 的形状（swap / rewrap 用）。
 

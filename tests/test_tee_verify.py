@@ -18,6 +18,7 @@ part of the effective cleanup set even though it never appears in
 ``_RDS_TABLES``/verify's scope.
 """
 import os
+import hashlib
 import re
 import sys
 import uuid
@@ -29,6 +30,7 @@ from psycopg.types.json import Jsonb
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
+import object_storage  # noqa: E402
 from tee_replicator import transforms  # noqa: E402
 from tee_shadow import mirror, verify  # noqa: E402
 from tee_shadow import table_registry as reg  # noqa: E402
@@ -279,6 +281,37 @@ def test_consistent_dbs_report_ok_with_zero_mismatches(backend_env):
     # sanity: the equation is non-trivial (not just "nothing to check")
     assert report["tables"]["chat_messages"]["rds_rows"] == 1
     assert report["tables"]["chat_messages"]["tee_rows"] == 1
+
+
+def test_plaintext_pointer_integrity_helper_checks_object_without_exposing_bytes(
+    monkeypatch,
+):
+    uid = "usr_integrity"
+    raw = b"\x00private-file\xff"
+    key = f"chatfiles/{uid}/g1/msg/version"
+    doc = {
+        "body_key": key,
+        "body_object_format": "plaintext_v1",
+        "body_size_bytes": len(raw),
+        "body_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    monkeypatch.setattr(
+        object_storage,
+        "get_chat_body_bytes",
+        lambda fetched_key, fetched_uid: (
+            raw if (fetched_key, fetched_uid) == (key, uid) else None
+        ),
+    )
+
+    assert verify._plaintext_pointer_integrity_error(uid, doc) is None
+    assert verify._plaintext_pointer_integrity_error(
+        uid,
+        {**doc, "body_size_bytes": len(raw) + 1},
+    ) == "body_size_mismatch"
+    assert verify._plaintext_pointer_integrity_error(
+        uid,
+        {**doc, "body_sha256": "0" * 64},
+    ) == "body_sha256_mismatch"
 
 
 def test_mutated_tee_row_is_pinpointed_as_mismatch(backend_env):

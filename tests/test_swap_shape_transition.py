@@ -40,6 +40,18 @@ def _plain(**extra) -> dict:
     return env
 
 
+def _binary_plain(**extra) -> dict:
+    env = {
+        "body_b64": "AAE=",
+        "body_size_bytes": 2,
+        "id": "itm-1",
+        "owner_user_id": "usr_owner",
+        "visibility": "shared",
+    }
+    env.update(extra)
+    return env
+
+
 # --------------------------------------------------------------------------- #
 # replace_record_shape —— 跨形状替换的唯一落点
 # --------------------------------------------------------------------------- #
@@ -125,6 +137,10 @@ def test_plaintext_rows_get_no_enclave_pk_fpr_key():
 
 def test_missing_check_accepts_plaintext_shape():
     assert content_core._swap_envelope_missing(_plain()) == []
+
+
+def test_missing_check_accepts_binary_plaintext_shape():
+    assert content_core._swap_envelope_missing(_binary_plain()) == []
 
 
 def test_missing_check_still_demands_the_sealed_field_set():

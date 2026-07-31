@@ -47,6 +47,27 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-31 — Task 1.3 backend 协议完成，生产迁移仍锁住
+
+### [DONE] R2 plaintext pointer、原子迁移与三形状读写已落地
+
+- 新增 raw object helper 与 `plaintext_v1` pointer：
+  `body_object_format + body_size_bytes + body_sha256`。成功水合只向公共读取出口交付
+  `body_b64`，并在交付前核 raw byte length 与 SHA-256；未知 marker、坏 base64 与
+  完整性不符全部 fail closed。
+- 新写只允许 effective `off` 用户的 image/file 使用 `body_b64`；text、加密档、
+  `local_only`、混合 crypto 字段与超限 decoded bytes 均拒绝。重体 offload 复用
+  versioned key、upload guard、per-key advisory lock 与 CAS，encrypted `body_ct`
+  路径保持兼容。
+- backfill 支持 live JSONB CAS 与 archive 事务内 delete+insert，不放宽 archive
+  immutable UPDATE trigger。CAS 输家/进程崩溃留下的新对象由 durable cleanup 回收，
+  旧权威对象不会被覆盖；CLI 缺省 inventory-only，apply 需双参数确认和部署环境 gate。
+- TEE replicator 对 plaintext pointer 原样保留、仅解密独立 thinking/caption；
+  live/archive 替换都进入 requeue。verify 改用 archive `source_seq` 对账，并抽样 GET
+  plaintext R2 对象核 size/hash，避免两库同指坏对象时假绿。
+- 公共 OpenAPI、Chat workflow、architecture、self-host trust model 与 Unreleased
+  changelog 同步更新。生产 apply 仍等待 iOS `body_b64` 支持和强更窗口。
+
 ## 2026-07-31 — Task 1.3 回退为只读盘点；补明文行复制终态
 
 ### [BLOCKER] R2 聊天重体不能靠原地覆盖完成明文化

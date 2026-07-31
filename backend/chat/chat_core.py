@@ -639,15 +639,19 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
     envelope = payload.get("envelope")
     if envelope is None:
         return {"error": "envelope required"}, 400
-    gate_err = core_envelope.validate_uploaded_envelope(envelope, user_id=store.user_id)
+    content_type = payload.get("content_type", "text")
+    if content_type not in ("text", "image", "file"):
+        return {"error": "content_type must be 'text', 'image', or 'file'"}, 400
+    gate_err = core_envelope.validate_uploaded_chat_envelope(
+        envelope,
+        user_id=store.user_id,
+        content_type=content_type,
+    )
     if gate_err is not None:
         return gate_err, 400
     conflict = _stale_key_conflict(store, envelope)
     if conflict is not None:
         return conflict
-    content_type = payload.get("content_type", "text")
-    if content_type not in ("text", "image", "file"):
-        return {"error": "content_type must be 'text', 'image', or 'file'"}, 400
     file_extra: dict = {}
     if content_type == "image":
         # Lazy import mirrors the existing hosted bridge below.
@@ -786,15 +790,19 @@ def write_response(
     envelope = payload.get("envelope")
     if envelope is None:
         return {"error": "envelope required"}, 400
-    gate_err = core_envelope.validate_uploaded_envelope(envelope, user_id=store.user_id)
+    content_type = payload.get("content_type", "text")
+    if content_type not in ("text", "image"):
+        return {"error": "content_type must be 'text' or 'image'"}, 400
+    gate_err = core_envelope.validate_uploaded_chat_envelope(
+        envelope,
+        user_id=store.user_id,
+        content_type=content_type,
+    )
     if gate_err is not None:
         return gate_err, 400
     conflict = _stale_key_conflict(store, envelope)
     if conflict is not None:
         return conflict
-    content_type = payload.get("content_type", "text")
-    if content_type not in ("text", "image"):
-        return {"error": "content_type must be 'text' or 'image'"}, 400
     raw_file_followups = payload.get("file_followups")
     file_followups: list[tuple[dict, dict]] = []
     if raw_file_followups is not None:
@@ -811,25 +819,14 @@ def write_response(
             followup_envelope = raw_followup.get("envelope")
             if not isinstance(followup_envelope, dict):
                 return {"error": "file_followup envelope required"}, 400
-            required, shape_err = core_envelope.upload_shape_gate(
-                followup_envelope, user_id=store.user_id)
-            if shape_err is not None:
-                return shape_err, 400
-            missing = [
-                field for field in required
-                if not followup_envelope.get(field)
-            ]
-            if missing:
-                return {
-                    "error": "file_followup_envelope_missing_fields",
-                    "detail": missing,
-                }, 400
-            if followup_envelope["visibility"] not in ("shared", "local_only"):
-                return {"error": "invalid file_followup visibility"}, 400
-            if core_envelope.requires_enclave_key(followup_envelope):
-                return {
-                    "error": "shared file_followup requires K_enclave"
-                }, 400
+            gate_err = core_envelope.validate_uploaded_chat_envelope(
+                followup_envelope,
+                user_id=store.user_id,
+                content_type="file",
+                max_binary_bytes=1_000_000,
+            )
+            if gate_err is not None:
+                return gate_err, 400
             conflict = _stale_key_conflict(store, followup_envelope)
             if conflict is not None:
                 return conflict

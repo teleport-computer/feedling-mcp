@@ -171,13 +171,19 @@ offloaded to object storage without giving that store the content key. The
 authenticated screen WebSocket is an ingest path only—Chat uses HTTP send,
 history, and long polling.
 
-Heavy Chat bodies—image and file ciphertext—can be offloaded the same way. The
-message row keeps its envelope metadata plus a pointer, and the ciphertext is
-re-fetched from object storage only at the exits that actually deliver a body.
-The object store receives ciphertext and never receives the content key, so this
-does not move the decrypt boundary. It does make the object store part of the
-read path: a body that is unreachable there degrades that one message rather
-than the conversation.
+Heavy Chat image and file bodies can be offloaded to object storage. On the
+encrypted tier the object remains ciphertext and the row keeps the envelope
+metadata plus a pointer; the object store receives no content key. On the
+plaintext tier the object is the raw image/file bytes, while the row keeps an
+explicit `plaintext_v1` pointer with byte length and SHA-256 integrity metadata.
+That means object storage and its backups are plaintext recipients for
+plaintext-tier attachments. Reads verify both values before returning the bytes
+as `body_b64`; storage keys and hashes are not exposed by the public API.
+
+Object storage is therefore part of the Chat read path in both tiers. A missing
+object degrades that one message rather than the conversation, and an unknown
+format or integrity mismatch fails closed rather than guessing whether bytes
+are encrypted.
 
 The [Perception workflow](/docs/workflows/perception) identifies the encrypted,
 plaintext, and legacy compatibility branches. Clients should choose the
@@ -234,10 +240,11 @@ Two boundaries hold in both tiers:
   rejected on both the upload and swap paths.
 
 Reads route per record rather than per user: a row carrying `body_ct` is opened
-through the decrypt service, a row carrying `body` is read directly. Mixed rows
-therefore coexist for a user who changes the preference, and `body_ct` wins when
-a row somehow carries both. The [`/v1/content/swap`](/docs/workflows/memory)
-endpoint converts existing records between the two shapes in place.
+through the decrypt service, `body_b64` is strictly base64-decoded locally, and
+`body` is read as UTF-8. Mixed rows therefore coexist for a user who changes the
+preference, and precedence is `body_ct`, then `body_b64`, then `body`. The
+[`/v1/content/swap`](/docs/workflows/memory) endpoint converts existing inline
+records between encrypted and plaintext shapes.
 
 Changing the preference does not re-encrypt or decrypt history on its own; it
 governs new writes, and existing records convert only through the swap endpoint.

@@ -586,6 +586,21 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "v": {"type": "integer", "const": 1, "default": 1},
             "id": {"type": "string"},
             "body_ct": {"type": "string", "description": "Base64 ciphertext."},
+            "body_b64": {
+                "type": "string",
+                "format": "byte",
+                "description": "Base64 plaintext bytes. Accepted only as the main "
+                               "envelope of a Chat image/file write when "
+                               "content_encryption_effective is \"off\"; text and "
+                               "non-Chat envelope endpoints reject this shape. "
+                               "Mutually exclusive with body_ct and body.",
+            },
+            "body_size_bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Optional decoded byte count for body_b64. When "
+                               "provided it must match exactly.",
+            },
             "body": {
                 "type": "string",
                 "description": "Plaintext body. Only valid when the caller's "
@@ -624,6 +639,14 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "description": "local_only requires encryption, so this branch pins "
                                "visibility to shared.",
                 "required": ["body"],
+                "properties": {"visibility": {"const": "shared"}},
+            },
+            {
+                "title": "Binary plaintext body (Chat image/file only)",
+                "description": "Only supported Chat attachment write paths accept "
+                               "this branch, and only while the account's effective "
+                               "tier is off.",
+                "required": ["body_b64"],
                 "properties": {"visibility": {"const": "shared"}},
             },
         ],
@@ -1067,7 +1090,12 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "required": ["envelope"],
         "properties": {
-            "envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
+            "envelope": {
+                "allOf": [{"$ref": "#/components/schemas/EncryptedEnvelope"}],
+                "description": "For content_type image/file, plaintext-tier clients "
+                               "may send body_b64 instead of an encrypted body_ct "
+                               "envelope. Text messages do not accept body_b64.",
+            },
             "client_msg_id": {
                 "type": "string",
                 "format": "uuid",
@@ -1102,7 +1130,12 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "required": ["envelope"],
         "properties": {
-            "envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
+            "envelope": {
+                "allOf": [{"$ref": "#/components/schemas/EncryptedEnvelope"}],
+                "description": "For content_type image, plaintext-tier clients may "
+                               "send body_b64 instead of an encrypted body_ct "
+                               "envelope. Text replies do not accept body_b64.",
+            },
             "source": {
                 "type": "string",
                 "enum": [

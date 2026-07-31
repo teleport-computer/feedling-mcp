@@ -144,7 +144,7 @@ def _encrypted_content_counts(store: UserStore) -> dict:
 # --------------------------------------------------------------------------- #
 
 def _swap_envelope_missing(env) -> list:
-    """两种形状都收（v6）：信封要密文那一套，明文只要 body。
+    """三种形状都收（v6）：信封、UTF-8 明文、二进制明文。
 
     形状判别用 ``body_ct`` 在不在，与读侧的 ``body_ct`` 优先规则一致；两者都没有
     时按信封报缺失，把「你想传信封但漏了字段」这个更常见的意图放在前面。
@@ -152,7 +152,10 @@ def _swap_envelope_missing(env) -> list:
     if not isinstance(env, dict):
         return ["envelope"]
     common = ("visibility", "owner_user_id")
-    if env.get("body") is not None and not env.get("body_ct"):
+    if (
+        (env.get("body") is not None or env.get("body_b64") is not None)
+        and not env.get("body_ct")
+    ):
         return [f for f in common if not env.get(f)]
     return [f for f in ("body_ct", "nonce", "K_user", *common) if not env.get(f)]
 
@@ -205,6 +208,14 @@ def _swap_chat(
             if msg.get("id") != msg_id:
                 continue
             if env is not None:
+                if env.get("body_b64") is not None:
+                    gate_err = core_envelope.validate_uploaded_chat_envelope(
+                        env,
+                        user_id=store.user_id,
+                        content_type=str(msg.get("content_type") or "text"),
+                    )
+                    if gate_err is not None:
+                        return f"error: {gate_err['error']}"
                 msg["v"] = int(env.get("v", 1))
                 core_envelope.replace_record_shape(msg, env)
             for prefix, sub_env in (sub_envs or {}).items():
@@ -524,6 +535,13 @@ def swap(store: UserStore, payload: dict) -> tuple[dict, int]:
             continue
         if env.get("body_ct") and env["visibility"] == "shared" and not env.get("K_enclave"):
             results.append({"type": itype, "id": iid, "status": "error: shared visibility requires K_enclave"})
+            continue
+        if env.get("body_b64") is not None and itype != "chat":
+            results.append({
+                "type": itype,
+                "id": iid,
+                "status": "error: body_b64 requires chat file/image",
+            })
             continue
         if not env.get("body_ct") and env["visibility"] == "local_only":
             # local_only 的含义是「只有设备解得开」，靠的就是没有 K_enclave。一行

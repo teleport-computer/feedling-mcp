@@ -396,7 +396,10 @@ def test_conditional_payloads_and_review_contract_match_runtime(
     for schema_name in ("EncryptedEnvelope", "MemoryEnvelope"):
         envelope = schemas[schema_name]
         branches = {branch["title"]: branch for branch in envelope["oneOf"]}
-        assert set(branches) == {"Encrypted body", "Plaintext body"}
+        expected = {"Encrypted body", "Plaintext body"}
+        if schema_name == "EncryptedEnvelope":
+            expected.add("Binary plaintext body (Chat image/file only)")
+        assert set(branches) == expected
 
         sealed = branches["Encrypted body"]
         assert sealed["required"] == ["body_ct", "nonce", "K_user"]
@@ -406,6 +409,12 @@ def test_conditional_payloads_and_review_contract_match_runtime(
         plain = branches["Plaintext body"]
         assert plain["required"] == ["body"]
         assert plain["properties"]["visibility"] == {"const": "shared"}
+
+        if schema_name == "EncryptedEnvelope":
+            binary = branches["Binary plaintext body (Chat image/file only)"]
+            assert binary["required"] == ["body_b64"]
+            assert binary["properties"]["visibility"] == {"const": "shared"}
+            assert envelope["properties"]["body_b64"]["format"] == "byte"
 
         # 顶层必填只剩两种形状共有的字段。
         assert "body_ct" not in envelope["required"]

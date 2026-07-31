@@ -384,9 +384,10 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
 
 ### Task 1.3: R2 聊天重体明文化（带 K_enclave 的）
 
-- [ ] ⛔ **阻塞：缺少明文 R2 指针协议与原子切换流程。**
-      `backend/backfill_chat_bodies_to_plaintext.py` 目前只保留**只读盘点**，
-      `--apply` 硬拒绝。2026-07-31 接手审计发现首版工具不能安全执行：
+- [ ] 🟡 **backend 协议与工具已完成；生产执行等待 iOS 强更/rollout gate。**
+      `backend/backfill_chat_bodies_to_plaintext.py` 缺省仍是**只读盘点**；apply
+      需要 CLI 双确认与部署 feature gate。2026-07-31 接手审计发现首版工具不能
+      安全执行：
 
       1. `object_storage.get_chat_body()` 返回的是重新 base64 后的 `body_ct`；
          `put_chat_body()` 又会 base64 解码并按参数生成 key。首版把明文字符串交给
@@ -411,6 +412,12 @@ X25519/ChaChaPoly）、alembic（cutover 后 alembic_tee 升格为唯一迁移�
       代码可先做，但存量 apply 必须后移到 iOS 支持 `body_b64` 且完成强更之后。
       **2026-07-31：spec §14 四项推荐方案已全部拍板。** 允许开始代码实现；
       这不等于批准生产 apply，后者仍受 iOS 强更与 rollout gate 约束。
+
+      **2026-07-31 backend 实现完成：** raw object helper、`plaintext_v1`
+      size/hash pointer、`body_b64` 写入/读取、live JSONB CAS、archive
+      delete+insert、upload guard/advisory-lock/durable cleanup、TEE requeue、
+      verify 的 R2 完整性抽样与双闸 backfill CLI 已落地。此 checkbox 保持未完成，
+      直到支持该 wire shape 的 iOS 版本完成强更并实际跑完生产迁移验收。
 
 ### Task 1.4: 分析表与杂项
 
