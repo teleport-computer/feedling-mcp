@@ -15,9 +15,11 @@ from starlette.responses import JSONResponse
 from enclave import auth, backend_client, envelope
 from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 
-# Pure-stdlib policy module (no DB deps) — safe to import inside the enclave, and
-# the reason this route can't drift from the backend's writable-field list again.
-from identity import card_policy
+# Pure-stdlib policy/view modules (no DB deps) — safe to import inside the
+# enclave, and the reason this route can't drift from the backend's writable-field
+# list again. card_view holds the assembly this route shares with the V2 identity
+# capability, which decrypts the same card through /v1/envelope/decrypt.
+from identity import card_view
 
 router = APIRouter()
 
@@ -58,25 +60,10 @@ async def v1_identity_get(request: Request):
     if identity is None:
         return JSONResponse({"identity": None, "user_id": user_id})
 
-    v = int(identity.get("v", 0))
-    base = {
-        "v": v,
-        "created_at": identity.get("created_at"),
-        "updated_at": identity.get("updated_at"),
-    }
-    # P5 concurrency baseline (Task 3's outer replaced_at, stamped only by full
-    # init/replace) — outer field, not inside the ciphertext, so it's available even
-    # before decrypt. Forwarded additively/guarded-truthy (older cards predate it) so
-    # the resident consumer can refresh its baseline after an identity_base_stale
-    # conflict (Task 5).
-    if identity.get("replaced_at"):
-        base["replaced_at"] = identity.get("replaced_at")
+    base = card_view.envelope_base(identity)
     if identity.get("visibility") == "local_only":
-        base.update({
-            "visibility": "local_only",
-            "decrypt_status": "local_only_agent_cannot_read",
-        })
-        return JSONResponse({"identity": base, "user_id": user_id})
+        return JSONResponse(
+            {"identity": card_view.local_only_view(base), "user_id": user_id})
 
     content_sk, err_response = await content_sk_or_503()
     if err_response is not None:
@@ -102,32 +89,9 @@ async def v1_identity_get(request: Request):
             else:
                 live_days = inner.get("days_with_user", 0)
 
-            base.update({
-                "agent_name": inner.get("agent_name"),
-                "self_introduction": inner.get("self_introduction"),
-                "dimensions": inner.get("dimensions", []),
-                "days_with_user": live_days,
-                "category": inner.get("category", ""),
-                "signature": inner.get("signature", []),
-                "visibility": identity.get("visibility", "shared"),
-                "decrypt_status": "ok",
-            })
-            # Remaining writable profile fields: forward only when present and
-            # non-empty so the response shape stays additive (no empty keys added
-            # for older cards that predate a field). These feed the read-modify-write
-            # merge in identity.profile_patch / dimension_nudge, which rebuilds the
-            # card from THIS response and re-encrypts it — so a field missing here is
-            # not just hidden, it is ERASED on the next partial update.
-            #
-            # Driven off card_policy's canonical list rather than hand-listed: the
-            # hand-listed version covered 4 of these and silently dropped 5, taking
-            # the user-authored custom_persona_prompt with it.
-            for key in card_policy.PROFILE_FIELDS:
-                if key in base:
-                    continue  # already set unconditionally above
-                if inner.get(key):
-                    base[key] = inner.get(key)
-            return {"identity": base, "user_id": user_id}
+            view = card_view.plaintext_view(
+                base, inner, identity, days_with_user=live_days)
+            return {"identity": view, "user_id": user_id}
         except (envelope.DecryptFailure, json.JSONDecodeError) as e:
             reason = e.reason if isinstance(e, envelope.DecryptFailure) else f"json: {e}"
             base.update({"decrypt_status": f"error: {reason}"})

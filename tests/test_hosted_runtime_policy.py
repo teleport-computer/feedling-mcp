@@ -24,6 +24,12 @@ from model_api_runtime.v2 import jobs_store  # noqa: E402
 ROOT = Path(__file__).parent.parent
 
 
+@pytest.fixture(autouse=True)
+def _legacy_exact_job_shapes_profile_off(monkeypatch):
+    """This suite's exact queue assertions describe the profile-off contract."""
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
+
+
 def _uid(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
@@ -581,6 +587,23 @@ def test_main_compose_serve_worker_shares_the_backend_image_and_stays_internal()
         env = worker["environment"]
         assert env["FEEDLING_API_URL"] == "http://backend:5001"
         assert env["FEEDLING_ENCLAVE_URL"] == "https://enclave:5003"
+
+
+def test_main_compose_serve_worker_enables_memory_maintenance_producers():
+    """The scheduler lives in serve-worker; backend-only flags are inert."""
+    for name in (
+        "docker-compose.phala.yaml",
+        "docker-compose.phala.test.yaml",
+        "docker-compose.phala.pre.yaml",
+    ):
+        compose = yaml.safe_load((ROOT / "deploy" / name).read_text())
+        env = compose["services"]["serve-worker"]["environment"]
+        assert env["FEEDLING_V2_CAPTURE_ENABLED"] == (
+            "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
+        ), name
+        assert env["FEEDLING_V2_DREAM_ENABLED"] == (
+            "${FEEDLING_V2_DREAM_ENABLED:-1}"
+        ), name
 
 
 def test_all_three_standalone_runner_composes_are_v1_agent_runner_only():

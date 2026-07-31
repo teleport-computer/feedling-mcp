@@ -37,6 +37,7 @@ LANES = {
     "capture",
     "maintenance",
     "dream",
+    "profile",
     "screen_watch",
     "trajectory_review",
 }
@@ -65,6 +66,7 @@ LANE_PRIORITY = {
     "capture": 10,
     "maintenance": 10,
     "dream": 10,
+    "profile": 10,
     # Offline analysis must never contend with foreground chat/wake or memory
     # maintenance. One generic job drains one encrypted failed-turn review.
     "trajectory_review": 1,
@@ -635,6 +637,100 @@ def enqueue_job(
                 )
 
 
+def enqueue_job_with_context_log(
+    user_id: str,
+    lane: str,
+    *,
+    reason: str | None,
+    trace_id: str | None,
+    context_stream: str,
+    context_doc: dict,
+    context_ts: float,
+    priority: int | None = None,
+) -> tuple[int, bool]:
+    """Atomically enqueue/coalesce one job and attach its input context.
+
+    This closes the enqueue->association crash/race window for externally
+    produced wake inputs. The active job row is locked by
+    ``coalesce_or_insert_on_cursor`` and the context row commits in the same
+    transaction, so finalization can use ``input_generation`` as an exact
+    consumed-input fence.
+    """
+    if lane not in LANES:
+        raise ValueError(f"unknown lane: {lane!r}")
+    if not str(context_stream).strip():
+        raise ValueError("context_stream is required")
+    if priority is None:
+        priority = LANE_PRIORITY.get(lane, 0)
+
+    inserted: tuple[int, bool, int, dict] | None = None
+    for _ in range(4):
+        try:
+            with _pool().connection() as conn:
+                with conn.transaction():
+                    with conn.cursor(row_factory=dict_row) as cur:
+                        cur.execute(
+                            "SELECT hosted_runtime_state,runtime_generation "
+                            "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                            (str(user_id),),
+                        )
+                        control = cur.fetchone()
+                        expected_generation = (
+                            int(control["runtime_generation"])
+                            if control is not None
+                            and str(control["hosted_runtime_state"]) == "v2"
+                            else None
+                        )
+                        job_id, coalesced = coalesce_or_insert_on_cursor(
+                            cur,
+                            str(user_id),
+                            lane,
+                            reason=reason,
+                            trace_id=trace_id,
+                            priority=int(priority),
+                            expected_generation=expected_generation,
+                        )
+                        payload = dict(context_doc)
+                        payload["agent_job_id"] = int(job_id)
+                        cur.execute(
+                            "INSERT INTO user_logs "
+                            "(user_id,stream,ts,item_key,doc) "
+                            "VALUES (%s,%s,%s,%s,%s) RETURNING seq",
+                            (
+                                str(user_id),
+                                str(context_stream),
+                                float(context_ts),
+                                str(int(job_id)),
+                                Jsonb(payload),
+                            ),
+                        )
+                        seq = int(cur.fetchone()["seq"])
+                        inserted = (int(job_id), bool(coalesced), seq, payload)
+            break
+        except psycopg.errors.UniqueViolation:
+            continue
+    if inserted is None:
+        raise RuntimeError("could not atomically enqueue job context")
+
+    job_id, coalesced, seq, payload = inserted
+    from tee_shadow import mirror
+
+    mirror.execute(
+        "INSERT INTO user_logs (user_id,stream,seq,ts,item_key,doc) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (user_id,stream,seq) DO NOTHING",
+        (
+            str(user_id),
+            str(context_stream),
+            seq,
+            float(context_ts),
+            str(job_id),
+            Jsonb(payload),
+        ),
+    )
+    return job_id, coalesced
+
+
 def claim_next_job(worker_id: str, *, lanes: set[str] | None = None) -> dict | None:
     """抢下一个 pending job（priority DESC, created_at）。先乐观选候选，再按
     runtime-state -> job 的统一锁顺序用 FOR UPDATE SKIP LOCKED 完成独占。
@@ -925,7 +1021,9 @@ def _latest_genuine_user_seq_on_cursor(cur, user_id: str) -> int:
         "NOT IN ('verify_ping','resident_maintenance')",
         (str(user_id),),
     )
-    return int(cur.fetchone()[0] or 0)
+    row = cur.fetchone()
+    value = next(iter(row.values())) if isinstance(row, dict) else row[0]
+    return int(value or 0)
 
 
 def _clear_wake_backoff_on_cursor(cur, user_id: str) -> None:
@@ -999,6 +1097,131 @@ def mark_completed(
             if clear_wake_backoff and str(row[1]) in _FAIL_BACKOFF_WAKE_LANES:
                 _clear_wake_backoff_on_cursor(cur, str(row[0]))
             return True
+
+
+def finish_wake_job(
+    job_id: int,
+    *,
+    claimed_by: str,
+    observed_generation: int,
+    context_stream: str,
+    consumed_context_seq: int,
+    clear_wake_backoff: bool = False,
+) -> tuple[bool, int | None]:
+    """Complete a wake and atomically hand late inputs to one successor.
+
+    Context producers increment ``input_generation`` and append ``user_logs``
+    under the same active-job lock. Rows newer than the worker's consumed
+    context cursor are reassigned to the successor in this transaction. Thus
+    finalization winning creates a fresh job for a later producer, while the
+    producer winning forces this finalizer to preserve its input.
+    """
+    successor_id: int | None = None
+    moved_context = False
+    user_id = ""
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT user_id FROM agent_jobs WHERE id=%s",
+                    (int(job_id),),
+                )
+                identity = cur.fetchone()
+                if identity is None:
+                    return False, None
+                user_id = str(identity["user_id"])
+                cur.execute(
+                    "SELECT hosted_runtime_state,runtime_generation "
+                    "FROM v2_runtime_state WHERE user_id=%s FOR UPDATE",
+                    (user_id,),
+                )
+                control = cur.fetchone()
+                if control is None or str(control["hosted_runtime_state"]) != "v2":
+                    return False, None
+                runtime_generation = int(control["runtime_generation"])
+                cur.execute(
+                    "SELECT lane,status,input_generation,priority,"
+                    "expected_runtime_generation,lease_expires_at "
+                    "FROM agent_jobs WHERE id=%s AND claimed_by=%s FOR UPDATE",
+                    (int(job_id), str(claimed_by)),
+                )
+                row = cur.fetchone()
+                if (
+                    row is None
+                    or str(row["lane"]) != "heartbeat"
+                    or row["expected_runtime_generation"] is None
+                    or int(row["expected_runtime_generation"]) != runtime_generation
+                ):
+                    return False, None
+                if str(row["status"]) == "completed":
+                    if clear_wake_backoff:
+                        _clear_wake_backoff_on_cursor(cur, user_id)
+                    return True, None
+                if (
+                    str(row["status"]) not in {"claimed", "running"}
+                    or row["lease_expires_at"] is None
+                    or row["lease_expires_at"] <= datetime.now(timezone.utc)
+                ):
+                    return False, None
+
+                has_late_input = int(row["input_generation"] or 0) > int(
+                    observed_generation
+                )
+                cur.execute(
+                    "UPDATE agent_jobs SET status='completed',finished_at=now() "
+                    "WHERE id=%s",
+                    (int(job_id),),
+                )
+                if clear_wake_backoff:
+                    _clear_wake_backoff_on_cursor(cur, user_id)
+                if has_late_input:
+                    cur.execute(
+                        "INSERT INTO agent_jobs "
+                        "(user_id,lane,status,reason,priority,"
+                        "expected_runtime_generation) "
+                        "VALUES (%s,'heartbeat','pending',"
+                        "'coalesced_perception_followup',%s,%s) RETURNING id",
+                        (
+                            user_id,
+                            int(row["priority"]),
+                            runtime_generation,
+                        ),
+                    )
+                    successor_id = int(cur.fetchone()["id"])
+                    cur.execute(
+                        "UPDATE user_logs SET item_key=%s,"
+                        "doc=jsonb_set(doc,'{agent_job_id}',"
+                        "to_jsonb(%s::bigint),true) "
+                        "WHERE user_id=%s AND stream=%s AND item_key=%s "
+                        "AND seq>%s",
+                        (
+                            str(successor_id),
+                            successor_id,
+                            user_id,
+                            str(context_stream),
+                            str(int(job_id)),
+                            max(0, int(consumed_context_seq)),
+                        ),
+                    )
+                    moved_context = bool(cur.rowcount)
+
+    if successor_id is not None and moved_context:
+        from tee_shadow import mirror
+
+        mirror.execute(
+            "UPDATE user_logs SET item_key=%s,"
+            "doc=jsonb_set(doc,'{agent_job_id}',to_jsonb(%s::bigint),true) "
+            "WHERE user_id=%s AND stream=%s AND item_key=%s AND seq>%s",
+            (
+                str(successor_id),
+                successor_id,
+                user_id,
+                str(context_stream),
+                str(int(job_id)),
+                max(0, int(consumed_context_seq)),
+            ),
+        )
+    return True, successor_id
 
 
 def mark_failed(
@@ -3955,20 +4178,32 @@ def recent_chat_operational_health(
     }
 
 
-def recent_runtime_health(
-    *,
-    within_hours: int = 24,
-    limit: int = 1000,
-) -> dict:
+def recent_runtime_health(*, within_hours: int = 24) -> dict:
     """全 lane 运行时健康快照（content-free），喂 admin 值班台。
 
     分母刻意从 ``agent_jobs`` 起算而非从 metrics/trajectory 起算：一次完全漏写
     若同时消失于分子和分母，就会报出虚假健康的机群。``superseded`` 单列、不进
     失败率——运行时代际切换不是故障。延迟分位数只取成功回合（``failed IS NOT
     TRUE``）：失败超时回合会把 p95 拉到与故障同源的高位，让一个故障看起来像两个。
+
+    **窗口内全量，不设采样上界**（2026-07-30 审计打回）：本函数曾对四条子查询各
+    加 ``LIMIT 1000``，于是 24h 档写着「24 小时」，实际是「最近 1000 个 job」。
+    同页的 ``recent_token_usage_by_lane`` 从一开始就是窗口内全量，两者在 168h /
+    720h 档覆盖的时间跨度并不相同——值班时把「失败率」和「token」放在一行读，
+    却是两批样本，无法互相对账。采样上界不是性能手段而是正确性缺陷：它让页面
+    在长窗口下**静默少报**故障总量。扫描量改由 0071 的三条 ``created_at`` /
+    ``finished_at`` 索引承担（不是 ``ix_v2_turn_metrics_lane_created_at``——它
+    以 ``lane`` 为前导列，对非前导列的范围谓词只能全索引扫描、给不出范围收窄；
+    0071 的注释里有 24h/720h 两档的 EXPLAIN 实测数字）。
+
+    ``capture`` 的第一个桶叫 ``terminal_seen_no_gap`` 而**不叫** ``complete``：
+    它只证明「找到了 ``turn_terminal`` 事件、且没有 ``capture_gap``」，不证明
+    prompt / provider 往返 / tool call / 最终回复这些 artifact 都齐全。叫
+    ``complete`` 会让读者（和下一个改这段代码的人）以为轨迹可以完整回放。
+    姊妹函数 ``recent_chat_operational_health`` 仍用 ``complete``/``complete_rate``
+    ——那是 /model_api 指标端点的对外契约，改名要单独走版本沟通，不混在本次改动里。
     """
     safe_hours = max(1, min(int(within_hours), 24 * 30))
-    safe_limit = max(1, min(int(limit), 1000))
     terminal_statuses = ("completed", "failed", "expired", "superseded")
 
     with _pool().connection() as conn:
@@ -3977,8 +4212,7 @@ def recent_runtime_health(
                 "WITH recent AS ("
                 "  SELECT lane,status,last_error FROM agent_jobs "
                 "  WHERE status IN ('completed','failed','expired','superseded') "
-                "    AND finished_at >= now() - make_interval(hours => %s) "
-                "  ORDER BY finished_at DESC,id DESC LIMIT %s"
+                "    AND finished_at >= now() - make_interval(hours => %s)"
                 ") SELECT lane,"
                 "  COUNT(*) FILTER (WHERE status='completed')::int AS completed,"
                 "  COUNT(*) FILTER (WHERE status='failed')::int AS failed,"
@@ -3989,7 +4223,7 @@ def recent_runtime_health(
                 "  COUNT(*) FILTER (WHERE status='expired' "
                 "    AND last_error='lease_timeout')::int AS lease_expired "
                 "FROM recent GROUP BY lane",
-                (safe_hours, safe_limit),
+                (safe_hours,),
             )
             outcome_rows = cur.fetchall()
 
@@ -3998,21 +4232,19 @@ def recent_runtime_health(
                 "  SELECT lane,latency_ms FROM v2_turn_metrics "
                 "  WHERE failed IS NOT TRUE AND latency_ms IS NOT NULL "
                 "    AND latency_ms >= 0 "
-                "    AND created_at >= now() - make_interval(hours => %s) "
-                "  ORDER BY created_at DESC,id DESC LIMIT %s"
+                "    AND created_at >= now() - make_interval(hours => %s)"
                 ") SELECT lane,"
                 "  percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms) AS p50_ms,"
                 "  percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95_ms "
                 "FROM recent GROUP BY lane",
-                (safe_hours, safe_limit),
+                (safe_hours,),
             )
             latency_rows = cur.fetchall()
 
             cur.execute(
                 "WITH recent_jobs AS ("
                 "  SELECT id,lane,status FROM agent_jobs "
-                "  WHERE created_at >= now() - make_interval(hours => %s) "
-                "  ORDER BY id DESC LIMIT %s"
+                "  WHERE created_at >= now() - make_interval(hours => %s)"
                 "), classified AS ("
                 "  SELECT job.lane,"
                 "    CASE "
@@ -4024,21 +4256,22 @@ def recent_runtime_health(
                 "          AND gap.event_kind='capture_gap') THEN 'partial' "
                 "      WHEN EXISTS (SELECT 1 FROM v2_trajectory_events terminal "
                 "        WHERE terminal.job_id=job.id "
-                "          AND terminal.event_kind='turn_terminal') THEN 'complete' "
+                "          AND terminal.event_kind='turn_terminal') "
+                "        THEN 'terminal_seen_no_gap' "
                 "      WHEN job.status=ANY(%s::text[]) THEN 'partial' "
                 "      ELSE 'open' "
                 "    END AS capture_status "
                 "  FROM recent_jobs job "
                 "  LEFT JOIN v2_trajectory_streams stream ON stream.job_id=job.id"
                 ") SELECT lane,"
-                "  COUNT(*) FILTER (WHERE capture_status='complete')::int AS complete,"
+                "  COUNT(*) FILTER (WHERE capture_status='terminal_seen_no_gap')::int "
+                "    AS terminal_seen_no_gap,"
                 "  COUNT(*) FILTER (WHERE capture_status='partial')::int AS partial,"
                 "  COUNT(*) FILTER (WHERE capture_status='missing')::int AS missing,"
                 "  COUNT(*) FILTER (WHERE capture_status='open')::int AS open "
                 "FROM classified GROUP BY lane",
                 (
                     safe_hours,
-                    safe_limit,
                     list(terminal_statuses),
                     list(terminal_statuses),
                 ),
@@ -4049,11 +4282,10 @@ def recent_runtime_health(
                 "WITH recent AS ("
                 "  SELECT lane,last_error FROM agent_jobs "
                 "  WHERE status IN ('failed','expired') AND last_error IS NOT NULL "
-                "    AND finished_at >= now() - make_interval(hours => %s) "
-                "  ORDER BY finished_at DESC,id DESC LIMIT %s"
+                "    AND finished_at >= now() - make_interval(hours => %s)"
                 ") SELECT lane,last_error,COUNT(*)::int AS count "
                 "FROM recent GROUP BY lane,last_error ORDER BY count DESC",
-                (safe_hours, safe_limit),
+                (safe_hours,),
             )
             failure_rows = cur.fetchall()
 
@@ -4116,7 +4348,10 @@ def recent_runtime_health(
             "p50_ok_ms": _optional_ms(latency_by_lane.get(lane), "p50_ms"),
             "p95_ok_ms": _optional_ms(latency_by_lane.get(lane), "p95_ms"),
             "capture": {
-                "complete": int((capture or {}).get("complete") or 0),
+                # 只表示「见到 turn_terminal 且无 capture_gap」，不表示 artifact 齐全。
+                "terminal_seen_no_gap": int(
+                    (capture or {}).get("terminal_seen_no_gap") or 0
+                ),
                 "partial": int((capture or {}).get("partial") or 0),
                 "missing": int((capture or {}).get("missing") or 0),
                 "open": int((capture or {}).get("open") or 0),
@@ -4156,16 +4391,17 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
     依据是错的，且方向反了：本查询**没有** ``WHERE lane = ...`` 等值谓词，
     只有 ``created_at >= ...`` 加 ``GROUP BY lane``。
     ``ix_v2_turn_metrics_lane_created_at`` 是 ``(lane, created_at DESC)``，
-    ``lane`` 是前缀这件事恰恰意味着它**服务不了**这条查询——PG 16 没有 B-tree
-    skip scan（PG 18 才有），前导列没有等值谓词时用不上索引。本地 PG 16
+    ``lane`` 是前缀这件事恰恰意味着它**给不出范围收窄**——PG 16 没有 B-tree
+    skip scan（PG 18 才有），前导列缺等值谓词时它最多退化成全索引扫描（720h
+    档实测确实会被选中，但扫满 21k+ buffer，见 0071 注释）。本地 PG 16
     （50 万行、5 个 lane）实测：本查询走 Parallel Seq Scan（
     ``Rows Removed by Filter`` 随窗口内行数线性增长，`shared hit` 六千+
     buffer）；而有 ``lane = 'chat'`` 等值谓词的既有
     ``recent_token_usage_summary`` 才真正吃到该索引的 Bitmap Index Scan
     （`shared read=35`）。``v2_turn_metrics`` 是 append-only 表，本查询的扫描
-    量因此随表增长单调变大；增长到不可接受时需要补一条单列索引
-    ``CREATE INDEX CONCURRENTLY ix_v2_turn_metrics_created_at ON
-    v2_turn_metrics (created_at DESC)``——记为明确的 follow-up，本次不加。
+    量因此随表增长单调变大；该 follow-up 已由迁移 0071 落地
+    （``ix_v2_turn_metrics_created_at``，单列 ``created_at DESC``）——
+    ``recent_runtime_health`` 同期去掉采样上界后，两条查询共用它。
 
     token 为空一律 ``None`` 而非 ``0``：provider 未回 usage 的调用应当降低
     ``usage_coverage``，而不是被记成零 token 混进总量假装正常。
@@ -4250,6 +4486,91 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
         }
 
     return {"window_hours": safe_hours, "lanes": lanes}
+
+
+def recent_delivery_health(*, within_hours: int = 24) -> dict:
+    """端到端交付健康（content-free），喂 admin 值班台。
+
+    补的是 2026-07-30 审计里最实的一个盲区：``agent_jobs`` 判 ``completed`` 只
+    证明**回合跑完了**，不证明它的产物到达了用户。副作用走 ``v2_effect_outbox``
+    落库后异步 apply，用户可见的终态失败走 ``v2_terminal_failure_outbox`` 投递；
+    这两条队列堵住时，job 结局层面一切正常——页面此前照样报绿。
+
+    三块的窗口语义**刻意不同**，别当成一套：
+
+    * ``effect_outbox`` / ``terminal_failure_outbox`` 是**当前积压状态量**，不受
+      ``within_hours`` 约束（和 ``pool.pending`` 同类）。一条三天前就该 apply 的
+      effect 如果还堵着，那是现在的故障，不该因为窗口切到 24h 就消失。
+    * ``mcp_mutation`` 是**窗口内计数**：远端 mutation 的结果未知是一次性事件，
+      过去某天出过一次不该永久点亮值班台。
+
+    ``unknown`` 与 ``unresolved`` 分开：前者是**已判定**结果不可知（远端可能已经
+    改了数据，我们不知道），后者是 ``resolved_at IS NULL`` 的悬空记录（进程死在
+    判定之前）。两者都需要人看，但含义不同，合并计数会掩盖后者。
+    """
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT COUNT(*)::int AS pending,"
+                "  EXTRACT(EPOCH FROM (clock_timestamp()-MIN(created_at))) "
+                "    AS oldest_pending_age_sec "
+                "FROM v2_effect_outbox WHERE status='pending'"
+            )
+            effect_row = cur.fetchone() or {}
+
+            # 两种投递义务各自独立退避、各自独立标记完成，所以分别计数；年龄取
+            # 两者中最老的未完成行——值班只需要一个「堵了多久」。
+            cur.execute(
+                "SELECT "
+                "  COUNT(*) FILTER (WHERE status_delivered_at IS NULL)::int "
+                "    AS status_undelivered,"
+                "  COUNT(*) FILTER (WHERE runtime_error_delivered_at IS NULL)::int "
+                "    AS runtime_error_undelivered,"
+                "  EXTRACT(EPOCH FROM (clock_timestamp()-MIN(created_at) FILTER ("
+                "    WHERE status_delivered_at IS NULL "
+                "      OR runtime_error_delivered_at IS NULL))) "
+                "    AS oldest_undelivered_age_sec "
+                "FROM v2_terminal_failure_outbox"
+            )
+            failure_row = cur.fetchone() or {}
+
+            cur.execute(
+                "SELECT "
+                "  COUNT(*) FILTER (WHERE outcome='unknown')::int AS unknown,"
+                "  COUNT(*) FILTER (WHERE outcome IS NULL "
+                "    AND resolved_at IS NULL)::int AS unresolved "
+                "FROM v2_mcp_mutation_attempts "
+                "WHERE started_at >= now() - make_interval(hours => %s)",
+                (safe_hours,),
+            )
+            mutation_row = cur.fetchone() or {}
+
+    def _age(row, key):
+        value = row.get(key)
+        return float(value) if value is not None else None
+
+    return {
+        "window_hours": safe_hours,
+        "effect_outbox": {
+            "pending": int(effect_row.get("pending") or 0),
+            "oldest_pending_age_sec": _age(effect_row, "oldest_pending_age_sec"),
+        },
+        "terminal_failure_outbox": {
+            "status_undelivered": int(failure_row.get("status_undelivered") or 0),
+            "runtime_error_undelivered": int(
+                failure_row.get("runtime_error_undelivered") or 0
+            ),
+            "oldest_undelivered_age_sec": _age(
+                failure_row, "oldest_undelivered_age_sec"
+            ),
+        },
+        "mcp_mutation": {
+            "unknown": int(mutation_row.get("unknown") or 0),
+            "unresolved": int(mutation_row.get("unresolved") or 0),
+        },
+    }
 
 
 def recent_prompt_cache_stats(

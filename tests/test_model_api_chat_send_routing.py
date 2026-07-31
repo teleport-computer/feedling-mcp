@@ -25,6 +25,12 @@ from push import service as push_service  # noqa: E402
 from conftest import configure_model_api_route  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _legacy_exact_job_shapes_profile_off(monkeypatch):
+    """Keep exact routing queue counts on the profile-off contract."""
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
+
+
 def _b64(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
 

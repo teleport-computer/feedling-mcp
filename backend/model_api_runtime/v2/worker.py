@@ -84,6 +84,8 @@ from model_api_runtime.v2 import kill_switch
 from model_api_runtime.v2 import model_identity as v2_model_identity
 from model_api_runtime.v2 import web_gate as v2_web_gate
 from model_api_runtime.v2 import prompt_frontier as v2_prompt_frontier
+from model_api_runtime.v2 import profile as v2_profile
+from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import status_stream
 from model_api_runtime.v2 import subagents as v2_subagents
 from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
@@ -194,6 +196,16 @@ def _positive_int_env(name: str, default: str) -> int:
     if value <= 0:
         raise RuntimeError(f"{name} must be a positive integer")
     return value
+
+
+def _allowlisted_bool_env(name: str, default: str = "0") -> bool:
+    """Enable a rollout flag only for an explicit affirmative value."""
+    return str(os.environ.get(name, default)).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _nonnegative_int_env(name: str, default: str) -> int:
@@ -499,6 +511,31 @@ _COMPACTION_BATCH = _positive_int_env("FEEDLING_V2_COMPACTION_BATCH_MSGS", "200"
 _COMPACTION_BATCH_CHARS = _positive_int_env(
     "FEEDLING_V2_COMPACTION_BATCH_CHARS", "120000"
 )
+# Operational dependency: DO NOT enable this before M5 MEMORY/USER prompt
+# injection is deployed. Until then, deterministic count sentinels replace the
+# model-written summary head without supplying the long-term context elsewhere.
+_PROFILE_COVERAGE_DETERMINISTIC = _allowlisted_bool_env(
+    "FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC"
+)
+_PROFILE_ENABLED = _allowlisted_bool_env("FEEDLING_V2_PROFILE_ENABLED")
+_PROFILE_MAX_AGE_SEC = float(
+    os.environ.get("FEEDLING_V2_PROFILE_MAX_AGE_SEC", str(7 * 24 * 60 * 60))
+)
+_PROFILE_RETRY_BASE_SEC = float(
+    os.environ.get("FEEDLING_V2_PROFILE_RETRY_BASE_SEC", "300")
+)
+_PROFILE_RETRY_CAP_SEC = float(
+    os.environ.get("FEEDLING_V2_PROFILE_RETRY_CAP_SEC", "21600")
+)
+if (
+    not math.isfinite(_PROFILE_MAX_AGE_SEC)
+    or _PROFILE_MAX_AGE_SEC <= 0
+    or not math.isfinite(_PROFILE_RETRY_BASE_SEC)
+    or _PROFILE_RETRY_BASE_SEC <= 0
+    or not math.isfinite(_PROFILE_RETRY_CAP_SEC)
+    or _PROFILE_RETRY_CAP_SEC < _PROFILE_RETRY_BASE_SEC
+):
+    raise RuntimeError("invalid Runtime V2 profile timing configuration")
 _SUMMARY_ROLLUP_FANOUT = _positive_int_env(
     "FEEDLING_V2_SUMMARY_ROLLUP_FANOUT", "8"
 )
@@ -1170,6 +1207,12 @@ class TurnDeps:
     read_summary_frontier: Callable[
         [str], "v2_summary_frontier.SummaryFrontierSnapshot | None"
     ] | None = None
+    # Content-free equivalent used by deterministic coverage mode. Exact
+    # segment payloads are reconstructed from their persisted row counts, so
+    # normal roll-up never needs to decrypt historical summaries.
+    read_summary_frontier_metadata: Callable[
+        [str], "v2_summary_frontier.SummaryFrontierSnapshot | None"
+    ] | None = None
     append_summary_segment: Callable[..., bool] | None = None
     append_summary_checkpoint: Callable[..., bool] | None = None
     # (user_id, message_ids) -> {message_id: {"image_mime": str, "image_b64": str}}：只对
@@ -1196,10 +1239,20 @@ class TurnDeps:
     # 任意一项可为 ""）：capture/dream prompt 需要的记忆上下文（enclave 解密明文）。取数失败
     # → 降级为空上下文，不失败 job（spec §3.5）。
     read_memory_context: Callable[[str], dict] | None = None
+    # user_id -> (all rendered Garden cards, exact card count). Unlike
+    # read_memory_context this is fail-loud and rejects any truncated read.
+    read_profile_cards: Callable[[str], tuple[str, int]] | None = None
+    # (user_id, summary, enabled=...) -> ProfilePromptSelection. Production
+    # performs a strict blob read and scoped enclave decrypt; any failure keeps
+    # the rollback-compatible summary and returns a content-free reason.
+    select_profile_for_turn: Callable[..., Any] | None = None
     # (user_id, job_id) -> due reminder content and backend-confirmed trigger
     # metadata. Plaintext remains in the scheduled-wake record; only bounded
     # task identity/state metadata may be attached to the visible activity.
     read_scheduled_wake_context: Callable[[str, int], list[dict]] | None = None
+    # (user_id, job_id) -> bounded perception events routed into this heartbeat
+    # job. These are untrusted runtime observations, never system instructions.
+    read_perception_wake_context: Callable[[str, int], list[dict]] | None = None
     # Pending timer identity lets follow-ups use a backend-confirmed wake_id.
     read_pending_scheduled_wake_context: Callable[[str], dict] | None = None
     # (user_id, actions) -> result dict：把抽取产出的 memory.add/memory.supersede action 落库
@@ -1909,20 +1962,23 @@ class TurnMetrics:
     earliest point `job_id`/`user_id`/`lane` are known — before that, chat-turn
     setup failures like an unresolvable BYOK provider have nowhere else to
     attribute a metric row to) and threaded down through `process_job` and
-    each self-contained lane handler (`_run_compaction`/`_run_wake`/
-    `_run_extraction`). `flush()` upserts ONE `v2_turn_metrics` row per job_id
+    each self-contained lane handler (`_run_compaction`/`_run_profile`/
+    `_run_wake`/`_run_extraction`). `flush()` upserts ONE
+    `v2_turn_metrics` row per job_id
     (idempotent replace, never append — see `jobs_store.record_whole_turn_metric`),
     called at exactly the terminal points spec'd by B5: EVERY lane's success
     return AND every `mark_failed` call site — chat, `maintenance` (compaction),
     wake (`heartbeat`/`scheduled`/`manual_wake`/`screen_watch`) and extraction
-    (`capture`/`dream`) alike. The background lanes are not metric-free: each
-    makes at least one real BYOK provider call per job (`_run_wake` and chat's
+    (`capture`/`dream`/`profile`) alike. The background lanes are not
+    metric-free: provider-backed paths record each real BYOK call
+    (`_run_wake` and chat's
     `process_job` both drive `tool_loop.run_tool_loop`, which calls `add_call`
     itself via its `add_usage` callback for every provider round; `_run_extraction`
     → `v2_extraction.extract`, `_run_compaction` → `v2_compaction.compact`, the
     last two only when the lane actually reaches its compaction/extraction call —
     e.g. a compaction job whose tail is already under budget skips the call and
-    legitimately flushes `model_calls=0`), so a success there carries real
+    legitimately flushes `model_calls=0`; an empty Garden profile does the
+    same), so a provider-backed success there carries real
     token/usage data worth a row — this is precisely the lane that burns
     idle-user BYOK tokens on heartbeat/scheduled wakes, so it is the metric
     consumers most need. `tool_loop.run_tool_loop` surfaces usage via its
@@ -3024,6 +3080,9 @@ def _make_build_messages_fn(
     mutation_recovery_active: bool = False,
     trusted_system_blocks: tuple[str, ...] = (),
     working_memory: str = "",
+    agent_memory: str = "",
+    user_profile: str = "",
+    coverage_hole_notice: str = "",
     provider_config: Any = None,
     temporal_context: dict[str, Any] | None = None,
     temporal_snapshot: dict[str, Any] | None = None,
@@ -3088,6 +3147,9 @@ def _make_build_messages_fn(
             mutation_recovery_active=mutation_recovery_active,
             trusted_system_blocks=(identity_block, *trusted_system_blocks),
             working_memory=working_memory,
+            agent_memory=agent_memory,
+            user_profile=user_profile,
+            coverage_hole_notice=coverage_hole_notice,
             temporal_context=_temporal_for(rendered_tail),
         )
 
@@ -4558,6 +4620,7 @@ async def _rebalance_summary_frontier(
     job_id=None,
     add_usage: Callable[[dict | None], None] | None = None,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+    deterministic_coverage: bool = False,
 ) -> list:
     """Roll immutable canonical nodes up until the prompt frontier is bounded.
 
@@ -4566,17 +4629,20 @@ async def _rebalance_summary_frontier(
     the canonical cover. Exhaustion is loud so no caller can substitute silent
     truncation for a complete historical representation.
     """
-    if (
-        deps.read_summary_frontier is None
-        or deps.append_summary_checkpoint is None
-    ):
+    frontier_reader = (
+        deps.read_summary_frontier_metadata
+        if deterministic_coverage
+        and deps.read_summary_frontier_metadata is not None
+        else deps.read_summary_frontier
+    )
+    if frontier_reader is None or deps.append_summary_checkpoint is None:
         return []
 
     async def _read_frontier():
         if enclave_sem is None:
-            return await asyncio.to_thread(deps.read_summary_frontier, user_id)
+            return await asyncio.to_thread(frontier_reader, user_id)
         async with enclave_sem:
-            return await asyncio.to_thread(deps.read_summary_frontier, user_id)
+            return await asyncio.to_thread(frontier_reader, user_id)
 
     no_progress = 0
     for _pass in range(_SUMMARY_ROLLUP_MAX_PASSES):
@@ -4658,26 +4724,41 @@ async def _rebalance_summary_frontier(
             )
             return result
 
-        try:
-            checkpoint = await v2_compaction.compact_checkpoint(
-                provider_config=provider_config,
-                child_summaries=checkpoint_messages,
-                llm=_recording_checkpoint_llm,
-                usage_out=add_usage,
-            )
-        except v2_compaction.CheckpointCompactionExhausted as exc:
-            raise v2_summary_frontier.SummaryFrontierExhausted(
-                "checkpoint_work_budget_exhausted"
-            ) from exc
+        checkpoint = (
+            v2_compaction.deterministic_checkpoint(checkpoint_messages)
+            if deterministic_coverage
+            else None
+        )
+        if checkpoint is None:
+            try:
+                checkpoint = await v2_compaction.compact_checkpoint(
+                    provider_config=provider_config,
+                    child_summaries=checkpoint_messages,
+                    llm=_recording_checkpoint_llm,
+                    usage_out=add_usage,
+                )
+            except v2_compaction.CheckpointCompactionExhausted as exc:
+                raise v2_summary_frontier.SummaryFrontierExhausted(
+                    "checkpoint_work_budget_exhausted"
+                ) from exc
         if checkpoint is None:
             raise v2_summary_frontier.SummaryFrontierExhausted(
                 "invalid_checkpoint_output"
             )
-        materialized_head = v2_summary_frontier.render_replacement(
-            frontier,
-            child_segment_ids=candidate.child_segment_ids,
-            parent_text=checkpoint,
-        )
+        if deterministic_coverage and not any(
+            item.coverage_kind == "legacy_opaque" for item in frontier
+        ):
+            materialized_head = v2_compaction.deterministic_fold(
+                source_message_count=sum(
+                    item.source_message_count for item in frontier
+                )
+            )
+        else:
+            materialized_head = v2_summary_frontier.render_replacement(
+                frontier,
+                child_segment_ids=candidate.child_segment_ids,
+                parent_text=checkpoint,
+            )
         if claimed_by and job_id is not None:
             renewed = await asyncio.to_thread(
                 jobs_store.renew_job_lease,
@@ -4767,23 +4848,58 @@ async def _bound_materialized_summary(
     return bounded
 
 
-def _with_coverage_hole_notice(summary: str, hole_count: int) -> str:
+def _coverage_hole_notice(hole_count: int) -> str:
     """Disclose that older messages were dropped from the bounded prompt window.
 
     Option A serves a bounded recency tail when compaction is behind, leaving a
     gap between the summary and the recent messages. Stating it plainly stops the
     model from assuming the omitted span never happened; the durable facts remain
     in long-term memory, and the background maintenance compaction chain shrinks
-    the gap over time. Rendered into the existing summary/context block, so it
-    never enters the seq-exact tail machinery.
+    the gap over time. It is rendered as a separate untrusted data block after
+    replay, so it never mutates the stable profile/summary prefix or seq-exact
+    tail.
     """
-    notice = (
-        f"\n\n[Context note: {hole_count} earlier message(s) between the summary "
+    return (
+        f"{hole_count} earlier message(s) between the historical profile/summary "
         "above and the recent messages below are omitted here to fit the context "
         "window. Their durable facts are retained in long-term memory — ask the "
-        "user if you need older details.]"
+        "user if you need older details."
     )
-    return ((summary or "").rstrip() + notice).strip()
+
+
+async def _select_profile_prompt_for_turn(
+    *,
+    user_id: str,
+    summary: str,
+    deps: TurnDeps,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
+) -> "v2_profile_store.ProfilePromptSelection":
+    if deps.select_profile_for_turn is None:
+        return v2_profile_store.ProfilePromptSelection(summary=str(summary))
+    try:
+        selection = await asyncio.to_thread(
+            deps.select_profile_for_turn,
+            user_id,
+            summary,
+            enabled=_PROFILE_ENABLED,
+        )
+        if not isinstance(selection, v2_profile_store.ProfilePromptSelection):
+            raise TypeError("invalid profile prompt selection")
+    except Exception as exc:  # noqa: BLE001 — turn must retain summary fallback
+        selection = v2_profile_store.ProfilePromptSelection(
+            summary=str(summary),
+            fallback_reason=(
+                "selection_failed:" + type(exc).__name__.lower()
+            ),
+        )
+    if selection.fallback_reason:
+        await _record_trajectory(
+            trajectory_recorder,
+            "profile_prompt_fallback",
+            {"reason": selection.fallback_reason},
+            best_effort=True,
+        )
+    return selection
 
 
 async def _read_seq_adaptive_prompt_context(
@@ -4800,7 +4916,7 @@ async def _read_seq_adaptive_prompt_context(
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None",
     active_image_ids: set[str] | None = None,
     tail_cap: int | None = None,
-) -> tuple[str, list[dict], list[list[dict]], bool, int]:
+) -> tuple[str, list[dict], list[list[dict]], bool, int, str, str, str]:
     """Read one exact core plus summary-covered complete-turn replay.
 
     ``tail_cap`` (Option A / graceful degradation): when set, the verbatim tail
@@ -4903,31 +5019,44 @@ async def _read_seq_adaptive_prompt_context(
                 read_files=deps.read_files,
             )
             optional_tail_turns = _group_complete_turns(optional_rows)
-    summary = await _bound_materialized_summary(
-        user_id,
-        summary,
-        deps,
-        provider_config=provider_config,
-        enclave_sem=enclave_sem,
-        claimed_by=claimed_by,
-        job_id=job_id,
-        add_usage=add_usage,
+    profile_selection = await _select_profile_prompt_for_turn(
+        user_id=user_id,
+        summary=summary,
+        deps=deps,
         trajectory_recorder=trajectory_recorder,
     )
+    summary = profile_selection.summary
+    if not profile_selection.used_profile:
+        summary = await _bound_materialized_summary(
+            user_id,
+            summary,
+            deps,
+            provider_config=provider_config,
+            enclave_sem=enclave_sem,
+            claimed_by=claimed_by,
+            job_id=job_id,
+            add_usage=add_usage,
+            trajectory_recorder=trajectory_recorder,
+        )
     await _assert_prompt_tail_exact(
         user_id,
         watermark_seq=prompt_floor_seq,
         through_seq=through_seq,
         tail=tail,
     )
-    if coverage_hole_count > 0:
-        summary = _with_coverage_hole_notice(summary, coverage_hole_count)
     return (
         summary,
         tail,
         optional_tail_turns,
         tail_source_truncated,
         int(watermark_seq),
+        profile_selection.memory,
+        profile_selection.user,
+        (
+            _coverage_hole_notice(coverage_hole_count)
+            if coverage_hole_count > 0
+            else ""
+        ),
     )
 
 
@@ -4974,6 +5103,158 @@ async def _run_compaction(
     静默 `mark_failed`，跟 chat turn 的用户可见失败路径彻底分开。
     """
     try:
+        if _PROFILE_COVERAGE_DETERMINISTIC:
+            if deps.append_summary_segment is None:
+                raise RuntimeError("deterministic_compaction_unwired")
+            summary_row = await asyncio.to_thread(
+                jobs_store.get_summary_row,
+                user_id,
+            )
+            watermark_seq = int(summary_row["watermark_seq"]) if summary_row else 0
+            watermark_ts = (
+                float(summary_row["watermark_ts"]) if summary_row else 0.0
+            )
+            version = int(summary_row["version"]) if summary_row else 0
+            unsummarized_count = await _unsummarized_count(
+                user_id,
+                watermark_seq,
+            )
+            if unsummarized_count <= _TAIL_KEEP:
+                await asyncio.to_thread(
+                    jobs_store.mark_completed,
+                    job_id,
+                    claimed_by=claimed_by,
+                )
+                if tm is not None:
+                    tm.flush(failed=False, status="ok")
+                return "completed"
+
+            fold_count = min(
+                _COMPACTION_BATCH,
+                unsummarized_count - _TAIL_KEEP,
+            )
+            first_seq, last_seq, source_count = await asyncio.to_thread(
+                db.chat_coverage_bounds_after_seq,
+                user_id,
+                watermark_seq,
+                limit=fold_count,
+                through_seq=None,
+            )
+            if (
+                source_count != fold_count
+                or first_seq <= watermark_seq
+                or last_seq < first_seq
+            ):
+                raise RuntimeError("deterministic_coverage_bounds_incomplete")
+            segment_text = v2_compaction.deterministic_fold(
+                source_message_count=source_count
+            )
+            covered_count = await asyncio.to_thread(
+                db.count_messages_after_seq,
+                user_id,
+                0,
+                through_seq=last_seq,
+                exclude_synthetic_sources=True,
+            )
+            head_text = v2_compaction.deterministic_fold(
+                source_message_count=covered_count
+            )
+            _report_turn_progress("deterministic_compaction_batch_start")
+            await _record_trajectory(
+                trajectory_recorder,
+                "deterministic_compaction_batch",
+                {
+                    "lane": "maintenance",
+                    "start_seq": first_seq,
+                    "end_seq": last_seq,
+                    "source_message_count": source_count,
+                },
+                best_effort=True,
+            )
+            if claimed_by and not await asyncio.to_thread(
+                jobs_store.renew_job_lease,
+                job_id,
+                claimed_by,
+                ttl_sec=jobs_store.RUNNING_TTL_SEC,
+            ):
+                raise LostJobLease(
+                    "compaction lease lost before deterministic summary write"
+                )
+            if deps.runtime_mode_enabled is not None and not await asyncio.to_thread(
+                deps.runtime_mode_enabled,
+                user_id,
+            ):
+                raise RuntimeModeChanged(
+                    "user rolled back before deterministic summary write"
+                )
+            ok = await asyncio.to_thread(
+                deps.append_summary_segment,
+                user_id,
+                segment_text,
+                current_summary="",
+                head_summary=head_text,
+                start_seq=first_seq,
+                end_seq=last_seq,
+                source_message_count=source_count,
+                watermark_ts=watermark_ts,
+                expected_version=version,
+                previous_watermark_seq=watermark_seq,
+            )
+            _report_turn_progress("deterministic_compaction_batch_complete")
+            if ok:
+                await _rebalance_summary_frontier(
+                    user_id,
+                    deps,
+                    provider_config=provider_config,
+                    enclave_sem=enclave_sem,
+                    claimed_by=claimed_by,
+                    job_id=job_id,
+                    add_usage=tm.add_call if tm is not None else None,
+                    trajectory_recorder=trajectory_recorder,
+                    deterministic_coverage=True,
+                )
+                remaining_count = await _unsummarized_count(
+                    user_id,
+                    last_seq,
+                )
+                completed = await asyncio.to_thread(
+                    jobs_store.mark_completed,
+                    job_id,
+                    claimed_by=claimed_by,
+                )
+                if completed and remaining_count > _TAIL_KEEP:
+                    await asyncio.to_thread(
+                        jobs_store.enqueue_job,
+                        user_id,
+                        "maintenance",
+                        reason="compaction_catchup",
+                    )
+                    await asyncio.to_thread(
+                        core_wake_bus.notify,
+                        "v2_jobs",
+                        user_id,
+                    )
+                if tm is not None:
+                    tm.flush(failed=False, status="ok")
+                return "completed"
+            failed_owned = await asyncio.to_thread(
+                jobs_store.mark_failed,
+                job_id,
+                "summary_cas_lost",
+                claimed_by=claimed_by,
+            )
+            if failed_owned:
+                await asyncio.to_thread(
+                    jobs_store.enqueue_job,
+                    user_id,
+                    "maintenance",
+                    reason="cas_lost_retry",
+                )
+                await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+            if tm is not None:
+                tm.flush(failed=True, status="summary_cas_lost")
+            return "failed"
+
         # Rebalance first, then read the head/version used by this leaf CAS.
         # A checkpoint increments the head version; reading first would waste
         # one provider call on a predictably stale leaf and force a retry job.
@@ -5832,12 +6113,20 @@ async def _ensure_prompt_coverage(
                 or deps.read_tail is not None
             )
         )
+        deterministic_callbacks = (
+            _PROFILE_COVERAGE_DETERMINISTIC
+            and deps.append_summary_segment is not None
+        )
         if (
             (
                 deps.write_summary is None
                 and deps.append_summary_segment is None
             )
-            or not (seq_callbacks or legacy_callbacks)
+            or not (
+                deterministic_callbacks
+                or seq_callbacks
+                or legacy_callbacks
+            )
         ):
             raise TurnError(_coverage_incomplete_reason("catchup_unwired"))
         if no_progress_attempts >= max_retries:
@@ -5921,6 +6210,89 @@ async def _ensure_prompt_coverage(
             batch_cap,
         )
         if fold_count <= 0:
+            continue
+        if deterministic_callbacks:
+            first_seq, last_seq, source_count = await _within_deadline(
+                lambda: asyncio.to_thread(
+                    db.chat_coverage_bounds_after_seq,
+                    user_id,
+                    watermark_seq,
+                    limit=fold_count,
+                    through_seq=compact_through_seq,
+                )
+            )
+            if (
+                source_count != fold_count
+                or first_seq <= watermark_seq
+                or last_seq < first_seq
+            ):
+                raise TurnError("prompt_coverage_incomplete")
+            segment_text = v2_compaction.deterministic_fold(
+                source_message_count=source_count
+            )
+            covered_count = await _within_deadline(
+                lambda: asyncio.to_thread(
+                    db.count_messages_after_seq,
+                    user_id,
+                    0,
+                    through_seq=last_seq,
+                    exclude_synthetic_sources=True,
+                )
+            )
+            head_text = v2_compaction.deterministic_fold(
+                source_message_count=covered_count
+            )
+            attempted_since_observation = True
+            _report_turn_progress("prompt_deterministic_catchup_batch_start")
+            await _renew_catchup_lease()
+            wrote = await _within_deadline(
+                lambda: asyncio.to_thread(
+                    deps.append_summary_segment,
+                    user_id,
+                    segment_text,
+                    current_summary="",
+                    head_summary=head_text,
+                    start_seq=first_seq,
+                    end_seq=last_seq,
+                    source_message_count=source_count,
+                    watermark_ts=(
+                        float(summary_row["watermark_ts"])
+                        if summary_row
+                        else 0.0
+                    ),
+                    expected_version=(
+                        int(summary_row["version"]) if summary_row else 0
+                    ),
+                    previous_watermark_seq=watermark_seq,
+                )
+            )
+            if wrote:
+                await _within_deadline(
+                    lambda: _rebalance_summary_frontier(
+                        user_id,
+                        deps,
+                        provider_config=provider_config,
+                        enclave_sem=enclave_sem,
+                        claimed_by=claimed_by,
+                        job_id=job_id,
+                        add_usage=add_usage,
+                        trajectory_recorder=trajectory_recorder,
+                        deterministic_coverage=True,
+                    )
+                )
+            _report_turn_progress("prompt_deterministic_catchup_batch_complete")
+            await _record_trajectory(
+                trajectory_recorder,
+                "deterministic_compaction_batch",
+                {
+                    "lane": "prompt_catchup",
+                    "start_seq": first_seq,
+                    "end_seq": last_seq,
+                    "source_message_count": source_count,
+                    "written": bool(wrote),
+                },
+                best_effort=True,
+            )
             continue
 
         async def _read_gap():
@@ -6283,9 +6655,10 @@ async def _run_wake(
 
     prompt 组装：读 summary+tail（同 chat 路径的 D1 读法）+ 固定的 `_WAKE_NUDGE`。
     `system_prompt`：`_SCREEN_WATCH_SYSTEM_PROMPT`（screen_watch lane）或
-    `_WAKE_SYSTEM_PROMPT`（其余三条 wake lane）。screen_watch 的 `screen_recent` 预取
-    结果通过 `_make_build_messages_fn` 的 `extra_context` 参数（复用
-    `context.action_context_str` 的渲染）注入——它是回合开始时取一次的静态
+    `_WAKE_SYSTEM_PROMPT`（其余三条 wake lane）。screen_watch 的 `screen_recent`、
+    普通 wake 的 perception snapshot，以及由感知事件路由进 heartbeat job 的触发上下文，
+    都通过 `_make_build_messages_fn` 的 `extra_context` 参数（复用
+    `context.action_context_str` 的渲染）注入。它们是回合开始时取一次的低信任静态
     grounding，不随 tool-loop 轮次增长，跟 `prior_tool_results`（每轮动态积累的工具
     观测）是两回事。
     """
@@ -6355,6 +6728,9 @@ async def _run_wake(
         legacy_context = deps.read_summary is not None and deps.read_tail is not None
         optional_tail_turns: list[list[dict]] = []
         tail_source_truncated = False
+        agent_memory = ""
+        user_profile = ""
+        coverage_hole_notice = ""
         wake_snapshot_seq = 0
         compact_through_seq = None
         if seq_context:
@@ -6389,6 +6765,9 @@ async def _run_wake(
                 optional_tail_turns,
                 tail_source_truncated,
                 watermark_seq,
+                agent_memory,
+                user_profile,
+                coverage_hole_notice,
             ) = await _read_seq_adaptive_prompt_context(
                 user_id=user_id,
                 deps=deps,
@@ -6426,17 +6805,27 @@ async def _run_wake(
                     user_id=user_id,
                     read_files=deps.read_files,
                 )
-            summary = await _bound_materialized_summary(
-                user_id,
-                summary,
-                deps,
-                provider_config=provider_config,
-                enclave_sem=enclave_sem,
-                claimed_by=claimed_by,
-                job_id=job_id,
-                add_usage=tm.add_call if tm is not None else None,
+            profile_selection = await _select_profile_prompt_for_turn(
+                user_id=user_id,
+                summary=summary,
+                deps=deps,
                 trajectory_recorder=trajectory_recorder,
             )
+            summary = profile_selection.summary
+            agent_memory = profile_selection.memory
+            user_profile = profile_selection.user
+            if not profile_selection.used_profile:
+                summary = await _bound_materialized_summary(
+                    user_id,
+                    summary,
+                    deps,
+                    provider_config=provider_config,
+                    enclave_sem=enclave_sem,
+                    claimed_by=claimed_by,
+                    job_id=job_id,
+                    add_usage=tm.add_call if tm is not None else None,
+                    trajectory_recorder=trajectory_recorder,
+                )
         if seq_context:
             # A wake is proactive work only while there is no unanswered user
             # input.  Keep the frozen prompt snapshot boundary separate from
@@ -6460,11 +6849,25 @@ async def _run_wake(
                 pending_check_through_seq,
             )
             if base_prompt_user_frontier > wake_reply_cursor_seq:
-                completed = await asyncio.to_thread(
-                    jobs_store.mark_completed,
-                    job_id,
-                    claimed_by=claimed_by,
-                )
+                successor_id = None
+                if (
+                    lane == "heartbeat"
+                    and deps.read_perception_wake_context is not None
+                ):
+                    completed, successor_id = await asyncio.to_thread(
+                        jobs_store.finish_wake_job,
+                        job_id,
+                        claimed_by=claimed_by,
+                        observed_generation=observed_generation,
+                        context_stream="v2_perception_wake_context",
+                        consumed_context_seq=0,
+                    )
+                else:
+                    completed = await asyncio.to_thread(
+                        jobs_store.mark_completed,
+                        job_id,
+                        claimed_by=claimed_by,
+                    )
                 if not completed:
                     raise LostJobLease(
                         "wake job ownership lost while yielding to chat input"
@@ -6481,6 +6884,9 @@ async def _run_wake(
         wake_nudge = _WAKE_NUDGE
         wake_system_prompt = _WAKE_SYSTEM_PROMPT
         scheduled_activity_events: list[dict] = []
+        perception_wake_context: list[dict] = []
+        wake_observed_generation = observed_generation
+        consumed_perception_context_seq = 0
         if lane == "scheduled" and deps.read_scheduled_wake_context is not None:
             scheduled_context: list[dict] = []
             # The scheduler notifies after associating the records, but a worker
@@ -6526,6 +6932,46 @@ async def _run_wake(
                 wake_nudge = (
                     "The following user-scheduled reminders are due now:\n"
                     + "\n".join(f"- {note}" for note in scheduled_notes)
+                )
+        elif lane == "heartbeat" and deps.read_perception_wake_context is not None:
+            # The producer attaches context before notifying, but a polling
+            # worker can claim the job between enqueue and association.
+            for attempt in range(3):
+                perception_wake_context = await asyncio.to_thread(
+                    deps.read_perception_wake_context,
+                    user_id,
+                    int(job_id),
+                )
+                if perception_wake_context or attempt == 2:
+                    break
+                await asyncio.sleep(0.05)
+            if perception_wake_context:
+                prompt_context: list[dict] = []
+                for raw_item in perception_wake_context[:10]:
+                    if not isinstance(raw_item, dict):
+                        continue
+                    item = dict(raw_item)
+                    try:
+                        consumed_perception_context_seq = max(
+                            consumed_perception_context_seq,
+                            int(item.pop("_context_seq", 0) or 0),
+                        )
+                        wake_observed_generation = max(
+                            wake_observed_generation,
+                            int(item.pop("_input_generation", 0) or 0),
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        item.pop("_context_seq", None)
+                        item.pop("_input_generation", None)
+                    prompt_context.append(item)
+                perception_wake_context = prompt_context
+                # Keep event-controlled text out of the authoritative nudge.
+                # The actual digest/origins are rendered below as explicitly
+                # untrusted runtime data.
+                wake_nudge = (
+                    "A recent perception change may be worth responding to. "
+                    "Use the untrusted runtime context below, and stay silent "
+                    "if it is not meaningful."
                 )
         temporal_snapshot = await _capture_turn_temporal_snapshot(
             user_id=user_id,
@@ -6574,6 +7020,14 @@ async def _run_wake(
             screen_results = await _perception_grounding_results(
                 store, runtime_token=token, enclave_sem=enclave_sem
             )
+        if perception_wake_context:
+            if screen_results is None:
+                screen_results = {}
+            screen_results["perception_wake"] = [
+                {"ok": True, "data": item}
+                for item in perception_wake_context[:10]
+                if isinstance(item, dict)
+            ]
 
         # Pin effects to the generation admitted/claimed for this job, never a
         # fresh read. A resident->v2 ABA during a long provider call can leave
@@ -7020,13 +7474,13 @@ async def _run_wake(
                 if consumed_seq is not None:
                     payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
                         "claimed_by": claimed_by,
-                        "input_generation": observed_generation,
+                        "input_generation": wake_observed_generation,
                         "through_seq": consumed_seq,
                     }
                 elif final:
                     payload[v2_effect_outbox.FINAL_REPLY_FENCE_KEY] = {
                         "claimed_by": claimed_by,
-                        "input_generation": observed_generation,
+                        "input_generation": wake_observed_generation,
                         "observed_user_seq": int(cursor_box["seq"]),
                     }
                 else:
@@ -7217,6 +7671,15 @@ async def _run_wake(
                     status == "discarded"
                     and last_error == v2_effect_outbox.FINAL_REPLY_INPUT_ADVANCED
                 ):
+                    if (
+                        lane == "heartbeat"
+                        and deps.read_perception_wake_context is not None
+                    ):
+                        # A perception event landed after this prompt's
+                        # generation fence. Suppress the now-stale proactive
+                        # bubble; successor-aware finalization below transfers
+                        # the unread context to a fresh heartbeat job.
+                        return
                     raise v2_tool_loop.FinalReplySuperseded()
                 if (
                     status == "discarded"
@@ -7287,6 +7750,9 @@ async def _run_wake(
                 ),
                 trusted_system_blocks=trusted_system_blocks,
                 working_memory=working_memory,
+                agent_memory=agent_memory,
+                user_profile=user_profile,
+                coverage_hole_notice=coverage_hole_notice,
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,
                 optional_tail_turns=optional_tail_turns,
@@ -7327,6 +7793,9 @@ async def _run_wake(
                     optional_tail_turns,
                     tail_source_truncated,
                     watermark_seq,
+                    agent_memory,
+                    user_profile,
+                    coverage_hole_notice,
                 ) = await _read_seq_adaptive_prompt_context(
                     user_id=user_id,
                     deps=deps,
@@ -7431,12 +7900,34 @@ async def _run_wake(
                 )
             raise
 
-        await asyncio.to_thread(
-            jobs_store.mark_completed,
-            job_id,
-            claimed_by=claimed_by,
-            clear_wake_backoff=(lane in _FAIL_BACKOFF_WAKE_LANES),
-        )
+        successor_id = None
+        if lane == "heartbeat" and deps.read_perception_wake_context is not None:
+            completed, successor_id = await asyncio.to_thread(
+                jobs_store.finish_wake_job,
+                job_id,
+                claimed_by=claimed_by,
+                observed_generation=wake_observed_generation,
+                context_stream="v2_perception_wake_context",
+                consumed_context_seq=consumed_perception_context_seq,
+                clear_wake_backoff=(lane in _FAIL_BACKOFF_WAKE_LANES),
+            )
+        else:
+            # Some reply-effect sinks terminalize the source job atomically
+            # with final publication. Preserve the established non-heartbeat
+            # behavior: a false return here is therefore not necessarily lease
+            # loss. Heartbeat's successor-aware path above owns its own exact
+            # terminalization and must return true.
+            await asyncio.to_thread(
+                jobs_store.mark_completed,
+                job_id,
+                claimed_by=claimed_by,
+                clear_wake_backoff=(lane in _FAIL_BACKOFF_WAKE_LANES),
+            )
+            completed = True
+        if not completed:
+            raise LostJobLease("wake job ownership lost during completion")
+        if successor_id is not None:
+            await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
         # End-of-turn drain (mirrors process_job's chat-branch finalize): a write
         # tool_call in the LAST round has no subsequent on_reply to trigger a drain,
         # so flush whatever's still pending. Best-effort — the job is already
@@ -7554,6 +8045,350 @@ def _memory_write_result_counts(
         "memory_action_failed",
     )
     return applied_count, skipped_count, failed_count, first_error
+
+
+def _profile_generated_timestamp(value: Any) -> float:
+    raw = str(value or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _profile_refresh_due(user_id: str, *, now: float | None = None) -> bool:
+    """Content-free post-turn profile scheduling decision."""
+
+    if not _PROFILE_ENABLED:
+        return False
+    current_time = float(time.time() if now is None else now)
+    raw = db.get_blob_strict(str(user_id), v2_profile_store.PROFILE_BLOB_KIND)
+    if raw is None:
+        return True
+    document = v2_profile_store.validate_profile_document(raw)
+    if document.get("disabled") is True:
+        return False
+    state = str(document.get("state") or "")
+    source = document.get("source") or {}
+    if state == "empty":
+        card_count, max_updated_at = db.memory_profile_source_stats(user_id)
+        return (
+            int(source.get("card_count") or 0) != card_count
+            or str(source.get("max_updated_at") or "") != max_updated_at
+        )
+    if state != "ok":
+        retry_not_before = float(
+            (document.get("last_attempt") or {}).get("retry_not_before") or 0
+        )
+        return current_time >= retry_not_before
+    generated_at = _profile_generated_timestamp(source.get("generated_at"))
+    if generated_at <= 0 or current_time - generated_at < _PROFILE_MAX_AGE_SEC:
+        return False
+    card_count, max_updated_at = db.memory_profile_source_stats(user_id)
+    return (
+        int(source.get("card_count") or 0) != card_count
+        or str(source.get("max_updated_at") or "") != max_updated_at
+    )
+
+
+async def _enqueue_profile_if_due(
+    user_id: str,
+    *,
+    reason: str,
+    force: bool = False,
+) -> bool:
+    if not _PROFILE_ENABLED:
+        return False
+    if not force and not await asyncio.to_thread(_profile_refresh_due, user_id):
+        return False
+    _job_id, coalesced = await asyncio.to_thread(
+        jobs_store.enqueue_job,
+        user_id,
+        "profile",
+        reason=reason,
+    )
+    if not coalesced:
+        await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+    return not coalesced
+
+
+def _profile_attempt_count(previous: dict) -> int:
+    try:
+        prior = int((previous.get("last_attempt") or {}).get("attempts") or 0)
+    except (TypeError, ValueError):
+        prior = 0
+    return max(1, prior + 1)
+
+
+def _profile_retry_not_before(attempts: int, *, now: float) -> float:
+    exponent = min(20, max(0, int(attempts) - 1))
+    return now + min(
+        _PROFILE_RETRY_CAP_SEC,
+        _PROFILE_RETRY_BASE_SEC * (2**exponent),
+    )
+
+
+class _ProfileProviderSetupFailure(RuntimeError):
+    """Content-free provider-resolution failure routed into profile handling."""
+
+
+def _profile_failure_code(exc: BaseException) -> str:
+    if isinstance(exc, _ProfileProviderSetupFailure):
+        return str(exc)
+    if isinstance(exc, v2_profile.ProfileGenerationExhausted):
+        code = str(exc)
+        if re.fullmatch(r"profile_source_exceeds_budget:[0-9]+", code):
+            return code
+    text = str(exc)
+    if re.fullmatch(
+        r"profile_cards_(?:truncated:[0-9]+/[0-9]+|"
+        r"index_failed:[0-9]+|fetch_failed:[0-9]+|"
+        r"index_invalid|count_invalid|id_missing|render_incomplete)",
+        text,
+    ):
+        return text
+    if isinstance(exc, (RuntimeModeChanged, LostJobLease, asyncio.CancelledError)):
+        return type(exc).__name__.lower()
+    return f"profile_generation_failed:{type(exc).__name__.lower()}"
+
+
+def _profile_source_for_failure(
+    previous: dict,
+    *,
+    card_count: int,
+    max_updated_at: str,
+) -> dict:
+    prior_source = previous.get("source")
+    if isinstance(prior_source, dict):
+        generated_at = str(prior_source.get("generated_at") or "")
+    else:
+        generated_at = ""
+    return {
+        "card_count": max(0, int(card_count)),
+        "max_updated_at": str(max_updated_at or ""),
+        # A failure marker is not a newly generated profile and must not outrank
+        # a successful CAS candidate merely because its attempt happened later.
+        "generated_at": generated_at,
+    }
+
+
+async def _run_profile(
+    job_id,
+    user_id: str,
+    deps: TurnDeps,
+    provider_config: Any,
+    enclave_sem: "asyncio.Semaphore",
+    claimed_by: str | None = None,
+    tm: "TurnMetrics | None" = None,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+) -> str:
+    """Background-only profile distillation; never emits chat/error UI."""
+
+    terminal_reject = ""
+
+    async def _trajectory(kind: str, payload: dict) -> None:
+        await _record_trajectory(
+            trajectory_recorder,
+            kind,
+            {"lane": "profile", **payload},
+            best_effort=True,
+        )
+
+    async def _fence_profile_write(effect: str) -> None:
+        if claimed_by and not await asyncio.to_thread(
+            jobs_store.renew_job_lease,
+            job_id,
+            claimed_by,
+            ttl_sec=jobs_store.RUNNING_TTL_SEC,
+        ):
+            raise LostJobLease(f"profile lease lost before {effect}")
+        if deps.runtime_mode_enabled is not None and not await asyncio.to_thread(
+            deps.runtime_mode_enabled,
+            user_id,
+        ):
+            raise RuntimeModeChanged(f"user rolled back before {effect}")
+
+    async def _metadata_failure(previous: dict, code: str) -> dict:
+        card_count, max_updated_at = await asyncio.to_thread(
+            db.memory_profile_source_stats,
+            user_id,
+        )
+        attempts = _profile_attempt_count(previous)
+        now_ts = time.time()
+        await _fence_profile_write("failure metadata write")
+        return v2_profile_store.build_profile_document(
+            user_id,
+            state=("degraded" if previous.get("memory") is not None else "pending"),
+            source=_profile_source_for_failure(
+                previous,
+                card_count=card_count,
+                max_updated_at=max_updated_at,
+            ),
+            last_attempt={
+                "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "reject_code": code,
+                "attempts": attempts,
+                "retry_not_before": _profile_retry_not_before(
+                    attempts,
+                    now=now_ts,
+                ),
+            },
+            previous=previous,
+        )
+
+    async def _recompute(previous: dict) -> dict:
+        nonlocal terminal_reject
+        if deps.read_profile_cards is None:
+            raise RuntimeError("profile_cards_reader_unavailable")
+        async with enclave_sem:
+            rendered, card_count = await asyncio.to_thread(
+                deps.read_profile_cards,
+                user_id,
+            )
+        raw_count, max_updated_at = await asyncio.to_thread(
+            db.memory_profile_source_stats,
+            user_id,
+        )
+        attempts = _profile_attempt_count(previous)
+        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        source = {
+            # The freshness witness is the raw table aggregate from the spec,
+            # not the eligible read-side count. Archived/superseded rows still
+            # exist in the Garden table; mixing the two counts would make an
+            # unchanged empty eligible view requeue after every Chat turn.
+            "card_count": max(0, int(raw_count)),
+            "max_updated_at": str(max_updated_at or ""),
+            "generated_at": now_iso,
+        }
+        if card_count == 0:
+            terminal_reject = ""
+            await _fence_profile_write("empty profile write")
+            return v2_profile_store.build_profile_document(
+                user_id,
+                state="empty",
+                source=source,
+                last_attempt={
+                    "at": now_iso,
+                    "reject_code": "",
+                    "attempts": attempts,
+                    "retry_not_before": 0,
+                },
+            )
+        generated = await v2_profile.generate_profile(
+            provider_config=provider_config,
+            rendered_cards=rendered,
+            llm=provider_client.reliable_chat_completion_async,
+            usage_out=(tm.add_call if tm is not None else None),
+            trajectory_out=_trajectory,
+        )
+        if generated.fields is None:
+            terminal_reject = generated.reject_code
+            return await _metadata_failure(previous, terminal_reject)
+        terminal_reject = ""
+        await _fence_profile_write("profile write")
+        return v2_profile_store.build_profile_document(
+            user_id,
+            state="ok",
+            source=source,
+            last_attempt={
+                "at": now_iso,
+                "reject_code": "",
+                "attempts": attempts,
+                "retry_not_before": 0,
+            },
+            memory_text=generated.fields["memory"],
+            user_text=generated.fields["user"],
+        )
+
+    try:
+        if not _PROFILE_ENABLED:
+            await asyncio.to_thread(
+                jobs_store.mark_completed,
+                job_id,
+                claimed_by=claimed_by,
+            )
+            if tm is not None:
+                tm.flush(failed=False, status="profile_disabled")
+            return "completed"
+        if isinstance(provider_config, _ProfileProviderSetupFailure):
+            raise provider_config
+        if claimed_by and not await asyncio.to_thread(
+            jobs_store.renew_job_lease,
+            job_id,
+            claimed_by,
+            ttl_sec=jobs_store.RUNNING_TTL_SEC,
+        ):
+            raise LostJobLease("profile lease lost before generation")
+        result = await v2_profile_store.update_profile_cas_async(
+            user_id,
+            _recompute,
+        )
+        if result.status == "superseded":
+            winner_state = str(result.document.get("state") or "")
+            if winner_state in {"ok", "empty"}:
+                terminal_reject = ""
+            elif not terminal_reject:
+                terminal_reject = str(
+                    (result.document.get("last_attempt") or {}).get(
+                        "reject_code"
+                    )
+                    or "profile_superseded_by_failure"
+                )
+        if result.status == "cas_failed":
+            terminal_reject = "profile_cas_failed"
+        if terminal_reject:
+            await asyncio.to_thread(
+                jobs_store.mark_failed,
+                job_id,
+                terminal_reject,
+                claimed_by=claimed_by,
+            )
+            if tm is not None:
+                tm.flush(failed=True, status=terminal_reject)
+            return "failed"
+        await asyncio.to_thread(
+            jobs_store.mark_completed,
+            job_id,
+            claimed_by=claimed_by,
+        )
+        if tm is not None:
+            tm.flush(failed=False, status="ok")
+        return "completed"
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — background-only, never surface UI
+        code = _profile_failure_code(exc)
+        try:
+            await v2_profile_store.update_profile_cas_async(
+                user_id,
+                lambda previous: _metadata_failure(previous, code),
+            )
+        except Exception as metadata_exc:  # noqa: BLE001
+            log.warning(
+                "[v2.worker] profile failure metadata write failed user=%s code=%s",
+                user_id,
+                type(metadata_exc).__name__.lower(),
+            )
+        await _record_trajectory(
+            trajectory_recorder,
+            "turn_exception",
+            {
+                "lane": "profile",
+                "error_class": type(exc).__name__,
+                "error_code": code,
+            },
+            best_effort=True,
+        )
+        await asyncio.to_thread(
+            jobs_store.mark_failed,
+            job_id,
+            code,
+            claimed_by=claimed_by,
+        )
+        if tm is not None:
+            tm.flush(failed=True, status=code)
+        return "failed"
 
 
 async def _run_extraction(
@@ -8159,6 +8994,19 @@ async def _run_extraction(
             raise RuntimeError(
                 f"extraction_memory_write_rejected:{first_error}"
             )
+        if lane == "dream":
+            try:
+                await _enqueue_profile_if_due(
+                    user_id,
+                    reason="dream_refresh",
+                    force=True,
+                )
+            except Exception as enqueue_exc:  # noqa: BLE001 — Dream already wrote
+                log.warning(
+                    "[v2.worker] enqueue profile after dream failed user=%s code=%s",
+                    user_id,
+                    type(enqueue_exc).__name__.lower(),
+                )
         await _complete_extraction(item_count=applied_count + skipped_count)
         if failed_count:
             log.warning(
@@ -8703,6 +9551,17 @@ async def process_job(
                 tm,
                 trajectory_recorder,
             )
+        if lane == "profile":
+            return await _run_profile(
+                job_id,
+                user_id,
+                deps,
+                provider_config,
+                enclave_sem,
+                claimed_by,
+                tm,
+                trajectory_recorder,
+            )
         if lane in _WAKE_LANES:
             # Self-contained wake path (D3 Task 6): proactive turn, not a reply to a
             # just-sent user message. Own try/except inside `_run_wake` — never falls
@@ -8991,6 +9850,9 @@ async def process_job(
         legacy_context = deps.read_summary is not None and deps.read_tail is not None
         optional_tail_turns: list[list[dict]] = []
         tail_source_truncated = False
+        agent_memory = ""
+        user_profile = ""
+        coverage_hole_notice = ""
         through_seq = 0
         compact_through_seq = None
         if seq_context:
@@ -9036,6 +9898,9 @@ async def process_job(
                     optional_tail_turns,
                     tail_source_truncated,
                     watermark_seq,
+                    agent_memory,
+                    user_profile,
+                    coverage_hole_notice,
                 ) = await _read_seq_adaptive_prompt_context(
                     user_id=user_id,
                     deps=deps,
@@ -9087,17 +9952,27 @@ async def process_job(
                         user_id=user_id,
                         read_files=deps.read_files,
                     )
-                summary = await _bound_materialized_summary(
-                    user_id,
-                    summary,
-                    deps,
-                    provider_config=provider_config,
-                    enclave_sem=enclave_sem,
-                    claimed_by=claimed_by,
-                    job_id=job_id,
-                    add_usage=tm.add_call,
+                profile_selection = await _select_profile_prompt_for_turn(
+                    user_id=user_id,
+                    summary=summary,
+                    deps=deps,
                     trajectory_recorder=trajectory_recorder,
                 )
+                summary = profile_selection.summary
+                agent_memory = profile_selection.memory
+                user_profile = profile_selection.user
+                if not profile_selection.used_profile:
+                    summary = await _bound_materialized_summary(
+                        user_id,
+                        summary,
+                        deps,
+                        provider_config=provider_config,
+                        enclave_sem=enclave_sem,
+                        claimed_by=claimed_by,
+                        job_id=job_id,
+                        add_usage=tm.add_call,
+                        trajectory_recorder=trajectory_recorder,
+                    )
             # Post-assembly hard assertion (D6): independent re-derivation,
             # not a reuse of `_ensure_prompt_coverage`'s return — see
             # `_assert_prompt_covers`'s docstring for why.
@@ -10176,6 +11051,9 @@ async def process_job(
                 mutation_recovery_active=(mutation_recovery_barrier is not None),
                 trusted_system_blocks=turn_trusted_system_blocks,
                 working_memory=working_memory,
+                agent_memory=agent_memory,
+                user_profile=user_profile,
+                coverage_hole_notice=coverage_hole_notice,
                 provider_config=provider_config,
                 temporal_snapshot=temporal_snapshot,
                 optional_tail_turns=optional_tail_turns,
@@ -10224,6 +11102,9 @@ async def process_job(
                     optional_tail_turns,
                     tail_source_truncated,
                     watermark_seq,
+                    agent_memory,
+                    user_profile,
+                    coverage_hole_notice,
                 ) = await _read_seq_adaptive_prompt_context(
                     user_id=user_id,
                     deps=deps,
@@ -10405,6 +11286,17 @@ async def process_job(
                 log.warning(
                     "[v2.worker] enqueue compaction failed for %s: %s", user_id, e
                 )
+        try:
+            await _enqueue_profile_if_due(
+                user_id,
+                reason="post_turn_refresh",
+            )
+        except Exception as profile_enqueue_exc:  # noqa: BLE001 — reply is durable
+            log.warning(
+                "[v2.worker] enqueue profile failed for %s: %s",
+                user_id,
+                type(profile_enqueue_exc).__name__.lower(),
+            )
 
         # Strict production replies commit the seq cursor atomically inside the
         # final compound reply effect.  Keep the old standalone cursor effect
@@ -10923,36 +11815,59 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
                 "attempt_count": job.get("attempt_count", 0),
             },
         )
-        async with ENCLAVE_SEMAPHORE:
-            provider_config, _meta = await asyncio.to_thread(
-                deps.resolve_provider, user_id
+        try:
+            async with ENCLAVE_SEMAPHORE:
+                provider_config, _meta = await asyncio.to_thread(
+                    deps.resolve_provider, user_id
+                )
+        except Exception as provider_exc:
+            if lane != "profile":
+                raise
+            provider_config = _ProfileProviderSetupFailure(
+                "profile_provider_unavailable:"
+                f"{type(provider_exc).__name__.lower()}"
             )
         _report_turn_progress("provider_config_resolved")
         if provider_config is None:
-            err = "provider_unavailable"
+            if lane == "profile":
+                provider_config = _ProfileProviderSetupFailure(
+                    "profile_provider_unavailable"
+                )
+            else:
+                err = "provider_unavailable"
+                await _record_trajectory(
+                    recorder,
+                    "turn_exception",
+                    {"stage": "provider_resolution", "error_code": err},
+                    best_effort=True,
+                )
+                owned = await asyncio.to_thread(
+                    jobs_store.mark_failed, job_id, err, claimed_by=claimed_by
+                )
+                if owned and lane == "chat":
+                    await _settle_legacy_traced_chat_failure(err)
+                    await asyncio.to_thread(
+                        _surface_terminal_error, deps, user_id, job_id, err
+                    )
+                tm.flush(failed=True, status=err)
+                return "failed"
+        if not isinstance(provider_config, _ProfileProviderSetupFailure):
+            tm.bind_provider(provider_config)
             await _record_trajectory(
                 recorder,
-                "turn_exception",
-                {"stage": "provider_resolution", "error_code": err},
-                best_effort=True,
+                "provider_config_resolved",
+                _safe_provider_metadata(provider_config),
             )
-            owned = await asyncio.to_thread(
-                jobs_store.mark_failed, job_id, err, claimed_by=claimed_by
+        if lane == "profile":
+            # This lane's assembly-owned card reader mints its own scoped
+            # runtime token. The generic process-job token is unused here, so
+            # a redundant mint must not bypass profile failure metadata.
+            runtime_token = ""
+        else:
+            runtime_token = await asyncio.to_thread(
+                deps.mint_enclave_token,
+                user_id,
             )
-            if owned and lane == "chat":
-                await _settle_legacy_traced_chat_failure(err)
-                await asyncio.to_thread(
-                    _surface_terminal_error, deps, user_id, job_id, err
-                )
-            tm.flush(failed=True, status=err)
-            return "failed"
-        tm.bind_provider(provider_config)
-        await _record_trajectory(
-            recorder,
-            "provider_config_resolved",
-            _safe_provider_metadata(provider_config),
-        )
-        runtime_token = await asyncio.to_thread(deps.mint_enclave_token, user_id)
         _report_turn_progress("runtime_token_minted")
         outcome = await process_job(
             job,

@@ -13,6 +13,7 @@ provider config.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Awaitable, Callable
 
 # Provider output limits are not a storage or trust boundary: a buggy adapter,
@@ -34,6 +35,9 @@ _DEFAULT_CHECKPOINT_SOURCE_CHARS = 120_000
 _VERBATIM_FOLD_MAX_CHARS = 4_000
 _MAX_CHECKPOINT_REDUCTION_LEVELS = 32
 _MAX_CHECKPOINT_PROVIDER_CALLS = 64
+_DETERMINISTIC_COVERAGE_RE = re.compile(
+    r"^- \[(?P<count>[1-9][0-9]*) 条更早的消息已由长期记忆覆盖\]$"
+)
 
 
 class CheckpointCompactionExhausted(RuntimeError):
@@ -239,6 +243,48 @@ def _verbatim_fold(
     )
     validated, _reject = _validate_new_bullets(rendered, current_summary="")
     return validated
+
+
+def deterministic_fold(*, source_message_count: int) -> str:
+    """Render one content-free exact-coverage leaf without a provider call.
+
+    The text is intentionally a normal validated summary bullet: storage and
+    prompt readers do not need a second payload type, while the immutable
+    segment metadata remains the authoritative exact seq/count witness.  A
+    malformed local sentinel must fail before it can advance a watermark, so
+    this uses the same all-or-nothing validator as provider output.
+    """
+
+    count = int(source_message_count)
+    if count <= 0:
+        raise ValueError("source_message_count must be positive")
+    rendered = f"- [{count} 条更早的消息已由长期记忆覆盖]"
+    validated, reject = _validate_new_bullets(
+        rendered,
+        current_summary="",
+    )
+    if validated is None:
+        raise ValueError(f"deterministic_fold_rejected:{reject}")
+    return validated
+
+
+def deterministic_checkpoint(child_texts: list[str]) -> str | None:
+    """Collapse deterministic coverage sentinels without an LLM.
+
+    Any non-sentinel child returns ``None`` so the caller can preserve the
+    existing provider checkpoint path for legacy/model-authored summaries.
+    """
+
+    values = [str(text or "").strip() for text in child_texts]
+    if not values:
+        return None
+    total = 0
+    for value in values:
+        match = _DETERMINISTIC_COVERAGE_RE.fullmatch(value)
+        if match is None:
+            return None
+        total += int(match.group("count"))
+    return deterministic_fold(source_message_count=total)
 
 
 async def compact(

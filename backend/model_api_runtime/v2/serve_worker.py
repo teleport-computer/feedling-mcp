@@ -49,7 +49,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 import httpx
@@ -80,11 +80,13 @@ from hosted import vision_observer
 from identity import identity_core
 from memory import memory_core
 from model_api_runtime.v2 import context as v2_context
+from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import child_supervisor as v2_child_supervisor
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import reaper as v2_reaper
 from model_api_runtime.v2 import runner_identity
 from model_api_runtime.v2 import scheduler
@@ -1192,6 +1194,56 @@ def _read_summary_frontier(user_id: str):
     )
 
 
+def _read_summary_frontier_metadata(user_id: str):
+    """Read a deterministic canonical cover without opening exact segments.
+
+    Exact-node text is fully determined by its authenticated row count.  A
+    legacy opaque node has no such witness, so the one migration case falls
+    back to the existing decrypting reader rather than inventing coverage.
+    """
+
+    state = jobs_store.get_summary_frontier_state(user_id)
+    if state is None:
+        return None
+    if not state.get("segments") and state.get("summary_envelope"):
+        seeded = jobs_store.seed_legacy_summary_segment(
+            user_id,
+            expected_version=int(state.get("version") or 0),
+            translated_watermark_seq=int(state.get("watermark_seq") or 0),
+        )
+        if not seeded:
+            raise v2_summary_frontier.SummaryFrontierIntegrityError(
+                "legacy_summary_seed_race"
+            )
+        state = jobs_store.get_summary_frontier_state(user_id)
+    if state is None or not state.get("segments"):
+        return None
+    metadata = _summary_metadata_frontier(state)
+    if any(item.coverage_kind == "legacy_opaque" for item in metadata):
+        return _read_summary_frontier(user_id)
+    deterministic = tuple(
+        v2_summary_frontier.SummarySegment(
+            segment_id=item.segment_id,
+            coverage_kind=item.coverage_kind,
+            level=item.level,
+            start_seq=item.start_seq,
+            end_seq=item.end_seq,
+            source_message_count=item.source_message_count,
+            legacy_opaque_through_seq=item.legacy_opaque_through_seq,
+            child_segment_ids=item.child_segment_ids,
+            text=v2_compaction.deterministic_fold(
+                source_message_count=item.source_message_count
+            ),
+        )
+        for item in metadata
+    )
+    return v2_summary_frontier.SummaryFrontierSnapshot(
+        segments=deterministic,
+        head_version=int(state.get("version") or 0),
+        watermark_seq=int(state.get("watermark_seq") or 0),
+    )
+
+
 def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
     """Read/decrypt summary plus its exact seq coverage watermark.
 
@@ -1240,6 +1292,41 @@ def _read_summary(user_id: str) -> tuple[str, float, int]:
     """
     summary, watermark_ts, version, _watermark_seq = _read_summary_with_seq(user_id)
     return summary, watermark_ts, version
+
+
+def _select_agent_profile_for_turn(
+    user_id: str,
+    summary: str,
+    *,
+    enabled: bool,
+) -> v2_profile_store.ProfilePromptSelection:
+    """Production strict-read/decrypt adapter for M5 prompt selection.
+
+    M2 lands and tests this trust/storage boundary before prompt wiring.  M5
+    consumes the returned selection; a DB/decrypt failure already has the final
+    safe behavior here: keep the summary and emit a content-free observable
+    fallback event/counter.
+    """
+    token: str | None = None
+
+    def _decrypt(envelope: dict, field: str) -> bytes:
+        nonlocal token
+        if token is None:
+            token = _mint_runtime_token(user_id)
+        return core_enclave._decrypt_envelope_via_enclave(
+            envelope,
+            None,
+            purpose=f"v2_profile_{field}_read",
+            runtime_token=token,
+        )
+
+    return v2_profile_store.select_profile_for_turn(
+        user_id,
+        summary,
+        enabled=enabled,
+        decrypt_envelope=_decrypt,
+        read_blob=db.get_blob_strict,
+    )
 
 
 def _write_summary(
@@ -1293,6 +1380,7 @@ def _append_summary_segment(
     segment_text: str,
     *,
     current_summary: str,
+    head_summary: str | None = None,
     start_seq: int,
     end_seq: int,
     source_message_count: int,
@@ -1312,10 +1400,15 @@ def _append_summary_segment(
             err,
         )
         return False
-    compatibility_text = str(current_summary or "").rstrip()
-    if compatibility_text:
-        compatibility_text += "\n"
-    compatibility_text += str(segment_text).strip()
+    if head_summary is None:
+        compatibility_text = str(current_summary or "").rstrip()
+        if compatibility_text:
+            compatibility_text += "\n"
+        compatibility_text += str(segment_text).strip()
+    else:
+        compatibility_text = str(head_summary).strip()
+        if not compatibility_text:
+            return False
     head_env, head_err = core_envelope._build_shared_envelope_for_store(
         store, compatibility_text.encode("utf-8")
     )
@@ -1488,6 +1581,55 @@ def _read_scheduled_wake_context(user_id: str, job_id: int) -> list[dict]:
         })
         if len(context) >= 10:
             break
+    return context
+
+
+def _read_perception_wake_context(user_id: str, job_id: int) -> list[dict]:
+    """Return a bounded, scalar-only projection for the wake prompt."""
+    from perception import store as perception_store
+
+    context: list[dict] = []
+    for raw in perception_store.read_v2_wake_context(user_id, job_id, limit=10):
+        if not isinstance(raw, dict):
+            continue
+        item: dict[str, Any] = {
+            "wake_id": str(raw.get("wake_id") or "")[:160],
+            "source": str(raw.get("source") or "")[:120],
+            "trigger": str(raw.get("trigger") or "")[:120],
+            "change_digest": str(raw.get("change_digest") or "")[:2000],
+            "origin_refs": [
+                str(ref)[:200]
+                for ref in list(raw.get("origin_refs") or [])[:10]
+            ],
+        }
+        hints: dict[str, bool | int | float | str] = {}
+        raw_hints = raw.get("presence_hints")
+        if isinstance(raw_hints, dict):
+            for key, value in list(raw_hints.items())[:10]:
+                safe_key = str(key)[:80]
+                if isinstance(value, bool):
+                    hints[safe_key] = value
+                elif isinstance(value, int):
+                    hints[safe_key] = value
+                elif isinstance(value, float) and math.isfinite(value):
+                    hints[safe_key] = value
+                elif isinstance(value, str):
+                    hints[safe_key] = value[:200]
+        item["presence_hints"] = hints
+        try:
+            created_at = float(raw.get("created_at") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            created_at = 0.0
+        item["created_at"] = created_at if math.isfinite(created_at) else 0.0
+        try:
+            item["_context_seq"] = max(0, int(raw.get("_context_seq") or 0))
+            item["_input_generation"] = max(
+                0, int(raw.get("_input_generation") or 0)
+            )
+        except (TypeError, ValueError, OverflowError):
+            item["_context_seq"] = 0
+            item["_input_generation"] = 0
+        context.append(item)
     return context
 
 
@@ -1780,6 +1922,98 @@ def _render_card_line(item: dict) -> str:
         parts.append(f"（桶：{bucket}）")
     parts.append(text)
     return "- " + " ".join(parts)
+
+
+_PROFILE_CARD_CONTENT_MAX_CHARS = 2_000
+
+
+def _render_profile_card(item: dict) -> str:
+    """Render one complete Garden card for profile distillation."""
+
+    if not isinstance(item, dict):
+        return ""
+    summary = str(item.get("summary") or item.get("title") or "").strip()
+    content = str(item.get("content") or "").strip()
+    if not summary and not content:
+        return ""
+    parts = [
+        f"id={str(item.get('id') or '').strip()}",
+        f"bucket={str(item.get('bucket') or '').strip()}",
+        f"occurred_at={str(item.get('occurred_at') or '').strip()}",
+        f"summary={summary}",
+        f"content={content[:_PROFILE_CARD_CONTENT_MAX_CHARS]}",
+    ]
+    return "- " + " | ".join(parts)
+
+
+def _read_profile_cards(user_id: str) -> tuple[str, int]:
+    """Read every eligible Garden card or fail loudly on any truncation.
+
+    The lightweight index proves the complete cardinality, then fetch obtains
+    each card's bounded content. Both use the scoped runtime token; no API key
+    or server-side envelope decryption is involved.
+    """
+
+    store = core_store.get_store(user_id)
+    token = _mint_runtime_token(user_id)
+
+    def _post(api_key, candidates, *, operation, payload=None):
+        return memory_readside_core.post_enclave_readside(
+            api_key,
+            candidates,
+            operation=operation,
+            payload=payload,
+            runtime_token=token,
+        )
+
+    body, status = memory_core.index(
+        store,
+        None,
+        {"limit": 0, "include_sensitive": True},
+        post_enclave=_post,
+    )
+    if status != 200 or not isinstance(body, dict):
+        raise RuntimeError(f"profile_cards_index_failed:{status}")
+    items = body.get("items")
+    if not isinstance(items, list):
+        raise RuntimeError("profile_cards_index_invalid")
+    try:
+        user_card_count = int(body.get("user_card_count"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("profile_cards_count_invalid") from exc
+    if body.get("truncated") is not False or user_card_count != len(items):
+        raise RuntimeError(
+            f"profile_cards_truncated:{user_card_count}/{len(items)}"
+        )
+    if not items:
+        return "", 0
+    ids = [str(item.get("id") or "").strip() for item in items]
+    if any(not memory_id for memory_id in ids):
+        raise RuntimeError("profile_cards_id_missing")
+    fetched, fetch_status = memory_core.fetch(
+        store,
+        None,
+        {"ids": ids, "limit": 0, "include_sensitive": True},
+        post_enclave=_post,
+    )
+    fetched_items = (
+        fetched.get("items") if isinstance(fetched, dict) else None
+    )
+    if fetch_status != 200 or not isinstance(fetched_items, list):
+        raise RuntimeError(f"profile_cards_fetch_failed:{fetch_status}")
+    by_id = {
+        str(item.get("id") or ""): item
+        for item in fetched_items
+        if isinstance(item, dict)
+    }
+    if len(by_id) != user_card_count or any(memory_id not in by_id for memory_id in ids):
+        raise RuntimeError(
+            f"profile_cards_truncated:{user_card_count}/{len(by_id)}"
+        )
+    rendered = [_render_profile_card(by_id[memory_id]) for memory_id in ids]
+    if any(not line for line in rendered):
+        raise RuntimeError("profile_cards_render_incomplete")
+    return "\n".join(rendered), user_card_count
 
 
 def _read_memory_context(user_id: str) -> dict:
@@ -3387,13 +3621,17 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_summary_with_seq=_read_summary_with_seq,
         write_summary=_write_summary,
         read_summary_frontier=_read_summary_frontier,
+        read_summary_frontier_metadata=_read_summary_frontier_metadata,
         append_summary_segment=_append_summary_segment,
         append_summary_checkpoint=_append_summary_checkpoint,
         read_images=_read_images,
         read_vision_observations=_read_vision_observations,
         read_files=_read_files,
         read_memory_context=_read_memory_context,
+        read_profile_cards=_read_profile_cards,
+        select_profile_for_turn=_select_agent_profile_for_turn,
         read_scheduled_wake_context=_read_scheduled_wake_context,
+        read_perception_wake_context=_read_perception_wake_context,
         read_pending_scheduled_wake_context=_read_pending_scheduled_wake_context,
         apply_memory_actions=_apply_memory_actions,
         build_memory_envelope=_build_memory_envelope,
@@ -3478,14 +3716,22 @@ def _build_scheduler_deps():
 
 
 def _seed_existing_v2_wake_schedules(*, now: float | None = None) -> int:
-    """Idempotent startup backfill for users flipped before seeding existed."""
+    """Idempotent startup repair for V2 users without an armed heartbeat.
+
+    A row can already exist because another producer (self-wake, screen watch,
+    payment cooldown, etc.) touched ``v2_wake_schedule`` while leaving
+    ``next_heartbeat_at`` NULL.  Treating any existing row as "seeded" makes
+    that user permanently invisible to ``due_heartbeat_users``.  Only a
+    non-NULL heartbeat timestamp proves that the heartbeat lane is armed.
+    """
     due_at = time.time() if now is None else float(now)
     users = admin_core.list_runtime_modes().get(
         hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2, []
     )
     seeded = 0
     for user_id in users:
-        if jobs_store.get_wake_schedule(user_id) is not None:
+        schedule = jobs_store.get_wake_schedule(user_id)
+        if schedule is not None and schedule.get("next_heartbeat_at") is not None:
             continue
         jobs_store.upsert_wake_schedule(user_id, next_heartbeat_at=due_at)
         seeded += 1

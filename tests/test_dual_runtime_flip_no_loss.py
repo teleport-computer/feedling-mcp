@@ -72,6 +72,8 @@ def _dual_policy(monkeypatch):
     # rather than depend on the env default, since other test modules pin
     # v2_only (test_chat_send_v2_enqueue.py) or vary it per-test.
     monkeypatch.setenv(POLICY_ENV, "dual")
+    # Exact queue-count assertions below predate the independent profile lane.
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
 
 
 @pytest.fixture()

@@ -32,7 +32,9 @@ _BYOK = provider_client.ProviderConfig(
 
 
 @pytest.fixture(autouse=True)
-def _clean_agent_jobs_table():
+def _clean_agent_jobs_table(monkeypatch):
+    # This module specifies the legacy plaintext fold's seq-watermark plumbing.
+    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", False)
     # claim_next_job() is a GLOBAL claim (no user_id filter, by design) — see
     # the identical fixture in test_v2_worker.py / test_v2_compaction_integration.py.
     with db.get_pool().connection() as conn:

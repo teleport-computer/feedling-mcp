@@ -19,18 +19,15 @@ is ever introduced here. Module-level references (``provider_client``,
 
 from __future__ import annotations
 
-import base64
 import os
-import random
 import re
-import struct
 import threading
 import uuid
-import zlib
 from functools import wraps
 
 import db
 import provider_health
+from capabilities import vision_probe as vision_probe_capability
 from core import enclave as core_enclave
 from core import envelope as core_envelope
 from core import util as core_util
@@ -49,12 +46,6 @@ from model_api_runtime.v2 import prompt_frontier
 
 _REASONING_EFFORT_OFF = {"off", "none", "no", "false", "0", "disabled"}
 _REASONING_EFFORT_LEVELS = {"low", "medium", "high"}
-_VISION_COLORS = {
-    "red": (224, 67, 54),
-    "green": (52, 168, 83),
-    "blue": (66, 133, 244),
-    "yellow": (251, 188, 4),
-}
 _VISION_TEST_LOCKS = tuple(threading.Lock() for _ in range(32))
 
 
@@ -210,41 +201,14 @@ def _public_saved_route(route: dict | None) -> dict | None:
     return {key: value for key, value in route.items() if key != "api_key_envelope"}
 
 
-def _png_chunk(kind: bytes, data: bytes) -> bytes:
-    checksum = zlib.crc32(kind + data)
-    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
-
-
 def _vision_probe_image() -> tuple[str, str]:
-    """Return a random four-stripe PNG and its unpredictable answer."""
-    names = list(_VISION_COLORS)
-    random.SystemRandom().shuffle(names)
-    width, height = 96, 24
-    scanlines = bytearray()
-    for _ in range(height):
-        scanlines.append(0)
-        for x in range(width):
-            scanlines.extend(_VISION_COLORS[names[min(x // 24, 3)]])
-    png = b"\x89PNG\r\n\x1a\n"
-    png += _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-    png += _png_chunk(b"IDAT", zlib.compress(bytes(scanlines), 9))
-    png += _png_chunk(b"IEND", b"")
-    return base64.b64encode(png).decode("ascii"), ",".join(names)
+    """Compatibility wrapper for tests and existing Model API callers."""
+    return vision_probe_capability.generate_image()
 
 
 def _vision_probe_images() -> tuple[list[dict[str, str]], list[str]]:
-    """Two independent controls make a blind pass only 1 in 576."""
-    generated = [_vision_probe_image(), _vision_probe_image()]
-    return (
-        [
-            {
-                "data_url": f"data:image/png;base64,{encoded}",
-                "mime_type": "image/png",
-            }
-            for encoded, _expected in generated
-        ],
-        [expected for _encoded, expected in generated],
-    )
+    """Compatibility wrapper around the shared two-image control generator."""
+    return vision_probe_capability.generate_images()
 
 
 def _vision_test_lock(user_id: str, route_id: str):

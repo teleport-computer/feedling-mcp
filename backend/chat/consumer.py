@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Callable, TypeVar
 
 import db
+from capabilities import vision_probe as vision_probe_capability
 from core.store import UserStore
 
 
@@ -27,6 +28,10 @@ _VISION_FAILURE_CODES = frozenset({
     "vision_model_unavailable",
     "vision_model_empty_response",
     "vision_model_failed",
+})
+_VISION_UNSUPPORTED_CODES = frozenset({
+    "vision_model_required",
+    "vision_model_incompatible",
 })
 _CONSUMER_RECENT_SEC = int(os.environ.get("FEEDLING_CONSUMER_RECENT_SEC", "180"))
 _DECRYPT_HEALTH_STATUSES = frozenset(
@@ -267,6 +272,11 @@ def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | No
     _mutate_consumer_state(store, mutate)
     if event_type == "poll":
         _touch_resident_binding_seen(store, info=info, now_epoch=now_epoch)
+        _maybe_begin_resident_vision_probe(
+            store,
+            info=info,
+            now_epoch=now_epoch,
+        )
 
 
 def _safe_epoch(value) -> float:
@@ -594,6 +604,75 @@ def _vision_binding_matches(binding: dict, current: dict) -> bool:
     )
 
 
+def _maybe_begin_resident_vision_probe(
+    store: UserStore,
+    *,
+    info: dict | None,
+    now_epoch: float | None = None,
+) -> bool:
+    """Best-effort auto-probe for a new or changed VPS resident binding.
+
+    Polling only enqueues the existing hidden side-channel; provider I/O stays
+    inside the resident's isolated background lane. A matching pending probe or
+    terminal verdict suppresses repeats until the binding changes.
+    """
+    if not isinstance(info, dict) or not info.get("official"):
+        return False
+    advertised = {
+        str(item).strip().lower()
+        for item in info.get("consumer_capabilities") or []
+    }
+    if VISION_PROBE_CAPABILITY not in advertised:
+        return False
+    source = str(info.get("agent_input_modalities_source") or "").strip().lower()
+    if source in {"pi_catalog", "explicit"}:
+        # resident_vision_validation already derives a deterministic verdict
+        # from these authoritative modality declarations.
+        return False
+    binding = _vision_binding(info)
+    if not all(binding.values()):
+        return False
+
+    try:
+        from accounts import onboarding
+
+        if onboarding._load_onboarding_route(store) != "resident":
+            return False
+        now = time.time() if now_epoch is None else float(now_epoch)
+        state = _load_consumer_state(store)
+        pending = state.get("resident_vision_probe")
+        if (
+            isinstance(pending, dict)
+            and _vision_binding_matches(binding, pending)
+            and float(pending.get("expires_at_epoch") or 0) > now
+        ):
+            return False
+        saved = state.get("resident_vision_validation")
+        if isinstance(saved, dict) and _vision_binding_matches(binding, saved):
+            return False
+
+        probe_images, expected = vision_probe_capability.generate_images()
+        encoded = [
+            image["data_url"].split(",", 1)[1]
+            for image in probe_images
+        ]
+        probe, _error_code = begin_vision_probe(
+            store,
+            images=encoded,
+            expected=expected,
+            now_epoch=now,
+        )
+        return probe is not None
+    except Exception as exc:
+        # Binding telemetry and probe generation are advisory. A failure here
+        # must never break or delay normal chat polling/sending.
+        print(
+            f"[{store.user_id}/vision-probe] auto-start failed: "
+            f"{type(exc).__name__}:{str(exc)[:160]}"
+        )
+        return False
+
+
 def begin_vision_probe(
     store: UserStore,
     *,
@@ -741,9 +820,17 @@ def complete_vision_probe(
         reported_status = str(payload.get("status") or "ok").strip().lower()
         if reported_status == "failed":
             error_code = str(payload.get("error_code") or "vision_model_failed")
-            if error_code not in _VISION_FAILURE_CODES:
-                error_code = "vision_model_failed"
-            status = "failed"
+            if error_code in _VISION_UNSUPPORTED_CODES:
+                # Consumer turn classification uses vision_model_required for
+                # an explicit provider rejection, while Model API probes use
+                # vision_model_incompatible. They are the same capability
+                # verdict here; normalize the persisted config-facing signal.
+                error_code = "vision_model_incompatible"
+                status = "unsupported"
+            else:
+                if error_code not in _VISION_FAILURE_CODES:
+                    error_code = "vision_model_failed"
+                status = "failed"
         else:
             observed = payload.get("observed")
             expected = probe.get("expected")

@@ -679,6 +679,30 @@ def cmd_chat_image(args):
     _emit({"ok": True, "message_id": mid, **(out if isinstance(out, dict) else {"data": out})})
 
 
+def _is_readable_card(body) -> bool:
+    """True when an /v1/identity/get response is usable by the agent.
+
+    ``body_ct`` present means we were handed the sealed envelope — readable only
+    by the key holder, which the agent is not. A ``local_only`` card counts as
+    readable: "the user opted you out" is a real answer the agent must act on,
+    not a failure to retry. An absent card (``identity: null``) is likewise a
+    valid answer — nothing has been written yet.
+
+    ``decrypt_status: "error: …"`` is the enclave's OTHER failure shape: HTTP 200,
+    envelope metadata only, no ciphertext to give it away. Checking for ciphertext
+    alone would pass that through as a card whose every field just happens to be
+    missing.
+    """
+    if not isinstance(body, dict):
+        return False
+    identity = body.get("identity")
+    if identity is None:
+        return "identity" in body
+    if not isinstance(identity, dict) or identity.get("body_ct"):
+        return False
+    return not str(identity.get("decrypt_status") or "").startswith("error")
+
+
 def cmd_identity_read(args):
     """Read the CURRENT identity card (decrypted) so a rewrite builds ON it, not over it.
 
@@ -686,21 +710,38 @@ def cmd_identity_read(args):
     keep the fields the new material doesn't address (部分补全), only change what it
     does. Decrypt source is the enclave's ``GET /v1/identity/get`` (TEE cert the
     stdlib client doesn't verify → insecure=True, mirrors chat-image), falling back
-    to the backend when no enclave is configured."""
+    to the backend when no enclave is configured.
+
+    The backend's same-named endpoint serves the raw E2E envelope on purpose (iOS
+    holds the user key and decrypts locally), so a fallback response is only
+    useful if it actually came back decrypted — hence ``_is_readable_card``. This
+    used to emit ``ok: True`` for an envelope, which made the agent describe its
+    own persona as unreadable encrypted fields AND discarded the enclave's status
+    code, destroying the evidence for why the decrypt path failed."""
     auth = _auth_headers()
     if not auth:
         _emit({"ok": False, "error": "missing auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
     enclave_url = _env("FEEDLING_ENCLAVE_URL")
     status, body = -1, {}
+    enclave_status, enclave_body = None, None
     if enclave_url:
         status, body = _http_json("GET", f"{enclave_url.rstrip('/')}/v1/identity/get", auth, insecure=True)
-    if status != 200 or not (isinstance(body, dict) and isinstance(body.get("identity"), dict)):
-        api_url = _env("FEEDLING_API_URL")
-        if api_url:
-            status, body = _http_json("GET", f"{api_url.rstrip('/')}/v1/identity/get", auth)
-    if status == 200 and isinstance(body, dict):
-        _emit({"ok": True, **body})
-    _emit({"ok": False, "http_status": status, "error": body}, 1)
+        if status == 200 and _is_readable_card(body):
+            _emit({"ok": True, **body})
+        enclave_status, enclave_body = status, body
+    api_url = _env("FEEDLING_API_URL")
+    if api_url:
+        status, body = _http_json("GET", f"{api_url.rstrip('/')}/v1/identity/get", auth)
+        if status == 200 and _is_readable_card(body):
+            _emit({"ok": True, **body})
+    out = {"ok": False, "http_status": status, "error": body}
+    if enclave_status is not None:
+        # Keep the enclave's own failure alongside the fallback's: the fallback
+        # usually "succeeds" with ciphertext, so without this the 503/401 that
+        # actually broke the read is nowhere in the output.
+        out["enclave_status"] = enclave_status
+        out["enclave_error"] = enclave_body
+    _emit(out, 1)
 
 
 # The 9 free-text profile fields (spec 3.1). Namespace attribute name == patch
