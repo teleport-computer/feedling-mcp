@@ -95,10 +95,10 @@ def page_html(query_string: str) -> str:
         if view == "debug":
             return data_track._render_data_track_debug_page(data_track._data_track_debug_payload())
         if view == "runtime":
-            # 窗口算一次、传给两个数据函数——两处各自读 request.args 会让窗口
+            # 窗口算一次、传给四个数据函数——各处自行读 request.args 会让窗口
             # 有机会不一致（同页一个 24 小时、一个 720 小时）。
             hours = data_track._runtime_health_window_hours()
-            # 三次调用是**三个独立的失败域**，不共用一个 try。健康数据是这页的
+            # 四次调用是**四个独立的失败域**，不共用一个 try。健康数据是这页的
             # 核心，它没了才该降级；token 与交付是附加信息。token 的查询无 LIMIT、
             # 扫描量随表增长单调变大，是最先超时的那个——让它把明明可用的健康数据
             # 一起拖进降级页，是这页最坏的失败模式（它恰恰是出事时才被打开的那一
@@ -118,7 +118,14 @@ def page_html(query_string: str) -> str:
             except Exception:
                 logging.exception("runtime delivery health failed (health still served)")
                 delivery = None
-            return data_track._render_runtime_health_page(payload, tokens, delivery)
+            try:
+                user_report = data_track._runtime_user_report(within_hours=hours)
+            except Exception:
+                logging.exception("runtime user report failed (health still served)")
+                user_report = None
+            return data_track._render_runtime_health_page(
+                payload, tokens, delivery, user_report
+            )
         if view == "events":
             event = (request.args.get("event") or "").strip()
             if event == "onboarding":

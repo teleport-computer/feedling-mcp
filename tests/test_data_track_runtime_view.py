@@ -1222,3 +1222,69 @@ def test_render_runtime_user_report_empty_window_is_not_unavailable(bound_reques
     assert "所选 168 小时窗口没有用户指标或当前待交付项" in html_out
     assert "暂时取不到" not in html_out
     assert "colspan='10'" in html_out
+
+
+# ---- Task 4: 每用户报表路由编排与装配 ----
+
+
+def test_runtime_view_passes_same_window_to_user_report(monkeypatch):
+    """路由漏传窗口会让每用户表和其余 Runtime 区块口径不一致。"""
+    seen = {}
+
+    def _health(**kwargs):
+        seen["health"] = kwargs["within_hours"]
+        return _payload()
+
+    def _tokens_for_window(**kwargs):
+        seen["tokens"] = kwargs["within_hours"]
+        return _tokens()
+
+    def _delivery_for_window(**kwargs):
+        seen["delivery"] = kwargs["within_hours"]
+        return _delivery()
+
+    def _users(**kwargs):
+        seen["users"] = kwargs["within_hours"]
+        return _user_report()
+
+    monkeypatch.setattr(_dt, "_runtime_health_summary", _health)
+    monkeypatch.setattr(_dt, "_runtime_token_by_lane", _tokens_for_window)
+    monkeypatch.setattr(_dt, "_runtime_delivery_health", _delivery_for_window)
+    monkeypatch.setattr(_dt, "_runtime_user_report", _users)
+
+    body = _admin_core.page_html("view=runtime&hours=168")
+
+    assert seen == {
+        "health": 168,
+        "tokens": 168,
+        "delivery": 168,
+        "users": 168,
+    }
+    assert "用户 Token / Model 与交付可靠性" in body
+
+
+def test_runtime_user_report_failure_does_not_hide_health(monkeypatch):
+    """用户聚合超时只能降级自己的区块，不能遮蔽可用健康数据。"""
+    monkeypatch.setattr(_dt, "_runtime_health_summary", lambda **_kw: _payload())
+    monkeypatch.setattr(_dt, "_runtime_token_by_lane", lambda **_kw: _tokens())
+    monkeypatch.setattr(_dt, "_runtime_delivery_health", lambda **_kw: _delivery())
+
+    def _boom(**_kw):
+        raise RuntimeError("user report db")
+
+    monkeypatch.setattr(_dt, "_runtime_user_report", _boom)
+
+    body = _admin_core.page_html("view=runtime&hours=24")
+
+    assert "Runtime 健康" in body
+    assert "各 lane 健康" in body
+    assert "用户 Token/model 与交付可靠性暂时取不到" in body
+    assert "user report db" not in body
+
+
+def test_runtime_user_report_is_wired_to_jobs_store():
+    """ASGI 装配遗漏时桩会悄然返回空表，必须绑定真实聚合。"""
+    import asgi_app  # noqa: F401
+    from model_api_runtime.v2 import jobs_store
+
+    assert _dt._runtime_user_report is jobs_store.recent_runtime_user_report
