@@ -2,10 +2,12 @@ from pathlib import Path
 import subprocess
 
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "check-pr-branch-flow.sh"
+WORKFLOW = ROOT / ".github" / "workflows" / "branch-flow.yml"
 
 
 def _run(base: str | None = None, head: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -45,3 +47,16 @@ def test_branch_flow_guard_rejects_missing_branch_names() -> None:
 
     assert result.returncode != 0
     assert "base and head branch names are required" in result.stderr
+
+
+def test_branch_flow_workflow_cannot_be_skipped_by_deploy_pin_commits() -> None:
+    workflow = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
+
+    assert set(workflow["on"]) == {"pull_request_target"}
+    trigger = workflow["on"]["pull_request_target"]
+    assert trigger["branches"] == ["main"]
+    assert trigger["types"] == ["opened", "synchronize", "reopened"]
+
+    checkout = workflow["jobs"]["branch-flow"]["steps"][0]
+    assert checkout["uses"] == "actions/checkout@v4"
+    assert checkout["with"]["ref"] == "${{ github.event.pull_request.base.sha }}"

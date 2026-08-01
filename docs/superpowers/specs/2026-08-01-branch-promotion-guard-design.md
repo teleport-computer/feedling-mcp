@@ -30,10 +30,16 @@ the public product documentation under `docs-site/content/docs/` is unchanged.
 
 ## CI Guard
 
-Add a small pull-request job to `.github/workflows/ci.yml`. For pull requests
-whose base branch is `main`, it succeeds only when `github.head_ref` is exactly
-`test` or `pre`. It is a no-op for pull requests targeting other branches and
-for push or manual workflow runs.
+Add a dedicated `.github/workflows/branch-flow.yml` triggered by
+`pull_request_target` for `main`. It succeeds only when the source branch is
+exactly `test` or `pre`. A dedicated target-side workflow is required because
+test deployment pin commits contain `[skip ci]`, which suppresses ordinary
+`pull_request` workflows and would leave a required check pending.
+
+Because `pull_request_target` runs in the base repository's security context,
+the workflow must never execute PR-head code. It checks out the explicit base
+SHA with credentials disabled, then invokes the trusted base copy of the guard
+script using branch names passed through quoted environment variables.
 
 The check must be configured as a required status check in the GitHub ruleset
 for `main`; repository workflow code alone cannot prevent a maintainer from

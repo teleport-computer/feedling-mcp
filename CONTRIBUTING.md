@@ -36,8 +36,10 @@
 中记录跳级原因、风险判断和补测计划；不要在代码中通过特殊分支名或标签静默绕过
 门禁。
 
-`.github/workflows/ci.yml` 的 `branch flow` 检查会拒绝不符合上述来源要求的
-`main` PR。仓库管理员还必须在 GitHub ruleset / branch protection 中：
+`.github/workflows/branch-flow.yml` 的 `branch flow` 检查会拒绝不符合上述来源
+要求的 `main` PR。它使用 `pull_request_target`，因此不会被 test 环境自动生成的
+`[skip ci]` 部署 pin 提交跳过；workflow 只 checkout 受信任的 base commit，绝不
+执行 PR head 的代码。仓库管理员还必须在 GitHub ruleset / branch protection 中：
 
 - 禁止直接 push `main`；
 - 要求通过 PR 合并；
