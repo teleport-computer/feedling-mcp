@@ -452,6 +452,29 @@ def test_memory_actions_response_exposes_independent_item_outcomes(
     assert {"status", "http_status"} <= set(result_schema["required"])
 
 
+def test_dream_status_documents_daily_capture_banner_fields(
+    public_schema: dict[str, Any],
+    operations: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    response = operations[("get", "/v1/dream/status")]["responses"]["200"]
+    assert response["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/DreamStatusResponse"
+    }
+    schema = public_schema["components"]["schemas"]["DreamStatusResponse"]
+    assert {"capture_completed_at", "capture_cards_added"} <= set(
+        schema["required"]
+    )
+    assert schema["properties"]["capture_completed_at"]["minimum"] == 0
+    assert schema["properties"]["capture_cards_added"] == {
+        "type": "integer",
+        "minimum": 0,
+        "description": (
+            "Cards actually added on the timestamp's device-local calendar "
+            "day, accumulated across Capture runs."
+        ),
+    }
+
+
 def test_model_catalog_request_schema_expresses_strict_xor(
     public_schema: dict[str, Any],
     operations: dict[tuple[str, str], dict[str, Any]],

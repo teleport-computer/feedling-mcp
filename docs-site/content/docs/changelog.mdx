@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Memory Garden status now reports today's captured-card total.**
+  `GET /v1/dream/status` adds `capture_cards_added` and
+  `capture_completed_at`. Resident and Runtime V2 Capture runs accumulate only
+  cards actually added on the device-local calendar day, start a fresh total
+  on the first positive Capture of the next day, and leave the banner fields
+  unchanged after a zero-card run.
+
 - **Background agent turns can no longer rewrite the identity card.** Runtime
   V2 now visibly refuses `identity_patch` and `identity_nudge` during proactive
   wake turns while preserving identity reads, foreground Chat identity changes,

@@ -521,6 +521,46 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "description": "JSON response object. Endpoint-specific fields may be added compatibly.",
         "additionalProperties": True,
     },
+    "DreamStatusResponse": {
+        "type": "object",
+        "description": (
+            "Memory Garden banner status. Dream counts describe the latest "
+            "completed Dream. Capture fields describe cards added on the "
+            "device-local calendar day containing capture_completed_at; clients "
+            "decide whether that timestamp is still today. Legal zero-card "
+            "Capture runs do not reset or refresh the fields."
+        ),
+        "required": [
+            "dreaming",
+            "last_completed_at",
+            "organized_count",
+            "merged_count",
+            "capture_completed_at",
+            "capture_cards_added",
+        ],
+        "additionalProperties": False,
+        "properties": {
+            "dreaming": {"type": "boolean"},
+            "last_completed_at": TIMESTAMP,
+            "organized_count": {"type": "integer", "minimum": 0},
+            "merged_count": {"type": "integer", "minimum": 0},
+            "capture_completed_at": {
+                **TIMESTAMP,
+                "description": (
+                    "Unix timestamp of the latest Capture completion that "
+                    "actually added at least one card; zero when none exists."
+                ),
+            },
+            "capture_cards_added": {
+                "type": "integer",
+                "minimum": 0,
+                "description": (
+                    "Cards actually added on the timestamp's device-local "
+                    "calendar day, accumulated across Capture runs."
+                ),
+            },
+        },
+    },
     # Pin the FastAPI-generated ValidationError shape so the published contract
     # doesn't gain/lose `input`/`ctx` with the fastapi/pydantic version of
     # whoever runs the exporter (older builds omit them, newer include them).
@@ -1963,6 +2003,16 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("get", "/v1/dream/status"): {
+        "200": {
+            "description": "Current Dream and daily Capture banner status.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/DreamStatusResponse"}
+                }
+            },
+        },
+    },
     ("post", "/v1/memory/actions"): {
         "200": {
             "description": (

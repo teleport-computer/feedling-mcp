@@ -11,9 +11,16 @@ Memory separates ciphertext storage from enclave-authorized read projections.
 | `GET /v1/memory/list` | Raw encrypted records for client synchronization. |
 | `POST /v1/memory/index` | Lightweight decrypted summaries for discovery. |
 | `POST /v1/memory/fetch` | Full decrypted content for selected IDs. |
+| `GET /v1/dream/status` | Dream and daily Capture counts for Memory Garden banners. |
 
 `local_only` records can be stored and synchronized, but the enclave has no
 wrapped key for them, so they are unavailable from `index` and `fetch`.
+
+`GET /v1/dream/status` also returns `capture_cards_added` and
+`capture_completed_at`. The count accumulates cards actually added across
+Capture runs on the device's calendar day. A Capture run that adds no cards
+does not reset the count or refresh the timestamp. Clients determine whether
+the timestamp is still today before displaying the count.
 
 ## 1. Build and store a card
 
