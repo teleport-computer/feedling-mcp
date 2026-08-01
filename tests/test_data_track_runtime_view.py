@@ -1170,6 +1170,52 @@ def test_render_runtime_health_page_shows_user_model_and_delivery_report(bound_r
     assert 'class="runtime-user-delivery"' in html_out
 
 
+def test_render_runtime_user_report_shows_user_link_only_on_first_model_row(bound_request):
+    # Repeating a long user link on every model row makes the report hard to scan
+    # and visually suggests that each model row belongs to a different user.
+    report = _user_report()
+    second_model = dict(report["users"][0]["models"][0])
+    second_model.update({
+        "provider": "openai",
+        "model": "gpt-second",
+        "route": "route-second",
+    })
+    report["users"][0]["models"].append(second_model)
+
+    html_out = _dt._render_runtime_health_page(
+        _payload(), _tokens(), _delivery(), report
+    )
+    table_start = html_out.index('<table class="runtime-user-models">')
+    table_end = html_out.index("</table>", table_start)
+    model_table = html_out[table_start:table_end]
+    assert model_table.count("/admin/data-track/users/usr_report_a") == 1
+
+    second_marker = "gpt-second"
+    second_start = model_table.rindex("<tr>", 0, model_table.index(second_marker))
+    second_end = model_table.index("</tr>", second_start)
+    second_row = model_table[second_start:second_end]
+    assert second_row.startswith("<tr><td>—</td>")
+
+
+def test_render_runtime_user_report_explains_user_id_attribution(bound_request):
+    html_out = _dt._render_runtime_health_page(
+        _payload(), _tokens(), _delivery(), _user_report()
+    )
+    assert "按 user_id 统计" in html_out
+    assert "不按真人/principal 合并" in html_out
+    assert "重新注册可能显示多行" in html_out
+
+
+def test_render_runtime_user_report_does_not_link_unknown_user_id(bound_request):
+    report = _user_report()
+    report["users"][0]["user_id"] = "unknown"
+    html_out = _dt._render_runtime_health_page(
+        _payload(), _tokens(), _delivery(), report
+    )
+    assert "<code>unknown</code>" in html_out
+    assert "/admin/data-track/users/unknown" not in html_out
+
+
 def test_render_runtime_user_report_preserves_unknowns_and_escapes(bound_request):
     report = _user_report()
     report["users"][0]["user_id"] = "usr_<unsafe>"

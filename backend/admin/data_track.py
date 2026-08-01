@@ -2688,12 +2688,15 @@ def _render_runtime_user_report(user_report: dict | None) -> str:
 
         def _user_cell(raw_user_id) -> str:
             user_id = str(raw_user_id or "unknown")
+            escaped_user_id = f"<code>{html.escape(user_id)}</code>"
+            if user_id == "unknown":
+                return escaped_user_id
             qs = _data_track_qs()
             qs_suffix = f"?{qs}" if qs else ""
             href = f"/admin/data-track/users/{quote(user_id, safe='')}{qs_suffix}"
             return (
-                f"<a href='{html.escape(href, quote=True)}'><code>"
-                f"{html.escape(user_id)}</code></a>"
+                f"<a href='{html.escape(href, quote=True)}'>"
+                f"{escaped_user_id}</a>"
             )
 
         def _effect_summary(effect: dict, *, include_discarded: bool) -> str:
@@ -2726,7 +2729,7 @@ def _render_runtime_user_report(user_report: dict | None) -> str:
 
         for user in users:
             user_cell = _user_cell(user.get("user_id"))
-            for model_fact in user.get("models") or []:
+            for model_index, model_fact in enumerate(user.get("models") or []):
                 provider = html.escape(str(model_fact.get("provider") or "unknown"))
                 model = html.escape(str(model_fact.get("model") or "unknown"))
                 route = html.escape(str(model_fact.get("route") or "unknown"))
@@ -2736,7 +2739,7 @@ def _render_runtime_user_report(user_report: dict | None) -> str:
                 ) or "—"
                 model_rows_list.append(
                     "<tr>"
-                    f"<td>{user_cell}</td>"
+                    f"<td>{user_cell if model_index == 0 else '—'}</td>"
                     f"<td>{provider} / {model} / <code>{route}</code></td>"
                     f"<td>{lanes}</td>"
                     f"<td>{_fmt_count(model_fact.get('turns'))}</td>"
@@ -2778,7 +2781,8 @@ def _render_runtime_user_report(user_report: dict | None) -> str:
     return f"""<section>
   <h2>用户 Token / Model 与交付可靠性</h2>
   <div class='note-box'>
-    <b>口径：</b>这里只统计 <b>hosted Runtime V2</b> 回合；provider / model / route 是
+    <b>口径：</b>按 user_id 统计，不按真人/principal 合并；重新注册可能显示多行。
+    这里只统计 <b>hosted Runtime V2</b> 回合；provider / model / route 是
     <b>历史每回合路由事实</b>，不是当前用户配置。交付「ok 不代表客户端已读」：它只表示
     服务端已完成可观测的 effect / failure 投递义务。当前 outstanding delivery
     <b>不受所选时间窗口限制</b>，因此旧积压也会显示；applied/discarded 与 delivered
