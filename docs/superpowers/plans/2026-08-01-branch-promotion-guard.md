@@ -4,7 +4,7 @@
 
 **Goal:** Document and enforce that pull requests into `main` originate from `test` or `pre`, while development work defaults to test-environment validation first.
 
-**Architecture:** A small shell script owns the branch predicate so it can be tested locally and called unchanged by GitHub Actions. The CI workflow invokes it for pull requests, while `CONTRIBUTING.md` and `AGENTS.md` describe the human and coding-agent responsibilities.
+**Architecture:** A small shell script owns the branch predicate so it can be tested locally and called unchanged by GitHub Actions. A dedicated `pull_request_target` workflow invokes the trusted base-branch copy even when the PR head is an automated `[skip ci]` deployment pin, while `CONTRIBUTING.md` and `AGENTS.md` describe the human and coding-agent responsibilities.
 
 **Tech Stack:** Bash, GitHub Actions YAML, pytest, Markdown
 
@@ -14,6 +14,7 @@
 - Do not constrain merge direction between `test` and `pre`.
 - Development branches default to pull requests against `test` and test-environment verification.
 - Emergency bypasses are explicit maintainer actions recorded in the pull request.
+- The gate must not execute code from the pull request head.
 - Do not modify public product documentation under `docs-site/content/docs/`.
 
 ---
@@ -52,20 +53,21 @@ Expected: all cases pass.
 ### Task 2: Workflow and guidance integration
 
 **Files:**
-- Modify: `.github/workflows/ci.yml`
+- Create: `.github/workflows/branch-flow.yml`
 - Modify: `CONTRIBUTING.md`
 - Modify: `AGENTS.md`
 
 **Interfaces:**
-- Consumes: GitHub Actions `github.base_ref` and `github.head_ref`.
+- Consumes: `github.event.pull_request.base.ref`, `head.ref`, and the explicit base SHA.
 - Produces: required-check candidate named `branch flow` on pull requests.
 
 - [x] **Step 1: Add the CI job**
 
-Add a pull-request-only job near the top of `ci.yml`, check out the repository, and call:
+Add a `pull_request_target` workflow for PRs targeting `main`. Check out only
+`${{ github.event.pull_request.base.sha }}` with credentials disabled, then call:
 
 ```bash
-scripts/check-pr-branch-flow.sh "$GITHUB_BASE_REF" "$GITHUB_HEAD_REF"
+scripts/check-pr-branch-flow.sh "$BASE_BRANCH" "$HEAD_BRANCH"
 ```
 
 - [x] **Step 2: Add the canonical contributor policy**
@@ -82,7 +84,7 @@ Run:
 
 ```bash
 PYTHONPATH=backend .venv-test/bin/python -m pytest tests/test_branch_flow_guard.py -q
-ruby -e 'require "yaml"; YAML.load_file(".github/workflows/ci.yml", aliases: true); puts "workflow yaml ok"'
+ruby -e 'require "yaml"; YAML.load_file(".github/workflows/branch-flow.yml", aliases: true); puts "workflow yaml ok"'
 git diff --check
 ```
 
