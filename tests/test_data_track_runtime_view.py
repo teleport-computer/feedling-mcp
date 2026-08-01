@@ -1022,3 +1022,167 @@ def test_runtime_view_passes_window_to_delivery_too(client, monkeypatch):
     client.get("/admin/data-track?view=runtime&hours=168", headers=_admin_headers())
 
     assert seen["within_hours"] == 168
+
+
+# ---- Task 3: 每用户 Runtime V2 token/model 与交付可靠性报表 ----
+
+
+def _user_report() -> dict:
+    empty_failure = {
+        "reply_delivered_in_window": 0,
+        "reply_undelivered": 0,
+        "status_delivered_in_window": 0,
+        "status_undelivered": 0,
+        "runtime_error_delivered_in_window": 0,
+        "runtime_error_undelivered": 0,
+    }
+    return {
+        "window_hours": 24,
+        "users": [
+            {
+                "user_id": "usr_report_a",
+                "known_total_tokens": 12_900,
+                "model_calls": 18,
+                "models": [{
+                    "provider": "anthropic",
+                    "model": "claude-example",
+                    "route": "route-fingerprint",
+                    "lanes": ["chat", "heartbeat"],
+                    "turns": 12,
+                    "model_calls": 18,
+                    "retries": 2,
+                    "usage_reported_calls": 17,
+                    "cache_reported_calls": 16,
+                    "usage_coverage": 17 / 18,
+                    "cache_coverage": 16 / 18,
+                    "prompt_tokens": 12_000,
+                    "completion_tokens": 900,
+                    "total_tokens": 12_900,
+                    "cache_read_tokens": 8_000,
+                    "cache_write_tokens": 500,
+                    "cache_miss_tokens": 4_000,
+                    "cache_hit_ratio": 2 / 3,
+                }],
+                "delivery": {
+                    "reply_effects": {
+                        "applied_in_window": 10,
+                        "pending": 1,
+                        "needs_reconciliation": 0,
+                    },
+                    "status_effects": {
+                        "applied_in_window": 4,
+                        "pending": 0,
+                        "needs_reconciliation": 0,
+                    },
+                    "all_effects": {
+                        "applied_in_window": 24,
+                        "discarded_in_window": 1,
+                        "pending": 1,
+                        "needs_reconciliation": 0,
+                    },
+                    "terminal_failure": dict(empty_failure),
+                    "oldest_unfinished_age_sec": 3600,
+                },
+            },
+            {
+                "user_id": "usr_delivery_only",
+                "known_total_tokens": None,
+                "model_calls": 0,
+                "models": [],
+                "delivery": {
+                    "reply_effects": {
+                        "applied_in_window": 0,
+                        "pending": 0,
+                        "needs_reconciliation": 0,
+                    },
+                    "status_effects": {
+                        "applied_in_window": 0,
+                        "pending": 0,
+                        "needs_reconciliation": 1,
+                    },
+                    "all_effects": {
+                        "applied_in_window": 0,
+                        "discarded_in_window": 0,
+                        "pending": 0,
+                        "needs_reconciliation": 1,
+                    },
+                    "terminal_failure": dict(empty_failure),
+                    "oldest_unfinished_age_sec": 60,
+                },
+            },
+        ],
+    }
+
+
+def test_runtime_user_delivery_level_uses_reconciliation_and_age_thresholds():
+    # A fresh pending count alone is intentionally not degraded; reconciliation
+    # and stale outstanding delivery are the observable delivery failures.
+    assert _dt._runtime_user_delivery_level({
+        "all_effects": {"needs_reconciliation": 1},
+        "oldest_unfinished_age_sec": 1,
+    }) == "bad"
+    assert _dt._runtime_user_delivery_level({
+        "all_effects": {"needs_reconciliation": 0},
+        "oldest_unfinished_age_sec": 3600,
+    }) == "warn"
+    assert _dt._runtime_user_delivery_level({
+        "all_effects": {"needs_reconciliation": 0},
+        "oldest_unfinished_age_sec": 21600,
+    }) == "bad"
+    assert _dt._runtime_user_delivery_level({
+        "all_effects": {"needs_reconciliation": 0},
+        "oldest_unfinished_age_sec": 30,
+    }) == "ok"
+
+
+def test_render_runtime_health_page_shows_user_model_and_delivery_report(bound_request):
+    html_out = _dt._render_runtime_health_page(
+        _payload(), _tokens(), _delivery(), _user_report()
+    )
+    assert "用户 Token / Model 与交付可靠性" in html_out
+    assert "anthropic" in html_out
+    assert "claude-example" in html_out
+    assert "route-fingerprint" in html_out
+    assert "Retries" in html_out
+    assert "Cache R / W / M" in html_out
+    assert "Reply effects" in html_out
+    assert "Failure reply/status/error" in html_out
+    assert "needs_reconciliation" in html_out
+    assert "hosted Runtime V2" in html_out
+    assert "历史每回合路由事实" in html_out
+    assert "ok 不代表客户端已读" in html_out
+    assert "不受所选时间窗口限制" in html_out
+    assert 'class="runtime-user-models"' in html_out
+    assert 'class="runtime-user-delivery"' in html_out
+
+
+def test_render_runtime_user_report_preserves_unknowns_and_escapes(bound_request):
+    report = _user_report()
+    report["users"][0]["user_id"] = "usr_<unsafe>"
+    report["users"][0]["models"][0]["model"] = "<script>bad</script>"
+    report["users"][0]["models"][0]["prompt_tokens"] = None
+    html_out = _dt._render_runtime_health_page(
+        _payload(), _tokens(), _delivery(), report
+    )
+    assert "<script>bad</script>" not in html_out
+    assert "&lt;script&gt;bad&lt;/script&gt;" in html_out
+    assert "usr_%3Cunsafe%3E" in html_out
+    assert "—" in html_out
+
+
+def test_render_runtime_health_page_user_report_unavailable_is_local(bound_request):
+    html_out = _dt._render_runtime_health_page(
+        _payload(), _tokens(), _delivery(), None
+    )
+    assert "用户 Token/model 与交付可靠性暂时取不到" in html_out
+    assert "各 lane 健康" in html_out
+    assert "端到端交付" in html_out
+
+
+def test_render_runtime_user_report_empty_window_is_not_unavailable(bound_request):
+    html_out = _dt._render_runtime_health_page(
+        _payload(), _tokens(), _delivery(), {"window_hours": 168, "users": []}
+    )
+    assert "所选 168 小时窗口没有用户指标或当前待交付项" in html_out
+    assert "暂时取不到" not in html_out
+    assert "colspan='10'" in html_out

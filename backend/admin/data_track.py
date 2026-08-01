@@ -2638,6 +2638,163 @@ def _runtime_delivery_health(*, within_hours: int = 24) -> dict:
     }
 
 
+# Injected by the assembly layer (asgi_app.py); the real implementation is
+# model_api_runtime.v2.jobs_store.recent_runtime_user_report.  Keep this stub
+# content-free so Admin can render safely before that binding is installed.
+def _runtime_user_report(*, within_hours: int = 24) -> dict:
+    return {"window_hours": within_hours, "users": []}
+
+
+def _runtime_user_delivery_level(delivery: dict) -> str:
+    """Return the per-user delivery severity without treating fresh volume as bad.
+
+    A current backlog can be healthy under load; only reconciliation work or an
+    old unfinished item makes a user's reliability row degrade.
+    """
+    reconciliation = int(
+        ((delivery or {}).get("all_effects") or {}).get("needs_reconciliation")
+        or 0
+    )
+    if reconciliation > 0:
+        return "bad"
+    age = (delivery or {}).get("oldest_unfinished_age_sec")
+    if age is not None and float(age) >= _RUNTIME_DELIVERY_AGE_BAD_SEC:
+        return "bad"
+    if age is not None and float(age) >= _RUNTIME_DELIVERY_AGE_WARN_SEC:
+        return "warn"
+    return "ok"
+
+
+def _render_runtime_user_report(user_report: dict | None) -> str:
+    """Render content-free, per-user Runtime V2 usage and delivery facts."""
+    if user_report is None:
+        return (
+            "<section><h2>用户 Token / Model 与交付可靠性</h2>"
+            "<div class='note-box'><b>用户 Token/model 与交付可靠性暂时取不到。</b>"
+            "其余 Runtime 健康区块不受影响。</div></section>"
+        )
+
+    window_hours = _fmt_count(user_report.get("window_hours"))
+    users = user_report.get("users") or []
+    if not users:
+        empty = (
+            f"所选 {window_hours} 小时窗口没有用户指标或当前待交付项。"
+        )
+        model_rows = f"<tr><td colspan='10' class='muted'>{empty}</td></tr>"
+        delivery_rows = f"<tr><td colspan='7' class='muted'>{empty}</td></tr>"
+    else:
+        model_rows_list: list[str] = []
+        delivery_rows_list: list[str] = []
+
+        def _user_cell(raw_user_id) -> str:
+            user_id = str(raw_user_id or "unknown")
+            qs = _data_track_qs()
+            qs_suffix = f"?{qs}" if qs else ""
+            href = f"/admin/data-track/users/{quote(user_id, safe='')}{qs_suffix}"
+            return (
+                f"<a href='{html.escape(href, quote=True)}'><code>"
+                f"{html.escape(user_id)}</code></a>"
+            )
+
+        def _effect_summary(effect: dict, *, include_discarded: bool) -> str:
+            effect = effect or {}
+            parts = [
+                f"applied {_fmt_count(effect.get('applied_in_window'))}",
+            ]
+            if include_discarded:
+                parts.append(f"discarded {_fmt_count(effect.get('discarded_in_window'))}")
+            parts.extend([
+                f"pending {_fmt_count(effect.get('pending'))}",
+                "needs_reconciliation "
+                f"{_fmt_count(effect.get('needs_reconciliation'))}",
+            ])
+            return " · ".join(parts)
+
+        def _failure_summary(failure: dict) -> str:
+            failure = failure or {}
+            return " · ".join([
+                "reply "
+                f"{_fmt_count(failure.get('reply_delivered_in_window'))}"
+                f" / {_fmt_count(failure.get('reply_undelivered'))}",
+                "status "
+                f"{_fmt_count(failure.get('status_delivered_in_window'))}"
+                f" / {_fmt_count(failure.get('status_undelivered'))}",
+                "error "
+                f"{_fmt_count(failure.get('runtime_error_delivered_in_window'))}"
+                f" / {_fmt_count(failure.get('runtime_error_undelivered'))}",
+            ])
+
+        for user in users:
+            user_cell = _user_cell(user.get("user_id"))
+            for model_fact in user.get("models") or []:
+                provider = html.escape(str(model_fact.get("provider") or "unknown"))
+                model = html.escape(str(model_fact.get("model") or "unknown"))
+                route = html.escape(str(model_fact.get("route") or "unknown"))
+                lanes = ", ".join(
+                    html.escape(str(lane or "unknown"))
+                    for lane in (model_fact.get("lanes") or [])
+                ) or "—"
+                model_rows_list.append(
+                    "<tr>"
+                    f"<td>{user_cell}</td>"
+                    f"<td>{provider} / {model} / <code>{route}</code></td>"
+                    f"<td>{lanes}</td>"
+                    f"<td>{_fmt_count(model_fact.get('turns'))}</td>"
+                    f"<td>{_fmt_count(model_fact.get('model_calls'))} / "
+                    f"{_fmt_count(model_fact.get('retries'))}</td>"
+                    f"<td>{_fmt_tokens_compact(model_fact.get('prompt_tokens'))} / "
+                    f"{_fmt_tokens_compact(model_fact.get('completion_tokens'))}</td>"
+                    f"<td>{_fmt_tokens_compact(model_fact.get('total_tokens'))}</td>"
+                    f"<td>{_fmt_tokens_compact(model_fact.get('cache_read_tokens'))} / "
+                    f"{_fmt_tokens_compact(model_fact.get('cache_write_tokens'))} / "
+                    f"{_fmt_tokens_compact(model_fact.get('cache_miss_tokens'))}</td>"
+                    f"<td>{_fmt_ratio(model_fact.get('cache_hit_ratio'))}</td>"
+                    f"<td>{_fmt_ratio(model_fact.get('usage_coverage'))} / "
+                    f"{_fmt_ratio(model_fact.get('cache_coverage'))}</td>"
+                    "</tr>"
+                )
+
+            delivery = user.get("delivery") or {}
+            level = _runtime_user_delivery_level(delivery)
+            level_text = {"ok": "正常", "warn": "注意", "bad": "异常"}[level]
+            delivery_rows_list.append(
+                "<tr>"
+                f"<td>{user_cell}</td>"
+                f"<td><span class='pill {level}'>{level_text}</span></td>"
+                f"<td>{_effect_summary(delivery.get('reply_effects') or {}, include_discarded=False)}</td>"
+                f"<td>{_effect_summary(delivery.get('status_effects') or {}, include_discarded=False)}</td>"
+                f"<td>{_effect_summary(delivery.get('all_effects') or {}, include_discarded=True)}</td>"
+                f"<td>{_failure_summary(delivery.get('terminal_failure') or {})}</td>"
+                f"<td>{_fmt_duration_sec(delivery.get('oldest_unfinished_age_sec'))}</td>"
+                "</tr>"
+            )
+
+        model_rows = "".join(model_rows_list) or (
+            "<tr><td colspan='10' class='muted'>所选窗口没有 model 指标。"
+            "交付可靠性仍在下表展示。</td></tr>"
+        )
+        delivery_rows = "".join(delivery_rows_list)
+
+    return f"""<section>
+  <h2>用户 Token / Model 与交付可靠性</h2>
+  <div class='note-box'>
+    <b>口径：</b>这里只统计 <b>hosted Runtime V2</b> 回合；provider / model / route 是
+    <b>历史每回合路由事实</b>，不是当前用户配置。交付「ok 不代表客户端已读」：它只表示
+    服务端已完成可观测的 effect / failure 投递义务。当前 outstanding delivery
+    <b>不受所选时间窗口限制</b>，因此旧积压也会显示；applied/discarded 与 delivered
+    计数才跟随所选窗口。所有内容、prompt、reply 与 outbox payload 均不渲染。
+  </div>
+  <table class="runtime-user-models">
+    <thead><tr><th>User</th><th>Provider / model / route</th><th>Lanes</th><th>Turns</th><th>Calls / Retries</th><th>Token in / out</th><th>Known total</th><th>Cache R / W / M</th><th>Cache hit</th><th>Usage / cache coverage</th></tr></thead>
+    <tbody>{model_rows}</tbody>
+  </table>
+  <table class="runtime-user-delivery">
+    <thead><tr><th>User</th><th>Reliability</th><th>Reply effects</th><th>Status effects</th><th>All effects</th><th>Failure reply/status/error</th><th>Oldest unfinished</th></tr></thead>
+    <tbody>{delivery_rows}</tbody>
+  </table>
+</section>"""
+
+
 # 本次新增的两个 Runtime 视图页共用这一份样式。刻意没有去改造既有 6 个视图页
 # 各自内联的 style——那是独立重构，不该混在功能改动里。
 # 普通字符串（非 f-string），花括号无需转义。
@@ -2676,6 +2833,7 @@ def _render_runtime_health_page(
     payload: dict,
     tokens: dict | None = None,
     delivery: dict | None = None,
+    user_report: dict | None = None,
 ) -> str:
     """Runtime V2 全 lane 运行时健康值班台（?view=runtime）。
 
@@ -2683,8 +2841,9 @@ def _render_runtime_health_page(
     （日报送达率，按天）。heartbeat lane 两页都出现但口径不同，故本页该行给出
     指向日报页的链接。
 
-    ``tokens`` / ``delivery`` 都可能是 None（各自独立的失败域，见 admin_core）：
-    取不到时该区块显「暂不可用」，不得把 None 渲染成 0——0 是"确认过是零"。
+    ``tokens`` / ``delivery`` / ``user_report`` 都可能是 None（各自独立的失败域，
+    见 admin_core）：取不到时对应区块显「暂不可用」，不得把 None 渲染成 0——0
+    是"确认过是零"。
     """
     level, reasons = _runtime_health_level(payload, delivery)
     window_hours = int(payload.get("window_hours") or 24)
@@ -2971,6 +3130,7 @@ def _render_runtime_health_page(
     <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>失败</th><th>过期</th><th>superseded</th><th>失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
     <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='13' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
   </table>
+  {_render_runtime_user_report(user_report)}
   <h2>失败原因 Top</h2>
   <table>
     <thead><tr><th>Lane</th><th>失败码</th><th>次数</th></tr></thead>
