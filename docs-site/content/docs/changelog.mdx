@@ -10,15 +10,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
-- **Visual-model setup now separates provider access, declared image support,
-  and unknown capability.** OpenRouter catalogs come from the authenticated
-  `models/user` endpoint, so the picker only shows models available to that API
-  key. Explicitly text-only models are rejected before selection, while models
-  with a compatible image-input contract receive a lightweight reachability
-  check. Catalogs without trustworthy modality metadata fall back to one small,
-  randomized image challenge. Stable visual error codes distinguish missing
-  model access, incompatible image input, invalid credentials, quota, rate
-  limits, and temporary provider failures.
+- **Visual-model setup now treats a real image probe as authoritative.** Every
+  selected model receives one small, randomized image challenge even when its
+  provider catalog declares image support, declares text-only input, omits the
+  model, or is unavailable. Catalog modalities are advisory and are preserved
+  only from explicit official per-model fields; model-name tables and provider
+  defaults are no longer used. Catalog/probe disagreements produce
+  content-free diagnostics. Empty visible replies from reasoning models are a
+  retryable failure rather than proof of image incompatibility, while a
+  non-empty reply with contradictory colors remains unsupported. Stable visual
+  error codes still distinguish incompatible image input, invalid credentials,
+  quota, rate limits, and temporary provider failures.
 
 - **Hosted visual failures are easier to diagnose without exposing user
   content.** Per-user admin detail now includes bounded model-route runtime

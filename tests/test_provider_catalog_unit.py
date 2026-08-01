@@ -107,121 +107,23 @@ def test_catalog_request_anthropic_headers_and_cursor():
 def test_parse_catalog_page_openai_data_shape():
     body = {"data": [{"id": "gpt-5.4", "name": "GPT-5.4"}, {"id": "o5"}]}
     models, nxt = pc._parse_catalog_page("openai", body)
-    assert models == [{"id": "gpt-5.4", "display_name": "GPT-5.4",
-                       "input_modalities": ["text", "image"]},
+    assert models == [{"id": "gpt-5.4", "display_name": "GPT-5.4"},
                       {"id": "o5", "display_name": "o5"}]
     assert nxt is None
 
 
-def test_parse_catalog_page_openai_uses_official_vision_capability_table():
+def test_parse_catalog_page_openai_never_infers_modalities_from_model_names():
     body = {
         "data": [
             {"id": "gpt-4.1", "owned_by": "openai"},
-            {"id": "gpt-4.1-mini-2025-04-14", "owned_by": "openai"},
-            {"id": "gpt-4o", "owned_by": "openai"},
-            {"id": "gpt-5-mini", "owned_by": "openai"},
-        ]
-    }
-    models, _ = pc._parse_catalog_page("openai", body)
-    assert [model["input_modalities"] for model in models] == [
-        ["text", "image"],
-        ["text", "image"],
-        ["text", "image"],
-        ["text", "image"],
-    ]
-
-
-def test_parse_catalog_page_openai_covers_current_reasoning_and_gpt_families():
-    body = {
-        "data": [
-            {"id": "o1", "owned_by": "openai"},
-            {"id": "o1-pro-2025-03-19", "owned_by": "openai"},
             {"id": "o3", "owned_by": "openai"},
-            {"id": "o3-pro-2025-06-10", "owned_by": "openai"},
-            {"id": "o4-mini", "owned_by": "openai"},
-            {"id": "gpt-5.1-codex-max", "owned_by": "openai"},
-            {"id": "gpt-5.2-pro", "owned_by": "openai"},
-            {"id": "gpt-5.4-mini-2026-03-17", "owned_by": "openai"},
-            {"id": "gpt-5.5-pro-2026-04-23", "owned_by": "openai"},
-            {"id": "gpt-5.6-sol", "owned_by": "openai"},
-            {"id": "chat-latest", "owned_by": "openai"},
-        ]
-    }
-
-    models, _ = pc._parse_catalog_page("openai", body)
-
-    assert all(model["input_modalities"] == ["text", "image"] for model in models)
-
-
-def test_parse_catalog_page_openai_excludes_tool_only_visual_models():
-    body = {
-        "data": [
-            {"id": "o3-deep-research", "owned_by": "openai"},
-            {"id": "o4-mini-deep-research-2025-06-26", "owned_by": "openai"},
-            {"id": "computer-use-preview", "owned_by": "openai"},
-        ]
-    }
-
-    models, _ = pc._parse_catalog_page("openai", body)
-
-    assert all(model["input_modalities"] == ["text"] for model in models)
-
-
-def test_parse_catalog_page_openai_marks_known_text_models_and_keeps_unknown_safe():
-    body = {
-        "data": [
-            {"id": "gpt-4-0613", "owned_by": "openai"},
-            {"id": "gpt-3.5-turbo", "owned_by": "openai"},
-            {"id": "ft:gpt-4.1:org:custom", "owned_by": "organization-owner"},
-            {"id": "gpt-future-specialized", "owned_by": "openai"},
-        ]
-    }
-    models, _ = pc._parse_catalog_page("openai", body)
-    assert models[0]["input_modalities"] == ["text"]
-    assert models[1]["input_modalities"] == ["text"]
-    assert "input_modalities" not in models[2]
-    assert "input_modalities" not in models[3]
-
-
-def test_parse_catalog_page_openai_covers_legacy_and_specialized_text_models():
-    body = {
-        "data": [
-            {"id": "gpt-3.5-turbo-16k", "owned_by": "openai"},
-            {"id": "gpt-3.5-turbo-instruct-0914", "owned_by": "openai"},
-            {"id": "babbage-002", "owned_by": "openai"},
-            {"id": "davinci-002", "owned_by": "openai"},
-            {"id": "o3-mini-2025-01-31", "owned_by": "openai"},
-            {"id": "gpt-4o-search-preview-2025-03-11", "owned_by": "openai"},
-        ]
-    }
-
-    models, _ = pc._parse_catalog_page("openai", body)
-
-    assert all(model["input_modalities"] == ["text"] for model in models)
-
-
-def test_parse_catalog_page_openai_marks_specialized_models_non_visual():
-    body = {
-        "data": [
             {"id": "whisper-1", "owned_by": "openai"},
-            {"id": "gpt-4o-mini-transcribe", "owned_by": "openai"},
-            {"id": "tts-1", "owned_by": "openai"},
-            {"id": "text-embedding-3-large", "owned_by": "openai"},
-            {"id": "gpt-image-1", "owned_by": "openai"},
-            {"id": "omni-moderation-latest", "owned_by": "openai"},
+            {"id": "future-opaque", "input_modalities": ["text", "image"]},
         ]
     }
-
     models, _ = pc._parse_catalog_page("openai", body)
-
-    assert [model["input_modalities"] for model in models] == [
-        ["audio"],
-        ["audio"],
-        ["text"],
-        ["text"],
-        ["text"],
-        ["text"],
-    ]
+    assert all("input_modalities" not in model for model in models)
+    assert pc._catalog_input_modalities("openai", body["data"][0]) is None
 
 
 def test_parse_catalog_page_gemini_strips_prefix_and_paginates():
@@ -235,12 +137,11 @@ def test_parse_catalog_page_gemini_strips_prefix_and_paginates():
     assert models == [{
         "id": "gemini-3.1-pro",
         "display_name": "Gemini 3.1 Pro",
-        "input_modalities": ["text", "image"],
     }]
     assert nxt == "tok2"
 
 
-def test_parse_catalog_page_gemini_excludes_non_observer_model_families():
+def test_parse_catalog_page_gemini_never_infers_modalities_from_model_names():
     body = {"models": [
         {
             "name": "models/gemma-3-27b-it",
@@ -259,10 +160,7 @@ def test_parse_catalog_page_gemini_excludes_non_observer_model_families():
 
     models, _ = pc._parse_catalog_page("gemini", body)
 
-    assert models[0]["input_modalities"] == ["text"]
-    assert models[1]["input_modalities"] == ["text"]
-    assert models[2]["input_modalities"] == ["text"]
-    assert "input_modalities" not in models[3]
+    assert all("input_modalities" not in model for model in models)
 
 
 def test_parse_catalog_page_anthropic_has_more():
@@ -298,7 +196,7 @@ def test_parse_catalog_page_anthropic_maps_image_capability_without_guessing():
     assert "input_modalities" not in models[2]
 
 
-def test_parse_catalog_page_deepseek_marks_official_models_text_only():
+def test_parse_catalog_page_deepseek_does_not_hardcode_modalities():
     body = {"data": [
         {"id": "deepseek-v4-flash", "object": "model", "owned_by": "deepseek"},
         {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek"},
@@ -306,7 +204,8 @@ def test_parse_catalog_page_deepseek_marks_official_models_text_only():
 
     models, _ = pc._parse_catalog_page("deepseek", body)
 
-    assert [model["input_modalities"] for model in models] == [["text"], ["text"]]
+    assert all("input_modalities" not in model for model in models)
+    assert pc._catalog_input_modalities("deepseek", body["data"][0]) is None
 
 
 def test_parse_catalog_page_compatible_accepts_only_explicit_safe_modalities():

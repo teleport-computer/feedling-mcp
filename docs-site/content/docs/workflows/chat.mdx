@@ -88,24 +88,25 @@ saved model route as an image observer. Read the current choice with `GET
 }
 ```
 
-IO first checks the authenticated provider catalog. A model explicitly declared
-text-only is rejected, while a model with a compatible image-input contract gets
-a lightweight reachability check. If the catalog cannot state image capability,
-IO sends one small randomized control image and requires an unambiguous partial
-match before recording that the route can inspect images. OpenRouter uses its
-key-scoped `models/user` catalog, so unavailable models are excluded before this
-step. A new dedicated selection succeeds only after that route records `ok`;
-`mode: "follow_main"` preserves the existing main-model image path. If a route
-that was selected earlier later becomes non-`ok`, Settings keeps that choice
-visible for diagnosis, but image observation fails closed and never sends the
-pixels to a fallback model.
+IO can consult explicit per-model capability fields from the authenticated
+provider catalog, but that metadata is advisory. Every selected model receives
+one small randomized control image, and its reply must contain an unambiguous
+partial match before the route is recorded as able to inspect images. A catalog
+declaration cannot make the test pass or fail by itself. OpenRouter uses its
+key-scoped `models/user` catalog for its picker. A new dedicated selection
+succeeds only after the real image probe records `ok`; `mode: "follow_main"`
+preserves the existing main-model image path. If a route that was selected
+earlier later becomes non-`ok`, Settings keeps that choice visible for diagnosis,
+but image observation fails closed and never sends the pixels to a fallback
+model.
 
 Use `POST /v1/vision/config` when adding a dedicated image model. It creates or
-reuses the saved route, runs the strongest available catalog or image check, and
-selects the route as one server-owned operation. A model that is explicitly
-text-only or fails the control image is not selected; authentication, provider,
-quota, and other operational failures remove only the route or credential
-created by that request.
+reuses the saved route, runs the randomized image check, and selects the route
+as one server-owned operation. A model that fails the control image is not
+selected; authentication, provider, quota, and other operational failures
+remove only the route or credential created by that request. An empty visible
+reply is recorded as a retryable test failure rather than as proof that the
+model cannot accept images.
 
 When a dedicated route is configured, IO records that exact route before the
 image turn is stored. Runtime V2 or the official resident then sends pixels only
