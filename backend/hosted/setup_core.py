@@ -211,6 +211,20 @@ def _vision_probe_images() -> tuple[list[dict[str, str]], list[str]]:
     return vision_probe_capability.generate_images()
 
 
+def _vision_probe_reply_matches(reply: str, expected: str) -> bool:
+    """Require a partial but unambiguous signal from the randomized image."""
+    expected_colors = set(expected.split(","))
+    observed_colors = {
+        color
+        for color in vision_probe_capability.color_names()
+        if re.search(rf"\b{re.escape(color)}\b", reply)
+    }
+    return (
+        len(observed_colors.intersection(expected_colors)) >= 2
+        and observed_colors.issubset(expected_colors)
+    )
+
+
 def _vision_test_lock(user_id: str, route_id: str):
     return _VISION_TEST_LOCKS[hash((user_id, route_id)) % len(_VISION_TEST_LOCKS)]
 
@@ -230,6 +244,23 @@ def _mark_route_vision_test(
     if expected_updated_at:
         kwargs["expected_updated_at"] = expected_updated_at
     return db.model_api_route_mark_vision_test(user_id, route_id, **kwargs)
+
+
+def _classify_catalog_route_vision_error(
+    exc: BaseException,
+    *,
+    catalog_model_found: bool,
+) -> vision_observer.VisionObserverError:
+    """Keep an endpoint mismatch distinct from a genuinely missing model."""
+    stable = vision_observer.classify_vision_error(exc)
+    if stable.error_code != "vision_model_not_found" or not catalog_model_found:
+        return stable
+    return vision_observer.VisionObserverError(
+        "vision_model_incompatible",
+        status_code=stable.status_code,
+        retryable=False,
+        detail="The provider lists this model but cannot use it for visual input.",
+    )
 
 
 def _vision_runtime_v2_enabled(store) -> bool:
@@ -310,7 +341,12 @@ def _run_route_vision_test_or_error(
     runtime_token: str = "",
     expected_updated_at: str = "",
 ):
-    """Prove that a saved route can inspect pixels, not merely answer text."""
+    """Validate a visual route using the strongest provider evidence available.
+
+    Explicit image metadata needs only a minimal reachability call; explicit
+    text-only metadata rejects immediately. Missing or unavailable capability
+    metadata falls back to a real randomized image-recognition probe.
+    """
     envelope = route.get("api_key_envelope")
     if not isinstance(envelope, dict):
         credential = db.model_api_credential_get(store.user_id, route["credential_id"])
@@ -331,10 +367,10 @@ def _run_route_vision_test_or_error(
             "detail": str(exc)[:220],
         }, 400
 
-    # Catalog metadata can reject an explicitly text-only model without
-    # spending tokens. A positive declaration is not sufficient proof that
-    # this provider/model route actually accepts image input, so it still falls
-    # through to the pixel control probe.
+    # OpenRouter uses /models/user here; other providers use their authenticated
+    # model catalogs.  Catalog membership is key-scoped access evidence, and an
+    # explicit image declaration is enough capability evidence.  We deliberately
+    # do not send a synthetic image during setup.
     catalog = None
     try:
         catalog = provider_client.list_provider_models(
@@ -371,7 +407,29 @@ def _run_route_vision_test_or_error(
         ),
         None,
     )
-    if isinstance(exact, dict) and "input_modalities" in exact:
+    catalog_is_complete = bool(
+        isinstance(catalog, dict)
+        and catalog.get("catalog_supported", True)
+        and catalog.get("complete", True)
+    )
+    if catalog_is_complete and exact is None:
+        detail = "This API key cannot access the selected model."
+        if not _mark_route_vision_test(
+            store.user_id,
+            route["id"],
+            status="failed",
+            error="vision_model_not_found",
+            expected_updated_at=expected_updated_at,
+        ):
+            return {"error": "model_api_route_write_failed"}, 500
+        return {
+            "error": "vision_model_not_found",
+            "detail": detail,
+            "retryable": False,
+        }, 400
+
+    capability_declared = isinstance(exact, dict) and "input_modalities" in exact
+    if capability_declared:
         supported = "image" in set(exact.get("input_modalities") or [])
         if not supported:
             detail = "Provider catalog reports a text-only model."
@@ -389,9 +447,65 @@ def _run_route_vision_test_or_error(
                 "retryable": False,
             }, 400
 
-    # Match the real chat contract: one user message contains one image. Some
-    # OpenRouter routes accept images but only forward the first image block;
-    # a two-image probe therefore produced false "unsupported" verdicts.
+    # A provider declaration is sufficient capability evidence. One tiny text
+    # call still proves current key/model access without spending image tokens.
+    if capability_declared:
+        try:
+            provider_client.chat_completion(
+                provider_client.ProviderConfig(
+                    route["provider"],
+                    route["model"],
+                    provider_key,
+                    route["base_url"],
+                    context_window_tokens=route.get("context_window_tokens"),
+                ),
+                [{"role": "user", "content": "Reply with ok."}],
+                max_tokens=1,
+                temperature=None,
+                timeout=30.0,
+                require_reply=False,
+                include_reasoning=False,
+            )
+        except provider_client.ProviderError as exc:
+            stable = _classify_catalog_route_vision_error(
+                exc,
+                catalog_model_found=exact is not None,
+            )
+            print(
+                f"[vision-probe:{store.user_id}] connection failed "
+                f"provider={route['provider']} model={route['model']} "
+                f"code={stable.error_code} status={stable.status_code} "
+                f"detail={str(exc)[:160]}"
+            )
+            unsupported = stable.error_code == "vision_model_incompatible"
+            status = "unsupported" if unsupported else "failed"
+            if not _mark_route_vision_test(
+                store.user_id,
+                route["id"],
+                status=status,
+                error=stable.error_code,
+                expected_updated_at=expected_updated_at,
+            ):
+                return {"error": "model_api_route_write_failed"}, 500
+            return {
+                "error": stable.error_code,
+                "detail": stable.detail,
+                "status_code": stable.status_code,
+                "retryable": stable.retryable,
+            }, 400
+
+        if not _mark_route_vision_test(
+            store.user_id,
+            route["id"],
+            status="ok",
+            expected_updated_at=expected_updated_at,
+        ):
+            return {"error": "model_api_route_write_failed"}, 500
+        return None
+
+    # The provider catalog cannot answer whether this route accepts images.
+    # Only this unknown branch spends image tokens: one small, randomized
+    # control image, matching the one-image contract used by real chat turns.
     encoded, expected = _vision_probe_image()
     probe_image = f"data:image/png;base64,{encoded}"
     prompt = (
@@ -418,13 +532,22 @@ def _run_route_vision_test_or_error(
                     },
                 ],
             }],
-            max_tokens=40,
+            max_tokens=256,
             temperature=None,
             timeout=45.0,
             include_reasoning=False,
         )
     except provider_client.ProviderError as exc:
-        stable = vision_observer.classify_vision_error(exc)
+        stable = _classify_catalog_route_vision_error(
+            exc,
+            catalog_model_found=exact is not None,
+        )
+        print(
+            f"[vision-probe:{store.user_id}] pixel probe failed "
+            f"provider={route['provider']} model={route['model']} "
+            f"code={stable.error_code} status={stable.status_code} "
+            f"detail={str(exc)[:160]}"
+        )
         unsupported = stable.error_code == "vision_model_incompatible"
         status = "unsupported" if unsupported else "failed"
         if not _mark_route_vision_test(
@@ -443,15 +566,16 @@ def _run_route_vision_test_or_error(
         }, 400
 
     reply = str(result.get("reply") or "").strip().lower()
-    colors = re.findall(r"red|green|blue|yellow", reply)[:4]
-    observed = ",".join(colors)
-    if observed != expected:
-        detail = "The model did not identify the visual test image correctly."
+    # Two correct colors are enough to prove image receipt without turning the
+    # capability check into an accuracy benchmark. Any color absent from the
+    # randomized image rejects a blind "red, green, blue, yellow" guess.
+    if not _vision_probe_reply_matches(reply, expected):
+        detail = "The model response did not contain a visual signal from the test image."
         if not _mark_route_vision_test(
             store.user_id,
             route["id"],
             status="unsupported",
-            error=detail,
+            error="vision_model_incompatible",
             expected_updated_at=expected_updated_at,
         ):
             return {"error": "model_api_route_write_failed"}, 500
@@ -460,6 +584,7 @@ def _run_route_vision_test_or_error(
             "detail": detail,
             "retryable": False,
         }, 400
+
     if not _mark_route_vision_test(
         store.user_id,
         route["id"],

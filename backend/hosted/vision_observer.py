@@ -59,7 +59,14 @@ def classify_vision_error(exc: BaseException) -> VisionObserverError:
         "vision_key_envelope_missing",
     }:
         code = "vision_model_not_ready"
-    elif raw == "vision_model_empty_observation":
+    elif raw == "vision_model_empty_observation" or any(
+        marker in raw
+        for marker in (
+            "provider response had no usable reply text",
+            "provider returned empty reply",
+            "vision model returned no observation",
+        )
+    ):
         code = "vision_model_empty_response"
     elif status_code in {401, 403}:
         code = "vision_model_auth_invalid"

@@ -1828,6 +1828,7 @@ def _openai_uses_responses_for_reasoning(model: str) -> bool:
         or lower.startswith("o1")
         or lower.startswith("o3")
         or lower.startswith("o4")
+        or lower.startswith("computer-use-preview")
     )
 
 
@@ -3405,6 +3406,116 @@ _CATALOG_SUPPORTED_PROVIDERS = {
 }
 
 
+# OpenAI's authenticated /models objects intentionally expose only identity /
+# ownership, not input modalities. Keep the official general-purpose model
+# contract here so the setup UI does not label every OpenAI model "unknown".
+# Entries are deliberately explicit: an unlisted new, specialized, fine-tuned,
+# or third-party id remains unknown and must pass the real image probe before it
+# can be saved as a visual route.
+_OPENAI_OFFICIAL_INPUT_MODALITIES: dict[str, list[str]] = {
+    # Current multimodal GPT families. Entries describe whether the model can
+    # produce the text observation required by IO's visual route, not whether
+    # it belongs to any image-related OpenAI product.
+    "gpt-5.6": ["text", "image"],
+    "gpt-5.6-sol": ["text", "image"],
+    "gpt-5.6-terra": ["text", "image"],
+    "gpt-5.6-luna": ["text", "image"],
+    "gpt-5.5": ["text", "image"],
+    "gpt-5.5-pro": ["text", "image"],
+    "gpt-5.4": ["text", "image"],
+    "gpt-5.4-pro": ["text", "image"],
+    "gpt-5.4-mini": ["text", "image"],
+    "gpt-5.4-nano": ["text", "image"],
+    "gpt-5.3-chat-latest": ["text", "image"],
+    "gpt-5.3-codex": ["text", "image"],
+    "gpt-5.2": ["text", "image"],
+    "gpt-5.2-pro": ["text", "image"],
+    "gpt-5.2-chat-latest": ["text", "image"],
+    "gpt-5.2-codex": ["text", "image"],
+    "gpt-5.1": ["text", "image"],
+    "gpt-5.1-chat-latest": ["text", "image"],
+    "gpt-5.1-codex": ["text", "image"],
+    "gpt-5.1-codex-mini": ["text", "image"],
+    "gpt-5.1-codex-max": ["text", "image"],
+    "gpt-5": ["text", "image"],
+    "gpt-5-pro": ["text", "image"],
+    "gpt-5-mini": ["text", "image"],
+    "gpt-5-nano": ["text", "image"],
+    "gpt-5-chat-latest": ["text", "image"],
+    "gpt-5-codex": ["text", "image"],
+    "chat-latest": ["text", "image"],
+    "gpt-4.1": ["text", "image"],
+    "gpt-4.1-mini": ["text", "image"],
+    "gpt-4.1-nano": ["text", "image"],
+    "gpt-4o": ["text", "image"],
+    "gpt-4o-mini": ["text", "image"],
+    "gpt-4-turbo": ["text", "image"],
+    "gpt-4-vision-preview": ["text", "image"],
+    # Reasoning and specialized text-output models with official image input.
+    "o1": ["text", "image"],
+    "o1-pro": ["text", "image"],
+    "o3": ["text", "image"],
+    "o3-pro": ["text", "image"],
+    "o4-mini": ["text", "image"],
+    # These accept image input only through specialized tool contracts that
+    # IO's plain text-observer route does not provide.
+    "o3-deep-research": ["text"],
+    "o4-mini-deep-research": ["text"],
+    "computer-use-preview": ["text"],
+    # Legacy GPT families whose official contract is text-only.
+    "gpt-4": ["text"],
+    "gpt-4-0613": ["text"],
+    "gpt-4-0314": ["text"],
+    "gpt-3.5-turbo": ["text"],
+    "gpt-3.5-turbo-16k": ["text"],
+    "gpt-3.5-turbo-0125": ["text"],
+    "gpt-3.5-turbo-1106": ["text"],
+    "gpt-3.5-turbo-instruct": ["text"],
+    "gpt-3.5-turbo-instruct-0914": ["text"],
+    "babbage-002": ["text"],
+    "davinci-002": ["text"],
+    "o3-mini": ["text"],
+    "gpt-4o-search-preview": ["text"],
+    "gpt-4o-mini-search-preview": ["text"],
+}
+
+_OPENAI_AUDIO_INPUT_PREFIXES = ("whisper-",)
+_OPENAI_AUDIO_INPUT_MARKERS = ("-transcribe",)
+_OPENAI_NON_VISUAL_PREFIXES = (
+    "tts-",
+    "text-embedding-",
+    "text-moderation-",
+    "omni-moderation-",
+    "dall-e-",
+    "gpt-image-",
+    "chatgpt-image-",
+    "sora-",
+)
+_OPENAI_NON_VISUAL_MARKERS = ("-tts", "-realtime", "-audio")
+
+
+def _openai_official_input_modalities(model_id: str) -> list[str] | None:
+    """Resolve known OpenAI models against the visual-chat contract."""
+    normalized = str(model_id or "").strip().lower()
+    direct = _OPENAI_OFFICIAL_INPUT_MODALITIES.get(normalized)
+    if direct is not None:
+        return list(direct)
+    snapshot = re.match(r"^(.*)-\d{4}-\d{2}-\d{2}$", normalized)
+    if snapshot:
+        canonical = _OPENAI_OFFICIAL_INPUT_MODALITIES.get(snapshot.group(1))
+        if canonical is not None:
+            return list(canonical)
+    if normalized.startswith(_OPENAI_AUDIO_INPUT_PREFIXES) or any(
+        marker in normalized for marker in _OPENAI_AUDIO_INPUT_MARKERS
+    ):
+        return ["audio"]
+    if normalized.startswith(_OPENAI_NON_VISUAL_PREFIXES) or any(
+        marker in normalized for marker in _OPENAI_NON_VISUAL_MARKERS
+    ):
+        return ["text"]
+    return None
+
+
 def validate_catalog_target(provider: str, base_url: str = "") -> tuple[str, str]:
     """Validate provider + base_url for the catalog path (no model required).
 
@@ -3467,18 +3578,17 @@ def _catalog_request(provider: str, api_key: str, base_url: str,
     base = (base_url or default_base_url(provider)).rstrip("/")
     if provider == "bedrock":
         raise ProviderError("model_catalog_unsupported")
-    url = f"{base}/models"
+    # OpenRouter's public /models catalog ignores the caller's privacy settings,
+    # ZDR policy, and guardrails. /models/user applies those constraints to this
+    # exact API key. Keep this request unmodified: carrying public-catalog filters
+    # such as output_modalities=all broadens the response beyond that default.
+    url = f"{base}/models/user" if provider == "openrouter" else f"{base}/models"
     params: dict = {}
     if provider in _CATALOG_BEARER_PROVIDERS:
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         if provider == "openrouter":
             headers["HTTP-Referer"] = "https://feedling.app"
             headers["X-Title"] = "Feedling IO Hosted Runtime"
-            # OpenRouter's /models defaults to text-output models only. Ask for
-            # the full multimodal catalog — the product decision is "show all,
-            # no modality filtering". Verified live 2026-07-26: the param
-            # returns HTTP 200 with a superset (449 vs 345 models).
-            params["output_modalities"] = "all"
     elif provider == "anthropic":
         headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
                    "Content-Type": "application/json"}
@@ -3560,18 +3670,30 @@ def _parse_catalog_page(provider: str, body: Any) -> tuple[list[dict], str | Non
 def _catalog_input_modalities(provider: str, model: dict) -> list[str] | None:
     """Return only explicit provider metadata; never infer from a model id.
 
-    OpenRouter publishes ``architecture.input_modalities``. Anthropic publishes
-    ``capabilities.image_input.supported``. OpenAI-compatible relays may expose
-    a direct ``input_modalities`` extension. Other catalog shapes currently do
-    not make image input support explicit enough to trust, so ``None`` means the
-    caller must use a real visual probe.
+    OpenAI's /models object omits modalities, so official model ids use the
+    maintained contract table above. OpenRouter publishes
+    ``architecture.input_modalities``. Anthropic publishes
+    ``capabilities.image_input.supported``. DeepSeek's official API contract is
+    text-only even though ``/models`` omits modalities. Gemini's catalog exposes
+    the supported generation methods, while Google's contract declares Gemini
+    model versions multimodal. OpenAI-compatible relays may expose a direct
+    ``input_modalities`` extension. Other catalog shapes do not make image input
+    support explicit enough to trust.
     """
     provider = normalize_provider(provider)
     raw = None
+    if provider == "openai":
+        return _openai_official_input_modalities(str(model.get("id") or ""))
     if provider == "openrouter":
         architecture = model.get("architecture")
         if isinstance(architecture, dict):
             raw = architecture.get("input_modalities")
+    elif provider == "deepseek":
+        # DeepSeek's authenticated /models response only carries id/object/
+        # owned_by. Its official V4 integrations declare both V4 Pro and Flash
+        # as text-only, so make that provider-level contract visible to every
+        # client instead of treating a successful text call as visual proof.
+        return ["text"]
     elif provider == "anthropic":
         capabilities = model.get("capabilities")
         image_input = (
@@ -3586,6 +3708,29 @@ def _catalog_input_modalities(provider: str, model: dict) -> list[str] | None:
         )
         if isinstance(supported, bool):
             return ["text", "image"] if supported else ["text"]
+    elif provider == "gemini":
+        name = str(model.get("name") or "").strip().lower()
+        methods = model.get("supportedGenerationMethods")
+        if not isinstance(methods, list):
+            return None
+        normalized_methods = {
+            str(method).strip().lower()
+            for method in methods
+            if isinstance(method, str)
+        }
+        # The catalog also contains Gemma, embedding, TTS, image-generation,
+        # and live-only entries. They are not compatible with this observer's
+        # text-response GenerateContent contract even when they handle media.
+        if "generatecontent" not in normalized_methods:
+            return ["text"]
+        is_gemini = name.startswith("models/gemini-")
+        specialized = any(
+            marker in name
+            for marker in ("embedding", "-tts", "-live", "-image")
+        )
+        if is_gemini and not specialized:
+            return ["text", "image"]
+        return ["text"]
     elif provider in {"openai_compatible"}:
         raw = model.get("input_modalities")
 
@@ -3662,43 +3807,6 @@ def _fetch_catalog_page(client: httpx.Client, url: str, headers: dict,
     return body, total
 
 
-def _verify_key_for_public_catalog(provider: str, api_key: str,
-                                   base_url: str) -> None:
-    """Reject a bad key for providers whose model *catalog* is PUBLIC.
-
-    OpenRouter's ``GET /models`` needs no auth: a bogus key still returns a full
-    HTTP 200 catalog, so the iOS validate-before-advance gate would wave a wrong
-    key through (both a wrong and a right key "load" a catalog). Probe an
-    AUTHENTICATED endpoint FIRST so a bad key raises before we ever fetch the
-    catalog. A bogus key → 401 → ``ProviderError(status_code=401)`` (mapped to
-    ``model_catalog_auth_failed`` by ``model_catalog_error_slug``); a real key →
-    200 → returns. Only the status matters — the body is intentionally ignored.
-
-    Every OTHER supported provider already requires auth on its own ``/models``
-    (openai/anthropic/gemini/deepseek all 401 on a bad key), so this is a no-op
-    for them.
-
-    Residual edge: ``openai_compatible`` custom relays have no assumable auth-
-    check endpoint, so they are deliberately NOT probed here. A custom relay that
-    exposes a PUBLIC ``/models`` could still accept a bad key at this gate — left
-    as documented behavior rather than guessing an endpoint that may not exist.
-    """
-    provider = normalize_provider(provider)
-    if provider != "openrouter":
-        return
-    # OpenRouter's auth-check endpoint. ``base`` is the normalized openrouter
-    # base (https://openrouter.ai/api/v1), so the probe hits .../v1/key.
-    base = (base_url or default_base_url(provider)).rstrip("/")
-    url = f"{base}/key"
-    headers = {"Authorization": f"Bearer {api_key}",
-               "Content-Type": "application/json"}
-    client = _http_client()
-    deadline = time.monotonic() + _CATALOG_TOTAL_BUDGET
-    # One bounded request via the same streamed/capped helper the catalog pages
-    # use; it RAISES ProviderError on any status >= 400 (carrying status_code).
-    _fetch_catalog_page(client, url, headers, {}, deadline, 0)
-
-
 def list_provider_models(provider: str, api_key: str, base_url: str = "") -> dict:
     provider = normalize_provider(provider)
     warnings: list[str] = []
@@ -3709,14 +3817,6 @@ def list_provider_models(provider: str, api_key: str, base_url: str = "") -> dic
             return {"models": [], "complete": True, "warnings": [],
                     "catalog_supported": False}
         raise
-
-    # For providers whose catalog is PUBLIC (openrouter), verify the key against
-    # an authenticated endpoint BEFORE fetching the catalog, so a bogus key is
-    # rejected instead of returning a full catalog. No-op for every other
-    # provider (their /models already authenticates). Let ProviderError
-    # propagate — setup_core maps it via model_catalog_error_slug (401 →
-    # model_catalog_auth_failed), so the contract is unchanged.
-    _verify_key_for_public_catalog(provider, api_key, base_url)
 
     seen: set[str] = set()
     seen_cursors: set[str] = set()

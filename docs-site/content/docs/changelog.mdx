@@ -10,6 +10,16 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Visual-model setup now separates provider access, declared image support,
+  and unknown capability.** OpenRouter catalogs come from the authenticated
+  `models/user` endpoint, so the picker only shows models available to that API
+  key. Explicitly text-only models are rejected before selection, while models
+  with a compatible image-input contract receive a lightweight reachability
+  check. Catalogs without trustworthy modality metadata fall back to one small,
+  randomized image challenge. Stable visual error codes distinguish missing
+  model access, incompatible image input, invalid credentials, quota, rate
+  limits, and temporary provider failures.
+
 - **Encrypted Runtime V2 profile storage is staged for the bounded
   Memory/User rollout.** Both fields share one `v2_agent_profile` CAS document
   but remain separate shared encrypted envelopes. PostgreSQL and the TEE shadow
