@@ -331,9 +331,10 @@ def _run_route_vision_test_or_error(
             "detail": str(exc)[:220],
         }, 400
 
-    # Provider catalogs are cheaper and more authoritative than asking a model
-    # about itself. Only explicit modality fields parsed by provider_client are
-    # trusted; missing metadata falls through to the pixel control probe.
+    # Catalog metadata can reject an explicitly text-only model without
+    # spending tokens. A positive declaration is not sufficient proof that
+    # this provider/model route actually accepts image input, so it still falls
+    # through to the pixel control probe.
     catalog = None
     try:
         catalog = provider_client.list_provider_models(
@@ -372,29 +373,31 @@ def _run_route_vision_test_or_error(
     )
     if isinstance(exact, dict) and "input_modalities" in exact:
         supported = "image" in set(exact.get("input_modalities") or [])
-        status = "ok" if supported else "unsupported"
-        detail = "" if supported else "Provider catalog reports a text-only model."
-        if not _mark_route_vision_test(
-            store.user_id,
-            route["id"],
-            status=status,
-            error=detail,
-            expected_updated_at=expected_updated_at,
-        ):
-            return {"error": "model_api_route_write_failed"}, 500
-        if supported:
-            return None
-        return {
-            "error": "vision_model_incompatible",
-            "detail": detail,
-            "retryable": False,
-        }, 400
+        if not supported:
+            detail = "Provider catalog reports a text-only model."
+            if not _mark_route_vision_test(
+                store.user_id,
+                route["id"],
+                status="unsupported",
+                error=detail,
+                expected_updated_at=expected_updated_at,
+            ):
+                return {"error": "model_api_route_write_failed"}, 500
+            return {
+                "error": "vision_model_incompatible",
+                "detail": detail,
+                "retryable": False,
+            }, 400
 
-    probe_images, expected = _vision_probe_images()
+    # Match the real chat contract: one user message contains one image. Some
+    # OpenRouter routes accept images but only forward the first image block;
+    # a two-image probe therefore produced false "unsupported" verdicts.
+    encoded, expected = _vision_probe_image()
+    probe_image = f"data:image/png;base64,{encoded}"
     prompt = (
-        "This is a private capability check. Inspect both images. Each has four "
-        "solid color stripes. Reply with exactly two lines, one per image in order, "
-        "using only lowercase color names separated by commas."
+        "This is a private capability check. Inspect this image. It has four "
+        "solid vertical color stripes. Reply using only four lowercase color "
+        "names from left to right, separated by commas."
     )
     try:
         result = provider_client.chat_completion(
@@ -409,16 +412,13 @@ def _run_route_vision_test_or_error(
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    *[
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image["data_url"]},
-                        }
-                        for image in probe_images
-                    ],
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": probe_image},
+                    },
                 ],
             }],
-            max_tokens=80,
+            max_tokens=40,
             temperature=None,
             timeout=45.0,
             include_reasoning=False,
@@ -443,8 +443,8 @@ def _run_route_vision_test_or_error(
         }, 400
 
     reply = str(result.get("reply") or "").strip().lower()
-    colors = re.findall(r"red|green|blue|yellow", reply)[:8]
-    observed = [",".join(colors[:4]), ",".join(colors[4:8])]
+    colors = re.findall(r"red|green|blue|yellow", reply)[:4]
+    observed = ",".join(colors)
     if observed != expected:
         detail = "The model did not identify the visual test image correctly."
         if not _mark_route_vision_test(
@@ -1122,14 +1122,11 @@ def vision_config_set(
         if route is not None
         else None
     )
-    warning = None
     if test_error is not None:
-        error_body, _ = test_error
-        if error_body.get("error") != "vision_model_incompatible":
-            return test_error
-        # Keep an explicit text-only selection visible while image admission
-        # remains fail-closed on its persisted unsupported verdict.
-        warning = error_body
+        # A route that failed the pixel probe is not a valid vision selection.
+        # Returning 200 here made "Test and add" close as if it succeeded, only
+        # for the list to show the newly selected model as unable to see images.
+        return test_error
 
     changed = (
         db.model_api_route_set_vision(store.user_id, route["id"])
@@ -1138,10 +1135,7 @@ def vision_config_set(
     )
     if not changed:
         return {"error": "model_api_route_write_failed"}, 500
-    body = {"config": _vision_config_payload(store)}
-    if warning is not None:
-        body["warning"] = warning
-    return body, 200
+    return {"config": _vision_config_payload(store)}, 200
 
 
 @_serialized_model_api_mutation
