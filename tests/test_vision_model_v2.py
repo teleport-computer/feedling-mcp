@@ -459,7 +459,41 @@ def test_follow_main_can_clear_dedicated_route_before_resident_update(monkeypatc
     assert body == {"config": {"mode": "follow_main", "available": False}}
 
 
-def test_explicit_catalog_modalities_skip_paid_pixel_probe(monkeypatch):
+def test_dedicated_selection_rejects_failed_pixel_probe(monkeypatch):
+    selected = []
+    route = {"id": "vision-route"}
+    monkeypatch.setattr(setup_core, "_vision_routing_available", lambda _store: True)
+    monkeypatch.setattr(setup_core.db, "model_api_route_get", lambda _uid, _rid: route)
+    monkeypatch.setattr(
+        setup_core,
+        "_test_route_vision_or_error",
+        lambda *_args, **_kwargs: (
+            {
+                "error": "vision_model_incompatible",
+                "detail": "provider rejected image input",
+                "retryable": False,
+            },
+            400,
+        ),
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_route_set_vision",
+        lambda _uid, route_id: selected.append(route_id) or True,
+    )
+
+    body, status = setup_core.vision_config_set.__wrapped__(
+        _store(),
+        {"mode": "dedicated", "route_id": "vision-route"},
+        caller_api_key="caller",
+    )
+
+    assert status == 400
+    assert body["error"] == "vision_model_incompatible"
+    assert selected == []
+
+
+def test_explicit_catalog_image_support_still_runs_pixel_probe(monkeypatch):
     marked = []
     route = {
         "id": "r1",
@@ -482,12 +516,17 @@ def test_explicit_catalog_modalities_skip_paid_pixel_probe(monkeypatch):
         },
     )
     monkeypatch.setattr(
-        setup_core.provider_client,
-        "chat_completion",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("explicit catalog metadata must avoid a paid probe")
-        ),
+        setup_core,
+        "_vision_probe_image",
+        lambda: ("a", "red,green,blue,yellow"),
     )
+    captured = {}
+
+    def complete(_config, messages, **_kwargs):
+        captured["content"] = messages[0]["content"]
+        return {"reply": "red,green,blue,yellow"}
+
+    monkeypatch.setattr(setup_core.provider_client, "chat_completion", complete)
     monkeypatch.setattr(
         setup_core.db,
         "model_api_route_mark_vision_test",
@@ -497,10 +536,11 @@ def test_explicit_catalog_modalities_skip_paid_pixel_probe(monkeypatch):
     assert setup_core._run_route_vision_test_or_error(
         _store(), route, "caller"
     ) is None
-    assert marked == [{"status": "ok", "error": ""}]
+    assert len([block for block in captured["content"] if block["type"] == "image_url"]) == 1
+    assert marked == [{"status": "ok"}]
 
 
-def test_missing_catalog_modalities_falls_through_to_two_image_probe(monkeypatch):
+def test_missing_catalog_modalities_falls_through_to_single_image_probe(monkeypatch):
     marked = []
     route = {
         "id": "r1",
@@ -522,17 +562,14 @@ def test_missing_catalog_modalities_falls_through_to_two_image_probe(monkeypatch
     )
     monkeypatch.setattr(
         setup_core,
-        "_vision_probe_images",
-        lambda: (
-            [{"data_url": "data:image/png;base64,a"}, {"data_url": "data:image/png;base64,b"}],
-            ["red,green,blue,yellow", "yellow,blue,green,red"],
-        ),
+        "_vision_probe_image",
+        lambda: ("a", "red,green,blue,yellow"),
     )
     captured = {}
 
     def complete(_config, messages, **_kwargs):
         captured["content"] = messages[0]["content"]
-        return {"reply": "red,green,blue,yellow\nyellow,blue,green,red"}
+        return {"reply": "red,green,blue,yellow"}
 
     monkeypatch.setattr(setup_core.provider_client, "chat_completion", complete)
     monkeypatch.setattr(
@@ -544,7 +581,7 @@ def test_missing_catalog_modalities_falls_through_to_two_image_probe(monkeypatch
     assert setup_core._run_route_vision_test_or_error(
         _store(), route, "caller"
     ) is None
-    assert len([block for block in captured["content"] if block["type"] == "image_url"]) == 2
+    assert len([block for block in captured["content"] if block["type"] == "image_url"]) == 1
     assert marked == [{"status": "ok"}]
 
 
@@ -573,18 +610,15 @@ def test_unavailable_catalog_endpoint_still_runs_pixel_probe(monkeypatch):
     )
     monkeypatch.setattr(
         setup_core,
-        "_vision_probe_images",
-        lambda: (
-            [{"data_url": "data:image/png;base64,a"}, {"data_url": "data:image/png;base64,b"}],
-            ["red,green,blue,yellow", "yellow,blue,green,red"],
-        ),
+        "_vision_probe_image",
+        lambda: ("a", "red,green,blue,yellow"),
     )
     probes = []
     monkeypatch.setattr(
         setup_core.provider_client,
         "chat_completion",
         lambda *_args, **_kwargs: probes.append(True) or {
-            "reply": "red,green,blue,yellow\nyellow,blue,green,red"
+            "reply": "red,green,blue,yellow"
         },
     )
     monkeypatch.setattr(

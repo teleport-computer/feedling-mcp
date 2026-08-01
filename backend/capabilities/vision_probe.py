@@ -9,10 +9,10 @@ import zlib
 
 
 _COLORS = {
-    "red": (224, 67, 54),
-    "green": (52, 168, 83),
-    "blue": (66, 133, 244),
-    "yellow": (251, 188, 4),
+    "red": (235, 35, 35),
+    "green": (20, 180, 65),
+    "blue": (25, 90, 235),
+    "yellow": (250, 210, 10),
 }
 
 
@@ -25,12 +25,16 @@ def generate_image() -> tuple[str, str]:
     """Return one random four-stripe PNG and its unpredictable answer."""
     names = list(_COLORS)
     random.SystemRandom().shuffle(names)
-    width, height = 96, 24
+    # Keep the control large enough to survive provider-side image resizing.
+    # The old 96x24 strip was occasionally read as reordered or "tan" by
+    # otherwise vision-capable Claude routes.
+    width, height = 512, 256
+    stripe_width = width // len(names)
     scanlines = bytearray()
     for _ in range(height):
         scanlines.append(0)
         for x in range(width):
-            scanlines.extend(_COLORS[names[min(x // 24, 3)]])
+            scanlines.extend(_COLORS[names[min(x // stripe_width, 3)]])
     png = b"\x89PNG\r\n\x1a\n"
     png += _png_chunk(
         b"IHDR",
