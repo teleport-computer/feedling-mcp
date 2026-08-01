@@ -7292,6 +7292,7 @@ async def _run_wake(
                         runtime_token=token,
                         enclave_sem=enclave_sem,
                         turn_authorization=True,
+                        identity_write_authorization=False,
                         enqueue_write_effect=_enqueue_write_effect,
                         before_write=_before_write,
                         observe_photo=observe_photo,
@@ -7376,6 +7377,7 @@ async def _run_wake(
                         runtime_token=token,
                         enclave_sem=enclave_sem,
                         turn_authorization=True,
+                        identity_write_authorization=False,
                         enqueue_write_effect=_enqueue_write_effect,
                         enqueue_workspace_batch_effect=(
                             _enqueue_workspace_batch_effect

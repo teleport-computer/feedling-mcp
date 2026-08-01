@@ -413,6 +413,49 @@ def test_wake_memory_write_is_authorized_applied_and_not_refused(monkeypatch):
     assert _job_status(job_id)[0] == "completed"
 
 
+@pytest.mark.parametrize("tool_call", [
+    _tc("identity-write", "identity_patch", signature="changed in background"),
+    _tc("identity-write", "identity_nudge", dimension="warmth", delta=1),
+])
+def test_wake_identity_write_is_visibly_refused_and_not_enqueued(
+    monkeypatch, tool_call,
+):
+    uid = "u_wake_toolloop_identity_refused"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
+    job = jobs_store.claim_next_job("w-identity-refused")
+
+    calls = _script_provider(monkeypatch, [
+        _tool_round(tool_call),
+        _text_round(""),
+    ])
+    sink_calls = []
+    deps = _wake_deps(tail=[], sink_calls=sink_calls)
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "manual_wake",
+        deps,
+        _BYOK,
+        worker.ENCLAVE_SEMAPHORE,
+        str(job["claimed_by"]),
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 2
+    exchanges = [m for m in calls[1]["messages"] if isinstance(m, ToolExchange)]
+    assert len(exchanges) == 1
+    result = exchanges[0].results[0]
+    assert result.call_id == "identity-write"
+    assert result.content.startswith("error:")
+    assert "identity write refused in background turn" in result.content
+    assert sink_calls == []
+    assert db.effect_pending(uid) == []
+    assert _job_status(job_id)[0] == "completed"
+
+
 def test_wake_mixed_valid_invalid_workspace_batch_applies_valid_call(
     monkeypatch,
 ):

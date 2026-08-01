@@ -10,6 +10,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Background agent turns can no longer rewrite the identity card.** Runtime
+  V2 now visibly refuses `identity_patch` and `identity_nudge` during proactive
+  wake turns while preserving identity reads, foreground Chat identity changes,
+  and wake-time Memory writes.
+
 - **Visual-model setup now treats a real image probe as authoritative.** Every
   selected model receives one small, randomized image challenge even when its
   provider catalog declares image support, declares text-only input, omits the
