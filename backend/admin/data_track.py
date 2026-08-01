@@ -3062,8 +3062,12 @@ def _render_runtime_health_page(
     # 回合（capture.open）、池里也没有 inflight/pending。若窗口内无终态 job 但
     # 有回合在飞，那不是"没数据"，是卡死的形状——I-3 的教训：之前这两种情形共
     # 用同一句"这不是故障"，把卡死误报成正常的空窗口。
-    no_terminal_samples = not any(int(l.get("sampled_jobs") or 0) for l in lanes)
-    total_open = sum(int((l.get("capture") or {}).get("open") or 0) for l in lanes)
+    no_terminal_samples = not any(
+        int(lane.get("sampled_jobs") or 0) for lane in lanes
+    )
+    total_open = sum(
+        int((lane.get("capture") or {}).get("open") or 0) for lane in lanes
+    )
     pool_inflight = int(pool.get("inflight") or 0)
     pool_pending = int(pool.get("pending") or 0)
     if not no_terminal_samples:
