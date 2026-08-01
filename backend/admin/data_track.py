@@ -3370,6 +3370,33 @@ def _render_data_track_dau_page(payload: dict) -> str:
         if _snap_first else
         "每日快照即将生效；生效后当天真实数据会冻结、不再随删号变化。"
     )
+    # 「加载更多日期」：本页服务端渲染，无 SPA。默认 days=30，点一次 +30，封顶
+    # 366（一年，DB / filters 两侧的硬上限）。链接经 _data_track_qs 保住 admin_key
+    # 与 since/day 等现有参数。到顶后换成说明文案。
+    _current_days = int(filters.get("days") or 30)
+    _DAU_DAYS_MAX = 366
+    if _current_days < _DAU_DAYS_MAX:
+        _next_days = min(_current_days + 30, _DAU_DAYS_MAX)
+        _more_href = _data_track_page_href(
+            view="dau", days=_next_days, day=histogram_day, offset=0,
+        )
+        _more_all_href = _data_track_page_href(
+            view="dau", days=_DAU_DAYS_MAX, day=histogram_day, offset=0,
+        )
+        load_more_html = (
+            "<div class='toolbar' style='margin-top:12px'>"
+            f"<a class='sort-button' href='{html.escape(_more_href, quote=True)}'>"
+            f"↓ 加载更多日期（{_current_days} → {_next_days} 天）</a>"
+            f"<a class='sort-button' href='{html.escape(_more_all_href, quote=True)}'>"
+            f"加载全部（最多 {_DAU_DAYS_MAX} 天 · 约一年）</a>"
+            "</div>"
+        )
+    else:
+        load_more_html = (
+            "<div class='muted' style='margin-top:12px'>"
+            f"已加载到最大范围 {_DAU_DAYS_MAX} 天（约一年）——更早的数据需提高后端上限。"
+            "</div>"
+        )
     rows_html = []
     for row in rows:
         rows_html.append(
@@ -3507,6 +3534,7 @@ def _render_data_track_dau_page(payload: dict) -> str:
     <thead><tr><th>Beijing day</th><th>状态</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>使用DAU</th><th>人均日使用时长</th><th>中位数日使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='13' class='muted'>No DAU activity in this range.</td></tr>"}</tbody>
   </table>
+  {load_more_html}
   <div class="muted" style="margin-top:12px">使用时长分布口径：先汇总每位用户在所选北京日的全部 app_session_end duration_sec，再按固定右开区间分桶。样本=当天有上报的 {histogram_total} 位用户；没打开 App 或没有 app_session_end 上报的用户不计入，也不会补 0。</div>
 </main>
 </body>
