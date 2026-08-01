@@ -580,6 +580,22 @@ def test_runtime_user_report_keeps_unknown_usage_and_identity():
     assert model["cache_coverage"] == pytest.approx(0.0)
 
 
+def test_runtime_user_report_normalizes_null_user_id_to_unknown():
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_turn_metrics "
+            "(job_id,user_id,lane,prompt_tokens,completion_tokens,latency_ms,"
+            "model_calls,retries,failed,status,usage_reported_calls) "
+            "VALUES (NULL,NULL,'chat',7,3,1000,1,0,false,'ok',1)"
+        )
+
+    users = jobs_store.recent_runtime_user_report()["users"]
+
+    assert [user["user_id"] for user in users] == ["unknown"]
+    assert users[0]["known_total_tokens"] == 10
+    assert all(user["user_id"] != "None" for user in users)
+
+
 def test_runtime_user_report_respects_window_and_orders_known_before_unknown():
     _add_metric("u_report_small", "chat", prompt=10, completion=1)
     _add_metric("u_report_big", "chat", prompt=100, completion=10)
@@ -866,10 +882,9 @@ def test_delivery_health_mutation_respects_window_but_outbox_does_not():
 
 
 def test_full_window_queries_have_their_supporting_indexes():
-    # 去掉采样上界后，这三条查询的扫描量全靠 0071 的索引兜着（24h 档实测：
-    # 无索引 Seq Scan 4226 buffer → 有索引 Index Scan 1454 buffer）。索引若被
-    # 谁的迁移顺手删掉，症状是值班台在长窗口下越来越慢——那是最难归因的一类
-    # 退化，所以在这里钉死。
+    # 0071 承托三条 fleet 全窗口扫描；0074 分别承托 user delivery 的窗口范围
+    # 与永久积压扫描。索引若被谁的迁移顺手删掉，症状是值班台随历史表增长变慢
+    # ——那是最难归因的一类退化，所以在这里钉死。
     with db.get_pool().connection() as conn:
         present = {
             row[0]
@@ -880,6 +895,10 @@ def test_full_window_queries_have_their_supporting_indexes():
                         "ix_agent_jobs_terminal_finished_at",
                         "ix_agent_jobs_created_at",
                         "ix_v2_turn_metrics_created_at",
+                        "ix_v2_effect_report_created_at",
+                        "ix_v2_effect_report_unfinished",
+                        "ix_v2_terminal_failure_report_created_at",
+                        "ix_v2_terminal_failure_report_unfinished",
                     ],
                 ),
             ).fetchall()
@@ -889,4 +908,84 @@ def test_full_window_queries_have_their_supporting_indexes():
         "ix_agent_jobs_terminal_finished_at",
         "ix_agent_jobs_created_at",
         "ix_v2_turn_metrics_created_at",
+        "ix_v2_effect_report_created_at",
+        "ix_v2_effect_report_unfinished",
+        "ix_v2_terminal_failure_report_created_at",
+        "ix_v2_terminal_failure_report_unfinished",
     }
+
+
+def test_runtime_user_delivery_queries_use_window_and_backlog_indexes():
+    effect_window_sql = jobs_store._RUNTIME_USER_EFFECT_WINDOW_SQL
+    effect_backlog_sql = jobs_store._RUNTIME_USER_EFFECT_BACKLOG_SQL
+    terminal_window_sql = jobs_store._RUNTIME_USER_TERMINAL_WINDOW_SQL
+    terminal_backlog_sql = jobs_store._RUNTIME_USER_TERMINAL_BACKLOG_SQL
+
+    seed_user("u_plan_effect")
+    seed_user("u_plan_terminal")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_effect_outbox "
+            "(effect_id,user_id,effect_type,expected_generation,payload,status,created_at) "
+            "SELECT 'e_plan_' || n,'u_plan_effect','memory',1,'{}'::jsonb,'applied',"
+            "clock_timestamp()-make_interval(hours => n) "
+            "FROM generate_series(1,12000) AS n"
+        )
+        conn.execute(
+            "INSERT INTO v2_effect_outbox "
+            "(effect_id,user_id,effect_type,expected_generation,payload,status,created_at) "
+            "VALUES ('e_plan_backlog','u_plan_effect','reply',1,'{}'::jsonb,"
+            "'needs_reconciliation',now()-interval '90 days')"
+        )
+        conn.execute(
+            "WITH inserted_jobs AS ("
+            "  INSERT INTO agent_jobs (user_id,lane,status,created_at,finished_at) "
+            "  SELECT 'u_plan_terminal','chat','failed',"
+            "    clock_timestamp()-make_interval(hours => n),"
+            "    clock_timestamp()-make_interval(hours => n) "
+            "  FROM generate_series(1,12000) AS n "
+            "  RETURNING id,created_at"
+            ") INSERT INTO v2_terminal_failure_outbox "
+            "(job_id,user_id,error_code,created_at,reply_delivered_at,"
+            "status_delivered_at,runtime_error_delivered_at) "
+            "SELECT id,'u_plan_terminal','turn_failed:x',created_at,now(),now(),now() "
+            "FROM inserted_jobs"
+        )
+        backlog_job = conn.execute(
+            "INSERT INTO agent_jobs (user_id,lane,status,created_at,finished_at) "
+            "VALUES ('u_plan_terminal','chat','failed',now()-interval '90 days',"
+            "now()-interval '90 days') RETURNING id"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO v2_terminal_failure_outbox "
+            "(job_id,user_id,error_code,created_at) "
+            "VALUES (%s,'u_plan_terminal','turn_failed:x',now()-interval '90 days')",
+            (backlog_job,),
+        )
+        conn.execute("ANALYZE v2_effect_outbox")
+        conn.execute("ANALYZE v2_terminal_failure_outbox")
+
+        def explain(sql: str, params=()) -> str:
+            return "\n".join(
+                row[0]
+                for row in conn.execute(
+                    "EXPLAIN (COSTS OFF) " + sql, params
+                ).fetchall()
+            )
+
+        plans = {
+            "effect_window": explain(effect_window_sql, (24,)),
+            "effect_backlog": explain(effect_backlog_sql),
+            "terminal_window": explain(terminal_window_sql, (24,)),
+            "terminal_backlog": explain(terminal_backlog_sql),
+        }
+
+    expected_indexes = {
+        "effect_window": "ix_v2_effect_report_created_at",
+        "effect_backlog": "ix_v2_effect_report_unfinished",
+        "terminal_window": "ix_v2_terminal_failure_report_created_at",
+        "terminal_backlog": "ix_v2_terminal_failure_report_unfinished",
+    }
+    for query, plan in plans.items():
+        assert expected_indexes[query] in plan, plan
+        assert "Seq Scan" not in plan, plan

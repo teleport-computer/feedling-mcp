@@ -35,6 +35,68 @@ def _migration_0041_module():
     )
 
 
+def _migration_0074_module():
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    return (
+        ScriptDirectory.from_config(cfg)
+        .get_revision("0074_runtime_user_delivery_idx")
+        .module
+    )
+
+
+def test_0074_runtime_user_delivery_indexes_are_concurrent_and_recoverable():
+    migration = _migration_0074_module()
+
+    assert migration.down_revision == "0073_merge_tail_anchor_deepseek"
+    assert set(migration._INDEXES) == {
+        "ix_v2_effect_report_created_at",
+        "ix_v2_effect_report_unfinished",
+        "ix_v2_terminal_failure_report_created_at",
+        "ix_v2_terminal_failure_report_unfinished",
+    }
+    assert all(
+        "CREATE INDEX CONCURRENTLY" in sql
+        for sql in migration._INDEXES.values()
+    )
+    upgrade_source = inspect.getsource(migration.upgrade)
+    assert "autocommit_block" in upgrade_source
+    assert "validity[name] is False" in upgrade_source
+    assert "DROP INDEX CONCURRENTLY IF EXISTS" in inspect.getsource(
+        migration.downgrade
+    )
+
+    with db.get_pool().connection() as conn:
+        definitions = dict(
+            conn.execute(
+                "SELECT indexname,indexdef FROM pg_indexes "
+                "WHERE indexname = ANY(%s)",
+                (list(migration._INDEXES),),
+            ).fetchall()
+        )
+    assert set(definitions) == set(migration._INDEXES)
+    assert "(created_at DESC, user_id)" in definitions[
+        "ix_v2_effect_report_created_at"
+    ]
+    assert "(user_id, status, created_at)" in definitions[
+        "ix_v2_effect_report_unfinished"
+    ]
+    assert "pending_fenced_v1" in definitions[
+        "ix_v2_effect_report_unfinished"
+    ]
+    assert "(created_at DESC, user_id)" in definitions[
+        "ix_v2_terminal_failure_report_created_at"
+    ]
+    terminal_backlog = definitions[
+        "ix_v2_terminal_failure_report_unfinished"
+    ]
+    assert "(user_id, created_at)" in terminal_backlog
+    assert "reply_delivered_at IS NULL" in terminal_backlog
+    assert "status_delivered_at IS NULL" in terminal_backlog
+    assert "runtime_error_delivered_at IS NULL" in terminal_backlog
+
+
 def test_v2_tables_exist():
     with db.get_pool().connection() as conn:
         rows = conn.execute(
