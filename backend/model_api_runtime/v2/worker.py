@@ -1234,6 +1234,10 @@ class TurnDeps:
     read_vision_observations: Callable[
         [str, list[dict]], dict[str, str]
     ] | None = None
+    # Model-requested perception photo observation. Production resolves the
+    # user's dedicated vision route first, then falls back to this turn's main
+    # provider config. Pixels stay in-process and never enter tool-result text.
+    observe_photo: Callable[..., str] | None = None
     # (user_id, message_ids) -> {message_id: {"file_name","file_mime","text","truncated"}}：
     # 优先读取加密 VFS text view；cache miss 时必须先拿到 sandbox 并记 usage，之后才从
     # enclave 解密文件、交给 sandbox materialize/parse。与 read_images 同理**不能**并进 read_tail
@@ -3427,6 +3431,7 @@ def _make_task_batch_dispatcher(
     enclave_sem: asyncio.Semaphore,
     trusted_system_blocks: tuple[str, ...],
     add_usage: Callable[[dict | None], None],
+    observe_photo=None,
     disabled_web_tool_names: frozenset[str] = v2_web_gate.WEB_TOOL_NAMES,
     trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
 ) -> Callable[[list], Awaitable[list[ToolResult]]]:
@@ -3542,6 +3547,7 @@ def _make_task_batch_dispatcher(
                                 turn_authorization=False,
                                 enqueue_write_effect=_no_child_write,
                                 before_write=None,
+                                observe_photo=observe_photo,
                                 read_parallelism=1,
                             )
                     except Exception as exc:
@@ -3649,6 +3655,34 @@ def _make_task_batch_dispatcher(
             ]
 
     return _dispatch
+
+
+class _PhotoObserverUnavailable(RuntimeError):
+    error_code = "vision_model_unavailable"
+
+
+def _make_photo_observer(
+    deps: TurnDeps,
+    *,
+    user_id: str,
+    provider_config,
+    api_key: str | None,
+    runtime_token: str,
+):
+    async def _observe(image_mime: str, image_b64: str) -> str:
+        if deps.observe_photo is None:
+            raise _PhotoObserverUnavailable("photo observer is not wired")
+        return await asyncio.to_thread(
+            deps.observe_photo,
+            user_id,
+            image_mime=image_mime,
+            image_b64=image_b64,
+            main_provider_config=provider_config,
+            api_key=api_key,
+            runtime_token=runtime_token,
+        )
+
+    return _observe
 
 
 def _make_provider_usage_dispatcher(
@@ -6722,6 +6756,13 @@ async def _run_wake(
         # Load before any prompt-coverage provider call so a broken workspace
         # never produces an under-authorized proactive response.
         token = deps.mint_enclave_token(user_id)
+        observe_photo = _make_photo_observer(
+            deps,
+            user_id=user_id,
+            provider_config=provider_config,
+            api_key=None,
+            runtime_token=token,
+        )
         trusted_system_blocks, working_memory = await _load_workspace_prompt_context(
             deps,
             store,
@@ -7230,6 +7271,7 @@ async def _run_wake(
             enclave_sem=enclave_sem,
             trusted_system_blocks=trusted_system_blocks,
             add_usage=_add_usage,
+            observe_photo=observe_photo,
             trajectory_recorder=trajectory_recorder,
         )
 
@@ -7252,6 +7294,7 @@ async def _run_wake(
                         turn_authorization=True,
                         enqueue_write_effect=_enqueue_write_effect,
                         before_write=_before_write,
+                        observe_photo=observe_photo,
                         read_parallelism=1,
                     )
                 finally:
@@ -7338,6 +7381,7 @@ async def _run_wake(
                             _enqueue_workspace_batch_effect
                         ),
                         before_write=_before_write,
+                        observe_photo=observe_photo,
                         read_parallelism=1,
                     )
                 finally:
@@ -7438,6 +7482,24 @@ async def _run_wake(
 
         async def _on_reply(text: str, *, final: bool, reasoning: str = "") -> None:
             text = str(text or "").strip()
+            # Self-authored thinking (same mechanism as the chat lane): peel a leading
+            # <think> off the wake reply BEFORE the degenerate/torn checks so they see
+            # the real reply, and surface the block in the thinking channel instead of
+            # native reasoning. Same kill switch. Fail-closed: a malformed block →
+            # silence (a legitimate wake outcome), never a leaked tag.
+            from core import self_thinking as _st_wake
+
+            _wake_self_thinking_on = _st_wake.enabled()
+            _wake_self_thinking_text = ""
+            if _wake_self_thinking_on and text:
+                _wst_status, _wst_thinking, _wst_reply = _st_wake.split_thinking(text)
+                if _wst_status == _st_wake.COMPLETE:
+                    text = _wst_reply
+                    _wake_self_thinking_text = _wst_thinking
+                elif _wst_status == _st_wake.FAILED:
+                    if final:
+                        raise TurnError("degenerate_reply_suppressed")
+                    return
             if text and _is_degenerate_reply(text):
                 log.warning(
                     "[v2.worker] wake degenerate reply suppressed user=%s "
@@ -7530,10 +7592,16 @@ async def _run_wake(
                         job_id=int(job_id),
                     )
                 )
-            # Surface provider chain-of-thought on the same effect (sealed into a
-            # separate thinking envelope), matching the chat lane. Only a final
-            # reply carries it; intermediate reply{} bubbles are agent-authored.
-            if final and reasoning:
+            # Surface thinking on the same effect (sealed into a separate envelope),
+            # matching the chat lane: PREFER the self-authored <think> when present,
+            # else the provider's native reasoning. Never mislabel one as the other.
+            # Only a final reply carries it; intermediate reply{} bubbles are agent-authored.
+            _wake_display_reasoning = reasoning
+            _wk_kind, _wk_source, _wk_native = "provider_reasoning", None, True
+            if _wake_self_thinking_on and _wake_self_thinking_text:
+                _wake_display_reasoning = _wake_self_thinking_text
+                _wk_kind, _wk_source, _wk_native = "agent_summary", "self_thinking", False
+            if final and _wake_display_reasoning:
                 thinking_effect_id = v2_effect_id.derive(
                     job_id=job_id,
                     effect_type=reply_effect_type,
@@ -7542,9 +7610,12 @@ async def _run_wake(
                 thinking_payload = await asyncio.to_thread(
                     _build_thinking_payload,
                     store,
-                    reasoning,
+                    _wake_display_reasoning,
                     effect_id=thinking_effect_id,
                     provider_config=provider_config,
+                    kind=_wk_kind,
+                    source=_wk_source,
+                    native=_wk_native,
                 )
                 if thinking_payload:
                     payload["thinking"] = thinking_payload
@@ -7753,12 +7824,20 @@ async def _run_wake(
             user_id, deps, cursor_box, enclave_sem=enclave_sem
         )
         def _wake_builder():
+            from core import self_thinking as _st_wake_sys
+
+            _wake_sys = (
+                _SCREEN_WATCH_SYSTEM_PROMPT
+                if lane == "screen_watch"
+                else wake_system_prompt
+            )
+            # Same as the chat lane's context.chat_system_prompt(): ask the model to
+            # open its reply with a <think> block so proactive turns show a clean
+            # self-authored thought instead of raw native reasoning.
+            if _st_wake_sys.enabled():
+                _wake_sys = _wake_sys + _st_wake_sys.INSTRUCTION
             return _make_build_messages_fn(
-                system_prompt=(
-                    _SCREEN_WATCH_SYSTEM_PROMPT
-                    if lane == "screen_watch"
-                    else wake_system_prompt
-                ),
+                system_prompt=_wake_sys,
                 summary=summary,
                 tail=wake_tail,
                 extra_context=(
@@ -7843,10 +7922,13 @@ async def _run_wake(
                     raise
 
         await _fence_wake_effect("wake turn")
+        from core import self_thinking as _st_wake_loop
+
         try:
             await v2_tool_loop.run_tool_loop(
                 provider_config=provider_config,
                 build_messages=build_messages,
+                suppress_native_reasoning=_st_wake_loop.enabled(),
                 disabled_tool_names=wake_disabled_tool_names,
                 dispatch_tools=_dispatch_tools,
                 on_reply=_on_reply,
@@ -10299,6 +10381,13 @@ async def process_job(
                     user_id,
                     type(exc).__name__.lower(),
                 )
+        observe_photo = _make_photo_observer(
+            deps,
+            user_id=user_id,
+            provider_config=provider_config,
+            api_key=api_key,
+            runtime_token=runtime_token,
+        )
         dispatch_task_batch = _make_task_batch_dispatcher(
             disabled_web_tool_names=disabled_web_tool_names,
             provider_config=provider_config,
@@ -10308,6 +10397,7 @@ async def process_job(
             enclave_sem=enclave_sem,
             trusted_system_blocks=trusted_system_blocks,
             add_usage=tm.add_call,
+            observe_photo=observe_photo,
             trajectory_recorder=trajectory_recorder,
         )
         # Chat-lane only (Task 6): closes over THIS turn's already-decrypted
@@ -10353,6 +10443,7 @@ async def process_job(
                         turn_authorization=(mutation_recovery_barrier is None),
                         enqueue_write_effect=_enqueue_write_effect,
                         before_write=_before_write,
+                        observe_photo=observe_photo,
                         read_parallelism=1,
                     )
                 finally:
@@ -10433,6 +10524,7 @@ async def process_job(
                             _enqueue_workspace_batch_effect
                         ),
                         before_write=_before_write,
+                        observe_photo=observe_photo,
                         read_parallelism=1,
                     )
                 finally:

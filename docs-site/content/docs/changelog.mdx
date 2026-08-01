@@ -10,6 +10,30 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Visual capability checks no longer misclassify truncated thinking-model
+  replies as proof of incompatibility.** Hosted provider probes now use a
+  larger model-agnostic output budget. An empty reply, or one with no color
+  evidence, records a retryable failed check rather than an unsupported
+  verdict; a non-empty, demonstrably incorrect color answer remains
+  unsupported. Changing a saved credential's provider or endpoint invalidates
+  its prior visual verdict, and per-user admin detail now exposes bounded
+  visual-test status, error, and timestamp metadata without endpoint URLs.
+
+- **Hosted visual failures are easier to diagnose without exposing user
+  content.** Per-user admin detail now includes bounded model-route runtime
+  error metadata and the newest 20 notice summaries through explicit
+  content-free field allowlists; provider endpoint URLs, notice text, notice
+  detail, and copyable prompts are excluded. Visual observation also emits
+  metadata-only debug trace events for image-read failures and provider-call
+  outcomes, without image data, observations, or raw provider responses.
+
+- **Hosted visual observation now works for zero-roster Runtime V1 users.**
+  The authenticated request's short-lived, user-bound runtime token is
+  forwarded through both the exact image-body read and visual provider-key
+  decrypt, instead of being discarded and replaced by an empty API key. Image
+  retries now fetch the requested message directly rather than searching only
+  the newest 20 Chat rows. Requests with neither credential still fail closed.
+
 - **Runtime V2 can replace its legacy summary with a bounded Memory/User
   profile.** The default-off `FEEDLING_V2_PROFILE_ENABLED` switch now gates
   both generation and turn-time selection. Only an `ok`, non-disabled profile

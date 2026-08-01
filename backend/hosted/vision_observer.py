@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import time
 
 import db
+import debug_trace
 import provider_client
 from capabilities import registry as cap_registry
 from core import enclave as core_enclave
@@ -167,6 +169,7 @@ def observe_pinned_message(
     payload: dict,
     *,
     caller_api_key: str | None,
+    caller_runtime_token: str = "",
 ) -> tuple[dict, int]:
     message_id = str(payload.get("message_id") or "").strip()
     route_id = str(payload.get("route_id") or "").strip()
@@ -177,10 +180,22 @@ def observe_pinned_message(
         "provider": str(route.get("provider") or "")[:80],
         "model": str(route.get("model") or "")[:96],
     }
-
     try:
         rows = store.reload_chat_strict()
     except Exception as exc:
+        debug_trace.trace_event(
+            store,
+            subsystem="vision",
+            type="vision.observe.failed",
+            actor="backend",
+            status="error",
+            summary="chat_reload_failed",
+            detail={
+                "stage": "chat_reload",
+                "error_class": "vision_image_unavailable",
+                "retryable": True,
+            },
+        )
         return {
             "error": "vision_image_unavailable",
             "error_class": "vision_image_unavailable",
@@ -201,20 +216,49 @@ def observe_pinned_message(
         "chat_image_read",
         store,
         api_key=caller_api_key,
+        runtime_token=caller_runtime_token or None,
         params={"message_id": message_id},
     )
     if not image_result.ok:
         code = str((image_result.error or {}).get("code") or "")
+        retryable = bool((image_result.error or {}).get("retryable"))
+        debug_trace.trace_event(
+            store,
+            subsystem="vision",
+            type="vision.observe.failed",
+            actor="backend",
+            status="error",
+            summary="image_read_failed",
+            detail={
+                "stage": "image_read",
+                "error_class": "vision_image_unavailable",
+                "reason": code[:160],
+                "retryable": retryable,
+            },
+        )
         return {
             "error": "vision_image_unavailable",
             "error_class": "vision_image_unavailable",
             "status_code": 502,
-            "retryable": bool((image_result.error or {}).get("retryable")),
+            "retryable": retryable,
             "detail": code[:160],
         }, 502
     image = image_result.data or {}
     image_b64 = str(image.get("image_b64") or "")
     if not image_b64:
+        debug_trace.trace_event(
+            store,
+            subsystem="vision",
+            type="vision.observe.failed",
+            actor="backend",
+            status="error",
+            summary="image_body_missing",
+            detail={
+                "stage": "image_read",
+                "error_class": "vision_image_unavailable",
+                "retryable": False,
+            },
+        )
         return {
             "error": "vision_image_unavailable",
             "error_class": "vision_image_unavailable",
@@ -223,12 +267,28 @@ def observe_pinned_message(
             "detail": "image_body_missing",
         }, 502
 
+    started_at = time.monotonic()
+    provider_called = False
     try:
         config = load_provider_config(
             store.user_id,
             route_id,
             api_key=caller_api_key,
+            runtime_token=caller_runtime_token,
         )
+        debug_trace.trace_event(
+            store,
+            subsystem="vision",
+            type="vision.provider.called",
+            actor="backend",
+            status="started",
+            summary="provider_call",
+            detail={
+                "provider": identity["provider"],
+                "model": identity["model"],
+            },
+        )
+        provider_called = True
         observation = observe_image(
             config,
             image_mime=str(image.get("image_mime") or "image/jpeg"),
@@ -236,6 +296,23 @@ def observe_pinned_message(
         )
     except Exception as exc:  # noqa: BLE001 - stable public failure surface
         failure = classify_vision_error(exc)
+        debug_trace.trace_event(
+            store,
+            subsystem="vision",
+            type="vision.provider.completed",
+            actor="backend",
+            status="error",
+            summary=failure.error_code,
+            detail={
+                "stage": "provider_call" if provider_called else "provider_config",
+                "provider": identity["provider"],
+                "model": identity["model"],
+                "error_class": failure.error_code,
+                "status_code": failure.status_code,
+                "retryable": failure.retryable,
+            },
+            dur_ms=(time.monotonic() - started_at) * 1000,
+        )
         log.warning(
             "[vision.observer] provider call failed user=%s route=%s "
             "error=%s class=%s status=%s",
@@ -253,6 +330,19 @@ def observe_pinned_message(
             "retryable": failure.retryable,
             **identity,
         }, 502
+    debug_trace.trace_event(
+        store,
+        subsystem="vision",
+        type="vision.provider.completed",
+        actor="backend",
+        status="ok",
+        summary="provider_call_complete",
+        detail={
+            "provider": identity["provider"],
+            "model": identity["model"],
+        },
+        dur_ms=(time.monotonic() - started_at) * 1000,
+    )
     return {
         "message_id": message_id,
         "route_id": route_id,

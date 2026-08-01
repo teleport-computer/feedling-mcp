@@ -418,7 +418,11 @@ def _run_route_vision_test_or_error(
                     ],
                 ],
             }],
-            max_tokens=80,
+            # Thinking-capable relays may spend most of a small completion
+            # budget on hidden reasoning even when reasoning output is disabled.
+            # Use one model-agnostic budget so an empty/truncated visible answer
+            # is not manufactured by the probe itself.
+            max_tokens=2000,
             temperature=None,
             timeout=45.0,
             include_reasoning=False,
@@ -444,6 +448,24 @@ def _run_route_vision_test_or_error(
 
     reply = str(result.get("reply") or "").strip().lower()
     colors = re.findall(r"red|green|blue|yellow", reply)[:8]
+    if not colors:
+        # No visible answer is transient/indeterminate evidence, not proof that
+        # the model cannot inspect pixels. In particular, thinking SKUs can
+        # exhaust their visible-answer budget after successfully reading them.
+        error_code = "vision_model_empty_response"
+        if not _mark_route_vision_test(
+            store.user_id,
+            route["id"],
+            status="failed",
+            error=error_code,
+            expected_updated_at=expected_updated_at,
+        ):
+            return {"error": "model_api_route_write_failed"}, 500
+        return {
+            "error": error_code,
+            "detail": error_code,
+            "retryable": True,
+        }, 400
     observed = [",".join(colors[:4]), ",".join(colors[4:8])]
     if observed != expected:
         detail = "The model did not identify the visual test image correctly."
