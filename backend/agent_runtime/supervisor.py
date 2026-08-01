@@ -59,6 +59,7 @@ from core import runtime_token
 from core import wake_bus
 from core.store import get_store
 from agent_runtime import leases, spawners
+from agent_runtime.heartbeat_policy import SUPERVISOR_HEARTBEAT_MAX_AGE_SEC
 # One-shot introduction machinery is shared with chat.chat_core so BOTH the
 # supervisor recovery path AND the resident chat_loop_verified fast-path enqueue
 # through ONE atomic entry (no parallel field / second state machine).
@@ -1381,7 +1382,7 @@ def _runner_heartbeat_owner(cvm_id: str | None, *, hostname: str, pid: int) -> s
 
 def _heartbeat_loop(*, owner: str, host_all: bool, pi: bool,
                     interval: float, stop_event, instance_payload_fn=None,
-                    prune_max_age_sec: float | None = None) -> None:
+                    prune_max_age_sec: float = SUPERVISOR_HEARTBEAT_MAX_AGE_SEC) -> None:
     """Write the supervisor heartbeat on a fixed cadence from a dedicated thread,
     decoupled from the (potentially slow) discover→resolve→spawn loop.
 
@@ -1404,11 +1405,10 @@ def _heartbeat_loop(*, owner: str, host_all: bool, pi: bool,
                 db.set_supervisor_instance_heartbeat(owner, instance_payload_fn(ts))
             except Exception as e:  # noqa: BLE001
                 log.warning("supervisor instance heartbeat write failed: %s", e)
-            if prune_max_age_sec is not None:
-                try:
-                    db.prune_supervisor_instance_heartbeats(prune_max_age_sec)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("supervisor instance heartbeat prune failed: %s", e)
+            try:
+                db.prune_supervisor_instance_heartbeats(prune_max_age_sec)
+            except Exception as e:  # noqa: BLE001
+                log.warning("supervisor instance heartbeat prune failed: %s", e)
         try:
             db.set_supervisor_heartbeat(_supervisor_heartbeat_payload(
                 owner, host_all=host_all, pi=pi, ts=ts))
@@ -1580,16 +1580,14 @@ def main() -> int:
             max_children=sup.max_children, shard_index=0, shard_count=1,
             version=None, ts=ts)
 
+    # The heartbeat loop's shared 90s retention default removes legacy
+    # PID-keyed rows before the 300s deployment grace ends.
     threading.Thread(
         target=_heartbeat_loop, daemon=True,
         kwargs={"owner": heartbeat_owner, "host_all": host_all_active,
                 "pi": pi_enabled,
                 "interval": min(interval, 15.0),
-                "stop_event": hb_stop, "instance_payload_fn": _instance_payload,
-                # Drop rows from decommissioned CVMs. Normal restarts overwrite
-                # the stable CVM-keyed row; this handles removed inventory nodes.
-                "prune_max_age_sec": float(os.environ.get(
-                    "AGENT_SUPERVISOR_HEARTBEAT_PRUNE_SEC", "3600"))},
+                "stop_event": hb_stop, "instance_payload_fn": _instance_payload},
     ).start()
 
     # Lease renewal from its own thread, on the same cadence — decoupled from the

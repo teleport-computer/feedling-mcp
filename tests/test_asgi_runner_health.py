@@ -234,6 +234,70 @@ def test_actual_extra_runner_cvm_still_fails_strict_count():
     assert check["observed"] == 2
 
 
+def test_first_stable_heartbeat_prunes_legacy_pid_row_before_deploy_grace(monkeypatch):
+    """Migration regression: a real legacy owner must not survive deploy grace."""
+    now = 1000.0
+    rows_by_owner = {
+        # Written by the old release. This is deliberately not produced through
+        # the new stable-identity helper.
+        "runner-host:1234": {
+            "ts": 900.0,
+            "host_all": True,
+            "owner": "runner-host:1234",
+        },
+    }
+    prune_cutoffs = []
+    waits = []
+
+    class OneHeartbeat:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def wait(self, interval):
+            waits.append(interval)
+            self.stopped = True
+
+    monkeypatch.setattr(supervisor_mod.time, "time", lambda: now)
+    monkeypatch.setattr(
+        supervisor_mod.db,
+        "set_supervisor_instance_heartbeat",
+        lambda owner, payload: rows_by_owner.__setitem__(owner, payload),
+    )
+
+    def prune(max_age):
+        prune_cutoffs.append(max_age)
+        for owner, row in list(rows_by_owner.items()):
+            if now - row["ts"] > max_age:
+                del rows_by_owner[owner]
+
+    monkeypatch.setattr(
+        supervisor_mod.db, "prune_supervisor_instance_heartbeats", prune,
+    )
+    monkeypatch.setattr(supervisor_mod.db, "set_supervisor_heartbeat", lambda payload: None)
+
+    supervisor_mod._heartbeat_loop(
+        owner="cvm-prod-a",
+        host_all=True,
+        pi=True,
+        interval=15.0,
+        stop_event=OneHeartbeat(),
+        instance_payload_fn=lambda ts: {
+            "ts": ts,
+            "host_all": True,
+            "owner": "cvm-prod-a",
+        },
+    )
+
+    assert prune_cutoffs == [90.0]
+    assert prune_cutoffs[0] + waits[0] < 300.0
+    assert set(rows_by_owner) == {"cvm-prod-a"}
+    assert runner_health.evaluate_runner_fleet(
+        list(rows_by_owner.values()), expected=1, now=now, max_age=90.0,
+    )["status"] == "ok"
+
+
 def test_runner_fleet_result_does_not_expose_instance_identity_fields():
     check = runner_health.evaluate_runner_fleet(
         [{"ts": 995.0, "host_all": True, "owner": "runner-7", "host": "secret-host"}],

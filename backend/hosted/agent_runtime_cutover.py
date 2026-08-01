@@ -13,6 +13,7 @@ import time
 
 import db
 import provider_client
+from agent_runtime.heartbeat_policy import SUPERVISOR_HEARTBEAT_MAX_AGE_SEC
 
 log = logging.getLogger("feedling.hosted.agent_runtime_cutover")
 
@@ -113,17 +114,14 @@ def build_processing_response(user_row: dict, *, driver: str) -> tuple[dict, int
 # Wedge guard: how stale the supervisor heartbeat may be before the backend
 # treats hosting as down. Generous (≈6 ticks at the 15s default) so a brief
 # supervisor restart doesn't 503 sends. Env-overridable for slow deployments.
-_SUPERVISOR_HEARTBEAT_MAX_AGE_SEC = 90.0
-
-
 def supervisor_heartbeat_max_age() -> float:
     raw = os.environ.get("FEEDLING_SUPERVISOR_HEARTBEAT_MAX_AGE_SEC", "").strip()
     if not raw:
-        return _SUPERVISOR_HEARTBEAT_MAX_AGE_SEC
+        return SUPERVISOR_HEARTBEAT_MAX_AGE_SEC
     try:
         return float(raw)
     except (TypeError, ValueError):
-        return _SUPERVISOR_HEARTBEAT_MAX_AGE_SEC
+        return SUPERVISOR_HEARTBEAT_MAX_AGE_SEC
 
 
 def evaluate_supervisor_heartbeat(
