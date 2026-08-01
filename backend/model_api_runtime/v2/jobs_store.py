@@ -4521,6 +4521,106 @@ def recent_runtime_user_report(*, within_hours: int = 24) -> dict:
                 (safe_hours,),
             )
             rows = cur.fetchall()
+            cur.execute(
+                """
+                WITH cutoff AS (
+                  SELECT now() - make_interval(hours => %s) AS ts
+                )
+                SELECT
+                  e.user_id,
+                  count(*) FILTER (
+                    WHERE e.created_at >= cutoff.ts
+                      AND e.status IN ('applied', 'applied_with_results')
+                  )::int AS all_applied_in_window,
+                  count(*) FILTER (
+                    WHERE e.created_at >= cutoff.ts AND e.status = 'discarded'
+                  )::int AS all_discarded_in_window,
+                  count(*) FILTER (WHERE e.status = 'pending')::int AS all_pending,
+                  count(*) FILTER (
+                    WHERE e.status = 'needs_reconciliation'
+                  )::int AS all_needs_reconciliation,
+                  count(*) FILTER (
+                    WHERE e.created_at >= cutoff.ts
+                      AND e.effect_type IN ('reply', 'reply_final_fenced_v1')
+                      AND e.status IN ('applied', 'applied_with_results')
+                  )::int AS reply_applied_in_window,
+                  count(*) FILTER (
+                    WHERE e.effect_type IN ('reply', 'reply_final_fenced_v1')
+                      AND e.status = 'pending'
+                  )::int AS reply_pending,
+                  count(*) FILTER (
+                    WHERE e.effect_type IN ('reply', 'reply_final_fenced_v1')
+                      AND e.status = 'needs_reconciliation'
+                  )::int AS reply_needs_reconciliation,
+                  count(*) FILTER (
+                    WHERE e.created_at >= cutoff.ts AND e.effect_type = 'status'
+                      AND e.status IN ('applied', 'applied_with_results')
+                  )::int AS status_applied_in_window,
+                  count(*) FILTER (
+                    WHERE e.effect_type = 'status' AND e.status = 'pending'
+                  )::int AS status_pending,
+                  count(*) FILTER (
+                    WHERE e.effect_type = 'status'
+                      AND e.status = 'needs_reconciliation'
+                  )::int AS status_needs_reconciliation,
+                  extract(epoch FROM (
+                    clock_timestamp() - min(e.created_at) FILTER (
+                      WHERE e.status IN ('pending', 'needs_reconciliation')
+                    )
+                  )) AS oldest_unfinished_age_sec
+                FROM v2_effect_outbox e
+                CROSS JOIN cutoff
+                WHERE e.created_at >= cutoff.ts
+                   OR e.status IN ('pending', 'needs_reconciliation')
+                GROUP BY e.user_id
+                """,
+                (safe_hours,),
+            )
+            effect_rows = cur.fetchall()
+            cur.execute(
+                """
+                WITH cutoff AS (
+                  SELECT now() - make_interval(hours => %s) AS ts
+                )
+                SELECT
+                  f.user_id,
+                  count(*) FILTER (
+                    WHERE f.created_at >= cutoff.ts AND f.reply_delivered_at IS NOT NULL
+                  )::int AS reply_delivered_in_window,
+                  count(*) FILTER (
+                    WHERE f.reply_delivered_at IS NULL
+                  )::int AS reply_undelivered,
+                  count(*) FILTER (
+                    WHERE f.created_at >= cutoff.ts AND f.status_delivered_at IS NOT NULL
+                  )::int AS status_delivered_in_window,
+                  count(*) FILTER (
+                    WHERE f.status_delivered_at IS NULL
+                  )::int AS status_undelivered,
+                  count(*) FILTER (
+                    WHERE f.created_at >= cutoff.ts
+                      AND f.runtime_error_delivered_at IS NOT NULL
+                  )::int AS runtime_error_delivered_in_window,
+                  count(*) FILTER (
+                    WHERE f.runtime_error_delivered_at IS NULL
+                  )::int AS runtime_error_undelivered,
+                  extract(epoch FROM (
+                    clock_timestamp() - min(f.created_at) FILTER (
+                      WHERE f.reply_delivered_at IS NULL
+                         OR f.status_delivered_at IS NULL
+                         OR f.runtime_error_delivered_at IS NULL
+                    )
+                  )) AS oldest_unfinished_age_sec
+                FROM v2_terminal_failure_outbox f
+                CROSS JOIN cutoff
+                WHERE f.created_at >= cutoff.ts
+                   OR f.reply_delivered_at IS NULL
+                   OR f.status_delivered_at IS NULL
+                   OR f.runtime_error_delivered_at IS NULL
+                GROUP BY f.user_id
+                """,
+                (safe_hours,),
+            )
+            terminal_failure_rows = cur.fetchall()
 
     def _optional_int(row, key):
         value = row.get(key)
@@ -4564,6 +4664,28 @@ def recent_runtime_user_report(*, within_hours: int = 24) -> dict:
         )
 
     users: dict[str, dict] = {}
+
+    def _delivery_user(user_id: str) -> dict:
+        return users.setdefault(
+            user_id,
+            {
+                "user_id": user_id,
+                "known_total_tokens": None,
+                "model_calls": 0,
+                "models": [],
+                "delivery": _empty_user_delivery(),
+            },
+        )
+
+    def _set_oldest_unfinished_age(delivery: dict, age) -> None:
+        if age is None:
+            return
+        current = delivery["oldest_unfinished_age_sec"]
+        delivery["oldest_unfinished_age_sec"] = max(
+            current if current is not None else 0,
+            float(age),
+        )
+
     for row in rows:
         model_calls = int(row["model_calls"] or 0)
         usage_calls = int(row["usage_reported_calls"] or 0)
@@ -4584,16 +4706,7 @@ def recent_runtime_user_report(*, within_hours: int = 24) -> dict:
             else 0
         )
         user_id = str(row["user_id"])
-        user = users.setdefault(
-            user_id,
-            {
-                "user_id": user_id,
-                "known_total_tokens": None,
-                "model_calls": 0,
-                "models": [],
-                **_empty_user_delivery(),
-            },
-        )
+        user = _delivery_user(user_id)
         user["models"].append({
             "provider": str(row["provider"]),
             "model": str(row["model"]),
@@ -4627,6 +4740,58 @@ def recent_runtime_user_report(*, within_hours: int = 24) -> dict:
             user["known_total_tokens"] = (
                 (user["known_total_tokens"] or 0) + total_tokens
             )
+
+    for row in effect_rows:
+        user = _delivery_user(str(row["user_id"]))
+        delivery = user["delivery"]
+        delivery["reply_effects"] = {
+            "applied_in_window": int(row["reply_applied_in_window"] or 0),
+            "pending": int(row["reply_pending"] or 0),
+            "needs_reconciliation": int(
+                row["reply_needs_reconciliation"] or 0
+            ),
+        }
+        delivery["status_effects"] = {
+            "applied_in_window": int(row["status_applied_in_window"] or 0),
+            "pending": int(row["status_pending"] or 0),
+            "needs_reconciliation": int(
+                row["status_needs_reconciliation"] or 0
+            ),
+        }
+        delivery["all_effects"] = {
+            "applied_in_window": int(row["all_applied_in_window"] or 0),
+            "discarded_in_window": int(row["all_discarded_in_window"] or 0),
+            "pending": int(row["all_pending"] or 0),
+            "needs_reconciliation": int(
+                row["all_needs_reconciliation"] or 0
+            ),
+        }
+        _set_oldest_unfinished_age(
+            delivery, row["oldest_unfinished_age_sec"]
+        )
+
+    for row in terminal_failure_rows:
+        user = _delivery_user(str(row["user_id"]))
+        delivery = user["delivery"]
+        delivery["terminal_failure"] = {
+            "reply_delivered_in_window": int(
+                row["reply_delivered_in_window"] or 0
+            ),
+            "reply_undelivered": int(row["reply_undelivered"] or 0),
+            "status_delivered_in_window": int(
+                row["status_delivered_in_window"] or 0
+            ),
+            "status_undelivered": int(row["status_undelivered"] or 0),
+            "runtime_error_delivered_in_window": int(
+                row["runtime_error_delivered_in_window"] or 0
+            ),
+            "runtime_error_undelivered": int(
+                row["runtime_error_undelivered"] or 0
+            ),
+        }
+        _set_oldest_unfinished_age(
+            delivery, row["oldest_unfinished_age_sec"]
+        )
 
     users_list = list(users.values())
     for user in users_list:

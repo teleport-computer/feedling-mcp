@@ -597,6 +597,63 @@ def test_runtime_user_report_respects_window_and_orders_known_before_unknown():
     ]
 
 
+def test_runtime_user_report_separates_reply_status_and_all_effect_delivery():
+    seed_user("u_delivery")
+    with db.get_pool().connection() as conn:
+        rows = [
+            ("e_reply_applied", "reply", "applied", 0),
+            ("e_final_applied", "reply_final_fenced_v1", "applied", 0),
+            ("e_status_applied", "status", "applied", 0),
+            ("e_workspace_results", "workspace_batch_encrypted_v1",
+             "applied_with_results", 0),
+            ("e_discarded", "memory", "discarded", 0),
+            ("e_pending", "reply", "pending", 7200),
+            ("e_reconcile", "status", "needs_reconciliation", 60),
+        ]
+        for effect_id, effect_type, status, age_sec in rows:
+            conn.execute(
+                "INSERT INTO v2_effect_outbox "
+                "(effect_id,user_id,effect_type,expected_generation,payload,status,"
+                "created_at) VALUES (%s,%s,%s,1,'{}'::jsonb,%s,"
+                "clock_timestamp()-make_interval(secs => %s))",
+                (effect_id, "u_delivery", effect_type, status, age_sec),
+            )
+
+    user = jobs_store.recent_runtime_user_report()["users"][0]
+    delivery = user["delivery"]
+    assert delivery["reply_effects"] == {
+        "applied_in_window": 2, "pending": 1, "needs_reconciliation": 0,
+    }
+    assert delivery["status_effects"] == {
+        "applied_in_window": 1, "pending": 0, "needs_reconciliation": 1,
+    }
+    assert delivery["all_effects"] == {
+        "applied_in_window": 4,
+        "discarded_in_window": 1,
+        "pending": 1,
+        "needs_reconciliation": 1,
+    }
+    assert delivery["oldest_unfinished_age_sec"] == pytest.approx(7200, abs=5)
+
+
+def test_runtime_user_report_keeps_old_unfinished_but_windows_finished_effects():
+    seed_user("u_old_delivery")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_effect_outbox "
+            "(effect_id,user_id,effect_type,expected_generation,payload,status,created_at) "
+            "VALUES ('e_old_applied',%s,'reply',1,'{}','applied',now()-interval '48 hours'),"
+            "('e_old_pending',%s,'reply',1,'{}','pending',now()-interval '48 hours')",
+            ("u_old_delivery", "u_old_delivery"),
+        )
+
+    user = jobs_store.recent_runtime_user_report(within_hours=24)["users"][0]
+    assert user["known_total_tokens"] is None
+    assert user["models"] == []
+    assert user["delivery"]["reply_effects"]["applied_in_window"] == 0
+    assert user["delivery"]["reply_effects"]["pending"] == 1
+
+
 # ---------------------------------------------------------------------------
 # recent_delivery_health：端到端交付（job 判 completed ≠ 产物到达用户）
 # ---------------------------------------------------------------------------
@@ -617,6 +674,7 @@ def _add_pending_effect(user_id: str, effect_id: str, *, age_sec: int = 0) -> No
 def _add_failure_outbox_row(
     user_id: str,
     *,
+    reply_delivered: bool = True,
     status_delivered: bool,
     runtime_error_delivered: bool,
     age_sec: int = 0,
@@ -625,19 +683,60 @@ def _add_failure_outbox_row(
     with db.get_pool().connection() as conn:
         conn.execute(
             "INSERT INTO v2_terminal_failure_outbox "
-            "(job_id,user_id,error_code,created_at,status_delivered_at,"
-            " runtime_error_delivered_at) VALUES (%s,%s,'turn_failed:x',"
+            "(job_id,user_id,error_code,created_at,reply_delivered_at,"
+            " status_delivered_at,runtime_error_delivered_at) VALUES (%s,%s,'turn_failed:x',"
             " clock_timestamp()-make_interval(secs => %s),"
+            " CASE WHEN %s THEN clock_timestamp() END,"
             " CASE WHEN %s THEN clock_timestamp() END,"
             " CASE WHEN %s THEN clock_timestamp() END)",
             (
                 job_id,
                 user_id,
                 age_sec,
+                reply_delivered,
                 status_delivered,
                 runtime_error_delivered,
             ),
         )
+
+
+def test_runtime_user_report_tracks_three_failure_delivery_duties_independently():
+    _add_failure_outbox_row(
+        "u_failure_delivery",
+        reply_delivered=True,
+        status_delivered=True,
+        runtime_error_delivered=False,
+        age_sec=0,
+    )
+    _add_failure_outbox_row(
+        "u_failure_delivery",
+        reply_delivered=False,
+        status_delivered=True,
+        runtime_error_delivered=True,
+        age_sec=48 * 3600,
+    )
+    _add_failure_outbox_row(
+        "u_old_fully_delivered",
+        reply_delivered=True,
+        status_delivered=True,
+        runtime_error_delivered=True,
+        age_sec=48 * 3600,
+    )
+
+    users = {
+        row["user_id"]: row
+        for row in jobs_store.recent_runtime_user_report(within_hours=24)["users"]
+    }
+    failure = users["u_failure_delivery"]["delivery"]["terminal_failure"]
+    assert failure == {
+        "reply_delivered_in_window": 1,
+        "reply_undelivered": 1,
+        "status_delivered_in_window": 1,
+        "status_undelivered": 0,
+        "runtime_error_delivered_in_window": 0,
+        "runtime_error_undelivered": 1,
+    }
+    assert "u_old_fully_delivered" not in users
 
 
 def _add_mutation_attempt(
