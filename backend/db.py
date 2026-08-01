@@ -1383,7 +1383,7 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
     client tracking events. Agent replies, proactive writes, and synthetic
     verify pings are excluded so automated reply loops cannot inflate activity.
     """
-    day_limit = max(1, min(int(days or 30), 366))
+    day_limit = max(1, min(int(days or 30), 1000))
     since = float(since_epoch or 0.0)
     try:
         with get_pool().connection() as conn:
@@ -1951,7 +1951,7 @@ def admin_data_track_growth(*, days: int = 60, tz: str = "Asia/Shanghai") -> lis
     Cumulative is a running sum over the FULL series so the returned tail carries
     a correct total; only the last ``days`` rows are returned for display.
     """
-    day_limit = max(1, min(int(days or 60), 366))
+    day_limit = max(1, min(int(days or 60), 1000))
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
@@ -2172,6 +2172,98 @@ def admin_data_track_retention(*, tz: str = "Asia/Shanghai") -> dict:
         return {"cohorts": [], "max_period": 0}
 
 
+_RETENTION_DAY_OFFSETS = (1, 3, 7, 14, 30)
+
+
+def admin_data_track_retention_daily(
+    *, tz: str = "Asia/Shanghai", since_day: str = "",
+) -> dict:
+    """Classic day-N cohort retention. Cohort = signup Beijing day; D_N = share
+    of that cohort active exactly N days later (activity = a user chat message
+    or a tracking event — identical to the DAU definition). Only cohorts whose
+    signup day is on/after ``since_day`` (the freeze boundary) are returned:
+    pre-freeze days are unreliable because deleted accounts retroactively shrink
+    them, so per the product decision they are excluded entirely.
+
+    Read live. A cell is ``None`` (rendered "—") when the cohort has not yet had
+    N full days to come back (cohort_day + N > today), so an immature cohort is
+    never shown as 0% retention.
+
+    Returns {offsets, cohorts:[{cohort, size, cells:{N: pct|None}}], since_day}.
+    """
+    offsets = list(_RETENTION_DAY_OFFSETS)
+    floor_day = since_day or "1970-01-01"
+    try:
+        zone = ZoneInfo(tz)
+    except Exception:
+        zone = ZoneInfo("Asia/Shanghai")
+    today = datetime.now(zone).date()
+    try:
+        with get_pool().connection() as conn:
+            size_rows = conn.execute(
+                f"""
+                SELECT to_char((timezone(%s, created_at::timestamptz))::date,
+                               'YYYY-MM-DD') AS cohort,
+                       COUNT(*)::int AS size
+                FROM users
+                WHERE {_CREATED_AT_ISO}
+                  AND (timezone(%s, created_at::timestamptz))::date >= %s::date
+                GROUP BY cohort
+                """,
+                (tz, tz, floor_day),
+            ).fetchall()
+            cell_rows = conn.execute(
+                f"""
+                WITH reg AS (
+                    SELECT user_id,
+                           (timezone(%s, created_at::timestamptz))::date AS cohort_day
+                    FROM users
+                    WHERE {_CREATED_AT_ISO}
+                      AND (timezone(%s, created_at::timestamptz))::date >= %s::date
+                ),
+                act AS (
+                    SELECT DISTINCT r.user_id, r.cohort_day,
+                           (timezone(%s, to_timestamp(a.ts)))::date AS act_day
+                    FROM reg r
+                    JOIN (
+                        SELECT user_id, ts FROM chat_messages
+                          WHERE doc->>'role' = 'user'
+                            AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
+                        UNION ALL
+                        SELECT user_id, ts FROM user_logs
+                          WHERE stream = 'tracking_events' AND ts IS NOT NULL
+                    ) a ON a.user_id = r.user_id
+                )
+                SELECT to_char(cohort_day, 'YYYY-MM-DD') AS cohort,
+                       (act_day - cohort_day)::int AS day_offset,
+                       COUNT(DISTINCT user_id)::int AS active
+                FROM act
+                WHERE (act_day - cohort_day) = ANY(%s)
+                GROUP BY cohort_day, day_offset
+                """,
+                (tz, tz, floor_day, tz, offsets),
+            ).fetchall()
+        sizes = {r[0]: int(r[1] or 0) for r in size_rows}
+        active = {(r[0], int(r[1])): int(r[2] or 0) for r in cell_rows}
+        cohorts = []
+        for cohort in sorted(sizes, reverse=True):
+            size = sizes[cohort]
+            cohort_date = date.fromisoformat(cohort)
+            cells: dict[int, float | None] = {}
+            for n in offsets:
+                if cohort_date + timedelta(days=n) > today:
+                    cells[n] = None
+                elif size:
+                    cells[n] = round(100.0 * active.get((cohort, n), 0) / size, 1)
+                else:
+                    cells[n] = 0.0
+            cohorts.append({"cohort": cohort, "size": size, "cells": cells})
+        return {"offsets": offsets, "cohorts": cohorts, "since_day": since_day}
+    except Exception as e:
+        log.error("[db] admin_data_track_retention_daily failed: %s", e)
+        return {"offsets": offsets, "cohorts": [], "since_day": since_day}
+
+
 def freeze_completed_retention_cohorts(*, now_epoch: float | None = None,
                                        tz: str = "Asia/Shanghai") -> list[str]:
     """Freeze (cohort_week, period) cells whose week has fully ended.
@@ -2248,7 +2340,7 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
     消息——sleep/纯动作）算成功：口径衡量「系统是否健康」，不是「醒了的里面
     有多少真正送达」。成功率由调用方算
     （(delivered+completed) / (delivered+completed+failed)）。"""
-    day_limit = max(1, min(int(days or 30), 366))
+    day_limit = max(1, min(int(days or 30), 1000))
     since = float(since_epoch or 0.0)
     screen_kinds = "('screen_watch','scene_change','screen_tick','broadcast_opened','heartbeat_broadcast_on')"
     maintenance_kinds = "('memory_capture','memory_dream','memory_migrate')"
@@ -2321,7 +2413,7 @@ def admin_data_track_proactive_kinds(*, since_epoch: float = 0.0, days: int = 30
     trigger → 'unknown')。全量分桶而不是猜枚举——现网出现过什么 kind 就报什么,
     新增唤醒源(解锁/到达/照片/scheduled…)自动出现,不需要每次改 SQL。
     2026-07 心跳暴增排查花了半天才发现分类盲区,这个函数就是那次的教训。"""
-    day_limit = max(1, min(int(days or 30), 366))
+    day_limit = max(1, min(int(days or 30), 1000))
     since = float(since_epoch or 0.0)
     try:
         with get_pool().connection() as conn:
@@ -2451,7 +2543,7 @@ def admin_v2_heartbeat_daily(*, since_epoch: float = 0.0, days: int = 30,
     对齐 jobs_store.wake_success_stats:completed=成功(含醒了决定不发声),
     failed/expired=失败侧;这里按天分桶供日报并列展示。blocked 的 wake 不落
     行,所以 jobs=当天 admitted 总量。"""
-    day_limit = max(1, min(int(days or 30), 366))
+    day_limit = max(1, min(int(days or 30), 1000))
     since = float(since_epoch or 0.0)
     try:
         with get_pool().connection() as conn:

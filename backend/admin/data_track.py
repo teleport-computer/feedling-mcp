@@ -1565,7 +1565,7 @@ def _data_track_request_filters() -> dict:
         "limit": read_int("limit", 100, 1, 500),
         "offset": read_int("offset", 0, 0, 1_000_000),
         "view": raw_view,
-        "days": read_int("days", 30, 1, 366),
+        "days": read_int("days", 30, 1, 1000),
     }
 
 
@@ -3517,7 +3517,15 @@ def _data_track_growth_payload() -> dict:
     filters = _data_track_request_filters()
     days = int(filters.get("days") or 60)
     growth = db.admin_data_track_growth(days=days, tz="Asia/Shanghai")
-    retention = db.admin_data_track_retention(tz="Asia/Shanghai")
+    # Retention now uses classic day-N cohorts, restricted to signup days on/after
+    # the freeze boundary (dau snapshot first_day). Pre-freeze days are excluded
+    # entirely per the product decision — their live recompute drifts as accounts
+    # delete, so they were never trustworthy for retention/growth.
+    dau_bounds = db.admin_dau_snapshot_bounds()
+    freeze_day = str(dau_bounds.get("first_day") or "")
+    retention = db.admin_data_track_retention_daily(
+        tz="Asia/Shanghai", since_day=freeze_day
+    )
     g_bounds = db.admin_growth_snapshot_bounds()
     latest = growth[-1] if growth else {}
     summary = {
@@ -3529,6 +3537,7 @@ def _data_track_growth_payload() -> dict:
         "latest_new": int(latest.get("new_users") or 0),
         "snapshot_first_day": g_bounds.get("first_day", ""),
         "snapshot_days": int(g_bounds.get("days") or 0),
+        "freeze_day": freeze_day,
         "cohort_count": len(retention.get("cohorts") or []),
     }
     return {
@@ -3594,26 +3603,26 @@ def _render_data_track_growth_page(payload: dict) -> str:
             "</tr>"
         )
 
-    cohorts = retention.get("cohorts", [])
-    max_period = int(retention.get("max_period") or 0)
-    head_cells = "".join(f"<th>W{p}</th>" for p in range(max_period + 1))
+    ret_offsets = retention.get("offsets", [1, 3, 7, 14, 30])
+    cohorts = retention.get("cohorts", [])  # already sorted newest-first by DB fn
+    head_cells = "".join(f"<th>D{n}</th>" for n in ret_offsets)
     ret_rows = []
-    for c in sorted(cohorts, key=lambda x: x["cohort_week"], reverse=True):
+    for c in cohorts:
         cells_html = []
-        for p in range(max_period + 1):
-            cell = c["cells"].get(p)
-            if cell is None:
-                cells_html.append("<td class='muted'></td>")
-                continue
-            mark = "" if cell["frozen"] else "*"
-            cells_html.append(
-                f"<td style='{_retention_cell_bg(cell['pct'])}'>"
-                f"{cell['pct']:.0f}%<br><span class='muted'>{cell['active']}{mark}</span></td>"
-            )
+        for n in ret_offsets:
+            pct = c["cells"].get(n)
+            if pct is None:
+                # cohort_day + N is still in the future → not enough time to
+                # judge; render "—" instead of a misleading 0%.
+                cells_html.append("<td class='muted'>—</td>")
+            else:
+                cells_html.append(
+                    f"<td style='{_retention_cell_bg(pct)}'>{pct:.0f}%</td>"
+                )
         ret_rows.append(
             "<tr>"
-            f"<td><b>{html.escape(c['cohort_week'])}</b></td>"
-            f"<td>{int(c['cohort_size'])}</td>"
+            f"<td><b>{html.escape(str(c['cohort']))}</b></td>"
+            f"<td>{int(c['size'])}</td>"
             + "".join(cells_html)
             + "</tr>"
         )
@@ -3624,9 +3633,9 @@ def _render_data_track_growth_page(payload: dict) -> str:
         _render_metric("cohort 数", summary["cohort_count"]),
         _render_metric("已冻结天数", summary["snapshot_days"]),
     ])
-    snap_first = html.escape(str(summary.get("snapshot_first_day") or ""))
-    boundary = (f"首个冻结日 <b>{snap_first}</b> 起,新增/留存不再随删号变化;之前的历史仍实时重算、会随删号偏少,仅供参考。"
-                if snap_first else "每日快照即将生效;生效后完成日的新增/留存会冻结、不再随删号变化。")
+    _freeze = html.escape(str(summary.get("freeze_day") or ""))
+    boundary = (f"留存只统计<b>冻结边界 {_freeze} 起</b>注册的 cohort;此日之前的历史实时重算、会随删号偏少不准,已按产品决策<b>整体排除</b>,不进本页。"
+                if _freeze else "每日快照尚未生效;生效后本页只统计冻结边界起注册的 cohort。")
     return f"""<!doctype html>
 <html>
 <head>
@@ -3644,7 +3653,7 @@ def _render_data_track_growth_page(payload: dict) -> str:
   <div class="muted" style="background:#fff8ef;border:1px solid #e8d8be;border-radius:8px;padding:12px 14px;margin:10px 0;line-height:1.7">
     <b>⚠️ 口径与已知偏差</b><br>
     {boundary}<br>
-    留存为<b>周 cohort</b>(北京周,行=注册周,列 W0=注册周自身…Wk=第 k 周);格子=该周仍活跃占比,小字=活跃人数(<b>*</b>=当前进行中的实时周,未冻结)。cohort_size 分母在首次冻结时钉死,删号不会缩小分母假抬留存。<br>
+    留存为<b>日 cohort · 经典 Day-N</b>(行=注册北京日,列 D_N=注册后第 N 天仍活跃的占比;D0=100% 定义上省略);<b>—</b>=该 cohort 距今不足 N 天、还判不了,不算 0。分母=当天注册人数。<br>
     <b>用户基数极小</b> → 曲线抖动大,当方向性参考,非统计显著。<b>③ 完全自部署</b>用户不在此表(不在我们后端注册)。"活跃"=当天有用户消息或 app tracking 事件,口径同 DAU。
   </div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
@@ -3653,10 +3662,10 @@ def _render_data_track_growth_page(payload: dict) -> str:
     <thead><tr><th>Beijing day</th><th>状态</th><th>新增</th><th>累计</th></tr></thead>
     <tbody>{''.join(growth_rows) if growth_rows else "<tr><td colspan='4' class='muted'>暂无注册数据</td></tr>"}</tbody>
   </table>
-  <h2>周 cohort 留存</h2>
+  <h2>日 cohort 留存 · Day-N（{_freeze} 起）</h2>
   <table>
-    <thead><tr><th>注册周</th><th>人数</th>{head_cells}</tr></thead>
-    <tbody>{''.join(ret_rows) if ret_rows else f"<tr><td colspan='{max_period + 3}' class='muted'>暂无 cohort 数据</td></tr>"}</tbody>
+    <thead><tr><th>注册日</th><th>新增数</th>{head_cells}</tr></thead>
+    <tbody>{''.join(ret_rows) if ret_rows else f"<tr><td colspan='{len(ret_offsets) + 2}' class='muted'>暂无冻结后 cohort 数据</td></tr>"}</tbody>
   </table>
 </main>
 </body>
