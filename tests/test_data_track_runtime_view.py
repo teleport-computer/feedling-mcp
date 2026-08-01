@@ -1133,6 +1133,17 @@ def test_runtime_user_delivery_level_uses_reconciliation_and_age_thresholds():
         "all_effects": {"needs_reconciliation": 0},
         "oldest_unfinished_age_sec": 30,
     }) == "ok"
+    # Fresh volume is not a delivery failure: an active worker can safely
+    # drain hundreds of effects.  This catches a regression that mistakenly
+    # degrades solely from the current pending count.
+    assert _dt._runtime_user_delivery_level({
+        "all_effects": {"pending": 999, "needs_reconciliation": 0},
+        "oldest_unfinished_age_sec": 30,
+    }) == "ok"
+    assert _dt._runtime_user_delivery_level({
+        "all_effects": {"pending": 999, "needs_reconciliation": 0},
+        "oldest_unfinished_age_sec": None,
+    }) == "ok"
 
 
 def test_render_runtime_health_page_shows_user_model_and_delivery_report(bound_request):
@@ -1148,6 +1159,9 @@ def test_render_runtime_health_page_shows_user_model_and_delivery_report(bound_r
     assert "Reply effects" in html_out
     assert "Failure reply/status/error" in html_out
     assert "needs_reconciliation" in html_out
+    assert "usr_delivery_only" in html_out
+    assert "<span class='pill bad'>异常</span>" in html_out
+    assert "needs_reconciliation 1" in html_out
     assert "hosted Runtime V2" in html_out
     assert "历史每回合路由事实" in html_out
     assert "ok 不代表客户端已读" in html_out
@@ -1159,15 +1173,37 @@ def test_render_runtime_health_page_shows_user_model_and_delivery_report(bound_r
 def test_render_runtime_user_report_preserves_unknowns_and_escapes(bound_request):
     report = _user_report()
     report["users"][0]["user_id"] = "usr_<unsafe>"
+    report["users"][0]["models"][0]["provider"] = "<unsafe-provider>"
     report["users"][0]["models"][0]["model"] = "<script>bad</script>"
+    report["users"][0]["models"][0]["route"] = 'route"&<unsafe>'
+    report["users"][0]["models"][0]["lanes"] = ["<unsafe-lane>"]
     report["users"][0]["models"][0]["prompt_tokens"] = None
     html_out = _dt._render_runtime_health_page(
         _payload(), _tokens(), _delivery(), report
     )
     assert "<script>bad</script>" not in html_out
     assert "&lt;script&gt;bad&lt;/script&gt;" in html_out
+    assert "<unsafe-provider>" not in html_out
+    assert "&lt;unsafe-provider&gt;" in html_out
+    assert 'route"&<unsafe>' not in html_out
+    assert "route&quot;&amp;&lt;unsafe&gt;" in html_out
+    assert "<unsafe-lane>" not in html_out
+    assert "&lt;unsafe-lane&gt;" in html_out
     assert "usr_%3Cunsafe%3E" in html_out
     assert "—" in html_out
+
+
+def test_render_runtime_user_report_links_keep_current_admin_query_string():
+    # The model and delivery tables link a user row back to Admin detail
+    # without dropping the analyst's current runtime filters.
+    with _admin_core.bind("q=needle&view=runtime&hours=168"):
+        html_out = _dt._render_runtime_health_page(
+            _payload(), _tokens(), _delivery(), _user_report()
+        )
+    assert (
+        "href='/admin/data-track/users/usr_report_a?"
+        "q=needle&amp;view=runtime&amp;hours=168'"
+    ) in html_out
 
 
 def test_render_runtime_health_page_user_report_unavailable_is_local(bound_request):
