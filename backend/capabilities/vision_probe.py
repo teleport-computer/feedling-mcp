@@ -9,10 +9,14 @@ import zlib
 
 
 _COLORS = {
-    "red": (224, 67, 54),
-    "green": (52, 168, 83),
-    "blue": (66, 133, 244),
-    "yellow": (251, 188, 4),
+    "red": (235, 35, 35),
+    "green": (20, 180, 65),
+    "blue": (25, 90, 235),
+    "yellow": (250, 210, 10),
+    "orange": (245, 120, 15),
+    "purple": (145, 60, 210),
+    "pink": (240, 70, 155),
+    "black": (20, 20, 20),
 }
 
 
@@ -22,15 +26,15 @@ def _png_chunk(kind: bytes, data: bytes) -> bytes:
 
 
 def generate_image() -> tuple[str, str]:
-    """Return one random four-stripe PNG and its unpredictable answer."""
-    names = list(_COLORS)
-    random.SystemRandom().shuffle(names)
+    """Return one small four-stripe PNG sampled from a larger color pool."""
+    names = random.SystemRandom().sample(list(_COLORS), 4)
     width, height = 96, 24
+    stripe_width = width // len(names)
     scanlines = bytearray()
     for _ in range(height):
         scanlines.append(0)
         for x in range(width):
-            scanlines.extend(_COLORS[names[min(x // 24, 3)]])
+            scanlines.extend(_COLORS[names[min(x // stripe_width, 3)]])
     png = b"\x89PNG\r\n\x1a\n"
     png += _png_chunk(
         b"IHDR",
@@ -39,6 +43,11 @@ def generate_image() -> tuple[str, str]:
     png += _png_chunk(b"IDAT", zlib.compress(bytes(scanlines), 9))
     png += _png_chunk(b"IEND", b"")
     return base64.b64encode(png).decode("ascii"), ",".join(names)
+
+
+def color_names() -> frozenset[str]:
+    """Return the complete answer vocabulary used by visual controls."""
+    return frozenset(_COLORS)
 
 
 def generate_images() -> tuple[list[dict[str, str]], list[str]]:
