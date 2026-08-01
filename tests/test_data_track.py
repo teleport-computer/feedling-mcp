@@ -1247,6 +1247,30 @@ def test_perception_permissions_block_renders_granted_denied_and_switches():
     assert _dt._render_perception_permissions({}) == ""
 
 
+def test_perception_freshness_renders_separate_content_free_app_event_feeds():
+    out = _dt._render_perception_freshness({
+        "perception_freshness": {
+            "fields": [{
+                "field": "app_state",
+                "capability": "app",
+                "reported": True,
+                "fresh": True,
+                "last_report_ts": 1700000000.0,
+                "age_sec": 5,
+                "ttl_sec": 900,
+            }],
+            "recent_app_open_ts": 1700000001.0,
+            "recent_app_open_age_sec": 4,
+            "recent_app_close_ts": 1700000002.0,
+            "recent_app_close_age_sec": 3,
+        }
+    })
+
+    assert "最近 app_open 上报" in out
+    assert "最近 app_close 上报" in out
+    assert "private-app-name" not in out
+
+
 def test_detail_payload_exposes_permission_metadata_without_private_directive(client):
     user_id, _api_key = _register(client)
     store = core_store.get_store(user_id)

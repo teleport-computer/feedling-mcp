@@ -625,18 +625,21 @@ change must not be interpreted as an API guarantee.
   claimed-but-unreadable messages (two by default, configurable with
   `FEEDLING_DECRYPT_DEGRADE_AFTER`). A real ordinary user-message decrypt resets
   the streak; a server-generated maintenance turn does not count as recovery.
-- New `GET /v1/agent/perception/recent_apps` returns recent app-open history
-  (`app`, `category`, `ts`, `minutes_ago`), newest first, with optional `limit`
-  (1–100, default 20) and `hours` query parameters. It reads the same app-open
-  history written by `GET /v1/perception/app_open`; no new storage. It is gated
-  by the same `app` capability as the current-app snapshot fields — when the
-  user has disabled that capability the response is
+- `GET /v1/agent/perception/recent_apps` now returns a merged app open/close
+  trajectory (`app`, `category`, `ts`, `event`, `minutes_ago`), newest first,
+  with optional `limit` (1–100, default 20) and `hours` query parameters. It
+  reads the existing streams written by `GET /v1/perception/app_open` and
+  `GET /v1/perception/app_close`; no new storage. Regular and pull snapshots
+  now include the same event shape as `recent_app_events` for the app signal's
+  15-minute freshness window. The endpoint remains gated by the same `app`
+  capability as the current-app snapshot fields — when the user has disabled
+  that capability the response is
   `{"ok": true, "disabled": true, "reason": ...}` with an empty `apps` list,
   which is distinguishable from a genuine empty history.
 - The `app_name` / `app_category` snapshot fields now expire 15 minutes after
-  the reported open instead of 5 minutes. Because the shortcut reports opens and
-  never closes, these fields mean "last open observed within the window", not
-  "currently on screen".
+  the reported open or matching close instead of 5 minutes. These fields mean
+  "last app event observed within the window", not "currently on screen";
+  inspect `app_state` to distinguish a foreground app from a matching close.
 - `POST /v1/content/rewrap-to-current-key` now also normalizes the **identity
   card plaintext** while rewrapping: dimension values are coerced onto the
   documented 0–100 integer contract (0–1-scale floats such as `0.95` rescale to

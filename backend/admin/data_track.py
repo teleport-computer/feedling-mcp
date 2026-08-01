@@ -4727,13 +4727,19 @@ def _render_perception_freshness(user: dict) -> str:
             f"<td>{last}</td><td>{age}</td><td>{ttl_txt}</td><td>{status}</td>"
             "</tr>"
         )
-    app_ts = pf.get("recent_app_open_ts")
-    app_line = (
-        f"<div class='ppmuted' style='margin-top:6px'>最近 app_open 上报：{_fmt_ts(app_ts)}"
-        f"（{_fmt_duration_sec(pf.get('recent_app_open_age_sec'))} 前）</div>"
-        if app_ts else
-        "<div class='ppmuted' style='margin-top:6px'>最近 app_open 上报：无（iOS 快捷指令可能已停）</div>"
-    )
+    def _app_event_line(event: str) -> str:
+        ts = pf.get(f"recent_app_{event}_ts")
+        if ts:
+            return (
+                f"<div class='ppmuted' style='margin-top:6px'>最近 app_{event} 上报：{_fmt_ts(ts)}"
+                f"（{_fmt_duration_sec(pf.get(f'recent_app_{event}_age_sec'))} 前）</div>"
+            )
+        return (
+            f"<div class='ppmuted' style='margin-top:6px'>最近 app_{event} 上报："
+            "无（iOS 快捷指令可能已停）</div>"
+        )
+
+    app_lines = _app_event_line("open") + _app_event_line("close")
     return (
         "<h2 style='font-size:15px;margin:22px 0 6px'>感知上报新鲜度</h2>"
         "<div class='ppmuted' style='font-size:12px;margin-bottom:6px'>"
@@ -4743,7 +4749,7 @@ def _render_perception_freshness(user: dict) -> str:
         f"<b style='color:#a05a00'>{stale_n} 过期</b> · {never_n} 从未上报。</div>"
         "<table style='font-size:12px'><thead><tr>"
         "<th>字段</th><th>能力</th><th>最后上报</th><th>距今</th><th>TTL</th><th>状态</th>"
-        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>" + app_line
+        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table>" + app_lines
     )
 
 

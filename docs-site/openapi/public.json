@@ -637,7 +637,7 @@
             "name": "limit",
             "in": "query",
             "required": false,
-            "description": "Maximum app-open events to return.",
+            "description": "Maximum merged app open/close events to return.",
             "schema": {
               "type": "integer",
               "minimum": 1,
@@ -650,7 +650,7 @@
             "name": "hours",
             "in": "query",
             "required": false,
-            "description": "Only include opens within the last N hours.",
+            "description": "Only include app events within the last N hours.",
             "schema": {
               "type": "number",
               "exclusiveMinimum": 0

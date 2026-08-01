@@ -44,17 +44,18 @@ Word document?” is not itself a request to create one.
 - Slow: `steps`, `sleep`, `workout`, `vitals`, `activity`, `body`, `metabolic`,
   `cycle`, `mood`, `reminders`
 - Extra: `focus` (is the user in a focus mode), `audio_route` (headphones/car),
-  `app` (the last app-open seen in the past 15 minutes — null otherwise)
+  `app` (the last app open/close event seen in the past 15 minutes — null otherwise)
 
 ### Apps: `app` vs `perception-recent-apps`
 
-The Shortcut reports app **opens** and never closes. So `app` means "the last
-app I saw them open, within 15 minutes" — NOT "this is on their screen now".
-Phrase it that way; don't assert they are currently using it.
+The two Shortcut automations report app **opens** and **closes** independently.
+So `app` means "the last app event I saw, within 15 minutes" — NOT "this is on
+their screen now". Phrase it that way; don't assert current usage. A missing
+close only means that close automation did not report one.
 
 When the user asks what they've *been* doing or using ("我刚在干嘛", "最近用了
-什么 app"), call `perception-recent-apps` — app-open history, newest first, each
-with `minutes_ago` and `category`. **Always check `minutes_ago` before calling
+什么 app"), call `perception-recent-apps` — the merged app open/close trajectory,
+newest first, each with `event`, `minutes_ago`, and `category`. **Always check `minutes_ago` before calling
 something "刚才"** — the list is not time-bounded by default, so the oldest
 entries can be days old.
 
