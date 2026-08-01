@@ -1143,6 +1143,11 @@ jobs:
             echo "::error::DATABASE_URL secret is not set — backend has no datastore to connect to"
             exit 1
           fi
+          FEEDLING_EXPECTED_RUNNER_COUNT=$(grep -vE '^[[:space:]]*(#|$)' deploy/prod-runner-cvm-ids.txt | wc -l | tr -d ' ')
+          if [ "$FEEDLING_EXPECTED_RUNNER_COUNT" -lt 1 ]; then
+            echo "::error::expected at least one production runner CVM"
+            exit 1
+          fi
           phala deploy \
             --api-token "$PHALA_CLOUD_API_KEY" \
             --cvm-id "$CVM_ID" \
@@ -1163,6 +1168,7 @@ jobs:
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
+            -e "FEEDLING_EXPECTED_RUNNER_COUNT=$FEEDLING_EXPECTED_RUNNER_COUNT" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
