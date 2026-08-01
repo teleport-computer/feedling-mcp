@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import asgi_app  # noqa: E402
 import db  # noqa: E402
 from asgi import runner_health  # noqa: E402
+from agent_runtime import supervisor as supervisor_mod  # noqa: E402
 from hosted import agent_runtime_cutover  # noqa: E402
 
 
@@ -180,6 +181,57 @@ def test_runner_fleet_malformed_or_absent_timestamp_is_observed_but_not_healthy(
         "status": "down", "reason": "runner_count_mismatch", "expected": 1,
         "healthy": 0, "observed": 1, "max_age_seconds": 90.0,
     }
+
+
+def test_runner_fleet_rejects_heartbeat_beyond_explicit_future_skew():
+    """A clock-corrupt future row must not satisfy the strict fleet check."""
+    assert runner_health.evaluate_runner_fleet(
+        [
+            {"ts": 999.0, "host_all": True},
+            {"ts": 1006.0, "host_all": True},
+        ],
+        expected=2,
+        now=1000.0,
+        max_age=90.0,
+    ) == {
+        "status": "down", "reason": "runner_count_mismatch", "expected": 2,
+        "healthy": 1, "observed": 2, "max_age_seconds": 90.0,
+    }
+
+
+def test_runner_restart_replaces_heartbeat_for_same_cvm_without_false_503():
+    """Stable CVM identity makes a restarted process replace its predecessor row."""
+    old_owner = supervisor_mod._runner_heartbeat_owner(
+        " cvm-prod-a ", hostname="container-old", pid=101,
+    )
+    new_owner = supervisor_mod._runner_heartbeat_owner(
+        "cvm-prod-a", hostname="container-new", pid=202,
+    )
+    rows_by_owner = {}
+    rows_by_owner[old_owner] = {"ts": 900.0, "host_all": True, "owner": old_owner}
+    rows_by_owner[new_owner] = {"ts": 995.0, "host_all": True, "owner": new_owner}
+
+    assert old_owner == new_owner == "cvm-prod-a"
+    assert runner_health.evaluate_runner_fleet(
+        list(rows_by_owner.values()), expected=1, now=1000.0, max_age=90.0,
+    )["status"] == "ok"
+
+
+def test_actual_extra_runner_cvm_still_fails_strict_count():
+    owners = [
+        supervisor_mod._runner_heartbeat_owner(cvm_id, hostname="same", pid=1)
+        for cvm_id in ("cvm-prod-a", "cvm-prod-b")
+    ]
+    check = runner_health.evaluate_runner_fleet(
+        [{"ts": 995.0, "host_all": True, "owner": owner} for owner in owners],
+        expected=1,
+        now=1000.0,
+        max_age=90.0,
+    )
+
+    assert owners == ["cvm-prod-a", "cvm-prod-b"]
+    assert check["status"] == "down"
+    assert check["observed"] == 2
 
 
 def test_runner_fleet_result_does_not_expose_instance_identity_fields():

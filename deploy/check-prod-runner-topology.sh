@@ -43,9 +43,8 @@ fi
 # Unconditional, regardless of $enabled: deploying the runner-only compose to
 # the main CVM would destroy the API/enclave release unit no matter whether
 # the redundancy preflight below is active.
-if grep -vE '^[[:space:]]*(#|$)' "$ids_file" \
-  | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
-  | grep -Fxq "$main_id"; then
+script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+if "$script_dir/list-prod-runner-cvm-ids.sh" "$ids_file" | grep -Fxq "$main_id"; then
   echo "::error::production main CVM $main_id must never appear in the runner inventory"
   echo "::error::deploying runner-only compose to the main CVM would destroy the API/enclave release unit"
   exit 1
@@ -59,10 +58,7 @@ fi
 # Blank lines and comments are documentation, not runners. Duplicate IDs are
 # one failure domain and therefore count once.
 count=$(
-  grep -vE '^[[:space:]]*(#|$)' "$ids_file" \
-    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
-    | grep . \
-    | sort -u \
+  "$script_dir/list-prod-runner-cvm-ids.sh" "$ids_file" \
     | wc -l \
     | tr -d '[:space:]' \
     || true

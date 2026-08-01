@@ -133,6 +133,7 @@ def test_prod_inventory_and_fleet_gates_trigger_the_shared_preflight():
     for path in (
         "deploy/prod-cvm-id.txt",
         "deploy/prod-runner-cvm-ids.txt",
+        "deploy/list-prod-runner-cvm-ids.sh",
         "deploy/check-prod-runner-topology.sh",
         "deploy/check-v2-runner-fleet.py",
     ):

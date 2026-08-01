@@ -1364,6 +1364,21 @@ def _supervisor_instance_payload(owner: str, *, host: str | None, host_all: bool
             "version": version}
 
 
+def _runner_heartbeat_owner(cvm_id: str | None, *, hostname: str, pid: int) -> str:
+    """Return the stable fleet identity used only for the heartbeat row.
+
+    Production injects the inventory CVM ID, so restarting a container/process
+    overwrites that CVM's existing row instead of leaving a ``hostname:pid``
+    ghost until the one-hour housekeeping prune. The process-specific fallback
+    preserves local/dev behavior when no deployment identity is available.
+
+    Lease ownership and runtime-token identity intentionally continue to use the
+    process-specific owner; only fleet liveness is keyed by the stable CVM.
+    """
+    stable_cvm_id = str(cvm_id or "").strip()
+    return stable_cvm_id or f"{hostname}:{pid}"
+
+
 def _heartbeat_loop(*, owner: str, host_all: bool, pi: bool,
                     interval: float, stop_event, instance_payload_fn=None,
                     prune_max_age_sec: float | None = None) -> None:
@@ -1425,7 +1440,12 @@ def main() -> int:
         level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    owner = f"{socket.gethostname()}:{os.getpid()}"
+    hostname = socket.gethostname()
+    pid = os.getpid()
+    owner = f"{hostname}:{pid}"
+    heartbeat_owner = _runner_heartbeat_owner(
+        os.environ.get("FEEDLING_RUNNER_CVM_ID"), hostname=hostname, pid=pid,
+    )
     # Default well above a worst-case multi-minute supervision lap so a lease
     # never lapses between renew passes. The compose pins this explicitly (300);
     # the code default matches so a missing env can't silently fall back to the
@@ -1555,19 +1575,19 @@ def main() -> int:
         with sup._lock:
             active = len(sup.children)
         return _supervisor_instance_payload(
-            owner, host=socket.gethostname(), host_all=host_all_active,
+            heartbeat_owner, host=hostname, host_all=host_all_active,
             pi=pi_enabled, active_children=active,
             max_children=sup.max_children, shard_index=0, shard_count=1,
             version=None, ts=ts)
 
     threading.Thread(
         target=_heartbeat_loop, daemon=True,
-        kwargs={"owner": owner, "host_all": host_all_active,
+        kwargs={"owner": heartbeat_owner, "host_all": host_all_active,
                 "pi": pi_enabled,
                 "interval": min(interval, 15.0),
                 "stop_event": hb_stop, "instance_payload_fn": _instance_payload,
-                # Drop rows from dead runners (each restart is a new hostname:pid
-                # owner). Generous so a briefly-paused runner isn't pruned mid-life.
+                # Drop rows from decommissioned CVMs. Normal restarts overwrite
+                # the stable CVM-keyed row; this handles removed inventory nodes.
                 "prune_max_age_sec": float(os.environ.get(
                     "AGENT_SUPERVISOR_HEARTBEAT_PRUNE_SEC", "3600"))},
     ).start()

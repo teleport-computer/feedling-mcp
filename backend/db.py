@@ -316,8 +316,9 @@ def read_supervisor_heartbeat() -> dict | None:
 
 
 # Per-owner supervisor heartbeats (migration 0009). Unlike the single global key
-# above, each runner writes its OWN row keyed by ``owner`` ("<host>:<pid>"), so
-# multiple runners don't clobber one another. The backend's wedge guard lists
+# above, each runner writes its OWN row keyed by ``owner`` (the stable production
+# CVM ID, with ``<host>:<pid>`` as a local/dev fallback), so separate CVMs don't
+# clobber one another. The backend's wedge guard lists
 # these and treats the cluster as live iff any fresh row is actually hosting.
 # Liveness alone is in the lease table; this row additionally carries the
 # cluster-capability flags (host_all/gateway) + shard/capacity config.

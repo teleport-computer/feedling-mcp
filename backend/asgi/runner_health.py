@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Reject timestamps beyond a small allowance for ordinary clock skew. Without a
+# lower age bound, a corrupt far-future row remains "fresh" for arbitrarily long
+# and can mask a dead runner.
+MAX_HEARTBEAT_FUTURE_SKEW_SECONDS = 5.0
+
 
 def parse_expected_runner_count(raw: str | None) -> int:
     try:
@@ -35,7 +40,12 @@ def evaluate_runner_fleet(instances, *, expected, now, max_age):
             ts = float(heartbeat.get("ts") or 0)
         except (TypeError, ValueError):
             ts = 0.0
-        if ts > 0 and now - ts <= max_age and bool(heartbeat.get("host_all")):
+        age = now - ts
+        if (
+            ts > 0
+            and -MAX_HEARTBEAT_FUTURE_SKEW_SECONDS <= age <= max_age
+            and bool(heartbeat.get("host_all"))
+        ):
             healthy += 1
     ok = observed == expected and healthy == expected
     result = {
