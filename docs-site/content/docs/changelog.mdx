@@ -10,14 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
-- **Visual capability checks no longer misclassify truncated thinking-model
-  replies as proof of incompatibility.** Hosted provider probes now use a
-  larger model-agnostic output budget. An empty reply, or one with no color
-  evidence, records a retryable failed check rather than an unsupported
-  verdict; a non-empty, demonstrably incorrect color answer remains
-  unsupported. Changing a saved credential's provider or endpoint invalidates
-  its prior visual verdict, and per-user admin detail now exposes bounded
-  visual-test status, error, and timestamp metadata without endpoint URLs.
+- **Visual-model setup now separates provider access, declared image support,
+  and unknown capability.** OpenRouter catalogs come from the authenticated
+  `models/user` endpoint, so the picker only shows models available to that API
+  key. Explicitly text-only models are rejected before selection, while models
+  with a compatible image-input contract receive a lightweight reachability
+  check. Catalogs without trustworthy modality metadata fall back to one small,
+  randomized image challenge. Stable visual error codes distinguish missing
+  model access, incompatible image input, invalid credentials, quota, rate
+  limits, and temporary provider failures.
 
 - **Hosted visual failures are easier to diagnose without exposing user
   content.** Per-user admin detail now includes bounded model-route runtime
@@ -68,7 +69,6 @@ change must not be interpreted as an API guarantee.
   respond to the actual change. The pooled worker also runs the independently
   consent-gated Memory Capture and Dream producers; each fleet lane remains
   independently reversible through deployment configuration.
-
 - **Encrypted Runtime V2 profile storage is staged for the bounded
   Memory/User rollout.** Both fields share one `v2_agent_profile` CAS document
   but remain separate shared encrypted envelopes. PostgreSQL and the TEE shadow
