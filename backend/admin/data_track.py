@@ -3646,6 +3646,86 @@ def _render_retention_table(retention: dict, *, unit_label: str) -> str:
             f"<tbody>{''.join(body) if body else empty}</tbody></table>")
 
 
+def _svg_growth_accounting(accounting: dict, *, width: int = 640, height: int = 220) -> str:
+    """Stacked growth-accounting bars: new + resurrected above the zero line,
+    churned below it — one bar per day (the baseline first day is skipped)."""
+    rows = [r for r in accounting.get("rows", []) if r.get("churned") is not None]
+    if not rows:
+        return "<div class='muted'>暂无足够天数做增长核算柱状图。</div>"
+    pad_l, pad_r, pad_t, pad_b = 34, 10, 14, 22
+    pw, ph = width - pad_l - pad_r, height - pad_t - pad_b
+    up = [(r.get("new") or 0) + (r.get("resurrected") or 0) for r in rows]
+    dn = [r.get("churned") or 0 for r in rows]
+    scale = max(max(up, default=1), max(dn, default=1), 1)
+    mid = pad_t + ph / 2
+    n = len(rows)
+    slot = pw / max(n, 1)
+    bw = min(slot * 0.7, 26)
+
+    def h(v: int) -> float:
+        return (ph / 2) * (v / scale)
+
+    parts = [f"<svg viewBox='0 0 {width} {height}' width='100%' "
+             f"style='max-width:{width}px;background:var(--card);"
+             f"border:1px solid var(--line);border-radius:8px'>"]
+    parts.append(f"<line x1='{pad_l}' y1='{mid:.1f}' x2='{pad_l+pw}' y2='{mid:.1f}' stroke='#bbb'/>")
+    parts.append(f"<text x='{pad_l-4}' y='{pad_t+8}' font-size='9' text-anchor='end' fill='#999'>+{scale}</text>")
+    parts.append(f"<text x='{pad_l-4}' y='{pad_t+ph:.0f}' font-size='9' text-anchor='end' fill='#999'>-{scale}</text>")
+    for i, r in enumerate(rows):
+        x = pad_l + slot * i + (slot - bw) / 2
+        newh, resh, chh = h(r.get("new") or 0), h(r.get("resurrected") or 0), h(r.get("churned") or 0)
+        parts.append(f"<rect x='{x:.1f}' y='{mid-newh:.1f}' width='{bw:.1f}' height='{newh:.1f}' fill='#b7352b'/>")
+        parts.append(f"<rect x='{x:.1f}' y='{mid-newh-resh:.1f}' width='{bw:.1f}' height='{resh:.1f}' fill='#1d7a4d'/>")
+        parts.append(f"<rect x='{x:.1f}' y='{mid:.1f}' width='{bw:.1f}' height='{chh:.1f}' fill='#d9b48a'/>")
+    step = max(1, n // 8)
+    for i in range(0, n, step):
+        x = pad_l + slot * i + slot / 2
+        parts.append(f"<text x='{x:.1f}' y='{height-7}' font-size='8' text-anchor='middle' fill='#999'>{html.escape(str(rows[i]['day'])[5:])}</text>")
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _svg_growth_curve(growth: list, *, width: int = 640, height: int = 220) -> str:
+    """Cumulative users on a LOG Y axis: a straight line ⇒ exponential growth,
+    bending down ⇒ slowing (log-scale diagnostic from the spec)."""
+    import math
+    pts = [(str(r.get("day") or ""), int(r.get("cumulative") or 0)) for r in growth]
+    pts = [(d, v) for d, v in pts if v > 0]
+    if len(pts) < 2:
+        return "<div class='muted'>累计数据不足画增长曲线。</div>"
+    pad_l, pad_r, pad_t, pad_b = 44, 10, 12, 22
+    pw, ph = width - pad_l - pad_r, height - pad_t - pad_b
+    vals = [v for _, v in pts]
+    vmax, vmin = max(vals), max(1, min(vals))
+    lo = math.log10(vmin)
+    hi = math.log10(vmax) if vmax > vmin else lo + 1
+    n = len(pts)
+
+    def px(i: int) -> float:
+        return pad_l + pw * (i / (n - 1))
+
+    def py(v: int) -> float:
+        return pad_t + ph * (1 - (math.log10(max(1, v)) - lo) / (hi - lo))
+
+    parts = [f"<svg viewBox='0 0 {width} {height}' width='100%' "
+             f"style='max-width:{width}px;background:var(--card);"
+             f"border:1px solid var(--line);border-radius:8px'>"]
+    p = math.floor(lo)
+    while 10 ** p <= vmax * 1.001:
+        if 10 ** p >= vmin * 0.999:
+            yy = py(10 ** p)
+            parts.append(f"<line x1='{pad_l}' y1='{yy:.1f}' x2='{pad_l+pw}' y2='{yy:.1f}' stroke='#eee'/>")
+            parts.append(f"<text x='{pad_l-5}' y='{yy+3:.1f}' font-size='9' text-anchor='end' fill='#999'>{10**p}</text>")
+        p += 1
+    poly = " ".join(f"{px(i):.1f},{py(v):.1f}" for i, (_, v) in enumerate(pts))
+    parts.append(f"<polyline points='{poly}' fill='none' stroke='#b7352b' stroke-width='1.8'/>")
+    step = max(1, n // 8)
+    for i in range(0, n, step):
+        parts.append(f"<text x='{px(i):.1f}' y='{height-7}' font-size='8' text-anchor='middle' fill='#999'>{html.escape(pts[i][0][5:])}</text>")
+    parts.append("</svg>")
+    return "".join(parts)
+
+
 def _render_data_track_growth_page(payload: dict) -> str:
     summary = payload["summary"]
     growth = payload.get("growth", [])
@@ -3673,6 +3753,8 @@ def _render_data_track_growth_page(payload: dict) -> str:
         )
 
     retention_chart = _svg_retention_lines(retention)
+    accounting_chart = _svg_growth_accounting(accounting)
+    growth_curve = _svg_growth_curve(growth)
     ret_day_table = _render_retention_table(retention, unit_label="注册日")
     ret_week_table = _render_retention_table(retention_week, unit_label="注册周(周一)")
 
@@ -3732,12 +3814,17 @@ def _render_data_track_growth_page(payload: dict) -> str:
     <thead><tr><th>Beijing day</th><th>状态</th><th>新增</th><th>累计</th></tr></thead>
     <tbody>{''.join(growth_rows) if growth_rows else "<tr><td colspan='4' class='muted'>暂无注册数据</td></tr>"}</tbody>
   </table>
+  <h2>累计用户 · log 轴增长曲线</h2>
+  <div class="muted" style="margin-bottom:8px">Y 轴为对数刻度:<b>直线=指数增长</b>,<b>上弯=加速</b>,<b>下弯=放缓</b>。全量累计(注册即计,不受冻结边界限制)。</div>
+  {growth_curve}
   <h2>Growth Accounting · 每日(新增/回流/留存/流失 + Quick Ratio)</h2>
   <div class="muted" style="margin-bottom:8px">活跃=当天有用户消息或 tracking(同 DAU)。<b>新增</b>=当天注册;<b>回流</b>=今天活跃、之前注册过、但昨天没活跃;<b>留存</b>=今昨都活跃;<b>流失</b>=昨天活跃今天没(负);<b>Quick Ratio</b>=(新增+回流)/流失,&gt;1 才是净增长。首日为基线无环比。仅冻结边界 {_freeze} 起。</div>
   <table>
     <thead><tr><th>Beijing day</th><th>活跃</th><th>新增</th><th>回流</th><th>留存</th><th>流失</th><th>Quick Ratio</th></tr></thead>
     <tbody>{''.join(acct_rows) if acct_rows else "<tr><td colspan='7' class='muted'>暂无足够天数做增长核算</td></tr>"}</tbody>
   </table>
+  <div class="muted" style="margin:6px 0">堆叠柱:<b style="color:#b7352b">■ 新增</b> + <b style="color:#1d7a4d">■ 回流</b> 向上,<b style="color:#c79a63">■ 流失</b> 向下;零线以上净增、以下净减。</div>
+  {accounting_chart}
   <h2>留存曲线 · Day-N（{_freeze} 起）</h2>
   <div class="muted" style="margin-bottom:8px">每条线=一个注册日 cohort;X=注册后天数,Y=当日留存率(仅画已成熟档位)。基数小、当方向性参考。</div>
   {retention_chart}
