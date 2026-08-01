@@ -5661,6 +5661,34 @@ def chat_recent_genuine_turn_boundary_seq(
     return int(row[0]) if row and row[0] is not None else None
 
 
+def chat_genuine_turn_count_after_seq(
+    user_id: str,
+    *,
+    after_seq: int,
+    through_seq: int,
+) -> int:
+    """Genuine user turns strictly after ``after_seq`` up to ``through_seq``.
+
+    Same predicate as :func:`chat_recent_genuine_turn_boundary_seq` so the
+    optional-window anchor's hysteresis counts exactly the rows that define
+    its window.
+    """
+    lower = int(after_seq)
+    upper = int(through_seq)
+    if lower < 0 or upper < 0:
+        raise ValueError("seq bounds must be >= 0")
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT count(*) FROM chat_messages "
+            "WHERE user_id=%s AND seq>%s AND seq<=%s "
+            "AND doc->>'role' IN ('user','human') "
+            "AND COALESCE(doc->>'source','') "
+            "NOT IN ('verify_ping','resident_maintenance')",
+            (str(user_id), lower, upper),
+        ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
 def v2_effective_batch_cap(user_id: str) -> int | None:
     """The fold batch size this conversation was last observed to digest.
 
@@ -8630,6 +8658,27 @@ def memory_load(user_id: str) -> list[dict]:
     except Exception as e:
         log.error("[db] memory_load(%s) failed: %s", user_id, e)
         return []
+
+
+def memory_profile_source_snapshot(user_id: str) -> dict:
+    """Content-free Memory Garden fingerprint used by profile refresh policy.
+
+    The profile generator itself still reads/decrypts every eligible card
+    through the enclave readside.  This aggregate is deliberately DB-only so a
+    normal chat turn can decide whether a seven-day-old profile is stale
+    without disclosing or loading any card plaintext.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT count(*)::bigint, "
+            "COALESCE(max(doc->>'updated_at'), '') "
+            "FROM memory_moments WHERE user_id=%s",
+            (str(user_id),),
+        ).fetchone()
+    return {
+        "card_count": int(row[0]) if row and row[0] is not None else 0,
+        "max_updated_at": str(row[1] or "") if row else "",
+    }
 
 
 def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> bool:
