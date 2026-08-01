@@ -435,11 +435,19 @@ def test_memory_actions_response_exposes_independent_item_outcomes(
     assert response["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/MemoryActionsResponse"
     }
+    failed_response = operations[("post", "/v1/memory/actions")]["responses"]["400"]
+    assert failed_response["content"]["application/json"]["schema"] == {
+        "oneOf": [
+            {"$ref": "#/components/schemas/MemoryActionsResponse"},
+            {"$ref": "#/components/schemas/ErrorResponse"},
+        ]
+    }
     schema = public_schema["components"]["schemas"]["MemoryActionsResponse"]
     assert schema["properties"]["status"]["enum"] == ["ok", "partial", "failed"]
     assert {
         "total_count", "applied_count", "skipped_count", "failed_count"
     } <= set(schema["required"])
+    assert {"error", "detail"} <= set(schema["properties"])
     result_schema = public_schema["components"]["schemas"]["MemoryActionResult"]
     assert {"status", "http_status"} <= set(result_schema["required"])
 

@@ -3468,7 +3468,7 @@
         "operationId": "memory_actions_v1_memory_actions_post",
         "responses": {
           "200": {
-            "description": "The structurally valid batch was processed item by item. Inspect status, counts, and every results entry; item failures do not change the batch HTTP status.",
+            "description": "The batch was processed item by item and either had no failures or applied at least one action. Inspect status, counts, and every results entry for partial outcomes.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3483,6 +3483,23 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No action was applied and at least one item failed. The first failed item's error and optional detail are promoted, while the complete independent results, effects, and counts are preserved.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/MemoryActionsResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
                 }
               }
             }
@@ -3502,7 +3519,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Apply up to 20 memory actions independently and in order. A structurally valid batch returns HTTP 200 even when some or all items fail; inspect every result and the applied/skipped/failed counts. The batch is not transactional and Idempotency-Key is not supported."
+        "description": "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported."
       }
     },
     "/v1/memory/add": {
@@ -9830,7 +9847,7 @@
           },
           "http_status": {
             "type": "integer",
-            "description": "Per-item execution status; inspect it even when the batch HTTP status is 200."
+            "description": "Per-item execution status; inspect it independently of the outer batch status."
           },
           "action": {
             "type": "string"
@@ -9900,6 +9917,26 @@
           "failed_count": {
             "type": "integer",
             "minimum": 0
+          },
+          "error": {
+            "type": "string",
+            "description": "For an HTTP 400 all-failed batch, the first failed item's stable error slug."
+          },
+          "detail": {
+            "description": "Optional validation detail copied from the first failed item in an HTTP 400 all-failed batch.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {}
+              },
+              {
+                "type": "object",
+                "additionalProperties": true
+              }
+            ]
           }
         },
         "additionalProperties": false

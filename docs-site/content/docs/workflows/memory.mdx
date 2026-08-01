@@ -213,12 +213,14 @@ between 1 and 20 actions. The implementation processes only the first 20, so a
 client must reject an oversized batch before sending it.
 
 The server executes every item independently and does not stop after one item
-fails. A structurally valid, non-empty batch returns HTTP `200` even when some
-or all actions fail. Read every `results` entry and the batch
-`applied_count`, `skipped_count`, and `failed_count`; top-level `status` is
-`ok`, `partial`, or `failed`. Each result includes its own `http_status`.
-Only a malformed request body, a non-array `actions` value, or an empty batch
-uses a request-level `4xx`.
+fails. Full success and partial applied success return HTTP `200`. When no
+action was applied and at least one failed, the batch returns HTTP `400`; its
+top-level `error` and optional `detail` come from the first failed item, while
+the complete `results`, `effects`, and counts remain available. An all-skipped
+batch returns HTTP `200`; skipped actions do not count as failures. Read every
+`results` entry and the batch `applied_count`, `skipped_count`, and
+`failed_count`; top-level `status` is `ok`, `partial`, or `failed`. Each result
+includes its own `http_status`.
 
 `source` and `capture_mode` are closed enums. Unknown values produce an
 item-level failure (`source_invalid` or `capture_mode_invalid`) rather than

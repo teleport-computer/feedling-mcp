@@ -97,12 +97,15 @@ change must not be interpreted as an API guarantee.
   background calls is the steady state.
 
 - **Memory action batches now isolate item failures.** A structurally valid
-  `POST /v1/memory/actions` batch processes every item and returns HTTP `200`
-  with `status: ok|partial|failed`, per-item `http_status`, and
-  `applied_count`/`skipped_count`/`failed_count`. Older clients that treated
-  every HTTP `200` as full success must inspect these fields. Capture clients
-  record applied, skipped, and failed items separately; partial success no
-  longer marks the whole capture job failed. Resident capture may re-ask the
+  `POST /v1/memory/actions` batch processes every item and returns per-item
+  `http_status` plus `applied_count`/`skipped_count`/`failed_count`. Full and
+  partial applied success return HTTP `200`; a batch with zero applied actions
+  and at least one failure returns HTTP `400`, promotes the first failed item's
+  `error` and optional `detail`, and still includes every item result and all
+  counts. An all-skipped batch remains HTTP `200`. Older clients that treated
+  every HTTP `200` as full success must still inspect the item fields. Capture
+  clients record applied, skipped, and failed items separately; partial success
+  no longer marks the whole capture job failed. Resident capture may re-ask the
   model once after either a format or semantic validation failure, using one
   shared per-job retry budget so the two layers cannot multiply retries.
 
