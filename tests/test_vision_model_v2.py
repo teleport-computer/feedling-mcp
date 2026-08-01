@@ -1,6 +1,10 @@
+import base64
+import struct
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
@@ -393,12 +397,30 @@ def test_config_exposes_dedicated_route_only_for_model_api_v2(monkeypatch):
     assert "api_key_envelope" not in config["dedicated_route"]
 
 
-def test_generated_probe_is_a_png_with_all_four_color_labels():
+def test_generated_probe_is_a_small_png_with_random_color_subset():
     encoded, expected = setup_core._vision_probe_image()
 
     assert encoded.startswith("iVBOR")
-    assert set(expected.split(",")) == {"red", "green", "blue", "yellow"}
-    assert len(expected.split(",")) == 4
+    raw = base64.b64decode(encoded)
+    assert struct.unpack(">II", raw[16:24]) == (96, 24)
+    expected_colors = expected.split(",")
+    assert len(expected_colors) == len(set(expected_colors)) == 4
+    assert set(expected_colors) < set(setup_core.vision_probe_capability.color_names())
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected", "matches"),
+    [
+        ("red and yellow", "red,green,blue,yellow", True),
+        ("red", "red,green,blue,yellow", False),
+        ("red, yellow, purple", "red,green,blue,yellow", False),
+        ("orange,purple,pink,black", "orange,purple,pink,black", True),
+    ],
+)
+def test_probe_reply_requires_two_correct_colors_and_no_absent_color(
+    reply, expected, matches
+):
+    assert setup_core._vision_probe_reply_matches(reply, expected) is matches
 
 
 def test_failed_new_vision_route_is_cleaned_up_inside_configure(monkeypatch):
@@ -493,7 +515,7 @@ def test_dedicated_selection_rejects_failed_pixel_probe(monkeypatch):
     assert selected == []
 
 
-def test_explicit_catalog_image_support_still_runs_pixel_probe(monkeypatch):
+def test_explicit_catalog_image_support_uses_lightweight_connection_probe(monkeypatch):
     marked = []
     route = {
         "id": "r1",
@@ -515,16 +537,12 @@ def test_explicit_catalog_image_support_still_runs_pixel_probe(monkeypatch):
             "models": [{"id": "vendor/vision", "input_modalities": ["text", "image"]}]
         },
     )
-    monkeypatch.setattr(
-        setup_core,
-        "_vision_probe_image",
-        lambda: ("a", "red,green,blue,yellow"),
-    )
     captured = {}
 
     def complete(_config, messages, **_kwargs):
         captured["content"] = messages[0]["content"]
-        return {"reply": "red,green,blue,yellow"}
+        captured["kwargs"] = _kwargs
+        return {"reply": ""}
 
     monkeypatch.setattr(setup_core.provider_client, "chat_completion", complete)
     monkeypatch.setattr(
@@ -536,11 +554,160 @@ def test_explicit_catalog_image_support_still_runs_pixel_probe(monkeypatch):
     assert setup_core._run_route_vision_test_or_error(
         _store(), route, "caller"
     ) is None
-    assert len([block for block in captured["content"] if block["type"] == "image_url"]) == 1
+    assert isinstance(captured["content"], str)
+    assert captured["kwargs"]["require_reply"] is False
+    assert captured["kwargs"]["max_tokens"] == 1
     assert marked == [{"status": "ok"}]
 
 
-def test_missing_catalog_modalities_falls_through_to_single_image_probe(monkeypatch):
+def test_deepseek_text_only_catalog_rejects_visual_route_without_model_call(monkeypatch):
+    marked = []
+    route = {
+        "id": "r1",
+        "credential_id": "c1",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "base_url": "https://api.deepseek.com",
+        "api_key_envelope": {"body_ct": "ciphertext"},
+    }
+    monkeypatch.setattr(
+        setup_core.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: b"provider-key",
+    )
+    monkeypatch.setattr(
+        setup_core.provider_client,
+        "list_provider_models",
+        lambda *_args: {
+            "models": [{
+                "id": "deepseek-v4-flash",
+                "input_modalities": ["text"],
+            }],
+            "complete": True,
+            "catalog_supported": True,
+        },
+    )
+    monkeypatch.setattr(
+        setup_core.provider_client,
+        "chat_completion",
+        lambda *_args, **_kwargs: pytest.fail(
+            "text-only DeepSeek model must not run the connectivity probe"
+        ),
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_route_mark_vision_test",
+        lambda _uid, _rid, **kwargs: marked.append(kwargs) or True,
+    )
+
+    body, status = setup_core._run_route_vision_test_or_error(
+        _store(), route, "caller"
+    )
+
+    assert status == 400
+    assert body["error"] == "vision_model_incompatible"
+    assert marked == [{
+        "status": "unsupported",
+        "error": "Provider catalog reports a text-only model.",
+    }]
+
+
+def test_model_missing_from_complete_key_catalog_is_rejected_without_probe(monkeypatch):
+    marked = []
+    route = {
+        "id": "r1",
+        "credential_id": "c1",
+        "provider": "openai",
+        "model": "vendor/not-allowed",
+        "base_url": "https://api.openai.com/v1",
+        "api_key_envelope": {"body_ct": "ciphertext"},
+    }
+    monkeypatch.setattr(
+        setup_core.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: b"provider-key",
+    )
+    monkeypatch.setattr(
+        setup_core.provider_client,
+        "list_provider_models",
+        lambda *_args: {"models": [{"id": "vendor/allowed", "input_modalities": ["image"]}]},
+    )
+    monkeypatch.setattr(
+        setup_core.provider_client,
+        "chat_completion",
+        lambda *_args, **_kwargs: pytest.fail("missing model must not be probed"),
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_route_mark_vision_test",
+        lambda _uid, _rid, **kwargs: marked.append(kwargs) or True,
+    )
+
+    body, status = setup_core._run_route_vision_test_or_error(
+        _store(), route, "caller"
+    )
+
+    assert status == 400
+    assert body["error"] == "vision_model_not_found"
+    assert marked == [{"status": "failed", "error": "vision_model_not_found"}]
+
+
+def test_unknown_catalog_model_404_reports_incompatible_instead_of_missing(monkeypatch):
+    marked = []
+    route = {
+        "id": "r1",
+        "credential_id": "c1",
+        "provider": "openai_compatible",
+        "model": "provider-specialized-model",
+        "base_url": "https://private.example/v1",
+        "api_key_envelope": {"body_ct": "ciphertext"},
+    }
+    monkeypatch.setattr(
+        setup_core.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: b"provider-key",
+    )
+    monkeypatch.setattr(
+        setup_core.provider_client,
+        "list_provider_models",
+        lambda *_args: {"models": [{"id": "provider-specialized-model"}]},
+    )
+    monkeypatch.setattr(
+        setup_core,
+        "_vision_probe_image",
+        lambda: ("encoded-png", "red,green,blue,yellow"),
+    )
+
+    def endpoint_rejects(*_args, **_kwargs):
+        raise setup_core.provider_client.ProviderError(
+            "provider_http_404",
+            status_code=404,
+        )
+
+    monkeypatch.setattr(
+        setup_core.provider_client,
+        "chat_completion",
+        endpoint_rejects,
+    )
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_route_mark_vision_test",
+        lambda _uid, _rid, **kwargs: marked.append(kwargs) or True,
+    )
+
+    body, status = setup_core._run_route_vision_test_or_error(
+        _store(), route, "caller"
+    )
+
+    assert status == 400
+    assert body["error"] == "vision_model_incompatible"
+    assert marked == [{
+        "status": "unsupported",
+        "error": "vision_model_incompatible",
+    }]
+
+
+def test_missing_catalog_modalities_accepts_partial_image_recognition(monkeypatch):
     marked = []
     route = {
         "id": "r1",
@@ -563,13 +730,14 @@ def test_missing_catalog_modalities_falls_through_to_single_image_probe(monkeypa
     monkeypatch.setattr(
         setup_core,
         "_vision_probe_image",
-        lambda: ("a", "red,green,blue,yellow"),
+        lambda: ("encoded-png", "red,green,blue,yellow"),
     )
     captured = {}
 
     def complete(_config, messages, **_kwargs):
         captured["content"] = messages[0]["content"]
-        return {"reply": "red,green,blue,yellow"}
+        captured["kwargs"] = _kwargs
+        return {"reply": "I can see red and yellow."}
 
     monkeypatch.setattr(setup_core.provider_client, "chat_completion", complete)
     monkeypatch.setattr(
@@ -581,11 +749,16 @@ def test_missing_catalog_modalities_falls_through_to_single_image_probe(monkeypa
     assert setup_core._run_route_vision_test_or_error(
         _store(), route, "caller"
     ) is None
-    assert len([block for block in captured["content"] if block["type"] == "image_url"]) == 1
+    assert isinstance(captured["content"], list)
+    assert captured["content"][1]["type"] == "image_url"
+    assert captured["content"][1]["image_url"]["url"].startswith(
+        "data:image/png;base64,"
+    )
+    assert captured["kwargs"]["max_tokens"] == 256
     assert marked == [{"status": "ok"}]
 
 
-def test_unavailable_catalog_endpoint_still_runs_pixel_probe(monkeypatch):
+def test_unavailable_catalog_endpoint_still_runs_real_image_probe(monkeypatch):
     route = {
         "id": "r1",
         "credential_id": "c1",
@@ -611,13 +784,13 @@ def test_unavailable_catalog_endpoint_still_runs_pixel_probe(monkeypatch):
     monkeypatch.setattr(
         setup_core,
         "_vision_probe_image",
-        lambda: ("a", "red,green,blue,yellow"),
+        lambda: ("encoded-png", "red,green,blue,yellow"),
     )
     probes = []
     monkeypatch.setattr(
         setup_core.provider_client,
         "chat_completion",
-        lambda *_args, **_kwargs: probes.append(True) or {
+        lambda _config, messages, **kwargs: probes.append((messages, kwargs)) or {
             "reply": "red,green,blue,yellow"
         },
     )
@@ -630,70 +803,10 @@ def test_unavailable_catalog_endpoint_still_runs_pixel_probe(monkeypatch):
     assert setup_core._run_route_vision_test_or_error(
         _store(), route, "caller"
     ) is None
-    assert probes == [True]
-
-
-def test_thinking_probe_empty_reply_is_retryable_failed_with_large_budget(monkeypatch):
-    result, marked, captured = _run_pixel_probe(monkeypatch, "")
-
-    body, status = result
-    assert status == 400
-    assert body == {
-        "error": "vision_model_empty_response",
-        "detail": "vision_model_empty_response",
-        "retryable": True,
-    }
-    assert "warning" not in body
-    assert marked == [{
-        "status": "failed",
-        "error": "vision_model_empty_response",
-    }]
-    assert captured["max_tokens"] == 2000
-    assert captured["include_reasoning"] is False
-
-    monkeypatch.setattr(
-        setup_core.accounts_onboarding,
-        "_load_onboarding_route",
-        lambda _store: "model_api",
-    )
-    monkeypatch.setattr(
-        setup_core.db,
-        "model_api_active_route",
-        lambda _uid: {
-            "provider": "openai_compatible",
-            "model": "claude-opus-4-6-thinking",
-        },
-    )
-    monkeypatch.setattr(
-        setup_core,
-        "_test_route_vision_or_error",
-        lambda *_args, **_kwargs: result,
-    )
-    projected, projected_status = setup_core.vision_main_test(
-        _store(), caller_api_key="caller"
-    )
-    assert projected_status == 200
-    assert projected["status"] == "failed"
-    assert projected["error_code"] == "vision_model_empty_response"
-    assert projected["retryable"] is True
-    assert "warning" not in projected
-
-
-def test_probe_nonempty_wrong_colors_remains_unsupported(monkeypatch):
-    result, marked, captured = _run_pixel_probe(
-        monkeypatch,
-        "red,red,red,red\nblue,blue,blue,blue",
-    )
-
-    body, status = result
-    assert status == 400
-    assert body["error"] == "vision_model_incompatible"
-    assert body["retryable"] is False
-    assert marked == [{
-        "status": "unsupported",
-        "error": "The model did not identify the visual test image correctly.",
-    }]
-    assert captured["max_tokens"] == 2000
+    assert len(probes) == 1
+    assert isinstance(probes[0][0][0]["content"], list)
+    assert probes[0][0][0]["content"][1]["type"] == "image_url"
+    assert probes[0][1]["max_tokens"] == 256
 
 
 def test_resident_probe_side_channel_hides_expected_and_pending_beats_old_ok(monkeypatch):

@@ -80,12 +80,12 @@ def test_catalog_request_openai_compatible_bearer():
     assert params == {}
 
 
-def test_catalog_request_openrouter_asks_all_modalities():
+def test_catalog_request_openrouter_uses_unmodified_user_catalog():
     url, headers, params = pc._catalog_request(
         "openrouter", "sk-or", "", None)
-    assert url.endswith("/models")
+    assert url.endswith("/models/user")
     assert headers["Authorization"] == "Bearer sk-or"
-    assert params.get("output_modalities") == "all"
+    assert params == {}
 
 
 def test_catalog_request_gemini_key_in_header_not_query():
@@ -107,17 +107,162 @@ def test_catalog_request_anthropic_headers_and_cursor():
 def test_parse_catalog_page_openai_data_shape():
     body = {"data": [{"id": "gpt-5.4", "name": "GPT-5.4"}, {"id": "o5"}]}
     models, nxt = pc._parse_catalog_page("openai", body)
-    assert models == [{"id": "gpt-5.4", "display_name": "GPT-5.4"},
+    assert models == [{"id": "gpt-5.4", "display_name": "GPT-5.4",
+                       "input_modalities": ["text", "image"]},
                       {"id": "o5", "display_name": "o5"}]
     assert nxt is None
 
 
+def test_parse_catalog_page_openai_uses_official_vision_capability_table():
+    body = {
+        "data": [
+            {"id": "gpt-4.1", "owned_by": "openai"},
+            {"id": "gpt-4.1-mini-2025-04-14", "owned_by": "openai"},
+            {"id": "gpt-4o", "owned_by": "openai"},
+            {"id": "gpt-5-mini", "owned_by": "openai"},
+        ]
+    }
+    models, _ = pc._parse_catalog_page("openai", body)
+    assert [model["input_modalities"] for model in models] == [
+        ["text", "image"],
+        ["text", "image"],
+        ["text", "image"],
+        ["text", "image"],
+    ]
+
+
+def test_parse_catalog_page_openai_covers_current_reasoning_and_gpt_families():
+    body = {
+        "data": [
+            {"id": "o1", "owned_by": "openai"},
+            {"id": "o1-pro-2025-03-19", "owned_by": "openai"},
+            {"id": "o3", "owned_by": "openai"},
+            {"id": "o3-pro-2025-06-10", "owned_by": "openai"},
+            {"id": "o4-mini", "owned_by": "openai"},
+            {"id": "gpt-5.1-codex-max", "owned_by": "openai"},
+            {"id": "gpt-5.2-pro", "owned_by": "openai"},
+            {"id": "gpt-5.4-mini-2026-03-17", "owned_by": "openai"},
+            {"id": "gpt-5.5-pro-2026-04-23", "owned_by": "openai"},
+            {"id": "gpt-5.6-sol", "owned_by": "openai"},
+            {"id": "chat-latest", "owned_by": "openai"},
+        ]
+    }
+
+    models, _ = pc._parse_catalog_page("openai", body)
+
+    assert all(model["input_modalities"] == ["text", "image"] for model in models)
+
+
+def test_parse_catalog_page_openai_excludes_tool_only_visual_models():
+    body = {
+        "data": [
+            {"id": "o3-deep-research", "owned_by": "openai"},
+            {"id": "o4-mini-deep-research-2025-06-26", "owned_by": "openai"},
+            {"id": "computer-use-preview", "owned_by": "openai"},
+        ]
+    }
+
+    models, _ = pc._parse_catalog_page("openai", body)
+
+    assert all(model["input_modalities"] == ["text"] for model in models)
+
+
+def test_parse_catalog_page_openai_marks_known_text_models_and_keeps_unknown_safe():
+    body = {
+        "data": [
+            {"id": "gpt-4-0613", "owned_by": "openai"},
+            {"id": "gpt-3.5-turbo", "owned_by": "openai"},
+            {"id": "ft:gpt-4.1:org:custom", "owned_by": "organization-owner"},
+            {"id": "gpt-future-specialized", "owned_by": "openai"},
+        ]
+    }
+    models, _ = pc._parse_catalog_page("openai", body)
+    assert models[0]["input_modalities"] == ["text"]
+    assert models[1]["input_modalities"] == ["text"]
+    assert "input_modalities" not in models[2]
+    assert "input_modalities" not in models[3]
+
+
+def test_parse_catalog_page_openai_covers_legacy_and_specialized_text_models():
+    body = {
+        "data": [
+            {"id": "gpt-3.5-turbo-16k", "owned_by": "openai"},
+            {"id": "gpt-3.5-turbo-instruct-0914", "owned_by": "openai"},
+            {"id": "babbage-002", "owned_by": "openai"},
+            {"id": "davinci-002", "owned_by": "openai"},
+            {"id": "o3-mini-2025-01-31", "owned_by": "openai"},
+            {"id": "gpt-4o-search-preview-2025-03-11", "owned_by": "openai"},
+        ]
+    }
+
+    models, _ = pc._parse_catalog_page("openai", body)
+
+    assert all(model["input_modalities"] == ["text"] for model in models)
+
+
+def test_parse_catalog_page_openai_marks_specialized_models_non_visual():
+    body = {
+        "data": [
+            {"id": "whisper-1", "owned_by": "openai"},
+            {"id": "gpt-4o-mini-transcribe", "owned_by": "openai"},
+            {"id": "tts-1", "owned_by": "openai"},
+            {"id": "text-embedding-3-large", "owned_by": "openai"},
+            {"id": "gpt-image-1", "owned_by": "openai"},
+            {"id": "omni-moderation-latest", "owned_by": "openai"},
+        ]
+    }
+
+    models, _ = pc._parse_catalog_page("openai", body)
+
+    assert [model["input_modalities"] for model in models] == [
+        ["audio"],
+        ["audio"],
+        ["text"],
+        ["text"],
+        ["text"],
+        ["text"],
+    ]
+
+
 def test_parse_catalog_page_gemini_strips_prefix_and_paginates():
-    body = {"models": [{"name": "models/gemini-3.1-pro", "displayName": "Gemini 3.1 Pro"}],
+    body = {"models": [{
+                "name": "models/gemini-3.1-pro",
+                "displayName": "Gemini 3.1 Pro",
+                "supportedGenerationMethods": ["generateContent"],
+            }],
             "nextPageToken": "tok2"}
     models, nxt = pc._parse_catalog_page("gemini", body)
-    assert models == [{"id": "gemini-3.1-pro", "display_name": "Gemini 3.1 Pro"}]
+    assert models == [{
+        "id": "gemini-3.1-pro",
+        "display_name": "Gemini 3.1 Pro",
+        "input_modalities": ["text", "image"],
+    }]
     assert nxt == "tok2"
+
+
+def test_parse_catalog_page_gemini_excludes_non_observer_model_families():
+    body = {"models": [
+        {
+            "name": "models/gemma-3-27b-it",
+            "supportedGenerationMethods": ["generateContent"],
+        },
+        {
+            "name": "models/gemini-2.5-flash-tts",
+            "supportedGenerationMethods": ["generateContent"],
+        },
+        {
+            "name": "models/gemini-embedding-2",
+            "supportedGenerationMethods": ["embedContent"],
+        },
+        {"name": "models/gemini-future-without-methods"},
+    ]}
+
+    models, _ = pc._parse_catalog_page("gemini", body)
+
+    assert models[0]["input_modalities"] == ["text"]
+    assert models[1]["input_modalities"] == ["text"]
+    assert models[2]["input_modalities"] == ["text"]
+    assert "input_modalities" not in models[3]
 
 
 def test_parse_catalog_page_anthropic_has_more():
@@ -151,6 +296,17 @@ def test_parse_catalog_page_anthropic_maps_image_capability_without_guessing():
     assert models[0]["input_modalities"] == ["text", "image"]
     assert models[1]["input_modalities"] == ["text"]
     assert "input_modalities" not in models[2]
+
+
+def test_parse_catalog_page_deepseek_marks_official_models_text_only():
+    body = {"data": [
+        {"id": "deepseek-v4-flash", "object": "model", "owned_by": "deepseek"},
+        {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek"},
+    ]}
+
+    models, _ = pc._parse_catalog_page("deepseek", body)
+
+    assert [model["input_modalities"] for model in models] == [["text"], ["text"]]
 
 
 def test_parse_catalog_page_compatible_accepts_only_explicit_safe_modalities():
@@ -256,32 +412,29 @@ def _install_fake_stream(monkeypatch, pages):
 
 
 def test_list_models_openrouter_single_page(monkeypatch):
-    # openrouter now probes the auth endpoint (/key) FIRST, then fetches /models.
+    # /models/user is authenticated and filtered for this exact API key.
     calls = _install_fake_stream(monkeypatch, [
-        (200, {"data": {"label": "ok"}}),               # /key probe (valid key)
-        (200, {"data": [{"id": "a"}, {"id": "b"}]}),     # /models catalog
+        (200, {"data": [{"id": "a"}, {"id": "b"}]}),
     ])
     res = pc.list_provider_models("openrouter", "k", "")
     assert res["catalog_supported"] is True and res["complete"] is True
     assert [m["id"] for m in res["models"]] == ["a", "b"]
-    assert calls[0]["url"].endswith("/key")             # probe hit first
-    assert calls[1]["url"].endswith("/models")
-    assert calls[1]["params"].get("output_modalities") == "all"
+    assert len(calls) == 1
+    assert calls[0]["url"].endswith("/models/user")
+    assert calls[0]["params"] == {}
 
 
-def test_list_models_openrouter_bogus_key_blocked_before_catalog(monkeypatch):
-    # OpenRouter's /models is PUBLIC → a bogus key would otherwise return a full
-    # catalog. The /key probe must 401 and block BEFORE any catalog is returned.
+def test_list_models_openrouter_bogus_key_rejected_by_user_catalog(monkeypatch):
+    # The key-filtered catalog itself is authenticated, so a bad key cannot
+    # receive the public all-model list.
     calls = _install_fake_stream(monkeypatch, [
-        (401, {"error": "invalid api key"}),            # /key probe rejects
-        (200, {"data": [{"id": "a"}, {"id": "b"}]}),     # /models — must NOT be reached
+        (401, {"error": "invalid api key"}),
     ])
     with pytest.raises(pc.ProviderError) as ei:
         pc.list_provider_models("openrouter", "bogus", "")
     assert ei.value.status_code == 401
-    # Only the probe ran; the catalog fetch never happened.
     assert len(calls) == 1
-    assert calls[0]["url"].endswith("/key")
+    assert calls[0]["url"].endswith("/models/user")
     # And the route maps a bogus openrouter key to the auth-failed slug.
     assert pc.model_catalog_error_slug(ei.value) == "model_catalog_auth_failed"
 

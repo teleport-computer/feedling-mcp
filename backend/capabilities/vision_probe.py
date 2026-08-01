@@ -13,6 +13,10 @@ _COLORS = {
     "green": (20, 180, 65),
     "blue": (25, 90, 235),
     "yellow": (250, 210, 10),
+    "orange": (245, 120, 15),
+    "purple": (145, 60, 210),
+    "pink": (240, 70, 155),
+    "black": (20, 20, 20),
 }
 
 
@@ -22,13 +26,9 @@ def _png_chunk(kind: bytes, data: bytes) -> bytes:
 
 
 def generate_image() -> tuple[str, str]:
-    """Return one random four-stripe PNG and its unpredictable answer."""
-    names = list(_COLORS)
-    random.SystemRandom().shuffle(names)
-    # Keep the control large enough to survive provider-side image resizing.
-    # The old 96x24 strip was occasionally read as reordered or "tan" by
-    # otherwise vision-capable Claude routes.
-    width, height = 512, 256
+    """Return one small four-stripe PNG sampled from a larger color pool."""
+    names = random.SystemRandom().sample(list(_COLORS), 4)
+    width, height = 96, 24
     stripe_width = width // len(names)
     scanlines = bytearray()
     for _ in range(height):
@@ -43,6 +43,11 @@ def generate_image() -> tuple[str, str]:
     png += _png_chunk(b"IDAT", zlib.compress(bytes(scanlines), 9))
     png += _png_chunk(b"IEND", b"")
     return base64.b64encode(png).decode("ascii"), ",".join(names)
+
+
+def color_names() -> frozenset[str]:
+    """Return the complete answer vocabulary used by visual controls."""
+    return frozenset(_COLORS)
 
 
 def generate_images() -> tuple[list[dict[str, str]], list[str]]:
