@@ -116,7 +116,7 @@ def build_processing_response(user_row: dict, *, driver: str) -> tuple[dict, int
 _SUPERVISOR_HEARTBEAT_MAX_AGE_SEC = 90.0
 
 
-def _heartbeat_max_age() -> float:
+def supervisor_heartbeat_max_age() -> float:
     raw = os.environ.get("FEEDLING_SUPERVISOR_HEARTBEAT_MAX_AGE_SEC", "").strip()
     if not raw:
         return _SUPERVISOR_HEARTBEAT_MAX_AGE_SEC
@@ -224,7 +224,7 @@ def check_supervisor_live(*, require_pi: bool = False,
     Pass ``require_pi=True`` for pi-driven providers so a runner that isn't running
     the pi driver is treated as not-live for them (avoids stuck ``processing``)."""
     now = time.time() if now is None else now
-    max_age = _heartbeat_max_age()
+    max_age = supervisor_heartbeat_max_age()
     try:
         instances = db.list_supervisor_instance_heartbeats()
     except Exception as e:  # noqa: BLE001 — new table unreadable → try legacy key
