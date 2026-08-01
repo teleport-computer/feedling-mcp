@@ -332,12 +332,17 @@ def _add_metric(
     *,
     prompt: int | None,
     completion: int | None,
-    failed: bool = False,
     model_calls: int = 1,
+    retries: int = 0,
+    failed: bool = False,
     usage_reported: int = 1,
     cache_read: int | None = None,
+    cache_write: int | None = None,
     cache_miss: int | None = None,
     cache_reported: int = 0,
+    provider: str | None = None,
+    model: str | None = None,
+    route: str | None = None,
     age_hours: int = 0,
 ) -> None:
     """直接写一行 v2_turn_metrics。job_id 传 None——该列的唯一索引允许多个 NULL。"""
@@ -345,10 +350,12 @@ def _add_metric(
     jobs_store.record_whole_turn_metric(
         None, user_id, lane,
         prompt_tokens=prompt, completion_tokens=completion, latency_ms=1000,
-        model_calls=model_calls, retries=0, failed=failed,
+        model_calls=model_calls, retries=retries, failed=failed,
         status="turn_failed:providererror" if failed else "ok",
-        cache_read_tokens=cache_read, cache_miss_tokens=cache_miss,
+        cache_read_tokens=cache_read, cache_write_tokens=cache_write,
+        cache_miss_tokens=cache_miss,
         usage_reported_calls=usage_reported, cache_reported_calls=cache_reported,
+        provider=provider, model=model, cache_route_fingerprint=route,
     )
     if age_hours:
         with db.get_pool().connection() as conn:
@@ -511,6 +518,83 @@ def test_token_usage_by_lane_cache_coverage_is_none_without_calls():
 
     assert chat["model_calls"] == 0
     assert chat["cache_coverage"] is None
+
+
+def test_runtime_user_report_groups_each_users_models_and_lanes():
+    _add_metric(
+        "u_report_a", "chat", prompt=100, completion=10,
+        cache_read=60, cache_write=5, cache_miss=40,
+        usage_reported=1, cache_reported=1,
+        provider="anthropic", model="claude-a", route="route-a", retries=2,
+    )
+    _add_metric(
+        "u_report_a", "heartbeat", prompt=200, completion=20,
+        cache_read=100, cache_write=10, cache_miss=100,
+        usage_reported=1, cache_reported=1,
+        provider="anthropic", model="claude-a", route="route-a", retries=1,
+    )
+    _add_metric(
+        "u_report_a", "chat", prompt=50, completion=5,
+        provider="openai", model="gpt-b", route="route-b",
+    )
+
+    report = jobs_store.recent_runtime_user_report(within_hours=24)
+    user = next(row for row in report["users"] if row["user_id"] == "u_report_a")
+
+    assert user["known_total_tokens"] == 385
+    assert user["model_calls"] == 3
+    assert [(m["provider"], m["model"], m["route"]) for m in user["models"]] == [
+        ("anthropic", "claude-a", "route-a"),
+        ("openai", "gpt-b", "route-b"),
+    ]
+    model = user["models"][0]
+    assert model["lanes"] == ["chat", "heartbeat"]
+    assert model["turns"] == 2
+    assert model["model_calls"] == 2
+    assert model["retries"] == 3
+    assert model["prompt_tokens"] == 300
+    assert model["completion_tokens"] == 30
+    assert model["cache_read_tokens"] == 160
+    assert model["cache_write_tokens"] == 15
+    assert model["cache_miss_tokens"] == 140
+    assert model["cache_hit_ratio"] == pytest.approx(160 / 300)
+    assert model["usage_coverage"] == pytest.approx(1.0)
+    assert model["cache_coverage"] == pytest.approx(1.0)
+
+
+def test_runtime_user_report_keeps_unknown_usage_and_identity():
+    _add_metric(
+        "u_report_unknown", "maintenance",
+        prompt=None, completion=None, model_calls=1,
+        usage_reported=0, cache_reported=0,
+    )
+    user = jobs_store.recent_runtime_user_report()["users"][0]
+    model = user["models"][0]
+    assert (model["provider"], model["model"], model["route"]) == (
+        "unknown", "unknown", "unknown",
+    )
+    assert user["known_total_tokens"] is None
+    assert model["total_tokens"] is None
+    assert model["cache_hit_ratio"] is None
+    assert model["usage_coverage"] == pytest.approx(0.0)
+    assert model["cache_coverage"] == pytest.approx(0.0)
+
+
+def test_runtime_user_report_respects_window_and_orders_known_before_unknown():
+    _add_metric("u_report_small", "chat", prompt=10, completion=1)
+    _add_metric("u_report_big", "chat", prompt=100, completion=10)
+    _add_metric(
+        "u_report_unknown", "chat", prompt=None, completion=None,
+        usage_reported=0,
+    )
+    _add_metric(
+        "u_report_old", "chat", prompt=1000, completion=100,
+        age_hours=48,
+    )
+    users = jobs_store.recent_runtime_user_report(within_hours=24)["users"]
+    assert [u["user_id"] for u in users] == [
+        "u_report_big", "u_report_small", "u_report_unknown",
+    ]
 
 
 # ---------------------------------------------------------------------------

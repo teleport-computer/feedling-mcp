@@ -4488,6 +4488,163 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
     return {"window_hours": safe_hours, "lanes": lanes}
 
 
+def recent_runtime_user_report(*, within_hours: int = 24) -> dict:
+    """Aggregate content-free Runtime V2 token telemetry by user and model."""
+    safe_hours = max(1, min(int(within_hours), 24 * 366))
+
+    with _pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT user_id,"
+                "  COALESCE(NULLIF(provider, ''), 'unknown') AS provider,"
+                "  COALESCE(NULLIF(model, ''), 'unknown') AS model,"
+                "  COALESCE(NULLIF(cache_route_fingerprint, ''), 'unknown') AS route,"
+                "  array_agg("
+                "    DISTINCT COALESCE(NULLIF(lane, ''), 'unknown')"
+                "    ORDER BY COALESCE(NULLIF(lane, ''), 'unknown')"
+                "  ) AS lanes,"
+                "  count(*)::int AS turns,"
+                "  coalesce(sum(model_calls), 0)::bigint AS model_calls,"
+                "  coalesce(sum(retries), 0)::bigint AS retries,"
+                "  coalesce(sum(usage_reported_calls), 0)::bigint"
+                "    AS usage_reported_calls,"
+                "  coalesce(sum(cache_reported_calls), 0)::bigint"
+                "    AS cache_reported_calls,"
+                "  sum(prompt_tokens)::bigint AS prompt_tokens,"
+                "  sum(completion_tokens)::bigint AS completion_tokens,"
+                "  sum(cache_read_tokens)::bigint AS cache_read_tokens,"
+                "  sum(cache_write_tokens)::bigint AS cache_write_tokens,"
+                "  sum(cache_miss_tokens)::bigint AS cache_miss_tokens "
+                "FROM v2_turn_metrics "
+                "WHERE created_at >= now() - make_interval(hours => %s) "
+                "GROUP BY user_id, provider, model, cache_route_fingerprint",
+                (safe_hours,),
+            )
+            rows = cur.fetchall()
+
+    def _optional_int(row, key):
+        value = row.get(key)
+        return int(value) if value is not None else None
+
+    def _empty_user_delivery() -> dict:
+        return {
+            "reply_effects": {
+                "applied_in_window": 0,
+                "pending": 0,
+                "needs_reconciliation": 0,
+            },
+            "status_effects": {
+                "applied_in_window": 0,
+                "pending": 0,
+                "needs_reconciliation": 0,
+            },
+            "all_effects": {
+                "applied_in_window": 0,
+                "discarded_in_window": 0,
+                "pending": 0,
+                "needs_reconciliation": 0,
+            },
+            "terminal_failure": {
+                "reply_delivered_in_window": 0,
+                "reply_undelivered": 0,
+                "status_delivered_in_window": 0,
+                "status_undelivered": 0,
+                "runtime_error_delivered_in_window": 0,
+                "runtime_error_undelivered": 0,
+            },
+            "oldest_unfinished_age_sec": None,
+        }
+
+    def _known_total_sort_key(total, calls, identity):
+        return (
+            total is None,
+            -(int(total) if total is not None else 0),
+            -int(calls or 0),
+            identity,
+        )
+
+    users: dict[str, dict] = {}
+    for row in rows:
+        model_calls = int(row["model_calls"] or 0)
+        usage_calls = int(row["usage_reported_calls"] or 0)
+        cache_calls = int(row["cache_reported_calls"] or 0)
+        prompt_tokens = _optional_int(row, "prompt_tokens")
+        completion_tokens = _optional_int(row, "completion_tokens")
+        cache_read = _optional_int(row, "cache_read_tokens")
+        cache_write = _optional_int(row, "cache_write_tokens")
+        cache_miss = _optional_int(row, "cache_miss_tokens")
+        total_tokens = (
+            prompt_tokens + completion_tokens
+            if prompt_tokens is not None and completion_tokens is not None
+            else None
+        )
+        cache_denominator = (
+            cache_read + cache_miss
+            if cache_read is not None and cache_miss is not None
+            else 0
+        )
+        user_id = str(row["user_id"])
+        user = users.setdefault(
+            user_id,
+            {
+                "user_id": user_id,
+                "known_total_tokens": None,
+                "model_calls": 0,
+                "models": [],
+                **_empty_user_delivery(),
+            },
+        )
+        user["models"].append({
+            "provider": str(row["provider"]),
+            "model": str(row["model"]),
+            "route": str(row["route"]),
+            "lanes": list(row["lanes"]),
+            "turns": int(row["turns"] or 0),
+            "model_calls": model_calls,
+            "retries": int(row["retries"] or 0),
+            "usage_reported_calls": usage_calls,
+            "cache_reported_calls": cache_calls,
+            "usage_coverage": (
+                float(usage_calls) / float(model_calls) if model_calls else None
+            ),
+            "cache_coverage": (
+                float(cache_calls) / float(model_calls) if model_calls else None
+            ),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+            "cache_miss_tokens": cache_miss,
+            "cache_hit_ratio": (
+                float(cache_read) / float(cache_denominator)
+                if cache_denominator
+                else None
+            ),
+        })
+        user["model_calls"] += model_calls
+        if total_tokens is not None:
+            user["known_total_tokens"] = (
+                (user["known_total_tokens"] or 0) + total_tokens
+            )
+
+    users_list = list(users.values())
+    for user in users_list:
+        user["models"].sort(
+            key=lambda model: _known_total_sort_key(
+                model["total_tokens"],
+                model["model_calls"],
+                (model["provider"], model["model"], model["route"]),
+            )
+        )
+    users_list.sort(
+        key=lambda user: _known_total_sort_key(
+            user["known_total_tokens"], user["model_calls"], user["user_id"]
+        )
+    )
+    return {"window_hours": safe_hours, "users": users_list}
+
+
 def recent_delivery_health(*, within_hours: int = 24) -> dict:
     """端到端交付健康（content-free），喂 admin 值班台。
 
