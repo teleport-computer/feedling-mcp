@@ -2000,6 +2000,17 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
         },
     },
+    ("get", "/healthz/runner"): {
+        "503": {
+            "description": (
+                "The runner fleet is unhealthy, unavailable, or misconfigured. "
+                "The body has the same shape as the 200 response, with top-level "
+                "\"status\": \"unhealthy\" and a down \"runner_fleet\" entry "
+                "under \"checks\"."
+            ),
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
+        },
+    },
     ("get", "/v1/screen/frames/{frame_id}/image"): {
         "200": {
             "description": "Complete decrypted frame image.",
