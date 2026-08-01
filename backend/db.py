@@ -2176,23 +2176,33 @@ _RETENTION_DAY_OFFSETS = (1, 3, 7, 14, 30)
 
 
 def admin_data_track_retention_daily(
-    *, tz: str = "Asia/Shanghai", since_day: str = "",
+    *, tz: str = "Asia/Shanghai", since_day: str = "", granularity: str = "day",
 ) -> dict:
-    """Classic day-N cohort retention. Cohort = signup Beijing day; D_N = share
-    of that cohort active exactly N days later (activity = a user chat message
-    or a tracking event — identical to the DAU definition). Only cohorts whose
-    signup day is on/after ``since_day`` (the freeze boundary) are returned:
-    pre-freeze days are unreliable because deleted accounts retroactively shrink
-    them, so per the product decision they are excluded entirely.
+    """Classic day-N cohort retention, cohort keyed by signup day or ISO week.
 
-    Read live. A cell is ``None`` (rendered "—") when the cohort has not yet had
-    N full days to come back (cohort_day + N > today), so an immature cohort is
-    never shown as 0% retention.
+    Cohort = signup Beijing day (``granularity="day"``) or Beijing ISO week
+    (``"week"``, labeled by the Monday). D_N = share of the cohort active exactly
+    N days after EACH member's own signup day (activity = a user chat message or
+    a tracking event — identical to the DAU definition). Only signups on/after
+    ``since_day`` (the freeze boundary) count; pre-freeze days drift as accounts
+    delete and are excluded entirely per the product decision.
 
-    Returns {offsets, cohorts:[{cohort, size, cells:{N: pct|None}}], since_day}.
+    A cell is ``None`` ("—") until the whole cohort has had N full days to return
+    (the cohort's LATEST signup + N <= today), so a still-maturing cohort is
+    never shown as a deflated 0%.
+
+    Returns {offsets, granularity, cohorts:[{cohort, size, cells:{N: pct|None}}],
+    since_day}.
     """
     offsets = list(_RETENTION_DAY_OFFSETS)
     floor_day = since_day or "1970-01-01"
+    gran = "week" if str(granularity).lower().startswith("w") else "day"
+    signup_expr = "(timezone(%s, created_at::timestamptz))::date"
+    cohort_expr = (
+        "(date_trunc('week', timezone(%s, created_at::timestamptz)))::date"
+        if gran == "week"
+        else "(timezone(%s, created_at::timestamptz))::date"
+    )
     try:
         zone = ZoneInfo(tz)
     except Exception:
@@ -2202,27 +2212,28 @@ def admin_data_track_retention_daily(
         with get_pool().connection() as conn:
             size_rows = conn.execute(
                 f"""
-                SELECT to_char((timezone(%s, created_at::timestamptz))::date,
-                               'YYYY-MM-DD') AS cohort,
-                       COUNT(*)::int AS size
+                SELECT to_char({cohort_expr}, 'YYYY-MM-DD') AS cohort,
+                       COUNT(*)::int AS size,
+                       to_char(MAX({signup_expr}), 'YYYY-MM-DD') AS mature_ref
                 FROM users
                 WHERE {_CREATED_AT_ISO}
-                  AND (timezone(%s, created_at::timestamptz))::date >= %s::date
-                GROUP BY cohort
+                  AND {signup_expr} >= %s::date
+                GROUP BY 1
                 """,
-                (tz, tz, floor_day),
+                (tz, tz, tz, floor_day),
             ).fetchall()
             cell_rows = conn.execute(
                 f"""
                 WITH reg AS (
                     SELECT user_id,
-                           (timezone(%s, created_at::timestamptz))::date AS cohort_day
+                           {signup_expr} AS signup_day,
+                           {cohort_expr} AS cohort_key
                     FROM users
                     WHERE {_CREATED_AT_ISO}
-                      AND (timezone(%s, created_at::timestamptz))::date >= %s::date
+                      AND {signup_expr} >= %s::date
                 ),
                 act AS (
-                    SELECT DISTINCT r.user_id, r.cohort_day,
+                    SELECT DISTINCT r.user_id, r.signup_day, r.cohort_key,
                            (timezone(%s, to_timestamp(a.ts)))::date AS act_day
                     FROM reg r
                     JOIN (
@@ -2234,34 +2245,122 @@ def admin_data_track_retention_daily(
                           WHERE stream = 'tracking_events' AND ts IS NOT NULL
                     ) a ON a.user_id = r.user_id
                 )
-                SELECT to_char(cohort_day, 'YYYY-MM-DD') AS cohort,
-                       (act_day - cohort_day)::int AS day_offset,
+                SELECT to_char(cohort_key, 'YYYY-MM-DD') AS cohort,
+                       (act_day - signup_day)::int AS day_offset,
                        COUNT(DISTINCT user_id)::int AS active
                 FROM act
-                WHERE (act_day - cohort_day) = ANY(%s)
-                GROUP BY cohort_day, day_offset
+                WHERE (act_day - signup_day) = ANY(%s)
+                GROUP BY cohort_key, day_offset
                 """,
-                (tz, tz, floor_day, tz, offsets),
+                (tz, tz, tz, floor_day, tz, offsets),
             ).fetchall()
-        sizes = {r[0]: int(r[1] or 0) for r in size_rows}
+        sizes = {r[0]: (int(r[1] or 0), r[2]) for r in size_rows}
         active = {(r[0], int(r[1])): int(r[2] or 0) for r in cell_rows}
         cohorts = []
         for cohort in sorted(sizes, reverse=True):
-            size = sizes[cohort]
-            cohort_date = date.fromisoformat(cohort)
+            size, mature_ref = sizes[cohort]
+            ref_date = date.fromisoformat(mature_ref or cohort)
             cells: dict[int, float | None] = {}
             for n in offsets:
-                if cohort_date + timedelta(days=n) > today:
+                if ref_date + timedelta(days=n) > today:
                     cells[n] = None
                 elif size:
                     cells[n] = round(100.0 * active.get((cohort, n), 0) / size, 1)
                 else:
                     cells[n] = 0.0
             cohorts.append({"cohort": cohort, "size": size, "cells": cells})
-        return {"offsets": offsets, "cohorts": cohorts, "since_day": since_day}
+        return {"offsets": offsets, "granularity": gran,
+                "cohorts": cohorts, "since_day": since_day}
     except Exception as e:
         log.error("[db] admin_data_track_retention_daily failed: %s", e)
-        return {"offsets": offsets, "cohorts": [], "since_day": since_day}
+        return {"offsets": offsets, "granularity": gran,
+                "cohorts": [], "since_day": since_day}
+
+
+def admin_data_track_growth_accounting(
+    *, tz: str = "Asia/Shanghai", since_day: str = "",
+) -> dict:
+    """Daily growth accounting (post-freeze only). For each Beijing day it splits
+    the active set into new / resurrected / retained, plus churned (users active
+    the prior day but not today) and Quick Ratio = (new+resurrected)/churned.
+
+    active = a user chat message or tracking event that day (DAU definition).
+    new = signed up that day; resurrected = active today, existed before, but was
+    not active yesterday; retained = active both days. Iterates every calendar
+    day from ``since_day`` to today so a zero-activity gap correctly shows as
+    churn, not a skipped comparison. The first day is a baseline (no deltas).
+    Returns {rows:[{day, active, new, resurrected, retained, churned, quick_ratio}], since_day}.
+    """
+    floor_day = since_day or ""
+    if not floor_day:
+        return {"rows": [], "since_day": since_day}
+    try:
+        zone = ZoneInfo(tz)
+    except Exception:
+        zone = ZoneInfo("Asia/Shanghai")
+    today = datetime.now(zone).date()
+    try:
+        with get_pool().connection() as conn:
+            act_rows = conn.execute(
+                f"""
+                SELECT DISTINCT user_id,
+                       (timezone(%s, to_timestamp(ts)))::date AS d
+                FROM (
+                    SELECT user_id, ts FROM chat_messages
+                      WHERE doc->>'role' = 'user'
+                        AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
+                    UNION ALL
+                    SELECT user_id, ts FROM user_logs
+                      WHERE stream = 'tracking_events' AND ts IS NOT NULL
+                ) a
+                WHERE (timezone(%s, to_timestamp(ts)))::date >= %s::date
+                """,
+                (tz, tz, floor_day),
+            ).fetchall()
+            signup_rows = conn.execute(
+                f"""
+                SELECT user_id, (timezone(%s, created_at::timestamptz))::date AS d
+                FROM users WHERE {_CREATED_AT_ISO}
+                """,
+                (tz,),
+            ).fetchall()
+        active_by_day: dict[str, set] = {}
+        for uid, d in act_rows:
+            active_by_day.setdefault(str(d), set()).add(uid)
+        signup = {uid: str(d) for uid, d in signup_rows}
+        start = date.fromisoformat(floor_day)
+        rows = []
+        prev_set: set = set()
+        first = True
+        cursor = start
+        while cursor <= today:
+            key = cursor.isoformat()
+            cur = active_by_day.get(key, set())
+            new = {u for u in cur if signup.get(u) == key}
+            if first:
+                rows.append({
+                    "day": key, "active": len(cur), "new": len(new),
+                    "resurrected": None, "retained": None,
+                    "churned": None, "quick_ratio": None,
+                })
+                first = False
+            else:
+                retained = cur & prev_set
+                resurrected = {u for u in (cur - prev_set) if u not in new}
+                churned = prev_set - cur
+                qr = (round((len(new) + len(resurrected)) / len(churned), 2)
+                      if churned else None)
+                rows.append({
+                    "day": key, "active": len(cur), "new": len(new),
+                    "resurrected": len(resurrected), "retained": len(retained),
+                    "churned": len(churned), "quick_ratio": qr,
+                })
+            prev_set = cur
+            cursor += timedelta(days=1)
+        return {"rows": rows, "since_day": since_day}
+    except Exception as e:
+        log.error("[db] admin_data_track_growth_accounting failed: %s", e)
+        return {"rows": [], "since_day": since_day}
 
 
 def freeze_completed_retention_cohorts(*, now_epoch: float | None = None,

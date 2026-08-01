@@ -113,3 +113,39 @@ def test_day_n_retention_math_and_freeze_floor(client):
 
     assert _today_minus(100) not in [c["cohort"] for c in result["cohorts"]], \
         "pre-freeze cohort leaked past the freeze floor"
+
+    # Weekly granularity: same users, cohort keyed by ISO week (Monday).
+    wk = db.admin_data_track_retention_daily(since_day=freeze, granularity="week")
+    assert wk["granularity"] == "week"
+    assert sum(c["size"] for c in wk["cohorts"]) == 10 + 5, wk  # A + B users
+
+
+def _acct_row(result: dict, day: str) -> dict:
+    return next((r for r in result["rows"] if r["day"] == day), {})
+
+
+def test_growth_accounting_new_resurrected_retained_churned(client):
+    a_day = _today_minus(6)   # freeze = baseline day
+    b_day = _today_minus(5)   # first day with deltas
+
+    u1, u2, u3, u4 = (_register(client) for _ in range(4))
+    _set_signup(u1, a_day); _set_signup(u2, a_day)
+    _set_signup(u3, b_day)   # signs up on B → new on B
+    _set_signup(u4, a_day)   # existed before B → resurrected candidate
+
+    _activity(u1, a_day); _activity(u1, b_day)   # active both → retained on B
+    _activity(u2, a_day)                          # active A only → churns on B
+    _activity(u3, b_day)                          # new on B
+    _activity(u4, b_day)                          # active B, not A → resurrected
+
+    result = db.admin_data_track_growth_accounting(since_day=a_day)
+
+    ra = _acct_row(result, a_day)
+    assert ra.get("active") == 2 and ra.get("new") == 2, ra
+    assert ra.get("retained") is None, ra  # baseline day → no prior comparison
+
+    rb = _acct_row(result, b_day)
+    assert rb == {
+        "day": b_day, "active": 3, "new": 1,
+        "resurrected": 1, "retained": 1, "churned": 1, "quick_ratio": 2.0,
+    }, rb
