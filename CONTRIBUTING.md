@@ -15,6 +15,40 @@
 
 ---
 
+## 分支与发布流程
+
+`test`、`pre`、`main` 的 push 会分别触发对应环境的部署；其中 `main` 是生产
+发布分支。因此，普通开发改动（包括 `feature/*`、`fix/*`、`opt/*`、`codex/*`
+等分支）**不得直接向 `main` 开 PR**。
+
+默认流程如下：
+
+1. 开发分支向 `test` 开 PR。
+2. CI 通过后合入 `test`，在 test 环境完成与改动风险相匹配的验证，并把结果记录在
+   后续发布 PR 中。
+3. 需要发布生产时，从已验证的环境分支向 `main` 开 PR；`main` 只接受来源为
+   `test` 或 `pre` 的 PR。
+
+仓库不强制 `test` 与 `pre` 之间的固定合并方向：可以按发布范围选择从 `test` 或
+`pre` 晋级到 `main`。但不能用普通开发分支绕过 test 环境验证直接进入生产。
+
+紧急修复仍应尽可能先经过 test 环境。确需例外时，必须由维护者明确授权，并在 PR
+中记录跳级原因、风险判断和补测计划；不要在代码中通过特殊分支名或标签静默绕过
+门禁。
+
+`.github/workflows/ci.yml` 的 `branch flow` 检查会拒绝不符合上述来源要求的
+`main` PR。仓库管理员还必须在 GitHub ruleset / branch protection 中：
+
+- 禁止直接 push `main`；
+- 要求通过 PR 合并；
+- 把 `branch flow` 配为 `main` 的 required status check；
+- 只把紧急发布负责人加入 ruleset bypass list。
+
+本地 merge 不会触发 PR 门禁，但把本地 `main` 推到远端会进入生产发布链路，不能把
+本地合并当成绕过审核的方式。
+
+---
+
 ## 一句话版本
 
 **asgi_app.py 只做装配（lifespan、中间件、include 路由、注入接线），业务逻辑
@@ -248,6 +282,8 @@ result = chat_completion(runtime, messages)
 ## 9. PR 自查清单
 
 ```
+[ ] 普通开发 PR 的目标是 test，并已计划/完成 test 环境验证
+[ ] 目标为 main 时，PR 来源是 test 或 pre，且描述中附有环境验证结果
 [ ] asgi_app.py 的 diff 只有装配/注入变化（理想情况是零 diff）
 [ ] 新路由在领域包 routes_asgi.py（APIRouter）上，新逻辑在 service/actions/core 层
 [ ] 没有新增向上 import（需要时用了注入钩子）

@@ -109,6 +109,7 @@ if not _provisioned:
     _PURE_UNIT = {
         "test_card_guard.py",
         "test_bucket_lang_normalize.py",
+        "test_branch_flow_guard.py",
         "test_memory_actions_guard.py",
         "test_protocol_leak.py",
         "test_memory_lane_torn_protocol_no_write.py",

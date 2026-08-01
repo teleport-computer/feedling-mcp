@@ -15,6 +15,19 @@ concurrency:
 
 jobs:
   # -------------------------------------------------------------------------
+  # Branch promotion — production PRs must come from an environment branch
+  # -------------------------------------------------------------------------
+  branch-flow:
+    name: branch flow
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate pull request source branch
+        run: scripts/check-pr-branch-flow.sh "$GITHUB_BASE_REF" "$GITHUB_HEAD_REF"
+
+  # -------------------------------------------------------------------------
   # Solidity — FeedlingAppAuth contract tests
   # -------------------------------------------------------------------------
   forge-test:
