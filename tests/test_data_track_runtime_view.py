@@ -1265,9 +1265,18 @@ def test_runtime_view_passes_same_window_to_user_report(monkeypatch):
 
 def test_runtime_user_report_failure_does_not_hide_health(monkeypatch):
     """用户聚合超时只能降级自己的区块，不能遮蔽可用健康数据。"""
+    tokens = _tokens()
+    delivery = _delivery(
+        effect_outbox={"pending": 7, "oldest_pending_age_sec": None},
+        terminal_failure_outbox={
+            "status_undelivered": 3,
+            "runtime_error_undelivered": 4,
+            "oldest_undelivered_age_sec": None,
+        },
+    )
     monkeypatch.setattr(_dt, "_runtime_health_summary", lambda **_kw: _payload())
-    monkeypatch.setattr(_dt, "_runtime_token_by_lane", lambda **_kw: _tokens())
-    monkeypatch.setattr(_dt, "_runtime_delivery_health", lambda **_kw: _delivery())
+    monkeypatch.setattr(_dt, "_runtime_token_by_lane", lambda **_kw: tokens)
+    monkeypatch.setattr(_dt, "_runtime_delivery_health", lambda **_kw: delivery)
 
     def _boom(**_kw):
         raise RuntimeError("user report db")
@@ -1278,6 +1287,8 @@ def test_runtime_user_report_failure_does_not_hide_health(monkeypatch):
 
     assert "Runtime 健康" in body
     assert "各 lane 健康" in body
+    assert "951.2k" in body
+    assert "<div class='metric-value'>3 / 4</div>" in body
     assert "用户 Token/model 与交付可靠性暂时取不到" in body
     assert "user report db" not in body
 
