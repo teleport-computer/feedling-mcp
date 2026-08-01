@@ -4621,43 +4621,47 @@ def recent_runtime_user_report(*, within_hours: int = 24) -> dict:
     safe_hours = max(1, min(int(within_hours), 24 * 366))
 
     with _pool().connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                "SELECT COALESCE(user_id, 'unknown') AS user_id,"
-                "  COALESCE(NULLIF(provider, ''), 'unknown') AS provider,"
-                "  COALESCE(NULLIF(model, ''), 'unknown') AS model,"
-                "  COALESCE(NULLIF(cache_route_fingerprint, ''), 'unknown') AS route,"
-                "  array_agg("
-                "    DISTINCT COALESCE(NULLIF(lane, ''), 'unknown')"
-                "    ORDER BY COALESCE(NULLIF(lane, ''), 'unknown')"
-                "  ) AS lanes,"
-                "  count(*)::int AS turns,"
-                "  coalesce(sum(model_calls), 0)::bigint AS model_calls,"
-                "  coalesce(sum(retries), 0)::bigint AS retries,"
-                "  coalesce(sum(usage_reported_calls), 0)::bigint"
-                "    AS usage_reported_calls,"
-                "  coalesce(sum(cache_reported_calls), 0)::bigint"
-                "    AS cache_reported_calls,"
-                "  sum(prompt_tokens)::bigint AS prompt_tokens,"
-                "  sum(completion_tokens)::bigint AS completion_tokens,"
-                "  sum(cache_read_tokens)::bigint AS cache_read_tokens,"
-                "  sum(cache_write_tokens)::bigint AS cache_write_tokens,"
-                "  sum(cache_miss_tokens)::bigint AS cache_miss_tokens "
-                "FROM v2_turn_metrics "
-                "WHERE created_at >= now() - make_interval(hours => %s) "
-                "GROUP BY COALESCE(user_id, 'unknown'), provider, model, "
-                "cache_route_fingerprint",
-                (safe_hours,),
-            )
-            rows = cur.fetchall()
-            cur.execute(_RUNTIME_USER_EFFECT_WINDOW_SQL, (safe_hours,))
-            effect_window_rows = cur.fetchall()
-            cur.execute(_RUNTIME_USER_EFFECT_BACKLOG_SQL)
-            effect_backlog_rows = cur.fetchall()
-            cur.execute(_RUNTIME_USER_TERMINAL_WINDOW_SQL, (safe_hours,))
-            terminal_window_rows = cur.fetchall()
-            cur.execute(_RUNTIME_USER_TERMINAL_BACKLOG_SQL)
-            terminal_backlog_rows = cur.fetchall()
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                )
+                cur.execute(
+                    "SELECT COALESCE(user_id, 'unknown') AS user_id,"
+                    "  COALESCE(NULLIF(provider, ''), 'unknown') AS provider,"
+                    "  COALESCE(NULLIF(model, ''), 'unknown') AS model,"
+                    "  COALESCE(NULLIF(cache_route_fingerprint, ''), 'unknown') AS route,"
+                    "  array_agg("
+                    "    DISTINCT COALESCE(NULLIF(lane, ''), 'unknown')"
+                    "    ORDER BY COALESCE(NULLIF(lane, ''), 'unknown')"
+                    "  ) AS lanes,"
+                    "  count(*)::int AS turns,"
+                    "  coalesce(sum(model_calls), 0)::bigint AS model_calls,"
+                    "  coalesce(sum(retries), 0)::bigint AS retries,"
+                    "  coalesce(sum(usage_reported_calls), 0)::bigint"
+                    "    AS usage_reported_calls,"
+                    "  coalesce(sum(cache_reported_calls), 0)::bigint"
+                    "    AS cache_reported_calls,"
+                    "  sum(prompt_tokens)::bigint AS prompt_tokens,"
+                    "  sum(completion_tokens)::bigint AS completion_tokens,"
+                    "  sum(cache_read_tokens)::bigint AS cache_read_tokens,"
+                    "  sum(cache_write_tokens)::bigint AS cache_write_tokens,"
+                    "  sum(cache_miss_tokens)::bigint AS cache_miss_tokens "
+                    "FROM v2_turn_metrics "
+                    "WHERE created_at >= now() - make_interval(hours => %s) "
+                    "GROUP BY COALESCE(user_id, 'unknown'), provider, model, "
+                    "cache_route_fingerprint",
+                    (safe_hours,),
+                )
+                rows = cur.fetchall()
+                cur.execute(_RUNTIME_USER_EFFECT_WINDOW_SQL, (safe_hours,))
+                effect_window_rows = cur.fetchall()
+                cur.execute(_RUNTIME_USER_EFFECT_BACKLOG_SQL)
+                effect_backlog_rows = cur.fetchall()
+                cur.execute(_RUNTIME_USER_TERMINAL_WINDOW_SQL, (safe_hours,))
+                terminal_window_rows = cur.fetchall()
+                cur.execute(_RUNTIME_USER_TERMINAL_BACKLOG_SQL)
+                terminal_backlog_rows = cur.fetchall()
 
     def _optional_int(row, key):
         value = row.get(key)

@@ -5,6 +5,7 @@ import base64
 import inspect
 import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -26,16 +27,22 @@ _TERMINAL = {"completed", "failed", "expired", "superseded"}
 
 @pytest.fixture(autouse=True)
 def _clean_tables():
-    with db.get_pool().connection() as conn:
-        conn.execute("DELETE FROM v2_turn_metrics")
-        # v2_effect_outbox.job_id 没有 FK（只有 user_id 有），所以删 agent_jobs
-        # 不会把它带走——必须显式清，否则上一个测试的积压会漏进下一个测试的
-        # 交付断言。另两张表虽然 CASCADE 得掉，一并显式列出以免下次谁改了 FK。
-        conn.execute("DELETE FROM v2_effect_outbox")
-        conn.execute("DELETE FROM v2_mcp_mutation_attempts")
-        conn.execute("DELETE FROM v2_terminal_failure_outbox")
-        conn.execute("DELETE FROM agent_jobs")
-    yield
+    def clean() -> None:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_turn_metrics")
+            # v2_effect_outbox.job_id 没有 FK（只有 user_id 有），所以删 agent_jobs
+            # 不会把它带走——必须显式清，否则上一个测试的积压会漏进下一个测试的
+            # 交付断言。另两张表虽然 CASCADE 得掉，一并显式列出以免下次谁改了 FK。
+            conn.execute("DELETE FROM v2_effect_outbox")
+            conn.execute("DELETE FROM v2_mcp_mutation_attempts")
+            conn.execute("DELETE FROM v2_terminal_failure_outbox")
+            conn.execute("DELETE FROM agent_jobs")
+
+    clean()
+    try:
+        yield
+    finally:
+        clean()
 
 
 def _add_job(
@@ -679,6 +686,115 @@ def test_runtime_user_report_keeps_old_unfinished_but_windows_finished_effects()
     assert user["delivery"]["oldest_unfinished_age_sec"] == pytest.approx(
         48 * 3600, abs=5
     )
+
+
+def test_runtime_user_report_holds_one_read_only_repeatable_read_snapshot(
+    monkeypatch,
+):
+    seed_user("u_snapshot_delivery")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_effect_outbox "
+            "(effect_id,user_id,effect_type,expected_generation,payload,status) "
+            "VALUES ('e_snapshot_delivery','u_snapshot_delivery','reply',1,"
+            "'{}'::jsonb,'pending')"
+        )
+
+    real_pool = db.get_pool()
+    window_read = threading.Event()
+    update_done = threading.Event()
+    update_errors = []
+    transaction_settings = []
+
+    class CursorProxy:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+        def execute(self, query, params=None):
+            if params is None:
+                result = self._cursor.execute(query)
+            else:
+                result = self._cursor.execute(query, params)
+            if str(query).startswith("SET TRANSACTION"):
+                transaction_settings.append(
+                    self._cursor.connection.execute(
+                        "SELECT current_setting('transaction_isolation'),"
+                        "current_setting('transaction_read_only')"
+                    ).fetchone()
+                )
+            if query == jobs_store._RUNTIME_USER_EFFECT_WINDOW_SQL:
+                window_read.set()
+                assert update_done.wait(5), "writer did not finish between report reads"
+            return result
+
+    class CursorContext:
+        def __init__(self, context):
+            self._context = context
+
+        def __enter__(self):
+            return CursorProxy(self._context.__enter__())
+
+        def __exit__(self, *args):
+            return self._context.__exit__(*args)
+
+    class ConnectionProxy:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+        def cursor(self, *args, **kwargs):
+            return CursorContext(self._connection.cursor(*args, **kwargs))
+
+    class ConnectionContext:
+        def __init__(self, context):
+            self._context = context
+
+        def __enter__(self):
+            return ConnectionProxy(self._context.__enter__())
+
+        def __exit__(self, *args):
+            return self._context.__exit__(*args)
+
+    class PoolProxy:
+        def connection(self):
+            return ConnectionContext(real_pool.connection())
+
+    def apply_effect() -> None:
+        try:
+            assert window_read.wait(5), "report did not reach effect window query"
+            with real_pool.connection() as conn:
+                conn.execute(
+                    "UPDATE v2_effect_outbox SET status='applied',applied_at=now() "
+                    "WHERE effect_id='e_snapshot_delivery'"
+                )
+        except BaseException as exc:  # surfaced in the test thread below
+            update_errors.append(exc)
+        finally:
+            update_done.set()
+
+    monkeypatch.setattr(jobs_store, "_pool", lambda: PoolProxy())
+    writer = threading.Thread(target=apply_effect)
+    writer.start()
+    try:
+        report = jobs_store.recent_runtime_user_report()
+    finally:
+        update_done.set()
+        writer.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert update_errors == []
+    assert transaction_settings == [("repeatable read", "on")]
+    user = next(row for row in report["users"] if row["user_id"] == "u_snapshot_delivery")
+    assert user["delivery"]["reply_effects"] == {
+        "applied_in_window": 0,
+        "pending": 1,
+        "needs_reconciliation": 0,
+    }
 
 
 # ---------------------------------------------------------------------------
