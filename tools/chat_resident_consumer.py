@@ -6920,6 +6920,14 @@ def call_agent_cli(
                       content_excerpt={"prompt_head": (message or "")[:1000]})
     child_env = os.environ.copy()
     child_env.update(_user_mcp_child_env(cmd))
+    # Tell io_cli which lane this turn is, so it can refuse identity writes when
+    # no user is present. usr_a40e (2026-08-01): during a heartbeat wake the model
+    # rewrote the card's signature and the relationship day count (1388 -> a made-up
+    # 220) with nobody talking to it; the user found out because the agent
+    # announced it. Only WRITES are gated — every lane still reads the card, which
+    # is what capture/dream inject as context. `lane` already defaults to
+    # "background" here, so a caller that forgets to pass one fails closed.
+    child_env["FEEDLING_AGENT_LANE"] = lane or "background"
     if trace_id:
         child_env["FEEDLING_TRACE_ID"] = trace_id
         child_env["FEEDLING_DEBUG_TRACE_ID"] = trace_id
