@@ -603,12 +603,18 @@ def test_runtime_user_report_separates_reply_status_and_all_effect_delivery():
         rows = [
             ("e_reply_applied", "reply", "applied", 0),
             ("e_final_applied", "reply_final_fenced_v1", "applied", 0),
+            ("e_terminal_applied", "reply_terminal_fenced_v1", "applied", 0),
+            ("e_intermediate_results", "reply_intermediate_fenced_v1",
+             "applied_with_results", 0),
             ("e_status_applied", "status", "applied", 0),
             ("e_workspace_results", "workspace_batch_encrypted_v1",
              "applied_with_results", 0),
             ("e_discarded", "memory", "discarded", 0),
             ("e_pending", "reply", "pending", 7200),
+            ("e_terminal_pending", "reply_terminal_fenced_v1", "pending", 3600),
             ("e_reconcile", "status", "needs_reconciliation", 60),
+            ("e_intermediate_reconcile", "reply_intermediate_fenced_v1",
+             "needs_reconciliation", 120),
         ]
         for effect_id, effect_type, status, age_sec in rows:
             conn.execute(
@@ -622,16 +628,16 @@ def test_runtime_user_report_separates_reply_status_and_all_effect_delivery():
     user = jobs_store.recent_runtime_user_report()["users"][0]
     delivery = user["delivery"]
     assert delivery["reply_effects"] == {
-        "applied_in_window": 2, "pending": 1, "needs_reconciliation": 0,
+        "applied_in_window": 4, "pending": 2, "needs_reconciliation": 1,
     }
     assert delivery["status_effects"] == {
         "applied_in_window": 1, "pending": 0, "needs_reconciliation": 1,
     }
     assert delivery["all_effects"] == {
-        "applied_in_window": 4,
+        "applied_in_window": 6,
         "discarded_in_window": 1,
-        "pending": 1,
-        "needs_reconciliation": 1,
+        "pending": 2,
+        "needs_reconciliation": 2,
     }
     assert delivery["oldest_unfinished_age_sec"] == pytest.approx(7200, abs=5)
 
@@ -643,7 +649,8 @@ def test_runtime_user_report_keeps_old_unfinished_but_windows_finished_effects()
             "INSERT INTO v2_effect_outbox "
             "(effect_id,user_id,effect_type,expected_generation,payload,status,created_at) "
             "VALUES ('e_old_applied',%s,'reply',1,'{}','applied',now()-interval '48 hours'),"
-            "('e_old_pending',%s,'reply',1,'{}','pending',now()-interval '48 hours')",
+            "('e_old_pending',%s,'reply_final_fenced_v1',1,'{}','pending',"
+            "now()-interval '48 hours')",
             ("u_old_delivery", "u_old_delivery"),
         )
 
@@ -652,6 +659,10 @@ def test_runtime_user_report_keeps_old_unfinished_but_windows_finished_effects()
     assert user["models"] == []
     assert user["delivery"]["reply_effects"]["applied_in_window"] == 0
     assert user["delivery"]["reply_effects"]["pending"] == 1
+    assert user["delivery"]["all_effects"]["pending"] == 1
+    assert user["delivery"]["oldest_unfinished_age_sec"] == pytest.approx(
+        48 * 3600, abs=5
+    )
 
 
 # ---------------------------------------------------------------------------

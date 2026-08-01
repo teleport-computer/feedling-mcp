@@ -4535,21 +4535,38 @@ def recent_runtime_user_report(*, within_hours: int = 24) -> dict:
                   count(*) FILTER (
                     WHERE e.created_at >= cutoff.ts AND e.status = 'discarded'
                   )::int AS all_discarded_in_window,
-                  count(*) FILTER (WHERE e.status = 'pending')::int AS all_pending,
+                  count(*) FILTER (
+                    WHERE e.status IN ('pending', 'pending_fenced_v1')
+                  )::int AS all_pending,
                   count(*) FILTER (
                     WHERE e.status = 'needs_reconciliation'
                   )::int AS all_needs_reconciliation,
                   count(*) FILTER (
                     WHERE e.created_at >= cutoff.ts
-                      AND e.effect_type IN ('reply', 'reply_final_fenced_v1')
+                      AND e.effect_type IN (
+                        'reply',
+                        'reply_final_fenced_v1',
+                        'reply_terminal_fenced_v1',
+                        'reply_intermediate_fenced_v1'
+                      )
                       AND e.status IN ('applied', 'applied_with_results')
                   )::int AS reply_applied_in_window,
                   count(*) FILTER (
-                    WHERE e.effect_type IN ('reply', 'reply_final_fenced_v1')
-                      AND e.status = 'pending'
+                    WHERE e.effect_type IN (
+                      'reply',
+                      'reply_final_fenced_v1',
+                      'reply_terminal_fenced_v1',
+                      'reply_intermediate_fenced_v1'
+                    )
+                      AND e.status IN ('pending', 'pending_fenced_v1')
                   )::int AS reply_pending,
                   count(*) FILTER (
-                    WHERE e.effect_type IN ('reply', 'reply_final_fenced_v1')
+                    WHERE e.effect_type IN (
+                      'reply',
+                      'reply_final_fenced_v1',
+                      'reply_terminal_fenced_v1',
+                      'reply_intermediate_fenced_v1'
+                    )
                       AND e.status = 'needs_reconciliation'
                   )::int AS reply_needs_reconciliation,
                   count(*) FILTER (
@@ -4565,13 +4582,21 @@ def recent_runtime_user_report(*, within_hours: int = 24) -> dict:
                   )::int AS status_needs_reconciliation,
                   extract(epoch FROM (
                     clock_timestamp() - min(e.created_at) FILTER (
-                      WHERE e.status IN ('pending', 'needs_reconciliation')
+                      WHERE e.status IN (
+                        'pending',
+                        'pending_fenced_v1',
+                        'needs_reconciliation'
+                      )
                     )
                   )) AS oldest_unfinished_age_sec
                 FROM v2_effect_outbox e
                 CROSS JOIN cutoff
                 WHERE e.created_at >= cutoff.ts
-                   OR e.status IN ('pending', 'needs_reconciliation')
+                   OR e.status IN (
+                     'pending',
+                     'pending_fenced_v1',
+                     'needs_reconciliation'
+                   )
                 GROUP BY e.user_id
                 """,
                 (safe_hours,),
