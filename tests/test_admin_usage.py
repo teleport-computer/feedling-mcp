@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -854,6 +855,140 @@ def test_usage_raw_report_sets_local_statement_timeout(monkeypatch, usage_rows):
     jobs_store._usage_report_snapshot_raw(_usage_query())
 
     assert settings == [str(jobs_store._USAGE_REPORT_STATEMENT_TIMEOUT_MS)]
+
+
+@pytest.mark.parametrize("failed_section", ["distribution", "daily", "users"])
+def test_usage_core_optional_sections_fail_independently(
+    monkeypatch, usage_rows, failed_section
+):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+    original = jobs_store._usage_optional_pg_section
+
+    def inject(cur, name, reader):
+        if name == failed_section:
+            return original(
+                cur,
+                name,
+                lambda: cur.execute("SELECT missing_usage_optional_column"),
+            )
+        return original(cur, name, reader)
+
+    monkeypatch.setattr(jobs_store, "_usage_optional_pg_section", inject)
+    try:
+        report = jobs_store.usage_report_snapshot(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert report["overview"]["total_tokens"] == 215
+    if failed_section == "distribution":
+        assert report["averages"]["user_day_tokens"] is None
+        assert report["daily"] is not None
+        assert report["users"] is not None
+    elif failed_section == "daily":
+        assert report["daily"] is None
+        assert report["users"] is not None
+    else:
+        assert report["daily"] is not None
+        assert report["users"] is None
+
+
+@pytest.mark.parametrize("failed_section", ["models", "lanes", "primary"])
+def test_usage_dimension_sections_fail_independently(
+    monkeypatch, usage_rows, failed_section
+):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+    original = jobs_store._usage_optional_pg_section
+
+    def inject(cur, name, reader):
+        if name == failed_section:
+            return original(
+                cur,
+                name,
+                lambda: cur.execute("SELECT missing_usage_dimension_column"),
+            )
+        return original(cur, name, reader)
+
+    monkeypatch.setattr(jobs_store, "_usage_optional_pg_section", inject)
+    try:
+        report = jobs_store.usage_report_snapshot(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    if failed_section == "models":
+        assert report["models"] is None
+        assert report["lanes"] is not None
+    elif failed_section == "lanes":
+        assert report["models"] is not None
+        assert report["lanes"] is None
+    else:
+        assert report["models"] is not None
+        assert report["lanes"] is not None
+        assert {row["primary_provider"] for row in report["users"]} == {
+            "unavailable"
+        }
+
+
+def test_usage_importer_two_statements_share_one_total_budget(
+    monkeypatch, usage_rows
+):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+    monkeypatch.setattr(jobs_store, "_USAGE_REPORT_STATEMENT_TIMEOUT_MS", 70)
+
+    def two_sleeps(cur, *_args):
+        cur.execute("SELECT pg_sleep(.045)")
+        cur.execute("SELECT pg_sleep(.045)")
+        return {}
+
+    monkeypatch.setattr(jobs_store, "_usage_parallel_dimension_rows", two_sleeps)
+    started = time.monotonic()
+    try:
+        report = jobs_store.usage_report_snapshot(query)
+    finally:
+        elapsed = time.monotonic() - started
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert elapsed < 0.25
+    assert report["models"] is None
+    assert report["lanes"] is None
+
+
+def test_usage_importer_timeout_cancels_and_releases_before_fallback(
+    monkeypatch, usage_rows
+):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+    monkeypatch.setattr(jobs_store, "_USAGE_REPORT_STATEMENT_TIMEOUT_MS", 50)
+    events = []
+    monkeypatch.setattr(
+        jobs_store,
+        "_usage_snapshot_observer",
+        lambda event, **fields: events.append((event, fields)),
+    )
+
+    def bypass_reader_proxy(cur, *_args):
+        cur.connection.execute("SELECT pg_sleep(.3)")
+        return {}
+
+    monkeypatch.setattr(
+        jobs_store, "_usage_parallel_dimension_rows", bypass_reader_proxy
+    )
+    try:
+        report = jobs_store.usage_report_snapshot(query)
+        with db.get_pool().connection(timeout=0.1) as conn:
+            assert conn.execute("SELECT 1").fetchone()[0] == 1
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert any(event == "cancel" for event, _fields in events)
+    assert report["models"] is None
+    assert report["lanes"] is None
 
 
 def _usage_render_report() -> dict:

@@ -4935,6 +4935,17 @@ def _usage_known_total_order(alias: str = "s") -> str:
     )
 
 
+def _usage_optional_pg_section(cur, name: str, reader):
+    """Rollback one optional aggregate without poisoning the shared snapshot."""
+
+    try:
+        with cur.connection.transaction():
+            return reader()
+    except Exception:
+        log.exception("usage %s section unavailable", name)
+        return None
+
+
 def _usage_parallel_core_rows(cur, query, partition, *, unknown_auxiliary=True) -> dict:
     """Aggregate user/day facts inside PostgreSQL; never fetch canonical rows."""
 
@@ -4957,9 +4968,7 @@ FROM source s
         params,
     )
     totals = cur.fetchone()
-    cur.execute(
-        prefix
-        + f""",
+    distribution_sql = prefix + f""",
 user_days AS (
  SELECT user_id,local_day,{_usage_known_sum('prompt_tokens')} AS prompt_tokens,
  {_usage_known_sum('completion_tokens')} AS completion_tokens
@@ -4973,23 +4982,23 @@ SELECT percentile_cont(.5) WITHIN GROUP (ORDER BY total_tokens) AS p50,
  percentile_cont(.9) WITHIN GROUP (ORDER BY total_tokens) AS p90,
  percentile_cont(.95) WITHIN GROUP (ORDER BY total_tokens) AS p95,
  max(total_tokens) AS max FROM known
-""",
-        params,
+"""
+    distribution = _usage_optional_pg_section(
+        cur,
+        "distribution",
+        lambda: (cur.execute(distribution_sql, params), cur.fetchone())[1],
     )
-    distribution = cur.fetchone()
-    cur.execute(
-        prefix
-        + f"""
+    daily_sql = prefix + f"""
 SELECT local_day,{aggregates},
  count(DISTINCT user_id) FILTER (WHERE model_calls>0)::int AS model_active_users
 FROM source s GROUP BY local_day ORDER BY local_day
-""",
-        params,
+"""
+    daily = _usage_optional_pg_section(
+        cur,
+        "daily",
+        lambda: (cur.execute(daily_sql, params), cur.fetchall())[1],
     )
-    daily = cur.fetchall()
-    cur.execute(
-        prefix
-        + f""",
+    users_sql = prefix + f""",
 user_days AS (
  SELECT user_id,local_day,{_usage_known_sum('prompt_tokens')} AS prompt_tokens,
  {_usage_known_sum('completion_tokens')} AS completion_tokens
@@ -5009,10 +5018,12 @@ SELECT s.user_id,{aggregates},
 FROM source s LEFT JOIN dist USING (user_id) GROUP BY s.user_id
 ORDER BY {_usage_known_total_order()} DESC NULLS LAST,
  sum(s.model_calls) DESC,s.user_id
-""",
-        params,
+"""
+    users = _usage_optional_pg_section(
+        cur,
+        "users",
+        lambda: (cur.execute(users_sql, params), cur.fetchall())[1],
     )
-    users = cur.fetchall()
     result = {
         "totals": totals,
         "distribution": distribution,
@@ -5038,6 +5049,8 @@ ORDER BY {_usage_known_total_order()} DESC NULLS LAST,
             ("daily", ("local_day",)),
             ("users", ("user_id",)),
         ):
+            if result[section] is None or auxiliary[section] is None:
+                continue
             by_key = {
                 tuple(row[key] for key in keys): row
                 for row in auxiliary[section]
@@ -5072,11 +5085,13 @@ ORDER BY {_usage_known_total_order()} DESC NULLS LAST,
         )
         return cur.fetchall()
 
-    models = grouped("provider,model")
-    lanes = grouped("lane")
-    cur.execute(
-        prefix
-        + """,
+    models = _usage_optional_pg_section(
+        cur, "models", lambda: grouped("provider,model")
+    )
+    lanes = _usage_optional_pg_section(
+        cur, "lanes", lambda: grouped("lane")
+    )
+    primary_sql = prefix + """,
 ranked AS (
  SELECT user_id,provider,model,
  row_number() OVER (PARTITION BY user_id
@@ -5084,10 +5099,13 @@ ranked AS (
  FROM source GROUP BY user_id,provider,model
 )
 SELECT user_id,provider,model FROM ranked WHERE rank=1
-""",
-        params,
+"""
+    primary = _usage_optional_pg_section(
+        cur,
+        "primary",
+        lambda: (cur.execute(primary_sql, params), cur.fetchall())[1],
     )
-    result = {"models": models, "lanes": lanes, "primary": cur.fetchall()}
+    result = {"models": models, "lanes": lanes, "primary": primary}
     if query.completeness == "unknown" and unknown_auxiliary:
         all_days = tuple(sorted(partition.rollup_days + partition.raw_days))
         auxiliary = _usage_parallel_dimension_rows(
@@ -5105,6 +5123,8 @@ SELECT user_id,provider,model FROM ranked WHERE rank=1
             ("models", ("provider", "model")),
             ("lanes", ("lane",)),
         ):
+            if result[section] is None or auxiliary[section] is None:
+                continue
             by_key = {
                 tuple(row[key] for key in keys): row
                 for row in auxiliary[section]
@@ -5175,29 +5195,119 @@ def _usage_parallel_latency_bundle(cur, query, partition) -> dict:
     }
 
 
-def _usage_import_snapshot(snapshot_id: str, reader, *args):
+class _UsageImporterControl:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._conn = None
+
+    def attach(self, conn) -> None:
+        with self._lock:
+            self._conn = conn
+
+    def detach(self, conn) -> None:
+        with self._lock:
+            if self._conn is conn:
+                self._conn = None
+
+    def cancel(self) -> None:
+        with self._lock:
+            conn = self._conn
+        if conn is not None:
+            _usage_snapshot_observer("cancel", role="importer")
+            conn.cancel()
+
+    def close(self) -> None:
+        with self._lock:
+            conn = self._conn
+        if conn is not None:
+            conn.close()
+
+
+def _usage_remaining_timeout_ms(deadline: float) -> int:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("usage report deadline exceeded")
+    return max(1, int(remaining * 1000))
+
+
+class _UsageDeadlineCursor:
+    def __init__(self, cursor, deadline: float):
+        self._cursor = cursor
+        self._deadline = deadline
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+    def execute(self, statement, params=None):
+        timeout_ms = _usage_remaining_timeout_ms(self._deadline)
+        self._cursor.execute(
+            "SELECT set_config('statement_timeout',%s,true)",
+            (str(timeout_ms),),
+        )
+        if params is None:
+            return self._cursor.execute(statement)
+        return self._cursor.execute(statement, params)
+
+
+def _usage_cancel_and_settle(future, control: _UsageImporterControl) -> None:
+    future.cancel()
+    try:
+        control.cancel()
+    except Exception:
+        pass
+    try:
+        future.result(timeout=1.0)
+    except FutureTimeoutError:
+        control.close()
+        try:
+            future.result(timeout=1.0)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _usage_importer_result(future, control, deadline: float):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        _usage_cancel_and_settle(future, control)
+        raise TimeoutError("usage importer total deadline exceeded")
+    try:
+        return future.result(timeout=remaining)
+    except FutureTimeoutError:
+        _usage_cancel_and_settle(future, control)
+        raise TimeoutError("usage importer total deadline exceeded")
+
+
+def _usage_import_snapshot(
+    snapshot_id: str,
+    control: _UsageImporterControl,
+    deadline: float,
+    reader,
+    *args,
+):
     """Import before every data read and isolate rollback/connection failure."""
 
     pool = _pool()
     with pool.connection(timeout=_USAGE_REPORT_POOL_TIMEOUT_SECONDS) as conn:
-        with conn.transaction():
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
-                )
-                cur.execute(
-                    sql.SQL("SET TRANSACTION SNAPSHOT {}").format(
-                        sql.Literal(snapshot_id)
+        control.attach(conn)
+        try:
+            with conn.transaction():
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
                     )
-                )
-                cur.execute(
-                    "SELECT set_config('statement_timeout',%s,true)",
-                    (str(_USAGE_REPORT_STATEMENT_TIMEOUT_MS),),
-                )
-                _usage_snapshot_observer(
-                    "imported", role=getattr(reader, "__name__", "reader")
-                )
-                return reader(cur, *args)
+                    cur.execute(
+                        sql.SQL("SET TRANSACTION SNAPSHOT {}").format(
+                            sql.Literal(snapshot_id)
+                        )
+                    )
+                    _usage_snapshot_observer(
+                        "imported", role=getattr(reader, "__name__", "reader")
+                    )
+                    return reader(_UsageDeadlineCursor(cur, deadline), *args)
+        finally:
+            control.detach(conn)
 
 
 def _usage_payload_from_parallel_rows(
@@ -5266,48 +5376,51 @@ def _usage_payload_from_parallel_rows(
         "retries_per_turn": _usage_rate(overview["retries"], overview["turns"]),
     }
 
-    daily_by_day = {row["local_day"]: row for row in (core.get("daily") or [])}
-    daily = []
-    day = query.start_at_utc.astimezone(usage_reporting.SHANGHAI).date()
-    last_day = (query.end_at_utc - timedelta(microseconds=1)).astimezone(usage_reporting.SHANGHAI).date()
-    while day <= last_day:
-        row = daily_by_day.get(day)
-        if row is None:
-            item = {
-                "turns": 0, "model_calls": 0, "retries": 0, "failed_turns": 0,
-                "metered_turns": 0, "prompt_tokens": 0, "completion_tokens": 0,
-                "total_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0,
-                "cache_miss_tokens": 0, "unknown_usage_calls": 0,
-                "usage_reported_calls": 0, "cache_reported_calls": 0,
-                "usage_coverage": None, "cache_coverage": None, "cache_hit_ratio": None,
-            }
-            active_users = 0
-            day_metered_total = None
-        else:
-            item = render(row)
-            active_users = int(row["model_active_users"] or 0)
-            mp = _usage_optional_int(row, "metered_prompt_tokens")
-            mc = _usage_optional_int(row, "metered_completion_tokens")
-            day_metered_total = mp + mc if mp is not None and mc is not None else None
-        item.update({
-            "local_day": day.isoformat(), "model_active_users": active_users,
-            "tokens_per_active_user_day": float(item["total_tokens"]) / active_users if item["total_tokens"] is not None and active_users else None,
-            "tokens_per_metered_turn": float(day_metered_total) / item["metered_turns"] if day_metered_total is not None and item["metered_turns"] else None,
-        })
-        daily.append(item)
-        day += timedelta(days=1)
+    daily = None
+    if core.get("daily") is not None:
+        daily_by_day = {row["local_day"]: row for row in core["daily"]}
+        daily = []
+        day = query.start_at_utc.astimezone(usage_reporting.SHANGHAI).date()
+        last_day = (query.end_at_utc - timedelta(microseconds=1)).astimezone(usage_reporting.SHANGHAI).date()
+        while day <= last_day:
+            row = daily_by_day.get(day)
+            if row is None:
+                item = {
+                    "turns": 0, "model_calls": 0, "retries": 0, "failed_turns": 0,
+                    "metered_turns": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                    "total_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0,
+                    "cache_miss_tokens": 0, "unknown_usage_calls": 0,
+                    "usage_reported_calls": 0, "cache_reported_calls": 0,
+                    "usage_coverage": None, "cache_coverage": None, "cache_hit_ratio": None,
+                }
+                active_users = 0
+                day_metered_total = None
+            else:
+                item = render(row)
+                active_users = int(row["model_active_users"] or 0)
+                mp = _usage_optional_int(row, "metered_prompt_tokens")
+                mc = _usage_optional_int(row, "metered_completion_tokens")
+                day_metered_total = mp + mc if mp is not None and mc is not None else None
+            item.update({
+                "local_day": day.isoformat(), "model_active_users": active_users,
+                "tokens_per_active_user_day": float(item["total_tokens"]) / active_users if item["total_tokens"] is not None and active_users else None,
+                "tokens_per_metered_turn": float(day_metered_total) / item["metered_turns"] if day_metered_total is not None and item["metered_turns"] else None,
+            })
+            daily.append(item)
+            day += timedelta(days=1)
 
+    primary_rows = (dimensions or {}).get("primary")
     primary = {
         str(row["user_id"]): (str(row["provider"]), str(row["model"]))
-        for row in (dimensions or {}).get("primary", [])
+        for row in (primary_rows or [])
     }
-    users = []
+    users = None if core.get("users") is None else []
     for row in core.get("users") or []:
         item = render(row)
         provider, model = primary.get(
             str(row["user_id"]),
             ("unavailable", "unavailable")
-            if dimensions is None
+            if dimensions is None or primary_rows is None
             else ("unknown", "unknown"),
         )
         mp = _usage_optional_int(row, "metered_prompt_tokens")
@@ -5328,7 +5441,7 @@ def _usage_payload_from_parallel_rows(
         users.append(item)
 
     def identity_rows(name: str, fields: tuple[str, ...]):
-        if dimensions is None:
+        if dimensions is None or dimensions.get(name) is None:
             return None
         latency_rows = ((latency_bundle or {}).get("latency") or {}).get(name, [])
         latency = {tuple(row[field] for field in fields): row for row in latency_rows}
@@ -6554,12 +6667,19 @@ def _usage_report_snapshot_hybrid_parallel(
             cur.execute("SELECT pg_export_snapshot()")
             snapshot_id = str(cur.fetchone()["pg_export_snapshot"])
             _usage_snapshot_observer("exported", snapshot_id=snapshot_id)
+            importer_deadline = (
+                time.monotonic() + _USAGE_REPORT_STATEMENT_TIMEOUT_MS / 1000
+            )
+            dimension_control = _UsageImporterControl()
+            latency_control = _UsageImporterControl()
             with ThreadPoolExecutor(
                 max_workers=2, thread_name_prefix="usage-report"
             ) as executor:
                 dimension_future = executor.submit(
                     _usage_import_snapshot,
                     snapshot_id,
+                    dimension_control,
+                    importer_deadline,
                     _usage_parallel_dimension_rows,
                     query,
                     partition,
@@ -6567,6 +6687,8 @@ def _usage_report_snapshot_hybrid_parallel(
                 latency_future = executor.submit(
                     _usage_import_snapshot,
                     snapshot_id,
+                    latency_control,
+                    importer_deadline,
                     _usage_parallel_latency_bundle,
                     query,
                     partition,
@@ -6574,8 +6696,10 @@ def _usage_report_snapshot_hybrid_parallel(
                 core = _usage_parallel_core_rows(cur, query, partition)
                 cohort = _usage_cohort_on_cursor(cur, query)
                 try:
-                    dimensions = dimension_future.result(
-                        timeout=_USAGE_REPORT_STATEMENT_TIMEOUT_MS / 1000 + 1
+                    dimensions = _usage_importer_result(
+                        dimension_future,
+                        dimension_control,
+                        importer_deadline,
                     )
                 except Exception:
                     dimension_future.cancel()
@@ -6583,6 +6707,10 @@ def _usage_report_snapshot_hybrid_parallel(
                         "usage dimension importer unavailable; trying serial"
                     )
                     try:
+                        cur.execute(
+                            "SELECT set_config('statement_timeout',%s,true)",
+                            (str(_usage_remaining_timeout_ms(importer_deadline)),),
+                        )
                         with conn.transaction():
                             dimensions = _usage_parallel_dimension_rows(
                                 cur, query, partition
@@ -6593,8 +6721,10 @@ def _usage_report_snapshot_hybrid_parallel(
                         )
                         dimensions = None
                 try:
-                    latency_bundle = latency_future.result(
-                        timeout=_USAGE_REPORT_STATEMENT_TIMEOUT_MS / 1000 + 1
+                    latency_bundle = _usage_importer_result(
+                        latency_future,
+                        latency_control,
+                        importer_deadline,
                     )
                 except Exception:
                     latency_future.cancel()
@@ -6602,6 +6732,10 @@ def _usage_report_snapshot_hybrid_parallel(
                         "usage latency/filter importer unavailable; trying serial"
                     )
                     try:
+                        cur.execute(
+                            "SELECT set_config('statement_timeout',%s,true)",
+                            (str(_usage_remaining_timeout_ms(importer_deadline)),),
+                        )
                         with conn.transaction():
                             latency_bundle = _usage_parallel_latency_bundle(
                                 cur, query, partition
