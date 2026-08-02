@@ -197,7 +197,8 @@ certificate, whose live fingerprint is checked against attestation `REPORT_DATA`
 | CVM ID | `0711c9a4-afdc-40c6-ba49-d8cb95f7e850` |
 | App ID | `9798850e096d770293c67305c6cfdceed68c1d28` |
 | Instance ID | `6fe9b54c9f2b428158c3e74de615d0f0a0c457ba` |
-| Compose | `deploy/docker-compose.phala.yaml` — `ingress`, `backend`, `enclave`, `enclave-domain`, `serve-worker`（`mcp` 服务已随 MCP 线于 2026-06-12 移除） |
+| Current/live Compose | Deployment unit `deploy/docker-compose.phala.yaml`; recorded live service set: `ingress`, `backend`, `enclave`（`mcp` 服务已随 MCP 线于 2026-06-12 移除） |
+| Release/source topology | The staged `deploy/docker-compose.phala.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, and `serve-worker`; this source row is not evidence that the custom domain has been deployed or is live. |
 | Current image | `ghcr.io/teleport-computer/feedling:22b0ed6` |
 | Live git commit | `22b0ed6aa92a05d76951768f1924f45010ecda15` |
 | Live built at | `2026-07-02T19:04:02Z` |
@@ -232,7 +233,8 @@ python tools/verify_enclave_domain.py \
 | CVM ID | `5bfa1543-c5b4-42ca-842d-fd88984e5edf` (also in `deploy/test-cvm-id.txt`) |
 | App ID | `173c7f49aeb54acb424676b17b17f78e5e2b2938` |
 | Created | 2026-07-01 as `feedling-io-test`, instance `tdx.small`, **Phala KMS** (prod9 chain-0). Account migration (path B): the old test CVM `19b13ebe-d12e-4d19-97d1-6cf41389b663` / app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` under `sxysun` was abandoned (balance exhausted 2026-06-18). Fresh app_id → new `enclave_content_pk`, so the reused test RDS was wiped of undecryptable rows. iOS test build repointed to the new app_id. Bootstrapped via the one-shot `.github/workflows/bootstrap-test-cvm.yml` (push to `bootstrap-cvm` branch; workflow since removed). CI deploy key is now `TEST_PHALA_CLOUD_API_KEY` (separate from prod's `PHALA_CLOUD_API_KEY`). |
-| Compose | `deploy/docker-compose.phala.test.yaml` — same 5 services as prod (`ingress`/`backend`/`enclave`/`enclave-domain`/`serve-worker`), with test domains + `_test` volumes |
+| Current/live Compose | Deployment unit `deploy/docker-compose.phala.test.yaml`; recorded live service set matches prod: `ingress`, `backend`, `enclave`, with test domains + `_test` volumes |
+| Release/source topology | The staged `deploy/docker-compose.phala.test.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, and `serve-worker`; this source row is not evidence that the custom domain has been deployed or is live. |
 | Public API | `https://test-api.feedling.app` (via dstack-ingress — live, `/healthz` 200) |
 | Public MCP | 已下线（FastMCP 服务器 2026-06-12 移除） |
 | Database | Dedicated test RDS `feedling-mcp-test-t4g-micro.cgh0oucoe0x9.us-east-1.rds.amazonaws.com:5432/postgres` — fully isolated from prod (separate instance → separate `enclave_content_pk` self-consistent, no shared schema). Injected via `TEST_DATABASE_URL`. |
@@ -285,7 +287,8 @@ in test, pre, and production.
 | CVM ID | `82485d6f-9c23-48f1-9bdd-5a0d38531c3e` (also in `deploy/pre-cvm-id.txt`) |
 | App ID | `7d18a1f234a0d90e5f643cac8283b6048451b8f7` |
 | Created | 2026-07-07 as `feedling-io-pre`, `tdx.small`, **Phala KMS** (prod9). Provisioned locally via `phala deploy` (no `--cvm-id` ⇒ new app) without secrets, to mint the app_id; the healthy secret-bearing deploy is the CI `deploy-pre-cvm` job. |
-| Compose | `deploy/docker-compose.phala.pre.yaml` — same 5 services as test (`ingress`/`backend`/`enclave`/`enclave-domain`/`serve-worker`), with pre domains + `_pre` volumes. `FEEDLING_IO_ONBOARDING_BRANCH` stays `test` (io-onboarding has no pre branch). |
+| Current/live Compose | Deployment unit `deploy/docker-compose.phala.pre.yaml`; recorded live service set matches test: `ingress`, `backend`, `enclave`, with `pre-api.feedling.app` + `_pre` volumes. `FEEDLING_IO_ONBOARDING_BRANCH` stays `test` (io-onboarding has no pre branch). `FEEDLING_HOSTED_RUNTIME_POLICY` is literal `v2_only`; no encrypted env can select resident. |
+| Release/source topology | The staged `deploy/docker-compose.phala.pre.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, and `serve-worker`; this source row is not evidence that the custom domain has been deployed or is live. |
 | Public API | `https://pre-api.feedling.app` (dstack-ingress auto-creates the CF DNS records once CI injects `CF_*`) |
 | Attestation | `https://7d18a1f234a0d90e5f643cac8283b6048451b8f7-5003s.dstack-pha-prod9.phala.network/attestation` (repo var `PRE_MAIN_ENCLAVE_URL`) |
 | Database | Dedicated pre RDS, injected via `PRE_DATABASE_URL` — fully isolated from test/prod (pre's enclave content key differs from test's, so sharing a DB would mix mutually-undecryptable ciphertext + double-schedule proactive jobs). |
