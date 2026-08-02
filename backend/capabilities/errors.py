@@ -13,6 +13,11 @@ UPSTREAM = "capability_upstream_error"
 # so the caller can tell "you turned web off" apart from an auth/permission
 # failure. Never retryable — retrying changes nothing until the user re-enables.
 DISABLED = "capability_disabled"
+# The caller has spent its per-user budget for this capability in the current
+# window. Distinct from UNAVAILABLE (operator halt) so the client can tell
+# "you're going too fast, wait" apart from "the operator turned this off".
+# Always retryable — the window drains on its own.
+RATE_LIMITED = "capability_rate_limited"
 
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
