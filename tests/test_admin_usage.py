@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -67,12 +68,28 @@ def test_admin_usage_scale_harness_self_check():
     }
 
 
-def test_admin_usage_scale_uses_full_shanghai_days_and_a_dedicated_local_db():
+def test_admin_usage_scale_uses_rolling_90d_partition_and_dedicated_local_db():
     harness = _load_usage_scale_harness()
 
     start_at, end_at = harness._production_window()
-    assert start_at.isoformat() == "2026-05-03T16:00:00+00:00"
-    assert end_at.isoformat() == "2026-08-01T16:00:00+00:00"
+    assert start_at.isoformat() == "2026-05-04T12:30:00+00:00"
+    assert end_at.isoformat() == "2026-08-02T12:30:00+00:00"
+    partition = usage_reporting.rollup_partition(
+        _usage.UsageQuery(
+            start_at_utc=start_at,
+            end_at_utc=end_at,
+            timezone="Asia/Shanghai",
+            preset="90d",
+        )
+    )
+    assert partition is not None
+    assert len(partition.rollup_days) == 89
+    assert partition.rollup_days[0].isoformat() == "2026-05-05"
+    assert partition.rollup_days[-1].isoformat() == "2026-08-01"
+    assert [day.isoformat() for day in partition.raw_days] == [
+        "2026-05-04",
+        "2026-08-02",
+    ]
     assert harness._validate_scale_database_url(
         "postgresql://postgres:test@127.0.0.1:55432/feedling_usage_scale_task4d"
     ) == {
@@ -80,14 +97,91 @@ def test_admin_usage_scale_uses_full_shanghai_days_and_a_dedicated_local_db():
         "host": "127.0.0.1",
         "port": 55432,
     }
+    assert harness._validate_scale_database_url(
+        "host=localhost port=55432 "
+        "dbname=feedling_usage_scale_conninfo user=postgres"
+    ) == {
+        "database": "feedling_usage_scale_conninfo",
+        "host": "localhost",
+        "port": 55432,
+    }
 
     for unsafe in (
         "postgresql://postgres:test@127.0.0.1:55432/postgres",
         "postgresql://postgres:test@feedling-prod.example.com:5432/feedling_usage_scale_task4d",
         "postgresql://postgres:test@127.0.0.1:55432/feedling_test",
+        "postgresql://postgres:test@127.0.0.1:55432/feedling_usage_scale_task4d?host=prod.example.com",
+        "postgresql://postgres:test@127.0.0.1:55432/feedling_usage_scale_task4d?hostaddr=10.0.0.10",
+        "postgresql://postgres:test@127.0.0.1:55432/feedling_usage_scale_task4d?port=5432",
+        "postgresql://postgres:test@127.0.0.1:55432/feedling_usage_scale_task4d?dbname=postgres",
+        "host=127.0.0.1,prod.example.com port=55432 dbname=feedling_usage_scale_task4d",
+        "host=127.0.0.1 port=55432 dbname=feedling_usage_scale_task4d service=prod",
+        "host=127.0.0.1 port=55432 dbname=feedling_usage_scale_task4d servicefile=/tmp/prod.conf",
+        "service=prod",
     ):
         with pytest.raises(SystemExit, match="dedicated local PostgreSQL"):
             harness._validate_scale_database_url(unsafe)
+
+
+def test_admin_usage_scale_revalidates_connected_database_identity():
+    harness = _load_usage_scale_harness()
+    validate = getattr(harness, "_validate_connected_scale_database", None)
+    assert validate is not None, "connected database identity check is required"
+    expected = {
+        "database": "feedling_usage_scale_task4d",
+        "host": "127.0.0.1",
+        "port": 55432,
+    }
+    safe = SimpleNamespace(
+        info=SimpleNamespace(
+            dbname="feedling_usage_scale_task4d",
+            host="127.0.0.1",
+            port=55432,
+        )
+    )
+    assert validate(safe, expected) == expected
+
+    for field, value in (
+        ("dbname", "postgres"),
+        ("host", "prod.example.com"),
+        ("port", 5432),
+    ):
+        info = SimpleNamespace(
+            dbname="feedling_usage_scale_task4d",
+            host="127.0.0.1",
+            port=55432,
+        )
+        setattr(info, field, value)
+        with pytest.raises(RuntimeError, match="connected PostgreSQL identity"):
+            validate(SimpleNamespace(info=info), expected)
+
+
+def test_admin_usage_scale_records_and_enforces_rolling_partition():
+    harness = _load_usage_scale_harness()
+    validate = getattr(harness, "_validate_rolling_partition", None)
+    assert validate is not None, "rolling partition gate is required"
+    start_at, end_at = harness._production_window()
+    partition = usage_reporting.rollup_partition(
+        _usage.UsageQuery(
+            start_at_utc=start_at,
+            end_at_utc=end_at,
+            timezone="Asia/Shanghai",
+            preset="90d",
+        )
+    )
+    assert partition is not None
+
+    assert validate(partition) == {
+        "rollup_days": [day.isoformat() for day in partition.rollup_days],
+        "raw_days": [day.isoformat() for day in partition.raw_days],
+    }
+    with pytest.raises(AssertionError, match="89 full rollup days and 2 partial"):
+        validate(
+            usage_reporting.RollupPartition(
+                rollup_days=partition.rollup_days,
+                raw_days=partition.raw_days[:1],
+            )
+        )
 
 
 def test_admin_usage_scale_sql_guards_allow_rollup_only_and_bound_raw_ranges():

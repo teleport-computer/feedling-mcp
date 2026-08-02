@@ -21,9 +21,10 @@ import re
 import sys
 import time
 from typing import Any
-from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
+
+from psycopg.conninfo import conninfo_to_dict
 
 
 DEFAULT_ROWS = 3_000_000
@@ -37,6 +38,8 @@ ROLLUP_TABLES = (
     "v2_usage_rollup_watermarks",
 )
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+SCALE_NOW_UTC = datetime(2026, 8, 2, 12, 30, tzinfo=timezone.utc)
+_LOCAL_SCALE_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _SENSITIVE_COLUMNS = frozenset(
     {
         "body_ct",
@@ -108,23 +111,45 @@ def assert_metric_time_ranges(statements: list[tuple[str, tuple[Any, ...]]]) -> 
             raise AssertionError("v2 metric statement lost its half-open created_at range")
 
 
-def _production_window() -> tuple[datetime, datetime]:
-    """Return 90 complete Shanghai days through 2026-08-01 inclusive."""
+def _production_window(
+    now_utc: datetime = SCALE_NOW_UTC,
+) -> tuple[datetime, datetime]:
+    """Return the reproducible rolling 90-day preset at a non-midnight now."""
 
-    end_local = datetime(2026, 8, 2, tzinfo=SHANGHAI)
-    start_local = end_local - timedelta(days=90)
-    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+    if now_utc.tzinfo is None or now_utc.utcoffset() is None:
+        raise ValueError("scale gate now must be timezone-aware")
+    end_at = now_utc.astimezone(timezone.utc)
+    return end_at - timedelta(days=90), end_at
 
 
 def _validate_scale_database_url(database_url: str) -> dict[str, Any]:
     """Refuse remote/shared databases before any destructive scale-fixture work."""
 
-    parsed = urlsplit(database_url)
-    database = unquote(parsed.path.lstrip("/"))
-    port = parsed.port or 5432
+    try:
+        conninfo = conninfo_to_dict(database_url)
+    except Exception as exc:
+        raise SystemExit(
+            "performance fixture requires a dedicated local PostgreSQL database: "
+            "127.0.0.1:55432/feedling_usage_scale_<name>"
+        ) from exc
+    database = str(conninfo.get("dbname") or "")
+    host = str(conninfo.get("host") or "")
+    hostaddr = str(conninfo.get("hostaddr") or "")
+    port_text = str(conninfo.get("port") or "")
+    hosts = host.split(",") if host else []
+    hostaddrs = hostaddr.split(",") if hostaddr else []
+    ports = port_text.split(",") if port_text else []
+    try:
+        port = int(ports[0]) if len(ports) == 1 else 0
+    except ValueError:
+        port = 0
     safe = bool(
-        parsed.scheme in {"postgres", "postgresql"}
-        and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+        not conninfo.get("service")
+        and not conninfo.get("servicefile")
+        and len(hosts) == 1
+        and hosts[0] in _LOCAL_SCALE_HOSTS
+        and (not hostaddrs or len(hostaddrs) == 1 and hostaddrs[0] in _LOCAL_SCALE_HOSTS)
+        and len(ports) == 1
         and port == 55432
         and database.startswith("feedling_usage_scale_")
         and database != "feedling_usage_scale_"
@@ -134,7 +159,47 @@ def _validate_scale_database_url(database_url: str) -> dict[str, Any]:
             "performance fixture requires a dedicated local PostgreSQL database: "
             "127.0.0.1:55432/feedling_usage_scale_<name>"
         )
-    return {"database": database, "host": parsed.hostname, "port": port}
+    return {"database": database, "host": hosts[0], "port": port}
+
+
+def _validate_connected_scale_database(conn, expected: dict[str, Any]) -> dict[str, Any]:
+    """Recheck libpq's connected endpoint before schema checks or fixture writes."""
+
+    actual = {
+        "database": str(conn.info.dbname or ""),
+        "host": str(conn.info.host or ""),
+        "port": int(conn.info.port or 0),
+    }
+    if actual != expected:
+        raise RuntimeError(
+            "connected PostgreSQL identity does not match the validated dedicated "
+            f"scale database: expected={expected}, actual={actual}"
+        )
+    return actual
+
+
+def _validate_rolling_partition(partition) -> dict[str, list[str]]:
+    """Require the real 90d preset shape: full interior days, two raw edges."""
+
+    if partition is None:
+        raise AssertionError(
+            "rolling 90d gate requires 89 full rollup days and 2 partial raw days; "
+            "got no rollup partition"
+        )
+    rollup_days = [day.isoformat() for day in partition.rollup_days]
+    raw_days = [day.isoformat() for day in partition.raw_days]
+    valid = bool(
+        len(rollup_days) == 89
+        and rollup_days[0] == "2026-05-05"
+        and rollup_days[-1] == "2026-08-01"
+        and raw_days == ["2026-05-04", "2026-08-02"]
+    )
+    if not valid:
+        raise AssertionError(
+            "rolling 90d gate requires 89 full rollup days and 2 partial raw "
+            f"days; got rollup={rollup_days}, raw={raw_days}"
+        )
+    return {"rollup_days": rollup_days, "raw_days": raw_days}
 
 
 def _self_test() -> int:
@@ -580,10 +645,15 @@ def _run(args) -> int:
 
     import db  # noqa: PLC0415
     from admin.usage import UsageQuery  # noqa: PLC0415
-    from model_api_runtime.v2 import jobs_store, usage_rollup  # noqa: PLC0415
+    from model_api_runtime.v2 import (  # noqa: PLC0415
+        jobs_store,
+        usage_reporting,
+        usage_rollup,
+    )
 
     pool = db.get_pool()
     with pool.connection() as conn:
+        _validate_connected_scale_database(conn, database_identity)
         _assert_schema(conn)
         _assert_empty_dedicated_database(conn)
     prefix = f"scale_usage_{uuid4().hex[:10]}_"
@@ -604,6 +674,9 @@ def _run(args) -> int:
             preset="90d",
         ),
     }
+    expected_partition = _validate_rolling_partition(
+        usage_reporting.rollup_partition(queries["unfiltered"])
+    )
     evidence: dict[str, Any] = {
         "database": {
             **database_identity,
@@ -627,6 +700,9 @@ def _run(args) -> int:
             "start_at_utc": start_at,
             "end_at_utc": end_at,
             "half_open": True,
+            "preset": "90d",
+            "fixed_now_at_utc": SCALE_NOW_UTC,
+            "expected_partition": expected_partition,
         },
         "cohorts": {},
     }
@@ -701,9 +777,20 @@ def _run(args) -> int:
             raw_sql_omitted = not any(
                 "v2_turn_metrics" in sql for sql, _params in statements
             )
-            if not coverage["raw_days"] and not raw_sql_omitted:
+            actual_partition = {
+                "rollup_days": coverage["rollup_days"],
+                "raw_days": coverage["raw_days"],
+            }
+            if actual_partition != expected_partition:
                 raise AssertionError(
-                    "rollup-only production report retained a v2_turn_metrics branch"
+                    "production report did not use the expected rolling partition: "
+                    f"expected={expected_partition}, actual={actual_partition}"
+                )
+            raw_sql_present = not raw_sql_omitted
+            if raw_sql_present != bool(expected_partition["raw_days"]):
+                raise AssertionError(
+                    "raw metric SQL presence did not match rolling partial days: "
+                    f"raw_sql_present={raw_sql_present}, partition={actual_partition}"
                 )
             assert_content_free_metric_sql(statements)
             assert_metric_time_ranges(statements)
@@ -728,6 +815,8 @@ def _run(args) -> int:
                 "content_free_metric_sql": True,
                 "half_open_created_at_range": True,
                 "rollup_only_omits_raw_table": raw_sql_omitted,
+                "raw_table_sql_present": raw_sql_present,
+                "raw_table_branch_matches_partition": True,
             }
     finally:
         if not args.keep_data:
