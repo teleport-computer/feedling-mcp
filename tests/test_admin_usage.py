@@ -991,6 +991,111 @@ def test_usage_importer_timeout_cancels_and_releases_before_fallback(
     assert report["lanes"] is None
 
 
+def test_usage_importer_cancel_owns_connection_until_detach():
+    control = jobs_store._UsageImporterControl()
+    cancel_entered = threading.Event()
+    allow_cancel_return = threading.Event()
+    detached = threading.Event()
+
+    class Connection:
+        def cancel_safe(self, *, timeout):
+            assert timeout == 0.25
+            cancel_entered.set()
+            assert allow_cancel_return.wait(timeout=1)
+
+    conn = Connection()
+    control.attach(conn)
+    cancel_thread = threading.Thread(target=control.cancel)
+    cancel_thread.start()
+    assert cancel_entered.wait(timeout=1)
+
+    def detach():
+        control.detach(conn)
+        detached.set()
+
+    detach_thread = threading.Thread(target=detach)
+    detach_thread.start()
+    assert not detached.wait(timeout=0.05)
+    allow_cancel_return.set()
+    cancel_thread.join(timeout=1)
+    detach_thread.join(timeout=1)
+
+    assert detached.is_set()
+    assert control._conn is None
+
+
+def test_usage_importer_executor_never_waits_for_unsettled_future():
+    calls = []
+
+    class Future:
+        def done(self):
+            return False
+
+        def cancel(self):
+            calls.append("future.cancel")
+            return False
+
+        def result(self, *, timeout):
+            calls.append(("future.result", timeout))
+            raise jobs_store.FutureTimeoutError()
+
+    class Control:
+        def cancel(self, *, timeout):
+            calls.append(("control.cancel", timeout))
+
+        def close(self):
+            calls.append("control.close")
+
+    class Executor:
+        def shutdown(self, *, wait, cancel_futures):
+            calls.append(("shutdown", wait, cancel_futures))
+
+    wrapper = jobs_store._UsageImporterExecutor.__new__(
+        jobs_store._UsageImporterExecutor
+    )
+    wrapper._executor = Executor()
+    wrapper._owned = [(Future(), Control())]
+
+    with pytest.raises(jobs_store._UsageImporterUnsettled):
+        wrapper.__exit__(None, None, None)
+
+    assert ("control.cancel", 0.25) in calls
+    assert "control.close" in calls
+    assert ("shutdown", False, True) in calls
+
+
+def test_usage_unsettled_importer_never_starts_serial_fallback(
+    monkeypatch, usage_rows
+):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+    original = jobs_store._usage_parallel_dimension_rows
+    calls = 0
+
+    def counted_reader(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    def force_unsettled(*_args, **_kwargs):
+        raise jobs_store._UsageImporterUnsettled("forced unsettled")
+
+    monkeypatch.setattr(
+        jobs_store, "_usage_parallel_dimension_rows", counted_reader
+    )
+    monkeypatch.setattr(jobs_store, "_usage_importer_result", force_unsettled)
+    try:
+        with pytest.raises(
+            jobs_store._UsageImporterUnsettled, match="forced unsettled"
+        ):
+            jobs_store.usage_report_snapshot(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert calls == 1
+
+
 def _usage_render_report() -> dict:
     return {
         "overview": {

@@ -5209,18 +5209,21 @@ class _UsageImporterControl:
             if self._conn is conn:
                 self._conn = None
 
-    def cancel(self) -> None:
+    def cancel(self, *, timeout: float = 0.25) -> None:
+        # Keep ownership through cancellation.  ``detach`` runs before the pool
+        # context returns this physical session, and must not race ahead while
+        # cancel is targeting it.
         with self._lock:
             conn = self._conn
-        if conn is not None:
-            _usage_snapshot_observer("cancel", role="importer")
-            conn.cancel()
+            if conn is not None:
+                _usage_snapshot_observer("cancel", role="importer")
+                conn.cancel_safe(timeout=timeout)
 
     def close(self) -> None:
         with self._lock:
             conn = self._conn
-        if conn is not None:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
 
 def _usage_remaining_timeout_ms(deadline: float) -> int:
@@ -5249,18 +5252,30 @@ class _UsageDeadlineCursor:
         return self._cursor.execute(statement, params)
 
 
+class _UsageImporterUnsettled(RuntimeError):
+    pass
+
+
 def _usage_cancel_and_settle(future, control: _UsageImporterControl) -> None:
     future.cancel()
     try:
-        control.cancel()
+        control.cancel(timeout=0.25)
     except Exception:
         pass
     try:
         future.result(timeout=1.0)
     except FutureTimeoutError:
+        if future.done():
+            return
         control.close()
         try:
-            future.result(timeout=1.0)
+            future.result(timeout=0.5)
+        except FutureTimeoutError as exc:
+            if future.done():
+                return
+            raise _UsageImporterUnsettled(
+                "usage importer did not settle after bounded cancel/close"
+            ) from exc
         except Exception:
             pass
     except Exception:
@@ -5275,8 +5290,45 @@ def _usage_importer_result(future, control, deadline: float):
     try:
         return future.result(timeout=remaining)
     except FutureTimeoutError:
+        if future.done():
+            return future.result()
         _usage_cancel_and_settle(future, control)
         raise TimeoutError("usage importer total deadline exceeded")
+
+
+class _UsageImporterExecutor:
+    """Never perform an unbounded ``shutdown(wait=True)`` on stuck importers."""
+
+    def __init__(self):
+        self._executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="usage-report"
+        )
+        self._owned = []
+
+    def __enter__(self):
+        return self
+
+    def submit(self, control, fn, *args):
+        future = self._executor.submit(fn, *args)
+        self._owned.append((future, control))
+        return future
+
+    def __exit__(self, exc_type, _exc, _tb):
+        unsettled = None
+        for future, control in self._owned:
+            if future.done():
+                continue
+            try:
+                _usage_cancel_and_settle(future, control)
+            except _UsageImporterUnsettled as error:
+                unsettled = unsettled or error
+        self._executor.shutdown(
+            wait=unsettled is None,
+            cancel_futures=True,
+        )
+        if unsettled is not None and exc_type is None:
+            raise unsettled
+        return False
 
 
 def _usage_import_snapshot(
@@ -6672,10 +6724,9 @@ def _usage_report_snapshot_hybrid_parallel(
             )
             dimension_control = _UsageImporterControl()
             latency_control = _UsageImporterControl()
-            with ThreadPoolExecutor(
-                max_workers=2, thread_name_prefix="usage-report"
-            ) as executor:
+            with _UsageImporterExecutor() as executor:
                 dimension_future = executor.submit(
+                    dimension_control,
                     _usage_import_snapshot,
                     snapshot_id,
                     dimension_control,
@@ -6685,6 +6736,7 @@ def _usage_report_snapshot_hybrid_parallel(
                     partition,
                 )
                 latency_future = executor.submit(
+                    latency_control,
                     _usage_import_snapshot,
                     snapshot_id,
                     latency_control,
@@ -6701,6 +6753,8 @@ def _usage_report_snapshot_hybrid_parallel(
                         dimension_control,
                         importer_deadline,
                     )
+                except _UsageImporterUnsettled:
+                    raise
                 except Exception:
                     dimension_future.cancel()
                     log.exception(
@@ -6726,6 +6780,8 @@ def _usage_report_snapshot_hybrid_parallel(
                         latency_control,
                         importer_deadline,
                     )
+                except _UsageImporterUnsettled:
+                    raise
                 except Exception:
                     latency_future.cancel()
                     log.exception(
