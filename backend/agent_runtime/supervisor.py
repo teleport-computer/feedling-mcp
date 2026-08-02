@@ -72,8 +72,10 @@ from notices import catalog
 log = logging.getLogger("feedling.agent_runtime.supervisor")
 
 # Scopes on the per-user runtime token minted for the hosted consumer. "web" lets
-# its io_cli reach /v1/agent/web/{search,fetch} (require_scope("web")). This is the
-# only token that carries "web"; the genesis worker mints its own narrower token.
+# its io_cli reach /v1/agent/web/{search,fetch} (require_runtime_scope("web") —
+# those endpoints are cloud-only and reject api-key auth, so ONLY a hosted
+# consumer holding this token gets there). This is the only token that carries
+# "web"; the genesis worker mints its own narrower token.
 _CONSUMER_TOKEN_SCOPES = ["chat", "memory", "identity", "perception", "envelope_decrypt", "web"]
 
 # Pooled HTTP clients. httpx's module-level verb helpers (httpx.get/httpx.post)

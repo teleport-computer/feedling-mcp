@@ -1,13 +1,19 @@
-"""The consumer must advertise the V1 web capability (batch 4).
+"""The consumer advertises the V1 web capability ONLY when hosted (batch 4 +
+cloud-only correction).
 
-A build whose io_cli carries the web verbs (tools/io_cli.py cmd_web_search /
-cmd_web_fetch) lists ``web_search_v1,web_fetch_v1`` in its
-X-Feedling-Consumer-Capabilities header. That claim is what the settings page's
-``_runtime_supported`` reads to decide the switch is really in effect for a V1
-account. An older build simply omits it, so those accounts fail closed.
+Our web-search / web-fetch is a CLOUD-ONLY product. The HOSTED consumer
+(per-user runtime token) advertises ``web_search_v1,web_fetch_v1`` in its
+X-Feedling-Consumer-Capabilities header; a VPS / self-hosted resident must NOT —
+it uses its own model provider's built-in web capability. That header is what
+the settings page's ``_runtime_supported`` reads, so omitting the web caps makes
+web read ``effective = false`` for self-hosted accounts, which is the intended
+boundary.
 
-Pure unit: imports the consumer module (no DB, no network) and reads the static
-header dict built at import time.
+Pure unit: imports the consumer module (no DB, no network). The header is built
+at import time from the process env; the module is imported here WITHOUT
+``FEEDLING_RUNTIME_TOKEN_FILE`` set, i.e. in the VPS (non-hosted) shape, so the
+static header must omit the web caps. The hosted vs VPS split itself is pinned
+against the pure ``_consumer_capabilities`` helper, which needs no re-import.
 """
 
 from __future__ import annotations
@@ -40,10 +46,31 @@ def _advertised() -> set[str]:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
-def test_consumer_advertises_both_web_capabilities():
-    advertised = _advertised()
+def _caps(hosted: bool) -> set[str]:
+    raw = crc._consumer_capabilities(hosted)
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def test_hosted_consumer_advertises_both_web_capabilities():
+    advertised = _caps(hosted=True)
     assert backend_consumer.WEB_SEARCH_CAPABILITY in advertised
     assert backend_consumer.WEB_FETCH_CAPABILITY in advertised
+
+
+def test_vps_consumer_never_advertises_web_capabilities():
+    """The cloud-only boundary: a self-hosted resident (no runtime-token file)
+    must NOT advertise web caps, so _runtime_supported reads false for it."""
+    advertised = _caps(hosted=False)
+    assert backend_consumer.WEB_SEARCH_CAPABILITY not in advertised
+    assert backend_consumer.WEB_FETCH_CAPABILITY not in advertised
+
+
+def test_import_time_header_is_vps_shape_without_web():
+    """This module is imported without FEEDLING_RUNTIME_TOKEN_FILE, i.e. VPS —
+    the static header baked at import time must carry no web caps."""
+    advertised = _advertised()
+    assert backend_consumer.WEB_SEARCH_CAPABILITY not in advertised
+    assert backend_consumer.WEB_FETCH_CAPABILITY not in advertised
 
 
 def test_web_capabilities_use_the_backend_constant_strings():
@@ -54,7 +81,9 @@ def test_web_capabilities_use_the_backend_constant_strings():
 
 
 def test_existing_vision_capabilities_are_untouched():
-    """Adding web must not drop the capabilities the consumer already shipped."""
-    advertised = _advertised()
-    assert "vision_observer_v1" in advertised
-    assert "vision_probe_v2" in advertised
+    """The cloud-only change must not drop the caps the consumer already shipped —
+    vision is advertised on BOTH lines."""
+    for hosted in (True, False):
+        advertised = _caps(hosted=hosted)
+        assert "vision_observer_v1" in advertised
+        assert "vision_probe_v2" in advertised

@@ -1,10 +1,19 @@
-"""Batch 5: the consumer advertises the io_cli web verbs to the model only while
-the backend's poll says web is effectively on, and corrects a resume-capable
-session once when it flips off.
+"""The consumer's io_cli web-verb display (batch 5 + cloud-only correction).
 
-Display only — the real block is the server-side execution gate (web/execution_
-core, fail closed). This file pins the pure decision helpers so they hold
-regardless of the driver/env the surrounding process was imported under.
+Our web-search / web-fetch is CLOUD-ONLY. This consumer's catalog-injection path
+runs for VPS / self-hosted residents ONLY (hosted returns early), so the web
+verbs are now ALWAYS stripped from the model-facing catalog here — regardless of
+the server-advertised policy. A self-hosted resident uses its own model
+provider's built-in web capability instead.
+
+Two layers are pinned:
+  * the pure decision helpers (``_strip_web_verbs_from_catalog`` etc.) — still
+    present, still exercised;
+  * the integration seam ``_prepend_io_cli_capability_catalog`` — the VPS path
+    that must strip the web verbs even when ``_web_policy`` says effective.
+
+The real enforcement is still the server-side execution gate (the endpoints now
+reject api-key auth outright); this is only about what the model is shown.
 """
 
 from __future__ import annotations
@@ -117,3 +126,39 @@ def test_a_different_session_off_does_not_borrow_another_sessions_advertise():
     crc._web_advertised_session_id = "s1"
     # s2 never advertised web → no notice even though s1 did
     assert crc._web_off_notice_for_turn("s2") == ""
+
+
+# --- VPS integration: the injected catalog NEVER carries the web verbs --------
+
+def test_vps_prepend_strips_web_verbs_even_when_policy_says_effective(monkeypatch):
+    """The cloud-only boundary at the display seam: on the VPS path, even a poll
+    that advertised web as effective must not leak the verbs into the model's
+    catalog. (Hosted never reaches this code — it returns early on ``_HOSTED``.)"""
+    # This path is VPS-only; assert the fixture really is non-hosted.
+    assert crc._HOSTED is False
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli", raising=False)
+    monkeypatch.setattr(crc, "_is_codex_cmd", lambda _tokens: False)
+    monkeypatch.setattr(crc, "_cli_cmd_tokens", lambda: [])
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess-vps")
+    monkeypatch.setattr(crc, "_io_cli_catalog_cache", _CATALOG, raising=False)
+    monkeypatch.setattr(crc, "_io_cli_catalog_injected_session_id", None, raising=False)
+    monkeypatch.setattr(crc, "_io_cli_catalog_pending_session_id", None, raising=False)
+    # Policy explicitly ON — must still be ignored on the VPS line.
+    crc._update_web_policy({"effective": True, "search": True, "fetch": True})
+
+    out = crc._prepend_io_cli_capability_catalog("USER TURN")
+
+    # No catalog LINE may advertise a web verb (match on the leading token, the
+    # same way _strip_web_verbs_from_catalog does — a bare "web-search" substring
+    # also occurs in the worktree path in other injected blocks).
+    web_verb_lines = [
+        ln for ln in out.split("\n")
+        if ln.split(" ", 1)[0].strip() in ("web-search", "web-fetch")
+    ]
+    assert web_verb_lines == [], web_verb_lines
+    # the rest of the catalog and the real user turn survive
+    assert "memory-index" in out
+    assert "photo-recent" in out
+    assert "USER TURN" in out
+    # nothing was advertised, so no session was ever marked as having seen web
+    assert crc._web_advertised_session_id is None

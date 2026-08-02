@@ -1259,13 +1259,32 @@ def _agent_entry_signature() -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def _consumer_capabilities(hosted: bool) -> str:
+    """Comma-separated ``X-Feedling-Consumer-Capabilities`` value.
+
+    Vision caps are advertised on every line. ``web_search_v1`` / ``web_fetch_v1``
+    are a CLOUD-ONLY product: only the HOSTED consumer (per-user runtime token)
+    advertises them. VPS / self-hosted residents must NOT — they use their own
+    model provider's built-in web capability, so our web tools are never offered
+    to them. The settings page keys ``_runtime_supported`` off this header, so
+    omitting the web caps makes web read ``effective = false`` for self-hosted
+    accounts, which is exactly the intended product boundary.
+    """
+    caps = ["vision_observer_v1", "vision_probe_v2"]
+    if hosted:
+        caps += ["web_search_v1", "web_fetch_v1"]
+    return ",".join(caps)
+
+
 _HEADERS = {
     "X-API-Key": FEEDLING_API_KEY,
     "X-Feedling-Consumer": "feedling-chat-resident",
-    # web_search_v1,web_fetch_v1: this build's io_cli carries the V1 web verbs
-    # (tools/io_cli.py cmd_web_search/cmd_web_fetch). Advertising them lets the
-    # settings page report web as runtime-supported for V1 (hosted + resident).
-    "X-Feedling-Consumer-Capabilities": "vision_observer_v1,vision_probe_v2,web_search_v1,web_fetch_v1",
+    # Web caps are hosted-only — see _consumer_capabilities. ``_HOSTED`` isn't
+    # defined until further down, so read the same signal (the runtime-token
+    # file) directly from the env here.
+    "X-Feedling-Consumer-Capabilities": _consumer_capabilities(
+        bool(os.environ.get("FEEDLING_RUNTIME_TOKEN_FILE", "").strip())
+    ),
     "X-Feedling-Consumer-Id": CONSUMER_ID,
     "X-Feedling-Consumer-Version": "resident-v1",
     "X-Feedling-Consumer-Commit": RUNNING_COMMIT,
@@ -7918,15 +7937,14 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
             )
         _io_cli_catalog_cache = catalog
 
-    # Apply the web policy to the (cached, full) catalog for THIS turn only — the
-    # cache stays the complete catalog so a re-enable simply stops filtering.
-    if _web_tools_effective():
-        catalog_for_turn = catalog
-        _web_advertised_session_id = sid  # this session has now seen the web verbs
-        if _web_off_notice_session_id == sid:
-            _web_off_notice_session_id = None  # re-enabled → a later off notifies again
-    else:
-        catalog_for_turn = _strip_web_verbs_from_catalog(catalog)
+    # Our web-search / web-fetch is CLOUD-ONLY. This whole path is VPS /
+    # self-hosted only (the ``_HOSTED`` early-return above), so the web verbs are
+    # ALWAYS stripped here regardless of the server-advertised policy — a
+    # self-hosted resident must never be offered our web tools; it uses its own
+    # model provider's built-in web capability. Because we never advertise the
+    # verbs, ``_web_advertised_session_id`` is never set, so ``web_notice`` above
+    # stays empty too (nothing was ever promised to retract).
+    catalog_for_turn = _strip_web_verbs_from_catalog(catalog)
 
     if not is_codex:
         # NOT committed yet — see _commit_io_cli_catalog_injection /

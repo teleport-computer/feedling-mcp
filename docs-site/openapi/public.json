@@ -770,7 +770,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Fetch one absolute http(s) URL and return its readable text (HTML is reduced to the main article; JSON, plain text, and source are returned as-is), size-capped with a data.truncated flag. SSRF-guarded: private/loopback/link-local targets are refused and every redirect hop is independently re-validated (max 5). Requires the `web` scope and the same three authorization gates as web search, reported in-band as HTTP 200 with ok:false and an error.code (capability_disabled, capability_rate_limited, capability_invalid_input for a bad or blocked url, capability_not_found / capability_upstream_error for an upstream HTTP status)."
+        "description": "Fetch one absolute http(s) URL and return its readable text (HTML is reduced to the main article; JSON, plain text, and source are returned as-is), size-capped with a data.truncated flag. SSRF-guarded: private/loopback/link-local targets are refused and every redirect hop is independently re-validated (max 5). Cloud-only: requires a hosted per-user runtime token carrying the `web` scope — long-term api-key auth is refused with 403 (self-hosted deployments use their model provider's own web capability). Then the same three authorization gates as web search apply, reported in-band as HTTP 200 with ok:false and an error.code (capability_disabled, capability_rate_limited, capability_invalid_input for a bad or blocked url, capability_not_found / capability_upstream_error for an upstream HTTP status)."
       }
     },
     "/v1/agent/web/search": {
@@ -813,7 +813,7 @@
           }
         },
         "x-feedling-contract-level": "documented",
-        "description": "Run a keyless web search (DuckDuckGo HTML scrape) and return ranked results. Requires the `web` scope. Authorization is re-checked on every call — the user's own web switch must be on, the operator must not have halted web_search, and a per-user rate limit applies — because V1 tool authorization is static and cannot live in the prompt. Every gate and input-validation failure is reported IN-BAND as HTTP 200 with ok:false and an error.code (capability_disabled when the user's switch is off — not retryable; capability_rate_limited when over the per-user budget — retryable; capability_invalid_input for a missing or sensitive query; capability_upstream_error when the search itself fails). The aggregate result set is character-budgeted; data.truncated flags dropped items."
+        "description": "Run a keyless web search (DuckDuckGo HTML scrape) and return ranked results. Cloud-only: requires a hosted per-user runtime token carrying the `web` scope — long-term api-key auth is refused with 403, so self-hosted deployments cannot reach this endpoint (their model uses its own provider's web capability instead). Authorization is re-checked on every call — the user's own web switch must be on, the operator must not have halted web_search, and a per-user rate limit applies — because V1 tool authorization is static and cannot live in the prompt. Every gate and input-validation failure is reported IN-BAND as HTTP 200 with ok:false and an error.code (capability_disabled when the user's switch is off — not retryable; capability_rate_limited when over the per-user budget — retryable; capability_invalid_input for a missing or sensitive query; capability_upstream_error when the search itself fails). The aggregate result set is character-budgeted; data.truncated flags dropped items."
       }
     },
     "/v1/bootstrap": {

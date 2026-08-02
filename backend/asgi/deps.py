@@ -50,6 +50,36 @@ def require_scope(scope: str):
     return _dep
 
 
+def require_runtime_scope(scope: str):
+    """Dependency factory: a HARD cloud-only gate for a runtime-token scope.
+
+    Unlike ``require_scope`` — which is a *no-op* for api-key callers because the
+    long-term key is full access — this REJECTS api-key auth outright: the route
+    is reachable only by a hosted (cloud) consumer holding a per-user runtime
+    token that carries ``scope``.
+
+    This is the boundary the V1 web endpoints use. Our web-search / web-fetch is
+    a cloud-only product; VPS / self-hosted residents authenticate with a
+    long-term api key and must never reach these routes — they use their own
+    model provider's built-in web capability instead. ``require_scope("web")``
+    would silently let every api-key caller (i.e. every VPS user) through, so it
+    is the wrong gate here.
+
+    Order matters: reject api-key / missing runtime token FIRST (403), then check
+    the scope. This is the security boundary — even if the display layer leaks
+    the verb, or a self-hosted model guesses the command, an api-key call is
+    refused here before the handler ever runs.
+    """
+
+    async def _dep(auth: AuthResult = Depends(require_auth)) -> AuthResult:
+        if not auth.runtime_token_claims:
+            raise auth_core.AuthError(403, "forbidden", "runtime_token_required")
+        auth_core.authorize_scope(auth.runtime_token_claims, auth.user_id, scope)
+        return auth
+
+    return _dep
+
+
 async def require_api_key(auth: AuthResult = Depends(require_auth)) -> AuthResult:
     """Restrict a route to long-term api-key callers only (reject runtime tokens).
 

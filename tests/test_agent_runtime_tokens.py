@@ -64,7 +64,8 @@ def test_authorize_rejects_missing_scope():
 
 # ---------------------------------------------------------------------------
 # Batch 4: the hosted-consumer runtime token must carry the "web" scope so its
-# io_cli can reach /v1/agent/web/{search,fetch} (backend require_scope("web")).
+# io_cli can reach /v1/agent/web/{search,fetch} (backend require_runtime_scope
+# ("web") — cloud-only endpoints that reject api-key auth outright).
 # ---------------------------------------------------------------------------
 
 

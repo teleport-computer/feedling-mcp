@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse
 from accounts.auth_core import AuthResult
 from asgi import http as asgi_http
 from asgi import threadpool
-from asgi.deps import require_api_key, require_scope
+from asgi.deps import require_api_key, require_runtime_scope
 from web import execution_core, settings_core
 
 router = APIRouter()
@@ -46,7 +46,7 @@ async def web_settings_post(
 
 @router.post("/v1/agent/web/search")
 async def web_search_exec(
-    request: Request, auth: AuthResult = Depends(require_scope("web"))
+    request: Request, auth: AuthResult = Depends(require_runtime_scope("web"))
 ):
     payload = (await asgi_http.read_json_silent(request)) or {}
     result = await threadpool.run_db(execution_core.run_search, auth.store, payload)
@@ -55,7 +55,7 @@ async def web_search_exec(
 
 @router.post("/v1/agent/web/fetch")
 async def web_fetch_exec(
-    request: Request, auth: AuthResult = Depends(require_scope("web"))
+    request: Request, auth: AuthResult = Depends(require_runtime_scope("web"))
 ):
     payload = (await asgi_http.read_json_silent(request)) or {}
     result = await threadpool.run_db(execution_core.run_fetch, auth.store, payload)
