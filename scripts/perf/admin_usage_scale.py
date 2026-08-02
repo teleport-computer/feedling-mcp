@@ -39,7 +39,7 @@ ROLLUP_TABLES = (
 )
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SCALE_NOW_UTC = datetime(2026, 8, 2, 12, 30, tzinfo=timezone.utc)
-_LOCAL_SCALE_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_LOCAL_SCALE_HOST = "127.0.0.1"
 _SENSITIVE_COLUMNS = frozenset(
     {
         "body_ct",
@@ -147,8 +147,12 @@ def _validate_scale_database_url(database_url: str) -> dict[str, Any]:
         not conninfo.get("service")
         and not conninfo.get("servicefile")
         and len(hosts) == 1
-        and hosts[0] in _LOCAL_SCALE_HOSTS
-        and (not hostaddrs or len(hostaddrs) == 1 and hostaddrs[0] in _LOCAL_SCALE_HOSTS)
+        and hosts[0] == _LOCAL_SCALE_HOST
+        and (
+            not hostaddrs
+            or len(hostaddrs) == 1
+            and hostaddrs[0] == _LOCAL_SCALE_HOST
+        )
         and len(ports) == 1
         and port == 55432
         and database.startswith("feedling_usage_scale_")
@@ -165,17 +169,67 @@ def _validate_scale_database_url(database_url: str) -> dict[str, Any]:
 def _validate_connected_scale_database(conn, expected: dict[str, Any]) -> dict[str, Any]:
     """Recheck libpq's connected endpoint before schema checks or fixture writes."""
 
-    actual = {
+    actual_identity = {
         "database": str(conn.info.dbname or ""),
         "host": str(conn.info.host or ""),
         "port": int(conn.info.port or 0),
     }
-    if actual != expected:
+    actual_hostaddr = str(getattr(conn.info, "hostaddr", "") or "")
+    if actual_identity != expected or actual_hostaddr != _LOCAL_SCALE_HOST:
         raise RuntimeError(
             "connected PostgreSQL identity does not match the validated dedicated "
-            f"scale database: expected={expected}, actual={actual}"
+            f"scale database: expected={expected}, actual={actual_identity}, "
+            f"actual_hostaddr={actual_hostaddr!r}"
         )
-    return actual
+    return actual_identity
+
+
+class _ValidatedScaleConnection(AbstractContextManager):
+    """Validate a checked-out connection before exposing it to the harness."""
+
+    def __init__(self, context, expected: dict[str, Any]):
+        self._context = context
+        self._expected = expected
+
+    def __enter__(self):
+        conn = self._context.__enter__()
+        try:
+            _validate_connected_scale_database(conn, self._expected)
+        except BaseException:
+            self._context.__exit__(*sys.exc_info())
+            raise
+        return conn
+
+    def __exit__(self, *args):
+        return self._context.__exit__(*args)
+
+
+class _ValidatedScalePool:
+    """Apply the destructive-harness identity gate to every pool checkout."""
+
+    def __init__(self, pool, expected: dict[str, Any]):
+        self._pool = pool
+        self._expected = expected
+
+    def __getattr__(self, name):
+        return getattr(self._pool, name)
+
+    def connection(self, *args, **kwargs):
+        return _ValidatedScaleConnection(
+            self._pool.connection(*args, **kwargs), self._expected
+        )
+
+
+def _install_validated_scale_pool(database_module, expected: dict[str, Any]):
+    """Make every production-module checkout use the validated scale pool."""
+
+    pool = _ValidatedScalePool(database_module.get_pool(), expected)
+
+    def get_validated_pool():
+        return pool
+
+    database_module.get_pool = get_validated_pool
+    return pool
 
 
 def _validate_rolling_partition(partition) -> dict[str, list[str]]:
@@ -651,7 +705,7 @@ def _run(args) -> int:
         usage_rollup,
     )
 
-    pool = db.get_pool()
+    pool = _install_validated_scale_pool(db, database_identity)
     with pool.connection() as conn:
         _validate_connected_scale_database(conn, database_identity)
         _assert_schema(conn)

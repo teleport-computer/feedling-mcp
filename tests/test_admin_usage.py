@@ -105,21 +105,15 @@ def test_admin_usage_scale_uses_rolling_90d_partition_and_dedicated_local_db():
         "host": "127.0.0.1",
         "port": 55432,
     }
-    assert harness._validate_scale_database_url(
-        "host=localhost port=55432 "
-        "dbname=feedling_usage_scale_conninfo user=postgres"
-    ) == {
-        "database": "feedling_usage_scale_conninfo",
-        "host": "localhost",
-        "port": 55432,
-    }
-
     for unsafe in (
         "postgresql://postgres:test@127.0.0.1:55432/postgres",
         "postgresql://postgres:test@feedling-prod.example.com:5432/feedling_usage_scale_task4d",
         "postgresql://postgres:test@127.0.0.1:55432/feedling_test",
+        "host=localhost port=55432 dbname=feedling_usage_scale_task4d",
+        "host=::1 port=55432 dbname=feedling_usage_scale_task4d",
         "postgresql://postgres:test@127.0.0.1:55432/feedling_usage_scale_task4d?host=prod.example.com",
         "postgresql://postgres:test@127.0.0.1:55432/feedling_usage_scale_task4d?hostaddr=10.0.0.10",
+        "postgresql://postgres:test@127.0.0.1:55432/feedling_usage_scale_task4d?hostaddr=::1",
         "postgresql://postgres:test@127.0.0.1:55432/feedling_usage_scale_task4d?port=5432",
         "postgresql://postgres:test@127.0.0.1:55432/feedling_usage_scale_task4d?dbname=postgres",
         "host=127.0.0.1,prod.example.com port=55432 dbname=feedling_usage_scale_task4d",
@@ -144,6 +138,7 @@ def test_admin_usage_scale_revalidates_connected_database_identity():
         info=SimpleNamespace(
             dbname="feedling_usage_scale_task4d",
             host="127.0.0.1",
+            hostaddr="127.0.0.1",
             port=55432,
         )
     )
@@ -152,16 +147,108 @@ def test_admin_usage_scale_revalidates_connected_database_identity():
     for field, value in (
         ("dbname", "postgres"),
         ("host", "prod.example.com"),
+        ("hostaddr", "::1"),
         ("port", 5432),
     ):
         info = SimpleNamespace(
             dbname="feedling_usage_scale_task4d",
             host="127.0.0.1",
+            hostaddr="127.0.0.1",
             port=55432,
         )
         setattr(info, field, value)
         with pytest.raises(RuntimeError, match="connected PostgreSQL identity"):
             validate(SimpleNamespace(info=info), expected)
+
+    missing_hostaddr = SimpleNamespace(
+        info=SimpleNamespace(
+            dbname="feedling_usage_scale_task4d",
+            host="127.0.0.1",
+            port=55432,
+        )
+    )
+    with pytest.raises(RuntimeError, match="connected PostgreSQL identity"):
+        validate(missing_hostaddr, expected)
+
+
+def test_admin_usage_scale_revalidates_every_pool_checkout():
+    harness = _load_usage_scale_harness()
+    validated_pool_type = getattr(harness, "_ValidatedScalePool", None)
+    assert validated_pool_type is not None, "every scale pool checkout must be validated"
+    expected = {
+        "database": "feedling_usage_scale_task4d",
+        "host": "127.0.0.1",
+        "port": 55432,
+    }
+
+    def connection(hostaddr):
+        return SimpleNamespace(
+            info=SimpleNamespace(
+                dbname="feedling_usage_scale_task4d",
+                host="127.0.0.1",
+                hostaddr=hostaddr,
+                port=55432,
+            )
+        )
+
+    class ConnectionContext:
+        def __init__(self, conn):
+            self.conn = conn
+            self.exited = False
+
+        def __enter__(self):
+            return self.conn
+
+        def __exit__(self, *_args):
+            self.exited = True
+
+    class Pool:
+        def __init__(self):
+            self.contexts = [
+                ConnectionContext(connection("127.0.0.1")),
+                ConnectionContext(connection("::1")),
+            ]
+
+        def connection(self):
+            return self.contexts.pop(0)
+
+    real_pool = Pool()
+    pool = validated_pool_type(real_pool, expected)
+    with pool.connection() as conn:
+        assert conn.info.hostaddr == "127.0.0.1"
+    assert real_pool.contexts[0].exited is False
+
+    with pytest.raises(RuntimeError, match="connected PostgreSQL identity"):
+        with pool.connection():
+            pytest.fail("unsafe connection was yielded to the harness")
+
+
+def test_admin_usage_scale_installs_validated_pool_for_production_modules():
+    harness = _load_usage_scale_harness()
+    install = getattr(harness, "_install_validated_scale_pool", None)
+    assert install is not None, "production modules must receive the validated pool"
+    raw_pool = object()
+
+    class DatabaseModule:
+        def __init__(self):
+            self.calls = 0
+
+        def get_pool(self):
+            self.calls += 1
+            return raw_pool
+
+    database_module = DatabaseModule()
+    expected = {
+        "database": "feedling_usage_scale_task4d",
+        "host": "127.0.0.1",
+        "port": 55432,
+    }
+
+    pool = install(database_module, expected)
+
+    assert database_module.calls == 1
+    assert database_module.get_pool() is pool
+    assert pool._pool is raw_pool
 
 
 def test_admin_usage_scale_records_and_enforces_rolling_partition():
