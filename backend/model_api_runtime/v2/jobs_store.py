@@ -4616,6 +4616,544 @@ GROUP BY f.user_id
 """
 
 
+def _usage_optional_int(row, key: str) -> int | None:
+    value = row.get(key)
+    return None if value is None else int(value)
+
+
+def _usage_optional_float(row, key: str) -> float | None:
+    value = row.get(key)
+    return None if value is None else float(value)
+
+
+def _usage_rate(numerator: int, denominator: int) -> float | None:
+    return float(numerator) / float(denominator) if denominator else None
+
+
+def usage_report_snapshot(query) -> dict:
+    """Return one coherent, content-free Hosted V2 Usage analytics snapshot."""
+
+    from admin import usage as admin_usage
+
+    where_sql, where_params = admin_usage.metric_filter_sql(query)
+    filter_where_sql, filter_where_params = admin_usage.metric_filter_sql(
+        query, include_dimensions=False
+    )
+    duration_days = (
+        query.end_at_utc - query.start_at_utc
+    ).total_seconds() / 86400.0
+    dimension_filtered = admin_usage.has_dimension_filter(query)
+    user_cohort_sql = ""
+    user_cohort_params: tuple[object, ...] = ()
+    if query.user_id:
+        user_cohort_sql = " AND u.user_id=%s"
+        user_cohort_params = (query.user_id,)
+
+    base_cte = f"""
+WITH base AS (
+  SELECT
+    COALESCE(m.user_id, 'unknown') AS user_id,
+    COALESCE(NULLIF(m.lane, ''), 'unknown') AS lane,
+    COALESCE(NULLIF(m.provider, ''), 'unknown') AS provider,
+    COALESCE(NULLIF(m.model, ''), 'unknown') AS model,
+    timezone(%s, m.created_at)::date AS local_day,
+    m.created_at, m.model_calls, m.retries, m.failed, m.latency_ms,
+    m.usage_reported_calls, m.cache_reported_calls,
+    m.prompt_tokens, m.completion_tokens,
+    m.cache_read_tokens, m.cache_write_tokens, m.cache_miss_tokens
+  FROM v2_turn_metrics m
+  WHERE {where_sql}
+)
+"""
+    base_params = (query.timezone, *where_params)
+
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                )
+                cur.execute(
+                    f"""
+WITH registered AS (
+  SELECT u.user_id,
+         CASE WHEN pg_input_is_valid(u.created_at, 'timestamptz')
+           THEN u.created_at::timestamptz < %s ELSE false END AS existed_at_end,
+         NOT COALESCE(pg_input_is_valid(u.created_at, 'timestamptz'), false)
+           AS unparseable
+  FROM users u
+  WHERE true {user_cohort_sql}
+), activated AS (
+  SELECT r.user_id
+  FROM registered r
+  WHERE r.existed_at_end AND (
+    EXISTS (
+      SELECT 1 FROM chat_messages c
+      WHERE c.user_id=r.user_id
+        AND c.doc->>'role'='user'
+        AND COALESCE(c.doc->>'source', '') NOT IN
+          ('verify_ping', 'resident_maintenance')
+        AND to_timestamp(c.ts) < %s
+    ) OR EXISTS (
+      SELECT 1 FROM memory_moments mm
+      WHERE mm.user_id=r.user_id
+        AND CASE WHEN pg_input_is_valid(mm.occurred_at, 'timestamptz')
+          THEN mm.occurred_at::timestamptz < %s ELSE false END
+    )
+  )
+)
+SELECT
+  count(*) FILTER (WHERE existed_at_end)::int AS registered_accounts,
+  (SELECT count(*)::int FROM activated) AS activated_users,
+  count(*) FILTER (WHERE unparseable)::int AS unparseable_registered_rows,
+  (SELECT count(*)::int FROM memory_moments mm
+   JOIN registered r ON r.user_id=mm.user_id
+   WHERE NOT COALESCE(
+     pg_input_is_valid(mm.occurred_at, 'timestamptz'), false))
+    AS unparseable_memory_rows
+FROM registered
+""",
+                    (
+                        query.end_at_utc,
+                        *user_cohort_params,
+                        query.end_at_utc,
+                        query.end_at_utc,
+                    ),
+                )
+                cohort = cur.fetchone()
+
+                cur.execute(
+                    base_cte
+                    + """
+SELECT
+  count(*)::int AS turns,
+  count(DISTINCT user_id) FILTER (WHERE model_calls > 0)::int
+    AS model_active_users,
+  count(DISTINCT user_id) FILTER (WHERE usage_reported_calls > 0)::int
+    AS metered_users,
+  count(DISTINCT (user_id, local_day)) FILTER (WHERE model_calls > 0)::int
+    AS active_user_days,
+  count(*) FILTER (WHERE usage_reported_calls > 0)::int AS metered_turns,
+  coalesce(sum(model_calls), 0)::bigint AS model_calls,
+  coalesce(sum(retries), 0)::bigint AS retries,
+  count(*) FILTER (WHERE failed)::int AS failed_turns,
+  sum(prompt_tokens)::bigint AS prompt_tokens,
+  sum(completion_tokens)::bigint AS completion_tokens,
+  sum(cache_read_tokens)::bigint AS cache_read_tokens,
+  sum(cache_write_tokens)::bigint AS cache_write_tokens,
+  sum(cache_miss_tokens)::bigint AS cache_miss_tokens,
+  coalesce(sum(GREATEST(model_calls - usage_reported_calls, 0)), 0)::bigint
+    AS unknown_usage_calls,
+  coalesce(sum(usage_reported_calls), 0)::bigint AS usage_reported_calls,
+  coalesce(sum(cache_reported_calls), 0)::bigint AS cache_reported_calls
+FROM base
+""",
+                    base_params,
+                )
+                totals = cur.fetchone()
+
+                cur.execute(
+                    base_cte
+                    + """,
+user_days AS (
+  SELECT user_id, local_day,
+         sum(prompt_tokens)::bigint AS prompt_tokens,
+         sum(completion_tokens)::bigint AS completion_tokens
+  FROM base
+  WHERE model_calls > 0
+  GROUP BY user_id, local_day
+), known_user_days AS (
+  SELECT (prompt_tokens + completion_tokens)::numeric AS total_tokens
+  FROM user_days
+  WHERE prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL
+)
+SELECT
+  percentile_cont(0.50) WITHIN GROUP (ORDER BY total_tokens) AS p50,
+  percentile_cont(0.75) WITHIN GROUP (ORDER BY total_tokens) AS p75,
+  percentile_cont(0.90) WITHIN GROUP (ORDER BY total_tokens) AS p90,
+  percentile_cont(0.95) WITHIN GROUP (ORDER BY total_tokens) AS p95,
+  max(total_tokens) AS max
+FROM known_user_days
+""",
+                    base_params,
+                )
+                distribution = cur.fetchone()
+
+                cur.execute(
+                    base_cte
+                    + """,
+days AS (
+  SELECT generate_series(
+    timezone(%s, %s::timestamptz)::date,
+    timezone(%s, (%s::timestamptz - interval '1 microsecond'))::date,
+    interval '1 day'
+  )::date AS local_day
+), daily AS (
+  SELECT local_day, count(*)::int AS turns,
+         count(DISTINCT user_id) FILTER (WHERE model_calls > 0)::int
+           AS model_active_users,
+         count(*) FILTER (WHERE usage_reported_calls > 0)::int AS metered_turns,
+         coalesce(sum(model_calls), 0)::bigint AS model_calls,
+         coalesce(sum(retries), 0)::bigint AS retries,
+         count(*) FILTER (WHERE failed)::int AS failed_turns,
+         sum(prompt_tokens)::bigint AS prompt_tokens,
+         sum(completion_tokens)::bigint AS completion_tokens,
+         sum(cache_read_tokens)::bigint AS cache_read_tokens,
+         sum(cache_write_tokens)::bigint AS cache_write_tokens,
+         sum(cache_miss_tokens)::bigint AS cache_miss_tokens,
+         coalesce(sum(GREATEST(model_calls-usage_reported_calls, 0)), 0)::bigint
+           AS unknown_usage_calls,
+         coalesce(sum(usage_reported_calls), 0)::bigint AS usage_reported_calls,
+         coalesce(sum(cache_reported_calls), 0)::bigint AS cache_reported_calls
+  FROM base GROUP BY local_day
+)
+SELECT days.local_day, coalesce(d.turns, 0)::int AS turns,
+       coalesce(d.model_active_users, 0)::int AS model_active_users,
+       coalesce(d.metered_turns, 0)::int AS metered_turns,
+       coalesce(d.model_calls, 0)::bigint AS model_calls,
+       coalesce(d.retries, 0)::bigint AS retries,
+       coalesce(d.failed_turns, 0)::int AS failed_turns,
+       d.prompt_tokens, d.completion_tokens,
+       d.cache_read_tokens, d.cache_write_tokens, d.cache_miss_tokens,
+       coalesce(d.unknown_usage_calls, 0)::bigint AS unknown_usage_calls,
+       coalesce(d.usage_reported_calls, 0)::bigint AS usage_reported_calls,
+       coalesce(d.cache_reported_calls, 0)::bigint AS cache_reported_calls
+FROM days LEFT JOIN daily d USING (local_day)
+ORDER BY days.local_day
+""",
+                    (
+                        *base_params,
+                        query.timezone,
+                        query.start_at_utc,
+                        query.timezone,
+                        query.end_at_utc,
+                    ),
+                )
+                daily_rows = cur.fetchall()
+
+                cur.execute(
+                    base_cte
+                    + """,
+user_days AS (
+  SELECT user_id,local_day,sum(prompt_tokens)::bigint AS prompt_tokens,
+         sum(completion_tokens)::bigint AS completion_tokens
+  FROM base WHERE model_calls > 0 GROUP BY user_id,local_day
+), user_distribution AS (
+  SELECT user_id,
+    percentile_cont(0.50) WITHIN GROUP
+      (ORDER BY prompt_tokens+completion_tokens) AS daily_p50,
+    percentile_cont(0.95) WITHIN GROUP
+      (ORDER BY prompt_tokens+completion_tokens) AS daily_p95
+  FROM user_days
+  WHERE prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL
+  GROUP BY user_id
+), provider_rank AS (
+  SELECT user_id,provider,
+    row_number() OVER (
+      PARTITION BY user_id ORDER BY sum(model_calls) DESC, provider
+    ) AS rank
+  FROM base GROUP BY user_id,provider
+)
+SELECT b.user_id, count(*)::int AS turns,
+  count(DISTINCT b.local_day) FILTER (WHERE b.model_calls > 0)::int AS active_days,
+  max(b.created_at) FILTER (WHERE b.model_calls > 0) AS last_model_call_at,
+  coalesce(sum(b.model_calls), 0)::bigint AS model_calls,
+  coalesce(sum(b.retries), 0)::bigint AS retries,
+  count(*) FILTER (WHERE b.failed)::int AS failed_turns,
+  count(*) FILTER (WHERE b.usage_reported_calls > 0)::int AS metered_turns,
+  sum(b.prompt_tokens)::bigint AS prompt_tokens,
+  sum(b.completion_tokens)::bigint AS completion_tokens,
+  sum(b.cache_read_tokens)::bigint AS cache_read_tokens,
+  sum(b.cache_write_tokens)::bigint AS cache_write_tokens,
+  sum(b.cache_miss_tokens)::bigint AS cache_miss_tokens,
+  coalesce(sum(GREATEST(b.model_calls-b.usage_reported_calls, 0)), 0)::bigint
+    AS unknown_usage_calls,
+  coalesce(sum(b.usage_reported_calls), 0)::bigint AS usage_reported_calls,
+  coalesce(sum(b.cache_reported_calls), 0)::bigint AS cache_reported_calls,
+  max(pr.provider) FILTER (WHERE pr.rank=1) AS primary_provider,
+  max(ud.daily_p50) AS daily_p50, max(ud.daily_p95) AS daily_p95
+FROM base b
+LEFT JOIN provider_rank pr ON pr.user_id=b.user_id AND pr.rank=1
+LEFT JOIN user_distribution ud ON ud.user_id=b.user_id
+GROUP BY b.user_id
+ORDER BY (sum(b.prompt_tokens)+sum(b.completion_tokens)) DESC NULLS LAST,
+         sum(b.model_calls) DESC, b.user_id
+""",
+                    base_params,
+                )
+                user_rows = cur.fetchall()
+
+                cur.execute(
+                    base_cte
+                    + """
+SELECT provider,model,count(DISTINCT user_id)::int AS users,
+  count(*)::int AS turns,
+  coalesce(sum(model_calls), 0)::bigint AS model_calls,
+  coalesce(sum(retries), 0)::bigint AS retries,
+  count(*) FILTER (WHERE failed)::int AS failed_turns,
+  sum(prompt_tokens)::bigint AS prompt_tokens,
+  sum(completion_tokens)::bigint AS completion_tokens,
+  sum(cache_read_tokens)::bigint AS cache_read_tokens,
+  sum(cache_write_tokens)::bigint AS cache_write_tokens,
+  sum(cache_miss_tokens)::bigint AS cache_miss_tokens,
+  coalesce(sum(GREATEST(model_calls-usage_reported_calls, 0)), 0)::bigint
+    AS unknown_usage_calls,
+  coalesce(sum(usage_reported_calls), 0)::bigint AS usage_reported_calls,
+  coalesce(sum(cache_reported_calls), 0)::bigint AS cache_reported_calls,
+  percentile_cont(0.50) WITHIN GROUP (ORDER BY latency_ms)
+    FILTER (WHERE latency_ms IS NOT NULL) AS latency_ms_p50,
+  percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)
+    FILTER (WHERE latency_ms IS NOT NULL) AS latency_ms_p95
+FROM base GROUP BY provider,model
+ORDER BY (sum(prompt_tokens)+sum(completion_tokens)) DESC NULLS LAST,
+         sum(model_calls) DESC,provider,model
+""",
+                    base_params,
+                )
+                model_rows = cur.fetchall()
+
+                cur.execute(
+                    f"""
+SELECT
+  array_agg(DISTINCT COALESCE(NULLIF(m.lane, ''), 'unknown')
+    ORDER BY COALESCE(NULLIF(m.lane, ''), 'unknown')) AS lanes,
+  array_agg(DISTINCT COALESCE(NULLIF(m.provider, ''), 'unknown')
+    ORDER BY COALESCE(NULLIF(m.provider, ''), 'unknown')) AS providers,
+  array_agg(DISTINCT COALESCE(NULLIF(m.model, ''), 'unknown')
+    ORDER BY COALESCE(NULLIF(m.model, ''), 'unknown')) AS models
+FROM v2_turn_metrics m WHERE {filter_where_sql}
+""",
+                    filter_where_params,
+                )
+                filter_options = cur.fetchone()
+
+    prompt_tokens = _usage_optional_int(totals, "prompt_tokens")
+    completion_tokens = _usage_optional_int(totals, "completion_tokens")
+    total_tokens = (
+        prompt_tokens + completion_tokens
+        if prompt_tokens is not None and completion_tokens is not None
+        else None
+    )
+    turns = int(totals["turns"] or 0)
+    model_calls = int(totals["model_calls"] or 0)
+    retries = int(totals["retries"] or 0)
+    active_user_days = int(totals["active_user_days"] or 0)
+    metered_turns = int(totals["metered_turns"] or 0)
+    activated_users = int(cohort["activated_users"] or 0)
+    usage_calls = int(totals["usage_reported_calls"] or 0)
+    cache_calls = int(totals["cache_reported_calls"] or 0)
+    cache_read = _usage_optional_int(totals, "cache_read_tokens")
+    cache_miss = _usage_optional_int(totals, "cache_miss_tokens")
+    cache_denominator = (
+        cache_read + cache_miss
+        if cache_read is not None and cache_miss is not None
+        else 0
+    )
+
+    overview = {
+        "registered_accounts": int(cohort["registered_accounts"] or 0),
+        "activated_users": activated_users,
+        "model_active_users": int(totals["model_active_users"] or 0),
+        "metered_users": int(totals["metered_users"] or 0),
+        "active_user_days": active_user_days,
+        "turns": turns,
+        "model_calls": model_calls,
+        "retries": retries,
+        "failed_turns": int(totals["failed_turns"] or 0),
+        "metered_turns": metered_turns,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": _usage_optional_int(totals, "cache_write_tokens"),
+        "cache_miss_tokens": cache_miss,
+        "unknown_usage_calls": int(totals["unknown_usage_calls"] or 0),
+    }
+    averages = {
+        "tokens_per_calendar_day": (
+            float(total_tokens) / duration_days
+            if total_tokens is not None and duration_days > 0
+            else None
+        ),
+        "tokens_per_active_user_day": (
+            float(total_tokens) / active_user_days
+            if total_tokens is not None and active_user_days
+            else None
+        ),
+        "tokens_per_activated_user_day": (
+            float(total_tokens) / (activated_users * duration_days)
+            if total_tokens is not None
+            and activated_users
+            and duration_days > 0
+            and not dimension_filtered
+            else None
+        ),
+        "tokens_per_metered_turn": (
+            float(total_tokens) / metered_turns
+            if total_tokens is not None and metered_turns
+            else None
+        ),
+        "user_day_tokens": {
+            key: _usage_optional_float(distribution, key)
+            for key in ("p50", "p75", "p90", "p95", "max")
+        },
+        "model_calls_per_turn": _usage_rate(model_calls, turns),
+        "retries_per_turn": _usage_rate(retries, turns),
+    }
+
+    def aggregate_row(row, *, include_day: bool = False) -> dict:
+        row_prompt = _usage_optional_int(row, "prompt_tokens")
+        row_completion = _usage_optional_int(row, "completion_tokens")
+        row_total = (
+            row_prompt + row_completion
+            if row_prompt is not None and row_completion is not None
+            else None
+        )
+        row_calls = int(row["model_calls"] or 0)
+        row_usage_calls = int(row["usage_reported_calls"] or 0)
+        row_cache_calls = int(row["cache_reported_calls"] or 0)
+        row_cache_read = _usage_optional_int(row, "cache_read_tokens")
+        row_cache_miss = _usage_optional_int(row, "cache_miss_tokens")
+        row_cache_denominator = (
+            row_cache_read + row_cache_miss
+            if row_cache_read is not None and row_cache_miss is not None
+            else 0
+        )
+        result = {
+            "turns": int(row["turns"] or 0),
+            "model_calls": row_calls,
+            "retries": int(row["retries"] or 0),
+            "failed_turns": int(row["failed_turns"] or 0),
+            "metered_turns": int(row.get("metered_turns") or 0),
+            "prompt_tokens": row_prompt,
+            "completion_tokens": row_completion,
+            "total_tokens": row_total,
+            "cache_read_tokens": row_cache_read,
+            "cache_write_tokens": _usage_optional_int(row, "cache_write_tokens"),
+            "cache_miss_tokens": row_cache_miss,
+            "unknown_usage_calls": int(row["unknown_usage_calls"] or 0),
+            "usage_reported_calls": row_usage_calls,
+            "cache_reported_calls": row_cache_calls,
+            "usage_coverage": _usage_rate(row_usage_calls, row_calls),
+            "cache_coverage": _usage_rate(row_cache_calls, row_calls),
+            "cache_hit_ratio": (
+                float(row_cache_read) / row_cache_denominator
+                if row_cache_denominator
+                else None
+            ),
+        }
+        if include_day:
+            result["local_day"] = row["local_day"].isoformat()
+            active_users = int(row["model_active_users"] or 0)
+            result["model_active_users"] = active_users
+            result["tokens_per_active_user_day"] = (
+                float(row_total) / active_users
+                if row_total is not None and active_users
+                else None
+            )
+            result["tokens_per_metered_turn"] = (
+                float(row_total) / result["metered_turns"]
+                if row_total is not None and result["metered_turns"]
+                else None
+            )
+        return result
+
+    daily = [aggregate_row(row, include_day=True) for row in daily_rows]
+    users = []
+    for row in user_rows:
+        item = aggregate_row(row)
+        item.update(
+            {
+                "user_id": str(row["user_id"]),
+                "active_days": int(row["active_days"] or 0),
+                "last_model_call_at": row["last_model_call_at"],
+                "primary_provider": str(row["primary_provider"] or "unknown"),
+                "daily_p50": _usage_optional_float(row, "daily_p50"),
+                "daily_p95": _usage_optional_float(row, "daily_p95"),
+                "tokens_per_calendar_day": (
+                    float(item["total_tokens"]) / duration_days
+                    if item["total_tokens"] is not None and duration_days > 0
+                    else None
+                ),
+                "tokens_per_active_day": (
+                    float(item["total_tokens"]) / int(row["active_days"])
+                    if item["total_tokens"] is not None and row["active_days"]
+                    else None
+                ),
+                "tokens_per_metered_turn": (
+                    float(item["total_tokens"]) / item["metered_turns"]
+                    if item["total_tokens"] is not None and item["metered_turns"]
+                    else None
+                ),
+                "known_token_share": (
+                    float(item["total_tokens"]) / total_tokens
+                    if item["total_tokens"] is not None and total_tokens
+                    else None
+                ),
+            }
+        )
+        users.append(item)
+
+    models = []
+    for row in model_rows:
+        item = aggregate_row(row)
+        item.update(
+            {
+                "provider": str(row["provider"]),
+                "model": str(row["model"]),
+                "users": int(row["users"] or 0),
+                "tokens_per_call": (
+                    float(item["total_tokens"]) / item["model_calls"]
+                    if item["total_tokens"] is not None and item["model_calls"]
+                    else None
+                ),
+                "latency_ms_p50": _usage_optional_float(row, "latency_ms_p50"),
+                "latency_ms_p95": _usage_optional_float(row, "latency_ms_p95"),
+                "failure_rate": _usage_rate(item["failed_turns"], item["turns"]),
+                "retry_rate": _usage_rate(item["retries"], item["model_calls"]),
+            }
+        )
+        models.append(item)
+
+    return {
+        "overview": overview,
+        "averages": averages,
+        "daily": daily,
+        "users": users,
+        "models": models,
+        "filters": {
+            "lanes": list(filter_options["lanes"] or []),
+            "providers": list(filter_options["providers"] or []),
+            "models": list(filter_options["models"] or []),
+        },
+        "coverage": {
+            "usage_reported_calls": usage_calls,
+            "model_calls": model_calls,
+            "usage_coverage": _usage_rate(usage_calls, model_calls),
+            "cache_reported_calls": cache_calls,
+            "cache_coverage": _usage_rate(cache_calls, model_calls),
+            "cache_hit_ratio": (
+                float(cache_read) / cache_denominator
+                if cache_denominator
+                else None
+            ),
+            "reference_cohort": {
+                "basis": "parseable_timestamps_at_end_at",
+                "unparseable_registered_rows": int(
+                    cohort["unparseable_registered_rows"] or 0
+                ),
+                "unparseable_memory_rows": int(
+                    cohort["unparseable_memory_rows"] or 0
+                ),
+                "limitation": (
+                    "legacy unparseable timestamps are excluded from "
+                    "historical registered and activated reference cohorts"
+                ),
+            },
+        },
+    }
+
+
 def recent_runtime_user_report(*, within_hours: int = 24) -> dict:
     """Aggregate content-free Runtime V2 token telemetry by user and model."""
     safe_hours = max(1, min(int(within_hours), 24 * 366))
