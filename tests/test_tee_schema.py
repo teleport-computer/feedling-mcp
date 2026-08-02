@@ -103,3 +103,52 @@ def test_tee_primary_shared_table_columns_match_runtime_schema():
         if rds[table] != tee[table]
     }
     assert mismatches == {}
+
+
+def test_tee_primary_shared_unique_contracts_match_runtime_schema():
+    """A promoted primary must satisfy every runtime ON CONFLICT target.
+
+    The old shadow deliberately omitted unique indexes because RDS serialized
+    writes.  That is unsafe once TEE becomes DATABASE_URL and was first exposed
+    by the whole-turn metric upsert failing on ``ON CONFLICT (job_id)``.
+    """
+    query = """
+        SELECT table_name, is_primary, is_unique, key_columns, predicate
+        FROM (
+          SELECT tbl.relname AS table_name,
+                 idx.indisprimary AS is_primary,
+                 idx.indisunique AS is_unique,
+                 ARRAY(
+                   SELECT pg_get_indexdef(idx.indexrelid, key_position, true)
+                   FROM generate_series(1, idx.indnkeyatts) AS key_position
+                   ORDER BY key_position
+                 ) AS key_columns,
+                 COALESCE(pg_get_expr(idx.indpred, idx.indrelid), '') AS predicate
+          FROM pg_index AS idx
+          JOIN pg_class AS tbl ON tbl.oid = idx.indrelid
+          JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace
+          WHERE ns.nspname = 'public'
+            AND (idx.indisprimary OR idx.indisunique)
+        ) AS contracts
+        ORDER BY table_name, is_primary, key_columns, predicate
+    """
+
+    def contracts(url: str) -> dict[str, set[tuple]]:
+        with psycopg.connect(url) as conn:
+            rows = conn.execute(query).fetchall()
+        result: dict[str, set[tuple]] = {}
+        for table, primary, unique, columns, predicate in rows:
+            result.setdefault(table, set()).add(
+                (bool(primary), bool(unique), tuple(columns), predicate)
+            )
+        return result
+
+    rds = contracts(os.environ["DATABASE_URL"])
+    tee = contracts(os.environ["TEE_DATABASE_URL"])
+    shared = set(rds) & set(tee)
+    missing = {
+        table: sorted(rds[table] - tee[table], key=repr)
+        for table in sorted(shared)
+        if rds[table] - tee[table]
+    }
+    assert missing == {}
