@@ -115,6 +115,15 @@ Mixed reads are supported steady state.
 Create explicit `on` and `off` accounts. On every supported surface, write a
 unique canary, read through the public/agent path, and inspect shape plus owner:
 
+For a hosted Runtime V2 canary, configuring a provider is not sufficient. Add
+each temporary account to `POST /v1/admin/runtime-allowlist` with
+`desired="v2"`, then set `POST /v1/admin/hosted-runtime-mode` to
+`db_action_v2`. Wait until the allowlist row reports `converged=true`, actual
+state `v2`, and the runtime-mode fence reads `db_action_v2` before sending the
+message. Otherwise the reconciler returns the account to `resident_cli`, and a
+202 response only proves the V1 ingress path. Remove the temporary allowlist
+rows and accounts in a `finally` cleanup.
+
 - `on`: `body_ct` and (for shared records) `K_enclave`; no plaintext body.
 - `off`: text `body`; binary `body_b64` or internal `plaintext_v1`; no crypto
   fields.
@@ -128,6 +137,12 @@ unique canary, read through the public/agent path, and inspect shape plus owner:
 
 Finally verify API/worker health, empty active/failed queues, schema head/marker,
 backup health, and unchanged frozen-source counts.
+
+Treat the two accounts as separate assertions. For `off`, every newly-created
+Chat and trajectory row must be plaintext; for `on`, every newly-created row
+must be encrypted. Do not compare lifetime environment totals: mixed historical
+rows are valid, and cleanup may cascade-delete the canary evidence. Capture
+counts scoped by canary account and creation time before cleanup.
 
 ## Environment cadence
 
