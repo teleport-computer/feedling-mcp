@@ -277,6 +277,27 @@ def test_0075_usage_rollup_rejects_negative_aggregates_and_tracks_watermarks():
 
 
 @pytest.mark.parametrize(
+    ("rollup_name", "dirty_from_day", "dirty_through_day"),
+    [
+        ("dirty_from_only", "2026-08-01", None),
+        ("dirty_through_only", None, "2026-08-02"),
+        ("dirty_reversed", "2026-08-03", "2026-08-02"),
+    ],
+)
+def test_0075_dirty_day_bounds_are_paired_and_ordered(
+    rollup_name, dirty_from_day, dirty_through_day
+):
+    with db.get_pool().connection() as conn:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO v2_usage_rollup_watermarks "
+                "(rollup_name,dirty_from_day,dirty_through_day) "
+                "VALUES (%s,%s,%s)",
+                (rollup_name, dirty_from_day, dirty_through_day),
+            )
+
+
+@pytest.mark.parametrize(
     ("table", "prefix", "day"),
     [
         ("v2_usage_daily_users", "all", "2026-09-01"),
@@ -398,6 +419,61 @@ def test_0075_upgrade_recovers_a_real_invalid_concurrent_index_shell():
         command.upgrade(cfg, "head")
         with db.get_pool().connection() as conn:
             conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+@pytest.mark.parametrize(
+    "wrong_index_sql",
+    [
+        "CREATE INDEX CONCURRENTLY ix_v2_turn_metrics_updated_id "
+        "ON users (user_id)",
+        "CREATE INDEX CONCURRENTLY ix_v2_turn_metrics_updated_id "
+        "ON v2_turn_metrics (created_at)",
+    ],
+    ids=("wrong-table", "wrong-columns"),
+)
+def test_0075_upgrade_rebuilds_a_valid_but_wrong_source_cursor_index(
+    wrong_index_sql,
+):
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    try:
+        command.downgrade(cfg, "0074_runtime_user_delivery_idx")
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(wrong_index_sql)
+            assert conn.execute(
+                "SELECT idx.indisvalid FROM pg_index idx "
+                "WHERE idx.indexrelid='ix_v2_turn_metrics_updated_id'::regclass"
+            ).fetchone() == (True,)
+
+        command.upgrade(cfg, "0075_v2_usage_rollup")
+        with db.get_pool().connection() as conn:
+            recovered = conn.execute(
+                "SELECT idx.indisvalid,tbl.relname,idx.indnkeyatts,idx.indnatts,"
+                "pg_get_indexdef(idx.indexrelid,1,true),"
+                "pg_get_indexdef(idx.indexrelid,2,true),"
+                "pg_get_indexdef(idx.indexrelid,3,true) "
+                "FROM pg_index idx "
+                "JOIN pg_class tbl ON tbl.oid=idx.indrelid "
+                "WHERE idx.indexrelid='ix_v2_turn_metrics_updated_id'::regclass"
+            ).fetchone()
+        assert recovered == (
+            True,
+            "v2_turn_metrics",
+            2,
+            3,
+            "updated_at",
+            "id",
+            "created_at",
+        )
+    finally:
+        command.downgrade(cfg, "0074_runtime_user_delivery_idx")
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(
+                "DROP INDEX CONCURRENTLY IF EXISTS ix_v2_turn_metrics_updated_id"
+            )
+        command.upgrade(cfg, "head")
 
 
 def test_0074_runtime_user_delivery_indexes_are_concurrent_and_recoverable():

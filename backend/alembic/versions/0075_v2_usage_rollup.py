@@ -167,8 +167,9 @@ CREATE TABLE IF NOT EXISTS v2_usage_rollup_watermarks (
     source_lag_seconds IS NULL OR source_lag_seconds >= 0
   ),
   CONSTRAINT ck_v2_usage_rollup_watermarks_dirty_range CHECK (
-    dirty_from_day IS NULL OR dirty_through_day IS NULL
-    OR dirty_from_day <= dirty_through_day
+    (dirty_from_day IS NULL AND dirty_through_day IS NULL)
+    OR (dirty_from_day IS NOT NULL AND dirty_through_day IS NOT NULL
+        AND dirty_from_day <= dirty_through_day)
   ),
   CONSTRAINT ck_v2_usage_rollup_watermarks_version CHECK (version >= 0)
 );
@@ -182,9 +183,19 @@ _SOURCE_CURSOR_INDEX = (
 
 
 def _source_index_validity() -> bool | None:
+    """None if absent; False if invalid or not the exact target index."""
     row = op.get_bind().exec_driver_sql(
-        "SELECT idx.indisvalid FROM pg_class AS cls "
+        "SELECT (idx.indisvalid "
+        "AND idx.indrelid='v2_turn_metrics'::regclass "
+        "AND am.amname='btree' AND NOT idx.indisunique "
+        "AND idx.indnkeyatts=2 AND idx.indnatts=3 "
+        "AND idx.indexprs IS NULL AND idx.indpred IS NULL "
+        "AND pg_get_indexdef(idx.indexrelid,1,true)='updated_at' "
+        "AND pg_get_indexdef(idx.indexrelid,2,true)='id' "
+        "AND pg_get_indexdef(idx.indexrelid,3,true)='created_at') "
+        "FROM pg_class AS cls "
         "JOIN pg_index AS idx ON idx.indexrelid=cls.oid "
+        "JOIN pg_am AS am ON am.oid=cls.relam "
         "WHERE cls.relkind='i' "
         "AND cls.relname='ix_v2_turn_metrics_updated_id' "
         "AND pg_table_is_visible(cls.oid)"
