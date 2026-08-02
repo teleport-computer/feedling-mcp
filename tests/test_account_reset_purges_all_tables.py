@@ -143,6 +143,20 @@ def _seed_all_per_user_tables(user_id: str) -> None:
             "VALUES ('2026-08-01',%s,'chat','anthropic','claude-test',1,1)",
             (user_id,),
         )
+        conn.execute(
+            "INSERT INTO llm_provider_attempts "
+            "(attempt_id,user_id,call_id,outer_attempt_ordinal,inner_attempt_ordinal,"
+            "requested_provider,resolved_provider,requested_model,resolved_model,"
+            "transport,lane,state,source) "
+            "VALUES (%s,%s,'reset-call',1,0,'openai','openai','gpt-test','gpt-test',"
+            "'responses','chat','started','runtime_recorder')",
+            (f"reset-attempt-{user_id}", user_id),
+        )
+        conn.execute(
+            "INSERT INTO llm_provider_attempt_corrections "
+            "(attempt_id,user_id,revision,reason_code) VALUES (%s,%s,1,'late_usage')",
+            (f"reset-attempt-{user_id}", user_id),
+        )
     cid = db.model_api_credential_create(
         user_id, provider="anthropic", base_url="", label="k",
         api_key_envelope={"v": 1, "body_ct": "ct", "nonce": "n"},
@@ -165,6 +179,8 @@ _PER_USER_TABLES = (
     "v2_chat_tail_anchor",
     "v2_usage_daily_users",
     "v2_usage_daily_dimensions",
+    "llm_provider_attempts",
+    "llm_provider_attempt_corrections",
     "chat_message_archive",
     "user_blobs",
 )
@@ -208,6 +224,20 @@ def test_db_belt_purges_usage_rollups_without_deleting_parent_user(client):
             (uid,),
         )
         conn.execute(
+            "INSERT INTO llm_provider_attempts "
+            "(attempt_id,user_id,call_id,outer_attempt_ordinal,inner_attempt_ordinal,"
+            "requested_provider,resolved_provider,requested_model,resolved_model,"
+            "transport,lane,state,source) "
+            "VALUES ('belt-attempt',%s,'belt-call',1,0,'openai','openai','gpt-test',"
+            "'gpt-test','responses','chat','started','runtime_recorder')",
+            (uid,),
+        )
+        conn.execute(
+            "INSERT INTO llm_provider_attempt_corrections "
+            "(attempt_id,user_id,revision,reason_code) VALUES ('belt-attempt',%s,1,'late_usage')",
+            (uid,),
+        )
+        conn.execute(
             "INSERT INTO v2_usage_daily_dimensions "
             "(local_day,user_id,lane,provider,model,all_turns) "
             "VALUES ('2026-08-02',%s,'chat','anthropic','claude-test',1)",
@@ -220,10 +250,18 @@ def test_db_belt_purges_usage_rollups_without_deleting_parent_user(client):
         assert conn.execute(
             "SELECT count(*) FROM users WHERE user_id=%s", (uid,)
         ).fetchone() == (1,)
-        for table in ("v2_usage_daily_users", "v2_usage_daily_dimensions"):
+        for table in (
+            "v2_usage_daily_users", "v2_usage_daily_dimensions",
+            "llm_provider_attempts",
+        ):
             assert conn.execute(
                 f"SELECT count(*) FROM {table} WHERE user_id=%s", (uid,)
             ).fetchone() == (0,)
+        assert conn.execute(
+            "SELECT count(*) FROM llm_provider_attempt_corrections "
+            "WHERE user_id=%s",
+            (uid,),
+        ).fetchone() == (0,)
         conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
 
 

@@ -181,6 +181,23 @@ REGISTRY: dict[str, Entry] = {
         SKIP,
         "Admin 用量 rollup 的 bootstrap/cursor/error 控制面；不含用户内容，必须跟 RDS 派生表同库推进",
     ),
+    "llm_provider_attempts": Entry(
+        SKIP,
+        "Canonical provider-attempt 账本只含计量/错误分类元数据；当前业务 RDS 是权威 totals "
+        "和 coverage 对账存储，不能在 TEE 造第二份账本",
+    ),
+    "llm_provider_attempt_corrections": Entry(
+        SKIP,
+        "Provider-attempt 的追加式 late usage/cost 修正审计；随主账本留在当前业务 RDS",
+    ),
+    "llm_rate_cards": Entry(
+        SKIP,
+        "Effective-dated provider/model 费率版本，供 RDS 账本成本解释使用，不是 TEE 用户内容",
+    ),
+    "llm_usage_rollup_watermarks": Entry(
+        SKIP,
+        "Provider-attempt 聚合的 cursor/replay 控制面；必须与 RDS ledger 原子推进",
+    ),
     "tee_sync_runs": Entry(
         SKIP, "TEE 同步自身的控制面/指标表，必须住在 RDS——复制到被它监控的库里没有意义"),
     "tee_reconcile_state": Entry(SKIP, "TEE reconcile 的控制面状态，同上，必须住 RDS"),

@@ -59,6 +59,150 @@ def _migration_0075_module():
     )
 
 
+def _migration_0076_module():
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    return (
+        ScriptDirectory.from_config(cfg)
+        .get_revision("0076_llm_provider_attempts")
+        .module
+    )
+
+
+def test_0076_provider_attempt_schema_is_content_free_and_deletion_safe():
+    """A provider dispatch is idempotent, queryable, and removed with its user.
+
+    This catches a missing FK/ordinal uniqueness or a migration that omits the
+    reporting indexes.  Prompt/reply columns are intentionally absent: this is
+    an operational ledger, never a content store.
+    """
+    migration = _migration_0076_module()
+
+    assert migration.down_revision == "0075_v2_usage_rollup"
+    assert set(migration._CONCURRENT_INDEXES) == {
+        "ix_llm_provider_attempts_user_started",
+        "ix_llm_provider_attempts_finished",
+        "ix_llm_provider_attempts_provider_model_finished",
+        "ix_llm_provider_attempts_call",
+    }
+
+    uid = "u_provider_attempt_schema"
+    _seed_user(uid)
+    try:
+        with db.get_pool().connection() as conn:
+            assert conn.execute(
+                "SELECT version_num FROM alembic_version"
+            ).fetchone() == ("0076_llm_provider_attempts",)
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_name = ANY(%s)",
+                    ([
+                        "llm_provider_attempts",
+                        "llm_provider_attempt_corrections",
+                        "llm_rate_cards",
+                        "llm_usage_rollup_watermarks",
+                    ],),
+                ).fetchall()
+            }
+            assert tables == {
+                "llm_provider_attempts",
+                "llm_provider_attempt_corrections",
+                "llm_rate_cards",
+                "llm_usage_rollup_watermarks",
+            }
+            actual_indexes = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT indexname FROM pg_indexes WHERE tablename='llm_provider_attempts'"
+                ).fetchall()
+            }
+            assert set(migration._CONCURRENT_INDEXES) <= actual_indexes
+
+            attempt_columns = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name='llm_provider_attempts'"
+                ).fetchall()
+            }
+            assert {
+                "attempt_id", "user_id", "call_id",
+                "outer_attempt_ordinal", "inner_attempt_ordinal",
+                "requested_provider", "resolved_provider", "requested_model",
+                "resolved_model", "transport", "state", "outcome", "error_class",
+                "usage_known", "usage_unknown_reason", "possibly_billed",
+                "input_tokens", "output_tokens", "reasoning_tokens",
+                "cache_read_tokens", "cache_write_tokens", "cache_miss_tokens",
+                "latency_ms", "ttft_ms", "cost", "currency", "rate_card_version",
+                "source", "revision", "created_at", "updated_at",
+            } <= attempt_columns
+            assert not {
+                "prompt", "reply", "reasoning", "request_body", "response_body",
+                "headers", "credentials", "endpoint", "stack",
+            } & attempt_columns
+            correction_columns = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name='llm_provider_attempt_corrections'"
+                ).fetchall()
+            }
+            assert {"attempt_id", "user_id", "revision", "reason_code"} <= correction_columns
+
+            conn.execute(
+                "INSERT INTO llm_provider_attempts "
+                "(attempt_id,user_id,call_id,outer_attempt_ordinal,inner_attempt_ordinal,"
+                "requested_provider,resolved_provider,requested_model,resolved_model,"
+                "transport,lane,state,source) "
+                "VALUES ('attempt-0076',%s,'call-0076',1,0,'openai','openai',"
+                "'gpt-test','gpt-test','responses','chat','started','runtime_recorder')",
+                (uid,),
+            )
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                conn.execute(
+                    "INSERT INTO llm_provider_attempts "
+                    "(attempt_id,user_id,call_id,outer_attempt_ordinal,inner_attempt_ordinal,"
+                    "requested_provider,resolved_provider,requested_model,resolved_model,"
+                    "transport,lane,state,source) "
+                    "VALUES ('attempt-0076-duplicate',%s,'call-0076',1,0,'openai','openai',"
+                    "'gpt-test','gpt-test','responses','chat','started','runtime_recorder')",
+                    (uid,),
+                )
+            conn.execute(
+                "INSERT INTO llm_provider_attempt_corrections "
+                "(attempt_id,user_id,revision,reason_code) "
+                "VALUES ('attempt-0076',%s,1,'late_usage')",
+                (uid,),
+            )
+            conn.execute(
+                "DELETE FROM users WHERE user_id=%s", (uid,)
+            )
+            assert conn.execute(
+                "SELECT count(*) FROM llm_provider_attempts WHERE attempt_id='attempt-0076'"
+            ).fetchone() == (0,)
+            assert conn.execute(
+                "SELECT count(*) FROM llm_provider_attempt_corrections "
+                "WHERE user_id=%s",
+                (uid,),
+            ).fetchone() == (0,)
+            conn.execute(
+                "INSERT INTO llm_rate_cards "
+                "(provider,model,version,currency,effective_at) "
+                "VALUES ('provider-0076','model-0076','v1','USD',now())"
+            )
+            with pytest.raises(psycopg.errors.RaiseException):
+                conn.execute(
+                    "UPDATE llm_rate_cards SET input_cost_per_million=1 "
+                    "WHERE provider='provider-0076' AND model='model-0076' AND version='v1'"
+                )
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
 def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
     migration = _migration_0075_module()
 
@@ -106,7 +250,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert head == ("0075_v2_usage_rollup",)
+    assert head == ("0076_llm_provider_attempts",)
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",

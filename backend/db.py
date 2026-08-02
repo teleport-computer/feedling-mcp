@@ -9984,6 +9984,8 @@ def delete_user_data(user_id: str) -> None:
     (0011)。仍被 content/content_core.py 的销号(account/reset)兜底路径调用；
     删账号主路径不再依赖它做 R2。"""
     tables = (
+        "llm_provider_attempt_corrections",
+        "llm_provider_attempts",
         "v2_usage_daily_dimensions",
         "v2_usage_daily_users",
         "v2_conversation_summary_segments",
