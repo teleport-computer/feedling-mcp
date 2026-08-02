@@ -4,8 +4,8 @@
 
 The production Admin Hosted V2 Usage report passes the 3,000 ms p95 gate at
 the required 3,000,000-row source scale. The fresh, unfiltered 90-day report
-measured **1,856.380 ms p95**; the provider/model-filtered report measured
-**1,311.303 ms p95**. Both results came from the real
+measured **2,534.168 ms p95**; the provider/model-filtered report measured
+**2,104.938 ms p95**. Both results came from the real rolling
 `usage_report_snapshot()` entry point after bootstrapping the production rollup
 tables from an empty, migrated database.
 
@@ -26,19 +26,19 @@ maximum measured value.
 
 | Cohort | Measured samples (ms) | p50 | p95 | Budget |
 |---|---|---:|---:|---:|
-| Unfiltered | 1856.258, 1846.012, 1847.883, 1838.799, 1856.380 | 1847.883 | **1856.380** | < 3000 |
-| `openrouter/openai/gpt-4o-mini` | 1285.730, 1295.001, 1288.769, 1311.303, 1303.678 | 1295.001 | **1311.303** | < 3000 |
+| Unfiltered | 2441.852, 2404.135, 2434.798, 2511.754, 2534.168 | 2441.852 | **2534.168** | < 3000 |
+| `openrouter/openai/gpt-4o-mini` | 2079.195, 2079.272, 2085.048, 2072.711, 2104.938 | 2079.272 | **2104.938** | < 3000 |
 
 The deterministic fixture contained 3,000,000 content-free
 `v2_turn_metrics` rows across 2,000 users and 365 days. The measured 90-day
 half-open interval contained 739,736 source rows. Production rollup bootstrap
-completed with no dirty range or last error and produced 730,000 rows in each
+completed with no dirty range or last error and produced 731,199 rows in each
 user-grain rollup table:
 
 | Relation | Rows | Relation bytes | Index bytes | Total bytes |
 |---|---:|---:|---:|---:|
-| `v2_usage_daily_users` | 730,000 | 398,688,256 | 80,699,392 | 479,518,720 |
-| `v2_usage_daily_dimensions` | 730,000 | 498,352,128 | 93,773,824 | 592,281,600 |
+| `v2_usage_daily_users` | 731,199 | 399,343,616 | 104,292,352 | 503,767,040 |
+| `v2_usage_daily_dimensions` | 731,199 | 499,113,984 | 195,420,160 | 694,689,792 |
 
 ## Production query shape
 
@@ -51,11 +51,13 @@ then assigned to three approximately equal bins:
    primary provider/model.
 3. Importer B: daily rows, lane rows, and model latency.
 
-Before the fresh gate, retained-fixture warmed medians were 1,547.024 ms,
-1,490.456 ms, and 1,547.066 ms for those three bins. Two retained five-run
-checks also passed before the database was emptied: unfiltered p95 values were
-1,617.516 ms and 1,567.045 ms; filtered p95 values were 1,299.266 ms and
-1,166.240 ms.
+The fixed query window was the half-open interval
+`[2026-05-04T12:30:00Z, 2026-08-02T12:30:00Z)`. It was intentionally not
+aligned to Asia/Shanghai midnight: 89 complete local days
+(`2026-05-05` through `2026-08-01`) came from rollups, while partial local days
+`2026-05-04` and `2026-08-02` came from authoritative raw metrics. This is the
+real rolling preset shape; the earlier all-full-day measurement is not the
+acceptance gate.
 
 Every optional task executes in its own savepoint. A task error rolls back and
 degrades only that report section; an exhausted shared deadline may degrade
@@ -65,20 +67,27 @@ runtime traffic.
 
 ## SQL and correctness gates
 
-Both final cohorts reported `hybrid-parallel` coverage with all 90 days served
-from rollups, no raw days, and no `v2_turn_metrics` branch in captured report
-SQL. The harness additionally verified:
+Both final cohorts reported `hybrid-parallel` coverage with exactly the expected
+89 rollup days and two raw partial days. Captured SQL included the
+`v2_turn_metrics` branch, and the harness verified that its presence matched the
+partition. It additionally verified:
 
 - half-open time bounds on every captured raw metric branch;
 - no content-bearing prompt, reply, message, or tool columns in reporting SQL;
+- direct scalar half-open raw ranges used `ix_v2_turn_metrics_created_at`
+  Bitmap Index Scans for `[2026-05-04T12:30Z, 2026-05-04T16:00Z)` and
+  `[2026-08-01T16:00Z, 2026-08-02T12:30Z)`;
 - exact latency percentile SQL was captured and explained;
 - rollup/raw and filtered mixed-partition parity in the database-backed suite;
 - `completeness=unknown` retains exact daily and user-day distributions;
 - at most three database connections are active per report.
 
-The final unfiltered exact-latency plan executed in 475.407 ms; the filtered
-plan executed in 294.977 ms. Both plans used the production
-`v2_usage_daily_dimensions` grain index over the requested day range.
+The final unfiltered overview plan executed in 1,723.485 ms and read 178,000
+rollup user-day rows plus 8,208 bounded raw-edge rows. The filtered overview
+plan executed in 1,220.051 ms and read 121,040 rollup dimension rows plus 5,596
+matching raw-edge rows. Exact-latency plans executed in 511.423 ms unfiltered
+and 592.995 ms filtered; both combined the production dimension-grain index
+with the same bounded raw-edge index scans.
 
 ## Environment and infrastructure scope
 
@@ -91,8 +100,7 @@ synchronous hot-path write, cache service, or other infrastructure.
 
 The production implementation and performance harness were verified with:
 
-- 92 passing Admin Usage tests;
-- 303 passing Admin/Data Track/Runtime/Migration tests;
+- 95 passing Admin Usage tests;
 - Ruff, Python compilation, and `git diff --check`;
 - an independent review with no Critical, Important, or Minor findings.
 
