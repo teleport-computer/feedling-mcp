@@ -191,6 +191,11 @@ equivalent to direct pinning. The legacy Phala `-5003s` passthrough remains the
 compatibility and audit endpoint: it presents the enclave's self-signed
 certificate, whose live fingerprint is checked against attestation `REPORT_DATA`.
 
+dstack-ingress 2.2 的 `quote.json` 使用 `hash_algorithm: "raw"` 和空 `prefix`：
+这里的 `raw` 表示调用方已经计算 `sha256(exact sha256sum.txt bytes)`，再把该 32-byte
+digest 原样交给 SDK v0.5 quote API；它不表示把未哈希 evidence 放进 `REPORT_DATA`。
+验证器仍要求解析后的 TDX quote `REPORT_DATA` 恰好为该 digest 加 32 个 zero bytes。
+
 | | |
 |---|---|
 | Provider | Phala Cloud dstack on prod9 (`dstack-pha-prod9.phala.network`) |
