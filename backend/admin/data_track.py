@@ -3295,8 +3295,12 @@ def _usage_filter_options(values, selected: str | None) -> str:
     return "".join(options)
 
 
-def _usage_user_href(query: admin_usage.UsageQuery, user_id: str) -> str:
-    canonical = _usage_page_href(query, user_id=user_id)
+def _usage_user_href(
+    query: admin_usage.UsageQuery,
+    user_id: str,
+    **updates,
+) -> str:
+    canonical = _usage_page_href(query, user_id=user_id, **updates)
     _, _, query_string = canonical.partition("?")
     path = f"/admin/data-track/users/{quote(user_id, safe='')}"
     return f"{path}?{query_string}" if query_string else path
@@ -3340,7 +3344,10 @@ def _usage_sorted_users(report: dict) -> tuple[list[dict], int, int]:
         offset = max(int(request.args.get("offset") or 0), 0)
     except (TypeError, ValueError):
         offset = 0
-    offset = min(offset, len(rows))
+    if not rows:
+        offset = 0
+    elif offset >= len(rows):
+        offset = ((len(rows) - 1) // 100) * 100
     return rows[offset:offset + 100], offset, len(rows)
 
 
@@ -3362,12 +3369,15 @@ def _render_usage_page(
         or query.completeness != "all"
     )
 
+    def page_href(**updates) -> str:
+        if drilldown_user_id:
+            return _usage_user_href(query, drilldown_user_id, **updates)
+        return _usage_page_href(query, **updates)
+
     preset_links = []
     for preset in ("24h", "7d", "30d", "90d"):
         cls = "sort-button active" if query.preset == preset else "sort-button"
-        href = _usage_page_href(
-            query, preset=preset, start_date=None, end_date=None, offset=0
-        )
+        href = page_href(preset=preset, start_date=None, end_date=None, offset=0)
         preset_links.append(
             f"<a class='{cls}' href='{html.escape(href, quote=True)}'>{preset}</a>"
         )
@@ -3376,19 +3386,28 @@ def _render_usage_page(
     custom_end = html.escape(str(query.end_date or ""), quote=True)
     timezone_name = html.escape(query.timezone, quote=True)
     user_id_value = html.escape(str(query.user_id or ""), quote=True)
+    form_action = "/admin/data-track"
+    user_filter = f"<label>User ID<input name='user_id' value='{user_id_value}'></label>"
+    if drilldown_user_id:
+        form_action = f"/admin/data-track/users/{quote(drilldown_user_id, safe='')}"
+        user_filter = (
+            "<input type='hidden' name='user_id' "
+            f"value='{html.escape(drilldown_user_id, quote=True)}'>"
+        )
+    form_action = html.escape(form_action, quote=True)
     preset_options = "".join(
         f"<option value='{preset}'{' selected' if query.preset == preset else ''}>{preset}</option>"
         for preset in ("24h", "7d", "30d", "90d", "custom")
     )
     filter_form = f"""
-  <form class='usage-filters' method='get' action='/admin/data-track'>
+  <form class='usage-filters' method='get' action='{form_action}'>
     <input type='hidden' name='view' value='usage'>
     <input type='hidden' name='admin_key' value='{admin_key}'>
     <label>Window<select name='preset'>{preset_options}</select></label>
     <label>Start date<input name='start_date' type='date' value='{custom_start}'></label>
     <label>End date<input name='end_date' type='date' value='{custom_end}'></label>
     <label>Timezone<input name='timezone' value='{timezone_name}'></label>
-    <label>User ID<input name='user_id' value='{user_id_value}'></label>
+    {user_filter}
     <label>Lane<select name='lane'>{_usage_filter_options(filters.get('lanes'), query.lane)}</select></label>
     <label>Provider<select name='provider'>{_usage_filter_options(filters.get('providers'), query.provider)}</select></label>
     <label>Model<select name='model'>{_usage_filter_options(filters.get('models'), query.model)}</select></label>
@@ -3497,15 +3516,15 @@ def _render_usage_page(
     active_dir = str(request.args.get("dir") or "desc").strip().lower()
     for key, label in (("tokens", "Known token"), ("calls", "Calls"), ("retries", "Retries"), ("recent", "Recent")):
         next_dir = "asc" if key == active_sort and active_dir == "desc" else "desc"
-        href = _usage_page_href(query, sort=key, dir=next_dir, offset=0)
+        href = page_href(sort=key, dir=next_dir, offset=0)
         cls = "sort-button active" if key == active_sort else "sort-button"
         sort_links.append(f"<a class='{cls}' href='{html.escape(href, quote=True)}'>{label}</a>")
     pager = []
     if user_offset:
-        href = _usage_page_href(query, sort=active_sort, dir=active_dir, offset=max(0, user_offset - 100))
+        href = page_href(sort=active_sort, dir=active_dir, offset=max(0, user_offset - 100))
         pager.append(f"<a class='sort-button' href='{html.escape(href, quote=True)}'>Prev</a>")
     if user_offset + len(user_rows) < user_total:
-        href = _usage_page_href(query, sort=active_sort, dir=active_dir, offset=user_offset + 100)
+        href = page_href(sort=active_sort, dir=active_dir, offset=user_offset + 100)
         pager.append(f"<a class='sort-button' href='{html.escape(href, quote=True)}'>Next</a>")
 
     models_available = report.get("models") is not None
@@ -3622,7 +3641,7 @@ def _render_usage_page(
   <h1>Usage / 模型用量</h1>
   <div class='muted'>Hosted Runtime V2 whole-turn telemetry · UTC range
     {html.escape(query.start_at_utc.isoformat())} — {html.escape(query.end_at_utc.isoformat())} · display timezone {timezone_name}.</div>
-  {_render_data_track_view_nav('usage', query)}
+  {_render_data_track_view_nav('usage', query, drilldown_user_id)}
   <div class='sortbar'>{''.join(preset_links)}</div>
   {filter_form}
   {drilldown}
@@ -3665,7 +3684,7 @@ def _render_usage_error_page(
     return f"""<!doctype html>
 <html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>Usage / 模型用量 · Feedling Data Track</title><style>{_RUNTIME_PAGE_CSS}</style></head>
-<body><main><h1>Usage / 模型用量</h1>{_render_data_track_view_nav('usage', query)}
+<body><main><h1>Usage / 模型用量</h1>{_render_data_track_view_nav('usage', query, drilldown_user_id)}
 <div class='note-box'><b>Usage 数据暂时取不到。</b>仅本页降级；Runtime 健康和其他 Admin 视图不受影响。具体异常见后端日志。</div>
 {drilldown}<div class='muted'>Requested UTC range {html.escape(query.start_at_utc.isoformat())} — {html.escape(query.end_at_utc.isoformat())}.</div>
 </main></body></html>"""
@@ -3674,11 +3693,19 @@ def _render_usage_error_page(
 def _render_data_track_view_nav(
     active: str,
     usage_query: admin_usage.UsageQuery | None = None,
+    usage_drilldown_user_id: str | None = None,
 ) -> str:
     def nav_item(view: str, label: str) -> str:
         cls = "sort-button active" if active == view else "sort-button"
         if view == "usage":
-            href = _usage_page_href(usage_query, offset=0)
+            if usage_drilldown_user_id:
+                href = _usage_user_href(
+                    usage_query,
+                    usage_drilldown_user_id,
+                    offset=0,
+                )
+            else:
+                href = _usage_page_href(usage_query, offset=0)
         else:
             href = _data_track_page_href(
                 view=None if view == "users" else view,

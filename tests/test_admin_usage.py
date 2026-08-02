@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from html import unescape
+import re
 import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -682,9 +684,12 @@ def test_usage_filter_form_preserves_rolling_preset_when_adding_provider(monkeyp
     form_start = body.index("<form class='usage-filters'")
     form_end = body.index("</form>", form_start)
     form = body[form_start:form_end]
+    assert "action='/admin/data-track'" in form
     assert "<select name='preset'>" in form
     assert "<option value='7d' selected>7d</option>" in form
     assert "type='hidden' name='preset' value='custom'" not in form
+    assert "<label>User ID<input name='user_id'" in form
+    assert "type='hidden' name='user_id'" not in form
 
     _admin_core.page_html(
         "view=usage&preset=7d&timezone=UTC&provider=other"
@@ -776,6 +781,136 @@ def test_usage_user_page_forces_path_user_and_keeps_same_query(monkeypatch):
     assert "chat" in body
     assert user_id in body
     assert "usr_ffffffffffffffff" not in body
+
+
+def test_usage_user_page_keeps_drilldown_path_in_presets_filters_and_sorts(
+    monkeypatch,
+):
+    """Usage controls must not navigate a drill-down back to the fleet page."""
+    user_id = "usr_0123456789abcdef"
+    monkeypatch.setattr(registry, "_users", [{"user_id": user_id}])
+    monkeypatch.setattr(
+        _data_track,
+        "_usage_report",
+        lambda _query: _usage_render_report(),
+    )
+
+    kind, body, status = _admin_core.user_page(
+        "view=usage&preset=7d&timezone=UTC&lane=chat"
+        "&sort=calls&dir=desc&admin_key=query-admin-token",
+        user_id,
+    )
+
+    assert (kind, status) == ("html", 200)
+    expected_path = f"/admin/data-track/users/{user_id}"
+
+    nav_start = body.index("<div class='viewbar'>")
+    nav_end = body.index("</div>", nav_start)
+    usage_nav = re.search(
+        r"href='([^']+)'[^>]*>Usage / 模型用量</a>",
+        body[nav_start:nav_end],
+    )
+    assert usage_nav is not None
+    assert urlsplit(unescape(usage_nav.group(1))).path == expected_path
+
+    preset_start = body.index("<div class='sortbar'>")
+    preset_end = body.index("</div>", preset_start)
+    preset_hrefs = [
+        unescape(href)
+        for href in re.findall(r"href='([^']+)'", body[preset_start:preset_end])
+    ]
+    assert len(preset_hrefs) == 4
+
+    form_start = body.index("<form class='usage-filters'")
+    form_end = body.index("</form>", form_start)
+    form = body[form_start:form_end]
+    assert f"action='{expected_path}'" in form
+    assert f"<input type='hidden' name='user_id' value='{user_id}'>" in form
+    assert "<label>User ID<input name='user_id'" not in form
+
+    user_section = body.index("<h2>Per-user Usage</h2>")
+    user_sortbar_end = body.index("</div>", user_section)
+    sort_hrefs = [
+        unescape(href)
+        for href in re.findall(
+            r"href='([^']+)'", body[user_section:user_sortbar_end]
+        )
+    ]
+    assert len(sort_hrefs) == 4
+
+    for href in preset_hrefs + sort_hrefs:
+        parsed = urlsplit(href)
+        params = parse_qs(parsed.query)
+        assert parsed.path == expected_path
+        assert params["user_id"] == [user_id]
+        assert params["admin_key"] == ["query-admin-token"]
+    assert "Lane breakdown" in body
+
+
+def test_usage_user_page_pager_keeps_drilldown_path_and_lane_table(monkeypatch):
+    """Paging within a drill-down must retain both its route and lane context."""
+    user_id = "usr_0123456789abcdef"
+    report = _usage_render_report()
+    template = report["users"][0]
+    report["users"] = [
+        {
+            **template,
+            "user_id": f"usr_{index:016x}",
+            "model_calls": 5,
+            "total_tokens": 100,
+        }
+        for index in range(101)
+    ]
+    monkeypatch.setattr(registry, "_users", [{"user_id": user_id}])
+    monkeypatch.setattr(_data_track, "_usage_report", lambda _query: report)
+    expected_path = f"/admin/data-track/users/{user_id}"
+
+    for offset, label in ((0, "Next"), (100, "Prev")):
+        kind, body, status = _admin_core.user_page(
+            f"view=usage&preset=7d&sort=calls&dir=desc&offset={offset}"
+            "&admin_key=query-admin-token",
+            user_id,
+        )
+
+        assert (kind, status) == ("html", 200)
+        user_section = body.index("<h2>Per-user Usage</h2>")
+        user_sortbar_end = body.index("</div>", user_section)
+        sortbar = body[user_section:user_sortbar_end]
+        match = re.search(rf"href='([^']+)'>{label}</a>", sortbar)
+        assert match is not None
+        pager_href = unescape(match.group(1))
+        parsed = urlsplit(pager_href)
+        params = parse_qs(parsed.query)
+        assert parsed.path == expected_path
+        assert params["user_id"] == [user_id]
+        assert params["admin_key"] == ["query-admin-token"]
+        assert "Lane breakdown" in body
+
+
+def test_usage_user_pagination_clamps_large_offset_to_last_page(monkeypatch):
+    report = _usage_render_report()
+    template = report["users"][0]
+    report["users"] = [
+        {**template, "user_id": f"usr_{index:016x}", "total_tokens": 100}
+        for index in range(101)
+    ]
+    monkeypatch.setattr(_data_track, "_usage_report", lambda _query: report)
+
+    body = _admin_core.page_html("view=usage&preset=7d&offset=9999")
+
+    assert "Showing 101–101 of 101" in body
+    assert "usr_0000000000000064" in body
+    assert "Showing 0–" not in body
+
+
+def test_usage_user_pagination_clamps_empty_report_offset_to_zero(monkeypatch):
+    report = _usage_render_report()
+    report["users"] = []
+    monkeypatch.setattr(_data_track, "_usage_report", lambda _query: report)
+
+    body = _admin_core.page_html("view=usage&preset=7d&offset=9999")
+
+    assert "Showing 0–0 of 0" in body
 
 
 def test_usage_query_failure_is_local_and_runtime_remains_available(monkeypatch):
