@@ -21,7 +21,9 @@ import re
 import sys
 import time
 from typing import Any
+from urllib.parse import unquote, urlsplit
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 
 DEFAULT_ROWS = 3_000_000
@@ -29,6 +31,12 @@ DEFAULT_USERS = 2_000
 DEFAULT_RUNS = 5
 DEFAULT_HISTORY_DAYS = 365
 P95_BUDGET_MS = 2_000.0
+ROLLUP_TABLES = (
+    "v2_usage_daily_users",
+    "v2_usage_daily_dimensions",
+    "v2_usage_rollup_watermarks",
+)
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 _SENSITIVE_COLUMNS = frozenset(
     {
         "body_ct",
@@ -64,11 +72,15 @@ def timing_summary(samples_ms: list[float]) -> dict[str, Any]:
 
 
 def assert_content_free_metric_sql(statements: list[tuple[str, tuple[Any, ...]]]) -> None:
-    """Reject content-bearing columns from every v2 metric reporting query."""
-    metric_sql = [sql for sql, _params in statements if "v2_turn_metrics" in sql]
-    if not metric_sql:
-        raise AssertionError("no v2_turn_metrics statement was captured")
-    for sql in metric_sql:
+    """Reject content-bearing columns without requiring a raw-table branch."""
+    reporting_sql = [
+        sql
+        for sql, _params in statements
+        if "v2_turn_metrics" in sql or "v2_usage_daily_" in sql
+    ]
+    if not reporting_sql:
+        raise AssertionError("no usage reporting statement was captured")
+    for sql in reporting_sql:
         lowered = sql.lower()
         found = sorted(
             column
@@ -80,14 +92,49 @@ def assert_content_free_metric_sql(statements: list[tuple[str, tuple[Any, ...]]]
 
 
 def assert_metric_time_ranges(statements: list[tuple[str, tuple[Any, ...]]]) -> None:
-    """Every captured v2 metric query must retain both half-open time bounds."""
+    """Every captured raw metric branch must retain half-open time bounds."""
     metric_sql = [sql for sql, _params in statements if "v2_turn_metrics" in sql]
-    if not metric_sql:
-        raise AssertionError("no v2_turn_metrics statement was captured")
     for sql in metric_sql:
         normalized = " ".join(sql.lower().split())
-        if "m.created_at >= %s" not in normalized or "m.created_at < %s" not in normalized:
+        direct_bounds = (
+            "m.created_at >= %s" in normalized
+            and "m.created_at < %s" in normalized
+        )
+        range_join = (
+            "m.created_at >= rr.start_at" in normalized
+            and "m.created_at < rr.end_at" in normalized
+        )
+        if not direct_bounds and not range_join:
             raise AssertionError("v2 metric statement lost its half-open created_at range")
+
+
+def _production_window() -> tuple[datetime, datetime]:
+    """Return 90 complete Shanghai days through 2026-08-01 inclusive."""
+
+    end_local = datetime(2026, 8, 2, tzinfo=SHANGHAI)
+    start_local = end_local - timedelta(days=90)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+def _validate_scale_database_url(database_url: str) -> dict[str, Any]:
+    """Refuse remote/shared databases before any destructive scale-fixture work."""
+
+    parsed = urlsplit(database_url)
+    database = unquote(parsed.path.lstrip("/"))
+    port = parsed.port or 5432
+    safe = bool(
+        parsed.scheme in {"postgres", "postgresql"}
+        and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+        and port == 55432
+        and database.startswith("feedling_usage_scale_")
+        and database != "feedling_usage_scale_"
+    )
+    if not safe:
+        raise SystemExit(
+            "performance fixture requires a dedicated local PostgreSQL database: "
+            "127.0.0.1:55432/feedling_usage_scale_<name>"
+        )
+    return {"database": database, "host": parsed.hostname, "port": port}
 
 
 def _self_test() -> int:
@@ -190,6 +237,21 @@ class _CapturePool:
 
 
 def _statement_label(sql: str) -> str:
+    normalized = " ".join(sql.lower().split())
+    if "cross join lateral unnest(s.latency_samples)" in normalized:
+        return "exact_latency"
+    if "array_agg(distinct lane" in normalized:
+        return "filter_options"
+    if "group by provider,model" in normalized:
+        return "provider_model"
+    if "group by lane" in normalized:
+        return "lane"
+    if "known_user_days" in normalized:
+        return "user_day_percentiles"
+    if "provider_model_rank" in normalized:
+        return "per_user"
+    if "generate_series(" in normalized:
+        return "daily"
     if "provider_model_rank AS" in sql:
         return "per_user"
     if "FROM base GROUP BY provider,model" in sql:
@@ -215,40 +277,74 @@ def _walk_plan(node: dict[str, Any]):
         yield from _walk_plan(child)
 
 
+def _compact_plan_text(value: object, limit: int = 240) -> object:
+    if not isinstance(value, str) or len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
+
+
 def _explain_statements(conn, statements):
     explained = []
+    seen: set[str] = set()
     for sql, params in statements:
+        if "v2_usage_daily_" not in sql and "v2_turn_metrics" not in sql:
+            continue
+        signature = f"{sql}\0{params!r}"
+        if signature in seen:
+            continue
+        seen.add(signature)
         row = conn.execute(
             "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + sql,
             params,
         ).fetchone()
         document = row[0][0]
         root = document["Plan"]
-        scans = []
+        key_nodes = []
         for node in _walk_plan(root):
             relation = node.get("Relation Name")
             index_name = node.get("Index Name")
-            if relation == "v2_turn_metrics" or (
-                isinstance(index_name, str) and "v2_turn_metrics" in index_name
-            ):
-                scans.append(
+            node_type = str(node.get("Node Type") or "")
+            usage_relation = bool(
+                relation in {
+                    "v2_turn_metrics",
+                    "v2_usage_daily_users",
+                    "v2_usage_daily_dimensions",
+                }
+                or isinstance(index_name, str)
+                and (
+                    "v2_turn_metrics" in index_name
+                    or "v2_usage_daily" in index_name
+                )
+            )
+            structural = any(
+                marker in node_type for marker in ("Aggregate", "Sort", "Gather")
+            )
+            if usage_relation or structural:
+                key_nodes.append(
                     {
-                        "node_type": node.get("Node Type"),
+                        "node_type": node_type,
+                        "relation": relation,
                         "index_name": index_name,
                         "actual_rows": node.get("Actual Rows"),
-                        "rows_removed_by_filter": node.get("Rows Removed by Filter", 0),
-                        "index_cond": node.get("Index Cond"),
-                        "filter": node.get("Filter"),
+                        "actual_loops": node.get("Actual Loops"),
+                        "index_cond": _compact_plan_text(node.get("Index Cond")),
+                        "filter": _compact_plan_text(node.get("Filter")),
                         "shared_hit_blocks": node.get("Shared Hit Blocks", 0),
                         "shared_read_blocks": node.get("Shared Read Blocks", 0),
+                        "temp_read_blocks": node.get("Temp Read Blocks", 0),
+                        "temp_written_blocks": node.get("Temp Written Blocks", 0),
+                        "sort_method": node.get("Sort Method"),
+                        "sort_space_kb": node.get("Sort Space Used"),
                     }
                 )
+        key_nodes = key_nodes[:16]
         explained.append(
             {
                 "label": _statement_label(sql),
                 "execution_time_ms": round(float(document["Execution Time"]), 3),
+                "planning_time_ms": round(float(document["Planning Time"]), 3),
                 "root_node": root.get("Node Type"),
-                "metric_scans": scans,
+                "key_nodes": key_nodes,
             }
         )
     return sorted(explained, key=lambda item: item["execution_time_ms"], reverse=True)
@@ -315,6 +411,67 @@ def _delete_fixture(conn, prefix: str) -> None:
     conn.execute("ANALYZE v2_turn_metrics")
 
 
+def _fixture_counts(conn, prefix: str) -> dict[str, int]:
+    counts = {}
+    for table in (
+        "v2_turn_metrics",
+        "v2_usage_daily_users",
+        "v2_usage_daily_dimensions",
+    ):
+        counts[table] = int(
+            conn.execute(
+                f"SELECT count(*) FROM {table} WHERE user_id LIKE %s",  # noqa: S608
+                (prefix + "%",),
+            ).fetchone()[0]
+        )
+    counts["users"] = int(
+        conn.execute(
+            "SELECT count(*) FROM users WHERE user_id LIKE %s", (prefix + "%",)
+        ).fetchone()[0]
+    )
+    counts["watermark"] = int(
+        conn.execute(
+            "SELECT count(*) FROM v2_usage_rollup_watermarks "
+            "WHERE rollup_name='hosted_v2_usage'"
+        ).fetchone()[0]
+    )
+    return counts
+
+
+def _assert_empty_dedicated_database(conn) -> None:
+    occupied = {
+        table: int(
+            conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]  # noqa: S608
+        )
+        for table in (
+            "v2_turn_metrics",
+            "v2_usage_daily_users",
+            "v2_usage_daily_dimensions",
+            "v2_usage_rollup_watermarks",
+        )
+    }
+    if any(occupied.values()):
+        raise RuntimeError(
+            "dedicated scale database is not empty; refusing to disturb existing "
+            f"source/rollup state: {occupied}"
+        )
+
+
+def _relation_stats(conn, table: str) -> dict[str, int]:
+    row = conn.execute(
+        "SELECT count(*)::bigint,pg_relation_size(%s::regclass)::bigint,"
+        "pg_indexes_size(%s::regclass)::bigint,"
+        "pg_total_relation_size(%s::regclass)::bigint FROM " + table,
+        (table, table, table),
+    ).fetchone()
+    return {
+        "rows": int(row[0]),
+        "relation_bytes": int(row[1]),
+        "index_bytes": int(row[2]),
+        "total_bytes": int(row[3]),
+    }
+
+
 def _assert_schema(conn) -> None:
     """Validate the pre-migrated test DB without mutating its Alembic state."""
     required_columns = {
@@ -352,6 +509,38 @@ def _assert_schema(conn) -> None:
     ).fetchone()
     if created_at_index is None:
         raise RuntimeError("test database lacks the v2_turn_metrics created_at index")
+    present = {
+        row[0]
+        for row in conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema=current_schema() AND table_name=ANY(%s)",
+            (list(ROLLUP_TABLES),),
+        ).fetchall()
+    }
+    missing_tables = sorted(set(ROLLUP_TABLES) - present)
+    if missing_tables:
+        raise RuntimeError(
+            f"test database lacks production rollup schema: {missing_tables}"
+        )
+
+
+def _bootstrap_rollups(usage_rollup, *, max_ticks: int = 20) -> list[dict[str, Any]]:
+    ticks = []
+    for _ in range(max_ticks):
+        result = usage_rollup.run_maintenance_tick(
+            max_days=31,
+            max_changed_rows=100_000,
+            overlap_seconds=0,
+            statement_timeout_ms=120_000,
+            pool_timeout_seconds=5,
+            now_utc=datetime.now(timezone.utc) + timedelta(seconds=1),
+        )
+        ticks.append(result)
+        if result.get("status") != "ok":
+            raise RuntimeError(f"production usage rollup bootstrap failed: {result}")
+        if result.get("bootstrap_complete") and not result.get("dirty_from_day"):
+            return ticks
+    raise RuntimeError(f"production usage rollup bootstrap exceeded {max_ticks} ticks")
 
 
 def _capture_report(jobs_store, real_pool, query):
@@ -359,10 +548,10 @@ def _capture_report(jobs_store, real_pool, query):
     original_pool = jobs_store._pool
     jobs_store._pool = lambda: _CapturePool(real_pool, statements)
     try:
-        jobs_store.usage_report_snapshot(query)
+        report = jobs_store.usage_report_snapshot(query)
     finally:
         jobs_store._pool = original_pool
-    return statements
+    return report, statements
 
 
 def _measure_report(jobs_store, query, runs: int) -> dict[str, Any]:
@@ -378,10 +567,12 @@ def _measure_report(jobs_store, query, runs: int) -> dict[str, Any]:
 def _run(args) -> int:
     if args.rows < 1 or args.users < 1 or args.runs < 5 or args.history_days < 90:
         raise SystemExit("rows/users must be positive, runs >= 5, history-days >= 90")
-    database_url = (args.database_url or os.environ.get("FEEDLING_TEST_PG") or "").strip()
+    database_url = args.database_url.strip()
     if not database_url:
-        raise SystemExit("pass --database-url or set FEEDLING_TEST_PG")
+        raise SystemExit("pass an explicit --database-url for the dedicated scale DB")
+    database_identity = _validate_scale_database_url(database_url)
     os.environ["DATABASE_URL"] = database_url
+    os.environ["FEEDLING_V2_USAGE_ROLLUP_ENABLED"] = "1"
     repo = Path(__file__).resolve().parents[2]
     backend = str(repo / "backend")
     if backend not in sys.path:
@@ -389,31 +580,32 @@ def _run(args) -> int:
 
     import db  # noqa: PLC0415
     from admin.usage import UsageQuery  # noqa: PLC0415
-    from model_api_runtime.v2 import jobs_store  # noqa: PLC0415
+    from model_api_runtime.v2 import jobs_store, usage_rollup  # noqa: PLC0415
 
     pool = db.get_pool()
     with pool.connection() as conn:
         _assert_schema(conn)
+        _assert_empty_dedicated_database(conn)
     prefix = f"scale_usage_{uuid4().hex[:10]}_"
-    end_at = datetime(2026, 8, 2, tzinfo=timezone.utc)
-    start_at = end_at - timedelta(days=90)
+    start_at, end_at = _production_window()
     queries = {
         "unfiltered": UsageQuery(
             start_at_utc=start_at,
             end_at_utc=end_at,
-            timezone="UTC",
+            timezone="Asia/Shanghai",
             preset="90d",
         ),
         "provider_model_filtered": UsageQuery(
             start_at_utc=start_at,
             end_at_utc=end_at,
-            timezone="UTC",
+            timezone="Asia/Shanghai",
             provider="openrouter",
             model="openai/gpt-4o-mini",
             preset="90d",
         ),
     }
     evidence: dict[str, Any] = {
+        "database": database_identity,
         "fixture": {
             "rows": args.rows,
             "users": args.users,
@@ -426,6 +618,12 @@ def _run(args) -> int:
             },
         },
         "budget_ms": P95_BUDGET_MS,
+        "query": {
+            "timezone": "Asia/Shanghai",
+            "start_at_utc": start_at,
+            "end_at_utc": end_at,
+            "half_open": True,
+        },
         "cohorts": {},
     }
     try:
@@ -438,26 +636,84 @@ def _run(args) -> int:
                 end_at=end_at,
                 history_days=args.history_days,
             )
-            evidence["fixture"]["rows_in_90d"] = int(
-                conn.execute(
-                    "SELECT count(*) FROM v2_turn_metrics WHERE user_id LIKE %s "
-                    "AND created_at >= %s AND created_at < %s",
-                    (prefix + "%", start_at, end_at),
-                ).fetchone()[0]
-            )
+            evidence["source"] = {
+                "total_rows": int(
+                    conn.execute(
+                        "SELECT count(*) FROM v2_turn_metrics WHERE user_id LIKE %s",
+                        (prefix + "%",),
+                    ).fetchone()[0]
+                ),
+                "rows_in_90d": int(
+                    conn.execute(
+                        "SELECT count(*) FROM v2_turn_metrics WHERE user_id LIKE %s "
+                        "AND created_at >= %s AND created_at < %s",
+                        (prefix + "%", start_at, end_at),
+                    ).fetchone()[0]
+                ),
+            }
+
+        bootstrap_started = time.perf_counter()
+        bootstrap_ticks = _bootstrap_rollups(usage_rollup)
+        evidence["rollup_bootstrap"] = {
+            "elapsed_ms": round((time.perf_counter() - bootstrap_started) * 1000, 3),
+            "ticks": bootstrap_ticks,
+        }
+        with pool.connection() as conn:
+            watermark = conn.execute(
+                "SELECT bootstrap_complete,dirty_from_day,dirty_through_day,"
+                "source_updated_at,source_id,source_observed_updated_at,"
+                "source_lag_seconds,refreshed_at,last_success_at,last_error "
+                "FROM v2_usage_rollup_watermarks "
+                "WHERE rollup_name='hosted_v2_usage'"
+            ).fetchone()
+            if watermark is None or not watermark[0] or watermark[1] is not None:
+                raise RuntimeError(f"production rollup watermark is not ready: {watermark}")
+            evidence["rollup"] = {
+                "tables": {
+                    table: _relation_stats(conn, table)
+                    for table in ("v2_usage_daily_users", "v2_usage_daily_dimensions")
+                },
+                "watermark": {
+                    "bootstrap_complete": bool(watermark[0]),
+                    "dirty_from_day": watermark[1],
+                    "dirty_through_day": watermark[2],
+                    "source_updated_at": watermark[3],
+                    "source_id": int(watermark[4]),
+                    "source_observed_updated_at": watermark[5],
+                    "source_lag_seconds": watermark[6],
+                    "refreshed_at": watermark[7],
+                    "last_success_at": watermark[8],
+                    "last_error": watermark[9],
+                },
+            }
 
         for name, query in queries.items():
-            statements = _capture_report(jobs_store, pool, query)
+            report, statements = _capture_report(jobs_store, pool, query)
+            coverage = report["coverage"]["rollup"]
+            if coverage["mode"] != "hybrid-parallel" or not coverage["rollup_days"]:
+                raise AssertionError(
+                    f"report did not use production hybrid rollup path: {coverage}"
+                )
             assert_content_free_metric_sql(statements)
             assert_metric_time_ranges(statements)
             timing = _measure_report(jobs_store, query, args.runs)
             with pool.connection() as conn:
-                conn.execute("SET statement_timeout='30s'")
+                conn.execute("SET statement_timeout='120s'")
                 explains = _explain_statements(conn, statements)
+            if not explains:
+                raise AssertionError("no production usage SQL was explained")
+            exact_latency = next(
+                (item for item in explains if item["label"] == "exact_latency"),
+                None,
+            )
+            if exact_latency is None:
+                raise AssertionError("exact latency SQL was not captured and explained")
             evidence["cohorts"][name] = {
                 "timing": timing,
                 "slowest_explain": explains[0],
+                "exact_latency_explain": exact_latency,
                 "all_explains": explains,
+                "coverage": coverage,
                 "content_free_metric_sql": True,
                 "half_open_created_at_range": True,
             }
@@ -465,12 +721,39 @@ def _run(args) -> int:
         if not args.keep_data:
             with pool.connection() as conn:
                 _delete_fixture(conn, prefix)
+                after_cascade = _fixture_counts(conn, prefix)
+                residual = {
+                    key: value
+                    for key, value in after_cascade.items()
+                    if key != "watermark" and value
+                }
+                if residual:
+                    raise RuntimeError(
+                        f"fixture cleanup left source/rollup rows: {residual}"
+                    )
+                conn.execute(
+                    "DELETE FROM v2_usage_rollup_watermarks "
+                    "WHERE rollup_name='hosted_v2_usage'"
+                )
+                after_cleanup = _fixture_counts(conn, prefix)
+                if any(after_cleanup.values()):
+                    raise RuntimeError(
+                        f"fixture cleanup left residual state: {after_cleanup}"
+                    )
+                evidence["cleanup"] = {
+                    "foreign_key_cascade_verified": True,
+                    "watermark_removed": True,
+                    "residual_counts": after_cleanup,
+                }
 
     evidence["passed"] = all(
         cohort["timing"]["p95_ms"] < P95_BUDGET_MS
         for cohort in evidence["cohorts"].values()
     )
-    print(json.dumps(evidence, indent=2, sort_keys=True, default=str))
+    rendered = json.dumps(evidence, indent=2, sort_keys=True, default=str) + "\n"
+    if args.output:
+        Path(args.output).write_text(rendered, encoding="utf-8")
+    print(rendered, end="")
     return 0 if evidence["passed"] else 1
 
 
@@ -483,6 +766,7 @@ def main() -> int:
     parser.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     parser.add_argument("--history-days", type=int, default=DEFAULT_HISTORY_DAYS)
     parser.add_argument("--keep-data", action="store_true")
+    parser.add_argument("--output", default="")
     args = parser.parse_args()
     if args.self_test:
         return _self_test()

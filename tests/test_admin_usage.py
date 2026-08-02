@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from html import unescape
+import importlib.util
 import json
 import re
 import subprocess
@@ -33,6 +34,15 @@ from conftest import seed_user  # noqa: E402
 NOW_UTC = datetime(2026, 8, 2, 12, 30, tzinfo=timezone.utc)
 
 
+def _load_usage_scale_harness():
+    path = Path(__file__).parent.parent / "scripts/perf/admin_usage_scale.py"
+    spec = importlib.util.spec_from_file_location("admin_usage_scale_harness", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_admin_usage_scale_harness_self_check():
     """The opt-in scale proof must keep its timing and SQL safety gates."""
     result = subprocess.run(
@@ -54,6 +64,59 @@ def test_admin_usage_scale_harness_self_check():
         "sensitive_column_check": "passed",
         "time_range_check": "passed",
     }
+
+
+def test_admin_usage_scale_uses_full_shanghai_days_and_a_dedicated_local_db():
+    harness = _load_usage_scale_harness()
+
+    start_at, end_at = harness._production_window()
+    assert start_at.isoformat() == "2026-05-03T16:00:00+00:00"
+    assert end_at.isoformat() == "2026-08-01T16:00:00+00:00"
+    assert harness._validate_scale_database_url(
+        "postgresql://postgres:test@127.0.0.1:55432/feedling_usage_scale_task4d"
+    ) == {
+        "database": "feedling_usage_scale_task4d",
+        "host": "127.0.0.1",
+        "port": 55432,
+    }
+
+    for unsafe in (
+        "postgresql://postgres:test@127.0.0.1:55432/postgres",
+        "postgresql://postgres:test@feedling-prod.example.com:5432/feedling_usage_scale_task4d",
+        "postgresql://postgres:test@127.0.0.1:55432/feedling_test",
+    ):
+        with pytest.raises(SystemExit, match="dedicated local PostgreSQL"):
+            harness._validate_scale_database_url(unsafe)
+
+
+def test_admin_usage_scale_sql_guards_allow_rollup_only_and_bound_raw_ranges():
+    harness = _load_usage_scale_harness()
+    rollup_only = [
+        (
+            "SELECT sum(all_turns) FROM v2_usage_daily_users "
+            "WHERE local_day = ANY(%s)",
+            (("2026-08-01",),),
+        )
+    ]
+    harness.assert_content_free_metric_sql(rollup_only)
+    harness.assert_metric_time_ranges(rollup_only)
+
+    hybrid = [
+        (
+            "WITH raw_ranges AS (SELECT %s::timestamptz start_at, "
+            "%s::timestamptz end_at) SELECT m.prompt_tokens "
+            "FROM v2_turn_metrics m JOIN raw_ranges rr "
+            "ON m.created_at >= rr.start_at AND m.created_at < rr.end_at",
+            ("start", "end"),
+        )
+    ]
+    harness.assert_content_free_metric_sql(hybrid)
+    harness.assert_metric_time_ranges(hybrid)
+
+    with pytest.raises(AssertionError, match="half-open"):
+        harness.assert_metric_time_ranges(
+            [(hybrid[0][0].replace("m.created_at < rr.end_at", "true"), hybrid[0][1])]
+        )
 
 
 @pytest.fixture
