@@ -23,6 +23,23 @@ change must not be interpreted as an API guarantee.
   cannot bypass it. On the managed runtime the model relies on these tools for
   web access, so the user's "off" switch is effectively a full cut.
 
+- **Attested custom enclave domains can accompany the direct audit endpoint.**
+  The production, test, and pre-production deployment definitions stage
+  `enclave.feedling.app`, `test-enclave.feedling.app`, and
+  `pre-enclave.feedling.app` through `dstack-ingress`; each URL becomes available
+  only after that environment is deployed and its evidence is validated.
+  Existing `-5003s` clients remain compatible and retain the direct audit route.
+  New clients must verify WebPKI plus both the ingress certificate-evidence and
+  enclave-attestation bundles before claiming pinning-equivalent security;
+  WebPKI alone is insufficient.
+
+- **Memory Garden status now reports today's captured-card total.**
+  `GET /v1/dream/status` adds `capture_cards_added` and
+  `capture_completed_at`. Resident and Runtime V2 Capture runs accumulate only
+  cards actually added on the device-local calendar day, start a fresh total
+  on the first positive Capture of the next day, and leave the banner fields
+  unchanged after a zero-card run.
+
 - **Background agent turns can no longer rewrite the identity card.** Runtime
   V2 now visibly refuses `identity_patch` and `identity_nudge` during proactive
   wake turns while preserving identity reads, foreground Chat identity changes,
@@ -110,12 +127,15 @@ change must not be interpreted as an API guarantee.
   background calls is the steady state.
 
 - **Memory action batches now isolate item failures.** A structurally valid
-  `POST /v1/memory/actions` batch processes every item and returns HTTP `200`
-  with `status: ok|partial|failed`, per-item `http_status`, and
-  `applied_count`/`skipped_count`/`failed_count`. Older clients that treated
-  every HTTP `200` as full success must inspect these fields. Capture clients
-  record applied, skipped, and failed items separately; partial success no
-  longer marks the whole capture job failed. Resident capture may re-ask the
+  `POST /v1/memory/actions` batch processes every item and returns per-item
+  `http_status` plus `applied_count`/`skipped_count`/`failed_count`. Full and
+  partial applied success return HTTP `200`; a batch with zero applied actions
+  and at least one failure returns HTTP `400`, promotes the first failed item's
+  `error` and optional `detail`, and still includes every item result and all
+  counts. An all-skipped batch remains HTTP `200`. Older clients that treated
+  every HTTP `200` as full success must still inspect the item fields. Capture
+  clients record applied, skipped, and failed items separately; partial success
+  no longer marks the whole capture job failed. Resident capture may re-ask the
   model once after either a format or semantic validation failure, using one
   shared per-job retry budget so the two layers cannot multiply retries.
 

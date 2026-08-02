@@ -26,6 +26,7 @@ from psycopg.types.json import Jsonb
 import db
 from core import wake_bus
 from notices import catalog as notices_catalog
+from proactive import capture_daily
 
 log = logging.getLogger("feedling.runtime_v2.jobs_store")
 
@@ -2111,6 +2112,7 @@ def commit_capture_batch(
     batch_id,
 ) -> dict:
     """Atomically apply every memory effect, advance seq, and finish the job."""
+    device_timezone = capture_daily.device_timezone_name(str(user_id))
     affected_ids: set[str] = set()
     persisted_state: dict | None = None
     mirrored_logs: list[tuple[int, str, dict, str]] = []
@@ -2251,6 +2253,7 @@ def commit_capture_batch(
                         tuple[dict, dict, dict | None, list[tuple[str, dict]]]
                     ] = []
                     rejection = ""
+                    cards_added = 0
                     # Validate and lock the complete effect set before the first
                     # write.  Semantic poison is rejected durably; transient DB
                     # errors still roll back and retain the prepared journal.
@@ -2315,9 +2318,10 @@ def commit_capture_batch(
                             "rejected": True,
                         }
                     else:
-                        now_iso = datetime.now(timezone.utc).isoformat().replace(
-                            "+00:00", "Z"
-                        )
+                        now_ts = time.time()
+                        now_iso = datetime.fromtimestamp(
+                            now_ts, timezone.utc
+                        ).isoformat().replace("+00:00", "Z")
                         for ordinal, (
                             action,
                             wanted,
@@ -2366,6 +2370,8 @@ def commit_capture_batch(
                                         bootstrap_id,
                                     )
                                 )
+                                if action["type"] == "memory.add":
+                                    cards_added += 1
                             affected_ids.add(memory_id)
                             for target_id, target in targets_locked:
                                 target.update(
@@ -2419,6 +2425,17 @@ def commit_capture_batch(
                                 )
                             )
 
+                        cur.execute(
+                            "SELECT doc FROM user_blobs WHERE user_id=%s "
+                            "AND kind='proactive_settings'",
+                            (str(user_id),),
+                        )
+                        settings_row = cur.fetchone()
+                        settings = (
+                            dict(settings_row["doc"] or {})
+                            if settings_row is not None
+                            else {}
+                        )
                         state.update(
                             {
                                 "last_captured_until_message_id": str(
@@ -2427,13 +2444,20 @@ def commit_capture_batch(
                                 "last_captured_until_ts": float(batch["until_ts"]),
                                 "last_captured_until_seq": int(batch["through_seq"]),
                                 "capture_seq_initialized": True,
-                                "last_capture_completed_at": time.time(),
+                                "last_capture_completed_at": now_ts,
                                 "pending_capture_key": "",
                                 "capture_fail_streak": 0,
                                 "last_capture_failed_at": 0.0,
                                 "updated_at": now_iso,
                             }
                         )
+                        state.update(capture_daily.daily_capture_patch(
+                            state,
+                            cards_added=cards_added,
+                            completed_at=now_ts,
+                            timezone_name=settings.get("timezone") or "UTC",
+                            device_timezone=device_timezone,
+                        ))
                         cur.execute(
                             "UPDATE user_blobs SET doc=%s "
                             "WHERE user_id=%s AND kind=%s",
@@ -2454,6 +2478,7 @@ def commit_capture_batch(
                         result = {
                             "committed": True,
                             "batch_id": int(batch_id),
+                            "cards_added": cards_added,
                             "affected_memory_ids": sorted(affected_ids),
                         }
     if persisted_state is not None:

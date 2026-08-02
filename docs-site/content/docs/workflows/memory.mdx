@@ -11,9 +11,16 @@ Memory separates ciphertext storage from enclave-authorized read projections.
 | `GET /v1/memory/list` | Raw encrypted records for client synchronization. |
 | `POST /v1/memory/index` | Lightweight decrypted summaries for discovery. |
 | `POST /v1/memory/fetch` | Full decrypted content for selected IDs. |
+| `GET /v1/dream/status` | Dream and daily Capture counts for Memory Garden banners. |
 
 `local_only` records can be stored and synchronized, but the enclave has no
 wrapped key for them, so they are unavailable from `index` and `fetch`.
+
+`GET /v1/dream/status` also returns `capture_cards_added` and
+`capture_completed_at`. The count accumulates cards actually added across
+Capture runs on the device's calendar day. A Capture run that adds no cards
+does not reset the count or refresh the timestamp. Clients determine whether
+the timestamp is still today before displaying the count.
 
 ## 1. Build and store a card
 
@@ -213,12 +220,14 @@ between 1 and 20 actions. The implementation processes only the first 20, so a
 client must reject an oversized batch before sending it.
 
 The server executes every item independently and does not stop after one item
-fails. A structurally valid, non-empty batch returns HTTP `200` even when some
-or all actions fail. Read every `results` entry and the batch
-`applied_count`, `skipped_count`, and `failed_count`; top-level `status` is
-`ok`, `partial`, or `failed`. Each result includes its own `http_status`.
-Only a malformed request body, a non-array `actions` value, or an empty batch
-uses a request-level `4xx`.
+fails. Full success and partial applied success return HTTP `200`. When no
+action was applied and at least one failed, the batch returns HTTP `400`; its
+top-level `error` and optional `detail` come from the first failed item, while
+the complete `results`, `effects`, and counts remain available. An all-skipped
+batch returns HTTP `200`; skipped actions do not count as failures. Read every
+`results` entry and the batch `applied_count`, `skipped_count`, and
+`failed_count`; top-level `status` is `ok`, `partial`, or `failed`. Each result
+includes its own `http_status`.
 
 `source` and `capture_mode` are closed enums. Unknown values produce an
 item-level failure (`source_invalid` or `capture_mode_invalid`) rather than

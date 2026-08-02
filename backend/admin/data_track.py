@@ -1565,7 +1565,7 @@ def _data_track_request_filters() -> dict:
         "limit": read_int("limit", 100, 1, 500),
         "offset": read_int("offset", 0, 0, 1_000_000),
         "view": raw_view,
-        "days": read_int("days", 30, 1, 366),
+        "days": read_int("days", 30, 1, 1000),
     }
 
 
@@ -2182,14 +2182,17 @@ def _data_track_dau_payload() -> dict:
         day=histogram_day,
         tz="Asia/Shanghai",
     )
-    dau_values = [int(row.get("dau") or 0) for row in rows]
+    # DAU now = 使用 DAU (app_session_end / genuinely opened the app), not the
+    # broad chat∪tracking count. session_dau is frozen in the snapshot too, so
+    # historical frozen days stay consistent.
+    dau_values = [int(row.get("session_dau") or 0) for row in rows]
     latest = rows[0] if rows else {}
     summary = {
         "generated_at": datetime.now().isoformat(),
         "timezone": "Asia/Shanghai",
         "days_returned": len(rows),
         "latest_day": latest.get("day", ""),
-        "latest_dau": int(latest.get("dau") or 0),
+        "latest_dau": int(latest.get("session_dau") or 0),
         "max_dau": max(dau_values, default=0),
         "avg_dau": (sum(dau_values) / len(dau_values)) if dau_values else 0,
         "user_messages": sum(int(row.get("user_messages") or 0) for row in rows),
@@ -2217,7 +2220,7 @@ def _data_track_dau_payload() -> dict:
         ],
         "usage_histogram": usage_histogram,
         "definition": {
-            "dau": "Distinct users with at least one user chat message or tracking event on the Beijing day.",
+            "dau": "DAU = 使用 DAU: distinct users with an app_session_end (foreground app open) on the Beijing day. Chat DAU / Tracking DAU are looser breakdowns.",
             "excluded": "Agent/openclaw messages, proactive writes, and verify_ping synthetic messages are excluded.",
             "timezone": "Asia/Shanghai",
         },
@@ -3370,6 +3373,33 @@ def _render_data_track_dau_page(payload: dict) -> str:
         if _snap_first else
         "每日快照即将生效；生效后当天真实数据会冻结、不再随删号变化。"
     )
+    # 「加载更多日期」：本页服务端渲染，无 SPA。默认 days=30，点一次 +30，封顶
+    # 366（一年，DB / filters 两侧的硬上限）。链接经 _data_track_qs 保住 admin_key
+    # 与 since/day 等现有参数。到顶后换成说明文案。
+    _current_days = int(filters.get("days") or 30)
+    _DAU_DAYS_MAX = 366
+    if _current_days < _DAU_DAYS_MAX:
+        _next_days = min(_current_days + 30, _DAU_DAYS_MAX)
+        _more_href = _data_track_page_href(
+            view="dau", days=_next_days, day=histogram_day, offset=0,
+        )
+        _more_all_href = _data_track_page_href(
+            view="dau", days=_DAU_DAYS_MAX, day=histogram_day, offset=0,
+        )
+        load_more_html = (
+            "<div class='toolbar' style='margin-top:12px'>"
+            f"<a class='sort-button' href='{html.escape(_more_href, quote=True)}'>"
+            f"↓ 加载更多日期（{_current_days} → {_next_days} 天）</a>"
+            f"<a class='sort-button' href='{html.escape(_more_all_href, quote=True)}'>"
+            f"加载全部（最多 {_DAU_DAYS_MAX} 天 · 约一年）</a>"
+            "</div>"
+        )
+    else:
+        load_more_html = (
+            "<div class='muted' style='margin-top:12px'>"
+            f"已加载到最大范围 {_DAU_DAYS_MAX} 天（约一年）——更早的数据需提高后端上限。"
+            "</div>"
+        )
     rows_html = []
     for row in rows:
         rows_html.append(
@@ -3378,13 +3408,12 @@ def _render_data_track_dau_page(payload: dict) -> str:
             + ("<td><span style='color:#1d7a4d;font-size:12px'>🔒 已冻结</span></td>"
                if row.get("frozen")
                else "<td><span style='color:#a05a00;font-size:12px'>⏱ 实时</span></td>")
-            + f"<td>{int(row.get('dau') or 0)}</td>"
+            + f"<td><b>{int(row.get('session_dau') or 0)}</b></td>"
             f"<td>{int(row.get('chat_dau') or 0)}</td>"
             f"<td>{int(row.get('tracking_dau') or 0)}</td>"
             f"<td>{int(row.get('active_events') or 0)}</td>"
             f"<td>{int(row.get('user_messages') or 0)}</td>"
             f"<td>{int(row.get('tracking_events') or 0)}</td>"
-            f"<td>{int(row.get('session_dau') or 0)}</td>"
             # 人均日使用时长 = 当天总前台时长 / 使用DAU(每个活跃用户当天实际用了多久)。
             # 之前是 avg_session_sec(每次会话均长),被大量前后台切换的微会话拉低,误导。
             f"<td><b>{_fmt_duration_sec((row.get('foreground_sec') or 0) / (row.get('session_dau') or 1))}</b></td>"
@@ -3434,10 +3463,10 @@ def _render_data_track_dau_page(payload: dict) -> str:
         f"最大值 {_fmt_duration_sec(histogram.get('max_sec'))}"
     )
     metrics = "".join([
-        _render_metric("latest DAU", summary["latest_dau"]),
+        _render_metric("latest DAU · 打开App", summary["latest_dau"]),
         _render_metric("latest day", summary.get("latest_day") or "n/a"),
-        _render_metric("max DAU", summary["max_dau"]),
-        _render_metric("avg DAU", f"{summary['avg_dau']:.1f}"),
+        _render_metric("max DAU · 打开App", summary["max_dau"]),
+        _render_metric("avg DAU · 打开App", f"{summary['avg_dau']:.1f}"),
         _render_metric("user messages", summary["user_messages"]),
         _render_metric("tracking events", summary["tracking_events"]),
     ])
@@ -3501,12 +3530,13 @@ def _render_data_track_dau_page(payload: dict) -> str:
     {_cutover_html}
   </div>
   <div class="muted">{html.escape(definition.get("dau") or "")} {html.escape(definition.get("excluded") or "")}</div>
-  <div class="muted">使用DAU=当天有 app 后台上报（app_session_end 事件）的用户数；人均日使用时长=当天总前台时长÷使用DAU（均值，会被少数重度用户拉高）；中位数日使用时长=每个用户当天前台总时长的中位数（典型用户实际用了多久，不被少数重度用户拉高，和均值并看更可信）——冻结快照只存聚合值，改动前已冻结的历史天显示"-"；会话数=当天 app_session_end 事件数（含大量前后台切换的微会话）。前台被强杀会漏报，略偏低估。均按北京日。</div>
+  <div class="muted"><b>DAU = 使用 DAU</b>=当天<b>真正打开过 App</b> 的用户数（有 app_session_end 前台会话）；此列已冻结进快照，历史天一致。<b>Chat DAU</b>=当天发过用户消息的人；<b>Tracking DAU</b>=当天有任意 tracking 事件的人（含后台/proactive 遥测，口径最松、仅作拆分参考——旧的「广义 DAU」就等于它，已去掉）。人均日使用时长=当天总前台时长÷DAU；中位数=每用户当天前台总时长的中位数（典型用户，和均值并看更可信）；会话数=app_session_end 事件数（含大量前后台切换微会话）。前台被强杀会漏报，略偏低估。均按北京日。<b>留存/增长也改用此 DAU（打开 App）口径</b>。</div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
   <table>
-    <thead><tr><th>Beijing day</th><th>状态</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>使用DAU</th><th>人均日使用时长</th><th>中位数日使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
+    <thead><tr><th>Beijing day</th><th>状态</th><th>DAU(打开App)</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>人均日使用时长</th><th>中位数日使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='13' class='muted'>No DAU activity in this range.</td></tr>"}</tbody>
   </table>
+  {load_more_html}
   <div class="muted" style="margin-top:12px">使用时长分布口径：先汇总每位用户在所选北京日的全部 app_session_end duration_sec，再按固定右开区间分桶。样本=当天有上报的 {histogram_total} 位用户；没打开 App 或没有 app_session_end 上报的用户不计入，也不会补 0。</div>
 </main>
 </body>
@@ -3517,7 +3547,21 @@ def _data_track_growth_payload() -> dict:
     filters = _data_track_request_filters()
     days = int(filters.get("days") or 60)
     growth = db.admin_data_track_growth(days=days, tz="Asia/Shanghai")
-    retention = db.admin_data_track_retention(tz="Asia/Shanghai")
+    # Retention now uses classic day-N cohorts, restricted to signup days on/after
+    # the freeze boundary (dau snapshot first_day). Pre-freeze days are excluded
+    # entirely per the product decision — their live recompute drifts as accounts
+    # delete, so they were never trustworthy for retention/growth.
+    dau_bounds = db.admin_dau_snapshot_bounds()
+    freeze_day = str(dau_bounds.get("first_day") or "")
+    retention = db.admin_data_track_retention_daily(
+        tz="Asia/Shanghai", since_day=freeze_day, granularity="day"
+    )
+    retention_week = db.admin_data_track_retention_daily(
+        tz="Asia/Shanghai", since_day=freeze_day, granularity="week"
+    )
+    accounting = db.admin_data_track_growth_accounting(
+        tz="Asia/Shanghai", since_day=freeze_day
+    )
     g_bounds = db.admin_growth_snapshot_bounds()
     latest = growth[-1] if growth else {}
     summary = {
@@ -3529,6 +3573,7 @@ def _data_track_growth_payload() -> dict:
         "latest_new": int(latest.get("new_users") or 0),
         "snapshot_first_day": g_bounds.get("first_day", ""),
         "snapshot_days": int(g_bounds.get("days") or 0),
+        "freeze_day": freeze_day,
         "cohort_count": len(retention.get("cohorts") or []),
     }
     return {
@@ -3536,6 +3581,8 @@ def _data_track_growth_payload() -> dict:
         "filters": {"days": days, "view": "growth"},
         "growth": growth,
         "retention": retention,
+        "retention_week": retention_week,
+        "accounting": accounting,
     }
 
 
@@ -3570,10 +3617,151 @@ def _retention_cell_bg(pct: float) -> str:
     return f"background:rgba(183,53,43,{alpha:.2f})"
 
 
+def _svg_retention_lines(retention: dict, *, width: int = 640, height: int = 240) -> str:
+    """Multi-cohort retention curve: X = day offset (D1..D30), Y = %, one
+    polyline per cohort (mature cells only). Inline SVG — no JS."""
+    offsets = retention.get("offsets") or [1, 3, 7, 14, 30]
+    cohorts = [c for c in retention.get("cohorts", [])
+               if any(c["cells"].get(n) is not None for n in offsets)]
+    if not cohorts:
+        return "<div class='muted'>暂无足够成熟的 cohort 画留存曲线（都还不满 D1）。</div>"
+    pad_l, pad_r, pad_t, pad_b = 34, 104, 12, 26
+    pw, ph = width - pad_l - pad_r, height - pad_t - pad_b
+    maxoff = max(offsets) or 1
+
+    def px(n: int) -> float:
+        return pad_l + pw * (n / maxoff)
+
+    def py(v: float) -> float:
+        return pad_t + ph * (1 - v / 100.0)
+
+    parts = [f"<svg viewBox='0 0 {width} {height}' width='100%' "
+             f"style='max-width:{width}px;background:var(--card);"
+             f"border:1px solid var(--line);border-radius:8px'>"]
+    for g in (0, 25, 50, 75, 100):
+        yy = py(g)
+        parts.append(f"<line x1='{pad_l}' y1='{yy:.1f}' x2='{pad_l+pw}' y2='{yy:.1f}' stroke='#eee'/>")
+        parts.append(f"<text x='{pad_l-5}' y='{yy+3:.1f}' font-size='9' text-anchor='end' fill='#999'>{g}%</text>")
+    for n in offsets:
+        parts.append(f"<text x='{px(n):.1f}' y='{height-9}' font-size='9' text-anchor='middle' fill='#999'>D{n}</text>")
+    palette = ['#b7352b', '#1d7a4d', '#2f6fb0', '#c07800', '#7a3fa0', '#496b2e', '#9c4f6b', '#37868a']
+    for i, c in enumerate(cohorts[:8]):
+        col = palette[i % len(palette)]
+        pts = [f"{px(n):.1f},{py(v):.1f}" for n in offsets
+               if (v := c["cells"].get(n)) is not None]
+        if pts:
+            parts.append(f"<polyline points='{' '.join(pts)}' fill='none' stroke='{col}' stroke-width='1.6'/>")
+            for p in pts:
+                xx, yy = p.split(",")
+                parts.append(f"<circle cx='{xx}' cy='{yy}' r='2' fill='{col}'/>")
+        parts.append(f"<text x='{pad_l+pw+8}' y='{pad_t+13*i+9}' font-size='9' fill='{col}'>{html.escape(str(c['cohort']))}</text>")
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _render_retention_table(retention: dict, *, unit_label: str) -> str:
+    offsets = retention.get("offsets", [1, 3, 7, 14, 30])
+    head = "".join(f"<th>D{n}</th>" for n in offsets)
+    body = []
+    for c in retention.get("cohorts", []):
+        cells = []
+        for n in offsets:
+            pct = c["cells"].get(n)
+            cells.append("<td class='muted'>—</td>" if pct is None
+                         else f"<td style='{_retention_cell_bg(pct)}'>{pct:.0f}%</td>")
+        body.append(f"<tr><td><b>{html.escape(str(c['cohort']))}</b></td>"
+                    f"<td>{int(c['size'])}</td>{''.join(cells)}</tr>")
+    empty = f"<tr><td colspan='{len(offsets)+2}' class='muted'>暂无冻结后 cohort 数据</td></tr>"
+    return (f"<table><thead><tr><th>{unit_label}</th><th>新增数</th>{head}</tr></thead>"
+            f"<tbody>{''.join(body) if body else empty}</tbody></table>")
+
+
+def _svg_growth_accounting(accounting: dict, *, width: int = 640, height: int = 220) -> str:
+    """Stacked growth-accounting bars: new + resurrected above the zero line,
+    churned below it — one bar per day (the baseline first day is skipped)."""
+    rows = [r for r in accounting.get("rows", []) if r.get("churned") is not None]
+    if not rows:
+        return "<div class='muted'>暂无足够天数做增长核算柱状图。</div>"
+    pad_l, pad_r, pad_t, pad_b = 34, 10, 14, 22
+    pw, ph = width - pad_l - pad_r, height - pad_t - pad_b
+    up = [(r.get("new") or 0) + (r.get("resurrected") or 0) for r in rows]
+    dn = [r.get("churned") or 0 for r in rows]
+    scale = max(max(up, default=1), max(dn, default=1), 1)
+    mid = pad_t + ph / 2
+    n = len(rows)
+    slot = pw / max(n, 1)
+    bw = min(slot * 0.7, 26)
+
+    def h(v: int) -> float:
+        return (ph / 2) * (v / scale)
+
+    parts = [f"<svg viewBox='0 0 {width} {height}' width='100%' "
+             f"style='max-width:{width}px;background:var(--card);"
+             f"border:1px solid var(--line);border-radius:8px'>"]
+    parts.append(f"<line x1='{pad_l}' y1='{mid:.1f}' x2='{pad_l+pw}' y2='{mid:.1f}' stroke='#bbb'/>")
+    parts.append(f"<text x='{pad_l-4}' y='{pad_t+8}' font-size='9' text-anchor='end' fill='#999'>+{scale}</text>")
+    parts.append(f"<text x='{pad_l-4}' y='{pad_t+ph:.0f}' font-size='9' text-anchor='end' fill='#999'>-{scale}</text>")
+    for i, r in enumerate(rows):
+        x = pad_l + slot * i + (slot - bw) / 2
+        newh, resh, chh = h(r.get("new") or 0), h(r.get("resurrected") or 0), h(r.get("churned") or 0)
+        parts.append(f"<rect x='{x:.1f}' y='{mid-newh:.1f}' width='{bw:.1f}' height='{newh:.1f}' fill='#b7352b'/>")
+        parts.append(f"<rect x='{x:.1f}' y='{mid-newh-resh:.1f}' width='{bw:.1f}' height='{resh:.1f}' fill='#1d7a4d'/>")
+        parts.append(f"<rect x='{x:.1f}' y='{mid:.1f}' width='{bw:.1f}' height='{chh:.1f}' fill='#d9b48a'/>")
+    step = max(1, n // 8)
+    for i in range(0, n, step):
+        x = pad_l + slot * i + slot / 2
+        parts.append(f"<text x='{x:.1f}' y='{height-7}' font-size='8' text-anchor='middle' fill='#999'>{html.escape(str(rows[i]['day'])[5:])}</text>")
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _svg_growth_curve(growth: list, *, width: int = 640, height: int = 220) -> str:
+    """Cumulative users on a LOG Y axis: a straight line ⇒ exponential growth,
+    bending down ⇒ slowing (log-scale diagnostic from the spec)."""
+    import math
+    pts = [(str(r.get("day") or ""), int(r.get("cumulative") or 0)) for r in growth]
+    pts = [(d, v) for d, v in pts if v > 0]
+    if len(pts) < 2:
+        return "<div class='muted'>累计数据不足画增长曲线。</div>"
+    pad_l, pad_r, pad_t, pad_b = 44, 10, 12, 22
+    pw, ph = width - pad_l - pad_r, height - pad_t - pad_b
+    vals = [v for _, v in pts]
+    vmax, vmin = max(vals), max(1, min(vals))
+    lo = math.log10(vmin)
+    hi = math.log10(vmax) if vmax > vmin else lo + 1
+    n = len(pts)
+
+    def px(i: int) -> float:
+        return pad_l + pw * (i / (n - 1))
+
+    def py(v: int) -> float:
+        return pad_t + ph * (1 - (math.log10(max(1, v)) - lo) / (hi - lo))
+
+    parts = [f"<svg viewBox='0 0 {width} {height}' width='100%' "
+             f"style='max-width:{width}px;background:var(--card);"
+             f"border:1px solid var(--line);border-radius:8px'>"]
+    p = math.floor(lo)
+    while 10 ** p <= vmax * 1.001:
+        if 10 ** p >= vmin * 0.999:
+            yy = py(10 ** p)
+            parts.append(f"<line x1='{pad_l}' y1='{yy:.1f}' x2='{pad_l+pw}' y2='{yy:.1f}' stroke='#eee'/>")
+            parts.append(f"<text x='{pad_l-5}' y='{yy+3:.1f}' font-size='9' text-anchor='end' fill='#999'>{10**p}</text>")
+        p += 1
+    poly = " ".join(f"{px(i):.1f},{py(v):.1f}" for i, (_, v) in enumerate(pts))
+    parts.append(f"<polyline points='{poly}' fill='none' stroke='#b7352b' stroke-width='1.8'/>")
+    step = max(1, n // 8)
+    for i in range(0, n, step):
+        parts.append(f"<text x='{px(i):.1f}' y='{height-7}' font-size='8' text-anchor='middle' fill='#999'>{html.escape(pts[i][0][5:])}</text>")
+    parts.append("</svg>")
+    return "".join(parts)
+
+
 def _render_data_track_growth_page(payload: dict) -> str:
     summary = payload["summary"]
     growth = payload.get("growth", [])
     retention = payload.get("retention", {})
+    retention_week = payload.get("retention_week", {})
+    accounting = payload.get("accounting", {})
     api_qs = _data_track_qs(view=None, q=None, limit=None, offset=None, sort=None, dir=None)
     api_url = f"/v1/admin/data-track/growth?{api_qs}" if api_qs else "/v1/admin/data-track/growth"
 
@@ -3594,29 +3782,32 @@ def _render_data_track_growth_page(payload: dict) -> str:
             "</tr>"
         )
 
-    cohorts = retention.get("cohorts", [])
-    max_period = int(retention.get("max_period") or 0)
-    head_cells = "".join(f"<th>W{p}</th>" for p in range(max_period + 1))
-    ret_rows = []
-    for c in sorted(cohorts, key=lambda x: x["cohort_week"], reverse=True):
-        cells_html = []
-        for p in range(max_period + 1):
-            cell = c["cells"].get(p)
-            if cell is None:
-                cells_html.append("<td class='muted'></td>")
-                continue
-            mark = "" if cell["frozen"] else "*"
-            cells_html.append(
-                f"<td style='{_retention_cell_bg(cell['pct'])}'>"
-                f"{cell['pct']:.0f}%<br><span class='muted'>{cell['active']}{mark}</span></td>"
-            )
-        ret_rows.append(
+    retention_chart = _svg_retention_lines(retention)
+    accounting_chart = _svg_growth_accounting(accounting)
+    growth_curve = _svg_growth_curve(growth)
+    ret_day_table = _render_retention_table(retention, unit_label="注册日")
+    ret_week_table = _render_retention_table(retention_week, unit_label="注册周(周一)")
+
+    def _opt(v):
+        return "—" if v is None else str(int(v))
+
+    acct_rows = []
+    for r in accounting.get("rows", []):
+        qr = r.get("quick_ratio")
+        churn = r.get("churned")
+        churn_txt = "—" if churn is None else (f"-{int(churn)}" if churn else "0")
+        acct_rows.append(
             "<tr>"
-            f"<td><b>{html.escape(c['cohort_week'])}</b></td>"
-            f"<td>{int(c['cohort_size'])}</td>"
-            + "".join(cells_html)
-            + "</tr>"
+            f"<td>{html.escape(str(r.get('day') or ''))}</td>"
+            f"<td>{int(r.get('active') or 0)}</td>"
+            f"<td><b>{int(r.get('new') or 0)}</b></td>"
+            f"<td>{_opt(r.get('resurrected'))}</td>"
+            f"<td>{_opt(r.get('retained'))}</td>"
+            f"<td style='color:#a05a00'>{churn_txt}</td>"
+            f"<td>{'—' if qr is None else f'{qr:.2f}'}</td>"
+            "</tr>"
         )
+    acct_rows.reverse()  # newest first
 
     metrics = "".join([
         _render_metric("累计用户", summary["total_users"]),
@@ -3624,9 +3815,9 @@ def _render_data_track_growth_page(payload: dict) -> str:
         _render_metric("cohort 数", summary["cohort_count"]),
         _render_metric("已冻结天数", summary["snapshot_days"]),
     ])
-    snap_first = html.escape(str(summary.get("snapshot_first_day") or ""))
-    boundary = (f"首个冻结日 <b>{snap_first}</b> 起,新增/留存不再随删号变化;之前的历史仍实时重算、会随删号偏少,仅供参考。"
-                if snap_first else "每日快照即将生效;生效后完成日的新增/留存会冻结、不再随删号变化。")
+    _freeze = html.escape(str(summary.get("freeze_day") or ""))
+    boundary = (f"留存只统计<b>冻结边界 {_freeze} 起</b>注册的 cohort;此日之前的历史实时重算、会随删号偏少不准,已按产品决策<b>整体排除</b>,不进本页。"
+                if _freeze else "每日快照尚未生效;生效后本页只统计冻结边界起注册的 cohort。")
     return f"""<!doctype html>
 <html>
 <head>
@@ -3644,8 +3835,8 @@ def _render_data_track_growth_page(payload: dict) -> str:
   <div class="muted" style="background:#fff8ef;border:1px solid #e8d8be;border-radius:8px;padding:12px 14px;margin:10px 0;line-height:1.7">
     <b>⚠️ 口径与已知偏差</b><br>
     {boundary}<br>
-    留存为<b>周 cohort</b>(北京周,行=注册周,列 W0=注册周自身…Wk=第 k 周);格子=该周仍活跃占比,小字=活跃人数(<b>*</b>=当前进行中的实时周,未冻结)。cohort_size 分母在首次冻结时钉死,删号不会缩小分母假抬留存。<br>
-    <b>用户基数极小</b> → 曲线抖动大,当方向性参考,非统计显著。<b>③ 完全自部署</b>用户不在此表(不在我们后端注册)。"活跃"=当天有用户消息或 app tracking 事件,口径同 DAU。
+    留存为<b>日 cohort · 经典 Day-N</b>(行=注册北京日,列 D_N=注册后第 N 天仍活跃的占比;D0=100% 定义上省略);<b>—</b>=该 cohort 距今不足 N 天、还判不了,不算 0。分母=当天注册人数。<br>
+    <b>用户基数极小</b> → 曲线抖动大,当方向性参考,非统计显著。<b>③ 完全自部署</b>用户不在此表(不在我们后端注册)。<b>"活跃"=使用 DAU=当天真打开过 App(app_session_end)</b>,不含只有后台/proactive 遥测的用户。
   </div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
   <h2>用户增长(新增 + 累计)</h2>
@@ -3653,11 +3844,24 @@ def _render_data_track_growth_page(payload: dict) -> str:
     <thead><tr><th>Beijing day</th><th>状态</th><th>新增</th><th>累计</th></tr></thead>
     <tbody>{''.join(growth_rows) if growth_rows else "<tr><td colspan='4' class='muted'>暂无注册数据</td></tr>"}</tbody>
   </table>
-  <h2>周 cohort 留存</h2>
+  <h2>累计用户 · log 轴增长曲线</h2>
+  <div class="muted" style="margin-bottom:8px">Y 轴为对数刻度:<b>直线=指数增长</b>,<b>上弯=加速</b>,<b>下弯=放缓</b>。全量累计(注册即计,不受冻结边界限制)。</div>
+  {growth_curve}
+  <h2>Growth Accounting · 每日(新增/回流/留存/流失 + Quick Ratio)</h2>
+  <div class="muted" style="margin-bottom:8px">活跃=使用 DAU=当天真打开过 App(app_session_end)。<b>新增</b>=当天注册;<b>回流</b>=今天活跃、之前注册过、但昨天没活跃;<b>留存</b>=今昨都活跃;<b>流失</b>=昨天活跃今天没(负);<b>Quick Ratio</b>=(新增+回流)/流失,&gt;1 才是净增长。首日为基线无环比。仅冻结边界 {_freeze} 起。</div>
   <table>
-    <thead><tr><th>注册周</th><th>人数</th>{head_cells}</tr></thead>
-    <tbody>{''.join(ret_rows) if ret_rows else f"<tr><td colspan='{max_period + 3}' class='muted'>暂无 cohort 数据</td></tr>"}</tbody>
+    <thead><tr><th>Beijing day</th><th>活跃</th><th>新增</th><th>回流</th><th>留存</th><th>流失</th><th>Quick Ratio</th></tr></thead>
+    <tbody>{''.join(acct_rows) if acct_rows else "<tr><td colspan='7' class='muted'>暂无足够天数做增长核算</td></tr>"}</tbody>
   </table>
+  <div class="muted" style="margin:6px 0">堆叠柱:<b style="color:#b7352b">■ 新增</b> + <b style="color:#1d7a4d">■ 回流</b> 向上,<b style="color:#c79a63">■ 流失</b> 向下;零线以上净增、以下净减。</div>
+  {accounting_chart}
+  <h2>留存曲线 · Day-N（{_freeze} 起）</h2>
+  <div class="muted" style="margin-bottom:8px">每条线=一个注册日 cohort;X=注册后天数,Y=当日留存率(仅画已成熟档位)。基数小、当方向性参考。</div>
+  {retention_chart}
+  <h2>日 cohort 留存表 · Day-N（{_freeze} 起）</h2>
+  {ret_day_table}
+  <h2>周 cohort 留存表 · Day-N(按注册周聚合,周一标签)</h2>
+  {ret_week_table}
 </main>
 </body>
 </html>"""

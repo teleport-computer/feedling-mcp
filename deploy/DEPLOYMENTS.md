@@ -173,13 +173,32 @@ fail closed 为 `503 voice_gateway_not_configured`。
 
 ### Production CVM (prod9, current)
 
+#### Custom enclave-domain and direct-audit transports
+
+The release topology defines `enclave.feedling.app`,
+`test-enclave.feedling.app`, and `pre-enclave.feedling.app` as the production,
+test, and pre custom-domain endpoints through `dstack-ingress`. Each becomes
+exposed/current only after its environment is deployed and its live ingress
+evidence verification succeeds. The custom-domain chain is client TLS → ingress
+inside the measured TDX CVM → Docker-internal HTTP → `enclave-domain`; the final
+hop is plaintext, but remains inside that measured CVM rather than crossing a
+public network. Cloudflare manages DNS-01 records only and does not proxy this
+traffic.
+
+Release clients using a custom domain must validate WebPKI, ingress certificate
+evidence, and enclave attestation as separate bundles before claiming security
+equivalent to direct pinning. The legacy Phala `-5003s` passthrough remains the
+compatibility and audit endpoint: it presents the enclave's self-signed
+certificate, whose live fingerprint is checked against attestation `REPORT_DATA`.
+
 | | |
 |---|---|
 | Provider | Phala Cloud dstack on prod9 (`dstack-pha-prod9.phala.network`) |
 | CVM ID | `0711c9a4-afdc-40c6-ba49-d8cb95f7e850` |
 | App ID | `9798850e096d770293c67305c6cfdceed68c1d28` |
 | Instance ID | `6fe9b54c9f2b428158c3e74de615d0f0a0c457ba` |
-| Compose | `deploy/docker-compose.phala.yaml` — `ingress`, `backend`, `enclave`（`mcp` 服务已随 MCP 线于 2026-06-12 移除） |
+| Current/live Compose | Deployment unit `deploy/docker-compose.phala.yaml`; recorded live service set: `ingress`, `backend`, `enclave`（`mcp` 服务已随 MCP 线于 2026-06-12 移除） |
+| Release/source topology | The staged `deploy/docker-compose.phala.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, and `serve-worker`; this source row is not evidence that the custom domain has been deployed or is live. |
 | Current image | `ghcr.io/teleport-computer/feedling:22b0ed6` |
 | Live git commit | `22b0ed6aa92a05d76951768f1924f45010ecda15` |
 | Live built at | `2026-07-02T19:04:02Z` |
@@ -195,6 +214,17 @@ fail closed 为 `503 voice_gateway_not_configured`。
 | KMS | legacy Phala KMS at `kms.dstack-pha-prod7.phala.network` (chain_id null — a KMS instance, NOT an on-chain KMS). The app-auth contract is on Sepolia: `0x6c8A6f1e3eD4180B2048B808f7C4b2874649b88F` (chain_id 11155111), per `/attestation` `app_auth`. |
 | Deploy path | GitHub Actions `deploy-cvm` pins the GHCR image tag, deploys this CVM via Phala, then publishes the live dstack-computed compose hash on Sepolia. |
 
+部署后从仓库根目录验证 production 自定义 enclave 域名的 live ingress evidence；
+`PROD_COMPOSE_HASH` 必须是本次部署返回的 live compose hash：
+
+```bash
+python tools/verify_enclave_domain.py \
+  --domain enclave.feedling.app \
+  --expected-compose-hash "$PROD_COMPOSE_HASH" \
+  --expected-content-pk "$ENCLAVE_CONTENT_PK_BASELINE" \
+  --reference-measurements "$PROD_REFERENCE_MEASUREMENTS"
+```
+
 ### Test CVM (prod9, `test` branch)
 
 | | |
@@ -203,7 +233,8 @@ fail closed 为 `503 voice_gateway_not_configured`。
 | CVM ID | `5bfa1543-c5b4-42ca-842d-fd88984e5edf` (also in `deploy/test-cvm-id.txt`) |
 | App ID | `173c7f49aeb54acb424676b17b17f78e5e2b2938` |
 | Created | 2026-07-01 as `feedling-io-test`, instance `tdx.small`, **Phala KMS** (prod9 chain-0). Account migration (path B): the old test CVM `19b13ebe-d12e-4d19-97d1-6cf41389b663` / app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` under `sxysun` was abandoned (balance exhausted 2026-06-18). Fresh app_id → new `enclave_content_pk`, so the reused test RDS was wiped of undecryptable rows. iOS test build repointed to the new app_id. Bootstrapped via the one-shot `.github/workflows/bootstrap-test-cvm.yml` (push to `bootstrap-cvm` branch; workflow since removed). CI deploy key is now `TEST_PHALA_CLOUD_API_KEY` (separate from prod's `PHALA_CLOUD_API_KEY`). |
-| Compose | `deploy/docker-compose.phala.test.yaml` — same 3 services as prod (`ingress`/`backend`/`enclave`), with test domains + `_test` volumes |
+| Current/live Compose | Deployment unit `deploy/docker-compose.phala.test.yaml`; recorded live service set matches prod: `ingress`, `backend`, `enclave`, with test domains + `_test` volumes |
+| Release/source topology | The staged `deploy/docker-compose.phala.test.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, and `serve-worker`; this source row is not evidence that the custom domain has been deployed or is live. |
 | Public API | `https://test-api.feedling.app` (via dstack-ingress — live, `/healthz` 200) |
 | Public MCP | 已下线（FastMCP 服务器 2026-06-12 移除） |
 | Database | Dedicated test RDS `feedling-mcp-test-t4g-micro.cgh0oucoe0x9.us-east-1.rds.amazonaws.com:5432/postgres` — fully isolated from prod (separate instance → separate `enclave_content_pk` self-consistent, no shared schema). Injected via `TEST_DATABASE_URL`. |
@@ -211,6 +242,17 @@ fail closed 为 `503 voice_gateway_not_configured`。
 | Deploy path | GitHub Actions `deploy-test-cvm` job (in `ci.yml`) on push to the `test` branch. Mirrors prod but targets the test compose / CVM / DB / contract and is branch-gated to `refs/heads/test`. |
 | First-boot note | The CVM was first created 2026-06-09 WITHOUT a CF token (to mint the app_id quickly), so `dstack-ingress` couldn't issue the `test-*.feedling.app` LE certs initially. The `test`-branch CI deploy injects `CF_*` from GitHub secrets — domains + certs are now live. Backend also needed the test RDS reachable from the CVM (Publicly accessible + SG inbound 5432) before it stopped crash-looping. |
 | iOS | The iOS app source is not in this repo. Point its test build at app_id `173c7f49aeb54acb424676b17b17f78e5e2b2938` + gateway `dstack-pha-prod9.phala.network` + test contract `0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5`. ⚠️ (Was `bb9716955423…` before the 2026-07-01 path-B account move — that app_id is **retired**; do not point new builds at it.) |
+
+部署后从仓库根目录验证 test 自定义 enclave 域名的 live ingress evidence；
+`TEST_COMPOSE_HASH` 必须是本次部署返回的 live compose hash：
+
+```bash
+python tools/verify_enclave_domain.py \
+  --domain test-enclave.feedling.app \
+  --expected-compose-hash "$TEST_COMPOSE_HASH" \
+  --expected-content-pk "$TEST_ENCLAVE_CONTENT_PK_BASELINE" \
+  --reference-measurements "$TEST_REFERENCE_MEASUREMENTS"
+```
 
 ### Runtime V2 worker CVM (test, `feedling-io-agents-test`)
 
@@ -245,13 +287,50 @@ in test, pre, and production.
 | CVM ID | `82485d6f-9c23-48f1-9bdd-5a0d38531c3e` (also in `deploy/pre-cvm-id.txt`) |
 | App ID | `7d18a1f234a0d90e5f643cac8283b6048451b8f7` |
 | Created | 2026-07-07 as `feedling-io-pre`, `tdx.small`, **Phala KMS** (prod9). Provisioned locally via `phala deploy` (no `--cvm-id` ⇒ new app) without secrets, to mint the app_id; the healthy secret-bearing deploy is the CI `deploy-pre-cvm` job. |
-| Compose | `deploy/docker-compose.phala.pre.yaml` — same 3 services as test (`ingress`/`backend`/`enclave`), with `pre-api.feedling.app` + `_pre` volumes. `FEEDLING_IO_ONBOARDING_BRANCH` stays `test` (io-onboarding has no pre branch). `FEEDLING_HOSTED_RUNTIME_POLICY` is literal `v2_only`; no encrypted env can select resident. |
+| Current/live Compose | Deployment unit `deploy/docker-compose.phala.pre.yaml`; recorded live service set matches test: `ingress`, `backend`, `enclave`, with `pre-api.feedling.app` + `_pre` volumes. `FEEDLING_IO_ONBOARDING_BRANCH` stays `test` (io-onboarding has no pre branch). `FEEDLING_HOSTED_RUNTIME_POLICY` is literal `v2_only`; no encrypted env can select resident. |
+| Release/source topology | The staged `deploy/docker-compose.phala.pre.yaml` definition has `ingress`, `backend`, `enclave`, `enclave-domain`, and `serve-worker`; this source row is not evidence that the custom domain has been deployed or is live. |
 | Public API | `https://pre-api.feedling.app` (dstack-ingress auto-creates the CF DNS records once CI injects `CF_*`) |
 | Attestation | `https://7d18a1f234a0d90e5f643cac8283b6048451b8f7-5003s.dstack-pha-prod9.phala.network/attestation` (repo var `PRE_MAIN_ENCLAVE_URL`) |
 | Database | Dedicated pre RDS, injected via `PRE_DATABASE_URL` — fully isolated from test/prod (pre's enclave content key differs from test's, so sharing a DB would mix mutually-undecryptable ciphertext + double-schedule proactive jobs). |
 | On-chain | **Separate** Sepolia FeedlingAppAuth `0x65844Dd69eba4Aa4a784e089dA9D9308F430F794` (owner = the `ETH_DEPLOYER_KEY` address, deployed 2026-07-07 via `deploy-test-contract.yml` dispatch), repo var `PRE_FEEDLING_APP_AUTH_CONTRACT`. Kept apart from test's contract because a shared AppAuth + a newly created CVM is the exact combination that flipped the main enclave key in the 2026-07-05 prod-runner incident. |
 | Deploy path | CI `deploy-pre-cvm` job (in `ci.yml`) on push to the `pre` branch. Clone of `deploy-test-cvm` with pre compose / CVM / DB / contract, branch-gated to `refs/heads/pre`. |
 | Baseline | Set repo var `PRE_ENCLAVE_CONTENT_PK_BASELINE` from a manual `/attestation` read after the first healthy deploy (the attestation gate is inert until then). |
+
+部署后从仓库根目录验证 pre 自定义 enclave 域名的 live ingress evidence；
+`PRE_COMPOSE_HASH` 必须是本次部署返回的 live compose hash：
+
+```bash
+python tools/verify_enclave_domain.py \
+  --domain pre-enclave.feedling.app \
+  --expected-compose-hash "$PRE_COMPOSE_HASH" \
+  --expected-content-pk "$PRE_ENCLAVE_CONTENT_PK_BASELINE" \
+  --reference-measurements "$PRE_REFERENCE_MEASUREMENTS"
+```
+
+每个 `$*_REFERENCE_MEASUREMENTS` 都必须指向运维人员已审核并批准的 JSON 文件；
+校验器不会从 live quote 自动信任或写入基线。初次部署时，先从 ingress 与 enclave
+quote 取得候选 measurement，经独立审核后写入对应环境的文件，再运行上述正常 gate。
+文件格式如下（所有 measurement 均为恰好 96 个十六进制字符）：
+
+```json
+{
+  "version": 1,
+  "domain": "pre-enclave.feedling.app",
+  "expected_compose_hash": "<64 hex>",
+  "expected_content_pk_hex": "<64 hex>",
+  "ingress": { "mrtd": "<96 hex>", "rtmr0": "<96 hex>", "rtmr1": "<96 hex>", "rtmr2": "<96 hex>" },
+  "enclave": { "mrtd": "<96 hex>", "rtmr0": "<96 hex>", "rtmr1": "<96 hex>", "rtmr2": "<96 hex>" }
+}
+```
+
+Ingress 与 enclave 是不同 workload，必须分别与各自批准值比较，禁止把两者
+measurement 互相比对。JSON 中的 domain、compose hash 与 content public key 也必须
+与命令行期望值逐项一致。
+
+`tools/verify_enclave_domain.py` 只做 evidence binding、环境期望值比对和 quote
+measurement 的**结构解析**；它不会验证 Intel DCAP signature chain。客户端 release
+gate 还必须独立完成 Intel DCAP signature-chain verification，不能把本工具的绿灯当作
+该密码学验证已经完成。
 
 ### Runtime V2 worker CVM (pre, `feedling-io-agents-pre`)
 

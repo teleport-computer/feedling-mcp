@@ -46,6 +46,7 @@ EXPECTED_BODYLESS_POSTS = {
 
 EXPECTED_PUBLIC_OPERATIONS = {
     ("get", "/healthz"),
+    ("get", "/healthz/runner"),
     ("get", "/v1/copytext"),
     ("post", "/v1/access/claim-token"),
     ("post", "/v1/account/recover/challenge"),
@@ -191,10 +192,10 @@ def test_public_operation_and_parameter_inventory(
     # authenticated resident observer exchange; three mutations carry bodies.
     # 160 since the voice session and OpenAI-compatible Custom LLM endpoints;
     # both accept compatibility JSON envelopes, hence 73 -> 75 bodies.
-    # 161 adds the bodyless unified main-model vision validator.
-    # 163 and 77 bodies since the V1 web execution endpoints
-    # (POST /v1/agent/web/search and /v1/agent/web/fetch, both with bodies).
-    assert len(operations) == 163
+    # 161 = bodyless unified main-model vision validator; 162 = public runner-fleet
+    # health endpoint (from test); +2 = V1 web execution endpoints
+    # (POST /v1/agent/web/{search,fetch}, both with bodies) → 164 ops, 77 bodies.
+    assert len(operations) == 164
     assert sum("requestBody" in operation for operation in operations.values()) == 77
 
     query_operations = {
@@ -439,13 +440,44 @@ def test_memory_actions_response_exposes_independent_item_outcomes(
     assert response["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/MemoryActionsResponse"
     }
+    failed_response = operations[("post", "/v1/memory/actions")]["responses"]["400"]
+    assert failed_response["content"]["application/json"]["schema"] == {
+        "oneOf": [
+            {"$ref": "#/components/schemas/MemoryActionsResponse"},
+            {"$ref": "#/components/schemas/ErrorResponse"},
+        ]
+    }
     schema = public_schema["components"]["schemas"]["MemoryActionsResponse"]
     assert schema["properties"]["status"]["enum"] == ["ok", "partial", "failed"]
     assert {
         "total_count", "applied_count", "skipped_count", "failed_count"
     } <= set(schema["required"])
+    assert {"error", "detail"} <= set(schema["properties"])
     result_schema = public_schema["components"]["schemas"]["MemoryActionResult"]
     assert {"status", "http_status"} <= set(result_schema["required"])
+
+
+def test_dream_status_documents_daily_capture_banner_fields(
+    public_schema: dict[str, Any],
+    operations: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    response = operations[("get", "/v1/dream/status")]["responses"]["200"]
+    assert response["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/DreamStatusResponse"
+    }
+    schema = public_schema["components"]["schemas"]["DreamStatusResponse"]
+    assert {"capture_completed_at", "capture_cards_added"} <= set(
+        schema["required"]
+    )
+    assert schema["properties"]["capture_completed_at"]["minimum"] == 0
+    assert schema["properties"]["capture_cards_added"] == {
+        "type": "integer",
+        "minimum": 0,
+        "description": (
+            "Cards actually added on the timestamp's device-local calendar "
+            "day, accumulated across Capture runs."
+        ),
+    }
 
 
 def test_model_catalog_request_schema_expresses_strict_xor(
@@ -611,6 +643,16 @@ def test_public_and_api_key_only_security_are_exact(
     }
     assert explicitly_public == EXPECTED_PUBLIC_OPERATIONS
     assert explicitly_api_key_only == EXPECTED_API_KEY_ONLY_OPERATIONS
+
+
+def test_runner_health_503_uses_the_aggregate_health_response_contract(
+    operations: dict[tuple[str, str], dict[str, Any]],
+) -> None:
+    response = operations[("get", "/healthz/runner")]["responses"]["503"]
+    assert response["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/GenericJsonResponse",
+    }
+    assert "same shape as the 200 response" in response["description"]
 
 
 def test_sensitive_control_planes_enforce_api_key_in_backend(

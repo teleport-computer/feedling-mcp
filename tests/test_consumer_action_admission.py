@@ -853,6 +853,51 @@ def test_execute_agent_actions_partial_4xx_maps_leading_success_failing_item_and
     assert replies[1] == crc._ACTION_OUTCOME_MIXED_NOTE_MANY_ZH.format(n=2)
 
 
+def test_execute_agent_actions_current_all_failed_400_recovers_every_item(monkeypatch):
+    """The current server returns 400 plus a complete independent result set.
+
+    The HTTP helper raises to preserve the outer failure signal, while the
+    admission funnel must recover the JSON body and report each stable slug.
+    """
+    body = {
+        "status": "failed",
+        "error": "anchor_required",
+        "detail": {"mem_type": "insight"},
+        "results": [
+            {
+                "status": "error",
+                "error": "anchor_required",
+                "detail": {"mem_type": "insight"},
+                "http_status": 400,
+            },
+            {"status": "error", "error": "not_found", "http_status": 404},
+        ],
+        "effects": [],
+        "total_count": 2,
+        "applied_count": 0,
+        "skipped_count": 0,
+        "failed_count": 2,
+    }
+    monkeypatch.setattr(
+        crc._HTTP,
+        "post",
+        _http_router(memory=_Resp(400, body)),
+    )
+
+    result = crc.execute_agent_actions([
+        {"type": "memory.add", "memory": {"summary": "bad"}},
+        {"type": "memory.delete", "memory_id": "missing"},
+    ])
+
+    assert result["effects"] == []
+    assert [row["outcome"] for row in result["outcomes"]] == [
+        "failed_execution", "failed_execution"
+    ]
+    assert [row["error_code"] for row in result["outcomes"]] == [
+        "anchor_required", "not_found"
+    ]
+
+
 def test_execute_agent_actions_4xx_without_results_key_falls_back_to_whole_bucket_failure(monkeypatch):
     """An error body with no results[] at all (or an unparseable/non-JSON
     body) carries no per-item signal — must fall back to the pre-existing
