@@ -486,3 +486,23 @@ def test_compose_memory_lanes_are_on_in_each_pooled_worker():
             in worker_block
         )
         assert "# DO NOT set to 1 before M5 MEMORY/USER prompt injection" in worker_block
+
+
+@pytest.mark.parametrize(
+    ("job", "next_job", "prefix"),
+    (
+        ("deploy-cvm", "deploy-test-cvm", "PROD"),
+        ("deploy-test-cvm", "deploy-test-runner-cvm", "TEST"),
+        ("deploy-pre-cvm", "deploy-pre-runner-cvm", "PRE"),
+    ),
+)
+def test_profile_flag_is_wired_through_each_phala_deploy_job(job, next_job, prefix):
+    workflow = (Path(__file__).parent.parent / ".github/workflows/ci.yml").read_text()
+    deploy = workflow.split(f"\n  {job}:\n", 1)[1].split(f"\n  {next_job}:\n", 1)[0]
+    mapping = (
+        "FEEDLING_V2_PROFILE_ENABLED:  "
+        f"${{{{ vars.{prefix}_FEEDLING_V2_PROFILE_ENABLED || '0' }}}}"
+    )
+    injection = '-e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED"'
+    assert mapping in deploy
+    assert deploy.count(injection) == 1
