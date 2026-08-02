@@ -20,6 +20,7 @@ import html
 from accounts import onboarding
 from accounts import onboarding as accounts_onboarding
 from accounts import registry
+from admin import usage as admin_usage
 from chat import consumer as chat_consumer
 from memory import service as memory_service
 from notices import core as notices_core
@@ -3217,6 +3218,75 @@ def _render_admin_login_page(error: bool = False, next_url: str = "/admin/data-t
 def _data_track_page_href(**updates) -> str:
     qs_inner = _data_track_qs(**updates)
     return f"/admin/data-track?{qs_inner}" if qs_inner else "/admin/data-track"
+
+
+def _usage_page_href(
+    query: admin_usage.UsageQuery | None = None,
+    *,
+    now_utc: datetime | None = None,
+    **updates,
+) -> str:
+    """Build a Usage link from its normalized whitelist, never raw args."""
+
+    if query is None:
+        query = admin_usage.parse_usage_query(request.args, now_utc=now_utc)
+    params = {
+        "preset": query.preset,
+        "timezone": query.timezone,
+        "completeness": query.completeness,
+    }
+    if query.start_date is not None:
+        params["start_date"] = query.start_date
+    if query.end_date is not None:
+        params["end_date"] = query.end_date
+    for key in ("user_id", "lane", "provider", "model"):
+        value = getattr(query, key)
+        if value is not None:
+            params[key] = value
+
+    allowed = {
+        "preset", "start_date", "end_date", "timezone", "user_id", "lane",
+        "provider", "model", "completeness",
+    }
+    for key, value in updates.items():
+        if key not in allowed:
+            continue
+        if value is None or value == "":
+            params.pop(key, None)
+        else:
+            params[key] = str(value)
+
+    normalized = admin_usage.parse_usage_query(
+        params,
+        now_utc=query.end_at_utc,
+    )
+    canonical = {
+        "view": "usage",
+        "preset": normalized.preset,
+        "timezone": normalized.timezone,
+        "completeness": normalized.completeness,
+    }
+    if normalized.start_date is not None:
+        canonical["start_date"] = normalized.start_date
+    if normalized.end_date is not None:
+        canonical["end_date"] = normalized.end_date
+    for key in ("user_id", "lane", "provider", "model"):
+        value = getattr(normalized, key)
+        if value is not None:
+            canonical[key] = value
+
+    try:
+        offset = int(updates.get("offset", 0))
+    except (TypeError, ValueError):
+        offset = 0
+    if offset > 0:
+        canonical["offset"] = str(min(offset, 1_000_000))
+    sort = str(updates.get("sort") or "").strip().lower()
+    if sort in {"tokens", "calls", "retries", "recent"}:
+        canonical["sort"] = sort
+        direction = str(updates.get("dir") or "desc").strip().lower()
+        canonical["dir"] = direction if direction in {"asc", "desc"} else "desc"
+    return f"/admin/data-track?{urlencode(canonical)}"
 
 
 def _render_data_track_view_nav(active: str) -> str:
