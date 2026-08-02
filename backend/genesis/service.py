@@ -483,6 +483,12 @@ def _staged_blob_kind(staged_id: str) -> str:
 def create_genesis_staged_payload(store: UserStore, payload: dict, *, ttl_sec: int) -> str:
     if not isinstance(payload, dict):
         raise ValueError("json_object_required")
+    # One active stage per account. This also reaps consumed tombstones so
+    # repeatedly opening the estimate screen cannot grow user_blobs without bound.
+    for previous in db.list_blobs(store.user_id, GENESIS_STAGED_BLOB_PREFIX):
+        previous_id = str((previous or {}).get("staged_id") or "")
+        if previous_id:
+            db.delete_blob(store.user_id, _staged_blob_kind(previous_id))
     staged_id = core_util._new_public_id("staged")
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     envelope, err = core_envelope._build_shared_envelope_for_store(
@@ -510,6 +516,7 @@ def load_genesis_staged_payload(
     if bool(blob.get("consumed")):
         raise ValueError("staged_import_consumed")
     if int(blob.get("expires_at") or 0) <= int(time.time()):
+        db.delete_blob(store.user_id, _staged_blob_kind(staged_id))
         raise TimeoutError("staged_import_expired")
     envelope = blob.get("content_envelope")
     if not isinstance(envelope, dict):

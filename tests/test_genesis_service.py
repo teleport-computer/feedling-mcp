@@ -6,6 +6,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from genesis import service  # noqa: E402
@@ -1283,12 +1285,23 @@ def test_genesis_checkpoint_load_verifies_and_decrypts(monkeypatch):
 
 def test_genesis_staged_payload_is_encrypted_and_consumed_as_tombstone(monkeypatch):
     stored = {}
+    deleted = []
 
     def build_envelope(_store, raw, *, item_id):
         stored["raw"] = raw
         return {"body_ct": "ciphertext", "id": item_id}, ""
 
     monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", build_envelope)
+    monkeypatch.setattr(
+        service.db,
+        "list_blobs",
+        lambda *_args: [{"staged_id": "staged_previous", "consumed": True}],
+    )
+    monkeypatch.setattr(
+        service.db,
+        "delete_blob",
+        lambda user_id, kind: deleted.append((user_id, kind)) or True,
+    )
     monkeypatch.setattr(
         service.db,
         "set_blob_strict_mirrored",
@@ -1303,6 +1316,7 @@ def test_genesis_staged_payload_is_encrypted_and_consumed_as_tombstone(monkeypat
 
     staged_id = service.create_genesis_staged_payload(
         _store(), {"content": "secret history"}, ttl_sec=600)
+    assert deleted == [("usr_genesis", "genesis_staged:staged_previous")]
     assert stored["kind"] == f"genesis_staged:{staged_id}"
     assert "secret history" not in json.dumps(stored["doc"])
     assert service.load_genesis_staged_payload(
@@ -1311,3 +1325,27 @@ def test_genesis_staged_payload_is_encrypted_and_consumed_as_tombstone(monkeypat
     service.mark_genesis_staged_consumed(_store(), staged_id, "job_1")
     assert stored["doc"]["consumed"] is True
     assert "content_envelope" not in stored["doc"]
+
+
+def test_expired_genesis_stage_is_deleted_before_410(monkeypatch):
+    deleted = []
+    monkeypatch.setattr(
+        service.db,
+        "get_blob_strict",
+        lambda *_args: {
+            "staged_id": "staged_expired",
+            "expires_at": 1,
+            "consumed": False,
+            "content_envelope": {"body_ct": "ciphertext"},
+        },
+    )
+    monkeypatch.setattr(
+        service.db,
+        "delete_blob",
+        lambda user_id, kind: deleted.append((user_id, kind)) or True,
+    )
+
+    with pytest.raises(TimeoutError, match="staged_import_expired"):
+        service.load_genesis_staged_payload(_store(), "api-key", "staged_expired")
+
+    assert deleted == [("usr_genesis", "genesis_staged:staged_expired")]

@@ -325,6 +325,7 @@ def test_plaintext_import_reuses_failed_job_for_checkpoint_resume(monkeypatch):
             "ingest": "plaintext",
             "input_hash": plaintext.history_import._history_import_payload_hash(payload),
             "mode": "onboarding",
+            "distill_model": "old-fast-model",
         },
     }
     list_calls = {"n": 0}
@@ -334,6 +335,14 @@ def test_plaintext_import_reuses_failed_job_for_checkpoint_resume(monkeypatch):
         return [failed]
 
     monkeypatch.setattr(plaintext.db, "genesis_list_jobs", list_jobs)
+    patched = {}
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_patch_job_metadata",
+        lambda _user_id, _job_id, patch: patched.update(patch) or {
+            **failed, "metadata": {**failed["metadata"], **patch}
+        },
+    )
     monkeypatch.setattr(
         plaintext.db,
         "genesis_set_job_status",
@@ -352,6 +361,7 @@ def test_plaintext_import_reuses_failed_job_for_checkpoint_resume(monkeypatch):
     assert resp.status_code == 202
     assert resp.get_json()["job"]["job_id"] == "genesis_failed"
     assert started["job"]["status"] == "processing"
+    assert patched["distill_model"] is None
 
 
 def test_plaintext_import_reuses_done_job_without_restart(monkeypatch):
@@ -659,6 +669,53 @@ def test_plaintext_commit_staged_id_errors_are_distinct(monkeypatch, error, stat
     assert resp.get_json()["error"] == str(error)
 
 
+def test_plaintext_commit_active_job_returns_409_without_consuming_stage(monkeypatch):
+    monkeypatch.setattr(
+        plaintext.service,
+        "load_genesis_staged_payload",
+        lambda *_args: {"format": "plaintext", "content": "User: staged"},
+    )
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_list_jobs",
+        lambda *_args, **_kwargs: [{
+            "job_id": "job_active",
+            "status": "processing",
+            "metadata": {"ingest": "plaintext", "input_hash": "other"},
+        }],
+    )
+    monkeypatch.setattr(
+        plaintext.service,
+        "mark_genesis_staged_consumed",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("409 must keep stage")),
+    )
+
+    resp = _client(monkeypatch).post(
+        "/v1/genesis/imports/plaintext/commit", json={"staged_id": "staged_1"})
+
+    assert resp.status_code == 409
+    assert resp.get_json() == {
+        "error": "import_job_active",
+        "active_job_id": "job_active",
+    }
+
+
+def test_plaintext_commit_rejects_invalid_distill_model(monkeypatch):
+    monkeypatch.setattr(
+        plaintext.service,
+        "load_genesis_staged_payload",
+        lambda *_args: {"format": "plaintext", "content": "User: staged"},
+    )
+
+    resp = _client(monkeypatch).post("/v1/genesis/imports/plaintext/commit", json={
+        "staged_id": "staged_1",
+        "distill_model": "x" * 161,
+    })
+
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "invalid_distill_model"
+
+
 def test_recommended_distill_model_catalog_priority(monkeypatch):
     runtime = plaintext.provider_client.ProviderConfig(
         "openai_compatible", "chat-model", "secret", "https://relay.example/v1")
@@ -681,6 +738,28 @@ def test_recommended_distill_model_catalog_priority(monkeypatch):
 
     assert plaintext._recommended_distill_model(_store(), "key") == "vendor/haiku-fast"
     assert captured["total_budget_sec"] == 3.0
+
+
+def test_plaintext_estimate_recommendation_failure_degrades_to_null(monkeypatch):
+    monkeypatch.setattr(
+        plaintext.service,
+        "create_genesis_staged_payload",
+        lambda *_args, **_kwargs: "staged_1",
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_recommended_distill_model",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("config unavailable")),
+    )
+
+    resp = _client(monkeypatch).post(
+        "/v1/genesis/imports/plaintext/estimate",
+        json={"content": "User: hello"},
+    )
+
+    assert resp.status_code == 201
+    assert resp.get_json()["staged_id"] == "staged_1"
+    assert resp.get_json()["recommended_model"] is None
 
 
 def test_plaintext_status_exposes_identity_materials_and_failure_copy(monkeypatch):
@@ -713,6 +792,29 @@ def test_plaintext_status_exposes_identity_materials_and_failure_copy(monkeypatc
     assert body["materials"] == [{**materials[0], "status": "failed"}]
     assert body["error_class"] == "provider_timeout"
     assert body["friendly_copy"]
+
+
+def test_plaintext_status_quota_failure_keeps_cause_aware_copy(monkeypatch):
+    raw_error = "plaintext_import_failed:ProviderError:provider_http_402"
+    monkeypatch.setattr(
+        genesis_core.db,
+        "genesis_get_job",
+        lambda *_args: {
+            "job_id": "job_quota",
+            "status": "failed",
+            "error": raw_error,
+            "output": {"stage": "plaintext_reducer", "materials": []},
+        },
+    )
+    monkeypatch.setattr(genesis_core.db, "get_blob", lambda *_args: None)
+
+    body, status = genesis_core.get_import_status(
+        _store(), "job_quota", include_missing_raw=False)
+
+    assert status == 200
+    assert body["error_class"] == "provider_quota"
+    assert service.GENESIS_ERROR_HINTS["provider_quota"] in body["friendly_copy"]
+    assert service.GENESIS_ERROR_HINTS["internal"] not in body["friendly_copy"]
 
 
 def test_plaintext_background_runner_distills_and_applies(monkeypatch):

@@ -531,7 +531,8 @@ def get_import_status(store, job_id: str, *, include_missing_raw) -> tuple[dict,
     if str(job.get("status") or "") == service.FAILED_JOB_STATUS:
         error_class = service.classify_genesis_error(str(job.get("error") or ""))
         status_projection["error_class"] = error_class
-        status_projection["friendly_copy"] = service.genesis_failure_required_text(error_class)
+        status_projection["friendly_copy"] = service.genesis_failure_required_text(
+            str(job.get("error") or ""))
     extra.update(status_projection)
     return _job_response(job, extra=extra), 200
 
@@ -841,11 +842,15 @@ def plaintext_estimate(store, payload: dict, *, api_key: str | None) -> tuple[di
         return _bad_from_value_error(e, 400)
     except Exception as e:  # noqa: BLE001
         return _bad(f"staged_import_create_failed:{type(e).__name__}", 500)
+    try:
+        recommended_model = plaintext_helpers._recommended_distill_model(store, api_key)
+    except Exception:  # noqa: BLE001
+        recommended_model = None
     return {
         "staged_id": staged_id,
         "materials": materials,
         "est_total_tokens": total,
-        "recommended_model": plaintext_helpers._recommended_distill_model(store, api_key),
+        "recommended_model": recommended_model,
     }, 201
 
 

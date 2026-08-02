@@ -348,6 +348,19 @@ def _distill_model_override(value: Any) -> str:
     return model
 
 
+def _material_card_count(output: dict | None) -> int:
+    value = output if isinstance(output, dict) else {}
+    cards = value.get("memories")
+    if not isinstance(cards, list):
+        cards = value.get("facts")
+    count = len(cards) if isinstance(cards, list) else 0
+    if _identity_payload_has_content(value.get("identity")):
+        count += 1
+    if value.get("persona") or value.get("persona_content"):
+        count += 1
+    return count
+
+
 def _plaintext_job_metadata(
     payload: dict,
     prepared: dict,
@@ -1673,7 +1686,7 @@ def _run_plaintext_update_identity_job(
     if progress:
         for source_pass, group in enumerate(progress.source_groups, start=1):
             family = str(group.get("source_family") or "ai_persona")
-            progress.record_non_map_group(source_pass, family)
+            progress.record_non_map_group(source_pass, family, cards=2)
     completed = db.genesis_complete_job(
         store.user_id,
         job_id,
@@ -1870,7 +1883,11 @@ def _run_plaintext_genesis_job(
                 ),
             )
             if progress and group_source_family in {"ai_persona", "memory_summary"}:
-                progress.record_non_map_group(idx, group_source_family)
+                progress.record_non_map_group(
+                    idx,
+                    group_source_family,
+                    cards=_material_card_count(output),
+                )
             _trace_genesis(
                 store,
                 "genesis.plaintext.reducer_pass.done",
