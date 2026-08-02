@@ -60,6 +60,27 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
                 "VALUES (%s, 'chat-1', 1, %s, 7)",
                 (uid, Jsonb({"id": "chat-1", "body_ct": "ciphertext"})),
             )
+            job_id = source.execute(
+                "INSERT INTO agent_jobs (user_id, lane, status) "
+                "VALUES (%s, 'chat', 'completed') RETURNING id",
+                (uid,),
+            ).fetchone()[0]
+            for suffix, status in (("applied", "applied"), ("discarded", "discarded")):
+                source.execute(
+                    "INSERT INTO v2_effect_outbox "
+                    "(effect_id, user_id, job_id, effect_type, "
+                    " expected_generation, payload, status) "
+                    "VALUES (%s, %s, %s, 'reply', 1, '{}'::jsonb, %s)",
+                    (f"phase4-{suffix}", uid, job_id, status),
+                )
+            source.execute(
+                "INSERT INTO v2_terminal_failure_outbox "
+                "(job_id, user_id, error_code, status_delivered_at, "
+                " runtime_error_delivered_at, reply_parent_message_id, "
+                " reply_delivered_at) "
+                "VALUES (%s, %s, 'historical', now(), now(), 'parent-1', now())",
+                (job_id, uid),
+            )
         with psycopg.connect(destination_url, autocommit=True) as destination:
             destination.execute(
                 "INSERT INTO users (user_id, created_at, doc) VALUES (%s, '', %s)",
@@ -78,6 +99,7 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
 
         report = phase4_cutover.run(apply=True, writes_frozen=True)
         assert report["ok"] is True
+        assert not any(report["drain"].values())
         assert report["frame_bridge"]["rows"] == 1
         assert report["chat_storage_generations"]["rows"] == 1
         assert set(report["primary_contract"]["enabled_triggers"]) == {
