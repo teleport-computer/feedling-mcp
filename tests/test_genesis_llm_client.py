@@ -4,6 +4,7 @@ import json
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -172,7 +173,7 @@ def test_genesis_canary_uses_real_first_call_once_then_normal_timeout(monkeypatc
 
 def test_genesis_canary_failure_has_stable_error(monkeypatch):
     def fail(*_args, **_kwargs):
-        raise RuntimeError("relay unavailable")
+        raise httpx.ReadTimeout("relay too slow")
 
     with pytest.raises(DistillModelTooSlowError, match="distill_model_too_slow") as exc:
         GenesisLLMClient(completion_fn=fail, persist_output=False, canary=True).complete(
@@ -184,3 +185,26 @@ def test_genesis_canary_failure_has_stable_error(monkeypatch):
             idempotency_key="first",
         )
     assert exc.value.feedling_error_class == "provider_config"
+
+
+def test_genesis_canary_preserves_provider_config_failure(monkeypatch):
+    provider_error = provider_client.ProviderError(
+        "invalid timeout setting and out of credits",
+        status_code=402,
+    )
+
+    def fail(*_args, **_kwargs):
+        raise provider_error
+
+    with pytest.raises(provider_client.ProviderError) as exc:
+        GenesisLLMClient(completion_fn=fail, persist_output=False, canary=True).complete(
+            user_id="usr",
+            job_id="job",
+            task_id="first-map",
+            runtime=_runtime(),
+            messages=[{"role": "user", "content": "hello"}],
+            idempotency_key="first",
+        )
+
+    assert exc.value is provider_error
+    assert provider_client.classify_provider_error(exc.value) == "provider_config"

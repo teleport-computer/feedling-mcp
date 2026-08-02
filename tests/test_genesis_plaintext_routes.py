@@ -1371,7 +1371,9 @@ def test_foreground_history_chunks_capped_support_untouched(monkeypatch):
     hist = next(g for g in capped if g["source_family"] == "history")
     persona = next(g for g in capped if g["source_family"] == "ai_persona")
     assert len(hist["chunk_texts"]) == 8          # history 采样到 8
+    assert hist["_checkpoint_chunk_indices"] == [0, 4, 7, 11, 15, 19, 22, 26]
     assert len(persona["chunk_texts"]) == 1        # 小桶不动
+    assert persona["_checkpoint_chunk_indices"] == [0]
 
 
 def test_plaintext_import_rejection_logs_breadcrumb(monkeypatch, caplog):

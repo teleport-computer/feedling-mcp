@@ -82,7 +82,7 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
         return None
 
 
-def _is_timeout_error(exc: BaseException) -> bool:
+def is_timeout_error(exc: BaseException) -> bool:
     """Recognize both raw httpx timeouts and adapter-wrapped ProviderErrors."""
     current: BaseException | None = exc
     seen: set[int] = set()
@@ -126,7 +126,7 @@ def reliable_chat_completion(
         except Exception as exc:  # noqa: BLE001 — classify, then re-raise or retry
             cls = classify_provider_error(exc)
             last_exc = exc
-            is_timeout = _is_timeout_error(exc)
+            is_timeout = is_timeout_error(exc)
             if is_timeout:
                 timeout_attempts += 1
             timeout_exhausted = is_timeout and timeout_attempts >= timeout_attempts_limit

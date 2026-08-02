@@ -31,8 +31,9 @@ change must not be interpreted as an API guarantee.
   with `active_job_id`; the guard is enforced in PostgreSQL across API workers.
   The first real model call is a bounded canary, provider timeouts make at most
   two attempts while `429`/`5xx` retain their existing retry budget, and a
-  failed canary is reported as `distill_model_too_slow` with copy directing the
-  user to a faster model. Each successful material window is durably
+  timed-out canary is reported as `distill_model_too_slow` with copy directing
+  the user to a faster model. Other provider configuration failures retain their
+  specific cause-aware guidance. Each successful material window is durably
   checkpointed in an encrypted envelope before progress advances. Retrying the
   same failed import skips completed windows and resumes at reduction, and
   failed onboarding validation now reports the durable window percentage and

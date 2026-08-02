@@ -149,11 +149,16 @@ class GenesisLLMClient:
             with _user_slot(user_id):
                 result = self._completion_fn(runtime, messages, **completion_kwargs)
         except Exception as exc:
-            if not canary_call:
-                raise
-            raise DistillModelTooSlowError(
-                f"distill_model_too_slow:{type(exc).__name__}:{str(exc)[:160]}"
-            ) from exc
+            provider_error_class = provider_client.classify_provider_error(exc)
+            if (
+                canary_call
+                and provider_error_class != "provider_config"
+                and provider_client.is_timeout_error(exc)
+            ):
+                raise DistillModelTooSlowError(
+                    f"distill_model_too_slow:{type(exc).__name__}:{str(exc)[:160]}"
+                ) from exc
+            raise
         self._canary_pending = False
         text = str(result.get("reply") or "")
         usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}

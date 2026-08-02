@@ -160,8 +160,10 @@ account. A second submission returns `409 import_job_active` and the existing
 the unchanged upload. Done and failed jobs release the account slot.
 
 The worker uses the first real model request as a canary with a default
-60-second timeout. A failed canary ends the job with
+60-second timeout. A timed-out canary ends the job with
 `distill_model_too_slow`; changing to a faster model is required before retry.
+Other provider configuration failures retain their specific error class and
+remediation guidance.
 Later provider timeout failures make at most two attempts. This timeout cap does
 not reduce the existing three-attempt budget for provider `429` and retryable
 `5xx` responses.

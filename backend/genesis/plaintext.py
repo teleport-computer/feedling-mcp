@@ -172,17 +172,21 @@ def _foreground_history_cap() -> int:
 
 def _cap_foreground_history_chunks(source_groups: list[dict]) -> list[dict]:
     """前台用:只对 history 桶采样到 cap(_select_evenly);其它桶(人物卡/档案/长期记忆)全读。
-    被砍的 history 块由后台补全,不影响身份(名字来自人物卡,全读)。"""
+    被砍的 history 块由后台补全,不影响身份(名字来自人物卡,全读)。每组同时保留
+    全量窗口序号,让前台 checkpoint 可被未采样的后台 pass 正确复用。"""
     cap = _foreground_history_cap()
     out: list[dict] = []
     for g in source_groups:
+        chunks = list(g.get("chunk_texts") or [])
+        indexed_chunks = list(enumerate(chunks))
         if str(g.get("source_family") or "") == "history":
-            chunks = list(g.get("chunk_texts") or [])
             if len(chunks) > cap:
-                chunks = history_import._select_evenly(chunks, cap)
-            out.append({**g, "chunk_texts": chunks})
-        else:
-            out.append(g)
+                indexed_chunks = history_import._select_evenly(indexed_chunks, cap)
+        out.append({
+            **g,
+            "chunk_texts": [chunk for _index, chunk in indexed_chunks],
+            "_checkpoint_chunk_indices": [index for index, _chunk in indexed_chunks],
+        })
     return out
 
 
@@ -958,9 +962,48 @@ def _run_plaintext_genesis_v2(
     for idx, group in enumerate(fg_source_groups, start=1):
         group_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
         group_family = str(group.get("source_family") or worker._source_family(group_kind))
-        group_chunks = [str(t) for t in (group.get("chunk_texts") or []) if str(t or "").strip()]
-        if not group_chunks:
+        raw_group_chunks = list(group.get("chunk_texts") or [])
+        checkpoint_indices = group.get("_checkpoint_chunk_indices")
+        if (
+            not isinstance(checkpoint_indices, list)
+            or len(checkpoint_indices) != len(raw_group_chunks)
+            or not all(isinstance(value, int) for value in checkpoint_indices)
+        ):
+            checkpoint_indices = list(range(len(raw_group_chunks)))
+        indexed_group_chunks = [
+            (full_index, str(text))
+            for full_index, text in zip(checkpoint_indices, raw_group_chunks)
+            if str(text or "").strip()
+        ]
+        if not indexed_group_chunks:
             continue
+        checkpoint_indices = [full_index for full_index, _text in indexed_group_chunks]
+        group_chunks = [text for _full_index, text in indexed_group_chunks]
+        resume_map_outputs = None
+        on_map_completed = None
+        if progress:
+            completed = progress.resume_outputs(idx, group_family)
+            resume_map_outputs = {
+                local_index: completed[full_index]
+                for local_index, full_index in enumerate(checkpoint_indices)
+                if full_index in completed
+            }
+
+            def on_map_completed(
+                chunk_index,
+                output,
+                *,
+                source_pass=idx,
+                family=group_family,
+                full_indices=tuple(checkpoint_indices),
+            ):
+                progress.record_map(
+                    source_pass,
+                    family,
+                    full_indices[chunk_index],
+                    output,
+                )
+
         if combined_map and group_family == "ai_persona":
             persona_material_parts.extend(group_chunks)
         reduce = worker.build_foreground_output_from_texts(
@@ -971,12 +1014,8 @@ def _run_plaintext_genesis_v2(
             write_core=False,
             user_name=user_name,
             llm=llm,
-            resume_map_outputs=(progress.resume_outputs(idx, group_family) if progress else None),
-            on_map_completed=(
-                (lambda chunk_index, output, source_pass=idx, family=group_family:
-                 progress.record_map(source_pass, family, chunk_index, output))
-                if progress else None
-            ),
+            resume_map_outputs=resume_map_outputs,
+            on_map_completed=on_map_completed,
         )
         foreground_reduces.append(reduce)
         voice_candidates.extend([c for c in (reduce.get("voice_candidates") or []) if isinstance(c, dict)])

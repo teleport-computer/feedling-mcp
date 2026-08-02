@@ -89,6 +89,81 @@ def test_v2_foreground_completes_then_background_skips_only_history_core(monkeyp
     assert calls["bg_known"] == ["用户养了一只狗叫蛋子"]
 
 
+def test_v2_sampled_foreground_checkpoints_full_history_indices(monkeypatch):
+    monkeypatch.setenv("FEEDLING_GENESIS_FG_HISTORY_CAP", "8")
+    chunks = [f"history-{idx}" for idx in range(12)]
+    expected_indices = [0, 2, 3, 5, 6, 8, 9, 11]
+    captured = {}
+
+    class Progress:
+        def __init__(self):
+            self.outputs = {}
+
+        def resume_outputs(self, source_pass, source_family):
+            assert (source_pass, source_family) == (1, "history")
+            return dict(self.outputs)
+
+        def record_map(self, source_pass, source_family, chunk_index, output):
+            assert (source_pass, source_family) == (1, "history")
+            self.outputs[chunk_index] = output
+
+        def publish(self, **_kwargs):
+            return None
+
+    progress = Progress()
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+
+    def fake_foreground(**kwargs):
+        assert kwargs["chunk_texts"] == [chunks[idx] for idx in expected_indices]
+        resumed = kwargs.get("resume_map_outputs") or {}
+        for local_index, text in enumerate(kwargs["chunk_texts"]):
+            if local_index not in resumed:
+                kwargs["on_map_completed"](
+                    local_index,
+                    {"fact_candidates": [{"summary": text}]},
+                )
+        return _greetable_fg()
+
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts", fake_foreground)
+    monkeypatch.setattr(
+        plaintext,
+        "_plaintext_merge_reducer_outputs",
+        lambda outs, **k: {"memories": [{"summary": "foreground memory"}]},
+    )
+    monkeypatch.setattr(
+        foreground_identity,
+        "derive_foreground_identity",
+        lambda **k: ({"agent_name": "", "dimensions": []}, []),
+    )
+    monkeypatch.setattr(service, "apply_reducer_output", lambda *a, **k: None)
+
+    def fake_background(*_args, **kwargs):
+        captured["resumed"] = kwargs["progress"].resume_outputs(1, "history")
+
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment", fake_background)
+
+    handled = plaintext._run_plaintext_genesis_v2(
+        _Store(),
+        "key",
+        "job-large",
+        runtime=object(),
+        source_groups=[{
+            "source_kind": "history_import",
+            "source_family": "history",
+            "chunk_texts": chunks,
+        }],
+        progress=progress,
+    )
+
+    assert handled is True
+    assert sorted(captured["resumed"]) == expected_indices
+    assert {
+        index: captured["resumed"][index]["fact_candidates"][0]["summary"]
+        for index in expected_indices
+    } == {index: chunks[index] for index in expected_indices}
+    assert sorted(set(range(len(chunks))) - set(captured["resumed"])) == [1, 4, 7, 10]
+
+
 def test_v2_returns_false_when_nothing_greetable(monkeypatch):
     applied = {"n": 0}
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
