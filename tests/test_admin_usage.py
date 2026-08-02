@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from html import unescape
+import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -27,6 +29,29 @@ from conftest import seed_user  # noqa: E402
 
 
 NOW_UTC = datetime(2026, 8, 2, 12, 30, tzinfo=timezone.utc)
+
+
+def test_admin_usage_scale_harness_self_check():
+    """The opt-in scale proof must keep its timing and SQL safety gates."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/perf/admin_usage_scale.py",
+            "--self-test",
+        ],
+        cwd=Path(__file__).parent.parent,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "p50_ms": 30.0,
+        "p95_ms": 50.0,
+        "sensitive_column_check": "passed",
+        "time_range_check": "passed",
+    }
 
 
 @pytest.fixture

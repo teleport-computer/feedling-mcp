@@ -1,0 +1,115 @@
+{
+  "date": "2026-08-02",
+  "base_commit": "00829415",
+  "budget_ms": 2000,
+  "environment": {
+    "database": "dedicated local PostgreSQL database, migrated through 0074_runtime_user_delivery_idx",
+    "database_name": "feedling_usage_scale_p0a (deleted after verification)",
+    "production_database_touched": false,
+    "production_infrastructure_added": false
+  },
+  "fixture": {
+    "source_rows": 3000000,
+    "users": 2000,
+    "history_days": 365,
+    "window_days": 90,
+    "rows_in_90d_approx": 740000,
+    "lanes": "chat 62%, heartbeat 15%, manual_wake 11%, maintenance 7%, scheduled 5%",
+    "providers": "openrouter 68%, anthropic 20%, google 12%",
+    "unknown_usage": "5%",
+    "content_columns_seeded": false
+  },
+  "raw_report": {
+    "rows_300k": {
+      "rows_in_90d": 74019,
+      "unfiltered_samples_ms": [2410.962, 2385.316, 2363.958, 2384.815, 2369.048],
+      "unfiltered_p50_ms": 2384.815,
+      "unfiltered_p95_ms": 2410.962,
+      "provider_model_filtered_samples_ms": [1483.856, 1482.404, 1478.263, 1481.841, 1497.881],
+      "provider_model_filtered_p50_ms": 1482.404,
+      "provider_model_filtered_p95_ms": 1497.881,
+      "created_at_index_used_by_every_metric_query": true,
+      "index_blocks": 195,
+      "heap_hit_blocks": 3274,
+      "slowest_unfiltered_statements_ms": {
+        "overview": 750.96,
+        "per_user": 662.383
+      }
+    },
+    "rows_3m": {
+      "status": "failed_budget_before_five_samples",
+      "observation": "capture/warm execution exceeded 90 seconds; a measured report was still in overview when stopped",
+      "interpretation": "raw execution is not a viable 2 second path; the 300k five-run p95 already exceeds the budget"
+    }
+  },
+  "rollup_prototypes": {
+    "single_user_day_dimension_table_300k": {
+      "rollup_rows": 300000,
+      "rollup_size_mb": 97,
+      "source_size_mb": 144,
+      "samples_ms": [1199.965, 1190.483, 1188.933, 1202.42, 1198.1],
+      "p50_ms": 1198.1,
+      "p95_ms": 1202.42
+    },
+    "single_user_day_dimension_table_3m": {
+      "rollup_rows": 731984,
+      "rollup_size_mb": 243,
+      "source_size_mb": 1356,
+      "samples_ms": [3222.325, 3205.025, 3199.355, 3212.626, 3202.329],
+      "p50_ms": 3205.025,
+      "p95_ms": 3222.325,
+      "work_mem_64mb_p95_ms": 2943.076
+    },
+    "single_table_narrow_reused_aggregates_3m": {
+      "samples_ms": [2946.68, 2823.189, 2825.367, 2816.447, 2826.792],
+      "p50_ms": 2825.367,
+      "p95_ms": 2946.68
+    },
+    "grouping_sets_3m": {
+      "samples_ms": [8195.579, 8123.257, 8169.561, 8162.034, 8147.691],
+      "p95_ms": 8195.579,
+      "rejected": true
+    },
+    "two_user_grain_tables_3m": {
+      "totals_rows": 731984,
+      "dimension_rows": 731984,
+      "totals_size_mb": 359,
+      "dimension_size_mb": 430,
+      "source_size_mb": 1356,
+      "default_samples_ms": [2977.803, 2980.701, 2964.483, 2973.913, 2977.191],
+      "default_p50_ms": 2977.191,
+      "default_p95_ms": 2980.701,
+      "provider_model_filtered_samples_ms": [1925.981, 1922.533, 1926.696, 1929.877, 1926.976],
+      "provider_model_filtered_p50_ms": 1926.696,
+      "provider_model_filtered_p95_ms": 1929.877,
+      "jit": false,
+      "completeness_storage": "all/metered/unknown overlapping counters and known-counts in each user-grain row"
+    }
+  },
+  "parallel_same_snapshot_prototype": {
+    "connections": 3,
+    "isolation": "REPEATABLE READ, READ ONLY",
+    "snapshot": "one pg_export_snapshot(), imported by two workers; coordinator also executes a branch",
+    "result_cache": false,
+    "warm_ms": 1573.485,
+    "samples": [
+      {"wall_ms": 1472.828, "a_core_ms": 772.828, "b_breakdowns_ms": 1468.135, "c_model_latency_ms": 345.992},
+      {"wall_ms": 1453.521, "a_core_ms": 759.779, "b_breakdowns_ms": 1449.517, "c_model_latency_ms": 345.646},
+      {"wall_ms": 1458.801, "a_core_ms": 763.614, "b_breakdowns_ms": 1454.512, "c_model_latency_ms": 348.23},
+      {"wall_ms": 1458.75, "a_core_ms": 759.804, "b_breakdowns_ms": 1454.783, "c_model_latency_ms": 347.74},
+      {"wall_ms": 1447.73, "a_core_ms": 762.239, "b_breakdowns_ms": 1436.793, "c_model_latency_ms": 341.17}
+    ],
+    "p50_ms": 1458.75,
+    "p95_ms": 1472.828,
+    "passed": true
+  },
+  "safety_gates": {
+    "half_open_created_at_range": true,
+    "sensitive_content_columns_absent": true,
+    "rollup_deletion_semantics": "user-grain only; no cross-user fleet aggregate",
+    "hot_path_write_added": false,
+    "sqlite_added": false,
+    "new_infrastructure_required": false,
+    "failure_policy": "analytics persistence and read failures must not affect runtime traffic"
+  }
+}
