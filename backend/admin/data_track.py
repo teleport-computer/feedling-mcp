@@ -2182,14 +2182,17 @@ def _data_track_dau_payload() -> dict:
         day=histogram_day,
         tz="Asia/Shanghai",
     )
-    dau_values = [int(row.get("dau") or 0) for row in rows]
+    # DAU now = 使用 DAU (app_session_end / genuinely opened the app), not the
+    # broad chat∪tracking count. session_dau is frozen in the snapshot too, so
+    # historical frozen days stay consistent.
+    dau_values = [int(row.get("session_dau") or 0) for row in rows]
     latest = rows[0] if rows else {}
     summary = {
         "generated_at": datetime.now().isoformat(),
         "timezone": "Asia/Shanghai",
         "days_returned": len(rows),
         "latest_day": latest.get("day", ""),
-        "latest_dau": int(latest.get("dau") or 0),
+        "latest_dau": int(latest.get("session_dau") or 0),
         "max_dau": max(dau_values, default=0),
         "avg_dau": (sum(dau_values) / len(dau_values)) if dau_values else 0,
         "user_messages": sum(int(row.get("user_messages") or 0) for row in rows),
@@ -2217,7 +2220,7 @@ def _data_track_dau_payload() -> dict:
         ],
         "usage_histogram": usage_histogram,
         "definition": {
-            "dau": "Distinct users with at least one user chat message or tracking event on the Beijing day.",
+            "dau": "DAU = 使用 DAU: distinct users with an app_session_end (foreground app open) on the Beijing day. Chat DAU / Tracking DAU are looser breakdowns.",
             "excluded": "Agent/openclaw messages, proactive writes, and verify_ping synthetic messages are excluded.",
             "timezone": "Asia/Shanghai",
         },
@@ -3405,13 +3408,12 @@ def _render_data_track_dau_page(payload: dict) -> str:
             + ("<td><span style='color:#1d7a4d;font-size:12px'>🔒 已冻结</span></td>"
                if row.get("frozen")
                else "<td><span style='color:#a05a00;font-size:12px'>⏱ 实时</span></td>")
-            + f"<td>{int(row.get('dau') or 0)}</td>"
+            + f"<td><b>{int(row.get('session_dau') or 0)}</b></td>"
             f"<td>{int(row.get('chat_dau') or 0)}</td>"
             f"<td>{int(row.get('tracking_dau') or 0)}</td>"
             f"<td>{int(row.get('active_events') or 0)}</td>"
             f"<td>{int(row.get('user_messages') or 0)}</td>"
             f"<td>{int(row.get('tracking_events') or 0)}</td>"
-            f"<td>{int(row.get('session_dau') or 0)}</td>"
             # 人均日使用时长 = 当天总前台时长 / 使用DAU(每个活跃用户当天实际用了多久)。
             # 之前是 avg_session_sec(每次会话均长),被大量前后台切换的微会话拉低,误导。
             f"<td><b>{_fmt_duration_sec((row.get('foreground_sec') or 0) / (row.get('session_dau') or 1))}</b></td>"
@@ -3461,10 +3463,10 @@ def _render_data_track_dau_page(payload: dict) -> str:
         f"最大值 {_fmt_duration_sec(histogram.get('max_sec'))}"
     )
     metrics = "".join([
-        _render_metric("latest DAU", summary["latest_dau"]),
+        _render_metric("latest DAU · 打开App", summary["latest_dau"]),
         _render_metric("latest day", summary.get("latest_day") or "n/a"),
-        _render_metric("max DAU", summary["max_dau"]),
-        _render_metric("avg DAU", f"{summary['avg_dau']:.1f}"),
+        _render_metric("max DAU · 打开App", summary["max_dau"]),
+        _render_metric("avg DAU · 打开App", f"{summary['avg_dau']:.1f}"),
         _render_metric("user messages", summary["user_messages"]),
         _render_metric("tracking events", summary["tracking_events"]),
     ])
@@ -3528,10 +3530,10 @@ def _render_data_track_dau_page(payload: dict) -> str:
     {_cutover_html}
   </div>
   <div class="muted">{html.escape(definition.get("dau") or "")} {html.escape(definition.get("excluded") or "")}</div>
-  <div class="muted">使用DAU=当天有 app 后台上报（app_session_end 事件）的用户数；人均日使用时长=当天总前台时长÷使用DAU（均值，会被少数重度用户拉高）；中位数日使用时长=每个用户当天前台总时长的中位数（典型用户实际用了多久，不被少数重度用户拉高，和均值并看更可信）——冻结快照只存聚合值，改动前已冻结的历史天显示"-"；会话数=当天 app_session_end 事件数（含大量前后台切换的微会话）。前台被强杀会漏报，略偏低估。均按北京日。</div>
+  <div class="muted"><b>DAU = 使用 DAU</b>=当天<b>真正打开过 App</b> 的用户数（有 app_session_end 前台会话）；此列已冻结进快照，历史天一致。<b>Chat DAU</b>=当天发过用户消息的人；<b>Tracking DAU</b>=当天有任意 tracking 事件的人（含后台/proactive 遥测，口径最松、仅作拆分参考——旧的「广义 DAU」就等于它，已去掉）。人均日使用时长=当天总前台时长÷DAU；中位数=每用户当天前台总时长的中位数（典型用户，和均值并看更可信）；会话数=app_session_end 事件数（含大量前后台切换微会话）。前台被强杀会漏报，略偏低估。均按北京日。<b>留存/增长也改用此 DAU（打开 App）口径</b>。</div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
   <table>
-    <thead><tr><th>Beijing day</th><th>状态</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>使用DAU</th><th>人均日使用时长</th><th>中位数日使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
+    <thead><tr><th>Beijing day</th><th>状态</th><th>DAU(打开App)</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>人均日使用时长</th><th>中位数日使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='13' class='muted'>No DAU activity in this range.</td></tr>"}</tbody>
   </table>
   {load_more_html}
@@ -3834,7 +3836,7 @@ def _render_data_track_growth_page(payload: dict) -> str:
     <b>⚠️ 口径与已知偏差</b><br>
     {boundary}<br>
     留存为<b>日 cohort · 经典 Day-N</b>(行=注册北京日,列 D_N=注册后第 N 天仍活跃的占比;D0=100% 定义上省略);<b>—</b>=该 cohort 距今不足 N 天、还判不了,不算 0。分母=当天注册人数。<br>
-    <b>用户基数极小</b> → 曲线抖动大,当方向性参考,非统计显著。<b>③ 完全自部署</b>用户不在此表(不在我们后端注册)。"活跃"=当天有用户消息或 app tracking 事件,口径同 DAU。
+    <b>用户基数极小</b> → 曲线抖动大,当方向性参考,非统计显著。<b>③ 完全自部署</b>用户不在此表(不在我们后端注册)。<b>"活跃"=使用 DAU=当天真打开过 App(app_session_end)</b>,不含只有后台/proactive 遥测的用户。
   </div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
   <h2>用户增长(新增 + 累计)</h2>
@@ -3846,7 +3848,7 @@ def _render_data_track_growth_page(payload: dict) -> str:
   <div class="muted" style="margin-bottom:8px">Y 轴为对数刻度:<b>直线=指数增长</b>,<b>上弯=加速</b>,<b>下弯=放缓</b>。全量累计(注册即计,不受冻结边界限制)。</div>
   {growth_curve}
   <h2>Growth Accounting · 每日(新增/回流/留存/流失 + Quick Ratio)</h2>
-  <div class="muted" style="margin-bottom:8px">活跃=当天有用户消息或 tracking(同 DAU)。<b>新增</b>=当天注册;<b>回流</b>=今天活跃、之前注册过、但昨天没活跃;<b>留存</b>=今昨都活跃;<b>流失</b>=昨天活跃今天没(负);<b>Quick Ratio</b>=(新增+回流)/流失,&gt;1 才是净增长。首日为基线无环比。仅冻结边界 {_freeze} 起。</div>
+  <div class="muted" style="margin-bottom:8px">活跃=使用 DAU=当天真打开过 App(app_session_end)。<b>新增</b>=当天注册;<b>回流</b>=今天活跃、之前注册过、但昨天没活跃;<b>留存</b>=今昨都活跃;<b>流失</b>=昨天活跃今天没(负);<b>Quick Ratio</b>=(新增+回流)/流失,&gt;1 才是净增长。首日为基线无环比。仅冻结边界 {_freeze} 起。</div>
   <table>
     <thead><tr><th>Beijing day</th><th>活跃</th><th>新增</th><th>回流</th><th>留存</th><th>流失</th><th>Quick Ratio</th></tr></thead>
     <tbody>{''.join(acct_rows) if acct_rows else "<tr><td colspan='7' class='muted'>暂无足够天数做增长核算</td></tr>"}</tbody>

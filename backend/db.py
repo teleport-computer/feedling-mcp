@@ -2238,12 +2238,12 @@ def admin_data_track_retention_daily(
                            (timezone(%s, to_timestamp(a.ts)))::date AS act_day
                     FROM reg r
                     JOIN (
-                        SELECT user_id, ts FROM chat_messages
-                          WHERE doc->>'role' = 'user'
-                            AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
-                        UNION ALL
+                        -- "使用 DAU": genuinely opened the app (an app_session_end
+                        -- foreground session), NOT the broad chat∪tracking DAU that
+                        -- also counts proactive/background telemetry.
                         SELECT user_id, ts FROM user_logs
-                          WHERE stream = 'tracking_events' AND ts IS NOT NULL
+                          WHERE stream = 'tracking_events'
+                            AND doc->>'type' = 'app_session_end' AND ts IS NOT NULL
                     ) a ON a.user_id = r.user_id
                 )
                 SELECT to_char(cohort_key, 'YYYY-MM-DD') AS cohort,
@@ -2307,12 +2307,10 @@ def admin_data_track_growth_accounting(
                 SELECT DISTINCT user_id,
                        (timezone(%s, to_timestamp(ts)))::date AS d
                 FROM (
-                    SELECT user_id, ts FROM chat_messages
-                      WHERE doc->>'role' = 'user'
-                        AND COALESCE(doc->>'source', '') NOT IN ('verify_ping', 'resident_maintenance')
-                    UNION ALL
+                    -- "使用 DAU": app_session_end foreground sessions only.
                     SELECT user_id, ts FROM user_logs
-                      WHERE stream = 'tracking_events' AND ts IS NOT NULL
+                      WHERE stream = 'tracking_events'
+                        AND doc->>'type' = 'app_session_end' AND ts IS NOT NULL
                 ) a
                 WHERE (timezone(%s, to_timestamp(ts)))::date >= %s::date
                 """,
