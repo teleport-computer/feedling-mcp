@@ -31,7 +31,7 @@ DEFAULT_ROWS = 3_000_000
 DEFAULT_USERS = 2_000
 DEFAULT_RUNS = 5
 DEFAULT_HISTORY_DAYS = 365
-P95_BUDGET_MS = 2_000.0
+P95_BUDGET_MS = 3_000.0
 ROLLUP_TABLES = (
     "v2_usage_daily_users",
     "v2_usage_daily_dimensions",

@@ -15,7 +15,7 @@
 - All source timestamps are UTC. Presentation defaults to `Asia/Shanghai`; custom windows are half-open `[start_at_utc, end_at_utc)` and at most 366 days.
 - Provider/model/lane/user filters must use bound SQL parameters. Never render prompt, reply, tool input/output, credential, or outbox payload content.
 - Keep the existing Runtime Health summary, lane token totals, delivery health, and per-user delivery reliability. Remove only the per-user token/model table from that page.
-- Use direct queries first. Add a rollup only if the required 10x-data 90-day `EXPLAIN (ANALYZE, BUFFERS)` proof cannot satisfy p95 under two seconds after index tuning.
+- Use direct queries first. Add a rollup only if the required 10x-data 90-day `EXPLAIN (ANALYZE, BUFFERS)` proof cannot satisfy p95 under three seconds after index tuning. This threshold was explicitly approved by the user on 2026-08-03 for the real rolling 90-day, 3M-row unfiltered and provider/model-filtered gate; default-on, fail-open, current-RDS-only, and no-new-infrastructure constraints remain unchanged.
 - Every implementation commit names only the files changed by that task with `git commit --only`, so unrelated workspace changes cannot leak into the PR.
 
 ---
@@ -78,7 +78,7 @@
 - Review: `docs/superpowers/specs/2026-08-01-admin-runtime-user-token-report-design.md` for consistency; leave unchanged when it already matches the delivered split
 
 - [ ] Add a deterministic 10x-volume fixture or repository-supported load harness and record `EXPLAIN (ANALYZE, BUFFERS)` for the worst 90-day unfiltered and provider/model-filtered queries. Assert the expected index/range predicates and no accidental content column reads.
-- [ ] Measure at least five warmed executions and record p50/p95 in PR #146. If p95 is at least two seconds, tune/index and repeat; if still over budget, implement a current-RDS rollup in this PR with an idempotent watermark and reconciliation test before declaring P0-A complete.
+- [ ] Measure at least five warmed executions and record p50/p95 in PR #146. If p95 is at least three seconds, tune/index and repeat; if still over budget, implement a current-RDS rollup in this PR with an idempotent watermark and reconciliation test before declaring P0-A complete.
 - [ ] Run `pytest -q tests/test_admin_usage.py tests/test_data_track.py tests/test_data_track_runtime_view.py tests/test_v2_runtime_health.py tests/test_v2_jobs_migration.py`.
 - [ ] Run the repository's full non-API test command with `FEEDLING_TEST_PG`; compare any failures with untouched `test` and link baseline evidence in the PR rather than hiding failures.
 - [ ] Inspect `git diff test...HEAD`, verify no public API/OpenAPI change and no infrastructure/config dependency, then commit the exact changed test paths with message `test(admin): verify usage report scale`.
@@ -125,6 +125,6 @@
 ### Task 4D: Repeat the final 3M gate and finish PR #146
 
 - [ ] Run the checked-in scale harness against the production implementation, not prototype TEMP/UNLOGGED tables. Record source/rollup rows and size, all five warmed default and provider/model-filtered timings, p50/p95, exact latency cost, and key EXPLAIN nodes/buffers.
-- [ ] Require default and filtered 90-day p95 below two seconds. If either fails, do not push or claim P0-A complete.
+- [ ] Require default and filtered rolling 90-day p95 below three seconds. If either fails, do not push or claim P0-A complete.
 - [ ] Run the complete P0-A related suites, full repository non-API suite, Ruff/compile/diff checks, dependency direction tests, and compare baseline failures.
 - [ ] Verify test/prod RDS PostgreSQL compatibility read-only, inspect `test...HEAD` for public API/docs/infrastructure scope, then push and update PR #146 with architecture, fail-open, deletion, freshness, performance, and test evidence.

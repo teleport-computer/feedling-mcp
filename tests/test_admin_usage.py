@@ -68,6 +68,14 @@ def test_admin_usage_scale_harness_self_check():
     }
 
 
+def test_admin_usage_scale_uses_approved_three_second_p95_budget():
+    harness = _load_usage_scale_harness()
+
+    assert harness.P95_BUDGET_MS == 3_000.0
+    assert 2_999.999 < harness.P95_BUDGET_MS
+    assert not 3_000.0 < harness.P95_BUDGET_MS
+
+
 def test_admin_usage_scale_uses_rolling_90d_partition_and_dedicated_local_db():
     harness = _load_usage_scale_harness()
 

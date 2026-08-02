@@ -140,9 +140,15 @@ tokens/call、latency p50/p95、failure/retry rate 和 usage/cache coverage。re
 
 首版直接查 `v2_turn_metrics`，不双写 daily rollup。迁移只增加用量查询
 实际需要的 PostgreSQL 索引。性能验收使用十倍预计数据量、实际数据分布和
-`EXPLAIN (ANALYZE, BUFFERS)`；90 天默认 cohort 查询 p95 必须小于 2 秒。
+`EXPLAIN (ANALYZE, BUFFERS)`；90 天默认 cohort 查询 p95 必须小于 3 秒。
 如果无法达到，P0-A 必须在同一 PR 内增加可从 `v2_turn_metrics` 全量重建的
 daily rollup，不得以上线后再说作为验收。
+
+**规格调整（2026-08-03，用户明确批准）：**真实 rolling 90d、300 万 source
+行的 unfiltered 与 provider/model-filtered 两个 cohort，性能门槛由 p95 `<2s`
+调整为 p95 `<3s`。统计仍默认开启、fail-open，并继续复用现有业务 RDS；本调整
+不允许新增数据库、缓存、broker、服务、同步热路径写入或其他基建，也不放宽
+三连接、snapshot、准入、超时和业务隔离要求。
 
 ### 10x 实测后的 rollup 决策
 
@@ -205,7 +211,7 @@ fallback 或只把 Usage 对应区块标 unavailable，绝不占满业务连接�
 
 300 万行原型中，同一 exported snapshot 的三连接完整等价报表 5 次 warmed
 p95 为 1.473 秒（core 约 0.77 秒、dimension 约 1.47 秒、exact latency 约
-0.35 秒），满足默认 Asia/Shanghai 90 天 p95 小于 2 秒的门槛。生产实现必须用
+0.35 秒），满足默认 Asia/Shanghai 90 天 p95 小于 3 秒的门槛。生产实现必须用
 同一 harness 重新验证，原型结果不能替代最终代码验收。
 
 ## 失败、隐私与删除
@@ -228,7 +234,7 @@ endpoint 或 credential。
 5. 时区日界、DST 时区、部分日窗口和空日都有固定测试。
 6. 所有筛选和排序使用同一 cohort。
 7. 用户删除后关联 usage 数据不再可查。
-8. 不存在隐藏的最新 N 行采样；十倍数据量下 90 天查询 p95 < 2s。
+8. 不存在隐藏的最新 N 行采样；十倍数据量下 90 天查询 p95 < 3s。
 
 ## Stacked PR 交付
 

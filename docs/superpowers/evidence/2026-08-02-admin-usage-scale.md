@@ -2,12 +2,17 @@
 
 ## Outcome
 
-The production Admin Hosted V2 Usage report passes the 2,000 ms p95 gate at
+The production Admin Hosted V2 Usage report passes the 3,000 ms p95 gate at
 the required 3,000,000-row source scale. The fresh, unfiltered 90-day report
 measured **1,856.380 ms p95**; the provider/model-filtered report measured
 **1,311.303 ms p95**. Both results came from the real
 `usage_report_snapshot()` entry point after bootstrapping the production rollup
 tables from an empty, migrated database.
+
+The real rolling 90-day, 3M-row gate was amended from p95 `<2s` to p95 `<3s`
+with explicit user approval on 2026-08-03. The report remains default-on and
+fail-open on the existing business RDS, with no new infrastructure or hot-path
+write introduced by this threshold adjustment.
 
 Machine-readable samples, coverage metadata, relation sizes, captured SQL
 plans, and cleanup counts are in
@@ -21,8 +26,8 @@ maximum measured value.
 
 | Cohort | Measured samples (ms) | p50 | p95 | Budget |
 |---|---|---:|---:|---:|
-| Unfiltered | 1856.258, 1846.012, 1847.883, 1838.799, 1856.380 | 1847.883 | **1856.380** | < 2000 |
-| `openrouter/openai/gpt-4o-mini` | 1285.730, 1295.001, 1288.769, 1311.303, 1303.678 | 1295.001 | **1311.303** | < 2000 |
+| Unfiltered | 1856.258, 1846.012, 1847.883, 1838.799, 1856.380 | 1847.883 | **1856.380** | < 3000 |
+| `openrouter/openai/gpt-4o-mini` | 1285.730, 1295.001, 1288.769, 1311.303, 1303.678 | 1295.001 | **1311.303** | < 3000 |
 
 The deterministic fixture contained 3,000,000 content-free
 `v2_turn_metrics` rows across 2,000 users and 365 days. The measured 90-day
