@@ -167,6 +167,11 @@ services:
       # has passed; TEE_DATABASE_URL uses the non-DDL app role.
       TEE_DATABASE_URL: "${TEE_DATABASE_URL:-}"
       FEEDLING_TEE_DUAL_WRITE: "${FEEDLING_TEE_DUAL_WRITE:-}"
+      # Pre rollout lane for PR #131. The backend defaults this gate OFF and
+      # accepts plaintext content shapes only for the exact value "1"; test and
+      # prod manifests intentionally omit it. Per-user intent still decides
+      # whether a known user is effective=off, and unknown users stay encrypted.
+      FEEDLING_PLAINTEXT_WRITES_ACCEPTED: "1"
       # Cloudflare R2 (S3-compatible) offload for the heavy frame ciphertext
       # (backend/object_storage.py). Injected via `phala deploy -e R2_*=...`
       # (encrypted env channel). Empty default = feature OFF (body_ct stays
