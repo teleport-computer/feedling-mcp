@@ -18,23 +18,24 @@ class _Store:
         return list(self._jobs)
 
 
-def _install_dream_blob(monkeypatch, initial=None):
-    blob = dict(initial or {})
+def _install_dream_blob(monkeypatch, initial=None, capture_initial=None):
+    blobs = {
+        dream_scheduler.DREAM_STATE_KIND: dict(initial or {}),
+        "capture_state": dict(capture_initial or {}),
+    }
 
     def fake_get_blob(user_id, kind):
         assert user_id == _Store.user_id
-        assert kind == dream_scheduler.DREAM_STATE_KIND
-        return dict(blob)
+        return dict(blobs.get(kind) or {})
 
     def fake_set_blob(user_id, kind, doc):
         assert user_id == _Store.user_id
-        assert kind == dream_scheduler.DREAM_STATE_KIND
-        blob.clear()
-        blob.update(doc)
+        blobs.setdefault(kind, {}).clear()
+        blobs[kind].update(doc)
 
     monkeypatch.setattr(dream_scheduler.db, "get_blob", fake_get_blob)
     monkeypatch.setattr(dream_scheduler.db, "set_blob", fake_set_blob)
-    return blob
+    return blobs[dream_scheduler.DREAM_STATE_KIND]
 
 
 def test_dream_completed_records_organized_and_merged_counts(monkeypatch):
@@ -64,6 +65,8 @@ def test_dream_completed_records_organized_and_merged_counts(monkeypatch):
         "last_completed_at": 1234.0,
         "organized_count": 4,
         "merged_count": 2,
+        "capture_completed_at": 0,
+        "capture_cards_added": 0,
     }
 
 
@@ -105,3 +108,21 @@ def test_dream_status_reports_active_dreaming(monkeypatch):
     assert status["last_completed_at"] == 3000.0
     assert status["organized_count"] == 7
     assert status["merged_count"] == 3
+    assert status["capture_completed_at"] == 0
+    assert status["capture_cards_added"] == 0
+
+
+def test_dream_status_includes_daily_capture_banner_fields(monkeypatch):
+    _install_dream_blob(
+        monkeypatch,
+        {},
+        capture_initial={
+            "last_capture_cards_added_at": 4321.0,
+            "last_capture_cards_added": 6,
+        },
+    )
+
+    status = proactive_core.dream_status(_Store())
+
+    assert status["capture_completed_at"] == 4321.0
+    assert status["capture_cards_added"] == 6

@@ -42,7 +42,15 @@ class _Store:
     user_id = "u1"
 
 
-def _run(tool_calls, *, turn_authorization, run_capability, enqueue_write_effect=None, monkeypatch):
+def _run(
+    tool_calls,
+    *,
+    turn_authorization,
+    run_capability,
+    enqueue_write_effect=None,
+    observe_photo=None,
+    monkeypatch,
+):
     monkeypatch.setattr(cap_registry, "run_capability", run_capability)
     calls = []
     if enqueue_write_effect is None:
@@ -52,6 +60,7 @@ def _run(tool_calls, *, turn_authorization, run_capability, enqueue_write_effect
         tool_calls, store=_Store(), api_key="k", runtime_token="rt",
         enclave_sem=asyncio.Semaphore(8), turn_authorization=turn_authorization,
         enqueue_write_effect=enqueue_write_effect,
+        observe_photo=observe_photo,
     )), calls
 
 
@@ -100,6 +109,94 @@ def test_one_read_exception_is_isolated_from_successful_sibling(monkeypatch):
     assert "sensitive adapter detail" not in results[0].content
     assert "web result" in results[1].content
     assert enqueued == []
+
+
+def test_photo_read_with_image_invokes_observer_and_hides_base64(monkeypatch):
+    seen = []
+
+    def _run_capability(*_args, **_kwargs):
+        return _FakeResult(True, {
+            "photo_id": "p1",
+            "has_image": True,
+            "image_media_type": "image/jpeg",
+            "image_b64": "cGl4ZWxz",
+        })
+
+    async def _observe_photo(mime, image_b64):
+        seen.append((mime, image_b64))
+        return "a red bicycle beside a wall"
+
+    results, enqueued = _run(
+        [ToolCall(
+            id="photo-1",
+            name="photo_read",
+            args={"photo_id": "p1", "include_image": True},
+        )],
+        turn_authorization=False,
+        run_capability=_run_capability,
+        observe_photo=_observe_photo,
+        monkeypatch=monkeypatch,
+    )
+
+    assert seen == [("image/jpeg", "cGl4ZWxz")]
+    assert "UNTRUSTED VISUAL OBSERVATION" in results[0].content
+    assert "a red bicycle beside a wall" in results[0].content
+    assert "cGl4ZWxz" not in results[0].content
+    assert "image_b64" not in results[0].content
+    assert enqueued == []
+
+
+def test_photo_read_without_include_image_never_invokes_observer(monkeypatch):
+    async def _observe_photo(*_args):
+        raise AssertionError("observer must remain pull-on-demand")
+
+    results, enqueued = _run(
+        [ToolCall(
+            id="photo-meta",
+            name="photo_read",
+            args={"photo_id": "p1"},
+        )],
+        turn_authorization=False,
+        run_capability=lambda *_a, **_k: _FakeResult(True, {"photo_id": "p1"}),
+        observe_photo=_observe_photo,
+        monkeypatch=monkeypatch,
+    )
+
+    assert "p1" in results[0].content
+    assert enqueued == []
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (type("RateLimited", (RuntimeError,), {"error_code": "vision_model_rate_limited"})(
+            "raw upstream response must not escape"
+        ), "error: vision_model_rate_limited"),
+        (RuntimeError("secret provider URL must not escape"), "error: vision_model_failed"),
+    ],
+)
+def test_photo_observer_failure_exposes_only_stable_code(monkeypatch, exc, expected):
+    async def _observe_photo(*_args):
+        raise exc
+
+    results, _ = _run(
+        [ToolCall(
+            id="photo-error",
+            name="photo_read",
+            args={"photo_id": "p1", "include_image": True},
+        )],
+        turn_authorization=False,
+        run_capability=lambda *_a, **_k: _FakeResult(True, {
+            "photo_id": "p1",
+            "image_media_type": "image/jpeg",
+            "image_b64": "cGl4ZWxz",
+        }),
+        observe_photo=_observe_photo,
+        monkeypatch=monkeypatch,
+    )
+
+    assert results[0].content == expected
+    assert str(exc) not in results[0].content
 
 
 def test_read_parallelism_is_bounded_by_configured_limit(monkeypatch):

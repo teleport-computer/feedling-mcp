@@ -12,6 +12,7 @@ Run:  python -m pytest tests/test_perception.py -q
 import json
 import sys
 import time
+import types
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -19,8 +20,15 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+import conftest
+import db
 import perception.service as service
+from perception import store as perception_store
 from perception import perception_read_core
+from core import store as core_store
+from core import wake_bus as core_wake_bus
+from hosted import config_store as hosted_config_store
+from model_api_runtime.v2 import jobs_store
 
 
 # The Flask /v1/perception/* blueprint was deleted in the ASGI cutover; this tiny
@@ -190,6 +198,138 @@ UID = "u1"
 
 # ---------------------------------------------------------------------------
 
+def test_v2_perception_wake_uses_agent_jobs_instead_of_legacy_queue(monkeypatch):
+    legacy_jobs = []
+    enqueued = []
+    notified = []
+    user_store = types.SimpleNamespace(
+        proactive_activation_ready=lambda: True,
+        append_proactive_job=lambda job: legacy_jobs.append(job),
+    )
+    monkeypatch.setattr(core_store, "get_store", lambda _uid: user_store)
+    monkeypatch.setattr(
+        hosted_config_store,
+        "get_hosted_runtime_mode_strict",
+        lambda _store: hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2,
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "enqueue_job_with_context_log",
+        lambda uid, lane, **kwargs: (
+            enqueued.append((uid, lane, kwargs)),
+            (123, False),
+        )[1],
+    )
+    monkeypatch.setattr(
+        core_wake_bus,
+        "notify",
+        lambda channel, uid: notified.append((channel, uid)),
+    )
+    monkeypatch.setattr(service.store, "trim_v2_wake_context", lambda uid: None)
+    event = types.SimpleNamespace(
+        user_id="u_v2_perception",
+        wake_id="wake-perception-1",
+        source="perception_event",
+        trigger="arrived_at_anchor",
+        change_digest="location changed",
+        origin_refs=("device:1",),
+        presence_hints={},
+        payload={},
+        created_at=100.0,
+        manual=False,
+    )
+
+    service._fire_wake_event_v2(event)
+
+    assert enqueued == [(
+        "u_v2_perception",
+        "heartbeat",
+        {
+            "reason": "arrived_at_anchor",
+            "trace_id": "wake-perception-1",
+            "context_stream": perception_store.V2_WAKE_CONTEXT_STREAM,
+            "context_doc": {
+                "wake_id": "wake-perception-1",
+                "source": "perception_event",
+                "trigger": "arrived_at_anchor",
+                "change_digest": "location changed",
+                "origin_refs": ["device:1"],
+                "presence_hints": {},
+                "created_at": 100.0,
+            },
+            "context_ts": 100.0,
+        },
+    )]
+    assert notified == [("v2_jobs", "u_v2_perception")]
+    assert legacy_jobs == []
+
+
+def test_resident_perception_wake_keeps_legacy_queue(monkeypatch):
+    legacy_jobs = []
+    user_store = types.SimpleNamespace(
+        proactive_activation_ready=lambda: True,
+        append_proactive_job=lambda job: legacy_jobs.append(job),
+    )
+    monkeypatch.setattr(core_store, "get_store", lambda _uid: user_store)
+    monkeypatch.setattr(
+        hosted_config_store,
+        "get_hosted_runtime_mode_strict",
+        lambda _store: hosted_config_store.HOSTED_RUNTIME_MODE_RESIDENT,
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "enqueue_job",
+        lambda *_args, **_kwargs: pytest.fail("resident wake entered V2 queue"),
+    )
+    event = types.SimpleNamespace(
+        user_id="u_resident_perception",
+        wake_id="wake-resident-1",
+        source="perception_event",
+        trigger="photo_added",
+        change_digest="photo changed",
+        origin_refs=("photo:1",),
+        presence_hints={},
+        payload={},
+        created_at=100.0,
+        manual=False,
+    )
+
+    service._fire_wake_event_v2(event)
+
+    assert len(legacy_jobs) == 1
+    assert legacy_jobs[0]["trigger"] == "photo_added"
+
+
+def test_v2_wake_context_store_keeps_coalesced_events_in_order():
+    uid = "u_perception_wake_context"
+    conftest.seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM user_logs WHERE user_id=%s AND stream=%s",
+            (uid, perception_store.V2_WAKE_CONTEXT_STREAM),
+        )
+
+    perception_store.append_v2_wake_context(
+        uid,
+        321,
+        {"wake_id": "w1", "trigger": "photo_added"},
+        ts=10.0,
+    )
+    perception_store.append_v2_wake_context(
+        uid,
+        321,
+        {"wake_id": "w2", "trigger": "arrived_at_anchor"},
+        ts=11.0,
+    )
+
+    rows = perception_store.read_v2_wake_context(uid, 321)
+
+    assert [row["wake_id"] for row in rows] == ["w1", "w2"]
+    assert all(row["agent_job_id"] == 321 for row in rows)
+
+
+# ---------------------------------------------------------------------------
+
 def _item(key, obj, message=""):
     """Build one context_snapshot item; obj=None -> data:"null"."""
     return {"key": key, "data": ("null" if obj is None else json.dumps(obj)), "message": message}
@@ -263,6 +403,22 @@ def test_admin_perception_freshness_reports_fresh_stale_and_never(env):
     fake.state[UID]["motion_state"]["ts"] = now - 10_000
     by2 = {f["field"]: f for f in service.admin_perception_freshness(UID, now=now)["fields"]}
     assert by2["motion_state"]["reported"] and not by2["motion_state"]["fresh"]  # stale
+
+
+def test_admin_perception_freshness_reports_app_open_and_close_timestamps_only(env):
+    fake, _ = env
+    now = time.time()
+    fake.append_app_open(UID, {"app": "private-open", "ts": now - 30}, now - 30)
+    fake.append_app_close(UID, {"app": "private-close", "ts": now - 10}, now - 10)
+
+    freshness = service.admin_perception_freshness(UID, now=now)
+
+    assert freshness["recent_app_open_ts"] == now - 30
+    assert freshness["recent_app_open_age_sec"] == 30
+    assert freshness["recent_app_close_ts"] == now - 10
+    assert freshness["recent_app_close_age_sec"] == 10
+    assert "private-open" not in str(freshness)
+    assert "private-close" not in str(freshness)
 
 
 def test_snapshot_timezone_survives_ttl_but_local_time_expires(env):

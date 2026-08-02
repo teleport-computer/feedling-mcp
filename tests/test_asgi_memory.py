@@ -409,7 +409,13 @@ def test_actions_unsupported_type_parity(user):
     body = {"actions": [{"type": "memory.bogus"}]}
     f, a = _both("POST", "/v1/memory/actions", api_key=api_key, json_body=body)
     assert f == a
+    # Both stacks preserve the complete per-item result, but a zero-applied
+    # batch with a failure restores the outer HTTP failure signal.
     assert f[0] == 400
+    assert f[1]["status"] == "failed"
+    assert f[1]["error"] == "unsupported_memory_action"
+    assert f[1]["failed_count"] == 1
+    assert f[1]["results"][0]["http_status"] == 400
     assert f[1]["results"][0]["error"] == "unsupported_memory_action"
 
 

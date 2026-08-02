@@ -372,3 +372,64 @@ def test_pending_job_count_counts_pending_agent_jobs():
     before = jobs_store.pending_job_count()
     jobs_store.enqueue_job("u_tm_3", "chat", reason="t")
     assert jobs_store.pending_job_count() == before + 1
+
+
+def test_flush_backfills_exhaustion_count_from_terminal_status():
+    """终态 status 说明 exhaustion 发生过；分散埋点漏记时，flush 必须兜底。
+
+    prod 实证：status='turn_failed:prompt_frontier_exhausted' 的行
+    prompt_frontier_exhaustion_count 仍为 0，导致该计数器不可用于判断
+    「有没有触发过」。
+    """
+    from model_api_runtime.v2 import worker as v2_worker
+
+    seed_user("u_tm_exh")
+    tm = v2_worker.TurnMetrics(job_id=910001, user_id="u_tm_exh", lane="chat")
+    assert tm.prompt_frontier_exhaustion_count == 0
+    tm.flush(failed=True, status="turn_failed:prompt_frontier_exhausted")
+
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT prompt_frontier_exhaustion_count, status "
+            "FROM v2_turn_metrics WHERE job_id=%s",
+            (910001,),
+        ).fetchone()
+    assert row is not None, "flush 必须落一行 metrics"
+    assert row[0] == 1, f"终态 status={row[1]} 却记了 {row[0]} 次 exhaustion"
+
+
+def test_flush_does_not_invent_exhaustion_for_unrelated_status():
+    """兜底只认 exhaustion 终态，绝不给普通失败凭空记一次。"""
+    from model_api_runtime.v2 import worker as v2_worker
+
+    seed_user("u_tm_exh2")
+    tm = v2_worker.TurnMetrics(job_id=910002, user_id="u_tm_exh2", lane="chat")
+    tm.flush(failed=True, status="turn_failed:providererror")
+
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT prompt_frontier_exhaustion_count FROM v2_turn_metrics "
+            "WHERE job_id=%s",
+            (910002,),
+        ).fetchone()
+    assert row[0] == 0
+
+
+def test_flush_preserves_a_real_recorded_count():
+    """已经埋点记过的真实次数不能被兜底覆盖成 1。"""
+    from model_api_runtime.v2 import worker as v2_worker
+
+    seed_user("u_tm_exh3")
+    tm = v2_worker.TurnMetrics(job_id=910003, user_id="u_tm_exh3", lane="chat")
+    tm.record_prompt_frontier_exhaustion()
+    tm.record_prompt_frontier_exhaustion()
+    tm.record_prompt_frontier_exhaustion()
+    tm.flush(failed=True, status="turn_failed:prompt_frontier_exhausted")
+
+    with db.get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT prompt_frontier_exhaustion_count FROM v2_turn_metrics "
+            "WHERE job_id=%s",
+            (910003,),
+        ).fetchone()
+    assert row[0] == 3

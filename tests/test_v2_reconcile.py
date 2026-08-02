@@ -36,7 +36,9 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def pg_clean():
+def pg_clean(monkeypatch):
+    # These exact catch-up queue shapes specify the profile-off contract.
+    monkeypatch.setenv("FEEDLING_V2_PROFILE_ENABLED", "0")
     with db.get_pool().connection() as conn:
         conn.execute(
             "TRUNCATE chat_messages, agent_jobs, v2_runtime_state, user_blobs, "

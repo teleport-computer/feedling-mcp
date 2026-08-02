@@ -12,13 +12,14 @@ All the generic machinery driven by catalog.py:
   - generic collection ingest/read kept for legacy Tier 2 health clients.
 
 No business logic lives in the assembly layer. The only upward coupling is a
-lazy import in _fire_wake_event_v2() (core.store / proactive.service) to
-enqueue a compatibility proactive job during cutover.
+lazy import in _fire_wake_event_v2(): resident users enqueue the compatibility
+proactive job, while pooled Runtime V2 users enqueue an ``agent_jobs`` wake.
 """
 from __future__ import annotations
 
 import logging
 import json
+import math
 import time
 from datetime import datetime
 from typing import Any, Callable, Mapping
@@ -719,6 +720,7 @@ def _submit_wake_event_v2_compat(event) -> None:
     store.append_event(event.user_id, {
         "cap": "runtime_v2",
         "type": "wake",
+        "wake_id": str(event.wake_id or ""),
         "source": event.source,
         "trigger": event.trigger,
         "change_digest": event.change_digest,
@@ -736,9 +738,42 @@ def _fire_wake_event_v2(event) -> None:
     try:
         from core import store as core_store  # lazy
         from core import util as core_util  # lazy
+        from core import wake_bus as core_wake_bus  # lazy
+        from hosted import config_store as hosted_config_store  # lazy
+        from model_api_runtime.v2 import jobs_store  # lazy
         from proactive import service as proactive_service  # lazy
         s = core_store.get_store(event.user_id)
         if not event.manual and not s.proactive_activation_ready():
+            return
+        # Strict fence before selecting the queue. A failed control-plane read
+        # must not silently strand a V2 event in resident ``proactive_jobs``.
+        runtime_mode = hosted_config_store.get_hosted_runtime_mode_strict(s)
+        if runtime_mode == hosted_config_store.HOSTED_RUNTIME_MODE_DB_ACTION_V2:
+            job_id, _ = jobs_store.enqueue_job_with_context_log(
+                event.user_id,
+                "heartbeat",
+                reason=str(event.trigger or event.source or "perception_event")[:120],
+                trace_id=str(event.wake_id or "")[:160] or None,
+                context_stream=store.V2_WAKE_CONTEXT_STREAM,
+                context_doc={
+                    "wake_id": str(event.wake_id or "")[:160],
+                    "source": str(event.source or "")[:120],
+                    "trigger": str(event.trigger or "")[:120],
+                    "change_digest": str(event.change_digest or "")[:2000],
+                    "origin_refs": [
+                        str(ref)[:200]
+                        for ref in list(event.origin_refs or ())[:10]
+                    ],
+                    "presence_hints": dict(event.presence_hints or {}),
+                    "created_at": float(event.created_at or _now()),
+                },
+                context_ts=float(event.created_at or _now()),
+            )
+            store.trim_v2_wake_context(event.user_id)
+            # A coalesced pending job may have been discovered only through a
+            # slow poll. Notify after every successful association so the new
+            # context is visible promptly; duplicate NOTIFY is harmless.
+            core_wake_bus.notify("v2_jobs", event.user_id)
             return
         job = {
             "job_id": core_util._new_public_id("pj"),
@@ -902,12 +937,74 @@ def _catalog_snapshot_fields(user_id: str, now: float | None = None, *, include_
     return snap
 
 
+def _merged_app_events(
+    user_id: str,
+    *,
+    now: float,
+    limit: int,
+    since_epoch: float = 0.0,
+) -> list[dict]:
+    """Project the two bounded app streams into one newest-first timeline."""
+    rows = [
+        (row, "open")
+        for row in (store.read_app_opens(
+            user_id, limit=limit, since_epoch=since_epoch
+        ) or [])
+    ]
+    rows.extend(
+        (row, "close")
+        for row in (store.read_app_closes(
+            user_id, limit=limit, since_epoch=since_epoch
+        ) or [])
+    )
+    events: list[dict] = []
+    for row, event in rows:
+        if not isinstance(row, dict):
+            continue
+        app = str(row.get("app") or "").strip()
+        if not app:
+            continue
+        try:
+            ts = float(row.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        category = row.get("category")
+        events.append({
+            "app": app,
+            "category": (str(category).strip() or None) if category else None,
+            "ts": ts,
+            "event": event,
+            "minutes_ago": round(max(0.0, now - ts) / 60.0, 1),
+        })
+    # Python's stable sort keeps an open immediately before a close when both
+    # streams report the exact same timestamp. The event names make that tie
+    # explicit to consumers; neither stream silently wins or overwrites it.
+    events.sort(key=lambda item: item["ts"], reverse=True)
+    return events[:limit] if limit > 0 else events
+
+
+def _snapshot_recent_app_events(user_id: str, now: float) -> list[dict]:
+    """App open/close events fresh under the app signal's own TTL contract."""
+    ttl_sec = float(catalog.SIGNALS["app"].ttl_sec)
+    cutoff = now - ttl_sec
+    # db.log_read uses ts > since_epoch, while snapshot freshness includes the
+    # exact TTL boundary. Step one float below the cutoff, then enforce >= here.
+    since_epoch = math.nextafter(cutoff, -math.inf) if cutoff > 0 else 0.0
+    events = _merged_app_events(
+        user_id, now=now, limit=0, since_epoch=since_epoch
+    )
+    return [event for event in events if event["ts"] >= cutoff]
+
+
 def snapshot(user_id: str, now: float | None = None) -> dict:
-    snap = _catalog_snapshot_fields(user_id, now, include_query_tools=False)
+    now_epoch = _now() if now is None else float(now)
+    snap = _catalog_snapshot_fields(user_id, now_epoch, include_query_tools=False)
     # user_state is always present (manual default if nothing set).
     snap["user_state"] = effective_user_state(user_id)
-    # recent_apps folds the old /app_usage read; capped to keep snapshot small.
+    # Keep the legacy open-only field unchanged, and expose the merged fresh
+    # trajectory separately so existing snapshot consumers do not change shape.
     snap["recent_apps"] = store.read_app_opens(user_id, limit=catalog.RECENT_APPS_LIMIT)
+    snap["recent_app_events"] = _snapshot_recent_app_events(user_id, now_epoch)
     return snap
 
 
@@ -917,7 +1014,10 @@ def pull_snapshot(user_id: str, now: float | None = None) -> dict:
     This includes query_tool capabilities such as weather/health without adding
     them to the cheap wake-attached `perception.now` snapshot.
     """
-    return _catalog_snapshot_fields(user_id, now, include_query_tools=True)
+    now_epoch = _now() if now is None else float(now)
+    snap = _catalog_snapshot_fields(user_id, now_epoch, include_query_tools=True)
+    snap["recent_app_events"] = _snapshot_recent_app_events(user_id, now_epoch)
+    return snap
 
 
 def admin_perception_freshness(user_id: str, now: float | None = None) -> dict:
@@ -964,15 +1064,20 @@ def admin_perception_freshness(user_id: str, now: float | None = None) -> dict:
                 "fresh": fresh,
             })
     fields.sort(key=lambda r: (r["capability"], r["field"]))
-    apps = store.read_app_opens(user_id, limit=1)
-    try:
-        last_app_ts = float(apps[0].get("ts") or 0) if (apps and isinstance(apps[0], dict)) else 0.0
-    except (TypeError, ValueError):
-        last_app_ts = 0.0
+    def _last_ts(rows: list[dict]) -> float:
+        try:
+            return float(rows[0].get("ts") or 0) if (rows and isinstance(rows[0], dict)) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    last_app_open_ts = _last_ts(store.read_app_opens(user_id, limit=1))
+    last_app_close_ts = _last_ts(store.read_app_closes(user_id, limit=1))
     return {
         "fields": fields,
-        "recent_app_open_ts": last_app_ts or None,
-        "recent_app_open_age_sec": int(now - last_app_ts) if last_app_ts else None,
+        "recent_app_open_ts": last_app_open_ts or None,
+        "recent_app_open_age_sec": int(now - last_app_open_ts) if last_app_open_ts else None,
+        "recent_app_close_ts": last_app_close_ts or None,
+        "recent_app_close_age_sec": int(now - last_app_close_ts) if last_app_close_ts else None,
     }
 
 
@@ -1237,7 +1342,7 @@ def app_close(user_id: str, app: str, category: str | None = None,
 
 
 def app_history_denied_reason(user_id: str) -> str:
-    """"" when app-open history is readable, else the disable reason.
+    """Return "" when app-event history is readable, else the disable reason.
 
     Fail-closed on a settings read error: if we cannot prove the user still
     allows `app`, we do not hand over their usage trajectory.
@@ -1252,13 +1357,12 @@ def app_history_denied_reason(user_id: str) -> str:
 
 def recent_apps(user_id: str, *, limit: int | None = None, hours: float | None = None,
                 now: float | None = None) -> dict:
-    """Recent app-open history for an explicit agent pull.
+    """Recent app open/close history for an explicit agent pull.
 
-    Reads the SAME ``app_usage`` stream the wake snapshot folds in (no second
-    store). Newest first, each entry projected to exactly {app, category, ts,
-    minutes_ago} — the raw log row is never passed through, so nothing the
-    ingest wrote can leak into a model prompt. No data -> an explicit empty
-    list, never a guess.
+    Merges the existing bounded open and close streams. Newest first, each entry
+    is projected to exactly {app, category, ts, event, minutes_ago} — the raw log
+    row is never passed through, so nothing else the ingest wrote can leak into
+    a model prompt. No data -> an explicit empty list, never a guess.
 
     Authorization is enforced HERE, not at the callers: the dedicated route,
     the signal path and the V2 executor adapter all funnel through this
@@ -1276,25 +1380,7 @@ def recent_apps(user_id: str, *, limit: int | None = None, hours: float | None =
     limit = max(1, min(int(limit), catalog.RECENT_APPS_TOOL_MAX))
     since = (now - hours * 3600.0) if hours else 0.0
 
-    rows = store.read_app_opens(user_id, limit=limit, since_epoch=since) or []
-    entries = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        app = str(row.get("app") or "").strip()
-        if not app:
-            continue
-        try:
-            ts = float(row.get("ts") or 0.0)
-        except (TypeError, ValueError):
-            continue
-        category = row.get("category")
-        entries.append({
-            "app": app,
-            "category": (str(category).strip() or None) if category else None,
-            "ts": ts,
-            "minutes_ago": round(max(0.0, now - ts) / 60.0, 1),
-        })
-    entries.sort(key=lambda e: e["ts"], reverse=True)
-    entries = entries[:limit]
+    entries = _merged_app_events(
+        user_id, now=now, limit=limit, since_epoch=since
+    )
     return {"ok": True, "apps": entries, "count": len(entries), "window_hours": hours}

@@ -17,6 +17,86 @@ def _store(user_id="u1"):
     return SimpleNamespace(user_id=user_id)
 
 
+def _run_pixel_probe(monkeypatch, reply):
+    route = {
+        "id": "r-thinking",
+        "credential_id": "c1",
+        "provider": "openai_compatible",
+        "model": "claude-opus-4-6-thinking",
+        "base_url": "https://relay.example/v1",
+        "api_key_envelope": {"body_ct": "ciphertext"},
+    }
+    marked = []
+    captured = {}
+    monkeypatch.setattr(
+        setup_core.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: b"provider-key",
+    )
+    monkeypatch.setattr(
+        setup_core.provider_client,
+        "list_provider_models",
+        lambda *_args: (_ for _ in ()).throw(
+            setup_core.provider_client.ProviderError(
+                "provider_http_405", status_code=405
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        setup_core,
+        "_vision_probe_image",
+        lambda: ("encoded-png", "red,green,blue,yellow"),
+    )
+
+    def complete(_config, _messages, **kwargs):
+        captured.update(kwargs)
+        return {"reply": reply}
+
+    monkeypatch.setattr(setup_core.provider_client, "chat_completion", complete)
+    monkeypatch.setattr(
+        setup_core.db,
+        "model_api_route_mark_vision_test",
+        lambda _uid, _rid, **kwargs: marked.append(kwargs) or True,
+    )
+    result = setup_core._run_route_vision_test_or_error(
+        _store(), route, "caller"
+    )
+    return result, marked, captured
+
+
+@pytest.mark.parametrize("reply", ["", "I cannot inspect that input."])
+def test_thinking_probe_without_color_reply_is_retryable_failure(monkeypatch, reply):
+    result, marked, captured = _run_pixel_probe(monkeypatch, reply)
+
+    body, status = result
+    assert status == 400
+    assert body == {
+        "error": "vision_model_empty_response",
+        "detail": "vision_model_empty_response",
+        "retryable": True,
+    }
+    assert marked == [{
+        "status": "failed",
+        "error": "vision_model_empty_response",
+    }]
+    assert captured["max_tokens"] == 2000
+    assert "warning" not in body
+    assert "banner" not in body
+
+
+def test_thinking_probe_nonempty_wrong_colors_are_unsupported(monkeypatch):
+    result, marked, _captured = _run_pixel_probe(monkeypatch, "red and purple")
+
+    body, status = result
+    assert status == 400
+    assert body["error"] == "vision_model_incompatible"
+    assert body["retryable"] is False
+    assert marked == [{
+        "status": "unsupported",
+        "error": "vision_model_incompatible",
+    }]
+
+
 def test_setup_vision_probe_kick_is_daemonized_and_nonblocking(
     monkeypatch,
     enable_setup_auto_vision_probe,
@@ -469,7 +549,7 @@ def test_dedicated_selection_rejects_failed_pixel_probe(monkeypatch):
     assert selected == []
 
 
-def test_explicit_catalog_image_support_uses_lightweight_connection_probe(monkeypatch):
+def test_catalog_image_declaration_cannot_override_hard_pixel_rejection(monkeypatch):
     marked = []
     route = {
         "id": "r1",
@@ -491,37 +571,61 @@ def test_explicit_catalog_image_support_uses_lightweight_connection_probe(monkey
             "models": [{"id": "vendor/vision", "input_modalities": ["text", "image"]}]
         },
     )
+    monkeypatch.setattr(
+        setup_core,
+        "_vision_probe_image",
+        lambda: ("encoded-png", "red,green,blue,yellow"),
+    )
     captured = {}
 
-    def complete(_config, messages, **_kwargs):
+    def complete(_config, messages, **kwargs):
         captured["content"] = messages[0]["content"]
-        captured["kwargs"] = _kwargs
-        return {"reply": ""}
+        captured["kwargs"] = kwargs
+        raise setup_core.provider_client.ProviderError(
+            "provider_http_415", status_code=415
+        )
 
+    events = []
     monkeypatch.setattr(setup_core.provider_client, "chat_completion", complete)
+    monkeypatch.setattr(
+        setup_core.debug_trace,
+        "trace_event",
+        lambda *_args, **kwargs: events.append(kwargs),
+    )
     monkeypatch.setattr(
         setup_core.db,
         "model_api_route_mark_vision_test",
         lambda _uid, _rid, **kwargs: marked.append(kwargs) or True,
     )
 
-    assert setup_core._run_route_vision_test_or_error(
+    body, status = setup_core._run_route_vision_test_or_error(
         _store(), route, "caller"
-    ) is None
-    assert isinstance(captured["content"], str)
-    assert captured["kwargs"]["require_reply"] is False
-    assert captured["kwargs"]["max_tokens"] == 1
-    assert marked == [{"status": "ok"}]
+    )
+    assert status == 400
+    assert body["error"] == "vision_model_incompatible"
+    assert isinstance(captured["content"], list)
+    assert captured["kwargs"]["max_tokens"] == 2000
+    assert marked == [{
+        "status": "unsupported",
+        "error": "vision_model_incompatible",
+    }]
+    assert events[0]["detail"] == {
+        "provider": "openrouter",
+        "model": "vendor/vision",
+        "declared": ["text", "image"],
+        "probed": "unsupported",
+    }
+    assert "base_url" not in events[0]["detail"]
 
 
-def test_deepseek_text_only_catalog_rejects_visual_route_without_model_call(monkeypatch):
+def test_catalog_text_only_declaration_cannot_override_successful_pixel_probe(monkeypatch):
     marked = []
     route = {
         "id": "r1",
         "credential_id": "c1",
-        "provider": "deepseek",
-        "model": "deepseek-v4-flash",
-        "base_url": "https://api.deepseek.com",
+        "provider": "openrouter",
+        "model": "vendor/vision",
+        "base_url": "https://openrouter.ai/api/v1",
         "api_key_envelope": {"body_ct": "ciphertext"},
     }
     monkeypatch.setattr(
@@ -534,7 +638,7 @@ def test_deepseek_text_only_catalog_rejects_visual_route_without_model_call(monk
         "list_provider_models",
         lambda *_args: {
             "models": [{
-                "id": "deepseek-v4-flash",
+                "id": "vendor/vision",
                 "input_modalities": ["text"],
             }],
             "complete": True,
@@ -542,11 +646,23 @@ def test_deepseek_text_only_catalog_rejects_visual_route_without_model_call(monk
         },
     )
     monkeypatch.setattr(
+        setup_core,
+        "_vision_probe_image",
+        lambda: ("encoded-png", "red,green,blue,yellow"),
+    )
+    calls = []
+    monkeypatch.setattr(
         setup_core.provider_client,
         "chat_completion",
-        lambda *_args, **_kwargs: pytest.fail(
-            "text-only DeepSeek model must not run the connectivity probe"
-        ),
+        lambda _config, messages, **kwargs: calls.append((messages, kwargs)) or {
+            "reply": "red and yellow"
+        },
+    )
+    events = []
+    monkeypatch.setattr(
+        setup_core.debug_trace,
+        "trace_event",
+        lambda *_args, **kwargs: events.append(kwargs),
     )
     monkeypatch.setattr(
         setup_core.db,
@@ -554,19 +670,16 @@ def test_deepseek_text_only_catalog_rejects_visual_route_without_model_call(monk
         lambda _uid, _rid, **kwargs: marked.append(kwargs) or True,
     )
 
-    body, status = setup_core._run_route_vision_test_or_error(
+    assert setup_core._run_route_vision_test_or_error(
         _store(), route, "caller"
-    )
-
-    assert status == 400
-    assert body["error"] == "vision_model_incompatible"
-    assert marked == [{
-        "status": "unsupported",
-        "error": "Provider catalog reports a text-only model.",
-    }]
+    ) is None
+    assert isinstance(calls[0][0][0]["content"], list)
+    assert marked == [{"status": "ok"}]
+    assert events[0]["detail"]["probed"] == "ok"
+    assert events[0]["detail"]["declared"] == ["text"]
 
 
-def test_model_missing_from_complete_key_catalog_is_rejected_without_probe(monkeypatch):
+def test_model_missing_from_catalog_still_uses_authoritative_pixel_probe(monkeypatch):
     marked = []
     route = {
         "id": "r1",
@@ -587,9 +700,17 @@ def test_model_missing_from_complete_key_catalog_is_rejected_without_probe(monke
         lambda *_args: {"models": [{"id": "vendor/allowed", "input_modalities": ["image"]}]},
     )
     monkeypatch.setattr(
+        setup_core,
+        "_vision_probe_image",
+        lambda: ("encoded-png", "red,green,blue,yellow"),
+    )
+    calls = []
+    monkeypatch.setattr(
         setup_core.provider_client,
         "chat_completion",
-        lambda *_args, **_kwargs: pytest.fail("missing model must not be probed"),
+        lambda _config, messages, **kwargs: calls.append((messages, kwargs)) or {
+            "reply": "green,blue"
+        },
     )
     monkeypatch.setattr(
         setup_core.db,
@@ -597,13 +718,11 @@ def test_model_missing_from_complete_key_catalog_is_rejected_without_probe(monke
         lambda _uid, _rid, **kwargs: marked.append(kwargs) or True,
     )
 
-    body, status = setup_core._run_route_vision_test_or_error(
+    assert setup_core._run_route_vision_test_or_error(
         _store(), route, "caller"
-    )
-
-    assert status == 400
-    assert body["error"] == "vision_model_not_found"
-    assert marked == [{"status": "failed", "error": "vision_model_not_found"}]
+    ) is None
+    assert isinstance(calls[0][0][0]["content"], list)
+    assert marked == [{"status": "ok"}]
 
 
 def test_unknown_catalog_model_404_reports_incompatible_instead_of_missing(monkeypatch):
@@ -708,7 +827,7 @@ def test_missing_catalog_modalities_accepts_partial_image_recognition(monkeypatc
     assert captured["content"][1]["image_url"]["url"].startswith(
         "data:image/png;base64,"
     )
-    assert captured["kwargs"]["max_tokens"] == 256
+    assert captured["kwargs"]["max_tokens"] == 2000
     assert marked == [{"status": "ok"}]
 
 
@@ -760,7 +879,7 @@ def test_unavailable_catalog_endpoint_still_runs_real_image_probe(monkeypatch):
     assert len(probes) == 1
     assert isinstance(probes[0][0][0]["content"], list)
     assert probes[0][0][0]["content"][1]["type"] == "image_url"
-    assert probes[0][1]["max_tokens"] == 256
+    assert probes[0][1]["max_tokens"] == 2000
 
 
 def test_resident_probe_side_channel_hides_expected_and_pending_beats_old_ok(monkeypatch):

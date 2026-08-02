@@ -198,6 +198,7 @@ jobs:
         run: |
           python -m pytest \
             tests/test_ci_image_tag_width.py \
+            tests/test_deploy_yaml_strict.py \
             tests/test_hosted_runtime_policy.py \
             tests/test_dual_runtime_coexistence.py \
             tests/test_dual_runtime_send_routing.py \
@@ -250,15 +251,16 @@ jobs:
             tests/test_v2_extraction_memory_integration.py \
             -v
 
-  # The rollout switch is default-off, so ordinary CI cannot exercise its
-  # TurnDeps contract. Keep both states live until M6 removes the switch.
+  # Both rollout switches are default-off, so ordinary CI cannot exercise
+  # their combined contract. Keep every state pair live until M6 removes them.
   runtime-v2-compaction-matrix:
-    name: Runtime V2 compaction (deterministic=${{ matrix.deterministic }})
+    name: Runtime V2 rollout (det=${{ matrix.deterministic }}, profile=${{ matrix.profile_enabled }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         deterministic: ["0", "1"]
+        profile_enabled: ["0", "1"]
     services:
       postgres:
         image: postgres:16
@@ -290,18 +292,33 @@ jobs:
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
           FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: "${{ matrix.deterministic }}"
+          FEEDLING_V2_PROFILE_ENABLED: "${{ matrix.profile_enabled }}"
         run: |
           python -m pytest \
+            tests/test_chat_send_v2_enqueue.py \
+            tests/test_dual_runtime_flip_no_loss.py \
+            tests/test_dual_runtime_send_routing.py \
+            tests/test_hosted_runtime_policy.py \
+            tests/test_model_api_chat_send_routing.py \
+            tests/test_provider_prompt_cache.py \
             tests/test_v2_adaptive_tail.py \
             tests/test_v2_compaction.py \
             tests/test_v2_compaction_integration.py \
             tests/test_v2_compaction_cas_requeue.py \
+            tests/test_v2_context.py \
             tests/test_v2_p0_history_safety.py \
+            tests/test_v2_profile_lane.py \
+            tests/test_v2_profile_prompt.py \
+            tests/test_v2_profile_refresh.py \
+            tests/test_v2_profile_storage.py \
+            tests/test_v2_reconcile.py \
+            tests/test_v2_reconcile_sweeper.py \
             tests/test_v2_serve_worker.py \
             tests/test_v2_summary_frontier_store.py \
             tests/test_v2_summary_watermark_seq.py \
             tests/test_v2_wake_worker.py \
             tests/test_v2_worker.py \
+            tests/test_v2_worker_tool_loop.py \
             tests/test_v2_deterministic_compaction.py \
             -v
 
@@ -429,6 +446,7 @@ jobs:
               - 'deploy/pin-runtime-release.sh'
               - 'deploy/prod-cvm-id.txt'
               - 'deploy/prod-runner-cvm-ids.txt'
+              - 'deploy/list-prod-runner-cvm-ids.sh'
               - 'deploy/check-prod-runner-topology.sh'
               - 'deploy/check-v2-runner-fleet.py'
               - 'deploy/publish-compose-hash.sh'
@@ -1126,6 +1144,11 @@ jobs:
             echo "::error::DATABASE_URL secret is not set — backend has no datastore to connect to"
             exit 1
           fi
+          FEEDLING_EXPECTED_RUNNER_COUNT=$(deploy/list-prod-runner-cvm-ids.sh deploy/prod-runner-cvm-ids.txt | wc -l | tr -d '[:space:]')
+          if [ "$FEEDLING_EXPECTED_RUNNER_COUNT" -lt 1 ]; then
+            echo "::error::expected at least one production runner CVM"
+            exit 1
+          fi
           phala deploy \
             --api-token "$PHALA_CLOUD_API_KEY" \
             --cvm-id "$CVM_ID" \
@@ -1146,6 +1169,7 @@ jobs:
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
+            -e "FEEDLING_EXPECTED_RUNNER_COUNT=$FEEDLING_EXPECTED_RUNNER_COUNT" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
@@ -2077,10 +2101,8 @@ jobs:
       - name: Read prod runner CVM ids
         id: ids
         run: |
-          # one id per line; ignore blank lines and # comments
-          IDS=$(grep -vE '^[[:space:]]*(#|$)' deploy/prod-runner-cvm-ids.txt \
-            | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
-            | grep . || true)
+          # Canonical helper trims, ignores comments/blanks, and collapses duplicates.
+          IDS=$(deploy/list-prod-runner-cvm-ids.sh deploy/prod-runner-cvm-ids.txt)
           if [ -z "$IDS" ]; then
             echo "::error::deploy/prod-runner-cvm-ids.txt has no CVM ids — provision at least one runner CVM first"
             exit 1
@@ -2121,6 +2143,7 @@ jobs:
               --api-token "$PHALA_CLOUD_API_KEY" \
               --cvm-id "$CVM_ID" \
               -c deploy/docker-compose.phala.prod.runner.yaml \
+              -e "FEEDLING_RUNNER_CVM_ID=$CVM_ID" \
               -e "FEEDLING_API_URL=$FEEDLING_API_URL" \
               -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
               -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \

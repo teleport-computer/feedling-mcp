@@ -8,7 +8,9 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 _DATA_DIR = tempfile.mkdtemp(prefix="feedling-capture-trace-test-")
 os.environ.setdefault("FEEDLING_DATA_DIR", _DATA_DIR)
@@ -122,6 +124,57 @@ def test_record_capture_job_status_completed_zero_cards_is_legal_noop_wording(tm
     done = [e for e in events if e["type"] == "memory.capture.done"]
     assert len(done) == 1
     assert "没有可抓取的新记忆" in done[0]["explain"]
+
+
+def test_v1_capture_banner_accumulates_resets_and_ignores_noop(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch, "usr_capture_daily_v1")
+    store.save_proactive_settings({"timezone": "Asia/Shanghai"})
+    zone = ZoneInfo("Asia/Shanghai")
+
+    def completed(cards_added: int, until: str) -> dict:
+        return {
+            "job_kind": "memory_capture",
+            "status": "completed",
+            "cards_added": cards_added,
+            "capture_window": {
+                "until_message_id": until,
+                "until_ts": 1.0,
+            },
+        }
+
+    first_at = datetime(2026, 8, 1, 10, tzinfo=zone).timestamp()
+    second_at = datetime(2026, 8, 1, 22, tzinfo=zone).timestamp()
+    noop_at = datetime(2026, 8, 2, 8, tzinfo=zone).timestamp()
+    next_positive_at = datetime(2026, 8, 2, 9, tzinfo=zone).timestamp()
+
+    capture_scheduler.record_capture_job_status(
+        store, completed(2, "m1"), status="completed", now=first_at
+    )
+    state = capture_scheduler.load_capture_state(store)
+    assert state["last_capture_cards_added"] == 2
+    assert state["last_capture_cards_added_at"] == first_at
+
+    capture_scheduler.record_capture_job_status(
+        store, completed(3, "m2"), status="completed", now=second_at
+    )
+    state = capture_scheduler.load_capture_state(store)
+    assert state["last_capture_cards_added"] == 5
+    assert state["last_capture_cards_added_at"] == second_at
+
+    capture_scheduler.record_capture_job_status(
+        store, completed(0, "m3"), status="completed", now=noop_at
+    )
+    state = capture_scheduler.load_capture_state(store)
+    assert state["last_capture_cards_added"] == 5
+    assert state["last_capture_cards_added_at"] == second_at
+    assert state["last_capture_completed_at"] == noop_at
+
+    capture_scheduler.record_capture_job_status(
+        store, completed(1, "m4"), status="completed", now=next_positive_at
+    )
+    state = capture_scheduler.load_capture_state(store)
+    assert state["last_capture_cards_added"] == 1
+    assert state["last_capture_cards_added_at"] == next_positive_at
 
 
 def test_record_capture_job_status_skipped_emits_done_event_not_error(tmp_path, monkeypatch):

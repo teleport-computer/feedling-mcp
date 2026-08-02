@@ -150,11 +150,20 @@ async def vision_route_test(route_id: str, request: Request,
 async def vision_observe(request: Request, auth: AuthResult = Depends(require_auth)):
     payload = (await asgi_http.read_json_silent(request)) or {}
     caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    # Forward only a token already verified by require_auth. When runtime-token
+    # auth is disabled, auth_core deliberately ignores the raw header; do not
+    # resurrect an unverified credential for the enclave hop here.
+    caller_runtime_token = (
+        auth_core.extract_runtime_token(request.headers) or ""
+        if auth.runtime_token_claims is not None
+        else ""
+    )
     body, status = await threadpool.run_db(
         vision_observer.observe_pinned_message,
         auth.store,
         payload,
         caller_api_key=caller_api_key,
+        caller_runtime_token=caller_runtime_token,
     )
     return JSONResponse(body, status_code=status)
 

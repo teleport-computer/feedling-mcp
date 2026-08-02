@@ -7,6 +7,7 @@ hands a document to the blob CAS or its TEE mirror.
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ import logging
 import math
 import re
 import threading
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import db
 from core import envelope as core_envelope
@@ -313,6 +314,67 @@ def _update_profile_cas_from_expected(
     raise AssertionError("unreachable")
 
 
+async def update_profile_cas_async(
+    user_id: str,
+    recompute: Callable[[dict], Awaitable[dict]],
+) -> ProfileCasResult:
+    """Async-provider counterpart of :func:`update_profile_cas`.
+
+    A CAS loss awaits ``recompute`` again against the winning document. The
+    first provider result is never replayed with a new expected value.
+    """
+
+    expected_raw = await asyncio.to_thread(
+        db.get_blob_strict,
+        str(user_id),
+        PROFILE_BLOB_KIND,
+    )
+    expected = deepcopy(expected_raw) if isinstance(expected_raw, dict) else {}
+    recomputations = 0
+    for cas_attempt in (1, 2):
+        candidate = validate_profile_document(
+            await recompute(deepcopy(expected))
+        )
+        recomputations += 1
+        landed = await asyncio.to_thread(
+            db.set_blob_if_unchanged,
+            str(user_id),
+            PROFILE_BLOB_KIND,
+            expected,
+            candidate,
+            insert_if_missing=(expected == {}),
+        )
+        if landed:
+            return ProfileCasResult(
+                status="written",
+                document=candidate,
+                cas_attempts=cas_attempt,
+                recomputations=recomputations,
+            )
+        winner_raw = await asyncio.to_thread(
+            db.get_blob_strict,
+            str(user_id),
+            PROFILE_BLOB_KIND,
+        )
+        winner = deepcopy(winner_raw) if isinstance(winner_raw, dict) else {}
+        if winner and _winner_supersedes(winner, candidate):
+            return ProfileCasResult(
+                status="superseded",
+                document=validate_profile_document(winner),
+                cas_attempts=cas_attempt,
+                recomputations=recomputations,
+            )
+        if cas_attempt == 2:
+            return ProfileCasResult(
+                status="cas_failed",
+                document=winner,
+                cas_attempts=cas_attempt,
+                recomputations=recomputations,
+            )
+        expected = winner
+    raise AssertionError("unreachable")
+
+
 def select_profile_for_turn(
     user_id: str,
     summary: str,
@@ -342,7 +404,11 @@ def select_profile_for_turn(
         return ProfilePromptSelection(
             summary=str(summary), fallback_reason=reason
         )
-    if document["state"] != "ok" or document["disabled"]:
+    if document["disabled"]:
+        return ProfilePromptSelection(
+            summary=str(summary), fallback_reason="disabled"
+        )
+    if document["state"] != "ok":
         return ProfilePromptSelection(
             summary=str(summary), fallback_reason=f"state:{document['state']}"
         )

@@ -63,6 +63,7 @@ def flow(monkeypatch):
     # the agent read path resolves state through perception.store
     monkeypatch.setattr(perception_store, "get_state", fake.get_state)
     monkeypatch.setattr(perception_store, "read_app_opens", fake.read_app_opens)
+    monkeypatch.setattr(perception_store, "read_app_closes", fake.read_app_closes)
     return fake, clock
 
 
@@ -70,6 +71,15 @@ def _open_app(fake, app, category=None):
     """The exact iOS Shortcut call: GET /v1/perception/app_open?app=...&category=..."""
     query = {"app": app, "category": category}
     body, status = perception_read_core.app_open(fake, type("Q", (), {"get": query.get})())
+    assert status == 200, body
+    return body
+
+
+def _close_app(fake, app, category=None):
+    query = {"app": app, "category": category}
+    body, status = perception_read_core.app_close(
+        fake, type("Q", (), {"get": query.get})()
+    )
     assert status == 200, body
     return body
 
@@ -156,6 +166,24 @@ def test_proactive_runtime_reads_the_same_history(flow):
     # and the proactive lane still sees the current app in the cheap snapshot
     snap = executor.execute(ToolCallV2("perception.now", user_id=UID))
     assert snap.result["snapshot"]["app_name"] == "xiaohongshu"
+
+
+def test_close_only_window_reaches_both_runtime_readers(flow):
+    fake, clock = flow
+    clock.advance(60)
+    _close_app(fake, "wechat", "social")
+
+    v1 = perception_core.recent_apps_payload(
+        _AuthStore(), limit_raw="5", hours_raw="1"
+    )
+    v2 = default_tool_runtime_adapters_v2().perception_recent_apps(
+        UID, {"limit": 5, "hours": 1}
+    )
+
+    assert v1 == v2
+    assert [(item["app"], item["event"]) for item in v1["apps"]] == [
+        ("wechat", "close")
+    ]
 
 
 def test_no_data_returns_an_explicit_empty_not_a_guess(flow):

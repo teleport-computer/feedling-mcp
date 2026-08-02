@@ -150,11 +150,15 @@ def _tc(call_id, name, **args):
     return {"id": call_id, "name": name, "args": args}
 
 
-def _wake_deps(*, tail=None, summary="", sink_calls=None, token="rt-enclave"):
+def _wake_deps(
+    *, tail=None, summary="", sink_calls=None, token="rt-enclave",
+    observe_photo=None,
+):
     return worker.TurnDeps(
         read_messages=lambda uid: [],
         resolve_provider=lambda uid: (_BYOK, {}),
         mint_enclave_token=lambda uid: token,
+        observe_photo=observe_photo,
         read_tail=lambda uid, after_ts, limit: list(tail if tail is not None else []),
         read_summary=lambda uid: (summary, 0.0, 0),
         apply_pending_effects=_apply_effects_factory(sink_calls if sink_calls is not None else []),
@@ -409,6 +413,49 @@ def test_wake_memory_write_is_authorized_applied_and_not_refused(monkeypatch):
     assert _job_status(job_id)[0] == "completed"
 
 
+@pytest.mark.parametrize("tool_call", [
+    _tc("identity-write", "identity_patch", signature="changed in background"),
+    _tc("identity-write", "identity_nudge", dimension="warmth", delta=1),
+])
+def test_wake_identity_write_is_visibly_refused_and_not_enqueued(
+    monkeypatch, tool_call,
+):
+    uid = "u_wake_toolloop_identity_refused"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
+    job = jobs_store.claim_next_job("w-identity-refused")
+
+    calls = _script_provider(monkeypatch, [
+        _tool_round(tool_call),
+        _text_round(""),
+    ])
+    sink_calls = []
+    deps = _wake_deps(tail=[], sink_calls=sink_calls)
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "manual_wake",
+        deps,
+        _BYOK,
+        worker.ENCLAVE_SEMAPHORE,
+        str(job["claimed_by"]),
+    ))
+
+    assert status == "completed"
+    assert len(calls) == 2
+    exchanges = [m for m in calls[1]["messages"] if isinstance(m, ToolExchange)]
+    assert len(exchanges) == 1
+    result = exchanges[0].results[0]
+    assert result.call_id == "identity-write"
+    assert result.content.startswith("error:")
+    assert "identity write refused in background turn" in result.content
+    assert sink_calls == []
+    assert db.effect_pending(uid) == []
+    assert _job_status(job_id)[0] == "completed"
+
+
 def test_wake_mixed_valid_invalid_workspace_batch_applies_valid_call(
     monkeypatch,
 ):
@@ -471,6 +518,89 @@ def test_wake_mixed_valid_invalid_workspace_batch_applies_valid_call(
     assert captured["results"][0].content == "ok: workspace_write applied"
     assert captured["results"][1].content.startswith("error: unparseable args")
     assert [kind for kind, _payload in sink_calls] == ["workspace_batch"]
+
+
+def test_wake_photo_read_observation_is_pull_on_demand(monkeypatch):
+    uid = "u_wake_photo_observation"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
+    job = jobs_store.claim_next_job("w-photo")
+    monkeypatch.setattr(
+        worker.cap_registry,
+        "run_capability",
+        lambda *_a, **_k: type("Result", (), {
+            "to_dict": lambda self: {
+                "ok": True,
+                "data": {
+                    "photo_id": "p1",
+                    "has_image": True,
+                    "image_media_type": "image/jpeg",
+                    "image_b64": "cGl4ZWxz",
+                },
+                "trace": {},
+                "warnings": [],
+            }
+        })(),
+    )
+    observed = []
+
+    def _observe_photo(user_id, **kwargs):
+        observed.append((user_id, kwargs))
+        return "a handwritten note on a desk"
+
+    calls = _script_provider(monkeypatch, [
+        _tool_round(_tc(
+            "photo-1", "photo_read", photo_id="p1", include_image=True
+        )),
+        _text_round(""),
+    ])
+    deps = _wake_deps(tail=[], observe_photo=_observe_photo)
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "manual_wake",
+        deps,
+        _BYOK,
+        worker.ENCLAVE_SEMAPHORE,
+        str(job["claimed_by"]),
+    ))
+
+    assert status == "completed"
+    assert len(observed) == 1
+    exchanges = [m for m in calls[1]["messages"] if isinstance(m, ToolExchange)]
+    assert len(exchanges) == 1
+    content = exchanges[0].results[0].content
+    assert "a handwritten note on a desk" in content
+    assert "cGl4ZWxz" not in content
+    assert "image_b64" not in content
+
+
+def test_wake_without_photo_read_never_observes_photo(monkeypatch):
+    uid = "u_wake_photo_not_pulled"
+    conftest.seed_user(uid)
+    _reset(uid)
+    job_id, _ = jobs_store.enqueue_job(uid, "manual_wake")
+    job = jobs_store.claim_next_job("w-no-photo")
+
+    def _observe_photo(*_a, **_k):
+        raise AssertionError("photo wake must stay pull-on-demand")
+
+    _script_provider(monkeypatch, [_text_round("")])
+    deps = _wake_deps(tail=[], observe_photo=_observe_photo)
+
+    status = asyncio.run(worker._run_wake(
+        job_id,
+        uid,
+        "manual_wake",
+        deps,
+        _BYOK,
+        worker.ENCLAVE_SEMAPHORE,
+        str(job["claimed_by"]),
+    ))
+
+    assert status == "completed"
 
 
 def test_wake_memory_write_refused_when_process_job_seeds_no_authorization(monkeypatch):

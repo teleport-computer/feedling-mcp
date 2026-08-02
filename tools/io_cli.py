@@ -838,6 +838,41 @@ def _parse_nudge_dimension(spec: str) -> tuple[str, int]:
 
 # V2 镜像:pre 分支 tool_schema.py identity_patch 参数与 capabilities/identity.py;
 # 0727 合并取本分支超集,描述文案照本 help 口径改硬。
+def _identity_write_lane_error() -> dict | None:
+    """Refuse an identity WRITE when this turn has no user in it.
+
+    2026-08-01, usr_a40e: during a heartbeat wake the model rewrote the card's
+    signature and the relationship day count (1388 -> a made-up 220). Nobody had
+    asked; nobody was even talking. The user only found out because the agent
+    announced it afterwards, and the server had already stamped the new anchor
+    ``user_calibrated`` — the top trust tier, which nothing lower can correct.
+
+    The rule is deliberately narrow: **背景轮次不写身份卡，读不受影响**. Chat turns
+    are untouched, so "改个名字" still works; capture/dream only ever read the card
+    (they inject it as context), so memory keeps working. Editing from the App
+    never comes through here at all.
+
+    Deliberately soft: the agent owns a shell and could bypass this CLI. This
+    guards a careless model — which is what happened — not an adversarial one.
+    A hard guarantee would need server-side lane plumbing whose false-rejection
+    risk Seven judged worse than the bug (2026-08-01 ruling).
+
+    Unset lane => allowed: a human running io_cli by hand has no lane, and
+    ``chat_resident_consumer`` always sets one (defaulting to "background").
+    """
+    lane = (_env("FEEDLING_AGENT_LANE") or "").strip().lower()
+    if not lane or lane == "chat":
+        return None
+    return {
+        "ok": False,
+        "error": "identity_write_not_allowed_in_background",
+        "lane": lane,
+        "hint": "身份卡只能在用户对话中修改。当前是后台轮次(" + lane + ")，"
+                "没有用户在场，不能改名字/签名/相处天数等身份字段。"
+                "如果用户确实要求过，请在回复他的那一轮里再改。",
+    }
+
+
 def _identity_write_payload_v2(ns) -> dict | None:
     """Build the /v1/identity/actions body for identity-write's full field set
     (spec 3.1). Pure (testable) — only reads attributes off ``ns`` (typically
@@ -861,6 +896,10 @@ def _identity_write_payload_v2(ns) -> dict | None:
     call, a malformed or over-cap --nudge-dimension entry, and a total action
     count (profile_patch, if any, + nudges) over 10 — see the I4 note below.
     """
+    lane_err = _identity_write_lane_error()
+    if lane_err:
+        raise _IdentityWritePrecheckError(lane_err)
+
     patch: dict = {}
     for field in _STRING_FIELDS:
         value = getattr(ns, field, None)

@@ -31,6 +31,7 @@ from asgi import middleware  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
+from core import runtime_token as core_runtime_token  # noqa: E402
 from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from hosted import setup_routes_asgi as setup_asgi  # noqa: E402
@@ -201,6 +202,47 @@ def test_capture_jobs_empty_parity(make_user):
     f = _flask("GET", "/v1/memory/capture_jobs", headers=_headers(api_key))
     a = _asgi("GET", "/v1/memory/capture_jobs", headers=_headers(api_key))
     assert f == a == (200, {"jobs": [], "active_recap": False})
+
+
+def test_vision_observe_forwards_zero_roster_runtime_token(make_user, monkeypatch):
+    user_id, _api_key = make_user()
+    secret = b"zero-roster-test-secret"
+    token = core_runtime_token.mint(
+        secret,
+        user_id=user_id,
+        runtime_instance_id="resident-zero-roster",
+        scope=["envelope_decrypt"],
+    )
+    seen = {}
+
+    def _observe(store, payload, *, caller_api_key, caller_runtime_token):
+        seen.update(
+            user_id=store.user_id,
+            payload=payload,
+            caller_api_key=caller_api_key,
+            caller_runtime_token=caller_runtime_token,
+        )
+        return {"observation": "ok"}, 200
+
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", secret.decode())
+    monkeypatch.setattr(
+        setup_asgi.vision_observer, "observe_pinned_message", _observe
+    )
+
+    status, body = _asgi(
+        "POST",
+        "/v1/vision/observe",
+        headers={"X-Feedling-Runtime-Token": token},
+        json_body={"message_id": "m1", "route_id": "r1"},
+    )
+
+    assert (status, body) == (200, {"observation": "ok"})
+    assert seen == {
+        "user_id": user_id,
+        "payload": {"message_id": "m1", "route_id": "r1"},
+        "caller_api_key": None,
+        "caller_runtime_token": token,
+    }
 
 
 # --------------------------------------------------------------------------- #

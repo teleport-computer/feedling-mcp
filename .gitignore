@@ -40,3 +40,4 @@ deploy/backups/
 .venv/
 .venv-audit/
 .superpowers/
+.worktrees/

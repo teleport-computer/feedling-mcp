@@ -1,6 +1,8 @@
 """Photo capabilities — facade over backend/perception/perception_read_core.py."""
 from __future__ import annotations
 
+import base64
+
 from perception import perception_read_core
 from screen import screen_read_core
 
@@ -40,4 +42,6 @@ def read(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityR
     if img.status == 200:
         result.data = {**result.data, "image_media_type": img.media_type,
                        "has_image": img.raw_body is not None}
+        if img.raw_body is not None:
+            result.data["image_b64"] = base64.b64encode(img.raw_body).decode("ascii")
     return result

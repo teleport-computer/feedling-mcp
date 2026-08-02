@@ -157,6 +157,74 @@ def test_skills_are_trusted_but_editable_working_memory_is_user_role_data():
         "UNTRUSTED HISTORICAL CONVERSATION SUMMARY"
     )
 
+
+def test_profile_is_one_stable_user_role_block_before_summary_and_tail():
+    kwargs = {
+        "system_prompt": "S",
+        "working_memory": "- editable",
+        "agent_memory": "我们在上海认识，正在准备旅行。",
+        "user_profile": "先陪伴，再给简短建议。",
+        "summary": "- legacy summary",
+        "tail": [{"role": "user", "content": "继续聊"}],
+    }
+
+    first = context.build_turn_messages(**kwargs)
+    second = context.build_turn_messages(**kwargs)
+
+    assert first == second
+    profile_messages = [
+        message
+        for message in first
+        if context.AGENT_MEMORY_HEADER in str(message.get("content") or "")
+    ]
+    assert len(profile_messages) == 1
+    assert profile_messages[0]["role"] == "user"
+    assert context.USER_PROFILE_HEADER in profile_messages[0]["content"]
+    assert "generated_at" not in profile_messages[0]["content"]
+    assert "card_count" not in profile_messages[0]["content"]
+    assert first.index(profile_messages[0]) == 2
+    assert "UNTRUSTED HISTORICAL" in first[3]["content"]
+    assert first[4]["content"] == "继续聊"
+    assert all(
+        "我们在上海认识" not in str(message.get("content") or "")
+        for message in first
+        if message["role"] == "system"
+    )
+
+
+def test_profile_requires_both_cas_fields_and_coverage_notice_is_separate():
+    messages = context.build_turn_messages(
+        system_prompt="S",
+        agent_memory="facts without pair",
+        user_profile="",
+        summary="",
+        tail=[{"role": "user", "content": "latest"}],
+        coverage_hole_notice="12 earlier messages are omitted.",
+        temporal_context={"local_time": "2026-07-31T12:00:00+08:00"},
+    )
+
+    assert not any(
+        context.AGENT_MEMORY_HEADER in str(message.get("content") or "")
+        for message in messages
+    )
+    notice_index = next(
+        index
+        for index, message in enumerate(messages)
+        if str(message.get("content") or "").startswith(
+            context.COVERAGE_HOLE_HEADER
+        )
+    )
+    temporal_index = next(
+        index
+        for index, message in enumerate(messages)
+        if str(message.get("content") or "").startswith(
+            context.TEMPORAL_CONTEXT_HEADER
+        )
+    )
+    assert notice_index < temporal_index
+    assert messages[notice_index]["role"] == "user"
+
+
 def test_build_turn_messages_drops_blank_tail_entries():
     tail=[{"id":"1","ts":1.0,"role":"user","content":"  "},{"id":"2","ts":2.0,"role":"user","content":"real"}]
     msgs = context.build_turn_messages(system_prompt="S", summary="", tail=tail)

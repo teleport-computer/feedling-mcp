@@ -151,6 +151,12 @@ def test_verify_loop_requires_decrypt_health_before_minting_sticky_green(monkeyp
         def first_chat_ok_at(self):
             return ""
 
+        def reload(self):
+            # No-op double: verify_loop now reloads before each poll read (to
+            # see a cross-worker ack). This fake's fake sleep injects the ack
+            # straight into chat_messages, so there is nothing to re-read here.
+            return None
+
     def run(status: str):
         store = Store()
         clock = {"now": 100.0}

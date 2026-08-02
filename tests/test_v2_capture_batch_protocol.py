@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from datetime import datetime
 import sys
 import threading
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from psycopg.types.json import Jsonb
@@ -163,6 +165,68 @@ def test_capture_commit_is_atomic_strips_plaintext_and_keeps_canonical_logs():
     assert moment["created_at"] != moment["occurred_at"]
     assert batch_count == 0
     assert {"memory_changes", "bootstrap_events"}.issubset(streams)
+
+
+def test_v2_capture_banner_accumulates_resets_and_ignores_noop(monkeypatch):
+    uid = "u_capture_daily_v2"
+    _seed(uid)
+    db.set_blob(uid, "proactive_settings", {
+        "capture_enabled": True,
+        "timezone": "Asia/Shanghai",
+    })
+    zone = ZoneInfo("Asia/Shanghai")
+
+    def commit(*, after: int, through: int, memory_id: str | None, now: float):
+        monkeypatch.setattr(jobs_store.time, "time", lambda: now)
+        job_id, _job = _running(uid)
+        actions = [_add(uid, memory_id)] if memory_id else []
+        batch = jobs_store.prepare_capture_batch(
+            job_id=job_id,
+            user_id=uid,
+            claimed_by="capture-worker",
+            window=_window(after=after, through=through),
+            actions=actions,
+        )
+        assert batch is not None
+        return jobs_store.commit_capture_batch(
+            job_id=job_id,
+            user_id=uid,
+            claimed_by="capture-worker",
+            batch_id=batch["id"],
+        )
+
+    first_at = datetime(2026, 8, 1, 10, tzinfo=zone).timestamp()
+    second_at = datetime(2026, 8, 1, 22, tzinfo=zone).timestamp()
+    noop_at = datetime(2026, 8, 2, 8, tzinfo=zone).timestamp()
+    next_positive_at = datetime(2026, 8, 2, 9, tzinfo=zone).timestamp()
+
+    assert commit(after=0, through=1, memory_id="mom-daily-1", now=first_at)[
+        "cards_added"
+    ] == 1
+    assert commit(after=1, through=2, memory_id="mom-daily-2", now=second_at)[
+        "cards_added"
+    ] == 1
+    state = db.get_blob_strict(uid, "capture_state")
+    assert state["last_capture_cards_added"] == 2
+    assert state["last_capture_cards_added_at"] == second_at
+
+    assert commit(after=2, through=3, memory_id=None, now=noop_at)[
+        "cards_added"
+    ] == 0
+    state = db.get_blob_strict(uid, "capture_state")
+    assert state["last_capture_cards_added"] == 2
+    assert state["last_capture_cards_added_at"] == second_at
+    assert state["last_capture_completed_at"] == noop_at
+
+    assert commit(
+        after=3,
+        through=4,
+        memory_id="mom-daily-3",
+        now=next_positive_at,
+    )["cards_added"] == 1
+    state = db.get_blob_strict(uid, "capture_state")
+    assert state["last_capture_cards_added"] == 1
+    assert state["last_capture_cards_added_at"] == next_positive_at
 
 
 def test_capture_waits_for_cross_process_whole_garden_mutation(monkeypatch):

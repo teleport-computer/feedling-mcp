@@ -1,5 +1,21 @@
 # Repository guidance for coding agents
 
+## Branch and pull-request flow
+
+- Ordinary development branches, including `feature/*`, `fix/*`, `opt/*`,
+  and agent-created branches, must not open pull requests directly against
+  `main`. When the target is not explicitly specified, use `test`.
+- Before proposing production promotion, merge the work into `test` and record
+  test-environment evidence appropriate to the change's risk.
+- Pull requests targeting `main` must originate from the repository's `test`
+  or `pre` branch. The repository does not enforce a fixed merge direction
+  between `test` and `pre`.
+- Do not bypass the `branch flow` check. An emergency exception requires an
+  explicit maintainer decision recorded in the pull request, including the
+  reason, risk assessment, and follow-up validation plan.
+- Local merges are not restricted, but pushing `main` starts the production
+  deployment path. Never push a locally assembled `main` to bypass review.
+
 ## Public documentation synchronization
 
 The public documentation is maintained in this repository; it is not

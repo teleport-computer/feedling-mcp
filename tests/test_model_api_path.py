@@ -292,12 +292,18 @@ def test_model_api_setup_auto_probe_is_nonblocking_and_updates_config(
         }
 
     monkeypatch.setattr(provider_client, "list_provider_models", text_only_catalog)
+    pixel_probes = []
+
+    def reject_pixel_probe(_config, messages, **kwargs):
+        pixel_probes.append((messages, kwargs))
+        # A single color can never satisfy the randomized probe's requirement
+        # for two correct colors, so the authoritative result is unsupported.
+        return {"reply": "red"}
+
     monkeypatch.setattr(
         provider_client,
         "chat_completion",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("explicit text-only catalog must avoid the pixel probe")
-        ),
+        reject_pixel_probe,
     )
     route_res = client.post(
         "/v1/onboarding/route",
@@ -333,6 +339,8 @@ def test_model_api_setup_auto_probe_is_nonblocking_and_updates_config(
         pytest.fail("setup-triggered vision probe did not publish its verdict")
 
     assert after["config"]["main_model"]["vision_test_status"] == "unsupported"
+    assert len(pixel_probes) == 1
+    assert isinstance(pixel_probes[0][0][0]["content"], list)
 
 
 @pytest.mark.parametrize(

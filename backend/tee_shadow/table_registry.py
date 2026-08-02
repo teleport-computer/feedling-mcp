@@ -143,6 +143,9 @@ REGISTRY: dict[str, Entry] = {
     "runtime_state": Entry(SNAPSHOT, "runtime 状态 state_json，UPDATE 密集，明文"),
     "user_growth_daily_snapshot": Entry(SNAPSHOT, "增长日快照，批量写，明文"),
     "v2_capture_batches": Entry(SNAPSHOT, "V2 捕获批次 actions_json，status 流转，明文"),
+    "v2_chat_tail_anchor": Entry(
+        SNAPSHOT,
+        "V2 对话尾锚点 anchor_seq，per-user 单行 UPDATE 密集（GREATEST 单调 upsert），明文整数"),
     "v2_effect_outbox": Entry(SNAPSHOT, "V2 效果 outbox，投递后删行，明文 payload（实测非信封）"),
     "v2_effect_sink_applied": Entry(SNAPSHOT, "V2 效果幂等标记，明文"),
     "v2_mcp_mutation_attempts": Entry(SNAPSHOT, "V2 MCP 变更尝试记录，明文"),

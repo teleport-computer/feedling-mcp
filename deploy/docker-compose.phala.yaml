@@ -275,8 +275,12 @@ services:
       # "resident" keeps day-1 behavior identical to pre-dual-runtime prod;
       # allowlisted users' desired state overrides this default.
       FEEDLING_RUNTIME_DEFAULT_DESIRED: "resident"
-      # Automatic Memory Capture stays explicit opt-in (default off).
-      FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-0}"
+      # Backend owns capture admission/triggers; serve-worker executes the lane.
+      # Keep both deployment gates aligned. User consent remains independent.
+      FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
+      # Backend owns the V2-cutover profile trigger; serve-worker executes it.
+      # Keep both copies default-off until profile generation is enabled.
+      FEEDLING_V2_PROFILE_ENABLED: "${FEEDLING_V2_PROFILE_ENABLED:-0}"
       # Unaudited-route context-window default — keep in sync with serve-worker
       # (the setup path resolves/validates the same limit). See the serve-worker
       # block for the rationale. ${VAR:-} form → tunable without a new compose_hash.
@@ -297,6 +301,7 @@ services:
       # Runtime-token secret shared by backend, enclave, and pooled V2 worker.
       # Empty = off. Encrypted env, not baked into compose_hash.
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+      FEEDLING_EXPECTED_RUNNER_COUNT: "${FEEDLING_EXPECTED_RUNNER_COUNT:-}"
       # gunicorn worker (process) count (backend/gunicorn_conf.py _worker_count,
       # default 1). N>1 is code-supported: leader-elected :9998 WS bind
       # (core/leader.py run_singleton, in the deployed image) + Postgres
@@ -365,6 +370,9 @@ services:
       FEEDLING_V2_RUNNER_CVM_ID: "${FEEDLING_V2_RUNNER_CVM_ID:-main-cvm}"
       FEEDLING_V2_DEPLOYED_BUILD: "${FEEDLING_V2_DEPLOYED_BUILD:-}"
       FEEDLING_GENESIS_WORKER_ENABLED: "1"
+      # Runtime V2 background memory lanes execute in this worker, not backend.
+      FEEDLING_V2_CAPTURE_ENABLED: "${FEEDLING_V2_CAPTURE_ENABLED:-1}"
+      FEEDLING_V2_DREAM_ENABLED: "${FEEDLING_V2_DREAM_ENABLED:-1}"
       # CVM-local in-process sandbox: PDF/DOCX/XLSX materialize + extract inside
       # the serve-worker (no E2B), staying within the TDX trust boundary.
       FEEDLING_V2_SANDBOX_PROVIDER: "local"
@@ -403,6 +411,9 @@ services:
       # return; the cost is more fold calls per backlog, which is bounded.
       FEEDLING_V2_COMPACTION_BATCH_MSGS: "${FEEDLING_V2_COMPACTION_BATCH_MSGS:-50}"
       FEEDLING_V2_COMPACTION_BATCH_CHARS: "${FEEDLING_V2_COMPACTION_BATCH_CHARS:-120000}"
+      # Generation may be enabled for M4 validation; prompt replacement stays
+      # locked until M5 has deployed and been verified.
+      FEEDLING_V2_PROFILE_ENABLED: "${FEEDLING_V2_PROFILE_ENABLED:-0}"
       # DO NOT set to 1 before M5 MEMORY/USER prompt injection is deployed.
       FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC: "${FEEDLING_V2_PROFILE_COVERAGE_DETERMINISTIC:-0}"
       FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC: "${FEEDLING_V2_PROMPT_CATCHUP_DEADLINE_SEC:-600}"

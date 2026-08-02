@@ -103,6 +103,54 @@ def test_vision_verdict_write_is_fenced_to_exact_route_version(backend_env):
     assert db.model_api_route_get(uid, route_id)["vision_test_status"] == "unsupported"
 
 
+def test_changing_model_creates_fresh_untested_vision_verdict(backend_env):
+    uid = _uid()
+    seed_user(uid)
+    cid = _cred(uid)
+    old_route = db.model_api_route_upsert(uid, cid, "old-vision-model", None)
+    assert db.model_api_route_mark_vision_test(
+        uid,
+        old_route,
+        status="unsupported",
+        error="vision_model_incompatible",
+    )
+
+    new_route = db.model_api_route_upsert(uid, cid, "new-vision-model", None)
+
+    assert new_route != old_route
+    current = db.model_api_route_get(uid, new_route)
+    assert current["vision_test_status"] == "untested"
+    assert current["last_vision_test_error"] == ""
+    assert current["last_vision_test_at"] == ""
+
+
+def test_changing_credential_provider_or_base_url_invalidates_vision_verdict(backend_env):
+    uid = _uid()
+    seed_user(uid)
+    cid = _cred(uid)
+    route_id = db.model_api_route_upsert(uid, cid, "vision-model", None)
+    assert db.model_api_route_mark_vision_test(
+        uid,
+        route_id,
+        status="unsupported",
+        error="vision_model_incompatible",
+    )
+
+    assert db.model_api_credential_update(
+        uid,
+        cid,
+        provider="openai_compatible",
+        base_url="https://relay.example/v1",
+    )
+
+    route = db.model_api_route_get(uid, route_id)
+    assert route["provider"] == "openai_compatible"
+    assert route["base_url"] == "https://relay.example/v1"
+    assert route["vision_test_status"] == "untested"
+    assert route["last_vision_test_error"] == ""
+    assert route["last_vision_test_at"] == ""
+
+
 def test_route_upsert_persists_and_preserves_context_window(backend_env):
     uid = _uid()
     seed_user(uid)

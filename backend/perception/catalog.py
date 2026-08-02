@@ -226,11 +226,13 @@ PHOTO_METADATA_FIELDS = (
 # "Back after long lock" wake threshold.
 UNLOCK_BACK_THRESHOLD_SEC = 1800.0  # 30 min
 
-# Recent app-open events surfaced in the snapshot (folds the standalone
-# /app_usage read; capped to keep the wake-attached snapshot small).
+# Legacy recent app-open rows surfaced in the snapshot (folds the standalone
+# /app_usage read; capped to keep the wake-attached snapshot small). The merged
+# TTL-bounded open/close trajectory is exposed separately as recent_app_events.
 RECENT_APPS_LIMIT = 10
 
-# Explicit `perception.recent_apps` pulls read the same app_usage stream, but an
-# agent asking "what have I been using today?" wants more than the wake budget.
+# Explicit `perception.recent_apps` pulls merge the existing open/close streams,
+# but an agent asking "what have I been using today?" wants more than the wake
+# budget.
 RECENT_APPS_TOOL_LIMIT = 20
 RECENT_APPS_TOOL_MAX = 100
