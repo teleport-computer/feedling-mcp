@@ -152,3 +152,78 @@ def test_tee_primary_shared_unique_contracts_match_runtime_schema():
         if rds[table] - tee[table]
     }
     assert missing == {}
+
+
+def test_tee_primary_shared_checks_and_foreign_keys_match_runtime_schema():
+    """Primary data validity and cascade behavior must match RDS."""
+    query = """
+        SELECT tbl.relname, contract.contype,
+               pg_get_constraintdef(contract.oid, true)
+        FROM pg_constraint AS contract
+        JOIN pg_class AS tbl ON tbl.oid = contract.conrelid
+        JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace
+        WHERE ns.nspname = 'public'
+          AND contract.contype IN ('c', 'f', 'x')
+        ORDER BY tbl.relname, contract.contype,
+                 pg_get_constraintdef(contract.oid, true)
+    """
+
+    def constraints(url: str) -> dict[str, set[tuple[str, str]]]:
+        with psycopg.connect(url) as conn:
+            rows = conn.execute(query).fetchall()
+        result: dict[str, set[tuple[str, str]]] = {}
+        for table, kind, definition in rows:
+            result.setdefault(table, set()).add((kind, definition))
+        return result
+
+    rds = constraints(os.environ["DATABASE_URL"])
+    tee = constraints(os.environ["TEE_DATABASE_URL"])
+    shared = set(rds) & set(tee)
+    missing = {
+        table: sorted(rds[table] - tee[table])
+        for table in sorted(shared)
+        if rds[table] - tee[table]
+    }
+    assert missing == {}
+
+
+def test_tee_primary_shared_runtime_indexes_match_runtime_schema():
+    """Do not promote a schema that drops the runtime's query plan contracts."""
+    query = """
+        SELECT tbl.relname, idx.indisprimary, idx.indisunique,
+               idx.indnkeyatts, idx.indnatts,
+               ARRAY(
+                 SELECT pg_get_indexdef(idx.indexrelid, position, true)
+                 FROM generate_series(1, idx.indnatts) AS position
+                 ORDER BY position
+               ),
+               COALESCE(pg_get_expr(idx.indpred, idx.indrelid), '')
+        FROM pg_index AS idx
+        JOIN pg_class AS tbl ON tbl.oid = idx.indrelid
+        JOIN pg_namespace AS ns ON ns.oid = tbl.relnamespace
+        WHERE ns.nspname = 'public'
+        ORDER BY tbl.relname, idx.indisprimary, idx.indisunique
+    """
+
+    def indexes(url: str) -> dict[str, set[tuple]]:
+        with psycopg.connect(url) as conn:
+            rows = conn.execute(query).fetchall()
+        result: dict[str, set[tuple]] = {}
+        for table, primary, unique, key_count, attr_count, columns, predicate in rows:
+            result.setdefault(table, set()).add(
+                (
+                    bool(primary), bool(unique), int(key_count), int(attr_count),
+                    tuple(columns), predicate,
+                )
+            )
+        return result
+
+    rds = indexes(os.environ["DATABASE_URL"])
+    tee = indexes(os.environ["TEE_DATABASE_URL"])
+    shared = set(rds) & set(tee)
+    missing = {
+        table: sorted(rds[table] - tee[table], key=repr)
+        for table in sorted(shared)
+        if rds[table] - tee[table]
+    }
+    assert missing == {}
