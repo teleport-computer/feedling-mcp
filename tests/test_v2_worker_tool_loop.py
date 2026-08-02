@@ -71,6 +71,38 @@ def _reset(uid):
     conftest.set_v2_runtime_owner(uid)
 
 
+def test_run_turn_passes_replay_stable_attempt_context_into_process_job(monkeypatch):
+    seen = []
+
+    async def process(job, _deps, **kwargs):
+        seen.append((dict(job), kwargs["provider_config"].provider_attempt_context))
+        return "completed"
+
+    monkeypatch.setattr(worker, "process_job", process)
+    monkeypatch.setattr(jobs_store, "record_whole_turn_metric", lambda *_a, **_k: None)
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "runtime-token",
+    )
+    base_job = {
+        "id": 912,
+        "user_id": "usr_attempt_worker",
+        "lane": "chat",
+        "claimed_by": "worker-a",
+    }
+
+    for attempt_count in (1, 4):
+        asyncio.run(worker._run_turn({**base_job, "attempt_count": attempt_count}, deps))
+
+    contexts = [context for _job, context in seen]
+    assert contexts[0] == contexts[1]
+    assert contexts[0].call_id == "v2job:912:base"
+    assert contexts[0].turn_id == "v2job:912"
+    assert contexts[0].job_id == 912
+    assert contexts[0].user_id == "usr_attempt_worker"
+
+
 @pytest.fixture(autouse=True)
 def _clean_agent_jobs_table(monkeypatch):
     """Mirrors test_v2_worker.py's fixture: claim_next_job() is a global claim,

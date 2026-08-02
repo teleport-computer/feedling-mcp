@@ -12,12 +12,292 @@ import httpx  # noqa: E402
 import pytest  # noqa: E402
 
 import provider_client  # noqa: E402
+from provider_attempt_accounting import (  # noqa: E402
+    AttemptLane,
+    AttemptOutcome,
+    AttemptState,
+    ProviderAttemptContext,
+)
 
 
 def _mock_async_client(monkeypatch, handler):
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     monkeypatch.setattr(provider_client, "_shared_async_client", client)
     return client
+
+
+def _accounted_config(*, capture_attempt_trace: bool = True):
+    return provider_client.ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-4o-mini",
+        api_key="secret-key",
+        base_url="https://relay.example/v1",
+        prompt_cache_route_fingerprint="route_fingerprint_1",
+        capture_attempt_trace=capture_attempt_trace,
+        provider_attempt_context=ProviderAttemptContext(
+            user_id="usr_attempt_test",
+            lane=AttemptLane.CHAT,
+            job_id=42,
+            call_id="v2job:42:tool:1",
+            turn_id="v2job:42",
+            round_id="tool:1",
+        ),
+    )
+
+
+def test_accounting_emits_one_started_and_completed_fact_per_successful_http_request(
+    monkeypatch,
+):
+    recorded = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"x-request-id": "req_success_1"},
+            json={
+                "id": "gen-1",
+                "choices": [{
+                    "message": {"content": "ok"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    "prompt_tokens_details": {"cached_tokens": 5},
+                },
+            },
+        )
+
+    _mock_async_client(monkeypatch, handler)
+    monkeypatch.setattr(provider_client, "record_provider_attempt", recorded.append)
+
+    out = asyncio.run(
+        provider_client.reliable_chat_completion_async(
+            _accounted_config(),
+            [{"role": "user", "content": "hi"}],
+            max_attempts=1,
+        )
+    )
+
+    assert out["reply"] == "ok"
+    assert [event.state for event in recorded] == [
+        AttemptState.STARTED,
+        AttemptState.COMPLETED,
+    ]
+    started, completed = recorded
+    assert started.attempt_id == completed.attempt_id
+    assert (completed.outer_attempt_ordinal, completed.inner_attempt_ordinal) == (1, 1)
+    assert completed.outcome is AttemptOutcome.SUCCEEDED
+    assert completed.provider_request_id == "req_success_1"
+    assert completed.input_tokens == 11
+    assert completed.output_tokens == 7
+    assert completed.cache_read_tokens == 5
+    assert completed.cache_miss_tokens == 6
+    assert completed.usage_known is True
+    assert completed.finished_at >= completed.started_at
+    assert completed.latency_ms >= completed.ttft_ms >= 0
+    trace = provider_client.runtime_provider_attempt_trace(out)
+    assert trace["attempts"][0]["call_id"] == "v2job:42:tool:1"
+    assert trace["attempts"][0]["outer_attempt"] == 1
+    assert trace["attempts"][0]["inner_attempt"] == 1
+    assert trace["attempts"][0]["provider_request_id"] == "req_success_1"
+    assert trace["attempts"][0]["route"] == "route_fingerprint_1"
+    assert trace["attempts"][0]["usage"]["input_tokens"] == 11
+
+
+@pytest.mark.parametrize(
+    ("response_or_error", "outcome", "error_class", "possibly_billed"),
+    [
+        (
+            httpx.Response(503, json={"error": {"message": "try again"}}),
+            AttemptOutcome.FAILED,
+            "provider",
+            False,
+        ),
+        (
+            httpx.ReadTimeout("headers timed out"),
+            AttemptOutcome.TIMED_OUT,
+            "timeout",
+            True,
+        ),
+    ],
+)
+def test_accounting_completes_http_failure_and_timeout_before_headers(
+    monkeypatch,
+    response_or_error,
+    outcome,
+    error_class,
+    possibly_billed,
+):
+    recorded = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if isinstance(response_or_error, BaseException):
+            response_or_error.request = request
+            raise response_or_error
+        return response_or_error
+
+    _mock_async_client(monkeypatch, handler)
+    monkeypatch.setattr(provider_client, "record_provider_attempt", recorded.append)
+
+    with pytest.raises(provider_client.ProviderError):
+        asyncio.run(
+            provider_client.reliable_chat_completion_async(
+                _accounted_config(),
+                [{"role": "user", "content": "hi"}],
+                max_attempts=1,
+            )
+        )
+
+    assert len(recorded) == 2
+    assert recorded[0].state is AttemptState.STARTED
+    completed = recorded[1]
+    assert completed.state is AttemptState.COMPLETED
+    assert completed.outcome is outcome
+    assert completed.error_class.value == error_class
+    assert completed.possibly_billed is possibly_billed
+    assert completed.usage_known is False
+
+
+def test_accounting_measures_streamed_first_body_byte(monkeypatch):
+    recorded = []
+
+    class DelayedBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            await asyncio.sleep(0.02)
+            yield b'{"id":"gen-stream","choices":[{"message":{"content":"ok"},'
+            yield b'"finish_reason":"stop"}],"usage":{"total_tokens":3}}'
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=DelayedBody())
+
+    _mock_async_client(monkeypatch, handler)
+    monkeypatch.setattr(provider_client, "record_provider_attempt", recorded.append)
+
+    asyncio.run(
+        provider_client.reliable_chat_completion_async(
+            _accounted_config(capture_attempt_trace=False),
+            [{"role": "user", "content": "hi"}],
+            max_attempts=1,
+        )
+    )
+
+    completed = recorded[-1]
+    assert completed.ttft_ms >= 15
+    assert completed.latency_ms >= completed.ttft_ms
+
+
+def test_inner_and_outer_retries_keep_stable_attempt_ids_without_trace_duplicates(
+    monkeypatch,
+):
+    all_runs = []
+
+    for _redelivery in range(2):
+        responses = [
+            httpx.Response(400, json={
+                "error": {"message": "`temperature` is deprecated"},
+            }),
+            httpx.Response(503, json={"error": {"message": "retry"}}),
+            httpx.Response(200, json={
+                "id": "gen-final",
+                "choices": [{
+                    "message": {"content": "ok"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+            }),
+        ]
+        recorded = []
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return responses.pop(0)
+
+        _mock_async_client(monkeypatch, handler)
+        monkeypatch.setattr(provider_client, "record_provider_attempt", recorded.append)
+        asyncio.run(
+            provider_client.reliable_chat_completion_async(
+                _accounted_config(),
+                [{"role": "user", "content": "hi"}],
+                temperature=0.1,
+                max_attempts=2,
+                base_delay_sec=0,
+            )
+        )
+        completed = [e for e in recorded if e.state is AttemptState.COMPLETED]
+        assert [(e.outer_attempt_ordinal, e.inner_attempt_ordinal) for e in completed] == [
+            (1, 1),
+            (1, 2),
+            (2, 1),
+        ]
+        assert len(recorded) == 6
+        all_runs.append([e.attempt_id for e in completed])
+
+    assert all_runs[0] == all_runs[1]
+
+
+def test_accounting_failure_cannot_change_provider_retry_order_or_result(monkeypatch):
+    statuses = [503, 200]
+    dispatches = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        status = statuses.pop(0)
+        dispatches.append(status)
+        if status == 503:
+            return httpx.Response(503, json={"error": {"message": "retry"}})
+        return httpx.Response(200, json={
+            "choices": [{
+                "message": {"content": "ok"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"total_tokens": 3},
+        })
+
+    _mock_async_client(monkeypatch, handler)
+    monkeypatch.setattr(
+        provider_client,
+        "record_provider_attempt",
+        lambda _event: (_ for _ in ()).throw(RuntimeError("queue failed")),
+    )
+
+    result = asyncio.run(
+        provider_client.reliable_chat_completion_async(
+            _accounted_config(),
+            [{"role": "user", "content": "hi"}],
+            max_attempts=2,
+            base_delay_sec=0,
+        )
+    )
+
+    assert result["reply"] == "ok"
+    assert dispatches == [503, 200]
+
+
+def test_unexpected_terminal_dispatch_exception_still_completes_one_attempt(
+    monkeypatch,
+):
+    recorded = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise RuntimeError("transport implementation exploded")
+
+    _mock_async_client(monkeypatch, handler)
+    monkeypatch.setattr(provider_client, "record_provider_attempt", recorded.append)
+
+    with pytest.raises(RuntimeError, match="transport implementation exploded"):
+        asyncio.run(
+            provider_client.reliable_chat_completion_async(
+                _accounted_config(),
+                [{"role": "user", "content": "hi"}],
+                max_attempts=1,
+            )
+        )
+
+    assert [event.state for event in recorded] == [
+        AttemptState.STARTED,
+        AttemptState.COMPLETED,
+    ]
+    assert recorded[-1].outcome is AttemptOutcome.FAILED
+    assert recorded[-1].error_class.value == "protocol"
 
 
 def test_openrouter_wire_async(monkeypatch):

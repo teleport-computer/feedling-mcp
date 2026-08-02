@@ -7,6 +7,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+import provider_client
 from hosted import config_store
 from model_api_runtime.v2 import jobs_store, profile, profile_store, worker
 
@@ -318,6 +319,61 @@ def test_empty_eligible_garden_persists_raw_source_witness(monkeypatch):
         "max_updated_at": "2026-07-31T00:00:00Z",
         "generated_at": captured["document"]["source"]["generated_at"],
     }
+
+
+def test_profile_provider_calls_receive_replay_stable_logical_ids(monkeypatch):
+    captured = []
+
+    async def _reliable(config, _messages, **_kwargs):
+        captured.append(config.provider_attempt_context)
+        return {"reply": "ok"}
+
+    async def _generate(*, provider_config, llm, **_kwargs):
+        await llm(provider_config, [])
+        await llm(provider_config, [])
+        return profile.ProfileGenerationResult(
+            fields={"memory": "facts", "user": "preferences"},
+            reject_code="",
+            overlap=None,
+            provider_calls=2,
+        )
+
+    async def _cas(_uid, recompute):
+        return _cas_result(await recompute({}))
+
+    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", _reliable)
+    monkeypatch.setattr(profile, "generate_profile", _generate)
+    monkeypatch.setattr(profile_store, "update_profile_cas_async", _cas)
+    monkeypatch.setattr(
+        profile_store,
+        "build_profile_document",
+        lambda _uid, **kwargs: {"state": kwargs["state"]},
+    )
+    monkeypatch.setattr(worker.db, "memory_profile_source_stats", lambda _uid: (1, "u1"))
+    monkeypatch.setattr(worker.jobs_store, "mark_completed", lambda *_a, **_kw: True)
+
+    base = worker._bind_provider_attempt_context(
+        provider_client.ProviderConfig(provider="openai", model="m", api_key="k"),
+        job_id=31,
+        user_id="u",
+        lane="profile",
+    )
+    status = asyncio.run(
+        worker._run_profile(
+            31,
+            "u",
+            _deps(),
+            base,
+            asyncio.Semaphore(1),
+        )
+    )
+
+    assert status == "completed"
+    assert [context.call_id for context in captured] == [
+        "v2job:31:profile:1",
+        "v2job:31:profile:2",
+    ]
+    assert [context.round_id for context in captured] == ["profile:1", "profile:2"]
 
 
 def test_profile_roll_back_after_generation_blocks_profile_cas(monkeypatch):

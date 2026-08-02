@@ -55,6 +55,7 @@ from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import db
+import provider_attempt_accounting
 import provider_attempt_ledger
 import provider_client
 import provider_health
@@ -116,6 +117,54 @@ log = logging.getLogger("feedling.runtime_v2.worker")
 _TRAJECTORY_REVIEW_LANE = "trajectory_review"
 _TRAJECTORY_REVIEW_MAX_TOKENS = 1200
 _TRAJECTORY_REVIEW_TIMEOUT_SEC = 75.0
+
+
+def _bind_provider_attempt_context(
+    provider_config: Any,
+    *,
+    job_id: Any,
+    user_id: str,
+    lane: str,
+) -> Any:
+    """Attach replay-stable job identity without task/global request state."""
+    if not isinstance(provider_config, provider_client.ProviderConfig):
+        return provider_config
+    try:
+        attempt_lane = provider_attempt_accounting.AttemptLane(str(lane))
+    except ValueError:
+        attempt_lane = provider_attempt_accounting.AttemptLane.UNKNOWN
+    try:
+        context = provider_attempt_accounting.ProviderAttemptContext(
+            user_id=str(user_id),
+            lane=attempt_lane,
+            job_id=int(job_id),
+            call_id=f"v2job:{int(job_id)}:base",
+            turn_id=f"v2job:{int(job_id)}",
+        )
+        return replace(provider_config, provider_attempt_context=context)
+    except (TypeError, ValueError, OverflowError):
+        # Invalid optional telemetry cannot make an otherwise valid provider
+        # configuration unusable. Production job/user identities are validated
+        # earlier; narrow test/future callers remain fail-open here.
+        return provider_config
+
+
+def _provider_attempt_call_id(
+    provider_config: Any,
+    component: str,
+    identity: str,
+    ordinal: int,
+) -> str | None:
+    context = getattr(provider_config, "provider_attempt_context", None)
+    if context is None:
+        return None
+    return f"v2job:{context.job_id}:{component}:{identity}:{int(ordinal)}"
+
+
+def _provider_batch_identity(rows: list[dict]) -> str:
+    """Stable content-free digest of row identities for compaction call replay."""
+    identities = [str(row.get("seq") or row.get("id") or "missing") for row in rows]
+    return hashlib.sha256("\x1f".join(identities).encode("utf-8")).hexdigest()[:16]
 
 _MUTATION_RECOVERY_BLOCKED_ERROR = "error: mutation_disabled_during_recovery"
 
@@ -2605,6 +2654,12 @@ async def _run_trajectory_review_turn(
         _report_turn_progress("trajectory_review_provider_resolve_complete")
         if provider_config is None:
             raise RuntimeError("provider_unavailable")
+        provider_config = _bind_provider_attempt_context(
+            provider_config,
+            job_id=job_id,
+            user_id=user_id,
+            lane=_TRAJECTORY_REVIEW_LANE,
+        )
         tm.bind_provider(provider_config)
         runtime_token = await asyncio.to_thread(deps.mint_enclave_token, user_id)
         capture_state = await asyncio.to_thread(
@@ -2653,10 +2708,15 @@ async def _run_trajectory_review_turn(
             ),
         )
         await _review_fence("trajectory_review_provider_start")
+        review_provider_config = provider_client.with_provider_attempt_call(
+            provider_config,
+            call_id=f"v2job:{job_id}:review:1",
+            round_id="review:1",
+        )
         try:
             result = await asyncio.wait_for(
                 provider_client.chat_completion_async(
-                    provider_config,
+                    review_provider_config,
                     messages,
                     tools=None,
                     max_tokens=_TRAJECTORY_REVIEW_MAX_TOKENS,
@@ -4676,9 +4736,29 @@ def _bounded_compaction_prefix(
 async def _compaction_llm_with_progress(
     user_id: str,
     *args: Any,
+    attempt_call_id: str | None = None,
     **kwargs: Any,
 ) -> Any:
     """Reliable compaction provider call with per-attempt stall heartbeats."""
+
+    if attempt_call_id:
+        config = args[0] if args else kwargs.get("config")
+        if isinstance(config, provider_client.ProviderConfig):
+            context = config.provider_attempt_context
+            round_id = str(attempt_call_id)
+            if context is not None:
+                prefix = f"v2job:{context.job_id}:"
+                if round_id.startswith(prefix):
+                    round_id = round_id[len(prefix):]
+            accounted_config = provider_client.with_provider_attempt_call(
+                config,
+                call_id=str(attempt_call_id),
+                round_id=round_id,
+            )
+            if args:
+                args = (accounted_config, *args[1:])
+            else:
+                kwargs["config"] = accounted_config
 
     def _attempt_progress(stage: str, attempt: int) -> None:
         _report_turn_progress(f"compaction_provider_{stage}_{attempt}")
@@ -4753,6 +4833,7 @@ async def _rebalance_summary_frontier(
 
         _report_turn_progress("summary_checkpoint_start")
         checkpoint_messages = [item.text for item in candidate.children]
+        checkpoint_call_ordinal = 0
 
         async def _recording_checkpoint_llm(*args: Any, **kwargs: Any) -> Any:
             # A legacy aggregate may require several bounded map/reduce calls.
@@ -4773,6 +4854,8 @@ async def _rebalance_summary_frontier(
                 raise RuntimeModeChanged(
                     "user rolled back during summary checkpoint"
                 )
+            nonlocal checkpoint_call_ordinal
+            checkpoint_call_ordinal += 1
             messages = args[1] if len(args) > 1 else kwargs.get("messages", [])
             await _record_trajectory(
                 trajectory_recorder,
@@ -4788,6 +4871,12 @@ async def _rebalance_summary_frontier(
                 result = await _compaction_llm_with_progress(
                     user_id,
                     *args,
+                    attempt_call_id=_provider_attempt_call_id(
+                        provider_config,
+                        "checkpoint",
+                        f"{candidate.parent_level}-{candidate.start_seq}-{candidate.end_seq}",
+                        checkpoint_call_ordinal,
+                    ),
                     **kwargs,
                 )
             except Exception as exc:
@@ -5466,8 +5555,12 @@ async def _run_compaction(
                         db.chat_seq_for_msg_id, user_id, first_id
                     )
             _report_turn_progress("compaction_batch_start")
+            compaction_batch_identity = _provider_batch_identity(old)
+            compaction_call_ordinal = 0
 
             async def _recording_compaction_llm(*args: Any, **kwargs: Any) -> Any:
+                nonlocal compaction_call_ordinal
+                compaction_call_ordinal += 1
                 messages = args[1] if len(args) > 1 else kwargs.get("messages", [])
                 await _record_trajectory(
                     trajectory_recorder,
@@ -5478,6 +5571,12 @@ async def _run_compaction(
                     result = await _compaction_llm_with_progress(
                         user_id,
                         *args,
+                        attempt_call_id=_provider_attempt_call_id(
+                            provider_config,
+                            "maintenance",
+                            compaction_batch_identity,
+                            compaction_call_ordinal,
+                        ),
                         **kwargs,
                     )
                 except Exception as exc:
@@ -6478,8 +6577,12 @@ async def _ensure_prompt_coverage(
             and deps.append_summary_segment is not None
             and len(summary_fields) >= 4
         )
+        catchup_batch_identity = _provider_batch_identity(old)
+        catchup_call_ordinal = 0
 
         async def _recording_catchup_llm(*args: Any, **kwargs: Any) -> Any:
+            nonlocal catchup_call_ordinal
+            catchup_call_ordinal += 1
             messages = args[1] if len(args) > 1 else kwargs.get("messages", [])
             await _record_trajectory(
                 trajectory_recorder,
@@ -6490,6 +6593,12 @@ async def _ensure_prompt_coverage(
                 result = await _compaction_llm_with_progress(
                     user_id,
                     *args,
+                    attempt_call_id=_provider_attempt_call_id(
+                        provider_config,
+                        "catchup",
+                        catchup_batch_identity,
+                        catchup_call_ordinal,
+                    ),
                     **kwargs,
                 )
             except Exception as exc:
@@ -8285,6 +8394,23 @@ async def _run_profile(
     """Background-only profile distillation; never emits chat/error UI."""
 
     terminal_reject = ""
+    profile_call_ordinal = 0
+
+    async def _profile_llm(*args: Any, **kwargs: Any) -> Any:
+        nonlocal profile_call_ordinal
+        profile_call_ordinal += 1
+        config = args[0] if args else kwargs.get("config")
+        if isinstance(config, provider_client.ProviderConfig):
+            config = provider_client.with_provider_attempt_call(
+                config,
+                call_id=f"v2job:{job_id}:profile:{profile_call_ordinal}",
+                round_id=f"profile:{profile_call_ordinal}",
+            )
+            if args:
+                args = (config, *args[1:])
+            else:
+                kwargs["config"] = config
+        return await provider_client.reliable_chat_completion_async(*args, **kwargs)
 
     async def _trajectory(kind: str, payload: dict) -> None:
         await _record_trajectory(
@@ -8377,7 +8503,7 @@ async def _run_profile(
         generated = await v2_profile.generate_profile(
             provider_config=provider_config,
             rendered_cards=rendered,
-            llm=provider_client.reliable_chat_completion_async,
+            llm=_profile_llm,
             usage_out=(tm.add_call if tm is not None else None),
             trajectory_out=_trajectory,
         )
@@ -12018,6 +12144,12 @@ async def _run_turn(job: dict, deps: TurnDeps) -> str:
                     )
                 tm.flush(failed=True, status=err)
                 return "failed"
+        provider_config = _bind_provider_attempt_context(
+            provider_config,
+            job_id=job_id,
+            user_id=user_id,
+            lane=lane,
+        )
         if not isinstance(provider_config, _ProfileProviderSetupFailure):
             tm.bind_provider(provider_config)
             await _record_trajectory(
@@ -12319,25 +12451,30 @@ async def run_worker_loop(
     escapes is therefore a broken slot invariant: cancel the siblings and let
     the process supervisor restart the worker instead of silently running with
     fewer (possibly zero) slots while its heartbeat advertises full capacity."""
-    _reserved_env = os.environ.get("FEEDLING_V2_CHAT_RESERVED_SLOTS", "").strip()
-    reserved = int(_reserved_env) if _reserved_env else None
-    assignments = _reserved_lane_slots(max_workers, reserved)
-    slots = [
-        asyncio.create_task(
-            _slot_loop(
-                f"{worker_id}#{i}",
-                poll_interval=poll_interval,
-                stop_event=stop_event,
-                deps=deps,
-                wake_event=wake_event,
-                lanes=assignments[i],
-                slot_id=i,
-                progress_cb=progress_cb,
-            )
-        )
-        for i in range(len(assignments))
-    ]
     try:
+        provider_attempt_accounting.start_provider_attempt_recorder()
+    except Exception:  # noqa: BLE001 - optional telemetry cannot stop a worker
+        pass
+    slots: list[asyncio.Task] = []
+    try:
+        _reserved_env = os.environ.get("FEEDLING_V2_CHAT_RESERVED_SLOTS", "").strip()
+        reserved = int(_reserved_env) if _reserved_env else None
+        assignments = _reserved_lane_slots(max_workers, reserved)
+        slots = [
+            asyncio.create_task(
+                _slot_loop(
+                    f"{worker_id}#{i}",
+                    poll_interval=poll_interval,
+                    stop_event=stop_event,
+                    deps=deps,
+                    wake_event=wake_event,
+                    lanes=assignments[i],
+                    slot_id=i,
+                    progress_cb=progress_cb,
+                )
+            )
+            for i in range(len(assignments))
+        ]
         await asyncio.gather(*slots)
     except BaseException:
         stop_event.set()
@@ -12348,3 +12485,10 @@ async def run_worker_loop(
         raise
     finally:
         _shutdown_capture_provider_guard_executor(wait=True)
+        try:
+            await asyncio.to_thread(
+                provider_attempt_accounting.shutdown_provider_attempt_recorder,
+                1.0,
+            )
+        except Exception:  # noqa: BLE001 - shutdown telemetry remains optional
+            pass

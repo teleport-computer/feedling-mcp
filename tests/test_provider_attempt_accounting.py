@@ -2,6 +2,7 @@
 
 import sys
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -98,6 +99,86 @@ def test_attempt_event_uses_a_typed_safe_usage_unknown_reason():
         kwargs["usage_unknown_reason"] = untyped_reason
         with pytest.raises(TypeError):
             ProviderAttemptEvent.create(**kwargs)
+
+
+def test_completed_attempt_event_carries_only_allowlisted_usage_and_timing_facts():
+    """Dropping any completed measurement must make the durable full-row fact incomplete."""
+    kwargs = _valid_event_kwargs()
+    kwargs.update(
+        state=AttemptState.COMPLETED,
+        outcome=AttemptOutcome.SUCCEEDED,
+        completeness=AttemptCompleteness.COMPLETE,
+        started_at=datetime(2026, 8, 3, 1, 2, 3, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 8, 3, 1, 2, 4, tzinfo=timezone.utc),
+        input_tokens=11,
+        output_tokens=7,
+        reasoning_tokens=3,
+        cache_read_tokens=5,
+        cache_write_tokens=2,
+        cache_miss_tokens=6,
+        usage_known=True,
+        possibly_billed=False,
+        latency_ms=1000.25,
+        ttft_ms=125.5,
+    )
+
+    row = ProviderAttemptEvent.create(**kwargs).as_row()
+
+    assert row["started_at"] == kwargs["started_at"]
+    assert row["finished_at"] == kwargs["finished_at"]
+    assert {
+        name: row[name]
+        for name in (
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "cache_miss_tokens",
+            "usage_known",
+            "possibly_billed",
+            "latency_ms",
+            "ttft_ms",
+        )
+    } == {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "reasoning_tokens": 3,
+        "cache_read_tokens": 5,
+        "cache_write_tokens": 2,
+        "cache_miss_tokens": 6,
+        "usage_known": True,
+        "possibly_billed": False,
+        "latency_ms": 1000.25,
+        "ttft_ms": 125.5,
+    }
+    assert "prompt" not in row
+    assert "response" not in row
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("started_at", datetime(2026, 8, 3, 1, 2, 3)),
+        ("finished_at", "2026-08-03T01:02:04Z"),
+        ("input_tokens", -1),
+        ("output_tokens", True),
+        ("reasoning_tokens", 1.5),
+        ("cache_read_tokens", float("inf")),
+        ("cache_write_tokens", "2"),
+        ("cache_miss_tokens", -3),
+        ("usage_known", 1),
+        ("possibly_billed", "false"),
+        ("latency_ms", -0.1),
+        ("ttft_ms", float("nan")),
+    ],
+)
+def test_attempt_event_rejects_unsafe_usage_and_timing_scalars(field, value):
+    """Measurements are bounded typed facts, never coercion channels for content."""
+    kwargs = _valid_event_kwargs()
+    kwargs[field] = value
+    with pytest.raises((TypeError, ValueError)):
+        ProviderAttemptEvent.create(**kwargs)
 
 
 @pytest.mark.parametrize(

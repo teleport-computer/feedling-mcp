@@ -13,11 +13,195 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import pytest
 
 import provider_client
+from provider_attempt_accounting import AttemptLane, ProviderAttemptContext
 from provider_types import ToolResult
+from model_api_runtime.v2 import extraction
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import tool_loop
 from model_api_runtime.v2 import trajectory
 from model_api_runtime.v2 import worker
+
+
+def _attempt_config(*, job_id: int = 77, lane: AttemptLane = AttemptLane.CHAT):
+    return provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-test",
+        api_key="secret",
+        provider_attempt_context=ProviderAttemptContext(
+            user_id="usr_attempt_v2",
+            lane=lane,
+            job_id=job_id,
+            call_id=f"v2job:{job_id}:base",
+            turn_id=f"v2job:{job_id}",
+        ),
+    )
+
+
+def test_worker_binds_the_same_content_free_attempt_context_after_redelivery():
+    """Changing claim attempt_count must not mint a new provider-attempt identity."""
+    config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-test",
+        api_key="secret",
+    )
+
+    first = worker._bind_provider_attempt_context(
+        config,
+        job_id=77,
+        user_id="usr_attempt_v2",
+        lane="capture",
+    )
+    redelivered = worker._bind_provider_attempt_context(
+        config,
+        job_id=77,
+        user_id="usr_attempt_v2",
+        lane="capture",
+    )
+
+    assert first.provider_attempt_context == redelivered.provider_attempt_context
+    assert first.provider_attempt_context == ProviderAttemptContext(
+        user_id="usr_attempt_v2",
+        lane=AttemptLane.CAPTURE,
+        job_id=77,
+        call_id="v2job:77:base",
+        turn_id="v2job:77",
+    )
+
+
+def test_tool_loop_binds_a_distinct_stable_logical_call_per_provider_round(
+    monkeypatch,
+):
+    seen_contexts = []
+    responses = iter([
+        {
+            "reply": "",
+            "tool_calls": [{"id": "c1", "name": "memory_search", "args": {}}],
+            "usage": {},
+        },
+        {"reply": "done", "tool_calls": [], "usage": {}},
+    ])
+
+    async def provider(config, _messages, **_kwargs):
+        seen_contexts.append(config.provider_attempt_context)
+        return next(responses)
+
+    async def dispatch(calls):
+        return [ToolResult(call_id=calls[0].id, content="found")]
+
+    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", provider)
+    outcome = asyncio.run(
+        tool_loop.run_tool_loop(
+            provider_config=_attempt_config(),
+            build_messages=lambda transcript: [
+                {"role": "user", "content": "hi"},
+                *transcript,
+            ],
+            dispatch_tools=dispatch,
+            on_reply=lambda *_args, **_kwargs: asyncio.sleep(0),
+            fold_new_messages=lambda: asyncio.sleep(0, result=[]),
+            add_usage=lambda _usage: None,
+            max_calls=3,
+        )
+    )
+
+    assert outcome.final_text == "done"
+    assert [context.call_id for context in seen_contexts] == [
+        "v2job:77:provider:1",
+        "v2job:77:provider:2",
+    ]
+    assert [context.round_id for context in seen_contexts] == [
+        "provider:1",
+        "provider:2",
+    ]
+
+
+def test_extraction_parse_retry_uses_two_stable_logical_call_ids(monkeypatch):
+    seen_contexts = []
+    responses = iter([
+        {"reply": "bad", "usage": {}},
+        {"reply": "good", "usage": {}},
+    ])
+
+    async def provider(config, _messages, **_kwargs):
+        seen_contexts.append(config.provider_attempt_context)
+        return next(responses)
+
+    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", provider)
+    result = asyncio.run(
+        extraction.extract(
+            provider_config=_attempt_config(job_id=88, lane=AttemptLane.CAPTURE),
+            prompt="private prompt",
+            parse=lambda reply: (None, "format") if reply == "bad" else (reply, None),
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _reason: True,
+                build_prompt=lambda prompt, _reason: prompt,
+                parse=lambda reply: (reply, None),
+            ),
+        )
+    )
+
+    assert result == ("good", None)
+    assert [context.call_id for context in seen_contexts] == [
+        "v2job:88:extraction:1",
+        "v2job:88:extraction:2",
+    ]
+    assert all(context.lane is AttemptLane.CAPTURE for context in seen_contexts)
+
+
+def test_worker_loop_starts_and_stops_attempt_recorder_off_provider_path(monkeypatch):
+    lifecycle = []
+    monkeypatch.setattr(
+        worker.provider_attempt_accounting,
+        "start_provider_attempt_recorder",
+        lambda: lifecycle.append("start") or True,
+    )
+    monkeypatch.setattr(
+        worker.provider_attempt_accounting,
+        "shutdown_provider_attempt_recorder",
+        lambda timeout=1: lifecycle.append(("shutdown", timeout)) or True,
+    )
+    stop = asyncio.Event()
+    stop.set()
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (None, {}),
+        mint_enclave_token=lambda _uid: "token",
+    )
+
+    asyncio.run(
+        worker.run_worker_loop(
+            "worker-attempt-recorder",
+            max_workers=1,
+            poll_interval=0.01,
+            stop_event=stop,
+            deps=deps,
+        )
+    )
+
+    assert lifecycle == ["start", ("shutdown", 1.0)]
+
+
+def test_compaction_wrapper_binds_its_explicit_stable_logical_call(monkeypatch):
+    seen = []
+
+    async def provider(config, _messages, **_kwargs):
+        seen.append(config.provider_attempt_context)
+        return {"reply": "summary", "usage": {}}
+
+    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", provider)
+    monkeypatch.setattr(worker, "_record_provider_success", lambda *_a, **_k: asyncio.sleep(0))
+    result = asyncio.run(
+        worker._compaction_llm_with_progress(
+            "usr_attempt_v2",
+            _attempt_config(job_id=91, lane=AttemptLane.MAINTENANCE),
+            [{"role": "user", "content": "private"}],
+            attempt_call_id="v2job:91:maintenance:batch:1",
+        )
+    )
+
+    assert result["reply"] == "summary"
+    assert seen[0].call_id == "v2job:91:maintenance:batch:1"
+    assert seen[0].round_id == "maintenance:batch:1"
 
 
 def test_payload_is_bounded_compressed_and_explicitly_truncated():
@@ -711,8 +895,13 @@ def test_failure_review_has_no_reply_effect_mcp_or_workspace_surface(monkeypatch
     )
     monkeypatch.setattr(jobs_store, "record_whole_turn_metric", lambda *_a, **_k: None)
 
-    async def provider(_config, messages, *, tools=None, **kwargs):
-        provider_calls.append({"messages": messages, "tools": tools, **kwargs})
+    async def provider(config, messages, *, tools=None, **kwargs):
+        provider_calls.append({
+            "messages": messages,
+            "tools": tools,
+            "attempt_context": config.provider_attempt_context,
+            **kwargs,
+        })
         return {"reply": '{"failure_class":"timeout"}', "tool_calls": [], "usage": {}}
 
     monkeypatch.setattr(provider_client, "chat_completion_async", provider)
@@ -760,6 +949,7 @@ def test_failure_review_has_no_reply_effect_mcp_or_workspace_surface(monkeypatch
     assert result == "completed"
     assert len(provider_calls) == 1
     assert provider_calls[0]["tools"] is None
+    assert provider_calls[0]["attempt_context"].call_id == "v2job:99:review:1"
     assert finished[0]["source_job_id"] == 7
     assert "review_envelope" in finished[0]
     assert finished[0]["captured_next_event_index"] == 0

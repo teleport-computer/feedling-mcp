@@ -8,8 +8,10 @@ provider-call behaviour.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 import logging
+import math
 import queue
 import re
 import threading
@@ -113,6 +115,10 @@ _EVENT_COLUMNS = (
     "resolved_provider", "resolved_model", "transport", "error_class",
     "runtime", "job_id", "turn_id", "round_id", "retry_kind",
     "provider_request_id", "usage_unknown_reason",
+    "started_at", "finished_at", "input_tokens", "output_tokens",
+    "reasoning_tokens", "cache_read_tokens", "cache_write_tokens",
+    "cache_miss_tokens", "usage_known", "possibly_billed", "latency_ms",
+    "ttft_ms",
 )
 _UPSERT_SQL = """
 INSERT INTO llm_provider_attempts (
@@ -120,7 +126,10 @@ INSERT INTO llm_provider_attempts (
   installation_id, source, lane, state, outcome, completeness,
   requested_provider, requested_model, resolved_provider, resolved_model,
   transport, error_class, runtime, job_id, turn_id, round_id, retry_kind,
-  provider_request_id, usage_unknown_reason, started_at, finished_at
+  provider_request_id, usage_unknown_reason, started_at, finished_at,
+  input_tokens, output_tokens, reasoning_tokens, cache_read_tokens,
+  cache_write_tokens, cache_miss_tokens, usage_known, possibly_billed,
+  latency_ms, ttft_ms
 ) VALUES (
   %(attempt_id)s, %(user_id)s, %(call_id)s, %(outer_attempt_ordinal)s,
   %(inner_attempt_ordinal)s, %(installation_id)s, %(source)s, %(lane)s,
@@ -128,8 +137,10 @@ INSERT INTO llm_provider_attempts (
   %(requested_model)s, %(resolved_provider)s, %(resolved_model)s,
   %(transport)s, %(error_class)s, %(runtime)s, %(job_id)s, %(turn_id)s,
   %(round_id)s, %(retry_kind)s, %(provider_request_id)s,
-  %(usage_unknown_reason)s, now(),
-  CASE WHEN %(state)s = 'completed' THEN now() ELSE NULL END
+  %(usage_unknown_reason)s, %(started_at)s, %(finished_at)s,
+  %(input_tokens)s, %(output_tokens)s, %(reasoning_tokens)s,
+  %(cache_read_tokens)s, %(cache_write_tokens)s, %(cache_miss_tokens)s,
+  %(usage_known)s, %(possibly_billed)s, %(latency_ms)s, %(ttft_ms)s
 )
 ON CONFLICT (attempt_id) DO UPDATE SET
   installation_id = CASE WHEN llm_provider_attempts.state = 'completed'
@@ -171,10 +182,31 @@ ON CONFLICT (attempt_id) DO UPDATE SET
     AND EXCLUDED.state = 'started' THEN llm_provider_attempts.provider_request_id ELSE EXCLUDED.provider_request_id END,
   usage_unknown_reason = CASE WHEN llm_provider_attempts.state = 'completed'
     AND EXCLUDED.state = 'started' THEN llm_provider_attempts.usage_unknown_reason ELSE EXCLUDED.usage_unknown_reason END,
+  started_at = LEAST(llm_provider_attempts.started_at, EXCLUDED.started_at),
+  input_tokens = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.input_tokens ELSE EXCLUDED.input_tokens END,
+  output_tokens = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.output_tokens ELSE EXCLUDED.output_tokens END,
+  reasoning_tokens = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.reasoning_tokens ELSE EXCLUDED.reasoning_tokens END,
+  cache_read_tokens = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.cache_read_tokens ELSE EXCLUDED.cache_read_tokens END,
+  cache_write_tokens = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.cache_write_tokens ELSE EXCLUDED.cache_write_tokens END,
+  cache_miss_tokens = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.cache_miss_tokens ELSE EXCLUDED.cache_miss_tokens END,
+  usage_known = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.usage_known ELSE EXCLUDED.usage_known END,
+  latency_ms = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.latency_ms ELSE EXCLUDED.latency_ms END,
+  ttft_ms = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.ttft_ms ELSE EXCLUDED.ttft_ms END,
   finished_at = CASE WHEN llm_provider_attempts.state = 'completed'
-    THEN llm_provider_attempts.finished_at WHEN EXCLUDED.state = 'completed' THEN now() ELSE NULL END,
-  possibly_billed = CASE WHEN EXCLUDED.state = 'completed' THEN FALSE
-    ELSE llm_provider_attempts.possibly_billed END,
+    THEN llm_provider_attempts.finished_at WHEN EXCLUDED.state = 'completed'
+    THEN EXCLUDED.finished_at ELSE NULL END,
+  possibly_billed = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.possibly_billed
+    ELSE EXCLUDED.possibly_billed END,
   updated_at = now()
 """
 _RECONCILE_STALE_SQL = """
@@ -230,6 +262,38 @@ def stable_attempt_id(call_id: str, outer_ordinal: int, inner_ordinal: int) -> s
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderAttemptContext:
+    """Immutable Hosted V2 identity propagated with one logical provider call."""
+
+    user_id: str
+    lane: AttemptLane
+    job_id: int
+    call_id: str
+    installation_id: str | None = None
+    runtime: str = "hosted_v2"
+    turn_id: str | None = None
+    round_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _safe_identifier("user_id", self.user_id, _INSTALLATION_ID)
+        if not isinstance(self.lane, AttemptLane):
+            raise TypeError("provider_attempt_lane_must_be_typed")
+        if (
+            not isinstance(self.job_id, int)
+            or isinstance(self.job_id, bool)
+            or self.job_id < 0
+        ):
+            raise ValueError("job_id_must_be_nonnegative")
+        _safe_identifier("call_id", self.call_id, _CALL_ID)
+        _safe_identifier(
+            "installation_id", self.installation_id, _INSTALLATION_ID, optional=True,
+        )
+        _safe_identifier("runtime", self.runtime, _RUNTIME, optional=True)
+        _safe_identifier("turn_id", self.turn_id, _CALL_ID, optional=True)
+        _safe_identifier("round_id", self.round_id, _CALL_ID, optional=True)
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderAttemptEvent:
     """Allowlisted metadata for a provider attempt; it cannot carry content."""
 
@@ -257,6 +321,18 @@ class ProviderAttemptEvent:
     retry_kind: AttemptRetryKind = AttemptRetryKind.INITIAL
     provider_request_id: str | None = None
     usage_unknown_reason: AttemptUsageUnknownReason | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    cache_miss_tokens: int | None = None
+    usage_known: bool = False
+    possibly_billed: bool = False
+    latency_ms: float | None = None
+    ttft_ms: float | None = None
 
     def __post_init__(self) -> None:
         """Keep direct dataclass construction inside the content-free contract."""
@@ -301,6 +377,39 @@ class ProviderAttemptEvent:
             or self.job_id < 0
         ):
             raise ValueError("job_id_must_be_nonnegative")
+        for name in (
+            "input_tokens", "output_tokens", "reasoning_tokens",
+            "cache_read_tokens", "cache_write_tokens", "cache_miss_tokens",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+            ):
+                raise ValueError(f"{name}_must_be_nonnegative_integer")
+        for name in ("usage_known", "possibly_billed"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"{name}_must_be_boolean")
+        for name in ("latency_ms", "ttft_ms"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"{name}_must_be_nonnegative_finite")
+        for name in ("started_at", "finished_at"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, datetime) or value.utcoffset() is None
+            ):
+                raise TypeError(f"{name}_must_be_timezone_aware_datetime")
+        if (
+            self.started_at is not None
+            and self.finished_at is not None
+            and self.finished_at < self.started_at
+        ):
+            raise ValueError("finished_at_before_started_at")
         if self.attempt_id != stable_attempt_id(
             self.call_id, self.outer_attempt_ordinal, self.inner_attempt_ordinal,
         ):
@@ -333,6 +442,18 @@ class ProviderAttemptEvent:
         retry_kind: AttemptRetryKind = AttemptRetryKind.INITIAL,
         provider_request_id: str | None = None,
         usage_unknown_reason: AttemptUsageUnknownReason | None = None,
+        started_at: datetime | None = None,
+        finished_at: datetime | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        reasoning_tokens: int | None = None,
+        cache_read_tokens: int | None = None,
+        cache_write_tokens: int | None = None,
+        cache_miss_tokens: int | None = None,
+        usage_known: bool = False,
+        possibly_billed: bool = False,
+        latency_ms: float | None = None,
+        ttft_ms: float | None = None,
     ) -> "ProviderAttemptEvent":
         _safe_identifier("user_id", user_id, _INSTALLATION_ID)
         for value, enum_type in (
@@ -366,6 +487,10 @@ class ProviderAttemptEvent:
             not isinstance(job_id, int) or isinstance(job_id, bool) or job_id < 0
         ):
             raise ValueError("job_id_must_be_nonnegative")
+        actual_started_at = started_at or datetime.now(timezone.utc)
+        actual_finished_at = finished_at
+        if state is AttemptState.COMPLETED and actual_finished_at is None:
+            actual_finished_at = datetime.now(timezone.utc)
         return cls(
             attempt_id=stable_attempt_id(
                 call_id, outer_attempt_ordinal, inner_attempt_ordinal,
@@ -393,6 +518,18 @@ class ProviderAttemptEvent:
             retry_kind=retry_kind,
             provider_request_id=provider_request_id,
             usage_unknown_reason=usage_unknown_reason,
+            started_at=actual_started_at,
+            finished_at=actual_finished_at,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            reasoning_tokens=reasoning_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            cache_miss_tokens=cache_miss_tokens,
+            usage_known=usage_known,
+            possibly_billed=possibly_billed,
+            latency_ms=latency_ms,
+            ttft_ms=ttft_ms,
         )
 
     def as_row(self) -> dict[str, object]:
@@ -425,6 +562,18 @@ class ProviderAttemptEvent:
                 None if self.usage_unknown_reason is None
                 else self.usage_unknown_reason.value
             ),
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "cache_miss_tokens": self.cache_miss_tokens,
+            "usage_known": self.usage_known,
+            "possibly_billed": self.possibly_billed,
+            "latency_ms": self.latency_ms,
+            "ttft_ms": self.ttft_ms,
         }
 
 

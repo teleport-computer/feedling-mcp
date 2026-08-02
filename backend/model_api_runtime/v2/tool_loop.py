@@ -685,6 +685,14 @@ async def run_tool_loop(
             },
         )
         attempts += 1
+        attempt_context = getattr(provider_config, "provider_attempt_context", None)
+        accounted_provider_config = provider_config
+        if attempt_context is not None:
+            accounted_provider_config = provider_client.with_provider_attempt_call(
+                provider_config,
+                call_id=f"v2job:{attempt_context.job_id}:provider:{attempts}",
+                round_id=f"provider:{attempts}",
+            )
         _progress("provider_start")
         try:
             provider_kwargs = {"tools": tools}
@@ -732,7 +740,7 @@ async def run_tool_loop(
                 # their existing limits unchanged.
                 provider_kwargs["max_tokens"] = prompt_output_reserve_tokens
             result = await provider_client.reliable_chat_completion_async(
-                provider_config,
+                accounted_provider_config,
                 messages,
                 max_attempts=(1 if forced_delivery_tool else 2),
                 base_delay_sec=0.2,

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import sys
+import os
 import threading
 import time
-from dataclasses import fields
+from dataclasses import fields, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
@@ -473,6 +476,53 @@ def test_completed_event_recovers_missing_start_and_replay_stays_idempotent():
     assert first_rows == replay_rows == [completed.as_row()]
     assert "finished_at = CASE" in executions[0][0]
     assert recorder.shutdown(timeout=0.5) is True
+
+
+@pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="needs PG")
+def test_completed_event_executes_against_the_real_attempt_schema():
+    """The full completion SQL must match revision 0076, not only fake cursors."""
+    user_id = "usr_attempt_recorder_sql"
+    accounting.db.upsert_user({"user_id": user_id})
+    started_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    event = replace(
+        _event(state=AttemptState.COMPLETED, outcome=AttemptOutcome.SUCCEEDED),
+        user_id=user_id,
+        started_at=started_at,
+        finished_at=started_at + timedelta(milliseconds=250),
+        input_tokens=11,
+        output_tokens=7,
+        reasoning_tokens=3,
+        cache_read_tokens=5,
+        cache_write_tokens=2,
+        cache_miss_tokens=6,
+        usage_known=True,
+        latency_ms=250.0,
+        ttft_ms=50.0,
+    )
+    with accounting.db.get_pool().connection() as connection:
+        connection.execute(
+            "DELETE FROM llm_provider_attempts WHERE attempt_id=%s",
+            (event.attempt_id,),
+        )
+    recorder = ProviderAttemptRecorder(batch_size=1, reconcile_interval=3600)
+    assert recorder.start() is True
+    assert recorder.record(event) is None
+
+    def _stored():
+        with accounting.db.get_pool().connection() as connection:
+            return connection.execute(
+                "SELECT input_tokens,output_tokens,reasoning_tokens,"
+                "cache_read_tokens,cache_write_tokens,cache_miss_tokens,"
+                "usage_known,latency_ms,ttft_ms "
+                "FROM llm_provider_attempts WHERE attempt_id=%s",
+                (event.attempt_id,),
+            ).fetchone()
+
+    _wait_until(lambda: _stored() is not None)
+    assert tuple(_stored()) == (11, 7, 3, 5, 2, 6, True, 250.0, 50.0)
+    assert recorder.shutdown(timeout=0.5) is True
+    with accounting.db.get_pool().connection() as connection:
+        connection.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
 
 
 def test_worker_retries_database_failure_with_bounded_backoff():

@@ -57,8 +57,23 @@ async def extract(
     它们各有自己的重试与退避。
     """
 
+    logical_call_ordinal = 0
+
     async def _call(attempt_prompt: str) -> tuple[str | None, str | None]:
         """跑一次 provider，返回 (reply, error_reason)。"""
+        nonlocal logical_call_ordinal
+        logical_call_ordinal += 1
+        attempt_context = getattr(provider_config, "provider_attempt_context", None)
+        accounted_provider_config = provider_config
+        if attempt_context is not None:
+            accounted_provider_config = provider_client.with_provider_attempt_call(
+                provider_config,
+                call_id=(
+                    f"v2job:{attempt_context.job_id}:extraction:"
+                    f"{logical_call_ordinal}"
+                ),
+                round_id=f"extraction:{logical_call_ordinal}",
+            )
         messages = [{"role": "user", "content": attempt_prompt}]
         if trajectory_out is not None:
             await trajectory_out(
@@ -66,7 +81,7 @@ async def extract(
             )
         try:
             result = await provider_client.reliable_chat_completion_async(
-                provider_config,
+                accounted_provider_config,
                 messages,
                 max_tokens=max_tokens,
                 temperature=_TEMPERATURE,
