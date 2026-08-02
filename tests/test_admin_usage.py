@@ -14,7 +14,9 @@ from psycopg.types.json import Jsonb
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from admin import data_track as _data_track  # noqa: E402
+from admin import admin_core as _admin_core  # noqa: E402
 from admin import usage as _usage  # noqa: E402
+from accounts import registry  # noqa: E402
 from core import reqctx  # noqa: E402
 import db  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
@@ -151,6 +153,144 @@ def _usage_query(**filters):
         timezone="UTC",
         **filters,
     )
+
+
+def _usage_render_report() -> dict:
+    return {
+        "overview": {
+            "registered_accounts": 12,
+            "activated_users": 8,
+            "model_active_users": 5,
+            "metered_users": 4,
+            "active_user_days": 7,
+            "turns": 11,
+            "model_calls": 14,
+            "retries": 3,
+            "failed_turns": 2,
+            "metered_turns": 9,
+            "prompt_tokens": 1_200,
+            "completion_tokens": 345,
+            "total_tokens": 1_545,
+            "cache_read_tokens": 600,
+            "cache_write_tokens": 40,
+            "cache_miss_tokens": 300,
+            "unknown_usage_calls": 2,
+        },
+        "averages": {
+            "tokens_per_calendar_day": 51.5,
+            "tokens_per_active_user_day": 220.714,
+            "tokens_per_activated_user_day": 6.4375,
+            "tokens_per_metered_turn": 171.667,
+            "user_day_tokens": {
+                "p50": 100.0,
+                "p75": 180.0,
+                "p90": 260.0,
+                "p95": 300.0,
+                "max": 400.0,
+            },
+            "model_calls_per_turn": 1.2727,
+            "retries_per_turn": 0.2727,
+        },
+        "daily": [{
+            "local_day": "2026-07-31",
+            "turns": 11,
+            "model_active_users": 5,
+            "metered_turns": 9,
+            "model_calls": 14,
+            "retries": 3,
+            "failed_turns": 2,
+            "prompt_tokens": 1_200,
+            "completion_tokens": 345,
+            "total_tokens": 1_545,
+            "cache_read_tokens": 600,
+            "cache_write_tokens": 40,
+            "cache_miss_tokens": 300,
+            "unknown_usage_calls": 2,
+            "usage_reported_calls": 12,
+            "cache_reported_calls": 8,
+            "usage_coverage": 12 / 14,
+            "cache_coverage": 8 / 14,
+            "cache_hit_ratio": 2 / 3,
+            "tokens_per_active_user_day": 309.0,
+            "tokens_per_metered_turn": 171.667,
+        }],
+        "users": [{
+            "user_id": "usr_0123456789abcdef",
+            "last_model_call_at": datetime(2026, 7, 31, 11, tzinfo=timezone.utc),
+            "active_days": 2,
+            "turns": 6,
+            "model_calls": 8,
+            "retries": 2,
+            "failed_turns": 1,
+            "metered_turns": 5,
+            "prompt_tokens": 900,
+            "completion_tokens": 200,
+            "total_tokens": 1_100,
+            "cache_read_tokens": 500,
+            "cache_write_tokens": 30,
+            "cache_miss_tokens": 200,
+            "unknown_usage_calls": 1,
+            "usage_reported_calls": 7,
+            "cache_reported_calls": 5,
+            "usage_coverage": 7 / 8,
+            "cache_coverage": 5 / 8,
+            "cache_hit_ratio": 5 / 7,
+            "primary_provider": "provider<&",
+            "primary_model": "model<script>",
+            "daily_p50": 500.0,
+            "daily_p95": 590.0,
+            "tokens_per_calendar_day": 36.667,
+            "tokens_per_active_day": 550.0,
+            "tokens_per_metered_turn": 220.0,
+            "known_token_share": 1100 / 1545,
+        }],
+        "models": [{
+            "provider": "provider<&",
+            "model": "model<script>",
+            "users": 1,
+            "turns": 6,
+            "model_calls": 8,
+            "retries": 2,
+            "failed_turns": 1,
+            "metered_turns": 5,
+            "prompt_tokens": 900,
+            "completion_tokens": 200,
+            "total_tokens": 1_100,
+            "cache_read_tokens": 500,
+            "cache_write_tokens": 30,
+            "cache_miss_tokens": 200,
+            "unknown_usage_calls": 1,
+            "usage_reported_calls": 7,
+            "cache_reported_calls": 5,
+            "usage_coverage": 7 / 8,
+            "cache_coverage": 5 / 8,
+            "cache_hit_ratio": 5 / 7,
+            "tokens_per_call": 137.5,
+            "latency_ms_p50": 1_200,
+            "latency_ms_p95": 4_500,
+            "failure_rate": 1 / 6,
+            "retry_rate": 0.25,
+        }],
+        "filters": {
+            "lanes": ["chat", "heartbeat"],
+            "providers": ["provider<&", "other"],
+            "models": ["model<script>", "other-model"],
+        },
+        "coverage": {
+            "usage_reported_calls": 12,
+            "model_calls": 14,
+            "usage_coverage": 12 / 14,
+            "cache_reported_calls": 8,
+            "cache_coverage": 8 / 14,
+            "cache_hit_ratio": 2 / 3,
+            "reference_cohort": {
+                "basis": "parseable_utc_write_timestamps_at_end_at",
+                "unparseable_registered_rows": 1,
+                "legacy_memory_rows_without_valid_created_at": 2,
+                "limitation": "legacy cohort timestamps are incomplete",
+            },
+        },
+    }
 
 
 def test_usage_query_defaults_to_rolling_30_days_in_shanghai_timezone():
@@ -445,6 +585,139 @@ def test_usage_page_href_keeps_query_while_adding_normalized_pagination():
         "sort": ["calls"],
         "dir": ["asc"],
     }
+
+
+def test_usage_page_renders_independent_report_filters_and_drill_down(monkeypatch):
+    """A missing Usage dispatch/render path must fail this operator contract."""
+    seen = []
+
+    def _report(query):
+        seen.append(query)
+        return _usage_render_report()
+
+    monkeypatch.setattr(_data_track, "_usage_report", _report)
+
+    body = _admin_core.page_html(
+        "view=usage&preset=custom&start_date=2026-07-01&end_date=2026-07-31"
+        "&timezone=UTC&lane=chat&provider=provider%3C%26&model=model%3Cscript%3E"
+        "&completeness=metered&admin_key=query-admin-token"
+    )
+
+    assert len(seen) == 1
+    query = seen[0]
+    assert query.start_at_utc == datetime(2026, 7, 1, tzinfo=timezone.utc)
+    assert query.end_at_utc == datetime(2026, 8, 1, tzinfo=timezone.utc)
+    assert query.timezone == "UTC"
+    assert query.lane == "chat"
+    assert query.provider == "provider<&"
+    assert query.model == "model<script>"
+    assert query.completeness == "metered"
+
+    for label in (
+        "Usage / 模型用量",
+        "Fleet Overview",
+        "平均值",
+        "每日趋势",
+        "Per-user Usage",
+        "Provider / Model",
+        "数据覆盖与边界",
+    ):
+        assert label in body
+    for value in ("1,545", "85.7%", "2026-07-31", "usr_0123456789abcdef"):
+        assert value in body
+    assert "24h" in body and "7d" in body and "30d" in body and "90d" in body
+    assert "name='start_date'" in body and "name='end_date'" in body
+    assert "name='lane'" in body and "name='provider'" in body
+    assert "name='model'" in body and "name='completeness'" in body
+    assert "unavailable until P0-B" in body
+    assert "unavailable until self-host phase" in body
+    assert "provider<&" not in body
+    assert "model<script>" not in body
+    assert "provider&lt;&amp;" in body
+    assert "model&lt;script&gt;" in body
+    assert (
+        "/admin/data-track/users/usr_0123456789abcdef?"
+        in body
+    )
+    assert "admin_key=query-admin-token" in body
+
+
+def test_usage_user_page_forces_path_user_and_keeps_same_query(monkeypatch):
+    """The drill-down path cannot silently fall back to the general user page."""
+    user_id = "usr_0123456789abcdef"
+    seen = []
+    monkeypatch.setattr(
+        registry,
+        "_users",
+        [{"user_id": user_id}],
+    )
+
+    def _report(query):
+        seen.append(query)
+        return _usage_render_report()
+
+    monkeypatch.setattr(_data_track, "_usage_report", _report)
+
+    kind, body, status = _admin_core.user_page(
+        "view=usage&preset=7d&timezone=UTC&lane=chat&user_id=usr_ffffffffffffffff",
+        user_id,
+    )
+
+    assert (kind, status) == ("html", 200)
+    assert seen[0].user_id == user_id
+    assert seen[0].lane == "chat"
+    assert "Usage / 模型用量" in body
+    assert "单用户钻取" in body
+    assert user_id in body
+    assert "usr_ffffffffffffffff" not in body
+
+
+def test_usage_query_failure_is_local_and_runtime_remains_available(monkeypatch):
+    """Usage/RDS failure must not make the runtime incident console unusable."""
+    def _boom(_query):
+        raise RuntimeError("private usage database detail")
+
+    monkeypatch.setattr(_data_track, "_usage_report", _boom)
+    monkeypatch.setattr(
+        _data_track,
+        "_runtime_health_summary",
+        lambda **_kw: {
+            "window_hours": 24,
+            "generated_at": 0,
+            "lanes": [],
+            "pool": {
+                "inflight": 0,
+                "pending": 0,
+                "live_workers": 1,
+                "capacity": 1,
+                "oldest_pending_age_sec": None,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        _data_track, "_runtime_token_by_lane", lambda **_kw: {"lanes": {}}
+    )
+    monkeypatch.setattr(_data_track, "_runtime_delivery_health", lambda **_kw: {})
+    monkeypatch.setattr(
+        _data_track,
+        "_runtime_user_report",
+        lambda **_kw: {"window_hours": 24, "users": []},
+    )
+
+    usage_body = _admin_core.page_html("view=usage&preset=30d")
+    runtime_body = _admin_core.page_html("view=runtime&hours=24")
+
+    assert "Usage 数据暂时取不到" in usage_body
+    assert "private usage database detail" not in usage_body
+    assert "Runtime 健康" in runtime_body
+    assert "各 lane 健康" in runtime_body
+
+
+def test_usage_report_is_wired_to_jobs_store():
+    """Assembly must replace the content-free stub with the real snapshot."""
+    import asgi_app  # noqa: F401
+
+    assert _data_track._usage_report is jobs_store.usage_report_snapshot
 
 
 def test_usage_snapshot_reconciles_users_days_models_failures_and_unknowns(usage_rows):

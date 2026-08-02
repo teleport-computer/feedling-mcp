@@ -1146,55 +1146,35 @@ def test_runtime_user_delivery_level_uses_reconciliation_and_age_thresholds():
     }) == "ok"
 
 
-def test_render_runtime_health_page_shows_user_model_and_delivery_report(bound_request):
+def test_render_runtime_health_page_shows_user_delivery_without_model_usage(bound_request):
     html_out = _dt._render_runtime_health_page(
         _payload(), _tokens(), _delivery(), _user_report()
     )
-    assert "用户 Token / Model 与交付可靠性" in html_out
-    assert "anthropic" in html_out
-    assert "claude-example" in html_out
-    assert "route-fingerprint" in html_out
-    assert "Retries" in html_out
-    assert "Cache R / W / M" in html_out
+    assert "用户交付可靠性" in html_out
     assert "Reply effects" in html_out
     assert "Failure reply/status/error" in html_out
     assert "needs_reconciliation" in html_out
     assert "usr_delivery_only" in html_out
     assert "<span class='pill bad'>异常</span>" in html_out
     assert "needs_reconciliation 1" in html_out
-    assert "hosted Runtime V2" in html_out
-    assert "历史每回合路由事实" in html_out
     assert "ok 不代表客户端已读" in html_out
     assert "不受所选时间窗口限制" in html_out
-    assert 'class="runtime-user-models"' in html_out
+    assert "用户 Token / Model 与交付可靠性" not in html_out
+    assert "claude-example" not in html_out
+    assert 'class="runtime-user-models"' not in html_out
     assert 'class="runtime-user-delivery"' in html_out
 
 
-def test_render_runtime_user_report_shows_user_link_only_on_first_model_row(bound_request):
-    # Repeating a long user link on every model row makes the report hard to scan
-    # and visually suggests that each model row belongs to a different user.
+def test_render_runtime_user_report_links_user_once_in_delivery_row(bound_request):
     report = _user_report()
-    second_model = dict(report["users"][0]["models"][0])
-    second_model.update({
-        "provider": "openai",
-        "model": "gpt-second",
-        "route": "route-second",
-    })
-    report["users"][0]["models"].append(second_model)
 
     html_out = _dt._render_runtime_health_page(
         _payload(), _tokens(), _delivery(), report
     )
-    table_start = html_out.index('<table class="runtime-user-models">')
+    table_start = html_out.index('<table class="runtime-user-delivery">')
     table_end = html_out.index("</table>", table_start)
-    model_table = html_out[table_start:table_end]
-    assert model_table.count("/admin/data-track/users/usr_report_a") == 1
-
-    second_marker = "gpt-second"
-    second_start = model_table.rindex("<tr>", 0, model_table.index(second_marker))
-    second_end = model_table.index("</tr>", second_start)
-    second_row = model_table[second_start:second_end]
-    assert second_row.startswith("<tr><td>—</td>")
+    delivery_table = html_out[table_start:table_end]
+    assert delivery_table.count("/admin/data-track/users/usr_report_a") == 1
 
 
 def test_render_runtime_user_report_explains_user_id_attribution(bound_request):
@@ -1219,24 +1199,12 @@ def test_render_runtime_user_report_does_not_link_unknown_user_id(bound_request)
 def test_render_runtime_user_report_preserves_unknowns_and_escapes(bound_request):
     report = _user_report()
     report["users"][0]["user_id"] = "usr_<unsafe>"
-    report["users"][0]["models"][0]["provider"] = "<unsafe-provider>"
-    report["users"][0]["models"][0]["model"] = "<script>bad</script>"
-    report["users"][0]["models"][0]["route"] = 'route"&<unsafe>'
-    report["users"][0]["models"][0]["lanes"] = ["<unsafe-lane>"]
-    report["users"][0]["models"][0]["prompt_tokens"] = None
     html_out = _dt._render_runtime_health_page(
         _payload(), _tokens(), _delivery(), report
     )
-    assert "<script>bad</script>" not in html_out
-    assert "&lt;script&gt;bad&lt;/script&gt;" in html_out
-    assert "<unsafe-provider>" not in html_out
-    assert "&lt;unsafe-provider&gt;" in html_out
-    assert 'route"&<unsafe>' not in html_out
-    assert "route&quot;&amp;&lt;unsafe&gt;" in html_out
-    assert "<unsafe-lane>" not in html_out
-    assert "&lt;unsafe-lane&gt;" in html_out
+    assert "usr_<unsafe>" not in html_out
+    assert "usr_&lt;unsafe&gt;" in html_out
     assert "usr_%3Cunsafe%3E" in html_out
-    assert "—" in html_out
 
 
 def test_render_runtime_user_report_links_keep_current_admin_query_string():
@@ -1256,7 +1224,7 @@ def test_render_runtime_health_page_user_report_unavailable_is_local(bound_reque
     html_out = _dt._render_runtime_health_page(
         _payload(), _tokens(), _delivery(), None
     )
-    assert "用户 Token/model 与交付可靠性暂时取不到" in html_out
+    assert "用户交付可靠性暂时取不到" in html_out
     assert "各 lane 健康" in html_out
     assert "端到端交付" in html_out
 
@@ -1267,7 +1235,7 @@ def test_render_runtime_user_report_empty_window_is_not_unavailable(bound_reques
     )
     assert "所选 168 小时窗口没有用户指标或当前待交付项" in html_out
     assert "暂时取不到" not in html_out
-    assert "colspan='10'" in html_out
+    assert "colspan='7'" in html_out
 
 
 # ---- Task 4: 每用户报表路由编排与装配 ----
@@ -1306,7 +1274,7 @@ def test_runtime_view_passes_same_window_to_user_report(monkeypatch):
         "delivery": 168,
         "users": 168,
     }
-    assert "用户 Token / Model 与交付可靠性" in body
+    assert "用户交付可靠性" in body
 
 
 def test_runtime_user_report_failure_does_not_hide_health(monkeypatch):
@@ -1335,7 +1303,7 @@ def test_runtime_user_report_failure_does_not_hide_health(monkeypatch):
     assert "各 lane 健康" in body
     assert "951.2k" in body
     assert "<div class='metric-value'>3 / 4</div>" in body
-    assert "用户 Token/model 与交付可靠性暂时取不到" in body
+    assert "用户交付可靠性暂时取不到" in body
     assert "user report db" not in body
 
 

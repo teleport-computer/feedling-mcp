@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import db
@@ -94,6 +95,14 @@ def page_html(query_string: str) -> str:
             return data_track._render_proactive_daily_page(data_track._data_track_proactive_daily_payload())
         if view == "debug":
             return data_track._render_data_track_debug_page(data_track._data_track_debug_payload())
+        if view == "usage":
+            query = data_track.admin_usage.parse_usage_query(request.args)
+            try:
+                report = data_track._usage_report(query)
+            except Exception:
+                logging.exception("admin usage report failed (other views still served)")
+                return data_track._render_usage_error_page(query)
+            return data_track._render_usage_page(report, query)
         if view == "runtime":
             # 窗口算一次、传给四个数据函数——各处自行读 request.args 会让窗口
             # 有机会不一致（同页一个 24 小时、一个 720 小时）。
@@ -152,6 +161,26 @@ def user_page(query_string: str, user_id: str) -> tuple[str, str, int]:
     if not entry:
         return "text", "user not found", 404
     with bind(query_string):
+        view = (request.args.get("view") or "").strip().lower()
+        if view == "usage":
+            query = replace(
+                data_track.admin_usage.parse_usage_query(request.args),
+                user_id=user_id,
+            )
+            try:
+                report = data_track._usage_report(query)
+            except Exception:
+                logging.exception(
+                    "admin user usage report failed (other views still served)"
+                )
+                body = data_track._render_usage_error_page(
+                    query, drilldown_user_id=user_id
+                )
+            else:
+                body = data_track._render_usage_page(
+                    report, query, drilldown_user_id=user_id
+                )
+            return "html", body, 200
         body = data_track._render_user_detail_page(
             data_track._build_data_track_user(entry, include_detail=True)
         )
