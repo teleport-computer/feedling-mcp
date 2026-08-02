@@ -1109,6 +1109,9 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.PROD_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
+          # M4/M5 profile generation + MEMORY/USER prompt injection. Encrypted
+          # env channel; default off, flip via repo var + redeploy.
+          FEEDLING_V2_PROFILE_ENABLED:  ${{ vars.PROD_FEEDLING_V2_PROFILE_ENABLED || '0' }}
           # Break-glass trajectory inspection (audited runner-local CLI inside
           # serve-worker). Default '0'; set the repo var to '1' only for the
           # duration of an incident, then back. Encrypted env — flipping it
@@ -1172,6 +1175,7 @@ jobs:
             -e "FEEDLING_EXPECTED_RUNNER_COUNT=$FEEDLING_EXPECTED_RUNNER_COUNT" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
+            -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
             -e "FEEDLING_V2_COMPACTION_BATCH_CHARS=$FEEDLING_V2_COMPACTION_BATCH_CHARS" \
@@ -1364,6 +1368,9 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.TEST_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
+          # M4/M5 profile generation + MEMORY/USER prompt injection. Encrypted
+          # env channel; default off, flip via repo var + redeploy.
+          FEEDLING_V2_PROFILE_ENABLED:  ${{ vars.TEST_FEEDLING_V2_PROFILE_ENABLED || '0' }}
           # Nightly memory Dream lane (provider-backed distillation). Explicit
           # opt-in like Capture; default '0'. serve_worker._tick_dream_for_user
           # only runs when this is '1'. Encrypted env — flip via repo var +
@@ -1424,6 +1431,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
+            -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_DREAM_ENABLED=$FEEDLING_V2_DREAM_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
@@ -1746,6 +1754,9 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.PRE_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
+          # M4/M5 profile generation + MEMORY/USER prompt injection. Encrypted
+          # env channel; default off, flip via repo var + redeploy.
+          FEEDLING_V2_PROFILE_ENABLED:  ${{ vars.PRE_FEEDLING_V2_PROFILE_ENABLED || '0' }}
           # Break-glass trajectory inspection (audited runner-local CLI inside
           # serve-worker). Default '0'; set the repo var to '1' only for the
           # duration of an incident, then back. Encrypted env — flipping it
@@ -1798,6 +1809,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
+            -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
             -e "FEEDLING_V2_COMPACTION_BATCH_CHARS=$FEEDLING_V2_COMPACTION_BATCH_CHARS" \
