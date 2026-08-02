@@ -1,15 +1,17 @@
 # Feedling — Phala TDX CVM compose (CVM-only, post-VPS migration).
 #
-# VPS is gone. This compose is the whole production stack:
-#   - dstack-ingress: TLS termination for api.feedling.app
-#   - backend:       ASGI (HTTP+WS) — sole source of truth for user data
-#   - enclave:       decrypt proxy + /attestation (own TLS on :5003,
-#                    reachable via dstack-gateway `-5003s.` passthrough)
+# This compose is the whole test stack:
+#   - dstack-ingress: WebPKI TLS for test-api.feedling.app and
+#                     test-enclave.feedling.app
+#   - backend:        ASGI (HTTP+WS) — sole source of truth for user data
+#   - enclave:        decrypt proxy + /attestation with its own TLS on :5003,
+#                     reachable directly via dstack-gateway `-5003s.` passthrough
+#   - enclave-domain: internal HTTP :5004 entrypoint, reachable only through
+#                     the ingress-backed test-enclave.feedling.app custom domain
+#   - serve-worker:   pooled Runtime V2 worker
 #
-# IMPORTANT: this replaces the prior VPS+CVM split. DNS A-records for
-# `api.feedling.app` is migrated off
-# the retired VPS host and onto Phala's dstack-gateway. Existing prod users
-# re-onboard from scratch (per user direction 2026-04-21).
+# IMPORTANT: test domains, volumes, database, content key, and AppAuth policy
+# stay isolated from production even though both deployments use prod9.
 #
 # REQUIRED CVM NODE: prod9 (dstack-pha-prod9). Multi-domain TXT routing
 # via `_dstack-app-address.<domain>` only works on the prod9 gateway;
@@ -19,23 +21,28 @@
 #
 # DNS records dstack-ingress manages automatically (needs CF token with
 # Zone.DNS:Edit on feedling.app):
-#   CNAME api.feedling.app → <app-id>.dstack-pha-prod9.phala.network
-#   TXT   _dstack-app-address.api.feedling.app → <app-id>:443
-#   CAA   api.feedling.app pinned to Let's Encrypt
+#   CNAME test-api.feedling.app → <app-id>.dstack-pha-prod9.phala.network
+#   TXT   _dstack-app-address.test-api.feedling.app → <app-id>:443
+#   CAA   test-api.feedling.app pinned to Let's Encrypt
+#   CNAME test-enclave.feedling.app → <app-id>.dstack-pha-prod9.phala.network
+#   TXT   _dstack-app-address.test-enclave.feedling.app → <app-id>:443
+#   CAA   test-enclave.feedling.app pinned to Let's Encrypt
+#
+# Enclave entrypoints intentionally coexist:
+#   direct: https://<app-id>-5003s.dstack-pha-prod9.phala.network → enclave:5003
+#           (enclave-owned TLS and certificate pinning)
+#   custom: https://test-enclave.feedling.app → ingress:443 → enclave-domain:5004
+#           (ingress evidence plus enclave application attestation; no host port)
 #
 # Deploy flow:
-#   1. `phala deploy -c deploy/docker-compose.phala.yaml -n feedling-enclave-v2 \
+#   1. `phala deploy -c deploy/docker-compose.phala.test.yaml -n feedling-test \
 #         --node-id <prod9-node-id> -e CF_API_TOKEN=... -e CF_ZONE_ID=...`
 #   2. Wait for ingress to issue LE certs (first-time boot ~2–3 min).
-#   3. Update CF DNS: A record for api → the public IP printed by
-#      `phala cvms get feedling-enclave-v2` (or the CNAME target above).
+#   3. Confirm both test DNS names target the app_id returned by
+#      `phala cvms get feedling-test`.
 #   4. Compute compose_hash; publish on-chain via FeedlingAppAuth.addComposeHash.
-#   5. iOS follow-up PR: update `AuditCardView.swift` `makeAttestationURL`
-#      and `FeedlingAPI.swift` pinning URL to the new app_id on prod9.
-#      Decide whether the MCP-port pubkey-pin row stays (now pins ingress
-#      cert — requires enclave_app.py to bake ingress cert SPKI hash into
-#      REPORT_DATA) or is retired (content-layer envelope crypto still
-#      secures reads/writes regardless of transport-layer pinning).
+#   5. Verify both entrypoints and their distinct evidence bindings before
+#      enabling clients to use the custom-domain path.
 #
 # CRITICAL: every literal in this file becomes part of the compose_hash.
 # Any ${VAR} below must be category (A) — cosmetic / non-security.
@@ -44,7 +51,7 @@
 name: feedling-test
 
 services:
-  # --- Public TLS termination for the api custom domain. ---
+  # --- Public TLS termination for the API and enclave custom domains. ---
   # HAProxy-based L4/L7 ingress inside the TDX CVM. Issues LE certs via
   # CF DNS-01, routes by SNI. Key material stays inside the enclave
   # volume `letsencrypt` — the CF token only has DNS-edit scope, not
@@ -61,8 +68,10 @@ services:
       CERTBOT_EMAIL: "security@feedling.app"
       DOMAINS: |
         test-api.feedling.app
+        test-enclave.feedling.app
       ROUTING_MAP: |
         test-api.feedling.app=backend:5001
+        test-enclave.feedling.app=enclave-domain:5004
       # CF_API_TOKEN must be injected via `phala deploy -e` (encrypted
       # env channel, NOT baked into compose_hash). Required scopes:
       # Zone.DNS:Edit on the feedling.app zone (for DNS-01 challenge +
@@ -78,6 +87,8 @@ services:
     depends_on:
       backend:
         condition: service_started
+      enclave-domain:
+        condition: service_started
 
   # --- Attestation service + decrypt proxy. ---
   # Keeps its own in-enclave TLS on :5003. NOT routed through ingress —
@@ -87,44 +98,65 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:d529026
-    command: ["python", "-u", "backend/enclave_app.py"]
+    image: &enclave-image ghcr.io/teleport-computer/feedling:f40d13a
+    command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
+      <<: &enclave-environment
+        FEEDLING_DATA_DIR: "/data"
+        FEEDLING_FLASK_URL: "http://backend:5001"
+        # Stage-D runtime token secret — lets the enclave verify a caller's runtime
+        # token LOCALLY (core/runtime_token.py) in whoami_live / whoami_cached,
+        # SKIPPING the reentrant backend /v1/users/whoami round-trip. MUST match the
+        # backend's (line ~257) + the runner's secret; CI injects the same
+        # TEST_FEEDLING_RUNTIME_TOKEN_SECRET into all three. Empty = falls back to
+        # the round-trip (old behavior, no regression).
+        #
+        # This line was MISSING on test while prod had it (compose drift), and the
+        # backend already had it here — so only the enclave fell back. Every
+        # envelope/decrypt then hit backend /v1/users/whoami, a path that is
+        # deliberately UNCACHED (auth.py: whoami_live, so a revoked key dies at
+        # once). Measured on test 2026-07-13: 891 whoami in 6.5min (2.2/s, vs 31
+        # chat/poll) saturating the single-worker backend, which was itself blocked
+        # awaiting the very decrypt that triggered them → decrypt p95 19.6s /
+        # max 47.7s → 34s chat replies of which pi was only 3.1s.
+        FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+        MEMORY_READSIDE_FOR_MODEL_API: "true"
+        # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
+        # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
+        # even when the value is empty, so an empty string would make it
+        # try to connect to "" and fail with EINVAL. Leaving the var unset
+        # lets dstack-sdk fall through to /var/run/dstack.sock (mounted
+        # below). Only set this on dev laptops running the simulator.
       FEEDLING_ENCLAVE_PORT: "5003"
-      FEEDLING_DATA_DIR: "/data"
       FEEDLING_ENCLAVE_TLS: "true"
-      FEEDLING_FLASK_URL: "http://backend:5001"
-      # Stage-D runtime token secret — lets the enclave verify a caller's runtime
-      # token LOCALLY (core/runtime_token.py) in whoami_live / whoami_cached,
-      # SKIPPING the reentrant backend /v1/users/whoami round-trip. MUST match the
-      # backend's (line ~257) + the runner's secret; CI injects the same
-      # TEST_FEEDLING_RUNTIME_TOKEN_SECRET into all three. Empty = falls back to
-      # the round-trip (old behavior, no regression).
-      #
-      # This line was MISSING on test while prod had it (compose drift), and the
-      # backend already had it here — so only the enclave fell back. Every
-      # envelope/decrypt then hit backend /v1/users/whoami, a path that is
-      # deliberately UNCACHED (auth.py: whoami_live, so a revoked key dies at
-      # once). Measured on test 2026-07-13: 891 whoami in 6.5min (2.2/s, vs 31
-      # chat/poll) saturating the single-worker backend, which was itself blocked
-      # awaiting the very decrypt that triggered them → decrypt p95 19.6s /
-      # max 47.7s → 34s chat replies of which pi was only 3.1s.
-      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
-      MEMORY_READSIDE_FOR_MODEL_API: "true"
-      # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
-      # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
-      # even when the value is empty, so an empty string would make it
-      # try to connect to "" and fail with EINVAL. Leaving the var unset
-      # lets dstack-sdk fall through to /var/run/dstack.sock (mounted
-      # below). Only set this on dev laptops running the simulator.
+      FEEDLING_ENCLAVE_TRANSPORT_MODE: "direct_tls"
     ports:
       - "5003:5003"
-    volumes:
+    volumes: &enclave-volumes
       - feedling_enclave_data_test:/data
       - /var/run/dstack.sock:/var/run/dstack.sock
     healthcheck:
       test: ["CMD-SHELL", "curl -k -s -o /dev/null -w '%{http_code}' https://127.0.0.1:5003/healthz | grep -qE '^(200|503)$'"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  enclave-domain:
+    image: *enclave-image
+    command: *enclave-command
+    restart: unless-stopped
+    environment:
+      <<: *enclave-environment
+      FEEDLING_ENCLAVE_PORT: "5004"
+      FEEDLING_ENCLAVE_TLS: "false"
+      FEEDLING_ENCLAVE_TRANSPORT_MODE: "attested_ingress"
+    expose:
+      - "5004"
+    volumes: *enclave-volumes
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:5004/healthz | grep -qE '^(200|503)$'"]
       interval: 15s
       timeout: 5s
       retries: 20
@@ -146,7 +178,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:d529026
+    image: ghcr.io/teleport-computer/feedling:f40d13a
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -317,7 +349,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:d529026
+    image: ghcr.io/teleport-computer/feedling:f40d13a
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped

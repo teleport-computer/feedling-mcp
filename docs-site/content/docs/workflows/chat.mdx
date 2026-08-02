@@ -309,6 +309,21 @@ also the hosted-V1 kill switch; changing it away from `resident` transfers
 execution ownership to the selected path. Poll claims remain database-atomic, so
 two healthy poll consumers cannot both claim the same parent turn.
 
+### Choose and verify the enclave transport
+
+An operator can configure a resident's enclave URL to the managed custom domain
+or to the existing Phala `-5003s` audit endpoint. The custom-domain route is
+client TLS to `dstack-ingress` in the measured TDX CVM, followed by
+Docker-internal HTTP to `enclave-domain`. That plaintext hop stays inside the
+measured CVM; Cloudflare supplies DNS-01 records only and does not proxy traffic.
+Before treating the route as pinning-equivalent, a client must verify WebPKI,
+the ingress certificate-evidence bundle, and the enclave attestation bundle.
+
+The `-5003s` route is retained for compatible clients and audit tooling. It
+instead verifies the enclave's live self-signed certificate fingerprint against
+the attestation `REPORT_DATA`; do not replace that direct check with WebPKI
+validation for the custom-domain route.
+
 CLI residents (Claude, Codex, and Pi) can also generate native download cards.
 The agent writes UTF-8 Markdown-like source inside its private
 `$FEEDLING_HOME/outbound-files` directory and calls the resident `send-file`

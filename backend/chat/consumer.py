@@ -16,6 +16,11 @@ from core.store import UserStore
 _OFFICIAL_CONSUMER_NAME = "feedling-chat-resident"
 VISION_OBSERVER_CAPABILITY = "vision_observer_v1"
 VISION_PROBE_CAPABILITY = "vision_probe_v2"
+# Advertised by a consumer build whose io_cli carries the V1 web verbs. An older
+# build simply omits these from its X-Feedling-Consumer-Capabilities header, so
+# the settings page fails closed for it (see web.settings_core._runtime_supported).
+WEB_SEARCH_CAPABILITY = "web_search_v1"
+WEB_FETCH_CAPABILITY = "web_fetch_v1"
 _VISION_PROBE_TTL_SEC = max(
     30, min(300, int(os.environ.get("FEEDLING_VISION_PROBE_TTL_SEC", "120")))
 )

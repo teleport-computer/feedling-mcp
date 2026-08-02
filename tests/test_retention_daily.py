@@ -55,9 +55,12 @@ def _set_signup(user_id: str, day: str) -> None:
 
 
 def _activity(user_id: str, day: str) -> None:
+    # "使用 DAU" basis: an app_session_end foreground session that day (a genuine
+    # app open), NOT a chat message — retention/growth now count real usage only.
     ts = datetime.fromisoformat(f"{day}T14:00:00+08:00").timestamp()
-    db.chat_append(user_id, f"m_{user_id}_{day}", ts,
-                   {"role": "user", "source": "chat"}, 500)
+    db.log_append(user_id, "tracking_events",
+                  {"type": "app_session_end", "payload": {"duration_sec": 600}},
+                  ts=ts)
 
 
 def _today_minus(n: int) -> str:

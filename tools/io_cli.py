@@ -220,7 +220,9 @@ def _http_json(method, url, auth, *, payload=None, insecure=False, timeout=30):
         return -1, {"error": f"{type(e).__name__}: {e}"}
 
 
-_REDACTED_ARG_KEYS = {"query", "self_introduction", "signature", "reason", "material_text"}
+# "url" is here because a fetch/search target's query string routinely carries
+# tokens/keys/session ids — it must never land verbatim in a debug trace.
+_REDACTED_ARG_KEYS = {"query", "url", "self_introduction", "signature", "reason", "material_text"}
 
 
 def _clip_arg(s, limit=80):
@@ -461,6 +463,44 @@ def _require_backend():
     if not api_url or not auth:
         _emit({"ok": False, "error": "missing FEEDLING_API_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
     return api_url.rstrip("/"), auth
+
+
+def _emit_web_result(status, body):
+    """Emit a web capability response VERBATIM (no extra wrapper).
+
+    Both /v1/agent/web/{search,fetch} return CapabilityResult.to_dict() on 200 —
+    either {"ok": True, "data": ..., "trace": ..., "warnings": ...} or
+    {"ok": False, "error": ...}. Unlike the other verbs (which do {"ok": True,
+    **body}), the model is handed the CapabilityResult shape as-is; the tool just
+    maps its ``ok`` to the process exit code so a fail-closed authorization/limit
+    error is a non-zero exit while the full JSON still reaches the agent.
+
+    A non-200 means no CapabilityResult came back — most commonly a 403 until the
+    V1 supervisor token carries the "web" scope (a later batch), or a transport
+    error. Surface the raw HTTP status + error and exit non-zero, matching every
+    other verb's non-200 shape."""
+    if status == 200 and isinstance(body, dict) and "ok" in body:
+        _emit(body, 0 if body.get("ok") else 1)
+        return  # _emit already sys.exit()s; explicit return so a future _emit
+        # that doesn't exit can never fall through and double-emit on a 200.
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
+def cmd_web_search(args):
+    """联网搜索实时信息。POST /v1/agent/web/search."""
+    api_url, auth = _require_backend()
+    payload = {"query": args.query}
+    if args.limit is not None:
+        payload["limit"] = args.limit
+    status, body = _http_json("POST", f"{api_url}/v1/agent/web/search", auth, payload=payload)
+    _emit_web_result(status, body)
+
+
+def cmd_web_fetch(args):
+    """抓取指定网页正文。POST /v1/agent/web/fetch."""
+    api_url, auth = _require_backend()
+    status, body = _http_json("POST", f"{api_url}/v1/agent/web/fetch", auth, payload={"url": args.url})
+    _emit_web_result(status, body)
 
 
 def cmd_memory_index(args):
@@ -1692,6 +1732,21 @@ def main():
     ph.add_argument("signal", help="e.g. vitals/sleep/motion/location/calendar/reminders/mood")
     ph.add_argument("--days", type=int, default=14, help="number of historical days to fetch")
     ph.set_defaults(func=cmd_perception_history)
+
+    ws = sub.add_parser(
+        "web-search",
+        help="联网搜索实时信息(新闻/天气/价格等训练数据里没有的当下内容)。",
+    )
+    ws.add_argument("query", help="search query, e.g. '今天北京天气'")
+    ws.add_argument("--limit", type=int, default=None, help="max results (optional)")
+    ws.set_defaults(func=cmd_web_search)
+
+    wf = sub.add_parser(
+        "web-fetch",
+        help="抓取指定网页正文(拿到一个 URL 后读它的实际内容)。",
+    )
+    wf.add_argument("url", help="the page URL to fetch")
+    wf.set_defaults(func=cmd_web_fetch)
 
     mi = sub.add_parser("memory-index", help="Compact memory index (readside, plaintext-safe).")
     mi.add_argument("--limit", type=int, default=50, help="maximum number of cards to return")

@@ -1259,10 +1259,32 @@ def _agent_entry_signature() -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def _consumer_capabilities(hosted: bool) -> str:
+    """Comma-separated ``X-Feedling-Consumer-Capabilities`` value.
+
+    Vision caps are advertised on every line. ``web_search_v1`` / ``web_fetch_v1``
+    are a CLOUD-ONLY product: only the HOSTED consumer (per-user runtime token)
+    advertises them. VPS / self-hosted residents must NOT — they use their own
+    model provider's built-in web capability, so our web tools are never offered
+    to them. The settings page keys ``_runtime_supported`` off this header, so
+    omitting the web caps makes web read ``effective = false`` for self-hosted
+    accounts, which is exactly the intended product boundary.
+    """
+    caps = ["vision_observer_v1", "vision_probe_v2"]
+    if hosted:
+        caps += ["web_search_v1", "web_fetch_v1"]
+    return ",".join(caps)
+
+
 _HEADERS = {
     "X-API-Key": FEEDLING_API_KEY,
     "X-Feedling-Consumer": "feedling-chat-resident",
-    "X-Feedling-Consumer-Capabilities": "vision_observer_v1,vision_probe_v2",
+    # Web caps are hosted-only — see _consumer_capabilities. ``_HOSTED`` isn't
+    # defined until further down, so read the same signal (the runtime-token
+    # file) directly from the env here.
+    "X-Feedling-Consumer-Capabilities": _consumer_capabilities(
+        bool(os.environ.get("FEEDLING_RUNTIME_TOKEN_FILE", "").strip())
+    ),
     "X-Feedling-Consumer-Id": CONSUMER_ID,
     "X-Feedling-Consumer-Version": "resident-v1",
     "X-Feedling-Consumer-Commit": RUNNING_COMMIT,
@@ -7860,6 +7882,7 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
     fails before the model ever saw the prompt does not permanently skip the
     catalog for the rest of that session."""
     global _io_cli_catalog_cache, _io_cli_catalog_pending_session_id
+    global _web_advertised_session_id, _web_off_notice_session_id
     if _HOSTED or AGENT_MODE != "cli":
         return content
 
@@ -7867,8 +7890,17 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
     sid = None
     if not is_codex:
         sid = _load_agent_session_id()
-        if sid == _io_cli_catalog_injected_session_id:
-            return content  # already confirmed-injected for this session
+
+    # Web policy (batch 5) is applied on TOP of the cached full catalog, per turn,
+    # so it tracks a mid-session toggle even for a resume-capable driver whose
+    # catalog was already injected — that early-return path still delivers the
+    # one-line "web is off now" correction below.
+    web_notice = _web_off_notice_for_turn(sid)
+
+    if not is_codex and sid == _io_cli_catalog_injected_session_id:
+        # Catalog already confirmed-injected for this session; only a web-off
+        # correction (if any) still needs to reach the model this turn.
+        return f"{web_notice}\n\n{content}" if web_notice else content
 
     catalog = _io_cli_catalog_cache
     if catalog is None:
@@ -7895,21 +7927,33 @@ def _prepend_io_cli_capability_catalog(content: str) -> str:
             # drop the ONLY defense against instructions smuggled through
             # files/web pages/memory cards now that D2 (confirmation) is gone
             # (I2). Prepend D3 alone — cheap, doesn't need a subprocess, and
-            # independent of whether the full --help sweep succeeds.
+            # independent of whether the full --help sweep succeeds. The fallback
+            # never lists the web verbs, so only a web-off correction can apply.
+            notice = f"{web_notice}\n\n" if web_notice else ""
             return (
-                f"{io_cli_catalog.D3_SOURCING_RULE}\n"
+                f"{notice}{io_cli_catalog.D3_SOURCING_RULE}\n"
                 f"{_memory_read_prompt_block()}\n"
                 f"{_outbound_file_prompt_block()}\n\n{content}"
             )
         _io_cli_catalog_cache = catalog
+
+    # Our web-search / web-fetch is CLOUD-ONLY. This whole path is VPS /
+    # self-hosted only (the ``_HOSTED`` early-return above), so the web verbs are
+    # ALWAYS stripped here regardless of the server-advertised policy — a
+    # self-hosted resident must never be offered our web tools; it uses its own
+    # model provider's built-in web capability. Because we never advertise the
+    # verbs, ``_web_advertised_session_id`` is never set, so ``web_notice`` above
+    # stays empty too (nothing was ever promised to retract).
+    catalog_for_turn = _strip_web_verbs_from_catalog(catalog)
 
     if not is_codex:
         # NOT committed yet — see _commit_io_cli_catalog_injection /
         # _discard_io_cli_catalog_pending_injection docstrings above.
         _io_cli_catalog_pending_session_id = sid
 
+    notice = f"{web_notice}\n\n" if web_notice else ""
     return (
-        f"{catalog}\n{_memory_read_prompt_block()}\n"
+        f"{notice}{catalog_for_turn}\n{_memory_read_prompt_block()}\n"
         f"{_outbound_file_prompt_block()}\n\n{content}"
     )
 
@@ -8746,6 +8790,71 @@ _agent_session_id_cache: dict[str, str] = {}
 _agent_session_meta_cache: dict[str, dict[str, Any]] = {}
 _chat_runtime_v2_profile: dict[str, Any] = {}
 
+# The effective web-tool policy the backend advertises on every /v1/chat/poll
+# (batch 5): {"effective": bool, "search": bool, "fetch": bool}. Drives whether
+# the io_cli web-search/web-fetch verbs are shown to the model in the injected
+# catalog. Display only — the real block is the server-side execution gate.
+_web_policy: dict[str, Any] = {}
+# The agent session id whose injected catalog last INCLUDED the web verbs, and
+# the session id we've already told "web is now off". Both keyed by session id
+# (None for codex — it has no resume, so the model never retained the verbs and
+# needs no correction). See _web_off_notice_for_turn.
+_web_advertised_session_id: str | None = None
+_web_off_notice_session_id: str | None = None
+
+# One-line correction prepended for a resume-capable session that already saw the
+# web verbs earlier this session and now has web turned off — the model still has
+# the old prompt in its resumed context, so tell it once the verbs are gone. The
+# server-side gate is what actually enforces; this only stops wasted attempts.
+_WEB_OFF_NOTICE = (
+    "联网搜索已关闭：web-search 与 web-fetch 目前不可用，请勿再调用；"
+    "如需联网请提示用户到设置里重新开启。"
+)
+
+
+def _update_web_policy(policy: Any) -> None:
+    global _web_policy
+    _web_policy = dict(policy) if isinstance(policy, dict) else {}
+
+
+def _web_tools_effective() -> bool:
+    try:
+        return bool(_web_policy.get("effective"))
+    except Exception:
+        return False
+
+
+def _strip_web_verbs_from_catalog(catalog: str) -> str:
+    """Drop the web-search/web-fetch catalog lines (first token match) when web
+    is off. The catalog's own lines are ``verb <args...>  description``, so the
+    leading token is the verb name."""
+    kept = []
+    for line in catalog.split("\n"):
+        token = line.split(" ", 1)[0].strip() if line.strip() else ""
+        if token in ("web-search", "web-fetch"):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _web_off_notice_for_turn(sid: str | None) -> str:
+    """Return the one-line 'web is off now' notice, once, for a resume-capable
+    session that already advertised the web verbs and now has web disabled;
+    ``''`` otherwise. Codex (sid is None) never gets it — with no resume the
+    model never carried the verbs forward, so the freshly-filtered catalog is
+    already the whole truth."""
+    global _web_off_notice_session_id
+    if _web_tools_effective():
+        return ""
+    if sid is None:
+        return ""
+    if _web_advertised_session_id != sid:
+        return ""  # this session never saw the web verbs
+    if _web_off_notice_session_id == sid:
+        return ""  # already corrected this session
+    _web_off_notice_session_id = sid
+    return _WEB_OFF_NOTICE
+
 
 def _load_whoami() -> bool:
     """Fetch encryption keys from /v1/users/whoami and cache them.
@@ -8931,6 +9040,7 @@ def poll_chat(since: float, timeout: int | None = None, claim: bool = True) -> d
     if isinstance(body, dict):
         _update_chat_runtime_v2_profile(body.get("runtime_v2"))
         _update_user_mcp_advertised(body.get("user_mcp"))
+        _update_web_policy(body.get("web_policy"))
     return body
 
 

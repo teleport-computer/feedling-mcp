@@ -34,6 +34,22 @@ does not provide Intel TDX attestation or protection from the machine operator.
 Envelope encryption still protects backups and accidental storage exposure, but
 the host operator controls the processes that can request decryption.
 
+### Managed enclave-domain access is a separate trust model
+
+The managed custom domain is available only when the endpoint is behind
+`dstack-ingress` inside a measured TDX CVM. Its route is client TLS to ingress,
+then Docker-internal HTTP to `enclave-domain`; this internal plaintext hop is
+within the measured CVM boundary, not a substitute for an additional TLS hop.
+Cloudflare manages the DNS-01 records only and does not proxy the connection.
+
+For a custom-domain client, validate WebPKI, the ingress certificate evidence,
+and the enclave attestation as separate evidence. Do not call WebPKI alone
+pinning-equivalent. The older Phala `-5003s` passthrough endpoint remains the
+compatibility and audit route: it uses the enclave's live self-signed
+certificate, whose fingerprint must be checked against attestation
+`REPORT_DATA`. A generic self-host cannot reproduce either hardware-attested
+trust chain merely by copying the Compose layout.
+
 A resident consumer can also re-run identity extraction (a "redistill") directly
 from a local terminal conversation, without going through the app's plaintext
 upload flow. This path reuses the existing sealed-import lane: the resident
