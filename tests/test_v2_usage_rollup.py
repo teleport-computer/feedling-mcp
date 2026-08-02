@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
+import time as wall_time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
 import psycopg
+from psycopg.rows import dict_row
 
 import db
 from conftest import seed_user
@@ -16,6 +19,39 @@ from model_api_runtime.v2 import usage_rollup
 
 
 ROLLUP_NAME = "hosted_v2_usage"
+_FACT_METRICS = (
+    "turns",
+    "model_calls",
+    "retries",
+    "failed_turns",
+    "usage_reported_calls",
+    "cache_reported_calls",
+    "unknown_usage_calls",
+    "prompt_tokens_sum",
+    "prompt_tokens_known_count",
+    "completion_tokens_sum",
+    "completion_tokens_known_count",
+    "cache_read_tokens_sum",
+    "cache_read_tokens_known_count",
+    "cache_write_tokens_sum",
+    "cache_write_tokens_known_count",
+    "cache_miss_tokens_sum",
+    "cache_miss_tokens_known_count",
+)
+_FACT_COLUMNS = tuple(
+    f"{prefix}_{metric}"
+    for prefix in ("all", "metered", "unknown")
+    for metric in _FACT_METRICS
+)
+
+
+def _flatten_expected(**prefixes: tuple[int, ...]) -> dict[str, int]:
+    assert set(prefixes) == {"all", "metered", "unknown"}
+    return {
+        f"{prefix}_{metric}": value
+        for prefix, values in prefixes.items()
+        for metric, value in zip(_FACT_METRICS, values, strict=True)
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -220,6 +256,71 @@ def test_recompute_one_day_preserves_overlapping_and_null_semantics():
     ]
 
 
+def test_every_user_and_dimension_subaggregate_matches_the_raw_fixture():
+    """Catches any one of all 51 count/sum fields or exact arrays drifting."""
+    day = date(2026, 8, 1)
+    uid = _seed_overlap_day(day)
+    usage_rollup.recompute_local_day(day)
+
+    expected_user = _flatten_expected(
+        all=(3, 6, 3, 1, 3, 1, 3, 150, 2, 20, 1, 10, 1, 0, 0, 0, 1),
+        metered=(2, 5, 3, 1, 3, 1, 2, 150, 2, 20, 1, 10, 1, 0, 0, 0, 1),
+        unknown=(2, 4, 2, 1, 1, 0, 3, 50, 1, 0, 0, 0, 0, 0, 0, 0, 0),
+    )
+    expected_chat = _flatten_expected(
+        all=(2, 5, 3, 1, 3, 1, 2, 150, 2, 20, 1, 10, 1, 0, 0, 0, 1),
+        metered=(2, 5, 3, 1, 3, 1, 2, 150, 2, 20, 1, 10, 1, 0, 0, 0, 1),
+        unknown=(1, 3, 2, 1, 1, 0, 2, 50, 1, 0, 0, 0, 0, 0, 0, 0, 0),
+    )
+    empty = (0,) * len(_FACT_METRICS)
+    unknown_only = (1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    expected_unknown_identity = _flatten_expected(
+        all=unknown_only,
+        metered=empty,
+        unknown=unknown_only,
+    )
+
+    columns_sql = ",".join(_FACT_COLUMNS)
+    with db.get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"SELECT {columns_sql} FROM v2_usage_daily_users "
+                "WHERE local_day=%s AND user_id=%s",
+                (day, uid),
+            )
+            user_row = cur.fetchone()
+            cur.execute(
+                f"SELECT lane,provider,model,{columns_sql},"
+                "all_latency_samples,metered_latency_samples,unknown_latency_samples "
+                "FROM v2_usage_daily_dimensions WHERE local_day=%s AND user_id=%s "
+                "ORDER BY lane,provider,model",
+                (day, uid),
+            )
+            dimensions = cur.fetchall()
+
+    assert user_row == expected_user
+    assert dimensions == [
+        {
+            "lane": "chat",
+            "provider": "openai",
+            "model": "gpt-5",
+            **expected_chat,
+            "all_latency_samples": [100, 200],
+            "metered_latency_samples": [100, 200],
+            "unknown_latency_samples": [200],
+        },
+        {
+            "lane": "unknown",
+            "provider": "unknown",
+            "model": "unknown",
+            **expected_unknown_identity,
+            "all_latency_samples": [],
+            "metered_latency_samples": [],
+            "unknown_latency_samples": [],
+        },
+    ]
+
+
 def test_recompute_preserves_one_canonical_null_user_row():
     """Catches nullable source attribution being dropped or duplicated during rebuild."""
     day = date(2026, 8, 5)
@@ -302,6 +403,69 @@ def test_day_replacement_is_idempotent_and_rolls_back_as_one_unit():
         )
 
 
+def test_day_user_and_dimension_facts_share_one_repeatable_read_snapshot():
+    """Catches the two INSERT aggregations observing different source versions."""
+    day = date(2026, 8, 6)
+    uid = _uid("day_snapshot")
+    seed_user(uid)
+    job_id = _insert_metric(
+        created_at=datetime(2026, 8, 6, 4, tzinfo=timezone.utc),
+        user_id=uid,
+        prompt_tokens=10,
+        completion_tokens=1,
+        model_calls=1,
+        usage_reported_calls=1,
+    )
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "CREATE OR REPLACE FUNCTION pause_after_usage_users() RETURNS trigger "
+            "LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.5); RETURN NULL; END $$"
+        )
+        conn.execute(
+            "CREATE TRIGGER pause_after_usage_users AFTER INSERT "
+            "ON v2_usage_daily_users FOR EACH STATEMENT "
+            "EXECUTE FUNCTION pause_after_usage_users()"
+        )
+
+    started = threading.Event()
+
+    def update_source_during_rebuild():
+        started.set()
+        wall_time.sleep(0.15)
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(
+                "UPDATE v2_turn_metrics SET prompt_tokens=99,updated_at=now() "
+                "WHERE job_id=%s",
+                (job_id,),
+            )
+
+    updater = threading.Thread(target=update_source_during_rebuild)
+    updater.start()
+    assert started.wait(timeout=1)
+    try:
+        usage_rollup.recompute_local_day(day)
+    finally:
+        updater.join(timeout=2)
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "DROP TRIGGER IF EXISTS pause_after_usage_users ON v2_usage_daily_users"
+            )
+            conn.execute("DROP FUNCTION IF EXISTS pause_after_usage_users()")
+    assert not updater.is_alive()
+    with db.get_pool().connection() as conn:
+        user_sum = conn.execute(
+            "SELECT all_prompt_tokens_sum FROM v2_usage_daily_users "
+            "WHERE local_day=%s AND user_id=%s",
+            (day, uid),
+        ).fetchone()[0]
+        dimension_sum = conn.execute(
+            "SELECT all_prompt_tokens_sum FROM v2_usage_daily_dimensions "
+            "WHERE local_day=%s AND user_id=%s",
+            (day, uid),
+        ).fetchone()[0]
+    assert (user_sum, dimension_sum) == (10, 10)
+
+
 def test_bootstrap_and_changed_row_scans_are_bounded():
     """Catches an initial deployment attempting an unbounded history transaction."""
     uid = _uid("bounded")
@@ -347,6 +511,133 @@ def test_bootstrap_and_changed_row_scans_are_bounded():
     assert second_tick["days_refreshed"] == 2
     assert second_tick["bootstrap_complete"] is True
     assert _watermark()["dirty_from_day"] is None
+
+
+def test_bootstrap_day_range_and_safe_cursor_share_one_snapshot(monkeypatch):
+    """Catches a concurrent new day entering the cursor but not bootstrap's dirty range."""
+    uid = _uid("bootstrap_snapshot")
+    seed_user(uid)
+    now = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+    first_day = date(2026, 6, 1)
+    second_day = first_day + timedelta(days=1)
+    first_job = _insert_metric(
+        created_at=datetime(2026, 6, 1, 4, tzinfo=timezone.utc),
+        updated_at=now - timedelta(days=1),
+        user_id=uid,
+        prompt_tokens=1,
+        completion_tokens=1,
+        model_calls=1,
+        usage_reported_calls=1,
+    )
+    original = usage_rollup._cursor_max_on_cursor
+    inserted = False
+
+    def insert_between_day_range_and_cursor(cur, **kwargs):
+        nonlocal inserted
+        if not inserted:
+            inserted = True
+            _insert_metric(
+                created_at=datetime(2026, 6, 2, 4, tzinfo=timezone.utc),
+                updated_at=now - timedelta(days=1) + timedelta(minutes=1),
+                user_id=uid,
+                prompt_tokens=2,
+                completion_tokens=1,
+                model_calls=1,
+                usage_reported_calls=1,
+            )
+        return original(cur, **kwargs)
+
+    monkeypatch.setattr(
+        usage_rollup, "_cursor_max_on_cursor", insert_between_day_range_and_cursor
+    )
+    first = usage_rollup.run_maintenance_tick(
+        max_days=1, overlap_seconds=600, now_utc=now
+    )
+    with db.get_pool().connection() as conn:
+        first_source_id = conn.execute(
+            "SELECT id FROM v2_turn_metrics WHERE job_id=%s", (first_job,)
+        ).fetchone()[0]
+    assert first["refreshed_days"] == [first_day.isoformat()]
+    assert first["source_id"] == first_source_id
+
+    second = usage_rollup.run_maintenance_tick(
+        max_days=1, overlap_seconds=600, now_utc=now
+    )
+    assert second["refreshed_days"] == [second_day.isoformat()]
+
+
+def test_forward_cursor_limits_rows_per_tick_and_eventually_rebuilds_all_days():
+    """Catches max_changed_rows being ignored or later eligible updates skipped."""
+    uid = _uid("cursor_batch")
+    seed_user(uid)
+    now = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+    assert (
+        usage_rollup.run_maintenance_tick(overlap_seconds=600, now_utc=now)[
+            "bootstrap_complete"
+        ]
+        is True
+    )
+    first_day = date(2026, 7, 1)
+    for offset in range(5):
+        day = first_day + timedelta(days=offset)
+        _insert_metric(
+            created_at=datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+            + timedelta(hours=4),
+            updated_at=now - timedelta(hours=1),
+            user_id=uid,
+            prompt_tokens=offset + 1,
+            completion_tokens=1,
+            model_calls=1,
+            usage_reported_calls=1,
+        )
+    with db.get_pool().connection() as conn:
+        source_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM v2_turn_metrics ORDER BY updated_at,id"
+            ).fetchall()
+        ]
+
+    ticks = [
+        usage_rollup.run_maintenance_tick(
+            max_days=2,
+            max_changed_rows=2,
+            overlap_seconds=600,
+            now_utc=now,
+        )
+        for _ in range(3)
+    ]
+    assert [tick["source_id"] for tick in ticks] == [
+        source_ids[1],
+        source_ids[3],
+        source_ids[4],
+    ]
+    assert ticks[0]["source_lag_seconds"] > 0
+    assert ticks[1]["source_lag_seconds"] > 0
+    assert ticks[2]["source_lag_seconds"] == 0
+    assert [tick["refreshed_days"] for tick in ticks] == [
+        [(first_day + timedelta(days=offset)).isoformat() for offset in (0, 1)],
+        [(first_day + timedelta(days=offset)).isoformat() for offset in (2, 3)],
+        [(first_day + timedelta(days=4)).isoformat()],
+    ]
+    assert (
+        usage_rollup.run_maintenance_tick(
+            max_days=2,
+            max_changed_rows=2,
+            overlap_seconds=600,
+            now_utc=now,
+        )["days_refreshed"]
+        == 0
+    )
+    with db.get_pool().connection() as conn:
+        assert (
+            conn.execute(
+                "SELECT count(DISTINCT local_day) FROM v2_usage_daily_users "
+                "WHERE user_id=%s",
+                (uid,),
+            ).fetchone()[0]
+            == 5
+        )
 
 
 def test_tick_commits_each_day_before_a_later_day_crashes():
@@ -446,7 +737,7 @@ def test_incremental_cursor_overlap_discovers_a_late_updated_old_day():
     refreshed = usage_rollup.run_maintenance_tick(
         max_days=1,
         overlap_seconds=600,
-        now_utc=now + timedelta(minutes=1),
+        now_utc=now + timedelta(minutes=11),
     )
     assert refreshed["days_refreshed"] == 1
     with db.get_pool().connection() as conn:
@@ -460,62 +751,67 @@ def test_incremental_cursor_overlap_discovers_a_late_updated_old_day():
         )
 
 
-def test_overlap_window_cannot_starve_an_old_late_row_behind_the_row_limit():
-    """Catches DESC/LIMIT overlap scans permanently revisiting only the newest rows."""
-    target_day = date(2026, 6, 10)
-    uid = _uid("overlap_starvation")
+def test_safe_lag_cursor_does_not_rebuild_without_new_source_updates():
+    """Catches a fixed overlap window recreating the same dirty day forever."""
+    day = date(2026, 6, 12)
+    uid = _uid("safe_lag_idle")
     seed_user(uid)
-    cursor_at = datetime(2026, 8, 1, 0, 10, tzinfo=timezone.utc)
-    target_job = _insert_metric(
-        created_at=datetime(2026, 6, 10, 4, tzinfo=timezone.utc),
-        updated_at=cursor_at,
+    now = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+    _insert_metric(
+        created_at=datetime(2026, 6, 12, 4, tzinfo=timezone.utc),
+        updated_at=now - timedelta(days=1),
         user_id=uid,
         prompt_tokens=10,
         completion_tokens=1,
         model_calls=1,
         usage_reported_calls=1,
     )
+    first = usage_rollup.run_maintenance_tick(
+        max_days=1, overlap_seconds=600, now_utc=now
+    )
+    second = usage_rollup.run_maintenance_tick(
+        max_days=1, overlap_seconds=600, now_utc=now
+    )
+    third = usage_rollup.run_maintenance_tick(
+        max_days=1, overlap_seconds=600, now_utc=now + timedelta(minutes=1)
+    )
+    assert first["refreshed_days"] == [day.isoformat()]
+    assert second["days_refreshed"] == 0
+    assert third["days_refreshed"] == 0
+
+
+def test_recent_source_update_waits_until_the_safe_horizon():
+    """Catches the cursor consuming transactions still inside the lateness budget."""
+    uid = _uid("safe_lag_recent")
+    seed_user(uid)
+    now = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
     assert (
-        usage_rollup.run_maintenance_tick(max_days=2, now_utc=cursor_at)[
+        usage_rollup.run_maintenance_tick(overlap_seconds=600, now_utc=now)[
             "bootstrap_complete"
         ]
         is True
     )
 
-    # Simulate rows whose transactions were invisible to the cursor snapshot
-    # but committed later with transaction-start timestamps behind the cursor.
-    with db.get_pool().connection() as conn:
-        conn.execute(
-            "UPDATE v2_turn_metrics SET prompt_tokens=99,updated_at=%s WHERE job_id=%s",
-            (datetime(2026, 7, 31, 20, 0, tzinfo=timezone.utc), target_job),
-        )
-    for minute in (0, 10, 20, 30):
-        _insert_metric(
-            created_at=datetime(2026, 6, 11, 4, tzinfo=timezone.utc),
-            updated_at=datetime(2026, 7, 31, 22, minute, tzinfo=timezone.utc),
-            user_id=uid,
-            prompt_tokens=1,
-            completion_tokens=1,
-            model_calls=1,
-            usage_reported_calls=1,
-        )
-
-    result = usage_rollup.run_maintenance_tick(
-        max_days=1,
-        max_changed_rows=2,
-        overlap_seconds=6 * 60 * 60,
-        now_utc=cursor_at + timedelta(minutes=1),
+    day = date(2026, 7, 20)
+    _insert_metric(
+        created_at=datetime(2026, 7, 20, 4, tzinfo=timezone.utc),
+        updated_at=now - timedelta(minutes=5),
+        user_id=uid,
+        prompt_tokens=7,
+        completion_tokens=1,
+        model_calls=1,
+        usage_reported_calls=1,
     )
-    assert result["refreshed_days"] == [target_day.isoformat()]
-    with db.get_pool().connection() as conn:
-        assert (
-            conn.execute(
-                "SELECT all_prompt_tokens_sum FROM v2_usage_daily_users "
-                "WHERE local_day=%s AND user_id=%s",
-                (target_day, uid),
-            ).fetchone()[0]
-            == 99
-        )
+    still_recent = usage_rollup.run_maintenance_tick(
+        max_days=1, overlap_seconds=600, now_utc=now
+    )
+    after_horizon = usage_rollup.run_maintenance_tick(
+        max_days=1,
+        overlap_seconds=600,
+        now_utc=now + timedelta(minutes=6),
+    )
+    assert still_recent["days_refreshed"] == 0
+    assert after_horizon["refreshed_days"] == [day.isoformat()]
 
 
 def test_advisory_lock_competition_skips_without_waiting():

@@ -175,6 +175,12 @@ _COMMON_FACT_COLUMNS = tuple(
 _LATENCY_COLUMNS = tuple(f"{prefix}_latency_samples" for prefix in _PREFIX_CONDITIONS)
 
 
+def _begin_repeatable_read(cur) -> None:
+    # Must be the first statement after BEGIN.  Every multi-statement helper
+    # derives its facts and cursor metadata from one PostgreSQL MVCC snapshot.
+    cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+
+
 def _set_local_limits(cur, statement_timeout_ms: int) -> None:
     cur.execute(
         "SELECT set_config('statement_timeout', %s, true), "
@@ -246,6 +252,7 @@ def recompute_local_day(
     with db.get_pool().connection(timeout=DEFAULT_POOL_TIMEOUT_SECONDS) as conn:
         with conn.transaction():
             with conn.cursor() as cur:
+                _begin_repeatable_read(cur)
                 _set_local_limits(cur, timeout_ms)
                 return _recompute_on_cursor(cur, local_day, refreshed_at=refreshed)
 
@@ -286,18 +293,44 @@ def _watermark_on_cursor(cur, *, for_update: bool = False) -> dict:
     return row
 
 
-def _cursor_max_on_cursor(cur) -> tuple[datetime, int] | None:
-    cur.execute(
-        "SELECT updated_at,id FROM v2_turn_metrics "
-        "ORDER BY updated_at DESC,id DESC LIMIT 1"
-    )
+def _cursor_max_on_cursor(
+    cur, *, through: datetime | None = None
+) -> tuple[datetime, int] | None:
+    if through is None:
+        cur.execute(
+            "SELECT updated_at,id FROM v2_turn_metrics "
+            "ORDER BY updated_at DESC,id DESC LIMIT 1"
+        )
+    else:
+        cur.execute(
+            "SELECT updated_at,id FROM v2_turn_metrics WHERE updated_at <= %s "
+            "ORDER BY updated_at DESC,id DESC LIMIT 1",
+            (through,),
+        )
     row = cur.fetchone()
     return None if row is None else (row["updated_at"], int(row["id"]))
 
 
-def _initialize_bootstrap(conn, *, now_utc: datetime, timeout_ms: int) -> dict:
+def _source_lag_seconds(
+    cursor: tuple[datetime, int], source_head: tuple[datetime, int] | None
+) -> float:
+    """Expose tuple backlog even when head and cursor timestamps are identical."""
+
+    if source_head is None or source_head <= cursor:
+        return 0.0
+    return max((source_head[0] - cursor[0]).total_seconds(), 0.001)
+
+
+def _initialize_bootstrap(
+    conn,
+    *,
+    now_utc: datetime,
+    overlap_seconds: float,
+    timeout_ms: int,
+) -> dict:
     with conn.transaction():
         with conn.cursor(row_factory=dict_row) as cur:
+            _begin_repeatable_read(cur)
             _set_local_limits(cur, timeout_ms)
             state = _watermark_on_cursor(cur, for_update=True)
             if state["bootstrap_started_at"] is not None:
@@ -308,12 +341,16 @@ def _initialize_bootstrap(conn, *, now_utc: datetime, timeout_ms: int) -> dict:
                 "FROM v2_turn_metrics"
             )
             days = cur.fetchone()
-            cursor = _cursor_max_on_cursor(cur)
+            safe_horizon = now_utc - timedelta(seconds=overlap_seconds)
+            cursor = _cursor_max_on_cursor(cur, through=safe_horizon)
+            source_head = _cursor_max_on_cursor(cur)
             complete = days["first_day"] is None
             source_at, source_id = cursor or (
                 datetime.fromtimestamp(0, tz=timezone.utc),
                 0,
             )
+            observed_at = source_head[0] if source_head is not None else None
+            source_lag = _source_lag_seconds((source_at, source_id), source_head)
             cur.execute(
                 "UPDATE v2_usage_rollup_watermarks SET "
                 "bootstrap_started_at=%s,bootstrap_complete=%s,"
@@ -321,7 +358,7 @@ def _initialize_bootstrap(conn, *, now_utc: datetime, timeout_ms: int) -> dict:
                 "dirty_from_day=%s,dirty_through_day=%s,"
                 "source_updated_at=%s,source_id=%s,"
                 "source_observed_updated_at=%s,"
-                "source_lag_seconds=GREATEST(extract(epoch FROM (%s-%s)),0),"
+                "source_lag_seconds=%s,"
                 "last_success_at=CASE WHEN %s THEN %s ELSE last_success_at END,"
                 "last_error=NULL,version=version+1,updated_at=%s "
                 "WHERE rollup_name=%s AND version=%s RETURNING *",
@@ -334,9 +371,8 @@ def _initialize_bootstrap(conn, *, now_utc: datetime, timeout_ms: int) -> dict:
                     days["last_day"],
                     source_at,
                     source_id,
-                    source_at,
-                    now_utc,
-                    source_at,
+                    observed_at,
+                    source_lag,
                     complete,
                     now_utc,
                     now_utc,
@@ -373,32 +409,23 @@ def _discover_dirty_days(
 ) -> dict:
     with conn.transaction():
         with conn.cursor(row_factory=dict_row) as cur:
+            _begin_repeatable_read(cur)
             _set_local_limits(cur, timeout_ms)
             state = _watermark_on_cursor(cur, for_update=True)
             if not state["bootstrap_complete"]:
                 return state
             cursor_at = state["source_updated_at"]
             cursor_id = int(state["source_id"])
+            safe_horizon = now_utc - timedelta(seconds=overlap_seconds)
             cur.execute(
                 "SELECT updated_at,id,(created_at AT TIME ZONE 'Asia/Shanghai')::date "
                 "AS local_day FROM v2_turn_metrics "
-                "WHERE (updated_at,id)>(%s,%s) ORDER BY updated_at,id LIMIT %s",
-                (cursor_at, cursor_id, max_changed_rows),
+                "WHERE (updated_at,id)>(%s,%s) AND updated_at <= %s "
+                "ORDER BY updated_at,id LIMIT %s",
+                (cursor_at, cursor_id, safe_horizon, max_changed_rows),
             )
             changed = cur.fetchall()
-            overlap_start = cursor_at - timedelta(seconds=overlap_seconds)
-            cur.execute(
-                "SELECT min((created_at AT TIME ZONE 'Asia/Shanghai')::date) "
-                "AS first_day,max((created_at AT TIME ZONE 'Asia/Shanghai')::date) "
-                "AS last_day,max(updated_at) AS observed_updated_at "
-                "FROM v2_turn_metrics "
-                "WHERE updated_at >= %s AND (updated_at,id) <= (%s,%s)",
-                (overlap_start, cursor_at, cursor_id),
-            )
-            overlap = cur.fetchone()
             discovered = [row["local_day"] for row in changed]
-            if overlap["first_day"] is not None:
-                discovered.extend((overlap["first_day"], overlap["last_day"]))
             new_cursor_at, new_cursor_id = cursor_at, cursor_id
             if changed:
                 last = changed[-1]
@@ -406,24 +433,15 @@ def _discover_dirty_days(
             dirty_from, dirty_through = _merge_dirty_range(
                 state["dirty_from_day"], state["dirty_through_day"], discovered
             )
-            observed = max(
-                [row["updated_at"] for row in changed]
-                + (
-                    [overlap["observed_updated_at"]]
-                    if overlap["observed_updated_at"]
-                    else []
-                )
-                + (
-                    [state["source_observed_updated_at"]]
-                    if state["source_observed_updated_at"]
-                    else []
-                )
-                + [new_cursor_at]
+            source_head = _cursor_max_on_cursor(cur)
+            observed = source_head[0] if source_head is not None else None
+            source_lag = _source_lag_seconds(
+                (new_cursor_at, new_cursor_id), source_head
             )
             cur.execute(
                 "UPDATE v2_usage_rollup_watermarks SET source_updated_at=%s,source_id=%s,"
                 "source_observed_updated_at=%s,"
-                "source_lag_seconds=GREATEST(extract(epoch FROM (%s-%s)),0),"
+                "source_lag_seconds=%s,"
                 "dirty_from_day=%s,dirty_through_day=%s,last_error=NULL,"
                 "version=version+1,updated_at=%s "
                 "WHERE rollup_name=%s AND version=%s RETURNING *",
@@ -431,8 +449,7 @@ def _discover_dirty_days(
                     new_cursor_at,
                     new_cursor_id,
                     observed,
-                    now_utc,
-                    observed,
+                    source_lag,
                     dirty_from,
                     dirty_through,
                     now_utc,
@@ -451,6 +468,7 @@ def _refresh_next_day(
 ) -> tuple[date | None, dict | None]:
     with conn.transaction():
         with conn.cursor(row_factory=dict_row) as cur:
+            _begin_repeatable_read(cur)
             _set_local_limits(cur, timeout_ms)
             state = _watermark_on_cursor(cur, for_update=True)
             local_day = state["dirty_from_day"]
@@ -562,7 +580,12 @@ def run_maintenance_tick(
                     "ON CONFLICT (rollup_name) DO NOTHING",
                     (ROLLUP_NAME,),
                 )
-                state = _initialize_bootstrap(conn, now_utc=now, timeout_ms=timeout_ms)
+                state = _initialize_bootstrap(
+                    conn,
+                    now_utc=now,
+                    overlap_seconds=overlap,
+                    timeout_ms=timeout_ms,
+                )
                 if state["bootstrap_complete"]:
                     state = _discover_dirty_days(
                         conn,
