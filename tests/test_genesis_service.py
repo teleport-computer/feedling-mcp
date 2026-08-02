@@ -29,6 +29,18 @@ def _chunk_meta(user_id: str = "usr_genesis", *, body: bytes = b"ciphertext") ->
     }
 
 
+def test_plaintext_chunk_round_trips_without_crypto_fields(monkeypatch):
+    raw = b"plain genesis chunk"
+    meta = {"v": 1, "id": "genesis_plain_0", "body": raw.decode(),
+            "visibility": "shared", "owner_user_id": "usr_plain"}
+    monkeypatch.setattr(service.core_envelope, "resolve_content_encryption",
+                        lambda user_id: "off" if user_id == "usr_plain" else "on")
+    stored_meta = service._chunk_envelope_meta(_store("usr_plain"), meta, raw)
+    row = {"aad": {"envelope_meta": stored_meta}, "encrypted_body": raw}
+    assert stored_meta["body_object_format"] == "plaintext_v1"
+    assert service.chunk_envelope_from_row(row) == meta
+
+
 def test_genesis_state_maps_active_job_to_processing_gate_status(monkeypatch):
     captured = {}
     monkeypatch.setattr(

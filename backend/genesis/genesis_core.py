@@ -434,8 +434,13 @@ def _job_response(job: dict | None, *, extra: dict | None = None) -> dict:
 def _json_chunk_payload(payload: dict) -> tuple[bytes, dict[str, Any]]:
     envelope = payload.get("envelope") if isinstance(payload.get("envelope"), dict) else {}
     envelope_meta = payload.get("envelope_meta") if isinstance(payload.get("envelope_meta"), dict) else envelope
-    body_ct = str(payload.get("ciphertext_b64") or envelope.get("body_ct") or "")
-    raw = service.b64decode_required(body_ct)
+    if envelope.get("body") is not None:
+        raw = str(envelope.get("body") or "").encode("utf-8")
+    elif envelope.get("body_b64") is not None:
+        raw = service.b64decode_required(str(envelope.get("body_b64") or ""))
+    else:
+        body_ct = str(payload.get("ciphertext_b64") or envelope.get("body_ct") or "")
+        raw = service.b64decode_required(body_ct)
     payload = {**payload, "envelope_meta": envelope_meta}
     return raw, payload
 

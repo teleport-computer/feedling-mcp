@@ -3784,6 +3784,9 @@ def wire_assembly() -> None:
     只是把它桥到本进程 event loop 的一个 asyncio.Event（context 由 `_serve` 在 loop 起来后
     经 `v2_worker.set_job_wake_context` 设置——这里只负责注册 handler，不依赖 running loop）。"""
     core_envelope.get_user_public_key = accounts_registry._get_user_public_key
+    core_envelope.resolve_content_encryption = (
+        accounts_registry.effective_content_encryption
+    )
     accounts_registry.load_users()
     core_wake_bus.register_handler("users", _reload_accounts_registry)
     core_wake_bus.register_handler("v2_jobs", v2_worker.on_v2_job_notify)

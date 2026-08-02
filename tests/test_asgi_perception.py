@@ -27,6 +27,7 @@ credentials through the current enclave adapter.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import sys
 from pathlib import Path
@@ -39,6 +40,7 @@ from asgi import middleware  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 
 import accounts.auth_core as auth_core  # noqa: E402
+from core import envelope as core_envelope  # noqa: E402
 import perception.routes_asgi as perception_asgi  # noqa: E402
 import perception.service as service  # noqa: E402
 
@@ -280,6 +282,25 @@ def test_photo_evaluate_stores_ciphertext_parity(env):
     stored = fake.get_photo_envelope(UID, "p_ok")
     assert stored["body_ct"] == "CIPHERTEXT"
     assert "image_b64" not in stored and "ocr_text" not in stored
+
+
+def test_photo_evaluate_stores_plaintext_binary_for_off_account(env, monkeypatch):
+    fake, _ = env
+    raw = b"jpeg-plaintext"
+    wire = {
+        "v": 1, "id": "p_plain", "body_b64": base64.b64encode(raw).decode(),
+        "body_size_bytes": len(raw), "visibility": "shared", "owner_user_id": UID,
+    }
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption", lambda uid: "off")
+
+    status, out, _ct = _both(
+        "POST", "/v1/perception/photo/evaluate",
+        json={"metadata": {"scene_hint": "landscape"}, "content_envelope": wire},
+    )
+
+    assert status == 200 and out["photo_id"] == "p_plain"
+    assert fake.get_photo_envelope(UID, "p_plain") == wire
 
 
 def test_photo_evaluate_missing_envelope_400_parity(env):

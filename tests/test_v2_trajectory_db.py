@@ -39,6 +39,15 @@ def _envelope(user_id: str, item_id: str, plaintext: str) -> dict:
     }
 
 
+def _plaintext_envelope(user_id: str, item_id: str, plaintext: str) -> dict:
+    return {
+        "id": item_id,
+        "owner_user_id": user_id,
+        "visibility": "shared",
+        "body": plaintext,
+    }
+
+
 @pytest.fixture(autouse=True)
 def clean_tables(monkeypatch):
     monkeypatch.setenv("FEEDLING_V2_TRAJECTORY_REVIEW_ENABLED", "1")
@@ -129,6 +138,43 @@ def test_encrypted_events_are_ordered_idempotent_and_immutable():
                 "WHERE job_id=%s AND event_index=0",
                 (job_id,),
             )
+
+
+def test_plaintext_tier_trajectory_event_is_accepted_and_stored_verbatim():
+    uid = "u_trajectory_plaintext"
+    job_id, _job = _source_job(uid)
+    payload = _plaintext_envelope(uid, "event-plain", '{"kind":"tool"}')
+
+    index = jobs_store.append_trajectory_event(
+        job_id,
+        uid,
+        event_kind="tool_call",
+        idempotency_key="plain_tool_call",
+        payload_envelope=payload,
+        payload_bytes=len(payload["body"]),
+    )
+
+    assert index == 0
+    stored = jobs_store.list_trajectory_events(job_id, uid)[0]["payload_envelope"]
+    assert stored == payload
+    assert "body_ct" not in stored
+
+
+def test_plaintext_trajectory_rejects_mixed_or_extra_fields():
+    uid = "u_trajectory_plaintext_invalid"
+    job_id, _job = _source_job(uid)
+    payload = _plaintext_envelope(uid, "event-plain-invalid", "payload")
+    payload["nonce"] = "must-not-survive"
+
+    with pytest.raises(ValueError, match="unsupported fields"):
+        jobs_store.append_trajectory_event(
+            job_id,
+            uid,
+            event_kind="tool_call",
+            idempotency_key="plain_invalid",
+            payload_envelope=payload,
+            payload_bytes=7,
+        )
 
 
 def test_encrypted_event_batch_is_atomic_ordered_and_idempotent():

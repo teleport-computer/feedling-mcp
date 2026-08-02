@@ -182,7 +182,7 @@ _TRAJECTORY_ACCESS_RESULT_RE = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
 _TRAJECTORY_ACCESS_REASONS = frozenset(
     {"incident", "support", "security", "debug"}
 )
-_TRAJECTORY_ENVELOPE_REQUIRED = frozenset(
+_TRAJECTORY_SEALED_REQUIRED = frozenset(
     {
         "v",
         "id",
@@ -194,7 +194,7 @@ _TRAJECTORY_ENVELOPE_REQUIRED = frozenset(
         "K_enclave",
     }
 )
-_TRAJECTORY_ENVELOPE_ALLOWED = frozenset(
+_TRAJECTORY_SEALED_ALLOWED = frozenset(
     {
         "v",
         "id",
@@ -207,6 +207,9 @@ _TRAJECTORY_ENVELOPE_ALLOWED = frozenset(
         "enclave_pk_fpr",
         "content_pk_fpr",
     }
+)
+_TRAJECTORY_PLAINTEXT_REQUIRED = frozenset(
+    {"id", "owner_user_id", "visibility", "body"}
 )
 
 
@@ -258,17 +261,25 @@ def _review_admission_available_on_cursor(cur) -> bool:
 def _validate_trajectory_envelope(user_id: str, envelope: object) -> dict:
     if not isinstance(envelope, dict):
         raise ValueError("trajectory payload envelope must be an object")
-    if not _TRAJECTORY_ENVELOPE_REQUIRED.issubset(envelope):
-        raise ValueError("trajectory payload envelope is incomplete")
-    if set(envelope) - _TRAJECTORY_ENVELOPE_ALLOWED:
-        raise ValueError("trajectory payload envelope has unsupported fields")
-    if type(envelope.get("v")) is not int:
-        raise ValueError("trajectory payload envelope version must be an integer")
     if envelope.get("owner_user_id") != str(user_id):
         raise ValueError("trajectory payload envelope owner mismatch")
     if envelope.get("visibility") != "shared":
         raise ValueError("trajectory payload envelope must be shared")
-    for field in ("id", "body_ct", "nonce", "K_user", "K_enclave"):
+    if "body_ct" in envelope:
+        if not _TRAJECTORY_SEALED_REQUIRED.issubset(envelope):
+            raise ValueError("trajectory payload envelope is incomplete")
+        if set(envelope) - _TRAJECTORY_SEALED_ALLOWED:
+            raise ValueError("trajectory payload envelope has unsupported fields")
+        if type(envelope.get("v")) is not int:
+            raise ValueError("trajectory payload envelope version must be an integer")
+        required = ("id", "body_ct", "nonce", "K_user", "K_enclave")
+    else:
+        if not _TRAJECTORY_PLAINTEXT_REQUIRED.issubset(envelope):
+            raise ValueError("trajectory plaintext payload is incomplete")
+        if set(envelope) != _TRAJECTORY_PLAINTEXT_REQUIRED:
+            raise ValueError("trajectory plaintext payload has unsupported fields")
+        required = ("id", "body")
+    for field in required:
         if not isinstance(envelope.get(field), str) or not envelope[field]:
             raise ValueError(f"trajectory payload envelope {field} required")
     return envelope

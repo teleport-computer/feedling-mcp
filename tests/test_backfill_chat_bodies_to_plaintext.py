@@ -10,6 +10,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
 import backfill_chat_bodies_to_plaintext as tool  # noqa: E402
 import object_storage  # noqa: E402
+from conftest import seed_user  # noqa: E402
+
+
+def test_v6_unset_preference_is_plaintext_but_unknown_user_fails_closed():
+    seed_user("usr_default_plain")
+    assert tool._tier_allows_plaintext("usr_default_plain") is True
+    assert tool._tier_allows_plaintext("usr_missing") is False
 
 
 def test_apply_is_rejected_before_any_database_or_r2_access(monkeypatch):

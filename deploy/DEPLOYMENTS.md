@@ -613,7 +613,7 @@ WAL-G 备份；test/prod 已接双写 + in-process 同步调度器，pre 在首�
 | Placement | prod9 node 18，`tdx.medium`（2 vCPU / 4GB），30GB ZFS |
 | Public PG | `ade3cabf133ec3e9ee6220265843c4ac993e1e63-5432s.dstack-pha-prod9.phala.network:443`（direct TLS） |
 | Backup | `s3://io-in-enclave-db/pre/wal-g`，pre 独立 libsodium key |
-| Schema baseline | Phase 4 target `0011_primary_runtime_bridge`；the owner-only workflow must reach this head before any app DSN switch. |
+| Schema baseline | Phase 4 target is the current `alembic_tee` release head (`0013_primary_runtime_contracts` at this revision); the owner-only workflow must reach the release's head before any app DSN switch. |
 | Deploy path | `Deploy Postgres CVM` workflow 的 `pre` lane，目标 ID 在 `deploy/pre-pg-cvm-id.txt` |
 | Migration | `TEE migrate` workflow 的 `pre` lane，owner DSN + verify-full CA |
 | App wiring | Shadow stage: `PRE_TEE_DATABASE_URL` + `PRE_FEEDLING_TEE_DUAL_WRITE`. Primary stage: `PRE_DATABASE_URL` points to the TEE app DSN, `FEEDLING_DATABASE_SCHEMA=tee`, and both shadow variables are empty. |
@@ -648,6 +648,10 @@ triggers disabled, so it is safe to migrate before the freeze; apply enables
 them only after data copying, then writes a head-bound prepared marker. TEE-mode
 application startup checks that marker and the three enabled triggers read-only
 and refuses to boot if the prepare was skipped or only partially completed.
+
+The complete encrypted/plaintext two-account release order, inventory queries,
+and test/prod promotion checklist are in
+`docs/CONTENT_ENCRYPTION_TEE_MIGRATION_RUNBOOK.md`.
 
 ### 磁盘 sizing 依据（实测 2026-07-13，prod RDS）
 

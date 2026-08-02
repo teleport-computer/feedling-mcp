@@ -378,6 +378,19 @@ def _safe_job_metadata(metadata: Any) -> dict:
 def _chunk_envelope_meta(store: UserStore, envelope_meta: dict | None, encrypted_body: bytes) -> dict:
     if not isinstance(envelope_meta, dict):
         raise ValueError("chunk_envelope_required")
+    shape_error = core_envelope.validate_uploaded_envelope(
+        envelope_meta, user_id=store.user_id)
+    if shape_error is not None:
+        raise ValueError(str(shape_error.get("error") or "chunk_envelope_invalid"))
+    if envelope_meta.get("body") is not None:
+        if str(envelope_meta.get("body") or "").encode("utf-8") != encrypted_body:
+            raise ValueError("chunk_envelope_body_mismatch")
+        return {
+            "v": int(envelope_meta.get("v") or 1),
+            "id": _text(envelope_meta.get("id"), 160),
+            "visibility": "shared", "owner_user_id": store.user_id,
+            "body_object_format": "plaintext_v1",
+        }
     body_ct = str(envelope_meta.get("body_ct") or "")
     if body_ct:
         if b64decode_required(body_ct) != encrypted_body:
@@ -429,6 +442,9 @@ def chunk_envelope_from_row(chunk: dict) -> dict:
         raise ValueError("chunk_encrypted_body_required")
     if not meta:
         raise ValueError("chunk_envelope_meta_missing")
+    if meta.get("body_object_format") == "plaintext_v1":
+        clean = {k: v for k, v in meta.items() if k != "body_object_format"}
+        return {**clean, "body": bytes(encrypted_body).decode("utf-8")}
     return {**meta, "body_ct": b64encode(bytes(encrypted_body))}
 
 
