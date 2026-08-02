@@ -797,6 +797,80 @@ def test_runtime_user_report_holds_one_read_only_repeatable_read_snapshot(
     }
 
 
+def test_runtime_user_delivery_report_never_reads_turn_metrics(monkeypatch):
+    """Runtime Health's delivery section must not pay for model/token scans."""
+    seed_user("u_delivery_only")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_effect_outbox "
+            "(effect_id,user_id,effect_type,expected_generation,payload,status) "
+            "VALUES ('e_delivery_only','u_delivery_only','reply',1,'{}','pending')"
+        )
+
+    real_pool = db.get_pool()
+    statements = []
+
+    class CursorProxy:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+        def execute(self, query, params=None):
+            statements.append(str(query))
+            if params is None:
+                return self._cursor.execute(query)
+            return self._cursor.execute(query, params)
+
+    class CursorContext:
+        def __init__(self, context):
+            self._context = context
+
+        def __enter__(self):
+            return CursorProxy(self._context.__enter__())
+
+        def __exit__(self, *args):
+            return self._context.__exit__(*args)
+
+    class ConnectionProxy:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+        def cursor(self, *args, **kwargs):
+            return CursorContext(self._connection.cursor(*args, **kwargs))
+
+    class ConnectionContext:
+        def __init__(self, context):
+            self._context = context
+
+        def __enter__(self):
+            return ConnectionProxy(self._context.__enter__())
+
+        def __exit__(self, *args):
+            return self._context.__exit__(*args)
+
+    class PoolProxy:
+        def connection(self):
+            return ConnectionContext(real_pool.connection())
+
+    monkeypatch.setattr(jobs_store, "_pool", lambda: PoolProxy())
+
+    report = jobs_store.recent_runtime_user_delivery_report(within_hours=24)
+
+    assert statements.count(
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+    ) == 1
+    assert all("v2_turn_metrics" not in statement for statement in statements)
+    assert any("v2_effect_outbox" in statement for statement in statements)
+    user = next(row for row in report["users"] if row["user_id"] == "u_delivery_only")
+    assert set(user) == {"user_id", "delivery"}
+    assert user["delivery"]["reply_effects"]["pending"] == 1
+
+
 # ---------------------------------------------------------------------------
 # recent_delivery_health：端到端交付（job 判 completed ≠ 产物到达用户）
 # ---------------------------------------------------------------------------

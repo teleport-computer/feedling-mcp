@@ -4631,6 +4631,28 @@ def _usage_rate(numerator: int, denominator: int) -> float | None:
     return float(numerator) / float(denominator) if denominator else None
 
 
+def _usage_optional_breakdown(
+    conn,
+    cur,
+    name: str,
+    statement: str,
+    params: tuple[object, ...],
+    *,
+    fetch: str,
+):
+    """Run one optional report section behind a savepoint in the outer snapshot."""
+    try:
+        # psycopg nests transaction contexts as SAVEPOINTs.  The caller already
+        # owns the single REPEATABLE READ, READ ONLY transaction, so this keeps
+        # one snapshot while allowing one broken breakdown to roll back locally.
+        with conn.transaction():
+            cur.execute(statement, params)
+            return cur.fetchone() if fetch == "one" else cur.fetchall()
+    except Exception:
+        log.exception("usage report %s breakdown unavailable", name)
+        return None
+
+
 def usage_report_snapshot(query) -> dict:
     """Return one coherent, content-free Hosted V2 Usage analytics snapshot."""
 
@@ -4770,7 +4792,10 @@ FROM base
                 )
                 totals = cur.fetchone()
 
-                cur.execute(
+                distribution = _usage_optional_breakdown(
+                    conn,
+                    cur,
+                    "distribution",
                     base_cte
                     + """,
 user_days AS (
@@ -4794,10 +4819,13 @@ SELECT
 FROM known_user_days
 """,
                     base_params,
+                    fetch="one",
                 )
-                distribution = cur.fetchone()
 
-                cur.execute(
+                daily_rows = _usage_optional_breakdown(
+                    conn,
+                    cur,
+                    "daily",
                     base_cte
                     + """,
 days AS (
@@ -4859,10 +4887,13 @@ ORDER BY days.local_day
                         query.timezone,
                         query.end_at_utc,
                     ),
+                    fetch="all",
                 )
-                daily_rows = cur.fetchall()
 
-                cur.execute(
+                user_rows = _usage_optional_breakdown(
+                    conn,
+                    cur,
+                    "users",
                     base_cte
                     + """,
 user_days AS (
@@ -4915,10 +4946,13 @@ ORDER BY (sum(b.prompt_tokens)+sum(b.completion_tokens)) DESC NULLS LAST,
          sum(b.model_calls) DESC, b.user_id
 """,
                     base_params,
+                    fetch="all",
                 )
-                user_rows = cur.fetchall()
 
-                cur.execute(
+                model_rows = _usage_optional_breakdown(
+                    conn,
+                    cur,
+                    "models",
                     base_cte
                     + """
 SELECT provider,model,count(DISTINCT user_id)::int AS users,
@@ -4944,10 +4978,46 @@ ORDER BY (sum(prompt_tokens)+sum(completion_tokens)) DESC NULLS LAST,
          sum(model_calls) DESC,provider,model
 """,
                     base_params,
+                    fetch="all",
                 )
-                model_rows = cur.fetchall()
 
-                cur.execute(
+                lane_rows = _usage_optional_breakdown(
+                    conn,
+                    cur,
+                    "lanes",
+                    base_cte
+                    + """
+SELECT lane,count(DISTINCT user_id)::int AS users,
+  count(*)::int AS turns,
+  coalesce(sum(model_calls), 0)::bigint AS model_calls,
+  coalesce(sum(retries), 0)::bigint AS retries,
+  count(*) FILTER (WHERE failed)::int AS failed_turns,
+  count(*) FILTER (WHERE usage_reported_calls > 0)::int AS metered_turns,
+  sum(prompt_tokens)::bigint AS prompt_tokens,
+  sum(completion_tokens)::bigint AS completion_tokens,
+  sum(cache_read_tokens)::bigint AS cache_read_tokens,
+  sum(cache_write_tokens)::bigint AS cache_write_tokens,
+  sum(cache_miss_tokens)::bigint AS cache_miss_tokens,
+  coalesce(sum(GREATEST(model_calls-usage_reported_calls, 0)), 0)::bigint
+    AS unknown_usage_calls,
+  coalesce(sum(usage_reported_calls), 0)::bigint AS usage_reported_calls,
+  coalesce(sum(cache_reported_calls), 0)::bigint AS cache_reported_calls,
+  percentile_cont(0.50) WITHIN GROUP (ORDER BY latency_ms)
+    FILTER (WHERE latency_ms IS NOT NULL) AS latency_ms_p50,
+  percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)
+    FILTER (WHERE latency_ms IS NOT NULL) AS latency_ms_p95
+FROM base GROUP BY lane
+ORDER BY (sum(prompt_tokens)+sum(completion_tokens)) DESC NULLS LAST,
+         sum(model_calls) DESC,lane
+""",
+                    base_params,
+                    fetch="all",
+                )
+
+                filter_options = _usage_optional_breakdown(
+                    conn,
+                    cur,
+                    "filters",
                     f"""
 SELECT
   array_agg(DISTINCT COALESCE(NULLIF(m.lane, ''), 'unknown')
@@ -4959,8 +5029,8 @@ SELECT
 FROM v2_turn_metrics m WHERE {filter_where_sql}
 """,
                     filter_where_params,
+                    fetch="one",
                 )
-                filter_options = cur.fetchone()
 
     prompt_tokens = _usage_optional_int(totals, "prompt_tokens")
     completion_tokens = _usage_optional_int(totals, "completion_tokens")
@@ -5040,10 +5110,14 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
             if metered_total_tokens is not None and metered_turns
             else None
         ),
-        "user_day_tokens": {
-            key: _usage_optional_float(distribution, key)
-            for key in ("p50", "p75", "p90", "p95", "max")
-        },
+        "user_day_tokens": (
+            {
+                key: _usage_optional_float(distribution, key)
+                for key in ("p50", "p75", "p90", "p95", "max")
+            }
+            if distribution is not None
+            else None
+        ),
         "model_calls_per_turn": _usage_rate(model_calls, turns),
         "retries_per_turn": _usage_rate(retries, turns),
     }
@@ -5117,73 +5191,115 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
             )
         return result
 
-    daily = [aggregate_row(row, include_day=True) for row in daily_rows]
-    users = []
-    for row in user_rows:
-        item = aggregate_row(row)
-        user_metered_prompt = _usage_optional_int(row, "metered_prompt_tokens")
-        user_metered_completion = _usage_optional_int(
-            row, "metered_completion_tokens"
-        )
-        user_metered_total = (
-            user_metered_prompt + user_metered_completion
-            if user_metered_prompt is not None
-            and user_metered_completion is not None
-            else None
-        )
-        item.update(
-            {
-                "user_id": str(row["user_id"]),
-                "active_days": int(row["active_days"] or 0),
-                "last_model_call_at": row["last_model_call_at"],
-                "primary_provider": str(row["primary_provider"] or "unknown"),
-                "primary_model": str(row["primary_model"] or "unknown"),
-                "daily_p50": _usage_optional_float(row, "daily_p50"),
-                "daily_p95": _usage_optional_float(row, "daily_p95"),
-                "tokens_per_calendar_day": (
-                    float(item["total_tokens"]) / duration_days
-                    if item["total_tokens"] is not None and duration_days > 0
-                    else None
-                ),
-                "tokens_per_active_day": (
-                    float(item["total_tokens"]) / int(row["active_days"])
-                    if item["total_tokens"] is not None and row["active_days"]
-                    else None
-                ),
-                "tokens_per_metered_turn": (
-                    float(user_metered_total) / item["metered_turns"]
-                    if user_metered_total is not None and item["metered_turns"]
-                    else None
-                ),
-                "known_token_share": (
-                    float(item["total_tokens"]) / total_tokens
-                    if item["total_tokens"] is not None and total_tokens
-                    else None
-                ),
-            }
-        )
-        users.append(item)
+    daily = (
+        [aggregate_row(row, include_day=True) for row in daily_rows]
+        if daily_rows is not None
+        else None
+    )
+    users = None
+    if user_rows is not None:
+        users = []
+        for row in user_rows:
+            item = aggregate_row(row)
+            user_metered_prompt = _usage_optional_int(
+                row, "metered_prompt_tokens"
+            )
+            user_metered_completion = _usage_optional_int(
+                row, "metered_completion_tokens"
+            )
+            user_metered_total = (
+                user_metered_prompt + user_metered_completion
+                if user_metered_prompt is not None
+                and user_metered_completion is not None
+                else None
+            )
+            item.update(
+                {
+                    "user_id": str(row["user_id"]),
+                    "active_days": int(row["active_days"] or 0),
+                    "last_model_call_at": row["last_model_call_at"],
+                    "primary_provider": str(
+                        row["primary_provider"] or "unknown"
+                    ),
+                    "primary_model": str(row["primary_model"] or "unknown"),
+                    "daily_p50": _usage_optional_float(row, "daily_p50"),
+                    "daily_p95": _usage_optional_float(row, "daily_p95"),
+                    "tokens_per_calendar_day": (
+                        float(item["total_tokens"]) / duration_days
+                        if item["total_tokens"] is not None
+                        and duration_days > 0
+                        else None
+                    ),
+                    "tokens_per_active_day": (
+                        float(item["total_tokens"]) / int(row["active_days"])
+                        if item["total_tokens"] is not None
+                        and row["active_days"]
+                        else None
+                    ),
+                    "tokens_per_metered_turn": (
+                        float(user_metered_total) / item["metered_turns"]
+                        if user_metered_total is not None
+                        and item["metered_turns"]
+                        else None
+                    ),
+                    "known_token_share": (
+                        float(item["total_tokens"]) / total_tokens
+                        if item["total_tokens"] is not None and total_tokens
+                        else None
+                    ),
+                }
+            )
+            users.append(item)
 
-    models = []
-    for row in model_rows:
-        item = aggregate_row(row)
-        item.update(
-            {
-                "provider": str(row["provider"]),
-                "model": str(row["model"]),
-                "users": int(row["users"] or 0),
-                "tokens_per_call": (
-                    float(item["total_tokens"]) / item["model_calls"]
-                    if item["total_tokens"] is not None and item["model_calls"]
-                    else None
-                ),
-                "latency_ms_p50": _usage_optional_float(row, "latency_ms_p50"),
-                "latency_ms_p95": _usage_optional_float(row, "latency_ms_p95"),
-                "failure_rate": _usage_rate(item["failed_turns"], item["turns"]),
-                "retry_rate": _usage_rate(item["retries"], item["model_calls"]),
-            }
-        )
-        models.append(item)
+    def identity_breakdown(rows, *identity_fields):
+        if rows is None:
+            return None
+        items = []
+        for row in rows:
+            item = aggregate_row(row)
+            item.update(
+                {
+                    field: str(row[field])
+                    for field in identity_fields
+                }
+            )
+            item.update(
+                {
+                    "users": int(row["users"] or 0),
+                    "tokens_per_call": (
+                        float(item["total_tokens"]) / item["model_calls"]
+                        if item["total_tokens"] is not None
+                        and item["model_calls"]
+                        else None
+                    ),
+                    "latency_ms_p50": _usage_optional_float(
+                        row, "latency_ms_p50"
+                    ),
+                    "latency_ms_p95": _usage_optional_float(
+                        row, "latency_ms_p95"
+                    ),
+                    "failure_rate": _usage_rate(
+                        item["failed_turns"], item["turns"]
+                    ),
+                    "retry_rate": _usage_rate(
+                        item["retries"], item["model_calls"]
+                    ),
+                }
+            )
+            items.append(item)
+        return items
+
+    models = identity_breakdown(model_rows, "provider", "model")
+    lanes = identity_breakdown(lane_rows, "lane")
+    rendered_filters = (
+        {
+            "lanes": list(filter_options["lanes"] or []),
+            "providers": list(filter_options["providers"] or []),
+            "models": list(filter_options["models"] or []),
+        }
+        if filter_options is not None
+        else None
+    )
 
     return {
         "overview": overview,
@@ -5191,11 +5307,8 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
         "daily": daily,
         "users": users,
         "models": models,
-        "filters": {
-            "lanes": list(filter_options["lanes"] or []),
-            "providers": list(filter_options["providers"] or []),
-            "models": list(filter_options["models"] or []),
-        },
+        "lanes": lanes,
+        "filters": rendered_filters,
         "coverage": {
             "usage_reported_calls": usage_calls,
             "model_calls": model_calls,
@@ -5225,8 +5338,161 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
     }
 
 
+def _empty_runtime_user_delivery() -> dict:
+    return {
+        "reply_effects": {
+            "applied_in_window": 0,
+            "pending": 0,
+            "needs_reconciliation": 0,
+        },
+        "status_effects": {
+            "applied_in_window": 0,
+            "pending": 0,
+            "needs_reconciliation": 0,
+        },
+        "all_effects": {
+            "applied_in_window": 0,
+            "discarded_in_window": 0,
+            "pending": 0,
+            "needs_reconciliation": 0,
+        },
+        "terminal_failure": {
+            "reply_delivered_in_window": 0,
+            "reply_undelivered": 0,
+            "status_delivered_in_window": 0,
+            "status_undelivered": 0,
+            "runtime_error_delivered_in_window": 0,
+            "runtime_error_undelivered": 0,
+        },
+        "oldest_unfinished_age_sec": None,
+    }
+
+
+def _merge_runtime_user_delivery(
+    ensure_user: Callable[[str], dict],
+    effect_window_rows,
+    effect_backlog_rows,
+    terminal_window_rows,
+    terminal_backlog_rows,
+) -> None:
+    def set_oldest(delivery: dict, age) -> None:
+        if age is None:
+            return
+        current = delivery["oldest_unfinished_age_sec"]
+        delivery["oldest_unfinished_age_sec"] = max(
+            current if current is not None else 0,
+            float(age),
+        )
+
+    for row in effect_window_rows:
+        delivery = ensure_user(str(row["user_id"]))["delivery"]
+        delivery["reply_effects"]["applied_in_window"] = int(
+            row["reply_applied_in_window"] or 0
+        )
+        delivery["status_effects"]["applied_in_window"] = int(
+            row["status_applied_in_window"] or 0
+        )
+        delivery["all_effects"]["applied_in_window"] = int(
+            row["all_applied_in_window"] or 0
+        )
+        delivery["all_effects"]["discarded_in_window"] = int(
+            row["all_discarded_in_window"] or 0
+        )
+
+    for row in effect_backlog_rows:
+        delivery = ensure_user(str(row["user_id"]))["delivery"]
+        delivery["reply_effects"]["pending"] = int(row["reply_pending"] or 0)
+        delivery["reply_effects"]["needs_reconciliation"] = int(
+            row["reply_needs_reconciliation"] or 0
+        )
+        delivery["status_effects"]["pending"] = int(
+            row["status_pending"] or 0
+        )
+        delivery["status_effects"]["needs_reconciliation"] = int(
+            row["status_needs_reconciliation"] or 0
+        )
+        delivery["all_effects"]["pending"] = int(row["all_pending"] or 0)
+        delivery["all_effects"]["needs_reconciliation"] = int(
+            row["all_needs_reconciliation"] or 0
+        )
+        set_oldest(delivery, row["oldest_unfinished_age_sec"])
+
+    for row in terminal_window_rows:
+        terminal = ensure_user(str(row["user_id"]))["delivery"][
+            "terminal_failure"
+        ]
+        terminal["reply_delivered_in_window"] = int(
+            row["reply_delivered_in_window"] or 0
+        )
+        terminal["status_delivered_in_window"] = int(
+            row["status_delivered_in_window"] or 0
+        )
+        terminal["runtime_error_delivered_in_window"] = int(
+            row["runtime_error_delivered_in_window"] or 0
+        )
+
+    for row in terminal_backlog_rows:
+        delivery = ensure_user(str(row["user_id"]))["delivery"]
+        terminal = delivery["terminal_failure"]
+        terminal["reply_undelivered"] = int(row["reply_undelivered"] or 0)
+        terminal["status_undelivered"] = int(row["status_undelivered"] or 0)
+        terminal["runtime_error_undelivered"] = int(
+            row["runtime_error_undelivered"] or 0
+        )
+        set_oldest(delivery, row["oldest_unfinished_age_sec"])
+
+
+def _read_runtime_user_delivery_rows(cur, safe_hours: int):
+    cur.execute(_RUNTIME_USER_EFFECT_WINDOW_SQL, (safe_hours,))
+    effect_window_rows = cur.fetchall()
+    cur.execute(_RUNTIME_USER_EFFECT_BACKLOG_SQL)
+    effect_backlog_rows = cur.fetchall()
+    cur.execute(_RUNTIME_USER_TERMINAL_WINDOW_SQL, (safe_hours,))
+    terminal_window_rows = cur.fetchall()
+    cur.execute(_RUNTIME_USER_TERMINAL_BACKLOG_SQL)
+    terminal_backlog_rows = cur.fetchall()
+    return (
+        effect_window_rows,
+        effect_backlog_rows,
+        terminal_window_rows,
+        terminal_backlog_rows,
+    )
+
+
+def recent_runtime_user_delivery_report(*, within_hours: int = 24) -> dict:
+    """Read only per-user delivery reliability; never scan turn metrics."""
+    safe_hours = max(1, min(int(within_hours), 24 * 366))
+
+    with _pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                )
+                delivery_rows = _read_runtime_user_delivery_rows(
+                    cur, safe_hours
+                )
+
+    users: dict[str, dict] = {}
+
+    def ensure_user(user_id: str) -> dict:
+        return users.setdefault(
+            user_id,
+            {
+                "user_id": user_id,
+                "delivery": _empty_runtime_user_delivery(),
+            },
+        )
+
+    _merge_runtime_user_delivery(ensure_user, *delivery_rows)
+    return {
+        "window_hours": safe_hours,
+        "users": sorted(users.values(), key=lambda row: row["user_id"]),
+    }
+
+
 def recent_runtime_user_report(*, within_hours: int = 24) -> dict:
-    """Aggregate content-free Runtime V2 token telemetry by user and model."""
+    """Legacy mixed token/model + delivery report kept for compatibility."""
     safe_hours = max(1, min(int(within_hours), 24 * 366))
 
     with _pool().connection() as conn:
@@ -5263,47 +5529,13 @@ def recent_runtime_user_report(*, within_hours: int = 24) -> dict:
                     (safe_hours,),
                 )
                 rows = cur.fetchall()
-                cur.execute(_RUNTIME_USER_EFFECT_WINDOW_SQL, (safe_hours,))
-                effect_window_rows = cur.fetchall()
-                cur.execute(_RUNTIME_USER_EFFECT_BACKLOG_SQL)
-                effect_backlog_rows = cur.fetchall()
-                cur.execute(_RUNTIME_USER_TERMINAL_WINDOW_SQL, (safe_hours,))
-                terminal_window_rows = cur.fetchall()
-                cur.execute(_RUNTIME_USER_TERMINAL_BACKLOG_SQL)
-                terminal_backlog_rows = cur.fetchall()
+                delivery_rows = _read_runtime_user_delivery_rows(
+                    cur, safe_hours
+                )
 
     def _optional_int(row, key):
         value = row.get(key)
         return int(value) if value is not None else None
-
-    def _empty_user_delivery() -> dict:
-        return {
-            "reply_effects": {
-                "applied_in_window": 0,
-                "pending": 0,
-                "needs_reconciliation": 0,
-            },
-            "status_effects": {
-                "applied_in_window": 0,
-                "pending": 0,
-                "needs_reconciliation": 0,
-            },
-            "all_effects": {
-                "applied_in_window": 0,
-                "discarded_in_window": 0,
-                "pending": 0,
-                "needs_reconciliation": 0,
-            },
-            "terminal_failure": {
-                "reply_delivered_in_window": 0,
-                "reply_undelivered": 0,
-                "status_delivered_in_window": 0,
-                "status_undelivered": 0,
-                "runtime_error_delivered_in_window": 0,
-                "runtime_error_undelivered": 0,
-            },
-            "oldest_unfinished_age_sec": None,
-        }
 
     def _known_total_sort_key(total, calls, identity):
         return (
@@ -5323,17 +5555,8 @@ def recent_runtime_user_report(*, within_hours: int = 24) -> dict:
                 "known_total_tokens": None,
                 "model_calls": 0,
                 "models": [],
-                "delivery": _empty_user_delivery(),
+                "delivery": _empty_runtime_user_delivery(),
             },
-        )
-
-    def _set_oldest_unfinished_age(delivery: dict, age) -> None:
-        if age is None:
-            return
-        current = delivery["oldest_unfinished_age_sec"]
-        delivery["oldest_unfinished_age_sec"] = max(
-            current if current is not None else 0,
-            float(age),
         )
 
     for row in rows:
@@ -5391,69 +5614,7 @@ def recent_runtime_user_report(*, within_hours: int = 24) -> dict:
                 (user["known_total_tokens"] or 0) + total_tokens
             )
 
-    for row in effect_window_rows:
-        user = _delivery_user(str(row["user_id"]))
-        delivery = user["delivery"]
-        delivery["reply_effects"]["applied_in_window"] = int(
-            row["reply_applied_in_window"] or 0
-        )
-        delivery["status_effects"]["applied_in_window"] = int(
-            row["status_applied_in_window"] or 0
-        )
-        delivery["all_effects"]["applied_in_window"] = int(
-            row["all_applied_in_window"] or 0
-        )
-        delivery["all_effects"]["discarded_in_window"] = int(
-            row["all_discarded_in_window"] or 0
-        )
-
-    for row in effect_backlog_rows:
-        user = _delivery_user(str(row["user_id"]))
-        delivery = user["delivery"]
-        delivery["reply_effects"]["pending"] = int(row["reply_pending"] or 0)
-        delivery["reply_effects"]["needs_reconciliation"] = int(
-            row["reply_needs_reconciliation"] or 0
-        )
-        delivery["status_effects"]["pending"] = int(
-            row["status_pending"] or 0
-        )
-        delivery["status_effects"]["needs_reconciliation"] = int(
-            row["status_needs_reconciliation"] or 0
-        )
-        delivery["all_effects"]["pending"] = int(row["all_pending"] or 0)
-        delivery["all_effects"]["needs_reconciliation"] = int(
-            row["all_needs_reconciliation"] or 0
-        )
-        _set_oldest_unfinished_age(
-            delivery, row["oldest_unfinished_age_sec"]
-        )
-
-    for row in terminal_window_rows:
-        user = _delivery_user(str(row["user_id"]))
-        delivery = user["delivery"]
-        terminal = delivery["terminal_failure"]
-        terminal["reply_delivered_in_window"] = int(
-            row["reply_delivered_in_window"] or 0
-        )
-        terminal["status_delivered_in_window"] = int(
-            row["status_delivered_in_window"] or 0
-        )
-        terminal["runtime_error_delivered_in_window"] = int(
-            row["runtime_error_delivered_in_window"] or 0
-        )
-
-    for row in terminal_backlog_rows:
-        user = _delivery_user(str(row["user_id"]))
-        delivery = user["delivery"]
-        terminal = delivery["terminal_failure"]
-        terminal["reply_undelivered"] = int(row["reply_undelivered"] or 0)
-        terminal["status_undelivered"] = int(row["status_undelivered"] or 0)
-        terminal["runtime_error_undelivered"] = int(
-            row["runtime_error_undelivered"] or 0
-        )
-        _set_oldest_unfinished_age(
-            delivery, row["oldest_unfinished_age_sec"]
-        )
+    _merge_runtime_user_delivery(_delivery_user, *delivery_rows)
 
     users_list = list(users.values())
     for user in users_list:

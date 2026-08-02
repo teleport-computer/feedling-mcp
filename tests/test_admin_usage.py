@@ -271,6 +271,32 @@ def _usage_render_report() -> dict:
             "failure_rate": 1 / 6,
             "retry_rate": 0.25,
         }],
+        "lanes": [{
+            "lane": "chat",
+            "users": 1,
+            "turns": 6,
+            "model_calls": 8,
+            "retries": 2,
+            "failed_turns": 1,
+            "metered_turns": 5,
+            "prompt_tokens": 900,
+            "completion_tokens": 200,
+            "total_tokens": 1_100,
+            "cache_read_tokens": 500,
+            "cache_write_tokens": 30,
+            "cache_miss_tokens": 200,
+            "unknown_usage_calls": 1,
+            "usage_reported_calls": 7,
+            "cache_reported_calls": 5,
+            "usage_coverage": 7 / 8,
+            "cache_coverage": 5 / 8,
+            "cache_hit_ratio": 5 / 7,
+            "tokens_per_call": 137.5,
+            "latency_ms_p50": 1_200,
+            "latency_ms_p95": 4_500,
+            "failure_rate": 1 / 6,
+            "retry_rate": 0.25,
+        }],
         "filters": {
             "lanes": ["chat", "heartbeat"],
             "providers": ["provider<&", "other"],
@@ -642,6 +668,84 @@ def test_usage_page_renders_independent_report_filters_and_drill_down(monkeypatc
     assert "admin_key=query-admin-token" in body
 
 
+def test_usage_filter_form_preserves_rolling_preset_when_adding_provider(monkeypatch):
+    """Submitting a provider filter must not turn a rolling 7d cohort into custom."""
+    seen = []
+    monkeypatch.setattr(
+        _data_track,
+        "_usage_report",
+        lambda query: seen.append(query) or _usage_render_report(),
+    )
+
+    body = _admin_core.page_html("view=usage&preset=7d&timezone=UTC")
+
+    form_start = body.index("<form class='usage-filters'")
+    form_end = body.index("</form>", form_start)
+    form = body[form_start:form_end]
+    assert "<select name='preset'>" in form
+    assert "<option value='7d' selected>7d</option>" in form
+    assert "type='hidden' name='preset' value='custom'" not in form
+
+    _admin_core.page_html(
+        "view=usage&preset=7d&timezone=UTC&provider=other"
+        "&start_date=2020-01-01&end_date=2020-01-02"
+    )
+    assert seen[-1].preset == "7d"
+    assert seen[-1].provider == "other"
+    assert seen[-1].start_date is None
+    assert seen[-1].end_date is None
+
+
+def test_usage_completeness_filter_marks_activated_average_not_applicable(monkeypatch):
+    """Unknown-only usage cannot use the fleet-wide activated-user denominator."""
+    report = _usage_render_report()
+    report["averages"]["tokens_per_activated_user_day"] = None
+    monkeypatch.setattr(_data_track, "_usage_report", lambda _query: report)
+
+    body = _admin_core.page_html("view=usage&preset=7d&completeness=unknown")
+
+    assert "not applicable for filtered cohort" in body
+
+
+def test_usage_user_sort_and_101_row_pagination_are_deterministic(monkeypatch):
+    """Equal metrics keep user_id order and page 101 must remain reachable."""
+    report = _usage_render_report()
+    template = report["users"][0]
+    report["users"] = [
+        {
+            **template,
+            "user_id": f"usr_{index:016x}",
+            "model_calls": 5,
+            "total_tokens": 100,
+        }
+        for index in range(101)
+    ]
+    monkeypatch.setattr(_data_track, "_usage_report", lambda _query: report)
+
+    first = _admin_core.page_html(
+        "view=usage&preset=7d&sort=calls&dir=desc&offset=0"
+    )
+    table_start = first.index("<h2>Per-user Usage</h2>")
+    table_end = first.index("</table>", table_start)
+    first_table = first[table_start:table_end]
+    assert first_table.index("usr_0000000000000000") < first_table.index(
+        "usr_0000000000000001"
+    )
+    assert "usr_0000000000000063" in first_table
+    assert "usr_0000000000000064" not in first_table
+    assert "offset=100" in first[table_start:table_end]
+
+    second = _admin_core.page_html(
+        "view=usage&preset=7d&sort=calls&dir=desc&offset=100"
+    )
+    second_start = second.index("<h2>Per-user Usage</h2>")
+    second_end = second.index("</table>", second_start)
+    second_table = second[second_start:second_end]
+    assert "usr_0000000000000064" in second_table
+    assert "usr_0000000000000063" not in second_table
+    assert ">Prev</a>" in second[second_start:second_end]
+
+
 def test_usage_user_page_forces_path_user_and_keeps_same_query(monkeypatch):
     """The drill-down path cannot silently fall back to the general user page."""
     user_id = "usr_0123456789abcdef"
@@ -668,6 +772,8 @@ def test_usage_user_page_forces_path_user_and_keeps_same_query(monkeypatch):
     assert seen[0].lane == "chat"
     assert "Usage / 模型用量" in body
     assert "单用户钻取" in body
+    assert "Lane breakdown" in body
+    assert "chat" in body
     assert user_id in body
     assert "usr_ffffffffffffffff" not in body
 
@@ -724,7 +830,8 @@ def test_usage_snapshot_reconciles_users_days_models_failures_and_unknowns(usage
     report = jobs_store.usage_report_snapshot(_usage_query())
 
     assert set(report) == {
-        "overview", "averages", "daily", "users", "models", "filters", "coverage"
+        "overview", "averages", "daily", "users", "models", "lanes",
+        "filters", "coverage"
     }
     assert report["overview"] == {
         "registered_accounts": 3,
@@ -783,6 +890,12 @@ def test_usage_snapshot_reconciles_users_days_models_failures_and_unknowns(usage
     assert models[("openrouter", "gpt-a")]["total_tokens"] == 155
     assert models[("anthropic", "claude-b")]["failed_turns"] == 1
     assert models[("unknown", "unknown")]["model_calls"] == 0
+
+    lanes = {row["lane"]: row for row in report["lanes"]}
+    assert lanes["chat"]["users"] == 2
+    assert lanes["chat"]["model_calls"] == 5
+    assert lanes["chat"]["total_tokens"] == 155
+    assert lanes["chat"]["usage_coverage"] == pytest.approx(3 / 5)
 
     assert report["filters"] == {
         "lanes": ["chat", "heartbeat", "maintenance"],
@@ -963,6 +1076,83 @@ def test_usage_snapshot_uses_one_repeatable_read_only_connection(monkeypatch, us
 
     assert connection_calls == 1
     assert settings == [("repeatable read", "on")]
+
+
+def test_usage_snapshot_model_sql_failure_only_degrades_models(
+    monkeypatch, usage_rows
+):
+    """A PostgreSQL error in one breakdown must roll back to its savepoint."""
+    real_pool = db.get_pool()
+    injected = False
+
+    class CursorProxy:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+        def execute(self, query, params=None):
+            nonlocal injected
+            text = str(query)
+            if not injected and "FROM base GROUP BY provider,model" in text:
+                injected = True
+                return self._cursor.execute(
+                    "SELECT missing_usage_breakdown_column"
+                )
+            if params is None:
+                return self._cursor.execute(query)
+            return self._cursor.execute(query, params)
+
+    class CursorContext:
+        def __init__(self, context):
+            self._context = context
+
+        def __enter__(self):
+            return CursorProxy(self._context.__enter__())
+
+        def __exit__(self, *args):
+            return self._context.__exit__(*args)
+
+    class ConnectionProxy:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+        def cursor(self, *args, **kwargs):
+            return CursorContext(self._connection.cursor(*args, **kwargs))
+
+    class ConnectionContext:
+        def __init__(self, context):
+            self._context = context
+
+        def __enter__(self):
+            return ConnectionProxy(self._context.__enter__())
+
+        def __exit__(self, *args):
+            return self._context.__exit__(*args)
+
+    class PoolProxy:
+        def connection(self):
+            return ConnectionContext(real_pool.connection())
+
+    monkeypatch.setattr(jobs_store, "_pool", lambda: PoolProxy())
+
+    report = jobs_store.usage_report_snapshot(_usage_query())
+
+    assert injected is True
+    assert report["models"] is None
+    assert report["overview"]["total_tokens"] == 215
+    assert report["daily"] is not None
+    assert report["users"] is not None
+    assert report["lanes"] is not None
+    with _admin_core.bind("view=usage&preset=30d"):
+        body = _data_track._render_usage_page(report, _usage_query())
+    assert "Provider / Model 暂时取不到" in body
+    assert "2026-07-01" in body
+    assert "u_usage_alpha" in body
 
 
 def test_usage_snapshot_marks_unparseable_historical_cohort_rows_as_limited(usage_rows):

@@ -2640,8 +2640,8 @@ def _runtime_delivery_health(*, within_hours: int = 24) -> dict:
 
 
 # Injected by the assembly layer (asgi_app.py); the real implementation is
-# model_api_runtime.v2.jobs_store.recent_runtime_user_report.  Keep this stub
-# content-free so Admin can render safely before that binding is installed.
+# model_api_runtime.v2.jobs_store.recent_runtime_user_delivery_report. Keep this
+# stub content-free so Admin can render safely before that binding is installed.
 def _runtime_user_report(*, within_hours: int = 24) -> dict:
     return {"window_hours": within_hours, "users": []}
 
@@ -3303,7 +3303,8 @@ def _usage_user_href(query: admin_usage.UsageQuery, user_id: str) -> str:
 
 
 def _usage_sorted_users(report: dict) -> tuple[list[dict], int, int]:
-    rows = list(report.get("users") or [])
+    source_rows = report.get("users")
+    rows = list(source_rows or [])
     sort = str(request.args.get("sort") or "tokens").strip().lower()
     if sort not in {"tokens", "calls", "retries", "recent"}:
         sort = "tokens"
@@ -3318,18 +3319,23 @@ def _usage_sorted_users(report: dict) -> tuple[list[dict], int, int]:
                 if raw.tzinfo is None:
                     raw = raw.replace(tzinfo=timezone.utc)
                 return raw.timestamp()
-            return 0.0
+            return None
         key = {"tokens": "total_tokens", "calls": "model_calls", "retries": "retries"}[sort]
         value = row.get(key)
         try:
-            return float(value) if value is not None else -1.0
+            return float(value) if value is not None else None
         except (TypeError, ValueError):
-            return -1.0
+            return None
 
-    rows.sort(
-        key=lambda row: (sortable(row), str(row.get("user_id") or "")),
-        reverse=direction == "desc",
-    )
+    # Sort the deterministic user_id tie-break first, then stably sort only the
+    # known metric rows.  ``reverse=True`` on a compound key would reverse the
+    # user_id tie-break as well; sentinel numbers would also put unknown values
+    # first for ascending order.  Unknown is always last in either direction.
+    rows.sort(key=lambda row: str(row.get("user_id") or ""))
+    known = [row for row in rows if sortable(row) is not None]
+    unknown = [row for row in rows if sortable(row) is None]
+    known.sort(key=sortable, reverse=direction == "desc")
+    rows = known + unknown
     try:
         offset = max(int(request.args.get("offset") or 0), 0)
     except (TypeError, ValueError):
@@ -3347,8 +3353,14 @@ def _render_usage_page(
     overview = report.get("overview") or {}
     averages = report.get("averages") or {}
     coverage = report.get("coverage") or {}
+    filters_available = report.get("filters") is not None
     filters = report.get("filters") or {}
-    dimension_filtered = any((query.lane, query.provider, query.model))
+    dimension_filtered = bool(
+        query.lane
+        or query.provider
+        or query.model
+        or query.completeness != "all"
+    )
 
     preset_links = []
     for preset in ("24h", "7d", "30d", "90d"):
@@ -3364,11 +3376,15 @@ def _render_usage_page(
     custom_end = html.escape(str(query.end_date or ""), quote=True)
     timezone_name = html.escape(query.timezone, quote=True)
     user_id_value = html.escape(str(query.user_id or ""), quote=True)
+    preset_options = "".join(
+        f"<option value='{preset}'{' selected' if query.preset == preset else ''}>{preset}</option>"
+        for preset in ("24h", "7d", "30d", "90d", "custom")
+    )
     filter_form = f"""
   <form class='usage-filters' method='get' action='/admin/data-track'>
     <input type='hidden' name='view' value='usage'>
-    <input type='hidden' name='preset' value='custom'>
     <input type='hidden' name='admin_key' value='{admin_key}'>
+    <label>Window<select name='preset'>{preset_options}</select></label>
     <label>Start date<input name='start_date' type='date' value='{custom_start}'></label>
     <label>End date<input name='end_date' type='date' value='{custom_end}'></label>
     <label>Timezone<input name='timezone' value='{timezone_name}'></label>
@@ -3381,7 +3397,7 @@ def _render_usage_page(
       <option value='metered'{" selected" if query.completeness == "metered" else ""}>Metered</option>
       <option value='unknown'{" selected" if query.completeness == "unknown" else ""}>Unknown</option>
     </select></label>
-    <button type='submit'>Apply custom range / filters</button>
+    <button type='submit'>Apply range / filters</button>
   </form>"""
 
     reference_metrics = "".join([
@@ -3415,6 +3431,7 @@ def _render_usage_page(
         if activated_average is None and dimension_filtered
         else _usage_float(activated_average)
     )
+    distribution_available = averages.get("user_day_tokens") is not None
     distribution = averages.get("user_day_tokens") or {}
     average_metrics = "".join([
         _render_metric("Tokens / calendar day", _usage_float(averages.get("tokens_per_calendar_day"))),
@@ -3428,6 +3445,7 @@ def _render_usage_page(
     ])
 
     daily_rows = []
+    daily_available = report.get("daily") is not None
     daily = report.get("daily") or []
     max_daily_tokens = max(
         (int(row.get("total_tokens") or 0) for row in daily), default=0
@@ -3449,6 +3467,7 @@ def _render_usage_page(
             "</tr>"
         )
 
+    users_available = report.get("users") is not None
     user_rows, user_offset, user_total = _usage_sorted_users(report)
     rendered_users = []
     for row in user_rows:
@@ -3489,6 +3508,7 @@ def _render_usage_page(
         href = _usage_page_href(query, sort=active_sort, dir=active_dir, offset=user_offset + 100)
         pager.append(f"<a class='sort-button' href='{html.escape(href, quote=True)}'>Next</a>")
 
+    models_available = report.get("models") is not None
     model_rows = []
     for row in report.get("models") or []:
         model_rows.append(
@@ -3506,6 +3526,21 @@ def _render_usage_page(
             "</tr>"
         )
 
+    lanes_available = report.get("lanes") is not None
+    lane_rows = []
+    for row in report.get("lanes") or []:
+        lane_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('lane') or 'unknown'))}</td>"
+            f"<td>{_fmt_count(row.get('users'))}</td>"
+            f"<td>{_fmt_count(row.get('turns'))} / {_fmt_count(row.get('model_calls'))} / {_fmt_count(row.get('retries'))}</td>"
+            f"<td>{_fmt_count(row.get('failed_turns'))} / {_fmt_ratio(row.get('failure_rate'))} / {_fmt_ratio(row.get('retry_rate'))}</td>"
+            f"<td>{_fmt_count(row.get('prompt_tokens'))} / {_fmt_count(row.get('completion_tokens'))} / {_fmt_count(row.get('total_tokens'))}</td>"
+            f"<td>{_fmt_count(row.get('cache_read_tokens'))} / {_fmt_count(row.get('cache_write_tokens'))} / {_fmt_count(row.get('cache_miss_tokens'))}</td>"
+            f"<td>{_fmt_ratio(row.get('usage_coverage'))} / {_fmt_ratio(row.get('cache_coverage'))}</td>"
+            "</tr>"
+        )
+
     cohort = coverage.get("reference_cohort") or {}
     drilldown = ""
     if drilldown_user_id:
@@ -3515,6 +3550,58 @@ def _render_usage_page(
             f"<code>{html.escape(drilldown_user_id)}</code> · "
             f"<a href='{html.escape(back_href, quote=True)}'>返回全体用户</a></div>"
         )
+    daily_body = (
+        "".join(daily_rows)
+        if daily_rows
+        else (
+            "<tr><td colspan='9' class='muted'>窗口内无日期。</td></tr>"
+            if daily_available
+            else "<tr><td colspan='9' class='muted'>每日趋势暂时取不到；其他区块仍可用。</td></tr>"
+        )
+    )
+    user_body = (
+        "".join(rendered_users)
+        if rendered_users
+        else (
+            "<tr><td colspan='12' class='muted'>当前 cohort 无用户用量。</td></tr>"
+            if users_available
+            else "<tr><td colspan='12' class='muted'>Per-user Usage 暂时取不到；其他区块仍可用。</td></tr>"
+        )
+    )
+    model_body = (
+        "".join(model_rows)
+        if model_rows
+        else (
+            "<tr><td colspan='10' class='muted'>当前 cohort 无 provider/model 数据。</td></tr>"
+            if models_available
+            else "<tr><td colspan='10' class='muted'>Provider / Model 暂时取不到；其他区块仍可用。</td></tr>"
+        )
+    )
+    lane_body = (
+        "".join(lane_rows)
+        if lane_rows
+        else (
+            "<tr><td colspan='7' class='muted'>当前 cohort 无 lane 数据。</td></tr>"
+            if lanes_available
+            else "<tr><td colspan='7' class='muted'>Lane breakdown 暂时取不到；其他区块仍可用。</td></tr>"
+        )
+    )
+    lane_section = ""
+    if drilldown_user_id:
+        lane_section = f"""
+  <h2>Lane breakdown</h2>
+  <div class='table-wrap'><table><thead><tr><th>Lane</th><th>Users</th><th>Turns / calls / retries</th><th>Failed / failure / retry rate</th><th>Prompt / completion / total</th><th>Cache R / W / M</th><th>Usage / cache coverage</th></tr></thead>
+  <tbody>{lane_body}</tbody></table></div>"""
+    optional_note_parts = []
+    if not filters_available:
+        optional_note_parts.append("筛选候选项暂时取不到，当前已选筛选仍然生效。")
+    if not distribution_available:
+        optional_note_parts.append("User-day 分位数暂时取不到。")
+    optional_note = (
+        f"<div class='note-box'>{html.escape(' '.join(optional_note_parts))}</div>"
+        if optional_note_parts
+        else ""
+    )
     return f"""<!doctype html>
 <html>
 <head>
@@ -3545,18 +3632,20 @@ def _render_usage_page(
   <section class='metrics'>{usage_metrics}</section>
   <h2>平均值</h2>
   <section class='metrics'>{average_metrics}</section>
+  {optional_note}
   <div class='note-box'><b>P0-A 边界：</b>Reasoning tokens、possibly-billed attempts 与 authoritative cost 均 <b>unavailable until P0-B</b>，不会显示成零。Prompt token 已包含 cache token，不能重复相加。</div>
   <h2>每日趋势</h2>
   <div class='table-wrap'><table><thead><tr><th>Local day</th><th>Known tokens</th><th>Active users</th><th>Tokens / active user-day</th><th>Tokens / metered turn</th><th>Calls</th><th>Retries</th><th>Failed</th><th>Usage / cache coverage</th></tr></thead>
-  <tbody>{''.join(daily_rows) if daily_rows else "<tr><td colspan='9' class='muted'>窗口内无日期。</td></tr>"}</tbody></table></div>
+  <tbody>{daily_body}</tbody></table></div>
   <h2>Per-user Usage</h2>
   <div class='sortbar'>{''.join(sort_links)} {''.join(pager)}<span class='muted'>Showing {user_offset + 1 if user_rows else 0}–{user_offset + len(user_rows)} of {user_total}</span></div>
   <div class='table-wrap'><table><thead><tr><th>User</th><th>Last model call (UTC)</th><th>Active days</th><th>Turns / calls / retries / failed</th><th>Prompt / completion / total</th><th>Cache R / W / M</th><th>Calendar / active-day avg</th><th>Daily p50 / p95</th><th>Tokens / metered turn</th><th>Primary provider / model</th><th>Usage / cache / unknown</th><th>Known share</th></tr></thead>
-  <tbody>{''.join(rendered_users) if rendered_users else "<tr><td colspan='12' class='muted'>当前 cohort 无用户用量。</td></tr>"}</tbody></table></div>
+  <tbody>{user_body}</tbody></table></div>
   <h2>Provider / Model</h2>
   <div class='muted'>Identity 是 whole-turn resolved / best-known；requested 与 resolved 将在 P0-B attempt ledger 分开。</div>
   <div class='table-wrap'><table><thead><tr><th>Provider</th><th>Model</th><th>Users</th><th>Turns / calls / retries</th><th>Failed / failure / retry rate</th><th>Prompt / completion / total</th><th>Cache R / W / M</th><th>Tokens / call</th><th>Latency p50 / p95</th><th>Usage / cache coverage</th></tr></thead>
-  <tbody>{''.join(model_rows) if model_rows else "<tr><td colspan='10' class='muted'>当前 cohort 无 provider/model 数据。</td></tr>"}</tbody></table></div>
+  <tbody>{model_body}</tbody></table></div>
+  {lane_section}
   <h2>数据覆盖与边界</h2>
   <div class='note-box'>Usage {_fmt_count(coverage.get('usage_reported_calls'))} / {_fmt_count(coverage.get('model_calls'))} ({_fmt_ratio(coverage.get('usage_coverage'))}) · Cache {_fmt_count(coverage.get('cache_reported_calls'))} / {_fmt_count(coverage.get('model_calls'))} ({_fmt_ratio(coverage.get('cache_coverage'))}) · Cache hit {_fmt_ratio(coverage.get('cache_hit_ratio'))}.<br>
   参考 cohort basis: <code>{html.escape(str(cohort.get('basis') or 'unknown'))}</code>；unparseable registrations {_fmt_count(cohort.get('unparseable_registered_rows'))}，legacy memory timestamps {_fmt_count(cohort.get('legacy_memory_rows_without_valid_created_at'))}。{html.escape(str(cohort.get('limitation') or ''))}<br>

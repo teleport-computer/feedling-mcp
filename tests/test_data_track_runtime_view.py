@@ -1312,4 +1312,4 @@ def test_runtime_user_report_is_wired_to_jobs_store():
     import asgi_app  # noqa: F401
     from model_api_runtime.v2 import jobs_store
 
-    assert _dt._runtime_user_report is jobs_store.recent_runtime_user_report
+    assert _dt._runtime_user_report is jobs_store.recent_runtime_user_delivery_report
