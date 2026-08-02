@@ -51,8 +51,17 @@ _DRAIN_GATES = {
         "WHERE status IN ('pending','claimed','running')"
     ),
     "agent_action_queue": "SELECT count(*) FROM agent_action_queue",
-    "v2_effect_outbox": "SELECT count(*) FROM v2_effect_outbox",
-    "v2_terminal_failure_outbox": "SELECT count(*) FROM v2_terminal_failure_outbox",
+    "active_v2_effect_outbox": (
+        "SELECT count(*) FROM v2_effect_outbox "
+        "WHERE status NOT IN ('applied','discarded')"
+    ),
+    "active_v2_terminal_failure_outbox": (
+        "SELECT count(*) FROM v2_terminal_failure_outbox "
+        "WHERE status_delivered_at IS NULL "
+        "OR runtime_error_delivered_at IS NULL "
+        "OR (COALESCE(reply_parent_message_id, '') <> '' "
+        "    AND reply_delivered_at IS NULL)"
+    ),
 }
 
 _PRIMARY_TRIGGER_TABLES = {
