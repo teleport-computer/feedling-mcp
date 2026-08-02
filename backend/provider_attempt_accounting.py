@@ -71,6 +71,17 @@ class AttemptRetryKind(str, Enum):
     FAILOVER = "failover"
 
 
+class AttemptUsageUnknownReason(str, Enum):
+    """Content-free lifecycle codes for usage that cannot be established."""
+
+    PROVIDER_OMITTED = "provider_omitted"
+    REQUEST_FAILED = "request_failed"
+    TIMEOUT = "timeout"
+    PARSE_ERROR = "parse_error"
+    RECORDER_GAP = "recorder_gap"
+    STARTED_ONLY = "started_only"
+
+
 _CALL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,159}\Z")
 _PROVIDER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,79}\Z")
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}\Z")
@@ -154,6 +165,7 @@ class ProviderAttemptEvent:
     round_id: str | None = None
     retry_kind: AttemptRetryKind = AttemptRetryKind.INITIAL
     provider_request_id: str | None = None
+    usage_unknown_reason: AttemptUsageUnknownReason | None = None
 
     @classmethod
     def create(
@@ -181,6 +193,7 @@ class ProviderAttemptEvent:
         round_id: str | None = None,
         retry_kind: AttemptRetryKind = AttemptRetryKind.INITIAL,
         provider_request_id: str | None = None,
+        usage_unknown_reason: AttemptUsageUnknownReason | None = None,
     ) -> "ProviderAttemptEvent":
         _safe_identifier("user_id", user_id, _INSTALLATION_ID)
         for value, enum_type in (
@@ -194,6 +207,10 @@ class ProviderAttemptEvent:
         ):
             if not isinstance(value, enum_type):
                 raise TypeError("provider_attempt_enums_required")
+        if usage_unknown_reason is not None and not isinstance(
+            usage_unknown_reason, AttemptUsageUnknownReason,
+        ):
+            raise TypeError("provider_attempt_usage_unknown_reason_must_be_typed")
         _safe_identifier("requested_provider", requested_provider, _PROVIDER)
         _safe_identifier("requested_model", requested_model, _MODEL)
         _safe_identifier("resolved_provider", resolved_provider, _PROVIDER)
@@ -236,6 +253,7 @@ class ProviderAttemptEvent:
             round_id=round_id,
             retry_kind=retry_kind,
             provider_request_id=provider_request_id,
+            usage_unknown_reason=usage_unknown_reason,
         )
 
     def as_row(self) -> dict[str, object]:
@@ -264,4 +282,8 @@ class ProviderAttemptEvent:
             "round_id": self.round_id,
             "retry_kind": self.retry_kind.value,
             "provider_request_id": self.provider_request_id,
+            "usage_unknown_reason": (
+                None if self.usage_unknown_reason is None
+                else self.usage_unknown_reason.value
+            ),
         }

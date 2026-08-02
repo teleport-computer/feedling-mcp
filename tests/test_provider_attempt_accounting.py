@@ -1,6 +1,7 @@
 """Content-free domain values for the canonical provider-attempt ledger."""
 
 import sys
+import re
 from pathlib import Path
 
 import pytest
@@ -15,12 +16,13 @@ try:
         AttemptRetryKind,
         AttemptSource,
         AttemptState,
+        AttemptUsageUnknownReason,
         ProviderAttemptEvent,
         stable_attempt_id,
     )
 except ImportError:
     AttemptCompleteness = AttemptLane = AttemptOutcome = AttemptRetryKind = None
-    AttemptSource = AttemptState = None
+    AttemptSource = AttemptState = AttemptUsageUnknownReason = None
     ProviderAttemptEvent = stable_attempt_id = None
 
 
@@ -28,6 +30,7 @@ def test_stable_attempt_id_is_deterministic_across_replay_and_distinguishes_ordi
     """Changing the stable call identity or either retry ordinal must change the row."""
     assert stable_attempt_id is not None
     first = stable_attempt_id("call-a", 2, 1)
+    assert re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", first)
     assert first == stable_attempt_id("call-a", 2, 1)
     assert first != stable_attempt_id("call-a", 3, 1)
     assert first != stable_attempt_id("call-a", 2, 2)
@@ -84,6 +87,19 @@ def test_attempt_event_rejects_an_enum_from_the_wrong_domain():
         )
 
 
+def test_attempt_event_uses_a_typed_safe_usage_unknown_reason():
+    """Unknown usage is a bounded lifecycle code, never a provider error body."""
+    kwargs = _valid_event_kwargs()
+    kwargs["usage_unknown_reason"] = AttemptUsageUnknownReason.TIMEOUT
+    event = ProviderAttemptEvent.create(**kwargs)
+    assert event.as_row()["usage_unknown_reason"] == "timeout"
+
+    for untyped_reason in ("timeout", "provider returned secret body"):
+        kwargs["usage_unknown_reason"] = untyped_reason
+        with pytest.raises(TypeError):
+            ProviderAttemptEvent.create(**kwargs)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -127,7 +143,7 @@ def test_attempt_event_rejects_invalid_optional_scalars_and_untyped_retry_kind(f
 
 
 def _valid_event_kwargs() -> dict:
-    assert AttemptRetryKind is not None
+    assert AttemptRetryKind is not None and AttemptUsageUnknownReason is not None
     return {
         "user_id": "usr_1",
         "call_id": "call-1:attempt.1",

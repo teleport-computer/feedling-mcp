@@ -60,6 +60,9 @@ CREATE TABLE IF NOT EXISTS llm_provider_attempts (
   CONSTRAINT ux_llm_provider_attempts_logical_ordinal
     UNIQUE (call_id, outer_attempt_ordinal, inner_attempt_ordinal),
   CONSTRAINT ux_llm_provider_attempts_attempt_user UNIQUE (attempt_id, user_id),
+  CONSTRAINT ck_llm_provider_attempts_attempt_id_uuid CHECK (
+    attempt_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  ),
   CONSTRAINT ck_llm_provider_attempts_ordinals CHECK (
     outer_attempt_ordinal >= 0 AND inner_attempt_ordinal >= 0
   ),
@@ -84,6 +87,11 @@ CREATE TABLE IF NOT EXISTS llm_provider_attempts (
   CONSTRAINT ck_llm_provider_attempts_completeness CHECK (completeness IN (
     'started_only','complete','usage_unknown','legacy_best_effort'
   )),
+  CONSTRAINT ck_llm_provider_attempts_usage_unknown_reason CHECK (
+    usage_unknown_reason IS NULL OR usage_unknown_reason IN (
+      'provider_omitted','request_failed','timeout','parse_error','recorder_gap','started_only'
+    )
+  ),
   CONSTRAINT ck_llm_provider_attempts_safe_identifiers CHECK (
     call_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$' AND
     requested_provider ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,79}$' AND
@@ -150,6 +158,9 @@ CREATE TABLE IF NOT EXISTS llm_provider_attempt_corrections (
     FOREIGN KEY (attempt_id, user_id)
     REFERENCES llm_provider_attempts(attempt_id, user_id) ON DELETE CASCADE,
   CONSTRAINT ck_llm_provider_attempt_corrections_revision CHECK (revision > 0),
+  CONSTRAINT ck_llm_provider_attempt_corrections_attempt_id_uuid CHECK (
+    attempt_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  ),
   CONSTRAINT ck_llm_provider_attempt_corrections_reason_code CHECK (
     reason_code ~ '^[a-z][a-z0-9_:-]{0,63}$'
   ),
@@ -205,7 +216,10 @@ CREATE TABLE IF NOT EXISTS llm_usage_rollup_watermarks (
   CONSTRAINT ck_llm_usage_rollup_watermarks_replay_generation
     CHECK (replay_generation >= 0),
   CONSTRAINT ck_llm_usage_rollup_watermarks_name
-    CHECK (rollup_name ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$')
+    CHECK (rollup_name ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'),
+  CONSTRAINT ck_llm_usage_rollup_watermarks_attempt_id_uuid CHECK (
+    attempt_id = '' OR attempt_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  )
 );
 
 CREATE OR REPLACE FUNCTION reject_llm_rate_card_mutation()

@@ -159,7 +159,7 @@ def test_0076_provider_attempt_schema_is_content_free_and_deletion_safe():
                 "(attempt_id,user_id,call_id,outer_attempt_ordinal,inner_attempt_ordinal,"
                 "requested_provider,resolved_provider,requested_model,resolved_model,"
                 "transport,lane,state,source) "
-                "VALUES ('attempt-0076',%s,'call-0076',1,0,'openai','openai',"
+                "VALUES ('11111111-1111-5111-8111-111111111111',%s,'call-0076',1,0,'openai','openai',"
                 "'gpt-test','gpt-test','responses','chat','started','runtime_recorder')",
                 (uid,),
             )
@@ -169,33 +169,33 @@ def test_0076_provider_attempt_schema_is_content_free_and_deletion_safe():
                     "(attempt_id,user_id,call_id,outer_attempt_ordinal,inner_attempt_ordinal,"
                     "requested_provider,resolved_provider,requested_model,resolved_model,"
                     "transport,lane,state,source) "
-                    "VALUES ('attempt-0076-duplicate',%s,'call-0076',1,0,'openai','openai',"
+                    "VALUES ('22222222-2222-5222-8222-222222222222',%s,'call-0076',1,0,'openai','openai',"
                     "'gpt-test','gpt-test','responses','chat','started','runtime_recorder')",
                     (uid,),
                 )
             conn.execute(
                 "INSERT INTO llm_provider_attempt_corrections "
                 "(attempt_id,user_id,revision,reason_code) "
-                "VALUES ('attempt-0076',%s,1,'late_usage')",
+                "VALUES ('11111111-1111-5111-8111-111111111111',%s,1,'late_usage')",
                 (uid,),
             )
             with pytest.raises(psycopg.errors.ForeignKeyViolation):
                 conn.execute(
                     "INSERT INTO llm_provider_attempt_corrections "
                     "(attempt_id,user_id,revision,reason_code) "
-                    "VALUES ('attempt-0076',%s,2,'late_usage')",
+                    "VALUES ('11111111-1111-5111-8111-111111111111',%s,2,'late_usage')",
                     (other_uid,),
                 )
             with pytest.raises(psycopg.errors.RaiseException):
                 conn.execute(
                     "DELETE FROM llm_provider_attempt_corrections "
-                    "WHERE attempt_id='attempt-0076' AND user_id=%s",
+                    "WHERE attempt_id='11111111-1111-5111-8111-111111111111' AND user_id=%s",
                     (uid,),
                 )
             with pytest.raises(psycopg.errors.RaiseException):
                 conn.execute(
                     "UPDATE llm_provider_attempt_corrections SET reason_code='changed' "
-                    "WHERE attempt_id='attempt-0076' AND user_id=%s",
+                    "WHERE attempt_id='11111111-1111-5111-8111-111111111111' AND user_id=%s",
                     (uid,),
                 )
             with pytest.raises(psycopg.errors.CheckViolation):
@@ -204,7 +204,7 @@ def test_0076_provider_attempt_schema_is_content_free_and_deletion_safe():
                     "(attempt_id,user_id,call_id,outer_attempt_ordinal,inner_attempt_ordinal,"
                     "requested_provider,resolved_provider,requested_model,resolved_model,"
                     "transport,lane,state,source) "
-                    "VALUES ('unsafe-attempt',%s,'call with space',1,0,'openai','openai',"
+                    "VALUES ('33333333-3333-5333-8333-333333333333',%s,'call with space',1,0,'openai','openai',"
                     "'gpt-test','gpt-test','responses','chat','started','runtime_recorder')",
                     (uid,),
                 )
@@ -214,16 +214,48 @@ def test_0076_provider_attempt_schema_is_content_free_and_deletion_safe():
                     "(attempt_id,user_id,call_id,outer_attempt_ordinal,inner_attempt_ordinal,"
                     "requested_provider,resolved_provider,requested_model,resolved_model,"
                     "transport,lane,state,source,provider_request_id) "
-                    "VALUES ('unsafe-request-id',%s,'call-request-id',1,0,'openai','openai',"
+                    "VALUES ('44444444-4444-5444-8444-444444444444',%s,'call-request-id',1,0,'openai','openai',"
                     "'gpt-test','gpt-test','responses','chat','started','runtime_recorder',"
                     "'api_key=secret')",
                     (uid,),
+                )
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(
+                    "INSERT INTO llm_provider_attempts "
+                    "(attempt_id,user_id,call_id,outer_attempt_ordinal,inner_attempt_ordinal,"
+                    "requested_provider,resolved_provider,requested_model,resolved_model,"
+                    "transport,lane,state,source,usage_unknown_reason) "
+                    "VALUES ('55555555-5555-5555-8555-555555555555',%s,'call-raw-reason',1,0,"
+                    "'openai','openai','gpt-test','gpt-test','responses','chat','started',"
+                    "'runtime_recorder','provider raw error body')",
+                    (uid,),
+                )
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(
+                    "INSERT INTO llm_provider_attempts "
+                    "(attempt_id,user_id,call_id,outer_attempt_ordinal,inner_attempt_ordinal,"
+                    "requested_provider,resolved_provider,requested_model,resolved_model,"
+                    "transport,lane,state,source) "
+                    "VALUES ('not-a-canonical-attempt-id',%s,'call-bad-attempt',1,0,"
+                    "'openai','openai','gpt-test','gpt-test','responses','chat','started',"
+                    "'runtime_recorder')",
+                    (uid,),
+                )
+            conn.execute(
+                "INSERT INTO llm_usage_rollup_watermarks (rollup_name,attempt_id) "
+                "VALUES ('attempt-ledger-test','')"
+            )
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(
+                    "INSERT INTO llm_usage_rollup_watermarks (rollup_name,attempt_id) "
+                    "VALUES ('attempt-ledger-bad-id','arbitrary-attempt-id')"
                 )
             conn.execute(
                 "DELETE FROM users WHERE user_id=%s", (uid,)
             )
             assert conn.execute(
-                "SELECT count(*) FROM llm_provider_attempts WHERE attempt_id='attempt-0076'"
+                "SELECT count(*) FROM llm_provider_attempts "
+                "WHERE attempt_id='11111111-1111-5111-8111-111111111111'"
             ).fetchone() == (0,)
             assert conn.execute(
                 "SELECT count(*) FROM llm_provider_attempt_corrections "

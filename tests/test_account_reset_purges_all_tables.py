@@ -150,12 +150,12 @@ def _seed_all_per_user_tables(user_id: str) -> None:
             "transport,lane,state,source) "
             "VALUES (%s,%s,'reset-call',1,0,'openai','openai','gpt-test','gpt-test',"
             "'responses','chat','started','runtime_recorder')",
-            (f"reset-attempt-{user_id}", user_id),
+            ("aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa", user_id),
         )
         conn.execute(
             "INSERT INTO llm_provider_attempt_corrections "
             "(attempt_id,user_id,revision,reason_code) VALUES (%s,%s,1,'late_usage')",
-            (f"reset-attempt-{user_id}", user_id),
+            ("aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa", user_id),
         )
     cid = db.model_api_credential_create(
         user_id, provider="anthropic", base_url="", label="k",
@@ -228,13 +228,13 @@ def test_db_belt_purges_usage_rollups_without_deleting_parent_user(client):
             "(attempt_id,user_id,call_id,outer_attempt_ordinal,inner_attempt_ordinal,"
             "requested_provider,resolved_provider,requested_model,resolved_model,"
             "transport,lane,state,source) "
-            "VALUES ('belt-attempt',%s,'belt-call',1,0,'openai','openai','gpt-test',"
+            "VALUES ('bbbbbbbb-bbbb-5bbb-8bbb-bbbbbbbbbbbb',%s,'belt-call',1,0,'openai','openai','gpt-test',"
             "'gpt-test','responses','chat','started','runtime_recorder')",
             (uid,),
         )
         conn.execute(
             "INSERT INTO llm_provider_attempt_corrections "
-            "(attempt_id,user_id,revision,reason_code) VALUES ('belt-attempt',%s,1,'late_usage')",
+            "(attempt_id,user_id,revision,reason_code) VALUES ('bbbbbbbb-bbbb-5bbb-8bbb-bbbbbbbbbbbb',%s,1,'late_usage')",
             (uid,),
         )
         conn.execute(
