@@ -4827,6 +4827,20 @@ def _usage_fact_query(
     rollup_where = ["local_day=ANY(%s::date[])", *user_clauses, *rollup_dimension_clauses]
     if selected != "all":
         rollup_where.append(f"{selected}_turns > 0")
+    rollup_statement = f"""
+SELECT local_day,coalesce(user_id,'unknown') AS user_id,{identity_columns}
+  first_metric_at,last_metric_at,last_model_call_at,
+  {rollup_metrics},{rollup_tokens},{rollup_metered}{rollup_latency}
+FROM {table}
+WHERE {' AND '.join(rollup_where)}
+"""
+    if not partition.raw_days:
+        # Empty parameter arrays do not guarantee that PostgreSQL avoids the
+        # other side of the UNION: filtered plans have chosen a hash join that
+        # scanned all of v2_turn_metrics before observing zero raw ranges.
+        # A complete rollup window has no authoritative-raw contribution, so
+        # omit that relation structurally rather than relying on join order.
+        return rollup_statement, tuple(rollup_params)
 
     raw_where = [selected_condition]
     if query.user_id:
@@ -4872,11 +4886,7 @@ def _usage_fact_query(
 WITH raw_ranges(start_at,end_at) AS (
   SELECT * FROM unnest(%s::timestamptz[],%s::timestamptz[])
 ), facts AS (
-SELECT local_day,coalesce(user_id,'unknown') AS user_id,{identity_columns}
-  first_metric_at,last_metric_at,last_model_call_at,
-  {rollup_metrics},{rollup_tokens},{rollup_metered}{rollup_latency}
-FROM {table}
-WHERE {' AND '.join(rollup_where)}
+{rollup_statement}
 UNION ALL
 SELECT (m.created_at AT TIME ZONE 'Asia/Shanghai')::date AS local_day,
   coalesce(m.user_id,'unknown') AS user_id,{identity_select}

@@ -504,6 +504,31 @@ def test_usage_hybrid_raw_sql_uses_bounded_created_at_ranges():
     assert "NOT ((m.created_at AT TIME ZONE" not in statement
 
 
+def test_usage_rollup_only_sql_omits_authoritative_raw_table_entirely():
+    partition = usage_reporting.RollupPartition(
+        rollup_days=(
+            datetime(2026, 7, 1).date(),
+            datetime(2026, 7, 2).date(),
+        ),
+        raw_days=(),
+    )
+    statement, params = jobs_store._usage_fact_query(
+        _shanghai_usage_query(provider="openrouter", model="gpt-a"),
+        partition,
+        dimensions=True,
+    )
+
+    assert "v2_usage_daily_dimensions" in statement
+    assert "v2_turn_metrics" not in statement
+    assert "raw_ranges" not in statement
+    assert "UNION ALL" not in statement
+    assert params == (
+        [datetime(2026, 7, 1).date(), datetime(2026, 7, 2).date()],
+        "openrouter",
+        "gpt-a",
+    )
+
+
 def test_usage_page_renders_rollup_freshness_without_coercing_unknown_to_zero():
     report = _usage_render_report()
     report["coverage"]["rollup"] = {

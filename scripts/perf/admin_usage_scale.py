@@ -694,6 +694,13 @@ def _run(args) -> int:
                 raise AssertionError(
                     f"report did not use production hybrid rollup path: {coverage}"
                 )
+            raw_sql_omitted = not any(
+                "v2_turn_metrics" in sql for sql, _params in statements
+            )
+            if not coverage["raw_days"] and not raw_sql_omitted:
+                raise AssertionError(
+                    "rollup-only production report retained a v2_turn_metrics branch"
+                )
             assert_content_free_metric_sql(statements)
             assert_metric_time_ranges(statements)
             timing = _measure_report(jobs_store, query, args.runs)
@@ -716,6 +723,7 @@ def _run(args) -> int:
                 "coverage": coverage,
                 "content_free_metric_sql": True,
                 "half_open_created_at_range": True,
+                "rollup_only_omits_raw_table": raw_sql_omitted,
             }
     finally:
         if not args.keep_data:
