@@ -174,18 +174,27 @@ rollup row 在列内分别保存 all / metered / unknown 子聚合，不通过�
 p50/p95保存精确 integer samples，不用 daily percentile 加权或近似摘要。
 
 rollup 不修改 `record_whole_turn_metric()` 热路径。现有 Runtime V2 worker 在
-独立、限额、fail-open 的后台 tick 中按 local day 执行同事务
-`DELETE + recompute + INSERT`，成功后才 CAS 推进 watermark。bootstrap 不完整
-时 Admin 全量 raw fallback；完成后首尾 partial day、未 ready day 和 cursor 后
-发现的 dirty day 整日 raw fallback。其他展示时区始终走精确 raw 路径。
+独立、限额、fail-open 的后台 tick 中按 local day 执行同一个
+`REPEATABLE READ` 事务内的 `DELETE + recompute + INSERT`，两张 fact 必须来自
+同一 MVCC snapshot。bootstrap 的 day range、初始 safe cursor 与 source head 也在
+同一 `REPEATABLE READ` snapshot 中读取；成功发现 dirty range 或完成整日替换后才
+CAS 推进对应 watermark 状态。bootstrap 不完整时 Admin 全量 raw fallback；完成后
+首尾 partial day、未 ready day 和 cursor 后发现的 dirty day 整日 raw fallback。
+其他展示时区始终走精确 raw 路径。
 刷新失败、连接不足、锁竞争和超时只造成 lag/raw fallback/unavailable，并显示
 freshness/coverage，不影响 provider、reply、retry、heartbeat 或其他 worker。
 
 异步 cursor 在任意长事务并发下只能提供 bounded eventual consistency，不能在
-完全不触碰写入热路径的同时形式化保证实时 exact。worker 使用 overlap 重扫并在
-页面显示 processed cursor、refreshed-at 与 lag；稳定 fixture、bootstrap 完成且
-无 dirty day 时必须与 raw 严格对账。账号删除由 user-grain FK 立即移除可归因
-rollup，不等待异步刷新。
+完全不触碰写入热路径的同时形式化保证实时 exact。worker 不重复重扫固定 overlap
+窗口，而只按 `(updated_at,id)` 顺序处理 `updated_at <= now - lateness_window` 的
+成熟 source；窗口内 source 暂不推进 processed cursor，以 source head / 非零 lag
+暴露，越过 safe horizon 后才进入 bounded row batch、标记 dirty day 并重建。这样
+持续时间不超过 lateness window 的迟提交会在 cursor 越过其时间点前可见，同时避免
+无新 source 时每个 tick 永久重建同一历史跨度；超过该窗口的任意长事务仍是明确的
+一致性限制。相同 `updated_at` 下 head `id` 尚未追平也必须显示非零 lag。页面显示
+processed cursor、source head、refreshed-at 与 lag；稳定 fixture、bootstrap 完成且
+无 dirty day、safe horizon 前可见 source 已全部处理时必须与 raw 严格对账。账号删除由
+user-grain FK 立即移除可归因 rollup，不等待异步刷新。
 
 为使完整默认报表达标，各 breakdown 在同一个 PostgreSQL exported snapshot 下
 并行读取：总共最多 3 条 `REPEATABLE READ, READ ONLY` 连接，exporter 自身执行

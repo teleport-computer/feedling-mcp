@@ -104,9 +104,9 @@
 - Modify: `backend/model_api_runtime/v2/serve_worker.py`
 - Create: `tests/test_v2_usage_rollup.py`
 
-- [ ] Write RED real-PostgreSQL tests for one-day recompute equivalence, overlapping completeness, NULL/known-count semantics, idempotent `DELETE + INSERT`, bootstrap, late update/dirty day discovery, advisory-lock competition, cursor CAS, crash rollback, bounded batches, and user deletion.
+- [ ] Write RED real-PostgreSQL tests for one-day recompute equivalence, all subaggregate columns, overlapping completeness, NULL/known-count semantics, idempotent `DELETE + INSERT`, repeatable-read day/bootstrap snapshots, bounded-lateness dirty-day discovery, advisory-lock competition, cursor CAS, crash rollback, bounded cursor/day batches, and user deletion.
 - [ ] Implement a bounded existing-worker maintenance tick. It never runs from `record_whole_turn_metric()` and catches pool, lock, SQL, timeout, and shutdown failures so provider/reply/retry/heartbeat behavior cannot change.
-- [ ] Keep bootstrap/refresh transactions short, use overlap for late commits, expose freshness/lag, and leave old complete rows readable until a day replacement commits.
+- [ ] Keep bootstrap/refresh transactions short and repeatable-read. Delay the `(updated_at,id)` cursor behind a bounded-lateness safe horizon instead of repeatedly rescanning a fixed overlap window; expose withheld/backlogged source as non-zero lag and leave old complete rows readable until a day replacement commits.
 - [ ] Run worker/failure-injection tests and commit exact files.
 
 ### Task 4C: Read rollup and raw edges from one exported snapshot
