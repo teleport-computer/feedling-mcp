@@ -195,6 +195,14 @@ dstack-ingress 2.2 的 `quote.json` 使用 `hash_algorithm: "raw"` 和空 `prefi
 这里的 `raw` 表示调用方已经计算 `sha256(exact sha256sum.txt bytes)`，再把该 32-byte
 digest 原样交给 SDK v0.5 quote API；它不表示把未哈希 evidence 放进 `REPORT_DATA`。
 验证器仍要求解析后的 TDX quote `REPORT_DATA` 恰好为该 digest 加 32 个 zero bytes。
+当前 ingress event log 没有可供 SDK v0.5.4 规则重放的 non-empty ordered digest，
+因此验证器明确不提供 RTMR3 replay，也不比较 ingress 与 enclave 的 RTMR3；这两者是
+不同 workload，不能把 event payload 或两者相等当作认证证据。
+
+若运行机的系统 trust store 缺少 Let's Encrypt roots，可用 certifi 的 Mozilla CA
+bundle 显式运行下列命令。`SSL_CERT_FILE="$(python -m certifi)"` 仍执行完整 WebPKI
+certificate-chain 与 hostname 验证；不得改成 unverified context、`verify=False` 或
+跳过 hostname check。系统默认 roots 可用时可省略此前缀。
 
 | | |
 |---|---|
@@ -223,6 +231,7 @@ digest 原样交给 SDK v0.5 quote API；它不表示把未哈希 evidence 放�
 `PROD_COMPOSE_HASH` 必须是本次部署返回的 live compose hash：
 
 ```bash
+SSL_CERT_FILE="$(python -m certifi)" \
 python tools/verify_enclave_domain.py \
   --domain enclave.feedling.app \
   --expected-compose-hash "$PROD_COMPOSE_HASH" \
@@ -252,6 +261,7 @@ python tools/verify_enclave_domain.py \
 `TEST_COMPOSE_HASH` 必须是本次部署返回的 live compose hash：
 
 ```bash
+SSL_CERT_FILE="$(python -m certifi)" \
 python tools/verify_enclave_domain.py \
   --domain test-enclave.feedling.app \
   --expected-compose-hash "$TEST_COMPOSE_HASH" \
@@ -305,6 +315,7 @@ in test, pre, and production.
 `PRE_COMPOSE_HASH` 必须是本次部署返回的 live compose hash：
 
 ```bash
+SSL_CERT_FILE="$(python -m certifi)" \
 python tools/verify_enclave_domain.py \
   --domain pre-enclave.feedling.app \
   --expected-compose-hash "$PRE_COMPOSE_HASH" \
@@ -314,12 +325,17 @@ python tools/verify_enclave_domain.py \
 
 每个 `$*_REFERENCE_MEASUREMENTS` 都必须指向运维人员已审核并批准的 JSON 文件；
 校验器不会从 live quote 自动信任或写入基线。初次部署时，先从 ingress 与 enclave
-quote 取得候选 measurement，经独立审核后写入对应环境的文件，再运行上述正常 gate。
+quote 取得 `UNAPPROVED_CANDIDATE` 候选 measurement。独立审核后，操作员必须有意识地
+复制测量值并创建另一份 `APPROVED_REFERENCE` 文件；校验器不会自动升级、改写或覆盖
+候选文件。只有带非空审批人和严格 UTC 审批时间的 approved 文件才能运行正常 gate。
 文件格式如下（所有 measurement 均为恰好 96 个十六进制字符）：
 
 ```json
 {
   "version": 1,
+  "status": "APPROVED_REFERENCE",
+  "approved_by": "security@example.com",
+  "approved_at": "2026-08-03T00:00:00Z",
   "domain": "pre-enclave.feedling.app",
   "expected_compose_hash": "<64 hex>",
   "expected_content_pk_hex": "<64 hex>",
