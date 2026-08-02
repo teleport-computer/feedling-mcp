@@ -36,6 +36,9 @@ x-agent-runner-env: &agent-runner-env
   AGENT_RESOLVE_CONCURRENCY: "${AGENT_RESOLVE_CONCURRENCY:-8}"
   AGENT_RUNTIME_ISOLATION: "process"
   DATABASE_URL: "${DATABASE_URL:-}"
+  # Must flip atomically with DATABASE_URL during Phase-4 promotion. Child
+  # processes inherit it and perform the same read-only TEE-head assertion.
+  FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
   AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
   AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
   FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"

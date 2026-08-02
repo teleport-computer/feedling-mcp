@@ -949,6 +949,23 @@ L1 **7219 passed / 0 failed**（含 `tests/test_envelope_storage_fields.py` 16 �
       切 `DATABASE_URL` 指向 TEE pg（backend、runner、consumer；**enclave 回调
       的 backend URL 不变**）→ 停 `FEEDLING_TEE_DUAL_WRITE`、停 scheduler/
       replicator → 解冻。
+- [ ] **Phase 4 运行时契约补齐（切 DSN 前硬 gate）**：先以 owner workflow 将
+      `alembic_tee` 升到 `0011_primary_runtime_bridge`。backend、主 CVM
+      `serve-worker`、独立 runner 必须同时设置 `FEEDLING_DATABASE_SCHEMA=tee`；该模式
+      启动只读核对 `alembic_tee_version=head`，不得拿 app role 跑 RDS Alembic。
+      selector 与 DSN 任一错配都按启动失败处理；回滚时二者也必须一起恢复为 RDS。
+- [ ] **冻结后的离线 prepare**：停掉全部写进程后先跑
+      `python -m admin.phase4_cutover`（dry-run），再用
+      `--apply --confirm-writes-frozen`。工具硬拦 genesis chunks/活跃 job、voice
+      临时态、agent job/action queue、两张 V2 outbox 与 TEE pending-device 队列；随后原样搬
+      `frame_envelopes` 兼容桥、补齐 live chat 的 `storage_generation` R2 fence、逐行
+      digest 校验，并把 TEE 全部 identity sequence `setval(max)`。它不切 DSN、不
+      部署，避免工具失败留下半切状态。
+- [ ] **FrameEnvelope v1 临时桥**：TEE 原 `frames` 是 enclave storage-key 的
+      `frames-tee/` 投影，无法还原现有客户端需要的原始信封，Phase 4 不新增吐帧明文的
+      enclave 端点。`0011` 在 TEE 主库暂留同形 `frame_envelopes`，冻结窗口原样复制
+      metadata + 旧 R2 pointer；新写继续走现有协议。该桥与 `frames` 并存，留 Phase 5
+      的版本化 frame 协议迁移后删除，不能把两表混读。
 - [ ] **加密用户密文行随库带走（v6 必做）**：opt-in 加密用户的双收件人信封行
       要原样在 TEE 主库（cutover 前最后一轮 reconcile 确认密文行搬运语义已就位，
       见 Task 2.4）。
@@ -957,7 +974,12 @@ L1 **7219 passed / 0 failed**（含 `tests/test_envelope_storage_fields.py` 16 �
       `bak_20260710_*` pg_dump 归档后弃。
 - [ ] 连接容量已备好（400）；cutover 后连续 3 天盯 `pg_stat_activity` 峰值与
       CVM `free -m`（available<1000MB 告警线）。
-- [ ] 回滚预案：观察期内 RDS 只读在线，任何 P0 → 切回 RDS DSN。
+- [ ] 回滚预案分界必须写清：**解冻前**尚无 TEE-only 新写，可原子切回 RDS DSN；
+      **解冻后的第一笔写开始，RDS 只读副本就不再是无损热回滚点**，直接切回会丢窗口内
+      的新增/更新并复活已删除行。观察期 P0 默认先停写、保全 TEE 快照、以前向修复恢复；
+      若仍要回 RDS，必须先做经逐表校验的 reverse reconcile/restore，不能只改 secret。
+      pre 首轮用测试账号验证并明确接受必要时丢弃窗口内测试写；prod 前必须另行完成反向
+      回迁演练或决定不承诺解冻后热回滚。
 - [ ] 观察 7-14 天后 RDS 快照留档 → 停实例。
 
 ---

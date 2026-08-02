@@ -1750,6 +1750,9 @@ jobs:
           OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
           FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
           DATABASE_URL:        ${{ secrets.PRE_DATABASE_URL }}
+          # Phase-4 DB-chain selector, shared by backend + in-CVM worker and
+          # the independent runner. Flip only together with PRE_DATABASE_URL.
+          FEEDLING_DATABASE_SCHEMA: ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA || 'rds' }}
           # Dedicated pre TEE Postgres shadow. Keep dual-write blank until the
           # new instance has passed schema, backup, and connectivity checks.
           TEE_DATABASE_URL:        ${{ secrets.PRE_TEE_DATABASE_URL }}
@@ -1810,6 +1813,7 @@ jobs:
             -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
             -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
             -e "DATABASE_URL=$DATABASE_URL" \
+            -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
@@ -1978,6 +1982,7 @@ jobs:
           AGENT_MAX_CHILDREN:           ${{ vars.PRE_AGENT_MAX_CHILDREN }}
           # Shared with the main pre CVM — MUST match (esp. the token secret).
           DATABASE_URL:                 ${{ secrets.PRE_DATABASE_URL }}
+          FEEDLING_DATABASE_SCHEMA:      ${{ vars.PRE_FEEDLING_DATABASE_SCHEMA || 'rds' }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           AGENT_RUNTIME_USERS:          ${{ secrets.PRE_AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.PRE_AGENT_RUNTIME_AUTODISCOVER }}
@@ -2001,6 +2006,7 @@ jobs:
             -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
             -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
             -e "DATABASE_URL=$DATABASE_URL" \
+            -e "FEEDLING_DATABASE_SCHEMA=$FEEDLING_DATABASE_SCHEMA" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
