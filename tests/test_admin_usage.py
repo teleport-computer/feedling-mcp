@@ -523,9 +523,35 @@ def test_usage_rollup_only_sql_omits_authoritative_raw_table_entirely():
     assert "raw_ranges" not in statement
     assert "UNION ALL" not in statement
     assert params == (
-        [datetime(2026, 7, 1).date(), datetime(2026, 7, 2).date()],
+        datetime(2026, 7, 1).date(),
+        datetime(2026, 7, 3).date(),
         "openrouter",
         "gpt-a",
+    )
+
+
+def test_usage_rollup_sql_compacts_contiguous_days_into_half_open_ranges():
+    partition = usage_reporting.RollupPartition(
+        rollup_days=(
+            datetime(2026, 7, 1).date(),
+            datetime(2026, 7, 2).date(),
+            datetime(2026, 7, 4).date(),
+        ),
+        raw_days=(),
+    )
+
+    statement, params = jobs_store._usage_fact_query(
+        _shanghai_usage_query(), partition, dimensions=False
+    )
+
+    assert statement.count("v2_usage_daily_users") == 1
+    assert statement.count("local_day >= %s AND local_day < %s") == 2
+    assert "local_day=ANY" not in statement
+    assert params == (
+        datetime(2026, 7, 1).date(),
+        datetime(2026, 7, 3).date(),
+        datetime(2026, 7, 4).date(),
+        datetime(2026, 7, 5).date(),
     )
 
 

@@ -4729,6 +4729,25 @@ _USAGE_FACT_TOKENS = (
 )
 
 
+def _usage_rollup_day_predicate(days) -> tuple[str, list[object]]:
+    """Compress exact local days into indexable half-open contiguous ranges."""
+
+    ordered = sorted(set(days))
+    if not ordered:
+        return "FALSE", []
+    ranges = []
+    start = previous = ordered[0]
+    for current in ordered[1:]:
+        if current != previous + timedelta(days=1):
+            ranges.append((start, previous + timedelta(days=1)))
+            start = current
+        previous = current
+    ranges.append((start, previous + timedelta(days=1)))
+    clauses = ["(local_day >= %s AND local_day < %s)" for _ in ranges]
+    params = [bound for pair in ranges for bound in pair]
+    return "(" + " OR ".join(clauses) + ")", params
+
+
 def _usage_fact_query(
     query,
     partition: usage_reporting.RollupPartition,
@@ -4799,7 +4818,9 @@ def _usage_fact_query(
         f",{selected}_latency_samples AS latency_samples" if dimensions else ""
     )
     user_clauses: list[str] = []
-    rollup_params: list[object] = [list(partition.rollup_days)]
+    rollup_day_where, rollup_params = _usage_rollup_day_predicate(
+        partition.rollup_days
+    )
     raw_starts: list[datetime] = []
     raw_ends: list[datetime] = []
     for raw_day in partition.raw_days:
@@ -4824,7 +4845,7 @@ def _usage_fact_query(
             if value:
                 rollup_dimension_clauses.append(f"{field}=%s")
                 rollup_params.append(value)
-    rollup_where = ["local_day=ANY(%s::date[])", *user_clauses, *rollup_dimension_clauses]
+    rollup_where = [rollup_day_where, *user_clauses, *rollup_dimension_clauses]
     if selected != "all":
         rollup_where.append(f"{selected}_turns > 0")
     rollup_statement = f"""
