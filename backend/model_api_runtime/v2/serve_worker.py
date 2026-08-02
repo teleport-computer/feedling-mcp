@@ -4151,10 +4151,32 @@ async def _usage_rollup_loop(
     cadence = _usage_rollup_interval_seconds() if interval is None else interval
     while not stop_event.is_set():
         if usage_rollup.enabled():
+            cancel_event = threading.Event()
+            tick_task: asyncio.Task | None = None
+            stop_task: asyncio.Task | None = None
             try:
-                result = await asyncio.to_thread(
-                    usage_rollup.run_maintenance_tick
+                tick_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        usage_rollup.run_maintenance_tick,
+                        cancel_event=cancel_event,
+                    )
                 )
+                stop_task = asyncio.create_task(stop_event.wait())
+                done, _pending = await asyncio.wait(
+                    (tick_task, stop_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stop_task in done:
+                    cancel_event.set()
+                    try:
+                        await asyncio.shield(tick_task)
+                    except Exception as e:  # noqa: BLE001 - optional reporting only
+                        log.warning(
+                            "[v2.serve_worker] usage rollup drain failed: %s",
+                            type(e).__name__,
+                        )
+                    break
+                result = tick_task.result()
                 if result.get("days_refreshed"):
                     log.info(
                         "[v2.serve_worker] usage rollup refreshed days=%s "
@@ -4162,11 +4184,32 @@ async def _usage_rollup_loop(
                         result["days_refreshed"],
                         result.get("bootstrap_complete"),
                     )
+            except asyncio.CancelledError:
+                # asyncio cannot stop a running to_thread call.  Signal its
+                # cooperative transaction boundaries, then join it under
+                # shield so shutdown cannot leave a DB thread running after
+                # the parent maintenance task has drained.
+                cancel_event.set()
+                if tick_task is not None:
+                    try:
+                        await asyncio.shield(tick_task)
+                    except Exception as e:  # noqa: BLE001 - shutdown remains bounded
+                        log.warning(
+                            "[v2.serve_worker] usage rollup cancel drain failed: %s",
+                            type(e).__name__,
+                        )
+                raise
             except Exception as e:  # noqa: BLE001 - reporting cannot kill worker
                 log.warning(
                     "[v2.serve_worker] usage rollup tick failed: %s",
                     type(e).__name__,
                 )
+            finally:
+                cancel_event.set()
+                if stop_task is not None and not stop_task.done():
+                    stop_task.cancel()
+                if stop_task is not None:
+                    await asyncio.gather(stop_task, return_exceptions=True)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=cadence)
         except asyncio.TimeoutError:

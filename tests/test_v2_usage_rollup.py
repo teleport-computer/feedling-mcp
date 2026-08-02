@@ -718,6 +718,49 @@ def test_tick_releases_the_session_advisory_lock_before_returning_pool_connectio
                 )
 
 
+def test_unlock_failure_closes_the_physical_connection_and_releases_session_lock(
+    monkeypatch,
+):
+    """Catches a failed unlock returning a lock-owning physical session to the pool."""
+    original_execute = psycopg.Connection.execute
+    failed_connections = []
+
+    def fail_unlock(self, query, *args, **kwargs):
+        if "pg_advisory_unlock" in str(query):
+            failed_connections.append(self)
+            raise psycopg.OperationalError("forced advisory unlock failure")
+        return original_execute(self, query, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(psycopg.Connection, "execute", fail_unlock)
+        assert usage_rollup.run_maintenance_tick()["status"] == "ok"
+
+    contender = psycopg.connect(os.environ["DATABASE_URL"], autocommit=True)
+    acquired = False
+    try:
+        acquired = contender.execute(
+            "SELECT pg_try_advisory_lock(%s)", (usage_rollup.ADVISORY_LOCK_KEY,)
+        ).fetchone()[0]
+        assert len(failed_connections) == 1
+        assert failed_connections[0].closed is True
+        assert acquired is True
+    finally:
+        if acquired:
+            contender.execute(
+                "SELECT pg_advisory_unlock(%s)",
+                (usage_rollup.ADVISORY_LOCK_KEY,),
+            )
+        else:
+            # RED cleanup: the pre-fix implementation leaked the lock into the
+            # pool, so borrow that session and release it before failing.
+            with db.get_pool().connection() as conn:
+                conn.execute(
+                    "SELECT pg_advisory_unlock(%s)",
+                    (usage_rollup.ADVISORY_LOCK_KEY,),
+                )
+        contender.close()
+
+
 def test_incremental_cursor_overlap_discovers_a_late_updated_old_day():
     """Catches cursor-only refresh that misses a late commit behind its last scan."""
     day = date(2026, 6, 10)
@@ -913,7 +956,7 @@ def test_worker_rollup_loop_is_default_on_opt_out_and_fail_open(monkeypatch):
     """Catches maintenance failure escaping its sibling worker loops or opt-out ignored."""
     attempts = []
 
-    def fail_tick():
+    def fail_tick(**_kwargs):
         attempts.append(1)
         raise RuntimeError("database unavailable")
 
@@ -943,6 +986,116 @@ def test_worker_rollup_loop_is_default_on_opt_out_and_fail_open(monkeypatch):
     before = len(attempts)
     asyncio.run(run_disabled())
     assert len(attempts) == before
+
+
+def test_worker_loop_cancellation_signals_and_joins_the_inflight_tick(monkeypatch):
+    """Catches asyncio cancellation abandoning a still-running to_thread tick."""
+    started = threading.Event()
+    stopped = threading.Event()
+    received = []
+
+    def blocking_tick(**kwargs):
+        cancel_event = kwargs.get("cancel_event")
+        received.append(cancel_event)
+        started.set()
+        if cancel_event is not None:
+            cancel_event.wait(timeout=1)
+        stopped.set()
+        return {"status": "cancelled", "days_refreshed": 0}
+
+    monkeypatch.setattr(usage_rollup, "run_maintenance_tick", blocking_tick)
+
+    async def run_and_cancel():
+        stop = asyncio.Event()
+        task = asyncio.create_task(serve_worker._usage_rollup_loop(stop, interval=30.0))
+        while not started.is_set():
+            await asyncio.sleep(0.005)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+
+    asyncio.run(run_and_cancel())
+    assert len(received) == 1
+    assert isinstance(received[0], threading.Event)
+    assert received[0].is_set()
+    assert stopped.is_set()
+
+
+def test_cancel_after_bootstrap_skips_discovery(monkeypatch):
+    """Catches shutdown starting a new discovery transaction after bootstrap."""
+    cancel_event = threading.Event()
+    original_initialize = usage_rollup._initialize_bootstrap
+    discovery_calls = []
+
+    def initialize_then_cancel(*args, **kwargs):
+        state = original_initialize(*args, **kwargs)
+        cancel_event.set()
+        return state
+
+    monkeypatch.setattr(usage_rollup, "_initialize_bootstrap", initialize_then_cancel)
+    monkeypatch.setattr(
+        usage_rollup,
+        "_discover_dirty_days",
+        lambda *args, **kwargs: discovery_calls.append(1),
+    )
+    result = usage_rollup.run_maintenance_tick(cancel_event=cancel_event)
+    assert result["status"] == "cancelled"
+    assert discovery_calls == []
+
+
+def test_cancel_after_discovery_skips_the_day_phase(monkeypatch):
+    """Catches shutdown starting a day transaction after discovery finishes."""
+    cancel_event = threading.Event()
+    original_discover = usage_rollup._discover_dirty_days
+    refresh_calls = []
+
+    def discover_then_cancel(*args, **kwargs):
+        state = original_discover(*args, **kwargs)
+        cancel_event.set()
+        return state
+
+    monkeypatch.setattr(usage_rollup, "_discover_dirty_days", discover_then_cancel)
+    monkeypatch.setattr(
+        usage_rollup,
+        "_refresh_next_day",
+        lambda *args, **kwargs: refresh_calls.append(1),
+    )
+    result = usage_rollup.run_maintenance_tick(cancel_event=cancel_event)
+    assert result["status"] == "cancelled"
+    assert refresh_calls == []
+
+
+def test_cancel_after_one_day_does_not_start_the_next_day_transaction(monkeypatch):
+    """Catches shutdown continuing a bounded bootstrap batch past its current day."""
+    uid = _uid("cancel_days")
+    seed_user(uid)
+    first = date(2026, 7, 10)
+    for offset in range(2):
+        day = first + timedelta(days=offset)
+        _insert_metric(
+            created_at=datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+            + timedelta(hours=4),
+            user_id=uid,
+            prompt_tokens=1,
+            completion_tokens=1,
+            model_calls=1,
+            usage_reported_calls=1,
+        )
+    cancel_event = threading.Event()
+    original_refresh = usage_rollup._refresh_next_day
+    refresh_calls = []
+
+    def refresh_once_then_cancel(*args, **kwargs):
+        result = original_refresh(*args, **kwargs)
+        refresh_calls.append(result[0])
+        cancel_event.set()
+        return result
+
+    monkeypatch.setattr(usage_rollup, "_refresh_next_day", refresh_once_then_cancel)
+    result = usage_rollup.run_maintenance_tick(max_days=2, cancel_event=cancel_event)
+    assert result["status"] == "cancelled"
+    assert result["refreshed_days"] == [first.isoformat()]
+    assert refresh_calls == [first]
 
 
 def test_worker_rollup_interval_bad_config_falls_back_instead_of_blocking_startup(

@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -519,6 +520,35 @@ def _record_error(error: BaseException, *, now_utc: datetime) -> None:
         pass
 
 
+def _cancel_requested(cancel_event: threading.Event | None) -> bool:
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _tick_result(
+    *,
+    status: str,
+    refreshed: list[str],
+    state: dict | None = None,
+) -> dict:
+    result = {
+        "status": status,
+        "days_refreshed": len(refreshed),
+        "refreshed_days": list(refreshed),
+    }
+    if state is not None:
+        result.update(
+            {
+                "bootstrap_complete": bool(state["bootstrap_complete"]),
+                "dirty_from_day": state["dirty_from_day"],
+                "dirty_through_day": state["dirty_through_day"],
+                "source_updated_at": state["source_updated_at"],
+                "source_id": int(state["source_id"]),
+                "source_lag_seconds": state["source_lag_seconds"],
+            }
+        )
+    return result
+
+
 def run_maintenance_tick(
     *,
     max_days: int = DEFAULT_MAX_DAYS,
@@ -527,6 +557,7 @@ def run_maintenance_tick(
     statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
     pool_timeout_seconds: float = DEFAULT_POOL_TIMEOUT_SECONDS,
     now_utc: datetime | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict:
     """Run one bounded refresh attempt and never raise to the worker service."""
 
@@ -575,6 +606,8 @@ def run_maintenance_tick(
             if not locked:
                 return {"status": "lock_busy", "days_refreshed": 0}
             try:
+                if _cancel_requested(cancel_event):
+                    return _tick_result(status="cancelled", refreshed=[])
                 conn.execute(
                     "INSERT INTO v2_usage_rollup_watermarks (rollup_name) VALUES (%s) "
                     "ON CONFLICT (rollup_name) DO NOTHING",
@@ -586,6 +619,8 @@ def run_maintenance_tick(
                     overlap_seconds=overlap,
                     timeout_ms=timeout_ms,
                 )
+                if _cancel_requested(cancel_event):
+                    return _tick_result(status="cancelled", refreshed=[], state=state)
                 if state["bootstrap_complete"]:
                     state = _discover_dirty_days(
                         conn,
@@ -594,8 +629,14 @@ def run_maintenance_tick(
                         overlap_seconds=overlap,
                         timeout_ms=timeout_ms,
                     )
+                if _cancel_requested(cancel_event):
+                    return _tick_result(status="cancelled", refreshed=[], state=state)
                 refreshed: list[str] = []
                 for _ in range(days_limit):
+                    if _cancel_requested(cancel_event):
+                        return _tick_result(
+                            status="cancelled", refreshed=refreshed, state=state
+                        )
                     local_day, outcome = _refresh_next_day(
                         conn, now_utc=now, timeout_ms=timeout_ms
                     )
@@ -603,17 +644,7 @@ def run_maintenance_tick(
                         break
                     refreshed.append(local_day.isoformat())
                     state = outcome["state"]
-                return {
-                    "status": "ok",
-                    "days_refreshed": len(refreshed),
-                    "refreshed_days": refreshed,
-                    "bootstrap_complete": bool(state["bootstrap_complete"]),
-                    "dirty_from_day": state["dirty_from_day"],
-                    "dirty_through_day": state["dirty_through_day"],
-                    "source_updated_at": state["source_updated_at"],
-                    "source_id": int(state["source_id"]),
-                    "source_lag_seconds": state["source_lag_seconds"],
-                }
+                return _tick_result(status="ok", refreshed=refreshed, state=state)
             finally:
                 # Unlock while this connection is still checked out.  Returning
                 # a session lock to the pool would let an unrelated borrower
@@ -621,7 +652,12 @@ def run_maintenance_tick(
                 try:
                     conn.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
                 except Exception:  # noqa: BLE001 - close also releases it
-                    pass
+                    # A session advisory lock belongs to the physical server
+                    # connection.  Returning that session to psycopg_pool after
+                    # an uncertain unlock would leak ownership to the next
+                    # borrower.  Closing makes the pool discard and replace it;
+                    # PostgreSQL releases the lock with the session.
+                    conn.close()
     except Exception as exc:  # noqa: BLE001 - optional reporting must never kill worker
         _record_error(exc, now_utc=now)
         log.warning("[v2.usage_rollup] maintenance tick failed: %s", type(exc).__name__)
