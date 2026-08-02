@@ -301,6 +301,7 @@ services:
       # Runtime-token secret shared by backend, enclave, and pooled V2 worker.
       # Empty = off. Encrypted env, not baked into compose_hash.
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+      FEEDLING_EXPECTED_RUNNER_COUNT: "${FEEDLING_EXPECTED_RUNNER_COUNT:-}"
       # gunicorn worker (process) count (backend/gunicorn_conf.py _worker_count,
       # default 1). N>1 is code-supported: leader-elected :9998 WS bind
       # (core/leader.py run_singleton, in the deployed image) + Postgres

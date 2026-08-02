@@ -47,6 +47,7 @@ EXCLUDED_OPERATIONS = {
 
 PUBLIC_OPERATIONS = {
     ("get", "/healthz"),
+    ("get", "/healthz/runner"),
     ("post", "/v1/access/claim-token"),
     ("post", "/v1/account/recover/challenge"),
     ("post", "/v1/account/recover/verify"),
