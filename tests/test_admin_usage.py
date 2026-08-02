@@ -8,6 +8,7 @@ import json
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -284,7 +285,7 @@ def test_usage_hybrid_serial_matches_raw_payload_and_exposes_freshness(usage_row
         else:
             assert hybrid[section] == raw[section], section
     assert freshness == {
-        "mode": "hybrid",
+        "mode": "hybrid-parallel",
         "refreshed_at": refreshed_at,
         "last_success_at": refreshed_at,
         "processed_updated_at": refreshed_at,
@@ -319,7 +320,7 @@ def test_usage_hybrid_filters_match_raw_including_unknown_metered_intersection(
             beta = next(row for row in report["users"] if row["user_id"] == "u_usage_beta")
             assert beta["metered_turns"] == 1
             assert beta["tokens_per_metered_turn"] == pytest.approx(35)
-        assert freshness["mode"] == "hybrid"
+        assert freshness["mode"] in {"hybrid", "hybrid-parallel"}
     finally:
         with db.get_pool().connection() as conn:
             conn.execute("DELETE FROM v2_usage_rollup_watermarks")
@@ -387,6 +388,255 @@ def test_usage_page_renders_rollup_freshness_without_coercing_unknown_to_zero():
     assert "lag unknown" in body
     assert "QueryCanceled" in body
     assert "lag 0" not in body
+
+
+def test_usage_parallel_exported_snapshot_matches_raw_and_imports_before_read(
+    monkeypatch, usage_rows
+):
+    query = _shanghai_usage_query()
+    raw = jobs_store._usage_report_snapshot_raw(query)
+    _enable_usage_rollup()
+    events = []
+    monkeypatch.setattr(
+        jobs_store,
+        "_usage_snapshot_observer",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    try:
+        report = jobs_store._usage_report_snapshot_hybrid_parallel(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    freshness = report["coverage"].pop("rollup")
+    assert report == raw
+    assert freshness["mode"] == "hybrid-parallel"
+    assert sum(event == "exported" for event, _ in events) == 1
+    for role in ("dimension", "latency"):
+        imported = next(
+            index for index, (event, fields) in enumerate(events)
+            if event == "imported" and role in fields["role"]
+        )
+        first_read = next(
+            index for index, (event, fields) in enumerate(events)
+            if event == "read" and fields["role"] == role
+        )
+        assert imported < first_read
+
+
+def test_usage_parallel_snapshot_excludes_writer_committed_after_export(
+    monkeypatch, usage_rows
+):
+    query = _shanghai_usage_query()
+    expected = jobs_store._usage_report_snapshot_raw(query)
+    first = datetime(2026, 7, 1).date()
+    second = datetime(2026, 7, 2).date()
+    _enable_usage_rollup(dirty_from_day=first, dirty_through_day=second)
+    inserted = False
+
+    def observer(event, **_fields):
+        nonlocal inserted
+        if event != "exported" or inserted:
+            return
+        inserted = True
+        with db.get_pool().connection() as writer:
+            writer.execute(
+                "INSERT INTO v2_turn_metrics "
+                "(user_id,lane,provider,model,prompt_tokens,completion_tokens,"
+                "usage_reported_calls,cache_reported_calls,model_calls,retries,failed,"
+                "status,latency_ms,created_at) VALUES "
+                "(%s,'chat','openrouter','late-model',999,1,1,0,1,0,false,%s,9,%s)",
+                ("u_usage_alpha", "parallel-after-export", "2026-07-01T12:30:00+00:00"),
+            )
+
+    monkeypatch.setattr(jobs_store, "_usage_snapshot_observer", observer)
+    try:
+        report = jobs_store._usage_report_snapshot_hybrid_parallel(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_turn_metrics WHERE status=%s", ("parallel-after-export",))
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    report["coverage"].pop("rollup")
+    assert inserted is True
+    assert report == expected
+
+
+def test_usage_parallel_uses_at_most_three_connections(monkeypatch, usage_rows):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+    real_pool = db.get_pool()
+    lock = threading.Lock()
+    active = 0
+    maximum = 0
+
+    class Context:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            nonlocal active, maximum
+            value = self.inner.__enter__()
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            return value
+
+        def __exit__(self, *args):
+            nonlocal active
+            try:
+                return self.inner.__exit__(*args)
+            finally:
+                with lock:
+                    active -= 1
+
+    class Pool:
+        def connection(self, *args, **kwargs):
+            return Context(real_pool.connection(*args, **kwargs))
+
+    monkeypatch.setattr(jobs_store, "_pool", lambda: Pool())
+    try:
+        report = jobs_store._usage_report_snapshot_hybrid_parallel(query)
+    finally:
+        with real_pool.connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert report["overview"]["total_tokens"] == 215
+    assert active == 0
+    assert 2 <= maximum <= 3
+
+
+def test_usage_process_and_rds_admission_fail_fast_without_extra_query(usage_rows):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+    assert jobs_store._USAGE_REPORT_GATE.acquire(blocking=False)
+    try:
+        with pytest.raises(RuntimeError, match="process admission busy"):
+            jobs_store.usage_report_snapshot(query)
+    finally:
+        jobs_store._USAGE_REPORT_GATE.release()
+
+    with db.get_pool().connection() as holder:
+        assert holder.execute(
+            "SELECT pg_try_advisory_lock(%s)",
+            (jobs_store._USAGE_REPORT_ADVISORY_KEY,),
+        ).fetchone()[0]
+        try:
+            with pytest.raises(RuntimeError, match="RDS admission busy"):
+                jobs_store.usage_report_snapshot(query)
+        finally:
+            holder.execute(
+                "SELECT pg_advisory_unlock(%s)",
+                (jobs_store._USAGE_REPORT_ADVISORY_KEY,),
+            )
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+
+
+def test_usage_importer_timeout_rolls_back_and_only_degrades_dimensions(
+    monkeypatch, usage_rows
+):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+    monkeypatch.setattr(jobs_store, "_USAGE_REPORT_STATEMENT_TIMEOUT_MS", 50)
+
+    def slow_dimension(cur, *_args):
+        cur.execute("SELECT pg_sleep(.2)")
+        return {}
+
+    monkeypatch.setattr(jobs_store, "_usage_parallel_dimension_rows", slow_dimension)
+    try:
+        report = jobs_store._usage_report_snapshot_hybrid_parallel(query)
+        with db.get_pool().connection() as conn:
+            assert conn.execute("SELECT 1").fetchone()[0] == 1
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert report["overview"]["total_tokens"] == 215
+    assert report["daily"] is not None
+    assert report["users"] is not None
+    assert report["models"] is None
+    assert report["lanes"] is None
+    assert {row["primary_provider"] for row in report["users"]} == {"unavailable"}
+
+
+def test_usage_importer_pool_failure_uses_exporter_serial_fallback(
+    monkeypatch, usage_rows
+):
+    query = _shanghai_usage_query()
+    expected = jobs_store._usage_report_snapshot_raw(query)
+    _enable_usage_rollup()
+    real_pool = db.get_pool()
+    calls = 0
+    lock = threading.Lock()
+
+    class Pool:
+        def connection(self, *args, **kwargs):
+            nonlocal calls
+            with lock:
+                calls += 1
+                current = calls
+            if current > 1:
+                raise TimeoutError("test importer checkout timeout")
+            return real_pool.connection(*args, **kwargs)
+
+    monkeypatch.setattr(jobs_store, "_pool", lambda: Pool())
+    try:
+        report = jobs_store._usage_report_snapshot_hybrid_parallel(query)
+    finally:
+        with real_pool.connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    report["coverage"].pop("rollup")
+    assert report == expected
+    assert calls == 3
+
+
+def test_usage_latency_failure_keeps_filters_and_dimension_totals(
+    monkeypatch, usage_rows
+):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+
+    def fail_latency(*_args):
+        raise RuntimeError("latency injected")
+
+    monkeypatch.setattr(jobs_store, "_usage_parallel_latency_rows", fail_latency)
+    try:
+        report = jobs_store._usage_report_snapshot_hybrid_parallel(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert report["filters"] == {
+        "lanes": ["chat", "heartbeat", "maintenance"],
+        "providers": ["anthropic", "openrouter", "unknown"],
+        "models": ["claude-b", "gpt-a", "unknown"],
+    }
+    assert report["models"] is not None
+    assert report["lanes"] is not None
+    assert all(row["latency_ms_p50"] is None for row in report["models"])
+
+
+def test_usage_parallel_releases_rds_session_admission(usage_rows):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+    try:
+        assert jobs_store._usage_report_snapshot_hybrid_parallel(query) is not None
+        with db.get_pool().connection() as conn:
+            assert conn.execute(
+                "SELECT pg_try_advisory_lock(%s)",
+                (jobs_store._USAGE_REPORT_ADVISORY_KEY,),
+            ).fetchone()[0]
+            assert conn.execute(
+                "SELECT pg_advisory_unlock(%s)",
+                (jobs_store._USAGE_REPORT_ADVISORY_KEY,),
+            ).fetchone()[0]
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
 
 
 def _usage_render_report() -> dict:
