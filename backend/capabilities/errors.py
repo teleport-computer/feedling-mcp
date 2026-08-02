@@ -8,6 +8,11 @@ INVALID = "capability_invalid_input"
 NOT_FOUND = "capability_not_found"
 FORBIDDEN = "capability_forbidden"
 UPSTREAM = "capability_upstream_error"
+# The user has switched this capability off (or its switch is unreadable, in
+# which case we fail closed and report it the same way). Distinct from FORBIDDEN
+# so the caller can tell "you turned web off" apart from an auth/permission
+# failure. Never retryable — retrying changes nothing until the user re-enables.
+DISABLED = "capability_disabled"
 
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 

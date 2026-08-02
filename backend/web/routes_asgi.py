@@ -18,8 +18,8 @@ from fastapi.responses import JSONResponse
 from accounts.auth_core import AuthResult
 from asgi import http as asgi_http
 from asgi import threadpool
-from asgi.deps import require_api_key
-from web import settings_core
+from asgi.deps import require_api_key, require_scope
+from web import execution_core, settings_core
 
 router = APIRouter()
 
@@ -42,6 +42,24 @@ async def web_settings_post(
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     return JSONResponse(body)
+
+
+@router.post("/v1/agent/web/search")
+async def web_search_exec(
+    request: Request, auth: AuthResult = Depends(require_scope("web"))
+):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    result = await threadpool.run_db(execution_core.run_search, auth.store, payload)
+    return JSONResponse(result.to_dict())
+
+
+@router.post("/v1/agent/web/fetch")
+async def web_fetch_exec(
+    request: Request, auth: AuthResult = Depends(require_scope("web"))
+):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    result = await threadpool.run_db(execution_core.run_fetch, auth.store, payload)
+    return JSONResponse(result.to_dict())
 
 
 def register_asgi(app) -> None:
