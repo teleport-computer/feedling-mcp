@@ -87,6 +87,8 @@ def _custom_bounds(
         end_utc = end_local.astimezone(timezone.utc)
     except (OverflowError, ValueError):
         return None
+    if start_utc >= end_utc:
+        return None
     return start_utc, end_utc
 
 

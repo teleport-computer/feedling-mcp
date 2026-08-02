@@ -3286,6 +3286,9 @@ def _usage_page_href(
         canonical["sort"] = sort
         direction = str(updates.get("dir") or "desc").strip().lower()
         canonical["dir"] = direction if direction in {"asc", "desc"} else "desc"
+    admin_key = str(request.args.get("admin_key") or "").strip()
+    if admin_key:
+        canonical["admin_key"] = admin_key
     return f"/admin/data-track?{urlencode(canonical)}"
 
 

@@ -155,6 +155,24 @@ def test_usage_query_local_start_before_utc_min_falls_back_to_30_days():
     assert query.end_date is None
 
 
+def test_usage_query_skipped_civil_date_falls_back_to_30_days():
+    query = _usage.parse_usage_query(
+        {
+            "preset": "custom",
+            "start_date": "2011-12-30",
+            "end_date": "2011-12-30",
+            "timezone": "Pacific/Apia",
+        },
+        now_utc=NOW_UTC,
+    )
+
+    assert query.preset == "30d"
+    assert query.start_at_utc == datetime(2026, 7, 3, 12, 30, tzinfo=timezone.utc)
+    assert query.end_at_utc == NOW_UTC
+    assert query.start_date is None
+    assert query.end_date is None
+
+
 def test_usage_query_custom_dates_follow_dst_boundaries_in_selected_timezone():
     query = _usage.parse_usage_query(
         {
@@ -212,7 +230,7 @@ def test_usage_page_href_rebuilds_only_the_canonical_normalized_query():
     with reqctx.bind(
         "view=runtime&preset=custom&start_date=2026-07-01&end_date=2026-07-02"
         "&timezone=Mars%2FOlympus&provider=%20OpenRouter%20&completeness=METERED"
-        "&offset=200&admin_key=must-not-survive"
+        "&offset=200&admin_key=query-admin-token"
     ):
         href = _data_track._usage_page_href(now_utc=NOW_UTC)
 
@@ -226,6 +244,26 @@ def test_usage_page_href_rebuilds_only_the_canonical_normalized_query():
         "timezone": ["Asia/Shanghai"],
         "provider": ["OpenRouter"],
         "completeness": ["metered"],
+        "admin_key": ["query-admin-token"],
+    }
+
+
+def test_usage_page_href_keeps_query_admin_auth_with_explicit_usage_query():
+    query = _usage.parse_usage_query(
+        {"preset": "7d", "timezone": "UTC"},
+        now_utc=NOW_UTC,
+    )
+
+    with reqctx.bind("admin_key=query-admin-token&offset=999"):
+        href = _data_track._usage_page_href(query, offset=100)
+
+    assert parse_qs(urlsplit(href).query) == {
+        "view": ["usage"],
+        "preset": ["7d"],
+        "timezone": ["UTC"],
+        "completeness": ["all"],
+        "offset": ["100"],
+        "admin_key": ["query-admin-token"],
     }
 
 
