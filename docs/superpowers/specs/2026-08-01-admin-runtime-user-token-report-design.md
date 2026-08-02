@@ -1,5 +1,14 @@
 # Admin Runtime 用户 Token / Model 与交付可靠性报表设计
 
+> **2026-08-02 信息架构更新：**本文的交付可靠性部分继续属于
+> Runtime Health；用户 Token/model analytics 已迁移到独立 Usage 页。新的
+> 约束与分阶段交付以
+> [`2026-08-02-hosted-v2-usage-p0a-design.md`](./2026-08-02-hosted-v2-usage-p0a-design.md)、
+> [`2026-08-02-provider-attempt-accounting-p0b-design.md`](./2026-08-02-provider-attempt-accounting-p0b-design.md)
+> 和
+> [`2026-08-02-resident-usage-rds-upload-design.md`](./2026-08-02-resident-usage-rds-upload-design.md)
+> 为准。本文保留为 PR #146 已实现交付可靠性语义的历史记录。
+
 ## 目标
 
 在 `/admin/data-track?view=runtime` 的 Runtime 健康页底部增加按 `user_id`
