@@ -362,6 +362,38 @@ def test_evidence_rejects_malformed_ingress_quote_event_log(
         )
 
 
+def test_evidence_rejects_ingress_event_log_with_invalid_json_text(evidence_fixture):
+    files = dict(evidence_fixture.files)
+    quote_json = json.loads(files["quote.json"])
+    quote_json["event_log"] = "not-json"
+    files["quote.json"] = json.dumps(quote_json).encode()
+
+    with pytest.raises(EvidenceError, match="event_log.*valid JSON"):
+        verify_ingress_evidence(
+            DOMAIN,
+            evidence_fixture.peer_der,
+            files,
+            evidence_fixture.quote_parser,
+        )
+
+
+def test_evidence_rejects_ingress_event_log_with_non_list_json_root(
+    evidence_fixture,
+):
+    files = dict(evidence_fixture.files)
+    quote_json = json.loads(files["quote.json"])
+    quote_json["event_log"] = '{"event": "not-a-list"}'
+    files["quote.json"] = json.dumps(quote_json).encode()
+
+    with pytest.raises(EvidenceError, match="event_log.*list"):
+        verify_ingress_evidence(
+            DOMAIN,
+            evidence_fixture.peer_der,
+            files,
+            evidence_fixture.quote_parser,
+        )
+
+
 def test_evidence_rejects_missing_manifest_file(evidence_fixture):
     files = dict(evidence_fixture.files)
     del files["account.json"]

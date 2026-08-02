@@ -174,8 +174,15 @@ def _parse_ingress_quote(
             raise ValueError(
                 f"unsupported prefix for hash_algorithm {hash_algorithm!r}"
             )
-        if not isinstance(quote_json["event_log"], str):
+        event_log_text = quote_json["event_log"]
+        if not isinstance(event_log_text, str):
             raise TypeError("event_log must be text")
+        try:
+            event_log = json.loads(event_log_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("event_log must be valid JSON") from exc
+        if not isinstance(event_log, list):
+            raise TypeError("event_log JSON root must be a list")
         quote_bytes = bytes.fromhex(quote_hex)
     except (
         KeyError,
