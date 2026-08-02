@@ -61,8 +61,10 @@ services:
       CERTBOT_EMAIL: "security@feedling.app"
       DOMAINS: |
         api.feedling.app
+        enclave.feedling.app
       ROUTING_MAP: |
         api.feedling.app=backend:5001
+        enclave.feedling.app=enclave-domain:5004
       # CF_API_TOKEN must be injected via `phala deploy -e` (encrypted
       # env channel, NOT baked into compose_hash). Required scopes:
       # Zone.DNS:Edit on the feedling.app zone (for DNS-01 challenge +
@@ -78,6 +80,8 @@ services:
     depends_on:
       backend:
         condition: service_started
+      enclave-domain:
+        condition: service_started
 
   # --- Attestation service + decrypt proxy. ---
   # Keeps its own in-enclave TLS on :5003. NOT routed through ingress —
@@ -87,47 +91,68 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:e94482d
-    command: ["python", "-u", "backend/enclave_app.py"]
+    image: &enclave-image ghcr.io/teleport-computer/feedling:e94482d
+    command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
+      <<: &enclave-environment
+        FEEDLING_DATA_DIR: "/data"
+        FEEDLING_FLASK_URL: "http://backend:5001"
+        # Stage-D runtime token secret. The enclave uses it to verify a caller's
+        # runtime token LOCALLY (core/runtime_token.py) in _whoami_cached and
+        # /v1/envelope/decrypt, SKIPPING the reentrant backend /v1/users/whoami
+        # round-trip (backend/enclave_app.py, commit fdb528a). MUST match the
+        # backend's + pooled V2 worker's secret. Empty = falls back to the backend
+        # round-trip (old behavior, no regression). Encrypted env, not baked into
+        # compose_hash. Without this line the local-verify code is dead and every
+        # Runtime V2 decrypt reentrantly hits the backend.
+        FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+        # gunicorn worker (process) count for the enclave (enclave_app.py
+        # _enclave_worker_count, default 1). Prod CVM is 8 vCPU so >1 parallelizes
+        # the GIL-bound envelope-decrypt crypto across processes. No :9998 bind in
+        # the enclave (that's the backend's), so N>1 is safe here. Encrypted env,
+        # not baked into compose_hash — flip via var without on-chain re-auth.
+        # 2026-07-15 2→4：enclave 是全部 iOS 读路径的解密代理（GIL 密集 crypto），
+        # 实测 2 worker 仅 223MB/7% CPU——4 worker 让解密并行度翻倍、单 worker 忙时
+        # 尾延迟更稳，资源代价可忽略（每 worker ~100-200MB，无 PG 连接、无端口单例）。
+        FEEDLING_ENCLAVE_WORKERS: "${FEEDLING_ENCLAVE_WORKERS:-4}"
+        # model_api reads from the memory read-side (mirrors the test enclave).
+        MEMORY_READSIDE_FOR_MODEL_API: "true"
+        # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
+        # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
+        # even when the value is empty, so an empty string would make it
+        # try to connect to "" and fail with EINVAL. Leaving the var unset
+        # lets dstack-sdk fall through to /var/run/dstack.sock (mounted
+        # below). Only set this on dev laptops running the simulator.
       FEEDLING_ENCLAVE_PORT: "5003"
-      FEEDLING_DATA_DIR: "/data"
       FEEDLING_ENCLAVE_TLS: "true"
-      FEEDLING_FLASK_URL: "http://backend:5001"
-      # Stage-D runtime token secret. The enclave uses it to verify a caller's
-      # runtime token LOCALLY (core/runtime_token.py) in _whoami_cached and
-      # /v1/envelope/decrypt, SKIPPING the reentrant backend /v1/users/whoami
-      # round-trip (backend/enclave_app.py, commit fdb528a). MUST match the
-      # backend's + pooled V2 worker's secret. Empty = falls back to the backend
-      # round-trip (old behavior, no regression). Encrypted env, not baked into
-      # compose_hash. Without this line the local-verify code is dead and every
-      # Runtime V2 decrypt reentrantly hits the backend.
-      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
-      # gunicorn worker (process) count for the enclave (enclave_app.py
-      # _enclave_worker_count, default 1). Prod CVM is 8 vCPU so >1 parallelizes
-      # the GIL-bound envelope-decrypt crypto across processes. No :9998 bind in
-      # the enclave (that's the backend's), so N>1 is safe here. Encrypted env,
-      # not baked into compose_hash — flip via var without on-chain re-auth.
-      # 2026-07-15 2→4：enclave 是全部 iOS 读路径的解密代理（GIL 密集 crypto），
-      # 实测 2 worker 仅 223MB/7% CPU——4 worker 让解密并行度翻倍、单 worker 忙时
-      # 尾延迟更稳，资源代价可忽略（每 worker ~100-200MB，无 PG 连接、无端口单例）。
-      FEEDLING_ENCLAVE_WORKERS: "${FEEDLING_ENCLAVE_WORKERS:-4}"
-      # model_api reads from the memory read-side (mirrors the test enclave).
-      MEMORY_READSIDE_FOR_MODEL_API: "true"
-      # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
-      # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
-      # even when the value is empty, so an empty string would make it
-      # try to connect to "" and fail with EINVAL. Leaving the var unset
-      # lets dstack-sdk fall through to /var/run/dstack.sock (mounted
-      # below). Only set this on dev laptops running the simulator.
+      FEEDLING_ENCLAVE_TRANSPORT_MODE: "direct_tls"
     ports:
       - "5003:5003"
-    volumes:
+    volumes: &enclave-volumes
       - feedling_enclave_data:/data
       - /var/run/dstack.sock:/var/run/dstack.sock
     healthcheck:
       test: ["CMD-SHELL", "curl -k -s -o /dev/null -w '%{http_code}' https://127.0.0.1:5003/healthz | grep -qE '^(200|503)$'"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  enclave-domain:
+    image: *enclave-image
+    command: *enclave-command
+    restart: unless-stopped
+    environment:
+      <<: *enclave-environment
+      FEEDLING_ENCLAVE_PORT: "5004"
+      FEEDLING_ENCLAVE_TLS: "false"
+      FEEDLING_ENCLAVE_TRANSPORT_MODE: "attested_ingress"
+    expose:
+      - "5004"
+    volumes: *enclave-volumes
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:5004/healthz | grep -qE '^(200|503)$'"]
       interval: 15s
       timeout: 5s
       retries: 20
