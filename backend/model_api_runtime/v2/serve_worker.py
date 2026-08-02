@@ -92,6 +92,7 @@ from model_api_runtime.v2 import runner_identity
 from model_api_runtime.v2 import scheduler
 from model_api_runtime.v2 import screen_watch
 from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
+from model_api_runtime.v2 import usage_rollup
 from model_api_runtime.v2 import watchdog as v2_watchdog
 from model_api_runtime.v2 import worker as v2_worker
 
@@ -4123,6 +4124,55 @@ _BACKLOG_SCAN_MIN = _positive_int_env("FEEDLING_V2_BACKLOG_SCAN_MIN", "200")
 _BACKLOG_SCAN_LIMIT = _positive_int_env("FEEDLING_V2_BACKLOG_SCAN_LIMIT", "200")
 
 
+def _usage_rollup_interval_seconds() -> float:
+    """Read optional telemetry cadence without making config startup-critical."""
+
+    raw = os.environ.get("FEEDLING_V2_USAGE_ROLLUP_INTERVAL_SEC", "300")
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return 300.0
+    if not math.isfinite(value) or value <= 0:
+        return 300.0
+    return min(value, 86_400.0)
+
+
+async def _usage_rollup_loop(
+    stop_event: asyncio.Event, *, interval: float | None = None
+) -> None:
+    """Run optional reporting maintenance without sharing a failure domain.
+
+    The feature is default-on with an explicit environment opt-out.  Every
+    failure boundary is caught here even though ``run_maintenance_tick`` is
+    itself fail-open, so a future regression cannot cancel heartbeat, provider
+    work, replies, retries, or any sibling maintenance coroutine.
+    """
+
+    cadence = _usage_rollup_interval_seconds() if interval is None else interval
+    while not stop_event.is_set():
+        if usage_rollup.enabled():
+            try:
+                result = await asyncio.to_thread(
+                    usage_rollup.run_maintenance_tick
+                )
+                if result.get("days_refreshed"):
+                    log.info(
+                        "[v2.serve_worker] usage rollup refreshed days=%s "
+                        "bootstrap_complete=%s",
+                        result["days_refreshed"],
+                        result.get("bootstrap_complete"),
+                    )
+            except Exception as e:  # noqa: BLE001 - reporting cannot kill worker
+                log.warning(
+                    "[v2.serve_worker] usage rollup tick failed: %s",
+                    type(e).__name__,
+                )
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=cadence)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def _backlog_scan_loop(
     stop_event: asyncio.Event, *, interval: float = _BACKLOG_SCAN_INTERVAL_SEC
 ) -> None:
@@ -4433,6 +4483,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
         asyncio.create_task(_watchdog_loop(supervisor, worker_id, stop_event)),
         asyncio.create_task(_reconcile_loop(stop_event)),
         asyncio.create_task(_backlog_scan_loop(stop_event)),
+        asyncio.create_task(_usage_rollup_loop(stop_event)),
     ]
     try:
         # Each loop handles recoverable iteration failures internally.  An
