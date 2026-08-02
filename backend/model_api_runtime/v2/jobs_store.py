@@ -4977,7 +4977,9 @@ def _usage_optional_pg_section(cur, name: str, reader):
         return None
 
 
-def _usage_parallel_core_rows(cur, query, partition, *, unknown_auxiliary=True) -> dict:
+def _usage_parallel_core_rows_separate(
+    cur, query, partition, *, unknown_auxiliary=True
+) -> dict:
     """Aggregate user/day facts inside PostgreSQL; never fetch canonical rows."""
 
     dimensions = usage_reporting.has_dimension_filter(query)
@@ -5063,7 +5065,7 @@ ORDER BY {_usage_known_total_order()} DESC NULLS LAST,
     }
     if query.completeness == "unknown" and unknown_auxiliary:
         all_days = tuple(sorted(partition.rollup_days + partition.raw_days))
-        auxiliary = _usage_parallel_core_rows(
+        auxiliary = _usage_parallel_core_rows_separate(
             cur,
             query,
             usage_reporting.RollupPartition(rollup_days=(), raw_days=all_days),
@@ -5091,6 +5093,94 @@ ORDER BY {_usage_known_total_order()} DESC NULLS LAST,
                 for field in fields:
                     row[field] = source.get(field)
     return result
+
+
+def _usage_parallel_core_rows(cur, query, partition, *, unknown_auxiliary=True) -> dict:
+    """Read the common core from one materialized fact scan, with safe fallback."""
+
+    if query.completeness == "unknown":
+        return _usage_parallel_core_rows_separate(
+            cur, query, partition, unknown_auxiliary=unknown_auxiliary
+        )
+    dimensions = usage_reporting.has_dimension_filter(query)
+    source_sql, params = _usage_fact_query(query, partition, dimensions=dimensions)
+    aggregates = _usage_fact_aggregate_columns()
+    try:
+        with cur.connection.transaction():
+            _usage_snapshot_observer("read", role="exporter", section="core_bundle")
+            cur.execute(
+                f"""
+WITH source AS MATERIALIZED ({source_sql}),
+totals_row AS (
+ SELECT {aggregates},
+  count(DISTINCT user_id) FILTER (WHERE model_calls>0)::int AS model_active_users,
+  count(DISTINCT user_id) FILTER (WHERE usage_reported_calls>0)::int AS metered_users,
+  count(DISTINCT (user_id,local_day)) FILTER (WHERE model_calls>0)::int AS active_user_days
+ FROM source s
+), distribution_user_days AS (
+ SELECT user_id,local_day,{_usage_known_sum('prompt_tokens')} AS prompt_tokens,
+  {_usage_known_sum('completion_tokens')} AS completion_tokens
+ FROM source s WHERE model_calls>0 GROUP BY user_id,local_day
+), distribution_row AS (
+ SELECT percentile_cont(.5) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens) AS p50,
+  percentile_cont(.75) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens) AS p75,
+  percentile_cont(.9) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens) AS p90,
+  percentile_cont(.95) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens) AS p95,
+  max(prompt_tokens+completion_tokens) AS max
+ FROM distribution_user_days WHERE prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL
+), daily_rows AS (
+ SELECT local_day,{aggregates},
+  count(DISTINCT user_id) FILTER (WHERE model_calls>0)::int AS model_active_users
+ FROM source s GROUP BY local_day
+), user_dist AS (
+ SELECT user_id,
+  percentile_cont(.5) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens)
+   FILTER (WHERE prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL) AS daily_p50,
+  percentile_cont(.95) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens)
+   FILTER (WHERE prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL) AS daily_p95
+ FROM distribution_user_days GROUP BY user_id
+), user_rows AS (
+ SELECT s.user_id,{aggregates},
+  count(DISTINCT s.local_day) FILTER (WHERE s.model_calls>0)::int AS active_days,
+  max(s.last_model_call_at) AS last_model_call_at,
+  max(d.daily_p50) AS daily_p50,max(d.daily_p95) AS daily_p95,
+  {_usage_known_total_order()} AS _order_total
+ FROM source s LEFT JOIN user_dist d USING (user_id) GROUP BY s.user_id
+)
+SELECT (SELECT to_jsonb(t) FROM totals_row t) AS totals,
+ (SELECT to_jsonb(d) FROM distribution_row d) AS distribution,
+ (SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY d.local_day),'[]') FROM daily_rows d) AS daily,
+ (SELECT coalesce(jsonb_agg(to_jsonb(u)-'_order_total'
+   ORDER BY u._order_total DESC NULLS LAST,u.model_calls DESC,u.user_id),'[]')
+  FROM user_rows u) AS users
+""",
+                params,
+            )
+            bundle = cur.fetchone()
+        daily = bundle["daily"]
+        users = bundle["users"]
+        for row in daily:
+            if isinstance(row.get("local_day"), str):
+                row["local_day"] = datetime.fromisoformat(row["local_day"]).date()
+        for row in users:
+            value = row.get("last_model_call_at")
+            if isinstance(value, str):
+                row["last_model_call_at"] = datetime.fromisoformat(value)
+        return {
+            "totals": bundle["totals"],
+            "distribution": bundle["distribution"],
+            "daily": daily,
+            "users": users,
+        }
+    except psycopg.errors.QueryCanceled:
+        # The shared report deadline is exhausted.  Four more isolated reads
+        # would multiply timeout load and delay admission release.
+        raise
+    except Exception:
+        log.exception("usage core bundle unavailable; trying isolated sections")
+        return _usage_parallel_core_rows_separate(
+            cur, query, partition, unknown_auxiliary=unknown_auxiliary
+        )
 
 
 def _usage_parallel_dimension_rows(

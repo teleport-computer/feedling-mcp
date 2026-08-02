@@ -15,6 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+import psycopg
 from psycopg.types.json import Jsonb
 
 
@@ -614,6 +615,58 @@ def test_usage_parallel_exported_snapshot_matches_raw_and_imports_before_read(
         assert imported < first_read
 
 
+def test_usage_core_bundle_error_falls_back_to_isolated_sections(
+    monkeypatch, usage_rows
+):
+    query = _shanghai_usage_query()
+    expected = jobs_store._usage_report_snapshot_raw(query)
+    _enable_usage_rollup()
+
+    def observer(event, **fields):
+        if event == "read" and fields.get("section") == "core_bundle":
+            raise RuntimeError("bundle injected")
+
+    monkeypatch.setattr(jobs_store, "_usage_snapshot_observer", observer)
+    try:
+        report = jobs_store._usage_report_snapshot_hybrid_parallel(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    report["coverage"].pop("rollup")
+    assert report == expected
+
+
+def test_usage_core_bundle_timeout_does_not_multiply_fallback_queries(
+    monkeypatch, usage_rows
+):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+    fallback_called = False
+
+    def observer(event, **fields):
+        if event == "read" and fields.get("section") == "core_bundle":
+            raise psycopg.errors.QueryCanceled("bundle deadline")
+
+    def forbidden_fallback(*_args, **_kwargs):
+        nonlocal fallback_called
+        fallback_called = True
+        raise AssertionError("deadline must not multiply fallback work")
+
+    monkeypatch.setattr(jobs_store, "_usage_snapshot_observer", observer)
+    monkeypatch.setattr(
+        jobs_store, "_usage_parallel_core_rows_separate", forbidden_fallback
+    )
+    try:
+        with pytest.raises(psycopg.errors.QueryCanceled, match="bundle deadline"):
+            jobs_store._usage_report_snapshot_hybrid_parallel(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert fallback_called is False
+
+
 def test_usage_parallel_snapshot_excludes_writer_committed_after_export(
     monkeypatch, usage_rows
 ):
@@ -989,6 +1042,13 @@ def test_usage_core_optional_sections_fail_independently(
         return original(cur, name, reader)
 
     monkeypatch.setattr(jobs_store, "_usage_optional_pg_section", inject)
+    def force_isolated_fallback(event, **fields):
+        if event == "read" and fields.get("section") == "core_bundle":
+            raise RuntimeError("force isolated fallback")
+
+    monkeypatch.setattr(
+        jobs_store, "_usage_snapshot_observer", force_isolated_fallback
+    )
     try:
         report = jobs_store.usage_report_snapshot(query)
     finally:
