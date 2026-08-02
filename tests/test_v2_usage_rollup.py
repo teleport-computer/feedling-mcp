@@ -428,16 +428,21 @@ def test_day_user_and_dimension_facts_share_one_repeatable_read_snapshot():
         )
 
     started = threading.Event()
+    update_outcome: list[int | BaseException] = []
 
     def update_source_during_rebuild():
-        started.set()
-        wall_time.sleep(0.15)
-        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
-            conn.execute(
-                "UPDATE v2_turn_metrics SET prompt_tokens=99,updated_at=now() "
-                "WHERE job_id=%s",
-                (job_id,),
-            )
+        try:
+            started.set()
+            wall_time.sleep(0.15)
+            with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+                row = conn.execute(
+                    "UPDATE v2_turn_metrics SET prompt_tokens=99,updated_at=now() "
+                    "WHERE job_id=%s RETURNING prompt_tokens",
+                    (job_id,),
+                ).fetchone()
+            update_outcome.append(int(row[0]) if row is not None else 0)
+        except BaseException as exc:  # propagate thread failures to the test thread
+            update_outcome.append(exc)
 
     updater = threading.Thread(target=update_source_during_rebuild)
     updater.start()
@@ -453,6 +458,10 @@ def test_day_user_and_dimension_facts_share_one_repeatable_read_snapshot():
             conn.execute("DROP FUNCTION IF EXISTS pause_after_usage_users()")
     assert not updater.is_alive()
     with db.get_pool().connection() as conn:
+        source_sum = conn.execute(
+            "SELECT prompt_tokens FROM v2_turn_metrics WHERE job_id=%s",
+            (job_id,),
+        ).fetchone()[0]
         user_sum = conn.execute(
             "SELECT all_prompt_tokens_sum FROM v2_usage_daily_users "
             "WHERE local_day=%s AND user_id=%s",
@@ -463,6 +472,8 @@ def test_day_user_and_dimension_facts_share_one_repeatable_read_snapshot():
             "WHERE local_day=%s AND user_id=%s",
             (day, uid),
         ).fetchone()[0]
+    assert update_outcome == [99]
+    assert source_sum == 99
     assert (user_sum, dimension_sum) == (10, 10)
 
 
