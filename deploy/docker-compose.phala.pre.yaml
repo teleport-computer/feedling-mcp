@@ -1,11 +1,14 @@
 # Feedling Pre — Phala TDX main-CVM compose.
 #
 # This file is the Pre main deployment unit:
-#   - dstack-ingress: TLS termination for pre-api.feedling.app
-#   - backend:       ASGI (HTTP+WS) — sole source of truth for user data
-#   - enclave:       decrypt proxy + /attestation (own TLS on :5003,
-#                    reachable via dstack-gateway `-5003s.` passthrough)
-#   - serve-worker:  pooled Runtime V2 worker (dual-runtime coexistence,
+#   - dstack-ingress: WebPKI TLS for pre-api.feedling.app and
+#                     pre-enclave.feedling.app
+#   - backend:        ASGI (HTTP+WS) — sole source of truth for user data
+#   - enclave:        decrypt proxy + /attestation with its own TLS on :5003,
+#                     reachable directly via dstack-gateway `-5003s.` passthrough
+#   - enclave-domain: internal HTTP :5004 entrypoint, reachable only through
+#                     the ingress-backed pre-enclave.feedling.app custom domain
+#   - serve-worker:   pooled Runtime V2 worker (dual-runtime coexistence,
 #                    2026-07-21 design doc §7a). Same image as backend; serves
 #                    only the per-user allowlist's v2/draining accounts.
 #
@@ -17,10 +20,16 @@
 # environment — a runner-side serve-worker would double-pool jobs against
 # this CVM's own serve-worker).
 #
-# dstack-ingress manages the pre-api.feedling.app CNAME/TXT/CAA records through
-# a narrowly scoped Cloudflare token injected by CI. The authoritative CVM IDs,
+# dstack-ingress manages both custom domains' CNAME/TXT/CAA records through a
+# narrowly scoped Cloudflare token injected by CI. The authoritative CVM IDs,
 # endpoints, deploy order, and compose-hash publication steps live in
 # deploy/DEPLOYMENTS.md and deploy/HOSTED_RUNTIME_V2_ROLLOUT.md.
+#
+# Enclave entrypoints intentionally coexist:
+#   direct: https://<app-id>-5003s.dstack-pha-prod9.phala.network → enclave:5003
+#           (enclave-owned TLS and certificate pinning)
+#   custom: https://pre-enclave.feedling.app → ingress:443 → enclave-domain:5004
+#           (ingress evidence plus enclave application attestation; no host port)
 #
 # CRITICAL: every literal in this file becomes part of the compose_hash.
 # Any ${VAR} below must be category (A) — cosmetic / non-security.
@@ -29,7 +38,7 @@
 name: feedling-pre
 
 services:
-  # --- Public TLS termination for the api custom domain. ---
+  # --- Public TLS termination for the API and enclave custom domains. ---
   # HAProxy-based L4/L7 ingress inside the TDX CVM. Issues LE certs via
   # CF DNS-01, routes by SNI. Key material stays inside the enclave
   # volume `letsencrypt` — the CF token only has DNS-edit scope, not

@@ -32,6 +32,88 @@ from tools.verify_enclave_domain import (
 
 DOMAIN = "test-enclave.feedling.app"
 CERT_NAME = f"cert-{DOMAIN}.pem"
+COMPOSE_HASH = "12" * 32
+CONTENT_PK = "34" * 32
+INGRESS_MEASUREMENTS = {
+    "mrtd": "10" * 48,
+    "rtmr0": "11" * 48,
+    "rtmr1": "12" * 48,
+    "rtmr2": "13" * 48,
+}
+ENCLAVE_MEASUREMENTS = {
+    "mrtd": "20" * 48,
+    "rtmr0": "21" * 48,
+    "rtmr1": "22" * 48,
+    "rtmr2": "23" * 48,
+}
+
+
+def _reference_measurements(**overrides):
+    reference = {
+        "version": 1,
+        "domain": DOMAIN,
+        "expected_compose_hash": COMPOSE_HASH,
+        "expected_content_pk_hex": CONTENT_PK,
+        "ingress": dict(INGRESS_MEASUREMENTS),
+        "enclave": dict(ENCLAVE_MEASUREMENTS),
+    }
+    reference.update(overrides)
+    return reference
+
+
+def _make_tdx_quote(
+    *,
+    report_data: bytes,
+    measurements: dict[str, str],
+    rtmr3: str = "24" * 48,
+    mr_config_id: str = "00" * 48,
+) -> bytes:
+    quote = bytearray(48 + 584 + 4)
+    quote[0:2] = (4).to_bytes(2, "little")
+    quote[4:8] = (0x81).to_bytes(4, "little")
+    body = 48
+    quote[body + 136 : body + 184] = bytes.fromhex(measurements["mrtd"])
+    quote[body + 184 : body + 232] = bytes.fromhex(mr_config_id)
+    quote[body + 328 : body + 376] = bytes.fromhex(measurements["rtmr0"])
+    quote[body + 376 : body + 424] = bytes.fromhex(measurements["rtmr1"])
+    quote[body + 424 : body + 472] = bytes.fromhex(measurements["rtmr2"])
+    quote[body + 472 : body + 520] = bytes.fromhex(rtmr3)
+    quote[body + 520 : body + 584] = report_data
+    return bytes(quote)
+
+
+def _enclave_report_data(content_pk_hex=CONTENT_PK, tls_fingerprint_hex="00" * 32):
+    binding = hashlib.sha256(
+        bytes.fromhex(content_pk_hex)
+        + bytes.fromhex(tls_fingerprint_hex)
+        + b"feedling-v1"
+    ).digest()
+    flag = b"\x01" if tls_fingerprint_hex == "00" * 32 else b"\x00"
+    return binding + b"\x01" + flag + bytes(30)
+
+
+def _attestation_bundle(
+    *, measurements=None, quote_measurements=None, report_data=None, mr_config_id=None
+):
+    claimed = dict(measurements or ENCLAVE_MEASUREMENTS)
+    claimed["rtmr3"] = "24" * 48
+    claimed["mr_config_id"] = mr_config_id or "01" + COMPOSE_HASH + "00" * 15
+    quote_claims = dict(quote_measurements or ENCLAVE_MEASUREMENTS)
+    quote = _make_tdx_quote(
+        report_data=report_data or _enclave_report_data(),
+        measurements=quote_claims,
+        rtmr3=claimed["rtmr3"],
+        mr_config_id=claimed["mr_config_id"],
+    )
+    return {
+        "tdx_quote_hex": quote.hex(),
+        "measurements": claimed,
+        "compose_hash": COMPOSE_HASH,
+        "enclave_content_pk_hex": CONTENT_PK,
+        "enclave_tls_cert_fingerprint_hex": "00" * 32,
+        "report_data_version": 1,
+        "transport_mode": "attested_ingress",
+    }
 
 
 @dataclass(frozen=True)
@@ -117,6 +199,25 @@ def test_manifest_rejects_duplicate_filename():
     text = "11" * 32 + "  cert.pem\n" + "22" * 32 + "  cert.pem\n"
     with pytest.raises(EvidenceError, match="duplicate evidence filename"):
         parse_sha256_manifest(text)
+
+
+def test_manifest_rejects_seventeenth_entry():
+    manifest = "".join(f"{'00' * 32}  evidence-{index}.bin\n" for index in range(17))
+    with pytest.raises(EvidenceError, match="more than 16 entries"):
+        parse_sha256_manifest(manifest)
+
+
+@pytest.mark.parametrize("separator", ["\r", "\v", "\f", "\x85", "\u2028"])
+def test_manifest_rejects_noncanonical_line_separator(separator):
+    manifest = f"{'00' * 32}  cert.pem{separator}{'11' * 32}  account.json\n"
+    with pytest.raises(EvidenceError, match="canonical LF or CRLF"):
+        parse_sha256_manifest(manifest)
+
+
+def test_manifest_accepts_canonical_lf_and_crlf():
+    assert parse_sha256_manifest(
+        f"{'00' * 32}  cert.pem\r\n{'11' * 32}  account.json\n"
+    ) == {"cert.pem": "00" * 32, "account.json": "11" * 32}
 
 
 @pytest.mark.parametrize(
@@ -237,6 +338,12 @@ def test_redirect_resolution_accepts_only_same_https_origin():
         _resolve_same_origin_redirect(current, f"http://{DOMAIN}/next", DOMAIN)
     with pytest.raises(EvidenceError, match="same HTTPS origin"):
         _resolve_same_origin_redirect(current, f"https://{DOMAIN}:444/next", DOMAIN)
+
+
+def test_redirect_resolution_normalizes_malformed_url_error():
+    current = f"https://{DOMAIN}/evidences/sha256sum.txt"
+    with pytest.raises(EvidenceError, match="malformed redirect URL"):
+        _resolve_same_origin_redirect(current, "https://[invalid", DOMAIN)
 
 
 def test_response_body_rejects_more_than_one_mebibyte():
@@ -444,15 +551,19 @@ def test_tls_peer_capture_uses_default_context_and_ten_second_timeouts(monkeypat
 
 
 def test_attestation_must_match_expected_environment():
-    attestation = {
-        "compose_hash": "12" * 32,
-        "enclave_content_pk_hex": "34" * 32,
-        "transport_mode": "attested_ingress",
-    }
-    assert _verify_attestation(attestation, "12" * 32, "34" * 32) == [
+    assert _verify_attestation(
+        _attestation_bundle(),
+        COMPOSE_HASH,
+        CONTENT_PK,
+        ENCLAVE_MEASUREMENTS,
+    ) == [
         "attestation compose_hash matches expected value",
         "attestation enclave_content_pk_hex matches expected value",
         "attestation transport_mode is attested_ingress",
+        "enclave quote matches attestation measurements",
+        "enclave quote matches approved reference measurements",
+        "enclave report_data binds content key and listener TLS mode",
+        "enclave mr_config_id binds expected compose_hash",
     ]
 
 
@@ -465,44 +576,89 @@ def test_attestation_must_match_expected_environment():
     ],
 )
 def test_attestation_rejects_mismatches(field, value, message):
-    attestation = {
-        "compose_hash": "12" * 32,
-        "enclave_content_pk_hex": "34" * 32,
-        "transport_mode": "attested_ingress",
-    }
+    attestation = _attestation_bundle()
     attestation[field] = value
     with pytest.raises(EvidenceError, match=message):
-        _verify_attestation(attestation, "12" * 32, "34" * 32)
+        _verify_attestation(
+            attestation,
+            COMPOSE_HASH,
+            CONTENT_PK,
+            ENCLAVE_MEASUREMENTS,
+        )
+
+
+def test_attestation_rejects_quote_measurement_mismatch():
+    attestation = _attestation_bundle(
+        quote_measurements={**ENCLAVE_MEASUREMENTS, "mrtd": "ff" * 48}
+    )
+    with pytest.raises(EvidenceError, match="quote measurement mismatch: mrtd"):
+        _verify_attestation(
+            attestation,
+            COMPOSE_HASH,
+            CONTENT_PK,
+            ENCLAVE_MEASUREMENTS,
+        )
+
+
+def test_attestation_rejects_unapproved_base_measurement():
+    approved = {**ENCLAVE_MEASUREMENTS, "rtmr1": "ff" * 48}
+    with pytest.raises(
+        EvidenceError, match="approved enclave measurement mismatch: rtmr1"
+    ):
+        _verify_attestation(
+            _attestation_bundle(),
+            COMPOSE_HASH,
+            CONTENT_PK,
+            approved,
+        )
+
+
+def test_attestation_rejects_report_data_content_key_mismatch():
+    attestation = _attestation_bundle(report_data=bytes(64))
+    with pytest.raises(EvidenceError, match="report_data does not bind content key"):
+        _verify_attestation(
+            attestation,
+            COMPOSE_HASH,
+            CONTENT_PK,
+            ENCLAVE_MEASUREMENTS,
+        )
+
+
+def test_attestation_rejects_mr_config_id_compose_mismatch():
+    attestation = _attestation_bundle(mr_config_id="01" + "ff" * 32 + "00" * 15)
+    with pytest.raises(
+        EvidenceError, match="mr_config_id does not bind expected compose_hash"
+    ):
+        _verify_attestation(
+            attestation,
+            COMPOSE_HASH,
+            CONTENT_PK,
+            ENCLAVE_MEASUREMENTS,
+        )
 
 
 def test_run_fetches_every_manifest_file_and_attestation(monkeypatch, evidence_fixture):
     files = dict(evidence_fixture.files)
-    quote = bytearray(48 + 584 + 4)
-    quote[0:2] = (4).to_bytes(2, "little")
-    quote[4:8] = (0x81).to_bytes(4, "little")
-    quote[48 + 520 : 48 + 552] = hashlib.sha256(files["sha256sum.txt"]).digest()
+    quote = _make_tdx_quote(
+        report_data=hashlib.sha256(files["sha256sum.txt"]).digest() + bytes(32),
+        measurements=INGRESS_MEASUREMENTS,
+    )
     files["quote.json"] = json.dumps(
         {
-            "quote": bytes(quote).hex(),
+            "quote": quote.hex(),
             "event_log": "[]",
             "hash_algorithm": "sha256",
             "prefix": "dstack-ingress",
         }
     ).encode()
-    attestation = json.dumps(
-        {
-            "compose_hash": "12" * 32,
-            "enclave_content_pk_hex": "34" * 32,
-            "transport_mode": "attested_ingress",
-        }
-    ).encode()
+    attestation = json.dumps(_attestation_bundle()).encode()
     responses = {
         f"https://{DOMAIN}/evidences/{name}": content for name, content in files.items()
     }
     responses[f"https://{DOMAIN}/attestation"] = attestation
     requested = []
 
-    def fake_https_get(url, domain):
+    def fake_https_get(url, domain, **_kwargs):
         assert domain == DOMAIN
         requested.append(url)
         return responses[url]
@@ -511,16 +667,26 @@ def test_run_fetches_every_manifest_file_and_attestation(monkeypatch, evidence_f
     monkeypatch.setattr(
         verifier,
         "_fetch_tls_peer_certificate",
-        lambda domain: evidence_fixture.peer_der,
+        lambda domain, **_kwargs: evidence_fixture.peer_der,
     )
 
-    assert _run(DOMAIN, "12" * 32, "34" * 32) == [
+    assert _run(
+        DOMAIN,
+        COMPOSE_HASH,
+        CONTENT_PK,
+        _reference_measurements(),
+    ) == [
         f"peer certificate matches {CERT_NAME}",
         "manifest hashes match all referenced evidence files",
         "quote report_data binds sha256sum.txt",
+        "ingress quote matches approved reference measurements",
         "attestation compose_hash matches expected value",
         "attestation enclave_content_pk_hex matches expected value",
         "attestation transport_mode is attested_ingress",
+        "enclave quote matches attestation measurements",
+        "enclave quote matches approved reference measurements",
+        "enclave report_data binds content key and listener TLS mode",
+        "enclave mr_config_id binds expected compose_hash",
     ]
     assert requested == [
         f"https://{DOMAIN}/evidences/sha256sum.txt",
@@ -531,7 +697,170 @@ def test_run_fetches_every_manifest_file_and_attestation(monkeypatch, evidence_f
     ]
 
 
-def test_cli_prints_structural_dcap_limitation(monkeypatch, capsys):
+def test_run_rejects_reference_metadata_mismatch(monkeypatch):
+    monkeypatch.setattr(
+        verifier,
+        "_https_get",
+        lambda *_args, **_kwargs: pytest.fail(
+            "network must not run before reference validation"
+        ),
+    )
+    with pytest.raises(EvidenceError, match="reference domain"):
+        _run(
+            DOMAIN,
+            COMPOSE_HASH,
+            CONTENT_PK,
+            _reference_measurements(domain="pre-enclave.feedling.app"),
+        )
+
+
+def test_run_rejects_more_than_four_mebibytes_of_aggregate_evidence(
+    monkeypatch, evidence_fixture
+):
+    files = dict(evidence_fixture.files)
+    for index in range(4):
+        files[f"large-{index}.bin"] = bytes(800 * 1024)
+    files["sha256sum.txt"] = "".join(
+        f"{hashlib.sha256(content).hexdigest()}  {name}\n"
+        for name, content in files.items()
+        if name not in {"sha256sum.txt", "quote.json"}
+    ).encode()
+    files["quote.json"] = json.dumps(
+        {
+            "quote": _make_tdx_quote(
+                report_data=hashlib.sha256(files["sha256sum.txt"]).digest() + bytes(32),
+                measurements=INGRESS_MEASUREMENTS,
+            ).hex(),
+            "event_log": "[]",
+            "hash_algorithm": "sha256",
+            "prefix": "dstack-ingress",
+        }
+    ).encode()
+    responses = {
+        f"https://{DOMAIN}/evidences/{name}": content for name, content in files.items()
+    }
+    oversized_aggregate_attestation = _attestation_bundle()
+    oversized_aggregate_attestation["padding"] = "x" * (900 * 1024)
+    responses[f"https://{DOMAIN}/attestation"] = json.dumps(
+        oversized_aggregate_attestation
+    ).encode()
+
+    monkeypatch.setattr(
+        verifier, "_https_get", lambda url, _domain, **_kwargs: responses[url]
+    )
+    monkeypatch.setattr(
+        verifier,
+        "_fetch_tls_peer_certificate",
+        lambda *_args, **_kwargs: evidence_fixture.peer_der,
+    )
+
+    with pytest.raises(EvidenceError, match="aggregate evidence exceeds 4194304 bytes"):
+        _run(DOMAIN, COMPOSE_HASH, CONTENT_PK, _reference_measurements())
+
+
+def test_run_rejects_cumulative_network_duration_over_sixty_seconds(
+    monkeypatch, evidence_fixture
+):
+    class FakeClock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    clock = FakeClock()
+    cert_pem = evidence_fixture.files[CERT_NAME]
+    manifest = f"{hashlib.sha256(cert_pem).hexdigest()}  {CERT_NAME}\n".encode()
+    ingress_quote = _make_tdx_quote(
+        report_data=hashlib.sha256(manifest).digest() + bytes(32),
+        measurements=INGRESS_MEASUREMENTS,
+    )
+    responses = {
+        f"https://{DOMAIN}/evidences/sha256sum.txt": manifest,
+        f"https://{DOMAIN}/evidences/quote.json": json.dumps(
+            {
+                "quote": ingress_quote.hex(),
+                "event_log": "[]",
+                "hash_algorithm": "sha256",
+                "prefix": "dstack-ingress",
+            }
+        ).encode(),
+        f"https://{DOMAIN}/evidences/{CERT_NAME}": cert_pem,
+        f"https://{DOMAIN}/attestation": json.dumps(_attestation_bundle()).encode(),
+    }
+
+    def slow_fetch(url, _domain, **_kwargs):
+        clock.now += 20.0
+        return responses[url]
+
+    monkeypatch.setattr(verifier, "_monotonic", clock)
+    monkeypatch.setattr(verifier, "_https_get", slow_fetch)
+    monkeypatch.setattr(
+        verifier,
+        "_fetch_tls_peer_certificate",
+        lambda *_args, **_kwargs: evidence_fixture.peer_der,
+    )
+
+    with pytest.raises(EvidenceError, match="overall verification deadline exceeded"):
+        _run(DOMAIN, COMPOSE_HASH, CONTENT_PK, _reference_measurements())
+
+
+def test_run_rejects_ingress_measurement_outside_approved_reference(
+    monkeypatch, evidence_fixture
+):
+    files = dict(evidence_fixture.files)
+    files["quote.json"] = json.dumps(
+        {
+            "quote": _make_tdx_quote(
+                report_data=hashlib.sha256(files["sha256sum.txt"]).digest() + bytes(32),
+                measurements=INGRESS_MEASUREMENTS,
+            ).hex(),
+            "event_log": "[]",
+            "hash_algorithm": "sha256",
+            "prefix": "dstack-ingress",
+        }
+    ).encode()
+    responses = {
+        f"https://{DOMAIN}/evidences/{name}": content for name, content in files.items()
+    }
+    responses[f"https://{DOMAIN}/attestation"] = json.dumps(
+        _attestation_bundle()
+    ).encode()
+    monkeypatch.setattr(
+        verifier, "_https_get", lambda url, _domain, **_kwargs: responses[url]
+    )
+    monkeypatch.setattr(
+        verifier,
+        "_fetch_tls_peer_certificate",
+        lambda *_args, **_kwargs: evidence_fixture.peer_der,
+    )
+    reference = _reference_measurements()
+    reference["ingress"]["mrtd"] = "ff" * 48
+
+    with pytest.raises(
+        EvidenceError, match="approved ingress measurement mismatch: mrtd"
+    ):
+        _run(DOMAIN, COMPOSE_HASH, CONTENT_PK, reference)
+
+
+def test_cli_requires_reference_measurements_file(monkeypatch):
+    monkeypatch.setattr(verifier, "_run", lambda *_args: ["unexpected"])
+    with pytest.raises(SystemExit) as exc_info:
+        verifier.main(
+            [
+                "--domain",
+                DOMAIN,
+                "--expected-compose-hash",
+                COMPOSE_HASH,
+                "--expected-content-pk",
+                CONTENT_PK,
+            ]
+        )
+    assert exc_info.value.code == 2
+
+
+def test_cli_prints_structural_dcap_limitation(monkeypatch, capsys, tmp_path):
+    reference_path = tmp_path / "references.json"
+    reference_path.write_text(json.dumps(_reference_measurements()))
     monkeypatch.setattr(verifier, "_run", lambda *_args: ["evidence verified"])
     result = verifier.main(
         [
@@ -540,7 +869,9 @@ def test_cli_prints_structural_dcap_limitation(monkeypatch, capsys):
             "--expected-compose-hash",
             "12" * 32,
             "--expected-content-pk",
-            "34" * 32,
+            CONTENT_PK,
+            "--reference-measurements",
+            str(reference_path),
         ]
     )
     output = capsys.readouterr().out
@@ -548,3 +879,31 @@ def test_cli_prints_structural_dcap_limitation(monkeypatch, capsys):
     assert "PASS: evidence verified" in output
     assert "does not validate the Intel DCAP signature chain" in output
     assert "client release gate must verify it separately" in output
+
+
+def test_cli_discloses_structural_dcap_limitation_on_failure(
+    monkeypatch, capsys, tmp_path
+):
+    reference_path = tmp_path / "references.json"
+    reference_path.write_text(json.dumps(_reference_measurements()))
+
+    def fail(*_args):
+        raise EvidenceError("synthetic failure")
+
+    monkeypatch.setattr(verifier, "_run", fail)
+    result = verifier.main(
+        [
+            "--domain",
+            DOMAIN,
+            "--expected-compose-hash",
+            COMPOSE_HASH,
+            "--expected-content-pk",
+            CONTENT_PK,
+            "--reference-measurements",
+            str(reference_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "FAIL: synthetic failure" in captured.err
+    assert "does not validate the Intel DCAP signature chain" in captured.out

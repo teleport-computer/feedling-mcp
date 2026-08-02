@@ -1,15 +1,17 @@
 # Feedling — Phala TDX CVM compose (CVM-only, post-VPS migration).
 #
-# VPS is gone. This compose is the whole production stack:
-#   - dstack-ingress: TLS termination for api.feedling.app
-#   - backend:       ASGI (HTTP+WS) — sole source of truth for user data
-#   - enclave:       decrypt proxy + /attestation (own TLS on :5003,
-#                    reachable via dstack-gateway `-5003s.` passthrough)
+# This compose is the whole test stack:
+#   - dstack-ingress: WebPKI TLS for test-api.feedling.app and
+#                     test-enclave.feedling.app
+#   - backend:        ASGI (HTTP+WS) — sole source of truth for user data
+#   - enclave:        decrypt proxy + /attestation with its own TLS on :5003,
+#                     reachable directly via dstack-gateway `-5003s.` passthrough
+#   - enclave-domain: internal HTTP :5004 entrypoint, reachable only through
+#                     the ingress-backed test-enclave.feedling.app custom domain
+#   - serve-worker:   pooled Runtime V2 worker
 #
-# IMPORTANT: this replaces the prior VPS+CVM split. DNS A-records for
-# `api.feedling.app` is migrated off
-# the retired VPS host and onto Phala's dstack-gateway. Existing prod users
-# re-onboard from scratch (per user direction 2026-04-21).
+# IMPORTANT: test domains, volumes, database, content key, and AppAuth policy
+# stay isolated from production even though both deployments use prod9.
 #
 # REQUIRED CVM NODE: prod9 (dstack-pha-prod9). Multi-domain TXT routing
 # via `_dstack-app-address.<domain>` only works on the prod9 gateway;
@@ -19,23 +21,28 @@
 #
 # DNS records dstack-ingress manages automatically (needs CF token with
 # Zone.DNS:Edit on feedling.app):
-#   CNAME api.feedling.app → <app-id>.dstack-pha-prod9.phala.network
-#   TXT   _dstack-app-address.api.feedling.app → <app-id>:443
-#   CAA   api.feedling.app pinned to Let's Encrypt
+#   CNAME test-api.feedling.app → <app-id>.dstack-pha-prod9.phala.network
+#   TXT   _dstack-app-address.test-api.feedling.app → <app-id>:443
+#   CAA   test-api.feedling.app pinned to Let's Encrypt
+#   CNAME test-enclave.feedling.app → <app-id>.dstack-pha-prod9.phala.network
+#   TXT   _dstack-app-address.test-enclave.feedling.app → <app-id>:443
+#   CAA   test-enclave.feedling.app pinned to Let's Encrypt
+#
+# Enclave entrypoints intentionally coexist:
+#   direct: https://<app-id>-5003s.dstack-pha-prod9.phala.network → enclave:5003
+#           (enclave-owned TLS and certificate pinning)
+#   custom: https://test-enclave.feedling.app → ingress:443 → enclave-domain:5004
+#           (ingress evidence plus enclave application attestation; no host port)
 #
 # Deploy flow:
-#   1. `phala deploy -c deploy/docker-compose.phala.yaml -n feedling-enclave-v2 \
+#   1. `phala deploy -c deploy/docker-compose.phala.test.yaml -n feedling-test \
 #         --node-id <prod9-node-id> -e CF_API_TOKEN=... -e CF_ZONE_ID=...`
 #   2. Wait for ingress to issue LE certs (first-time boot ~2–3 min).
-#   3. Update CF DNS: A record for api → the public IP printed by
-#      `phala cvms get feedling-enclave-v2` (or the CNAME target above).
+#   3. Confirm both test DNS names target the app_id returned by
+#      `phala cvms get feedling-test`.
 #   4. Compute compose_hash; publish on-chain via FeedlingAppAuth.addComposeHash.
-#   5. iOS follow-up PR: update `AuditCardView.swift` `makeAttestationURL`
-#      and `FeedlingAPI.swift` pinning URL to the new app_id on prod9.
-#      Decide whether the MCP-port pubkey-pin row stays (now pins ingress
-#      cert — requires enclave_app.py to bake ingress cert SPKI hash into
-#      REPORT_DATA) or is retired (content-layer envelope crypto still
-#      secures reads/writes regardless of transport-layer pinning).
+#   5. Verify both entrypoints and their distinct evidence bindings before
+#      enabling clients to use the custom-domain path.
 #
 # CRITICAL: every literal in this file becomes part of the compose_hash.
 # Any ${VAR} below must be category (A) — cosmetic / non-security.
@@ -44,7 +51,7 @@
 name: feedling-test
 
 services:
-  # --- Public TLS termination for the api custom domain. ---
+  # --- Public TLS termination for the API and enclave custom domains. ---
   # HAProxy-based L4/L7 ingress inside the TDX CVM. Issues LE certs via
   # CF DNS-01, routes by SNI. Key material stays inside the enclave
   # volume `letsencrypt` — the CF token only has DNS-edit scope, not
