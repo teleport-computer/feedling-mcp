@@ -7,6 +7,7 @@ ABOVE core in the dependency stack — the assembly layer (asgi/lifespan.py) inj
 
 import base64
 import hashlib
+import os
 
 import content_encryption
 from content_encryption import build_envelope
@@ -30,10 +31,15 @@ def resolve_content_encryption(user_id: str) -> str:
     return "on"
 
 
-# 服务端是否接受明文形状的内容写入。**Task 2.2 完成前必须是 False**：客户端
-# 写闸仍硬校验 K_enclave（worldbook_core._validate_envelope:51 等），明文写入
-# 会 400。这里是唯一的开关点——翻成 True 前先确认所有写闸都已接受明文。
-PLAINTEXT_WRITES_ACCEPTED = False
+# 服务端是否接受明文形状的内容写入。默认关闭，只有部署显式传入精确值 ``1``
+# 才开启；未知/拼错/缺失都 fail-safe 回到加密。用环境级开关而不是改代码常量，
+# 才能只在 pre 验证明文档而不把 test/prod 一起打开。
+def _plaintext_writes_accepted(env: dict | None = None) -> bool:
+    source = os.environ if env is None else env
+    return str(source.get("FEEDLING_PLAINTEXT_WRITES_ACCEPTED", "")).strip() == "1"
+
+
+PLAINTEXT_WRITES_ACCEPTED = _plaintext_writes_accepted()
 
 
 def _decode_content_public_key(public_key: str) -> tuple[bytes | None, str]:

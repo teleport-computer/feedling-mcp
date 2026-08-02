@@ -253,6 +253,11 @@ not enabled plaintext storage reports `on` regardless of the preference, so a
 client that ships support for plaintext ahead of the server still writes
 envelopes. Treat an absent, empty, or unrecognized value as `on`.
 
+The deployment gate is closed by default and opens only when
+`FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` is set. The pre-production environment
+currently enables it for functional testing; test and production remain closed.
+Even in an enabled deployment, an unknown user remains fail-safe encrypted.
+
 Two boundaries hold in both tiers:
 
 - A record is never silently downgraded. If a user's effective shape is `on` and

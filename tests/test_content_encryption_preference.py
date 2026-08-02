@@ -185,16 +185,42 @@ def test_unchanged_value_is_a_noop(uid, monkeypatch):
 # PLAINTEXT_WRITES_ACCEPTED 翻成 True 才真正开始产生明文行。
 
 
-def test_effective_is_on_while_plaintext_writes_are_rejected(uid):
+def test_effective_is_on_while_plaintext_writes_are_rejected(uid, monkeypatch):
     """服务端还不收明文时，即便用户意图 off，生效值也必须是 "on"。"""
     from core import envelope as core_envelope
 
-    assert core_envelope.PLAINTEXT_WRITES_ACCEPTED is False, (
-        "Task 2.2 尚未完成；翻成 True 前请先确认所有写闸都接受明文形状")
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", False)
 
     registry._set_user_content_encryption(uid, "off")
 
     assert registry.effective_content_encryption(uid) == "on"
+
+
+def test_plaintext_write_gate_defaults_closed():
+    """Only the exact deployment value 1 opens the fail-safe gate."""
+    from core import envelope as core_envelope
+
+    key = "FEEDLING_PLAINTEXT_WRITES_ACCEPTED"
+    assert core_envelope._plaintext_writes_accepted({}) is False
+    assert core_envelope._plaintext_writes_accepted({key: ""}) is False
+    assert core_envelope._plaintext_writes_accepted({key: "true"}) is False
+    assert core_envelope._plaintext_writes_accepted({key: "0"}) is False
+    assert core_envelope._plaintext_writes_accepted({key: " 1 "}) is True
+
+
+def test_pre_manifest_is_the_only_manifest_that_opens_plaintext_gate():
+    """The rollout is pre-only; merging this code cannot open test or prod."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    key = "FEEDLING_PLAINTEXT_WRITES_ACCEPTED"
+    pre = (root / "deploy/docker-compose.phala.pre.yaml").read_text()
+    test = (root / "deploy/docker-compose.phala.test.yaml").read_text()
+    prod = (root / "deploy/docker-compose.phala.yaml").read_text()
+
+    assert f'{key}: "1"' in pre
+    assert key not in test
+    assert key not in prod
 
 
 def test_effective_follows_intent_once_plaintext_writes_are_accepted(uid, monkeypatch):

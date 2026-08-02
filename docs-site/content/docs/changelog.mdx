@@ -36,8 +36,9 @@ change must not be interpreted as an API guarantee.
   the preference. `/v1/content/swap` converts existing records between shapes
   in place. Two boundaries are enforced server-side: a record is never silently
   downgraded to plaintext, and `local_only` visibility still requires
-  encryption. No deployment has enabled plaintext storage yet, so the effective
-  value is currently `on` everywhere. See
+  encryption. The pre-production environment now enables plaintext storage for
+  functional testing through the default-off deployment gate; test and
+  production still report an effective value of `on` for every user. See
   [architecture](/docs/architecture#content-encryption-is-a-per-user-preference).
 
 - **Runtime V2 can replace its legacy summary with a bounded Memory/User

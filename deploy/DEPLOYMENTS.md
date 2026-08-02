@@ -251,6 +251,12 @@ in test, pre, and production.
 | Database | Dedicated pre RDS, injected via `PRE_DATABASE_URL` — fully isolated from test/prod (pre's enclave content key differs from test's, so sharing a DB would mix mutually-undecryptable ciphertext + double-schedule proactive jobs). |
 | On-chain | **Separate** Sepolia FeedlingAppAuth `0x65844Dd69eba4Aa4a784e089dA9D9308F430F794` (owner = the `ETH_DEPLOYER_KEY` address, deployed 2026-07-07 via `deploy-test-contract.yml` dispatch), repo var `PRE_FEEDLING_APP_AUTH_CONTRACT`. Kept apart from test's contract because a shared AppAuth + a newly created CVM is the exact combination that flipped the main enclave key in the 2026-07-05 prod-runner incident. |
 | Deploy path | CI `deploy-pre-cvm` job (in `ci.yml`) on push to the `pre` branch. Clone of `deploy-test-cvm` with pre compose / CVM / DB / contract, branch-gated to `refs/heads/pre`. |
+
+The pre backend sets `FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1` to exercise PR #131's
+per-user plaintext tier. The code default is closed and the test/prod manifests
+intentionally omit the variable, so merging the implementation cannot enable
+plaintext writes outside pre. Unknown users and users whose effective preference
+is `on` still write encrypted envelopes.
 | Baseline | Set repo var `PRE_ENCLAVE_CONTENT_PK_BASELINE` from a manual `/attestation` read after the first healthy deploy (the attestation gate is inert until then). |
 
 ### Runtime V2 worker CVM (pre, `feedling-io-agents-pre`)
