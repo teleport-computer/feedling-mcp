@@ -80,9 +80,14 @@ def _custom_bounds(
     inclusive_days = (end_day - start_day).days + 1
     if inclusive_days < 1 or inclusive_days > 366:
         return None
-    start_local = datetime.combine(start_day, time.min, tzinfo=display_tz)
-    end_local = datetime.combine(exclusive_end_day, time.min, tzinfo=display_tz)
-    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+    try:
+        start_local = datetime.combine(start_day, time.min, tzinfo=display_tz)
+        end_local = datetime.combine(exclusive_end_day, time.min, tzinfo=display_tz)
+        start_utc = start_local.astimezone(timezone.utc)
+        end_utc = end_local.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        return None
+    return start_utc, end_utc
 
 
 def parse_usage_query(

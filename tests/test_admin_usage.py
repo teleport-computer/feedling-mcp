@@ -137,6 +137,24 @@ def test_usage_query_custom_end_without_exclusive_successor_falls_back_to_30_day
     assert query.end_date is None
 
 
+def test_usage_query_local_start_before_utc_min_falls_back_to_30_days():
+    query = _usage.parse_usage_query(
+        {
+            "preset": "custom",
+            "start_date": "0001-01-01",
+            "end_date": "0001-01-01",
+            "timezone": "Asia/Shanghai",
+        },
+        now_utc=NOW_UTC,
+    )
+
+    assert query.preset == "30d"
+    assert query.start_at_utc == datetime(2026, 7, 3, 12, 30, tzinfo=timezone.utc)
+    assert query.end_at_utc == NOW_UTC
+    assert query.start_date is None
+    assert query.end_date is None
+
+
 def test_usage_query_custom_dates_follow_dst_boundaries_in_selected_timezone():
     query = _usage.parse_usage_query(
         {
