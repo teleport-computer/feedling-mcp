@@ -175,12 +175,15 @@ fail closed 为 `503 voice_gateway_not_configured`。
 
 #### Custom enclave-domain and direct-audit transports
 
-The production, test, and pre environments expose `enclave.feedling.app`,
-`test-enclave.feedling.app`, and `pre-enclave.feedling.app` through
-`dstack-ingress`. The custom-domain chain is client TLS → ingress inside the
-measured TDX CVM → Docker-internal HTTP → `enclave-domain`; the final hop is
-plaintext, but remains inside that measured CVM rather than crossing a public
-network. Cloudflare manages DNS-01 records only and does not proxy this traffic.
+The release topology defines `enclave.feedling.app`,
+`test-enclave.feedling.app`, and `pre-enclave.feedling.app` as the production,
+test, and pre custom-domain endpoints through `dstack-ingress`. Each becomes
+exposed/current only after its environment is deployed and its live ingress
+evidence verification succeeds. The custom-domain chain is client TLS → ingress
+inside the measured TDX CVM → Docker-internal HTTP → `enclave-domain`; the final
+hop is plaintext, but remains inside that measured CVM rather than crossing a
+public network. Cloudflare manages DNS-01 records only and does not proxy this
+traffic.
 
 Release clients using a custom domain must validate WebPKI, ingress certificate
 evidence, and enclave attestation as separate bundles before claiming security
