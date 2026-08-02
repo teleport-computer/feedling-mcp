@@ -5,11 +5,13 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from dataclasses import fields
 from pathlib import Path
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+import provider_attempt_accounting as accounting  # noqa: E402
 from provider_attempt_accounting import (  # noqa: E402
     AttemptCompleteness,
     AttemptLane,
@@ -132,6 +134,125 @@ def test_record_enqueues_without_pool_access_or_blocking():
     assert recorder.shutdown(timeout=0) is True
 
 
+def test_record_never_starts_a_worker_on_the_provider_hot_path():
+    """A blocking thread start after enqueue must not delay a provider caller."""
+    starts = []
+
+    class _BlockingStartThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            starts.append(True)
+            time.sleep(0.2)
+
+        def join(self, _timeout=None):
+            return None
+
+        def is_alive(self):
+            return False
+
+    recorder = ProviderAttemptRecorder(
+        thread_factory=lambda **kwargs: _BlockingStartThread(**kwargs),
+    )
+    began = time.monotonic()
+    assert recorder.record(_event()) is None
+
+    assert time.monotonic() - began < 0.05
+    assert starts == []
+    assert recorder.queue_size == 1
+
+
+def test_singleton_record_never_starts_a_worker_on_the_provider_hot_path(monkeypatch):
+    """The singleton wrapper has the same no-start latency guarantee as direct use."""
+    starts = []
+
+    class _BlockingStartThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            starts.append(True)
+            time.sleep(0.2)
+
+        def join(self, _timeout=None):
+            return None
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(accounting, "_recorder", None)
+    monkeypatch.setattr(accounting.threading, "Thread", _BlockingStartThread)
+    began = time.monotonic()
+    assert accounting.record_provider_attempt(_event()) is None
+
+    assert time.monotonic() - began < 0.05
+    assert starts == []
+
+
+def test_logger_and_counter_failures_cannot_escape_direct_record(monkeypatch):
+    """A broken diagnostic path must not turn a telemetry drop into a call failure."""
+    recorder = ProviderAttemptRecorder(
+        queue_capacity=1,
+        thread_factory=lambda **kwargs: _StoppedThread(**kwargs),
+    )
+    assert recorder.record(_event()) is None
+    monkeypatch.setattr(
+        accounting.log,
+        "warning",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("logger failed")),
+    )
+
+    assert recorder.record(_event()) is None
+
+    counter_failure = ProviderAttemptRecorder(
+        queue_capacity=1,
+        thread_factory=lambda **kwargs: _StoppedThread(**kwargs),
+    )
+    assert counter_failure.record(_event()) is None
+
+    class _ExplodingCounter:
+        def __iadd__(self, _value):
+            raise RuntimeError("counter failed")
+
+    counter_failure._dropped_count = _ExplodingCounter()
+    assert counter_failure.record(_event()) is None
+
+
+def test_direct_dataclass_construction_rejects_unsafe_metadata():
+    """Bypassing create() cannot bypass the content-free identifier contract."""
+    event = _event()
+    direct_values = {field.name: getattr(event, field.name) for field in fields(event)}
+    direct_values["requested_model"] = "Bearer secret"
+
+    try:
+        ProviderAttemptEvent(**direct_values)
+    except ValueError as exc:
+        assert str(exc) == "invalid_requested_model"
+    else:
+        raise AssertionError("direct dataclass construction accepted unsafe metadata")
+
+
+def test_forged_event_is_dropped_before_cursor_execution():
+    """Persistence revalidates a mutated frozen object before its data reaches SQL."""
+    executions = []
+    recorder = ProviderAttemptRecorder(
+        pool_factory=lambda: _Pool(_Connection(executions)),
+        batch_size=1,
+        flush_interval=0.01,
+        reconcile_interval=3600,
+    )
+    event = _event()
+    object.__setattr__(event, "requested_model", "Bearer secret")
+
+    assert recorder.record(event) is None
+    recorder._ensure_worker()
+    _wait_until(lambda: recorder.dropped_count == 1)
+
+    assert executions == []
+    assert recorder.shutdown(timeout=0.5) is True
+
+
 def test_full_queue_drops_event_without_raising_or_growing_memory():
     """A full bounded queue drops telemetry instead of delaying a provider call."""
     recorder = ProviderAttemptRecorder(
@@ -146,8 +267,8 @@ def test_full_queue_drops_event_without_raising_or_growing_memory():
     assert recorder.shutdown(timeout=0) is True
 
 
-def test_single_lazy_worker_starts_once_for_many_records():
-    """Concurrent-looking hot-path records share one lazily started daemon."""
+def test_explicit_bootstrap_starts_one_worker_for_many_records():
+    """The off-hot-path bootstrap starts one daemon for queued provider facts."""
     executions = []
     starts = []
 
@@ -163,6 +284,7 @@ def test_single_lazy_worker_starts_once_for_many_records():
         reconcile_interval=3600,
     )
 
+    assert recorder.start() is True
     assert recorder.record(_event()) is None
     assert recorder.record(_event()) is None
     _wait_until(lambda: len(executions) >= 1)
@@ -210,6 +332,7 @@ def test_completed_event_recovers_missing_start_and_replay_stays_idempotent():
     )
 
     completed = _event(state=AttemptState.COMPLETED, outcome=AttemptOutcome.FAILED)
+    assert recorder.start() is True
     assert recorder.record(completed) is None
     _wait_until(lambda: len(executions) == 1)
     assert recorder.record(completed) is None
@@ -237,6 +360,7 @@ def test_worker_retries_database_failure_with_bounded_backoff():
         reconcile_interval=3600,
     )
 
+    assert recorder.start() is True
     assert recorder.record(_event()) is None
     _wait_until(lambda: len(executions) == 2)
 
@@ -255,6 +379,7 @@ def test_background_reconciliation_marks_only_stale_started_rows():
         reconcile_interval=0,
     )
 
+    assert recorder.start() is True
     assert recorder.record(_event()) is None
     _wait_until(lambda: len(executions) >= 2)
 
@@ -298,6 +423,7 @@ def test_startup_serialization_pool_and_sql_failures_are_all_contained():
 
     startup_failure = ProviderAttemptRecorder(thread_factory=lambda **kwargs: _BrokenThread(**kwargs))
     assert startup_failure.record(_event()) is None
+    assert startup_failure.start() is False
     assert startup_failure.dropped_count == 1
 
     pool_failure = ProviderAttemptRecorder(
@@ -306,6 +432,7 @@ def test_startup_serialization_pool_and_sql_failures_are_all_contained():
         max_retries=0,
     )
     assert pool_failure.record(_event()) is None
+    assert pool_failure.start() is True
     _wait_until(lambda: pool_failure.dropped_count == 1)
     assert pool_failure.shutdown(timeout=0.5) is True
 
@@ -319,6 +446,7 @@ def test_startup_serialization_pool_and_sql_failures_are_all_contained():
         max_retries=0,
     )
     assert serialization_failure.record(_BadEvent()) is None
+    assert serialization_failure.start() is True
     _wait_until(lambda: serialization_failure.dropped_count == 1)
     assert serialization_failure.shutdown(timeout=0.5) is True
 
@@ -328,5 +456,6 @@ def test_startup_serialization_pool_and_sql_failures_are_all_contained():
         max_retries=0,
     )
     assert sql_failure.record(_event()) is None
+    assert sql_failure.start() is True
     _wait_until(lambda: sql_failure.dropped_count == 1)
     assert sql_failure.shutdown(timeout=0.5) is True

@@ -40,3 +40,26 @@
 - The queue is deliberately lossy under saturation or recorder failure.  The
   eventual report must surface that loss through ledger coverage rather than
   treating it as zero provider activity.
+
+## Fix round 1 — accepted P1 review findings
+
+- `record()` and `record_provider_attempt()` no longer call `Thread.start()`.
+  `ProviderAttemptRecorder.start()` and `start_provider_attempt_recorder()` are
+  explicit off-hot-path bootstrap entry points; the queue remains bounded and
+  the worker remains one daemon per recorder/singleton.
+- Direct recorder calls now isolate both counter and logging failures, in
+  addition to the wrapper's existing broad fail-open boundary.
+- `ProviderAttemptEvent.__post_init__` validates direct dataclass construction,
+  including stable UUID identity.  The recorder calls `event.validate()` again
+  before serialization/SQL so a forged mutation cannot reach a cursor.
+
+### Fix-round verification
+
+- RED: the five new regressions failed against `a50937a9`: direct and singleton
+  record calls blocked in injected `Thread.start`, a logger exception escaped,
+  direct construction accepted an unsafe model, and a forged event reached the
+  cursor.
+- GREEN: `python3 -m pytest -q tests/test_provider_attempt_accounting.py tests/test_provider_attempt_recorder.py` — 34 passed.
+- `python3 -m ruff check backend/provider_attempt_accounting.py tests/test_provider_attempt_accounting.py tests/test_provider_attempt_recorder.py`,
+  `python3 -m compileall -q backend/provider_attempt_accounting.py`, and
+  `git diff --check` — passed.

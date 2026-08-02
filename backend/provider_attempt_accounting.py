@@ -258,6 +258,54 @@ class ProviderAttemptEvent:
     provider_request_id: str | None = None
     usage_unknown_reason: AttemptUsageUnknownReason | None = None
 
+    def __post_init__(self) -> None:
+        """Keep direct dataclass construction inside the content-free contract."""
+        self.validate()
+
+    def validate(self) -> None:
+        """Revalidate before persistence in case a frozen object was forged."""
+        _safe_identifier("user_id", self.user_id, _INSTALLATION_ID)
+        for value, enum_type in (
+            (self.source, AttemptSource),
+            (self.lane, AttemptLane),
+            (self.state, AttemptState),
+            (self.outcome, AttemptOutcome),
+            (self.completeness, AttemptCompleteness),
+            (self.error_class, AttemptErrorClass),
+            (self.retry_kind, AttemptRetryKind),
+        ):
+            if not isinstance(value, enum_type):
+                raise TypeError("provider_attempt_enums_required")
+        if self.usage_unknown_reason is not None and not isinstance(
+            self.usage_unknown_reason, AttemptUsageUnknownReason,
+        ):
+            raise TypeError("provider_attempt_usage_unknown_reason_must_be_typed")
+        _safe_identifier("requested_provider", self.requested_provider, _PROVIDER)
+        _safe_identifier("requested_model", self.requested_model, _MODEL)
+        _safe_identifier("resolved_provider", self.resolved_provider, _PROVIDER)
+        _safe_identifier("resolved_model", self.resolved_model, _MODEL)
+        _safe_identifier("transport", self.transport, _TRANSPORT)
+        _safe_identifier(
+            "installation_id", self.installation_id, _INSTALLATION_ID, optional=True,
+        )
+        _safe_identifier("runtime", self.runtime, _RUNTIME, optional=True)
+        _safe_identifier("turn_id", self.turn_id, _CALL_ID, optional=True)
+        _safe_identifier("round_id", self.round_id, _CALL_ID, optional=True)
+        _safe_identifier(
+            "provider_request_id", self.provider_request_id, _PROVIDER_REQUEST_ID,
+            optional=True,
+        )
+        if self.job_id is not None and (
+            not isinstance(self.job_id, int)
+            or isinstance(self.job_id, bool)
+            or self.job_id < 0
+        ):
+            raise ValueError("job_id_must_be_nonnegative")
+        if self.attempt_id != stable_attempt_id(
+            self.call_id, self.outer_attempt_ordinal, self.inner_attempt_ordinal,
+        ):
+            raise ValueError("attempt_id_must_match_stable_identity")
+
     @classmethod
     def create(
         cls,
@@ -433,20 +481,19 @@ class ProviderAttemptRecorder:
 
     def record(self, event: ProviderAttemptEvent) -> None:
         """Enqueue a fact with one non-blocking operation; never raise."""
-        if self._stop.is_set():
-            self._drop("shutdown")
-            return None
         try:
-            self._queue.put_nowait(event)
-        except queue.Full:
-            self._drop("queue_full")
-            self._ensure_worker()
+            if self._stop.is_set():
+                self._drop("shutdown")
+                return None
+            try:
+                self._queue.put_nowait(event)
+            except queue.Full:
+                self._drop("queue_full")
+            except Exception:  # noqa: BLE001 - custom queue/runtime failures are telemetry-only
+                self._drop("queue_failure")
             return None
-        except Exception:  # noqa: BLE001 - custom queue/runtime failures are telemetry-only
-            self._drop("queue_failure")
+        except Exception:  # noqa: BLE001 - no telemetry path may alter a provider result
             return None
-        self._ensure_worker()
-        return None
 
     def shutdown(self, timeout: float = 1.0) -> bool:
         """Request bounded drain/exit and never propagate shutdown failures."""
@@ -460,30 +507,34 @@ class ProviderAttemptRecorder:
         except Exception:  # noqa: BLE001 - process shutdown must remain safe
             return False
 
-    def _ensure_worker(self) -> None:
+    def start(self) -> bool:
+        """Start the daemon from process bootstrap, never from a provider call."""
         thread = self._thread
         try:
             if thread is not None and thread.is_alive():
-                return
+                return True
         except Exception:  # noqa: BLE001
             pass
-        if not self._startup_lock.acquire(blocking=False):
-            return
-        try:
+        with self._startup_lock:
             thread = self._thread
             if thread is not None and thread.is_alive():
-                return
-            worker = self._thread_factory(
-                target=self._run,
-                name="provider-attempt-recorder",
-                daemon=True,
-            )
-            worker.start()
-            self._thread = worker
-        except Exception:  # noqa: BLE001 - daemon startup is non-essential telemetry
-            self._drop("worker_start_failure")
-        finally:
-            self._startup_lock.release()
+                return True
+            try:
+                worker = self._thread_factory(
+                    target=self._run,
+                    name="provider-attempt-recorder",
+                    daemon=True,
+                )
+                worker.start()
+                self._thread = worker
+                return True
+            except Exception:  # noqa: BLE001 - daemon startup is non-essential telemetry
+                self._drop("worker_start_failure")
+                return False
+
+    def _ensure_worker(self) -> bool:
+        """Compatibility shim for explicit off-hot-path bootstrap callers."""
+        return self.start()
 
     def _run(self) -> None:
         try:
@@ -520,6 +571,9 @@ class ProviderAttemptRecorder:
         rows: list[dict[str, object]] = []
         for event in events:
             try:
+                if type(event) is not ProviderAttemptEvent:
+                    raise TypeError("provider_attempt_event_required")
+                event.validate()
                 row = event.as_row()
                 if tuple(row) != _EVENT_COLUMNS:
                     raise ValueError("provider_attempt_row_shape")
@@ -554,15 +608,24 @@ class ProviderAttemptRecorder:
             self._diagnostic("reconcile_failure")
 
     def _drop(self, reason: str, count: int = 1) -> None:
-        self._dropped_count += count
-        self._diagnostic(reason)
+        try:
+            self._dropped_count += count
+        except Exception:  # noqa: BLE001 - counters are only best-effort diagnostics
+            pass
+        try:
+            self._diagnostic(reason)
+        except Exception:  # noqa: BLE001 - diagnostics must not escape any caller
+            pass
 
     def _diagnostic(self, reason: str) -> None:
-        now = time.monotonic()
-        if now - self._last_diagnostic < 60:
+        try:
+            now = time.monotonic()
+            if now - self._last_diagnostic < 60:
+                return
+            self._last_diagnostic = now
+            log.warning("provider attempt recorder event dropped or deferred: %s", reason)
+        except Exception:  # noqa: BLE001 - logging failures cannot break telemetry
             return
-        self._last_diagnostic = now
-        log.warning("provider attempt recorder event dropped or deferred: %s", reason)
 
 
 _recorder: ProviderAttemptRecorder | None = None
@@ -589,6 +652,16 @@ def record_provider_attempt(event: ProviderAttemptEvent) -> None:
     except Exception:  # noqa: BLE001 - preserve provider call behaviour
         return None
     return None
+
+
+def start_provider_attempt_recorder() -> bool:
+    """Explicit off-hot-path bootstrap for the process singleton's daemon."""
+    global _recorder
+    with _recorder_lock:
+        if _recorder is None:
+            _recorder = ProviderAttemptRecorder()
+        recorder = _recorder
+    return recorder.start()
 
 
 def shutdown_provider_attempt_recorder(timeout: float = 1.0) -> bool:
