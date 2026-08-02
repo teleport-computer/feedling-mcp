@@ -352,6 +352,81 @@ def test_usage_hybrid_partial_dirty_and_empty_days_match_disjoint_raw(usage_rows
     assert freshness["raw_days"] == ["2026-07-01", "2026-07-02", "2026-07-04"]
 
 
+def test_usage_parallel_orders_known_zero_before_unknown_tokens():
+    users = ("u_usage_known_zero", "u_usage_unknown_order")
+    for user_id in users:
+        seed_user(user_id, created_at="2026-06-01T00:00:00+00:00")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_turn_metrics "
+            "(user_id,lane,provider,model,prompt_tokens,completion_tokens,"
+            "usage_reported_calls,cache_reported_calls,model_calls,retries,failed,"
+            "status,created_at) VALUES "
+            "(%s,'known-lane','known-provider','known-model',0,0,1,0,1,0,false,'known-zero',%s),"
+            "(%s,'unknown-lane','unknown-provider','unknown-model',NULL,NULL,0,0,5,0,false,'unknown-order',%s)",
+            (
+                users[0], "2026-07-01T10:00:00+00:00",
+                users[1], "2026-07-01T11:00:00+00:00",
+            ),
+        )
+    query = _shanghai_usage_query()
+    raw = jobs_store._usage_report_snapshot_raw(query)
+    _enable_usage_rollup(days=(datetime(2026, 7, 1).date(), datetime(2026, 7, 2).date()))
+    try:
+        report = jobs_store.usage_report_snapshot(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+            conn.execute("DELETE FROM users WHERE user_id=ANY(%s)", (list(users),))
+
+    report["coverage"].pop("rollup")
+    assert report == raw
+    assert [row["user_id"] for row in report["users"]] == list(users)
+    assert [row["model"] for row in report["models"]] == [
+        "known-model", "unknown-model"
+    ]
+    assert [row["lane"] for row in report["lanes"]] == [
+        "known-lane", "unknown-lane"
+    ]
+
+
+def test_usage_rollup_report_has_no_rows_after_account_deletion():
+    user_id = "u_usage_rollup_delete"
+    seed_user(user_id, created_at="2026-06-01T00:00:00+00:00")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_turn_metrics "
+            "(user_id,lane,provider,model,prompt_tokens,completion_tokens,"
+            "usage_reported_calls,cache_reported_calls,model_calls,retries,failed,"
+            "status,created_at) VALUES (%s,'chat','provider','model',10,5,1,0,1,0,false,'delete-rollup',%s)",
+            (user_id, "2026-07-01T10:00:00+00:00"),
+        )
+    _enable_usage_rollup()
+    query = _shanghai_usage_query(user_id=user_id)
+    before = jobs_store.usage_report_snapshot(query)
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+        residual = conn.execute(
+            "SELECT "
+            "(SELECT count(*) FROM v2_turn_metrics WHERE user_id=%s),"
+            "(SELECT count(*) FROM v2_usage_daily_users WHERE user_id=%s),"
+            "(SELECT count(*) FROM v2_usage_daily_dimensions WHERE user_id=%s)",
+            (user_id, user_id, user_id),
+        ).fetchone()
+    try:
+        after = jobs_store.usage_report_snapshot(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert before["overview"]["total_tokens"] == 15
+    assert residual == (0, 0, 0)
+    assert after["overview"]["registered_accounts"] == 0
+    assert after["overview"]["turns"] == 0
+    assert after["users"] == []
+    assert after["models"] == []
+
+
 def test_usage_hybrid_raw_sql_uses_bounded_created_at_ranges():
     partition = usage_reporting.RollupPartition(
         rollup_days=(datetime(2026, 7, 1).date(),),
@@ -524,6 +599,14 @@ def test_usage_process_and_rds_admission_fail_fast_without_extra_query(usage_row
         try:
             with pytest.raises(RuntimeError, match="RDS admission busy"):
                 jobs_store.usage_report_snapshot(query)
+            with pytest.raises(RuntimeError, match="RDS admission busy"):
+                jobs_store.usage_report_snapshot(_usage_query())
+            holder.execute(
+                "UPDATE v2_usage_rollup_watermarks SET bootstrap_complete=false "
+                "WHERE rollup_name='hosted_v2_usage'"
+            )
+            with pytest.raises(RuntimeError, match="RDS admission busy"):
+                jobs_store.usage_report_snapshot(query)
         finally:
             holder.execute(
                 "SELECT pg_advisory_unlock(%s)",
@@ -560,6 +643,45 @@ def test_usage_importer_timeout_rolls_back_and_only_degrades_dimensions(
     assert report["models"] is None
     assert report["lanes"] is None
     assert {row["primary_provider"] for row in report["users"]} == {"unavailable"}
+
+
+@pytest.mark.parametrize("raw_path", ["utc", "bootstrap"])
+def test_usage_raw_fallback_reuses_exporter_while_rds_admission_is_held(
+    monkeypatch, usage_rows, raw_path
+):
+    query = _usage_query() if raw_path == "utc" else _shanghai_usage_query()
+    if raw_path == "bootstrap":
+        _enable_usage_rollup()
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE v2_usage_rollup_watermarks SET bootstrap_complete=false "
+                "WHERE rollup_name='hosted_v2_usage'"
+            )
+    real_raw = jobs_store._usage_report_snapshot_raw
+    expected = real_raw(query)
+    observed = []
+
+    def raw_spy(request_query, *, exporter_conn=None):
+        assert exporter_conn is not None
+        observed.append(exporter_conn.info.backend_pid)
+        with db.get_pool().connection() as contender:
+            assert not contender.execute(
+                "SELECT pg_try_advisory_lock(%s)",
+                (jobs_store._USAGE_REPORT_ADVISORY_KEY,),
+            ).fetchone()[0]
+        return real_raw(request_query, exporter_conn=exporter_conn)
+
+    monkeypatch.setattr(jobs_store, "_usage_report_snapshot_raw", raw_spy)
+    try:
+        report = jobs_store.usage_report_snapshot(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert len(observed) == 1
+    assert report["coverage"]["rollup"]["mode"] == "raw"
+    report["coverage"].pop("rollup")
+    assert report == expected
 
 
 def test_usage_importer_pool_failure_uses_exporter_serial_fallback(
@@ -644,10 +766,10 @@ def test_usage_parallel_core_failure_does_not_start_expensive_raw_fallback(
 ):
     raw_calls = 0
 
-    def fail_parallel(_query):
+    def fail_parallel(_query, **_kwargs):
         raise RuntimeError("core injected")
 
-    def raw_spy(_query):
+    def raw_spy(_query, **_kwargs):
         nonlocal raw_calls
         raw_calls += 1
         return {}

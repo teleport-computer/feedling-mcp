@@ -20,6 +20,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FutureTimeoutError,
 )
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -47,6 +48,42 @@ class _UsageReportAdmissionBusy(RuntimeError):
 
 def _usage_snapshot_observer(_event: str, **_fields) -> None:
     """No-op test hook; events never contain user/content data."""
+
+
+@contextmanager
+def _usage_report_admission():
+    """Hold process and RDS admission until the whole report is finished."""
+
+    if not _USAGE_REPORT_GATE.acquire(blocking=False):
+        raise _UsageReportAdmissionBusy("usage process admission busy")
+    try:
+        with _usage_pool_connection() as conn:
+            if not conn.autocommit:
+                conn.autocommit = True
+            locked = bool(
+                conn.execute(
+                    "SELECT pg_try_advisory_lock(%s)",
+                    (_USAGE_REPORT_ADVISORY_KEY,),
+                ).fetchone()[0]
+            )
+            if not locked:
+                raise _UsageReportAdmissionBusy("usage RDS admission busy")
+            try:
+                yield conn
+            finally:
+                try:
+                    unlocked = bool(
+                        conn.execute(
+                            "SELECT pg_advisory_unlock(%s)",
+                            (_USAGE_REPORT_ADVISORY_KEY,),
+                        ).fetchone()[0]
+                    )
+                    if not unlocked:
+                        conn.close()
+                except Exception:
+                    conn.close()
+    finally:
+        _USAGE_REPORT_GATE.release()
 
 LANES = {
     "chat",
@@ -4888,6 +4925,16 @@ def _usage_fact_aggregate_columns(alias: str = "s") -> str:
     )
 
 
+def _usage_known_total_order(alias: str = "s") -> str:
+    """Match raw ``sum(prompt)+sum(completion) NULLS LAST`` semantics."""
+
+    return (
+        f"CASE WHEN sum({alias}.prompt_tokens_known_count)>0 "
+        f"AND sum({alias}.completion_tokens_known_count)>0 "
+        f"THEN sum({alias}.prompt_tokens_sum)+sum({alias}.completion_tokens_sum) END"
+    )
+
+
 def _usage_parallel_core_rows(cur, query, partition, *, unknown_auxiliary=True) -> dict:
     """Aggregate user/day facts inside PostgreSQL; never fetch canonical rows."""
 
@@ -4960,7 +5007,7 @@ SELECT s.user_id,{aggregates},
  max(s.last_model_call_at) AS last_model_call_at,
  max(dist.daily_p50) AS daily_p50,max(dist.daily_p95) AS daily_p95
 FROM source s LEFT JOIN dist USING (user_id) GROUP BY s.user_id
-ORDER BY (sum(s.prompt_tokens_sum)+sum(s.completion_tokens_sum)) DESC NULLS LAST,
+ORDER BY {_usage_known_total_order()} DESC NULLS LAST,
  sum(s.model_calls) DESC,s.user_id
 """,
         params,
@@ -5018,7 +5065,7 @@ def _usage_parallel_dimension_rows(
             + f"""
 SELECT {fields},{aggregates},count(DISTINCT user_id)::int AS users
 FROM source s GROUP BY {fields}
-ORDER BY (sum(s.prompt_tokens_sum)+sum(s.completion_tokens_sum)) DESC NULLS LAST,
+ORDER BY {_usage_known_total_order()} DESC NULLS LAST,
  sum(s.model_calls) DESC,{fields}
 """,
             params,
@@ -5343,7 +5390,7 @@ def _usage_payload_from_parallel_rows(
     }
 
 
-def _usage_report_snapshot_raw(query) -> dict:
+def _usage_report_snapshot_raw(query, *, exporter_conn=None) -> dict:
     """Return one coherent, content-free Hosted V2 Usage analytics snapshot."""
 
     where_sql, where_params = usage_reporting.metric_filter_sql(query)
@@ -5395,7 +5442,12 @@ WITH base AS (
 """
     base_params = (query.timezone, *where_params)
 
-    with _usage_pool_connection() as conn:
+    connection_context = (
+        nullcontext(exporter_conn)
+        if exporter_conn is not None
+        else _usage_pool_connection()
+    )
+    with connection_context as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
@@ -6465,157 +6517,132 @@ def _usage_report_snapshot_hybrid_serial(query) -> dict | None:
     }
 
 
-def _usage_report_snapshot_hybrid_parallel(query) -> dict | None:
+def _usage_report_snapshot_hybrid_parallel(
+    query, *, exporter_conn=None
+) -> dict | None:
     """Read three server-aggregated sections from one exported snapshot."""
 
-    pool = _pool()
-    with pool.connection(timeout=_USAGE_REPORT_POOL_TIMEOUT_SECONDS) as conn:
-        locked = False
-        try:
-            if not conn.autocommit:
-                conn.autocommit = True
-            locked = bool(
-                conn.execute(
-                    "SELECT pg_try_advisory_lock(%s)",
-                    (_USAGE_REPORT_ADVISORY_KEY,),
-                ).fetchone()[0]
+    if exporter_conn is None:
+        with _usage_report_admission() as admitted_conn:
+            return _usage_report_snapshot_hybrid_parallel(
+                query, exporter_conn=admitted_conn
             )
-            if not locked:
-                raise _UsageReportAdmissionBusy("usage RDS admission busy")
-            with conn.transaction():
-                with conn.cursor(row_factory=dict_row) as cur:
-                    cur.execute(
-                        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
-                    )
-                    cur.execute(
-                        "SELECT set_config('statement_timeout',%s,true)",
-                        (str(_USAGE_REPORT_STATEMENT_TIMEOUT_MS),),
-                    )
-                    cur.execute(
-                        "SELECT * FROM v2_usage_rollup_watermarks "
-                        "WHERE rollup_name='hosted_v2_usage'"
-                    )
-                    state = cur.fetchone()
-                    if state is None or not state["bootstrap_complete"]:
-                        return None
-                    partition = usage_reporting.rollup_partition(
-                        query,
-                        dirty_from_day=state["dirty_from_day"],
-                        dirty_through_day=state["dirty_through_day"],
-                    )
-                    if partition is None:
-                        return None
-                    cur.execute("SELECT pg_export_snapshot()")
-                    snapshot_id = str(cur.fetchone()["pg_export_snapshot"])
-                    _usage_snapshot_observer("exported", snapshot_id=snapshot_id)
-                    with ThreadPoolExecutor(
-                        max_workers=2, thread_name_prefix="usage-report"
-                    ) as executor:
-                        dimension_future = executor.submit(
-                            _usage_import_snapshot,
-                            snapshot_id,
-                            _usage_parallel_dimension_rows,
-                            query,
-                            partition,
-                        )
-                        latency_future = executor.submit(
-                            _usage_import_snapshot,
-                            snapshot_id,
-                            _usage_parallel_latency_bundle,
-                            query,
-                            partition,
-                        )
-                        core = _usage_parallel_core_rows(cur, query, partition)
-                        cohort = _usage_cohort_on_cursor(cur, query)
-                        try:
-                            dimensions = dimension_future.result(
-                                timeout=_USAGE_REPORT_STATEMENT_TIMEOUT_MS / 1000 + 1
-                            )
-                        except Exception:
-                            dimension_future.cancel()
-                            log.exception(
-                                "usage dimension importer unavailable; trying serial"
-                            )
-                            try:
-                                with conn.transaction():
-                                    dimensions = _usage_parallel_dimension_rows(
-                                        cur, query, partition
-                                    )
-                            except Exception:
-                                log.exception(
-                                    "usage dimension serial fallback unavailable"
-                                )
-                                dimensions = None
-                        try:
-                            latency_bundle = latency_future.result(
-                                timeout=_USAGE_REPORT_STATEMENT_TIMEOUT_MS / 1000 + 1
-                            )
-                        except Exception:
-                            latency_future.cancel()
-                            log.exception(
-                                "usage latency/filter importer unavailable; trying serial"
-                            )
-                            try:
-                                with conn.transaction():
-                                    latency_bundle = _usage_parallel_latency_bundle(
-                                        cur, query, partition
-                                    )
-                            except Exception:
-                                log.exception(
-                                    "usage latency/filter serial fallback unavailable"
-                                )
-                                latency_bundle = None
-                    return _usage_payload_from_parallel_rows(
-                        query,
-                        cohort,
-                        core,
-                        dimensions,
-                        latency_bundle,
-                        state,
-                        partition,
-                    )
-        finally:
-            if locked:
+    conn = exporter_conn
+    with conn.transaction():
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+            )
+            cur.execute(
+                "SELECT set_config('statement_timeout',%s,true)",
+                (str(_USAGE_REPORT_STATEMENT_TIMEOUT_MS),),
+            )
+            cur.execute(
+                "SELECT * FROM v2_usage_rollup_watermarks "
+                "WHERE rollup_name='hosted_v2_usage'"
+            )
+            state = cur.fetchone()
+            if state is None or not state["bootstrap_complete"]:
+                return None
+            partition = usage_reporting.rollup_partition(
+                query,
+                dirty_from_day=state["dirty_from_day"],
+                dirty_through_day=state["dirty_through_day"],
+            )
+            if partition is None:
+                return None
+            cur.execute("SELECT pg_export_snapshot()")
+            snapshot_id = str(cur.fetchone()["pg_export_snapshot"])
+            _usage_snapshot_observer("exported", snapshot_id=snapshot_id)
+            with ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="usage-report"
+            ) as executor:
+                dimension_future = executor.submit(
+                    _usage_import_snapshot,
+                    snapshot_id,
+                    _usage_parallel_dimension_rows,
+                    query,
+                    partition,
+                )
+                latency_future = executor.submit(
+                    _usage_import_snapshot,
+                    snapshot_id,
+                    _usage_parallel_latency_bundle,
+                    query,
+                    partition,
+                )
+                core = _usage_parallel_core_rows(cur, query, partition)
+                cohort = _usage_cohort_on_cursor(cur, query)
                 try:
-                    unlocked = bool(
-                        conn.execute(
-                            "SELECT pg_advisory_unlock(%s)",
-                            (_USAGE_REPORT_ADVISORY_KEY,),
-                        ).fetchone()[0]
+                    dimensions = dimension_future.result(
+                        timeout=_USAGE_REPORT_STATEMENT_TIMEOUT_MS / 1000 + 1
                     )
-                    if not unlocked:
-                        conn.close()
                 except Exception:
-                    # Session locks must never leak to the next pool borrower.
-                    conn.close()
+                    dimension_future.cancel()
+                    log.exception(
+                        "usage dimension importer unavailable; trying serial"
+                    )
+                    try:
+                        with conn.transaction():
+                            dimensions = _usage_parallel_dimension_rows(
+                                cur, query, partition
+                            )
+                    except Exception:
+                        log.exception(
+                            "usage dimension serial fallback unavailable"
+                        )
+                        dimensions = None
+                try:
+                    latency_bundle = latency_future.result(
+                        timeout=_USAGE_REPORT_STATEMENT_TIMEOUT_MS / 1000 + 1
+                    )
+                except Exception:
+                    latency_future.cancel()
+                    log.exception(
+                        "usage latency/filter importer unavailable; trying serial"
+                    )
+                    try:
+                        with conn.transaction():
+                            latency_bundle = _usage_parallel_latency_bundle(
+                                cur, query, partition
+                            )
+                    except Exception:
+                        log.exception(
+                            "usage latency/filter serial fallback unavailable"
+                        )
+                        latency_bundle = None
+            return _usage_payload_from_parallel_rows(
+                query,
+                cohort,
+                core,
+                dimensions,
+                latency_bundle,
+                state,
+                partition,
+            )
 
 
 def usage_report_snapshot(query) -> dict:
     """Select the exact rollup/raw report path without changing its payload."""
 
-    if query.timezone == "Asia/Shanghai":
-        admitted = _USAGE_REPORT_GATE.acquire(blocking=False)
-        if not admitted:
-            raise _UsageReportAdmissionBusy("usage process admission busy")
+    with _usage_report_admission() as exporter_conn:
         try:
-            try:
-                report = _usage_report_snapshot_hybrid_parallel(query)
-                if report is None:
-                    report = _usage_report_snapshot_raw(query)
-                    report["coverage"]["rollup"] = _usage_raw_freshness()
-                return report
-            except _UsageReportAdmissionBusy:
-                raise
-            except Exception:
-                log.exception(
-                    "usage rollup report unavailable"
+            report = None
+            if query.timezone == "Asia/Shanghai":
+                report = _usage_report_snapshot_hybrid_parallel(
+                    query, exporter_conn=exporter_conn
                 )
-                raise
-        finally:
-            _USAGE_REPORT_GATE.release()
-    report = _usage_report_snapshot_raw(query)
-    report["coverage"]["rollup"] = _usage_raw_freshness()
-    return report
+            if report is None:
+                report = _usage_report_snapshot_raw(
+                    query, exporter_conn=exporter_conn
+                )
+                report["coverage"]["rollup"] = _usage_raw_freshness()
+            return report
+        except _UsageReportAdmissionBusy:
+            raise
+        except Exception:
+            log.exception("usage report unavailable")
+            raise
 
 
 def _usage_raw_freshness() -> dict:
