@@ -346,6 +346,43 @@ def test_shutdown_waits_for_a_gated_factory_failure_before_succeeding():
     assert recorder.shutdown(timeout=0.1) is True
 
 
+def test_shutdown_cancels_a_factory_returned_worker_before_thread_start():
+    """A stop fence between factory return and start must prevent daemon launch."""
+    entered_factory = threading.Event()
+    release_factory = threading.Event()
+    starts = []
+
+    class _Worker:
+        def start(self):
+            starts.append(True)
+
+        def join(self, _timeout=None):
+            return None
+
+        def is_alive(self):
+            return False
+
+    def thread_factory(**_kwargs):
+        entered_factory.set()
+        release_factory.wait()
+        return _Worker()
+
+    recorder = ProviderAttemptRecorder(thread_factory=thread_factory)
+    result = []
+    starter = threading.Thread(target=lambda: result.append(recorder.start()))
+    starter.start()
+    assert entered_factory.wait(0.5)
+
+    try:
+        assert recorder.shutdown(timeout=0.01) is False
+    finally:
+        release_factory.set()
+        starter.join(0.5)
+    assert result == [False]
+    assert starts == []
+    assert recorder.shutdown(timeout=0.1) is True
+
+
 def test_full_queue_drops_event_without_raising_or_growing_memory():
     """A full bounded queue drops telemetry instead of delaying a provider call."""
     recorder = ProviderAttemptRecorder(

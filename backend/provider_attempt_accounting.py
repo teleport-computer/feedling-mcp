@@ -463,7 +463,7 @@ class ProviderAttemptRecorder:
         self._sleeper = sleeper or time.sleep
         self._stop = threading.Event()
         self._lifecycle = threading.Condition()
-        self._starting = False
+        self._start_phase = "idle"
         self._thread: Any | None = None
         self._dropped_count = 0
         self._last_diagnostic = 0.0
@@ -502,7 +502,7 @@ class ProviderAttemptRecorder:
         try:
             deadline = time.monotonic() + max(0.0, float(timeout))
             with self._lifecycle:
-                while self._starting:
+                while self._start_phase != "idle":
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return False
@@ -526,26 +526,39 @@ class ProviderAttemptRecorder:
                     return True
             except Exception:  # noqa: BLE001
                 pass
-            if self._starting:
+            if self._start_phase != "idle":
                 return False
-            self._starting = True
+            self._start_phase = "factory"
         try:
             worker = self._thread_factory(
                 target=self._run,
                 name="provider-attempt-recorder",
                 daemon=True,
             )
+        except Exception:  # noqa: BLE001 - daemon startup is non-essential telemetry
+            with self._lifecycle:
+                self._start_phase = "idle"
+                self._lifecycle.notify_all()
+            self._drop("worker_start_failure")
+            return False
+        with self._lifecycle:
+            if self._stop.is_set():
+                self._start_phase = "idle"
+                self._lifecycle.notify_all()
+                return False
+            self._start_phase = "thread_start"
+        try:
             worker.start()
         except Exception:  # noqa: BLE001 - daemon startup is non-essential telemetry
             with self._lifecycle:
-                self._starting = False
+                self._start_phase = "idle"
                 self._lifecycle.notify_all()
             self._drop("worker_start_failure")
             return False
         with self._lifecycle:
             self._thread = worker
             stopped = self._stop.is_set()
-            self._starting = False
+            self._start_phase = "idle"
             self._lifecycle.notify_all()
             return not stopped
 

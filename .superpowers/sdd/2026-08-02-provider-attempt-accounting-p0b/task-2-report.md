@@ -76,3 +76,16 @@
 - Added gated thread-start and factory-failure race regressions, plus repeated
   start/shutdown coverage proving one live worker at most and no post-stop
   restart.
+
+## Fix round 3 — factory/start commit fence
+
+- Split the in-flight lifecycle state into `factory` and `thread_start` phases.
+  After a factory returns, `start()` re-enters the lifecycle condition and
+  checks the stop fence before committing `worker.start()`.
+- A shutdown that arrives during factory construction now cancels the
+  uncommitted worker: it may time out with `False` while the factory is gated,
+  but releasing that factory never launches a daemon.  The already committed,
+  start-gated path retains the round-2 bounded/accurate shutdown behavior.
+- RED: the new gated-factory regression observed `worker.start()` after the
+  shutdown fence on the prior commit.  GREEN: both factory-gated and
+  start-gated regressions pass.
