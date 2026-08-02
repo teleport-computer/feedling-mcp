@@ -634,10 +634,10 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "description": (
             "Memory Garden banner status. Dream counts describe the latest "
-            "completed Dream. Capture fields describe cards added on the "
-            "device-local calendar day containing capture_completed_at; clients "
-            "decide whether that timestamp is still today. Legal zero-card "
-            "Capture runs do not reset or refresh the fields."
+            "completed Dream. Capture fields expose a monotonic total of cards "
+            "added by Capture; clients subtract the total saved when the user "
+            "last dismissed the banner. Legal zero-card Capture runs do not "
+            "reset or refresh the fields."
         ),
         "required": [
             "dreaming",
@@ -664,8 +664,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "type": "integer",
                 "minimum": 0,
                 "description": (
-                    "Cards actually added on the timestamp's device-local "
-                    "calendar day, accumulated across Capture runs."
+                    "Monotonic total of cards actually added across Capture runs."
                 ),
             },
         },
@@ -2148,7 +2147,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
     ("get", "/v1/dream/status"): {
         "200": {
-            "description": "Current Dream and daily Capture banner status.",
+            "description": "Current Dream and Capture banner status.",
             "content": {
                 "application/json": {
                     "schema": {"$ref": "#/components/schemas/DreamStatusResponse"}

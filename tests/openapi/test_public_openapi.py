@@ -457,7 +457,7 @@ def test_memory_actions_response_exposes_independent_item_outcomes(
     assert {"status", "http_status"} <= set(result_schema["required"])
 
 
-def test_dream_status_documents_daily_capture_banner_fields(
+def test_dream_status_documents_monotonic_capture_banner_fields(
     public_schema: dict[str, Any],
     operations: dict[tuple[str, str], dict[str, Any]],
 ) -> None:
@@ -473,10 +473,7 @@ def test_dream_status_documents_daily_capture_banner_fields(
     assert schema["properties"]["capture_cards_added"] == {
         "type": "integer",
         "minimum": 0,
-        "description": (
-            "Cards actually added on the timestamp's device-local calendar "
-            "day, accumulated across Capture runs."
-        ),
+        "description": "Monotonic total of cards actually added across Capture runs.",
     }
 
 

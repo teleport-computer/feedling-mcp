@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from datetime import datetime
+from datetime import datetime, timezone
 import sys
 import threading
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import pytest
 from psycopg.types.json import Jsonb
@@ -167,14 +166,12 @@ def test_capture_commit_is_atomic_strips_plaintext_and_keeps_canonical_logs():
     assert {"memory_changes", "bootstrap_events"}.issubset(streams)
 
 
-def test_v2_capture_banner_accumulates_resets_and_ignores_noop(monkeypatch):
+def test_v2_capture_banner_accumulates_across_midnight_and_ignores_noop(monkeypatch):
     uid = "u_capture_daily_v2"
     _seed(uid)
     db.set_blob(uid, "proactive_settings", {
         "capture_enabled": True,
-        "timezone": "Asia/Shanghai",
     })
-    zone = ZoneInfo("Asia/Shanghai")
 
     def commit(*, after: int, through: int, memory_id: str | None, now: float):
         monkeypatch.setattr(jobs_store.time, "time", lambda: now)
@@ -195,10 +192,10 @@ def test_v2_capture_banner_accumulates_resets_and_ignores_noop(monkeypatch):
             batch_id=batch["id"],
         )
 
-    first_at = datetime(2026, 8, 1, 10, tzinfo=zone).timestamp()
-    second_at = datetime(2026, 8, 1, 22, tzinfo=zone).timestamp()
-    noop_at = datetime(2026, 8, 2, 8, tzinfo=zone).timestamp()
-    next_positive_at = datetime(2026, 8, 2, 9, tzinfo=zone).timestamp()
+    first_at = datetime(2026, 8, 1, 10, tzinfo=timezone.utc).timestamp()
+    second_at = datetime(2026, 8, 1, 22, tzinfo=timezone.utc).timestamp()
+    noop_at = datetime(2026, 8, 2, 8, tzinfo=timezone.utc).timestamp()
+    next_positive_at = datetime(2026, 8, 2, 9, tzinfo=timezone.utc).timestamp()
 
     assert commit(after=0, through=1, memory_id="mom-daily-1", now=first_at)[
         "cards_added"
@@ -225,7 +222,7 @@ def test_v2_capture_banner_accumulates_resets_and_ignores_noop(monkeypatch):
         now=next_positive_at,
     )["cards_added"] == 1
     state = db.get_blob_strict(uid, "capture_state")
-    assert state["last_capture_cards_added"] == 1
+    assert state["last_capture_cards_added"] == 3
     assert state["last_capture_cards_added_at"] == next_positive_at
 
 

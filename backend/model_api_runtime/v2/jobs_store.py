@@ -2112,7 +2112,6 @@ def commit_capture_batch(
     batch_id,
 ) -> dict:
     """Atomically apply every memory effect, advance seq, and finish the job."""
-    device_timezone = capture_daily.device_timezone_name(str(user_id))
     affected_ids: set[str] = set()
     persisted_state: dict | None = None
     mirrored_logs: list[tuple[int, str, dict, str]] = []
@@ -2425,17 +2424,6 @@ def commit_capture_batch(
                                 )
                             )
 
-                        cur.execute(
-                            "SELECT doc FROM user_blobs WHERE user_id=%s "
-                            "AND kind='proactive_settings'",
-                            (str(user_id),),
-                        )
-                        settings_row = cur.fetchone()
-                        settings = (
-                            dict(settings_row["doc"] or {})
-                            if settings_row is not None
-                            else {}
-                        )
                         state.update(
                             {
                                 "last_captured_until_message_id": str(
@@ -2455,8 +2443,6 @@ def commit_capture_batch(
                             state,
                             cards_added=cards_added,
                             completed_at=now_ts,
-                            timezone_name=settings.get("timezone") or "UTC",
-                            device_timezone=device_timezone,
                         ))
                         cur.execute(
                             "UPDATE user_blobs SET doc=%s "

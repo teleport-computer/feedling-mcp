@@ -33,12 +33,12 @@ change must not be interpreted as an API guarantee.
   enclave-attestation bundles before claiming pinning-equivalent security;
   WebPKI alone is insufficient.
 
-- **Memory Garden status now reports today's captured-card total.**
+- **Memory Garden status now reports a monotonic captured-card total.**
   `GET /v1/dream/status` adds `capture_cards_added` and
-  `capture_completed_at`. Resident and Runtime V2 Capture runs accumulate only
-  cards actually added on the device-local calendar day, start a fresh total
-  on the first positive Capture of the next day, and leave the banner fields
-  unchanged after a zero-card run.
+  `capture_completed_at`. Resident and Runtime V2 Capture runs add only cards
+  actually inserted, never reset the total at a calendar boundary, and leave
+  the banner fields unchanged after a zero-card run. Clients derive the
+  unconfirmed count from the total saved when the user last dismissed it.
 
 - **Background agent turns can no longer rewrite the identity card.** Runtime
   V2 now visibly refuses `identity_patch` and `identity_nudge` during proactive
