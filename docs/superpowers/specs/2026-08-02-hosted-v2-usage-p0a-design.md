@@ -144,6 +144,61 @@ tokens/call、latency p50/p95、failure/retry rate 和 usage/cache coverage。re
 如果无法达到，P0-A 必须在同一 PR 内增加可从 `v2_turn_metrics` 全量重建的
 daily rollup，不得以上线后再说作为验收。
 
+### 10x 实测后的 rollup 决策
+
+直接查询在 30 万总行、90 天 74,019 行时，5 次 warmed 完整报表 p95 为
+2.411 秒；300 万总行、90 天约 74 万行时单个完整请求超过 90 秒。把 raw
+查询合成一个 materialized CTE 在 30 万行仅降到约 1.22 秒，不能线性满足
+300 万行门槛。因此 P0-A 启用上述条件分支，在当前业务 RDS 增加可重建
+daily rollup；这不是新增数据库实例或服务。
+
+rollup 使用两张都保留 `user_id` 的 canonical 表，不保存跨用户、无法随账号
+删除级联的 fleet 副本：
+
+- `v2_usage_daily_users`：每个 Asia/Shanghai local day / user 一行，保存
+  overview、daily、per-user 和 user-day distribution 所需的 all / metered /
+  unknown 三套重叠子计数、token sum 与 known-count。
+- `v2_usage_daily_dimensions`：每个 local day / user / lane / provider / model
+  一行，保存 provider/model、lane、primary identity、filter option 与精确
+  provider/model latency 所需的子计数和 `latency_samples`。
+- `v2_usage_rollup_watermarks`：bootstrap、source update cursor、refreshed-at
+  和错误/lag 元数据。两个 fact 表的已知 `user_id` 都使用 nullable FK
+  `ON DELETE CASCADE`；NULL user 通过 `UNIQUE NULLS NOT DISTINCT` 保持一条
+  canonical row。
+
+`metered` 与 `unknown` 不是互斥桶。partial turn 可同时满足
+`usage_reported_calls > 0` 和 `usage_reported_calls < model_calls`，因此每个
+rollup row 在列内分别保存 all / metered / unknown 子聚合，不通过互斥枚举
+拆行。NULL token/cache 继续用 `known_count + sum` 区分完全缺报、部分已知与
+真正的零；cache 不加入 total。latency 仅为 spec 要求的 provider/model
+p50/p95保存精确 integer samples，不用 daily percentile 加权或近似摘要。
+
+rollup 不修改 `record_whole_turn_metric()` 热路径。现有 Runtime V2 worker 在
+独立、限额、fail-open 的后台 tick 中按 local day 执行同事务
+`DELETE + recompute + INSERT`，成功后才 CAS 推进 watermark。bootstrap 不完整
+时 Admin 全量 raw fallback；完成后首尾 partial day、未 ready day 和 cursor 后
+发现的 dirty day 整日 raw fallback。其他展示时区始终走精确 raw 路径。
+刷新失败、连接不足、锁竞争和超时只造成 lag/raw fallback/unavailable，并显示
+freshness/coverage，不影响 provider、reply、retry、heartbeat 或其他 worker。
+
+异步 cursor 在任意长事务并发下只能提供 bounded eventual consistency，不能在
+完全不触碰写入热路径的同时形式化保证实时 exact。worker 使用 overlap 重扫并在
+页面显示 processed cursor、refreshed-at 与 lag；稳定 fixture、bootstrap 完成且
+无 dirty day 时必须与 raw 严格对账。账号删除由 user-grain FK 立即移除可归因
+rollup，不等待异步刷新。
+
+为使完整默认报表达标，各 breakdown 在同一个 PostgreSQL exported snapshot 下
+并行读取：总共最多 3 条 `REPEATABLE READ, READ ONLY` 连接，exporter 自身执行
+user/day core，两条 importer 在读取前导入同一 snapshot，分别执行 dimension
+breakdowns 和精确 latency。必须有进程内单飞与 RDS advisory admission、短连接
+获取超时、每 statement deadline、cancel/rollback；拿不到容量时串行 raw/rollup
+fallback 或只把 Usage 对应区块标 unavailable，绝不占满业务连接池。
+
+300 万行原型中，同一 exported snapshot 的三连接完整等价报表 5 次 warmed
+p95 为 1.473 秒（core 约 0.77 秒、dimension 约 1.47 秒、exact latency 约
+0.35 秒），满足默认 Asia/Shanghai 90 天 p95 小于 2 秒的门槛。生产实现必须用
+同一 harness 重新验证，原型结果不能替代最终代码验收。
+
 ## 失败、隐私与删除
 
 Usage 查询是 Admin 独立失败域；某一 breakdown 失败时只将对应区块显示

@@ -83,3 +83,48 @@
 - [ ] Run the repository's full non-API test command with `FEEDLING_TEST_PG`; compare any failures with untouched `test` and link baseline evidence in the PR rather than hiding failures.
 - [ ] Inspect `git diff test...HEAD`, verify no public API/OpenAPI change and no infrastructure/config dependency, then commit the exact changed test paths with message `test(admin): verify usage report scale`.
 - [ ] Push `feat/admin-runtime-user-report`, update PR #146 description with screenshots/query evidence, and wait for required checks before beginning its stacked child branch.
+
+### Task 4A: Add deletion-safe current-RDS rollup schema
+
+**Files:**
+- Create: the next linear migration under `backend/alembic/versions/` for `v2_usage_daily_users`, `v2_usage_daily_dimensions`, `v2_usage_rollup_watermarks`, and the `(updated_at, id)` source cursor index
+- Modify: `backend/db.py`
+- Modify: `tests/test_v2_jobs_migration.py`
+- Modify: `tests/test_account_reset_purges_all_tables.py`
+- Modify: `tests/test_admin_usage.py`
+
+- [ ] Write RED migration and lifecycle tests for nullable user FK cascade, `UNIQUE NULLS NOT DISTINCT`, all/metered/unknown overlapping subaggregates, token/cache known counts, exact provider/model latency samples, watermarks, cursor index, and redundant account-reset cleanup.
+- [ ] Implement schema only; Alembic must not perform a multi-million-row backfill transaction. No fleet table without user attribution, trigger, new database, broker, cache, service, or deployment unit.
+- [ ] Run migration/account deletion tests and commit exact files.
+
+### Task 4B: Rebuild rollups from the authoritative source off the hot path
+
+**Files:**
+- Create: `backend/model_api_runtime/v2/usage_rollup.py`
+- Modify: `backend/model_api_runtime/v2/serve_worker.py`
+- Create: `tests/test_v2_usage_rollup.py`
+
+- [ ] Write RED real-PostgreSQL tests for one-day recompute equivalence, overlapping completeness, NULL/known-count semantics, idempotent `DELETE + INSERT`, bootstrap, late update/dirty day discovery, advisory-lock competition, cursor CAS, crash rollback, bounded batches, and user deletion.
+- [ ] Implement a bounded existing-worker maintenance tick. It never runs from `record_whole_turn_metric()` and catches pool, lock, SQL, timeout, and shutdown failures so provider/reply/retry/heartbeat behavior cannot change.
+- [ ] Keep bootstrap/refresh transactions short, use overlap for late commits, expose freshness/lag, and leave old complete rows readable until a day replacement commits.
+- [ ] Run worker/failure-injection tests and commit exact files.
+
+### Task 4C: Read rollup and raw edges from one exported snapshot
+
+**Files:**
+- Modify: `backend/model_api_runtime/v2/jobs_store.py`
+- Modify: `backend/model_api_runtime/v2/usage_reporting.py`
+- Modify: `backend/admin/data_track.py`
+- Modify: `tests/test_admin_usage.py`
+
+- [ ] Write RED tests that compare rollup-backed and raw payloads exactly for all metrics, filters, partial-day edges, dirty/unready days, deletion, and unknowns; other timezones and incomplete bootstrap must fall back raw.
+- [ ] Add real-PostgreSQL exported-snapshot concurrency tests: total three RR/RO connections, importer snapshot before any read, same MVCC result during a concurrent writer, process/RDS single-flight admission, short pool acquisition, statement timeout, cancel/rollback, serial fallback, and per-breakdown unavailable behavior.
+- [ ] Implement Asia/Shanghai full-day rollup + disjoint raw edges/dirty days. Display rollup freshness/lag and never render stale/failed data as zero.
+- [ ] Run report/Admin/Runtime regression tests and commit exact files.
+
+### Task 4D: Repeat the final 3M gate and finish PR #146
+
+- [ ] Run the checked-in scale harness against the production implementation, not prototype TEMP/UNLOGGED tables. Record source/rollup rows and size, all five warmed default and provider/model-filtered timings, p50/p95, exact latency cost, and key EXPLAIN nodes/buffers.
+- [ ] Require default and filtered 90-day p95 below two seconds. If either fails, do not push or claim P0-A complete.
+- [ ] Run the complete P0-A related suites, full repository non-API suite, Ruff/compile/diff checks, dependency direction tests, and compare baseline failures.
+- [ ] Verify test/prod RDS PostgreSQL compatibility read-only, inspect `test...HEAD` for public API/docs/infrastructure scope, then push and update PR #146 with architecture, fail-open, deletion, freshness, performance, and test evidence.
