@@ -23,6 +23,38 @@ from chat import service as chat_service
 from core.store import UserStore
 
 
+def web_policy(store: UserStore, *, settings_reader=None) -> dict:
+    """The user's *effective* web-tool state, for the consumer's advertised-verb
+    display (batch 5). This is the SAME ``effective`` the settings page reports —
+    ``web.settings_core.get_settings`` already folds together the user's saved
+    preference, the operator kill switch, and whether the runtime advertises the
+    web capability, so this must never recompute any of that: it only projects
+    the fields the consumer needs.
+
+    The advertised-verb layer is a UX nicety (don't tempt the model with a verb
+    that's currently off); the real block stays server-side in
+    ``web/execution_core`` (fail-closed). So a read failure here degrades to
+    "off" rather than 500-ing the poll — under-advertising is the safe miss.
+
+    ``settings_reader`` is injectable for unit tests; the default is the
+    DB-backed ``get_settings`` (lazy import — chat poll must not own the web
+    package's startup, same idiom as ``proactive``/``hosted`` below)."""
+    if settings_reader is None:
+        from web import settings_core as web_settings_core  # lazy upward, see docstring
+
+        settings_reader = web_settings_core.get_settings
+    try:
+        settings = settings_reader(store)
+    except Exception:  # noqa: BLE001 — advertised-verb display must never 500 the poll
+        return {"effective": False, "search": False, "fetch": False}
+    tools = settings.get("tools") or {}
+    return {
+        "effective": bool(settings.get("effective")),
+        "search": bool((tools.get("web_search") or {}).get("available")),
+        "fetch": bool((tools.get("web_fetch") or {}).get("available")),
+    }
+
+
 def poll_context(store: UserStore, consumer_info: dict | None = None) -> dict:
     """The runtime/release fields advertised on every poll response.
 
@@ -37,6 +69,9 @@ def poll_context(store: UserStore, consumer_info: dict | None = None) -> dict:
         "runtime_v2": resident_runtime_v2.resident_runtime_v2_public_profile(store),
         "client_release": {"expected_consumer_commit": chat_consumer.expected_consumer_commit()},
         "user_mcp": {"fingerprint": mcp_core.fingerprint_for_store(store)},
+        # The effective web-tool state, so the consumer advertises web-search/
+        # web-fetch to the model only while they are actually on (batch 5).
+        "web_policy": web_policy(store),
         # A control-plane side channel for a resident-only visual probe. It is
         # deliberately not a chat row: no history, push, capture, summary, or
         # Live Activity can observe it. The expected answer never leaves the
@@ -154,6 +189,7 @@ def build_response(
         "client_release": context["client_release"],
         "user_mcp": context["user_mcp"],
         "vision_probe": context.get("vision_probe"),
+        "web_policy": context.get("web_policy"),
         "timed_out": timed_out,
         "consumer_id": consumer_id,
         "claimed": claim,

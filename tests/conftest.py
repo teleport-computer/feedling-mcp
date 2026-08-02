@@ -178,6 +178,9 @@ if not _provisioned:
         "test_consumer_action_admission.py",
         "test_consumer_capability_inject.py",
         "test_consumer_web_capability.py",
+        # Batch 5: web verbs advertised only while the poll's web policy is on.
+        # Pure — exercises the consumer's decision helpers with no DB/network.
+        "test_consumer_web_advertise.py",
         "test_identity_redistill_ipc.py",
         "test_redistill_server_merge.py",
         "test_update_stall_reason.py",

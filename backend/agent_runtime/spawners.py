@@ -159,17 +159,40 @@ _AGENT_PROMPT_FALLBACK_COMMANDS = (
     "python {io_cli} web-fetch <url>"
 )
 
-# Module-level memo of the live catalog text, keyed by io_cli path (in practice
-# always _IO_CLI). A ``None``/failed build is NEVER cached — same rule as VPS's
+# The V1 web verbs. When the user's web toggle is OFF (or operator-halted, or
+# unsupported — all folded into the ``web_visible`` flag by the caller) these are
+# dropped from the ADVERTISED catalog so the model isn't tempted to call a verb
+# that would just 403 at the server-side execution gate. This is display only:
+# the static Bash allow-rule (``_IO_CLI_VERBS`` above) stays put — a mid-session
+# toggle needs no respawn — and the real authorization boundary is re-checked
+# server-side on every call (web/execution_core, fail closed).
+_WEB_ADVERTISED_VERBS = ("web-search", "web-fetch")
+
+# Module-level memo of the live catalog text, keyed by (io_cli path, web_visible).
+# ``web_visible`` MUST be part of the key: the same process renders the catalog
+# for many users, and a user with web OFF filters the web verbs out — caching that
+# filtered text under the path alone would then serve it to the NEXT user whose
+# web is ON (and vice-versa), leaking one user's toggle onto everyone (Codex
+# batch-5 review). A ``None``/failed build is NEVER cached — same rule as VPS's
 # ``_io_cli_catalog_cache`` (tools/chat_resident_consumer.py) — so a transient
 # failure (e.g. io_cli.py mid-deploy write) retries on the next spawn instead of
 # permanently sticking every subsequent user on the fallback text for this
 # process's lifetime. Without this memo, every agent_home_files() call (one per
 # user spawn) would shell out ~20 subprocesses (one --help per catalog verb).
-_hosted_io_cli_catalog_cache: dict[str, str] = {}
+_hosted_io_cli_catalog_cache: dict[tuple[str, bool], str] = {}
 
 
-def _hosted_io_cli_catalog_text(io_cli: str = _IO_CLI) -> str:
+def _drop_web_from_fallback(fallback: str, io_cli: str) -> str:
+    """Strip the web-search/web-fetch lines from the static fallback command
+    list when web is not visible for this user (mirrors the live-catalog filter
+    below so the fallback path advertises the same surface)."""
+    prefixes = tuple(f"python {io_cli} {verb}" for verb in _WEB_ADVERTISED_VERBS)
+    return "\n".join(
+        line for line in fallback.split("\n") if not line.startswith(prefixes)
+    )
+
+
+def _hosted_io_cli_catalog_text(io_cli: str = _IO_CLI, *, web_visible: bool = True) -> str:
     """Render the io_cli command catalog for the hosted prompt.
 
     Unlike VPS's ``_prepend_io_cli_capability_catalog`` (which prepends
@@ -191,11 +214,14 @@ def _hosted_io_cli_catalog_text(io_cli: str = _IO_CLI) -> str:
     filtering — has nothing left to teach, so a catalog hiccup never ships an
     empty tools section.
     """
-    cached = _hosted_io_cli_catalog_cache.get(io_cli)
+    cache_key = (io_cli, web_visible)
+    cached = _hosted_io_cli_catalog_cache.get(cache_key)
     if cached is not None:
         return cached
 
     fallback = _AGENT_PROMPT_FALLBACK_COMMANDS.format(io_cli=io_cli)
+    if not web_visible:
+        fallback = _drop_web_from_fallback(fallback, io_cli)
     raw = None
     try:
         tools_dir = str(_REPO_ROOT / "tools")
@@ -214,12 +240,16 @@ def _hosted_io_cli_catalog_text(io_cli: str = _IO_CLI) -> str:
     lines = raw.split("\n")
     header, body = lines[:2], lines[2:]  # header = build_catalog's D8/D3 guidance lines
     allowed = set(_IO_CLI_VERBS)
+    if not web_visible:
+        # Advertised-only filter: the verb stays in _IO_CLI_VERBS (Bash allow-rule
+        # untouched), it just isn't shown to the model while web is off.
+        allowed = allowed - set(_WEB_ADVERTISED_VERBS)
     commands = [f"python {io_cli} {line}" for line in body if line.split(" ", 1)[0] in allowed]
     if not commands:
         return fallback
 
     text = "\n".join(header + commands)
-    _hosted_io_cli_catalog_cache[io_cli] = text
+    _hosted_io_cli_catalog_cache[cache_key] = text
     return text
 
 
@@ -765,6 +795,7 @@ def agent_home_files(
     provider: str = "",
     identity_model: str = "",
     reasoning_effort: str = "",
+    web_visible: bool = True,
 ) -> dict[str, str]:
     """Per-user files seeded into the agent home before spawn (pure: path→content).
 
@@ -799,7 +830,8 @@ def agent_home_files(
     # fill it with the LIVE catalog (falls back to the static list internally on
     # any build failure — see _hosted_io_cli_catalog_text).
     system_append = _AGENT_PROMPT_TEXT.replace("<io_cli>", io_cli).replace(
-        _IO_CLI_CATALOG_PLACEHOLDER, _hosted_io_cli_catalog_text(io_cli)
+        _IO_CLI_CATALOG_PLACEHOLDER,
+        _hosted_io_cli_catalog_text(io_cli, web_visible=web_visible),
     ).replace(_OUTBOUND_FILE_DIR_PLACEHOLDER, f"{home}/outbound-files")
     persona = (persona_content or "").strip()
     if persona:
@@ -870,6 +902,7 @@ def materialize_home(
     provider: str = "",
     identity_model: str = "",
     reasoning_effort: str = "",
+    web_visible: bool = True,
 ) -> None:
     """Write the per-user home files for a spawn AND prune stale ones a persistent
     home may carry (see ``stale_home_files``). Idempotent — safe before every
@@ -882,7 +915,7 @@ def materialize_home(
     files = agent_home_files(
         home, driver=driver, io_cli=io_cli, model=model, persona_content=persona_content,
         base_url=base_url, provider=provider, identity_model=identity_model,
-        reasoning_effort=reasoning_effort)
+        reasoning_effort=reasoning_effort, web_visible=web_visible)
     for path, content in files.items():
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -947,6 +980,28 @@ def _genesis_persona_content(user_id: str, api_key: str | None = None,
         return raw.decode("utf-8")
 
     return _persona_from_blob(blob, _decrypt)
+
+
+def _web_visible_for_user(user_id: str) -> bool:
+    """Whether this user's web verbs should be ADVERTISED in the baked prompt at
+    (re)spawn — the effective web-tool state from ``web.settings_core`` (user
+    preference AND not operator-halted AND runtime-supported). Advertised-only:
+    the Bash allow-rule stays regardless, and the server-side execution gate is
+    the real boundary, so a read failure fails toward NOT advertising (the model
+    just doesn't see the verbs — safe under-advertise, never a false promise).
+
+    A mid-session toggle only reaches the baked prompt on the next respawn; the
+    running consumer keeps the allow-rule and the gate enforces live. Local
+    imports keep this module pure-unit importable without DB/web deps (same idiom
+    as ``_genesis_persona_content``)."""
+    try:
+        from core.store import UserStore
+        from web import settings_core as web_settings_core
+
+        return bool(web_settings_core.get_settings(UserStore(user_id)).get("effective"))
+    except Exception as e:  # noqa: BLE001 — advertised-verb display must never block a spawn
+        log.warning("web-visibility read failed for %s (advertising off): %s", user_id, e)
+        return False
 
 
 def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dict:
@@ -1124,7 +1179,7 @@ class ProcessSpawner:
     def spawn(self, entry: dict, user_id: str, home: str) -> int:
         driver = (entry.get("driver") or "claude").strip().lower()
         materialize_home(
-            home, driver=driver,
+            home, driver=driver, web_visible=_web_visible_for_user(user_id),
             model=str(entry.get("model") or ""),
             base_url=str(entry.get("base_url") or ""),
             provider=str(entry.get("provider") or ""),
