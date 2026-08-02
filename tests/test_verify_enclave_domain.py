@@ -298,6 +298,100 @@ def test_https_fetch_applies_connect_and_response_timeouts(monkeypatch):
     assert observed["closed"] is True
 
 
+def test_https_fetch_rejects_headers_after_absolute_response_deadline(monkeypatch):
+    class FakeClock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    class FakeSocket:
+        def settimeout(self, _timeout):
+            pass
+
+    class FakeResponse:
+        status = 200
+
+        def read(self, _amount):
+            return b""
+
+    clock = FakeClock()
+
+    class FakeConnection:
+        sock = FakeSocket()
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def connect(self):
+            pass
+
+        def request(self, *_args, **_kwargs):
+            pass
+
+        def getresponse(self):
+            clock.now = RESPONSE_TIMEOUT_SECONDS + 0.1
+            return FakeResponse()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(verifier, "_monotonic", clock, raising=False)
+    monkeypatch.setattr(verifier.ssl, "create_default_context", object)
+    monkeypatch.setattr(verifier.http.client, "HTTPSConnection", FakeConnection)
+
+    with pytest.raises(EvidenceError, match="absolute response deadline exceeded"):
+        _https_get(f"https://{DOMAIN}/attestation", DOMAIN)
+
+
+def test_https_fetch_rejects_drip_fed_body_after_absolute_deadline(monkeypatch):
+    class FakeClock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    class FakeSocket:
+        def settimeout(self, _timeout):
+            pass
+
+    clock = FakeClock()
+
+    class DripResponse:
+        status = 200
+        chunks = 0
+
+        def read(self, _amount):
+            self.chunks += 1
+            clock.now += 4.0
+            return b"x" if self.chunks <= 3 else b""
+
+    class FakeConnection:
+        sock = FakeSocket()
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def connect(self):
+            pass
+
+        def request(self, *_args, **_kwargs):
+            pass
+
+        def getresponse(self):
+            return DripResponse()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(verifier, "_monotonic", clock, raising=False)
+    monkeypatch.setattr(verifier.ssl, "create_default_context", object)
+    monkeypatch.setattr(verifier.http.client, "HTTPSConnection", FakeConnection)
+
+    with pytest.raises(EvidenceError, match="absolute response deadline exceeded"):
+        _https_get(f"https://{DOMAIN}/attestation", DOMAIN)
+
+
 def test_tls_peer_capture_uses_default_context_and_ten_second_timeouts(monkeypatch):
     observed = {"raw_timeouts": [], "tls_timeouts": []}
 

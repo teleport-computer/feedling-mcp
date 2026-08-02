@@ -14,10 +14,13 @@ import hashlib
 import hmac
 import http.client
 import json
+import queue
 import re
 import socket
 import ssl
 import sys
+import threading
+import time
 from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import quote as urlquote
@@ -41,6 +44,7 @@ _MANIFEST_LINE = re.compile(r"([0-9A-Fa-f]{64})  ([^\r\n]+)")
 _SAFE_EVIDENCE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
 _DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 _HEX_32_BYTES = re.compile(r"[0-9A-Fa-f]{64}")
+_monotonic = time.monotonic
 
 
 class EvidenceError(Exception):
@@ -195,12 +199,29 @@ def _resolve_same_origin_redirect(current_url: str, location: str, domain: str) 
     return urlunsplit(("https", domain, parts.path or "/", parts.query, ""))
 
 
-def _read_bounded_response(response: Any, description: str) -> bytes:
+def _raise_if_response_deadline_expired(
+    deadline: float | None, description: str
+) -> None:
+    if deadline is not None and _monotonic() >= deadline:
+        raise EvidenceError(
+            "absolute response deadline exceeded after "
+            f"{RESPONSE_TIMEOUT_SECONDS} seconds: {description}"
+        )
+
+
+def _read_bounded_response(
+    response: Any,
+    description: str,
+    *,
+    deadline: float | None = None,
+) -> bytes:
     """Read a response body while rejecting the byte immediately over limit."""
     body = bytearray()
     while True:
+        _raise_if_response_deadline_expired(deadline, description)
         remaining_with_overflow_byte = MAX_RESPONSE_BYTES + 1 - len(body)
         chunk = response.read(min(_READ_CHUNK_BYTES, remaining_with_overflow_byte))
+        _raise_if_response_deadline_expired(deadline, description)
         if not chunk:
             return bytes(body)
         body.extend(chunk)
@@ -208,6 +229,58 @@ def _read_bounded_response(response: Any, description: str) -> bytes:
             raise EvidenceError(
                 f"{description} exceeds {MAX_RESPONSE_BYTES} byte limit"
             )
+
+
+def _receive_response(
+    connection: http.client.HTTPSConnection,
+    description: str,
+    deadline: float,
+) -> tuple[int, str | None, bytes | None]:
+    response = connection.getresponse()
+    _raise_if_response_deadline_expired(deadline, description)
+    if response.status in {301, 302, 303, 307, 308}:
+        return response.status, response.getheader("Location"), None
+    if not 200 <= response.status < 300:
+        return response.status, None, None
+    return (
+        response.status,
+        None,
+        _read_bounded_response(response, description, deadline=deadline),
+    )
+
+
+def _receive_response_before_deadline(
+    connection: http.client.HTTPSConnection,
+    description: str,
+    deadline: float,
+) -> tuple[int, str | None, bytes | None]:
+    """Interrupt a header/body drip at one absolute monotonic deadline."""
+    result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def receive() -> None:
+        try:
+            result_queue.put(
+                (True, _receive_response(connection, description, deadline))
+            )
+        except Exception as exc:  # noqa: BLE001 - propagate worker failure verbatim
+            result_queue.put((False, exc))
+
+    worker = threading.Thread(target=receive, daemon=True)
+    worker.start()
+    remaining = deadline - _monotonic()
+    if remaining <= 0:
+        _raise_if_response_deadline_expired(deadline, description)
+    try:
+        succeeded, result = result_queue.get(timeout=remaining)
+    except queue.Empty as exc:
+        raise EvidenceError(
+            "absolute response deadline exceeded after "
+            f"{RESPONSE_TIMEOUT_SECONDS} seconds: {description}"
+        ) from exc
+    _raise_if_response_deadline_expired(deadline, description)
+    if not succeeded:
+        raise result
+    return result
 
 
 def _https_get(url: str, domain: str) -> bytes:
@@ -244,21 +317,26 @@ def _https_get(url: str, domain: str) -> bytes:
                     "Accept": "application/json, text/plain, application/octet-stream"
                 },
             )
-            response = connection.getresponse()
-            if response.status in {301, 302, 303, 307, 308}:
+            deadline = _monotonic() + RESPONSE_TIMEOUT_SECONDS
+            status, location, body = _receive_response_before_deadline(
+                connection, current_url, deadline
+            )
+            if status in {301, 302, 303, 307, 308}:
                 if redirect_count == MAX_REDIRECTS:
                     raise EvidenceError(f"too many redirects fetching {url}")
                 current_url = _resolve_same_origin_redirect(
                     current_url,
-                    response.getheader("Location"),
+                    location,
                     normalized_domain,
                 )
                 continue
-            if not 200 <= response.status < 300:
+            if not 200 <= status < 300:
                 raise EvidenceError(
-                    f"HTTPS fetch failed for {current_url}: HTTP {response.status}"
+                    f"HTTPS fetch failed for {current_url}: HTTP {status}"
                 )
-            return _read_bounded_response(response, current_url)
+            if body is None:
+                raise EvidenceError(f"HTTPS fetch returned no body for {current_url}")
+            return body
         except EvidenceError:
             raise
         except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
