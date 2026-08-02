@@ -83,6 +83,8 @@ EXPECTED_CORE_BODY_REFS = {
     ("post", "/v1/memory/retype"): "MemoryRetypeRequest",
     ("post", "/v1/perception/report"): "PerceptionReportRequest",
     ("post", "/v1/perception/photo/evaluate"): "PerceptionPhotoEvaluateRequest",
+    ("post", "/v1/agent/web/search"): "WebSearchRequest",
+    ("post", "/v1/agent/web/fetch"): "WebFetchRequest",
 }
 
 EXPECTED_HEADER_OPERATIONS = {
@@ -190,8 +192,10 @@ def test_public_operation_and_parameter_inventory(
     # 160 since the voice session and OpenAI-compatible Custom LLM endpoints;
     # both accept compatibility JSON envelopes, hence 73 -> 75 bodies.
     # 161 adds the bodyless unified main-model vision validator.
-    assert len(operations) == 161
-    assert sum("requestBody" in operation for operation in operations.values()) == 75
+    # 163 and 77 bodies since the V1 web execution endpoints
+    # (POST /v1/agent/web/search and /v1/agent/web/fetch, both with bodies).
+    assert len(operations) == 163
+    assert sum("requestBody" in operation for operation in operations.values()) == 77
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")

@@ -730,6 +730,92 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/agent/web/fetch": {
+      "post": {
+        "summary": "Web Fetch Exec",
+        "operationId": "web_fetch_exec_v1_agent_web_fetch_post",
+        "responses": {
+          "200": {
+            "description": "The capability envelope. Always HTTP 200 — inspect `ok`. On success `data` holds `{url, text, truncated}`; otherwise `error.code` explains the refusal (disabled, rate-limited, invalid/blocked url, operator halt, or upstream status).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebCapabilityResult"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Agent"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebFetchRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented",
+        "description": "Fetch one absolute http(s) URL and return its readable text (HTML is reduced to the main article; JSON, plain text, and source are returned as-is), size-capped with a data.truncated flag. SSRF-guarded: private/loopback/link-local targets are refused and every redirect hop is independently re-validated (max 5). Requires the `web` scope and the same three authorization gates as web search, reported in-band as HTTP 200 with ok:false and an error.code (capability_disabled, capability_rate_limited, capability_invalid_input for a bad or blocked url, capability_not_found / capability_upstream_error for an upstream HTTP status)."
+      }
+    },
+    "/v1/agent/web/search": {
+      "post": {
+        "summary": "Web Search Exec",
+        "operationId": "web_search_exec_v1_agent_web_search_post",
+        "responses": {
+          "200": {
+            "description": "The capability envelope. Always HTTP 200 — inspect `ok`. On success `data` holds the search results; otherwise `error.code` explains the refusal (disabled, rate-limited, invalid input, operator halt, or upstream failure).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebCapabilityResult"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Agent"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WebSearchRequest"
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented",
+        "description": "Run a keyless web search (DuckDuckGo HTML scrape) and return ranked results. Requires the `web` scope. Authorization is re-checked on every call — the user's own web switch must be on, the operator must not have halted web_search, and a per-user rate limit applies — because V1 tool authorization is static and cannot live in the prompt. Every gate and input-validation failure is reported IN-BAND as HTTP 200 with ok:false and an error.code (capability_disabled when the user's switch is off — not retryable; capability_rate_limited when over the per-user budget — retryable; capability_invalid_input for a missing or sensitive query; capability_upstream_error when the search itself fails). The aggregate result set is character-budgeted; data.truncated flags dropped items."
+      }
+    },
     "/v1/bootstrap": {
       "post": {
         "summary": "Bootstrap",
@@ -8190,7 +8276,7 @@
       },
       "WebSettingsResponse": {
         "type": "object",
-        "description": "Web-search state. `enabled` is the user's saved preference and is written only by the user — an operator halt never rewrites it. `runtime_supported` is false for self-hosted accounts, whose consumer does not run the tool loop these tools live in, so the preference is inert there. `effective` is derived, and covers every lane: the proactive companion's background turns follow the same switch as foreground chat.",
+        "description": "Web-search state. `enabled` is the user's saved preference and is written only by the user — an operator halt never rewrites it. `runtime_supported` is true when this account's runtime can reach the web tools: a Runtime V2 tool loop (intrinsic), or a Runtime V1 consumer — hosted runner OR self-hosted resident — but only once a new consumer build actually advertises the web capability on a fresh poll. An old consumer build never claims it, a stale heartbeat, or any read error all fail closed to false, so the switch stays inert for that account. `effective` is derived, and covers every lane: the proactive companion's background turns follow the same switch as foreground chat.",
         "required": [
           "enabled",
           "runtime_supported",
@@ -8249,6 +8335,117 @@
           "available": {
             "type": "boolean"
           }
+        }
+      },
+      "WebSearchRequest": {
+        "type": "object",
+        "description": "Web-search input for POST /v1/agent/web/search.",
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Search terms. A query that looks like it carries sensitive data (email addresses, API keys, phone numbers) is refused before any network call — the response is HTTP 200 with ok:false and error.code capability_invalid_input."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10,
+            "default": 5,
+            "description": "Maximum results. Clamped to 1..10; defaults to 5."
+          }
+        },
+        "example": {
+          "query": "weather in Tokyo today",
+          "limit": 5
+        }
+      },
+      "WebFetchRequest": {
+        "type": "object",
+        "description": "Web-fetch input for POST /v1/agent/web/fetch.",
+        "required": [
+          "url"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Absolute http(s) URL. Private, loopback, and link-local targets are refused, and every redirect hop (up to 5) is independently re-validated. HTML is reduced to readable text; non-HTML (JSON, plain text, source) is returned as-is. The response body is size-capped and flags truncation."
+          }
+        },
+        "example": {
+          "url": "https://example.com/article"
+        }
+      },
+      "WebCapabilityResult": {
+        "type": "object",
+        "description": "Uniform capability envelope returned by the V1 web execution endpoints. ALWAYS delivered as HTTP 200 — a transport 200 does NOT mean the call succeeded, so branch on `ok`, never on the HTTP status. When ok is true, `data` holds the tool payload (search: `{query, results[], truncated}`; fetch: `{url, text, truncated}`). When ok is false, `error.code` is a stable slug: capability_disabled (the user's web switch is off — not retryable), capability_rate_limited (per-user budget spent — retryable), capability_invalid_input (missing/sensitive query, or a bad/blocked url), capability_unavailable (operator halt), capability_not_found / capability_upstream_error (upstream fetch status).",
+        "required": [
+          "ok"
+        ],
+        "additionalProperties": true,
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "description": "True only when the tool ran and produced a result."
+          },
+          "data": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Tool payload; present when ok is true."
+          },
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ],
+            "additionalProperties": true,
+            "description": "Present when ok is false.",
+            "properties": {
+              "code": {
+                "type": "string",
+                "description": "Stable error slug: capability_disabled, capability_rate_limited, capability_invalid_input, capability_unavailable, capability_not_found, capability_upstream_error, capability_forbidden."
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              }
+            }
+          },
+          "trace": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "example": {
+          "ok": true,
+          "data": {
+            "query": "weather in Tokyo today",
+            "truncated": false,
+            "results": [
+              {
+                "title": "Tokyo weather",
+                "url": "https://example.com/tokyo",
+                "snippet": "…"
+              }
+            ]
+          },
+          "trace": {},
+          "warnings": []
         }
       },
       "FreeFormJsonObject": {

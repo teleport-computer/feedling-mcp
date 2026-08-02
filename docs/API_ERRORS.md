@@ -290,6 +290,24 @@
 | `unknown_or_unhistorized_signal` | 400 | — | | |
 | `invalid_days` | 400 | — | `days` 查询参数非数字 | |
 
+## Web 能力（`POST /v1/agent/web/{search,fetch}`，CapabilityResult `error.code`）
+
+> 与上面所有表格是**两套不同的命名空间**：这两个 V1 web 执行端点返回的是
+> capability 信封 `{"ok": false, "error": {"code": "<slug>", "message", "retryable"}}`，
+> HTTP 状态码**恒为 200**（分不出成功/失败要看 `ok`，不是看 HTTP 码），slug 落在
+> `error.code` 而非顶层 `error`。消费方是 **agent 运行时/io_cli**（把结果喂给模型），
+> 不进 iOS 本地化表，故「需本地化」恒空。code 定义在 `backend/capabilities/errors.py`。
+> `search`/`fetch` 共用同一套 gate，下表只列本次为 V1 web 门控新增的两个；其余
+> `capability_invalid_input`（query 缺失/含敏感数据、url 非法或被出网校验拦截）、
+> `capability_unavailable`（运维 kill switch 暂停该工具）、`capability_upstream_error` /
+> `capability_not_found` / `capability_forbidden`（上游抓取状态映射）沿用 V2 capability
+> 层既有 code，未在本次新增。「状态码」列恒为 `200`（信封码，非 gate 语义）。
+
+| error.code | 状态码 | blame | 说明 | 需本地化 |
+|---|---|---|---|---|
+| `capability_disabled` | 200 | — | 用户把联网开关关了（或开关不可读，fail-closed 同样按关处理）；`retryable=false`——重试无用，除非用户重新打开 | |
+| `capability_rate_limited` | 200 | — | 该用户在当前窗口内的 per-user web 调用预算已用尽（search+fetch 共享一个桶）；`retryable=true`——窗口自行漏空后可重试，`message` 带建议等待秒数 | |
+
 ## 内容 / 导出 / 账号重置（content_core）
 
 | slug | 状态码 | blame | 说明 | 需本地化 |

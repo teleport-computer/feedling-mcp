@@ -10,6 +10,20 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Web search and fetch now work on Runtime V1 too.** The user-controlled
+  `web_search` / `web_fetch` tools were previously a Runtime V2 capability only;
+  V1 accounts — both the hosted runner and self-hosted residents — can now use
+  them through new backend endpoints `POST /v1/agent/web/search` and
+  `POST /v1/agent/web/fetch` (require the `web` scope). The same user toggle
+  governs both runtimes, and authorization is re-checked on every call
+  (user switch, operator halt, per-user rate limit), so a static V1 tool prompt
+  cannot bypass it. **Scope of the toggle:** it controls Feedling's own web
+  tools, not the model's entire network egress. On a self-hosted deployment the
+  operator's model can still reach the internet by other means the operator
+  configured, so "off" removes Feedling's web tools rather than guaranteeing an
+  airtight network cut; on the managed runtime the model relies on these tools
+  for web access, so "off" is effectively a full cut.
+
 - **Background agent turns can no longer rewrite the identity card.** Runtime
   V2 now visibly refuses `identity_patch` and `identity_nudge` during proactive
   wake turns while preserving identity reads, foreground Chat identity changes,
@@ -468,8 +482,12 @@ change must not be interpreted as an API guarantee.
   actually possible right now:
   `{"enabled", "runtime_supported", "status", "effective", "tools"}`.
   `enabled` is written only by the user — an operator halt never rewrites it.
-  `runtime_supported` is false for self-hosted accounts, whose consumer does not
-  run the tool loop these tools live in. `status` is `available` / `degraded` /
+  `runtime_supported` is true when the account's runtime can actually reach the
+  web tools: a Runtime V2 tool loop, or — since the V1 web endpoints shipped — a
+  Runtime V1 consumer (hosted runner or self-hosted resident) once a new
+  consumer build advertises the web capability on a fresh poll. An old consumer
+  build, a stale heartbeat, or any read error fail closed to `false`, so the
+  switch stays inert for that account. `status` is `available` / `degraded` /
   `unavailable`, where `degraded` means one of the two tools is halted and the
   other still works. `effective` is derived, and covers every lane. `POST` requires a real JSON boolean under `enabled`; strings such as
   `"no"` are rejected with `400` rather than coerced.
