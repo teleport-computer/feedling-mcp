@@ -19,7 +19,13 @@ class QueryArgs(Protocol):
 
 @dataclass(frozen=True)
 class UsageQuery:
-    """One immutable cohort shared by every Usage report section."""
+    """One immutable cohort shared by every Usage report section.
+
+    Provider/model filters keep the P0-A best-known identity for whole-turn
+    outcomes and target resolved identity in the P0-B attempt ledger.  The
+    report exposes requested identity as a separate breakdown instead of
+    ambiguously applying one filter to both identities.
+    """
 
     start_at_utc: datetime
     end_at_utc: datetime

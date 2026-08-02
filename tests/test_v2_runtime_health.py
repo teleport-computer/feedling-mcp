@@ -36,6 +36,7 @@ def _clean_tables():
             conn.execute("DELETE FROM v2_effect_outbox")
             conn.execute("DELETE FROM v2_mcp_mutation_attempts")
             conn.execute("DELETE FROM v2_terminal_failure_outbox")
+            conn.execute("DELETE FROM llm_provider_attempts")
             conn.execute("DELETE FROM agent_jobs")
 
     clean()
@@ -399,11 +400,64 @@ def test_token_usage_by_lane_counts_failed_turns():
     assert lanes["chat"]["model_calls"] == 2
 
 
+def test_token_usage_by_lane_exposes_provider_attempt_accounting_with_corrections():
+    _add_metric(
+        "u_tok_attempts", "chat", prompt=9_999, completion=999,
+        model_calls=3, retries=99, failed=True,
+    )
+    with db.get_pool().connection() as conn:
+        for values in (
+            (
+                "81111111-1111-5111-8111-111111111111", "runtime-call", 1,
+                "initial", "succeeded", 100, 20, 5, 10, False,
+            ),
+            (
+                "82222222-2222-5222-8222-222222222222", "runtime-call", 2,
+                "outer_retry", "failed", 50, 10, 3, 5, True,
+            ),
+        ):
+            conn.execute(
+                "INSERT INTO llm_provider_attempts ("
+                "attempt_id,user_id,lane,call_id,outer_attempt_ordinal,"
+                "inner_attempt_ordinal,retry_kind,requested_provider,resolved_provider,"
+                "requested_model,resolved_model,transport,started_at,finished_at,state,"
+                "outcome,error_class,input_tokens,output_tokens,reasoning_tokens,"
+                "cache_read_tokens,usage_known,possibly_billed,source,completeness,revision) "
+                "VALUES (%s,'u_tok_attempts','chat',%s,%s,1,%s,'asked','actual',"
+                "'asked-model','actual-model','openai_responses',now(),now(),'completed',"
+                "%s,'none',%s,%s,%s,%s,true,%s,'runtime_recorder','complete',2)",
+                values,
+            )
+        conn.execute(
+            "INSERT INTO llm_provider_attempt_corrections "
+            "(attempt_id,user_id,revision,reason_code,input_tokens_delta,"
+            "reasoning_tokens_delta) VALUES "
+            "('81111111-1111-5111-8111-111111111111','u_tok_attempts',3,"
+            "'late_usage',7,2)"
+        )
+
+    report = jobs_store.recent_token_usage_by_lane(within_hours=24)
+    attempts = report["attempt_lanes"]["chat"]
+
+    assert attempts["attempts"] == 2
+    assert attempts["logical_calls"] == 1
+    assert attempts["retry_attempts"] == 1
+    assert attempts["failed_attempts"] == 1
+    assert attempts["possibly_billed_attempts"] == 1
+    assert attempts["input_tokens"] == 157
+    assert attempts["output_tokens"] == 30
+    assert attempts["reasoning_tokens"] == 10
+    assert attempts["cache_read_tokens"] == 15
+    assert attempts["whole_turn_model_calls"] == 3
+    assert attempts["logical_call_coverage"] == pytest.approx(1 / 3)
+
+
 def test_token_usage_by_lane_reports_none_not_zero_without_usage():
     # provider 没回 usage 时不得记成 0 token 混进总量假装正常
     _add_metric("u_tok_nousage", "chat", prompt=None, completion=None, usage_reported=0)
 
-    chat = jobs_store.recent_token_usage_by_lane()["lanes"]["chat"]
+    report = jobs_store.recent_token_usage_by_lane()
+    chat = report["lanes"]["chat"]
 
     assert chat["prompt_tokens"] is None
     assert chat["completion_tokens"] is None
@@ -411,6 +465,12 @@ def test_token_usage_by_lane_reports_none_not_zero_without_usage():
     assert chat["model_calls"] == 1
     assert chat["usage_reported_calls"] == 0
     assert chat["usage_coverage"] == pytest.approx(0.0)
+    attempt_chat = report["attempt_lanes"]["chat"]
+    assert attempt_chat["attempts"] == 0
+    assert attempt_chat["logical_calls"] == 0
+    assert attempt_chat["input_tokens"] is None
+    assert attempt_chat["output_tokens"] is None
+    assert attempt_chat["logical_call_coverage"] == pytest.approx(0.0)
 
 
 def test_token_usage_by_lane_coverage_is_none_without_calls():

@@ -2621,7 +2621,7 @@ def _runtime_health_summary(*, within_hours: int = 24) -> dict:
 # Injected by the assembly layer (asgi_app.py); the real implementation is
 # model_api_runtime.v2.jobs_store.recent_token_usage_by_lane.
 def _runtime_token_by_lane(*, within_hours: int = 24) -> dict:
-    return {"window_hours": within_hours, "lanes": {}}
+    return {"window_hours": within_hours, "lanes": {}, "attempt_lanes": None}
 
 
 # Injected by the assembly layer (asgi_app.py); the real implementation is
@@ -2652,7 +2652,7 @@ def _runtime_user_report(*, within_hours: int = 24) -> dict:
 def _usage_report(query: admin_usage.UsageQuery) -> dict:
     return {
         "overview": {}, "averages": {}, "daily": [], "users": [],
-        "models": [], "filters": {}, "coverage": {},
+        "models": [], "filters": {}, "coverage": {}, "attempts": None,
     }
 
 
@@ -2837,7 +2837,12 @@ def _render_runtime_health_page(
     # 上面已经算完的 _runtime_health_level 判定（那是纯 job 结局层面的判断，
     # token-only 的 lane 没有任何 job 结局信息可供判定）。跟 jobs_store 里
     # recent_runtime_health 自己的 all_lanes 是同一个哲学，只是补在渲染层。
-    token_lanes = (tokens or {}).get("lanes") or {}
+    attempt_lanes = (tokens or {}).get("attempt_lanes")
+    uses_attempt_ledger = attempt_lanes is not None
+    token_lanes = (
+        attempt_lanes if uses_attempt_ledger
+        else (tokens or {}).get("lanes") or {}
+    )
     known_lane_names = {str(lane.get("lane") or "unknown") for lane in lanes}
     token_only_lane_names = sorted(
         name for name in token_lanes if name not in known_lane_names
@@ -2954,9 +2959,13 @@ def _render_runtime_health_page(
             )
         # 某 lane 有 job 但无 turn metric 行时（例如全部回合都还没终态），
         # tokens["lanes"] 里没有这个键——两列显 —，不得 KeyError、也不得显 0。
-        lane_tokens = ((tokens or {}).get("lanes") or {}).get(name) or {}
-        prompt_tok = lane_tokens.get("prompt_tokens")
-        completion_tok = lane_tokens.get("completion_tokens")
+        lane_tokens = token_lanes.get(name) or {}
+        prompt_tok = lane_tokens.get(
+            "input_tokens" if uses_attempt_ledger else "prompt_tokens"
+        )
+        completion_tok = lane_tokens.get(
+            "output_tokens" if uses_attempt_ledger else "completion_tokens"
+        )
         if prompt_tok is None and completion_tok is None:
             token_cell = "<td class='muted'>—</td>"
         else:
@@ -2968,12 +2977,23 @@ def _render_runtime_health_page(
         # 上报」，那个"上报"指的是 token usage 上报，读者却会当成 cache 上报
         # （2026-07-30 审计）。cache coverage 与 usage coverage 是两个独立的量。
         hit_ratio = lane_tokens.get("cache_hit_ratio")
+        if uses_attempt_ledger:
+            cache_read = lane_tokens.get("cache_read_tokens")
+            cache_miss = lane_tokens.get("cache_miss_tokens")
+            hit_ratio = (
+                float(cache_read) / (cache_read + cache_miss)
+                if cache_read is not None and cache_miss is not None
+                and cache_read + cache_miss
+                else None
+            )
         cache_cell = (
             "<td class='muted'>—</td>" if hit_ratio is None
             else f"<td>{_fmt_ratio(hit_ratio)}</td>"
         )
-        usage_cov = lane_tokens.get("usage_coverage")
-        cache_cov = lane_tokens.get("cache_coverage")
+        usage_cov = lane_tokens.get(
+            "logical_call_coverage" if uses_attempt_ledger else "usage_coverage"
+        )
+        cache_cov = None if uses_attempt_ledger else lane_tokens.get("cache_coverage")
         if usage_cov is None and cache_cov is None:
             coverage_cell = "<td class='muted'>—</td>"
         else:
@@ -3057,6 +3077,19 @@ def _render_runtime_health_page(
             "——可能是卡死，不是「当天没数据」。</div>"
         )
 
+    token_source_note = (
+        "provider-attempt ledger (input/output and logical-call coverage)"
+        if uses_attempt_ledger
+        else "legacy whole-turn usage telemetry"
+    )
+    token_header = (
+        "token 入/出 (attempt input/output)"
+        if uses_attempt_ledger else "token 入/出"
+    )
+    coverage_header = (
+        "logical-call coverage / cache —"
+        if uses_attempt_ledger else "上报 usage/cache"
+    )
     return f"""<!doctype html>
 <html>
 <head>
@@ -3079,7 +3112,8 @@ def _render_runtime_health_page(
     heartbeat lane 两页都会出现，但口径不同，别直接对数。
     分母一律从 agent_jobs 起算，因此「完全没写 metrics」的回合不会从统计里消失。
     延迟只算成功回合：失败超时会把 p95 拉高，混在一起会让一个故障看起来像两个。
-    token 含<b>失败回合</b>——失败也烧钱，与上方失败率不是同一批样本的筛选口径。
+    token source: <b>{html.escape(token_source_note)}</b>。Attempt token 包含失败 attempt——失败也可能烧钱，
+    与上方 whole-turn 失败率不是同一批样本的筛选口径。
     健康列与 token 列<b>都是窗口内全量</b>，无采样上界——两者覆盖同一批样本，
     可以放在一行对账。
     prompt token 已包含 cache read/write，<b>不要与缓存列相加</b>，否则重复计数。
@@ -3108,7 +3142,7 @@ def _render_runtime_health_page(
   {delivery_section}
   <h2>各 lane 健康</h2>
   <table>
-    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>失败</th><th>过期</th><th>superseded</th><th>失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
+    <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>失败</th><th>过期</th><th>superseded</th><th>失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>{html.escape(token_header)}</th><th>缓存命中</th><th>{html.escape(coverage_header)}</th></tr></thead>
     <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='13' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
   </table>
   {_render_runtime_user_report(user_report)}
@@ -3429,12 +3463,12 @@ def _render_usage_page(
         _render_metric("Metered users", _fmt_count(overview.get("metered_users"))),
         _render_metric("Active user-days", _fmt_count(overview.get("active_user_days"))),
         _render_metric("Turns", _fmt_count(overview.get("turns"))),
-        _render_metric("Model calls", _fmt_count(overview.get("model_calls"))),
-        _render_metric("Retries", _fmt_count(overview.get("retries"))),
+        _render_metric("Whole-turn model_calls (coverage denominator)", _fmt_count(overview.get("model_calls"))),
+        _render_metric("Legacy whole-turn retry projection", _fmt_count(overview.get("retries"))),
         _render_metric("Failed turns", _fmt_count(overview.get("failed_turns"))),
-        _render_metric("Prompt tokens", _fmt_count(overview.get("prompt_tokens"))),
-        _render_metric("Completion tokens", _fmt_count(overview.get("completion_tokens"))),
-        _render_metric("Known total tokens", _fmt_count(overview.get("total_tokens"))),
+        _render_metric("Legacy whole-turn prompt tokens", _fmt_count(overview.get("prompt_tokens"))),
+        _render_metric("Legacy whole-turn completion tokens", _fmt_count(overview.get("completion_tokens"))),
+        _render_metric("Legacy whole-turn known tokens", _fmt_count(overview.get("total_tokens"))),
         _render_metric("Cache read / write / miss", " / ".join([
             _fmt_count(overview.get("cache_read_tokens")),
             _fmt_count(overview.get("cache_write_tokens")),
@@ -3462,6 +3496,160 @@ def _render_usage_page(
         _render_metric("Model calls / turn", _usage_float(averages.get("model_calls_per_turn"), digits=2)),
         _render_metric("Retries / turn", _usage_float(averages.get("retries_per_turn"), digits=2)),
     ])
+
+    attempts = report.get("attempts")
+    if "attempts" not in report:
+        attempt_section = (
+            "<div class='note-box'><b>P0-A 边界：</b>Reasoning tokens、"
+            "possibly-billed attempts 与 authoritative cost 均 "
+            "<b>unavailable until P0-B</b>，不会显示成零。"
+            "Prompt token 已包含 cache token，不能重复相加。</div>"
+        )
+    elif attempts is None:
+        attempt_section = (
+            "<h2>Provider-attempt ledger</h2>"
+            "<div class='note-box'><b>Attempt ledger 暂时取不到。</b>"
+            "Whole-turn truth、reference cohort 与其他 Usage 区块仍可用；"
+            "账本用量和费用均为 unknown，不会降级成零。</div>"
+        )
+    else:
+        attempt_overview = attempts.get("overview") or {}
+        attempt_coverage = attempts.get("coverage") or {}
+        attempt_metrics = "".join([
+            _render_metric("Provider attempts", _fmt_count(attempt_overview.get("attempts"))),
+            _render_metric("Logical calls recorded", _fmt_count(attempt_overview.get("logical_calls"))),
+            _render_metric("Retry attempts", _fmt_count(attempt_overview.get("retry_attempts"))),
+            _render_metric("Failover attempts", _fmt_count(attempt_overview.get("failover_attempts"))),
+            _render_metric("Failed attempts", _fmt_count(attempt_overview.get("failed_attempts"))),
+            _render_metric("Possibly billed attempts", _fmt_count(attempt_overview.get("possibly_billed_attempts"))),
+            _render_metric("Input / output / reasoning tokens", " / ".join([
+                _fmt_count(attempt_overview.get("input_tokens")),
+                _fmt_count(attempt_overview.get("output_tokens")),
+                _fmt_count(attempt_overview.get("reasoning_tokens")),
+            ])),
+            _render_metric("Cache read / write / miss", " / ".join([
+                _fmt_count(attempt_overview.get("cache_read_tokens")),
+                _fmt_count(attempt_overview.get("cache_write_tokens")),
+                _fmt_count(attempt_overview.get("cache_miss_tokens")),
+            ])),
+            _render_metric("Usage known / unknown attempts", " / ".join([
+                _fmt_count(attempt_overview.get("usage_known_attempts")),
+                _fmt_count(attempt_overview.get("usage_unknown_attempts")),
+            ])),
+            _render_metric("TTFT p50 / p95", " / ".join([
+                _fmt_duration_sec(
+                    float(attempt_overview["ttft_ms_p50"]) / 1000
+                    if attempt_overview.get("ttft_ms_p50") is not None else None
+                ),
+                _fmt_duration_sec(
+                    float(attempt_overview["ttft_ms_p95"]) / 1000
+                    if attempt_overview.get("ttft_ms_p95") is not None else None
+                ),
+            ])),
+            _render_metric("Logical-call coverage", (
+                f"{_fmt_count(attempt_coverage.get('recorded_logical_calls'))} / "
+                f"{_fmt_count(attempt_coverage.get('whole_turn_model_calls'))} "
+                f"({_fmt_ratio(attempt_coverage.get('logical_call_coverage'))})"
+            )),
+            _render_metric("Attempt sequence gaps", _fmt_count(
+                attempt_coverage.get("attempt_sequence_gaps")
+            )),
+        ])
+
+        def _attempt_identity_table(title: str, rows) -> str:
+            rendered = []
+            for row in rows or []:
+                rendered.append(
+                    "<tr>"
+                    f"<td>{html.escape(str(row.get('provider') or 'unknown'))}</td>"
+                    f"<td>{html.escape(str(row.get('model') or 'unknown'))}</td>"
+                    f"<td>{_fmt_count(row.get('logical_calls'))} / {_fmt_count(row.get('attempts'))}</td>"
+                    f"<td>{_fmt_count(row.get('retry_attempts'))} / {_fmt_count(row.get('failover_attempts'))} / {_fmt_count(row.get('failed_attempts'))}</td>"
+                    f"<td>{_fmt_count(row.get('input_tokens'))} / {_fmt_count(row.get('output_tokens'))} / {_fmt_count(row.get('reasoning_tokens'))}</td>"
+                    f"<td>{_fmt_count(row.get('possibly_billed_attempts'))}</td>"
+                    "</tr>"
+                )
+            body = "".join(rendered) or (
+                "<tr><td colspan='6' class='muted'>No canonical attempts in this cohort.</td></tr>"
+            )
+            return (
+                f"<h3>{html.escape(title)}</h3>"
+                "<div class='table-wrap'><table><thead><tr>"
+                "<th>Provider</th><th>Model</th>"
+                "<th title='Distinct recorded call_id / physical provider-attempt rows'>Logical calls / attempts</th>"
+                "<th>Retry / failover / failed attempts</th>"
+                "<th>Input / output / reasoning</th><th>Possibly billed</th>"
+                f"</tr></thead><tbody>{body}</tbody></table></div>"
+            )
+
+        def _attempt_scope_table(title: str, rows, identity: str) -> str:
+            rendered = []
+            for row in rows or []:
+                rendered.append(
+                    "<tr>"
+                    f"<td>{html.escape(str(row.get(identity) or 'unknown'))}</td>"
+                    f"<td>{_fmt_count(row.get('logical_calls'))} / {_fmt_count(row.get('attempts'))}</td>"
+                    f"<td>{_fmt_count(row.get('retry_attempts'))} / {_fmt_count(row.get('failover_attempts'))} / {_fmt_count(row.get('failed_attempts'))}</td>"
+                    f"<td>{_fmt_count(row.get('input_tokens'))} / {_fmt_count(row.get('output_tokens'))} / {_fmt_count(row.get('reasoning_tokens'))}</td>"
+                    f"<td>{_fmt_count(row.get('possibly_billed_attempts'))}</td>"
+                    "</tr>"
+                )
+            body = "".join(rendered) or (
+                "<tr><td colspan='5' class='muted'>No canonical attempts in this cohort.</td></tr>"
+            )
+            return (
+                f"<h3>{html.escape(title)}</h3>"
+                "<div class='table-wrap'><table><thead><tr>"
+                f"<th>{html.escape(identity.replace('_', ' ').title())}</th>"
+                "<th>Logical calls / attempts</th>"
+                "<th>Retry / failover / failed attempts</th>"
+                "<th>Input / output / reasoning</th><th>Possibly billed</th>"
+                f"</tr></thead><tbody>{body}</tbody></table></div>"
+            )
+
+        cost_rows = []
+        for row in attempts.get("costs") or []:
+            def _cost(value) -> str:
+                if value is None:
+                    return "—"
+                try:
+                    return format(value, "f")
+                except (TypeError, ValueError):
+                    return "—"
+
+            cost_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(row.get('currency') or 'unknown'))}</td>"
+                f"<td>{html.escape(_cost(row.get('authoritative_cost')))}</td>"
+                f"<td>{html.escape(_cost(row.get('estimated_cost')))}</td>"
+                f"<td>{_fmt_count(row.get('authoritative_attempts'))} / {_fmt_count(row.get('estimated_attempts'))} / {_fmt_count(row.get('unknown_attempts'))}</td>"
+                "</tr>"
+            )
+        cost_body = "".join(cost_rows) or (
+            "<tr><td colspan='4' class='muted'>No cost observations; cost is unknown, not zero.</td></tr>"
+        )
+        attempt_section = f"""
+  <h2>Provider-attempt ledger</h2>
+  <div class='muted'>Calls, retries, failovers, tokens, cache, reasoning, TTFT,
+    possibly-billed state and cost come from canonical rev-latest attempt rows plus
+    append-only correction deltas. Turns and terminal outcomes remain Whole-turn truth.</div>
+  <section class='metrics'>{attempt_metrics}</section>
+  <div class='note-box'><b>Reconciliation:</b> Logical-call coverage is distinct recorded
+    <code>call_id</code> divided by whole-turn <code>model_calls</code>; physical attempt count
+    can exceed 100% after retries. Attempt sequence gaps are separate: outer
+    {_fmt_count(attempt_coverage.get('missing_outer_ordinals'))}, inner
+    {_fmt_count(attempt_coverage.get('missing_inner_ordinals'))}.</div>
+  <h3>Authoritative / estimated / unknown cost</h3>
+  <div class='muted'>Authoritative uses recorded cost plus correction deltas; estimated uses
+    the immutable rate card effective at dispatch time; unknown stays unknown.</div>
+  <div class='table-wrap'><table><thead><tr><th>Currency</th><th>Authoritative</th>
+    <th>Estimated</th><th>Authoritative / estimated / unknown attempts</th></tr></thead>
+    <tbody>{cost_body}</tbody></table></div>
+  {_attempt_identity_table('Requested provider / model', attempts.get('requested_models'))}
+  {_attempt_identity_table('Resolved provider / model', attempts.get('resolved_models'))}
+  {_attempt_scope_table('Provider-attempt ledger by user', attempts.get('users'), 'user_id')}
+  {_attempt_scope_table('Provider-attempt ledger by lane', attempts.get('lanes'), 'lane')}
+"""
 
     daily_rows = []
     daily_available = report.get("daily") is not None
@@ -3674,21 +3862,24 @@ def _render_usage_page(
   {drilldown}
   <h2>Fleet Overview · reference cohort</h2>
   <section class='metrics'>{reference_metrics}</section>
-  <h2>Fleet Overview · filtered usage</h2>
+  <h2>Fleet Overview · Whole-turn truth</h2>
+  <div class='muted'>Turns and terminal outcomes come from v2_turn_metrics. The attempt ledger below is the accounting source for provider calls and usage.</div>
   <section class='metrics'>{usage_metrics}</section>
   <h2>平均值</h2>
+  <div class='muted'>Whole-turn legacy usage projection; canonical attempt accounting is above.</div>
   <section class='metrics'>{average_metrics}</section>
   {optional_note}
-  <div class='note-box'><b>P0-A 边界：</b>Reasoning tokens、possibly-billed attempts 与 authoritative cost 均 <b>unavailable until P0-B</b>，不会显示成零。Prompt token 已包含 cache token，不能重复相加。</div>
-  <h2>每日趋势</h2>
+  {attempt_section}
+  <h2>Whole-turn 每日趋势</h2>
   <div class='table-wrap'><table><thead><tr><th>Local day</th><th>Known tokens</th><th>Active users</th><th>Tokens / active user-day</th><th>Tokens / metered turn</th><th>Calls</th><th>Retries</th><th>Failed</th><th>Usage / cache coverage</th></tr></thead>
   <tbody>{daily_body}</tbody></table></div>
   <h2>Per-user Usage</h2>
   <div class='sortbar'>{''.join(sort_links)} {''.join(pager)}<span class='muted'>Showing {user_offset + 1 if user_rows else 0}–{user_offset + len(user_rows)} of {user_total}</span></div>
+  <div class='muted'>Whole-turn outcome projection; canonical attempt-ledger per-user accounting is above.</div>
   <div class='table-wrap'><table><thead><tr><th>User</th><th>Last model call (UTC)</th><th>Active days</th><th>Turns / calls / retries / failed</th><th>Prompt / completion / total</th><th>Cache R / W / M</th><th>Calendar / active-day avg</th><th>Daily p50 / p95</th><th>Tokens / metered turn</th><th>Primary provider / model</th><th>Usage / cache / unknown</th><th>Known share</th></tr></thead>
   <tbody>{user_body}</tbody></table></div>
-  <h2>Provider / Model</h2>
-  <div class='muted'>Identity 是 whole-turn resolved / best-known；requested 与 resolved 将在 P0-B attempt ledger 分开。</div>
+  <h2>Whole-turn Provider / Model</h2>
+  <div class='muted'>This table is the whole-turn outcome projection. Requested and resolved attempt identity are shown separately in the Provider-attempt ledger.</div>
   <div class='table-wrap'><table><thead><tr><th>Provider</th><th>Model</th><th>Users</th><th>Turns / calls / retries</th><th>Failed / failure / retry rate</th><th>Prompt / completion / total</th><th>Cache R / W / M</th><th>Tokens / call</th><th>Latency p50 / p95</th><th>Usage / cache coverage</th></tr></thead>
   <tbody>{model_body}</tbody></table></div>
   {lane_section}

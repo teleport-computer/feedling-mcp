@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from html import unescape
 import importlib.util
 import json
@@ -437,6 +438,466 @@ def _usage_query(**filters):
     )
 
 
+def _insert_attempt(
+    conn,
+    *,
+    attempt_id: str,
+    user_id: str,
+    call_id: str,
+    outer: int = 1,
+    inner: int = 1,
+    retry_kind: str = "initial",
+    requested_provider: str = "requested-provider",
+    requested_model: str = "requested-model",
+    resolved_provider: str = "resolved-provider",
+    resolved_model: str = "resolved-model",
+    outcome: str = "succeeded",
+    usage_known: bool = True,
+    possibly_billed: bool = False,
+    input_tokens=None,
+    output_tokens=None,
+    reasoning_tokens=None,
+    cache_read_tokens=None,
+    cache_write_tokens=None,
+    cache_miss_tokens=None,
+    ttft_ms=None,
+    cost=None,
+    currency=None,
+    rate_card_version=None,
+):
+    conn.execute(
+        "INSERT INTO llm_provider_attempts ("
+        "attempt_id,user_id,lane,call_id,outer_attempt_ordinal,"
+        "inner_attempt_ordinal,retry_kind,requested_provider,resolved_provider,"
+        "requested_model,resolved_model,transport,started_at,finished_at,state,"
+        "outcome,error_class,input_tokens,output_tokens,reasoning_tokens,"
+        "cache_read_tokens,cache_write_tokens,cache_miss_tokens,usage_known,"
+        "possibly_billed,latency_ms,ttft_ms,cost,currency,rate_card_version,"
+        "source,completeness,revision) VALUES ("
+        "%s,%s,'chat',%s,%s,%s,%s,%s,%s,%s,%s,'openai_responses',%s,%s,"
+        "'completed',%s,'none',%s,%s,%s,%s,%s,%s,%s,%s,120,%s,%s,%s,%s,"
+        "'runtime_recorder',%s,2)",
+        (
+            attempt_id,
+            user_id,
+            call_id,
+            outer,
+            inner,
+            retry_kind,
+            requested_provider,
+            resolved_provider,
+            requested_model,
+            resolved_model,
+            "2026-07-01T10:00:00+00:00",
+            "2026-07-01T10:00:01+00:00",
+            outcome,
+            input_tokens,
+            output_tokens,
+            reasoning_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            cache_miss_tokens,
+            usage_known,
+            possibly_billed,
+            ttft_ms,
+            cost,
+            currency,
+            rate_card_version,
+            "complete" if usage_known else "usage_unknown",
+        ),
+    )
+
+
+@pytest.fixture
+def provider_attempt_usage_rows():
+    user_id = "u_attempt_usage"
+    seed_user(user_id, created_at="2026-06-01T00:00:00+00:00")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_turn_metrics "
+            "(user_id,lane,provider,model,model_calls,retries,failed,status,created_at) "
+            "VALUES (%s,'chat','turn-provider','turn-model',4,99,true,'attempt-turn',%s)",
+            (user_id, "2026-07-01T10:00:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO llm_rate_cards "
+            "(provider,model,version,currency,input_cost_per_million,"
+            "output_cost_per_million,reasoning_cost_per_million,"
+            "cache_read_cost_per_million,effective_at) "
+            "VALUES ('resolved-b','model-b','rate-v1','USD',2,4,6,1,%s)",
+            ("2026-06-01T00:00:00+00:00",),
+        )
+        conn.execute(
+            "INSERT INTO llm_rate_cards "
+            "(provider,model,version,currency,input_cost_per_million,"
+            "output_cost_per_million,reasoning_cost_per_million,"
+            "cache_read_cost_per_million,effective_at) "
+            "VALUES ('resolved-b','model-b','rate-v2','USD',999,999,999,999,%s)",
+            ("2026-07-02T00:00:00+00:00",),
+        )
+        _insert_attempt(
+            conn,
+            attempt_id="11111111-1111-5111-8111-111111111111",
+            user_id=user_id,
+            call_id="logical-a",
+            requested_provider="requested-a",
+            requested_model="asked-model",
+            resolved_provider="resolved-a",
+            resolved_model="model-a",
+            input_tokens=100,
+            output_tokens=20,
+            reasoning_tokens=5,
+            cache_read_tokens=10,
+            cache_write_tokens=2,
+            cache_miss_tokens=4,
+            ttft_ms=40,
+            cost=Decimal("0.50000000"),
+            currency="USD",
+            rate_card_version="invoice-v1",
+        )
+        _insert_attempt(
+            conn,
+            attempt_id="22222222-2222-5222-8222-222222222222",
+            user_id=user_id,
+            call_id="logical-a",
+            outer=2,
+            retry_kind="failover",
+            requested_provider="requested-a",
+            requested_model="asked-model",
+            resolved_provider="resolved-b",
+            resolved_model="model-b",
+            outcome="failed",
+            input_tokens=50,
+            output_tokens=10,
+            reasoning_tokens=4,
+            cache_read_tokens=5,
+            cache_write_tokens=1,
+            cache_miss_tokens=3,
+            ttft_ms=80,
+        )
+        _insert_attempt(
+            conn,
+            attempt_id="33333333-3333-5333-8333-333333333333",
+            user_id=user_id,
+            call_id="logical-b",
+            usage_known=False,
+            possibly_billed=True,
+            outcome="timed_out",
+        )
+        conn.execute(
+            "INSERT INTO llm_provider_attempt_corrections "
+            "(attempt_id,user_id,revision,reason_code,input_tokens_delta,"
+            "output_tokens_delta,reasoning_tokens_delta,cache_read_tokens_delta,"
+            "cost_delta,currency) VALUES (%s,%s,3,'late_usage',7,3,2,1,.1,'USD')",
+            ("11111111-1111-5111-8111-111111111111", user_id),
+        )
+    try:
+        yield user_id
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+
+
+def test_usage_snapshot_uses_attempt_ledger_and_keeps_turn_outcome_truth(
+    provider_attempt_usage_rows,
+):
+    report = jobs_store.usage_report_snapshot(
+        _usage_query(user_id=provider_attempt_usage_rows)
+    )
+
+    assert report["overview"]["turns"] == 1
+    assert report["overview"]["failed_turns"] == 1
+    assert report["overview"]["model_calls"] == 4
+    attempts = report["attempts"]
+    assert attempts["overview"] == {
+        "attempts": 3,
+        "logical_calls": 2,
+        "retry_attempts": 1,
+        "failover_attempts": 1,
+        "failed_attempts": 2,
+        "usage_known_attempts": 2,
+        "usage_unknown_attempts": 1,
+        "possibly_billed_attempts": 1,
+        "input_tokens": 157,
+        "output_tokens": 33,
+        "reasoning_tokens": 11,
+        "cache_read_tokens": 16,
+        "cache_write_tokens": 3,
+        "cache_miss_tokens": 7,
+        "ttft_ms_p50": 60.0,
+        "ttft_ms_p95": 78.0,
+    }
+    assert attempts["coverage"]["whole_turn_model_calls"] == 4
+    assert attempts["coverage"]["recorded_logical_calls"] == 2
+    assert attempts["coverage"]["logical_call_coverage"] == pytest.approx(.5)
+    assert attempts["coverage"]["attempt_sequence_gaps"] == 0
+    assert attempts["costs"] == [
+        {
+            "currency": "USD",
+            "authoritative_cost": Decimal("0.60000000"),
+            "estimated_cost": Decimal("0.00015700"),
+            "authoritative_attempts": 1,
+            "estimated_attempts": 1,
+            "unknown_attempts": 0,
+        },
+        {
+            "currency": None,
+            "authoritative_cost": None,
+            "estimated_cost": None,
+            "authoritative_attempts": 0,
+            "estimated_attempts": 0,
+            "unknown_attempts": 1,
+        },
+    ]
+    assert attempts["requested_models"][0]["provider"] == "requested-a"
+    assert attempts["requested_models"][0]["model"] == "asked-model"
+    resolved = {(row["provider"], row["model"]) for row in attempts["resolved_models"]}
+    assert resolved == {
+        ("resolved-a", "model-a"),
+        ("resolved-b", "model-b"),
+        ("resolved-provider", "resolved-model"),
+    }
+
+
+def test_usage_snapshot_reports_ordinal_gaps_separately_from_call_coverage():
+    user_id = "u_attempt_gaps"
+    seed_user(user_id, created_at="2026-06-01T00:00:00+00:00")
+    try:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO v2_turn_metrics "
+                "(user_id,lane,model_calls,retries,failed,status,created_at) "
+                "VALUES (%s,'chat',1,0,false,'gap-turn',%s)",
+                (user_id, "2026-07-01T10:00:00+00:00"),
+            )
+            for attempt_id, outer, inner in (
+                ("44444444-4444-5444-8444-444444444444", 1, 1),
+                ("55555555-5555-5555-8555-555555555555", 3, 1),
+                ("66666666-6666-5666-8666-666666666666", 3, 3),
+            ):
+                _insert_attempt(
+                    conn,
+                    attempt_id=attempt_id,
+                    user_id=user_id,
+                    call_id="logical-gap",
+                    outer=outer,
+                    inner=inner,
+                    usage_known=False,
+                )
+        report = jobs_store.usage_report_snapshot(_usage_query(user_id=user_id))
+        coverage = report["attempts"]["coverage"]
+        assert coverage["logical_call_coverage"] == pytest.approx(1.0)
+        assert coverage["attempt_sequence_gaps"] == 2
+        assert coverage["missing_outer_ordinals"] == 1
+        assert coverage["missing_inner_ordinals"] == 1
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+
+
+def test_usage_snapshot_gap_detection_uses_full_call_cohort_before_identity_filter():
+    user_id = "u_attempt_filtered_gaps"
+    seed_user(user_id, created_at="2026-06-01T00:00:00+00:00")
+    try:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO v2_turn_metrics "
+                "(user_id,lane,provider,model,model_calls,retries,failed,status,created_at) "
+                "VALUES (%s,'chat','visible-provider','visible-model',1,0,false,"
+                "'filtered-gap-turn',%s)",
+                (user_id, "2026-07-01T10:00:00+00:00"),
+            )
+            _insert_attempt(
+                conn,
+                attempt_id="68888888-8888-5888-8888-888888888888",
+                user_id=user_id,
+                call_id="logical-filtered-gap",
+                outer=1,
+                resolved_provider="hidden-provider",
+                resolved_model="hidden-model",
+            )
+            _insert_attempt(
+                conn,
+                attempt_id="69999999-9999-5999-8999-999999999999",
+                user_id=user_id,
+                call_id="logical-filtered-gap",
+                outer=2,
+                retry_kind="failover",
+                resolved_provider="visible-provider",
+                resolved_model="visible-model",
+            )
+
+        coverage = jobs_store.usage_report_snapshot(
+            _usage_query(user_id=user_id, provider="visible-provider")
+        )["attempts"]["coverage"]
+
+        assert coverage["recorded_logical_calls"] == 1
+        assert coverage["missing_outer_ordinals"] == 0
+        assert coverage["missing_inner_ordinals"] == 0
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+
+
+def test_usage_snapshot_cost_categories_are_mutually_exclusive():
+    user_id = "u_attempt_cost_categories"
+    seed_user(user_id, created_at="2026-06-01T00:00:00+00:00")
+    try:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO v2_turn_metrics "
+                "(user_id,lane,model_calls,retries,failed,status,created_at) "
+                "VALUES (%s,'chat',1,0,false,'cost-category-turn',%s)",
+                (user_id, "2026-07-01T10:00:00+00:00"),
+            )
+            conn.execute(
+                "INSERT INTO llm_rate_cards "
+                "(provider,model,version,currency,input_cost_per_million,"
+                "cache_read_cost_per_million,cache_write_cost_per_million,"
+                "cache_miss_cost_per_million,effective_at) VALUES "
+                "('category-provider','category-model','v1','USD',2,1,3,4,%s)",
+                ("2026-06-01T00:00:00+00:00",),
+            )
+            _insert_attempt(
+                conn,
+                attempt_id="6aaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa",
+                user_id=user_id,
+                call_id="logical-cost-category",
+                resolved_provider="category-provider",
+                resolved_model="category-model",
+                input_tokens=100,
+                cache_read_tokens=20,
+                cache_write_tokens=10,
+                cache_miss_tokens=40,
+            )
+
+        costs = jobs_store.usage_report_snapshot(
+            _usage_query(user_id=user_id)
+        )["attempts"]["costs"]
+
+        # 40 regular*2 + 20 read*1 + 10 write*3 + 30 non-write miss*4.
+        assert costs == [{
+            "currency": "USD",
+            "authoritative_cost": None,
+            "estimated_cost": Decimal("0.00025000"),
+            "authoritative_attempts": 0,
+            "estimated_attempts": 1,
+            "unknown_attempts": 0,
+        }]
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+
+
+def test_usage_snapshot_does_not_relabel_authoritative_cost_currency_conflicts():
+    user_id = "u_attempt_currency_conflict"
+    attempt_id = "6bbbbbbb-bbbb-5bbb-8bbb-bbbbbbbbbbbb"
+    seed_user(user_id, created_at="2026-06-01T00:00:00+00:00")
+    try:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO v2_turn_metrics "
+                "(user_id,lane,model_calls,retries,failed,status,created_at) "
+                "VALUES (%s,'chat',1,0,false,'currency-conflict-turn',%s)",
+                (user_id, "2026-07-01T10:00:00+00:00"),
+            )
+            conn.execute(
+                "INSERT INTO llm_rate_cards "
+                "(provider,model,version,currency,input_cost_per_million,effective_at) "
+                "VALUES ('currency-provider','currency-model','v1','USD',2,%s)",
+                ("2026-06-01T00:00:00+00:00",),
+            )
+            _insert_attempt(
+                conn,
+                attempt_id=attempt_id,
+                user_id=user_id,
+                call_id="logical-currency-conflict",
+                resolved_provider="currency-provider",
+                resolved_model="currency-model",
+                input_tokens=100,
+                cost=Decimal("1.00000000"),
+                currency="USD",
+            )
+            conn.execute(
+                "INSERT INTO llm_provider_attempt_corrections "
+                "(attempt_id,user_id,revision,reason_code,cost_delta,currency) "
+                "VALUES (%s,%s,3,'late_cost',.25,'EUR')",
+                (attempt_id, user_id),
+            )
+
+        costs = jobs_store.usage_report_snapshot(
+            _usage_query(user_id=user_id)
+        )["attempts"]["costs"]
+
+        assert costs == [{
+            "currency": None,
+            "authoritative_cost": Decimal("1.25000000"),
+            "estimated_cost": None,
+            "authoritative_attempts": 1,
+            "estimated_attempts": 0,
+            "unknown_attempts": 0,
+        }]
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+
+
+def test_usage_snapshot_keeps_all_unknown_ledger_usage_and_cost_null():
+    user_id = "u_attempt_unknown"
+    seed_user(user_id, created_at="2026-06-01T00:00:00+00:00")
+    try:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO v2_turn_metrics "
+                "(user_id,lane,model_calls,retries,failed,status,created_at) "
+                "VALUES (%s,'chat',1,0,false,'unknown-turn',%s)",
+                (user_id, "2026-07-01T10:00:00+00:00"),
+            )
+            _insert_attempt(
+                conn,
+                attempt_id="77777777-7777-5777-8777-777777777777",
+                user_id=user_id,
+                call_id="logical-unknown",
+                usage_known=False,
+            )
+        attempts = jobs_store.usage_report_snapshot(
+            _usage_query(user_id=user_id)
+        )["attempts"]
+        assert attempts["overview"]["input_tokens"] is None
+        assert attempts["overview"]["output_tokens"] is None
+        assert attempts["overview"]["reasoning_tokens"] is None
+        assert attempts["costs"] == [{
+            "currency": None,
+            "authoritative_cost": None,
+            "estimated_cost": None,
+            "authoritative_attempts": 0,
+            "estimated_attempts": 0,
+            "unknown_attempts": 1,
+        }]
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+
+
+def test_usage_attempt_section_failure_does_not_hide_whole_turn_sections(
+    monkeypatch, usage_rows,
+):
+    def observer(event, **fields):
+        if event == "read" and fields.get("section") == "attempt_ledger":
+            raise RuntimeError("attempt ledger injected")
+
+    monkeypatch.setattr(jobs_store, "_usage_snapshot_observer", observer)
+
+    report = jobs_store.usage_report_snapshot(_usage_query())
+
+    assert report["attempts"] is None
+    assert report["overview"]["turns"] == 5
+    assert report["overview"]["failed_turns"] == 2
+    assert report["daily"] is not None
+    assert report["users"] is not None
+    assert report["models"] is not None
+
+
 def _shanghai_usage_query(**filters):
     return _usage.UsageQuery(
         start_at_utc=datetime(2026, 6, 30, 16, tzinfo=timezone.utc),
@@ -800,6 +1261,106 @@ def test_usage_page_renders_rollup_freshness_without_coercing_unknown_to_zero():
     assert "lag 0" not in body
 
 
+def test_usage_page_labels_turn_and_attempt_sources_and_escapes_identities():
+    report = _usage_render_report()
+    report["attempts"] = {
+        "overview": {
+            "attempts": 18,
+            "logical_calls": 13,
+            "retry_attempts": 5,
+            "failover_attempts": 2,
+            "failed_attempts": 3,
+            "usage_known_attempts": 15,
+            "usage_unknown_attempts": 3,
+            "possibly_billed_attempts": 1,
+            "input_tokens": 1_210,
+            "output_tokens": 350,
+            "reasoning_tokens": 70,
+            "cache_read_tokens": 610,
+            "cache_write_tokens": 41,
+            "cache_miss_tokens": 302,
+            "ttft_ms_p50": 125,
+            "ttft_ms_p95": 800,
+        },
+        "users": [],
+        "lanes": [],
+        "requested_models": [{
+            "provider": "asked<&",
+            "model": "model<script>",
+            "attempts": 18,
+            "logical_calls": 13,
+            "retry_attempts": 5,
+            "failover_attempts": 2,
+            "failed_attempts": 3,
+            "usage_known_attempts": 15,
+            "usage_unknown_attempts": 3,
+            "possibly_billed_attempts": 1,
+            "input_tokens": 1_210,
+            "output_tokens": 350,
+            "reasoning_tokens": 70,
+            "cache_read_tokens": 610,
+            "cache_write_tokens": 41,
+            "cache_miss_tokens": 302,
+            "ttft_ms_p50": 125,
+            "ttft_ms_p95": 800,
+        }],
+        "resolved_models": [{
+            "provider": "actual>&",
+            "model": "resolved</td>",
+            "attempts": 18,
+            "logical_calls": 13,
+            "retry_attempts": 5,
+            "failover_attempts": 2,
+            "failed_attempts": 3,
+            "usage_known_attempts": 15,
+            "usage_unknown_attempts": 3,
+            "possibly_billed_attempts": 1,
+            "input_tokens": 1_210,
+            "output_tokens": 350,
+            "reasoning_tokens": 70,
+            "cache_read_tokens": 610,
+            "cache_write_tokens": 41,
+            "cache_miss_tokens": 302,
+            "ttft_ms_p50": 125,
+            "ttft_ms_p95": 800,
+        }],
+        "costs": [{
+            "currency": "USD<script>",
+            "authoritative_cost": Decimal("1.25"),
+            "estimated_cost": Decimal("0.75"),
+            "authoritative_attempts": 8,
+            "estimated_attempts": 7,
+            "unknown_attempts": 3,
+        }],
+        "coverage": {
+            "whole_turn_model_calls": 14,
+            "recorded_logical_calls": 13,
+            "logical_call_coverage": 13 / 14,
+            "missing_outer_ordinals": 1,
+            "missing_inner_ordinals": 2,
+            "attempt_sequence_gaps": 3,
+        },
+    }
+
+    with _admin_core.bind("view=usage&preset=30d"):
+        body = _data_track._render_usage_page(report, _usage_query())
+
+    assert "Whole-turn truth" in body
+    assert "Provider-attempt ledger" in body
+    assert "Possibly billed attempts" in body
+    assert "Logical-call coverage" in body
+    assert "13 / 14" in body
+    assert "Attempt sequence gaps" in body
+    assert "Authoritative / estimated / unknown cost" in body
+    assert "Requested provider / model" in body
+    assert "Resolved provider / model" in body
+    assert "asked&lt;&amp;" in body and "model&lt;script&gt;" in body
+    assert "actual&gt;&amp;" in body and "resolved&lt;/td&gt;" in body
+    assert "USD&lt;script&gt;" in body
+    assert "unavailable until P0-B" not in body
+    assert "<script>" not in body
+
+
 def test_usage_parallel_exported_snapshot_matches_raw_and_imports_before_read(
     monkeypatch, usage_rows
 ):
@@ -909,6 +1470,14 @@ def test_usage_parallel_snapshot_excludes_writer_committed_after_export(
                 "status,latency_ms,created_at) VALUES "
                 "(%s,'chat','openrouter','late-model',999,1,1,0,1,0,false,%s,9,%s)",
                 ("u_usage_alpha", "parallel-after-export", "2026-07-01T12:30:00+00:00"),
+            )
+            _insert_attempt(
+                writer,
+                attempt_id="89999999-9999-5999-8999-999999999999",
+                user_id="u_usage_alpha",
+                call_id="parallel-after-export",
+                input_tokens=999,
+                output_tokens=1,
             )
 
     monkeypatch.setattr(jobs_store, "_usage_snapshot_observer", observer)
@@ -2449,7 +3018,7 @@ def test_usage_snapshot_reconciles_users_days_models_failures_and_unknowns(usage
 
     assert set(report) == {
         "overview", "averages", "daily", "users", "models", "lanes",
-        "filters", "coverage"
+        "filters", "coverage", "attempts"
     }
     assert report["overview"] == {
         "registered_accounts": 3,
