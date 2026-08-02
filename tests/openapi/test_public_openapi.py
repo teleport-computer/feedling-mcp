@@ -194,9 +194,10 @@ def test_public_operation_and_parameter_inventory(
     # both accept compatibility JSON envelopes, hence 73 -> 75 bodies.
     # 161 = bodyless unified main-model vision validator; 162 = public runner-fleet
     # health endpoint (from test); +2 = V1 web execution endpoints
-    # (POST /v1/agent/web/{search,fetch}, both with bodies) → 164 ops, 77 bodies.
-    assert len(operations) == 164
-    assert sum("requestBody" in operation for operation in operations.values()) == 77
+    # (POST /v1/agent/web/{search,fetch}, both with bodies) → 164 ops, 77 bodies;
+    # Genesis plaintext estimate + commit add two body-bearing operations.
+    assert len(operations) == 166
+    assert sum("requestBody" in operation for operation in operations.values()) == 79
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")
@@ -303,6 +304,18 @@ def test_runtime_success_statuses_and_non_json_media_are_explicit(
     plaintext_responses = operations[("post", "/v1/genesis/imports/plaintext")]["responses"]
     assert "409" in plaintext_responses
     assert "import_job_active" in plaintext_responses["409"]["description"]
+
+    estimate_responses = operations[
+        ("post", "/v1/genesis/imports/plaintext/estimate")
+    ]["responses"]
+    assert "201" in estimate_responses
+    assert "no LLM call" in estimate_responses["201"]["description"]
+
+    commit_responses = operations[
+        ("post", "/v1/genesis/imports/plaintext/commit")
+    ]["responses"]
+    assert {"200", "202", "404", "409", "410"} <= set(commit_responses)
+    assert "staged_import_expired" in commit_responses["410"]["description"]
 
     image_responses = operations[
         ("get", "/v1/screen/frames/{frame_id}/image")

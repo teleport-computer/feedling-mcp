@@ -29,6 +29,7 @@ GENESIS_STATE_BLOB = "genesis_state"
 GENESIS_PERSONA_BLOB = "genesis_persona"
 GENESIS_VOICE_BLOB = "genesis_voice"
 GENESIS_CHECKPOINT_BLOB_PREFIX = "genesis_checkpoint:"
+GENESIS_STAGED_BLOB_PREFIX = "genesis_staged:"
 GENESIS_SOURCE = "genesis_import"
 GENESIS_PERSONA_REF = f"user_blob:{GENESIS_PERSONA_BLOB}"
 GENESIS_VOICE_REF = f"user_blob:{GENESIS_VOICE_BLOB}"
@@ -60,6 +61,25 @@ def public_stage(stage: str) -> str:
     """Client-facing stage name. v2-internal stages -> legacy phases the old iOS maps;
     legacy/unknown stages pass through unchanged."""
     return _PUBLIC_STAGE_MAP.get(str(stage or ""), str(stage or ""))
+
+
+def public_materials_for_job(job: dict | None) -> list[dict]:
+    row = job if isinstance(job, dict) else {}
+    output = row.get("output") if isinstance(row.get("output"), dict) else {}
+    failed = str(row.get("status") or "") == FAILED_JOB_STATUS
+    materials: list[dict] = []
+    for raw in output.get("materials") or []:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        status = str(item.get("status") or "queued")
+        if failed and status == "processing":
+            status = "failed"
+        if status not in {"queued", "processing", "failed", "done"}:
+            status = "queued"
+        item["status"] = status
+        materials.append(item)
+    return materials
 
 
 PRIVACY_MODE = "backend_storage_no_plaintext_user_provider_authorized"
@@ -319,6 +339,7 @@ SAFE_JOB_METADATA_KEYS = {
     "archive_format",
     "client_version",
     "client_job_id",
+    "distill_model",
     "file_count",
     "history_tier",
     "ingest",
@@ -450,6 +471,70 @@ def _checkpoint_blob_kind(job_id: str) -> str:
     if not safe_job_id:
         raise ValueError("genesis_checkpoint_job_id_required")
     return f"{GENESIS_CHECKPOINT_BLOB_PREFIX}{safe_job_id}"
+
+
+def _staged_blob_kind(staged_id: str) -> str:
+    safe_staged_id = _text(staged_id, 100)
+    if not safe_staged_id or safe_staged_id != str(staged_id or ""):
+        raise ValueError("invalid_staged_id")
+    return f"{GENESIS_STAGED_BLOB_PREFIX}{safe_staged_id}"
+
+
+def create_genesis_staged_payload(store: UserStore, payload: dict, *, ttl_sec: int) -> str:
+    if not isinstance(payload, dict):
+        raise ValueError("json_object_required")
+    staged_id = core_util._new_public_id("staged")
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    envelope, err = core_envelope._build_shared_envelope_for_store(
+        store, raw, item_id=f"genesis_staged_{staged_id}")
+    if envelope is None:
+        raise RuntimeError(f"genesis_staged_envelope_failed:{err}")
+    db.set_blob_strict_mirrored(store.user_id, _staged_blob_kind(staged_id), {
+        "v": 1,
+        "staged_id": staged_id,
+        "content_envelope": envelope,
+        "sha256": _sha256_hex(raw),
+        "expires_at": int(time.time()) + max(60, int(ttl_sec)),
+        "consumed": False,
+        "created_at": _now_iso(),
+    })
+    return staged_id
+
+
+def load_genesis_staged_payload(
+    store: UserStore, api_key: str | None, staged_id: str
+) -> dict:
+    blob = db.get_blob_strict(store.user_id, _staged_blob_kind(staged_id))
+    if not isinstance(blob, dict):
+        raise LookupError("staged_import_not_found")
+    if bool(blob.get("consumed")):
+        raise ValueError("staged_import_consumed")
+    if int(blob.get("expires_at") or 0) <= int(time.time()):
+        raise TimeoutError("staged_import_expired")
+    envelope = blob.get("content_envelope")
+    if not isinstance(envelope, dict):
+        raise RuntimeError("staged_import_payload_missing")
+    raw = core_enclave._decrypt_envelope_via_enclave(
+        envelope, api_key, purpose="genesis_staged_payload")
+    if _sha256_hex(raw) != str(blob.get("sha256") or ""):
+        raise RuntimeError("staged_import_sha256_mismatch")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("staged_import_invalid_json") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("staged_import_invalid_object")
+    return payload
+
+
+def mark_genesis_staged_consumed(store: UserStore, staged_id: str, job_id: str) -> None:
+    db.set_blob_strict_mirrored(store.user_id, _staged_blob_kind(staged_id), {
+        "v": 1,
+        "staged_id": staged_id,
+        "consumed": True,
+        "job_id": _text(job_id, 100),
+        "consumed_at": _now_iso(),
+    })
 
 
 def write_genesis_checkpoint(store: UserStore, job_id: str, checkpoint_doc: dict) -> None:

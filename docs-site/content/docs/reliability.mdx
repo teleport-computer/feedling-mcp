@@ -154,6 +154,15 @@ provider's context limit.
 
 ## Genesis plaintext processing
 
+New clients use a two-step flow. `POST /v1/genesis/imports/plaintext/estimate`
+parses and encrypted-stages the upload without making an LLM call, then returns
+per-material `windows` / `est_tokens`, `est_total_tokens`, and an optional
+`recommended_model`. `POST /v1/genesis/imports/plaintext/commit` accepts the
+returned `staged_id` and an optional `distill_model`. The override applies only
+to that Genesis job; the configured chat model is unchanged. Missing, consumed,
+and expired stages return distinct `staged_import_not_found`,
+`staged_import_consumed`, and `staged_import_expired` errors.
+
 `POST /v1/genesis/imports/plaintext` allows one processing plaintext import per
 account. A second submission returns `409 import_job_active` and the existing
 `active_job_id`; clients should display or poll that job rather than retrying
@@ -176,6 +185,11 @@ starts again from the unfinished map or reduction work. Status and onboarding
 validation retain the durable `processed_chunks` count and per-material
 `windows_done` / `windows_total` values after failure; only a completed job
 reports 100 percent.
+
+Job status also exposes `identity_ready` and material entries ordered as AI
+persona, user profile, memory summary, then chat history. Material status uses
+`queued`, `processing`, `failed`, or `done`; `cards` reports the durable mapped
+candidate count instead of a placeholder.
 
 Automatic Runtime V2 heartbeat and agent-scheduled wake failures use a
 persistent per-user exponential retry delay. The delay starts at 60 seconds

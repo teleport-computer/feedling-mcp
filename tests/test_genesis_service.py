@@ -106,6 +106,7 @@ def test_create_import_job_drops_plaintext_metadata(monkeypatch):
             "file_manifest_hash": "abc123",
             "file_count": 2,
             "timeline_span_days": 7,
+            "distill_model": "claude-haiku-4-5",
         },
     })
 
@@ -113,6 +114,7 @@ def test_create_import_job_drops_plaintext_metadata(monkeypatch):
     assert metadata["file_manifest_hash"] == "abc123"
     assert metadata["file_count"] == 2
     assert metadata["timeline_span_days"] == 7
+    assert metadata["distill_model"] == "claude-haiku-4-5"
     assert metadata["privacy_copy"] == service.PRIVACY_COPY
     assert "transcript" not in metadata
     assert "ai_persona" not in metadata
@@ -1277,3 +1279,35 @@ def test_genesis_checkpoint_load_verifies_and_decrypts(monkeypatch):
     )
 
     assert service.load_genesis_checkpoint(_store(), "api-key", "job_1") == checkpoint_doc
+
+
+def test_genesis_staged_payload_is_encrypted_and_consumed_as_tombstone(monkeypatch):
+    stored = {}
+
+    def build_envelope(_store, raw, *, item_id):
+        stored["raw"] = raw
+        return {"body_ct": "ciphertext", "id": item_id}, ""
+
+    monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", build_envelope)
+    monkeypatch.setattr(
+        service.db,
+        "set_blob_strict_mirrored",
+        lambda user_id, kind, doc: stored.update(user_id=user_id, kind=kind, doc=doc),
+    )
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda *_args: stored["doc"])
+    monkeypatch.setattr(
+        service.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: stored["raw"],
+    )
+
+    staged_id = service.create_genesis_staged_payload(
+        _store(), {"content": "secret history"}, ttl_sec=600)
+    assert stored["kind"] == f"genesis_staged:{staged_id}"
+    assert "secret history" not in json.dumps(stored["doc"])
+    assert service.load_genesis_staged_payload(
+        _store(), "api-key", staged_id) == {"content": "secret history"}
+
+    service.mark_genesis_staged_consumed(_store(), staged_id, "job_1")
+    assert stored["doc"]["consumed"] is True
+    assert "content_envelope" not in stored["doc"]

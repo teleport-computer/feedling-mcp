@@ -13,11 +13,13 @@ import os
 import re
 import threading
 import time
+from dataclasses import replace
 from datetime import date
 from typing import Any
 
 import db
 import debug_trace
+import provider_client
 from core import enclave as core_enclave
 from genesis import checkpoint, dedup, foreground, foreground_identity, lightweight_identity, service, worker
 from genesis.llm_client import GenesisLLMClient
@@ -31,9 +33,9 @@ from notices import core as notices_core
 _SECONDS_PER_DAY = 24 * 60 * 60
 _PLAINTEXT_SOURCE_ORDER = (
     history_import._AI_PERSONA_SOURCE,
-    history_import._HISTORY_SOURCE,
-    history_import._MEMORY_SUMMARY_SOURCE,
     history_import._USER_PROFILE_SOURCE,
+    history_import._MEMORY_SUMMARY_SOURCE,
+    history_import._HISTORY_SOURCE,
 )
 _PLAINTEXT_SUPPORT_SOURCE_FAMILIES = {
     history_import._AI_PERSONA_SOURCE,
@@ -42,6 +44,12 @@ _PLAINTEXT_SUPPORT_SOURCE_FAMILIES = {
 }
 _PLAINTEXT_MODES = {"onboarding", "add_memory", "update_identity"}
 MATERIAL_EMPTY_ERROR = "material_empty"
+_MATERIAL_KIND_BY_FAMILY = {
+    "ai_persona": "ai_persona",
+    "user_profile": "user_profile",
+    "memory_summary": "memory_summary",
+    "history": "chat_history",
+}
 
 
 class MaterialEmptyError(ValueError):
@@ -275,6 +283,71 @@ def _prepare_plaintext_import(payload: dict) -> dict:
     }
 
 
+def _staged_ttl_sec() -> int:
+    try:
+        return max(60, int(os.environ.get("FEEDLING_GENESIS_STAGED_TTL_SEC", "86400")))
+    except (TypeError, ValueError):
+        return 86400
+
+
+def _estimate_plaintext_materials(prepared: dict) -> tuple[list[dict], int]:
+    materials: list[dict] = []
+    for group in prepared.get("source_groups") or []:
+        if not isinstance(group, dict):
+            continue
+        chunks = [str(text) for text in group.get("chunk_texts") or [] if str(text or "").strip()]
+        if not chunks:
+            continue
+        family = str(group.get("source_family") or "history")
+        # Conservative arithmetic: input chars / 3.5 plus prompt and maximum
+        # output reservations for every real map window.
+        input_tokens = math.ceil(sum(len(text) for text in chunks) / 3.5)
+        estimated = input_tokens + len(chunks) * (1200 + 2400)
+        materials.append({
+            "kind": _MATERIAL_KIND_BY_FAMILY.get(family, family),
+            "windows": len(chunks),
+            "est_tokens": estimated,
+        })
+    return materials, sum(item["est_tokens"] for item in materials)
+
+
+def _recommended_distill_model(store, api_key: str | None) -> str | None:
+    runtime = hosted_config_store._load_runtime_provider_config(store, api_key)
+    if isinstance(runtime, tuple):
+        return None
+    provider = provider_client.normalize_provider(runtime.provider)
+    if provider == "openrouter":
+        return "anthropic/claude-haiku-4-5"
+    if provider == "anthropic":
+        return "claude-haiku-4-5"
+    if provider != "openai_compatible":
+        return None
+    try:
+        catalog = provider_client.list_provider_models(
+            provider, runtime.api_key, runtime.base_url, total_budget_sec=3.0)
+    except Exception:
+        return None
+    ids = [
+        str(item.get("id") or "")
+        for item in catalog.get("models") or []
+        if isinstance(item, dict) and "thinking" not in str(item.get("id") or "").lower()
+    ]
+    for needle in ("haiku", "flash", "mini"):
+        match = next((model_id for model_id in ids if needle in model_id.lower()), "")
+        if match:
+            return match
+    return None
+
+
+def _distill_model_override(value: Any) -> str:
+    model = str(value or "").strip()
+    if not model:
+        return ""
+    if len(model) > 160 or any(ord(char) < 32 for char in model):
+        raise ValueError("invalid_distill_model")
+    return model
+
+
 def _plaintext_job_metadata(
     payload: dict,
     prepared: dict,
@@ -384,7 +457,9 @@ class _PlaintextCheckpointProgress:
             source_pass=source_pass,
         )
 
-    def record_non_map_group(self, source_pass: int, source_family: str) -> None:
+    def record_non_map_group(
+        self, source_pass: int, source_family: str, *, cards: int = 0
+    ) -> None:
         """Mark direct-reduce source windows complete after that reduce succeeds."""
         task_id = self._task_id(source_pass, source_family)
         total = len(self.source_groups[source_pass - 1].get("chunk_texts") or [])
@@ -399,6 +474,9 @@ class _PlaintextCheckpointProgress:
                 source_pass=str(source_pass),
                 output_summary="direct_reduce_complete",
             )
+        material_cards = dict(self.doc.get("material_cards") or {})
+        material_cards[task_id] = max(0, int(cards))
+        self.doc["material_cards"] = material_cards
         service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
         self.publish(
             stage="plaintext_reducer",
@@ -408,6 +486,8 @@ class _PlaintextCheckpointProgress:
 
     def materials(self, *, active_pass: int = 0) -> list[dict]:
         materials: list[dict] = []
+        outputs = self.doc.get("map_outputs") if isinstance(self.doc.get("map_outputs"), dict) else {}
+        material_cards = self.doc.get("material_cards") if isinstance(self.doc.get("material_cards"), dict) else {}
         for source_pass, group in enumerate(self.source_groups, start=1):
             family = str(group.get("source_family") or "history")
             task_id = self._task_id(source_pass, family)
@@ -421,15 +501,26 @@ class _PlaintextCheckpointProgress:
             elif source_pass == active_pass or done:
                 status = "processing"
             else:
-                status = "pending"
+                status = "queued"
+            cards = int(material_cards.get(task_id) or 0)
+            if not cards:
+                cards = sum(
+                    len((outputs.get(checkpoint.task_key(task_id, idx)) or {}).get("fact_candidates") or [])
+                    for idx in range(total)
+                    if isinstance(outputs.get(checkpoint.task_key(task_id, idx)), dict)
+                )
             materials.append({
                 "kind": "chat_history" if family == "history" else family,
                 "status": status,
                 "windows_done": done,
                 "windows_total": total,
-                "cards": 0,
+                "cards": cards,
             })
         return materials
+
+    def mark_identity_ready(self) -> None:
+        self.doc["identity_ready"] = True
+        service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
 
     def processed_chunks(self) -> int:
         return sum(item["windows_done"] for item in self.materials())
@@ -446,6 +537,7 @@ class _PlaintextCheckpointProgress:
         output: dict[str, Any] = {
             "stage": stage,
             "materials": self.materials(active_pass=source_pass),
+            "identity_ready": bool(self.doc.get("identity_ready")),
         }
         if source_family:
             output["source_family"] = source_family
@@ -1169,6 +1261,7 @@ def _run_plaintext_genesis_v2(
         service.apply_reducer_output(store, api_key, job_id, fg_merged)
 
     if progress:
+        progress.mark_identity_ready()
         progress.publish(
             stage="genesis_v2_foreground_ready",
             status=service.DONE_JOB_STATUS,
@@ -1500,6 +1593,7 @@ def _run_plaintext_add_memory_job(
     if completed:
         service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
         if progress:
+            progress.mark_identity_ready()
             progress.publish(stage="plaintext_add_memory_done", status=service.DONE_JOB_STATUS)
     _write_back_plaintext_user_name(store, api_key, user_name)
 
@@ -1592,6 +1686,7 @@ def _run_plaintext_update_identity_job(
     if completed:
         service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
         if progress:
+            progress.mark_identity_ready()
             progress.publish(stage="plaintext_update_identity_done", status=service.DONE_JOB_STATUS)
         # this update_identity path never goes through service.apply_reducer_output
         # (which resolves genesis notices on the other completion paths) -> resolve
@@ -1653,6 +1748,10 @@ def _run_plaintext_genesis_job(
         if isinstance(runtime, tuple):
             _, err = runtime
             raise RuntimeError(json.dumps(err, ensure_ascii=False))
+        job_metadata = job.get("metadata") if isinstance((job or {}).get("metadata"), dict) else {}
+        distill_model = _distill_model_override(job_metadata.get("distill_model"))
+        if distill_model:
+            runtime = replace(runtime, model=distill_model)
         _trace_genesis(
             store,
             "genesis.plaintext.runtime.loaded",
@@ -1815,6 +1914,7 @@ def _run_plaintext_genesis_job(
             },
         )
         service.apply_reducer_output(store, api_key, job_id, reducer_output)
+        progress.mark_identity_ready()
         progress.publish(stage="plaintext_reducer_done", status=service.DONE_JOB_STATUS)
         _write_back_plaintext_user_name(store, api_key, user_name)
         _trace_genesis(

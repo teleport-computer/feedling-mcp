@@ -157,6 +157,15 @@ fields. An authorized retry decrypts the checkpoint inside the trusted boundary
 and skips completed windows; successful completion deletes the checkpoint.
 Resident-sealed imports and their local plaintext boundary are unchanged.
 
+Managed clients can first call the plaintext estimate endpoint. The API parses
+the material without an LLM call, stores the original payload in a short-lived
+shared encrypted envelope, and returns only material kinds, window counts,
+conservative token estimates, and an optional model recommendation. Commit
+decrypts that account-bound stage inside the trusted boundary and starts the
+same plaintext pipeline. A commit-time model override is copied into job
+metadata and changes only that job's model string; it does not mutate the
+account's chat route, provider URL, or credential.
+
 ### ElevenLabs voice calls
 
 1. An authenticated client creates a short-lived voice session with

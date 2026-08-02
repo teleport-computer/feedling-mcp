@@ -3720,7 +3720,13 @@ def _fetch_catalog_page(client: httpx.Client, url: str, headers: dict,
     return body, total
 
 
-def list_provider_models(provider: str, api_key: str, base_url: str = "") -> dict:
+def list_provider_models(
+    provider: str,
+    api_key: str,
+    base_url: str = "",
+    *,
+    total_budget_sec: float | None = None,
+) -> dict:
     provider = normalize_provider(provider)
     warnings: list[str] = []
     try:
@@ -3737,7 +3743,8 @@ def list_provider_models(provider: str, api_key: str, base_url: str = "") -> dic
     cursor: str | None = None
     complete = True
     total_bytes = 0
-    deadline = time.monotonic() + _CATALOG_TOTAL_BUDGET
+    budget = _CATALOG_TOTAL_BUDGET if total_budget_sec is None else float(total_budget_sec)
+    deadline = time.monotonic() + max(0.1, budget)
     client = _http_client()
 
     for _page in range(_CATALOG_MAX_PAGES):

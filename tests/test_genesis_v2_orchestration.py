@@ -110,6 +110,9 @@ def test_v2_sampled_foreground_checkpoints_full_history_indices(monkeypatch):
         def publish(self, **_kwargs):
             return None
 
+        def mark_identity_ready(self):
+            return None
+
     progress = Progress()
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
 

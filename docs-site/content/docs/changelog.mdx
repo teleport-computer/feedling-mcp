@@ -25,6 +25,15 @@ change must not be interpreted as an API guarantee.
   `failed` with the underlying action error instead of completing with a zero
   memory count; partial batches that write at least one card still complete.
 
+- **Genesis onboarding supports estimate then commit.** Managed clients can
+  encrypted-stage onboarding material and receive per-material window/token
+  estimates without an LLM call, then commit the `staged_id` with an optional
+  job-only model override. Fast-model recommendations use the configured
+  provider, including a three-second catalog probe for compatible relays. Job
+  status now exposes ordered material progress, real candidate-card counts,
+  `identity_ready`, and cause-aware failure fields. Missing, consumed, and
+  expired stages have distinct 4xx errors.
+
 - **Genesis plaintext processing now fails fast and resumes completed windows.**
   `POST /v1/genesis/imports/plaintext` permits only one processing plaintext
   job per account. A concurrent submission returns `409 import_job_active`

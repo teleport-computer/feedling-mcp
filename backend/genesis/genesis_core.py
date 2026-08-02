@@ -38,6 +38,7 @@ import re
 from typing import Any
 
 import db
+from genesis import plaintext as plaintext_helpers
 from genesis import service
 from hosted import history_import
 from identity import service as identity_service
@@ -420,7 +421,10 @@ def _job_response(job: dict | None, *, extra: dict | None = None) -> dict:
     # so shipped apps show correct copy without an update. Stored stage is unchanged.
     out = job.get("output")
     if isinstance(out, dict) and out.get("stage"):
-        job = {**job, "output": {**out, "stage": service.public_stage(out["stage"])}}
+        public_output = {**out, "stage": service.public_stage(out["stage"])}
+        if isinstance(out.get("materials"), list):
+            public_output["materials"] = service.public_materials_for_job(job)
+        job = {**job, "output": public_output}
     body = {
         "job": job,
         "privacy_mode": service.PRIVACY_MODE,
@@ -515,6 +519,20 @@ def get_import_status(store, job_id: str, *, include_missing_raw) -> tuple[dict,
             job_id,
             int(job.get("total_chunks") or 0),
         )
+    output = job.get("output") if isinstance(job.get("output"), dict) else {}
+    status_projection: dict[str, Any] = {
+        "job_id": str(job.get("job_id") or job_id),
+        "status": str(job.get("status") or ""),
+        "identity_ready": bool(output.get("identity_ready")),
+        "materials": service.public_materials_for_job(job),
+        "error_class": None,
+        "friendly_copy": "",
+    }
+    if str(job.get("status") or "") == service.FAILED_JOB_STATUS:
+        error_class = service.classify_genesis_error(str(job.get("error") or ""))
+        status_projection["error_class"] = error_class
+        status_projection["friendly_copy"] = service.genesis_failure_required_text(error_class)
+    extra.update(status_projection)
     return _job_response(job, extra=extra), 200
 
 
@@ -670,6 +688,7 @@ def plaintext_import(
     plaintext_mode,
     job_metadata,
     start_job,
+    distill_model: str = "",
 ) -> tuple[dict, int]:
     """Enqueue (or reuse) a plaintext genesis distill job.
 
@@ -680,6 +699,10 @@ def plaintext_import(
     that patch ``routes._start_plaintext_genesis_job`` keep working."""
     if not isinstance(payload, dict):
         return _bad("json_object_required", 400)
+    try:
+        normalized_distill_model = plaintext_helpers._distill_model_override(distill_model)
+    except ValueError as e:
+        return _bad(str(e), 400)
 
     # Route by body type, not a global switch. A SEALED body (self-hosted app encrypted it
     # client-side so the server never sees plaintext) → resident lane, where the user's own
@@ -727,6 +750,15 @@ def plaintext_import(
         return _bad_from_value_error(e, 400)
 
     if existing:
+        existing_metadata = (
+            existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {}
+        )
+        if normalized_distill_model or existing_metadata.get("distill_model"):
+            existing = db.genesis_patch_job_metadata(
+                store.user_id,
+                str(existing.get("job_id") or ""),
+                {"distill_model": normalized_distill_model or None},
+            ) or existing
         try:
             existing = db.genesis_set_job_status(
                 store.user_id,
@@ -757,6 +789,8 @@ def plaintext_import(
         input_hash=input_hash,
         mode=mode,
     )
+    if normalized_distill_model:
+        metadata["distill_model"] = normalized_distill_model
     total_bytes = sum(len(text.encode("utf-8")) for text in prepared["chunk_texts"])
     try:
         job, _status = service.create_import_job(store, {
@@ -791,3 +825,72 @@ def plaintext_import(
         analysis_messages=prepared["analysis_messages"],
     )
     return _job_response(job, extra={"status": "processing"}), 202
+
+
+def plaintext_estimate(store, payload: dict, *, api_key: str | None) -> tuple[dict, int]:
+    if not isinstance(payload, dict):
+        return _bad("json_object_required", 400)
+    if _is_sealed_body(payload):
+        return _bad("sealed_estimate_unsupported", 400)
+    try:
+        prepared = plaintext_helpers._prepare_plaintext_import(payload)
+        materials, total = plaintext_helpers._estimate_plaintext_materials(prepared)
+        staged_id = service.create_genesis_staged_payload(
+            store, payload, ttl_sec=plaintext_helpers._staged_ttl_sec())
+    except ValueError as e:
+        return _bad_from_value_error(e, 400)
+    except Exception as e:  # noqa: BLE001
+        return _bad(f"staged_import_create_failed:{type(e).__name__}", 500)
+    return {
+        "staged_id": staged_id,
+        "materials": materials,
+        "est_total_tokens": total,
+        "recommended_model": plaintext_helpers._recommended_distill_model(store, api_key),
+    }, 201
+
+
+def plaintext_commit(
+    store,
+    payload: dict,
+    *,
+    api_key: str | None,
+    prepare,
+    find_reusable,
+    plaintext_mode,
+    job_metadata,
+    start_job,
+) -> tuple[dict, int]:
+    if not isinstance(payload, dict):
+        return _bad("json_object_required", 400)
+    staged_id = str(payload.get("staged_id") or "").strip()
+    if not staged_id:
+        return _bad("staged_id_required", 400)
+    try:
+        staged_payload = service.load_genesis_staged_payload(store, api_key, staged_id)
+    except LookupError as e:
+        return _bad(str(e), 404)
+    except TimeoutError as e:
+        return _bad(str(e), 410)
+    except ValueError as e:
+        return _bad(str(e), 409 if str(e) == "staged_import_consumed" else 400)
+    except Exception as e:  # noqa: BLE001
+        return _bad(f"staged_import_load_failed:{type(e).__name__}", 500)
+    body, status = plaintext_import(
+        store,
+        staged_payload,
+        api_key=api_key,
+        prepare=prepare,
+        find_reusable=find_reusable,
+        plaintext_mode=plaintext_mode,
+        job_metadata=job_metadata,
+        start_job=start_job,
+        distill_model=str(payload.get("distill_model") or ""),
+    )
+    if 200 <= status < 300:
+        job = body.get("job") if isinstance(body.get("job"), dict) else {}
+        try:
+            service.mark_genesis_staged_consumed(
+                store, staged_id, str(job.get("job_id") or ""))
+        except Exception:
+            log.exception("genesis staged tombstone write failed staged_id=%s", staged_id)
+    return body, status

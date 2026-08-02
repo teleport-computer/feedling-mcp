@@ -62,6 +62,20 @@ class _CoreClient:
                 start_job=plaintext._start_plaintext_genesis_job,
             )
             return _Resp(body, status)
+        if p == "/v1/genesis/imports/plaintext/estimate":
+            body, status = genesis_core.plaintext_estimate(
+                self._store, json or {}, api_key="user_api_key")
+            return _Resp(body, status)
+        if p == "/v1/genesis/imports/plaintext/commit":
+            body, status = genesis_core.plaintext_commit(
+                self._store, json or {}, api_key="user_api_key",
+                prepare=plaintext._prepare_plaintext_import,
+                find_reusable=plaintext._find_reusable_plaintext_job,
+                plaintext_mode=plaintext._plaintext_mode,
+                job_metadata=plaintext._plaintext_job_metadata,
+                start_job=plaintext._start_plaintext_genesis_job,
+            )
+            return _Resp(body, status)
         raise AssertionError(f"unrouted path: {p}")
 
 
@@ -542,16 +556,163 @@ def test_prepare_plaintext_import_builds_ordered_per_source_groups(monkeypatch):
 
     assert [group["source_family"] for group in prepared["source_groups"]] == [
         "ai_persona",
-        "history",
-        "memory_summary",
         "user_profile",
+        "memory_summary",
+        "history",
     ]
     assert prepared["chunk_texts"] == [
         "ai_persona_import:1",
-        "history_import:1",
-        "memory_summary_import:1",
         "user_profile_import:1",
+        "memory_summary_import:1",
+        "history_import:1",
     ]
+
+
+def test_plaintext_estimate_stages_without_llm_and_returns_locked_contract(monkeypatch):
+    monkeypatch.setattr(
+        plaintext.service,
+        "create_genesis_staged_payload",
+        lambda _store, payload, **_kwargs: "staged_1",
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_recommended_distill_model",
+        lambda *_args: "anthropic/claude-haiku-4-5",
+    )
+
+    resp = _client(monkeypatch).post("/v1/genesis/imports/plaintext/estimate", json={
+        "ai_persona_content": "Name: Mira",
+        "personal_profile_content": "User likes direct answers",
+        "content": "User: hello\nAssistant: hi",
+    })
+
+    assert resp.status_code == 201
+    body = resp.get_json()
+    assert set(body) == {
+        "staged_id", "materials", "est_total_tokens", "recommended_model"
+    }
+    assert body["staged_id"] == "staged_1"
+    assert [item["kind"] for item in body["materials"]] == [
+        "ai_persona", "user_profile", "chat_history"
+    ]
+    assert all(set(item) == {"kind", "windows", "est_tokens"} for item in body["materials"])
+    assert body["est_total_tokens"] == sum(item["est_tokens"] for item in body["materials"])
+    assert body["recommended_model"] == "anthropic/claude-haiku-4-5"
+
+
+def test_plaintext_commit_applies_job_model_override_and_consumes_stage(monkeypatch):
+    staged_payload = {"format": "plaintext", "content": "User: hello"}
+    captured = {}
+    monkeypatch.setattr(
+        plaintext.service, "load_genesis_staged_payload",
+        lambda *_args: staged_payload,
+    )
+    monkeypatch.setattr(
+        plaintext.service, "mark_genesis_staged_consumed",
+        lambda _store, staged_id, job_id: captured.update(consumed=(staged_id, job_id)),
+    )
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [])
+
+    def fake_create(_store, payload, **_kwargs):
+        captured["metadata"] = payload["metadata"]
+        return ({"job_id": "job_commit", "status": "processing", "metadata": payload["metadata"]}, 201)
+
+    monkeypatch.setattr(plaintext.service, "create_import_job", fake_create)
+    monkeypatch.setattr(
+        plaintext.db, "genesis_set_job_status",
+        lambda *_args, **_kwargs: {
+            "job_id": "job_commit", "status": "processing", "metadata": captured["metadata"]
+        },
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plaintext, "_start_plaintext_genesis_job", lambda *_args, **_kwargs: True)
+
+    resp = _client(monkeypatch).post("/v1/genesis/imports/plaintext/commit", json={
+        "staged_id": "staged_1",
+        "distill_model": "anthropic/claude-haiku-4-5",
+    })
+
+    assert resp.status_code == 202
+    assert captured["metadata"]["distill_model"] == "anthropic/claude-haiku-4-5"
+    assert captured["consumed"] == ("staged_1", "job_commit")
+
+
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        (LookupError("staged_import_not_found"), 404),
+        (TimeoutError("staged_import_expired"), 410),
+        (ValueError("staged_import_consumed"), 409),
+    ],
+)
+def test_plaintext_commit_staged_id_errors_are_distinct(monkeypatch, error, status):
+    monkeypatch.setattr(
+        plaintext.service,
+        "load_genesis_staged_payload",
+        lambda *_args: (_ for _ in ()).throw(error),
+    )
+
+    resp = _client(monkeypatch).post(
+        "/v1/genesis/imports/plaintext/commit", json={"staged_id": "staged_1"})
+
+    assert resp.status_code == status
+    assert resp.get_json()["error"] == str(error)
+
+
+def test_recommended_distill_model_catalog_priority(monkeypatch):
+    runtime = plaintext.provider_client.ProviderConfig(
+        "openai_compatible", "chat-model", "secret", "https://relay.example/v1")
+    monkeypatch.setattr(
+        plaintext.hosted_config_store,
+        "_load_runtime_provider_config",
+        lambda *_args: runtime,
+    )
+    captured = {}
+
+    def catalog(*_args, **kwargs):
+        captured.update(kwargs)
+        return {"models": [
+            {"id": "vendor/flash-thinking"},
+            {"id": "vendor/mini-fast"},
+            {"id": "vendor/haiku-fast"},
+        ]}
+
+    monkeypatch.setattr(plaintext.provider_client, "list_provider_models", catalog)
+
+    assert plaintext._recommended_distill_model(_store(), "key") == "vendor/haiku-fast"
+    assert captured["total_budget_sec"] == 3.0
+
+
+def test_plaintext_status_exposes_identity_materials_and_failure_copy(monkeypatch):
+    materials = [{
+        "kind": "chat_history",
+        "status": "processing",
+        "windows_done": 2,
+        "windows_total": 4,
+        "cards": 7,
+    }]
+    monkeypatch.setattr(
+        genesis_core.db,
+        "genesis_get_job",
+        lambda *_args: {
+            "job_id": "job_status",
+            "status": "failed",
+            "error": "plaintext_import_failed:ReadTimeout",
+            "output": {"identity_ready": True, "materials": materials},
+        },
+    )
+    monkeypatch.setattr(genesis_core.db, "get_blob", lambda *_args: None)
+
+    body, status = genesis_core.get_import_status(
+        _store(), "job_status", include_missing_raw=False)
+
+    assert status == 200
+    assert body["job_id"] == "job_status"
+    assert body["status"] == "failed"
+    assert body["identity_ready"] is True
+    assert body["materials"] == [{**materials[0], "status": "failed"}]
+    assert body["error_class"] == "provider_timeout"
+    assert body["friendly_copy"]
 
 
 def test_plaintext_background_runner_distills_and_applies(monkeypatch):
@@ -572,11 +733,18 @@ def test_plaintext_background_runner_distills_and_applies(monkeypatch):
             "status": kwargs["status"],
             "source_kind": "history_import",
             "privacy_mode": service.PRIVACY_MODE,
+            "metadata": {"distill_model": "fast-genesis-model"},
         }
 
     monkeypatch.setattr(plaintext.db, "genesis_set_job_status", fake_set_status)
     monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(plaintext.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    chat_runtime = plaintext.provider_client.ProviderConfig(
+        "anthropic", "chat-model", "provider-key", "https://api.anthropic.com")
+    monkeypatch.setattr(
+        plaintext.hosted_config_store,
+        "_load_runtime_provider_config",
+        lambda *_args: chat_runtime,
+    )
 
     def fake_build(**kwargs):
         calls["build"] = kwargs
@@ -606,9 +774,12 @@ def test_plaintext_background_runner_distills_and_applies(monkeypatch):
     assert calls["build"]["user_id"] == "usr_plaintext"
     assert calls["build"]["chunk_texts"] == ["window 1"]
     assert calls["build"]["source_kind"] == "history_import"
+    assert calls["build"]["runtime"].model == "fast-genesis-model"
+    assert chat_runtime.model == "chat-model"
     assert calls["applied"]["memories"] == []
     assert calls["statuses"][-1]["processed_chunks"] == 1
     assert calls["statuses"][-1]["status"] == service.DONE_JOB_STATUS
+    assert calls["statuses"][-1]["output"]["identity_ready"] is True
     assert calls["statuses"][-1]["output"]["materials"] == [{
         "kind": "chat_history",
         "status": "done",
@@ -635,6 +806,37 @@ def test_plaintext_background_runner_distills_and_applies(monkeypatch):
         "genesis.plaintext.apply.started",
         "genesis.plaintext.done",
     ]
+
+
+def test_plaintext_material_cards_come_from_durable_map_outputs(monkeypatch):
+    statuses = []
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        lambda *_args, **kwargs: statuses.append(kwargs) or None,
+    )
+    progress = plaintext._PlaintextCheckpointProgress(
+        _store(),
+        "api-key",
+        "job-cards",
+        [{
+            "source_kind": "history_import",
+            "source_family": "history",
+            "chunk_texts": ["window"],
+        }],
+    )
+
+    progress.record_map(1, "history", 0, {
+        "fact_candidates": [{"summary": "one"}, {"summary": "two"}],
+    })
+
+    assert statuses[-1]["output"]["materials"] == [{
+        "kind": "chat_history",
+        "status": "done",
+        "windows_done": 1,
+        "windows_total": 1,
+        "cards": 2,
+    }]
 
 
 def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(monkeypatch):

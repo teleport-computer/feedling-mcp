@@ -3108,6 +3108,12 @@ def set_blob_strict(user_id: str, kind: str, doc) -> None:
                 )
 
 
+def set_blob_strict_mirrored(user_id: str, kind: str, doc) -> None:
+    """Strict singleton write with the same mirror policy as ``set_blob``."""
+    set_blob_strict(user_id, kind, doc)
+    _mirror_persisted_blob(user_id, kind, doc)
+
+
 def set_onboarding_route_strict(user_id: str, doc: dict) -> str | None:
     """Persist the route selector and reconcile the V1 model route atomically.
 
@@ -4361,6 +4367,22 @@ def genesis_list_jobs(user_id: str, *, limit: int = 20) -> list[dict]:
                 item[key] = value.isoformat()
         out.append(item)
     return out
+
+
+def genesis_patch_job_metadata(user_id: str, job_id: str, patch: dict) -> dict | None:
+    if not isinstance(patch, dict) or not patch:
+        return genesis_get_job(user_id, job_id)
+    sql = (
+        "UPDATE genesis_import_jobs SET metadata = metadata || %s::jsonb, "
+        "updated_at = now() WHERE user_id = %s AND job_id = %s RETURNING *"
+    )
+    params = (Jsonb(patch), user_id, job_id)
+    with get_pool().connection() as conn:
+        cur = conn.execute(sql, params)
+        result = _genesis_row(cur, cur.fetchone())
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
+    return result
 
 
 def genesis_claim_uploaded_jobs(*, worker_id: str = "", limit: int = 1) -> list[dict]:

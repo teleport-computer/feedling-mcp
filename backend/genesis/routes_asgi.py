@@ -67,6 +67,39 @@ async def genesis_import_plaintext(request: Request, auth: AuthResult = Depends(
     return JSONResponse(body, status_code=status)
 
 
+@router.post("/v1/genesis/imports/plaintext/estimate")
+async def genesis_import_plaintext_estimate(
+    request: Request, auth: AuthResult = Depends(require_auth)
+):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    body, status = await threadpool.run_db(
+        genesis_core.plaintext_estimate,
+        auth.store,
+        payload,
+        api_key=auth.api_key,
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/genesis/imports/plaintext/commit")
+async def genesis_import_plaintext_commit(
+    request: Request, auth: AuthResult = Depends(require_auth)
+):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    body, status = await threadpool.run_db(
+        genesis_core.plaintext_commit,
+        auth.store,
+        payload,
+        api_key=auth.api_key,
+        prepare=genesis_flask_routes._prepare_plaintext_import,
+        find_reusable=genesis_flask_routes._find_reusable_plaintext_job,
+        plaintext_mode=genesis_flask_routes._plaintext_mode,
+        job_metadata=genesis_flask_routes._plaintext_job_metadata,
+        start_job=genesis_flask_routes._start_plaintext_genesis_job,
+    )
+    return JSONResponse(body, status_code=status)
+
+
 @router.get("/v1/genesis/imports")
 async def genesis_import_list(request: Request, auth: AuthResult = Depends(require_auth)):
     body, status = await threadpool.run_db(

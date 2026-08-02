@@ -184,7 +184,7 @@ def test_failed_genesis_reports_durable_window_progress_and_materials(monkeypatc
     assert history["progress"] == 40
     assert history["candidate_windows_done"] == 2
     assert history["candidate_windows_total"] == 5
-    assert history["materials"] == materials
+    assert history["materials"] == [{**materials[0], "status": "failed"}]
 
 
 def test_model_api_failed_genesis_required_names_the_real_cause(monkeypatch):

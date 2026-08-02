@@ -241,7 +241,7 @@ def _model_api_steps_with_genesis(
         "history_windows_failed": history_windows_failed,
         "degraded": bool(history_windows_failed > 0),
         "support_inputs_present": bool(_int_value(metadata.get("support_count")) > 0),
-        "materials": output.get("materials") if isinstance(output.get("materials"), list) else [],
+        "materials": genesis_service.public_materials_for_job(genesis_job),
         "required": (
             # Cause-aware bilingual line (classify_genesis_error). The old
             # static "Start onboarding again with the latest app build" named
