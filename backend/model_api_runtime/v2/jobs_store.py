@@ -4649,6 +4649,23 @@ def usage_report_snapshot(query) -> dict:
         user_cohort_sql = " AND u.user_id=%s"
         user_cohort_params = (query.user_id,)
 
+    def utc_text_timestamp(expression: str) -> str:
+        """Parse explicit-offset ISO text directly and legacy naive text as UTC."""
+
+        return f"""
+CASE
+  WHEN ({expression}) ~ '(Z|[+-]\\d{{2}}:?\\d{{2}})$'
+    AND pg_input_is_valid(({expression}), 'timestamptz')
+    THEN ({expression})::timestamptz
+  WHEN pg_input_is_valid(({expression}), 'timestamp')
+    THEN ({expression})::timestamp AT TIME ZONE 'UTC'
+  ELSE NULL
+END
+"""
+
+    registered_at_sql = utc_text_timestamp("u.created_at")
+    memory_created_at_sql = utc_text_timestamp("mm.doc->>'created_at'")
+
     base_cte = f"""
 WITH base AS (
   SELECT
@@ -4675,14 +4692,14 @@ WITH base AS (
                 )
                 cur.execute(
                     f"""
-WITH registered AS (
-  SELECT u.user_id,
-         CASE WHEN pg_input_is_valid(u.created_at, 'timestamptz')
-           THEN u.created_at::timestamptz < %s ELSE false END AS existed_at_end,
-         NOT COALESCE(pg_input_is_valid(u.created_at, 'timestamptz'), false)
-           AS unparseable
+WITH user_times AS (
+  SELECT u.user_id, {registered_at_sql} AS registered_at
   FROM users u
   WHERE true {user_cohort_sql}
+), registered AS (
+  SELECT user_id, registered_at < %s AS existed_at_end,
+         registered_at IS NULL AS unparseable
+  FROM user_times
 ), activated AS (
   SELECT r.user_id
   FROM registered r
@@ -4697,8 +4714,7 @@ WITH registered AS (
     ) OR EXISTS (
       SELECT 1 FROM memory_moments mm
       WHERE mm.user_id=r.user_id
-        AND CASE WHEN pg_input_is_valid(mm.occurred_at, 'timestamptz')
-          THEN mm.occurred_at::timestamptz < %s ELSE false END
+        AND ({memory_created_at_sql}) < %s
     )
   )
 )
@@ -4708,14 +4724,13 @@ SELECT
   count(*) FILTER (WHERE unparseable)::int AS unparseable_registered_rows,
   (SELECT count(*)::int FROM memory_moments mm
    JOIN registered r ON r.user_id=mm.user_id
-   WHERE NOT COALESCE(
-     pg_input_is_valid(mm.occurred_at, 'timestamptz'), false))
-    AS unparseable_memory_rows
+   WHERE ({memory_created_at_sql}) IS NULL)
+    AS legacy_memory_rows_without_valid_created_at
 FROM registered
 """,
                     (
-                        query.end_at_utc,
                         *user_cohort_params,
+                        query.end_at_utc,
                         query.end_at_utc,
                         query.end_at_utc,
                     ),
@@ -4739,6 +4754,10 @@ SELECT
   count(*) FILTER (WHERE failed)::int AS failed_turns,
   sum(prompt_tokens)::bigint AS prompt_tokens,
   sum(completion_tokens)::bigint AS completion_tokens,
+  sum(prompt_tokens) FILTER (WHERE usage_reported_calls > 0)::bigint
+    AS metered_prompt_tokens,
+  sum(completion_tokens) FILTER (WHERE usage_reported_calls > 0)::bigint
+    AS metered_completion_tokens,
   sum(cache_read_tokens)::bigint AS cache_read_tokens,
   sum(cache_write_tokens)::bigint AS cache_write_tokens,
   sum(cache_miss_tokens)::bigint AS cache_miss_tokens,
@@ -4798,6 +4817,10 @@ days AS (
          count(*) FILTER (WHERE failed)::int AS failed_turns,
          sum(prompt_tokens)::bigint AS prompt_tokens,
          sum(completion_tokens)::bigint AS completion_tokens,
+         sum(prompt_tokens) FILTER (WHERE usage_reported_calls > 0)::bigint
+           AS metered_prompt_tokens,
+         sum(completion_tokens) FILTER (WHERE usage_reported_calls > 0)::bigint
+           AS metered_completion_tokens,
          sum(cache_read_tokens)::bigint AS cache_read_tokens,
          sum(cache_write_tokens)::bigint AS cache_write_tokens,
          sum(cache_miss_tokens)::bigint AS cache_miss_tokens,
@@ -4813,8 +4836,17 @@ SELECT days.local_day, coalesce(d.turns, 0)::int AS turns,
        coalesce(d.model_calls, 0)::bigint AS model_calls,
        coalesce(d.retries, 0)::bigint AS retries,
        coalesce(d.failed_turns, 0)::int AS failed_turns,
-       d.prompt_tokens, d.completion_tokens,
-       d.cache_read_tokens, d.cache_write_tokens, d.cache_miss_tokens,
+       CASE WHEN d.local_day IS NULL THEN 0 ELSE d.prompt_tokens END
+         AS prompt_tokens,
+       CASE WHEN d.local_day IS NULL THEN 0 ELSE d.completion_tokens END
+         AS completion_tokens,
+       d.metered_prompt_tokens, d.metered_completion_tokens,
+       CASE WHEN d.local_day IS NULL THEN 0 ELSE d.cache_read_tokens END
+         AS cache_read_tokens,
+       CASE WHEN d.local_day IS NULL THEN 0 ELSE d.cache_write_tokens END
+         AS cache_write_tokens,
+       CASE WHEN d.local_day IS NULL THEN 0 ELSE d.cache_miss_tokens END
+         AS cache_miss_tokens,
        coalesce(d.unknown_usage_calls, 0)::bigint AS unknown_usage_calls,
        coalesce(d.usage_reported_calls, 0)::bigint AS usage_reported_calls,
        coalesce(d.cache_reported_calls, 0)::bigint AS cache_reported_calls
@@ -4847,12 +4879,12 @@ user_days AS (
   FROM user_days
   WHERE prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL
   GROUP BY user_id
-), provider_rank AS (
-  SELECT user_id,provider,
+), provider_model_rank AS (
+  SELECT user_id,provider,model,
     row_number() OVER (
-      PARTITION BY user_id ORDER BY sum(model_calls) DESC, provider
+      PARTITION BY user_id ORDER BY sum(model_calls) DESC, provider, model
     ) AS rank
-  FROM base GROUP BY user_id,provider
+  FROM base GROUP BY user_id,provider,model
 )
 SELECT b.user_id, count(*)::int AS turns,
   count(DISTINCT b.local_day) FILTER (WHERE b.model_calls > 0)::int AS active_days,
@@ -4863,6 +4895,10 @@ SELECT b.user_id, count(*)::int AS turns,
   count(*) FILTER (WHERE b.usage_reported_calls > 0)::int AS metered_turns,
   sum(b.prompt_tokens)::bigint AS prompt_tokens,
   sum(b.completion_tokens)::bigint AS completion_tokens,
+  sum(b.prompt_tokens) FILTER (WHERE b.usage_reported_calls > 0)::bigint
+    AS metered_prompt_tokens,
+  sum(b.completion_tokens) FILTER (WHERE b.usage_reported_calls > 0)::bigint
+    AS metered_completion_tokens,
   sum(b.cache_read_tokens)::bigint AS cache_read_tokens,
   sum(b.cache_write_tokens)::bigint AS cache_write_tokens,
   sum(b.cache_miss_tokens)::bigint AS cache_miss_tokens,
@@ -4870,10 +4906,10 @@ SELECT b.user_id, count(*)::int AS turns,
     AS unknown_usage_calls,
   coalesce(sum(b.usage_reported_calls), 0)::bigint AS usage_reported_calls,
   coalesce(sum(b.cache_reported_calls), 0)::bigint AS cache_reported_calls,
-  max(pr.provider) FILTER (WHERE pr.rank=1) AS primary_provider,
+  max(pr.provider) AS primary_provider, max(pr.model) AS primary_model,
   max(ud.daily_p50) AS daily_p50, max(ud.daily_p95) AS daily_p95
 FROM base b
-LEFT JOIN provider_rank pr ON pr.user_id=b.user_id AND pr.rank=1
+LEFT JOIN provider_model_rank pr ON pr.user_id=b.user_id AND pr.rank=1
 LEFT JOIN user_distribution ud ON ud.user_id=b.user_id
 GROUP BY b.user_id
 ORDER BY (sum(b.prompt_tokens)+sum(b.completion_tokens)) DESC NULLS LAST,
@@ -4934,6 +4970,18 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
         if prompt_tokens is not None and completion_tokens is not None
         else None
     )
+    metered_prompt_tokens = _usage_optional_int(
+        totals, "metered_prompt_tokens"
+    )
+    metered_completion_tokens = _usage_optional_int(
+        totals, "metered_completion_tokens"
+    )
+    metered_total_tokens = (
+        metered_prompt_tokens + metered_completion_tokens
+        if metered_prompt_tokens is not None
+        and metered_completion_tokens is not None
+        else None
+    )
     turns = int(totals["turns"] or 0)
     model_calls = int(totals["model_calls"] or 0)
     retries = int(totals["retries"] or 0)
@@ -4989,8 +5037,8 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
             else None
         ),
         "tokens_per_metered_turn": (
-            float(total_tokens) / metered_turns
-            if total_tokens is not None and metered_turns
+            float(metered_total_tokens) / metered_turns
+            if metered_total_tokens is not None and metered_turns
             else None
         ),
         "user_day_tokens": {
@@ -5051,9 +5099,21 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
                 if row_total is not None and active_users
                 else None
             )
+            day_metered_prompt = _usage_optional_int(
+                row, "metered_prompt_tokens"
+            )
+            day_metered_completion = _usage_optional_int(
+                row, "metered_completion_tokens"
+            )
+            day_metered_total = (
+                day_metered_prompt + day_metered_completion
+                if day_metered_prompt is not None
+                and day_metered_completion is not None
+                else None
+            )
             result["tokens_per_metered_turn"] = (
-                float(row_total) / result["metered_turns"]
-                if row_total is not None and result["metered_turns"]
+                float(day_metered_total) / result["metered_turns"]
+                if day_metered_total is not None and result["metered_turns"]
                 else None
             )
         return result
@@ -5062,12 +5122,23 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
     users = []
     for row in user_rows:
         item = aggregate_row(row)
+        user_metered_prompt = _usage_optional_int(row, "metered_prompt_tokens")
+        user_metered_completion = _usage_optional_int(
+            row, "metered_completion_tokens"
+        )
+        user_metered_total = (
+            user_metered_prompt + user_metered_completion
+            if user_metered_prompt is not None
+            and user_metered_completion is not None
+            else None
+        )
         item.update(
             {
                 "user_id": str(row["user_id"]),
                 "active_days": int(row["active_days"] or 0),
                 "last_model_call_at": row["last_model_call_at"],
                 "primary_provider": str(row["primary_provider"] or "unknown"),
+                "primary_model": str(row["primary_model"] or "unknown"),
                 "daily_p50": _usage_optional_float(row, "daily_p50"),
                 "daily_p95": _usage_optional_float(row, "daily_p95"),
                 "tokens_per_calendar_day": (
@@ -5081,8 +5152,8 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
                     else None
                 ),
                 "tokens_per_metered_turn": (
-                    float(item["total_tokens"]) / item["metered_turns"]
-                    if item["total_tokens"] is not None and item["metered_turns"]
+                    float(user_metered_total) / item["metered_turns"]
+                    if user_metered_total is not None and item["metered_turns"]
                     else None
                 ),
                 "known_token_share": (
@@ -5138,16 +5209,17 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
                 else None
             ),
             "reference_cohort": {
-                "basis": "parseable_timestamps_at_end_at",
+                "basis": "parseable_utc_write_timestamps_at_end_at",
                 "unparseable_registered_rows": int(
                     cohort["unparseable_registered_rows"] or 0
                 ),
-                "unparseable_memory_rows": int(
-                    cohort["unparseable_memory_rows"] or 0
+                "legacy_memory_rows_without_valid_created_at": int(
+                    cohort["legacy_memory_rows_without_valid_created_at"] or 0
                 ),
                 "limitation": (
-                    "legacy unparseable timestamps are excluded from "
-                    "historical registered and activated reference cohorts"
+                    "legacy users.created_at and memory doc.created_at values "
+                    "that are missing or invalid are excluded from historical "
+                    "registered and activated reference cohorts"
                 ),
             },
         },

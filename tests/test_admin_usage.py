@@ -46,7 +46,12 @@ def usage_rows():
         conn.execute(
             "INSERT INTO memory_moments (user_id,moment_id,occurred_at,doc) "
             "VALUES (%s,%s,%s,%s)",
-            ("u_usage_alpha", "usage-memory", "2026-06-15T00:00:00+00:00", Jsonb({})),
+            (
+                "u_usage_alpha",
+                "usage-memory",
+                "2026-06-15T00:00:00+00:00",
+                Jsonb({"created_at": "2026-06-15T00:00:00+00:00"}),
+            ),
         )
         conn.execute(
             "INSERT INTO chat_messages (user_id,msg_id,ts,doc) VALUES (%s,%s,%s,%s)",
@@ -73,7 +78,7 @@ def usage_rows():
                 "u_usage_idle",
                 "usage-future-memory",
                 "2026-07-04T00:00:00+00:00",
-                Jsonb({}),
+                Jsonb({"created_at": "2026-06-25T00:00:00+00:00"}),
             ),
         )
         metrics = [
@@ -450,7 +455,7 @@ def test_usage_snapshot_reconciles_users_days_models_failures_and_unknowns(usage
     }
     assert report["overview"] == {
         "registered_accounts": 3,
-        "activated_users": 2,
+        "activated_users": 3,
         "model_active_users": 2,
         "metered_users": 2,
         "active_user_days": 4,
@@ -470,7 +475,7 @@ def test_usage_snapshot_reconciles_users_days_models_failures_and_unknowns(usage
     averages = report["averages"]
     assert averages["tokens_per_calendar_day"] == pytest.approx(107.5)
     assert averages["tokens_per_active_user_day"] == pytest.approx(53.75)
-    assert averages["tokens_per_activated_user_day"] == pytest.approx(53.75)
+    assert averages["tokens_per_activated_user_day"] == pytest.approx(215 / 6)
     assert averages["tokens_per_metered_turn"] == pytest.approx(215 / 3)
     assert averages["model_calls_per_turn"] == pytest.approx(1.2)
     assert averages["retries_per_turn"] == pytest.approx(0.4)
@@ -496,6 +501,7 @@ def test_usage_snapshot_reconciles_users_days_models_failures_and_unknowns(usage
     assert users["u_usage_alpha"]["total_tokens"] == 180
     assert users["u_usage_alpha"]["active_days"] == 2
     assert users["u_usage_alpha"]["primary_provider"] == "openrouter"
+    assert users["u_usage_alpha"]["primary_model"] == "gpt-a"
     assert users["u_usage_beta"]["total_tokens"] == 35
     assert users["u_usage_beta"]["unknown_usage_calls"] == 2
     assert users["u_usage_idle"]["total_tokens"] is None
@@ -523,7 +529,7 @@ def test_usage_snapshot_filters_every_usage_section_but_not_reference_cohorts(us
     )
 
     assert report["overview"]["registered_accounts"] == 3
-    assert report["overview"]["activated_users"] == 2
+    assert report["overview"]["activated_users"] == 3
     assert report["overview"]["turns"] == 2
     assert report["overview"]["model_calls"] == 3
     assert report["overview"]["total_tokens"] == 35
@@ -548,6 +554,76 @@ def test_usage_snapshot_preserves_unknown_token_and_cache_totals(usage_rows):
     assert first["cache_read_tokens"] is None
     assert first["cache_hit_ratio"] is None
     assert first["usage_coverage"] == pytest.approx(0.0)
+
+
+def test_usage_snapshot_metered_turn_average_excludes_legacy_unreported_tokens(
+    usage_rows,
+):
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_turn_metrics "
+            "(user_id,lane,provider,model,prompt_tokens,completion_tokens,"
+            "usage_reported_calls,cache_reported_calls,model_calls,retries,failed,"
+            "status,created_at) VALUES (%s,%s,%s,%s,%s,%s,0,0,1,0,false,%s,%s)",
+            (
+                "u_usage_beta",
+                "chat",
+                "openrouter",
+                "legacy-model",
+                700,
+                70,
+                "legacy-inconsistent-usage",
+                "2026-07-01T13:00:00+00:00",
+            ),
+        )
+
+    report = jobs_store.usage_report_snapshot(_usage_query())
+    beta = next(row for row in report["users"] if row["user_id"] == "u_usage_beta")
+
+    assert report["overview"]["total_tokens"] == 985
+    assert report["averages"]["tokens_per_metered_turn"] == pytest.approx(215 / 3)
+    assert beta["total_tokens"] == 805
+    assert beta["tokens_per_metered_turn"] == pytest.approx(35)
+
+
+def test_usage_snapshot_distinguishes_empty_days_from_unreported_metric_days(
+    usage_rows,
+):
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_turn_metrics SET created_at=%s "
+            "WHERE user_id=%s AND status=%s",
+            (
+                "2026-07-03T11:00:00+00:00",
+                "u_usage_beta",
+                "usage-3",
+            ),
+        )
+
+    report = jobs_store.usage_report_snapshot(
+        _usage.UsageQuery(
+            start_at_utc=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            end_at_utc=datetime(2026, 7, 4, tzinfo=timezone.utc),
+            timezone="UTC",
+            user_id="u_usage_beta",
+        )
+    )
+    first, empty, third = report["daily"]
+
+    assert first["local_day"] == "2026-07-01"
+    assert first["turns"] == 1
+    assert first["total_tokens"] is None
+    assert first["cache_read_tokens"] is None
+    assert empty["local_day"] == "2026-07-02"
+    assert empty["turns"] == 0
+    assert empty["prompt_tokens"] == 0
+    assert empty["completion_tokens"] == 0
+    assert empty["total_tokens"] == 0
+    assert empty["cache_read_tokens"] == 0
+    assert empty["cache_write_tokens"] == 0
+    assert empty["cache_miss_tokens"] == 0
+    assert third["local_day"] == "2026-07-03"
+    assert third["total_tokens"] == 35
 
 
 def test_usage_snapshot_uses_one_repeatable_read_only_connection(monkeypatch, usage_rows):
@@ -625,7 +701,7 @@ def test_usage_snapshot_marks_unparseable_historical_cohort_rows_as_limited(usag
             (
                 "u_usage_bad_time",
                 "bad-time-memory",
-                "2026-99-99T99:99:99",
+                "2026-06-20T00:00:00+00:00",
                 Jsonb({}),
             ),
         )
@@ -636,7 +712,47 @@ def test_usage_snapshot_marks_unparseable_historical_cohort_rows_as_limited(usag
             conn.execute("DELETE FROM users WHERE user_id=%s", ("u_usage_bad_time",))
 
     cohort = report["coverage"]["reference_cohort"]
-    assert cohort["basis"] == "parseable_timestamps_at_end_at"
+    assert cohort["basis"] == "parseable_utc_write_timestamps_at_end_at"
     assert cohort["unparseable_registered_rows"] == 1
-    assert cohort["unparseable_memory_rows"] == 1
-    assert "unparseable timestamps are excluded" in cohort["limitation"]
+    assert cohort["legacy_memory_rows_without_valid_created_at"] == 1
+    assert "memory doc.created_at" in cohort["limitation"]
+
+
+def test_usage_snapshot_treats_naive_registration_time_as_utc_in_every_session_timezone(
+    monkeypatch,
+):
+    user_id = "u_usage_naive_registration"
+    seed_user(user_id, created_at="2026-07-03T07:00:00")
+    query = _usage.UsageQuery(
+        start_at_utc=datetime(2026, 7, 2, 4, tzinfo=timezone.utc),
+        end_at_utc=datetime(2026, 7, 3, 4, tzinfo=timezone.utc),
+        timezone="UTC",
+        user_id=user_id,
+    )
+    real_pool = db.get_pool()
+
+    try:
+        with real_pool.connection() as held_connection:
+            class HeldConnectionContext:
+                def __enter__(self):
+                    return held_connection
+
+                def __exit__(self, *_args):
+                    return False
+
+            class HeldPool:
+                def connection(self):
+                    return HeldConnectionContext()
+
+            monkeypatch.setattr(jobs_store, "_pool", lambda: HeldPool())
+            held_connection.execute("SET TIME ZONE 'UTC'")
+            utc_report = jobs_store.usage_report_snapshot(query)
+            held_connection.execute("SET TIME ZONE 'Asia/Shanghai'")
+            shanghai_report = jobs_store.usage_report_snapshot(query)
+            held_connection.execute("RESET TIME ZONE")
+    finally:
+        with real_pool.connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+
+    assert utc_report["overview"]["registered_accounts"] == 0
+    assert shanghai_report["overview"]["registered_accounts"] == 0
