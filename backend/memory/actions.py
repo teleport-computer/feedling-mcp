@@ -1112,7 +1112,7 @@ def _execute_memory_actions(
         batch_status = "failed"
     else:
         batch_status = "partial"
-    return {
+    body = {
         "status": batch_status,
         "results": results,
         "effects": effects,
@@ -1120,4 +1120,18 @@ def _execute_memory_actions(
         "applied_count": applied_count,
         "skipped_count": skipped_count,
         "failed_count": failed_count,
-    }, 200
+    }
+    # Preserve independent item execution and complete result accounting, but
+    # do not let a batch with no applied write masquerade as HTTP success to
+    # callers that use the outer status as their failure signal. Successful
+    # no-ops/skips alone remain 200; a skip mixed with a failure is still 400
+    # because nothing was applied and at least one requested action failed.
+    if applied_count == 0 and failed_count > 0:
+        first_failed = next(
+            row for row in results if int(row.get("http_status") or 0) >= 400
+        )
+        body["error"] = first_failed.get("error") or "memory_action_failed"
+        if "detail" in first_failed:
+            body["detail"] = first_failed["detail"]
+        return body, 400
+    return body, 200

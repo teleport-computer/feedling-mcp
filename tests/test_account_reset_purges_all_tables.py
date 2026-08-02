@@ -126,6 +126,11 @@ def _seed_all_per_user_tables(user_id: str) -> None:
                 ),
             ),
         )
+        conn.execute(
+            "INSERT INTO v2_chat_tail_anchor (user_id, anchor_seq) "
+            "VALUES (%s, 42)",
+            (user_id,),
+        )
     cid = db.model_api_credential_create(
         user_id, provider="anthropic", base_url="", label="k",
         api_key_envelope={"v": 1, "body_ct": "ct", "nonce": "n"},
@@ -145,6 +150,7 @@ _PER_USER_TABLES = (
     "model_api_routes",
     "v2_turn_metrics",
     "v2_capture_batches",
+    "v2_chat_tail_anchor",
     "chat_message_archive",
     "user_blobs",
 )

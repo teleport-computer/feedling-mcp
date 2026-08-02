@@ -68,6 +68,9 @@ def test_consumer_agent_runtime_requires_fresh_official_poll(monkeypatch):
             "agent_provider": "openrouter",
             "agent_model": "deepseek/deepseek-v4-flash",
             "agent_input_modalities": ["text"],
+            "agent_input_modalities_source": "pi_catalog",
+            "agent_entry_signature": "entry-signature-1",
+            "consumer_id": "resident-1",
         },
     )
 
@@ -75,11 +78,21 @@ def test_consumer_agent_runtime_requires_fresh_official_poll(monkeypatch):
         "provider": "openrouter",
         "model": "deepseek/deepseek-v4-flash",
         "input_modalities": ["text"],
+        "input_modalities_source": "pi_catalog",
+        "entry_signature": "entry-signature-1",
+        "consumer_id": "resident-1",
     }
     assert consumer.consumer_agent_runtime(
         store,
         now_epoch=1_000.0 + consumer._CONSUMER_RECENT_SEC + 1,
-    ) == {"provider": "", "model": "", "input_modalities": []}
+    ) == {
+        "provider": "",
+        "model": "",
+        "input_modalities": [],
+        "input_modalities_source": "",
+        "entry_signature": "",
+        "consumer_id": "",
+    }
 
 
 def test_fresh_ok_decrypt_health_passes_independently_of_poll_freshness(monkeypatch):

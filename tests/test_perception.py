@@ -405,6 +405,22 @@ def test_admin_perception_freshness_reports_fresh_stale_and_never(env):
     assert by2["motion_state"]["reported"] and not by2["motion_state"]["fresh"]  # stale
 
 
+def test_admin_perception_freshness_reports_app_open_and_close_timestamps_only(env):
+    fake, _ = env
+    now = time.time()
+    fake.append_app_open(UID, {"app": "private-open", "ts": now - 30}, now - 30)
+    fake.append_app_close(UID, {"app": "private-close", "ts": now - 10}, now - 10)
+
+    freshness = service.admin_perception_freshness(UID, now=now)
+
+    assert freshness["recent_app_open_ts"] == now - 30
+    assert freshness["recent_app_open_age_sec"] == 30
+    assert freshness["recent_app_close_ts"] == now - 10
+    assert freshness["recent_app_close_age_sec"] == 10
+    assert "private-open" not in str(freshness)
+    assert "private-close" not in str(freshness)
+
+
 def test_snapshot_timezone_survives_ttl_but_local_time_expires(env):
     """Stable identity fields (timezone/locale) must NOT be nulled out by the
     freshness TTL: a proactive wake fires long after the last foreground report,

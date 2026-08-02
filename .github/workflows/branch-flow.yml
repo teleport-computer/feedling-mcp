@@ -1,0 +1,27 @@
+name: Branch flow
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  branch-flow:
+    name: branch flow
+    runs-on: ubuntu-24.04
+    steps:
+      # pull_request_target must never execute code from the PR head. Pin the
+      # checkout to the trusted base commit before invoking the guard script.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Validate pull request source branch
+        env:
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: scripts/check-pr-branch-flow.sh "$BASE_BRANCH" "$HEAD_BRANCH"

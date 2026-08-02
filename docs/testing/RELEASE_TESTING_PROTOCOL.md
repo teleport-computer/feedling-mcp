@@ -145,6 +145,23 @@ pytest/build 必须在被审的树里跑。
 > 文件"不构成防线。发现裹错了：只要还没 push 就重切，别靠提交信息补说明。
 > 同理，commit 前先 `git status` 看一眼有没有**别人的**未提交改动，有就说明你们在同一棵树上。
 
+> **共享树里"干净 HEAD vs 我的树"隔离不出任何人的改动**——上一条是提交内容被污染，
+> 这一条是**验证方法**被污染，更阴，因为它给你一个**绿色的假答案**。2026-08-01 两次：
+> ① 跑测试挂了一条 `test_verify_loop_gc_dangling_pointer`，我按规矩用 `git archive HEAD`
+> 导出干净树对照——干净树全绿，于是判"是我弄坏的"。**错**：`git archive` 排除的是**所有**
+> 未提交改动，包括同事在途的 `chat_core.py`，那条失败根本不是我的。
+> ② 想证明新写的回归测试"真能抓住旧实现"，用了 `git archive HEAD~1` 当无闸基线——
+> **全绿**。因为那时 HEAD 已经被同事的提交 + 一次 merge 推走，`HEAD~1` 里仍然含我的闸。
+> 差点把一组什么都没测的用例当成有效回归交出去。
+>
+> **两条对策**：
+> - 想证明"这个失败是不是我造成的" → **只把自己改的文件叠到干净树**
+>   （`git archive HEAD | tar -x -C /tmp/x && cp <我的文件> /tmp/x/...`），别整树对照；
+> - 想证明"测试能抓住旧实现" → 基线用**显式 SHA**（`git archive <我那个commit>~1`），
+>   **绝不用 `HEAD~1` 这类相对引用**，共享树里 HEAD 随时在动。
+> - 导完先自检一句：`grep -c <你新加的符号> /tmp/x/<文件>` 应为 0——基线要是本来就含你的
+>   改动，后面跑出来的绿全是假的。
+
 ## 3. P0 冒烟集（全自动，Claude 执行，~30-45 分钟）
 
 **目标**：每个 driver 一个临时账号，把"用户能不能正常用"的最小闭环跑通。
@@ -319,6 +336,10 @@ model_api + resident **两路都跑**，不许一路代表全部。自查话术�
 | **记忆花园重复生成同一张卡 + 旧卡被覆盖（usr_fee1dfed / usr_1baf02f1，prod，均为廉价小模型）** | 2026-07-30。用户原话"被覆盖了一条旧记忆，而且还不断重复生成一模一样的记忆 5 条了（标题和下面的内容是没有关系的）"。**根因不是缺校验**——服务端防线一直完整（`actions.py` 的 `supersedes_required` 400 / `not_found` 404 / owner 校验 / `card_guard` 污染拦截）；而是 `tools/chat_resident_consumer.py::_capture_actions_from_cards` 在 `merge/supersede` **缺 target_id 时把它静默改写成 `memory.add`**，不合格输入改头换面成合法请求，**服务端根本没机会拒绝**。每轮 capture 都判"该更新那张卡"、每轮都没给 ID ⇒ 每轮新增一张一样的；给错 ID 则覆盖到不相干的卡（"标题和内容没关系"）。第二缺陷：`source` 枚举无白名单，模型自编值原样入库（prod 实测 150 种取值，含 `'对话'`、`'2026-07-24对话：xp问答…'`、大量 `ob_migration:<hash>`）。数据签名：两用户"变更次数∶剩余卡数"分别 83∶39=2.1 与 310∶137=2.3，**都是廉价小模型**（漏字段概率高）。修复 `ce3d0a09`（禁止降级 + `backend/memory/source_policy.py` 单一策略源同时约束服务端与 io_cli + 内容查重 + 留痕）与 `9022268d`（批内逐张独立、`ok/partial/failed` + 逐项 `http_status` + 四个计数、effects 只含成功项；F5 格式与语义**共享 1 次**重问预算 `CAPTURE_AGENT_REASK_BUDGET=1`，把本该记住的记忆救回）。已入 pytest：`tests/test_memory_guard_endpoint.py`、`tests/test_memory_v1_schema.py`、`tests/test_chat_resident_consumer.py`（含 `test_capture_format_bounce_consumes_shared_semantic_reask_budget` 锁预算不叠乘）、`tests/test_v2_memory_sink_robustness.py`。**教训①：客户端不得把任一非法 action 改写成另一种合法 action——那等于替服务端把自己的防线关掉（「静默降级」家族第三例，见 M2/N）；教训②：收紧校验前必须拿 prod 真实取值全集验一遍（白名单初版会拒掉 5 个自家值，`resident_absorb` 292 条是 agent 写记忆的默认 source，上线即 400）；教训③：加了拒绝规则要反问「这会不会把清理旧脏数据的路也焊死」——本例因 supersede 不继承 source 才没锁死，属侥幸而非设计；教训④：AI 输出不合格时，格式与语义都该带原因打回重问，但重试预算必须显式、跨层共享、可观测（`reask_count/trigger/outcome`），否则重试放大就是真实的钱**。存量脏数据按 Seven 决策**不做批量清理**，交 dream 车道自然整合（其第一优先级即合并重复卡，且永不硬删只用 superseded 保留链条；前端只显示 active，用户看到的花园已干净）。 |
 | **托管 agent 改不了已有记忆卡（409 `memory_decrypt_failed`，2026-07-30）** | 用户让 AI 改记忆花园的卡片，AI 报 409 放弃并建议"关掉重开 app"。根因＝托管 consumer 改用 runtime token 认证后（`chat_resident_consumer.py:1450`），`backend/memory/routes_asgi.py:116` 的 `actions` 路由**没传 `runtime_token`**——同文件 `index`/`fetch`/`buckets`/`threads`/`legacy_batch` 五个都传了，参数 `runtime_token` 也一路都在，只有这一行没填；于是 `auth.api_key` 为 None → `core/enclave.py:232` 抛 `api_key_unavailable`。**读正常、写全挂**，所以现象像"模型不会改"。影响所有托管用户（V1+V2）的 supersede/patch/upgrade。**回归落点：TESTING §2-R「认证/凭据形态变更」**——读写各要一条"以新凭据认证"的用例（现有用例全用 api-key 跑，这个组合一次都没覆盖过）。⚠️ 该失败**不写 trace**（两个 `raise` 在首次 `_trace_enclave` 之前），只看 trace 会误判为无异常 |
 | **切到 V2 后主动能力静默消失（usr_453c 等，2026-07-31）** | 用户："切到 v2 以后就不主动找我了，晚上也不整理记忆了。"开关全开、聊天正常（25 秒回复），只有主动那一半死。实测 `/v1/admin/v2-metrics`：`wake` 车道**24 小时全舰队 0 completed / 0 failed / 0 expired**，同期聊天车道 104 job 健康、`pending: 0`（不是没人消费，是没被创建）。口径已核（`jobs_store.py:4420` 读 `agent_jobs` 的 `heartbeat/scheduled/manual_wake`，且"这轮决定不发消息"也落 completed，不能用"它选择沉默"解释）。横向对比：**4 个 V2 用户里 3 个自切换起再没写过一张记忆卡**，两个回滚 V1 的当天都在正常写。指向 `v2_wake_schedule` 未播种（心跳生产者读它，无行 / `next_heartbeat_at` NULL 则永不到期；代码有 `_seed_existing_v2_wake_schedules()` 说明该表需显式播种）——**待 DB 确认**，无 admin 端点可查。**回归落点：TESTING §2-O 的"切换那一半"**。**教训**：① 这类失效**对用户完全静默**（不像聊天失败会冒错误气泡），只会被感受成"它不理我了"；② **dream / capture 车道至今无舰队级指标**（wake 指标不含这两个 lane），本次靠逐用户比对 `bootstrap_events` 才看出来，方法不可持续；③ 白名单里还挂着一个 data-track 404 的已删用户，切换清单需要对账 |
+| **配了视觉模型但发图必失败（usr_99d2f492，prod，2026-08-01）** | 用户配独立视觉模型（中转 qwen），App"验证"通过，发图报「图片已上传，但视觉服务没能读取它」，详情 `vision_image_unavailable · HTTP 502 · capability_forbidden`。根因＝**R 族又一案**：zero-roster 托管 consumer 全程用 runtime token，`/v1/vision/observe` 只提取 api-key（空）→ 取图能力空凭证打 enclave → 401。**探针通≠实弹通**（验证按钮走 backend 直连凭证，真实链路走 consumer 凭证）。影响面＝全体 43 个托管 API 用户的独立视觉从未可用；resident（带真 key）/V2（worker 原生注入）无感，故"只有他报"。修复 3c1a7744（token 双步透传 + 取图改单消息有界路由，顺带消掉"重试老图必 not_found"和多图截断）。查案额外代价：observer 零埋点 + admin 不暴露路由错误，只能让用户截图——治本 1a20679a（admin 每路由 last_runtime_error + notices 摘要 + observer trace）。**回归落点：TESTING §2-R 第二案 + e2e 三案配方（Router msa53tbe，V3 纯红图全链）** |
+| **AI 明明能看图却被横幅说"没有视觉能力"（usr_3bf3be / usr_5d3d90，prod，2026-08-01）** | 真实回合准确描述照片，App 仍持续弹「你的 AI 似乎没有视觉能力」。根因＝探针 `max_tokens=80` 对 `-thinking` SKU 必然空可见回复，落进"颜色答错"分支被判 `unsupported`——**"定 A"只护了异常路径，漏了答错分支**（空回复冒充了答错）。修复后**又被 liko main 侧 vision 重构静默覆盖一次**（合并整体取 main 版、验收测试一并被删、CI 全绿），第二次重铺 60cbf604 并把事故注释写进分类逻辑上方防第三次。终局口径（Seven 拍板）：**零对照表**，catalog 只认官方显式字段且仅作引导，真图探针永远最终裁决，verdict 换模型/base_url 失效。**回归落点：TESTING §2-T（能力探针四规）+ §2-S（分支同步幸存核查）** |
+
+| **AI 在主动唤醒里自主改写身份卡（usr_a40e，prod，2026-08-01）** | 用户原话「我没有要求过改名字和时间和签名…其他的都变了」。一次心跳唤醒里模型自己把**签名**和**相处天数**改了——1388 天写成它编造的 220 天，**用户全程没说话**，是 AI 事后自己宣布「都改好了」才被发现。时间戳咬合：`identity_action_profile_patch` @ 02:19:59Z ／ 截图「TA 主动找你」@ 10:20 本地 = 02:20Z。两处放大伤害：① `identity/actions.py:744` 把「patch 里出现 `relationship_days`」当成「用户亲自校准」并盖 `user_calibrated`（**最高信任级，之后任何低级来源都推不翻**）——而 patch 的作者是模型不是用户；② 护栏是偏的：七维人格微调有 `\|delta\|<=10` 等严格约束，`relationship_days` 却**只校验形状**（非负整数/不超上限），1388→220 一次调用就过。修复 `ba000d84`(V1/resident) + `fce1c34d`(V2) + `ff0561b5`(测试)，规则收敛成一条：**后台/唤醒轮次不写身份卡，读不受影响**。**回归落点：TESTING §2-P（agent 工具面按 lane 分档）**。**教训①：给 agent 的写能力必须按"用户在不在场"分档，不能只按"是不是写操作"分档**——wake 必须能写记忆（capture/dream 靠它），但不该能改身份；② **Seven 定调「本质是模型问题，我们只能做简单防护，绝对不能太硬」**：最初方案含 header 契约＋用户消息 id 绑定＋服务端解密原话做字面比对，被叫停砍到 55 行；那套字面比对会误杀「签名改成两只小动物加个紫心」「相处天数改成三年」这类正常说法（开集判据，见 TESTING §6），**且并不能覆盖它想覆盖的洞**（`io_cli` 根本不发 consumer header，actor 判据从一开始就不成立）；③ 已知仍错、刻意不修：上面那个 `user_calibrated` 假设——闸生效后模型没机会在无人时发这个字段，等真出现「聊天中被顺手改」再单独处理 |
 
 **规则**：以后每个 prod 事故结案时，必须在本表加一行 + 在对应层落一条用例，
 否则不算结案。**"没有用户报障"不是免检理由**——上面两条（中转全线 400、V2 空开关）

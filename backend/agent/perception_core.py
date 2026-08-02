@@ -162,12 +162,11 @@ def agent_perception_payload(store, *, signals_raw: str | None) -> dict[str, Any
 
 def recent_apps_payload(store, *, limit_raw: str | None, hours_raw: str | None,
                         now: float | None = None) -> dict[str, Any]:
-    """Recent app-open history (the `perception.recent_apps` tool).
+    """Recent app open/close history (the `perception.recent_apps` tool).
 
-    ``signals=app`` only carries the LAST observed app-open inside its TTL (the
-    Shortcut never reports a close, so it is not proof of what is on screen
-    now); this answers "what has she been using", with timestamps, which is what
-    a chat turn minutes after the fact actually needs.
+    ``signals=app`` only carries the last observed app event inside its TTL and
+    cannot answer a trajectory question. This pull returns both Shortcut open
+    and close events with timestamps, including close-only windows.
     """
     limit = None
     if limit_raw is not None and str(limit_raw).strip():

@@ -21,6 +21,7 @@ INTERNAL = "internal"
 # A child summary can contain remote web text or user-editable workspace/memory
 # content. Treat it exactly like other external model input in the parent loop.
 EXTERNAL_READS = frozenset({"web_search", "web_fetch", "task"})
+IDENTITY_WRITE_ACTIONS = frozenset({"identity_patch", "identity_nudge"})
 
 
 def provenance_for_read(tool_name: str) -> str:
@@ -31,11 +32,16 @@ def turn_has_write_authorization(seed: str) -> bool:
     return seed in (USER, WAKE_TRIGGER)
 
 
-def write_gate(tool_name: str, *, turn_authorization: bool) -> tuple[bool, str]:
+def write_gate(
+    tool_name: str, *, turn_authorization: bool,
+    identity_write_authorization: bool = True,
+) -> tuple[bool, str]:
     """Reads are never gated. A WRITE_ACTIONS tool is allowed only when the turn holds a
     user/wake authorization; otherwise deterministically refused."""
     if tool_name not in cap_registry.WRITE_ACTIONS:
         return True, ""
+    if tool_name in IDENTITY_WRITE_ACTIONS and not identity_write_authorization:
+        return False, f"error: identity write refused in background turn for {tool_name}"
     if turn_authorization:
         return True, ""
     return False, f"write refused: no user/wake authorization in this turn for {tool_name}"

@@ -53,9 +53,10 @@ def test_polluted_summary_rejected_at_endpoint(api_key):
         "content": "正常的一段正文内容",
         "title": "analysis to=functions.memory_write",
     })
-    assert status == 200, body
+    assert status == 400, body
     assert body["status"] == "failed"
-    # 合法批请求以 200 返回逐项结果；断言拿到的是 pollution 拒绝。
+    assert body["error"] == "memory_card_polluted"
+    # 全败批次恢复外层 400，同时保留逐项 pollution 拒绝。
     assert "memory_card_polluted" in str(body), body
 
 
@@ -114,8 +115,9 @@ def test_write_validation_and_duplicate_skip_at_real_endpoint(api_key, monkeypat
             },
         }]},
     )
-    assert invalid_source.status_code == 200
+    assert invalid_source.status_code == 400
     assert invalid_source.get_json()["status"] == "failed"
+    assert invalid_source.get_json()["error"] == "source_invalid"
     assert invalid_source.get_json()["results"][0]["error"] == "source_invalid"
 
     invalid_mode = client.post(
@@ -131,8 +133,9 @@ def test_write_validation_and_duplicate_skip_at_real_endpoint(api_key, monkeypat
             "capture_mode": "conversation_2026",
         }]},
     )
-    assert invalid_mode.status_code == 200
+    assert invalid_mode.status_code == 400
     assert invalid_mode.get_json()["status"] == "failed"
+    assert invalid_mode.get_json()["error"] == "capture_mode_invalid"
     assert invalid_mode.get_json()["results"][0]["error"] == "capture_mode_invalid"
 
     def post(summary: str, content: str):
@@ -185,7 +188,8 @@ def test_supersede_target_errors_keep_item_level_400_404_and_403(api_key):
             "capture_mode": "state",
         }]},
     )
-    assert no_target.status_code == 200
+    assert no_target.status_code == 400
+    assert no_target.get_json()["error"] == "supersedes_required"
     assert no_target.get_json()["results"][0]["http_status"] == 400
     assert no_target.get_json()["results"][0]["error"] == "supersedes_required"
 
@@ -199,7 +203,8 @@ def test_supersede_target_errors_keep_item_level_400_404_and_403(api_key):
             "capture_mode": "state",
         }]},
     )
-    assert missing.status_code == 200
+    assert missing.status_code == 400
+    assert missing.get_json()["error"] == "not_found"
     assert missing.get_json()["results"][0]["http_status"] == 404
     assert missing.get_json()["results"][0]["error"] == "not_found"
 
@@ -225,7 +230,8 @@ def test_supersede_target_errors_keep_item_level_400_404_and_403(api_key):
             "capture_mode": "state",
         }]},
     )
-    assert not_owned.status_code == 200
+    assert not_owned.status_code == 400
+    assert not_owned.get_json()["error"] == "not_owned"
     assert not_owned.get_json()["results"][0]["http_status"] == 403
     assert not_owned.get_json()["results"][0]["error"] == "not_owned"
 

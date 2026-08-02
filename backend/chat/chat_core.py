@@ -1296,6 +1296,15 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
     found_reply = False
     while time.time() < deadline:
         time.sleep(2)
+        # Cross-worker visibility: the resident consumer may POST its hidden
+        # verify ack through a DIFFERENT worker, which persists it to the DB and
+        # accepts it (routes_asgi._allow_verify_reply_with_fresh_pending_check
+        # reloads there before its negative decision too). This poll loop
+        # otherwise only reads THIS worker's cached store.chat_messages, so
+        # without a reload a valid ack stays invisible until a LISTEN/NOTIFY
+        # eviction that may never land inside the wait window — yielding
+        # loop_alive=false / response_time_sec=null despite the ack's 200.
+        store.reload()
         with store.chat_lock:
             chat_msgs = list(store.chat_messages)
         for m in chat_msgs:

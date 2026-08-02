@@ -90,3 +90,37 @@ def test_v2_worker_counts_partial_results_without_failing_successful_items():
     assert worker._memory_write_result_counts(actions, result) == (
         1, 0, 1, "source_invalid"
     )
+
+
+def test_v2_all_failed_400_body_survives_apply_and_drives_f5_counts(monkeypatch):
+    actions = [
+        {"type": "memory.add"},
+        {"type": "memory.delete", "memory_id": "missing"},
+    ]
+    body = {
+        "status": "failed",
+        "error": "anchor_required",
+        "detail": {"mem_type": "insight"},
+        "results": [
+            {
+                "status": "error",
+                "error": "anchor_required",
+                "detail": {"mem_type": "insight"},
+                "http_status": 400,
+            },
+            {"status": "error", "error": "not_found", "http_status": 404},
+        ],
+        "effects": [],
+        "total_count": 2,
+        "applied_count": 0,
+        "skipped_count": 0,
+        "failed_count": 2,
+    }
+    _stub_actions(monkeypatch, body, 400)
+
+    write_result = serve_worker._apply_memory_actions("u1", actions)
+
+    assert write_result is body
+    assert worker._memory_write_result_counts(actions, write_result) == (
+        0, 0, 2, "anchor_required"
+    )

@@ -25,7 +25,7 @@ from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
-from asgi import health, middleware
+from asgi import health, middleware, runner_health
 from asgi.lifespan import lifespan
 from asgi.settings import settings
 
@@ -126,6 +126,7 @@ middleware.register_exception_handlers(app)
 # Native routers. /healthz has no auth/package; domain routers fan out via
 # register_asgi(app), mirroring app.py's pkg.register(app).
 app.include_router(health.router)
+app.include_router(runner_health.router)
 for _mod_name in _ASGI_PACKAGES:
     importlib.import_module(_mod_name).register_asgi(app)
 

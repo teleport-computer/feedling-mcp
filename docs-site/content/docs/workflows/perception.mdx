@@ -170,7 +170,8 @@ X-API-Key: YOUR_FEEDLING_API_KEY
   "app_category": null,
   "app_state": null,
   "user_state": "default",
-  "recent_apps": []
+  "recent_apps": [],
+  "recent_app_events": []
 }
 ```
 
@@ -288,12 +289,15 @@ The shortcut reports opens and closes, so `app_name` means "the app named in
 the most recent open-or-matching-close event observed within the TTL" — check
 `app_state` if you need to distinguish "still in it" from "just left it".
 
-`GET /v1/agent/perception/recent_apps` reads **only the app-open history** —
-there is currently no read endpoint over the app-close stream. A close event's
-only externally visible effect is the `app_state: "closed"` it may leave in
-the snapshot above (until the 15-minute TTL expires it). The close stream is
-being accumulated for a future usage-duration pairing (open ts → matching
-close ts), not exposed on its own yet.
+`GET /v1/agent/perception/recent_apps` merges the app-open and app-close
+histories into one trajectory. Each entry has an `event` value of `"open"` or
+`"close"`; either kind can appear on its own when a user configured only one
+Shortcut automation or when the other event was not delivered.
+
+The regular and pull snapshots also expose `recent_app_events`, containing the
+same merged event shape for the app signal's 15-minute freshness window. This
+field is additive; the older `recent_apps` snapshot field remains available for
+compatibility.
 
 ```http
 GET /v1/agent/perception/recent_apps?limit=20&hours=24 HTTP/1.1
@@ -305,18 +309,20 @@ X-API-Key: YOUR_FEEDLING_API_KEY
 {
   "ok": true,
   "apps": [
-    {"app": "Notes", "category": "productivity", "ts": 1783978500.125, "minutes_ago": 3.5}
+    {"app": "Notes", "category": "productivity", "ts": 1783980000.125, "event": "close", "minutes_ago": 1.0},
+    {"app": "Notes", "category": "productivity", "ts": 1783978500.125, "event": "open", "minutes_ago": 3.5}
   ],
-  "count": 1,
+  "count": 2,
   "window_hours": 24
 }
 ```
 
-Entries are newest first. `hours` is optional and unbounded by default, so check
-`minutes_ago` before treating an entry as recent. Both this endpoint and the
-current-app fields are gated by the single `app` capability: when the user turns
-it off, the response is `{"ok": true, "disabled": true, "reason": ...}` with an
-empty `apps` list — which is deliberately distinguishable from a genuine empty
+Entries are newest first across both streams, and `limit` applies after the
+merge. `hours` is optional and unbounded by default, so check `minutes_ago`
+before treating an entry as recent. Both this endpoint and the current-app
+fields are gated by the single `app` capability: when the user turns it off,
+the response is `{"ok": true, "disabled": true, "reason": ...}` with an empty
+`apps` list — which is deliberately distinguishable from a genuine empty
 history.
 
 ## Encrypted photo flow

@@ -9,8 +9,9 @@ Covers the 6 core-function error sites converged by this task:
   - memory/actions._memory_validate_write (anchor_required)      — HTTP /v1/memory/actions
 
 None of these six functions go through the api_error() helper (Task 1) — they
-keep returning framework-neutral ``(dict, status)`` tuples. Only the ``error``
-value and an added ``detail`` field change; status codes are unchanged.
+keep returning framework-neutral ``(dict, status)`` tuples. The actions batch
+preserves its HTTP-200 aggregate response while exposing the validation status
+and stable error slug on the failed item.
 
 Run:  python -m pytest tests/test_error_slug_convergence.py -q
 """
@@ -113,8 +114,8 @@ def test_chat_response_thinking_envelope_missing_fields_is_slug(backend_env):
 # --------------------------------------------------------------------------- #
 # memory_core.add — HTTP /v1/memory/add
 #
-# ⚠️ 实现者决定：memory_core.py:292 所在的 add() 有直达 HTTP 路由
-# (POST /v1/memory/add, wired in memory/routes_asgi.py:174-178), so this test
+# ⚠️ 实现者决定：memory_core 的 add() 有直达 HTTP 路由
+# (POST /v1/memory/add, wired in memory/routes_asgi.py), so this test
 # drives it end-to-end via make_client() rather than falling back to a
 # core-level unit test — the brief's fallback note doesn't apply here.
 # --------------------------------------------------------------------------- #
@@ -133,7 +134,7 @@ def test_memory_add_missing_envelope_fields_is_slug(backend_env):
 
 
 # --------------------------------------------------------------------------- #
-# memory_core.retype (memory_core.py:418) — HTTP /v1/memory/retype
+# memory_core.retype — HTTP /v1/memory/retype
 # --------------------------------------------------------------------------- #
 
 def test_memory_retype_anchor_required_is_slug(backend_env):
@@ -165,7 +166,7 @@ def test_memory_retype_anchor_required_is_slug(backend_env):
 
 
 # --------------------------------------------------------------------------- #
-# memory/actions._memory_validate_write (actions.py:160) — HTTP /v1/memory/actions
+# memory/actions._memory_validate_write — HTTP /v1/memory/actions
 # via the prebuilt-envelope memory.add path (_memory_add_envelope_action ->
 # _memory_validate_prebuilt_envelope -> _memory_validate_write), which is the
 # shared validator behind add / content_patch / retype / supersede actions.
@@ -190,9 +191,12 @@ def test_memory_actions_add_anchor_required_is_slug(backend_env):
             ]
         },
     )
-    assert res.status_code == 400
+    # A syntactically valid actions batch always reports its independent item
+    # outcomes as HTTP 200; the rejected write remains a per-item 400.
+    assert res.status_code == 200
     body = res.get_json()
-    assert body["error"] == "anchor_required"           # top-level, slug
+    assert body["status"] == "failed"
     result0 = body["results"][0]
+    assert result0["http_status"] == 400
     assert result0["error"] == "anchor_required"
     assert result0["detail"] == {"mem_type": "insight"}
