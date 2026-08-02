@@ -3,6 +3,7 @@
 import os
 
 import psycopg
+import pytest
 
 
 def _tee_conn():
@@ -35,8 +36,8 @@ def test_tee_version_table_is_isolated():
     assert {r[0] for r in rows} == {"alembic_tee_version"}
 
 
-def test_tee_primary_startup_assertion_is_read_only(monkeypatch):
-    """Phase-4 startup must not stamp/run the RDS chain on the promoted DB."""
+def test_tee_primary_startup_refuses_unprepared_shadow(monkeypatch):
+    """A schema head alone is not proof that the frozen prepare completed."""
     import db
 
     with _tee_conn() as c:
@@ -49,7 +50,8 @@ def test_tee_primary_startup_assertion_is_read_only(monkeypatch):
 
     monkeypatch.setenv("DATABASE_URL", os.environ["TEE_DATABASE_URL"])
     monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "tee")
-    db.init_schema()
+    with pytest.raises(RuntimeError, match="frozen Phase-4 prepare"):
+        db.init_schema()
 
     with _tee_conn() as c:
         after = {
