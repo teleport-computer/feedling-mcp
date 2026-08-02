@@ -10264,13 +10264,18 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
     pointer whose object is already present; a failed upload just keeps the
     inline row. ``doc`` is offloaded out of the row only after the body is in
     R2, so the at-rest table stays small without a missing-object window."""
-    if object_storage.enabled() and isinstance(doc, dict) and doc.get("body_ct") is not None:
+    body_field = (
+        "body_ct" if isinstance(doc, dict) and doc.get("body_ct") is not None
+        else "body_b64" if isinstance(doc, dict) and doc.get("body_b64") is not None
+        else None
+    )
+    if object_storage.enabled() and body_field is not None:
         # 1) inline first — frame readable, references no R2 object yet.
         if not _frame_write_row(user_id, frame_id, ts, doc, None, None):
             return  # DB write failed → nothing committed, R2 untouched.
         # 2) upload; on failure keep the inline row (frame stays readable).
         try:
-            object_storage.put_frame_body(user_id, frame_id, doc["body_ct"])
+            object_storage.put_frame_body(user_id, frame_id, doc[body_field])
         except Exception as e:  # noqa: BLE001
             log.error("[db] frame_upsert(%s,%s) R2 upload failed, leaving inline: %s",
                       user_id, frame_id, e)
@@ -10278,7 +10283,11 @@ def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
         # 3) object now exists → flip to pointer as the last durable step. If
         #    this write fails the row stays inline (readable); the uploaded
         #    object is a harmless orphan.
-        env_meta = {k: v for k, v in doc.items() if k != "body_ct"}
+        env_meta = {k: v for k, v in doc.items() if k != body_field}
+        if body_field == "body_b64":
+            env_meta["body_object_format"] = "plaintext_v1"
+            raw = base64.b64decode(str(doc[body_field]), validate=True)
+            env_meta["body_sha256"] = hashlib.sha256(raw).hexdigest()
         body_key = object_storage.frame_key(user_id, frame_id)
         _frame_write_row(user_id, frame_id, ts, None, env_meta, body_key)
         return
@@ -10318,15 +10327,34 @@ def frame_get(user_id: str, frame_id: str) -> dict | None:
         return None
     doc, env_meta, body_key = row
     if body_key:
-        body_ct = object_storage.get_frame_body(user_id, frame_id)
-        if body_ct is None:
+        body = object_storage.get_frame_body(user_id, frame_id)
+        if body is None:
             # The pointer row exists but its R2 body is missing/unreadable.
             # Report not-found rather than a metadata-only dict — callers treat
             # any dict as a valid envelope and would serve an undecryptable frame.
             log.error("[db] frame_get(%s,%s) R2 body missing for key %s",
                       user_id, frame_id, body_key)
             return None
-        return {**(env_meta or {}), "body_ct": body_ct}
+        out = dict(env_meta or {})
+        if out.pop("body_object_format", None) == "plaintext_v1":
+            try:
+                raw = base64.b64decode(body, validate=True)
+            except Exception:
+                log.error("[db] frame_get(%s,%s) plaintext R2 body invalid base64",
+                          user_id, frame_id)
+                return None
+            expected_size = out.get("body_size_bytes")
+            expected_sha = str(out.pop("body_sha256", "") or "")
+            if (type(expected_size) is not int or len(raw) != expected_size
+                    or not expected_sha
+                    or hashlib.sha256(raw).hexdigest() != expected_sha):
+                log.error("[db] frame_get(%s,%s) plaintext R2 integrity mismatch",
+                          user_id, frame_id)
+                return None
+            out["body_b64"] = body
+        else:
+            out["body_ct"] = body
+        return out
     return doc
 
 

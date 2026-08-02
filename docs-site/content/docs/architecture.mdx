@@ -216,14 +216,17 @@ selection, fetch, and action contracts.
 
 ### Perception and screen content
 
-Sensitive Perception signals and photo bodies use encrypted envelopes. Ordinary
-operational context fields can be submitted as plaintext. Encrypted sensitive
-signals are opened for authorized processing, after which normalized state and
-metadata can be persisted separately from the original body. The legacy
-collection branch stores each `doc` as provided.
+Sensitive Perception signals and photo bodies follow the owning account's
+effective content shape. Ordinary operational context fields can be submitted
+as plaintext in either tier. Encrypted sensitive signals are opened for
+authorized processing; plaintext-tier envelopes are read locally inside the
+managed service boundary. Normalized state and metadata can then be persisted
+separately from the original body. The legacy collection branch stores each
+`doc` as provided.
 
-Screen pixels use encrypted frame envelopes; large frame ciphertext can be
-offloaded to object storage without giving that store the content key. The
+Screen pixels use encrypted frame envelopes on the encrypted tier and strict
+`body_b64` envelopes on the plaintext tier. Large frame bodies can be offloaded
+to object storage; plaintext-tier frame objects are plaintext recipients. The
 authenticated screen WebSocket is an ingest path only—Chat uses HTTP send,
 history, and long polling.
 
@@ -309,6 +312,9 @@ records between encrypted and plaintext shapes.
 
 Changing the preference does not re-encrypt or decrypt history on its own; it
 governs new writes, and existing records convert only through the swap endpoint.
+Encrypted old-client uploads remain accepted for a plaintext-tier account so a
+staged client rollout and mixed history stay readable. Environment migration
+must preserve explicit encrypted accounts and fail closed for unknown users.
 
 ## Authentication and credential roles
 

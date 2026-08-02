@@ -142,7 +142,8 @@ def _decrypt_signal_payload_v2(
 ) -> tuple[Any | None, str]:
     if not isinstance(envelope, Mapping):
         return None, "invalid_envelope"
-    if not api_key and decrypt_envelope is None:
+    if (not envelope.get("body") and not envelope.get("body_b64")
+            and not api_key and decrypt_envelope is None):
         return None, "decrypt_skipped"
     try:
         # 默认走形状路由：明文行直读、信封行才打 enclave。签名与
@@ -352,11 +353,19 @@ def ingest_snapshot_v2(
                 results[key] = "accepted"
             continue
         if key in ENCRYPTED_SIGNAL_KEYS_V2:
-            if signal.encrypted:
+            envelope = item.get("envelope")
+            if isinstance(envelope, Mapping):
+                shape_error = None
+                if envelope.get("body") is not None:
+                    shape_error = core_envelope.validate_uploaded_envelope(
+                        dict(envelope), user_id=user_id)
+                if shape_error is not None:
+                    results[key] = str(shape_error.get("error") or "invalid_envelope")
+                    continue
                 results[key] = "accepted"
                 plaintext, err = _decrypt_signal_payload_v2(
                     key,
-                    item.get("envelope") if isinstance(item.get("envelope"), Mapping) else {},
+                    envelope,
                     api_key=api_key,
                     decrypt_envelope=decrypt_envelope,
                 )

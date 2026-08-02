@@ -562,14 +562,13 @@ def _decrypt_chunks(enclave_url: str, runtime_token: str, chunks: list[dict], *,
     texts: list[str] = []
     for chunk in chunks:
         envelope = service.chunk_envelope_from_row(chunk)
-        raw = _decrypt_envelope(
-            enclave_url,
-            runtime_token,
-            envelope,
-            purpose="genesis_chunk",
-            store=store,
-            job_id=job_id,
-        )
+        if envelope.get("body") is not None:
+            raw = str(envelope.get("body") or "").encode("utf-8")
+        else:
+            raw = _decrypt_envelope(
+                enclave_url, runtime_token, envelope, purpose="genesis_chunk",
+                store=store, job_id=job_id,
+            )
         texts.append(raw.decode("utf-8"))
     return texts
 

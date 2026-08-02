@@ -400,7 +400,7 @@ def test_conditional_payloads_and_review_contract_match_runtime(
         branches = {branch["title"]: branch for branch in envelope["oneOf"]}
         expected = {"Encrypted body", "Plaintext body"}
         if schema_name == "EncryptedEnvelope":
-            expected.add("Binary plaintext body (Chat image/file only)")
+            expected.add("Binary plaintext body")
         assert set(branches) == expected
 
         sealed = branches["Encrypted body"]
@@ -413,7 +413,7 @@ def test_conditional_payloads_and_review_contract_match_runtime(
         assert plain["properties"]["visibility"] == {"const": "shared"}
 
         if schema_name == "EncryptedEnvelope":
-            binary = branches["Binary plaintext body (Chat image/file only)"]
+            binary = branches["Binary plaintext body"]
             assert binary["required"] == ["body_b64"]
             assert binary["properties"]["visibility"] == {"const": "shared"}
             assert envelope["properties"]["body_b64"]["format"] == "byte"

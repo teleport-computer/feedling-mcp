@@ -3,6 +3,7 @@
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -442,6 +443,37 @@ def test_wire_assembly_injects_envelope_pubkey_getter():
 
     serve_worker.wire_assembly()
     assert core_envelope.get_user_public_key is accounts_registry._get_user_public_key
+    assert (
+        core_envelope.resolve_content_encryption
+        is accounts_registry.effective_content_encryption
+    )
+
+
+def test_wire_assembly_makes_off_account_v2_writes_plaintext(monkeypatch):
+    from accounts import registry as accounts_registry
+    from core import envelope as core_envelope
+
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
+    monkeypatch.setattr(
+        accounts_registry,
+        "_get_user_content_encryption",
+        lambda user_id: "off" if user_id == "u_v2_plain" else None,
+    )
+    serve_worker.wire_assembly()
+
+    envelope, error = core_envelope._build_shared_envelope_for_store(
+        SimpleNamespace(user_id="u_v2_plain"),
+        b'{"kind":"reply"}',
+        item_id="v2-plain-reply",
+    )
+
+    assert error == ""
+    assert envelope == {
+        "body": '{"kind":"reply"}',
+        "id": "v2-plain-reply",
+        "owner_user_id": "u_v2_plain",
+        "visibility": "shared",
+    }
 
 
 def test_health_app_healthz_ok():

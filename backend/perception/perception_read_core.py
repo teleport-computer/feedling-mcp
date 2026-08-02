@@ -33,6 +33,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from core import envelope as core_envelope
+
 from . import service
 
 
@@ -106,12 +108,26 @@ def photo_evaluate(store, payload: dict) -> tuple[dict, int]:
     Stores ciphertext only; no decryption / no enclave call here.
     """
     p = payload or {}
+    content_envelope = p.get("content_envelope")
+    if content_envelope is None:
+        return {"error": "content_envelope_required"}, 400
+    if isinstance(content_envelope, dict) and content_envelope.get("body_b64") is not None:
+        error = core_envelope.validate_uploaded_chat_envelope(
+            content_envelope, user_id=store.user_id, content_type="image")
+        if error is not None:
+            return error, 400
+    meta_envelope = p.get("meta_envelope")
+    if isinstance(meta_envelope, dict) and meta_envelope.get("body") is not None:
+        error = core_envelope.validate_uploaded_envelope(
+            meta_envelope, user_id=store.user_id)
+        if error is not None:
+            return {"error": f"meta_{error.get('error', 'invalid_envelope')}"}, 400
     return service.photo_evaluate(
         store.user_id,
         p.get("metadata") or {},
-        p.get("content_envelope"),
+        content_envelope,
         p.get("exif_gps"),
-        p.get("meta_envelope"),
+        meta_envelope,
     )
 
 

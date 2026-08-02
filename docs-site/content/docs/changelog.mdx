@@ -10,6 +10,17 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **The plaintext tier now covers the remaining active content producers.**
+  Runtime V2 standalone workers receive the same per-user shape resolver as the
+  API process, and plaintext trajectories are accepted by the application
+  contract. Genesis chunks, sensitive Perception context/photos, Chat
+  attachment captions, and Broadcast frames now select encrypted or plaintext
+  wire shapes from `content_encryption_effective`. Plaintext binary frames use
+  strict `body_b64`, may be stored behind a `plaintext_v1` object pointer, and
+  are read without an enclave call. Encrypted old-client writes and mixed
+  historical rows remain supported; changing the preference affects new writes
+  rather than silently rewriting existing records.
+
 - **Managed deployments can promote the confidential-VM PostgreSQL replica to
   the application primary without running the legacy RDS migration chain on
   it.** Backend and runner processes now use an explicit schema contract,

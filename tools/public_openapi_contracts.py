@@ -629,10 +629,10 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "body_b64": {
                 "type": "string",
                 "format": "byte",
-                "description": "Base64 plaintext bytes. Accepted only as the main "
-                               "envelope of a Chat image/file write when "
-                               "content_encryption_effective is \"off\"; text and "
-                               "non-Chat envelope endpoints reject this shape. "
+                "description": "Base64 plaintext bytes. Accepted by binary content "
+                               "surfaces (Chat image/file, Perception photo, and "
+                               "screen-frame ingest) when content_encryption_effective "
+                               "is \"off\"; text-envelope surfaces reject this shape. "
                                "Mutually exclusive with body_ct and body.",
             },
             "body_size_bytes": {
@@ -682,10 +682,10 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "properties": {"visibility": {"const": "shared"}},
             },
             {
-                "title": "Binary plaintext body (Chat image/file only)",
-                "description": "Only supported Chat attachment write paths accept "
-                               "this branch, and only while the account's effective "
-                               "tier is off.",
+                "title": "Binary plaintext body",
+                "description": "Only supported binary content paths accept this "
+                               "branch, and only while the account's effective tier "
+                               "is off.",
                 "required": ["body_b64"],
                 "properties": {"visibility": {"const": "shared"}},
             },
@@ -1146,7 +1146,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "file_mime": {"type": "string"},
             "caption_envelope": {
                 "allOf": [{"$ref": "#/components/schemas/EncryptedEnvelope"}],
-                "description": "Optional separately-encrypted user text sent alongside an image/file (content_type image or file). Same E2E envelope shape as the main `envelope`; the enclave decrypts it into the message's plaintext content so the agent sees the caption. Ignored for content_type=text.",
+                "description": "Optional shape-aware user text sent alongside an image/file. It follows content_encryption_effective independently of the binary main envelope. Ignored for content_type=text.",
             },
         },
         "additionalProperties": True,
@@ -1542,7 +1542,10 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "required": ["content_envelope"],
         "properties": {
-            "content_envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
+            "content_envelope": {
+                "allOf": [{"$ref": "#/components/schemas/EncryptedEnvelope"}],
+                "description": "Encrypted body_ct or plaintext-tier body_b64 image envelope.",
+            },
             "metadata": {
                 "type": "object",
                 "properties": {
@@ -1558,7 +1561,10 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
                 "additionalProperties": False,
             },
-            "meta_envelope": {"$ref": "#/components/schemas/EncryptedEnvelope"},
+            "meta_envelope": {
+                "allOf": [{"$ref": "#/components/schemas/EncryptedEnvelope"}],
+                "description": "Optional encrypted or plaintext-tier UTF-8 metadata envelope.",
+            },
             "exif_gps": {"type": "object", "deprecated": True, "description": "Legacy compatibility only; clients should not upload raw EXIF GPS."},
         },
         "additionalProperties": False,

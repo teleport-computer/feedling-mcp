@@ -6,6 +6,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from perception import service  # noqa: E402
+from core import envelope as core_envelope  # noqa: E402
 from perception.differ_v2 import PerceptionDifferV2  # noqa: E402
 from perception.ingress_v2 import (  # noqa: E402
     device_event_observations_v2,
@@ -233,6 +234,30 @@ def test_weather_health_and_focus_ingress_are_pull_only_after_decrypt(monkeypatc
     assert service.pull_snapshot("u_weather_health", now=200.0)["in_focus"] is True
     assert service.pull_snapshot("u_weather_health", now=200.0)["output_type"] == "bluetooth"
     assert emitted == []
+
+
+def test_plaintext_sensitive_signal_reads_without_decrypt_credential(monkeypatch):
+    fake = _Store()
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
+    monkeypatch.setattr(core_envelope, "PLAINTEXT_WRITES_ACCEPTED", True)
+    monkeypatch.setattr(core_envelope, "resolve_content_encryption", lambda uid: "off")
+    body = json.dumps({"values": {"condition": "clear", "temperature": 21.5},
+                       "message": "local plaintext"})
+
+    results = service.ingest_snapshot_v2(
+        "u_plain_perception",
+        [{"key": "weather", "envelope": {
+            "id": "weather-plain", "owner_user_id": "u_plain_perception",
+            "visibility": "shared", "body": body,
+        }, "changed": True}],
+        client_ts=200.0,
+    )
+
+    assert results["weather"] == "accepted"
+    state = fake.get_state("u_plain_perception")
+    assert state["condition"]["v"] == "clear"
+    assert state["temperature"]["v"] == 21.5
 
 
 def test_encrypted_body_output_key_values_are_unwrapped_before_storage(monkeypatch):

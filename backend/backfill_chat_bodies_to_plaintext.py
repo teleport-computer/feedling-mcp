@@ -9,7 +9,7 @@
 计划的这一条写于 v5「彻底删掉加密」时代。v6 之后加密是**每用户偏好**，所以
 **绝不能全量明文化**——加密档用户的重体必须原样保留密文。本工具因此按档位过滤：
 
-- 用户 ``content_encryption == "off"``（显式选明文）→ 处理
+- 已存在且 ``content_encryption`` 为 ``"off"`` 或未设置（v6 默认明文）→ 处理
 - ``"on"`` 或查不到用户 → **跳过**（fail-safe：拿不准就不解密）
 
 与 ``tee_replicator.worker._carries_verbatim`` 同一条判据、同一个失败方向：
@@ -57,14 +57,14 @@ _PAGE_SIZE = 200
 
 
 def _tier_allows_plaintext(user_id: str) -> bool:
-    """只有显式选明文的用户才处理。查不到用户按加密档处理（fail-safe）。"""
+    """已知用户按 v6 默认处理；查不到用户仍按加密档（fail-safe）。"""
     with db.get_pool().connection() as conn:
         row = conn.execute(
-            "SELECT 1 FROM users WHERE user_id=%s "
-            "AND doc->>'content_encryption'='off'",
+            "SELECT COALESCE(doc->>'content_encryption','off') "
+            "FROM users WHERE user_id=%s",
             (user_id,),
         ).fetchone()
-    return row is not None
+    return row is not None and str(row[0] or "off").strip().lower() == "off"
 
 
 def _rows_to_process(user_filter: str | None, limit: int) -> list[tuple]:

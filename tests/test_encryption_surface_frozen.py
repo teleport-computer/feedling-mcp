@@ -63,6 +63,11 @@ ALLOWLISTED_MIGRATIONS = {
     # （加密档用户的行仍须完整），而守卫做的是文本匹配、认不出 `OR 明文分支`。
     # 登记在此而非放松 pattern：pattern 一旦放松，真正的新增强制约束也会溜过去。
     "0072_relax_v2_envelope_shape.py",
+    # TEE 0013 restores the same primary-runtime CHECK after the plaintext
+    # migration has completed.  Its predicate explicitly accepts the exact
+    # plaintext body shape as an OR branch, just like RDS 0072; the scanner only
+    # sees the encrypted branch's K_enclave tokens and cannot infer that widening.
+    "0013_primary_runtime_contracts.py",
 }
 
 # 底层封装 primitive：直接调用就产生双收件人信封。通用
