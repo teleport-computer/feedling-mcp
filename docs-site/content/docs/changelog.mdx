@@ -10,6 +10,16 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Attested custom enclave domains can accompany the direct audit endpoint.**
+  The production, test, and pre-production deployment definitions stage
+  `enclave.feedling.app`, `test-enclave.feedling.app`, and
+  `pre-enclave.feedling.app` through `dstack-ingress`; each URL becomes available
+  only after that environment is deployed and its evidence is validated.
+  Existing `-5003s` clients remain compatible and retain the direct audit route.
+  New clients must verify WebPKI plus both the ingress certificate-evidence and
+  enclave-attestation bundles before claiming pinning-equivalent security;
+  WebPKI alone is insufficient.
+
 - **Memory Garden status now reports today's captured-card total.**
   `GET /v1/dream/status` adds `capture_cards_added` and
   `capture_completed_at`. Resident and Runtime V2 Capture runs accumulate only

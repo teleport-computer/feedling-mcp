@@ -387,6 +387,30 @@ does not protect its private key from that machine's operator. Achieving managed
 production parity also requires measured deployment, key lifecycle, network
 policy, secret distribution, backups, monitoring, and incident response.
 
+### Enclave transport trust chains
+
+Managed deployments expose two supported transports to the enclave service. They
+are not interchangeable evidence models:
+
+> Custom-domain path: client TLS -> dstack-ingress inside the measured TDX CVM
+> -> Docker-internal HTTP -> enclave-domain. Verify WebPKI, ingress certificate
+> evidence, and enclave attestation.
+
+> Direct audit path: client TLS -> Phala -5003s passthrough -> enclave. Verify the
+> live self-signed certificate fingerprint against enclave attestation REPORT_DATA.
+
+The custom-domain route has a deliberately disclosed plaintext hop between
+`dstack-ingress` and `enclave-domain`. It is Docker-internal traffic inside the
+measured TDX CVM, not a public-network hop; its protection relies on that CVM
+boundary rather than a second TLS layer. Cloudflare manages DNS-01 records only
+and does not proxy this traffic.
+
+Clients using the custom domain must verify both the ingress certificate-evidence
+bundle and the enclave attestation bundle, in addition to ordinary WebPKI, before
+claiming security equivalent to direct fingerprint pinning. The existing
+`-5003s` endpoint remains the compatibility and audit route for clients that
+perform the direct certificate-fingerprint-to-`REPORT_DATA` check.
+
 ## Health and capability readiness
 
 `GET /healthz` returns a structured liveness and dependency snapshot. It carries

@@ -25,6 +25,16 @@ ENCLAVE_PORT = int(os.environ.get("FEEDLING_ENCLAVE_PORT", 5003))
 # Off by default so the local dstack simulator + curl/httpx stay HTTP.
 # docker-compose.phala.yaml sets this true on real deployments.
 ENCLAVE_TLS = os.environ.get("FEEDLING_ENCLAVE_TLS", "false").lower() == "true"
+_transport_raw = os.environ.get("FEEDLING_ENCLAVE_TRANSPORT_MODE", "").strip().lower()
+ENCLAVE_TRANSPORT_MODE = _transport_raw or ("direct_tls" if ENCLAVE_TLS else "operator_tls")
+if ENCLAVE_TRANSPORT_MODE not in {"direct_tls", "attested_ingress", "operator_tls"}:
+    raise RuntimeError(
+        "FEEDLING_ENCLAVE_TRANSPORT_MODE must be direct_tls, attested_ingress, or operator_tls"
+    )
+if ENCLAVE_TRANSPORT_MODE == "direct_tls" and not ENCLAVE_TLS:
+    raise RuntimeError("FEEDLING_ENCLAVE_TRANSPORT_MODE=direct_tls requires FEEDLING_ENCLAVE_TLS=true")
+if ENCLAVE_TRANSPORT_MODE == "attested_ingress" and ENCLAVE_TLS:
+    raise RuntimeError("FEEDLING_ENCLAVE_TRANSPORT_MODE=attested_ingress requires FEEDLING_ENCLAVE_TLS=false")
 
 # Internal HTTPS (or HTTP in dev) to the non-TEE backend. This is the
 # only network dependency the enclave has after boot. Requests carry the

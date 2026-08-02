@@ -73,6 +73,29 @@ def test_attestation_shape_and_cache_header(monkeypatch, client):
         assert field in body
 
 
+def test_health_and_attestation_expose_attested_ingress_transport(monkeypatch, client):
+    monkeypatch.setattr("enclave.routes.health.config.ENCLAVE_TRANSPORT_MODE", "attested_ingress")
+    monkeypatch.setitem(enclave_state._state, "tls_enabled", False)
+    monkeypatch.setitem(enclave_state._state, "content_pk_hex", "aa" * 32)
+    monkeypatch.setitem(enclave_state._state, "signing_pk_hex", "bb" * 32)
+    monkeypatch.setitem(enclave_state._state, "booted_at", 123.0)
+    monkeypatch.setitem(enclave_state._state, "attestation", {
+        "tdx_quote_hex": "cc" * 64,
+        "event_log_json": "[]",
+        "measurements": {"mrtd": "00"},
+        "compose_hash": "h",
+        "app_id": "app",
+        "instance_id": "inst",
+    })
+
+    health = client.get("/healthz").get_json()
+    attestation = client.get("/attestation").get_json()
+    assert health["transport_mode"] == "attested_ingress"
+    assert attestation["transport_mode"] == "attested_ingress"
+    assert attestation["tls_in_enclave"] is False
+    assert "dstack-ingress evidence" in attestation["notes"]
+
+
 def test_attestation_not_ready(monkeypatch, client):
     monkeypatch.setitem(enclave_state._state, "ready", False)
     monkeypatch.setitem(enclave_state._state, "error", "kms down")

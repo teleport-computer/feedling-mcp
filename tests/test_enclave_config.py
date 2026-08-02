@@ -2,11 +2,57 @@
 from __future__ import annotations
 
 import sys
+import os
+import subprocess
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from enclave import config  # noqa: E402
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _probe(tls: str, mode: str | None) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ROOT / "backend")
+    env["FEEDLING_ENCLAVE_TLS"] = tls
+    if mode is None:
+        env.pop("FEEDLING_ENCLAVE_TRANSPORT_MODE", None)
+    else:
+        env["FEEDLING_ENCLAVE_TRANSPORT_MODE"] = mode
+    return subprocess.run(
+        [sys.executable, "-c", "from enclave import config; print(config.ENCLAVE_TRANSPORT_MODE)"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(("tls", "mode", "expected"), [
+    ("true", None, "direct_tls"),
+    ("false", None, "operator_tls"),
+    ("false", "attested_ingress", "attested_ingress"),
+])
+def test_enclave_transport_mode_defaults_and_override(tls, mode, expected):
+    result = _probe(tls, mode)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+
+
+@pytest.mark.parametrize(
+    ("tls", "mode"),
+    [("true", "attested_ingress"), ("false", "direct_tls"), ("false", "bogus")],
+)
+def test_enclave_transport_mode_rejects_invalid_combinations(tls, mode):
+    result = _probe(tls, mode)
+    assert result.returncode != 0
+    assert "FEEDLING_ENCLAVE_TRANSPORT_MODE" in result.stderr
 
 
 def test_constants_exist_and_typed():
