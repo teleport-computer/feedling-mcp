@@ -161,6 +161,11 @@ services:
       # compose synthesis / build never aborts on an unset var; the backend
       # still fails fast at startup (db.py) if it ends up empty at runtime.
       DATABASE_URL: "${DATABASE_URL:-}"
+      # Phase-4 schema selector. Keep "rds" while DATABASE_URL points at the
+      # shadow source; switch both values together (DATABASE_URL=TEE app DSN,
+      # FEEDLING_DATABASE_SCHEMA=tee). In tee mode startup only asserts the
+      # owner-migrated alembic_tee head and never runs the RDS migration chain.
+      FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
       # Dedicated pre TEE Postgres shadow. Both values use the encrypted env
       # channel and do not affect compose_hash. Empty dual-write keeps the
       # freshly provisioned shadow isolated until schema/backup verification
@@ -267,6 +272,7 @@ services:
       FEEDLING_API_URL: "http://backend:5001"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       DATABASE_URL: "${DATABASE_URL:-}"
+      FEEDLING_DATABASE_SCHEMA: "${FEEDLING_DATABASE_SCHEMA:-rds}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       FEEDLING_V2_MAX_WORKERS: "4"
       FEEDLING_V2_FLEET_IDENTITY_REQUIRED: "1"

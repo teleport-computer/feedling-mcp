@@ -10,6 +10,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Managed deployments can promote the confidential-VM PostgreSQL replica to
+  the application primary without running the legacy RDS migration chain on
+  it.** Backend and runner processes now use an explicit schema contract,
+  assert the owner-migrated TEE head read-only, and force shadow dual-write off
+  after promotion. The maintenance-window preflight also drains transient
+  queues, copies the existing FrameEnvelope v1 metadata/object-pointer bridge
+  without decrypting frame bodies, and aligns identity sequences before the DSN
+  switch. This changes managed deployment topology, not the public HTTP schema.
+
 - **Plaintext-tier Chat image/file bodies now have an explicit binary wire and
   object-storage shape.** Main Chat envelopes may carry strict-base64
   `body_b64` (and optional matching `body_size_bytes`) only for `image` or

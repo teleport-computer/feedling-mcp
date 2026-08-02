@@ -248,7 +248,7 @@ in test, pre, and production.
 | Compose | `deploy/docker-compose.phala.pre.yaml` — same 3 services as test (`ingress`/`backend`/`enclave`), with `pre-api.feedling.app` + `_pre` volumes. `FEEDLING_IO_ONBOARDING_BRANCH` stays `test` (io-onboarding has no pre branch). `FEEDLING_HOSTED_RUNTIME_POLICY` is literal `v2_only`; no encrypted env can select resident. |
 | Public API | `https://pre-api.feedling.app` (dstack-ingress auto-creates the CF DNS records once CI injects `CF_*`) |
 | Attestation | `https://7d18a1f234a0d90e5f643cac8283b6048451b8f7-5003s.dstack-pha-prod9.phala.network/attestation` (repo var `PRE_MAIN_ENCLAVE_URL`) |
-| Database | Dedicated pre RDS, injected via `PRE_DATABASE_URL` — fully isolated from test/prod (pre's enclave content key differs from test's, so sharing a DB would mix mutually-undecryptable ciphertext + double-schedule proactive jobs). |
+| Database | Dedicated pre RDS during shadow convergence; Phase 4 promotes `feedling-io-db-pre` by changing `PRE_DATABASE_URL` to its app DSN and setting `FEEDLING_DATABASE_SCHEMA=tee` on the main and runner deployment units together. Both databases remain fully isolated from test/prod. |
 | On-chain | **Separate** Sepolia FeedlingAppAuth `0x65844Dd69eba4Aa4a784e089dA9D9308F430F794` (owner = the `ETH_DEPLOYER_KEY` address, deployed 2026-07-07 via `deploy-test-contract.yml` dispatch), repo var `PRE_FEEDLING_APP_AUTH_CONTRACT`. Kept apart from test's contract because a shared AppAuth + a newly created CVM is the exact combination that flipped the main enclave key in the 2026-07-05 prod-runner incident. |
 | Deploy path | CI `deploy-pre-cvm` job (in `ci.yml`) on push to the `pre` branch. Clone of `deploy-test-cvm` with pre compose / CVM / DB / contract, branch-gated to `refs/heads/pre`. |
 
@@ -613,10 +613,34 @@ WAL-G 备份；test/prod 已接双写 + in-process 同步调度器，pre 在首�
 | Placement | prod9 node 18，`tdx.medium`（2 vCPU / 4GB），30GB ZFS |
 | Public PG | `ade3cabf133ec3e9ee6220265843c4ac993e1e63-5432s.dstack-pha-prod9.phala.network:443`（direct TLS） |
 | Backup | `s3://io-in-enclave-db/pre/wal-g`，pre 独立 libsodium key |
-| Schema baseline | `0009_provider_latency`，55 张 public 表（创建日） |
+| Schema baseline | Phase 4 target `0011_primary_runtime_bridge`；the owner-only workflow must reach this head before any app DSN switch. |
 | Deploy path | `Deploy Postgres CVM` workflow 的 `pre` lane，目标 ID 在 `deploy/pre-pg-cvm-id.txt` |
 | Migration | `TEE migrate` workflow 的 `pre` lane，owner DSN + verify-full CA |
-| App wiring | `PRE_TEE_DATABASE_URL` + `PRE_FEEDLING_TEE_DUAL_WRITE`；后者为空即停双写/回填 |
+| App wiring | Shadow stage: `PRE_TEE_DATABASE_URL` + `PRE_FEEDLING_TEE_DUAL_WRITE`. Primary stage: `PRE_DATABASE_URL` points to the TEE app DSN, `FEEDLING_DATABASE_SCHEMA=tee`, and both shadow variables are empty. |
+
+Phase 4 is a stop-the-world release unit. After stopping backend, main
+`serve-worker`, and the independent runner, run the final replicate/reconcile
+and strict verify, then execute the offline bridge tool from the same release:
+
+```bash
+cd backend
+python -m admin.phase4_cutover
+python -m admin.phase4_cutover --apply --confirm-writes-frozen
+```
+
+The first invocation is read-only. The second refuses to run unless Genesis
+chunks/jobs, active voice handoffs, active agent jobs, the action queue, both
+V2 outboxes, and TEE pending-device migrations are drained. It copies
+`frame_envelopes` to the TEE compatibility
+bridge, carries the live Chat R2 storage-generation fences, and aligns every
+identity sequence. Only after its report is green may
+CI redeploy both pre units with the primary-stage variables. Before writes are
+re-enabled, rollback can switch both units back to the RDS DSN with
+`FEEDLING_DATABASE_SCHEMA=rds`; do not mix a TEE DSN with the RDS selector or
+vice versa. After the first TEE-primary write, the frozen RDS no longer contains
+a lossless current state. A later rollback must stop writes and reverse-reconcile
+or restore the TEE changes first; changing only the DSN would lose new/updated
+rows and resurrect deletes.
 
 ### 磁盘 sizing 依据（实测 2026-07-13，prod RDS）
 

@@ -105,8 +105,8 @@ remain unchanged.
 
 The bounded Memory/User profile storage contract uses one
 `v2_agent_profile` document so both fields advance under one compare-and-swap.
-The two field bodies are separate shared encrypted envelopes; PostgreSQL and
-the TEE shadow see the same ciphertext document. Field character counts,
+The two field bodies are separate shared encrypted envelopes; the PostgreSQL
+primary stores the same ciphertext document. Field character counts,
 state, disabled status, source-card counts, and generation/retry timestamps
 remain plaintext routing and observability metadata. A stale CAS loser must
 re-read and recompute rather than replaying its earlier result.
@@ -129,6 +129,31 @@ It sends that plaintext Garden view to the user's configured model provider,
 then seals the generated Memory/User fields before the compare-and-swap write.
 Generation failure only updates bounded retry metadata and fails the background
 job; it does not publish a Chat bubble or terminal turn error.
+
+### Managed PostgreSQL promotion
+
+The managed rollout can promote an independently migrated PostgreSQL instance
+inside a confidential VM from a replication target to the application primary.
+This is an operator-controlled maintenance-window change, not an API-selected
+data route. Every backend and runner must switch `DATABASE_URL` and the explicit
+schema contract together. In the promoted mode, application startup performs a
+read-only assertion against `alembic_tee_version`; it never applies the legacy
+RDS migration chain with the application role. Shadow dual-write and its
+reconciliation scheduler are disabled in this mode, including when stale
+shadow variables remain present.
+
+Current FrameEnvelope v1 clients still require the original envelope metadata
+and object pointer. During promotion, the managed deployment therefore copies a
+temporary `frame_envelopes` compatibility bridge into the confidential-VM
+database without decrypting the body. The storage-key-encrypted `frames`
+projection remains separate. Removing that bridge requires a later versioned
+frame protocol and is not implied by database promotion.
+
+The former primary can remain frozen as a rollback snapshot, but it is a
+lossless switch-back target only until the first write reaches the promoted
+database. After that boundary, rollback requires a stopped-write reverse
+reconciliation or restore; changing only the connection string would discard
+new and updated rows and could resurrect deleted state.
 
 The staged worker refreshes after a successful dream write, after Runtime V2
 cutover, and best-effort after Chat when a profile is missing, eligible for

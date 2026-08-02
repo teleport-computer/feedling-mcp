@@ -157,6 +157,7 @@ class _Table:
 
 
 _SEQ_KEY = "_replicator_seq"  # smuggled through the plaintext doc dict, see below
+_STORAGE_GENERATION_KEY = "_replicator_storage_generation"
 
 
 def _chat_unpack(r: tuple) -> tuple:
@@ -177,23 +178,33 @@ def _chat_unpack(r: tuple) -> tuple:
     返回、transform 照常失败 → freeze → 下个 pass 重试，与其余瞬时错误同策略。
     unpack 同时服务 run_table 游标环和 _consume_requeue，两条路径一并覆盖。
     """
-    uid, msg_id, ts, doc, seq = r
+    uid, msg_id, ts, doc, seq, storage_generation = r
     if (
         db._is_chat_file_pointer(doc)
         and db._chat_body_object_format(doc) == "sealed_v1"
     ):
         doc = db.hydrate_chat_file_body(uid, doc)
-    return (uid, msg_id, ts, {**doc, _SEQ_KEY: seq})
+    return (
+        uid,
+        msg_id,
+        ts,
+        {
+            **doc,
+            _SEQ_KEY: seq,
+            _STORAGE_GENERATION_KEY: storage_generation,
+        },
+    )
 
 
 def _chat_upsert_args(uid: str, iid: str, sort, doc: dict) -> tuple:
     seq = doc.pop(_SEQ_KEY)
-    return (uid, seq, iid, sort, Jsonb(doc))
+    storage_generation = doc.pop(_STORAGE_GENERATION_KEY)
+    return (uid, seq, iid, sort, Jsonb(doc), storage_generation)
 
 
 _TABLES: dict[str, _Table] = {
     "chat_messages": _Table(
-        select_sql=("SELECT user_id, msg_id, ts, doc, seq FROM chat_messages "
+        select_sql=("SELECT user_id, msg_id, ts, doc, seq, storage_generation FROM chat_messages "
                     "WHERE (ts, msg_id) > (%s, %s) ORDER BY ts, msg_id LIMIT %s"),
         cursor_kind="numeric",
         transform=transforms.plaintext_chat_doc,
@@ -209,12 +220,16 @@ _TABLES: dict[str, _Table] = {
         # row was already inserted with the correct seq the first time
         # (upserts are idempotent replays of the same watermark range), so
         # the existing seq is already right and simply needs to survive.
-        upsert_sql=("INSERT INTO chat_messages (user_id, seq, msg_id, ts, doc) "
-                    "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s) "
-                    "ON CONFLICT (user_id, msg_id) DO UPDATE SET ts=EXCLUDED.ts, doc=EXCLUDED.doc"),
+        upsert_sql=("INSERT INTO chat_messages "
+                    "(user_id, seq, msg_id, ts, doc, storage_generation) "
+                    "OVERRIDING SYSTEM VALUE VALUES (%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (user_id, msg_id) DO UPDATE SET "
+                    "ts=EXCLUDED.ts, doc=EXCLUDED.doc, "
+                    "storage_generation=EXCLUDED.storage_generation"),
         unpack=_chat_unpack,
         upsert_args=_chat_upsert_args,
-        requeue_fetch_sql=("SELECT user_id, msg_id, ts, doc, seq FROM chat_messages "
+        requeue_fetch_sql=("SELECT user_id, msg_id, ts, doc, seq, storage_generation "
+                           "FROM chat_messages "
                            "WHERE user_id = %s AND msg_id = %s"),
         requeue_delete_tee_sql="DELETE FROM chat_messages WHERE user_id = %s AND msg_id = %s",
         prune_rds_keys_sql="SELECT user_id, msg_id FROM chat_messages",

@@ -70,6 +70,21 @@ def _database_url() -> str:
     return url
 
 
+def database_schema() -> str:
+    """Return the migration contract for ``DATABASE_URL``.
+
+    ``rds`` is the backwards-compatible default.  Phase-4 promotion sets this
+    explicitly to ``tee`` on every process that points ``DATABASE_URL`` at the
+    promoted database.  Keeping the selector independent from the hostname is
+    deliberate: inferring a trust/schema boundary from a mutable DSN is too
+    easy to get wrong during rollback.
+    """
+    value = os.environ.get("FEEDLING_DATABASE_SCHEMA", "rds").strip().lower()
+    if value not in {"rds", "tee"}:
+        raise RuntimeError("FEEDLING_DATABASE_SCHEMA must be 'rds' or 'tee'")
+    return value
+
+
 def _pool_max_size() -> int:
     """Return the process-local pool ceiling, failing closed on bad config.
 
@@ -133,13 +148,39 @@ _schema_lock = threading.Lock()
 
 
 def init_schema() -> None:
-    """Bring the database schema up to the latest Alembic revision.
+    """Bring the selected database schema to a safe application state.
 
-    Runs ``alembic upgrade head`` programmatically, reading DATABASE_URL via
-    backend/alembic/env.py. The baseline revision's DDL is idempotent, so this
-    is safe on the already-provisioned production database (it just records the
-    version). Called at app startup, by the migrate container, and by tests.
+    The historical ``rds`` mode runs ``alembic upgrade head``.  A promoted TEE
+    database is different: its owner-only migration chain has already run in a
+    dedicated workflow, while application processes connect as the non-DDL
+    ``app`` role.  ``tee`` mode therefore performs a read-only, fail-closed head
+    assertion and must never run the RDS chain against that database.
     """
+    if database_schema() == "tee":
+        from alembic.script import ScriptDirectory
+        from alembic.config import Config
+
+        here = Path(__file__).resolve().parent
+        cfg = Config(str(here / "alembic_tee" / "alembic.ini"))
+        cfg.set_main_option("script_location", str(here / "alembic_tee"))
+        expected_heads = set(ScriptDirectory.from_config(cfg).get_heads())
+        with _schema_lock, psycopg.connect(_database_url(), autocommit=True) as conn:
+            actual_heads = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT version_num FROM alembic_tee_version"
+                ).fetchall()
+            }
+        if actual_heads != expected_heads:
+            raise RuntimeError(
+                "TEE database schema is not at the application head: "
+                f"expected={sorted(expected_heads)} actual={sorted(actual_heads)}; "
+                "run the owner-only alembic_tee migration workflow before startup"
+            )
+        log.info("[db] TEE schema at head (read-only assertion: %s)",
+                 ",".join(sorted(actual_heads)))
+        return
+
     from alembic import command
     from alembic.config import Config
 
