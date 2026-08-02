@@ -51,6 +51,9 @@ ENCLAVE_MEASUREMENTS = {
 def _reference_measurements(**overrides):
     reference = {
         "version": 1,
+        "status": "APPROVED_REFERENCE",
+        "approved_by": "security@example.com",
+        "approved_at": "2026-08-03T00:00:00Z",
         "domain": DOMAIN,
         "expected_compose_hash": COMPOSE_HASH,
         "expected_content_pk_hex": CONTENT_PK,
@@ -66,14 +69,16 @@ def _make_tdx_quote(
     report_data: bytes,
     measurements: dict[str, str],
     rtmr3: str = "24" * 48,
-    mr_config_id: str = "00" * 48,
+    mr_config_id: str | None = None,
 ) -> bytes:
     quote = bytearray(48 + 584 + 4)
     quote[0:2] = (4).to_bytes(2, "little")
     quote[4:8] = (0x81).to_bytes(4, "little")
     body = 48
     quote[body + 136 : body + 184] = bytes.fromhex(measurements["mrtd"])
-    quote[body + 184 : body + 232] = bytes.fromhex(mr_config_id)
+    quote[body + 184 : body + 232] = bytes.fromhex(
+        mr_config_id or "01" + COMPOSE_HASH + "00" * 15
+    )
     quote[body + 328 : body + 376] = bytes.fromhex(measurements["rtmr0"])
     quote[body + 376 : body + 424] = bytes.fromhex(measurements["rtmr1"])
     quote[body + 424 : body + 472] = bytes.fromhex(measurements["rtmr2"])
@@ -848,7 +853,9 @@ def test_attestation_rejects_mr_config_id_compose_mismatch():
         )
 
 
-def test_run_fetches_every_manifest_file_and_attestation(monkeypatch, evidence_fixture):
+def test_run_accepts_approved_reference_and_fetches_all_evidence(
+    monkeypatch, evidence_fixture
+):
     files = dict(evidence_fixture.files)
     quote = _make_tdx_quote(
         report_data=hashlib.sha256(files["sha256sum.txt"]).digest() + bytes(32),
@@ -891,6 +898,7 @@ def test_run_fetches_every_manifest_file_and_attestation(monkeypatch, evidence_f
         "manifest hashes match all referenced evidence files",
         "quote report_data binds sha256sum.txt",
         "ingress quote matches approved reference measurements",
+        "ingress mr_config_id binds expected compose_hash",
         "attestation compose_hash matches expected value",
         "attestation enclave_content_pk_hex matches expected value",
         "attestation transport_mode is attested_ingress",
@@ -923,6 +931,41 @@ def test_run_rejects_reference_metadata_mismatch(monkeypatch):
             CONTENT_PK,
             _reference_measurements(domain="pre-enclave.feedling.app"),
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("status", None, "status"),
+        ("status", "UNAPPROVED_CANDIDATE", "status"),
+        ("approved_by", None, "approved_by"),
+        ("approved_by", "   ", "approved_by"),
+        ("approved_by", 7, "approved_by"),
+        ("approved_at", None, "approved_at"),
+        ("approved_at", "not-a-timestamp", "approved_at"),
+        ("approved_at", "2026-02-30T00:00:00Z", "approved_at"),
+        ("approved_at", "2026-08-03T00:00:00+00:00", "approved_at"),
+    ],
+)
+def test_run_rejects_unapproved_reference_before_network(
+    monkeypatch, field, value, message
+):
+    network_calls = []
+
+    def unexpected_network(*_args, **_kwargs):
+        network_calls.append(True)
+        raise EvidenceError("network reached before reference approval validation")
+
+    monkeypatch.setattr(verifier, "_https_get", unexpected_network)
+    reference = _reference_measurements()
+    if value is None:
+        reference.pop(field)
+    else:
+        reference[field] = value
+
+    with pytest.raises(EvidenceError, match=message):
+        _run(DOMAIN, COMPOSE_HASH, CONTENT_PK, reference)
+    assert network_calls == []
 
 
 def test_run_rejects_more_than_four_mebibytes_of_aggregate_evidence(
@@ -1051,6 +1094,43 @@ def test_run_rejects_ingress_measurement_outside_approved_reference(
         EvidenceError, match="approved ingress measurement mismatch: mrtd"
     ):
         _run(DOMAIN, COMPOSE_HASH, CONTENT_PK, reference)
+
+
+def test_run_rejects_ingress_mr_config_id_compose_mismatch(
+    monkeypatch, evidence_fixture
+):
+    files = dict(evidence_fixture.files)
+    files["quote.json"] = json.dumps(
+        {
+            "quote": _make_tdx_quote(
+                report_data=hashlib.sha256(files["sha256sum.txt"]).digest() + bytes(32),
+                measurements=INGRESS_MEASUREMENTS,
+                mr_config_id="01" + "ff" * 32 + "00" * 15,
+            ).hex(),
+            "event_log": "[]",
+            "hash_algorithm": "raw",
+            "prefix": "",
+        }
+    ).encode()
+    responses = {
+        f"https://{DOMAIN}/evidences/{name}": content for name, content in files.items()
+    }
+    responses[f"https://{DOMAIN}/attestation"] = json.dumps(
+        _attestation_bundle()
+    ).encode()
+    monkeypatch.setattr(
+        verifier, "_https_get", lambda url, _domain, **_kwargs: responses[url]
+    )
+    monkeypatch.setattr(
+        verifier,
+        "_fetch_tls_peer_certificate",
+        lambda *_args, **_kwargs: evidence_fixture.peer_der,
+    )
+
+    with pytest.raises(
+        EvidenceError, match="ingress mr_config_id does not bind expected compose_hash"
+    ):
+        _run(DOMAIN, COMPOSE_HASH, CONTENT_PK, _reference_measurements())
 
 
 def test_cli_requires_reference_measurements_file(monkeypatch):

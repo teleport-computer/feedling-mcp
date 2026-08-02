@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote as urlquote
@@ -55,6 +56,7 @@ _HEX_32_BYTES = re.compile(r"[0-9A-Fa-f]{64}")
 _HEX_48_BYTES = re.compile(r"[0-9A-Fa-f]{96}")
 _MEASUREMENT_FIELDS = ("mrtd", "rtmr0", "rtmr1", "rtmr2")
 _CLAIMED_MEASUREMENT_FIELDS = _MEASUREMENT_FIELDS + ("rtmr3", "mr_config_id")
+_APPROVED_AT_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
 _INGRESS_QUOTE_PREFIX_BY_ALGORITHM = {
     "raw": "",
     "sha256": "dstack-ingress",
@@ -555,6 +557,23 @@ def _validate_reference_measurements(
         raise EvidenceError("reference measurements root must be an object")
     if type(reference.get("version")) is not int or reference.get("version") != 1:
         raise EvidenceError("reference measurements version must be 1")
+    if reference.get("status") != "APPROVED_REFERENCE":
+        raise EvidenceError("reference status must be APPROVED_REFERENCE")
+    approved_by = reference.get("approved_by")
+    if not isinstance(approved_by, str) or not approved_by.strip():
+        raise EvidenceError("reference approved_by must be nonempty text")
+    approved_at = reference.get("approved_at")
+    if (
+        not isinstance(approved_at, str)
+        or _APPROVED_AT_UTC.fullmatch(approved_at) is None
+    ):
+        raise EvidenceError("reference approved_at must be a strict UTC timestamp")
+    try:
+        datetime.fromisoformat(approved_at[:-1] + "+00:00")
+    except ValueError as exc:
+        raise EvidenceError(
+            "reference approved_at must be a strict UTC timestamp"
+        ) from exc
     reference_domain = _validate_domain(reference.get("domain"))
     if reference_domain != domain:
         raise EvidenceError("reference domain does not match CLI domain")
@@ -791,6 +810,18 @@ def _run(
     ingress_quote = _parse_ingress_quote(files)
     _verify_approved_quote_measurements(ingress_quote, approved["ingress"], "ingress")
     checks.append("ingress quote matches approved reference measurements")
+    expected_ingress_mr_config_id = (
+        b"\x01"
+        + bytes.fromhex(
+            _normalize_32_byte_hex(expected_compose_hash, "expected compose_hash")
+        )
+        + bytes(15)
+    )
+    if not hmac.compare_digest(
+        ingress_quote.body.mrconfig_id, expected_ingress_mr_config_id
+    ):
+        raise EvidenceError("ingress mr_config_id does not bind expected compose_hash")
+    checks.append("ingress mr_config_id binds expected compose_hash")
 
     attestation_data = fetch(
         f"https://{normalized_domain}/attestation", "attestation fetch"
