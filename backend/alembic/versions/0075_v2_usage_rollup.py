@@ -76,6 +76,7 @@ def _bounds_check(*, latency: bool) -> str:
                 f"{prefix}_cache_write_tokens_known_count <= {prefix}_turns",
                 f"{prefix}_cache_miss_tokens_known_count <= {prefix}_turns",
                 f"{prefix}_usage_reported_calls <= {prefix}_model_calls",
+                f"{prefix}_cache_reported_calls <= {prefix}_model_calls",
                 f"{prefix}_unknown_usage_calls <= {prefix}_model_calls",
             )
         )

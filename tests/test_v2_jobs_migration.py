@@ -1,6 +1,7 @@
 """0014 迁移落地：四张 V2 表 + single-flight 唯一索引真的存在且生效。"""
 
 import inspect
+import os
 import sys
 from pathlib import Path
 
@@ -10,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
 import psycopg
+from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from model_api_runtime.v2 import jobs_store
@@ -272,6 +274,130 @@ def test_0075_usage_rollup_rejects_negative_aggregates_and_tracks_watermarks():
     assert row[0] is True
     assert row[1] is not None and row[2] == 42 and row[3] is not None
     assert row[4] is not None and row[5] == "transient timeout" and row[6] == 3
+
+
+@pytest.mark.parametrize(
+    ("table", "prefix", "day"),
+    [
+        ("v2_usage_daily_users", "all", "2026-09-01"),
+        ("v2_usage_daily_users", "metered", "2026-09-02"),
+        ("v2_usage_daily_users", "unknown", "2026-09-03"),
+        ("v2_usage_daily_dimensions", "all", "2026-09-04"),
+        ("v2_usage_daily_dimensions", "metered", "2026-09-05"),
+        ("v2_usage_daily_dimensions", "unknown", "2026-09-06"),
+    ],
+)
+def test_0075_cache_reported_calls_cannot_exceed_model_calls(
+    table, prefix, day
+):
+    with db.get_pool().connection() as conn:
+        if table == "v2_usage_daily_users":
+            sql = (
+                f"INSERT INTO {table} "
+                f"(local_day,user_id,{prefix}_cache_reported_calls,"
+                f"{prefix}_model_calls) VALUES (%s,NULL,1,0)"
+            )
+        else:
+            sql = (
+                f"INSERT INTO {table} "
+                f"(local_day,user_id,lane,provider,model,"
+                f"{prefix}_cache_reported_calls,{prefix}_model_calls) "
+                "VALUES (%s,NULL,'chat','unknown','unknown',1,0)"
+            )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(sql, (day,))
+
+
+def test_0075_downgrade_and_replay_is_repeatable():
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    try:
+        command.downgrade(cfg, "0074_runtime_user_delivery_idx")
+        with db.get_pool().connection() as conn:
+            assert conn.execute(
+                "SELECT version_num FROM alembic_version"
+            ).fetchone() == ("0074_runtime_user_delivery_idx",)
+            assert conn.execute(
+                "SELECT to_regclass('v2_usage_daily_users')"
+            ).fetchone() == (None,)
+
+        command.upgrade(cfg, "0075_v2_usage_rollup")
+        with db.get_pool().connection() as conn:
+            assert conn.execute(
+                "SELECT version_num FROM alembic_version"
+            ).fetchone() == ("0075_v2_usage_rollup",)
+            assert conn.execute(
+                "SELECT to_regclass('v2_usage_daily_users')"
+            ).fetchone()[0] is not None
+
+        command.downgrade(cfg, "0074_runtime_user_delivery_idx")
+        command.upgrade(cfg, "0075_v2_usage_rollup")
+        with db.get_pool().connection() as conn:
+            assert conn.execute(
+                "SELECT version_num FROM alembic_version"
+            ).fetchone() == ("0075_v2_usage_rollup",)
+            assert conn.execute(
+                "SELECT to_regclass('v2_usage_daily_dimensions')"
+            ).fetchone()[0] is not None
+    finally:
+        command.upgrade(cfg, "head")
+
+
+def test_0075_upgrade_recovers_a_real_invalid_concurrent_index_shell():
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    uid = "u_0075_invalid_index"
+    _seed_user(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_turn_metrics "
+            "(user_id,lane,model_calls,updated_at) VALUES (%s,'chat',1,now())",
+            (uid,),
+        )
+
+    try:
+        command.downgrade(cfg, "0074_runtime_user_delivery_idx")
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(
+                "CREATE FUNCTION v2_usage_test_fail_index(timestamptz) "
+                "RETURNS timestamptz LANGUAGE plpgsql IMMUTABLE AS $$ "
+                "BEGIN RAISE EXCEPTION 'intentional index build failure'; END $$"
+            )
+            with pytest.raises(psycopg.errors.RaiseException):
+                conn.execute(
+                    "CREATE INDEX CONCURRENTLY ix_v2_turn_metrics_updated_id "
+                    "ON v2_turn_metrics "
+                    "(v2_usage_test_fail_index(updated_at),id) INCLUDE(created_at)"
+                )
+            invalid = conn.execute(
+                "SELECT indisvalid FROM pg_index "
+                "WHERE indexrelid='ix_v2_turn_metrics_updated_id'::regclass"
+            ).fetchone()
+        assert invalid == (False,)
+
+        command.upgrade(cfg, "0075_v2_usage_rollup")
+        with db.get_pool().connection() as conn:
+            recovered = conn.execute(
+                "SELECT idx.indisvalid,pg_get_indexdef(idx.indexrelid) "
+                "FROM pg_index idx "
+                "WHERE idx.indexrelid='ix_v2_turn_metrics_updated_id'::regclass"
+            ).fetchone()
+        assert recovered[0] is True
+        assert "(updated_at, id) INCLUDE (created_at)" in recovered[1]
+        assert "v2_usage_test_fail_index" not in recovered[1]
+    finally:
+        command.downgrade(cfg, "0074_runtime_user_delivery_idx")
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(
+                "DROP INDEX CONCURRENTLY IF EXISTS ix_v2_turn_metrics_updated_id"
+            )
+            conn.execute("DROP FUNCTION IF EXISTS v2_usage_test_fail_index(timestamptz)")
+        command.upgrade(cfg, "head")
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
 
 
 def test_0074_runtime_user_delivery_indexes_are_concurrent_and_recoverable():
