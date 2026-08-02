@@ -4956,6 +4956,39 @@ def _usage_fact_aggregate_columns(alias: str = "s") -> str:
     )
 
 
+def _usage_fact_reduce_columns(alias: str = "s") -> str:
+    counters = (
+        "turns", "model_calls", "retries", "failed_turns",
+        "usage_reported_calls", "cache_reported_calls", "unknown_usage_calls",
+        "metered_turns", "metered_prompt_tokens_sum",
+        "metered_prompt_tokens_known_count", "metered_completion_tokens_sum",
+        "metered_completion_tokens_known_count",
+    )
+    values = [f"coalesce(sum({alias}.{field}),0)::bigint AS {field}" for field in counters]
+    for field in _USAGE_FACT_TOKENS:
+        values.extend(
+            (
+                f"coalesce(sum({alias}.{field}_sum),0)::bigint AS {field}_sum",
+                f"coalesce(sum({alias}.{field}_known_count),0)::bigint AS {field}_known_count",
+            )
+        )
+    return ",".join(values)
+
+
+def _usage_rendered_aggregate_columns(alias: str = "u") -> str:
+    counters = (
+        "turns", "model_calls", "retries", "failed_turns",
+        "usage_reported_calls", "cache_reported_calls", "unknown_usage_calls",
+        "metered_turns",
+    )
+    values = [f"coalesce(sum({alias}.{field}),0)::bigint AS {field}" for field in counters]
+    for field in (*_USAGE_FACT_TOKENS, "metered_prompt_tokens", "metered_completion_tokens"):
+        values.append(
+            f"CASE WHEN count({alias}.{field})>0 THEN sum({alias}.{field})::bigint END AS {field}"
+        )
+    return ",".join(values)
+
+
 def _usage_known_total_order(alias: str = "s") -> str:
     """Match raw ``sum(prompt)+sum(completion) NULLS LAST`` semantics."""
 
@@ -5104,48 +5137,49 @@ def _usage_parallel_core_rows(cur, query, partition, *, unknown_auxiliary=True) 
         )
     dimensions = usage_reporting.has_dimension_filter(query)
     source_sql, params = _usage_fact_query(query, partition, dimensions=dimensions)
-    aggregates = _usage_fact_aggregate_columns()
+    aggregates = _usage_fact_aggregate_columns("d")
+    reduced = _usage_fact_reduce_columns()
+    rendered_aggregates = _usage_rendered_aggregate_columns()
     try:
         with cur.connection.transaction():
             _usage_snapshot_observer("read", role="exporter", section="core_bundle")
             cur.execute(
                 f"""
-WITH source AS MATERIALIZED ({source_sql}),
-totals_row AS (
- SELECT {aggregates},
-  count(DISTINCT user_id) FILTER (WHERE model_calls>0)::int AS model_active_users,
-  count(DISTINCT user_id) FILTER (WHERE usage_reported_calls>0)::int AS metered_users,
-  count(DISTINCT (user_id,local_day)) FILTER (WHERE model_calls>0)::int AS active_user_days
- FROM source s
-), distribution_user_days AS (
- SELECT user_id,local_day,{_usage_known_sum('prompt_tokens')} AS prompt_tokens,
-  {_usage_known_sum('completion_tokens')} AS completion_tokens
- FROM source s WHERE model_calls>0 GROUP BY user_id,local_day
-), distribution_row AS (
- SELECT percentile_cont(.5) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens) AS p50,
-  percentile_cont(.75) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens) AS p75,
-  percentile_cont(.9) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens) AS p90,
-  percentile_cont(.95) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens) AS p95,
-  max(prompt_tokens+completion_tokens) AS max
- FROM distribution_user_days WHERE prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL
+WITH source AS ({source_sql}),
+user_days AS MATERIALIZED (
+ SELECT user_id,local_day,min(first_metric_at) AS first_metric_at,
+  max(last_metric_at) AS last_metric_at,max(last_model_call_at) AS last_model_call_at,
+  {reduced}
+ FROM source s GROUP BY user_id,local_day
+),
+distribution_row AS (
+ SELECT percentile_cont(.5) WITHIN GROUP (ORDER BY prompt_tokens_sum+completion_tokens_sum) AS p50,
+  percentile_cont(.75) WITHIN GROUP (ORDER BY prompt_tokens_sum+completion_tokens_sum) AS p75,
+  percentile_cont(.9) WITHIN GROUP (ORDER BY prompt_tokens_sum+completion_tokens_sum) AS p90,
+  percentile_cont(.95) WITHIN GROUP (ORDER BY prompt_tokens_sum+completion_tokens_sum) AS p95,
+  max(prompt_tokens_sum+completion_tokens_sum) AS max
+ FROM user_days WHERE model_calls>0 AND prompt_tokens_known_count>0
+  AND completion_tokens_known_count>0
 ), daily_rows AS (
  SELECT local_day,{aggregates},
   count(DISTINCT user_id) FILTER (WHERE model_calls>0)::int AS model_active_users
- FROM source s GROUP BY local_day
-), user_dist AS (
- SELECT user_id,
-  percentile_cont(.5) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens)
-   FILTER (WHERE prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL) AS daily_p50,
-  percentile_cont(.95) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens)
-   FILTER (WHERE prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL) AS daily_p95
- FROM distribution_user_days GROUP BY user_id
-), user_rows AS (
- SELECT s.user_id,{aggregates},
-  count(DISTINCT s.local_day) FILTER (WHERE s.model_calls>0)::int AS active_days,
-  max(s.last_model_call_at) AS last_model_call_at,
-  max(d.daily_p50) AS daily_p50,max(d.daily_p95) AS daily_p95,
-  {_usage_known_total_order()} AS _order_total
- FROM source s LEFT JOIN user_dist d USING (user_id) GROUP BY s.user_id
+ FROM user_days d GROUP BY local_day
+), user_rows AS MATERIALIZED (
+ SELECT d.user_id,{aggregates},
+  count(DISTINCT d.local_day) FILTER (WHERE d.model_calls>0)::int AS active_days,
+  max(d.last_model_call_at) AS last_model_call_at,
+  percentile_cont(.5) WITHIN GROUP (ORDER BY d.prompt_tokens_sum+d.completion_tokens_sum)
+   FILTER (WHERE d.model_calls>0 AND d.prompt_tokens_known_count>0 AND d.completion_tokens_known_count>0) AS daily_p50,
+  percentile_cont(.95) WITHIN GROUP (ORDER BY d.prompt_tokens_sum+d.completion_tokens_sum)
+   FILTER (WHERE d.model_calls>0 AND d.prompt_tokens_known_count>0 AND d.completion_tokens_known_count>0) AS daily_p95,
+  {_usage_known_total_order('d')} AS _order_total
+ FROM user_days d GROUP BY d.user_id
+), totals_row AS (
+ SELECT {rendered_aggregates},
+  count(*) FILTER (WHERE model_calls>0)::int AS model_active_users,
+  count(*) FILTER (WHERE usage_reported_calls>0)::int AS metered_users,
+  coalesce(sum(active_days),0)::int AS active_user_days
+ FROM user_rows u
 )
 SELECT (SELECT to_jsonb(t) FROM totals_row t) AS totals,
  (SELECT to_jsonb(d) FROM distribution_row d) AS distribution,

@@ -610,6 +610,7 @@ def _run(args) -> int:
             "precondition": args.precondition_note or None,
         },
         "fixture": {
+            "prefix": prefix,
             "rows": args.rows,
             "users": args.users,
             "history_days": args.history_days,
