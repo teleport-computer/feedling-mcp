@@ -4824,8 +4824,8 @@ def _usage_fact_query(
     rollup_day_where, rollup_params = _usage_rollup_day_predicate(
         partition.rollup_days
     )
-    raw_starts: list[datetime] = []
-    raw_ends: list[datetime] = []
+    raw_range_clauses: list[str] = []
+    raw_params: list[object] = []
     for raw_day in partition.raw_days:
         day_start = datetime.combine(
             raw_day, datetime.min.time(), tzinfo=usage_reporting.SHANGHAI
@@ -4835,9 +4835,15 @@ def _usage_fact_query(
             datetime.min.time(),
             tzinfo=usage_reporting.SHANGHAI,
         ).astimezone(timezone.utc)
-        raw_starts.append(max(day_start, query.start_at_utc))
-        raw_ends.append(min(day_end, query.end_at_utc))
-    raw_params: list[object] = [raw_starts, raw_ends]
+        raw_range_clauses.append(
+            "(m.created_at >= %s AND m.created_at < %s)"
+        )
+        raw_params.extend(
+            (
+                max(day_start, query.start_at_utc),
+                min(day_end, query.end_at_utc),
+            )
+        )
     if query.user_id:
         user_clauses.append("coalesce(user_id,'unknown')=%s")
         rollup_params.append(query.user_id)
@@ -4866,7 +4872,10 @@ WHERE {' AND '.join(rollup_where)}
         # omit that relation structurally rather than relying on join order.
         return rollup_statement, tuple(rollup_params)
 
-    raw_where = [selected_condition]
+    raw_where = [
+        selected_condition,
+        "(" + " OR ".join(raw_range_clauses) + ")",
+    ]
     if query.user_id:
         raw_where.append("coalesce(m.user_id,'unknown')=%s")
         raw_params.append(query.user_id)
@@ -4907,9 +4916,7 @@ WHERE {' AND '.join(rollup_where)}
         else ""
     )
     statement = f"""
-WITH raw_ranges(start_at,end_at) AS (
-  SELECT * FROM unnest(%s::timestamptz[],%s::timestamptz[])
-), facts AS (
+WITH facts AS (
 {rollup_statement}
 UNION ALL
 SELECT (m.created_at AT TIME ZONE 'Asia/Shanghai')::date AS local_day,
@@ -4917,15 +4924,13 @@ SELECT (m.created_at AT TIME ZONE 'Asia/Shanghai')::date AS local_day,
   min(m.created_at) AS first_metric_at,max(m.created_at) AS last_metric_at,
   max(m.created_at) FILTER (WHERE m.model_calls>0) AS last_model_call_at,
   {raw_metrics},{raw_tokens},{raw_metered}{raw_latency}
-FROM raw_ranges rr
-JOIN v2_turn_metrics m
-  ON m.created_at >= rr.start_at AND m.created_at < rr.end_at
+FROM v2_turn_metrics m
 WHERE {' AND '.join(raw_where)}
 GROUP BY (m.created_at AT TIME ZONE 'Asia/Shanghai')::date,m.user_id{identity_group}
 )
 SELECT * FROM facts
 """
-    return statement, tuple(raw_params[:2] + rollup_params + raw_params[2:])
+    return statement, tuple(rollup_params + raw_params)
 
 
 def _usage_known_sum(field: str, alias: str = "s") -> str:

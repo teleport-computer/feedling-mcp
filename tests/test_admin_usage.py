@@ -607,17 +607,26 @@ def test_usage_rollup_report_has_no_rows_after_account_deletion():
     assert after["models"] == []
 
 
-def test_usage_hybrid_raw_sql_uses_bounded_created_at_ranges():
-    partition = usage_reporting.RollupPartition(
-        rollup_days=(datetime(2026, 7, 1).date(),),
-        raw_days=(datetime(2026, 7, 2).date(),),
+def test_usage_hybrid_raw_sql_inlines_scalar_created_at_ranges_for_index_selectivity():
+    query = _usage.UsageQuery(
+        start_at_utc=datetime(2026, 5, 4, 12, 30, tzinfo=timezone.utc),
+        end_at_utc=datetime(2026, 8, 2, 12, 30, tzinfo=timezone.utc),
+        timezone="Asia/Shanghai",
+        preset="90d",
     )
-    statement, _params = jobs_store._usage_fact_query(
-        _shanghai_usage_query(), partition, dimensions=True
-    )
+    partition = usage_reporting.rollup_partition(query)
+    assert partition is not None
+    statement, params = jobs_store._usage_fact_query(query, partition, dimensions=False)
 
-    assert "m.created_at >= rr.start_at AND m.created_at < rr.end_at" in statement
+    assert "raw_ranges" not in statement
+    assert statement.count("m.created_at >= %s AND m.created_at < %s") == 2
     assert "NOT ((m.created_at AT TIME ZONE" not in statement
+    assert params[-4:] == (
+        datetime(2026, 5, 4, 12, 30, tzinfo=timezone.utc),
+        datetime(2026, 5, 4, 16, tzinfo=timezone.utc),
+        datetime(2026, 8, 1, 16, tzinfo=timezone.utc),
+        datetime(2026, 8, 2, 12, 30, tzinfo=timezone.utc),
+    )
 
 
 def test_usage_rollup_only_sql_omits_authoritative_raw_table_entirely():
