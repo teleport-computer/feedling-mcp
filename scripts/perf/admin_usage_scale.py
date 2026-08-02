@@ -605,7 +605,10 @@ def _run(args) -> int:
         ),
     }
     evidence: dict[str, Any] = {
-        "database": database_identity,
+        "database": {
+            **database_identity,
+            "precondition": args.precondition_note or None,
+        },
         "fixture": {
             "rows": args.rows,
             "users": args.users,
@@ -775,6 +778,7 @@ def main() -> int:
     parser.add_argument("--history-days", type=int, default=DEFAULT_HISTORY_DAYS)
     parser.add_argument("--keep-data", action="store_true")
     parser.add_argument("--output", default="")
+    parser.add_argument("--precondition-note", default="")
     args = parser.parse_args()
     if args.self_test:
         return _self_test()
