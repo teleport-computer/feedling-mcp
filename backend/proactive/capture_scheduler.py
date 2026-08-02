@@ -14,7 +14,7 @@ from typing import Any, Callable, Mapping
 
 import db
 from psycopg.types.json import Jsonb
-from proactive import capture_jobs
+from proactive import capture_daily, capture_jobs
 from memory import migration as memory_migration
 
 CAPTURE_STATE_KIND = "capture_state"
@@ -93,6 +93,12 @@ def _state_doc(raw: Any) -> dict[str, Any]:
         "capture_seq_initialized": seq_initialized,
         "pending_capture_key": str(doc.get("pending_capture_key") or "")[:240],
         "last_capture_completed_at": _safe_float(doc.get("last_capture_completed_at"), 0.0),
+        "last_capture_cards_added_at": _safe_float(
+            doc.get("last_capture_cards_added_at"), 0.0
+        ),
+        "last_capture_cards_added": max(
+            0, int(_safe_float(doc.get("last_capture_cards_added"), 0.0))
+        ),
         "capture_fail_streak": max(0, int(_safe_float(doc.get("capture_fail_streak"), 0.0))),
         "last_capture_failed_at": _safe_float(doc.get("last_capture_failed_at"), 0.0),
         "migrate_fail_streak": max(0, int(_safe_float(doc.get("migrate_fail_streak"), 0.0))),
@@ -685,6 +691,10 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
         return load_capture_state(store)
     now_ts = time.time() if now is None else float(now)
     state = load_capture_state(store)
+    try:
+        cards_added = max(0, int(job.get("cards_added") or 0))
+    except (TypeError, ValueError):
+        cards_added = 0
     capture_key = str(job.get("capture_key") or "")
     if capture_key and str(state.get("pending_capture_key") or "") == capture_key:
         state["pending_capture_key"] = ""
@@ -699,6 +709,17 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
             state["last_captured_until_message_id"] = until_id
             state["last_captured_until_ts"] = until_ts
             state["last_capture_completed_at"] = now_ts
+        try:
+            settings = store.load_proactive_settings()
+        except Exception:
+            settings = {}
+        state.update(capture_daily.daily_capture_patch(
+            state,
+            cards_added=cards_added,
+            completed_at=now_ts,
+            timezone_name=(settings or {}).get("timezone") or "UTC",
+            device_timezone=capture_daily.device_timezone_name(store.user_id),
+        ))
         state["capture_fail_streak"] = 0
         state["last_capture_failed_at"] = 0.0
     elif status_text == "failed":
@@ -714,10 +735,6 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
 
     job_id = _capture_trace_job_id(job)
     if status_text == "completed":
-        try:
-            cards_added = int(job.get("cards_added") or 0)
-        except (TypeError, ValueError):
-            cards_added = 0
         titles = _capture_trace_card_titles(job)
         debug_trace.trace_event(
             store,

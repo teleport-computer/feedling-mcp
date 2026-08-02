@@ -80,12 +80,12 @@ def test_catalog_request_openai_compatible_bearer():
     assert params == {}
 
 
-def test_catalog_request_openrouter_asks_all_modalities():
+def test_catalog_request_openrouter_uses_unmodified_user_catalog():
     url, headers, params = pc._catalog_request(
         "openrouter", "sk-or", "", None)
-    assert url.endswith("/models")
+    assert url.endswith("/models/user")
     assert headers["Authorization"] == "Bearer sk-or"
-    assert params.get("output_modalities") == "all"
+    assert params == {}
 
 
 def test_catalog_request_gemini_key_in_header_not_query():
@@ -112,12 +112,55 @@ def test_parse_catalog_page_openai_data_shape():
     assert nxt is None
 
 
+def test_parse_catalog_page_openai_never_infers_modalities_from_model_names():
+    body = {
+        "data": [
+            {"id": "gpt-4.1", "owned_by": "openai"},
+            {"id": "o3", "owned_by": "openai"},
+            {"id": "whisper-1", "owned_by": "openai"},
+            {"id": "future-opaque", "input_modalities": ["text", "image"]},
+        ]
+    }
+    models, _ = pc._parse_catalog_page("openai", body)
+    assert all("input_modalities" not in model for model in models)
+    assert pc._catalog_input_modalities("openai", body["data"][0]) is None
+
+
 def test_parse_catalog_page_gemini_strips_prefix_and_paginates():
-    body = {"models": [{"name": "models/gemini-3.1-pro", "displayName": "Gemini 3.1 Pro"}],
+    body = {"models": [{
+                "name": "models/gemini-3.1-pro",
+                "displayName": "Gemini 3.1 Pro",
+                "supportedGenerationMethods": ["generateContent"],
+            }],
             "nextPageToken": "tok2"}
     models, nxt = pc._parse_catalog_page("gemini", body)
-    assert models == [{"id": "gemini-3.1-pro", "display_name": "Gemini 3.1 Pro"}]
+    assert models == [{
+        "id": "gemini-3.1-pro",
+        "display_name": "Gemini 3.1 Pro",
+    }]
     assert nxt == "tok2"
+
+
+def test_parse_catalog_page_gemini_never_infers_modalities_from_model_names():
+    body = {"models": [
+        {
+            "name": "models/gemma-3-27b-it",
+            "supportedGenerationMethods": ["generateContent"],
+        },
+        {
+            "name": "models/gemini-2.5-flash-tts",
+            "supportedGenerationMethods": ["generateContent"],
+        },
+        {
+            "name": "models/gemini-embedding-2",
+            "supportedGenerationMethods": ["embedContent"],
+        },
+        {"name": "models/gemini-future-without-methods"},
+    ]}
+
+    models, _ = pc._parse_catalog_page("gemini", body)
+
+    assert all("input_modalities" not in model for model in models)
 
 
 def test_parse_catalog_page_anthropic_has_more():
@@ -151,6 +194,18 @@ def test_parse_catalog_page_anthropic_maps_image_capability_without_guessing():
     assert models[0]["input_modalities"] == ["text", "image"]
     assert models[1]["input_modalities"] == ["text"]
     assert "input_modalities" not in models[2]
+
+
+def test_parse_catalog_page_deepseek_does_not_hardcode_modalities():
+    body = {"data": [
+        {"id": "deepseek-v4-flash", "object": "model", "owned_by": "deepseek"},
+        {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek"},
+    ]}
+
+    models, _ = pc._parse_catalog_page("deepseek", body)
+
+    assert all("input_modalities" not in model for model in models)
+    assert pc._catalog_input_modalities("deepseek", body["data"][0]) is None
 
 
 def test_parse_catalog_page_compatible_accepts_only_explicit_safe_modalities():
@@ -256,32 +311,29 @@ def _install_fake_stream(monkeypatch, pages):
 
 
 def test_list_models_openrouter_single_page(monkeypatch):
-    # openrouter now probes the auth endpoint (/key) FIRST, then fetches /models.
+    # /models/user is authenticated and filtered for this exact API key.
     calls = _install_fake_stream(monkeypatch, [
-        (200, {"data": {"label": "ok"}}),               # /key probe (valid key)
-        (200, {"data": [{"id": "a"}, {"id": "b"}]}),     # /models catalog
+        (200, {"data": [{"id": "a"}, {"id": "b"}]}),
     ])
     res = pc.list_provider_models("openrouter", "k", "")
     assert res["catalog_supported"] is True and res["complete"] is True
     assert [m["id"] for m in res["models"]] == ["a", "b"]
-    assert calls[0]["url"].endswith("/key")             # probe hit first
-    assert calls[1]["url"].endswith("/models")
-    assert calls[1]["params"].get("output_modalities") == "all"
+    assert len(calls) == 1
+    assert calls[0]["url"].endswith("/models/user")
+    assert calls[0]["params"] == {}
 
 
-def test_list_models_openrouter_bogus_key_blocked_before_catalog(monkeypatch):
-    # OpenRouter's /models is PUBLIC → a bogus key would otherwise return a full
-    # catalog. The /key probe must 401 and block BEFORE any catalog is returned.
+def test_list_models_openrouter_bogus_key_rejected_by_user_catalog(monkeypatch):
+    # The key-filtered catalog itself is authenticated, so a bad key cannot
+    # receive the public all-model list.
     calls = _install_fake_stream(monkeypatch, [
-        (401, {"error": "invalid api key"}),            # /key probe rejects
-        (200, {"data": [{"id": "a"}, {"id": "b"}]}),     # /models — must NOT be reached
+        (401, {"error": "invalid api key"}),
     ])
     with pytest.raises(pc.ProviderError) as ei:
         pc.list_provider_models("openrouter", "bogus", "")
     assert ei.value.status_code == 401
-    # Only the probe ran; the catalog fetch never happened.
     assert len(calls) == 1
-    assert calls[0]["url"].endswith("/key")
+    assert calls[0]["url"].endswith("/models/user")
     # And the route maps a bogus openrouter key to the auth-failed slug.
     assert pc.model_catalog_error_slug(ei.value) == "model_catalog_auth_failed"
 

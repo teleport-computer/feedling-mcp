@@ -5,6 +5,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
@@ -148,8 +150,9 @@ def test_memory_action_rejects_invented_source_and_capture_mode(monkeypatch):
         "type": "memory.add",
         "memory": {**base_memory, "source": "对话"},
     }])
-    assert status == 200
+    assert status == 400
     assert body["status"] == "failed"
+    assert body["error"] == "source_invalid"
     assert body["results"][0]["error"] == "source_invalid"
     assert saved == []
 
@@ -158,8 +161,9 @@ def test_memory_action_rejects_invented_source_and_capture_mode(monkeypatch):
         "memory": {**base_memory, "source": "chat"},
         "capture_mode": "conversation_2026",
     }])
-    assert status == 200
+    assert status == 400
     assert body["status"] == "failed"
+    assert body["error"] == "capture_mode_invalid"
     assert body["results"][0]["error"] == "capture_mode_invalid"
     assert saved == []
 
@@ -200,7 +204,32 @@ def test_memory_source_policy_covers_known_production_values():
     assert PROD_MEMORY_SOURCE_VALUES_2026_07_29 <= MEMORY_SOURCE_VALUES
 
 
-def test_memory_batch_all_item_failures_return_200_with_complete_results(monkeypatch):
+@pytest.mark.parametrize("count", [1, 2])
+def test_memory_batch_all_success_stays_200(monkeypatch, count):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    monkeypatch.setattr(
+        memory_actions,
+        "_execute_memory_action",
+        lambda _store, _api_key, action, **_kwargs: (
+            {"status": "ok", "id": f"mem_{action['marker']}"},
+            [{"memory_id": f"mem_{action['marker']}"}],
+            200,
+        ),
+    )
+
+    body, status = memory_actions._execute_memory_actions(
+        store, "api_key", [{"marker": i} for i in range(count)]
+    )
+
+    assert status == 200
+    assert body["status"] == "ok"
+    assert body["applied_count"] == count
+    assert body["skipped_count"] == body["failed_count"] == 0
+    assert "error" not in body and "detail" not in body
+    assert [row["http_status"] for row in body["results"]] == [200] * count
+
+
+def test_memory_batch_all_item_failures_return_400_with_complete_results(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_v1")
     calls = []
 
@@ -209,6 +238,7 @@ def test_memory_batch_all_item_failures_return_200_with_complete_results(monkeyp
         return {
             "status": "error",
             "error": f"bad_{action['marker']}",
+            "detail": {"marker": action["marker"]},
         }, [{"type": "must_not_escape_failed_item"}], 400
 
     monkeypatch.setattr(memory_actions, "_execute_memory_action", fail_one)
@@ -218,15 +248,45 @@ def test_memory_batch_all_item_failures_return_200_with_complete_results(monkeyp
         [{"marker": "one"}, {"marker": "two"}],
     )
 
-    assert status == 200
+    assert status == 400
     assert calls == ["one", "two"]
     assert body["status"] == "failed"
+    assert body["error"] == "bad_one"
+    assert body["detail"] == {"marker": "one"}
     assert body["total_count"] == 2
     assert body["applied_count"] == 0
     assert body["skipped_count"] == 0
     assert body["failed_count"] == 2
     assert [row["error"] for row in body["results"]] == ["bad_one", "bad_two"]
     assert body["effects"] == []
+
+
+def test_memory_batch_single_item_failure_returns_400_with_full_result(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    monkeypatch.setattr(
+        memory_actions,
+        "_execute_memory_action",
+        lambda *_args, **_kwargs: (
+            {
+                "status": "error",
+                "error": "anchor_required",
+                "detail": {"mem_type": "insight"},
+            },
+            [],
+            400,
+        ),
+    )
+
+    body, status = memory_actions._execute_memory_actions(
+        store, "api_key", [{"marker": "one"}]
+    )
+
+    assert status == 400
+    assert body["error"] == "anchor_required"
+    assert body["detail"] == {"mem_type": "insight"}
+    assert body["total_count"] == body["failed_count"] == 1
+    assert body["applied_count"] == body["skipped_count"] == 0
+    assert body["results"][0]["http_status"] == 400
 
 
 def test_memory_batch_mixed_failures_and_noop_do_not_affect_neighbors(monkeypatch):
@@ -263,12 +323,62 @@ def test_memory_batch_mixed_failures_and_noop_do_not_affect_neighbors(monkeypatc
     assert body["applied_count"] == 2
     assert body["skipped_count"] == 1
     assert body["failed_count"] == 4
+    assert "error" not in body and "detail" not in body
     assert [effect["memory_id"] for effect in body["effects"]] == [
         "mem_1", "mem_2"
     ]
     assert [row["http_status"] for row in body["results"]] == [
         200, 400, 404, 403, 400, 200, 200
     ]
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_memory_batch_all_skipped_stays_200(monkeypatch, count):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    monkeypatch.setattr(
+        memory_actions,
+        "_execute_memory_action",
+        lambda *_args, **_kwargs: (
+            {"status": "ok", "noop": True, "skipped": "duplicate_active"},
+            [],
+            200,
+        ),
+    )
+
+    body, status = memory_actions._execute_memory_actions(
+        store, "api_key", [{"marker": i} for i in range(count)]
+    )
+
+    assert status == 200
+    assert body["status"] == "ok"
+    assert body["applied_count"] == body["failed_count"] == 0
+    assert body["skipped_count"] == count
+    assert "error" not in body and "detail" not in body
+
+
+def test_memory_batch_skipped_plus_failed_without_apply_returns_400(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    outcomes = iter([
+        ({"status": "ok", "noop": True, "skipped": "duplicate_active"}, [], 200),
+        ({"status": "error", "error": "not_found", "detail": {"id": "missing"}}, [], 404),
+    ])
+    monkeypatch.setattr(
+        memory_actions,
+        "_execute_memory_action",
+        lambda *_args, **_kwargs: next(outcomes),
+    )
+
+    body, status = memory_actions._execute_memory_actions(
+        store, "api_key", [{"marker": "skip"}, {"marker": "fail"}]
+    )
+
+    assert status == 400
+    assert body["status"] == "partial"
+    assert body["error"] == "not_found"
+    assert body["detail"] == {"id": "missing"}
+    assert body["applied_count"] == 0
+    assert body["skipped_count"] == body["failed_count"] == 1
+    assert [row["http_status"] for row in body["results"]] == [200, 404]
 
 
 def test_memory_add_skips_normalized_duplicate_but_keeps_distinct_content(monkeypatch):

@@ -40,6 +40,15 @@ class _Store:
     def read_events(self, uid, limit=50):
         return list(self.events.get(uid, [])[-limit:])
 
+    # pull_snapshot now includes the TTL-bounded app open/close trajectory.
+    # These ingress tests do not seed app events, but their store double must
+    # still implement the production read contract used by that snapshot.
+    def read_app_opens(self, uid, limit=100, since_epoch=0.0):
+        return []
+
+    def read_app_closes(self, uid, limit=100, since_epoch=0.0):
+        return []
+
     def append_decrypt_failure(self, uid, doc, ts):
         self.decrypt_failures.setdefault(uid, []).append(dict(doc))
 

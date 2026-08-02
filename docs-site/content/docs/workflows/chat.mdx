@@ -88,20 +88,25 @@ saved model route as an image observer. Read the current choice with `GET
 }
 ```
 
-IO sends the candidate a generated image whose answer is not known in advance
-and records whether the returned observation proves image understanding.
-Selection and capability are separate: a reachable text-only model may remain
-selected with `effective_status: "unsupported"` as settings feedback, but image
-sends are not blocked by probe state. `mode: "follow_main"` preserves the
-existing main-model image path, while a selected dedicated route is pinned for
-delivery even if its latest probe is stale or unsuccessful.
+IO can consult explicit per-model capability fields from the authenticated
+provider catalog, but that metadata is advisory. Every selected model receives
+one small randomized control image, and its reply must contain an unambiguous
+partial match before the route is recorded as able to inspect images. A catalog
+declaration cannot make the test pass or fail by itself. OpenRouter uses its
+key-scoped `models/user` catalog for its picker. A new dedicated selection
+succeeds only after the real image probe records `ok`; `mode: "follow_main"`
+preserves the existing main-model image path. If a route that was selected
+earlier later becomes non-`ok`, Settings keeps that choice visible for diagnosis,
+but image observation fails closed and never sends the pixels to a fallback
+model.
 
 Use `POST /v1/vision/config` when adding a dedicated image model. It creates or
-reuses the saved route, runs the generated-image check, and selects the route
-as one server-owned operation. A reachable model that proves text-only remains
-saved and selected with an `unsupported` warning, while authentication,
-provider, quota, and other operational failures remove only the route or
-credential created by that request.
+reuses the saved route, runs the randomized image check, and selects the route
+as one server-owned operation. A model that fails the control image is not
+selected; authentication, provider, quota, and other operational failures
+remove only the route or credential created by that request. An empty visible
+reply is recorded as a retryable test failure rather than as proof that the
+model cannot accept images.
 
 When a dedicated route is configured, IO records that exact route before the
 image turn is stored. Runtime V2 or the official resident then sends pixels only

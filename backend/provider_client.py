@@ -1863,6 +1863,7 @@ def _openai_uses_responses_for_reasoning(model: str) -> bool:
         or lower.startswith("o1")
         or lower.startswith("o3")
         or lower.startswith("o4")
+        or lower.startswith("computer-use-preview")
     )
 
 
@@ -3502,18 +3503,17 @@ def _catalog_request(provider: str, api_key: str, base_url: str,
     base = (base_url or default_base_url(provider)).rstrip("/")
     if provider == "bedrock":
         raise ProviderError("model_catalog_unsupported")
-    url = f"{base}/models"
+    # OpenRouter's public /models catalog ignores the caller's privacy settings,
+    # ZDR policy, and guardrails. /models/user applies those constraints to this
+    # exact API key. Keep this request unmodified: carrying public-catalog filters
+    # such as output_modalities=all broadens the response beyond that default.
+    url = f"{base}/models/user" if provider == "openrouter" else f"{base}/models"
     params: dict = {}
     if provider in _CATALOG_BEARER_PROVIDERS:
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         if provider == "openrouter":
             headers["HTTP-Referer"] = "https://feedling.app"
             headers["X-Title"] = "Feedling IO Hosted Runtime"
-            # OpenRouter's /models defaults to text-output models only. Ask for
-            # the full multimodal catalog — the product decision is "show all,
-            # no modality filtering". Verified live 2026-07-26: the param
-            # returns HTTP 200 with a superset (449 vs 345 models).
-            params["output_modalities"] = "all"
     elif provider == "anthropic":
         headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
                    "Content-Type": "application/json"}
@@ -3593,13 +3593,12 @@ def _parse_catalog_page(provider: str, body: Any) -> tuple[list[dict], str | Non
 
 
 def _catalog_input_modalities(provider: str, model: dict) -> list[str] | None:
-    """Return only explicit provider metadata; never infer from a model id.
+    """Return only modality fields explicitly supplied by this catalog row.
 
-    OpenRouter publishes ``architecture.input_modalities``. Anthropic publishes
-    ``capabilities.image_input.supported``. OpenAI-compatible relays may expose
-    a direct ``input_modalities`` extension. Other catalog shapes currently do
-    not make image input support explicit enough to trust, so ``None`` means the
-    caller must use a real visual probe.
+    No maintained model table, provider-level default, or model-name heuristic
+    belongs here. OpenAI, DeepSeek, Gemini, and other catalogs that omit an
+    official per-row modality field remain unknown and fall through to the real
+    image probe.
     """
     provider = normalize_provider(provider)
     raw = None
@@ -3621,7 +3620,7 @@ def _catalog_input_modalities(provider: str, model: dict) -> list[str] | None:
         )
         if isinstance(supported, bool):
             return ["text", "image"] if supported else ["text"]
-    elif provider in {"openai_compatible"}:
+    elif provider == "openai_compatible":
         raw = model.get("input_modalities")
 
     if not isinstance(raw, list):
@@ -3697,43 +3696,6 @@ def _fetch_catalog_page(client: httpx.Client, url: str, headers: dict,
     return body, total
 
 
-def _verify_key_for_public_catalog(provider: str, api_key: str,
-                                   base_url: str) -> None:
-    """Reject a bad key for providers whose model *catalog* is PUBLIC.
-
-    OpenRouter's ``GET /models`` needs no auth: a bogus key still returns a full
-    HTTP 200 catalog, so the iOS validate-before-advance gate would wave a wrong
-    key through (both a wrong and a right key "load" a catalog). Probe an
-    AUTHENTICATED endpoint FIRST so a bad key raises before we ever fetch the
-    catalog. A bogus key → 401 → ``ProviderError(status_code=401)`` (mapped to
-    ``model_catalog_auth_failed`` by ``model_catalog_error_slug``); a real key →
-    200 → returns. Only the status matters — the body is intentionally ignored.
-
-    Every OTHER supported provider already requires auth on its own ``/models``
-    (openai/anthropic/gemini/deepseek all 401 on a bad key), so this is a no-op
-    for them.
-
-    Residual edge: ``openai_compatible`` custom relays have no assumable auth-
-    check endpoint, so they are deliberately NOT probed here. A custom relay that
-    exposes a PUBLIC ``/models`` could still accept a bad key at this gate — left
-    as documented behavior rather than guessing an endpoint that may not exist.
-    """
-    provider = normalize_provider(provider)
-    if provider != "openrouter":
-        return
-    # OpenRouter's auth-check endpoint. ``base`` is the normalized openrouter
-    # base (https://openrouter.ai/api/v1), so the probe hits .../v1/key.
-    base = (base_url or default_base_url(provider)).rstrip("/")
-    url = f"{base}/key"
-    headers = {"Authorization": f"Bearer {api_key}",
-               "Content-Type": "application/json"}
-    client = _http_client()
-    deadline = time.monotonic() + _CATALOG_TOTAL_BUDGET
-    # One bounded request via the same streamed/capped helper the catalog pages
-    # use; it RAISES ProviderError on any status >= 400 (carrying status_code).
-    _fetch_catalog_page(client, url, headers, {}, deadline, 0)
-
-
 def list_provider_models(provider: str, api_key: str, base_url: str = "") -> dict:
     provider = normalize_provider(provider)
     warnings: list[str] = []
@@ -3744,14 +3706,6 @@ def list_provider_models(provider: str, api_key: str, base_url: str = "") -> dic
             return {"models": [], "complete": True, "warnings": [],
                     "catalog_supported": False}
         raise
-
-    # For providers whose catalog is PUBLIC (openrouter), verify the key against
-    # an authenticated endpoint BEFORE fetching the catalog, so a bogus key is
-    # rejected instead of returning a full catalog. No-op for every other
-    # provider (their /models already authenticates). Let ProviderError
-    # propagate — setup_core maps it via model_catalog_error_slug (401 →
-    # model_catalog_auth_failed), so the contract is unchanged.
-    _verify_key_for_public_catalog(provider, api_key, base_url)
 
     seen: set[str] = set()
     seen_cursors: set[str] = set()

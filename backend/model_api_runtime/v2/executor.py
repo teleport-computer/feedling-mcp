@@ -105,6 +105,7 @@ async def dispatch_tool_calls(
     enqueue_workspace_batch_effect=None,
     observe_photo=None,
     read_parallelism: int = 4,
+    identity_write_authorization: bool = True,
 ) -> list[ToolResult]:
     """Dispatch provider tool_calls (spec C3). READ_ACTIONS run inline-parallel (their content
     feeds back to the model); WRITE_ACTIONS pass the provenance write_gate then are ENQUEUED as
@@ -222,6 +223,7 @@ async def dispatch_tool_calls(
                 allowed, reason = _prov.write_gate(
                     candidate.name,
                     turn_authorization=turn_authorization,
+                    identity_write_authorization=identity_write_authorization,
                 )
                 if not allowed:
                     results_by_id[candidate.id] = ToolResult(
@@ -247,7 +249,11 @@ async def dispatch_tool_calls(
         # Every non-workspace mutation remains strictly serial in provider
         # order.  A workspace run stops before reaching this branch, so it can
         # never overtake a memory/identity/schedule/MCP operation.
-        allowed, reason = _prov.write_gate(tc.name, turn_authorization=turn_authorization)
+        allowed, reason = _prov.write_gate(
+            tc.name,
+            turn_authorization=turn_authorization,
+            identity_write_authorization=identity_write_authorization,
+        )
         if not allowed:
             results_by_id[tc.id] = ToolResult(call_id=tc.id, content=reason)
             write_index += 1

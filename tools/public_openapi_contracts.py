@@ -226,8 +226,8 @@ OPERATION_PARAMETERS: dict[Operation, list[dict[str, Any]]] = {
         _query("days", _schema("integer", minimum=1, maximum=365, default=14), "Lookback window in days.", example=14),
     ],
     ("get", "/v1/agent/perception/recent_apps"): [
-        _query("limit", _schema("integer", minimum=1, maximum=100, default=20), "Maximum app-open events to return.", example=20),
-        _query("hours", _schema("number", exclusiveMinimum=0), "Only include opens within the last N hours.", example=24),
+        _query("limit", _schema("integer", minimum=1, maximum=100, default=20), "Maximum merged app open/close events to return.", example=20),
+        _query("hours", _schema("number", exclusiveMinimum=0), "Only include app events within the last N hours.", example=24),
     ],
     ("get", "/v1/agent/perception/digest"): [
         _query("days", _schema("integer", minimum=1, maximum=365, default=30), "Lookback window in days.", example=30),
@@ -520,6 +520,46 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "description": "JSON response object. Endpoint-specific fields may be added compatibly.",
         "additionalProperties": True,
+    },
+    "DreamStatusResponse": {
+        "type": "object",
+        "description": (
+            "Memory Garden banner status. Dream counts describe the latest "
+            "completed Dream. Capture fields describe cards added on the "
+            "device-local calendar day containing capture_completed_at; clients "
+            "decide whether that timestamp is still today. Legal zero-card "
+            "Capture runs do not reset or refresh the fields."
+        ),
+        "required": [
+            "dreaming",
+            "last_completed_at",
+            "organized_count",
+            "merged_count",
+            "capture_completed_at",
+            "capture_cards_added",
+        ],
+        "additionalProperties": False,
+        "properties": {
+            "dreaming": {"type": "boolean"},
+            "last_completed_at": TIMESTAMP,
+            "organized_count": {"type": "integer", "minimum": 0},
+            "merged_count": {"type": "integer", "minimum": 0},
+            "capture_completed_at": {
+                **TIMESTAMP,
+                "description": (
+                    "Unix timestamp of the latest Capture completion that "
+                    "actually added at least one card; zero when none exists."
+                ),
+            },
+            "capture_cards_added": {
+                "type": "integer",
+                "minimum": 0,
+                "description": (
+                    "Cards actually added on the timestamp's device-local "
+                    "calendar day, accumulated across Capture runs."
+                ),
+            },
+        },
     },
     # Pin the FastAPI-generated ValidationError shape so the published contract
     # doesn't gain/lose `input`/`ctx` with the fastapi/pydantic version of
@@ -1364,7 +1404,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "required": ["status", "http_status"],
         "properties": {
             "status": {"type": "string", "enum": ["ok", "error"]},
-            "http_status": {"type": "integer", "description": "Per-item execution status; inspect it even when the batch HTTP status is 200."},
+            "http_status": {"type": "integer", "description": "Per-item execution status; inspect it independently of the outer batch status."},
             "action": {"type": "string"},
             "error": {"type": "string"},
             "id": {"type": "string"},
@@ -1385,6 +1425,15 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
             "applied_count": {"type": "integer", "minimum": 0},
             "skipped_count": {"type": "integer", "minimum": 0},
             "failed_count": {"type": "integer", "minimum": 0},
+            "error": {"type": "string", "description": "For an HTTP 400 all-failed batch, the first failed item's stable error slug."},
+            "detail": {
+                "description": "Optional validation detail copied from the first failed item in an HTTP 400 all-failed batch.",
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "array", "items": {}},
+                    {"type": "object", "additionalProperties": True},
+                ],
+            },
         },
         "additionalProperties": False,
     },
@@ -1938,7 +1987,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("post", "/v1/chat/turn-activity/{turn_id}/events"): "Append one authenticated V1 resident tool transition. This endpoint is used by the shipped resident io_cli runtime, accepts only running/success/failure plus display-safe fixed metadata, rejects V2-owned users, and never accepts tool arguments, model prose, or result bodies.",
     ("post", "/v1/memory/index"): "Return lightweight memory cards. This is selection, not full-content retrieval; query is intentionally not exposed because it is not a search filter today.",
     ("post", "/v1/memory/fetch"): "Fetch full records for selected memory IDs. Sensitive fetch behavior is not part of the current public contract.",
-    ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. A structurally valid batch returns HTTP 200 even when some or all items fail; inspect every result and the applied/skipped/failed counts. The batch is not transactional and Idempotency-Key is not supported.",
+    ("post", "/v1/memory/actions"): "Apply up to 20 memory actions independently and in order. Full or partial applied success returns HTTP 200. When no action is applied and at least one fails, HTTP 400 promotes the first failed item's error/detail while preserving every result and all counts. An all-skipped batch remains 200. The batch is not transactional and Idempotency-Key is not supported.",
     ("post", "/v1/perception/report"): "Submit device context. Sensitive signals must use encrypted envelopes; inspect each results entry even when HTTP status is 200.",
     ("get", "/v1/perception/app_open"): "Legacy iOS Shortcut compatibility endpoint. This GET records an event and therefore has side effects.",
     ("get", "/v1/perception/app_close"): "iOS Shortcut compatibility endpoint for the automation's \"is closed\" trigger. This GET records an event and therefore has side effects.",
@@ -2031,16 +2080,43 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("get", "/v1/dream/status"): {
+        "200": {
+            "description": "Current Dream and daily Capture banner status.",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/DreamStatusResponse"}
+                }
+            },
+        },
+    },
     ("post", "/v1/memory/actions"): {
         "200": {
             "description": (
-                "The structurally valid batch was processed item by item. "
-                "Inspect status, counts, and every results entry; item failures "
-                "do not change the batch HTTP status."
+                "The batch was processed item by item and either had no failures "
+                "or applied at least one action. Inspect status, counts, and every "
+                "results entry for partial outcomes."
             ),
             "content": {
                 "application/json": {
                     "schema": {"$ref": "#/components/schemas/MemoryActionsResponse"}
+                }
+            },
+        },
+        "400": {
+            "description": (
+                "No action was applied and at least one item failed. The first "
+                "failed item's error and optional detail are promoted, while the "
+                "complete independent results, effects, and counts are preserved."
+            ),
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "oneOf": [
+                            {"$ref": "#/components/schemas/MemoryActionsResponse"},
+                            {"$ref": "#/components/schemas/ErrorResponse"},
+                        ]
+                    }
                 }
             },
         },
@@ -2073,6 +2149,17 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
                 "connection in time. The body has the same shape as the 200 "
                 "response, with top-level \"status\": \"unhealthy\" and the "
                 "failing entry under \"checks\"."
+            ),
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
+        },
+    },
+    ("get", "/healthz/runner"): {
+        "503": {
+            "description": (
+                "The runner fleet is unhealthy, unavailable, or misconfigured. "
+                "The body has the same shape as the 200 response, with top-level "
+                "\"status\": \"unhealthy\" and a down \"runner_fleet\" entry "
+                "under \"checks\"."
             ),
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
         },

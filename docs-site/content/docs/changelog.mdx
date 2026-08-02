@@ -40,7 +40,44 @@ change must not be interpreted as an API guarantee.
   functional testing through the default-off deployment gate; test and
   production still report an effective value of `on` for every user. See
   [architecture](/docs/architecture#content-encryption-is-a-per-user-preference).
+- **Memory Garden status now reports today's captured-card total.**
+  `GET /v1/dream/status` adds `capture_cards_added` and
+  `capture_completed_at`. Resident and Runtime V2 Capture runs accumulate only
+  cards actually added on the device-local calendar day, start a fresh total
+  on the first positive Capture of the next day, and leave the banner fields
+  unchanged after a zero-card run.
 
+- **Background agent turns can no longer rewrite the identity card.** Runtime
+  V2 now visibly refuses `identity_patch` and `identity_nudge` during proactive
+  wake turns while preserving identity reads, foreground Chat identity changes,
+  and wake-time Memory writes.
+
+- **Visual-model setup now treats a real image probe as authoritative.** Every
+  selected model receives one small, randomized image challenge even when its
+  provider catalog declares image support, declares text-only input, omits the
+  model, or is unavailable. Catalog modalities are advisory and are preserved
+  only from explicit official per-model fields; model-name tables and provider
+  defaults are no longer used. Catalog/probe disagreements produce
+  content-free diagnostics. Empty visible replies from reasoning models are a
+  retryable failure rather than proof of image incompatibility, while a
+  non-empty reply with contradictory colors remains unsupported. Stable visual
+  error codes still distinguish incompatible image input, invalid credentials,
+  quota, rate limits, and temporary provider failures.
+
+- **Hosted visual failures are easier to diagnose without exposing user
+  content.** Per-user admin detail now includes bounded model-route runtime
+  error metadata and the newest 20 notice summaries through explicit
+  content-free field allowlists; provider endpoint URLs, notice text, notice
+  detail, and copyable prompts are excluded. Visual observation also emits
+  metadata-only debug trace events for image-read failures and provider-call
+  outcomes, without image data, observations, or raw provider responses.
+
+- **Hosted visual observation now works for zero-roster Runtime V1 users.**
+  The authenticated request's short-lived, user-bound runtime token is
+  forwarded through both the exact image-body read and visual provider-key
+  decrypt, instead of being discarded and replaced by an empty API key. Image
+  retries now fetch the requested message directly rather than searching only
+  the newest 20 Chat rows. Requests with neither credential still fail closed.
 - **Runtime V2 can replace its legacy summary with a bounded Memory/User
   profile.** The default-off `FEEDLING_V2_PROFILE_ENABLED` switch now gates
   both generation and turn-time selection. Only an `ok`, non-disabled profile
@@ -75,7 +112,6 @@ change must not be interpreted as an API guarantee.
   respond to the actual change. The pooled worker also runs the independently
   consent-gated Memory Capture and Dream producers; each fleet lane remains
   independently reversible through deployment configuration.
-
 - **Encrypted Runtime V2 profile storage is staged for the bounded
   Memory/User rollout.** Both fields share one `v2_agent_profile` CAS document
   but remain separate shared encrypted envelopes. PostgreSQL and the TEE shadow
@@ -97,12 +133,15 @@ change must not be interpreted as an API guarantee.
   background calls is the steady state.
 
 - **Memory action batches now isolate item failures.** A structurally valid
-  `POST /v1/memory/actions` batch processes every item and returns HTTP `200`
-  with `status: ok|partial|failed`, per-item `http_status`, and
-  `applied_count`/`skipped_count`/`failed_count`. Older clients that treated
-  every HTTP `200` as full success must inspect these fields. Capture clients
-  record applied, skipped, and failed items separately; partial success no
-  longer marks the whole capture job failed. Resident capture may re-ask the
+  `POST /v1/memory/actions` batch processes every item and returns per-item
+  `http_status` plus `applied_count`/`skipped_count`/`failed_count`. Full and
+  partial applied success return HTTP `200`; a batch with zero applied actions
+  and at least one failure returns HTTP `400`, promotes the first failed item's
+  `error` and optional `detail`, and still includes every item result and all
+  counts. An all-skipped batch remains HTTP `200`. Older clients that treated
+  every HTTP `200` as full success must still inspect the item fields. Capture
+  clients record applied, skipped, and failed items separately; partial success
+  no longer marks the whole capture job failed. Resident capture may re-ask the
   model once after either a format or semantic validation failure, using one
   shared per-job retry budget so the two layers cannot multiply retries.
 
@@ -625,18 +664,21 @@ change must not be interpreted as an API guarantee.
   claimed-but-unreadable messages (two by default, configurable with
   `FEEDLING_DECRYPT_DEGRADE_AFTER`). A real ordinary user-message decrypt resets
   the streak; a server-generated maintenance turn does not count as recovery.
-- New `GET /v1/agent/perception/recent_apps` returns recent app-open history
-  (`app`, `category`, `ts`, `minutes_ago`), newest first, with optional `limit`
-  (1–100, default 20) and `hours` query parameters. It reads the same app-open
-  history written by `GET /v1/perception/app_open`; no new storage. It is gated
-  by the same `app` capability as the current-app snapshot fields — when the
-  user has disabled that capability the response is
+- `GET /v1/agent/perception/recent_apps` now returns a merged app open/close
+  trajectory (`app`, `category`, `ts`, `event`, `minutes_ago`), newest first,
+  with optional `limit` (1–100, default 20) and `hours` query parameters. It
+  reads the existing streams written by `GET /v1/perception/app_open` and
+  `GET /v1/perception/app_close`; no new storage. Regular and pull snapshots
+  now include the same event shape as `recent_app_events` for the app signal's
+  15-minute freshness window. The endpoint remains gated by the same `app`
+  capability as the current-app snapshot fields — when the user has disabled
+  that capability the response is
   `{"ok": true, "disabled": true, "reason": ...}` with an empty `apps` list,
   which is distinguishable from a genuine empty history.
 - The `app_name` / `app_category` snapshot fields now expire 15 minutes after
-  the reported open instead of 5 minutes. Because the shortcut reports opens and
-  never closes, these fields mean "last open observed within the window", not
-  "currently on screen".
+  the reported open or matching close instead of 5 minutes. These fields mean
+  "last app event observed within the window", not "currently on screen";
+  inspect `app_state` to distinguish a foreground app from a matching close.
 - `POST /v1/content/rewrap-to-current-key` now also normalizes the **identity
   card plaintext** while rewrapping: dimension values are coerced onto the
   documented 0–100 integer contract (0–1-scale floats such as `0.95` rescale to

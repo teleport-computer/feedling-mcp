@@ -105,11 +105,18 @@ def state_save(store, payload: dict) -> dict:
 
 def dream_status(store) -> dict:
     state = dream_scheduler.load_dream_state(store)
+    capture_state = capture_scheduler.load_capture_state(store)
     return {
         "dreaming": capture_jobs._find_active_dream(store) is not None,
         "last_completed_at": state.get("last_dream_completed_at") or 0,
         "organized_count": int(state.get("last_dream_organized_count") or 0),
         "merged_count": int(state.get("last_dream_merged_count") or 0),
+        "capture_completed_at": (
+            capture_state.get("last_capture_cards_added_at") or 0
+        ),
+        "capture_cards_added": int(
+            capture_state.get("last_capture_cards_added") or 0
+        ),
     }
 
 

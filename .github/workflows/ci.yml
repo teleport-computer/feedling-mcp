@@ -446,6 +446,7 @@ jobs:
               - 'deploy/pin-runtime-release.sh'
               - 'deploy/prod-cvm-id.txt'
               - 'deploy/prod-runner-cvm-ids.txt'
+              - 'deploy/list-prod-runner-cvm-ids.sh'
               - 'deploy/check-prod-runner-topology.sh'
               - 'deploy/check-v2-runner-fleet.py'
               - 'deploy/publish-compose-hash.sh'
@@ -1108,6 +1109,9 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.PROD_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
+          # M4/M5 profile generation + MEMORY/USER prompt injection. Encrypted
+          # env channel; default off, flip via repo var + redeploy.
+          FEEDLING_V2_PROFILE_ENABLED:  ${{ vars.PROD_FEEDLING_V2_PROFILE_ENABLED || '0' }}
           # Break-glass trajectory inspection (audited runner-local CLI inside
           # serve-worker). Default '0'; set the repo var to '1' only for the
           # duration of an incident, then back. Encrypted env — flipping it
@@ -1143,6 +1147,11 @@ jobs:
             echo "::error::DATABASE_URL secret is not set — backend has no datastore to connect to"
             exit 1
           fi
+          FEEDLING_EXPECTED_RUNNER_COUNT=$(deploy/list-prod-runner-cvm-ids.sh deploy/prod-runner-cvm-ids.txt | wc -l | tr -d '[:space:]')
+          if [ "$FEEDLING_EXPECTED_RUNNER_COUNT" -lt 1 ]; then
+            echo "::error::expected at least one production runner CVM"
+            exit 1
+          fi
           phala deploy \
             --api-token "$PHALA_CLOUD_API_KEY" \
             --cvm-id "$CVM_ID" \
@@ -1163,8 +1172,10 @@ jobs:
             -e "TEE_DATABASE_URL=$TEE_DATABASE_URL" \
             -e "FEEDLING_TEE_DUAL_WRITE=$FEEDLING_TEE_DUAL_WRITE" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
+            -e "FEEDLING_EXPECTED_RUNNER_COUNT=$FEEDLING_EXPECTED_RUNNER_COUNT" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
+            -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
             -e "FEEDLING_V2_COMPACTION_BATCH_CHARS=$FEEDLING_V2_COMPACTION_BATCH_CHARS" \
@@ -1357,6 +1368,9 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.TEST_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
+          # M4/M5 profile generation + MEMORY/USER prompt injection. Encrypted
+          # env channel; default off, flip via repo var + redeploy.
+          FEEDLING_V2_PROFILE_ENABLED:  ${{ vars.TEST_FEEDLING_V2_PROFILE_ENABLED || '0' }}
           # Nightly memory Dream lane (provider-backed distillation). Explicit
           # opt-in like Capture; default '0'. serve_worker._tick_dream_for_user
           # only runs when this is '1'. Encrypted env — flip via repo var +
@@ -1417,6 +1431,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
+            -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_DREAM_ENABLED=$FEEDLING_V2_DREAM_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
@@ -1743,6 +1758,9 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
           FEEDLING_V2_CAPTURE_ENABLED:  ${{ vars.PRE_FEEDLING_V2_CAPTURE_ENABLED || '0' }}
+          # M4/M5 profile generation + MEMORY/USER prompt injection. Encrypted
+          # env channel; default off, flip via repo var + redeploy.
+          FEEDLING_V2_PROFILE_ENABLED:  ${{ vars.PRE_FEEDLING_V2_PROFILE_ENABLED || '0' }}
           # Break-glass trajectory inspection (audited runner-local CLI inside
           # serve-worker). Default '0'; set the repo var to '1' only for the
           # duration of an incident, then back. Encrypted env — flipping it
@@ -1797,6 +1815,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             -e "FEEDLING_V2_CAPTURE_ENABLED=$FEEDLING_V2_CAPTURE_ENABLED" \
+            -e "FEEDLING_V2_PROFILE_ENABLED=$FEEDLING_V2_PROFILE_ENABLED" \
             -e "FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED=$FEEDLING_V2_TRAJECTORY_INSPECT_ENABLED" \
             -e "FEEDLING_V2_COMPACTION_BATCH_MSGS=$FEEDLING_V2_COMPACTION_BATCH_MSGS" \
             -e "FEEDLING_V2_COMPACTION_BATCH_CHARS=$FEEDLING_V2_COMPACTION_BATCH_CHARS" \
@@ -2100,10 +2119,8 @@ jobs:
       - name: Read prod runner CVM ids
         id: ids
         run: |
-          # one id per line; ignore blank lines and # comments
-          IDS=$(grep -vE '^[[:space:]]*(#|$)' deploy/prod-runner-cvm-ids.txt \
-            | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
-            | grep . || true)
+          # Canonical helper trims, ignores comments/blanks, and collapses duplicates.
+          IDS=$(deploy/list-prod-runner-cvm-ids.sh deploy/prod-runner-cvm-ids.txt)
           if [ -z "$IDS" ]; then
             echo "::error::deploy/prod-runner-cvm-ids.txt has no CVM ids — provision at least one runner CVM first"
             exit 1
@@ -2144,6 +2161,7 @@ jobs:
               --api-token "$PHALA_CLOUD_API_KEY" \
               --cvm-id "$CVM_ID" \
               -c deploy/docker-compose.phala.prod.runner.yaml \
+              -e "FEEDLING_RUNNER_CVM_ID=$CVM_ID" \
               -e "FEEDLING_API_URL=$FEEDLING_API_URL" \
               -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
               -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \

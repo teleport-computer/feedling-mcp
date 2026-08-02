@@ -24,6 +24,32 @@ def test_write_gate_allows_writes_with_authorization():
     assert allowed is True and reason == ""
 
 
+def test_write_gate_refuses_background_identity_writes_only():
+    for tool_name in ("identity_patch", "identity_nudge"):
+        allowed, reason = prov.write_gate(
+            tool_name,
+            turn_authorization=True,
+            identity_write_authorization=False,
+        )
+        assert allowed is False
+        assert reason.startswith("error:")
+        assert "background" in reason
+
+    allowed, reason = prov.write_gate(
+        "memory_write",
+        turn_authorization=True,
+        identity_write_authorization=False,
+    )
+    assert allowed is True and reason == ""
+
+    allowed, reason = prov.write_gate(
+        "identity_get",
+        turn_authorization=True,
+        identity_write_authorization=False,
+    )
+    assert allowed is True and reason == ""
+
+
 def test_write_gate_refuses_writes_without_authorization():
     for w in ("memory_write", "identity_patch", "schedule_wake", "cancel_wake"):
         allowed, reason = prov.write_gate(w, turn_authorization=False)
