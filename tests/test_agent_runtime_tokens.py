@@ -60,3 +60,32 @@ def test_authorize_rejects_missing_scope():
     claims = {"user_id": "u_1", "scope": ["screen:read"]}
     with pytest.raises(tokens.TokenError):
         tokens.authorize(claims, user_id="u_1", scope="chat:write")
+
+
+# ---------------------------------------------------------------------------
+# Batch 4: the hosted-consumer runtime token must carry the "web" scope so its
+# io_cli can reach /v1/agent/web/{search,fetch} (backend require_scope("web")).
+# ---------------------------------------------------------------------------
+
+
+def test_hosted_consumer_token_scopes_include_web():
+    from agent_runtime import supervisor
+
+    scopes = supervisor._CONSUMER_TOKEN_SCOPES
+    assert "web" in scopes
+    # A credential change is a whole family: the originals must survive intact.
+    for base in ("chat", "memory", "identity", "perception", "envelope_decrypt"):
+        assert base in scopes
+
+
+def test_token_minted_with_consumer_scopes_authorizes_web():
+    from agent_runtime import supervisor
+
+    tok = tokens.mint(SECRET, user_id="u_1", runtime_instance_id="ri_1",
+                      scope=list(supervisor._CONSUMER_TOKEN_SCOPES),
+                      now=1000.0, ttl=600.0)
+    claims = tokens.verify(SECRET, tok, now=1100.0)
+    tokens.authorize(claims, user_id="u_1", scope="web")  # must not raise
+    # Not a blanket grant — a scope that was never minted is still refused.
+    with pytest.raises(tokens.TokenError):
+        tokens.authorize(claims, user_id="u_1", scope="genesis")

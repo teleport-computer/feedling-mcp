@@ -71,6 +71,11 @@ from notices import catalog
 
 log = logging.getLogger("feedling.agent_runtime.supervisor")
 
+# Scopes on the per-user runtime token minted for the hosted consumer. "web" lets
+# its io_cli reach /v1/agent/web/{search,fetch} (require_scope("web")). This is the
+# only token that carries "web"; the genesis worker mints its own narrower token.
+_CONSUMER_TOKEN_SCOPES = ["chat", "memory", "identity", "perception", "envelope_decrypt", "web"]
+
 # Pooled HTTP clients. httpx's module-level verb helpers (httpx.get/httpx.post)
 # build a throwaway Client per call, so every tick paid a fresh TCP+TLS handshake
 # — pure waste for a long-lived supervisor that hits the same two hosts forever.
@@ -1485,7 +1490,7 @@ def main() -> int:
     if secret_raw:
         secret = secret_raw.encode("utf-8")
         ttl = float(os.environ.get("AGENT_RUNTIME_TOKEN_TTL_SEC", "900"))
-        scopes = ["chat", "memory", "identity", "perception", "envelope_decrypt"]
+        scopes = list(_CONSUMER_TOKEN_SCOPES)
 
         def mint_token(user_id):
             return runtime_token.mint(secret, user_id=user_id, runtime_instance_id=owner,

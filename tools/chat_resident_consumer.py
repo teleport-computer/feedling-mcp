@@ -1262,7 +1262,10 @@ def _agent_entry_signature() -> str:
 _HEADERS = {
     "X-API-Key": FEEDLING_API_KEY,
     "X-Feedling-Consumer": "feedling-chat-resident",
-    "X-Feedling-Consumer-Capabilities": "vision_observer_v1,vision_probe_v2",
+    # web_search_v1,web_fetch_v1: this build's io_cli carries the V1 web verbs
+    # (tools/io_cli.py cmd_web_search/cmd_web_fetch). Advertising them lets the
+    # settings page report web as runtime-supported for V1 (hosted + resident).
+    "X-Feedling-Consumer-Capabilities": "vision_observer_v1,vision_probe_v2,web_search_v1,web_fetch_v1",
     "X-Feedling-Consumer-Id": CONSUMER_ID,
     "X-Feedling-Consumer-Version": "resident-v1",
     "X-Feedling-Consumer-Commit": RUNNING_COMMIT,
