@@ -46,6 +46,234 @@ def _migration_0074_module():
     )
 
 
+def _migration_0075_module():
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    return (
+        ScriptDirectory.from_config(cfg)
+        .get_revision("0075_v2_usage_rollup")
+        .module
+    )
+
+
+def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
+    migration = _migration_0075_module()
+
+    assert migration.down_revision == "0074_runtime_user_delivery_idx"
+    assert migration._SOURCE_CURSOR_INDEX == (
+        "CREATE INDEX CONCURRENTLY ix_v2_turn_metrics_updated_id "
+        "ON v2_turn_metrics (updated_at, id) INCLUDE (created_at)"
+    )
+    assert "INSERT INTO v2_usage_daily" not in migration._SCHEMA_UP
+
+    with db.get_pool().connection() as conn:
+        head = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_name = ANY(%s)",
+                (
+                    [
+                        "v2_usage_daily_users",
+                        "v2_usage_daily_dimensions",
+                        "v2_usage_rollup_watermarks",
+                    ],
+                ),
+            ).fetchall()
+        }
+        source_index = conn.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE indexname='ix_v2_turn_metrics_updated_id'"
+        ).fetchone()
+        cascade_indexes = dict(
+            conn.execute(
+                "SELECT indexname,indexdef FROM pg_indexes "
+                "WHERE indexname = ANY(%s)",
+                (
+                    [
+                        "ix_v2_usage_daily_users_user_id",
+                        "ix_v2_usage_daily_dimensions_user_id",
+                    ],
+                ),
+            ).fetchall()
+        )
+        rollup_triggers = conn.execute(
+            "SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal "
+            "AND tgrelid='v2_turn_metrics'::regclass"
+        ).fetchone()[0]
+
+    assert head == ("0075_v2_usage_rollup",)
+    assert tables == {
+        "v2_usage_daily_users",
+        "v2_usage_daily_dimensions",
+        "v2_usage_rollup_watermarks",
+    }
+    assert source_index is not None
+    assert "(updated_at, id) INCLUDE (created_at)" in source_index[0]
+    assert set(cascade_indexes) == {
+        "ix_v2_usage_daily_users_user_id",
+        "ix_v2_usage_daily_dimensions_user_id",
+    }
+    assert all(
+        "(user_id) WHERE (user_id IS NOT NULL)" in definition
+        for definition in cascade_indexes.values()
+    )
+    assert rollup_triggers == 0
+
+
+def test_0075_schema_phase_is_restartable_after_concurrent_index_failure():
+    migration = _migration_0075_module()
+
+    # autocommit_block commits the schema phase before CREATE INDEX
+    # CONCURRENTLY.  Replaying after an interrupted index build must therefore
+    # accept the already-created empty tables and child-key indexes.
+    with db.get_pool().connection() as conn:
+        conn.execute(migration._SCHEMA_UP)
+
+
+def test_0075_usage_rollup_columns_preserve_overlapping_completeness():
+    expected_common = {
+        f"{prefix}_{metric}"
+        for prefix in ("all", "metered", "unknown")
+        for metric in (
+            "turns",
+            "model_calls",
+            "retries",
+            "failed_turns",
+            "usage_reported_calls",
+            "cache_reported_calls",
+            "unknown_usage_calls",
+            "prompt_tokens_sum",
+            "prompt_tokens_known_count",
+            "completion_tokens_sum",
+            "completion_tokens_known_count",
+            "cache_read_tokens_sum",
+            "cache_read_tokens_known_count",
+            "cache_write_tokens_sum",
+            "cache_write_tokens_known_count",
+            "cache_miss_tokens_sum",
+            "cache_miss_tokens_known_count",
+        )
+    }
+    with db.get_pool().connection() as conn:
+        columns_by_table = {}
+        types_by_table = {}
+        for table in ("v2_usage_daily_users", "v2_usage_daily_dimensions"):
+            rows = conn.execute(
+                "SELECT column_name,data_type FROM information_schema.columns "
+                "WHERE table_name=%s",
+                (table,),
+            ).fetchall()
+            columns_by_table[table] = {row[0] for row in rows}
+            types_by_table[table] = {row[0]: row[1] for row in rows}
+
+    assert expected_common <= columns_by_table["v2_usage_daily_users"]
+    assert expected_common <= columns_by_table["v2_usage_daily_dimensions"]
+    for table in columns_by_table:
+        for column in expected_common:
+            assert types_by_table[table][column] == "bigint"
+    assert {
+        "all_latency_samples",
+        "metered_latency_samples",
+        "unknown_latency_samples",
+    } <= columns_by_table["v2_usage_daily_dimensions"]
+    assert types_by_table["v2_usage_daily_dimensions"]["all_latency_samples"] == "ARRAY"
+
+
+def test_0075_nullable_user_rows_are_canonical_and_known_users_cascade():
+    uid = "u_usage_rollup_fk"
+    day = "2026-08-01"
+    _seed_user(uid)
+    try:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO v2_usage_daily_users (local_day,user_id) "
+                "VALUES (%s,NULL),(%s,%s)",
+                (day, day, uid),
+            )
+            conn.execute(
+                "INSERT INTO v2_usage_daily_dimensions "
+                "(local_day,user_id,lane,provider,model) "
+                "VALUES (%s,NULL,'chat','unknown','unknown'),"
+                "(%s,%s,'chat','anthropic','claude-test')",
+                (day, day, uid),
+            )
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                conn.execute(
+                    "INSERT INTO v2_usage_daily_users (local_day,user_id) "
+                    "VALUES (%s,NULL)",
+                    (day,),
+                )
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                conn.execute(
+                    "INSERT INTO v2_usage_daily_dimensions "
+                    "(local_day,user_id,lane,provider,model) "
+                    "VALUES (%s,NULL,'chat','unknown','unknown')",
+                    (day,),
+                )
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+            assert conn.execute(
+                "SELECT count(*) FROM v2_usage_daily_users WHERE user_id=%s",
+                (uid,),
+            ).fetchone() == (0,)
+            assert conn.execute(
+                "SELECT count(*) FROM v2_usage_daily_dimensions WHERE user_id=%s",
+                (uid,),
+            ).fetchone() == (0,)
+            assert conn.execute(
+                "SELECT count(*) FROM v2_usage_daily_users WHERE user_id IS NULL "
+                "AND local_day=%s",
+                (day,),
+            ).fetchone() == (1,)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM v2_usage_daily_dimensions WHERE local_day=%s",
+                (day,),
+            )
+            conn.execute(
+                "DELETE FROM v2_usage_daily_users WHERE local_day=%s",
+                (day,),
+            )
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+def test_0075_usage_rollup_rejects_negative_aggregates_and_tracks_watermarks():
+    with db.get_pool().connection() as conn:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO v2_usage_daily_users "
+                "(local_day,user_id,all_model_calls) VALUES ('2026-08-02',NULL,-1)"
+            )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute(
+                "INSERT INTO v2_usage_daily_dimensions "
+                "(local_day,user_id,lane,provider,model,all_prompt_tokens_known_count) "
+                "VALUES ('2026-08-02',NULL,'chat','unknown','unknown',1)"
+            )
+        conn.execute(
+            "INSERT INTO v2_usage_rollup_watermarks "
+            "(rollup_name,bootstrap_complete,source_updated_at,source_id,"
+            "refreshed_at,last_error_at,last_error,version) "
+            "VALUES ('hosted_v2_usage',true,'2026-08-02T00:00:00Z',42,now(),"
+            "now(),'transient timeout',3)"
+        )
+        row = conn.execute(
+            "SELECT bootstrap_complete,source_updated_at,source_id,refreshed_at,"
+            "last_error_at,last_error,version "
+            "FROM v2_usage_rollup_watermarks WHERE rollup_name='hosted_v2_usage'"
+        ).fetchone()
+        conn.execute(
+            "DELETE FROM v2_usage_rollup_watermarks "
+            "WHERE rollup_name='hosted_v2_usage'"
+        )
+    assert row[0] is True
+    assert row[1] is not None and row[2] == 42 and row[3] is not None
+    assert row[4] is not None and row[5] == "transient timeout" and row[6] == 3
+
+
 def test_0074_runtime_user_delivery_indexes_are_concurrent_and_recoverable():
     migration = _migration_0074_module()
 

@@ -131,6 +131,18 @@ def _seed_all_per_user_tables(user_id: str) -> None:
             "VALUES (%s, 42)",
             (user_id,),
         )
+        conn.execute(
+            "INSERT INTO v2_usage_daily_users "
+            "(local_day,user_id,all_turns,all_model_calls) "
+            "VALUES ('2026-08-01',%s,1,1)",
+            (user_id,),
+        )
+        conn.execute(
+            "INSERT INTO v2_usage_daily_dimensions "
+            "(local_day,user_id,lane,provider,model,all_turns,all_model_calls) "
+            "VALUES ('2026-08-01',%s,'chat','anthropic','claude-test',1,1)",
+            (user_id,),
+        )
     cid = db.model_api_credential_create(
         user_id, provider="anthropic", base_url="", label="k",
         api_key_envelope={"v": 1, "body_ct": "ct", "nonce": "n"},
@@ -151,6 +163,8 @@ _PER_USER_TABLES = (
     "v2_turn_metrics",
     "v2_capture_batches",
     "v2_chat_tail_anchor",
+    "v2_usage_daily_users",
+    "v2_usage_daily_dimensions",
     "chat_message_archive",
     "user_blobs",
 )
@@ -183,6 +197,34 @@ def test_reset_purges_every_per_user_table(client):
 
     leftover = {t: n for t, n in _remaining_rows(uid).items() if n > 0}
     assert leftover == {}, f"删账号后这些表仍有残留行: {leftover}"
+
+
+def test_db_belt_purges_usage_rollups_without_deleting_parent_user(client):
+    uid, _api_key = _register(client)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_usage_daily_users "
+            "(local_day,user_id,all_turns) VALUES ('2026-08-02',%s,1)",
+            (uid,),
+        )
+        conn.execute(
+            "INSERT INTO v2_usage_daily_dimensions "
+            "(local_day,user_id,lane,provider,model,all_turns) "
+            "VALUES ('2026-08-02',%s,'chat','anthropic','claude-test',1)",
+            (uid,),
+        )
+
+    db.delete_user_data(uid)
+
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT count(*) FROM users WHERE user_id=%s", (uid,)
+        ).fetchone() == (1,)
+        for table in ("v2_usage_daily_users", "v2_usage_daily_dimensions"):
+            assert conn.execute(
+                f"SELECT count(*) FROM {table} WHERE user_id=%s", (uid,)
+            ).fetchone() == (0,)
+        conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
 
 
 @pytest.fixture()
