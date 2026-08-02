@@ -1,121 +1,111 @@
-# Admin Usage report scale verification — 2026-08-02
+# Admin Usage report production scale verification — 2026-08-02
 
 ## Outcome
 
-The current raw-table report does not meet the 2-second p95 budget. It already
-reaches 2.411 seconds p95 with 300,000 source rows, and the 3,000,000-row warm
-path exceeded 90 seconds before five report samples could be collected.
+The production Admin Hosted V2 Usage report passes the 2,000 ms p95 gate at
+the required 3,000,000-row source scale. The fresh, unfiltered 90-day report
+measured **1,856.380 ms p95**; the provider/model-filtered report measured
+**1,311.303 ms p95**. Both results came from the real
+`usage_report_snapshot()` entry point after bootstrapping the production rollup
+tables from an empty, migrated database.
 
-A deletion-safe, user-grain daily rollup can meet the target only when the
-independent report branches execute concurrently on one exported PostgreSQL
-snapshot. The final three-connection prototype completed the full default
-90-day report at **1.473 seconds p95**. The equivalent serial two-table query
-was **2.981 seconds p95**. This is evidence for a design option, not production
-DDL or a production implementation.
-
-Machine-readable measurements are in
+Machine-readable samples, coverage metadata, relation sizes, captured SQL
+plans, and cleanup counts are in
 [`2026-08-02-admin-usage-scale.json`](./2026-08-02-admin-usage-scale.json).
 
-## Reproduction harness
+## Fresh standard gate
 
-The opt-in harness is `scripts/perf/admin_usage_scale.py`. It defaults to:
+The final run used one explicit warm-up followed by five measured executions
+per cohort. p95 is the nearest-rank value, so with five samples it is the
+maximum measured value.
 
-- 3,000,000 deterministic, content-free `v2_turn_metrics` rows;
-- 2,000 users over 365 days and a 90-day measured window;
-- five measured runs after one explicit warm-up;
-- unfiltered and `openrouter/openai/gpt-4o-mini` filtered cohorts;
-- `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` for every SQL statement captured
-  from the real `usage_report_snapshot()` entry point;
-- a hard failure when either cohort's warmed p95 is at least 2,000 ms;
-- fixture cleanup scoped by a random user-id prefix unless `--keep-data` is
-  explicitly supplied.
+| Cohort | Measured samples (ms) | p50 | p95 | Budget |
+|---|---|---:|---:|---:|
+| Unfiltered | 1856.258, 1846.012, 1847.883, 1838.799, 1856.380 | 1847.883 | **1856.380** | < 2000 |
+| `openrouter/openai/gpt-4o-mini` | 1285.730, 1295.001, 1288.769, 1311.303, 1303.678 | 1295.001 | **1311.303** | < 2000 |
 
-The harness validates a migrated, explicitly supplied PostgreSQL database; it
-does not run migrations or point itself at a default database. Example:
+The deterministic fixture contained 3,000,000 content-free
+`v2_turn_metrics` rows across 2,000 users and 365 days. The measured 90-day
+half-open interval contained 739,736 source rows. Production rollup bootstrap
+completed with no dirty range or last error and produced 730,000 rows in each
+user-grain rollup table:
+
+| Relation | Rows | Relation bytes | Index bytes | Total bytes |
+|---|---:|---:|---:|---:|
+| `v2_usage_daily_users` | 730,000 | 398,688,256 | 80,699,392 | 479,518,720 |
+| `v2_usage_daily_dimensions` | 730,000 | 498,352,128 | 93,773,824 | 592,281,600 |
+
+## Production query shape
+
+The report uses one `REPEATABLE READ, READ ONLY` exported snapshot and exactly
+three concurrent PostgreSQL connections. Work was measured independently and
+then assigned to three approximately equal bins:
+
+1. Exporter: core totals/users plus lane latency.
+2. Importer A: fleet user-day distribution, model rows, filter options, and
+   primary provider/model.
+3. Importer B: daily rows, lane rows, and model latency.
+
+Before the fresh gate, retained-fixture warmed medians were 1,547.024 ms,
+1,490.456 ms, and 1,547.066 ms for those three bins. Two retained five-run
+checks also passed before the database was emptied: unfiltered p95 values were
+1,617.516 ms and 1,567.045 ms; filtered p95 values were 1,299.266 ms and
+1,166.240 ms.
+
+Every optional task executes in its own savepoint. A task error rolls back and
+degrades only that report section; an exhausted shared deadline may degrade
+all optional bins while preserving bounded cancellation and connection
+release. Report admission is fail-fast, and analytics failures do not affect
+runtime traffic.
+
+## SQL and correctness gates
+
+Both final cohorts reported `hybrid-parallel` coverage with all 90 days served
+from rollups, no raw days, and no `v2_turn_metrics` branch in captured report
+SQL. The harness additionally verified:
+
+- half-open time bounds on every captured raw metric branch;
+- no content-bearing prompt, reply, message, or tool columns in reporting SQL;
+- exact latency percentile SQL was captured and explained;
+- rollup/raw and filtered mixed-partition parity in the database-backed suite;
+- `completeness=unknown` retains exact daily and user-day distributions;
+- at most three database connections are active per report.
+
+The final unfiltered exact-latency plan executed in 475.407 ms; the filtered
+plan executed in 294.977 ms. Both plans used the production
+`v2_usage_daily_dimensions` grain index over the requested day range.
+
+## Environment and infrastructure scope
+
+The gate ran only against the dedicated local database
+`feedling_usage_scale_task4d` on `127.0.0.1:55432`. It was empty before the
+fixture, used PostgreSQL's default **4 MB `work_mem`**, and never touched a
+remote or production RDS. The final implementation persists analytics in the
+existing business PostgreSQL/RDS schema and adds no SQLite, trigger,
+synchronous hot-path write, cache service, or other infrastructure.
+
+The production implementation and performance harness were verified with:
+
+- 92 passing Admin Usage tests;
+- 303 passing Admin/Data Track/Runtime/Migration tests;
+- Ruff, Python compilation, and `git diff --check`;
+- an independent review with no Critical, Important, or Minor findings.
+
+## Reproduction and cleanup
+
+The opt-in harness refuses remote/shared databases and accepts only a dedicated
+local database named `feedling_usage_scale_<name>` on port 55432:
 
 ```shell
-FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/usage_scale' \
-  .venv-test/bin/python scripts/perf/admin_usage_scale.py
+.venv-test/bin/python scripts/perf/admin_usage_scale.py \
+  --database-url \
+  'postgresql://postgres:test@127.0.0.1:55432/feedling_usage_scale_task4d' \
+  --output docs/superpowers/evidence/2026-08-02-admin-usage-scale.json \
+  --precondition-note \
+  'Dedicated empty local PostgreSQL database on 127.0.0.1:55432; default 4MB work_mem; no remote RDS touched'
 ```
 
-The fast self-check mutation-tests both SQL safety gates and validates the
-nearest-rank p50/p95 calculation:
-
-```shell
-.venv-test/bin/python scripts/perf/admin_usage_scale.py --self-test
-```
-
-## Raw-path evidence
-
-At 300,000 rows (74,019 inside the 90-day range), all metric statements used
-the existing `v2_turn_metrics.created_at` index and retained the half-open
-`created_at >= start AND created_at < end` bounds. The unfiltered warmed samples
-were 2410.962, 2385.316, 2363.958, 2384.815, and 2369.048 ms (p95 2410.962
-ms). Provider/model-filtered p95 was 1497.881 ms. The slowest unfiltered
-statements were overview (750.960 ms) and per-user aggregation (662.383 ms).
-
-At 3,000,000 rows, about 740,000 rows fell in the 90-day range. Capturing and
-warming the full raw report exceeded 90 seconds, and execution was stopped
-instead of reporting an invented five-run percentile. This does not weaken the
-budget conclusion: the five-run 300,000-row result already fails the threshold.
-
-## Rollup experiments
-
-The experiments preserved exact token NULL semantics with sum plus known-count
-pairs and preserved exact latency samples, including duplicates. Cross-user
-fleet aggregates were rejected because a user deletion could not cascade
-accurately. The acceptable data shape therefore remained user-grain.
-
-Key serial results:
-
-| Shape | Scale | p95 |
-|---|---:|---:|
-| One user/day/dimension table | 300k source | 1202.420 ms |
-| One user/day/dimension table | 3M source | 3222.325 ms |
-| Same table, 64 MB `work_mem` | 3M source | 2943.076 ms |
-| Narrow CTE and reused aggregates | 3M source | 2946.680 ms |
-| `GROUPING SETS` | 3M source | 8195.579 ms |
-| Two user-grain tables, default report | 3M source | 2980.701 ms |
-| Two user-grain tables, provider/model filter | 3M source | 1929.877 ms |
-
-The final two-table prototype used one row per user/day for fleet totals and
-one row per user/day/lane/provider/model for breakdowns. Completeness was not a
-grouping dimension: each row carried overlapping all/metered/unknown counters,
-token sums, and known-counts. It produced 731,984 rows in each table. With the
-full realistic counter width, the tables occupied 359 MB and 430 MB versus
-1,356 MB for the 3,000,000-row source.
-
-## Same-snapshot parallel result
-
-The successful prototype used three total PostgreSQL connections, not three
-workers plus a coordinator:
-
-1. The coordinator began `REPEATABLE READ, READ ONLY`, exported a snapshot,
-   and executed overview/daily/users/distribution.
-2. A second connection imported that snapshot and executed models, lanes,
-   filter options, and primary provider/model.
-3. A third connection imported the same snapshot and calculated exact
-   provider/model latency percentiles.
-
-Timing included transaction setup, snapshot export/import, concurrent query
-execution, result reads, and commits. No report-result cache was used. Five
-end-to-end wall samples were 1472.828, 1453.521, 1458.801, 1458.750, and
-1447.730 ms: p50 1458.750 ms and p95 1472.828 ms. The breakdown branch was the
-bottleneck at 1436.793–1468.135 ms; the core branch took 759.779–772.828 ms,
-and exact provider/model latency took 341.170–348.230 ms.
-
-Before production use, pool capacity must be evaluated because one admin
-report temporarily consumes three connections. Failure to acquire the extra
-connections, refresh a rollup, or read analytics must degrade only the Admin
-Usage section; it must never block or fail runtime traffic. The proposed
-persistence remains on the existing business RDS, refreshed asynchronously by
-an idempotent worker. It requires no SQLite, trigger, synchronous hot-path
-write, or new infrastructure.
-
-## Safety and scope
-
-The harness asserts that every captured metric query excludes content-bearing
-columns such as message bodies, tool input/output, prompts, and replies. It
-also asserts both time bounds on every `v2_turn_metrics` statement. No public
-API, OpenAPI contract, deployment topology, or infrastructure is changed by
-this verification-only commit.
+After measurement and EXPLAIN capture, deleting the 2,000 fixture users
+cascaded through the 3,000,000 source rows and both rollup tables. The harness
+then removed its watermark and verified residual counts of zero for users,
+source metrics, both rollup tables, and watermark state.
