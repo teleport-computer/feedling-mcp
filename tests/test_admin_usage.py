@@ -756,3 +756,32 @@ def test_usage_snapshot_treats_naive_registration_time_as_utc_in_every_session_t
 
     assert utc_report["overview"]["registered_accounts"] == 0
     assert shanghai_report["overview"]["registered_accounts"] == 0
+
+
+def test_usage_snapshot_activates_legacy_human_role_only_before_end_at():
+    user_ids = ["u_usage_human_before", "u_usage_human_after"]
+    for user_id in user_ids:
+        seed_user(user_id, created_at="2026-06-01T00:00:00+00:00")
+    with db.get_pool().connection() as conn:
+        for user_id, sent_at in (
+            ("u_usage_human_before", datetime(2026, 7, 2, tzinfo=timezone.utc)),
+            ("u_usage_human_after", datetime(2026, 7, 4, tzinfo=timezone.utc)),
+        ):
+            conn.execute(
+                "INSERT INTO chat_messages (user_id,msg_id,ts,doc) "
+                "VALUES (%s,%s,%s,%s)",
+                (
+                    user_id,
+                    f"{user_id}-message",
+                    sent_at.timestamp(),
+                    Jsonb({"role": "human", "source": "chat"}),
+                ),
+            )
+    try:
+        report = jobs_store.usage_report_snapshot(_usage_query())
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id = ANY(%s)", (user_ids,))
+
+    assert report["overview"]["registered_accounts"] == 2
+    assert report["overview"]["activated_users"] == 1

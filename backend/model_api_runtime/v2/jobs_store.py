@@ -25,6 +25,7 @@ from psycopg.types.json import Jsonb
 
 import db
 from core import wake_bus
+from model_api_runtime.v2 import usage_reporting
 from notices import catalog as notices_catalog
 
 log = logging.getLogger("feedling.runtime_v2.jobs_store")
@@ -4633,16 +4634,14 @@ def _usage_rate(numerator: int, denominator: int) -> float | None:
 def usage_report_snapshot(query) -> dict:
     """Return one coherent, content-free Hosted V2 Usage analytics snapshot."""
 
-    from admin import usage as admin_usage
-
-    where_sql, where_params = admin_usage.metric_filter_sql(query)
-    filter_where_sql, filter_where_params = admin_usage.metric_filter_sql(
+    where_sql, where_params = usage_reporting.metric_filter_sql(query)
+    filter_where_sql, filter_where_params = usage_reporting.metric_filter_sql(
         query, include_dimensions=False
     )
     duration_days = (
         query.end_at_utc - query.start_at_utc
     ).total_seconds() / 86400.0
-    dimension_filtered = admin_usage.has_dimension_filter(query)
+    dimension_filtered = usage_reporting.has_dimension_filter(query)
     user_cohort_sql = ""
     user_cohort_params: tuple[object, ...] = ()
     if query.user_id:
@@ -4707,7 +4706,7 @@ WITH user_times AS (
     EXISTS (
       SELECT 1 FROM chat_messages c
       WHERE c.user_id=r.user_id
-        AND c.doc->>'role'='user'
+        AND c.doc->>'role' IN ('user', 'human')
         AND COALESCE(c.doc->>'source', '') NOT IN
           ('verify_ping', 'resident_maintenance')
         AND to_timestamp(c.ts) < %s

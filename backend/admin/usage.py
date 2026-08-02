@@ -7,7 +7,6 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_PRESET = "30d"
 _PRESET_DAYS = {"24h": 1, "7d": 7, "30d": 30, "90d": 90}
@@ -33,55 +32,6 @@ class UsageQuery:
     preset: Literal["24h", "7d", "30d", "90d", "custom"] = DEFAULT_PRESET
     start_date: str | None = None
     end_date: str | None = None
-
-
-def metric_filter_sql(
-    query: UsageQuery,
-    *,
-    alias: str = "m",
-    include_dimensions: bool = True,
-) -> tuple[str, tuple[object, ...]]:
-    """Return one bound-parameter metric cohort used by every report section."""
-
-    if alias not in {"m", "metric"}:
-        raise ValueError("unsupported SQL alias")
-    clauses = [
-        f"{alias}.created_at >= %s",
-        f"{alias}.created_at < %s",
-    ]
-    params: list[object] = [query.start_at_utc, query.end_at_utc]
-    if query.user_id:
-        clauses.append(f"COALESCE({alias}.user_id, 'unknown') = %s")
-        params.append(query.user_id)
-    if include_dimensions:
-        for field, value in (
-            ("lane", query.lane),
-            ("provider", query.provider),
-            ("model", query.model),
-        ):
-            if value:
-                clauses.append(
-                    f"COALESCE(NULLIF({alias}.{field}, ''), 'unknown') = %s"
-                )
-                params.append(value)
-        if query.completeness == "metered":
-            clauses.append(f"{alias}.usage_reported_calls > 0")
-        elif query.completeness == "unknown":
-            clauses.append(
-                f"{alias}.usage_reported_calls < {alias}.model_calls"
-            )
-    return " AND ".join(clauses), tuple(params)
-
-
-def has_dimension_filter(query: UsageQuery) -> bool:
-    """Whether a fleet-wide activated-user denominator would be misleading."""
-
-    return bool(
-        query.lane
-        or query.provider
-        or query.model
-        or query.completeness != "all"
-    )
 
 
 def _text(args: QueryArgs, key: str) -> str:

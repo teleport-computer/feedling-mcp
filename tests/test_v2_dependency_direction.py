@@ -17,7 +17,7 @@ _EXEMPT = {"serve_worker.py", "__init__.py"}
 # all escaped this guard that way. Deriving from the directory means a new v2 module is
 # guarded the moment it exists, which is the only version of this rule that stays true.
 _CORE_MODULES = sorted(p.name for p in _V2.glob("*.py") if p.name not in _EXEMPT)
-_FORBIDDEN = ("hosted", "agent_runtime")
+_FORBIDDEN = ("hosted", "agent_runtime", "admin")
 
 
 def _top_level_imports(path: pathlib.Path) -> set[str]:
@@ -34,7 +34,7 @@ def _top_level_imports(path: pathlib.Path) -> set[str]:
     return mods
 
 
-def test_v2_core_modules_do_not_import_hosted_or_agent_runtime():
+def test_v2_core_modules_do_not_import_higher_level_packages():
     offenders = {}
     for name in _CORE_MODULES:
         path = _V2 / name
@@ -44,7 +44,7 @@ def test_v2_core_modules_do_not_import_hosted_or_agent_runtime():
         if bad:
             offenders[name] = bad
     assert not offenders, (
-        "V2 core modules must not import hosted/agent_runtime "
+        "V2 core modules must not import hosted/agent_runtime/admin "
         f"(dependency direction); offenders: {offenders}"
     )
 
