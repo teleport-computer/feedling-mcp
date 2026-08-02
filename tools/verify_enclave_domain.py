@@ -5,6 +5,10 @@ This tool verifies evidence-file hashes, binds the live WebPKI TLS peer
 certificate to the domain-specific evidence certificate, structurally parses
 the TDX quote, and checks the enclave attestation values supplied by the
 operator. It does not validate the Intel DCAP signature chain.
+
+dstack-ingress 2.2 uses ``hash_algorithm=raw`` with an empty prefix because it
+passes an already-computed 32-byte SHA-256 manifest digest to the quote API.
+``raw`` does not mean that unhashed evidence is placed in REPORT_DATA.
 """
 
 from __future__ import annotations
@@ -51,6 +55,10 @@ _HEX_32_BYTES = re.compile(r"[0-9A-Fa-f]{64}")
 _HEX_48_BYTES = re.compile(r"[0-9A-Fa-f]{96}")
 _MEASUREMENT_FIELDS = ("mrtd", "rtmr0", "rtmr1", "rtmr2")
 _CLAIMED_MEASUREMENT_FIELDS = _MEASUREMENT_FIELDS + ("rtmr3", "mr_config_id")
+_INGRESS_QUOTE_PREFIX_BY_ALGORITHM = {
+    "raw": "",
+    "sha256": "dstack-ingress",
+}
 _monotonic = time.monotonic
 _DCAP_LIMITATION = (
     "LIMITATION: structural quote parsing only; this tool does not validate "
@@ -145,12 +153,29 @@ def _parse_ingress_quote(
         if not isinstance(quote_json, dict):
             raise TypeError("quote.json root is not an object")
         quote_hex = quote_json["quote"]
-        if not isinstance(quote_hex, str):
-            raise TypeError("quote is not a string")
-        if quote_json.get("hash_algorithm") != "sha256":
-            raise ValueError("hash_algorithm is not sha256")
-        if "event_log" not in quote_json or "prefix" not in quote_json:
-            raise KeyError("missing live ingress quote fields")
+        if (
+            not isinstance(quote_hex, str)
+            or not quote_hex
+            or len(quote_hex) % 2
+            or re.fullmatch(r"[0-9A-Fa-f]+", quote_hex) is None
+        ):
+            raise TypeError("quote must be non-empty, even-length hexadecimal text")
+        hash_algorithm = quote_json["hash_algorithm"]
+        if not isinstance(hash_algorithm, str):
+            raise TypeError("hash_algorithm must be text")
+        try:
+            expected_prefix = _INGRESS_QUOTE_PREFIX_BY_ALGORITHM[hash_algorithm]
+        except KeyError as exc:
+            raise ValueError(f"unsupported hash_algorithm: {hash_algorithm!r}") from exc
+        prefix = quote_json["prefix"]
+        if not isinstance(prefix, str):
+            raise TypeError("prefix must be text")
+        if prefix != expected_prefix:
+            raise ValueError(
+                f"unsupported prefix for hash_algorithm {hash_algorithm!r}"
+            )
+        if not isinstance(quote_json["event_log"], str):
+            raise TypeError("event_log must be text")
         quote_bytes = bytes.fromhex(quote_hex)
     except (
         KeyError,
@@ -203,11 +228,13 @@ def verify_ingress_evidence(
 
     parsed_quote = _parse_ingress_quote(files, quote_parser)
     report_data = parsed_quote.body.report_data
-    if not isinstance(report_data, bytes) or len(report_data) < 32:
-        raise EvidenceError("ingress quote report_data is shorter than 32 bytes")
+    if not isinstance(report_data, bytes) or len(report_data) != 64:
+        raise EvidenceError("ingress quote report_data must be exactly 64 bytes")
     manifest_digest = hashlib.sha256(manifest_bytes).digest()
     if not hmac.compare_digest(report_data[:32], manifest_digest):
         raise EvidenceError("quote report_data does not bind sha256sum.txt")
+    if not hmac.compare_digest(report_data[32:], bytes(32)):
+        raise EvidenceError("ingress quote report_data must use zero padding")
 
     return [
         f"peer certificate matches {cert_name}",

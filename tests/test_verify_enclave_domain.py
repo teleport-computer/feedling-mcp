@@ -259,6 +259,109 @@ def test_evidence_accepts_peer_manifest_and_report_data(evidence_fixture):
     ]
 
 
+def test_evidence_accepts_live_dstack_ingress_raw_prehash_contract(
+    evidence_fixture,
+):
+    files = dict(evidence_fixture.files)
+    quote_json = json.loads(files["quote.json"])
+    quote_json.update(hash_algorithm="raw", prefix="")
+    files["quote.json"] = json.dumps(quote_json).encode()
+
+    checks = verify_ingress_evidence(
+        DOMAIN,
+        evidence_fixture.peer_der,
+        files,
+        evidence_fixture.quote_parser,
+    )
+
+    assert "quote report_data binds sha256sum.txt" in checks
+
+
+@pytest.mark.parametrize(
+    ("hash_algorithm", "prefix"),
+    [
+        ("raw", "attacker-controlled"),
+        ("sha256", "attacker-controlled"),
+        ("raw", None),
+        ("sha256", 1),
+    ],
+)
+def test_evidence_rejects_unsafe_ingress_quote_prefix(
+    evidence_fixture, hash_algorithm, prefix
+):
+    files = dict(evidence_fixture.files)
+    quote_json = json.loads(files["quote.json"])
+    quote_json.update(hash_algorithm=hash_algorithm, prefix=prefix)
+    files["quote.json"] = json.dumps(quote_json).encode()
+
+    with pytest.raises(EvidenceError, match="prefix"):
+        verify_ingress_evidence(
+            DOMAIN,
+            evidence_fixture.peer_der,
+            files,
+            evidence_fixture.quote_parser,
+        )
+
+
+def test_evidence_rejects_unknown_ingress_quote_hash_algorithm(evidence_fixture):
+    files = dict(evidence_fixture.files)
+    quote_json = json.loads(files["quote.json"])
+    quote_json.update(hash_algorithm="sha512", prefix="")
+    files["quote.json"] = json.dumps(quote_json).encode()
+
+    with pytest.raises(EvidenceError, match="unsupported hash_algorithm"):
+        verify_ingress_evidence(
+            DOMAIN,
+            evidence_fixture.peer_der,
+            files,
+            evidence_fixture.quote_parser,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("quote", None, "quote"),
+        ("quote", "not-hex", "quote"),
+        ("quote", "a", "quote"),
+        ("hash_algorithm", None, "hash_algorithm"),
+    ],
+)
+def test_evidence_rejects_malformed_ingress_quote_fields(
+    evidence_fixture, field, value, message
+):
+    files = dict(evidence_fixture.files)
+    quote_json = json.loads(files["quote.json"])
+    quote_json[field] = value
+    files["quote.json"] = json.dumps(quote_json).encode()
+
+    with pytest.raises(EvidenceError, match=message):
+        verify_ingress_evidence(
+            DOMAIN,
+            evidence_fixture.peer_der,
+            files,
+            evidence_fixture.quote_parser,
+        )
+
+
+@pytest.mark.parametrize("event_log", [None, 1, {}, []])
+def test_evidence_rejects_malformed_ingress_quote_event_log(
+    evidence_fixture, event_log
+):
+    files = dict(evidence_fixture.files)
+    quote_json = json.loads(files["quote.json"])
+    quote_json["event_log"] = event_log
+    files["quote.json"] = json.dumps(quote_json).encode()
+
+    with pytest.raises(EvidenceError, match="event_log"):
+        verify_ingress_evidence(
+            DOMAIN,
+            evidence_fixture.peer_der,
+            files,
+            evidence_fixture.quote_parser,
+        )
+
+
 def test_evidence_rejects_missing_manifest_file(evidence_fixture):
     files = dict(evidence_fixture.files)
     del files["account.json"]
@@ -309,6 +412,82 @@ def test_evidence_rejects_wrong_report_data_binding(evidence_fixture):
             evidence_fixture.peer_der,
             evidence_fixture.files,
             wrong_quote_parser,
+        )
+
+
+@pytest.mark.parametrize(
+    "report_data",
+    [
+        hashlib.sha256(b"different manifest").digest() + bytes(32),
+        bytes(64),
+    ],
+)
+def test_evidence_rejects_malformed_report_data_digest(evidence_fixture, report_data):
+    files = dict(evidence_fixture.files)
+    quote_json = json.loads(files["quote.json"])
+    quote_json.update(hash_algorithm="raw", prefix="")
+    files["quote.json"] = json.dumps(quote_json).encode()
+
+    def quote_parser(_raw: bytes):
+        return SimpleNamespace(body=SimpleNamespace(report_data=report_data))
+
+    with pytest.raises(EvidenceError, match="does not bind sha256sum.txt"):
+        verify_ingress_evidence(
+            DOMAIN,
+            evidence_fixture.peer_der,
+            files,
+            quote_parser,
+        )
+
+
+@pytest.mark.parametrize(
+    "report_data",
+    [
+        hashlib.sha256(b"placeholder").digest(),
+        hashlib.sha256(b"placeholder").digest() + bytes(31),
+        hashlib.sha256(b"placeholder").digest() + bytes(33),
+    ],
+)
+def test_evidence_requires_exact_64_byte_ingress_report_data(
+    evidence_fixture, report_data
+):
+    files = dict(evidence_fixture.files)
+    quote_json = json.loads(files["quote.json"])
+    quote_json.update(hash_algorithm="raw", prefix="")
+    files["quote.json"] = json.dumps(quote_json).encode()
+    manifest_digest = hashlib.sha256(files["sha256sum.txt"]).digest()
+    shaped_report_data = manifest_digest + report_data[32:]
+
+    def quote_parser(_raw: bytes):
+        return SimpleNamespace(body=SimpleNamespace(report_data=shaped_report_data))
+
+    with pytest.raises(EvidenceError, match="exactly 64 bytes"):
+        verify_ingress_evidence(
+            DOMAIN,
+            evidence_fixture.peer_der,
+            files,
+            quote_parser,
+        )
+
+
+def test_evidence_rejects_nonzero_ingress_report_data_padding(evidence_fixture):
+    files = dict(evidence_fixture.files)
+    quote_json = json.loads(files["quote.json"])
+    quote_json.update(hash_algorithm="raw", prefix="")
+    files["quote.json"] = json.dumps(quote_json).encode()
+    manifest_digest = hashlib.sha256(files["sha256sum.txt"]).digest()
+
+    def quote_parser(_raw: bytes):
+        return SimpleNamespace(
+            body=SimpleNamespace(report_data=manifest_digest + bytes(31) + b"\x01")
+        )
+
+    with pytest.raises(EvidenceError, match="zero padding"):
+        verify_ingress_evidence(
+            DOMAIN,
+            evidence_fixture.peer_der,
+            files,
+            quote_parser,
         )
 
 
