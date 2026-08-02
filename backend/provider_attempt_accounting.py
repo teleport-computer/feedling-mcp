@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import re
 from uuid import NAMESPACE_URL, uuid5
 
 
@@ -63,13 +64,62 @@ class AttemptCompleteness(str, Enum):
     LEGACY_BEST_EFFORT = "legacy_best_effort"
 
 
+class AttemptRetryKind(str, Enum):
+    INITIAL = "initial"
+    OUTER_RETRY = "outer_retry"
+    COMPATIBILITY_RETRY = "compatibility_retry"
+    FAILOVER = "failover"
+
+
+_CALL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,159}\Z")
+_PROVIDER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,79}\Z")
+_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}\Z")
+_TRANSPORT = re.compile(r"[a-z][a-z0-9_-]{0,47}\Z")
+_RUNTIME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_INSTALLATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_PROVIDER_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,159}\Z")
+_SENSITIVE_PREFIXES = (
+    "authorization:", "x-api-key:", "cookie:", "host:", "bearer",
+    "basic", "sk-", "rk-", "pk-",
+)
+_SENSITIVE_MARKERS = ("api_key", "apikey", "token=", "secret=", "password=")
+
+
+def _safe_identifier(
+    name: str,
+    value: str | None,
+    pattern: re.Pattern[str],
+    *,
+    optional: bool = False,
+) -> str | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or not pattern.fullmatch(value):
+        raise ValueError(f"invalid_{name}")
+    folded = value.casefold()
+    if (
+        "://" in value
+        or folded.startswith(_SENSITIVE_PREFIXES)
+        or any(marker in folded for marker in _SENSITIVE_MARKERS)
+    ):
+        raise ValueError(f"unsafe_{name}")
+    return value
+
+
 def stable_attempt_id(call_id: str, outer_ordinal: int, inner_ordinal: int) -> str:
     """Return the replay-stable ID for one actual provider dispatch."""
-    if not isinstance(call_id, str) or not call_id:
-        raise ValueError("call_id_required")
-    if not isinstance(outer_ordinal, int) or outer_ordinal < 0:
+    _safe_identifier("call_id", call_id, _CALL_ID)
+    if (
+        not isinstance(outer_ordinal, int)
+        or isinstance(outer_ordinal, bool)
+        or outer_ordinal < 0
+    ):
         raise ValueError("outer_ordinal_must_be_nonnegative")
-    if not isinstance(inner_ordinal, int) or inner_ordinal < 0:
+    if (
+        not isinstance(inner_ordinal, int)
+        or isinstance(inner_ordinal, bool)
+        or inner_ordinal < 0
+    ):
         raise ValueError("inner_ordinal_must_be_nonnegative")
     return str(uuid5(
         NAMESPACE_URL,
@@ -86,6 +136,7 @@ class ProviderAttemptEvent:
     call_id: str
     outer_attempt_ordinal: int
     inner_attempt_ordinal: int
+    installation_id: str | None
     source: AttemptSource
     lane: AttemptLane
     state: AttemptState
@@ -101,7 +152,7 @@ class ProviderAttemptEvent:
     job_id: int | None = None
     turn_id: str | None = None
     round_id: str | None = None
-    retry_kind: str = "initial"
+    retry_kind: AttemptRetryKind = AttemptRetryKind.INITIAL
     provider_request_id: str | None = None
 
     @classmethod
@@ -112,6 +163,7 @@ class ProviderAttemptEvent:
         call_id: str,
         outer_attempt_ordinal: int,
         inner_attempt_ordinal: int,
+        installation_id: str | None = None,
         source: AttemptSource,
         lane: AttemptLane,
         state: AttemptState,
@@ -127,11 +179,10 @@ class ProviderAttemptEvent:
         job_id: int | None = None,
         turn_id: str | None = None,
         round_id: str | None = None,
-        retry_kind: str = "initial",
+        retry_kind: AttemptRetryKind = AttemptRetryKind.INITIAL,
         provider_request_id: str | None = None,
     ) -> "ProviderAttemptEvent":
-        if not isinstance(user_id, str) or not user_id:
-            raise ValueError("user_id_required")
+        _safe_identifier("user_id", user_id, _INSTALLATION_ID)
         for value, enum_type in (
             (source, AttemptSource),
             (lane, AttemptLane),
@@ -139,15 +190,26 @@ class ProviderAttemptEvent:
             (outcome, AttemptOutcome),
             (completeness, AttemptCompleteness),
             (error_class, AttemptErrorClass),
+            (retry_kind, AttemptRetryKind),
         ):
             if not isinstance(value, enum_type):
                 raise TypeError("provider_attempt_enums_required")
-        for value in (
-            requested_provider, requested_model, resolved_provider,
-            resolved_model, transport,
+        _safe_identifier("requested_provider", requested_provider, _PROVIDER)
+        _safe_identifier("requested_model", requested_model, _MODEL)
+        _safe_identifier("resolved_provider", resolved_provider, _PROVIDER)
+        _safe_identifier("resolved_model", resolved_model, _MODEL)
+        _safe_identifier("transport", transport, _TRANSPORT)
+        _safe_identifier("installation_id", installation_id, _INSTALLATION_ID, optional=True)
+        _safe_identifier("runtime", runtime, _RUNTIME, optional=True)
+        _safe_identifier("turn_id", turn_id, _CALL_ID, optional=True)
+        _safe_identifier("round_id", round_id, _CALL_ID, optional=True)
+        _safe_identifier(
+            "provider_request_id", provider_request_id, _PROVIDER_REQUEST_ID, optional=True,
+        )
+        if job_id is not None and (
+            not isinstance(job_id, int) or isinstance(job_id, bool) or job_id < 0
         ):
-            if not isinstance(value, str) or not value:
-                raise ValueError("provider_attempt_identity_required")
+            raise ValueError("job_id_must_be_nonnegative")
         return cls(
             attempt_id=stable_attempt_id(
                 call_id, outer_attempt_ordinal, inner_attempt_ordinal,
@@ -156,6 +218,7 @@ class ProviderAttemptEvent:
             call_id=call_id,
             outer_attempt_ordinal=outer_attempt_ordinal,
             inner_attempt_ordinal=inner_attempt_ordinal,
+            installation_id=installation_id,
             source=source,
             lane=lane,
             state=state,
@@ -183,6 +246,7 @@ class ProviderAttemptEvent:
             "call_id": self.call_id,
             "outer_attempt_ordinal": self.outer_attempt_ordinal,
             "inner_attempt_ordinal": self.inner_attempt_ordinal,
+            "installation_id": self.installation_id,
             "source": self.source.value,
             "lane": self.lane.value,
             "state": self.state.value,
@@ -198,6 +262,6 @@ class ProviderAttemptEvent:
             "job_id": self.job_id,
             "turn_id": self.turn_id,
             "round_id": self.round_id,
-            "retry_kind": self.retry_kind,
+            "retry_kind": self.retry_kind.value,
             "provider_request_id": self.provider_request_id,
         }

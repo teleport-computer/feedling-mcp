@@ -12,13 +12,15 @@ try:
         AttemptCompleteness,
         AttemptLane,
         AttemptOutcome,
+        AttemptRetryKind,
         AttemptSource,
         AttemptState,
         ProviderAttemptEvent,
         stable_attempt_id,
     )
-except ModuleNotFoundError:
-    AttemptCompleteness = AttemptLane = AttemptOutcome = AttemptSource = AttemptState = None
+except ImportError:
+    AttemptCompleteness = AttemptLane = AttemptOutcome = AttemptRetryKind = None
+    AttemptSource = AttemptState = None
     ProviderAttemptEvent = stable_attempt_id = None
 
 
@@ -80,3 +82,72 @@ def test_attempt_event_rejects_an_enum_from_the_wrong_domain():
             resolved_provider="openai", resolved_model="gpt-test",
             transport="responses",
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("call_id", "call id"),
+        ("requested_provider", "openai\nheader"),
+        ("requested_model", "Bearer secret"),
+        ("resolved_provider", "https://provider.example"),
+        ("resolved_model", "sk-live-secret"),
+        ("transport", "response body"),
+        ("runtime", "runtime\tvalue"),
+        ("turn_id", "Authorization: Bearer token"),
+        ("round_id", "round\x00one"),
+        ("provider_request_id", "api_key=secret"),
+        ("installation_id", "installation\nsecret"),
+    ],
+)
+def test_attempt_event_rejects_content_or_credential_shaped_text(field, value):
+    """Every free-form text input must stay inside the ledger identifier allowlist."""
+    kwargs = _valid_event_kwargs()
+    kwargs[field] = value
+    with pytest.raises(ValueError):
+        ProviderAttemptEvent.create(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("outer_attempt_ordinal", True),
+        ("inner_attempt_ordinal", False),
+        ("job_id", True),
+        ("job_id", -1),
+        ("retry_kind", "initial"),
+    ],
+)
+def test_attempt_event_rejects_invalid_optional_scalars_and_untyped_retry_kind(field, value):
+    """Boolean ordinals and untyped retry strings cannot silently enter the ledger."""
+    kwargs = _valid_event_kwargs()
+    kwargs[field] = value
+    with pytest.raises((TypeError, ValueError)):
+        ProviderAttemptEvent.create(**kwargs)
+
+
+def _valid_event_kwargs() -> dict:
+    assert AttemptRetryKind is not None
+    return {
+        "user_id": "usr_1",
+        "call_id": "call-1:attempt.1",
+        "outer_attempt_ordinal": 1,
+        "inner_attempt_ordinal": 0,
+        "source": AttemptSource.RUNTIME_RECORDER,
+        "lane": AttemptLane.CHAT,
+        "state": AttemptState.STARTED,
+        "outcome": AttemptOutcome.UNKNOWN,
+        "completeness": AttemptCompleteness.STARTED_ONLY,
+        "requested_provider": "openrouter/openai",
+        "requested_model": "openai/gpt-4o-mini",
+        "resolved_provider": "openai",
+        "resolved_model": "gpt-4o-mini",
+        "transport": "responses",
+        "retry_kind": AttemptRetryKind.INITIAL,
+        "runtime": "v2-runtime",
+        "job_id": 1,
+        "turn_id": "turn-1",
+        "round_id": "round:1",
+        "provider_request_id": "req_1",
+        "installation_id": "install-1",
+    }

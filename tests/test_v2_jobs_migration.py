@@ -88,7 +88,9 @@ def test_0076_provider_attempt_schema_is_content_free_and_deletion_safe():
     }
 
     uid = "u_provider_attempt_schema"
+    other_uid = "u_provider_attempt_other"
     _seed_user(uid)
+    _seed_user(other_uid)
     try:
         with db.get_pool().connection() as conn:
             assert conn.execute(
@@ -177,6 +179,46 @@ def test_0076_provider_attempt_schema_is_content_free_and_deletion_safe():
                 "VALUES ('attempt-0076',%s,1,'late_usage')",
                 (uid,),
             )
+            with pytest.raises(psycopg.errors.ForeignKeyViolation):
+                conn.execute(
+                    "INSERT INTO llm_provider_attempt_corrections "
+                    "(attempt_id,user_id,revision,reason_code) "
+                    "VALUES ('attempt-0076',%s,2,'late_usage')",
+                    (other_uid,),
+                )
+            with pytest.raises(psycopg.errors.RaiseException):
+                conn.execute(
+                    "DELETE FROM llm_provider_attempt_corrections "
+                    "WHERE attempt_id='attempt-0076' AND user_id=%s",
+                    (uid,),
+                )
+            with pytest.raises(psycopg.errors.RaiseException):
+                conn.execute(
+                    "UPDATE llm_provider_attempt_corrections SET reason_code='changed' "
+                    "WHERE attempt_id='attempt-0076' AND user_id=%s",
+                    (uid,),
+                )
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(
+                    "INSERT INTO llm_provider_attempts "
+                    "(attempt_id,user_id,call_id,outer_attempt_ordinal,inner_attempt_ordinal,"
+                    "requested_provider,resolved_provider,requested_model,resolved_model,"
+                    "transport,lane,state,source) "
+                    "VALUES ('unsafe-attempt',%s,'call with space',1,0,'openai','openai',"
+                    "'gpt-test','gpt-test','responses','chat','started','runtime_recorder')",
+                    (uid,),
+                )
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(
+                    "INSERT INTO llm_provider_attempts "
+                    "(attempt_id,user_id,call_id,outer_attempt_ordinal,inner_attempt_ordinal,"
+                    "requested_provider,resolved_provider,requested_model,resolved_model,"
+                    "transport,lane,state,source,provider_request_id) "
+                    "VALUES ('unsafe-request-id',%s,'call-request-id',1,0,'openai','openai',"
+                    "'gpt-test','gpt-test','responses','chat','started','runtime_recorder',"
+                    "'api_key=secret')",
+                    (uid,),
+                )
             conn.execute(
                 "DELETE FROM users WHERE user_id=%s", (uid,)
             )
@@ -201,6 +243,7 @@ def test_0076_provider_attempt_schema_is_content_free_and_deletion_safe():
     finally:
         with db.get_pool().connection() as conn:
             conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+            conn.execute("DELETE FROM users WHERE user_id=%s", (other_uid,))
 
 
 def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
@@ -616,6 +659,62 @@ def test_0075_upgrade_rebuilds_a_valid_but_wrong_source_cursor_index(
         with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
             conn.execute(
                 "DROP INDEX CONCURRENTLY IF EXISTS ix_v2_turn_metrics_updated_id"
+            )
+        command.upgrade(cfg, "head")
+
+
+def test_0076_upgrade_rebuilds_same_table_index_with_wrong_definition():
+    """A valid same-name index must still match the intended reporting shape."""
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    migration = _migration_0076_module()
+
+    try:
+        command.downgrade(cfg, "0075_v2_usage_rollup")
+        with db.get_pool().connection() as conn:
+            conn.execute(migration._SCHEMA_UP)
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(
+                "CREATE INDEX CONCURRENTLY ix_llm_provider_attempts_user_started "
+                "ON llm_provider_attempts (started_at)"
+            )
+        command.upgrade(cfg, "head")
+        with db.get_pool().connection() as conn:
+            recovered = conn.execute(
+                "SELECT idx.indisvalid,pg_get_indexdef(idx.indexrelid) FROM pg_index idx "
+                "WHERE idx.indexrelid='ix_llm_provider_attempts_user_started'::regclass"
+            ).fetchone()
+        assert recovered[0] is True
+        assert "(user_id, started_at DESC)" in recovered[1]
+    finally:
+        command.upgrade(cfg, "head")
+
+
+def test_0076_upgrade_refuses_same_name_index_on_another_relation():
+    """Recovery must not drop an unrelated users index just to claim its name."""
+    backend = Path(__file__).parent.parent / "backend"
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    try:
+        command.downgrade(cfg, "0075_v2_usage_rollup")
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(
+                "CREATE INDEX CONCURRENTLY ix_llm_provider_attempts_user_started "
+                "ON users (user_id)"
+            )
+        with pytest.raises(RuntimeError, match="another relation"):
+            command.upgrade(cfg, "head")
+        with db.get_pool().connection() as conn:
+            assert conn.execute(
+                "SELECT indrelid::regclass::text FROM pg_index "
+                "WHERE indexrelid='ix_llm_provider_attempts_user_started'::regclass"
+            ).fetchone() == ("users",)
+    finally:
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(
+                "DROP INDEX CONCURRENTLY IF EXISTS ix_llm_provider_attempts_user_started"
             )
         command.upgrade(cfg, "head")
 
