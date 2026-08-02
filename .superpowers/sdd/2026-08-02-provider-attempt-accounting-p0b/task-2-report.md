@@ -63,3 +63,16 @@
 - `python3 -m ruff check backend/provider_attempt_accounting.py tests/test_provider_attempt_accounting.py tests/test_provider_attempt_recorder.py`,
   `python3 -m compileall -q backend/provider_attempt_accounting.py`, and
   `git diff --check` — passed.
+
+## Fix round 2 — lifecycle race
+
+- Replaced the startup-only lock with a short-held lifecycle condition and an
+  explicit in-flight-start state.  No lock is held while a thread factory or
+  `Thread.start()` may block.
+- Shutdown sets the irreversible stop fence first, waits only until its caller
+  deadline for an in-flight start to publish/fail, and joins a published worker
+  only with the remaining budget.  It returns `False` rather than reporting a
+  false success when factory/start remains gated.
+- Added gated thread-start and factory-failure race regressions, plus repeated
+  start/shutdown coverage proving one live worker at most and no post-stop
+  restart.

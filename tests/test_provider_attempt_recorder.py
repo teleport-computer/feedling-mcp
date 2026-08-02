@@ -253,6 +253,99 @@ def test_forged_event_is_dropped_before_cursor_execution():
     assert recorder.shutdown(timeout=0.5) is True
 
 
+def test_shutdown_never_succeeds_while_thread_start_is_still_gated():
+    """Shutdown must await startup publication or report its bounded timeout."""
+    entered_start = threading.Event()
+    release_start = threading.Event()
+
+    class _GatedThread:
+        def __init__(self, **_kwargs):
+            self.alive = False
+
+        def start(self):
+            entered_start.set()
+            release_start.wait()
+            self.alive = True
+
+        def join(self, _timeout=None):
+            self.alive = False
+
+        def is_alive(self):
+            return self.alive
+
+    recorder = ProviderAttemptRecorder(
+        thread_factory=lambda **kwargs: _GatedThread(**kwargs),
+    )
+    result = []
+    starter = threading.Thread(target=lambda: result.append(recorder.start()))
+    starter.start()
+    assert entered_start.wait(0.5)
+
+    try:
+        assert recorder.shutdown(timeout=0.01) is False
+    finally:
+        release_start.set()
+        starter.join(0.5)
+    assert result == [False]
+    assert recorder.shutdown(timeout=0.1) is True
+
+
+def test_repeated_start_and_shutdown_publish_at_most_one_live_worker():
+    """Lifecycle calls are idempotent and shutdown fences every later start."""
+    factories = []
+
+    class _LiveThread:
+        def __init__(self, **_kwargs):
+            self.alive = False
+
+        def start(self):
+            self.alive = True
+
+        def join(self, _timeout=None):
+            self.alive = False
+
+        def is_alive(self):
+            return self.alive
+
+    def thread_factory(**kwargs):
+        factories.append(kwargs)
+        return _LiveThread(**kwargs)
+
+    recorder = ProviderAttemptRecorder(thread_factory=thread_factory)
+    assert recorder.start() is True
+    assert recorder.start() is True
+    assert len(factories) == 1
+    assert recorder.shutdown(timeout=0.1) is True
+    assert recorder.shutdown(timeout=0.1) is True
+    assert recorder.start() is False
+    assert len(factories) == 1
+
+
+def test_shutdown_waits_for_a_gated_factory_failure_before_succeeding():
+    """An unreturned factory is an in-flight start, even if it later fails."""
+    entered_factory = threading.Event()
+    release_factory = threading.Event()
+
+    def thread_factory(**_kwargs):
+        entered_factory.set()
+        release_factory.wait()
+        raise RuntimeError("factory failed")
+
+    recorder = ProviderAttemptRecorder(thread_factory=thread_factory)
+    result = []
+    starter = threading.Thread(target=lambda: result.append(recorder.start()))
+    starter.start()
+    assert entered_factory.wait(0.5)
+
+    try:
+        assert recorder.shutdown(timeout=0.01) is False
+    finally:
+        release_factory.set()
+        starter.join(0.5)
+    assert result == [False]
+    assert recorder.shutdown(timeout=0.1) is True
+
+
 def test_full_queue_drops_event_without_raising_or_growing_memory():
     """A full bounded queue drops telemetry instead of delaying a provider call."""
     recorder = ProviderAttemptRecorder(
