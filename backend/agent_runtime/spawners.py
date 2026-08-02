@@ -727,10 +727,19 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
         # native only exposes best-effort summaries, not raw reasoning, so
         # `detailed` improves the chance of seeing a summary but cannot guarantee
         # one for every turn.
+        # -c web_search=disabled: codex ships a native Responses web-search tool
+        # (web.run). Left on, the model reaches for it instead of our io_cli
+        # web-search verb — bypassing the server-side authorization/kill-switch
+        # gate entirely. Disable it at the CLI so web only ever flows through
+        # io_cli. TOML top-level key form is the only one that takes on codex-cli
+        # 0.142.4 (`-c tools.web_search=false` / `features.web_search=false` are
+        # dropped/ignored there); a home-level config.toml seeds the same key so an
+        # operator cli_cmd override can't silently re-enable it (see agent_home_files).
         return (
             "codex exec --skip-git-repo-check --json "
             "-c model_reasoning_effort=medium "
             "-c model_reasoning_summary=detailed "
+            "-c web_search=disabled "
             "{mcp} "
             "--dangerously-bypass-approvals-and-sandbox {message}"
         )
@@ -738,7 +747,7 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
     return (
         f"claude {_CLAUDE_PERMISSION_FLAG} {_attach_dirs_add_dir(home)} "
-        f"--allowed-tools '{grant}' "
+        f"--allowed-tools '{grant}' {_CLAUDE_DISALLOWED_WEB_TOOLS} "
         f"--append-system-prompt-file {prompt_file} {{mcp}} -p {{message}}"
     )
 
@@ -753,6 +762,19 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
 # (Verified in-CVM + locally on claude-code 2.1.195, sonnet-4-5 image turns.)
 _CLAUDE_PERMISSION_FLAG = "--permission-mode acceptEdits"
 
+# claude ships its own built-in WebSearch + WebFetch tools. Neither is in our
+# --allowed-tools allowlist, so when the model reaches for WebSearch (its
+# preferred way to go online) claude denies it as "requires approval" — and the
+# model never falls back to our io_cli ``web-search`` verb, so the user just sees
+# "联网被权限拦截" instead of a real search. --disallowed-tools hard-DENIES both
+# (deny outranks allow) so the model stops reaching for them and uses io_cli
+# web-search/web-fetch. WebFetch must be denied too, or a model blocked from
+# WebSearch could still WebFetch an arbitrary URL directly, bypassing our
+# server-side web-fetch authorization gate. Belt-and-suspenders with the
+# settings.json ``permissions.deny`` (agent_home_files) — an operator ``cli_cmd``
+# override drops this flag but still inherits the settings deny, and vice-versa.
+_CLAUDE_DISALLOWED_WEB_TOOLS = "--disallowed-tools WebSearch,WebFetch"
+
 
 def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
     """Claude Code exposes thinking blocks in stream-json output."""
@@ -765,7 +787,7 @@ def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
     return (
         f"claude {_CLAUDE_PERMISSION_FLAG} {_attach_dirs_add_dir(home)} --verbose "
         f"--output-format stream-json --include-partial-messages --effort high "
-        f"--allowed-tools '{grant}' "
+        f"--allowed-tools '{grant}' {_CLAUDE_DISALLOWED_WEB_TOOLS} "
         f"--append-system-prompt-file {prompt_file} {{mcp}} -p {{message}}"
     )
 
@@ -844,8 +866,18 @@ def agent_home_files(
     files = {f"{home}/{_AGENT_PROMPT_BASENAME}": system_append}
     if driver == "codex":
         # codex is native-only now (LiteLLM gateway retired) — it reads AGENTS.md
-        # and talks straight to api.openai.com; NO config.toml is ever written.
+        # and talks straight to api.openai.com. The only thing config.toml carries
+        # is ``web_search = "disabled"``: codex's native Responses web-search tool
+        # (web.run) must stay off so web only ever flows through our io_cli
+        # web-search verb (server-side authorized + kill-switchable), never codex's
+        # own ungated tool. Seeding it in the home — not just the CLI ``-c`` flag —
+        # closes the operator ``cli_cmd`` override hole (a custom command without
+        # the flag still inherits this). TOML top-level key form is the one codex-cli
+        # 0.142.4 honors (``tools.web_search`` / ``features.web_search`` are ignored
+        # there). codex_config_merged (user-MCP) prepends its managed [mcp_servers]
+        # block AFTER this top-level key, so the merge preserves it.
         files[f"{home}/codex-home/AGENTS.md"] = system_append
+        files[f"{home}/codex-home/config.toml"] = 'web_search = "disabled"\n'
     elif driver == "pi":
         # pi reads the tools how-to via --append-system-prompt (same mechanism as
         # claude); the relay is registered as a custom provider in models.json.
@@ -860,9 +892,17 @@ def agent_home_files(
         # the allow rules are treated as hints and the default mode auto-denies
         # non-interactively. acceptEdits makes the pre-granted allowlist actually
         # honored without a prompt. (Verified in-CVM: sonnet-4-5 image turns.)
+        # deny WebSearch/WebFetch here too (not only on the CLI --disallowed-tools
+        # flag): _default_cli_cmd can be replaced wholesale by an operator ``cli_cmd``
+        # override, which would drop the flag — but claude still reads this
+        # settings.json, and permissions.deny outranks allow, so the built-in web
+        # tools stay blocked and the model falls back to our io_cli web-search verb.
+        # user-MCP merge only rewrites permissions.allow (merge_settings_allow), so
+        # this deny survives it untouched.
         settings = {
             "permissions": {
                 "defaultMode": "acceptEdits",
+                "deny": ["WebSearch", "WebFetch"],
                 "allow": _claude_allow_rules(io_cli, home),
             }
         }
@@ -878,10 +918,14 @@ def stale_home_files(home: str, *, driver: str) -> list[str]:
     The motivating case (historical): a codex user who used to be bridged through
     the in-CVM LiteLLM gateway (now retired) — or who switches to the claude
     driver — may still carry a ``codex-home/config.toml`` pointing at the
-    (now-dead) gateway on a PERSISTENT home; ``agent_home_files`` never writes
-    that file any more (codex is native-only), so it must always be pruned here
-    or a stale config would keep routing codex at a port nothing listens on
-    anymore → ``error sending request`` → user-visible fallback."""
+    (now-dead) gateway on a PERSISTENT home; a stale config would keep routing
+    codex at a port nothing listens on anymore → ``error sending request`` →
+    user-visible fallback. It stays in this list unconditionally: for a NON-codex
+    driver it is pruned (that user has no codex config); for the codex driver
+    ``agent_home_files`` now writes a fresh ``config.toml`` (``web_search =
+    "disabled"``), which is in ``files`` so ``materialize_home``'s prune guard
+    skips it and the fresh write OVERWRITES any stale gateway content — same net
+    effect (no dead gateway config survives) via overwrite instead of unlink."""
     stale: list[str] = [f"{home}/codex-home/config.toml"]
     if driver != "pi":
         # A user who switched off the pi driver leaves a models.json pointing at
