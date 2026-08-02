@@ -4755,6 +4755,7 @@ def _usage_fact_query(
     dimensions: bool,
     prefix: str | None = None,
     include_dimension_filters: bool = True,
+    include_latency: bool = True,
 ) -> tuple[str, tuple[object, ...]]:
     """Build a disjoint rollup/full-day + raw/edge fact relation."""
 
@@ -4817,6 +4818,8 @@ def _usage_fact_query(
     rollup_latency = (
         f",{selected}_latency_samples AS latency_samples" if dimensions else ""
     )
+    if not include_latency:
+        rollup_latency = ""
     user_clauses: list[str] = []
     rollup_day_where, rollup_params = _usage_rollup_day_predicate(
         partition.rollup_days
@@ -4900,7 +4903,7 @@ WHERE {' AND '.join(rollup_where)}
     raw_latency = (
         ",coalesce(array_agg(m.latency_ms ORDER BY m.latency_ms,m.id) "
         "FILTER (WHERE m.latency_ms IS NOT NULL),'{}'::integer[]) AS latency_samples"
-        if dimensions
+        if dimensions and include_latency
         else ""
     )
     statement = f"""
@@ -5152,19 +5155,7 @@ user_days AS MATERIALIZED (
   {reduced}
  FROM source s GROUP BY user_id,local_day
 ),
-distribution_row AS (
- SELECT percentile_cont(.5) WITHIN GROUP (ORDER BY prompt_tokens_sum+completion_tokens_sum) AS p50,
-  percentile_cont(.75) WITHIN GROUP (ORDER BY prompt_tokens_sum+completion_tokens_sum) AS p75,
-  percentile_cont(.9) WITHIN GROUP (ORDER BY prompt_tokens_sum+completion_tokens_sum) AS p90,
-  percentile_cont(.95) WITHIN GROUP (ORDER BY prompt_tokens_sum+completion_tokens_sum) AS p95,
-  max(prompt_tokens_sum+completion_tokens_sum) AS max
- FROM user_days WHERE model_calls>0 AND prompt_tokens_known_count>0
-  AND completion_tokens_known_count>0
-), daily_rows AS (
- SELECT local_day,{aggregates},
-  count(DISTINCT user_id) FILTER (WHERE model_calls>0)::int AS model_active_users
- FROM user_days d GROUP BY local_day
-), user_rows AS MATERIALIZED (
+user_rows AS MATERIALIZED (
  SELECT d.user_id,{aggregates},
   count(DISTINCT d.local_day) FILTER (WHERE d.model_calls>0)::int AS active_days,
   max(d.last_model_call_at) AS last_model_call_at,
@@ -5182,8 +5173,8 @@ distribution_row AS (
  FROM user_rows u
 )
 SELECT (SELECT to_jsonb(t) FROM totals_row t) AS totals,
- (SELECT to_jsonb(d) FROM distribution_row d) AS distribution,
- (SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY d.local_day),'[]') FROM daily_rows d) AS daily,
+ NULL::jsonb AS distribution,
+ NULL::jsonb AS daily,
  (SELECT coalesce(jsonb_agg(to_jsonb(u)-'_order_total'
    ORDER BY u._order_total DESC NULLS LAST,u.model_calls DESC,u.user_id),'[]')
   FROM user_rows u) AS users
@@ -5193,7 +5184,7 @@ SELECT (SELECT to_jsonb(t) FROM totals_row t) AS totals,
             bundle = cur.fetchone()
         daily = bundle["daily"]
         users = bundle["users"]
-        for row in daily:
+        for row in daily or []:
             if isinstance(row.get("local_day"), str):
                 row["local_day"] = datetime.fromisoformat(row["local_day"]).date()
         for row in users:
@@ -5217,36 +5208,39 @@ SELECT (SELECT to_jsonb(t) FROM totals_row t) AS totals,
         )
 
 
-def _usage_parallel_dimension_rows(
-    cur, query, partition, *, unknown_auxiliary=True
-) -> dict:
-    """Return only grouped dimension payload rows from PostgreSQL."""
-
+def _usage_parallel_grouped_dimension_rows(cur, query, partition, fields: str):
     source_sql, params = _usage_fact_query(query, partition, dimensions=True)
     prefix = f"WITH source AS ({source_sql})"
     aggregates = _usage_fact_aggregate_columns()
-    _usage_snapshot_observer("read", role="dimension", section="breakdowns")
-
-    def grouped(fields: str):
-        cur.execute(
-            prefix
-            + f"""
+    cur.execute(
+        prefix
+        + f"""
 SELECT {fields},{aggregates},count(DISTINCT user_id)::int AS users
 FROM source s GROUP BY {fields}
 ORDER BY {_usage_known_total_order()} DESC NULLS LAST,
  sum(s.model_calls) DESC,{fields}
 """,
-            params,
-        )
-        return cur.fetchall()
+        params,
+    )
+    return cur.fetchall()
 
-    models = _usage_optional_pg_section(
-        cur, "models", lambda: grouped("provider,model")
+
+def _usage_parallel_model_rows(cur, query, partition):
+    return _usage_parallel_grouped_dimension_rows(
+        cur, query, partition, "provider,model"
     )
-    lanes = _usage_optional_pg_section(
-        cur, "lanes", lambda: grouped("lane")
-    )
-    primary_sql = prefix + """,
+
+
+def _usage_parallel_lane_rows(cur, query, partition):
+    return _usage_parallel_grouped_dimension_rows(cur, query, partition, "lane")
+
+
+def _usage_parallel_primary_rows(cur, query, partition):
+    source_sql, params = _usage_fact_query(query, partition, dimensions=True)
+    prefix = f"WITH source AS ({source_sql})"
+    cur.execute(
+        prefix
+        + """,
 ranked AS (
  SELECT user_id,provider,model,
  row_number() OVER (PARTITION BY user_id
@@ -5254,13 +5248,68 @@ ranked AS (
  FROM source GROUP BY user_id,provider,model
 )
 SELECT user_id,provider,model FROM ranked WHERE rank=1
-"""
-    primary = _usage_optional_pg_section(
-        cur,
-        "primary",
-        lambda: (cur.execute(primary_sql, params), cur.fetchall())[1],
+""",
+        params,
     )
-    result = {"models": models, "lanes": lanes, "primary": primary}
+    return cur.fetchall()
+
+
+def _usage_parallel_dimension_rows(
+    cur,
+    query,
+    partition,
+    *,
+    unknown_auxiliary=True,
+    auxiliary_only=False,
+) -> dict:
+    """Run fixed-bin A, plus only the raw patches needed by unknown."""
+
+    _usage_snapshot_observer("read", role="dimension", section="breakdowns")
+
+    models = _usage_optional_pg_section(
+        cur, "models", lambda: _usage_parallel_model_rows(cur, query, partition)
+    )
+    lanes = (
+        _usage_optional_pg_section(
+            cur, "lanes", lambda: _usage_parallel_lane_rows(cur, query, partition)
+        )
+        if query.completeness == "unknown" or auxiliary_only
+        else None
+    )
+    primary = (
+        None
+        if auxiliary_only
+        else _usage_optional_pg_section(
+            cur,
+            "primary",
+            lambda: _usage_parallel_primary_rows(cur, query, partition),
+        )
+    )
+    filters = (
+        None
+        if auxiliary_only
+        else _usage_optional_pg_section(
+            cur,
+            "filters",
+            lambda: _usage_parallel_option_rows(cur, query, partition),
+        )
+    )
+    distribution = (
+        _usage_optional_pg_section(
+            cur,
+            "distribution",
+            lambda: _usage_parallel_distribution_row(cur, query, partition),
+        )
+        if query.completeness != "unknown" and not auxiliary_only
+        else None
+    )
+    result = {
+        "models": models,
+        "lanes": lanes,
+        "primary": primary,
+        "filters": filters,
+        "distribution": distribution,
+    }
     if query.completeness == "unknown" and unknown_auxiliary:
         all_days = tuple(sorted(partition.rollup_days + partition.raw_days))
         auxiliary = _usage_parallel_dimension_rows(
@@ -5268,6 +5317,7 @@ SELECT user_id,provider,model FROM ranked WHERE rank=1
             query,
             usage_reporting.RollupPartition(rollup_days=(), raw_days=all_days),
             unknown_auxiliary=False,
+            auxiliary_only=True,
         )
         fields = (
             "metered_turns",
@@ -5310,43 +5360,120 @@ def _usage_parallel_option_rows(cur, query, partition) -> dict:
     return cur.fetchone()
 
 
-def _usage_parallel_latency_rows(cur, query, partition) -> dict:
-    """Compute exact p50/p95 in PostgreSQL; return only grouped percentiles."""
-
+def _usage_parallel_grouped_latency_rows(cur, query, partition, fields: str):
     source_sql, params = _usage_fact_query(query, partition, dimensions=True)
     prefix = f"WITH source AS ({source_sql}), samples AS ("
     prefix += (
         "SELECT s.provider,s.model,s.lane,value::double precision AS latency_ms "
         "FROM source s CROSS JOIN LATERAL unnest(s.latency_samples) value)"
     )
+    cur.execute(
+        prefix
+        + f" SELECT {fields},"
+        "percentile_cont(.5) WITHIN GROUP (ORDER BY latency_ms) AS latency_ms_p50,"
+        "percentile_cont(.95) WITHIN GROUP (ORDER BY latency_ms) AS latency_ms_p95 "
+        f"FROM samples GROUP BY {fields}",
+        params,
+    )
+    return cur.fetchall()
+
+
+def _usage_parallel_latency_model_rows(cur, query, partition):
+    return _usage_parallel_grouped_latency_rows(
+        cur, query, partition, "provider,model"
+    )
+
+
+def _usage_parallel_latency_lane_rows(cur, query, partition):
+    return _usage_parallel_grouped_latency_rows(cur, query, partition, "lane")
+
+
+def _usage_parallel_latency_rows(cur, query, partition) -> dict:
+    """Compute exact p50/p95 in PostgreSQL; return only grouped percentiles."""
+
     _usage_snapshot_observer("read", role="latency", section="latency")
+    return {
+        "models": _usage_parallel_latency_model_rows(cur, query, partition),
+        "lanes": _usage_parallel_latency_lane_rows(cur, query, partition),
+    }
 
-    def grouped(fields: str):
-        cur.execute(
-            prefix
-            + f" SELECT {fields},"
-            "percentile_cont(.5) WITHIN GROUP (ORDER BY latency_ms) AS latency_ms_p50,"
-            "percentile_cont(.95) WITHIN GROUP (ORDER BY latency_ms) AS latency_ms_p95 "
-            f"FROM samples GROUP BY {fields}",
-            params,
-        )
-        return cur.fetchall()
 
-    return {"models": grouped("provider,model"), "lanes": grouped("lane")}
+def _usage_parallel_distribution_row(cur, query, partition) -> dict:
+    dimensions = usage_reporting.has_dimension_filter(query)
+    source_sql, params = _usage_fact_query(
+        query,
+        partition,
+        dimensions=dimensions,
+        include_latency=False,
+    )
+    cur.execute(
+        f"""
+WITH source AS ({source_sql}), user_days AS (
+ SELECT user_id,local_day,{_usage_known_sum('prompt_tokens')} AS prompt_tokens,
+  {_usage_known_sum('completion_tokens')} AS completion_tokens
+ FROM source s WHERE model_calls>0 GROUP BY user_id,local_day
+)
+SELECT percentile_cont(.5) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens) AS p50,
+ percentile_cont(.75) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens) AS p75,
+ percentile_cont(.9) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens) AS p90,
+ percentile_cont(.95) WITHIN GROUP (ORDER BY prompt_tokens+completion_tokens) AS p95,
+ max(prompt_tokens+completion_tokens) AS max
+FROM user_days WHERE prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL
+""",
+        params,
+    )
+    return cur.fetchone()
+
+
+def _usage_parallel_daily_rows(cur, query, partition) -> list[dict]:
+    dimensions = usage_reporting.has_dimension_filter(query)
+    source_sql, params = _usage_fact_query(
+        query,
+        partition,
+        dimensions=dimensions,
+        include_latency=False,
+    )
+    aggregates = _usage_fact_aggregate_columns()
+    cur.execute(
+        f"""
+WITH source AS ({source_sql})
+SELECT local_day,{aggregates},
+ count(DISTINCT user_id) FILTER (WHERE model_calls>0)::int AS model_active_users
+FROM source s GROUP BY local_day ORDER BY local_day
+""",
+        params,
+    )
+    return cur.fetchall()
 
 
 def _usage_parallel_latency_bundle(cur, query, partition) -> dict:
-    def optional(name, reader):
-        try:
-            with cur.connection.transaction():
-                return reader(cur, query, partition)
-        except Exception:
-            log.exception("usage %s importer section unavailable", name)
-            return None
+    """Run fixed-bin B; every task rolls back and degrades independently."""
 
+    _usage_snapshot_observer("read", role="latency", section="task_b")
     return {
-        "latency": optional("latency", _usage_parallel_latency_rows),
-        "filters": optional("filters", _usage_parallel_option_rows),
+        "daily": (
+            _usage_optional_pg_section(
+                cur,
+                "daily",
+                lambda: _usage_parallel_daily_rows(cur, query, partition),
+            )
+            if query.completeness != "unknown"
+            else None
+        ),
+        "lanes": (
+            _usage_optional_pg_section(
+                cur,
+                "lanes",
+                lambda: _usage_parallel_lane_rows(cur, query, partition),
+            )
+            if query.completeness != "unknown"
+            else None
+        ),
+        "latency_models": _usage_optional_pg_section(
+            cur,
+            "latency_models",
+            lambda: _usage_parallel_latency_model_rows(cur, query, partition),
+        ),
     }
 
 
@@ -5650,7 +5777,9 @@ def _usage_payload_from_parallel_rows(
     def identity_rows(name: str, fields: tuple[str, ...]):
         if dimensions is None or dimensions.get(name) is None:
             return None
-        latency_rows = ((latency_bundle or {}).get("latency") or {}).get(name, [])
+        latency_rows = (
+            ((latency_bundle or {}).get("latency") or {}).get(name) or []
+        )
         latency = {tuple(row[field] for field in fields): row for row in latency_rows}
         items = []
         for row in dimensions[name]:
@@ -6837,10 +6966,44 @@ def _usage_report_snapshot_hybrid_serial(query) -> dict | None:
     }
 
 
+def _usage_merge_parallel_task_results(
+    core: dict,
+    task_a: dict | None,
+    task_b: dict | None,
+    latency_lanes: list[dict] | None,
+) -> tuple[dict, dict, dict]:
+    """Reassemble fixed three-bin reads into the existing report payload."""
+
+    task_a = task_a or {}
+    task_b = task_b or {}
+    merged_core = dict(core)
+    if merged_core.get("distribution") is None:
+        merged_core["distribution"] = task_a.get("distribution")
+    if merged_core.get("daily") is None:
+        merged_core["daily"] = task_b.get("daily")
+    dimensions = {
+        "models": task_a.get("models"),
+        "lanes": (
+            task_a["lanes"]
+            if task_a.get("lanes") is not None
+            else task_b.get("lanes")
+        ),
+        "primary": task_a.get("primary"),
+    }
+    latency_bundle = {
+        "filters": task_a.get("filters"),
+        "latency": {
+            "models": task_b.get("latency_models"),
+            "lanes": latency_lanes,
+        },
+    }
+    return merged_core, dimensions, latency_bundle
+
+
 def _usage_report_snapshot_hybrid_parallel(
     query, *, exporter_conn=None
 ) -> dict | None:
-    """Read three server-aggregated sections from one exported snapshot."""
+    """Read three balanced aggregate bins from one exported snapshot."""
 
     if exporter_conn is None:
         with _usage_report_admission() as admitted_conn:
@@ -6877,43 +7040,50 @@ def _usage_report_snapshot_hybrid_parallel(
             importer_deadline = (
                 time.monotonic() + _USAGE_REPORT_STATEMENT_TIMEOUT_MS / 1000
             )
-            dimension_control = _UsageImporterControl()
-            latency_control = _UsageImporterControl()
+            task_a_control = _UsageImporterControl()
+            task_b_control = _UsageImporterControl()
             with _UsageImporterExecutor() as executor:
-                dimension_future = executor.submit(
-                    dimension_control,
+                task_a_future = executor.submit(
+                    task_a_control,
                     _usage_import_snapshot,
                     snapshot_id,
-                    dimension_control,
+                    task_a_control,
                     importer_deadline,
                     _usage_parallel_dimension_rows,
                     query,
                     partition,
                 )
-                latency_future = executor.submit(
-                    latency_control,
+                task_b_future = executor.submit(
+                    task_b_control,
                     _usage_import_snapshot,
                     snapshot_id,
-                    latency_control,
+                    task_b_control,
                     importer_deadline,
                     _usage_parallel_latency_bundle,
                     query,
                     partition,
                 )
                 core = _usage_parallel_core_rows(cur, query, partition)
+                latency_lanes = _usage_optional_pg_section(
+                    cur,
+                    "latency_lanes",
+                    lambda: _usage_parallel_latency_lane_rows(
+                        cur, query, partition
+                    ),
+                )
                 cohort = _usage_cohort_on_cursor(cur, query)
                 try:
                     dimensions = _usage_importer_result(
-                        dimension_future,
-                        dimension_control,
+                        task_a_future,
+                        task_a_control,
                         importer_deadline,
                     )
                 except _UsageImporterUnsettled:
                     raise
                 except Exception:
-                    dimension_future.cancel()
+                    task_a_future.cancel()
                     log.exception(
-                        "usage dimension importer unavailable; trying serial"
+                        "usage task A importer unavailable; trying serial"
                     )
                     try:
                         cur.execute(
@@ -6926,21 +7096,21 @@ def _usage_report_snapshot_hybrid_parallel(
                             )
                     except Exception:
                         log.exception(
-                            "usage dimension serial fallback unavailable"
+                            "usage task A serial fallback unavailable"
                         )
                         dimensions = None
                 try:
                     latency_bundle = _usage_importer_result(
-                        latency_future,
-                        latency_control,
+                        task_b_future,
+                        task_b_control,
                         importer_deadline,
                     )
                 except _UsageImporterUnsettled:
                     raise
                 except Exception:
-                    latency_future.cancel()
+                    task_b_future.cancel()
                     log.exception(
-                        "usage latency/filter importer unavailable; trying serial"
+                        "usage task B importer unavailable; trying serial"
                     )
                     try:
                         cur.execute(
@@ -6953,9 +7123,12 @@ def _usage_report_snapshot_hybrid_parallel(
                             )
                     except Exception:
                         log.exception(
-                            "usage latency/filter serial fallback unavailable"
+                            "usage task B serial fallback unavailable"
                         )
                         latency_bundle = None
+            core, dimensions, latency_bundle = _usage_merge_parallel_task_results(
+                core, dimensions, latency_bundle, latency_lanes
+            )
             return _usage_payload_from_parallel_rows(
                 query,
                 cohort,

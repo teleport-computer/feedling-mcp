@@ -382,6 +382,7 @@ def test_usage_hybrid_filters_match_raw_including_unknown_metered_intersection(
         if filters.get("completeness") == "unknown":
             report = jobs_store.usage_report_snapshot(query)
             assert report["averages"]["tokens_per_metered_turn"] == pytest.approx(35)
+            assert report["averages"]["user_day_tokens"] is not None
             beta = next(row for row in report["users"] if row["user_id"] == "u_usage_beta")
             assert beta["metered_turns"] == 1
             assert beta["tokens_per_metered_turn"] == pytest.approx(35)
@@ -415,6 +416,26 @@ def test_usage_hybrid_partial_dirty_and_empty_days_match_disjoint_raw(usage_rows
 
     assert freshness["rollup_days"] == ["2026-07-03"]
     assert freshness["raw_days"] == ["2026-07-01", "2026-07-02", "2026-07-04"]
+
+
+def test_usage_distribution_matches_raw_for_filtered_mixed_partition(usage_rows):
+    dirty = datetime(2026, 7, 2).date()
+    _enable_usage_rollup(dirty_from_day=dirty, dirty_through_day=dirty)
+    query = _usage.UsageQuery(
+        start_at_utc=datetime(2026, 6, 30, 16, tzinfo=timezone.utc),
+        end_at_utc=datetime(2026, 7, 2, 16, tzinfo=timezone.utc),
+        timezone="Asia/Shanghai",
+        provider="openrouter",
+        model="gpt-a",
+    )
+    try:
+        freshness = _assert_hybrid_matches_raw(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert freshness["rollup_days"] == ["2026-07-01"]
+    assert freshness["raw_days"] == ["2026-07-02"]
 
 
 def test_usage_parallel_orders_known_zero_before_unknown_tokens():
@@ -749,6 +770,80 @@ def test_usage_parallel_uses_at_most_three_connections(monkeypatch, usage_rows):
     assert 2 <= maximum <= 3
 
 
+@pytest.mark.parametrize("failed_task", [None, "a", "b"])
+def test_usage_parallel_three_bin_merge_degrades_only_failed_task(failed_task):
+    merge = getattr(jobs_store, "_usage_merge_parallel_task_results", None)
+    assert merge is not None, "three-bin result merge must be implemented"
+    core = {"totals": {"model_calls": 1}, "distribution": None, "daily": None}
+    task_a = None if failed_task == "a" else {
+        "distribution": {"p50": 11},
+        "models": [{"provider": "p", "model": "m"}],
+        "primary": [{"user_id": "u", "provider": "p", "model": "m"}],
+        "filters": {"lanes": ["chat"]},
+        "lanes": None,
+    }
+    task_b = None if failed_task == "b" else {
+        "daily": [{"local_day": "2026-07-01"}],
+        "lanes": [{"lane": "chat"}],
+        "latency_models": [{"provider": "p", "model": "m", "latency_ms_p50": 7}],
+    }
+    latency_lanes = [{"lane": "chat", "latency_ms_p50": 8}]
+
+    merged_core, dimensions, latency_bundle = merge(
+        core, task_a, task_b, latency_lanes
+    )
+
+    assert core == {
+        "totals": {"model_calls": 1},
+        "distribution": None,
+        "daily": None,
+    }
+    assert merged_core["distribution"] == (
+        None if failed_task == "a" else {"p50": 11}
+    )
+    assert merged_core["daily"] == (
+        None if failed_task == "b" else [{"local_day": "2026-07-01"}]
+    )
+    assert dimensions["models"] == (
+        None if failed_task == "a" else [{"provider": "p", "model": "m"}]
+    )
+    assert dimensions["lanes"] == (
+        None if failed_task == "b" else [{"lane": "chat"}]
+    )
+    assert dimensions["primary"] == (
+        None
+        if failed_task == "a"
+        else [{"user_id": "u", "provider": "p", "model": "m"}]
+    )
+    assert latency_bundle["filters"] == (
+        None if failed_task == "a" else {"lanes": ["chat"]}
+    )
+    assert latency_bundle["latency"]["models"] == (
+        None
+        if failed_task == "b"
+        else [{"provider": "p", "model": "m", "latency_ms_p50": 7}]
+    )
+    assert latency_bundle["latency"]["lanes"] == latency_lanes
+
+
+def test_usage_parallel_three_bin_merge_preserves_unknown_core_sections():
+    merge = jobs_store._usage_merge_parallel_task_results
+    core = {
+        "distribution": {"p50": 13},
+        "daily": [{"local_day": "2026-07-01", "model_calls": 2}],
+    }
+
+    merged_core, dimensions, _latency_bundle = merge(
+        core,
+        {"models": [], "lanes": [], "primary": [], "distribution": None},
+        {"daily": None, "lanes": None, "latency_models": []},
+        [],
+    )
+
+    assert merged_core == core
+    assert dimensions == {"models": [], "lanes": [], "primary": []}
+
+
 def test_usage_process_and_rds_admission_fail_fast_without_extra_query(usage_rows):
     query = _shanghai_usage_query()
     _enable_usage_rollup()
@@ -785,18 +880,16 @@ def test_usage_process_and_rds_admission_fail_fast_without_extra_query(usage_row
 
 
 
-def test_usage_importer_timeout_rolls_back_and_only_degrades_dimensions(
+def test_usage_importer_failure_rolls_back_and_only_degrades_task_a(
     monkeypatch, usage_rows
 ):
     query = _shanghai_usage_query()
     _enable_usage_rollup()
-    monkeypatch.setattr(jobs_store, "_USAGE_REPORT_STATEMENT_TIMEOUT_MS", 50)
 
-    def slow_dimension(cur, *_args):
-        cur.execute("SELECT pg_sleep(.2)")
-        return {}
+    def fail_task_a(*_args):
+        raise RuntimeError("task A injected")
 
-    monkeypatch.setattr(jobs_store, "_usage_parallel_dimension_rows", slow_dimension)
+    monkeypatch.setattr(jobs_store, "_usage_parallel_dimension_rows", fail_task_a)
     try:
         report = jobs_store._usage_report_snapshot_hybrid_parallel(query)
         with db.get_pool().connection() as conn:
@@ -809,7 +902,7 @@ def test_usage_importer_timeout_rolls_back_and_only_degrades_dimensions(
     assert report["daily"] is not None
     assert report["users"] is not None
     assert report["models"] is None
-    assert report["lanes"] is None
+    assert report["lanes"] is not None
     assert {row["primary_provider"] for row in report["users"]} == {"unavailable"}
 
 
@@ -893,7 +986,12 @@ def test_usage_latency_failure_keeps_filters_and_dimension_totals(
     def fail_latency(*_args):
         raise RuntimeError("latency injected")
 
-    monkeypatch.setattr(jobs_store, "_usage_parallel_latency_rows", fail_latency)
+    monkeypatch.setattr(
+        jobs_store, "_usage_parallel_latency_model_rows", fail_latency
+    )
+    monkeypatch.setattr(
+        jobs_store, "_usage_parallel_latency_lane_rows", fail_latency
+    )
     try:
         report = jobs_store._usage_report_snapshot_hybrid_parallel(query)
     finally:
@@ -907,7 +1005,79 @@ def test_usage_latency_failure_keeps_filters_and_dimension_totals(
     }
     assert report["models"] is not None
     assert report["lanes"] is not None
+    assert report["averages"]["user_day_tokens"] is not None
+    assert report["daily"] is not None
     assert all(row["latency_ms_p50"] is None for row in report["models"])
+    assert all(row["latency_ms_p50"] is None for row in report["lanes"])
+
+
+def test_usage_task_b_failure_only_degrades_task_b(monkeypatch, usage_rows):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+
+    def fail_task_b(*_args):
+        raise RuntimeError("task B injected")
+
+    monkeypatch.setattr(jobs_store, "_usage_parallel_latency_bundle", fail_task_b)
+    try:
+        report = jobs_store._usage_report_snapshot_hybrid_parallel(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert report["overview"]["total_tokens"] == 215
+    assert report["averages"]["user_day_tokens"] is not None
+    assert report["filters"] is not None
+    assert report["models"] is not None
+    assert report["daily"] is None
+    assert report["lanes"] is None
+
+
+def test_usage_distribution_failure_only_degrades_user_day_percentiles(
+    monkeypatch, usage_rows
+):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+
+    monkeypatch.setattr(
+        jobs_store,
+        "_usage_parallel_distribution_row",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("distribution injected")),
+    )
+    try:
+        report = jobs_store._usage_report_snapshot_hybrid_parallel(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert report["overview"]["total_tokens"] == 215
+    assert report["averages"]["user_day_tokens"] is None
+    assert report["daily"] is not None
+    assert report["users"] is not None
+    assert report["models"] is not None
+
+
+def test_usage_daily_failure_does_not_degrade_other_core_sections(
+    monkeypatch, usage_rows
+):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+
+    def fail_daily(*_args):
+        raise RuntimeError("daily injected")
+
+    monkeypatch.setattr(jobs_store, "_usage_parallel_daily_rows", fail_daily)
+    try:
+        report = jobs_store._usage_report_snapshot_hybrid_parallel(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert report["overview"]["total_tokens"] == 215
+    assert report["daily"] is None
+    assert report["users"] is not None
+    assert report["averages"]["user_day_tokens"] is not None
+    assert report["models"] is not None
 
 
 def test_usage_parallel_releases_rds_session_admission(usage_rows):
@@ -1129,6 +1299,7 @@ def test_usage_importer_two_statements_share_one_total_budget(
 
     assert elapsed < 0.25
     assert report["models"] is None
+    # Both importers share this exhausted deadline; all optional bins may degrade.
     assert report["lanes"] is None
 
 
@@ -1162,6 +1333,7 @@ def test_usage_importer_timeout_cancels_and_releases_before_fallback(
 
     assert any(event == "cancel" for event, _fields in events)
     assert report["models"] is None
+    # Cancellation follows the shared deadline, so task B may also time out.
     assert report["lanes"] is None
 
 
