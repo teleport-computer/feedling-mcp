@@ -1,15 +1,23 @@
-"""Content-free domain values for canonical provider-attempt accounting.
+"""Content-free provider-attempt facts and their fail-open RDS recorder.
 
-This module intentionally contains no recorder, queue, or database I/O.  It
-defines the stable identity and the small allowlisted payload that later hot
-path instrumentation may hand to a fail-open recorder.
+The only request-path operation is a bounded ``Queue.put_nowait``.  All pool
+work, serialization, SQL, retries, and stale-start reconciliation run on a
+daemon worker and are deliberately allowed to lose telemetry rather than alter
+provider-call behaviour.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import logging
+import queue
 import re
+import threading
+import time
+from typing import Any, Callable
 from uuid import NAMESPACE_URL, uuid5
+
+import db
 
 
 class AttemptSource(str, Enum):
@@ -94,6 +102,89 @@ _SENSITIVE_PREFIXES = (
     "basic", "sk-", "rk-", "pk-",
 )
 _SENSITIVE_MARKERS = ("api_key", "apikey", "token=", "secret=", "password=")
+
+
+log = logging.getLogger("feedling.provider_attempt_accounting")
+
+_EVENT_COLUMNS = (
+    "attempt_id", "user_id", "call_id", "outer_attempt_ordinal",
+    "inner_attempt_ordinal", "installation_id", "source", "lane", "state",
+    "outcome", "completeness", "requested_provider", "requested_model",
+    "resolved_provider", "resolved_model", "transport", "error_class",
+    "runtime", "job_id", "turn_id", "round_id", "retry_kind",
+    "provider_request_id", "usage_unknown_reason",
+)
+_UPSERT_SQL = """
+INSERT INTO llm_provider_attempts (
+  attempt_id, user_id, call_id, outer_attempt_ordinal, inner_attempt_ordinal,
+  installation_id, source, lane, state, outcome, completeness,
+  requested_provider, requested_model, resolved_provider, resolved_model,
+  transport, error_class, runtime, job_id, turn_id, round_id, retry_kind,
+  provider_request_id, usage_unknown_reason, started_at, finished_at
+) VALUES (
+  %(attempt_id)s, %(user_id)s, %(call_id)s, %(outer_attempt_ordinal)s,
+  %(inner_attempt_ordinal)s, %(installation_id)s, %(source)s, %(lane)s,
+  %(state)s, %(outcome)s, %(completeness)s, %(requested_provider)s,
+  %(requested_model)s, %(resolved_provider)s, %(resolved_model)s,
+  %(transport)s, %(error_class)s, %(runtime)s, %(job_id)s, %(turn_id)s,
+  %(round_id)s, %(retry_kind)s, %(provider_request_id)s,
+  %(usage_unknown_reason)s, now(),
+  CASE WHEN %(state)s = 'completed' THEN now() ELSE NULL END
+)
+ON CONFLICT (attempt_id) DO UPDATE SET
+  installation_id = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.installation_id
+    ELSE EXCLUDED.installation_id END,
+  source = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.source ELSE EXCLUDED.source END,
+  lane = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.lane ELSE EXCLUDED.lane END,
+  state = CASE WHEN llm_provider_attempts.state = 'completed' THEN 'completed'
+    ELSE EXCLUDED.state END,
+  outcome = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.outcome ELSE EXCLUDED.outcome END,
+  completeness = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.completeness ELSE EXCLUDED.completeness END,
+  requested_provider = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.requested_provider ELSE EXCLUDED.requested_provider END,
+  requested_model = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.requested_model ELSE EXCLUDED.requested_model END,
+  resolved_provider = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.resolved_provider ELSE EXCLUDED.resolved_provider END,
+  resolved_model = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.resolved_model ELSE EXCLUDED.resolved_model END,
+  transport = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.transport ELSE EXCLUDED.transport END,
+  error_class = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.error_class ELSE EXCLUDED.error_class END,
+  runtime = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.runtime ELSE EXCLUDED.runtime END,
+  job_id = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.job_id ELSE EXCLUDED.job_id END,
+  turn_id = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.turn_id ELSE EXCLUDED.turn_id END,
+  round_id = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.round_id ELSE EXCLUDED.round_id END,
+  retry_kind = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.retry_kind ELSE EXCLUDED.retry_kind END,
+  provider_request_id = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.provider_request_id ELSE EXCLUDED.provider_request_id END,
+  usage_unknown_reason = CASE WHEN llm_provider_attempts.state = 'completed'
+    AND EXCLUDED.state = 'started' THEN llm_provider_attempts.usage_unknown_reason ELSE EXCLUDED.usage_unknown_reason END,
+  finished_at = CASE WHEN llm_provider_attempts.state = 'completed'
+    THEN llm_provider_attempts.finished_at WHEN EXCLUDED.state = 'completed' THEN now() ELSE NULL END,
+  possibly_billed = CASE WHEN EXCLUDED.state = 'completed' THEN FALSE
+    ELSE llm_provider_attempts.possibly_billed END,
+  updated_at = now()
+"""
+_RECONCILE_STALE_SQL = """
+UPDATE llm_provider_attempts
+SET possibly_billed = TRUE, updated_at = now()
+WHERE state = 'started'
+  AND finished_at IS NULL
+  AND possibly_billed = FALSE
+  AND started_at < now() - (%s * interval '1 second')
+"""
 
 
 def _safe_identifier(
@@ -287,3 +378,220 @@ class ProviderAttemptEvent:
                 else self.usage_unknown_reason.value
             ),
         }
+
+
+class ProviderAttemptRecorder:
+    """A bounded, process-local, deliberately lossy event recorder.
+
+    ``record`` is safe to call from provider code: it never waits for a pool,
+    a database, a worker, or a queue slot, and it always returns ``None``.
+    """
+
+    def __init__(
+        self,
+        *,
+        queue_capacity: int = 1024,
+        batch_size: int = 64,
+        flush_interval: float = 0.05,
+        max_retries: int = 2,
+        retry_backoff: float = 0.05,
+        stale_after_seconds: float = 900,
+        reconcile_interval: float = 60,
+        pool_factory: Callable[[], Any] | None = None,
+        thread_factory: Callable[..., Any] | None = None,
+        sleeper: Callable[[float], None] | None = None,
+    ) -> None:
+        if queue_capacity < 1 or batch_size < 1:
+            raise ValueError("provider_attempt_recorder_capacity_must_be_positive")
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=queue_capacity)
+        self._batch_size = batch_size
+        self._flush_interval = max(0.001, float(flush_interval))
+        self._max_retries = max(0, int(max_retries))
+        self._retry_backoff = max(0.0, float(retry_backoff))
+        self._stale_after_seconds = max(0.0, float(stale_after_seconds))
+        self._reconcile_interval = max(0.0, float(reconcile_interval))
+        self._pool_factory = pool_factory or db.get_pool
+        self._thread_factory = thread_factory or threading.Thread
+        self._sleeper = sleeper or time.sleep
+        self._stop = threading.Event()
+        self._startup_lock = threading.Lock()
+        self._thread: Any | None = None
+        self._dropped_count = 0
+        self._last_diagnostic = 0.0
+        self._last_reconcile = time.monotonic()
+
+    @property
+    def dropped_count(self) -> int:
+        return self._dropped_count
+
+    @property
+    def queue_size(self) -> int:
+        try:
+            return self._queue.qsize()
+        except Exception:  # noqa: BLE001 - diagnostics cannot affect callers
+            return 0
+
+    def record(self, event: ProviderAttemptEvent) -> None:
+        """Enqueue a fact with one non-blocking operation; never raise."""
+        if self._stop.is_set():
+            self._drop("shutdown")
+            return None
+        try:
+            self._queue.put_nowait(event)
+        except queue.Full:
+            self._drop("queue_full")
+            self._ensure_worker()
+            return None
+        except Exception:  # noqa: BLE001 - custom queue/runtime failures are telemetry-only
+            self._drop("queue_failure")
+            return None
+        self._ensure_worker()
+        return None
+
+    def shutdown(self, timeout: float = 1.0) -> bool:
+        """Request bounded drain/exit and never propagate shutdown failures."""
+        self._stop.set()
+        thread = self._thread
+        if thread is None:
+            return True
+        try:
+            thread.join(max(0.0, float(timeout)))
+            return not thread.is_alive()
+        except Exception:  # noqa: BLE001 - process shutdown must remain safe
+            return False
+
+    def _ensure_worker(self) -> None:
+        thread = self._thread
+        try:
+            if thread is not None and thread.is_alive():
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        if not self._startup_lock.acquire(blocking=False):
+            return
+        try:
+            thread = self._thread
+            if thread is not None and thread.is_alive():
+                return
+            worker = self._thread_factory(
+                target=self._run,
+                name="provider-attempt-recorder",
+                daemon=True,
+            )
+            worker.start()
+            self._thread = worker
+        except Exception:  # noqa: BLE001 - daemon startup is non-essential telemetry
+            self._drop("worker_start_failure")
+        finally:
+            self._startup_lock.release()
+
+    def _run(self) -> None:
+        try:
+            while True:
+                batch = self._next_batch()
+                if batch:
+                    self._write_batch(batch)
+                self._reconcile_if_due()
+                if self._stop.is_set() and not batch and self.queue_size == 0:
+                    return
+        except Exception:  # noqa: BLE001 - a recorder crash must not cross its thread boundary
+            self._diagnostic("worker_crash")
+
+    def _next_batch(self) -> list[Any]:
+        try:
+            first = self._queue.get(timeout=self._flush_interval)
+        except queue.Empty:
+            return []
+        except Exception:  # noqa: BLE001
+            self._drop("queue_read_failure")
+            return []
+        batch = [first]
+        while len(batch) < self._batch_size:
+            try:
+                batch.append(self._queue.get_nowait())
+            except queue.Empty:
+                break
+            except Exception:  # noqa: BLE001
+                self._diagnostic("queue_read_failure")
+                break
+        return batch
+
+    def _write_batch(self, events: list[Any]) -> None:
+        rows: list[dict[str, object]] = []
+        for event in events:
+            try:
+                row = event.as_row()
+                if tuple(row) != _EVENT_COLUMNS:
+                    raise ValueError("provider_attempt_row_shape")
+                rows.append(row)
+            except Exception:  # noqa: BLE001 - malformed telemetry is dropped off-path
+                self._drop("serialization_failure")
+        if not rows:
+            return
+        for attempt in range(self._max_retries + 1):
+            try:
+                pool = self._pool_factory()
+                with pool.connection() as connection:
+                    with connection.cursor() as cursor:
+                        cursor.executemany(_UPSERT_SQL, rows)
+                return
+            except Exception:  # noqa: BLE001 - RDS failures are intentionally fail-open
+                if attempt == self._max_retries:
+                    self._drop("database_failure", len(rows))
+                    return
+                self._sleeper(self._retry_backoff * (2 ** attempt))
+
+    def _reconcile_if_due(self) -> None:
+        now = time.monotonic()
+        if now - self._last_reconcile < self._reconcile_interval:
+            return
+        self._last_reconcile = now
+        try:
+            pool = self._pool_factory()
+            with pool.connection() as connection:
+                connection.execute(_RECONCILE_STALE_SQL, (self._stale_after_seconds,))
+        except Exception:  # noqa: BLE001 - background cleanup never impacts event recording
+            self._diagnostic("reconcile_failure")
+
+    def _drop(self, reason: str, count: int = 1) -> None:
+        self._dropped_count += count
+        self._diagnostic(reason)
+
+    def _diagnostic(self, reason: str) -> None:
+        now = time.monotonic()
+        if now - self._last_diagnostic < 60:
+            return
+        self._last_diagnostic = now
+        log.warning("provider attempt recorder event dropped or deferred: %s", reason)
+
+
+_recorder: ProviderAttemptRecorder | None = None
+_recorder_lock = threading.Lock()
+
+
+def record_provider_attempt(event: ProviderAttemptEvent) -> None:
+    """Record one fact through the process singleton without changing callers."""
+    global _recorder
+    recorder = _recorder
+    if recorder is None:
+        if not _recorder_lock.acquire(blocking=False):
+            return None
+        try:
+            if _recorder is None:
+                _recorder = ProviderAttemptRecorder()
+            recorder = _recorder
+        except Exception:  # noqa: BLE001 - singleton construction is optional telemetry
+            return None
+        finally:
+            _recorder_lock.release()
+    try:
+        recorder.record(event)
+    except Exception:  # noqa: BLE001 - preserve provider call behaviour
+        return None
+    return None
+
+
+def shutdown_provider_attempt_recorder(timeout: float = 1.0) -> bool:
+    """Stop the singleton during controlled process shutdown."""
+    recorder = _recorder
+    return True if recorder is None else recorder.shutdown(timeout)
