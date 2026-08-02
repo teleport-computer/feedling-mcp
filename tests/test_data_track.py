@@ -1166,6 +1166,150 @@ def test_detail_payload_exposes_content_free_route_errors_and_notice_summaries(c
     assert "private-dedupe" not in serialized
 
 
+def test_detail_payload_exposes_content_free_v2_profile_status_true_pg(client):
+    from model_api_runtime.v2 import profile_store
+
+    user_id, _api_key = _register(client)
+    endpoint = f"/v1/admin/data-track/users/{user_id}"
+
+    missing = client.get(endpoint, headers=_admin_headers())
+    assert missing.status_code == 200
+    assert missing.get_json()["user"]["v2_profile"] == {"state": "missing"}
+
+    pending_doc = profile_store.build_profile_document(
+        user_id,
+        state="pending",
+        source={
+            "card_count": 7,
+            "max_updated_at": "2026-08-01T10:00:00Z",
+            "generated_at": "2026-08-01T10:01:00Z",
+        },
+        last_attempt={
+            "at": "2026-08-01T10:01:00Z",
+            "reject_code": "provider_retry",
+            "attempts": 2,
+            "retry_not_before": 1_785_580_860,
+        },
+        disabled=False,
+    )
+    db.set_blob(user_id, profile_store.PROFILE_BLOB_KIND, pending_doc)
+
+    pending = client.get(endpoint, headers=_admin_headers())
+    assert pending.status_code == 200
+    assert pending.get_json()["user"]["v2_profile"] == {
+        "state": "pending",
+        "memory_chars": 0,
+        "user_chars": 0,
+        "source": {
+            "card_count": 7,
+            "max_updated_at": "2026-08-01T10:00:00Z",
+            "generated_at": "2026-08-01T10:01:00Z",
+        },
+        "last_attempt": {
+            "reject_code": "provider_retry",
+            "attempts": 2,
+            "retry_not_before": 1_785_580_860.0,
+        },
+        "disabled": False,
+    }
+
+    ok_doc = profile_store.build_profile_document(
+        user_id,
+        state="ok",
+        source={
+            "card_count": 8,
+            "max_updated_at": "2026-08-02T10:00:00Z",
+            "generated_at": "2026-08-02T10:01:00Z",
+        },
+        last_attempt={
+            "at": "2026-08-02T10:01:00Z",
+            "reject_code": "",
+            "attempts": 3,
+            "retry_not_before": 0,
+        },
+        memory_text="private memory profile",
+        user_text="private user profile",
+        seal_text=lambda _uid, text: {
+            "body_ct": f"private-ciphertext-{len(text)}",
+            "nonce": "private-nonce",
+        },
+        disabled=True,
+    )
+    db.set_blob(user_id, profile_store.PROFILE_BLOB_KIND, ok_doc)
+
+    ok = client.get(endpoint, headers=_admin_headers())
+    assert ok.status_code == 200
+    user_detail = ok.get_json()["user"]
+    profile = user_detail["v2_profile"]
+    assert profile == {
+        "state": "ok",
+        "memory_chars": len("private memory profile"),
+        "user_chars": len("private user profile"),
+        "source": {
+            "card_count": 8,
+            "max_updated_at": "2026-08-02T10:00:00Z",
+            "generated_at": "2026-08-02T10:01:00Z",
+        },
+        "last_attempt": {
+            "reject_code": "",
+            "attempts": 3,
+            "retry_not_before": 0.0,
+        },
+        "disabled": True,
+    }
+    serialized = json.dumps(user_detail, sort_keys=True)
+    assert "envelope" not in serialized
+    assert "body_ct" not in serialized
+    assert "private" not in serialized
+
+
+def test_v2_profile_detail_is_allowlisted_truncated_and_read_safe(monkeypatch):
+    from admin import data_track as data_track
+
+    monkeypatch.setattr(
+        data_track.db,
+        "get_blob_strict",
+        lambda *_args: {
+            "state": "degraded",
+            "memory": {"chars": 4, "envelope": {"body_ct": "secret"}},
+            "user": {"chars": 5, "envelope": {"body_ct": "secret"}},
+            "source": {
+                "card_count": 6,
+                "max_updated_at": "latest",
+                "generated_at": "generated",
+                "private_source": "secret",
+            },
+            "last_attempt": {
+                "reject_code": "r" * 200,
+                "attempts": 7,
+                "retry_not_before": 8,
+                "private_error": "secret",
+            },
+            "disabled": False,
+            "plaintext": "secret",
+        },
+    )
+
+    detail = data_track._v2_profile_detail("usr_test")
+    assert detail["last_attempt"]["reject_code"] == "r" * 160
+    assert set(detail) == {
+        "state", "memory_chars", "user_chars", "source", "last_attempt", "disabled"
+    }
+    assert set(detail["source"]) == {
+        "card_count", "max_updated_at", "generated_at"
+    }
+    assert set(detail["last_attempt"]) == {
+        "reject_code", "attempts", "retry_not_before"
+    }
+    assert "secret" not in json.dumps(detail, sort_keys=True)
+
+    def _fail(*_args):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(data_track.db, "get_blob_strict", _fail)
+    assert data_track._v2_profile_detail("usr_test") == {"state": "read_error"}
+
+
 def test_detail_payload_exposes_capture_validation_decisions(client):
     from admin import data_track as data_track
 

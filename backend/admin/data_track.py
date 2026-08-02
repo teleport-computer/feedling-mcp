@@ -2,6 +2,7 @@
 
 import json
 import hashlib
+import math
 import re
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -1360,6 +1361,79 @@ def _v2_chat_failures_detail(user_id: str) -> dict:
         return {"error": f"{type(e).__name__}:{str(e)[:120]}"}
 
 
+def _v2_profile_detail(user_id: str) -> dict:
+    """Return the Runtime V2 profile's content-free support metadata only.
+
+    The encrypted ``memory`` / ``user`` envelope bodies are deliberately not
+    copied, validated, or decrypted here.  Keep this as an explicit allowlist:
+    a future field added to the stored profile must not automatically become
+    visible through the admin detail endpoint.
+    """
+    try:
+        from model_api_runtime.v2 import profile_store as _v2_profile_store
+
+        document = db.get_blob_strict(
+            str(user_id),
+            _v2_profile_store.PROFILE_BLOB_KIND,
+        )
+    except Exception:  # noqa: BLE001 — observability must never 500 the page
+        return {"state": "read_error"}
+
+    if document is None:
+        return {"state": "missing"}
+    if not isinstance(document, dict):
+        return {"state": "read_error"}
+
+    state = str(document.get("state") or "")
+    if state not in {"ok", "pending", "degraded", "empty"}:
+        return {"state": "read_error"}
+
+    def _count(value) -> int:
+        if isinstance(value, bool):
+            return 0
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    def _retry_at(value) -> float:
+        try:
+            parsed = float(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return parsed if math.isfinite(parsed) and parsed >= 0 else 0.0
+
+    source = document.get("source")
+    if not isinstance(source, dict):
+        source = {}
+    last_attempt = document.get("last_attempt")
+    if not isinstance(last_attempt, dict):
+        last_attempt = {}
+    memory = document.get("memory")
+    if not isinstance(memory, dict):
+        memory = {}
+    user = document.get("user")
+    if not isinstance(user, dict):
+        user = {}
+
+    return {
+        "state": state,
+        "memory_chars": _count(memory.get("chars")),
+        "user_chars": _count(user.get("chars")),
+        "source": {
+            "card_count": _count(source.get("card_count")),
+            "max_updated_at": str(source.get("max_updated_at") or ""),
+            "generated_at": str(source.get("generated_at") or ""),
+        },
+        "last_attempt": {
+            "reject_code": str(last_attempt.get("reject_code") or "")[:160],
+            "attempts": _count(last_attempt.get("attempts")),
+            "retry_not_before": _retry_at(last_attempt.get("retry_not_before")),
+        },
+        "disabled": document.get("disabled") is True,
+    }
+
+
 def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) -> dict:
     user_id = str(user_entry.get("user_id") or "")
     store = core_store.get_store(user_id)
@@ -1484,6 +1558,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         row["notice_summaries"] = _notice_summaries(user_id)
         row["provider_attempt_ledger"] = _provider_attempts_detail(store)
         row["v2_chat_failures"] = _v2_chat_failures_detail(user_id)
+        row["v2_profile"] = _v2_profile_detail(user_id)
         row["memory_capture_validation"] = _memory_capture_validation_detail(store)
         _ps = store.load_proactive_settings()
         row["perception_permissions"] = {
