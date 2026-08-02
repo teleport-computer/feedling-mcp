@@ -91,6 +91,15 @@ _IO_CLI_VERBS = (
     "memory-delete",
     "schedule-wake",
     "cancel-wake",
+    # web-search/web-fetch: the V1 web capability. Adding them here is the STATIC
+    # Bash allow-rule ONLY — it lets claude's --allowed-tools call io_cli without a
+    # per-turn approval prompt, and the user's mid-session on/off toggle needs no
+    # respawn. It is NOT the authorization boundary: that is re-checked server-side
+    # on every call (web/execution_core: user switch + operator kill switch, fail
+    # closed). Until the V1 supervisor token carries the "web" scope (a later
+    # batch), the endpoint 403s — the allow-rule is harmless before then.
+    "web-search",
+    "web-fetch",
 )
 # Host-side resident sessions rotate at this many turns (vs the shared consumer
 # default of 40) so the persona file re-grounds voice more often within a long
@@ -145,7 +154,9 @@ _AGENT_PROMPT_FALLBACK_COMMANDS = (
     "python {io_cli} chat-image --id <message_id>\n"
     "python {io_cli} send-file --path <source_path> --name <download_name>\n"
     "python {io_cli} schedule-wake --at <time> [--reason <text>] [--tz <tz>]\n"
-    "python {io_cli} cancel-wake --wake-id <id> [--reason <text>]"
+    "python {io_cli} cancel-wake --wake-id <id> [--reason <text>]\n"
+    "python {io_cli} web-search <query> [--limit <n>]\n"
+    "python {io_cli} web-fetch <url>"
 )
 
 # Module-level memo of the live catalog text, keyed by io_cli path (in practice
