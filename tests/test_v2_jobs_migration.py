@@ -163,6 +163,16 @@ def test_0076_provider_attempt_schema_is_content_free_and_deletion_safe():
                 "'gpt-test','gpt-test','responses','chat','started','runtime_recorder')",
                 (uid,),
             )
+            conn.execute(
+                "INSERT INTO llm_provider_attempts "
+                "(attempt_id,user_id,call_id,outer_attempt_ordinal,inner_attempt_ordinal,"
+                "requested_provider,resolved_provider,requested_model,resolved_model,"
+                "transport,lane,state,source) "
+                "VALUES ('33333333-3333-5333-8333-333333333333',%s,"
+                "'call-profile-0076',1,0,'openai','openai','gpt-test','gpt-test',"
+                "'responses','profile','started','runtime_recorder')",
+                (uid,),
+            )
             with pytest.raises(psycopg.errors.UniqueViolation):
                 conn.execute(
                     "INSERT INTO llm_provider_attempts "

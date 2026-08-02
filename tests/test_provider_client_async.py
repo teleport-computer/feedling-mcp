@@ -235,6 +235,96 @@ def test_inner_and_outer_retries_keep_stable_attempt_ids_without_trace_duplicate
     assert all_runs[0] == all_runs[1]
 
 
+def test_inner_attempt_is_terminal_before_compatibility_retry_decision(monkeypatch):
+    recorded = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"error": {"message": "`temperature` is deprecated"}},
+        )
+
+    def crash_before_retry(*_args, **_kwargs):
+        assert [event.state for event in recorded] == [
+            AttemptState.STARTED,
+            AttemptState.COMPLETED,
+        ]
+        assert recorded[-1].revision == 1
+        raise RuntimeError("crash before compatibility retry")
+
+    _mock_async_client(monkeypatch, handler)
+    monkeypatch.setattr(provider_client, "record_provider_attempt", recorded.append)
+    monkeypatch.setattr(provider_client, "_compatibility_fallback", crash_before_retry)
+
+    with pytest.raises(RuntimeError, match="crash before compatibility retry"):
+        asyncio.run(
+            provider_client.chat_completion_async(
+                _accounted_config(),
+                [{"role": "user", "content": "hi"}],
+                temperature=0.1,
+            )
+        )
+
+
+def test_postprocess_enrichment_uses_higher_revision_without_rewriting_http_outcome(
+    monkeypatch,
+):
+    recorded = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"not-json")
+
+    _mock_async_client(monkeypatch, handler)
+    monkeypatch.setattr(provider_client, "record_provider_attempt", recorded.append)
+
+    with pytest.raises(provider_client.ProviderError, match="non-json"):
+        asyncio.run(
+            provider_client.chat_completion_async(
+                _accounted_config(),
+                [{"role": "user", "content": "hi"}],
+            )
+        )
+
+    terminal = [event for event in recorded if event.state is AttemptState.COMPLETED]
+    assert [event.revision for event in terminal] == [1, 2]
+    assert [event.outcome for event in terminal] == [
+        AttemptOutcome.SUCCEEDED,
+        AttemptOutcome.SUCCEEDED,
+    ]
+    assert terminal[1].finished_at == terminal[0].finished_at
+    assert terminal[1].error_class.value == "protocol"
+
+
+def test_usage_normalization_failure_still_emits_terminal_unknown_revision(monkeypatch):
+    recorded = []
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": {"message": "retry"}})
+
+    _mock_async_client(monkeypatch, handler)
+    monkeypatch.setattr(provider_client, "record_provider_attempt", recorded.append)
+    monkeypatch.setattr(
+        provider_client,
+        "_attempt_usage_from_response",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("normalizer failed")),
+    )
+
+    with pytest.raises(provider_client.ProviderError):
+        asyncio.run(
+            provider_client.chat_completion_async(
+                _accounted_config(),
+                [{"role": "user", "content": "hi"}],
+            )
+        )
+
+    completed = [event for event in recorded if event.state is AttemptState.COMPLETED]
+    assert len(completed) == 1
+    assert completed[0].revision == 1
+    assert completed[0].outcome is AttemptOutcome.FAILED
+    assert completed[0].usage_known is False
+    assert completed[0].usage_unknown_reason.value == "request_failed"
+
+
 def test_accounting_failure_cannot_change_provider_retry_order_or_result(monkeypatch):
     statuses = [503, 200]
     dispatches = []

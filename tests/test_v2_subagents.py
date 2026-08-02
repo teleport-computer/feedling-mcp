@@ -14,6 +14,10 @@ from model_api_runtime.v2 import subagents  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
 from capabilities import registry as cap_registry  # noqa: E402
 import provider_client  # noqa: E402
+from provider_attempt_accounting import (  # noqa: E402
+    AttemptLane,
+    ProviderAttemptContext,
+)
 from provider_types import ToolCall  # noqa: E402
 
 
@@ -51,6 +55,78 @@ def test_task_batch_runs_in_parallel_and_preserves_provider_order() -> None:
         "done:one",
         "done:two",
     ]
+
+
+def test_task_batch_rejects_duplicate_child_ids_before_parallel_execution() -> None:
+    called = False
+
+    async def child(_task):
+        nonlocal called
+        called = True
+        return subagents.ChildTaskResult(summary="unexpected")
+
+    with pytest.raises(subagents.SubagentBatchError, match="duplicate child id"):
+        asyncio.run(
+            subagents.run_task_batch(
+                [_call("same-child", "one"), _call("same-child", "two")],
+                run_child=child,
+            )
+        )
+
+    assert called is False
+
+
+def test_parallel_children_use_stable_distinct_provider_attempt_scopes(monkeypatch):
+    runs = []
+
+    async def provider(config, _messages, **_kwargs):
+        runs[-1].append(config.provider_attempt_context.call_id)
+        await asyncio.sleep(0 if "f8e12151a40f3d13" in config.provider_attempt_context.call_id else 0.01)
+        return {"reply": "done", "tool_calls": [], "usage": {}}
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    base = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-test",
+        api_key="secret",
+        provider_attempt_context=ProviderAttemptContext(
+            user_id="usr_subagent_attempts",
+            lane=AttemptLane.CHAT,
+            job_id=73,
+            call_id="v2job:73:base",
+            turn_id="v2job:73",
+        ),
+    )
+
+    async def redelivery():
+        for _ in range(2):
+            runs.append([])
+            dispatcher = worker._make_task_batch_dispatcher(
+                disabled_web_tool_names=frozenset(),
+                provider_config=base,
+                store=object(),
+                api_key=None,
+                runtime_token="runtime-token",
+                enclave_sem=asyncio.Semaphore(1),
+                trusted_system_blocks=(),
+                add_usage=lambda _usage: None,
+            )
+            await dispatcher([
+                _call("child-left", "left private task"),
+                _call("child-right", "right private task"),
+            ])
+            # Provider tool-call ids are sibling-unique, but a provider may
+            # reuse one in a later logical round.  A later batch must not
+            # overwrite the first batch's child-attempt rows.
+            await dispatcher([
+                _call("child-left", "later left private task"),
+                _call("child-right", "later right private task"),
+            ])
+
+    asyncio.run(redelivery())
+
+    assert len(set(runs[0])) == 4
+    assert runs[0] == runs[1]
 
 
 def test_task_batch_isolates_failure_and_deadline() -> None:

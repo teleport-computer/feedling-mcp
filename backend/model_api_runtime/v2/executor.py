@@ -163,6 +163,7 @@ async def dispatch_tool_calls(
                         observation = await observe_photo(
                             str(payload.get("image_media_type") or "image/jpeg"),
                             image_b64,
+                            call_id=tc.id,
                         )
                     except Exception as exc:  # noqa: BLE001 — stable error below
                         return tc.id, ToolResult(

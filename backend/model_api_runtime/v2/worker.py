@@ -3524,13 +3524,27 @@ def _make_task_batch_dispatcher(
         budget.complete_provider_call(usage)
         add_usage(usage)
 
+    task_batch_ordinal = 0
+
     async def _dispatch(task_calls) -> list[ToolResult]:
+        nonlocal task_batch_ordinal
+        task_batch_ordinal += 1
+        current_batch_ordinal = task_batch_ordinal
+
         async def _run_child(task: v2_subagents.ChildTask):
             # ``task`` schema and run_task_batch both reject overlay today. Keep
             # this independent runtime check so a forged/internal caller cannot
             # acquire write authority through a future parser regression.
             if task.workspace_mode != "read_only":
                 raise RuntimeError("subagent workspace writes unavailable")
+
+            child_scope = hashlib.sha256(
+                f"{current_batch_ordinal}:{task.call_id}".encode("utf-8")
+            ).hexdigest()[:16]
+            scoped_child_provider_config = provider_client.with_provider_attempt_scope(
+                child_provider_config,
+                scope_id=f"subagent:{child_scope}",
+            )
 
             child_recorder = (
                 trajectory_recorder.scoped(f"subagent:{task.call_id}")
@@ -3655,7 +3669,7 @@ def _make_task_batch_dispatcher(
                 working_memory="",
             )
             outcome = await v2_tool_loop.run_tool_loop(
-                provider_config=child_provider_config,
+                provider_config=scoped_child_provider_config,
                 build_messages=build_messages,
                 dispatch_tools=_child_dispatch,
                 on_reply=_capture_child_reply,
@@ -3729,15 +3743,37 @@ def _make_photo_observer(
     api_key: str | None,
     runtime_token: str,
 ):
-    async def _observe(image_mime: str, image_b64: str) -> str:
+    call_invocations: dict[str, int] = {}
+
+    async def _observe(
+        image_mime: str,
+        image_b64: str,
+        *,
+        call_id: str,
+    ) -> str:
         if deps.observe_photo is None:
             raise _PhotoObserverUnavailable("photo observer is not wired")
+        accounted_config = provider_config
+        attempt_context = getattr(provider_config, "provider_attempt_context", None)
+        if attempt_context is not None:
+            invocation = call_invocations.get(call_id, 0) + 1
+            call_invocations[call_id] = invocation
+            call_digest = hashlib.sha256(
+                f"{call_id}:{invocation}".encode("utf-8")
+            ).hexdigest()[:16]
+            accounted_config = provider_client.with_provider_attempt_call(
+                provider_config,
+                call_id=(
+                    f"v2job:{attempt_context.job_id}:vision-tool:{call_digest}"
+                ),
+                round_id=f"vision-tool:{call_digest}",
+            )
         return await asyncio.to_thread(
             deps.observe_photo,
             user_id,
             image_mime=image_mime,
             image_b64=image_b64,
-            main_provider_config=provider_config,
+            main_provider_config=accounted_config,
             api_key=api_key,
             runtime_token=runtime_token,
         )
@@ -4812,6 +4848,7 @@ async def _rebalance_summary_frontier(
             return await asyncio.to_thread(frontier_reader, user_id)
 
     no_progress = 0
+    checkpoint_invocations: dict[str, int] = {}
     for _pass in range(_SUMMARY_ROLLUP_MAX_PASSES):
         snapshot = await _read_frontier()
         if snapshot is None:
@@ -4833,7 +4870,12 @@ async def _rebalance_summary_frontier(
 
         _report_turn_progress("summary_checkpoint_start")
         checkpoint_messages = [item.text for item in candidate.children]
-        checkpoint_call_ordinal = 0
+        checkpoint_work_identity = hashlib.sha256(
+            (
+                f"{snapshot.head_version}:"
+                + ",".join(str(value) for value in candidate.child_segment_ids)
+            ).encode("utf-8")
+        ).hexdigest()[:16]
 
         async def _recording_checkpoint_llm(*args: Any, **kwargs: Any) -> Any:
             # A legacy aggregate may require several bounded map/reduce calls.
@@ -4854,8 +4896,12 @@ async def _rebalance_summary_frontier(
                 raise RuntimeModeChanged(
                     "user rolled back during summary checkpoint"
                 )
-            nonlocal checkpoint_call_ordinal
-            checkpoint_call_ordinal += 1
+            checkpoint_call_ordinal = (
+                checkpoint_invocations.get(checkpoint_work_identity, 0) + 1
+            )
+            checkpoint_invocations[checkpoint_work_identity] = (
+                checkpoint_call_ordinal
+            )
             messages = args[1] if len(args) > 1 else kwargs.get("messages", [])
             await _record_trajectory(
                 trajectory_recorder,
@@ -4874,7 +4920,7 @@ async def _rebalance_summary_frontier(
                     attempt_call_id=_provider_attempt_call_id(
                         provider_config,
                         "checkpoint",
-                        f"{candidate.parent_level}-{candidate.start_seq}-{candidate.end_seq}",
+                        checkpoint_work_identity,
                         checkpoint_call_ordinal,
                     ),
                     **kwargs,
@@ -5172,6 +5218,9 @@ async def _read_seq_adaptive_prompt_context(
             read_images=deps.read_images,
             active_image_ids=active_image_ids,
             read_vision_observations=deps.read_vision_observations,
+            provider_attempt_context=getattr(
+                provider_config, "provider_attempt_context", None
+            ),
         )
         tail = await asyncio.to_thread(
             _inject_tail_files,
@@ -5187,6 +5236,9 @@ async def _read_seq_adaptive_prompt_context(
                 read_images=deps.read_images,
                 active_image_ids=active_image_ids,
                 read_vision_observations=deps.read_vision_observations,
+                provider_attempt_context=getattr(
+                    provider_config, "provider_attempt_context", None
+                ),
             )
             optional_rows = await asyncio.to_thread(
                 _inject_tail_files,
@@ -6242,6 +6294,7 @@ async def _ensure_prompt_coverage(
     # call per job rediscovering the same limit.  Unmeasured conversations get
     # the configured batch size, so the healthy path is unchanged.
     batch_cap = await _load_batch_cap(user_id)
+    catchup_invocations: dict[str, int] = {}
 
     def _note_reject(code: str) -> None:
         nonlocal last_reject_code
@@ -6578,11 +6631,15 @@ async def _ensure_prompt_coverage(
             and len(summary_fields) >= 4
         )
         catchup_batch_identity = _provider_batch_identity(old)
-        catchup_call_ordinal = 0
+        catchup_work_identity = (
+            f"{version}:{watermark_seq}:{catchup_batch_identity}"
+        )
 
         async def _recording_catchup_llm(*args: Any, **kwargs: Any) -> Any:
-            nonlocal catchup_call_ordinal
-            catchup_call_ordinal += 1
+            catchup_call_ordinal = (
+                catchup_invocations.get(catchup_work_identity, 0) + 1
+            )
+            catchup_invocations[catchup_work_identity] = catchup_call_ordinal
             messages = args[1] if len(args) > 1 else kwargs.get("messages", [])
             await _record_trajectory(
                 trajectory_recorder,
@@ -7001,6 +7058,9 @@ async def _run_wake(
                     read_images=deps.read_images,
                     active_image_ids=set(),
                     read_vision_observations=deps.read_vision_observations,
+                    provider_attempt_context=getattr(
+                        provider_config, "provider_attempt_context", None
+                    ),
                 )
                 tail = await asyncio.to_thread(
                     _inject_tail_files,
@@ -9410,6 +9470,7 @@ def _inject_tail_images(
     read_images,
     active_image_ids: set[str] | None = None,
     read_vision_observations=None,
+    provider_attempt_context=None,
 ) -> list[dict]:
     """Materialize V2 image rows without crossing the selected privacy route.
 
@@ -9438,7 +9499,16 @@ def _inject_tail_images(
         if read_vision_observations is None:
             raise DedicatedVisionUnavailable("vision observer is not wired")
         try:
-            observations = read_vision_observations(user_id, dedicated_targets) or {}
+            if provider_attempt_context is None:
+                observations = read_vision_observations(
+                    user_id, dedicated_targets
+                ) or {}
+            else:
+                observations = read_vision_observations(
+                    user_id,
+                    dedicated_targets,
+                    provider_attempt_context=provider_attempt_context,
+                ) or {}
         except Exception as exc:  # noqa: BLE001 — stable V2 failure surface below
             safe_code = str(
                 getattr(exc, "error_code", "") or "vision_model_failed"
@@ -10227,6 +10297,9 @@ async def process_job(
                             if row.get("has_image") and row.get("id")
                         },
                         read_vision_observations=deps.read_vision_observations,
+                        provider_attempt_context=getattr(
+                            provider_config, "provider_attempt_context", None
+                        ),
                     )
                     tail = await asyncio.to_thread(
                         _inject_tail_files,

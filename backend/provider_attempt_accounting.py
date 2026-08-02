@@ -36,6 +36,7 @@ class AttemptLane(str, Enum):
     MAINTENANCE = "maintenance"
     CAPTURE = "capture"
     DREAM = "dream"
+    PROFILE = "profile"
     TRAJECTORY_REVIEW = "trajectory_review"
     UNKNOWN = "unknown"
 
@@ -118,7 +119,7 @@ _EVENT_COLUMNS = (
     "started_at", "finished_at", "input_tokens", "output_tokens",
     "reasoning_tokens", "cache_read_tokens", "cache_write_tokens",
     "cache_miss_tokens", "usage_known", "possibly_billed", "latency_ms",
-    "ttft_ms",
+    "ttft_ms", "revision",
 )
 _UPSERT_SQL = """
 INSERT INTO llm_provider_attempts (
@@ -129,7 +130,7 @@ INSERT INTO llm_provider_attempts (
   provider_request_id, usage_unknown_reason, started_at, finished_at,
   input_tokens, output_tokens, reasoning_tokens, cache_read_tokens,
   cache_write_tokens, cache_miss_tokens, usage_known, possibly_billed,
-  latency_ms, ttft_ms
+  latency_ms, ttft_ms, revision
 ) VALUES (
   %(attempt_id)s, %(user_id)s, %(call_id)s, %(outer_attempt_ordinal)s,
   %(inner_attempt_ordinal)s, %(installation_id)s, %(source)s, %(lane)s,
@@ -140,7 +141,8 @@ INSERT INTO llm_provider_attempts (
   %(usage_unknown_reason)s, %(started_at)s, %(finished_at)s,
   %(input_tokens)s, %(output_tokens)s, %(reasoning_tokens)s,
   %(cache_read_tokens)s, %(cache_write_tokens)s, %(cache_miss_tokens)s,
-  %(usage_known)s, %(possibly_billed)s, %(latency_ms)s, %(ttft_ms)s
+  %(usage_known)s, %(possibly_billed)s, %(latency_ms)s, %(ttft_ms)s,
+  %(revision)s
 )
 ON CONFLICT (attempt_id) DO UPDATE SET
   installation_id = CASE WHEN llm_provider_attempts.state = 'completed'
@@ -207,7 +209,9 @@ ON CONFLICT (attempt_id) DO UPDATE SET
   possibly_billed = CASE WHEN llm_provider_attempts.state = 'completed'
     AND EXCLUDED.state = 'started' THEN llm_provider_attempts.possibly_billed
     ELSE EXCLUDED.possibly_billed END,
+  revision = EXCLUDED.revision,
   updated_at = now()
+WHERE EXCLUDED.revision > llm_provider_attempts.revision
 """
 _RECONCILE_STALE_SQL = """
 UPDATE llm_provider_attempts
@@ -273,6 +277,7 @@ class ProviderAttemptContext:
     runtime: str = "hosted_v2"
     turn_id: str | None = None
     round_id: str | None = None
+    scope_id: str | None = None
 
     def __post_init__(self) -> None:
         _safe_identifier("user_id", self.user_id, _INSTALLATION_ID)
@@ -291,6 +296,7 @@ class ProviderAttemptContext:
         _safe_identifier("runtime", self.runtime, _RUNTIME, optional=True)
         _safe_identifier("turn_id", self.turn_id, _CALL_ID, optional=True)
         _safe_identifier("round_id", self.round_id, _CALL_ID, optional=True)
+        _safe_identifier("scope_id", self.scope_id, _CALL_ID, optional=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,6 +339,7 @@ class ProviderAttemptEvent:
     possibly_billed: bool = False
     latency_ms: float | None = None
     ttft_ms: float | None = None
+    revision: int = 0
 
     def __post_init__(self) -> None:
         """Keep direct dataclass construction inside the content-free contract."""
@@ -389,6 +396,14 @@ class ProviderAttemptEvent:
         for name in ("usage_known", "possibly_billed"):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name}_must_be_boolean")
+        if (
+            not isinstance(self.revision, int)
+            or isinstance(self.revision, bool)
+            or self.revision < 0
+        ):
+            raise ValueError("revision_must_be_nonnegative_integer")
+        if self.state is AttemptState.COMPLETED and self.revision < 1:
+            raise ValueError("completed_revision_must_be_positive")
         for name in ("latency_ms", "ttft_ms"):
             value = getattr(self, name)
             if value is not None and (
@@ -454,6 +469,7 @@ class ProviderAttemptEvent:
         possibly_billed: bool = False,
         latency_ms: float | None = None,
         ttft_ms: float | None = None,
+        revision: int | None = None,
     ) -> "ProviderAttemptEvent":
         _safe_identifier("user_id", user_id, _INSTALLATION_ID)
         for value, enum_type in (
@@ -491,6 +507,11 @@ class ProviderAttemptEvent:
         actual_finished_at = finished_at
         if state is AttemptState.COMPLETED and actual_finished_at is None:
             actual_finished_at = datetime.now(timezone.utc)
+        actual_revision = (
+            (1 if state is AttemptState.COMPLETED else 0)
+            if revision is None
+            else revision
+        )
         return cls(
             attempt_id=stable_attempt_id(
                 call_id, outer_attempt_ordinal, inner_attempt_ordinal,
@@ -530,6 +551,7 @@ class ProviderAttemptEvent:
             possibly_billed=possibly_billed,
             latency_ms=latency_ms,
             ttft_ms=ttft_ms,
+            revision=actual_revision,
         )
 
     def as_row(self) -> dict[str, object]:
@@ -574,6 +596,7 @@ class ProviderAttemptEvent:
             "possibly_billed": self.possibly_billed,
             "latency_ms": self.latency_ms,
             "ttft_ms": self.ttft_ms,
+            "revision": self.revision,
         }
 
 

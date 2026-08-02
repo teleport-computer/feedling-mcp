@@ -12,6 +12,11 @@ from model_api_runtime.v2 import prompt_frontier  # noqa: E402
 from model_api_runtime.v2 import compaction  # noqa: E402
 from model_api_runtime.v2 import jobs_store  # noqa: E402
 from model_api_runtime.v2 import worker  # noqa: E402
+import provider_client  # noqa: E402
+from provider_attempt_accounting import (  # noqa: E402
+    AttemptLane,
+    ProviderAttemptContext,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -206,6 +211,97 @@ def test_required_only_overflow_is_not_hidden_by_optional_eviction():
 
     with pytest.raises(prompt_frontier.PromptFrontierExhausted):
         _plan(builder, tokens=32768)
+
+
+def test_repeated_catchup_refusals_use_monotonic_stable_invocation_ids(monkeypatch):
+    rows = [_row(seq, "user", f"row-{seq}") for seq in range(11, 21)]
+    state = {"summary": "- old", "version": 3, "watermark_seq": 10}
+    seen = []
+    monkeypatch.setattr(worker, "_COMPACTION_BATCH", 10)
+    monkeypatch.setattr(worker, "_QUARANTINE_ENABLED", False)
+    monkeypatch.setattr(worker.db, "v2_effective_batch_cap", lambda _uid: 10)
+    monkeypatch.setattr(
+        worker,
+        "_record_provider_success",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "get_summary_row",
+        lambda _uid: {"watermark_seq": state["watermark_seq"]},
+    )
+    monkeypatch.setattr(
+        worker.db,
+        "count_messages_after_seq",
+        lambda _uid, after_seq, **_kwargs: len([
+            row for row in rows if row["seq"] > after_seq
+        ]),
+    )
+
+    async def _llm(config, _messages, **_kwargs):
+        seen.append(config.provider_attempt_context.call_id)
+        return {"reply": "- refused", "usage": {}}
+
+    async def _refuse(
+        *, provider_config, current_summary, old_messages, llm, **_kwargs
+    ):
+        await llm(provider_config, [{"role": "user", "content": "private"}])
+        return current_summary
+
+    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", _llm)
+    monkeypatch.setattr(compaction, "compact", _refuse)
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (None, {}),
+        mint_enclave_token=lambda _uid: "token",
+        read_summary=lambda _uid: (
+            state["summary"],
+            float(state["watermark_seq"]),
+            state["version"],
+        ),
+        read_compaction_tail=lambda _uid, after_seq, limit: [
+            row for row in rows if row["seq"] > after_seq
+        ][:limit],
+        read_tail=lambda *_args, **_kwargs: [],
+        write_summary=lambda *_args, **_kwargs: False,
+    )
+    config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-test",
+        api_key="secret",
+        provider_attempt_context=ProviderAttemptContext(
+            user_id="usr_catchup_ids",
+            lane=AttemptLane.CHAT,
+            job_id=86,
+            call_id="v2job:86:base",
+        ),
+    )
+
+    with pytest.raises(worker.TurnError, match="prompt_coverage_incomplete"):
+        asyncio.run(
+            worker._ensure_prompt_coverage(
+                "usr_catchup_ids",
+                deps,
+                provider_config=config,
+                enclave_sem=None,
+                tail_limit=0,
+                max_retries=3,
+                job_id=86,
+                catchup_deadline_sec=30,
+            )
+        )
+
+    assert seen == [
+        "v2job:86:catchup:5d7e3aeda8c00210:1",
+        "v2job:86:catchup:5d7e3aeda8c00210:2",
+        "v2job:86:catchup:5d7e3aeda8c00210:3",
+        "v2job:86:catchup:2cf96dd241d609ba:1",
+        "v2job:86:catchup:2cf96dd241d609ba:2",
+        "v2job:86:catchup:2cf96dd241d609ba:3",
+        "v2job:86:catchup:4fc82b26aecb47d2:1",
+        "v2job:86:catchup:4fc82b26aecb47d2:2",
+        "v2job:86:catchup:4fc82b26aecb47d2:3",
+    ]
 
 
 def test_targeted_catchup_compacts_exactly_through_safe_boundary(monkeypatch):

@@ -122,8 +122,8 @@ def test_photo_read_with_image_invokes_observer_and_hides_base64(monkeypatch):
             "image_b64": "cGl4ZWxz",
         })
 
-    async def _observe_photo(mime, image_b64):
-        seen.append((mime, image_b64))
+    async def _observe_photo(mime, image_b64, *, call_id):
+        seen.append((mime, image_b64, call_id))
         return "a red bicycle beside a wall"
 
     results, enqueued = _run(
@@ -138,7 +138,7 @@ def test_photo_read_with_image_invokes_observer_and_hides_base64(monkeypatch):
         monkeypatch=monkeypatch,
     )
 
-    assert seen == [("image/jpeg", "cGl4ZWxz")]
+    assert seen == [("image/jpeg", "cGl4ZWxz", "photo-1")]
     assert "UNTRUSTED VISUAL OBSERVATION" in results[0].content
     assert "a red bicycle beside a wall" in results[0].content
     assert "cGl4ZWxz" not in results[0].content
@@ -147,7 +147,7 @@ def test_photo_read_with_image_invokes_observer_and_hides_base64(monkeypatch):
 
 
 def test_photo_read_without_include_image_never_invokes_observer(monkeypatch):
-    async def _observe_photo(*_args):
+    async def _observe_photo(*_args, **_kwargs):
         raise AssertionError("observer must remain pull-on-demand")
 
     results, enqueued = _run(
@@ -176,7 +176,7 @@ def test_photo_read_without_include_image_never_invokes_observer(monkeypatch):
     ],
 )
 def test_photo_observer_failure_exposes_only_stable_code(monkeypatch, exc, expected):
-    async def _observe_photo(*_args):
+    async def _observe_photo(*_args, **_kwargs):
         raise exc
 
     results, _ = _run(

@@ -8,6 +8,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+import provider_client
+from provider_attempt_accounting import AttemptLane, ProviderAttemptContext
 from model_api_runtime.v2 import jobs_store, reaper as v2_reaper, serve_worker, worker
 
 
@@ -131,8 +133,22 @@ def test_temporal_snapshot_uses_perception_then_china_default(monkeypatch):
 
 
 def test_observe_photo_prefers_selected_dedicated_route(monkeypatch):
-    main_config = object()
-    dedicated_config = object()
+    main_config = provider_client.ProviderConfig(
+        provider="openai",
+        model="main-model",
+        api_key="main-key",
+        provider_attempt_context=ProviderAttemptContext(
+            user_id="usr_vision_context",
+            lane=AttemptLane.CHAT,
+            job_id=91,
+            call_id="v2job:91:vision-tool:309ad63028c1da2e",
+        ),
+    )
+    dedicated_config = provider_client.ProviderConfig(
+        provider="openrouter",
+        model="vision-model",
+        api_key="vision-key",
+    )
     seen = []
     monkeypatch.setattr(
         serve_worker.db,
@@ -166,10 +182,14 @@ def test_observe_photo_prefers_selected_dedicated_route(monkeypatch):
     )
 
     assert result == "dedicated observation"
-    assert seen == [
-        ("load", "u-photo", "vision-route", None, "rt-photo"),
-        ("observe", dedicated_config, "image/jpeg", "cGl4ZWxz"),
-    ]
+    assert seen[0] == ("load", "u-photo", "vision-route", None, "rt-photo")
+    observed_config = seen[1][1]
+    assert observed_config.provider == dedicated_config.provider
+    assert observed_config.model == dedicated_config.model
+    assert (
+        observed_config.provider_attempt_context
+        == main_config.provider_attempt_context
+    )
 
 
 def test_observe_photo_falls_back_to_current_main_route(monkeypatch):

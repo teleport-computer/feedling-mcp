@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS llm_provider_attempts (
   ),
   CONSTRAINT ck_llm_provider_attempts_lane CHECK (lane IN (
     'chat','heartbeat','scheduled','manual_wake','screen_watch','maintenance',
-    'capture','dream','trajectory_review','unknown'
+    'capture','dream','profile','trajectory_review','unknown'
   )),
   CONSTRAINT ck_llm_provider_attempts_retry_kind CHECK (retry_kind IN (
     'initial','outer_retry','compatibility_retry','failover'

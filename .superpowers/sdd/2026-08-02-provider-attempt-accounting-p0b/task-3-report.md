@@ -66,12 +66,65 @@
   trajectory review, compaction/checkpoint, and profile generation. The current
   runtime has no separate provider-failover dispatch path; no synthetic
   failover row or ordinal was introduced.
-- The Task 1 lane constraint does not contain the pre-existing `profile` job
-  lane, so profile attempts use the schema's typed `unknown` lane while retaining
-  stable job/call/round identity. Changing that schema constraint is outside
-  Task 3.
+- Profile is now a first-class `AttemptLane.PROFILE` value and migration 0076's
+  lane constraint accepts `profile`; profile calls no longer degrade to
+  `unknown`.
 - No prompt, reply, reasoning text, tool payload, URL/hostname, credential,
   header, stack trace, or raw body was added to the accounting event or RDS row.
   Existing wire bodies remain only in the opt-in encrypted trajectory trace.
-- No Admin Usage/reporting surface, deployment change, migration, retry policy,
-  or provider failover behavior was added.
+- No Admin Usage/reporting surface, deployment change, retry policy, or provider
+  failover behavior was added.
+
+## Fix round 1
+
+### Accepted findings closed
+
+1. **Collision-free child and vision scopes.** Task batches reject duplicate
+   sibling ids before any child runs. Child attempt scopes combine the stable
+   logical task-batch ordinal with the child call id, then hash the result;
+   photo-tool scopes combine the stable tool-call id with its per-id invocation
+   ordinal. Both counters are allocated before an await, so completion order
+   cannot affect identity, and fresh dispatcher/observer instances reproduce
+   the same identities on redelivery. Pinned vision uses the durable message id.
+2. **Synchronous Hosted V2 vision dispatch.** The five sync provider adapters
+   (OpenAI Responses, OpenAI-compatible Chat, Anthropic Messages, Bedrock
+   Converse, and Gemini GenerateContent) now account at their actual HTTP POST
+   seams. Outer retries keep the existing cadence and exception classes while
+   receiving real outer ordinals; compatibility retries receive real inner
+   ordinals.
+3. **Monotonic compaction identities.** Checkpoint and catch-up invocation
+   counters live outside their resetting retry loops and are keyed by stable,
+   content-free work identities. Repeated CAS/refusal work advances ordinals
+   while independent batches each start at one.
+4. **Immediate terminal facts with revision semantics.** Revision 0 is started,
+   revision 1 is the transport terminal fact emitted before any compatibility
+   or outer retry decision, and revision 2 is optional protocol/post-processing
+   enrichment. Usage normalization is fail-open. Revision 2 preserves the
+   revision-1 HTTP outcome and finish time. The SQL upsert accepts only a
+   strictly greater revision, so lower and same-revision replays are no-ops;
+   either revision can insert a missing row independently.
+5. **PROFILE schema lane.** Added `AttemptLane.PROFILE` and `profile` to the
+   0076 schema constraint, with profile runtime and real migration coverage.
+
+### RED / GREEN matrix
+
+| Finding | RED boundary | GREEN boundary |
+| --- | --- | --- |
+| Child scopes | Duplicate ids executed; parallel/replayed children shared `v2job:73:provider:1`; reused ids collided across later batches | Duplicate siblings rejected; four calls across two logical batches are distinct and reproduce exactly on redelivery |
+| Vision scopes / sync seam | Executor did not pass tool id; dedicated/pinned configs lost context; sync retries emitted no rows; reused tool ids collided | Tool/message-derived scopes propagate; same-id later invocation is distinct and replay-stable; real sync retry emits two started/terminal pairs |
+| Checkpoint/catch-up | CAS/refusal retries reset invocation ordinal to one | Per-work counters advance monotonically and remain independent across batches |
+| Terminal/revision | Completed events had no revision; terminal fact was absent at the compatibility-retry decision seam | Revision-1 terminal is present before retry; revision-2 enrichment preserves HTTP facts; usage parser failure still emits terminal unknown usage |
+| PROFILE | Enum access raised `AttributeError`; schema rejected the lane | Domain/runtime tests pass and migration 0076 accepts a real profile row |
+
+### Fix-round verification
+
+- Final combined focused verification against local PostgreSQL — 283 passed.
+- Focused V2/vision set — 197 passed against the local PostgreSQL fixture.
+- Accounting/provider/compaction pure set — 66 passed.
+- Migration plus full recorder set against local PostgreSQL — 20 passed;
+  the real recorder test additionally proves lower and same revisions cannot
+  overwrite a stored revision-2 successful outcome.
+- Collision/replay identity tests — 2 passed after their explicit RED boundary.
+- Ruff passed for all touched files; the legacy `serve_worker.py` import block
+  was checked with its established E402/F401 exclusions. `compileall` and
+  `git diff --check` passed.

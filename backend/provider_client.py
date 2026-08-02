@@ -112,9 +112,19 @@ def reliable_chat_completion(
     """
     attempts = max(1, int(max_attempts))
     last_exc: BaseException | None = None
+    config = args[0] if args and isinstance(args[0], ProviderConfig) else None
+    if config is None and isinstance(kwargs.get("config"), ProviderConfig):
+        config = kwargs["config"]
     for attempt in range(1, attempts + 1):
         try:
-            result = chat_completion(*args, **kwargs)
+            if config is not None and config.provider_attempt_context is not None:
+                result = chat_completion(
+                    *args,
+                    _provider_outer_attempt=attempt,
+                    **kwargs,
+                )
+            else:
+                result = chat_completion(*args, **kwargs)
             return _with_reliable_retry_count(result, attempt - 1)
         except Exception as exc:  # noqa: BLE001 — classify, then re-raise or retry
             cls = classify_provider_error(exc)
@@ -236,6 +246,21 @@ def with_provider_attempt_call(
             call_id=call_id,
             round_id=round_id,
         ),
+    )
+
+
+def with_provider_attempt_scope(
+    config: ProviderConfig,
+    *,
+    scope_id: str,
+) -> ProviderConfig:
+    """Return ``config`` in an immutable stable child/vision call namespace."""
+    context = config.provider_attempt_context
+    if context is None:
+        return config
+    return replace(
+        config,
+        provider_attempt_context=replace(context, scope_id=scope_id),
     )
 
 
@@ -2093,6 +2118,9 @@ def _chat_completion_openai_responses(
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
     prompt_cache_key: str = "",
+    attempt_config: ProviderConfig | None = None,
+    outer_attempt: int = 1,
+    attempt_trace: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     payload, url, headers = _build_openai_responses_payload(
         model=model,
@@ -2119,7 +2147,20 @@ def _chat_completion_openai_responses(
     attempts_used = 0
     for attempt in range(1, _compatibility_attempt_limit(payload) + 1):
         attempts_used = attempt
-        resp = post_with_payload(current_payload)
+        if attempt_config is None:
+            resp = post_with_payload(current_payload)
+        else:
+            resp, _ = _traced_sync_json_post(
+                trace=attempt_trace,
+                config=attempt_config,
+                provider="openai",
+                model=model,
+                outer_attempt=outer_attempt,
+                inner_attempt=attempt,
+                transport="openai_responses",
+                request_payload=current_payload,
+                post=post_with_payload,
+            )
         try:
             _raise_for_provider_status(resp)
             break
@@ -2592,90 +2633,90 @@ def _record_attempt_started(
         return
 
 
-def _finalize_attempt_accounting(
-    attempts: list[dict[str, Any]] | None,
+def _record_attempt_terminal(
+    entry: dict[str, Any],
     context: ProviderAttemptContext | None,
+    *,
+    revision: int = 1,
 ) -> None:
-    """Emit one full completion for each actual dispatch, never trace markers."""
-    if context is None or attempts is None:
+    """Emit one revisioned terminal fact for one real HTTP dispatch."""
+    if context is None or entry.get("kind") != "http_attempt":
         return
-    for entry in attempts:
-        if entry.get("kind") != "http_attempt":
-            continue
+    try:
+        usage = entry.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        usage_known = _attempt_usage_known(usage)
+        outcome = AttemptOutcome(str(entry.get("accounting_outcome") or "failed"))
+        error_class = AttemptErrorClass(
+            str(entry.get("accounting_error_class") or "unknown")
+        )
+        if usage_known:
+            unknown_reason = None
+            completeness = AttemptCompleteness.COMPLETE
+        elif outcome is AttemptOutcome.TIMED_OUT:
+            unknown_reason = AttemptUsageUnknownReason.TIMEOUT
+            completeness = AttemptCompleteness.USAGE_UNKNOWN
+        elif entry.get("outcome") == "postprocess_error":
+            unknown_reason = AttemptUsageUnknownReason.PARSE_ERROR
+            completeness = AttemptCompleteness.USAGE_UNKNOWN
+        elif outcome is AttemptOutcome.SUCCEEDED:
+            unknown_reason = AttemptUsageUnknownReason.PROVIDER_OMITTED
+            completeness = AttemptCompleteness.USAGE_UNKNOWN
+        else:
+            unknown_reason = AttemptUsageUnknownReason.REQUEST_FAILED
+            completeness = AttemptCompleteness.USAGE_UNKNOWN
+        event_kwargs = {
+            "user_id": context.user_id,
+            "call_id": context.call_id,
+            "outer_attempt_ordinal": int(entry["outer_attempt"]),
+            "inner_attempt_ordinal": int(entry["inner_attempt"]),
+            "installation_id": context.installation_id,
+            "source": AttemptSource.RUNTIME_RECORDER,
+            "lane": context.lane,
+            "state": AttemptState.COMPLETED,
+            "outcome": outcome,
+            "completeness": completeness,
+            "requested_provider": str(entry["requested_provider"]),
+            "requested_model": str(entry["requested_model"]),
+            "resolved_provider": str(entry["provider"]),
+            "resolved_model": str(entry["model"]),
+            "transport": str(entry["transport"]),
+            "error_class": error_class,
+            "runtime": context.runtime,
+            "job_id": context.job_id,
+            "turn_id": context.turn_id,
+            "round_id": context.round_id,
+            "retry_kind": (
+                AttemptRetryKind.COMPATIBILITY_RETRY
+                if int(entry["inner_attempt"]) > 1
+                else AttemptRetryKind.OUTER_RETRY
+                if int(entry["outer_attempt"]) > 1
+                else AttemptRetryKind.INITIAL
+            ),
+            "provider_request_id": entry.get("provider_request_id"),
+            "usage_unknown_reason": unknown_reason,
+            "started_at": datetime.fromisoformat(str(entry["request_started_at"])),
+            "finished_at": datetime.fromisoformat(str(entry["finished_at"])),
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "reasoning_tokens": usage.get("reasoning_tokens"),
+            "cache_read_tokens": usage.get("cache_read_tokens"),
+            "cache_write_tokens": usage.get("cache_write_tokens"),
+            "cache_miss_tokens": usage.get("cache_miss_tokens"),
+            "usage_known": usage_known,
+            "possibly_billed": bool(entry.get("possibly_billed")),
+            "latency_ms": float(entry["duration_ms"]),
+            "ttft_ms": entry.get("ttft_ms"),
+            "revision": revision,
+        }
         try:
-            usage = entry.get("usage")
-            usage = usage if isinstance(usage, dict) else {}
-            usage_known = _attempt_usage_known(usage)
-            outcome = AttemptOutcome(str(entry.get("accounting_outcome") or "failed"))
-            error_class = AttemptErrorClass(
-                str(entry.get("accounting_error_class") or "unknown")
-            )
-            if usage_known:
-                unknown_reason = None
-                completeness = AttemptCompleteness.COMPLETE
-            elif outcome is AttemptOutcome.TIMED_OUT:
-                unknown_reason = AttemptUsageUnknownReason.TIMEOUT
-                completeness = AttemptCompleteness.USAGE_UNKNOWN
-            elif entry.get("outcome") == "postprocess_error":
-                unknown_reason = AttemptUsageUnknownReason.PARSE_ERROR
-                completeness = AttemptCompleteness.USAGE_UNKNOWN
-            elif outcome is AttemptOutcome.SUCCEEDED:
-                unknown_reason = AttemptUsageUnknownReason.PROVIDER_OMITTED
-                completeness = AttemptCompleteness.USAGE_UNKNOWN
-            else:
-                unknown_reason = AttemptUsageUnknownReason.REQUEST_FAILED
-                completeness = AttemptCompleteness.USAGE_UNKNOWN
-            event_kwargs = {
-                "user_id": context.user_id,
-                "call_id": context.call_id,
-                "outer_attempt_ordinal": int(entry["outer_attempt"]),
-                "inner_attempt_ordinal": int(entry["inner_attempt"]),
-                "installation_id": context.installation_id,
-                "source": AttemptSource.RUNTIME_RECORDER,
-                "lane": context.lane,
-                "state": AttemptState.COMPLETED,
-                "outcome": outcome,
-                "completeness": completeness,
-                "requested_provider": str(entry["requested_provider"]),
-                "requested_model": str(entry["requested_model"]),
-                "resolved_provider": str(entry["provider"]),
-                "resolved_model": str(entry["model"]),
-                "transport": str(entry["transport"]),
-                "error_class": error_class,
-                "runtime": context.runtime,
-                "job_id": context.job_id,
-                "turn_id": context.turn_id,
-                "round_id": context.round_id,
-                "retry_kind": (
-                    AttemptRetryKind.COMPATIBILITY_RETRY
-                    if int(entry["inner_attempt"]) > 1
-                    else AttemptRetryKind.OUTER_RETRY
-                    if int(entry["outer_attempt"]) > 1
-                    else AttemptRetryKind.INITIAL
-                ),
-                "provider_request_id": entry.get("provider_request_id"),
-                "usage_unknown_reason": unknown_reason,
-                "started_at": datetime.fromisoformat(str(entry["request_started_at"])),
-                "finished_at": datetime.fromisoformat(str(entry["finished_at"])),
-                "input_tokens": usage.get("input_tokens"),
-                "output_tokens": usage.get("output_tokens"),
-                "reasoning_tokens": usage.get("reasoning_tokens"),
-                "cache_read_tokens": usage.get("cache_read_tokens"),
-                "cache_write_tokens": usage.get("cache_write_tokens"),
-                "cache_miss_tokens": usage.get("cache_miss_tokens"),
-                "usage_known": usage_known,
-                "possibly_billed": bool(entry.get("possibly_billed")),
-                "latency_ms": float(entry["duration_ms"]),
-                "ttft_ms": entry.get("ttft_ms"),
-            }
-            try:
-                event = ProviderAttemptEvent.create(**event_kwargs)
-            except (TypeError, ValueError):
-                event_kwargs["provider_request_id"] = None
-                event = ProviderAttemptEvent.create(**event_kwargs)
-            record_provider_attempt(event)
-        except BaseException:  # noqa: BLE001 - one malformed fact cannot affect others
-            continue
+            event = ProviderAttemptEvent.create(**event_kwargs)
+        except (TypeError, ValueError):
+            event_kwargs["provider_request_id"] = None
+            event = ProviderAttemptEvent.create(**event_kwargs)
+        record_provider_attempt(event)
+    except BaseException:  # noqa: BLE001 - accounting cannot alter dispatch
+        return
 
 
 def _trace_envelope(attempts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2708,7 +2749,7 @@ def _attach_provider_attempt_trace(
 
 def _mark_attempt_postprocess_error(
     attempts: list[dict[str, Any]], exc: BaseException
-) -> None:
+) -> dict[str, Any] | None:
     """Mark a transport-2xx attempt whose response failed decode/validation."""
     for entry in reversed(attempts):
         if entry.get("kind") != "http_attempt":
@@ -2717,9 +2758,10 @@ def _mark_attempt_postprocess_error(
             entry["error_class"] = classify_provider_error(exc)
             entry["outcome"] = "postprocess_error"
             entry["postprocess_stage"] = "response_decode_or_validation"
-            entry["accounting_outcome"] = AttemptOutcome.FAILED.value
             entry["accounting_error_class"] = AttemptErrorClass.PROTOCOL.value
-        return
+            return entry
+        return None
+    return None
 
 
 def _attempts_from_result(result: Any) -> list[dict[str, Any]]:
@@ -2775,6 +2817,109 @@ def _extend_attempt_trace(
         target.append(item)
         ordinals.append(item["ordinal"])
     return ordinals
+
+
+def _traced_sync_json_post(
+    *,
+    trace: list[dict[str, Any]] | None,
+    config: ProviderConfig,
+    provider: str,
+    model: str,
+    outer_attempt: int,
+    inner_attempt: int,
+    transport: str,
+    request_payload: dict[str, Any],
+    post: Any,
+) -> tuple[httpx.Response, dict[str, Any] | None]:
+    """Dispatch one synchronous HTTP request with fail-open accounting."""
+    context = config.provider_attempt_context
+    if trace is None and context is None:
+        return post(request_payload), None
+    started_ns = time.monotonic_ns()
+    started_at = datetime.now(timezone.utc)
+    _record_attempt_started(
+        context,
+        outer_attempt=outer_attempt,
+        inner_attempt=inner_attempt,
+        config=config,
+        provider=provider,
+        model=model,
+        transport=transport,
+        started_at=started_at,
+    )
+    if trace is None:
+        return post(request_payload), None
+    entry: dict[str, Any] = {
+        "ordinal": len(trace) + 1,
+        "kind": "http_attempt",
+        "call_id": context.call_id if context is not None else None,
+        "outer_attempt": int(outer_attempt),
+        "inner_attempt": int(inner_attempt),
+        "requested_provider": str(config.provider).strip(),
+        "requested_model": config.model,
+        "provider": provider,
+        "model": model,
+        "transport": transport,
+        "route": str(config.prompt_cache_route_fingerprint or "")[:160] or None,
+        "status": None,
+        "error_class": None,
+        "accounting_outcome": AttemptOutcome.UNKNOWN.value,
+        "accounting_error_class": AttemptErrorClass.NONE.value,
+        "compatibility_fallback": None,
+        "request_started_at": started_at.isoformat(),
+        "first_byte_at": None,
+        "finished_at": started_at.isoformat(),
+        "duration_ms": 0.0,
+        "ttft_ms": None,
+        "provider_request_id": None,
+        "usage": {},
+        "possibly_billed": False,
+        "wire": {"encoding": "json_body", "payload": request_payload},
+    }
+    try:
+        response = post(request_payload)
+    except BaseException as exc:  # noqa: BLE001 - preserve provider exception
+        finished_ns = time.monotonic_ns()
+        status = getattr(exc, "status_code", None)
+        entry["status"] = int(status) if isinstance(status, int) else None
+        entry["error_class"] = classify_provider_error(exc)
+        outcome, error_class, possibly_billed = _attempt_error_fact(exc)
+        entry["accounting_outcome"] = outcome.value
+        entry["accounting_error_class"] = error_class.value
+        entry["possibly_billed"] = possibly_billed
+        entry["finished_at"] = _attempt_timestamp(
+            started_at, started_ns, finished_ns
+        ).isoformat()
+        entry["duration_ms"] = round(
+            max(0, finished_ns - started_ns) / 1_000_000.0, 3
+        )
+        trace.append(entry)
+        _record_attempt_terminal(entry, context)
+        raise
+    finished_ns = time.monotonic_ns()
+    status = int(response.status_code)
+    outcome, error_class, possibly_billed = _attempt_error_fact(status_code=status)
+    entry["status"] = status
+    entry["error_class"] = _provider_status_error_class(status)
+    entry["accounting_outcome"] = outcome.value
+    entry["accounting_error_class"] = error_class.value
+    entry["possibly_billed"] = possibly_billed
+    entry["first_byte_at"] = _attempt_timestamp(
+        started_at, started_ns, finished_ns
+    ).isoformat()
+    entry["finished_at"] = entry["first_byte_at"]
+    entry["duration_ms"] = round(
+        max(0, finished_ns - started_ns) / 1_000_000.0, 3
+    )
+    entry["ttft_ms"] = entry["duration_ms"]
+    entry["provider_request_id"] = _request_id_from_response(response)
+    try:
+        entry["usage"] = _attempt_usage_from_response(provider, response)
+    except BaseException:  # noqa: BLE001 - usage enrichment cannot alter response
+        entry["usage"] = {}
+    trace.append(entry)
+    _record_attempt_terminal(entry, context)
+    return response, entry
 
 
 async def _traced_async_json_post(
@@ -2864,6 +3009,7 @@ async def _traced_async_json_post(
             max(0, finished_ns - started_ns) / 1_000_000.0, 3,
         )
         trace.append(entry)
+        _record_attempt_terminal(entry, context)
         raise
     finished_ns = time.monotonic_ns()
     status = int(response.status_code)
@@ -2889,8 +3035,12 @@ async def _traced_async_json_post(
         max(0, first_byte_ns - started_ns) / 1_000_000.0, 3,
     )
     entry["provider_request_id"] = _request_id_from_response(response)
-    entry["usage"] = _attempt_usage_from_response(provider, response)
+    try:
+        entry["usage"] = _attempt_usage_from_response(provider, response)
+    except BaseException:  # noqa: BLE001 - usage enrichment cannot alter response
+        entry["usage"] = {}
     trace.append(entry)
+    _record_attempt_terminal(entry, context)
     return response, entry
 
 
@@ -2950,6 +3100,9 @@ def _chat_completion_openai_compatible(
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
     prompt_cache_key: str = "",
+    attempt_config: ProviderConfig | None = None,
+    outer_attempt: int = 1,
+    attempt_trace: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     payload = _build_openai_compat_payload(
         provider=provider,
@@ -2983,7 +3136,20 @@ def _chat_completion_openai_compatible(
     # fallbacks; each step removes fields only and always preserves tools.
     for attempt in range(1, _compatibility_attempt_limit(payload) + 1):
         attempts_used = attempt
-        resp = post_with_payload(current_payload)
+        if attempt_config is None:
+            resp = post_with_payload(current_payload)
+        else:
+            resp, _ = _traced_sync_json_post(
+                trace=attempt_trace,
+                config=attempt_config,
+                provider=provider,
+                model=model,
+                outer_attempt=outer_attempt,
+                inner_attempt=attempt,
+                transport="openai_chat",
+                request_payload=current_payload,
+                post=post_with_payload,
+            )
         try:
             _raise_for_provider_status(resp)
             break
@@ -3132,6 +3298,9 @@ def _chat_completion_anthropic(
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
     prompt_cache_key: str = "",
+    attempt_config: ProviderConfig | None = None,
+    outer_attempt: int = 1,
+    attempt_trace: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     payload, url, headers = _build_anthropic_payload(
         model=model,
@@ -3166,7 +3335,20 @@ def _chat_completion_anthropic(
     attempts_used = 0
     for attempt in range(1, _compatibility_attempt_limit(payload) + 1):
         attempts_used = attempt
-        resp = post_with_payload(current_payload)
+        if attempt_config is None:
+            resp = post_with_payload(current_payload)
+        else:
+            resp, _ = _traced_sync_json_post(
+                trace=attempt_trace,
+                config=attempt_config,
+                provider="anthropic",
+                model=model,
+                outer_attempt=outer_attempt,
+                inner_attempt=attempt,
+                transport="anthropic_messages",
+                request_payload=current_payload,
+                post=post_with_payload,
+            )
         try:
             _raise_for_provider_status(resp)
             break
@@ -3439,6 +3621,9 @@ def _chat_completion_bedrock(
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
     prompt_cache_key: str = "",
+    attempt_config: ProviderConfig | None = None,
+    outer_attempt: int = 1,
+    attempt_trace: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     payload, url, headers = _build_bedrock_payload(
         model=model,
@@ -3468,7 +3653,20 @@ def _chat_completion_bedrock(
     attempts_used = 0
     for attempt in range(1, _compatibility_attempt_limit(payload) + 1):
         attempts_used = attempt
-        resp = post_with_payload(current_payload)
+        if attempt_config is None:
+            resp = post_with_payload(current_payload)
+        else:
+            resp, _ = _traced_sync_json_post(
+                trace=attempt_trace,
+                config=attempt_config,
+                provider="bedrock",
+                model=model,
+                outer_attempt=outer_attempt,
+                inner_attempt=attempt,
+                transport="bedrock_converse",
+                request_payload=current_payload,
+                post=post_with_payload,
+            )
         try:
             _raise_for_provider_status(resp)
             break
@@ -3596,6 +3794,9 @@ def _chat_completion_gemini(
     require_reply: bool = True,
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
+    attempt_config: ProviderConfig | None = None,
+    outer_attempt: int = 1,
+    attempt_trace: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     payload, url, headers = _build_gemini_payload(
         model=model,
@@ -3609,10 +3810,30 @@ def _chat_completion_gemini(
         tools=tools,
     )
 
-    try:
-        resp = _http_client().post(url, headers=headers, json=payload, timeout=timeout)
-    except httpx.HTTPError as e:
-        raise ProviderError(f"provider network error: {type(e).__name__}") from e
+    def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
+        try:
+            return _http_client().post(
+                url, headers=headers, json=request_payload, timeout=timeout
+            )
+        except httpx.HTTPError as e:
+            raise ProviderError(
+                f"provider network error: {type(e).__name__}"
+            ) from e
+
+    if attempt_config is None:
+        resp = post_with_payload(payload)
+    else:
+        resp, _ = _traced_sync_json_post(
+            trace=attempt_trace,
+            config=attempt_config,
+            provider="gemini",
+            model=model,
+            outer_attempt=outer_attempt,
+            inner_attempt=1,
+            transport="gemini_generate_content",
+            request_payload=payload,
+            post=post_with_payload,
+        )
 
     _raise_for_provider_status(resp)
 
@@ -3637,6 +3858,7 @@ def chat_completion(
     require_reply: bool = True,
     include_reasoning: bool = False,
     tools: "list[ToolSpec] | None" = None,
+    _provider_outer_attempt: int = 1,
 ) -> dict[str, Any]:
     provider, model, base_url = validate_config(
         config.provider, config.model, config.base_url
@@ -3645,83 +3867,115 @@ def chat_completion(
     key = (config.api_key or "").strip()
     if not key:
         raise ProviderError("api_key required")
-
-    if provider == "anthropic":
-        return _chat_completion_anthropic(
-            model=model,
-            base_url=base_url,
-            key=key,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            timeout=timeout,
-            response_format=response_format,
-            require_reply=require_reply,
-            include_reasoning=include_reasoning,
-            tools=tools,
-            prompt_cache_key=config.prompt_cache_key,
-        )
-    if provider == "bedrock":
-        return _chat_completion_bedrock(
-            model=model,
-            base_url=base_url,
-            key=key,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            timeout=timeout,
-            response_format=response_format,
-            require_reply=require_reply,
-            include_reasoning=include_reasoning,
-            tools=tools,
-            prompt_cache_key=config.prompt_cache_key,
-        )
-    if provider == "gemini":
-        return _chat_completion_gemini(
-            model=model,
-            base_url=base_url,
-            key=key,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            timeout=timeout,
-            response_format=response_format,
-            require_reply=require_reply,
-            include_reasoning=include_reasoning,
-            tools=tools,
-        )
-
-    if provider == "openai" and _openai_uses_responses_for_reasoning(request_model):
-        return _chat_completion_openai_responses(
-            model=request_model,
-            base_url=base_url,
-            key=key,
-            messages=messages,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            response_format=response_format,
-            require_reply=require_reply,
-            include_reasoning=include_reasoning,
-            tools=tools,
-            prompt_cache_key=config.prompt_cache_key,
-        )
-
-    return _chat_completion_openai_compatible(
-        provider=provider,
-        model=request_model,
-        base_url=base_url,
-        key=key,
-        messages=messages,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        timeout=timeout,
-        response_format=response_format,
-        extra_body=extra_body,
-        require_reply=require_reply,
-        include_reasoning=include_reasoning,
-        tools=tools,
-        prompt_cache_key=config.prompt_cache_key,
+    capture_attempt_trace = bool(config.capture_attempt_trace)
+    attempt_trace: list[dict[str, Any]] | None = (
+        []
+        if capture_attempt_trace or config.provider_attempt_context is not None
+        else None
     )
+    attempt_options = {
+        "attempt_config": config,
+        "outer_attempt": max(1, int(_provider_outer_attempt)),
+        "attempt_trace": attempt_trace,
+    }
+    try:
+        if provider == "anthropic":
+            result = _chat_completion_anthropic(
+                model=model,
+                base_url=base_url,
+                key=key,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                timeout=timeout,
+                response_format=response_format,
+                require_reply=require_reply,
+                include_reasoning=include_reasoning,
+                tools=tools,
+                prompt_cache_key=config.prompt_cache_key,
+                **attempt_options,
+            )
+        elif provider == "bedrock":
+            result = _chat_completion_bedrock(
+                model=model,
+                base_url=base_url,
+                key=key,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                timeout=timeout,
+                response_format=response_format,
+                require_reply=require_reply,
+                include_reasoning=include_reasoning,
+                tools=tools,
+                prompt_cache_key=config.prompt_cache_key,
+                **attempt_options,
+            )
+        elif provider == "gemini":
+            result = _chat_completion_gemini(
+                model=model,
+                base_url=base_url,
+                key=key,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                timeout=timeout,
+                response_format=response_format,
+                require_reply=require_reply,
+                include_reasoning=include_reasoning,
+                tools=tools,
+                **attempt_options,
+            )
+        elif provider == "openai" and _openai_uses_responses_for_reasoning(
+            request_model
+        ):
+            result = _chat_completion_openai_responses(
+                model=request_model,
+                base_url=base_url,
+                key=key,
+                messages=messages,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                response_format=response_format,
+                require_reply=require_reply,
+                include_reasoning=include_reasoning,
+                tools=tools,
+                prompt_cache_key=config.prompt_cache_key,
+                **attempt_options,
+            )
+        else:
+            result = _chat_completion_openai_compatible(
+                provider=provider,
+                model=request_model,
+                base_url=base_url,
+                key=key,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                timeout=timeout,
+                response_format=response_format,
+                extra_body=extra_body,
+                require_reply=require_reply,
+                include_reasoning=include_reasoning,
+                tools=tools,
+                prompt_cache_key=config.prompt_cache_key,
+                **attempt_options,
+            )
+    except BaseException as exc:  # noqa: BLE001 - annotate and preserve original
+        if attempt_trace is not None:
+            enriched = _mark_attempt_postprocess_error(attempt_trace, exc)
+            if enriched is not None:
+                _record_attempt_terminal(
+                    enriched,
+                    config.provider_attempt_context,
+                    revision=2,
+                )
+        if capture_attempt_trace and attempt_trace is not None:
+            _attach_provider_attempt_trace(exc, attempt_trace)
+        raise
+    if capture_attempt_trace and attempt_trace is not None:
+        return _with_provider_attempt_trace(result, attempt_trace)
+    return result
 
 
 # `probe_responses_support` lived here until 2026-07-27. It probed POST
@@ -4684,18 +4938,16 @@ async def chat_completion_async(
         )
     except BaseException as exc:  # noqa: BLE001 -- annotate and preserve original
         if attempt_trace is not None:
-            _mark_attempt_postprocess_error(attempt_trace, exc)
-            _finalize_attempt_accounting(
-                attempt_trace,
-                config.provider_attempt_context,
-            )
+            enriched = _mark_attempt_postprocess_error(attempt_trace, exc)
+            if enriched is not None:
+                _record_attempt_terminal(
+                    enriched,
+                    config.provider_attempt_context,
+                    revision=2,
+                )
         if capture_attempt_trace and attempt_trace is not None:
             _attach_provider_attempt_trace(exc, attempt_trace)
         raise
-    _finalize_attempt_accounting(
-        attempt_trace,
-        config.provider_attempt_context,
-    )
     if not capture_attempt_trace or attempt_trace is None:
         return result
     return _with_provider_attempt_trace(result, attempt_trace)

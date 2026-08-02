@@ -374,6 +374,7 @@ def test_profile_provider_calls_receive_replay_stable_logical_ids(monkeypatch):
         "v2job:31:profile:2",
     ]
     assert [context.round_id for context in captured] == ["profile:1", "profile:2"]
+    assert all(context.lane.value == "profile" for context in captured)
 
 
 def test_profile_roll_back_after_generation_blocks_profile_cas(monkeypatch):

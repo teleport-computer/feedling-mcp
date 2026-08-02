@@ -688,9 +688,16 @@ async def run_tool_loop(
         attempt_context = getattr(provider_config, "provider_attempt_context", None)
         accounted_provider_config = provider_config
         if attempt_context is not None:
+            scope = (
+                f":{attempt_context.scope_id}"
+                if attempt_context.scope_id is not None
+                else ""
+            )
             accounted_provider_config = provider_client.with_provider_attempt_call(
                 provider_config,
-                call_id=f"v2job:{attempt_context.job_id}:provider:{attempts}",
+                call_id=(
+                    f"v2job:{attempt_context.job_id}{scope}:provider:{attempts}"
+                ),
                 round_id=f"provider:{attempts}",
             )
         _progress("provider_start")

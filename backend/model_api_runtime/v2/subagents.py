@@ -222,6 +222,9 @@ async def run_task_batch(
         raise SubagentBatchError("subagent task batch exceeds the per-round limit")
 
     tasks = [_parse_task(call) for call in calls]
+    child_ids = [task.call_id for task in tasks]
+    if len(child_ids) != len(set(child_ids)):
+        raise SubagentBatchError("subagent task batch has duplicate child id")
     gate = asyncio.Semaphore(parallelism)
 
     async def _one(task: ChildTask) -> ToolResult:

@@ -447,7 +447,7 @@ def test_worker_batches_queued_events_into_one_full_row_upsert():
     sql, rows = executions[0]
     assert "INSERT INTO llm_provider_attempts" in sql
     assert "ON CONFLICT (attempt_id) DO UPDATE" in sql
-    assert "CASE WHEN llm_provider_attempts.state = 'completed'" in sql
+    assert "EXCLUDED.revision > llm_provider_attempts.revision" in sql
     assert len(rows) == 2
     assert rows[1]["state"] == "completed"
     assert rows[1]["outcome"] == "succeeded"
@@ -474,7 +474,7 @@ def test_completed_event_recovers_missing_start_and_replay_stays_idempotent():
     first_rows = executions[0][1]
     replay_rows = executions[1][1]
     assert first_rows == replay_rows == [completed.as_row()]
-    assert "finished_at = CASE" in executions[0][0]
+    assert "EXCLUDED.revision > llm_provider_attempts.revision" in executions[0][0]
     assert recorder.shutdown(timeout=0.5) is True
 
 
@@ -498,6 +498,7 @@ def test_completed_event_executes_against_the_real_attempt_schema():
         usage_known=True,
         latency_ms=250.0,
         ttft_ms=50.0,
+        revision=2,
     )
     with accounting.db.get_pool().connection() as connection:
         connection.execute(
@@ -513,14 +514,36 @@ def test_completed_event_executes_against_the_real_attempt_schema():
             return connection.execute(
                 "SELECT input_tokens,output_tokens,reasoning_tokens,"
                 "cache_read_tokens,cache_write_tokens,cache_miss_tokens,"
-                "usage_known,latency_ms,ttft_ms "
+                "usage_known,latency_ms,ttft_ms,revision,outcome "
                 "FROM llm_provider_attempts WHERE attempt_id=%s",
                 (event.attempt_id,),
             ).fetchone()
 
     _wait_until(lambda: _stored() is not None)
-    assert tuple(_stored()) == (11, 7, 3, 5, 2, 6, True, 250.0, 50.0)
+    assert tuple(_stored()) == (
+        11, 7, 3, 5, 2, 6, True, 250.0, 50.0, 2, "succeeded"
+    )
     assert recorder.shutdown(timeout=0.5) is True
+
+    # A delayed lower revision and a conflicting same-revision replay are
+    # both no-ops; neither may worsen the known HTTP outcome or usage.
+    stale = replace(
+        event,
+        revision=1,
+        outcome=AttemptOutcome.FAILED,
+        input_tokens=999,
+    )
+    conflicting_replay = replace(
+        event,
+        outcome=AttemptOutcome.FAILED,
+        input_tokens=888,
+    )
+    ProviderAttemptRecorder(reconcile_interval=3600)._write_batch(
+        [stale, conflicting_replay]
+    )
+    assert tuple(_stored()) == (
+        11, 7, 3, 5, 2, 6, True, 250.0, 50.0, 2, "succeeded"
+    )
     with accounting.db.get_pool().connection() as connection:
         connection.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
 

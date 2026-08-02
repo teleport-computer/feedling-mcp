@@ -204,6 +204,45 @@ def test_compaction_wrapper_binds_its_explicit_stable_logical_call(monkeypatch):
     assert seen[0].round_id == "maintenance:batch:1"
 
 
+def test_photo_observer_derives_stable_tool_call_identity_before_assembly():
+    deliveries = []
+
+    def observe(user_id, **kwargs):
+        deliveries[-1].append((user_id, kwargs["main_provider_config"]))
+        return "observation"
+
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (None, {}),
+        mint_enclave_token=lambda _uid: "token",
+        observe_photo=observe,
+    )
+    async def redelivery():
+        for _ in range(2):
+            deliveries.append([])
+            observer = worker._make_photo_observer(
+                deps,
+                user_id="usr_vision_tool",
+                provider_config=_attempt_config(job_id=94),
+                api_key=None,
+                runtime_token="token",
+            )
+            assert await observer(
+                "image/jpeg", "private-b64", call_id="photo-call-1"
+            ) == "observation"
+            assert await observer(
+                "image/jpeg", "private-b64", call_id="photo-call-1"
+            ) == "observation"
+
+    asyncio.run(redelivery())
+
+    call_ids = [item[1].provider_attempt_context.call_id for item in deliveries[0]]
+    assert len(set(call_ids)) == 2
+    assert call_ids == [
+        item[1].provider_attempt_context.call_id for item in deliveries[1]
+    ]
+
+
 def test_payload_is_bounded_compressed_and_explicitly_truncated():
     secret = "private-conversation-needle"
     encoded, truncated, original_size = trajectory.encode_payload(

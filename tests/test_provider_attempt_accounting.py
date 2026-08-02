@@ -38,6 +38,10 @@ def test_stable_attempt_id_is_deterministic_across_replay_and_distinguishes_ordi
     assert first != stable_attempt_id("call-b", 2, 1)
 
 
+def test_profile_is_a_first_class_provider_attempt_lane():
+    assert AttemptLane.PROFILE.value == "profile"
+
+
 def test_attempt_event_accepts_only_safe_typed_metadata():
     """A prompt-like field is rejected instead of becoming ledger content."""
     assert ProviderAttemptEvent is not None
@@ -120,6 +124,7 @@ def test_completed_attempt_event_carries_only_allowlisted_usage_and_timing_facts
         possibly_billed=False,
         latency_ms=1000.25,
         ttft_ms=125.5,
+        revision=2,
     )
 
     row = ProviderAttemptEvent.create(**kwargs).as_row()
@@ -152,6 +157,7 @@ def test_completed_attempt_event_carries_only_allowlisted_usage_and_timing_facts
         "latency_ms": 1000.25,
         "ttft_ms": 125.5,
     }
+    assert row["revision"] == 2
     assert "prompt" not in row
     assert "response" not in row
 
@@ -171,6 +177,8 @@ def test_completed_attempt_event_carries_only_allowlisted_usage_and_timing_facts
         ("possibly_billed", "false"),
         ("latency_ms", -0.1),
         ("ttft_ms", float("nan")),
+        ("revision", -1),
+        ("revision", True),
     ],
 )
 def test_attempt_event_rejects_unsafe_usage_and_timing_scalars(field, value):

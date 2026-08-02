@@ -6,7 +6,13 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from hosted import vision_observer
+import httpx
 import provider_client
+from provider_attempt_accounting import (
+    AttemptLane,
+    AttemptState,
+    ProviderAttemptContext,
+)
 
 
 class _Store:
@@ -58,6 +64,63 @@ def test_observe_image_uses_bounded_reliable_provider_call(monkeypatch):
     assert captured["messages"][0]["content"][1]["image_url"]["url"] == (
         "data:image/jpeg;base64,encoded-image"
     )
+
+
+def test_observe_image_accounts_each_real_sync_retry(monkeypatch):
+    recorded = []
+    statuses = [503, 200]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        status = statuses.pop(0)
+        if status == 503:
+            return httpx.Response(503, json={"error": {"message": "retry"}})
+        return httpx.Response(200, json={
+            "choices": [{
+                "message": {"content": "A red bicycle."},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 9, "completion_tokens": 3},
+        })
+
+    monkeypatch.setattr(
+        provider_client,
+        "_shared_client",
+        httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    monkeypatch.setattr(provider_client, "record_provider_attempt", recorded.append)
+    monkeypatch.setattr(provider_client.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(provider_client.random, "uniform", lambda _a, _b: 0)
+    config = provider_client.ProviderConfig(
+        provider="openrouter",
+        model="vision-model",
+        api_key="vision-key",
+        base_url="https://relay.example/v1",
+        provider_attempt_context=ProviderAttemptContext(
+            user_id="usr_sync_vision",
+            lane=AttemptLane.CHAT,
+            job_id=93,
+            call_id="v2job:93:vision-tool:309ad63028c1da2e",
+        ),
+    )
+
+    result = vision_observer.observe_image(
+        config,
+        image_mime="image/jpeg",
+        image_b64="encoded-image",
+    )
+
+    assert result == "A red bicycle."
+    assert [event.state for event in recorded] == [
+        AttemptState.STARTED,
+        AttemptState.COMPLETED,
+        AttemptState.STARTED,
+        AttemptState.COMPLETED,
+    ]
+    assert [
+        (event.outer_attempt_ordinal, event.inner_attempt_ordinal)
+        for event in recorded
+        if event.state is AttemptState.COMPLETED
+    ] == [(1, 1), (2, 1)]
 
 
 def test_observe_image_exposes_safe_auth_failure(monkeypatch):

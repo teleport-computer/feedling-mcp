@@ -12,6 +12,7 @@ from model_api_runtime.v2 import compaction
 from model_api_runtime.v2 import summary_frontier as frontier
 from model_api_runtime.v2 import worker
 import provider_client
+from provider_attempt_accounting import AttemptLane, ProviderAttemptContext
 
 
 def _segment(
@@ -136,6 +137,64 @@ def test_compact_checkpoint_rejects_malformed_output_as_full_noop():
         )
     )
     assert result is None
+
+
+def test_checkpoint_cas_retries_use_monotonic_stable_invocation_ids(monkeypatch):
+    snapshot = frontier.SummaryFrontierSnapshot(
+        segments=(_segment(1), _segment(2)),
+        head_version=5,
+        watermark_seq=20,
+    )
+    seen = []
+
+    async def _llm(config, _messages, **_kwargs):
+        seen.append(config.provider_attempt_context.call_id)
+        return {"reply": "- compacted checkpoint", "usage": {}}
+
+    monkeypatch.setattr(provider_client, "reliable_chat_completion_async", _llm)
+    monkeypatch.setattr(
+        worker,
+        "_record_provider_success",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+    monkeypatch.setattr(worker, "_SUMMARY_ROLLUP_FANOUT", 2)
+    monkeypatch.setattr(worker, "_SUMMARY_FRONTIER_MAX_SEGMENTS", 1)
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (None, {}),
+        mint_enclave_token=lambda _uid: "token",
+        read_summary_frontier=lambda _uid: snapshot,
+        append_summary_checkpoint=lambda *_args, **_kwargs: False,
+    )
+    config = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-test",
+        api_key="secret",
+        provider_attempt_context=ProviderAttemptContext(
+            user_id="usr_checkpoint_ids",
+            lane=AttemptLane.MAINTENANCE,
+            job_id=85,
+            call_id="v2job:85:base",
+        ),
+    )
+
+    with pytest.raises(frontier.SummaryFrontierExhausted) as excinfo:
+        asyncio.run(
+            worker._rebalance_summary_frontier(
+                "usr_checkpoint_ids",
+                deps,
+                provider_config=config,
+                enclave_sem=None,
+                job_id=85,
+            )
+        )
+    assert excinfo.value.detail == "checkpoint_cas_no_progress"
+
+    assert seen == [
+        "v2job:85:checkpoint:d4da4f42ba956dc4:1",
+        "v2job:85:checkpoint:d4da4f42ba956dc4:2",
+        "v2job:85:checkpoint:d4da4f42ba956dc4:3",
+    ]
 
 
 def test_oversized_legacy_summary_rolls_up_without_new_messages(monkeypatch):

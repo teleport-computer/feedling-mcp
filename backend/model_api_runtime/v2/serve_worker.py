@@ -1702,6 +1702,17 @@ def _observe_photo(
             api_key=api_key,
             runtime_token=runtime_token,
         )
+        attempt_context = getattr(
+            main_provider_config, "provider_attempt_context", None
+        )
+        if (
+            attempt_context is not None
+            and isinstance(config, provider_client.ProviderConfig)
+        ):
+            config = replace(
+                config,
+                provider_attempt_context=attempt_context,
+            )
     return vision_observer.observe_image(
         config,
         image_mime=image_mime,
@@ -1712,6 +1723,8 @@ def _observe_photo(
 def _read_vision_observations(
     user_id: str,
     targets: list[dict],
+    *,
+    provider_attempt_context=None,
 ) -> dict[str, str]:
     """Send pinned V2 images to their observer and return text-only data.
 
@@ -1754,9 +1767,25 @@ def _read_vision_observations(
             configs[route_id] = config
 
         mime = str(image.get("image_mime") or "image/jpeg")
+        accounted_config = config
+        if provider_attempt_context is not None:
+            message_digest = hashlib.sha256(
+                message_id.encode("utf-8")
+            ).hexdigest()[:16]
+            accounted_config = replace(
+                config,
+                provider_attempt_context=replace(
+                    provider_attempt_context,
+                    call_id=(
+                        f"v2job:{provider_attempt_context.job_id}:"
+                        f"vision-pinned:{message_digest}"
+                    ),
+                    round_id=f"vision-pinned:{message_digest}",
+                ),
+            )
         try:
             observations[message_id] = vision_observer.observe_image(
-                config,
+                accounted_config,
                 image_mime=mime,
                 image_b64=image_b64,
             )
