@@ -8,7 +8,8 @@
   decoding, provider failure, timeout, cancellation, or unexpected exception.
 - Extended the existing encrypted in-process attempt trace with content-free
   call identity, outer/inner ordinals, requested/resolved provider and model,
-  transport and route fingerprint, request/first-byte/finish timestamps,
+  transport and route fingerprint, request/finish timestamps, optional
+  first-byte timing when a streaming boundary is observed,
   request ID, normalized token/cache counters, bounded outcome/error class, and
   billing uncertainty. Accounting consumes only `http_attempt` facts, so outer
   retry trace markers cannot create duplicate ledger rows.
@@ -18,9 +19,9 @@
   job and content-free row/round identities, never claim attempt count or global
   mutable request state.
 - Extended the Task 2 recorder row/upsert contract to persist the terminal
-  timestamps, usage/cache counters, billing flag, latency, and TTFT fields that
-  already exist in migration `0076_llm_provider_attempts`. A real PostgreSQL
-  test executes the completed-event SQL against that schema.
+  timestamps, usage/cache counters, billing flag, latency, and optional TTFT
+  fields that already exist in migration `0076_llm_provider_attempts`. A real
+  PostgreSQL test executes the completed-event SQL against that schema.
 - Wired explicit recorder startup before V2 worker slots and bounded shutdown
   off the provider path. Provider-side accounting remains fail-open and invokes
   only the non-blocking recorder enqueue API.
@@ -43,9 +44,9 @@
 4. A focused regression exposed an accidental helper-body displacement while
    adding the worker helpers; source inspection restored the intended function
    boundary before continuing.
-5. Broader provider tests exposed narrow fake clients without `.stream()`;
-   production retains streaming TTFT measurement and a compatibility fallback
-   preserves the pre-existing fake/client seam.
+5. Broader async-provider tests exposed narrow fake clients without `.stream()`;
+   the async production path retains streaming TTFT measurement and a
+   compatibility fallback preserves the pre-existing fake/client seam.
 
 ## Verification
 
@@ -83,9 +84,9 @@
    sibling ids before any child runs. Child attempt scopes combine the stable
    logical task-batch ordinal with the child call id, then hash the result;
    photo-tool scopes combine the stable tool-call id with its per-id invocation
-   ordinal. Both counters are allocated before an await, so completion order
-   cannot affect identity, and fresh dispatcher/observer instances reproduce
-   the same identities on redelivery. Pinned vision uses the durable message id.
+   ordinal. Fresh dispatcher/observer instances reproduce the same identities
+   on redelivery. Pinned vision uses the durable message id. Round 2 below
+   strengthens sibling photo isolation.
 2. **Synchronous Hosted V2 vision dispatch.** The five sync provider adapters
    (OpenAI Responses, OpenAI-compatible Chat, Anthropic Messages, Bedrock
    Converse, and Gemini GenerateContent) now account at their actual HTTP POST
@@ -128,3 +129,36 @@
 - Ruff passed for all touched files; the legacy `serve_worker.py` import block
   was checked with its established E402/F401 exclusions. `compileall` and
   `git diff --check` passed.
+
+## Fix round 2
+
+### Accepted findings closed
+
+1. **Child-scoped photo identity.** The parent photo observer is re-bindable,
+   and each parallel child receives a new observer bound to its scoped child
+   `ProviderAttemptContext`. Each child observer owns its invocation counter;
+   the photo identity digest also includes the child scope. Siblings that reuse
+   the same provider tool-call id therefore cannot exchange identities when
+   their pre-observe arrival order changes. Reuse inside one child still gets
+   distinct monotonic occurrences, reproduced on redelivery.
+2. **Honest synchronous timing.** The synchronous vision adapters use buffered
+   `httpx.Client.post()`, which exposes completion but no response-first-byte
+   boundary. Their attempt facts now leave `first_byte_at` and `ttft_ms` null
+   while retaining `finished_at` and total `latency_ms`. Async streaming TTFT
+   behavior is unchanged.
+
+### RED / GREEN evidence
+
+- RED: two parallel children used `shared-photo-call` twice each. Reversing
+  their pre-observe delays on redelivery swapped the left/right call-id
+  sequences and both observations retained the parent scope. GREEN: each label
+  keeps the same scoped two-id sequence across both deliveries; sibling sets
+  are disjoint and same-child occurrences are distinct.
+- RED: the real synchronous vision retry test observed `ttft_ms == latency_ms`
+  and a fabricated `first_byte_at` for both buffered posts. GREEN: both fields
+  are null for both attempts, while both terminal facts retain total latency.
+
+### Fix-round-2 verification
+
+- Targeted provider/worker/vision tests plus the real PostgreSQL revision test:
+  294 passed. Alembic emitted its two existing `path_separator` warnings.

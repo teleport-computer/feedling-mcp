@@ -4,6 +4,7 @@ import asyncio
 import json
 import pathlib
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -127,6 +128,152 @@ def test_parallel_children_use_stable_distinct_provider_attempt_scopes(monkeypat
 
     assert len(set(runs[0])) == 4
     assert runs[0] == runs[1]
+
+
+def test_parallel_children_bind_photo_identity_to_child_scope_across_redelivery(
+    monkeypatch,
+):
+    deliveries = []
+    delivery_index = -1
+    provider_rounds = {}
+
+    async def provider(config, messages, **_kwargs):
+        scope = config.provider_attempt_context.scope_id
+        label = "left" if "left private task" in str(messages) else "right"
+        provider_rounds[(delivery_index, scope)] = (
+            provider_rounds.get((delivery_index, scope), 0) + 1
+        )
+        provider_round = provider_rounds[(delivery_index, scope)]
+        if provider_round <= 2:
+            if provider_round == 1:
+                delay = (
+                    0.02
+                    if (delivery_index == 0 and label == "left")
+                    or (delivery_index == 1 and label == "right")
+                    else 0
+                )
+                await asyncio.sleep(delay)
+            return {
+                "reply": "",
+                "tool_calls": [{
+                    "id": "shared-photo-call",
+                    "name": "photo_read",
+                    "args": {
+                        "photo_id": label,
+                        "include_image": True,
+                    },
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+        return {
+            "reply": f"done:{label}",
+            "tool_calls": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+
+    class _PhotoResult:
+        def __init__(self, label):
+            self.label = label
+
+        def to_dict(self):
+            return {
+                "ok": True,
+                "data": {
+                    "photo_id": self.label,
+                    "image_media_type": "image/jpeg",
+                    "image_b64": self.label,
+                },
+            }
+
+    def capability(name, _store, **kwargs):
+        assert name == "photo_read"
+        return _PhotoResult(kwargs["params"]["photo_id"])
+
+    def observe(_user_id, **kwargs):
+        context = kwargs["main_provider_config"].provider_attempt_context
+        deliveries[-1].append(
+            (kwargs["image_b64"], context.scope_id, context.call_id)
+        )
+        return "observation"
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", provider)
+    monkeypatch.setattr(cap_registry, "run_capability", capability)
+    # Exercise the already-wired child observer path without broadening the
+    # production child capability policy in this accounting-only regression.
+    monkeypatch.setattr(
+        worker,
+        "_SUBAGENT_ALLOWED_TOOLS",
+        worker._SUBAGENT_ALLOWED_TOOLS | {"photo_read"},
+    )
+    monkeypatch.setattr(
+        worker,
+        "_SUBAGENT_DISABLED_TOOLS",
+        worker._SUBAGENT_DISABLED_TOOLS - {"photo_read"},
+    )
+    monkeypatch.setattr(
+        worker, "_record_provider_success", lambda *_a: asyncio.sleep(0)
+    )
+    base = provider_client.ProviderConfig(
+        provider="anthropic",
+        model="claude-test",
+        api_key="secret",
+        provider_attempt_context=ProviderAttemptContext(
+            user_id="usr_child_photo_attempts",
+            lane=AttemptLane.CHAT,
+            job_id=74,
+            call_id="v2job:74:base",
+            turn_id="v2job:74",
+        ),
+    )
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (None, {}),
+        mint_enclave_token=lambda _uid: "token",
+        observe_photo=observe,
+    )
+
+    async def redelivery():
+        nonlocal delivery_index
+        for delivery_index in range(2):
+            deliveries.append([])
+            photo_observer = worker._make_photo_observer(
+                deps,
+                user_id="usr_child_photo_attempts",
+                provider_config=base,
+                api_key=None,
+                runtime_token="token",
+            )
+            dispatcher = worker._make_task_batch_dispatcher(
+                disabled_web_tool_names=frozenset(),
+                provider_config=base,
+                store=SimpleNamespace(user_id="usr_child_photo_attempts"),
+                api_key=None,
+                runtime_token="token",
+                enclave_sem=asyncio.Semaphore(2),
+                trusted_system_blocks=(),
+                add_usage=lambda _usage: None,
+                observe_photo=photo_observer,
+            )
+            await dispatcher([
+                _call("child-left", "left private task"),
+                _call("child-right", "right private task"),
+            ])
+
+    asyncio.run(redelivery())
+
+    by_label = []
+    for delivery in deliveries:
+        current = {"left": [], "right": []}
+        for label, scope, call_id in delivery:
+            current[label].append((scope, call_id))
+        by_label.append(current)
+    assert by_label[0] == by_label[1]
+    assert by_label[0]["left"][0][0] != by_label[0]["right"][0][0]
+    assert {item[1] for item in by_label[0]["left"]}.isdisjoint(
+        item[1] for item in by_label[0]["right"]
+    )
+    assert len({item[1] for item in by_label[0]["left"]}) == 2
+    assert len({item[1] for item in by_label[0]["right"]}) == 2
 
 
 def test_task_batch_isolates_failure_and_deadline() -> None:

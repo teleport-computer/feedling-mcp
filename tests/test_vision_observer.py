@@ -68,6 +68,7 @@ def test_observe_image_uses_bounded_reliable_provider_call(monkeypatch):
 
 def test_observe_image_accounts_each_real_sync_retry(monkeypatch):
     recorded = []
+    terminal_entries = []
     statuses = [503, 200]
 
     def handler(_request: httpx.Request) -> httpx.Response:
@@ -88,6 +89,15 @@ def test_observe_image_accounts_each_real_sync_retry(monkeypatch):
         httpx.Client(transport=httpx.MockTransport(handler)),
     )
     monkeypatch.setattr(provider_client, "record_provider_attempt", recorded.append)
+    original_terminal = provider_client._record_attempt_terminal
+
+    def capture_terminal(entry, context, **kwargs):
+        terminal_entries.append(dict(entry))
+        return original_terminal(entry, context, **kwargs)
+
+    monkeypatch.setattr(
+        provider_client, "_record_attempt_terminal", capture_terminal
+    )
     monkeypatch.setattr(provider_client.time, "sleep", lambda _delay: None)
     monkeypatch.setattr(provider_client.random, "uniform", lambda _a, _b: 0)
     config = provider_client.ProviderConfig(
@@ -121,6 +131,13 @@ def test_observe_image_accounts_each_real_sync_retry(monkeypatch):
         for event in recorded
         if event.state is AttemptState.COMPLETED
     ] == [(1, 1), (2, 1)]
+    completed = [
+        event for event in recorded if event.state is AttemptState.COMPLETED
+    ]
+    assert all(event.ttft_ms is None for event in completed)
+    assert all(event.latency_ms is not None for event in completed)
+    assert all(entry["first_byte_at"] is None for entry in terminal_entries)
+    assert all(entry["ttft_ms"] is None for entry in terminal_entries)
 
 
 def test_observe_image_exposes_safe_auth_failure(monkeypatch):

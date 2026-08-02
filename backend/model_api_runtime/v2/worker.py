@@ -3545,6 +3545,14 @@ def _make_task_batch_dispatcher(
                 child_provider_config,
                 scope_id=f"subagent:{child_scope}",
             )
+            child_observe_photo = observe_photo
+            bind_photo_observer = getattr(
+                observe_photo, "bind_provider_config", None
+            )
+            if callable(bind_photo_observer):
+                child_observe_photo = bind_photo_observer(
+                    scoped_child_provider_config
+                )
 
             child_recorder = (
                 trajectory_recorder.scoped(f"subagent:{task.call_id}")
@@ -3621,7 +3629,7 @@ def _make_task_batch_dispatcher(
                                 turn_authorization=False,
                                 enqueue_write_effect=_no_child_write,
                                 before_write=None,
-                                observe_photo=observe_photo,
+                                observe_photo=child_observe_photo,
                                 read_parallelism=1,
                             )
                     except Exception as exc:
@@ -3735,6 +3743,71 @@ class _PhotoObserverUnavailable(RuntimeError):
     error_code = "vision_model_unavailable"
 
 
+class _BoundPhotoObserver:
+    def __init__(
+        self,
+        deps: TurnDeps,
+        *,
+        user_id: str,
+        provider_config,
+        api_key: str | None,
+        runtime_token: str,
+    ) -> None:
+        self._deps = deps
+        self._user_id = user_id
+        self._provider_config = provider_config
+        self._api_key = api_key
+        self._runtime_token = runtime_token
+        self._call_invocations: dict[str, int] = {}
+
+    def bind_provider_config(self, provider_config) -> "_BoundPhotoObserver":
+        """Give one child its own stable photo-call occurrence namespace."""
+        return _BoundPhotoObserver(
+            self._deps,
+            user_id=self._user_id,
+            provider_config=provider_config,
+            api_key=self._api_key,
+            runtime_token=self._runtime_token,
+        )
+
+    async def __call__(
+        self,
+        image_mime: str,
+        image_b64: str,
+        *,
+        call_id: str,
+    ) -> str:
+        if self._deps.observe_photo is None:
+            raise _PhotoObserverUnavailable("photo observer is not wired")
+        accounted_config = self._provider_config
+        attempt_context = getattr(
+            self._provider_config, "provider_attempt_context", None
+        )
+        if attempt_context is not None:
+            invocation = self._call_invocations.get(call_id, 0) + 1
+            self._call_invocations[call_id] = invocation
+            scope_id = str(attempt_context.scope_id or "root")
+            call_digest = hashlib.sha256(
+                f"{scope_id}:{call_id}:{invocation}".encode("utf-8")
+            ).hexdigest()[:16]
+            accounted_config = provider_client.with_provider_attempt_call(
+                self._provider_config,
+                call_id=(
+                    f"v2job:{attempt_context.job_id}:vision-tool:{call_digest}"
+                ),
+                round_id=f"vision-tool:{call_digest}",
+            )
+        return await asyncio.to_thread(
+            self._deps.observe_photo,
+            self._user_id,
+            image_mime=image_mime,
+            image_b64=image_b64,
+            main_provider_config=accounted_config,
+            api_key=self._api_key,
+            runtime_token=self._runtime_token,
+        )
+
+
 def _make_photo_observer(
     deps: TurnDeps,
     *,
@@ -3743,42 +3816,13 @@ def _make_photo_observer(
     api_key: str | None,
     runtime_token: str,
 ):
-    call_invocations: dict[str, int] = {}
-
-    async def _observe(
-        image_mime: str,
-        image_b64: str,
-        *,
-        call_id: str,
-    ) -> str:
-        if deps.observe_photo is None:
-            raise _PhotoObserverUnavailable("photo observer is not wired")
-        accounted_config = provider_config
-        attempt_context = getattr(provider_config, "provider_attempt_context", None)
-        if attempt_context is not None:
-            invocation = call_invocations.get(call_id, 0) + 1
-            call_invocations[call_id] = invocation
-            call_digest = hashlib.sha256(
-                f"{call_id}:{invocation}".encode("utf-8")
-            ).hexdigest()[:16]
-            accounted_config = provider_client.with_provider_attempt_call(
-                provider_config,
-                call_id=(
-                    f"v2job:{attempt_context.job_id}:vision-tool:{call_digest}"
-                ),
-                round_id=f"vision-tool:{call_digest}",
-            )
-        return await asyncio.to_thread(
-            deps.observe_photo,
-            user_id,
-            image_mime=image_mime,
-            image_b64=image_b64,
-            main_provider_config=accounted_config,
-            api_key=api_key,
-            runtime_token=runtime_token,
-        )
-
-    return _observe
+    return _BoundPhotoObserver(
+        deps,
+        user_id=user_id,
+        provider_config=provider_config,
+        api_key=api_key,
+        runtime_token=runtime_token,
+    )
 
 
 def _make_provider_usage_dispatcher(

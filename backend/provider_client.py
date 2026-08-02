@@ -2904,14 +2904,12 @@ def _traced_sync_json_post(
     entry["accounting_outcome"] = outcome.value
     entry["accounting_error_class"] = error_class.value
     entry["possibly_billed"] = possibly_billed
-    entry["first_byte_at"] = _attempt_timestamp(
+    entry["finished_at"] = _attempt_timestamp(
         started_at, started_ns, finished_ns
     ).isoformat()
-    entry["finished_at"] = entry["first_byte_at"]
     entry["duration_ms"] = round(
         max(0, finished_ns - started_ns) / 1_000_000.0, 3
     )
-    entry["ttft_ms"] = entry["duration_ms"]
     entry["provider_request_id"] = _request_id_from_response(response)
     try:
         entry["usage"] = _attempt_usage_from_response(provider, response)
