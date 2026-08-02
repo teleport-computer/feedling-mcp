@@ -152,6 +152,29 @@ account's configured BYOK credential, so the account owner bears those token
 costs. Actual usage depends on message size, summary size, tools, and the
 provider's context limit.
 
+## Genesis plaintext processing
+
+`POST /v1/genesis/imports/plaintext` allows one processing plaintext import per
+account. A second submission returns `409 import_job_active` and the existing
+`active_job_id`; clients should display or poll that job rather than retrying
+the unchanged upload. Done and failed jobs release the account slot.
+
+The worker uses the first real model request as a canary with a default
+60-second timeout. A failed canary ends the job with
+`distill_model_too_slow`; changing to a faster model is required before retry.
+Later provider timeout failures make at most two attempts. This timeout cap does
+not reduce the existing three-attempt budget for provider `429` and retryable
+`5xx` responses.
+
+Each successful map window is checkpointed before its public progress count is
+advanced. The checkpoint's candidates are stored as an encrypted shared
+envelope, not plaintext workflow metadata. Re-submitting the same failed
+`client_job_id` or input resumes that job, skips checkpointed map windows, and
+starts again from the unfinished map or reduction work. Status and onboarding
+validation retain the durable `processed_chunks` count and per-material
+`windows_done` / `windows_total` values after failure; only a completed job
+reports 100 percent.
+
 Automatic Runtime V2 heartbeat and agent-scheduled wake failures use a
 persistent per-user exponential retry delay. The delay starts at 60 seconds
 and is capped at one hour; a successful automatic wake clears it. A new

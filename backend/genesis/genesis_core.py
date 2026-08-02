@@ -701,6 +701,25 @@ def plaintext_import(
     if existing and str(existing.get("status") or "") == service.DONE_JOB_STATUS:
         return _job_response(existing, extra={"status": "done"}), 200
 
+    # Fast-path the stable 409 response. The partial unique index remains the
+    # authoritative cross-worker race guard between this read and insertion.
+    try:
+        active_jobs = db.genesis_list_jobs(store.user_id, limit=100)
+    except Exception:
+        active_jobs = []
+    active_plaintext = next((
+        job for job in active_jobs
+        if str((job or {}).get("status") or "") == "processing"
+        and isinstance((job or {}).get("metadata"), dict)
+        and str(job["metadata"].get("ingest") or "") == "plaintext"
+    ), None)
+    if active_plaintext:
+        return _bad(
+            "import_job_active",
+            409,
+            active_job_id=str(active_plaintext.get("job_id") or ""),
+        )
+
     try:
         prepared = prepare(payload)
     except ValueError as e:
@@ -708,13 +727,15 @@ def plaintext_import(
         return _bad_from_value_error(e, 400)
 
     if existing:
-        existing = db.genesis_set_job_status(
-            store.user_id,
-            str(existing.get("job_id") or ""),
-            status="processing",
-            output={"stage": "plaintext_queued"},
-            processed_chunks=0,
-        ) or existing
+        try:
+            existing = db.genesis_set_job_status(
+                store.user_id,
+                str(existing.get("job_id") or ""),
+                status="processing",
+                output={"stage": "plaintext_queued"},
+            ) or existing
+        except db.GenesisPlaintextJobActive as e:
+            return _bad("import_job_active", 409, active_job_id=e.active_job_id)
         service.write_genesis_state(store, existing, status="processing")
         start_job(
             store,
@@ -744,7 +765,9 @@ def plaintext_import(
             "total_chunks": len(prepared["chunk_texts"]),
             "total_bytes": total_bytes,
             "metadata": metadata,
-        })
+        }, initial_status="processing")
+    except db.GenesisPlaintextJobActive as e:
+        return _bad("import_job_active", 409, active_job_id=e.active_job_id)
     except ValueError as e:
         _log_plaintext_import_rejected(store, mode=mode, reason=str(e), payload=payload)
         return _bad_from_value_error(e, 400)
@@ -754,7 +777,6 @@ def plaintext_import(
         str(job.get("job_id") or ""),
         status="processing",
         output={"stage": "plaintext_queued"},
-        processed_chunks=0,
     ) or job
     service.write_genesis_state(store, job, status="processing")
     start_job(

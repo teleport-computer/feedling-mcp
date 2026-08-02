@@ -300,6 +300,10 @@ def test_runtime_success_statuses_and_non_json_media_are_explicit(
         }
         assert actual == expected, key
 
+    plaintext_responses = operations[("post", "/v1/genesis/imports/plaintext")]["responses"]
+    assert "409" in plaintext_responses
+    assert "import_job_active" in plaintext_responses["409"]["description"]
+
     image_responses = operations[
         ("get", "/v1/screen/frames/{frame_id}/image")
     ]["responses"]

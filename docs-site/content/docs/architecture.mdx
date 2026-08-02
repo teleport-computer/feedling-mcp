@@ -141,6 +141,22 @@ An [independent resident consumer](/docs/workflows/chat#independent-resident-loo
 uses the same encrypted queue-and-reply protocol but runs in infrastructure the
 user or integrator controls instead of Feedling's hosted runner.
 
+### Genesis plaintext imports
+
+The plaintext compatibility endpoint accepts onboarding material inside the
+managed confidential-VM boundary and sends only the required prompt to the
+user-selected model provider. PostgreSQL serializes processing plaintext jobs
+per account, so separate API workers cannot start two provider pipelines for
+the same account concurrently.
+
+After each successful map window, the API creates a shared encrypted envelope
+containing the resumable candidate output. PostgreSQL stores that envelope plus
+plaintext operational metadata such as job ID, material kind, window counts,
+status, and hashes. Candidate text is not written into the job JSON or progress
+fields. An authorized retry decrypts the checkpoint inside the trusted boundary
+and skips completed windows; successful completion deletes the checkpoint.
+Resident-sealed imports and their local plaintext boundary are unchanged.
+
 ### ElevenLabs voice calls
 
 1. An authenticated client creates a short-lived voice session with

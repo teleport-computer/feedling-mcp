@@ -4230,6 +4230,7 @@ class GenesisRedistillJobActive(Exception):
     active resident_redistill job per user" — NOT the ``(user_id, job_id)``
     primary key (that conflict is absorbed by ``ON CONFLICT ... DO NOTHING``
     below and simply returns ``None``, same as before this index existed).
+    Plaintext imports use the separate ``GenesisPlaintextJobActive`` contract.
 
     Carries the job_id of whichever OTHER job currently holds the exclusivity
     slot, so the caller (``genesis_core._resident_sealed_import``) can surface
@@ -4238,6 +4239,14 @@ class GenesisRedistillJobActive(Exception):
 
     def __init__(self, active_job_id: str):
         super().__init__(f"resident_redistill job already active: {active_job_id}")
+        self.active_job_id = active_job_id
+
+
+class GenesisPlaintextJobActive(Exception):
+    """A different processing plaintext import already owns this user's slot."""
+
+    def __init__(self, active_job_id: str):
+        super().__init__(f"plaintext import job already active: {active_job_id}")
         self.active_job_id = active_job_id
 
 
@@ -4255,8 +4264,18 @@ def _genesis_active_job_of_kind(conn, user_id: str, source_kind: str) -> dict | 
     return _genesis_row(cur, cur.fetchone())
 
 
+def _genesis_active_plaintext_job(conn, user_id: str) -> dict | None:
+    cur = conn.execute(
+        "SELECT * FROM genesis_import_jobs WHERE user_id = %s "
+        "AND status = 'processing' AND metadata->>'ingest' = 'plaintext' "
+        "ORDER BY updated_at DESC LIMIT 1",
+        (user_id,),
+    )
+    return _genesis_row(cur, cur.fetchone())
+
+
 def genesis_create_job(user_id: str, job: dict) -> dict | None:
-    """Insert a new genesis import job. Two distinct conflict shapes, kept apart
+    """Insert a new genesis import job. Conflict shapes stay explicit
     so callers can't mistake one for the other:
 
     (a) same ``(user_id, job_id)`` already exists (idempotent retry — job_id is
@@ -4267,7 +4286,10 @@ def genesis_create_job(user_id: str, job: dict) -> dict | None:
     (b) a DIFFERENT job_id of source_kind='resident_redistill' is already
         active for this user (0023's partial unique index) — raises
         ``GenesisRedistillJobActive(active_job_id=...)``. This can only happen
-        for that one job kind; every other kind's concurrency is unaffected.
+        for that one job kind.
+    (c) a DIFFERENT processing job with metadata.ingest='plaintext' is active
+        for this user (0074's partial unique index) — raises
+        ``GenesisPlaintextJobActive(active_job_id=...)``.
     """
     sql = (
         """
@@ -4301,6 +4323,10 @@ def genesis_create_job(user_id: str, job: dict) -> dict | None:
             # this failed statement was its own implicit transaction, so the
             # connection is immediately usable for the lookup below (no rollback
             # needed, unlike a multi-statement transaction).
+            metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+            if str(metadata.get("ingest") or "") == "plaintext":
+                active = _genesis_active_plaintext_job(conn, user_id)
+                raise GenesisPlaintextJobActive(active["job_id"] if active else "") from None
             active = _genesis_active_job_of_kind(conn, user_id, source_kind)
             raise GenesisRedistillJobActive(active["job_id"] if active else "") from None
         result = _genesis_row(cur, cur.fetchone())
@@ -4941,7 +4967,18 @@ def genesis_set_job_status(
         job_id,
     )
     with get_pool().connection() as conn:
-        cur = conn.execute(sql, params)
+        try:
+            cur = conn.execute(sql, params)
+        except psycopg.errors.UniqueViolation:
+            if status != "processing":
+                raise
+            active = _genesis_active_plaintext_job(conn, user_id)
+            if active:
+                raise GenesisPlaintextJobActive(active["job_id"]) from None
+            redistill = _genesis_active_job_of_kind(conn, user_id, "resident_redistill")
+            if redistill:
+                raise GenesisRedistillJobActive(redistill["job_id"]) from None
+            raise
         result = _genesis_row(cur, cur.fetchone())
     from tee_shadow import mirror
     mirror.execute(sql, (

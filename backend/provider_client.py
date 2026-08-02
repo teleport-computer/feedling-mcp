@@ -82,9 +82,23 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
         return None
 
 
+def _is_timeout_error(exc: BaseException) -> bool:
+    """Recognize both raw httpx timeouts and adapter-wrapped ProviderErrors."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, httpx.TimeoutException):
+            return True
+        current = current.__cause__ or current.__context__
+    normalized = re.sub(r"[^a-z]+", "", str(exc).lower())
+    return "timeout" in normalized or "deadlineexceeded" in normalized
+
+
 def reliable_chat_completion(
     *args: Any,
     max_attempts: int = 3,
+    max_timeout_attempts: int | None = None,
     base_delay_sec: float = 1.0,
     max_delay_sec: float = 30.0,
     **kwargs: Any,
@@ -98,6 +112,12 @@ def reliable_chat_completion(
     path (genesis CVM worker). Default `chat_completion` is untouched; opt-in.
     """
     attempts = max(1, int(max_attempts))
+    timeout_attempts_limit = (
+        attempts
+        if max_timeout_attempts is None
+        else max(1, min(int(max_timeout_attempts), attempts))
+    )
+    timeout_attempts = 0
     last_exc: BaseException | None = None
     for attempt in range(1, attempts + 1):
         try:
@@ -106,7 +126,11 @@ def reliable_chat_completion(
         except Exception as exc:  # noqa: BLE001 — classify, then re-raise or retry
             cls = classify_provider_error(exc)
             last_exc = exc
-            if cls == "provider_config" or attempt >= attempts:
+            is_timeout = _is_timeout_error(exc)
+            if is_timeout:
+                timeout_attempts += 1
+            timeout_exhausted = is_timeout and timeout_attempts >= timeout_attempts_limit
+            if cls == "provider_config" or attempt >= attempts or timeout_exhausted:
                 exc.feedling_error_class = (
                     "provider_config"
                     if cls == "provider_config"

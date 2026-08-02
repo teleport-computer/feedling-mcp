@@ -4,10 +4,12 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import provider_client  # noqa: E402
-from genesis.llm_client import GenesisLLMClient  # noqa: E402
+from genesis.llm_client import DistillModelTooSlowError, GenesisLLMClient  # noqa: E402
 
 
 def _runtime():
@@ -139,3 +141,46 @@ def test_genesis_llm_client_heartbeats_job_after_each_call(monkeypatch):
     )
 
     assert touched == [("usr", "job")]
+
+
+def test_genesis_canary_uses_real_first_call_once_then_normal_timeout(monkeypatch):
+    from genesis import llm_client
+
+    monkeypatch.setenv("FEEDLING_GENESIS_CANARY_TIMEOUT_SEC", "17")
+    monkeypatch.setattr(llm_client.db, "genesis_upsert_output", lambda *a, **k: None)
+    monkeypatch.setattr(llm_client.db, "genesis_touch_job", lambda *a, **k: None)
+    calls = []
+
+    def fake_completion(_runtime, _messages, **kwargs):
+        calls.append(kwargs)
+        return {"reply": "{}", "usage": {}}
+
+    client = GenesisLLMClient(completion_fn=fake_completion, canary=True)
+    for key in ("first", "second"):
+        client.complete(
+            user_id="usr",
+            job_id="job",
+            task_id=key,
+            runtime=_runtime(),
+            messages=[{"role": "user", "content": key}],
+            timeout=90,
+            idempotency_key=key,
+        )
+
+    assert [call["timeout"] for call in calls] == [17.0, 90]
+
+
+def test_genesis_canary_failure_has_stable_error(monkeypatch):
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("relay unavailable")
+
+    with pytest.raises(DistillModelTooSlowError, match="distill_model_too_slow") as exc:
+        GenesisLLMClient(completion_fn=fail, persist_output=False, canary=True).complete(
+            user_id="usr",
+            job_id="job",
+            task_id="first-map",
+            runtime=_runtime(),
+            messages=[{"role": "user", "content": "hello"}],
+            idempotency_key="first",
+        )
+    assert exc.value.feedling_error_class == "provider_config"

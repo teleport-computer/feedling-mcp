@@ -28,6 +28,7 @@ from notices import core as notices
 GENESIS_STATE_BLOB = "genesis_state"
 GENESIS_PERSONA_BLOB = "genesis_persona"
 GENESIS_VOICE_BLOB = "genesis_voice"
+GENESIS_CHECKPOINT_BLOB_PREFIX = "genesis_checkpoint:"
 GENESIS_SOURCE = "genesis_import"
 GENESIS_PERSONA_REF = f"user_blob:{GENESIS_PERSONA_BLOB}"
 GENESIS_VOICE_REF = f"user_blob:{GENESIS_VOICE_BLOB}"
@@ -87,6 +88,7 @@ FAILED_JOB_STATUS = "failed"
 # pre's daemon.py only needs to call the same write_genesis_state/mark_failed
 # seam, not duplicate the classification logic.
 GENESIS_ERROR_CODES = (
+    "distill_model_too_slow",
     "bad_api_key",
     "provider_timeout",
     "provider_quota",
@@ -99,6 +101,7 @@ GENESIS_ERROR_CODES = (
 )
 
 GENESIS_ERROR_HINTS: dict[str, str] = {
+    "distill_model_too_slow": "当前模型无法及时处理文件,请换更快的模型后重试",
     "bad_api_key": "模型 API key 无效或无权限,检查 key",
     # usr_9037eaa8 (2026-07-24): a relay "thinking" model timed out 15+ times
     # in a row; the old "稍后重试" hint sent the user retrying into the same
@@ -122,6 +125,9 @@ GENESIS_ERROR_HINTS: dict[str, str] = {
 # read by clients that render `required` verbatim, so the failure line ships
 # both languages; keep the two dicts key-identical (contract-tested).
 GENESIS_ERROR_HINTS_EN: dict[str, str] = {
+    "distill_model_too_slow": (
+        "the current model could not process the file promptly; switch to a faster model and retry"
+    ),
     "bad_api_key": "the model API key is invalid or unauthorized — check the key",
     "provider_timeout": (
         "the model timed out — thinking/slow models and unstable relays are "
@@ -209,6 +215,9 @@ def classify_genesis_error(error: str, exc: BaseException | None = None) -> str:
     """
     text = str(error or "")
     lower = text.lower()
+
+    if "distill_model_too_slow" in lower:
+        return "distill_model_too_slow"
 
     status_code = getattr(exc, "status_code", None)
     if isinstance(status_code, int):
@@ -436,6 +445,81 @@ def new_job_id() -> str:
     return core_util._new_public_id("genesis")
 
 
+def _checkpoint_blob_kind(job_id: str) -> str:
+    safe_job_id = _text(job_id, 100)
+    if not safe_job_id:
+        raise ValueError("genesis_checkpoint_job_id_required")
+    return f"{GENESIS_CHECKPOINT_BLOB_PREFIX}{safe_job_id}"
+
+
+def write_genesis_checkpoint(store: UserStore, job_id: str, checkpoint_doc: dict) -> None:
+    """Persist resumable Genesis state without storing candidate plaintext."""
+    if not isinstance(checkpoint_doc, dict):
+        raise ValueError("genesis_checkpoint_object_required")
+    raw = json.dumps(
+        checkpoint_doc,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = _sha256_hex(raw)
+    envelope, err = core_envelope._build_shared_envelope_for_store(
+        store,
+        raw,
+        item_id=f"genesis_checkpoint_{job_id}",
+    )
+    if envelope is None:
+        raise RuntimeError(f"genesis_checkpoint_envelope_failed:{err}")
+    kind = _checkpoint_blob_kind(job_id)
+    db.set_blob(store.user_id, kind, {
+        "v": 1,
+        "job_id": job_id,
+        "encrypted": True,
+        "content_envelope": envelope,
+        "sha256": digest,
+        "task_count": len(checkpoint_doc.get("tasks") or {}),
+        "updated_at": _now_iso(),
+    })
+    saved = db.get_blob_strict(store.user_id, kind)
+    if not isinstance(saved, dict) or str(saved.get("sha256") or "") != digest:
+        raise RuntimeError("genesis_checkpoint_write_failed")
+
+
+def load_genesis_checkpoint(
+    store: UserStore,
+    api_key: str | None,
+    job_id: str,
+    *,
+    runtime_token: str = "",
+) -> dict | None:
+    blob = db.get_blob_strict(store.user_id, _checkpoint_blob_kind(job_id))
+    if blob is None:
+        return None
+    envelope = blob.get("content_envelope") if isinstance(blob, dict) else None
+    if not isinstance(envelope, dict):
+        raise RuntimeError("genesis_checkpoint_envelope_missing")
+    raw = core_enclave._decrypt_envelope_via_enclave(
+        envelope,
+        api_key,
+        purpose="genesis_checkpoint",
+        runtime_token=runtime_token,
+    )
+    digest = _sha256_hex(raw)
+    if digest != str(blob.get("sha256") or ""):
+        raise RuntimeError("genesis_checkpoint_sha256_mismatch")
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("genesis_checkpoint_invalid_json") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("genesis_checkpoint_invalid_object")
+    return parsed
+
+
+def delete_genesis_checkpoint(store: UserStore, job_id: str) -> None:
+    db.delete_blob(store.user_id, _checkpoint_blob_kind(job_id))
+
+
 def gate_status_for_job_status(status: str) -> str:
     status = str(status or "").strip().lower()
     if status == DONE_JOB_STATUS:
@@ -491,7 +575,12 @@ def write_genesis_state(
     return state
 
 
-def create_import_job(store: UserStore, payload: dict) -> tuple[dict, int]:
+def create_import_job(
+    store: UserStore,
+    payload: dict,
+    *,
+    initial_status: str = "created",
+) -> tuple[dict, int]:
     job_id = _text(payload.get("job_id") or new_job_id(), 80)
     source_kind = _text(payload.get("source_kind") or payload.get("source") or "unknown", 80)
     try:
@@ -508,9 +597,12 @@ def create_import_job(store: UserStore, payload: dict) -> tuple[dict, int]:
         **metadata,
         "privacy_copy": PRIVACY_COPY,
     }
+    normalized_status = str(initial_status or "created").strip().lower()
+    if normalized_status not in {"created", "processing"}:
+        raise ValueError("invalid_initial_job_status")
     job = db.genesis_create_job(store.user_id, {
         "job_id": job_id,
-        "status": "created",
+        "status": normalized_status,
         "source_kind": source_kind,
         "file_manifest_hash": _text(payload.get("file_manifest_hash"), 128),
         "total_chunks": total_chunks,

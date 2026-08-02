@@ -80,6 +80,16 @@ def test_classify_provider_timeout_from_httpx_exception_type_name():
     ) == "provider_timeout"
 
 
+def test_classify_distill_model_too_slow_before_generic_timeout():
+    assert service.classify_genesis_error(
+        "plaintext_import_failed:DistillModelTooSlowError:distill_model_too_slow:ReadTimeout"
+    ) == "distill_model_too_slow"
+    copy = service.genesis_failure_required_text("distill_model_too_slow")
+    assert "换更快的模型" in copy
+    assert "switch to a faster model" in copy
+    assert "蒸馏" not in copy
+
+
 def test_classify_provider_timeout_from_live_httpx_exc():
     exc = httpx.ReadTimeout("timed out")
     assert service.classify_genesis_error("some wrapper text", exc) == "provider_timeout"

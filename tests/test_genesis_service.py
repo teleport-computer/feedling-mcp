@@ -118,6 +118,28 @@ def test_create_import_job_drops_plaintext_metadata(monkeypatch):
     assert "ai_persona" not in metadata
 
 
+def test_create_import_job_does_not_trust_payload_status(monkeypatch):
+    saved = {}
+
+    def fake_create(_user_id, job):
+        saved.update(job)
+        return {"job_id": job["job_id"], "status": job["status"]}
+
+    monkeypatch.setattr(service.db, "genesis_create_job", fake_create)
+    monkeypatch.setattr(service.db, "set_blob", lambda *_args: None)
+
+    service.create_import_job(_store(), {"job_id": "job_1", "status": "processing"})
+    assert saved["status"] == "created"
+
+    saved.clear()
+    service.create_import_job(
+        _store(),
+        {"job_id": "job_2"},
+        initial_status="processing",
+    )
+    assert saved["status"] == "processing"
+
+
 def test_create_import_job_is_idempotent_for_existing_job(monkeypatch):
     monkeypatch.setattr(service.db, "genesis_create_job", lambda *_args: None)
     monkeypatch.setattr(
@@ -1208,3 +1230,50 @@ def test_public_stage_maps_plaintext_reducer_to_friendly_phases():
     assert service.public_stage("plaintext_reducer_done") == "background_importing"
     assert service.public_stage("genesis_v2_foreground") == "chat_history_importing"  # unchanged
     assert service.public_stage("unknown_stage") == "unknown_stage"  # passthrough
+
+
+def test_genesis_checkpoint_persists_only_encrypted_content(monkeypatch):
+    stored = {}
+    raw_seen = {}
+
+    def build_envelope(_store, raw, *, item_id):
+        raw_seen["raw"] = raw
+        return {"body_ct": "ciphertext", "id": item_id}, ""
+
+    monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", build_envelope)
+    monkeypatch.setattr(
+        service.db,
+        "set_blob",
+        lambda user_id, kind, doc: stored.update(user_id=user_id, kind=kind, doc=doc),
+    )
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda *_args: stored["doc"])
+
+    checkpoint_doc = {
+        "tasks": {"fact-map::0": {"status": "done"}},
+        "map_outputs": {"fact-map::0": {"fact_candidates": [{"summary": "secret"}]}},
+    }
+    service.write_genesis_checkpoint(_store(), "job_1", checkpoint_doc)
+
+    assert json.loads(raw_seen["raw"]) == checkpoint_doc
+    assert stored["kind"] == "genesis_checkpoint:job_1"
+    assert "secret" not in json.dumps(stored["doc"])
+    assert stored["doc"]["encrypted"] is True
+
+
+def test_genesis_checkpoint_load_verifies_and_decrypts(monkeypatch):
+    checkpoint_doc = {"v": 1, "tasks": {}, "map_outputs": {}}
+    raw = json.dumps(
+        checkpoint_doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+    blob = {
+        "content_envelope": {"body_ct": "ciphertext"},
+        "sha256": service._sha256_hex(raw),
+    }
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda *_args: blob)
+    monkeypatch.setattr(
+        service.core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, api_key, **kwargs: raw,
+    )
+
+    assert service.load_genesis_checkpoint(_store(), "api-key", "job_1") == checkpoint_doc

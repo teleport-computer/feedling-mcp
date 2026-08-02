@@ -5,6 +5,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from genesis import genesis_core, plaintext, service  # noqa: E402
@@ -13,6 +15,23 @@ from urllib.parse import urlparse  # noqa: E402
 
 def _store(user_id: str = "usr_plaintext"):
     return types.SimpleNamespace(user_id=user_id)
+
+
+@pytest.fixture(autouse=True)
+def _memory_checkpoint(monkeypatch):
+    checkpoints = {}
+
+    def load(_store, _api_key, job_id, **_kwargs):
+        value = checkpoints.get(job_id)
+        return json.loads(json.dumps(value)) if value is not None else None
+
+    def write(_store, job_id, doc):
+        checkpoints[job_id] = json.loads(json.dumps(doc))
+
+    monkeypatch.setattr(plaintext.service, "load_genesis_checkpoint", load)
+    monkeypatch.setattr(plaintext.service, "write_genesis_checkpoint", write)
+    monkeypatch.setattr(plaintext.service, "delete_genesis_checkpoint", lambda *_args: None)
+    monkeypatch.setattr(plaintext.db, "genesis_get_job", lambda *_args: None)
 
 
 class _Resp:
@@ -193,8 +212,9 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
 
     monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [])
 
-    def fake_create(_store, create_payload):
+    def fake_create(_store, create_payload, *, initial_status="created"):
         captured["create_payload"] = create_payload
+        captured["initial_status"] = initial_status
         job = {
             "job_id": "genesis_job_1",
             "status": "created",
@@ -252,6 +272,72 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
     assert captured["create_payload"]["metadata"]["ingest"] == "plaintext"
     assert captured["create_payload"]["metadata"]["client_job_id"] == "ios_job_1"
     assert captured["create_payload"]["metadata"]["timeline_span_days"] == 0
+    assert captured["initial_status"] == "processing"
+
+
+def test_plaintext_import_rejects_second_processing_job_with_active_id(monkeypatch):
+    client = _client(monkeypatch)
+    active = {
+        "job_id": "genesis_active",
+        "status": "processing",
+        "metadata": {"ingest": "plaintext", "input_hash": "different"},
+    }
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [active])
+    monkeypatch.setattr(
+        plaintext.service,
+        "create_import_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not create")),
+    )
+
+    resp = client.post(
+        "/v1/genesis/imports/plaintext",
+        json={"format": "plaintext", "content": "User: second upload"},
+    )
+
+    assert resp.status_code == 409
+    assert resp.get_json() == {
+        "error": "import_job_active",
+        "active_job_id": "genesis_active",
+    }
+
+
+def test_plaintext_import_reuses_failed_job_for_checkpoint_resume(monkeypatch):
+    client = _client(monkeypatch)
+    payload = {"format": "plaintext", "content": "User: retry me"}
+    failed = {
+        "job_id": "genesis_failed",
+        "status": "failed",
+        "metadata": {
+            "ingest": "plaintext",
+            "input_hash": plaintext.history_import._history_import_payload_hash(payload),
+            "mode": "onboarding",
+        },
+    }
+    list_calls = {"n": 0}
+
+    def list_jobs(*_args, **_kwargs):
+        list_calls["n"] += 1
+        return [failed]
+
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", list_jobs)
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        lambda *_args, **_kwargs: {**failed, "status": "processing"},
+    )
+    started = {}
+    monkeypatch.setattr(
+        plaintext,
+        "_start_plaintext_genesis_job",
+        lambda _store, _api_key, job, **_kwargs: started.update(job=job) or True,
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+
+    resp = client.post("/v1/genesis/imports/plaintext", json=payload)
+
+    assert resp.status_code == 202
+    assert resp.get_json()["job"]["job_id"] == "genesis_failed"
+    assert started["job"]["status"] == "processing"
 
 
 def test_plaintext_import_reuses_done_job_without_restart(monkeypatch):
@@ -494,6 +580,7 @@ def test_plaintext_background_runner_distills_and_applies(monkeypatch):
 
     def fake_build(**kwargs):
         calls["build"] = kwargs
+        kwargs["on_map_completed"](0, {"fact_candidates": []})
         return {"memories": [], "identity": {}, "voice": {}, "persona": {}}
 
     monkeypatch.setattr(plaintext.worker, "build_reducer_output_from_texts", fake_build)
@@ -521,6 +608,14 @@ def test_plaintext_background_runner_distills_and_applies(monkeypatch):
     assert calls["build"]["source_kind"] == "history_import"
     assert calls["applied"]["memories"] == []
     assert calls["statuses"][-1]["processed_chunks"] == 1
+    assert calls["statuses"][-1]["status"] == service.DONE_JOB_STATUS
+    assert calls["statuses"][-1]["output"]["materials"] == [{
+        "kind": "chat_history",
+        "status": "done",
+        "windows_done": 1,
+        "windows_total": 1,
+        "cards": 0,
+    }]
     assert [
         event["type"]
         for event in trace_events
@@ -689,6 +784,80 @@ def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(mon
     serialized = json.dumps(applied, ensure_ascii=False)
     assert "WrongUserName" not in serialized
     assert "bad user persona" not in serialized
+
+
+def test_plaintext_retry_uses_checkpoint_and_skips_completed_maps(monkeypatch):
+    store = _store()
+    calls = {"maps": 0, "reduces": 0, "failures": []}
+    monkeypatch.setattr(plaintext.worker, "genesis_v2_enabled", lambda: True)
+    monkeypatch.setattr(plaintext.worker, "genesis_combined_map_enabled", lambda: True)
+    monkeypatch.setattr(plaintext.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    monkeypatch.setattr(plaintext, "_resolve_plaintext_user_name", lambda *_args: "TA")
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_set_job_status",
+        lambda _uid, _jid, **kwargs: {"job_id": "resume_job", "status": kwargs["status"]},
+    )
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+
+    def foreground_map(**kwargs):
+        if 0 not in (kwargs.get("resume_map_outputs") or {}):
+            calls["maps"] += 1
+            kwargs["on_map_completed"](0, {"fact_candidates": [{"summary": "remembered"}]})
+        return {
+            "source_family": "history",
+            "all_fact_candidates": [{"summary": "remembered"}],
+            "core_fact_candidates": [{"summary": "remembered"}],
+        }
+
+    monkeypatch.setattr(plaintext.worker, "build_foreground_output_from_texts", foreground_map)
+
+    def reduce_candidates(**_kwargs):
+        calls["reduces"] += 1
+        if calls["reduces"] == 1:
+            raise RuntimeError("forced reduce failure")
+        return {"memories": [{"summary": "remembered"}], "identity": {}}
+
+    monkeypatch.setattr(plaintext.worker, "build_memory_output_from_fact_candidates", reduce_candidates)
+    monkeypatch.setattr(
+        plaintext.worker,
+        "build_voice_persona_output_from_candidates",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        plaintext,
+        "_plaintext_merge_reducer_outputs",
+        lambda *_args, **_kwargs: {"memories": [{"summary": "remembered"}]},
+    )
+    monkeypatch.setattr(
+        plaintext.foreground_identity,
+        "derive_foreground_identity",
+        lambda **_kwargs: ({"agent_name": "", "dimensions": []}, []),
+    )
+    monkeypatch.setattr(plaintext.lightweight_identity, "derive_from_support", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(plaintext.lightweight_identity, "has_signal", lambda *_args: False)
+    monkeypatch.setattr(plaintext, "_append_plaintext_onboarding_greeting", lambda *_args, **_kwargs: "hi")
+    monkeypatch.setattr(plaintext.service, "apply_reducer_output", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        plaintext.service,
+        "mark_failed",
+        lambda _store, _job_id, error, **_kwargs: calls["failures"].append(error),
+    )
+
+    kwargs = {
+        "source_groups": [{
+            "source_kind": "history_import",
+            "source_family": "history",
+            "chunk_texts": ["window one"],
+        }],
+        "analysis_messages": [{"role": "user", "content": "window one"}],
+    }
+    plaintext._run_plaintext_genesis_job(store, "api_key", "resume_job", **kwargs)
+    plaintext._run_plaintext_genesis_job(store, "api_key", "resume_job", **kwargs)
+
+    assert calls["maps"] == 1
+    assert calls["reduces"] == 2
+    assert len(calls["failures"]) == 1
 
 
 def test_plaintext_relationship_anchor_uses_earliest_timestamp_when_no_date():
@@ -1157,7 +1326,7 @@ def test_update_identity_plaintext_enqueues_without_existing_identity(monkeypatc
     monkeypatch.setattr(
         plaintext.service,
         "create_import_job",
-        lambda _store, payload: ({
+        lambda _store, payload, **_kwargs: ({
             "job_id": "identity_create",
             "status": "created",
             "source_kind": payload["source_kind"],

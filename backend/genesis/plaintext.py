@@ -19,7 +19,8 @@ from typing import Any
 import db
 import debug_trace
 from core import enclave as core_enclave
-from genesis import dedup, foreground, foreground_identity, lightweight_identity, service, worker
+from genesis import checkpoint, dedup, foreground, foreground_identity, lightweight_identity, service, worker
+from genesis.llm_client import GenesisLLMClient
 from hosted import config_store as hosted_config_store
 from hosted import history_import
 from identity import service as identity_service
@@ -28,8 +29,6 @@ from notices import catalog
 from notices import core as notices_core
 
 _SECONDS_PER_DAY = 24 * 60 * 60
-_PLAINTEXT_ACTIVE_LOCK = threading.Lock()
-_PLAINTEXT_ACTIVE_JOBS: set[tuple[str, str]] = set()
 _PLAINTEXT_SOURCE_ORDER = (
     history_import._AI_PERSONA_SOURCE,
     history_import._HISTORY_SOURCE,
@@ -326,6 +325,140 @@ def _metadata_plaintext_mode(metadata: dict) -> str:
     return _plaintext_mode_from_client_job_id(str(metadata.get("client_job_id") or ""))
 
 
+def _plaintext_map_task_id(source_pass: int, source_family: str) -> str:
+    return f"plaintext-map:{source_pass}:{source_family}"
+
+
+class _PlaintextCheckpointProgress:
+    """Encrypted map checkpoint plus the non-content progress projection."""
+
+    def __init__(self, store, api_key: str | None, job_id: str, source_groups: list[dict]):
+        self.store = store
+        self.api_key = api_key
+        self.job_id = job_id
+        self.source_groups = source_groups
+        loaded = service.load_genesis_checkpoint(store, api_key, job_id)
+        self.doc = checkpoint.resume(loaded) if loaded else checkpoint.new_checkpoint()
+        self.doc.setdefault("map_outputs", {})
+        service.write_genesis_checkpoint(store, job_id, self.doc)
+        self.publish(stage="plaintext_reducer")
+
+    def _task_id(self, source_pass: int, source_family: str) -> str:
+        return _plaintext_map_task_id(source_pass, source_family)
+
+    def resume_outputs(self, source_pass: int, source_family: str) -> dict[int, dict]:
+        task_id = self._task_id(source_pass, source_family)
+        outputs = self.doc.get("map_outputs") if isinstance(self.doc.get("map_outputs"), dict) else {}
+        resumed: dict[int, dict] = {}
+        for idx in range(len(self.source_groups[source_pass - 1].get("chunk_texts") or [])):
+            key = checkpoint.task_key(task_id, idx)
+            value = outputs.get(key)
+            if checkpoint.is_task_done(self.doc, task_id, idx) and isinstance(value, dict):
+                resumed[idx] = value
+        return resumed
+
+    def record_map(self, source_pass: int, source_family: str, chunk_index: int, output: dict) -> None:
+        task_id = self._task_id(source_pass, source_family)
+        key = checkpoint.task_key(task_id, chunk_index)
+        outputs = dict(self.doc.get("map_outputs") or {})
+        outputs[key] = output
+        self.doc["map_outputs"] = outputs
+        self.doc = checkpoint.upsert_task(
+            self.doc,
+            task_id=task_id,
+            chunk_id=chunk_index,
+            status=checkpoint.TASK_DONE,
+            source_pass=str(source_pass),
+            output_summary=f"candidates={len(output.get('fact_candidates') or [])}",
+        )
+        # Durable checkpoint first, visible progress second. A crash can under-report
+        # completed work, but can never report a window that cannot be resumed.
+        service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
+        self.publish(
+            stage="plaintext_reducer",
+            source_family=source_family,
+            source_pass=source_pass,
+        )
+
+    def record_non_map_group(self, source_pass: int, source_family: str) -> None:
+        """Mark direct-reduce source windows complete after that reduce succeeds."""
+        task_id = self._task_id(source_pass, source_family)
+        total = len(self.source_groups[source_pass - 1].get("chunk_texts") or [])
+        for chunk_index in range(total):
+            if checkpoint.is_task_done(self.doc, task_id, chunk_index):
+                continue
+            self.doc = checkpoint.upsert_task(
+                self.doc,
+                task_id=task_id,
+                chunk_id=chunk_index,
+                status=checkpoint.TASK_DONE,
+                source_pass=str(source_pass),
+                output_summary="direct_reduce_complete",
+            )
+        service.write_genesis_checkpoint(self.store, self.job_id, self.doc)
+        self.publish(
+            stage="plaintext_reducer",
+            source_family=source_family,
+            source_pass=source_pass,
+        )
+
+    def materials(self, *, active_pass: int = 0) -> list[dict]:
+        materials: list[dict] = []
+        for source_pass, group in enumerate(self.source_groups, start=1):
+            family = str(group.get("source_family") or "history")
+            task_id = self._task_id(source_pass, family)
+            total = len(group.get("chunk_texts") or [])
+            done = sum(
+                1 for idx in range(total)
+                if checkpoint.is_task_done(self.doc, task_id, idx)
+            )
+            if total and done >= total:
+                status = "done"
+            elif source_pass == active_pass or done:
+                status = "processing"
+            else:
+                status = "pending"
+            materials.append({
+                "kind": "chat_history" if family == "history" else family,
+                "status": status,
+                "windows_done": done,
+                "windows_total": total,
+                "cards": 0,
+            })
+        return materials
+
+    def processed_chunks(self) -> int:
+        return sum(item["windows_done"] for item in self.materials())
+
+    def publish(
+        self,
+        *,
+        stage: str,
+        source_family: str = "",
+        source_pass: int = 0,
+        status: str = "processing",
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        output: dict[str, Any] = {
+            "stage": stage,
+            "materials": self.materials(active_pass=source_pass),
+        }
+        if source_family:
+            output["source_family"] = source_family
+        if source_pass:
+            output["source_pass"] = source_pass
+            output["source_pass_total"] = len(self.source_groups)
+        if extra:
+            output.update(extra)
+        db.genesis_set_job_status(
+            self.store.user_id,
+            self.job_id,
+            status=status,
+            output=output,
+            processed_chunks=self.processed_chunks(),
+        )
+
+
 def _find_reusable_plaintext_job(
     store,
     *,
@@ -338,8 +471,6 @@ def _find_reusable_plaintext_job(
     except Exception:
         return None
     for job in jobs:
-        if str(job.get("status") or "") == service.FAILED_JOB_STATUS:
-            continue
         metadata = _metadata_for_job(job)
         if metadata.get("ingest") != "plaintext":
             continue
@@ -761,6 +892,8 @@ def _run_plaintext_genesis_v2(
     relationship_anchor: dict | None = None,
     analysis_messages: list[dict] | None = None,
     user_name: str = "",
+    llm: GenesisLLMClient | None = None,
+    progress: _PlaintextCheckpointProgress | None = None,
 ) -> bool:
     """Genesis v2 foreground-fast orchestration (behind FEEDLING_GENESIS_V2_ENABLED).
 
@@ -837,6 +970,13 @@ def _run_plaintext_genesis_v2(
             include_voice_candidates=combined_map,
             write_core=False,
             user_name=user_name,
+            llm=llm,
+            resume_map_outputs=(progress.resume_outputs(idx, group_family) if progress else None),
+            on_map_completed=(
+                (lambda chunk_index, output, source_pass=idx, family=group_family:
+                 progress.record_map(source_pass, family, chunk_index, output))
+                if progress else None
+            ),
         )
         foreground_reduces.append(reduce)
         voice_candidates.extend([c for c in (reduce.get("voice_candidates") or []) if isinstance(c, dict)])
@@ -869,6 +1009,7 @@ def _run_plaintext_genesis_v2(
         runtime=runtime,
         fact_candidates=all_fact_candidates,
         user_name=user_name,
+        llm=llm,
     )
     fg_merged = _plaintext_merge_reducer_outputs(
         [{**primary_reduce, **full_fact_write}],
@@ -883,6 +1024,7 @@ def _run_plaintext_genesis_v2(
             voice_candidates=voice_candidates,
             existing_persona={"content": "\n\n".join(persona_material_parts).strip()} if persona_material_parts else None,
             user_name=user_name,
+            llm=llm,
         )
         fg_merged = _plaintext_merge_reducer_outputs(
             [{**fg_merged, **voice_persona_output}],
@@ -987,6 +1129,16 @@ def _run_plaintext_genesis_v2(
         )
         service.apply_reducer_output(store, api_key, job_id, fg_merged)
 
+    if progress:
+        progress.publish(
+            stage="genesis_v2_foreground_ready",
+            status=service.DONE_JOB_STATUS,
+            extra={
+                "history_windows_total": hw_total,
+                "history_windows_failed": hw_failed,
+            },
+        )
+
     if fresh_start_only:
         # No material by definition -> nothing to enrich. Background here would
         # re-reduce the pure sentinel as history with write_identity=True (prod
@@ -1016,6 +1168,8 @@ def _run_plaintext_genesis_v2(
             known_memories=core_memory_texts, write_identity=not identity_first,
             include_memory=False,
             user_name=user_name,
+            llm=llm,
+            progress=progress,
         )
     except Exception as e:  # noqa: BLE001
         db.genesis_set_job_status(
@@ -1040,6 +1194,8 @@ def _run_plaintext_background_enrichment(
     write_identity: bool = True,
     include_memory: bool = True,
     user_name: str = "",
+    llm: GenesisLLMClient | None = None,
+    progress: _PlaintextCheckpointProgress | None = None,
 ) -> None:
     """Background continuation: the full reduce over every group (skipping the core the
     foreground already wrote for skip_family), then apply the REST incrementally —
@@ -1060,11 +1216,19 @@ def _run_plaintext_background_enrichment(
         group_chunks = [str(t) for t in (group.get("chunk_texts") or []) if str(t or "").strip()]
         if not group_chunks:
             continue
-        db.genesis_set_job_status(
-            store.user_id, job_id, status=service.DONE_JOB_STATUS,
-            output={"stage": "genesis_v2_background", "source_family": group_family,
-                    "source_pass": idx, "source_pass_total": len(source_groups)},
-        )
+        if progress:
+            progress.publish(
+                stage="genesis_v2_background",
+                source_family=group_family,
+                source_pass=idx,
+                status=service.DONE_JOB_STATUS,
+            )
+        else:
+            db.genesis_set_job_status(
+                store.user_id, job_id, status=service.DONE_JOB_STATUS,
+                output={"stage": "genesis_v2_background", "source_family": group_family,
+                        "source_pass": idx, "source_pass_total": len(source_groups)},
+            )
         output = worker.build_reducer_output_from_texts(
             user_id=store.user_id, job_id=job_id,
             key_prefix=f"{job_id}:source_pass:{idx}:{group_family}",
@@ -1075,6 +1239,13 @@ def _run_plaintext_background_enrichment(
             known_memories=known if group_family == skip_family else None,
             include_memory=include_memory,
             user_name=user_name,
+            llm=llm,
+            resume_map_outputs=(progress.resume_outputs(idx, group_family) if progress else None),
+            on_map_completed=(
+                (lambda chunk_index, mapped, source_pass=idx, family=group_family:
+                 progress.record_map(source_pass, family, chunk_index, mapped))
+                if progress else None
+            ),
         )
         reducer_outputs.append(output)
         next_persona = _plaintext_existing_persona_from_output(output)
@@ -1121,9 +1292,12 @@ def _run_plaintext_background_enrichment(
         )
     service.write_persona_artifact(store, job_id, merged)
     service.write_voice_artifact(store, job_id, merged)
-    db.genesis_set_job_status(
-        store.user_id, job_id, status=service.DONE_JOB_STATUS, output={"stage": "genesis_v2_done"},
-    )
+    if progress:
+        progress.publish(stage="genesis_v2_done", status=service.DONE_JOB_STATUS)
+    else:
+        db.genesis_set_job_status(
+            store.user_id, job_id, status=service.DONE_JOB_STATUS, output={"stage": "genesis_v2_done"},
+        )
     # NOTE: deliberately no notices_core.resolve() here. This function is a pure
     # continuation after the job already completed (foreground already ran either
     # the identity-first path, which resolves at :799, or service.apply_reducer_output
@@ -1190,6 +1364,8 @@ def _run_plaintext_add_memory_job(
     source_groups: list[dict],
     relationship_anchor: dict | None = None,
     user_name: str = "",
+    llm: GenesisLLMClient | None = None,
+    progress: _PlaintextCheckpointProgress | None = None,
 ) -> None:
     # this add_memory job path bypasses service.apply_reducer_output (which resolves
     # genesis notices for the reducer-driven completion path) -> resolve here too, at
@@ -1231,6 +1407,13 @@ def _run_plaintext_add_memory_job(
             write_core=False,
             keep_all=keep_all,
             user_name=user_name,
+            llm=llm,
+            resume_map_outputs=(progress.resume_outputs(idx, group_family) if progress else None),
+            on_map_completed=(
+                (lambda chunk_index, mapped, source_pass=idx, family=group_family:
+                 progress.record_map(source_pass, family, chunk_index, mapped))
+                if progress else None
+            ),
         )
         if not first_output:
             first_output = output
@@ -1245,6 +1428,7 @@ def _run_plaintext_add_memory_job(
         fact_candidates=fact_candidates,
         keep_all=keep_all_job,
         user_name=user_name,
+        llm=llm,
     )
     merged = _plaintext_merge_reducer_outputs([{**first_output, **memory_output}], relationship_anchor=relationship_anchor)
     raw_items = merged.get("memories")
@@ -1276,6 +1460,8 @@ def _run_plaintext_add_memory_job(
     )
     if completed:
         service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
+        if progress:
+            progress.publish(stage="plaintext_add_memory_done", status=service.DONE_JOB_STATUS)
     _write_back_plaintext_user_name(store, api_key, user_name)
 
 
@@ -1288,6 +1474,8 @@ def _run_plaintext_update_identity_job(
     analysis_messages: list[dict] | None,
     relationship_anchor: dict | None = None,
     user_name: str = "",
+    llm: GenesisLLMClient | None = None,
+    progress: _PlaintextCheckpointProgress | None = None,
 ) -> str | None:
     msgs = analysis_messages if isinstance(analysis_messages, list) else []
     language = history_import._import_language_for_store(store, msgs)
@@ -1329,6 +1517,7 @@ def _run_plaintext_update_identity_job(
             source_family="ai_persona",
             existing_persona=existing_persona,
             user_name=user_name,
+            llm=llm,
         )
     except Exception as e:  # noqa: BLE001
         service.mark_failed(
@@ -1348,6 +1537,10 @@ def _run_plaintext_update_identity_job(
             store, job_id, f"persona_write_failed:{type(e).__name__}:{str(e)[:160]}", exc=e,
         )
         return
+    if progress:
+        for source_pass, group in enumerate(progress.source_groups, start=1):
+            family = str(group.get("source_family") or "ai_persona")
+            progress.record_non_map_group(source_pass, family)
     completed = db.genesis_complete_job(
         store.user_id,
         job_id,
@@ -1359,6 +1552,8 @@ def _run_plaintext_update_identity_job(
     )
     if completed:
         service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
+        if progress:
+            progress.publish(stage="plaintext_update_identity_done", status=service.DONE_JOB_STATUS)
         # this update_identity path never goes through service.apply_reducer_output
         # (which resolves genesis notices on the other completion paths) -> resolve
         # here too, so a prior genesis_failed notice from an earlier failed attempt
@@ -1382,7 +1577,6 @@ def _run_plaintext_genesis_job(
     relationship_anchor: dict | None = None,
     analysis_messages: list[dict] | None = None,
 ) -> None:
-    active_key = (store.user_id, job_id)
     started_at = time.time()
     group_count = len(source_groups) if isinstance(source_groups, list) else 0
     chunk_count = len(chunk_texts or [])
@@ -1413,7 +1607,6 @@ def _run_plaintext_genesis_job(
             job_id,
             status="processing",
             output={"stage": "plaintext_reducer"},
-            processed_chunks=0,
         )
         if job:
             service.write_genesis_state(store, job, status="processing")
@@ -1427,6 +1620,10 @@ def _run_plaintext_genesis_job(
             job_id=job_id,
             summary="runtime config loaded",
             detail={"mode": mode},
+        )
+        llm = GenesisLLMClient(canary=True)
+        progress = _PlaintextCheckpointProgress(
+            store, api_key, job_id, source_groups
         )
         user_name = _resolve_plaintext_user_name(
             store, api_key, runtime, source_groups
@@ -1442,6 +1639,8 @@ def _run_plaintext_genesis_job(
                 source_groups=source_groups,
                 relationship_anchor=relationship_anchor,
                 user_name=user_name,
+                llm=llm,
+                progress=progress,
             )
             _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="add memory job done",
                            detail={"mode": mode}, dur_ms=(time.time() - started_at) * 1000)
@@ -1457,6 +1656,8 @@ def _run_plaintext_genesis_job(
                 analysis_messages=analysis_messages,
                 relationship_anchor=relationship_anchor,
                 user_name=user_name,
+                llm=llm,
+                progress=progress,
             )
             _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="update identity job done",
                            detail={"mode": mode, "identity_status": identity_status or ""},
@@ -1471,6 +1672,8 @@ def _run_plaintext_genesis_job(
             runtime=runtime, source_groups=source_groups, relationship_anchor=relationship_anchor,
             analysis_messages=analysis_messages,
             user_name=user_name,
+            llm=llm,
+            progress=progress,
         ):
             _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="genesis v2 job handled",
                            detail={"mode": mode, "genesis_v2": True}, dur_ms=(time.time() - started_at) * 1000)
@@ -1521,7 +1724,15 @@ def _run_plaintext_genesis_job(
                 existing_persona=existing_persona,
                 existing_voice=existing_voice,
                 user_name=user_name,
+                llm=llm,
+                resume_map_outputs=progress.resume_outputs(idx, group_source_family),
+                on_map_completed=(
+                    lambda chunk_index, mapped, source_pass=idx, family=group_source_family:
+                    progress.record_map(source_pass, family, chunk_index, mapped)
+                ),
             )
+            if progress and group_source_family in {"ai_persona", "memory_summary"}:
+                progress.record_non_map_group(idx, group_source_family)
             _trace_genesis(
                 store,
                 "genesis.plaintext.reducer_pass.done",
@@ -1538,7 +1749,7 @@ def _run_plaintext_genesis_job(
                 dur_ms=(time.time() - pass_started_at) * 1000,
             )
             reducer_outputs.append(output)
-            processed_chunks += len(group_chunk_texts)
+            processed_chunks = progress.processed_chunks()
             next_persona = _plaintext_existing_persona_from_output(output)
             if next_persona:
                 existing_persona = next_persona
@@ -1551,13 +1762,7 @@ def _run_plaintext_genesis_job(
             relationship_anchor=relationship_anchor,
         )
         _attach_plaintext_user_name(reducer_output, user_name)
-        db.genesis_set_job_status(
-            store.user_id,
-            job_id,
-            status="processing",
-            output={"stage": "plaintext_reducer_done"},
-            processed_chunks=sum(len(group.get("chunk_texts") or []) for group in source_groups),
-        )
+        progress.publish(stage="plaintext_reducer_done")
         _trace_genesis(
             store,
             "genesis.plaintext.apply.started",
@@ -1571,6 +1776,7 @@ def _run_plaintext_genesis_job(
             },
         )
         service.apply_reducer_output(store, api_key, job_id, reducer_output)
+        progress.publish(stage="plaintext_reducer_done", status=service.DONE_JOB_STATUS)
         _write_back_plaintext_user_name(store, api_key, user_name)
         _trace_genesis(
             store,
@@ -1594,8 +1800,12 @@ def _run_plaintext_genesis_job(
             store, job_id, f"plaintext_import_failed:{type(e).__name__}:{str(e)[:220]}", exc=e,
         )
     finally:
-        with _PLAINTEXT_ACTIVE_LOCK:
-            _PLAINTEXT_ACTIVE_JOBS.discard(active_key)
+        try:
+            terminal_job = db.genesis_get_job(store.user_id, job_id)
+            if str((terminal_job or {}).get("status") or "") == service.DONE_JOB_STATUS:
+                service.delete_genesis_checkpoint(store, job_id)
+        except Exception:
+            pass
 
 
 def _start_plaintext_genesis_job(
@@ -1613,11 +1823,6 @@ def _start_plaintext_genesis_job(
     job_id = str(job.get("job_id") or "")
     if not job_id:
         return False
-    active_key = (store.user_id, job_id)
-    with _PLAINTEXT_ACTIVE_LOCK:
-        if active_key in _PLAINTEXT_ACTIVE_JOBS:
-            return False
-        _PLAINTEXT_ACTIVE_JOBS.add(active_key)
     thread = threading.Thread(
         target=_run_plaintext_genesis_job,
         args=(store, api_key, job_id),
@@ -1632,12 +1837,7 @@ def _start_plaintext_genesis_job(
         name=f"genesis-plaintext-{job_id[:24]}",
         daemon=True,
     )
-    try:
-        thread.start()
-    except Exception:
-        with _PLAINTEXT_ACTIVE_LOCK:
-            _PLAINTEXT_ACTIVE_JOBS.discard(active_key)
-        raise
+    thread.start()
     return True
 
 
