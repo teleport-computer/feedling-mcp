@@ -6600,18 +6600,26 @@ def usage_report_snapshot(query) -> dict:
         try:
             try:
                 report = _usage_report_snapshot_hybrid_parallel(query)
-                if report is not None:
-                    return report
+                if report is None:
+                    report = _usage_report_snapshot_raw(query)
+                    report["coverage"]["rollup"] = _usage_raw_freshness()
+                return report
             except _UsageReportAdmissionBusy:
                 raise
             except Exception:
                 log.exception(
-                    "usage rollup report unavailable; using raw fallback"
+                    "usage rollup report unavailable"
                 )
+                raise
         finally:
             _USAGE_REPORT_GATE.release()
     report = _usage_report_snapshot_raw(query)
-    report["coverage"]["rollup"] = {
+    report["coverage"]["rollup"] = _usage_raw_freshness()
+    return report
+
+
+def _usage_raw_freshness() -> dict:
+    return {
         "mode": "raw",
         "refreshed_at": None,
         "last_success_at": None,
@@ -6624,7 +6632,6 @@ def usage_report_snapshot(query) -> dict:
         "raw_days": None,
         "rollup_days": [],
     }
-    return report
 
 
 def _empty_runtime_user_delivery() -> dict:

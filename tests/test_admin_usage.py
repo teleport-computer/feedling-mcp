@@ -639,6 +639,101 @@ def test_usage_parallel_releases_rds_session_admission(usage_rows):
             conn.execute("DELETE FROM v2_usage_rollup_watermarks")
 
 
+def test_usage_parallel_core_failure_does_not_start_expensive_raw_fallback(
+    monkeypatch,
+):
+    raw_calls = 0
+
+    def fail_parallel(_query):
+        raise RuntimeError("core injected")
+
+    def raw_spy(_query):
+        nonlocal raw_calls
+        raw_calls += 1
+        return {}
+
+    monkeypatch.setattr(jobs_store, "_usage_report_snapshot_hybrid_parallel", fail_parallel)
+    monkeypatch.setattr(jobs_store, "_usage_report_snapshot_raw", raw_spy)
+
+    with pytest.raises(RuntimeError, match="core injected"):
+        jobs_store.usage_report_snapshot(_shanghai_usage_query())
+
+    assert raw_calls == 0
+
+
+def test_usage_raw_report_uses_short_pool_acquire(monkeypatch):
+    seen = []
+
+    class Pool:
+        def connection(self, *, timeout):
+            seen.append(timeout)
+            raise TimeoutError("raw checkout injected")
+
+    monkeypatch.setattr(jobs_store, "_pool", lambda: Pool())
+
+    with pytest.raises(TimeoutError, match="raw checkout injected"):
+        jobs_store._usage_report_snapshot_raw(_usage_query())
+
+    assert seen == [jobs_store._USAGE_REPORT_POOL_TIMEOUT_SECONDS]
+
+
+def test_usage_raw_report_sets_local_statement_timeout(monkeypatch, usage_rows):
+    real_pool = db.get_pool()
+    settings = []
+
+    class Cursor:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def execute(self, statement, params=None):
+            if "set_config('statement_timeout'" in str(statement):
+                settings.append(params[0])
+            return self.inner.execute(statement, params) if params is not None else self.inner.execute(statement)
+
+    class CursorContext:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            return Cursor(self.inner.__enter__())
+
+        def __exit__(self, *args):
+            return self.inner.__exit__(*args)
+
+    class Connection:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def cursor(self, *args, **kwargs):
+            return CursorContext(self.inner.cursor(*args, **kwargs))
+
+    class ConnectionContext:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            return Connection(self.inner.__enter__())
+
+        def __exit__(self, *args):
+            return self.inner.__exit__(*args)
+
+    class Pool:
+        def connection(self, *, timeout):
+            assert timeout == jobs_store._USAGE_REPORT_POOL_TIMEOUT_SECONDS
+            return ConnectionContext(real_pool.connection(timeout=timeout))
+
+    monkeypatch.setattr(jobs_store, "_pool", lambda: Pool())
+    jobs_store._usage_report_snapshot_raw(_usage_query())
+
+    assert settings == [str(jobs_store._USAGE_REPORT_STATEMENT_TIMEOUT_MS)]
+
+
 def _usage_render_report() -> dict:
     return {
         "overview": {
