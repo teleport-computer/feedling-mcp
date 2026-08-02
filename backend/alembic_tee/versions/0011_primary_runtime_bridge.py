@@ -117,10 +117,9 @@ CREATE TABLE IF NOT EXISTS voice_turn_streams (
 CREATE INDEX IF NOT EXISTS ix_voice_turn_streams_expiry
     ON voice_turn_streams(expires_at);
 
--- These are runtime-primary triggers, intentionally installed in the final
--- promotion migration rather than the shadow baseline.  Run 0011 only after
--- writers are frozen so the shadow replicator cannot manufacture cleanup work
--- between this DDL and the DSN switch.
+-- These are runtime-primary triggers, intentionally created DISABLED so 0011
+-- can land before the freeze without changing shadow behavior.  The offline
+-- cutover tool enables them with the owner role only after all writers stop.
 CREATE OR REPLACE FUNCTION enqueue_retired_chat_r2_body()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -185,6 +184,7 @@ DROP TRIGGER IF EXISTS chat_messages_retire_r2_body ON chat_messages;
 CREATE TRIGGER chat_messages_retire_r2_body
 AFTER DELETE OR UPDATE OF doc ON chat_messages
 FOR EACH ROW EXECUTE FUNCTION enqueue_retired_chat_r2_body();
+ALTER TABLE chat_messages DISABLE TRIGGER chat_messages_retire_r2_body;
 
 CREATE OR REPLACE FUNCTION enqueue_retired_archived_chat_r2_body()
 RETURNS trigger
@@ -220,6 +220,8 @@ DROP TRIGGER IF EXISTS chat_message_archive_retire_r2_body
 CREATE TRIGGER chat_message_archive_retire_r2_body
 AFTER DELETE ON chat_message_archive
 FOR EACH ROW EXECUTE FUNCTION enqueue_retired_archived_chat_r2_body();
+ALTER TABLE chat_message_archive
+    DISABLE TRIGGER chat_message_archive_retire_r2_body;
 
 CREATE OR REPLACE FUNCTION reject_archived_chat_update()
 RETURNS trigger LANGUAGE plpgsql AS $$
@@ -232,6 +234,7 @@ DROP TRIGGER IF EXISTS chat_message_archive_immutable ON chat_message_archive;
 CREATE TRIGGER chat_message_archive_immutable
 BEFORE UPDATE ON chat_message_archive
 FOR EACH ROW EXECUTE FUNCTION reject_archived_chat_update();
+ALTER TABLE chat_message_archive DISABLE TRIGGER chat_message_archive_immutable;
 """
 
 _DOWN = """

@@ -953,14 +953,18 @@ L1 **7219 passed / 0 failed**（含 `tests/test_envelope_storage_fields.py` 16 �
       `alembic_tee` 升到 `0011_primary_runtime_bridge`。backend、主 CVM
       `serve-worker`、独立 runner 必须同时设置 `FEEDLING_DATABASE_SCHEMA=tee`；该模式
       启动只读核对 `alembic_tee_version=head`，不得拿 app role 跑 RDS Alembic。
-      selector 与 DSN 任一错配都按启动失败处理；回滚时二者也必须一起恢复为 RDS。
+      同时核对 frozen-prepare marker 与三张 Chat lifecycle trigger 已启用；仅迁 schema
+      未 prepare 也拒绝启动。selector 与 DSN 任一错配都按启动失败处理；回滚时二者
+      也必须一起恢复为 RDS。
 - [ ] **冻结后的离线 prepare**：停掉全部写进程后先跑
       `python -m admin.phase4_cutover`（dry-run），再用
       `--apply --confirm-writes-frozen`。工具硬拦 genesis chunks/活跃 job、voice
       临时态、agent job/action queue、两张 V2 outbox 与 TEE pending-device 队列；随后原样搬
       `frame_envelopes` 兼容桥、补齐 live chat 的 `storage_generation` R2 fence、逐行
       digest 校验，并把 TEE 全部 identity sequence `setval(max)`。它不切 DSN、不
-      部署，避免工具失败留下半切状态。
+      部署；apply 另需同库 owner `TEE_MIGRATION_DATABASE_URL`，最后才启用 0011 预建
+      但默认 disabled 的 R2/Archive triggers 并写 prepared marker，避免工具失败留下
+      能被应用误启动的半切状态。
 - [ ] **FrameEnvelope v1 临时桥**：TEE 原 `frames` 是 enclave storage-key 的
       `frames-tee/` 投影，无法还原现有客户端需要的原始信封，Phase 4 不新增吐帧明文的
       enclave 端点。`0011` 在 TEE 主库暂留同形 `frame_envelopes`，冻结窗口原样复制

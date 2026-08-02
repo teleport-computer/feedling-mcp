@@ -11,7 +11,9 @@ Dry-run (default) performs no writes.  Mutation requires both explicit flags::
     python -m admin.phase4_cutover --apply --confirm-writes-frozen
 
 Environment: ``DATABASE_URL`` is the frozen RDS source and
-``TEE_DATABASE_URL`` is the owner-migrated TEE destination (app role is enough).
+``TEE_DATABASE_URL`` is the TEE app-role destination.  Apply additionally
+requires ``TEE_MIGRATION_DATABASE_URL`` for the same database's owner role so
+the cutover-only R2/immutability triggers can be enabled after copying stops.
 """
 
 from __future__ import annotations
@@ -28,6 +30,8 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from psycopg import sql
 from psycopg.types.json import Jsonb
+
+import db
 
 
 _DRAIN_GATES = {
@@ -49,6 +53,12 @@ _DRAIN_GATES = {
     "agent_action_queue": "SELECT count(*) FROM agent_action_queue",
     "v2_effect_outbox": "SELECT count(*) FROM v2_effect_outbox",
     "v2_terminal_failure_outbox": "SELECT count(*) FROM v2_terminal_failure_outbox",
+}
+
+_PRIMARY_TRIGGER_TABLES = {
+    "chat_messages_retire_r2_body": "chat_messages",
+    "chat_message_archive_retire_r2_body": "chat_message_archive",
+    "chat_message_archive_immutable": "chat_message_archive",
 }
 
 
@@ -234,6 +244,50 @@ def _align_identity_sequences(conn: psycopg.Connection) -> dict[str, int]:
     return aligned
 
 
+def _enabled_primary_triggers(conn: psycopg.Connection) -> set[str]:
+    return {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT tgname FROM pg_trigger "
+            "WHERE NOT tgisinternal AND tgenabled = 'O' AND tgname = ANY(%s)",
+            (list(_PRIMARY_TRIGGER_TABLES),),
+        ).fetchall()
+    }
+
+
+def _activate_primary_contract(owner: psycopg.Connection,
+                               app: psycopg.Connection,
+                               report: dict[str, object],
+                               tee_heads: set[str]) -> dict[str, object]:
+    """Owner-enable cutover-only triggers, then publish the startup marker."""
+    with owner.transaction():
+        for trigger, table in _PRIMARY_TRIGGER_TABLES.items():
+            owner.execute(
+                sql.SQL("ALTER TABLE {} ENABLE TRIGGER {}").format(
+                    sql.Identifier(table), sql.Identifier(trigger)
+                )
+            )
+    enabled = _enabled_primary_triggers(app)
+    if enabled != set(_PRIMARY_TRIGGER_TABLES):
+        raise RuntimeError(
+            "failed to enable TEE-primary triggers: "
+            f"expected={sorted(_PRIMARY_TRIGGER_TABLES)} actual={sorted(enabled)}"
+        )
+
+    marker = {
+        "prepared": True,
+        "tee_heads": sorted(tee_heads),
+        "frame_sha256": report["frame_bridge"]["sha256"],
+        "chat_generation_sha256": report["chat_storage_generations"]["sha256"],
+    }
+    app.execute(
+        "INSERT INTO server_config (key, value) VALUES (%s, %s) "
+        "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+        (db._TEE_PRIMARY_PREPARED_KEY, json.dumps(marker, sort_keys=True).encode("utf-8")),
+    )
+    return {"marker": marker, "enabled_triggers": sorted(enabled)}
+
+
 def run(*, apply: bool, writes_frozen: bool) -> dict[str, object]:
     source_url = _required_env("DATABASE_URL")
     destination_url = _required_env("TEE_DATABASE_URL")
@@ -290,6 +344,15 @@ def run(*, apply: bool, writes_frozen: bool) -> dict[str, object]:
                 source, destination
             )
         result["identity_sequences"] = _align_identity_sequences(destination)
+        owner_url = _required_env("TEE_MIGRATION_DATABASE_URL")
+        with psycopg.connect(owner_url, autocommit=True) as owner:
+            if _fingerprint(owner) != destination_fingerprint:
+                raise RuntimeError(
+                    "TEE_MIGRATION_DATABASE_URL does not resolve to TEE_DATABASE_URL"
+                )
+            result["primary_contract"] = _activate_primary_contract(
+                owner, destination, result, actual_heads
+            )
         result["ok"] = True
         return result
 

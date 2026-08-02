@@ -80,6 +80,17 @@ def test_phase4_prepare_copies_frame_bridge_and_aligns_sequences(monkeypatch):
         assert report["ok"] is True
         assert report["frame_bridge"]["rows"] == 1
         assert report["chat_storage_generations"]["rows"] == 1
+        assert set(report["primary_contract"]["enabled_triggers"]) == {
+            "chat_messages_retire_r2_body",
+            "chat_message_archive_retire_r2_body",
+            "chat_message_archive_immutable",
+        }
+
+        # The same app role now passes startup's read-only head + prepared
+        # marker + trigger assertion; no RDS Alembic table is created.
+        monkeypatch.setenv("DATABASE_URL", destination_url)
+        monkeypatch.setenv("FEEDLING_DATABASE_SCHEMA", "tee")
+        db.init_schema()
 
         with psycopg.connect(destination_url, autocommit=True) as destination:
             copied = destination.execute(

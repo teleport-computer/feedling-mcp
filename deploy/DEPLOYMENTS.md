@@ -642,6 +642,13 @@ a lossless current state. A later rollback must stop writes and reverse-reconcil
 or restore the TEE changes first; changing only the DSN would lose new/updated
 rows and resurrect deletes.
 
+The apply invocation also requires `TEE_MIGRATION_DATABASE_URL` for the TEE
+owner role. Revision 0011 creates the Chat R2-retirement and archive-immutability
+triggers disabled, so it is safe to migrate before the freeze; apply enables
+them only after data copying, then writes a head-bound prepared marker. TEE-mode
+application startup checks that marker and the three enabled triggers read-only
+and refuses to boot if the prepare was skipped or only partially completed.
+
 ### 磁盘 sizing 依据（实测 2026-07-13，prod RDS）
 
 CVM 磁盘创建时定死、事后扩容麻烦，故按「未来可能指向 prod / 长期不扩容」一次留够。
