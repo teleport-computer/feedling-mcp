@@ -15,7 +15,7 @@ import re
 import time
 import uuid
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 import psycopg
@@ -4653,7 +4653,181 @@ def _usage_optional_breakdown(
         return None
 
 
-def usage_report_snapshot(query) -> dict:
+_USAGE_FACT_TOKENS = (
+    "prompt_tokens",
+    "completion_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "cache_miss_tokens",
+)
+
+
+def _usage_fact_query(
+    query,
+    partition: usage_reporting.RollupPartition,
+    *,
+    dimensions: bool,
+    prefix: str | None = None,
+    include_dimension_filters: bool = True,
+) -> tuple[str, tuple[object, ...]]:
+    """Build a disjoint rollup/full-day + raw/edge fact relation."""
+
+    selected = prefix or query.completeness
+    if selected not in {"all", "metered", "unknown"}:
+        raise ValueError("unsupported usage completeness")
+    table = (
+        "v2_usage_daily_dimensions"
+        if dimensions
+        else "v2_usage_daily_users"
+    )
+    identity_columns = "lane,provider,model," if dimensions else ""
+    identity_group = (
+        ",coalesce(nullif(m.lane,''),'unknown'),"
+        "coalesce(nullif(m.provider,''),'unknown'),"
+        "coalesce(nullif(m.model,''),'unknown')"
+        if dimensions
+        else ""
+    )
+    identity_select = (
+        "coalesce(nullif(m.lane,''),'unknown') AS lane,"
+        "coalesce(nullif(m.provider,''),'unknown') AS provider,"
+        "coalesce(nullif(m.model,''),'unknown') AS model,"
+        if dimensions
+        else ""
+    )
+    selected_condition = {
+        "all": "TRUE",
+        "metered": "m.usage_reported_calls > 0",
+        "unknown": "m.usage_reported_calls < m.model_calls",
+    }[selected]
+    metered_prefix = "metered" if selected in {"all", "metered"} else None
+    metric_columns = (
+        "turns",
+        "model_calls",
+        "retries",
+        "failed_turns",
+        "usage_reported_calls",
+        "cache_reported_calls",
+        "unknown_usage_calls",
+    )
+    rollup_metrics = ",".join(
+        f"{selected}_{field} AS {field}" for field in metric_columns
+    )
+    rollup_tokens = ",".join(
+        f"{selected}_{field}_sum AS {field}_sum,"
+        f"{selected}_{field}_known_count AS {field}_known_count"
+        for field in _USAGE_FACT_TOKENS
+    )
+    if metered_prefix is None:
+        rollup_metered = ",".join(
+            f"NULL::bigint AS metered_{field}"
+            for field in ("turns", "prompt_tokens_sum", "prompt_tokens_known_count", "completion_tokens_sum", "completion_tokens_known_count")
+        )
+    else:
+        rollup_metered = ",".join(
+            f"{metered_prefix}_{field} AS metered_{field}"
+            for field in ("turns", "prompt_tokens_sum", "prompt_tokens_known_count", "completion_tokens_sum", "completion_tokens_known_count")
+        )
+    rollup_latency = (
+        f",{selected}_latency_samples AS latency_samples" if dimensions else ""
+    )
+    user_clauses: list[str] = []
+    rollup_params: list[object] = [list(partition.rollup_days)]
+    raw_starts: list[datetime] = []
+    raw_ends: list[datetime] = []
+    for raw_day in partition.raw_days:
+        day_start = datetime.combine(
+            raw_day, datetime.min.time(), tzinfo=usage_reporting.SHANGHAI
+        ).astimezone(timezone.utc)
+        day_end = datetime.combine(
+            raw_day + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=usage_reporting.SHANGHAI,
+        ).astimezone(timezone.utc)
+        raw_starts.append(max(day_start, query.start_at_utc))
+        raw_ends.append(min(day_end, query.end_at_utc))
+    raw_params: list[object] = [raw_starts, raw_ends]
+    if query.user_id:
+        user_clauses.append("coalesce(user_id,'unknown')=%s")
+        rollup_params.append(query.user_id)
+    rollup_dimension_clauses: list[str] = []
+    if dimensions and include_dimension_filters:
+        for field in ("lane", "provider", "model"):
+            value = getattr(query, field)
+            if value:
+                rollup_dimension_clauses.append(f"{field}=%s")
+                rollup_params.append(value)
+    rollup_where = ["local_day=ANY(%s::date[])", *user_clauses, *rollup_dimension_clauses]
+    if selected != "all":
+        rollup_where.append(f"{selected}_turns > 0")
+
+    raw_where = [selected_condition]
+    if query.user_id:
+        raw_where.append("coalesce(m.user_id,'unknown')=%s")
+        raw_params.append(query.user_id)
+    if dimensions and include_dimension_filters:
+        for field in ("lane", "provider", "model"):
+            value = getattr(query, field)
+            if value:
+                raw_where.append(
+                    f"coalesce(nullif(m.{field},''),'unknown')=%s"
+                )
+                raw_params.append(value)
+
+    raw_metrics = (
+        "count(*)::bigint AS turns,"
+        "coalesce(sum(m.model_calls),0)::bigint AS model_calls,"
+        "coalesce(sum(m.retries),0)::bigint AS retries,"
+        "count(*) FILTER (WHERE m.failed)::bigint AS failed_turns,"
+        "coalesce(sum(m.usage_reported_calls),0)::bigint AS usage_reported_calls,"
+        "coalesce(sum(m.cache_reported_calls),0)::bigint AS cache_reported_calls,"
+        "coalesce(sum(greatest(m.model_calls-m.usage_reported_calls,0)),0)::bigint AS unknown_usage_calls"
+    )
+    raw_tokens = ",".join(
+        f"coalesce(sum(m.{field}),0)::bigint AS {field}_sum,"
+        f"count(m.{field})::bigint AS {field}_known_count"
+        for field in _USAGE_FACT_TOKENS
+    )
+    raw_metered = (
+        "count(*) FILTER (WHERE m.usage_reported_calls>0)::bigint AS metered_turns,"
+        "coalesce(sum(m.prompt_tokens) FILTER (WHERE m.usage_reported_calls>0),0)::bigint AS metered_prompt_tokens_sum,"
+        "count(m.prompt_tokens) FILTER (WHERE m.usage_reported_calls>0)::bigint AS metered_prompt_tokens_known_count,"
+        "coalesce(sum(m.completion_tokens) FILTER (WHERE m.usage_reported_calls>0),0)::bigint AS metered_completion_tokens_sum,"
+        "count(m.completion_tokens) FILTER (WHERE m.usage_reported_calls>0)::bigint AS metered_completion_tokens_known_count"
+    )
+    raw_latency = (
+        ",coalesce(array_agg(m.latency_ms ORDER BY m.latency_ms,m.id) "
+        "FILTER (WHERE m.latency_ms IS NOT NULL),'{}'::integer[]) AS latency_samples"
+        if dimensions
+        else ""
+    )
+    statement = f"""
+WITH raw_ranges(start_at,end_at) AS (
+  SELECT * FROM unnest(%s::timestamptz[],%s::timestamptz[])
+), facts AS (
+SELECT local_day,coalesce(user_id,'unknown') AS user_id,{identity_columns}
+  first_metric_at,last_metric_at,last_model_call_at,
+  {rollup_metrics},{rollup_tokens},{rollup_metered}{rollup_latency}
+FROM {table}
+WHERE {' AND '.join(rollup_where)}
+UNION ALL
+SELECT (m.created_at AT TIME ZONE 'Asia/Shanghai')::date AS local_day,
+  coalesce(m.user_id,'unknown') AS user_id,{identity_select}
+  min(m.created_at) AS first_metric_at,max(m.created_at) AS last_metric_at,
+  max(m.created_at) FILTER (WHERE m.model_calls>0) AS last_model_call_at,
+  {raw_metrics},{raw_tokens},{raw_metered}{raw_latency}
+FROM raw_ranges rr
+JOIN v2_turn_metrics m
+  ON m.created_at >= rr.start_at AND m.created_at < rr.end_at
+WHERE {' AND '.join(raw_where)}
+GROUP BY (m.created_at AT TIME ZONE 'Asia/Shanghai')::date,m.user_id{identity_group}
+)
+SELECT * FROM facts
+"""
+    return statement, tuple(raw_params[:2] + rollup_params + raw_params[2:])
+
+
+def _usage_report_snapshot_raw(query) -> dict:
     """Return one coherent, content-free Hosted V2 Usage analytics snapshot."""
 
     where_sql, where_params = usage_reporting.metric_filter_sql(query)
@@ -5336,6 +5510,466 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
             },
         },
     }
+
+
+def _usage_percentile(values: list[int], fraction: float) -> float | None:
+    """PostgreSQL percentile_cont-compatible interpolation."""
+
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return float(ordered[lower])
+    return float(ordered[lower]) + (ordered[upper] - ordered[lower]) * (
+        position - lower
+    )
+
+
+def _usage_sum_facts(rows: list[dict]) -> dict:
+    result = {
+        key: sum(int(row.get(key) or 0) for row in rows)
+        for key in (
+            "turns",
+            "model_calls",
+            "retries",
+            "failed_turns",
+            "usage_reported_calls",
+            "cache_reported_calls",
+            "unknown_usage_calls",
+            "metered_turns",
+        )
+    }
+    for field in _USAGE_FACT_TOKENS:
+        known = sum(int(row.get(f"{field}_known_count") or 0) for row in rows)
+        result[f"{field}_known_count"] = known
+        result[field] = (
+            sum(int(row.get(f"{field}_sum") or 0) for row in rows)
+            if known
+            else None
+        )
+    for field in ("prompt_tokens", "completion_tokens"):
+        known = sum(
+            int(row.get(f"metered_{field}_known_count") or 0) for row in rows
+        )
+        result[f"metered_{field}_known_count"] = known
+        result[f"metered_{field}"] = (
+            sum(int(row.get(f"metered_{field}_sum") or 0) for row in rows)
+            if known
+            else None
+        )
+    result["last_model_call_at"] = max(
+        (row["last_model_call_at"] for row in rows if row.get("last_model_call_at")),
+        default=None,
+    )
+    result["latency_samples"] = [
+        int(value) for row in rows for value in (row.get("latency_samples") or [])
+    ]
+    return result
+
+
+def _usage_group_facts(rows: list[dict], fields: tuple[str, ...]) -> list[dict]:
+    grouped: dict[tuple[object, ...], list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(tuple(row[field] for field in fields), []).append(row)
+    return [
+        {**dict(zip(fields, key, strict=True)), **_usage_sum_facts(items)}
+        for key, items in grouped.items()
+    ]
+
+
+def _usage_cohort_on_cursor(cur, query) -> dict:
+    user_filter = " AND u.user_id=%s" if query.user_id else ""
+    params: list[object] = [query.user_id] if query.user_id else []
+    # Explicit offsets are honored; legacy naive values remain UTC regardless
+    # of the database session timezone.
+    registered = """
+CASE
+  WHEN (u.created_at) ~ '(Z|[+-]\\d{2}:?\\d{2})$'
+    AND pg_input_is_valid((u.created_at), 'timestamptz')
+    THEN (u.created_at)::timestamptz
+  WHEN pg_input_is_valid((u.created_at), 'timestamp')
+    THEN (u.created_at)::timestamp AT TIME ZONE 'UTC'
+  ELSE NULL
+END
+"""
+    memory = """
+CASE
+  WHEN (mm.doc->>'created_at') ~ '(Z|[+-]\\d{2}:?\\d{2})$'
+    AND pg_input_is_valid((mm.doc->>'created_at'), 'timestamptz')
+    THEN (mm.doc->>'created_at')::timestamptz
+  WHEN pg_input_is_valid((mm.doc->>'created_at'), 'timestamp')
+    THEN (mm.doc->>'created_at')::timestamp AT TIME ZONE 'UTC'
+  ELSE NULL
+END
+"""
+    cur.execute(
+        f"""
+WITH registered AS (
+ SELECT u.user_id,{registered} AS registered_at FROM users u WHERE true{user_filter}
+), at_end AS (
+ SELECT user_id,registered_at < %s AS existed_at_end,
+        registered_at IS NULL AS unparseable FROM registered
+), activated AS (
+ SELECT r.user_id FROM at_end r WHERE r.existed_at_end AND (
+  EXISTS (SELECT 1 FROM chat_messages c WHERE c.user_id=r.user_id
+    AND c.doc->>'role' IN ('user','human')
+    AND coalesce(c.doc->>'source','') NOT IN ('verify_ping','resident_maintenance')
+    AND to_timestamp(c.ts) < %s)
+  OR EXISTS (SELECT 1 FROM memory_moments mm WHERE mm.user_id=r.user_id
+    AND ({memory}) < %s)
+ ))
+SELECT count(*) FILTER (WHERE existed_at_end)::int AS registered_accounts,
+ (SELECT count(*)::int FROM activated) AS activated_users,
+ count(*) FILTER (WHERE unparseable)::int AS unparseable_registered_rows,
+ (SELECT count(*)::int FROM memory_moments mm JOIN at_end r ON r.user_id=mm.user_id
+  WHERE ({memory}) IS NULL) AS legacy_memory_rows_without_valid_created_at
+FROM at_end
+""",
+        (*params, query.end_at_utc, query.end_at_utc, query.end_at_utc),
+    )
+    return cur.fetchone()
+
+
+def _usage_report_snapshot_hybrid_serial(query) -> dict | None:
+    """Read exact daily facts and raw edges from one bounded RR/RO snapshot."""
+
+    with _pool().connection(timeout=0.5) as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                cur.execute("SELECT set_config('statement_timeout','15000',true)")
+                cur.execute(
+                    "SELECT * FROM v2_usage_rollup_watermarks "
+                    "WHERE rollup_name='hosted_v2_usage'"
+                )
+                state = cur.fetchone()
+                if state is None or not state["bootstrap_complete"]:
+                    return None
+                partition = usage_reporting.rollup_partition(
+                    query,
+                    dirty_from_day=state["dirty_from_day"],
+                    dirty_through_day=state["dirty_through_day"],
+                )
+                if partition is None:
+                    return None
+                core_dimensions = usage_reporting.has_dimension_filter(query)
+                core_sql, core_params = _usage_fact_query(
+                    query, partition, dimensions=core_dimensions
+                )
+                cur.execute(core_sql, core_params)
+                core_facts = cur.fetchall()
+                dim_sql, dim_params = _usage_fact_query(
+                    query, partition, dimensions=True
+                )
+                cur.execute(dim_sql, dim_params)
+                dimension_facts = cur.fetchall()
+                if query.completeness == "unknown":
+                    # The three canonical prefixes deliberately overlap, but
+                    # unknown-and-metered turn count/token sums are an
+                    # intersection not encoded as a fourth prefix.  Read only
+                    # that auxiliary from authoritative raw rows in this same
+                    # snapshot; never approximate it from two daily totals.
+                    touched_days = tuple(
+                        sorted(partition.rollup_days + partition.raw_days)
+                    )
+                    auxiliary_partition = usage_reporting.RollupPartition(
+                        rollup_days=(), raw_days=touched_days
+                    )
+                    auxiliary_sql, auxiliary_params = _usage_fact_query(
+                        query, auxiliary_partition, dimensions=True
+                    )
+                    cur.execute(auxiliary_sql, auxiliary_params)
+                    auxiliary_dimensions = cur.fetchall()
+                    auxiliary_by_dimension = {
+                        (
+                            row["local_day"], row["user_id"], row["lane"],
+                            row["provider"], row["model"],
+                        ): row
+                        for row in auxiliary_dimensions
+                    }
+                    metered_fields = (
+                        "metered_turns",
+                        "metered_prompt_tokens_sum",
+                        "metered_prompt_tokens_known_count",
+                        "metered_completion_tokens_sum",
+                        "metered_completion_tokens_known_count",
+                    )
+                    for row in dimension_facts:
+                        auxiliary = auxiliary_by_dimension.get(
+                            (
+                                row["local_day"], row["user_id"], row["lane"],
+                                row["provider"], row["model"],
+                            )
+                        )
+                        for field in metered_fields:
+                            row[field] = int(auxiliary.get(field) or 0) if auxiliary else 0
+                    if core_dimensions:
+                        core_facts = dimension_facts
+                    else:
+                        auxiliary_users = {
+                            (row["local_day"], row["user_id"]): row
+                            for row in _usage_group_facts(
+                                auxiliary_dimensions, ("local_day", "user_id")
+                            )
+                        }
+                        for row in core_facts:
+                            auxiliary = auxiliary_users.get(
+                                (row["local_day"], row["user_id"])
+                            )
+                            for field in metered_fields:
+                                row[field] = int(auxiliary.get(field) or 0) if auxiliary else 0
+                option_sql, option_params = _usage_fact_query(
+                    query,
+                    partition,
+                    dimensions=True,
+                    prefix="all",
+                    include_dimension_filters=False,
+                )
+                cur.execute(option_sql, option_params)
+                option_facts = cur.fetchall()
+                cohort = _usage_cohort_on_cursor(cur, query)
+
+    totals = _usage_sum_facts(core_facts)
+    duration_days = (query.end_at_utc - query.start_at_utc).total_seconds() / 86400
+    active_user_days = len(
+        {(row["user_id"], row["local_day"]) for row in core_facts if row["model_calls"] > 0}
+    )
+    model_active_users = len(
+        {row["user_id"] for row in core_facts if row["model_calls"] > 0}
+    )
+    metered_users = len(
+        {row["user_id"] for row in core_facts if row["usage_reported_calls"] > 0}
+    )
+    activated_users = int(cohort["activated_users"] or 0)
+    prompt = totals["prompt_tokens"]
+    completion = totals["completion_tokens"]
+    total_tokens = prompt + completion if prompt is not None and completion is not None else None
+    metered_prompt = totals["metered_prompt_tokens"]
+    metered_completion = totals["metered_completion_tokens"]
+    metered_total = (
+        metered_prompt + metered_completion
+        if metered_prompt is not None and metered_completion is not None
+        else None
+    )
+
+    def render_aggregate(row: dict) -> dict:
+        row_prompt = row["prompt_tokens"]
+        row_completion = row["completion_tokens"]
+        row_total = (
+            row_prompt + row_completion
+            if row_prompt is not None and row_completion is not None
+            else None
+        )
+        calls = int(row["model_calls"])
+        cache_read = row["cache_read_tokens"]
+        cache_miss = row["cache_miss_tokens"]
+        cache_denominator = (
+            cache_read + cache_miss
+            if cache_read is not None and cache_miss is not None
+            else 0
+        )
+        return {
+            "turns": int(row["turns"]),
+            "model_calls": calls,
+            "retries": int(row["retries"]),
+            "failed_turns": int(row["failed_turns"]),
+            "metered_turns": int(row["metered_turns"]),
+            "prompt_tokens": row_prompt,
+            "completion_tokens": row_completion,
+            "total_tokens": row_total,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": row["cache_write_tokens"],
+            "cache_miss_tokens": cache_miss,
+            "unknown_usage_calls": int(row["unknown_usage_calls"]),
+            "usage_reported_calls": int(row["usage_reported_calls"]),
+            "cache_reported_calls": int(row["cache_reported_calls"]),
+            "usage_coverage": _usage_rate(int(row["usage_reported_calls"]), calls),
+            "cache_coverage": _usage_rate(int(row["cache_reported_calls"]), calls),
+            "cache_hit_ratio": (
+                float(cache_read) / cache_denominator if cache_denominator else None
+            ),
+        }
+
+    overview = {
+        "registered_accounts": int(cohort["registered_accounts"] or 0),
+        "activated_users": activated_users,
+        "model_active_users": model_active_users,
+        "metered_users": metered_users,
+        "active_user_days": active_user_days,
+        **{key: render_aggregate(totals)[key] for key in (
+            "turns", "model_calls", "retries", "failed_turns", "metered_turns",
+            "prompt_tokens", "completion_tokens", "total_tokens", "cache_read_tokens",
+            "cache_write_tokens", "cache_miss_tokens", "unknown_usage_calls",
+        )},
+    }
+    user_day_groups = _usage_group_facts(core_facts, ("user_id", "local_day"))
+    known_user_day_tokens = [
+        row["prompt_tokens"] + row["completion_tokens"]
+        for row in user_day_groups
+        if row["model_calls"] > 0
+        and row["prompt_tokens"] is not None
+        and row["completion_tokens"] is not None
+    ]
+    averages = {
+        "tokens_per_calendar_day": float(total_tokens) / duration_days if total_tokens is not None and duration_days > 0 else None,
+        "tokens_per_active_user_day": float(total_tokens) / active_user_days if total_tokens is not None and active_user_days else None,
+        "tokens_per_activated_user_day": (
+            float(total_tokens) / (activated_users * duration_days)
+            if total_tokens is not None and activated_users and duration_days > 0
+            and not usage_reporting.has_dimension_filter(query) else None
+        ),
+        "tokens_per_metered_turn": (
+            float(metered_total) / totals["metered_turns"]
+            if metered_total is not None and totals["metered_turns"] else None
+        ),
+        "user_day_tokens": {
+            "p50": _usage_percentile(known_user_day_tokens, 0.5),
+            "p75": _usage_percentile(known_user_day_tokens, 0.75),
+            "p90": _usage_percentile(known_user_day_tokens, 0.9),
+            "p95": _usage_percentile(known_user_day_tokens, 0.95),
+            "max": float(max(known_user_day_tokens)) if known_user_day_tokens else None,
+        },
+        "model_calls_per_turn": _usage_rate(totals["model_calls"], totals["turns"]),
+        "retries_per_turn": _usage_rate(totals["retries"], totals["turns"]),
+    }
+
+    by_day = {row["local_day"]: row for row in _usage_group_facts(core_facts, ("local_day",))}
+    daily = []
+    day = query.start_at_utc.astimezone(usage_reporting.SHANGHAI).date()
+    final_day = (query.end_at_utc - timedelta(microseconds=1)).astimezone(usage_reporting.SHANGHAI).date()
+    while day <= final_day:
+        row = by_day.get(day)
+        if row is None:
+            row = _usage_sum_facts([])
+            for field in _USAGE_FACT_TOKENS:
+                row[field] = 0
+        item = render_aggregate(row)
+        day_users = {fact["user_id"] for fact in core_facts if fact["local_day"] == day and fact["model_calls"] > 0}
+        item.update({
+            "local_day": day.isoformat(),
+            "model_active_users": len(day_users),
+            "tokens_per_active_user_day": float(item["total_tokens"]) / len(day_users) if item["total_tokens"] is not None and day_users else None,
+            "tokens_per_metered_turn": (
+                float(row["metered_prompt_tokens"] + row["metered_completion_tokens"]) / row["metered_turns"]
+                if row["metered_prompt_tokens"] is not None and row["metered_completion_tokens"] is not None and row["metered_turns"] else None
+            ),
+        })
+        daily.append(item)
+        day += timedelta(days=1)
+
+    primary_groups = _usage_group_facts(dimension_facts, ("user_id", "provider", "model"))
+    primary_by_user: dict[str, tuple[str, str]] = {}
+    for row in sorted(primary_groups, key=lambda row: (row["user_id"], -row["model_calls"], row["provider"], row["model"])):
+        primary_by_user.setdefault(str(row["user_id"]), (str(row["provider"]), str(row["model"])))
+    user_groups = _usage_group_facts(core_facts, ("user_id",))
+    users = []
+    for row in user_groups:
+        item = render_aggregate(row)
+        user_days = [day_row for day_row in user_day_groups if day_row["user_id"] == row["user_id"] and day_row["model_calls"] > 0]
+        known = [d["prompt_tokens"] + d["completion_tokens"] for d in user_days if d["prompt_tokens"] is not None and d["completion_tokens"] is not None]
+        provider, model = primary_by_user.get(str(row["user_id"]), ("unknown", "unknown"))
+        user_metered_total = row["metered_prompt_tokens"] + row["metered_completion_tokens"] if row["metered_prompt_tokens"] is not None and row["metered_completion_tokens"] is not None else None
+        item.update({
+            "user_id": str(row["user_id"]), "active_days": len(user_days),
+            "last_model_call_at": row["last_model_call_at"], "primary_provider": provider,
+            "primary_model": model, "daily_p50": _usage_percentile(known, 0.5),
+            "daily_p95": _usage_percentile(known, 0.95),
+            "tokens_per_calendar_day": float(item["total_tokens"]) / duration_days if item["total_tokens"] is not None and duration_days > 0 else None,
+            "tokens_per_active_day": float(item["total_tokens"]) / len(user_days) if item["total_tokens"] is not None and user_days else None,
+            "tokens_per_metered_turn": float(user_metered_total) / row["metered_turns"] if user_metered_total is not None and row["metered_turns"] else None,
+            "known_token_share": float(item["total_tokens"]) / total_tokens if item["total_tokens"] is not None and total_tokens else None,
+        })
+        users.append(item)
+    users.sort(key=lambda item: (item["total_tokens"] is None, -(item["total_tokens"] or 0), -item["model_calls"], item["user_id"]))
+
+    def breakdown(fields: tuple[str, ...]) -> list[dict]:
+        result = []
+        for row in _usage_group_facts(dimension_facts, fields):
+            item = render_aggregate(row)
+            # Preserve the existing Provider / Model payload contract.  Its raw
+            # query never exposed a metered-turn count (lanes do).
+            if fields == ("provider", "model"):
+                item["metered_turns"] = 0
+            item.update({field: str(row[field]) for field in fields})
+            item.update({
+                "users": len({f["user_id"] for f in dimension_facts if all(f[field] == row[field] for field in fields)}),
+                "tokens_per_call": float(item["total_tokens"]) / item["model_calls"] if item["total_tokens"] is not None and item["model_calls"] else None,
+                "latency_ms_p50": _usage_percentile(row["latency_samples"], 0.5),
+                "latency_ms_p95": _usage_percentile(row["latency_samples"], 0.95),
+                "failure_rate": _usage_rate(item["failed_turns"], item["turns"]),
+                "retry_rate": _usage_rate(item["retries"], item["model_calls"]),
+            })
+            result.append(item)
+        result.sort(key=lambda item: (item["total_tokens"] is None, -(item["total_tokens"] or 0), -item["model_calls"], *(item[field] for field in fields)))
+        return result
+
+    rendered_totals = render_aggregate(totals)
+    cache_read = rendered_totals["cache_read_tokens"]
+    cache_miss = rendered_totals["cache_miss_tokens"]
+    cache_denominator = cache_read + cache_miss if cache_read is not None and cache_miss is not None else 0
+    return {
+        "overview": overview, "averages": averages, "daily": daily, "users": users,
+        "models": breakdown(("provider", "model")), "lanes": breakdown(("lane",)),
+        "filters": {
+            "lanes": sorted({str(row["lane"]) for row in option_facts}),
+            "providers": sorted({str(row["provider"]) for row in option_facts}),
+            "models": sorted({str(row["model"]) for row in option_facts}),
+        },
+        "coverage": {
+            "usage_reported_calls": totals["usage_reported_calls"], "model_calls": totals["model_calls"],
+            "usage_coverage": _usage_rate(totals["usage_reported_calls"], totals["model_calls"]),
+            "cache_reported_calls": totals["cache_reported_calls"],
+            "cache_coverage": _usage_rate(totals["cache_reported_calls"], totals["model_calls"]),
+            "cache_hit_ratio": float(cache_read) / cache_denominator if cache_denominator else None,
+            "reference_cohort": {
+                "basis": "parseable_utc_write_timestamps_at_end_at",
+                "unparseable_registered_rows": int(cohort["unparseable_registered_rows"] or 0),
+                "legacy_memory_rows_without_valid_created_at": int(cohort["legacy_memory_rows_without_valid_created_at"] or 0),
+                "limitation": "legacy users.created_at and memory doc.created_at values that are missing or invalid are excluded from historical registered and activated reference cohorts",
+            },
+            "rollup": {
+                "mode": "hybrid", "refreshed_at": state["refreshed_at"],
+                "last_success_at": state["last_success_at"],
+                "processed_updated_at": state["source_updated_at"],
+                "processed_id": int(state["source_id"]),
+                "source_observed_updated_at": state["source_observed_updated_at"],
+                "source_lag_seconds": state["source_lag_seconds"],
+                "last_error_at": state["last_error_at"], "last_error": state["last_error"],
+                "raw_days": [d.isoformat() for d in partition.raw_days],
+                "rollup_days": [d.isoformat() for d in partition.rollup_days],
+            },
+        },
+    }
+
+
+def usage_report_snapshot(query) -> dict:
+    """Select the exact rollup/raw report path without changing its payload."""
+
+    if query.timezone == "Asia/Shanghai":
+        try:
+            report = _usage_report_snapshot_hybrid_serial(query)
+            if report is not None:
+                return report
+        except Exception:
+            log.exception("usage rollup report unavailable; using raw fallback")
+    report = _usage_report_snapshot_raw(query)
+    report["coverage"]["rollup"] = {
+        "mode": "raw",
+        "refreshed_at": None,
+        "last_success_at": None,
+        "processed_updated_at": None,
+        "processed_id": None,
+        "source_observed_updated_at": None,
+        "source_lag_seconds": None,
+        "last_error_at": None,
+        "last_error": None,
+        "raw_days": None,
+        "rollup_days": [],
+    }
+    return report
 
 
 def _empty_runtime_user_delivery() -> dict:

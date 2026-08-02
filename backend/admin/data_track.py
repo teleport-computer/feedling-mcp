@@ -3561,6 +3561,33 @@ def _render_usage_page(
         )
 
     cohort = coverage.get("reference_cohort") or {}
+    rollup = coverage.get("rollup")
+    if rollup:
+        lag = rollup.get("source_lag_seconds")
+        lag_text = "unknown" if lag is None else _fmt_duration_sec(float(lag))
+        error = rollup.get("last_error")
+        error_text = (
+            f" · last error {html.escape(str(error))} at "
+            f"{html.escape(str(rollup.get('last_error_at') or 'unknown'))}"
+            if error
+            else ""
+        )
+        rollup_freshness = (
+            "<div class='note-box'><b>Rollup freshness:</b> "
+            f"mode {html.escape(str(rollup.get('mode') or 'unknown'))} · "
+            f"refreshed {html.escape(str(rollup.get('refreshed_at') or 'unknown'))} · "
+            f"processed ({html.escape(str(rollup.get('processed_updated_at') or 'unknown'))}, "
+            f"{html.escape(str(rollup.get('processed_id') if rollup.get('processed_id') is not None else 'unknown'))}) · "
+            f"source observed {html.escape(str(rollup.get('source_observed_updated_at') or 'unknown'))} · "
+            f"lag {lag_text} · raw days {_fmt_count(len(rollup.get('raw_days') or []))} · "
+            f"rollup days {_fmt_count(len(rollup.get('rollup_days') or []))}"
+            f"{error_text}</div>"
+        )
+    else:
+        rollup_freshness = (
+            "<div class='note-box'><b>Rollup freshness:</b> unavailable; "
+            "freshness and lag are unknown, not zero.</div>"
+        )
     drilldown = ""
     if drilldown_user_id:
         back_href = _usage_page_href(query, user_id=None, offset=0)
@@ -3666,6 +3693,7 @@ def _render_usage_page(
   <tbody>{model_body}</tbody></table></div>
   {lane_section}
   <h2>数据覆盖与边界</h2>
+  {rollup_freshness}
   <div class='note-box'>Usage {_fmt_count(coverage.get('usage_reported_calls'))} / {_fmt_count(coverage.get('model_calls'))} ({_fmt_ratio(coverage.get('usage_coverage'))}) · Cache {_fmt_count(coverage.get('cache_reported_calls'))} / {_fmt_count(coverage.get('model_calls'))} ({_fmt_ratio(coverage.get('cache_coverage'))}) · Cache hit {_fmt_ratio(coverage.get('cache_hit_ratio'))}.<br>
   参考 cohort basis: <code>{html.escape(str(cohort.get('basis') or 'unknown'))}</code>；unparseable registrations {_fmt_count(cohort.get('unparseable_registered_rows'))}，legacy memory timestamps {_fmt_count(cohort.get('legacy_memory_rows_without_valid_created_at'))}。{html.escape(str(cohort.get('limitation') or ''))}<br>
   仅统计本实例 Hosted Runtime V2；self-host 与 installation 级统计 unavailable until self-host phase。Unknown 是缺报，不是零。</div>

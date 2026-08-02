@@ -23,7 +23,7 @@ from admin import usage as _usage  # noqa: E402
 from accounts import registry  # noqa: E402
 from core import reqctx  # noqa: E402
 import db  # noqa: E402
-from model_api_runtime.v2 import jobs_store  # noqa: E402
+from model_api_runtime.v2 import jobs_store, usage_reporting, usage_rollup  # noqa: E402
 
 from conftest import seed_user  # noqa: E402
 
@@ -180,6 +180,213 @@ def _usage_query(**filters):
         timezone="UTC",
         **filters,
     )
+
+
+def _shanghai_usage_query(**filters):
+    return _usage.UsageQuery(
+        start_at_utc=datetime(2026, 6, 30, 16, tzinfo=timezone.utc),
+        end_at_utc=datetime(2026, 7, 2, 16, tzinfo=timezone.utc),
+        timezone="Asia/Shanghai",
+        **filters,
+    )
+
+
+def _enable_usage_rollup(
+    *,
+    dirty_from_day=None,
+    dirty_through_day=None,
+    days=(datetime(2026, 7, 1).date(), datetime(2026, 7, 2).date()),
+):
+    refreshed_at = datetime(2026, 8, 2, 10, tzinfo=timezone.utc)
+    for local_day in days:
+        usage_rollup.recompute_local_day(local_day, refreshed_at=refreshed_at)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO v2_usage_rollup_watermarks "
+            "(rollup_name,bootstrap_complete,source_updated_at,source_id,"
+            "source_observed_updated_at,source_lag_seconds,refreshed_at,last_success_at,"
+            "dirty_from_day,dirty_through_day) "
+            "VALUES ('hosted_v2_usage',true,%s,99,%s,12.5,%s,%s,%s,%s) "
+            "ON CONFLICT (rollup_name) DO UPDATE SET bootstrap_complete=true,"
+            "dirty_from_day=excluded.dirty_from_day,dirty_through_day=excluded.dirty_through_day,"
+            "source_updated_at=excluded.source_updated_at,source_id=excluded.source_id,"
+            "source_observed_updated_at=excluded.source_observed_updated_at,"
+            "source_lag_seconds=excluded.source_lag_seconds,refreshed_at=excluded.refreshed_at,"
+            "last_success_at=excluded.last_success_at,last_error=NULL,last_error_at=NULL",
+            (
+                refreshed_at, refreshed_at, refreshed_at, refreshed_at,
+                dirty_from_day, dirty_through_day,
+            ),
+        )
+    return refreshed_at
+
+
+def _assert_hybrid_matches_raw(query):
+    raw = jobs_store._usage_report_snapshot_raw(query)
+    hybrid = jobs_store.usage_report_snapshot(query)
+    freshness = hybrid["coverage"].pop("rollup")
+    assert hybrid == raw
+    return freshness
+
+
+def test_usage_rollup_partition_keeps_partial_and_dirty_days_raw():
+    query = _usage.UsageQuery(
+        start_at_utc=datetime(2026, 6, 30, 16, tzinfo=timezone.utc),
+        end_at_utc=datetime(2026, 7, 3, 18, tzinfo=timezone.utc),
+        timezone="Asia/Shanghai",
+    )
+
+    partition = usage_reporting.rollup_partition(
+        query,
+        dirty_from_day=datetime(2026, 7, 2).date(),
+        dirty_through_day=datetime(2026, 7, 2).date(),
+    )
+
+    assert partition.rollup_days == (
+        datetime(2026, 7, 1).date(),
+        datetime(2026, 7, 3).date(),
+    )
+    assert partition.raw_days == (
+        datetime(2026, 7, 2).date(),
+        datetime(2026, 7, 4).date(),
+    )
+
+
+def test_usage_rollup_partition_rejects_non_shanghai_but_accepts_unknown():
+    assert usage_reporting.rollup_partition(_usage_query()) is None
+    assert usage_reporting.rollup_partition(
+        _shanghai_usage_query(completeness="unknown")
+    ) == usage_reporting.RollupPartition(
+        rollup_days=(
+            datetime(2026, 7, 1).date(),
+            datetime(2026, 7, 2).date(),
+        ),
+        raw_days=(),
+    )
+
+
+def test_usage_hybrid_serial_matches_raw_payload_and_exposes_freshness(usage_rows):
+    query = _shanghai_usage_query()
+    raw = jobs_store._usage_report_snapshot_raw(query)
+    refreshed_at = _enable_usage_rollup()
+    try:
+        hybrid = jobs_store.usage_report_snapshot(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    freshness = hybrid["coverage"].pop("rollup")
+    for section in raw:
+        if section == "models":
+            for actual, expected in zip(hybrid[section], raw[section], strict=True):
+                for key in expected:
+                    assert actual[key] == expected[key], (section, key, actual, expected)
+        else:
+            assert hybrid[section] == raw[section], section
+    assert freshness == {
+        "mode": "hybrid",
+        "refreshed_at": refreshed_at,
+        "last_success_at": refreshed_at,
+        "processed_updated_at": refreshed_at,
+        "processed_id": 99,
+        "source_observed_updated_at": refreshed_at,
+        "source_lag_seconds": 12.5,
+        "last_error_at": None,
+        "last_error": None,
+        "raw_days": [],
+        "rollup_days": ["2026-07-01", "2026-07-02"],
+    }
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        {"lane": "chat", "provider": "openrouter", "model": "gpt-a"},
+        {"completeness": "metered"},
+        {"completeness": "unknown"},
+    ],
+)
+def test_usage_hybrid_filters_match_raw_including_unknown_metered_intersection(
+    usage_rows, filters
+):
+    _enable_usage_rollup()
+    try:
+        query = _shanghai_usage_query(**filters)
+        freshness = _assert_hybrid_matches_raw(query)
+        if filters.get("completeness") == "unknown":
+            report = jobs_store.usage_report_snapshot(query)
+            assert report["averages"]["tokens_per_metered_turn"] == pytest.approx(35)
+            beta = next(row for row in report["users"] if row["user_id"] == "u_usage_beta")
+            assert beta["metered_turns"] == 1
+            assert beta["tokens_per_metered_turn"] == pytest.approx(35)
+        assert freshness["mode"] == "hybrid"
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+
+def test_usage_hybrid_partial_dirty_and_empty_days_match_disjoint_raw(usage_rows):
+    dirty = datetime(2026, 7, 2).date()
+    _enable_usage_rollup(
+        dirty_from_day=dirty,
+        dirty_through_day=dirty,
+        days=(
+            datetime(2026, 7, 1).date(),
+            datetime(2026, 7, 2).date(),
+            datetime(2026, 7, 3).date(),
+        ),
+    )
+    query = _usage.UsageQuery(
+        start_at_utc=datetime(2026, 6, 30, 18, tzinfo=timezone.utc),
+        end_at_utc=datetime(2026, 7, 3, 18, tzinfo=timezone.utc),
+        timezone="Asia/Shanghai",
+    )
+    try:
+        freshness = _assert_hybrid_matches_raw(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert freshness["rollup_days"] == ["2026-07-03"]
+    assert freshness["raw_days"] == ["2026-07-01", "2026-07-02", "2026-07-04"]
+
+
+def test_usage_hybrid_raw_sql_uses_bounded_created_at_ranges():
+    partition = usage_reporting.RollupPartition(
+        rollup_days=(datetime(2026, 7, 1).date(),),
+        raw_days=(datetime(2026, 7, 2).date(),),
+    )
+    statement, _params = jobs_store._usage_fact_query(
+        _shanghai_usage_query(), partition, dimensions=True
+    )
+
+    assert "m.created_at >= rr.start_at AND m.created_at < rr.end_at" in statement
+    assert "NOT ((m.created_at AT TIME ZONE" not in statement
+
+
+def test_usage_page_renders_rollup_freshness_without_coercing_unknown_to_zero():
+    report = _usage_render_report()
+    report["coverage"]["rollup"] = {
+        "mode": "hybrid",
+        "refreshed_at": datetime(2026, 8, 2, 10, tzinfo=timezone.utc),
+        "last_success_at": datetime(2026, 8, 2, 9, 59, tzinfo=timezone.utc),
+        "processed_updated_at": datetime(2026, 8, 2, 9, 55, tzinfo=timezone.utc),
+        "processed_id": 42,
+        "source_observed_updated_at": datetime(2026, 8, 2, 10, tzinfo=timezone.utc),
+        "source_lag_seconds": None,
+        "last_error_at": datetime(2026, 8, 2, 9, 58, tzinfo=timezone.utc),
+        "last_error": "QueryCanceled",
+        "raw_days": ["2026-08-02"],
+        "rollup_days": ["2026-08-01"],
+    }
+
+    with _admin_core.bind("view=usage&preset=30d"):
+        body = _data_track._render_usage_page(report, _usage_query())
+
+    assert "Rollup freshness" in body
+    assert "lag unknown" in body
+    assert "QueryCanceled" in body
+    assert "lag 0" not in body
 
 
 def _usage_render_report() -> dict:
