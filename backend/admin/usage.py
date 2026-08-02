@@ -74,13 +74,14 @@ def _custom_bounds(
     try:
         start_day = _iso_date(start_raw)
         end_day = _iso_date(end_raw)
-    except ValueError:
+        exclusive_end_day = end_day + timedelta(days=1)
+    except (OverflowError, ValueError):
         return None
     inclusive_days = (end_day - start_day).days + 1
     if inclusive_days < 1 or inclusive_days > 366:
         return None
     start_local = datetime.combine(start_day, time.min, tzinfo=display_tz)
-    end_local = datetime.combine(end_day + timedelta(days=1), time.min, tzinfo=display_tz)
+    end_local = datetime.combine(exclusive_end_day, time.min, tzinfo=display_tz)
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
 
 
