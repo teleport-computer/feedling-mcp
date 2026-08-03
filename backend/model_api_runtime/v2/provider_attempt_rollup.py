@@ -33,6 +33,12 @@ _TOKEN_FIELDS = (
 )
 
 
+def _rollup_sql_observer(*, section: str, statement: str, params: tuple) -> None:
+    """Optional test/performance seam; production deliberately does nothing."""
+
+    del section, statement, params
+
+
 def _local_day_bounds(local_day: date) -> tuple[datetime, datetime]:
     start = datetime.combine(local_day, time.min, tzinfo=LOCAL_TIMEZONE)
     end = datetime.combine(
@@ -170,8 +176,7 @@ WITH turn_cohort AS MATERIALIZED (
 """
 
 
-def _insert_dimensions(cur, local_day: date, start_at: datetime, end_at: datetime,
-                       refreshed_at: datetime) -> int:
+def _day_rebuild_statement() -> str:
     token_columns = ",".join(
         item
         for field in _TOKEN_FIELDS
@@ -185,9 +190,37 @@ def _insert_dimensions(cur, local_day: date, start_at: datetime, end_at: datetim
             f"count({field})::bigint",
         )
     )
-    cur.execute(
+    return (
         _effective_attempt_ctes()
-        + f"""
+        + f""",
+cohort_calls AS MATERIALIZED (
+  SELECT DISTINCT call_id FROM corrected
+), global_attempts AS MATERIALIZED (
+  SELECT a.call_id,a.outer_attempt_ordinal,a.inner_attempt_ordinal
+  FROM cohort_calls c JOIN llm_provider_attempts a USING (call_id)
+  WHERE a.source='runtime_recorder'
+), outer_gaps AS (
+  SELECT call_id,
+    greatest(
+      coalesce(max(outer_attempt_ordinal) FILTER (WHERE outer_attempt_ordinal>=1),0)
+      -count(DISTINCT outer_attempt_ordinal)
+        FILTER (WHERE outer_attempt_ordinal>=1),0
+    )::bigint AS missing_outer_ordinals
+  FROM global_attempts GROUP BY call_id
+), inner_gap_groups AS (
+  SELECT call_id,outer_attempt_ordinal,
+    greatest(
+      coalesce(max(inner_attempt_ordinal) FILTER (WHERE inner_attempt_ordinal>=1),0)
+      -count(DISTINCT inner_attempt_ordinal)
+        FILTER (WHERE inner_attempt_ordinal>=1),0
+    )::bigint AS missing_inner_ordinals
+  FROM global_attempts GROUP BY call_id,outer_attempt_ordinal
+), call_gaps AS (
+  SELECT o.call_id,o.missing_outer_ordinals,
+    coalesce(sum(i.missing_inner_ordinals),0)::bigint AS missing_inner_ordinals
+  FROM outer_gaps o LEFT JOIN inner_gap_groups i USING (call_id)
+  GROUP BY o.call_id,o.missing_outer_ordinals
+), dimension_insert AS (
 INSERT INTO llm_usage_daily_attempt_dimensions (
   local_day,user_id,cohort_lane,requested_provider,requested_model,
   resolved_provider,resolved_model,effective_usage_known,cost_kind,currency,
@@ -226,45 +259,8 @@ GROUP BY user_id,cohort_lane,requested_provider,requested_model,
        WHEN estimated_cost IS NOT NULL THEN 'estimated' ELSE 'unknown' END,
   CASE WHEN authoritative_cost IS NOT NULL THEN authoritative_currency
        WHEN estimated_cost IS NOT NULL THEN rate_currency ELSE NULL END
-""",
-        (start_at, end_at, local_day, refreshed_at),
-    )
-    return cur.rowcount
-
-
-def _insert_memberships(cur, local_day: date, start_at: datetime, end_at: datetime,
-                        refreshed_at: datetime) -> int:
-    cur.execute(
-        _effective_attempt_ctes()
-        + """,
-cohort_calls AS MATERIALIZED (
-  SELECT DISTINCT call_id FROM corrected
-), global_attempts AS MATERIALIZED (
-  SELECT a.call_id,a.outer_attempt_ordinal,a.inner_attempt_ordinal
-  FROM cohort_calls c JOIN llm_provider_attempts a USING (call_id)
-  WHERE a.source='runtime_recorder'
-), outer_gaps AS (
-  SELECT call_id,
-    greatest(
-      coalesce(max(outer_attempt_ordinal) FILTER (WHERE outer_attempt_ordinal>=1),0)
-      -count(DISTINCT outer_attempt_ordinal)
-        FILTER (WHERE outer_attempt_ordinal>=1),0
-    )::bigint AS missing_outer_ordinals
-  FROM global_attempts GROUP BY call_id
-), inner_gap_groups AS (
-  SELECT call_id,outer_attempt_ordinal,
-    greatest(
-      coalesce(max(inner_attempt_ordinal) FILTER (WHERE inner_attempt_ordinal>=1),0)
-      -count(DISTINCT inner_attempt_ordinal)
-        FILTER (WHERE inner_attempt_ordinal>=1),0
-    )::bigint AS missing_inner_ordinals
-  FROM global_attempts GROUP BY call_id,outer_attempt_ordinal
-), call_gaps AS (
-  SELECT o.call_id,o.missing_outer_ordinals,
-    coalesce(sum(i.missing_inner_ordinals),0)::bigint AS missing_inner_ordinals
-  FROM outer_gaps o LEFT JOIN inner_gap_groups i USING (call_id)
-  GROUP BY o.call_id,o.missing_outer_ordinals
-)
+RETURNING 1
+), membership_insert AS (
 INSERT INTO llm_usage_daily_call_memberships (
   local_day,user_id,cohort_lane,call_id,requested_provider,requested_model,
   resolved_provider,resolved_model,effective_usage_known,
@@ -274,10 +270,12 @@ SELECT DISTINCT %s,p.user_id,p.cohort_lane,p.call_id,p.requested_provider,
   p.requested_model,p.resolved_provider,p.resolved_model,p.effective_usage_known,
   coalesce(g.missing_outer_ordinals,0),coalesce(g.missing_inner_ordinals,0),%s
 FROM priced p LEFT JOIN call_gaps g USING (call_id)
-""",
-        (start_at, end_at, local_day, refreshed_at),
+RETURNING 1
+)
+SELECT (SELECT count(*)::int FROM dimension_insert) AS dimensions,
+       (SELECT count(*)::int FROM membership_insert) AS memberships
+"""
     )
-    return cur.rowcount
 
 
 def _recompute_on_cursor(cur, local_day: date, *, refreshed_at: datetime) -> dict:
@@ -290,8 +288,20 @@ def _recompute_on_cursor(cur, local_day: date, *, refreshed_at: datetime) -> dic
         "DELETE FROM llm_usage_daily_call_memberships WHERE local_day=%s",
         (local_day,),
     )
-    dimensions = _insert_dimensions(cur, local_day, start_at, end_at, refreshed_at)
-    memberships = _insert_memberships(cur, local_day, start_at, end_at, refreshed_at)
+    statement = _day_rebuild_statement()
+    params = (
+        start_at,
+        end_at,
+        local_day,
+        refreshed_at,
+        local_day,
+        refreshed_at,
+    )
+    _rollup_sql_observer(
+        section="day_rebuild", statement=statement, params=params
+    )
+    cur.execute(statement, params)
+    counts = cur.fetchone()
     cur.execute(
         "DELETE FROM llm_usage_rollup_dirty_days "
         "WHERE rollup_name=%s AND local_day=%s",
@@ -299,8 +309,8 @@ def _recompute_on_cursor(cur, local_day: date, *, refreshed_at: datetime) -> dic
     )
     return {
         "status": "ok",
-        "dimensions": dimensions,
-        "memberships": memberships,
+        "dimensions": int(counts["dimensions"]),
+        "memberships": int(counts["memberships"]),
     }
 
 

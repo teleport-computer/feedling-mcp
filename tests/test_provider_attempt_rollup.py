@@ -376,6 +376,57 @@ def test_recompute_local_day_is_idempotent_and_matches_raw_attempt_overview(
     ] == raw["costs"]
 
 
+def test_recompute_local_day_executes_one_shared_business_pipeline(
+    attempt_rollup_rows, monkeypatch
+):
+    """Splitting dimensions and memberships must not rerun cohort or pricing."""
+    statements = []
+
+    def observe(*, section, statement, params):
+        statements.append((section, statement, params))
+
+    monkeypatch.setattr(provider_attempt_rollup, "_rollup_sql_observer", observe)
+
+    result = provider_attempt_rollup.recompute_local_day(LOCAL_DAY)
+
+    assert result == {"status": "ok", "dimensions": 3, "memberships": 4}
+    rebuilds = [
+        (sql, params)
+        for section, sql, params in statements
+        if section == "day_rebuild"
+    ]
+    assert len(rebuilds) == 1
+    statement, params = rebuilds[0]
+    assert statement.count("turn_cohort AS MATERIALIZED") == 1
+    assert statement.count("attempt_base AS MATERIALIZED") == 1
+    assert statement.count("correction AS MATERIALIZED") == 1
+    assert statement.count("rate_ranges AS MATERIALIZED") == 1
+    assert statement.count("priced AS MATERIALIZED") == 1
+    assert statement.count(
+        "INSERT INTO llm_usage_daily_attempt_dimensions"
+    ) == 1
+    assert statement.count(
+        "INSERT INTO llm_usage_daily_call_memberships"
+    ) == 1
+    with db.get_pool().connection() as conn:
+        explained = conn.execute(
+            "EXPLAIN (FORMAT JSON) " + statement, params
+        ).fetchone()[0][0]["Plan"]
+
+    def modify_relations(node):
+        relations = []
+        if node.get("Node Type") == "ModifyTable":
+            relations.append(node.get("Relation Name"))
+        for child in node.get("Plans", []):
+            relations.extend(modify_relations(child))
+        return relations
+
+    assert sorted(modify_relations(explained)) == [
+        "llm_usage_daily_attempt_dimensions",
+        "llm_usage_daily_call_memberships",
+    ]
+
+
 def test_recompute_local_day_rolls_back_both_tables_and_keeps_dirty_claim(
     attempt_rollup_rows,
 ):

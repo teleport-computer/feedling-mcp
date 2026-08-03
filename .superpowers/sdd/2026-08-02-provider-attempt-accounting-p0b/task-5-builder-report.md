@@ -47,3 +47,22 @@ tests/test_provider_attempt_rollup.py + tests/test_admin_usage.py
 
 Ruff passed for both changed Python files. `py_compile` and `git diff --check`
 also passed.
+
+## Builder review fix round
+
+The initial builder executed the complete cohort/correction/rate pipeline once
+for dimensions and again for memberships. Although both queries were set-based,
+that duplicated the expensive day source work.
+
+A new observer/captured-SQL RED now requires exactly one business rebuild
+statement and exactly one occurrence of each materialized cohort, attempt,
+correction, rate-range, and priced stage. The builder now uses one
+data-modifying `WITH`: a shared pipeline feeds one dimensions `INSERT ...
+RETURNING` and one memberships `INSERT ... RETURNING`, and the final `SELECT`
+returns both inserted counts. Day deletes and dirty-claim removal remain in the
+same outer transaction; no temporary table or catalog object is created.
+
+PostgreSQL `EXPLAIN (FORMAT JSON)` additionally proves that the captured shared
+statement has exactly the two intended `ModifyTable` nodes. The fix-round
+builder plus full Admin Usage run is **126 passed**; all prior raw parity,
+idempotency, and real-failure rollback assertions remain green.
