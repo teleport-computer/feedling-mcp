@@ -446,6 +446,7 @@ def _validate_resume_snapshot(
         "invalid_user_ids": 0,
         "invalid_fixture_docs": 0,
         "missing_user_sequence": 0,
+        "invalid_created_at": 0,
     }:
         raise RuntimeError("resume reuse mismatch in fixture users")
     if snapshot.get("source_integrity") != {
@@ -1252,6 +1253,37 @@ def _fixture_counts(conn, prefix: str) -> dict[str, int]:
     return counts
 
 
+def _collect_user_shape(
+    conn,
+    *,
+    prefix: str,
+    users: int,
+    expected_created_at: datetime,
+) -> dict[str, int]:
+    row = conn.execute(
+        "SELECT count(*) FILTER (WHERE user_id !~ %s),"
+        "count(*) FILTER (WHERE doc IS DISTINCT FROM "
+        "jsonb_build_object('scale_fixture',true)),"
+        "(SELECT count(*) FROM generate_series(0,%s) AS g "
+        "LEFT JOIN users expected ON expected.user_id=%s || lpad(g::text,6,'0') "
+        "WHERE expected.user_id IS NULL),"
+        "count(*) FILTER (WHERE created_at::timestamptz IS DISTINCT FROM %s) "
+        "FROM users",
+        (
+            f"^{re.escape(prefix)}[0-9]{{6}}$",
+            users - 1,
+            prefix,
+            expected_created_at,
+        ),
+    ).fetchone()
+    return {
+        "invalid_user_ids": int(row[0]),
+        "invalid_fixture_docs": int(row[1]),
+        "missing_user_sequence": int(row[2]),
+        "invalid_created_at": int(row[3]),
+    }
+
+
 def _integrity_plan_evidence(document: dict[str, Any]) -> dict[str, list[str]]:
     nodes = tuple(_walk_plan(document["Plan"]))
     return {
@@ -1368,12 +1400,14 @@ def _source_turn_integrity_sql() -> str:
 
 def _source_attempt_integrity_sql() -> str:
     compared = (
-        "attempt_id,user_id,lane,call_id,outer_attempt_ordinal,"
+        "attempt_id,user_id,installation_id,runtime,lane,turn_id,round_id,"
+        "call_id,outer_attempt_ordinal,"
         "inner_attempt_ordinal,retry_kind,requested_provider,resolved_provider,"
         "requested_model,resolved_model,transport,started_at,finished_at,state,"
-        "outcome,error_class,input_tokens,output_tokens,reasoning_tokens,"
+        "outcome,error_class,provider_request_id,input_tokens,output_tokens,reasoning_tokens,"
         "cache_read_tokens,cache_write_tokens,cache_miss_tokens,usage_known,"
-        "possibly_billed,source,completeness,revision,cost,currency,ttft_ms"
+        "usage_unknown_reason,possibly_billed,latency_ms,source,completeness,"
+        "revision,cost,currency,rate_card_version,ttft_ms"
     ).split(",")
     expected_values = ",".join(f"e.{column}" for column in compared)
     actual_values = ",".join(f"a.{column}" for column in compared)
@@ -1385,9 +1419,11 @@ def _source_attempt_integrity_sql() -> str:
         "FROM generate_series(1,%s::bigint) AS g),expected AS MATERIALIZED ("
         "SELECT g AS job_id,substr(digest,1,8)||'-'||substr(digest,9,4)||'-'||"
         "substr(digest,13,4)||'-'||substr(digest,17,4)||'-'||substr(digest,21,12) "
-        "AS attempt_id,user_id,CASE WHEN g%%100<62 THEN 'chat' WHEN g%%100<77 "
+        "AS attempt_id,user_id,NULL::text AS installation_id,NULL::text AS runtime,"
+        "CASE WHEN g%%100<62 THEN 'chat' WHEN g%%100<77 "
         "THEN 'heartbeat' WHEN g%%100<88 THEN 'manual_wake' WHEN g%%100<95 "
-        "THEN 'maintenance' ELSE 'scheduled' END AS lane,%s||'call-'||g AS call_id,"
+        "THEN 'maintenance' ELSE 'scheduled' END AS lane,NULL::text AS turn_id,"
+        "NULL::text AS round_id,%s||'call-'||g AS call_id,"
         "1 AS outer_attempt_ordinal,1 AS inner_attempt_ordinal,'initial' AS retry_kind,"
         "CASE WHEN g%%100<68 THEN 'openrouter' WHEN g%%100<88 THEN 'anthropic' "
         "ELSE 'google' END AS requested_provider,CASE WHEN g%%100<68 THEN "
@@ -1398,14 +1434,17 @@ def _source_attempt_integrity_sql() -> str:
         "WHEN g%%100<88 THEN 'claude-3-5-haiku' ELSE 'gemini-2.5-flash' END "
         "AS resolved_model,'openai_responses' AS transport,started_at,"
         "started_at+interval '100 milliseconds' AS finished_at,'completed' AS state,"
-        "'succeeded' AS outcome,'none' AS error_class,400+(g%%1600) AS input_tokens,"
+        "'succeeded' AS outcome,'none' AS error_class,NULL::text AS provider_request_id,"
+        "400+(g%%1600) AS input_tokens,"
         "40+(g%%360) AS output_tokens,NULL::bigint AS reasoning_tokens,"
         "CASE WHEN g%%4=0 THEN 100+(g%%900) ELSE 0 END AS cache_read_tokens,"
         "CASE WHEN g%%10=0 THEN 20+(g%%80) ELSE 0 END AS cache_write_tokens,"
         "CASE WHEN g%%4=0 THEN 50+(g%%450) ELSE 0 END AS cache_miss_tokens,"
-        "true AS usage_known,false AS possibly_billed,'runtime_recorder' AS source,"
+        "true AS usage_known,NULL::text AS usage_unknown_reason,false AS possibly_billed,"
+        "NULL::double precision AS latency_ms,'runtime_recorder' AS source,"
         "'complete' AS completeness,2 AS revision,NULL::numeric AS cost,"
-        "NULL::text AS currency,NULL::double precision AS ttft_ms FROM shaped),"
+        "NULL::text AS currency,NULL::text AS rate_card_version,"
+        "NULL::double precision AS ttft_ms FROM shaped),"
         "actual AS MATERIALIZED (SELECT job_id,attempt_id::text AS attempt_id,"
         + ",".join(column for column in compared if column != "attempt_id")
         + " FROM llm_provider_attempts WHERE left(user_id,length(%s))=%s) "
@@ -1685,15 +1724,13 @@ def _collect_resume_snapshot_in_transaction(
             ),
         }
     )
-    user_shape = conn.execute(
-        "SELECT count(*) FILTER (WHERE user_id !~ %s),"
-        "count(*) FILTER (WHERE doc IS DISTINCT FROM "
-        "jsonb_build_object('scale_fixture',true)),"
-        "(SELECT count(*) FROM generate_series(0,%s) AS g "
-        "LEFT JOIN users expected ON expected.user_id=%s || lpad(g::text,6,'0') "
-        "WHERE expected.user_id IS NULL) FROM users",
-        (f"^{re.escape(prefix)}[0-9]{{6}}$", FORMAL_USERS - 1, prefix),
-    ).fetchone()
+    user_shape = _collect_user_shape(
+        conn,
+        prefix=prefix,
+        users=FORMAL_USERS,
+        expected_created_at=SCALE_NOW_UTC
+        - timedelta(days=DEFAULT_HISTORY_DAYS),
+    )
     source_integrity_row = conn.execute(
         "SELECT "
         "(SELECT count(DISTINCT job_id) FROM v2_turn_metrics),"
@@ -1770,11 +1807,7 @@ def _collect_resume_snapshot_in_transaction(
         "prefix": prefix,
         "global_counts": global_counts,
         "prefix_counts": prefix_counts,
-        "user_shape": {
-            "invalid_user_ids": int(user_shape[0]),
-            "invalid_fixture_docs": int(user_shape[1]),
-            "missing_user_sequence": int(user_shape[2]),
-        },
+        "user_shape": user_shape,
         "source_integrity": {
             key: int(value)
             for key, value in zip(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from html import unescape
 import importlib.util
@@ -377,6 +377,7 @@ def _healthy_formal_resume_snapshot():
             "invalid_user_ids": 0,
             "invalid_fixture_docs": 0,
             "missing_user_sequence": 0,
+            "invalid_created_at": 0,
         },
         "source_integrity": {
             "turn_distinct_jobs": 3_000_000,
@@ -535,6 +536,10 @@ def test_formal_resume_mode_options_fail_closed(
             "reuse mismatch",
         ),
         (
+            lambda item: item["user_shape"].update(invalid_created_at=1),
+            "fixture users",
+        ),
+        (
             lambda item: item["reference_counts"].update(llm_rate_cards=1),
             "foreign pricing reference",
         ),
@@ -612,6 +617,109 @@ def test_formal_resume_snapshot_accepts_exact_complete_fixture():
         )
         is snapshot
     )
+
+
+def test_formal_user_shape_rejects_single_same_count_created_at_mutation():
+    harness = _load_usage_scale_harness()
+    prefix = "scale_usage_a11ce00001_"
+    with db.get_pool().connection() as conn:
+        try:
+            harness._seed_fixture(
+                conn,
+                prefix=prefix,
+                rows=1,
+                attempt_rows=1,
+                users=1,
+                end_at=harness.SCALE_NOW_UTC,
+                history_days=365,
+            )
+            before = harness._fixture_counts(conn, prefix)
+            conn.execute(
+                "UPDATE users SET created_at=%s "
+                "WHERE user_id=%s",
+                (
+                    (harness.SCALE_NOW_UTC - timedelta(days=365, seconds=-1))
+                    .isoformat(),
+                    prefix + "000000",
+                ),
+            )
+            after = harness._fixture_counts(conn, prefix)
+            shape = harness._collect_user_shape(
+                conn,
+                prefix=prefix,
+                users=1,
+                expected_created_at=harness.SCALE_NOW_UTC - timedelta(days=365),
+            )
+        finally:
+            harness._delete_fixture(conn, prefix)
+
+    assert before == after
+    assert shape["invalid_created_at"] == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("installation_id", "installation-1"),
+        ("runtime", "runtime-1"),
+        ("turn_id", "turn-1"),
+        ("round_id", "round-1"),
+        ("provider_request_id", "request-1"),
+        ("usage_unknown_reason", "provider_omitted"),
+        ("latency_ms", 1.0),
+        ("rate_card_version", "rate-1"),
+    ],
+)
+def test_source_attempt_exact_check_rejects_same_count_nullable_field_mutation(
+    field, value
+):
+    harness = _load_usage_scale_harness()
+    prefix = "scale_usage_b11ce00001_"
+    with db.get_pool().connection() as conn:
+        try:
+            harness._seed_fixture(
+                conn,
+                prefix=prefix,
+                rows=1,
+                attempt_rows=1,
+                users=1,
+                end_at=harness.SCALE_NOW_UTC,
+                history_days=365,
+            )
+            before = harness._fixture_counts(conn, prefix)
+            conn.execute(
+                f"UPDATE llm_provider_attempts SET {field}=%s "  # noqa: S608
+                "WHERE user_id=%s",
+                (value, prefix + "000000"),
+            )
+            after = harness._fixture_counts(conn, prefix)
+            params = (
+                prefix,
+                1,
+                prefix,
+                harness.SCALE_NOW_UTC,
+                365 * 86_400,
+                1,
+                prefix,
+                prefix,
+                prefix,
+            )
+            row = conn.execute(
+                harness._source_attempt_integrity_sql(), params
+            ).fetchone()
+        finally:
+            harness._delete_fixture(conn, prefix)
+
+    assert before == after
+    assert tuple(map(int, row)) == (1, 1, 1)
+
+
+def test_attempt_source_exact_check_excludes_only_wallclock_metadata():
+    harness = _load_usage_scale_harness()
+    sql = harness._source_attempt_integrity_sql()
+
+    assert "created_at" not in sql
+    assert "updated_at" not in sql
 
 
 def test_fresh_formal_empty_database_gate_rejects_rate_card_reference_state():

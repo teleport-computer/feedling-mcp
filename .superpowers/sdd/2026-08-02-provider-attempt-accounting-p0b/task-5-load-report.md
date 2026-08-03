@@ -240,3 +240,43 @@ removed redundant wide CTE materialization and repeated full-field anti-joins;
 it preserved bidirectional key equality plus per-row fact equality and reduced
 the membership check to 29.815 seconds. No formal resume was run, and the
 dedicated fixture remains intact.
+
+### Remaining source-field closure
+
+The formal gate also binds every fixture user's parsed `created_at` instant to
+the deterministic seed value (`SCALE_NOW_UTC - 365 days`). A PostgreSQL
+mutation test changes one user's valid timestamp by one second without changing
+any fixture count and proves that validation rejects it. This makes the
+registered/activated population inputs exact rather than merely cardinality
+complete.
+
+The source-attempt proof now additionally requires the following eight fields
+to be exactly `NULL`, as emitted by the seed path: `installation_id`, `runtime`,
+`turn_id`, `round_id`, `provider_request_id`, `usage_unknown_reason`,
+`latency_ms`, and `rate_card_version`. Eight parameterized PostgreSQL mutation
+tests change one field on one attempt at a time, preserve every fixture count,
+and prove that the same bidirectional exact query rejects all eight mutations.
+Attempt-table `created_at` and `updated_at` are deliberately the only omitted
+source columns: they are PostgreSQL wall-clock defaults/maintenance metadata,
+not deterministic seed facts, so a resumed fixture cannot reproduce their
+values exactly.
+
+The widened statements passed PostgreSQL `EXPLAIN (FORMAT JSON)` parsing and a
+bounded small-data execution test. A fresh real 3M read-only validation then
+passed with exit 0 and retained the original 180,000ms per-statement limit:
+
+- source turns: 8,304.616ms, 3,000,000 expected/actual, zero mismatches;
+- source attempts: 23,860.519ms, 3,000,000 expected/actual, zero mismatches;
+- daily users: 18,666.285ms, 731,199 expected/actual, zero mismatches;
+- daily dimensions: 24,762.993ms, 731,199 expected/actual, zero mismatches;
+- attempt dimensions: 23,552.349ms, 731,199 expected/actual, zero mismatches;
+- memberships: 33,984.986ms, 3,000,000 expected/actual, zero mismatches.
+
+The same snapshot reported `invalid_created_at=0`. This was again
+`--validate-resume-only`: no business producer, formal timing, or cleanup ran,
+and the dedicated fixture remains intact.
+
+Fresh closure verification passed: 226 focused tests, Ruff over both perf
+scripts and both focused test modules, compileall for both perf scripts, and the
+harness self-test (percentiles, sensitive-column guard, and half-open time
+range). The PostgreSQL EXPLAIN/small-data subset separately passed 2 tests.
