@@ -8423,6 +8423,58 @@ def wake_success_stats(*, within_hours: int = 24) -> dict:
     }
 
 
+def memory_lane_health(*, within_hours: int = 24) -> dict:
+    """记忆车道（capture 落卡 / dream 整理）的舰队级健康度。
+
+    为什么单独一条而不是塞进 ``wake_success_stats`` 的 lane 列表：这两条车道不是
+    唤醒。混进去会让"做梦大面积失败"表现为"唤醒成功率下降"，把排查的人引去查唤醒
+    ——同一个数字承载两件事，就是 TESTING §2-N 那条口径漂移。
+
+    补这条的由来（2026-07-31）：用户报"切到 V2 后晚上不整理记忆了"，而当时
+    ``/v1/admin/v2-metrics`` 里**没有任何记忆车道的数字**，只能靠逐个用户比对
+    ``bootstrap_events`` 里最后一次写卡时间才看出 4 个 V2 用户里 3 个自切换起再没
+    写过卡。那个方法只在"已经知道该怀疑谁"时管用；**没有用户报障的话，记忆整理
+    全线停摆我们也发现不了**——它坏掉的样子就是"什么都没发生"，和"今天没什么可记
+    的"长得一模一样。
+
+    与 wake 同一条判据（照抄那边的地雷1）：``completed`` 就是成功，**即使这一轮
+    一张卡都没写**。capture 跑完发现没什么值得记是合法结果（noop），不能当失败去
+    拉低成功率；只有 ``failed``（解析/provider 真错误）和 ``expired``（reaper 判定
+    卡死回收）计入失败侧。
+
+    返回形状与 ``wake_success_stats`` 一致，便于并排读。"""
+    with _pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT lane, status, count(*) FROM agent_jobs "
+                "WHERE lane IN ('capture','dream') "
+                "AND finished_at IS NOT NULL "
+                "AND finished_at > now() - make_interval(hours => %s) "
+                "GROUP BY lane, status",
+                (int(within_hours),),
+            )
+            rows = cur.fetchall()
+    completed = failed = expired = 0
+    by_lane: dict[str, dict[str, int]] = {}
+    for lane, status, count in rows:
+        count = int(count)
+        by_lane.setdefault(lane, {})[status] = count
+        if status == "completed":
+            completed += count
+        elif status == "failed":
+            failed += count
+        elif status == "expired":
+            expired += count
+    denom = completed + failed + expired
+    return {
+        "completed": completed,
+        "failed": failed,
+        "expired": expired,
+        "success_rate": (completed / denom) if denom else None,
+        "by_lane": by_lane,
+    }
+
+
 def pending_job_count() -> int:
     """当前排队中（status='pending'，尚未被任何 worker claim）的 job 数。"""
     with _pool().connection() as conn:

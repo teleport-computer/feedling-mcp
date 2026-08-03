@@ -101,3 +101,85 @@ def test_wake_success_stats_no_wake_jobs_is_none_rate():
     assert stats["expired"] == 0
     assert stats["success_rate"] is None
     assert stats["by_lane"] == {}
+
+
+# ---------------------------------------------------------------------------
+# memory_lane_health — capture / dream 的舰队级健康度
+#
+# 补这条的由来（2026-07-31）：用户报"切到 V2 后晚上不整理记忆了"，而当时
+# /v1/admin/v2-metrics 里没有任何记忆车道的数字，只能逐个用户比对 bootstrap_events
+# 才看出来。没有用户报障的话，记忆整理全线停摆我们发现不了——它坏掉的样子就是
+# "什么都没发生"。
+# ---------------------------------------------------------------------------
+
+
+def test_memory_lane_health_counts_capture_and_dream():
+    seed_user("u_mem_1")
+    _insert_job("u_mem_1", "capture", "completed")
+    _insert_job("u_mem_1", "capture", "completed")
+    _insert_job("u_mem_1", "capture", "failed")
+    _insert_job("u_mem_1", "dream", "completed")
+    _insert_job("u_mem_1", "dream", "expired")
+
+    stats = jobs_store.memory_lane_health()
+
+    assert stats["completed"] == 3
+    assert stats["failed"] == 1
+    assert stats["expired"] == 1
+    assert stats["success_rate"] == pytest.approx(3 / 5)
+    assert stats["by_lane"]["capture"] == {"completed": 2, "failed": 1}
+    assert stats["by_lane"]["dream"] == {"completed": 1, "expired": 1}
+
+
+def test_memory_lane_health_counts_a_zero_card_run_as_success():
+    """capture 跑完发现没什么值得记，是合法结果，不是失败。
+
+    与 wake 的"silence 也算成功"同一条判据。把 noop 当失败会让成功率长期偏低，
+    真正的故障反而淹没在噪声里。终态是 completed 就是成功——这里 job 层面看不到
+    卡数，也不该看。
+    """
+    seed_user("u_mem_noop")
+    _insert_job("u_mem_noop", "capture", "completed")
+
+    stats = jobs_store.memory_lane_health()
+
+    assert stats["success_rate"] == 1.0
+    assert stats["failed"] == 0
+
+
+def test_memory_lane_health_and_wake_do_not_contaminate_each_other():
+    """两个指标必须互不含对方的车道。
+
+    这是这条指标单独存在的全部理由：把 capture/dream 折进 wake，会让"做梦大面积
+    失败"表现成"唤醒成功率下降"，排查的人就去查唤醒了（TESTING §2-N 的口径漂移）。
+    """
+    seed_user("u_mix")
+    _insert_job("u_mix", "heartbeat", "completed")
+    _insert_job("u_mix", "capture", "failed")
+    _insert_job("u_mix", "dream", "failed")
+
+    wake = jobs_store.wake_success_stats()
+    memory = jobs_store.memory_lane_health()
+
+    # 两条记忆车道的失败，一条都不许算进唤醒
+    assert wake["failed"] == 0
+    assert wake["success_rate"] == 1.0
+    assert set(wake["by_lane"]) == {"heartbeat"}
+
+    # 反向同理：唤醒的成功不许被记忆车道借去充数
+    assert memory["completed"] == 0
+    assert memory["failed"] == 2
+    assert set(memory["by_lane"]) == {"capture", "dream"}
+
+
+def test_memory_lane_health_is_explicit_when_nothing_ran():
+    """没有历史时 success_rate 是 None，不是 0。
+
+    0 会被读成"全挂了"，None 才是"无从判断"。同 wake_success_stats 的约定。
+    """
+    stats = jobs_store.memory_lane_health()
+
+    assert stats == {
+        "completed": 0, "failed": 0, "expired": 0,
+        "success_rate": None, "by_lane": {},
+    }

@@ -409,6 +409,10 @@ def v2_metrics(
             )
         },
         "wake": jobs_store.wake_success_stats(),
+        # Deliberately its own block, not extra lanes inside `wake`: capture/dream
+        # are not wakes, and folding them in would make a memory-lane outage look
+        # like a falling wake success rate. See jobs_store.memory_lane_health().
+        "memory_lanes": jobs_store.memory_lane_health(),
         "effects": db.effect_outbox_health(),
         # The genesis import worker rides in the serve_worker process on its own
         # thread, and `run_loop` imports `genesis.worker` lazily — so that thread can

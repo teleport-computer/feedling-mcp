@@ -193,6 +193,18 @@ def env(monkeypatch):
             "by_lane": {"heartbeat": {"completed": 4}, "scheduled": {"failed": 1}},
         },
     )
+    # 刻意给一组与 wake 不同的数字：整字典断言才能证明两个块没有串位
+    monkeypatch.setattr(
+        jobs_store,
+        "memory_lane_health",
+        lambda **kw: {
+            "completed": 7,
+            "failed": 2,
+            "expired": 1,
+            "success_rate": 0.7,
+            "by_lane": {"capture": {"completed": 7}, "dream": {"failed": 2, "expired": 1}},
+        },
+    )
     yield
 
 
@@ -346,6 +358,13 @@ def test_v2_metrics_returns_every_field(env):
             "expired": 0,
             "success_rate": 0.8,
             "by_lane": {"heartbeat": {"completed": 4}, "scheduled": {"failed": 1}},
+        },
+        "memory_lanes": {
+            "completed": 7,
+            "failed": 2,
+            "expired": 1,
+            "success_rate": 0.7,
+            "by_lane": {"capture": {"completed": 7}, "dream": {"failed": 2, "expired": 1}},
         },
         "effects": {
             "pending": 2,
