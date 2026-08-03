@@ -355,3 +355,36 @@ because non-formal evidence cannot pass the formal gate. The temporary database
 was dropped, and a catalog check again showed only the retained 3M database.
 No formal resume or retained-fixture cleanup ran. Fresh focused verification
 passed 240 tests.
+
+## First formal artifact: scale and cleanup failures
+
+The first formal artifact was written atomically to
+`docs/superpowers/evidence/2026-08-03-admin-usage-attempt-rollup-scale.json` and
+failed closed. Provider/model-filtered p50/p95 were 4,243.152/4,456.927ms;
+unfiltered p50/p95 were 4,840.773/5,649.255ms. The attempt-ledger EXPLAIN took
+34,617.528ms filtered and 52,134.309ms unfiltered. Raw-edge guards all passed:
+only 8,208 raw calls and bounded runtime-job/call probes were present. The
+actual bottleneck was the complete-day logical-call path: 178,000 attempt
+dimension rows plus 731,528 wide call memberships, expanded into approximately
+2.51M or 3.70M scope rows and externally sorted with substantial temporary I/O.
+
+A read-only SQL-only candidate removed the five-scope lateral expansion and
+used five exact per-scope `count(DISTINCT call_id)` aggregates. An unfiltered
+ordinary fetch still took 53,078.502ms for 2,017 rows. It therefore did not
+remove the distinct-call work and was rejected; the 3,000ms production attempt
+limit and p95 budget remain unchanged.
+
+Cleanup independently failed because one prefix-wide user delete inherited the
+3s timeout while cascading into 3M memberships. PostgreSQL rolled back the
+whole transaction. The artifact's post-cleanup map and a subsequent read-only
+inspection both showed the full fixture remained present; no business producer
+ran and no formal retry or cleanup followed.
+
+The proposed correction is documented in
+`docs/superpowers/specs/2026-08-03-attempt-ranked-flags-and-resumable-cleanup-design.md`.
+It removes the not-yet-deployed membership relation and ranks exact logical
+call/gap counters into 32 fixed BIGINT columns on the existing daily attempt
+dimensions. The design covers every provider/model/completeness selector,
+requested/resolved breakdown, raw edge, replay/retention path, migration and
+storage gate, plus independently timed, batched, crash-resumable fixture
+cleanup. It is a design only and has not been implemented.
