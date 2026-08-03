@@ -26,6 +26,7 @@ from memory.source_policy import (
 
 
 _DREAM_MAX_CONSOLIDATIONS = 5
+_DREAM_MAX_SUPERSEDED_CARDS = 4
 _DREAM_OUTPUT_COOLDOWN_SEC = 7 * 24 * 60 * 60
 
 
@@ -1139,6 +1140,25 @@ def _execute_memory_actions(
             "status": "error",
             "error": "memory_dream_action_cap_exceeded",
             "limit": _DREAM_MAX_CONSOLIDATIONS,
+            "results": [],
+            "effects": [],
+            "total_count": 0,
+            "applied_count": 0,
+            "skipped_count": 0,
+            "failed_count": 0,
+        }, 400
+    dream_superseded_cards = sum(
+        len(_memory_supersedes_list(action))
+        for action in actions
+        if isinstance(action, dict)
+        and str(action.get("type") or "").strip() == "memory.supersede"
+        and str(action.get("capture_mode") or "").strip() == "memory_dream"
+    )
+    if dream_superseded_cards > _DREAM_MAX_SUPERSEDED_CARDS:
+        return {
+            "status": "error",
+            "error": "memory_dream_superseded_card_cap_exceeded",
+            "limit": _DREAM_MAX_SUPERSEDED_CARDS,
             "results": [],
             "effects": [],
             "total_count": 0,

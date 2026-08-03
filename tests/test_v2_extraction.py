@@ -502,7 +502,7 @@ def _merge(ids, *, content="合并后的正文包含两张旧卡的全部具体�
     }
 
 
-def test_dream_guard_caps_batch_and_never_touches_unreferenced_cards():
+def test_dream_guard_caps_retired_cards_and_never_touches_unreferenced_cards():
     cards = [_existing(f"m{i}") for i in range(13)]
     consolidations = [_merge([f"m{i}", f"m{i + 1}"]) for i in range(0, 12, 2)]
 
@@ -514,10 +514,10 @@ def test_dream_guard_caps_batch_and_never_touches_unreferenced_cards():
         existing_cards=cards,
     )
 
-    assert len(actions) == extraction.DREAM_MAX_CONSOLIDATIONS == 5
-    assert superseded == 10
+    assert len(actions) == 2
+    assert superseded == extraction.DREAM_MAX_SUPERSEDED_CARDS == 4
     touched = {memory_id for action in actions for memory_id in action["supersedes"]}
-    assert touched == {f"m{i}" for i in range(10)}
+    assert touched == {f"m{i}" for i in range(4)}
     assert "m12" not in touched
 
 
@@ -588,6 +588,65 @@ def test_dream_guard_rejects_recent_dream_output_for_seven_days():
         source_ids=[],
         build_envelope=_env,
         existing_cards=[fresh, other],
+    )
+
+    assert (actions, added, superseded) == ([], 0, 0)
+
+
+def test_dream_guard_live_rig_shape_merges_only_the_true_duplicate_pair():
+    cards = [
+        {
+            "id": "freeze-dried-a",
+            "summary": "小波爱吃冻干",
+            "content": "小波最喜欢吃鸡肉冻干，会把它当作日常零食。",
+            "source": "memory_capture",
+        },
+        {
+            "id": "freeze-dried-b",
+            "summary": "小波爱吃冻干",
+            "content": "小波喜欢吃鸡肉冻干，平时会把冻干当作零食。",
+            "source": "memory_capture",
+        },
+        {"id": "cycling", "summary": "周末骑行", "content": "计划沿江骑行四十公里。"},
+        {"id": "coffee", "summary": "手冲咖啡", "content": "早晨用 V60 和浅烘豆冲咖啡。"},
+        {"id": "kyoto", "summary": "京都旅行", "content": "秋天想去京都看红叶和寺院。"},
+        {"id": "project", "summary": "项目截止", "content": "发布版本的截止日期是九月十五日。"},
+        {"id": "birthday", "summary": "家人生日", "content": "妈妈的生日是五月十二日。"},
+        {"id": "insomnia", "summary": "最近失眠", "content": "最近连续三晚凌晨两点后才能睡着。"},
+    ]
+    pairings = [
+        ["freeze-dried-a", "freeze-dried-b"],
+        ["cycling", "coffee"],
+        ["kyoto", "project"],
+        ["birthday", "insomnia"],
+    ]
+
+    actions, _added, superseded = extraction.consolidations_to_actions(
+        [_merge(pair) for pair in pairings],
+        occurred_at="2026-08-03T00:00:00Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
+    )
+
+    assert len(actions) == 1
+    assert actions[0]["supersedes"] == ["freeze-dried-a", "freeze-dried-b"]
+    assert superseded == 2
+
+
+def test_dream_guard_requires_every_pair_in_a_multi_card_merge_to_be_similar():
+    cards = [
+        {"id": "a", "summary": "小波爱吃鸡肉冻干", "content": "每天吃一块鸡肉冻干。"},
+        {"id": "b", "summary": "小波爱吃鸡肉冻干", "content": "鸡肉冻干是每天的零食。"},
+        {"id": "c", "summary": "京都旅行计划", "content": "秋天去京都看红叶。"},
+    ]
+
+    actions, added, superseded = extraction.consolidations_to_actions(
+        [_merge(["a", "b", "c"])],
+        occurred_at="2026-08-03T00:00:00Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
     )
 
     assert (actions, added, superseded) == ([], 0, 0)

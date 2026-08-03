@@ -26,7 +26,10 @@ _TIMEOUT_SEC = 90.0
 # bounds rather than model instructions: a weak or compromised provider cannot
 # bypass them by returning a larger batch.
 DREAM_MAX_CONSOLIDATIONS = 5
+DREAM_MAX_SUPERSEDED_CARDS = 4
 DREAM_OUTPUT_COOLDOWN_SEC = 7 * 24 * 60 * 60
+DREAM_MERGE_MIN_TRIGRAM_OVERLAP = 0.30
+DREAM_MERGE_MIN_SHARED_TRIGRAMS = 3
 
 
 def _iso_epoch(value: Any) -> float | None:
@@ -93,6 +96,46 @@ def _has_substantive_increment(old_card: dict, result: dict) -> bool:
     new_grams = {new_text[i : i + 3] for i in range(max(0, len(new_text) - 2))}
     min_novel = max(6, math.ceil(len(old_grams) * 0.10))
     return len(new_grams - old_grams) >= min_novel
+
+
+def _semantic_trigrams(card: dict) -> set[str]:
+    text = _normalized_semantic_text(card)
+    return {text[i : i + 3] for i in range(max(0, len(text) - 2))}
+
+
+def _cards_are_merge_similar(left: dict, right: dict) -> bool:
+    """Conservative pairwise duplicate/event similarity for destructive merge.
+
+    The overlap coefficient uses the shorter card as the denominator so an
+    expanded duplicate can still match its concise source.  A minimum of three
+    shared trigrams prevents a generic short prefix (person/topic name) from
+    making two otherwise unrelated cards look similar.
+    """
+
+    left_text = _normalized_semantic_text(left)
+    right_text = _normalized_semantic_text(right)
+    if not left_text or not right_text:
+        return False
+    if left_text == right_text:
+        return True
+    left_grams = _semantic_trigrams(left)
+    right_grams = _semantic_trigrams(right)
+    denominator = min(len(left_grams), len(right_grams))
+    if denominator <= 0:
+        return False
+    shared = len(left_grams & right_grams)
+    return (
+        shared >= DREAM_MERGE_MIN_SHARED_TRIGRAMS
+        and shared / denominator >= DREAM_MERGE_MIN_TRIGRAM_OVERLAP
+    )
+
+
+def _all_merge_targets_similar(cards: list[dict]) -> bool:
+    return all(
+        _cards_are_merge_similar(cards[left], cards[right])
+        for left in range(len(cards))
+        for right in range(left + 1, len(cards))
+    )
 
 
 class ParseRetry(NamedTuple):
@@ -427,7 +470,7 @@ def consolidations_to_actions(
         else (_iso_epoch(occurred_at) or datetime.now(timezone.utc).timestamp())
     )
     used_ids: set[str] = set()
-    guard_rejections = 0
+    policy_rejections = 0
     structurally_valid = 0
     for consolidation in consolidations or []:
         if not isinstance(consolidation, dict):
@@ -449,6 +492,12 @@ def consolidations_to_actions(
         if op not in {"merge", "thicken", "supersede"} or not card_ids or not result:
             continue
         structurally_valid += 1
+        if (
+            len(card_ids) > DREAM_MAX_SUPERSEDED_CARDS
+            or superseded + len(card_ids) > DREAM_MAX_SUPERSEDED_CARDS
+        ):
+            policy_rejections += 1
+            continue
         if guarded:
             old_cards = [by_id.get(memory_id) for memory_id in card_ids]
             if (
@@ -463,8 +512,12 @@ def consolidations_to_actions(
                     len(card_ids) == 1
                     and not _has_substantive_increment(old_cards[0], result)
                 )
+                or (
+                    len(card_ids) > 1
+                    and not _all_merge_targets_similar(old_cards)
+                )
             ):
-                guard_rejections += 1
+                policy_rejections += 1
                 continue
         card = {"type": "fact", **result}
         actions.append(
@@ -490,7 +543,7 @@ def consolidations_to_actions(
         if len(actions) >= DREAM_MAX_CONSOLIDATIONS:
             break
     if consolidations and not actions and not (
-        guarded and structurally_valid > 0 and guard_rejections == structurally_valid
+        structurally_valid > 0 and policy_rejections == structurally_valid
     ):
         raise ValueError("dream_no_memory_actions")
     return actions, 0, superseded

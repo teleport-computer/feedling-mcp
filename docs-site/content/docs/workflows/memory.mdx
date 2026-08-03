@@ -24,13 +24,14 @@ cards does not change the total or refresh the timestamp.
 
 Hosted Dream maintenance reads the full decrypted content of every candidate
 card before proposing a consolidation. Each run can apply at most five
-consolidations, cannot target the same card twice, and cannot consume a
-Dream-authored card until it is at least seven days old. A one-card rewrite is
-accepted only when it contains a substantive increment; otherwise the original
-card stays active. New conversation turns alone do not schedule another Dream
-run: the trigger advances only when new non-Dream cards are added. These limits
-are enforced after model output and again at the memory write boundary where
-applicable.
+consolidations and retire at most four cards. It cannot target the same card
+twice or consume a Dream-authored card until it is at least seven days old.
+Every pair in a multi-card merge must pass a deterministic text-similarity
+threshold; a one-card rewrite is accepted only when it contains a substantive
+increment. Rejected operations leave every original card active. New
+conversation turns alone do not schedule another Dream run: the trigger
+advances only when new non-Dream cards are added. These limits are enforced
+after model output and again at the memory write boundary where applicable.
 
 ## 1. Build and store a card
 

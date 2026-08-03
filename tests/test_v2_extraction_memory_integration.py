@@ -213,3 +213,80 @@ def test_dream_apply_rejects_more_than_five_rewrites_before_any_write(monkeypatc
     assert body["error"] == "memory_dream_action_cap_exceeded"
     assert saved == []
     assert all(moment["status"] == "active" for moment in moments)
+
+
+def test_dream_apply_rejects_more_than_four_retired_cards_before_any_write(monkeypatch):
+    user_id = "dream-retired-cap-user"
+    store = types.SimpleNamespace(user_id=user_id)
+    moments = [_old_card(user_id, f"memory-{i}") for i in range(6)]
+    saved = _install_storage(monkeypatch, moments)
+    builder = _builder(user_id)
+    actions = []
+    for offset in (0, 3):
+        mapped, _added, _superseded = extraction.consolidations_to_actions(
+            [{
+                "op": "merge",
+                "card_ids": [f"memory-{i}" for i in range(offset, offset + 3)],
+                "result": {"summary": f"merged-{offset}", "content": "merged body"},
+            }],
+            occurred_at="2026-08-01T00:00:00Z",
+            source_ids=[],
+            build_envelope=builder,
+        )
+        actions.extend(mapped)
+
+    body, status = memory_actions._execute_memory_actions(store, None, actions)
+
+    assert status == 400
+    assert body["error"] == "memory_dream_superseded_card_cap_exceeded"
+    assert saved == []
+    assert all(moment["status"] == "active" for moment in moments)
+
+
+def test_dream_live_rig_shape_persists_only_duplicate_merge(monkeypatch):
+    user_id = "dream-live-rig-user"
+    store = types.SimpleNamespace(user_id=user_id)
+    candidates = [
+        {"id": "freeze-a", "summary": "小波爱吃冻干", "content": "小波最喜欢吃鸡肉冻干，会当作日常零食。"},
+        {"id": "freeze-b", "summary": "小波爱吃冻干", "content": "小波喜欢吃鸡肉冻干，平时会当作零食。"},
+        {"id": "cycling", "summary": "周末骑行", "content": "计划沿江骑行四十公里。"},
+        {"id": "coffee", "summary": "手冲咖啡", "content": "早晨用 V60 和浅烘豆冲咖啡。"},
+        {"id": "kyoto", "summary": "京都旅行", "content": "秋天想去京都看红叶和寺院。"},
+        {"id": "project", "summary": "项目截止", "content": "发布版本截止日期是九月十五日。"},
+        {"id": "birthday", "summary": "家人生日", "content": "妈妈生日是五月十二日。"},
+        {"id": "insomnia", "summary": "最近失眠", "content": "连续三晚凌晨两点后才睡着。"},
+    ]
+    moments = [_old_card(user_id, card["id"]) for card in candidates]
+    saved = _install_storage(monkeypatch, moments)
+    pairings = [
+        ["freeze-a", "freeze-b"],
+        ["cycling", "coffee"],
+        ["kyoto", "project"],
+        ["birthday", "insomnia"],
+    ]
+    actions, _added, superseded = extraction.consolidations_to_actions(
+        [
+            {
+                "op": "merge",
+                "card_ids": pair,
+                "result": {"summary": "模型合并结果", "content": "模型合并后的正文。"},
+            }
+            for pair in pairings
+        ],
+        occurred_at="2026-08-03T00:00:00Z",
+        source_ids=[],
+        build_envelope=_builder(user_id),
+        existing_cards=candidates,
+    )
+
+    body, status = memory_actions._execute_memory_actions(store, None, actions)
+
+    assert status == 200 and body["applied_count"] == 1
+    assert superseded == 2
+    assert len(saved) == 9
+    by_id = {item["id"]: item for item in saved}
+    assert by_id["freeze-a"]["status"] == "superseded"
+    assert by_id["freeze-b"]["status"] == "superseded"
+    for memory_id in ("cycling", "coffee", "kyoto", "project", "birthday", "insomnia"):
+        assert by_id[memory_id]["status"] == "active"
+    assert sum(1 for item in saved if item.get("status") == "active") == 7

@@ -13,8 +13,10 @@ change must not be interpreted as an API guarantee.
 - **Hosted Dream maintenance now fails closed against destructive rewrite
   loops.** Runtime V2 fetches candidate card bodies instead of reconstructing
   them from one-line index summaries, applies at most five non-overlapping
-  consolidations per run, rejects one-card rewrites without substantive new
-  information, and gives Dream-authored cards a seven-day cooldown. Dream's
+  consolidations and retires at most four cards per run, rejects multi-card
+  merges whose targets are not pairwise text-similar, rejects one-card rewrites
+  without substantive new information, and gives Dream-authored cards a
+  seven-day cooldown. Dream's
   durable trigger now advances only on new non-Dream cards and Runtime V2
   records completion state, so its own output and ordinary new turns cannot
   retrigger the same Garden snapshot. The managed test Compose defaults the V2
