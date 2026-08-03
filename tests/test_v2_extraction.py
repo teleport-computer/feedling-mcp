@@ -473,6 +473,7 @@ def test_consolidations_to_actions_supersedes_when_target_present():
         [{
             "op": "merge",
             "card_ids": ["m1", "m2"],
+            "rationale": "同一事件的两条记录",
             "result": {"summary": "merged", "content": "merged body"},
         }],
         occurred_at="T", source_ids=[], build_envelope=_env)
@@ -498,11 +499,14 @@ def _merge(ids, *, content="合并后的正文包含两张旧卡的全部具体�
     return {
         "op": "merge",
         "card_ids": list(ids),
+        "rationale": "独立二审确认属于同一事件或同一线索的演进",
+        "_review_approved": True,
+        "_review_reason": "来源卡属于同一事件线索",
         "result": {"summary": "合并摘要", "content": content},
     }
 
 
-def test_dream_guard_caps_retired_cards_and_never_touches_unreferenced_cards():
+def test_dream_guard_has_no_quantity_cap_after_independent_review():
     cards = [_existing(f"m{i}") for i in range(13)]
     consolidations = [_merge([f"m{i}", f"m{i + 1}"]) for i in range(0, 12, 2)]
 
@@ -514,10 +518,10 @@ def test_dream_guard_caps_retired_cards_and_never_touches_unreferenced_cards():
         existing_cards=cards,
     )
 
-    assert len(actions) == 2
-    assert superseded == extraction.DREAM_MAX_SUPERSEDED_CARDS == 4
+    assert len(actions) == 6
+    assert superseded == 12
     touched = {memory_id for action in actions for memory_id in action["supersedes"]}
-    assert touched == {f"m{i}" for i in range(4)}
+    assert touched == {f"m{i}" for i in range(12)}
     assert "m12" not in touched
 
 
@@ -543,7 +547,8 @@ def test_dream_guard_rejects_unknown_and_overlapping_targets():
 def test_dream_guard_rejects_lossy_one_to_one_rewrite():
     card = _existing("m1")
     actions, added, superseded = extraction.consolidations_to_actions(
-        [{"op": "thicken", "card_ids": ["m1"], "result": {
+        [{"op": "thicken", "card_ids": ["m1"],
+          "rationale": "同一卡片补充细节", "_review_approved": True, "result": {
             "summary": "改写摘要", "content": "更短的改写。",
         }}],
         occurred_at="2026-08-01T00:00:00Z",
@@ -562,7 +567,8 @@ def test_dream_guard_accepts_one_to_one_only_with_substantive_increment():
         + " 新增事实：从 2026 年 7 月起固定使用浅烘豆，并记录了研磨刻度、水粉比和冲煮时长。"
     )
     actions, _added, superseded = extraction.consolidations_to_actions(
-        [{"op": "thicken", "card_ids": ["m1"], "result": {
+        [{"op": "thicken", "card_ids": ["m1"],
+          "rationale": "同一卡片补充新的冲煮事实", "_review_approved": True, "result": {
             "summary": card["summary"], "content": new_detail,
         }}],
         occurred_at="2026-08-01T00:00:00Z",
@@ -575,7 +581,7 @@ def test_dream_guard_accepts_one_to_one_only_with_substantive_increment():
     assert superseded == 1
 
 
-def test_dream_guard_rejects_recent_dream_output_for_seven_days():
+def test_dream_guard_allows_prior_run_dream_output_to_evolve_immediately():
     fresh = _existing(
         "dream-new",
         source="memory_dream",
@@ -590,66 +596,43 @@ def test_dream_guard_rejects_recent_dream_output_for_seven_days():
         existing_cards=[fresh, other],
     )
 
-    assert (actions, added, superseded) == ([], 0, 0)
+    assert added == 0 and superseded == 2
+    assert len(actions) == 1
 
 
-def test_dream_guard_live_rig_shape_merges_only_the_true_duplicate_pair():
+def test_dream_guard_accepts_low_text_overlap_evolution_after_review():
     cards = [
-        {
-            "id": "freeze-dried-a",
-            "summary": "小波爱吃冻干",
-            "content": "小波最喜欢吃鸡肉冻干，会把它当作日常零食。",
-            "source": "memory_capture",
-        },
-        {
-            "id": "freeze-dried-b",
-            "summary": "小波爱吃冻干",
-            "content": "小波喜欢吃鸡肉冻干，平时会把冻干当作零食。",
-            "source": "memory_capture",
-        },
-        {"id": "cycling", "summary": "周末骑行", "content": "计划沿江骑行四十公里。"},
-        {"id": "coffee", "summary": "手冲咖啡", "content": "早晨用 V60 和浅烘豆冲咖啡。"},
-        {"id": "kyoto", "summary": "京都旅行", "content": "秋天想去京都看红叶和寺院。"},
-        {"id": "project", "summary": "项目截止", "content": "发布版本的截止日期是九月十五日。"},
-        {"id": "birthday", "summary": "家人生日", "content": "妈妈的生日是五月十二日。"},
-        {"id": "insomnia", "summary": "最近失眠", "content": "最近连续三晚凌晨两点后才能睡着。"},
-    ]
-    pairings = [
-        ["freeze-dried-a", "freeze-dried-b"],
-        ["cycling", "coffee"],
-        ["kyoto", "project"],
-        ["birthday", "insomnia"],
+        {"id": "plan", "summary": "想去京都看红叶", "content": "希望今年秋天成行。"},
+        {"id": "ticket", "summary": "已经订好机票", "content": "11 月飞往关西机场。"},
     ]
 
     actions, _added, superseded = extraction.consolidations_to_actions(
-        [_merge(pair) for pair in pairings],
+        [_merge(["plan", "ticket"], content="京都计划已从意向推进到 11 月出票。")],
         occurred_at="2026-08-03T00:00:00Z",
         source_ids=[],
         build_envelope=_env,
         existing_cards=cards,
     )
 
-    assert len(actions) == 1
-    assert actions[0]["supersedes"] == ["freeze-dried-a", "freeze-dried-b"]
-    assert superseded == 2
+    assert len(actions) == 1 and superseded == 2
 
 
-def test_dream_guard_requires_every_pair_in_a_multi_card_merge_to_be_similar():
-    cards = [
-        {"id": "a", "summary": "小波爱吃鸡肉冻干", "content": "每天吃一块鸡肉冻干。"},
-        {"id": "b", "summary": "小波爱吃鸡肉冻干", "content": "鸡肉冻干是每天的零食。"},
-        {"id": "c", "summary": "京都旅行计划", "content": "秋天去京都看红叶。"},
-    ]
+def test_dream_guard_rejects_unreviewed_or_rationale_free_proposal():
+    cards = [_existing("m1"), _existing("m2")]
+    unreviewed = _merge(["m1", "m2"])
+    unreviewed.pop("_review_approved")
+    no_rationale = _merge(["m1", "m2"])
+    no_rationale["rationale"] = ""
 
-    actions, added, superseded = extraction.consolidations_to_actions(
-        [_merge(["a", "b", "c"])],
-        occurred_at="2026-08-03T00:00:00Z",
-        source_ids=[],
-        build_envelope=_env,
-        existing_cards=cards,
-    )
-
-    assert (actions, added, superseded) == ([], 0, 0)
+    for proposal in (unreviewed, no_rationale):
+        actions, added, superseded = extraction.consolidations_to_actions(
+            [proposal],
+            occurred_at="2026-08-03T00:00:00Z",
+            source_ids=[],
+            build_envelope=_env,
+            existing_cards=cards,
+        )
+        assert (actions, added, superseded) == ([], 0, 0)
 
 
 def test_nonempty_actions_require_occurred_at():

@@ -49,6 +49,20 @@ def test_write_tools_have_object_params():
         assert specs[w].parameters["type"] == "object"
 
 
+def test_memory_index_exposes_partition_filters_without_offset():
+    spec = next(
+        item for item in tool_schema.build_tool_specs() if item.name == "memory_index"
+    )
+
+    assert set(spec.parameters["properties"]) == {"limit", "bucket", "thread"}
+    assert "offset" not in spec.parameters["properties"]
+    assert tool_schema.validate_tool_args(
+        "memory_index", {"bucket": "旅行", "thread": "京都"}
+    ) is None
+    assert "memory_search" in spec.description
+    assert "memory_organize" in spec.description
+
+
 def test_identity_patch_exposes_agent_name_so_a_rename_is_discoverable():
     """The model can only rename the persona if the tool says it can.
 

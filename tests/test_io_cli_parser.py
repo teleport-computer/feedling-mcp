@@ -32,6 +32,7 @@ REAL_SUBCOMMANDS = {
     "identity-write",
     "memory-delete",
     "memory-patch",
+    "memory-organize",
 }
 
 
@@ -94,6 +95,13 @@ def test_memory_delete_reaches_handler_not_argparse_crash():
 
 def test_memory_patch_reaches_handler_not_argparse_crash():
     r = _run("memory-patch", "--id", "abc", "--summary", "corrected")
+    assert "conflicting subparser" not in r.stderr
+    payload = json.loads(r.stdout.strip().splitlines()[-1])
+    assert payload.get("ok") is False
+
+
+def test_memory_organize_reaches_handler_not_argparse_crash():
+    r = _run("memory-organize")
     assert "conflicting subparser" not in r.stderr
     payload = json.loads(r.stdout.strip().splitlines()[-1])
     assert payload.get("ok") is False

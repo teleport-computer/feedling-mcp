@@ -27,10 +27,23 @@ def _norm(body, status, *, default_msg: str) -> CapabilityResult:
                retryable=errors.retryable_for_status(status))
 
 
+def _norm_index(body, status, *, default_msg: str) -> CapabilityResult:
+    """Add content-free completeness metadata before the shared item cap."""
+
+    if status != 200 or not isinstance(body, dict):
+        return _norm(body, status, default_msg=default_msg)
+    items = body.get("items") if isinstance(body.get("items"), list) else []
+    try:
+        total = max(0, int(body.get("user_card_count")))
+    except (TypeError, ValueError, OverflowError):
+        total = len(items)
+    return ok(data=errors.cap_data({**body, "total": total, "returned": len(items)}))
+
+
 def index(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
     body, status = memory_core.index(store, api_key, params or {},
                                      post_enclave=_post_enclave_for(runtime_token))
-    return _norm(body, status, default_msg="memory index unavailable")
+    return _norm_index(body, status, default_msg="memory index unavailable")
 
 
 def search(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:
@@ -42,7 +55,7 @@ def search(store, *, api_key=None, runtime_token=None, params=None) -> Capabilit
         return err(errors.INVALID, "query is required for memory_search", retryable=False)
     body, status = memory_core.index(store, api_key, {**params, "query": query},
                                      post_enclave=_post_enclave_for(runtime_token))
-    return _norm(body, status, default_msg="memory search unavailable")
+    return _norm_index(body, status, default_msg="memory search unavailable")
 
 
 def fetch(store, *, api_key=None, runtime_token=None, params=None) -> CapabilityResult:

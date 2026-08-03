@@ -109,8 +109,10 @@ from memory.card_text import (
 )
 from memory.dream_prompt_v1 import (
     build_dream_prompt,
+    build_dream_review_prompt,
     build_dream_retry_prompt,
     parse_dream_consolidations,
+    parse_dream_review,
 )
 
 log = logging.getLogger("feedling.runtime_v2.worker")
@@ -214,6 +216,115 @@ async def _extract_with_provider_health(
             user_id, latency_ms=(time.monotonic() - started) * 1000.0
         )
     return result
+
+
+async def _review_dream_consolidations(
+    user_id: str,
+    consolidations: list[dict],
+    *,
+    card_items: list[dict],
+    provider_config: Any,
+    job_id,
+    claimed_by: str | None,
+    tm: "TurnMetrics | None" = None,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+) -> list[dict]:
+    """Independently review each Dream proposal with a fresh BYOK call.
+
+    A review failure rejects only that proposal. Lease loss is different: a
+    stale worker must stop the whole job before any write. The approved marker
+    is internal and is required again by the deterministic mapper.
+    """
+
+    by_id = {
+        str(card.get("id") or "").strip(): card
+        for card in card_items
+        if isinstance(card, dict) and str(card.get("id") or "").strip()
+    }
+    approved: list[dict] = []
+    for index, consolidation in enumerate(consolidations):
+        if not isinstance(consolidation, dict):
+            continue
+        rationale = str(consolidation.get("rationale") or "").strip()
+        card_ids = list(
+            dict.fromkeys(
+                str(memory_id or "").strip()
+                for memory_id in (consolidation.get("card_ids") or [])
+                if str(memory_id or "").strip()
+            )
+        )
+        source_cards = [by_id.get(memory_id) for memory_id in card_ids]
+        reject_code = ""
+        review: dict | None = None
+        if not rationale:
+            reject_code = "rationale_missing"
+        elif not card_ids or any(card is None for card in source_cards):
+            reject_code = "source_card_unavailable"
+        else:
+            if claimed_by and not await asyncio.to_thread(
+                jobs_store.renew_job_lease,
+                job_id,
+                claimed_by,
+                ttl_sec=jobs_store.RUNNING_TTL_SEC,
+            ):
+                raise LostJobLease("dream ownership lost before semantic review")
+            prompt = build_dream_review_prompt(
+                consolidation=consolidation,
+                source_cards=[card for card in source_cards if card is not None],
+            )
+            _report_turn_progress(f"dream_review_{index}_start")
+            review_result, review_error = await _extract_with_provider_health(
+                user_id,
+                provider_config=provider_config,
+                prompt=prompt,
+                parse=parse_dream_review,
+                max_tokens=300,
+                progress_cb=lambda stage, attempt, proposal=index: _report_turn_progress(
+                    f"dream_review_{proposal}_{stage}_{attempt}"
+                ),
+                usage_out=tm.add_call if tm is not None else None,
+                trajectory_out=(
+                    trajectory_recorder.record
+                    if trajectory_recorder is not None
+                    else None
+                ),
+            )
+            _report_turn_progress(f"dream_review_{index}_complete")
+            if review_error:
+                reject_code = str(review_error)[:120]
+            elif not isinstance(review_result, dict):
+                reject_code = "review_result_invalid"
+            elif review_result.get("approved") is not True:
+                reject_code = "review_no"
+                review = review_result
+            else:
+                review = review_result
+        await _record_trajectory(
+            trajectory_recorder,
+            "dream_semantic_review",
+            {
+                "proposal_index": index,
+                "target_count": len(card_ids),
+                "approved": bool(review and review.get("approved") is True),
+                "reject_code": reject_code,
+            },
+            best_effort=True,
+        )
+        if not review or review.get("approved") is not True:
+            log.warning(
+                "[v2.worker] dream proposal rejected by semantic review "
+                "user=%s proposal=%d targets=%d code=%s",
+                user_id,
+                index,
+                len(card_ids),
+                reject_code or "review_no",
+            )
+            continue
+        accepted = dict(consolidation)
+        accepted["_review_approved"] = True
+        accepted["_review_reason"] = str(review.get("reason") or "")[:1000]
+        approved.append(accepted)
+    return approved
 
 
 def _positive_int_env(name: str, default: str) -> int:
@@ -1615,6 +1726,8 @@ async def _dispatch_mixed_tool_calls(
             mutations.append(("mcp", tc))
         elif mcp_turn.handles(tc.name):
             reads.append(("mcp", tc))
+        elif tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL:
+            mutations.append(("platform", tc))
         elif tc.name in cap_registry.WRITE_ACTIONS:
             mutations.append(("platform", tc))
         else:
@@ -1673,7 +1786,11 @@ async def _dispatch_mixed_tool_calls(
                         if inspect.isawaitable(prepared):
                             await prepared
             continue
-        if kind == "platform" and prepare_platform_mutation is not None:
+        if (
+            kind == "platform"
+            and tc.name in cap_registry.WRITE_ACTIONS
+            and prepare_platform_mutation is not None
+        ):
             prepared = prepare_platform_mutation(tc)
             if inspect.isawaitable(prepared):
                 await prepared
@@ -3814,6 +3931,79 @@ def _make_provider_usage_dispatcher(
         return results
 
     return _dispatch
+
+
+_DREAM_TOOL_ENABLED = os.environ.get(
+    "FEEDLING_V2_DREAM_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _dream_tool_enabled_for_user(user_id: str) -> bool:
+    """Fail closed on both the deployment switch and the user's Dream switch."""
+
+    if not _DREAM_TOOL_ENABLED:
+        return False
+    settings = db.get_blob_strict(str(user_id), "proactive_settings")
+    if settings is None:
+        return True
+    if not isinstance(settings, dict):
+        return False
+    return bool(settings.get("dream_enabled", True))
+
+
+async def _dispatch_memory_organize_tool(user_id: str, tc) -> ToolResult:
+    """Force-enqueue Dream without bypassing any Dream execution safety checks."""
+
+    try:
+        enabled = await asyncio.to_thread(_dream_tool_enabled_for_user, user_id)
+    except Exception:  # noqa: BLE001 — unreadable switch fails closed, stays explainable
+        enabled = False
+    if not enabled:
+        return ToolResult(
+            call_id=tc.id,
+            content=json.dumps(
+                {
+                    "status": "disabled",
+                    "message": "整理功能暂时关闭",
+                },
+                ensure_ascii=False,
+            ),
+        )
+    try:
+        job_id, coalesced = await asyncio.to_thread(
+            jobs_store.enqueue_job,
+            user_id,
+            "dream",
+            reason="user_requested",
+        )
+    except Exception:  # noqa: BLE001 — tool failure must remain model-visible
+        return ToolResult(
+            call_id=tc.id,
+            content=json.dumps(
+                {
+                    "status": "error",
+                    "message": "记忆整理暂时无法开始",
+                },
+                ensure_ascii=False,
+            ),
+        )
+    if not coalesced:
+        await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
+    return ToolResult(
+        call_id=tc.id,
+        content=json.dumps(
+            {
+                "status": "coalesced" if coalesced else "queued",
+                "job_id": str(job_id),
+                "message": (
+                    "已合并到正在进行的记忆整理"
+                    if coalesced
+                    else "已开始后台整理，完成的部分会体现在记忆花园里"
+                ),
+            },
+            ensure_ascii=False,
+        ),
+    )
 
 
 def _memory_tool_actions(raw_actions) -> list[dict]:
@@ -7429,7 +7619,8 @@ async def _run_wake(
         # answer, so it must never be offered here — unconditionally, not
         # gated by the kill switch (that gate is chat-lane's Task 6 concern).
         wake_disabled_tool_names = wake_disabled_web_tool_names | {
-            cap_tool_schema.PROVIDER_USAGE_TOOL
+            cap_tool_schema.PROVIDER_USAGE_TOOL,
+            cap_tool_schema.MEMORY_ORGANIZE_TOOL,
         }
 
         dispatch_task_batch = _make_task_batch_dispatcher(
@@ -7454,6 +7645,8 @@ async def _run_wake(
             await _fence_wake_effect("tool dispatch")
 
             async def _dispatch_platform_one(tc) -> ToolResult:
+                if tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL:
+                    return await _dispatch_memory_organize_tool(user_id, tc)
                 try:
                     (result,) = await v2_executor.dispatch_tool_calls(
                         [tc],
@@ -9137,6 +9330,17 @@ async def _run_extraction(
             _report_turn_progress("extraction_provider_complete")
         if reason:
             raise RuntimeError(reason)
+        if lane == "dream" and items:
+            items = await _review_dream_consolidations(
+                user_id,
+                list(items),
+                card_items=list(ctx.get("card_items") or []),
+                provider_config=provider_config,
+                job_id=job_id,
+                claimed_by=claimed_by,
+                tm=tm,
+                trajectory_recorder=trajectory_recorder,
+            )
         if not items and lane != "capture":
             await _complete_extraction(item_count=0)
             if tm is not None:
@@ -10485,7 +10689,10 @@ async def process_job(
             disabled_mutation_tool_names = frozenset(
                 set(cap_registry.WRITE_ACTIONS)
                 | set(mcp_mutating_names)
-                | {cap_tool_schema.FILE_REPLY_TOOL}
+                | {
+                    cap_tool_schema.FILE_REPLY_TOOL,
+                    cap_tool_schema.MEMORY_ORGANIZE_TOOL,
+                }
             )
             offered_mcp_tool_specs = tuple(
                 spec
@@ -10619,6 +10826,8 @@ async def process_job(
                 # One call per coroutine lets platform reads share the exact same
                 # worker-level gate as MCP reads. Executor still owns validation,
                 # provenance, encrypted outbox writes, and terminal write failures.
+                if tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL:
+                    return await _dispatch_memory_organize_tool(user_id, tc)
                 try:
                     (result,) = await v2_executor.dispatch_tool_calls(
                         [tc],
@@ -10807,6 +11016,7 @@ async def process_job(
                     for tc in tool_calls
                     if tc.name in mcp_mutating_names
                     or tc.name in cap_registry.WRITE_ACTIONS
+                    or tc.name == cap_tool_schema.MEMORY_ORGANIZE_TOOL
                 }
                 dispatchable_calls = [
                     tc for tc in tool_calls if str(tc.id) not in blocked_by_id

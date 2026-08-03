@@ -35,6 +35,9 @@ MUTATION_BLOCKED_AFTER_UNKNOWN_OUTCOME_ERROR = (
     "error: mutation_blocked_after_unknown_outcome"
 )
 _MEMORY_DISCOVERY_TOOLS = frozenset({"memory_index", "memory_search"})
+_PLATFORM_MUTATION_TOOLS = frozenset(
+    set(cap_registry.WRITE_ACTIONS) | {tool_schema.MEMORY_ORGANIZE_TOOL}
+)
 _FILE_DELIVERY_TOOLS = frozenset(
     {
         "memory_index",
@@ -108,12 +111,11 @@ def _serialized_chars(value) -> int | None:
         return None
 
 
-def _truncate_result_content(content: str, cap: int) -> str:
+def _truncate_result_content(content: str, cap: int, *, marker: str = _RESULT_TRUNCATION_MARKER) -> str:
     """Deterministically cap one result, including the truncation marker."""
     text = str(content or "")
     if len(text) <= cap:
         return text
-    marker = _RESULT_TRUNCATION_MARKER
     if cap <= len(marker):
         return marker[:cap]
     return text[: cap - len(marker)] + marker
@@ -155,8 +157,23 @@ def _normalize_tool_results(
     batch_cap: int,
 ) -> list[ToolResult]:
     """Apply provider-neutral per-call and aggregate prompt budgets in call order."""
+    markers = []
+    for result in results:
+        metadata = result.metadata or {}
+        if metadata.get("memory_query_kind") in {"memory_index", "memory_search"}:
+            total = metadata.get("memory_total")
+            returned = metadata.get("memory_returned")
+            markers.append(
+                "...[memory result truncated; this query returned "
+                f"{returned if isinstance(returned, int) else '?'} of "
+                f"{total if isinstance(total, int) else '?'} total cards. "
+                "Use memory_index with bucket or thread filters to browse partitions.]"
+            )
+        else:
+            markers.append(_RESULT_TRUNCATION_MARKER)
     individually_capped = [
-        _truncate_result_content(result.content, per_result_cap) for result in results
+        _truncate_result_content(result.content, per_result_cap, marker=marker)
+        for result, marker in zip(results, markers)
     ]
     quotas = _result_quotas(
         [len(content) for content in individually_capped], batch_cap
@@ -164,9 +181,10 @@ def _normalize_tool_results(
     return [
         ToolResult(
             call_id=result.call_id,
-            content=_truncate_result_content(content, quota),
+            content=_truncate_result_content(content, quota, marker=marker),
+            metadata=result.metadata,
         )
-        for result, content, quota in zip(results, individually_capped, quotas)
+        for result, content, quota, marker in zip(results, individually_capped, quotas, markers)
     ]
 
 
@@ -572,7 +590,7 @@ async def run_tool_loop(
             # call is checked again below before dispatch.
             blocked_tools: set[str] = set()
             if external_content_seen:
-                blocked_tools.update(cap_registry.WRITE_ACTIONS)
+                blocked_tools.update(_PLATFORM_MUTATION_TOOLS)
                 # Every MCP call crosses an outbound data boundary.  A matching
                 # read-only approval permits parallel execution before external
                 # content is observed, but cannot permit a later data-dependent
@@ -586,7 +604,7 @@ async def run_tool_loop(
             # With no server-wide idempotency contract, allowing the model to
             # try any later mutation can duplicate or compound unknown state.
             if mutation_outcome_unknown:
-                blocked_tools.update(cap_registry.WRITE_ACTIONS)
+                blocked_tools.update(_PLATFORM_MUTATION_TOOLS)
                 blocked_tools.update(mutating_mcp_names)
             # A private read may expose persona, workspace/artifact, or memory
             # content. That observation cannot influence a later outbound
@@ -1012,7 +1030,7 @@ async def run_tool_loop(
             tc.name in {tool_schema.REPLY_TOOL, tool_schema.FILE_REPLY_TOOL}
             for tc in pr.tool_calls
         ) and any(
-            tc.name in cap_registry.WRITE_ACTIONS or tc.name in mutating_mcp_names
+            tc.name in _PLATFORM_MUTATION_TOOLS or tc.name in mutating_mcp_names
             for tc in pr.tool_calls
         )
         if (

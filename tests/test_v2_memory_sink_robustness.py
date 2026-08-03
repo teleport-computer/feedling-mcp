@@ -57,6 +57,32 @@ def test_success_returns_body(monkeypatch):
     assert serve_worker._apply_memory_actions("u1", [{"type": "memory.add"}]) == {"status": "ok", "results": []}
 
 
+def test_more_than_twenty_actions_are_chunked_without_truncation(monkeypatch):
+    seen: list[list[dict]] = []
+
+    def _actions(store, api_key, payload, **kwargs):
+        batch = list(payload["actions"])
+        seen.append(batch)
+        return ({
+            "status": "ok",
+            "results": [{"status": "ok"} for _action in batch],
+            "effects": [{"type": "memory_superseded"} for _action in batch],
+            "total_count": len(batch),
+            "applied_count": len(batch),
+            "skipped_count": 0,
+            "failed_count": 0,
+        }, 200)
+
+    monkeypatch.setattr(serve_worker.memory_core, "actions", _actions)
+    actions = [{"type": "memory.supersede", "memory_id": str(index)} for index in range(45)]
+
+    body = serve_worker._apply_memory_actions("u1", actions)
+
+    assert [len(batch) for batch in seen] == [20, 20, 5]
+    assert body["total_count"] == body["applied_count"] == 45
+    assert len(body["results"]) == len(body["effects"]) == 45
+
+
 def test_partial_200_returns_item_details_instead_of_raising(monkeypatch, caplog):
     body = {
         "status": "partial",

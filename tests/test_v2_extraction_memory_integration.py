@@ -126,6 +126,7 @@ def test_dream_parser_mapper_and_real_validator_supersede_all_sources(monkeypatc
         "consolidations": [{
             "op": "merge",
             "card_ids": ["memory-a", "memory-b"],
+            "rationale": "两张卡都是晨间手冲这一稳定偏好的记录",
             "result": {
                 "summary": "用户稳定地喜欢自己做咖啡。",
                 "content": "多次提到晨间手冲，合并为一个稳定偏好。",
@@ -160,7 +161,7 @@ def test_dream_parser_mapper_and_real_validator_supersede_all_sources(monkeypatc
     assert new["occurred_at"] == "2026-07-18T10:00:00Z"
 
 
-def test_dream_apply_rejects_fresh_dream_output_even_if_mapper_is_bypassed(monkeypatch):
+def test_dream_apply_allows_prior_run_dream_output_without_long_cooldown(monkeypatch):
     user_id = "dream-cooldown-user"
     store = types.SimpleNamespace(user_id=user_id)
     recent = _old_card(user_id, "dream-recent")
@@ -172,6 +173,7 @@ def test_dream_apply_rejects_fresh_dream_output_even_if_mapper_is_bypassed(monke
         [{
             "op": "thicken",
             "card_ids": ["dream-recent"],
+            "rationale": "同一线索出现了新的演进事实",
             "result": {"summary": "new", "content": "new body"},
         }],
         occurred_at="2026-08-01T00:00:00Z",
@@ -181,13 +183,12 @@ def test_dream_apply_rejects_fresh_dream_output_even_if_mapper_is_bypassed(monke
 
     body, status = memory_actions._execute_memory_actions(store, None, actions)
 
-    assert status == 400
-    assert body["error"] == "memory_dream_target_cooldown"
-    assert saved == []
-    assert moments[0]["status"] == "active"
+    assert status == 200 and body["applied_count"] == 1
+    assert len(saved) == 2
+    assert moments[0]["status"] == "superseded"
 
 
-def test_dream_apply_rejects_more_than_five_rewrites_before_any_write(monkeypatch):
+def test_dream_apply_has_no_five_rewrite_cap(monkeypatch):
     user_id = "dream-cap-user"
     store = types.SimpleNamespace(user_id=user_id)
     moments = [_old_card(user_id, f"memory-{i}") for i in range(12)]
@@ -199,6 +200,7 @@ def test_dream_apply_rejects_more_than_five_rewrites_before_any_write(monkeypatc
             [{
                 "op": "merge",
                 "card_ids": [f"memory-{i * 2}", f"memory-{i * 2 + 1}"],
+                "rationale": "独立二审已确认同一线索",
                 "result": {"summary": f"merged-{i}", "content": f"body-{i}"},
             }],
             occurred_at="2026-08-01T00:00:00Z",
@@ -209,13 +211,16 @@ def test_dream_apply_rejects_more_than_five_rewrites_before_any_write(monkeypatc
 
     body, status = memory_actions._execute_memory_actions(store, None, actions)
 
-    assert status == 400
-    assert body["error"] == "memory_dream_action_cap_exceeded"
-    assert saved == []
-    assert all(moment["status"] == "active" for moment in moments)
+    assert status == 200 and body["applied_count"] == 6
+    assert len(saved) == 18
+    assert all(
+        moment["status"] == "superseded"
+        for moment in moments
+        if moment["id"].startswith("memory-")
+    )
 
 
-def test_dream_apply_rejects_more_than_four_retired_cards_before_any_write(monkeypatch):
+def test_dream_apply_has_no_four_retired_card_cap(monkeypatch):
     user_id = "dream-retired-cap-user"
     store = types.SimpleNamespace(user_id=user_id)
     moments = [_old_card(user_id, f"memory-{i}") for i in range(6)]
@@ -227,6 +232,7 @@ def test_dream_apply_rejects_more_than_four_retired_cards_before_any_write(monke
             [{
                 "op": "merge",
                 "card_ids": [f"memory-{i}" for i in range(offset, offset + 3)],
+                "rationale": "独立二审已确认三张卡是同一事件演进",
                 "result": {"summary": f"merged-{offset}", "content": "merged body"},
             }],
             occurred_at="2026-08-01T00:00:00Z",
@@ -237,10 +243,13 @@ def test_dream_apply_rejects_more_than_four_retired_cards_before_any_write(monke
 
     body, status = memory_actions._execute_memory_actions(store, None, actions)
 
-    assert status == 400
-    assert body["error"] == "memory_dream_superseded_card_cap_exceeded"
-    assert saved == []
-    assert all(moment["status"] == "active" for moment in moments)
+    assert status == 200 and body["applied_count"] == 2
+    assert len(saved) == 8
+    assert all(
+        moment["status"] == "superseded"
+        for moment in moments
+        if moment["id"].startswith("memory-")
+    )
 
 
 def test_dream_live_rig_shape_persists_only_duplicate_merge(monkeypatch):
@@ -269,6 +278,8 @@ def test_dream_live_rig_shape_persists_only_duplicate_merge(monkeypatch):
             {
                 "op": "merge",
                 "card_ids": pair,
+                "rationale": "批处理模型声称它们属于同一线索",
+                **({"_review_approved": True} if pair == pairings[0] else {}),
                 "result": {"summary": "模型合并结果", "content": "模型合并后的正文。"},
             }
             for pair in pairings

@@ -24,6 +24,7 @@ REPLY_TOOL = "reply"
 FILE_REPLY_TOOL = "send_file"
 TASK_TOOL = "task"
 PROVIDER_USAGE_TOOL = "provider_usage"
+MEMORY_ORGANIZE_TOOL = "memory_organize"
 
 _EXCLUDED = frozenset({"chat_image_read", "chat_file_read"})
 
@@ -86,7 +87,7 @@ PARAMS: dict[str, dict] = {
     # "limit" is inspected directly (memory_core.index reads payload.get("limit")).
     "memory_index": {
         "type": "object",
-        "properties": {"limit": _INT},
+        "properties": {"limit": _INT, "bucket": _STR, "thread": _STR},
         "required": [],
     },
     # memory.search(store, ...): params.get("query") (required, non-empty) + optional
@@ -262,6 +263,7 @@ PARAMS: dict[str, dict] = {
     # -- runtime-native provider_usage tool (chat-lane only; see worker.py
     # _SUBAGENT_ALLOWED_TOOLS / _PRIVATE_READ_TOOLS / _run_wake disabled set) --
     PROVIDER_USAGE_TOOL: {"type": "object", "properties": {}, "additionalProperties": False},
+    MEMORY_ORGANIZE_TOOL: {"type": "object", "properties": {}, "additionalProperties": False},
 }
 
 # Tool arguments cross an untrusted model boundary.  Close every model-facing
@@ -300,15 +302,21 @@ DESCRIPTIONS: dict[str, str] = {
                        "must name a dimension that already exists — call identity_get "
                        "first to see the current dimensions and values. Optional "
                        "'reason'. To add or rename dimensions, use identity_patch."),
-    "memory_index": ("List recent memory cards, optionally capped by limit. Use this "
-                     "once for an open-ended overview such as all memories or an "
-                     "overall relationship summary; do not pair it with or repeat "
-                     "memory_search in the same turn."),
-    "memory_search": ("Keyword-search memory cards by a required query string. Use "
-                      "this only when the user asks about a specific remembered "
-                      "subject, person, phrase, or event. Never use it for ordinary "
-                      "conversation, model/runtime identity, or an all-memory "
-                      "overview, and do not repeat it after one discovery result."),
+    "memory_index": ("Browse memory-card summaries, optionally filtered by one exact "
+                     "bucket or thread and capped by limit. Do not indiscriminately pull "
+                     "the whole Garden. For an open-ended overview, inspect the returned "
+                     "total/returned counts and browse bucket by bucket (or thread by "
+                     "thread) until the partition counts reconcile with total. For a "
+                     "specific subject use memory_search then memory_fetch instead. For "
+                     "a user-requested bulk rewrite or cleanup, call memory_organize "
+                     "instead of trying to edit every card in chat."),
+    "memory_search": ("Keyword-search memory cards by a required query string, then use "
+                      "memory_fetch for the selected ids. This is the normal path for a "
+                      "specific remembered subject, person, phrase, or event. Never use "
+                      "it for ordinary conversation, model/runtime identity, or an "
+                      "all-memory overview, and do not repeat it after one discovery "
+                      "result. For a user-requested bulk rewrite or cleanup, call "
+                      "memory_organize."),
     "memory_fetch": "Fetch specific memory cards by their ids.",
     "memory_write": ("Write, update, or delete memory cards. Each action needs an "
                      "'op': 'add' (supply a one-line 'summary' AND full 'content', "
@@ -366,6 +374,14 @@ DESCRIPTIONS: dict[str, str] = {
     PROVIDER_USAGE_TOOL: (
         "查询当前 AI 服务商账户的余额与用量（只读）。仅在用户明确询问余额、用量、"
         "还剩多少钱时调用；结果如实转述，查不到就说查不到。"
+    ),
+    MEMORY_ORGANIZE_TOOL: (
+        "Queue a full Dream reorganization of the user's existing memory garden. "
+        "Dream already runs automatically at night; call this only when the user "
+        "explicitly asks you to organize, consolidate, or clean up their memories. "
+        "Do not call it proactively or for ordinary single-card edits (use memory_write "
+        "for those). This queues safe background organization; it does not let the chat "
+        "turn merge cards directly."
     ),
 }
 
@@ -517,7 +533,13 @@ def build_tool_specs() -> list[ToolSpec]:
         if name in _EXCLUDED:
             continue
         specs.append(ToolSpec(name=name, description=DESCRIPTIONS[name], parameters=PARAMS[name]))
-    for name in (TASK_TOOL, REPLY_TOOL, FILE_REPLY_TOOL, PROVIDER_USAGE_TOOL):
+    for name in (
+        TASK_TOOL,
+        REPLY_TOOL,
+        FILE_REPLY_TOOL,
+        PROVIDER_USAGE_TOOL,
+        MEMORY_ORGANIZE_TOOL,
+    ):
         specs.append(ToolSpec(
             name=name,
             description=DESCRIPTIONS[name],

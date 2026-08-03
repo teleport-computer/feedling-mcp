@@ -10,17 +10,36 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
-- **Hosted Dream maintenance now fails closed against destructive rewrite
-  loops.** Runtime V2 fetches candidate card bodies instead of reconstructing
-  them from one-line index summaries, applies at most five non-overlapping
-  consolidations and retires at most four cards per run, rejects multi-card
-  merges whose targets are not pairwise text-similar, rejects one-card rewrites
-  without substantive new information, and gives Dream-authored cards a
-  seven-day cooldown. Dream's
-  durable trigger now advances only on new non-Dream cards and Runtime V2
-  records completion state, so its own output and ordinary new turns cannot
-  retrigger the same Garden snapshot. The managed test Compose defaults the V2
-  Dream worker gate to off during incident recovery; Capture is unchanged.
+- **Hosted Dream maintenance now uses proposal rationale plus independent
+  semantic review.** Runtime V2 fetches complete candidate card bodies instead
+  of reconstructing them from one-line summaries. Every consolidation must
+  include a rationale and receive an isolated second yes/no judgment from the
+  account's BYOK model; a negative, failed, timed-out, or malformed judgment
+  rejects only that proposal. This replaces the temporary text-overlap,
+  five-consolidation, four-retired-card, and seven-day cooldown fences, allowing
+  low-overlap evolution such as a travel plan becoming a booked ticket while
+  keeping merely related events separate. One-card rewrites still require
+  substantive new information, one source card cannot be reused within a run,
+  and all actions remain soft supersedes bound to the pre-run card snapshot.
+  Dream's durable automatic trigger advances only on new non-Dream cards.
+
+- **Users can explicitly wake a full Memory Dream organization from chat.**
+  Runtime V2 exposes `memory_organize` only for an explicit user request and
+  force-enqueues a single-flight Dream job without granting direct merge access
+  to the chat turn. It bypasses automatic timing and new-material gates but
+  retains rationale review, soft supersedes, and the deployment/user Dream
+  switches; a disabled switch returns a clear disabled state. Resident V1 has
+  the equivalent `memory-organize` CLI verb over `POST /v1/dream/tick` with
+  `force: true`.
+
+- **Runtime V2 can browse large Memory Gardens by partition without increasing
+  its tool-result cap.** `memory_index` now exposes the existing `bucket` and
+  `thread` filters, restoring resident CLI parity without adding offset-based
+  full-library pagination. Index and search results report content-free
+  `total` and `returned` counts, and truncated results tell the model to browse
+  bucket or thread partitions. Tool guidance keeps targeted questions on
+  `memory_search` then `memory_fetch`, while user-requested bulk cleanup is sent
+  to `memory_organize` rather than many chat-loop card edits.
 
 - **Scheduled reminders can repeat daily or weekly.** The model-facing
   `schedule_wake` tool accepts `repeat: "daily"` or `repeat: "weekly"` and uses

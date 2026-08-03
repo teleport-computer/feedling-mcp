@@ -85,7 +85,6 @@ from model_api_runtime.v2 import cursor as v2_cursor
 from model_api_runtime.v2 import child_supervisor as v2_child_supervisor
 from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
-from model_api_runtime.v2 import extraction as v2_extraction
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import profile_store as v2_profile_store
 from model_api_runtime.v2 import reaper as v2_reaper
@@ -2180,18 +2179,11 @@ def _read_memory_context(user_id: str, *, full_cards: bool = False) -> dict:
                     raise RuntimeError(
                         f"dream_cards_fetch_incomplete:{len(ids)}/{len(by_id)}"
                     )
-                now_epoch = time.time()
-                eligible = [
-                    by_id[memory_id]
-                    for memory_id in ids
-                    if v2_extraction.dream_card_is_eligible(
-                        by_id[memory_id], now_epoch=now_epoch
-                    )
-                ]
                 selected: list[dict] = []
                 lines: list[str] = []
                 rendered_chars = 0
-                for item in eligible:
+                for memory_id in ids:
+                    item = by_id[memory_id]
                     line = _render_card_line(item)
                     if not line:
                         continue
@@ -2252,34 +2244,56 @@ def _apply_memory_actions(
       卡确实删了、turn 却失败）。丢弃+记日志：用户照常拿到回复，被拒的 action 在
       runner 日志里可见（body 打进 warning，供事后定位）。"""
     store = core_store.get_store(user_id)
-    body, status = memory_core.actions(
-        store,
-        None,
-        {"actions": actions},
-        runtime_token=runtime_token,
-    )
-    if status >= 500:
-        raise RuntimeError(
-            f"memory_actions_failed: status={status} body={str(body)[:160]}"
+    batches: list[dict] = []
+    for offset in range(0, len(actions), 20):
+        body, status = memory_core.actions(
+            store,
+            None,
+            {"actions": actions[offset : offset + 20]},
+            runtime_token=runtime_token,
         )
-    if status >= 400:
-        log.warning(
-            "[v2.serve_worker] memory action rejected (4xx, dropped) user=%s status=%s body=%s",
-            user_id,
-            status,
-            str(body)[:300],
-        )
-    elif int(body.get("failed_count") or 0) > 0:
-        log.warning(
-            "[v2.serve_worker] memory batch had item failures user=%s "
-            "applied=%s skipped=%s failed=%s body=%s",
-            user_id,
-            body.get("applied_count"),
-            body.get("skipped_count"),
-            body.get("failed_count"),
-            str(body)[:500],
-        )
-    return body
+        if status >= 500:
+            raise RuntimeError(
+                f"memory_actions_failed: status={status} body={str(body)[:160]}"
+            )
+        if status >= 400:
+            log.warning(
+                "[v2.serve_worker] memory action rejected (4xx, dropped) user=%s status=%s body=%s",
+                user_id,
+                status,
+                str(body)[:300],
+            )
+        elif int(body.get("failed_count") or 0) > 0:
+            log.warning(
+                "[v2.serve_worker] memory batch had item failures user=%s "
+                "applied=%s skipped=%s failed=%s body=%s",
+                user_id,
+                body.get("applied_count"),
+                body.get("skipped_count"),
+                body.get("failed_count"),
+                str(body)[:500],
+            )
+        batches.append(body)
+    if len(batches) <= 1:
+        return batches[0] if batches else {"status": "ok", "results": [], "effects": []}
+    results = [row for body in batches for row in body.get("results", [])]
+    effects = [row for body in batches for row in body.get("effects", [])]
+    failed_count = sum(int(body.get("failed_count") or 0) for body in batches)
+    applied_count = sum(int(body.get("applied_count") or 0) for body in batches)
+    skipped_count = sum(int(body.get("skipped_count") or 0) for body in batches)
+    merged = {
+        "status": "ok" if failed_count == 0 else ("failed" if failed_count == len(results) else "partial"),
+        "results": results,
+        "effects": effects,
+        "total_count": len(results),
+        "applied_count": applied_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+    }
+    first_error = next((body.get("error") for body in batches if body.get("error")), None)
+    if first_error:
+        merged["error"] = first_error
+    return merged
 
 
 def _build_memory_envelope(

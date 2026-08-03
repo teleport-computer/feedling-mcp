@@ -78,7 +78,11 @@ def _deps(**over):
         ],
         read_memory_context=lambda uid: {
             "ai_name": "小克", "user_name": "Z", "buckets": "B",
-            "threads": "T", "identity": "I", "cards": "C"},
+            "threads": "T", "identity": "I", "cards": "C",
+            "card_items": [
+                {"id": "old-a", "summary": "计划去京都", "content": "想看红叶。"},
+                {"id": "old-b", "summary": "订了京都机票", "content": "11 月出发。"},
+            ]},
         build_memory_envelope=_envelope,
         apply_memory_actions=lambda uid, actions: {
             "status": "ok", "applied": len(actions)},
@@ -117,9 +121,12 @@ def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
         assert provider_config is _BYOK          # BYOK-only
         if lane == "capture":
             return ([{"action": "add", "summary": "s", "content": "c"}], None)
+        if "独立的记忆整理审查员" in prompt:
+            return ({"approved": True, "reason": "同一京都计划的演进"}, None)
         return ([{
             "op": "merge",
             "card_ids": ["old-a", "old-b"],
+            "rationale": "同一京都计划从意向推进到出票",
             "result": {"summary": "s", "content": "c"},
         }], None)
 
@@ -153,6 +160,82 @@ def test_extraction_lane_applies_actions_and_completes(monkeypatch, lane):
     assert _job_row(job_id)[0] == "completed"
 
 
+def test_dream_semantic_review_accepts_duplicate_and_evolution_but_rejects_unrelated(
+    monkeypatch,
+):
+    cards = [
+        {"id": "food-a", "summary": "小波爱吃冻干", "content": "每天吃鸡肉冻干。"},
+        {"id": "food-b", "summary": "小波爱吃冻干", "content": "冻干是日常零食。"},
+        {"id": "plan", "summary": "想去京都看红叶", "content": "希望秋天成行。"},
+        {"id": "ticket", "summary": "订了京都机票", "content": "11 月飞关西。"},
+        {"id": "cycling", "summary": "周末骑行", "content": "沿江骑四十公里。"},
+        {"id": "insomnia", "summary": "最近失眠", "content": "凌晨两点后才睡。"},
+    ]
+    proposals = [
+        {"op": "merge", "card_ids": ["food-a", "food-b"], "rationale": "同一偏好", "result": {}},
+        {"op": "merge", "card_ids": ["plan", "ticket"], "rationale": "同一计划演进", "result": {}},
+        {"op": "merge", "card_ids": ["cycling", "insomnia"], "rationale": "都和健康有关", "result": {}},
+    ]
+    prompts = []
+
+    async def _review(_uid, **kwargs):
+        prompt = kwargs["prompt"]
+        prompts.append(prompt)
+        if '"cycling"' in prompt:
+            return {"approved": False, "reason": "两个独立事实"}, None
+        return {"approved": True, "reason": "同一事件或线索"}, None
+
+    monkeypatch.setattr(worker, "_extract_with_provider_health", _review)
+    approved = asyncio.run(worker._review_dream_consolidations(
+        "review-user",
+        proposals,
+        card_items=cards,
+        provider_config=_BYOK,
+        job_id="job-review",
+        claimed_by=None,
+    ))
+
+    assert len(prompts) == 3  # one fresh provider call per proposal
+    assert [row["card_ids"] for row in approved] == [
+        ["food-a", "food-b"],
+        ["plan", "ticket"],
+    ]
+    assert all(row["_review_approved"] is True for row in approved)
+
+
+def test_dream_semantic_review_failure_rejects_one_proposal_and_continues(monkeypatch):
+    cards = [
+        {"id": "a", "summary": "A"},
+        {"id": "b", "summary": "B"},
+        {"id": "c", "summary": "C"},
+        {"id": "d", "summary": "D"},
+    ]
+    proposals = [
+        {"op": "merge", "card_ids": ["a", "b"], "rationale": "第一条", "result": {}},
+        {"op": "merge", "card_ids": ["c", "d"], "rationale": "第二条", "result": {}},
+    ]
+    calls = {"n": 0}
+
+    async def _review(_uid, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None, "provider_call_failed:upstream_unavailable"
+        return {"approved": True, "reason": "第二条通过"}, None
+
+    monkeypatch.setattr(worker, "_extract_with_provider_health", _review)
+    approved = asyncio.run(worker._review_dream_consolidations(
+        "review-user",
+        proposals,
+        card_items=cards,
+        provider_config=_BYOK,
+        job_id="job-review",
+        claimed_by=None,
+    ))
+
+    assert calls["n"] == 2
+    assert [row["card_ids"] for row in approved] == [["c", "d"]]
+
+
 @pytest.mark.parametrize("lane", ["capture", "dream"])
 def test_extraction_lane_records_whole_turn_metric_on_success(monkeypatch, lane):
     """PR B review finding: `_run_extraction` makes a real `v2_extraction.extract`
@@ -174,9 +257,12 @@ def test_extraction_lane_records_whole_turn_metric_on_success(monkeypatch, lane)
         })
         if lane == "capture":
             return ([{"action": "add", "summary": "s", "content": "c"}], None)
+        if "独立的记忆整理审查员" in prompt:
+            return ({"approved": True, "reason": "同一京都计划的演进"}, None)
         return ([{
             "op": "merge",
             "card_ids": ["old-a", "old-b"],
+            "rationale": "同一京都计划从意向推进到出票",
             "result": {"summary": "s", "content": "c"},
         }], None)
 
@@ -195,12 +281,18 @@ def test_extraction_lane_records_whole_turn_metric_on_success(monkeypatch, lane)
             "FROM v2_turn_metrics WHERE job_id=%s", (job_id,)).fetchone()
     assert row is not None
     assert row[0] == lane
-    assert row[1] == 90 and row[2] == 9
-    assert row[3] == 1
+    expected_calls = 2 if lane == "dream" else 1
+    assert row[1] == 90 * expected_calls and row[2] == 9 * expected_calls
+    assert row[3] == expected_calls
     assert row[4] is False
     assert row[5] == "ok"
     assert row[6:] == (
-        70, 20, 1, 1, "anthropic", "claude-sonnet-4-test",
+        70 * expected_calls,
+        20 * expected_calls,
+        expected_calls,
+        expected_calls,
+        "anthropic",
+        "claude-sonnet-4-test",
     )
 
 

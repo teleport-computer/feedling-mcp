@@ -71,7 +71,7 @@ def _strip_blobs(value: Any) -> Any:
     return value
 
 
-def _summarize_capability_result(data: dict) -> str:
+def _summarize_capability_result(data: dict, *, tool_name: str = "") -> str:
     """把单次 `run_capability(...).to_dict()` 结果渲染成喂回模型 tool content 的
     字符串：失败只暴露稳定 error code（不回显 message，可能带解密体/URL/查询词），
     成功先剥 blob 键再 json 序列化，超 `_RESULT_CHAR_CAP` 截断——防一个肥 capability
@@ -87,7 +87,19 @@ def _summarize_capability_result(data: dict) -> str:
         return "ok"
     rendered = json.dumps(payload, ensure_ascii=False)
     if len(rendered) > _RESULT_CHAR_CAP:
-        rendered = rendered[:_RESULT_CHAR_CAP] + "...[truncated]"
+        marker = "...[truncated]"
+        if str(tool_name) in {"memory_index", "memory_search"}:
+            total = payload.get("total") if isinstance(payload, dict) else None
+            returned = payload.get("returned") if isinstance(payload, dict) else None
+            if isinstance(total, int) and isinstance(returned, int):
+                marker = (
+                    "...[memory result truncated; this query returned "
+                    f"{returned} of {total} total cards. Use memory_index with "
+                    "bucket or thread filters to browse partitions.]"
+                )
+        legacy_cap = _RESULT_CHAR_CAP + len("...[truncated]")
+        prefix_cap = max(0, legacy_cap - len(marker))
+        rendered = rendered[:prefix_cap] + marker
     return rendered
 
 
@@ -180,7 +192,7 @@ async def dispatch_tool_calls(
                             ),
                         },
                     }
-            content = _summarize_capability_result(data)
+            content = _summarize_capability_result(data, tool_name=tc.name)
             metadata = activity_metadata.memory_result_metadata(tc.name, data) or None
         except Exception:  # noqa: BLE001 — isolate one bad read; never expose its exception
             # Read calls are independent and side-effect-free.  A capability bug or
