@@ -66,3 +66,29 @@ E2E_KEY_DEEPSEEK=sk-…
 - 首轮回复超时 300s（含 hosted runner 冷 spawn）；后续 180s。
 - hermes 格子需要本地 `hermes` CLI + 其自身 profile 可用。
 - P1 全功能清单（协议 §4）暂为半自动：复用本包 client 手工驱动，后续脚本化。
+
+## 处理管线探针(processing_probe)
+
+`docs/testing/TESTING.md` 的「入住/记忆处理」判据的可执行实现。跑真 provider
+的 estimate → commit → status 全链,断言契约、防重、身份先行、分母诚实、
+帧稳定性。
+
+```bash
+python3 -m tools.e2e.processing_probe --list                  # 看格子与 key
+python3 -m tools.e2e.processing_probe                         # 全部已配 key 的 provider
+python3 -m tools.e2e.processing_probe --only hojimi-relay     # 单格
+python3 -m tools.e2e.processing_probe --large                 # 多窗大素材(慢,复刻大导入事故)
+```
+
+**为什么要真跑**:2026-08-03/04 这批上线前,本探针的前身在真跑里抓出四个
+单测与契约测试全绿却真实存在的问题 —— 白名单缺失导致蒸馏 100% 挂、
+combined_map 让 24 窗只蒸 8 窗、后端重启后用户被锁 30 分钟、status 帧
+materials 抖动。共同点:只在「真 provider + 多帧观察」下暴露。
+
+**合并前也能跑**:client 放行 `127.0.0.1`,配合本机 `serve_dev` + dev-seed
+enclave 可以在分支上先真跑一遍(见 docs/testing/TESTING.md 的本地全栈配方),
+再合 test。
+
+**中转站要测两家**:不同中转站 `/models` 的目录格式差异很大(带日期后缀 /
+带方括号标签 / 裸名),推荐链路只测一家不够 —— `relay-openai-compatible`
+与 `hojimi-relay` 两个格子就是为此并存。
