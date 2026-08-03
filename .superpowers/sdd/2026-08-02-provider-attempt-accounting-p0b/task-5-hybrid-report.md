@@ -103,3 +103,29 @@ The formal 3M + 3M run is deliberately deferred to the later proof slice.
 - Ruff: passed for all five changed Python files.
 - `py_compile`: passed for all five changed Python files.
 - `git diff --check`: passed.
+
+## Harness measurement-scale review fix
+
+The formal EXPLAIN gate now classifies the complete JSON plan before truncating
+the 128-node evidence display.  Its attempt-row bound is derived from the exact
+raw-edge cohort selected by `query.raw_days`: half-open turn ranges are counted
+first, then runtime-recorder attempts are counted through the job join, with
+logical calls recorded separately for the call-probe bound.  A sequential
+attempt scan or examined attempt rows above three times that exact edge cohort
+(with a 100-row floor) fails; call probes are bounded relative to the exact
+raw-edge logical calls.  Cleanup is also part of the formal success gate and
+requires cascade verification, watermark removal, and all residual counts at
+zero.
+
+Synthetic regressions prove that forbidden rate/call probes after display node
+128 and a 2,999,999-row index scan in a 3,000,000-row ledger fail, while the
+rollup-plus-bounded-edge shape passes.  Empty probe lists pass only when the
+complete plan contains no matching nodes.
+
+Review-fix verification (without the formal 3M run):
+
+- Admin Usage, Runtime health, attempt builder/reconciler/migration: **220
+  passed**, 29 existing Alembic warnings.
+- Ruff: passed for the harness and its tests.
+- `py_compile`: passed for the harness and its tests.
+- `git diff --check`: passed.

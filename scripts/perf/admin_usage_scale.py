@@ -78,9 +78,17 @@ def timing_summary(samples_ms: list[float]) -> dict[str, Any]:
     }
 
 
-def _formal_gate_passed(cohorts: dict[str, Any]) -> bool:
+def _formal_gate_passed(
+    cohorts: dict[str, Any], cleanup: dict[str, Any]
+) -> bool:
     required = {"unfiltered", "provider_model_filtered"}
-    return set(cohorts) == required and all(
+    cleanup_passed = bool(
+        cleanup.get("foreign_key_cascade_verified") is True
+        and cleanup.get("watermark_removed") is True
+        and cleanup.get("residual_counts")
+        and not any(cleanup["residual_counts"].values())
+    )
+    return cleanup_passed and set(cohorts) == required and all(
         cohort["timing"]["p95_ms"] < P95_BUDGET_MS
         and cohort["attempt_ledger_statement_count"] == 1
         and cohort["attempt_runtime_job_index_used"] is True
@@ -138,6 +146,51 @@ def _production_window(
         raise ValueError("scale gate now must be timezone-aware")
     end_at = now_utc.astimezone(timezone.utc)
     return end_at - timedelta(days=90), end_at
+
+
+def _raw_edge_bounds(partition, *, start_at, end_at):
+    bounds = []
+    for local_day in partition.raw_days:
+        day_start = datetime.combine(
+            local_day, datetime.min.time(), tzinfo=SHANGHAI
+        ).astimezone(timezone.utc)
+        day_end = datetime.combine(
+            local_day + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=SHANGHAI,
+        ).astimezone(timezone.utc)
+        bounds.append((max(day_start, start_at), min(day_end, end_at)))
+    return tuple(bounds)
+
+
+def _raw_edge_source_counts(conn, *, prefix, partition, start_at, end_at):
+    bounds = _raw_edge_bounds(
+        partition, start_at=start_at, end_at=end_at
+    )
+    if not bounds:
+        return {"turn_rows": 0, "attempt_rows": 0, "logical_calls": 0}
+    starts = [item[0] for item in bounds]
+    ends = [item[1] for item in bounds]
+    row = conn.execute(
+        "WITH raw_ranges(start_at,end_at) AS ("
+        " SELECT * FROM unnest(%s::timestamptz[],%s::timestamptz[])"
+        "), raw_turns AS MATERIALIZED ("
+        " SELECT m.job_id FROM raw_ranges r JOIN v2_turn_metrics m"
+        " ON m.created_at>=r.start_at AND m.created_at<r.end_at"
+        " WHERE left(m.user_id,length(%s))=%s"
+        "), raw_attempts AS MATERIALIZED ("
+        " SELECT a.call_id FROM raw_turns t JOIN llm_provider_attempts a"
+        " ON a.job_id=t.job_id WHERE a.source='runtime_recorder'"
+        ") SELECT (SELECT count(*) FROM raw_turns),"
+        "(SELECT count(*) FROM raw_attempts),"
+        "(SELECT count(DISTINCT call_id) FROM raw_attempts)",
+        (starts, ends, prefix, prefix),
+    ).fetchone()
+    return {
+        "turn_rows": int(row[0]),
+        "attempt_rows": int(row[1]),
+        "logical_calls": int(row[2]),
+    }
 
 
 def _resolve_attempt_rows(rows: int, requested: int | None) -> int:
@@ -425,13 +478,106 @@ def _walk_plan(node: dict[str, Any]):
         yield from _walk_plan(child)
 
 
+def _attempt_plan_guards(
+    root: dict[str, Any],
+    *,
+    total_attempt_rows: int,
+    expected_raw_edge_attempt_rows: int,
+    expected_raw_edge_logical_calls: int,
+) -> dict[str, Any]:
+    """Derive formal guards from every node in the untruncated JSON plan."""
+
+    nodes = list(_walk_plan(root))
+    attempt_nodes = [
+        node
+        for node in nodes
+        if node.get("Relation Name") == "llm_provider_attempts"
+        or node.get("Index Name") in {
+            "ix_llm_provider_attempts_runtime_job",
+            "ix_llm_provider_attempts_call",
+        }
+    ]
+    rate_nodes = [
+        node for node in nodes
+        if node.get("Relation Name") == "llm_rate_cards"
+    ]
+    call_nodes = [
+        node for node in nodes
+        if node.get("Index Name") == "ix_llm_provider_attempts_call"
+    ]
+    examined_attempt_rows = sum(
+        int(node.get("Actual Rows") or 0)
+        * int(node.get("Actual Loops") or 0)
+        for node in attempt_nodes
+        if node.get("Relation Name") == "llm_provider_attempts"
+    )
+    call_probe_loops = sum(
+        int(node.get("Actual Loops") or 0) for node in call_nodes
+    )
+    rate_probe_loops = sum(
+        int(node.get("Actual Loops") or 0) for node in rate_nodes
+    )
+    edge_scan_limit = max(
+        100,
+        int(expected_raw_edge_attempt_rows) * 3,
+    )
+    call_probe_limit = max(
+        10,
+        int(expected_raw_edge_logical_calls) * 2,
+    )
+    rollup_relations = {
+        str(node.get("Relation Name"))
+        for node in nodes
+        if node.get("Relation Name") in {
+            "llm_usage_daily_attempt_dimensions",
+            "llm_usage_daily_call_memberships",
+        }
+    }
+    return {
+        "complete_plan_node_count": len(nodes),
+        "attempt_relation_scan_nodes": len(attempt_nodes),
+        "rate_card_scan_nodes": len(rate_nodes),
+        "call_probe_nodes": len(call_nodes),
+        "examined_attempt_rows": examined_attempt_rows,
+        "expected_raw_edge_attempt_rows": int(expected_raw_edge_attempt_rows),
+        "attempt_edge_scan_limit": edge_scan_limit,
+        "call_probe_loops": call_probe_loops,
+        "expected_raw_edge_logical_calls": int(expected_raw_edge_logical_calls),
+        "call_probe_loop_limit": call_probe_limit,
+        "rate_card_probe_loops": rate_probe_loops,
+        "attempt_runtime_job_index_used": any(
+            node.get("Index Name") == "ix_llm_provider_attempts_runtime_job"
+            for node in nodes
+        ),
+        "attempt_rollup_relations_used": rollup_relations == {
+            "llm_usage_daily_attempt_dimensions",
+            "llm_usage_daily_call_memberships",
+        },
+        "attempt_full_history_scan_absent": bool(
+            total_attempt_rows > 0
+            and examined_attempt_rows <= edge_scan_limit
+            and not any(
+                node.get("Node Type") == "Seq Scan"
+                and node.get("Relation Name") == "llm_provider_attempts"
+                for node in nodes
+            )
+        ),
+        "attempt_rate_card_probe_loops_absent": (
+            not rate_nodes or rate_probe_loops <= 1
+        ),
+        "attempt_full_window_call_probe_loops_absent": (
+            not call_nodes or call_probe_loops <= call_probe_limit
+        ),
+    }
+
+
 def _compact_plan_text(value: object, limit: int = 240) -> object:
     if not isinstance(value, str) or len(value) <= limit:
         return value
     return value[: limit - 1] + "…"
 
 
-def _explain_statements(conn, statements):
+def _explain_statements(conn, statements, *, attempt_guard_context=None):
     explained = []
     seen: set[str] = set()
     for sql, params in statements:
@@ -447,6 +593,12 @@ def _explain_statements(conn, statements):
         ).fetchone()
         document = row[0][0]
         root = document["Plan"]
+        label = _statement_label(sql)
+        attempt_guards = None
+        if label == "attempt_ledger" and attempt_guard_context is not None:
+            attempt_guards = _attempt_plan_guards(
+                root, **attempt_guard_context
+            )
         key_nodes = []
         for node in _walk_plan(root):
             relation = node.get("Relation Name")
@@ -494,11 +646,12 @@ def _explain_statements(conn, statements):
         key_nodes = key_nodes[:128]
         explained.append(
             {
-                "label": _statement_label(sql),
+                "label": label,
                 "execution_time_ms": round(float(document["Execution Time"]), 3),
                 "planning_time_ms": round(float(document["Planning Time"]), 3),
                 "root_node": root.get("Node Type"),
                 "key_nodes": key_nodes,
+                "attempt_plan_guards": attempt_guards,
             }
         )
     return sorted(explained, key=lambda item: item["execution_time_ms"], reverse=True)
@@ -957,6 +1110,15 @@ def _run(args) -> int:
                 end_at=end_at,
                 history_days=args.history_days,
             )
+            raw_edge_counts = _raw_edge_source_counts(
+                conn,
+                prefix=prefix,
+                partition=usage_reporting.rollup_partition(
+                    queries["unfiltered"]
+                ),
+                start_at=start_at,
+                end_at=end_at,
+            )
             evidence["source"] = {
                 "total_rows": int(
                     conn.execute(
@@ -987,6 +1149,9 @@ def _run(args) -> int:
                         (prefix + "%", start_at, end_at),
                     ).fetchone()[0]
                 ),
+                "expected_raw_edge_turn_rows": raw_edge_counts["turn_rows"],
+                "expected_raw_edge_attempt_rows": raw_edge_counts["attempt_rows"],
+                "expected_raw_edge_logical_calls": raw_edge_counts["logical_calls"],
             }
 
         bootstrap_started = time.perf_counter()
@@ -1095,7 +1260,19 @@ def _run(args) -> int:
             timing = _measure_report(jobs_store, query, args.runs)
             with pool.connection() as conn:
                 conn.execute("SET statement_timeout='120s'")
-                explains = _explain_statements(conn, statements)
+                explains = _explain_statements(
+                    conn,
+                    statements,
+                    attempt_guard_context={
+                        "total_attempt_rows": evidence["source"]["attempt_rows"],
+                        "expected_raw_edge_attempt_rows": evidence["source"][
+                            "expected_raw_edge_attempt_rows"
+                        ],
+                        "expected_raw_edge_logical_calls": evidence["source"][
+                            "expected_raw_edge_logical_calls"
+                        ],
+                    },
+                )
             if not explains:
                 raise AssertionError("no production usage SQL was explained")
             exact_latency = next(
@@ -1112,33 +1289,11 @@ def _run(args) -> int:
                 raise AssertionError(
                     "provider-attempt ledger SQL was not captured and explained"
                 )
-            attempt_scan_nodes = [
-                node for node in attempt_explain["key_nodes"]
-                if node.get("relation") == "llm_provider_attempts"
-            ]
-            rate_scan_nodes = [
-                node for node in attempt_explain["key_nodes"]
-                if node.get("relation") == "llm_rate_cards"
-            ]
-            attempt_rollup_relations = {
-                node.get("relation") for node in attempt_explain["key_nodes"]
-                if node.get("relation") in {
-                    "llm_usage_daily_attempt_dimensions",
-                    "llm_usage_daily_call_memberships",
-                }
-            }
-            examined_attempt_rows = sum(
-                int(node.get("actual_rows") or 0)
-                * int(node.get("actual_loops") or 0)
-                for node in attempt_scan_nodes
-            )
-            call_probe_nodes = [
-                node for node in attempt_scan_nodes
-                if node.get("index_name") == "ix_llm_provider_attempts_call"
-            ]
-            full_window_calls = max(
-                1, int(evidence["source"]["attempt_rows_in_90d_job_cohort"])
-            )
+            attempt_guards = attempt_explain.get("attempt_plan_guards")
+            if attempt_guards is None:
+                raise AssertionError(
+                    "attempt EXPLAIN did not produce complete-plan guards"
+                )
             evidence["cohorts"][name] = {
                 "timing": timing,
                 "slowest_explain": explains[0],
@@ -1152,37 +1307,29 @@ def _run(args) -> int:
                 "raw_table_sql_present": raw_sql_present,
                 "raw_table_branch_matches_partition": True,
                 "attempt_ledger_statement_count": len(attempt_statements),
-                "attempt_runtime_job_index_used": any(
-                    node.get("index_name")
-                    == "ix_llm_provider_attempts_runtime_job"
-                    for node in attempt_scan_nodes
-                ),
-                "attempt_rollup_relations_used": attempt_rollup_relations == {
-                    "llm_usage_daily_attempt_dimensions",
-                    "llm_usage_daily_call_memberships",
-                },
-                "attempt_full_history_scan_absent": (
-                    not any(
-                        node.get("node_type") == "Seq Scan"
-                        for node in attempt_scan_nodes
-                    )
-                    and examined_attempt_rows < attempt_rows
-                ),
-                "attempt_rate_card_probe_loops_absent": all(
-                    int(node.get("actual_loops") or 0) <= 1
-                    for node in rate_scan_nodes
-                ),
-                "attempt_full_window_call_probe_loops_absent": all(
-                    int(node.get("actual_loops") or 0)
-                    < max(1, full_window_calls // 10)
-                    for node in call_probe_nodes
-                ),
+                "attempt_runtime_job_index_used": attempt_guards[
+                    "attempt_runtime_job_index_used"
+                ],
+                "attempt_rollup_relations_used": attempt_guards[
+                    "attempt_rollup_relations_used"
+                ],
+                "attempt_full_history_scan_absent": attempt_guards[
+                    "attempt_full_history_scan_absent"
+                ],
+                "attempt_rate_card_probe_loops_absent": attempt_guards[
+                    "attempt_rate_card_probe_loops_absent"
+                ],
+                "attempt_full_window_call_probe_loops_absent": attempt_guards[
+                    "attempt_full_window_call_probe_loops_absent"
+                ],
+                "attempt_plan_guards": attempt_guards,
                 "attempt_relation_scan_nodes": [
                     {
                         "node_type": node.get("node_type"),
                         "index_name": node.get("index_name"),
                     }
-                    for node in attempt_scan_nodes
+                    for node in attempt_explain["key_nodes"]
+                    if node.get("relation") == "llm_provider_attempts"
                 ],
             }
     finally:
@@ -1219,7 +1366,9 @@ def _run(args) -> int:
                     "residual_counts": after_cleanup,
                 }
 
-    evidence["passed"] = _formal_gate_passed(evidence["cohorts"])
+    evidence["passed"] = _formal_gate_passed(
+        evidence["cohorts"], evidence["cleanup"]
+    )
     rendered = json.dumps(evidence, indent=2, sort_keys=True, default=str) + "\n"
     if args.output:
         Path(args.output).write_text(rendered, encoding="utf-8")

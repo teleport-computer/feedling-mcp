@@ -93,6 +93,30 @@ def test_admin_usage_scale_attempt_fixture_is_explicit_and_bounded():
             harness._resolve_attempt_rows(3_000_000, invalid)
 
 
+def test_admin_usage_scale_raw_edge_bounds_are_exact_half_open_query_edges():
+    harness = _load_usage_scale_harness()
+    start_at, end_at = harness._production_window()
+    partition = SimpleNamespace(
+        raw_days=(
+            datetime(2026, 5, 4, tzinfo=timezone.utc).date(),
+            datetime(2026, 8, 2, tzinfo=timezone.utc).date(),
+        )
+    )
+
+    assert harness._raw_edge_bounds(
+        partition, start_at=start_at, end_at=end_at
+    ) == (
+        (
+            datetime(2026, 5, 4, 12, 30, tzinfo=timezone.utc),
+            datetime(2026, 5, 4, 16, 0, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 8, 1, 16, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 2, 12, 30, tzinfo=timezone.utc),
+        ),
+    )
+
+
 def test_admin_usage_scale_formal_gate_requires_attempt_index_for_both_cohorts():
     harness = _load_usage_scale_harness()
     cohorts = {
@@ -108,12 +132,191 @@ def test_admin_usage_scale_formal_gate_requires_attempt_index_for_both_cohorts()
         for name in ("unfiltered", "provider_model_filtered")
     }
 
-    assert harness._formal_gate_passed(cohorts) is True
+    cleanup = {
+        "foreign_key_cascade_verified": True,
+        "watermark_removed": True,
+        "residual_counts": {"users": 0, "watermark": 0, "dirty_days": 0},
+    }
+    assert harness._formal_gate_passed(cohorts, cleanup) is True
     cohorts["provider_model_filtered"]["attempt_runtime_job_index_used"] = False
-    assert harness._formal_gate_passed(cohorts) is False
+    assert harness._formal_gate_passed(cohorts, cleanup) is False
     cohorts["provider_model_filtered"]["attempt_runtime_job_index_used"] = True
     cohorts["provider_model_filtered"]["attempt_full_history_scan_absent"] = False
-    assert harness._formal_gate_passed(cohorts) is False
+    assert harness._formal_gate_passed(cohorts, cleanup) is False
+    cohorts["provider_model_filtered"]["attempt_full_history_scan_absent"] = True
+    cleanup["residual_counts"]["dirty_days"] = 1
+    assert harness._formal_gate_passed(cohorts, cleanup) is False
+
+
+def _synthetic_attempt_plan(*nodes):
+    return {"Node Type": "Result", "Plans": list(nodes)}
+
+
+def _synthetic_scan(relation, *, rows, loops=1, index=None, node_type="Index Scan"):
+    return {
+        "Node Type": node_type,
+        "Relation Name": relation,
+        "Index Name": index,
+        "Actual Rows": rows,
+        "Actual Loops": loops,
+    }
+
+
+def _synthetic_formal_gate(harness, guards):
+    cohorts = {
+        name: {
+            "timing": {"p95_ms": 2_999.0},
+            "attempt_ledger_statement_count": 1,
+            "attempt_runtime_job_index_used": guards[
+                "attempt_runtime_job_index_used"
+            ],
+            "attempt_rollup_relations_used": guards[
+                "attempt_rollup_relations_used"
+            ],
+            "attempt_full_history_scan_absent": guards[
+                "attempt_full_history_scan_absent"
+            ],
+            "attempt_rate_card_probe_loops_absent": guards[
+                "attempt_rate_card_probe_loops_absent"
+            ],
+            "attempt_full_window_call_probe_loops_absent": guards[
+                "attempt_full_window_call_probe_loops_absent"
+            ],
+        }
+        for name in ("unfiltered", "provider_model_filtered")
+    }
+    cleanup = {
+        "foreign_key_cascade_verified": True,
+        "watermark_removed": True,
+        "residual_counts": {"users": 0, "watermark": 0, "dirty_days": 0},
+    }
+    return harness._formal_gate_passed(cohorts, cleanup)
+
+
+def test_admin_usage_scale_attempt_plan_guards_use_complete_plan_not_display_slice():
+    harness = _load_usage_scale_harness()
+    harmless = [{"Node Type": "Aggregate"} for _ in range(128)]
+    dangerous_rate = _synthetic_scan("llm_rate_cards", rows=1, loops=1_000)
+    dangerous_call = _synthetic_scan(
+        "llm_provider_attempts",
+        rows=1,
+        loops=700_000,
+        index="ix_llm_provider_attempts_call",
+    )
+    root = _synthetic_attempt_plan(
+        *harmless,
+        dangerous_rate,
+        dangerous_call,
+        _synthetic_scan("llm_usage_daily_attempt_dimensions", rows=10),
+        _synthetic_scan("llm_usage_daily_call_memberships", rows=10),
+        _synthetic_scan(
+            "llm_provider_attempts",
+            rows=1_000,
+            index="ix_llm_provider_attempts_runtime_job",
+        ),
+    )
+
+    guards = harness._attempt_plan_guards(
+        root,
+        total_attempt_rows=3_000_000,
+        expected_raw_edge_attempt_rows=1_000,
+        expected_raw_edge_logical_calls=900,
+    )
+
+    assert guards["attempt_rate_card_probe_loops_absent"] is False
+    assert guards["attempt_full_window_call_probe_loops_absent"] is False
+    assert guards["complete_plan_node_count"] > 128
+    assert _synthetic_formal_gate(harness, guards) is False
+
+
+def test_admin_usage_scale_attempt_plan_guards_reject_near_full_scan_and_accept_edge():
+    harness = _load_usage_scale_harness()
+    common = (
+        _synthetic_scan("llm_usage_daily_attempt_dimensions", rows=90),
+        _synthetic_scan("llm_usage_daily_call_memberships", rows=90),
+        _synthetic_scan("llm_rate_cards", rows=3, loops=1, node_type="Seq Scan"),
+    )
+    near_full = _synthetic_attempt_plan(
+        *common,
+        _synthetic_scan(
+            "llm_provider_attempts",
+            rows=2_999_999,
+            index="ix_llm_provider_attempts_runtime_job",
+        ),
+    )
+    safe_edge = _synthetic_attempt_plan(
+        *common,
+        _synthetic_scan(
+            "llm_provider_attempts",
+            rows=1_050,
+            index="ix_llm_provider_attempts_runtime_job",
+        ),
+        _synthetic_scan(
+            "llm_provider_attempts",
+            rows=2,
+            loops=400,
+            index="ix_llm_provider_attempts_call",
+        ),
+    )
+
+    rejected = harness._attempt_plan_guards(
+        near_full,
+        total_attempt_rows=3_000_000,
+        expected_raw_edge_attempt_rows=1_000,
+        expected_raw_edge_logical_calls=900,
+    )
+    accepted = harness._attempt_plan_guards(
+        safe_edge,
+        total_attempt_rows=3_000_000,
+        expected_raw_edge_attempt_rows=1_000,
+        expected_raw_edge_logical_calls=900,
+    )
+
+    assert rejected["attempt_full_history_scan_absent"] is False
+    assert accepted["attempt_full_history_scan_absent"] is True
+    assert accepted["attempt_rate_card_probe_loops_absent"] is True
+    assert accepted["attempt_full_window_call_probe_loops_absent"] is True
+    assert _synthetic_formal_gate(harness, rejected) is False
+    assert _synthetic_formal_gate(harness, accepted) is True
+
+
+def test_admin_usage_scale_empty_probe_lists_pass_only_when_complete_plan_has_none():
+    harness = _load_usage_scale_harness()
+    clean = _synthetic_attempt_plan(
+        _synthetic_scan("llm_usage_daily_attempt_dimensions", rows=90),
+        _synthetic_scan("llm_usage_daily_call_memberships", rows=90),
+        _synthetic_scan(
+            "llm_provider_attempts",
+            rows=1_000,
+            index="ix_llm_provider_attempts_runtime_job",
+        ),
+    )
+    hidden = _synthetic_attempt_plan(
+        *([{"Node Type": "Aggregate"}] * 128),
+        _synthetic_scan("llm_rate_cards", rows=1, loops=2),
+    )
+
+    clean_guards = harness._attempt_plan_guards(
+        clean,
+        total_attempt_rows=3_000_000,
+        expected_raw_edge_attempt_rows=1_000,
+        expected_raw_edge_logical_calls=900,
+    )
+    hidden_guards = harness._attempt_plan_guards(
+        hidden,
+        total_attempt_rows=3_000_000,
+        expected_raw_edge_attempt_rows=1_000,
+        expected_raw_edge_logical_calls=900,
+    )
+
+    assert clean_guards["rate_card_scan_nodes"] == 0
+    assert clean_guards["call_probe_nodes"] == 0
+    assert clean_guards["attempt_rate_card_probe_loops_absent"] is True
+    assert clean_guards["attempt_full_window_call_probe_loops_absent"] is True
+    assert hidden_guards["rate_card_scan_nodes"] == 1
+    assert hidden_guards["attempt_rate_card_probe_loops_absent"] is False
+    assert _synthetic_formal_gate(harness, clean_guards) is True
+    assert _synthetic_formal_gate(harness, hidden_guards) is False
 
 
 def test_admin_usage_scale_seeds_and_cleans_content_free_attempt_fixture():
