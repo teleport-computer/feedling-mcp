@@ -104,3 +104,40 @@ A small non-formal database probe will exercise the unified order without
 touching the retained 3M fixture. Focused PostgreSQL tests, Ruff, compileall,
 self-test, and diff-check complete verification. No formal 3M resume or cleanup
 will be run during implementation.
+
+## Single-Orchestrator Correction
+
+Production `_run` must invoke `_execute_scale_workflow` exactly once for every
+non-validation run. It must not duplicate phase tracing, exception
+classification, cleanup, zero-count gates, producer ordering, or terminal-state
+selection. The callbacks supplied by `_run` own only domain operations:
+
+- `prepare_fixture(arm_cleanup)` handles the one intentional branch. Fresh
+  runs require an empty database, arm cleanup before the first seed write, then
+  seed and bootstrap. Resume runs exact prevalidation first and arm cleanup only
+  after it passes. This preserves partial-fresh-seed cleanup while leaving an
+  invalid retained fixture untouched.
+- `run_fixture_workload()` owns the shared retention evidence, production
+  report timing, and EXPLAIN checks.
+- `cleanup_fixture()` performs exact-prefix cascade verification plus watermark
+  and dirty-state removal and writes the existing top-level cleanup evidence.
+- `collect_database_counts()` returns the twelve global counters.
+- `produce_business()` returns the complete `{"pool": ..., "business": ...}`
+  result after the helper has proved the database empty.
+
+The helper is the only owner of `phase_trace`, `terminal_phase`, structured
+`failure`, cleanup status, the three zero-count maps, `business_status`, and
+`business_result`. `_run` copies the returned workflow unchanged into the
+artifact, derives top-level `business_path` from a successful
+`workflow.business_result.business`, evaluates the existing gates, and uses the
+atomic writer on both success and failure. A failed workflow retains
+`business_result=null`; its artifact must still be complete JSON and return 1.
+
+Real-entry integration spy tests call `_run`, not only the helper. A replaceable
+runtime-loading boundary supplies production modules normally and controlled
+stateful fakes in tests; lower-level seed/report/cleanup operations are spied at
+their existing module-function boundaries. Tests cover fresh and resume
+success, timing failure with zero cleanup and no producer, cleanup failure with
+no producer, business failure after the fixture is zero, invalid resume, and
+read-only validation-only. Every test parses the actual atomically written
+`--output` file and no test creates a large fixture.
