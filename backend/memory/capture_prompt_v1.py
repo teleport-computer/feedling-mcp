@@ -90,6 +90,7 @@ _CAPTURE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。你�
 【现有的桶】{buckets}
 【通用桶（先复用现有桶，没有就从这里选，都不贴合再起具体新桶）】{common_buckets}
 【现有的线索】{threads}
+【现有记忆索引（merge/supersede 只能从这里复制确切 target_id）】{cards}
 【你和 TA 的关系】{identity}
 【这段对话】{window}
 
@@ -243,17 +244,45 @@ def build_capture_retry_prompt(prompt: str, err: str) -> str:
 
 
 def build_capture_semantic_retry_prompt(prompt: str, reasons: list[str]) -> str:
-    """语义校验打回：保留原上下文，只重答失败/缺目标的卡，最多由调用方执行一次。"""
+    """语义校验打回：保留原上下文，完整重答整批卡，最多执行一次。
+
+    The extraction seam replaces the first parsed batch with the retry batch.
+    Asking for only the invalid rows would therefore silently discard valid
+    rows from the first response.  A full-batch retry keeps that contract
+    explicit and makes the replacement lossless.
+    """
     detail = "\n".join(f"- {reason}" for reason in reasons if str(reason).strip())
     return (
         f"{prompt}\n\n"
         "【上一次的输出通过了格式检查，但记忆操作无法执行，请重做】\n"
         f"{detail or '- 记忆操作语义无效，请重新确认。'}\n"
-        "只输出修正后的 JSON。不要重复已经成功的卡；只重答失败的卡。\n"
+        "请重新输出这一轮应保留的完整 JSON（包括上次已经合法的卡），"
+        "不要只输出失败的卡。\n"
         "如果要覆盖旧卡，必须给出上方记忆索引中确切的 target_id；"
         "无法确认时改成 action=add。不要编造 ID。\n"
         f"如果没有可修正的卡，输出 {_EMPTY_CAPTURE_REPLY}。\n"
     )
+
+
+def capture_semantic_retry_reasons(cards: list[dict]) -> list[str]:
+    """Return content-free prompt feedback for locally provable bad actions.
+
+    Only a missing target is knowable before the durable commit.  A stale or
+    foreign target is deliberately left to the server-side ownership check;
+    guessing from a bounded prompt index could reject a valid older card.
+    """
+    if any(
+        str(card.get("action") or "").strip().lower()
+        in {"merge", "supersede"}
+        and not str(card.get("target_id") or "").strip()
+        for card in cards or []
+        if isinstance(card, dict)
+    ):
+        return [
+            "你要求覆盖旧卡，但没有给 target_id；"
+            "请从上方记忆索引复制确切 ID，或改成 action=add。"
+        ]
+    return []
 
 
 def build_capture_prompt(
@@ -264,6 +293,7 @@ def build_capture_prompt(
     threads: str,
     identity: str,
     window: str,
+    cards: str = "",
 ) -> str:
     """Render the 落卡 prompt with this session's context injected.
 
@@ -278,6 +308,7 @@ def build_capture_prompt(
         buckets=buckets or "（暂无）",
         common_buckets=COMMON_BUCKETS_GUIDANCE_V1,
         threads=threads or "（暂无）",
+        cards=cards or "（暂无）",
         identity=identity or "（暂无）",
         window=window or "（空）",
     )

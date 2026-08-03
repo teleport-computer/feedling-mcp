@@ -21,18 +21,84 @@ _TIMEOUT_SEC = 90.0
 
 
 class ParseRetry(NamedTuple):
-    """「解析结果不合格 → 原样打回去重问一次」的注入点。
+    """「解析/语义结果不合格 → 原样打回去重问一次」的注入点。
 
     判据与纠错文案属于 memory/ 层（依赖方向不允许本模块 import 它），
     所以由 worker 组装三个纯回调传进来：
       should_retry(err)          -> 这个 reason 值不值得重问；
       build_prompt(prompt, err)  -> 第二次的 prompt（含「哪个字段没填」）；
       parse(reply)               -> 第二次的解析（通常放宽成「只丢脏行」）。
+
+    Capture 可选再注入 ``semantic_reasons`` / ``build_semantic_prompt``：
+    格式打回和语义打回**共享一次** provider 预算。若格式重问后
+    仍少 target_id，直接 fail closed，不再发第三问。
     """
 
     should_retry: Callable[[str], bool]
     build_prompt: Callable[[str, str], str]
     parse: Callable[[str], tuple]
+    semantic_reasons: Callable[[Any], list[str]] | None = None
+    build_semantic_prompt: Callable[[str, list[str]], str] | None = None
+
+
+_PROVIDER_FAILURE_CODES = frozenset(
+    {
+        "auth_invalid",
+        "content_filtered",
+        "model_not_found",
+        "provider_config",
+        "provider_incompatible",
+        "quota_insufficient",
+        "rate_limited",
+        "unknown",
+        "upstream_unavailable",
+    }
+)
+
+
+def provider_failure_code_from_reason(reason: str) -> str | None:
+    """Extract the allowlisted class from an ``extract`` provider reason."""
+    prefix = "provider_call_failed:"
+    raw = str(reason or "").strip()
+    if not raw.startswith(prefix):
+        return None
+    code = raw[len(prefix) :]
+    return code if code in _PROVIDER_FAILURE_CODES else "unknown"
+
+
+def _provider_failure_code(exc: BaseException) -> str:
+    """Return a content-free provider failure class; never inspect messages."""
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        trace = provider_client.runtime_provider_attempt_trace(exc) or {}
+        attempts = trace.get("attempts") if isinstance(trace, dict) else []
+        for attempt in reversed(attempts if isinstance(attempts, list) else []):
+            candidate = attempt.get("status") if isinstance(attempt, dict) else None
+            if isinstance(candidate, int):
+                status = candidate
+                break
+    if status == 402:
+        return "quota_insufficient"
+    if status in {401, 403}:
+        return "auth_invalid"
+    if status == 404:
+        return "model_not_found"
+    if status == 429:
+        return "rate_limited"
+    if isinstance(status, int) and status >= 500:
+        return "upstream_unavailable"
+
+    reliable_class = str(getattr(exc, "feedling_error_class", "") or "")
+    if reliable_class == "transient_exhausted":
+        return "upstream_unavailable"
+    if reliable_class == "provider_config":
+        return "provider_config"
+    coarse = provider_client.classify_provider_error(exc)
+    if coarse == "transient":
+        return "upstream_unavailable"
+    if coarse == "provider_config":
+        return "provider_config"
+    return "unknown"
 
 
 async def extract(
@@ -74,11 +140,12 @@ async def extract(
                 progress_cb=progress_cb,
             )
         except Exception as e:  # noqa: BLE001 — 背景 job：归一成 reason，绝不抛
+            error_code = _provider_failure_code(e)
             if trajectory_out is not None:
                 await trajectory_out(
                     "provider_error",
                     {
-                        "error_class": type(e).__name__,
+                        "error_class": error_code,
                         "provider_attempt_trace": (
                             provider_client.runtime_provider_attempt_trace(e)
                         ),
@@ -86,7 +153,7 @@ async def extract(
                 )
             if usage_out is not None:
                 usage_out(None)
-            return None, f"provider_call_failed:{type(e).__name__}"
+            return None, f"provider_call_failed:{error_code}"
         if usage_out is not None:
             usage_out(result.get("usage") if isinstance(result, dict) else None)
         if trajectory_out is not None:
@@ -101,23 +168,49 @@ async def extract(
         return None, call_error
     parsed = parse(reply)
     value, err = parsed[0], parsed[-1]
-    if not err:
+    retried_once = False
+    if err:
+        if parse_retry is None or not parse_retry.should_retry(str(err)):
+            return None, str(err)
+        if trajectory_out is not None:
+            await trajectory_out("parse_bounced", {"reason": str(err)})
+        retry_reply, retry_call_error = await _call(
+            parse_retry.build_prompt(prompt, str(err))
+        )
+        if retry_call_error is not None:
+            # 重问这一跳自己挂了：如实报重问的失败原因，别把它伪装成原来的格式问题。
+            return None, retry_call_error
+        retried = parse_retry.parse(retry_reply)
+        value, retry_err = retried[0], retried[-1]
+        if retry_err:
+            return None, str(retry_err)
+        retried_once = True
+
+    semantic_reasons = (
+        parse_retry.semantic_reasons(value)
+        if parse_retry is not None and parse_retry.semantic_reasons is not None
+        else []
+    )
+    if not semantic_reasons:
         return value, None
-    if parse_retry is None or not parse_retry.should_retry(str(err)):
-        return None, str(err)
+    if retried_once or parse_retry is None or parse_retry.build_semantic_prompt is None:
+        return None, "semantic_validation_failed_after_retry"
 
     if trajectory_out is not None:
-        await trajectory_out("parse_bounced", {"reason": str(err)})
+        await trajectory_out(
+            "semantic_bounced", {"reason_count": len(semantic_reasons)}
+        )
     retry_reply, retry_call_error = await _call(
-        parse_retry.build_prompt(prompt, str(err))
+        parse_retry.build_semantic_prompt(prompt, semantic_reasons)
     )
     if retry_call_error is not None:
-        # 重问这一跳自己挂了：如实报重问的失败原因，别把它伪装成原来的格式问题。
         return None, retry_call_error
     retried = parse_retry.parse(retry_reply)
     retry_value, retry_err = retried[0], retried[-1]
     if retry_err:
         return None, str(retry_err)
+    if parse_retry.semantic_reasons(retry_value):
+        return None, "semantic_validation_failed_after_retry"
     return retry_value, None
 
 

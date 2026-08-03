@@ -1509,6 +1509,171 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
         return []
 
 
+def _admin_utc_text_timestamp_sql(
+    expression: str,
+    *,
+    supports_input_validation: bool,
+) -> str:
+    """Safely parse ISO text, treating legacy offset-less values as UTC.
+
+    PostgreSQL 16 added ``pg_input_is_valid``.  Older supported/test clusters
+    use the strict fallback below: its outer CASE proves the shape, the nested
+    CASE proves the real number of days in the month, and only then can a cast
+    run.  Keeping casts inside CASE branches matters because SQL does not
+    promise WHERE/AND predicate evaluation order.
+    """
+
+    if supports_input_validation:
+        return f"""
+CASE
+  WHEN ({expression}) ~ '(Z|[+-]\\d{{2}}:?\\d{{2}})$'
+    AND pg_input_is_valid(({expression}), 'timestamptz')
+    THEN ({expression})::timestamptz
+  WHEN pg_input_is_valid(({expression}), 'timestamp')
+    THEN ({expression})::timestamp AT TIME ZONE 'UTC'
+  ELSE NULL
+END
+"""
+    return f"""
+CASE
+  WHEN ({expression}) ~
+    '^[0-9]{{4}}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])'
+    '([T ]([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]'
+    '(\\.[0-9]+)?(Z|[+-](0[0-9]|1[0-5]):?[0-5][0-9])?)?$'
+  THEN CASE
+    WHEN substring(({expression}) FROM 9 FOR 2)::int <= CASE
+      WHEN substring(({expression}) FROM 6 FOR 2)::int IN (1,3,5,7,8,10,12)
+        THEN 31
+      WHEN substring(({expression}) FROM 6 FOR 2)::int IN (4,6,9,11)
+        THEN 30
+      WHEN (
+        mod(substring(({expression}) FROM 1 FOR 4)::int, 400) = 0 OR (
+          mod(substring(({expression}) FROM 1 FOR 4)::int, 4) = 0
+          AND mod(substring(({expression}) FROM 1 FOR 4)::int, 100) <> 0
+        )
+      ) THEN 29
+      ELSE 28
+    END
+    THEN CASE
+      WHEN ({expression}) ~ '(Z|[+-]\\d{{2}}:?\\d{{2}})$'
+        THEN ({expression})::timestamptz
+      ELSE ({expression})::timestamp AT TIME ZONE 'UTC'
+    END
+    ELSE NULL
+  END
+  ELSE NULL
+END
+"""
+
+
+def recent_admin_product_kpis(*, within_hours: int = 24) -> dict:
+    """Rolling-window product/account KPIs for the Admin operations overview.
+
+    This is intentionally *not* the daily DAU snapshot.  ``window_app_users``
+    is one distinct-account count across the exact rolling 24h/7d/30d window;
+    it does not sum daily DAU and therefore does not double-count a user active
+    on multiple days.  The dedicated DAU page remains the Beijing-calendar-day
+    source of truth.
+
+    Onboarding reuses ``admin_onboarding_funnel``'s existing event milestones.
+    Its denominator is parseable accounts registered inside this same rolling
+    window, and "complete" means that cohort has reached first genuine reply
+    (t3) by query time.  If the funnel cannot cover the registration cohort,
+    the rate is returned as ``None`` rather than a fabricated zero.
+    """
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    with get_pool().connection() as conn:
+        registered_at_sql = _admin_utc_text_timestamp_sql(
+            "users.created_at",
+            supports_input_validation=conn.info.server_version >= 160000,
+        )
+        row = conn.execute(
+            f"""
+            WITH bounds AS (
+              SELECT extract(epoch FROM clock_timestamp())::double precision AS now_ts,
+                     extract(epoch FROM (
+                       clock_timestamp() - make_interval(hours => %s)
+                     ))::double precision AS cutoff_ts
+            ), sessions AS (
+              SELECT logs.user_id
+              FROM user_logs logs CROSS JOIN bounds
+              WHERE logs.stream='tracking_events'
+                AND logs.doc->>'type'='app_session_end'
+                AND logs.ts IS NOT NULL
+                AND logs.ts >= bounds.cutoff_ts AND logs.ts <= bounds.now_ts
+            ), parsed_users AS (
+              SELECT users.user_id,{registered_at_sql} AS registered_at
+              FROM users
+            ), registrations AS (
+              SELECT parsed_users.user_id
+              FROM parsed_users CROSS JOIN bounds
+              WHERE extract(epoch FROM parsed_users.registered_at)
+                    >= bounds.cutoff_ts
+                AND extract(epoch FROM parsed_users.registered_at)
+                    <= bounds.now_ts
+            )
+            SELECT
+              bounds.now_ts,
+              bounds.cutoff_ts,
+              (SELECT count(DISTINCT user_id)::int FROM sessions)
+                AS window_app_users,
+              (SELECT count(*)::int FROM sessions) AS app_sessions,
+              (SELECT count(*)::int FROM registrations)
+                AS new_registered_accounts,
+              (SELECT count(*)::int FROM parsed_users
+               WHERE registered_at IS NULL)
+                AS unparseable_registration_rows,
+              (SELECT count(*)::int FROM parsed_users) AS account_rows
+            FROM bounds
+            """,
+            (safe_hours,),
+        ).fetchone()
+
+    now_ts = float(row[0])
+    cutoff_ts = float(row[1])
+    new_registered = int(row[4] or 0)
+    funnel_rows = admin_onboarding_funnel()
+    cohort = [
+        item
+        for item in funnel_rows
+        if item.get("t0") is not None
+        and cutoff_ts <= float(item["t0"]) <= now_ts
+    ]
+    # ``admin_onboarding_funnel`` historically catches query errors and returns
+    # ``[]``.  Compare its fleet row count as well as the window cohort so an
+    # outage cannot look like a valid empty cohort when accounts do exist.
+    funnel_coverage_complete = (
+        len(funnel_rows) == int(row[6] or 0)
+        and len(cohort) == new_registered
+    )
+    configured = sum(1 for item in cohort if item.get("t1") is not None)
+    content_ready = sum(1 for item in cohort if item.get("t2") is not None)
+    first_reply = sum(1 for item in cohort if item.get("t3") is not None)
+    onboarding_rate = (
+        float(first_reply) / float(new_registered)
+        if funnel_coverage_complete and new_registered
+        else None
+    )
+    return {
+        "window_hours": safe_hours,
+        "generated_at": now_ts,
+        "cutoff_at": cutoff_ts,
+        "window_app_users": int(row[2] or 0),
+        "app_sessions": int(row[3] or 0),
+        "new_registered_accounts": new_registered,
+        "unparseable_registration_rows": int(row[5] or 0),
+        "onboarding": {
+            "definition": "registered_cohort_to_first_genuine_reply",
+            "cohort_accounts": new_registered,
+            "configured": configured if funnel_coverage_complete else None,
+            "content_ready": content_ready if funnel_coverage_complete else None,
+            "first_genuine_reply": first_reply if funnel_coverage_complete else None,
+            "completion_rate": onboarding_rate,
+            "coverage_complete": funnel_coverage_complete,
+        },
+    }
+
+
 _ADMIN_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -2948,11 +3113,14 @@ def admin_onboarding_funnel() -> list[dict]:
     The caller aggregates conversion + median segment durations, split VPS/API."""
     try:
         with get_pool().connection() as conn:
+            registered_at_sql = _admin_utc_text_timestamp_sql(
+                "created_at",
+                supports_input_validation=conn.info.server_version >= 160000,
+            )
             rows = conn.execute(f"""
                 {_EVENTS_ROUTES_CTE},
                 u AS (SELECT user_id,
-                        CASE WHEN created_at ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
-                             THEN EXTRACT(EPOCH FROM created_at::timestamptz) ELSE NULL END AS t0
+                        EXTRACT(EPOCH FROM ({registered_at_sql})) AS t0
                       FROM users),
                 gen_started AS (SELECT user_id, MIN(EXTRACT(EPOCH FROM updated_at)) AS t
                           FROM genesis_import_jobs
@@ -4367,6 +4535,197 @@ def genesis_list_jobs(user_id: str, *, limit: int = 20) -> list[dict]:
                 item[key] = value.isoformat()
         out.append(item)
     return out
+
+
+def recent_genesis_import_health(
+    *,
+    within_hours: int = 24,
+    recent_limit: int = 50,
+) -> dict:
+    """Content-free Genesis fleet health for the Admin import view.
+
+    ``status='done'`` is deliberately kept separate from
+    ``artifact_verified``.  The former is a reducer lifecycle fact; the latter
+    is conservative evidence from the durable ledger that the job produced the
+    artifact its mode called for.  This avoids turning a terminal row into a
+    false-green import result while we still lack a dedicated per-attempt
+    artifact-verification ledger.
+
+    The returned failure code is derived in SQL from at most the first two
+    snake-case error segments.  Free-form exception text is neither returned
+    nor rendered by the metadata-only Admin page.
+    """
+    safe_hours = max(1, min(int(within_hours), 24 * 30))
+    safe_limit = max(1, min(int(recent_limit), 200))
+    from psycopg.rows import dict_row
+
+    # Modes have slightly different success artifacts.  add_memory requires a
+    # memory write; update_identity requires an identity write.  Onboarding is
+    # intentionally strict: when source material exists it requires both.  A
+    # legitimate nameless/fresh-start completion may therefore remain
+    # "unverified" rather than being mislabeled successful.
+    classification_cte = """
+      WITH recent AS (
+        SELECT g.*,
+          lower(coalesce(nullif(g.metadata->>'mode',''), g.source_kind, 'unknown'))
+            AS import_mode,
+          (
+            g.total_chunks > 0 OR g.total_bytes > 0 OR
+            (coalesce(g.metadata->>'content_bytes','') ~ '^[0-9]+$'
+              AND (g.metadata->>'content_bytes')::bigint > 0) OR
+            (coalesce(g.metadata->>'history_count','') ~ '^[0-9]+$'
+              AND (g.metadata->>'history_count')::bigint > 0) OR
+            (coalesce(g.metadata->>'support_count','') ~ '^[0-9]+$'
+              AND (g.metadata->>'support_count')::bigint > 0)
+          ) AS has_source_material,
+          (
+            lower(coalesce(g.identity_status,'')) IN
+              ('initialized','updated','already_initialized')
+            OR coalesce(g.persona_ref,'') <> ''
+          ) AS has_identity_evidence
+        FROM genesis_import_jobs g
+        WHERE g.created_at >= now() - make_interval(hours => %s)
+      ), classified AS (
+        SELECT recent.*,
+          CASE
+            WHEN import_mode LIKE '%%add_memory%%'
+              THEN memory_action_count > 0
+            WHEN import_mode LIKE '%%update_identity%%'
+              OR import_mode = 'resident_redistill'
+              THEN has_identity_evidence
+            ELSE has_identity_evidence
+              AND (NOT has_source_material OR memory_action_count > 0)
+          END AS artifact_evidence_complete
+        FROM recent
+      )
+    """
+
+    with get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                classification_cte
+                + """
+                SELECT
+                  count(*)::int AS started,
+                  count(DISTINCT user_id)::int AS users,
+                  count(*) FILTER (WHERE status='done')::int AS completed,
+                  count(*) FILTER (
+                    WHERE status='done' AND artifact_evidence_complete
+                  )::int AS artifact_verified,
+                  count(*) FILTER (
+                    WHERE status='done' AND NOT artifact_evidence_complete
+                  )::int AS completed_unverified,
+                  count(*) FILTER (WHERE status='failed')::int AS failed,
+                  count(*) FILTER (
+                    WHERE status NOT IN ('done','failed')
+                  )::int AS processing,
+                  count(*) FILTER (
+                    WHERE status NOT IN ('done','failed')
+                      AND updated_at < clock_timestamp() - interval '15 minutes'
+                  )::int AS stuck_over_15m,
+                  percentile_cont(0.5) WITHIN GROUP (
+                    ORDER BY extract(epoch FROM (completed_at-created_at))
+                  ) FILTER (
+                    WHERE status='done' AND completed_at IS NOT NULL
+                      AND completed_at >= created_at
+                  ) AS p50_complete_sec,
+                  percentile_cont(0.95) WITHIN GROUP (
+                    ORDER BY extract(epoch FROM (completed_at-created_at))
+                  ) FILTER (
+                    WHERE status='done' AND completed_at IS NOT NULL
+                      AND completed_at >= created_at
+                  ) AS p95_complete_sec
+                FROM classified
+                """,
+                (safe_hours,),
+            )
+            summary = cur.fetchone() or {}
+
+            cur.execute(
+                """
+                WITH recent AS (
+                  SELECT error FROM genesis_import_jobs
+                  WHERE status='failed'
+                    AND created_at >= now() - make_interval(hours => %s)
+                ), safe AS (
+                  SELECT CASE
+                    WHEN lower(error) ~ '^[a-z0-9_]+:[a-z0-9_]+(:.*)?$'
+                      THEN split_part(lower(error),':',1) || ':' ||
+                           split_part(lower(error),':',2)
+                    WHEN lower(error) ~ '^[a-z0-9_]+(:.*)?$'
+                      THEN split_part(lower(error),':',1)
+                    ELSE 'other'
+                  END AS error_code
+                  FROM recent
+                )
+                SELECT error_code, count(*)::int AS count
+                FROM safe GROUP BY error_code ORDER BY count DESC, error_code
+                LIMIT 12
+                """,
+                (safe_hours,),
+            )
+            failure_reasons = [dict(row) for row in cur.fetchall()]
+
+            cur.execute(
+                classification_cte
+                + """
+                SELECT
+                  user_id, job_id, status, source_kind, import_mode,
+                  artifact_evidence_complete,
+                  has_identity_evidence,
+                  has_source_material,
+                  memory_action_count,
+                  identity_status,
+                  created_at, updated_at, completed_at,
+                  CASE
+                    WHEN status='failed' AND
+                      lower(error) ~ '^[a-z0-9_]+:[a-z0-9_]+(:.*)?$'
+                      THEN split_part(lower(error),':',1) || ':' ||
+                           split_part(lower(error),':',2)
+                    WHEN status='failed' AND
+                      lower(error) ~ '^[a-z0-9_]+(:.*)?$'
+                      THEN split_part(lower(error),':',1)
+                    WHEN status='failed' THEN 'other'
+                    ELSE ''
+                  END AS error_code,
+                  extract(epoch FROM (clock_timestamp()-updated_at))
+                    AS age_since_update_sec
+                FROM classified
+                ORDER BY created_at DESC, user_id, job_id
+                LIMIT %s
+                """,
+                (safe_hours, safe_limit),
+            )
+            recent_jobs = [dict(row) for row in cur.fetchall()]
+
+    def optional_float(value):
+        return None if value is None else float(value)
+
+    completed = int(summary.get("completed") or 0)
+    verified = int(summary.get("artifact_verified") or 0)
+    return {
+        "window_hours": safe_hours,
+        "started": int(summary.get("started") or 0),
+        "users": int(summary.get("users") or 0),
+        "completed": completed,
+        "artifact_verified": verified,
+        "completed_unverified": int(summary.get("completed_unverified") or 0),
+        "failed": int(summary.get("failed") or 0),
+        "processing": int(summary.get("processing") or 0),
+        "stuck_over_15m": int(summary.get("stuck_over_15m") or 0),
+        "terminal_success_rate": (
+            float(completed) / float(completed + int(summary.get("failed") or 0))
+            if completed + int(summary.get("failed") or 0) else None
+        ),
+        "artifact_verified_rate": (
+            float(verified) / float(completed) if completed else None
+        ),
+        "p50_complete_sec": optional_float(summary.get("p50_complete_sec")),
+        "p95_complete_sec": optional_float(summary.get("p95_complete_sec")),
+        "failure_reasons": failure_reasons,
+        "recent_jobs": recent_jobs,
+        "evidence_contract": "ledger_strict_v1",
+    }
 
 
 def genesis_patch_job_metadata(user_id: str, job_id: str, patch: dict) -> dict | None:

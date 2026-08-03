@@ -387,7 +387,6 @@ _V2_WAKE_OWNER_ID = "hosted_runtime_v2"
 
 _IMAGE_MARKER = "[image]"
 _UNAVAILABLE_CHAT_MARKER = "[message unavailable]"
-_SUMMARY_INTEGRITY_ERROR = "v2_summary_integrity_error"
 _USER_ROLES = frozenset({"user", "human"})
 
 
@@ -1125,6 +1124,44 @@ def _summary_metadata_frontier(state: dict) -> list:
     return validated
 
 
+def _decrypt_summary_text(
+    envelope: dict,
+    *,
+    runtime_token: str,
+    purpose: str,
+) -> str:
+    """Open one canonical summary envelope and preserve integrity failures.
+
+    Enclave availability/auth failures remain ordinary runtime failures so an
+    optional checkpoint may retry later.  An authenticated decrypt rejection,
+    invalid plaintext framing, or non-UTF-8 summary means the canonical node
+    itself cannot be opened and must never be downgraded to best effort.
+    """
+    try:
+        raw = core_enclave._decrypt_envelope_via_enclave(
+            envelope,
+            None,
+            purpose=purpose,
+            runtime_token=runtime_token,
+        )
+    except RuntimeError as exc:
+        reason = str(exc or "")
+        if (
+            reason.startswith("enclave_http_403:")
+            and "decrypt_failed" in reason
+        ) or reason.startswith("enclave_plaintext_decode:"):
+            raise v2_summary_frontier.SummaryFrontierIntegrityError(
+                "canonical_summary_decrypt_failed"
+            ) from exc
+        raise
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise v2_summary_frontier.SummaryFrontierIntegrityError(
+            "canonical_summary_not_utf8"
+        ) from exc
+
+
 def _open_summary_frontier_state(user_id: str) -> tuple[dict | None, list]:
     """Open canonical nodes only for checkpoint generation."""
     state = jobs_store.get_summary_frontier_state(user_id)
@@ -1140,15 +1177,14 @@ def _open_summary_frontier_state(user_id: str) -> tuple[dict | None, list]:
     for row in segment_rows:
         env = row.get("summary_envelope")
         if not env:
-            raise RuntimeError(
-                f"{_SUMMARY_INTEGRITY_ERROR}: segment without encrypted envelope"
+            raise v2_summary_frontier.SummaryFrontierIntegrityError(
+                "canonical_segment_missing_envelope"
             )
-        plaintext = core_enclave._decrypt_envelope_via_enclave(
+        plaintext = _decrypt_summary_text(
             env,
-            None,
             purpose="v2_summary_segment_read",
             runtime_token=token,
-        ).decode("utf-8")
+        )
         meta = metadata_by_id[int(row["segment_id"])]
         opened.append(
             v2_summary_frontier.SummarySegment(
@@ -1269,17 +1305,19 @@ def _read_summary_with_seq(user_id: str) -> tuple[str, float, int, int]:
     env = row.get("summary_envelope")
     if not env:
         if has_durable_coverage:
-            raise RuntimeError(
-                f"{_SUMMARY_INTEGRITY_ERROR}: nonzero watermark without summary envelope"
+            raise v2_summary_frontier.SummaryFrontierIntegrityError(
+                "covered_summary_missing_envelope"
             )
         return "", watermark_ts, version, watermark_seq
     token = _mint_runtime_token(user_id)
-    plaintext = core_enclave._decrypt_envelope_via_enclave(
-        env, None, purpose="v2_summary_read", runtime_token=token
-    ).decode("utf-8")
+    plaintext = _decrypt_summary_text(
+        env,
+        purpose="v2_summary_read",
+        runtime_token=token,
+    )
     if has_durable_coverage and not plaintext.strip():
-        raise RuntimeError(
-            f"{_SUMMARY_INTEGRITY_ERROR}: nonzero watermark with empty summary plaintext"
+        raise v2_summary_frontier.SummaryFrontierIntegrityError(
+            "covered_summary_empty_plaintext"
         )
     return plaintext, watermark_ts, version, watermark_seq
 

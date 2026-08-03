@@ -114,6 +114,49 @@ def test_recent_runtime_health_splits_expiry_reasons():
     assert lanes["chat"]["failure_rate"] == pytest.approx(1.0)
 
 
+def test_recent_runtime_health_separates_operational_control_and_safety():
+    _add_job("u_rh_hb_ok_split", "heartbeat", "completed")
+    _add_job(
+        "u_rh_hb_guard",
+        "heartbeat",
+        "failed",
+        last_error="wake_failed:degenerate_reply_suppressed",
+    )
+    _add_job(
+        "u_rh_hb_control",
+        "heartbeat",
+        "failed",
+        last_error="turns_halted",
+    )
+    _add_job(
+        "u_rh_hb_provider",
+        "heartbeat",
+        "failed",
+        last_error="wake_failed:providererror",
+    )
+
+    heartbeat = {
+        row["lane"]: row for row in jobs_store.recent_runtime_health()["lanes"]
+    }["heartbeat"]
+
+    assert heartbeat["sampled_jobs"] == 4
+    assert heartbeat["failure_rate"] == pytest.approx(3 / 4)
+    assert heartbeat["operational_failures"] == 1
+    assert heartbeat["operational_failure_rate"] == pytest.approx(1 / 4)
+    assert heartbeat["control_outcomes"] == 1
+    assert heartbeat["safety_suppressions"] == 1
+    classes = {
+        row["code"]: row["outcome_class"]
+        for row in heartbeat["top_failures"]
+    }
+    assert classes["wake_failed:providererror"] == "operational_failure"
+    assert classes["turns_halted"] == "control"
+    assert (
+        classes["wake_failed:degenerate_reply_suppressed"]
+        == "safety_suppression"
+    )
+
+
 def test_recent_runtime_health_respects_window():
     _add_job("u_rh_recent", "chat", "completed")
     _add_job("u_rh_old", "chat", "failed", age_hours=48)
@@ -287,8 +330,16 @@ def test_recent_runtime_health_top_failures_are_enumerated_codes():
     lanes = {r["lane"]: r for r in jobs_store.recent_runtime_health()["lanes"]}
     top = lanes["chat"]["top_failures"]
 
-    assert top[0] == {"code": "turn_failed:providererror", "count": 2}
-    assert {"code": "turn_failed:responder_error", "count": 1} in top
+    assert top[0]["code"] == "turn_failed:providererror"
+    assert top[0]["count"] == 2
+    assert top[0]["outcome_class"] == "operational_failure"
+    assert top[0]["error_class"] == ""
+    assert any(
+        item["code"] == "turn_failed:responder_error"
+        and item["count"] == 1
+        and item["outcome_class"] == "operational_failure"
+        for item in top
+    )
 
 
 def test_recent_runtime_health_reports_pool_and_pending_age():

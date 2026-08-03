@@ -98,6 +98,8 @@ from model_api_runtime.v2 import trajectory as v2_trajectory
 from memory.capture_prompt_v1 import (
     build_capture_prompt,
     build_capture_retry_prompt,
+    build_capture_semantic_retry_prompt,
+    capture_semantic_retry_reasons,
     parse_capture_cards,
 )
 from identity.user_naming import transcript_speaker_label
@@ -172,6 +174,25 @@ async def _record_provider_failure(
     )
 
 
+async def _record_provider_failure_class(
+    user_id: str,
+    error_class: str,
+) -> None:
+    """Record an already-normalized, content-free provider failure class."""
+    normalized = str(error_class or "unknown")
+    if normalized not in notices_catalog.ERROR_CLASSES:
+        # ``provider_config`` is a useful extraction code but too coarse for
+        # the notice catalog: without a safe status-derived subtype, blaming
+        # the user would be guesswork. Provider health therefore records it as
+        # catalog-backed ``unknown`` until a precise class is available.
+        normalized = "unknown"
+    await asyncio.to_thread(
+        provider_health.record_failure,
+        user_id,
+        error_class=normalized,
+    )
+
+
 async def _extract_with_provider_health(
     user_id: str,
     **kwargs: Any,
@@ -182,9 +203,16 @@ async def _extract_with_provider_health(
     except Exception as exc:
         await _record_provider_failure(user_id, exc)
         raise
-    await _record_provider_success(
-        user_id, latency_ms=(time.monotonic() - started) * 1000.0
-    )
+    _items, reason = result
+    provider_failure = v2_extraction.provider_failure_code_from_reason(reason or "")
+    if provider_failure is not None:
+        await _record_provider_failure_class(user_id, provider_failure)
+    else:
+        # Parse/semantic rejection still proves the provider route answered;
+        # provider-health tracks route liveness, not card quality.
+        await _record_provider_success(
+            user_id, latency_ms=(time.monotonic() - started) * 1000.0
+        )
     return result
 
 
@@ -953,6 +981,7 @@ _DEGENERATE_REPLY_ERROR_CLASS = "upstream_unavailable"
 # job_failed_reasons aggregation instead of hiding behind a plain sleep.
 _PROTOCOL_FRAGMENT_ERROR_CLASS = "upstream_unavailable"
 _PROTOCOL_FRAGMENT_REASON = "protocol_fragment_suppressed"
+_MALFORMED_SELF_THINKING_REASON = "malformed_self_thinking_suppressed"
 
 
 def _torn_protocol_evidence(text: str, reasoning: str, *, lane: str) -> str:
@@ -1044,6 +1073,8 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
             "degenerate_reply_suppressed",
             "empty_reply",
             "no_user_messages",
+            _PROTOCOL_FRAGMENT_REASON,
+            _MALFORMED_SELF_THINKING_REASON,
         }:
             kind = raw
         elif raw == _COVERAGE_INCOMPLETE or raw.startswith(
@@ -1079,6 +1110,48 @@ def _safe_failure_code(scope: str, exc: BaseException) -> str:
     return f"{scope}:{kind}"[:120]
 
 
+_EXTRACTION_FAILURE_REASONS = frozenset(
+    {
+        "capture_batch_frontier_unavailable",
+        "capture_commit_protocol_unavailable",
+        "capture_no_memory_actions",
+        "capture_oldest_reader_unavailable",
+        "capture_provider_authorization_unavailable",
+        "capture_provider_call_cancelled",
+        "capture_provider_fence_incomplete",
+        "capture_provider_result_invalid",
+        "dream_no_memory_actions",
+        "empty_reply",
+        "extraction_memory_writer_unavailable",
+        "memory_occurred_at_required",
+        "missing_cards_list",
+        "missing_consolidations_list",
+        "no_json_object",
+        "not_an_object",
+        "semantic_validation_failed_after_retry",
+    }
+)
+
+
+def _extraction_failure_code(exc: BaseException) -> str:
+    """Preserve expected extraction causes without persisting raw messages."""
+    raw = str(exc or "").strip()
+    provider_code = v2_extraction.provider_failure_code_from_reason(raw)
+    if provider_code is not None:
+        return f"extraction_failed:{provider_code}"
+    if raw.startswith("json_decode_error:"):
+        return "extraction_failed:json_decode_error"
+    if raw.startswith("invalid_card_content_after_retry:"):
+        return "extraction_failed:invalid_card_content_after_retry"
+    if raw.startswith("invalid_card_content:"):
+        return "extraction_failed:invalid_card_content"
+    if raw.startswith("extraction_memory_write_rejected:"):
+        return "extraction_failed:memory_write_rejected"
+    if raw in _EXTRACTION_FAILURE_REASONS:
+        return f"extraction_failed:{raw}"
+    return _safe_failure_code("extraction_failed", exc)
+
+
 def _turn_failure_error_class(exc: BaseException) -> str:
     """Classify V2 foreground failures through the shared notice catalog."""
     if isinstance(exc, DedicatedVisionUnavailable):
@@ -1095,6 +1168,8 @@ def _turn_failure_error_class(exc: BaseException) -> str:
     if isinstance(exc, TurnError) and str(exc) in {
         "degenerate_reply_suppressed",
         "empty_reply",
+        _PROTOCOL_FRAGMENT_REASON,
+        _MALFORMED_SELF_THINKING_REASON,
     }:
         return "reply_parse_failed"
     if isinstance(exc, TurnError) and (
@@ -2195,7 +2270,7 @@ def _make_trajectory_recorder(
 ) -> v2_trajectory.TrajectoryRecorder | None:
     if deps.seal_trajectory_payload is None:
         return None
-    return v2_trajectory.TrajectoryRecorder(
+    recorder = v2_trajectory.TrajectoryRecorder(
         job_id=job["id"],
         user_id=str(job["user_id"]),
         seal=deps.seal_trajectory_payload,
@@ -2203,10 +2278,13 @@ def _make_trajectory_recorder(
         append_batch=jobs_store.append_trajectory_events_batch,
         attempt_identity=int(job.get("attempt_count") or 0),
     )
+    setattr(recorder, _LEDGER_LANE_ATTR, str(job.get("lane") or "unknown"))
+    return recorder
 
 
 _LEDGER_EVENTS = frozenset({"provider_response", "provider_error"})
 _LEDGER_ROUTE_ATTR = "_ledger_route"
+_LEDGER_LANE_ATTR = "_ledger_lane"
 
 
 def _note_provider_attempt(
@@ -2289,11 +2367,17 @@ async def _mirror_provider_attempt(
     if not user_id:
         return
     provider, model = getattr(recorder, _LEDGER_ROUTE_ATTR, ("", ""))
+    ledger_payload = payload
+    if not str(payload.get("lane") or ""):
+        ledger_payload = dict(payload)
+        ledger_payload["lane"] = str(
+            getattr(recorder, _LEDGER_LANE_ATTR, "") or "unknown"
+        )
     await asyncio.to_thread(
         _note_provider_attempt,
         user_id,
         event_kind,
-        payload,
+        ledger_payload,
         job_id=getattr(recorder, "job_id", None),
         provider=provider,
         model=model,
@@ -4888,6 +4972,110 @@ async def _rebalance_summary_frontier(
     )
 
 
+_CHECKPOINT_EXHAUSTION_DETAILS = frozenset(
+    {
+        "empty_rollup_candidate",
+        "single_segment_exceeds_rollup_input",
+        "fanout_run_exceeds_rollup_input",
+        "frontier_head_exceeds_rollup_input",
+        "no_reducing_rollup_candidate",
+        "checkpoint_work_budget_exhausted",
+        "invalid_checkpoint_output",
+        "checkpoint_cas_no_progress",
+        "checkpoint_pass_budget_exhausted",
+        "materialized_prompt_view_over_target",
+    }
+)
+
+
+def _checkpoint_degradation_detail(exc: BaseException) -> str:
+    """Return an allowlisted, content-free checkpoint reason.
+
+    Arbitrary ``.detail`` / ``.code`` attributes are untrusted just like an
+    exception message: a provider SDK or adapter can put credentials or user
+    content there.  Only details minted by our own frontier exception are
+    eligible for plaintext telemetry; everything else is reduced to its class.
+    """
+    if isinstance(exc, v2_summary_frontier.SummaryFrontierExhausted):
+        detail = str(exc.detail or "")
+        if detail in _CHECKPOINT_EXHAUSTION_DETAILS:
+            return detail
+        return "summary_frontier_exhausted"
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "checkpoint_timeout"
+    type_name = re.sub(r"[^a-z0-9_]", "", type(exc).__name__.lower())[:64]
+    return f"checkpoint_{type_name}" if type_name else "checkpoint_error"
+
+
+async def _rebalance_summary_frontier_best_effort(
+    user_id: str,
+    deps: TurnDeps,
+    *,
+    lane: str,
+    phase: str,
+    provider_config: Any,
+    enclave_sem: "asyncio.Semaphore | None",
+    claimed_by: str | None = None,
+    job_id=None,
+    add_usage: Callable[[dict | None], None] | None = None,
+    trajectory_recorder: "v2_trajectory.TrajectoryRecorder | None" = None,
+    deterministic_coverage: bool = False,
+    timeout_sec: float = 30.0,
+) -> bool:
+    """Run an optional checkpoint without undoing an already-durable leaf.
+
+    Lease/control cancellation and a corrupt frontier remain fatal.  Every
+    other checkpoint-local failure is a bounded degradation: the exact leaf
+    coverage is already durable and a later maintenance turn can retry the
+    roll-up.  This distinction prevents post-fold optimization failures from
+    being counted as if the fold itself failed.
+    """
+    try:
+        if not math.isfinite(float(timeout_sec)) or float(timeout_sec) <= 0:
+            raise asyncio.TimeoutError
+        await asyncio.wait_for(
+            _rebalance_summary_frontier(
+                user_id,
+                deps,
+                provider_config=provider_config,
+                enclave_sem=enclave_sem,
+                claimed_by=claimed_by,
+                job_id=job_id,
+                add_usage=add_usage,
+                trajectory_recorder=trajectory_recorder,
+                deterministic_coverage=deterministic_coverage,
+            ),
+            timeout=float(timeout_sec),
+        )
+        return True
+    except (LostJobLease, RuntimeModeChanged, asyncio.CancelledError):
+        raise
+    except v2_summary_frontier.SummaryFrontierIntegrityError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — checkpoint is optional here
+        detail = _checkpoint_degradation_detail(exc)
+        _report_turn_progress("compaction_checkpoint_degraded")
+        await _record_trajectory(
+            trajectory_recorder,
+            "compaction_checkpoint_degraded",
+            {
+                "lane": str(lane or "unknown")[:40],
+                "phase": str(phase or "unknown")[:40],
+                "error_class": type(exc).__name__,
+                "detail": detail,
+            },
+            best_effort=True,
+        )
+        log.warning(
+            "[v2.worker] checkpoint degraded user=%s lane=%s phase=%s code=%s",
+            user_id,
+            lane,
+            phase,
+            detail,
+        )
+        return False
+
+
 async def _bound_materialized_summary(
     user_id: str,
     summary: str,
@@ -5289,9 +5477,11 @@ async def _run_compaction(
             )
             _report_turn_progress("deterministic_compaction_batch_complete")
             if ok:
-                await _rebalance_summary_frontier(
+                await _rebalance_summary_frontier_best_effort(
                     user_id,
                     deps,
+                    lane="maintenance",
+                    phase="post_fold_deterministic",
                     provider_config=provider_config,
                     enclave_sem=enclave_sem,
                     claimed_by=claimed_by,
@@ -5346,53 +5536,18 @@ async def _run_compaction(
         # A checkpoint increments the head version; reading first would waste
         # one provider call on a predictably stale leaf and force a retry job.
         if deps.read_summary_frontier is not None:
-            try:
-                await _rebalance_summary_frontier(
-                    user_id,
-                    deps,
-                    provider_config=provider_config,
-                    enclave_sem=enclave_sem,
-                    claimed_by=claimed_by,
-                    job_id=job_id,
-                    add_usage=tm.add_call if tm is not None else None,
-                    trajectory_recorder=trajectory_recorder,
-                )
-            except (LostJobLease, RuntimeModeChanged, asyncio.CancelledError):
-                # Lifecycle, not the checkpoint's own failure — this worker no
-                # longer owns the job and must not keep folding.
-                raise
-            except v2_summary_frontier.SummaryFrontierIntegrityError:
-                # The persisted cover cannot prove complete coverage. Folding on
-                # top of a frontier we cannot trust would extend the damage, so
-                # this one stays fatal.
-                raise
-            except Exception as rebalance_exc:  # noqa: BLE001 — see below
-                # A checkpoint only reduces how many nodes a later prompt has to
-                # read; the fold below is the actual work. Letting a failed
-                # checkpoint skip it (it sits ABOVE the tail read) meant the
-                # backlog could never drain, and since the roll-up input does
-                # not change, it failed identically on every retry — including
-                # manual re-enqueues. usr_7f30 on prod sat at a frozen watermark
-                # for days on exactly this, with `model_calls=1` proving the one
-                # provider call was the checkpoint, never the fold.
-                _report_turn_progress("compaction_checkpoint_degraded")
-                await _record_trajectory(
-                    trajectory_recorder,
-                    "compaction_checkpoint_degraded",
-                    {
-                        "lane": "maintenance",
-                        "error_class": type(rebalance_exc).__name__,
-                        "detail": str(
-                            getattr(rebalance_exc, "detail", "") or ""
-                        )[:80],
-                    },
-                    best_effort=True,
-                )
-                log.warning(
-                    "[v2.worker] checkpoint rebalance degraded for %s: %s",
-                    user_id,
-                    type(rebalance_exc).__name__,
-                )
+            await _rebalance_summary_frontier_best_effort(
+                user_id,
+                deps,
+                lane="maintenance",
+                phase="pre_fold",
+                provider_config=provider_config,
+                enclave_sem=enclave_sem,
+                claimed_by=claimed_by,
+                job_id=job_id,
+                add_usage=tm.add_call if tm is not None else None,
+                trajectory_recorder=trajectory_recorder,
+            )
         async with enclave_sem:
             if deps.read_summary_with_seq is not None and (
                 deps.read_compaction_tail_after_seq is not None
@@ -5604,9 +5759,11 @@ async def _run_compaction(
                     min(_COMPACTION_BATCH, fold_limit + _BATCH_CAP_INCREMENT),
                 )
             if segmented_write:
-                await _rebalance_summary_frontier(
+                await _rebalance_summary_frontier_best_effort(
                     user_id,
                     deps,
+                    lane="maintenance",
+                    phase="post_fold",
                     provider_config=provider_config,
                     enclave_sem=enclave_sem,
                     claimed_by=claimed_by,
@@ -6354,10 +6511,15 @@ async def _ensure_prompt_coverage(
                 )
             )
             if wrote:
-                await _within_deadline(
-                    lambda: _rebalance_summary_frontier(
+                # Leave enough budget for the next authoritative coverage read;
+                # the checkpoint is optional, that verification is not.
+                checkpoint_budget = deadline_at - time.monotonic() - 2.0
+                if checkpoint_budget > 0:
+                    await _rebalance_summary_frontier_best_effort(
                         user_id,
                         deps,
+                        lane="prompt_catchup",
+                        phase="post_fold_deterministic",
                         provider_config=provider_config,
                         enclave_sem=enclave_sem,
                         claimed_by=claimed_by,
@@ -6365,8 +6527,8 @@ async def _ensure_prompt_coverage(
                         add_usage=add_usage,
                         trajectory_recorder=trajectory_recorder,
                         deterministic_coverage=True,
+                        timeout_sec=min(30.0, checkpoint_budget),
                     )
-                )
             _report_turn_progress("prompt_deterministic_catchup_batch_complete")
             await _record_trajectory(
                 trajectory_recorder,
@@ -6673,18 +6835,23 @@ async def _ensure_prompt_coverage(
                 )
             )
             if wrote:
-                await _within_deadline(
-                    lambda: _rebalance_summary_frontier(
+                # Leave enough budget for the next authoritative coverage read;
+                # the checkpoint is optional, that verification is not.
+                checkpoint_budget = deadline_at - time.monotonic() - 2.0
+                if checkpoint_budget > 0:
+                    await _rebalance_summary_frontier_best_effort(
                         user_id,
                         deps,
+                        lane="prompt_catchup",
+                        phase="post_fold",
                         provider_config=provider_config,
                         enclave_sem=enclave_sem,
                         claimed_by=claimed_by,
                         job_id=job_id,
                         add_usage=add_usage,
                         trajectory_recorder=trajectory_recorder,
+                        timeout_sec=min(30.0, checkpoint_budget),
                     )
-                )
         elif new_watermark_seq is not None:
             await _within_deadline(
                 lambda: asyncio.to_thread(
@@ -7500,7 +7667,7 @@ async def _run_wake(
                     _wake_self_thinking_text = _wst_thinking
                 elif _wst_status == _st_wake.FAILED:
                     if final:
-                        raise TurnError("degenerate_reply_suppressed")
+                        raise TurnError(_MALFORMED_SELF_THINKING_REASON)
                     return
             if text and _is_degenerate_reply(text):
                 log.warning(
@@ -8762,6 +8929,8 @@ async def _run_extraction(
                 should_retry=is_card_format_error,
                 build_prompt=build_capture_retry_prompt,
                 parse=lambda reply: parse_capture_cards(reply, strict=False),
+                semantic_reasons=capture_semantic_retry_reasons,
+                build_semantic_prompt=build_capture_semantic_retry_prompt,
             )
         else:
             prompt = build_dream_prompt(
@@ -8797,6 +8966,7 @@ async def _run_extraction(
                     threads=ctx.get("threads", ""),
                     identity=ctx.get("identity", ""),
                     window=window,
+                    cards=ctx.get("cards", ""),
                 )
         if lane == "capture" and prompt_tail:
             await _ensure_capture_not_halted("provider_authorization")
@@ -9160,7 +9330,7 @@ async def _run_extraction(
             tm.flush(failed=True, status="turns_halted")
         return "failed"
     except Exception as e:  # noqa: BLE001 — 背景 job：静默 mark_failed，绝不 surface/写气泡
-        code = _safe_failure_code("extraction_failed", e)
+        code = _extraction_failure_code(e)
         if lane != "capture" and not extraction_status_recorded:
             try:
                 await _record_extraction_status("failed")

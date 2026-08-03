@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import pytest
 
-from model_api_runtime.v2 import extraction
+from model_api_runtime.v2 import extraction, worker
 
 
 def _env(inner):
@@ -61,6 +61,39 @@ def test_extract_returns_reason_on_provider_error(monkeypatch):
     assert parsed is None
     assert err.startswith("provider_call_failed:")
     assert seen == [None]
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (401, "auth_invalid"),
+        (402, "quota_insufficient"),
+        (404, "model_not_found"),
+        (429, "rate_limited"),
+        (503, "upstream_unavailable"),
+    ],
+)
+def test_extract_provider_failure_reason_is_stable_and_content_free(
+    monkeypatch, status, expected
+):
+    async def _boom(cfg, messages, **kw):
+        raise extraction.provider_client.ProviderError(
+            "secret upstream response body", status_code=status
+        )
+
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", _boom
+    )
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=lambda raw: (["never"], None),
+        )
+    )
+    assert parsed is None
+    assert err == f"provider_call_failed:{expected}"
+    assert "secret" not in err
 
 
 def test_extract_returns_reason_on_parse_error(monkeypatch):
@@ -184,6 +217,192 @@ def test_extract_records_the_bounce_in_the_trajectory(monkeypatch):
         )))
     bounced = [p for kind, p in events if kind == "parse_bounced"]
     assert bounced == [{"reason": "invalid_card_content:content_empty"}]
+
+
+def test_extract_semantic_bounce_shares_the_one_retry_budget(monkeypatch):
+    fake, prompts = _stub_provider(["missing-target", "corrected"])
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", fake
+    )
+
+    def _parse(raw):
+        target = "mem_1" if raw == "corrected" else ""
+        return ([{"action": "supersede", "target_id": target}], None)
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=_parse,
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _e: False,
+                build_prompt=lambda prompt, _e: prompt,
+                parse=_parse,
+                semantic_reasons=lambda cards: (
+                    ["missing target"] if not cards[0].get("target_id") else []
+                ),
+                build_semantic_prompt=lambda prompt, _reasons: prompt + "|semantic",
+            ),
+        )
+    )
+    assert err is None
+    assert parsed[0]["target_id"] == "mem_1"
+    assert prompts == ["P", "P|semantic"]
+
+
+def test_extract_semantic_retry_keeps_valid_cards_when_full_batch_is_returned(
+    monkeypatch,
+):
+    fake, prompts = _stub_provider(["mixed", "corrected-full-batch"])
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", fake
+    )
+
+    def _parse(raw):
+        if raw == "mixed":
+            return (
+                [
+                    {"action": "add", "summary": "valid"},
+                    {"action": "supersede", "target_id": ""},
+                ],
+                None,
+            )
+        return (
+            [
+                {"action": "add", "summary": "valid"},
+                {"action": "supersede", "target_id": "mem_1"},
+            ],
+            None,
+        )
+
+    def _semantic_reasons(cards):
+        return [
+            "missing target"
+            for card in cards
+            if card.get("action") == "supersede" and not card.get("target_id")
+        ]
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=_parse,
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _e: False,
+                build_prompt=lambda prompt, _e: prompt,
+                parse=_parse,
+                semantic_reasons=_semantic_reasons,
+                build_semantic_prompt=lambda prompt, _reasons: prompt + "|semantic",
+            ),
+        )
+    )
+
+    assert err is None
+    assert parsed == [
+        {"action": "add", "summary": "valid"},
+        {"action": "supersede", "target_id": "mem_1"},
+    ]
+    assert prompts == ["P", "P|semantic"]
+
+
+def test_extract_does_not_issue_third_call_after_format_retry(monkeypatch):
+    fake, prompts = _stub_provider(["bad-format", "still-missing-target", "unused"])
+    monkeypatch.setattr(
+        extraction.provider_client, "reliable_chat_completion_async", fake
+    )
+
+    parsed, err = asyncio.run(
+        extraction.extract(
+            provider_config=object(),
+            prompt="P",
+            parse=lambda _raw: (None, "invalid_card_content:summary_empty"),
+            parse_retry=extraction.ParseRetry(
+                should_retry=lambda _e: True,
+                build_prompt=lambda prompt, _e: prompt + "|format",
+                parse=lambda _raw: ([{"action": "supersede", "target_id": ""}], None),
+                semantic_reasons=lambda cards: (
+                    ["missing target"] if not cards[0].get("target_id") else []
+                ),
+                build_semantic_prompt=lambda prompt, _reasons: prompt + "|semantic",
+            ),
+        )
+    )
+    assert parsed is None
+    assert err == "semantic_validation_failed_after_retry"
+    assert prompts == ["P", "P|format"]
+
+
+def test_extraction_failure_codes_are_allowlisted_and_drop_raw_details():
+    assert worker._extraction_failure_code(
+        RuntimeError("provider_call_failed:quota_insufficient")
+    ) == "extraction_failed:quota_insufficient"
+    assert worker._extraction_failure_code(
+        RuntimeError("provider_call_failed:sk-live-secret")
+    ) == "extraction_failed:unknown"
+    assert worker._extraction_failure_code(
+        RuntimeError("json_decode_error:JSONDecodeError")
+    ) == "extraction_failed:json_decode_error"
+    assert worker._extraction_failure_code(
+        RuntimeError("extraction_memory_write_rejected:private-db-detail")
+    ) == "extraction_failed:memory_write_rejected"
+
+
+def test_extract_provider_reason_records_failure_not_false_success(monkeypatch):
+    async def _failed_extract(**_kwargs):
+        return None, "provider_call_failed:rate_limited"
+
+    events = []
+
+    async def _failure(user_id, error_class):
+        events.append(("failure", user_id, error_class))
+
+    async def _success(user_id, *, latency_ms=None):
+        events.append(("success", user_id, latency_ms))
+
+    monkeypatch.setattr(extraction, "extract", _failed_extract)
+    monkeypatch.setattr(worker, "_record_provider_failure_class", _failure)
+    monkeypatch.setattr(worker, "_record_provider_success", _success)
+    result = asyncio.run(
+        worker._extract_with_provider_health("u_provider", prompt="P")
+    )
+    assert result == (None, "provider_call_failed:rate_limited")
+    assert events == [("failure", "u_provider", "rate_limited")]
+
+
+def test_extract_empty_reply_records_route_success(monkeypatch):
+    async def _empty_extract(**_kwargs):
+        return None, "empty_reply"
+
+    events = []
+
+    async def _failure(user_id, error_class):
+        events.append(("failure", user_id, error_class))
+
+    async def _success(user_id, *, latency_ms=None):
+        events.append(("success", user_id, latency_ms))
+
+    monkeypatch.setattr(extraction, "extract", _empty_extract)
+    monkeypatch.setattr(worker, "_record_provider_failure_class", _failure)
+    monkeypatch.setattr(worker, "_record_provider_success", _success)
+    result = asyncio.run(
+        worker._extract_with_provider_health("u_provider", prompt="P")
+    )
+    assert result == (None, "empty_reply")
+    assert len(events) == 1
+    assert events[0][0:2] == ("success", "u_provider")
+
+
+def test_provider_health_uses_only_catalog_classes(monkeypatch):
+    seen = []
+
+    def _record(user_id, *, error_class):
+        seen.append((user_id, error_class))
+
+    monkeypatch.setattr(worker.provider_health, "record_failure", _record)
+    asyncio.run(
+        worker._record_provider_failure_class("u_provider", "provider_config")
+    )
+    assert seen == [("u_provider", "unknown")]
 
 
 # ---------- cards_to_actions ----------

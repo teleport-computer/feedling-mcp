@@ -234,7 +234,7 @@ def test_extraction_failure_is_silent_no_bubble_no_error_chip(monkeypatch, lane)
     job = jobs_store.claim_next_job("w")
 
     async def _err(*, provider_config, prompt, parse, **kw):
-        return (None, "provider_call_failed:RuntimeError")
+        return (None, "provider_call_failed:upstream_unavailable")
 
     monkeypatch.setattr(extraction, "extract", _err)
     written = {}
@@ -250,7 +250,7 @@ def test_extraction_failure_is_silent_no_bubble_no_error_chip(monkeypatch, lane)
     assert written == {}                       # no chat bubble
     assert emitted == []                       # no user-visible status/error chip
     row = _job_row(job_id)
-    assert row == ("failed", "extraction_failed:runtimeerror")
+    assert row == ("failed", "extraction_failed:upstream_unavailable")
 
 
 def test_rejected_memory_write_fails_job_instead_of_marking_completed(monkeypatch):
@@ -347,6 +347,37 @@ def test_capture_prompt_degrades_when_memory_context_is_missing(monkeypatch):
         api_key=None, runtime_token="rt"))
     assert status == "completed"
     assert "（暂无）" in seen["prompt"]          # prompt builder's own fallback kicked in
+
+
+def test_capture_prompt_includes_existing_card_ids(monkeypatch):
+    uid = "u_x_cards_context"
+    _seed_v2(uid)
+    jobs_store.enqueue_job(uid, "capture")
+    job = jobs_store.claim_next_job("w")
+    seen = {}
+
+    async def _capture(*, prompt, **_kwargs):
+        seen["prompt"] = prompt
+        return [], None
+
+    monkeypatch.setattr(extraction, "extract", _capture)
+    deps = _deps(
+        read_memory_context=lambda _uid: {
+            "cards": "- [mom_existing] （桶：工作）之前的工作记忆"
+        }
+    )
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+    assert status == "completed"
+    assert "[mom_existing]" in seen["prompt"]
+    assert "target_id" in seen["prompt"]
 
 
 def test_extraction_reads_go_through_the_enclave_semaphore(monkeypatch):

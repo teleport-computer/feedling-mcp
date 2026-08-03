@@ -323,6 +323,106 @@ def test_checkpoint_failure_must_not_block_the_fold(monkeypatch):
     assert "folded bullet" in str((row["summary_envelope"] or {}).get("plaintext") or "")
 
 
+def _deterministic_post_fold_case(monkeypatch, uid: str, rebalance_error: Exception):
+    conftest.seed_user(uid)
+    _reset(uid)
+    total = worker._TAIL_KEEP + 5
+    with db.get_pool().connection() as conn:
+        with conn.transaction():
+            for index in range(total):
+                conn.execute(
+                    "INSERT INTO chat_messages (user_id,msg_id,ts,doc) "
+                    "VALUES (%s,%s,%s,%s)",
+                    (
+                        uid,
+                        f"post-fold-{index}",
+                        float(index + 1),
+                        db.Jsonb({
+                            "id": f"post-fold-{index}",
+                            "role": "user" if index % 2 == 0 else "openclaw",
+                            "source": "model_api",
+                            "body_ct": f"cipher-{index}",
+                        }),
+                    ),
+                )
+
+    monkeypatch.setattr(worker, "_PROFILE_COVERAGE_DETERMINISTIC", True)
+
+    async def _rebalance_fails(*_args, **_kwargs):
+        raise rebalance_error
+
+    monkeypatch.setattr(worker, "_rebalance_summary_frontier", _rebalance_fails)
+
+    def _append_segment(uid_, segment_text, **kwargs):
+        return jobs_store.append_summary_leaf_cas(
+            uid_,
+            summary_envelope={"plaintext": str(segment_text)},
+            head_summary_envelope={"plaintext": str(kwargs["head_summary"])},
+            start_seq=kwargs["start_seq"],
+            end_seq=kwargs["end_seq"],
+            source_message_count=kwargs["source_message_count"],
+            watermark_ts=kwargs["watermark_ts"],
+            expected_version=kwargs["expected_version"],
+            previous_watermark_seq=kwargs["previous_watermark_seq"],
+        )
+
+    deps = worker.TurnDeps(
+        read_messages=lambda _uid: [],
+        resolve_provider=lambda _uid: (_BYOK, {}),
+        mint_enclave_token=lambda _uid: "rt",
+        runtime_mode_enabled=lambda _uid: True,
+        append_summary_segment=_append_segment,
+    )
+    job_id, _ = jobs_store.enqueue_job(uid, "maintenance", reason="post-fold-test")
+    job = jobs_store.claim_next_job("post-fold-worker")
+    assert job is not None and job["id"] == job_id
+    status = asyncio.run(
+        worker._run_compaction(
+            job_id,
+            uid,
+            deps,
+            _BYOK,
+            asyncio.Semaphore(1),
+            claimed_by=str(job["claimed_by"]),
+        )
+    )
+    with db.get_pool().connection() as conn:
+        terminal = conn.execute(
+            "SELECT status,last_error FROM agent_jobs WHERE id=%s", (job_id,)
+        ).fetchone()
+    return status, terminal, jobs_store.get_summary_row(uid)
+
+
+def test_post_fold_checkpoint_exhaustion_keeps_durable_fold(monkeypatch):
+    status, terminal, summary = _deterministic_post_fold_case(
+        monkeypatch,
+        "u_v2_post_fold_exhausted",
+        v2_summary_frontier.SummaryFrontierExhausted(
+            "checkpoint_pass_budget_exhausted"
+        ),
+    )
+
+    assert status == "completed"
+    assert terminal[0] == "completed"
+    assert summary is not None and summary["watermark_seq"] > 0
+
+
+def test_post_fold_frontier_integrity_error_remains_fatal(monkeypatch):
+    status, terminal, summary = _deterministic_post_fold_case(
+        monkeypatch,
+        "u_v2_post_fold_integrity",
+        v2_summary_frontier.SummaryFrontierIntegrityError(
+            "non_contiguous_exact_frontier"
+        ),
+    )
+
+    assert status == "failed"
+    assert terminal[0] == "failed"
+    assert terminal[1] == "compaction_failed:v2_summary_frontier_integrity_error"
+    # The exact leaf still landed before the integrity problem was detected.
+    assert summary is not None and summary["watermark_seq"] > 0
+
+
 def test_refused_fold_shrinks_instead_of_reporting_success(monkeypatch):
     """A refused fold must be retried smaller, not silently written off.
 

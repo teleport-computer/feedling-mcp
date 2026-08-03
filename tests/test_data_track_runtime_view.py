@@ -120,6 +120,41 @@ def test_runtime_health_level_red_on_high_failure_rate():
     assert any("失败率" in r for r in reasons)
 
 
+def test_runtime_health_level_guard_is_warning_not_hard_failure():
+    lane = _lane(
+        lane="heartbeat",
+        completed=90,
+        failed=10,
+        failure_rate=0.10,
+        operational_failures=0,
+        operational_failure_rate=0.0,
+        safety_suppressions=10,
+    )
+
+    level, reasons = _dt._runtime_health_level(_payload([lane]))
+
+    assert level == "warn"
+    assert any("安全抑制" in reason for reason in reasons)
+    assert not any("系统故障率" in reason for reason in reasons)
+
+
+def test_runtime_health_level_chat_keeps_user_impact_rate():
+    lane = _lane(
+        lane="chat",
+        completed=92,
+        failed=8,
+        failure_rate=0.08,
+        operational_failures=0,
+        operational_failure_rate=0.0,
+        control_outcomes=8,
+    )
+
+    level, reasons = _dt._runtime_health_level(_payload([lane]))
+
+    assert level == "warn"
+    assert any("回复失败率" in reason for reason in reasons)
+
+
 def test_runtime_health_level_red_on_missing_trajectory():
     # 漏写没有「轻微」档：一条就是数据缺口
     level, reasons = _dt._runtime_health_level(
@@ -719,7 +754,8 @@ def test_render_runtime_health_page_token_columns_are_dash_without_data(bound_re
     # 精确断言：chat 行的 token / 缓存命中 / 上报覆盖 三列都渲染成 muted 的 —。
     # 只写 `assert "—" in html_out` 是无效断言——页面别处本来就有 —。
     # 数量是 3 而非 2：命中率与上报覆盖率已拆成两列（2026-07-30 审计）。
-    assert chat_row.count("<td class='muted'>—</td>") == 3
+    # 新增控制/抑制拆分后，旧 payload 对这两列也只能显示未知（—）。
+    assert chat_row.count("<td class='muted'>—</td>") == 5
     # maintenance 的数字绝不能串到 chat 行上
     assert "951.2k" not in chat_row
 
@@ -739,11 +775,10 @@ def test_render_runtime_health_page_includes_token_only_lane(bound_request):
     assert "87.3%" in row
     # 健康列（样本/成功/失败/过期/superseded/失败率/p50/p95/capture）没有
     # 任何数据来源——必须显 —，不得显 0（0 意味着"确认过是零"，这里是
-    # "压根没被健康查询看见"）。5 个 muted 的 — 来自 superseded/失败率/
-    # p50/p95/capture（这几列本来就带 muted class 或在无数据时切换成
-    # muted）；样本/成功/失败/过期四列不带 muted class，但内容也必须是 —
-    # 而非 0。
-    assert row.count("<td class='muted'>—</td>") == 5
+    # "压根没被健康查询看见"）。新表把控制/抑制与两种失败率拆开，故共有
+    # 7 个 muted dash；样本/成功/失败/过期/系统故障五列不带 muted class，
+    # 内容也必须是 — 而非 0。
+    assert row.count("<td class='muted'>—</td>") == 7
     assert "<td>—</td>" in row  # 样本/成功/失败/过期这几列（不带 muted class）
     assert ">0<" not in row and "0 / 0" not in row
 
@@ -897,8 +932,8 @@ def test_render_runtime_health_page_separates_two_coverages(bound_request):
 
 def test_render_runtime_health_page_coverage_columns_dash_without_data(bound_request):
     html_out = _dt._render_runtime_health_page(_payload(), _tokens(lane_name="other"))
-    # chat 行三列全无数据 → token 列 + 命中列 + 覆盖列各一个 muted dash
-    assert _lane_row_html(html_out, "chat").count("<td class='muted'>—</td>") == 3
+    # chat 行 token/命中/覆盖均未知；旧 payload 的控制/抑制列也未知。
+    assert _lane_row_html(html_out, "chat").count("<td class='muted'>—</td>") == 5
 
 
 def test_runtime_page_links_drop_params_it_ignores():
