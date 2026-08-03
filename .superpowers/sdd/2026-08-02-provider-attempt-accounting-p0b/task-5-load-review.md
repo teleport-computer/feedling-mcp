@@ -2,6 +2,176 @@
 
 Reviewed commit: `deff128524dea481e85c32e9a4943db1c1bb211d`
 
+## Resume-path review of `a3911c76f663dee0490f121959985af20895f04a`
+
+### Resume review verdict
+
+- **Spec: FAIL**
+- **Quality: FAIL**
+- **Ready to run destructive formal resume: NO**
+
+The control-flow safety properties are largely correct: the prefix is strict
+and formal-only; connected-database/schema/resume validation precedes the
+business producer; invalid validation and `--validate-resume-only` return
+before cleanup is armed; a full resume skips only seed/bootstrap and reruns the
+business producer, both timing cohorts, SQL capture/EXPLAIN, final gates, and
+cleanup.  Exact-prefix deletion is used for user-scoped rows.
+
+However, the preflight does not yet prove that a same-cardinality fixture has
+the deterministic source distribution or semantically correct rollups, formal
+configuration is not fully locked, and the producer's own rollup writes are not
+revalidated before timing and destructive cleanup.
+
+### C1 — Deterministic source and rollup integrity can be forged with equal counts
+
+Relevant code:
+
+- `scripts/perf/admin_usage_scale.py:297-391`
+- `scripts/perf/admin_usage_scale.py:1046-1180`
+- `tests/test_admin_usage.py:98-159`
+
+Global and prefix cardinalities are checked exactly, as are user ID/document
+shape, distinct source IDs/calls/jobs, source/user ownership, one membership
+per call, orphan absence, and watermark/retention fields.  Those are useful but
+do not establish the deterministic fixture used by the performance proof.
+
+The clearest counterexample is already in the tests.  The accepted synthetic
+snapshot uses `rows_in_90d=739726` and raw-edge counts of 16438, while the real
+read-only artifact reports 739736 and 8208.  `_validate_resume_snapshot`
+accepts both because it requires only a positive 90-day count and equality
+between turn/attempt/call counters.  Moving source timestamps while preserving
+all IDs and counts therefore passes preflight but changes the report cohort,
+raw-edge volume, plans, and timing distribution.
+
+Likewise, the three daily rollup tables are validated only by total row count.
+Daily keys or aggregates can be swapped/corrupted while keeping 731199 rows.
+Membership validation checks call/user existence but not its local day, lane,
+requested/resolved provider/model identity, or equality with the canonical
+attempt/turn cohort.  A same-count membership-day corruption passes and changes
+which 90-day rows the hybrid report reads.  The final formal gate checks
+performance and plan shape, not semantic equality of the returned totals, so it
+does not repair this gap.
+
+Minimum fix:
+
+- Derive the exact expected 90-day and raw-edge source values from the fixture
+  formula and fixed production window/partition, then require exact equality.
+  Prefer a deterministic SQL/formula computation bound to the seed contract
+  rather than unexplained copied magic numbers.
+- For source shape, validate the deterministic timestamp/user/job/call and
+  provider/model/lane distribution with exact checksums or bidirectional set
+  equality/anti-joins.
+- For each daily rollup, compare canonical keys and aggregate fields to a
+  recomputed raw-source relation using `EXCEPT`/anti-joins or a collision-
+  resistant ordered checksum plus exact counts/totals.
+- For memberships, require bidirectional equality with the expected
+  call/user/Shanghai-local-day and requested/resolved identity projection, not
+  merely non-orphan cardinality.
+- Add negative tests that alter a source timestamp, a daily aggregate/key, and
+  a membership local day while preserving every current count; all must fail.
+
+### C2 — Formal users/history configuration is not exact or provenance-safe
+
+Relevant code:
+
+- `scripts/perf/admin_usage_scale.py:1497-1519`
+- `scripts/perf/admin_usage_scale.py:1630-1656`
+- `scripts/perf/admin_usage_scale.py:1968-1978`
+
+Formal mode requires exactly 3,000,000 turns and attempts, but still accepts any
+positive `--users` and any `--history-days >= 90`.  A fresh formal run can seed
+one user over 90 days and remain eligible for the existing cardinality gate.
+On resume the actual preflight does require 2,000 users, but the final artifact
+records the caller's unrelated `args.users` and `args.history_days`; the final
+gate does not reconcile those fields with the validated fixture.
+
+Minimum fix:
+
+- Require formal CLI configuration to use exactly 2,000 users and 365 history
+  days before database access, alongside the existing 3M/3M requirements.
+- Require the final gate's fixture fields and pre/post resume snapshots to agree
+  with all four formal constants.  Add fresh-formal and resumed-formal negative
+  tests for wrong users/history values.
+
+### C3 — Producer rollup writes invalidate the only checked snapshot
+
+Relevant code:
+
+- `scripts/perf/admin_usage_scale.py:1568-1619`
+- `scripts/perf/admin_usage_scale.py:1671-1684`
+- `scripts/perf/provider_attempt_business_path.py:1348-1460`
+
+The preflight correctly runs before the producer.  In resume mode the producer
+then deliberately inserts twenty dirty days and successfully recomputes those
+existing rollup days.  It proves its maintenance outcomes and removes the
+load-proof dirty claims, but it does not prove that the resumed daily rows,
+membership state, counts, and watermarks still match the validated fixture.
+The runner copies the stale pre-producer `resume_snapshot` into evidence, arms
+cleanup, and proceeds directly to timing.
+
+A recompute regression that deletes, duplicates, or changes aggregate rows can
+therefore invalidate preflight while the stale snapshot remains healthy in the
+artifact.  Timing/EXPLAIN may still pass, after which cleanup destroys the only
+recoverable fixture.
+
+Minimum fix:
+
+- Immediately after the business producer settles, collect a second complete
+  resume snapshot and run the same strengthened exact validator before timing
+  or arming destructive cleanup.
+- Store both pre- and post-producer snapshots in evidence and require exact
+  invariant equality (allowing only explicitly documented volatile watermark
+  timestamps/cursors).
+- Add a test producer that preserves business evidence but corrupts one daily
+  rollup row; assert timing is never called, cleanup is not armed, and the run
+  fails closed.
+
+### I1 — Control flow is statically safe but lacks mutation-spy regression tests
+
+The current ordering does satisfy these properties by inspection:
+
+- invalid prefix/snapshot fails before producer and before the cleanup
+  `try/finally` exists;
+- validate-only executes SELECT-based schema/snapshot collection, optionally
+  writes its local JSON output, and returns before producer/timing/cleanup;
+- a successful full resume sets `cleanup_armed` only after business evidence is
+  produced;
+- cleanup deletes user-scoped rows by exact `left(...)=prefix` matching, then
+  removes the globally unique watermarks only after global ownership passed;
+- an external hard interruption cannot emit final `passed=true`; an
+  interruption during the producer can leave fail-closed load-proof dirty
+  state that a future preflight rejects rather than silently trusting.
+
+The added tests exercise helper validation but not `_run` ordering or mutation
+absence.  Add spies/fakes proving invalid preflight never calls producer,
+delete, seed, bootstrap, timing, or EXPLAIN; validate-only calls only expected
+read operations; full resume skips seed/bootstrap but invokes every downstream
+proof stage; and failure before post-producer validation never deletes the
+fixture.  Also document that a second external interruption during the
+producer may require an explicit repair/validation step because leftover
+`load_proof` dirty rows intentionally block automatic reuse.
+
+### Resume review verification
+
+- Resume helper negatives plus provider business-path/recorder/provider tests:
+  **87 passed, 1 skipped**.
+- Dry read-only artifact inspected at
+  `/private/tmp/admin-usage-resume-validation.json`; it records exact global and
+  prefix 3M/3M/2,000 counts, 739736 90-day rows, 8208 raw-edge rows, clean
+  watermarks, completed-through 2026-08-02, retained-from 2025-06-29, and zero
+  dirty rows.
+- No formal run, external provider network request, remote RDS write, or local
+  fixture cleanup was performed.
+- The existing untracked business-path evidence file was not modified.
+
+### Resume ready verdict
+
+**Not ready for destructive resume.**  Strengthen C1's exact deterministic
+source/rollup equality, lock C2's 2,000-user/365-day configuration, perform and
+record C3's post-producer revalidation, and add the I1 control-flow spy tests.
+The read-only validation result is useful evidence, but it is not yet enough to
+authorize timing followed by cleanup.
+
 ## Final re-review of `7864b97a39f680f5b5bab8380ade1792c4722356`
 
 ### Final verdict
