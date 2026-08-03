@@ -152,3 +152,58 @@ upper partial raw day.  The retention boundary precedes both the earliest day
 in the 365-day fixture and the 90-day report window, so it cannot truncate the
 measured cohort.  No formal resume was run and the validated fixture remains
 intact for the separately authorized timing run.
+
+## Strengthened formal resume integrity design
+
+The resume gate is a five-state machine: exact prevalidation, optional
+read-only validation exit, business-producer proof, exact postvalidation, then
+destructive-cleanup arming. Timing and EXPLAIN begin only after postvalidation;
+any prefix/config/preflight/producer/postflight failure leaves the existing
+fixture unarmed and untouched. Formal configuration is exactly 3,000,000
+turns, 3,000,000 attempts, 2,000 users, and 365 history days. Non-formal
+probes remain separately configurable and permanently ineligible to pass.
+
+Expected source-window values are derived from the fixture's deterministic
+formula (`(g * 104729) % (365 * 86400)`) and the fixed half-open production
+window/raw-day bounds. The derivation, rather than an artifact literal, must
+produce exactly 739,736 rows in the 90-day cohort and 8,208 matching turn,
+attempt, and logical-call raw-edge rows.
+
+Resume DB integrity is checked inside one read-only, repeatable-read snapshot.
+Set-based bidirectional `EXCEPT`/anti-joins compare canonical raw-source facts
+with both v2 daily grains, attempt dimensions, and call memberships; volatile
+row IDs and refresh timestamps are excluded. Membership equality covers local
+day, user, lane, call, requested/resolved provider/model, usage-known and gap
+fields, while the source proof establishes the fixture's one-to-one attempt-
+ID/call-ID mapping because the membership schema has no attempt-ID column.
+Attempt dimensions cover canonical keys plus attempt, failure/retry, token-
+known/token-sum, cost-kind/cost-count/cost-amount and TTFT summaries. Formal
+reference state also requires zero corrections and zero rate cards.
+
+Every expensive integrity statement has a formal-local bounded statement
+timeout. Evidence records elapsed milliseconds, missing/extra counts, and
+`EXPLAIN (FORMAT JSON)` plan/index evidence for the set-based checks. The
+checks run against the same MVCC snapshot, avoiding a preflight assembled from
+different database states.
+
+### Strengthening implementation plan
+
+1. Add RED tests that reject wrong formal users/history on both fresh and
+   resume paths, and require the final gate to bind all four constants plus
+   healthy pre/post integrity. Implement the minimal config/final-gate locks.
+2. Add RED tests for a pure deterministic seed-formula calculator, including
+   the fixed 739,736 cohort and 8,208 raw-edge result. Implement the cached
+   formula and replace permissive snapshot source checks with exact equality.
+3. Add RED tests for same-count source-time, daily key/aggregate, attempt
+   dimension and membership-day corruption. Implement bounded, set-based,
+   bidirectional DB checks and auditable plan/timing evidence in one read-only
+   repeatable-read transaction.
+4. Add spy RED tests for invalid, validation-only, producer-failure,
+   postvalidation-failure and successful resume ordering. Implement the
+   pre/producer/post gate, immutable snapshot comparison, and arm cleanup only
+   after complete postvalidation.
+5. Add final-gate RED tests for config and pre/post evidence mismatch, update
+   the report evidence shape, and run focused tests after every GREEN cycle.
+6. Run the real `--validate-resume-only` command, never formal resume; then run
+   the complete focused suite, Ruff, compileall, harness self-test and
+   diff-check before committing implementation.
