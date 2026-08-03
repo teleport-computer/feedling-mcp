@@ -12,6 +12,7 @@ _HEALTH_HISTORY = frozenset({
     "health_vitals", "health_sleep", "health_workout", "health_activity",
     "health_body", "health_metabolic", "health_cycle",
 })
+_EXPIRED_MARKERS = frozenset({"expired", "stale", "is_expired", "is_stale"})
 _EVENT_FIELDS = {
     "unlock_after_absence": {"trigger": "unlock_after_absence", "returned_after_absence": True},
     "arrived_at_anchor": {"trigger": "arrived_at_anchor", "anchor_changed": True},
@@ -20,35 +21,57 @@ _EVENT_FIELDS = {
 }
 
 
-def _present(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, bool):
-        return True
-    if isinstance(value, (int, float)):
-        return math.isfinite(float(value))
-    if isinstance(value, str):
-        return bool(value.strip())
-    if isinstance(value, Mapping):
-        return any(_present(item) for item in value.values())
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return any(_present(item) for item in value)
-    return False
+def _finite_number(value: Any) -> bool:
+    return type(value) in {int, float} and math.isfinite(float(value))
+
+
+def _text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _sequence(value: Any) -> bool:
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)) and bool(value)
+
+
+def _event(value: Any) -> bool:
+    return isinstance(value, Mapping) and any((
+        _text(value.get("title")),
+        _text(value.get("start_time")),
+        _finite_number(value.get("starts_in_min")),
+        _finite_number(value.get("minutes_until_start")),
+    ))
 
 
 def _doc(signals: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     value = signals.get(name)
-    if not isinstance(value, Mapping) or value.get("disabled") is True:
+    if (
+        not isinstance(value, Mapping)
+        or value.get("disabled") is True
+        or value.get("fresh") is False
+        or any(value.get(marker) is True for marker in _EXPIRED_MARKERS)
+    ):
         return {}
     return value
 
 
-def _available(doc: Mapping[str, Any]) -> bool:
-    return any(_present(value) for key, value in doc.items() if key not in {"disabled", "reason"})
+def _available(
+    doc: Mapping[str, Any],
+    *,
+    number_fields: Sequence[str] = (),
+    text_fields: Sequence[str] = (),
+    bool_fields: Sequence[str] = (),
+    sequence_fields: Sequence[str] = (),
+    event_fields: Sequence[str] = (),
+) -> bool:
+    return any(_finite_number(doc.get(field)) for field in number_fields) or any(
+        _text(doc.get(field)) for field in text_fields
+    ) or any(type(doc.get(field)) is bool for field in bool_fields) or any(
+        _sequence(doc.get(field)) for field in sequence_fields
+    ) or any(_event(doc.get(field)) for field in event_fields)
 
 
 def _positive_count(value: Any) -> bool:
-    return type(value) in {int, float} and math.isfinite(float(value)) and float(value) > 0
+    return _finite_number(value) and float(value) > 0
 
 
 def build_perception_glance(
@@ -64,36 +87,45 @@ def build_perception_glance(
     }
     out: dict[str, dict[str, bool]] = {}
     location = _doc(safe_signals, "location")
-    if _available(location):
+    if _available(location, text_fields=("place_label", "wifi_label", "country", "locality", "wifi_anchor_id")):
         out["location"] = {"available": True, "notable_change": "location_signal" in changed}
     now = _doc(safe_signals, "now")
     playing = now.get("now_playing")
-    if _present(playing):
+    if isinstance(playing, Mapping) and _available(playing, text_fields=("title", "artist", "album", "playback_state")):
         out["media"] = {"available": True, "active": True, "notable_change": "playback" in changed}
     app = _doc(safe_signals, "app")
-    if _available(app):
+    if _available(app, text_fields=("app_name", "app_category", "app_state")):
         out["app"] = {"available": True, "recent_activity": True}
     health_docs = [_doc(safe_signals, name) for name in _HEALTH_SIGNALS]
-    if any(_available(value) for value in health_docs):
+    if any((
+        _available(health_docs[0], number_fields=("step_count",)),
+        _available(health_docs[1], number_fields=("asleep_minutes", "core_minutes", "deep_minutes", "rem_minutes")),
+        _available(health_docs[2], number_fields=("duration_min", "count_today"), text_fields=("workout_type",)),
+        _available(health_docs[3], number_fields=("resting_heart_rate", "step_count", "current_heart_rate", "hrv_sdnn_ms", "respiratory_rate", "oxygen_saturation_pct", "vo2_max")),
+        _available(health_docs[4], number_fields=("active_energy_kcal", "exercise_minutes", "stand_minutes", "mindful_minutes")),
+        _available(health_docs[5], number_fields=("weight_kg", "bmi", "body_fat_pct", "height_cm")),
+        _available(health_docs[6], number_fields=("blood_glucose_mmol_l", "blood_pressure_systolic", "blood_pressure_diastolic")),
+        _available(health_docs[7], text_fields=("flow_level",), bool_fields=("is_active_period",)),
+    )):
         out["health"] = {"available": True, "notable_change": bool(changed & _HEALTH_HISTORY)}
     weather = _doc(safe_signals, "weather")
-    if _available(weather):
+    if _available(weather, number_fields=("temperature", "apparent_temperature", "humidity", "precipitation_chance", "uv_index"), text_fields=("condition",), bool_fields=("is_daylight",), sequence_fields=("alerts",)):
         out["weather"] = {"available": True, "notable_change": "weather" in changed}
     mood = _doc(safe_signals, "mood")
-    if _available(mood):
+    if _available(mood, number_fields=("valence", "label_count"), text_fields=("valence_classification", "kind"), bool_fields=("recorded_today",)):
         out["mood"] = {"available": True, "recorded": mood.get("recorded_today") is True}
     reminders = _doc(safe_signals, "reminders")
-    if _available(reminders):
+    if _available(reminders, number_fields=("overdue_count", "due_today_count"), text_fields=("next_reminder",), bool_fields=("reminders_truncated",), sequence_fields=("reminders",)):
         out["reminders"] = {
             "available": True,
             "has_due": _positive_count(reminders.get("due_today_count")),
             "has_overdue": _positive_count(reminders.get("overdue_count")),
         }
     calendar = _doc(safe_signals, "calendar")
-    if _available(calendar):
+    if _available(calendar, sequence_fields=("calendar_events",), event_fields=("calendar_next_event",)):
         out["calendar"] = {
             "available": True,
-            "has_upcoming": _present(calendar.get("calendar_next_event")) or _present(calendar.get("calendar_events")),
+            "has_upcoming": _event(calendar.get("calendar_next_event")) or _sequence(calendar.get("calendar_events")),
         }
     return out
 

@@ -55,6 +55,33 @@ def test_disabled_null_and_non_finite_docs_are_unavailable():
     }) == {}
 
 
+def test_explicitly_expired_or_stale_docs_are_unavailable():
+    assert build_perception_glance({
+        "location": {"expired": True, "place_label": "home"},
+        "weather": {"stale": True, "temperature": 20.0},
+        "steps": {"fresh": False, "step_count": 42},
+    }) == {}
+
+
+def test_malformed_or_arbitrary_fields_do_not_make_domains_available():
+    assert build_perception_glance({
+        "location": {"unexpected": "private"},
+        "weather": {"temperature": "not-a-temperature"},
+        "app": {"app_name": 42},
+        "steps": {"step_count": "many"},
+        "mood": {"recorded_today": "yes"},
+        "reminders": {"due_today_count": "four"},
+        "calendar": {"calendar_events": "private"},
+    }) == {}
+
+
+def test_steps_notable_change_uses_the_canonical_health_vitals_signal():
+    assert build_perception_glance(
+        {"steps": {"step_count": 42}},
+        notable_changes=[{"signal": "health_vitals"}],
+    ) == {"health": {"available": True, "notable_change": True}}
+
+
 def test_event_projection_is_allowlist_only():
     assert project_perception_wake_events([
         {"trigger": "photo_added", "change_digest": "battery 17", "origin_refs": ["photo:secret"]},
