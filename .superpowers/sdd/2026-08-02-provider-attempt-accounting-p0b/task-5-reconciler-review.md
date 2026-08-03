@@ -200,3 +200,73 @@ a static old-threshold regression rather than proof of sustained-load capacity.
   failure-cadence finding.
 
 No test or prod RDS was accessed.
+
+---
+
+## Final re-review — commit `80c38c78`
+
+### Final verdict
+
+- **Spec review: PASS**
+- **Code-quality review: PASS**
+
+The remaining mixed-lane cadence finding is closed. All three Important findings
+from the original review are now resolved.
+
+### Per-lane cadence verification
+
+The worker now stores one `time.monotonic()` next-eligible deadline per reporting
+lane (`backend/model_api_runtime/v2/serve_worker.py:4221-4236`). After a tick,
+each eligible lane receives its own deadline from its own result
+(`serve_worker.py:4258-4268`):
+
+- successful pending work receives the bounded catch-up delay;
+- clean success, error, lock contention, cancellation-like results, or any other
+  non-`ok` status receive the normal cadence;
+- a missing result is synthesized as `LaneUnavailable` and receives the normal
+  cadence;
+- an exception escaping the combined tick assigns the normal cadence to every
+  lane that was eligible for that tick (`serve_worker.py:4291-4298`).
+
+The next sleep is the smallest nonnegative difference between an enabled lane's
+deadline and the current monotonic clock (`serve_worker.py:4304-4315`). This
+allows a successful pending lane to catch up without re-invoking a failed sibling.
+The real async mixed-lane regression runs the pending usage lane at least three
+times while asserting the failed attempt lane ran exactly once
+(`tests/test_provider_attempt_rollup_reconciler.py:535-573`).
+
+### Boundary audit
+
+- **Monotonic time:** deadlines, comparisons, and elapsed waits use
+  `time.monotonic()`; wall-clock changes cannot accelerate retries.
+- **Disabled/re-enabled:** disabled lanes are excluded from both eligibility and
+  next-wakeup selection. Re-enabling preserves a future prior backoff; if its
+  old deadline has elapsed, the lane becomes eligible immediately. If every lane
+  is disabled, the loop sleeps the ordinary cadence rather than spinning.
+- **Missing result:** an eligible lane omitted from `results` is treated as an
+  error and backed off for the normal cadence.
+- **Outer exception:** every lane selected for the failed combined tick receives
+  a normal-cadence deadline before the loop continues.
+- **Cancel/stop:** a stop signal sets the cooperative cancellation event, drains
+  the thread, and breaks; task cancellation signals, drains, and re-raises.
+  Neither path returns to a zero-delay iteration.
+- **No eligible lane:** sleep duration is derived from the nearest future
+  deadline; it cannot busy-spin unless that lane is actually due, after which
+  every completed/error path advances its deadline again.
+
+An `enabled()` implementation raising before tick creation remains outside the
+loop's exception boundary, but both current implementations are pure bounded
+environment parsers and do not perform I/O. This is not a blocking regression
+or a realistic failure mode for the reviewed change.
+
+### Fresh verification for `80c38c78`
+
+- Local PostgreSQL focused suites — reconciler, 0077 migration, rollup builder,
+  and V2 worker: **110 passed**, 29 warnings.
+- The listener-shutdown warning occurred after the successful test summary and
+  is the existing local wake-bus teardown behavior, not a test failure.
+- Prior global-budget/fairness, overflow/replay, exact-index/recovery/plan, and
+  static 2,101-row PostgreSQL regressions remain included in this fresh run.
+
+No implementation code was changed by this review. No test or prod RDS was
+accessed.
