@@ -2,6 +2,89 @@
 
 Reviewed commit: `deff128524dea481e85c32e9a4943db1c1bb211d`
 
+## Final single-workflow review of `14935cf2` + `a8a6db87`
+
+### Verdict
+
+- **Spec: PASS**
+- **Quality: PASS**
+- **Ready for the destructive formal resume: YES**
+- **P0-B release evidence still requires the fresh formal 3M artifact**
+
+The change closes the sole blocker from `0b4a7cb4`.  Production `_run` now
+constructs the five domain callbacks and invokes `_execute_scale_workflow`
+exactly once.  The duplicate production phase/error/cleanup/business state
+machine has been removed; repository search finds one production helper call
+and no copied workflow owner.
+
+### C1 — CLOSED: one tested state machine owns production evidence
+
+The helper is now the sole owner of phase trace, cleanup arming/status/failure,
+fixture-post and business pre/post counts, business status/result, failure
+classification, and terminal phase.  `_run` derives top-level `business_path`
+from the helper's same `business_result`; successful evidence contains the
+literal `pool` and `business` pair, while every pre-business or producer
+failure retains `business_result=null`.  Helper and production schemas no
+longer diverge.
+
+The preparation safety boundaries are correct:
+
+- Fresh preparation verifies the database is empty, calls `arm_cleanup()`
+  immediately before `_seed_fixture`, and then seeds.  A partial seed failure
+  therefore enters the helper's armed cleanup `finally`.
+- Resume preparation collects and fully validates the exact snapshot first,
+  records its preexisting counts and exact-prevalidated evidence, and only then
+  arms cleanup.  Invalid exact validation cannot mutate or delete the retained
+  fixture.
+- Validation-only keeps its separate read-only early return and never enters
+  the workflow.
+
+Seven entry scenarios execute the real `_run`, real helper, and real atomic
+writer: fresh success, resume success, timing failure, cleanup failure,
+business failure, invalid resume, and validation-only.  The three failure
+cases parse the produced JSON and prove producer prohibition or post-count
+`finally` ordering as applicable.  Invalid resume proves cleanup remains
+unarmed and no misleading exact-prevalidated value is emitted.  Success proves
+the callback sequence is cleanup, fixture-post count, business-pre count,
+producer, and business-post count.
+
+### Existing gates and producer proof
+
+- All three global maps still contain the twelve database counters and must be
+  present and zero: fixture-post, business-pre, and business-post.
+- Producer rollup/dirty state cleanup remains in its own `finally`; the global
+  business-post gate independently proves zero residual state.
+- Business evidence remains validated against the full current Git commit and
+  top-level evidence is derived from that validated producer result.
+- The serialization witness captures malformed-item consumption at the
+  injection boundary, so later normal queue activity cannot invalidate it.
+- Formal 3M/3M/2,000/365 configuration, exact resume user/source/rollup/
+  membership comparisons, single RR/RO snapshot with 180-second statement
+  bounds, strict timing/plan gates, and final exact-prevalidation gate are
+  unchanged.
+
+### Verification
+
+- `tests/test_provider_attempt_business_path.py` and
+  `tests/test_admin_usage.py`: **240 passed in 11.64s** against the dedicated
+  local PostgreSQL test instance.
+- `/private/tmp/admin-usage-single-workflow-probe.json` was inspected.  Its
+  100-turn/100-attempt non-formal workflow is complete, business status passes,
+  `business_result` contains `pool` and `business`, top-level business evidence
+  is the same object, and each twelve-counter fixture-post/business-pre/
+  business-post map is all zero.  Report p95 is 27.456 ms unfiltered and
+  22.666 ms filtered; exit 1 is solely the permanent non-formal gate.
+- `git diff 0b4a7cb4 a8a6db87 --check`: passed.
+- No formal run or cleanup of the retained 3M fixture was performed.  The
+  existing untracked business-path evidence file was untouched.
+
+### Final ready verdict
+
+**Ready for the destructive formal resume.**  Formal success must still be
+established by a fresh reviewed-commit artifact with exact 3M/3M source,
+strict sub-3,000 ms cohorts, all exact/plan/business/workflow gates passing,
+and zero residual state after cleanup.
+
 ## Unified-order review of `8fd9154c` + `ff382933`
 
 ### Verdict
