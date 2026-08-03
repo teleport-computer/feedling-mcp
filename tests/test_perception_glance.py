@@ -66,12 +66,12 @@ def test_explicitly_expired_or_stale_docs_are_unavailable():
 def test_malformed_or_arbitrary_fields_do_not_make_domains_available():
     assert build_perception_glance({
         "location": {"unexpected": "private"},
-        "weather": {"temperature": "not-a-temperature"},
+        "weather": {"temperature": "not-a-temperature", "alerts": ["private"]},
         "app": {"app_name": 42},
         "steps": {"step_count": "many"},
         "mood": {"recorded_today": "yes"},
-        "reminders": {"due_today_count": "four"},
-        "calendar": {"calendar_events": "private"},
+        "reminders": {"due_today_count": "four", "reminders": ["private"]},
+        "calendar": {"calendar_events": ["private"]},
     }) == {}
 
 

@@ -5,7 +5,7 @@ from collections.abc import Mapping, Sequence
 import hashlib
 import json
 import math
-from typing import Any
+from typing import Any, Callable
 
 _HEALTH_SIGNALS = ("steps", "sleep", "workout", "vitals", "activity", "body", "metabolic", "cycle")
 _HEALTH_HISTORY = frozenset({
@@ -29,8 +29,12 @@ def _text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def _sequence(value: Any) -> bool:
-    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)) and bool(value)
+def _items(value: Any, predicate: Callable[[Any], bool]) -> bool:
+    return (
+        isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes, bytearray))
+        and any(predicate(item) for item in value)
+    )
 
 
 def _event(value: Any) -> bool:
@@ -40,6 +44,21 @@ def _event(value: Any) -> bool:
         _finite_number(value.get("starts_in_min")),
         _finite_number(value.get("minutes_until_start")),
     ))
+
+
+def _reminder(value: Any) -> bool:
+    return isinstance(value, Mapping) and any((
+        _text(value.get("title")),
+        _text(value.get("due_time")),
+        _text(value.get("due_date")),
+        type(value.get("overdue")) is bool,
+    ))
+
+
+def _alert(value: Any) -> bool:
+    return isinstance(value, Mapping) and any(
+        _text(value.get(field)) for field in ("title", "summary", "headline", "description", "severity")
+    )
 
 
 def _doc(signals: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -60,14 +79,13 @@ def _available(
     number_fields: Sequence[str] = (),
     text_fields: Sequence[str] = (),
     bool_fields: Sequence[str] = (),
-    sequence_fields: Sequence[str] = (),
     event_fields: Sequence[str] = (),
 ) -> bool:
     return any(_finite_number(doc.get(field)) for field in number_fields) or any(
         _text(doc.get(field)) for field in text_fields
     ) or any(type(doc.get(field)) is bool for field in bool_fields) or any(
-        _sequence(doc.get(field)) for field in sequence_fields
-    ) or any(_event(doc.get(field)) for field in event_fields)
+        _event(doc.get(field)) for field in event_fields
+    )
 
 
 def _positive_count(value: Any) -> bool:
@@ -109,23 +127,33 @@ def build_perception_glance(
     )):
         out["health"] = {"available": True, "notable_change": bool(changed & _HEALTH_HISTORY)}
     weather = _doc(safe_signals, "weather")
-    if _available(weather, number_fields=("temperature", "apparent_temperature", "humidity", "precipitation_chance", "uv_index"), text_fields=("condition",), bool_fields=("is_daylight",), sequence_fields=("alerts",)):
+    if _available(
+        weather,
+        number_fields=("temperature", "apparent_temperature", "humidity", "precipitation_chance", "uv_index"),
+        text_fields=("condition",),
+        bool_fields=("is_daylight",),
+    ) or _items(weather.get("alerts"), _alert):
         out["weather"] = {"available": True, "notable_change": "weather" in changed}
     mood = _doc(safe_signals, "mood")
     if _available(mood, number_fields=("valence", "label_count"), text_fields=("valence_classification", "kind"), bool_fields=("recorded_today",)):
         out["mood"] = {"available": True, "recorded": mood.get("recorded_today") is True}
     reminders = _doc(safe_signals, "reminders")
-    if _available(reminders, number_fields=("overdue_count", "due_today_count"), text_fields=("next_reminder",), bool_fields=("reminders_truncated",), sequence_fields=("reminders",)):
+    if _available(
+        reminders,
+        number_fields=("overdue_count", "due_today_count"),
+        text_fields=("next_reminder",),
+        bool_fields=("reminders_truncated",),
+    ) or _items(reminders.get("reminders"), _reminder):
         out["reminders"] = {
             "available": True,
             "has_due": _positive_count(reminders.get("due_today_count")),
             "has_overdue": _positive_count(reminders.get("overdue_count")),
         }
     calendar = _doc(safe_signals, "calendar")
-    if _available(calendar, sequence_fields=("calendar_events",), event_fields=("calendar_next_event",)):
+    if _available(calendar, event_fields=("calendar_next_event",)) or _items(calendar.get("calendar_events"), _event):
         out["calendar"] = {
             "available": True,
-            "has_upcoming": _event(calendar.get("calendar_next_event")) or _sequence(calendar.get("calendar_events")),
+            "has_upcoming": _event(calendar.get("calendar_next_event")) or _items(calendar.get("calendar_events"), _event),
         }
     return out
 
