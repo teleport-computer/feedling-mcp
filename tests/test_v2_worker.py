@@ -444,11 +444,13 @@ def test_process_job_acquires_enclave_semaphore_for_read_messages_and_prefetch(m
 
     Task 7: the old planner-lane memory_index/perception_snapshot prefetches
     are gone (the unified tool loop only fetches what the model actually asks
-    for), so this now drives a 2-round script — a `web_search` tool call, then
-    a terminal reply — to exercise a THIRD enclave-bound call
+    for), so this now drives a 2-round script — an explicitly enabled
+    `web_search` tool call, then a terminal reply — to exercise a THIRD
+    enclave-bound call
     (`executor.dispatch_tool_calls`'s inline read, same `_run_one` capability
     path the old prefetches used) alongside `_coalesce_inputs`'s read_messages
-    and the summary/tail read block, preserving the ">= 3 acquisitions" shape.
+    and the summary/tail read block. Together with the per-round fold described
+    below, that preserves the ">= 4 acquisitions" assertion.
 
     Task 7 FIX (BUG-2): the per-round fold ahead of round 1 (call_idx > 0) is
     now ALSO gated by the same enclave_sem (`_make_fold_new_messages` wraps its
@@ -478,6 +480,7 @@ def test_process_job_acquires_enclave_semaphore_for_read_messages_and_prefetch(m
         resolve_provider=lambda uid_: (_BYOK, {}),
         mint_enclave_token=lambda uid_: "rt",
         apply_pending_effects=_apply_effects,
+        web_tools_enabled=lambda uid_: True,
         # Wired (even trivially) so the summary/tail read block below runs
         # under enclave_sem too — see the docstring's acquisition count.
         read_summary=lambda uid_: ("", 0.0, 0),
