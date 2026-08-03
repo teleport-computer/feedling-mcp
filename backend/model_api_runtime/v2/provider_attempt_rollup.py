@@ -489,7 +489,7 @@ def _upsert_dirty_days(
     )
     watermark = cur.fetchone()
     retained_from = watermark["retained_from"] if watermark else None
-    if retained_from is not None:
+    if retained_from is not None and reason != "source_change":
         rows = [local_day for local_day in rows if local_day >= retained_from]
     if not rows:
         return
@@ -904,7 +904,9 @@ def _run_retention_batch(
         "dimensions_deleted": 0,
         "memberships_deleted": 0,
         "dirty_days_deleted": 0,
+        "corrections_cascaded": 0,
         "retained_from": None,
+        "retention_pending_from": None,
     }
     if max_rows <= 0:
         return {**empty, "status": "ok"}
@@ -914,119 +916,106 @@ def _run_retention_batch(
                 _set_transaction(cur, timeout_ms)
                 state = _watermark_on_cursor(cur, for_update=True)
                 published = state["retained_from"]
-                if published is not None and cutoff <= published:
-                    return {
-                        **empty,
-                        "status": "ok",
-                        "complete": True,
-                        "retained_from": published,
-                    }
-                effective_cutoff = max(cutoff, published) if published else cutoff
+                pending = state["retention_pending_from"]
+                effective_cutoff = max(
+                    value for value in (cutoff, published, pending) if value is not None
+                )
                 cutoff_at, _ = _local_day_bounds(effective_cutoff)
-                published_at = (
-                    _local_day_bounds(published)[0]
-                    if published is not None else None
-                )
                 if _cancel_requested(cancel_event):
                     raise _RetentionCancelled
-                lower_turn = (
-                    "AND m.created_at>=%s " if published_at is not None else ""
-                )
-                candidate_job_limit = min(max_rows * 4, 40_000)
-                attempt_delete_job = (
-                    "WITH old_jobs AS MATERIALIZED (SELECT m.job_id,m.created_at "
-                    "FROM v2_turn_metrics m WHERE m.created_at<%s "
-                    + lower_turn
-                    + "AND EXISTS (SELECT 1 FROM llm_provider_attempts eligible "
-                    "WHERE eligible.job_id=m.job_id "
-                    "AND eligible.job_id IS NOT NULL "
-                    "AND eligible.source='runtime_recorder' OFFSET 0) "
-                    "ORDER BY m.created_at DESC,m.id DESC LIMIT %s), "
-                    "picked AS (SELECT a.attempt_id FROM old_jobs m "
-                    "JOIN LATERAL (SELECT candidate.attempt_id "
-                    "FROM llm_provider_attempts candidate "
-                    "WHERE candidate.job_id=m.job_id "
-                    "AND candidate.job_id IS NOT NULL "
-                    "AND candidate.source='runtime_recorder' OFFSET 0) candidate "
-                    "ON true JOIN llm_provider_attempts a "
-                    "ON a.attempt_id=candidate.attempt_id "
-                    "ORDER BY m.created_at DESC,a.attempt_id "
-                    "FOR UPDATE OF a SKIP LOCKED LIMIT %s), deleted AS ("
-                    "DELETE FROM llm_provider_attempts a USING picked p "
-                    "WHERE a.attempt_id=p.attempt_id RETURNING 1) "
-                    "SELECT count(*)::int AS count FROM deleted"
-                )
-                _retention_sql_observer(
-                    section="attempt_delete_job", statement=attempt_delete_job
-                )
-                job_params: tuple[object, ...] = (
-                    (cutoff_at, published_at, candidate_job_limit, max_rows)
-                    if published_at is not None
-                    else (cutoff_at, candidate_job_limit, max_rows)
-                )
-                cur.execute(attempt_delete_job, job_params)
-                attempts_deleted = int(cur.fetchone()["count"])
-
-                remaining_limit = max_rows - attempts_deleted
-                attempt_delete_orphan = (
-                    "WITH picked AS (SELECT a.attempt_id "
-                    "FROM llm_provider_attempts a "
-                    "WHERE a.source='runtime_recorder' AND a.started_at<%s "
-                    + ("AND a.started_at>=%s " if published_at is not None else "")
-                    + "AND NOT EXISTS (SELECT 1 FROM v2_turn_metrics m "
-                    "WHERE m.job_id=a.job_id) "
-                    "ORDER BY a.started_at DESC,a.attempt_id "
-                    "FOR UPDATE OF a SKIP LOCKED LIMIT %s), deleted AS ("
-                    "DELETE FROM llm_provider_attempts a USING picked p "
-                    "WHERE a.attempt_id=p.attempt_id RETURNING 1) "
-                    "SELECT count(*)::int AS count FROM deleted"
-                )
-                _retention_sql_observer(
-                    section="attempt_delete_orphan",
-                    statement=attempt_delete_orphan,
-                )
-                orphan_params: tuple[object, ...] = (
-                    (cutoff_at, published_at, remaining_limit)
-                    if published_at is not None
-                    else (cutoff_at, remaining_limit)
-                )
-                cur.execute(
-                    attempt_delete_orphan,
-                    orphan_params,
-                )
-                attempts_deleted += int(cur.fetchone()["count"])
-                _retention_sql_observer(
-                    section="after_attempt_delete", statement=None
-                )
-                if _cancel_requested(cancel_event):
-                    raise _RetentionCancelled
-
-                deleted: dict[str, int] = {}
-                for key, table, extra_where in (
-                    ("dimensions", "llm_usage_daily_attempt_dimensions", ""),
-                    ("memberships", "llm_usage_daily_call_memberships", ""),
-                    (
-                        "dirty_days",
-                        "llm_usage_rollup_dirty_days",
-                        " AND rollup_name=%s",
-                    ),
-                ):
-                    params: tuple[object, ...]
-                    if extra_where:
-                        params = (effective_cutoff, ROLLUP_NAME, max_rows)
+                deleted = {
+                    "attempts": 0,
+                    "dimensions": 0,
+                    "memberships": 0,
+                    "dirty_days": 0,
+                }
+                corrections_cascaded = 0
+                targets = ("attempts", "dimensions", "memberships", "dirty_days")
+                start = int(state["version"]) % len(targets)
+                ordered_targets = targets[start:] + targets[:start]
+                budget = max_rows
+                for index, key in enumerate(ordered_targets):
+                    if budget <= 0:
+                        break
+                    quota = max(1, budget // (len(ordered_targets) - index))
+                    if key == "attempts":
+                        attempt_delete_job = (
+                            "WITH picked AS MATERIALIZED (SELECT a.attempt_id "
+                            "FROM v2_turn_metrics m JOIN llm_provider_attempts a "
+                            "ON a.job_id=m.job_id WHERE m.created_at<%s "
+                            "AND a.source='runtime_recorder' "
+                            "ORDER BY m.created_at DESC,a.attempt_id "
+                            "FOR UPDATE OF a SKIP LOCKED LIMIT %s), "
+                            "correction_count AS MATERIALIZED (SELECT count(*)::int AS count "
+                            "FROM llm_provider_attempt_corrections c JOIN picked p "
+                            "ON p.attempt_id=c.attempt_id), deleted AS ("
+                            "DELETE FROM llm_provider_attempts a USING picked p "
+                            "WHERE a.attempt_id=p.attempt_id RETURNING 1) "
+                            "SELECT count(*)::int AS count,"
+                            "(SELECT count FROM correction_count) AS corrections FROM deleted"
+                        )
+                        _retention_sql_observer(
+                            section="attempt_delete_job", statement=attempt_delete_job
+                        )
+                        cur.execute(attempt_delete_job, (cutoff_at, quota))
+                        row = cur.fetchone()
+                        deleted[key] = int(row["count"])
+                        corrections_cascaded += int(row["corrections"])
+                        orphan_quota = quota - deleted[key]
+                        attempt_delete_orphan = (
+                            "WITH picked AS MATERIALIZED (SELECT a.attempt_id "
+                            "FROM llm_provider_attempts a "
+                            "WHERE a.source='runtime_recorder' AND a.started_at<%s "
+                            "AND NOT EXISTS (SELECT 1 FROM v2_turn_metrics m "
+                            "WHERE m.job_id=a.job_id) "
+                            "ORDER BY a.started_at DESC,a.attempt_id "
+                            "FOR UPDATE OF a SKIP LOCKED LIMIT %s), "
+                            "correction_count AS MATERIALIZED (SELECT count(*)::int AS count "
+                            "FROM llm_provider_attempt_corrections c JOIN picked p "
+                            "ON p.attempt_id=c.attempt_id), deleted AS ("
+                            "DELETE FROM llm_provider_attempts a USING picked p "
+                            "WHERE a.attempt_id=p.attempt_id RETURNING 1) "
+                            "SELECT count(*)::int AS count,"
+                            "(SELECT count FROM correction_count) AS corrections FROM deleted"
+                        )
+                        _retention_sql_observer(
+                            section="attempt_delete_orphan",
+                            statement=attempt_delete_orphan,
+                        )
+                        if orphan_quota > 0:
+                            cur.execute(attempt_delete_orphan, (cutoff_at, orphan_quota))
+                            row = cur.fetchone()
+                            deleted[key] += int(row["count"])
+                            corrections_cascaded += int(row["corrections"])
                     else:
-                        params = (effective_cutoff, max_rows)
-                    cur.execute(
-                        f"WITH picked AS (SELECT ctid FROM {table} "
-                        f"WHERE local_day<%s{extra_where} ORDER BY local_day,ctid "
-                        "FOR UPDATE SKIP LOCKED LIMIT %s), deleted AS ("
-                        f"DELETE FROM {table} t USING picked p WHERE t.ctid=p.ctid "
-                        "RETURNING 1) SELECT count(*)::int AS count FROM deleted",
-                        params,
-                    )
-                    deleted[key] = int(cur.fetchone()["count"])
+                        table = {
+                            "dimensions": "llm_usage_daily_attempt_dimensions",
+                            "memberships": "llm_usage_daily_call_memberships",
+                            "dirty_days": "llm_usage_rollup_dirty_days",
+                        }[key]
+                        extra_where = " AND rollup_name=%s" if key == "dirty_days" else ""
+                        params: tuple[object, ...] = (
+                            (effective_cutoff, ROLLUP_NAME, quota)
+                            if extra_where
+                            else (effective_cutoff, quota)
+                        )
+                        cur.execute(
+                            f"WITH picked AS (SELECT ctid FROM {table} "
+                            f"WHERE local_day<%s{extra_where} ORDER BY local_day,ctid "
+                            "FOR UPDATE SKIP LOCKED LIMIT %s), deleted AS ("
+                            f"DELETE FROM {table} t USING picked p WHERE t.ctid=p.ctid "
+                            "RETURNING 1) SELECT count(*)::int AS count FROM deleted",
+                            params,
+                        )
+                        deleted[key] = int(cur.fetchone()["count"])
+                    budget -= deleted[key]
                     _retention_sql_observer(
-                        section=f"after_{key}_delete", statement=None
+                        section=(
+                            "after_attempt_delete"
+                            if key == "attempts"
+                            else f"after_{key}_delete"
+                        ),
+                        statement=None,
                     )
                     if _cancel_requested(cancel_event):
                         raise _RetentionCancelled
@@ -1035,13 +1024,9 @@ def _run_retention_batch(
                     "SELECT "
                     "(EXISTS (SELECT 1 FROM v2_turn_metrics m "
                     "JOIN llm_provider_attempts a ON a.job_id=m.job_id "
-                    "WHERE m.created_at<%s "
-                    + lower_turn
-                    + "AND a.source='runtime_recorder') OR "
+                    "WHERE m.created_at<%s AND a.source='runtime_recorder') OR "
                     "EXISTS (SELECT 1 FROM llm_provider_attempts a "
                     "WHERE a.source='runtime_recorder' AND a.started_at<%s "
-                    + ("AND a.started_at>=%s " if published_at is not None else "")
-                    +
                     "AND NOT EXISTS (SELECT 1 FROM v2_turn_metrics m "
                     "WHERE m.job_id=a.job_id))) AS attempts,"
                     "EXISTS (SELECT 1 FROM llm_usage_daily_attempt_dimensions "
@@ -1050,17 +1035,13 @@ def _run_retention_batch(
                     "WHERE local_day<%s) AS memberships,"
                     "EXISTS (SELECT 1 FROM llm_usage_rollup_dirty_days "
                     "WHERE rollup_name=%s AND local_day<%s) AS dirty_days",
-                    tuple(
-                        [cutoff_at]
-                        + ([published_at] if published_at is not None else [])
-                        + [cutoff_at]
-                        + ([published_at] if published_at is not None else [])
-                        + [
-                            effective_cutoff,
-                            effective_cutoff,
-                            ROLLUP_NAME,
-                            effective_cutoff,
-                        ]
+                    (
+                        cutoff_at,
+                        cutoff_at,
+                        effective_cutoff,
+                        effective_cutoff,
+                        ROLLUP_NAME,
+                        effective_cutoff,
                     ),
                 )
                 remaining = cur.fetchone()
@@ -1071,7 +1052,8 @@ def _run_retention_batch(
                 if complete:
                     cur.execute(
                         "UPDATE llm_usage_rollup_watermarks SET retained_from=%s,"
-                        "version=version+1,updated_at=%s WHERE rollup_name=%s "
+                        "retention_pending_from=NULL,version=version+1,updated_at=%s "
+                        "WHERE rollup_name=%s "
                         "AND version=%s RETURNING retained_from",
                         (
                             effective_cutoff,
@@ -1084,14 +1066,34 @@ def _run_retention_batch(
                     if updated is None:
                         raise _CASConflict("attempt retention watermark changed")
                     retained_from = updated["retained_from"]
+                    pending = None
+                else:
+                    cur.execute(
+                        "UPDATE llm_usage_rollup_watermarks SET "
+                        "retention_pending_from=%s,version=version+1,updated_at=%s "
+                        "WHERE rollup_name=%s AND version=%s "
+                        "RETURNING retention_pending_from",
+                        (
+                            effective_cutoff,
+                            now_utc,
+                            ROLLUP_NAME,
+                            state["version"],
+                        ),
+                    )
+                    updated = cur.fetchone()
+                    if updated is None:
+                        raise _CASConflict("attempt retention watermark changed")
+                    pending = updated["retention_pending_from"]
                 return {
                     "status": "ok",
                     "complete": complete,
-                    "attempts_deleted": attempts_deleted,
+                    "attempts_deleted": deleted["attempts"],
                     "dimensions_deleted": deleted["dimensions"],
                     "memberships_deleted": deleted["memberships"],
                     "dirty_days_deleted": deleted["dirty_days"],
+                    "corrections_cascaded": corrections_cascaded,
                     "retained_from": retained_from,
+                    "retention_pending_from": pending,
                 }
     except _RetentionCancelled:
         return {**empty, "status": "cancelled"}
@@ -1283,7 +1285,8 @@ def run_maintenance_tick(
                     ).fetchone()[0]
                 )
                 retention = None
-                if not dirty_pending and retention_limit > 0:
+                source_backlog = any(state.get("_source_backlog", {}).values())
+                if not dirty_pending and not source_backlog and retention_limit > 0:
                     cutoff = now.astimezone(LOCAL_TIMEZONE).date() - timedelta(
                         days=retention_days()
                     )

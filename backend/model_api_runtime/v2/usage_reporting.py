@@ -18,6 +18,7 @@ class RollupPartition:
     rollup_days: tuple[date, ...]
     raw_days: tuple[date, ...]
     retained_from: date | None = None
+    retention_pending_from: date | None = None
     retention_truncated: bool = False
     retention_partial_reason: str | None = None
 

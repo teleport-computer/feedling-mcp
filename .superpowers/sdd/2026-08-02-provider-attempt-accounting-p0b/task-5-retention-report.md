@@ -18,13 +18,16 @@ proof or open/update a PR.
   are owned by authoritative `v2_turn_metrics.created_at`; attempts with no
   matching whole-turn row use `started_at` conservatively.
 - Retention runs only after the current tick has rebuilt every eligible dirty
-  day. Replay, source discovery, and dirty selection exclude days before an
-  already-published `retained_from`.
+  day and every source cursor reports no backlog. Replay/bootstrap avoids
+  rebuilding retained-out days, while late source-change claims below a
+  published boundary remain durable until retention consumes them.
 - Parent attempts are selected with bounded `FOR UPDATE OF a SKIP LOCKED`
-  batches. Corrections disappear only through the parent FK cascade. Derived
-  dimensions, memberships, and expired dirty claims are pruned in bounded
-  batches in the same transaction.
-- `retained_from` advances only after the transaction proves there are no
+  batches. One rotating global budget is shared fairly by parents, dimensions,
+  memberships, and dirty claims. Corrections disappear only through the parent
+  FK cascade and are reported separately from explicit budget consumption.
+- The first incomplete destructive page publishes `retention_pending_from` in
+  the same transaction as its deletes. `retained_from` advances only after the
+  transaction proves there are no
   eligible parent attempts or derived rows left. A locked row, SQL error,
   timeout, cancellation, or CAS loss prevents publication and rolls back the
   page. A previously published boundary never regresses.
@@ -33,25 +36,52 @@ proof or open/update a PR.
 
 ## Bounded plan and steady state
 
-The job-backed delete first takes a bounded newest-first page of expired
-whole-turn jobs from `ix_v2_turn_metrics_created_at`, then performs parameterized
-lookups through `ix_llm_provider_attempts_runtime_job`. The orphan branch uses a
+The job-backed delete takes a bounded newest-first page through
+`ix_v2_turn_metrics_created_at` and `ix_llm_provider_attempts_runtime_job`.
+Matched and orphan proofs continue below an already-published boundary, so late
+attempts and corrected turn dates cannot become permanently invisible. The
+orphan branch uses a
 new exact partial current-RDS index,
 `ix_llm_provider_attempts_retention_started`, on
 `(started_at, attempt_id) INCLUDE (job_id)` for canonical runtime rows. An
 EXPLAIN regression with a 3,001-row skewed fixture requires all three indexes.
-Once a cutoff is published, repeated ticks on the same Shanghai day are a
-watermark-only no-op; the next day scans only the newly expired interval.
+Repeated same-cutoff ticks retain bounded late-data probes rather than using an
+unsafe watermark fast path.
 
 ## Coverage payload
 
 Admin hybrid/raw attempt payloads now expose `retained_from`,
+`retention_pending_from`,
 `retention_truncated`, and `retention_partial_reason`. A query crossing the
 boundary keeps the known whole-turn denominator but marks logical-call coverage
 unavailable and attempt totals partial; missing retained-out rows are never
 rendered as complete zero. The Admin HTML explains the boundary. Runtime health
 exports the same retention coverage and sets per-lane logical coverage to
-`None` with an explicit reason instead of `0`.
+`None` with an explicit reason instead of `0`. UTC and arbitrary IANA display
+timezones compare against Shanghai retention midnight, crop only the published
+interval, and preserve surviving raw rows while a pending fence is active.
+
+## Independent review hardening
+
+The follow-up review findings C1-C3 and I1 are covered by RED-to-GREEN tests:
+
+- a late orphan and a matched turn moved behind `retained_from` are deleted
+  before the next cutoff publishes;
+- multi-page deletion publishes an atomic pending fence, including a
+  repeatable-read test proving no intermediate reader state;
+- UTC and America/Los_Angeles queries crossing the Shanghai boundary expose the
+  same partial reason, denominator, and unavailable ratio;
+- `max_retention_rows=1` never explicitly mutates more than one target row per
+  tick and rotating progress reaches every target; correction cascades are
+  measured separately.
+
+I2 remains a formal-run gate rather than an invented local result. The opt-in
+3M harness verifies the exact retention-index definition under the normal
+planner and records index bytes, bytes per attempt, share of attempt-table
+bytes, and maintenance counters. It fails closed unless JSON evidence also
+supplies pool peak/capacity/timeouts and recorder plus OpenRouter/Anthropic/
+Google request counts, p95 latency, business errors, and baseline-result
+equivalence. The formal 3M run was intentionally not run in this task.
 
 ## TDD evidence
 
@@ -72,9 +102,7 @@ Admin/Runtime partial coverage, HTML copy, and the existing account-reset path.
 
 ## Verification
 
-- Focused PostgreSQL/Admin/Runtime/account/worker suite: **331 passed**, 30
-  existing Alembic deprecation warnings.
-- Final Admin + Runtime rerun after denominator hardening: **188 passed**, 2
+- Final retention migration/reconciler/Admin/Runtime suite: **243 passed**, 37
   existing Alembic deprecation warnings.
 - Ruff: passed for all changed Python files.
 - `py_compile`: passed for all changed Python files.

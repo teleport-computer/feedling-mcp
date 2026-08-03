@@ -177,6 +177,7 @@ def test_0077_installs_exact_attempt_rollup_grains_and_durable_cursors():
             "bootstrap_complete",
             "completed_through_day",
             "retained_from",
+            "retention_pending_from",
             "version",
         } <= watermark_columns
 
@@ -424,9 +425,15 @@ def test_0077_retention_orphan_index_is_exact_and_query_uses_it():
             conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
 
 
-def test_0077_repairs_wrong_stale_index_and_refuses_unrelated_owner():
+@pytest.mark.parametrize(
+    "name",
+    [
+        "ix_llm_provider_attempts_stale_started",
+        "ix_llm_provider_attempts_retention_started",
+    ],
+)
+def test_0077_repairs_wrong_partial_index_and_refuses_unrelated_owner(name):
     cfg = _alembic_config()
-    name = "ix_llm_provider_attempts_stale_started"
     try:
         command.downgrade(cfg, "0076_llm_provider_attempts")
         migration = _migration_module()
@@ -607,6 +614,7 @@ def test_0077_downgrade_removes_only_followup_watermark_columns():
             "bootstrap_complete",
             "completed_through_day",
             "retained_from",
+            "retention_pending_from",
             "version",
         } & columns
     finally:

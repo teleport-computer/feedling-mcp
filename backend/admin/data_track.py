@@ -3518,7 +3518,21 @@ def _render_usage_page(
         logical_coverage_reason = attempt_coverage.get(
             "logical_call_coverage_reason"
         )
-        if logical_coverage_reason == "provider_attempt_retention_window_truncated":
+        if logical_coverage_reason == "provider_attempt_retention_pending":
+            logical_coverage_value = "partial / unavailable"
+            pending_from = html.escape(
+                str(
+                    attempt_coverage.get("retention_pending_from")
+                    or "unknown"
+                )
+            )
+            reconciliation_note = (
+                "<b>Provider-attempt retention is in progress</b>: the "
+                f"pending boundary {pending_from} is already fenced while "
+                "bounded deletion continues. Surviving ledger rows remain "
+                "visible, but missing attempts are unknown rather than zero."
+            )
+        elif logical_coverage_reason == "provider_attempt_retention_window_truncated":
             logical_coverage_value = "partial / unavailable"
             retained_from = html.escape(
                 str(attempt_coverage.get("retained_from") or "unknown")

@@ -7,6 +7,7 @@ from decimal import Decimal
 from html import unescape
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -640,6 +641,60 @@ def test_admin_usage_scale_records_and_enforces_rolling_partition():
                 raw_days=partition.raw_days[:1],
             )
         )
+
+
+def test_admin_usage_scale_retention_index_evidence_gate_is_auditable():
+    harness = _load_usage_scale_harness()
+    gate = getattr(harness, "_retention_index_evidence_passed", None)
+    assert gate is not None
+    evidence = {
+        "present": True,
+        "valid": True,
+        "definition_exact": True,
+        "index_bytes": 4096,
+        "attempt_rows": 300_000,
+        "bytes_per_attempt": 0.013653,
+        "attempt_table_total_bytes": 10_000_000,
+        "index_share_of_attempt_total": 0.0004096,
+        "maintenance": {
+            "idx_scan": 2,
+            "idx_tup_read": 20,
+            "idx_tup_fetch": 10,
+        },
+    }
+    assert gate(evidence) is True
+    assert gate({**evidence, "definition_exact": False}) is False
+    assert gate({**evidence, "bytes_per_attempt": None}) is False
+    assert gate({**evidence, "maintenance": {}}) is False
+
+
+def test_admin_usage_scale_business_path_evidence_gate_is_fail_closed():
+    harness = _load_usage_scale_harness()
+    gate = harness._business_path_evidence_passed
+    evidence = {
+        "pool": {"peak_occupancy": 7, "capacity": 20, "timeouts": 0},
+        "recorder": {
+            "requests": 10_000,
+            "p95_ms": 4.2,
+            "business_errors": 0,
+            "results_match_baseline": True,
+        },
+        "providers": {
+            provider: {
+                "requests": 100,
+                "p95_ms": 800.0,
+                "business_errors": 0,
+                "results_match_baseline": True,
+            }
+            for provider in ("openrouter", "anthropic", "google")
+        },
+    }
+    assert gate(evidence) is True
+    assert gate({}) is False
+    assert gate({**evidence, "pool": {**evidence["pool"], "timeouts": 1}}) is False
+    broken = json.loads(json.dumps(evidence))
+    broken["providers"]["anthropic"]["results_match_baseline"] = False
+    assert gate(broken) is False
 
 
 def test_admin_usage_scale_sql_guards_allow_rollup_only_and_bound_raw_ranges():
@@ -1335,6 +1390,186 @@ def test_usage_attempt_partition_intersects_whole_turn_completed_clean_days():
         retention_truncated=True,
         retention_partial_reason="provider_attempt_retention_window_truncated",
     )
+
+
+def test_usage_attempt_partition_pending_fence_falls_back_to_surviving_raw():
+    whole_turn = usage_reporting.RollupPartition(
+        rollup_days=tuple(datetime(2026, 7, day).date() for day in range(1, 5)),
+        raw_days=(),
+    )
+
+    partition = jobs_store._usage_attempt_partition(
+        whole_turn,
+        completed_through_day=datetime(2026, 7, 4).date(),
+        retained_from=datetime(2026, 7, 1).date(),
+        retention_pending_from=datetime(2026, 7, 3).date(),
+        dirty_days=(),
+    )
+
+    assert partition == usage_reporting.RollupPartition(
+        rollup_days=(
+            datetime(2026, 7, 3).date(),
+            datetime(2026, 7, 4).date(),
+        ),
+        raw_days=(
+            datetime(2026, 7, 1).date(),
+            datetime(2026, 7, 2).date(),
+        ),
+        retained_from=datetime(2026, 7, 1).date(),
+        retention_pending_from=datetime(2026, 7, 3).date(),
+        retention_truncated=True,
+        retention_partial_reason="provider_attempt_retention_pending",
+    )
+
+
+@pytest.mark.parametrize("report_timezone", ["UTC", "America/Los_Angeles"])
+def test_usage_attempt_non_shanghai_range_honors_retained_boundary(
+    provider_attempt_usage_rows,
+    report_timezone,
+):
+    retained_from = datetime(2026, 7, 2).date()
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO llm_usage_rollup_watermarks "
+            "(rollup_name,bootstrap_complete,retained_from) VALUES (%s,true,%s) "
+            "ON CONFLICT (rollup_name) DO UPDATE SET "
+            "bootstrap_complete=true,retained_from=excluded.retained_from,"
+            "retention_pending_from=NULL",
+            (provider_attempt_rollup.ROLLUP_NAME, retained_from),
+        )
+    query = _usage.UsageQuery(
+        start_at_utc=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        end_at_utc=datetime(2026, 7, 3, tzinfo=timezone.utc),
+        timezone=report_timezone,
+        user_id=provider_attempt_usage_rows,
+    )
+    try:
+        attempts = jobs_store._usage_report_snapshot_raw(query)["attempts"]
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM llm_usage_rollup_watermarks WHERE rollup_name=%s",
+                (provider_attempt_rollup.ROLLUP_NAME,),
+            )
+
+    assert attempts["overview"]["attempts"] == 0
+    assert attempts["coverage"]["retained_from"] == "2026-07-02"
+    assert attempts["coverage"]["retention_truncated"] is True
+    assert attempts["coverage"]["retention_partial_reason"] == (
+        "provider_attempt_retention_window_truncated"
+    )
+    assert attempts["coverage"]["whole_turn_model_calls"] == 4
+    assert attempts["coverage"]["logical_call_coverage"] is None
+
+
+def test_usage_attempt_pending_fence_keeps_surviving_raw_and_marks_partial(
+    provider_attempt_usage_rows,
+):
+    pending = datetime(2026, 7, 2).date()
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO llm_usage_rollup_watermarks "
+            "(rollup_name,bootstrap_complete,retention_pending_from) "
+            "VALUES (%s,true,%s) ON CONFLICT (rollup_name) DO UPDATE SET "
+            "bootstrap_complete=true,retained_from=NULL,"
+            "retention_pending_from=excluded.retention_pending_from",
+            (provider_attempt_rollup.ROLLUP_NAME, pending),
+        )
+    try:
+        attempts = jobs_store._usage_report_snapshot_raw(
+            _usage_query(user_id=provider_attempt_usage_rows)
+        )["attempts"]
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM llm_usage_rollup_watermarks WHERE rollup_name=%s",
+                (provider_attempt_rollup.ROLLUP_NAME,),
+            )
+
+    assert attempts["overview"]["attempts"] == 3
+    assert attempts["coverage"]["retention_pending_from"] == "2026-07-02"
+    assert attempts["coverage"]["retention_truncated"] is True
+    assert attempts["coverage"]["retention_partial_reason"] == (
+        "provider_attempt_retention_pending"
+    )
+    assert attempts["coverage"]["whole_turn_model_calls"] == 4
+    assert attempts["coverage"]["logical_call_coverage"] is None
+
+
+def test_retention_pending_and_destructive_rows_are_atomically_visible(
+    provider_attempt_usage_rows,
+):
+    pending = datetime(2026, 7, 2).date()
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO llm_usage_rollup_watermarks "
+            "(rollup_name,bootstrap_complete) VALUES (%s,true) "
+            "ON CONFLICT (rollup_name) DO UPDATE SET "
+            "bootstrap_complete=true,retained_from=NULL,retention_pending_from=NULL",
+            (provider_attempt_rollup.ROLLUP_NAME,),
+        )
+    try:
+        with psycopg.connect(os.environ["DATABASE_URL"]) as old_reader:
+            old_reader.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+            )
+            assert old_reader.execute(
+                "SELECT retention_pending_from FROM llm_usage_rollup_watermarks "
+                "WHERE rollup_name=%s",
+                (provider_attempt_rollup.ROLLUP_NAME,),
+            ).fetchone() == (None,)
+            assert old_reader.execute(
+                "SELECT count(*) FROM llm_provider_attempts WHERE user_id=%s",
+                (provider_attempt_usage_rows,),
+            ).fetchone() == (3,)
+
+            with db.get_pool().connection() as writer:
+                with writer.transaction():
+                    writer.execute(
+                        "UPDATE llm_usage_rollup_watermarks SET "
+                        "retention_pending_from=%s WHERE rollup_name=%s",
+                        (pending, provider_attempt_rollup.ROLLUP_NAME),
+                    )
+                    writer.execute(
+                        "DELETE FROM llm_provider_attempts WHERE user_id=%s",
+                        (provider_attempt_usage_rows,),
+                    )
+
+            assert old_reader.execute(
+                "SELECT retention_pending_from FROM llm_usage_rollup_watermarks "
+                "WHERE rollup_name=%s",
+                (provider_attempt_rollup.ROLLUP_NAME,),
+            ).fetchone() == (None,)
+            assert old_reader.execute(
+                "SELECT count(*) FROM llm_provider_attempts WHERE user_id=%s",
+                (provider_attempt_usage_rows,),
+            ).fetchone() == (3,)
+
+        with db.get_pool().connection() as new_reader:
+            assert new_reader.execute(
+                "SELECT retention_pending_from FROM llm_usage_rollup_watermarks "
+                "WHERE rollup_name=%s",
+                (provider_attempt_rollup.ROLLUP_NAME,),
+            ).fetchone() == (pending,)
+            assert new_reader.execute(
+                "SELECT count(*) FROM llm_provider_attempts WHERE user_id=%s",
+                (provider_attempt_usage_rows,),
+            ).fetchone() == (0,)
+        attempts = jobs_store._usage_report_snapshot_raw(
+            _usage_query(user_id=provider_attempt_usage_rows)
+        )["attempts"]
+        assert attempts["overview"]["attempts"] == 0
+        assert attempts["coverage"]["retention_partial_reason"] == (
+            "provider_attempt_retention_pending"
+        )
+        assert attempts["coverage"]["whole_turn_model_calls"] == 4
+        assert attempts["coverage"]["logical_call_coverage"] is None
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM llm_usage_rollup_watermarks WHERE rollup_name=%s",
+                (provider_attempt_rollup.ROLLUP_NAME,),
+            )
 
 
 def test_usage_attempt_payload_marks_cross_retention_range_partial_not_zero(
@@ -2511,6 +2746,38 @@ def test_usage_page_explains_retention_truncated_attempt_totals():
 
     assert "Provider-attempt totals are partial" in body
     assert "retained from 2025-06-29" in body
+    assert "0 / 12" not in body
+
+
+def test_usage_page_explains_pending_retention_without_claiming_zero():
+    report = _usage_render_report()
+    report["attempts"] = {
+        "overview": {"attempts": 0, "logical_calls": 0},
+        "users": [],
+        "lanes": [],
+        "requested_models": [],
+        "resolved_models": [],
+        "costs": [],
+        "coverage": {
+            "whole_turn_model_calls": 12,
+            "recorded_logical_calls": 0,
+            "logical_call_coverage": None,
+            "logical_call_coverage_reason": "provider_attempt_retention_pending",
+            "retained_from": None,
+            "retention_pending_from": "2025-06-29",
+            "retention_truncated": True,
+            "retention_partial_reason": "provider_attempt_retention_pending",
+            "missing_outer_ordinals": 0,
+            "missing_inner_ordinals": 0,
+            "attempt_sequence_gaps": 0,
+        },
+    }
+
+    with _admin_core.bind("view=usage&preset=all"):
+        body = _data_track._render_usage_page(report, _usage_query())
+
+    assert "Provider-attempt retention is in progress" in body
+    assert "pending boundary 2025-06-29" in body
     assert "0 / 12" not in body
 
 

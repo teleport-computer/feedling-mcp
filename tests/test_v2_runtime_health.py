@@ -724,6 +724,7 @@ def test_token_usage_by_lane_marks_retention_truncated_attempts_partial():
 
     assert report["attempt_coverage"] == {
         "retained_from": (local_day + timedelta(days=1)).isoformat(),
+        "retention_pending_from": None,
         "retention_truncated": True,
         "retention_partial_reason": "provider_attempt_retention_window_truncated",
     }
@@ -731,6 +732,55 @@ def test_token_usage_by_lane_marks_retention_truncated_attempts_partial():
     assert chat["logical_call_coverage"] is None
     assert chat["logical_call_coverage_reason"] == (
         "provider_attempt_retention_window_truncated"
+    )
+
+
+def test_token_usage_by_lane_marks_pending_retention_partial():
+    user_id = "u_tok_retention_pending"
+    job_id = 8_660_002
+    _add_metric(
+        user_id,
+        "chat",
+        prompt=100,
+        completion=10,
+        job_id=job_id,
+        model_calls=1,
+        age_hours=36,
+    )
+    with db.get_pool().connection() as conn:
+        metric = conn.execute(
+            "SELECT (created_at AT TIME ZONE 'Asia/Shanghai')::date "
+            "FROM v2_turn_metrics WHERE user_id=%s",
+            (user_id,),
+        ).fetchone()
+        pending = metric[0] + timedelta(days=1)
+        conn.execute(
+            "INSERT INTO llm_usage_rollup_watermarks "
+            "(rollup_name,bootstrap_complete,retention_pending_from) "
+            "VALUES (%s,true,%s) ON CONFLICT (rollup_name) DO UPDATE SET "
+            "bootstrap_complete=true,retained_from=NULL,"
+            "retention_pending_from=excluded.retention_pending_from",
+            (provider_attempt_rollup.ROLLUP_NAME, pending),
+        )
+
+    try:
+        report = jobs_store.recent_token_usage_by_lane(within_hours=72)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM llm_usage_rollup_watermarks WHERE rollup_name=%s",
+                (provider_attempt_rollup.ROLLUP_NAME,),
+            )
+
+    assert report["attempt_coverage"] == {
+        "retained_from": None,
+        "retention_pending_from": pending.isoformat(),
+        "retention_truncated": True,
+        "retention_partial_reason": "provider_attempt_retention_pending",
+    }
+    assert report["attempt_lanes"]["chat"]["logical_call_coverage"] is None
+    assert report["attempt_lanes"]["chat"]["logical_call_coverage_reason"] == (
+        "provider_attempt_retention_pending"
     )
 
 

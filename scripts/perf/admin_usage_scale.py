@@ -100,6 +100,60 @@ def _formal_gate_passed(
     )
 
 
+def _retention_index_evidence_passed(evidence: dict[str, Any]) -> bool:
+    """Require inspectable size/write-maintenance evidence from a formal run."""
+
+    maintenance = evidence.get("maintenance") or {}
+    numeric = (
+        evidence.get("index_bytes"),
+        evidence.get("attempt_rows"),
+        evidence.get("bytes_per_attempt"),
+        evidence.get("attempt_table_total_bytes"),
+        evidence.get("index_share_of_attempt_total"),
+        maintenance.get("idx_scan"),
+        maintenance.get("idx_tup_read"),
+        maintenance.get("idx_tup_fetch"),
+    )
+    return bool(
+        evidence.get("present") is True
+        and evidence.get("valid") is True
+        and evidence.get("definition_exact") is True
+        and all(isinstance(value, (int, float)) and value >= 0 for value in numeric)
+        and int(evidence["attempt_rows"]) > 0
+    )
+
+
+def _business_path_evidence_passed(evidence: dict[str, Any]) -> bool:
+    """Gate externally captured recorder/pool/provider no-impact evidence."""
+
+    pool = evidence.get("pool") or {}
+    recorder = evidence.get("recorder") or {}
+    providers = evidence.get("providers") or {}
+
+    def healthy_path(path: dict[str, Any]) -> bool:
+        return bool(
+            isinstance(path.get("requests"), int)
+            and path["requests"] > 0
+            and isinstance(path.get("p95_ms"), (int, float))
+            and path["p95_ms"] >= 0
+            and path.get("business_errors") == 0
+            and path.get("results_match_baseline") is True
+        )
+
+    return bool(
+        isinstance(pool.get("peak_occupancy"), int)
+        and isinstance(pool.get("capacity"), int)
+        and 0 <= pool["peak_occupancy"] <= pool["capacity"]
+        and pool["capacity"] > 0
+        and pool.get("timeouts") == 0
+        and healthy_path(recorder)
+        and set(providers) >= {"openrouter", "anthropic", "google"}
+        and all(healthy_path(providers[name]) for name in (
+            "openrouter", "anthropic", "google"
+        ))
+    )
+
+
 def assert_content_free_metric_sql(statements: list[tuple[str, tuple[Any, ...]]]) -> None:
     """Reject content-bearing columns without requiring a raw-table branch."""
     reporting_sql = [
@@ -886,6 +940,51 @@ def _relation_stats(conn, table: str) -> dict[str, int]:
     }
 
 
+def _retention_index_evidence(conn, *, attempt_rows: int) -> dict[str, Any]:
+    name = "ix_llm_provider_attempts_retention_started"
+    row = conn.execute(
+        "SELECT idx.indisvalid,pg_get_indexdef(idx.indexrelid),"
+        "pg_get_expr(idx.indpred,idx.indrelid,true),"
+        "pg_relation_size(idx.indexrelid)::bigint,"
+        "pg_total_relation_size(idx.indrelid)::bigint,"
+        "coalesce(stats.idx_scan,0)::bigint,"
+        "coalesce(stats.idx_tup_read,0)::bigint,"
+        "coalesce(stats.idx_tup_fetch,0)::bigint "
+        "FROM pg_index idx LEFT JOIN pg_stat_user_indexes stats "
+        "ON stats.indexrelid=idx.indexrelid "
+        "WHERE idx.indexrelid=to_regclass(%s)",
+        (name,),
+    ).fetchone()
+    if row is None:
+        return {"present": False}
+    index_bytes = int(row[3])
+    table_total_bytes = int(row[4])
+    definition_exact = bool(
+        "USING btree (started_at, attempt_id) INCLUDE (job_id)" in row[1]
+        and row[2] == "source = 'runtime_recorder'::text"
+    )
+    return {
+        "name": name,
+        "present": True,
+        "valid": bool(row[0]),
+        "definition_exact": definition_exact,
+        "definition": row[1],
+        "predicate": row[2],
+        "index_bytes": index_bytes,
+        "attempt_rows": int(attempt_rows),
+        "bytes_per_attempt": index_bytes / attempt_rows if attempt_rows else None,
+        "attempt_table_total_bytes": table_total_bytes,
+        "index_share_of_attempt_total": (
+            index_bytes / table_total_bytes if table_total_bytes else 0.0
+        ),
+        "maintenance": {
+            "idx_scan": int(row[5]),
+            "idx_tup_read": int(row[6]),
+            "idx_tup_fetch": int(row[7]),
+        },
+    }
+
+
 def _assert_schema(conn) -> dict[str, Any]:
     """Validate the pre-migrated test DB without mutating its Alembic state."""
     required_columns = {
@@ -976,10 +1075,29 @@ def _assert_schema(conn) -> dict[str, Any]:
         raise RuntimeError(
             "test database lacks the exact runtime provider-attempt job index"
         )
+    retention_index = conn.execute(
+        "SELECT idx.indisvalid,pg_get_indexdef(idx.indexrelid),"
+        "pg_get_expr(idx.indpred,idx.indrelid,true) FROM pg_index idx WHERE "
+        "idx.indexrelid=to_regclass('ix_llm_provider_attempts_retention_started')"
+    ).fetchone()
+    if (
+        retention_index is None
+        or retention_index[0] is not True
+        or "USING btree (started_at, attempt_id) INCLUDE (job_id)"
+        not in retention_index[1]
+        or retention_index[2] != "source = 'runtime_recorder'::text"
+    ):
+        raise RuntimeError(
+            "test database lacks the exact provider-attempt retention index"
+        )
     return {
         "runtime_job_index_present": True,
         "runtime_job_index_valid": True,
         "runtime_job_index_definition": runtime_job_index[1],
+        "retention_index_present": True,
+        "retention_index_valid": True,
+        "retention_index_definition": retention_index[1],
+        "retention_index_predicate": retention_index[2],
     }
 
 
@@ -1051,6 +1169,16 @@ def _run(args) -> int:
     if args.rows < 1 or args.users < 1 or args.runs < 5 or args.history_days < 90:
         raise SystemExit("rows/users must be positive, runs >= 5, history-days >= 90")
     attempt_rows = _resolve_attempt_rows(args.rows, args.attempt_rows)
+    if not args.business_path_evidence:
+        raise SystemExit(
+            "pass --business-path-evidence with recorder/pool/provider load evidence"
+        )
+    try:
+        business_path_evidence = json.loads(
+            Path(args.business_path_evidence).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"invalid business-path evidence: {type(exc).__name__}") from exc
     database_url = args.database_url.strip()
     if not database_url:
         raise SystemExit("pass an explicit --database-url for the dedicated scale DB")
@@ -1120,6 +1248,7 @@ def _run(args) -> int:
             },
         },
         "schema": schema_evidence,
+        "business_path": business_path_evidence,
         "budget_ms": P95_BUDGET_MS,
         "query": {
             "timezone": "Asia/Shanghai",
@@ -1204,6 +1333,9 @@ def _run(args) -> int:
             "ticks": attempt_bootstrap_ticks,
         }
         with pool.connection() as conn:
+            evidence["retention_index"] = _retention_index_evidence(
+                conn, attempt_rows=evidence["source"]["attempt_rows"]
+            )
             watermark = conn.execute(
                 "SELECT bootstrap_complete,dirty_from_day,dirty_through_day,"
                 "source_updated_at,source_id,source_observed_updated_at,"
@@ -1214,7 +1346,8 @@ def _run(args) -> int:
             if watermark is None or not watermark[0] or watermark[1] is not None:
                 raise RuntimeError(f"production rollup watermark is not ready: {watermark}")
             attempt_watermark = conn.execute(
-                "SELECT bootstrap_complete,completed_through_day,retained_from "
+                "SELECT bootstrap_complete,completed_through_day,retained_from,"
+                "retention_pending_from "
                 "FROM llm_usage_rollup_watermarks "
                 "WHERE rollup_name='hosted_v2_attempt_usage'"
             ).fetchone()
@@ -1250,6 +1383,7 @@ def _run(args) -> int:
                     "bootstrap_complete": bool(attempt_watermark[0]),
                     "completed_through_day": attempt_watermark[1],
                     "retained_from": attempt_watermark[2],
+                    "retention_pending_from": attempt_watermark[3],
                 },
             }
 
@@ -1401,7 +1535,9 @@ def _run(args) -> int:
 
     evidence["passed"] = _formal_gate_passed(
         evidence["cohorts"], evidence["cleanup"]
-    )
+    ) and _retention_index_evidence_passed(
+        evidence["retention_index"]
+    ) and _business_path_evidence_passed(evidence["business_path"])
     rendered = json.dumps(evidence, indent=2, sort_keys=True, default=str) + "\n"
     if args.output:
         Path(args.output).write_text(rendered, encoding="utf-8")
@@ -1421,6 +1557,7 @@ def main() -> int:
     parser.add_argument("--keep-data", action="store_true")
     parser.add_argument("--output", default="")
     parser.add_argument("--precondition-note", default="")
+    parser.add_argument("--business-path-evidence", default="")
     args = parser.parse_args()
     if args.self_test:
         return _self_test()

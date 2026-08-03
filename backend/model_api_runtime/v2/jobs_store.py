@@ -4521,6 +4521,9 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
                         coverage = attempt_bundle["attempts"]["coverage"]
                         attempt_coverage = {
                             "retained_from": coverage.get("retained_from"),
+                            "retention_pending_from": coverage.get(
+                                "retention_pending_from"
+                            ),
                             "retention_truncated": bool(
                                 coverage.get("retention_truncated")
                             ),
@@ -6010,6 +6013,7 @@ def _usage_attempt_partition(
     completed_through_day,
     retained_from,
     dirty_days,
+    retention_pending_from=None,
 ) -> usage_reporting.RollupPartition:
     """Take the exact safe intersection of whole-turn and attempt rollups."""
 
@@ -6020,15 +6024,25 @@ def _usage_attempt_partition(
             | set(whole_turn_partition.raw_days)
         )
     )
-    retention_truncated = bool(
+    published_overlap = bool(
         retained_from is not None and touched and touched[0] < retained_from
+    )
+    pending_overlap = bool(
+        retention_pending_from is not None
+        and touched
+        and touched[0] < retention_pending_from
+    )
+    retention_truncated = published_overlap or pending_overlap
+    rollup_floor = max(
+        (value for value in (retained_from, retention_pending_from) if value),
+        default=None,
     )
     rolled = tuple(
         day
         for day in whole_turn_partition.rollup_days
         if completed_through_day is not None
         and day <= completed_through_day
-        and (retained_from is None or day >= retained_from)
+        and (rollup_floor is None or day >= rollup_floor)
         and day not in dirty
     )
     rolled_set = set(rolled)
@@ -6045,10 +6059,16 @@ def _usage_attempt_partition(
         rollup_days=rolled,
         raw_days=raw,
         retained_from=retained_from,
+        retention_pending_from=retention_pending_from,
         retention_truncated=retention_truncated,
         retention_partial_reason=(
-            "provider_attempt_retention_window_truncated"
-            if retention_truncated else None
+            "provider_attempt_retention_pending"
+            if pending_overlap
+            else (
+                "provider_attempt_retention_window_truncated"
+                if published_overlap
+                else None
+            )
         ),
     )
 
@@ -6059,7 +6079,8 @@ def _usage_attempt_partition_on_cursor(cur, query, whole_turn_partition):
     if whole_turn_partition is None or query.timezone != "Asia/Shanghai":
         return None
     cur.execute(
-        "SELECT bootstrap_complete,completed_through_day,retained_from "
+        "SELECT bootstrap_complete,completed_through_day,retained_from,"
+        "retention_pending_from "
         "FROM llm_usage_rollup_watermarks WHERE rollup_name=%s",
         ("hosted_v2_attempt_usage",),
     )
@@ -6084,16 +6105,33 @@ def _usage_attempt_partition_on_cursor(cur, query, whole_turn_partition):
         whole_turn_partition,
         completed_through_day=state["completed_through_day"],
         retained_from=state["retained_from"],
+        retention_pending_from=state["retention_pending_from"],
         dirty_days=dirty_days,
     )
 
 
-def _usage_attempt_raw_predicate(query, partition):
+def _usage_retention_boundary_utc(local_day):
+    if local_day is None:
+        return None
+    return datetime.combine(
+        local_day, datetime.min.time(), tzinfo=usage_reporting.SHANGHAI
+    ).astimezone(timezone.utc)
+
+
+def _usage_attempt_raw_predicate(query, partition, *, retained_from=None):
     clauses: list[str] = []
     params: list[object] = []
     if partition is None:
         clauses.append("m.created_at >= %s AND m.created_at < %s")
-        params.extend((query.start_at_utc, query.end_at_utc))
+        retained_at = _usage_retention_boundary_utc(retained_from)
+        params.extend(
+            (
+                max(query.start_at_utc, retained_at)
+                if retained_at is not None
+                else query.start_at_utc,
+                query.end_at_utc,
+            )
+        )
     else:
         range_clauses: list[str] = []
         for raw_day in partition.raw_days:
@@ -6130,7 +6168,9 @@ def _usage_attempt_raw_predicate(query, partition):
     return " AND ".join(f"({clause})" for clause in clauses), params
 
 
-def _usage_attempt_query(query, partition) -> tuple[str, tuple[object, ...]]:
+def _usage_attempt_query(
+    query, partition, *, retained_from=None
+) -> tuple[str, tuple[object, ...]]:
     """Build one exact rollup/raw-edge attempt statement."""
 
     from model_api_runtime.v2 import provider_attempt_rollup
@@ -6179,7 +6219,9 @@ def _usage_attempt_query(query, partition) -> tuple[str, tuple[object, ...]]:
 
     has_raw = partition is None or bool(partition.raw_days)
     if has_raw:
-        raw_where, raw_params = _usage_attempt_raw_predicate(query, partition)
+        raw_where, raw_params = _usage_attempt_raw_predicate(
+            query, partition, retained_from=retained_from
+        )
         effective = provider_attempt_rollup._effective_attempt_ctes(
             cohort_where=raw_where
         ).strip()
@@ -6380,9 +6422,14 @@ def _usage_attempt_snapshot(
     """
 
     cur = _UsageAttemptCursor(cur)
+    retained_from = partition.retained_from if partition is not None else None
+    retention_pending_from = (
+        partition.retention_pending_from if partition is not None else None
+    )
     if partition is None:
         cur.execute(
-            "SELECT retained_from FROM llm_usage_rollup_watermarks "
+            "SELECT retained_from,retention_pending_from "
+            "FROM llm_usage_rollup_watermarks "
             "WHERE rollup_name=%s",
             ("hosted_v2_attempt_usage",),
         )
@@ -6390,15 +6437,28 @@ def _usage_attempt_snapshot(
         retained_from = (
             retention_state["retained_from"] if retention_state else None
         )
+        retention_pending_from = (
+            retention_state["retention_pending_from"]
+            if retention_state else None
+        )
         whole_partition = usage_reporting.rollup_partition(query)
-        if retained_from is not None and whole_partition is not None:
+        if (
+            (retained_from is not None or retention_pending_from is not None)
+            and whole_partition is not None
+        ):
             partition = _usage_attempt_partition(
                 whole_partition,
                 completed_through_day=None,
                 retained_from=retained_from,
+                retention_pending_from=retention_pending_from,
                 dirty_days=(),
             )
-    statement, params = _usage_attempt_query(query, partition)
+    if partition is None:
+        statement, params = _usage_attempt_query(
+            query, partition, retained_from=retained_from
+        )
+    else:
+        statement, params = _usage_attempt_query(query, partition)
     _usage_snapshot_observer(
         "read", role=observer_role, section="attempt_ledger"
     )
@@ -6465,9 +6525,20 @@ def _usage_attempt_snapshot(
     outer_gaps = int(gaps.get("outer_gaps") or 0)
     inner_gaps = int(gaps.get("inner_gaps") or 0)
     logical_calls = overview["logical_calls"]
-    retention_truncated = bool(
-        partition is not None and partition.retention_truncated
-    )
+    pending_at = _usage_retention_boundary_utc(retention_pending_from)
+    retained_at = _usage_retention_boundary_utc(retained_from)
+    if partition is not None:
+        retention_truncated = partition.retention_truncated
+        retention_reason = partition.retention_partial_reason
+    elif pending_at is not None and query.start_at_utc < pending_at:
+        retention_truncated = True
+        retention_reason = "provider_attempt_retention_pending"
+    elif retained_at is not None and query.start_at_utc < retained_at:
+        retention_truncated = True
+        retention_reason = "provider_attempt_retention_window_truncated"
+    else:
+        retention_truncated = False
+        retention_reason = None
     denominator_attributable = not (
         query.provider or query.model or query.completeness != "all"
     )
@@ -6476,7 +6547,7 @@ def _usage_attempt_snapshot(
         int(whole_turn_model_calls or 0) if denominator_attributable else None
     )
     if retention_truncated:
-        coverage_reason = "provider_attempt_retention_window_truncated"
+        coverage_reason = retention_reason
     elif coverage_attributable:
         coverage_reason = None
     else:
@@ -6504,16 +6575,17 @@ def _usage_attempt_snapshot(
                 ) if coverage_attributable else None,
                 "logical_call_coverage_reason": coverage_reason,
                 "retained_from": (
-                    partition.retained_from.isoformat()
-                    if partition is not None
-                    and partition.retained_from is not None
+                    retained_from.isoformat()
+                    if retained_from is not None
+                    else None
+                ),
+                "retention_pending_from": (
+                    retention_pending_from.isoformat()
+                    if retention_pending_from is not None
                     else None
                 ),
                 "retention_truncated": retention_truncated,
-                "retention_partial_reason": (
-                    partition.retention_partial_reason
-                    if partition is not None else None
-                ),
+                "retention_partial_reason": retention_reason,
                 "missing_outer_ordinals": outer_gaps,
                 "missing_inner_ordinals": inner_gaps,
                 "attempt_sequence_gaps": outer_gaps + inner_gaps,

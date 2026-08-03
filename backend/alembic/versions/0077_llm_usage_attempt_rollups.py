@@ -177,6 +177,7 @@ ALTER TABLE llm_usage_rollup_watermarks
   ADD COLUMN IF NOT EXISTS bootstrap_complete BOOLEAN NOT NULL DEFAULT false,
   ADD COLUMN IF NOT EXISTS completed_through_day DATE,
   ADD COLUMN IF NOT EXISTS retained_from DATE,
+  ADD COLUMN IF NOT EXISTS retention_pending_from DATE,
   ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
 
 DO $$ BEGIN
@@ -190,6 +191,8 @@ DO $$ BEGIN
         turn_metric_id >= 0 AND version >= 0 AND
         (attempt_updated_id = '' OR attempt_updated_id ~
           '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$') AND
+        (retention_pending_from IS NULL OR retained_from IS NULL OR
+          retention_pending_from >= retained_from) AND
         ((rate_card_provider = '' AND rate_card_model = '' AND rate_card_version = '')
          OR (rate_card_provider ~ '^[A-Za-z0-9][A-Za-z0-9._/-]{{0,79}}$'
           AND rate_card_model ~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{{0,159}}$'
@@ -420,6 +423,7 @@ def downgrade() -> None:
         "DROP COLUMN IF EXISTS bootstrap_complete, "
         "DROP COLUMN IF EXISTS completed_through_day, "
         "DROP COLUMN IF EXISTS retained_from, "
+        "DROP COLUMN IF EXISTS retention_pending_from, "
         "DROP COLUMN IF EXISTS version"
     )
     op.execute("DROP FUNCTION IF EXISTS llm_ttft_samples_are_sorted(double precision[])")

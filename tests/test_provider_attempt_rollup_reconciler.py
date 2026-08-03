@@ -112,6 +112,204 @@ def test_retention_days_default_clamps_short_values_and_accepts_longer(monkeypat
     assert provider_attempt_rollup.retention_days() == 730
 
 
+def test_next_cutoff_prunes_late_orphan_older_than_published_boundary():
+    published = date(2026, 7, 10)
+    user_id = f"attempt_reconcile_{uuid.uuid4().hex[:10]}"
+    seed_user(user_id)
+    attempt_id = _attempt_id()
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO llm_usage_rollup_watermarks "
+            "(rollup_name,bootstrap_complete,retained_from) VALUES (%s,true,%s)",
+            (ROLLUP_NAME, published),
+        )
+        conn.execute(
+            "INSERT INTO llm_provider_attempts (attempt_id,user_id,lane,call_id,"
+            "outer_attempt_ordinal,inner_attempt_ordinal,retry_kind,requested_provider,"
+            "resolved_provider,requested_model,resolved_model,transport,started_at,state,"
+            "outcome,error_class,source,completeness,revision) VALUES "
+            "(%s,%s,'chat','late-orphan',1,1,'initial','asked','served','asked-model',"
+            "'served-model','responses',%s,'completed','succeeded','none',"
+            "'runtime_recorder','complete',1)",
+            (
+                attempt_id,
+                user_id,
+                datetime(2026, 7, 8, 15, tzinfo=timezone.utc),
+            ),
+        )
+
+    with db.get_pool().connection() as conn:
+        provider_attempt_rollup._run_retention_batch(
+            conn,
+            cutoff=published,
+            max_rows=10,
+            timeout_ms=5_000,
+            now_utc=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        )
+    with db.get_pool().connection() as conn:
+        result = provider_attempt_rollup._run_retention_batch(
+            conn,
+            cutoff=published + timedelta(days=1),
+            max_rows=10,
+            timeout_ms=5_000,
+            now_utc=datetime(2026, 7, 11, tzinfo=timezone.utc),
+        )
+        assert conn.execute(
+            "SELECT count(*) FROM llm_provider_attempts WHERE attempt_id=%s",
+            (attempt_id,),
+        ).fetchone()[0] == 0
+        state = conn.execute(
+            "SELECT retained_from,retention_pending_from "
+            "FROM llm_usage_rollup_watermarks WHERE rollup_name=%s",
+            (ROLLUP_NAME,),
+        ).fetchone()
+    assert result["complete"] is True
+    assert state == (published + timedelta(days=1), None)
+
+
+def test_next_cutoff_prunes_turn_moved_behind_published_boundary_and_dirty_claim():
+    published = date(2026, 7, 10)
+    user_id, job_id, attempt_id = _seed_turn_attempt(local_day=published)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO llm_provider_attempt_corrections "
+            "(attempt_id,user_id,revision,reason_code,input_tokens_delta) "
+            "VALUES (%s,%s,2,'late_usage',1)",
+            (attempt_id, user_id),
+        )
+        conn.execute(
+            "INSERT INTO llm_usage_rollup_watermarks "
+            "(rollup_name,bootstrap_complete,retained_from) VALUES (%s,true,%s)",
+            (ROLLUP_NAME, published),
+        )
+        moved_at = datetime.combine(
+            published - timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=timezone.utc,
+        ) + timedelta(hours=4)
+        conn.execute(
+            "UPDATE v2_turn_metrics SET created_at=%s,updated_at=clock_timestamp() "
+            "WHERE job_id=%s",
+            (moved_at, job_id),
+        )
+    assert _dirty_days() == [published - timedelta(days=1), published]
+
+    with db.get_pool().connection() as conn:
+        result = provider_attempt_rollup._run_retention_batch(
+            conn,
+            cutoff=published + timedelta(days=1),
+            max_rows=20,
+            timeout_ms=5_000,
+            now_utc=datetime(2026, 7, 11, tzinfo=timezone.utc),
+        )
+        assert conn.execute(
+            "SELECT count(*) FROM llm_provider_attempts WHERE attempt_id=%s",
+            (attempt_id,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT count(*) FROM llm_provider_attempt_corrections "
+            "WHERE attempt_id=%s", (attempt_id,),
+        ).fetchone()[0] == 0
+        state = conn.execute(
+            "SELECT retained_from,retention_pending_from "
+            "FROM llm_usage_rollup_watermarks WHERE rollup_name=%s",
+            (ROLLUP_NAME,),
+        ).fetchone()
+    assert result["complete"] is True
+    assert _dirty_days() == []
+    assert state == (published + timedelta(days=1), None)
+
+
+def test_retention_pending_fence_precedes_multi_page_destructive_state():
+    cutoff = date(2026, 7, 10)
+    _seed_turn_attempt(local_day=cutoff - timedelta(days=1))
+    _seed_turn_attempt(local_day=cutoff - timedelta(days=2))
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO llm_usage_rollup_watermarks (rollup_name,bootstrap_complete) "
+            "VALUES (%s,true)", (ROLLUP_NAME,),
+        )
+    with db.get_pool().connection() as conn:
+        first = provider_attempt_rollup._run_retention_batch(
+            conn,
+            cutoff=cutoff,
+            max_rows=1,
+            timeout_ms=5_000,
+            now_utc=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        )
+        state = conn.execute(
+            "SELECT retained_from,retention_pending_from "
+            "FROM llm_usage_rollup_watermarks WHERE rollup_name=%s",
+            (ROLLUP_NAME,),
+        ).fetchone()
+    assert first["complete"] is False
+    assert state == (None, cutoff)
+
+
+def test_max_retention_rows_is_one_global_fair_budget_and_cascades_are_separate():
+    cutoff = date(2026, 7, 10)
+    user_id, _job_id_value, attempt_id = _seed_turn_attempt(
+        local_day=cutoff - timedelta(days=1)
+    )
+    old_day = cutoff - timedelta(days=1)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO llm_provider_attempt_corrections "
+            "(attempt_id,user_id,revision,reason_code,input_tokens_delta) "
+            "VALUES (%s,%s,2,'late_usage',1)", (attempt_id, user_id),
+        )
+        conn.execute(
+            "INSERT INTO llm_usage_daily_attempt_dimensions "
+            "(local_day,user_id,cohort_lane,requested_provider,requested_model,"
+            "resolved_provider,resolved_model,effective_usage_known,cost_kind,"
+            "attempts,unknown_cost_attempts) VALUES (%s,%s,'chat','asked','asked-model',"
+            "'served','served-model',false,'unknown',1,1)", (old_day, user_id),
+        )
+        conn.execute(
+            "INSERT INTO llm_usage_daily_call_memberships "
+            "(local_day,user_id,cohort_lane,call_id,requested_provider,requested_model,"
+            "resolved_provider,resolved_model,effective_usage_known) VALUES "
+            "(%s,%s,'chat','budget-call','asked','asked-model','served',"
+            "'served-model',false)", (old_day, user_id),
+        )
+        conn.execute(
+            "INSERT INTO llm_usage_rollup_dirty_days "
+            "(rollup_name,local_day,reason,generation) VALUES (%s,%s,'source_change',0)",
+            (ROLLUP_NAME, old_day),
+        )
+        conn.execute(
+            "INSERT INTO llm_usage_rollup_watermarks (rollup_name,bootstrap_complete) "
+            "VALUES (%s,true)", (ROLLUP_NAME,),
+        )
+
+    progress = set()
+    cascaded = 0
+    for tick in range(8):
+        with db.get_pool().connection() as conn:
+            result = provider_attempt_rollup._run_retention_batch(
+                conn,
+                cutoff=cutoff,
+                max_rows=1,
+                timeout_ms=5_000,
+                now_utc=datetime(2026, 8, 1, tzinfo=timezone.utc)
+                + timedelta(seconds=tick),
+            )
+        explicit = {
+            "attempts": result["attempts_deleted"],
+            "dimensions": result["dimensions_deleted"],
+            "memberships": result["memberships_deleted"],
+            "dirty_days": result["dirty_days_deleted"],
+        }
+        assert sum(explicit.values()) <= 1
+        progress.update(key for key, value in explicit.items() if value)
+        cascaded += result["corrections_cascaded"]
+        if result["complete"]:
+            break
+    assert progress == {"attempts", "dimensions", "memberships", "dirty_days"}
+    assert cascaded == 1
+    assert result["complete"] is True
+
+
 def test_retention_is_bounded_cascades_corrections_and_publishes_watermark_last():
     cutoff = date(2026, 7, 10)
     old_user, _old_job, old_attempt = _seed_turn_attempt(
@@ -200,17 +398,31 @@ def test_retention_is_bounded_cascades_corrections_and_publishes_watermark_last(
             "WHERE rollup_name=%s", (ROLLUP_NAME,),
         ).fetchone()[0] is None
 
-    with db.get_pool().connection() as conn:
-        second = provider_attempt_rollup._run_retention_batch(
-            conn,
-            cutoff=cutoff,
-            max_rows=1,
-            timeout_ms=5_000,
-            now_utc=datetime(2026, 8, 1, tzinfo=timezone.utc),
-        )
-    assert second["status"] == "ok"
-    assert second["complete"] is True
-    assert second["retained_from"] == cutoff
+    result = first
+    for tick in range(1, 10):
+        with db.get_pool().connection() as conn:
+            result = provider_attempt_rollup._run_retention_batch(
+                conn,
+                cutoff=cutoff,
+                max_rows=1,
+                timeout_ms=5_000,
+                now_utc=datetime(2026, 8, 1, tzinfo=timezone.utc)
+                + timedelta(seconds=tick),
+            )
+        assert sum(
+            result[key]
+            for key in (
+                "attempts_deleted",
+                "dimensions_deleted",
+                "memberships_deleted",
+                "dirty_days_deleted",
+            )
+        ) <= 1
+        if result["complete"]:
+            break
+    assert result["status"] == "ok"
+    assert result["complete"] is True
+    assert result["retained_from"] == cutoff
     with db.get_pool().connection() as conn:
         assert conn.execute(
             "SELECT attempt_id FROM llm_provider_attempts ORDER BY attempt_id"
@@ -323,7 +535,7 @@ def test_retention_parent_selection_plan_is_bounded_and_index_driven(monkeypatch
                 conn.execute(
                     "EXPLAIN (FORMAT JSON) "
                     + statements["attempt_delete_job"],
-                    (cutoff_at, 40, 10),
+                    (cutoff_at, 10),
                 ).fetchone()[0][0],
                 conn.execute(
                     "EXPLAIN (FORMAT JSON) "
@@ -356,7 +568,7 @@ def test_retention_parent_selection_plan_is_bounded_and_index_driven(monkeypatch
     assert "ix_llm_provider_attempts_retention_started" in indexes
 
 
-def test_retention_same_published_cutoff_is_a_steady_state_noop(monkeypatch):
+def test_retention_same_published_cutoff_checks_late_data_without_mutation(monkeypatch):
     cutoff = date(2026, 7, 10)
     with db.get_pool().connection() as conn:
         conn.execute(
@@ -380,7 +592,15 @@ def test_retention_same_published_cutoff_is_a_steady_state_noop(monkeypatch):
         )
     assert result["complete"] is True
     assert result["retained_from"] == cutoff
-    assert observed == []
+    assert result["attempts_deleted"] == 0
+    assert result["dimensions_deleted"] == 0
+    assert result["memberships_deleted"] == 0
+    assert result["dirty_days_deleted"] == 0
+    assert result["retention_pending_from"] is None
+    assert {item["section"] for item in observed} >= {
+        "attempt_delete_job",
+        "attempt_delete_orphan",
+    }
 
 
 def test_retention_skips_expired_turns_without_attempts_before_candidate_limit():
