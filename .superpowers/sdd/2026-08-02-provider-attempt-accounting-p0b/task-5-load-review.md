@@ -2,6 +2,93 @@
 
 Reviewed commit: `deff128524dea481e85c32e9a4943db1c1bb211d`
 
+## Unified-order review of `8fd9154c` + `ff382933`
+
+### Verdict
+
+- **Spec: FAIL**
+- **Quality: FAIL**
+- **Ready for the destructive formal resume: NO**
+
+The runtime order in `_run` is statically improved: both fresh and resume run
+the full fixture workload and EXPLAINs before armed cleanup in `finally`; the
+business producer is prohibited until fixture-post and business-pre global
+counts are zero, and its post-count is collected in `finally`.  The three
+zero-count maps cover users, sources, corrections, rate cards, both daily
+rollups, memberships, both watermarks, and dirty days.  Workflow failure
+evidence is rendered through a same-directory fsync-and-replace writer.  The
+producer retains its own finally cleanup, zero post-count gate, full-commit
+validator, and deterministic serialization-consumption witness.  Resume exact
+prevalidation, formal cardinality/configuration, semantic source/rollup gates,
+and plan/timing gates have not been relaxed.
+
+However, the claimed unified state machine is not used by the production
+entrypoint, and the tests do not exercise the duplicated production failure
+paths.  The required structured/atomic timing, cleanup, and business failure
+artifacts therefore remain unproved at the actual runner boundary.
+
+### C1 — Production `_run` bypasses the tested state machine
+
+Relevant code:
+
+- `scripts/perf/admin_usage_scale.py:623-723`
+- `scripts/perf/admin_usage_scale.py:2525-2925`
+- `tests/test_admin_usage.py:311-479`
+
+`_execute_scale_workflow` is referenced only by its four direct unit tests;
+`rg` finds no production caller.  `_run` separately reimplements the phase
+trace, cleanup `finally`, three count checks, producer try/finally, failure
+classification, and terminal-state selection across roughly 400 lines.  There
+is no `_run`-level fresh/resume ordering test and no `_run`-level timing,
+cleanup, or business failure test that parses the atomically written artifact.
+
+The two implementations have already diverged at the evidence boundary.  The
+helper stores `business_result`, while the production workflow leaves that
+field `None` and writes only top-level `business_path`.  The helper performs
+fixture preparation inside `prepare_fixture`; production appends
+`prepare_fixture` without doing preparation, then seeds/bootstrap under
+`fixture_workload`, so a seed failure is classified differently.  Passing
+helper tests cannot establish production ordering, failure classification, or
+artifact completeness.
+
+The real 100/100 non-formal artifact proves only the successful production
+path: complete phase order, business validation, and all three zero maps.  It
+does not close any of the three production failure cases.
+
+Minimum fix:
+
+- Prefer routing production `_run` through the single
+  `_execute_scale_workflow` state machine with fresh/resume preparation,
+  fixture workload, cleanup, count, and business callbacks.  Keep one evidence
+  schema and one phase/failure classifier.
+- If the production orchestration cannot use that helper, add entry-level
+  integration spies around `_run` for both fresh and resume plus timing,
+  cleanup, and business failures.  Each failure test must parse the real
+  `--output` JSON, prove atomic complete output, verify exact phase/producer
+  prohibition or post-count ordering, and return 1.
+- In either approach, the helper must not remain dead/test-only and helper and
+  production evidence schemas must agree, including `business_result` and
+  preparation failure phase semantics.
+
+### Verification
+
+- `tests/test_provider_attempt_business_path.py` and
+  `tests/test_admin_usage.py`: **233 passed in 10.50s** against the dedicated
+  local PostgreSQL test instance.
+- The 100/100 non-formal artifact was inspected: terminal phase is complete;
+  fixture-post, business-pre, and business-post maps contain the full twelve
+  global counters and are all zero; cleanup and business status pass.
+- `git diff a2b4c7b6 ff382933 --check`: passed.
+- No formal run or cleanup of the retained fixture was performed.  The existing
+  untracked business-path evidence file was untouched.
+
+### Ready verdict
+
+**Not ready for the destructive formal resume.**  Operational happy-path order
+looks correct, but the production failure/atomic-artifact contract must be
+owned by the tested state machine or proven directly at `_run` before the one
+retained 3M fixture is allowed to enter destructive cleanup.
+
 ## Final strengthened-resume review of `7012b801`
 
 ### Verdict
