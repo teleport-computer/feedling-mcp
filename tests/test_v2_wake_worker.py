@@ -664,6 +664,125 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
     )
 
 
+def test_lost_heartbeat_lease_does_not_persist_glance_fingerprint(monkeypatch):
+    """Catches a candidate write that happens before terminalization wins."""
+    uid = "u_glance_lost_lease"
+    conftest.seed_user(uid)
+    _reset(uid)
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+
+    async def fake_provider(*args, **kwargs):
+        return _text_round("")
+
+    async def fake_cap_data(store, action_type, **kwargs):
+        assert action_type == "perception_glance"
+        return {
+            "glance": {
+                "weather": {"available": True, "notable_change": False}
+            }
+        }
+
+    upserts = []
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
+    monkeypatch.setattr(
+        jobs_store,
+        "finish_wake_job",
+        lambda *args, **kwargs: (False, None),
+    )
+    monkeypatch.setattr(
+        jobs_store,
+        "upsert_runtime_state",
+        lambda *args, **kwargs: upserts.append((args, kwargs)),
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.read_perception_wake_context = lambda uid, job_id: []
+    jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    assert upserts == []
+
+
+def test_completed_ordinary_heartbeat_fingerprint_write_is_generation_fenced(
+    monkeypatch,
+):
+    """Catches an unfenced retry resurrecting state after a generation change."""
+    uid = "u_glance_generation_fence"
+    conftest.seed_user(uid)
+    _reset(uid)
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+
+    async def fake_provider(*args, **kwargs):
+        return _text_round("")
+
+    async def fake_cap_data(store, action_type, **kwargs):
+        assert action_type == "perception_glance"
+        return {
+            "glance": {
+                "weather": {"available": True, "notable_change": False}
+            }
+        }
+
+    real_finish_wake_job = jobs_store.finish_wake_job
+
+    def finish_then_advance_generation(*args, **kwargs):
+        result = real_finish_wake_job(*args, **kwargs)
+        assert result == (True, None)
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE v2_runtime_state "
+                "SET runtime_generation=runtime_generation+1 "
+                "WHERE user_id=%s",
+                (uid,),
+            )
+        return result
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
+    monkeypatch.setattr(
+        jobs_store,
+        "finish_wake_job",
+        finish_then_advance_generation,
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.read_perception_wake_context = lambda uid, job_id: []
+    jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert (
+        "last_completed_perception_glance_fingerprint"
+        not in jobs_store.get_runtime_state(uid)
+    )
+
+
 def test_run_perception_wake_hands_late_context_to_successor(monkeypatch):
     from perception import store as perception_store
 

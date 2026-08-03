@@ -36,6 +36,7 @@ from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import worker
+from perception.glance import perception_glance_fingerprint
 
 pytestmark = pytest.mark.skipif(not os.environ.get("DATABASE_URL"), reason="needs PG")
 
@@ -403,6 +404,248 @@ def test_heartbeat_injects_boolean_glance_without_snapshot_values(monkeypatch):
     assert "365" not in joined
     assert "21.5" not in joined
     assert "step_count" not in joined
+
+
+def test_repeated_completed_ordinary_heartbeat_marks_glance_unchanged(
+    monkeypatch,
+):
+    """Catches missing post-completion persistence or prompt-visible hashes."""
+    uid = "u_glance_repeat"
+    conftest.seed_user(uid)
+    _reset(uid)
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    prompts = []
+
+    async def fake_provider(config, messages, *, tools=None, **kwargs):
+        prompts.append(messages)
+        return _text_round("")
+
+    glance = {
+        "weather": {"available": True, "notable_change": False}
+    }
+    candidate_fingerprint = perception_glance_fingerprint(glance)
+
+    async def fake_cap_data(store, action_type, **kwargs):
+        assert action_type == "perception_glance"
+        return {"glance": glance}
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
+
+    jobs_store.enqueue_job(uid, "heartbeat")
+    first_job = jobs_store.claim_next_job("w-first")
+    first_status = asyncio.run(
+        worker.process_job(
+            first_job,
+            _wake_deps(
+                [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+            ),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    first_runtime_data = _runtime_payload({"messages": prompts[0]})[
+        "runtime_data"
+    ]
+    assert first_status == "completed"
+    assert first_runtime_data["perception_glance"]["glance_changed"] is True
+    first_state = jobs_store.get_runtime_state(uid)
+    stored_fingerprint = first_state[
+        "last_completed_perception_glance_fingerprint"
+    ]
+    assert stored_fingerprint == candidate_fingerprint
+    assert len(stored_fingerprint) == 64
+
+    jobs_store.enqueue_job(uid, "heartbeat")
+    second_job = jobs_store.claim_next_job("w-second")
+    second_status = asyncio.run(
+        worker.process_job(
+            second_job,
+            _wake_deps(
+                [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+            ),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    second_runtime_data = _runtime_payload({"messages": prompts[1]})[
+        "runtime_data"
+    ]
+    assert second_status == "completed"
+    assert second_runtime_data["perception_glance"]["glance_changed"] is False
+    assert (
+        jobs_store.get_runtime_state(uid)[
+            "last_completed_perception_glance_fingerprint"
+        ]
+        == stored_fingerprint
+    )
+    for messages in prompts:
+        prompt_text = _joined({"messages": messages})
+        for hidden_fingerprint in (
+            stored_fingerprint,
+            candidate_fingerprint,
+        ):
+            assert hidden_fingerprint not in prompt_text
+
+
+@pytest.mark.parametrize("lane", ["manual_wake", "scheduled", "screen_watch"])
+def test_non_ordinary_wake_does_not_replace_glance_fingerprint(
+    monkeypatch, lane
+):
+    """Catches persistence from any lane other than an ordinary heartbeat."""
+    uid = f"u_glance_nonordinary_{lane}"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.upsert_runtime_state(
+        uid,
+        {"last_completed_perception_glance_fingerprint": "a" * 64},
+    )
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    seen = {}
+    _spy_provider(monkeypatch, seen)
+
+    async def fake_cap_data(store, action_type, **kwargs):
+        if action_type == "perception_glance":
+            return {
+                "glance": {
+                    "health": {"available": True, "notable_change": True}
+                }
+            }
+        assert action_type == "screen_recent"
+        return {"recent_count": 1, "unread_count": 1}
+
+    monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
+    deps = _wake_deps(
+        [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    if lane == "scheduled":
+        deps.read_scheduled_wake_context = lambda uid, job_id: []
+
+    jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job("w")
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert (
+        jobs_store.get_runtime_state(uid)[
+            "last_completed_perception_glance_fingerprint"
+        ]
+        == "a" * 64
+    )
+
+
+def test_perception_event_heartbeat_does_not_replace_ordinary_fingerprint(
+    monkeypatch,
+):
+    """Catches event-driven heartbeat completion overwriting ordinary state."""
+    uid = "u_glance_event_no_replace"
+    conftest.seed_user(uid)
+    _reset(uid)
+    jobs_store.upsert_runtime_state(
+        uid,
+        {"last_completed_perception_glance_fingerprint": "b" * 64},
+    )
+    monkeypatch.setattr(
+        worker, "_write_encrypted_reply", lambda store, text: {"id": "r"}
+    )
+    seen = {}
+    _spy_provider(monkeypatch, seen)
+
+    async def fake_cap_data(store, action_type, **kwargs):
+        assert action_type == "perception_glance"
+        return {
+            "glance": {
+                "health": {"available": True, "notable_change": True}
+            }
+        }
+
+    monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
+    deps = _wake_deps(
+        [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    deps.read_perception_wake_context = lambda uid, job_id: [{
+        "_context_seq": 1,
+        "_input_generation": 1,
+        "trigger": "photo_added",
+    }]
+    jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "completed"
+    assert _runtime_payload(seen)["runtime_data"]["perception_wake"] == [
+        {"trigger": "photo_added", "new_photo": True}
+    ]
+    assert (
+        jobs_store.get_runtime_state(uid)[
+            "last_completed_perception_glance_fingerprint"
+        ]
+        == "b" * 64
+    )
+
+
+def test_failed_heartbeat_does_not_persist_glance_fingerprint(monkeypatch):
+    """Catches persistence before provider success and job terminalization."""
+    uid = "u_glance_failed"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    async def failed_provider(*args, **kwargs):
+        raise RuntimeError("provider failed")
+
+    async def fake_cap_data(store, action_type, **kwargs):
+        assert action_type == "perception_glance"
+        return {
+            "glance": {
+                "weather": {"available": True, "notable_change": False}
+            }
+        }
+
+    monkeypatch.setattr(provider_client, "chat_completion_async", failed_provider)
+    monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
+    jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            _wake_deps(
+                [{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+            ),
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    assert (
+        "last_completed_perception_glance_fingerprint"
+        not in jobs_store.get_runtime_state(uid)
+    )
 
 
 def test_perception_wake_injects_only_projected_trigger(monkeypatch):

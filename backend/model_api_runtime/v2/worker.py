@@ -7834,6 +7834,22 @@ async def _run_wake(
             completed = True
         if not completed:
             raise LostJobLease("wake job ownership lost during completion")
+        ordinary_heartbeat = (
+            lane == "heartbeat"
+            and not perception_wake_context
+            and glance_fingerprint is not None
+        )
+        if ordinary_heartbeat:
+            await asyncio.to_thread(
+                jobs_store.upsert_runtime_state,
+                user_id,
+                {
+                    "last_completed_perception_glance_fingerprint": (
+                        glance_fingerprint
+                    )
+                },
+                source_job_id=job_id,
+            )
         if successor_id is not None:
             await asyncio.to_thread(core_wake_bus.notify, "v2_jobs", user_id)
         # End-of-turn drain (mirrors process_job's chat-branch finalize): a write
