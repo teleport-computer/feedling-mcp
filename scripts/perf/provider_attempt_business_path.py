@@ -21,7 +21,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 from uuid import UUID, uuid4
 
@@ -46,6 +46,7 @@ HOT_PATH_PAIRED_P95_BUDGET_MS = 5.0
 USAGE_REPORT_TOTAL_DEADLINE_MS = 15_000
 ATTEMPT_SUBSECTION_TIMEOUT_MS = 3_000
 MAINTENANCE_STATEMENT_TIMEOUT_MS = 3_000
+SEEDED_DIRTY_DAYS = 20
 POOL_ROLES = (
     "usage_exporter",
     "usage_importer_core",
@@ -61,6 +62,24 @@ def _canonical_bytes(payload: dict[str, Any]) -> bytes:
     return json.dumps(
         unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
+
+
+def _maintenance_outcome_json(value: Any) -> Any:
+    """Normalize a raw maintenance outcome to explicit canonical JSON types."""
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        if not all(isinstance(key, str) for key in value):
+            raise TypeError("maintenance outcome keys must be strings")
+        return {key: _maintenance_outcome_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_maintenance_outcome_json(item) for item in value]
+    raise TypeError(
+        f"maintenance outcome contains non-JSON type: {type(value).__name__}"
+    )
 
 
 def canonical_digest(payload: dict[str, Any]) -> str:
@@ -306,12 +325,113 @@ def validate_business_path_evidence(
     _require(timeline["peak_occupancy"] <= pool["capacity"], "pool peak exceeds capacity")
     _require(timeline["maintenance_second_connection_observed"] is True, "maintenance second connection not observed")
     _require(timeline["required_overlap_observed"] is True, "required pool role overlap absent")
+    _validate_maintenance_evidence(pool.get("maintenance"), acquisitions)
     _validate_pool_provider_paths(
         pool.get("provider_paths"),
         budget=float(budget),
         acquisitions=acquisitions,
     )
     return evidence
+
+
+def _validate_maintenance_evidence(
+    maintenance: Any, acquisitions: list[dict[str, Any]]
+) -> None:
+    _require(isinstance(maintenance, dict), "maintenance evidence missing")
+    _require(
+        maintenance.get("seeded_dirty_days") == SEEDED_DIRTY_DAYS,
+        "maintenance seeded dirty-day claim invalid",
+    )
+    ticks = maintenance.get("ticks")
+    _require(isinstance(ticks, list) and ticks, "maintenance raw ticks missing")
+    refreshed: list[str] = []
+    valid_indices: set[int] = set()
+    for tick in ticks:
+        _require(isinstance(tick, dict), "maintenance raw tick invalid")
+        index = tick.get("tick_index")
+        started = tick.get("started_ns")
+        finished = tick.get("finished_ns")
+        outcome = tick.get("outcome")
+        _require(
+            isinstance(index, int) and index not in valid_indices,
+            "maintenance tick index invalid",
+        )
+        valid_indices.add(index)
+        _require(
+            isinstance(started, int)
+            and isinstance(finished, int)
+            and finished > started,
+            "maintenance tick interval invalid",
+        )
+        _require(
+            isinstance(outcome, dict)
+            and outcome.get("status") == "ok"
+            and not any(
+                key in outcome
+                for key in ("error", "cancelled", "canceled", "lock_busy")
+            ),
+            "maintenance tick status invalid",
+        )
+        days = outcome.get("refreshed_days")
+        _require(
+            isinstance(days, list)
+            and days
+            and outcome.get("days_refreshed") == len(days),
+            "maintenance tick refreshed no days",
+        )
+        try:
+            for day in days:
+                _require(
+                    isinstance(day, str)
+                    and datetime.strptime(day, "%Y-%m-%d").date().isoformat() == day,
+                    "maintenance refreshed local day invalid",
+                )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("maintenance refreshed local day invalid") from exc
+        refreshed.extend(days)
+
+        tick_acquisitions = [
+            item
+            for item in acquisitions
+            if item.get("maintenance_tick_index") == index
+        ]
+        _require(
+            {item["role"] for item in tick_acquisitions}
+            == {"attempt_rollup_outer", "attempt_rollup_rebuild"},
+            "maintenance tick recompute intervals incomplete",
+        )
+        _require(
+            all(
+                started <= int(item["acquired_ns"])
+                and int(item["released_ns"]) <= finished
+                for item in tick_acquisitions
+            ),
+            "maintenance tick recompute interval mismatch",
+        )
+
+    _require(
+        len(refreshed) == len(set(refreshed)),
+        "maintenance refreshed days not unique",
+    )
+    _require(
+        len(refreshed) == SEEDED_DIRTY_DAYS,
+        "maintenance seeded dirty-day coverage incomplete",
+    )
+    _require(
+        maintenance.get("refreshed_local_days") == refreshed,
+        "maintenance refreshed-day claim mismatch",
+    )
+    _require(
+        maintenance.get("dirty_remaining_before_cleanup") == 0,
+        "maintenance dirty backlog not drained",
+    )
+    maintenance_acquisitions = [
+        item for item in acquisitions if str(item.get("role", "")).startswith("attempt_rollup_")
+    ]
+    _require(
+        all(item.get("maintenance_tick_index") in valid_indices for item in maintenance_acquisitions),
+        "maintenance interval lacks successful tick",
+    )
 
 
 def _validate_pool_provider_paths(
@@ -450,6 +570,9 @@ class _TrackedConnectionContext(AbstractContextManager):
                     "acquired_ns": acquired_ns,
                     "released_ns": None,
                     "wait_ms": round(wait_ms, 6),
+                    "maintenance_tick_index": getattr(
+                        self._tracker._local, "maintenance_tick_index", None
+                    ),
                 }
             )
         return self._connection
@@ -538,13 +661,16 @@ class _TrackedPool:
         return False
 
     @contextmanager
-    def operation(self, name: str):
+    def operation(self, name: str, *, maintenance_tick_index: int | None = None):
         previous = getattr(self._local, "operation", "")
+        previous_tick = getattr(self._local, "maintenance_tick_index", None)
         self._local.operation = name
+        self._local.maintenance_tick_index = maintenance_tick_index
         try:
             yield self
         finally:
             self._local.operation = previous
+            self._local.maintenance_tick_index = previous_tick
 
     def connection(self, **kwargs: Any) -> _TrackedConnectionContext:
         return _TrackedConnectionContext(self, kwargs)
@@ -1108,17 +1234,19 @@ def measure_pool_contention_evidence(
                 raise RuntimeError("real DB contention roles did not become active")
             paths = {"baseline": {}, "pool_contention": {}}
             execution_order = []
+            coverage_targets = iter(
+                (
+                    "attempt_rollup_rebuild",
+                    "usage_importer_core",
+                    "usage_importer_attempt",
+                    "provider_recorder",
+                )
+            )
 
             def await_real_db_overlap(scenario: str, sample: int) -> None:
                 if scenario != "pool_contention" or sample < 0:
                     return
-                target_by_sample = {
-                    0: "attempt_rollup_rebuild",
-                    1: "usage_importer_core",
-                    2: "usage_importer_attempt",
-                    3: "provider_recorder",
-                }
-                target = target_by_sample.get(sample, "usage_exporter")
+                target = next(coverage_targets, "usage_exporter")
                 if not tracker.wait_for_active_roles({target}, timeout=2):
                     raise RuntimeError(
                         f"real DB overlap role did not become active: {target}"
@@ -1158,10 +1286,14 @@ def measure_pool_contention_evidence(
         try:
             start_gate.wait(timeout=2)
             ticks = []
-            while not provider_done.is_set():
-                with tracker.operation("attempt_rollup"):
-                    ticks.append(
-                        provider_attempt_rollup.run_maintenance_tick(
+            refreshed_days: list[str] = []
+            while len(refreshed_days) < SEEDED_DIRTY_DAYS:
+                tick_index = len(ticks)
+                started_ns = time.perf_counter_ns()
+                with tracker.operation(
+                    "attempt_rollup", maintenance_tick_index=tick_index
+                ):
+                    outcome = provider_attempt_rollup.run_maintenance_tick(
                             max_days=1,
                             max_changed_rows=1,
                             max_dirty_days=1,
@@ -1169,9 +1301,32 @@ def measure_pool_contention_evidence(
                             max_retention_rows=0,
                             statement_timeout_ms=MAINTENANCE_STATEMENT_TIMEOUT_MS,
                             pool_timeout_seconds=0.5,
-                        )
                     )
-            outcomes["maintenance"] = ticks
+                finished_ns = time.perf_counter_ns()
+                outcome_json = _maintenance_outcome_json(outcome)
+                ticks.append(
+                    {
+                        "tick_index": tick_index,
+                        "started_ns": started_ns,
+                        "finished_ns": finished_ns,
+                        "outcome": outcome_json,
+                    }
+                )
+                days = outcome_json.get("refreshed_days")
+                if (
+                    outcome_json.get("status") != "ok"
+                    or not isinstance(days, list)
+                    or not days
+                ):
+                    break
+                refreshed_days.extend(days)
+                if len(ticks) >= SEEDED_DIRTY_DAYS * 2:
+                    break
+            outcomes["maintenance"] = {
+                "seeded_dirty_days": SEEDED_DIRTY_DAYS,
+                "ticks": ticks,
+                "refreshed_local_days": refreshed_days,
+            }
         except BaseException as exc:  # noqa: BLE001
             errors.append(f"maintenance:{type(exc).__name__}")
 
@@ -1209,8 +1364,8 @@ def measure_pool_contention_evidence(
                 "INSERT INTO llm_usage_rollup_dirty_days "
                 "(rollup_name,local_day,reason) "
                 "SELECT 'hosted_v2_attempt_usage',%s - day_offset,'load_proof' "
-                "FROM generate_series(0,19) AS days(day_offset)",
-                (dirty_day,),
+                "FROM generate_series(0,%s - 1) AS days(day_offset)",
+                (dirty_day, SEEDED_DIRTY_DAYS),
             )
     try:
         db_module.get_pool = lambda: tracker
@@ -1240,6 +1395,15 @@ def measure_pool_contention_evidence(
         # the batch it just dequeued.  Join it before freezing interval evidence.
         recorder.shutdown(timeout=2)
         provider_paths = outcomes.get("provider") or {}
+        maintenance = outcomes.get("maintenance") or {}
+        with real_pool.connection() as conn:
+            dirty_remaining = int(
+                conn.execute(
+                    "SELECT count(*) FROM llm_usage_rollup_dirty_days "
+                    "WHERE rollup_name='hosted_v2_attempt_usage'"
+                ).fetchone()[0]
+            )
+        maintenance["dirty_remaining_before_cleanup"] = dirty_remaining
         for provider in PROVIDERS:
             candidate = provider_paths["paths"]["pool_contention"][provider]
             candidate["overlapping_roles"] = [
@@ -1256,6 +1420,7 @@ def measure_pool_contention_evidence(
                 "usage_report_total_deadline_ms": usage_report_total_deadline_ms,
                 "attempt_subsection_timeout_ms": attempt_subsection_timeout_ms,
                 "maintenance_statement_timeout_ms": MAINTENANCE_STATEMENT_TIMEOUT_MS,
+                "maintenance": maintenance,
             }
         )
         if not set(POOL_ROLES) <= set(evidence["roles"]):

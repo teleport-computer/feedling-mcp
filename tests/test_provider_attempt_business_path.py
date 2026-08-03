@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from datetime import date
 import hashlib
 import json
 from pathlib import Path
@@ -21,6 +22,24 @@ def _canonical_digest(payload: dict) -> str:
         unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def test_maintenance_outcome_is_normalized_to_canonical_json_types() -> None:
+    from scripts.perf.provider_attempt_business_path import (
+        _maintenance_outcome_json,
+    )
+
+    assert _maintenance_outcome_json(
+        {
+            "status": "ok",
+            "completed_through_day": date(2026, 8, 3),
+            "retention": {"retained_from": date(2025, 6, 29)},
+        }
+    ) == {
+        "status": "ok",
+        "completed_through_day": "2026-08-03",
+        "retention": {"retained_from": "2025-06-29"},
+    }
 
 
 def _healthy_artifact(commit: str = "a" * 40) -> dict:
@@ -129,6 +148,9 @@ def _healthy_artifact(commit: str = "a" * 40) -> dict:
             "acquired_ns": 100 + index,
             "released_ns": 200 + index,
             "wait_ms": 0.1,
+            "maintenance_tick_index": (
+                0 if role.startswith("attempt_rollup_") else None
+            ),
         }
         for index, role in enumerate(pool_roles)
     ]
@@ -219,6 +241,27 @@ def _healthy_artifact(commit: str = "a" * 40) -> dict:
                 ],
                 "paired_latency_delta_ms": [0.1] * (samples * 3),
                 "paired_p95_regression_ms": 0.1,
+            },
+            "maintenance": {
+                "seeded_dirty_days": 20,
+                "ticks": [
+                    {
+                        "tick_index": 0,
+                        "started_ns": 99,
+                        "finished_ns": 206,
+                        "outcome": {
+                            "status": "ok",
+                            "days_refreshed": 20,
+                            "refreshed_days": [
+                                f"2026-07-{day:02d}" for day in range(1, 21)
+                            ],
+                        },
+                    }
+                ],
+                "refreshed_local_days": [
+                    f"2026-07-{day:02d}" for day in range(1, 21)
+                ],
+                "dirty_remaining_before_cleanup": 0,
             },
         },
     }
@@ -481,6 +524,70 @@ def test_validator_keeps_report_attempt_and_maintenance_timeouts_distinct(
     artifact["canonical_sha256"] = _canonical_digest(artifact)
 
     with pytest.raises(ValueError, match="timeout contract"):
+        validate_business_path_evidence(artifact, expected_commit="a" * 40)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda maintenance: maintenance["ticks"][0]["outcome"].update(
+                status="error", error="RollupBuildError"
+            ),
+            "maintenance tick status",
+        ),
+        (
+            lambda maintenance: maintenance["ticks"][0]["outcome"].update(
+                days_refreshed=0, refreshed_days=[]
+            ),
+            "maintenance tick refreshed no days",
+        ),
+        (
+            lambda maintenance: maintenance["ticks"][0]["outcome"][
+                "refreshed_days"
+            ].__setitem__(19, "2026-07-01"),
+            "maintenance refreshed days not unique",
+        ),
+        (
+            lambda maintenance: maintenance["ticks"][0]["outcome"][
+                "refreshed_days"
+            ].__setitem__(0, 20260701),
+            "maintenance refreshed local day invalid",
+        ),
+        (
+            lambda maintenance: maintenance["ticks"][0]["outcome"][
+                "refreshed_days"
+            ].__setitem__(0, "2026-02-30"),
+            "maintenance refreshed local day invalid",
+        ),
+        (
+            lambda maintenance: (
+                maintenance["ticks"][0]["outcome"].update(
+                    days_refreshed=19,
+                    refreshed_days=maintenance["ticks"][0]["outcome"][
+                        "refreshed_days"
+                    ][:19],
+                ),
+                maintenance.update(
+                    refreshed_local_days=maintenance["refreshed_local_days"][:19]
+                ),
+            ),
+            "maintenance seeded dirty-day coverage incomplete",
+        ),
+    ],
+)
+def test_validator_rejects_failed_noop_repeated_or_incomplete_maintenance(
+    mutation, message
+) -> None:
+    from scripts.perf.provider_attempt_business_path import (
+        validate_business_path_evidence,
+    )
+
+    artifact = _healthy_artifact()
+    mutation(artifact["pool"]["maintenance"])
+    artifact["canonical_sha256"] = _canonical_digest(artifact)
+
+    with pytest.raises(ValueError, match=message):
         validate_business_path_evidence(artifact, expected_commit="a" * 40)
 
 

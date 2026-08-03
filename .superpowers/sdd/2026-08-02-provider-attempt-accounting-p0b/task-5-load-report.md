@@ -49,17 +49,23 @@ The focused producer ran against the explicit dedicated local database
   attempt importer simultaneously.
 - Provider results, exceptions, HTTP attempts and retries under pool contention
   matched their adjacent baseline samples exactly.  Pool contention's paired
-  p95 latency regression was +0.348584 ms.
+  p95 latency regression was +0.244291 ms.
 - Every one of the 60 measured pool-contention candidate calls records its own
   `started_ns`/`finished_ns`; the validator recomputes its intersecting DB roles
   from the raw acquisition intervals.  No candidate had an empty intersection.
-  Coverage was outer maintenance 60/60, rebuild 43/60, recorder 57/60,
+  Coverage was outer maintenance 60/60, rebuild 1/60, recorder 57/60,
   exporter 60/60, attempt importer 60/60, and core importer 59/60.  The real
-  role intervals ranged from 8.12–44.15 ms for rebuild, 32.44–57.88 ms for the
-  outer maintenance connection, 1.11–36.91 ms for recorder batches,
-  35.13–68.82 ms for exporter, 21.85–64.23 ms for attempt importer, and
-  16.53–50.74 ms for core importer.  Maintenance used twenty real dirty-day
-  recompute inputs rather than repeated no-op ticks.
+  role intervals ranged from 3.00–15.16 ms for rebuild, 10.59–80.60 ms for the
+  outer maintenance connection, 1.25–38.80 ms for recorder batches,
+  62.39–76.86 ms for exporter, 43.21–72.47 ms for attempt importer, and
+  24.52–70.15 ms for core importer.
+- Maintenance used twenty real dirty-day recompute inputs rather than repeated
+  no-op ticks.  The artifact retains all 20 canonicalized raw tick outcomes;
+  every tick had `status=ok`, refreshed exactly one unique ISO local day, had
+  no error/cancel/lock-busy field, and was bound by tick index to both its outer
+  and rebuild acquisition intervals.  The claimed and recomputed unique day
+  counts were exactly 20, the last tick reported no dirty work pending, and a
+  separate pre-cleanup query measured zero remaining dirty rows.
 - Timeout evidence is separated by contract: the production Usage report total
   deadline is 15,000 ms, its attempt subsection is 3,000 ms, and the actual
   maintenance statement timeout passed by the probe is 3,000 ms.  The validator
@@ -74,13 +80,13 @@ The focused producer ran against the explicit dedicated local database
   precondition queue, before/after drop deltas and zero queue-full drops.
   Serialization injects and consumes exactly one malformed item.  None altered
   provider results, exceptions, HTTP-attempt counts or retries.
-- Paired p95 hot-path regression was +0.092917 ms for queue saturation and
-  +0.100708 ms for combined recorder failures, both strictly below the
+- Paired p95 hot-path regression was +0.137583 ms for queue saturation and
+  +0.154959 ms for combined recorder failures, both strictly below the
   predeclared +5.0 ms budget.
 - Probe cleanup left both watermark tables and the dirty-day table at zero.
 
 A 100-turn/100-attempt end-to-end **non-formal** runner integration also reached
-final cleanup.  Its report timings were 32.788 ms unfiltered and 21.973 ms
+final cleanup.  Its report timings were 22.651 ms unfiltered and 22.763 ms
 filtered, and all source/rollup/watermark/dirty counts were zero after cleanup.
 The final gate returned false by construction: only an exact 3,000,000-turn and
 3,000,000-attempt run without `--non-formal` can pass.  Formal CLI invocations
@@ -93,8 +99,10 @@ performed in this task.
   hand-written healthy summaries, incomplete providers, false paired-p95
   claims, non-interleaved execution claims, missing measured pool evidence,
   nested maintenance occupancy, pre-existing rollup-state refusal, and separate
-  turn/attempt watermark cleanup accounting.
-- Focused verification: `93 passed, 1 skipped` across the new evidence tests,
+  turn/attempt watermark cleanup accounting.  Maintenance negatives cover
+  error status, no-op success, duplicate days, insufficient seeded-day
+  coverage, non-string/invalid local dates, and non-canonical Python dates.
+- Focused verification: `100 passed, 1 skipped` across the new evidence tests,
   provider recorder tests and provider client tests.
 - Ruff passed for both perf scripts and the new tests.
 - Compileall passed for both perf scripts.
