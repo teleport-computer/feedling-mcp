@@ -1104,6 +1104,117 @@ def test_narrow_candidate_shapes_match_complete_adversarial_outputs():
     assert gaps_row["inner_gaps"] == 1
 
 
+def _healthy_narrow_probe_evidence():
+    return {
+        "temp_relation": {
+            "rows": 731_199,
+            "heap_bytes": 330_000_000,
+            "index_bytes": 320_000_000,
+            "total_bytes": 650_000_000,
+            "membership_total_bytes": 2_820_399_104,
+        },
+        "build": {"days": 366, "max_ms": 119_999.0},
+        "raw_edge": {"attempts": 8_208, "logical_calls": 8_208},
+        "adversarial": {"exact": True},
+        "shapes": {
+            name: _healthy_narrow_shape_evidence(
+                2_500.0 if name == "grouping_sets" else 2_700.0
+            )
+            for name in ("bounded_unions", "grouping_sets")
+        },
+        "selected_shape": "grouping_sets",
+        "plan_guards": {"forbidden_paths_absent": True},
+        "persistent_state": {"unchanged": True},
+        "session_close": {"persistent_probe_objects": []},
+    }
+
+
+def test_narrow_probe_hard_gate_rejects_each_missing_or_boundary_witness():
+    probe = _load_narrow_call_probe()
+    healthy = _healthy_narrow_probe_evidence()
+
+    assert probe._probe_passed(healthy) is True
+    mutations = (
+        lambda item: item["shapes"]["grouping_sets"]["cohorts"][
+            "unfiltered"
+        ]["samples"]["warm"].update(elapsed_ms=3_000.0),
+        lambda item: item["temp_relation"].update(total_bytes=700_000_001),
+        lambda item: item["temp_relation"].update(
+            total_bytes=705_099_776, membership_total_bytes=2_820_399_104
+        ),
+        lambda item: item["shapes"]["grouping_sets"]["cohorts"][
+            "unfiltered"
+        ]["samples"]["ordinary"].update(temp_written_blocks=1),
+        lambda item: item["temp_relation"].update(rows=731_200),
+        lambda item: item["raw_edge"].update(attempts=8_209),
+        lambda item: item["persistent_state"].update(unchanged=False),
+        lambda item: item["session_close"].update(
+            persistent_probe_objects=["public.bad_probe"]
+        ),
+        lambda item: item["build"].update(days=365),
+        lambda item: item["adversarial"].update(exact=False),
+        lambda item: item["plan_guards"].update(forbidden_paths_absent=False),
+        lambda item: item.update(selected_shape=None),
+    )
+    for mutate in mutations:
+        candidate = json.loads(json.dumps(healthy))
+        mutate(candidate)
+        assert probe._probe_passed(candidate) is False
+
+
+def test_narrow_probe_failure_closes_session_audits_and_writes_atomic_json(
+    monkeypatch, tmp_path
+):
+    probe = _load_narrow_call_probe()
+
+    class Cursor:
+        def fetchall(self):
+            return []
+
+    class Connection:
+        def __init__(self):
+            self.closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.closed = True
+
+        def execute(self, *_args, **_kwargs):
+            return Cursor()
+
+    all_sessions = [Connection(), Connection()]
+    sessions = list(all_sessions)
+
+    def connect(*_args, **_kwargs):
+        return sessions.pop(0)
+
+    def fail_pre_witness(*_args, **_kwargs):
+        raise RuntimeError("synthetic pre-witness failure")
+
+    monkeypatch.setattr(probe.psycopg, "connect", connect)
+    monkeypatch.setattr(probe, "_persistent_snapshot", fail_pre_witness)
+    output = tmp_path / "nested" / "evidence.json"
+
+    evidence = probe._run_probe(
+        "postgresql://unused",
+        output=output,
+        prefix="scale_usage_42e02f444a_",
+    )
+
+    assert evidence["passed"] is False
+    assert evidence["failure"] == {
+        "type": "RuntimeError",
+        "message": "synthetic pre-witness failure",
+        "phase": "pre_witness",
+    }
+    assert evidence["session_close"] == {"persistent_probe_objects": []}
+    assert all(session.closed for session in all_sessions)
+    assert json.loads(output.read_text(encoding="utf-8")) == evidence
+    assert list(output.parent.glob(".*.tmp")) == []
+
+
 def test_admin_usage_scale_harness_self_check():
     """The opt-in scale proof must keep its timing and SQL safety gates."""
     result = subprocess.run(
