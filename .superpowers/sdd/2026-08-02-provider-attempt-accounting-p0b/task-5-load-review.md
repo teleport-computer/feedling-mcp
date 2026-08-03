@@ -2,6 +2,136 @@
 
 Reviewed commit: `deff128524dea481e85c32e9a4943db1c1bb211d`
 
+## Strengthened-resume re-review of `6e6c4b8e` + `156946ae`
+
+### Verdict
+
+- **Spec: FAIL**
+- **Quality: FAIL**
+- **Ready to run destructive formal resume: NO**
+
+The strengthened gate closes the earlier configuration, source-distribution,
+rollup, membership, post-producer, and cleanup-arming findings.  Formal mode is
+now locked to 3M turns, 3M attempts, 2,000 users, and 365 days before database
+access.  The six semantic comparisons run in one repeatable-read/read-only
+transaction, each with a 180-second statement timeout and per-query plan,
+elapsed-time, expected/actual-count, and mismatch diagnostics.  Daily and
+attempt rollups are recomputed from source facts rather than accepted by count
+or checksum, and membership key bijection plus full membership-fact comparison
+is logically complete.  A full resume records and compares pre- and
+post-producer stable snapshots before timing or cleanup arming; validate-only
+remains read-only and never arms cleanup.
+
+Two source columns sets remain outside the exact proof.  Both admit
+same-cardinality mutations that survive the pre/post gate.  Consequently the
+gate does not yet prove exact reuse of the deterministic formal fixture.
+
+### C1 — `users.created_at` is deterministic and report-semantic, but unchecked
+
+Relevant code:
+
+- `scripts/perf/admin_usage_scale.py:445-449`
+- `scripts/perf/admin_usage_scale.py:1090-1105`
+- `backend/model_api_runtime/v2/jobs_store.py:6684-6728`
+
+`_seed_fixture` explicitly assigns every fixture user
+`(end_at - timedelta(days=history_days)).isoformat()`.  Under the now-fixed
+formal configuration this is one exact timestamp derived from the formal seed,
+not volatile metadata.  `user_shape` proves only the ID sequence and fixture
+document.  It never compares `users.created_at`.
+
+The production report parses `u.created_at` into `registered_at` and uses
+`registered_at < report_end` to calculate the registered and activated
+reference cohorts.  Moving one or all user timestamps while retaining the
+2,000 IDs and documents therefore passes every current resume integrity check
+but changes report semantics (or its unparseable-registration count).
+
+Minimum fix:
+
+- Add an exact user-source comparison keyed by `user_id`, requiring the
+  formal prefix sequence, fixture document, and parsed timestamp equality with
+  `SCALE_NOW_UTC - 365 days`.  This can extend `user_shape` or be a seventh
+  bounded semantic statement, but it must participate in both pre- and
+  post-producer stable snapshots and the final gate.
+- Add one same-count mutation test: update a single prefix user's
+  `created_at` to another valid ISO timestamp one second later, assert all
+  cardinalities are unchanged, and assert resume validation fails before the
+  producer, timing, or cleanup arming.
+
+### C2 — Eight deterministic attempt fields implicitly seeded as `NULL` are omitted
+
+Relevant code:
+
+- `backend/alembic/versions/0076_llm_provider_attempts.py:17-57`
+- `scripts/perf/admin_usage_scale.py:1155-1196`
+- `scripts/perf/admin_usage_scale.py:1369-1420`
+
+The attempt insert omits eight non-default business/identity fields, so every
+formal seed row deterministically stores SQL `NULL`.  The exact-source query's
+`compared` tuple omits all eight:
+
+| Field | Seed contract | Semantic class |
+| --- | --- | --- |
+| `installation_id` | `NULL::text` | installation identity/provenance |
+| `runtime` | `NULL::text` | runtime identity/provenance |
+| `turn_id` | `NULL::text` | turn identity |
+| `round_id` | `NULL::text` | round identity |
+| `provider_request_id` | `NULL::text` | provider request identity |
+| `usage_unknown_reason` | `NULL::text` | usage/reliability classification |
+| `latency_ms` | `NULL::double precision` | attempt delivery/latency fact |
+| `rate_card_version` | `NULL::text` | pricing provenance |
+
+These are canonical ledger event fields or report/audit provenance, and none is
+database-maintained or expected to vary after seeding.  A same-count update of
+any one passes `_source_attempt_integrity_sql`, even though the row no longer
+matches the formal fixture.
+
+By contrast, `llm_provider_attempts.created_at` and `updated_at` are populated
+by `DEFAULT now()` because the seed does not specify them.  They depend on the
+actual insert wall clock (and may reflect later ledger maintenance), so they
+are the two genuinely nondeterministic database metadata columns that can be
+explicitly excluded from the fixed-source equality.  This exception does not
+apply to `users.created_at`, which the seed supplies from fixed formal inputs.
+
+Minimum fix:
+
+- Extend expected and actual source-attempt rows with all eight fields above,
+  using explicit typed `NULL`s in the expected relation and `IS DISTINCT FROM`
+  through the existing row comparison.  Keep only attempt `created_at` and
+  `updated_at` outside deterministic equality, and document that exclusion.
+- Add one parameterized, same-count PostgreSQL mutation test over the eight
+  fields.  For a one-row generated fixture, set exactly one field at a time to
+  a valid non-NULL value (`latency_ms=1` for the numeric case), verify row and
+  distinct-ID/call counts remain unchanged, and require
+  `source_attempts.mismatched_rows=1`.  This single parameterized test is the
+  minimum direct proof that every omitted column is now bound.
+
+### Closed findings and verification evidence
+
+- Previous C1 distribution/rollup/membership gap: **closed except for the two
+  source-column omissions above**.  The 90-day and raw-edge counts are derived
+  from the exact seed formula; daily user, daily dimension, attempt dimension,
+  and membership facts use full set/fact comparisons, not checksums.
+- Previous C2 formal configuration gap: **closed**.
+- Previous C3 post-producer revalidation gap: **closed**.
+- Previous I1 control-flow coverage gap: **closed** for invalid,
+  validate-only, postvalidation-before-timing, failure-before-arming, and stable
+  snapshot ordering.
+- Focused suite: **94 passed, 1 skipped in 9.84s**.
+- `git diff a3911c76 156946ae --check`: passed.
+- Read-only dry artifact
+  `/private/tmp/admin-usage-resume-validation-strengthened.json` reports all six
+  integrity queries passing with zero mismatches and each below 30 seconds.
+- No formal run, cleanup, external provider request, or remote database write
+  was performed.  The existing untracked business-path artifact was untouched.
+
+### Ready verdict
+
+**Not ready for destructive formal resume.**  Bind deterministic
+`users.created_at` and all eight nonvolatile attempt fields to the exact source
+proof, add the two same-count mutation tests above, and rerun the bounded
+read-only validation before authorizing the formal resume/cleanup path.
+
 ## Resume-path review of `a3911c76f663dee0490f121959985af20895f04a`
 
 ### Resume review verdict
