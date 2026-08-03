@@ -1327,6 +1327,9 @@ class TurnDeps:
     # 任意一项可为 ""）：capture/dream prompt 需要的记忆上下文（enclave 解密明文）。取数失败
     # → 降级为空上下文，不失败 job（spec §3.5）。
     read_memory_context: Callable[[str], dict] | None = None
+    # Dream-specific reader may fetch full selected card bodies.  When absent,
+    # tests/legacy assembly fall back to read_memory_context.
+    read_dream_memory_context: Callable[[str], dict] | None = None
     # user_id -> (all rendered Garden cards, exact card count). Unlike
     # read_memory_context this is fail-loud and rejects any truncated read.
     read_profile_cards: Callable[[str], tuple[str, int]] | None = None
@@ -8819,10 +8822,15 @@ async def _run_extraction(
         # post_enclave 往返；read_tail 逐条解密），所以**必须同在 enclave_sem 闸内**——enclave
         # 是全系统共享、容量有限的解密代理，正是整个子项目要保护的东西（spec §4）。
         async with enclave_sem:
-            if deps.read_memory_context is not None:
+            memory_context_reader = (
+                deps.read_dream_memory_context
+                if lane == "dream" and deps.read_dream_memory_context is not None
+                else deps.read_memory_context
+            )
+            if memory_context_reader is not None:
                 try:
                     ctx = (
-                        await asyncio.to_thread(deps.read_memory_context, user_id) or {}
+                        await asyncio.to_thread(memory_context_reader, user_id) or {}
                     )
                 except Exception as e:  # noqa: BLE001 — 上下文取数失败 → 降级，不失败（spec §3.5）
                     log.warning(
@@ -9202,12 +9210,18 @@ async def _run_extraction(
                     "card_user_token_residual",
                     {"lane": lane, "count": leak_count, "cards": len(items)},
                 )
-            actions, _added, _superseded = to_actions(
-                items,
-                occurred_at=occurred_at,
-                source_ids=source_ids,
-                build_envelope=_build_extraction_envelope,
-            )
+            action_kwargs = {
+                "occurred_at": occurred_at,
+                "source_ids": source_ids,
+                "build_envelope": _build_extraction_envelope,
+            }
+            if lane == "dream" and "card_items" in ctx:
+                # Bind every destructive result to the exact full-text cards
+                # disclosed for this run.  Unknown, overlapping, fresh Dream
+                # output, and lossy 1:1 rewrites are rejected deterministically
+                # by the pure mapper before any write reaches Memory Garden.
+                action_kwargs["existing_cards"] = list(ctx.get("card_items") or [])
+            actions, _added, _superseded = to_actions(items, **action_kwargs)
         if claimed_by and not await asyncio.to_thread(
             jobs_store.renew_job_lease,
             job_id,

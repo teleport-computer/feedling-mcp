@@ -5,6 +5,7 @@ import json
 import re
 import unicodedata
 import uuid
+from datetime import datetime, timezone
 
 
 import db
@@ -22,6 +23,51 @@ from memory.source_policy import (
     MEMORY_CAPTURE_MODE_VALUES,
     MEMORY_SOURCE_VALUES,
 )
+
+
+_DREAM_MAX_CONSOLIDATIONS = 5
+_DREAM_OUTPUT_COOLDOWN_SEC = 7 * 24 * 60 * 60
+
+
+def _memory_iso_epoch(value) -> float | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _dream_target_cooldown_error(action: dict, old_cards: list[dict]) -> dict | None:
+    """Apply-time backstop for fresh Dream-output rewrites.
+
+    Prompt/input filtering is not a write fence.  Re-check envelope provenance
+    immediately before applying a Dream supersede so a stale or forged action
+    cannot feed yesterday's generated card back into the lane.
+    """
+
+    if str(action.get("capture_mode") or "").strip() != "memory_dream":
+        return None
+    now_epoch = datetime.now(timezone.utc).timestamp()
+    blocked: list[str] = []
+    for card in old_cards:
+        if str(card.get("source") or "").strip() != "memory_dream":
+            continue
+        created = _memory_iso_epoch(card.get("created_at") or card.get("occurred_at"))
+        if created is None or now_epoch - created < _DREAM_OUTPUT_COOLDOWN_SEC:
+            blocked.append(str(card.get("id") or ""))
+    if not blocked:
+        return None
+    return {
+        "status": "error",
+        "error": "memory_dream_target_cooldown",
+        "blocked": blocked,
+        "action": "memory.supersede",
+    }
 
 
 def _memory_action_metadata_error(action: dict) -> dict | None:
@@ -796,6 +842,9 @@ def _memory_supersede_action(
     old_cards = [moments[idx] for idx in old_indices]
     if any(old.get("owner_user_id") != store.user_id for old in old_cards):
         return {"status": "error", "error": "not_owned", "action": "memory.supersede"}, [], 403
+    cooldown_error = _dream_target_cooldown_error(action, old_cards)
+    if cooldown_error is not None:
+        return cooldown_error, [], 409
 
     ok, err = _memory_validate_write(store, moments, mem_type=mem_type, anchor_ids=anchor_ids)
     if not ok:
@@ -901,6 +950,9 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
     old_cards = [moments[idx] for idx in old_indices]
     if any(old.get("owner_user_id") != store.user_id for old in old_cards):
         return {"status": "error", "error": "not_owned", "action": "memory.supersede"}, [], 403
+    cooldown_error = _dream_target_cooldown_error(action, old_cards)
+    if cooldown_error is not None:
+        return cooldown_error, [], 409
 
     envelope["supersedes"] = list(old_ids)
     ok, err = _memory_validate_prebuilt_envelope(
@@ -1068,6 +1120,25 @@ def _execute_memory_actions(
         return {
             "status": "error",
             "error": "actions_required",
+            "results": [],
+            "effects": [],
+            "total_count": 0,
+            "applied_count": 0,
+            "skipped_count": 0,
+            "failed_count": 0,
+        }, 400
+    dream_rewrites = sum(
+        1
+        for action in actions
+        if isinstance(action, dict)
+        and str(action.get("type") or "").strip() == "memory.supersede"
+        and str(action.get("capture_mode") or "").strip() == "memory_dream"
+    )
+    if dream_rewrites > _DREAM_MAX_CONSOLIDATIONS:
+        return {
+            "status": "error",
+            "error": "memory_dream_action_cap_exceeded",
+            "limit": _DREAM_MAX_CONSOLIDATIONS,
             "results": [],
             "effects": [],
             "total_count": 0,

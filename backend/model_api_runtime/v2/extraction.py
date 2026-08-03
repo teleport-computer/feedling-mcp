@@ -11,6 +11,9 @@
 
 from __future__ import annotations
 
+import math
+import re
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, NamedTuple
 
 import provider_client
@@ -18,6 +21,78 @@ import provider_client
 _MAX_TOKENS = 1500
 _TEMPERATURE = 0.3
 _TIMEOUT_SEC = 90.0
+
+# Dream is maintenance, not a bulk rewrite lane.  These are hard safety
+# bounds rather than model instructions: a weak or compromised provider cannot
+# bypass them by returning a larger batch.
+DREAM_MAX_CONSOLIDATIONS = 5
+DREAM_OUTPUT_COOLDOWN_SEC = 7 * 24 * 60 * 60
+
+
+def _iso_epoch(value: Any) -> float | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def dream_card_is_eligible(card: dict, *, now_epoch: float) -> bool:
+    """Whether an existing card may be consumed by this Dream run.
+
+    Fresh Dream output is deliberately unavailable for seven days.  This
+    breaks the nightly output->input feedback loop at both prompt construction
+    and deterministic action mapping.  Missing provenance timestamps fail
+    closed for Dream-authored cards; ordinary Capture/import cards are not
+    delayed.
+    """
+
+    if not isinstance(card, dict):
+        return False
+    source = str(card.get("source") or card.get("capture_mode") or "").strip()
+    if source != "memory_dream":
+        return True
+    created = _iso_epoch(card.get("created_at") or card.get("occurred_at"))
+    return created is not None and now_epoch - created >= DREAM_OUTPUT_COOLDOWN_SEC
+
+
+def _semantic_text(card: dict) -> str:
+    values: list[str] = []
+    for key in ("title", "summary", "description", "content"):
+        value = str(card.get(key) or "").strip()
+        if value and value not in values:
+            values.append(value)
+    return " ".join(values)
+
+
+def _normalized_semantic_text(card: dict) -> str:
+    return "".join(re.findall(r"[\w]", _semantic_text(card).lower(), flags=re.UNICODE))
+
+
+def _has_substantive_increment(old_card: dict, result: dict) -> bool:
+    """Conservative deterministic fence for one-card Dream rewrites.
+
+    A 1:1 ``thicken``/``supersede`` must contain materially more text *and*
+    genuinely new 3-character sequences.  Paraphrases and lossy summaries are
+    rejected; multi-card merges use the separate all-targets-present fence.
+    """
+
+    old_text = _normalized_semantic_text(old_card)
+    new_text = _normalized_semantic_text(result)
+    if not old_text or not new_text:
+        return False
+    min_growth = max(24, math.ceil(len(old_text) * 0.15))
+    if len(new_text) < len(old_text) + min_growth:
+        return False
+    old_grams = {old_text[i : i + 3] for i in range(max(0, len(old_text) - 2))}
+    new_grams = {new_text[i : i + 3] for i in range(max(0, len(new_text) - 2))}
+    min_novel = max(6, math.ceil(len(old_grams) * 0.10))
+    return len(new_grams - old_grams) >= min_novel
 
 
 class ParseRetry(NamedTuple):
@@ -323,7 +398,13 @@ def cards_to_actions(cards, *, occurred_at, source_ids, build_envelope):
 
 
 def consolidations_to_actions(
-    consolidations, *, occurred_at, source_ids, build_envelope
+    consolidations,
+    *,
+    occurred_at,
+    source_ids,
+    build_envelope,
+    existing_cards: list[dict] | None = None,
+    now_epoch: float | None = None,
 ):
     """Map Dream's native ``op/card_ids/result`` shape to multi-card
     ``memory.supersede`` actions.
@@ -334,6 +415,20 @@ def consolidations_to_actions(
     """
     actions: list[dict] = []
     superseded = 0
+    guarded = existing_cards is not None
+    by_id = {
+        str(card.get("id") or "").strip(): card
+        for card in (existing_cards or [])
+        if isinstance(card, dict) and str(card.get("id") or "").strip()
+    }
+    effective_now = (
+        float(now_epoch)
+        if now_epoch is not None
+        else (_iso_epoch(occurred_at) or datetime.now(timezone.utc).timestamp())
+    )
+    used_ids: set[str] = set()
+    guard_rejections = 0
+    structurally_valid = 0
     for consolidation in consolidations or []:
         if not isinstance(consolidation, dict):
             continue
@@ -353,6 +448,24 @@ def consolidations_to_actions(
         )
         if op not in {"merge", "thicken", "supersede"} or not card_ids or not result:
             continue
+        structurally_valid += 1
+        if guarded:
+            old_cards = [by_id.get(memory_id) for memory_id in card_ids]
+            if (
+                any(card is None for card in old_cards)
+                or any(memory_id in used_ids for memory_id in card_ids)
+                or any(
+                    not dream_card_is_eligible(card, now_epoch=effective_now)
+                    for card in old_cards
+                    if card is not None
+                )
+                or (
+                    len(card_ids) == 1
+                    and not _has_substantive_increment(old_cards[0], result)
+                )
+            ):
+                guard_rejections += 1
+                continue
         card = {"type": "fact", **result}
         actions.append(
             {
@@ -373,6 +486,11 @@ def consolidations_to_actions(
             }
         )
         superseded += len(card_ids)
-    if consolidations and not actions:
+        used_ids.update(card_ids)
+        if len(actions) >= DREAM_MAX_CONSOLIDATIONS:
+            break
+    if consolidations and not actions and not (
+        guarded and structurally_valid > 0 and guard_rejections == structurally_valid
+    ):
         raise ValueError("dream_no_memory_actions")
     return actions, 0, superseded

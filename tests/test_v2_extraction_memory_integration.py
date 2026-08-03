@@ -158,3 +158,58 @@ def test_dream_parser_mapper_and_real_validator_supersede_all_sources(monkeypatc
     assert new["supersedes"] == ["memory-a", "memory-b"]
     assert new["source"] == "memory_dream"
     assert new["occurred_at"] == "2026-07-18T10:00:00Z"
+
+
+def test_dream_apply_rejects_fresh_dream_output_even_if_mapper_is_bypassed(monkeypatch):
+    user_id = "dream-cooldown-user"
+    store = types.SimpleNamespace(user_id=user_id)
+    recent = _old_card(user_id, "dream-recent")
+    recent["source"] = "memory_dream"
+    recent["created_at"] = "2999-01-01T00:00:00Z"
+    moments = [recent]
+    saved = _install_storage(monkeypatch, moments)
+    actions, _added, _superseded = extraction.consolidations_to_actions(
+        [{
+            "op": "thicken",
+            "card_ids": ["dream-recent"],
+            "result": {"summary": "new", "content": "new body"},
+        }],
+        occurred_at="2026-08-01T00:00:00Z",
+        source_ids=[],
+        build_envelope=_builder(user_id),
+    )
+
+    body, status = memory_actions._execute_memory_actions(store, None, actions)
+
+    assert status == 400
+    assert body["error"] == "memory_dream_target_cooldown"
+    assert saved == []
+    assert moments[0]["status"] == "active"
+
+
+def test_dream_apply_rejects_more_than_five_rewrites_before_any_write(monkeypatch):
+    user_id = "dream-cap-user"
+    store = types.SimpleNamespace(user_id=user_id)
+    moments = [_old_card(user_id, f"memory-{i}") for i in range(12)]
+    saved = _install_storage(monkeypatch, moments)
+    builder = _builder(user_id)
+    actions = []
+    for i in range(6):
+        mapped, _added, _superseded = extraction.consolidations_to_actions(
+            [{
+                "op": "merge",
+                "card_ids": [f"memory-{i * 2}", f"memory-{i * 2 + 1}"],
+                "result": {"summary": f"merged-{i}", "content": f"body-{i}"},
+            }],
+            occurred_at="2026-08-01T00:00:00Z",
+            source_ids=[],
+            build_envelope=builder,
+        )
+        actions.extend(mapped)
+
+    body, status = memory_actions._execute_memory_actions(store, None, actions)
+
+    assert status == 400
+    assert body["error"] == "memory_dream_action_cap_exceeded"
+    assert saved == []
+    assert all(moment["status"] == "active" for moment in moments)

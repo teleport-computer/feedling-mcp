@@ -484,6 +484,115 @@ def test_consolidations_to_actions_supersedes_when_target_present():
     assert actions[0]["envelope"]["occurred_at"] == "T"
 
 
+def _existing(memory_id, *, source="memory_capture", created_at="2026-07-01T00:00:00Z"):
+    return {
+        "id": memory_id,
+        "summary": f"{memory_id} 的旧摘要",
+        "content": f"{memory_id} 的旧卡正文，包含需要完整保留的具体事实。",
+        "source": source,
+        "created_at": created_at,
+    }
+
+
+def _merge(ids, *, content="合并后的正文包含两张旧卡的全部具体事实，并保留原始上下文。"):
+    return {
+        "op": "merge",
+        "card_ids": list(ids),
+        "result": {"summary": "合并摘要", "content": content},
+    }
+
+
+def test_dream_guard_caps_batch_and_never_touches_unreferenced_cards():
+    cards = [_existing(f"m{i}") for i in range(13)]
+    consolidations = [_merge([f"m{i}", f"m{i + 1}"]) for i in range(0, 12, 2)]
+
+    actions, _added, superseded = extraction.consolidations_to_actions(
+        consolidations,
+        occurred_at="2026-08-01T00:00:00Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
+    )
+
+    assert len(actions) == extraction.DREAM_MAX_CONSOLIDATIONS == 5
+    assert superseded == 10
+    touched = {memory_id for action in actions for memory_id in action["supersedes"]}
+    assert touched == {f"m{i}" for i in range(10)}
+    assert "m12" not in touched
+
+
+def test_dream_guard_rejects_unknown_and_overlapping_targets():
+    cards = [_existing("m1"), _existing("m2"), _existing("m3")]
+    actions, _added, superseded = extraction.consolidations_to_actions(
+        [
+            _merge(["m1", "m2"]),
+            _merge(["m2", "m3"]),
+            _merge(["missing", "m3"]),
+        ],
+        occurred_at="2026-08-01T00:00:00Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=cards,
+    )
+
+    assert len(actions) == 1
+    assert actions[0]["supersedes"] == ["m1", "m2"]
+    assert superseded == 2
+
+
+def test_dream_guard_rejects_lossy_one_to_one_rewrite():
+    card = _existing("m1")
+    actions, added, superseded = extraction.consolidations_to_actions(
+        [{"op": "thicken", "card_ids": ["m1"], "result": {
+            "summary": "改写摘要", "content": "更短的改写。",
+        }}],
+        occurred_at="2026-08-01T00:00:00Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=[card],
+    )
+
+    assert (actions, added, superseded) == ([], 0, 0)
+
+
+def test_dream_guard_accepts_one_to_one_only_with_substantive_increment():
+    card = _existing("m1")
+    new_detail = (
+        card["content"]
+        + " 新增事实：从 2026 年 7 月起固定使用浅烘豆，并记录了研磨刻度、水粉比和冲煮时长。"
+    )
+    actions, _added, superseded = extraction.consolidations_to_actions(
+        [{"op": "thicken", "card_ids": ["m1"], "result": {
+            "summary": card["summary"], "content": new_detail,
+        }}],
+        occurred_at="2026-08-01T00:00:00Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=[card],
+    )
+
+    assert len(actions) == 1
+    assert superseded == 1
+
+
+def test_dream_guard_rejects_recent_dream_output_for_seven_days():
+    fresh = _existing(
+        "dream-new",
+        source="memory_dream",
+        created_at="2026-07-30T00:00:00Z",
+    )
+    other = _existing("m2")
+    actions, added, superseded = extraction.consolidations_to_actions(
+        [_merge(["dream-new", "m2"])],
+        occurred_at="2026-08-01T00:00:00Z",
+        source_ids=[],
+        build_envelope=_env,
+        existing_cards=[fresh, other],
+    )
+
+    assert (actions, added, superseded) == ([], 0, 0)
+
+
 def test_nonempty_actions_require_occurred_at():
     with pytest.raises(ValueError, match="memory_occurred_at_required"):
         extraction.cards_to_actions(
