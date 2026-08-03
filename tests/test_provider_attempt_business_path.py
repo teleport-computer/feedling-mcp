@@ -58,11 +58,110 @@ def _healthy_artifact(commit: str = "a" * 40) -> dict:
             "paired_latency_delta_ms": [0.1] * (samples * 3),
             "paired_p95_regression_ms": 0.1,
             "failure_modes": {
-                name: {"observed": True, "dropped_count": 1}
-                for name in ("startup", "pool", "sql", "serialization")
+                "startup": {
+                    "stage": "thread_factory",
+                    "exception_type": "RuntimeError",
+                    "injection_calls": 1,
+                    "queue_size_before": 0,
+                    "queue_size_after": 100,
+                    "queue_capacity": 4096,
+                    "drop_before": 0,
+                    "drop_after": 1,
+                    "drop_delta": 1,
+                    "queue_full_drops": 0,
+                    "start_returned": False,
+                },
+                "pool": {
+                    "stage": "pool_factory",
+                    "exception_type": "RuntimeError",
+                    "injection_calls": 10,
+                    "queue_size_before": 0,
+                    "queue_size_after": 0,
+                    "queue_capacity": 4096,
+                    "drop_before": 0,
+                    "drop_after": 20,
+                    "drop_delta": 20,
+                    "queue_full_drops": 0,
+                },
+                "sql": {
+                    "stage": "cursor_executemany",
+                    "exception_type": "RuntimeError",
+                    "injection_calls": 10,
+                    "queue_size_before": 0,
+                    "queue_size_after": 0,
+                    "queue_capacity": 4096,
+                    "drop_before": 0,
+                    "drop_after": 20,
+                    "drop_delta": 20,
+                    "queue_full_drops": 0,
+                },
+                "serialization": {
+                    "stage": "event_type_check",
+                    "exception_type": "TypeError",
+                    "injected_items": 1,
+                    "consumed_items": 1,
+                    "queue_size_before": 0,
+                    "queue_size_after": 0,
+                    "queue_capacity": 4096,
+                    "drop_before": 0,
+                    "drop_after": 1,
+                    "drop_delta": 1,
+                    "queue_full_drops": 0,
+                },
             },
         }
     )
+    pool_roles = (
+        "usage_exporter",
+        "usage_importer_core",
+        "usage_importer_attempt",
+        "provider_recorder",
+        "attempt_rollup_outer",
+        "attempt_rollup_rebuild",
+    )
+    raw_acquisitions = [
+        {
+            "event_id": index + 1,
+            "role": role,
+            "thread_id": index + 10,
+            "acquired_ns": 100 + index,
+            "released_ns": 200 + index,
+            "wait_ms": 0.1,
+        }
+        for index, role in enumerate(pool_roles)
+    ]
+    active = []
+    active_snapshots = []
+    for index, role in enumerate(pool_roles):
+        active.append(role)
+        active_snapshots.append(
+            {
+                "at_ns": 100 + index,
+                "active_count": len(active),
+                "active_roles": sorted(set(active)),
+            }
+        )
+    for index, role in enumerate(pool_roles):
+        active.remove(role)
+        active_snapshots.append(
+            {
+                "at_ns": 200 + index,
+                "active_count": len(active),
+                "active_roles": sorted(set(active)),
+            }
+        )
+    pool_paths = {
+        "baseline": {
+            provider: copy.deepcopy(provider_path)
+            for provider in ("openrouter", "anthropic", "google")
+        },
+        "pool_contention": {
+            provider: copy.deepcopy(provider_path)
+            for provider in ("openrouter", "anthropic", "google")
+        },
+    }
+    for path in pool_paths["pool_contention"].values():
+        path["raw_latency_ms"] = [1.1] * samples
     payload = {
         "schema_version": 1,
         "producer": "scripts/perf/provider_attempt_business_path.py",
@@ -90,18 +189,30 @@ def _healthy_artifact(commit: str = "a" * 40) -> dict:
         "pool": {
             "measurement": "production_concurrent_paths",
             "capacity": 16,
-            "peak_occupancy": 5,
+            "peak_occupancy": 6,
             "timeouts": 0,
-            "operations": ["provider_recorder", "attempt_rollup_maintenance", "usage_report"],
-            "provider_results_match_baseline": True,
+            "roles": sorted(pool_roles),
             "report_statement_timeout_ms": 3000,
             "maintenance_second_connection_observed": True,
-            "raw_acquisitions": [
-                {"operation": name, "occupancy": index + 1, "wait_ms": 0.1}
-                for index, name in enumerate(
-                    ("provider_recorder", "attempt_rollup_maintenance", "usage_report")
-                )
-            ],
+            "required_overlap_observed": True,
+            "active_role_snapshots": active_snapshots,
+            "raw_acquisitions": raw_acquisitions,
+            "provider_paths": {
+                "samples_per_provider": samples,
+                "paths": pool_paths,
+                "execution_order": [
+                    {"provider": provider, "sample": sample, "scenario": scenario}
+                    for provider in ("openrouter", "anthropic", "google")
+                    for sample in range(samples)
+                    for scenario in (
+                        ("baseline", "pool_contention")
+                        if sample % 2 == 0
+                        else ("pool_contention", "baseline")
+                    )
+                ],
+                "paired_latency_delta_ms": [0.1] * (samples * 3),
+                "paired_p95_regression_ms": 0.1,
+            },
         },
     }
     payload["canonical_sha256"] = _canonical_digest(payload)
@@ -245,8 +356,67 @@ def test_validator_rejects_non_interleaved_execution_claim() -> None:
         validate_business_path_evidence(artifact, expected_commit="a" * 40)
 
 
+def test_validator_rejects_queue_full_as_failure_mode_witness() -> None:
+    from scripts.perf.provider_attempt_business_path import (
+        validate_business_path_evidence,
+    )
+
+    artifact = _healthy_artifact()
+    mode = artifact["scenarios"]["recorder_failures"]["failure_modes"]["pool"]
+    mode["injection_calls"] = 0
+    mode["queue_full_drops"] = mode["drop_delta"]
+    artifact["canonical_sha256"] = _canonical_digest(artifact)
+
+    with pytest.raises(ValueError, match="queue-full evidence is ambiguous"):
+        validate_business_path_evidence(artifact, expected_commit="a" * 40)
+
+
+def test_validator_rejects_missing_pool_role_or_nonoverlapping_intervals() -> None:
+    from scripts.perf.provider_attempt_business_path import (
+        _derive_pool_timeline,
+        validate_business_path_evidence,
+    )
+
+    missing = _healthy_artifact()
+    missing["pool"]["raw_acquisitions"][1]["role"] = "usage_importer_attempt"
+    missing["canonical_sha256"] = _canonical_digest(missing)
+    with pytest.raises(ValueError, match="roles incomplete"):
+        validate_business_path_evidence(missing, expected_commit="a" * 40)
+
+    disjoint = _healthy_artifact()
+    for index, item in enumerate(disjoint["pool"]["raw_acquisitions"]):
+        item["acquired_ns"] = index * 20
+        item["released_ns"] = index * 20 + 10
+    timeline = _derive_pool_timeline(disjoint["pool"]["raw_acquisitions"])
+    disjoint["pool"].update(timeline)
+    disjoint["canonical_sha256"] = _canonical_digest(disjoint)
+    with pytest.raises(ValueError, match="maintenance second connection"):
+        validate_business_path_evidence(disjoint, expected_commit="a" * 40)
+
+
+def test_validator_rejects_pool_contention_latency_regression_from_raw_pairs() -> None:
+    from scripts.perf.provider_attempt_business_path import (
+        validate_business_path_evidence,
+    )
+
+    artifact = _healthy_artifact()
+    payload = artifact["pool"]["provider_paths"]
+    candidate = payload["paths"]["pool_contention"]["openrouter"][
+        "raw_latency_ms"
+    ]
+    candidate[:4] = [10.0] * 4
+    payload["paired_latency_delta_ms"][:4] = [9.0] * 4
+    artifact["canonical_sha256"] = _canonical_digest(artifact)
+
+    with pytest.raises(ValueError, match="pool paired p95"):
+        validate_business_path_evidence(artifact, expected_commit="a" * 40)
+
+
 def test_tracked_pool_records_raw_peak_and_nested_maintenance_connection() -> None:
-    from scripts.perf.provider_attempt_business_path import _TrackedPool
+    from scripts.perf.provider_attempt_business_path import (
+        _TrackedPool,
+        _derive_pool_timeline,
+    )
 
     class ConnectionContext:
         def __enter__(self):
@@ -266,7 +436,7 @@ def test_tracked_pool_records_raw_peak_and_nested_maintenance_connection() -> No
     release = threading.Event()
 
     def report() -> None:
-        with tracker.operation("usage_report"):
+        with tracker.operation("usage_exporter"):
             with tracker.connection():
                 report_ready.set()
                 assert release.wait(1)
@@ -274,18 +444,19 @@ def test_tracked_pool_records_raw_peak_and_nested_maintenance_connection() -> No
     thread = threading.Thread(target=report)
     thread.start()
     assert report_ready.wait(1)
-    with tracker.operation("attempt_rollup_maintenance"):
+    with tracker.operation("attempt_rollup"):
         with tracker.connection():
             with tracker.connection():
                 release.set()
     thread.join(1)
 
-    evidence = tracker.evidence(provider_results_match_baseline=True)
-    assert evidence["peak_occupancy"] == 3
-    assert evidence["maintenance_second_connection_observed"] is True
-    assert {item["operation"] for item in evidence["raw_acquisitions"]} == {
-        "usage_report",
-        "attempt_rollup_maintenance",
+    timeline = _derive_pool_timeline(tracker._raw)
+    assert timeline["peak_occupancy"] == 3
+    assert timeline["maintenance_second_connection_observed"] is True
+    assert {item["role"] for item in tracker._raw} == {
+        "usage_exporter",
+        "attempt_rollup_outer",
+        "attempt_rollup_rebuild",
     }
 
 

@@ -33,11 +33,25 @@ SCHEMA_VERSION = 1
 PRODUCER = "scripts/perf/provider_attempt_business_path.py"
 PROVIDERS = ("openrouter", "anthropic", "google")
 FAILURE_MODES = ("startup", "pool", "sql", "serialization")
+FAILURE_STAGES = {
+    "startup": "thread_factory",
+    "pool": "pool_factory",
+    "sql": "cursor_executemany",
+    "serialization": "event_type_check",
+}
 MIN_SAMPLES_PER_PROVIDER = 20
 DEFAULT_SAMPLES_PER_PROVIDER = 40
 DEFAULT_WARMUPS_PER_PROVIDER = 3
 HOT_PATH_PAIRED_P95_BUDGET_MS = 5.0
 REPORT_STATEMENT_TIMEOUT_MS = 3_000
+POOL_ROLES = (
+    "usage_exporter",
+    "usage_importer_core",
+    "usage_importer_attempt",
+    "provider_recorder",
+    "attempt_rollup_outer",
+    "attempt_rollup_rebuild",
+)
 
 
 def _canonical_bytes(payload: dict[str, Any]) -> bytes:
@@ -215,41 +229,104 @@ def validate_business_path_evidence(
     _require(isinstance(failure_modes, dict) and set(failure_modes) == set(FAILURE_MODES), "recorder failure modes incomplete")
     for name in FAILURE_MODES:
         mode = failure_modes[name]
-        _require(mode.get("observed") is True and isinstance(mode.get("dropped_count"), int) and mode["dropped_count"] > 0, f"recorder {name} failure not observed")
+        _require(mode.get("stage") == FAILURE_STAGES[name], f"recorder {name} stage mismatch")
+        _require(mode.get("exception_type") in {"RuntimeError", "TypeError"}, f"recorder {name} exception witness missing")
+        _require(mode.get("queue_size_before") == 0, f"recorder {name} queue precondition invalid")
+        _require(mode.get("queue_full_drops") == 0, f"recorder {name} queue-full evidence is ambiguous")
+        _require(
+            isinstance(mode.get("drop_before"), int)
+            and isinstance(mode.get("drop_after"), int)
+            and mode.get("drop_delta") == mode["drop_after"] - mode["drop_before"]
+            and mode["drop_delta"] > 0,
+            f"recorder {name} dedicated drop delta invalid",
+        )
+        if name == "serialization":
+            _require(mode.get("injected_items") == 1 and mode.get("consumed_items") == 1, "recorder serialization witness missing")
+            _require(mode["drop_delta"] == 1, "recorder serialization drop delta invalid")
+        else:
+            _require(isinstance(mode.get("injection_calls"), int) and mode["injection_calls"] > 0, f"recorder {name} injection was not called")
+        if name == "startup":
+            _require(mode["injection_calls"] == 1 and mode["drop_delta"] == 1, "recorder startup witness invalid")
 
     pool = evidence.get("pool")
     _require(isinstance(pool, dict), "pool evidence missing")
     _require(pool.get("measurement") == "production_concurrent_paths", "pool measurement provenance missing")
     _require(isinstance(pool.get("capacity"), int) and pool["capacity"] >= 2, "pool capacity invalid")
-    _require(isinstance(pool.get("peak_occupancy"), int) and 2 <= pool["peak_occupancy"] <= pool["capacity"], "pool peak invalid")
     _require(pool.get("timeouts") == 0, "pool timeout observed")
-    _require(
-        set(pool.get("operations") or ())
-        == {"provider_recorder", "attempt_rollup_maintenance", "usage_report"},
-        "pool operations incomplete",
-    )
-    _require(pool.get("provider_results_match_baseline") is True, "pool contention changed provider results")
     _require(pool.get("report_statement_timeout_ms") == REPORT_STATEMENT_TIMEOUT_MS, "report timeout budget changed")
-    _require(pool.get("maintenance_second_connection_observed") is True, "maintenance second connection not observed")
     acquisitions = pool.get("raw_acquisitions")
     _require(isinstance(acquisitions, list) and acquisitions, "pool raw acquisitions missing")
     _require(
         all(
             isinstance(item, dict)
-            and item.get("operation") in pool["operations"]
-            and isinstance(item.get("occupancy"), int)
-            and 1 <= item["occupancy"] <= pool["capacity"]
+            and item.get("role") in POOL_ROLES
+            and isinstance(item.get("event_id"), int)
             and isinstance(item.get("wait_ms"), (int, float))
             and item["wait_ms"] >= 0
             for item in acquisitions
         ),
         "pool raw acquisition invalid",
     )
+    timeline = _derive_pool_timeline(acquisitions)
     _require(
-        set(item["operation"] for item in acquisitions) == set(pool["operations"]),
-        "pool raw operations incomplete",
+        set(item["role"] for item in acquisitions) == set(POOL_ROLES),
+        "pool roles incomplete",
     )
+    _require(pool.get("roles") == sorted(POOL_ROLES), "pool role summary mismatch")
+    for key in (
+        "peak_occupancy",
+        "maintenance_second_connection_observed",
+        "required_overlap_observed",
+        "active_role_snapshots",
+    ):
+        _require(pool.get(key) == timeline[key], f"pool {key} summary mismatch")
+    _require(timeline["peak_occupancy"] <= pool["capacity"], "pool peak exceeds capacity")
+    _require(timeline["maintenance_second_connection_observed"] is True, "maintenance second connection not observed")
+    _require(timeline["required_overlap_observed"] is True, "required pool role overlap absent")
+    _validate_pool_provider_paths(pool.get("provider_paths"), budget=float(budget))
     return evidence
+
+
+def _validate_pool_provider_paths(payload: Any, *, budget: float) -> None:
+    _require(isinstance(payload, dict), "pool provider paths missing")
+    samples = payload.get("samples_per_provider")
+    _require(isinstance(samples, int) and samples >= MIN_SAMPLES_PER_PROVIDER, "pool provider samples insufficient")
+    paths = payload.get("paths")
+    _require(isinstance(paths, dict) and set(paths) == {"baseline", "pool_contention"}, "pool provider scenarios invalid")
+    for scenario in ("baseline", "pool_contention"):
+        _require(set(paths[scenario]) == set(PROVIDERS), f"pool {scenario} providers invalid")
+        for provider in PROVIDERS:
+            _validate_provider_path(
+                paths[scenario][provider],
+                samples=samples,
+                label=f"pool/{scenario}/{provider}",
+            )
+    expected_order = [
+        {"provider": provider, "sample": sample, "scenario": scenario}
+        for provider in PROVIDERS
+        for sample in range(samples)
+        for scenario in (
+            ("baseline", "pool_contention")
+            if sample % 2 == 0
+            else ("pool_contention", "baseline")
+        )
+    ]
+    _require(payload.get("execution_order") == expected_order, "pool provider execution order invalid")
+    for provider in PROVIDERS:
+        baseline = paths["baseline"][provider]
+        candidate = paths["pool_contention"][provider]
+        for key in (
+            "result_digests",
+            "exception_fingerprints",
+            "http_attempts",
+            "retries",
+        ):
+            _require(candidate[key] == baseline[key], f"pool {provider} {key} changed")
+    expected_deltas = _paired_deltas(paths["baseline"], paths["pool_contention"])
+    _require(payload.get("paired_latency_delta_ms") == expected_deltas, "pool raw paired deltas mismatch")
+    p95 = _nearest_rank(expected_deltas, 0.95)
+    _require(p95 < budget, "pool paired p95 exceeds strict budget")
+    _require(abs(float(payload.get("paired_p95_regression_ms")) - p95) < 0.001, "pool paired p95 claim mismatch")
 
 
 class _Context(AbstractContextManager):
@@ -269,7 +346,8 @@ class _TrackedConnectionContext(AbstractContextManager):
         self._kwargs = kwargs
         self._inner: Any = None
         self._connection: Any = None
-        self._operation = ""
+        self._role = ""
+        self._event_id = 0
 
     def __enter__(self) -> Any:
         started = time.perf_counter_ns()
@@ -281,28 +359,43 @@ class _TrackedConnectionContext(AbstractContextManager):
                 self._tracker._timeouts += 1
             raise
         wait_ms = (time.perf_counter_ns() - started) / 1_000_000
-        self._operation = self._tracker.current_operation()
+        acquired_ns = time.perf_counter_ns()
         with self._tracker._lock:
+            self._role = self._tracker._current_role_locked()
             self._tracker._occupancy += 1
             self._tracker._peak = max(self._tracker._peak, self._tracker._occupancy)
-            active = self._tracker._active_by_operation.get(self._operation, 0) + 1
-            self._tracker._active_by_operation[self._operation] = active
-            if self._operation == "attempt_rollup_maintenance" and active >= 2:
-                self._tracker._maintenance_second = True
+            self._tracker._next_event_id += 1
+            self._event_id = self._tracker._next_event_id
+            thread_id = threading.get_ident()
+            self._tracker._active_by_thread.setdefault(thread_id, []).append(
+                self._event_id
+            )
             self._tracker._raw.append(
                 {
-                    "operation": self._operation,
-                    "occupancy": self._tracker._occupancy,
+                    "event_id": self._event_id,
+                    "role": self._role,
+                    "thread_id": thread_id,
+                    "acquired_ns": acquired_ns,
+                    "released_ns": None,
                     "wait_ms": round(wait_ms, 6),
                 }
             )
         return self._connection
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-        with self._tracker._lock:
-            self._tracker._occupancy -= 1
-            self._tracker._active_by_operation[self._operation] -= 1
-        return bool(self._inner.__exit__(exc_type, exc, tb))
+        try:
+            return bool(self._inner.__exit__(exc_type, exc, tb))
+        finally:
+            released_ns = time.perf_counter_ns()
+            with self._tracker._lock:
+                self._tracker._occupancy -= 1
+                for item in self._tracker._raw:
+                    if item["event_id"] == self._event_id:
+                        item["released_ns"] = released_ns
+                        break
+                active = self._tracker._active_by_thread.get(threading.get_ident(), [])
+                if self._event_id in active:
+                    active.remove(self._event_id)
 
 
 class _TrackedPool:
@@ -315,24 +408,41 @@ class _TrackedPool:
         self._occupancy = 0
         self._peak = 0
         self._timeouts = 0
-        self._active_by_operation: dict[str, int] = {}
-        self._maintenance_second = False
+        self._active_by_thread: dict[int, list[int]] = {}
+        self._next_event_id = 0
         self._raw: list[dict[str, Any]] = []
 
     @property
     def max_size(self) -> int:
         return int(self._pool.max_size)
 
-    def current_operation(self) -> str:
+    def _current_role_locked(self) -> str:
         explicit = getattr(self._local, "operation", "")
+        if explicit == "attempt_rollup":
+            active = self._active_by_thread.get(threading.get_ident(), [])
+            return "attempt_rollup_rebuild" if active else "attempt_rollup_outer"
         if explicit:
             return str(explicit)
         name = threading.current_thread().name.lower()
         if "provider-attempt-recorder" in name:
             return "provider_recorder"
         if "usage" in name or "importer" in name:
-            return "usage_report"
+            return "usage_importer_pending"
         return "unknown"
+
+    def assign_current_role(self, role: str) -> None:
+        if role not in {"usage_importer_core", "usage_importer_attempt"}:
+            raise ValueError("invalid importer role")
+        with self._lock:
+            active = self._active_by_thread.get(threading.get_ident(), [])
+            if not active:
+                raise RuntimeError("no active importer acquisition")
+            event_id = active[-1]
+            for item in self._raw:
+                if item["event_id"] == event_id:
+                    item["role"] = role
+                    return
+            raise RuntimeError("active importer acquisition missing")
 
     @contextmanager
     def operation(self, name: str):
@@ -346,48 +456,122 @@ class _TrackedPool:
     def connection(self, **kwargs: Any) -> _TrackedConnectionContext:
         return _TrackedConnectionContext(self, kwargs)
 
-    def evidence(self, *, provider_results_match_baseline: bool) -> dict[str, Any]:
+    def evidence(self, *, provider_paths: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
+            timeline = _derive_pool_timeline(self._raw)
             return {
                 "measurement": "production_concurrent_paths",
                 "capacity": self.max_size,
-                "peak_occupancy": self._peak,
+                "peak_occupancy": timeline["peak_occupancy"],
                 "timeouts": self._timeouts,
-                "operations": sorted({item["operation"] for item in self._raw}),
-                "provider_results_match_baseline": provider_results_match_baseline,
+                "roles": sorted({item["role"] for item in self._raw}),
                 "report_statement_timeout_ms": REPORT_STATEMENT_TIMEOUT_MS,
-                "maintenance_second_connection_observed": self._maintenance_second,
+                "maintenance_second_connection_observed": timeline[
+                    "maintenance_second_connection_observed"
+                ],
+                "required_overlap_observed": timeline[
+                    "required_overlap_observed"
+                ],
+                "active_role_snapshots": timeline["active_role_snapshots"],
                 "raw_acquisitions": list(self._raw),
+                "provider_paths": provider_paths,
             }
 
 
+def _derive_pool_timeline(raw: list[dict[str, Any]]) -> dict[str, Any]:
+    points: list[tuple[int, int, int, str]] = []
+    for item in raw:
+        acquired = item.get("acquired_ns")
+        released = item.get("released_ns")
+        if not isinstance(acquired, int) or not isinstance(released, int):
+            raise ValueError("pool acquisition interval incomplete")
+        if released < acquired:
+            raise ValueError("pool acquisition interval reversed")
+        # A release and a later acquisition sharing the same clock tick are not
+        # overlapping; process releases first to keep the proof fail-closed.
+        points.append((acquired, 1, int(item["event_id"]), str(item["role"])))
+        points.append((released, 0, int(item["event_id"]), str(item["role"])))
+    active: dict[int, str] = {}
+    snapshots: list[dict[str, Any]] = []
+    peak = 0
+    for at_ns, kind, event_id, role in sorted(points):
+        if kind == 0:
+            active.pop(event_id, None)
+        else:
+            active[event_id] = role
+        roles = sorted(set(active.values()))
+        peak = max(peak, len(active))
+        snapshots.append(
+            {"at_ns": at_ns, "active_count": len(active), "active_roles": roles}
+        )
+    role_sets = [set(item["active_roles"]) for item in snapshots]
+    maintenance = {"attempt_rollup_outer", "attempt_rollup_rebuild"}
+    usage = {
+        "usage_exporter",
+        "usage_importer_core",
+        "usage_importer_attempt",
+    }
+    maintenance_second = any(maintenance <= roles for roles in role_sets)
+    required_overlap = bool(
+        any(usage <= roles for roles in role_sets)
+        and maintenance_second
+        and any(
+            "provider_recorder" in roles
+            and "attempt_rollup_outer" in roles
+            and len(roles & usage) >= 1
+            for roles in role_sets
+        )
+    )
+    return {
+        "peak_occupancy": peak,
+        "maintenance_second_connection_observed": maintenance_second,
+        "required_overlap_observed": required_overlap,
+        "active_role_snapshots": snapshots,
+    }
+
+
+class _InjectionWitness:
+    def __init__(self, stage: str):
+        self.stage = stage
+        self.calls = 0
+        self.exception_type = ""
+
+    def fail(self) -> None:
+        self.calls += 1
+        try:
+            raise RuntimeError(f"deterministic {self.stage} failure")
+        except RuntimeError as exc:
+            self.exception_type = type(exc).__name__
+            raise
+
+
 class _Cursor:
-    def __init__(self, *, fail: bool = False):
-        self.fail = fail
+    def __init__(self, *, witness: _InjectionWitness | None = None):
+        self.witness = witness
 
     def executemany(self, _sql: str, _rows: list[dict[str, Any]]) -> None:
-        if self.fail:
-            raise RuntimeError("deterministic SQL failure")
+        if self.witness is not None:
+            self.witness.fail()
 
 
 class _Connection:
-    def __init__(self, *, fail: bool = False):
-        self.fail = fail
+    def __init__(self, *, witness: _InjectionWitness | None = None):
+        self.witness = witness
 
     def cursor(self) -> _Context:
-        return _Context(_Cursor(fail=self.fail))
+        return _Context(_Cursor(witness=self.witness))
 
     def execute(self, *_args: Any, **_kwargs: Any) -> None:
-        if self.fail:
-            raise RuntimeError("deterministic SQL failure")
+        if self.witness is not None:
+            self.witness.fail()
 
 
 class _Pool:
-    def __init__(self, *, fail: bool = False):
-        self.fail = fail
+    def __init__(self, *, witness: _InjectionWitness | None = None):
+        self.witness = witness
 
     def connection(self, *_args: Any, **_kwargs: Any) -> _Context:
-        return _Context(_Connection(fail=self.fail))
+        return _Context(_Connection(witness=self.witness))
 
 
 class _StoppedThread:
@@ -535,6 +719,11 @@ def _run_interleaved_provider_paths(
     samples: int,
     warmups: int,
     records: dict[str, Callable[[Any], None]],
+    scenario_order: tuple[str, ...] = (
+        "baseline",
+        "queue_saturation",
+        "recorder_failures",
+    ),
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Run control/candidates adjacent, reversing order every sample."""
     transports = {
@@ -560,11 +749,7 @@ def _run_interleaved_provider_paths(
     old_record = pc.record_provider_attempt
     try:
         for sample in range(-warmups, samples):
-            order = (
-                ("baseline", "queue_saturation", "recorder_failures")
-                if sample % 2 == 0
-                else ("recorder_failures", "queue_saturation", "baseline")
-            )
+            order = scenario_order if sample % 2 == 0 else tuple(reversed(scenario_order))
             for scenario in order:
                 transport = transports[scenario]
                 pc._shared_client = clients[scenario]
@@ -626,34 +811,51 @@ def _paired_deltas(baseline: dict[str, Any], scenario: dict[str, Any]) -> list[f
 
 
 def _recorder_failure_fanout(accounting: Any) -> tuple[Callable[[Any], None], dict[str, Any], Callable[[], None]]:
+    capacity = 4096
+    startup_witness = _InjectionWitness("thread_factory")
     startup = accounting.ProviderAttemptRecorder(
-        queue_capacity=1,
-        thread_factory=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("startup")),
+        queue_capacity=capacity,
+        thread_factory=lambda **_kwargs: startup_witness.fail(),
     )
+    startup_before = {
+        "queue_size_before": startup.queue_size,
+        "drop_before": startup.dropped_count,
+    }
     startup_started = startup.start()
+    pool_witness = _InjectionWitness("pool_factory")
     pool = accounting.ProviderAttemptRecorder(
-        queue_capacity=16,
+        queue_capacity=capacity,
         batch_size=1,
         max_retries=0,
         flush_interval=0.001,
-        pool_factory=lambda: (_ for _ in ()).throw(RuntimeError("pool")),
+        pool_factory=pool_witness.fail,
     )
+    sql_witness = _InjectionWitness("cursor_executemany")
     sql = accounting.ProviderAttemptRecorder(
-        queue_capacity=16,
+        queue_capacity=capacity,
         batch_size=1,
         max_retries=0,
         flush_interval=0.001,
-        pool_factory=lambda: _Pool(fail=True),
+        pool_factory=lambda: _Pool(witness=sql_witness),
     )
     serialization = accounting.ProviderAttemptRecorder(
-        queue_capacity=16,
+        queue_capacity=capacity,
         batch_size=1,
         flush_interval=0.001,
         pool_factory=lambda: _Pool(),
     )
+    mode_before = {
+        "pool": (pool.queue_size, pool.dropped_count),
+        "sql": (sql.queue_size, sql.dropped_count),
+        "serialization": (serialization.queue_size, serialization.dropped_count),
+    }
     for recorder in (pool, sql, serialization):
         recorder.start()
     serialization._queue.put_nowait(object())
+    _wait_for(
+        lambda: serialization.queue_size == 0
+        and serialization.dropped_count - mode_before["serialization"][1] == 1
+    )
 
     def fanout(event: Any) -> None:
         for recorder in (startup, pool, sql, serialization):
@@ -662,17 +864,67 @@ def _recorder_failure_fanout(accounting: Any) -> tuple[Callable[[Any], None], di
     state: dict[str, Any] = {"startup_started": startup_started}
 
     def finish() -> None:
-        _wait_for(lambda: pool.dropped_count > 0 and sql.dropped_count > 0 and serialization.dropped_count > 0)
+        _wait_for(lambda: pool.queue_size == 0 and sql.queue_size == 0)
+        startup_drop_after = startup.dropped_count
         state["failure_modes"] = {
-            "startup": {"observed": not startup_started, "dropped_count": startup.dropped_count},
-            "pool": {"observed": pool.dropped_count > 0, "dropped_count": pool.dropped_count},
-            "sql": {"observed": sql.dropped_count > 0, "dropped_count": sql.dropped_count},
-            "serialization": {"observed": serialization.dropped_count > 0, "dropped_count": serialization.dropped_count},
+            "startup": {
+                **startup_before,
+                "stage": "thread_factory",
+                "exception_type": startup_witness.exception_type,
+                "injection_calls": startup_witness.calls,
+                "drop_after": startup_drop_after,
+                "drop_delta": startup_drop_after - startup_before["drop_before"],
+                "queue_size_after": startup.queue_size,
+                "queue_capacity": capacity,
+                "queue_full_drops": 0,
+                "start_returned": startup_started,
+            },
+            "pool": _recorder_mode_evidence(
+                pool, mode_before["pool"], pool_witness, "pool_factory", capacity
+            ),
+            "sql": _recorder_mode_evidence(
+                sql, mode_before["sql"], sql_witness, "cursor_executemany", capacity
+            ),
+            "serialization": {
+                "stage": "event_type_check",
+                "exception_type": "TypeError",
+                "injected_items": 1,
+                "consumed_items": 1 if serialization.queue_size == 0 else 0,
+                "queue_size_before": mode_before["serialization"][0],
+                "queue_size_after": serialization.queue_size,
+                "queue_capacity": capacity,
+                "drop_before": mode_before["serialization"][1],
+                "drop_after": serialization.dropped_count,
+                "drop_delta": serialization.dropped_count
+                - mode_before["serialization"][1],
+                "queue_full_drops": 0,
+            },
         }
         for recorder in (startup, pool, sql, serialization):
             recorder.shutdown(timeout=1)
 
     return fanout, state, finish
+
+
+def _recorder_mode_evidence(
+    recorder: Any,
+    before: tuple[int, int],
+    witness: _InjectionWitness,
+    stage: str,
+    capacity: int,
+) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "exception_type": witness.exception_type,
+        "injection_calls": witness.calls,
+        "queue_size_before": before[0],
+        "queue_size_after": recorder.queue_size,
+        "queue_capacity": capacity,
+        "drop_before": before[1],
+        "drop_after": recorder.dropped_count,
+        "drop_delta": recorder.dropped_count - before[1],
+        "queue_full_drops": 0,
+    }
 
 
 def _git_commit(repo: Path) -> str:
@@ -721,14 +973,6 @@ def measure_pool_contention_evidence(
 
     tracker = _TrackedPool(real_pool)
     dirty_day = datetime.now(timezone.utc).date()
-    baseline = _run_provider_path(
-        pc=pc,
-        accounting=accounting,
-        provider="openrouter",
-        samples=samples,
-        warmups=1,
-        record=lambda _event: None,
-    )
     recorder = accounting.ProviderAttemptRecorder(
         queue_capacity=128,
         batch_size=8,
@@ -745,21 +989,39 @@ def measure_pool_contention_evidence(
     def provider_work() -> None:
         try:
             start_gate.wait(timeout=2)
-            outcomes["provider"] = _run_provider_path(
-                pc=pc,
-                accounting=accounting,
-                provider="openrouter",
-                samples=samples,
-                warmups=1,
-                record=recorder.record,
-            )
+            paths = {"baseline": {}, "pool_contention": {}}
+            execution_order = []
+            for provider in PROVIDERS:
+                provider_paths, provider_order = _run_interleaved_provider_paths(
+                    pc=pc,
+                    accounting=accounting,
+                    provider=provider,
+                    samples=samples,
+                    warmups=1,
+                    records={
+                        "baseline": lambda _event: None,
+                        "pool_contention": recorder.record,
+                    },
+                    scenario_order=("baseline", "pool_contention"),
+                )
+                for scenario, path in provider_paths.items():
+                    paths[scenario][provider] = path
+                execution_order.extend(provider_order)
+            deltas = _paired_deltas(paths["baseline"], paths["pool_contention"])
+            outcomes["provider"] = {
+                "samples_per_provider": samples,
+                "paths": paths,
+                "execution_order": execution_order,
+                "paired_latency_delta_ms": deltas,
+                "paired_p95_regression_ms": round(_nearest_rank(deltas, 0.95), 6),
+            }
         except BaseException as exc:  # noqa: BLE001
             errors.append(f"provider:{type(exc).__name__}")
 
     def maintenance_work() -> None:
         try:
             start_gate.wait(timeout=2)
-            with tracker.operation("attempt_rollup_maintenance"):
+            with tracker.operation("attempt_rollup"):
                 outcomes["maintenance"] = provider_attempt_rollup.run_maintenance_tick(
                     max_days=1,
                     max_changed_rows=1,
@@ -775,7 +1037,7 @@ def measure_pool_contention_evidence(
     def report_work() -> None:
         try:
             start_gate.wait(timeout=2)
-            with tracker.operation("usage_report"):
+            with tracker.operation("usage_exporter"):
                 outcomes["report"] = jobs_store.usage_report_snapshot(usage_query)
         except BaseException as exc:  # noqa: BLE001
             errors.append(f"report:{type(exc).__name__}")
@@ -807,6 +1069,18 @@ def measure_pool_contention_evidence(
             )
     try:
         db_module.get_pool = lambda: tracker
+        old_observer = jobs_store._usage_snapshot_observer
+
+        def observe_usage(event: str, **fields: Any) -> None:
+            if event == "imported":
+                reader = str(fields.get("role") or "")
+                tracker.assign_current_role(
+                    "usage_importer_attempt"
+                    if "attempt" in reader
+                    else "usage_importer_core"
+                )
+
+        jobs_store._usage_snapshot_observer = observe_usage
         recorder.start()
         for thread in threads:
             thread.start()
@@ -817,31 +1091,20 @@ def measure_pool_contention_evidence(
         if errors:
             raise RuntimeError(f"pool proof production path failed: {errors}")
         _wait_for(lambda: recorder.queue_size == 0, timeout=2)
-        candidate = outcomes.get("provider") or {}
-        comparable_keys = (
-            "result_digests",
-            "exception_fingerprints",
-            "http_attempts",
-            "retries",
-            "business_errors",
-        )
-        results_match = all(
-            candidate.get(key) == baseline.get(key) for key in comparable_keys
-        )
-        evidence = tracker.evidence(
-            provider_results_match_baseline=results_match
-        )
-        if set(evidence["operations"]) != {
-            "provider_recorder",
-            "attempt_rollup_maintenance",
-            "usage_report",
-        }:
+        # An empty queue does not mean the worker has released the connection for
+        # the batch it just dequeued.  Join it before freezing interval evidence.
+        recorder.shutdown(timeout=2)
+        provider_paths = outcomes.get("provider") or {}
+        evidence = tracker.evidence(provider_paths=provider_paths)
+        if not set(POOL_ROLES) <= set(evidence["roles"]):
             raise RuntimeError(
-                f"pool proof did not observe every production path: {evidence['operations']}"
+                f"pool proof did not observe every production role: {evidence['roles']}"
             )
         return evidence
     finally:
         recorder.shutdown(timeout=2)
+        if "old_observer" in locals():
+            jobs_store._usage_snapshot_observer = old_observer
         db_module.get_pool = old_get_pool
         with real_pool.connection() as conn:
             conn.execute(

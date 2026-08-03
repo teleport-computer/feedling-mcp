@@ -41,26 +41,36 @@ The focused producer ran against the explicit dedicated local database
 `127.0.0.1:55432/feedling_usage_scale_task4d`; no remote RDS was touched.
 
 - Pool capacity: 16; measured peak occupancy: 5; acquisition timeouts: 0.
-- The raw acquisition stream contained Usage exporter/importers, recorder, and
-  two simultaneously held attempt-maintenance connections.
-- Provider results under pool contention matched baseline exactly.
+- The raw interval stream contained all six exact roles: Usage exporter, core
+  importer, attempt importer, recorder, attempt-maintenance outer connection,
+  and its nested rebuild connection.  The three Usage roles overlapped; the
+  two maintenance connections overlapped; and a measured five-connection
+  snapshot contained outer maintenance, nested rebuild, recorder, exporter and
+  attempt importer simultaneously.
+- Provider results, exceptions, HTTP attempts and retries under pool contention
+  matched their adjacent baseline samples exactly.  Pool contention's paired
+  p95 latency regression was +0.080875 ms.
 - OpenRouter, Anthropic and Google each recorded exactly two real HTTP requests
   and one retry per sample, with zero business errors in every scenario.
-- Queue saturation dropped 263 telemetry events while remaining bounded at its
+- Queue saturation dropped 515 telemetry events while remaining bounded at its
   configured capacity.
-- Startup, pool, SQL and serialization failures all produced recorder drops and
-  did not alter provider results, exceptions, HTTP-attempt counts or retries.
-- Paired p95 hot-path regression was +0.089416 ms for queue saturation and
-  +0.112750 ms for combined recorder failures, both strictly below the
+- Startup, pool, SQL and serialization failures each have an isolated
+  reason-bound witness: exact injection stage and exception type, an empty
+  precondition queue, before/after drop deltas and zero queue-full drops.
+  Serialization injects and consumes exactly one malformed item.  None altered
+  provider results, exceptions, HTTP-attempt counts or retries.
+- Paired p95 hot-path regression was +0.092917 ms for queue saturation and
+  +0.100708 ms for combined recorder failures, both strictly below the
   predeclared +5.0 ms budget.
 - Probe cleanup left both watermark tables and the dirty-day table at zero.
 
-A 100-turn/100-attempt end-to-end formal-runner integration also reached final
-cleanup.  Its report timings were 31.381 ms unfiltered and 20.609 ms filtered,
-and all source/rollup/watermark/dirty counts were zero after cleanup.  The final
-formal gate correctly returned false for that tiny fixture because PostgreSQL
-selected a sequential attempt scan instead of the 3M-scale job index; the
-index/full-history plan guards were not weakened to make a small fixture pass.
+A 100-turn/100-attempt end-to-end **non-formal** runner integration also reached
+final cleanup.  Its report timings were 32.788 ms unfiltered and 21.973 ms
+filtered, and all source/rollup/watermark/dirty counts were zero after cleanup.
+The final gate returned false by construction: only an exact 3,000,000-turn and
+3,000,000-attempt run without `--non-formal` can pass.  Formal CLI invocations
+reject any other cardinality before touching PostgreSQL.  No formal 3M run was
+performed in this task.
 
 ## TDD and verification
 
@@ -69,7 +79,7 @@ index/full-history plan guards were not weakened to make a small fixture pass.
   claims, non-interleaved execution claims, missing measured pool evidence,
   nested maintenance occupancy, pre-existing rollup-state refusal, and separate
   turn/attempt watermark cleanup accounting.
-- Focused verification: `80 passed, 1 skipped` across the new evidence tests,
+- Focused verification: `87 passed, 1 skipped` across the new evidence tests,
   provider recorder tests and provider client tests.
 - Ruff passed for both perf scripts and the new tests.
 - Compileall passed for both perf scripts.

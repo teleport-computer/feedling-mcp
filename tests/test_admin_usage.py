@@ -139,15 +139,57 @@ def test_admin_usage_scale_formal_gate_requires_attempt_index_for_both_cohorts()
         "watermark_removed": True,
         "residual_counts": {"users": 0, "watermark": 0, "dirty_days": 0},
     }
-    assert harness._formal_gate_passed(cohorts, cleanup) is True
+    source = {"total_rows": 3_000_000, "attempt_rows": 3_000_000}
+    fixture = {"rows": 3_000_000, "attempt_rows": 3_000_000}
+    def gate():
+        return harness._formal_gate_passed(
+            cohorts, cleanup, source=source, fixture=fixture, formal=True
+        )
+    assert gate() is True
     cohorts["provider_model_filtered"]["attempt_runtime_job_index_used"] = False
-    assert harness._formal_gate_passed(cohorts, cleanup) is False
+    assert gate() is False
     cohorts["provider_model_filtered"]["attempt_runtime_job_index_used"] = True
     cohorts["provider_model_filtered"]["attempt_full_history_scan_absent"] = False
-    assert harness._formal_gate_passed(cohorts, cleanup) is False
+    assert gate() is False
     cohorts["provider_model_filtered"]["attempt_full_history_scan_absent"] = True
     cleanup["residual_counts"]["dirty_days"] = 1
-    assert harness._formal_gate_passed(cohorts, cleanup) is False
+    assert gate() is False
+
+
+def test_admin_usage_scale_formal_gate_rejects_small_or_nonformal_fixture_even_if_healthy():
+    harness = _load_usage_scale_harness()
+    cohorts = {
+        name: {
+            "timing": {"p95_ms": 1.0},
+            "attempt_ledger_statement_count": 1,
+            "attempt_runtime_job_index_used": True,
+            "attempt_rollup_relations_used": True,
+            "attempt_full_history_scan_absent": True,
+            "attempt_rate_card_probe_loops_absent": True,
+            "attempt_full_window_call_probe_loops_absent": True,
+        }
+        for name in ("unfiltered", "provider_model_filtered")
+    }
+    cleanup = {
+        "foreign_key_cascade_verified": True,
+        "watermark_removed": True,
+        "residual_counts": {"all": 0},
+    }
+
+    assert not harness._formal_gate_passed(
+        cohorts,
+        cleanup,
+        source={"total_rows": 100, "attempt_rows": 100},
+        fixture={"rows": 100, "attempt_rows": 100},
+        formal=True,
+    )
+    assert not harness._formal_gate_passed(
+        cohorts,
+        cleanup,
+        source={"total_rows": 3_000_000, "attempt_rows": 3_000_000},
+        fixture={"rows": 3_000_000, "attempt_rows": 3_000_000},
+        formal=False,
+    )
 
 
 def _synthetic_attempt_plan(*nodes):
@@ -192,7 +234,13 @@ def _synthetic_formal_gate(harness, guards):
         "watermark_removed": True,
         "residual_counts": {"users": 0, "watermark": 0, "dirty_days": 0},
     }
-    return harness._formal_gate_passed(cohorts, cleanup)
+    return harness._formal_gate_passed(
+        cohorts,
+        cleanup,
+        source={"total_rows": 3_000_000, "attempt_rows": 3_000_000},
+        fixture={"rows": 3_000_000, "attempt_rows": 3_000_000},
+        formal=True,
+    )
 
 
 def test_admin_usage_scale_attempt_plan_guards_use_complete_plan_not_display_slice():
@@ -671,6 +719,7 @@ def test_admin_usage_scale_retention_index_evidence_gate_is_auditable():
 def test_admin_usage_scale_business_path_evidence_gate_is_fail_closed():
     harness = _load_usage_scale_harness()
     gate = harness._business_path_evidence_passed
+    commit = "a" * 40
     evidence = {
         "pool": {"peak_occupancy": 7, "capacity": 20, "timeouts": 0},
         "recorder": {
@@ -689,12 +738,21 @@ def test_admin_usage_scale_business_path_evidence_gate_is_fail_closed():
             for provider in ("openrouter", "anthropic", "google")
         },
     }
-    assert gate(evidence) is True
-    assert gate({}) is False
-    assert gate({**evidence, "pool": {**evidence["pool"], "timeouts": 1}}) is False
+    # A summary-only document used to satisfy this gate.  The gate now delegates to
+    # the producer validator, so evidence without provenance and raw paired samples
+    # must fail closed even when all of its summary claims look healthy.
+    assert gate(evidence, expected_commit=commit) is False
+    assert gate({}, expected_commit=commit) is False
+    assert (
+        gate(
+            {**evidence, "pool": {**evidence["pool"], "timeouts": 1}},
+            expected_commit=commit,
+        )
+        is False
+    )
     broken = json.loads(json.dumps(evidence))
     broken["providers"]["anthropic"]["results_match_baseline"] = False
-    assert gate(broken) is False
+    assert gate(broken, expected_commit=commit) is False
 
 
 def test_admin_usage_scale_sql_guards_allow_rollup_only_and_bound_raw_ranges():

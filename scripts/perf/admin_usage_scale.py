@@ -29,7 +29,9 @@ from psycopg.conninfo import conninfo_to_dict
 
 
 DEFAULT_ROWS = 3_000_000
-DEFAULT_ATTEMPT_ROWS = 0
+DEFAULT_ATTEMPT_ROWS = 3_000_000
+FORMAL_ROWS = 3_000_000
+FORMAL_ATTEMPT_ROWS = 3_000_000
 DEFAULT_USERS = 2_000
 DEFAULT_RUNS = 5
 DEFAULT_HISTORY_DAYS = 365
@@ -80,7 +82,12 @@ def timing_summary(samples_ms: list[float]) -> dict[str, Any]:
 
 
 def _formal_gate_passed(
-    cohorts: dict[str, Any], cleanup: dict[str, Any]
+    cohorts: dict[str, Any],
+    cleanup: dict[str, Any],
+    *,
+    source: dict[str, Any],
+    fixture: dict[str, Any],
+    formal: bool,
 ) -> bool:
     required = {"unfiltered", "provider_model_filtered"}
     cleanup_passed = bool(
@@ -89,7 +96,14 @@ def _formal_gate_passed(
         and cleanup.get("residual_counts")
         and not any(cleanup["residual_counts"].values())
     )
-    return cleanup_passed and set(cohorts) == required and all(
+    cardinality_passed = bool(
+        formal
+        and fixture.get("rows") == FORMAL_ROWS
+        and fixture.get("attempt_rows") == FORMAL_ATTEMPT_ROWS
+        and source.get("total_rows") == FORMAL_ROWS
+        and source.get("attempt_rows") == FORMAL_ATTEMPT_ROWS
+    )
+    return cardinality_passed and cleanup_passed and set(cohorts) == required and all(
         cohort["timing"]["p95_ms"] < P95_BUDGET_MS
         and cohort["attempt_ledger_statement_count"] == 1
         and cohort["attempt_runtime_job_index_used"] is True
@@ -1174,6 +1188,14 @@ def _run(args) -> int:
     if args.rows < 1 or args.users < 1 or args.runs < 5 or args.history_days < 90:
         raise SystemExit("rows/users must be positive, runs >= 5, history-days >= 90")
     attempt_rows = _resolve_attempt_rows(args.rows, args.attempt_rows)
+    formal = not args.non_formal
+    if formal and (
+        args.rows != FORMAL_ROWS or attempt_rows != FORMAL_ATTEMPT_ROWS
+    ):
+        raise SystemExit(
+            "formal mode requires exactly --rows 3000000 --attempt-rows 3000000; "
+            "use --non-formal for a probe that can never pass"
+        )
     database_url = args.database_url.strip()
     if not database_url:
         raise SystemExit("pass an explicit --database-url for the dedicated scale DB")
@@ -1249,6 +1271,7 @@ def _run(args) -> int:
             "precondition": args.precondition_note or None,
         },
         "fixture": {
+            "formal": formal,
             "prefix": prefix,
             "rows": args.rows,
             "attempt_rows": attempt_rows,
@@ -1555,7 +1578,11 @@ def _run(args) -> int:
                 }
 
     evidence["passed"] = _formal_gate_passed(
-        evidence["cohorts"], evidence["cleanup"]
+        evidence["cohorts"],
+        evidence["cleanup"],
+        source=evidence.get("source") or {},
+        fixture=evidence["fixture"],
+        formal=formal,
     ) and _retention_index_evidence_passed(
         evidence["retention_index"]
     ) and _business_path_evidence_passed(
@@ -1580,6 +1607,11 @@ def main() -> int:
     parser.add_argument("--keep-data", action="store_true")
     parser.add_argument("--output", default="")
     parser.add_argument("--precondition-note", default="")
+    parser.add_argument(
+        "--non-formal",
+        action="store_true",
+        help="run a small probe; evidence is permanently ineligible to pass",
+    )
     parser.add_argument("--business-path-output", default="")
     args = parser.parse_args()
     if args.self_test:
