@@ -32,6 +32,11 @@ DEFAULT_ROWS = 3_000_000
 DEFAULT_ATTEMPT_ROWS = 3_000_000
 FORMAL_ROWS = 3_000_000
 FORMAL_ATTEMPT_ROWS = 3_000_000
+FORMAL_USERS = 2_000
+FORMAL_DAILY_ROWS = 731_199
+FORMAL_ATTEMPT_COMPLETED_THROUGH_DAY = "2026-08-02"
+FORMAL_ATTEMPT_RETAINED_FROM = "2025-06-29"
+_RESUME_PREFIX_RE = re.compile(r"^scale_usage_[0-9a-f]{10}_$")
 DEFAULT_USERS = 2_000
 DEFAULT_RUNS = 5
 DEFAULT_HISTORY_DAYS = 365
@@ -267,6 +272,122 @@ def _resolve_attempt_rows(rows: int, requested: int | None) -> int:
     if attempt_rows < 0 or attempt_rows > rows:
         raise SystemExit("attempt-rows must be between 0 and rows")
     return attempt_rows
+
+
+def _validate_resume_prefix(prefix: str, *, formal: bool) -> str:
+    if not formal:
+        raise SystemExit("--resume-prefix is formal-only")
+    if not _RESUME_PREFIX_RE.fullmatch(prefix):
+        raise SystemExit(
+            "--resume-prefix must match ^scale_usage_[0-9a-f]{10}_$ "
+            "including the trailing underscore"
+        )
+    return prefix
+
+
+def _validate_resume_mode_options(
+    *, resumed: bool, keep_data: bool, validate_only: bool
+) -> None:
+    if validate_only and not resumed:
+        raise SystemExit("--validate-resume-only requires --resume-prefix")
+    if resumed and keep_data:
+        raise SystemExit("--resume-prefix cannot be combined with --keep-data")
+
+
+def _validate_resume_snapshot(
+    snapshot: dict[str, Any], *, prefix: str
+) -> dict[str, Any]:
+    """Fail closed on a pre-existing formal fixture before any probe writes."""
+
+    if snapshot.get("prefix") != prefix:
+        raise RuntimeError("resume prefix mismatch")
+    expected_counts = {
+        "users": FORMAL_USERS,
+        "v2_turn_metrics": FORMAL_ROWS,
+        "llm_provider_attempts": FORMAL_ATTEMPT_ROWS,
+        "llm_provider_attempt_corrections": 0,
+        "v2_usage_daily_users": FORMAL_DAILY_ROWS,
+        "v2_usage_daily_dimensions": FORMAL_DAILY_ROWS,
+        "llm_usage_daily_attempt_dimensions": FORMAL_DAILY_ROWS,
+        "llm_usage_daily_call_memberships": FORMAL_ATTEMPT_ROWS,
+        "turn_watermark": 1,
+        "attempt_watermark": 1,
+        "dirty_days": 0,
+    }
+    prefix_counts = snapshot.get("prefix_counts")
+    if prefix_counts != expected_counts:
+        raise RuntimeError(
+            "resume fixture is partial or stale: "
+            f"expected={expected_counts}, actual={prefix_counts}"
+        )
+    if snapshot.get("global_counts") != prefix_counts:
+        raise RuntimeError(
+            "resume database contains foreign users/source/rollup state"
+        )
+    if snapshot.get("user_shape") != {
+        "invalid_user_ids": 0,
+        "invalid_fixture_docs": 0,
+        "missing_user_sequence": 0,
+    }:
+        raise RuntimeError("resume reuse mismatch in fixture users")
+    if snapshot.get("source_integrity") != {
+        "turn_distinct_jobs": FORMAL_ROWS,
+        "attempt_distinct_ids": FORMAL_ATTEMPT_ROWS,
+        "attempt_distinct_calls": FORMAL_ATTEMPT_ROWS,
+        "orphan_turn_users": 0,
+        "orphan_attempt_users": 0,
+        "attempt_job_user_mismatches": 0,
+        "non_runtime_attempts": 0,
+    }:
+        raise RuntimeError("resume reuse mismatch in source rows")
+    if snapshot.get("rollup_integrity") != {
+        "membership_distinct_attempts": FORMAL_ATTEMPT_ROWS,
+        "membership_orphans": 0,
+        "attempts_without_membership": 0,
+    }:
+        raise RuntimeError("resume fixture is partial or stale in rollup rows")
+    turn_watermark = snapshot.get("turn_watermark")
+    expected_turn_watermark = {
+        "bootstrap_complete": True,
+        "dirty_from_day": None,
+        "dirty_through_day": None,
+        "last_error": None,
+    }
+    if turn_watermark != expected_turn_watermark:
+        raise RuntimeError(
+            "resume turn watermark is partial or stale: "
+            f"expected={expected_turn_watermark}, actual={turn_watermark}"
+        )
+    attempt_watermark = snapshot.get("attempt_watermark")
+    expected_attempt_watermark = {
+        "bootstrap_complete": True,
+        "completed_through_day": FORMAL_ATTEMPT_COMPLETED_THROUGH_DAY,
+        "retained_from": FORMAL_ATTEMPT_RETAINED_FROM,
+        "retention_pending_from": None,
+    }
+    if attempt_watermark != expected_attempt_watermark:
+        raise RuntimeError(
+            "resume attempt watermark is partial or stale: "
+            f"expected={expected_attempt_watermark}, actual={attempt_watermark}"
+        )
+    source = snapshot.get("source") or {}
+    raw_turns = source.get("expected_raw_edge_turn_rows")
+    raw_attempts = source.get("expected_raw_edge_attempt_rows")
+    raw_calls = source.get("expected_raw_edge_logical_calls")
+    if not (
+        source.get("total_rows") == FORMAL_ROWS
+        and source.get("attempt_rows") == FORMAL_ATTEMPT_ROWS
+        and isinstance(source.get("rows_in_90d"), int)
+        and source["rows_in_90d"] > 0
+        and source.get("attempt_rows_in_90d_job_cohort")
+        == source["rows_in_90d"]
+        and isinstance(raw_turns, int)
+        and raw_turns > 0
+        and raw_attempts == raw_turns
+        and raw_calls == raw_turns
+    ):
+        raise RuntimeError("resume reuse mismatch in 90d/raw-edge baseline")
+    return snapshot
 
 
 def _validate_scale_database_url(database_url: str) -> dict[str, Any]:
@@ -890,13 +1011,15 @@ def _fixture_counts(conn, prefix: str) -> dict[str, int]:
     ):
         counts[table] = int(
             conn.execute(
-                f"SELECT count(*) FROM {table} WHERE user_id LIKE %s",  # noqa: S608
-                (prefix + "%",),
+                f"SELECT count(*) FROM {table} "  # noqa: S608
+                "WHERE left(user_id,length(%s))=%s",
+                (prefix, prefix),
             ).fetchone()[0]
         )
     counts["users"] = int(
         conn.execute(
-            "SELECT count(*) FROM users WHERE user_id LIKE %s", (prefix + "%",)
+            "SELECT count(*) FROM users WHERE left(user_id,length(%s))=%s",
+            (prefix, prefix),
         ).fetchone()[0]
     )
     counts["turn_watermark"] = int(
@@ -918,6 +1041,193 @@ def _fixture_counts(conn, prefix: str) -> dict[str, int]:
         ).fetchone()[0]
     )
     return counts
+
+
+def _collect_resume_snapshot(
+    conn,
+    *,
+    prefix: str,
+    partition,
+    start_at: datetime,
+    end_at: datetime,
+) -> dict[str, Any]:
+    """Collect all read-only ownership and completeness evidence for resume."""
+
+    prefix_counts = _fixture_counts(conn, prefix)
+    global_counts = {
+        table: int(
+            conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]  # noqa: S608
+        )
+        for table in (
+            "users",
+            "v2_turn_metrics",
+            "llm_provider_attempts",
+            "llm_provider_attempt_corrections",
+            "v2_usage_daily_users",
+            "v2_usage_daily_dimensions",
+            "llm_usage_daily_attempt_dimensions",
+            "llm_usage_daily_call_memberships",
+        )
+    }
+    global_counts.update(
+        {
+            "turn_watermark": int(
+                conn.execute(
+                    "SELECT count(*) FROM v2_usage_rollup_watermarks"
+                ).fetchone()[0]
+            ),
+            "attempt_watermark": int(
+                conn.execute(
+                    "SELECT count(*) FROM llm_usage_rollup_watermarks"
+                ).fetchone()[0]
+            ),
+            "dirty_days": int(
+                conn.execute(
+                    "SELECT count(*) FROM llm_usage_rollup_dirty_days"
+                ).fetchone()[0]
+            ),
+        }
+    )
+    user_shape = conn.execute(
+        "SELECT count(*) FILTER (WHERE user_id !~ %s),"
+        "count(*) FILTER (WHERE doc IS DISTINCT FROM "
+        "jsonb_build_object('scale_fixture',true)),"
+        "(SELECT count(*) FROM generate_series(0,%s) AS g "
+        "LEFT JOIN users expected ON expected.user_id=%s || lpad(g::text,6,'0') "
+        "WHERE expected.user_id IS NULL) FROM users",
+        (f"^{re.escape(prefix)}[0-9]{{6}}$", FORMAL_USERS - 1, prefix),
+    ).fetchone()
+    source_integrity_row = conn.execute(
+        "SELECT "
+        "(SELECT count(DISTINCT job_id) FROM v2_turn_metrics),"
+        "(SELECT count(DISTINCT attempt_id) FROM llm_provider_attempts),"
+        "(SELECT count(DISTINCT call_id) FROM llm_provider_attempts),"
+        "(SELECT count(*) FROM v2_turn_metrics m LEFT JOIN users u USING(user_id) "
+        " WHERE u.user_id IS NULL),"
+        "(SELECT count(*) FROM llm_provider_attempts a LEFT JOIN users u USING(user_id) "
+        " WHERE u.user_id IS NULL),"
+        "(SELECT count(*) FROM llm_provider_attempts a LEFT JOIN v2_turn_metrics m "
+        " ON m.job_id=a.job_id AND m.user_id=a.user_id WHERE m.job_id IS NULL),"
+        "(SELECT count(*) FROM llm_provider_attempts "
+        " WHERE source<>'runtime_recorder')"
+    ).fetchone()
+    rollup_integrity_row = conn.execute(
+        "SELECT "
+        "(SELECT count(DISTINCT call_id) FROM llm_usage_daily_call_memberships),"
+        "(SELECT count(*) FROM llm_usage_daily_call_memberships c "
+        " LEFT JOIN llm_provider_attempts a "
+        " ON a.call_id=c.call_id AND a.user_id=c.user_id "
+        " WHERE a.attempt_id IS NULL),"
+        "(SELECT count(*) FROM llm_provider_attempts a "
+        " LEFT JOIN llm_usage_daily_call_memberships c "
+        " ON c.call_id=a.call_id AND c.user_id=a.user_id "
+        " WHERE c.call_id IS NULL)"
+    ).fetchone()
+    turn_watermark_row = conn.execute(
+        "SELECT bootstrap_complete,dirty_from_day,dirty_through_day,last_error "
+        "FROM v2_usage_rollup_watermarks "
+        "WHERE rollup_name='hosted_v2_usage'"
+    ).fetchone()
+    attempt_watermark_row = conn.execute(
+        "SELECT bootstrap_complete,completed_through_day,retained_from,"
+        "retention_pending_from "
+        "FROM llm_usage_rollup_watermarks "
+        "WHERE rollup_name='hosted_v2_attempt_usage'"
+    ).fetchone()
+    if turn_watermark_row is None or attempt_watermark_row is None:
+        raise RuntimeError("resume fixture has missing rollup watermark")
+    raw_edge_counts = _raw_edge_source_counts(
+        conn,
+        prefix=prefix,
+        partition=partition,
+        start_at=start_at,
+        end_at=end_at,
+    )
+    rows_in_90d = int(
+        conn.execute(
+            "SELECT count(*) FROM v2_turn_metrics "
+            "WHERE left(user_id,length(%s))=%s "
+            "AND created_at >= %s AND created_at < %s",
+            (prefix, prefix, start_at, end_at),
+        ).fetchone()[0]
+    )
+    attempts_in_90d = int(
+        conn.execute(
+            "SELECT count(*) FROM llm_provider_attempts a "
+            "JOIN v2_turn_metrics m ON m.job_id=a.job_id "
+            "WHERE left(a.user_id,length(%s))=%s "
+            "AND a.source='runtime_recorder' "
+            "AND m.created_at >= %s AND m.created_at < %s",
+            (prefix, prefix, start_at, end_at),
+        ).fetchone()[0]
+    )
+    return {
+        "prefix": prefix,
+        "global_counts": global_counts,
+        "prefix_counts": prefix_counts,
+        "user_shape": {
+            "invalid_user_ids": int(user_shape[0]),
+            "invalid_fixture_docs": int(user_shape[1]),
+            "missing_user_sequence": int(user_shape[2]),
+        },
+        "source_integrity": {
+            key: int(value)
+            for key, value in zip(
+                (
+                    "turn_distinct_jobs",
+                    "attempt_distinct_ids",
+                    "attempt_distinct_calls",
+                    "orphan_turn_users",
+                    "orphan_attempt_users",
+                    "attempt_job_user_mismatches",
+                    "non_runtime_attempts",
+                ),
+                source_integrity_row,
+                strict=True,
+            )
+        },
+        "rollup_integrity": {
+            key: int(value)
+            for key, value in zip(
+                (
+                    "membership_distinct_attempts",
+                    "membership_orphans",
+                    "attempts_without_membership",
+                ),
+                rollup_integrity_row,
+                strict=True,
+            )
+        },
+        "turn_watermark": {
+            "bootstrap_complete": bool(turn_watermark_row[0]),
+            "dirty_from_day": turn_watermark_row[1],
+            "dirty_through_day": turn_watermark_row[2],
+            "last_error": turn_watermark_row[3],
+        },
+        "attempt_watermark": {
+            "bootstrap_complete": bool(attempt_watermark_row[0]),
+            "completed_through_day": (
+                None
+                if attempt_watermark_row[1] is None
+                else attempt_watermark_row[1].isoformat()
+            ),
+            "retained_from": (
+                None
+                if attempt_watermark_row[2] is None
+                else attempt_watermark_row[2].isoformat()
+            ),
+            "retention_pending_from": attempt_watermark_row[3],
+        },
+        "source": {
+            "total_rows": prefix_counts["v2_turn_metrics"],
+            "rows_in_90d": rows_in_90d,
+            "attempt_rows": prefix_counts["llm_provider_attempts"],
+            "attempt_rows_in_90d_job_cohort": attempts_in_90d,
+            "expected_raw_edge_turn_rows": raw_edge_counts["turn_rows"],
+            "expected_raw_edge_attempt_rows": raw_edge_counts["attempt_rows"],
+            "expected_raw_edge_logical_calls": raw_edge_counts["logical_calls"],
+        },
+    }
 
 
 def _assert_empty_dedicated_database(conn) -> None:
@@ -1189,6 +1499,17 @@ def _run(args) -> int:
         raise SystemExit("rows/users must be positive, runs >= 5, history-days >= 90")
     attempt_rows = _resolve_attempt_rows(args.rows, args.attempt_rows)
     formal = not args.non_formal
+    resume_value = str(args.resume_prefix or "").strip()
+    resumed = bool(resume_value)
+    _validate_resume_mode_options(
+        resumed=resumed,
+        keep_data=bool(args.keep_data),
+        validate_only=bool(args.validate_resume_only),
+    )
+    if resumed:
+        prefix = _validate_resume_prefix(resume_value, formal=formal)
+    else:
+        prefix = f"scale_usage_{uuid4().hex[:10]}_"
     if formal and (
         args.rows != FORMAL_ROWS or attempt_rows != FORMAL_ATTEMPT_ROWS
     ):
@@ -1225,11 +1546,6 @@ def _run(args) -> int:
     )
 
     pool = _install_validated_scale_pool(db, database_identity)
-    with pool.connection() as conn:
-        _validate_connected_scale_database(conn, database_identity)
-        schema_evidence = _assert_schema(conn)
-        _assert_empty_dedicated_database(conn)
-    prefix = f"scale_usage_{uuid4().hex[:10]}_"
     start_at, end_at = _production_window()
     queries = {
         "unfiltered": UsageQuery(
@@ -1247,12 +1563,56 @@ def _run(args) -> int:
             preset="90d",
         ),
     }
+    partition = usage_reporting.rollup_partition(queries["unfiltered"])
+    expected_partition = _validate_rolling_partition(partition)
+    resume_snapshot = None
+    with pool.connection() as conn:
+        _validate_connected_scale_database(conn, database_identity)
+        schema_evidence = _assert_schema(conn)
+        if resumed:
+            resume_snapshot = _validate_resume_snapshot(
+                _collect_resume_snapshot(
+                    conn,
+                    prefix=prefix,
+                    partition=partition,
+                    start_at=start_at,
+                    end_at=end_at,
+                ),
+                prefix=prefix,
+            )
+        else:
+            _assert_empty_dedicated_database(conn)
+    if args.validate_resume_only:
+        validation_evidence = {
+            "database": database_identity,
+            "fixture": {
+                "formal": True,
+                "resumed": True,
+                "prefix": prefix,
+                "preexisting_counts": {
+                    "prefix": resume_snapshot["prefix_counts"],
+                    "global": resume_snapshot["global_counts"],
+                },
+            },
+            "query": {"expected_partition": expected_partition},
+            "resume_validation": resume_snapshot,
+            "schema": schema_evidence,
+            "validated": True,
+        }
+        rendered = json.dumps(
+            validation_evidence, indent=2, sort_keys=True, default=str
+        ) + "\n"
+        if args.output:
+            Path(args.output).write_text(rendered, encoding="utf-8")
+        print(rendered, end="")
+        return 0
     pool_evidence = measure_pool_contention_evidence(
         real_pool=pool,
         db_module=db,
         jobs_store=jobs_store,
         provider_attempt_rollup=provider_attempt_rollup,
         usage_query=queries["unfiltered"],
+        preserve_existing_rollup_state=resumed,
     )
     business_path_evidence = produce_business_path_evidence(
         repo=repo, pool_evidence=pool_evidence
@@ -1262,9 +1622,6 @@ def _run(args) -> int:
             json.dumps(business_path_evidence, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-    expected_partition = _validate_rolling_partition(
-        usage_reporting.rollup_partition(queries["unfiltered"])
-    )
     evidence: dict[str, Any] = {
         "database": {
             **database_identity,
@@ -1272,6 +1629,7 @@ def _run(args) -> int:
         },
         "fixture": {
             "formal": formal,
+            "resumed": resumed,
             "prefix": prefix,
             "rows": args.rows,
             "attempt_rows": attempt_rows,
@@ -1287,6 +1645,14 @@ def _run(args) -> int:
                     "zero corrections"
                 ),
             },
+            "preexisting_counts": (
+                None
+                if resume_snapshot is None
+                else {
+                    "prefix": resume_snapshot["prefix_counts"],
+                    "global": resume_snapshot["global_counts"],
+                }
+            ),
         },
         "schema": schema_evidence,
         "business_path": business_path_evidence,
@@ -1302,77 +1668,99 @@ def _run(args) -> int:
         },
         "cohorts": {},
     }
+    cleanup_armed = resumed
     try:
-        with pool.connection() as conn:
-            _seed_fixture(
-                conn,
-                prefix=prefix,
-                rows=args.rows,
-                attempt_rows=attempt_rows,
-                users=args.users,
-                end_at=end_at,
-                history_days=args.history_days,
-            )
-            raw_edge_counts = _raw_edge_source_counts(
-                conn,
-                prefix=prefix,
-                partition=usage_reporting.rollup_partition(
-                    queries["unfiltered"]
-                ),
-                start_at=start_at,
-                end_at=end_at,
-            )
-            evidence["source"] = {
-                "total_rows": int(
-                    conn.execute(
-                        "SELECT count(*) FROM v2_turn_metrics WHERE user_id LIKE %s",
-                        (prefix + "%",),
-                    ).fetchone()[0]
-                ),
-                "rows_in_90d": int(
-                    conn.execute(
-                        "SELECT count(*) FROM v2_turn_metrics WHERE user_id LIKE %s "
-                        "AND created_at >= %s AND created_at < %s",
-                        (prefix + "%", start_at, end_at),
-                    ).fetchone()[0]
-                ),
-                "attempt_rows": int(
-                    conn.execute(
-                        "SELECT count(*) FROM llm_provider_attempts "
-                        "WHERE user_id LIKE %s",
-                        (prefix + "%",),
-                    ).fetchone()[0]
-                ),
-                "attempt_rows_in_90d_job_cohort": int(
-                    conn.execute(
-                        "SELECT count(*) FROM llm_provider_attempts a "
-                        "JOIN v2_turn_metrics m ON m.job_id=a.job_id "
-                        "WHERE a.user_id LIKE %s AND a.source='runtime_recorder' "
-                        "AND m.created_at>=%s AND m.created_at<%s",
-                        (prefix + "%", start_at, end_at),
-                    ).fetchone()[0]
-                ),
-                "expected_raw_edge_turn_rows": raw_edge_counts["turn_rows"],
-                "expected_raw_edge_attempt_rows": raw_edge_counts["attempt_rows"],
-                "expected_raw_edge_logical_calls": raw_edge_counts["logical_calls"],
+        if resumed:
+            evidence["source"] = dict(resume_snapshot["source"])
+            evidence["rollup_bootstrap"] = {
+                "resumed": True,
+                "elapsed_ms": 0.0,
+                "ticks": [],
             }
+            evidence["attempt_rollup_bootstrap"] = {
+                "resumed": True,
+                "elapsed_ms": 0.0,
+                "ticks": [],
+            }
+        else:
+            cleanup_armed = True
+            with pool.connection() as conn:
+                _seed_fixture(
+                    conn,
+                    prefix=prefix,
+                    rows=args.rows,
+                    attempt_rows=attempt_rows,
+                    users=args.users,
+                    end_at=end_at,
+                    history_days=args.history_days,
+                )
+                raw_edge_counts = _raw_edge_source_counts(
+                    conn,
+                    prefix=prefix,
+                    partition=partition,
+                    start_at=start_at,
+                    end_at=end_at,
+                )
+                evidence["source"] = {
+                    "total_rows": int(
+                        conn.execute(
+                            "SELECT count(*) FROM v2_turn_metrics "
+                            "WHERE user_id LIKE %s",
+                            (prefix + "%",),
+                        ).fetchone()[0]
+                    ),
+                    "rows_in_90d": int(
+                        conn.execute(
+                            "SELECT count(*) FROM v2_turn_metrics "
+                            "WHERE user_id LIKE %s "
+                            "AND created_at >= %s AND created_at < %s",
+                            (prefix + "%", start_at, end_at),
+                        ).fetchone()[0]
+                    ),
+                    "attempt_rows": int(
+                        conn.execute(
+                            "SELECT count(*) FROM llm_provider_attempts "
+                            "WHERE user_id LIKE %s",
+                            (prefix + "%",),
+                        ).fetchone()[0]
+                    ),
+                    "attempt_rows_in_90d_job_cohort": int(
+                        conn.execute(
+                            "SELECT count(*) FROM llm_provider_attempts a "
+                            "JOIN v2_turn_metrics m ON m.job_id=a.job_id "
+                            "WHERE a.user_id LIKE %s "
+                            "AND a.source='runtime_recorder' "
+                            "AND m.created_at>=%s AND m.created_at<%s",
+                            (prefix + "%", start_at, end_at),
+                        ).fetchone()[0]
+                    ),
+                    "expected_raw_edge_turn_rows": raw_edge_counts["turn_rows"],
+                    "expected_raw_edge_attempt_rows": raw_edge_counts[
+                        "attempt_rows"
+                    ],
+                    "expected_raw_edge_logical_calls": raw_edge_counts[
+                        "logical_calls"
+                    ],
+                }
 
-        bootstrap_started = time.perf_counter()
-        bootstrap_ticks = _bootstrap_rollups(usage_rollup)
-        evidence["rollup_bootstrap"] = {
-            "elapsed_ms": round((time.perf_counter() - bootstrap_started) * 1000, 3),
-            "ticks": bootstrap_ticks,
-        }
-        attempt_bootstrap_started = time.perf_counter()
-        attempt_bootstrap_ticks = _bootstrap_attempt_rollups(
-            provider_attempt_rollup
-        )
-        evidence["attempt_rollup_bootstrap"] = {
-            "elapsed_ms": round(
-                (time.perf_counter() - attempt_bootstrap_started) * 1000, 3
-            ),
-            "ticks": attempt_bootstrap_ticks,
-        }
+            bootstrap_started = time.perf_counter()
+            bootstrap_ticks = _bootstrap_rollups(usage_rollup)
+            evidence["rollup_bootstrap"] = {
+                "elapsed_ms": round(
+                    (time.perf_counter() - bootstrap_started) * 1000, 3
+                ),
+                "ticks": bootstrap_ticks,
+            }
+            attempt_bootstrap_started = time.perf_counter()
+            attempt_bootstrap_ticks = _bootstrap_attempt_rollups(
+                provider_attempt_rollup
+            )
+            evidence["attempt_rollup_bootstrap"] = {
+                "elapsed_ms": round(
+                    (time.perf_counter() - attempt_bootstrap_started) * 1000, 3
+                ),
+                "ticks": attempt_bootstrap_ticks,
+            }
         with pool.connection() as conn:
             evidence["retention_index"] = _retention_index_evidence(
                 conn, attempt_rows=evidence["source"]["attempt_rows"]
@@ -1541,7 +1929,7 @@ def _run(args) -> int:
                 ],
             }
     finally:
-        if not args.keep_data:
+        if cleanup_armed and not args.keep_data:
             with pool.connection() as conn:
                 _delete_fixture(conn, prefix)
                 after_cascade = _fixture_counts(conn, prefix)
@@ -1611,6 +1999,16 @@ def main() -> int:
         "--non-formal",
         action="store_true",
         help="run a small probe; evidence is permanently ineligible to pass",
+    )
+    parser.add_argument(
+        "--resume-prefix",
+        default="",
+        help="resume an exact, prevalidated formal fixture prefix",
+    )
+    parser.add_argument(
+        "--validate-resume-only",
+        action="store_true",
+        help="run read-only resume preflight and exit before producer/timing/cleanup",
     )
     parser.add_argument("--business-path-output", default="")
     args = parser.parse_args()

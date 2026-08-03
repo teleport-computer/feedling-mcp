@@ -95,6 +95,175 @@ def test_admin_usage_scale_attempt_fixture_is_explicit_and_bounded():
             harness._resolve_attempt_rows(3_000_000, invalid)
 
 
+def _healthy_formal_resume_snapshot():
+    counts = {
+        "users": 2_000,
+        "v2_turn_metrics": 3_000_000,
+        "llm_provider_attempts": 3_000_000,
+        "llm_provider_attempt_corrections": 0,
+        "v2_usage_daily_users": 731_199,
+        "v2_usage_daily_dimensions": 731_199,
+        "llm_usage_daily_attempt_dimensions": 731_199,
+        "llm_usage_daily_call_memberships": 3_000_000,
+        "turn_watermark": 1,
+        "attempt_watermark": 1,
+        "dirty_days": 0,
+    }
+    return {
+        "prefix": "scale_usage_42e02f444a_",
+        "global_counts": counts.copy(),
+        "prefix_counts": counts.copy(),
+        "user_shape": {
+            "invalid_user_ids": 0,
+            "invalid_fixture_docs": 0,
+            "missing_user_sequence": 0,
+        },
+        "source_integrity": {
+            "turn_distinct_jobs": 3_000_000,
+            "attempt_distinct_ids": 3_000_000,
+            "attempt_distinct_calls": 3_000_000,
+            "orphan_turn_users": 0,
+            "orphan_attempt_users": 0,
+            "attempt_job_user_mismatches": 0,
+            "non_runtime_attempts": 0,
+        },
+        "rollup_integrity": {
+            "membership_distinct_attempts": 3_000_000,
+            "membership_orphans": 0,
+            "attempts_without_membership": 0,
+        },
+        "turn_watermark": {
+            "bootstrap_complete": True,
+            "dirty_from_day": None,
+            "dirty_through_day": None,
+            "last_error": None,
+        },
+        "attempt_watermark": {
+            "bootstrap_complete": True,
+            "completed_through_day": "2026-08-02",
+            "retained_from": "2025-06-29",
+            "retention_pending_from": None,
+        },
+        "source": {
+            "total_rows": 3_000_000,
+            "attempt_rows": 3_000_000,
+            "rows_in_90d": 739_726,
+            "attempt_rows_in_90d_job_cohort": 739_726,
+            "expected_raw_edge_turn_rows": 16_438,
+            "expected_raw_edge_attempt_rows": 16_438,
+            "expected_raw_edge_logical_calls": 16_438,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "scale_usage_42e02f444a",
+        "scale_usage_42E02F444A_",
+        "scale_usage_42e02f444_",
+        "scale_usage_42e02f444aa_",
+        "other_42e02f444a_",
+        "scale_usage_42e02f444a_%",
+    ],
+)
+def test_formal_resume_rejects_wrong_prefix(prefix):
+    harness = _load_usage_scale_harness()
+
+    with pytest.raises(SystemExit, match="resume-prefix"):
+        harness._validate_resume_prefix(prefix, formal=True)
+
+
+def test_formal_resume_rejects_nonformal_mode():
+    harness = _load_usage_scale_harness()
+
+    with pytest.raises(SystemExit, match="formal-only"):
+        harness._validate_resume_prefix("scale_usage_42e02f444a_", formal=False)
+
+
+@pytest.mark.parametrize(
+    ("resumed", "keep_data", "validate_only", "message"),
+    [
+        (False, False, True, "requires --resume-prefix"),
+        (True, True, False, "cannot be combined with --keep-data"),
+        (True, True, True, "cannot be combined with --keep-data"),
+    ],
+)
+def test_formal_resume_mode_options_fail_closed(
+    resumed, keep_data, validate_only, message
+):
+    harness = _load_usage_scale_harness()
+
+    with pytest.raises(SystemExit, match=message):
+        harness._validate_resume_mode_options(
+            resumed=resumed,
+            keep_data=keep_data,
+            validate_only=validate_only,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda item: item["prefix_counts"].update(
+                llm_provider_attempts=2_999_999
+            ),
+            "partial",
+        ),
+        (
+            lambda item: item["global_counts"].update(v2_turn_metrics=3_000_001),
+            "foreign",
+        ),
+        (
+            lambda item: item.update(prefix="scale_usage_deadbeef00_"),
+            "prefix mismatch",
+        ),
+        (
+            lambda item: item["source_integrity"].update(
+                attempt_job_user_mismatches=1
+            ),
+            "reuse mismatch",
+        ),
+        (
+            lambda item: item["attempt_watermark"].update(
+                completed_through_day="2026-07-31"
+            ),
+            "partial or stale.*actual=.*2026-07-31",
+        ),
+        (
+            lambda item: item["attempt_watermark"].update(
+                retained_from="2026-05-05"
+            ),
+            "partial or stale.*actual=.*2026-05-05",
+        ),
+    ],
+)
+def test_formal_resume_snapshot_rejects_partial_foreign_or_reused_fixture(
+    mutation, message
+):
+    harness = _load_usage_scale_harness()
+    snapshot = _healthy_formal_resume_snapshot()
+    mutation(snapshot)
+
+    with pytest.raises(RuntimeError, match=message):
+        harness._validate_resume_snapshot(
+            snapshot, prefix="scale_usage_42e02f444a_"
+        )
+
+
+def test_formal_resume_snapshot_accepts_exact_complete_fixture():
+    harness = _load_usage_scale_harness()
+    snapshot = _healthy_formal_resume_snapshot()
+
+    assert (
+        harness._validate_resume_snapshot(
+            snapshot, prefix="scale_usage_42e02f444a_"
+        )
+        is snapshot
+    )
+
+
 def test_admin_usage_scale_raw_edge_bounds_are_exact_half_open_query_edges():
     harness = _load_usage_scale_harness()
     start_at, end_at = harness._production_window()
@@ -510,6 +679,12 @@ def test_admin_usage_scale_uses_rolling_90d_partition_and_dedicated_local_db():
         "2026-05-04",
         "2026-08-02",
     ]
+    assert harness.FORMAL_ATTEMPT_COMPLETED_THROUGH_DAY == "2026-08-02"
+    assert (
+        harness.FORMAL_ATTEMPT_RETAINED_FROM
+        < "2025-08-02"  # the earliest day in the 365-day formal fixture
+        < start_at.date().isoformat()
+    )
     assert harness._validate_scale_database_url(
         "postgresql://postgres:test@127.0.0.1:55432/feedling_usage_scale_task4d"
     ) == {

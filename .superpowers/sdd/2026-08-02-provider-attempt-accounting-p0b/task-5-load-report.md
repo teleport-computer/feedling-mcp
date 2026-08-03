@@ -112,3 +112,43 @@ performed in this task.
 The commit-bound JSON is generated after checkout by the producer/formal runner
 and is intentionally not checked into the same commit: committing the artifact
 would necessarily change HEAD and make its own commit binding stale.
+
+## Formal resume recovery design and plan
+
+`--resume-prefix` is a formal-only recovery path for a fully seeded, fully
+rolled-up fixture whose original process was externally terminated.  It accepts
+only `^scale_usage_[0-9a-f]{10}_$`; validates the connected local database,
+schema, unique fixture ownership, exact 2,000-user/3,000,000-turn/3,000,000-
+attempt cardinality, deterministic 90-day/raw-edge baseline, complete daily and
+membership rollups, and clean completed watermarks before any business-path
+probe runs.  It records the validated pre-existing counts in evidence, skips
+seeding and rollup bootstrap, then follows the unchanged report timing,
+EXPLAIN, formal gate, and exact-prefix cleanup path.
+
+Implementation order is strict TDD: add prefix/formal-mode negative tests; add
+partial, foreign-state, and cardinality/rollup mismatch tests for an isolated
+resume validator; wire the validated branch ahead of the business producer;
+allow that producer's local pool proof to preserve already validated rollup
+state; verify parser/evidence/cleanup behavior; then run focused tests, Ruff,
+compileall and the harness self-test.  This task neither executes the formal
+resume nor deletes the existing dedicated fixture.
+
+### Read-only recovery validation
+
+The externally interrupted fixture was validated with
+`--resume-prefix scale_usage_42e02f444a_ --validate-resume-only`.  The command
+exited 0 before the business producer, timing, or cleanup paths and reported:
+2,000 exact fixture users; 3,000,000 turns and 3,000,000 runtime attempts;
+3,000,000 distinct membership calls with zero membership orphans; zero
+attempt/job/user mismatches; 739,736 turns and attempts in the fixed 90-day
+cohort; and 8,208 matching positive turn, attempt, and logical-call raw-edge
+rows.  Global and exact-prefix counts matched, so no foreign state was present.
+
+Both rollups were complete and clean.  The attempt maintenance watermark was
+exactly complete through 2026-08-02 with `retained_from=2025-06-29` and no
+pending retention.  This is intentionally distinct from the fixed report
+partition: its full rollup days end on 2026-08-01 and 2026-08-02 remains the
+upper partial raw day.  The retention boundary precedes both the earliest day
+in the 365-day fixture and the 90-day report window, so it cannot truncate the
+measured cohort.  No formal resume was run and the validated fixture remains
+intact for the separately authorized timing run.

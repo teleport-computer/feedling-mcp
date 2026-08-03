@@ -1183,6 +1183,7 @@ def measure_pool_contention_evidence(
     provider_attempt_rollup: Any,
     usage_query: Any,
     samples: int = MIN_SAMPLES_PER_PROVIDER,
+    preserve_existing_rollup_state: bool = False,
 ) -> dict[str, Any]:
     """Run recorder, attempt maintenance and the bounded report concurrently.
 
@@ -1347,19 +1348,21 @@ def measure_pool_contention_evidence(
         threading.Thread(target=report_work, name="load-proof-usage-report"),
     ]
     with real_pool.connection() as conn:
-        _assert_pool_probe_empty(conn)
+        if not preserve_existing_rollup_state:
+            _assert_pool_probe_empty(conn)
         with conn.transaction():
-            conn.execute(
-                "INSERT INTO v2_usage_rollup_watermarks "
-                "(rollup_name,bootstrap_complete,source_updated_at,source_id) "
-                "VALUES ('hosted_v2_usage',true,'epoch',0)"
-            )
-            conn.execute(
-                "INSERT INTO llm_usage_rollup_watermarks "
-                "(rollup_name,bootstrap_complete,completed_through_day) "
-                "VALUES ('hosted_v2_attempt_usage',true,%s)",
-                (dirty_day,),
-            )
+            if not preserve_existing_rollup_state:
+                conn.execute(
+                    "INSERT INTO v2_usage_rollup_watermarks "
+                    "(rollup_name,bootstrap_complete,source_updated_at,source_id) "
+                    "VALUES ('hosted_v2_usage',true,'epoch',0)"
+                )
+                conn.execute(
+                    "INSERT INTO llm_usage_rollup_watermarks "
+                    "(rollup_name,bootstrap_complete,completed_through_day) "
+                    "VALUES ('hosted_v2_attempt_usage',true,%s)",
+                    (dirty_day,),
+                )
             conn.execute(
                 "INSERT INTO llm_usage_rollup_dirty_days "
                 "(rollup_name,local_day,reason) "
@@ -1436,16 +1439,18 @@ def measure_pool_contention_evidence(
         with real_pool.connection() as conn:
             conn.execute(
                 "DELETE FROM llm_usage_rollup_dirty_days "
-                "WHERE rollup_name='hosted_v2_attempt_usage'"
+                "WHERE rollup_name='hosted_v2_attempt_usage' "
+                "AND reason='load_proof'"
             )
-            conn.execute(
-                "DELETE FROM llm_usage_rollup_watermarks "
-                "WHERE rollup_name='hosted_v2_attempt_usage'"
-            )
-            conn.execute(
-                "DELETE FROM v2_usage_rollup_watermarks "
-                "WHERE rollup_name='hosted_v2_usage'"
-            )
+            if not preserve_existing_rollup_state:
+                conn.execute(
+                    "DELETE FROM llm_usage_rollup_watermarks "
+                    "WHERE rollup_name='hosted_v2_attempt_usage'"
+                )
+                conn.execute(
+                    "DELETE FROM v2_usage_rollup_watermarks "
+                    "WHERE rollup_name='hosted_v2_usage'"
+                )
 
 
 def produce_business_path_evidence(
