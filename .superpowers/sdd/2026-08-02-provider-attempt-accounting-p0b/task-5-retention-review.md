@@ -1,214 +1,203 @@
-# P0-B Task 5 retention independent review
+# P0-B Task 5 retention independent re-review
 
-Reviewed commit: `0b52a55586b3327ebd842e2512b0567687ce0587`
+Initial implementation: `0b52a55586b3327ebd842e2512b0567687ce0587`
+
+Initial review: `70b8ae6b` (Spec FAIL / Quality FAIL / Not Ready)
+
+Fix reviewed: `a99d18073f98c704ed391f626408272cca9daff1`
 
 ## Verdict
 
-- **Spec: FAIL**
-- **Quality: FAIL**
-- **Ready: NO**
+- **Spec: PASS for the retention slice**
+- **Quality: PASS for the retention slice**
+- **Ready: YES for the formal 3M + load-proof stage**
+- **P0-B release readiness: NO until I2 is closed by that formal stage**
 
-The implementation has good policy, locking, cascade, migration-recovery, and
-operator-visibility foundations, but it is not safe to ship yet. Three
-correctness paths can either retain expired personal rows indefinitely or make
-deleted history look like complete zero. The maintenance row budget is also not
-global despite its public parameter name.
+The fix closes the original C1, C2, C3, and I1 findings with bounded,
+transactionally visible behavior and focused PostgreSQL coverage. No new
+retention correctness blocker remains. The broad retention-index write cost and
+the authenticity of external business-path evidence remain intentionally
+assigned to the next formal proof; they are not results this commit claims to
+have produced.
 
-## Critical findings
+## Original findings
 
-### C1. Rows that become old after `retained_from` is published are permanently skipped
+### C1 — CLOSED: late-old rows are no longer hidden below a published boundary
 
-Locations:
+Relevant implementation:
 
-- `backend/model_api_runtime/v2/provider_attempt_rollup.py:921-935`
-- `backend/model_api_runtime/v2/provider_attempt_rollup.py:962-997`
-- `backend/model_api_runtime/v2/provider_attempt_rollup.py:1034-1064`
-- `backend/alembic/versions/0077_llm_usage_attempt_rollups.py:201-238`
+- `backend/model_api_runtime/v2/provider_attempt_rollup.py:917-990`
+- `backend/model_api_runtime/v2/provider_attempt_rollup.py:1023-1069`
+- `backend/model_api_runtime/v2/provider_attempt_rollup.py:476-505`
 
-The same-cutoff fast path returns before inspecting rows whenever
-`cutoff <= published`. On a later day, both parent deletion and the completion
-proof add a lower bound at the already-published cutoff. That assumes rows can
-never newly enter the expired interval after publication, but both supported
-write paths violate the assumption:
+The unsafe same-cutoff no-op and `>= published_at` lower bounds are gone.
+Matched deletion/proof always checks authoritative
+`v2_turn_metrics.created_at < cutoff`; orphan deletion/proof always checks
+`started_at < cutoff`. Both destructive branches remain bounded with
+`FOR UPDATE ... SKIP LOCKED LIMIT quota`, while the `EXISTS` completion proof
+cannot publish past a surviving late-old row.
 
-1. a delayed/replayed canonical attempt can be inserted with `started_at`
-   before `retained_from`; and
-2. the migration explicitly supports a rare `v2_turn_metrics.created_at`
-   correction, including a move from a retained day to a day before
-   `retained_from`.
+Source-change dirty claims are allowed below `retained_from`; ordinary replay
+and bootstrap claims remain fenced. Maintenance waits for source cursors to
+have no backlog, then the retention target rotation consumes the old claim.
+This handles both delayed/replayed orphan attempts and supported turn-date
+corrections without rebuilding a retained-out day.
 
-The trigger inserts the old dirty day, but maintenance deliberately fences old
-dirty days out. The old attempt is therefore excluded from deletion and from
-the `remaining` proof forever while the watermark keeps advancing. This breaks
-the authoritative-day policy and user-data retention guarantee.
+Regression coverage verified:
 
-Minimal regression tests:
+- `test_next_cutoff_prunes_late_orphan_older_than_published_boundary`
+- `test_next_cutoff_prunes_turn_moved_behind_published_boundary_and_dirty_claim`
+- `test_retention_same_published_cutoff_checks_late_data_without_mutation`
 
-1. Publish `retained_from=P`, insert a runtime-recorder orphan with
-   `started_at<P`, run retention first at `P` and then at `P+1`; assert the row
-   is deleted before `P+1` is published.
-2. Publish `retained_from=P`, seed a matched attempt whose turn starts at `P`,
-   update the turn to `P-1`, then run retention at `P+1`; assert the attempt and
-   correction cascade are deleted and the old dirty claim cannot be silently
-   stranded.
+### C2 — CLOSED: pending boundary and destructive rows are atomically visible
 
-The fix needs a bounded late-old lane (or equivalent indexed invariant) that
-continues checking below the published boundary. The published lower bound may
-optimize normal forward pruning, but cannot be the only eligibility/proof
-range.
+Relevant implementation:
 
-### C2. Multi-batch retention deletes rollups before publishing any partial boundary
+- `backend/alembic/versions/0077_llm_usage_attempt_rollups.py:177-196`
+- `backend/model_api_runtime/v2/provider_attempt_rollup.py:913-1097`
+- `backend/model_api_runtime/v2/jobs_store.py:6010-6069`
+- `backend/model_api_runtime/v2/jobs_store.py:6424-6588`
 
-Locations:
+`retention_pending_from` is durable in the existing watermark row. An
+incomplete destructive page writes the pending boundary in the same PostgreSQL
+transaction as all parent/derived deletes. A repeatable-read reader sees the
+old boundary and old rows; a later reader sees the pending boundary and the
+committed deletes. Error, cancellation, timeout, or CAS loss rolls the entire
+page back, so no reader can observe deletion without either the old complete
+snapshot or the new partial fence.
 
-- `backend/model_api_runtime/v2/provider_attempt_rollup.py:967-1032`
-- `backend/model_api_runtime/v2/provider_attempt_rollup.py:1066-1085`
-- `backend/model_api_runtime/v2/jobs_store.py:6016-6053`
+While pending, affected rollup days fall back to surviving raw rows and both
+Admin and Runtime expose `provider_attempt_retention_pending`; the known
+whole-turn denominator remains, while logical coverage is `None`. Final
+completion atomically advances `retained_from` and clears the pending boundary.
 
-Every page commits deletion from attempts and independently deletes up to
-`max_rows` dimensions and memberships. If more old attempts remain (or one is
-locked), `retained_from` intentionally stays unchanged. Readers still classify
-the affected historical days as completed rollup days because there is no
-published pending-retention fence. They can therefore read already-deleted
-rollup rows as zero while the known whole-turn denominator remains, with no
-`retention_truncated` marker.
+Regression coverage verified:
 
-This is observable across ordinary multi-page retention, not only a failure
-case: page one may delete derived data and commit while parent cleanup needs
-page two. The existing locked-row test asserts late watermark publication but
-does not query Admin/Runtime between pages.
+- `test_retention_pending_fence_precedes_multi_page_destructive_state`
+- `test_retention_pending_and_destructive_rows_are_atomically_visible`
+- `test_usage_attempt_partition_pending_fence_falls_back_to_surviving_raw`
+- `test_usage_attempt_pending_fence_keeps_surviving_raw_and_marks_partial`
+- `test_token_usage_by_lane_marks_pending_retention_partial`
+- `test_usage_page_explains_pending_retention_without_claiming_zero`
 
-Minimal regression test:
+Migration review confirms the new column is installed, constrained relative to
+`retained_from`, included in downgrade cleanup, and covered by the existing
+schema/downgrade tests. Exact concurrent-index recovery and unrelated-owner
+preflight remain intact.
 
-- Seed at least two expired attempts and a matching daily dimension/membership,
-  run a page with `max_rows=1` (or lock one parent), then query the Usage report
-  before the next page. Assert the report either falls back to surviving raw
-  facts or exposes an explicit pending-retention partial reason; it must not
-  render complete zero/coverage.
+### C3 — CLOSED: arbitrary Admin timezones honor the Shanghai retention boundary
 
-Safe designs include delaying derived deletion until all parents are gone, or
-publishing a separate `retention_pending_from` before the first destructive
-page and making every reader treat the affected range as raw/partial. Advancing
-`retained_from` early would be incorrect because it claims completion.
+Relevant implementation:
 
-### C3. Non-Shanghai Admin queries silently bypass retention coverage
+- `backend/model_api_runtime/v2/jobs_store.py:6109-6168`
+- `backend/model_api_runtime/v2/jobs_store.py:6424-6459`
+- `backend/model_api_runtime/v2/jobs_store.py:6528-6557`
 
-Locations:
+The raw fallback now converts the Shanghai local retention day to its exact UTC
+midnight and crops the already-published interval independently of the report's
+display timezone. Coverage detection uses that same UTC boundary for UTC and
+arbitrary IANA zones. A pending fence marks totals partial but deliberately
+keeps surviving raw rows visible; a published boundary excludes the known
+pruned interval. Both paths preserve the whole-turn denominator and set the
+ratio to `None` rather than reporting a false zero.
 
-- `backend/admin/usage.py:21-32,59-65,107-140`
-- `backend/model_api_runtime/v2/jobs_store.py:6056-6060`
-- `backend/model_api_runtime/v2/jobs_store.py:6383-6400`
+Regression coverage verified for `UTC` and `America/Los_Angeles` by
+`test_usage_attempt_non_shanghai_range_honors_retained_boundary`, in addition
+to Shanghai Admin and Runtime cases.
 
-Admin accepts any valid IANA display timezone. The hybrid path only builds a
-partition for `Asia/Shanghai`; other timezones fall back to raw. The raw
-snapshot reads `retained_from`, but only applies it when
-`usage_reporting.rollup_partition(query)` returns a partition, which it does
-not outside Shanghai. Consequently, a UTC/custom-zone query crossing the
-published cutoff scans only surviving ledger rows, reports no
-`retained_from`/`retention_truncated`, and may calculate `0 / known denominator`
-as real coverage.
+### I1 — CLOSED: one strict global explicit-row budget with rotating fairness
 
-Minimal regression test:
+Relevant implementation:
 
-- Publish `retained_from=P`; issue equivalent custom ranges crossing `P` using
-  `timezone="UTC"` and another valid non-Shanghai zone. Assert the same
-  retained boundary, partial reason, preserved whole-turn denominator, and
-  `logical_call_coverage is None` as the Shanghai query.
+- `backend/model_api_runtime/v2/provider_attempt_rollup.py:926-1021`
 
-The retention boundary is defined in Shanghai, but coverage detection can be
-timezone-independent by comparing the UTC query interval with Shanghai
-midnight for `retained_from`; raw predicates must also exclude the pruned
-interval explicitly.
+Attempts, dimensions, memberships, and dirty days now share one decrementing
+`max_rows` budget. Attempt quota is shared between matched and orphan parents.
+The starting target rotates by watermark version; an empty target consumes no
+budget and the remainder is reclaimed by later targets. With `max_rows=1`, each
+tick explicitly mutates at most one row and repeated ticks reach all four
+targets.
 
-## Important findings
+Correction cascades are counted separately as implicit FK work rather than
+misrepresented as explicit budget consumption. Their amplification is now
+visible for the formal load proof.
 
-### I1. `max_retention_rows` is a per-table limit, not a global maintenance budget
+Regression coverage verified:
 
-Locations:
+- `test_max_retention_rows_is_one_global_fair_budget_and_cascades_are_separate`
+- existing locked-row, rollback/cancel, cascade, and plan-shape tests
 
-- `backend/model_api_runtime/v2/provider_attempt_rollup.py:970-1027`
-- `backend/model_api_runtime/v2/provider_attempt_rollup.py:1185-1190`
+## I2 — OPEN for the next formal proof
 
-Parent deletion is globally capped at `N` across job-backed and orphan rows,
-which is good. The same `N` is then independently applied to dimensions,
-memberships, and dirty days. One tick can therefore mutate up to `4N` rows
-(plus correction cascades), although the API/config name communicates one
-bounded row budget. At the default this is up to 2,000 explicit rows rather
-than 500, and at the accepted maximum up to 40,000 plus cascades.
+The retention slice is ready to run the proof, but I2 is not yet closed.
 
-Use one remaining budget across all retention targets, with reserved/fair
-progress so a large parent backlog cannot permanently starve derived cleanup.
-Correction cascades should be measured separately and covered in the load
-proof because one parent can own multiple corrections.
+### What is now fail-closed
 
-### I2. The new orphan index adds write amplification to every canonical attempt; 3M proof is still pending
+`scripts/perf/admin_usage_scale.py` now requires:
 
-Locations:
+- exactly two report cohorts with p95 strictly below 3,000 ms;
+- one attempt statement, exact runtime-job index use, rollup relation use, and
+  complete-plan scan/probe guards;
+- exact valid retention-index definition plus nonnegative size and maintenance
+  evidence from the connected 3M database;
+- complete FK/watermark/dirty cleanup with zero residual rows; and
+- an explicit business-path evidence file. Missing, unreadable, malformed, or
+  incomplete JSON exits/fails, as do pool timeouts, business errors, baseline
+  mismatches, missing provider lanes, or absent retention-index metrics.
 
-- `backend/alembic/versions/0077_llm_usage_attempt_rollups.py:258-261`
-- `tests/test_provider_attempt_rollup_reconciler.py:276-353`
-- `tests/test_provider_attempt_rollup_migration.py:385-425`
+The formal output's `passed` bit is the conjunction of all these gates, and the
+process exits nonzero when any gate fails. The earlier defect where index use
+was merely recorded rather than enforced is closed.
 
-The exact migration recovery/downgrade ownership checks are sound, and the
-query shape is appropriately driven by `ix_v2_turn_metrics_created_at`,
-`ix_llm_provider_attempts_runtime_job`, and the new orphan index. However, the
-new `(started_at, attempt_id) INCLUDE (job_id)` partial index covers effectively
-every canonical runtime-recorder row, so it adds a B-tree write on every start
-and relevant update in addition to the existing attempt indexes. The committed
-EXPLAIN fixture has only 3,001 rows and disables sequential scans; it is a plan
-shape regression, not the requested 3M-scale cost/business-impact proof.
+### What the formal load producer must still add
 
-Do not remove the index without an alternative orphan lookup, but require the
-formal 3M attempts EXPLAIN and recorder/provider load proof to include index
-size/write overhead, normal planner behavior (without forcing
-`enable_seqscan=off`), maintenance latency, pool occupancy, and provider-path
-latency/results.
+The current business-path JSON gate validates self-reported values but does not
+establish provenance. A hand-authored JSON object with healthy values passes
+`_business_path_evidence_passed`; the repository currently has no producer that
+binds those fields to raw samples, the tested commit, fixture/run identity, or
+the formal invocation. Therefore the next load task must not treat an arbitrary
+JSON file as proof.
 
-## Minor findings
+Before I2 can close, the producer and consumer should provide an auditable
+binding, for example:
 
-### M1. Retention configuration silently caps longer policies at 36,500 days
+- producer-owned schema/version and unique run ID;
+- tested commit and configuration/fixture identity;
+- raw baseline and saturated/failure-injection samples from which p95,
+  results-equivalence, errors, queue bound, retry counts, and pool occupancy are
+  recomputed rather than trusted as booleans;
+- provider-lane evidence for OpenRouter, Anthropic, and Google;
+- a digest (or same-process generation) binding the consumed evidence to the
+  formal output; and
+- tests proving a fabricated value, altered sample, mismatched run/commit,
+  stale file, missing field, or missing file makes the formal result fail.
 
-`retention_days()` correctly defaults to 400, clamps shorter/malformed values,
-and accepts tested longer values. The undocumented 100-year maximum means the
-environment cannot increase retention without limit. This is unlikely to
-matter operationally, but either document the safety cap or reject an
-out-of-range value visibly instead of silently changing policy.
+The formal 3M run must also record the broad retention index's size,
+bytes/attempt, table share, normal-planner use, maintenance latency, pool
+occupancy, and provider-path latency/results. This is the intended point at
+which the remaining write-amplification risk is accepted or rejected.
 
-## Confirmed strengths
+## Verification
 
-- Default-on maintenance with explicit false-like opt-out; no new service,
-  database, queue, thread, or deployment unit.
-- Shanghai half-open cutoff keeps the cutoff day and newer.
-- Job-backed rows use `v2_turn_metrics.created_at`; only unmatched rows use
-  `started_at`.
-- Parent selection uses `FOR UPDATE ... SKIP LOCKED`; job/orphan parent deletes
-  share one cap.
-- Correction deletion correctly relies on the parent FK cascade; rate cards,
-  turns, and users are not direct retention targets.
-- Transaction errors, cancellation, CAS loss, and SQL timeout are caught and
-  remain fail-open to the business path.
-- Replay/bootstrap/dirty selection fences an already-published boundary.
-- Shanghai Admin and Runtime payloads preserve the whole-turn denominator,
-  set logical coverage to `None`, and expose an explicit partial reason when a
-  query crosses a published boundary.
-- The new concurrent index participates in the migration's exact-definition
-  recovery, unrelated-owner preflight, and downgrade path.
+Independent focused PostgreSQL run after the fix:
 
-## Verification evidence
+- retention late-old, pending fence, strict global budget, index plan,
+  non-Shanghai coverage, pending Admin/Runtime, and evidence-gate cases:
+  **12 passed**, 2 existing Alembic deprecation warnings;
+- migration install and downgrade cases for the new watermark field:
+  **2 passed**, 5 existing Alembic deprecation warnings;
+- changed Python files: `py_compile` passed;
+- commit diff: `git diff --check` passed.
 
-- Implementation report: 331 focused PostgreSQL/Admin/Runtime tests passed;
-  final Admin + Runtime rerun 188 passed; Ruff, `py_compile`, and diff check
-  passed.
-- Independent static review inspected the complete retention implementation,
-  coverage paths, migration index recovery/downgrade, and focused tests.
-- An independent local PostgreSQL rerun could not execute in this reviewer
-  sandbox because TCP access to `127.0.0.1:55432` was denied with
-  `Operation not permitted`; this is an environment limitation, not a test
-  failure attributed to the commit.
+Implementation report additionally records the broader final retention suite as
+**243 passed**, 37 existing Alembic deprecation warnings, with Ruff and
+`py_compile` passing.
 
 ## Ready verdict
 
-**Not Ready.** Fix C1-C3 and I1, add the stated regression tests, then rerun the
-focused PostgreSQL/Admin/Runtime suite and independent review. I2 must be
-closed by the already-planned formal 3M + 3M and no-business-impact proof before
-P0-B is considered complete.
+**Ready for formal proof.** C1, C2, C3, and I1 are closed. The retention fix
+does not need another implementation pass before the 3M + load stage.
+
+**Not ready to declare P0-B complete or release-ready.** I2 remains open until a
+trusted load-evidence producer and the actual formal 3M + 3M run close the
+index-write and no-business-impact gates.
