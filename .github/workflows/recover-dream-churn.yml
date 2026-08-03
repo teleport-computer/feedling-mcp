@@ -1,0 +1,52 @@
+name: recover-dream-churn
+
+# Manually-dispatched runner for tools/recover_memory_dream_churn.py.
+# Exists so the test-RDS DSN never leaves GitHub secrets: the recovery
+# script is test-only, dry-run by default, double-confirmed for apply,
+# and performs zero hard deletes (see tests/test_recover_memory_dream_churn.py).
+
+on:
+  workflow_dispatch:
+    inputs:
+      user_id:
+        description: "Target user id (usr_ + 16 hex)"
+        required: true
+        type: string
+      apply:
+        description: "Set to APPLY to actually write; anything else = dry-run"
+        required: false
+        default: "dry-run"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recover-dream-churn
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install psycopg
+        run: pip install 'psycopg[binary]'
+      - name: Run recovery (dry-run unless apply=APPLY)
+        env:
+          TEST_DATABASE_URL: ${{ secrets.TEST_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.apply }}" = "APPLY" ]; then
+            python3 tools/recover_memory_dream_churn.py \
+              --env test --user-id "${{ inputs.user_id }}" \
+              --apply --confirm-user-id "${{ inputs.user_id }}" \
+              --confirm-churn-stopped
+          else
+            python3 tools/recover_memory_dream_churn.py \
+              --env test --user-id "${{ inputs.user_id }}"
+          fi
