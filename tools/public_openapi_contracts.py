@@ -1395,6 +1395,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "type": "string",
                 "enum": [
                     "agent_tool",
+                    "genesis_import",
                     "genesis_resident_distill",
                     "memory_capture",
                     "memory_dream",

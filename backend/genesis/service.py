@@ -725,6 +725,17 @@ def _memory_action_from_output(
     }
 
 
+def _memory_action_result_failed(row: object) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("status") or "").strip().lower() in {"error", "failed"}:
+        return True
+    try:
+        return int(row.get("http_status") or 0) >= 400
+    except (TypeError, ValueError):
+        return False
+
+
 def apply_memory_outputs(
     store: UserStore,
     api_key: str | None,
@@ -772,8 +783,7 @@ def apply_memory_outputs(
             else sum(
                 1
                 for row in rows
-                if not isinstance(row, dict)
-                or str(row.get("status") or "").strip().lower() != "error"
+                if not _memory_action_result_failed(row)
             )
         )
         written += batch_written
@@ -783,17 +793,19 @@ def apply_memory_outputs(
             else sum(
                 1
                 for row in rows
-                if isinstance(row, dict)
-                and str(row.get("status") or "").strip().lower() == "error"
+                if _memory_action_result_failed(row)
             )
         )
-        if batch_failed == len(batch):
+        # Do not let legacy/malformed executors turn an all-rejected batch into a
+        # successful Genesis job with ``memory_action_count=0``.  Partial success
+        # remains valid; a batch is fatal only when it wrote nothing and reported
+        # at least one concrete failure.
+        if batch_written == 0 and batch_failed > 0:
             first_error = next(
                 (
                     str(row.get("error") or "memory_action_failed")
                     for row in rows
-                    if isinstance(row, dict)
-                    and str(row.get("status") or "") == "error"
+                    if _memory_action_result_failed(row)
                 ),
                 "memory_action_failed",
             )

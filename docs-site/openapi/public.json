@@ -10058,6 +10058,7 @@
             "type": "string",
             "enum": [
               "agent_tool",
+              "genesis_import",
               "genesis_resident_distill",
               "memory_capture",
               "memory_dream",
