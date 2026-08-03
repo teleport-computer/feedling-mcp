@@ -717,6 +717,54 @@ def test_lost_heartbeat_lease_does_not_persist_glance_fingerprint(monkeypatch):
     assert upserts == []
 
 
+def test_heartbeat_without_context_reader_does_not_persist_after_failed_completion(
+    monkeypatch,
+):
+    """Catches optional-reader heartbeats treating failed completion as success."""
+    uid = "u_glance_no_context_reader_lost_lease"
+    conftest.seed_user(uid)
+    _reset(uid)
+
+    async def fake_provider(*args, **kwargs):
+        return _text_round("")
+
+    async def fake_cap_data(store, action_type, **kwargs):
+        assert action_type == "perception_glance"
+        return {
+            "glance": {
+                "weather": {"available": True, "notable_change": False}
+            }
+        }
+
+    upserts = []
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_provider)
+    monkeypatch.setattr(worker, "_cap_data", fake_cap_data)
+    monkeypatch.setattr(jobs_store, "mark_completed", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        jobs_store,
+        "upsert_runtime_state",
+        lambda *args, **kwargs: upserts.append((args, kwargs)),
+    )
+    deps = _wake_deps(
+        tail=[{"id": "m1", "ts": 1.0, "role": "user", "content": "hi"}]
+    )
+    assert deps.read_perception_wake_context is None
+    jobs_store.enqueue_job(uid, "heartbeat")
+    job = jobs_store.claim_next_job("w")
+    status = asyncio.run(
+        worker.process_job(
+            job,
+            deps,
+            provider_config=_BYOK,
+            api_key=None,
+            runtime_token="rt",
+        )
+    )
+
+    assert status == "failed"
+    assert upserts == []
+
+
 def test_completed_ordinary_heartbeat_fingerprint_write_is_generation_fenced(
     monkeypatch,
 ):

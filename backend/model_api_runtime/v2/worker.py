@@ -7809,6 +7809,7 @@ async def _run_wake(
             raise
 
         successor_id = None
+        heartbeat_terminalized = False
         if lane == "heartbeat" and deps.read_perception_wake_context is not None:
             completed, successor_id = await asyncio.to_thread(
                 jobs_store.finish_wake_job,
@@ -7819,23 +7820,37 @@ async def _run_wake(
                 consumed_context_seq=consumed_perception_context_seq,
                 clear_wake_backoff=(lane in _FAIL_BACKOFF_WAKE_LANES),
             )
+            heartbeat_terminalized = completed
         else:
             # Some reply-effect sinks terminalize the source job atomically
             # with final publication. Preserve the established non-heartbeat
             # behavior: a false return here is therefore not necessarily lease
-            # loss. Heartbeat's successor-aware path above owns its own exact
-            # terminalization and must return true.
-            await asyncio.to_thread(
+            # loss. An optional-reader heartbeat must still prove that either
+            # this call completed the job or the exact owned source was already
+            # completed by its final-reply effect.
+            transitioned = await asyncio.to_thread(
                 jobs_store.mark_completed,
                 job_id,
                 claimed_by=claimed_by,
                 clear_wake_backoff=(lane in _FAIL_BACKOFF_WAKE_LANES),
             )
-            completed = True
+            if lane == "heartbeat":
+                heartbeat_terminalized = transitioned
+                if not heartbeat_terminalized:
+                    source_status = await asyncio.to_thread(
+                        jobs_store.get_job_status,
+                        job_id,
+                        user_id=user_id,
+                        claimed_by=claimed_by,
+                    )
+                    heartbeat_terminalized = source_status == "completed"
+                completed = heartbeat_terminalized
+            else:
+                completed = True
         if not completed:
             raise LostJobLease("wake job ownership lost during completion")
         ordinary_heartbeat = (
-            lane == "heartbeat"
+            heartbeat_terminalized
             and not perception_wake_context
             and glance_fingerprint is not None
         )
