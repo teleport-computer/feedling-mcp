@@ -2,6 +2,115 @@
 
 Reviewed commit: `deff128524dea481e85c32e9a4943db1c1bb211d`
 
+## Second re-review of `2e55b1a915d2b2094ac0430ba9be4ebbaca78a4c`
+
+### Second re-review verdict
+
+- **Spec: FAIL**
+- **Quality: FAIL**
+- **Ready for the formal 3M + 3M run: NO**
+
+The fix closes the previous C3, C4, and I2 findings.  Candidate provider call
+intervals are now bound to raw DB acquisition intervals; every candidate must
+have a non-empty recomputed intersection and the full batch must cover all six
+roles.  Timeout evidence now reads the production Usage total and attempt
+budgets and separately records the actual maintenance argument.  The stale
+default-attempt test is updated and green.
+
+One remaining maintenance-outcome evidence gap can still allow a broken
+rebuild workload to satisfy the contention proof.
+
+### Previous C3 — CLOSED: provider samples are bound to raw contention intervals
+
+Every provider path now stores monotonic `started_ns` and `finished_ns` arrays.
+For each OpenRouter, Anthropic, and Google pool-contention candidate, the
+producer derives `overlapping_roles` from half-open intersections with raw
+connection acquisition/release intervals.  The validator independently
+recomputes the intersection, requires every candidate's intersection to be
+non-empty, and requires the complete candidate population to cover all six
+exact roles.  Result digests, exceptions, HTTP attempts, retries, raw paired
+deltas, and strict p95 remain independently recomputed.
+
+The provider worker waits for real exporter/maintenance roles before sampling,
+and report plus maintenance loops continue until the provider population is
+finished.  Negative tests reject a candidate outside the DB intervals and a
+batch missing the rebuild role.  This closes the timing-to-contention binding
+defect from the first re-review.
+
+### Previous C4 — CLOSED: all three timeout contracts reflect their actual source
+
+The producer reads `jobs_store._USAGE_REPORT_STATEMENT_TIMEOUT_MS` (15,000 ms)
+and `jobs_store._RUNTIME_ATTEMPT_USAGE_STATEMENT_TIMEOUT_MS` (3,000 ms), fails
+immediately if either production contract changes, and records them under
+distinct names.  The maintenance field is the 3,000 ms constant actually
+passed as `statement_timeout_ms` to `run_maintenance_tick`.  The validator
+checks all three independently, and parameterized negative tests reject every
+cross-labelled/mismatched value.
+
+### Previous I2 — CLOSED: default-attempt focused test is current
+
+`test_admin_usage_scale_attempt_fixture_is_explicit_and_bounded` now expects
+the formal default of 3,000,000 attempts while retaining explicit zero,
+partial, negative, and over-limit cases.  The focused test passes.
+
+### I3 — OPEN: rebuild acquisition is recorded, but maintenance success is not
+
+Relevant code:
+
+- `scripts/perf/provider_attempt_business_path.py:1155-1174`
+- `scripts/perf/provider_attempt_business_path.py:1194-1214`
+- `scripts/perf/provider_attempt_business_path.py:1242-1265`
+- `scripts/perf/provider_attempt_business_path.py:268-310`
+
+The probe seeds twenty real dirty-day claims and repeatedly invokes the real
+`provider_attempt_rollup.run_maintenance_tick`; nested
+`attempt_rollup_rebuild` intervals prove that `recompute_local_day` acquired
+its second production connection rather than the maintenance loop remaining a
+pure no-op.  However, `run_maintenance_tick` deliberately returns structured
+`status='error'` results instead of raising.  The maintenance thread stores
+those tick results only in `outcomes['maintenance']`, then the producer drops
+them when constructing the artifact.  Neither the artifact nor validator
+requires any tick to be `ok`, any dirty day to be successfully refreshed, or
+the refreshed days to be unique.
+
+A failing recompute can therefore repeatedly acquire the rebuild connection
+for the same surviving dirty day, produce all required raw intervals and role
+coverage, and still pass the evidence validator.  The load report's stronger
+claim that twenty real dirty-day recompute inputs were exercised is not bound
+to auditable outcomes.
+
+Minimum fix:
+
+- Add raw maintenance tick outcomes to the artifact and validate that every
+  workload tick used for contention returned `status='ok'` (or the exact
+  documented success status), with no error/cancel/lock-busy result.
+- Record and validate a non-empty set of unique successfully refreshed dirty
+  days; if the intended claim is twenty, require exactly twenty distinct seeded
+  days to be consumed and confirm no load-proof dirty claims remain before the
+  cleanup delete.
+- Add a negative test whose maintenance function returns structured errors
+  while still acquiring a nested connection, and prove it cannot satisfy the
+  validator.
+
+### Second re-review verification
+
+- Producer/recorder/provider plus formal/default gate tests: **66 passed, 1
+  skipped**.
+- `git diff 215e0d44 2e55b1a9 --check`: passed.
+- Static trace confirmed candidate interval intersection is recomputed from raw
+  DB intervals and all-six-role batch coverage is mandatory.
+- Static trace confirmed 15,000 ms total Usage deadline and 3,000 ms attempt
+  cap come from the production module, while the 3,000 ms maintenance timeout
+  is the actual argument passed by the probe.
+- No 3M run, external provider network call, or remote RDS access was performed.
+
+### Second re-review ready verdict
+
+**Not ready.**  C3, C4, and I2 are closed.  Bind successful, distinct dirty-day
+rebuild outcomes into the artifact and validator, add the structured-error
+negative test, then obtain one final focused re-review before starting the
+formal 3M + 3M run.
+
 ## Re-review of `e6b30a84d3a4e2163ed91a02ed8061cd7edd4735`
 
 ### Re-review verdict
