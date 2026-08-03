@@ -98,6 +98,7 @@ def test_v2_sampled_foreground_checkpoints_full_history_indices(monkeypatch):
     class Progress:
         def __init__(self):
             self.outputs = {}
+            self.published = []
 
         def resume_outputs(self, source_pass, source_family):
             assert (source_pass, source_family) == (1, "history")
@@ -107,8 +108,8 @@ def test_v2_sampled_foreground_checkpoints_full_history_indices(monkeypatch):
             assert (source_pass, source_family) == (1, "history")
             self.outputs[chunk_index] = output
 
-        def publish(self, **_kwargs):
-            return None
+        def publish(self, **kwargs):
+            self.published.append(kwargs)
 
         def mark_identity_ready(self):
             return None
@@ -165,6 +166,8 @@ def test_v2_sampled_foreground_checkpoints_full_history_indices(monkeypatch):
         for index in expected_indices
     } == {index: chunks[index] for index in expected_indices}
     assert sorted(set(range(len(chunks))) - set(captured["resumed"])) == [1, 4, 7, 10]
+    assert progress.published[0]["stage"] == "genesis_v2_foreground"
+    assert progress.published[0]["source_pass"] == 1
 
 
 def test_v2_returns_false_when_nothing_greetable(monkeypatch):

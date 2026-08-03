@@ -1161,10 +1161,21 @@ def _run_plaintext_genesis_v2(
     fg_kind = str(fg_group.get("source_kind") or history_import._HISTORY_SOURCE)
     fg_family = str(fg_group.get("source_family") or worker._source_family(fg_kind))
 
-    db.genesis_set_job_status(
-        store.user_id, job_id, status="processing",
-        output={"stage": "genesis_v2_foreground", "source_family": fg_family}, processed_chunks=0,
-    )
+    if progress:
+        progress.publish(
+            stage="genesis_v2_foreground",
+            source_family=fg_family,
+            source_pass=fg_idx,
+            status="processing",
+        )
+    else:
+        db.genesis_set_job_status(
+            store.user_id,
+            job_id,
+            status="processing",
+            output={"stage": "genesis_v2_foreground", "source_family": fg_family},
+            processed_chunks=0,
+        )
     msgs = analysis_messages if isinstance(analysis_messages, list) else []
     # fresh_start-only = every analysis message is the synthetic sentinel (routed
     # into the history bucket by _plaintext_route_family, so group source_kind
@@ -1743,17 +1754,25 @@ def _run_plaintext_add_memory_job(
             continue
         keep_all = group_family == "memory_summary"
         keep_all_job = keep_all_job or keep_all
-        db.genesis_set_job_status(
-            store.user_id,
-            job_id,
-            status="processing",
-            output={
-                "stage": "plaintext_add_memory",
-                "source_family": group_family,
-                "source_pass": idx,
-                "source_pass_total": len(source_groups),
-            },
-        )
+        if progress:
+            progress.publish(
+                stage="plaintext_add_memory",
+                source_family=group_family,
+                source_pass=idx,
+                status="processing",
+            )
+        else:
+            db.genesis_set_job_status(
+                store.user_id,
+                job_id,
+                status="processing",
+                output={
+                    "stage": "plaintext_add_memory",
+                    "source_family": group_family,
+                    "source_pass": idx,
+                    "source_pass_total": len(source_groups),
+                },
+            )
         output = worker.build_foreground_output_from_texts(
             user_id=store.user_id,
             job_id=job_id,
@@ -1969,14 +1988,7 @@ def _run_plaintext_genesis_job(
         if not source_groups:
             raise MaterialEmptyError("plaintext_import_empty")
 
-        job = db.genesis_set_job_status(
-            store.user_id,
-            job_id,
-            status="processing",
-            output={"stage": "plaintext_reducer"},
-        )
-        if job:
-            service.write_genesis_state(store, job, status="processing")
+        job = db.genesis_get_job(store.user_id, job_id)
         runtime = hosted_config_store._load_runtime_provider_config(store, api_key)
         if isinstance(runtime, tuple):
             _, err = runtime
@@ -2053,24 +2065,17 @@ def _run_plaintext_genesis_job(
         reducer_outputs: list[dict] = []
         existing_persona: dict = {}
         existing_voice: dict = {}
-        processed_chunks = 0
         for idx, group in enumerate(source_groups, start=1):
             group_source_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
             group_source_family = str(group.get("source_family") or worker._source_family(group_source_kind))
             group_chunk_texts = [str(text) for text in (group.get("chunk_texts") or []) if str(text or "").strip()]
             if not group_chunk_texts:
                 continue
-            db.genesis_set_job_status(
-                store.user_id,
-                job_id,
+            progress.publish(
+                stage="plaintext_reducer",
+                source_family=group_source_family,
+                source_pass=idx,
                 status="processing",
-                output={
-                    "stage": "plaintext_reducer",
-                    "source_family": group_source_family,
-                    "source_pass": idx,
-                    "source_pass_total": len(source_groups),
-                },
-                processed_chunks=processed_chunks,
             )
             pass_started_at = time.time()
             _trace_genesis(
@@ -2124,7 +2129,6 @@ def _run_plaintext_genesis_job(
                 dur_ms=(time.time() - pass_started_at) * 1000,
             )
             reducer_outputs.append(output)
-            processed_chunks = progress.processed_chunks()
             next_persona = _plaintext_existing_persona_from_output(output)
             if next_persona:
                 existing_persona = next_persona

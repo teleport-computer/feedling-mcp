@@ -398,6 +398,17 @@ def test_plaintext_import_recovers_stale_processing_job_and_resumes(monkeypatch)
     )
     monkeypatch.setattr(
         plaintext.db,
+        "genesis_patch_job_metadata",
+        lambda *_args, **_kwargs: {
+            **failed,
+            "metadata": {
+                **failed["metadata"],
+                **plaintext._plaintext_worker_metadata(),
+            },
+        },
+    )
+    monkeypatch.setattr(
+        plaintext.db,
         "genesis_set_job_status",
         lambda *_args, **_kwargs: {**failed, "status": "processing"},
     )
@@ -1172,6 +1183,15 @@ def test_plaintext_background_runner_distills_and_applies(monkeypatch):
         }
 
     monkeypatch.setattr(plaintext.db, "genesis_set_job_status", fake_set_status)
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_get_job",
+        lambda *_args: {
+            "job_id": "genesis_job_1",
+            "status": "processing",
+            "metadata": {"distill_model": "fast-genesis-model"},
+        },
+    )
     monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
     chat_runtime = plaintext.provider_client.ProviderConfig(
         "anthropic", "chat-model", "provider-key", "https://api.anthropic.com")
@@ -1222,6 +1242,14 @@ def test_plaintext_background_runner_distills_and_applies(monkeypatch):
         "windows_total": 1,
         "cards": 0,
     }]
+    material_counts = [
+        len(status["output"].get("materials") or [])
+        for status in calls["statuses"]
+        if status.get("status") == "processing"
+    ]
+    assert material_counts
+    assert material_counts == sorted(material_counts)
+    assert material_counts[0] == 1
     assert [
         event["type"]
         for event in trace_events
@@ -1475,6 +1503,11 @@ def test_plaintext_retry_uses_checkpoint_and_skips_completed_maps(monkeypatch):
     monkeypatch.setattr(plaintext.lightweight_identity, "has_signal", lambda *_args: False)
     monkeypatch.setattr(plaintext, "_append_plaintext_onboarding_greeting", lambda *_args, **_kwargs: "hi")
     monkeypatch.setattr(plaintext.service, "apply_reducer_output", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        plaintext.db,
+        "genesis_complete_job",
+        lambda _user_id, job_id, **_kwargs: {"job_id": job_id, "status": "done"},
+    )
     monkeypatch.setattr(
         plaintext.service,
         "mark_failed",

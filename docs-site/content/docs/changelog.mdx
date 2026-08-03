@@ -32,8 +32,10 @@ change must not be interpreted as an API guarantee.
   DeepSeek, Gemini, OpenAI, and OpenRouter, with a three-second catalog probe
   for compatible relays. Job status immediately exposes every material as
   queued, followed by ordered progress and real candidate-card counts,
-  `identity_ready`, and cause-aware failure fields. Missing, consumed, and
-  expired stages have distinct 4xx errors. Genesis V2 now remains processing
+  `identity_ready`, and cause-aware failure fields. Processing frames preserve
+  the complete material list while individual items advance, so counters do
+  not disappear between stages. Missing, consumed, and expired stages have
+  distinct 4xx errors. Genesis V2 now remains processing
   after foreground identity readiness and reaches done only after all material
   windows complete, including combined-map imports. Malformed provider JSON is
   reported as `model_bad_json` instead of an internal error. Plaintext workers
