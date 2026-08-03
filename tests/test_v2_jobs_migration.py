@@ -85,6 +85,7 @@ def test_0076_provider_attempt_schema_is_content_free_and_deletion_safe():
         "ix_llm_provider_attempts_finished",
         "ix_llm_provider_attempts_provider_model_finished",
         "ix_llm_provider_attempts_call",
+        "ix_llm_provider_attempts_runtime_job",
     }
 
     uid = "u_provider_attempt_schema"
@@ -122,6 +123,19 @@ def test_0076_provider_attempt_schema_is_content_free_and_deletion_safe():
                 ).fetchall()
             }
             assert set(migration._CONCURRENT_INDEXES) <= actual_indexes
+            runtime_job_index = conn.execute(
+                "SELECT pg_get_indexdef(idx.indexrelid),"
+                "pg_get_expr(idx.indpred,idx.indrelid,true),idx.indoption::text "
+                "FROM pg_index idx WHERE "
+                "idx.indexrelid='ix_llm_provider_attempts_runtime_job'::regclass"
+            ).fetchone()
+            assert runtime_job_index == (
+                "CREATE INDEX ix_llm_provider_attempts_runtime_job ON "
+                "public.llm_provider_attempts USING btree (job_id) WHERE "
+                "((source = 'runtime_recorder'::text) AND (job_id IS NOT NULL))",
+                "source = 'runtime_recorder'::text AND job_id IS NOT NULL",
+                "0",
+            )
 
             attempt_columns = {
                 row[0]
@@ -718,17 +732,19 @@ def test_0076_upgrade_rebuilds_same_table_index_with_wrong_definition():
             conn.execute(migration._SCHEMA_UP)
         with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
             conn.execute(
-                "CREATE INDEX CONCURRENTLY ix_llm_provider_attempts_user_started "
+                "CREATE INDEX CONCURRENTLY ix_llm_provider_attempts_runtime_job "
                 "ON llm_provider_attempts (started_at)"
             )
         command.upgrade(cfg, "head")
         with db.get_pool().connection() as conn:
             recovered = conn.execute(
                 "SELECT idx.indisvalid,pg_get_indexdef(idx.indexrelid) FROM pg_index idx "
-                "WHERE idx.indexrelid='ix_llm_provider_attempts_user_started'::regclass"
+                "WHERE idx.indexrelid='ix_llm_provider_attempts_runtime_job'::regclass"
             ).fetchone()
         assert recovered[0] is True
-        assert "(user_id, started_at DESC)" in recovered[1]
+        assert "(job_id)" in recovered[1]
+        assert "source = 'runtime_recorder'::text" in recovered[1]
+        assert "job_id IS NOT NULL" in recovered[1]
     finally:
         command.upgrade(cfg, "head")
 
@@ -743,7 +759,7 @@ def test_0076_upgrade_refuses_same_name_index_on_another_relation():
         command.downgrade(cfg, "0075_v2_usage_rollup")
         with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
             conn.execute(
-                "CREATE INDEX CONCURRENTLY ix_llm_provider_attempts_user_started "
+                "CREATE INDEX CONCURRENTLY ix_llm_provider_attempts_runtime_job "
                 "ON users (user_id)"
             )
         with pytest.raises(RuntimeError, match="another relation"):
@@ -751,12 +767,12 @@ def test_0076_upgrade_refuses_same_name_index_on_another_relation():
         with db.get_pool().connection() as conn:
             assert conn.execute(
                 "SELECT indrelid::regclass::text FROM pg_index "
-                "WHERE indexrelid='ix_llm_provider_attempts_user_started'::regclass"
+                "WHERE indexrelid='ix_llm_provider_attempts_runtime_job'::regclass"
             ).fetchone() == ("users",)
     finally:
         with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
             conn.execute(
-                "DROP INDEX CONCURRENTLY IF EXISTS ix_llm_provider_attempts_user_started"
+                "DROP INDEX CONCURRENTLY IF EXISTS ix_llm_provider_attempts_runtime_job"
             )
         command.upgrade(cfg, "head")
 

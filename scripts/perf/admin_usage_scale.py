@@ -28,6 +28,7 @@ from psycopg.conninfo import conninfo_to_dict
 
 
 DEFAULT_ROWS = 3_000_000
+DEFAULT_ATTEMPT_ROWS = 0
 DEFAULT_USERS = 2_000
 DEFAULT_RUNS = 5
 DEFAULT_HISTORY_DAYS = 365
@@ -120,6 +121,15 @@ def _production_window(
         raise ValueError("scale gate now must be timezone-aware")
     end_at = now_utc.astimezone(timezone.utc)
     return end_at - timedelta(days=90), end_at
+
+
+def _resolve_attempt_rows(rows: int, requested: int | None) -> int:
+    """Keep the legacy metric-only default; formal P0-B runs opt in explicitly."""
+
+    attempt_rows = DEFAULT_ATTEMPT_ROWS if requested is None else requested
+    if attempt_rows < 0 or attempt_rows > rows:
+        raise SystemExit("attempt-rows must be between 0 and rows")
+    return attempt_rows
 
 
 def _validate_scale_database_url(database_url: str) -> dict[str, Any]:
@@ -357,6 +367,8 @@ class _CapturePool:
 
 def _statement_label(sql: str) -> str:
     normalized = " ".join(sql.lower().split())
+    if "llm_provider_attempts" in normalized:
+        return "attempt_ledger"
     if "cross join lateral unnest(s.latency_samples)" in normalized:
         return "exact_latency"
     if "array_agg(distinct lane" in normalized:
@@ -428,11 +440,15 @@ def _explain_statements(conn, statements):
                     "v2_turn_metrics",
                     "v2_usage_daily_users",
                     "v2_usage_daily_dimensions",
+                    "llm_provider_attempts",
+                    "llm_provider_attempt_corrections",
+                    "llm_rate_cards",
                 }
                 or isinstance(index_name, str)
                 and (
                     "v2_turn_metrics" in index_name
                     or "v2_usage_daily" in index_name
+                    or "llm_provider_attempt" in index_name
                 )
             )
             structural = any(
@@ -456,7 +472,7 @@ def _explain_statements(conn, statements):
                         "sort_space_kb": node.get("Sort Space Used"),
                     }
                 )
-        key_nodes = key_nodes[:16]
+        key_nodes = key_nodes[:32]
         explained.append(
             {
                 "label": _statement_label(sql),
@@ -469,7 +485,16 @@ def _explain_statements(conn, statements):
     return sorted(explained, key=lambda item: item["execution_time_ms"], reverse=True)
 
 
-def _seed_fixture(conn, *, prefix: str, rows: int, users: int, end_at, history_days: int):
+def _seed_fixture(
+    conn,
+    *,
+    prefix: str,
+    rows: int,
+    attempt_rows: int,
+    users: int,
+    end_at,
+    history_days: int,
+):
     conn.execute(
         "INSERT INTO users (user_id,created_at,doc) "
         "SELECT %s || lpad(g::text, 6, '0'), %s, "
@@ -479,11 +504,11 @@ def _seed_fixture(conn, *, prefix: str, rows: int, users: int, end_at, history_d
     )
     insert_metrics_sql = (
         "INSERT INTO v2_turn_metrics "
-        "(user_id,lane,provider,model,prompt_tokens,completion_tokens,latency_ms,"
+        "(job_id,user_id,lane,provider,model,prompt_tokens,completion_tokens,latency_ms,"
         "model_calls,retries,failed,status,cache_read_tokens,cache_write_tokens,"
         "cache_miss_tokens,usage_reported_calls,cache_reported_calls,created_at) "
         "SELECT "
-        "%s || lpad(((g-1) %% %s)::text, 6, '0'), "
+        "g,%s || lpad(((g-1) %% %s)::text, 6, '0'), "
         "CASE WHEN g %% 100 < 62 THEN 'chat' WHEN g %% 100 < 77 THEN 'heartbeat' "
         "WHEN g %% 100 < 88 THEN 'manual_wake' WHEN g %% 100 < 95 THEN 'maintenance' "
         "ELSE 'scheduled' END, "
@@ -519,7 +544,56 @@ def _seed_fixture(conn, *, prefix: str, rows: int, users: int, end_at, history_d
                 last_row,
             ),
         )
+    insert_attempts_sql = (
+        "WITH fixture AS (SELECT g,%s || lpad(((g-1) %% %s)::text,6,'0') "
+        "AS user_id,%s::timestamptz-make_interval(secs => "
+        "((g::bigint*104729) %% %s)::double precision) AS started_at "
+        "FROM generate_series(%s::bigint,%s::bigint) AS g), shaped AS ("
+        "SELECT *,md5(%s||g::text) AS digest FROM fixture) "
+        "INSERT INTO llm_provider_attempts (attempt_id,user_id,lane,job_id,call_id,"
+        "outer_attempt_ordinal,inner_attempt_ordinal,retry_kind,requested_provider,"
+        "resolved_provider,requested_model,resolved_model,transport,started_at,"
+        "finished_at,state,outcome,error_class,input_tokens,output_tokens,"
+        "cache_read_tokens,cache_write_tokens,cache_miss_tokens,usage_known,"
+        "possibly_billed,source,completeness,revision) SELECT "
+        "substr(digest,1,8)||'-'||substr(digest,9,4)||'-'||substr(digest,13,4)||'-'||"
+        "substr(digest,17,4)||'-'||substr(digest,21,12),user_id,"
+        "CASE WHEN g %% 100 < 62 THEN 'chat' WHEN g %% 100 < 77 THEN 'heartbeat' "
+        "WHEN g %% 100 < 88 THEN 'manual_wake' WHEN g %% 100 < 95 THEN 'maintenance' "
+        "ELSE 'scheduled' END,g,%s||'call-'||g,1,1,'initial',"
+        "CASE WHEN g %% 100 < 68 THEN 'openrouter' WHEN g %% 100 < 88 THEN 'anthropic' "
+        "ELSE 'google' END,"
+        "CASE WHEN g %% 100 < 68 THEN 'openrouter' WHEN g %% 100 < 88 THEN 'anthropic' "
+        "ELSE 'google' END,"
+        "CASE WHEN g %% 100 < 68 THEN 'openai/gpt-4o-mini' "
+        "WHEN g %% 100 < 88 THEN 'claude-3-5-haiku' ELSE 'gemini-2.5-flash' END,"
+        "CASE WHEN g %% 100 < 68 THEN 'openai/gpt-4o-mini' "
+        "WHEN g %% 100 < 88 THEN 'claude-3-5-haiku' ELSE 'gemini-2.5-flash' END,"
+        "'openai_responses',started_at,started_at+interval '100 milliseconds',"
+        "'completed','succeeded','none',400+(g %% 1600),40+(g %% 360),"
+        "CASE WHEN g %% 4=0 THEN 100+(g %% 900) ELSE 0 END,"
+        "CASE WHEN g %% 10=0 THEN 20+(g %% 80) ELSE 0 END,"
+        "CASE WHEN g %% 4=0 THEN 50+(g %% 450) ELSE 0 END,true,false,"
+        "'runtime_recorder','complete',2 FROM shaped"
+    )
+    for first_row in range(1, attempt_rows + 1, 100_000):
+        last_row = min(first_row + 100_000 - 1, attempt_rows)
+        conn.execute(
+            insert_attempts_sql,
+            (
+                prefix,
+                users,
+                end_at,
+                history_days * 86400,
+                first_row,
+                last_row,
+                prefix,
+                prefix,
+            ),
+        )
     conn.execute("ANALYZE v2_turn_metrics")
+    if attempt_rows:
+        conn.execute("ANALYZE llm_provider_attempts")
 
 
 def _delete_fixture(conn, prefix: str) -> None:
@@ -528,12 +602,15 @@ def _delete_fixture(conn, prefix: str) -> None:
         (prefix, prefix),
     )
     conn.execute("ANALYZE v2_turn_metrics")
+    conn.execute("ANALYZE llm_provider_attempts")
 
 
 def _fixture_counts(conn, prefix: str) -> dict[str, int]:
     counts = {}
     for table in (
         "v2_turn_metrics",
+        "llm_provider_attempts",
+        "llm_provider_attempt_corrections",
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",
     ):
@@ -564,6 +641,8 @@ def _assert_empty_dedicated_database(conn) -> None:
         )
         for table in (
             "v2_turn_metrics",
+            "llm_provider_attempts",
+            "llm_provider_attempt_corrections",
             "v2_usage_daily_users",
             "v2_usage_daily_dimensions",
             "v2_usage_rollup_watermarks",
@@ -591,9 +670,10 @@ def _relation_stats(conn, table: str) -> dict[str, int]:
     }
 
 
-def _assert_schema(conn) -> None:
+def _assert_schema(conn) -> dict[str, Any]:
     """Validate the pre-migrated test DB without mutating its Alembic state."""
     required_columns = {
+        "job_id",
         "user_id",
         "lane",
         "provider",
@@ -641,6 +721,50 @@ def _assert_schema(conn) -> None:
         raise RuntimeError(
             f"test database lacks production rollup schema: {missing_tables}"
         )
+    attempt_columns = {
+        row[0]
+        for row in conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema=current_schema() "
+            "AND table_name='llm_provider_attempts'"
+        ).fetchall()
+    }
+    required_attempt_columns = {
+        "attempt_id",
+        "user_id",
+        "job_id",
+        "call_id",
+        "resolved_provider",
+        "resolved_model",
+        "started_at",
+        "source",
+    }
+    missing_attempt_columns = sorted(required_attempt_columns - attempt_columns)
+    if missing_attempt_columns:
+        raise RuntimeError(
+            "test database lacks provider-attempt schema: "
+            f"{missing_attempt_columns}"
+        )
+    runtime_job_index = conn.execute(
+        "SELECT idx.indisvalid,pg_get_indexdef(idx.indexrelid),"
+        "pg_get_expr(idx.indpred,idx.indrelid,true) FROM pg_index idx WHERE "
+        "idx.indexrelid=to_regclass('ix_llm_provider_attempts_runtime_job')"
+    ).fetchone()
+    if (
+        runtime_job_index is None
+        or runtime_job_index[0] is not True
+        or "USING btree (job_id)" not in runtime_job_index[1]
+        or runtime_job_index[2]
+        != "source = 'runtime_recorder'::text AND job_id IS NOT NULL"
+    ):
+        raise RuntimeError(
+            "test database lacks the exact runtime provider-attempt job index"
+        )
+    return {
+        "runtime_job_index_present": True,
+        "runtime_job_index_valid": True,
+        "runtime_job_index_definition": runtime_job_index[1],
+    }
 
 
 def _bootstrap_rollups(usage_rollup, *, max_ticks: int = 20) -> list[dict[str, Any]]:
@@ -686,6 +810,7 @@ def _measure_report(jobs_store, query, runs: int) -> dict[str, Any]:
 def _run(args) -> int:
     if args.rows < 1 or args.users < 1 or args.runs < 5 or args.history_days < 90:
         raise SystemExit("rows/users must be positive, runs >= 5, history-days >= 90")
+    attempt_rows = _resolve_attempt_rows(args.rows, args.attempt_rows)
     database_url = args.database_url.strip()
     if not database_url:
         raise SystemExit("pass an explicit --database-url for the dedicated scale DB")
@@ -708,7 +833,7 @@ def _run(args) -> int:
     pool = _install_validated_scale_pool(db, database_identity)
     with pool.connection() as conn:
         _validate_connected_scale_database(conn, database_identity)
-        _assert_schema(conn)
+        schema_evidence = _assert_schema(conn)
         _assert_empty_dedicated_database(conn)
     prefix = f"scale_usage_{uuid4().hex[:10]}_"
     start_at, end_at = _production_window()
@@ -739,6 +864,7 @@ def _run(args) -> int:
         "fixture": {
             "prefix": prefix,
             "rows": args.rows,
+            "attempt_rows": attempt_rows,
             "users": args.users,
             "history_days": args.history_days,
             "window_days": 90,
@@ -746,8 +872,13 @@ def _run(args) -> int:
                 "lanes": "chat 62%, heartbeat 15%, manual_wake 11%, maintenance 7%, scheduled 5%",
                 "providers": "openrouter 68%, anthropic 20%, google 12%",
                 "unknown_usage": "5%",
+                "provider_attempts": (
+                    "explicit deterministic one-to-one prefix of metric rows; "
+                    "zero corrections"
+                ),
             },
         },
+        "schema": schema_evidence,
         "budget_ms": P95_BUDGET_MS,
         "query": {
             "timezone": "Asia/Shanghai",
@@ -766,6 +897,7 @@ def _run(args) -> int:
                 conn,
                 prefix=prefix,
                 rows=args.rows,
+                attempt_rows=attempt_rows,
                 users=args.users,
                 end_at=end_at,
                 history_days=args.history_days,
@@ -781,6 +913,22 @@ def _run(args) -> int:
                     conn.execute(
                         "SELECT count(*) FROM v2_turn_metrics WHERE user_id LIKE %s "
                         "AND created_at >= %s AND created_at < %s",
+                        (prefix + "%", start_at, end_at),
+                    ).fetchone()[0]
+                ),
+                "attempt_rows": int(
+                    conn.execute(
+                        "SELECT count(*) FROM llm_provider_attempts "
+                        "WHERE user_id LIKE %s",
+                        (prefix + "%",),
+                    ).fetchone()[0]
+                ),
+                "attempt_rows_in_90d_job_cohort": int(
+                    conn.execute(
+                        "SELECT count(*) FROM llm_provider_attempts a "
+                        "JOIN v2_turn_metrics m ON m.job_id=a.job_id "
+                        "WHERE a.user_id LIKE %s AND a.source='runtime_recorder' "
+                        "AND m.created_at>=%s AND m.created_at<%s",
                         (prefix + "%", start_at, end_at),
                     ).fetchone()[0]
                 ),
@@ -805,7 +953,11 @@ def _run(args) -> int:
             evidence["rollup"] = {
                 "tables": {
                     table: _relation_stats(conn, table)
-                    for table in ("v2_usage_daily_users", "v2_usage_daily_dimensions")
+                    for table in (
+                        "v2_usage_daily_users",
+                        "v2_usage_daily_dimensions",
+                        "llm_provider_attempts",
+                    )
                 },
                 "watermark": {
                     "bootstrap_complete": bool(watermark[0]),
@@ -829,7 +981,8 @@ def _run(args) -> int:
                     f"report did not use production hybrid rollup path: {coverage}"
                 )
             raw_sql_omitted = not any(
-                "v2_turn_metrics" in sql for sql, _params in statements
+                "v2_turn_metrics" in sql and "llm_provider_attempts" not in sql
+                for sql, _params in statements
             )
             actual_partition = {
                 "rollup_days": coverage["rollup_days"],
@@ -848,6 +1001,15 @@ def _run(args) -> int:
                 )
             assert_content_free_metric_sql(statements)
             assert_metric_time_ranges(statements)
+            attempt_statements = [
+                sql for sql, _params in statements
+                if "llm_provider_attempts" in sql
+            ]
+            if len(attempt_statements) != 1:
+                raise AssertionError(
+                    "usage report must execute exactly one attempt-ledger statement; "
+                    f"captured={len(attempt_statements)}"
+                )
             timing = _measure_report(jobs_store, query, args.runs)
             with pool.connection() as conn:
                 conn.execute("SET statement_timeout='120s'")
@@ -860,10 +1022,23 @@ def _run(args) -> int:
             )
             if exact_latency is None:
                 raise AssertionError("exact latency SQL was not captured and explained")
+            attempt_explain = next(
+                (item for item in explains if item["label"] == "attempt_ledger"),
+                None,
+            )
+            if attempt_explain is None:
+                raise AssertionError(
+                    "provider-attempt ledger SQL was not captured and explained"
+                )
+            attempt_scan_nodes = [
+                node for node in attempt_explain["key_nodes"]
+                if node.get("relation") == "llm_provider_attempts"
+            ]
             evidence["cohorts"][name] = {
                 "timing": timing,
                 "slowest_explain": explains[0],
                 "exact_latency_explain": exact_latency,
+                "attempt_ledger_explain": attempt_explain,
                 "all_explains": explains,
                 "coverage": coverage,
                 "content_free_metric_sql": True,
@@ -871,6 +1046,19 @@ def _run(args) -> int:
                 "rollup_only_omits_raw_table": raw_sql_omitted,
                 "raw_table_sql_present": raw_sql_present,
                 "raw_table_branch_matches_partition": True,
+                "attempt_ledger_statement_count": len(attempt_statements),
+                "attempt_runtime_job_index_used": any(
+                    node.get("index_name")
+                    == "ix_llm_provider_attempts_runtime_job"
+                    for node in attempt_scan_nodes
+                ),
+                "attempt_relation_scan_nodes": [
+                    {
+                        "node_type": node.get("node_type"),
+                        "index_name": node.get("index_name"),
+                    }
+                    for node in attempt_scan_nodes
+                ],
             }
     finally:
         if not args.keep_data:
@@ -917,6 +1105,7 @@ def main() -> int:
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--database-url", default="")
     parser.add_argument("--rows", type=int, default=DEFAULT_ROWS)
+    parser.add_argument("--attempt-rows", type=int, default=None)
     parser.add_argument("--users", type=int, default=DEFAULT_USERS)
     parser.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     parser.add_argument("--history-days", type=int, default=DEFAULT_HISTORY_DAYS)

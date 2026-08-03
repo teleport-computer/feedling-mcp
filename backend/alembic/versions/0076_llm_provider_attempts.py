@@ -267,6 +267,10 @@ _CONCURRENT_INDEXES = {
     "ix_llm_provider_attempts_call":
         "CREATE INDEX CONCURRENTLY ix_llm_provider_attempts_call "
         "ON llm_provider_attempts (call_id, outer_attempt_ordinal, inner_attempt_ordinal)",
+    "ix_llm_provider_attempts_runtime_job":
+        "CREATE INDEX CONCURRENTLY ix_llm_provider_attempts_runtime_job "
+        "ON llm_provider_attempts (job_id) "
+        "WHERE source='runtime_recorder' AND job_id IS NOT NULL",
 }
 
 _INDEX_TARGETS = {
@@ -282,6 +286,11 @@ _INDEX_TARGETS = {
     ),
     "ix_llm_provider_attempts_call": (
         ("call_id", "outer_attempt_ordinal", "inner_attempt_ordinal"), "", "0 0 0",
+    ),
+    "ix_llm_provider_attempts_runtime_job": (
+        ("job_id",),
+        "source = 'runtime_recorder'::text AND job_id IS NOT NULL",
+        "0",
     ),
 }
 

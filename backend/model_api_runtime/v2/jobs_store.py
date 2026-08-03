@@ -40,6 +40,7 @@ _USAGE_REPORT_GATE = threading.BoundedSemaphore(1)
 _USAGE_REPORT_ADVISORY_KEY = 0x4656325553410002
 _USAGE_REPORT_POOL_TIMEOUT_SECONDS = 0.5
 _USAGE_REPORT_STATEMENT_TIMEOUT_MS = 15_000
+_RUNTIME_ATTEMPT_USAGE_STATEMENT_TIMEOUT_MS = 3_000
 
 
 class _UsageReportAdmissionBusy(RuntimeError):
@@ -4491,6 +4492,10 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
                 try:
                     with conn.transaction():
                         cur.execute(
+                            "SELECT set_config('statement_timeout',%s,true)",
+                            (str(_RUNTIME_ATTEMPT_USAGE_STATEMENT_TIMEOUT_MS),),
+                        )
+                        cur.execute(
                             "WITH turn_cohort AS ("
                             " SELECT job_id,coalesce(nullif(lane,''),'unknown') AS lane"
                             " FROM v2_turn_metrics"
@@ -5990,31 +5995,6 @@ def _usage_turn_cohort_filter(query, *, alias: str = "m"):
     return " AND ".join(clauses), tuple(params)
 
 
-def _usage_attempt_filter_options(cur, query):
-    """Resolved identities observed on canonical attempts in the job cohort."""
-
-    cohort_where, params = _usage_turn_cohort_filter(query)
-    _usage_snapshot_observer(
-        "read", role="exporter", section="attempt_filter_options"
-    )
-    cur.execute(
-        f"""
-WITH turn_cohort AS MATERIALIZED (
- SELECT m.job_id FROM v2_turn_metrics m WHERE {cohort_where}
-), identities AS (
- SELECT a.resolved_provider AS provider,a.resolved_model AS model
- FROM turn_cohort t JOIN llm_provider_attempts a ON a.job_id=t.job_id
- WHERE a.source='runtime_recorder'
-)
-SELECT array_agg(DISTINCT provider ORDER BY provider) AS providers,
-       array_agg(DISTINCT model ORDER BY model) AS models
-FROM identities
-""",
-        params,
-    )
-    return cur.fetchone()
-
-
 def _usage_merge_attempt_filter_options(filters, attempt_filters):
     if attempt_filters is None:
         return filters
@@ -6175,11 +6155,11 @@ WITH turn_cohort AS MATERIALIZED (
              AND (c.input_cost_per_million=0 OR c.input_tokens IS NOT NULL)
              AND (c.output_cost_per_million=0 OR c.output_tokens IS NOT NULL)
              AND (c.reasoning_cost_per_million=0 OR c.reasoning_tokens IS NOT NULL)
-             AND (c.cache_read_cost_per_million=0
+             AND (c.cache_read_cost_per_million=c.input_cost_per_million
                   OR c.cache_read_tokens IS NOT NULL)
-             AND (c.cache_write_cost_per_million=0
+             AND (c.cache_write_cost_per_million=c.input_cost_per_million
                   OR c.cache_write_tokens IS NOT NULL)
-             AND (c.cache_miss_cost_per_million=0
+             AND (c.cache_miss_cost_per_million=c.input_cost_per_million
                   OR c.cache_miss_tokens IS NOT NULL)
        THEN (
          greatest(
@@ -6193,9 +6173,7 @@ WITH turn_cohort AS MATERIALIZED (
         +coalesce(c.cache_write_tokens,0)*c.cache_write_cost_per_million
         +CASE WHEN c.cache_miss_tokens IS NULL THEN 0 ELSE greatest(
            c.cache_miss_tokens-coalesce(c.cache_write_tokens,0),0
-         ) END*CASE WHEN c.cache_miss_cost_per_million=0
-                    THEN c.input_cost_per_million
-                    ELSE c.cache_miss_cost_per_million END
+         ) END*c.cache_miss_cost_per_million
         +coalesce(c.output_tokens,0)*c.output_cost_per_million
         +coalesce(c.reasoning_tokens,0)*c.reasoning_cost_per_million
        )/1000000::numeric END AS estimated_cost
@@ -6240,6 +6218,10 @@ UNION ALL
 SELECT 'resolved_model',NULL,NULL,resolved_provider,resolved_model,NULL,
  {metric_columns},{null_cost_columns},NULL,NULL,NULL
  FROM facts GROUP BY resolved_provider,resolved_model
+UNION ALL
+SELECT 'filter_option',NULL,NULL,resolved_provider,resolved_model,NULL,
+ {null_metric_columns},{null_cost_columns},NULL,NULL,NULL
+ FROM attempt_base GROUP BY resolved_provider,resolved_model
 UNION ALL
 SELECT 'cost',NULL,NULL,NULL,NULL,
  CASE WHEN authoritative_cost IS NOT NULL THEN authoritative_currency
@@ -6332,22 +6314,40 @@ SELECT 'gaps',NULL,NULL,NULL,NULL,NULL,{null_metric_columns},
         "whole_turn_model_calls"
     )
     return {
-        "overview": overview,
-        "users": breakdown("user", "user_id"),
-        "lanes": breakdown("lane", "lane"),
-        "requested_models": breakdown("requested_model", "provider", "model"),
-        "resolved_models": breakdown("resolved_model", "provider", "model"),
-        "costs": costs,
-        "coverage": {
-            "whole_turn_model_calls": whole_turn_model_calls,
-            "recorded_logical_calls": logical_calls,
-            "logical_call_coverage": _usage_rate(
-                logical_calls, whole_turn_model_calls
-            ) if coverage_attributable else None,
-            "logical_call_coverage_reason": coverage_reason,
-            "missing_outer_ordinals": outer_gaps,
-            "missing_inner_ordinals": inner_gaps,
-            "attempt_sequence_gaps": outer_gaps + inner_gaps,
+        "attempts": {
+            "overview": overview,
+            "users": breakdown("user", "user_id"),
+            "lanes": breakdown("lane", "lane"),
+            "requested_models": breakdown(
+                "requested_model", "provider", "model"
+            ),
+            "resolved_models": breakdown(
+                "resolved_model", "provider", "model"
+            ),
+            "costs": costs,
+            "coverage": {
+                "whole_turn_model_calls": whole_turn_model_calls,
+                "recorded_logical_calls": logical_calls,
+                "logical_call_coverage": _usage_rate(
+                    logical_calls, whole_turn_model_calls
+                ) if coverage_attributable else None,
+                "logical_call_coverage_reason": coverage_reason,
+                "missing_outer_ordinals": outer_gaps,
+                "missing_inner_ordinals": inner_gaps,
+                "attempt_sequence_gaps": outer_gaps + inner_gaps,
+            },
+        },
+        "filter_options": {
+            "providers": sorted({
+                str(row["provider"])
+                for row in by_scope.get("filter_option") or []
+                if row.get("provider") is not None
+            }),
+            "models": sorted({
+                str(row["model"])
+                for row in by_scope.get("filter_option") or []
+                if row.get("model") is not None
+            }),
         },
     }
 
@@ -6739,12 +6739,7 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
                     filter_where_params,
                     fetch="one",
                 )
-                attempt_filter_options = _usage_optional_pg_section(
-                    cur,
-                    "attempt_filter_options",
-                    lambda: _usage_attempt_filter_options(cur, query),
-                )
-                attempt_snapshot = _usage_optional_pg_section(
+                attempt_bundle = _usage_optional_pg_section(
                     cur,
                     "attempt_ledger",
                     lambda: _usage_attempt_snapshot(cur, query),
@@ -7018,8 +7013,13 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
         if filter_options is not None
         else None
     )
+    attempt_snapshot = (
+        attempt_bundle.get("attempts") if attempt_bundle is not None else None
+    )
     rendered_filters = _usage_merge_attempt_filter_options(
-        rendered_filters, attempt_filter_options
+        rendered_filters,
+        attempt_bundle.get("filter_options")
+        if attempt_bundle is not None else None,
     )
 
     return {
@@ -7665,18 +7665,19 @@ def _usage_report_snapshot_hybrid_parallel(
                 state,
                 partition,
             )
-            attempt_filter_options = _usage_optional_pg_section(
-                cur,
-                "attempt_filter_options",
-                lambda: _usage_attempt_filter_options(cur, query),
-            )
-            payload["filters"] = _usage_merge_attempt_filter_options(
-                payload.get("filters"), attempt_filter_options
-            )
-            payload["attempts"] = _usage_optional_pg_section(
+            attempt_bundle = _usage_optional_pg_section(
                 cur,
                 "attempt_ledger",
                 lambda: _usage_attempt_snapshot(cur, query),
+            )
+            payload["filters"] = _usage_merge_attempt_filter_options(
+                payload.get("filters"),
+                attempt_bundle.get("filter_options")
+                if attempt_bundle is not None else None,
+            )
+            payload["attempts"] = (
+                attempt_bundle.get("attempts")
+                if attempt_bundle is not None else None
             )
             return payload
 

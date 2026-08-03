@@ -508,6 +508,87 @@ def test_token_usage_by_lane_joins_attempts_to_recent_turn_job_cohort():
     assert "screen_watch" not in report["attempt_lanes"]
 
 
+def test_token_usage_by_lane_bounds_attempt_query_and_fails_open(monkeypatch):
+    _add_metric(
+        "u_tok_attempt_timeout", "chat", prompt=100, completion=10,
+        job_id=82004, model_calls=1,
+    )
+    real_pool = db.get_pool()
+    statements = []
+
+    class CursorProxy:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def __getattr__(self, name):
+            return getattr(self._cursor, name)
+
+        def execute(self, query, params=None):
+            statements.append((str(query), params))
+            if "attempt_base AS (" in str(query) and "llm_provider_attempts" in str(
+                query
+            ):
+                raise TimeoutError("injected runtime attempt timeout")
+            if params is None:
+                return self._cursor.execute(query)
+            return self._cursor.execute(query, params)
+
+    class CursorContext:
+        def __init__(self, context):
+            self._context = context
+
+        def __enter__(self):
+            return CursorProxy(self._context.__enter__())
+
+        def __exit__(self, *args):
+            return self._context.__exit__(*args)
+
+    class ConnectionProxy:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+        def cursor(self, *args, **kwargs):
+            return CursorContext(self._connection.cursor(*args, **kwargs))
+
+    class ConnectionContext:
+        def __init__(self, context):
+            self._context = context
+
+        def __enter__(self):
+            return ConnectionProxy(self._context.__enter__())
+
+        def __exit__(self, *args):
+            return self._context.__exit__(*args)
+
+    class PoolProxy:
+        def connection(self):
+            return ConnectionContext(real_pool.connection())
+
+    monkeypatch.setattr(jobs_store, "_pool", lambda: PoolProxy())
+
+    report = jobs_store.recent_token_usage_by_lane(within_hours=24)
+
+    attempt_position = next(
+        index
+        for index, (statement, _params) in enumerate(statements)
+        if "attempt_base AS (" in statement and "llm_provider_attempts" in statement
+    )
+    timeout_positions = [
+        (index, params)
+        for index, (statement, params) in enumerate(statements)
+        if "set_config('statement_timeout'" in statement
+    ]
+    assert timeout_positions == [(
+        attempt_position - 1,
+        (str(jobs_store._RUNTIME_ATTEMPT_USAGE_STATEMENT_TIMEOUT_MS),),
+    )]
+    assert report["lanes"]["chat"]["prompt_tokens"] == 100
+    assert report["attempt_lanes"] is None
+
+
 def test_token_usage_by_lane_reports_none_not_zero_without_usage():
     # provider 没回 usage 时不得记成 0 token 混进总量假装正常
     _add_metric("u_tok_nousage", "chat", prompt=None, completion=None, usage_reported=0)
@@ -1205,6 +1286,7 @@ def test_full_window_queries_have_their_supporting_indexes():
                         "ix_v2_effect_report_unfinished",
                         "ix_v2_terminal_failure_report_created_at",
                         "ix_v2_terminal_failure_report_unfinished",
+                        "ix_llm_provider_attempts_runtime_job",
                     ],
                 ),
             ).fetchall()
@@ -1218,7 +1300,59 @@ def test_full_window_queries_have_their_supporting_indexes():
         "ix_v2_effect_report_unfinished",
         "ix_v2_terminal_failure_report_created_at",
         "ix_v2_terminal_failure_report_unfinished",
+        "ix_llm_provider_attempts_runtime_job",
     }
+
+
+def test_usage_and_runtime_attempt_joins_use_runtime_job_index():
+    seed_user("u_plan_attempt_job")
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO llm_provider_attempts ("
+            "attempt_id,user_id,lane,job_id,call_id,outer_attempt_ordinal,"
+            "inner_attempt_ordinal,retry_kind,requested_provider,resolved_provider,"
+            "requested_model,resolved_model,transport,state,outcome,error_class,source) "
+            "SELECT substr(md5(n::text),1,8)||'-'||substr(md5(n::text),9,4)||'-'||"
+            "substr(md5(n::text),13,4)||'-'||substr(md5(n::text),17,4)||'-'||"
+            "substr(md5(n::text),21,12),'u_plan_attempt_job','chat',900000+n,"
+            "'plan-attempt-call-'||n,1,1,'initial','asked','actual','asked-model',"
+            "'actual-model','openai_responses','completed','succeeded','none',"
+            "'runtime_recorder' FROM generate_series(1,12000) AS n"
+        )
+        conn.execute(
+            "INSERT INTO v2_turn_metrics "
+            "(job_id,user_id,lane,model_calls,status,created_at) "
+            "VALUES (900001,'u_plan_attempt_job','chat',1,'plan-attempt',now())"
+        )
+        conn.execute("ANALYZE llm_provider_attempts")
+        conn.execute("ANALYZE v2_turn_metrics")
+
+        def explain(sql: str) -> str:
+            return "\n".join(
+                row[0]
+                for row in conn.execute("EXPLAIN (COSTS OFF) " + sql).fetchall()
+            )
+
+        plans = {
+            "runtime": explain(
+                "SELECT a.attempt_id FROM (SELECT job_id FROM v2_turn_metrics "
+                "WHERE created_at>=now()-interval '24 hours') t "
+                "JOIN llm_provider_attempts a ON a.job_id=t.job_id "
+                "WHERE a.source='runtime_recorder'"
+            ),
+            "usage": explain(
+                "SELECT a.attempt_id FROM (SELECT job_id FROM v2_turn_metrics "
+                "WHERE created_at>=now()-interval '1 hour' "
+                "AND created_at<now()+interval '1 hour' "
+                "AND user_id='u_plan_attempt_job' AND lane='chat') t "
+                "JOIN llm_provider_attempts a ON a.job_id=t.job_id "
+                "WHERE a.source='runtime_recorder'"
+            ),
+        }
+
+    for plan in plans.values():
+        assert "ix_llm_provider_attempts_runtime_job" in plan, plan
+        assert "Seq Scan on llm_provider_attempts" not in plan, plan
 
 
 def test_runtime_user_delivery_queries_use_window_and_backlog_indexes():

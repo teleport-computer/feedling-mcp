@@ -77,6 +77,61 @@ def test_admin_usage_scale_uses_approved_three_second_p95_budget():
     assert not 3_000.0 < harness.P95_BUDGET_MS
 
 
+def test_admin_usage_scale_attempt_fixture_is_explicit_and_bounded():
+    harness = _load_usage_scale_harness()
+
+    assert harness._resolve_attempt_rows(3_000_000, None) == 0
+    assert harness._resolve_attempt_rows(3_000_000, 0) == 0
+    assert harness._resolve_attempt_rows(3_000_000, 1_500_000) == 1_500_000
+    for invalid in (-1, 3_000_001):
+        with pytest.raises(SystemExit, match="attempt-rows"):
+            harness._resolve_attempt_rows(3_000_000, invalid)
+
+
+def test_admin_usage_scale_seeds_and_cleans_content_free_attempt_fixture():
+    harness = _load_usage_scale_harness()
+    prefix = "scale_usage_unit_attempt_"
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM users WHERE left(user_id,length(%s))=%s",
+            (prefix, prefix),
+        )
+        try:
+            harness._seed_fixture(
+                conn,
+                prefix=prefix,
+                rows=4,
+                attempt_rows=3,
+                users=2,
+                end_at=harness.SCALE_NOW_UTC,
+                history_days=365,
+            )
+            counts = harness._fixture_counts(conn, prefix)
+            shapes = conn.execute(
+                "SELECT min(job_id),max(job_id),min(outer_attempt_ordinal),"
+                "min(inner_attempt_ordinal),min(revision),count(*) FILTER (WHERE "
+                "source='runtime_recorder' AND state='completed' "
+                "AND completeness='complete') FROM llm_provider_attempts "
+                "WHERE user_id LIKE %s",
+                (prefix + "%",),
+            ).fetchone()
+
+            assert counts["users"] == 2
+            assert counts["v2_turn_metrics"] == 4
+            assert counts["llm_provider_attempts"] == 3
+            assert counts["llm_provider_attempt_corrections"] == 0
+            assert shapes == (1, 3, 1, 1, 2, 3)
+        finally:
+            harness._delete_fixture(conn, prefix)
+        counts = harness._fixture_counts(conn, prefix)
+
+    assert all(
+        value == 0
+        for key, value in counts.items()
+        if key != "watermark"
+    )
+
+
 def test_admin_usage_scale_uses_rolling_90d_partition_and_dedicated_local_db():
     harness = _load_usage_scale_harness()
 
@@ -647,7 +702,7 @@ def test_usage_snapshot_uses_attempt_ledger_and_keeps_turn_outcome_truth(
         {
             "currency": "USD",
             "authoritative_cost": Decimal("0.60000000"),
-            "estimated_cost": Decimal("0.00015700"),
+            "estimated_cost": Decimal("0.00015300"),
             "authoritative_attempts": 1,
             "estimated_attempts": 1,
             "unknown_attempts": 0,
@@ -912,6 +967,34 @@ def test_usage_filter_options_include_resolved_attempt_identity_from_turn_cohort
             conn.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
 
 
+@pytest.mark.parametrize("report_path", ("raw", "hybrid"))
+def test_usage_report_executes_one_attempt_ledger_statement(
+    monkeypatch, usage_rows, report_path,
+):
+    attempt_reads = []
+
+    def observer(event, **fields):
+        if event == "read" and str(fields.get("section", "")).startswith(
+            "attempt_"
+        ):
+            attempt_reads.append(fields["section"])
+
+    monkeypatch.setattr(jobs_store, "_usage_snapshot_observer", observer)
+
+    if report_path == "hybrid":
+        _enable_usage_rollup()
+    try:
+        jobs_store.usage_report_snapshot(
+            _usage_query() if report_path == "raw" else _shanghai_usage_query()
+        )
+    finally:
+        if report_path == "hybrid":
+            with db.get_pool().connection() as conn:
+                conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert attempt_reads == ["attempt_ledger"]
+
+
 def test_usage_snapshot_cost_categories_are_mutually_exclusive():
     user_id = "u_attempt_cost_categories"
     seed_user(user_id, created_at="2026-06-01T00:00:00+00:00")
@@ -1014,6 +1097,139 @@ def test_usage_snapshot_estimated_cost_requires_every_nonzero_rate_component():
             "authoritative_attempts": 0,
             "estimated_attempts": 0,
             "unknown_attempts": 1,
+        }]
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+
+
+@pytest.mark.parametrize(
+    "zero_rate_column",
+    (
+        "cache_read_cost_per_million",
+        "cache_write_cost_per_million",
+        "cache_miss_cost_per_million",
+    ),
+)
+def test_usage_snapshot_requires_cache_allocation_for_zero_differential_rate(
+    zero_rate_column,
+):
+    suffix = zero_rate_column.removeprefix("cache_").removesuffix(
+        "_cost_per_million"
+    )
+    user_id = f"u_attempt_zero_{suffix}_rate"
+    provider = f"zero-{suffix}-provider"
+    model = f"zero-{suffix}-model"
+    rates = {
+        "cache_read_cost_per_million": 2,
+        "cache_write_cost_per_million": 2,
+        "cache_miss_cost_per_million": 2,
+    }
+    rates[zero_rate_column] = 0
+    cache_allocations = {
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "cache_miss_tokens": 0,
+    }
+    cache_allocations[zero_rate_column.replace("_cost_per_million", "_tokens")] = None
+    seed_user(user_id, created_at="2026-06-01T00:00:00+00:00")
+    try:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO v2_turn_metrics "
+                "(job_id,user_id,lane,model_calls,retries,failed,status,created_at) "
+                "VALUES (81020,%s,'chat',1,0,false,%s,%s)",
+                (user_id, f"zero-{suffix}-rate-turn", "2026-07-01T10:00:00+00:00"),
+            )
+            conn.execute(
+                "INSERT INTO llm_rate_cards "
+                "(provider,model,version,currency,input_cost_per_million,"
+                "cache_read_cost_per_million,cache_write_cost_per_million,"
+                "cache_miss_cost_per_million,effective_at) VALUES "
+                "(%s,%s,'v1','USD',2,%s,%s,%s,%s)",
+                (
+                    provider,
+                    model,
+                    rates["cache_read_cost_per_million"],
+                    rates["cache_write_cost_per_million"],
+                    rates["cache_miss_cost_per_million"],
+                    "2026-06-01T00:00:00+00:00",
+                ),
+            )
+            _insert_attempt(
+                conn,
+                attempt_id={
+                    "read": "61111111-1111-5111-8111-111111111111",
+                    "write": "62222222-2222-5222-8222-222222222222",
+                    "miss": "63333333-3333-5333-8333-333333333333",
+                }[suffix],
+                user_id=user_id,
+                job_id=81020,
+                call_id=f"zero-{suffix}-rate-call",
+                resolved_provider=provider,
+                resolved_model=model,
+                input_tokens=100,
+                **cache_allocations,
+            )
+
+        costs = jobs_store.usage_report_snapshot(
+            _usage_query(user_id=user_id)
+        )["attempts"]["costs"]
+
+        assert costs == [{
+            "currency": None,
+            "authoritative_cost": None,
+            "estimated_cost": None,
+            "authoritative_attempts": 0,
+            "estimated_attempts": 0,
+            "unknown_attempts": 1,
+        }]
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+
+
+def test_usage_snapshot_allows_missing_cache_allocations_at_equal_input_rate():
+    user_id = "u_attempt_equal_cache_rates"
+    seed_user(user_id, created_at="2026-06-01T00:00:00+00:00")
+    try:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO v2_turn_metrics "
+                "(job_id,user_id,lane,model_calls,retries,failed,status,created_at) "
+                "VALUES (81021,%s,'chat',1,0,false,'equal-cache-rates-turn',%s)",
+                (user_id, "2026-07-01T10:00:00+00:00"),
+            )
+            conn.execute(
+                "INSERT INTO llm_rate_cards "
+                "(provider,model,version,currency,input_cost_per_million,"
+                "cache_read_cost_per_million,cache_write_cost_per_million,"
+                "cache_miss_cost_per_million,effective_at) VALUES "
+                "('equal-cache-provider','equal-cache-model','v1','USD',2,2,2,2,%s)",
+                ("2026-06-01T00:00:00+00:00",),
+            )
+            _insert_attempt(
+                conn,
+                attempt_id="64444444-4444-5444-8444-444444444444",
+                user_id=user_id,
+                job_id=81021,
+                call_id="equal-cache-rate-call",
+                resolved_provider="equal-cache-provider",
+                resolved_model="equal-cache-model",
+                input_tokens=100,
+            )
+
+        costs = jobs_store.usage_report_snapshot(
+            _usage_query(user_id=user_id)
+        )["attempts"]["costs"]
+
+        assert costs == [{
+            "currency": "USD",
+            "authoritative_cost": None,
+            "estimated_cost": Decimal("0.00020000"),
+            "authoritative_attempts": 0,
+            "estimated_attempts": 1,
+            "unknown_attempts": 0,
         }]
     finally:
         with db.get_pool().connection() as conn:
