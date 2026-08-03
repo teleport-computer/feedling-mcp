@@ -70,6 +70,132 @@ def _load_ranked_flags_probe():
     return module
 
 
+def _load_narrow_call_probe():
+    path = (
+        Path(__file__).parent.parent
+        / "scripts/perf/admin_usage_narrow_call_temp_probe.py"
+    )
+    if not path.exists():
+        pytest.fail("narrow-call TEMP probe is not implemented")
+    spec = importlib.util.spec_from_file_location(
+        "admin_usage_narrow_call_temp_probe", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_narrow_call_probe_schema_contains_only_identity_and_flags():
+    probe = _load_narrow_call_probe()
+
+    assert probe.NARROW_IDENTITY_COLUMNS == (
+        "local_day",
+        "user_id",
+        "cohort_lane",
+        "requested_provider",
+        "requested_model",
+        "resolved_provider",
+        "resolved_model",
+        "effective_usage_known",
+    )
+    statements = probe._narrow_table_ddl(
+        relation="admin_usage_daily_call_dimensions"
+    )
+    sql = " ".join(statements).lower()
+    assert sql.count("create temp table") == 1
+    assert sql.count("create") == 4
+    assert all(name in sql for name in probe.FLAG_COLUMN_NAMES)
+    for forbidden in (
+        "call_id",
+        "attempts",
+        "input_tokens",
+        "cost_kind",
+        "currency",
+        "ttft_samples",
+        "refreshed_at",
+        "llm_usage_daily_call_memberships",
+    ):
+        assert forbidden not in sql
+
+
+def test_narrow_call_probe_storage_gate_requires_both_byte_limits():
+    probe = _load_narrow_call_probe()
+    healthy = {
+        "heap_bytes": 330_000_000,
+        "index_bytes": 320_000_000,
+        "total_bytes": 650_000_000,
+    }
+
+    assert probe._narrow_storage_passed(
+        healthy, membership_total_bytes=2_820_399_104
+    ) is True
+    assert probe._narrow_storage_passed(
+        {**healthy, "total_bytes": 700_000_001},
+        membership_total_bytes=2_820_399_104,
+    ) is False
+    assert probe._narrow_storage_passed(
+        healthy, membership_total_bytes=2_400_000_000
+    ) is False
+
+
+def test_narrow_call_probe_ddl_creates_exact_temporary_postgresql_schema():
+    probe = _load_narrow_call_probe()
+    relation = "admin_usage_daily_call_dimensions"
+
+    with db.get_pool().connection() as conn, conn.transaction():
+        try:
+            for statement in probe._narrow_table_ddl(relation=relation):
+                conn.execute(statement)
+            persistence = conn.execute(
+                "SELECT relpersistence FROM pg_class "
+                "WHERE oid=%s::regclass",
+                (relation,),
+            ).fetchone()[0]
+            columns = conn.execute(
+                "SELECT a.attname,format_type(a.atttypid,a.atttypmod) "
+                "FROM pg_attribute a WHERE a.attrelid=%s::regclass "
+                "AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum",
+                (relation,),
+            ).fetchall()
+            indexes = tuple(
+                row[0]
+                for row in conn.execute(
+                    "SELECT pg_get_indexdef(indexrelid) FROM pg_index "
+                    "WHERE indrelid=%s::regclass ORDER BY indexrelid::regclass::text",
+                    (relation,),
+                ).fetchall()
+            )
+        finally:
+            conn.execute(f"DROP TABLE IF EXISTS {relation}")
+
+    assert persistence == "t"
+    assert columns == [
+        ("local_day", "date"),
+        ("user_id", "text"),
+        ("cohort_lane", "text"),
+        ("requested_provider", "text"),
+        ("requested_model", "text"),
+        ("resolved_provider", "text"),
+        ("resolved_model", "text"),
+        ("effective_usage_known", "boolean"),
+        *((name, "bigint") for name in probe.FLAG_COLUMN_NAMES),
+    ]
+    assert len(indexes) == 3
+    assert any(" UNIQUE " in definition for definition in indexes)
+    assert any("(user_id, local_day)" in definition for definition in indexes)
+    assert any(
+        "(local_day, resolved_provider, resolved_model, user_id, cohort_lane)"
+        in definition
+        and "INCLUDE (requested_provider, requested_model, effective_usage_known)"
+        in definition
+        for definition in indexes
+    )
+    assert all(
+        flag not in " ".join(indexes) for flag in probe.FLAG_COLUMN_NAMES
+    )
+
+
 def test_ranked_probe_declares_exact_32_column_matrix():
     probe = _load_ranked_flags_probe()
     expected = tuple(
