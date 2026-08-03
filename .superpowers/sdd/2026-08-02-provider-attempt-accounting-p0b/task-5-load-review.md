@@ -2,6 +2,83 @@
 
 Reviewed commit: `deff128524dea481e85c32e9a4943db1c1bb211d`
 
+## Final re-review of `7864b97a39f680f5b5bab8380ade1792c4722356`
+
+### Final verdict
+
+- **Spec: PASS for the load/formal harness**
+- **Quality: PASS for the load/formal harness**
+- **Ready for the formal 3M + 3M run: YES**
+- **P0-B release readiness: still depends on the actual formal artifact and
+  remaining branch-wide verification**
+
+The fix closes I3.  The evidence now binds successful dirty-day recomputation,
+not merely nested connection acquisition, to the pool-contention workload.  No
+open finding remains in this review slice.
+
+### I3 — CLOSED: raw successful tick outcomes are fail-closed
+
+The probe canonicalizes every raw maintenance result to explicit JSON types and
+retains tick index, monotonic start/end, and the complete production outcome.
+The validator requires every recorded tick to have `status='ok'`, at least one
+refreshed day, matching `days_refreshed`, no error/cancel/lock-busy field, and a
+valid canonical ISO local date for every refreshed day.
+
+Across all tick outcomes it requires exactly twenty refreshed dates, all
+unique, and exact equality with the separately claimed refreshed-day list.
+`dirty_remaining_before_cleanup` is measured after all worker threads and the
+recorder have settled but before the `finally` cleanup; it must be zero.
+
+Every maintenance pool interval now carries its tick index.  For every
+successful tick, the validator requires both `attempt_rollup_outer` and
+`attempt_rollup_rebuild` acquisitions, with their complete intervals contained
+inside that tick's measured interval.  Conversely, every maintenance
+acquisition must reference one of the validated successful tick indices.  A
+failed recompute can no longer contribute an unbound interval to an otherwise
+healthy artifact.
+
+The production loop seeds exactly twenty dirty claims and runs with
+`max_days=1` until all twenty successful days are observed, breaking early on
+an error/no-op outcome and bounding attempts at twice the seeded-day count.
+Structured error, zero-day success, duplicate day, insufficient coverage,
+non-string date, invalid date, and missing/incorrect interval evidence all fail
+validation.
+
+### Exception, serialization, and cleanup behavior
+
+Maintenance outcomes containing dates/datetimes are normalized recursively;
+non-string dictionary keys or unsupported non-JSON values raise before an
+artifact can be produced.  Such producer exceptions are captured by the
+maintenance thread, make the aggregate probe fail, and still execute the
+existing `finally` cleanup.  The cleanup deletes seeded dirty claims and both
+watermarks after restoring the production observer and pool accessor.
+
+The explicit pre-cleanup zero check is separate from that cleanup, so deletion
+cannot manufacture the successful-drain claim.  The formal scale harness's
+later source/rollup/correction/watermark residual-count gate remains unchanged.
+
+### Final verification
+
+- Provider business-path, recorder, async provider, and formal/default gate
+  tests: **73 passed, 1 skipped**.
+- New maintenance negative coverage includes error status, no-op success,
+  duplicate days, fewer than twenty days, non-string/invalid local dates, and
+  canonical date serialization.
+- Changed perf scripts: `compileall` passed.
+- `git diff a641ab4d 7864b97a --check`: passed.
+- Root has separately retained the real local artifact evidence; this final
+  review did not repeat a PostgreSQL probe and did not run the prohibited 3M
+  fixture.
+- No external provider network request or remote RDS access was performed.
+
+### Final ready verdict
+
+**Ready for the formal 3M + 3M run.**  C1/C2/C3/C4 and I1/I2/I3 from the three
+review rounds are closed.  Formal success must still come from a fresh exact
+3M-turn/3M-attempt run at the reviewed commit, pass both strict sub-3,000 ms
+cohorts and all plan/index/business-path gates, and finish with zero residual
+state.
+
 ## Second re-review of `2e55b1a915d2b2094ac0430ba9be4ebbaca78a4c`
 
 ### Second re-review verdict
