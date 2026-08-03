@@ -505,15 +505,19 @@ def _attempt_plan_guards(
         node for node in nodes
         if node.get("Index Name") == "ix_llm_provider_attempts_call"
     ]
-    examined_attempt_rows = sum(
+    attempt_scan_rows = [
         int(node.get("Actual Rows") or 0)
         * int(node.get("Actual Loops") or 0)
         for node in attempt_nodes
         if node.get("Relation Name") == "llm_provider_attempts"
-    )
-    call_probe_loops = sum(
+    ]
+    call_node_loops = [
         int(node.get("Actual Loops") or 0) for node in call_nodes
-    )
+    ]
+    examined_attempt_rows = sum(attempt_scan_rows)
+    max_single_attempt_scan_rows = max(attempt_scan_rows, default=0)
+    call_probe_loops = sum(call_node_loops)
+    max_single_call_probe_loops = max(call_node_loops, default=0)
     rate_probe_loops = sum(
         int(node.get("Actual Loops") or 0) for node in rate_nodes
     )
@@ -524,6 +528,22 @@ def _attempt_plan_guards(
     call_probe_limit = max(
         10,
         int(expected_raw_edge_logical_calls) * 2,
+    )
+    single_attempt_scan_limit = max(
+        1,
+        int(expected_raw_edge_attempt_rows) * 3,
+    )
+    single_call_probe_loop_limit = max(
+        1,
+        int(expected_raw_edge_logical_calls) * 2,
+    )
+    near_full_attempt_scan_threshold = max(
+        1,
+        int(total_attempt_rows) - int(expected_raw_edge_attempt_rows),
+    )
+    near_full_attempt_scan_absent = bool(
+        expected_raw_edge_attempt_rows >= total_attempt_rows
+        or max_single_attempt_scan_rows < near_full_attempt_scan_threshold
     )
     rollup_relations = {
         str(node.get("Relation Name"))
@@ -541,9 +561,15 @@ def _attempt_plan_guards(
         "examined_attempt_rows": examined_attempt_rows,
         "expected_raw_edge_attempt_rows": int(expected_raw_edge_attempt_rows),
         "attempt_edge_scan_limit": edge_scan_limit,
+        "max_single_attempt_scan_rows": max_single_attempt_scan_rows,
+        "single_attempt_scan_limit": single_attempt_scan_limit,
+        "near_full_attempt_scan_threshold": near_full_attempt_scan_threshold,
+        "near_full_attempt_scan_absent": near_full_attempt_scan_absent,
         "call_probe_loops": call_probe_loops,
         "expected_raw_edge_logical_calls": int(expected_raw_edge_logical_calls),
         "call_probe_loop_limit": call_probe_limit,
+        "max_single_call_probe_loops": max_single_call_probe_loops,
+        "single_call_probe_loop_limit": single_call_probe_loop_limit,
         "rate_card_probe_loops": rate_probe_loops,
         "attempt_runtime_job_index_used": any(
             node.get("Index Name") == "ix_llm_provider_attempts_runtime_job"
@@ -556,6 +582,8 @@ def _attempt_plan_guards(
         "attempt_full_history_scan_absent": bool(
             total_attempt_rows > 0
             and examined_attempt_rows <= edge_scan_limit
+            and max_single_attempt_scan_rows <= single_attempt_scan_limit
+            and near_full_attempt_scan_absent
             and not any(
                 node.get("Node Type") == "Seq Scan"
                 and node.get("Relation Name") == "llm_provider_attempts"
@@ -566,7 +594,12 @@ def _attempt_plan_guards(
             not rate_nodes or rate_probe_loops <= 1
         ),
         "attempt_full_window_call_probe_loops_absent": (
-            not call_nodes or call_probe_loops <= call_probe_limit
+            not call_nodes
+            or (
+                call_probe_loops <= call_probe_limit
+                and max_single_call_probe_loops
+                <= single_call_probe_loop_limit
+            )
         ),
     }
 

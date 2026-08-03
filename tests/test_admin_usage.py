@@ -280,6 +280,81 @@ def test_admin_usage_scale_attempt_plan_guards_reject_near_full_scan_and_accept_
     assert _synthetic_formal_gate(harness, accepted) is True
 
 
+def test_admin_usage_scale_small_fixture_rejects_single_near_full_scan_and_call_probe():
+    harness = _load_usage_scale_harness()
+    common = (
+        _synthetic_scan("llm_usage_daily_attempt_dimensions", rows=1),
+        _synthetic_scan("llm_usage_daily_call_memberships", rows=1),
+        _synthetic_scan(
+            "llm_provider_attempts",
+            rows=1,
+            index="ix_llm_provider_attempts_runtime_job",
+        ),
+    )
+    dangerous_scans = (50, 49)
+
+    for rows in dangerous_scans:
+        guards = harness._attempt_plan_guards(
+            _synthetic_attempt_plan(
+                *common,
+                _synthetic_scan(
+                    "llm_provider_attempts",
+                    rows=rows,
+                    index="ix_llm_provider_attempts_runtime_job",
+                ),
+            ),
+            total_attempt_rows=50,
+            expected_raw_edge_attempt_rows=1,
+            expected_raw_edge_logical_calls=1,
+        )
+        assert guards["attempt_full_history_scan_absent"] is False
+        assert guards["max_single_attempt_scan_rows"] == rows
+        assert guards["single_attempt_scan_limit"] == 3
+        assert guards["near_full_attempt_scan_threshold"] == 49
+        assert _synthetic_formal_gate(harness, guards) is False
+
+    for loops in dangerous_scans:
+        call_node = {
+            "Node Type": "Index Scan",
+            "Index Name": "ix_llm_provider_attempts_call",
+            "Actual Rows": 1,
+            "Actual Loops": loops,
+        }
+        guards = harness._attempt_plan_guards(
+            _synthetic_attempt_plan(*common, call_node),
+            total_attempt_rows=50,
+            expected_raw_edge_attempt_rows=1,
+            expected_raw_edge_logical_calls=1,
+        )
+        assert guards["attempt_full_window_call_probe_loops_absent"] is False
+        assert guards["max_single_call_probe_loops"] == loops
+        assert guards["single_call_probe_loop_limit"] == 2
+        assert _synthetic_formal_gate(harness, guards) is False
+
+    legitimate = harness._attempt_plan_guards(
+        _synthetic_attempt_plan(
+            *common,
+            _synthetic_scan(
+                "llm_provider_attempts",
+                rows=3,
+                index="ix_llm_provider_attempts_runtime_job",
+            ),
+            {
+                "Node Type": "Index Scan",
+                "Index Name": "ix_llm_provider_attempts_call",
+                "Actual Rows": 1,
+                "Actual Loops": 3,
+            },
+        ),
+        total_attempt_rows=50,
+        expected_raw_edge_attempt_rows=1,
+        expected_raw_edge_logical_calls=2,
+    )
+    assert legitimate["attempt_full_history_scan_absent"] is True
+    assert legitimate["attempt_full_window_call_probe_loops_absent"] is True
+    assert _synthetic_formal_gate(harness, legitimate) is True
+
+
 def test_admin_usage_scale_empty_probe_lists_pass_only_when_complete_plan_has_none():
     harness = _load_usage_scale_harness()
     clean = _synthetic_attempt_plan(

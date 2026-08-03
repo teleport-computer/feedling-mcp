@@ -129,3 +129,22 @@ Review-fix verification (without the formal 3M run):
 - Ruff: passed for the harness and its tests.
 - `py_compile`: passed for the harness and its tests.
 - `git diff --check`: passed.
+
+### Small-fixture single-node guard follow-up
+
+Aggregate examined-row/loop limits retain their fixed floor for harmless
+multi-node plan noise, but no longer let one large node hide under that floor.
+Evidence now includes the maximum rows examined by any single attempt scan and
+the maximum loops of any single call probe, each checked against an unfloored
+edge-relative limit (`3 * raw-edge attempts` and `2 * raw-edge logical calls`,
+with only a one-unit minimum).  When the edge is smaller than the full fixture,
+a separate near-full threshold of `total attempts - edge attempts` is recorded
+and must not be reached.
+
+The locked small-fixture regression rejects both 50/50 and 49/50 attempt scans
+when the expected edge is one, rejects the corresponding call-probe loops, and
+accepts legitimate one-to-three-row/loop edge probes.
+
+Follow-up verification: **221 passed** with 29 existing Alembic warnings;
+Ruff, `py_compile`, and `git diff --check` all passed.  The formal 3M run was
+not executed in this harness-only fix.
