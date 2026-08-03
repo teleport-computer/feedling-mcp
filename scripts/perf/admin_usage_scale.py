@@ -37,6 +37,9 @@ ROLLUP_TABLES = (
     "v2_usage_daily_users",
     "v2_usage_daily_dimensions",
     "v2_usage_rollup_watermarks",
+    "llm_usage_daily_attempt_dimensions",
+    "llm_usage_daily_call_memberships",
+    "llm_usage_rollup_dirty_days",
 )
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SCALE_NOW_UTC = datetime(2026, 8, 2, 12, 30, tzinfo=timezone.utc)
@@ -81,6 +84,10 @@ def _formal_gate_passed(cohorts: dict[str, Any]) -> bool:
         cohort["timing"]["p95_ms"] < P95_BUDGET_MS
         and cohort["attempt_ledger_statement_count"] == 1
         and cohort["attempt_runtime_job_index_used"] is True
+        and cohort["attempt_rollup_relations_used"] is True
+        and cohort["attempt_full_history_scan_absent"] is True
+        and cohort["attempt_rate_card_probe_loops_absent"] is True
+        and cohort["attempt_full_window_call_probe_loops_absent"] is True
         for cohort in cohorts.values()
     )
 
@@ -453,6 +460,8 @@ def _explain_statements(conn, statements):
                     "llm_provider_attempts",
                     "llm_provider_attempt_corrections",
                     "llm_rate_cards",
+                    "llm_usage_daily_attempt_dimensions",
+                    "llm_usage_daily_call_memberships",
                 }
                 or isinstance(index_name, str)
                 and (
@@ -482,7 +491,7 @@ def _explain_statements(conn, statements):
                         "sort_space_kb": node.get("Sort Space Used"),
                     }
                 )
-        key_nodes = key_nodes[:32]
+        key_nodes = key_nodes[:128]
         explained.append(
             {
                 "label": _statement_label(sql),
@@ -623,6 +632,8 @@ def _fixture_counts(conn, prefix: str) -> dict[str, int]:
         "llm_provider_attempt_corrections",
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",
+        "llm_usage_daily_attempt_dimensions",
+        "llm_usage_daily_call_memberships",
     ):
         counts[table] = int(
             conn.execute(
@@ -638,7 +649,13 @@ def _fixture_counts(conn, prefix: str) -> dict[str, int]:
     counts["watermark"] = int(
         conn.execute(
             "SELECT count(*) FROM v2_usage_rollup_watermarks "
-            "WHERE rollup_name='hosted_v2_usage'"
+            "WHERE rollup_name IN ('hosted_v2_usage','hosted_v2_attempt_usage')"
+        ).fetchone()[0]
+    )
+    counts["dirty_days"] = int(
+        conn.execute(
+            "SELECT count(*) FROM llm_usage_rollup_dirty_days "
+            "WHERE rollup_name='hosted_v2_attempt_usage'"
         ).fetchone()[0]
     )
     return counts
@@ -656,6 +673,9 @@ def _assert_empty_dedicated_database(conn) -> None:
             "v2_usage_daily_users",
             "v2_usage_daily_dimensions",
             "v2_usage_rollup_watermarks",
+            "llm_usage_daily_attempt_dimensions",
+            "llm_usage_daily_call_memberships",
+            "llm_usage_rollup_dirty_days",
         )
     }
     if any(occupied.values()):
@@ -796,6 +816,30 @@ def _bootstrap_rollups(usage_rollup, *, max_ticks: int = 20) -> list[dict[str, A
     raise RuntimeError(f"production usage rollup bootstrap exceeded {max_ticks} ticks")
 
 
+def _bootstrap_attempt_rollups(provider_attempt_rollup, *, max_ticks: int = 100):
+    ticks = []
+    for _ in range(max_ticks):
+        result = provider_attempt_rollup.run_maintenance_tick(
+            max_days=31,
+            max_changed_rows=100_000,
+            max_dirty_days=2_000,
+            max_stale_rows=0,
+            statement_timeout_ms=120_000,
+            pool_timeout_seconds=5,
+            now_utc=datetime.now(timezone.utc) + timedelta(seconds=1),
+        )
+        ticks.append(result)
+        if result.get("status") != "ok":
+            raise RuntimeError(
+                f"production attempt rollup bootstrap failed: {result}"
+            )
+        if result.get("bootstrap_complete") and not result.get("dirty_pending"):
+            return ticks
+    raise RuntimeError(
+        f"production attempt rollup bootstrap exceeded {max_ticks} ticks"
+    )
+
+
 def _capture_report(jobs_store, real_pool, query):
     statements: list[tuple[str, tuple[Any, ...]]] = []
     original_pool = jobs_store._pool
@@ -836,6 +880,7 @@ def _run(args) -> int:
     from admin.usage import UsageQuery  # noqa: PLC0415
     from model_api_runtime.v2 import (  # noqa: PLC0415
         jobs_store,
+        provider_attempt_rollup,
         usage_reporting,
         usage_rollup,
     )
@@ -950,6 +995,16 @@ def _run(args) -> int:
             "elapsed_ms": round((time.perf_counter() - bootstrap_started) * 1000, 3),
             "ticks": bootstrap_ticks,
         }
+        attempt_bootstrap_started = time.perf_counter()
+        attempt_bootstrap_ticks = _bootstrap_attempt_rollups(
+            provider_attempt_rollup
+        )
+        evidence["attempt_rollup_bootstrap"] = {
+            "elapsed_ms": round(
+                (time.perf_counter() - attempt_bootstrap_started) * 1000, 3
+            ),
+            "ticks": attempt_bootstrap_ticks,
+        }
         with pool.connection() as conn:
             watermark = conn.execute(
                 "SELECT bootstrap_complete,dirty_from_day,dirty_through_day,"
@@ -960,6 +1015,16 @@ def _run(args) -> int:
             ).fetchone()
             if watermark is None or not watermark[0] or watermark[1] is not None:
                 raise RuntimeError(f"production rollup watermark is not ready: {watermark}")
+            attempt_watermark = conn.execute(
+                "SELECT bootstrap_complete,completed_through_day,retained_from "
+                "FROM llm_usage_rollup_watermarks "
+                "WHERE rollup_name='hosted_v2_attempt_usage'"
+            ).fetchone()
+            if attempt_watermark is None or not attempt_watermark[0]:
+                raise RuntimeError(
+                    "production attempt rollup watermark is not ready: "
+                    f"{attempt_watermark}"
+                )
             evidence["rollup"] = {
                 "tables": {
                     table: _relation_stats(conn, table)
@@ -967,6 +1032,8 @@ def _run(args) -> int:
                         "v2_usage_daily_users",
                         "v2_usage_daily_dimensions",
                         "llm_provider_attempts",
+                        "llm_usage_daily_attempt_dimensions",
+                        "llm_usage_daily_call_memberships",
                     )
                 },
                 "watermark": {
@@ -980,6 +1047,11 @@ def _run(args) -> int:
                     "refreshed_at": watermark[7],
                     "last_success_at": watermark[8],
                     "last_error": watermark[9],
+                },
+                "attempt_watermark": {
+                    "bootstrap_complete": bool(attempt_watermark[0]),
+                    "completed_through_day": attempt_watermark[1],
+                    "retained_from": attempt_watermark[2],
                 },
             }
 
@@ -1044,6 +1116,29 @@ def _run(args) -> int:
                 node for node in attempt_explain["key_nodes"]
                 if node.get("relation") == "llm_provider_attempts"
             ]
+            rate_scan_nodes = [
+                node for node in attempt_explain["key_nodes"]
+                if node.get("relation") == "llm_rate_cards"
+            ]
+            attempt_rollup_relations = {
+                node.get("relation") for node in attempt_explain["key_nodes"]
+                if node.get("relation") in {
+                    "llm_usage_daily_attempt_dimensions",
+                    "llm_usage_daily_call_memberships",
+                }
+            }
+            examined_attempt_rows = sum(
+                int(node.get("actual_rows") or 0)
+                * int(node.get("actual_loops") or 0)
+                for node in attempt_scan_nodes
+            )
+            call_probe_nodes = [
+                node for node in attempt_scan_nodes
+                if node.get("index_name") == "ix_llm_provider_attempts_call"
+            ]
+            full_window_calls = max(
+                1, int(evidence["source"]["attempt_rows_in_90d_job_cohort"])
+            )
             evidence["cohorts"][name] = {
                 "timing": timing,
                 "slowest_explain": explains[0],
@@ -1061,6 +1156,26 @@ def _run(args) -> int:
                     node.get("index_name")
                     == "ix_llm_provider_attempts_runtime_job"
                     for node in attempt_scan_nodes
+                ),
+                "attempt_rollup_relations_used": attempt_rollup_relations == {
+                    "llm_usage_daily_attempt_dimensions",
+                    "llm_usage_daily_call_memberships",
+                },
+                "attempt_full_history_scan_absent": (
+                    not any(
+                        node.get("node_type") == "Seq Scan"
+                        for node in attempt_scan_nodes
+                    )
+                    and examined_attempt_rows < attempt_rows
+                ),
+                "attempt_rate_card_probe_loops_absent": all(
+                    int(node.get("actual_loops") or 0) <= 1
+                    for node in rate_scan_nodes
+                ),
+                "attempt_full_window_call_probe_loops_absent": all(
+                    int(node.get("actual_loops") or 0)
+                    < max(1, full_window_calls // 10)
+                    for node in call_probe_nodes
                 ),
                 "attempt_relation_scan_nodes": [
                     {
@@ -1086,7 +1201,12 @@ def _run(args) -> int:
                     )
                 conn.execute(
                     "DELETE FROM v2_usage_rollup_watermarks "
-                    "WHERE rollup_name='hosted_v2_usage'"
+                    "WHERE rollup_name IN "
+                    "('hosted_v2_usage','hosted_v2_attempt_usage')"
+                )
+                conn.execute(
+                    "DELETE FROM llm_usage_rollup_dirty_days "
+                    "WHERE rollup_name='hosted_v2_attempt_usage'"
                 )
                 after_cleanup = _fixture_counts(conn, prefix)
                 if any(after_cleanup.values()):

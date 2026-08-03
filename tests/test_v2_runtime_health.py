@@ -525,7 +525,7 @@ def test_token_usage_by_lane_bounds_attempt_query_and_fails_open(monkeypatch):
 
         def execute(self, query, params=None):
             statements.append((str(query), params))
-            if "attempt_base AS (" in str(query) and "llm_provider_attempts" in str(
+            if "attempt_base AS MATERIALIZED" in str(query) and "llm_provider_attempts" in str(
                 query
             ):
                 raise TimeoutError("injected runtime attempt timeout")
@@ -574,19 +574,89 @@ def test_token_usage_by_lane_bounds_attempt_query_and_fails_open(monkeypatch):
     attempt_position = next(
         index
         for index, (statement, _params) in enumerate(statements)
-        if "attempt_base AS (" in statement and "llm_provider_attempts" in statement
+        if "attempt_base AS MATERIALIZED" in statement
+        and "llm_provider_attempts" in statement
     )
     timeout_positions = [
         (index, params)
         for index, (statement, params) in enumerate(statements)
         if "set_config('statement_timeout'" in statement
     ]
-    assert timeout_positions == [(
-        attempt_position - 1,
-        (str(jobs_store._RUNTIME_ATTEMPT_USAGE_STATEMENT_TIMEOUT_MS),),
-    )]
+    assert len(timeout_positions) == 1
+    timeout_position, timeout_params = timeout_positions[0]
+    assert timeout_position == attempt_position - 1
+    assert 0 < int(timeout_params[0]) <= (
+        jobs_store._RUNTIME_ATTEMPT_USAGE_STATEMENT_TIMEOUT_MS
+    )
     assert report["lanes"]["chat"]["prompt_tokens"] == 100
     assert report["attempt_lanes"] is None
+
+
+def test_token_usage_by_lane_uses_attempt_rollup_for_completed_clean_day(
+    monkeypatch,
+):
+    user_id = "u_tok_attempt_rollup"
+    job_id = 82005
+    _add_metric(
+        user_id,
+        "chat",
+        prompt=100,
+        completion=10,
+        job_id=job_id,
+        model_calls=1,
+        age_hours=36,
+    )
+    with db.get_pool().connection() as conn:
+        metric = conn.execute(
+            "SELECT created_at,(created_at AT TIME ZONE 'Asia/Shanghai')::date "
+            "FROM v2_turn_metrics WHERE user_id=%s",
+            (user_id,),
+        ).fetchone()
+        local_day = metric[1]
+        conn.execute(
+            "INSERT INTO llm_provider_attempts (attempt_id,user_id,lane,job_id,"
+            "call_id,outer_attempt_ordinal,inner_attempt_ordinal,retry_kind,"
+            "requested_provider,resolved_provider,requested_model,resolved_model,"
+            "transport,started_at,finished_at,state,outcome,error_class,input_tokens,"
+            "usage_known,possibly_billed,source,completeness,revision) VALUES "
+            "('86666666-6666-5666-8666-666666666666',%s,'chat',%s,'rollup-call',"
+            "1,1,'initial','asked','actual','asked-model','actual-model',"
+            "'openai_responses',%s,%s,'completed','succeeded','none',42,true,false,"
+            "'runtime_recorder','complete',2)",
+            (user_id, job_id, metric[0], metric[0]),
+        )
+    from model_api_runtime.v2 import provider_attempt_rollup
+
+    provider_attempt_rollup.recompute_local_day(local_day)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO llm_usage_rollup_watermarks "
+            "(rollup_name,bootstrap_complete,completed_through_day,retained_from) "
+            "VALUES (%s,true,%s,%s) ON CONFLICT (rollup_name) DO UPDATE SET "
+            "bootstrap_complete=true,completed_through_day=excluded.completed_through_day,"
+            "retained_from=excluded.retained_from",
+            (provider_attempt_rollup.ROLLUP_NAME, local_day, local_day),
+        )
+
+    observed = []
+    original = jobs_store._usage_attempt_query
+
+    def capture(query, partition):
+        observed.append(partition)
+        return original(query, partition)
+
+    monkeypatch.setattr(jobs_store, "_usage_attempt_query", capture)
+    try:
+        report = jobs_store.recent_token_usage_by_lane(within_hours=72)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM v2_usage_rollup_watermarks WHERE rollup_name=%s",
+                (provider_attempt_rollup.ROLLUP_NAME,),
+            )
+
+    assert observed and local_day in observed[0].rollup_days
+    assert report["attempt_lanes"]["chat"]["input_tokens"] == 42
 
 
 def test_token_usage_by_lane_reports_none_not_zero_without_usage():

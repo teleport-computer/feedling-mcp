@@ -116,7 +116,17 @@ def _set_transaction(cur, timeout_ms: int) -> None:
     )
 
 
-def _effective_attempt_ctes() -> str:
+def _effective_attempt_ctes(
+    *,
+    cohort_where: str = "m.created_at >= %s AND m.created_at < %s",
+) -> str:
+    """Shared set-based correction/pricing pipeline.
+
+    Maintenance uses the default full-day predicate.  Read-side hybrid reports
+    pass an already-built, parameterized raw-edge predicate; values never enter
+    this SQL fragment through string interpolation.
+    """
+
     corrected_tokens = ",\n".join(
         f"CASE WHEN a.{field} IS NULL AND c.{field}_delta IS NULL THEN NULL "
         f"ELSE coalesce(a.{field},0)+coalesce(c.{field}_delta,0) END AS {field}"
@@ -127,7 +137,7 @@ WITH turn_cohort AS MATERIALIZED (
   SELECT m.job_id,m.user_id,
          coalesce(nullif(m.lane,''),'unknown') AS cohort_lane
   FROM v2_turn_metrics m
-  WHERE m.created_at >= %s AND m.created_at < %s
+  WHERE {cohort_where}
 ), attempt_base AS MATERIALIZED (
   SELECT a.*,t.user_id AS cohort_user_id,t.cohort_lane
   FROM turn_cohort t JOIN llm_provider_attempts a ON a.job_id=t.job_id

@@ -29,7 +29,12 @@ from admin import usage as _usage  # noqa: E402
 from accounts import registry  # noqa: E402
 from core import reqctx  # noqa: E402
 import db  # noqa: E402
-from model_api_runtime.v2 import jobs_store, usage_reporting, usage_rollup  # noqa: E402
+from model_api_runtime.v2 import (  # noqa: E402
+    jobs_store,
+    provider_attempt_rollup,
+    usage_reporting,
+    usage_rollup,
+)
 
 from conftest import seed_user  # noqa: E402
 
@@ -95,12 +100,19 @@ def test_admin_usage_scale_formal_gate_requires_attempt_index_for_both_cohorts()
             "timing": {"p95_ms": 2_999.0},
             "attempt_ledger_statement_count": 1,
             "attempt_runtime_job_index_used": True,
+            "attempt_rollup_relations_used": True,
+            "attempt_full_history_scan_absent": True,
+            "attempt_rate_card_probe_loops_absent": True,
+            "attempt_full_window_call_probe_loops_absent": True,
         }
         for name in ("unfiltered", "provider_model_filtered")
     }
 
     assert harness._formal_gate_passed(cohorts) is True
     cohorts["provider_model_filtered"]["attempt_runtime_job_index_used"] = False
+    assert harness._formal_gate_passed(cohorts) is False
+    cohorts["provider_model_filtered"]["attempt_runtime_job_index_used"] = True
+    cohorts["provider_model_filtered"]["attempt_full_history_scan_absent"] = False
     assert harness._formal_gate_passed(cohorts) is False
 
 
@@ -993,7 +1005,7 @@ def test_usage_report_executes_one_attempt_ledger_statement(
         if event == "read" and str(fields.get("section", "")).startswith(
             "attempt_"
         ):
-            attempt_reads.append(fields["section"])
+            attempt_reads.append((fields["section"], fields.get("role")))
 
     monkeypatch.setattr(jobs_store, "_usage_snapshot_observer", observer)
 
@@ -1008,7 +1020,238 @@ def test_usage_report_executes_one_attempt_ledger_statement(
             with db.get_pool().connection() as conn:
                 conn.execute("DELETE FROM v2_usage_rollup_watermarks")
 
-    assert attempt_reads == ["attempt_ledger"]
+    assert attempt_reads == [(
+        "attempt_ledger",
+        "exporter" if report_path == "raw" else "importer_attempt",
+    )]
+
+
+def test_usage_attempt_partition_intersects_whole_turn_completed_clean_days():
+    whole_turn = usage_reporting.RollupPartition(
+        rollup_days=tuple(
+            datetime(2026, 7, day).date() for day in range(1, 6)
+        ),
+        raw_days=(datetime(2026, 7, 6).date(),),
+    )
+
+    partition = jobs_store._usage_attempt_partition(
+        whole_turn,
+        completed_through_day=datetime(2026, 7, 4).date(),
+        retained_from=datetime(2026, 7, 2).date(),
+        dirty_days={datetime(2026, 7, 3).date()},
+    )
+
+    assert partition == usage_reporting.RollupPartition(
+        rollup_days=(
+            datetime(2026, 7, 2).date(),
+            datetime(2026, 7, 4).date(),
+        ),
+        raw_days=(
+            datetime(2026, 7, 1).date(),
+            datetime(2026, 7, 3).date(),
+            datetime(2026, 7, 5).date(),
+            datetime(2026, 7, 6).date(),
+        ),
+    )
+
+
+def test_usage_attempt_query_has_disjoint_rollup_raw_and_hybrid_shapes():
+    query = _shanghai_usage_query()
+    first = datetime(2026, 7, 1).date()
+    second = datetime(2026, 7, 2).date()
+
+    rollup_only, _ = jobs_store._usage_attempt_query(
+        query,
+        usage_reporting.RollupPartition(
+            rollup_days=(first, second), raw_days=()
+        ),
+    )
+    assert "llm_usage_daily_attempt_dimensions" in rollup_only
+    assert "llm_usage_daily_call_memberships" in rollup_only
+    assert "v2_turn_metrics" not in rollup_only
+    assert "llm_provider_attempts" not in rollup_only
+    assert "llm_provider_attempt_corrections" not in rollup_only
+
+    raw_only, _ = jobs_store._usage_attempt_query(query, None)
+    assert "v2_turn_metrics" in raw_only
+    assert "llm_provider_attempts" in raw_only
+    assert "llm_provider_attempt_corrections" in raw_only
+    assert "llm_usage_daily_attempt_dimensions" not in raw_only
+    assert "llm_usage_daily_call_memberships" not in raw_only
+
+    hybrid, _ = jobs_store._usage_attempt_query(
+        query,
+        usage_reporting.RollupPartition(
+            rollup_days=(first,), raw_days=(second,)
+        ),
+    )
+    assert "llm_usage_daily_attempt_dimensions" in hybrid
+    assert "llm_usage_daily_call_memberships" in hybrid
+    assert "v2_turn_metrics" in hybrid
+    assert "llm_provider_attempts" in hybrid
+    assert "llm_provider_attempt_corrections" in hybrid
+    assert "LEFT JOIN LATERAL" not in hybrid
+    assert "percentile_cont" in hybrid
+    assert "attempt_scope_rows AS MATERIALIZED" in hybrid
+
+    rolling = _usage.UsageQuery(
+        start_at_utc=datetime(2026, 5, 4, 12, 30, tzinfo=timezone.utc),
+        end_at_utc=datetime(2026, 8, 2, 12, 30, tzinfo=timezone.utc),
+        timezone="Asia/Shanghai",
+        preset="90d",
+    )
+    rolling_partition = usage_reporting.rollup_partition(rolling)
+    assert rolling_partition is not None
+    rolling_sql, rolling_params = jobs_store._usage_attempt_query(
+        rolling, rolling_partition
+    )
+    raw_cohort = rolling_sql.split("turn_cohort AS MATERIALIZED", 1)[1].split(
+        "), attempt_base", 1
+    )[0]
+    assert raw_cohort.count("m.created_at >= %s AND m.created_at < %s") == 2
+    assert " OR " in raw_cohort
+    assert rolling_params[-4:] == (
+        datetime(2026, 5, 4, 12, 30, tzinfo=timezone.utc),
+        datetime(2026, 5, 4, 16, tzinfo=timezone.utc),
+        datetime(2026, 8, 1, 16, tzinfo=timezone.utc),
+        datetime(2026, 8, 2, 12, 30, tzinfo=timezone.utc),
+    )
+
+
+def test_usage_attempt_hybrid_rollup_only_matches_raw_payload(
+    provider_attempt_usage_rows,
+):
+    query = _shanghai_usage_query(user_id=provider_attempt_usage_rows)
+    raw = jobs_store._usage_report_snapshot_raw(query)["attempts"]
+    days = (datetime(2026, 7, 1).date(), datetime(2026, 7, 2).date())
+    for local_day in days:
+        provider_attempt_rollup.recompute_local_day(local_day)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO llm_usage_rollup_watermarks "
+            "(rollup_name,bootstrap_complete,completed_through_day,retained_from) "
+            "VALUES (%s,true,%s,%s) ON CONFLICT (rollup_name) DO UPDATE SET "
+            "bootstrap_complete=true,completed_through_day=excluded.completed_through_day,"
+            "retained_from=excluded.retained_from",
+            (provider_attempt_rollup.ROLLUP_NAME, days[-1], days[0]),
+        )
+    _enable_usage_rollup(days=days)
+    try:
+        hybrid = jobs_store.usage_report_snapshot(query)["attempts"]
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM v2_usage_rollup_watermarks WHERE rollup_name=ANY(%s)",
+                (["hosted_v2_usage", provider_attempt_rollup.ROLLUP_NAME],),
+            )
+
+    assert hybrid == raw
+
+
+def test_usage_attempt_hybrid_partial_dirty_correction_and_ttft_match_raw():
+    user_id = "u_attempt_hybrid_edges"
+    seed_user(user_id, created_at="2026-06-01T00:00:00+00:00")
+    first = datetime(2026, 7, 1).date()
+    second = datetime(2026, 7, 2).date()
+    second_attempt = "67777777-7777-5777-8777-777777777777"
+    try:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO v2_turn_metrics "
+                "(job_id,user_id,lane,model_calls,retries,failed,status,created_at) "
+                "VALUES (81120,%s,'chat',1,0,false,'attempt-edge-1',%s),"
+                "(81121,%s,'chat',1,0,false,'attempt-edge-2',%s)",
+                (
+                    user_id,
+                    "2026-07-01T10:00:00+00:00",
+                    user_id,
+                    "2026-07-02T10:00:00+00:00",
+                ),
+            )
+            _insert_attempt(
+                conn,
+                attempt_id="66666666-6666-5666-8666-666666666666",
+                user_id=user_id,
+                job_id=81120,
+                call_id="attempt-edge-call-1",
+                input_tokens=10,
+                ttft_ms=10,
+            )
+            _insert_attempt(
+                conn,
+                attempt_id=second_attempt,
+                user_id=user_id,
+                job_id=81121,
+                call_id="attempt-edge-call-2",
+                input_tokens=20,
+                ttft_ms=90,
+                resolved_provider="edge-provider",
+                resolved_model="edge-model",
+            )
+        for local_day in (first, second):
+            provider_attempt_rollup.recompute_local_day(local_day)
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO llm_usage_rollup_watermarks "
+                "(rollup_name,bootstrap_complete,completed_through_day,retained_from) "
+                "VALUES (%s,true,%s,%s) ON CONFLICT (rollup_name) DO UPDATE SET "
+                "bootstrap_complete=true,completed_through_day=excluded.completed_through_day,"
+                "retained_from=excluded.retained_from",
+                (provider_attempt_rollup.ROLLUP_NAME, second, first),
+            )
+        _enable_usage_rollup(days=(first, second))
+        query = _usage.UsageQuery(
+            start_at_utc=datetime(2026, 7, 1, 2, tzinfo=timezone.utc),
+            end_at_utc=datetime(2026, 7, 2, 16, tzinfo=timezone.utc),
+            timezone="Asia/Shanghai",
+            user_id=user_id,
+        )
+        raw = jobs_store._usage_report_snapshot_raw(query)["attempts"]
+        hybrid = jobs_store.usage_report_snapshot(query)["attempts"]
+        assert hybrid == raw
+        assert hybrid["overview"]["ttft_ms_p50"] == pytest.approx(50)
+        assert hybrid["overview"]["ttft_ms_p95"] == pytest.approx(86)
+
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO llm_provider_attempt_corrections "
+                "(attempt_id,user_id,revision,reason_code,input_tokens_delta) "
+                "VALUES (%s,%s,3,'late_usage',7)",
+                (second_attempt, user_id),
+            )
+            conn.execute(
+                "INSERT INTO llm_usage_rollup_dirty_days "
+                "(rollup_name,local_day,reason,generation) VALUES (%s,%s,'test',0) "
+                "ON CONFLICT (rollup_name,local_day) DO UPDATE SET reason='test'",
+                (provider_attempt_rollup.ROLLUP_NAME, second),
+            )
+        dirty_raw = jobs_store._usage_report_snapshot_raw(query)["attempts"]
+        dirty_hybrid = jobs_store.usage_report_snapshot(query)["attempts"]
+        assert dirty_hybrid == dirty_raw
+        assert dirty_hybrid["overview"]["input_tokens"] == 37
+
+        filtered_query = _usage.UsageQuery(
+            start_at_utc=query.start_at_utc,
+            end_at_utc=query.end_at_utc,
+            timezone="Asia/Shanghai",
+            user_id=user_id,
+            provider="edge-provider",
+            model="edge-model",
+        )
+        assert jobs_store.usage_report_snapshot(filtered_query)["attempts"] == (
+            jobs_store._usage_report_snapshot_raw(filtered_query)["attempts"]
+        )
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+            conn.execute(
+                "DELETE FROM llm_usage_rollup_dirty_days WHERE rollup_name=%s",
+                (provider_attempt_rollup.ROLLUP_NAME,),
+            )
+            conn.execute(
+                "DELETE FROM v2_usage_rollup_watermarks WHERE rollup_name=ANY(%s)",
+                (["hosted_v2_usage", provider_attempt_rollup.ROLLUP_NAME],),
+            )
 
 
 def test_usage_snapshot_cost_categories_are_mutually_exclusive():
@@ -1944,6 +2187,90 @@ def test_usage_parallel_exported_snapshot_matches_raw_and_imports_before_read(
         assert imported < first_read
 
 
+def test_usage_parallel_attempt_overlaps_exporter_core_without_fourth_connection(
+    monkeypatch, usage_rows,
+):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+    attempt_started = threading.Event()
+    core_started = threading.Event()
+    main_thread = threading.get_ident()
+    original_attempt = jobs_store._usage_attempt_snapshot
+
+    def observed_attempt(*args, **kwargs):
+        assert threading.get_ident() != main_thread
+        attempt_started.set()
+        assert core_started.wait(1), "exporter core did not overlap attempt importer"
+        return original_attempt(*args, **kwargs)
+
+    def observer(event, **fields):
+        if event == "read" and fields.get("section") == "core_bundle":
+            core_started.set()
+            assert attempt_started.wait(1), "attempt was scheduled after exporter core"
+
+    monkeypatch.setattr(jobs_store, "_usage_attempt_snapshot", observed_attempt)
+    monkeypatch.setattr(jobs_store, "_usage_snapshot_observer", observer)
+    try:
+        report = jobs_store.usage_report_snapshot(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert report["attempts"] is not None
+
+
+def test_usage_parallel_attempt_failure_keeps_sibling_latency_bundle(
+    monkeypatch, usage_rows,
+):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+
+    def fail_attempt(*_args, **_kwargs):
+        raise RuntimeError("injected attempt failure")
+
+    monkeypatch.setattr(jobs_store, "_usage_attempt_snapshot", fail_attempt)
+    try:
+        report = jobs_store.usage_report_snapshot(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert report["attempts"] is None
+    assert report["models"] is not None
+    assert report["lanes"] is not None
+
+
+def test_usage_parallel_latency_restores_report_deadline_after_attempt_cap(
+    monkeypatch, usage_rows,
+):
+    query = _shanghai_usage_query()
+    _enable_usage_rollup()
+    observed_timeout_ms = []
+    original = jobs_store._usage_parallel_latency_bundle
+
+    def inspect_timeout(cur, *args):
+        cur.execute("SHOW statement_timeout")
+        value = str(cur.fetchone()["statement_timeout"])
+        assert value.endswith("ms")
+        observed_timeout_ms.append(int(value.removesuffix("ms")))
+        return original(cur, *args)
+
+    monkeypatch.setattr(
+        jobs_store, "_usage_parallel_latency_bundle", inspect_timeout
+    )
+    try:
+        report = jobs_store.usage_report_snapshot(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert observed_timeout_ms
+    assert observed_timeout_ms[0] > (
+        jobs_store._RUNTIME_ATTEMPT_USAGE_STATEMENT_TIMEOUT_MS
+    )
+    assert report["models"] is not None
+
+
 def test_usage_core_bundle_error_falls_back_to_isolated_sections(
     monkeypatch, usage_rows
 ):
@@ -2508,7 +2835,8 @@ def test_usage_raw_report_sets_local_statement_timeout(monkeypatch, usage_rows):
     monkeypatch.setattr(jobs_store, "_pool", lambda: Pool())
     jobs_store._usage_report_snapshot_raw(_usage_query())
 
-    assert settings == [str(jobs_store._USAGE_REPORT_STATEMENT_TIMEOUT_MS)]
+    assert settings[0] == str(jobs_store._USAGE_REPORT_STATEMENT_TIMEOUT_MS)
+    assert 0 < int(settings[1]) <= jobs_store._RUNTIME_ATTEMPT_USAGE_STATEMENT_TIMEOUT_MS
 
 
 @pytest.mark.parametrize("failed_section", ["distribution", "daily", "users"])

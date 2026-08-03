@@ -22,6 +22,7 @@ from concurrent.futures import (
 )
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import psycopg
@@ -4491,73 +4492,31 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
                 rows = cur.fetchall()
                 try:
                     with conn.transaction():
-                        cur.execute(
-                            "SELECT set_config('statement_timeout',%s,true)",
-                            (str(_RUNTIME_ATTEMPT_USAGE_STATEMENT_TIMEOUT_MS),),
+                        cur.execute("SELECT now() AS report_end")
+                        report_end = cur.fetchone()["report_end"]
+                        attempt_query = SimpleNamespace(
+                            start_at_utc=report_end - timedelta(hours=safe_hours),
+                            end_at_utc=report_end,
+                            timezone="Asia/Shanghai",
+                            user_id=None,
+                            lane=None,
+                            provider=None,
+                            model=None,
+                            completeness="all",
                         )
-                        cur.execute(
-                            "WITH turn_cohort AS ("
-                            " SELECT job_id,coalesce(nullif(lane,''),'unknown') AS lane"
-                            " FROM v2_turn_metrics"
-                            " WHERE created_at>=now()-make_interval(hours => %s)"
-                            "), attempt_base AS ("
-                            " SELECT a.*,t.lane AS cohort_lane"
-                            " FROM turn_cohort t JOIN llm_provider_attempts a"
-                            " ON a.job_id=t.job_id"
-                            " WHERE a.source='runtime_recorder'"
-                            "), correction AS ("
-                            " SELECT c.attempt_id,"
-                            " sum(input_tokens_delta)::bigint AS input_tokens_delta,"
-                            " sum(output_tokens_delta)::bigint AS output_tokens_delta,"
-                            " sum(reasoning_tokens_delta)::bigint AS reasoning_tokens_delta,"
-                            " sum(cache_read_tokens_delta)::bigint AS cache_read_tokens_delta,"
-                            " sum(cache_write_tokens_delta)::bigint AS cache_write_tokens_delta,"
-                            " sum(cache_miss_tokens_delta)::bigint AS cache_miss_tokens_delta"
-                            " FROM llm_provider_attempt_corrections c"
-                            " JOIN attempt_base a ON a.attempt_id=c.attempt_id"
-                            " GROUP BY c.attempt_id"
-                            "), facts AS ("
-                            " SELECT a.cohort_lane AS lane,a.call_id,a.retry_kind,a.outcome,"
-                            " a.possibly_billed,"
-                            " CASE WHEN a.input_tokens IS NULL AND c.input_tokens_delta IS NULL"
-                            " THEN NULL ELSE coalesce(a.input_tokens,0)"
-                            " +coalesce(c.input_tokens_delta,0) END AS input_tokens,"
-                            " CASE WHEN a.output_tokens IS NULL AND c.output_tokens_delta IS NULL"
-                            " THEN NULL ELSE coalesce(a.output_tokens,0)"
-                            " +coalesce(c.output_tokens_delta,0) END AS output_tokens,"
-                            " CASE WHEN a.reasoning_tokens IS NULL AND c.reasoning_tokens_delta IS NULL"
-                            " THEN NULL ELSE coalesce(a.reasoning_tokens,0)"
-                            " +coalesce(c.reasoning_tokens_delta,0) END AS reasoning_tokens,"
-                            " CASE WHEN a.cache_read_tokens IS NULL AND c.cache_read_tokens_delta IS NULL"
-                            " THEN NULL ELSE coalesce(a.cache_read_tokens,0)"
-                            " +coalesce(c.cache_read_tokens_delta,0) END AS cache_read_tokens,"
-                            " CASE WHEN a.cache_write_tokens IS NULL AND c.cache_write_tokens_delta IS NULL"
-                            " THEN NULL ELSE coalesce(a.cache_write_tokens,0)"
-                            " +coalesce(c.cache_write_tokens_delta,0) END AS cache_write_tokens,"
-                            " CASE WHEN a.cache_miss_tokens IS NULL AND c.cache_miss_tokens_delta IS NULL"
-                            " THEN NULL ELSE coalesce(a.cache_miss_tokens,0)"
-                            " +coalesce(c.cache_miss_tokens_delta,0) END AS cache_miss_tokens"
-                            " FROM attempt_base a LEFT JOIN correction c USING(attempt_id)"
-                            ") SELECT lane,count(*)::bigint AS attempts,"
-                            " count(DISTINCT call_id)::bigint AS logical_calls,"
-                            " count(*) FILTER (WHERE retry_kind<>'initial')::bigint"
-                            " AS retry_attempts,"
-                            " count(*) FILTER (WHERE retry_kind='failover')::bigint"
-                            " AS failover_attempts,"
-                            " count(*) FILTER (WHERE outcome IN"
-                            " ('failed','timed_out','cancelled'))::bigint AS failed_attempts,"
-                            " count(*) FILTER (WHERE possibly_billed)::bigint"
-                            " AS possibly_billed_attempts,"
-                            " sum(input_tokens)::bigint AS input_tokens,"
-                            " sum(output_tokens)::bigint AS output_tokens,"
-                            " sum(reasoning_tokens)::bigint AS reasoning_tokens,"
-                            " sum(cache_read_tokens)::bigint AS cache_read_tokens,"
-                            " sum(cache_write_tokens)::bigint AS cache_write_tokens,"
-                            " sum(cache_miss_tokens)::bigint AS cache_miss_tokens"
-                            " FROM facts GROUP BY lane",
-                            (safe_hours,),
+                        whole_partition = usage_reporting.rollup_partition(
+                            attempt_query
                         )
-                        attempt_rows = cur.fetchall()
+                        attempt_partition = _usage_attempt_partition_on_cursor(
+                            cur, attempt_query, whole_partition
+                        )
+                        attempt_bundle = _usage_attempt_snapshot(
+                            cur,
+                            attempt_query,
+                            partition=attempt_partition,
+                            observer_role="runtime",
+                        )
+                        attempt_rows = attempt_bundle["attempts"]["lanes"]
                 except Exception:
                     log.exception("runtime attempt usage by lane unavailable")
 
@@ -5663,6 +5622,36 @@ class _UsageDeadlineCursor:
         return self._cursor.execute(statement, params)
 
 
+class _UsageAttemptCursor:
+    """Cap every statement in the optional attempt section at three seconds."""
+
+    def __init__(self, cursor):
+        self._cursor = (
+            cursor._cursor if isinstance(cursor, _UsageDeadlineCursor) else cursor
+        )
+        self._deadline = min(
+            getattr(cursor, "_deadline", float("inf")),
+            time.monotonic()
+            + _RUNTIME_ATTEMPT_USAGE_STATEMENT_TIMEOUT_MS / 1000,
+        )
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+    def execute(self, statement, params=None):
+        timeout_ms = min(
+            _RUNTIME_ATTEMPT_USAGE_STATEMENT_TIMEOUT_MS,
+            _usage_remaining_timeout_ms(self._deadline),
+        )
+        self._cursor.execute(
+            "SELECT set_config('statement_timeout',%s,true)",
+            (str(timeout_ms),),
+        )
+        if params is None:
+            return self._cursor.execute(statement)
+        return self._cursor.execute(statement, params)
+
+
 class _UsageImporterUnsettled(RuntimeError):
     pass
 
@@ -5978,23 +5967,6 @@ _USAGE_ATTEMPT_TOKEN_FIELDS = (
 )
 
 
-def _usage_turn_cohort_filter(query, *, alias: str = "m"):
-    """Return the shared whole-turn time/user/lane cohort predicate."""
-
-    clauses = [
-        f"{alias}.created_at >= %s",
-        f"{alias}.created_at < %s",
-    ]
-    params: list[object] = [query.start_at_utc, query.end_at_utc]
-    if query.user_id:
-        clauses.append(f"coalesce({alias}.user_id,'unknown')=%s")
-        params.append(query.user_id)
-    if query.lane:
-        clauses.append(f"coalesce(nullif({alias}.lane,''),'unknown')=%s")
-        params.append(query.lane)
-    return " AND ".join(clauses), tuple(params)
-
-
 def _usage_merge_attempt_filter_options(filters, attempt_filters):
     if attempt_filters is None:
         return filters
@@ -6008,67 +5980,249 @@ def _usage_merge_attempt_filter_options(filters, attempt_filters):
     return filters
 
 
-def _usage_attempt_snapshot(cur, query) -> dict:
-    """Aggregate canonical provider attempts inside the caller's snapshot.
+def _usage_attempt_partition(
+    whole_turn_partition: usage_reporting.RollupPartition,
+    *,
+    completed_through_day,
+    retained_from,
+    dirty_days,
+) -> usage_reporting.RollupPartition:
+    """Take the exact safe intersection of whole-turn and attempt rollups."""
 
-    Whole-turn outcomes deliberately stay outside this relation.  Corrections
-    are append-only deltas over the current main row, and estimated cost uses
-    the immutable rate card effective when the dispatch started.
-    """
+    dirty = set(dirty_days or ())
+    rolled = tuple(
+        day
+        for day in whole_turn_partition.rollup_days
+        if completed_through_day is not None
+        and day <= completed_through_day
+        and (retained_from is None or day >= retained_from)
+        and day not in dirty
+    )
+    rolled_set = set(rolled)
+    raw = tuple(
+        sorted(
+            (
+                set(whole_turn_partition.rollup_days)
+                | set(whole_turn_partition.raw_days)
+            )
+            - rolled_set
+        )
+    )
+    return usage_reporting.RollupPartition(rollup_days=rolled, raw_days=raw)
 
-    cohort_where, cohort_params = _usage_turn_cohort_filter(query)
-    params: list[object] = list(cohort_params)
+
+def _usage_attempt_partition_on_cursor(cur, query, whole_turn_partition):
+    """Read attempt watermark/dirty state from the caller's RR snapshot."""
+
+    if whole_turn_partition is None or query.timezone != "Asia/Shanghai":
+        return None
+    cur.execute(
+        "SELECT bootstrap_complete,completed_through_day,retained_from "
+        "FROM llm_usage_rollup_watermarks WHERE rollup_name=%s",
+        ("hosted_v2_attempt_usage",),
+    )
+    state = cur.fetchone()
+    if state is None or not state["bootstrap_complete"]:
+        return None
+    touched = tuple(
+        sorted(
+            set(whole_turn_partition.rollup_days)
+            | set(whole_turn_partition.raw_days)
+        )
+    )
+    dirty_days = ()
+    if touched:
+        cur.execute(
+            "SELECT local_day FROM llm_usage_rollup_dirty_days "
+            "WHERE rollup_name=%s AND local_day>=%s AND local_day<=%s",
+            ("hosted_v2_attempt_usage", touched[0], touched[-1]),
+        )
+        dirty_days = tuple(row["local_day"] for row in cur.fetchall())
+    return _usage_attempt_partition(
+        whole_turn_partition,
+        completed_through_day=state["completed_through_day"],
+        retained_from=state["retained_from"],
+        dirty_days=dirty_days,
+    )
+
+
+def _usage_attempt_raw_predicate(query, partition):
+    clauses: list[str] = []
+    params: list[object] = []
+    if partition is None:
+        clauses.append("m.created_at >= %s AND m.created_at < %s")
+        params.extend((query.start_at_utc, query.end_at_utc))
+    else:
+        range_clauses: list[str] = []
+        for raw_day in partition.raw_days:
+            day_start = datetime.combine(
+                raw_day, datetime.min.time(), tzinfo=usage_reporting.SHANGHAI
+            ).astimezone(timezone.utc)
+            day_end = datetime.combine(
+                raw_day + timedelta(days=1),
+                datetime.min.time(),
+                tzinfo=usage_reporting.SHANGHAI,
+            ).astimezone(timezone.utc)
+            range_clauses.append("(m.created_at >= %s AND m.created_at < %s)")
+            params.extend(
+                (
+                    max(day_start, query.start_at_utc),
+                    min(day_end, query.end_at_utc),
+                )
+            )
+        clauses.append("(" + " OR ".join(range_clauses) + ")")
+    if query.user_id:
+        clauses.append("coalesce(m.user_id,'unknown')=%s")
+        params.append(query.user_id)
+    if query.lane:
+        clauses.append("coalesce(nullif(m.lane,''),'unknown')=%s")
+        params.append(query.lane)
+    return " AND ".join(f"({clause})" for clause in clauses), params
+
+
+def _usage_attempt_query(query, partition) -> tuple[str, tuple[object, ...]]:
+    """Build one exact rollup/raw-edge attempt statement."""
+
+    from model_api_runtime.v2 import provider_attempt_rollup
+
+    ctes: list[str] = []
+    params: list[object] = []
+    dimension_relations: list[str] = []
+    membership_relations: list[str] = []
+
+    if partition is not None and partition.rollup_days:
+        day_where, day_params = _usage_rollup_day_predicate(partition.rollup_days)
+        rollup_clauses = [day_where]
+        rollup_params: list[object] = list(day_params)
+        if query.user_id:
+            rollup_clauses.append("user_id=%s")
+            rollup_params.append(query.user_id)
+        if query.lane:
+            rollup_clauses.append("cohort_lane=%s")
+            rollup_params.append(query.lane)
+        rollup_where = " AND ".join(rollup_clauses)
+        ctes.append(
+            "rollup_dimensions AS MATERIALIZED ("
+            " SELECT user_id,cohort_lane,requested_provider,requested_model,"
+            "resolved_provider,resolved_model,effective_usage_known,cost_kind,"
+            "currency,attempts,retry_attempts,failover_attempts,failed_attempts,"
+            "possibly_billed_attempts,input_tokens_sum,input_tokens_known_count,"
+            "output_tokens_sum,output_tokens_known_count,reasoning_tokens_sum,"
+            "reasoning_tokens_known_count,cache_read_tokens_sum,"
+            "cache_read_tokens_known_count,cache_write_tokens_sum,"
+            "cache_write_tokens_known_count,cache_miss_tokens_sum,"
+            "cache_miss_tokens_known_count,authoritative_cost_attempts,"
+            "estimated_cost_attempts,unknown_cost_attempts,cost_amount,ttft_samples"
+            " FROM llm_usage_daily_attempt_dimensions WHERE " + rollup_where + ")"
+        )
+        params.extend(rollup_params)
+        ctes.append(
+            "rollup_memberships AS MATERIALIZED ("
+            " SELECT user_id,cohort_lane,call_id,requested_provider,requested_model,"
+            "resolved_provider,resolved_model,effective_usage_known,"
+            "missing_outer_ordinals,missing_inner_ordinals"
+            " FROM llm_usage_daily_call_memberships WHERE " + rollup_where + ")"
+        )
+        params.extend(rollup_params)
+        dimension_relations.append("SELECT * FROM rollup_dimensions")
+        membership_relations.append("SELECT * FROM rollup_memberships")
+
+    has_raw = partition is None or bool(partition.raw_days)
+    if has_raw:
+        raw_where, raw_params = _usage_attempt_raw_predicate(query, partition)
+        effective = provider_attempt_rollup._effective_attempt_ctes(
+            cohort_where=raw_where
+        ).strip()
+        if not effective.startswith("WITH "):
+            raise AssertionError("attempt pricing pipeline must start with WITH")
+        ctes.append(effective.removeprefix("WITH "))
+        params.extend(raw_params)
+        ctes.extend(
+            [
+                "raw_cohort_calls AS MATERIALIZED (SELECT DISTINCT call_id FROM corrected)",
+                "raw_global_attempts AS MATERIALIZED ("
+                " SELECT a.call_id,a.outer_attempt_ordinal,a.inner_attempt_ordinal"
+                " FROM raw_cohort_calls c JOIN llm_provider_attempts a USING(call_id)"
+                " WHERE a.source='runtime_recorder')",
+                "raw_outer_gaps AS (SELECT call_id,greatest("
+                "coalesce(max(outer_attempt_ordinal) FILTER (WHERE outer_attempt_ordinal>=1),0)"
+                "-count(DISTINCT outer_attempt_ordinal) FILTER (WHERE outer_attempt_ordinal>=1),0)"
+                "::bigint AS missing_outer_ordinals FROM raw_global_attempts GROUP BY call_id)",
+                "raw_inner_gap_groups AS (SELECT call_id,outer_attempt_ordinal,greatest("
+                "coalesce(max(inner_attempt_ordinal) FILTER (WHERE inner_attempt_ordinal>=1),0)"
+                "-count(DISTINCT inner_attempt_ordinal) FILTER (WHERE inner_attempt_ordinal>=1),0)"
+                "::bigint AS missing_inner_ordinals FROM raw_global_attempts"
+                " GROUP BY call_id,outer_attempt_ordinal)",
+                "raw_call_gaps AS (SELECT o.call_id,o.missing_outer_ordinals,"
+                "coalesce(sum(i.missing_inner_ordinals),0)::bigint AS missing_inner_ordinals"
+                " FROM raw_outer_gaps o LEFT JOIN raw_inner_gap_groups i USING(call_id)"
+                " GROUP BY o.call_id,o.missing_outer_ordinals)",
+                "raw_dimensions AS MATERIALIZED (SELECT user_id,cohort_lane,"
+                "requested_provider,requested_model,resolved_provider,resolved_model,"
+                "effective_usage_known,CASE WHEN authoritative_cost IS NOT NULL THEN"
+                " 'authoritative' WHEN estimated_cost IS NOT NULL THEN 'estimated' ELSE"
+                " 'unknown' END AS cost_kind,CASE WHEN authoritative_cost IS NOT NULL THEN"
+                " authoritative_currency WHEN estimated_cost IS NOT NULL THEN rate_currency"
+                " END AS currency,count(*)::bigint AS attempts,"
+                "count(*) FILTER (WHERE retry_kind<>'initial')::bigint AS retry_attempts,"
+                "count(*) FILTER (WHERE retry_kind='failover')::bigint AS failover_attempts,"
+                "count(*) FILTER (WHERE outcome IN ('failed','timed_out','cancelled'))::bigint"
+                " AS failed_attempts,count(*) FILTER (WHERE possibly_billed)::bigint AS"
+                " possibly_billed_attempts,"
+                + ",".join(
+                    f"coalesce(sum({field}) FILTER (WHERE {field} IS NOT NULL),0)::bigint"
+                    f" AS {field}_sum,count({field})::bigint AS {field}_known_count"
+                    for field in _USAGE_ATTEMPT_TOKEN_FIELDS
+                )
+                + ",count(*) FILTER (WHERE authoritative_cost IS NOT NULL)::bigint AS"
+                " authoritative_cost_attempts,count(*) FILTER (WHERE authoritative_cost IS NULL"
+                " AND estimated_cost IS NOT NULL)::bigint AS estimated_cost_attempts,"
+                "count(*) FILTER (WHERE authoritative_cost IS NULL AND estimated_cost IS NULL)"
+                "::bigint AS unknown_cost_attempts,coalesce(sum(CASE WHEN authoritative_cost"
+                " IS NOT NULL THEN authoritative_cost WHEN estimated_cost IS NOT NULL THEN"
+                " estimated_cost ELSE 0 END),0) AS cost_amount,coalesce(array_agg(ttft_ms"
+                " ORDER BY ttft_ms,attempt_id) FILTER (WHERE ttft_ms IS NOT NULL),"
+                "'{}'::double precision[]) AS ttft_samples FROM priced GROUP BY user_id,"
+                "cohort_lane,requested_provider,requested_model,resolved_provider,resolved_model,"
+                "effective_usage_known,CASE WHEN authoritative_cost IS NOT NULL THEN"
+                " 'authoritative' WHEN estimated_cost IS NOT NULL THEN 'estimated' ELSE"
+                " 'unknown' END,CASE WHEN authoritative_cost IS NOT NULL THEN"
+                " authoritative_currency WHEN estimated_cost IS NOT NULL THEN rate_currency END)",
+                "raw_memberships AS MATERIALIZED (SELECT DISTINCT p.user_id,p.cohort_lane,"
+                "p.call_id,p.requested_provider,p.requested_model,p.resolved_provider,"
+                "p.resolved_model,p.effective_usage_known,coalesce(g.missing_outer_ordinals,0)"
+                " AS missing_outer_ordinals,coalesce(g.missing_inner_ordinals,0) AS"
+                " missing_inner_ordinals FROM priced p LEFT JOIN raw_call_gaps g USING(call_id))",
+            ]
+        )
+        dimension_relations.append("SELECT * FROM raw_dimensions")
+        membership_relations.append("SELECT * FROM raw_memberships")
+
     fact_clauses = [{
         "all": "TRUE",
         "metered": "effective_usage_known",
         "unknown": "NOT effective_usage_known",
     }[query.completeness]]
-    for field, column in (
-        ("provider", "resolved_provider"),
-        ("model", "resolved_model"),
-    ):
-        value = getattr(query, field)
-        if value:
-            fact_clauses.append(f"{column}=%s")
-            params.append(value)
-    corrected_tokens = ",".join(
-        f"CASE WHEN a.{field} IS NULL AND c.{field}_delta IS NULL THEN NULL "
-        f"ELSE coalesce(a.{field},0)+coalesce(c.{field}_delta,0) END AS {field}"
+    fact_params: list[object] = []
+    if query.provider:
+        fact_clauses.append("resolved_provider=%s")
+        fact_params.append(query.provider)
+    if query.model:
+        fact_clauses.append("resolved_model=%s")
+        fact_params.append(query.model)
+    selected_where = " AND ".join(fact_clauses)
+    params.extend(fact_params)
+    params.extend(fact_params)
+    token_outputs = ",".join(
+        f"CASE WHEN sum({field}_known_count)>0 THEN sum({field}_sum)::bigint END"
+        f" AS {field}"
         for field in _USAGE_ATTEMPT_TOKEN_FIELDS
     )
-    token_sums = ",".join(
-        f"sum({field})::bigint AS {field}"
-        for field in _USAGE_ATTEMPT_TOKEN_FIELDS
-    )
-    metric_columns = f"""
- count(*)::bigint AS attempts,
- count(DISTINCT call_id)::bigint AS logical_calls,
- count(*) FILTER (WHERE retry_kind<>'initial')::bigint AS retry_attempts,
- count(*) FILTER (WHERE retry_kind='failover')::bigint AS failover_attempts,
- count(*) FILTER (WHERE outcome IN ('failed','timed_out','cancelled'))::bigint
-   AS failed_attempts,
- count(*) FILTER (WHERE effective_usage_known)::bigint AS usage_known_attempts,
- count(*) FILTER (WHERE NOT effective_usage_known)::bigint AS usage_unknown_attempts,
- count(*) FILTER (WHERE possibly_billed)::bigint AS possibly_billed_attempts,
- {token_sums},
- percentile_cont(.50) WITHIN GROUP (ORDER BY ttft_ms)
-   FILTER (WHERE ttft_ms IS NOT NULL) AS ttft_ms_p50,
- percentile_cont(.95) WITHIN GROUP (ORDER BY ttft_ms)
-   FILTER (WHERE ttft_ms IS NOT NULL) AS ttft_ms_p95
-"""
-    null_cost_columns = """
- NULL::numeric AS authoritative_cost,NULL::numeric AS estimated_cost,
- NULL::bigint AS authoritative_attempts,NULL::bigint AS estimated_attempts,
- NULL::bigint AS unknown_cost_attempts
-"""
-    null_metric_columns = ",".join(
+    null_metrics = ",".join(
         [
-            "NULL::bigint AS attempts",
-            "NULL::bigint AS logical_calls",
-            "NULL::bigint AS retry_attempts",
-            "NULL::bigint AS failover_attempts",
-            "NULL::bigint AS failed_attempts",
-            "NULL::bigint AS usage_known_attempts",
+            "NULL::bigint AS attempts", "NULL::bigint AS logical_calls",
+            "NULL::bigint AS retry_attempts", "NULL::bigint AS failover_attempts",
+            "NULL::bigint AS failed_attempts", "NULL::bigint AS usage_known_attempts",
             "NULL::bigint AS usage_unknown_attempts",
             "NULL::bigint AS possibly_billed_attempts",
             *(f"NULL::bigint AS {field}" for field in _USAGE_ATTEMPT_TOKEN_FIELDS),
@@ -6076,183 +6230,125 @@ def _usage_attempt_snapshot(cur, query) -> dict:
             "NULL::double precision AS ttft_ms_p95",
         ]
     )
-    statement = f"""
-WITH turn_cohort AS MATERIALIZED (
- SELECT m.job_id,m.model_calls FROM v2_turn_metrics m WHERE {cohort_where}
-), turn_totals AS (
- SELECT coalesce(sum(model_calls),0)::bigint AS whole_turn_model_calls
- FROM turn_cohort
-), attempt_base AS MATERIALIZED (
- SELECT a.* FROM turn_cohort t
- JOIN llm_provider_attempts a ON a.job_id=t.job_id
- WHERE a.source='runtime_recorder'
-), correction AS (
- SELECT c.attempt_id,
-  sum(input_tokens_delta)::bigint AS input_tokens_delta,
-  sum(output_tokens_delta)::bigint AS output_tokens_delta,
-  sum(reasoning_tokens_delta)::bigint AS reasoning_tokens_delta,
-  sum(cache_read_tokens_delta)::bigint AS cache_read_tokens_delta,
-  sum(cache_write_tokens_delta)::bigint AS cache_write_tokens_delta,
-  sum(cache_miss_tokens_delta)::bigint AS cache_miss_tokens_delta,
-  sum(cost_delta) AS cost_delta,
-  count(*) FILTER (
-    WHERE input_tokens_delta IS NOT NULL OR output_tokens_delta IS NOT NULL
-       OR reasoning_tokens_delta IS NOT NULL OR cache_read_tokens_delta IS NOT NULL
-       OR cache_write_tokens_delta IS NOT NULL OR cache_miss_tokens_delta IS NOT NULL
-  ) > 0 AS has_usage_correction,
-  bool_or(c.cost_delta IS NOT NULL AND c.currency IS NULL)
-    AS cost_currency_missing,
-  min(c.currency) FILTER (WHERE c.cost_delta IS NOT NULL) AS cost_currency,
-  count(DISTINCT c.currency) FILTER (WHERE c.cost_delta IS NOT NULL)
-    AS cost_currency_count
- FROM llm_provider_attempt_corrections c
- JOIN attempt_base a ON a.attempt_id=c.attempt_id GROUP BY c.attempt_id
-), corrected AS MATERIALIZED (
- SELECT a.attempt_id,a.user_id,a.lane,a.call_id,a.outer_attempt_ordinal,
-  a.inner_attempt_ordinal,a.retry_kind,a.requested_provider,a.requested_model,
-  a.resolved_provider,a.resolved_model,a.outcome,a.possibly_billed,a.ttft_ms,
-  a.started_at,(a.usage_known OR coalesce(c.has_usage_correction,false))
-    AS effective_usage_known,
-  {corrected_tokens},
-  CASE WHEN a.cost IS NULL AND c.cost_delta IS NULL THEN NULL
-       ELSE coalesce(a.cost,0)+coalesce(c.cost_delta,0) END AS authoritative_cost,
-  CASE
-    WHEN a.cost IS NOT NULL AND a.currency IS NULL THEN NULL
-    WHEN coalesce(c.cost_currency_missing,false) THEN NULL
-    WHEN a.cost IS NOT NULL AND c.cost_currency IS NOT NULL
-         AND a.currency<>c.cost_currency THEN NULL
-    WHEN coalesce(c.cost_currency_count,0)>1 THEN NULL
-    ELSE coalesce(
-      CASE WHEN a.cost IS NOT NULL THEN a.currency END,
-      c.cost_currency
+    ctes.extend(
+        [
+            "dimension_source AS MATERIALIZED (" + " UNION ALL ".join(dimension_relations) + ")",
+            "membership_source AS MATERIALIZED (" + " UNION ALL ".join(membership_relations) + ")",
+            "selected_dimensions AS MATERIALIZED (SELECT * FROM dimension_source WHERE "
+            + selected_where + ")",
+            "selected_memberships AS MATERIALIZED (SELECT * FROM membership_source WHERE "
+            + selected_where + ")",
+            "attempt_scope_rows AS MATERIALIZED (SELECT s.scope,s.user_id,s.lane,"
+            "s.provider,s.model,sum(d.attempts)::bigint AS attempts,"
+            "sum(d.retry_attempts)::bigint AS retry_attempts,"
+            "sum(d.failover_attempts)::bigint AS failover_attempts,"
+            "sum(d.failed_attempts)::bigint AS failed_attempts,"
+            "sum(d.attempts) FILTER (WHERE d.effective_usage_known)::bigint AS"
+            " usage_known_attempts,sum(d.attempts) FILTER (WHERE NOT d.effective_usage_known)"
+            "::bigint AS usage_unknown_attempts,sum(d.possibly_billed_attempts)::bigint AS"
+            " possibly_billed_attempts," + token_outputs + " FROM selected_dimensions d"
+            " CROSS JOIN LATERAL (VALUES ('overview'::text,NULL::text,NULL::text,NULL::text,NULL::text),"
+            "('user',d.user_id,NULL,NULL,NULL),('lane',NULL,d.cohort_lane,NULL,NULL),"
+            "('requested_model',NULL,NULL,d.requested_provider,d.requested_model),"
+            "('resolved_model',NULL,NULL,d.resolved_provider,d.resolved_model))"
+            " s(scope,user_id,lane,provider,model) GROUP BY s.scope,s.user_id,s.lane,"
+            "s.provider,s.model)",
+            "ttft_scope_rows AS MATERIALIZED (SELECT s.scope,s.user_id,s.lane,s.provider,"
+            "s.model,percentile_cont(.50) WITHIN GROUP (ORDER BY sample) AS ttft_ms_p50,"
+            "percentile_cont(.95) WITHIN GROUP (ORDER BY sample) AS ttft_ms_p95"
+            " FROM selected_dimensions d CROSS JOIN LATERAL unnest(d.ttft_samples) sample"
+            " CROSS JOIN LATERAL (VALUES ('overview'::text,NULL::text,NULL::text,NULL::text,NULL::text),"
+            "('user',d.user_id,NULL,NULL,NULL),('lane',NULL,d.cohort_lane,NULL,NULL),"
+            "('requested_model',NULL,NULL,d.requested_provider,d.requested_model),"
+            "('resolved_model',NULL,NULL,d.resolved_provider,d.resolved_model))"
+            " s(scope,user_id,lane,provider,model) GROUP BY s.scope,s.user_id,s.lane,"
+            "s.provider,s.model)",
+            "call_scope_rows AS MATERIALIZED (SELECT s.scope,s.user_id,s.lane,s.provider,"
+            "s.model,count(DISTINCT m.call_id)::bigint AS logical_calls FROM"
+            " selected_memberships m CROSS JOIN LATERAL (VALUES"
+            " ('overview'::text,NULL::text,NULL::text,NULL::text,NULL::text),"
+            "('user',m.user_id,NULL,NULL,NULL),('lane',NULL,m.cohort_lane,NULL,NULL),"
+            "('requested_model',NULL,NULL,m.requested_provider,m.requested_model),"
+            "('resolved_model',NULL,NULL,m.resolved_provider,m.resolved_model))"
+            " s(scope,user_id,lane,provider,model) GROUP BY s.scope,s.user_id,s.lane,"
+            "s.provider,s.model)",
+            "collapsed_calls AS MATERIALIZED (SELECT call_id,max(missing_outer_ordinals)"
+            " AS missing_outer_ordinals,max(missing_inner_ordinals) AS missing_inner_ordinals"
+            " FROM selected_memberships GROUP BY call_id)",
+        ]
     )
-  END AS authoritative_currency
- FROM attempt_base a LEFT JOIN correction c USING (attempt_id)
-), rate_resolved AS MATERIALIZED (
- SELECT c.*,r.version AS estimated_rate_card_version,r.currency AS rate_currency,
-  r.input_cost_per_million,r.output_cost_per_million,
-  r.reasoning_cost_per_million,r.cache_read_cost_per_million,
-  r.cache_write_cost_per_million,r.cache_miss_cost_per_million
- FROM corrected c LEFT JOIN LATERAL (
-  SELECT version,currency,input_cost_per_million,output_cost_per_million,
-   reasoning_cost_per_million,cache_read_cost_per_million,
-   cache_write_cost_per_million,cache_miss_cost_per_million
-  FROM llm_rate_cards r
-  WHERE r.provider=c.resolved_provider AND r.model=c.resolved_model
-    AND r.effective_at<=c.started_at
-  ORDER BY r.effective_at DESC,r.version DESC LIMIT 1
- ) r ON true
-), priced AS MATERIALIZED (
- SELECT c.*,
-  -- Normalized input_tokens is the effective prompt and already contains
-  -- cache tokens.  Partition it into disjoint regular/read/write/non-write
-  -- miss categories before applying provider billing rates.
-  CASE WHEN c.authoritative_cost IS NULL AND c.effective_usage_known
-             AND c.estimated_rate_card_version IS NOT NULL
-             AND (c.input_tokens IS NOT NULL OR c.output_tokens IS NOT NULL
-               OR c.reasoning_tokens IS NOT NULL OR c.cache_read_tokens IS NOT NULL
-               OR c.cache_write_tokens IS NOT NULL OR c.cache_miss_tokens IS NOT NULL)
-             AND (c.input_cost_per_million=0 OR c.input_tokens IS NOT NULL)
-             AND (c.output_cost_per_million=0 OR c.output_tokens IS NOT NULL)
-             AND (c.reasoning_cost_per_million=0 OR c.reasoning_tokens IS NOT NULL)
-             AND (c.cache_read_cost_per_million=c.input_cost_per_million
-                  OR c.cache_read_tokens IS NOT NULL)
-             AND (c.cache_write_cost_per_million=c.input_cost_per_million
-                  OR c.cache_write_tokens IS NOT NULL)
-             AND (c.cache_miss_cost_per_million=c.input_cost_per_million
-                  OR c.cache_miss_tokens IS NOT NULL)
-       THEN (
-         greatest(
-           coalesce(c.input_tokens,0)-coalesce(c.cache_read_tokens,0)
-           -CASE WHEN c.cache_miss_tokens IS NOT NULL
-                 THEN c.cache_miss_tokens
-                 ELSE coalesce(c.cache_write_tokens,0) END,
-           0
-         )*c.input_cost_per_million
-        +coalesce(c.cache_read_tokens,0)*c.cache_read_cost_per_million
-        +coalesce(c.cache_write_tokens,0)*c.cache_write_cost_per_million
-        +CASE WHEN c.cache_miss_tokens IS NULL THEN 0 ELSE greatest(
-           c.cache_miss_tokens-coalesce(c.cache_write_tokens,0),0
-         ) END*c.cache_miss_cost_per_million
-        +coalesce(c.output_tokens,0)*c.output_cost_per_million
-        +coalesce(c.reasoning_tokens,0)*c.reasoning_cost_per_million
-       )/1000000::numeric END AS estimated_cost
- FROM rate_resolved c
-), facts AS MATERIALIZED (
- SELECT * FROM priced WHERE {' AND '.join(fact_clauses)}
-), selected_calls AS MATERIALIZED (
- SELECT DISTINCT call_id FROM facts
-), gap_facts AS MATERIALIZED (
- SELECT a.call_id,a.outer_attempt_ordinal,a.inner_attempt_ordinal
- FROM selected_calls s JOIN llm_provider_attempts a USING (call_id)
- WHERE a.source='runtime_recorder'
-), outer_gaps AS (
- SELECT call_id,greatest(max(outer_attempt_ordinal)
-   -count(DISTINCT outer_attempt_ordinal),0)::bigint AS gaps
- FROM gap_facts GROUP BY call_id
-), inner_gaps AS (
- SELECT call_id,outer_attempt_ordinal,greatest(max(inner_attempt_ordinal)
-   -count(DISTINCT inner_attempt_ordinal),0)::bigint AS gaps
- FROM gap_facts GROUP BY call_id,outer_attempt_ordinal
-), gaps AS (
- SELECT coalesce((SELECT sum(gaps) FROM outer_gaps),0)::bigint AS outer_gaps,
-        coalesce((SELECT sum(gaps) FROM inner_gaps),0)::bigint AS inner_gaps,
-        (SELECT whole_turn_model_calls FROM turn_totals)
-          AS whole_turn_model_calls
-)
-SELECT 'overview'::text AS scope,NULL::text AS user_id,NULL::text AS lane,
- NULL::text AS provider,NULL::text AS model,NULL::text AS currency,
- {metric_columns},{null_cost_columns},NULL::bigint AS outer_gaps,
- NULL::bigint AS inner_gaps,NULL::bigint AS whole_turn_model_calls FROM facts
-UNION ALL
-SELECT 'user',user_id,NULL,NULL,NULL,NULL,{metric_columns},{null_cost_columns},
- NULL,NULL,NULL FROM facts GROUP BY user_id
-UNION ALL
-SELECT 'lane',NULL,lane,NULL,NULL,NULL,{metric_columns},{null_cost_columns},
- NULL,NULL,NULL FROM facts GROUP BY lane
-UNION ALL
-SELECT 'requested_model',NULL,NULL,requested_provider,requested_model,NULL,
- {metric_columns},{null_cost_columns},NULL,NULL,NULL
- FROM facts GROUP BY requested_provider,requested_model
-UNION ALL
-SELECT 'resolved_model',NULL,NULL,resolved_provider,resolved_model,NULL,
- {metric_columns},{null_cost_columns},NULL,NULL,NULL
- FROM facts GROUP BY resolved_provider,resolved_model
-UNION ALL
-SELECT 'filter_option',NULL,NULL,resolved_provider,resolved_model,NULL,
- {null_metric_columns},{null_cost_columns},NULL,NULL,NULL
- FROM attempt_base GROUP BY resolved_provider,resolved_model
-UNION ALL
-SELECT 'cost',NULL,NULL,NULL,NULL,
- CASE WHEN authoritative_cost IS NOT NULL THEN authoritative_currency
-      WHEN estimated_cost IS NOT NULL THEN rate_currency END,
- {null_metric_columns},
- sum(authoritative_cost) FILTER (WHERE authoritative_cost IS NOT NULL),
- sum(estimated_cost) FILTER (WHERE estimated_cost IS NOT NULL),
- count(*) FILTER (WHERE authoritative_cost IS NOT NULL)::bigint,
- count(*) FILTER (WHERE authoritative_cost IS NULL AND estimated_cost IS NOT NULL)::bigint,
- count(*) FILTER (WHERE authoritative_cost IS NULL AND estimated_cost IS NULL)::bigint,
- NULL,NULL,NULL FROM facts
- GROUP BY CASE WHEN authoritative_cost IS NOT NULL THEN authoritative_currency
-               WHEN estimated_cost IS NOT NULL THEN rate_currency END
-UNION ALL
-SELECT 'gaps',NULL,NULL,NULL,NULL,NULL,{null_metric_columns},
- {null_cost_columns},outer_gaps,inner_gaps,whole_turn_model_calls FROM gaps
-"""
-    _usage_snapshot_observer("read", role="exporter", section="attempt_ledger")
-    cur.execute(statement, tuple(params))
+    metric_select = (
+        "a.scope,a.user_id,a.lane,a.provider,a.model,NULL::text AS currency,"
+        "a.attempts,coalesce(c.logical_calls,0)::bigint AS logical_calls,"
+        "a.retry_attempts,a.failover_attempts,a.failed_attempts,"
+        "coalesce(a.usage_known_attempts,0)::bigint AS usage_known_attempts,"
+        "coalesce(a.usage_unknown_attempts,0)::bigint AS usage_unknown_attempts,"
+        "a.possibly_billed_attempts," + ",".join(f"a.{f}" for f in _USAGE_ATTEMPT_TOKEN_FIELDS)
+        + ",t.ttft_ms_p50,t.ttft_ms_p95,NULL::numeric AS authoritative_cost,"
+        "NULL::numeric AS estimated_cost,NULL::bigint AS authoritative_attempts,"
+        "NULL::bigint AS estimated_attempts,NULL::bigint AS unknown_cost_attempts,"
+        "NULL::bigint AS outer_gaps,NULL::bigint AS inner_gaps,"
+        "NULL::bigint AS whole_turn_model_calls FROM attempt_scope_rows a"
+        " LEFT JOIN call_scope_rows c ON c.scope=a.scope AND c.user_id IS NOT DISTINCT"
+        " FROM a.user_id AND c.lane IS NOT DISTINCT FROM a.lane AND c.provider IS NOT"
+        " DISTINCT FROM a.provider AND c.model IS NOT DISTINCT FROM a.model"
+        " LEFT JOIN ttft_scope_rows t ON t.scope=a.scope AND t.user_id IS NOT DISTINCT"
+        " FROM a.user_id AND t.lane IS NOT DISTINCT FROM a.lane AND t.provider IS NOT"
+        " DISTINCT FROM a.provider AND t.model IS NOT DISTINCT FROM a.model"
+    )
+    statement = "WITH " + ",\n".join(ctes) + "\nSELECT " + metric_select + (
+        " UNION ALL SELECT 'cost',NULL,NULL,NULL,NULL,currency," + null_metrics
+        + ",sum(cost_amount) FILTER (WHERE cost_kind='authoritative'),"
+        "sum(cost_amount) FILTER (WHERE cost_kind='estimated'),"
+        "sum(authoritative_cost_attempts)::bigint,sum(estimated_cost_attempts)::bigint,"
+        "sum(unknown_cost_attempts)::bigint,NULL,NULL,NULL FROM selected_dimensions"
+        " GROUP BY currency UNION ALL SELECT 'gaps',NULL,NULL,NULL,NULL,NULL," + null_metrics
+        + ",NULL::numeric,NULL::numeric,NULL::bigint,NULL::bigint,NULL::bigint,"
+        "coalesce(sum(missing_outer_ordinals),0)::bigint,"
+        "coalesce(sum(missing_inner_ordinals),0)::bigint,NULL::bigint FROM collapsed_calls"
+        " UNION ALL SELECT 'filter_option',NULL,NULL,resolved_provider,resolved_model,NULL,"
+        + null_metrics
+        + ",NULL::numeric,NULL::numeric,NULL::bigint,NULL::bigint,NULL::bigint,NULL,NULL,NULL"
+        " FROM dimension_source GROUP BY resolved_provider,resolved_model"
+    )
+    return statement, tuple(params)
+
+
+def _usage_attempt_snapshot(
+    cur,
+    query,
+    *,
+    partition=None,
+    whole_turn_model_calls: int | None = None,
+    observer_role: str = "exporter",
+) -> dict:
+    """Aggregate canonical provider attempts inside the caller's snapshot.
+
+    Whole-turn outcomes deliberately stay outside this relation.  Corrections
+    are append-only deltas over the current main row, and estimated cost uses
+    the immutable rate card effective when the dispatch started.
+    """
+
+    cur = _UsageAttemptCursor(cur)
+    statement, params = _usage_attempt_query(query, partition)
+    _usage_snapshot_observer(
+        "read", role=observer_role, section="attempt_ledger"
+    )
+    cur.execute(statement, params)
     rows = cur.fetchall()
 
     def render_metrics(row) -> dict:
         return {
-            "attempts": int(row["attempts"] or 0),
-            "logical_calls": int(row["logical_calls"] or 0),
-            "retry_attempts": int(row["retry_attempts"] or 0),
-            "failover_attempts": int(row["failover_attempts"] or 0),
-            "failed_attempts": int(row["failed_attempts"] or 0),
-            "usage_known_attempts": int(row["usage_known_attempts"] or 0),
-            "usage_unknown_attempts": int(row["usage_unknown_attempts"] or 0),
-            "possibly_billed_attempts": int(row["possibly_billed_attempts"] or 0),
+            "attempts": int(row.get("attempts") or 0),
+            "logical_calls": int(row.get("logical_calls") or 0),
+            "retry_attempts": int(row.get("retry_attempts") or 0),
+            "failover_attempts": int(row.get("failover_attempts") or 0),
+            "failed_attempts": int(row.get("failed_attempts") or 0),
+            "usage_known_attempts": int(row.get("usage_known_attempts") or 0),
+            "usage_unknown_attempts": int(row.get("usage_unknown_attempts") or 0),
+            "possibly_billed_attempts": int(
+                row.get("possibly_billed_attempts") or 0
+            ),
             **{
                 field: _usage_optional_int(row, field)
                 for field in _USAGE_ATTEMPT_TOKEN_FIELDS
@@ -6305,8 +6401,7 @@ SELECT 'gaps',NULL,NULL,NULL,NULL,NULL,{null_metric_columns},
         query.provider or query.model or query.completeness != "all"
     )
     whole_turn_model_calls = (
-        int(gaps.get("whole_turn_model_calls") or 0)
-        if coverage_attributable else None
+        int(whole_turn_model_calls or 0) if coverage_attributable else None
     )
     coverage_reason = (
         None if coverage_attributable else
@@ -6350,6 +6445,44 @@ SELECT 'gaps',NULL,NULL,NULL,NULL,NULL,{null_metric_columns},
             }),
         },
     }
+
+
+def _usage_parallel_attempt_latency_bundle(
+    cur, query, partition, attempt_partition
+) -> dict:
+    """Run attempt accounting and task B on one existing importer session."""
+
+    attempt_bundle = _usage_optional_pg_section(
+        cur,
+        "attempt_ledger",
+        lambda: _usage_attempt_snapshot(
+            cur,
+            query,
+            partition=attempt_partition,
+            observer_role="importer_attempt",
+        ),
+    )
+    return {
+        "attempt_bundle": attempt_bundle,
+        "latency_bundle": _usage_parallel_latency_bundle(
+            cur, query, partition
+        ),
+    }
+
+
+def _usage_apply_attempt_denominator(attempt_bundle, whole_turn_model_calls):
+    if attempt_bundle is None:
+        return None
+    attempts = attempt_bundle.get("attempts")
+    if attempts is None:
+        return attempt_bundle
+    coverage = attempts.get("coverage") or {}
+    if coverage.get("logical_call_coverage_reason") is None:
+        denominator = int(whole_turn_model_calls or 0)
+        recorded = int(coverage.get("recorded_logical_calls") or 0)
+        coverage["whole_turn_model_calls"] = denominator
+        coverage["logical_call_coverage"] = _usage_rate(recorded, denominator)
+    return attempt_bundle
 
 
 def _usage_report_snapshot_raw(query, *, exporter_conn=None) -> dict:
@@ -6742,7 +6875,11 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
                 attempt_bundle = _usage_optional_pg_section(
                     cur,
                     "attempt_ledger",
-                    lambda: _usage_attempt_snapshot(cur, query),
+                    lambda: _usage_attempt_snapshot(
+                        cur,
+                        query,
+                        whole_turn_model_calls=int(totals["model_calls"] or 0),
+                    ),
                 )
 
     prompt_tokens = _usage_optional_int(totals, "prompt_tokens")
@@ -7561,6 +7698,9 @@ def _usage_report_snapshot_hybrid_parallel(
             )
             if partition is None:
                 return None
+            attempt_partition = _usage_attempt_partition_on_cursor(
+                cur, query, partition
+            )
             cur.execute("SELECT pg_export_snapshot()")
             snapshot_id = str(cur.fetchone()["pg_export_snapshot"])
             _usage_snapshot_observer("exported", snapshot_id=snapshot_id)
@@ -7586,9 +7726,10 @@ def _usage_report_snapshot_hybrid_parallel(
                     snapshot_id,
                     task_b_control,
                     importer_deadline,
-                    _usage_parallel_latency_bundle,
+                    _usage_parallel_attempt_latency_bundle,
                     query,
                     partition,
+                    attempt_partition,
                 )
                 core = _usage_parallel_core_rows(cur, query, partition)
                 latency_lanes = _usage_optional_pg_section(
@@ -7627,7 +7768,7 @@ def _usage_report_snapshot_hybrid_parallel(
                         )
                         dimensions = None
                 try:
-                    latency_bundle = _usage_importer_result(
+                    task_b_result = _usage_importer_result(
                         task_b_future,
                         task_b_control,
                         importer_deadline,
@@ -7645,14 +7786,22 @@ def _usage_report_snapshot_hybrid_parallel(
                             (str(_usage_remaining_timeout_ms(importer_deadline)),),
                         )
                         with conn.transaction():
-                            latency_bundle = _usage_parallel_latency_bundle(
-                                cur, query, partition
+                            task_b_result = _usage_parallel_attempt_latency_bundle(
+                                cur, query, partition, attempt_partition
                             )
                     except Exception:
                         log.exception(
                             "usage task B serial fallback unavailable"
                         )
-                        latency_bundle = None
+                        task_b_result = None
+                latency_bundle = (
+                    task_b_result.get("latency_bundle")
+                    if task_b_result is not None else None
+                )
+                attempt_bundle = (
+                    task_b_result.get("attempt_bundle")
+                    if task_b_result is not None else None
+                )
             core, dimensions, latency_bundle = _usage_merge_parallel_task_results(
                 core, dimensions, latency_bundle, latency_lanes
             )
@@ -7665,10 +7814,9 @@ def _usage_report_snapshot_hybrid_parallel(
                 state,
                 partition,
             )
-            attempt_bundle = _usage_optional_pg_section(
-                cur,
-                "attempt_ledger",
-                lambda: _usage_attempt_snapshot(cur, query),
+            attempt_bundle = _usage_apply_attempt_denominator(
+                attempt_bundle,
+                payload["overview"]["model_calls"],
             )
             payload["filters"] = _usage_merge_attempt_filter_options(
                 payload.get("filters"),
