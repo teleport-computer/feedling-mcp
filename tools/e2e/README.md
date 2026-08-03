@@ -39,6 +39,22 @@ E2E_KEY_DEEPSEEK=sk-…
 | `vps.py` | VPS 格子流程：本地起真 consumer（子进程）→heartbeat→verify_loop→聊天→删号 |
 | `p0.py` | 编排器 + 结果表（§8 报告格式） |
 
+**专项探针**（不在 p0 编排里，触碰对应功能时手动跑）：
+
+| 文件 | 验什么 | 何时跑 |
+|---|---|---|
+| `repeat_wake_probe.py` | 重复定时提醒：fire 后自动续排 +24h、用**已 fired 的旧 id** 能整串取消、同刻同 repeat 去重、一次性提醒不续排 | 动 `scheduled_wake_v2` / `schedule_wake` 工具面时 |
+| `card_gate_probe.py` | 记忆卡内容闸不误杀真卡 | 动 capture/dream 判据时 |
+| `temporal_probe.py` | 模型真的读到了注入的时间锚点 | 动 V2 上下文组装时 |
+| `turn_failure_smoke.py` | 回合失败的字段/归责能下发到客户端 | 动错误分类或 consumer 兜底时 |
+| `resident_maintenance_smoke.py` | resident 识别/poll/notice/genesis claim | 动 consumer 这几条时 |
+
+`repeat_wake_probe` 的两个坑（写新探针时同样适用）：
+- `/v1/proactive/scheduled/fire` **只触发已到期的**（`due_at <= now`），
+  所以要排在**过去**；排在未来那次 fire 是空转，看起来像"续排没发生"。
+- 断言之间有依赖时要**显式声明前置**——本探针第一版里"取消后无残留 pending"
+  是绿的，但那只是因为上一步压根没排出续排，**假通过**。
+
 ## 判定语义
 
 - **fail**（阻断）：setup / 解锁 / 聊天回环或解密 / 连续性 / 错误气泡非零 / consumer 起不来
