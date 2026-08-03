@@ -6426,7 +6426,16 @@ _EVENT_DESCRIPTIONS = {
 
 
 def _data_track_events_payload() -> dict:
-    raw = db.admin_events_overview()
+    """事件健康度看板。
+
+    **按天统计**（北京时区）：`?day=YYYY-MM-DD`，缺省为今天。在 2026-08-04 之前
+    这里是全量历史累计，而 URL 上的 `day=`/`hours=` 参数对它毫无作用——于是"今天
+    200 次全挂"在一万次历史成功面前仍显示 98% 绿，分母只增不减，指标越用越钝。
+    运营真正要看的是"今天健康吗"，所以口径改成单日。
+    """
+    raw_day = str(request.args.get("day") or "").strip()
+    day = _validated_dau_day(raw_day) if raw_day else _events_today()
+    raw = db.admin_events_overview(day=day)
 
     def blank():
         return {"vps": _blank_evt_stat(), "api": _blank_evt_stat()}
@@ -6473,8 +6482,15 @@ def _data_track_events_payload() -> dict:
     return {
         "generated_at": datetime.now().isoformat(),
         "categories": [{"key": k, **cats[k]} for k, _ in _EVENT_CATEGORIES],
-        "note": "Onboarding 漏斗 + 回复延迟为下一阶段；本页先给 成功率/次数/中位耗时(job类)/兜底率，VPS·API 分列。",
+        "day": day,
+        "note": "Onboarding 漏斗 + 回复延迟为下一阶段；本页先给 成功率/次数/中位耗时(job类)/兜底率，VPS·API 分列。按北京时区单日统计。",
     }
+
+
+def _events_today() -> str:
+    """北京时间的今天。与 `admin_events_overview` 的分桶时区同源，
+    否则页面默认打开的"今天"会和 SQL 认定的"今天"错开几小时。"""
+    return datetime.now(_SHANGHAI_TZ).strftime("%Y-%m-%d")
 
 
 def _blank_evt_stat() -> dict:
@@ -6494,6 +6510,35 @@ def _evt_dur(b: dict) -> str:
         return "—"
     d = float(d)
     return f"{d:.1f}s" if d < 60 else f"{d/60:.1f}m"
+
+
+def _render_events_day_nav(day: str) -> str:
+    """前一天 / 后一天 / 直接选日期。
+
+    这个看板的口径是单日，所以"看哪天"必须是页面上的一等控件——否则用户只能手改
+    URL，而 URL 里那个 `day=` 参数在 2026-08-04 之前恰恰是不生效的装饰。
+    """
+    try:
+        d = datetime.strptime(day, "%Y-%m-%d").date()
+    except ValueError:
+        return ""
+    prev = (d - timedelta(days=1)).isoformat()
+    nxt = (d + timedelta(days=1)).isoformat()
+    today = _events_today()
+    # 不给"未来"入口：那天必然是空表，只会让人以为出故障了
+    next_link = (f"<a class='sort-button' href='?view=events&day={nxt}'>后一天 ›</a>"
+                 if nxt <= today else
+                 "<span class='sort-button muted' aria-disabled='true'>后一天 ›</span>")
+    return f"""<div class="viewbar">
+    <a class="sort-button" href="?view=events&day={prev}">‹ 前一天</a>
+    <form method="get" style="display:inline-flex; gap:8px; align-items:center;">
+      <input type="hidden" name="view" value="events">
+      <input class="sort-button" type="date" name="day" value="{html.escape(day)}" max="{today}">
+      <button class="sort-button" type="submit">查看</button>
+    </form>
+    {next_link}
+    {"" if day == today else f"<a class='sort-button' href='?view=events&day={today}'>回到今天</a>"}
+  </div>"""
 
 
 def _render_events_page(payload: dict) -> str:
@@ -6561,8 +6606,9 @@ def _render_events_page(payload: dict) -> str:
   .note-box {{ background:#fff8ef; border:1px solid #e8d8be; border-radius:8px; padding:12px 14px; margin:14px 0; font-size:13px; line-height:1.65; color:#5a4d3c; }}
 </style></head><body><main>
   <h1>事件健康度</h1>
-  <div class="muted">VPS=resident 自托管；API=model_api 托管。Generated {html.escape(_bj_iso(payload.get('generated_at')))}.</div>
+  <div class="muted">VPS=resident 自托管；API=model_api 托管。统计口径 = <b>{html.escape(str(payload.get('day') or ''))}</b> 当天（北京时间）。Generated {html.escape(_bj_iso(payload.get('generated_at')))}.</div>
   {_render_data_track_view_nav("events")}
+  {_render_events_day_nav(str(payload.get('day') or ''))}
   <div class="note-box">
     <b>每一格怎么读：</b>
     <b>成功率</b> = 完成 ÷（完成 + 失败）（回复类 = 真回复 ÷ 用户消息数，越高越健康）；

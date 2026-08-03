@@ -2854,14 +2854,53 @@ _JOB_DUR_SEC = (
 )
 
 
-def admin_events_overview() -> dict:
+_VALID_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_VALID_TZ_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_+/-]{0,63}$")
+
+
+def admin_events_overview(*, day: str = "", tz: str = "Asia/Shanghai") -> dict:
     """Fleet-wide event-health aggregates for the `view=events` board, split by
     route (VPS/resident vs API/model_api). Each sub-query is independently
     guarded so one failure degrades to an empty slice, not the whole board.
 
+    ``day`` scopes every aggregate to ONE calendar day in ``tz`` (default Beijing);
+    empty means all time. Until 2026-08-04 this function took no arguments and had
+    no time filter at all, so the board silently reported since-the-beginning-of-time
+    totals while the page URL carried `day=`/`hours=` params that did nothing. That
+    makes an outage invisible: 200 failures today against 10,000 historical successes
+    still renders 98% green, and the denominator only grows, so the metric gets
+    number by the day. Day-scoped is what an operator actually reads it for —
+    "was today healthy".
+
     Returns {proactive:[...], capture:[...], genesis:[...], reply:[...]} where each
     row carries route + the event dimension + counts + median duration (seconds)."""
     out = {"proactive": [], "capture": [], "genesis": [], "reply": []}
+    zone = str(tz or "Asia/Shanghai")
+    if not _VALID_TZ_NAME.match(zone):
+        zone = "Asia/Shanghai"
+    want_day = str(day or "").strip()
+    if want_day and not _VALID_DAY.match(want_day):
+        # An unparseable day would otherwise silently widen back to all-time —
+        # the exact failure this function was changed to remove.
+        raise ValueError(f"admin_events_overview: bad day {want_day!r}, want YYYY-MM-DD")
+
+    def _day_filter(ts_expr: str, *, epoch: bool = True) -> str:
+        """SQL predicate scoping one row's time column to ``want_day`` in ``tz``.
+
+        ``epoch=True`` for the numeric ``ts`` columns (user_logs / chat_messages),
+        False for a real timestamptz (genesis_import_jobs.created_at). Same
+        bucketing idiom as admin_data_track_dau, so this board and the DAU chart
+        can never disagree about which day a row belongs to.
+
+        ``want_day``/``zone`` are inlined rather than bound because these SQL
+        strings are assembled by f-string in the callers below; both are stripped
+        of quotes and every caller passes a value this function itself validated
+        (``_valid_day``), so no caller-controlled text reaches SQL."""
+        if not want_day:
+            return ""
+        stamp = f"to_timestamp({ts_expr})" if epoch else f"({ts_expr})"
+        return (f" AND to_char(timezone('{zone}', {stamp}), "
+                f"'YYYY-MM-DD') = '{want_day}'")
 
     def _run(key, sql):
         try:
@@ -2893,6 +2932,7 @@ def admin_events_overview() -> dict:
             LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),NULLIF(l.doc->>'wake_kind',''),NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
           WHERE l.stream = 'proactive_jobs'
             AND COALESCE(l.doc->>'job_kind','') NOT IN ('memory_capture','memory_dream','memory_migrate')
+            {_day_filter('l.ts')}
         ) j LEFT JOIN routes r ON r.user_id = j.user_id
         GROUP BY route, j.lane
     """)
@@ -2915,11 +2955,13 @@ def admin_events_overview() -> dict:
           SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur
           FROM user_logs l
           WHERE l.stream = 'memory_capture_jobs'
+            {_day_filter('l.ts')}
           UNION ALL
           SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur
           FROM user_logs l
           WHERE l.stream = 'proactive_jobs'
             AND COALESCE(l.doc->>'job_kind','') IN ('memory_capture','memory_dream','memory_migrate')
+            {_day_filter('l.ts')}
         ) m LEFT JOIN routes r ON r.user_id = m.user_id
         GROUP BY route
     """)
@@ -2939,6 +2981,7 @@ def admin_events_overview() -> dict:
                (COUNT(*) FILTER (WHERE g.status IN ('done','completed')))::int AS success,
                (COUNT(*) FILTER (WHERE g.status IN ('error','failed')))::int AS failed
         FROM genesis_import_jobs g LEFT JOIN routes r ON r.user_id = g.user_id
+        WHERE TRUE {_day_filter('g.created_at', epoch=False)}
         GROUP BY route, distill
     """)
     out["genesis"] = [
@@ -2949,6 +2992,9 @@ def admin_events_overview() -> dict:
     # 4) 回复消息: 真回复率 + 兜底率 + 回复延迟(中位)。real_replies 排除
     #    agent_initiated_proactive(主动消息不是"对用户的回复")。latency = 每条真回复
     #    与其前一条用户消息的时间差(窗口配对)。
+    #    日期过滤只能加在 paired 之外：窗口函数要回看"这条回复之前的那条用户消息"，
+    #    在 CTE 里就按天切会让每天 0 点后的第一条回复找不到它的问句(last_user_ts 为
+    #    NULL)，于是被算成"没有真回复"——把跨零点的正常对话统计成故障。
     rows = _run("reply", f"""
         {_EVENTS_ROUTES_CTE}, paired AS (
           SELECT c.user_id, c.ts, c.doc->>'role' AS role, COALESCE(c.doc->>'source','') AS src,
@@ -2968,6 +3014,7 @@ def admin_events_overview() -> dict:
                       AND p.last_user_ts IS NOT NULL AND p.ts >= p.last_user_ts
                       THEN p.ts - p.last_user_ts END) AS median_latency
         FROM paired p LEFT JOIN routes r ON r.user_id = p.user_id
+        WHERE TRUE {_day_filter('p.ts')}
         GROUP BY route
     """)
     out["reply"] = [

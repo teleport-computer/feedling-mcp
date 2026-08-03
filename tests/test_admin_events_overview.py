@@ -142,3 +142,89 @@ def test_admin_events_overview_aggregates_routes_events_and_durations():
     assert delta("reply", ("model_api",), "fallback_replies", "route") == 1
     assert delta("reply", ("official_import",), "real_replies", "route") == 0
     assert delta("reply", ("official_import",), "fallback_replies", "route") == 0
+
+
+# ---------------------------------------------------------------------------
+# 按天口径（2026-08-04）
+#
+# 在此之前这个看板统计的是**全量历史**，而页面 URL 上的 `day=`/`hours=` 参数对它
+# 毫无作用。后果是故障被历史稀释到看不见：今天 200 次全挂、历史 10000 次成功，
+# 页面照样显示 98% 绿；而且分母只增不减，越往后越钝。
+# ---------------------------------------------------------------------------
+
+
+def _bj_epoch(day: str, hour: int = 12) -> float:
+    """北京时间某天某点的 epoch。"""
+    from zoneinfo import ZoneInfo
+    d = datetime.strptime(day, "%Y-%m-%d").replace(
+        hour=hour, tzinfo=ZoneInfo("Asia/Shanghai"))
+    return d.timestamp()
+
+
+def test_events_overview_scopes_counts_to_one_beijing_day():
+    u = _uid("events_day")
+    seed_user(u)
+    db.set_blob(u, "onboarding_route", {"route": "model_api"})
+
+    # 昨天成功、今天失败：按天看应该是两幅完全不同的画面
+    db.log_append(u, "proactive_jobs", {
+        "job_id": "d1", "job_kind": "heartbeat", "status": "delivered",
+    }, ts=_bj_epoch("2026-03-01"), item_key="d1")
+    db.log_append(u, "proactive_jobs", {
+        "job_id": "d2", "job_kind": "heartbeat", "status": "failed",
+    }, ts=_bj_epoch("2026-03-02"), item_key="d2")
+
+    day1 = db.admin_events_overview(day="2026-03-01")
+    day2 = db.admin_events_overview(day="2026-03-02")
+
+    def lane(payload, want_lane="heartbeat"):
+        return [r for r in payload["proactive"]
+                if r["lane"] == want_lane and r["route"] == "model_api"]
+
+    r1 = lane(day1)
+    r2 = lane(day2)
+    assert len(r1) == 1 and r1[0]["success"] == 1 and r1[0]["failed"] == 0, r1
+    assert len(r2) == 1 and r2[0]["success"] == 0 and r2[0]["failed"] == 1, r2
+
+
+def test_events_overview_does_not_leak_across_the_beijing_midnight():
+    """北京 23:59 与次日 00:01 必须落在不同的两天。
+
+    若 SQL 按 UTC 分桶，北京时间当天 00:00-08:00 的事件会被算进"昨天"——运营看到的
+    "今天"就少了一整个上午。
+    """
+    u = _uid("events_mid")
+    seed_user(u)
+    db.set_blob(u, "onboarding_route", {"route": "model_api"})
+
+    db.log_append(u, "proactive_jobs", {
+        "job_id": "late", "job_kind": "heartbeat", "status": "delivered",
+    }, ts=_bj_epoch("2026-03-05", hour=23), item_key="late")
+    db.log_append(u, "proactive_jobs", {
+        "job_id": "early", "job_kind": "heartbeat", "status": "delivered",
+    }, ts=_bj_epoch("2026-03-06", hour=0), item_key="early")
+
+    d5 = [r for r in db.admin_events_overview(day="2026-03-05")["proactive"]
+          if r["route"] == "model_api" and r["lane"] == "heartbeat"]
+    d6 = [r for r in db.admin_events_overview(day="2026-03-06")["proactive"]
+          if r["route"] == "model_api" and r["lane"] == "heartbeat"]
+
+    assert len(d5) == 1 and d5[0]["total"] == 1
+    assert len(d6) == 1 and d6[0]["total"] == 1
+
+
+def test_events_overview_rejects_a_malformed_day_instead_of_widening():
+    """坏日期必须报错，不能静默回退成全量。
+
+    静默回退正是这次要消灭的行为：调用方以为拿到的是某一天，实际是开天辟地至今。
+    """
+    with pytest.raises(ValueError):
+        db.admin_events_overview(day="2026/03/05")
+    with pytest.raises(ValueError):
+        db.admin_events_overview(day="yesterday")
+
+
+def test_events_overview_without_a_day_still_returns_all_time():
+    """不传 day 时维持旧行为（全量），供不关心日期的调用方使用。"""
+    payload = db.admin_events_overview()
+    assert set(payload) == {"proactive", "capture", "genesis", "reply"}
