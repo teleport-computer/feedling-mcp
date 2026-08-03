@@ -631,12 +631,12 @@ _PRIVATE_READ_TOOLS = frozenset(
         cap_tool_schema.PROVIDER_USAGE_TOOL,
     }
 )
-# Static perception grounding is allowed to coexist with first-round web/MCP/task
-# access, so it must contain only values that cannot carry natural-language
-# instructions.  Keep useful typed readings eager while making every free-form
-# label/title/description pull-only.  The allowlist is deliberately per field,
-# not merely ``isinstance(value, scalar)``: strings are scalars too, and are the
-# exact prompt-injection carrier this boundary excludes.
+# The wake path's legacy static perception grounding is allowed to coexist with
+# first-round web/MCP/task access, so it must contain only values that cannot
+# carry natural-language instructions. Keep useful typed readings eager while
+# making every free-form label/title/description pull-only. The allowlist is
+# deliberately per field, not merely ``isinstance(value, scalar)``: strings are
+# scalars too, and are the exact prompt-injection carrier this boundary excludes.
 _EAGER_PERCEPTION_SCALAR_FIELDS = {
     "now": frozenset({"battery_level", "charging", "broadcast_active"}),
     "weather": frozenset(
@@ -2751,12 +2751,10 @@ async def _run_trajectory_review_turn(
 
 
 async def _perception_grounding_results(store, *, runtime_token, enclave_sem):
-    """Prefetch safe typed perception scalars as static grounding.
+    """Prefetch safe typed perception scalars as legacy wake grounding.
 
-    Without this the agent is perception-BLIND on every lane but screen_watch: the
-    chat system prompt never mentions perception, so asked "how many steps today"
-    the model answered "can't get that" while `perception_snapshot(signals=["steps"])`
-    would have returned the count immediately.
+    Wake lanes other than screen_watch still use this helper. Foreground chat is
+    pull-only and must discover exact readings through the model-facing tools.
 
     Signals are passed EXPLICITLY over the full catalog: the capability's default is
     `FAST_AGENT_PERCEPTION_SIGNALS` (now/location/weather/motion/calendar) and every
@@ -2775,9 +2773,7 @@ async def _perception_grounding_results(store, *, runtime_token, enclave_sem):
     tool loop removes later web/MCP/task channels.
 
     Disabled/null values for allowlisted typed fields are kept: the agent must not
-    infer zero from an absent reading. Their interpretation guidance lives in
-    ``context._RUNTIME_CONTEXT_POLICY`` so the changing runtime-data payload
-    remains observations only.
+    infer zero from an absent reading.
 
     Returns the `action_results` shape `action_context_str` expects, or None when the
     prefetch came back empty — `_cap_data` degrades to {} on failure and this is
@@ -10353,14 +10349,6 @@ async def process_job(
         # would therefore fail to bound the whole-turn MCP contribution.
         mcp_wall_budget = _McpTurnWallBudget(MCP_TURN_WALL_BUDGET_SEC)
 
-        # Perception grounding for the chat turn. Sits HERE, beside the MCP load and
-        # deliberately OUTSIDE the `async with enclave_sem` block above: `_cap_data`
-        # acquires enclave_sem itself and asyncio.Semaphore is not reentrant (see its
-        # docstring / the wake lane's identical note) — nesting deadlocks at
-        # FEEDLING_V2_ENCLAVE_CONCURRENCY=1.
-        perception_results = await _perception_grounding_results(
-            store, runtime_token=runtime_token, enclave_sem=enclave_sem
-        )
         pending_schedule_results = None
         if deps.read_pending_scheduled_wake_context is not None:
             try:
@@ -11197,8 +11185,6 @@ async def process_job(
             return await base_fold_new_messages()
 
         grounding_results: dict[str, Any] = {}
-        if perception_results:
-            grounding_results.update(perception_results)
         if pending_schedule_results:
             grounding_results.update(pending_schedule_results)
         turn_extra_context = (
