@@ -3,6 +3,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "backend"))  # noq
 
 from agent import perception_core  # noqa: E402
 from capabilities import perception as cap_perc  # noqa: E402
+from capabilities import registry, tool_schema  # noqa: E402
 
 
 def test_snapshot_joins_signal_list_and_wraps(monkeypatch):
@@ -44,3 +45,63 @@ def test_snapshot_caps_large_signal_list(monkeypatch):
                         lambda store, *, signals_raw: {"ok": True, "items": list(range(1000))})
     r = cap_perc.snapshot("STORE", params={})
     assert r.ok is True and len(r.data["items"]) == 50
+
+
+def test_glance_wraps_internal_payload(monkeypatch):
+    """The internal glance facade exposes only the payload body to callers."""
+    seen = {}
+
+    def fake(store, *, days_raw):
+        seen.update(store=store, days_raw=days_raw)
+        return {"ok": True, "glance": {"weather": {"available": True}}}
+
+    monkeypatch.setattr(perception_core, "perception_glance_payload", fake)
+
+    result = cap_perc.glance("STORE", params={"days": 30})
+
+    assert result.ok is True
+    assert result.data == {"glance": {"weather": {"available": True}}}
+    assert seen == {"store": "STORE", "days_raw": 30}
+
+
+def test_perception_glance_is_internal_not_model_callable():
+    """Registry-only actions must not become callable by the model."""
+    assert "perception_glance" in registry.CAPABILITIES
+    assert "perception_glance" not in {spec.name for spec in tool_schema.build_tool_specs()}
+
+
+def test_glance_payload_projects_permission_gated_signals(monkeypatch):
+    """Disabled signals from the authorized snapshot cannot surface in a glance."""
+    monkeypatch.setattr(perception_core, "agent_perception_payload", lambda store, *, signals_raw: {
+        "ok": True,
+        "signals": {
+            "steps": {"disabled": True, "reason": "switch_off"},
+            "weather": {"temperature": 22.0},
+        },
+    })
+    monkeypatch.setattr(perception_core.perception_store, "list_perception_daily",
+                        lambda uid, signal, days: [])
+
+    result = perception_core.perception_glance_payload(
+        type("S", (), {"user_id": "u"})(), days_raw="30")
+
+    assert result == {
+        "ok": True,
+        "glance": {"weather": {"available": True, "notable_change": False}},
+    }
+
+
+def test_glance_payload_reuses_existing_notable_changes(monkeypatch):
+    """The glance maps the shared health-history change signal to health."""
+    monkeypatch.setattr(perception_core, "agent_perception_payload", lambda store, *, signals_raw: {
+        "ok": True, "signals": {"steps": {"step_count": 10}}
+    })
+    monkeypatch.setattr(perception_core.perception_store, "list_perception_daily",
+                        lambda uid, signal, days: [{"doc": {}}])
+    monkeypatch.setattr(perception_core.perception_history, "notable_changes",
+                        lambda rows, max_changes: [{"signal": "health_vitals"}])
+
+    result = perception_core.perception_glance_payload(
+        type("S", (), {"user_id": "u"})(), days_raw=None)
+
+    assert result["glance"] == {"health": {"available": True, "notable_change": True}}

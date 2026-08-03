@@ -5,15 +5,16 @@ from capabilities import tool_schema, registry
 from provider_types import ToolSpec
 
 
-def test_catalog_covers_capabilities_plus_synthetic_tools_minus_internal_reads():
+def test_catalog_covers_capabilities_plus_synthetic_tools_minus_internal_actions():
     specs = tool_schema.build_tool_specs()
     names = {s.name for s in specs}
     assert "reply" in names
     assert "task" in names
     assert "chat_image_read" not in names   # BUG-1 mitigation
     assert "chat_file_read" not in names    # internal-only, never offered to the model
+    assert "perception_glance" not in names  # proactive-runtime only
     for cap in registry.CAPABILITIES:
-        if cap in ("chat_image_read", "chat_file_read"):
+        if cap in ("chat_image_read", "chat_file_read", "perception_glance"):
             continue
         assert cap in names, f"missing tool: {cap}"
     assert all(isinstance(s, ToolSpec) for s in specs)

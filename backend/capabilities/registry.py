@@ -19,6 +19,7 @@ CAPABILITIES: dict[str, Callable[..., CapabilityResult]] = {
     "perception_snapshot": lambda store, **kw: perception.snapshot(store, **kw),
     "perception_trend": lambda store, **kw: perception.trend(store, **kw),
     "perception_history": lambda store, **kw: perception.history(store, **kw),
+    "perception_glance": lambda store, **kw: perception.glance(store, **kw),
     "screen_recent": lambda store, **kw: screen.recent(store, **kw),
     "screen_read": lambda store, **kw: screen.read(store, **kw),
     "photo_recent": lambda store, **kw: photo.recent(store, **kw),

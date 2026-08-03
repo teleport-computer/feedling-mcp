@@ -1,8 +1,8 @@
 """Tool-schema catalog (Plan C, Task 3 / C1).
 
 Derives one `ToolSpec` per model-facing capability in `capabilities.registry.CAPABILITIES`
-(everything except the internal-only `chat_image_read` and `chat_file_read`, which have
-no model-facing schema) plus the runtime-native `task`, `reply`, and
+(everything except the internal-only `chat_image_read`, `chat_file_read`, and
+`perception_glance`, which have no model-facing schema) plus the runtime-native `task`, `reply`, and
 `provider_usage` tools.  The unified tool loop handles these specially instead
 of dispatching them through the capability executor. `provider_usage` is
 chat-lane only — it is deliberately absent from `worker._SUBAGENT_ALLOWED_TOOLS`
@@ -25,7 +25,7 @@ FILE_REPLY_TOOL = "send_file"
 TASK_TOOL = "task"
 PROVIDER_USAGE_TOOL = "provider_usage"
 
-_EXCLUDED = frozenset({"chat_image_read", "chat_file_read"})
+_EXCLUDED = frozenset({"chat_image_read", "chat_file_read", "perception_glance"})
 
 _STR = {"type": "string"}
 _INT = {"type": "integer"}

@@ -28,6 +28,7 @@ from perception.agent_fields import (
     FAST_AGENT_PERCEPTION_SIGNALS,
     project_signal,
 )
+from perception.glance import build_perception_glance
 
 
 class AgentRouteError(Exception):
@@ -208,6 +209,30 @@ def perception_history_payload(store, *, signal_raw: str | None, days_raw: str |
     days = _parse_days(days_raw, "14")
     rows = perception_store.list_perception_daily(store.user_id, sig, days)
     return {"ok": True, "signal": sig, "days": days, "daily": rows}
+
+
+def perception_glance_payload(store, *, days_raw: str | None) -> dict[str, Any]:
+    """Permission-aware, number-free perception overview for proactive runtime use."""
+    days = _parse_days(days_raw, "30")
+    snapshot = agent_perception_payload(
+        store,
+        signals_raw=",".join(AGENT_PERCEPTION_SIGNALS),
+    )
+    rows_by_signal = {
+        signal: perception_store.list_perception_daily(store.user_id, signal, days)
+        for signal in perception_history.comparable_signals()
+    }
+    changes = perception_history.notable_changes(
+        rows_by_signal,
+        max_changes=_digest_notable_max(),
+    )
+    return {
+        "ok": True,
+        "glance": build_perception_glance(
+            snapshot.get("signals") if isinstance(snapshot.get("signals"), Mapping) else {},
+            notable_changes=changes,
+        ),
+    }
 
 
 def perception_digest_payload(store, *, days_raw: str | None) -> dict[str, Any]:
