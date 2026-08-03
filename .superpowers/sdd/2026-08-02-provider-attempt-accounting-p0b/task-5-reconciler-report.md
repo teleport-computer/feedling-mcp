@@ -49,9 +49,38 @@ throwaway local PostgreSQL test database on `127.0.0.1:55432`.
   `test_provider_attempt_rollup_reconciler.py`,
   `test_provider_attempt_rollup_migration.py`,
   `test_provider_attempt_recorder.py`,
-  `test_v2_usage_rollup.py`, and `test_v2_serve_worker.py` — **148 passed**.
-- New reconciler file — **15 passed**.
+  `test_v2_usage_rollup.py`, and `test_v2_serve_worker.py` — **153 passed**.
+- Reconciler file — **18 passed**; 0077 migration file — **12 passed**.
 - Ruff passed for the reconciler, migration, and tests; the changed worker file
   passed with its pre-existing module-path `E402` and unrelated `F401` baseline
   exclusions.
 - `py_compile` and `git diff --check` passed.
+
+## Independent-review fix round
+
+The first independent review found that the source-row limit was applied once
+per stream, stale-start lookup lacked a selective index, and the fixed
+five-minute cadence could fall behind sustained writers. The fix round adds:
+
+- one hard global source-row budget (default 6,000) shared by attempt,
+  correction, turn, and rate-card streams; the three main streams receive a
+  reserved fair first quota, and unused quota is reclaimed only in a bounded
+  second pass;
+- a test observer proving total fetched and advanced source rows remain within
+  the configured budget, correction/turn cursors advance under continuous
+  attempt backlog, and same-day rows can consume the independent row budget
+  without consuming extra dirty-day capacity;
+- safe per-stream backlog booleans, maximum source lag seconds, and a dirty-work
+  signal in tick results; successful pending work uses a bounded five-second
+  catch-up delay, while errors keep the normal cadence and cannot tight-loop;
+- a deterministic 2,101-row attempt fixture (more than the old 2,000 rows per
+  300-second cadence, or 6.7 rows/second) that the new default page catches up
+  in one tick; and
+- exact recoverable concurrent partial index
+  `ix_llm_provider_attempts_stale_started` on `(started_at,attempt_id)` for the
+  canonical started-only predicate. Migration tests cover exact validity,
+  same-relation wrong-definition repair, unrelated-owner downgrade refusal, and
+  an `EXPLAIN (ANALYZE, BUFFERS)` plan using the partial index.
+
+The second pooled connection used by the day builder remains intentionally
+unchanged for the final load proof, per review scope.

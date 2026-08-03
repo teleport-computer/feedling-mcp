@@ -250,6 +250,11 @@ _CONCURRENT_INDEXES = {
         "CREATE INDEX CONCURRENTLY ix_llm_provider_attempts_updated_id "
         "ON public.llm_provider_attempts (updated_at,attempt_id) INCLUDE (job_id) "
         "WHERE source='runtime_recorder'",
+    "ix_llm_provider_attempts_stale_started":
+        "CREATE INDEX CONCURRENTLY ix_llm_provider_attempts_stale_started "
+        "ON public.llm_provider_attempts (started_at,attempt_id) "
+        "WHERE source='runtime_recorder' AND state='started' "
+        "AND finished_at IS NULL AND possibly_billed=false",
     "ix_llm_rate_cards_created_identity":
         "CREATE INDEX CONCURRENTLY ix_llm_rate_cards_created_identity "
         "ON public.llm_rate_cards (created_at,provider,model,version) INCLUDE (effective_at)",
@@ -284,6 +289,13 @@ _INDEX_TARGETS = {
         ("updated_at", "attempt_id"),
         ("job_id",),
         "source = 'runtime_recorder'::text",
+    ),
+    "ix_llm_provider_attempts_stale_started": (
+        "llm_provider_attempts",
+        ("started_at", "attempt_id"),
+        (),
+        "source = 'runtime_recorder'::text AND state = 'started'::text "
+        "AND finished_at IS NULL AND possibly_billed = false",
     ),
     "ix_llm_rate_cards_created_identity": (
         "llm_rate_cards",

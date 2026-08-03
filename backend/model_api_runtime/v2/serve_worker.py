@@ -4184,6 +4184,22 @@ def _run_reporting_maintenance_tick(*, cancel_event: threading.Event) -> dict:
     return outcomes
 
 
+def _reporting_maintenance_delay(results: dict, cadence: float) -> float:
+    """Use a bounded catch-up cadence only for successful pending work."""
+
+    for result in results.values():
+        if result.get("status") != "ok":
+            continue
+        backlog = result.get("source_backlog") or {}
+        if (
+            not result.get("bootstrap_complete", True)
+            or result.get("dirty_pending", False)
+            or any(bool(value) for value in backlog.values())
+        ):
+            return min(cadence, 5.0)
+    return cadence
+
+
 async def _usage_rollup_loop(
     stop_event: asyncio.Event, *, interval: float | None = None
 ) -> None:
@@ -4197,6 +4213,7 @@ async def _usage_rollup_loop(
 
     cadence = _usage_rollup_interval_seconds() if interval is None else interval
     while not stop_event.is_set():
+        next_delay = cadence
         if usage_rollup.enabled() or provider_attempt_rollup.enabled():
             cancel_event = threading.Event()
             tick_task: asyncio.Task | None = None
@@ -4224,6 +4241,7 @@ async def _usage_rollup_loop(
                         )
                     break
                 results = tick_task.result()
+                next_delay = _reporting_maintenance_delay(results, cadence)
                 for name, result in results.items():
                     if result.get("days_refreshed"):
                         log.info(
@@ -4260,7 +4278,7 @@ async def _usage_rollup_loop(
                 if stop_task is not None:
                     await asyncio.gather(stop_task, return_exceptions=True)
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=cadence)
+            await asyncio.wait_for(stop_event.wait(), timeout=next_delay)
         except asyncio.TimeoutError:
             pass
 

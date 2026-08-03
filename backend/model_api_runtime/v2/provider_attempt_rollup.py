@@ -26,7 +26,7 @@ ADVISORY_LOCK_KEY = 0x4656324154540001
 DEFAULT_STATEMENT_TIMEOUT_MS = 15_000
 DEFAULT_POOL_TIMEOUT_SECONDS = 0.5
 DEFAULT_MAX_DAYS = 2
-DEFAULT_MAX_CHANGED_ROWS = 2_000
+DEFAULT_MAX_CHANGED_ROWS = 6_000
 DEFAULT_MAX_DIRTY_DAYS = 400
 DEFAULT_MAX_STALE_ROWS = 500
 DEFAULT_STALE_AFTER_SECONDS = 900.0
@@ -79,6 +79,14 @@ def _rollup_sql_observer(*, section: str, statement: str, params: tuple) -> None
     """Optional test/performance seam; production deliberately does nothing."""
 
     del section, statement, params
+
+
+def _reconciler_source_observer(
+    *, stream: str, fetched: int, advanced: int, limit: int, pending: bool
+) -> None:
+    """Optional test/load seam; production deliberately does nothing."""
+
+    del stream, fetched, advanced, limit, pending
 
 
 def _local_day_bounds(local_day: date) -> tuple[datetime, datetime]:
@@ -562,17 +570,29 @@ def _discover_changes(
 ) -> dict:
     """Discover four source streams; every cursor commits with its dirty rows."""
 
-    limit = max_changed_rows
     with conn.transaction():
         with conn.cursor(row_factory=dict_row) as cur:
             _set_transaction(cur, timeout_ms)
             state = _watermark_on_cursor(cur, for_update=True)
             generation = int(state["replay_generation"])
             dirty: set[date] = set()
+            attempt_at = state["attempt_updated_at"]
+            attempt_id = state["attempt_updated_id"]
+            correction_id = int(state["late_correction_id"])
+            turn_at = state["turn_metric_updated_at"]
+            turn_id = int(state["turn_metric_id"])
+            rate_cursor = (
+                state["rate_card_created_at"],
+                state["rate_card_provider"],
+                state["rate_card_model"],
+                state["rate_card_version"],
+            )
+            replay_requested = False
 
             def consume(rows: list[dict]) -> list[dict]:
                 """Take only the cursor prefix whose new days fit this tick."""
 
+                nonlocal replay_requested
                 accepted: list[dict] = []
                 for row in rows:
                     local_day = row["local_day"]
@@ -581,49 +601,68 @@ def _discover_changes(
                         and local_day not in dirty
                         and len(dirty) >= max_dirty_days
                     ):
-                        break
+                        # No per-stream cursor contains a day subcursor. Switch
+                        # to the bounded replay generation so this source may
+                        # advance without losing the omitted day or starving a
+                        # later stream behind perpetual earlier-stream writes.
+                        replay_requested = True
                     accepted.append(row)
-                    if local_day is not None:
+                    if local_day is not None and len(dirty) < max_dirty_days:
                         dirty.add(local_day)
                 return accepted
 
-            cur.execute(
-                "SELECT a.updated_at,a.attempt_id,"
-                "(m.created_at AT TIME ZONE 'Asia/Shanghai')::date AS local_day "
-                "FROM llm_provider_attempts a LEFT JOIN v2_turn_metrics m ON m.job_id=a.job_id "
-                "WHERE a.source='runtime_recorder' AND (a.updated_at,a.attempt_id)>(%s,%s) "
-                "ORDER BY a.updated_at,a.attempt_id LIMIT %s",
-                (state["attempt_updated_at"], state["attempt_updated_id"], limit),
-            )
-            attempts = consume(cur.fetchall())
-            attempt_at = attempts[-1]["updated_at"] if attempts else state["attempt_updated_at"]
-            attempt_id = attempts[-1]["attempt_id"] if attempts else state["attempt_updated_id"]
+            def fetch_stream(stream: str, limit: int) -> tuple[int, bool]:
+                nonlocal attempt_at, attempt_id, correction_id, turn_at, turn_id
+                if limit <= 0:
+                    return 0, False
+                if stream == "attempt":
+                    cur.execute(
+                        "SELECT a.updated_at,a.attempt_id,"
+                        "(m.created_at AT TIME ZONE 'Asia/Shanghai')::date AS local_day "
+                        "FROM llm_provider_attempts a LEFT JOIN v2_turn_metrics m "
+                        "ON m.job_id=a.job_id WHERE a.source='runtime_recorder' "
+                        "AND (a.updated_at,a.attempt_id)>(%s,%s) "
+                        "ORDER BY a.updated_at,a.attempt_id LIMIT %s",
+                        (attempt_at, attempt_id, limit),
+                    )
+                elif stream == "correction":
+                    cur.execute(
+                        "SELECT c.id,(m.created_at AT TIME ZONE 'Asia/Shanghai')::date "
+                        "AS local_day FROM llm_provider_attempt_corrections c "
+                        "JOIN llm_provider_attempts a ON a.attempt_id=c.attempt_id "
+                        "LEFT JOIN v2_turn_metrics m ON m.job_id=a.job_id "
+                        "WHERE c.id>%s ORDER BY c.id LIMIT %s",
+                        (correction_id, limit),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT updated_at,id,"
+                        "(created_at AT TIME ZONE 'Asia/Shanghai')::date AS local_day "
+                        "FROM v2_turn_metrics WHERE (updated_at,id)>(%s,%s) "
+                        "ORDER BY updated_at,id LIMIT %s",
+                        (turn_at, turn_id, limit),
+                    )
+                rows = cur.fetchall()
+                accepted = consume(rows)
+                if accepted:
+                    last = accepted[-1]
+                    if stream == "attempt":
+                        attempt_at, attempt_id = last["updated_at"], last["attempt_id"]
+                    elif stream == "correction":
+                        correction_id = int(last["id"])
+                    else:
+                        turn_at, turn_id = last["updated_at"], int(last["id"])
+                pending = len(rows) == limit or len(accepted) < len(rows)
+                _reconciler_source_observer(
+                    stream=stream,
+                    fetched=len(rows),
+                    advanced=len(accepted),
+                    limit=limit,
+                    pending=pending,
+                )
+                return len(rows), pending
 
-            cur.execute(
-                "SELECT c.id,(m.created_at AT TIME ZONE 'Asia/Shanghai')::date AS local_day "
-                "FROM llm_provider_attempt_corrections c "
-                "JOIN llm_provider_attempts a ON a.attempt_id=c.attempt_id "
-                "LEFT JOIN v2_turn_metrics m ON m.job_id=a.job_id "
-                "WHERE c.id>%s ORDER BY c.id LIMIT %s",
-                (state["late_correction_id"], limit),
-            )
-            corrections = consume(cur.fetchall())
-            correction_id = int(corrections[-1]["id"]) if corrections else int(state["late_correction_id"])
-
-            cur.execute(
-                "SELECT updated_at,id,(created_at AT TIME ZONE 'Asia/Shanghai')::date AS local_day "
-                "FROM v2_turn_metrics WHERE (updated_at,id)>(%s,%s) "
-                "ORDER BY updated_at,id LIMIT %s",
-                (state["turn_metric_updated_at"], state["turn_metric_id"], limit),
-            )
-            turns = consume(cur.fetchall())
-            turn_at = turns[-1]["updated_at"] if turns else state["turn_metric_updated_at"]
-            turn_id = int(turns[-1]["id"]) if turns else int(state["turn_metric_id"])
-
-            rate_cursor = (
-                state["rate_card_created_at"], state["rate_card_provider"],
-                state["rate_card_model"], state["rate_card_version"],
-            )
+            # Rate cards consume one row from the same hard global budget.
             cur.execute(
                 "SELECT created_at,provider,model,version,effective_at FROM llm_rate_cards "
                 "WHERE (created_at,provider,model,version)>(%s,%s,%s,%s) "
@@ -631,7 +670,40 @@ def _discover_changes(
                 rate_cursor,
             )
             rate = cur.fetchone()
-            replay_requested = False
+            rate_rows = int(rate is not None)
+            _reconciler_source_observer(
+                stream="rate_card",
+                fetched=rate_rows,
+                advanced=rate_rows,
+                limit=1,
+                pending=rate is not None,
+            )
+
+            main_budget = max_changed_rows - rate_rows
+            base, remainder = divmod(main_budget, 3)
+            quotas = {
+                stream: base + int(index < remainder)
+                for index, stream in enumerate(("attempt", "correction", "turn"))
+            }
+            pending_streams: list[str] = []
+            unused = 0
+            for stream in ("attempt", "correction", "turn"):
+                fetched, pending = fetch_stream(stream, quotas[stream])
+                unused += quotas[stream] - fetched
+                if pending:
+                    pending_streams.append(stream)
+            # Reclaim unused reserved quota only after every main stream had a
+            # fair first page. A bounded second pass cannot exceed the same
+            # max_changed_rows hard cap.
+            while unused > 0 and pending_streams:
+                stream = pending_streams.pop(0)
+                fetched, pending = fetch_stream(stream, unused)
+                unused -= fetched
+                if pending and fetched > 0:
+                    pending_streams.append(stream)
+                if fetched == 0:
+                    break
+
             if rate is not None:
                 remaining = max_dirty_days - len(dirty)
                 cur.execute(
@@ -687,7 +759,47 @@ def _discover_changes(
             updated = cur.fetchone()
             if updated is None:
                 raise _CASConflict("attempt source cursor changed")
-            return updated
+            result = dict(updated)
+            pending_times: dict[str, datetime | None] = {}
+            cur.execute(
+                "SELECT updated_at FROM llm_provider_attempts "
+                "WHERE source='runtime_recorder' AND (updated_at,attempt_id)>(%s,%s) "
+                "ORDER BY updated_at,attempt_id LIMIT 1",
+                (attempt_at, attempt_id),
+            )
+            row = cur.fetchone()
+            pending_times["attempt"] = row["updated_at"] if row else None
+            cur.execute(
+                "SELECT created_at FROM llm_provider_attempt_corrections "
+                "WHERE id>%s ORDER BY id LIMIT 1", (correction_id,),
+            )
+            row = cur.fetchone()
+            pending_times["correction"] = row["created_at"] if row else None
+            cur.execute(
+                "SELECT updated_at FROM v2_turn_metrics WHERE (updated_at,id)>(%s,%s) "
+                "ORDER BY updated_at,id LIMIT 1", (turn_at, turn_id),
+            )
+            row = cur.fetchone()
+            pending_times["turn"] = row["updated_at"] if row else None
+            cur.execute(
+                "SELECT created_at FROM llm_rate_cards "
+                "WHERE (created_at,provider,model,version)>(%s,%s,%s,%s) "
+                "ORDER BY created_at,provider,model,version LIMIT 1", rate_cursor,
+            )
+            row = cur.fetchone()
+            pending_times["rate_card"] = row["created_at"] if row else None
+            result["_source_backlog"] = {
+                stream: value is not None for stream, value in pending_times.items()
+            }
+            result["_source_lag_seconds"] = max(
+                (
+                    max((now_utc - value).total_seconds(), 0.0)
+                    for value in pending_times.values()
+                    if value is not None
+                ),
+                default=0.0,
+            )
+            return result
 
 
 def _reconcile_stale_started(
@@ -756,6 +868,16 @@ def _tick_result(status: str, refreshed: list[str], state: dict | None = None, *
             bootstrap_complete=bool(state["bootstrap_complete"]),
             replay_generation=int(state["replay_generation"]),
             completed_through_day=state["completed_through_day"],
+            source_backlog=state.get(
+                "_source_backlog",
+                {
+                    "attempt": False,
+                    "correction": False,
+                    "turn": False,
+                    "rate_card": False,
+                },
+            ),
+            source_lag_seconds=float(state.get("_source_lag_seconds", 0.0)),
         )
     return result
 
@@ -778,7 +900,7 @@ def run_maintenance_tick(
         return {"status": "disabled", "days_refreshed": 0}
     days_limit = _bounded_int(max_days, DEFAULT_MAX_DAYS, minimum=0, maximum=31)
     changed_limit = _bounded_int(
-        max_changed_rows, DEFAULT_MAX_CHANGED_ROWS, minimum=1, maximum=100_000
+        max_changed_rows, DEFAULT_MAX_CHANGED_ROWS, minimum=4, maximum=100_000
     )
     dirty_limit = _bounded_int(
         max_dirty_days, DEFAULT_MAX_DIRTY_DAYS, minimum=1, maximum=2_000
@@ -854,13 +976,27 @@ def run_maintenance_tick(
                         expected_generation=int(row[1]),
                     )
                     if outcome.get("status") != "ok":
+                        dirty_pending = bool(
+                            conn.execute(
+                                "SELECT EXISTS (SELECT 1 FROM llm_usage_rollup_dirty_days "
+                                "WHERE rollup_name=%s)", (ROLLUP_NAME,),
+                            ).fetchone()[0]
+                        )
                         return _tick_result(
                             "error", refreshed, state, stale_reconciled=stale_count,
+                            dirty_pending=dirty_pending,
                             error=outcome.get("error", "RollupBuildError"),
                         )
                     refreshed.append(row[0].isoformat())
+                dirty_pending = bool(
+                    conn.execute(
+                        "SELECT EXISTS (SELECT 1 FROM llm_usage_rollup_dirty_days "
+                        "WHERE rollup_name=%s)", (ROLLUP_NAME,),
+                    ).fetchone()[0]
+                )
                 return _tick_result(
-                    "ok", refreshed, state, stale_reconciled=stale_count
+                    "ok", refreshed, state, stale_reconciled=stale_count,
+                    dirty_pending=dirty_pending,
                 )
             finally:
                 try:

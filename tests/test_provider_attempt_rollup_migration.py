@@ -336,6 +336,86 @@ def test_0077_concurrent_indexes_have_exact_recoverable_shapes():
             ).fetchone() == (True,)
 
 
+def test_0077_stale_started_partial_index_is_exact_and_query_uses_it():
+    migration = _migration_module()
+    name = "ix_llm_provider_attempts_stale_started"
+    assert name in migration._CONCURRENT_INDEXES
+    with db.get_pool().connection() as conn:
+        assert migration._index_validity(name, conn) is True
+    uid = "u_attempt_stale_index"
+    _seed_user(uid)
+    try:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO llm_provider_attempts (attempt_id,user_id,lane,call_id,"
+                "outer_attempt_ordinal,inner_attempt_ordinal,retry_kind,requested_provider,"
+                "resolved_provider,requested_model,resolved_model,transport,started_at,state,"
+                "outcome,error_class,source,completeness,revision) "
+                "SELECT '00000000-0000-5000-8000-'||lpad(to_hex(n),12,'0'),%s,'chat',"
+                "'stale-call-'||n,1,1,'initial','asked','served','asked-model','served-model',"
+                "'responses',now()-interval '2 hours'-(n*interval '1 second'),'started',"
+                "'unknown','none','runtime_recorder','started_only',0 "
+                "FROM generate_series(1,3000) n",
+                (uid,),
+            )
+            conn.execute("ANALYZE llm_provider_attempts")
+            plan = conn.execute(
+                "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) "
+                "SELECT attempt_id FROM llm_provider_attempts "
+                "WHERE source='runtime_recorder' AND state='started' "
+                "AND finished_at IS NULL AND possibly_billed=false "
+                "AND started_at<now()-interval '60 seconds' "
+                "ORDER BY started_at,attempt_id LIMIT 10"
+            ).fetchone()[0][0]
+
+        def nodes(node):
+            yield node
+            for child in node.get("Plans", []):
+                yield from nodes(child)
+
+        assert any(
+            node.get("Index Name") == name for node in nodes(plan["Plan"])
+        )
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
+def test_0077_repairs_wrong_stale_index_and_refuses_unrelated_owner():
+    cfg = _alembic_config()
+    name = "ix_llm_provider_attempts_stale_started"
+    try:
+        command.downgrade(cfg, "0076_llm_provider_attempts")
+        migration = _migration_module()
+        with db.get_pool().connection() as conn:
+            conn.execute(migration._SCHEMA_UP)
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(
+                f"CREATE INDEX CONCURRENTLY {name} ON llm_provider_attempts (call_id)"
+            )
+        command.upgrade(cfg, "head")
+        with db.get_pool().connection() as conn:
+            assert _migration_module()._index_validity(name, conn) is True
+
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(f"DROP INDEX CONCURRENTLY public.{name}")
+            conn.execute(f"CREATE INDEX CONCURRENTLY {name} ON public.users (user_id)")
+        with pytest.raises(RuntimeError, match="another relation"):
+            command.downgrade(cfg, "0076_llm_provider_attempts")
+        with db.get_pool().connection() as conn:
+            assert conn.execute(
+                "SELECT tbl.relname FROM pg_class idx "
+                "JOIN pg_index pi ON pi.indexrelid=idx.oid "
+                "JOIN pg_class tbl ON tbl.oid=pi.indrelid "
+                "WHERE idx.relname=%s", (name,),
+            ).fetchone() == ("users",)
+    finally:
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS public.{name}")
+        command.downgrade(cfg, "0076_llm_provider_attempts")
+        command.upgrade(cfg, "head")
+
+
 def test_0077_schema_phase_restart_does_not_create_surrogate_sequences():
     """Replaying the committed schema phase must preserve natural-grain storage."""
     migration = _migration_module()

@@ -282,7 +282,7 @@ def test_discovery_enforces_one_global_dirty_day_budget_across_all_four_streams(
 
 
 def test_same_day_rows_advance_the_source_row_budget_not_the_dirty_day_budget():
-    seeded = [_seed_turn_attempt(local_day=date(2026, 8, 1)) for _ in range(3)]
+    seeded = [_seed_turn_attempt(local_day=date(2026, 8, 1)) for _ in range(4)]
     provider_attempt_rollup.run_maintenance_tick(max_days=10)
     with db.get_pool().connection() as conn:
         for _uid, _job, attempt_id in seeded:
@@ -294,9 +294,17 @@ def test_same_day_rows_advance_the_source_row_budget_not_the_dirty_day_budget():
             "SELECT attempt_id FROM llm_provider_attempts "
             "ORDER BY updated_at DESC,attempt_id DESC LIMIT 1"
         ).fetchone()[0]
-    result = provider_attempt_rollup.run_maintenance_tick(
-        max_days=0, max_changed_rows=3, max_dirty_days=1
+    observed = []
+    original = provider_attempt_rollup._reconciler_source_observer
+    provider_attempt_rollup._reconciler_source_observer = (
+        lambda **item: observed.append(item)
     )
+    try:
+        result = provider_attempt_rollup.run_maintenance_tick(
+            max_days=0, max_changed_rows=4, max_dirty_days=1
+        )
+    finally:
+        provider_attempt_rollup._reconciler_source_observer = original
     assert result["status"] == "ok"
     with db.get_pool().connection() as conn:
         actual = conn.execute(
@@ -304,6 +312,114 @@ def test_same_day_rows_advance_the_source_row_budget_not_the_dirty_day_budget():
             "WHERE rollup_name=%s", (ROLLUP_NAME,),
         ).fetchone()[0]
     assert actual == expected
+    assert sum(item["fetched"] for item in observed) <= 4
+    assert sum(item["advanced"] for item in observed) <= 4
+
+
+def test_global_source_budget_reserves_fair_progress_under_attempt_backlog(monkeypatch):
+    seeded = [_seed_turn_attempt(local_day=date(2026, 7, 20) + timedelta(days=i)) for i in range(3)]
+    attempt_backlog = [seeded[0]] + [
+        _seed_turn_attempt(local_day=date(2026, 7, 20)) for _ in range(7)
+    ]
+    provider_attempt_rollup.run_maintenance_tick(max_days=10)
+    with db.get_pool().connection() as conn:
+        # Attempt remains continuously backlogged while the two later streams
+        # each have one row that must still advance this tick.
+        for _uid, _job, attempt_id in attempt_backlog:
+            conn.execute(
+                "UPDATE llm_provider_attempts SET updated_at=clock_timestamp() "
+                "WHERE attempt_id=%s", (attempt_id,),
+            )
+        conn.execute(
+            "INSERT INTO llm_provider_attempt_corrections "
+            "(attempt_id,user_id,revision,reason_code,input_tokens_delta) "
+            "VALUES (%s,%s,2,'late_usage',1)", (seeded[1][2], seeded[1][0]),
+        )
+        correction_head = conn.execute(
+            "SELECT max(id) FROM llm_provider_attempt_corrections"
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE v2_turn_metrics SET status='fair',updated_at=clock_timestamp() "
+            "WHERE job_id=%s", (seeded[2][1],),
+        )
+        turn_head = conn.execute(
+            "SELECT id FROM v2_turn_metrics WHERE job_id=%s", (seeded[2][1],)
+        ).fetchone()[0]
+    observed = []
+    monkeypatch.setattr(
+        provider_attempt_rollup,
+        "_reconciler_source_observer",
+        lambda **item: observed.append(item),
+    )
+    result = provider_attempt_rollup.run_maintenance_tick(
+        max_days=0, max_changed_rows=4, max_dirty_days=1
+    )
+    assert result["status"] == "ok"
+    assert sum(item["fetched"] for item in observed) <= 4
+    assert sum(item["advanced"] for item in observed) <= 4
+    with db.get_pool().connection() as conn:
+        state = conn.execute(
+            "SELECT late_correction_id,turn_metric_id FROM llm_usage_rollup_watermarks "
+            "WHERE rollup_name=%s", (ROLLUP_NAME,),
+        ).fetchone()
+    assert state == (correction_head, turn_head)
+
+
+def test_tick_exposes_safe_backlog_lag_and_default_budget_catches_old_overload(monkeypatch):
+    assert provider_attempt_rollup.DEFAULT_MAX_CHANGED_ROWS == 6_000
+    seeded = [_seed_turn_attempt(local_day=date(2026, 7, 30)) for _ in range(5)]
+    provider_attempt_rollup.run_maintenance_tick(max_days=10)
+    with db.get_pool().connection() as conn:
+        for _uid, _job, attempt_id in seeded:
+            conn.execute(
+                "UPDATE llm_provider_attempts SET updated_at=clock_timestamp() "
+                "WHERE attempt_id=%s", (attempt_id,),
+            )
+    first = provider_attempt_rollup.run_maintenance_tick(
+        max_days=0, max_changed_rows=4, max_dirty_days=1
+    )
+    assert first["source_backlog"]["attempt"] is True
+    assert first["source_lag_seconds"] >= 0
+    second = provider_attempt_rollup.run_maintenance_tick(
+        max_days=0, max_changed_rows=4, max_dirty_days=1
+    )
+    assert second["source_backlog"]["attempt"] is False
+    results = {"attempt": {**second, "dirty_pending": False}}
+    assert serve_worker._reporting_maintenance_delay(results, 300.0) == 300.0
+    results["attempt"]["source_backlog"]["attempt"] = True
+    assert serve_worker._reporting_maintenance_delay(results, 300.0) == 5.0
+    results["attempt"]["status"] = "error"
+    assert serve_worker._reporting_maintenance_delay(results, 300.0) == 300.0
+
+
+def test_default_page_catches_writer_rate_above_old_2000_per_cadence_limit():
+    user_id, job_id, _attempt = _seed_turn_attempt(local_day=date(2026, 7, 29))
+    provider_attempt_rollup.run_maintenance_tick(max_days=10)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO llm_provider_attempts (attempt_id,user_id,lane,job_id,call_id,"
+            "outer_attempt_ordinal,inner_attempt_ordinal,retry_kind,requested_provider,"
+            "resolved_provider,requested_model,resolved_model,transport,started_at,state,"
+            "outcome,error_class,source,completeness,revision,updated_at) "
+            "SELECT '10000000-0000-5000-8000-'||lpad(to_hex(n),12,'0'),%s,'chat',%s,"
+            "'writer-call-'||n,1,1,'initial','asked','served','asked-model','served-model',"
+            "'responses',now()-interval '1 minute','completed','succeeded','none',"
+            "'runtime_recorder','complete',1,clock_timestamp() "
+            "FROM generate_series(1,2101) n",
+            (user_id, job_id),
+        )
+        head = conn.execute(
+            "SELECT attempt_id FROM llm_provider_attempts "
+            "ORDER BY updated_at DESC,attempt_id DESC LIMIT 1"
+        ).fetchone()[0]
+    result = provider_attempt_rollup.run_maintenance_tick(max_days=0, max_dirty_days=1)
+    assert result["status"] == "ok"
+    assert result["source_backlog"]["attempt"] is False
+    with db.get_pool().connection() as conn:
+        assert conn.execute(
+            "SELECT attempt_updated_id FROM llm_usage_rollup_watermarks "
+            "WHERE rollup_name=%s", (ROLLUP_NAME,),
+        ).fetchone()[0] == head
 
 
 def test_cancel_after_stale_phase_does_not_start_bootstrap(monkeypatch):
