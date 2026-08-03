@@ -35,7 +35,10 @@ TEST_ENCLAVE = os.environ.get(
 )
 # Test-family hosts only. pre-api is the Runtime V2 qualification target
 # (2026-07-21); prod stays out → any provisioning against it is refused.
-_ALLOWED_HOSTS = ("test-api.feedling.app", "pre-api.feedling.app")
+# 本机目标(serve_dev + dev enclave)用于**合并前**在分支上真跑一遍 —— 2026-08-04
+# 这样抓出了四个单测发现不了的问题。回环地址不可能是 prod,放行是安全的。
+_ALLOWED_HOSTS = ("test-api.feedling.app", "pre-api.feedling.app",
+                  "127.0.0.1", "localhost")
 # Credentials of not-yet-torn-down accounts (leak manifest; see provision()).
 _ORPHANS_DIR = Path.home() / ".feedling-e2e-orphans"
 

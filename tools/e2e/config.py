@@ -59,6 +59,10 @@ HOSTED_CELLS: list[HostedCell] = [
                [], base_url_env="E2E_RELAY_BASE"),   # models from E2E_RELAY_MODEL
     HostedCell("deepseek-official", "deepseek", "E2E_KEY_DEEPSEEK",
                ["deepseek-chat"]),
+    # 第二个中转站:不同中转站的 /models 目录格式差异很大(带日期后缀 /
+    # 带方括号标签 / 裸名),推荐链路(§2-10)必须都能匹配 —— 只测一个不够。
+    HostedCell("hojimi-relay", "openai_compatible", "E2E_KEY_HOJIMI",
+               ["claude-haiku-4-5-20251001"], base_url_env="E2E_HOJIMI_BASE"),
 ]
 
 
