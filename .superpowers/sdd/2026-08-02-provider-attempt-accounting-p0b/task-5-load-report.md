@@ -323,3 +323,35 @@ resume or 3M cleanup was run.
 
 Fresh final verification for the unified order passed 233 focused tests plus
 Ruff, compileall, the harness self-test, and diff-check.
+
+### Single production workflow closure
+
+Review found that `_run` had reproduced the tested state machine instead of
+calling it. The duplicate phase/error/cleanup/business block was removed.
+Production now builds five domain callbacks and calls
+`_execute_scale_workflow` exactly once; that helper is the sole owner of phase
+trace, cleanup status, failure classification, all three zero-count maps,
+business status/result, and terminal phase. A successful complete
+`business_result` contains both pool and commit-bound business evidence, and
+top-level `business_path` is derived from that same object. Failed workflows
+retain `business_result=null` and are atomically rendered by `_run`.
+
+Seven real-entry integration scenarios call `_run`, the real state machine, and
+the real atomic writer with stateful domain callbacks: fresh success, resume
+success, timing failure with cleanup-zero and no producer, cleanup failure with
+no producer, business failure after fixture-zero with a post-count in
+`finally`, invalid resume with cleanup unarmed/no mutation, and read-only
+validation-only. The invalid-resume RED also caught and removed a misleading
+`exact_prevalidated` claim whose `pre` value was null. Fresh preparation still
+arms cleanup immediately before the first seed write, while resume arms only
+after exact prevalidation.
+
+A new real 100-turn/100-attempt non-formal temporary-database probe completed
+the single production state machine. Its terminal phase was complete, business
+status passed, `business_result` contained `pool` and `business`, all three
+twelve-counter maps were zero, and fixture cleanup residuals were zero. Report
+p95 was 27.456ms unfiltered and 22.666ms filtered. The process exited 1 only
+because non-formal evidence cannot pass the formal gate. The temporary database
+was dropped, and a catalog check again showed only the retained 3M database.
+No formal resume or retained-fixture cleanup ran. Fresh focused verification
+passed 240 tests.

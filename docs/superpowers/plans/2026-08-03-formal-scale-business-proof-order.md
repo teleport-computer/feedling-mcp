@@ -224,3 +224,124 @@ git add scripts/perf/admin_usage_scale.py tests/test_admin_usage.py \
 git add -f .superpowers/sdd/2026-08-02-provider-attempt-accounting-p0b/task-5-load-report.md
 git commit -m "fix(perf): run business proof after scale cleanup"
 ```
+
+---
+
+### Task 5: Make the tested workflow the only production orchestrator
+
+**Files:**
+- Modify: `tests/test_admin_usage.py`
+- Modify: `scripts/perf/admin_usage_scale.py`
+
+**Interfaces:**
+- Produces: `_build_scale_workflow_callbacks(context: dict[str, Any]) -> dict[str, Callable[..., Any]]` with `prepare_fixture`, `run_fixture_workload`, `cleanup_fixture`, `collect_database_counts`, and `produce_business`.
+- Production `_run(args) -> int` calls `_execute_scale_workflow(**callbacks)` exactly once for each non-validation run.
+- `_execute_scale_workflow` remains the sole producer of the complete workflow evidence schema, including `business_result`.
+
+- [ ] **Step 1: Add real-entry RED tests**
+
+Create a stateful test runtime around the actual `_run` boundary. Patch only
+the validated local-pool/runtime-loading boundary and the five domain callbacks;
+do not patch `_execute_scale_workflow` or `_write_evidence_atomic`. Each call
+uses a real `tmp_path` output and parses the resulting JSON.
+
+```python
+@pytest.mark.parametrize("resumed", [False, True])
+def test_run_entry_uses_single_workflow_for_fresh_and_resume_happy_path(...):
+    # Assert exit is 1 only because the synthetic/non-formal gate is false,
+    # workflow is complete, business_result has literal pool/business fields,
+    # and the literal event order ends cleanup,count,count,business,count.
+
+def test_run_entry_timing_failure_writes_atomic_cleanup_zero_without_business(...):
+    # workload raises; cleanup changes state to zero; parse failure phase and
+    # prove producer status not_run.
+
+def test_run_entry_cleanup_failure_writes_atomic_failure_without_business(...):
+    # cleanup raises and leaves literal nonzero state; parse cleanup failure.
+
+def test_run_entry_business_failure_starts_after_zero_and_writes_failed_artifact(...):
+    # producer asserts state zero then raises; parse post zero and failed status.
+```
+
+- [ ] **Step 2: Run entry tests and verify RED**
+
+Expected: old production `_run` bypasses the patched callback builder and the
+real helper, so event/artifact expectations fail.
+
+- [ ] **Step 3: Extract callbacks without changing domain behavior**
+
+Move the existing fresh/resume preparation, shared timing/EXPLAIN workload, and
+exact cleanup blocks into the five callback closures returned by
+`_build_scale_workflow_callbacks`. Fresh calls `arm_cleanup()` immediately
+before `_seed_fixture`; resume exact-validates before calling it. The callbacks
+continue mutating the existing top-level evidence dictionaries for source,
+bootstrap, cohort, retention, and cleanup data.
+
+- [ ] **Step 4: Route `_run` through the helper and verify GREEN**
+
+Replace the copied workflow block with:
+
+```python
+callbacks = _build_scale_workflow_callbacks(context)
+workflow = _execute_scale_workflow(**callbacks)
+evidence["workflow"] = workflow
+business_result = workflow.get("business_result")
+evidence["business_path"] = (
+    business_result.get("business") if isinstance(business_result, dict) else None
+)
+```
+
+Evaluate existing gates only after this call and always atomically render the
+artifact. Run the Step 1 tests; expected: pass.
+
+- [ ] **Step 5: Add invalid-resume and validation-only mutation tests**
+
+Call `_run` with the same stateful boundary. For invalid resume, make exact
+validation fail before arming and assert state unchanged, no cleanup, no
+producer, atomic failed JSON, and exit 1. For validation-only, return a healthy
+exact snapshot and assert exit 0 with no seed/workload/cleanup/producer events.
+
+- [ ] **Step 6: Run all seven entry scenarios**
+
+Expected: fresh happy, resume happy, timing failure, cleanup failure, business
+failure, invalid resume, and validation-only all pass without a large fixture.
+
+---
+
+### Task 6: Probe, verification, report, and review-fix commit
+
+**Files:**
+- Modify: `.superpowers/sdd/2026-08-02-provider-attempt-accounting-p0b/task-5-load-report.md`
+- Verify: `scripts/perf/admin_usage_scale.py`
+- Verify: `scripts/perf/provider_attempt_business_path.py`
+- Verify: `tests/test_admin_usage.py`
+- Verify: `tests/test_provider_attempt_business_path.py`
+
+- [ ] **Step 1: Run a fresh 100/100 non-formal temporary-database probe**
+
+Create and migrate an explicitly named local `feedling_usage_scale_*` database,
+run the unified probe, parse complete workflow/business/zero evidence, then
+drop exactly that temporary database. Confirm the retained
+`feedling_usage_scale_task4d` database remains the only scale database.
+
+- [ ] **Step 2: Run focused and static verification**
+
+```bash
+FEEDLING_TEST_PG='postgresql://postgres:test@127.0.0.1:55432/postgres' \
+  .venv-test/bin/python -m pytest \
+  tests/test_provider_attempt_business_path.py tests/test_admin_usage.py -q
+uv run ruff check scripts/perf/admin_usage_scale.py \
+  scripts/perf/provider_attempt_business_path.py tests/test_admin_usage.py \
+  tests/test_provider_attempt_business_path.py
+.venv-test/bin/python -m compileall -q scripts/perf/admin_usage_scale.py \
+  scripts/perf/provider_attempt_business_path.py
+.venv-test/bin/python scripts/perf/admin_usage_scale.py --self-test
+git diff --check
+```
+
+- [ ] **Step 3: Update evidence and commit**
+
+Document the production-helper ownership, seven entry scenarios, 100/100 probe,
+temporary database deletion, unchanged budgets, and no retained-fixture
+mutation. Commit implementation, tests, plan, and forced-add report while
+excluding the existing untracked business-path evidence JSON.

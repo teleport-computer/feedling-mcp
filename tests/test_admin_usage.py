@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from html import unescape
@@ -477,6 +478,312 @@ def test_scale_workflow_business_failure_collects_post_counts_in_finally():
     }
     assert result["business_status"] == "failed"
     assert result["business_database_counts"]["post"] == {"users": 0}
+
+
+def _run_entry_args(tmp_path, *, resumed=False, validate_only=False):
+    return SimpleNamespace(
+        rows=3_000_000 if resumed else 100,
+        attempt_rows=3_000_000 if resumed else 100,
+        users=2_000 if resumed else 10,
+        runs=5,
+        history_days=365,
+        non_formal=not resumed,
+        resume_prefix="scale_usage_42e02f444a_" if resumed else "",
+        validate_resume_only=validate_only,
+        keep_data=False,
+        database_url=(
+            "postgresql://postgres:test@127.0.0.1:55432/"
+            "feedling_usage_scale_entry_test"
+        ),
+        output=str(tmp_path / "entry-evidence.json"),
+        business_path_output="",
+        precondition_note="entry integration spy",
+    )
+
+
+def _install_run_entry_boundary(monkeypatch, harness):
+    monkeypatch.setenv("DATABASE_URL", os.environ.get("DATABASE_URL", ""))
+    monkeypatch.setenv(
+        "FEEDLING_V2_USAGE_ROLLUP_ENABLED",
+        os.environ.get("FEEDLING_V2_USAGE_ROLLUP_ENABLED", ""),
+    )
+
+    class Connection:
+        pass
+
+    class Pool:
+        def connection(self):
+            return nullcontext(Connection())
+
+    pool = Pool()
+    monkeypatch.setattr(
+        harness,
+        "_validate_scale_database_url",
+        lambda _url: {
+            "database": "feedling_usage_scale_entry_test",
+            "host": "127.0.0.1",
+            "port": 55432,
+        },
+    )
+    monkeypatch.setattr(
+        harness, "_install_validated_scale_pool", lambda _db, _identity: pool
+    )
+    monkeypatch.setattr(
+        harness, "_validate_connected_scale_database", lambda _conn, identity: identity
+    )
+    monkeypatch.setattr(harness, "_assert_schema", lambda _conn: {"valid": True})
+    monkeypatch.setattr(harness, "_assert_empty_dedicated_database", lambda _conn: None)
+    monkeypatch.setattr(
+        harness,
+        "_validate_rolling_partition",
+        lambda _partition: {"rollup_days": ["2026-08-01"], "raw_days": []},
+    )
+    monkeypatch.setattr(
+        harness,
+        "_seed_fixture",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("copied production workflow used")
+        ),
+    )
+    monkeypatch.setattr(
+        harness,
+        "_capture_report",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("copied production workflow used")
+        ),
+    )
+    monkeypatch.setattr(harness, "_delete_fixture", lambda *_args: None)
+    monkeypatch.setattr(
+        harness,
+        "_fixture_counts",
+        lambda *_args: {"users": 0, "turn_watermark": 0, "attempt_watermark": 0},
+    )
+    monkeypatch.setattr(harness, "_database_counts", lambda _conn: {"users": 0})
+    return pool
+
+
+def _install_workflow_callback_spy(monkeypatch, harness, *, scenario, events):
+    state = {"rows": 0}
+
+    def build(context):
+        evidence = context["evidence"]
+        resumed = context["resumed"]
+
+        def prepare(arm_cleanup):
+            events.append("prepare_resume" if resumed else "prepare_fresh")
+            arm_cleanup()
+            state["rows"] = 1
+
+        def workload():
+            events.append("workload")
+            if scenario == "timing_failure":
+                raise RuntimeError("timing failed")
+
+        def cleanup():
+            events.append("cleanup")
+            if scenario == "cleanup_failure":
+                raise RuntimeError("cleanup failed")
+            state["rows"] = 0
+            evidence["cleanup"] = {
+                "foreign_key_cascade_verified": True,
+                "watermark_removed": True,
+                "residual_counts": {"users": 0},
+            }
+
+        def counts():
+            events.append("count")
+            return {"users": state["rows"]}
+
+        def business():
+            events.append("business")
+            assert state["rows"] == 0
+            if scenario == "business_failure":
+                raise ValueError("business failed")
+            return {
+                "pool": {"measurement": "entry-spy"},
+                "business": {"producer": "entry-spy"},
+            }
+
+        return {
+            "prepare_fixture": prepare,
+            "run_fixture_workload": workload,
+            "cleanup_fixture": cleanup,
+            "collect_database_counts": counts,
+            "produce_business": business,
+        }
+
+    monkeypatch.setattr(
+        harness, "_build_scale_workflow_callbacks", build, raising=False
+    )
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+def test_run_entry_uses_single_workflow_for_fresh_and_resume_happy_path(
+    tmp_path, monkeypatch, resumed
+):
+    harness = _load_usage_scale_harness()
+    _install_run_entry_boundary(monkeypatch, harness)
+    if resumed:
+        monkeypatch.setattr(
+            harness,
+            "_collect_resume_snapshot",
+            lambda *_args, **_kwargs: _healthy_formal_resume_snapshot(),
+        )
+    events = []
+    _install_workflow_callback_spy(
+        monkeypatch, harness, scenario="happy", events=events
+    )
+
+    exit_code = harness._run(_run_entry_args(tmp_path, resumed=resumed))
+    artifact = json.loads(
+        (tmp_path / "entry-evidence.json").read_text(encoding="utf-8")
+    )
+
+    assert exit_code == 1
+    assert artifact["workflow"]["terminal_phase"] == "complete"
+    assert artifact["workflow"]["business_result"] == {
+        "pool": {"measurement": "entry-spy"},
+        "business": {"producer": "entry-spy"},
+    }
+    assert artifact["business_path"] == {"producer": "entry-spy"}
+    assert events == [
+        "prepare_resume" if resumed else "prepare_fresh",
+        "workload",
+        "cleanup",
+        "count",
+        "count",
+        "business",
+        "count",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "terminal_phase", "business_status", "expected_events"),
+    [
+        (
+            "timing_failure",
+            "fixture_workload_failed",
+            "not_run",
+            ["prepare_fresh", "workload", "cleanup", "count"],
+        ),
+        (
+            "cleanup_failure",
+            "cleanup_failed",
+            "not_run",
+            ["prepare_fresh", "workload", "cleanup", "count"],
+        ),
+        (
+            "business_failure",
+            "business_failed",
+            "failed",
+            [
+                "prepare_fresh",
+                "workload",
+                "cleanup",
+                "count",
+                "count",
+                "business",
+                "count",
+            ],
+        ),
+    ],
+)
+def test_run_entry_writes_atomic_failure_from_single_workflow(
+    tmp_path,
+    monkeypatch,
+    scenario,
+    terminal_phase,
+    business_status,
+    expected_events,
+):
+    harness = _load_usage_scale_harness()
+    _install_run_entry_boundary(monkeypatch, harness)
+    events = []
+    _install_workflow_callback_spy(
+        monkeypatch, harness, scenario=scenario, events=events
+    )
+
+    exit_code = harness._run(_run_entry_args(tmp_path))
+    artifact = json.loads(
+        (tmp_path / "entry-evidence.json").read_text(encoding="utf-8")
+    )
+
+    assert exit_code == 1
+    assert artifact["passed"] is False
+    assert artifact["workflow"]["terminal_phase"] == terminal_phase
+    assert artifact["workflow"]["business_status"] == business_status
+    assert artifact["workflow"]["business_result"] is None
+    assert events == expected_events
+    if scenario == "timing_failure":
+        assert artifact["workflow"]["post_fixture_empty_counts"] == {"users": 0}
+    if scenario == "cleanup_failure":
+        assert artifact["workflow"]["post_fixture_empty_counts"] == {"users": 1}
+    if scenario == "business_failure":
+        assert artifact["workflow"]["business_database_counts"] == {
+            "pre": {"users": 0},
+            "post": {"users": 0},
+        }
+
+
+def test_run_entry_invalid_resume_never_arms_or_mutates_fixture(
+    tmp_path, monkeypatch
+):
+    harness = _load_usage_scale_harness()
+    _install_run_entry_boundary(monkeypatch, harness)
+    invalid = _healthy_formal_resume_snapshot()
+    invalid["prefix_counts"]["users"] = 1_999
+    monkeypatch.setattr(
+        harness,
+        "_collect_resume_snapshot",
+        lambda *_args, **_kwargs: invalid,
+    )
+
+    exit_code = harness._run(_run_entry_args(tmp_path, resumed=True))
+    artifact = json.loads(
+        (tmp_path / "entry-evidence.json").read_text(encoding="utf-8")
+    )
+
+    assert exit_code == 1
+    assert artifact["workflow"]["phase_trace"] == ["prepare_fixture"]
+    assert artifact["workflow"]["failure"]["phase"] == "prepare_fixture"
+    assert artifact["workflow"]["cleanup"] == {
+        "armed": False,
+        "status": "not_run",
+        "failure": None,
+    }
+    assert artifact["workflow"]["business_status"] == "not_run"
+    assert artifact["workflow"]["business_result"] is None
+    assert artifact["fixture"]["preexisting_counts"] is None
+    assert artifact["fixture"]["resume_validation"] is None
+
+
+def test_run_entry_validate_only_is_read_only_and_skips_workflow(
+    tmp_path, monkeypatch
+):
+    harness = _load_usage_scale_harness()
+    _install_run_entry_boundary(monkeypatch, harness)
+    snapshot = _healthy_formal_resume_snapshot()
+    monkeypatch.setattr(
+        harness,
+        "_collect_resume_snapshot",
+        lambda *_args, **_kwargs: snapshot,
+    )
+
+    exit_code = harness._run(
+        _run_entry_args(tmp_path, resumed=True, validate_only=True)
+    )
+    artifact = json.loads(
+        (tmp_path / "entry-evidence.json").read_text(encoding="utf-8")
+    )
+
+    assert exit_code == 0
+    assert artifact["validated"] is True
+    assert artifact["resume_validation"] == {
+        "pre": snapshot,
+        "post": None,
+        "stable": None,
+    }
+    assert "workflow" not in artifact
 
 
 def test_database_counts_observe_user_insert_and_exact_cleanup():
