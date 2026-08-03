@@ -3515,6 +3515,29 @@ def _render_usage_page(
     else:
         attempt_overview = attempts.get("overview") or {}
         attempt_coverage = attempts.get("coverage") or {}
+        logical_coverage_reason = attempt_coverage.get(
+            "logical_call_coverage_reason"
+        )
+        if logical_coverage_reason:
+            logical_coverage_value = "unavailable"
+            reconciliation_note = (
+                "<b>Logical-call coverage unavailable</b>: "
+                "provider/model/completeness filters cannot attribute "
+                "whole-turn <code>model_calls</code>; filtered attempt "
+                "statistics remain available."
+            )
+        else:
+            logical_coverage_value = (
+                f"{_fmt_count(attempt_coverage.get('recorded_logical_calls'))} / "
+                f"{_fmt_count(attempt_coverage.get('whole_turn_model_calls'))} "
+                f"({_fmt_ratio(attempt_coverage.get('logical_call_coverage'))})"
+            )
+            reconciliation_note = (
+                "<b>Reconciliation:</b> Logical-call coverage is distinct "
+                "recorded <code>call_id</code> divided by whole-turn "
+                "<code>model_calls</code>; physical attempt count can exceed "
+                "logical calls after retries."
+            )
         attempt_metrics = "".join([
             _render_metric("Provider attempts", _fmt_count(attempt_overview.get("attempts"))),
             _render_metric("Logical calls recorded", _fmt_count(attempt_overview.get("logical_calls"))),
@@ -3546,11 +3569,7 @@ def _render_usage_page(
                     if attempt_overview.get("ttft_ms_p95") is not None else None
                 ),
             ])),
-            _render_metric("Logical-call coverage", (
-                f"{_fmt_count(attempt_coverage.get('recorded_logical_calls'))} / "
-                f"{_fmt_count(attempt_coverage.get('whole_turn_model_calls'))} "
-                f"({_fmt_ratio(attempt_coverage.get('logical_call_coverage'))})"
-            )),
+            _render_metric("Logical-call coverage", logical_coverage_value),
             _render_metric("Attempt sequence gaps", _fmt_count(
                 attempt_coverage.get("attempt_sequence_gaps")
             )),
@@ -3634,9 +3653,7 @@ def _render_usage_page(
     possibly-billed state and cost come from canonical rev-latest attempt rows plus
     append-only correction deltas. Turns and terminal outcomes remain Whole-turn truth.</div>
   <section class='metrics'>{attempt_metrics}</section>
-  <div class='note-box'><b>Reconciliation:</b> Logical-call coverage is distinct recorded
-    <code>call_id</code> divided by whole-turn <code>model_calls</code>; physical attempt count
-    can exceed 100% after retries. Attempt sequence gaps are separate: outer
+  <div class='note-box'>{reconciliation_note} Attempt sequence gaps are separate: outer
     {_fmt_count(attempt_coverage.get('missing_outer_ordinals'))}, inner
     {_fmt_count(attempt_coverage.get('missing_inner_ordinals'))}.</div>
   <h3>Authoritative / estimated / unknown cost</h3>
@@ -3866,7 +3883,7 @@ def _render_usage_page(
   <div class='muted'>Turns and terminal outcomes come from v2_turn_metrics. The attempt ledger below is the accounting source for provider calls and usage.</div>
   <section class='metrics'>{usage_metrics}</section>
   <h2>平均值</h2>
-  <div class='muted'>Whole-turn legacy usage projection; canonical attempt accounting is above.</div>
+  <div class='muted'>Whole-turn legacy usage projection; canonical attempt accounting is below.</div>
   <section class='metrics'>{average_metrics}</section>
   {optional_note}
   {attempt_section}

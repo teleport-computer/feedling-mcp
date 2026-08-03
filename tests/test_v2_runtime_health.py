@@ -340,6 +340,7 @@ def _add_metric(
     *,
     prompt: int | None,
     completion: int | None,
+    job_id: int | None = None,
     model_calls: int = 1,
     retries: int = 0,
     failed: bool = False,
@@ -353,10 +354,10 @@ def _add_metric(
     route: str | None = None,
     age_hours: int = 0,
 ) -> None:
-    """直接写一行 v2_turn_metrics。job_id 传 None——该列的唯一索引允许多个 NULL。"""
+    """直接写一行 v2_turn_metrics；默认 NULL 保留旧测试的多行写入能力。"""
     seed_user(user_id)
     jobs_store.record_whole_turn_metric(
-        None, user_id, lane,
+        job_id, user_id, lane,
         prompt_tokens=prompt, completion_tokens=completion, latency_ms=1000,
         model_calls=model_calls, retries=retries, failed=failed,
         status="turn_failed:providererror" if failed else "ok",
@@ -403,7 +404,7 @@ def test_token_usage_by_lane_counts_failed_turns():
 def test_token_usage_by_lane_exposes_provider_attempt_accounting_with_corrections():
     _add_metric(
         "u_tok_attempts", "chat", prompt=9_999, completion=999,
-        model_calls=3, retries=99, failed=True,
+        job_id=82001, model_calls=3, retries=99, failed=True,
     )
     with db.get_pool().connection() as conn:
         for values in (
@@ -418,12 +419,12 @@ def test_token_usage_by_lane_exposes_provider_attempt_accounting_with_correction
         ):
             conn.execute(
                 "INSERT INTO llm_provider_attempts ("
-                "attempt_id,user_id,lane,call_id,outer_attempt_ordinal,"
+                "attempt_id,user_id,lane,job_id,call_id,outer_attempt_ordinal,"
                 "inner_attempt_ordinal,retry_kind,requested_provider,resolved_provider,"
                 "requested_model,resolved_model,transport,started_at,finished_at,state,"
                 "outcome,error_class,input_tokens,output_tokens,reasoning_tokens,"
                 "cache_read_tokens,usage_known,possibly_billed,source,completeness,revision) "
-                "VALUES (%s,'u_tok_attempts','chat',%s,%s,1,%s,'asked','actual',"
+                "VALUES (%s,'u_tok_attempts','chat',82001,%s,%s,1,%s,'asked','actual',"
                 "'asked-model','actual-model','openai_responses',now(),now(),'completed',"
                 "%s,'none',%s,%s,%s,%s,true,%s,'runtime_recorder','complete',2)",
                 values,
@@ -450,6 +451,61 @@ def test_token_usage_by_lane_exposes_provider_attempt_accounting_with_correction
     assert attempts["cache_read_tokens"] == 15
     assert attempts["whole_turn_model_calls"] == 3
     assert attempts["logical_call_coverage"] == pytest.approx(1 / 3)
+
+
+def test_token_usage_by_lane_joins_attempts_to_recent_turn_job_cohort():
+    _add_metric(
+        "u_tok_recent_job", "chat", prompt=100, completion=10,
+        job_id=82002, model_calls=1,
+    )
+    _add_metric(
+        "u_tok_old_job", "screen_watch", prompt=999, completion=99,
+        job_id=82003, model_calls=1, age_hours=48,
+    )
+    with db.get_pool().connection() as conn:
+        for values in (
+            (
+                "83333333-3333-5333-8333-333333333333",
+                "u_tok_recent_job", 82002, "recent-job-call", 1,
+                "initial", 10, "48 hours",
+            ),
+            (
+                "84444444-4444-5444-8444-444444444444",
+                "u_tok_recent_job", 82002, "recent-job-call", 2,
+                "failover", 20, "48 hours",
+            ),
+            (
+                "85555555-5555-5555-8555-555555555555",
+                "u_tok_old_job", 82003, "old-job-call", 1,
+                "initial", 999, "0 hours",
+            ),
+        ):
+            conn.execute(
+                "INSERT INTO llm_provider_attempts ("
+                "attempt_id,user_id,lane,job_id,call_id,outer_attempt_ordinal,"
+                "inner_attempt_ordinal,retry_kind,requested_provider,resolved_provider,"
+                "requested_model,resolved_model,transport,started_at,finished_at,state,"
+                "outcome,error_class,input_tokens,usage_known,possibly_billed,source,"
+                "completeness,revision) VALUES (%s,%s,CASE WHEN %s=82002 THEN 'chat' "
+                "ELSE 'screen_watch' END,%s,%s,%s,1,%s,'asked','actual','asked-model',"
+                "'actual-model','openai_responses',clock_timestamp()-CAST(%s AS interval),"
+                "clock_timestamp(),'completed','succeeded','none',%s,true,false,"
+                "'runtime_recorder','complete',2)",
+                (
+                    values[0], values[1], values[2], values[2], values[3],
+                    values[4], values[5], values[7], values[6],
+                ),
+            )
+
+    report = jobs_store.recent_token_usage_by_lane(within_hours=24)
+    chat = report["attempt_lanes"]["chat"]
+
+    assert chat["attempts"] == 2
+    assert chat["logical_calls"] == 1
+    assert chat["input_tokens"] == 30
+    assert chat["whole_turn_model_calls"] == 1
+    assert chat["logical_call_coverage"] == pytest.approx(1.0)
+    assert "screen_watch" not in report["attempt_lanes"]
 
 
 def test_token_usage_by_lane_reports_none_not_zero_without_usage():
