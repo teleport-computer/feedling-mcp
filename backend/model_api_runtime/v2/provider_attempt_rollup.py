@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import threading
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -20,8 +22,14 @@ log = logging.getLogger("feedling.runtime_v2.provider_attempt_rollup")
 
 ROLLUP_NAME = "hosted_v2_attempt_usage"
 LOCAL_TIMEZONE = ZoneInfo("Asia/Shanghai")
+ADVISORY_LOCK_KEY = 0x4656324154540001
 DEFAULT_STATEMENT_TIMEOUT_MS = 15_000
 DEFAULT_POOL_TIMEOUT_SECONDS = 0.5
+DEFAULT_MAX_DAYS = 2
+DEFAULT_MAX_CHANGED_ROWS = 2_000
+DEFAULT_MAX_DIRTY_DAYS = 400
+DEFAULT_MAX_STALE_ROWS = 500
+DEFAULT_STALE_AFTER_SECONDS = 900.0
 
 _TOKEN_FIELDS = (
     "input_tokens",
@@ -31,6 +39,40 @@ _TOKEN_FIELDS = (
     "cache_write_tokens",
     "cache_miss_tokens",
 )
+
+
+class _CASConflict(RuntimeError):
+    pass
+
+
+def _bounded_int(value: object, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if isinstance(value, bool):
+        return default
+    return max(minimum, min(parsed, maximum))
+
+
+def _bounded_float(
+    value: object, default: float, *, minimum: float, maximum: float
+) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return max(minimum, min(parsed, maximum))
+
+
+def enabled() -> bool:
+    """Default on; only an explicit false-like value disables maintenance."""
+
+    return os.environ.get(
+        "FEEDLING_PROVIDER_ATTEMPT_ROLLUP_ENABLED", "1"
+    ).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _rollup_sql_observer(*, section: str, statement: str, params: tuple) -> None:
@@ -278,7 +320,13 @@ SELECT (SELECT count(*)::int FROM dimension_insert) AS dimensions,
     )
 
 
-def _recompute_on_cursor(cur, local_day: date, *, refreshed_at: datetime) -> dict:
+def _recompute_on_cursor(
+    cur,
+    local_day: date,
+    *,
+    refreshed_at: datetime,
+    expected_generation: int | None = None,
+) -> dict:
     start_at, end_at = _local_day_bounds(local_day)
     cur.execute(
         "DELETE FROM llm_usage_daily_attempt_dimensions WHERE local_day=%s",
@@ -302,11 +350,20 @@ def _recompute_on_cursor(cur, local_day: date, *, refreshed_at: datetime) -> dic
     )
     cur.execute(statement, params)
     counts = cur.fetchone()
-    cur.execute(
-        "DELETE FROM llm_usage_rollup_dirty_days "
-        "WHERE rollup_name=%s AND local_day=%s",
-        (ROLLUP_NAME, local_day),
-    )
+    if expected_generation is None:
+        cur.execute(
+            "DELETE FROM llm_usage_rollup_dirty_days "
+            "WHERE rollup_name=%s AND local_day=%s",
+            (ROLLUP_NAME, local_day),
+        )
+    else:
+        cur.execute(
+            "DELETE FROM llm_usage_rollup_dirty_days "
+            "WHERE rollup_name=%s AND local_day=%s AND generation=%s",
+            (ROLLUP_NAME, local_day, expected_generation),
+        )
+        if cur.rowcount != 1:
+            raise _CASConflict("attempt rollup dirty generation changed")
     return {
         "status": "ok",
         "dimensions": int(counts["dimensions"]),
@@ -319,6 +376,7 @@ def recompute_local_day(
     *,
     statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
     refreshed_at: datetime | None = None,
+    expected_generation: int | None = None,
 ) -> dict:
     """Atomically replace both attempt rollups; return safely on any failure."""
 
@@ -329,15 +387,490 @@ def recompute_local_day(
         refreshed = refreshed_at or datetime.now(timezone.utc)
         if refreshed.tzinfo is None:
             raise TypeError("refreshed_at must be timezone-aware")
+        if expected_generation is not None and (
+            not isinstance(expected_generation, int)
+            or isinstance(expected_generation, bool)
+            or expected_generation < 0
+        ):
+            raise ValueError("expected_generation must be nonnegative")
         timeout_ms = _bounded_timeout(statement_timeout_ms)
         with db.get_pool().connection(timeout=DEFAULT_POOL_TIMEOUT_SECONDS) as conn:
             with conn.transaction():
                 with conn.cursor(row_factory=dict_row) as cur:
                     _set_transaction(cur, timeout_ms)
                     return _recompute_on_cursor(
-                        cur, local_day, refreshed_at=refreshed
+                        cur,
+                        local_day,
+                        refreshed_at=refreshed,
+                        expected_generation=expected_generation,
                     )
     except Exception as exc:  # noqa: BLE001 - optional accounting stays fail-open
         error = type(exc).__name__[:120]
         log.warning("[attempt_rollup] local day rebuild failed: %s", error)
         return {**empty, "error": error}
+
+
+def _cancel_requested(cancel_event: threading.Event | None) -> bool:
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def _watermark_on_cursor(cur, *, for_update: bool = False) -> dict:
+    cur.execute(
+        "SELECT * FROM llm_usage_rollup_watermarks WHERE rollup_name=%s"
+        + (" FOR UPDATE" if for_update else ""),
+        (ROLLUP_NAME,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise RuntimeError("attempt rollup watermark missing")
+    return row
+
+
+def _upsert_dirty_days(
+    cur,
+    days: set[date] | list[date],
+    *,
+    reason: str,
+    generation: int,
+    now_utc: datetime,
+) -> None:
+    rows = sorted(set(days))
+    if not rows:
+        return
+    cur.executemany(
+        "INSERT INTO llm_usage_rollup_dirty_days "
+        "(rollup_name,local_day,reason,generation,created_at,updated_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (rollup_name,local_day) DO UPDATE SET "
+        "reason=EXCLUDED.reason,generation=greatest("
+        "llm_usage_rollup_dirty_days.generation,EXCLUDED.generation),"
+        "updated_at=EXCLUDED.updated_at",
+        [(ROLLUP_NAME, day, reason, generation, now_utc, now_utc) for day in rows],
+    )
+
+
+def _source_heads_on_cursor(cur) -> dict[str, object]:
+    cur.execute(
+        "SELECT updated_at,attempt_id FROM llm_provider_attempts "
+        "WHERE source='runtime_recorder' ORDER BY updated_at DESC,attempt_id DESC LIMIT 1"
+    )
+    attempt = cur.fetchone()
+    cur.execute("SELECT coalesce(max(id),0)::bigint AS id FROM llm_provider_attempt_corrections")
+    correction = cur.fetchone()
+    cur.execute(
+        "SELECT updated_at,id FROM v2_turn_metrics "
+        "ORDER BY updated_at DESC,id DESC LIMIT 1"
+    )
+    turn = cur.fetchone()
+    cur.execute(
+        "SELECT created_at,provider,model,version FROM llm_rate_cards "
+        "ORDER BY created_at DESC,provider DESC,model DESC,version DESC LIMIT 1"
+    )
+    rate = cur.fetchone()
+    epoch = datetime.fromtimestamp(0, tz=timezone.utc)
+    return {
+        "attempt_updated_at": attempt["updated_at"] if attempt else epoch,
+        "attempt_updated_id": attempt["attempt_id"] if attempt else "",
+        "late_correction_id": int(correction["id"]),
+        "turn_metric_updated_at": turn["updated_at"] if turn else epoch,
+        "turn_metric_id": int(turn["id"]) if turn else 0,
+        "rate_card_created_at": rate["created_at"] if rate else epoch,
+        "rate_card_provider": rate["provider"] if rate else "",
+        "rate_card_model": rate["model"] if rate else "",
+        "rate_card_version": rate["version"] if rate else "",
+    }
+
+
+def _bootstrap_batch(
+    conn,
+    *,
+    max_dirty_days: int,
+    now_utc: datetime,
+    timeout_ms: int,
+) -> dict:
+    """Enqueue one sparse bootstrap/replay page and atomically move its cursor."""
+
+    with conn.transaction():
+        with conn.cursor(row_factory=dict_row) as cur:
+            _set_transaction(cur, timeout_ms)
+            state = _watermark_on_cursor(cur, for_update=True)
+            if state["bootstrap_complete"]:
+                return state
+            generation = int(state["replay_generation"])
+            if state["completed_through_day"] is None:
+                # Initial bootstrap snapshots all four source heads. Any later
+                # change is then discovered after the sparse day build.
+                if generation == 0:
+                    heads = _source_heads_on_cursor(cur)
+                    cur.execute(
+                        "UPDATE llm_usage_rollup_watermarks SET "
+                        "attempt_updated_at=%s,attempt_updated_id=%s,late_correction_id=%s,"
+                        "turn_metric_updated_at=%s,turn_metric_id=%s,"
+                        "rate_card_created_at=%s,rate_card_provider=%s,rate_card_model=%s,"
+                        "rate_card_version=%s,version=version+1,updated_at=%s "
+                        "WHERE rollup_name=%s AND version=%s RETURNING *",
+                        (
+                            heads["attempt_updated_at"], heads["attempt_updated_id"],
+                            heads["late_correction_id"], heads["turn_metric_updated_at"],
+                            heads["turn_metric_id"], heads["rate_card_created_at"],
+                            heads["rate_card_provider"], heads["rate_card_model"],
+                            heads["rate_card_version"], now_utc, ROLLUP_NAME,
+                            state["version"],
+                        ),
+                    )
+                    state = cur.fetchone()
+                    if state is None:
+                        raise _CASConflict("attempt bootstrap head changed")
+            cur.execute(
+                "SELECT DISTINCT (created_at AT TIME ZONE 'Asia/Shanghai')::date AS local_day "
+                "FROM v2_turn_metrics WHERE (%s::date IS NULL OR "
+                "(created_at AT TIME ZONE 'Asia/Shanghai')::date>%s) "
+                "ORDER BY local_day LIMIT %s",
+                (state["completed_through_day"], state["completed_through_day"], max_dirty_days),
+            )
+            days = [row["local_day"] for row in cur.fetchall()]
+            _upsert_dirty_days(
+                cur, days, reason="replay" if generation else "bootstrap",
+                generation=generation, now_utc=now_utc,
+            )
+            through = days[-1] if days else state["completed_through_day"]
+            cur.execute(
+                "SELECT EXISTS (SELECT 1 FROM v2_turn_metrics WHERE "
+                "(%s::date IS NULL OR (created_at AT TIME ZONE 'Asia/Shanghai')::date>%s))",
+                (through, through),
+            )
+            complete = not bool(cur.fetchone()["exists"])
+            cur.execute(
+                "UPDATE llm_usage_rollup_watermarks SET completed_through_day=%s,"
+                "bootstrap_complete=%s,version=version+1,updated_at=%s "
+                "WHERE rollup_name=%s AND version=%s RETURNING *",
+                (through, complete, now_utc, ROLLUP_NAME, state["version"]),
+            )
+            updated = cur.fetchone()
+            if updated is None:
+                raise _CASConflict("attempt bootstrap cursor changed")
+            return updated
+
+
+def _discover_changes(
+    conn,
+    *,
+    max_changed_rows: int,
+    max_dirty_days: int,
+    now_utc: datetime,
+    timeout_ms: int,
+) -> dict:
+    """Discover four source streams; every cursor commits with its dirty rows."""
+
+    limit = max_changed_rows
+    with conn.transaction():
+        with conn.cursor(row_factory=dict_row) as cur:
+            _set_transaction(cur, timeout_ms)
+            state = _watermark_on_cursor(cur, for_update=True)
+            generation = int(state["replay_generation"])
+            dirty: set[date] = set()
+
+            def consume(rows: list[dict]) -> list[dict]:
+                """Take only the cursor prefix whose new days fit this tick."""
+
+                accepted: list[dict] = []
+                for row in rows:
+                    local_day = row["local_day"]
+                    if (
+                        local_day is not None
+                        and local_day not in dirty
+                        and len(dirty) >= max_dirty_days
+                    ):
+                        break
+                    accepted.append(row)
+                    if local_day is not None:
+                        dirty.add(local_day)
+                return accepted
+
+            cur.execute(
+                "SELECT a.updated_at,a.attempt_id,"
+                "(m.created_at AT TIME ZONE 'Asia/Shanghai')::date AS local_day "
+                "FROM llm_provider_attempts a LEFT JOIN v2_turn_metrics m ON m.job_id=a.job_id "
+                "WHERE a.source='runtime_recorder' AND (a.updated_at,a.attempt_id)>(%s,%s) "
+                "ORDER BY a.updated_at,a.attempt_id LIMIT %s",
+                (state["attempt_updated_at"], state["attempt_updated_id"], limit),
+            )
+            attempts = consume(cur.fetchall())
+            attempt_at = attempts[-1]["updated_at"] if attempts else state["attempt_updated_at"]
+            attempt_id = attempts[-1]["attempt_id"] if attempts else state["attempt_updated_id"]
+
+            cur.execute(
+                "SELECT c.id,(m.created_at AT TIME ZONE 'Asia/Shanghai')::date AS local_day "
+                "FROM llm_provider_attempt_corrections c "
+                "JOIN llm_provider_attempts a ON a.attempt_id=c.attempt_id "
+                "LEFT JOIN v2_turn_metrics m ON m.job_id=a.job_id "
+                "WHERE c.id>%s ORDER BY c.id LIMIT %s",
+                (state["late_correction_id"], limit),
+            )
+            corrections = consume(cur.fetchall())
+            correction_id = int(corrections[-1]["id"]) if corrections else int(state["late_correction_id"])
+
+            cur.execute(
+                "SELECT updated_at,id,(created_at AT TIME ZONE 'Asia/Shanghai')::date AS local_day "
+                "FROM v2_turn_metrics WHERE (updated_at,id)>(%s,%s) "
+                "ORDER BY updated_at,id LIMIT %s",
+                (state["turn_metric_updated_at"], state["turn_metric_id"], limit),
+            )
+            turns = consume(cur.fetchall())
+            turn_at = turns[-1]["updated_at"] if turns else state["turn_metric_updated_at"]
+            turn_id = int(turns[-1]["id"]) if turns else int(state["turn_metric_id"])
+
+            rate_cursor = (
+                state["rate_card_created_at"], state["rate_card_provider"],
+                state["rate_card_model"], state["rate_card_version"],
+            )
+            cur.execute(
+                "SELECT created_at,provider,model,version,effective_at FROM llm_rate_cards "
+                "WHERE (created_at,provider,model,version)>(%s,%s,%s,%s) "
+                "ORDER BY created_at,provider,model,version LIMIT 1",
+                rate_cursor,
+            )
+            rate = cur.fetchone()
+            replay_requested = False
+            if rate is not None:
+                remaining = max_dirty_days - len(dirty)
+                cur.execute(
+                    "SELECT min(effective_at) AS effective_before FROM llm_rate_cards "
+                    "WHERE provider=%s AND model=%s AND effective_at>%s",
+                    (rate["provider"], rate["model"], rate["effective_at"]),
+                )
+                effective_before = cur.fetchone()["effective_before"]
+                cur.execute(
+                    "SELECT DISTINCT (m.created_at AT TIME ZONE 'Asia/Shanghai')::date AS local_day "
+                    "FROM llm_provider_attempts a JOIN v2_turn_metrics m ON m.job_id=a.job_id "
+                    "WHERE a.source='runtime_recorder' AND a.resolved_provider=%s "
+                    "AND a.resolved_model=%s AND a.started_at>=%s "
+                    "AND (%s::timestamptz IS NULL OR a.started_at<%s) "
+                    "ORDER BY local_day LIMIT %s",
+                    (
+                        rate["provider"], rate["model"], rate["effective_at"],
+                        effective_before, effective_before, remaining + 1,
+                    ),
+                )
+                rate_days = [row["local_day"] for row in cur.fetchall()]
+                if len(rate_days) <= remaining:
+                    dirty.update(rate_days)
+                else:
+                    # The durable cursor has no intra-card day component. A
+                    # bounded sparse replay is the only way to advance without
+                    # either losing days or retrying this card forever.
+                    replay_requested = True
+                rate_cursor = (
+                    rate["created_at"], rate["provider"], rate["model"], rate["version"]
+                )
+
+            _upsert_dirty_days(
+                cur, dirty, reason="source_change", generation=generation, now_utc=now_utc
+            )
+            cur.execute(
+                "UPDATE llm_usage_rollup_watermarks SET "
+                "attempt_updated_at=%s,attempt_updated_id=%s,late_correction_id=%s,"
+                "turn_metric_updated_at=%s,turn_metric_id=%s,rate_card_created_at=%s,"
+                "rate_card_provider=%s,rate_card_model=%s,rate_card_version=%s,"
+                "replay_generation=%s,bootstrap_complete=%s,completed_through_day=%s,"
+                "version=version+1,updated_at=%s WHERE rollup_name=%s AND version=%s "
+                "RETURNING *",
+                (
+                    attempt_at, attempt_id, correction_id, turn_at, turn_id,
+                    *rate_cursor,
+                    generation + 1 if replay_requested else generation,
+                    False if replay_requested else state["bootstrap_complete"],
+                    None if replay_requested else state["completed_through_day"],
+                    now_utc, ROLLUP_NAME, state["version"],
+                ),
+            )
+            updated = cur.fetchone()
+            if updated is None:
+                raise _CASConflict("attempt source cursor changed")
+            return updated
+
+
+def _reconcile_stale_started(
+    conn,
+    *,
+    max_rows: int,
+    stale_after_seconds: float,
+    timeout_ms: int,
+) -> int:
+    if max_rows <= 0:
+        return 0
+    with conn.transaction():
+        with conn.cursor(row_factory=dict_row) as cur:
+            _set_transaction(cur, timeout_ms)
+            cur.execute(
+                "WITH picked AS (SELECT attempt_id FROM llm_provider_attempts "
+                "WHERE source='runtime_recorder' AND state='started' "
+                "AND finished_at IS NULL AND possibly_billed=false "
+                "AND started_at < now()-(%s * interval '1 second') "
+                "ORDER BY started_at,attempt_id FOR UPDATE SKIP LOCKED LIMIT %s) "
+                "UPDATE llm_provider_attempts a SET possibly_billed=true,"
+                "updated_at=clock_timestamp() FROM picked p "
+                "WHERE a.attempt_id=p.attempt_id RETURNING a.attempt_id",
+                (stale_after_seconds, max_rows),
+            )
+            return len(cur.fetchall())
+
+
+def request_replay() -> int | None:
+    """Fail-open operator seam: request a bounded full rebuild generation."""
+
+    try:
+        with db.get_pool().connection(timeout=DEFAULT_POOL_TIMEOUT_SECONDS) as conn:
+            row = conn.execute(
+                "UPDATE llm_usage_rollup_watermarks SET replay_generation=replay_generation+1,"
+                "bootstrap_complete=false,completed_through_day=NULL,version=version+1,"
+                "updated_at=now() WHERE rollup_name=%s RETURNING replay_generation",
+                (ROLLUP_NAME,),
+            ).fetchone()
+            return None if row is None else int(row[0])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[attempt_rollup] replay request failed: %s", type(exc).__name__)
+        return None
+
+
+def _record_error(error: BaseException, *, now_utc: datetime) -> None:
+    try:
+        with db.get_pool().connection(timeout=DEFAULT_POOL_TIMEOUT_SECONDS) as conn:
+            conn.execute(
+                "UPDATE llm_usage_rollup_watermarks SET updated_at=%s "
+                "WHERE rollup_name=%s", (now_utc, ROLLUP_NAME),
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _tick_result(status: str, refreshed: list[str], state: dict | None = None, **extra) -> dict:
+    result = {
+        "status": status,
+        "days_refreshed": len(refreshed),
+        "refreshed_days": list(refreshed),
+        **extra,
+    }
+    if state is not None:
+        result.update(
+            bootstrap_complete=bool(state["bootstrap_complete"]),
+            replay_generation=int(state["replay_generation"]),
+            completed_through_day=state["completed_through_day"],
+        )
+    return result
+
+
+def run_maintenance_tick(
+    *,
+    max_days: int = DEFAULT_MAX_DAYS,
+    max_changed_rows: int = DEFAULT_MAX_CHANGED_ROWS,
+    max_dirty_days: int = DEFAULT_MAX_DIRTY_DAYS,
+    max_stale_rows: int = DEFAULT_MAX_STALE_ROWS,
+    stale_after_seconds: float = DEFAULT_STALE_AFTER_SECONDS,
+    statement_timeout_ms: int = DEFAULT_STATEMENT_TIMEOUT_MS,
+    pool_timeout_seconds: float = DEFAULT_POOL_TIMEOUT_SECONDS,
+    now_utc: datetime | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict:
+    """Run one bounded, single-leader maintenance tick; never raise."""
+
+    if not enabled():
+        return {"status": "disabled", "days_refreshed": 0}
+    days_limit = _bounded_int(max_days, DEFAULT_MAX_DAYS, minimum=0, maximum=31)
+    changed_limit = _bounded_int(
+        max_changed_rows, DEFAULT_MAX_CHANGED_ROWS, minimum=1, maximum=100_000
+    )
+    dirty_limit = _bounded_int(
+        max_dirty_days, DEFAULT_MAX_DIRTY_DAYS, minimum=1, maximum=2_000
+    )
+    stale_limit = _bounded_int(
+        max_stale_rows, DEFAULT_MAX_STALE_ROWS, minimum=0, maximum=10_000
+    )
+    stale_after = _bounded_float(
+        stale_after_seconds, DEFAULT_STALE_AFTER_SECONDS, minimum=1, maximum=86_400
+    )
+    timeout_ms = _bounded_timeout(statement_timeout_ms)
+    pool_timeout = _bounded_float(
+        pool_timeout_seconds, DEFAULT_POOL_TIMEOUT_SECONDS, minimum=0.05, maximum=5
+    )
+    now = now_utc or datetime.now(timezone.utc)
+    refreshed: list[str] = []
+    try:
+        with db.get_pool().connection(timeout=pool_timeout) as conn:
+            if not conn.autocommit:
+                conn.autocommit = True
+            locked = bool(
+                conn.execute(
+                    "SELECT pg_try_advisory_lock(%s)", (ADVISORY_LOCK_KEY,)
+                ).fetchone()[0]
+            )
+            if not locked:
+                return {"status": "lock_busy", "days_refreshed": 0}
+            try:
+                if _cancel_requested(cancel_event):
+                    return _tick_result("cancelled", refreshed)
+                conn.execute(
+                    "INSERT INTO llm_usage_rollup_watermarks (rollup_name) VALUES (%s) "
+                    "ON CONFLICT (rollup_name) DO NOTHING", (ROLLUP_NAME,)
+                )
+                stale_count = _reconcile_stale_started(
+                    conn, max_rows=stale_limit, stale_after_seconds=stale_after,
+                    timeout_ms=timeout_ms,
+                )
+                if _cancel_requested(cancel_event):
+                    return _tick_result(
+                        "cancelled", refreshed, stale_reconciled=stale_count
+                    )
+                state = _bootstrap_batch(
+                    conn, max_dirty_days=dirty_limit, now_utc=now, timeout_ms=timeout_ms
+                )
+                if _cancel_requested(cancel_event):
+                    return _tick_result(
+                        "cancelled", refreshed, state, stale_reconciled=stale_count
+                    )
+                if state["bootstrap_complete"]:
+                    state = _discover_changes(
+                        conn, max_changed_rows=changed_limit,
+                        max_dirty_days=dirty_limit, now_utc=now, timeout_ms=timeout_ms,
+                    )
+                if _cancel_requested(cancel_event):
+                    return _tick_result(
+                        "cancelled", refreshed, state, stale_reconciled=stale_count
+                    )
+                for _ in range(days_limit):
+                    if _cancel_requested(cancel_event):
+                        return _tick_result(
+                            "cancelled", refreshed, state, stale_reconciled=stale_count
+                        )
+                    row = conn.execute(
+                        "SELECT local_day,generation FROM llm_usage_rollup_dirty_days "
+                        "WHERE rollup_name=%s ORDER BY local_day LIMIT 1",
+                        (ROLLUP_NAME,),
+                    ).fetchone()
+                    if row is None:
+                        break
+                    outcome = recompute_local_day(
+                        row[0], statement_timeout_ms=timeout_ms, refreshed_at=now,
+                        expected_generation=int(row[1]),
+                    )
+                    if outcome.get("status") != "ok":
+                        return _tick_result(
+                            "error", refreshed, state, stale_reconciled=stale_count,
+                            error=outcome.get("error", "RollupBuildError"),
+                        )
+                    refreshed.append(row[0].isoformat())
+                return _tick_result(
+                    "ok", refreshed, state, stale_reconciled=stale_count
+                )
+            finally:
+                try:
+                    conn.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
+                except Exception:  # noqa: BLE001 - discard uncertain session lock
+                    conn.close()
+    except Exception as exc:  # noqa: BLE001 - optional telemetry remains fail-open
+        _record_error(exc, now_utc=now)
+        log.warning("[attempt_rollup] maintenance tick failed: %s", type(exc).__name__)
+        return {
+            "status": "error", "days_refreshed": len(refreshed),
+            "refreshed_days": refreshed, "error": type(exc).__name__,
+        }

@@ -87,6 +87,7 @@ from model_api_runtime.v2 import effect_id as v2_effect_id
 from model_api_runtime.v2 import effect_outbox as v2_effect_outbox
 from model_api_runtime.v2 import jobs_store
 from model_api_runtime.v2 import profile_store as v2_profile_store
+from model_api_runtime.v2 import provider_attempt_rollup
 from model_api_runtime.v2 import reaper as v2_reaper
 from model_api_runtime.v2 import runner_identity
 from model_api_runtime.v2 import scheduler
@@ -4166,6 +4167,23 @@ def _usage_rollup_interval_seconds() -> float:
     return min(value, 86_400.0)
 
 
+def _run_reporting_maintenance_tick(*, cancel_event: threading.Event) -> dict:
+    """Run independently fail-open reporting lanes in the existing worker loop."""
+
+    outcomes: dict[str, dict] = {}
+    for name, module in (
+        ("usage", usage_rollup),
+        ("attempt", provider_attempt_rollup),
+    ):
+        if not module.enabled():
+            continue
+        try:
+            outcomes[name] = module.run_maintenance_tick(cancel_event=cancel_event)
+        except Exception as exc:  # noqa: BLE001 - optional lane cannot skip its sibling
+            outcomes[name] = {"status": "error", "error": type(exc).__name__}
+    return outcomes
+
+
 async def _usage_rollup_loop(
     stop_event: asyncio.Event, *, interval: float | None = None
 ) -> None:
@@ -4179,14 +4197,14 @@ async def _usage_rollup_loop(
 
     cadence = _usage_rollup_interval_seconds() if interval is None else interval
     while not stop_event.is_set():
-        if usage_rollup.enabled():
+        if usage_rollup.enabled() or provider_attempt_rollup.enabled():
             cancel_event = threading.Event()
             tick_task: asyncio.Task | None = None
             stop_task: asyncio.Task | None = None
             try:
                 tick_task = asyncio.create_task(
                     asyncio.to_thread(
-                        usage_rollup.run_maintenance_tick,
+                        _run_reporting_maintenance_tick,
                         cancel_event=cancel_event,
                     )
                 )
@@ -4205,14 +4223,16 @@ async def _usage_rollup_loop(
                             type(e).__name__,
                         )
                     break
-                result = tick_task.result()
-                if result.get("days_refreshed"):
-                    log.info(
-                        "[v2.serve_worker] usage rollup refreshed days=%s "
-                        "bootstrap_complete=%s",
-                        result["days_refreshed"],
-                        result.get("bootstrap_complete"),
-                    )
+                results = tick_task.result()
+                for name, result in results.items():
+                    if result.get("days_refreshed"):
+                        log.info(
+                            "[v2.serve_worker] %s rollup refreshed days=%s "
+                            "bootstrap_complete=%s",
+                            name,
+                            result["days_refreshed"],
+                            result.get("bootstrap_complete"),
+                        )
             except asyncio.CancelledError:
                 # asyncio cannot stop a running to_thread call.  Signal its
                 # cooperative transaction boundaries, then join it under

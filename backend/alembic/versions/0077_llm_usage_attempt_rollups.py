@@ -197,6 +197,51 @@ DO $$ BEGIN
       );
   END IF;
 END $$;
+
+-- A cursor row contains only the post-update turn day.  Preserve both sides of
+-- a rare created_at correction atomically at the source; otherwise the old
+-- derived day could never be discovered.  This writes only the small, existing
+-- current-RDS dirty queue and adds no service or provider-path dependency.
+CREATE OR REPLACE FUNCTION mark_attempt_rollup_turn_day_move()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  current_generation BIGINT;
+  old_day DATE;
+  new_day DATE;
+BEGIN
+  IF OLD.created_at IS NOT DISTINCT FROM NEW.created_at THEN
+    RETURN NEW;
+  END IF;
+  old_day := (OLD.created_at AT TIME ZONE 'Asia/Shanghai')::date;
+  new_day := (NEW.created_at AT TIME ZONE 'Asia/Shanghai')::date;
+  IF old_day = new_day THEN
+    RETURN NEW;
+  END IF;
+  SELECT replay_generation INTO current_generation
+    FROM llm_usage_rollup_watermarks
+    WHERE rollup_name='hosted_v2_attempt_usage';
+  current_generation := coalesce(current_generation,0);
+  INSERT INTO llm_usage_rollup_dirty_days
+    (rollup_name,local_day,reason,generation,created_at,updated_at)
+  VALUES
+    ('hosted_v2_attempt_usage',
+     old_day,
+     'turn_day_move',current_generation,now(),now()),
+    ('hosted_v2_attempt_usage',
+     new_day,
+     'turn_day_move',current_generation,now(),now())
+  ON CONFLICT (rollup_name,local_day) DO UPDATE SET
+    reason=EXCLUDED.reason,
+    generation=greatest(llm_usage_rollup_dirty_days.generation,EXCLUDED.generation),
+    updated_at=EXCLUDED.updated_at;
+  RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS trg_v2_turn_metrics_attempt_rollup_day_move
+  ON v2_turn_metrics;
+CREATE TRIGGER trg_v2_turn_metrics_attempt_rollup_day_move
+  AFTER UPDATE OF created_at ON v2_turn_metrics
+  FOR EACH ROW EXECUTE FUNCTION mark_attempt_rollup_turn_day_move();
 """
 
 
@@ -331,6 +376,11 @@ def downgrade() -> None:
         for name, validity in owned.items():
             if validity is not None:
                 op.execute(f"DROP INDEX CONCURRENTLY public.{name}")
+    op.execute(
+        "DROP TRIGGER IF EXISTS trg_v2_turn_metrics_attempt_rollup_day_move "
+        "ON v2_turn_metrics"
+    )
+    op.execute("DROP FUNCTION IF EXISTS mark_attempt_rollup_turn_day_move()")
     op.execute("DROP TABLE IF EXISTS llm_usage_rollup_dirty_days")
     op.execute("DROP TABLE IF EXISTS llm_usage_daily_call_memberships")
     op.execute("DROP TABLE IF EXISTS llm_usage_daily_attempt_dimensions")
