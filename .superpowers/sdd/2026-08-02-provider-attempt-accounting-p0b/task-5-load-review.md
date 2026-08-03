@@ -2,6 +2,93 @@
 
 Reviewed commit: `deff128524dea481e85c32e9a4943db1c1bb211d`
 
+## Final strengthened-resume review of `7012b801`
+
+### Verdict
+
+- **Spec: PASS**
+- **Quality: PASS**
+- **Ready to run the destructive formal resume: YES**
+- **P0-B release evidence still requires the fresh formal run artifact**
+
+The change closes both blockers from `148ef511`.  No new finding remains in
+the formal resume harness.
+
+### C1 — CLOSED: fixture-user registration time is bound to the seed formula
+
+`_collect_user_shape` now compares every user row's parsed `created_at` with
+`SCALE_NOW_UTC - timedelta(days=DEFAULT_HISTORY_DAYS)`.  Formal configuration
+already fixes those inputs to the same `end_at` and 365 days used by
+`_seed_fixture`, so the resume proof and seed formula agree exactly.  The
+result is part of the pre/post stable snapshot and the final validation gate.
+
+The PostgreSQL negative test changes one user's timestamp by one second while
+preserving every fixture count and proves `invalid_created_at=1`.  Thus a
+same-cardinality change to the registered/activated cohort basis is rejected.
+
+### C2 — CLOSED: all eight nonvolatile seed-NULL attempt fields are exact
+
+The expected attempt relation supplies explicit typed NULLs and the existing
+`ROW(...) IS DISTINCT FROM ROW(...)` equality now includes each previously
+missing field:
+
+- identity/provenance: `installation_id`, `runtime`, `turn_id`, `round_id`,
+  `provider_request_id`, and `rate_card_version`;
+- usage/delivery facts: `usage_unknown_reason` and `latency_ms`.
+
+The parameterized PostgreSQL test mutates each field independently to a valid
+non-NULL value, preserves row/distinct identity cardinalities, and observes
+exactly one source-attempt mismatch for every case.  This directly proves all
+eight fields are bound rather than relying on SQL-string inspection alone.
+
+Only `llm_provider_attempts.created_at` and `updated_at` remain excluded.  The
+seed does not supply them; PostgreSQL assigns `DEFAULT now()` wall-clock values
+and later ledger maintenance may update `updated_at`.  Excluding those two
+nondeterministic database metadata fields is appropriate and does not weaken
+the fixed business/identity source contract.  `users.created_at` is not part of
+that exception because the formal seed explicitly derives and writes it.
+
+### Resume safety and exactness regression check
+
+- Formal mode remains locked before database access to 3M turns, 3M attempts,
+  2,000 users, and 365 history days.
+- Exact source distribution, daily user/dimension facts, attempt-dimension
+  facts, and membership key+fact bijection remain unchanged; none relies on a
+  checksum approximation.
+- All six large semantic statements still execute within one
+  repeatable-read/read-only snapshot, with a 180-second per-statement bound and
+  plan, elapsed-time, expected/actual, and mismatch diagnostics.
+- Resume control flow remains prevalidation, producer, postvalidation and
+  stable-snapshot equality, then cleanup arming and timing.  Failure and
+  validate-only paths do not arm cleanup; validate-only performs no producer
+  mutation.  The final gate revalidates both snapshots and exact formal
+  configuration.
+
+### Verification
+
+- Focused non-database portion: **150 passed**.  The initial sandbox run's
+  database cases could not open localhost (`Operation not permitted`), rather
+  than failing an assertion.
+- The twelve affected PostgreSQL cases were rerun with approved access to the
+  dedicated local test instance: **12 passed in 0.62s**.  These include the
+  user timestamp mutation, all eight attempt-field mutations, semantic SQL
+  parse/bounded execution, and the real attempt schema check.
+- The strengthened read-only dry artifact at
+  `/private/tmp/admin-usage-resume-validation-strengthened.json` has
+  `invalid_created_at=0`; all six exact integrity queries pass with zero
+  mismatches.  The slowest is membership at 33,984.986 ms, below the 180-second
+  bound.
+- `git diff 148ef511 7012b801 --check`: passed.
+- No formal run, cleanup, external provider request, or remote database write
+  was performed.  The existing untracked business-path artifact was untouched.
+
+### Final ready verdict
+
+**Ready for the destructive formal resume.**  Success still requires a fresh
+formal artifact at the reviewed commit with exact 3M/3M cardinality, both
+strict sub-3,000 ms report cohorts, all plan/business/final gates passing, and
+zero residual state after cleanup.
+
 ## Strengthened-resume re-review of `6e6c4b8e` + `156946ae`
 
 ### Verdict
