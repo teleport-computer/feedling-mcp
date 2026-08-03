@@ -5043,9 +5043,21 @@ def _usage_parallel_core_rows_separate(
     _usage_snapshot_observer("read", role="exporter", section="core")
     cur.execute(
         prefix
-        + f"""
+        + f""",
+token_user_totals AS (
+ SELECT user_id,
+  (sum(prompt_tokens_sum)+sum(completion_tokens_sum))::bigint
+    AS total_tokens
+ FROM source
+ GROUP BY user_id
+ HAVING sum(prompt_tokens_known_count)>0
+    AND sum(completion_tokens_known_count)>0
+)
 SELECT {aggregates},
  count(DISTINCT user_id) FILTER (WHERE model_calls>0)::int AS model_active_users,
+ (SELECT count(*)::int FROM token_user_totals) AS token_users,
+ (SELECT coalesce(sum(total_tokens),0)::bigint FROM token_user_totals)
+   AS token_user_tokens,
  count(DISTINCT user_id) FILTER (WHERE usage_reported_calls>0)::int AS metered_users,
  count(DISTINCT (user_id,local_day)) FILTER (WHERE model_calls>0)::int AS active_user_days
 FROM source s
@@ -5073,9 +5085,46 @@ SELECT percentile_cont(.5) WITHIN GROUP (ORDER BY total_tokens) AS p50,
         "distribution",
         lambda: (cur.execute(distribution_sql, params), cur.fetchone())[1],
     )
-    daily_sql = prefix + f"""
+    if dimensions:
+        token_user_days = f""",
+token_user_days AS (
+ SELECT local_day,user_id,
+  (sum(prompt_tokens_sum)+sum(completion_tokens_sum))::bigint
+    AS total_tokens
+ FROM source
+ GROUP BY local_day,user_id
+ HAVING sum(prompt_tokens_known_count)>0
+    AND sum(completion_tokens_known_count)>0
+), token_daily AS (
+ SELECT local_day,count(*)::int AS token_users,
+  coalesce(sum(total_tokens),0)::bigint AS token_user_tokens
+ FROM token_user_days GROUP BY local_day
+), daily_rows AS (
+ SELECT local_day,{aggregates},
+  count(DISTINCT user_id) FILTER (WHERE model_calls>0)::int
+    AS model_active_users
+ FROM source s GROUP BY local_day
+)"""
+        daily_sql = prefix + token_user_days + """
+SELECT d.*,coalesce(t.token_users,0)::int AS token_users,
+ coalesce(t.token_user_tokens,0)::bigint AS token_user_tokens
+FROM daily_rows d LEFT JOIN token_daily t USING (local_day)
+ORDER BY d.local_day
+"""
+    else:
+        # The non-dimensional source is already one row per user/day.  Avoid
+        # materializing and rescanning it only to reconstruct the same grain.
+        daily_token_columns = """
+ count(*) FILTER (
+  WHERE prompt_tokens_known_count>0 AND completion_tokens_known_count>0
+ )::int AS token_users,
+ coalesce(sum(prompt_tokens_sum+completion_tokens_sum) FILTER (
+  WHERE prompt_tokens_known_count>0 AND completion_tokens_known_count>0
+ ),0)::bigint AS token_user_tokens"""
+        daily_sql = prefix + f"""
 SELECT local_day,{aggregates},
- count(DISTINCT user_id) FILTER (WHERE model_calls>0)::int AS model_active_users
+ count(DISTINCT user_id) FILTER (WHERE model_calls>0)::int AS model_active_users,
+{daily_token_columns}
 FROM source s GROUP BY local_day ORDER BY local_day
 """
     daily = _usage_optional_pg_section(
@@ -5183,7 +5232,13 @@ user_rows AS MATERIALIZED (
  FROM user_days d GROUP BY d.user_id
 ), totals_row AS (
  SELECT {rendered_aggregates},
-  count(*) FILTER (WHERE model_calls>0)::int AS model_active_users,
+ count(*) FILTER (WHERE model_calls>0)::int AS model_active_users,
+  count(*) FILTER (
+    WHERE prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL
+  )::int AS token_users,
+  coalesce(sum(prompt_tokens+completion_tokens) FILTER (
+    WHERE prompt_tokens IS NOT NULL AND completion_tokens IS NOT NULL
+  ),0)::bigint AS token_user_tokens,
   count(*) FILTER (WHERE usage_reported_calls>0)::int AS metered_users,
   coalesce(sum(active_days),0)::int AS active_user_days
  FROM user_rows u
@@ -5450,13 +5505,50 @@ def _usage_parallel_daily_rows(cur, query, partition) -> list[dict]:
         include_latency=False,
     )
     aggregates = _usage_fact_aggregate_columns()
-    cur.execute(
-        f"""
+    if dimensions:
+        token_user_days = f""", token_user_days AS (
+ SELECT local_day,user_id,
+  (sum(prompt_tokens_sum)+sum(completion_tokens_sum))::bigint
+    AS total_tokens
+ FROM source
+ GROUP BY local_day,user_id
+ HAVING sum(prompt_tokens_known_count)>0
+    AND sum(completion_tokens_known_count)>0
+), token_daily AS (
+ SELECT local_day,count(*)::int AS token_users,
+  coalesce(sum(total_tokens),0)::bigint AS token_user_tokens
+ FROM token_user_days GROUP BY local_day
+), daily_rows AS (
+ SELECT local_day,{aggregates},
+  count(DISTINCT user_id) FILTER (WHERE model_calls>0)::int
+    AS model_active_users
+ FROM source s GROUP BY local_day
+)"""
+        statement = f"""
+WITH source AS ({source_sql}){token_user_days}
+SELECT d.*,coalesce(t.token_users,0)::int AS token_users,
+ coalesce(t.token_user_tokens,0)::bigint AS token_user_tokens
+FROM daily_rows d LEFT JOIN token_daily t USING (local_day)
+ORDER BY d.local_day
+"""
+    else:
+        # The non-dimensional fact query already emits one row per user/day.
+        daily_token_columns = """
+ count(*) FILTER (
+  WHERE prompt_tokens_known_count>0 AND completion_tokens_known_count>0
+ )::int AS token_users,
+ coalesce(sum(prompt_tokens_sum+completion_tokens_sum) FILTER (
+  WHERE prompt_tokens_known_count>0 AND completion_tokens_known_count>0
+ ),0)::bigint AS token_user_tokens"""
+        statement = f"""
 WITH source AS ({source_sql})
 SELECT local_day,{aggregates},
- count(DISTINCT user_id) FILTER (WHERE model_calls>0)::int AS model_active_users
+ count(DISTINCT user_id) FILTER (WHERE model_calls>0)::int AS model_active_users,
+{daily_token_columns}
 FROM source s GROUP BY local_day ORDER BY local_day
-""",
+"""
+    cur.execute(
+        statement,
         params,
     )
     return cur.fetchall()
@@ -5695,6 +5787,11 @@ def _usage_payload_from_parallel_rows(
 
     rendered_totals = render(totals)
     activated = int(cohort["activated_users"] or 0)
+    current_app_users = int(cohort["current_app_users"] or 0)
+    current_hosted_v2_users = int(
+        cohort["current_hosted_v2_users"] or 0
+    )
+    token_user_tokens = int(totals.get("token_user_tokens") or 0)
     total_tokens = rendered_totals["total_tokens"]
     metered_prompt = _usage_optional_int(totals, "metered_prompt_tokens")
     metered_completion = _usage_optional_int(totals, "metered_completion_tokens")
@@ -5702,7 +5799,14 @@ def _usage_payload_from_parallel_rows(
     overview = {
         "registered_accounts": int(cohort["registered_accounts"] or 0),
         "activated_users": activated,
+        "current_app_users": current_app_users,
+        "current_hosted_v2_users": current_hosted_v2_users,
+        "current_hosted_v2_coverage": _usage_rate(
+            current_hosted_v2_users, current_app_users
+        ),
         "model_active_users": int(totals["model_active_users"] or 0),
+        "token_users": int(totals["token_users"] or 0),
+        "token_user_tokens": token_user_tokens,
         "metered_users": int(totals["metered_users"] or 0),
         "active_user_days": int(totals["active_user_days"] or 0),
         **{key: rendered_totals[key] for key in (
@@ -5715,6 +5819,7 @@ def _usage_payload_from_parallel_rows(
     averages = {
         "tokens_per_calendar_day": float(total_tokens) / duration_days if total_tokens is not None and duration_days > 0 else None,
         "tokens_per_active_user_day": float(total_tokens) / overview["active_user_days"] if total_tokens is not None and overview["active_user_days"] else None,
+        "tokens_per_token_user": float(token_user_tokens) / overview["token_users"] if overview["token_users"] else None,
         "tokens_per_activated_user_day": (
             float(total_tokens) / (activated * duration_days)
             if total_tokens is not None and activated and duration_days > 0
@@ -5742,18 +5847,26 @@ def _usage_payload_from_parallel_rows(
                     "cache_miss_tokens": 0, "unknown_usage_calls": 0,
                     "usage_reported_calls": 0, "cache_reported_calls": 0,
                     "usage_coverage": None, "cache_coverage": None, "cache_hit_ratio": None,
+                    "token_user_tokens": 0,
                 }
                 active_users = 0
+                token_users = 0
                 day_metered_total = None
             else:
                 item = render(row)
                 active_users = int(row["model_active_users"] or 0)
+                token_users = int(row["token_users"] or 0)
+                item["token_user_tokens"] = int(
+                    row.get("token_user_tokens") or 0
+                )
                 mp = _usage_optional_int(row, "metered_prompt_tokens")
                 mc = _usage_optional_int(row, "metered_completion_tokens")
                 day_metered_total = mp + mc if mp is not None and mc is not None else None
             item.update({
                 "local_day": day.isoformat(), "model_active_users": active_users,
+                "token_users": token_users,
                 "tokens_per_active_user_day": float(item["total_tokens"]) / active_users if item["total_tokens"] is not None and active_users else None,
+                "tokens_per_token_user": float(item["token_user_tokens"]) / token_users if token_users else None,
                 "tokens_per_metered_turn": float(day_metered_total) / item["metered_turns"] if day_metered_total is not None and item["metered_turns"] else None,
             })
             daily.append(item)
@@ -5949,10 +6062,20 @@ WITH user_times AS (
         AND ({memory_created_at_sql}) < %s
     )
   )
+), current_population AS (
+  SELECT
+    count(*)::int AS current_app_users,
+    count(*) FILTER (WHERE s.hosted_runtime_state='v2')::int
+      AS current_hosted_v2_users
+  FROM users u
+  LEFT JOIN v2_runtime_state s ON s.user_id=u.user_id
 )
 SELECT
   count(*) FILTER (WHERE existed_at_end)::int AS registered_accounts,
   (SELECT count(*)::int FROM activated) AS activated_users,
+  (SELECT current_app_users FROM current_population) AS current_app_users,
+  (SELECT current_hosted_v2_users FROM current_population)
+    AS current_hosted_v2_users,
   count(*) FILTER (WHERE unparseable)::int AS unparseable_registered_rows,
   (SELECT count(*)::int FROM memory_moments mm
    JOIN registered r ON r.user_id=mm.user_id
@@ -5971,11 +6094,21 @@ FROM registered
 
                 cur.execute(
                     base_cte
-                    + """
+                    + """,
+token_user_totals AS (
+  SELECT user_id,
+         (sum(prompt_tokens) + sum(completion_tokens))::bigint AS total_tokens
+  FROM base
+  GROUP BY user_id
+  HAVING count(prompt_tokens)>0 AND count(completion_tokens)>0
+)
 SELECT
   count(*)::int AS turns,
   count(DISTINCT user_id) FILTER (WHERE model_calls > 0)::int
     AS model_active_users,
+  (SELECT count(*)::int FROM token_user_totals) AS token_users,
+  (SELECT coalesce(sum(total_tokens),0)::bigint FROM token_user_totals)
+    AS token_user_tokens,
   count(DISTINCT user_id) FILTER (WHERE usage_reported_calls > 0)::int
     AS metered_users,
   count(DISTINCT (user_id, local_day)) FILTER (WHERE model_calls > 0)::int
@@ -6067,9 +6200,23 @@ days AS (
          coalesce(sum(usage_reported_calls), 0)::bigint AS usage_reported_calls,
          coalesce(sum(cache_reported_calls), 0)::bigint AS cache_reported_calls
   FROM base GROUP BY local_day
+), daily_token_users AS (
+  SELECT local_day, count(*)::int AS token_users,
+         coalesce(sum(total_tokens),0)::bigint AS token_user_tokens
+  FROM (
+    SELECT local_day, user_id,
+           (sum(prompt_tokens) + sum(completion_tokens))::bigint
+             AS total_tokens
+    FROM base
+    GROUP BY local_day, user_id
+    HAVING count(prompt_tokens)>0 AND count(completion_tokens)>0
+  ) known_user_days
+  GROUP BY local_day
 )
 SELECT days.local_day, coalesce(d.turns, 0)::int AS turns,
        coalesce(d.model_active_users, 0)::int AS model_active_users,
+       coalesce(t.token_users, 0)::int AS token_users,
+       coalesce(t.token_user_tokens, 0)::bigint AS token_user_tokens,
        coalesce(d.metered_turns, 0)::int AS metered_turns,
        coalesce(d.model_calls, 0)::bigint AS model_calls,
        coalesce(d.retries, 0)::bigint AS retries,
@@ -6088,7 +6235,9 @@ SELECT days.local_day, coalesce(d.turns, 0)::int AS turns,
        coalesce(d.unknown_usage_calls, 0)::bigint AS unknown_usage_calls,
        coalesce(d.usage_reported_calls, 0)::bigint AS usage_reported_calls,
        coalesce(d.cache_reported_calls, 0)::bigint AS cache_reported_calls
-FROM days LEFT JOIN daily d USING (local_day)
+FROM days
+LEFT JOIN daily d USING (local_day)
+LEFT JOIN daily_token_users t USING (local_day)
 ORDER BY days.local_day
 """,
                     (
@@ -6268,6 +6417,11 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
     active_user_days = int(totals["active_user_days"] or 0)
     metered_turns = int(totals["metered_turns"] or 0)
     activated_users = int(cohort["activated_users"] or 0)
+    current_app_users = int(cohort["current_app_users"] or 0)
+    current_hosted_v2_users = int(
+        cohort["current_hosted_v2_users"] or 0
+    )
+    token_user_tokens = int(totals.get("token_user_tokens") or 0)
     usage_calls = int(totals["usage_reported_calls"] or 0)
     cache_calls = int(totals["cache_reported_calls"] or 0)
     cache_read = _usage_optional_int(totals, "cache_read_tokens")
@@ -6281,7 +6435,14 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
     overview = {
         "registered_accounts": int(cohort["registered_accounts"] or 0),
         "activated_users": activated_users,
+        "current_app_users": current_app_users,
+        "current_hosted_v2_users": current_hosted_v2_users,
+        "current_hosted_v2_coverage": _usage_rate(
+            current_hosted_v2_users, current_app_users
+        ),
         "model_active_users": int(totals["model_active_users"] or 0),
+        "token_users": int(totals["token_users"] or 0),
+        "token_user_tokens": token_user_tokens,
         "metered_users": int(totals["metered_users"] or 0),
         "active_user_days": active_user_days,
         "turns": turns,
@@ -6306,6 +6467,11 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
         "tokens_per_active_user_day": (
             float(total_tokens) / active_user_days
             if total_tokens is not None and active_user_days
+            else None
+        ),
+        "tokens_per_token_user": (
+            float(token_user_tokens) / overview["token_users"]
+            if overview["token_users"]
             else None
         ),
         "tokens_per_activated_user_day": (
@@ -6377,10 +6543,20 @@ FROM v2_turn_metrics m WHERE {filter_where_sql}
         if include_day:
             result["local_day"] = row["local_day"].isoformat()
             active_users = int(row["model_active_users"] or 0)
+            token_users = int(row["token_users"] or 0)
             result["model_active_users"] = active_users
+            result["token_users"] = token_users
+            result["token_user_tokens"] = int(
+                row.get("token_user_tokens") or 0
+            )
             result["tokens_per_active_user_day"] = (
                 float(row_total) / active_users
                 if row_total is not None and active_users
+                else None
+            )
+            result["tokens_per_token_user"] = (
+                float(result["token_user_tokens"]) / token_users
+                if token_users
                 else None
             )
             day_metered_prompt = _usage_optional_int(
@@ -6657,9 +6833,18 @@ WITH registered AS (
     AND to_timestamp(c.ts) < %s)
   OR EXISTS (SELECT 1 FROM memory_moments mm WHERE mm.user_id=r.user_id
     AND ({memory}) < %s)
- ))
+ )), current_population AS (
+ SELECT count(*)::int AS current_app_users,
+  count(*) FILTER (WHERE s.hosted_runtime_state='v2')::int
+    AS current_hosted_v2_users
+ FROM users u
+ LEFT JOIN v2_runtime_state s ON s.user_id=u.user_id
+ )
 SELECT count(*) FILTER (WHERE existed_at_end)::int AS registered_accounts,
  (SELECT count(*)::int FROM activated) AS activated_users,
+ (SELECT current_app_users FROM current_population) AS current_app_users,
+ (SELECT current_hosted_v2_users FROM current_population)
+   AS current_hosted_v2_users,
  count(*) FILTER (WHERE unparseable)::int AS unparseable_registered_rows,
  (SELECT count(*)::int FROM memory_moments mm JOIN at_end r ON r.user_id=mm.user_id
   WHERE ({memory}) IS NULL) AS legacy_memory_rows_without_valid_created_at
@@ -6780,7 +6965,23 @@ def _usage_report_snapshot_hybrid_serial(query) -> dict | None:
     metered_users = len(
         {row["user_id"] for row in core_facts if row["usage_reported_calls"] > 0}
     )
+    user_groups = _usage_group_facts(core_facts, ("user_id",))
+    known_token_users = [
+        row
+        for row in user_groups
+        if row["prompt_tokens"] is not None
+        and row["completion_tokens"] is not None
+    ]
+    token_users = len(known_token_users)
+    token_user_tokens = sum(
+        int(row["prompt_tokens"]) + int(row["completion_tokens"])
+        for row in known_token_users
+    )
     activated_users = int(cohort["activated_users"] or 0)
+    current_app_users = int(cohort["current_app_users"] or 0)
+    current_hosted_v2_users = int(
+        cohort["current_hosted_v2_users"] or 0
+    )
     prompt = totals["prompt_tokens"]
     completion = totals["completion_tokens"]
     total_tokens = prompt + completion if prompt is not None and completion is not None else None
@@ -6833,7 +7034,14 @@ def _usage_report_snapshot_hybrid_serial(query) -> dict | None:
     overview = {
         "registered_accounts": int(cohort["registered_accounts"] or 0),
         "activated_users": activated_users,
+        "current_app_users": current_app_users,
+        "current_hosted_v2_users": current_hosted_v2_users,
+        "current_hosted_v2_coverage": _usage_rate(
+            current_hosted_v2_users, current_app_users
+        ),
         "model_active_users": model_active_users,
+        "token_users": token_users,
+        "token_user_tokens": token_user_tokens,
         "metered_users": metered_users,
         "active_user_days": active_user_days,
         **{key: render_aggregate(totals)[key] for key in (
@@ -6853,6 +7061,7 @@ def _usage_report_snapshot_hybrid_serial(query) -> dict | None:
     averages = {
         "tokens_per_calendar_day": float(total_tokens) / duration_days if total_tokens is not None and duration_days > 0 else None,
         "tokens_per_active_user_day": float(total_tokens) / active_user_days if total_tokens is not None and active_user_days else None,
+        "tokens_per_token_user": float(token_user_tokens) / token_users if token_users else None,
         "tokens_per_activated_user_day": (
             float(total_tokens) / (activated_users * duration_days)
             if total_tokens is not None and activated_users and duration_days > 0
@@ -6885,10 +7094,24 @@ def _usage_report_snapshot_hybrid_serial(query) -> dict | None:
                 row[field] = 0
         item = render_aggregate(row)
         day_users = {fact["user_id"] for fact in core_facts if fact["local_day"] == day and fact["model_calls"] > 0}
+        day_token_users = [
+            fact
+            for fact in user_day_groups
+            if fact["local_day"] == day
+            and fact["prompt_tokens"] is not None
+            and fact["completion_tokens"] is not None
+        ]
+        day_token_user_tokens = sum(
+            int(fact["prompt_tokens"]) + int(fact["completion_tokens"])
+            for fact in day_token_users
+        )
         item.update({
             "local_day": day.isoformat(),
             "model_active_users": len(day_users),
+            "token_users": len(day_token_users),
+            "token_user_tokens": day_token_user_tokens,
             "tokens_per_active_user_day": float(item["total_tokens"]) / len(day_users) if item["total_tokens"] is not None and day_users else None,
+            "tokens_per_token_user": float(day_token_user_tokens) / len(day_token_users) if day_token_users else None,
             "tokens_per_metered_turn": (
                 float(row["metered_prompt_tokens"] + row["metered_completion_tokens"]) / row["metered_turns"]
                 if row["metered_prompt_tokens"] is not None and row["metered_completion_tokens"] is not None and row["metered_turns"] else None
@@ -6901,7 +7124,6 @@ def _usage_report_snapshot_hybrid_serial(query) -> dict | None:
     primary_by_user: dict[str, tuple[str, str]] = {}
     for row in sorted(primary_groups, key=lambda row: (row["user_id"], -row["model_calls"], row["provider"], row["model"])):
         primary_by_user.setdefault(str(row["user_id"]), (str(row["provider"]), str(row["model"])))
-    user_groups = _usage_group_facts(core_facts, ("user_id",))
     users = []
     for row in user_groups:
         item = render_aggregate(row)

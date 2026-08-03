@@ -328,6 +328,12 @@ def usage_rows():
         )
     with db.get_pool().connection() as conn:
         conn.execute(
+            "INSERT INTO v2_runtime_state (user_id,hosted_runtime_state) "
+            "VALUES (%s,'v2'),(%s,'v2') "
+            "ON CONFLICT (user_id) DO UPDATE SET hosted_runtime_state='v2'",
+            ("u_usage_alpha", "u_usage_beta"),
+        )
+        conn.execute(
             "INSERT INTO memory_moments (user_id,moment_id,occurred_at,doc) "
             "VALUES (%s,%s,%s,%s)",
             (
@@ -1645,7 +1651,12 @@ def _usage_render_report() -> dict:
         "overview": {
             "registered_accounts": 12,
             "activated_users": 8,
+            "current_app_users": 12,
+            "current_hosted_v2_users": 7,
+            "current_hosted_v2_coverage": 7 / 12,
             "model_active_users": 5,
+            "token_users": 4,
+            "token_user_tokens": 1_545,
             "metered_users": 4,
             "active_user_days": 7,
             "turns": 11,
@@ -1664,6 +1675,7 @@ def _usage_render_report() -> dict:
         "averages": {
             "tokens_per_calendar_day": 51.5,
             "tokens_per_active_user_day": 220.714,
+            "tokens_per_token_user": 386.25,
             "tokens_per_activated_user_day": 6.4375,
             "tokens_per_metered_turn": 171.667,
             "user_day_tokens": {
@@ -1680,6 +1692,8 @@ def _usage_render_report() -> dict:
             "local_day": "2026-07-31",
             "turns": 11,
             "model_active_users": 5,
+            "token_users": 4,
+            "token_user_tokens": 1_545,
             "metered_turns": 9,
             "model_calls": 14,
             "retries": 3,
@@ -1697,6 +1711,7 @@ def _usage_render_report() -> dict:
             "cache_coverage": 8 / 14,
             "cache_hit_ratio": 2 / 3,
             "tokens_per_active_user_day": 309.0,
+            "tokens_per_token_user": 386.25,
             "tokens_per_metered_turn": 171.667,
         }],
         "users": [{
@@ -1781,6 +1796,31 @@ def _usage_render_report() -> dict:
             "latency_ms_p95": 4_500,
             "failure_rate": 1 / 6,
             "retry_rate": 0.25,
+        }, {
+            "lane": "heartbeat",
+            "users": 2,
+            "turns": 5,
+            "model_calls": 6,
+            "retries": 1,
+            "failed_turns": 1,
+            "metered_turns": 4,
+            "prompt_tokens": 300,
+            "completion_tokens": 145,
+            "total_tokens": 445,
+            "cache_read_tokens": 100,
+            "cache_write_tokens": 10,
+            "cache_miss_tokens": 100,
+            "unknown_usage_calls": 1,
+            "usage_reported_calls": 5,
+            "cache_reported_calls": 3,
+            "usage_coverage": 5 / 6,
+            "cache_coverage": 0.5,
+            "cache_hit_ratio": 0.5,
+            "tokens_per_call": 445 / 6,
+            "latency_ms_p50": 2_000,
+            "latency_ms_p95": 6_000,
+            "failure_rate": 0.2,
+            "retry_rate": 1 / 6,
         }],
         "filters": {
             "lanes": ["chat", "heartbeat"],
@@ -2126,11 +2166,19 @@ def test_usage_page_renders_independent_report_filters_and_drill_down(monkeypatc
 
     for label in (
         "Usage / 模型用量",
+        "用户覆盖与窗口活动",
+        "当前账号覆盖",
+        "所选窗口活动 · 跟随筛选",
+        "全部 App 用户",
+        "当前 Hosted V2",
+        "窗口内 Token 用户",
         "Fleet Overview",
+        "Token 用量与成本结构",
         "平均值",
         "每日趋势",
         "Per-user Usage",
         "Provider / Model",
+        "Lane breakdown · 成本拆分",
         "数据覆盖与边界",
     ):
         assert label in body
@@ -2142,6 +2190,15 @@ def test_usage_page_renders_independent_report_filters_and_drill_down(monkeypatc
     assert "name='model'" in body and "name='completeness'" in body
     assert "unavailable until P0-B" in body
     assert "unavailable until self-host phase" in body
+    assert "Resident V1、Hosted V1 与 self-host token 均未计入" in body
+    assert "Background known tokens" in body
+    assert "两组不是漏斗，不能直接相减" in body
+    assert "筛选 lane=chat 时 Background 为 0，不代表全站后台用量为 0" in body
+    assert "窗口内 input / output 两列各至少有一次已知值" in body
+    assert "Complete-cohort tokens" in body
+    assert "Known total 会保留 partial-only 用户已知的 token" in body
+    assert "445" in body
+    assert "28.8%" in body
     assert "provider<&" not in body
     assert "model<script>" not in body
     assert "provider&lt;&amp;" in body
@@ -2151,6 +2208,23 @@ def test_usage_page_renders_independent_report_filters_and_drill_down(monkeypatc
         in body
     )
     assert "admin_key=query-admin-token" in body
+
+
+def test_usage_page_renders_unknown_v2_coverage_as_dash(monkeypatch):
+    report = _usage_render_report()
+    report["overview"].update({
+        "current_app_users": 0,
+        "current_hosted_v2_users": 0,
+        "current_hosted_v2_coverage": None,
+    })
+    monkeypatch.setattr(_data_track, "_usage_report", lambda _query: report)
+
+    body = _admin_core.page_html("view=usage&preset=7d")
+    start = body.index("当前 Hosted V2")
+    current_v2_card = body[start:body.index("</div></div>", start)]
+
+    assert "coverage-value'>0</div>" in current_v2_card
+    assert "占全部 App 用户 —" in current_v2_card
 
 
 def test_usage_filter_form_preserves_rolling_preset_when_adding_provider(monkeypatch):
@@ -2454,7 +2528,12 @@ def test_usage_snapshot_reconciles_users_days_models_failures_and_unknowns(usage
     assert report["overview"] == {
         "registered_accounts": 3,
         "activated_users": 3,
+        "current_app_users": 4,
+        "current_hosted_v2_users": 2,
+        "current_hosted_v2_coverage": 0.5,
         "model_active_users": 2,
+        "token_users": 2,
+        "token_user_tokens": 215,
         "metered_users": 2,
         "active_user_days": 4,
         "turns": 5,
@@ -2473,6 +2552,7 @@ def test_usage_snapshot_reconciles_users_days_models_failures_and_unknowns(usage
     averages = report["averages"]
     assert averages["tokens_per_calendar_day"] == pytest.approx(107.5)
     assert averages["tokens_per_active_user_day"] == pytest.approx(53.75)
+    assert averages["tokens_per_token_user"] == pytest.approx(107.5)
     assert averages["tokens_per_activated_user_day"] == pytest.approx(215 / 6)
     assert averages["tokens_per_metered_turn"] == pytest.approx(215 / 3)
     assert averages["model_calls_per_turn"] == pytest.approx(1.2)
@@ -2487,11 +2567,15 @@ def test_usage_snapshot_reconciles_users_days_models_failures_and_unknowns(usage
     first, second = report["daily"]
     assert first["total_tokens"] == 120
     assert first["model_active_users"] == 2
+    assert first["token_users"] == 1
+    assert first["tokens_per_token_user"] == pytest.approx(120)
     assert first["tokens_per_active_user_day"] == pytest.approx(60)
     assert first["model_calls"] == 3
     assert first["failed_turns"] == 1
     assert first["unknown_usage_calls"] == 1
     assert second["total_tokens"] == 95
+    assert second["token_users"] == 2
+    assert second["tokens_per_token_user"] == pytest.approx(47.5)
     assert second["model_calls"] == 3
     assert second["retries"] == 1
 
@@ -2534,6 +2618,8 @@ def test_usage_snapshot_filters_every_usage_section_but_not_reference_cohorts(us
 
     assert report["overview"]["registered_accounts"] == 3
     assert report["overview"]["activated_users"] == 3
+    assert report["overview"]["current_app_users"] == 4
+    assert report["overview"]["current_hosted_v2_users"] == 2
     assert report["overview"]["turns"] == 2
     assert report["overview"]["model_calls"] == 3
     assert report["overview"]["total_tokens"] == 35
@@ -2544,6 +2630,41 @@ def test_usage_snapshot_filters_every_usage_section_but_not_reference_cohorts(us
         ("openrouter", "gpt-a")
     }
     assert sum(row["turns"] for row in report["daily"]) == 2
+
+
+def test_usage_snapshot_user_drilldown_keeps_global_current_population(usage_rows):
+    report = jobs_store.usage_report_snapshot(
+        _usage_query(user_id="u_usage_beta")
+    )
+
+    assert report["overview"]["registered_accounts"] == 1
+    assert report["overview"]["current_app_users"] == 4
+    assert report["overview"]["current_hosted_v2_users"] == 2
+    assert report["overview"]["current_hosted_v2_coverage"] == pytest.approx(0.5)
+
+
+def test_usage_current_v2_population_excludes_resident_and_draining_states(
+    usage_rows,
+):
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE v2_runtime_state SET hosted_runtime_state='draining' "
+            "WHERE user_id='u_usage_beta'"
+        )
+        conn.execute(
+            "INSERT INTO v2_runtime_state (user_id,hosted_runtime_state) "
+            "VALUES ('u_usage_idle','resident') "
+            "ON CONFLICT (user_id) DO UPDATE "
+            "SET hosted_runtime_state='resident'"
+        )
+
+    report = jobs_store.usage_report_snapshot(_usage_query())
+
+    assert report["overview"]["current_app_users"] == 4
+    assert report["overview"]["current_hosted_v2_users"] == 1
+    assert report["overview"]["current_hosted_v2_coverage"] == pytest.approx(
+        0.25
+    )
 
 
 def test_usage_snapshot_preserves_unknown_token_and_cache_totals(usage_rows):
@@ -2558,6 +2679,61 @@ def test_usage_snapshot_preserves_unknown_token_and_cache_totals(usage_rows):
     assert first["cache_read_tokens"] is None
     assert first["cache_hit_ratio"] is None
     assert first["usage_coverage"] == pytest.approx(0.0)
+
+
+def test_usage_token_user_average_excludes_partial_only_and_matches_all_paths(
+    usage_rows,
+):
+    rows = [
+        ("u_usage_idle", "split-prompt", "split-a", 40, None),
+        ("u_usage_idle", "split-completion", "split-b", None, 10),
+        ("u_usage_future", "partial-only", "partial", 90, None),
+    ]
+    with db.get_pool().connection() as conn:
+        for user_id, status, model, prompt, completion in rows:
+            conn.execute(
+                "INSERT INTO v2_turn_metrics "
+                "(user_id,lane,provider,model,prompt_tokens,completion_tokens,"
+                "usage_reported_calls,cache_reported_calls,model_calls,retries,"
+                "failed,status,created_at) "
+                "VALUES (%s,'chat','openrouter',%s,%s,%s,1,0,1,0,false,%s,%s)",
+                (
+                    user_id,
+                    model,
+                    prompt,
+                    completion,
+                    status,
+                    "2026-07-01T13:00:00+00:00",
+                ),
+            )
+
+    query = _shanghai_usage_query(provider="openrouter")
+    raw = jobs_store._usage_report_snapshot_raw(query)
+    _enable_usage_rollup()
+    try:
+        parallel = jobs_store.usage_report_snapshot(query)
+        serial = jobs_store._usage_report_snapshot_hybrid_serial(query)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM v2_usage_rollup_watermarks")
+
+    assert serial is not None
+    for report in (raw, parallel, serial):
+        assert report["overview"]["total_tokens"] == 295
+        assert report["overview"]["token_users"] == 3
+        assert report["overview"]["token_user_tokens"] == 205
+        assert report["averages"]["tokens_per_token_user"] == pytest.approx(
+            205 / 3
+        )
+        first, second = report["daily"]
+        assert first["total_tokens"] == 260
+        assert first["token_users"] == 2
+        assert first["token_user_tokens"] == 170
+        assert first["tokens_per_token_user"] == pytest.approx(85)
+        assert second["total_tokens"] == 35
+        assert second["token_users"] == 1
+        assert second["token_user_tokens"] == 35
+        assert second["tokens_per_token_user"] == pytest.approx(35)
 
 
 def test_usage_snapshot_metered_turn_average_excludes_legacy_unreported_tokens(

@@ -3447,6 +3447,81 @@ def _render_usage_page(
         or query.completeness != "all"
     )
 
+    current_app_users = overview.get("current_app_users")
+    current_hosted_v2_users = overview.get("current_hosted_v2_users")
+    current_v2_coverage = overview.get("current_hosted_v2_coverage")
+    lane_source = report.get("lanes")
+    lanes_available = lane_source is not None
+    lanes = list(lane_source or [])
+
+    def summed_lane_tokens(rows: list[dict]) -> int | None:
+        if not lanes_available:
+            return None
+        if not rows:
+            return 0
+        values = [row.get("total_tokens") for row in rows]
+        if any(value is None for value in values):
+            return None
+        return sum(int(value) for value in values)
+
+    chat_tokens = summed_lane_tokens([
+        row for row in lanes if str(row.get("lane") or "unknown") == "chat"
+    ])
+    background_tokens = summed_lane_tokens([
+        row for row in lanes if str(row.get("lane") or "unknown") != "chat"
+    ])
+    split_total = (
+        chat_tokens + background_tokens
+        if chat_tokens is not None and background_tokens is not None
+        else None
+    )
+    background_share = (
+        float(background_tokens) / split_total
+        if split_total
+        else None
+    )
+
+    def coverage_node(label: str, value: str, detail: str) -> str:
+        return (
+            "<div class='coverage-node'>"
+            f"<div class='coverage-label'>{html.escape(label)}</div>"
+            f"<div class='coverage-value'>{html.escape(value)}</div>"
+            f"<div class='coverage-detail'>{html.escape(detail)}</div>"
+            "</div>"
+        )
+
+    coverage_groups = (
+        "<div class='coverage-groups'>"
+        "<section class='coverage-group'>"
+        "<div class='coverage-group-title'>当前账号覆盖</div>"
+        "<div class='coverage-pair'>"
+        + coverage_node(
+            "全部 App 用户",
+            _fmt_count(current_app_users),
+            "当前 users account rows · 全 runtime mode",
+        )
+        + coverage_node(
+            "当前 Hosted V2",
+            _fmt_count(current_hosted_v2_users),
+            f"占全部 App 用户 {_fmt_ratio(current_v2_coverage)}",
+        )
+        + "</div></section>"
+        "<section class='coverage-group'>"
+        "<div class='coverage-group-title'>所选窗口活动 · 跟随筛选</div>"
+        "<div class='coverage-pair'>"
+        + coverage_node(
+            "窗口内模型用户",
+            _fmt_count(overview.get("model_active_users")),
+            "至少一次 model call",
+        )
+        + coverage_node(
+            "窗口内 Token 用户（完整）",
+            _fmt_count(overview.get("token_users")),
+            "窗口内 input / output 两列各至少有一次已知值",
+        )
+        + "</div></section></div>"
+    )
+
     def page_href(**updates) -> str:
         if drilldown_user_id:
             return _usage_user_href(query, drilldown_user_id, **updates)
@@ -3498,21 +3573,29 @@ def _render_usage_page(
   </form>"""
 
     reference_metrics = "".join([
-        _render_metric("Registered reference", _fmt_count(overview.get("registered_accounts"))),
-        _render_metric("Activated reference", _fmt_count(overview.get("activated_users"))),
+        _render_metric("Range-end registered", _fmt_count(overview.get("registered_accounts"))),
+        _render_metric("Range-end activated", _fmt_count(overview.get("activated_users"))),
         _render_metric("Installations", "unavailable until self-host phase"),
     ])
     usage_metrics = "".join([
         _render_metric("Model-active users", _fmt_count(overview.get("model_active_users"))),
-        _render_metric("Metered users", _fmt_count(overview.get("metered_users"))),
+        _render_metric("Complete-token users", _fmt_count(overview.get("token_users"))),
+        _render_metric("Usage-reporting users", _fmt_count(overview.get("metered_users"))),
         _render_metric("Active user-days", _fmt_count(overview.get("active_user_days"))),
         _render_metric("Turns", _fmt_count(overview.get("turns"))),
         _render_metric("Model calls", _fmt_count(overview.get("model_calls"))),
         _render_metric("Retries", _fmt_count(overview.get("retries"))),
         _render_metric("Failed turns", _fmt_count(overview.get("failed_turns"))),
+    ])
+    token_metrics = "".join([
         _render_metric("Prompt tokens", _fmt_count(overview.get("prompt_tokens"))),
         _render_metric("Completion tokens", _fmt_count(overview.get("completion_tokens"))),
         _render_metric("Known total tokens", _fmt_count(overview.get("total_tokens"))),
+        _render_metric("Complete-cohort tokens", _fmt_count(overview.get("token_user_tokens"))),
+        _render_metric("Tokens / complete-token user", _usage_float(averages.get("tokens_per_token_user"))),
+        _render_metric("Chat known tokens", _fmt_count(chat_tokens)),
+        _render_metric("Background known tokens", _fmt_count(background_tokens)),
+        _render_metric("Background share", _fmt_ratio(background_share)),
         _render_metric("Cache read / write / miss", " / ".join([
             _fmt_count(overview.get("cache_read_tokens")),
             _fmt_count(overview.get("cache_write_tokens")),
@@ -3555,6 +3638,8 @@ def _render_usage_page(
             f"<td>{html.escape(str(row.get('local_day') or ''))}</td>"
             f"<td>{_fmt_count(total)}<div class='usage-bar'><span style='width:{width:.1f}%'></span></div></td>"
             f"<td>{_fmt_count(row.get('model_active_users'))}</td>"
+            f"<td>{_fmt_count(row.get('token_users'))}</td>"
+            f"<td>{_usage_float(row.get('tokens_per_token_user'))}</td>"
             f"<td>{_usage_float(row.get('tokens_per_active_user_day'))}</td>"
             f"<td>{_usage_float(row.get('tokens_per_metered_turn'))}</td>"
             f"<td>{_fmt_count(row.get('model_calls'))}</td>"
@@ -3623,9 +3708,8 @@ def _render_usage_page(
             "</tr>"
         )
 
-    lanes_available = report.get("lanes") is not None
     lane_rows = []
-    for row in report.get("lanes") or []:
+    for row in lanes:
         lane_rows.append(
             "<tr>"
             f"<td>{html.escape(str(row.get('lane') or 'unknown'))}</td>"
@@ -3678,9 +3762,9 @@ def _render_usage_page(
         "".join(daily_rows)
         if daily_rows
         else (
-            "<tr><td colspan='9' class='muted'>窗口内无日期。</td></tr>"
+            "<tr><td colspan='11' class='muted'>窗口内无日期。</td></tr>"
             if daily_available
-            else "<tr><td colspan='9' class='muted'>每日趋势暂时取不到；其他区块仍可用。</td></tr>"
+            else "<tr><td colspan='11' class='muted'>每日趋势暂时取不到；其他区块仍可用。</td></tr>"
         )
     )
     user_body = (
@@ -3710,10 +3794,9 @@ def _render_usage_page(
             else "<tr><td colspan='7' class='muted'>Lane breakdown 暂时取不到；其他区块仍可用。</td></tr>"
         )
     )
-    lane_section = ""
-    if drilldown_user_id:
-        lane_section = f"""
-  <h2>Lane breakdown</h2>
+    lane_section = f"""
+  <h2>Lane breakdown · 成本拆分</h2>
+  <div class='muted'>chat 单列；background 是所有非 chat lane 的合计。下表保留逐 lane 明细，便于定位 dream / profile / heartbeat / maintenance / capture 的成本。</div>
   <div class='table-wrap'><table><thead><tr><th>Lane</th><th>Users</th><th>Turns / calls / retries</th><th>Failed / failure / retry rate</th><th>Prompt / completion / total</th><th>Cache R / W / M</th><th>Usage / cache coverage</th></tr></thead>
   <tbody>{lane_body}</tbody></table></div>"""
     optional_note_parts = []
@@ -3740,6 +3823,18 @@ def _render_usage_page(
     .usage-bar {{ width:90px; height:4px; margin-top:4px; background:#eee3d9; border-radius:2px; overflow:hidden; }}
     .usage-bar span {{ display:block; height:100%; background:var(--accent); }}
     .table-wrap {{ overflow-x:auto; }}
+    .coverage-groups {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:18px 0 8px; }}
+    .coverage-group {{ min-width:0; padding:12px; border:1px solid var(--line); border-radius:9px; background:#fbf7f3; }}
+    .coverage-group-title {{ margin:0 0 9px 2px; color:var(--muted); font-size:12px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; }}
+    .coverage-pair {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; align-items:stretch; }}
+    .coverage-node {{ height:100%; box-sizing:border-box; background:var(--card); border:1px solid var(--line); border-top:3px solid var(--accent); border-radius:8px; padding:14px; }}
+    .coverage-label {{ color:var(--muted); font-size:12px; letter-spacing:.04em; }}
+    .coverage-value {{ margin:3px 0 2px; font-size:28px; line-height:1.15; font-weight:750; font-variant-numeric:tabular-nums; }}
+    .coverage-detail {{ color:var(--muted); font-size:11px; }}
+    @media (max-width:760px) {{
+      .coverage-groups {{ grid-template-columns:1fr; }}
+    }}
+    @media (max-width:460px) {{ .coverage-pair {{ grid-template-columns:1fr; }} }}
   </style>
 </head>
 <body><main>
@@ -3750,16 +3845,23 @@ def _render_usage_page(
   <div class='sortbar'>{''.join(preset_links)}</div>
   {filter_form}
   {drilldown}
-  <h2>Fleet Overview · reference cohort</h2>
+  <h2>用户覆盖与窗口活动</h2>
+  {coverage_groups}
+  <div class='note-box'><b>先看清口径：</b>“当前账号覆盖”是此刻的全站账号状态；“所选窗口活动”是 Hosted V2 telemetry 的历史窗口数据，并跟随筛选。两组不是漏斗，不能直接相减。当前 Hosted V2 覆盖率 = Hosted V2 users / 全部 App account rows；它不是 usage 上报覆盖率。</div>
+  <h2>Reference cohort · 截止所选区间末端</h2>
   <section class='metrics'>{reference_metrics}</section>
   <h2>Fleet Overview · filtered usage</h2>
   <section class='metrics'>{usage_metrics}</section>
+  <h2>Token 用量与成本结构 · 跟随当前筛选</h2>
+  <section class='metrics'>{token_metrics}</section>
+  <div class='muted'>Known total 会保留 partial-only 用户已知的 token；Complete-cohort tokens 与其人均值只统计窗口内 input / output 两列各至少有一次已知值的用户，因此两者不一定相等。Chat / Background 仅拆分当前所选 cohort；例如筛选 lane=chat 时 Background 为 0，不代表全站后台用量为 0。</div>
   <h2>平均值</h2>
   <section class='metrics'>{average_metrics}</section>
   {optional_note}
   <div class='note-box'><b>P0-A 边界：</b>Reasoning tokens、possibly-billed attempts 与 authoritative cost 均 <b>unavailable until P0-B</b>，不会显示成零。Prompt token 已包含 cache token，不能重复相加。</div>
   <h2>每日趋势</h2>
-  <div class='table-wrap'><table><thead><tr><th>Local day</th><th>Known tokens</th><th>Active users</th><th>Tokens / active user-day</th><th>Tokens / metered turn</th><th>Calls</th><th>Retries</th><th>Failed</th><th>Usage / cache coverage</th></tr></thead>
+  <div class='muted'>按 {timezone_name} 自然日展示；滚动窗口的首尾日期可能只覆盖部分自然日，custom 日期区间则按完整自然日。</div>
+  <div class='table-wrap'><table><thead><tr><th>Local day</th><th>Known tokens</th><th>Active users</th><th>Complete-token users</th><th>Tokens / complete-token user</th><th>Tokens / active user-day</th><th>Tokens / metered turn</th><th>Calls</th><th>Retries</th><th>Failed</th><th>Usage / cache coverage</th></tr></thead>
   <tbody>{daily_body}</tbody></table></div>
   <h2>Per-user Usage</h2>
   <div class='sortbar'>{''.join(sort_links)} {''.join(pager)}<span class='muted'>Showing {user_offset + 1 if user_rows else 0}–{user_offset + len(user_rows)} of {user_total}</span></div>
@@ -3774,7 +3876,7 @@ def _render_usage_page(
   {rollup_freshness}
   <div class='note-box'>Usage {_fmt_count(coverage.get('usage_reported_calls'))} / {_fmt_count(coverage.get('model_calls'))} ({_fmt_ratio(coverage.get('usage_coverage'))}) · Cache {_fmt_count(coverage.get('cache_reported_calls'))} / {_fmt_count(coverage.get('model_calls'))} ({_fmt_ratio(coverage.get('cache_coverage'))}) · Cache hit {_fmt_ratio(coverage.get('cache_hit_ratio'))}.<br>
   参考 cohort basis: <code>{html.escape(str(cohort.get('basis') or 'unknown'))}</code>；unparseable registrations {_fmt_count(cohort.get('unparseable_registered_rows'))}，legacy memory timestamps {_fmt_count(cohort.get('legacy_memory_rows_without_valid_created_at'))}。{html.escape(str(cohort.get('limitation') or ''))}<br>
-  仅统计本实例 Hosted Runtime V2；self-host 与 installation 级统计 unavailable until self-host phase。Unknown 是缺报，不是零。</div>
+  <b>范围：</b>全部 App 用户与 range-end reference cards 来自 users，跨所有 runtime mode；其余 usage、每日趋势、用户/模型/lane 明细仅统计本实例 Hosted Runtime V2。Resident V1、Hosted V1 与 self-host token 均未计入，不能从本页数字外推。Unknown 是缺报，不是零。</div>
 </main></body></html>"""
 
 
