@@ -785,6 +785,325 @@ def test_narrow_probe_day_and_raw_builders_execute_on_empty_postgresql():
     assert raw_cursor.rowcount == 0
 
 
+@pytest.mark.parametrize("shape", ("bounded_unions", "grouping_sets"))
+def test_narrow_candidate_is_one_statement_without_forbidden_paths(shape):
+    probe = _load_narrow_call_probe()
+    sql = " ".join(
+        probe._candidate_query(
+            shape=shape,
+            selector="provider_model",
+            completeness="all",
+        ).split()
+    ).lower()
+
+    assert sql.startswith("with ")
+    assert "llm_usage_daily_attempt_dimensions" in sql
+    assert "admin_usage_daily_call_dimensions" in sql
+    for forbidden in (
+        "llm_usage_daily_call_memberships",
+        "count(distinct",
+        "cross join lateral",
+    ):
+        assert forbidden not in sql
+    assert not re.search(
+        r"selected_attempt_dimensions\s+[^)]*join\s+"
+        r"selected_call_dimensions",
+        sql,
+    )
+
+
+def test_narrow_shape_order_is_interleaved():
+    probe = _load_narrow_call_probe()
+
+    assert probe._shape_order("unfiltered") == (
+        "bounded_unions",
+        "grouping_sets",
+    )
+    assert probe._shape_order("provider_model_filtered") == (
+        "grouping_sets",
+        "bounded_unions",
+    )
+
+
+def _healthy_narrow_shape_evidence(maximum_ms):
+    return {
+        "cohorts": {
+            cohort: {
+                "exact": True,
+                "samples": {
+                    "first_execution_after_build_analyze": {
+                        "elapsed_ms": maximum_ms,
+                        "temp_read_blocks": 0,
+                        "temp_written_blocks": 0,
+                    },
+                    "warm": {
+                        "elapsed_ms": maximum_ms - 1,
+                        "temp_read_blocks": 0,
+                        "temp_written_blocks": 0,
+                    },
+                    "ordinary": {
+                        "elapsed_ms": maximum_ms - 2,
+                        "temp_read_blocks": 0,
+                        "temp_written_blocks": 0,
+                    },
+                },
+            }
+            for cohort in ("unfiltered", "provider_model_filtered")
+        }
+    }
+
+
+def test_narrow_shape_selection_requires_all_samples_and_minimizes_worst_case():
+    probe = _load_narrow_call_probe()
+    shapes = {
+        "bounded_unions": _healthy_narrow_shape_evidence(2_700.0),
+        "grouping_sets": _healthy_narrow_shape_evidence(2_500.0),
+    }
+
+    assert probe._shape_eligible(shapes["bounded_unions"]) is True
+    assert probe._shape_eligible(shapes["grouping_sets"]) is True
+    assert probe._select_shape(shapes) == "grouping_sets"
+
+    shapes["grouping_sets"]["cohorts"]["unfiltered"]["samples"][
+        "warm"
+    ]["elapsed_ms"] = 3_000.0
+    assert probe._shape_eligible(shapes["grouping_sets"]) is False
+    assert probe._select_shape(shapes) == "bounded_unions"
+
+    shapes["bounded_unions"]["cohorts"]["provider_model_filtered"][
+        "exact"
+    ] = False
+    assert probe._shape_eligible(shapes["bounded_unions"]) is False
+    assert probe._select_shape(shapes) is None
+
+
+@pytest.mark.parametrize("shape", ("bounded_unions", "grouping_sets"))
+@pytest.mark.parametrize(
+    ("selector", "completeness", "filter_params"),
+    [
+        ("all", "all", ()),
+        ("provider", "all", ("p1",)),
+        ("model", "all", ("m1",)),
+        ("provider_model", "all", ("p1", "m1")),
+        ("all", "effective", (True,)),
+        ("provider", "effective", (True, "p1")),
+        ("model", "effective", (True, "m1")),
+        ("provider_model", "effective", (True, "p1", "m1")),
+    ],
+)
+def test_narrow_candidate_shapes_parse_on_postgresql(
+    shape, selector, completeness, filter_params
+):
+    probe = _load_narrow_call_probe()
+    local_day = datetime(2026, 8, 1).date()
+
+    with db.get_pool().connection() as conn, conn.transaction():
+        conn.execute(
+            "DROP TABLE IF EXISTS "
+            "pg_temp.admin_usage_daily_attempt_raw_dimensions,"
+            "pg_temp.admin_usage_daily_call_dimensions,"
+            "pg_temp.admin_usage_daily_call_raw_dimensions"
+        )
+        conn.execute(
+            "CREATE TEMP TABLE admin_usage_daily_attempt_raw_dimensions "
+            "ON COMMIT DROP AS SELECT * FROM "
+            "llm_usage_daily_attempt_dimensions WITH NO DATA"
+        )
+        for relation in (
+            "admin_usage_daily_call_dimensions",
+            "admin_usage_daily_call_raw_dimensions",
+        ):
+            for statement in probe._narrow_table_ddl(relation=relation):
+                conn.execute(statement)
+        row = conn.execute(
+            "EXPLAIN (FORMAT JSON) "
+            + probe._candidate_query(
+                shape=shape,
+                selector=selector,
+                completeness=completeness,
+            ),
+            (
+                local_day,
+                local_day,
+                local_day,
+                local_day,
+                *filter_params,
+                *filter_params,
+            ),
+        ).fetchone()
+
+    assert row[0][0]["Plan"]
+
+
+def _narrow_candidate_rows(cur, probe, shape, selector, completeness, params):
+    cur.execute(
+        probe._candidate_query(
+            shape=shape,
+            selector=selector,
+            completeness=completeness,
+        ),
+        params,
+    )
+    columns = tuple(item.name for item in cur.description)
+    rows = tuple(
+        sorted(
+            (tuple(row) for row in cur),
+            key=lambda row: tuple(repr(value) for value in row),
+        )
+    )
+    return rows, columns
+
+
+def test_narrow_candidate_shapes_match_complete_adversarial_outputs():
+    probe = _load_narrow_call_probe()
+    local_day = datetime(2026, 8, 1).date()
+    attempts = (
+        ("00000000-0000-5000-8000-000000000001", "call-a", "u1", "chat", "req", "a", "p1", "shared", True, "unknown", None),
+        ("00000000-0000-5000-8000-000000000002", "call-a", "u1", "chat", "req", "b", "p2", "shared", False, "unknown", None),
+        ("00000000-0000-5000-8000-000000000003", "call-b", "u1", "maintenance", "req", "a", "p1", "m1", True, "authoritative", "USD"),
+        ("00000000-0000-5000-8000-000000000004", "call-b", "u1", "maintenance", "req", "a", "p1", "m2", True, "estimated", "USD"),
+        ("00000000-0000-5000-8000-000000000005", "call-c", "u2", "chat", "req", "c", "p2", "m1", False, "unknown", None),
+        ("00000000-0000-5000-8000-000000000006", "call-c", "u2", "chat", "req", "c", "p2", "m1", False, "estimated", "USD"),
+    )
+    gaps = {"call-a": (1, 0), "call-b": (0, 1), "call-c": (0, 0)}
+    attempt_placeholders = ",".join(
+        "(" + ",".join(("%s",) * len(attempts[0])) + ")"
+        for _ in attempts
+    )
+    gap_placeholders = ",".join("(%s,%s,%s)" for _ in gaps)
+    identity_columns = ",".join(probe.NARROW_IDENTITY_COLUMNS[1:])
+    flag_columns = ",".join(probe.FLAG_COLUMN_NAMES)
+
+    with db.get_pool().connection() as conn, conn.transaction():
+        conn.execute(
+            "DROP TABLE IF EXISTS "
+            "pg_temp.llm_usage_daily_attempt_dimensions,"
+            "pg_temp.admin_usage_daily_attempt_raw_dimensions,"
+            "pg_temp.admin_usage_daily_call_dimensions,"
+            "pg_temp.admin_usage_daily_call_raw_dimensions"
+        )
+        conn.execute(
+            "CREATE TEMP TABLE llm_usage_daily_attempt_dimensions "
+            "(LIKE public.llm_usage_daily_attempt_dimensions INCLUDING DEFAULTS) "
+            "ON COMMIT DROP"
+        )
+        conn.execute(
+            "CREATE TEMP TABLE admin_usage_daily_attempt_raw_dimensions "
+            "ON COMMIT DROP AS SELECT * FROM "
+            "llm_usage_daily_attempt_dimensions WITH NO DATA"
+        )
+        for relation in (
+            "admin_usage_daily_call_dimensions",
+            "admin_usage_daily_call_raw_dimensions",
+        ):
+            for statement in probe._narrow_table_ddl(relation=relation):
+                conn.execute(statement)
+
+        fact_columns = (
+            "local_day,user_id,cohort_lane,requested_provider,requested_model,"
+            "resolved_provider,resolved_model,effective_usage_known,cost_kind,"
+            "currency,attempts,retry_attempts,failover_attempts,failed_attempts,"
+            "possibly_billed_attempts,input_tokens_sum,input_tokens_known_count,"
+            "authoritative_cost_attempts,estimated_cost_attempts,"
+            "unknown_cost_attempts,cost_amount,ttft_samples"
+        )
+        fact_rows = tuple(
+            (
+                local_day,
+                *attempt[2:],
+                1,
+                int(index == 2),
+                int(index == 2),
+                int(index == 4),
+                int(index == 4),
+                index * 10,
+                1,
+                int(attempt[9] == "authoritative"),
+                int(attempt[9] == "estimated"),
+                int(attempt[9] == "unknown"),
+                Decimal(index) if attempt[9] != "unknown" else Decimal(0),
+                [float(index * 10)],
+            )
+            for index, attempt in enumerate(attempts, start=1)
+        )
+        with conn.cursor() as fact_cur:
+            fact_cur.executemany(
+                "INSERT INTO llm_usage_daily_attempt_dimensions ("
+                + fact_columns
+                + ") VALUES ("
+                + ",".join(("%s",) * len(fact_rows[0]))
+                + ")",
+                fact_rows,
+            )
+        dimension_params = (
+            tuple(value for row in attempts for value in row)
+            + tuple(
+                value
+                for call_id, values in gaps.items()
+                for value in (call_id, *values)
+            )
+        )
+        conn.execute(
+            "INSERT INTO admin_usage_daily_call_dimensions "
+            "(local_day," + identity_columns + "," + flag_columns + ") "
+            "WITH priced(attempt_id,call_id,user_id,cohort_lane,"
+            "requested_provider,requested_model,resolved_provider,"
+            "resolved_model,effective_usage_known,cost_kind,currency) "
+            "AS (VALUES " + attempt_placeholders + "),"
+            "call_gaps(call_id,missing_outer_ordinals,missing_inner_ordinals) "
+            "AS (VALUES " + gap_placeholders + ") SELECT %s,dimensions.* FROM ("
+            + probe._narrow_dimension_select(
+                priced_relation="priced", gap_relation="call_gaps"
+            )
+            + ") dimensions",
+            (*dimension_params, local_day),
+        )
+
+        cases = (
+            ("all", "all", ()),
+            ("provider", "all", ("p1",)),
+            ("model", "all", ("m1",)),
+            ("provider_model", "all", ("p1", "m1")),
+            ("all", "effective", (True,)),
+            ("provider", "effective", (True, "p1")),
+            ("model", "effective", (True, "m1")),
+            ("provider_model", "effective", (True, "p1", "m1")),
+        )
+        results = {}
+        with conn.cursor() as cur:
+            for selector, completeness, filters in cases:
+                params = (
+                    local_day,
+                    local_day,
+                    local_day,
+                    local_day,
+                    *filters,
+                    *filters,
+                )
+                bounded = _narrow_candidate_rows(
+                    cur, probe, "bounded_unions", selector, completeness, params
+                )
+                grouped = _narrow_candidate_rows(
+                    cur, probe, "grouping_sets", selector, completeness, params
+                )
+                assert grouped == bounded, (selector, completeness)
+                results[(selector, completeness)] = bounded
+
+    rows, columns = results[("all", "all")]
+    overview = dict(zip(columns, next(row for row in rows if row[0] == "overview"), strict=True))
+    gaps_row = dict(zip(columns, next(row for row in rows if row[0] == "gaps"), strict=True))
+    assert overview["attempts"] == 6
+    assert overview["logical_calls"] == 3
+    assert overview["retry_attempts"] == 1
+    assert overview["failover_attempts"] == 1
+    assert overview["failed_attempts"] == 1
+    assert overview["usage_known_attempts"] == 3
+    assert overview["usage_unknown_attempts"] == 3
+    assert overview["input_tokens"] == 210
+    assert gaps_row["outer_gaps"] == 1
+    assert gaps_row["inner_gaps"] == 1
+
+
 def test_admin_usage_scale_harness_self_check():
     """The opt-in scale proof must keep its timing and SQL safety gates."""
     result = subprocess.run(
