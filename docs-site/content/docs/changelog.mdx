@@ -10,6 +10,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Changed Hosted Runtime V2 perception grounding to keep foreground chat
+  readings tool-only and give proactive wake a boolean-only glance.
+  Perception-triggered wake messages no longer receive unrelated exact battery,
+  weather, activity, sleep, or health values in their initial prompt.
+
 - **Hosted Genesis memory imports no longer fail provenance validation or
   complete after every card was rejected.** `genesis_import` is now a published
   `capture_mode` for `POST /v1/memory/actions`, matching the existing memory

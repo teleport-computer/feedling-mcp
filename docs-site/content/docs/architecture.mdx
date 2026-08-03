@@ -307,17 +307,26 @@ reply, recursive task, mutating MCP, platform-effect, or workspace-write
 surface. Multiple independent children may run in parallel and return bounded
 results to the parent.
 
-Eager perception is projected to fixed numeric, boolean, or null fields.
-Third-party calendar/reminder/app/place/weather text and screen/photo content
-are pull-only; after an explicit text-bearing read, later web, MCP, and `task`
+Runtime V2 layers perception by lane. Foreground Chat starts with perception
+tools but no current readings. Ordinary heartbeat and manual-wake prompts may
+receive only a fixed boolean glance describing domain availability and whether
+that glance changed. Scheduled wake remains reminder-only. Screen watch retains
+only its isolated safe screen-count metadata, while a perception-triggered
+heartbeat receives only its allowlisted event type. Raw change digests,
+presence hints, origin references, exact readings, private text, and internal
+glance fingerprints never enter model-visible runtime data.
+
+Exact device, environment, activity, health, calendar, reminder, photo, and
+shared-screen data cross the decrypt boundary only through an authorized tool
+read. After an explicit text-bearing private read, later web, MCP, and `task`
 tools are removed for that turn. Numeric health snapshot/trend reads remain
 compatible with outbound work.
 
 ### Runtime V2 prompt caching
 
 Tool schemas, runtime policy, and canonical-path-sorted trusted `/skills` are
-serialized deterministically before dynamic summary, tail, perception, and tool
-results. Provider adapters use route-bound cache affinity or provider-native
+serialized deterministically before dynamic summary, tail, runtime context, and
+tool results. Provider adapters use route-bound cache affinity or provider-native
 cache controls/checkpoints where supported and normalize cache read/write/miss
 usage into whole-turn telemetry.
 
