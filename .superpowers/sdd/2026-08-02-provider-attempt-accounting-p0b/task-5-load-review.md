@@ -2,6 +2,168 @@
 
 Reviewed commit: `deff128524dea481e85c32e9a4943db1c1bb211d`
 
+## Re-review of `e6b30a84d3a4e2163ed91a02ed8061cd7edd4735`
+
+### Re-review verdict
+
+- **Spec: FAIL**
+- **Quality: FAIL**
+- **Ready for the formal 3M + 3M run: NO**
+
+The fix closes C1 and C2.  It also substantially strengthens I1: six exact
+pool roles are captured as acquisition/release intervals, peak and overlap
+claims are recomputed from those raw intervals, and all three provider adapters
+now have raw adjacent baseline/candidate samples with a strict recomputed
+paired-p95 gate.  Two remaining evidence defects and one focused-test
+regression still block the expensive formal run.
+
+### C1 — CLOSED: exact 3M + 3M is enforced twice
+
+Formal CLI mode now rejects any turn or attempt cardinality other than exactly
+3,000,000 before database URL validation or PostgreSQL access.  The final gate
+independently requires `formal=True`, exact fixture cardinalities, and exact
+observed `source.total_rows` / `source.attempt_rows`.  `--non-formal` evidence
+is permanently ineligible to pass even if every timing and plan assertion is
+otherwise healthy.
+
+Verified by the two new formal-gate tests and a direct 100/100 formal invocation
+that exited with the cardinality error before attempting a database
+connection.
+
+### C2 — CLOSED: each failure has a reason-level witness
+
+Startup, pool construction, SQL execution, and serialization now begin with an
+empty per-mode queue and use separate recorders.  Startup/pool/SQL witnesses
+count the exact injected call and capture the exception type; serialization
+injects one malformed object and waits for its consumption and exact one-drop
+delta.  The large fixed capacity prevents the measured fanout from saturating
+these queues, and the validator rejects queue-full attribution.
+
+An independent producer probe with 20 samples/provider observed: startup one
+thread-factory call and one drop; pool 252 factory calls and 252 drops; SQL 252
+`executemany` calls and 252 drops; serialization one injected/consumed item and
+one drop.  All queue preconditions were zero and all reported queue-full drops
+were zero.
+
+### C3 — OPEN: paired provider timings are not bound to the real pool-contention interval
+
+Relevant code:
+
+- `scripts/perf/provider_attempt_business_path.py:714-796`
+- `scripts/perf/provider_attempt_business_path.py:989-1017`
+- `scripts/perf/provider_attempt_business_path.py:1021-1049`
+- `scripts/perf/provider_attempt_business_path.py:1084-1098`
+
+The pool probe starts provider, maintenance, and Usage threads at one barrier,
+but maintenance and the one Usage report are free to finish while the provider
+thread continues 120 measured logical calls.  Provider samples contain elapsed
+duration only; they do not contain monotonic start/end timestamps.  The pool
+acquisition intervals therefore cannot establish which candidate samples, or
+how many of the p95 population, actually overlapped the Usage exporter/
+importers and maintenance connections.
+
+The `pool_contention` candidate differs from baseline by enqueuing into the
+recorder, so it does measure recorder hot-path overhead.  It does not prove the
+reported paired p95 was measured during real report + maintenance shared-pool
+contention.  A brief overlap somewhere in the run and a p95 computed mostly
+after those background operations finish can both pass.
+
+Minimum fix:
+
+- Store monotonic start/end timestamps for every pool baseline/candidate
+  provider sample and validate a predeclared minimum sample population per
+  provider whose candidate intervals overlap the required DB-role contention
+  window; or hold/repeat the real Usage/maintenance workload until all measured
+  candidate samples finish.
+- Compute the pool-contention paired p95 only over the auditable overlapping
+  pairs (with the same minimum 20/provider), and add a negative test where DB
+  role intervals end before the provider samples.
+
+### C4 — OPEN: the artifact's 3,000 ms Usage report timeout is not production truth
+
+Relevant code:
+
+- `scripts/perf/provider_attempt_business_path.py:40`
+- `scripts/perf/provider_attempt_business_path.py:281`
+- `scripts/perf/provider_attempt_business_path.py:1025-1033`
+- `backend/model_api_runtime/v2/jobs_store.py:43-44`
+- `backend/model_api_runtime/v2/jobs_store.py:7843-7874`
+
+`REPORT_STATEMENT_TIMEOUT_MS = 3_000` is producer-owned.  It is passed to the
+attempt-maintenance tick, but it is not passed to
+`jobs_store.usage_report_snapshot`.  The production Usage exporter transaction
+and importer deadline use `_USAGE_REPORT_STATEMENT_TIMEOUT_MS = 15_000`; only
+the attempt sub-section has a separate 3,000 ms cap.  Nevertheless the pool
+artifact states `report_statement_timeout_ms: 3000`, and the validator merely
+compares it with the producer's own constant.
+
+This is a self-reported placeholder rather than the production report budget
+claimed by the load report.  It must not be used as proof that the report's
+connection occupancy is bounded by three seconds.
+
+Minimum fix:
+
+- Report both production budgets with precise names, reading or observing the
+  actual Usage constants/configuration: the 15,000 ms total exporter/importer
+  deadline and the 3,000 ms attempt-section cap.
+- If the proof requires a 3,000 ms whole-report limit, add an explicit supported
+  test-only argument at the production entry point and verify the SQL session
+  setting/deadline; do not label the maintenance argument as the report budget.
+- Add a negative test that changes/mismatches the production Usage budget and
+  proves the artifact validator fails.
+
+### I2 — OPEN: stale focused test after changing the default attempt cardinality
+
+Relevant code:
+
+- `tests/test_admin_usage.py:87-96`
+- `scripts/perf/admin_usage_scale.py:31-34`
+
+`DEFAULT_ATTEMPT_ROWS` correctly changed from zero to 3,000,000 for the formal
+default, but `test_admin_usage_scale_attempt_fixture_is_explicit_and_bounded`
+still asserts `_resolve_attempt_rows(3_000_000, None) == 0`.  The focused test
+therefore fails.  Update the assertion and preserve explicit negative/bounded
+coverage for non-formal probes before claiming a green load-proof suite.
+
+### Six-role interval verification
+
+The role capture itself is genuine.  The exporter is explicitly scoped;
+importer connections are initially marked pending and relabeled from the
+production snapshot-import observer while their acquired connection remains
+active; recorder threads are identified by their production thread name; and
+maintenance outer/rebuild roles are distinguished by nested active connection
+state on the same explicitly scoped thread.  `_derive_pool_timeline` rebuilds
+peak occupancy and active-role snapshots from acquisition/release timestamps,
+requires all three Usage roles to overlap, requires maintenance outer/rebuild
+to overlap, and requires recorder + maintenance outer + at least one Usage role
+to overlap.  Summary tampering or disjoint intervals fail validation.
+
+This closes the original coarse-label/summary-trust portion of I1, but it does
+not close C3's missing link between those intervals and the timed provider
+sample population.
+
+### Re-review verification
+
+- Producer/recorder/provider plus new formal-gate tests: **59 passed, 1
+  skipped**.
+- Existing focused default-attempt test: **1 failed** because it still expects
+  zero instead of the new 3,000,000 default.
+- Independent in-process producer probe (no PostgreSQL/network): completed and
+  validated all four exact failure witnesses; queue/failure paired p95 values
+  remained below 5 ms.
+- `admin_usage_scale.py --self-test`: passed.
+- Direct 100/100 formal CLI probe: rejected before database access.
+- Full Admin attempt was not valid evidence in this shell because
+  `DATABASE_URL` was intentionally unset; database-backed errors from that run
+  are environmental and are not counted as implementation findings.
+- No 3M run, external network request, or remote RDS access was performed.
+
+### Re-review ready verdict
+
+**Not ready.**  C1 and C2 are closed, and six-role pool accounting is now
+auditable.  Close C3 and C4, repair I2, then obtain one more focused review
+before running the formal 3M + 3M proof.
+
 ## Verdict
 
 - **Spec: FAIL**
