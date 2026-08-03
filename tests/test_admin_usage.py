@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from html import unescape
@@ -75,6 +74,52 @@ def test_admin_usage_scale_harness_self_check():
         "sensitive_column_check": "passed",
         "time_range_check": "passed",
     }
+
+
+def test_scale_evidence_atomic_write_preserves_previous_artifact_on_replace_failure(
+    tmp_path, monkeypatch
+):
+    harness = _load_usage_scale_harness()
+    output = tmp_path / "scale-evidence.json"
+    output.write_text('{"previous":true}\n', encoding="utf-8")
+
+    def fail_replace(_source, _destination):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(harness.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        harness._write_evidence_atomic(
+            output,
+            '{"passed":false,"workflow":{"terminal_phase":"cleanup_failed"}}\n',
+        )
+
+    assert output.read_text(encoding="utf-8") == '{"previous":true}\n'
+    assert list(tmp_path.glob(".scale-evidence.json.*.tmp")) == []
+
+
+def test_scale_failed_evidence_atomic_write_is_complete_json(tmp_path):
+    harness = _load_usage_scale_harness()
+    output = tmp_path / "failed-scale-evidence.json"
+    evidence = {
+        "passed": False,
+        "workflow": {
+            "terminal_phase": "fixture_workload_failed",
+            "failure": {
+                "phase": "fixture_workload",
+                "type": "RuntimeError",
+                "message": "timing failed",
+            },
+            "business_status": "not_run",
+        },
+    }
+
+    harness._write_evidence_atomic(
+        output, json.dumps(evidence, indent=2, sort_keys=True) + "\n"
+    )
+
+    assert json.loads(output.read_text(encoding="utf-8")) == evidence
+    assert list(tmp_path.glob(".failed-scale-evidence.json.*.tmp")) == []
 
 
 def test_admin_usage_scale_uses_approved_three_second_p95_budget():
@@ -263,96 +308,244 @@ def test_membership_exact_anti_join_keeps_actual_relation_indexable():
     assert "missing_inner_ordinals" in sql
 
 
-@pytest.mark.parametrize("validate_only", [True, False])
-def test_resume_gate_invalid_or_validate_only_never_reaches_producer_or_ready(
-    validate_only
-):
+def test_scale_workflow_runs_business_only_after_verified_empty_cleanup():
     harness = _load_usage_scale_harness()
     events = []
+    counts = {"users": 1}
 
-    def collect():
-        events.append("collect")
-        return _healthy_formal_resume_snapshot()
+    def prepare(arm_cleanup):
+        events.append("prepare")
+        arm_cleanup()
 
-    def validate(snapshot, *, prefix):
-        events.append("validate")
-        if not validate_only:
-            raise RuntimeError("invalid preflight")
-        return snapshot
+    def cleanup():
+        events.append("cleanup")
+        counts["users"] = 0
 
-    with pytest.raises(RuntimeError, match="invalid preflight") if not validate_only else nullcontext():
-        result = harness._run_resume_gate(
-            prefix="scale_usage_42e02f444a_",
-            validate_only=validate_only,
-            collect=collect,
-            validate=validate,
-            producer=lambda: events.append("producer"),
-            arm_cleanup=lambda: events.append("arm"),
-            on_ready=lambda: events.append("timing"),
-        )
+    def collect_counts():
+        events.append("count")
+        return dict(counts)
 
-    assert events == ["collect", "validate"]
-    if validate_only:
-        assert result["cleanup_armed"] is False
-
-
-def test_resume_gate_postvalidation_precedes_timing_and_cleanup_arming():
-    harness = _load_usage_scale_harness()
-    events = []
-    snapshots = iter(
-        [_healthy_formal_resume_snapshot(), _healthy_formal_resume_snapshot()]
-    )
-
-    result = harness._run_resume_gate(
-        prefix="scale_usage_42e02f444a_",
-        validate_only=False,
-        collect=lambda: (events.append("collect"), next(snapshots))[1],
-        validate=lambda snapshot, *, prefix: (
-            events.append("validate"),
-            snapshot,
+    result = harness._execute_scale_workflow(
+        prepare_fixture=prepare,
+        run_fixture_workload=lambda: events.append("workload"),
+        cleanup_fixture=cleanup,
+        collect_database_counts=collect_counts,
+        produce_business=lambda: (
+            events.append("business"),
+            {"business": {"passed": True}},
         )[1],
-        producer=lambda: (events.append("producer"), {"passed": True})[1],
-        arm_cleanup=lambda: events.append("arm"),
-        on_ready=lambda: events.append("timing"),
     )
 
     assert events == [
-        "collect",
-        "validate",
-        "producer",
-        "collect",
-        "validate",
-        "arm",
-        "timing",
+        "prepare",
+        "workload",
+        "cleanup",
+        "count",
+        "count",
+        "business",
+        "count",
     ]
-    assert result["cleanup_armed"] is True
-    assert result["pre"] == result["post"]
+    assert result["terminal_phase"] == "complete"
+    assert result["failure"] is None
+    assert result["business_status"] == "passed"
+    assert result["post_fixture_empty_counts"] == {"users": 0}
+    assert result["business_database_counts"] == {
+        "pre": {"users": 0},
+        "post": {"users": 0},
+    }
 
 
-def test_resume_gate_postvalidation_failure_never_reaches_timing_or_arms_cleanup():
+def test_scale_workflow_timing_failure_cleans_and_never_runs_business():
     harness = _load_usage_scale_harness()
     events = []
-    post = _healthy_formal_resume_snapshot()
-    post["semantic_integrity"]["daily_users"]["mismatched_rows"] = 1
-    snapshots = iter([_healthy_formal_resume_snapshot(), post])
+    counts = {"users": 1}
 
-    with pytest.raises(RuntimeError, match="postvalidation failed"):
-        harness._run_resume_gate(
-            prefix="scale_usage_42e02f444a_",
-            validate_only=False,
-            collect=lambda: (events.append("collect"), next(snapshots))[1],
-            validate=lambda snapshot, *, prefix: (
-                events.append("validate"),
-                (_ for _ in ()).throw(RuntimeError("postvalidation failed"))
-                if snapshot is post
-                else snapshot,
-            )[1],
-            producer=lambda: events.append("producer"),
-            arm_cleanup=lambda: events.append("arm"),
-            on_ready=lambda: events.append("timing"),
-        )
+    def prepare(arm_cleanup):
+        events.append("prepare")
+        arm_cleanup()
 
-    assert events == ["collect", "validate", "producer", "collect", "validate"]
+    def fail_workload():
+        events.append("workload")
+        raise RuntimeError("timing failed")
+
+    def cleanup():
+        events.append("cleanup")
+        counts["users"] = 0
+
+    result = harness._execute_scale_workflow(
+        prepare_fixture=prepare,
+        run_fixture_workload=fail_workload,
+        cleanup_fixture=cleanup,
+        collect_database_counts=lambda: (
+            events.append("count"),
+            dict(counts),
+        )[1],
+        produce_business=lambda: events.append("business"),
+    )
+
+    assert events == ["prepare", "workload", "cleanup", "count"]
+    assert result["terminal_phase"] == "fixture_workload_failed"
+    assert result["failure"] == {
+        "phase": "fixture_workload",
+        "type": "RuntimeError",
+        "message": "timing failed",
+    }
+    assert result["cleanup"]["status"] == "passed"
+    assert result["post_fixture_empty_counts"] == {"users": 0}
+    assert result["business_status"] == "not_run"
+
+
+def test_scale_workflow_cleanup_failure_never_runs_business():
+    harness = _load_usage_scale_harness()
+    events = []
+
+    def prepare(arm_cleanup):
+        events.append("prepare")
+        arm_cleanup()
+
+    def fail_cleanup():
+        events.append("cleanup")
+        raise RuntimeError("cleanup failed")
+
+    result = harness._execute_scale_workflow(
+        prepare_fixture=prepare,
+        run_fixture_workload=lambda: events.append("workload"),
+        cleanup_fixture=fail_cleanup,
+        collect_database_counts=lambda: (
+            events.append("count"),
+            {"users": 1},
+        )[1],
+        produce_business=lambda: events.append("business"),
+    )
+
+    assert events == ["prepare", "workload", "cleanup", "count"]
+    assert result["terminal_phase"] == "cleanup_failed"
+    assert result["failure"] == {
+        "phase": "fixture_cleanup",
+        "type": "RuntimeError",
+        "message": "cleanup failed",
+    }
+    assert result["cleanup"]["status"] == "failed"
+    assert result["post_fixture_empty_counts"] == {"users": 1}
+    assert result["business_status"] == "not_run"
+
+
+def test_scale_workflow_business_failure_collects_post_counts_in_finally():
+    harness = _load_usage_scale_harness()
+    events = []
+    counts = {"users": 1}
+
+    def prepare(arm_cleanup):
+        events.append("prepare")
+        arm_cleanup()
+
+    def cleanup():
+        events.append("cleanup")
+        counts["users"] = 0
+
+    def collect_counts():
+        events.append("count")
+        return dict(counts)
+
+    def fail_business():
+        events.append("business")
+        assert counts == {"users": 0}
+        raise ValueError("business failed")
+
+    result = harness._execute_scale_workflow(
+        prepare_fixture=prepare,
+        run_fixture_workload=lambda: events.append("workload"),
+        cleanup_fixture=cleanup,
+        collect_database_counts=collect_counts,
+        produce_business=fail_business,
+    )
+
+    assert events == [
+        "prepare",
+        "workload",
+        "cleanup",
+        "count",
+        "count",
+        "business",
+        "count",
+    ]
+    assert result["terminal_phase"] == "business_failed"
+    assert result["failure"] == {
+        "phase": "business_producer",
+        "type": "ValueError",
+        "message": "business failed",
+    }
+    assert result["business_status"] == "failed"
+    assert result["business_database_counts"]["post"] == {"users": 0}
+
+
+def test_database_counts_observe_user_insert_and_exact_cleanup():
+    harness = _load_usage_scale_harness()
+    user_id = "scale_count_probe_user"
+    with db.get_pool().connection() as conn:
+        before = harness._database_counts(conn)
+        try:
+            conn.execute(
+                "INSERT INTO users (user_id,doc,created_at) VALUES (%s,%s,%s)",
+                (user_id, Jsonb({"scale_count_probe": True}), NOW_UTC.isoformat()),
+            )
+            during = harness._database_counts(conn)
+        finally:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+        after = harness._database_counts(conn)
+
+    assert set(before) == {
+        "users",
+        "v2_turn_metrics",
+        "llm_provider_attempts",
+        "llm_provider_attempt_corrections",
+        "llm_rate_cards",
+        "v2_usage_daily_users",
+        "v2_usage_daily_dimensions",
+        "v2_usage_rollup_watermarks",
+        "llm_usage_daily_attempt_dimensions",
+        "llm_usage_daily_call_memberships",
+        "llm_usage_rollup_watermarks",
+        "llm_usage_rollup_dirty_days",
+    }
+    assert during == {**before, "users": before["users"] + 1}
+    assert after == before
+
+
+def _healthy_scale_workflow_evidence():
+    zero = {
+        "users": 0,
+        "v2_turn_metrics": 0,
+        "llm_provider_attempts": 0,
+    }
+    return {
+        "terminal_phase": "complete",
+        "failure": None,
+        "cleanup": {"armed": True, "status": "passed", "failure": None},
+        "post_fixture_empty_counts": zero.copy(),
+        "business_database_counts": {
+            "pre": zero.copy(),
+            "post": zero.copy(),
+        },
+        "business_status": "passed",
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda item: item["post_fixture_empty_counts"].update(users=1),
+        lambda item: item["business_database_counts"]["pre"].update(users=1),
+        lambda item: item["business_database_counts"]["post"].update(users=1),
+    ],
+)
+def test_workflow_evidence_gate_rejects_nonzero_database_counts(mutate):
+    harness = _load_usage_scale_harness()
+    evidence = _healthy_scale_workflow_evidence()
+
+    assert harness._workflow_evidence_passed(evidence) is True
+    mutate(evidence)
+    assert harness._workflow_evidence_passed(evidence) is False
 
 
 def _healthy_formal_resume_snapshot():
@@ -849,7 +1042,7 @@ def test_admin_usage_scale_formal_gate_rejects_small_or_nonformal_fixture_even_i
     )
 
 
-def test_formal_gate_requires_exact_config_and_stable_resume_integrity():
+def test_formal_gate_requires_exact_config_and_resume_prevalidation():
     harness = _load_usage_scale_harness()
     cohorts = {
         name: {
@@ -869,7 +1062,6 @@ def test_formal_gate_requires_exact_config_and_stable_resume_integrity():
         "residual_counts": {"all": 0},
     }
     pre = _healthy_formal_resume_snapshot()
-    post = _healthy_formal_resume_snapshot()
     fixture = {
         "rows": 3_000_000,
         "attempt_rows": 3_000_000,
@@ -877,7 +1069,7 @@ def test_formal_gate_requires_exact_config_and_stable_resume_integrity():
         "history_days": 365,
         "resumed": True,
         "prefix": "scale_usage_42e02f444a_",
-        "resume_validation": {"pre": pre, "post": post, "stable": True},
+        "resume_validation": {"pre": pre, "exact_prevalidated": True},
     }
 
     def gate():
@@ -896,10 +1088,10 @@ def test_formal_gate_requires_exact_config_and_stable_resume_integrity():
     fixture["history_days"] = 364
     assert gate() is False
     fixture["history_days"] = 365
-    fixture["resume_validation"]["stable"] = False
+    fixture["resume_validation"]["exact_prevalidated"] = False
     assert gate() is False
-    fixture["resume_validation"]["stable"] = True
-    post["semantic_integrity"]["daily_dimensions"]["mismatched_rows"] = 1
+    fixture["resume_validation"]["exact_prevalidated"] = True
+    pre["semantic_integrity"]["daily_dimensions"]["mismatched_rows"] = 1
     assert gate() is False
 
 

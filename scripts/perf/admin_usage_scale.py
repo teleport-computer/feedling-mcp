@@ -107,17 +107,13 @@ def _formal_gate_passed(
     if fixture.get("resumed") is True:
         resume_validation = fixture.get("resume_validation") or {}
         pre = resume_validation.get("pre")
-        post = resume_validation.get("post")
         prefix = fixture.get("prefix")
         try:
             resume_integrity_passed = bool(
-                resume_validation.get("stable") is True
+                resume_validation.get("exact_prevalidated") is True
                 and isinstance(pre, dict)
-                and isinstance(post, dict)
                 and isinstance(prefix, str)
                 and _validate_resume_snapshot(pre, prefix=prefix) is pre
-                and _validate_resume_snapshot(post, prefix=prefix) is post
-                and _stable_resume_snapshot(pre) == _stable_resume_snapshot(post)
             )
         except (RuntimeError, SystemExit, TypeError, ValueError):
             resume_integrity_passed = False
@@ -181,6 +177,22 @@ def _business_path_evidence_passed(
     return True
 
 
+def _workflow_evidence_passed(evidence: dict[str, Any]) -> bool:
+    cleanup = evidence.get("cleanup") or {}
+    business_counts = evidence.get("business_database_counts") or {}
+    return bool(
+        evidence.get("terminal_phase") == "complete"
+        and evidence.get("failure") is None
+        and cleanup.get("armed") is True
+        and cleanup.get("status") == "passed"
+        and cleanup.get("failure") is None
+        and evidence.get("business_status") == "passed"
+        and _counts_are_zero(evidence.get("post_fixture_empty_counts"))
+        and _counts_are_zero(business_counts.get("pre"))
+        and _counts_are_zero(business_counts.get("post"))
+    )
+
+
 def _current_git_commit(repo: Path) -> str:
     commit = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -192,6 +204,21 @@ def _current_git_commit(repo: Path) -> str:
     if len(commit) != 40:
         raise RuntimeError("formal gate requires a full Git commit")
     return commit
+
+
+def _write_evidence_atomic(output: Path, rendered: str) -> None:
+    destination = Path(output)
+    temporary = destination.with_name(
+        f".{destination.name}.{uuid4().hex}.tmp"
+    )
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def assert_content_free_metric_sql(statements: list[tuple[str, tuple[Any, ...]]]) -> None:
@@ -564,40 +591,134 @@ def _stable_resume_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _run_resume_gate(
-    *,
-    prefix: str,
-    validate_only: bool,
-    collect,
-    validate,
-    producer,
-    arm_cleanup,
-    on_ready,
-) -> dict[str, Any]:
-    pre = validate(collect(), prefix=prefix)
-    if validate_only:
-        return {
-            "pre": pre,
-            "post": None,
-            "business": None,
-            "cleanup_armed": False,
-        }
-    business = producer()
-    post = validate(collect(), prefix=prefix)
-    if _stable_resume_snapshot(pre) != _stable_resume_snapshot(post):
-        raise RuntimeError(
-            "resume immutable snapshot changed across business producer: "
-            f"pre={_stable_resume_snapshot(pre)}, "
-            f"post={_stable_resume_snapshot(post)}"
-        )
-    arm_cleanup()
-    on_ready()
+def _workflow_failure(phase: str, exc: Exception) -> dict[str, str]:
     return {
-        "pre": pre,
-        "post": post,
-        "business": business,
-        "cleanup_armed": True,
+        "phase": phase,
+        "type": type(exc).__name__,
+        "message": str(exc)[:500],
     }
+
+
+def _counts_are_zero(counts: dict[str, int]) -> bool:
+    return bool(counts) and not any(int(value) for value in counts.values())
+
+
+def _new_scale_workflow_evidence() -> dict[str, Any]:
+    return {
+        "phase_trace": [],
+        "terminal_phase": "preparing_fixture",
+        "failure": None,
+        "cleanup": {
+            "armed": False,
+            "status": "not_run",
+            "failure": None,
+        },
+        "post_fixture_empty_counts": None,
+        "business_database_counts": {"pre": None, "post": None},
+        "business_status": "not_run",
+        "business_result": None,
+    }
+
+
+def _execute_scale_workflow(
+    *,
+    prepare_fixture,
+    run_fixture_workload,
+    cleanup_fixture,
+    collect_database_counts,
+    produce_business,
+) -> dict[str, Any]:
+    """Run the empty-DB business proof strictly after exact fixture cleanup."""
+    result = _new_scale_workflow_evidence()
+
+    def arm_cleanup() -> None:
+        result["cleanup"]["armed"] = True
+
+    try:
+        result["phase_trace"].append("prepare_fixture")
+        prepare_fixture(arm_cleanup)
+        result["phase_trace"].append("fixture_workload")
+        run_fixture_workload()
+    except Exception as exc:  # noqa: BLE001
+        phase = result["phase_trace"][-1]
+        result["failure"] = _workflow_failure(phase, exc)
+    finally:
+        if result["cleanup"]["armed"]:
+            result["phase_trace"].append("fixture_cleanup")
+            try:
+                cleanup_fixture()
+                result["cleanup"]["status"] = "passed"
+            except Exception as exc:  # noqa: BLE001
+                cleanup_failure = _workflow_failure("fixture_cleanup", exc)
+                result["cleanup"]["status"] = "failed"
+                result["cleanup"]["failure"] = cleanup_failure
+                if result["failure"] is None:
+                    result["failure"] = cleanup_failure
+            result["phase_trace"].append("post_fixture_count")
+            try:
+                result["post_fixture_empty_counts"] = collect_database_counts()
+            except Exception as exc:  # noqa: BLE001
+                count_failure = _workflow_failure("post_fixture_count", exc)
+                if result["failure"] is None:
+                    result["failure"] = count_failure
+
+    cleanup = result["cleanup"]
+    post_fixture_counts = result["post_fixture_empty_counts"]
+    if result["failure"] is not None:
+        failed_phase = result["failure"]["phase"]
+        result["terminal_phase"] = (
+            "cleanup_failed"
+            if cleanup["status"] == "failed"
+            else f"{failed_phase}_failed"
+        )
+        return result
+    if cleanup["status"] != "passed" or not _counts_are_zero(post_fixture_counts):
+        result["failure"] = {
+            "phase": "post_fixture_empty_check",
+            "type": "RuntimeError",
+            "message": f"dedicated database is not empty: {post_fixture_counts}",
+        }
+        result["terminal_phase"] = "post_fixture_empty_check_failed"
+        return result
+
+    result["phase_trace"].append("business_pre_count")
+    try:
+        business_pre = collect_database_counts()
+        result["business_database_counts"]["pre"] = business_pre
+        if not _counts_are_zero(business_pre):
+            raise RuntimeError(
+                f"dedicated database is not empty before business proof: {business_pre}"
+            )
+        result["phase_trace"].append("business_producer")
+        result["business_result"] = produce_business()
+        result["business_status"] = "passed"
+    except Exception as exc:  # noqa: BLE001
+        result["business_status"] = "failed"
+        result["failure"] = _workflow_failure(
+            result["phase_trace"][-1], exc
+        )
+    finally:
+        result["phase_trace"].append("business_post_count")
+        try:
+            business_post = collect_database_counts()
+            result["business_database_counts"]["post"] = business_post
+            if result["failure"] is None and not _counts_are_zero(business_post):
+                raise RuntimeError(
+                    "dedicated database is not empty after business proof: "
+                    f"{business_post}"
+                )
+        except Exception as exc:  # noqa: BLE001
+            if result["failure"] is None:
+                result["failure"] = _workflow_failure(
+                    "business_post_count", exc
+                )
+                result["business_status"] = "failed"
+
+    if result["failure"] is not None:
+        result["terminal_phase"] = "business_failed"
+        return result
+    result["terminal_phase"] = "complete"
+    return result
 
 
 def _validate_scale_database_url(database_url: str) -> dict[str, Any]:
@@ -1894,12 +2015,13 @@ def _collect_resume_snapshot(
         )
 
 
-def _assert_empty_dedicated_database(conn) -> None:
-    occupied = {
+def _database_counts(conn) -> dict[str, int]:
+    return {
         table: int(
             conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]  # noqa: S608
         )
         for table in (
+            "users",
             "v2_turn_metrics",
             "llm_provider_attempts",
             "llm_provider_attempt_corrections",
@@ -1909,9 +2031,14 @@ def _assert_empty_dedicated_database(conn) -> None:
             "v2_usage_rollup_watermarks",
             "llm_usage_daily_attempt_dimensions",
             "llm_usage_daily_call_memberships",
+            "llm_usage_rollup_watermarks",
             "llm_usage_rollup_dirty_days",
         )
     }
+
+
+def _assert_empty_dedicated_database(conn) -> None:
+    occupied = _database_counts(conn)
     if any(occupied.values()):
         raise RuntimeError(
             "dedicated scale database is not empty; refusing to disturb existing "
@@ -2231,13 +2358,51 @@ def _run(args) -> int:
     partition = usage_reporting.rollup_partition(queries["unfiltered"])
     expected_partition = _validate_rolling_partition(partition)
     resume_snapshot = None
-    resume_post_snapshot = None
-    resume_postvalidated = {"value": False}
-    with pool.connection() as conn:
-        _validate_connected_scale_database(conn, database_identity)
-        schema_evidence = _assert_schema(conn)
-        if not resumed:
-            _assert_empty_dedicated_database(conn)
+
+    def write_early_failure(phase: str, exc: Exception, *, schema=None) -> int:
+        failed_workflow = _new_scale_workflow_evidence()
+        failed_workflow["phase_trace"].append(phase)
+        failed_workflow["failure"] = _workflow_failure(phase, exc)
+        failed_workflow["terminal_phase"] = f"{phase}_failed"
+        failed_evidence = {
+            "database": {
+                **database_identity,
+                "precondition": args.precondition_note or None,
+            },
+            "fixture": {
+                "formal": formal,
+                "resumed": resumed,
+                "prefix": prefix,
+                "rows": args.rows,
+                "attempt_rows": attempt_rows,
+                "users": args.users,
+                "history_days": args.history_days,
+            },
+            "schema": schema,
+            "workflow": failed_workflow,
+            "business_path": None,
+            "passed": False,
+        }
+        rendered_failure = (
+            json.dumps(failed_evidence, indent=2, sort_keys=True, default=str)
+            + "\n"
+        )
+        if args.output:
+            _write_evidence_atomic(Path(args.output), rendered_failure)
+        print(rendered_failure, end="")
+        return 1
+
+    schema_evidence = None
+    try:
+        with pool.connection() as conn:
+            _validate_connected_scale_database(conn, database_identity)
+            schema_evidence = _assert_schema(conn)
+            if not resumed:
+                _assert_empty_dedicated_database(conn)
+    except Exception as exc:  # noqa: BLE001
+        return write_early_failure(
+            "database_precondition", exc, schema=schema_evidence
+        )
 
     def collect_resume_snapshot():
         with pool.connection() as conn:
@@ -2257,7 +2422,7 @@ def _run(args) -> int:
             jobs_store=jobs_store,
             provider_attempt_rollup=provider_attempt_rollup,
             usage_query=queries["unfiltered"],
-            preserve_existing_rollup_state=resumed,
+            preserve_existing_rollup_state=False,
         )
         return {
             "pool": measured_pool,
@@ -2266,19 +2431,15 @@ def _run(args) -> int:
             ),
         }
 
-    resume_gate = None
     if resumed:
-        resume_gate = _run_resume_gate(
-            prefix=prefix,
-            validate_only=bool(args.validate_resume_only),
-            collect=collect_resume_snapshot,
-            validate=_validate_resume_snapshot,
-            producer=produce_business_evidence,
-            arm_cleanup=lambda: resume_postvalidated.__setitem__("value", True),
-            on_ready=lambda: None,
-        )
-        resume_snapshot = resume_gate["pre"]
-        resume_post_snapshot = resume_gate["post"]
+        try:
+            resume_snapshot = _validate_resume_snapshot(
+                collect_resume_snapshot(), prefix=prefix
+            )
+        except Exception as exc:  # noqa: BLE001
+            return write_early_failure(
+                "resume_prevalidation", exc, schema=schema_evidence
+            )
     if args.validate_resume_only:
         validation_evidence = {
             "database": database_identity,
@@ -2304,18 +2465,9 @@ def _run(args) -> int:
             validation_evidence, indent=2, sort_keys=True, default=str
         ) + "\n"
         if args.output:
-            Path(args.output).write_text(rendered, encoding="utf-8")
+            _write_evidence_atomic(Path(args.output), rendered)
         print(rendered, end="")
         return 0
-    business_result = (
-        resume_gate["business"] if resumed else produce_business_evidence()
-    )
-    business_path_evidence = business_result["business"]
-    if args.business_path_output:
-        Path(args.business_path_output).write_text(
-            json.dumps(business_path_evidence, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
     evidence: dict[str, Any] = {
         "database": {
             **database_identity,
@@ -2352,16 +2504,12 @@ def _run(args) -> int:
                 if not resumed
                 else {
                     "pre": resume_snapshot,
-                    "post": resume_post_snapshot,
-                    "stable": (
-                        _stable_resume_snapshot(resume_snapshot)
-                        == _stable_resume_snapshot(resume_post_snapshot)
-                    ),
+                    "exact_prevalidated": True,
                 }
             ),
         },
         "schema": schema_evidence,
-        "business_path": business_path_evidence,
+        "business_path": None,
         "budget_ms": P95_BUDGET_MS,
         "query": {
             "timezone": "Asia/Shanghai",
@@ -2374,7 +2522,12 @@ def _run(args) -> int:
         },
         "cohorts": {},
     }
-    cleanup_armed = resumed and resume_postvalidated["value"]
+    workflow = _new_scale_workflow_evidence()
+    workflow["phase_trace"].append("prepare_fixture")
+    cleanup_armed = resumed
+    if resumed:
+        workflow["cleanup"]["armed"] = True
+    workflow["phase_trace"].append("fixture_workload")
     try:
         if resumed:
             evidence["source"] = dict(resume_snapshot["source"])
@@ -2390,6 +2543,7 @@ def _run(args) -> int:
             }
         else:
             cleanup_armed = True
+            workflow["cleanup"]["armed"] = True
             with pool.connection() as conn:
                 _seed_fixture(
                     conn,
@@ -2634,44 +2788,143 @@ def _run(args) -> int:
                     if node.get("relation") == "llm_provider_attempts"
                 ],
             }
+    except Exception as exc:  # noqa: BLE001
+        workflow["failure"] = _workflow_failure("fixture_workload", exc)
     finally:
         if cleanup_armed and not args.keep_data:
+            workflow["phase_trace"].append("fixture_cleanup")
+            try:
+                with pool.connection() as conn:
+                    _delete_fixture(conn, prefix)
+                    after_cascade = _fixture_counts(conn, prefix)
+                    residual = {
+                        key: value
+                        for key, value in after_cascade.items()
+                        if key not in {"turn_watermark", "attempt_watermark"}
+                        and value
+                    }
+                    if residual:
+                        raise RuntimeError(
+                            f"fixture cleanup left source/rollup rows: {residual}"
+                        )
+                    conn.execute(
+                        "DELETE FROM v2_usage_rollup_watermarks "
+                        "WHERE rollup_name='hosted_v2_usage'"
+                    )
+                    conn.execute(
+                        "DELETE FROM llm_usage_rollup_watermarks "
+                        "WHERE rollup_name='hosted_v2_attempt_usage'"
+                    )
+                    conn.execute(
+                        "DELETE FROM llm_usage_rollup_dirty_days "
+                        "WHERE rollup_name='hosted_v2_attempt_usage'"
+                    )
+                    after_cleanup = _fixture_counts(conn, prefix)
+                    if any(after_cleanup.values()):
+                        raise RuntimeError(
+                            f"fixture cleanup left residual state: {after_cleanup}"
+                        )
+                    evidence["cleanup"] = {
+                        "foreign_key_cascade_verified": True,
+                        "watermark_removed": True,
+                        "residual_counts": after_cleanup,
+                    }
+                workflow["cleanup"]["status"] = "passed"
+            except Exception as exc:  # noqa: BLE001
+                cleanup_failure = _workflow_failure("fixture_cleanup", exc)
+                workflow["cleanup"]["status"] = "failed"
+                workflow["cleanup"]["failure"] = cleanup_failure
+                if workflow["failure"] is None:
+                    workflow["failure"] = cleanup_failure
+        workflow["phase_trace"].append("post_fixture_count")
+        try:
             with pool.connection() as conn:
-                _delete_fixture(conn, prefix)
-                after_cascade = _fixture_counts(conn, prefix)
-                residual = {
-                    key: value
-                    for key, value in after_cascade.items()
-                    if key not in {"turn_watermark", "attempt_watermark"} and value
-                }
-                if residual:
-                    raise RuntimeError(
-                        f"fixture cleanup left source/rollup rows: {residual}"
-                    )
-                conn.execute(
-                    "DELETE FROM v2_usage_rollup_watermarks "
-                    "WHERE rollup_name='hosted_v2_usage'"
+                workflow["post_fixture_empty_counts"] = _database_counts(conn)
+        except Exception as exc:  # noqa: BLE001
+            if workflow["failure"] is None:
+                workflow["failure"] = _workflow_failure(
+                    "post_fixture_count", exc
                 )
-                conn.execute(
-                    "DELETE FROM llm_usage_rollup_watermarks "
-                    "WHERE rollup_name='hosted_v2_attempt_usage'"
-                )
-                conn.execute(
-                    "DELETE FROM llm_usage_rollup_dirty_days "
-                    "WHERE rollup_name='hosted_v2_attempt_usage'"
-                )
-                after_cleanup = _fixture_counts(conn, prefix)
-                if any(after_cleanup.values()):
-                    raise RuntimeError(
-                        f"fixture cleanup left residual state: {after_cleanup}"
-                    )
-                evidence["cleanup"] = {
-                    "foreign_key_cascade_verified": True,
-                    "watermark_removed": True,
-                    "residual_counts": after_cleanup,
-                }
 
-    evidence["passed"] = _formal_gate_passed(
+    if workflow["failure"] is None and (
+        workflow["cleanup"]["status"] != "passed"
+        or not _counts_are_zero(workflow["post_fixture_empty_counts"])
+    ):
+        workflow["failure"] = {
+            "phase": "post_fixture_empty_check",
+            "type": "RuntimeError",
+            "message": (
+                "dedicated database is not empty after fixture cleanup: "
+                f"{workflow['post_fixture_empty_counts']}"
+            ),
+        }
+    fixture_ready_for_business = bool(
+        workflow["failure"] is None
+        and workflow["cleanup"]["status"] == "passed"
+        and _counts_are_zero(workflow["post_fixture_empty_counts"])
+    )
+    if fixture_ready_for_business:
+        workflow["phase_trace"].append("business_pre_count")
+        try:
+            with pool.connection() as conn:
+                pre_business_counts = _database_counts(conn)
+            workflow["business_database_counts"]["pre"] = pre_business_counts
+            if not _counts_are_zero(pre_business_counts):
+                raise RuntimeError(
+                    "dedicated database is not empty before business proof: "
+                    f"{pre_business_counts}"
+                )
+            workflow["phase_trace"].append("business_producer")
+            business_result = produce_business_evidence()
+            workflow["business_status"] = "passed"
+            evidence["business_path"] = business_result["business"]
+            if args.business_path_output:
+                _write_evidence_atomic(
+                    Path(args.business_path_output),
+                    json.dumps(
+                        evidence["business_path"], indent=2, sort_keys=True
+                    )
+                    + "\n",
+                )
+        except Exception as exc:  # noqa: BLE001
+            workflow["business_status"] = "failed"
+            workflow["failure"] = _workflow_failure(
+                workflow["phase_trace"][-1], exc
+            )
+        finally:
+            workflow["phase_trace"].append("business_post_count")
+            try:
+                with pool.connection() as conn:
+                    post_business_counts = _database_counts(conn)
+                workflow["business_database_counts"]["post"] = post_business_counts
+                if (
+                    workflow["failure"] is None
+                    and not _counts_are_zero(post_business_counts)
+                ):
+                    raise RuntimeError(
+                        "dedicated database is not empty after business proof: "
+                        f"{post_business_counts}"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                if workflow["failure"] is None:
+                    workflow["failure"] = _workflow_failure(
+                        "business_post_count", exc
+                    )
+                    workflow["business_status"] = "failed"
+
+    if workflow["failure"] is None and workflow["business_status"] == "passed":
+        workflow["terminal_phase"] = "complete"
+    elif workflow["cleanup"]["status"] == "failed":
+        workflow["terminal_phase"] = "cleanup_failed"
+    elif workflow["business_status"] == "failed":
+        workflow["terminal_phase"] = "business_failed"
+    elif workflow["failure"] is not None:
+        workflow["terminal_phase"] = (
+            f"{workflow['failure']['phase']}_failed"
+        )
+    evidence["workflow"] = workflow
+
+    evidence["passed"] = _workflow_evidence_passed(workflow) and _formal_gate_passed(
         evidence["cohorts"],
         evidence["cleanup"],
         source=evidence.get("source") or {},
@@ -2680,11 +2933,12 @@ def _run(args) -> int:
     ) and _retention_index_evidence_passed(
         evidence["retention_index"]
     ) and _business_path_evidence_passed(
-        evidence["business_path"], expected_commit=_current_git_commit(repo)
+        evidence.get("business_path") or {},
+        expected_commit=_current_git_commit(repo),
     )
     rendered = json.dumps(evidence, indent=2, sort_keys=True, default=str) + "\n"
     if args.output:
-        Path(args.output).write_text(rendered, encoding="utf-8")
+        _write_evidence_atomic(Path(args.output), rendered)
     print(rendered, end="")
     return 0 if evidence["passed"] else 1
 

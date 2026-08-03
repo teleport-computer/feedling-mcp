@@ -1078,7 +1078,7 @@ def _recorder_failure_fanout(accounting: Any) -> tuple[Callable[[Any], None], di
     for recorder in (pool, sql, serialization):
         recorder.start()
     serialization._queue.put_nowait(object())
-    _wait_for(
+    serialization_witness_consumed = _wait_for(
         lambda: serialization.queue_size == 0
         and serialization.dropped_count - mode_before["serialization"][1] == 1
     )
@@ -1111,25 +1111,41 @@ def _recorder_failure_fanout(accounting: Any) -> tuple[Callable[[Any], None], di
             "sql": _recorder_mode_evidence(
                 sql, mode_before["sql"], sql_witness, "cursor_executemany", capacity
             ),
-            "serialization": {
-                "stage": "event_type_check",
-                "exception_type": "TypeError",
-                "injected_items": 1,
-                "consumed_items": 1 if serialization.queue_size == 0 else 0,
-                "queue_size_before": mode_before["serialization"][0],
-                "queue_size_after": serialization.queue_size,
-                "queue_capacity": capacity,
-                "drop_before": mode_before["serialization"][1],
-                "drop_after": serialization.dropped_count,
-                "drop_delta": serialization.dropped_count
-                - mode_before["serialization"][1],
-                "queue_full_drops": 0,
-            },
+            "serialization": _serialization_mode_evidence(
+                recorder=serialization,
+                before=mode_before["serialization"],
+                capacity=capacity,
+                witness_consumed=serialization_witness_consumed,
+            ),
         }
         for recorder in (startup, pool, sql, serialization):
             recorder.shutdown(timeout=1)
 
     return fanout, state, finish
+
+
+def _serialization_mode_evidence(
+    *,
+    recorder: Any,
+    before: tuple[int, int],
+    capacity: int,
+    witness_consumed: bool,
+) -> dict[str, Any]:
+    queue_before, drop_before = before
+    drop_after = recorder.dropped_count
+    return {
+        "stage": "event_type_check",
+        "exception_type": "TypeError",
+        "injected_items": 1,
+        "consumed_items": 1 if witness_consumed else 0,
+        "queue_size_before": queue_before,
+        "queue_size_after": recorder.queue_size,
+        "queue_capacity": capacity,
+        "drop_before": drop_before,
+        "drop_after": drop_after,
+        "drop_delta": drop_after - drop_before,
+        "queue_full_drops": 0,
+    }
 
 
 def _recorder_mode_evidence(

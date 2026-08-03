@@ -663,6 +663,28 @@ def test_scale_cleanup_counts_turn_and_attempt_watermarks_separately() -> None:
     assert counts["attempt_watermark"] == 3
 
 
+def test_serialization_witness_is_not_invalidated_by_later_queue_activity() -> None:
+    from scripts.perf.provider_attempt_business_path import (
+        _serialization_mode_evidence,
+    )
+
+    class Recorder:
+        queue_size = 7
+        dropped_count = 4
+
+    evidence = _serialization_mode_evidence(
+        recorder=Recorder(),
+        before=(0, 3),
+        capacity=4096,
+        witness_consumed=True,
+    )
+
+    assert evidence["injected_items"] == 1
+    assert evidence["consumed_items"] == 1
+    assert evidence["queue_size_after"] == 7
+    assert evidence["drop_delta"] == 1
+
+
 def test_pool_probe_refuses_preexisting_rollup_state() -> None:
     from scripts.perf.provider_attempt_business_path import _assert_pool_probe_empty
 

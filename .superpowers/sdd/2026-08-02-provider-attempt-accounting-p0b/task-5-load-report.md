@@ -280,3 +280,46 @@ Fresh closure verification passed: 226 focused tests, Ruff over both perf
 scripts and both focused test modules, compileall for both perf scripts, and the
 harness self-test (percentiles, sensitive-column guard, and half-open time
 range). The PostgreSQL EXPLAIN/small-data subset separately passed 2 tests.
+
+## Unified fixture and business-proof ordering
+
+The first real formal resume attempt failed safely before cleanup was armed.
+The exact prevalidation was followed by the empty-database business/pool probe
+while the full 3M fixture was still installed; the probe's production Usage
+attempt subsection and maintenance rebuild reached their unchanged 3,000ms
+statement limits. A fresh read-only exact validation after that failure passed
+with all source/rollup counts unchanged, all six semantic mismatch counts zero,
+`invalid_created_at=0`, and clean complete watermarks. The retained fixture was
+therefore intact and was not cleaned during this correction.
+
+Fresh and resume now share one state machine after fixture acquisition:
+full-fixture timing/EXPLAIN, exact cleanup, global empty-database proof, then the
+commit-bound business/pool producer in the same empty dedicated database.
+Evidence includes the ordered phase trace, `post_fixture_empty_counts`, and
+business pre/post database counts. All three count maps must be present and
+zero. Timing failure still runs fixture cleanup but prohibits the producer;
+cleanup failure also prohibits it; business failure happens only after fixture
+removal and records post-counts in `finally`. Every workflow failure produces a
+structured failed artifact through an atomic same-directory temporary write,
+`fsync`, and `os.replace`, so an existing artifact cannot become partial JSON.
+
+The producer remains sealed to the full current Git commit and is still checked
+by its original strict validator. A previously timing-dependent serialization
+witness was made deterministic: its successful malformed-item consumption is
+captured at the injection boundary rather than inferred later from queue size
+after normal fanout traffic. No retry or validator relaxation was added.
+
+A real 100-turn/100-attempt non-formal probe against a separately created local
+temporary database completed this exact order:
+`prepare_fixture`, `fixture_workload`, `fixture_cleanup`,
+`post_fixture_count`, `business_pre_count`, `business_producer`,
+`business_post_count`. Fixture-post, business-pre, and business-post global
+counts were all zero; business status passed with a canonical digest bound to
+the then-current full commit. Report p95 was 21.341ms unfiltered and 21.281ms
+filtered. Its process exit was 1 only because non-formal evidence is permanently
+ineligible to pass the formal gate. The temporary database was dropped and a
+catalog check showed only the retained 3M database remained. No second formal
+resume or 3M cleanup was run.
+
+Fresh final verification for the unified order passed 233 focused tests plus
+Ruff, compileall, the harness self-test, and diff-check.
