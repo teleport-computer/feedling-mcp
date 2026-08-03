@@ -1162,6 +1162,88 @@ def test_narrow_probe_hard_gate_rejects_each_missing_or_boundary_witness():
         assert probe._probe_passed(candidate) is False
 
 
+def test_narrow_diagnostic_mode_can_never_pass_the_hard_gate():
+    probe = _load_narrow_call_probe()
+    evidence = _healthy_narrow_probe_evidence()
+    evidence["diagnostic_mode"] = True
+    evidence["diagnostic"] = {"hard_verdict_frozen": False}
+
+    assert probe._probe_passed(evidence) is False
+
+
+def test_narrow_shape_diagnostic_records_five_warm_attempts_and_full_plan(
+    monkeypatch
+):
+    probe = _load_narrow_call_probe()
+
+    class Connection:
+        calls = 0
+
+        def execute(self, *_args, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("canceling statement due to statement timeout")
+
+    plan = {
+        "Node Type": "Aggregate",
+        "Actual Rows": 5,
+        "Shared Hit Blocks": 7,
+        "Shared Read Blocks": 11,
+        "Temp Read Blocks": 13,
+        "Temp Written Blocks": 17,
+        "Plans": [
+            {
+                "Node Type": "Sort",
+                "Actual Rows": 731_199,
+                "Sort Method": "external merge",
+                "Sort Space Used": 23,
+                "Sort Space Type": "Disk",
+            }
+        ],
+    }
+    monkeypatch.setattr(probe, "_set_statement_timeout", lambda *_args: None)
+    monkeypatch.setattr(
+        probe,
+        "_explain_candidate",
+        lambda *_args: {
+            "execution_ms": 12_345.0,
+            "planning_ms": 1.0,
+            "temp_read_blocks": 13,
+            "temp_written_blocks": 17,
+            "plan": plan,
+        },
+    )
+
+    evidence = probe._diagnose_shape(Connection(), "SELECT 1", ())
+
+    assert len(evidence["warm_attempts"]) == 5
+    assert [item["attempt"] for item in evidence["warm_attempts"]] == [
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
+    assert {item["status"] for item in evidence["warm_attempts"]} == {
+        "timeout"
+    }
+    assert evidence["full_plan"]["elapsed_ms"] == 12_345.0
+    assert evidence["full_plan"]["summary"] == {
+        "max_actual_rows": 731_199,
+        "shared_hit_blocks": 7,
+        "shared_read_blocks": 11,
+        "temp_read_blocks": 13,
+        "temp_written_blocks": 17,
+        "spill_nodes": [
+            {
+                "node_type": "Sort",
+                "sort_method": "external merge",
+                "sort_space_used": 23,
+                "sort_space_type": "Disk",
+            }
+        ],
+    }
+
+
 def test_narrow_probe_failure_closes_session_audits_and_writes_atomic_json(
     monkeypatch, tmp_path
 ):

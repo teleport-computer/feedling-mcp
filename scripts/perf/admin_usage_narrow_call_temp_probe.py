@@ -64,6 +64,7 @@ __all__ = (
     "FLAG_COLUMN_NAMES",
     "NARROW_IDENTITY_COLUMNS",
     "_candidate_query",
+    "_diagnose_shape",
     "_narrow_day_insert_sql",
     "_narrow_dimension_select",
     "_narrow_raw_insert_sql",
@@ -139,7 +140,8 @@ def _probe_passed(evidence: dict) -> bool:
     shapes = evidence.get("shapes", {})
     selected = evidence.get("selected_shape")
     return bool(
-        temp.get("rows") == 731_199
+        evidence.get("diagnostic_mode") is not True
+        and temp.get("rows") == 731_199
         and _narrow_storage_passed(
             temp,
             membership_total_bytes=int(temp.get("membership_total_bytes", 0)),
@@ -641,6 +643,96 @@ def _sample_candidate(conn, statement: str, params: tuple) -> dict[str, Any]:
     }
 
 
+def _plan_summary(node: dict[str, Any]) -> dict[str, Any]:
+    nodes = []
+
+    def visit(item: dict[str, Any]) -> None:
+        nodes.append(item)
+        for child in item.get("Plans", ()):
+            visit(child)
+
+    visit(node)
+    spills = []
+    for item in nodes:
+        sort_method = str(item.get("Sort Method", ""))
+        hash_batches = int(item.get("Hash Batches", 1) or 1)
+        if "external" in sort_method.lower() or hash_batches > 1:
+            spill = {"node_type": item.get("Node Type")}
+            if sort_method:
+                spill.update(
+                    {
+                        "sort_method": sort_method,
+                        "sort_space_used": item.get("Sort Space Used"),
+                        "sort_space_type": item.get("Sort Space Type"),
+                    }
+                )
+            if hash_batches > 1:
+                spill["hash_batches"] = hash_batches
+            spills.append(spill)
+    return {
+        "max_actual_rows": max(
+            (int(item.get("Actual Rows", 0) or 0) for item in nodes),
+            default=0,
+        ),
+        "shared_hit_blocks": int(node.get("Shared Hit Blocks", 0) or 0),
+        "shared_read_blocks": int(node.get("Shared Read Blocks", 0) or 0),
+        "temp_read_blocks": int(node.get("Temp Read Blocks", 0) or 0),
+        "temp_written_blocks": int(node.get("Temp Written Blocks", 0) or 0),
+        "spill_nodes": spills,
+    }
+
+
+def _diagnose_shape(conn, statement: str, params: tuple) -> dict[str, Any]:
+    evidence: dict[str, Any] = {"warm_attempts": []}
+    for attempt in range(1, 6):
+        _set_statement_timeout(conn, int(P95_BUDGET_MS))
+        started = time.perf_counter()
+        item: dict[str, Any] = {"attempt": attempt}
+        try:
+            rows = _canonical_rows(conn.execute(statement, params).fetchall())
+            item.update({"status": "pass", "rows": _rows_witness(rows)})
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc)
+            item.update(
+                {
+                    "status": (
+                        "timeout"
+                        if "statement timeout" in message.lower()
+                        else "error"
+                    ),
+                    "failure": {
+                        "type": type(exc).__name__,
+                        "message": message,
+                    },
+                }
+            )
+        item["elapsed_ms"] = (time.perf_counter() - started) * 1000
+        evidence["warm_attempts"].append(item)
+
+    _set_statement_timeout(conn, DIAGNOSTIC_TIMEOUT_MS)
+    try:
+        plan = _explain_candidate(conn, statement, params)
+        evidence["full_plan"] = {
+            "status": "pass",
+            "elapsed_ms": plan["execution_ms"],
+            "planning_ms": plan["planning_ms"],
+            "temp_read_blocks": plan["temp_read_blocks"],
+            "temp_written_blocks": plan["temp_written_blocks"],
+            "summary": _plan_summary(plan["plan"]),
+            "plan": plan["plan"],
+        }
+    except Exception as exc:  # noqa: BLE001
+        evidence["full_plan"] = {
+            "status": (
+                "timeout"
+                if "statement timeout" in str(exc).lower()
+                else "error"
+            ),
+            "failure": {"type": type(exc).__name__, "message": str(exc)},
+        }
+    return evidence
+
+
 def _samples_passed(cohort: dict[str, Any]) -> bool:
     samples = cohort.get("samples", {})
     return bool(
@@ -656,7 +748,11 @@ def _samples_passed(cohort: dict[str, Any]) -> bool:
 
 
 def _run_probe(
-    database_url: str, *, output: Path, prefix: str = DEFAULT_PREFIX
+    database_url: str,
+    *,
+    output: Path,
+    prefix: str = DEFAULT_PREFIX,
+    diagnostic_after_hard_failure: bool = False,
 ) -> dict[str, Any]:
     """Run the one-session narrow checkpoint and always persist failure evidence."""
 
@@ -679,12 +775,20 @@ def _run_probe(
         "prefix": prefix,
         "budget_ms": P95_BUDGET_MS,
         "maintenance_timeout_ms": MAINTENANCE_TIMEOUT_MS,
+        "diagnostic_mode": diagnostic_after_hard_failure,
         "phase": "starting",
         "shapes": {
             shape: {"cohorts": {}}
             for shape in ("bounded_unions", "grouping_sets")
         },
     }
+    if diagnostic_after_hard_failure:
+        evidence["diagnostic"] = {
+            "hard_verdict_frozen": False,
+            "reference_skipped": True,
+            "filtered_skipped": True,
+            "cohorts": {},
+        }
     pre_snapshot = None
     try:
         with psycopg.connect(database_url, autocommit=True) as conn:
@@ -936,6 +1040,30 @@ def _run_probe(
                         )
                     )
                     if not viable:
+                        if (
+                            diagnostic_after_hard_failure
+                            and cohort_name == "unfiltered"
+                        ):
+                            diagnostic_cohort = {}
+                            evidence["diagnostic"]["cohorts"][cohort_name] = (
+                                diagnostic_cohort
+                            )
+                            for shape in _shape_order(cohort_name):
+                                evidence["phase"] = (
+                                    f"{cohort_name}_{shape}_diagnostic"
+                                )
+                                diagnostic_cohort[shape] = _diagnose_shape(
+                                    conn,
+                                    _candidate_query(
+                                        shape=shape,
+                                        selector=selector,
+                                        completeness="all",
+                                    ),
+                                    params,
+                                )
+                            evidence["phase"] = (
+                                f"{cohort_name}_diagnostic_hard_stop"
+                            )
                         raise RuntimeError(
                             f"neither shape can pass cohort {cohort_name}"
                         )
@@ -1036,11 +1164,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--prefix", default=DEFAULT_PREFIX)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--diagnostic-after-hard-failure",
+        action="store_true",
+        help="keep hard=false and collect unfiltered warm/full-plan diagnostics",
+    )
     args = parser.parse_args(argv)
     if not args.database_url.strip():
         parser.error("set SCALE_PROBE_DSN or pass --database-url")
     evidence = _run_probe(
-        args.database_url.strip(), output=args.output, prefix=args.prefix
+        args.database_url.strip(),
+        output=args.output,
+        prefix=args.prefix,
+        diagnostic_after_hard_failure=args.diagnostic_after_hard_failure,
     )
     print(json.dumps(evidence, indent=2, sort_keys=True, default=str))
     return 0 if evidence.get("passed") is True else 1
