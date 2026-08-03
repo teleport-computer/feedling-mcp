@@ -3518,7 +3518,18 @@ def _render_usage_page(
         logical_coverage_reason = attempt_coverage.get(
             "logical_call_coverage_reason"
         )
-        if logical_coverage_reason:
+        if logical_coverage_reason == "provider_attempt_retention_window_truncated":
+            logical_coverage_value = "partial / unavailable"
+            retained_from = html.escape(
+                str(attempt_coverage.get("retained_from") or "unknown")
+            )
+            reconciliation_note = (
+                "<b>Provider-attempt totals are partial</b>: ledger rows are "
+                f"retained from {retained_from}; this query crosses that "
+                "boundary, so missing historical attempts are unknown rather "
+                "than zero."
+            )
+        elif logical_coverage_reason:
             logical_coverage_value = "unavailable"
             reconciliation_note = (
                 "<b>Logical-call coverage unavailable</b>: "

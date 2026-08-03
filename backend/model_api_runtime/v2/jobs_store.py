@@ -4467,6 +4467,7 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
     safe_hours = max(1, min(int(within_hours), 24 * 366))
 
     attempt_rows = None
+    attempt_coverage = None
     with _pool().connection() as conn:
         with conn.transaction():
             with conn.cursor(row_factory=dict_row) as cur:
@@ -4517,6 +4518,16 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
                             observer_role="runtime",
                         )
                         attempt_rows = attempt_bundle["attempts"]["lanes"]
+                        coverage = attempt_bundle["attempts"]["coverage"]
+                        attempt_coverage = {
+                            "retained_from": coverage.get("retained_from"),
+                            "retention_truncated": bool(
+                                coverage.get("retention_truncated")
+                            ),
+                            "retention_partial_reason": coverage.get(
+                                "retention_partial_reason"
+                            ),
+                        }
                 except Exception:
                     log.exception("runtime attempt usage by lane unavailable")
 
@@ -4579,6 +4590,14 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
 
     attempt_lanes = None
     if attempt_rows is not None:
+        retention_truncated = bool(
+            attempt_coverage
+            and attempt_coverage.get("retention_truncated")
+        )
+        retention_reason = (
+            attempt_coverage.get("retention_partial_reason")
+            if attempt_coverage else None
+        )
         attempt_lanes = {}
         for row in attempt_rows:
             lane = str(row["lane"] or "unknown")
@@ -4600,7 +4619,8 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
                 "whole_turn_model_calls": whole_turn_calls,
                 "logical_call_coverage": _usage_rate(
                     logical_calls, whole_turn_calls
-                ),
+                ) if not retention_truncated else None,
+                "logical_call_coverage_reason": retention_reason,
             }
         for lane, whole_turn in lanes.items():
             whole_turn_calls = int(whole_turn.get("model_calls") or 0)
@@ -4619,11 +4639,15 @@ def recent_token_usage_by_lane(*, within_hours: int = 24) -> dict:
                 "cache_miss_tokens": None,
                 "whole_turn_model_calls": whole_turn_calls,
                 "logical_call_coverage": _usage_rate(0, whole_turn_calls),
+                "logical_call_coverage_reason": retention_reason,
             })
+            if retention_truncated:
+                attempt_lanes[lane]["logical_call_coverage"] = None
     return {
         "window_hours": safe_hours,
         "lanes": lanes,
         "attempt_lanes": attempt_lanes,
+        "attempt_coverage": attempt_coverage,
     }
 
 
@@ -5990,6 +6014,15 @@ def _usage_attempt_partition(
     """Take the exact safe intersection of whole-turn and attempt rollups."""
 
     dirty = set(dirty_days or ())
+    touched = tuple(
+        sorted(
+            set(whole_turn_partition.rollup_days)
+            | set(whole_turn_partition.raw_days)
+        )
+    )
+    retention_truncated = bool(
+        retained_from is not None and touched and touched[0] < retained_from
+    )
     rolled = tuple(
         day
         for day in whole_turn_partition.rollup_days
@@ -6008,7 +6041,16 @@ def _usage_attempt_partition(
             - rolled_set
         )
     )
-    return usage_reporting.RollupPartition(rollup_days=rolled, raw_days=raw)
+    return usage_reporting.RollupPartition(
+        rollup_days=rolled,
+        raw_days=raw,
+        retained_from=retained_from,
+        retention_truncated=retention_truncated,
+        retention_partial_reason=(
+            "provider_attempt_retention_window_truncated"
+            if retention_truncated else None
+        ),
+    )
 
 
 def _usage_attempt_partition_on_cursor(cur, query, whole_turn_partition):
@@ -6055,6 +6097,11 @@ def _usage_attempt_raw_predicate(query, partition):
     else:
         range_clauses: list[str] = []
         for raw_day in partition.raw_days:
+            if (
+                partition.retained_from is not None
+                and raw_day < partition.retained_from
+            ):
+                continue
             day_start = datetime.combine(
                 raw_day, datetime.min.time(), tzinfo=usage_reporting.SHANGHAI
             ).astimezone(timezone.utc)
@@ -6070,7 +6117,10 @@ def _usage_attempt_raw_predicate(query, partition):
                     min(day_end, query.end_at_utc),
                 )
             )
-        clauses.append("(" + " OR ".join(range_clauses) + ")")
+        clauses.append(
+            "(" + " OR ".join(range_clauses) + ")"
+            if range_clauses else "false"
+        )
     if query.user_id:
         clauses.append("coalesce(m.user_id,'unknown')=%s")
         params.append(query.user_id)
@@ -6330,6 +6380,24 @@ def _usage_attempt_snapshot(
     """
 
     cur = _UsageAttemptCursor(cur)
+    if partition is None:
+        cur.execute(
+            "SELECT retained_from FROM llm_usage_rollup_watermarks "
+            "WHERE rollup_name=%s",
+            ("hosted_v2_attempt_usage",),
+        )
+        retention_state = cur.fetchone()
+        retained_from = (
+            retention_state["retained_from"] if retention_state else None
+        )
+        whole_partition = usage_reporting.rollup_partition(query)
+        if retained_from is not None and whole_partition is not None:
+            partition = _usage_attempt_partition(
+                whole_partition,
+                completed_through_day=None,
+                retained_from=retained_from,
+                dirty_days=(),
+            )
     statement, params = _usage_attempt_query(query, partition)
     _usage_snapshot_observer(
         "read", role=observer_role, section="attempt_ledger"
@@ -6397,17 +6465,25 @@ def _usage_attempt_snapshot(
     outer_gaps = int(gaps.get("outer_gaps") or 0)
     inner_gaps = int(gaps.get("inner_gaps") or 0)
     logical_calls = overview["logical_calls"]
-    coverage_attributable = not (
+    retention_truncated = bool(
+        partition is not None and partition.retention_truncated
+    )
+    denominator_attributable = not (
         query.provider or query.model or query.completeness != "all"
     )
+    coverage_attributable = denominator_attributable and not retention_truncated
     whole_turn_model_calls = (
-        int(whole_turn_model_calls or 0) if coverage_attributable else None
+        int(whole_turn_model_calls or 0) if denominator_attributable else None
     )
-    coverage_reason = (
-        None if coverage_attributable else
-        "provider_model_or_completeness_filters_cannot_attribute_"
-        "whole_turn_model_calls"
-    )
+    if retention_truncated:
+        coverage_reason = "provider_attempt_retention_window_truncated"
+    elif coverage_attributable:
+        coverage_reason = None
+    else:
+        coverage_reason = (
+            "provider_model_or_completeness_filters_cannot_attribute_"
+            "whole_turn_model_calls"
+        )
     return {
         "attempts": {
             "overview": overview,
@@ -6427,6 +6503,17 @@ def _usage_attempt_snapshot(
                     logical_calls, whole_turn_model_calls
                 ) if coverage_attributable else None,
                 "logical_call_coverage_reason": coverage_reason,
+                "retained_from": (
+                    partition.retained_from.isoformat()
+                    if partition is not None
+                    and partition.retained_from is not None
+                    else None
+                ),
+                "retention_truncated": retention_truncated,
+                "retention_partial_reason": (
+                    partition.retention_partial_reason
+                    if partition is not None else None
+                ),
                 "missing_outer_ordinals": outer_gaps,
                 "missing_inner_ordinals": inner_gaps,
                 "attempt_sequence_gaps": outer_gaps + inner_gaps,
@@ -6477,11 +6564,17 @@ def _usage_apply_attempt_denominator(attempt_bundle, whole_turn_model_calls):
     if attempts is None:
         return attempt_bundle
     coverage = attempts.get("coverage") or {}
-    if coverage.get("logical_call_coverage_reason") is None:
+    reason = coverage.get("logical_call_coverage_reason")
+    if reason != (
+        "provider_model_or_completeness_filters_cannot_attribute_"
+        "whole_turn_model_calls"
+    ):
         denominator = int(whole_turn_model_calls or 0)
         recorded = int(coverage.get("recorded_logical_calls") or 0)
         coverage["whole_turn_model_calls"] = denominator
-        coverage["logical_call_coverage"] = _usage_rate(recorded, denominator)
+        coverage["logical_call_coverage"] = (
+            _usage_rate(recorded, denominator) if reason is None else None
+        )
     return attempt_bundle
 
 

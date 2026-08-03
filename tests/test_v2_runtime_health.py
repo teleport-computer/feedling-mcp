@@ -6,6 +6,7 @@ import inspect
 import os
 import sys
 import threading
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import db
-from model_api_runtime.v2 import jobs_store
+from model_api_runtime.v2 import jobs_store, provider_attempt_rollup
 
 from conftest import seed_user, set_v2_runtime_owner
 
@@ -678,6 +679,59 @@ def test_token_usage_by_lane_reports_none_not_zero_without_usage():
     assert attempt_chat["input_tokens"] is None
     assert attempt_chat["output_tokens"] is None
     assert attempt_chat["logical_call_coverage"] == pytest.approx(0.0)
+
+
+def test_token_usage_by_lane_marks_retention_truncated_attempts_partial():
+    user_id = "u_tok_retention_partial"
+    job_id = 8_660_001
+    _add_metric(
+        user_id,
+        "chat",
+        prompt=100,
+        completion=10,
+        job_id=job_id,
+        model_calls=1,
+        age_hours=36,
+    )
+    with db.get_pool().connection() as conn:
+        metric = conn.execute(
+            "SELECT created_at,(created_at AT TIME ZONE 'Asia/Shanghai')::date "
+            "FROM v2_turn_metrics WHERE user_id=%s",
+            (user_id,),
+        ).fetchone()
+        local_day = metric[1]
+        conn.execute(
+            "INSERT INTO llm_usage_rollup_watermarks "
+            "(rollup_name,bootstrap_complete,completed_through_day,retained_from) "
+            "VALUES (%s,true,%s,%s) ON CONFLICT (rollup_name) DO UPDATE SET "
+            "bootstrap_complete=true,completed_through_day=excluded.completed_through_day,"
+            "retained_from=excluded.retained_from",
+            (
+                provider_attempt_rollup.ROLLUP_NAME,
+                local_day,
+                local_day + timedelta(days=1),
+            ),
+        )
+
+    try:
+        report = jobs_store.recent_token_usage_by_lane(within_hours=72)
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "DELETE FROM llm_usage_rollup_watermarks WHERE rollup_name=%s",
+                (provider_attempt_rollup.ROLLUP_NAME,),
+            )
+
+    assert report["attempt_coverage"] == {
+        "retained_from": (local_day + timedelta(days=1)).isoformat(),
+        "retention_truncated": True,
+        "retention_partial_reason": "provider_attempt_retention_window_truncated",
+    }
+    chat = report["attempt_lanes"]["chat"]
+    assert chat["logical_call_coverage"] is None
+    assert chat["logical_call_coverage_reason"] == (
+        "provider_attempt_retention_window_truncated"
+    )
 
 
 def test_token_usage_by_lane_coverage_is_none_without_calls():

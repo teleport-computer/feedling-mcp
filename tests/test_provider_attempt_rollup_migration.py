@@ -381,6 +381,49 @@ def test_0077_stale_started_partial_index_is_exact_and_query_uses_it():
             conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
 
 
+def test_0077_retention_orphan_index_is_exact_and_query_uses_it():
+    migration = _migration_module()
+    name = "ix_llm_provider_attempts_retention_started"
+    assert name in migration._CONCURRENT_INDEXES
+    with db.get_pool().connection() as conn:
+        assert migration._index_validity(name, conn) is True
+    uid = "u_attempt_retention_index"
+    _seed_user(uid)
+    try:
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO llm_provider_attempts (attempt_id,user_id,lane,call_id,"
+                "outer_attempt_ordinal,inner_attempt_ordinal,retry_kind,requested_provider,"
+                "resolved_provider,requested_model,resolved_model,transport,started_at,state,"
+                "outcome,error_class,source,completeness,revision) "
+                "SELECT '30000000-0000-5000-8000-'||lpad(to_hex(n),12,'0'),%s,'chat',"
+                "'retention-call-'||n,1,1,'initial','asked','served','asked-model',"
+                "'served-model','responses',now()-interval '500 days'"
+                "-(n*interval '1 second'),'completed','succeeded','none',"
+                "'runtime_recorder','complete',1 FROM generate_series(1,3000) n",
+                (uid,),
+            )
+            conn.execute("ANALYZE llm_provider_attempts")
+            plan = conn.execute(
+                "EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) "
+                "SELECT attempt_id FROM llm_provider_attempts "
+                "WHERE source='runtime_recorder' AND started_at<now()-interval '400 days' "
+                "ORDER BY started_at,attempt_id LIMIT 10"
+            ).fetchone()[0][0]
+
+        def nodes(node):
+            yield node
+            for child in node.get("Plans", []):
+                yield from nodes(child)
+
+        assert any(
+            node.get("Index Name") == name for node in nodes(plan["Plan"])
+        )
+    finally:
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
 def test_0077_repairs_wrong_stale_index_and_refuses_unrelated_owner():
     cfg = _alembic_config()
     name = "ix_llm_provider_attempts_stale_started"

@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 import psycopg
+from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 
@@ -1330,6 +1331,47 @@ def test_usage_attempt_partition_intersects_whole_turn_completed_clean_days():
             datetime(2026, 7, 5).date(),
             datetime(2026, 7, 6).date(),
         ),
+        retained_from=datetime(2026, 7, 2).date(),
+        retention_truncated=True,
+        retention_partial_reason="provider_attempt_retention_window_truncated",
+    )
+
+
+def test_usage_attempt_payload_marks_cross_retention_range_partial_not_zero(
+    provider_attempt_usage_rows,
+):
+    query = _usage_query(user_id=provider_attempt_usage_rows)
+    partition = usage_reporting.RollupPartition(
+        rollup_days=(),
+        raw_days=(datetime(2026, 7, 1).date(),),
+        retained_from=datetime(2026, 7, 2).date(),
+        retention_truncated=True,
+        retention_partial_reason="provider_attempt_retention_window_truncated",
+    )
+    with db.get_pool().connection() as conn:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+                )
+                attempts = jobs_store._usage_attempt_snapshot(
+                    cur,
+                    query,
+                    partition=partition,
+                    whole_turn_model_calls=4,
+                )["attempts"]
+
+    coverage = attempts["coverage"]
+    assert attempts["overview"]["attempts"] == 0
+    assert coverage["retained_from"] == "2026-07-02"
+    assert coverage["retention_truncated"] is True
+    assert coverage["retention_partial_reason"] == (
+        "provider_attempt_retention_window_truncated"
+    )
+    assert coverage["whole_turn_model_calls"] == 4
+    assert coverage["logical_call_coverage"] is None
+    assert coverage["logical_call_coverage_reason"] == (
+        "provider_attempt_retention_window_truncated"
     )
 
 
@@ -1423,6 +1465,12 @@ def test_usage_attempt_hybrid_rollup_only_matches_raw_payload(
                 (["hosted_v2_usage", provider_attempt_rollup.ROLLUP_NAME],),
             )
 
+    assert hybrid["coverage"]["retained_from"] == days[0].isoformat()
+    assert hybrid["coverage"]["retention_truncated"] is False
+    for coverage in (hybrid["coverage"], raw["coverage"]):
+        coverage.pop("retained_from")
+        coverage.pop("retention_truncated")
+        coverage.pop("retention_partial_reason")
     assert hybrid == raw
 
 
@@ -2429,6 +2477,41 @@ def test_usage_page_explains_unattributable_filtered_logical_coverage():
     assert "Logical-call coverage unavailable" in body
     assert "provider/model/completeness filters" in body
     assert "filtered attempt statistics remain available" in body
+
+
+def test_usage_page_explains_retention_truncated_attempt_totals():
+    report = _usage_render_report()
+    report["attempts"] = {
+        "overview": {"attempts": 0, "logical_calls": 0},
+        "users": [],
+        "lanes": [],
+        "requested_models": [],
+        "resolved_models": [],
+        "costs": [],
+        "coverage": {
+            "whole_turn_model_calls": 12,
+            "recorded_logical_calls": 0,
+            "logical_call_coverage": None,
+            "logical_call_coverage_reason": (
+                "provider_attempt_retention_window_truncated"
+            ),
+            "retained_from": "2025-06-29",
+            "retention_truncated": True,
+            "retention_partial_reason": (
+                "provider_attempt_retention_window_truncated"
+            ),
+            "missing_outer_ordinals": 0,
+            "missing_inner_ordinals": 0,
+            "attempt_sequence_gaps": 0,
+        },
+    }
+
+    with _admin_core.bind("view=usage&preset=all"):
+        body = _data_track._render_usage_page(report, _usage_query())
+
+    assert "Provider-attempt totals are partial" in body
+    assert "retained from 2025-06-29" in body
+    assert "0 / 12" not in body
 
 
 def test_usage_parallel_exported_snapshot_matches_raw_and_imports_before_read(
