@@ -384,15 +384,15 @@ def test_tick_exposes_safe_backlog_lag_and_default_budget_catches_old_overload(m
         max_days=0, max_changed_rows=4, max_dirty_days=1
     )
     assert second["source_backlog"]["attempt"] is False
-    results = {"attempt": {**second, "dirty_pending": False}}
-    assert serve_worker._reporting_maintenance_delay(results, 300.0) == 300.0
-    results["attempt"]["source_backlog"]["attempt"] = True
-    assert serve_worker._reporting_maintenance_delay(results, 300.0) == 5.0
-    results["attempt"]["status"] = "error"
-    assert serve_worker._reporting_maintenance_delay(results, 300.0) == 300.0
+    clean = {**second, "dirty_pending": False}
+    assert serve_worker._reporting_lane_delay(clean, 300.0) == 300.0
+    clean["source_backlog"]["attempt"] = True
+    assert serve_worker._reporting_lane_delay(clean, 300.0) == 5.0
+    clean["status"] = "error"
+    assert serve_worker._reporting_lane_delay(clean, 300.0) == 300.0
 
 
-def test_default_page_catches_writer_rate_above_old_2000_per_cadence_limit():
+def test_default_page_catches_static_batch_above_old_2000_page_limit():
     user_id, job_id, _attempt = _seed_turn_attempt(local_day=date(2026, 7, 29))
     provider_attempt_rollup.run_maintenance_tick(max_days=10)
     with db.get_pool().connection() as conn:
@@ -531,3 +531,41 @@ def test_existing_worker_maintenance_loop_runs_attempt_tick_and_isolates_failure
     asyncio.run(run_loop())
     assert len(calls) >= 2
     assert all(isinstance(item, threading.Event) for item in calls)
+
+
+def test_mixed_worker_loop_catches_up_pending_lane_without_accelerating_error_lane(
+    monkeypatch,
+):
+    usage_calls = []
+    attempt_calls = []
+    monkeypatch.setattr(serve_worker.usage_rollup, "enabled", lambda: True)
+    monkeypatch.setattr(provider_attempt_rollup, "enabled", lambda: True)
+    monkeypatch.setattr(serve_worker, "_REPORTING_CATCH_UP_SECONDS", 0.01)
+
+    def pending_usage(**_kwargs):
+        usage_calls.append(1)
+        return {
+            "status": "ok",
+            "bootstrap_complete": True,
+            "dirty_pending": True,
+            "source_backlog": {},
+        }
+
+    def failed_attempt(**_kwargs):
+        attempt_calls.append(1)
+        return {"status": "error", "error": "Injected"}
+
+    monkeypatch.setattr(serve_worker.usage_rollup, "run_maintenance_tick", pending_usage)
+    monkeypatch.setattr(provider_attempt_rollup, "run_maintenance_tick", failed_attempt)
+
+    async def run_loop():
+        stop = asyncio.Event()
+        task = asyncio.create_task(serve_worker._usage_rollup_loop(stop, interval=10.0))
+        while len(usage_calls) < 3:
+            await asyncio.sleep(0.003)
+        stop.set()
+        await asyncio.wait_for(task, timeout=1)
+
+    asyncio.run(run_loop())
+    assert len(usage_calls) >= 3
+    assert attempt_calls == [1]

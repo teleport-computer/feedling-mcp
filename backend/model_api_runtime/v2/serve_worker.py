@@ -4167,15 +4167,26 @@ def _usage_rollup_interval_seconds() -> float:
     return min(value, 86_400.0)
 
 
-def _run_reporting_maintenance_tick(*, cancel_event: threading.Event) -> dict:
+_REPORTING_CATCH_UP_SECONDS = 5.0
+_REPORTING_LANES = (
+    ("usage", usage_rollup),
+    ("attempt", provider_attempt_rollup),
+)
+
+
+def _run_reporting_maintenance_tick(
+    *, cancel_event: threading.Event, eligible_lanes: set[str] | None = None
+) -> dict:
     """Run independently fail-open reporting lanes in the existing worker loop."""
 
     outcomes: dict[str, dict] = {}
-    for name, module in (
-        ("usage", usage_rollup),
-        ("attempt", provider_attempt_rollup),
-    ):
-        if not module.enabled():
+    eligible = (
+        {name for name, _module in _REPORTING_LANES}
+        if eligible_lanes is None
+        else set(eligible_lanes)
+    )
+    for name, module in _REPORTING_LANES:
+        if name not in eligible or not module.enabled():
             continue
         try:
             outcomes[name] = module.run_maintenance_tick(cancel_event=cancel_event)
@@ -4184,19 +4195,17 @@ def _run_reporting_maintenance_tick(*, cancel_event: threading.Event) -> dict:
     return outcomes
 
 
-def _reporting_maintenance_delay(results: dict, cadence: float) -> float:
-    """Use a bounded catch-up cadence only for successful pending work."""
+def _reporting_lane_delay(result: dict, cadence: float) -> float:
+    """Return one lane's next delay without accelerating a failed sibling."""
 
-    for result in results.values():
-        if result.get("status") != "ok":
-            continue
+    if result.get("status") == "ok":
         backlog = result.get("source_backlog") or {}
         if (
             not result.get("bootstrap_complete", True)
             or result.get("dirty_pending", False)
             or any(bool(value) for value in backlog.values())
         ):
-            return min(cadence, 5.0)
+            return min(cadence, _REPORTING_CATCH_UP_SECONDS)
     return cadence
 
 
@@ -4212,9 +4221,16 @@ async def _usage_rollup_loop(
     """
 
     cadence = _usage_rollup_interval_seconds() if interval is None else interval
+    next_eligible = {name: 0.0 for name, _module in _REPORTING_LANES}
     while not stop_event.is_set():
-        next_delay = cadence
-        if usage_rollup.enabled() or provider_attempt_rollup.enabled():
+        now = time.monotonic()
+        enabled_lanes = {
+            name for name, module in _REPORTING_LANES if module.enabled()
+        }
+        eligible_lanes = {
+            name for name in enabled_lanes if now >= next_eligible[name]
+        }
+        if eligible_lanes:
             cancel_event = threading.Event()
             tick_task: asyncio.Task | None = None
             stop_task: asyncio.Task | None = None
@@ -4223,6 +4239,7 @@ async def _usage_rollup_loop(
                     asyncio.to_thread(
                         _run_reporting_maintenance_tick,
                         cancel_event=cancel_event,
+                        eligible_lanes=eligible_lanes,
                     )
                 )
                 stop_task = asyncio.create_task(stop_event.wait())
@@ -4241,7 +4258,14 @@ async def _usage_rollup_loop(
                         )
                     break
                 results = tick_task.result()
-                next_delay = _reporting_maintenance_delay(results, cadence)
+                finished = time.monotonic()
+                for name in eligible_lanes:
+                    result = results.get(
+                        name, {"status": "error", "error": "LaneUnavailable"}
+                    )
+                    next_eligible[name] = finished + _reporting_lane_delay(
+                        result, cadence
+                    )
                 for name, result in results.items():
                     if result.get("days_refreshed"):
                         log.info(
@@ -4267,6 +4291,9 @@ async def _usage_rollup_loop(
                         )
                 raise
             except Exception as e:  # noqa: BLE001 - reporting cannot kill worker
+                failed_at = time.monotonic()
+                for name in eligible_lanes:
+                    next_eligible[name] = failed_at + cadence
                 log.warning(
                     "[v2.serve_worker] usage rollup tick failed: %s",
                     type(e).__name__,
@@ -4277,6 +4304,15 @@ async def _usage_rollup_loop(
                     stop_task.cancel()
                 if stop_task is not None:
                     await asyncio.gather(stop_task, return_exceptions=True)
+        now = time.monotonic()
+        enabled_lanes = {
+            name for name, module in _REPORTING_LANES if module.enabled()
+        }
+        next_delay = (
+            min(max(next_eligible[name] - now, 0.0) for name in enabled_lanes)
+            if enabled_lanes
+            else cadence
+        )
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=next_delay)
         except asyncio.TimeoutError:

@@ -49,8 +49,8 @@ throwaway local PostgreSQL test database on `127.0.0.1:55432`.
   `test_provider_attempt_rollup_reconciler.py`,
   `test_provider_attempt_rollup_migration.py`,
   `test_provider_attempt_recorder.py`,
-  `test_v2_usage_rollup.py`, and `test_v2_serve_worker.py` — **153 passed**.
-- Reconciler file — **18 passed**; 0077 migration file — **12 passed**.
+  `test_v2_usage_rollup.py`, and `test_v2_serve_worker.py` — **154 passed**.
+- Reconciler file — **19 passed**; 0077 migration file — **12 passed**.
 - Ruff passed for the reconciler, migration, and tests; the changed worker file
   passed with its pre-existing module-path `E402` and unrelated `F401` baseline
   exclusions.
@@ -60,7 +60,7 @@ throwaway local PostgreSQL test database on `127.0.0.1:55432`.
 
 The first independent review found that the source-row limit was applied once
 per stream, stale-start lookup lacked a selective index, and the fixed
-five-minute cadence could fall behind sustained writers. The fix round adds:
+five-minute cadence had no bounded catch-up signal. The fix round adds:
 
 - one hard global source-row budget (default 6,000) shared by attempt,
   correction, turn, and rate-card streams; the three main streams receive a
@@ -73,9 +73,8 @@ five-minute cadence could fall behind sustained writers. The fix round adds:
 - safe per-stream backlog booleans, maximum source lag seconds, and a dirty-work
   signal in tick results; successful pending work uses a bounded five-second
   catch-up delay, while errors keep the normal cadence and cannot tight-loop;
-- a deterministic 2,101-row attempt fixture (more than the old 2,000 rows per
-  300-second cadence, or 6.7 rows/second) that the new default page catches up
-  in one tick; and
+- a real-PostgreSQL static 2,101-row attempt batch, larger than the old 2,000-row
+  page, that the new default page consumes in one tick; and
 - exact recoverable concurrent partial index
   `ix_llm_provider_attempts_stale_started` on `(started_at,attempt_id)` for the
   canonical started-only predicate. Migration tests cover exact validity,
@@ -84,3 +83,10 @@ five-minute cadence could fall behind sustained writers. The fix round adds:
 
 The second pooled connection used by the day builder remains intentionally
 unchanged for the final load proof, per review scope.
+
+The final loop fix tracks a separate monotonic next-eligible time per reporting
+lane. A successful pending lane may run again after five seconds, while an error
+lane keeps the normal cadence even if its sibling is catching up. Mixed-lane
+tests prove a pending usage lane advances repeatedly without re-invoking a
+failed attempt lane; disabled, stop, cancellation, and all-error paths retain
+their bounded behavior.
