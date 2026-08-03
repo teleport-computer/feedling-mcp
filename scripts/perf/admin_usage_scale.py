@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 import json
 import math
 import os
@@ -36,6 +37,7 @@ FORMAL_USERS = 2_000
 FORMAL_DAILY_ROWS = 731_199
 FORMAL_ATTEMPT_COMPLETED_THROUGH_DAY = "2026-08-02"
 FORMAL_ATTEMPT_RETAINED_FROM = "2025-06-29"
+FORMAL_INTEGRITY_STATEMENT_TIMEOUT_MS = 180_000
 _RESUME_PREFIX_RE = re.compile(r"^scale_usage_[0-9a-f]{10}_$")
 DEFAULT_USERS = 2_000
 DEFAULT_RUNS = 5
@@ -101,14 +103,34 @@ def _formal_gate_passed(
         and cleanup.get("residual_counts")
         and not any(cleanup["residual_counts"].values())
     )
+    resume_integrity_passed = True
+    if fixture.get("resumed") is True:
+        resume_validation = fixture.get("resume_validation") or {}
+        pre = resume_validation.get("pre")
+        post = resume_validation.get("post")
+        prefix = fixture.get("prefix")
+        try:
+            resume_integrity_passed = bool(
+                resume_validation.get("stable") is True
+                and isinstance(pre, dict)
+                and isinstance(post, dict)
+                and isinstance(prefix, str)
+                and _validate_resume_snapshot(pre, prefix=prefix) is pre
+                and _validate_resume_snapshot(post, prefix=prefix) is post
+                and _stable_resume_snapshot(pre) == _stable_resume_snapshot(post)
+            )
+        except (RuntimeError, SystemExit, TypeError, ValueError):
+            resume_integrity_passed = False
     cardinality_passed = bool(
         formal
         and fixture.get("rows") == FORMAL_ROWS
         and fixture.get("attempt_rows") == FORMAL_ATTEMPT_ROWS
+        and fixture.get("users") == FORMAL_USERS
+        and fixture.get("history_days") == DEFAULT_HISTORY_DAYS
         and source.get("total_rows") == FORMAL_ROWS
         and source.get("attempt_rows") == FORMAL_ATTEMPT_ROWS
     )
-    return cardinality_passed and cleanup_passed and set(cohorts) == required and all(
+    return cardinality_passed and resume_integrity_passed and cleanup_passed and set(cohorts) == required and all(
         cohort["timing"]["p95_ms"] < P95_BUDGET_MS
         and cohort["attempt_ledger_statement_count"] == 1
         and cohort["attempt_runtime_job_index_used"] is True
@@ -274,6 +296,102 @@ def _resolve_attempt_rows(rows: int, requested: int | None) -> int:
     return attempt_rows
 
 
+def _validate_run_configuration(
+    *,
+    formal: bool,
+    rows: int,
+    attempt_rows: int,
+    users: int,
+    history_days: int,
+) -> None:
+    if formal and (
+        rows != FORMAL_ROWS
+        or attempt_rows != FORMAL_ATTEMPT_ROWS
+        or users != FORMAL_USERS
+        or history_days != DEFAULT_HISTORY_DAYS
+    ):
+        raise SystemExit(
+            "formal mode requires exactly --rows 3000000, "
+            "--attempt-rows 3000000, --users 2000, and --history-days 365; "
+            "use --non-formal for a probe that can never pass"
+        )
+
+
+@lru_cache(maxsize=8)
+def _derive_expected_source_counts(
+    *,
+    rows: int,
+    attempt_rows: int,
+    history_days: int,
+    start_at: datetime,
+    end_at: datetime,
+    raw_bounds: tuple[tuple[datetime, datetime], ...],
+) -> dict[str, int]:
+    """Derive source cohorts from the exact deterministic seed expression."""
+
+    period_seconds = history_days * 86_400
+    cohort_lower_offset = int((end_at - end_at).total_seconds())
+    cohort_upper_offset = int((end_at - start_at).total_seconds())
+    raw_offset_bounds = tuple(
+        (
+            int((end_at - bound_end).total_seconds()),
+            int((end_at - bound_start).total_seconds()),
+        )
+        for bound_start, bound_end in raw_bounds
+    )
+    turn_window = 0
+    attempt_window = 0
+    turn_edges = 0
+    attempt_edges = 0
+    for g in range(1, max(rows, attempt_rows) + 1):
+        offset = (g * 104_729) % period_seconds
+        in_window = cohort_lower_offset < offset <= cohort_upper_offset
+        in_raw_edge = any(lower < offset <= upper for lower, upper in raw_offset_bounds)
+        if g <= rows:
+            turn_window += int(in_window)
+            turn_edges += int(in_raw_edge)
+        if g <= min(rows, attempt_rows):
+            attempt_window += int(in_window)
+            attempt_edges += int(in_raw_edge)
+    return {
+        "total_rows": rows,
+        "attempt_rows": attempt_rows,
+        "rows_in_90d": turn_window,
+        "attempt_rows_in_90d_job_cohort": attempt_window,
+        "expected_raw_edge_turn_rows": turn_edges,
+        "expected_raw_edge_attempt_rows": attempt_edges,
+        "expected_raw_edge_logical_calls": attempt_edges,
+    }
+
+
+@lru_cache(maxsize=1)
+def _formal_expected_source_counts() -> dict[str, int]:
+    start_at, end_at = _production_window()
+    raw_days = (
+        start_at.astimezone(SHANGHAI).date(),
+        end_at.astimezone(SHANGHAI).date(),
+    )
+    raw_bounds = []
+    for local_day in raw_days:
+        day_start = datetime.combine(
+            local_day, datetime.min.time(), tzinfo=SHANGHAI
+        ).astimezone(timezone.utc)
+        day_end = datetime.combine(
+            local_day + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=SHANGHAI,
+        ).astimezone(timezone.utc)
+        raw_bounds.append((max(day_start, start_at), min(day_end, end_at)))
+    return _derive_expected_source_counts(
+        rows=FORMAL_ROWS,
+        attempt_rows=FORMAL_ATTEMPT_ROWS,
+        history_days=DEFAULT_HISTORY_DAYS,
+        start_at=start_at,
+        end_at=end_at,
+        raw_bounds=tuple(raw_bounds),
+    )
+
+
 def _validate_resume_prefix(prefix: str, *, formal: bool) -> str:
     if not formal:
         raise SystemExit("--resume-prefix is formal-only")
@@ -340,12 +458,69 @@ def _validate_resume_snapshot(
         "non_runtime_attempts": 0,
     }:
         raise RuntimeError("resume reuse mismatch in source rows")
+    if snapshot.get("reference_counts") != {"llm_rate_cards": 0}:
+        raise RuntimeError(
+            "resume database contains foreign pricing reference state: "
+            f"actual={snapshot.get('reference_counts')}"
+        )
     if snapshot.get("rollup_integrity") != {
         "membership_distinct_attempts": FORMAL_ATTEMPT_ROWS,
         "membership_orphans": 0,
         "attempts_without_membership": 0,
     }:
         raise RuntimeError("resume fixture is partial or stale in rollup rows")
+    expected_semantic_integrity = {
+        "source_turns": {
+            "expected_rows": FORMAL_ROWS,
+            "actual_rows": FORMAL_ROWS,
+            "mismatched_rows": 0,
+        },
+        "source_attempts": {
+            "expected_rows": FORMAL_ATTEMPT_ROWS,
+            "actual_rows": FORMAL_ATTEMPT_ROWS,
+            "mismatched_rows": 0,
+        },
+        "daily_users": {
+            "expected_rows": FORMAL_DAILY_ROWS,
+            "actual_rows": FORMAL_DAILY_ROWS,
+            "mismatched_rows": 0,
+        },
+        "daily_dimensions": {
+            "expected_rows": FORMAL_DAILY_ROWS,
+            "actual_rows": FORMAL_DAILY_ROWS,
+            "mismatched_rows": 0,
+        },
+        "attempt_dimensions": {
+            "expected_rows": FORMAL_DAILY_ROWS,
+            "actual_rows": FORMAL_DAILY_ROWS,
+            "mismatched_rows": 0,
+        },
+        "memberships": {
+            "expected_rows": FORMAL_ATTEMPT_ROWS,
+            "actual_rows": FORMAL_ATTEMPT_ROWS,
+            "mismatched_rows": 0,
+        },
+    }
+    if snapshot.get("semantic_integrity") != expected_semantic_integrity:
+        raise RuntimeError(
+            "resume semantic integrity mismatch: "
+            f"expected={expected_semantic_integrity}, "
+            f"actual={snapshot.get('semantic_integrity')}"
+        )
+    query_evidence = snapshot.get("integrity_query_evidence") or {}
+    if set(query_evidence) != set(expected_semantic_integrity) or any(
+        item.get("passed") is not True
+        or item.get("statement_timeout_ms")
+        != FORMAL_INTEGRITY_STATEMENT_TIMEOUT_MS
+        or not isinstance(item.get("elapsed_ms"), (int, float))
+        or item["elapsed_ms"] < 0
+        or not item.get("plan_relations")
+        for item in query_evidence.values()
+    ):
+        raise RuntimeError(
+            "resume integrity query evidence is incomplete or failed: "
+            f"actual={query_evidence}"
+        )
     turn_watermark = snapshot.get("turn_watermark")
     expected_turn_watermark = {
         "bootstrap_complete": True,
@@ -371,23 +546,57 @@ def _validate_resume_snapshot(
             f"expected={expected_attempt_watermark}, actual={attempt_watermark}"
         )
     source = snapshot.get("source") or {}
-    raw_turns = source.get("expected_raw_edge_turn_rows")
-    raw_attempts = source.get("expected_raw_edge_attempt_rows")
-    raw_calls = source.get("expected_raw_edge_logical_calls")
-    if not (
-        source.get("total_rows") == FORMAL_ROWS
-        and source.get("attempt_rows") == FORMAL_ATTEMPT_ROWS
-        and isinstance(source.get("rows_in_90d"), int)
-        and source["rows_in_90d"] > 0
-        and source.get("attempt_rows_in_90d_job_cohort")
-        == source["rows_in_90d"]
-        and isinstance(raw_turns, int)
-        and raw_turns > 0
-        and raw_attempts == raw_turns
-        and raw_calls == raw_turns
-    ):
-        raise RuntimeError("resume reuse mismatch in 90d/raw-edge baseline")
+    expected_source = _formal_expected_source_counts()
+    if source != expected_source:
+        raise RuntimeError(
+            "resume deterministic source mismatch: "
+            f"expected={expected_source}, actual={source}"
+        )
     return snapshot
+
+
+def _stable_resume_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in snapshot.items()
+        if key != "integrity_query_evidence"
+    }
+
+
+def _run_resume_gate(
+    *,
+    prefix: str,
+    validate_only: bool,
+    collect,
+    validate,
+    producer,
+    arm_cleanup,
+    on_ready,
+) -> dict[str, Any]:
+    pre = validate(collect(), prefix=prefix)
+    if validate_only:
+        return {
+            "pre": pre,
+            "post": None,
+            "business": None,
+            "cleanup_armed": False,
+        }
+    business = producer()
+    post = validate(collect(), prefix=prefix)
+    if _stable_resume_snapshot(pre) != _stable_resume_snapshot(post):
+        raise RuntimeError(
+            "resume immutable snapshot changed across business producer: "
+            f"pre={_stable_resume_snapshot(pre)}, "
+            f"post={_stable_resume_snapshot(post)}"
+        )
+    arm_cleanup()
+    on_ready()
+    return {
+        "pre": pre,
+        "post": post,
+        "business": business,
+        "cleanup_armed": True,
+    }
 
 
 def _validate_scale_database_url(database_url: str) -> dict[str, Any]:
@@ -1043,13 +1252,401 @@ def _fixture_counts(conn, prefix: str) -> dict[str, int]:
     return counts
 
 
-def _collect_resume_snapshot(
+def _integrity_plan_evidence(document: dict[str, Any]) -> dict[str, list[str]]:
+    nodes = tuple(_walk_plan(document["Plan"]))
+    return {
+        "plan_relations": sorted(
+            {
+                str(node["Relation Name"])
+                for node in nodes
+                if node.get("Relation Name")
+            }
+        ),
+        "plan_indexes": sorted(
+            {
+                str(node["Index Name"])
+                for node in nodes
+                if node.get("Index Name")
+            }
+        ),
+    }
+
+
+def _execute_integrity_statement(
+    conn,
+    *,
+    name: str,
+    sql: str,
+    params: tuple[Any, ...],
+    result_fields: tuple[str, ...],
+) -> tuple[dict[str, int], dict[str, Any]]:
+    conn.execute(
+        "SELECT set_config('statement_timeout',%s,true)",
+        (str(FORMAL_INTEGRITY_STATEMENT_TIMEOUT_MS),),
+    )
+    explained = conn.execute(
+        "EXPLAIN (FORMAT JSON) " + sql, params
+    ).fetchone()[0][0]
+    plan_evidence = _integrity_plan_evidence(explained)
+    started = time.perf_counter()
+    try:
+        row = conn.execute(sql, params).fetchone()
+    except BaseException as exc:
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+        raise RuntimeError(
+            f"resume integrity query failed: name={name}, "
+            f"elapsed_ms={elapsed_ms}, "
+            "statement_timeout_ms="
+            f"{FORMAL_INTEGRITY_STATEMENT_TIMEOUT_MS}, "
+            f"plan_relations={plan_evidence['plan_relations']}, "
+            f"plan_indexes={plan_evidence['plan_indexes']}, "
+            f"cause={type(exc).__name__}: {exc}"
+        ) from exc
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+    result = {
+        field: int(value)
+        for field, value in zip(result_fields, row, strict=True)
+    }
+    mismatch_fields = (
+        ("mismatched_rows",)
+        if "mismatched_rows" in result
+        else ("missing_rows", "extra_rows")
+    )
+    evidence = {
+        "passed": all(result[field] == 0 for field in mismatch_fields),
+        "statement_timeout_ms": FORMAL_INTEGRITY_STATEMENT_TIMEOUT_MS,
+        "elapsed_ms": elapsed_ms,
+        **plan_evidence,
+    }
+    if not evidence["plan_relations"]:
+        raise RuntimeError(f"resume integrity query has no relation plan: {name}")
+    return result, evidence
+
+
+def _source_turn_integrity_sql() -> str:
+    compared = (
+        "user_id,lane,provider,model,prompt_tokens,completion_tokens,latency_ms,"
+        "model_calls,retries,failed,status,cache_read_tokens,cache_write_tokens,"
+        "cache_miss_tokens,usage_reported_calls,cache_reported_calls,created_at"
+    ).split(",")
+    expected_values = ",".join(f"e.{column}" for column in compared)
+    actual_values = ",".join(f"a.{column}" for column in compared)
+    return (
+        "WITH expected AS MATERIALIZED (SELECT g AS job_id,"
+        "%s||lpad(((g-1)%% %s)::text,6,'0') AS user_id,"
+        "CASE WHEN g%%100<62 THEN 'chat' WHEN g%%100<77 THEN 'heartbeat' "
+        "WHEN g%%100<88 THEN 'manual_wake' WHEN g%%100<95 THEN 'maintenance' "
+        "ELSE 'scheduled' END AS lane,"
+        "CASE WHEN g%%100<68 THEN 'openrouter' WHEN g%%100<88 THEN 'anthropic' "
+        "ELSE 'google' END AS provider,"
+        "CASE WHEN g%%100<68 THEN 'openai/gpt-4o-mini' "
+        "WHEN g%%100<88 THEN 'claude-3-5-haiku' ELSE 'gemini-2.5-flash' END AS model,"
+        "CASE WHEN g%%20=0 THEN NULL ELSE 400+(g%%1600) END AS prompt_tokens,"
+        "CASE WHEN g%%20=0 THEN NULL ELSE 40+(g%%360) END AS completion_tokens,"
+        "100+(g%%15000) AS latency_ms,1+(g%%2) AS model_calls,"
+        "CASE WHEN g%%20=0 THEN 1 ELSE 0 END AS retries,(g%%97=0) AS failed,"
+        "'scale-ok' AS status,"
+        "CASE WHEN g%%4=0 THEN 100+(g%%900) ELSE 0 END AS cache_read_tokens,"
+        "CASE WHEN g%%10=0 THEN 20+(g%%80) ELSE 0 END AS cache_write_tokens,"
+        "CASE WHEN g%%4=0 THEN 50+(g%%450) ELSE 0 END AS cache_miss_tokens,"
+        "CASE WHEN g%%20=0 THEN 0 ELSE 1+(g%%2) END AS usage_reported_calls,"
+        "CASE WHEN g%%4=0 THEN 1+(g%%2) ELSE 0 END AS cache_reported_calls,"
+        "%s::timestamptz-make_interval(secs=>"
+        "((g::bigint*104729)%% %s)::double precision) AS created_at "
+        "FROM generate_series(1,%s::bigint) AS g),"
+        "actual AS MATERIALIZED (SELECT job_id,"
+        + ",".join(compared)
+        + " FROM v2_turn_metrics WHERE left(user_id,length(%s))=%s) "
+        "SELECT count(e.job_id),count(a.job_id),count(*) FILTER (WHERE "
+        "e.job_id IS NULL OR a.job_id IS NULL OR ROW("
+        + expected_values
+        + ") IS DISTINCT FROM ROW("
+        + actual_values
+        + ")) FROM expected e FULL JOIN actual a USING(job_id)"
+    )
+
+
+def _source_attempt_integrity_sql() -> str:
+    compared = (
+        "attempt_id,user_id,lane,call_id,outer_attempt_ordinal,"
+        "inner_attempt_ordinal,retry_kind,requested_provider,resolved_provider,"
+        "requested_model,resolved_model,transport,started_at,finished_at,state,"
+        "outcome,error_class,input_tokens,output_tokens,reasoning_tokens,"
+        "cache_read_tokens,cache_write_tokens,cache_miss_tokens,usage_known,"
+        "possibly_billed,source,completeness,revision,cost,currency,ttft_ms"
+    ).split(",")
+    expected_values = ",".join(f"e.{column}" for column in compared)
+    actual_values = ",".join(f"a.{column}" for column in compared)
+    return (
+        "WITH shaped AS MATERIALIZED (SELECT g,"
+        "%s||lpad(((g-1)%% %s)::text,6,'0') AS user_id,md5(%s||g::text) AS digest,"
+        "%s::timestamptz-make_interval(secs=>"
+        "((g::bigint*104729)%% %s)::double precision) AS started_at "
+        "FROM generate_series(1,%s::bigint) AS g),expected AS MATERIALIZED ("
+        "SELECT g AS job_id,substr(digest,1,8)||'-'||substr(digest,9,4)||'-'||"
+        "substr(digest,13,4)||'-'||substr(digest,17,4)||'-'||substr(digest,21,12) "
+        "AS attempt_id,user_id,CASE WHEN g%%100<62 THEN 'chat' WHEN g%%100<77 "
+        "THEN 'heartbeat' WHEN g%%100<88 THEN 'manual_wake' WHEN g%%100<95 "
+        "THEN 'maintenance' ELSE 'scheduled' END AS lane,%s||'call-'||g AS call_id,"
+        "1 AS outer_attempt_ordinal,1 AS inner_attempt_ordinal,'initial' AS retry_kind,"
+        "CASE WHEN g%%100<68 THEN 'openrouter' WHEN g%%100<88 THEN 'anthropic' "
+        "ELSE 'google' END AS requested_provider,CASE WHEN g%%100<68 THEN "
+        "'openrouter' WHEN g%%100<88 THEN 'anthropic' ELSE 'google' END "
+        "AS resolved_provider,CASE WHEN g%%100<68 THEN 'openai/gpt-4o-mini' "
+        "WHEN g%%100<88 THEN 'claude-3-5-haiku' ELSE 'gemini-2.5-flash' END "
+        "AS requested_model,CASE WHEN g%%100<68 THEN 'openai/gpt-4o-mini' "
+        "WHEN g%%100<88 THEN 'claude-3-5-haiku' ELSE 'gemini-2.5-flash' END "
+        "AS resolved_model,'openai_responses' AS transport,started_at,"
+        "started_at+interval '100 milliseconds' AS finished_at,'completed' AS state,"
+        "'succeeded' AS outcome,'none' AS error_class,400+(g%%1600) AS input_tokens,"
+        "40+(g%%360) AS output_tokens,NULL::bigint AS reasoning_tokens,"
+        "CASE WHEN g%%4=0 THEN 100+(g%%900) ELSE 0 END AS cache_read_tokens,"
+        "CASE WHEN g%%10=0 THEN 20+(g%%80) ELSE 0 END AS cache_write_tokens,"
+        "CASE WHEN g%%4=0 THEN 50+(g%%450) ELSE 0 END AS cache_miss_tokens,"
+        "true AS usage_known,false AS possibly_billed,'runtime_recorder' AS source,"
+        "'complete' AS completeness,2 AS revision,NULL::numeric AS cost,"
+        "NULL::text AS currency,NULL::double precision AS ttft_ms FROM shaped),"
+        "actual AS MATERIALIZED (SELECT job_id,attempt_id::text AS attempt_id,"
+        + ",".join(column for column in compared if column != "attempt_id")
+        + " FROM llm_provider_attempts WHERE left(user_id,length(%s))=%s) "
+        "SELECT count(e.job_id),count(a.job_id),count(*) FILTER (WHERE "
+        "e.job_id IS NULL OR a.job_id IS NULL OR ROW("
+        + expected_values
+        + ") IS DISTINCT FROM ROW("
+        + actual_values
+        + ")) FROM expected e FULL JOIN actual a USING(job_id)"
+    )
+
+
+def _daily_integrity_sql(usage_rollup, *, dimensions: bool) -> str:
+    common = tuple(usage_rollup._COMMON_FACT_COLUMNS)
+    latency = tuple(usage_rollup._LATENCY_COLUMNS) if dimensions else ()
+    facts = common + latency + (
+        "first_metric_at",
+        "last_metric_at",
+        "last_model_call_at",
+    )
+    if dimensions:
+        keys = ("local_day", "user_id", "lane", "provider", "model")
+        identities = (
+            "coalesce(nullif(m.lane,''),'unknown') AS lane,"
+            "coalesce(nullif(m.provider,''),'unknown') AS provider,"
+            "coalesce(nullif(m.model,''),'unknown') AS model,"
+        )
+        group = " GROUP BY 1,2,3,4,5"
+        table = "v2_usage_daily_dimensions"
+    else:
+        keys = ("local_day", "user_id")
+        identities = ()
+        group = " GROUP BY 1,2"
+        table = "v2_usage_daily_users"
+    expected_facts = ",".join(f"e.{column}" for column in facts)
+    actual_facts = ",".join(f"a.{column}" for column in facts)
+    join = " AND ".join(f"a.{column}=e.{column}" for column in keys)
+    aggregate = usage_rollup._aggregate_selects(include_latency=dimensions)
+    return (
+        "WITH expected AS MATERIALIZED (SELECT "
+        "timezone('Asia/Shanghai',m.created_at)::date AS local_day,m.user_id,"
+        + "".join(identities)
+        + aggregate
+        + ",min(m.created_at) AS first_metric_at,max(m.created_at) AS last_metric_at,"
+        "max(m.created_at) FILTER (WHERE m.model_calls>0) AS last_model_call_at "
+        "FROM v2_turn_metrics m WHERE left(m.user_id,length(%s))=%s"
+        + group
+        + "),actual AS MATERIALIZED (SELECT "
+        + ",".join(keys + facts)
+        + f" FROM {table} WHERE left(user_id,length(%s))=%s) "
+        "SELECT count(e.local_day),count(a.local_day),count(*) FILTER (WHERE "
+        "e.local_day IS NULL OR a.local_day IS NULL OR ROW("
+        + expected_facts
+        + ") IS DISTINCT FROM ROW("
+        + actual_facts
+        + ")) FROM expected e FULL JOIN actual a ON "
+        + join
+    )
+
+
+_ATTEMPT_TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "cache_miss_tokens",
+)
+
+
+def _attempt_dimension_integrity_sql() -> str:
+    keys = (
+        "local_day",
+        "user_id",
+        "cohort_lane",
+        "requested_provider",
+        "requested_model",
+        "resolved_provider",
+        "resolved_model",
+        "effective_usage_known",
+        "cost_kind",
+        "currency",
+    )
+    facts = (
+        "attempts",
+        "retry_attempts",
+        "failover_attempts",
+        "failed_attempts",
+        "possibly_billed_attempts",
+        *(item for field in _ATTEMPT_TOKEN_FIELDS for item in (f"{field}_sum", f"{field}_known_count")),
+        "authoritative_cost_attempts",
+        "estimated_cost_attempts",
+        "unknown_cost_attempts",
+        "cost_amount",
+        "ttft_samples",
+    )
+    token_selects = ",".join(
+        item
+        for field in _ATTEMPT_TOKEN_FIELDS
+        for item in (
+            f"coalesce(sum(a.{field}) FILTER (WHERE a.{field} IS NOT NULL),0)::bigint AS {field}_sum",
+            f"count(a.{field})::bigint AS {field}_known_count",
+        )
+    )
+    join = " AND ".join(
+        (
+            "coalesce(a.currency,'')=coalesce(e.currency,'')"
+            if key == "currency"
+            else f"a.{key}=e.{key}"
+        )
+        for key in keys
+    )
+    return (
+        "WITH expected AS (SELECT timezone('Asia/Shanghai',"
+        "m.created_at)::date AS local_day,m.user_id,coalesce(nullif(m.lane,''),"
+        "'unknown') AS cohort_lane,a.requested_provider,a.requested_model,"
+        "a.resolved_provider,a.resolved_model,true AS effective_usage_known,"
+        "'unknown' AS cost_kind,NULL::text AS currency,count(*)::bigint AS attempts,"
+        "count(*) FILTER (WHERE a.retry_kind<>'initial')::bigint AS retry_attempts,"
+        "count(*) FILTER (WHERE a.retry_kind='failover')::bigint AS failover_attempts,"
+        "count(*) FILTER (WHERE a.outcome IN ('failed','timed_out','cancelled'))::bigint "
+        "AS failed_attempts,count(*) FILTER (WHERE a.possibly_billed)::bigint "
+        "AS possibly_billed_attempts,"
+        + token_selects
+        + ",0::bigint AS authoritative_cost_attempts,0::bigint AS estimated_cost_attempts,"
+        "count(*)::bigint AS unknown_cost_attempts,0::numeric AS cost_amount,"
+        "coalesce(array_agg(a.ttft_ms ORDER BY a.ttft_ms,a.attempt_id) FILTER "
+        "(WHERE a.ttft_ms IS NOT NULL),'{}'::double precision[]) AS ttft_samples "
+        "FROM v2_turn_metrics m JOIN llm_provider_attempts a ON a.job_id=m.job_id "
+        "AND a.user_id=m.user_id WHERE left(m.user_id,length(%s))=%s "
+        "AND a.source='runtime_recorder' GROUP BY 1,2,3,4,5,6,7),"
+        "actual AS (SELECT "
+        + ",".join(keys + facts)
+        + " FROM llm_usage_daily_attempt_dimensions WHERE left(user_id,length(%s))=%s) "
+        "SELECT count(e.local_day),count(a.local_day),count(*) FILTER (WHERE "
+        "e.local_day IS NULL OR a.local_day IS NULL OR ROW("
+        + ",".join(f"e.{field}" for field in facts)
+        + ") IS DISTINCT FROM ROW("
+        + ",".join(f"a.{field}" for field in facts)
+        + ")) FROM expected e FULL JOIN actual a ON "
+        + join
+    )
+
+
+def _membership_integrity_sql() -> str:
+    return (
+        "SELECT (SELECT count(*) FROM llm_provider_attempts a0 WHERE "
+        "left(a0.user_id,length(%s))=%s AND a0.source='runtime_recorder'),"
+        "(SELECT count(*) FROM llm_usage_daily_call_memberships c0 WHERE "
+        "left(c0.user_id,length(%s))=%s),count(*) FILTER (WHERE ROW("
+        "c.local_day,c.user_id,c.cohort_lane,c.call_id,c.requested_provider,"
+        "c.requested_model,c.resolved_provider,c.resolved_model,"
+        "c.effective_usage_known,c.missing_outer_ordinals,c.missing_inner_ordinals"
+        ") IS DISTINCT FROM ROW(timezone('Asia/Shanghai',m.created_at)::date,"
+        "m.user_id,coalesce(nullif(m.lane,''),'unknown'),a.call_id,"
+        "a.requested_provider,a.requested_model,a.resolved_provider,"
+        "a.resolved_model,a.usage_known,0::bigint,0::bigint)) "
+        "FROM llm_usage_daily_call_memberships c "
+        "JOIN llm_provider_attempts a ON a.call_id=c.call_id "
+        "AND a.user_id=c.user_id AND a.source='runtime_recorder' "
+        "JOIN v2_turn_metrics m ON m.job_id=a.job_id AND m.user_id=a.user_id "
+        "WHERE left(c.user_id,length(%s))=%s"
+    )
+
+
+def _semantic_integrity_checks(*, prefix: str, usage_rollup):
+    return (
+        (
+            "source_turns",
+            _source_turn_integrity_sql(),
+            (prefix, FORMAL_USERS, SCALE_NOW_UTC, DEFAULT_HISTORY_DAYS * 86_400, FORMAL_ROWS, prefix, prefix),
+            ("expected_rows", "actual_rows", "mismatched_rows"),
+        ),
+        (
+            "source_attempts",
+            _source_attempt_integrity_sql(),
+            (
+                prefix,
+                FORMAL_USERS,
+                prefix,
+                SCALE_NOW_UTC,
+                DEFAULT_HISTORY_DAYS * 86_400,
+                FORMAL_ATTEMPT_ROWS,
+                prefix,
+                prefix,
+                prefix,
+            ),
+            ("expected_rows", "actual_rows", "mismatched_rows"),
+        ),
+        (
+            "daily_users",
+            _daily_integrity_sql(usage_rollup, dimensions=False),
+            (prefix, prefix, prefix, prefix),
+            ("expected_rows", "actual_rows", "mismatched_rows"),
+        ),
+        (
+            "daily_dimensions",
+            _daily_integrity_sql(usage_rollup, dimensions=True),
+            (prefix, prefix, prefix, prefix),
+            ("expected_rows", "actual_rows", "mismatched_rows"),
+        ),
+        (
+            "attempt_dimensions",
+            _attempt_dimension_integrity_sql(),
+            (prefix, prefix, prefix, prefix),
+            ("expected_rows", "actual_rows", "mismatched_rows"),
+        ),
+        (
+            "memberships",
+            _membership_integrity_sql(),
+            (prefix, prefix, prefix, prefix, prefix, prefix),
+            ("expected_rows", "actual_rows", "mismatched_rows"),
+        ),
+    )
+
+
+def _collect_semantic_integrity(conn, *, prefix: str, usage_rollup):
+    checks = _semantic_integrity_checks(
+        prefix=prefix, usage_rollup=usage_rollup
+    )
+    integrity = {}
+    evidence = {}
+    for name, sql, params, fields in checks:
+        integrity[name], evidence[name] = _execute_integrity_statement(
+            conn,
+            name=name,
+            sql=sql,
+            params=params,
+            result_fields=fields,
+        )
+    return integrity, evidence
+
+
+def _collect_resume_snapshot_in_transaction(
     conn,
     *,
     prefix: str,
     partition,
     start_at: datetime,
     end_at: datetime,
+    usage_rollup,
 ) -> dict[str, Any]:
     """Collect all read-only ownership and completeness evidence for resume."""
 
@@ -1161,6 +1758,14 @@ def _collect_resume_snapshot(
             (prefix, prefix, start_at, end_at),
         ).fetchone()[0]
     )
+    reference_counts = {
+        "llm_rate_cards": int(
+            conn.execute("SELECT count(*) FROM llm_rate_cards").fetchone()[0]
+        )
+    }
+    semantic_integrity, integrity_query_evidence = _collect_semantic_integrity(
+        conn, prefix=prefix, usage_rollup=usage_rollup
+    )
     return {
         "prefix": prefix,
         "global_counts": global_counts,
@@ -1198,6 +1803,9 @@ def _collect_resume_snapshot(
                 strict=True,
             )
         },
+        "reference_counts": reference_counts,
+        "semantic_integrity": semantic_integrity,
+        "integrity_query_evidence": integrity_query_evidence,
         "turn_watermark": {
             "bootstrap_complete": bool(turn_watermark_row[0]),
             "dirty_from_day": turn_watermark_row[1],
@@ -1230,6 +1838,29 @@ def _collect_resume_snapshot(
     }
 
 
+def _collect_resume_snapshot(
+    conn,
+    *,
+    prefix: str,
+    partition,
+    start_at: datetime,
+    end_at: datetime,
+    usage_rollup,
+) -> dict[str, Any]:
+    with conn.transaction():
+        conn.execute(
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+        )
+        return _collect_resume_snapshot_in_transaction(
+            conn,
+            prefix=prefix,
+            partition=partition,
+            start_at=start_at,
+            end_at=end_at,
+            usage_rollup=usage_rollup,
+        )
+
+
 def _assert_empty_dedicated_database(conn) -> None:
     occupied = {
         table: int(
@@ -1239,6 +1870,7 @@ def _assert_empty_dedicated_database(conn) -> None:
             "v2_turn_metrics",
             "llm_provider_attempts",
             "llm_provider_attempt_corrections",
+            "llm_rate_cards",
             "v2_usage_daily_users",
             "v2_usage_daily_dimensions",
             "v2_usage_rollup_watermarks",
@@ -1510,13 +2142,13 @@ def _run(args) -> int:
         prefix = _validate_resume_prefix(resume_value, formal=formal)
     else:
         prefix = f"scale_usage_{uuid4().hex[:10]}_"
-    if formal and (
-        args.rows != FORMAL_ROWS or attempt_rows != FORMAL_ATTEMPT_ROWS
-    ):
-        raise SystemExit(
-            "formal mode requires exactly --rows 3000000 --attempt-rows 3000000; "
-            "use --non-formal for a probe that can never pass"
-        )
+    _validate_run_configuration(
+        formal=formal,
+        rows=args.rows,
+        attempt_rows=attempt_rows,
+        users=args.users,
+        history_days=args.history_days,
+    )
     database_url = args.database_url.strip()
     if not database_url:
         raise SystemExit("pass an explicit --database-url for the dedicated scale DB")
@@ -1566,22 +2198,54 @@ def _run(args) -> int:
     partition = usage_reporting.rollup_partition(queries["unfiltered"])
     expected_partition = _validate_rolling_partition(partition)
     resume_snapshot = None
+    resume_post_snapshot = None
+    resume_postvalidated = {"value": False}
     with pool.connection() as conn:
         _validate_connected_scale_database(conn, database_identity)
         schema_evidence = _assert_schema(conn)
-        if resumed:
-            resume_snapshot = _validate_resume_snapshot(
-                _collect_resume_snapshot(
+        if not resumed:
+            _assert_empty_dedicated_database(conn)
+
+    def collect_resume_snapshot():
+        with pool.connection() as conn:
+            return _collect_resume_snapshot(
                     conn,
                     prefix=prefix,
                     partition=partition,
                     start_at=start_at,
                     end_at=end_at,
-                ),
-                prefix=prefix,
+                    usage_rollup=usage_rollup,
             )
-        else:
-            _assert_empty_dedicated_database(conn)
+
+    def produce_business_evidence():
+        measured_pool = measure_pool_contention_evidence(
+            real_pool=pool,
+            db_module=db,
+            jobs_store=jobs_store,
+            provider_attempt_rollup=provider_attempt_rollup,
+            usage_query=queries["unfiltered"],
+            preserve_existing_rollup_state=resumed,
+        )
+        return {
+            "pool": measured_pool,
+            "business": produce_business_path_evidence(
+                repo=repo, pool_evidence=measured_pool
+            ),
+        }
+
+    resume_gate = None
+    if resumed:
+        resume_gate = _run_resume_gate(
+            prefix=prefix,
+            validate_only=bool(args.validate_resume_only),
+            collect=collect_resume_snapshot,
+            validate=_validate_resume_snapshot,
+            producer=produce_business_evidence,
+            arm_cleanup=lambda: resume_postvalidated.__setitem__("value", True),
+            on_ready=lambda: None,
+        )
+        resume_snapshot = resume_gate["pre"]
+        resume_post_snapshot = resume_gate["post"]
     if args.validate_resume_only:
         validation_evidence = {
             "database": database_identity,
@@ -1595,7 +2259,11 @@ def _run(args) -> int:
                 },
             },
             "query": {"expected_partition": expected_partition},
-            "resume_validation": resume_snapshot,
+            "resume_validation": {
+                "pre": resume_snapshot,
+                "post": None,
+                "stable": None,
+            },
             "schema": schema_evidence,
             "validated": True,
         }
@@ -1606,17 +2274,10 @@ def _run(args) -> int:
             Path(args.output).write_text(rendered, encoding="utf-8")
         print(rendered, end="")
         return 0
-    pool_evidence = measure_pool_contention_evidence(
-        real_pool=pool,
-        db_module=db,
-        jobs_store=jobs_store,
-        provider_attempt_rollup=provider_attempt_rollup,
-        usage_query=queries["unfiltered"],
-        preserve_existing_rollup_state=resumed,
+    business_result = (
+        resume_gate["business"] if resumed else produce_business_evidence()
     )
-    business_path_evidence = produce_business_path_evidence(
-        repo=repo, pool_evidence=pool_evidence
-    )
+    business_path_evidence = business_result["business"]
     if args.business_path_output:
         Path(args.business_path_output).write_text(
             json.dumps(business_path_evidence, indent=2, sort_keys=True) + "\n",
@@ -1653,6 +2314,18 @@ def _run(args) -> int:
                     "global": resume_snapshot["global_counts"],
                 }
             ),
+            "resume_validation": (
+                None
+                if not resumed
+                else {
+                    "pre": resume_snapshot,
+                    "post": resume_post_snapshot,
+                    "stable": (
+                        _stable_resume_snapshot(resume_snapshot)
+                        == _stable_resume_snapshot(resume_post_snapshot)
+                    ),
+                }
+            ),
         },
         "schema": schema_evidence,
         "business_path": business_path_evidence,
@@ -1668,7 +2341,7 @@ def _run(args) -> int:
         },
         "cohorts": {},
     }
-    cleanup_armed = resumed
+    cleanup_armed = resumed and resume_postvalidated["value"]
     try:
         if resumed:
             evidence["source"] = dict(resume_snapshot["source"])

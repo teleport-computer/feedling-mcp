@@ -207,3 +207,36 @@ different database states.
 6. Run the real `--validate-resume-only` command, never formal resume; then run
    the complete focused suite, Ruff, compileall, harness self-test and
    diff-check before committing implementation.
+
+### Strengthened read-only validation result
+
+The strengthened 3M read-only validation passed with exit 0 and
+`validated=true`. It ran before, and therefore never entered, the business
+producer, timing, EXPLAIN-ANALYZE, or cleanup paths. The exact deterministic
+source derivation and database facts agreed at 739,736 fixed-window rows and
+8,208 rows for every raw-edge turn/attempt/logical-call counter.
+
+All set-based semantic checks passed inside one read-only repeatable-read
+snapshot with a 180,000ms per-statement hard limit:
+
+- source turns: 8,159.331ms, 3,000,000 expected/actual, zero mismatches;
+- source attempts: 22,739.376ms, 3,000,000 expected/actual, zero mismatches;
+- daily users: 17,690.893ms, 731,199 expected/actual, zero mismatches;
+- daily dimensions: 23,414.494ms, 731,199 expected/actual, zero mismatches;
+- attempt dimensions: 21,877.056ms, 731,199 expected/actual, zero mismatches;
+- memberships: 29,815.493ms, 3,000,000 expected/actual, zero mismatches.
+
+Membership integrity is one fail-closed gate composed of the pre-existing
+bidirectional key proof and the strengthened per-key facts proof. The key
+proof found 3,000,000 distinct calls, zero membership orphans, and zero
+attempts without membership; source identity separately proved 3,000,000
+distinct attempt IDs and calls. The facts proof then checked every matched row's
+Shanghai local day, user, cohort lane, call, requested/resolved provider and
+model, effective-usage flag, and both ordinal-gap fields with zero mismatches.
+
+Two earlier dry attempts correctly failed closed at the membership statement's
+180-second timeout and did not clean the fixture. The final exact decomposition
+removed redundant wide CTE materialization and repeated full-field anti-joins;
+it preserved bidirectional key equality plus per-row fact equality and reduced
+the membership check to 29.815 seconds. No formal resume was run, and the
+dedicated fixture remains intact.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from decimal import Decimal
 from html import unescape
@@ -95,6 +96,265 @@ def test_admin_usage_scale_attempt_fixture_is_explicit_and_bounded():
             harness._resolve_attempt_rows(3_000_000, invalid)
 
 
+@pytest.mark.parametrize(
+    ("formal", "users", "history_days", "fails"),
+    [
+        (True, 1_999, 365, True),
+        (True, 2_001, 365, True),
+        (True, 2_000, 364, True),
+        (True, 2_000, 366, True),
+        (True, 2_000, 365, False),
+        (False, 7, 90, False),
+    ],
+)
+def test_formal_configuration_locks_users_and_history_days(
+    formal, users, history_days, fails
+):
+    harness = _load_usage_scale_harness()
+
+    def call():
+        harness._validate_run_configuration(
+            formal=formal,
+            rows=3_000_000 if formal else 100,
+            attempt_rows=3_000_000 if formal else 100,
+            users=users,
+            history_days=history_days,
+        )
+
+    if fails:
+        with pytest.raises(SystemExit, match="formal mode requires exactly"):
+            call()
+    else:
+        call()
+
+
+def test_formal_source_expectation_is_derived_from_seed_formula_and_fixed_window():
+    harness = _load_usage_scale_harness()
+    start_at, end_at = harness._production_window()
+    partition = SimpleNamespace(
+        raw_days=(
+            datetime(2026, 5, 4, tzinfo=timezone.utc).date(),
+            datetime(2026, 8, 2, tzinfo=timezone.utc).date(),
+        )
+    )
+
+    expected = harness._derive_expected_source_counts(
+        rows=3_000_000,
+        attempt_rows=3_000_000,
+        history_days=365,
+        start_at=start_at,
+        end_at=end_at,
+        raw_bounds=harness._raw_edge_bounds(
+            partition, start_at=start_at, end_at=end_at
+        ),
+    )
+
+    assert expected == {
+        "total_rows": 3_000_000,
+        "attempt_rows": 3_000_000,
+        "rows_in_90d": 739_736,
+        "attempt_rows_in_90d_job_cohort": 739_736,
+        "expected_raw_edge_turn_rows": 8_208,
+        "expected_raw_edge_attempt_rows": 8_208,
+        "expected_raw_edge_logical_calls": 8_208,
+    }
+
+
+def test_formal_resume_integrity_statements_parse_on_postgresql():
+    harness = _load_usage_scale_harness()
+    checks = harness._semantic_integrity_checks(
+        prefix="scale_usage_42e02f444a_", usage_rollup=usage_rollup
+    )
+
+    with db.get_pool().connection() as conn:
+        for name, sql, params, fields in checks:
+            row = conn.execute("EXPLAIN (FORMAT JSON) " + sql, params).fetchone()
+            assert row[0][0]["Plan"]
+            assert name
+            assert fields
+
+
+def test_formal_resume_integrity_statements_execute_bounded_on_empty_postgresql():
+    harness = _load_usage_scale_harness()
+    checks = harness._semantic_integrity_checks(
+        prefix="scale_usage_42e02f444a_", usage_rollup=usage_rollup
+    )
+
+    with db.get_pool().connection() as conn, conn.transaction():
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        for name, sql, original_params, fields in checks:
+            params = list(original_params)
+            if name == "source_turns":
+                params[4] = 10
+            elif name == "source_attempts":
+                params[5] = 10
+            result, evidence = harness._execute_integrity_statement(
+                conn,
+                name=name,
+                sql=sql,
+                params=tuple(params),
+                result_fields=fields,
+            )
+            assert tuple(result) == fields
+            assert evidence["statement_timeout_ms"] == 180_000
+            assert evidence["elapsed_ms"] >= 0
+            assert evidence["plan_relations"]
+
+
+def test_integrity_timeout_error_includes_check_elapsed_timeout_and_plan():
+    harness = _load_usage_scale_harness()
+
+    class Cursor:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class Connection:
+        calls = 0
+
+        def execute(self, sql, params=()):
+            self.calls += 1
+            if self.calls == 1:
+                return Cursor((None,))
+            if self.calls == 2:
+                return Cursor(
+                    ([{"Plan": {"Node Type": "Seq Scan", "Relation Name": "facts"}}],)
+                )
+            raise RuntimeError("canceling statement due to statement timeout")
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "attempt_dimensions.*elapsed_ms=.*statement_timeout_ms=180000"
+            ".*plan_relations=.*facts"
+        ),
+    ):
+        harness._execute_integrity_statement(
+            Connection(),
+            name="attempt_dimensions",
+            sql="SELECT 1 FROM facts",
+            params=(),
+            result_fields=("expected_rows",),
+        )
+
+
+def test_attempt_dimension_exact_check_does_not_force_wide_cte_materialization():
+    harness = _load_usage_scale_harness()
+    sql = harness._attempt_dimension_integrity_sql()
+
+    assert "expected AS MATERIALIZED" not in sql
+    assert "actual AS MATERIALIZED" not in sql
+    assert "FULL JOIN" in sql
+    assert "IS DISTINCT FROM" in sql
+
+
+def test_membership_exact_anti_join_keeps_actual_relation_indexable():
+    harness = _load_usage_scale_harness()
+    sql = harness._membership_integrity_sql()
+
+    assert "MATERIALIZED" not in sql
+    assert "NOT EXISTS" not in sql
+    assert "JOIN llm_provider_attempts" in sql
+    assert "JOIN v2_turn_metrics" in sql
+    assert "IS DISTINCT FROM" in sql
+    assert "missing_outer_ordinals" in sql
+    assert "missing_inner_ordinals" in sql
+
+
+@pytest.mark.parametrize("validate_only", [True, False])
+def test_resume_gate_invalid_or_validate_only_never_reaches_producer_or_ready(
+    validate_only
+):
+    harness = _load_usage_scale_harness()
+    events = []
+
+    def collect():
+        events.append("collect")
+        return _healthy_formal_resume_snapshot()
+
+    def validate(snapshot, *, prefix):
+        events.append("validate")
+        if not validate_only:
+            raise RuntimeError("invalid preflight")
+        return snapshot
+
+    with pytest.raises(RuntimeError, match="invalid preflight") if not validate_only else nullcontext():
+        result = harness._run_resume_gate(
+            prefix="scale_usage_42e02f444a_",
+            validate_only=validate_only,
+            collect=collect,
+            validate=validate,
+            producer=lambda: events.append("producer"),
+            arm_cleanup=lambda: events.append("arm"),
+            on_ready=lambda: events.append("timing"),
+        )
+
+    assert events == ["collect", "validate"]
+    if validate_only:
+        assert result["cleanup_armed"] is False
+
+
+def test_resume_gate_postvalidation_precedes_timing_and_cleanup_arming():
+    harness = _load_usage_scale_harness()
+    events = []
+    snapshots = iter(
+        [_healthy_formal_resume_snapshot(), _healthy_formal_resume_snapshot()]
+    )
+
+    result = harness._run_resume_gate(
+        prefix="scale_usage_42e02f444a_",
+        validate_only=False,
+        collect=lambda: (events.append("collect"), next(snapshots))[1],
+        validate=lambda snapshot, *, prefix: (
+            events.append("validate"),
+            snapshot,
+        )[1],
+        producer=lambda: (events.append("producer"), {"passed": True})[1],
+        arm_cleanup=lambda: events.append("arm"),
+        on_ready=lambda: events.append("timing"),
+    )
+
+    assert events == [
+        "collect",
+        "validate",
+        "producer",
+        "collect",
+        "validate",
+        "arm",
+        "timing",
+    ]
+    assert result["cleanup_armed"] is True
+    assert result["pre"] == result["post"]
+
+
+def test_resume_gate_postvalidation_failure_never_reaches_timing_or_arms_cleanup():
+    harness = _load_usage_scale_harness()
+    events = []
+    post = _healthy_formal_resume_snapshot()
+    post["semantic_integrity"]["daily_users"]["mismatched_rows"] = 1
+    snapshots = iter([_healthy_formal_resume_snapshot(), post])
+
+    with pytest.raises(RuntimeError, match="postvalidation failed"):
+        harness._run_resume_gate(
+            prefix="scale_usage_42e02f444a_",
+            validate_only=False,
+            collect=lambda: (events.append("collect"), next(snapshots))[1],
+            validate=lambda snapshot, *, prefix: (
+                events.append("validate"),
+                (_ for _ in ()).throw(RuntimeError("postvalidation failed"))
+                if snapshot is post
+                else snapshot,
+            )[1],
+            producer=lambda: events.append("producer"),
+            arm_cleanup=lambda: events.append("arm"),
+            on_ready=lambda: events.append("timing"),
+        )
+
+    assert events == ["collect", "validate", "producer", "collect", "validate"]
+
+
 def _healthy_formal_resume_snapshot():
     counts = {
         "users": 2_000,
@@ -132,6 +392,55 @@ def _healthy_formal_resume_snapshot():
             "membership_orphans": 0,
             "attempts_without_membership": 0,
         },
+        "reference_counts": {"llm_rate_cards": 0},
+        "semantic_integrity": {
+            "source_turns": {
+                "expected_rows": 3_000_000,
+                "actual_rows": 3_000_000,
+                "mismatched_rows": 0,
+            },
+            "source_attempts": {
+                "expected_rows": 3_000_000,
+                "actual_rows": 3_000_000,
+                "mismatched_rows": 0,
+            },
+            "daily_users": {
+                "expected_rows": 731_199,
+                "actual_rows": 731_199,
+                "mismatched_rows": 0,
+            },
+            "daily_dimensions": {
+                "expected_rows": 731_199,
+                "actual_rows": 731_199,
+                "mismatched_rows": 0,
+            },
+            "attempt_dimensions": {
+                "expected_rows": 731_199,
+                "actual_rows": 731_199,
+                "mismatched_rows": 0,
+            },
+            "memberships": {
+                "expected_rows": 3_000_000,
+                "actual_rows": 3_000_000,
+                "mismatched_rows": 0,
+            },
+        },
+        "integrity_query_evidence": {
+            name: {
+                "passed": True,
+                "statement_timeout_ms": 180_000,
+                "elapsed_ms": 1.0,
+                "plan_relations": ["v2_turn_metrics"],
+            }
+            for name in (
+                "source_turns",
+                "source_attempts",
+                "daily_users",
+                "daily_dimensions",
+                "attempt_dimensions",
+                "memberships",
+            )
+        },
         "turn_watermark": {
             "bootstrap_complete": True,
             "dirty_from_day": None,
@@ -147,11 +456,11 @@ def _healthy_formal_resume_snapshot():
         "source": {
             "total_rows": 3_000_000,
             "attempt_rows": 3_000_000,
-            "rows_in_90d": 739_726,
-            "attempt_rows_in_90d_job_cohort": 739_726,
-            "expected_raw_edge_turn_rows": 16_438,
-            "expected_raw_edge_attempt_rows": 16_438,
-            "expected_raw_edge_logical_calls": 16_438,
+            "rows_in_90d": 739_736,
+            "attempt_rows_in_90d_job_cohort": 739_736,
+            "expected_raw_edge_turn_rows": 8_208,
+            "expected_raw_edge_attempt_rows": 8_208,
+            "expected_raw_edge_logical_calls": 8_208,
         },
     }
 
@@ -226,6 +535,47 @@ def test_formal_resume_mode_options_fail_closed(
             "reuse mismatch",
         ),
         (
+            lambda item: item["reference_counts"].update(llm_rate_cards=1),
+            "foreign pricing reference",
+        ),
+        (
+            lambda item: item["source"].update(
+                rows_in_90d=739_735,
+                attempt_rows_in_90d_job_cohort=739_735,
+            ),
+            "deterministic source mismatch",
+        ),
+        (
+            lambda item: item["semantic_integrity"]["source_turns"].update(
+                mismatched_rows=1
+            ),
+            "semantic integrity mismatch",
+        ),
+        (
+            lambda item: item["semantic_integrity"]["daily_users"].update(
+                mismatched_rows=1
+            ),
+            "semantic integrity mismatch",
+        ),
+        (
+            lambda item: item["semantic_integrity"]["attempt_dimensions"].update(
+                mismatched_rows=1
+            ),
+            "semantic integrity mismatch",
+        ),
+        (
+            lambda item: item["semantic_integrity"]["memberships"].update(
+                mismatched_rows=1,
+            ),
+            "semantic integrity mismatch",
+        ),
+        (
+            lambda item: item["integrity_query_evidence"]["memberships"].update(
+                passed=False
+            ),
+            "integrity query evidence",
+        ),
+        (
             lambda item: item["attempt_watermark"].update(
                 completed_through_day="2026-07-31"
             ),
@@ -262,6 +612,24 @@ def test_formal_resume_snapshot_accepts_exact_complete_fixture():
         )
         is snapshot
     )
+
+
+def test_fresh_formal_empty_database_gate_rejects_rate_card_reference_state():
+    harness = _load_usage_scale_harness()
+
+    class Cursor:
+        def __init__(self, value):
+            self._value = value
+
+        def fetchone(self):
+            return (self._value,)
+
+    class Connection:
+        def execute(self, sql):
+            return Cursor(1 if "FROM llm_rate_cards" in sql else 0)
+
+    with pytest.raises(RuntimeError, match="llm_rate_cards.*1"):
+        harness._assert_empty_dedicated_database(Connection())
 
 
 def test_admin_usage_scale_raw_edge_bounds_are_exact_half_open_query_edges():
@@ -309,7 +677,13 @@ def test_admin_usage_scale_formal_gate_requires_attempt_index_for_both_cohorts()
         "residual_counts": {"users": 0, "watermark": 0, "dirty_days": 0},
     }
     source = {"total_rows": 3_000_000, "attempt_rows": 3_000_000}
-    fixture = {"rows": 3_000_000, "attempt_rows": 3_000_000}
+    fixture = {
+        "rows": 3_000_000,
+        "attempt_rows": 3_000_000,
+        "users": 2_000,
+        "history_days": 365,
+        "resumed": False,
+    }
     def gate():
         return harness._formal_gate_passed(
             cohorts, cleanup, source=source, fixture=fixture, formal=True
@@ -356,9 +730,69 @@ def test_admin_usage_scale_formal_gate_rejects_small_or_nonformal_fixture_even_i
         cohorts,
         cleanup,
         source={"total_rows": 3_000_000, "attempt_rows": 3_000_000},
-        fixture={"rows": 3_000_000, "attempt_rows": 3_000_000},
+        fixture={
+            "rows": 3_000_000,
+            "attempt_rows": 3_000_000,
+            "users": 2_000,
+            "history_days": 365,
+            "resumed": False,
+        },
         formal=False,
     )
+
+
+def test_formal_gate_requires_exact_config_and_stable_resume_integrity():
+    harness = _load_usage_scale_harness()
+    cohorts = {
+        name: {
+            "timing": {"p95_ms": 1.0},
+            "attempt_ledger_statement_count": 1,
+            "attempt_runtime_job_index_used": True,
+            "attempt_rollup_relations_used": True,
+            "attempt_full_history_scan_absent": True,
+            "attempt_rate_card_probe_loops_absent": True,
+            "attempt_full_window_call_probe_loops_absent": True,
+        }
+        for name in ("unfiltered", "provider_model_filtered")
+    }
+    cleanup = {
+        "foreign_key_cascade_verified": True,
+        "watermark_removed": True,
+        "residual_counts": {"all": 0},
+    }
+    pre = _healthy_formal_resume_snapshot()
+    post = _healthy_formal_resume_snapshot()
+    fixture = {
+        "rows": 3_000_000,
+        "attempt_rows": 3_000_000,
+        "users": 2_000,
+        "history_days": 365,
+        "resumed": True,
+        "prefix": "scale_usage_42e02f444a_",
+        "resume_validation": {"pre": pre, "post": post, "stable": True},
+    }
+
+    def gate():
+        return harness._formal_gate_passed(
+            cohorts,
+            cleanup,
+            source={"total_rows": 3_000_000, "attempt_rows": 3_000_000},
+            fixture=fixture,
+            formal=True,
+        )
+
+    assert gate() is True
+    fixture["users"] = 1_999
+    assert gate() is False
+    fixture["users"] = 2_000
+    fixture["history_days"] = 364
+    assert gate() is False
+    fixture["history_days"] = 365
+    fixture["resume_validation"]["stable"] = False
+    assert gate() is False
+    fixture["resume_validation"]["stable"] = True
+    post["semantic_integrity"]["daily_dimensions"]["mismatched_rows"] = 1
+    assert gate() is False
 
 
 def _synthetic_attempt_plan(*nodes):
@@ -407,7 +841,13 @@ def _synthetic_formal_gate(harness, guards):
         cohorts,
         cleanup,
         source={"total_rows": 3_000_000, "attempt_rows": 3_000_000},
-        fixture={"rows": 3_000_000, "attempt_rows": 3_000_000},
+        fixture={
+            "rows": 3_000_000,
+            "attempt_rows": 3_000_000,
+            "users": 2_000,
+            "history_days": 365,
+            "resumed": False,
+        },
         formal=True,
     )
 
