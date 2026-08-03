@@ -606,11 +606,13 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
         seen["messages"] = messages
         return _text_round("")
 
-    async def _empty_grounding(*_args, **_kwargs):
-        return {}
+    async def _empty_glance(*_args, **_kwargs):
+        return None, None
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
-    monkeypatch.setattr(worker, "_perception_grounding_results", _empty_grounding)
+    monkeypatch.setattr(
+        worker, "_perception_glance_grounding_results", _empty_glance
+    )
     deps = _wake_deps(tail=[])
     deps.read_perception_wake_context = lambda user_id, wake_job_id: [{
         "wake_id": "wake-1",
@@ -651,8 +653,9 @@ def test_run_perception_wake_injects_trigger_as_untrusted_runtime_data(monkeypat
     runtime_text = str(runtime_messages[0]["content"])
     assert '"perception_wake"' in runtime_text
     assert "arrived_at_anchor" in runtime_text
-    assert "arrived near home" in runtime_text
-    assert "location:home" in runtime_text
+    assert "anchor_changed" in runtime_text
+    assert "arrived near home" not in runtime_text
+    assert "location:home" not in runtime_text
     assert any(
         "A recent perception change may be worth responding to."
         in str(message.get("content") or "")
@@ -733,11 +736,13 @@ def test_run_perception_wake_hands_late_context_to_successor(monkeypatch):
         assert late_coalesced is True
         return _text_round("This reply is stale after the late event.")
 
-    async def _empty_grounding(*_args, **_kwargs):
-        return {}
+    async def _empty_glance(*_args, **_kwargs):
+        return None, None
 
     monkeypatch.setattr(provider_client, "chat_completion_async", _fake)
-    monkeypatch.setattr(worker, "_perception_grounding_results", _empty_grounding)
+    monkeypatch.setattr(
+        worker, "_perception_glance_grounding_results", _empty_glance
+    )
     deps = _wake_deps(tail=[])
     deps.read_messages_after_seq = lambda user_id, after_seq: []
     deps.read_perception_wake_context = (

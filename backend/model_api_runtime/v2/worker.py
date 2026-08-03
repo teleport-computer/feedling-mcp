@@ -12,7 +12,7 @@ this module so the worker never imports the hosted layer.
   resolve_provider(user_id) 在本回合只解密一次（single-flight 之外的每 job 一次），
   由 `_slot_loop` 在把 job 交给 `process_job` 之前调用、并把结果原样传入、整个回合复用。
 - api_key + runtime_token（enclave-auth）：只喂 executor 的 capability 调用 + 便宜预取
-  （memory_index/perception_snapshot）+ `TurnDeps.read_messages`（enclave 内解密取明文）。
+  （memory_index/perception_glance）+ `TurnDeps.read_messages`（enclave 内解密取明文）。
   runtime_token 由 `TurnDeps.mint_enclave_token` 铸造——这只是签一个短时效令牌（HMAC，不
   是解密），可以在回合内按需多铸，不违反「resolve_provider 只解密一次」的不变量（那条
   不变量特指 BYOK provider-key 的解密，不是 enclave-auth 令牌的签发次数）。
@@ -52,7 +52,6 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import db
 import provider_attempt_ledger
@@ -69,7 +68,10 @@ from core import provider_usage
 from core import store as core_store
 from core import wake_bus as core_wake_bus
 from core.downloadable_reply import sanitize_downloadable_reply
-from perception.agent_fields import AGENT_PERCEPTION_SIGNALS
+from perception.glance import (
+    perception_glance_fingerprint,
+    project_perception_wake_events,
+)
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
 from model_api_runtime.v2 import context
@@ -631,58 +633,6 @@ _PRIVATE_READ_TOOLS = frozenset(
         cap_tool_schema.PROVIDER_USAGE_TOOL,
     }
 )
-# The wake path's legacy static perception grounding is allowed to coexist with
-# first-round web/MCP/task access, so it must contain only values that cannot
-# carry natural-language instructions. Keep useful typed readings eager while
-# making every free-form label/title/description pull-only. The allowlist is
-# deliberately per field, not merely ``isinstance(value, scalar)``: strings are
-# scalars too, and are the exact prompt-injection carrier this boundary excludes.
-_EAGER_PERCEPTION_SCALAR_FIELDS = {
-    "now": frozenset({"battery_level", "charging", "broadcast_active"}),
-    "weather": frozenset(
-        {
-            "temperature",
-            "apparent_temperature",
-            "humidity",
-            "precipitation_chance",
-            "uv_index",
-            "is_daylight",
-        }
-    ),
-    "calendar": frozenset({"calendar_events_truncated"}),
-    "focus": frozenset({"in_focus"}),
-    "audio_route": frozenset({"is_bluetooth"}),
-    "steps": frozenset({"step_count"}),
-    "sleep": frozenset(
-        {"asleep_minutes", "core_minutes", "deep_minutes", "rem_minutes"}
-    ),
-    "workout": frozenset({"duration_min", "count_today"}),
-    "vitals": frozenset(
-        {
-            "resting_heart_rate",
-            "step_count",
-            "current_heart_rate",
-            "hrv_sdnn_ms",
-            "respiratory_rate",
-            "oxygen_saturation_pct",
-            "vo2_max",
-        }
-    ),
-    "activity": frozenset(
-        {"active_energy_kcal", "exercise_minutes", "stand_minutes", "mindful_minutes"}
-    ),
-    "body": frozenset({"weight_kg", "bmi", "body_fat_pct", "height_cm"}),
-    "metabolic": frozenset(
-        {"blood_glucose_mmol_l", "blood_pressure_systolic", "blood_pressure_diastolic"}
-    ),
-    "cycle": frozenset({"is_active_period"}),
-    "mood": frozenset({"valence", "label_count", "recorded_today"}),
-    "reminders": frozenset(
-        {"overdue_count", "due_today_count", "reminders_truncated"}
-    ),
-}
-_STABLE_DISABLED_REASONS = frozenset({"not_permitted", "switch_off"})
-
 # These snapshot signals are made entirely of numeric fields (apart from the
 # runtime-generated disabled marker).  An explicit read limited to this set can
 # safely leave later outbound tools available. Mixed/free-form signals fence the
@@ -694,135 +644,6 @@ _OUTBOUND_SAFE_PERCEPTION_SIGNALS = frozenset(
 _TEXT_BEARING_MEDIA_READ_TOOLS = frozenset(
     {"screen_recent", "screen_read", "photo_recent", "photo_read"}
 )
-
-
-def _finite_typed_scalar(value: object) -> bool:
-    if value is None or isinstance(value, bool) or isinstance(value, int):
-        return True
-    return isinstance(value, float) and math.isfinite(value)
-
-
-# A tiny, format-constrained set of TEXT perception fields that are safe to
-# ground eagerly even though they are strings. The eager block sits before the
-# first round of outbound web/MCP/task tools, so — exactly like the scalar
-# allowlist above — every value here must be incapable of carrying a
-# natural-language instruction. Each field has an explicit validator that
-# returns the value ONLY if the WHOLE value is provably benign, else None
-# (fail-closed, never partial-clean):
-#   - place/city names come from the OS reverse geocoder (a bounded,
-#     non-user-controllable vocabulary), so `locality`/`country` are gated by a
-#     conservative character allowlist + length cap;
-#   - `now.local_time`/`now.timezone` are gated by ISO-8601 / IANA parsing.
-# The genuinely user-nameable free text — `place_label` (user-labeled places)
-# and `wifi_label` (an SSID can literally be "ignore previous instructions") —
-# is deliberately NOT here and stays pull-only behind the outbound fence.
-_COARSE_PLACE_TEXT_RE = re.compile(r"[0-9A-Za-zÀ-￿ .,'\-]+")
-_COARSE_PLACE_MAX_LEN = 48
-
-
-def _safe_coarse_place_text(value: object) -> str | None:
-    """Reverse-geocoded locality/country: whole-value allowlist or drop."""
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not (1 <= len(text) <= _COARSE_PLACE_MAX_LEN):
-        return None
-    if _COARSE_PLACE_TEXT_RE.fullmatch(text) is None:
-        return None
-    return text
-
-
-def _safe_iso_local_time(value: object) -> str | None:
-    """Device-reported local wall clock: must parse as ISO-8601, else drop."""
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not (1 <= len(text) <= 40):
-        return None
-    try:
-        datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    return text
-
-
-def _safe_iana_timezone(value: object) -> str | None:
-    """Device-reported timezone: must be a loadable IANA identifier, else drop."""
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if not (1 <= len(text) <= 64):
-        return None
-    try:
-        ZoneInfo(text)
-    except (ZoneInfoNotFoundError, ValueError):
-        return None
-    return text
-
-
-# (signal, field) -> validator. Kept separate from the scalar allowlist so the
-# "scalars only, no strings" invariant of _EAGER_PERCEPTION_SCALAR_FIELDS stays
-# intact and each added string field is opted in with an explicit gate.
-_EAGER_PERCEPTION_TEXT_VALIDATORS: dict[tuple[str, str], Callable[[object], str | None]] = {
-    ("location", "locality"): _safe_coarse_place_text,
-    ("location", "country"): _safe_coarse_place_text,
-    ("now", "local_time"): _safe_iso_local_time,
-    ("now", "timezone"): _safe_iana_timezone,
-}
-# signal -> ordered text fields, derived from the validators above.
-_EAGER_PERCEPTION_TEXT_FIELDS: dict[str, tuple[str, ...]] = {}
-for _sig, _field in _EAGER_PERCEPTION_TEXT_VALIDATORS:
-    _EAGER_PERCEPTION_TEXT_FIELDS.setdefault(_sig, ())
-    _EAGER_PERCEPTION_TEXT_FIELDS[_sig] += (_field,)
-# Signals that contribute ONLY text fields (no scalar allowlist entry) — appended
-# after the scalar signals so projection order stays deterministic.
-_EAGER_PERCEPTION_TEXT_ONLY_SIGNALS = tuple(
-    signal
-    for signal in _EAGER_PERCEPTION_TEXT_FIELDS
-    if signal not in _EAGER_PERCEPTION_SCALAR_FIELDS
-)
-
-
-def _safe_eager_perception_snapshot(data: object) -> dict:
-    """Project a full snapshot to fixed numeric/bool/null fields plus a tiny set
-    of validated, format-constrained text fields.
-
-    Numeric/bool readings pass through the per-signal scalar allowlist. On top of
-    that, `location.locality`/`location.country` (reverse-geocoded, bounded
-    vocabulary) and `now.local_time`/`now.timezone` (ISO / IANA) pass through
-    per-field validators so the agent can answer "where am I / what day is it"
-    without guessing. Everything else free-form — calendar/reminder titles,
-    place/wifi/app/device labels, playback metadata, weather condition/alert
-    strings — is intentionally absent and remains available only through an
-    explicit tool read, which activates the outbound fence below.
-    """
-    if not isinstance(data, dict) or not isinstance(data.get("signals"), dict):
-        return {}
-    safe_signals: dict[str, dict] = {}
-    signal_order = list(_EAGER_PERCEPTION_SCALAR_FIELDS.keys())
-    signal_order.extend(_EAGER_PERCEPTION_TEXT_ONLY_SIGNALS)
-    for signal in signal_order:
-        raw_doc = data["signals"].get(signal)
-        if not isinstance(raw_doc, dict):
-            continue
-        safe_doc = {
-            field: raw_doc[field]
-            for field in _EAGER_PERCEPTION_SCALAR_FIELDS.get(signal, ())
-            if field in raw_doc and _finite_typed_scalar(raw_doc[field])
-        }
-        for field in _EAGER_PERCEPTION_TEXT_FIELDS.get(signal, ()):
-            validator = _EAGER_PERCEPTION_TEXT_VALIDATORS[(signal, field)]
-            cleaned = validator(raw_doc.get(field))
-            if cleaned is not None:
-                safe_doc[field] = cleaned
-        if raw_doc.get("disabled") is True:
-            safe_doc["disabled"] = True
-            reason = str(raw_doc.get("reason") or "").strip().lower()
-            if reason in _STABLE_DISABLED_REASONS:
-                safe_doc["reason"] = reason
-        if safe_doc:
-            safe_signals[signal] = safe_doc
-    return {"signals": safe_signals} if safe_signals else {}
 
 
 def _safe_eager_screen_metadata(data: object) -> dict:
@@ -889,20 +710,17 @@ _SUBAGENT_DISABLED_TOOLS = frozenset(
 # silently mishandled by this task's scope.
 _WAKE_LANES = frozenset({"heartbeat", "scheduled", "manual_wake", "screen_watch"})
 
-# The full agent-pullable catalog, taken from perception.agent_fields — the single
-# source of truth both the agent routes and this grounding read from ("Add a new
-# agent-pullable signal here ONCE and both paths pick it up"). Re-listing the names
-# here would silently drift the moment a signal is added.
-_PERCEPTION_GROUNDING_SIGNALS = tuple(AGENT_PERCEPTION_SIGNALS)
 # 记忆抽取 lane（capture=一窗对话→记忆卡，dream=现有卡片→合并）。同形：
 # build prompt → BYOK 抽取 → parse → memory actions。永不写气泡、永不弹 error chip。
 _EXTRACTION_LANES = frozenset({"capture", "dream"})
 _WAKE_SYSTEM_PROMPT = (
     "You are the user's companion. This is a PROACTIVE moment — the user has not "
-    "just spoken. Look at the conversation so far. If there is something genuine, "
-    "specific, and worth saying right now — a follow-up, a thought, a check-in — say "
-    "it naturally in your own voice. If there is nothing worth saying, reply with an "
-    "empty message; staying silent is correct and expected."
+    "just spoken. Look at the conversation so far. A perception_glance is only a "
+    "hint for deciding whether to look deeper; it is not a checklist to report. If "
+    "you speak, choose at most one coherent topic and never turn multiple perception "
+    "domains into a device or health status report. Use a perception tool when an "
+    "exact reading is genuinely needed. If there is no specific, natural reason to "
+    "reach out, reply with an empty message; silence is correct."
 )
 _WAKE_NUDGE = "(A quiet moment has passed. Reach out only if something is genuinely worth saying right now.)"
 _SCHEDULED_WAKE_SYSTEM_PROMPT = (
@@ -912,9 +730,10 @@ _SCHEDULED_WAKE_SYSTEM_PROMPT = (
     "with a generic check-in."
 )
 # screen_watch lane (Task 3): a wake grounded on recent shared-screen frames rather
-# than a perception snapshot. Its own system prompt sits beside _WAKE_SYSTEM_PROMPT;
-# _run_wake selects it only for lane=="screen_watch". Silence is still the correct
-# answer most ticks (inherits the "weak wake sleeps" empty_reply path).
+# than an ambient perception glance. Its own system prompt sits beside
+# _WAKE_SYSTEM_PROMPT; _run_wake selects it only for lane=="screen_watch". Silence
+# is still the correct answer most ticks (inherits the "weak wake sleeps" empty_reply
+# path).
 _SCREEN_WATCH_SYSTEM_PROMPT = (
     "You are the user's personal companion, quietly watching the screen they are sharing. "
     "Recent frame availability is provided as grounding context; use the screen tools "
@@ -2750,47 +2569,31 @@ async def _run_trajectory_review_turn(
         await asyncio.gather(lease_keepalive_task, return_exceptions=True)
 
 
-async def _perception_grounding_results(store, *, runtime_token, enclave_sem):
-    """Prefetch safe typed perception scalars as legacy wake grounding.
-
-    Wake lanes other than screen_watch still use this helper. Foreground chat is
-    pull-only and must discover exact readings through the model-facing tools.
-
-    Signals are passed EXPLICITLY over the full catalog: the capability's default is
-    `FAST_AGENT_PERCEPTION_SIGNALS` (now/location/weather/motion/calendar) and every
-    health signal — steps/sleep/vitals/activity/body — lives in the SLOW set, so the
-    default would reproduce the exact blindness this fixes. Signal COUNT is not a
-    latency cost (the read is a fixed 3 store reads regardless); it costs tokens only,
-    and the block lands after the reusable conversation prefix (at the end of
-    the base context, before any same-turn transcript), so it does not invalidate
-    prompt caching.
-
-    The complete snapshot is *not* safe to place before first-round outbound
-    tools: calendar/reminder titles, app/device/place labels, playback metadata,
-    and similar third-party strings can contain instructions. The eager block is
-    therefore projected through ``_safe_eager_perception_snapshot``; text remains
-    available only through an explicit perception tool read, after which the
-    tool loop removes later web/MCP/task channels.
-
-    Disabled/null values for allowlisted typed fields are kept: the agent must not
-    infer zero from an absent reading.
-
-    Returns the `action_results` shape `action_context_str` expects, or None when the
-    prefetch came back empty — `_cap_data` degrades to {} on failure and this is
-    never fatal: the model still has the tool and can fetch perception itself.
-    """
+async def _perception_glance_grounding_results(
+    store,
+    *,
+    runtime_token,
+    enclave_sem,
+    previous_fingerprint: str | None,
+) -> tuple[dict[str, list[dict]] | None, str | None]:
+    """Prefetch one number-free proactive glance and compare it locally."""
     data = await _cap_data(
         store,
-        "perception_snapshot",
+        "perception_glance",
         api_key=None,
         runtime_token=runtime_token,
-        params={"signals": list(_PERCEPTION_GROUNDING_SIGNALS)},
+        params={"days": 30},
         enclave_sem=enclave_sem,
     )
-    safe_data = _safe_eager_perception_snapshot(data)
-    if not safe_data:
-        return None
-    return {"perception_snapshot": [{"ok": True, "data": safe_data}]}
+    glance = data.get("glance") if isinstance(data, dict) else None
+    if not isinstance(glance, dict) or not glance:
+        return None, None
+    fingerprint = perception_glance_fingerprint(glance)
+    prompt_data = {
+        "glance": glance,
+        "glance_changed": fingerprint != previous_fingerprint,
+    }
+    return {"perception_glance": [{"ok": True, "data": prompt_data}]}, fingerprint
 
 
 async def _cap_data(
@@ -2800,7 +2603,7 @@ async def _cap_data(
     调用方（如 `_run_wake` 的 screen_watch screen_recent 预取）容忍空结果，不是必须成功
     的前提，模型自己会看到空 grounding context 并据此决定要不要再发 tool_call 补查。
 
-    enclave-bound（spec §11 R3）：capability 调用可能触达 enclave（如 perception_snapshot
+    enclave-bound（spec §11 R3）：capability 调用可能触达 enclave（如 perception_glance
     的解密读），跟 executor._run_one 的 capability 调用一样必须过 enclave_sem，否则多 worker
     并发预取会绕开闸门直接打容量有限的共享 enclave。enclave_sem 为 None（部分单测直调）时不设闸——
     与 executor._run_one/process_job 对 enclave_sem 的处理口径一致。"""
@@ -6739,7 +6542,7 @@ async def _run_wake(
     prompt 组装：读 summary+tail（同 chat 路径的 D1 读法）+ 固定的 `_WAKE_NUDGE`。
     `system_prompt`：`_SCREEN_WATCH_SYSTEM_PROMPT`（screen_watch lane）或
     `_WAKE_SYSTEM_PROMPT`（其余三条 wake lane）。screen_watch 的 `screen_recent`、
-    普通 wake 的 perception snapshot，以及由感知事件路由进 heartbeat job 的触发上下文，
+    普通 wake 的 perception glance，以及由感知事件路由进 heartbeat job 的安全触发标记，
     都通过 `_make_build_messages_fn` 的 `extra_context` 参数（复用
     `context.action_context_str` 的渲染）注入。它们是回合开始时取一次的低信任静态
     grounding，不随 tool-loop 轮次增长，跟 `prior_tool_results`（每轮动态积累的工具
@@ -7036,28 +6839,23 @@ async def _run_wake(
                     break
                 await asyncio.sleep(0.05)
             if perception_wake_context:
-                prompt_context: list[dict] = []
                 for raw_item in perception_wake_context[:10]:
                     if not isinstance(raw_item, dict):
                         continue
-                    item = dict(raw_item)
                     try:
                         consumed_perception_context_seq = max(
                             consumed_perception_context_seq,
-                            int(item.pop("_context_seq", 0) or 0),
+                            int(raw_item.get("_context_seq", 0) or 0),
                         )
                         wake_observed_generation = max(
                             wake_observed_generation,
-                            int(item.pop("_input_generation", 0) or 0),
+                            int(raw_item.get("_input_generation", 0) or 0),
                         )
                     except (TypeError, ValueError, OverflowError):
-                        item.pop("_context_seq", None)
-                        item.pop("_input_generation", None)
-                    prompt_context.append(item)
-                perception_wake_context = prompt_context
+                        pass
                 # Keep event-controlled text out of the authoritative nudge.
-                # The actual digest/origins are rendered below as explicitly
-                # untrusted runtime data.
+                # Only a fixed trigger projection is rendered below as untrusted
+                # runtime data; raw event details remain internal accounting input.
                 wake_nudge = (
                     "A recent perception change may be worth responding to. "
                     "Use the untrusted runtime context below, and stay silent "
@@ -7076,8 +6874,8 @@ async def _run_wake(
         }]
 
         # screen_watch lane grounds on recent shared-screen availability (Task 3).
-        # Fetch ONLY screen_recent — NOT perception_snapshot: the resident explicitly
-        # sets perception_digest=None for screen-watch jobs
+        # Fetch ONLY screen_recent — no perception_glance or perception_snapshot: the
+        # resident explicitly sets perception_digest=None for screen-watch jobs
         # (chat_resident_consumer.py:6611). Caption/app/window text is pull-only;
         # putting it in the first prompt would let screen content choose an outbound
         # web/MCP/task call before any execution fence can activate.
@@ -7089,7 +6887,8 @@ async def _run_wake(
         # (FEEDLING_V2_ENCLAVE_CONCURRENCY defaults to 2, so a naive test would pass
         # while production wedges wherever the value is 1). The gate still bounds the
         # call — _cap_data holds the semaphore for its own turn.
-        screen_results = None
+        grounding_results = None
+        glance_fingerprint = None
         if lane == "screen_watch":
             data = await _cap_data(
                 store,
@@ -7100,23 +6899,37 @@ async def _run_wake(
             )
             safe_screen = _safe_eager_screen_metadata(data)
             if safe_screen:
-                screen_results = {
+                grounding_results = {
                     "screen_recent": [{"ok": True, "data": safe_screen}]
                 }
-        else:
-            # Every OTHER wake lane grounds on the user's perception instead: a
-            # proactive message that cannot see how the user slept / moved / where
-            # they are has nothing real to open with.
-            screen_results = await _perception_grounding_results(
-                store, runtime_token=token, enclave_sem=enclave_sem
+        elif lane in {"heartbeat", "manual_wake"}:
+            prior = await asyncio.to_thread(jobs_store.get_runtime_state, user_id)
+            grounding_results, glance_fingerprint = (
+                await _perception_glance_grounding_results(
+                    store,
+                    runtime_token=token,
+                    enclave_sem=enclave_sem,
+                    previous_fingerprint=(
+                        str(
+                            prior.get(
+                                "last_completed_perception_glance_fingerprint"
+                            )
+                            or ""
+                        )
+                        or None
+                    ),
+                )
             )
-        if perception_wake_context:
-            if screen_results is None:
-                screen_results = {}
-            screen_results["perception_wake"] = [
-                {"ok": True, "data": item}
-                for item in perception_wake_context[:10]
-                if isinstance(item, dict)
+        safe_perception_events = project_perception_wake_events(
+            perception_wake_context
+        )
+        if safe_perception_events:
+            grounding_results = grounding_results or {}
+            # Static action folding unwraps a singleton successful run. Keep the
+            # projected marker collection inside that run so runtime_data retains
+            # a stable list shape even when exactly one event triggered the wake.
+            grounding_results["perception_wake"] = [
+                {"ok": True, "data": safe_perception_events}
             ]
 
         # Pin effects to the generation admitted/claimed for this job, never a
@@ -7839,8 +7652,8 @@ async def _run_wake(
                 summary=summary,
                 tail=wake_tail,
                 extra_context=(
-                    context.action_context_str(screen_results)
-                    if screen_results
+                    context.action_context_str(grounding_results)
+                    if grounding_results
                     else ""
                 ),
                 trusted_system_blocks=trusted_system_blocks,
