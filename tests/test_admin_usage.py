@@ -54,6 +54,358 @@ def _load_usage_scale_harness():
     return module
 
 
+def _load_ranked_flags_probe():
+    path = (
+        Path(__file__).parent.parent
+        / "scripts/perf/admin_usage_ranked_flags_temp_probe.py"
+    )
+    if not path.exists():
+        pytest.fail("ranked-flags TEMP probe is not implemented")
+    spec = importlib.util.spec_from_file_location(
+        "admin_usage_ranked_flags_temp_probe", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_ranked_probe_declares_exact_32_column_matrix():
+    probe = _load_ranked_flags_probe()
+    expected = tuple(
+        f"{metric}_{selector}_{completeness}"
+        for selector in ("all", "provider", "model", "provider_model")
+        for completeness in ("all", "effective")
+        for metric in (
+            "logical_calls_cohort",
+            "logical_calls_requested",
+            "missing_outer_ordinals",
+            "missing_inner_ordinals",
+        )
+    )
+
+    assert probe.FLAG_COLUMN_NAMES == expected
+    assert len(set(expected)) == 32
+
+
+def test_ranked_probe_uses_16_stable_ranks_and_no_persistent_ddl():
+    probe = _load_ranked_flags_probe()
+    sql = probe._ranked_flag_ctes(
+        priced_relation="priced", gap_relation="call_gaps"
+    )
+    normalized = " ".join(sql.split())
+
+    assert normalized.count("row_number() OVER") == 16
+    assert normalized.count("ORDER BY p.attempt_id") == 16
+    assert "CREATE TABLE" not in normalized
+    assert "llm_usage_daily_call_memberships" not in normalized
+
+
+def test_ranked_probe_candidate_rollup_sql_has_no_distinct_call_path():
+    probe = _load_ranked_flags_probe()
+    sql = " ".join(
+        probe._candidate_query_sql(
+            selector="provider_model", completeness="all"
+        ).split()
+    ).lower()
+
+    assert "llm_usage_daily_call_memberships" not in sql
+    assert "call_id" not in sql
+    assert "count(distinct" not in sql
+    assert "logical_calls_cohort_provider_model_all" in sql
+    assert "logical_calls_requested_provider_model_all" in sql
+
+
+def test_ranked_probe_hard_gate_requires_every_nonpersistent_scale_witness():
+    probe = _load_ranked_flags_probe()
+    healthy = {
+        "temp_relation": {
+            "rows": 731_199,
+            "heap_bytes": 1,
+            "index_bytes": 1,
+            "total_bytes": 2,
+        },
+        "build": {
+            "days": 365,
+            "total_ms": 1.0,
+            "p50_ms": 1.0,
+            "p95_ms": 1.0,
+            "max_ms": 119_999.0,
+        },
+        "raw_edge": {"attempts": 8_208, "logical_calls": 8_208},
+        "cohorts": {
+            name: {
+                "exact": True,
+                "ordinary_ms": 2_999.0,
+                "cold": {"execution_ms": 2_999.0, "temp_read_blocks": 0, "temp_written_blocks": 0},
+                "warm": {"execution_ms": 2_999.0, "temp_read_blocks": 0, "temp_written_blocks": 0},
+                "candidate_forbidden_path_absent": True,
+            }
+            for name in ("unfiltered", "provider_model_filtered")
+        },
+        "persistent_state": {"unchanged": True},
+        "session_close": {"persistent_probe_objects": []},
+    }
+
+    assert probe._probe_passed(healthy) is True
+    for mutate in (
+        lambda item: item["temp_relation"].update(rows=731_198),
+        lambda item: item["build"].update(max_ms=120_000.0),
+        lambda item: item["raw_edge"].update(attempts=8_209),
+        lambda item: item["cohorts"]["unfiltered"].update(exact=False),
+        lambda item: item["cohorts"]["unfiltered"]["cold"].update(execution_ms=3_000.0),
+        lambda item: item["cohorts"]["unfiltered"]["warm"].update(temp_written_blocks=1),
+        lambda item: item["persistent_state"].update(unchanged=False),
+        lambda item: item["session_close"].update(persistent_probe_objects=["bad"]),
+    ):
+        candidate = json.loads(json.dumps(healthy))
+        mutate(candidate)
+        assert probe._probe_passed(candidate) is False
+
+
+@pytest.mark.parametrize(
+    ("selector", "completeness", "filter_params"),
+    [
+        ("all", "all", ()),
+        ("provider", "all", ("p1",)),
+        ("model", "all", ("m1",)),
+        ("provider_model", "all", ("p1", "m1")),
+        ("provider_model", "effective", (True, "p1", "m1")),
+    ],
+)
+def test_ranked_probe_candidate_sql_parses_on_postgresql(
+    selector, completeness, filter_params
+):
+    probe = _load_ranked_flags_probe()
+    flag_projection = ",".join(
+        f"0::bigint AS {name}" for name in probe.FLAG_COLUMN_NAMES
+    )
+    with db.get_pool().connection() as conn, conn.transaction():
+        for relation in (
+            "admin_usage_ranked_dimensions",
+            "admin_usage_ranked_raw_dimensions",
+        ):
+            conn.execute(
+                f"CREATE TEMP TABLE {relation} ON COMMIT DROP AS "  # noqa: S608
+                "SELECT d.*," + flag_projection + " FROM "
+                "llm_usage_daily_attempt_dimensions d WITH NO DATA"
+            )
+        row = conn.execute(
+            "EXPLAIN (FORMAT JSON) "
+            + probe._candidate_query_sql(
+                selector=selector, completeness=completeness
+            ),
+            (datetime(2026, 5, 5).date(), datetime(2026, 8, 1).date(), *filter_params),
+        ).fetchone()
+
+    assert row[0][0]["Plan"]
+
+
+def test_ranked_probe_temp_build_statements_execute_on_empty_postgresql():
+    probe = _load_ranked_flags_probe()
+    flag_projection = ",".join(
+        f"0::bigint AS {name}" for name in probe.FLAG_COLUMN_NAMES
+    )
+    local_day = datetime(2026, 8, 1).date()
+    with db.get_pool().connection() as conn, conn.transaction():
+        conn.execute(
+            "CREATE TEMP TABLE admin_usage_ranked_dimensions ON COMMIT DROP AS "
+            "SELECT d.*," + flag_projection + " FROM "
+            "llm_usage_daily_attempt_dimensions d WITH NO DATA"
+        )
+        conn.execute(
+            "CREATE TEMP TABLE admin_usage_ranked_raw_dimensions "
+            "(LIKE admin_usage_ranked_dimensions INCLUDING DEFAULTS) ON COMMIT DROP"
+        )
+        day_cursor = conn.execute(
+            probe._day_rank_update_sql(
+                provider_attempt_rollup._effective_attempt_ctes()
+            ),
+            (
+                datetime(2026, 7, 31, 16, tzinfo=timezone.utc),
+                datetime(2026, 8, 1, 16, tzinfo=timezone.utc),
+                local_day,
+            ),
+        )
+        raw_cursor = conn.execute(
+            probe._raw_ranked_insert_sql(
+                provider_attempt_rollup._effective_attempt_ctes(
+                    cohort_where="false"
+                )
+            )
+        )
+
+    assert day_cursor.rowcount == 0
+    assert raw_cursor.rowcount == 0
+
+
+def _ranked_probe_totals(conn, rows):
+    probe = _load_ranked_flags_probe()
+    statement = probe._ranked_flag_select(
+        priced_relation="priced", gap_relation="call_gaps"
+    )
+    columns = ",".join(f"sum({name})::bigint" for name in probe.FLAG_COLUMN_NAMES)
+    values = ",".join(
+        conn.execute("SELECT quote_literal(%s)", (value,)).fetchone()[0]
+        if isinstance(value, str)
+        else ("true" if value is True else "false")
+        for row in rows
+        for value in row
+    )
+    row_width = len(rows[0])
+    tuples = ",".join(
+        "(" + ",".join(values.split(",")[offset : offset + row_width]) + ")"
+        for offset in range(0, len(rows) * row_width, row_width)
+    )
+    result = conn.execute(
+        "WITH priced(attempt_id,call_id,requested_provider,requested_model,"
+        "resolved_provider,resolved_model,effective_usage_known) AS (VALUES "
+        + tuples
+        + "),call_gaps(call_id,missing_outer_ordinals,missing_inner_ordinals)"
+        " AS (VALUES ('call-a',1::bigint,0::bigint)),ranked AS ("
+        + statement
+        + ") SELECT "
+        + columns
+        + " FROM ranked"
+    ).fetchone()
+    return dict(zip(probe.FLAG_COLUMN_NAMES, result, strict=True))
+
+
+def test_ranked_probe_deduplicates_one_call_for_each_resolved_selector():
+    rows = (
+        ("00000000-0000-5000-8000-000000000001", "call-a", "req", "a", "p1", "shared", True),
+        ("00000000-0000-5000-8000-000000000002", "call-a", "req", "b", "p2", "shared", False),
+    )
+    with db.get_pool().connection() as conn:
+        totals = _ranked_probe_totals(conn, rows)
+
+    assert totals["logical_calls_cohort_all_all"] == 1
+    assert totals["logical_calls_cohort_provider_all"] == 2
+    assert totals["logical_calls_cohort_model_all"] == 1
+    assert totals["logical_calls_cohort_provider_model_all"] == 2
+    assert totals["logical_calls_requested_all_all"] == 2
+
+
+def test_ranked_probe_splits_effective_completeness_but_keeps_all_exact():
+    rows = (
+        ("00000000-0000-5000-8000-000000000001", "call-a", "req", "same", "p1", "shared", True),
+        ("00000000-0000-5000-8000-000000000002", "call-a", "req", "same", "p1", "shared", False),
+    )
+    with db.get_pool().connection() as conn:
+        totals = _ranked_probe_totals(conn, rows)
+
+    assert totals["logical_calls_cohort_all_all"] == 1
+    assert totals["logical_calls_cohort_all_effective"] == 2
+    assert totals["logical_calls_requested_all_all"] == 1
+    assert totals["logical_calls_requested_all_effective"] == 2
+    assert totals["missing_outer_ordinals_all_all"] == 1
+    assert totals["missing_outer_ordinals_all_effective"] == 2
+
+
+def test_ranked_probe_matches_canonical_calls_for_full_filter_matrix():
+    probe = _load_ranked_flags_probe()
+    attempts = (
+        ("00000000-0000-5000-8000-000000000001", "call-a", "u1", "chat", "req", "a", "p1", "shared", True, "unknown", None),
+        ("00000000-0000-5000-8000-000000000002", "call-a", "u1", "chat", "req", "b", "p2", "shared", False, "unknown", None),
+        ("00000000-0000-5000-8000-000000000003", "call-b", "u1", "maintenance", "req", "a", "p1", "m1", True, "authoritative", "USD"),
+        ("00000000-0000-5000-8000-000000000004", "call-b", "u1", "maintenance", "req", "a", "p1", "m2", True, "estimated", "USD"),
+        ("00000000-0000-5000-8000-000000000005", "call-c", "u2", "chat", "req", "c", "p2", "m1", False, "unknown", None),
+    )
+    gaps = {"call-a": (1, 0), "call-b": (0, 1), "call-c": (0, 0)}
+    placeholders = ",".join(
+        "(" + ",".join(("%s",) * len(attempts[0])) + ")" for _ in attempts
+    )
+    gap_placeholders = ",".join("(%s,%s,%s)" for _ in gaps)
+    with db.get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "WITH priced(attempt_id,call_id,user_id,cohort_lane,"
+                "requested_provider,requested_model,resolved_provider,"
+                "resolved_model,effective_usage_known,cost_kind,currency) AS (VALUES "
+                + placeholders
+                + "),call_gaps(call_id,missing_outer_ordinals,missing_inner_ordinals)"
+                " AS (VALUES "
+                + gap_placeholders
+                + ") "
+                + probe._ranked_dimension_select(
+                    priced_relation="priced", gap_relation="call_gaps"
+                ),
+                tuple(value for row in attempts for value in row)
+                + tuple(value for call_id, values in gaps.items() for value in (call_id, *values)),
+            )
+            dimensions = tuple(cur.fetchall())
+
+    raw = tuple(
+        {
+            "call_id": row[1], "user_id": row[2], "cohort_lane": row[3],
+            "requested": (row[4], row[5]), "resolved": (row[6], row[7]),
+            "effective": row[8],
+        }
+        for row in attempts
+    )
+    for user_id in (None, "u1", "u2"):
+        for lane in (None, "chat", "maintenance"):
+            for provider in (None, "p1", "p2"):
+                for model in (None, "shared", "m1", "m2"):
+                    for completeness in ("all", "metered", "unknown"):
+                        selected = tuple(
+                            row for row in raw
+                            if (user_id is None or row["user_id"] == user_id)
+                            and (lane is None or row["cohort_lane"] == lane)
+                            and (provider is None or row["resolved"][0] == provider)
+                            and (model is None or row["resolved"][1] == model)
+                            and (
+                                completeness == "all"
+                                or row["effective"] is (completeness == "metered")
+                            )
+                        )
+                        expected_calls = {row["call_id"] for row in selected}
+                        expected_requested = {
+                            identity: len({row["call_id"] for row in selected if row["requested"] == identity})
+                            for identity in {row["requested"] for row in selected}
+                        }
+                        expected_resolved = {
+                            identity: len({row["call_id"] for row in selected if row["resolved"] == identity})
+                            for identity in {row["resolved"] for row in selected}
+                        }
+                        selector = (
+                            "provider_model" if provider and model else
+                            "provider" if provider else "model" if model else "all"
+                        )
+                        stored_completeness = "all" if completeness == "all" else "effective"
+                        cohort_column = f"logical_calls_cohort_{selector}_{stored_completeness}"
+                        requested_column = f"logical_calls_requested_{selector}_{stored_completeness}"
+                        resolved_column = f"logical_calls_cohort_provider_model_{stored_completeness}"
+                        outer_column = f"missing_outer_ordinals_{selector}_{stored_completeness}"
+                        inner_column = f"missing_inner_ordinals_{selector}_{stored_completeness}"
+                        selected_dimensions = tuple(
+                            row for row in dimensions
+                            if (user_id is None or row["user_id"] == user_id)
+                            and (lane is None or row["cohort_lane"] == lane)
+                            and (provider is None or row["resolved_provider"] == provider)
+                            and (model is None or row["resolved_model"] == model)
+                            and (
+                                completeness == "all"
+                                or row["effective_usage_known"] is (completeness == "metered")
+                            )
+                        )
+                        actual_requested = {}
+                        actual_resolved = {}
+                        for row in selected_dimensions:
+                            requested_identity = (row["requested_provider"], row["requested_model"])
+                            resolved_identity = (row["resolved_provider"], row["resolved_model"])
+                            actual_requested[requested_identity] = actual_requested.get(requested_identity, 0) + row[requested_column]
+                            actual_resolved[resolved_identity] = actual_resolved.get(resolved_identity, 0) + row[resolved_column]
+                        actual_requested = {key: value for key, value in actual_requested.items() if value}
+                        actual_resolved = {key: value for key, value in actual_resolved.items() if value}
+                        context = (user_id, lane, provider, model, completeness)
+                        assert sum(row[cohort_column] for row in selected_dimensions) == len(expected_calls), context
+                        assert actual_requested == expected_requested, context
+                        assert actual_resolved == expected_resolved, context
+                        assert sum(row[outer_column] for row in selected_dimensions) == sum(gaps[call_id][0] for call_id in expected_calls), context
+                        assert sum(row[inner_column] for row in selected_dimensions) == sum(gaps[call_id][1] for call_id in expected_calls), context
+
+
 def test_admin_usage_scale_harness_self_check():
     """The opt-in scale proof must keep its timing and SQL safety gates."""
     result = subprocess.run(

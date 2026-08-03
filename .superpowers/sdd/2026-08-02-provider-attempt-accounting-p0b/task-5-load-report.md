@@ -388,3 +388,46 @@ dimensions. The design covers every provider/model/completeness selector,
 requested/resolved breakdown, raw edge, replay/retention path, migration and
 storage gate, plus independently timed, batched, crash-resumable fixture
 cleanup. It is a design only and has not been implemented.
+
+## Ranked-flags TEMP feasibility checkpoint: failed
+
+The approved non-persistent checkpoint ran against the retained dedicated
+local database and failed before any migration or production implementation.
+Its artifact is
+`/private/tmp/2026-08-03-ranked-flags-temp-probe.json`. The first invocation
+found a harness-only PostgreSQL syntax error while setting a parameterized
+session timeout and exited before creating TEMP state. After replacing that
+statement with `set_config`, compileall, Ruff, thirteen focused ranked-flag
+tests, real empty-PostgreSQL day/raw execution, and five candidate EXPLAIN
+shapes passed before the real rerun.
+
+The rerun built the complete TEMP candidate from the corrected/priced source:
+
+- 366 Shanghai local days and all 731,199 existing dimension rows were updated;
+- build total was 602,434.870ms, p50 1,388.212ms, p95 3,203.356ms, and max
+  6,602.574ms, safely below the unchanged 120,000ms maintenance statement
+  limit for every day;
+- TEMP heap/index/total sizes were 913,424,384 / 82,026,496 / 995,704,832
+  bytes. This is the complete cloned fact relation plus the flags, not an
+  incremental-column-only measurement;
+- the bounded raw edge was exact at 8,208 attempts and 8,208 logical calls.
+
+The hard query gate failed on the first, unfiltered formal cohort. The old
+diagnostic reference statement completed under its 180,000ms allowance; after
+the harness switched to the unchanged business statement timeout, the ranked
+candidate was cancelled at 3,000ms. Consequently it did not produce the
+required exact result-set witness or cold/warm EXPLAIN measurements, and no
+filtered cohort was attempted. This is a strict acceptance failure: there is
+no timeout increase, p95 relaxation, migration edit, production query edit, or
+continuation to the later implementation tasks.
+
+The failed session closed and PostgreSQL dropped both TEMP relations. A fresh
+connection found zero non-temporary `admin_usage_ranked_%` objects. Post-failure
+read-only witnesses exactly matched the pre-witness: 2,000 users, 3,000,000
+turns, 3,000,000 attempts, zero corrections/rate cards, 731,199 rows in each
+daily rollup relation, 3,000,000 memberships, one watermark in each watermark
+table, and zero dirty days. User/turn/attempt hash sums remained respectively
+`-20000464400364806619`, `3575410787973148833422`, and
+`-4676877262142338493875`; both watermark JSON witnesses were byte-for-byte
+unchanged. The retained 0076 source and existing 0077 derived fixture therefore
+remain intact.
