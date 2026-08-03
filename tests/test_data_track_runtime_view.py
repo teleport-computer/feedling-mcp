@@ -1022,3 +1022,294 @@ def test_runtime_view_passes_window_to_delivery_too(client, monkeypatch):
     client.get("/admin/data-track?view=runtime&hours=168", headers=_admin_headers())
 
     assert seen["within_hours"] == 168
+
+
+# ---- Task 3: 每用户 Runtime V2 token/model 与交付可靠性报表 ----
+
+
+def _user_report() -> dict:
+    empty_failure = {
+        "reply_delivered_in_window": 0,
+        "reply_undelivered": 0,
+        "status_delivered_in_window": 0,
+        "status_undelivered": 0,
+        "runtime_error_delivered_in_window": 0,
+        "runtime_error_undelivered": 0,
+    }
+    return {
+        "window_hours": 24,
+        "users": [
+            {
+                "user_id": "usr_report_a",
+                "known_total_tokens": 12_900,
+                "model_calls": 18,
+                "models": [{
+                    "provider": "anthropic",
+                    "model": "claude-example",
+                    "route": "route-fingerprint",
+                    "lanes": ["chat", "heartbeat"],
+                    "turns": 12,
+                    "model_calls": 18,
+                    "retries": 2,
+                    "usage_reported_calls": 17,
+                    "cache_reported_calls": 16,
+                    "usage_coverage": 17 / 18,
+                    "cache_coverage": 16 / 18,
+                    "prompt_tokens": 12_000,
+                    "completion_tokens": 900,
+                    "total_tokens": 12_900,
+                    "cache_read_tokens": 8_000,
+                    "cache_write_tokens": 500,
+                    "cache_miss_tokens": 4_000,
+                    "cache_hit_ratio": 2 / 3,
+                }],
+                "delivery": {
+                    "reply_effects": {
+                        "applied_in_window": 10,
+                        "pending": 1,
+                        "needs_reconciliation": 0,
+                    },
+                    "status_effects": {
+                        "applied_in_window": 4,
+                        "pending": 0,
+                        "needs_reconciliation": 0,
+                    },
+                    "all_effects": {
+                        "applied_in_window": 24,
+                        "discarded_in_window": 1,
+                        "pending": 1,
+                        "needs_reconciliation": 0,
+                    },
+                    "terminal_failure": dict(empty_failure),
+                    "oldest_unfinished_age_sec": 3600,
+                },
+            },
+            {
+                "user_id": "usr_delivery_only",
+                "known_total_tokens": None,
+                "model_calls": 0,
+                "models": [],
+                "delivery": {
+                    "reply_effects": {
+                        "applied_in_window": 0,
+                        "pending": 0,
+                        "needs_reconciliation": 0,
+                    },
+                    "status_effects": {
+                        "applied_in_window": 0,
+                        "pending": 0,
+                        "needs_reconciliation": 1,
+                    },
+                    "all_effects": {
+                        "applied_in_window": 0,
+                        "discarded_in_window": 0,
+                        "pending": 0,
+                        "needs_reconciliation": 1,
+                    },
+                    "terminal_failure": dict(empty_failure),
+                    "oldest_unfinished_age_sec": 60,
+                },
+            },
+        ],
+    }
+
+
+def test_runtime_user_delivery_level_uses_reconciliation_and_age_thresholds():
+    # A fresh pending count alone is intentionally not degraded; reconciliation
+    # and stale outstanding delivery are the observable delivery failures.
+    assert _dt._runtime_user_delivery_level({
+        "all_effects": {"needs_reconciliation": 1},
+        "oldest_unfinished_age_sec": 1,
+    }) == "bad"
+    assert _dt._runtime_user_delivery_level({
+        "all_effects": {"needs_reconciliation": 0},
+        "oldest_unfinished_age_sec": 3600,
+    }) == "warn"
+    assert _dt._runtime_user_delivery_level({
+        "all_effects": {"needs_reconciliation": 0},
+        "oldest_unfinished_age_sec": 21600,
+    }) == "bad"
+    assert _dt._runtime_user_delivery_level({
+        "all_effects": {"needs_reconciliation": 0},
+        "oldest_unfinished_age_sec": 30,
+    }) == "ok"
+    # Fresh volume is not a delivery failure: an active worker can safely
+    # drain hundreds of effects.  This catches a regression that mistakenly
+    # degrades solely from the current pending count.
+    assert _dt._runtime_user_delivery_level({
+        "all_effects": {"pending": 999, "needs_reconciliation": 0},
+        "oldest_unfinished_age_sec": 30,
+    }) == "ok"
+    assert _dt._runtime_user_delivery_level({
+        "all_effects": {"pending": 999, "needs_reconciliation": 0},
+        "oldest_unfinished_age_sec": None,
+    }) == "ok"
+
+
+def test_render_runtime_health_page_shows_user_delivery_without_model_usage(bound_request):
+    html_out = _dt._render_runtime_health_page(
+        _payload(), _tokens(), _delivery(), _user_report()
+    )
+    assert "用户交付可靠性" in html_out
+    assert "Reply effects" in html_out
+    assert "Failure reply/status/error" in html_out
+    assert "needs_reconciliation" in html_out
+    assert "usr_delivery_only" in html_out
+    assert "<span class='pill bad'>异常</span>" in html_out
+    assert "needs_reconciliation 1" in html_out
+    assert "ok 不代表客户端已读" in html_out
+    assert "不受所选时间窗口限制" in html_out
+    assert "用户 Token / Model 与交付可靠性" not in html_out
+    assert "claude-example" not in html_out
+    assert 'class="runtime-user-models"' not in html_out
+    assert 'class="runtime-user-delivery"' in html_out
+
+
+def test_render_runtime_user_report_links_user_once_in_delivery_row(bound_request):
+    report = _user_report()
+
+    html_out = _dt._render_runtime_health_page(
+        _payload(), _tokens(), _delivery(), report
+    )
+    table_start = html_out.index('<table class="runtime-user-delivery">')
+    table_end = html_out.index("</table>", table_start)
+    delivery_table = html_out[table_start:table_end]
+    assert delivery_table.count("/admin/data-track/users/usr_report_a") == 1
+
+
+def test_render_runtime_user_report_explains_user_id_attribution(bound_request):
+    html_out = _dt._render_runtime_health_page(
+        _payload(), _tokens(), _delivery(), _user_report()
+    )
+    assert "按 user_id 统计" in html_out
+    assert "不按真人/principal 合并" in html_out
+    assert "重新注册可能显示多行" in html_out
+
+
+def test_render_runtime_user_report_does_not_link_unknown_user_id(bound_request):
+    report = _user_report()
+    report["users"][0]["user_id"] = "unknown"
+    html_out = _dt._render_runtime_health_page(
+        _payload(), _tokens(), _delivery(), report
+    )
+    assert "<code>unknown</code>" in html_out
+    assert "/admin/data-track/users/unknown" not in html_out
+
+
+def test_render_runtime_user_report_preserves_unknowns_and_escapes(bound_request):
+    report = _user_report()
+    report["users"][0]["user_id"] = "usr_<unsafe>"
+    html_out = _dt._render_runtime_health_page(
+        _payload(), _tokens(), _delivery(), report
+    )
+    assert "usr_<unsafe>" not in html_out
+    assert "usr_&lt;unsafe&gt;" in html_out
+    assert "usr_%3Cunsafe%3E" in html_out
+
+
+def test_render_runtime_user_report_links_keep_current_admin_query_string():
+    # The model and delivery tables link a user row back to Admin detail
+    # without dropping the analyst's current runtime filters.
+    with _admin_core.bind("q=needle&view=runtime&hours=168"):
+        html_out = _dt._render_runtime_health_page(
+            _payload(), _tokens(), _delivery(), _user_report()
+        )
+    assert (
+        "href='/admin/data-track/users/usr_report_a?"
+        "q=needle&amp;view=runtime&amp;hours=168'"
+    ) in html_out
+
+
+def test_render_runtime_health_page_user_report_unavailable_is_local(bound_request):
+    html_out = _dt._render_runtime_health_page(
+        _payload(), _tokens(), _delivery(), None
+    )
+    assert "用户交付可靠性暂时取不到" in html_out
+    assert "各 lane 健康" in html_out
+    assert "端到端交付" in html_out
+
+
+def test_render_runtime_user_report_empty_window_is_not_unavailable(bound_request):
+    html_out = _dt._render_runtime_health_page(
+        _payload(), _tokens(), _delivery(), {"window_hours": 168, "users": []}
+    )
+    assert "所选 168 小时窗口没有用户指标或当前待交付项" in html_out
+    assert "暂时取不到" not in html_out
+    assert "colspan='7'" in html_out
+
+
+# ---- Task 4: 每用户报表路由编排与装配 ----
+
+
+def test_runtime_view_passes_same_window_to_user_report(monkeypatch):
+    """路由漏传窗口会让每用户表和其余 Runtime 区块口径不一致。"""
+    seen = {}
+
+    def _health(**kwargs):
+        seen["health"] = kwargs["within_hours"]
+        return _payload()
+
+    def _tokens_for_window(**kwargs):
+        seen["tokens"] = kwargs["within_hours"]
+        return _tokens()
+
+    def _delivery_for_window(**kwargs):
+        seen["delivery"] = kwargs["within_hours"]
+        return _delivery()
+
+    def _users(**kwargs):
+        seen["users"] = kwargs["within_hours"]
+        return _user_report()
+
+    monkeypatch.setattr(_dt, "_runtime_health_summary", _health)
+    monkeypatch.setattr(_dt, "_runtime_token_by_lane", _tokens_for_window)
+    monkeypatch.setattr(_dt, "_runtime_delivery_health", _delivery_for_window)
+    monkeypatch.setattr(_dt, "_runtime_user_report", _users)
+
+    body = _admin_core.page_html("view=runtime&hours=168")
+
+    assert seen == {
+        "health": 168,
+        "tokens": 168,
+        "delivery": 168,
+        "users": 168,
+    }
+    assert "用户交付可靠性" in body
+
+
+def test_runtime_user_report_failure_does_not_hide_health(monkeypatch):
+    """用户聚合超时只能降级自己的区块，不能遮蔽可用健康数据。"""
+    tokens = _tokens()
+    delivery = _delivery(
+        effect_outbox={"pending": 7, "oldest_pending_age_sec": None},
+        terminal_failure_outbox={
+            "status_undelivered": 3,
+            "runtime_error_undelivered": 4,
+            "oldest_undelivered_age_sec": None,
+        },
+    )
+    monkeypatch.setattr(_dt, "_runtime_health_summary", lambda **_kw: _payload())
+    monkeypatch.setattr(_dt, "_runtime_token_by_lane", lambda **_kw: tokens)
+    monkeypatch.setattr(_dt, "_runtime_delivery_health", lambda **_kw: delivery)
+
+    def _boom(**_kw):
+        raise RuntimeError("user report db")
+
+    monkeypatch.setattr(_dt, "_runtime_user_report", _boom)
+
+    body = _admin_core.page_html("view=runtime&hours=24")
+
+    assert "Runtime 健康" in body
+    assert "各 lane 健康" in body
+    assert "951.2k" in body
+    assert "<div class='metric-value'>3 / 4</div>" in body
+    assert "用户交付可靠性暂时取不到" in body
+    assert "user report db" not in body
+
+
+def test_runtime_user_report_is_wired_to_jobs_store():
+    """ASGI 装配遗漏时桩会悄然返回空表，必须绑定真实聚合。"""
+    import asgi_app  # noqa: F401
+    from model_api_runtime.v2 import jobs_store
+
+    assert _dt._runtime_user_report is jobs_store.recent_runtime_user_delivery_report

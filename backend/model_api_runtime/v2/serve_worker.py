@@ -92,6 +92,7 @@ from model_api_runtime.v2 import runner_identity
 from model_api_runtime.v2 import scheduler
 from model_api_runtime.v2 import screen_watch
 from model_api_runtime.v2 import summary_frontier as v2_summary_frontier
+from model_api_runtime.v2 import usage_rollup
 from model_api_runtime.v2 import watchdog as v2_watchdog
 from model_api_runtime.v2 import worker as v2_worker
 
@@ -4123,6 +4124,98 @@ _BACKLOG_SCAN_MIN = _positive_int_env("FEEDLING_V2_BACKLOG_SCAN_MIN", "200")
 _BACKLOG_SCAN_LIMIT = _positive_int_env("FEEDLING_V2_BACKLOG_SCAN_LIMIT", "200")
 
 
+def _usage_rollup_interval_seconds() -> float:
+    """Read optional telemetry cadence without making config startup-critical."""
+
+    raw = os.environ.get("FEEDLING_V2_USAGE_ROLLUP_INTERVAL_SEC", "300")
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return 300.0
+    if not math.isfinite(value) or value <= 0:
+        return 300.0
+    return min(value, 86_400.0)
+
+
+async def _usage_rollup_loop(
+    stop_event: asyncio.Event, *, interval: float | None = None
+) -> None:
+    """Run optional reporting maintenance without sharing a failure domain.
+
+    The feature is default-on with an explicit environment opt-out.  Every
+    failure boundary is caught here even though ``run_maintenance_tick`` is
+    itself fail-open, so a future regression cannot cancel heartbeat, provider
+    work, replies, retries, or any sibling maintenance coroutine.
+    """
+
+    cadence = _usage_rollup_interval_seconds() if interval is None else interval
+    while not stop_event.is_set():
+        if usage_rollup.enabled():
+            cancel_event = threading.Event()
+            tick_task: asyncio.Task | None = None
+            stop_task: asyncio.Task | None = None
+            try:
+                tick_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        usage_rollup.run_maintenance_tick,
+                        cancel_event=cancel_event,
+                    )
+                )
+                stop_task = asyncio.create_task(stop_event.wait())
+                done, _pending = await asyncio.wait(
+                    (tick_task, stop_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stop_task in done:
+                    cancel_event.set()
+                    try:
+                        await asyncio.shield(tick_task)
+                    except Exception as e:  # noqa: BLE001 - optional reporting only
+                        log.warning(
+                            "[v2.serve_worker] usage rollup drain failed: %s",
+                            type(e).__name__,
+                        )
+                    break
+                result = tick_task.result()
+                if result.get("days_refreshed"):
+                    log.info(
+                        "[v2.serve_worker] usage rollup refreshed days=%s "
+                        "bootstrap_complete=%s",
+                        result["days_refreshed"],
+                        result.get("bootstrap_complete"),
+                    )
+            except asyncio.CancelledError:
+                # asyncio cannot stop a running to_thread call.  Signal its
+                # cooperative transaction boundaries, then join it under
+                # shield so shutdown cannot leave a DB thread running after
+                # the parent maintenance task has drained.
+                cancel_event.set()
+                if tick_task is not None:
+                    try:
+                        await asyncio.shield(tick_task)
+                    except Exception as e:  # noqa: BLE001 - shutdown remains bounded
+                        log.warning(
+                            "[v2.serve_worker] usage rollup cancel drain failed: %s",
+                            type(e).__name__,
+                        )
+                raise
+            except Exception as e:  # noqa: BLE001 - reporting cannot kill worker
+                log.warning(
+                    "[v2.serve_worker] usage rollup tick failed: %s",
+                    type(e).__name__,
+                )
+            finally:
+                cancel_event.set()
+                if stop_task is not None and not stop_task.done():
+                    stop_task.cancel()
+                if stop_task is not None:
+                    await asyncio.gather(stop_task, return_exceptions=True)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=cadence)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def _backlog_scan_loop(
     stop_event: asyncio.Event, *, interval: float = _BACKLOG_SCAN_INTERVAL_SEC
 ) -> None:
@@ -4433,6 +4526,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
         asyncio.create_task(_watchdog_loop(supervisor, worker_id, stop_event)),
         asyncio.create_task(_reconcile_loop(stop_event)),
         asyncio.create_task(_backlog_scan_loop(stop_event)),
+        asyncio.create_task(_usage_rollup_loop(stop_event)),
     ]
     try:
         # Each loop handles recoverable iteration failures internally.  An

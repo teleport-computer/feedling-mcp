@@ -21,6 +21,7 @@ import html
 from accounts import onboarding
 from accounts import onboarding as accounts_onboarding
 from accounts import registry
+from admin import usage as admin_usage
 from chat import consumer as chat_consumer
 from memory import service as memory_service
 from notices import core as notices_core
@@ -2716,6 +2717,139 @@ def _runtime_delivery_health(*, within_hours: int = 24) -> dict:
     }
 
 
+# Injected by the assembly layer (asgi_app.py); the real implementation is
+# model_api_runtime.v2.jobs_store.recent_runtime_user_delivery_report. Keep this
+# stub content-free so Admin can render safely before that binding is installed.
+def _runtime_user_report(*, within_hours: int = 24) -> dict:
+    return {"window_hours": within_hours, "users": []}
+
+
+# Injected by the assembly layer (asgi_app.py); the real implementation is
+# model_api_runtime.v2.jobs_store.usage_report_snapshot.  The stub keeps Admin
+# importable in isolation without reversing the admin -> Runtime V2 dependency.
+def _usage_report(query: admin_usage.UsageQuery) -> dict:
+    return {
+        "overview": {}, "averages": {}, "daily": [], "users": [],
+        "models": [], "filters": {}, "coverage": {},
+    }
+
+
+def _runtime_user_delivery_level(delivery: dict) -> str:
+    """Return the per-user delivery severity without treating fresh volume as bad.
+
+    A current backlog can be healthy under load; only reconciliation work or an
+    old unfinished item makes a user's reliability row degrade.
+    """
+    reconciliation = int(
+        ((delivery or {}).get("all_effects") or {}).get("needs_reconciliation")
+        or 0
+    )
+    if reconciliation > 0:
+        return "bad"
+    age = (delivery or {}).get("oldest_unfinished_age_sec")
+    if age is not None and float(age) >= _RUNTIME_DELIVERY_AGE_BAD_SEC:
+        return "bad"
+    if age is not None and float(age) >= _RUNTIME_DELIVERY_AGE_WARN_SEC:
+        return "warn"
+    return "ok"
+
+
+def _render_runtime_user_report(user_report: dict | None) -> str:
+    """Render content-free per-user delivery reliability for Runtime Health."""
+    if user_report is None:
+        return (
+            "<section><h2>用户交付可靠性</h2>"
+            "<div class='note-box'><b>用户交付可靠性暂时取不到。</b>"
+            "其余 Runtime 健康区块不受影响。</div></section>"
+        )
+
+    window_hours = _fmt_count(user_report.get("window_hours"))
+    users = user_report.get("users") or []
+    if not users:
+        empty = (
+            f"所选 {window_hours} 小时窗口没有用户指标或当前待交付项。"
+        )
+        delivery_rows = f"<tr><td colspan='7' class='muted'>{empty}</td></tr>"
+    else:
+        delivery_rows_list: list[str] = []
+
+        def _user_cell(raw_user_id) -> str:
+            user_id = str(raw_user_id or "unknown")
+            escaped_user_id = f"<code>{html.escape(user_id)}</code>"
+            if user_id == "unknown":
+                return escaped_user_id
+            qs = _data_track_qs()
+            qs_suffix = f"?{qs}" if qs else ""
+            href = f"/admin/data-track/users/{quote(user_id, safe='')}{qs_suffix}"
+            return (
+                f"<a href='{html.escape(href, quote=True)}'>"
+                f"{escaped_user_id}</a>"
+            )
+
+        def _effect_summary(effect: dict, *, include_discarded: bool) -> str:
+            effect = effect or {}
+            parts = [
+                f"applied {_fmt_count(effect.get('applied_in_window'))}",
+            ]
+            if include_discarded:
+                parts.append(f"discarded {_fmt_count(effect.get('discarded_in_window'))}")
+            parts.extend([
+                f"pending {_fmt_count(effect.get('pending'))}",
+                "needs_reconciliation "
+                f"{_fmt_count(effect.get('needs_reconciliation'))}",
+            ])
+            return " · ".join(parts)
+
+        def _failure_summary(failure: dict) -> str:
+            failure = failure or {}
+            return " · ".join([
+                "reply "
+                f"{_fmt_count(failure.get('reply_delivered_in_window'))}"
+                f" / {_fmt_count(failure.get('reply_undelivered'))}",
+                "status "
+                f"{_fmt_count(failure.get('status_delivered_in_window'))}"
+                f" / {_fmt_count(failure.get('status_undelivered'))}",
+                "error "
+                f"{_fmt_count(failure.get('runtime_error_delivered_in_window'))}"
+                f" / {_fmt_count(failure.get('runtime_error_undelivered'))}",
+            ])
+
+        for user in users:
+            user_cell = _user_cell(user.get("user_id"))
+            delivery = user.get("delivery") or {}
+            level = _runtime_user_delivery_level(delivery)
+            level_text = {"ok": "正常", "warn": "注意", "bad": "异常"}[level]
+            delivery_rows_list.append(
+                "<tr>"
+                f"<td>{user_cell}</td>"
+                f"<td><span class='pill {level}'>{level_text}</span></td>"
+                f"<td>{_effect_summary(delivery.get('reply_effects') or {}, include_discarded=False)}</td>"
+                f"<td>{_effect_summary(delivery.get('status_effects') or {}, include_discarded=False)}</td>"
+                f"<td>{_effect_summary(delivery.get('all_effects') or {}, include_discarded=True)}</td>"
+                f"<td>{_failure_summary(delivery.get('terminal_failure') or {})}</td>"
+                f"<td>{_fmt_duration_sec(delivery.get('oldest_unfinished_age_sec'))}</td>"
+                "</tr>"
+            )
+
+        delivery_rows = "".join(delivery_rows_list)
+
+    return f"""<section>
+  <h2>用户交付可靠性</h2>
+  <div class='note-box'>
+    <b>口径：</b>按 user_id 统计，不按真人/principal 合并；重新注册可能显示多行。
+    交付「ok 不代表客户端已读」：它只表示
+    服务端已完成可观测的 effect / failure 投递义务。当前 outstanding delivery
+    <b>不受所选时间窗口限制</b>，因此旧积压也会显示；applied/discarded 与 delivered
+    计数才跟随所选窗口。所有内容、prompt、reply 与 outbox payload 均不渲染。
+    Token / model 分析已移到独立的 <b>Usage / 模型用量</b> 页。
+  </div>
+  <table class="runtime-user-delivery">
+    <thead><tr><th>User</th><th>Reliability</th><th>Reply effects</th><th>Status effects</th><th>All effects</th><th>Failure reply/status/error</th><th>Oldest unfinished</th></tr></thead>
+    <tbody>{delivery_rows}</tbody>
+  </table>
+</section>"""
+
+
 # 本次新增的两个 Runtime 视图页共用这一份样式。刻意没有去改造既有 6 个视图页
 # 各自内联的 style——那是独立重构，不该混在功能改动里。
 # 普通字符串（非 f-string），花括号无需转义。
@@ -2754,6 +2888,7 @@ def _render_runtime_health_page(
     payload: dict,
     tokens: dict | None = None,
     delivery: dict | None = None,
+    user_report: dict | None = None,
 ) -> str:
     """Runtime V2 全 lane 运行时健康值班台（?view=runtime）。
 
@@ -2761,8 +2896,9 @@ def _render_runtime_health_page(
     （日报送达率，按天）。heartbeat lane 两页都出现但口径不同，故本页该行给出
     指向日报页的链接。
 
-    ``tokens`` / ``delivery`` 都可能是 None（各自独立的失败域，见 admin_core）：
-    取不到时该区块显「暂不可用」，不得把 None 渲染成 0——0 是"确认过是零"。
+    ``tokens`` / ``delivery`` / ``user_report`` 都可能是 None（各自独立的失败域，
+    见 admin_core）：取不到时对应区块显「暂不可用」，不得把 None 渲染成 0——0
+    是"确认过是零"。
     """
     level, reasons = _runtime_health_level(payload, delivery)
     window_hours = int(payload.get("window_hours") or 24)
@@ -2977,8 +3113,12 @@ def _render_runtime_health_page(
     # 回合（capture.open）、池里也没有 inflight/pending。若窗口内无终态 job 但
     # 有回合在飞，那不是"没数据"，是卡死的形状——I-3 的教训：之前这两种情形共
     # 用同一句"这不是故障"，把卡死误报成正常的空窗口。
-    no_terminal_samples = not any(int(l.get("sampled_jobs") or 0) for l in lanes)
-    total_open = sum(int((l.get("capture") or {}).get("open") or 0) for l in lanes)
+    no_terminal_samples = not any(
+        int(lane.get("sampled_jobs") or 0) for lane in lanes
+    )
+    total_open = sum(
+        int((lane.get("capture") or {}).get("open") or 0) for lane in lanes
+    )
     pool_inflight = int(pool.get("inflight") or 0)
     pool_pending = int(pool.get("pending") or 0)
     if not no_terminal_samples:
@@ -3049,6 +3189,7 @@ def _render_runtime_health_page(
     <thead><tr><th>Lane</th><th>样本</th><th>成功</th><th>失败</th><th>过期</th><th>superseded</th><th>失败率</th><th>p50(成功)</th><th>p95(成功)</th><th>捕获 见终态·无缺口/有缺口/漏写/在飞</th><th>token 入/出</th><th>缓存命中</th><th>上报 usage/cache</th></tr></thead>
     <tbody>{''.join(lane_rows) if lane_rows else "<tr><td colspan='13' class='muted'>当前窗口无 job。</td></tr>"}</tbody>
   </table>
+  {_render_runtime_user_report(user_report)}
   <h2>失败原因 Top</h2>
   <table>
     <thead><tr><th>Lane</th><th>失败码</th><th>次数</th></tr></thead>
@@ -3129,10 +3270,557 @@ def _data_track_page_href(**updates) -> str:
     return f"/admin/data-track?{qs_inner}" if qs_inner else "/admin/data-track"
 
 
-def _render_data_track_view_nav(active: str) -> str:
+def _usage_page_href(
+    query: admin_usage.UsageQuery | None = None,
+    *,
+    now_utc: datetime | None = None,
+    **updates,
+) -> str:
+    """Build a Usage link from its normalized whitelist, never raw args."""
+
+    if query is None:
+        query = admin_usage.parse_usage_query(request.args, now_utc=now_utc)
+    params = {
+        "preset": query.preset,
+        "timezone": query.timezone,
+        "completeness": query.completeness,
+    }
+    if query.start_date is not None:
+        params["start_date"] = query.start_date
+    if query.end_date is not None:
+        params["end_date"] = query.end_date
+    for key in ("user_id", "lane", "provider", "model"):
+        value = getattr(query, key)
+        if value is not None:
+            params[key] = value
+
+    allowed = {
+        "preset", "start_date", "end_date", "timezone", "user_id", "lane",
+        "provider", "model", "completeness",
+    }
+    for key, value in updates.items():
+        if key not in allowed:
+            continue
+        if value is None or value == "":
+            params.pop(key, None)
+        else:
+            params[key] = str(value)
+
+    normalized = admin_usage.parse_usage_query(
+        params,
+        now_utc=query.end_at_utc,
+    )
+    canonical = {
+        "view": "usage",
+        "preset": normalized.preset,
+        "timezone": normalized.timezone,
+        "completeness": normalized.completeness,
+    }
+    if normalized.start_date is not None:
+        canonical["start_date"] = normalized.start_date
+    if normalized.end_date is not None:
+        canonical["end_date"] = normalized.end_date
+    for key in ("user_id", "lane", "provider", "model"):
+        value = getattr(normalized, key)
+        if value is not None:
+            canonical[key] = value
+
+    try:
+        offset = int(updates.get("offset", 0))
+    except (TypeError, ValueError):
+        offset = 0
+    if offset > 0:
+        canonical["offset"] = str(min(offset, 1_000_000))
+    sort = str(updates.get("sort") or "").strip().lower()
+    if sort in {"tokens", "calls", "retries", "recent"}:
+        canonical["sort"] = sort
+        direction = str(updates.get("dir") or "desc").strip().lower()
+        canonical["dir"] = direction if direction in {"asc", "desc"} else "desc"
+    admin_key = str(request.args.get("admin_key") or "").strip()
+    if admin_key:
+        canonical["admin_key"] = admin_key
+    return f"/admin/data-track?{urlencode(canonical)}"
+
+
+def _usage_float(value, *, digits: int = 1) -> str:
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):,.{digits}f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _usage_timestamp(value) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return str(value)
+
+
+def _usage_filter_options(values, selected: str | None) -> str:
+    normalized = [str(value) for value in (values or [])]
+    if selected and selected not in normalized:
+        normalized.insert(0, selected)
+    options = ["<option value=''>All</option>"]
+    for value in normalized:
+        marker = " selected" if value == selected else ""
+        escaped = html.escape(value, quote=True)
+        options.append(f"<option value='{escaped}'{marker}>{escaped}</option>")
+    return "".join(options)
+
+
+def _usage_user_href(
+    query: admin_usage.UsageQuery,
+    user_id: str,
+    **updates,
+) -> str:
+    canonical = _usage_page_href(query, user_id=user_id, **updates)
+    _, _, query_string = canonical.partition("?")
+    path = f"/admin/data-track/users/{quote(user_id, safe='')}"
+    return f"{path}?{query_string}" if query_string else path
+
+
+def _usage_sorted_users(report: dict) -> tuple[list[dict], int, int]:
+    source_rows = report.get("users")
+    rows = list(source_rows or [])
+    sort = str(request.args.get("sort") or "tokens").strip().lower()
+    if sort not in {"tokens", "calls", "retries", "recent"}:
+        sort = "tokens"
+    direction = str(request.args.get("dir") or "desc").strip().lower()
+    if direction not in {"asc", "desc"}:
+        direction = "desc"
+
+    def sortable(row: dict):
+        if sort == "recent":
+            raw = row.get("last_model_call_at")
+            if isinstance(raw, datetime):
+                if raw.tzinfo is None:
+                    raw = raw.replace(tzinfo=timezone.utc)
+                return raw.timestamp()
+            return None
+        key = {"tokens": "total_tokens", "calls": "model_calls", "retries": "retries"}[sort]
+        value = row.get(key)
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    # Sort the deterministic user_id tie-break first, then stably sort only the
+    # known metric rows.  ``reverse=True`` on a compound key would reverse the
+    # user_id tie-break as well; sentinel numbers would also put unknown values
+    # first for ascending order.  Unknown is always last in either direction.
+    rows.sort(key=lambda row: str(row.get("user_id") or ""))
+    known = [row for row in rows if sortable(row) is not None]
+    unknown = [row for row in rows if sortable(row) is None]
+    known.sort(key=sortable, reverse=direction == "desc")
+    rows = known + unknown
+    try:
+        offset = max(int(request.args.get("offset") or 0), 0)
+    except (TypeError, ValueError):
+        offset = 0
+    if not rows:
+        offset = 0
+    elif offset >= len(rows):
+        offset = ((len(rows) - 1) // 100) * 100
+    return rows[offset:offset + 100], offset, len(rows)
+
+
+def _render_usage_page(
+    report: dict,
+    query: admin_usage.UsageQuery,
+    *,
+    drilldown_user_id: str | None = None,
+) -> str:
+    overview = report.get("overview") or {}
+    averages = report.get("averages") or {}
+    coverage = report.get("coverage") or {}
+    filters_available = report.get("filters") is not None
+    filters = report.get("filters") or {}
+    dimension_filtered = bool(
+        query.lane
+        or query.provider
+        or query.model
+        or query.completeness != "all"
+    )
+
+    def page_href(**updates) -> str:
+        if drilldown_user_id:
+            return _usage_user_href(query, drilldown_user_id, **updates)
+        return _usage_page_href(query, **updates)
+
+    preset_links = []
+    for preset in ("24h", "7d", "30d", "90d"):
+        cls = "sort-button active" if query.preset == preset else "sort-button"
+        href = page_href(preset=preset, start_date=None, end_date=None, offset=0)
+        preset_links.append(
+            f"<a class='{cls}' href='{html.escape(href, quote=True)}'>{preset}</a>"
+        )
+    admin_key = html.escape(str(request.args.get("admin_key") or ""), quote=True)
+    custom_start = html.escape(str(query.start_date or ""), quote=True)
+    custom_end = html.escape(str(query.end_date or ""), quote=True)
+    timezone_name = html.escape(query.timezone, quote=True)
+    user_id_value = html.escape(str(query.user_id or ""), quote=True)
+    form_action = "/admin/data-track"
+    user_filter = f"<label>User ID<input name='user_id' value='{user_id_value}'></label>"
+    if drilldown_user_id:
+        form_action = f"/admin/data-track/users/{quote(drilldown_user_id, safe='')}"
+        user_filter = (
+            "<input type='hidden' name='user_id' "
+            f"value='{html.escape(drilldown_user_id, quote=True)}'>"
+        )
+    form_action = html.escape(form_action, quote=True)
+    preset_options = "".join(
+        f"<option value='{preset}'{' selected' if query.preset == preset else ''}>{preset}</option>"
+        for preset in ("24h", "7d", "30d", "90d", "custom")
+    )
+    filter_form = f"""
+  <form class='usage-filters' method='get' action='{form_action}'>
+    <input type='hidden' name='view' value='usage'>
+    <input type='hidden' name='admin_key' value='{admin_key}'>
+    <label>Window<select name='preset'>{preset_options}</select></label>
+    <label>Start date<input name='start_date' type='date' value='{custom_start}'></label>
+    <label>End date<input name='end_date' type='date' value='{custom_end}'></label>
+    <label>Timezone<input name='timezone' value='{timezone_name}'></label>
+    {user_filter}
+    <label>Lane<select name='lane'>{_usage_filter_options(filters.get('lanes'), query.lane)}</select></label>
+    <label>Provider<select name='provider'>{_usage_filter_options(filters.get('providers'), query.provider)}</select></label>
+    <label>Model<select name='model'>{_usage_filter_options(filters.get('models'), query.model)}</select></label>
+    <label>Completeness<select name='completeness'>
+      <option value='all'{" selected" if query.completeness == "all" else ""}>All</option>
+      <option value='metered'{" selected" if query.completeness == "metered" else ""}>Metered</option>
+      <option value='unknown'{" selected" if query.completeness == "unknown" else ""}>Unknown</option>
+    </select></label>
+    <button type='submit'>Apply range / filters</button>
+  </form>"""
+
+    reference_metrics = "".join([
+        _render_metric("Registered reference", _fmt_count(overview.get("registered_accounts"))),
+        _render_metric("Activated reference", _fmt_count(overview.get("activated_users"))),
+        _render_metric("Installations", "unavailable until self-host phase"),
+    ])
+    usage_metrics = "".join([
+        _render_metric("Model-active users", _fmt_count(overview.get("model_active_users"))),
+        _render_metric("Metered users", _fmt_count(overview.get("metered_users"))),
+        _render_metric("Active user-days", _fmt_count(overview.get("active_user_days"))),
+        _render_metric("Turns", _fmt_count(overview.get("turns"))),
+        _render_metric("Model calls", _fmt_count(overview.get("model_calls"))),
+        _render_metric("Retries", _fmt_count(overview.get("retries"))),
+        _render_metric("Failed turns", _fmt_count(overview.get("failed_turns"))),
+        _render_metric("Prompt tokens", _fmt_count(overview.get("prompt_tokens"))),
+        _render_metric("Completion tokens", _fmt_count(overview.get("completion_tokens"))),
+        _render_metric("Known total tokens", _fmt_count(overview.get("total_tokens"))),
+        _render_metric("Cache read / write / miss", " / ".join([
+            _fmt_count(overview.get("cache_read_tokens")),
+            _fmt_count(overview.get("cache_write_tokens")),
+            _fmt_count(overview.get("cache_miss_tokens")),
+        ])),
+        _render_metric("Unknown usage calls", _fmt_count(overview.get("unknown_usage_calls"))),
+        _render_metric("Usage coverage", _fmt_ratio(coverage.get("usage_coverage"))),
+        _render_metric("Cache coverage", _fmt_ratio(coverage.get("cache_coverage"))),
+    ])
+    activated_average = averages.get("tokens_per_activated_user_day")
+    activated_average_text = (
+        "not applicable for filtered cohort"
+        if activated_average is None and dimension_filtered
+        else _usage_float(activated_average)
+    )
+    distribution_available = averages.get("user_day_tokens") is not None
+    distribution = averages.get("user_day_tokens") or {}
+    average_metrics = "".join([
+        _render_metric("Tokens / calendar day", _usage_float(averages.get("tokens_per_calendar_day"))),
+        _render_metric("Tokens / active user-day", _usage_float(averages.get("tokens_per_active_user_day"))),
+        _render_metric("Tokens / activated user-day", activated_average_text),
+        _render_metric("Tokens / metered turn", _usage_float(averages.get("tokens_per_metered_turn"))),
+        _render_metric("User-day p50 / p75", f"{_usage_float(distribution.get('p50'))} / {_usage_float(distribution.get('p75'))}"),
+        _render_metric("User-day p90 / p95 / max", f"{_usage_float(distribution.get('p90'))} / {_usage_float(distribution.get('p95'))} / {_usage_float(distribution.get('max'))}"),
+        _render_metric("Model calls / turn", _usage_float(averages.get("model_calls_per_turn"), digits=2)),
+        _render_metric("Retries / turn", _usage_float(averages.get("retries_per_turn"), digits=2)),
+    ])
+
+    daily_rows = []
+    daily_available = report.get("daily") is not None
+    daily = report.get("daily") or []
+    max_daily_tokens = max(
+        (int(row.get("total_tokens") or 0) for row in daily), default=0
+    )
+    for row in daily:
+        total = row.get("total_tokens")
+        width = (float(total) * 100 / max_daily_tokens) if total is not None and max_daily_tokens else 0
+        daily_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('local_day') or ''))}</td>"
+            f"<td>{_fmt_count(total)}<div class='usage-bar'><span style='width:{width:.1f}%'></span></div></td>"
+            f"<td>{_fmt_count(row.get('model_active_users'))}</td>"
+            f"<td>{_usage_float(row.get('tokens_per_active_user_day'))}</td>"
+            f"<td>{_usage_float(row.get('tokens_per_metered_turn'))}</td>"
+            f"<td>{_fmt_count(row.get('model_calls'))}</td>"
+            f"<td>{_fmt_count(row.get('retries'))}</td>"
+            f"<td>{_fmt_count(row.get('failed_turns'))}</td>"
+            f"<td>{_fmt_ratio(row.get('usage_coverage'))} / {_fmt_ratio(row.get('cache_coverage'))}</td>"
+            "</tr>"
+        )
+
+    users_available = report.get("users") is not None
+    user_rows, user_offset, user_total = _usage_sorted_users(report)
+    rendered_users = []
+    for row in user_rows:
+        raw_user_id = str(row.get("user_id") or "unknown")
+        user_label = f"<code>{html.escape(raw_user_id)}</code>"
+        if raw_user_id != "unknown":
+            href = _usage_user_href(query, raw_user_id)
+            user_label = f"<a href='{html.escape(href, quote=True)}'>{user_label}</a>"
+        rendered_users.append(
+            "<tr>"
+            f"<td>{user_label}</td>"
+            f"<td>{html.escape(_usage_timestamp(row.get('last_model_call_at')))}</td>"
+            f"<td>{_fmt_count(row.get('active_days'))}</td>"
+            f"<td>{_fmt_count(row.get('turns'))} / {_fmt_count(row.get('model_calls'))} / {_fmt_count(row.get('retries'))} / {_fmt_count(row.get('failed_turns'))}</td>"
+            f"<td>{_fmt_count(row.get('prompt_tokens'))} / {_fmt_count(row.get('completion_tokens'))} / {_fmt_count(row.get('total_tokens'))}</td>"
+            f"<td>{_fmt_count(row.get('cache_read_tokens'))} / {_fmt_count(row.get('cache_write_tokens'))} / {_fmt_count(row.get('cache_miss_tokens'))}</td>"
+            f"<td>{_usage_float(row.get('tokens_per_calendar_day'))} / {_usage_float(row.get('tokens_per_active_day'))}</td>"
+            f"<td>{_usage_float(row.get('daily_p50'))} / {_usage_float(row.get('daily_p95'))}</td>"
+            f"<td>{_usage_float(row.get('tokens_per_metered_turn'))}</td>"
+            f"<td>{html.escape(str(row.get('primary_provider') or 'unknown'))} / {html.escape(str(row.get('primary_model') or 'unknown'))}</td>"
+            f"<td>{_fmt_ratio(row.get('usage_coverage'))} / {_fmt_ratio(row.get('cache_coverage'))} / {_fmt_count(row.get('unknown_usage_calls'))}</td>"
+            f"<td>{_fmt_ratio(row.get('known_token_share'))}</td>"
+            "</tr>"
+        )
+    sort_links = []
+    active_sort = str(request.args.get("sort") or "tokens").strip().lower()
+    active_dir = str(request.args.get("dir") or "desc").strip().lower()
+    for key, label in (("tokens", "Known token"), ("calls", "Calls"), ("retries", "Retries"), ("recent", "Recent")):
+        next_dir = "asc" if key == active_sort and active_dir == "desc" else "desc"
+        href = page_href(sort=key, dir=next_dir, offset=0)
+        cls = "sort-button active" if key == active_sort else "sort-button"
+        sort_links.append(f"<a class='{cls}' href='{html.escape(href, quote=True)}'>{label}</a>")
+    pager = []
+    if user_offset:
+        href = page_href(sort=active_sort, dir=active_dir, offset=max(0, user_offset - 100))
+        pager.append(f"<a class='sort-button' href='{html.escape(href, quote=True)}'>Prev</a>")
+    if user_offset + len(user_rows) < user_total:
+        href = page_href(sort=active_sort, dir=active_dir, offset=user_offset + 100)
+        pager.append(f"<a class='sort-button' href='{html.escape(href, quote=True)}'>Next</a>")
+
+    models_available = report.get("models") is not None
+    model_rows = []
+    for row in report.get("models") or []:
+        model_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('provider') or 'unknown'))}</td>"
+            f"<td>{html.escape(str(row.get('model') or 'unknown'))}</td>"
+            f"<td>{_fmt_count(row.get('users'))}</td>"
+            f"<td>{_fmt_count(row.get('turns'))} / {_fmt_count(row.get('model_calls'))} / {_fmt_count(row.get('retries'))}</td>"
+            f"<td>{_fmt_count(row.get('failed_turns'))} / {_fmt_ratio(row.get('failure_rate'))} / {_fmt_ratio(row.get('retry_rate'))}</td>"
+            f"<td>{_fmt_count(row.get('prompt_tokens'))} / {_fmt_count(row.get('completion_tokens'))} / {_fmt_count(row.get('total_tokens'))}</td>"
+            f"<td>{_fmt_count(row.get('cache_read_tokens'))} / {_fmt_count(row.get('cache_write_tokens'))} / {_fmt_count(row.get('cache_miss_tokens'))}</td>"
+            f"<td>{_usage_float(row.get('tokens_per_call'))}</td>"
+            f"<td>{_fmt_duration_sec((row.get('latency_ms_p50') or 0) / 1000 if row.get('latency_ms_p50') is not None else None)} / {_fmt_duration_sec((row.get('latency_ms_p95') or 0) / 1000 if row.get('latency_ms_p95') is not None else None)}</td>"
+            f"<td>{_fmt_ratio(row.get('usage_coverage'))} / {_fmt_ratio(row.get('cache_coverage'))}</td>"
+            "</tr>"
+        )
+
+    lanes_available = report.get("lanes") is not None
+    lane_rows = []
+    for row in report.get("lanes") or []:
+        lane_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('lane') or 'unknown'))}</td>"
+            f"<td>{_fmt_count(row.get('users'))}</td>"
+            f"<td>{_fmt_count(row.get('turns'))} / {_fmt_count(row.get('model_calls'))} / {_fmt_count(row.get('retries'))}</td>"
+            f"<td>{_fmt_count(row.get('failed_turns'))} / {_fmt_ratio(row.get('failure_rate'))} / {_fmt_ratio(row.get('retry_rate'))}</td>"
+            f"<td>{_fmt_count(row.get('prompt_tokens'))} / {_fmt_count(row.get('completion_tokens'))} / {_fmt_count(row.get('total_tokens'))}</td>"
+            f"<td>{_fmt_count(row.get('cache_read_tokens'))} / {_fmt_count(row.get('cache_write_tokens'))} / {_fmt_count(row.get('cache_miss_tokens'))}</td>"
+            f"<td>{_fmt_ratio(row.get('usage_coverage'))} / {_fmt_ratio(row.get('cache_coverage'))}</td>"
+            "</tr>"
+        )
+
+    cohort = coverage.get("reference_cohort") or {}
+    rollup = coverage.get("rollup")
+    if rollup:
+        lag = rollup.get("source_lag_seconds")
+        lag_text = "unknown" if lag is None else _fmt_duration_sec(float(lag))
+        error = rollup.get("last_error")
+        error_text = (
+            f" · last error {html.escape(str(error))} at "
+            f"{html.escape(str(rollup.get('last_error_at') or 'unknown'))}"
+            if error
+            else ""
+        )
+        rollup_freshness = (
+            "<div class='note-box'><b>Rollup freshness:</b> "
+            f"mode {html.escape(str(rollup.get('mode') or 'unknown'))} · "
+            f"refreshed {html.escape(str(rollup.get('refreshed_at') or 'unknown'))} · "
+            f"processed ({html.escape(str(rollup.get('processed_updated_at') or 'unknown'))}, "
+            f"{html.escape(str(rollup.get('processed_id') if rollup.get('processed_id') is not None else 'unknown'))}) · "
+            f"source observed {html.escape(str(rollup.get('source_observed_updated_at') or 'unknown'))} · "
+            f"lag {lag_text} · raw days {_fmt_count(len(rollup.get('raw_days') or []))} · "
+            f"rollup days {_fmt_count(len(rollup.get('rollup_days') or []))}"
+            f"{error_text}</div>"
+        )
+    else:
+        rollup_freshness = (
+            "<div class='note-box'><b>Rollup freshness:</b> unavailable; "
+            "freshness and lag are unknown, not zero.</div>"
+        )
+    drilldown = ""
+    if drilldown_user_id:
+        back_href = _usage_page_href(query, user_id=None, offset=0)
+        drilldown = (
+            "<div class='note-box'><b>单用户钻取：</b>"
+            f"<code>{html.escape(drilldown_user_id)}</code> · "
+            f"<a href='{html.escape(back_href, quote=True)}'>返回全体用户</a></div>"
+        )
+    daily_body = (
+        "".join(daily_rows)
+        if daily_rows
+        else (
+            "<tr><td colspan='9' class='muted'>窗口内无日期。</td></tr>"
+            if daily_available
+            else "<tr><td colspan='9' class='muted'>每日趋势暂时取不到；其他区块仍可用。</td></tr>"
+        )
+    )
+    user_body = (
+        "".join(rendered_users)
+        if rendered_users
+        else (
+            "<tr><td colspan='12' class='muted'>当前 cohort 无用户用量。</td></tr>"
+            if users_available
+            else "<tr><td colspan='12' class='muted'>Per-user Usage 暂时取不到；其他区块仍可用。</td></tr>"
+        )
+    )
+    model_body = (
+        "".join(model_rows)
+        if model_rows
+        else (
+            "<tr><td colspan='10' class='muted'>当前 cohort 无 provider/model 数据。</td></tr>"
+            if models_available
+            else "<tr><td colspan='10' class='muted'>Provider / Model 暂时取不到；其他区块仍可用。</td></tr>"
+        )
+    )
+    lane_body = (
+        "".join(lane_rows)
+        if lane_rows
+        else (
+            "<tr><td colspan='7' class='muted'>当前 cohort 无 lane 数据。</td></tr>"
+            if lanes_available
+            else "<tr><td colspan='7' class='muted'>Lane breakdown 暂时取不到；其他区块仍可用。</td></tr>"
+        )
+    )
+    lane_section = ""
+    if drilldown_user_id:
+        lane_section = f"""
+  <h2>Lane breakdown</h2>
+  <div class='table-wrap'><table><thead><tr><th>Lane</th><th>Users</th><th>Turns / calls / retries</th><th>Failed / failure / retry rate</th><th>Prompt / completion / total</th><th>Cache R / W / M</th><th>Usage / cache coverage</th></tr></thead>
+  <tbody>{lane_body}</tbody></table></div>"""
+    optional_note_parts = []
+    if not filters_available:
+        optional_note_parts.append("筛选候选项暂时取不到，当前已选筛选仍然生效。")
+    if not distribution_available:
+        optional_note_parts.append("User-day 分位数暂时取不到。")
+    optional_note = (
+        f"<div class='note-box'>{html.escape(' '.join(optional_note_parts))}</div>"
+        if optional_note_parts
+        else ""
+    )
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset='utf-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <title>Usage / 模型用量 · Feedling Data Track</title>
+  <style>{_RUNTIME_PAGE_CSS}
+    .usage-filters {{ display:flex; flex-wrap:wrap; gap:10px; align-items:end; margin:14px 0 20px; }}
+    .usage-filters label {{ display:flex; flex-direction:column; gap:4px; color:var(--muted); font-size:12px; }}
+    .usage-filters input,.usage-filters select,.usage-filters button {{ min-height:34px; box-sizing:border-box; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); padding:6px 8px; }}
+    .usage-filters button {{ color:#fff; background:var(--accent); cursor:pointer; }}
+    .usage-bar {{ width:90px; height:4px; margin-top:4px; background:#eee3d9; border-radius:2px; overflow:hidden; }}
+    .usage-bar span {{ display:block; height:100%; background:var(--accent); }}
+    .table-wrap {{ overflow-x:auto; }}
+  </style>
+</head>
+<body><main>
+  <h1>Usage / 模型用量</h1>
+  <div class='muted'>Hosted Runtime V2 whole-turn telemetry · UTC range
+    {html.escape(query.start_at_utc.isoformat())} — {html.escape(query.end_at_utc.isoformat())} · display timezone {timezone_name}.</div>
+  {_render_data_track_view_nav('usage', query, drilldown_user_id)}
+  <div class='sortbar'>{''.join(preset_links)}</div>
+  {filter_form}
+  {drilldown}
+  <h2>Fleet Overview · reference cohort</h2>
+  <section class='metrics'>{reference_metrics}</section>
+  <h2>Fleet Overview · filtered usage</h2>
+  <section class='metrics'>{usage_metrics}</section>
+  <h2>平均值</h2>
+  <section class='metrics'>{average_metrics}</section>
+  {optional_note}
+  <div class='note-box'><b>P0-A 边界：</b>Reasoning tokens、possibly-billed attempts 与 authoritative cost 均 <b>unavailable until P0-B</b>，不会显示成零。Prompt token 已包含 cache token，不能重复相加。</div>
+  <h2>每日趋势</h2>
+  <div class='table-wrap'><table><thead><tr><th>Local day</th><th>Known tokens</th><th>Active users</th><th>Tokens / active user-day</th><th>Tokens / metered turn</th><th>Calls</th><th>Retries</th><th>Failed</th><th>Usage / cache coverage</th></tr></thead>
+  <tbody>{daily_body}</tbody></table></div>
+  <h2>Per-user Usage</h2>
+  <div class='sortbar'>{''.join(sort_links)} {''.join(pager)}<span class='muted'>Showing {user_offset + 1 if user_rows else 0}–{user_offset + len(user_rows)} of {user_total}</span></div>
+  <div class='table-wrap'><table><thead><tr><th>User</th><th>Last model call (UTC)</th><th>Active days</th><th>Turns / calls / retries / failed</th><th>Prompt / completion / total</th><th>Cache R / W / M</th><th>Calendar / active-day avg</th><th>Daily p50 / p95</th><th>Tokens / metered turn</th><th>Primary provider / model</th><th>Usage / cache / unknown</th><th>Known share</th></tr></thead>
+  <tbody>{user_body}</tbody></table></div>
+  <h2>Provider / Model</h2>
+  <div class='muted'>Identity 是 whole-turn resolved / best-known；requested 与 resolved 将在 P0-B attempt ledger 分开。</div>
+  <div class='table-wrap'><table><thead><tr><th>Provider</th><th>Model</th><th>Users</th><th>Turns / calls / retries</th><th>Failed / failure / retry rate</th><th>Prompt / completion / total</th><th>Cache R / W / M</th><th>Tokens / call</th><th>Latency p50 / p95</th><th>Usage / cache coverage</th></tr></thead>
+  <tbody>{model_body}</tbody></table></div>
+  {lane_section}
+  <h2>数据覆盖与边界</h2>
+  {rollup_freshness}
+  <div class='note-box'>Usage {_fmt_count(coverage.get('usage_reported_calls'))} / {_fmt_count(coverage.get('model_calls'))} ({_fmt_ratio(coverage.get('usage_coverage'))}) · Cache {_fmt_count(coverage.get('cache_reported_calls'))} / {_fmt_count(coverage.get('model_calls'))} ({_fmt_ratio(coverage.get('cache_coverage'))}) · Cache hit {_fmt_ratio(coverage.get('cache_hit_ratio'))}.<br>
+  参考 cohort basis: <code>{html.escape(str(cohort.get('basis') or 'unknown'))}</code>；unparseable registrations {_fmt_count(cohort.get('unparseable_registered_rows'))}，legacy memory timestamps {_fmt_count(cohort.get('legacy_memory_rows_without_valid_created_at'))}。{html.escape(str(cohort.get('limitation') or ''))}<br>
+  仅统计本实例 Hosted Runtime V2；self-host 与 installation 级统计 unavailable until self-host phase。Unknown 是缺报，不是零。</div>
+</main></body></html>"""
+
+
+def _render_usage_error_page(
+    query: admin_usage.UsageQuery,
+    *,
+    drilldown_user_id: str | None = None,
+) -> str:
+    drilldown = (
+        f"<div class='muted'>Requested user: <code>{html.escape(drilldown_user_id)}</code></div>"
+        if drilldown_user_id else ""
+    )
+    return f"""<!doctype html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Usage / 模型用量 · Feedling Data Track</title><style>{_RUNTIME_PAGE_CSS}</style></head>
+<body><main><h1>Usage / 模型用量</h1>{_render_data_track_view_nav('usage', query, drilldown_user_id)}
+<div class='note-box'><b>Usage 数据暂时取不到。</b>仅本页降级；Runtime 健康和其他 Admin 视图不受影响。具体异常见后端日志。</div>
+{drilldown}<div class='muted'>Requested UTC range {html.escape(query.start_at_utc.isoformat())} — {html.escape(query.end_at_utc.isoformat())}.</div>
+</main></body></html>"""
+
+
+def _render_data_track_view_nav(
+    active: str,
+    usage_query: admin_usage.UsageQuery | None = None,
+    usage_drilldown_user_id: str | None = None,
+) -> str:
     def nav_item(view: str, label: str) -> str:
         cls = "sort-button active" if active == view else "sort-button"
-        href = _data_track_page_href(view=None if view == "users" else view, offset=0)
+        if view == "usage":
+            if usage_drilldown_user_id:
+                href = _usage_user_href(
+                    usage_query,
+                    usage_drilldown_user_id,
+                    offset=0,
+                )
+            else:
+                href = _usage_page_href(usage_query, offset=0)
+        else:
+            href = _data_track_page_href(
+                view=None if view == "users" else view,
+                offset=0,
+                # A Usage drill-down's user_id belongs to its analytics cohort.
+                # Do not leak it into unrelated views where user_id has another
+                # meaning (or is silently ignored).
+                user_id=None if active == "usage" else request.args.get("user_id"),
+            )
         return f"<a class='{cls}' href='{html.escape(href, quote=True)}'>{html.escape(label)}</a>"
 
     return (
@@ -3143,6 +3831,7 @@ def _render_data_track_view_nav(active: str) -> str:
         f"{nav_item('proactive', 'Proactive 日报')}"
         f"{nav_item('events', '事件健康度')}"
         f"{nav_item('runtime', 'Runtime 健康')}"
+        f"{nav_item('usage', 'Usage / 模型用量')}"
         f"{nav_item('debug', 'Debug')}"
         "</div>"
     )
