@@ -182,10 +182,16 @@ PARAMS: dict[str, dict] = {
 
     # -- wake.py (backed by proactive/scheduled_wake_v2.py) --
     # wake.schedule: params.get("at") (required, ISO-ish time string), optional
-    # "tz" and "reason" strings. NOTE: the field is "at", not "when".
+    # "tz" / "reason" strings and repeat=daily|weekly. NOTE: the field is
+    # "at", not "when".
     "schedule_wake": {
         "type": "object",
-        "properties": {"at": _STR, "tz": _STR, "reason": _STR},
+        "properties": {
+            "at": _STR,
+            "tz": _STR,
+            "reason": _STR,
+            "repeat": {"type": "string", "enum": ["daily", "weekly"]},
+        },
         "required": ["at"],
     },
     # wake.cancel: params.get("wake_id") or params.get("id") (required), optional
@@ -318,7 +324,9 @@ DESCRIPTIONS: dict[str, str] = {
     "photo_read": "Read a specific photo by id, optionally including its decrypted image.",
     "web_search": "Search the live public web for current information such as news, weather, prices, or recent events, or anything past your training data that you are not sure is current. Prefer this over guessing or telling the user you cannot access the internet.",
     "web_fetch": "Fetch a specific URL and return its main text content. Use when the user provides a link, or to read a page found through web_search.",
-    "schedule_wake": "Schedule a future self-wake at a given time, with optional timezone and reason.",
+    "schedule_wake": ("Schedule a future self-wake at a given time, with optional "
+                      "timezone, reason, and repeat ('daily' every 24 hours or "
+                      "'weekly' every 7 days)."),
     "cancel_wake": "Cancel a previously scheduled self-wake by its wake_id.",
     "workspace_list": ("List encrypted virtual workspace entries and revisions. "
                        "Namespaces are /artifacts (read-only), /skills (read-only), "

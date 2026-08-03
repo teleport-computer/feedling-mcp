@@ -1462,6 +1462,7 @@ def test_read_scheduled_wake_context_returns_notes_and_confirmed_metadata_for_on
             "task_id": "timer-1",
             "next_trigger_at": "2026-07-27T08:00:00",
             "timezone": "Asia/Shanghai",
+            "repeat": "",
             "fired_at": 0.0,
         },
         {
@@ -1471,6 +1472,7 @@ def test_read_scheduled_wake_context_returns_notes_and_confirmed_metadata_for_on
             "task_id": "timer-2",
             "next_trigger_at": "2026-07-27T08:00:00",
             "timezone": "Asia/Shanghai",
+            "repeat": "",
             "fired_at": 0.0,
         },
     ]

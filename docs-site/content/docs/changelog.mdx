@@ -10,6 +10,13 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- **Scheduled reminders can repeat daily or weekly.** The model-facing
+  `schedule_wake` tool accepts `repeat: "daily"` or `repeat: "weekly"` and uses
+  fixed 24-hour or 7-day intervals. Identical pending reminders are deduplicated
+  by trigger instant and repeat mode, each successful trigger publishes a new
+  pending `wake_id`, and `cancel_wake` stops the complete repeating series.
+  One-time reminders remain unchanged.
+
 - **Hosted Genesis memory imports no longer fail provenance validation or
   complete after every card was rejected.** `genesis_import` is now a published
   `capture_mode` for `POST /v1/memory/actions`, matching the existing memory

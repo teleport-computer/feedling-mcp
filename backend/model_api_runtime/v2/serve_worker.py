@@ -1578,6 +1578,7 @@ def _read_scheduled_wake_context(user_id: str, job_id: int) -> list[dict]:
             "task_id": str(record.timer_id or ""),
             "next_trigger_at": str(record.at or ""),
             "timezone": str(record.timezone or ""),
+            "repeat": str(record.repeat or ""),
             "fired_at": float(record.fired_at or 0.0),
         })
         if len(context) >= 10:
@@ -2907,8 +2908,9 @@ def _sink_schedule(user_id: str, payload: dict) -> object:
     1. Worker's write-tool-call mapping (`worker.process_job`'s
        `_enqueue_write_effect`, spec C6): a `schedule_wake`/`cancel_wake` tool
        call becomes ``{"op": tc.name, **tc.args}`` — the user CAPABILITY params
-       (``at``/``tz``/``reason`` for schedule_wake, ``wake_id``/``reason`` for
-       cancel_wake; see `capabilities/wake.py`'s `schedule`/`cancel`). When
+       (``at``/``tz``/``reason``/``repeat`` for schedule_wake,
+       ``wake_id``/``reason`` for cancel_wake; see `capabilities/wake.py`'s
+       `schedule`/`cancel`). When
        ``payload["op"]`` names one of these, route through
        `cap_registry.run_capability` — the same dispatcher
        `_sink_identity`/executor already use for capability writes — so the
