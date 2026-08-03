@@ -1,13 +1,13 @@
 """Enforce one processing plaintext Genesis import per user.
 
-Revision ID: 0074_plaintext_job_exclusivity
-Revises: 0073_merge_tail_anchor_deepseek
+Revision ID: 0076_plaintext_job_exclusivity
+Revises: 0075_v2_usage_rollup
 """
 
 from alembic import op
 
-revision = "0074_plaintext_job_exclusivity"
-down_revision = "0073_merge_tail_anchor_deepseek"
+revision = "0076_plaintext_job_exclusivity"
+down_revision = "0075_v2_usage_rollup"
 branch_labels = None
 depends_on = None
 
@@ -24,7 +24,7 @@ WITH ranked AS (
 )
 UPDATE genesis_import_jobs g
 SET status = 'failed',
-    error = 'superseded_by_migration_0074_plaintext_exclusivity',
+    error = 'superseded_by_migration_0076_plaintext_exclusivity',
     updated_at = now()
 FROM ranked
 WHERE g.user_id = ranked.user_id

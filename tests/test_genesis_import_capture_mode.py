@@ -34,6 +34,9 @@ def _setup_plaintext_job(monkeypatch, *, job_id: str):
     monkeypatch.setattr(plaintext, "_write_back_plaintext_user_name", lambda *_args: None)
     monkeypatch.setattr(plaintext, "_trace_genesis", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "load_genesis_checkpoint", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "write_genesis_checkpoint", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "delete_genesis_checkpoint", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         plaintext.worker,
         "build_foreground_output_from_texts",
@@ -96,7 +99,7 @@ def test_plaintext_genesis_import_persists_memory_card_in_postgres(monkeypatch):
     _run_add_memory(store, job_id)
 
     job = db.genesis_get_job(user_id, job_id)
-    assert job["status"] == "done"
+    assert job["status"] == "done", job
     assert job["memory_action_count"] == 1
     moments = db.memory_load(user_id)
     assert len(moments) == 1
