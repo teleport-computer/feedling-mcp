@@ -313,8 +313,10 @@ receive only a fixed boolean glance describing domain availability and whether
 that glance changed. Scheduled wake remains reminder-only. Screen watch retains
 only its isolated safe screen-count metadata, while a perception-triggered
 heartbeat receives only its allowlisted event type. Raw change digests,
-presence hints, origin references, exact readings, private text, and internal
-glance fingerprints never enter model-visible runtime data.
+presence hints, origin references, and internal glance fingerprints never
+enter model-visible runtime data. Exact readings and private text do not enter
+the initial prompt; they become model-visible only through an authorized tool
+read.
 
 Exact device, environment, activity, health, calendar, reminder, photo, and
 shared-screen data cross the decrypt boundary only through an authorized tool
