@@ -111,6 +111,7 @@ def test_0077_installs_exact_attempt_rollup_grains_and_durable_cursors():
             "refreshed_at",
         } <= set(dimension_columns)
         assert dimension_columns["ttft_samples"] == "ARRAY"
+        assert "id" not in dimension_columns
 
         membership_columns = {
             row[0]
@@ -133,6 +134,26 @@ def test_0077_installs_exact_attempt_rollup_grains_and_durable_cursors():
             "missing_inner_ordinals",
             "refreshed_at",
         } <= membership_columns
+        assert "id" not in membership_columns
+
+        for table in (
+            "llm_usage_daily_attempt_dimensions",
+            "llm_usage_daily_call_memberships",
+        ):
+            assert conn.execute(
+                "SELECT count(*) FROM information_schema.table_constraints "
+                "WHERE table_schema='public' AND table_name=%s "
+                "AND constraint_type='PRIMARY KEY'",
+                (table,),
+            ).fetchone() == (0,)
+            assert conn.execute(
+                "SELECT count(*) FROM pg_class seq "
+                "JOIN pg_depend dep ON dep.objid=seq.oid "
+                "JOIN pg_class tbl ON tbl.oid=dep.refobjid "
+                "JOIN pg_namespace ns ON ns.oid=tbl.relnamespace "
+                "WHERE seq.relkind='S' AND ns.nspname='public' AND tbl.relname=%s",
+                (table,),
+            ).fetchone() == (0,)
 
         watermark_columns = {
             row[0]
@@ -315,6 +336,25 @@ def test_0077_concurrent_indexes_have_exact_recoverable_shapes():
             ).fetchone() == (True,)
 
 
+def test_0077_schema_phase_restart_does_not_create_surrogate_sequences():
+    """Replaying the committed schema phase must preserve natural-grain storage."""
+    migration = _migration_module()
+    with db.get_pool().connection() as conn:
+        conn.execute(migration._SCHEMA_UP)
+        assert conn.execute(
+            "SELECT count(*) FROM pg_class seq "
+            "JOIN pg_depend dep ON dep.objid=seq.oid "
+            "JOIN pg_class tbl ON tbl.oid=dep.refobjid "
+            "JOIN pg_namespace ns ON ns.oid=tbl.relnamespace "
+            "WHERE seq.relkind='S' AND ns.nspname='public' "
+            "AND tbl.relname=ANY(%s)",
+            ([
+                "llm_usage_daily_attempt_dimensions",
+                "llm_usage_daily_call_memberships",
+            ],),
+        ).fetchone() == (0,)
+
+
 def test_0077_upgrade_repairs_same_relation_wrong_index_definition():
     """A valid but wrong same-table shell must be replaced, not accepted."""
     cfg = _alembic_config()
@@ -354,6 +394,61 @@ def test_0077_upgrade_refuses_same_name_index_on_another_relation():
     finally:
         with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
             conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
+        command.upgrade(cfg, "head")
+
+
+def test_0077_upgrade_refuses_same_name_index_in_another_schema():
+    """Index recovery must resolve public explicitly, never through search_path."""
+    cfg = _alembic_config()
+    name = "ix_llm_usage_daily_call_memberships_resolved"
+    try:
+        command.downgrade(cfg, "0076_llm_provider_attempts")
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute("CREATE SCHEMA rollup_shadow")
+            conn.execute("CREATE TABLE rollup_shadow.memberships (call_id text)")
+            conn.execute(
+                f"CREATE INDEX {name} ON rollup_shadow.memberships (call_id)"
+            )
+        with pytest.raises(RuntimeError, match="another schema"):
+            command.upgrade(cfg, "head")
+        with db.get_pool().connection() as conn:
+            assert conn.execute(
+                "SELECT ns.nspname,tbl.relname FROM pg_class idx "
+                "JOIN pg_namespace ns ON ns.oid=idx.relnamespace "
+                "JOIN pg_index pi ON pi.indexrelid=idx.oid "
+                "JOIN pg_class tbl ON tbl.oid=pi.indrelid "
+                "WHERE idx.relname=%s",
+                (name,),
+            ).fetchall() == [("rollup_shadow", "memberships")]
+    finally:
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute("DROP SCHEMA IF EXISTS rollup_shadow CASCADE")
+        command.upgrade(cfg, "head")
+
+
+def test_0077_downgrade_refuses_same_name_index_on_another_relation():
+    """Downgrade preflights ownership before deleting any concurrent index."""
+    cfg = _alembic_config()
+    name = "ix_llm_usage_daily_call_memberships_resolved"
+    try:
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(f"DROP INDEX CONCURRENTLY public.{name}")
+            conn.execute(f"CREATE INDEX CONCURRENTLY {name} ON public.users (user_id)")
+        with pytest.raises(RuntimeError, match="another relation"):
+            command.downgrade(cfg, "0076_llm_provider_attempts")
+        with db.get_pool().connection() as conn:
+            assert conn.execute(
+                "SELECT tbl.relname FROM pg_class idx "
+                "JOIN pg_index pi ON pi.indexrelid=idx.oid "
+                "JOIN pg_class tbl ON tbl.oid=pi.indrelid "
+                "JOIN pg_namespace ns ON ns.oid=idx.relnamespace "
+                "WHERE ns.nspname='public' AND idx.relname=%s",
+                (name,),
+            ).fetchone() == ("users",)
+    finally:
+        with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+            conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS public.{name}")
+        command.downgrade(cfg, "0076_llm_provider_attempts")
         command.upgrade(cfg, "head")
 
 

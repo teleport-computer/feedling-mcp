@@ -53,7 +53,6 @@ RETURNS boolean LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
 $$;
 
 CREATE TABLE IF NOT EXISTS llm_usage_daily_attempt_dimensions (
-  id BIGSERIAL PRIMARY KEY,
   local_day DATE NOT NULL,
   user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
   cohort_lane TEXT NOT NULL,
@@ -117,7 +116,6 @@ CREATE TABLE IF NOT EXISTS llm_usage_daily_attempt_dimensions (
 );
 
 CREATE TABLE IF NOT EXISTS llm_usage_daily_call_memberships (
-  id BIGSERIAL PRIMARY KEY,
   local_day DATE NOT NULL,
   user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
   cohort_lane TEXT NOT NULL,
@@ -205,31 +203,31 @@ END $$;
 _CONCURRENT_INDEXES = {
     "ix_llm_provider_attempts_updated_id":
         "CREATE INDEX CONCURRENTLY ix_llm_provider_attempts_updated_id "
-        "ON llm_provider_attempts (updated_at,attempt_id) INCLUDE (job_id) "
+        "ON public.llm_provider_attempts (updated_at,attempt_id) INCLUDE (job_id) "
         "WHERE source='runtime_recorder'",
     "ix_llm_rate_cards_created_identity":
         "CREATE INDEX CONCURRENTLY ix_llm_rate_cards_created_identity "
-        "ON llm_rate_cards (created_at,provider,model,version) INCLUDE (effective_at)",
+        "ON public.llm_rate_cards (created_at,provider,model,version) INCLUDE (effective_at)",
     "ix_llm_usage_daily_attempt_dimensions_user":
         "CREATE INDEX CONCURRENTLY ix_llm_usage_daily_attempt_dimensions_user "
-        "ON llm_usage_daily_attempt_dimensions (user_id,local_day)",
+        "ON public.llm_usage_daily_attempt_dimensions (user_id,local_day)",
     "ix_llm_usage_daily_attempt_dimensions_resolved":
         "CREATE INDEX CONCURRENTLY ix_llm_usage_daily_attempt_dimensions_resolved "
-        "ON llm_usage_daily_attempt_dimensions "
+        "ON public.llm_usage_daily_attempt_dimensions "
         "(local_day,resolved_provider,resolved_model,user_id,cohort_lane) "
         "INCLUDE (requested_provider,requested_model,effective_usage_known,cost_kind,currency)",
     "ix_llm_usage_daily_call_memberships_user":
         "CREATE INDEX CONCURRENTLY ix_llm_usage_daily_call_memberships_user "
-        "ON llm_usage_daily_call_memberships (user_id,local_day)",
+        "ON public.llm_usage_daily_call_memberships (user_id,local_day)",
     "ix_llm_usage_daily_call_memberships_resolved":
         "CREATE INDEX CONCURRENTLY ix_llm_usage_daily_call_memberships_resolved "
-        "ON llm_usage_daily_call_memberships "
+        "ON public.llm_usage_daily_call_memberships "
         "(local_day,resolved_provider,resolved_model,user_id,cohort_lane) "
         "INCLUDE (call_id,requested_provider,requested_model,effective_usage_known,"
         "missing_outer_ordinals,missing_inner_ordinals)",
     "ix_llm_usage_daily_call_memberships_cohort":
         "CREATE INDEX CONCURRENTLY ix_llm_usage_daily_call_memberships_cohort "
-        "ON llm_usage_daily_call_memberships (local_day,user_id,cohort_lane) "
+        "ON public.llm_usage_daily_call_memberships (local_day,user_id,cohort_lane) "
         "INCLUDE (call_id,requested_provider,requested_model,resolved_provider,"
         "resolved_model,effective_usage_known,missing_outer_ordinals,missing_inner_ordinals)",
 }
@@ -284,26 +282,32 @@ def _index_validity(name: str, bind=None) -> bool | None:
     )
     bind = op.get_bind() if bind is None else bind
     execute = getattr(bind, "exec_driver_sql", bind.execute)
-    row = execute(
-        "SELECT tbl.relname,"
+    rows = execute(
+        "SELECT idx_ns.nspname,tbl_ns.nspname,tbl.relname,"
         "(idx.indisvalid AND am.amname='btree' AND NOT idx.indisunique "
         f"AND idx.indnkeyatts={len(keys)} AND idx.indnatts={len(columns)} "
         f"AND idx.indexprs IS NULL AND {column_checks} "
         "AND COALESCE(pg_get_expr(idx.indpred,idx.indrelid,true),'')=%s) "
         "FROM pg_class AS cls "
+        "JOIN pg_namespace AS idx_ns ON idx_ns.oid=cls.relnamespace "
         "JOIN pg_index AS idx ON idx.indexrelid=cls.oid "
         "JOIN pg_class AS tbl ON tbl.oid=idx.indrelid "
+        "JOIN pg_namespace AS tbl_ns ON tbl_ns.oid=tbl.relnamespace "
         "JOIN pg_am AS am ON am.oid=cls.relam "
-        "WHERE cls.relkind='i' AND cls.relname=%s AND pg_table_is_visible(cls.oid)",
+        "WHERE cls.relkind='i' AND cls.relname=%s",
         (*columns, predicate, name),
-    ).fetchone()
-    if row is None:
+    ).fetchall()
+    if not rows:
         return None
-    if row[0] != relation:
+    if any(row[0] != "public" or row[1] != "public" for row in rows):
+        raise RuntimeError(
+            f"{name} exists in another schema; refusing ambiguous index ownership"
+        )
+    if len(rows) != 1 or rows[0][2] != relation:
         raise RuntimeError(
             f"{name} exists on another relation; refusing to drop an unrelated index"
         )
-    return bool(row[1])
+    return bool(rows[0][3])
 
 
 def upgrade() -> None:
@@ -313,15 +317,20 @@ def upgrade() -> None:
         for name, sql in _CONCURRENT_INDEXES.items():
             validity = _index_validity(name)
             if validity is False:
-                op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
+                op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS public.{name}")
             if validity is not True:
                 op.execute(sql)
 
 
 def downgrade() -> None:
+    # Preflight every name before the first autocommit DROP.  This avoids a
+    # partially destructive downgrade when a later name belongs to another
+    # schema/relation.
+    owned = {name: _index_validity(name) for name in _CONCURRENT_INDEXES}
     with op.get_context().autocommit_block():
-        for name in _CONCURRENT_INDEXES:
-            op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {name}")
+        for name, validity in owned.items():
+            if validity is not None:
+                op.execute(f"DROP INDEX CONCURRENTLY public.{name}")
     op.execute("DROP TABLE IF EXISTS llm_usage_rollup_dirty_days")
     op.execute("DROP TABLE IF EXISTS llm_usage_daily_call_memberships")
     op.execute("DROP TABLE IF EXISTS llm_usage_daily_attempt_dimensions")
