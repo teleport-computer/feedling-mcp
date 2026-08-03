@@ -27,6 +27,8 @@ def _healthy_artifact(commit: str = "a" * 40) -> dict:
     samples = 20
     provider_path = {
         "raw_latency_ms": [1.0] * samples,
+        "started_ns": [120] * samples,
+        "finished_ns": [121] * samples,
         "result_digests": ["b" * 64] * samples,
         "exception_fingerprints": [None] * samples,
         "http_attempts": [2] * samples,
@@ -162,6 +164,9 @@ def _healthy_artifact(commit: str = "a" * 40) -> dict:
     }
     for path in pool_paths["pool_contention"].values():
         path["raw_latency_ms"] = [1.1] * samples
+        path["overlapping_roles"] = [
+            sorted(pool_roles) for _ in range(samples)
+        ]
     payload = {
         "schema_version": 1,
         "producer": "scripts/perf/provider_attempt_business_path.py",
@@ -192,7 +197,9 @@ def _healthy_artifact(commit: str = "a" * 40) -> dict:
             "peak_occupancy": 6,
             "timeouts": 0,
             "roles": sorted(pool_roles),
-            "report_statement_timeout_ms": 3000,
+            "usage_report_total_deadline_ms": 15000,
+            "attempt_subsection_timeout_ms": 3000,
+            "maintenance_statement_timeout_ms": 3000,
             "maintenance_second_connection_observed": True,
             "required_overlap_observed": True,
             "active_role_snapshots": active_snapshots,
@@ -409,6 +416,71 @@ def test_validator_rejects_pool_contention_latency_regression_from_raw_pairs() -
     artifact["canonical_sha256"] = _canonical_digest(artifact)
 
     with pytest.raises(ValueError, match="pool paired p95"):
+        validate_business_path_evidence(artifact, expected_commit="a" * 40)
+
+
+def test_validator_binds_every_pool_candidate_to_raw_db_contention_window() -> None:
+    from scripts.perf.provider_attempt_business_path import (
+        validate_business_path_evidence,
+    )
+
+    artifact = _healthy_artifact()
+    candidate = artifact["pool"]["provider_paths"]["paths"]["pool_contention"][
+        "openrouter"
+    ]
+    candidate["started_ns"][0] = 300
+    candidate["finished_ns"][0] = 301
+    candidate["overlapping_roles"][0] = []
+    artifact["canonical_sha256"] = _canonical_digest(artifact)
+
+    with pytest.raises(ValueError, match="candidate contention overlap"):
+        validate_business_path_evidence(artifact, expected_commit="a" * 40)
+
+
+def test_validator_requires_candidate_batch_to_cover_every_db_role() -> None:
+    from scripts.perf.provider_attempt_business_path import (
+        _derive_pool_timeline,
+        validate_business_path_evidence,
+    )
+
+    artifact = _healthy_artifact()
+    pool = artifact["pool"]
+    for acquisition in pool["raw_acquisitions"]:
+        if acquisition["role"] == "attempt_rollup_rebuild":
+            acquisition["acquired_ns"] = 130
+            acquisition["released_ns"] = 140
+    pool.update(_derive_pool_timeline(pool["raw_acquisitions"]))
+    for path in pool["provider_paths"]["paths"]["pool_contention"].values():
+        path["overlapping_roles"] = [
+            [role for role in roles if role != "attempt_rollup_rebuild"]
+            for roles in path["overlapping_roles"]
+        ]
+    artifact["canonical_sha256"] = _canonical_digest(artifact)
+
+    with pytest.raises(ValueError, match="role coverage incomplete"):
+        validate_business_path_evidence(artifact, expected_commit="a" * 40)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("usage_report_total_deadline_ms", 3000),
+        ("attempt_subsection_timeout_ms", 15000),
+        ("maintenance_statement_timeout_ms", 15000),
+    ],
+)
+def test_validator_keeps_report_attempt_and_maintenance_timeouts_distinct(
+    field, value
+) -> None:
+    from scripts.perf.provider_attempt_business_path import (
+        validate_business_path_evidence,
+    )
+
+    artifact = _healthy_artifact()
+    artifact["pool"][field] = value
+    artifact["canonical_sha256"] = _canonical_digest(artifact)
+
+    with pytest.raises(ValueError, match="timeout contract"):
         validate_business_path_evidence(artifact, expected_commit="a" * 40)
 
 

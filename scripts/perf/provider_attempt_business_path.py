@@ -43,7 +43,9 @@ MIN_SAMPLES_PER_PROVIDER = 20
 DEFAULT_SAMPLES_PER_PROVIDER = 40
 DEFAULT_WARMUPS_PER_PROVIDER = 3
 HOT_PATH_PAIRED_P95_BUDGET_MS = 5.0
-REPORT_STATEMENT_TIMEOUT_MS = 3_000
+USAGE_REPORT_TOTAL_DEADLINE_MS = 15_000
+ATTEMPT_SUBSECTION_TIMEOUT_MS = 3_000
+MAINTENANCE_STATEMENT_TIMEOUT_MS = 3_000
 POOL_ROLES = (
     "usage_exporter",
     "usage_importer_core",
@@ -83,6 +85,8 @@ def _validate_provider_path(path: Any, *, samples: int, label: str) -> None:
         key: path.get(key)
         for key in (
             "raw_latency_ms",
+            "started_ns",
+            "finished_ns",
             "result_digests",
             "exception_fingerprints",
             "http_attempts",
@@ -95,6 +99,17 @@ def _validate_provider_path(path: Any, *, samples: int, label: str) -> None:
     _require(
         all(isinstance(value, (int, float)) and value >= 0 for value in arrays["raw_latency_ms"]),
         f"{label} latency sample invalid",
+    )
+    _require(
+        all(
+            isinstance(started, int)
+            and isinstance(finished, int)
+            and finished > started
+            for started, finished in zip(
+                arrays["started_ns"], arrays["finished_ns"], strict=True
+            )
+        ),
+        f"{label} call interval invalid",
     )
     _require(
         all(isinstance(value, str) and len(value) == 64 for value in arrays["result_digests"]),
@@ -253,7 +268,15 @@ def validate_business_path_evidence(
     _require(pool.get("measurement") == "production_concurrent_paths", "pool measurement provenance missing")
     _require(isinstance(pool.get("capacity"), int) and pool["capacity"] >= 2, "pool capacity invalid")
     _require(pool.get("timeouts") == 0, "pool timeout observed")
-    _require(pool.get("report_statement_timeout_ms") == REPORT_STATEMENT_TIMEOUT_MS, "report timeout budget changed")
+    _require(
+        pool.get("usage_report_total_deadline_ms")
+        == USAGE_REPORT_TOTAL_DEADLINE_MS
+        and pool.get("attempt_subsection_timeout_ms")
+        == ATTEMPT_SUBSECTION_TIMEOUT_MS
+        and pool.get("maintenance_statement_timeout_ms")
+        == MAINTENANCE_STATEMENT_TIMEOUT_MS,
+        "pool timeout contract mismatch",
+    )
     acquisitions = pool.get("raw_acquisitions")
     _require(isinstance(acquisitions, list) and acquisitions, "pool raw acquisitions missing")
     _require(
@@ -283,11 +306,17 @@ def validate_business_path_evidence(
     _require(timeline["peak_occupancy"] <= pool["capacity"], "pool peak exceeds capacity")
     _require(timeline["maintenance_second_connection_observed"] is True, "maintenance second connection not observed")
     _require(timeline["required_overlap_observed"] is True, "required pool role overlap absent")
-    _validate_pool_provider_paths(pool.get("provider_paths"), budget=float(budget))
+    _validate_pool_provider_paths(
+        pool.get("provider_paths"),
+        budget=float(budget),
+        acquisitions=acquisitions,
+    )
     return evidence
 
 
-def _validate_pool_provider_paths(payload: Any, *, budget: float) -> None:
+def _validate_pool_provider_paths(
+    payload: Any, *, budget: float, acquisitions: list[dict[str, Any]]
+) -> None:
     _require(isinstance(payload, dict), "pool provider paths missing")
     samples = payload.get("samples_per_provider")
     _require(isinstance(samples, int) and samples >= MIN_SAMPLES_PER_PROVIDER, "pool provider samples insufficient")
@@ -322,11 +351,54 @@ def _validate_pool_provider_paths(payload: Any, *, budget: float) -> None:
             "retries",
         ):
             _require(candidate[key] == baseline[key], f"pool {provider} {key} changed")
+        claimed_overlaps = candidate.get("overlapping_roles")
+        _require(
+            isinstance(claimed_overlaps, list) and len(claimed_overlaps) == samples,
+            f"pool {provider} candidate contention overlap missing",
+        )
+        for index, (started, finished) in enumerate(
+            zip(candidate["started_ns"], candidate["finished_ns"], strict=True)
+        ):
+            expected_roles = _overlapping_pool_roles(
+                started, finished, acquisitions
+            )
+            _require(
+                claimed_overlaps[index] == expected_roles and expected_roles,
+                f"pool {provider} candidate contention overlap invalid",
+            )
+    covered_roles = {
+        role
+        for provider in PROVIDERS
+        for roles in paths["pool_contention"][provider]["overlapping_roles"]
+        for role in roles
+    }
+    _require(
+        covered_roles == set(POOL_ROLES),
+        "pool candidate contention role coverage incomplete: "
+        f"{sorted(covered_roles)}",
+    )
     expected_deltas = _paired_deltas(paths["baseline"], paths["pool_contention"])
     _require(payload.get("paired_latency_delta_ms") == expected_deltas, "pool raw paired deltas mismatch")
     p95 = _nearest_rank(expected_deltas, 0.95)
     _require(p95 < budget, "pool paired p95 exceeds strict budget")
     _require(abs(float(payload.get("paired_p95_regression_ms")) - p95) < 0.001, "pool paired p95 claim mismatch")
+
+
+def _overlapping_pool_roles(
+    started_ns: int,
+    finished_ns: int,
+    acquisitions: list[dict[str, Any]],
+) -> list[str]:
+    """Return exact DB roles whose half-open intervals intersect a call."""
+
+    return sorted(
+        {
+            str(item["role"])
+            for item in acquisitions
+            if int(item["acquired_ns"]) < finished_ns
+            and started_ns < int(item["released_ns"])
+        }
+    )
 
 
 class _Context(AbstractContextManager):
@@ -444,6 +516,27 @@ class _TrackedPool:
                     return
             raise RuntimeError("active importer acquisition missing")
 
+    def wait_for_active_roles(
+        self, required: set[str], *, timeout: float
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                active_ids = {
+                    event_id
+                    for event_ids in self._active_by_thread.values()
+                    for event_id in event_ids
+                }
+                active_roles = {
+                    str(item["role"])
+                    for item in self._raw
+                    if item["event_id"] in active_ids
+                }
+            if required <= active_roles:
+                return True
+            threading.Event().wait(0.001)
+        return False
+
     @contextmanager
     def operation(self, name: str):
         previous = getattr(self._local, "operation", "")
@@ -465,7 +558,6 @@ class _TrackedPool:
                 "peak_occupancy": timeline["peak_occupancy"],
                 "timeouts": self._timeouts,
                 "roles": sorted({item["role"] for item in self._raw}),
-                "report_statement_timeout_ms": REPORT_STATEMENT_TIMEOUT_MS,
                 "maintenance_second_connection_observed": timeline[
                     "maintenance_second_connection_observed"
                 ],
@@ -724,6 +816,7 @@ def _run_interleaved_provider_paths(
         "queue_saturation",
         "recorder_failures",
     ),
+    before_call: Callable[[str, int], None] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Run control/candidates adjacent, reversing order every sample."""
     transports = {
@@ -736,6 +829,8 @@ def _run_interleaved_provider_paths(
     paths = {
         scenario: {
             "raw_latency_ms": [],
+            "started_ns": [],
+            "finished_ns": [],
             "result_digests": [],
             "exception_fingerprints": [],
             "http_attempts": [],
@@ -751,6 +846,8 @@ def _run_interleaved_provider_paths(
         for sample in range(-warmups, samples):
             order = scenario_order if sample % 2 == 0 else tuple(reversed(scenario_order))
             for scenario in order:
+                if before_call is not None:
+                    before_call(scenario, sample)
                 transport = transports[scenario]
                 pc._shared_client = clients[scenario]
                 pc.record_provider_attempt = records[scenario]
@@ -773,12 +870,15 @@ def _run_interleaved_provider_paths(
                 except BaseException as exc:  # noqa: BLE001 - evidence captures leak
                     result = None
                     exception = f"{type(exc).__name__}:{exc}"
-                elapsed = (time.perf_counter_ns() - started) / 1_000_000
+                finished = time.perf_counter_ns()
+                elapsed = (finished - started) / 1_000_000
                 actual_attempts = transport.requests - before
                 if sample < 0:
                     continue
                 path = paths[scenario]
                 path["raw_latency_ms"].append(round(elapsed, 6))
+                path["started_ns"].append(started)
+                path["finished_ns"].append(finished)
                 path["result_digests"].append(_result_digest(result))
                 path["exception_fingerprints"].append(exception)
                 path["http_attempts"].append(actual_attempts)
@@ -958,11 +1058,12 @@ def measure_pool_contention_evidence(
     usage_query: Any,
     samples: int = MIN_SAMPLES_PER_PROVIDER,
 ) -> dict[str, Any]:
-    """Run recorder, attempt maintenance and the 3-second report concurrently.
+    """Run recorder, attempt maintenance and the bounded report concurrently.
 
     The caller supplies the already validated dedicated local PostgreSQL pool.
-    Only the two known rollup watermarks and one synthetic dirty day are seeded;
-    they are removed in ``finally`` before the scale fixture is installed.
+    Only the two known rollup watermarks and twenty synthetic dirty days are
+    seeded.  The dirty days force real rebuild work while calls are sampled;
+    everything is removed in ``finally`` before the scale fixture is installed.
     """
     repo = Path(__file__).resolve().parents[2]
     backend = str(repo / "backend")
@@ -972,6 +1073,17 @@ def measure_pool_contention_evidence(
     import provider_client as pc  # noqa: PLC0415
 
     tracker = _TrackedPool(real_pool)
+    usage_report_total_deadline_ms = int(
+        jobs_store._USAGE_REPORT_STATEMENT_TIMEOUT_MS
+    )
+    attempt_subsection_timeout_ms = int(
+        jobs_store._RUNTIME_ATTEMPT_USAGE_STATEMENT_TIMEOUT_MS
+    )
+    if (
+        usage_report_total_deadline_ms != USAGE_REPORT_TOTAL_DEADLINE_MS
+        or attempt_subsection_timeout_ms != ATTEMPT_SUBSECTION_TIMEOUT_MS
+    ):
+        raise RuntimeError("production usage timeout contract changed")
     dirty_day = datetime.now(timezone.utc).date()
     recorder = accounting.ProviderAttemptRecorder(
         queue_capacity=128,
@@ -984,13 +1096,34 @@ def measure_pool_contention_evidence(
     start_gate = threading.Barrier(3)
     outcomes: dict[str, Any] = {}
     errors: list[str] = []
+    provider_done = threading.Event()
     old_get_pool = db_module.get_pool
 
     def provider_work() -> None:
         try:
             start_gate.wait(timeout=2)
+            if not tracker.wait_for_active_roles(
+                {"usage_exporter", "attempt_rollup_outer"}, timeout=2
+            ):
+                raise RuntimeError("real DB contention roles did not become active")
             paths = {"baseline": {}, "pool_contention": {}}
             execution_order = []
+
+            def await_real_db_overlap(scenario: str, sample: int) -> None:
+                if scenario != "pool_contention" or sample < 0:
+                    return
+                target_by_sample = {
+                    0: "attempt_rollup_rebuild",
+                    1: "usage_importer_core",
+                    2: "usage_importer_attempt",
+                    3: "provider_recorder",
+                }
+                target = target_by_sample.get(sample, "usage_exporter")
+                if not tracker.wait_for_active_roles({target}, timeout=2):
+                    raise RuntimeError(
+                        f"real DB overlap role did not become active: {target}"
+                    )
+
             for provider in PROVIDERS:
                 provider_paths, provider_order = _run_interleaved_provider_paths(
                     pc=pc,
@@ -1003,6 +1136,7 @@ def measure_pool_contention_evidence(
                         "pool_contention": recorder.record,
                     },
                     scenario_order=("baseline", "pool_contention"),
+                    before_call=await_real_db_overlap,
                 )
                 for scenario, path in provider_paths.items():
                     paths[scenario][provider] = path
@@ -1017,28 +1151,38 @@ def measure_pool_contention_evidence(
             }
         except BaseException as exc:  # noqa: BLE001
             errors.append(f"provider:{type(exc).__name__}")
+        finally:
+            provider_done.set()
 
     def maintenance_work() -> None:
         try:
             start_gate.wait(timeout=2)
-            with tracker.operation("attempt_rollup"):
-                outcomes["maintenance"] = provider_attempt_rollup.run_maintenance_tick(
-                    max_days=1,
-                    max_changed_rows=1,
-                    max_dirty_days=1,
-                    max_stale_rows=0,
-                    max_retention_rows=0,
-                    statement_timeout_ms=REPORT_STATEMENT_TIMEOUT_MS,
-                    pool_timeout_seconds=0.5,
-                )
+            ticks = []
+            while not provider_done.is_set():
+                with tracker.operation("attempt_rollup"):
+                    ticks.append(
+                        provider_attempt_rollup.run_maintenance_tick(
+                            max_days=1,
+                            max_changed_rows=1,
+                            max_dirty_days=1,
+                            max_stale_rows=0,
+                            max_retention_rows=0,
+                            statement_timeout_ms=MAINTENANCE_STATEMENT_TIMEOUT_MS,
+                            pool_timeout_seconds=0.5,
+                        )
+                    )
+            outcomes["maintenance"] = ticks
         except BaseException as exc:  # noqa: BLE001
             errors.append(f"maintenance:{type(exc).__name__}")
 
     def report_work() -> None:
         try:
             start_gate.wait(timeout=2)
-            with tracker.operation("usage_exporter"):
-                outcomes["report"] = jobs_store.usage_report_snapshot(usage_query)
+            reports = []
+            while not provider_done.is_set():
+                with tracker.operation("usage_exporter"):
+                    reports.append(jobs_store.usage_report_snapshot(usage_query))
+            outcomes["report"] = reports
         except BaseException as exc:  # noqa: BLE001
             errors.append(f"report:{type(exc).__name__}")
 
@@ -1063,8 +1207,9 @@ def measure_pool_contention_evidence(
             )
             conn.execute(
                 "INSERT INTO llm_usage_rollup_dirty_days "
-                "(rollup_name,local_day,reason) VALUES "
-                "('hosted_v2_attempt_usage',%s,'load_proof')",
+                "(rollup_name,local_day,reason) "
+                "SELECT 'hosted_v2_attempt_usage',%s - day_offset,'load_proof' "
+                "FROM generate_series(0,19) AS days(day_offset)",
                 (dirty_day,),
             )
     try:
@@ -1095,7 +1240,24 @@ def measure_pool_contention_evidence(
         # the batch it just dequeued.  Join it before freezing interval evidence.
         recorder.shutdown(timeout=2)
         provider_paths = outcomes.get("provider") or {}
+        for provider in PROVIDERS:
+            candidate = provider_paths["paths"]["pool_contention"][provider]
+            candidate["overlapping_roles"] = [
+                _overlapping_pool_roles(started, finished, tracker._raw)
+                for started, finished in zip(
+                    candidate["started_ns"],
+                    candidate["finished_ns"],
+                    strict=True,
+                )
+            ]
         evidence = tracker.evidence(provider_paths=provider_paths)
+        evidence.update(
+            {
+                "usage_report_total_deadline_ms": usage_report_total_deadline_ms,
+                "attempt_subsection_timeout_ms": attempt_subsection_timeout_ms,
+                "maintenance_statement_timeout_ms": MAINTENANCE_STATEMENT_TIMEOUT_MS,
+            }
+        )
         if not set(POOL_ROLES) <= set(evidence["roles"]):
             raise RuntimeError(
                 f"pool proof did not observe every production role: {evidence['roles']}"

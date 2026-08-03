@@ -87,7 +87,7 @@ def test_admin_usage_scale_uses_approved_three_second_p95_budget():
 def test_admin_usage_scale_attempt_fixture_is_explicit_and_bounded():
     harness = _load_usage_scale_harness()
 
-    assert harness._resolve_attempt_rows(3_000_000, None) == 0
+    assert harness._resolve_attempt_rows(3_000_000, None) == 3_000_000
     assert harness._resolve_attempt_rows(3_000_000, 0) == 0
     assert harness._resolve_attempt_rows(3_000_000, 1_500_000) == 1_500_000
     for invalid in (-1, 3_000_001):

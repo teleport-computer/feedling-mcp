@@ -49,7 +49,22 @@ The focused producer ran against the explicit dedicated local database
   attempt importer simultaneously.
 - Provider results, exceptions, HTTP attempts and retries under pool contention
   matched their adjacent baseline samples exactly.  Pool contention's paired
-  p95 latency regression was +0.080875 ms.
+  p95 latency regression was +0.348584 ms.
+- Every one of the 60 measured pool-contention candidate calls records its own
+  `started_ns`/`finished_ns`; the validator recomputes its intersecting DB roles
+  from the raw acquisition intervals.  No candidate had an empty intersection.
+  Coverage was outer maintenance 60/60, rebuild 43/60, recorder 57/60,
+  exporter 60/60, attempt importer 60/60, and core importer 59/60.  The real
+  role intervals ranged from 8.12–44.15 ms for rebuild, 32.44–57.88 ms for the
+  outer maintenance connection, 1.11–36.91 ms for recorder batches,
+  35.13–68.82 ms for exporter, 21.85–64.23 ms for attempt importer, and
+  16.53–50.74 ms for core importer.  Maintenance used twenty real dirty-day
+  recompute inputs rather than repeated no-op ticks.
+- Timeout evidence is separated by contract: the production Usage report total
+  deadline is 15,000 ms, its attempt subsection is 3,000 ms, and the actual
+  maintenance statement timeout passed by the probe is 3,000 ms.  The validator
+  checks all three independently; 3 seconds is not described as the report's
+  total budget.
 - OpenRouter, Anthropic and Google each recorded exactly two real HTTP requests
   and one retry per sample, with zero business errors in every scenario.
 - Queue saturation dropped 515 telemetry events while remaining bounded at its
@@ -79,7 +94,7 @@ performed in this task.
   claims, non-interleaved execution claims, missing measured pool evidence,
   nested maintenance occupancy, pre-existing rollup-state refusal, and separate
   turn/attempt watermark cleanup accounting.
-- Focused verification: `87 passed, 1 skipped` across the new evidence tests,
+- Focused verification: `93 passed, 1 skipped` across the new evidence tests,
   provider recorder tests and provider client tests.
 - Ruff passed for both perf scripts and the new tests.
 - Compileall passed for both perf scripts.
